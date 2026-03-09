@@ -589,7 +589,7 @@ def batch_process9s_transformer(
     output_dir,
     split,
     num_workers,
-    progress_interval_sec=180,
+    progress_interval_sec=60,
     force_reprocess=False,
 ):
     output_dir = Path(output_dir)
@@ -674,7 +674,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--progress_interval_sec", type=int, default=180)
+    parser.add_argument("--progress_interval_sec", type=int, default=60)
     parser.add_argument(
         "--force_reprocess",
         action="store_true",
