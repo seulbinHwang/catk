@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ---------------- CPU 분리 설정 (업로드 스크립트와 동일) ----------------
-CPUSET="${CPUSET:-0-31,64-95}"
-NUM_CPUS="${NUM_CPUS:-64}"
+# ---------------- CPU / 동시성 설정 ----------------
+CPUSET="${CPUSET:-}"
 PROGRESS_INTERVAL_SEC="${PROGRESS_INTERVAL_SEC:-60}"
-
-export DP_MAX_CPUS="${NUM_CPUS}"
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -14,15 +11,8 @@ export NUMEXPR_NUM_THREADS=1
 export BLIS_NUM_THREADS=1
 # ------------------------------------------------------------------------
 
-# 스크립트 자체를 CPUSET에 고정
-if command -v taskset >/dev/null 2>&1; then
-  taskset -cp "${CPUSET}" $$ >/dev/null
-fi
-
 REMOTE_DIR="${1:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache}}"
 LOCAL_DIR="${2:-${LOCAL_DIR:-/workspace/womd_v1_3/SMART_cache}}"
-
-echo "[SMART_CACHE_DOWNLOAD] CPUSET=${CPUSET}, DP_MAX_CPUS=${DP_MAX_CPUS}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
 
 if ! command -v nubescli >/dev/null 2>&1; then
   echo "ERROR: nubescli not found in PATH"
@@ -37,13 +27,79 @@ fi
 
 mkdir -p "$LOCAL_DIR"
 
-# nubes_to_mlx_only_womd.sh 방식: 전체 코어의 4/5 사용
-NUBES_JOBS=$(( ( $(nproc) * 4 ) / 5 ))
-if [ "$NUBES_JOBS" -lt 1 ]; then
+_count_cpus_in_set() {
+  local cpu_set="$1"
+  local total=0
+  local part
+  local start
+  local end
+
+  if [[ -z "$cpu_set" ]]; then
+    echo "0"
+    return
+  fi
+
+  IFS=',' read -ra parts <<< "$cpu_set"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      start="${part%-*}"
+      end="${part#*-}"
+      total=$(( total + end - start + 1 ))
+    else
+      total=$(( total + 1 ))
+    fi
+  done
+
+  echo "$total"
+}
+
+_detect_cpuset() {
+  if [[ -n "$CPUSET" ]]; then
+    echo "$CPUSET"
+    return
+  fi
+
+  if command -v taskset >/dev/null 2>&1; then
+    taskset -pc $$ 2>/dev/null | awk -F': ' 'NR==1 {print $2}'
+    return
+  fi
+
+  echo ""
+}
+
+_run_pinned() {
+  if [[ -n "$ACTIVE_CPUSET" ]] && command -v taskset >/dev/null 2>&1; then
+    taskset -c "$ACTIVE_CPUSET" "$@"
+  else
+    "$@"
+  fi
+}
+
+ACTIVE_CPUSET="$(_detect_cpuset)"
+AVAILABLE_CPUS="$(_count_cpus_in_set "$ACTIVE_CPUSET")"
+if [[ "$AVAILABLE_CPUS" -le 0 ]]; then
+  AVAILABLE_CPUS="$(nproc)"
+fi
+
+export DP_MAX_CPUS="${AVAILABLE_CPUS}"
+
+if [[ -z "${NUBES_JOBS:-}" ]]; then
+  if [[ "$AVAILABLE_CPUS" -le 4 ]]; then
+    NUBES_JOBS="$AVAILABLE_CPUS"
+  elif [[ "$AVAILABLE_CPUS" -le 8 ]]; then
+    NUBES_JOBS=$(( AVAILABLE_CPUS - 1 ))
+  elif [[ "$AVAILABLE_CPUS" -le 16 ]]; then
+    NUBES_JOBS=$(( AVAILABLE_CPUS - 2 ))
+  else
+    NUBES_JOBS=$(( (AVAILABLE_CPUS * 3) / 4 ))
+  fi
+fi
+
+if [[ "$NUBES_JOBS" -lt 1 ]]; then
   NUBES_JOBS=1
 fi
 
-echo "[NUBES_JOBS] total_cores=$(nproc), use_cores=${NUBES_JOBS} (4/5)"
+echo "[SMART_CACHE_DOWNLOAD] CPUSET=${ACTIVE_CPUSET:-auto}, DP_MAX_CPUS=${DP_MAX_CPUS}, NUBES_JOBS=${NUBES_JOBS}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
 
 _format_hours_minutes() {
   local seconds="$1"
@@ -145,8 +201,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "[LIST] reading remote object list from $REMOTE_DIR [start]"
-taskset -c "${CPUSET}" \
-nubescli list "$REMOTE_DIR" -R -o -f > "$manifest_path"
+_run_pinned nubescli list "$REMOTE_DIR" -R -o -f > "$manifest_path"
 echo "[LIST] reading remote object list from $REMOTE_DIR [end]"
 
 total_expected=$(grep -c . "$manifest_path" || true)
@@ -165,8 +220,7 @@ _monitor_progress "$manifest_path" "$total_expected" "$start_count" "$start_epoc
 monitor_pid=$!
 
 echo "[DOWNLOAD] NUBES SMART_cache missing files -> $LOCAL_DIR [start]"
-taskset -c "${CPUSET}" \
-nubescli dir-download \
+_run_pinned nubescli dir-download \
   "$REMOTE_DIR" \
   "$LOCAL_DIR" \
   -j "$NUBES_JOBS" \
