@@ -23,6 +23,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 
 import numpy as np
 import tensorflow as tf
@@ -75,9 +81,25 @@ _signal_state_to_polygon_light_type = {
 _PROGRESS_COUNTER = None
 
 
-def _init_worker(progress_counter) -> None:
+def _configure_runtime_threads(threads_per_worker: int) -> None:
+    threads_per_worker = max(1, int(threads_per_worker))
+    torch.set_num_threads(threads_per_worker)
+    if hasattr(torch, "set_num_interop_threads"):
+        try:
+            torch.set_num_interop_threads(threads_per_worker)
+        except RuntimeError:
+            pass
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(threads_per_worker)
+        tf.config.threading.set_inter_op_parallelism_threads(threads_per_worker)
+    except RuntimeError:
+        pass
+
+
+def _init_worker(progress_counter, threads_per_worker: int) -> None:
     global _PROGRESS_COUNTER
     _PROGRESS_COUNTER = progress_counter
+    _configure_runtime_threads(threads_per_worker)
 
 
 def _increment_progress(delta: int = 1) -> None:
@@ -601,9 +623,11 @@ def batch_process9s_transformer(
     output_dir,
     split,
     num_workers,
+    threads_per_worker=1,
     progress_interval_sec=60,
     force_reprocess=False,
 ):
+    _configure_runtime_threads(threads_per_worker)
     output_dir = Path(output_dir)
     output_dir_tfrecords_splitted = None
     if split == "validation":
@@ -656,7 +680,7 @@ def batch_process9s_transformer(
         with multiprocessing.Pool(
             num_workers,
             initializer=_init_worker,
-            initargs=(progress_counter,),
+            initargs=(progress_counter, threads_per_worker),
         ) as p:
             list(
                 tqdm(
@@ -686,6 +710,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument(
+        "--threads_per_worker",
+        type=int,
+        default=1,
+        help="Maximum CPU threads each preprocessing worker may use internally.",
+    )
     parser.add_argument("--progress_interval_sec", type=int, default=60)
     parser.add_argument(
         "--force_reprocess",
@@ -699,6 +729,7 @@ if __name__ == "__main__":
         args.output_dir,
         args.split,
         num_workers=args.num_workers,
+        threads_per_worker=args.threads_per_worker,
         progress_interval_sec=args.progress_interval_sec,
         force_reprocess=args.force_reprocess,
     )
