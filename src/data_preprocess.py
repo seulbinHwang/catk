@@ -120,8 +120,13 @@ def _progress_monitor(
         _print_progress(split, total_expected, current_count, start_count, start_time)
 
 
+def _iter_tfrecord_numpy(file_path: str):
+    dataset = tf.data.TFRecordDataset([file_path], compression_type="")
+    return dataset.as_numpy_iterator()
+
+
 def _count_records_in_tfrecord(file_path: str) -> int:
-    return sum(1 for _ in tf.compat.v1.io.tf_record_iterator(file_path))
+    return sum(1 for _ in _iter_tfrecord_numpy(file_path))
 
 
 def _count_total_expected(packages: List[str], num_workers: int) -> int:
@@ -544,7 +549,7 @@ def wm2argo(
         return 0
 
     processed_count = 0
-    for tf_data in tf.compat.v1.io.tf_record_iterator(file_path):
+    for tf_data in _iter_tfrecord_numpy(file_path):
         scenario = scenario_pb2.Scenario()
         scenario.ParseFromString(bytes(tf_data))
 
