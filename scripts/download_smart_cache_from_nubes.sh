@@ -62,7 +62,7 @@ if [[ -z "${NUBES_JOBS:-}" ]]; then
   elif [[ "$AVAILABLE_CPUS" -le 16 ]]; then
     NUBES_JOBS=$(( AVAILABLE_CPUS - 2 ))
   else
-    NUBES_JOBS=$(( (AVAILABLE_CPUS * 3) / 4 ))
+    NUBES_JOBS=$(( (AVAILABLE_CPUS * 4) / 5 ))
   fi
 fi
 
