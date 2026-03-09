@@ -26,11 +26,10 @@ def normalize_sincos(traj: Tensor, eps: float = 1e-6) -> Tensor:
     Returns:
         같은 shape의 텐서입니다.
     """
-    out = traj.clone()
-    vec = out[..., 2:4]
+    vec = traj[..., 2:4]
     denom = torch.clamp(torch.norm(vec, dim=-1, keepdim=True), min=eps)
-    out[..., 2:4] = vec / denom
-    return out
+    normed_vec = vec / denom
+    return torch.cat([traj[..., :2], normed_vec], dim=-1)
 
 
 

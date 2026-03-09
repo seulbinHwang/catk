@@ -168,12 +168,13 @@ class SMARTAgentDecoder(nn.Module):
         agent_token_emb_veh = self.token_emb_veh(trajectory_token_veh)
         agent_token_emb_ped = self.token_emb_ped(trajectory_token_ped)
         agent_token_emb_cyc = self.token_emb_cyc(trajectory_token_cyc)
+        embed_dtype = agent_token_emb_veh.dtype
         agent_token_emb = torch.zeros(
-            (n_agent, n_step, self.hidden_dim), device=_device, dtype=pos_a.dtype
+            (n_agent, n_step, self.hidden_dim), device=_device, dtype=embed_dtype
         )
-        agent_token_emb[veh_mask] = agent_token_emb_veh[agent_token_index[veh_mask]]
-        agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]
-        agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]]
+        agent_token_emb[veh_mask] = agent_token_emb_veh[agent_token_index[veh_mask]].to(embed_dtype)
+        agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]].to(embed_dtype)
+        agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]].to(embed_dtype)
 
         motion_vector_a = torch.cat(
             [
