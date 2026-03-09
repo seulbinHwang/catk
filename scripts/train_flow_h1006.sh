@@ -12,7 +12,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
 TRAINER_DEVICES="${TRAINER_DEVICES:-$NPROC_PER_NODE}"
 CACHE_ROOT="${CACHE_ROOT:-}"
 WANDB_MODE="${WANDB_MODE:-online}"
-WANDB_PROJECT="${WANDB_PROJECT:-SMART-FLOW}"
+TRAIN_WANDB_PROJECT="${TRAIN_WANDB_PROJECT:-SMART-FLOW}"
 WANDB_ENTITY="${WANDB_ENTITY:-jksg01019-naver-labs}"
 
 if [[ -n "${WANDB_OFFLINE:-}" ]]; then
@@ -30,7 +30,7 @@ cmd=(
   experiment="$EXPERIMENT"
   trainer.devices="$TRAINER_DEVICES"
   logger.wandb.offline="$_wandb_offline"
-  logger.wandb.project="$WANDB_PROJECT"
+  logger.wandb.project="$TRAIN_WANDB_PROJECT"
   logger.wandb.entity="$WANDB_ENTITY"
   task_name="$TASK_NAME"
 )

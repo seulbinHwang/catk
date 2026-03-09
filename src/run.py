@@ -13,6 +13,8 @@
 
 import os
 import signal
+import sys
+import traceback
 from pathlib import Path
 from typing import List
 
@@ -140,6 +142,22 @@ def terminate_torchrun_worker_group() -> None:
         pass
 
 
+def report_unhandled_exception(cfg: DictConfig) -> None:
+    rank = os.environ.get("RANK", "0")
+    local_rank = os.environ.get("LOCAL_RANK", "0")
+    header = f"[rank {rank} local_rank {local_rank}] Unhandled exception"
+    traceback_text = "".join(traceback.format_exc())
+
+    print(header, file=sys.stderr, flush=True)
+    print(traceback_text, file=sys.stderr, flush=True)
+
+    try:
+        failure_path = Path(cfg.paths.output_dir) / f"failure_rank{rank}.log"
+        failure_path.write_text(header + "\n" + traceback_text)
+    except OSError:
+        pass
+
+
 def install_wandb_signal_handlers() -> None:
     def _finish_wandb(signum, _frame) -> None:
         try:
@@ -228,7 +246,7 @@ def main(cfg: DictConfig) -> None:
     try:
         run(cfg)  # train/val/test the model
     except Exception:
-        log.exception("Run failed. Terminating torchrun worker group.")
+        report_unhandled_exception(cfg)
         terminate_torchrun_worker_group()
         raise
 
