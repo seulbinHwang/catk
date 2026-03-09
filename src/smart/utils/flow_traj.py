@@ -130,20 +130,31 @@ def build_ot_flow_path(target: Tensor, noise_scale: float, eps: float = 1e-3) ->
     tau = torch.rand(target.shape[0], device=target.device, dtype=target.dtype)
     tau = tau.clamp(min=eps, max=1.0 - eps)
     tau_view = tau.view(-1, 1, 1, 1)
+
     noise = torch.randn_like(target) * noise_scale
     noise[:, 0, 0, 0] = 0.0
     noise[:, 0, 0, 1] = 0.0
     noise[:, 0, 0, 2] = 0.0
     noise[:, 0, 0, 3] = 1.0
+
     z_tau = (1.0 - tau_view) * noise + tau_view * target
     z_tau[:, 0, 0, 0] = 0.0
     z_tau[:, 0, 0, 1] = 0.0
     z_tau[:, 0, 0, 2] = 0.0
     z_tau[:, 0, 0, 3] = 1.0
-    z_tau = normalize_sincos(z_tau)
+
+    # NOTE:
+    # `z_tau`는 flow matching의 선형 OT 경로 그대로 유지해야 합니다.
+    # 여기서 `(sin, cos)`를 미리 정규화해 버리면,
+    # - 모델 입력은 "정규화된 상태"를 보게 되고
+    # - 정답 velocity는 "정규화 전 선형 경로" 기준으로 남아
+    # 조건 입력과 학습 타깃이 서로 다른 경로를 가리키게 됩니다.
+    # 그 결과 perfect velocity를 예측해도 재구성이 정확히 target으로
+    # 돌아가지 않는 irreducible error floor가 생깁니다.
+    # 따라서 training OT path에서는 정규화를 하지 않고,
+    # 재구성 후/ODE 적분 후에만 정규화합니다.
     target_velocity = target - noise
     return noise, z_tau, tau, target_velocity
-
 
 
 def build_anchor_10hz_indices(

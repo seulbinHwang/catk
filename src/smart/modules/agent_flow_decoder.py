@@ -248,31 +248,44 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
         return seg_feat + tau_feat + seg_index_feat + context["ctx_feat"].unsqueeze(1)
 
     def flow_field(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        context: Dict[str, Tensor],
-        z: Tensor,
-        tau: Tensor,
+            self,
+            tokenized_agent: Dict[str, Tensor],
+            map_feature: Dict[str, Tensor],
+            context: Dict[str, Tensor],
+            z: Tensor,
+            tau: Tensor,
     ) -> Tensor:
         """현재 noisy future에서 velocity field를 예측합니다."""
-        z = normalize_sincos(z)
-        query = self.build_future_queries(context, z, tau)  # [n_agent, 4, hidden_dim]
+        # IMPORTANT:
+        # flow matching에서는 velocity target이 "정규화 전 선형 OT 경로"를 기준으로
+        # 정의됩니다. 따라서 query conditioning도 같은 raw `z`를 봐야 합니다.
+        # 여기서 미리 normalize를 해 버리면 모델은 다른 경로의 상태를 입력으로 받고,
+        # target velocity는 원래 경로를 향해 있어 학습이 일관되지 않습니다.
+        query = self.build_future_queries(context, z,
+                                          tau)  # [n_agent, 4, hidden_dim]
+
+        # 다만 sparse relation을 만들 때는 heading이 안정적이어야 하므로,
+        # geometry를 뽑아낼 때만 별도의 정규화 사본을 사용합니다.
+        geom_z = normalize_sincos(z)
         end_pos, end_head = segment_endpoint_pose_global(
-            segments_local=z,
+            segments_local=geom_z,
             current_pos=context["current_pos"],
             current_head=context["current_head"],
         )
-        head_vector = torch.stack([end_head.cos(), end_head.sin()], dim=-1)  # [n_agent, 4, 2]
-        mask = context["active_mask"].unsqueeze(1).expand(-1, self.n_future_segments)  # [n_agent, 4]
+        head_vector = torch.stack([end_head.cos(), end_head.sin()],
+                                  dim=-1)  # [n_agent, 4, 2]
+        mask = context["active_mask"].unsqueeze(1).expand(-1,
+                                                          self.n_future_segments)  # [n_agent, 4]
         n_agent = z.shape[0]
 
         batch_s = torch.cat(
-            [tokenized_agent["batch"] + tokenized_agent["num_graphs"] * t for t in range(self.n_future_segments)],
+            [tokenized_agent["batch"] + tokenized_agent["num_graphs"] * t for t
+             in range(self.n_future_segments)],
             dim=0,
         )  # [n_agent * 4]
         batch_pl = torch.cat(
-            [map_feature["batch"] + tokenized_agent["num_graphs"] * t for t in range(self.n_future_segments)],
+            [map_feature["batch"] + tokenized_agent["num_graphs"] * t for t in
+             range(self.n_future_segments)],
             dim=0,
         )  # [n_pl * 4]
 
@@ -299,17 +312,28 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             batch_s=batch_s,
             batch_pl=batch_pl,
         )
-        feat_map = map_feature["pt_token"].unsqueeze(0).expand(self.n_future_segments, -1, -1).flatten(0, 1)
+        feat_map = map_feature["pt_token"].unsqueeze(0).expand(
+            self.n_future_segments, -1, -1).flatten(0, 1)
         feat = query
         for i in range(self.num_layers):
             feat = feat.flatten(0, 1)
             feat = self.t_attn_layers[i](feat, r_t, edge_index_t)
-            feat = feat.view(n_agent, self.n_future_segments, -1).transpose(0, 1).flatten(0, 1)
-            feat = self.pt2a_attn_layers[i]((feat_map, feat), r_pl2a, edge_index_pl2a)
+            feat = feat.view(n_agent, self.n_future_segments, -1).transpose(0,
+                                                                            1).flatten(
+                0, 1)
+            feat = self.pt2a_attn_layers[i]((feat_map, feat), r_pl2a,
+                                            edge_index_pl2a)
             feat = self.a2a_attn_layers[i](feat, r_a2a, edge_index_a2a)
-            feat = feat.view(self.n_future_segments, n_agent, -1).transpose(0, 1)
-        velocity = self.segment_out_head(feat).view(n_agent, self.n_future_segments, self.segment_points, self.state_dim)
-        velocity = velocity * context["active_mask"].to(velocity.dtype).view(-1, 1, 1, 1)
+            feat = feat.view(self.n_future_segments, n_agent, -1).transpose(0,
+                                                                            1)
+
+        velocity = self.segment_out_head(feat).view(
+            n_agent, self.n_future_segments, self.segment_points, self.state_dim
+        )
+        velocity = velocity * context["active_mask"].to(velocity.dtype).view(-1,
+                                                                             1,
+                                                                             1,
+                                                                             1)
         velocity[:, 0, 0, 0] = 0.0
         velocity[:, 0, 0, 1] = 0.0
         velocity[:, 0, 0, 2] = 0.0
