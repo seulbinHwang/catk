@@ -176,18 +176,18 @@ $CACHE_ROOT/
 
 ### 4.2 Nubes 에서 캐시 다운로드
 
-이미 만들어진 pkl 캐시를 쓰고 싶다면 `download_smart_cache_from_nubes.sh` 를 사용할 수 있습니다.
+이미 만들어진 pkl 캐시를 쓰고 싶다면 `scripts/download_smart_cache_from_nubes.sh` 를 사용할 수 있습니다.
 
 기본 사용법:
 
 ```bash
-bash download_smart_cache_from_nubes.sh <remote_dir> <local_dir>
+bash scripts/download_smart_cache_from_nubes.sh <remote_dir> <local_dir>
 ```
 
 예시:
 
 ```bash
-bash download_smart_cache_from_nubes.sh \
+bash scripts/download_smart_cache_from_nubes.sh \
   labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
   "$CACHE_ROOT"
 ```
@@ -197,7 +197,7 @@ bash download_smart_cache_from_nubes.sh \
 ```bash
 REMOTE_DIR=labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
 LOCAL_DIR="$CACHE_ROOT" \
-bash download_smart_cache_from_nubes.sh
+bash scripts/download_smart_cache_from_nubes.sh
 ```
 
 주의:
@@ -476,7 +476,7 @@ python -m src.run \
 - `validation_tfrecords_splitted/` 가 없으면 로컬 평가와 mp4 저장이 실패합니다.
 - `ffmpeg` 가 없으면 mp4 저장이 실패합니다.
 - W&B artifact 를 쓰는 평가 머신에서도 `wandb login` 또는 `WANDB_API_KEY` 가 필요합니다.
-- `download_smart_cache_from_nubes.sh` 는 대상 디렉터리 내용을 비우므로 경로를 잘 확인해야 합니다.
+- `scripts/download_smart_cache_from_nubes.sh` 는 대상 디렉터리 내용을 비우므로 경로를 잘 확인해야 합니다.
 
 ## 11. 최소 실행 순서 요약
 
