@@ -41,6 +41,86 @@ _detect_cpuset() {
   echo ""
 }
 
+_count_cpus_in_list() {
+  local cpu_list="$1"
+  local total=0
+  local part
+  local start
+  local end
+
+  if [[ -z "$cpu_list" ]]; then
+    echo "0"
+    return
+  fi
+
+  IFS=',' read -ra parts <<< "$cpu_list"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      start="${part%-*}"
+      end="${part#*-}"
+      total=$(( total + end - start + 1 ))
+    else
+      total=$(( total + 1 ))
+    fi
+  done
+
+  echo "$total"
+}
+
+_detect_available_cpus() {
+  local quota
+  local period
+  local cpus
+
+  if [[ -n "${NUM_CPUS:-}" ]]; then
+    CPU_DETECTION_SOURCE="NUM_CPUS"
+    AVAILABLE_CPUS="$NUM_CPUS"
+    return
+  fi
+
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max || true
+    if [[ -n "${quota:-}" && -n "${period:-}" && "$quota" != "max" && "$period" -gt 0 ]]; then
+      cpus=$(( quota / period ))
+      if [[ "$cpus" -gt 0 ]]; then
+        CPU_DETECTION_SOURCE="cgroup_cpu.max"
+        AVAILABLE_CPUS="$cpus"
+        return
+      fi
+    fi
+  fi
+
+  if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    quota="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+    period="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+    if [[ -n "${quota:-}" && -n "${period:-}" && "$quota" -gt 0 && "$period" -gt 0 ]]; then
+      cpus=$(( quota / period ))
+      if [[ "$cpus" -gt 0 ]]; then
+        CPU_DETECTION_SOURCE="cgroup_cfs"
+        AVAILABLE_CPUS="$cpus"
+        return
+      fi
+    fi
+  fi
+
+  cpus="$(nproc 2>/dev/null || true)"
+  if [[ -n "${cpus:-}" && "$cpus" -gt 0 ]]; then
+    CPU_DETECTION_SOURCE="nproc"
+    AVAILABLE_CPUS="$cpus"
+    return
+  fi
+
+  cpus="$(_count_cpus_in_list "$ACTIVE_CPUSET")"
+  if [[ "$cpus" -gt 0 ]]; then
+    CPU_DETECTION_SOURCE="taskset"
+    AVAILABLE_CPUS="$cpus"
+    return
+  fi
+
+  CPU_DETECTION_SOURCE="fallback"
+  AVAILABLE_CPUS="1"
+}
+
 _run_pinned() {
   if [[ -n "$ACTIVE_CPUSET" ]] && command -v taskset >/dev/null 2>&1; then
     taskset -c "$ACTIVE_CPUSET" "$@"
@@ -50,7 +130,9 @@ _run_pinned() {
 }
 
 ACTIVE_CPUSET="$(_detect_cpuset)"
-AVAILABLE_CPUS="${NUM_CPUS:-$(nproc)}"
+CPU_DETECTION_SOURCE=""
+AVAILABLE_CPUS=""
+_detect_available_cpus
 
 export DP_MAX_CPUS="${AVAILABLE_CPUS}"
 
@@ -73,7 +155,7 @@ fi
 CPU_USAGE_PERCENT=$(awk "BEGIN { printf \"%.1f\", 100 * $NUBES_JOBS / $AVAILABLE_CPUS }")
 
 echo "[SMART_CACHE_DOWNLOAD] CPUSET=${ACTIVE_CPUSET:-auto}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
-echo "[SMART_CACHE_DOWNLOAD] available_cpus=${AVAILABLE_CPUS}, chosen_download_jobs=${NUBES_JOBS}, cpu_usage_percent=${CPU_USAGE_PERCENT}%"
+echo "[SMART_CACHE_DOWNLOAD] available_cpus=${AVAILABLE_CPUS}, chosen_download_jobs=${NUBES_JOBS}, cpu_usage_percent=${CPU_USAGE_PERCENT}%, cpu_detection_source=${CPU_DETECTION_SOURCE}"
 
 _format_hours_minutes() {
   local seconds="$1"
