@@ -11,6 +11,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import os
 import math
 import multiprocessing
 import threading
@@ -20,6 +21,8 @@ from argparse import ArgumentParser
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import numpy as np
 import pandas as pd
@@ -31,6 +34,8 @@ from waymo_open_dataset.protos import scenario_pb2
 
 from src.smart.utils.geometry import wrap_angle
 from src.smart.utils.preprocess import get_polylines_from_polygon, preprocess_map
+
+tf.get_logger().setLevel("ERROR")
 
 # agent_types = {0: "vehicle", 1: "pedestrian", 2: "cyclist"}
 # agent_roles = {0: "ego_vehicle", 1: "interest", 2: "predict"}
