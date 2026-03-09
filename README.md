@@ -239,6 +239,23 @@ CACHE_ROOT="$CACHE_ROOT" NPROC_PER_NODE=6 TRAINER_DEVICES=6 bash scripts/train_f
 
 이 실험은 기본적으로 6 GPU 기준입니다. GPU 수가 다르면 `NPROC_PER_NODE`, `trainer.devices`, 필요시 batch size 를 함께 조정하십시오.
 
+batch size 를 바꿔가며 실험하려면 아래처럼 override 하면 됩니다.
+
+```bash
+torchrun \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=flow_pretrain_h1006 \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_pretrain_bs8 \
+  data.train_batch_size=8 \
+  data.val_batch_size=8
+```
+
+예를 들어 `12 -> 10 -> 8 -> 6` 순서로 줄여보면 됩니다.
+메모리 여유를 보면서 조절하려면 별도 터미널에서 `watch -n 1 'nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits'` 를 같이 보면 됩니다.
+
 학습 결과는 아래에 저장됩니다.
 
 - 로그 루트: `logs/flow_pretrain_h1006/runs/<YYYY-MM-DD>_<HH-MM-SS>/`
