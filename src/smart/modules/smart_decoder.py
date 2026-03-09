@@ -3,31 +3,26 @@
 # NVIDIA-proprietary are not a contribution and subject to the following terms and conditions:
 # SPDX-FileCopyrightText: Copyright (c) <year> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
 
 from typing import Dict, Optional
 
 import torch.nn as nn
-from omegaconf import DictConfig
 from torch import Tensor
 
-from .agent_decoder import SMARTAgentDecoder
+from .agent_flow_decoder import SMARTAgentFlowDecoder
 from .map_decoder import SMARTMapDecoder
 
 
 class SMARTDecoder(nn.Module):
+    """SMART map encoder와 flow agent decoder를 묶는 얇은 래퍼입니다."""
 
     def __init__(
         self,
         hidden_dim: int,
         num_historical_steps: int,
         num_future_steps: int,
+        future_window_steps: int,
+        anchor_chunk_k: int,
         pl2pl_radius: float,
         time_span: Optional[int],
         pl2a_radius: float,
@@ -40,8 +35,9 @@ class SMARTDecoder(nn.Module):
         dropout: float,
         hist_drop_prob: float,
         n_token_agent: int,
+        history_slots: int = 6,
     ) -> None:
-        super(SMARTDecoder, self).__init__()
+        super().__init__()
         self.map_encoder = SMARTMapDecoder(
             hidden_dim=hidden_dim,
             pl2pl_radius=pl2pl_radius,
@@ -51,10 +47,11 @@ class SMARTDecoder(nn.Module):
             head_dim=head_dim,
             dropout=dropout,
         )
-        self.agent_encoder = SMARTAgentDecoder(
+        self.agent_encoder = SMARTAgentFlowDecoder(
             hidden_dim=hidden_dim,
             num_historical_steps=num_historical_steps,
             num_future_steps=num_future_steps,
+            future_window_steps=future_window_steps,
             time_span=time_span,
             pl2a_radius=pl2a_radius,
             a2a_radius=a2a_radius,
@@ -65,23 +62,55 @@ class SMARTDecoder(nn.Module):
             dropout=dropout,
             hist_drop_prob=hist_drop_prob,
             n_token_agent=n_token_agent,
+            history_slots=history_slots,
         )
 
     def forward(
-        self, tokenized_map: Dict[str, Tensor], tokenized_agent: Dict[str, Tensor]
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        data,
+        anchor_10hz: int,
+        sampling_cfg,
     ) -> Dict[str, Tensor]:
+        """open-loop anchor 하나를 학습할 때 사용합니다."""
         map_feature = self.map_encoder(tokenized_map)
-        pred_dict = self.agent_encoder(tokenized_agent, map_feature)
-        return pred_dict
+        return self.agent_encoder(tokenized_agent, map_feature, data, anchor_10hz, sampling_cfg)
+
+    def rollout(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        sampling_cfg,
+        data=None,
+        rollout_steps: Optional[int] = None,
+        return_targets: bool = False,
+    ) -> Dict[str, Tensor]:
+        """closed-loop rollout을 수행합니다."""
+        map_feature = self.map_encoder(tokenized_map)
+        return self.agent_encoder.rollout(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_cfg=sampling_cfg,
+            data=data,
+            rollout_steps=rollout_steps,
+            return_targets=return_targets,
+        )
 
     def inference(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-        sampling_scheme: DictConfig,
+        sampling_cfg,
+        data=None,
+        rollout_steps: Optional[int] = None,
     ) -> Dict[str, Tensor]:
-        map_feature = self.map_encoder(tokenized_map)
-        pred_dict = self.agent_encoder.inference(
-            tokenized_agent, map_feature, sampling_scheme
+        """기존 호출과의 호환을 위한 alias입니다."""
+        return self.rollout(
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
+            sampling_cfg=sampling_cfg,
+            data=data,
+            rollout_steps=rollout_steps,
+            return_targets=False,
         )
-        return pred_dict
