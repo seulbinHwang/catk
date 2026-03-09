@@ -11,7 +11,10 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import math
 import multiprocessing
+import threading
+import time
 import pickle
 from argparse import ArgumentParser
 from functools import partial
@@ -55,6 +58,93 @@ _polygon_light_type = [
     "LANE_STATE_GO",
     "LANE_STATE_CAUTION",
 ]
+
+_PROGRESS_COUNTER = None
+
+
+def _init_worker(progress_counter) -> None:
+    global _PROGRESS_COUNTER
+    _PROGRESS_COUNTER = progress_counter
+
+
+def _increment_progress(delta: int = 1) -> None:
+    if _PROGRESS_COUNTER is None:
+        return
+    with _PROGRESS_COUNTER.get_lock():
+        _PROGRESS_COUNTER.value += delta
+
+
+def _format_hours_minutes(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "unknown"
+    total_minutes = int(seconds // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _print_progress(
+    split: str,
+    total_expected: int,
+    current_count: int,
+    start_count: int,
+    start_time: float,
+) -> None:
+    percent = 100.0 * current_count / total_expected if total_expected > 0 else 0.0
+    elapsed_seconds = time.time() - start_time
+    processed_this_run = max(current_count - start_count, 0)
+    rate = processed_this_run / elapsed_seconds if elapsed_seconds > 0 else 0.0
+    remaining = max(total_expected - current_count, 0)
+    eta_seconds = remaining / rate if rate > 0 else float("inf")
+    print(
+        "[preprocess-progress] "
+        f"split={split} total_expected={total_expected} "
+        f"generated={current_count} percent={percent:.2f}% "
+        f"elapsed={_format_hours_minutes(elapsed_seconds)} "
+        f"eta={_format_hours_minutes(eta_seconds)}",
+        flush=True,
+    )
+
+
+def _progress_monitor(
+    split: str,
+    total_expected: int,
+    progress_counter,
+    start_count: int,
+    start_time: float,
+    interval_sec: int,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.wait(interval_sec):
+        with progress_counter.get_lock():
+            current_count = progress_counter.value
+        _print_progress(split, total_expected, current_count, start_count, start_time)
+
+
+def _count_records_in_tfrecord(file_path: str) -> int:
+    return sum(1 for _ in tf.compat.v1.io.tf_record_iterator(file_path))
+
+
+def _count_total_expected(packages: List[str], num_workers: int) -> int:
+    count_workers = max(1, min(num_workers, multiprocessing.cpu_count()))
+    with multiprocessing.Pool(count_workers) as pool:
+        counts = pool.imap_unordered(_count_records_in_tfrecord, packages, chunksize=8)
+        return sum(tqdm(counts, total=len(packages), desc="counting scenarios"))
+
+
+def _count_existing_pickles(output_dir: Path) -> int:
+    return sum(1 for _ in output_dir.glob("*.pkl"))
+
+
+def _done_marker_path(state_dir: Path, file_path: str) -> Path:
+    return state_dir / (Path(file_path).name + ".done")
+
+
+def _write_done_marker(marker_path: Path, processed_count: int) -> None:
+    marker_path.parent.mkdir(exist_ok=True, parents=True)
+    tmp_path = marker_path.with_suffix(marker_path.suffix + ".tmp")
+    with open(tmp_path, "w") as f:
+        f.write(str(processed_count))
+    tmp_path.replace(marker_path)
 
 
 def get_agent_features(
@@ -441,12 +531,20 @@ def decode_dynamic_map_states_from_proto(dynamic_map_states):
     return dynamic_map_infos
 
 
-def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
-    dataset = tf.data.TFRecordDataset(
-        file_path, compression_type="", num_parallel_reads=3
-    )
-    for tf_data in dataset:
-        tf_data = tf_data.numpy()
+def wm2argo(
+    file_path,
+    split,
+    output_dir,
+    output_dir_tfrecords_splitted,
+    state_dir,
+    force_reprocess,
+):
+    marker_path = _done_marker_path(state_dir, file_path)
+    if marker_path.exists() and not force_reprocess:
+        return 0
+
+    processed_count = 0
+    for tf_data in tf.compat.v1.io.tf_record_iterator(file_path):
         scenario = scenario_pb2.Scenario()
         scenario.ParseFromString(bytes(tf_data))
 
@@ -472,15 +570,28 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
 
         data["scenario_id"] = scenario_id
         with open(output_dir / f"{scenario_id}.pkl", "wb+") as f:
-            pickle.dump(data, f)
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         if output_dir_tfrecords_splitted is not None:
             file_name = output_dir_tfrecords_splitted / f"{scenario_id}.tfrecords"
             with tf.io.TFRecordWriter(file_name.as_posix()) as file_writer:
                 file_writer.write(tf_data)
 
+        processed_count += 1
+        _increment_progress(1)
 
-def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
+    _write_done_marker(marker_path, processed_count)
+    return processed_count
+
+
+def batch_process9s_transformer(
+    input_dir,
+    output_dir,
+    split,
+    num_workers,
+    progress_interval_sec=180,
+    force_reprocess=False,
+):
     output_dir = Path(output_dir)
     output_dir_tfrecords_splitted = None
     if split == "validation":
@@ -488,18 +599,67 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
         output_dir_tfrecords_splitted.mkdir(exist_ok=True, parents=True)
     output_dir = output_dir / split
     output_dir.mkdir(exist_ok=True, parents=True)
+    state_dir = output_dir.parent / ".preprocess_state" / split
+    state_dir.mkdir(exist_ok=True, parents=True)
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
+    total_expected = _count_total_expected(packages, num_workers)
+    existing_count = _count_existing_pickles(output_dir)
+    progress_counter = multiprocessing.Value("Q", existing_count)
+    start_time = time.time()
+
+    print(
+        f"[preprocess-start] split={split} total_expected={total_expected} "
+        f"existing={existing_count} progress_interval_sec={progress_interval_sec}",
+        flush=True,
+    )
+    _print_progress(split, total_expected, existing_count, existing_count, start_time)
+
+    stop_event = threading.Event()
+    monitor_thread = threading.Thread(
+        target=_progress_monitor,
+        args=(
+            split,
+            total_expected,
+            progress_counter,
+            existing_count,
+            start_time,
+            progress_interval_sec,
+            stop_event,
+        ),
+        daemon=True,
+    )
+    monitor_thread.start()
+
     func = partial(
         wm2argo,
         split=split,
         output_dir=output_dir,
         output_dir_tfrecords_splitted=output_dir_tfrecords_splitted,
+        state_dir=state_dir,
+        force_reprocess=force_reprocess,
     )
+    try:
+        with multiprocessing.Pool(
+            num_workers,
+            initializer=_init_worker,
+            initargs=(progress_counter,),
+        ) as p:
+            list(
+                tqdm(
+                    p.imap_unordered(func, packages, chunksize=8),
+                    total=len(packages),
+                    desc=f"packages:{split}",
+                )
+            )
+    finally:
+        stop_event.set()
+        monitor_thread.join(timeout=1.0)
 
-    with multiprocessing.Pool(num_workers) as p:
-        r = list(tqdm(p.imap_unordered(func, packages), total=len(packages)))
+    with progress_counter.get_lock():
+        final_count = progress_counter.value
+    _print_progress(split, total_expected, final_count, existing_count, start_time)
 
 
 if __name__ == "__main__":
@@ -514,8 +674,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--progress_interval_sec", type=int, default=180)
+    parser.add_argument(
+        "--force_reprocess",
+        action="store_true",
+        help="Ignore completed tfrecord markers and rebuild all scenarios.",
+    )
     args = parser.parse_args()
 
     batch_process9s_transformer(
-        args.input_dir, args.output_dir, args.split, num_workers=args.num_workers
+        args.input_dir,
+        args.output_dir,
+        args.split,
+        num_workers=args.num_workers,
+        progress_interval_sec=args.progress_interval_sec,
+        force_reprocess=args.force_reprocess,
     )

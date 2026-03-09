@@ -58,6 +58,78 @@ export WANDB_MODE=offline
 
 온라인 로깅을 쓰려면 `configs/logger/wandb.yaml` 의 `entity` 값을 실제 계정으로 바꾸십시오.
 
+### 1.1 W&B 상세 사용법
+
+이 저장소의 W&B 기본 설정은 [configs/logger/wandb.yaml](/home/user/PycharmProjects/catk/configs/logger/wandb.yaml) 에 있습니다.
+
+- logger type: `lightning.pytorch.loggers.wandb.WandbLogger`
+- 기본 project: `clsft-catk`
+- run name: `task_name` 값
+- 기본 resume 정책: `resume: allow`
+- 코드에서 `WandbLogger` 사용 시 `watch(model, log="all")` 이 자동 실행됩니다.
+
+또한 실행 종료 시 [src/run.py](/home/user/PycharmProjects/catk/src/run.py) 에서 `wandb.finish()` 를 호출합니다.
+
+온라인 로깅을 정확히 쓰는 순서:
+
+1. W&B 로그인
+
+```bash
+wandb login
+```
+
+2. 실행 시 온라인 모드 명시
+
+스크립트 실행(권장):
+
+```bash
+WANDB_OFFLINE=False WANDB_ENTITY=<your_wandb_entity> CACHE_ROOT="$CACHE_ROOT" bash scripts/train_flow_h1006.sh
+```
+
+직접 실행:
+
+```bash
+python -m src.run \
+  experiment=flow_local_val \
+  action=validate \
+  ckpt_path=/absolute/path/to/model.ckpt \
+  logger.wandb.offline=False \
+  logger.wandb.entity=<your_wandb_entity> \
+  logger.wandb.project=clsft-catk \
+  task_name=flow_local_val_online
+```
+
+오프라인 로깅:
+
+- 스크립트 기본값은 `WANDB_OFFLINE=True` 입니다.
+- 직접 실행에서는 `logger.wandb.offline=True` 를 넣으면 됩니다.
+- 오프라인 런 파일은 각 hydra output dir 아래 `wandb/` 폴더에 저장됩니다.
+
+오프라인 결과를 나중에 업로드:
+
+```bash
+wandb sync logs/<task_name>/runs/<YYYY-MM-DD>_<HH-MM-SS>/wandb/offline-run-*
+```
+
+중단된 W&B run 재개:
+
+```bash
+python -m src.run \
+  experiment=flow_pretrain_h1006 \
+  action=fit \
+  ckpt_path=/absolute/path/to/last.ckpt \
+  logger.wandb.offline=False \
+  logger.wandb.entity=<your_wandb_entity> \
+  logger.wandb.id=<existing_wandb_run_id> \
+  logger.wandb.resume=must \
+  task_name=flow_pretrain_h1006_resume
+```
+
+참고:
+
+- 체크포인트 재개(`ckpt_path`)와 W&B run 재개(`logger.wandb.id`, `logger.wandb.resume`)는 별개입니다. 둘 다 넣어야 학습 상태와 W&B 런이 동시에 이어집니다.
+- 평가 시 mp4를 생성하면 모델 코드에서 `self.logger.log_video(...)` 를 호출해 W&B에 비디오를 같이 업로드합니다.
+
 ## 2. Waymo 데이터 다운로드
 
 이 저장소는 Waymo Open Motion Dataset의 scenario proto TFRecord를 사용합니다. 공식 다운로드 페이지에서 Motion dataset의 scenario 데이터를 받아 아래 구조로 정리하십시오.
@@ -90,19 +162,19 @@ export CACHE_ROOT=/path/to/SMART_cache
 ```bash
 python -m src.data_preprocess \
   --split training \
-  --num_workers 12 \
+  --num_workers 56 \
   --input_dir "$RAW_ROOT" \
   --output_dir "$CACHE_ROOT"
 
 python -m src.data_preprocess \
   --split validation \
-  --num_workers 12 \
+  --num_workers 56 \
   --input_dir "$RAW_ROOT" \
   --output_dir "$CACHE_ROOT"
 
 python -m src.data_preprocess \
   --split testing \
-  --num_workers 12 \
+  --num_workers 56 \
   --input_dir "$RAW_ROOT" \
   --output_dir "$CACHE_ROOT"
 ```
