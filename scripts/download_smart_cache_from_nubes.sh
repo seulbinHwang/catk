@@ -70,7 +70,10 @@ if [[ "$NUBES_JOBS" -lt 1 ]]; then
   NUBES_JOBS=1
 fi
 
-echo "[SMART_CACHE_DOWNLOAD] CPUSET=${ACTIVE_CPUSET:-auto}, DP_MAX_CPUS=${DP_MAX_CPUS}, NUBES_JOBS=${NUBES_JOBS}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
+CPU_USAGE_PERCENT=$(awk "BEGIN { printf \"%.1f\", 100 * $NUBES_JOBS / $AVAILABLE_CPUS }")
+
+echo "[SMART_CACHE_DOWNLOAD] CPUSET=${ACTIVE_CPUSET:-auto}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
+echo "[SMART_CACHE_DOWNLOAD] available_cpus=${AVAILABLE_CPUS}, chosen_download_jobs=${NUBES_JOBS}, cpu_usage_percent=${CPU_USAGE_PERCENT}%"
 
 _format_hours_minutes() {
   local seconds="$1"
