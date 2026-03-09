@@ -21,7 +21,10 @@ if command -v taskset >/dev/null 2>&1; then
   taskset -cp "${CPUSET}" $$ >/dev/null
 fi
 
-echo "[SMART_CACHE_UPLOAD] Using CPUSET=${CPUSET}, NUM_CPUS=${NUM_CPUS}, NUM_CPUS_FOR_USE=${NUM_CPUS_FOR_USE}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
+CPU_USAGE_PERCENT=$(awk "BEGIN { printf \"%.1f\", 100 * $NUM_CPUS_FOR_USE / $NUM_CPUS }")
+
+echo "[SMART_CACHE_UPLOAD] CPUSET=${CPUSET}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
+echo "[SMART_CACHE_UPLOAD] available_cpus=${NUM_CPUS}, chosen_upload_jobs=${NUM_CPUS_FOR_USE}, cpu_usage_percent=${CPU_USAGE_PERCENT}%"
 
 LOCAL_DIR="${LOCAL_DIR:-/media/user/E/dataset/womd_v1_3/SMART_cache}"
 REMOTE_DIR="${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache}"
