@@ -16,6 +16,7 @@ ckpt_path: null
 logger:
   wandb:
     log_model: all
+    project: SMART-FLOW
 
 callbacks:
   model_checkpoint:
