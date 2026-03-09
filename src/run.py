@@ -117,6 +117,29 @@ def resolve_ckpt_path(cfg: DictConfig) -> str | None:
     return ckpt_path
 
 
+def terminate_torchrun_worker_group() -> None:
+    if "LOCAL_RANK" not in os.environ:
+        return
+
+    try:
+        parent_cmdline = (
+            Path(f"/proc/{os.getppid()}/cmdline")
+            .read_bytes()
+            .replace(b"\x00", b" ")
+            .decode("utf-8", errors="ignore")
+        )
+    except OSError:
+        parent_cmdline = ""
+
+    if "torchrun" not in parent_cmdline and "torch.distributed.run" not in parent_cmdline:
+        return
+
+    try:
+        os.killpg(os.getpgrp(), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
 def install_wandb_signal_handlers() -> None:
     def _finish_wandb(signum, _frame) -> None:
         try:
@@ -202,7 +225,12 @@ def main(cfg: DictConfig) -> None:
     log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
     print_config_tree(cfg, resolve=True, save_to_file=True)
 
-    run(cfg)  # train/val/test the model
+    try:
+        run(cfg)  # train/val/test the model
+    except Exception:
+        log.exception("Run failed. Terminating torchrun worker group.")
+        terminate_torchrun_worker_group()
+        raise
 
     log.info("Closing wandb!")
     wandb.finish()
