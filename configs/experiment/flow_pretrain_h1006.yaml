@@ -5,6 +5,7 @@ defaults:
 model:
   model_config:
     lr: 5e-4
+    lr_warmup_steps: 4
     lr_min_ratio: 1e-2
     val_open_loop: true
     val_closed_loop: false

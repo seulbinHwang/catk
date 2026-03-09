@@ -69,6 +69,10 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             hist_drop_prob=hist_drop_prob,
             n_token_agent=n_token_agent,
         )
+        # Flow pretraining/fine-tuning never uses the legacy next-token classifier head.
+        # Leaving it trainable creates DDP-ununsed parameters for the flow path.
+        for p in self.token_predict_head.parameters():
+            p.requires_grad = False
         self.future_window_steps = future_window_steps
         self.history_slots = history_slots
         self.n_future_segments = 4

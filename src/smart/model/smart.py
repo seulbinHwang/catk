@@ -291,26 +291,34 @@ class SMART(LightningModule):
                 self.wosac_submission.save_sub_file()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=self.lr)
 
         def lr_lambda(current_step):
-            current_step = self.current_epoch + 1
+            current_step = max(int(current_step), 0)
             if current_step < self.lr_warmup_steps:
                 return self.lr_min_ratio + (1 - self.lr_min_ratio) * current_step / self.lr_warmup_steps
+            decay_steps = max(self.lr_total_steps - self.lr_warmup_steps, 1)
             return self.lr_min_ratio + 0.5 * (1 - self.lr_min_ratio) * (
                 1.0
                 + math.cos(
                     math.pi
                     * min(
                         1.0,
-                        (current_step - self.lr_warmup_steps)
-                        / (self.lr_total_steps - self.lr_warmup_steps),
+                        (current_step - self.lr_warmup_steps) / decay_steps,
                     )
                 )
             )
 
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-        return [optimizer], [lr_scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": lr_scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
