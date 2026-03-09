@@ -494,14 +494,15 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
                 current_pos=state["current_pos"],
                 current_head=state["current_head"],
             )
-            active = context["active_mask"].unsqueeze(-1)
+            active_traj = context["active_mask"].unsqueeze(-1).unsqueeze(-1)
+            active_head = context["active_mask"].unsqueeze(-1)
             pred_traj_10hz[:, step * self.shift : (step + 1) * self.shift] = torch.where(
-                active,
+                active_traj,
                 pos_global[:, 1:],
                 pred_traj_10hz[:, step * self.shift : (step + 1) * self.shift],
             )
             pred_head_10hz[:, step * self.shift : (step + 1) * self.shift] = torch.where(
-                context["active_mask"].unsqueeze(-1),
+                active_head,
                 head_global[:, 1:],
                 pred_head_10hz[:, step * self.shift : (step + 1) * self.shift],
             )
