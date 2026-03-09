@@ -1,18 +1,35 @@
-#!/bin/sh
+#!/usr/bin/env bash
+set -euo pipefail
+
 export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-MY_EXPERIMENT="pre_bc"
-MY_TASK_NAME=$MY_EXPERIMENT"-debug"
+EXPERIMENT="${EXPERIMENT:-pre_bc}"
+TASK_NAME="${TASK_NAME:-$EXPERIMENT-debug}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+TRAINER_DEVICES="${TRAINER_DEVICES:-$NPROC_PER_NODE}"
+CACHE_ROOT="${CACHE_ROOT:-}"
+WANDB_OFFLINE="${WANDB_OFFLINE:-True}"
+WANDB_ENTITY="${WANDB_ENTITY:-null}"
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate catk
-torchrun \
-  -m src.run \
-  experiment=$MY_EXPERIMENT \
-  task_name=$MY_TASK_NAME
+cmd=(
+  torchrun
+  --nproc_per_node="$NPROC_PER_NODE"
+  -m src.run
+  experiment="$EXPERIMENT"
+  trainer.devices="$TRAINER_DEVICES"
+  logger.wandb.offline="$WANDB_OFFLINE"
+  logger.wandb.entity="$WANDB_ENTITY"
+  task_name="$TASK_NAME"
+)
+
+if [[ -n "$CACHE_ROOT" ]]; then
+  cmd+=(paths.cache_root="$CACHE_ROOT")
+fi
+
+"${cmd[@]}"
 
 # ! below is for training with ddp
 # torchrun \
@@ -26,4 +43,4 @@ torchrun \
 #   trainer=ddp \
 #   task_name=$MY_TASK_NAME
 
-echo "bash train.sh done!"
+echo "bash scripts/train.sh done!"

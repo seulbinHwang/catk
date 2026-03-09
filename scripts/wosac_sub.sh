@@ -1,19 +1,40 @@
-#!/bin/sh
+#!/usr/bin/env bash
+set -euo pipefail
+
 export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 
-ACTION=validate # validate, test
-MY_EXPERIMENT="wosac_sub"
-MY_TASK_NAME=$MY_EXPERIMENT-$ACTION"-debug"
+ACTION="${1:-${ACTION:-validate}}"
+case "$ACTION" in
+  validate|test) ;;
+  *)
+    echo "Invalid action: $ACTION (expected: validate or test)"
+    exit 1
+    ;;
+esac
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate catk
-python \
-  -m src.run \
-  experiment=$MY_EXPERIMENT \
-  action=$ACTION \
-  task_name=$MY_TASK_NAME
+EXPERIMENT="${EXPERIMENT:-wosac_sub}"
+TASK_NAME="${TASK_NAME:-$EXPERIMENT-$ACTION-debug}"
+CACHE_ROOT="${CACHE_ROOT:-}"
+WANDB_OFFLINE="${WANDB_OFFLINE:-True}"
+WANDB_ENTITY="${WANDB_ENTITY:-null}"
+
+cmd=(
+  python
+  -m src.run
+  experiment="$EXPERIMENT"
+  action="$ACTION"
+  logger.wandb.offline="$WANDB_OFFLINE"
+  logger.wandb.entity="$WANDB_ENTITY"
+  task_name="$TASK_NAME"
+)
+
+if [[ -n "$CACHE_ROOT" ]]; then
+  cmd+=(paths.cache_root="$CACHE_ROOT")
+fi
+
+"${cmd[@]}"
 
 # below is for training with ddp
 # torchrun \
@@ -28,4 +49,4 @@ python \
 #   action=$ACTION \
 #   task_name=$MY_TASK_NAME
 
-echo bash $ACTION done!
+echo "bash scripts/wosac_sub.sh $ACTION done!"
