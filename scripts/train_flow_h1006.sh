@@ -11,8 +11,17 @@ TASK_NAME="${TASK_NAME:-$EXPERIMENT}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
 TRAINER_DEVICES="${TRAINER_DEVICES:-$NPROC_PER_NODE}"
 CACHE_ROOT="${CACHE_ROOT:-}"
-WANDB_OFFLINE="${WANDB_OFFLINE:-True}"
-WANDB_ENTITY="${WANDB_ENTITY:-null}"
+WANDB_MODE="${WANDB_MODE:-online}"
+WANDB_PROJECT="${WANDB_PROJECT:-SMART-FLOW}"
+WANDB_ENTITY="${WANDB_ENTITY:-jksg01019-naver-labs}"
+
+if [[ -n "${WANDB_OFFLINE:-}" ]]; then
+  _wandb_offline="$WANDB_OFFLINE"
+elif [[ "$WANDB_MODE" == "offline" || "$WANDB_MODE" == "disabled" ]]; then
+  _wandb_offline="True"
+else
+  _wandb_offline="False"
+fi
 
 cmd=(
   torchrun
@@ -20,7 +29,8 @@ cmd=(
   -m src.run
   experiment="$EXPERIMENT"
   trainer.devices="$TRAINER_DEVICES"
-  logger.wandb.offline="$WANDB_OFFLINE"
+  logger.wandb.offline="$_wandb_offline"
+  logger.wandb.project="$WANDB_PROJECT"
   logger.wandb.entity="$WANDB_ENTITY"
   task_name="$TASK_NAME"
 )
