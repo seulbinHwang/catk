@@ -12,8 +12,12 @@
 # its affiliates is strictly prohibited.
 
 import os
+import signal
 from pathlib import Path
 from typing import List
+
+os.environ.setdefault("WANDB_SILENT", "true")
+os.environ.setdefault("WANDB_CONSOLE", "off")
 
 import hydra
 import lightning as L
@@ -113,6 +117,18 @@ def resolve_ckpt_path(cfg: DictConfig) -> str | None:
     return ckpt_path
 
 
+def install_wandb_signal_handlers() -> None:
+    def _finish_wandb(signum, _frame) -> None:
+        try:
+            wandb.finish(exit_code=128 + signum)
+        except Exception:
+            pass
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, _finish_wandb)
+    signal.signal(signal.SIGTERM, _finish_wandb)
+
+
 def run(cfg: DictConfig) -> None:
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
@@ -181,6 +197,7 @@ def run(cfg: DictConfig) -> None:
 @hydra.main(config_path="../configs/", config_name="run.yaml", version_base=None)
 def main(cfg: DictConfig) -> None:
     torch.set_printoptions(precision=3)
+    install_wandb_signal_handlers()
 
     log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
     print_config_tree(cfg, resolve=True, save_to_file=True)
