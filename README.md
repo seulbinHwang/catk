@@ -204,10 +204,10 @@ bash scripts/download_smart_cache_from_nubes.sh
 
 - `nubescli` 가 PATH 에 있어야 합니다.
 - 스크립트는 `nubescli dir-download -s` 를 사용하므로, 이미 있는 로컬 파일은 유지하고 없는 파일만 다운로드합니다.
-- 실행 중에는 원격 전체 파일 수 대비 현재 로컬에 존재하는 파일 수를 기준으로 진행률을 1분마다 출력합니다.
+- 실행 중에는 원격 전체 파일 수 대비 현재 `LOCAL_DIR` 아래에 존재하는 파일 수를 기준으로 진행률을 1분마다 출력합니다.
 - 진행률 로그에는 `percent`, `elapsed`, `eta` 가 함께 표시됩니다.
 - 스크립트는 현재 프로세스에 할당된 CPU 수를 자동 감지해 다운로드 동시성을 정합니다. 예를 들어 32 CPU 환경에서는 기본적으로 `NUBES_JOBS=24` 를 사용합니다.
-- 필요하면 `NUBES_JOBS`, `CPUSET`, `PROGRESS_INTERVAL_SEC` 를 환경변수로 override 할 수 있습니다.
+- 필요하면 `NUBES_JOBS`, `NUM_CPUS`, `CPUSET`, `PROGRESS_INTERVAL_SEC` 를 환경변수로 override 할 수 있습니다.
 - `CACHE_ROOT` 로 사용할 경로를 그대로 `LOCAL_DIR` 로 넘기는 것이 가장 단순합니다.
 
 ## 5. Open-Loop Pretraining

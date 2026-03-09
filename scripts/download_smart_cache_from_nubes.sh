@@ -27,32 +27,6 @@ fi
 
 mkdir -p "$LOCAL_DIR"
 
-_count_cpus_in_set() {
-  local cpu_set="$1"
-  local total=0
-  local part
-  local start
-  local end
-
-  if [[ -z "$cpu_set" ]]; then
-    echo "0"
-    return
-  fi
-
-  IFS=',' read -ra parts <<< "$cpu_set"
-  for part in "${parts[@]}"; do
-    if [[ "$part" == *-* ]]; then
-      start="${part%-*}"
-      end="${part#*-}"
-      total=$(( total + end - start + 1 ))
-    else
-      total=$(( total + 1 ))
-    fi
-  done
-
-  echo "$total"
-}
-
 _detect_cpuset() {
   if [[ -n "$CPUSET" ]]; then
     echo "$CPUSET"
@@ -76,10 +50,7 @@ _run_pinned() {
 }
 
 ACTIVE_CPUSET="$(_detect_cpuset)"
-AVAILABLE_CPUS="$(_count_cpus_in_set "$ACTIVE_CPUSET")"
-if [[ "$AVAILABLE_CPUS" -le 0 ]]; then
-  AVAILABLE_CPUS="$(nproc)"
-fi
+AVAILABLE_CPUS="${NUM_CPUS:-$(nproc)}"
 
 export DP_MAX_CPUS="${AVAILABLE_CPUS}"
 
@@ -118,24 +89,13 @@ _format_hours_minutes() {
   printf "%dh %dm" "$hours" "$minutes"
 }
 
-_count_existing_files() {
-  local manifest_path="$1"
-  local count=0
-  local remote_path
-  local rel_path
+_count_local_files() {
+  if [[ ! -d "$LOCAL_DIR" ]]; then
+    echo "0"
+    return
+  fi
 
-  while IFS= read -r remote_path; do
-    [[ -z "$remote_path" ]] && continue
-    rel_path="${remote_path#${REMOTE_DIR}/}"
-    if [[ "$rel_path" == "$remote_path" ]]; then
-      rel_path="${remote_path##*/}"
-    fi
-    if [[ -f "$LOCAL_DIR/$rel_path" ]]; then
-      count=$(( count + 1 ))
-    fi
-  done < "$manifest_path"
-
-  echo "$count"
+  find "$LOCAL_DIR" -type f 2>/dev/null | wc -l | awk '{print $1}'
 }
 
 _print_progress() {
@@ -149,6 +109,10 @@ _print_progress() {
   local rate
   local remaining
   local eta_seconds
+
+  if [[ "$current_count" -gt "$total_expected" ]]; then
+    current_count="$total_expected"
+  fi
 
   if [[ "$total_expected" -gt 0 ]]; then
     percent=$(awk "BEGIN { printf \"%.2f\", 100 * $current_count / $total_expected }")
@@ -175,15 +139,14 @@ _print_progress() {
 }
 
 _monitor_progress() {
-  local manifest_path="$1"
-  local total_expected="$2"
-  local start_count="$3"
-  local start_epoch="$4"
+  local total_expected="$1"
+  local start_count="$2"
+  local start_epoch="$3"
   local current_count
 
   while true; do
     sleep "$PROGRESS_INTERVAL_SEC"
-    current_count=$(_count_existing_files "$manifest_path")
+    current_count=$(_count_local_files)
     _print_progress "$total_expected" "$current_count" "$start_count" "$start_epoch"
   done
 }
@@ -204,8 +167,12 @@ echo "[LIST] reading remote object list from $REMOTE_DIR [start]"
 _run_pinned nubescli list "$REMOTE_DIR" -R -o -f > "$manifest_path"
 echo "[LIST] reading remote object list from $REMOTE_DIR [end]"
 
-total_expected=$(grep -c . "$manifest_path" || true)
-start_count=$(_count_existing_files "$manifest_path")
+if [[ -s "$manifest_path" ]]; then
+  total_expected=$(awk 'NR == 1 && $0 == "Path" {next} NF {count++} END {print count + 0}' "$manifest_path")
+else
+  total_expected=0
+fi
+start_count=$(_count_local_files)
 start_epoch=$(date +%s)
 
 echo "[PRECHECK] total_expected=${total_expected}, already_existing=${start_count}, missing=$(( total_expected - start_count ))"
@@ -216,7 +183,7 @@ if [[ "$start_count" -ge "$total_expected" ]]; then
   exit 0
 fi
 
-_monitor_progress "$manifest_path" "$total_expected" "$start_count" "$start_epoch" &
+_monitor_progress "$total_expected" "$start_count" "$start_epoch" &
 monitor_pid=$!
 
 echo "[DOWNLOAD] NUBES SMART_cache missing files -> $LOCAL_DIR [start]"
@@ -228,6 +195,6 @@ _run_pinned nubescli dir-download \
   --no-progress
 echo "[DOWNLOAD] NUBES SMART_cache missing files -> $LOCAL_DIR [end]"
 
-final_count=$(_count_existing_files "$manifest_path")
+final_count=$(_count_local_files)
 _print_progress "$total_expected" "$final_count" "$start_count" "$start_epoch"
 echo "Download complete."
