@@ -2,10 +2,11 @@
 set -Eeuo pipefail
 
 # ---------------- CPU 분리 설정 (업로드 스크립트와 동일) ----------------
-CPUSET="0-31,64-95"
-NUM_CPUS=64
+CPUSET="${CPUSET:-0-31,64-95}"
+NUM_CPUS="${NUM_CPUS:-64}"
+PROGRESS_INTERVAL_SEC="${PROGRESS_INTERVAL_SEC:-60}"
 
-export DP_MAX_CPUS=${NUM_CPUS}
+export DP_MAX_CPUS="${NUM_CPUS}"
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -21,7 +22,7 @@ fi
 REMOTE_DIR="${1:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache}}"
 LOCAL_DIR="${2:-${LOCAL_DIR:-/workspace/womd_v1_3/SMART_cache}}"
 
-echo "[SMART_CACHE_DOWNLOAD] CPUSET=${CPUSET}, DP_MAX_CPUS=${DP_MAX_CPUS}"
+echo "[SMART_CACHE_DOWNLOAD] CPUSET=${CPUSET}, DP_MAX_CPUS=${DP_MAX_CPUS}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
 
 if ! command -v nubescli >/dev/null 2>&1; then
   echo "ERROR: nubescli not found in PATH"
@@ -34,6 +35,8 @@ if [[ -z "$REMOTE_DIR" || -z "$LOCAL_DIR" ]]; then
   exit 1
 fi
 
+mkdir -p "$LOCAL_DIR"
+
 # nubes_to_mlx_only_womd.sh 방식: 전체 코어의 4/5 사용
 NUBES_JOBS=$(( ( $(nproc) * 4 ) / 5 ))
 if [ "$NUBES_JOBS" -lt 1 ]; then
@@ -42,21 +45,126 @@ fi
 
 echo "[NUBES_JOBS] total_cores=$(nproc), use_cores=${NUBES_JOBS} (4/5)"
 
-# 대상 디렉터리 준비(내용만 비우고 디렉터리는 유지)
-if [ -d "$LOCAL_DIR" ]; then
-  echo "[PREPARE] clean contents under $LOCAL_DIR [start]"
-  if [[ "$LOCAL_DIR" == "/" || "$LOCAL_DIR" == "" ]]; then
-    echo "Refusing to clean unsafe directory: '$LOCAL_DIR'"
-    exit 1
+_format_hours_minutes() {
+  local seconds="$1"
+  local total_minutes
+  local hours
+  local minutes
+
+  if ! awk "BEGIN { exit !($seconds >= 0) }"; then
+    echo "unknown"
+    return
   fi
-  find "$LOCAL_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-  echo "[PREPARE] clean contents under $LOCAL_DIR [end]"
-else
-  echo "[PREPARE] create $LOCAL_DIR"
-  mkdir -p "$LOCAL_DIR"
+
+  total_minutes=$(( seconds / 60 ))
+  hours=$(( total_minutes / 60 ))
+  minutes=$(( total_minutes % 60 ))
+  printf "%dh %dm" "$hours" "$minutes"
+}
+
+_count_existing_files() {
+  local manifest_path="$1"
+  local count=0
+  local remote_path
+  local rel_path
+
+  while IFS= read -r remote_path; do
+    [[ -z "$remote_path" ]] && continue
+    rel_path="${remote_path#${REMOTE_DIR}/}"
+    if [[ "$rel_path" == "$remote_path" ]]; then
+      rel_path="${remote_path##*/}"
+    fi
+    if [[ -f "$LOCAL_DIR/$rel_path" ]]; then
+      count=$(( count + 1 ))
+    fi
+  done < "$manifest_path"
+
+  echo "$count"
+}
+
+_print_progress() {
+  local total_expected="$1"
+  local current_count="$2"
+  local start_count="$3"
+  local start_epoch="$4"
+  local percent=0
+  local elapsed_seconds
+  local processed_this_run
+  local rate
+  local remaining
+  local eta_seconds
+
+  if [[ "$total_expected" -gt 0 ]]; then
+    percent=$(awk "BEGIN { printf \"%.2f\", 100 * $current_count / $total_expected }")
+  fi
+
+  elapsed_seconds=$(( $(date +%s) - start_epoch ))
+  processed_this_run=$(( current_count - start_count ))
+  if [[ "$processed_this_run" -lt 0 ]]; then
+    processed_this_run=0
+  fi
+
+  if [[ "$elapsed_seconds" -gt 0 && "$processed_this_run" -gt 0 ]]; then
+    rate=$(awk "BEGIN { printf \"%.6f\", $processed_this_run / $elapsed_seconds }")
+    remaining=$(( total_expected - current_count ))
+    if [[ "$remaining" -lt 0 ]]; then
+      remaining=0
+    fi
+    eta_seconds=$(awk "BEGIN { printf \"%d\", $remaining / $rate }")
+  else
+    eta_seconds=-1
+  fi
+
+  echo "[download-progress] total_expected=${total_expected} existing=${current_count} percent=${percent}% elapsed=$(_format_hours_minutes "$elapsed_seconds") eta=$(_format_hours_minutes "$eta_seconds")"
+}
+
+_monitor_progress() {
+  local manifest_path="$1"
+  local total_expected="$2"
+  local start_count="$3"
+  local start_epoch="$4"
+  local current_count
+
+  while true; do
+    sleep "$PROGRESS_INTERVAL_SEC"
+    current_count=$(_count_existing_files "$manifest_path")
+    _print_progress "$total_expected" "$current_count" "$start_count" "$start_epoch"
+  done
+}
+
+manifest_path="$(mktemp)"
+monitor_pid=""
+
+cleanup() {
+  if [[ -n "$monitor_pid" ]]; then
+    kill "$monitor_pid" >/dev/null 2>&1 || true
+    wait "$monitor_pid" 2>/dev/null || true
+  fi
+  rm -f "$manifest_path"
+}
+trap cleanup EXIT
+
+echo "[LIST] reading remote object list from $REMOTE_DIR [start]"
+taskset -c "${CPUSET}" \
+nubescli list "$REMOTE_DIR" -R -o -f > "$manifest_path"
+echo "[LIST] reading remote object list from $REMOTE_DIR [end]"
+
+total_expected=$(grep -c . "$manifest_path" || true)
+start_count=$(_count_existing_files "$manifest_path")
+start_epoch=$(date +%s)
+
+echo "[PRECHECK] total_expected=${total_expected}, already_existing=${start_count}, missing=$(( total_expected - start_count ))"
+_print_progress "$total_expected" "$start_count" "$start_count" "$start_epoch"
+
+if [[ "$start_count" -ge "$total_expected" ]]; then
+  echo "[DOWNLOAD] skipped because all files already exist under $LOCAL_DIR"
+  exit 0
 fi
 
-echo "[DOWNLOAD] NUBES SMART_cache -> $LOCAL_DIR [start]"
+_monitor_progress "$manifest_path" "$total_expected" "$start_count" "$start_epoch" &
+monitor_pid=$!
+
+echo "[DOWNLOAD] NUBES SMART_cache missing files -> $LOCAL_DIR [start]"
 taskset -c "${CPUSET}" \
 nubescli dir-download \
   "$REMOTE_DIR" \
@@ -64,6 +172,8 @@ nubescli dir-download \
   -j "$NUBES_JOBS" \
   -s \
   --no-progress
-echo "[DOWNLOAD] NUBES SMART_cache -> $LOCAL_DIR [end]"
+echo "[DOWNLOAD] NUBES SMART_cache missing files -> $LOCAL_DIR [end]"
 
+final_count=$(_count_existing_files "$manifest_path")
+_print_progress "$total_expected" "$final_count" "$start_count" "$start_epoch"
 echo "Download complete."

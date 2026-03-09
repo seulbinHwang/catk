@@ -112,7 +112,7 @@ export WANDB_MODE=offline
 
 ```bash
 export RAW_ROOT=/path/to/womd/scenario
-export CACHE_ROOT=/path/to/SMART_cache
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
 ```
 
 `training` 과 `validation` 캐시는 학습과 로컬 평가에 필요합니다. `testing` 캐시는 최종 WOSAC test submission 을 만들 때 필요합니다.
@@ -203,7 +203,9 @@ bash scripts/download_smart_cache_from_nubes.sh
 주의:
 
 - `nubescli` 가 PATH 에 있어야 합니다.
-- 스크립트는 다운로드 전에 `LOCAL_DIR` 내부 내용을 비웁니다.
+- 스크립트는 `nubescli dir-download -s` 를 사용하므로, 이미 있는 로컬 파일은 유지하고 없는 파일만 다운로드합니다.
+- 실행 중에는 원격 전체 파일 수 대비 현재 로컬에 존재하는 파일 수를 기준으로 진행률을 1분마다 출력합니다.
+- 진행률 로그에는 `percent`, `elapsed`, `eta` 가 함께 표시됩니다.
 - `CACHE_ROOT` 로 사용할 경로를 그대로 `LOCAL_DIR` 로 넘기는 것이 가장 단순합니다.
 
 ## 5. Open-Loop Pretraining
@@ -476,7 +478,7 @@ python -m src.run \
 - `validation_tfrecords_splitted/` 가 없으면 로컬 평가와 mp4 저장이 실패합니다.
 - `ffmpeg` 가 없으면 mp4 저장이 실패합니다.
 - W&B artifact 를 쓰는 평가 머신에서도 `wandb login` 또는 `WANDB_API_KEY` 가 필요합니다.
-- `scripts/download_smart_cache_from_nubes.sh` 는 대상 디렉터리 내용을 비우므로 경로를 잘 확인해야 합니다.
+- `scripts/download_smart_cache_from_nubes.sh` 는 기존 파일은 유지하고 누락 파일만 받습니다. 다만 원격 전체 파일 수를 기준으로 진행률을 계산하므로, 원격 목록 조회 시간이 처음에 한 번 필요합니다.
 
 ## 11. 최소 실행 순서 요약
 
