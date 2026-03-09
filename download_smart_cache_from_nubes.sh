@@ -18,13 +18,19 @@ if command -v taskset >/dev/null 2>&1; then
   taskset -cp "${CPUSET}" $$ >/dev/null
 fi
 
-REMOTE_DIR="labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache"
-LOCAL_DIR="/workspace/womd_v1_3/SMART_cache"
+REMOTE_DIR="${1:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache}}"
+LOCAL_DIR="${2:-${LOCAL_DIR:-/workspace/womd_v1_3/SMART_cache}}"
 
 echo "[SMART_CACHE_DOWNLOAD] CPUSET=${CPUSET}, DP_MAX_CPUS=${DP_MAX_CPUS}"
 
 if ! command -v nubescli >/dev/null 2>&1; then
   echo "ERROR: nubescli not found in PATH"
+  exit 1
+fi
+
+if [[ -z "$REMOTE_DIR" || -z "$LOCAL_DIR" ]]; then
+  echo "Usage: bash download_smart_cache_from_nubes.sh <remote_dir> <local_dir>"
+  echo "or set REMOTE_DIR and LOCAL_DIR env vars."
   exit 1
 fi
 

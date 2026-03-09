@@ -15,6 +15,16 @@ model:
 
 ckpt_path: FLOW_PRETRAINED_MODEL.ckpt
 
+logger:
+  wandb:
+    log_model: all
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/ADE
+    mode: min
+    save_last: true
+
 trainer:
   limit_train_batches: 1.0
   limit_val_batches: 50

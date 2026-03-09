@@ -1,24 +1,26 @@
 # CAT-K Flow
 
-이 README는 이 저장소를 처음 받는 사람이 Waymo Open Motion Dataset(WOMD) scenario 데이터 준비부터 open-loop 학습, short closed-loop fine-tuning, 추론, 평가, mp4 저장, WOSAC 제출 파일 생성까지 그대로 따라할 수 있게 정리한 실행 가이드입니다.
+이 저장소는 Waymo Open Motion Dataset(WOMD) scenario 데이터를 입력으로 사용해 아래 순서로 실행하는 것을 기준으로 정리되어 있습니다.
 
-이 저장소에서 기본으로 사용하는 실험 설정은 아래 4개입니다.
+1. WOMD scenario 데이터 준비
+2. pkl 캐시 생성 또는 다운로드
+3. open-loop 학습
+4. short closed-loop fine-tuning
+5. 추론 및 로컬 평가
+6. mp4 저장
+7. WOSAC 제출 파일 생성
+
+기본으로 사용하는 실험 설정은 아래 4개입니다.
 
 - open-loop pretraining: `configs/experiment/flow_pretrain_h1006.yaml`
 - short closed-loop fine-tuning: `configs/experiment/flow_clsft_h1006.yaml`
 - local evaluation: `configs/experiment/flow_local_val.yaml`
 - WOSAC submission export: `configs/experiment/flow_wosac_sub.yaml`
 
-토큰 파일은 저장소에 이미 포함되어 있으므로 별도로 다운로드할 필요가 없습니다.
+토큰 파일은 저장소에 이미 포함되어 있으므로 별도 다운로드가 필요하지 않습니다.
 
 - `src/smart/tokens/map_traj_token5.pkl`
 - `src/smart/tokens/agent_vocab_555_s2.pkl`
-
-중요:
-
-- 아래 명령은 이 README를 기준으로 직접 실행하는 방식을 표준으로 설명합니다.
-- `scripts/*.sh` 는 conda 경로나 env 이름을 하드코딩하지 않습니다. 현재 쉘에서 이미 활성화된 Python 환경을 그대로 사용합니다.
-- 학습/평가 실행 시 캐시 루트는 `paths.cache_root` 로 결정됩니다. 기본값은 `configs/paths/default.yaml` 의 `/scratch/cache/SMART` 이므로, 다른 경로를 쓸 경우 아래 예시처럼 매번 `paths.cache_root=...` 를 넘기는 편이 가장 안전합니다.
 
 ## 1. 환경 설치
 
@@ -30,7 +32,7 @@
 - PyTorch `2.4.1`
 - `ffmpeg` 설치 완료 상태
 
-저장소 루트에서 아래 순서로 설치합니다.
+이 저장소의 스크립트는 conda 경로나 env 이름을 하드코딩하지 않습니다. 현재 쉘에서 이미 활성화된 Python 환경의 `python` / `torchrun` 을 그대로 사용합니다.
 
 ```bash
 conda create -n catk python=3.11.9 -y
@@ -43,98 +45,58 @@ pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+
 pip install --no-cache-dir --no-deps waymo-open-dataset-tf-2-12-0==1.6.4
 ```
 
-`ffmpeg` 는 시스템 패키지로 설치해야 합니다.
+`ffmpeg` 는 시스템 패키지로 설치합니다.
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y ffmpeg
 ```
 
-W&B를 온라인으로 쓰지 않을 계획이면 아래 설정을 먼저 해두는 것이 편합니다.
+## 2. W&B 준비
+
+학습 스크립트 `scripts/train_flow_h1006.sh` 와 `scripts/finetune_flow_h1006.sh` 는 기본적으로 W&B online 로 실행됩니다.
+
+기본값:
+
+- `WANDB_PROJECT=SMART-FLOW`
+- `WANDB_ENTITY=jksg01019-naver-labs`
+- `WANDB_MODE=online`
+
+다른 계정을 쓸 경우 실행 전에 바꾸면 됩니다.
+
+```bash
+export WANDB_ENTITY=<your_wandb_entity>
+wandb login
+```
+
+온라인으로 학습하면 W&B에는 아래 정보가 저장됩니다.
+
+- 학습/검증 metric
+- 실행 config 와 주요 hyperparameter
+- 모델 checkpoint artifact
+- 평가 시 생성한 비디오가 있으면 비디오 로그
+
+open-loop pretraining 과 short closed-loop fine-tuning 은 checkpoint를 artifact 로 업로드합니다. 각 run 에 대해 아래 alias 를 바로 사용할 수 있습니다.
+
+- `best`
+- `latest`
+
+학습이 끝나면 콘솔에 ready-to-copy artifact ref 가 출력되고, 같은 값이 아래 두 곳에도 저장됩니다.
+
+- W&B summary: `artifact/run_path`, `artifact/best_ckpt_ref`, `artifact/latest_ckpt_ref`
+- 로컬 파일: `logs/<task_name>/runs/<...>/artifact_refs.txt`
+
+오프라인으로 돌리고 싶으면 아래처럼 바꾸면 됩니다.
 
 ```bash
 export WANDB_MODE=offline
 ```
 
-온라인 로깅을 쓰려면 `configs/logger/wandb.yaml` 의 `entity` 값을 실제 계정으로 바꾸십시오.
+## 3. WOMD scenario 데이터 준비
 
-### 1.1 W&B 상세 사용법
+이 저장소는 Waymo Open Motion Dataset의 scenario proto TFRecord 를 사용합니다.
 
-이 저장소의 W&B 기본 설정은 [configs/logger/wandb.yaml](/home/user/PycharmProjects/catk/configs/logger/wandb.yaml) 에 있습니다.
-
-- logger type: `lightning.pytorch.loggers.wandb.WandbLogger`
-- 기본 project: `clsft-catk`
-- run name: `task_name` 값
-- 기본 resume 정책: `resume: allow`
-- 코드에서 `WandbLogger` 사용 시 `watch(model, log="all")` 이 자동 실행됩니다.
-
-또한 실행 종료 시 [src/run.py](/home/user/PycharmProjects/catk/src/run.py) 에서 `wandb.finish()` 를 호출합니다.
-
-온라인 로깅을 정확히 쓰는 순서:
-
-1. W&B 로그인
-
-```bash
-wandb login
-```
-
-2. 실행 시 온라인 모드 명시
-
-스크립트 실행(권장):
-
-```bash
-WANDB_OFFLINE=False WANDB_ENTITY=<your_wandb_entity> CACHE_ROOT="$CACHE_ROOT" bash scripts/train_flow_h1006.sh
-```
-
-직접 실행:
-
-```bash
-python -m src.run \
-  experiment=flow_local_val \
-  action=validate \
-  ckpt_path=/absolute/path/to/model.ckpt \
-  logger.wandb.offline=False \
-  logger.wandb.entity=<your_wandb_entity> \
-  logger.wandb.project=clsft-catk \
-  task_name=flow_local_val_online
-```
-
-오프라인 로깅:
-
-- 스크립트 기본값은 `WANDB_OFFLINE=True` 입니다.
-- 직접 실행에서는 `logger.wandb.offline=True` 를 넣으면 됩니다.
-- 오프라인 런 파일은 각 hydra output dir 아래 `wandb/` 폴더에 저장됩니다.
-
-오프라인 결과를 나중에 업로드:
-
-```bash
-wandb sync logs/<task_name>/runs/<YYYY-MM-DD>_<HH-MM-SS>/wandb/offline-run-*
-```
-
-중단된 W&B run 재개:
-
-```bash
-python -m src.run \
-  experiment=flow_pretrain_h1006 \
-  action=fit \
-  ckpt_path=/absolute/path/to/last.ckpt \
-  logger.wandb.offline=False \
-  logger.wandb.entity=<your_wandb_entity> \
-  logger.wandb.id=<existing_wandb_run_id> \
-  logger.wandb.resume=must \
-  task_name=flow_pretrain_h1006_resume
-```
-
-참고:
-
-- 체크포인트 재개(`ckpt_path`)와 W&B run 재개(`logger.wandb.id`, `logger.wandb.resume`)는 별개입니다. 둘 다 넣어야 학습 상태와 W&B 런이 동시에 이어집니다.
-- 평가 시 mp4를 생성하면 모델 코드에서 `self.logger.log_video(...)` 를 호출해 W&B에 비디오를 같이 업로드합니다.
-
-## 2. Waymo 데이터 다운로드
-
-이 저장소는 Waymo Open Motion Dataset의 scenario proto TFRecord를 사용합니다. 공식 다운로드 페이지에서 Motion dataset의 scenario 데이터를 받아 아래 구조로 정리하십시오.
-
-- 공식 다운로드 페이지: `https://waymo.com/open/download`
+- 다운로드 페이지: `https://waymo.com/open/download`
 - Motion dataset 설명: `https://waymo.com/open/data/motion/`
 
 예시 디렉터리 구조:
@@ -146,18 +108,27 @@ python -m src.run \
 └── testing/
 ```
 
-이 README에서는 아래 두 변수를 사용합니다.
+이 README 에서는 아래 두 변수를 사용합니다.
 
 ```bash
 export RAW_ROOT=/path/to/womd/scenario
 export CACHE_ROOT=/path/to/SMART_cache
 ```
 
-`training` 과 `validation` 캐시는 학습과 로컬 평가에 필요합니다. `testing` 캐시는 최종 WOSAC test submission 을 만들 때만 필요합니다.
+`training` 과 `validation` 캐시는 학습과 로컬 평가에 필요합니다. `testing` 캐시는 최종 WOSAC test submission 을 만들 때 필요합니다.
 
-## 3. 데이터 전처리와 캐시 생성
+## 4. pkl 캐시 준비
 
-전처리는 split 별로 한 번씩 실행합니다.
+학습과 평가에는 TFRecord 원본이 아니라 시나리오별 `.pkl` 캐시가 필요합니다.
+
+캐시를 준비하는 방법은 두 가지입니다.
+
+1. 직접 전처리해서 생성
+2. Nubes 에 저장된 캐시를 다운로드
+
+### 4.1 전처리로 캐시 생성
+
+split 별로 한 번씩 실행합니다.
 
 ```bash
 python -m src.data_preprocess \
@@ -179,15 +150,15 @@ python -m src.data_preprocess \
   --output_dir "$CACHE_ROOT"
 ```
 
-동일 작업을 스크립트로 실행하려면:
+동일 작업을 스크립트로 실행할 수도 있습니다.
 
 ```bash
-RAW_ROOT=/path/to/womd/scenario CACHE_ROOT=/path/to/SMART_cache bash scripts/cache_womd.sh training
-RAW_ROOT=/path/to/womd/scenario CACHE_ROOT=/path/to/SMART_cache bash scripts/cache_womd.sh validation
-RAW_ROOT=/path/to/womd/scenario CACHE_ROOT=/path/to/SMART_cache bash scripts/cache_womd.sh testing
+RAW_ROOT="$RAW_ROOT" CACHE_ROOT="$CACHE_ROOT" NUM_WORKERS=56 bash scripts/cache_womd.sh training
+RAW_ROOT="$RAW_ROOT" CACHE_ROOT="$CACHE_ROOT" NUM_WORKERS=56 bash scripts/cache_womd.sh validation
+RAW_ROOT="$RAW_ROOT" CACHE_ROOT="$CACHE_ROOT" NUM_WORKERS=56 bash scripts/cache_womd.sh testing
 ```
 
-전처리가 끝나면 캐시는 아래처럼 생겨야 합니다.
+전처리가 끝나면 캐시는 대략 아래 구조가 됩니다.
 
 ```text
 $CACHE_ROOT/
@@ -199,13 +170,47 @@ $CACHE_ROOT/
 
 설명:
 
-- `training/`, `validation/`, `testing/` 안에는 시나리오별 `.pkl` 캐시가 생깁니다.
-- `validation_tfrecords_splitted/` 는 `validation` 전처리 때 자동 생성됩니다.
-- 로컬 평가와 mp4 저장은 원본 validation TFRecord 를 시나리오 단위로 다시 읽기 때문에 `validation_tfrecords_splitted/` 가 반드시 있어야 합니다.
+- `training/`, `validation/`, `testing/` 에 시나리오별 `.pkl` 파일이 생성됩니다.
+- `validation_tfrecords_splitted/` 는 `validation` 전처리 시 자동 생성됩니다.
+- 로컬 평가와 mp4 저장은 이 `validation_tfrecords_splitted/` 를 사용하므로 반드시 필요합니다.
 
-## 4. Open-Loop Pretraining
+### 4.2 Nubes 에서 캐시 다운로드
+
+이미 만들어진 pkl 캐시를 쓰고 싶다면 `download_smart_cache_from_nubes.sh` 를 사용할 수 있습니다.
+
+기본 사용법:
+
+```bash
+bash download_smart_cache_from_nubes.sh <remote_dir> <local_dir>
+```
+
+예시:
+
+```bash
+bash download_smart_cache_from_nubes.sh \
+  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
+  "$CACHE_ROOT"
+```
+
+또는 환경변수로 넘겨도 됩니다.
+
+```bash
+REMOTE_DIR=labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
+LOCAL_DIR="$CACHE_ROOT" \
+bash download_smart_cache_from_nubes.sh
+```
+
+주의:
+
+- `nubescli` 가 PATH 에 있어야 합니다.
+- 스크립트는 다운로드 전에 `LOCAL_DIR` 내부 내용을 비웁니다.
+- `CACHE_ROOT` 로 사용할 경로를 그대로 `LOCAL_DIR` 로 넘기는 것이 가장 단순합니다.
+
+## 5. Open-Loop Pretraining
 
 먼저 open-loop pretraining 으로 초기 체크포인트를 만듭니다.
+
+직접 실행:
 
 ```bash
 export LOGLEVEL=INFO
@@ -219,32 +224,44 @@ torchrun \
   experiment=flow_pretrain_h1006 \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  logger.wandb.offline=True \
-  logger.wandb.entity=null \
   task_name=flow_pretrain_h1006
 ```
 
-동일 작업을 스크립트로 실행하려면:
+스크립트 실행:
 
 ```bash
 CACHE_ROOT="$CACHE_ROOT" NPROC_PER_NODE=6 TRAINER_DEVICES=6 bash scripts/train_flow_h1006.sh
 ```
 
-이 설정은 기본적으로 6 GPU 기준입니다. GPU 수가 다르면 `--nproc_per_node`, `trainer.devices`, 그리고 필요시 `data.train_batch_size` / `data.val_batch_size` / `data.test_batch_size` 를 함께 조정하십시오.
+이 실험은 기본적으로 6 GPU 기준입니다. GPU 수가 다르면 `NPROC_PER_NODE`, `trainer.devices`, 필요시 batch size 를 함께 조정하십시오.
 
-출력 위치:
+학습 결과는 아래에 저장됩니다.
 
 - 로그 루트: `logs/flow_pretrain_h1006/runs/<YYYY-MM-DD>_<HH-MM-SS>/`
 - 체크포인트: `logs/flow_pretrain_h1006/runs/<...>/checkpoints/`
-- 보통 다음 단계에는 `last.ckpt` 또는 원하는 epoch 체크포인트를 사용합니다.
+- artifact ref 메모: `logs/flow_pretrain_h1006/runs/<...>/artifact_refs.txt`
 
-## 5. Short Closed-Loop Fine-Tuning
+다음 단계에는 보통 아래 둘 중 하나를 사용합니다.
 
-open-loop 체크포인트를 만든 뒤 short closed-loop fine-tuning 을 수행합니다.
+- 로컬 체크포인트: `last.ckpt` 또는 원하는 epoch 체크포인트
+- W&B artifact ref: `entity/project/model-<run_id>:best` 또는 `:latest`
+
+## 6. Short Closed-Loop Fine-Tuning
+
+short closed-loop fine-tuning 은 open-loop pretraining 결과를 입력으로 사용합니다. 로컬 checkpoint 와 W&B artifact 둘 다 사용할 수 있습니다.
+
+### 6.1 로컬 checkpoint 로 fine-tuning
 
 ```bash
 export PRETRAIN_CKPT=/absolute/path/to/open_loop/checkpoints/last.ckpt
 
+CACHE_ROOT="$CACHE_ROOT" NPROC_PER_NODE=6 TRAINER_DEVICES=6 \
+bash scripts/finetune_flow_h1006.sh "$PRETRAIN_CKPT"
+```
+
+직접 실행:
+
+```bash
 torchrun \
   --nproc_per_node=6 \
   -m src.run \
@@ -252,37 +269,53 @@ torchrun \
   ckpt_path="$PRETRAIN_CKPT" \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  logger.wandb.offline=True \
-  logger.wandb.entity=null \
   task_name=flow_clsft_h1006
 ```
 
-동일 작업을 스크립트로 실행하려면:
+### 6.2 W&B artifact 로 fine-tuning
 
 ```bash
-CACHE_ROOT="$CACHE_ROOT" NPROC_PER_NODE=6 TRAINER_DEVICES=6 bash scripts/finetune_flow_h1006.sh "$PRETRAIN_CKPT"
+export PRETRAIN_ARTIFACT='jksg01019-naver-labs/SMART-FLOW/model-<run_id>:best'
+
+CACHE_ROOT="$CACHE_ROOT" NPROC_PER_NODE=6 TRAINER_DEVICES=6 \
+FLOW_CKPT_ARTIFACT="$PRETRAIN_ARTIFACT" \
+bash scripts/finetune_flow_h1006.sh
 ```
 
-fine-tuning 역시 기본값은 6 GPU 기준입니다. GPU 수가 다르면 `--nproc_per_node`, `trainer.devices`, `data.*_batch_size`, `trainer.accumulate_grad_batches` 를 같이 조정해야 합니다.
+직접 실행:
 
-fine-tuning 결과 체크포인트는 다음 단계의 추론/평가/제출 생성에 사용합니다.
+```bash
+torchrun \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=flow_clsft_h1006 \
+  ckpt_artifact='jksg01019-naver-labs/SMART-FLOW/model-<run_id>:best' \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_clsft_h1006
+```
+
+fine-tuning 결과 체크포인트도 동일하게 로컬 파일 또는 W&B artifact 로 다음 단계에서 사용할 수 있습니다.
+
+## 7. 추론과 로컬 평가
+
+이 저장소에서 별도 inference-only 엔트리포인트는 없습니다. 보통 아래 두 실행이 추론 역할을 합니다.
+
+- `flow_local_val`: validation split 에서 closed-loop rollout 생성 + metric 계산
+- `flow_wosac_sub`: validation 또는 test split 에서 rollout 생성 + 제출 파일 생성
+
+즉, 로컬 평가나 WOSAC 제출 생성 명령이 곧 추론 명령입니다.
+
+### 7.1 로컬 checkpoint 로 평가
 
 ```bash
 export FT_CKPT=/absolute/path/to/flow_clsft_h1006/checkpoints/last.ckpt
+
+CACHE_ROOT="$CACHE_ROOT" TRAINER_DEVICES=1 \
+bash scripts/local_val_flow.sh "$FT_CKPT"
 ```
 
-## 6. 추론
-
-이 저장소에는 별도의 "inference only" 엔트리포인트가 있지 않습니다. 대신 아래 두 방식이 추론 역할을 합니다.
-
-- validation split 에서 rollout 을 생성하면서 지표를 계산하려면 `flow_local_val`
-- validation 또는 test split 에서 rollout 을 생성해 WOSAC 제출 파일로 저장하려면 `flow_wosac_sub`
-
-즉, 보통은 아래 7단계와 9단계 명령이 곧 추론 명령입니다.
-
-## 7. 로컬 평가
-
-validation split 에서 closed-loop rollout 을 만들고, ADE 및 WOSAC 계열 지표를 계산합니다.
+직접 실행:
 
 ```bash
 python -m src.run \
@@ -294,25 +327,42 @@ python -m src.run \
   trainer.devices=1 \
   trainer.strategy=auto \
   paths.cache_root="$CACHE_ROOT" \
-  logger.wandb.offline=True \
-  logger.wandb.entity=null \
   task_name=flow_local_val
 ```
 
-동일 작업을 스크립트로 실행하려면:
+### 7.2 W&B artifact 로 평가
 
 ```bash
-CACHE_ROOT="$CACHE_ROOT" TRAINER_DEVICES=1 bash scripts/local_val_flow.sh "$FT_CKPT"
+export FT_ARTIFACT='jksg01019-naver-labs/SMART-FLOW/model-<run_id>:best'
+
+CACHE_ROOT="$CACHE_ROOT" TRAINER_DEVICES=1 \
+FLOW_CKPT_ARTIFACT="$FT_ARTIFACT" \
+bash scripts/local_val_flow.sh
 ```
 
-기본 `flow_local_val` 설정은 비디오를 저장하지 않습니다. 대신 다음 항목들을 계산합니다.
+직접 실행:
+
+```bash
+python -m src.run \
+  experiment=flow_local_val \
+  action=validate \
+  ckpt_artifact='jksg01019-naver-labs/SMART-FLOW/model-<run_id>:best' \
+  trainer=default \
+  trainer.accelerator=gpu \
+  trainer.devices=1 \
+  trainer.strategy=auto \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_local_val
+```
+
+기본 `flow_local_val` 설정은 아래를 계산합니다.
 
 - `val_closed/ADE`
 - WOSAC realism / kinematic / interactive / map-based metrics
 
-## 8. 평가 결과를 mp4로 저장하기
+## 8. mp4 저장
 
-mp4 저장은 validation 시각화 경로를 켜야만 동작합니다. `ffmpeg` 가 설치되어 있어야 하며, 아래처럼 시각화 관련 옵션을 override 하십시오.
+mp4 저장은 `flow_local_val` 에서 시각화 관련 override 를 켠 경우에만 동작합니다. `ffmpeg` 가 반드시 설치되어 있어야 합니다.
 
 ```bash
 python -m src.run \
@@ -329,8 +379,6 @@ python -m src.run \
   data.pin_memory=false \
   data.persistent_workers=false \
   paths.cache_root="$CACHE_ROOT" \
-  logger.wandb.offline=True \
-  logger.wandb.entity=null \
   model.model_config.n_rollout_closed_val=2 \
   model.model_config.n_batch_wosac_metric=1 \
   model.model_config.n_vis_batch=1 \
@@ -339,7 +387,7 @@ python -m src.run \
   task_name=flow_local_val_video
 ```
 
-저장 위치:
+영상은 아래 경로에 저장됩니다.
 
 - `logs/flow_local_val_video/runs/<...>/videos/batch_00-scenario_00/gt.mp4`
 - `logs/flow_local_val_video/runs/<...>/videos/batch_00-scenario_00/rollout_00.mp4`
@@ -347,13 +395,13 @@ python -m src.run \
 
 주의:
 
-- `model.model_config.n_vis_rollout` 는 `model.model_config.n_rollout_closed_val` 보다 크면 안 됩니다.
-- `model.model_config.n_vis_scenario` 는 `data.val_batch_size` 보다 크면 안 됩니다.
-- 평가 기본 설정인 `flow_local_val` 은 `n_vis_batch=0` 이므로, override 를 주지 않으면 mp4 가 저장되지 않습니다.
+- `model.model_config.n_vis_rollout <= model.model_config.n_rollout_closed_val`
+- `model.model_config.n_vis_scenario <= data.val_batch_size`
+- 기본 `flow_local_val` 은 `n_vis_batch=0` 이므로 override 없이는 mp4 가 저장되지 않습니다.
 
 ## 9. WOSAC 제출 파일 생성
 
-제출 파일을 만들기 전에 먼저 `configs/experiment/flow_wosac_sub.yaml` 의 메타데이터를 실제 값으로 수정하십시오.
+제출 전에 `configs/experiment/flow_wosac_sub.yaml` 의 아래 메타데이터를 실제 값으로 수정하십시오.
 
 - `authors`
 - `affiliation`
@@ -363,24 +411,50 @@ python -m src.run \
 
 ### 9.1 validation split 으로 submission 샘플 생성
 
+로컬 checkpoint 사용:
+
+```bash
+CACHE_ROOT="$CACHE_ROOT" bash scripts/wosac_sub_flow.sh "$FT_CKPT" validate
+```
+
+W&B artifact 사용:
+
+```bash
+CACHE_ROOT="$CACHE_ROOT" \
+ACTION=validate \
+FLOW_CKPT_ARTIFACT='jksg01019-naver-labs/SMART-FLOW/model-<run_id>:best' \
+bash scripts/wosac_sub_flow.sh
+```
+
+직접 실행:
+
 ```bash
 python -m src.run \
   experiment=flow_wosac_sub \
   action=validate \
   ckpt_path="$FT_CKPT" \
   paths.cache_root="$CACHE_ROOT" \
-  logger.wandb.offline=True \
-  logger.wandb.entity=null \
   task_name=flow_wosac_sub_validate
 ```
 
-동일 작업을 스크립트로 실행하려면:
+### 9.2 test split 으로 최종 submission 생성
+
+로컬 checkpoint 사용:
 
 ```bash
-CACHE_ROOT="$CACHE_ROOT" bash scripts/wosac_sub_flow.sh "$FT_CKPT" validate
+CACHE_ROOT="$CACHE_ROOT" bash scripts/wosac_sub_flow.sh "$FT_CKPT" test
 ```
 
-### 9.2 test split 으로 최종 submission 생성
+W&B artifact 사용:
+
+```bash
+CACHE_ROOT="$CACHE_ROOT" \
+ACTION=test \
+FLOW_CKPT_ARTIFACT='jksg01019-naver-labs/SMART-FLOW/model-<run_id>:best' \
+bash scripts/wosac_sub_flow.sh
+```
+
+직접 실행:
 
 ```bash
 python -m src.run \
@@ -388,15 +462,7 @@ python -m src.run \
   action=test \
   ckpt_path="$FT_CKPT" \
   paths.cache_root="$CACHE_ROOT" \
-  logger.wandb.offline=True \
-  logger.wandb.entity=null \
   task_name=flow_wosac_sub_test
-```
-
-동일 작업을 스크립트로 실행하려면:
-
-```bash
-CACHE_ROOT="$CACHE_ROOT" bash scripts/wosac_sub_flow.sh "$FT_CKPT" test
 ```
 
 출력 위치:
@@ -406,20 +472,21 @@ CACHE_ROOT="$CACHE_ROOT" bash scripts/wosac_sub_flow.sh "$FT_CKPT" test
 
 ## 10. 자주 막히는 지점
 
-- `paths.cache_root` 를 빼먹으면 기본값 `/scratch/cache/SMART` 를 읽습니다.
-- `validation_tfrecords_splitted/` 가 없으면 로컬 평가의 WOSAC metric 계산과 mp4 저장이 실패합니다.
+- `paths.cache_root` 를 지정하지 않으면 기본값 `/scratch/cache/SMART` 를 읽습니다.
+- `validation_tfrecords_splitted/` 가 없으면 로컬 평가와 mp4 저장이 실패합니다.
 - `ffmpeg` 가 없으면 mp4 저장이 실패합니다.
-- W&B 온라인 로깅을 쓸 때 `entity` 를 실제 값으로 바꾸지 않으면 실행 초기에 막힐 수 있습니다.
+- W&B artifact 를 쓰는 평가 머신에서도 `wandb login` 또는 `WANDB_API_KEY` 가 필요합니다.
+- `download_smart_cache_from_nubes.sh` 는 대상 디렉터리 내용을 비우므로 경로를 잘 확인해야 합니다.
 
 ## 11. 최소 실행 순서 요약
 
 처음부터 끝까지 가장 일반적인 순서는 아래입니다.
 
 1. 환경을 만들고 의존성을 설치합니다.
-2. WOMD scenario 데이터를 `training/validation/testing` 구조로 내려받습니다.
-3. `training`, `validation`, `testing` split 을 캐시로 전처리합니다.
+2. WOMD scenario 데이터를 `training/validation/testing` 구조로 준비합니다.
+3. pkl 캐시를 전처리로 만들거나, Nubes 에서 다운로드합니다.
 4. `flow_pretrain_h1006` 로 open-loop pretraining 을 수행합니다.
-5. pretraining 체크포인트를 넣어 `flow_clsft_h1006` 로 short closed-loop fine-tuning 을 수행합니다.
-6. fine-tuned 체크포인트로 `flow_local_val` 을 실행해 validation 지표를 확인합니다.
+5. pretraining checkpoint 로 `flow_clsft_h1006` short closed-loop fine-tuning 을 수행합니다.
+6. fine-tuned checkpoint 로 `flow_local_val` 을 실행해 validation metric 을 확인합니다.
 7. 필요하면 같은 validation 경로에서 시각화 override 를 켜서 mp4 를 저장합니다.
 8. 제출이 필요하면 `flow_wosac_sub` 로 validation/test submission 파일을 생성합니다.

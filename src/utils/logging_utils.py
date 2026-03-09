@@ -62,6 +62,7 @@ def log_hyperparameters(object_dict: Dict[str, Any]) -> None:
 
     hparams["task_name"] = cfg.get("task_name")
     hparams["ckpt_path"] = cfg.get("ckpt_path")
+    hparams["ckpt_artifact"] = cfg.get("ckpt_artifact")
     hparams["seed"] = cfg.get("seed")
     hparams["train_job_id"] = cfg.get("train_job_id")
 

@@ -280,7 +280,15 @@ class SMART(LightningModule):
         if self.val_closed_loop:
             if not self.wosac_submission.is_active:
                 epoch_wosac_metrics = self.wosac_metrics.compute()
-                epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
+                val_closed_ade = self.minADE.compute()
+                self.log(
+                    "val_closed/ADE",
+                    val_closed_ade,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
+                epoch_wosac_metrics["val_closed/ADE"] = val_closed_ade
                 if self.global_rank == 0:
                     epoch_wosac_metrics["epoch"] = self.log_epoch if self.log_epoch >= 0 else self.current_epoch
                     self.logger.log_metrics(epoch_wosac_metrics)
