@@ -25,14 +25,11 @@ from typing import Any, Dict, List, Optional
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import numpy as np
-import pandas as pd
 import tensorflow as tf
 import torch
-from scipy.interpolate import interp1d
 from tqdm import tqdm
 from waymo_open_dataset.protos import scenario_pb2
 
-from src.smart.utils.geometry import wrap_angle
 from src.smart.utils.preprocess import get_polylines_from_polygon, preprocess_map
 
 tf.get_logger().setLevel("ERROR")
@@ -63,6 +60,17 @@ _polygon_light_type = [
     "LANE_STATE_GO",
     "LANE_STATE_CAUTION",
 ]
+_signal_state_to_polygon_light_type = {
+    0: 1,  # UNKNOWN
+    1: 2,  # ARROW_STOP
+    2: 4,  # ARROW_CAUTION
+    3: 3,  # ARROW_GO
+    4: 2,  # STOP
+    5: 4,  # CAUTION
+    6: 3,  # GO
+    7: 2,  # FLASHING_STOP
+    8: 4,  # FLASHING_CAUTION
+}
 
 _PROGRESS_COUNTER = None
 
@@ -134,11 +142,47 @@ def _count_records_in_tfrecord(file_path: str) -> int:
     return sum(1 for _ in _iter_tfrecord_numpy(file_path))
 
 
-def _count_total_expected(packages: List[str], num_workers: int) -> int:
+def _count_cache_path(state_dir: Path, file_path: str) -> Path:
+    return state_dir / (Path(file_path).name + ".count")
+
+
+def _read_cached_int(file_path: Path) -> Optional[int]:
+    if not file_path.exists():
+        return None
+    try:
+        return int(file_path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _count_records_job(file_path: str):
+    return file_path, _count_records_in_tfrecord(file_path)
+
+
+def _count_total_expected(packages: List[str], num_workers: int, state_dir: Path) -> int:
+    cached_total = 0
+    missing_packages = []
+    for file_path in packages:
+        cached_count = _read_cached_int(_count_cache_path(state_dir, file_path))
+        if cached_count is None:
+            missing_packages.append(file_path)
+        else:
+            cached_total += cached_count
+
+    if not missing_packages:
+        return cached_total
+
     count_workers = max(1, min(num_workers, multiprocessing.cpu_count()))
     with multiprocessing.Pool(count_workers) as pool:
-        counts = pool.imap_unordered(_count_records_in_tfrecord, packages, chunksize=8)
-        return sum(tqdm(counts, total=len(packages), desc="counting scenarios"))
+        counts = pool.imap_unordered(_count_records_job, missing_packages, chunksize=8)
+        for file_path, count in tqdm(
+            counts,
+            total=len(missing_packages),
+            desc="counting scenarios",
+        ):
+            cached_total += count
+            _write_done_marker(_count_cache_path(state_dir, file_path), count)
+    return cached_total
 
 
 def _count_existing_pickles(output_dir: Path) -> int:
@@ -208,14 +252,29 @@ def get_agent_features(
         heading = states[:, 6]  # [n_step], heading
         if valid.sum() > 1:
             t_start, t_end = valid_steps[0], valid_steps[-1]
-            f_pos = interp1d(valid_steps, position[valid], axis=0)
-            f_vel = interp1d(valid_steps, velocity[valid], axis=0)
-            f_yaw = interp1d(valid_steps, np.unwrap(heading[valid], axis=0), axis=0)
             t_in = np.arange(t_start, t_end + 1)
+            position_valid = position[valid]
+            velocity_valid = velocity[valid]
+            heading_valid = np.unwrap(heading[valid], axis=0)
             out_dict["valid_mask"][i, t_start : t_end + 1] = True
-            out_dict["position"][i, t_start : t_end + 1] = torch.from_numpy(f_pos(t_in))
-            out_dict["velocity"][i, t_start : t_end + 1] = torch.from_numpy(f_vel(t_in))
-            out_dict["heading"][i, t_start : t_end + 1] = torch.from_numpy(f_yaw(t_in))
+            out_dict["position"][i, t_start : t_end + 1, 0] = torch.from_numpy(
+                np.interp(t_in, valid_steps, position_valid[:, 0])
+            )
+            out_dict["position"][i, t_start : t_end + 1, 1] = torch.from_numpy(
+                np.interp(t_in, valid_steps, position_valid[:, 1])
+            )
+            out_dict["position"][i, t_start : t_end + 1, 2] = torch.from_numpy(
+                np.interp(t_in, valid_steps, position_valid[:, 2])
+            )
+            out_dict["velocity"][i, t_start : t_end + 1, 0] = torch.from_numpy(
+                np.interp(t_in, valid_steps, velocity_valid[:, 0])
+            )
+            out_dict["velocity"][i, t_start : t_end + 1, 1] = torch.from_numpy(
+                np.interp(t_in, valid_steps, velocity_valid[:, 1])
+            )
+            out_dict["heading"][i, t_start : t_end + 1] = torch.from_numpy(
+                np.interp(t_in, valid_steps, heading_valid)
+            )
         else:
             t = valid_steps[0]
             out_dict["valid_mask"][i, t] = True
@@ -226,9 +285,10 @@ def get_agent_features(
     return out_dict
 
 
-def get_map_features(map_infos, tf_current_light, dim=2):
+def get_map_features(map_infos, current_light_by_lane_id, dim=2):
     polygon_ids = [x["id"] for k in _polygon_types for x in map_infos[k]]
     num_polygons = len(polygon_ids)
+    polygon_id_to_idx = {polygon_id: i for i, polygon_id in enumerate(polygon_ids)}
 
     # initialization
     polygon_type = torch.zeros(num_polygons, dtype=torch.uint8)
@@ -239,7 +299,7 @@ def get_map_features(map_infos, tf_current_light, dim=2):
 
     for _key in _polygon_types:
         for _seg in map_infos[_key]:
-            _idx = polygon_ids.index(_seg["id"])
+            _idx = polygon_id_to_idx[_seg["id"]]
             centerline = map_infos["all_polylines"][
                 _seg["polyline_index"][0] : _seg["polyline_index"][1]
             ]
@@ -256,11 +316,7 @@ def get_map_features(map_infos, tf_current_light, dim=2):
             )
 
             if _key == "lane":
-                res = tf_current_light[tf_current_light["lane_id"] == _seg["id"]]
-                if len(res) != 0:
-                    polygon_light_type[_idx] = _polygon_light_type.index(
-                        res["state"].item()
-                    )
+                polygon_light_type[_idx] = current_light_by_lane_id.get(_seg["id"], 0)
 
     num_points = torch.tensor(
         [point.size(0) for point in point_position], dtype=torch.long
@@ -297,33 +353,6 @@ def get_map_features(map_infos, tf_current_light, dim=2):
         "edge_index"
     ] = point_to_polygon_edge_index
     return map_data
-
-
-def process_dynamic_map(dynamic_map_infos):
-    lane_ids = dynamic_map_infos["lane_id"]
-    tf_lights = []
-    for t in range(len(lane_ids)):
-        lane_id = lane_ids[t]
-        time = np.ones_like(lane_id) * t
-        state = dynamic_map_infos["state"][t]
-        tf_light = np.concatenate([lane_id, time, state], axis=0)
-        tf_lights.append(tf_light)
-    tf_lights = np.concatenate(tf_lights, axis=1).transpose(1, 0)
-    tf_lights = pd.DataFrame(data=tf_lights, columns=["lane_id", "time_step", "state"])
-    tf_lights["time_step"] = tf_lights["time_step"].astype("int")
-    tf_lights["lane_id"] = tf_lights["lane_id"].astype("int")
-    tf_lights["state"] = tf_lights["state"].astype("str")
-    tf_lights.loc[tf_lights["state"].str.contains("STOP"), ["state"]] = (
-        "LANE_STATE_STOP"
-    )
-    tf_lights.loc[tf_lights["state"].str.contains("GO"), ["state"]] = "LANE_STATE_GO"
-    tf_lights.loc[tf_lights["state"].str.contains("CAUTION"), ["state"]] = (
-        "LANE_STATE_CAUTION"
-    )
-    tf_lights.loc[tf_lights["state"].str.contains("UNKNOWN"), ["state"]] = (
-        "LANE_STATE_UNKNOWN"
-    )
-    return tf_lights
 
 
 def decode_tracks_from_proto(scenario):
@@ -384,6 +413,7 @@ def decode_map_features_from_proto(map_features):
     map_infos = {"lane": [], "road_edge": [], "road_line": [], "crosswalk": []}
     polylines = []
     point_cnt = 0
+    lane_id_to_index = {}
     for mf in map_features:
         feature_data_type = mf.WhichOneof("feature_data")
         # pip install waymo-open-dataset-tf-2-6-0==1.4.9, not updated, should be driveway
@@ -413,6 +443,7 @@ def decode_map_features_from_proto(map_features):
 
                 cur_info["polyline_index"] = (point_cnt, point_cnt + len(cur_polyline))
                 map_infos["lane"].append(cur_info)
+                lane_id_to_index[mf.id] = len(map_infos["lane"]) - 1
                 polylines.append(cur_polyline)
                 point_cnt += len(cur_polyline)
 
@@ -494,14 +525,9 @@ def decode_map_features_from_proto(map_features):
             for l_id in feature.lane:
                 # override FREEWAY/SURFACE_STREET with stop sign lane
                 # BIKE_LANE remains unchanged
-                is_found = False
-                for _i in range(len(map_infos["lane"])):
-                    if map_infos["lane"][_i]["id"] == l_id:
-                        is_found = True
-                        if map_infos["lane"][_i]["type"] < 2:
-                            map_infos["lane"][_i]["type"] = 2
-                # not necessary found, some stop sign lanes are for lane with length 1
-                # assert is_found
+                lane_idx = lane_id_to_index.get(l_id)
+                if lane_idx is not None and map_infos["lane"][lane_idx]["type"] < 2:
+                    map_infos["lane"][lane_idx]["type"] = 2
 
     try:
         polylines = np.concatenate(polylines, axis=0).astype(np.float32)
@@ -511,34 +537,13 @@ def decode_map_features_from_proto(map_features):
     map_infos["all_polylines"] = polylines
     return map_infos
 
-
-def decode_dynamic_map_states_from_proto(dynamic_map_states):
-    signal_state = {
-        0: "LANE_STATE_UNKNOWN",
-        #  States for traffic signals with arrows.
-        1: "LANE_STATE_ARROW_STOP",
-        2: "LANE_STATE_ARROW_CAUTION",
-        3: "LANE_STATE_ARROW_GO",
-        #  Standard round traffic signals.
-        4: "LANE_STATE_STOP",
-        5: "LANE_STATE_CAUTION",
-        6: "LANE_STATE_GO",
-        #  Flashing light signals.
-        7: "LANE_STATE_FLASHING_STOP",
-        8: "LANE_STATE_FLASHING_CAUTION",
-    }
-
-    dynamic_map_infos = {"lane_id": [], "state": []}
-    for cur_data in dynamic_map_states:  # (num_timestamp)
-        lane_id, state = [], []
-        for cur_signal in cur_data.lane_states:  # (num_observed_signals)
-            lane_id.append(cur_signal.lane)
-            state.append(signal_state[cur_signal.state])
-
-        dynamic_map_infos["lane_id"].append(np.array([lane_id]))
-        dynamic_map_infos["state"].append(np.array([state]))
-
-    return dynamic_map_infos
+def decode_current_dynamic_map_state(dynamic_map_states, current_time_index):
+    current_light_by_lane_id = {}
+    for cur_signal in dynamic_map_states[current_time_index].lane_states:
+        current_light_by_lane_id[cur_signal.lane] = _signal_state_to_polygon_light_type[
+            cur_signal.state
+        ]
+    return current_light_by_lane_id
 
 
 def wm2argo(
@@ -560,15 +565,12 @@ def wm2argo(
 
         track_infos = decode_tracks_from_proto(scenario)
         map_infos = decode_map_features_from_proto(scenario.map_features)
-        dynamic_map_infos = decode_dynamic_map_states_from_proto(
-            scenario.dynamic_map_states
-        )
-
         current_time_index = scenario.current_time_index
         scenario_id = scenario.scenario_id
-        tf_lights = process_dynamic_map(dynamic_map_infos)
-        tf_current_light = tf_lights.loc[tf_lights["time_step"] == current_time_index]
-        map_data = get_map_features(map_infos, tf_current_light)
+        current_light_by_lane_id = decode_current_dynamic_map_state(
+            scenario.dynamic_map_states, current_time_index
+        )
+        map_data = get_map_features(map_infos, current_light_by_lane_id)
 
         data = preprocess_map(map_data)
         data["agent"] = get_agent_features(
@@ -614,7 +616,7 @@ def batch_process9s_transformer(
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
-    total_expected = _count_total_expected(packages, num_workers)
+    total_expected = _count_total_expected(packages, num_workers, state_dir)
     existing_count = _count_existing_pickles(output_dir)
     progress_counter = multiprocessing.Value("Q", existing_count)
     start_time = time.time()
