@@ -108,12 +108,13 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
         """
         anchor_token_idx = anchor_10hz // self.shift
         start_token_idx = max(0, anchor_token_idx - self.history_slots)
+        clean_heading_full = tokenized_agent.get("clean_heading_full", data["agent"]["heading"])
 
-        current_head = data["agent"]["heading"][:, anchor_10hz].clone()  # [n_agent]
+        current_head = clean_heading_full[:, anchor_10hz].clone()  # [n_agent]
         current_vel = data["agent"]["velocity"][:, anchor_10hz].clone()  # [n_agent, 2]
         current_valid = data["agent"]["valid_mask"][:, anchor_10hz].clone()  # [n_agent]
         if anchor_10hz > 0:
-            prev_head = data["agent"]["heading"][:, anchor_10hz - 1]
+            prev_head = clean_heading_full[:, anchor_10hz - 1]
             current_yaw_rate = wrap_angle(current_head - prev_head) / 0.1  # [n_agent]
         else:
             current_yaw_rate = current_head.new_zeros(current_head.shape)
@@ -208,9 +209,11 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
             feat_a = feat_a.view(n_hist, n_agent, -1).transpose(0, 1)
 
-        last_idx = mask.long().sum(dim=1).sub(1).clamp(min=0)  # [n_agent]
+        has_valid = mask.any(dim=1)
+        valid_index = torch.arange(n_hist, device=mask.device).unsqueeze(0).expand_as(mask)
+        last_idx = valid_index.masked_fill(~mask, -1).amax(dim=1).clamp(min=0)  # [n_agent]
         hist_feat = feat_a[torch.arange(n_agent, device=feat_a.device), last_idx]  # [n_agent, hidden_dim]
-        hist_feat = hist_feat * mask.any(dim=1, keepdim=True).to(hist_feat.dtype)
+        hist_feat = hist_feat * has_valid.unsqueeze(1).to(hist_feat.dtype)
         return hist_feat
 
     def prepare_context(
@@ -355,9 +358,10 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
         """open-loop anchor 하나에 대한 flow 학습 입력을 만듭니다."""
         state = self.build_initial_state(tokenized_agent, data, anchor_10hz)
         context = self.prepare_context(tokenized_agent, map_feature, state)
+        clean_heading_full = tokenized_agent.get("clean_heading_full", data["agent"]["heading"])
         target_future, target_valid = build_local_future_target(
             pos_global=data["agent"]["position"][..., :2],
-            head_global=data["agent"]["heading"],
+            head_global=clean_heading_full,
             valid_mask=data["agent"]["valid_mask"],
             anchor_10hz=anchor_10hz,
             anchor_pos=state["current_pos"],
@@ -535,9 +539,10 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
                 pred_head_10hz[:, step * self.shift : (step + 1) * self.shift],
             )
             if return_targets and data is not None:
+                clean_heading_full = tokenized_agent.get("clean_heading_full", data["agent"]["heading"])
                 target_future, target_valid = build_local_future_target(
                     pos_global=data["agent"]["position"][..., :2],
-                    head_global=data["agent"]["heading"],
+                    head_global=clean_heading_full,
                     valid_mask=data["agent"]["valid_mask"],
                     anchor_10hz=anchor_10hz,
                     anchor_pos=state["current_pos"],

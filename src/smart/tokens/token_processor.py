@@ -139,15 +139,18 @@ class TokenProcessor(torch.nn.Module):
             data["agent"]["type"]
         )
 
-        # ! get raw trajectory data
-        valid = data["agent"]["valid_mask"]  # [n_agent, n_step]
-        heading = data["agent"]["heading"]  # [n_agent, n_step]
-        pos = data["agent"]["position"][..., :2].contiguous()  # [n_agent, n_step, 2]
-        vel = data["agent"]["velocity"]  # [n_agent, n_step, 2]
+        valid_raw = data["agent"]["valid_mask"]  # [n_agent, n_step]
+        heading_raw = data["agent"]["heading"]  # [n_agent, n_step]
+        pos_raw = data["agent"]["position"][..., :2]  # [n_agent, n_step, 2]
+        vel_raw = data["agent"]["velocity"]  # [n_agent, n_step, 2]
 
-        # ! agent, specifically vehicle's heading can be 180 degree off. We fix it here.
-        heading = self._clean_heading(valid, heading)
-        # ! extrapolate to previous 5th step.
+        # Keep the original batch immutable. The cleaned full heading is reused by
+        # anchor/GT construction, while the extrapolated copies are only for tokenization.
+        clean_heading_full = self._clean_heading(valid_raw.clone(), heading_raw.clone())
+        valid = valid_raw.clone()
+        heading = clean_heading_full.clone()
+        pos = pos_raw.clone().contiguous()
+        vel = vel_raw.clone()
         valid, pos, heading, vel = self._extrapolate_agent_to_prev_token_step(
             valid, pos, heading, vel
         )
@@ -160,6 +163,7 @@ class TokenProcessor(torch.nn.Module):
             "ego_mask": data["agent"]["role"][:, 0],  # [n_agent]
             "token_agent_shape": agent_shape,  # [n_agent, 2]
             "batch": data["agent"]["batch"],
+            "clean_heading_full": clean_heading_full,  # [n_agent, n_step]
             "token_traj_all": token_traj_all,  # [n_agent, n_token, 6, 4, 2]
             "token_traj": token_traj,  # [n_agent, n_token, 4, 2]
             # for step {5, 10, ..., 90}
