@@ -28,7 +28,7 @@ import wandb
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from lightning.pytorch.loggers.wandb import WandbLogger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from src.utils import (
     RankedLogger,
@@ -170,6 +170,21 @@ def install_wandb_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, _finish_wandb)
 
 
+def build_trainer_cfg(cfg: DictConfig, model: LightningModule) -> DictConfig:
+    trainer_cfg = OmegaConf.create(OmegaConf.to_container(cfg.trainer, resolve=False))
+    if getattr(model, "automatic_optimization", True):
+        return trainer_cfg
+
+    clip_val = trainer_cfg.get("gradient_clip_val")
+    clip_algorithm = trainer_cfg.get("gradient_clip_algorithm")
+    if hasattr(model, "set_manual_gradient_clipping"):
+        model.set_manual_gradient_clipping(clip_val, clip_algorithm)
+
+    # Lightning rejects Trainer-level automatic clipping for manual optimization.
+    trainer_cfg.gradient_clip_val = None
+    return trainer_cfg
+
+
 def run(cfg: DictConfig) -> None:
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
@@ -191,9 +206,16 @@ def run(cfg: DictConfig) -> None:
         if isinstance(_logger, WandbLogger) and is_global_zero:
             _logger.watch(model, log="all")
 
-    log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
+    trainer_cfg = build_trainer_cfg(cfg, model)
+    if not getattr(model, "automatic_optimization", True):
+        log.info(
+            "Manual optimization detected; disabling Trainer automatic gradient clipping "
+            "and delegating clipping to the model."
+        )
+
+    log.info(f"Instantiating trainer <{trainer_cfg._target_}>")
     trainer: Trainer = hydra.utils.instantiate(
-        cfg.trainer, callbacks=callbacks, logger=logger
+        trainer_cfg, callbacks=callbacks, logger=logger
     )
 
     log.info("Logging hyperparameters!")

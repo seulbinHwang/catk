@@ -64,6 +64,8 @@ class SMART(LightningModule):
         self.video_dir = Path(self.video_dir) / "videos"
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
         self.automatic_optimization = False
+        self.manual_gradient_clip_val = None
+        self.manual_gradient_clip_algorithm = None
 
     @property
     def anchor_steps(self) -> List[int]:
@@ -120,14 +122,23 @@ class SMART(LightningModule):
     def _should_step_optimizer(self, batch_idx: int, accumulate_grad_batches: int) -> bool:
         return (batch_idx + 1) % accumulate_grad_batches == 0 or self._is_last_train_batch(batch_idx)
 
+    def set_manual_gradient_clipping(self, clip_val, clip_algorithm) -> None:
+        self.manual_gradient_clip_val = clip_val
+        self.manual_gradient_clip_algorithm = clip_algorithm
+
     def _clip_gradients_if_needed(self, optimizer) -> None:
-        clip_val = getattr(self.trainer, "gradient_clip_val", None)
+        clip_val = self.manual_gradient_clip_val
+        if clip_val is None:
+            clip_val = getattr(self.trainer, "gradient_clip_val", None)
         if clip_val is None or clip_val <= 0:
             return
+        clip_algorithm = self.manual_gradient_clip_algorithm
+        if clip_algorithm is None:
+            clip_algorithm = getattr(self.trainer, "gradient_clip_algorithm", None)
         self.clip_gradients(
             optimizer,
             gradient_clip_val=clip_val,
-            gradient_clip_algorithm=getattr(self.trainer, "gradient_clip_algorithm", None),
+            gradient_clip_algorithm=clip_algorithm,
         )
 
     def training_step(self, data, batch_idx):
