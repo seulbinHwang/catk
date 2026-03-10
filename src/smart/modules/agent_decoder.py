@@ -430,6 +430,47 @@ class SMARTAgentDecoder(nn.Module):
         seg_feat = seg_feat + flow_t.unsqueeze(1)
         return seg_feat
 
+    def _build_reference_future_pose(self, state: Dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """현재 상태만으로 map lookup용 deterministic 2초 reference pose를 만든다.
+
+        Query feature와 dynamic future graph는 noisy ``x_t``를 그대로 사용하고,
+        정적인 map cross-attention만 현재 상태 기반 reference를 사용해 graph support를
+        안정화한다.
+        """
+        dt = state["current_pos"].new_tensor([0.5, 1.0, 1.5, 2.0])
+        head_now = state["current_head"]
+        vel_now = state["current_vel"]
+        yaw_rate = state["current_yaw_rate"]
+
+        cos_h = head_now.cos()
+        sin_h = head_now.sin()
+        vel_x_local = vel_now[:, 0] * cos_h + vel_now[:, 1] * sin_h
+        vel_y_local = -vel_now[:, 0] * sin_h + vel_now[:, 1] * cos_h
+
+        omega = yaw_rate.unsqueeze(1)
+        omega_dt = omega * dt.unsqueeze(0)
+        small_turn = omega.abs() < 1e-4
+        safe_omega = torch.where(small_turn, torch.ones_like(omega), omega)
+
+        dx_local_linear = vel_x_local.unsqueeze(1) * dt.unsqueeze(0)
+        dy_local_linear = vel_y_local.unsqueeze(1) * dt.unsqueeze(0)
+        dx_local_turn = (
+            omega_dt.sin() * vel_x_local.unsqueeze(1)
+            - (1.0 - omega_dt.cos()) * vel_y_local.unsqueeze(1)
+        ) / safe_omega
+        dy_local_turn = (
+            (1.0 - omega_dt.cos()) * vel_x_local.unsqueeze(1)
+            + omega_dt.sin() * vel_y_local.unsqueeze(1)
+        ) / safe_omega
+        dx_local = torch.where(small_turn, dx_local_linear, dx_local_turn)
+        dy_local = torch.where(small_turn, dy_local_linear, dy_local_turn)
+
+        dx_global = dx_local * cos_h.unsqueeze(1) - dy_local * sin_h.unsqueeze(1)
+        dy_global = dx_local * sin_h.unsqueeze(1) + dy_local * cos_h.unsqueeze(1)
+        future_pos = state["current_pos"].unsqueeze(1) + torch.stack([dx_global, dy_global], dim=-1)
+        future_head = wrap_angle(head_now.unsqueeze(1) + omega_dt)
+        return future_pos, future_head
+
     def build_temporal_edge(
         self,
         pos_a: Tensor,
@@ -679,12 +720,14 @@ class SMARTAgentDecoder(nn.Module):
             batch_s=batch_s,
             mask=future_mask,
         )
+        map_ref_pos, map_ref_head = self._build_reference_future_pose(state)
+        map_ref_head_vec = torch.stack([map_ref_head.cos(), map_ref_head.sin()], dim=-1)
         edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
             pos_pl=map_feature["position"],
             orient_pl=map_feature["orientation"],
-            pos_a=future_pos,
-            head_a=future_head,
-            head_vector_a=future_head_vec,
+            pos_a=map_ref_pos,
+            head_a=map_ref_head,
+            head_vector_a=map_ref_head_vec,
             mask=future_mask,
             batch_s=batch_s,
             batch_pl=batch_pl,
