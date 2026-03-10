@@ -81,6 +81,13 @@ _detect_available_cpus() {
     return
   fi
 
+  cpus="$(_count_cpus_in_list "$ACTIVE_CPUSET")"
+  if [[ "$cpus" -gt 0 ]]; then
+    CPU_DETECTION_SOURCE="cpuset"
+    AVAILABLE_CPUS="$cpus"
+    return
+  fi
+
   if [[ -r /sys/fs/cgroup/cpu.max ]]; then
     read -r quota period < /sys/fs/cgroup/cpu.max || true
     if [[ -n "${quota:-}" && -n "${period:-}" && "$quota" != "max" && "$period" -gt 0 ]]; then
@@ -109,13 +116,6 @@ _detect_available_cpus() {
   cpus="$(nproc 2>/dev/null || true)"
   if [[ -n "${cpus:-}" && "$cpus" -gt 0 ]]; then
     CPU_DETECTION_SOURCE="nproc"
-    AVAILABLE_CPUS="$cpus"
-    return
-  fi
-
-  cpus="$(_count_cpus_in_list "$ACTIVE_CPUSET")"
-  if [[ "$cpus" -gt 0 ]]; then
-    CPU_DETECTION_SOURCE="taskset"
     AVAILABLE_CPUS="$cpus"
     return
   fi
