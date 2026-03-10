@@ -192,7 +192,10 @@ class SMARTAgentDecoder(nn.Module):
         agent_token_emb_veh = self.token_emb_veh(trajectory_token_veh)
         agent_token_emb_ped = self.token_emb_ped(trajectory_token_ped)
         agent_token_emb_cyc = self.token_emb_cyc(trajectory_token_cyc)
-        agent_token_emb = torch.zeros((n_agent, n_step, self.hidden_dim), device=device, dtype=pos_a.dtype)
+        # Mixed precision can autocast token embeddings to bf16 while the history
+        # state tensors stay in fp32. Build the staging buffer from the embedding
+        # dtype so indexed assignment remains valid under bf16-mixed training.
+        agent_token_emb = agent_token_emb_veh.new_zeros((n_agent, n_step, self.hidden_dim))
         if veh_mask.any():
             agent_token_emb[veh_mask] = agent_token_emb_veh[agent_token_index[veh_mask]]
         if ped_mask.any():
