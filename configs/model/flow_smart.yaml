@@ -58,6 +58,6 @@ model_config:
     account_name: YOUR_ACCOUNT_NAME
   training_loss:
     flow_weight: 1.0
-    overlap_weight: 0.25
-    recon_weight: 0.1
+    consistency_weight: 0.5
+    xy_scale_m: 20.0
   finetune: false

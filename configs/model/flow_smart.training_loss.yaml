@@ -1,3 +1,4 @@
 training_loss:
   flow_weight: 1.0
   consistency_weight: 0.5
+  xy_scale_m: 20.0

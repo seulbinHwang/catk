@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,12 +25,30 @@ class FlowMatchingLoss(nn.Module):
     Args:
         flow_weight: 기본 flow 손실 가중치.
         consistency_weight: segment 경계 일치 손실 가중치.
+        xy_scale_m: loss에서만 x, y 오차를 나눌 고정 길이 스케일.
+        overlap_weight: ``consistency_weight`` 의 하위 호환 alias.
+        recon_weight: 더 이상 쓰지 않지만 기존 config 호환을 위해 받는다.
     """
 
-    def __init__(self, flow_weight: float = 1.0, consistency_weight: float = 1.0) -> None:
+    def __init__(
+        self,
+        flow_weight: float = 1.0,
+        consistency_weight: Optional[float] = None,
+        xy_scale_m: float = 20.0,
+        overlap_weight: Optional[float] = None,
+        recon_weight: Optional[float] = None,
+    ) -> None:
         super().__init__()
+        if consistency_weight is None:
+            consistency_weight = overlap_weight if overlap_weight is not None else 1.0
+        if xy_scale_m <= 0.0:
+            raise ValueError(f"xy_scale_m must be positive, got {xy_scale_m}.")
+
+        del recon_weight
+
         self.flow_weight = flow_weight
         self.consistency_weight = consistency_weight
+        self.xy_scale_m = xy_scale_m
 
     @staticmethod
     def _masked_mean(square_error: Tensor, mask: Tensor) -> Tensor:
@@ -44,8 +62,19 @@ class FlowMatchingLoss(nn.Module):
             마스크가 적용된 스칼라 평균값.
         """
         weight = mask.to(square_error.dtype)
+        _, weight = torch.broadcast_tensors(square_error, weight)
         denom = torch.clamp(weight.sum(), min=1.0)
         return (square_error * weight).sum() / denom
+
+    def _channel_balanced_loss(self, diff: Tensor, mask: Tensor) -> Tensor:
+        """xy와 heading 채널을 분리 평균해 채널 불균형을 줄인다.
+
+        geometry에 해당하는 trajectory/segment 자체는 raw 공간에 두고,
+        최종 loss residual에만 xy 스케일 정규화를 적용한다.
+        """
+        xy_loss = self._masked_mean((diff[..., :2] / self.xy_scale_m) ** 2, mask)
+        heading_loss = self._masked_mean(diff[..., 2:] ** 2, mask)
+        return 0.5 * (xy_loss + heading_loss)
 
     def _flow_loss(
         self,
@@ -64,7 +93,7 @@ class FlowMatchingLoss(nn.Module):
             스칼라 기본 손실.
         """
         seg_mask = loss_mask[:, None, None, None]  # [N, 1, 1, 1]
-        return self._masked_mean((flow_pred - flow_target) ** 2, seg_mask)
+        return self._channel_balanced_loss(flow_pred - flow_target, seg_mask)
 
     def _consistency_loss(self, pred_segments: Tensor, loss_mask: Tensor) -> Tensor:
         """겹치는 future segment 경계 일치 손실을 계산한다.
@@ -80,11 +109,10 @@ class FlowMatchingLoss(nn.Module):
             스칼라 경계 일치 손실.
         """
         boundary_mask = loss_mask[:, None]  # [N, 1]
-
+        boundary_diffs = pred_segments[:, :-1, -1] - pred_segments[:, 1:, 0]  # [N, 3, 4]
         boundary_losses = [
-            self._masked_mean((pred_segments[:, 0, -1] - pred_segments[:, 1, 0]) ** 2, boundary_mask),
-            self._masked_mean((pred_segments[:, 1, -1] - pred_segments[:, 2, 0]) ** 2, boundary_mask),
-            self._masked_mean((pred_segments[:, 2, -1] - pred_segments[:, 3, 0]) ** 2, boundary_mask),
+            self._channel_balanced_loss(boundary_diffs[:, i], boundary_mask)
+            for i in range(boundary_diffs.shape[1])
         ]
         return torch.stack(boundary_losses).mean()
 
