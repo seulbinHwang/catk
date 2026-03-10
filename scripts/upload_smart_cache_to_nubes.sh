@@ -40,6 +40,6 @@ echo "Step: Uploading SMART_cache directory..."
 taskset -c "${CPUSET}" \
 nubescli dir-upload "$REMOTE_DIR" \
   "$LOCAL_DIR" \
-  -e -j ${NUM_CPUS_FOR_USE}
+  -s -j ${NUM_CPUS_FOR_USE}
 
 echo "Upload complete."
