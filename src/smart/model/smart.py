@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -62,6 +63,7 @@ class SMART(LightningModule):
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
+        self.automatic_optimization = False
 
     @property
     def anchor_steps(self) -> List[int]:
@@ -105,7 +107,36 @@ class SMART(LightningModule):
             loss_mask=loss_mask,
         )
 
+    def _accumulate_grad_batches(self) -> int:
+        return max(int(getattr(self.trainer, "accumulate_grad_batches", 1)), 1)
+
+    def _is_last_train_batch(self, batch_idx: int) -> bool:
+        trainer_last_batch = getattr(self.trainer, "is_last_batch", None)
+        if isinstance(trainer_last_batch, bool):
+            return trainer_last_batch
+        num_batches = getattr(self.trainer, "num_training_batches", None)
+        return isinstance(num_batches, int) and batch_idx + 1 >= num_batches
+
+    def _should_step_optimizer(self, batch_idx: int, accumulate_grad_batches: int) -> bool:
+        return (batch_idx + 1) % accumulate_grad_batches == 0 or self._is_last_train_batch(batch_idx)
+
+    def _clip_gradients_if_needed(self, optimizer) -> None:
+        clip_val = getattr(self.trainer, "gradient_clip_val", None)
+        if clip_val is None or clip_val <= 0:
+            return
+        self.clip_gradients(
+            optimizer,
+            gradient_clip_val=clip_val,
+            gradient_clip_algorithm=getattr(self.trainer, "gradient_clip_algorithm", None),
+        )
+
     def training_step(self, data, batch_idx):
+        optimizer = self.optimizers()
+        accumulate_grad_batches = self._accumulate_grad_batches()
+        if batch_idx % accumulate_grad_batches == 0:
+            optimizer.zero_grad()
+        should_step_optimizer = self._should_step_optimizer(batch_idx, accumulate_grad_batches)
+
         tokenized_map, tokenized_agent = self.token_processor(data)
         map_feature = self.encoder.encode_map(tokenized_map)
 
@@ -113,44 +144,68 @@ class SMART(LightningModule):
         total_flow = 0.0
         total_overlap = 0.0
         total_recon = 0.0
-        n_terms = 0
-
-        if self.use_closed_loop_finetune:
-            outputs = self.encoder.closed_loop_train(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                agent_raw=data["agent"],
-                unroll_steps=self.closed_loop_unroll,
-            )
-            for pred in outputs:
-                loss_mask = self._loss_mask_train(pred, data)
-                loss, log_dict = self._compute_single_loss(pred, loss_mask)
-                total_loss = total_loss + loss
-                total_flow = total_flow + log_dict["flow"]
-                total_overlap = total_overlap + log_dict["overlap"]
-                total_recon = total_recon + log_dict["recon"]
-                n_terms += 1
-        else:
-            for anchor_step in self._select_train_anchor_steps():
-                pred = self.encoder.forward_from_map(
-                    map_feature=map_feature,
+        block_backward_sync = getattr(self.trainer.strategy, "block_backward_sync", None)
+        backward_sync_ctx = (
+            block_backward_sync(self, block=not should_step_optimizer)
+            if callable(block_backward_sync)
+            else nullcontext()
+        )
+        with backward_sync_ctx:
+            if self.use_closed_loop_finetune:
+                n_terms = self.closed_loop_unroll
+                state = self.encoder.init_closed_loop_state(
                     tokenized_agent=tokenized_agent,
                     agent_raw=data["agent"],
-                    anchor_step=anchor_step,
                 )
-                loss_mask = self._loss_mask_train(pred, data)
-                loss, log_dict = self._compute_single_loss(pred, loss_mask)
-                total_loss = total_loss + loss
-                total_flow = total_flow + log_dict["flow"]
-                total_overlap = total_overlap + log_dict["overlap"]
-                total_recon = total_recon + log_dict["recon"]
-                n_terms += 1
+                for step_idx in range(self.closed_loop_unroll):
+                    pred, state = self.encoder.closed_loop_train_step(
+                        map_feature=map_feature,
+                        tokenized_agent=tokenized_agent,
+                        agent_raw=data["agent"],
+                        state=state,
+                        step_idx=step_idx,
+                    )
+                    loss_mask = self._loss_mask_train(pred, data)
+                    loss, log_dict = self._compute_single_loss(pred, loss_mask)
+                    total_loss = total_loss + loss.detach()
+                    total_flow = total_flow + log_dict["flow"].detach()
+                    total_overlap = total_overlap + log_dict["overlap"].detach()
+                    total_recon = total_recon + log_dict["recon"].detach()
+                    self.manual_backward(
+                        loss / max(n_terms * accumulate_grad_batches, 1),
+                        retain_graph=step_idx + 1 < n_terms,
+                    )
+                    del pred, loss, log_dict
+            else:
+                anchor_steps = self._select_train_anchor_steps()
+                n_terms = len(anchor_steps)
+                for anchor_idx, anchor_step in enumerate(anchor_steps):
+                    pred = self.encoder.forward_from_map(
+                        map_feature=map_feature,
+                        tokenized_agent=tokenized_agent,
+                        agent_raw=data["agent"],
+                        anchor_step=anchor_step,
+                    )
+                    loss_mask = self._loss_mask_train(pred, data)
+                    loss, log_dict = self._compute_single_loss(pred, loss_mask)
+                    total_loss = total_loss + loss.detach()
+                    total_flow = total_flow + log_dict["flow"].detach()
+                    total_overlap = total_overlap + log_dict["overlap"].detach()
+                    total_recon = total_recon + log_dict["recon"].detach()
+                    self.manual_backward(
+                        loss / max(n_terms * accumulate_grad_batches, 1),
+                        retain_graph=anchor_idx + 1 < n_terms,
+                    )
+                    del pred, loss, log_dict
 
         total_loss = total_loss / max(n_terms, 1)
         self.log("train/loss", total_loss, on_step=True, batch_size=1)
         self.log("train/flow", total_flow / max(n_terms, 1), on_step=True, batch_size=1)
         self.log("train/overlap", total_overlap / max(n_terms, 1), on_step=True, batch_size=1)
         self.log("train/recon", total_recon / max(n_terms, 1), on_step=True, batch_size=1)
+        if should_step_optimizer:
+            self._clip_gradients_if_needed(optimizer)
+            optimizer.step()
         return total_loss
 
     def validation_step(self, data, batch_idx):
@@ -253,6 +308,16 @@ class SMART(LightningModule):
                 self.minADE.reset()
             elif self.global_rank == 0:
                 self.wosac_submission.save_sub_file()
+
+    def on_train_epoch_end(self) -> None:
+        scheduler = self.lr_schedulers()
+        if scheduler is None:
+            return
+        if isinstance(scheduler, (list, tuple)):
+            for lr_scheduler in scheduler:
+                lr_scheduler.step()
+            return
+        scheduler.step()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
