@@ -4,30 +4,28 @@
 # SPDX-FileCopyrightText: Copyright (c) <year> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 
+from __future__ import annotations
+
 import math
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, Tuple
 
 import hydra
 import torch
 from lightning import LightningModule
+from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import FlowMatchingLoss, WOSACMetrics, WOSACSubmission, minADE
 from src.smart.modules.smart_decoder import SMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
-from src.smart.utils.flow_traj import (
-    build_anchor_10hz_indices,
-    chunk_future_21_to_4x6,
-    sample_anchor_10hz_indices,
-)
 from src.utils.vis_waymo import VisWaymo
 from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
 
 class SMART(LightningModule):
-    """CAT-K 학습/검증 파이프라인을 유지한 flow 버전 SMART입니다."""
+    """CAT-K/SMART 학습·검증·제출 파이프라인을 유지한 flow 버전 모델."""
 
     def __init__(self, model_config) -> None:
         super().__init__()
@@ -39,24 +37,21 @@ class SMART(LightningModule):
         self.num_historical_steps = model_config.decoder.num_historical_steps
         self.num_future_steps = model_config.decoder.num_future_steps
         self.future_window_steps = model_config.decoder.future_window_steps
-        self.anchor_chunk_k = model_config.decoder.anchor_chunk_k
-        self.closed_loop_steps = model_config.closed_loop_steps
-        self.train_max_num = model_config.get("train_max_num")
+        self.anchor_chunk_k = model_config.anchor_chunk_k
+        self.closed_loop_unroll = model_config.closed_loop_unroll
+        self.use_closed_loop_finetune = model_config.use_closed_loop_finetune
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
-
         self.token_processor = TokenProcessor(**model_config.token_processor)
-        self.encoder = SMARTDecoder(
-            **model_config.decoder,
-            n_token_agent=self.token_processor.n_token_agent,
-        )
+
+        self.encoder = SMARTDecoder(**model_config.decoder, n_token_agent=self.token_processor.n_token_agent)
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
+        self.flow_loss = FlowMatchingLoss(**model_config.training_loss)
         self.minADE = minADE()
         self.wosac_metrics = WOSACMetrics("val_closed")
         self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
-        self.training_loss = FlowMatchingLoss(**model_config.training_loss)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
         self.n_vis_batch = model_config.n_vis_batch
@@ -64,263 +59,140 @@ class SMART(LightningModule):
         self.n_vis_rollout = model_config.n_vis_rollout
         self.n_batch_wosac_metric = model_config.n_batch_wosac_metric
 
-        self.flow_sampling = model_config.flow_sampling
-        self.validation_flow_sampling = model_config.validation_flow_sampling
-
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
+        self.validation_rollout_sampling = model_config.validation_rollout_sampling
 
-    def _get_train_mask(self, data) -> torch.Tensor | None:
-        if "train_mask" in data["agent"]:
-            return data["agent"]["train_mask"]
-        return None
+    @property
+    def anchor_steps(self) -> List[int]:
+        """2초 supervisory window가 끝까지 존재하는 모든 anchor step 목록."""
+        last_anchor = self.num_historical_steps - 1 + self.num_future_steps - self.future_window_steps
+        return list(range(self.num_historical_steps - 1, last_anchor + 1, 5))
 
-    def _limit_train_mask_per_graph(
-        self,
-        role_train_mask: torch.Tensor,
-        extra_train_mask: torch.Tensor,
-        batch: torch.Tensor,
-        num_graphs: int,
-    ) -> torch.Tensor:
-        train_mask = role_train_mask.clone()
-        extra_only_mask = extra_train_mask & ~role_train_mask
-        if self.train_max_num is None:
-            train_mask |= extra_only_mask
-            return train_mask
+    def _select_train_anchor_steps(self) -> List[int]:
+        """랜덤 1개 대신 deterministic anchor-chunk를 고른다."""
+        anchors = self.anchor_steps
+        if self.anchor_chunk_k >= len(anchors):
+            return anchors
+        start = (self.global_step * self.anchor_chunk_k) % len(anchors)
+        return [anchors[(start + i) % len(anchors)] for i in range(self.anchor_chunk_k)]
 
-        for graph_idx in range(num_graphs):
-            graph_mask = batch == graph_idx
-            graph_role_count = int((role_train_mask & graph_mask).sum().item())
-            remaining = self.train_max_num - graph_role_count
-            if remaining <= 0:
-                continue
+    @staticmethod
+    def _local_ade(pred_future_local: Tensor, gt_future_local: Tensor, mask: Tensor) -> Tensor:
+        """2초 local ADE를 계산한다."""
+        dist = torch.norm(pred_future_local[..., :2] - gt_future_local[..., :2], dim=-1)
+        weight = mask[:, None].to(dist.dtype)
+        denom = torch.clamp(weight.sum() * dist.shape[1], min=1.0)
+        return (dist * weight).sum() / denom
 
-            extra_indices = torch.where(extra_only_mask & graph_mask)[0]
-            if extra_indices.numel() <= remaining:
-                train_mask[extra_indices] = True
-                continue
+    def _loss_mask_train(self, pred: Dict[str, Tensor], data) -> Tensor:
+        """학습용 agent mask를 만든다."""
+        return data["agent"]["train_mask"] & pred["future_valid"]
 
-            selected = torch.randperm(extra_indices.numel(), device=batch.device)[:remaining]
-            train_mask[extra_indices[selected]] = True
-        return train_mask
+    def _loss_mask_eval(self, pred: Dict[str, Tensor], data, anchor_step: int) -> Tensor:
+        """검증용 유효 agent mask를 만든다."""
+        return data["agent"]["valid_mask"][:, anchor_step] & pred["future_valid"]
 
-    def _build_anchor_train_mask(
-        self,
-        data,
-        anchor_10hz: int,
-        target_valid: torch.Tensor,
-    ) -> torch.Tensor:
-        anchor_active = target_valid[:, 0]
-        if self._get_train_mask(data) is None:
-            return anchor_active
-
-        agent_batch = data["agent"]["batch"]
-        ego_mask = data["agent"]["role"][:, 0]
-        if int(ego_mask.sum().item()) != data.num_graphs:
-            raise ValueError("Expected exactly one ego agent per graph when building anchor train masks.")
-
-        anchor_pos = data["agent"]["position"][:, anchor_10hz, :2]
-        ego_anchor_pos = anchor_pos.new_zeros((data.num_graphs, 2))
-        ego_anchor_pos[agent_batch[ego_mask]] = anchor_pos[ego_mask]
-        anchor_distance = torch.norm(anchor_pos - ego_anchor_pos[agent_batch], dim=-1)
-
-        role_train_mask = data["agent"]["role"].any(-1)
-        future_valid_count = target_valid[:, 1:].sum(-1)
-        extra_train_mask = (anchor_distance < 100.0) & (future_valid_count >= 5)
-        train_mask = self._limit_train_mask_per_graph(
-            role_train_mask=role_train_mask,
-            extra_train_mask=extra_train_mask,
-            batch=agent_batch,
-            num_graphs=data.num_graphs,
-        )
-        return train_mask & anchor_active
-
-    def _open_loop_anchor_loss(
-        self,
-        data,
-        tokenized_map: Dict[str, torch.Tensor],
-        tokenized_agent: Dict[str, torch.Tensor],
-        map_feature: Dict[str, torch.Tensor],
-        anchor_10hz: int,
-    ):
-        pred = self.encoder(
-            tokenized_map=tokenized_map,
-            tokenized_agent=tokenized_agent,
-            data=data,
-            anchor_10hz=anchor_10hz,
-            sampling_cfg=self.flow_sampling,
-            map_feature=map_feature,
-        )
-        train_mask = self._build_anchor_train_mask(
-            data=data,
-            anchor_10hz=anchor_10hz,
-            target_valid=pred["target_valid"],
-        )
-        return self.training_loss(
+    def _compute_single_loss(self, pred: Dict[str, Tensor], loss_mask: Tensor) -> Tuple[Tensor, Dict[str, Tensor]]:
+        """한 anchor의 flow loss를 계산한다."""
+        return self.flow_loss(
+            flow_pred=pred["flow_pred"],
+            flow_target=pred["flow_target"],
             pred_segments=pred["pred_segments"],
-            target_segments=pred["target_segments"],
-            target_valid=pred["target_valid"],
-            train_mask=train_mask,
-            pred_velocity=pred["pred_velocity"],
-            target_velocity=pred["target_velocity"],
-        )
-
-    def _closed_loop_train_loss(self, data, tokenized_map, tokenized_agent, map_feature):
-        rollout = self.encoder.rollout(
-            tokenized_map=tokenized_map,
-            tokenized_agent=tokenized_agent,
-            sampling_cfg=self.flow_sampling,
-            data=data,
-            rollout_steps=self.closed_loop_steps,
-            return_targets=True,
-            map_feature=map_feature,
-        )
-        pred_future = torch.cat(rollout["pred_local_futures"], dim=0)  # [n_agent * n_step, 21, 4]
-        target_future = torch.cat(rollout["target_local_futures"], dim=0)  # [n_agent * n_step, 21, 4]
-        target_valid = torch.cat(rollout["target_valids"], dim=0)  # [n_agent * n_step, 21]
-        pred_segments = chunk_future_21_to_4x6(pred_future)
-        target_segments = chunk_future_21_to_4x6(target_future)
-        train_mask = None
-        if self._get_train_mask(data) is not None:
-            shift = self.encoder.agent_encoder.shift
-            start_anchor = self.num_historical_steps - 1
-            train_mask = torch.cat(
-                [
-                    self._build_anchor_train_mask(
-                        data=data,
-                        anchor_10hz=start_anchor + step * shift,
-                        target_valid=step_target_valid,
-                    )
-                    for step, step_target_valid in enumerate(rollout["target_valids"])
-                ],
-                dim=0,
-            )
-        return self.training_loss(
-            pred_segments=pred_segments,
-            target_segments=target_segments,
-            target_valid=target_valid,
-            train_mask=train_mask,
-            pred_velocity=None,
-            target_velocity=None,
+            gt_segments=pred["gt_segments"],
+            pred_future_local=pred["pred_future_local"],
+            gt_future_local=pred["gt_future_local"],
+            loss_mask=loss_mask,
         )
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
-        # The static map does not depend on the sampled anchor, so reuse one graph per batch.
         map_feature = self.encoder.encode_map(tokenized_map)
 
-        if self.closed_loop_steps > 0:
-            loss_out = self._closed_loop_train_loss(data, tokenized_map, tokenized_agent, map_feature)
-        else:
-            candidate_anchors = build_anchor_10hz_indices(
-                num_historical_steps=self.num_historical_steps,
-                future_window_steps=self.future_window_steps,
-                total_steps=data["agent"]["position"].shape[1],
-                shift=5,
-            )
-            anchor_list = sample_anchor_10hz_indices(
-                candidate_anchors=candidate_anchors,
-                anchor_chunk_k=self.anchor_chunk_k,
-                device=data["agent"]["position"].device,
-            )
-            loss_items = [
-                self._open_loop_anchor_loss(
-                    data,
-                    tokenized_map,
-                    tokenized_agent,
-                    map_feature,
-                    anchor_10hz=a,
-                )
-                for a in anchor_list
-            ]
-            total_loss = torch.stack([x.total_loss for x in loss_items]).mean()
-            flow_loss = torch.stack([x.flow_loss for x in loss_items]).mean()
-            overlap_loss = torch.stack([x.overlap_loss for x in loss_items]).mean()
-            ade_2s = torch.stack([x.ade_2s for x in loss_items]).mean()
-            loss_out = type(loss_items[0])(
-                total_loss=total_loss,
-                flow_loss=flow_loss,
-                overlap_loss=overlap_loss,
-                ade_2s=ade_2s,
-            )
+        total_loss = 0.0
+        total_flow = 0.0
+        total_overlap = 0.0
+        total_recon = 0.0
+        n_terms = 0
 
-        self.log("train/loss", loss_out.total_loss, on_step=True, batch_size=1)
-        self.log("train/flow_loss", loss_out.flow_loss, on_step=True, batch_size=1)
-        self.log("train/overlap_loss", loss_out.overlap_loss, on_step=True, batch_size=1)
-        self.log("train/ade_2s", loss_out.ade_2s, on_step=True, batch_size=1)
-        return loss_out.total_loss
+        if self.use_closed_loop_finetune:
+            outputs = self.encoder.closed_loop_train(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                agent_raw=data["agent"],
+                unroll_steps=self.closed_loop_unroll,
+            )
+            for pred in outputs:
+                loss_mask = self._loss_mask_train(pred, data)
+                loss, log_dict = self._compute_single_loss(pred, loss_mask)
+                total_loss = total_loss + loss
+                total_flow = total_flow + log_dict["flow"]
+                total_overlap = total_overlap + log_dict["overlap"]
+                total_recon = total_recon + log_dict["recon"]
+                n_terms += 1
+        else:
+            for anchor_step in self._select_train_anchor_steps():
+                pred = self.encoder.forward_from_map(
+                    map_feature=map_feature,
+                    tokenized_agent=tokenized_agent,
+                    agent_raw=data["agent"],
+                    anchor_step=anchor_step,
+                )
+                loss_mask = self._loss_mask_train(pred, data)
+                loss, log_dict = self._compute_single_loss(pred, loss_mask)
+                total_loss = total_loss + loss
+                total_flow = total_flow + log_dict["flow"]
+                total_overlap = total_overlap + log_dict["overlap"]
+                total_recon = total_recon + log_dict["recon"]
+                n_terms += 1
+
+        total_loss = total_loss / max(n_terms, 1)
+        self.log("train/loss", total_loss, on_step=True, batch_size=1)
+        self.log("train/flow", total_flow / max(n_terms, 1), on_step=True, batch_size=1)
+        self.log("train/overlap", total_overlap / max(n_terms, 1), on_step=True, batch_size=1)
+        self.log("train/recon", total_recon / max(n_terms, 1), on_step=True, batch_size=1)
+        return total_loss
 
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
-        # Validation reuses the same scene map across all anchors / rollouts as well.
         map_feature = self.encoder.encode_map(tokenized_map)
 
         if self.val_open_loop:
-            candidate_anchors = build_anchor_10hz_indices(
-                num_historical_steps=self.num_historical_steps,
-                future_window_steps=self.future_window_steps,
-                total_steps=data["agent"]["position"].shape[1],
-                shift=5,
-            )
-            loss_items = [
-                self._open_loop_anchor_loss(
-                    data,
-                    tokenized_map,
-                    tokenized_agent,
-                    map_feature,
-                    anchor_10hz=a,
+            total_loss = 0.0
+            total_ade = 0.0
+            n_terms = 0
+            for anchor_step in self.anchor_steps:
+                pred = self.encoder.forward_from_map(
+                    map_feature=map_feature,
+                    tokenized_agent=tokenized_agent,
+                    agent_raw=data["agent"],
+                    anchor_step=anchor_step,
                 )
-                for a in candidate_anchors
-            ]
-            if len(loss_items) > 0:
-                self.log(
-                    "val_open/loss",
-                    torch.stack([x.total_loss for x in loss_items]).mean(),
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
-                self.log(
-                    "val_open/flow_loss",
-                    torch.stack([x.flow_loss for x in loss_items]).mean(),
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
-                self.log(
-                    "val_open/overlap_loss",
-                    torch.stack([x.overlap_loss for x in loss_items]).mean(),
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
-                self.log(
-                    "val_open/ade_2s",
-                    torch.stack([x.ade_2s for x in loss_items]).mean(),
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
+                loss_mask = self._loss_mask_eval(pred, data, anchor_step)
+                loss, _ = self._compute_single_loss(pred, loss_mask)
+                ade = self._local_ade(pred["pred_future_local"], pred["gt_future_local"], loss_mask)
+                total_loss = total_loss + loss
+                total_ade = total_ade + ade
+                n_terms += 1
+            self.log("val_open/loss", total_loss / max(n_terms, 1), on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("val_open/ade2s", total_ade / max(n_terms, 1), on_epoch=True, sync_dist=True, batch_size=1)
 
         if self.val_closed_loop:
             pred_traj, pred_z, pred_head = [], [], []
             for _ in range(self.n_rollout_closed_val):
-                pred = self.encoder.rollout(
-                    tokenized_map=tokenized_map,
+                pred = self.encoder.agent_encoder.inference(
                     tokenized_agent=tokenized_agent,
-                    sampling_cfg=self.validation_flow_sampling,
-                    data=data,
-                    rollout_steps=self.num_future_steps // 5,
-                    return_targets=False,
                     map_feature=map_feature,
+                    agent_raw=data["agent"],
+                    sampling_scheme=self.validation_rollout_sampling,
                 )
                 pred_traj.append(pred["pred_traj_10hz"])
                 pred_z.append(pred["pred_z_10hz"])
                 pred_head.append(pred["pred_head_10hz"])
 
-            pred_traj = torch.stack(pred_traj, dim=1)  # [n_agent, n_rollout, 80, 2]
-            pred_z = torch.stack(pred_z, dim=1)        # [n_agent, n_rollout, 80]
-            pred_head = torch.stack(pred_head, dim=1)  # [n_agent, n_rollout, 80]
+            pred_traj = torch.stack(pred_traj, dim=1)
+            pred_z = torch.stack(pred_z, dim=1)
+            pred_head = torch.stack(pred_head, dim=1)
 
             scenario_rollouts = None
             if self.wosac_submission.is_active:
@@ -333,12 +205,12 @@ class SMART(LightningModule):
                     pred_head=pred_head,
                     global_rank=self.global_rank,
                 )
-                _gpu_dict_sync = self.wosac_submission.compute()
+                gpu_dict_sync = self.wosac_submission.compute()
                 if self.global_rank == 0:
-                    for k in _gpu_dict_sync.keys():
-                        if isinstance(_gpu_dict_sync[k], list):
-                            _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
-                    scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
+                    for k in gpu_dict_sync.keys():
+                        if isinstance(gpu_dict_sync[k], list):
+                            gpu_dict_sync[k] = gpu_dict_sync[k][0]
+                    scenario_rollouts = get_scenario_rollouts(**gpu_dict_sync)
                     self.wosac_submission.aggregate_rollouts(scenario_rollouts)
                 self.wosac_submission.reset()
             else:
@@ -360,81 +232,58 @@ class SMART(LightningModule):
                     self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
 
             if self.global_rank == 0 and batch_idx < self.n_vis_batch and scenario_rollouts is not None:
-                for _i_sc in range(self.n_vis_scenario):
-                    _vis = VisWaymo(
-                        scenario_path=data["tfrecord_path"][_i_sc],
-                        save_dir=self.video_dir / f"batch_{batch_idx:02d}-scenario_{_i_sc:02d}",
+                for i_sc in range(self.n_vis_scenario):
+                    vis = VisWaymo(
+                        scenario_path=data["tfrecord_path"][i_sc],
+                        save_dir=self.video_dir / f"batch_{batch_idx:02d}-scenario_{i_sc:02d}",
                     )
-                    _vis.save_video_scenario_rollout(scenario_rollouts[_i_sc], self.n_vis_rollout)
-                    for _path in _vis.video_paths:
-                        self.logger.log_video("/".join(_path.split("/")[-3:]), [_path])
+                    vis.save_video_scenario_rollout(scenario_rollouts[i_sc], self.n_vis_rollout)
+                    for path in vis.video_paths:
+                        self.logger.log_video("/".join(path.split("/")[-3:]), [path])
 
     def on_validation_epoch_end(self):
         if self.val_closed_loop:
             if not self.wosac_submission.is_active:
-                epoch_wosac_metrics = self.wosac_metrics.compute()
-                val_closed_ade = self.minADE.compute()
-                self.log(
-                    "val_closed/ADE",
-                    val_closed_ade,
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
-                epoch_wosac_metrics["val_closed/ADE"] = val_closed_ade
+                epoch_metrics = self.wosac_metrics.compute()
+                epoch_metrics["val_closed/ADE"] = self.minADE.compute()
                 if self.global_rank == 0:
-                    epoch_wosac_metrics["epoch"] = self.log_epoch if self.log_epoch >= 0 else self.current_epoch
-                    self.logger.log_metrics(epoch_wosac_metrics)
+                    epoch_metrics["epoch"] = self.log_epoch if self.log_epoch >= 0 else self.current_epoch
+                    self.logger.log_metrics(epoch_metrics)
                 self.wosac_metrics.reset()
                 self.minADE.reset()
-
-            if self.global_rank == 0 and self.wosac_submission.is_active:
+            elif self.global_rank == 0:
                 self.wosac_submission.save_sub_file()
 
     def configure_optimizers(self):
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable_params, lr=self.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
 
-        def lr_lambda(current_step):
-            current_step = max(int(current_step), 0)
+        def lr_lambda(_current_step):
+            current_step = self.current_epoch + 1
             if current_step < self.lr_warmup_steps:
                 return self.lr_min_ratio + (1 - self.lr_min_ratio) * current_step / self.lr_warmup_steps
-            decay_steps = max(self.lr_total_steps - self.lr_warmup_steps, 1)
             return self.lr_min_ratio + 0.5 * (1 - self.lr_min_ratio) * (
-                1.0
-                + math.cos(
+                1.0 + math.cos(
                     math.pi
                     * min(
                         1.0,
-                        (current_step - self.lr_warmup_steps) / decay_steps,
+                        (current_step - self.lr_warmup_steps)
+                        / max(1, (self.lr_total_steps - self.lr_warmup_steps)),
                     )
                 )
             )
 
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": lr_scheduler,
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
+        return [optimizer], [lr_scheduler]
 
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
-        # Test rollout sees the same static map at every rollout step.
-        map_feature = self.encoder.encode_map(tokenized_map)
         pred_traj, pred_z, pred_head = [], [], []
         for _ in range(self.n_rollout_closed_val):
-            pred = self.encoder.rollout(
+            pred = self.encoder.inference(
                 tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,
-                sampling_cfg=self.validation_flow_sampling,
-                data=data,
-                rollout_steps=self.num_future_steps // 5,
-                return_targets=False,
-                map_feature=map_feature,
+                agent_raw=data["agent"],
+                sampling_scheme=self.validation_rollout_sampling,
             )
             pred_traj.append(pred["pred_traj_10hz"])
             pred_z.append(pred["pred_z_10hz"])
@@ -444,25 +293,24 @@ class SMART(LightningModule):
         pred_z = torch.stack(pred_z, dim=1)
         pred_head = torch.stack(pred_head, dim=1)
 
-        if self.wosac_submission.is_active:
-            self.wosac_submission.update(
-                scenario_id=data["scenario_id"],
-                agent_id=data["agent"]["id"],
-                agent_batch=data["agent"]["batch"],
-                pred_traj=pred_traj,
-                pred_z=pred_z,
-                pred_head=pred_head,
-                global_rank=self.global_rank,
-            )
-            _gpu_dict_sync = self.wosac_submission.compute()
-            if self.global_rank == 0:
-                for k in _gpu_dict_sync.keys():
-                    if isinstance(_gpu_dict_sync[k], list):
-                        _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
-                scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
-                self.wosac_submission.aggregate_rollouts(scenario_rollouts)
-            self.wosac_submission.reset()
+        self.wosac_submission.update(
+            scenario_id=data["scenario_id"],
+            agent_id=data["agent"]["id"],
+            agent_batch=data["agent"]["batch"],
+            pred_traj=pred_traj,
+            pred_z=pred_z,
+            pred_head=pred_head,
+            global_rank=self.global_rank,
+        )
+        gpu_dict_sync = self.wosac_submission.compute()
+        if self.global_rank == 0:
+            for k in gpu_dict_sync.keys():
+                if isinstance(gpu_dict_sync[k], list):
+                    gpu_dict_sync[k] = gpu_dict_sync[k][0]
+            scenario_rollouts = get_scenario_rollouts(**gpu_dict_sync)
+            self.wosac_submission.aggregate_rollouts(scenario_rollouts)
+        self.wosac_submission.reset()
 
     def on_test_epoch_end(self):
-        if self.global_rank == 0 and self.wosac_submission.is_active:
+        if self.global_rank == 0:
             self.wosac_submission.save_sub_file()

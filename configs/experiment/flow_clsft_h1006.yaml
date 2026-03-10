@@ -6,9 +6,11 @@ model:
   model_config:
     lr: 5e-5
     lr_min_ratio: 0.05
+    use_closed_loop_finetune: true
+    closed_loop_unroll: 4
+    finetune: true
     val_open_loop: false
     val_closed_loop: true
-    closed_loop_steps: 4
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
@@ -29,15 +31,18 @@ trainer:
   limit_train_batches: 1.0
   limit_val_batches: 50
   check_val_every_n_epoch: 1
-  max_epochs: 16
+  max_epochs: 8
   precision: bf16-mixed
   gradient_clip_val: 0.5
   accumulate_grad_batches: 2
 
+# H100 6장 기준 권장값
+# effective batch = 4(per-device) * 6(gpu) * 2(accum) = 48
+# short closed-loop FT는 open-loop보다 메모리와 시간이 더 무거워서 batch를 한 단계 낮춘다.
 data:
-  train_batch_size: 6
-  val_batch_size: 6
-  test_batch_size: 6
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 4
   num_workers: 12
 
 action: finetune

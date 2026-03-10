@@ -13,7 +13,7 @@ model:
     val_closed_loop: true
     wosac_submission:
       is_active: true
-      method_name: "CATK-flow-tiny-7M"
+      method_name: "SMART-tiny-Flow"
       authors: [Anonymous]
       affiliation: YOUR_AFFILIATION
       description: YOUR_DESCRIPTION
@@ -30,9 +30,9 @@ trainer:
   precision: bf16-mixed
 
 data:
-  train_batch_size: 12
-  val_batch_size: 12
-  test_batch_size: 12
+  train_batch_size: 8
+  val_batch_size: 8
+  test_batch_size: 8
   num_workers: 12
   shuffle: false
   pin_memory: false

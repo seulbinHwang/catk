@@ -4,25 +4,26 @@
 # SPDX-FileCopyrightText: Copyright (c) <year> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 
+from __future__ import annotations
+
 from typing import Dict, Optional
 
 import torch.nn as nn
+from omegaconf import DictConfig
 from torch import Tensor
 
-from .agent_flow_decoder import SMARTAgentFlowDecoder
+from .agent_decoder import SMARTAgentDecoder
 from .map_decoder import SMARTMapDecoder
 
 
 class SMARTDecoder(nn.Module):
-    """SMART map encoder와 flow agent decoder를 묶는 얇은 래퍼입니다."""
+    """RoadNet + Flow-based Agent decoder wrapper."""
 
     def __init__(
         self,
         hidden_dim: int,
         num_historical_steps: int,
         num_future_steps: int,
-        future_window_steps: int,
-        anchor_chunk_k: int,
         pl2pl_radius: float,
         time_span: Optional[int],
         pl2a_radius: float,
@@ -35,7 +36,12 @@ class SMARTDecoder(nn.Module):
         dropout: float,
         hist_drop_prob: float,
         n_token_agent: int,
-        history_slots: int = 6,
+        history_steps: int = 6,
+        future_window_steps: int = 20,
+        future_num_segments: int = 4,
+        future_segment_points: int = 6,
+        ode_steps: int = 4,
+        hist2f_radius: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -47,11 +53,10 @@ class SMARTDecoder(nn.Module):
             head_dim=head_dim,
             dropout=dropout,
         )
-        self.agent_encoder = SMARTAgentFlowDecoder(
+        self.agent_encoder = SMARTAgentDecoder(
             hidden_dim=hidden_dim,
             num_historical_steps=num_historical_steps,
             num_future_steps=num_future_steps,
-            future_window_steps=future_window_steps,
             time_span=time_span,
             pl2a_radius=pl2a_radius,
             a2a_radius=a2a_radius,
@@ -62,63 +67,54 @@ class SMARTDecoder(nn.Module):
             dropout=dropout,
             hist_drop_prob=hist_drop_prob,
             n_token_agent=n_token_agent,
-            history_slots=history_slots,
+            history_steps=history_steps,
+            future_window_steps=future_window_steps,
+            future_num_segments=future_num_segments,
+            future_segment_points=future_segment_points,
+            ode_steps=ode_steps,
+            hist2f_radius=hist2f_radius,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        """static map feature를 한 번만 인코딩해 재사용합니다."""
+        """도로 token을 한 번만 인코딩한다."""
         return self.map_encoder(tokenized_map)
 
     def forward(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-        data,
-        anchor_10hz: int,
-        sampling_cfg,
-        map_feature: Optional[Dict[str, Tensor]] = None,
+        agent_raw: Dict[str, Tensor],
+        anchor_step: int,
     ) -> Dict[str, Tensor]:
-        """open-loop anchor 하나를 학습할 때 사용합니다."""
-        map_feature = map_feature if map_feature is not None else self.encode_map(tokenized_map)
-        return self.agent_encoder(tokenized_agent, map_feature, data, anchor_10hz, sampling_cfg)
+        map_feature = self.encode_map(tokenized_map)
+        return self.agent_encoder(tokenized_agent, map_feature, agent_raw, anchor_step)
 
-    def rollout(
+    def forward_from_map(
         self,
-        tokenized_map: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-        sampling_cfg,
-        data=None,
-        rollout_steps: Optional[int] = None,
-        return_targets: bool = False,
-        map_feature: Optional[Dict[str, Tensor]] = None,
+        agent_raw: Dict[str, Tensor],
+        anchor_step: int,
     ) -> Dict[str, Tensor]:
-        """closed-loop rollout을 수행합니다."""
-        map_feature = map_feature if map_feature is not None else self.encode_map(tokenized_map)
-        return self.agent_encoder.rollout(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            sampling_cfg=sampling_cfg,
-            data=data,
-            rollout_steps=rollout_steps,
-            return_targets=return_targets,
-        )
+        """이미 계산된 map feature를 재사용한다."""
+        return self.agent_encoder(tokenized_agent, map_feature, agent_raw, anchor_step)
+
+    def closed_loop_train(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        agent_raw: Dict[str, Tensor],
+        unroll_steps: int,
+    ) -> list[Dict[str, Tensor]]:
+        """짧은 closed-loop fine-tuning을 수행한다."""
+        return self.agent_encoder.closed_loop_train(tokenized_agent, map_feature, agent_raw, unroll_steps)
 
     def inference(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-        sampling_cfg,
-        data=None,
-        rollout_steps: Optional[int] = None,
-        map_feature: Optional[Dict[str, Tensor]] = None,
+        agent_raw: Dict[str, Tensor],
+        sampling_scheme: DictConfig,
     ) -> Dict[str, Tensor]:
-        """기존 호출과의 호환을 위한 alias입니다."""
-        return self.rollout(
-            tokenized_map=tokenized_map,
-            tokenized_agent=tokenized_agent,
-            sampling_cfg=sampling_cfg,
-            data=data,
-            rollout_steps=rollout_steps,
-            return_targets=False,
-            map_feature=map_feature,
-        )
+        map_feature = self.encode_map(tokenized_map)
+        return self.agent_encoder.inference(tokenized_agent, map_feature, agent_raw, sampling_scheme)

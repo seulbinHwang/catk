@@ -22,9 +22,9 @@ trainer:
   precision: bf16-mixed
 
 data:
-  train_batch_size: 12
-  val_batch_size: 12
-  test_batch_size: 12
+  train_batch_size: 8
+  val_batch_size: 8
+  test_batch_size: 8
   num_workers: 12
 
 action: validate

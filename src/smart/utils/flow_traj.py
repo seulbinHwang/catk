@@ -1,342 +1,327 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Tuple
+from typing import Callable, Dict, Tuple
 
 import torch
 from torch import Tensor
 
 from src.smart.utils.geometry import wrap_angle
-from src.smart.utils.rollout import cal_polygon_contour, transform_to_global, transform_to_local
+from src.smart.utils.rollout import transform_to_global, transform_to_local
 
 
-SEGMENT_STARTS: Tuple[int, int, int, int] = (0, 5, 10, 15)
-SEGMENT_LEN: int = 6
-
-
-def stabilize_invalid_future(
-    future_local: Tensor,
-    valid_mask: Tensor,
-) -> Tensor:
-    """invalid future point를 마지막 valid local pose로 대체합니다.
-
-    loss에서는 invalid point를 마스킹하지만,
-    flow-matching input `z_tau`는 target 전체로부터 만들어집니다.
-    따라서 invalid global point가 zero padding이면 anchor-local 변환 후
-    수천 미터짜리 값으로 튀어 query/attention을 오염시킬 수 있습니다.
-
-    anchor가 valid한 agent는 invalid suffix를 마지막 valid pose로 forward-fill하고,
-    anchor 자체가 invalid한 agent는 전체를 canonical zero pose로 둡니다.
-    """
-    cleaned = future_local.clone()
-    canonical = cleaned.new_tensor((0.0, 0.0, 0.0, 1.0)).view(1, 1, 4)
-    anchor_valid = valid_mask[:, 0]
-
-    cleaned[:, 0] = canonical[:, 0]
-    if (~anchor_valid).any():
-        cleaned[~anchor_valid] = canonical
-
-    for t in range(1, cleaned.shape[1]):
-        current_valid = valid_mask[:, t] & anchor_valid
-        cleaned[:, t] = torch.where(
-            current_valid.unsqueeze(-1),
-            cleaned[:, t],
-            cleaned[:, t - 1],
-        )
-    return cleaned
-
-
-def normalize_sincos(traj: Tensor, eps: float = 1e-6) -> Tensor:
-    """`(sin, cos)` 두 값을 다시 길이 1로 맞춥니다.
+def renorm_sin_cos(x: Tensor, start_dim: int = -1) -> Tensor:
+    """sin, cos 쌍을 다시 길이 1로 맞춘다.
 
     Args:
-        traj: 마지막 축의 뒤 2개가 `(sin, cos)`인 텐서입니다.
-            예시 shape:
-                - `[n_agent, 21, 4]`
-                - `[n_agent, 4, 6, 4]`
-        eps: 0으로 나누는 문제를 막기 위한 작은 값입니다.
+        x: 마지막 차원에 ``[..., sin, cos]`` 를 포함하는 텐서.
+        start_dim: sin 값이 시작되는 차원 인덱스. 기본값은 마지막 차원 기준
+            ``x[..., 2:4]`` 를 정규화하는 용도에 맞춘 ``-1`` 이다.
 
     Returns:
-        같은 shape의 텐서입니다.
+        정규화된 텐서. 입력 shape은 그대로 유지된다.
     """
-    vec = traj[..., 2:4]
-    denom = torch.clamp(torch.norm(vec, dim=-1, keepdim=True), min=eps)
-    normed_vec = vec / denom
-    return torch.cat([traj[..., :2], normed_vec], dim=-1)
+    if start_dim == -1:
+        sin_cos = x[..., -2:]
+        denom = torch.clamp(torch.norm(sin_cos, dim=-1, keepdim=True), min=1e-6)
+        x = x.clone()
+        x[..., -2:] = sin_cos / denom
+        return x
+
+    sin_cos = x[..., start_dim : start_dim + 2]
+    denom = torch.clamp(torch.norm(sin_cos, dim=-1, keepdim=True), min=1e-6)
+    x = x.clone()
+    x[..., start_dim : start_dim + 2] = sin_cos / denom
+    return x
 
 
-
-def chunk_future_21_to_4x6(future: Tensor) -> Tensor:
-    """21개 점 미래를 4개의 겹치는 조각으로 바꿉니다.
+def chunk_future_21_to_4x6(future_21: Tensor) -> Tensor:
+    """21개 future 점을 4개의 겹치는 0.5초 segment로 바꾼다.
 
     Args:
-        future: 로컬 좌표 미래입니다.
-            shape: `[n_agent, 21, 4]`
+        future_21: ``[N, 21, 4]``. 마지막 차원은
+            ``(x_local, y_local, sin(dyaw), cos(dyaw))`` 이다.
 
     Returns:
-        조각 미래입니다.
-        shape: `[n_agent, 4, 6, 4]`
+        ``[N, 4, 6, 4]`` segment 텐서.
     """
-    chunks = [future[:, start : start + SEGMENT_LEN] for start in SEGMENT_STARTS]
-    return torch.stack(chunks, dim=1)
-
-
-
-def chunk_valid_21_to_4x6(valid: Tensor) -> Tensor:
-    """21개 점 유효 마스크를 조각 단위 마스크로 바꿉니다.
-
-    Args:
-        valid: 점 단위 유효 여부입니다.
-            shape: `[n_agent, 21]`
-
-    Returns:
-        조각 단위 유효 마스크입니다.
-        shape: `[n_agent, 4, 6]`
-    """
-    chunks = [valid[:, start : start + SEGMENT_LEN] for start in SEGMENT_STARTS]
-    return torch.stack(chunks, dim=1)
-
+    return torch.stack(
+        [
+            future_21[:, 0:6],
+            future_21[:, 5:11],
+            future_21[:, 10:16],
+            future_21[:, 15:21],
+        ],
+        dim=1,
+    )
 
 
 def assemble_4x6_to_21(segments: Tensor) -> Tensor:
-    """4개의 겹치는 조각을 다시 21개 점 미래로 합칩니다.
-
-    겹치는 경계점은 평균으로 합치고, 마지막에 `(sin, cos)`를 다시 정규화합니다.
+    """4개의 겹치는 segment를 다시 21개 future 점으로 합친다.
 
     Args:
-        segments: 조각 미래입니다.
-            shape: `[n_agent, 4, 6, 4]`
+        segments: ``[N, 4, 6, 4]``.
 
     Returns:
-        다시 합친 미래입니다.
-        shape: `[n_agent, 21, 4]`
+        ``[N, 21, 4]``.
     """
-    n_agent = segments.shape[0]
-    out = segments.new_zeros((n_agent, 21, 4))
-    cnt = segments.new_zeros((n_agent, 21, 1))
-    for seg_idx, start in enumerate(SEGMENT_STARTS):
-        out[:, start : start + SEGMENT_LEN] += segments[:, seg_idx]
-        cnt[:, start : start + SEGMENT_LEN] += 1.0
-    out = out / cnt.clamp_min(1.0)
-    out[:, 0, 0] = 0.0
-    out[:, 0, 1] = 0.0
-    out[:, 0, 2] = 0.0
-    out[:, 0, 3] = 1.0
-    return normalize_sincos(out)
-
-
-
-def overlap_consistency_residual(segments: Tensor) -> Tensor:
-    """이웃 조각 경계가 얼마나 안 맞는지 계산합니다.
-
-    Args:
-        segments: 조각 미래입니다.
-            shape: `[n_agent, 4, 6, 4]`
-
-    Returns:
-        경계 차이입니다.
-        shape: `[n_agent, 3, 4]`
-    """
-    return segments[:, :-1, -1] - segments[:, 1:, 0]
-
-
-
-def build_ot_flow_path(target: Tensor, noise_scale: float, eps: float = 1e-3) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """선형 OT 경로용 noised 입력과 정답 속도를 만듭니다.
-
-    Args:
-        target: 정답 조각 미래입니다.
-            shape: `[n_agent, 4, 6, 4]`
-        noise_scale: 시작 잡음 크기입니다.
-        eps: 시간 값이 0이나 1에 너무 붙지 않게 막는 작은 값입니다.
-
-    Returns:
-        noise: 시작 잡음.
-            shape: `[n_agent, 4, 6, 4]`
-        z_tau: 시간 `tau`에서의 noised 입력.
-            shape: `[n_agent, 4, 6, 4]`
-        tau: agent별 시간 값.
-            shape: `[n_agent]`
-        target_velocity: 맞춰야 하는 속도장.
-            shape: `[n_agent, 4, 6, 4]`
-    """
-    tau = torch.rand(target.shape[0], device=target.device, dtype=target.dtype)
-    tau = tau.clamp(min=eps, max=1.0 - eps)
-    tau_view = tau.view(-1, 1, 1, 1)
-
-    noise = torch.randn_like(target) * noise_scale
-    noise[:, 0, 0, 0] = 0.0
-    noise[:, 0, 0, 1] = 0.0
-    noise[:, 0, 0, 2] = 0.0
-    noise[:, 0, 0, 3] = 1.0
-
-    z_tau = (1.0 - tau_view) * noise + tau_view * target
-    z_tau[:, 0, 0, 0] = 0.0
-    z_tau[:, 0, 0, 1] = 0.0
-    z_tau[:, 0, 0, 2] = 0.0
-    z_tau[:, 0, 0, 3] = 1.0
-
-    # NOTE:
-    # `z_tau`는 flow matching의 선형 OT 경로 그대로 유지해야 합니다.
-    # 여기서 `(sin, cos)`를 미리 정규화해 버리면,
-    # - 모델 입력은 "정규화된 상태"를 보게 되고
-    # - 정답 velocity는 "정규화 전 선형 경로" 기준으로 남아
-    # 조건 입력과 학습 타깃이 서로 다른 경로를 가리키게 됩니다.
-    # 그 결과 perfect velocity를 예측해도 재구성이 정확히 target으로
-    # 돌아가지 않는 irreducible error floor가 생깁니다.
-    # 따라서 training OT path에서는 정규화를 하지 않고,
-    # 재구성 후/ODE 적분 후에만 정규화합니다.
-    target_velocity = target - noise
-    return noise, z_tau, tau, target_velocity
-
-
-def build_anchor_10hz_indices(
-    num_historical_steps: int,
-    future_window_steps: int,
-    total_steps: int = 91,
-    shift: int = 5,
-) -> List[int]:
-    """학습에 사용할 10Hz anchor 시각 후보를 만듭니다."""
-    start = num_historical_steps - 1
-    last = total_steps - future_window_steps - 1
-    return list(range(start, last + 1, shift))
-
-
-
-def sample_anchor_10hz_indices(
-    candidate_anchors: Iterable[int],
-    anchor_chunk_k: int,
-    device: torch.device,
-) -> List[int]:
-    """anchor 후보 중 일부만 무작위로 고릅니다."""
-    candidates = list(candidate_anchors)
-    if len(candidates) <= anchor_chunk_k:
-        return candidates
-    perm = torch.randperm(len(candidates), device=device)[:anchor_chunk_k].cpu().tolist()
-    return [candidates[i] for i in perm]
-
+    segments = renorm_sin_cos(segments)
+    future = torch.zeros(
+        segments.shape[0], 21, segments.shape[-1], device=segments.device, dtype=segments.dtype
+    )
+    count = torch.zeros(
+        segments.shape[0], 21, 1, device=segments.device, dtype=segments.dtype
+    )
+    spans = [(0, 6), (5, 11), (10, 16), (15, 21)]
+    for seg_idx, (start, end) in enumerate(spans):
+        future[:, start:end] += segments[:, seg_idx]
+        count[:, start:end] += 1.0
+    future = future / torch.clamp(count, min=1.0)
+    future = renorm_sin_cos(future)
+    return future
 
 
 def build_local_future_target(
     pos_global: Tensor,
     head_global: Tensor,
-    valid_mask: Tensor,
-    anchor_10hz: int,
-    anchor_pos: Tensor,
-    anchor_head: Tensor,
+    anchor_step: int,
     future_window_steps: int,
-) -> Tuple[Tensor, Tensor]:
-    """anchor 기준 로컬 미래 정답을 만듭니다."""
-    end = anchor_10hz + future_window_steps + 1
-    pos_slice = pos_global[:, anchor_10hz:end]
-    head_slice = head_global[:, anchor_10hz:end]
-    valid_slice = valid_mask[:, anchor_10hz:end]
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """GT 2초 future를 현재 agent-local 좌표계로 바꾼다.
 
-    pos_local, _ = transform_to_local(
-        pos_global=pos_slice,
-        head_global=None,
-        pos_now=anchor_pos,
-        head_now=anchor_head,
+    Args:
+        pos_global: ``[N, 91, 2]`` global 중심점.
+        head_global: ``[N, 91]`` global heading.
+        anchor_step: 현재 기준 raw step. SMART 기본값에서는 10, 15, ... 이다.
+        future_window_steps: future 길이. 여기서는 20을 권장한다.
+
+    Returns:
+        tuple:
+            - future_local: ``[N, 21, 4]``
+            - pos_now: ``[N, 2]``
+            - head_now: ``[N]``
+            - head_delta: ``[N, 21]``
+    """
+    pos_now = pos_global[:, anchor_step]
+    head_now = head_global[:, anchor_step]
+    future_pos = pos_global[:, anchor_step : anchor_step + future_window_steps + 1]
+    future_head = head_global[:, anchor_step : anchor_step + future_window_steps + 1]
+
+    future_pos_local, future_head_local = transform_to_local(
+        pos_global=future_pos,
+        head_global=future_head,
+        pos_now=pos_now,
+        head_now=head_now,
     )
-    delta_head = wrap_angle(head_slice - anchor_head.unsqueeze(1))
     future_local = torch.cat(
         [
-            pos_local,
-            delta_head.sin().unsqueeze(-1),
-            delta_head.cos().unsqueeze(-1),
+            future_pos_local,
+            future_head_local.sin().unsqueeze(-1),
+            future_head_local.cos().unsqueeze(-1),
         ],
         dim=-1,
     )
-    future_local[:, 0, 0] = 0.0
-    future_local[:, 0, 1] = 0.0
-    future_local[:, 0, 2] = 0.0
-    future_local[:, 0, 3] = 1.0
-    future_local = stabilize_invalid_future(future_local, valid_slice)
-    future_local = normalize_sincos(future_local)
-    return future_local, valid_slice
+    future_local = renorm_sin_cos(future_local)
+    return future_local, pos_now, head_now, future_head_local
 
 
-
-def build_current_anchor_feature(
-    current_head: Tensor,
-    current_vel_global: Tensor,
-    current_yaw_rate: Tensor,
-    agent_shape: Tensor,
-    agent_type: Tensor,
-) -> Tensor:
-    """현재 정확한 상태를 8차원 anchor 입력으로 바꿉니다."""
-    cos_h = current_head.cos()
-    sin_h = current_head.sin()
-    vx_local = current_vel_global[:, 0] * cos_h + current_vel_global[:, 1] * sin_h
-    vy_local = -current_vel_global[:, 0] * sin_h + current_vel_global[:, 1] * cos_h
-    return torch.stack(
-        [
-            vx_local,
-            vy_local,
-            current_head.sin(),
-            current_head.cos(),
-            current_yaw_rate,
-            agent_shape[:, 0],
-            agent_shape[:, 1],
-            agent_type.float(),
-        ],
-        dim=-1,
-    )
-
-
-
-def segment_local_to_global(
-    segment_local: Tensor,
-    current_pos: Tensor,
-    current_head: Tensor,
+def local_future_to_global(
+    future_local: Tensor,
+    pos_now: Tensor,
+    head_now: Tensor,
 ) -> Tuple[Tensor, Tensor]:
-    """첫 0.5초 조각을 글로벌 위치/heading으로 바꿉니다."""
-    local_pos = segment_local[..., :2]
-    local_head = torch.atan2(segment_local[..., 2], segment_local[..., 3])
-    pos_global, head_global = transform_to_global(
-        pos_local=local_pos,
+    """agent-local future를 world 좌표로 바꾼다.
+
+    Args:
+        future_local: ``[N, T, 4]``.
+        pos_now: ``[N, 2]``.
+        head_now: ``[N]``.
+
+    Returns:
+        tuple:
+            - global_pos: ``[N, T, 2]``
+            - global_head: ``[N, T]``
+    """
+    future_local = renorm_sin_cos(future_local)
+    local_head = torch.atan2(future_local[..., 2], future_local[..., 3])
+    global_pos, global_head = transform_to_global(
+        pos_local=future_local[..., :2],
         head_local=local_head,
-        pos_now=current_pos,
-        head_now=current_head,
+        pos_now=pos_now,
+        head_now=head_now,
     )
-    return pos_global, wrap_angle(head_global)
+    global_head = wrap_angle(global_head)
+    return global_pos, global_head
 
 
-
-def segment_endpoint_pose_global(
+def segment_end_pose_global(
     segments_local: Tensor,
-    current_pos: Tensor,
-    current_head: Tensor,
+    pos_now: Tensor,
+    head_now: Tensor,
 ) -> Tuple[Tensor, Tensor]:
-    """각 조각의 마지막 점을 글로벌 pose로 바꿉니다."""
-    flat_pos_local = segments_local[:, :, -1, :2].reshape(-1, 1, 2)
-    flat_head_local = torch.atan2(
-        segments_local[:, :, -1, 2].reshape(-1, 1),
-        segments_local[:, :, -1, 3].reshape(-1, 1),
-    )
-    flat_anchor_pos = current_pos.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 2)
-    flat_anchor_head = current_head.unsqueeze(1).expand(-1, 4).reshape(-1)
-    pos_global, head_global = transform_to_global(
-        pos_local=flat_pos_local,
-        head_local=flat_head_local,
-        pos_now=flat_anchor_pos,
-        head_now=flat_anchor_head,
-    )
-    return pos_global[:, 0].reshape(-1, 4, 2), wrap_angle(head_global[:, 0].reshape(-1, 4))
+    """각 0.5초 segment의 마지막 점을 world pose로 바꾼다.
+
+    Args:
+        segments_local: ``[N, 4, 6, 4]``.
+        pos_now: ``[N, 2]``.
+        head_now: ``[N]``.
+
+    Returns:
+        tuple:
+            - seg_end_pos_global: ``[N, 4, 2]``
+            - seg_end_head_global: ``[N, 4]``
+    """
+    end_local = renorm_sin_cos(segments_local[:, :, -1])
+    end_global_pos, end_global_head = local_future_to_global(end_local, pos_now, head_now)
+    return end_global_pos, end_global_head
 
 
+def build_flow_path(x0: Tensor, x1: Tensor, tau: Tensor) -> Tuple[Tensor, Tensor]:
+    """선형 conditional flow matching path를 만든다.
 
-def match_first_segment_token(
-    first_segment_local: Tensor,
-    token_traj_all: Tensor,
-    token_agent_shape: Tensor,
+    Args:
+        x0: ``[N, 4, 6, 4]`` source noise.
+        x1: ``[N, 4, 6, 4]`` clean target.
+        tau: ``[N, 1, 1, 1]`` 또는 broadcast 가능한 shape.
+
+    Returns:
+        tuple:
+            - x_tau: ``[N, 4, 6, 4]``
+            - u_t: ``[N, 4, 6, 4]`` target velocity field
+    """
+    x_tau = (1.0 - tau) * x0 + tau * x1
+    x_tau = renorm_sin_cos(x_tau)
+    u_t = x1 - x0
+    return x_tau, u_t
+
+
+def midpoint_ode_integrate(
+    x0: Tensor,
+    ode_steps: int,
+    velocity_fn: Callable[[Tensor, Tensor], Tensor],
 ) -> Tensor:
-    """예측한 첫 0.5초 조각을 가장 가까운 SMART token으로 바꿉니다."""
-    local_pos = first_segment_local[..., :2]
-    local_head = torch.atan2(first_segment_local[..., 2], first_segment_local[..., 3])
-    contour = cal_polygon_contour(
-        pos=local_pos,
-        head=local_head,
-        width_length=token_agent_shape.unsqueeze(1),
-    )
-    dist = torch.norm(token_traj_all - contour.unsqueeze(1), dim=-1).mean(dim=(-1, -2))
-    return torch.argmin(dist, dim=-1)
+    """4-step midpoint ODE 적분을 수행한다.
+
+    Args:
+        x0: ``[N, 4, 6, 4]`` 초기 noise.
+        ode_steps: 적분 step 수. 이번 구현에서는 4를 기본값으로 둔다.
+        velocity_fn: ``f(x, t) -> dx/dt`` 형태의 함수.
+
+    Returns:
+        ``[N, 4, 6, 4]`` 최종 적분 결과.
+    """
+    x = renorm_sin_cos(x0)
+    dt = 1.0 / float(ode_steps)
+    for step in range(ode_steps):
+        t = x.new_full((x.shape[0], 1), float(step) * dt)
+        k1 = velocity_fn(x, t)
+        x_mid = renorm_sin_cos(x + 0.5 * dt * k1)
+        t_mid = x.new_full((x.shape[0], 1), (float(step) + 0.5) * dt)
+        k2 = velocity_fn(x_mid, t_mid)
+        x = renorm_sin_cos(x + dt * k2)
+    return x
+
+
+def _center_to_contour(pos: Tensor, head: Tensor, agent_shape: Tensor) -> Tensor:
+    """중심점과 heading을 4개 꼭짓점 contour로 바꾼다.
+
+    Args:
+        pos: ``[N, 2]``.
+        head: ``[N]``.
+        agent_shape: ``[N, 2]``. ``(width, length)``.
+
+    Returns:
+        ``[N, 4, 2]`` contour.
+    """
+    width = agent_shape[:, 0]
+    length = agent_shape[:, 1]
+    half_cos = 0.5 * head.cos()
+    half_sin = 0.5 * head.sin()
+    length_cos = length * half_cos
+    length_sin = length * half_sin
+    width_cos = width * half_cos
+    width_sin = width * half_sin
+    left_front = torch.stack([pos[:, 0] + length_cos - width_sin, pos[:, 1] + length_sin + width_cos], dim=-1)
+    right_front = torch.stack([pos[:, 0] + length_cos + width_sin, pos[:, 1] + length_sin - width_cos], dim=-1)
+    right_back = torch.stack([pos[:, 0] - length_cos + width_sin, pos[:, 1] - length_sin - width_cos], dim=-1)
+    left_back = torch.stack([pos[:, 0] - length_cos - width_sin, pos[:, 1] - length_sin + width_cos], dim=-1)
+    return torch.stack([left_front, right_front, right_back, left_back], dim=-2)
+
+
+def local_traj_to_local_contour(
+    future_local: Tensor,
+    agent_shape: Tensor,
+) -> Tensor:
+    """center trajectory + heading을 contour trajectory로 바꾼다.
+
+    Args:
+        future_local: ``[N, 6, 4]``. 첫 점 포함 0.5초 trajectory.
+        agent_shape: ``[N, 2]``. ``(width, length)``.
+
+    Returns:
+        ``[N, 6, 4, 2]`` local contour trajectory.
+    """
+    future_local = renorm_sin_cos(future_local)
+    local_head = torch.atan2(future_local[..., 2], future_local[..., 3])
+    contour_list = []
+    for t in range(future_local.shape[1]):
+        contour_list.append(_center_to_contour(future_local[:, t, :2], local_head[:, t], agent_shape))
+    return torch.stack(contour_list, dim=1)
+
+
+def nearest_agent_token_idx(
+    local_chunk_6: Tensor,
+    agent_shape: Tensor,
+    token_traj_all: Tensor,
+) -> Tensor:
+    """첫 0.5초 continuous chunk를 가장 가까운 SMART token id로 바꾼다.
+
+    Args:
+        local_chunk_6: ``[N, 6, 4]``.
+        agent_shape: ``[N, 2]``.
+        token_traj_all: ``[N, V, 6, 4, 2]``.
+
+    Returns:
+        ``[N]`` nearest token index.
+    """
+    contour_local = local_traj_to_local_contour(local_chunk_6, agent_shape).unsqueeze(1)
+    dist = torch.norm(token_traj_all - contour_local, dim=-1).mean(dim=(-1, -2))
+    return dist.argmin(dim=-1)
+
+
+def executed_chunk_to_rollout_update(
+    future_local_21: Tensor,
+    pos_now: Tensor,
+    head_now: Tensor,
+) -> Dict[str, Tensor]:
+    """2초 예측에서 실제로 실행할 첫 0.5초와 다음 현재 상태를 뽑는다.
+
+    Args:
+        future_local_21: ``[N, 21, 4]``.
+        pos_now: ``[N, 2]``.
+        head_now: ``[N]``.
+
+    Returns:
+        dict:
+            - exec_local_6: ``[N, 6, 4]``
+            - exec_global_pos_6: ``[N, 6, 2]``
+            - exec_global_head_6: ``[N, 6]``
+            - next_pos: ``[N, 2]``
+            - next_head: ``[N]``
+            - next_vel: ``[N, 2]``
+            - next_yaw_rate: ``[N]``
+    """
+    exec_local_6 = renorm_sin_cos(future_local_21[:, :6])
+    exec_global_pos_6, exec_global_head_6 = local_future_to_global(exec_local_6, pos_now, head_now)
+    next_pos = exec_global_pos_6[:, -1]
+    next_head = exec_global_head_6[:, -1]
+    next_vel = (exec_global_pos_6[:, -1] - exec_global_pos_6[:, -2]) / 0.1
+    next_yaw_rate = wrap_angle(exec_global_head_6[:, -1] - exec_global_head_6[:, -2]) / 0.1
+    return {
+        "exec_local_6": exec_local_6,
+        "exec_global_pos_6": exec_global_pos_6,
+        "exec_global_head_6": exec_global_head_6,
+        "next_pos": next_pos,
+        "next_head": next_head,
+        "next_vel": next_vel,
+        "next_yaw_rate": next_yaw_rate,
+    }
