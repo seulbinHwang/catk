@@ -105,14 +105,23 @@ class SMART(LightningModule):
             loss_mask=loss_mask,
         )
 
-    def training_step(self, data, batch_idx):
+    def training_step(self, data: dict, batch_idx: int) -> Tensor:
+        """학습 step을 수행한다.
+
+        이 버전은 Flow-Planner 스타일에 맞춰 두 손실만 기록한다.
+
+        - ``train/flow``
+        - ``train/consistency``
+
+        Returns:
+            스칼라 total loss.
+        """
         tokenized_map, tokenized_agent = self.token_processor(data)
         map_feature = self.encoder.encode_map(tokenized_map)
 
         total_loss = 0.0
         total_flow = 0.0
-        total_overlap = 0.0
-        total_recon = 0.0
+        total_consistency = 0.0
         n_terms = 0
 
         if self.use_closed_loop_finetune:
@@ -125,10 +134,10 @@ class SMART(LightningModule):
             for pred in outputs:
                 loss_mask = self._loss_mask_train(pred, data)
                 loss, log_dict = self._compute_single_loss(pred, loss_mask)
+
                 total_loss = total_loss + loss
                 total_flow = total_flow + log_dict["flow"]
-                total_overlap = total_overlap + log_dict["overlap"]
-                total_recon = total_recon + log_dict["recon"]
+                total_consistency = total_consistency + log_dict["consistency"]
                 n_terms += 1
         else:
             for anchor_step in self._select_train_anchor_steps():
@@ -140,17 +149,19 @@ class SMART(LightningModule):
                 )
                 loss_mask = self._loss_mask_train(pred, data)
                 loss, log_dict = self._compute_single_loss(pred, loss_mask)
+
                 total_loss = total_loss + loss
                 total_flow = total_flow + log_dict["flow"]
-                total_overlap = total_overlap + log_dict["overlap"]
-                total_recon = total_recon + log_dict["recon"]
+                total_consistency = total_consistency + log_dict["consistency"]
                 n_terms += 1
 
         total_loss = total_loss / max(n_terms, 1)
+
         self.log("train/loss", total_loss, on_step=True, batch_size=1)
-        self.log("train/flow", total_flow / max(n_terms, 1), on_step=True, batch_size=1)
-        self.log("train/overlap", total_overlap / max(n_terms, 1), on_step=True, batch_size=1)
-        self.log("train/recon", total_recon / max(n_terms, 1), on_step=True, batch_size=1)
+        self.log("train/flow", total_flow / max(n_terms, 1), on_step=True,
+                 batch_size=1)
+        self.log("train/consistency", total_consistency / max(n_terms, 1),
+                 on_step=True, batch_size=1)
         return total_loss
 
     def validation_step(self, data, batch_idx):
