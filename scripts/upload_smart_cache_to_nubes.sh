@@ -4,7 +4,7 @@ set -euo pipefail
 # ---------------- CPU 분리 설정 ----------------
 CPUSET="0-31,64-95"
 NUM_CPUS=64
-NUM_CPUS_FOR_USE=56
+NUM_CPUS_FOR_USE=32
 
 export DP_MAX_CPUS=${NUM_CPUS}
 export OMP_NUM_THREADS=1
