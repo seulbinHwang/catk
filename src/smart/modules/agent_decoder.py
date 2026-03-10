@@ -99,7 +99,7 @@ class SMARTAgentDecoder(nn.Module):
         self.token_emb_ped = MLPEmbedding(input_dim=8, hidden_dim=hidden_dim)
         self.token_emb_cyc = MLPEmbedding(input_dim=8, hidden_dim=hidden_dim)
         self.fusion_emb = MLPEmbedding(input_dim=hidden_dim * 2, hidden_dim=hidden_dim)
-        self.current_anchor_emb = MLPEmbedding(input_dim=8, hidden_dim=hidden_dim)
+        self.current_anchor_emb = MLPEmbedding(input_dim=5, hidden_dim=hidden_dim)
         self.future_segment_emb = MLPEmbedding(input_dim=24, hidden_dim=hidden_dim)
         self.segment_out_head = MLPLayer(hidden_dim, hidden_dim, 24)
 
@@ -184,24 +184,29 @@ class SMARTAgentDecoder(nn.Module):
             ``[N, H, 128]`` history token feature.
         """
         n_agent, n_step, traj_dim = pos_a.shape
-        device = pos_a.device
-        veh_mask = agent_type == 0
-        ped_mask = agent_type == 1
-        cyc_mask = agent_type == 2
+        veh_mask = (agent_type == 0).unsqueeze(1).unsqueeze(2)
+        ped_mask = (agent_type == 1).unsqueeze(1).unsqueeze(2)
+        cyc_mask = (agent_type == 2).unsqueeze(1).unsqueeze(2)
 
         agent_token_emb_veh = self.token_emb_veh(trajectory_token_veh)
         agent_token_emb_ped = self.token_emb_ped(trajectory_token_ped)
         agent_token_emb_cyc = self.token_emb_cyc(trajectory_token_cyc)
-        # Mixed precision can autocast token embeddings to bf16 while the history
-        # state tensors stay in fp32. Build the staging buffer from the embedding
-        # dtype so indexed assignment remains valid under bf16-mixed training.
-        agent_token_emb = agent_token_emb_veh.new_zeros((n_agent, n_step, self.hidden_dim))
-        if veh_mask.any():
-            agent_token_emb[veh_mask] = agent_token_emb_veh[agent_token_index[veh_mask]]
-        if ped_mask.any():
-            agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]
-        if cyc_mask.any():
-            agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]]
+
+        # Keep all type-specific embedding branches in the autograd graph every step.
+        # Otherwise, rank-local batches missing a type can trigger DDP unused-parameter
+        # errors when find_unused_parameters=False.
+        idx_veh = agent_token_index.clamp(max=agent_token_emb_veh.size(0) - 1)
+        idx_ped = agent_token_index.clamp(max=agent_token_emb_ped.size(0) - 1)
+        idx_cyc = agent_token_index.clamp(max=agent_token_emb_cyc.size(0) - 1)
+
+        emb_veh = agent_token_emb_veh[idx_veh]
+        emb_ped = agent_token_emb_ped[idx_ped]
+        emb_cyc = agent_token_emb_cyc[idx_cyc]
+        agent_token_emb = (
+            emb_veh * veh_mask.to(emb_veh.dtype)
+            + emb_ped * ped_mask.to(emb_ped.dtype)
+            + emb_cyc * cyc_mask.to(emb_cyc.dtype)
+        )
 
         motion_vector = torch.cat(
             [pos_a.new_zeros(n_agent, 1, traj_dim), pos_a[:, 1:] - pos_a[:, :-1]], dim=1
@@ -231,32 +236,27 @@ class SMARTAgentDecoder(nn.Module):
         agent_shape: Tensor,
         ego_mask: Tensor,
     ) -> Tensor:
-        """현재 정확한 연속 상태를 anchor token으로 바꾼다.
+        """현재 시각의 연속 상태를 0.1초 local 운동 변화량 anchor token으로 바꾼다.
 
-        Args:
-            current_vel: ``[N, 2]`` global velocity.
-            current_head: ``[N]`` global heading.
-            current_yaw_rate: ``[N]``.
-            agent_type: ``[N]``.
-            agent_shape: ``[N, 3]``.
-            ego_mask: ``[N]``.
-
-        Returns:
-            ``[N, 128]``.
+        연속 입력은 아래 5개만 사용한다.
+        1) 0.1초 local 이동량 x
+        2) 0.1초 local 이동량 y
+        3) 0.1초 heading 변화량의 sin
+        4) 0.1초 heading 변화량의 cos
+        5) ego flag
         """
+        dt = 0.1
         cos_h = current_head.cos()
         sin_h = current_head.sin()
-        vx_local = current_vel[:, 0] * cos_h - current_vel[:, 1] * sin_h
-        vy_local = current_vel[:, 0] * sin_h + current_vel[:, 1] * cos_h
+        vx_local = current_vel[:, 0] * cos_h + current_vel[:, 1] * sin_h
+        vy_local = -current_vel[:, 0] * sin_h + current_vel[:, 1] * cos_h
+        delta_head = wrap_angle(current_yaw_rate * dt)
         anchor_cont = torch.stack(
             [
-                vx_local,
-                vy_local,
-                current_head.sin(),
-                current_head.cos(),
-                current_yaw_rate,
-                agent_shape[:, 0],
-                agent_shape[:, 1],
+                vx_local * dt,
+                vy_local * dt,
+                delta_head.sin(),
+                delta_head.cos(),
                 ego_mask.float(),
             ],
             dim=-1,
