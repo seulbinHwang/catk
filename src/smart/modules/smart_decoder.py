@@ -65,6 +65,10 @@ class SMARTDecoder(nn.Module):
             history_slots=history_slots,
         )
 
+    def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """static map feature를 한 번만 인코딩해 재사용합니다."""
+        return self.map_encoder(tokenized_map)
+
     def forward(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -72,9 +76,10 @@ class SMARTDecoder(nn.Module):
         data,
         anchor_10hz: int,
         sampling_cfg,
+        map_feature: Optional[Dict[str, Tensor]] = None,
     ) -> Dict[str, Tensor]:
         """open-loop anchor 하나를 학습할 때 사용합니다."""
-        map_feature = self.map_encoder(tokenized_map)
+        map_feature = map_feature if map_feature is not None else self.encode_map(tokenized_map)
         return self.agent_encoder(tokenized_agent, map_feature, data, anchor_10hz, sampling_cfg)
 
     def rollout(
@@ -85,9 +90,10 @@ class SMARTDecoder(nn.Module):
         data=None,
         rollout_steps: Optional[int] = None,
         return_targets: bool = False,
+        map_feature: Optional[Dict[str, Tensor]] = None,
     ) -> Dict[str, Tensor]:
         """closed-loop rollout을 수행합니다."""
-        map_feature = self.map_encoder(tokenized_map)
+        map_feature = map_feature if map_feature is not None else self.encode_map(tokenized_map)
         return self.agent_encoder.rollout(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
@@ -104,6 +110,7 @@ class SMARTDecoder(nn.Module):
         sampling_cfg,
         data=None,
         rollout_steps: Optional[int] = None,
+        map_feature: Optional[Dict[str, Tensor]] = None,
     ) -> Dict[str, Tensor]:
         """기존 호출과의 호환을 위한 alias입니다."""
         return self.rollout(
@@ -113,4 +120,5 @@ class SMARTDecoder(nn.Module):
             data=data,
             rollout_steps=rollout_steps,
             return_targets=False,
+            map_feature=map_feature,
         )

@@ -316,21 +316,24 @@ class SMARTAgentDecoder(nn.Module):
         batch_pl,  # [n_pl*n_step]
     ):
         n_step = pos_a.shape[1]
+        n_pl = pos_pl.shape[0]
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        pos_pl = pos_pl.repeat(n_step, 1)
-        orient_pl = orient_pl.repeat(n_step)
+        pos_pl_rep = pos_pl.repeat(n_step, 1)
         edge_index_pl2a = radius(
             x=pos_s[:, :2],
-            y=pos_pl[:, :2],
+            y=pos_pl_rep[:, :2],
             r=self.pl2a_radius,
             batch_x=batch_s,
             batch_y=batch_pl,
             max_num_neighbors=300,
         )
         edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
+        # Edge search still runs on time-expanded map nodes, but attention can reuse the
+        # original static map features by folding source indices back to [0, n_pl).
+        edge_index_pl2a[0] = edge_index_pl2a[0].remainder(n_pl)
         rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
         rel_orient_pl2a = wrap_angle(
             orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]]
@@ -415,10 +418,7 @@ class SMARTAgentDecoder(nn.Module):
         )
 
         # ! attention layers
-        # [n_step*n_pl, hidden_dim]
-        feat_map = (
-            map_feature["pt_token"].unsqueeze(0).expand(n_step, -1, -1).flatten(0, 1)
-        )
+        feat_map = map_feature["pt_token"]  # [n_pl, hidden_dim]
 
         for i in range(self.num_layers):
             feat_a = feat_a.flatten(0, 1)  # [n_agent*n_step, hidden_dim]
@@ -574,16 +574,8 @@ class SMARTAgentDecoder(nn.Module):
                     ).view(n_agent, n_step, -1)
                     _feat_temporal = _feat_temporal.transpose(0, 1).flatten(0, 1)
 
-                    # [hist_step*n_pl, hidden_dim]
-                    _feat_map = (
-                        map_feature["pt_token"]
-                        .unsqueeze(0)
-                        .expand(hist_step, -1, -1)
-                        .flatten(0, 1)
-                    )
-
                     _feat_temporal = self.pt2a_attn_layers[i](
-                        (_feat_map, _feat_temporal), r_pl2a, edge_index_pl2a
+                        (map_feature["pt_token"], _feat_temporal), r_pl2a, edge_index_pl2a
                     )
                     _feat_temporal = self.a2a_attn_layers[i](
                         _feat_temporal, r_a2a, edge_index_a2a

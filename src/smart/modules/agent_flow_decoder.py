@@ -199,7 +199,7 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             batch_s=batch_s,
             batch_pl=batch_pl,
         )
-        feat_map = map_feature["pt_token"].unsqueeze(0).expand(n_hist, -1, -1).flatten(0, 1)
+        feat_map = map_feature["pt_token"]
 
         for i in range(self.num_layers):
             feat_a = feat_a.flatten(0, 1)
@@ -295,7 +295,6 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
              range(self.n_future_segments)],
             dim=0,
         )  # [n_pl * 4]
-
         edge_index_t, r_t = self.build_temporal_edge(
             pos_a=end_pos,
             head_a=end_head,
@@ -319,8 +318,7 @@ class SMARTAgentFlowDecoder(SMARTAgentDecoder):
             batch_s=batch_s,
             batch_pl=batch_pl,
         )
-        feat_map = map_feature["pt_token"].unsqueeze(0).expand(
-            self.n_future_segments, -1, -1).flatten(0, 1)
+        feat_map = map_feature["pt_token"]
         feat = query
         for i in range(self.num_layers):
             feat = feat.flatten(0, 1)

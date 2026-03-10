@@ -79,6 +79,7 @@ class SMART(LightningModule):
         data,
         tokenized_map: Dict[str, torch.Tensor],
         tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
         anchor_10hz: int,
     ):
         pred = self.encoder(
@@ -87,6 +88,7 @@ class SMART(LightningModule):
             data=data,
             anchor_10hz=anchor_10hz,
             sampling_cfg=self.flow_sampling,
+            map_feature=map_feature,
         )
         train_mask = self._get_train_mask(data)
         if train_mask is not None:
@@ -102,7 +104,7 @@ class SMART(LightningModule):
             target_velocity=pred["target_velocity"],
         )
 
-    def _closed_loop_train_loss(self, data, tokenized_map, tokenized_agent):
+    def _closed_loop_train_loss(self, data, tokenized_map, tokenized_agent, map_feature):
         rollout = self.encoder.rollout(
             tokenized_map=tokenized_map,
             tokenized_agent=tokenized_agent,
@@ -110,6 +112,7 @@ class SMART(LightningModule):
             data=data,
             rollout_steps=self.closed_loop_steps,
             return_targets=True,
+            map_feature=map_feature,
         )
         pred_future = torch.cat(rollout["pred_local_futures"], dim=0)  # [n_agent * n_step, 21, 4]
         target_future = torch.cat(rollout["target_local_futures"], dim=0)  # [n_agent * n_step, 21, 4]
@@ -130,9 +133,11 @@ class SMART(LightningModule):
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+        # The static map does not depend on the sampled anchor, so reuse one graph per batch.
+        map_feature = self.encoder.encode_map(tokenized_map)
 
         if self.closed_loop_steps > 0:
-            loss_out = self._closed_loop_train_loss(data, tokenized_map, tokenized_agent)
+            loss_out = self._closed_loop_train_loss(data, tokenized_map, tokenized_agent, map_feature)
         else:
             candidate_anchors = build_anchor_10hz_indices(
                 num_historical_steps=self.num_historical_steps,
@@ -146,7 +151,13 @@ class SMART(LightningModule):
                 device=data["agent"]["position"].device,
             )
             loss_items = [
-                self._open_loop_anchor_loss(data, tokenized_map, tokenized_agent, anchor_10hz=a)
+                self._open_loop_anchor_loss(
+                    data,
+                    tokenized_map,
+                    tokenized_agent,
+                    map_feature,
+                    anchor_10hz=a,
+                )
                 for a in anchor_list
             ]
             total_loss = torch.stack([x.total_loss for x in loss_items]).mean()
@@ -168,6 +179,8 @@ class SMART(LightningModule):
 
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+        # Validation reuses the same scene map across all anchors / rollouts as well.
+        map_feature = self.encoder.encode_map(tokenized_map)
 
         if self.val_open_loop:
             candidate_anchors = build_anchor_10hz_indices(
@@ -177,7 +190,13 @@ class SMART(LightningModule):
                 shift=5,
             )
             loss_items = [
-                self._open_loop_anchor_loss(data, tokenized_map, tokenized_agent, anchor_10hz=a)
+                self._open_loop_anchor_loss(
+                    data,
+                    tokenized_map,
+                    tokenized_agent,
+                    map_feature,
+                    anchor_10hz=a,
+                )
                 for a in candidate_anchors
             ]
             if len(loss_items) > 0:
@@ -220,6 +239,7 @@ class SMART(LightningModule):
                     data=data,
                     rollout_steps=self.num_future_steps // 5,
                     return_targets=False,
+                    map_feature=map_feature,
                 )
                 pred_traj.append(pred["pred_traj_10hz"])
                 pred_z.append(pred["pred_z_10hz"])
@@ -330,6 +350,8 @@ class SMART(LightningModule):
 
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+        # Test rollout sees the same static map at every rollout step.
+        map_feature = self.encoder.encode_map(tokenized_map)
         pred_traj, pred_z, pred_head = [], [], []
         for _ in range(self.n_rollout_closed_val):
             pred = self.encoder.rollout(
@@ -339,6 +361,7 @@ class SMART(LightningModule):
                 data=data,
                 rollout_steps=self.num_future_steps // 5,
                 return_targets=False,
+                map_feature=map_feature,
             )
             pred_traj.append(pred["pred_traj_10hz"])
             pred_z.append(pred["pred_z_10hz"])
