@@ -760,15 +760,25 @@ class SMARTAgentDecoder(nn.Module):
         flow_pred = self.segment_out_head(future_feat).view(n_agent, self.future_num_segments, self.future_segment_points, 4)
         return flow_pred
 
-    def _forward_with_state(
+    def forward(
         self,
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
         agent_raw: Dict[str, Tensor],
         anchor_step: int,
-        state: Dict[str, Tensor],
     ) -> Dict[str, Tensor]:
-        """주어진 state에서 flow loss 계산용 출력을 만든다."""
+        """한 anchor 시각에 대한 open-loop flow matching 출력을 만든다.
+
+        Args:
+            tokenized_agent: tokenized agent dict.
+            map_feature: encoded map dict.
+            agent_raw: raw ``data['agent']`` dict.
+            anchor_step: raw 10Hz anchor step.
+
+        Returns:
+            flow loss 계산에 필요한 dict.
+        """
+        state = self._build_gt_state(tokenized_agent, agent_raw, anchor_step)
         gt_future_local, _, _, _ = build_local_future_target(
             pos_global=agent_raw["position"][..., :2],
             head_global=agent_raw["heading"],
@@ -804,59 +814,6 @@ class SMARTAgentDecoder(nn.Module):
             "future_valid": future_valid,
         }
 
-    def forward(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        agent_raw: Dict[str, Tensor],
-        anchor_step: int,
-    ) -> Dict[str, Tensor]:
-        """한 anchor 시각에 대한 open-loop flow matching 출력을 만든다.
-
-        Args:
-            tokenized_agent: tokenized agent dict.
-            map_feature: encoded map dict.
-            agent_raw: raw ``data['agent']`` dict.
-            anchor_step: raw 10Hz anchor step.
-
-        Returns:
-            flow loss 계산에 필요한 dict.
-        """
-        state = self._build_gt_state(tokenized_agent, agent_raw, anchor_step)
-        return self._forward_with_state(tokenized_agent, map_feature, agent_raw, anchor_step, state)
-
-    def init_closed_loop_state(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        agent_raw: Dict[str, Tensor],
-    ) -> Dict[str, Tensor]:
-        """짧은 closed-loop fine-tuning용 초기 rollout state를 만든다."""
-        return self._init_rollout_state(tokenized_agent, agent_raw)
-
-    def closed_loop_train_step(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        agent_raw: Dict[str, Tensor],
-        state: Dict[str, Tensor],
-        step_idx: int,
-    ) -> tuple[Dict[str, Tensor], Dict[str, Tensor]]:
-        """closed-loop fine-tuning의 한 unroll step만 계산한다."""
-        anchor_step = self.current_step + step_idx * self.shift
-        pred = self._forward_with_state(tokenized_agent, map_feature, agent_raw, anchor_step, state)
-        rollout = executed_chunk_to_rollout_update(
-            future_local_21=pred["pred_future_local"].detach(),
-            pos_now=state["current_pos"],
-            head_now=state["current_head"],
-        )
-        nearest_idx = nearest_agent_token_idx(
-            local_chunk_6=rollout["exec_local_6"],
-            agent_shape=tokenized_agent["token_agent_shape"],
-            token_traj_all=tokenized_agent["token_traj_all"],
-        )
-        next_state = self._advance_rollout_state(state, nearest_idx, rollout)
-        return pred, next_state
-
     def closed_loop_train(
         self,
         tokenized_agent: Dict[str, Tensor],
@@ -875,17 +832,57 @@ class SMARTAgentDecoder(nn.Module):
         Returns:
             각 unroll step의 open-loop style 출력 dict list.
         """
-        state = self.init_closed_loop_state(tokenized_agent, agent_raw)
+        state = self._init_rollout_state(tokenized_agent, agent_raw)
         outputs = []
         for step in range(unroll_steps):
-            pred, state = self.closed_loop_train_step(
+            anchor_step = self.current_step + step * self.shift
+            gt_future_local, _, _, _ = build_local_future_target(
+                pos_global=agent_raw["position"][..., :2],
+                head_global=agent_raw["heading"],
+                anchor_step=anchor_step,
+                future_window_steps=self.future_window_steps,
+            )
+            gt_segments = chunk_future_21_to_4x6(gt_future_local)
+            future_valid = agent_raw["valid_mask"][
+                :,
+                anchor_step : anchor_step + self.future_window_steps + 1,
+            ].all(dim=1)
+            future_mask = self._expand_agent_mask_to_future_segments(future_valid)
+            x0 = torch.randn_like(gt_segments)
+            tau = torch.rand(gt_segments.shape[0], 1, 1, 1, device=gt_segments.device, dtype=gt_segments.dtype)
+            x_t, flow_target = build_flow_path(x0, gt_segments, tau)
+            flow_pred = self._predict_velocity_field(
+                x_t=x_t,
+                tau=tau.view(gt_segments.shape[0], 1),
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
-                agent_raw=agent_raw,
                 state=state,
-                step_idx=step,
+                future_mask=future_mask,
             )
-            outputs.append(pred)
+            pred_segments = x_t + (1.0 - tau) * flow_pred
+            pred_future_local = assemble_4x6_to_21(pred_segments)
+            outputs.append(
+                {
+                    "flow_pred": flow_pred,
+                    "flow_target": flow_target,
+                    "pred_segments": pred_segments,
+                    "gt_segments": gt_segments,
+                    "pred_future_local": pred_future_local,
+                    "gt_future_local": gt_future_local,
+                    "future_valid": future_valid,
+                }
+            )
+            rollout = executed_chunk_to_rollout_update(
+                future_local_21=pred_future_local.detach(),
+                pos_now=state["current_pos"],
+                head_now=state["current_head"],
+            )
+            nearest_idx = nearest_agent_token_idx(
+                local_chunk_6=rollout["exec_local_6"],
+                agent_shape=tokenized_agent["token_agent_shape"],
+                token_traj_all=tokenized_agent["token_traj_all"],
+            )
+            state = self._advance_rollout_state(state, nearest_idx, rollout)
         return outputs
 
     @torch.no_grad()

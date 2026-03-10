@@ -64,14 +64,6 @@ def instantiate_loggers(logger_cfg: DictConfig) -> List[Logger]:
     for _, lg_conf in logger_cfg.items():
         if isinstance(lg_conf, DictConfig) and "_target_" in lg_conf:
             log.info(f"Instantiating logger <{lg_conf._target_}>")
-            instantiate_kwargs = {}
-            if (
-                lg_conf.get("_target_") == "lightning.pytorch.loggers.wandb.WandbLogger"
-                and lg_conf.get("offline")
-                and lg_conf.get("log_model")
-            ):
-                log.info("Disabling W&B checkpoint artifact upload because offline logging is enabled")
-                instantiate_kwargs["log_model"] = False
-            logger.append(hydra.utils.instantiate(lg_conf, **instantiate_kwargs))
+            logger.append(hydra.utils.instantiate(lg_conf))
 
     return logger

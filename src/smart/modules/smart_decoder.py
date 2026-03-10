@@ -109,31 +109,6 @@ class SMARTDecoder(nn.Module):
         """짧은 closed-loop fine-tuning을 수행한다."""
         return self.agent_encoder.closed_loop_train(tokenized_agent, map_feature, agent_raw, unroll_steps)
 
-    def init_closed_loop_state(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        agent_raw: Dict[str, Tensor],
-    ) -> Dict[str, Tensor]:
-        """짧은 closed-loop fine-tuning용 초기 rollout state를 만든다."""
-        return self.agent_encoder.init_closed_loop_state(tokenized_agent, agent_raw)
-
-    def closed_loop_train_step(
-        self,
-        map_feature: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        agent_raw: Dict[str, Tensor],
-        state: Dict[str, Tensor],
-        step_idx: int,
-    ) -> tuple[Dict[str, Tensor], Dict[str, Tensor]]:
-        """짧은 closed-loop fine-tuning의 한 unroll step만 계산한다."""
-        return self.agent_encoder.closed_loop_train_step(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            agent_raw=agent_raw,
-            state=state,
-            step_idx=step_idx,
-        )
-
     def inference(
         self,
         tokenized_map: Dict[str, Tensor],
