@@ -35,7 +35,7 @@ model_config:
     dropout: 0.1
     hist_drop_prob: 0.1
     num_map_layers: 3
-    num_agent_layers: 6
+    num_agent_layers: 5
     pl2pl_radius: 10
     pl2a_radius: 30
     a2a_radius: 60
