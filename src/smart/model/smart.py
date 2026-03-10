@@ -41,6 +41,7 @@ class SMART(LightningModule):
         self.future_window_steps = model_config.decoder.future_window_steps
         self.anchor_chunk_k = model_config.decoder.anchor_chunk_k
         self.closed_loop_steps = model_config.closed_loop_steps
+        self.train_max_num = model_config.get("train_max_num")
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
@@ -74,6 +75,66 @@ class SMART(LightningModule):
             return data["agent"]["train_mask"]
         return None
 
+    def _limit_train_mask_per_graph(
+        self,
+        role_train_mask: torch.Tensor,
+        extra_train_mask: torch.Tensor,
+        batch: torch.Tensor,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        train_mask = role_train_mask.clone()
+        extra_only_mask = extra_train_mask & ~role_train_mask
+        if self.train_max_num is None:
+            train_mask |= extra_only_mask
+            return train_mask
+
+        for graph_idx in range(num_graphs):
+            graph_mask = batch == graph_idx
+            graph_role_count = int((role_train_mask & graph_mask).sum().item())
+            remaining = self.train_max_num - graph_role_count
+            if remaining <= 0:
+                continue
+
+            extra_indices = torch.where(extra_only_mask & graph_mask)[0]
+            if extra_indices.numel() <= remaining:
+                train_mask[extra_indices] = True
+                continue
+
+            selected = torch.randperm(extra_indices.numel(), device=batch.device)[:remaining]
+            train_mask[extra_indices[selected]] = True
+        return train_mask
+
+    def _build_anchor_train_mask(
+        self,
+        data,
+        anchor_10hz: int,
+        target_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        anchor_active = target_valid[:, 0]
+        if self._get_train_mask(data) is None:
+            return anchor_active
+
+        agent_batch = data["agent"]["batch"]
+        ego_mask = data["agent"]["role"][:, 0]
+        if int(ego_mask.sum().item()) != data.num_graphs:
+            raise ValueError("Expected exactly one ego agent per graph when building anchor train masks.")
+
+        anchor_pos = data["agent"]["position"][:, anchor_10hz, :2]
+        ego_anchor_pos = anchor_pos.new_zeros((data.num_graphs, 2))
+        ego_anchor_pos[agent_batch[ego_mask]] = anchor_pos[ego_mask]
+        anchor_distance = torch.norm(anchor_pos - ego_anchor_pos[agent_batch], dim=-1)
+
+        role_train_mask = data["agent"]["role"].any(-1)
+        future_valid_count = target_valid[:, 1:].sum(-1)
+        extra_train_mask = (anchor_distance < 100.0) & (future_valid_count >= 5)
+        train_mask = self._limit_train_mask_per_graph(
+            role_train_mask=role_train_mask,
+            extra_train_mask=extra_train_mask,
+            batch=agent_batch,
+            num_graphs=data.num_graphs,
+        )
+        return train_mask & anchor_active
+
     def _open_loop_anchor_loss(
         self,
         data,
@@ -90,11 +151,11 @@ class SMART(LightningModule):
             sampling_cfg=self.flow_sampling,
             map_feature=map_feature,
         )
-        train_mask = self._get_train_mask(data)
-        if train_mask is not None:
-            train_mask = train_mask & pred["active_mask"]
-        else:
-            train_mask = pred["active_mask"]
+        train_mask = self._build_anchor_train_mask(
+            data=data,
+            anchor_10hz=anchor_10hz,
+            target_valid=pred["target_valid"],
+        )
         return self.training_loss(
             pred_segments=pred["pred_segments"],
             target_segments=pred["target_segments"],
@@ -119,9 +180,21 @@ class SMART(LightningModule):
         target_valid = torch.cat(rollout["target_valids"], dim=0)  # [n_agent * n_step, 21]
         pred_segments = chunk_future_21_to_4x6(pred_future)
         target_segments = chunk_future_21_to_4x6(target_future)
-        train_mask = self._get_train_mask(data)
-        if train_mask is not None:
-            train_mask = train_mask.repeat(self.closed_loop_steps)
+        train_mask = None
+        if self._get_train_mask(data) is not None:
+            shift = self.encoder.agent_encoder.shift
+            start_anchor = self.num_historical_steps - 1
+            train_mask = torch.cat(
+                [
+                    self._build_anchor_train_mask(
+                        data=data,
+                        anchor_10hz=start_anchor + step * shift,
+                        target_valid=step_target_valid,
+                    )
+                    for step, step_target_valid in enumerate(rollout["target_valids"])
+                ],
+                dim=0,
+            )
         return self.training_loss(
             pred_segments=pred_segments,
             target_segments=target_segments,

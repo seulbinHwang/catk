@@ -4,6 +4,7 @@ model_config:
   lr_warmup_steps: 0
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.05
+  train_max_num: ${data.train_max_num}
 
   n_rollout_closed_val: 32
   n_batch_wosac_metric: 10
