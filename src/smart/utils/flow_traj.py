@@ -13,6 +13,38 @@ SEGMENT_STARTS: Tuple[int, int, int, int] = (0, 5, 10, 15)
 SEGMENT_LEN: int = 6
 
 
+def stabilize_invalid_future(
+    future_local: Tensor,
+    valid_mask: Tensor,
+) -> Tensor:
+    """invalid future point를 마지막 valid local pose로 대체합니다.
+
+    loss에서는 invalid point를 마스킹하지만,
+    flow-matching input `z_tau`는 target 전체로부터 만들어집니다.
+    따라서 invalid global point가 zero padding이면 anchor-local 변환 후
+    수천 미터짜리 값으로 튀어 query/attention을 오염시킬 수 있습니다.
+
+    anchor가 valid한 agent는 invalid suffix를 마지막 valid pose로 forward-fill하고,
+    anchor 자체가 invalid한 agent는 전체를 canonical zero pose로 둡니다.
+    """
+    cleaned = future_local.clone()
+    canonical = cleaned.new_tensor((0.0, 0.0, 0.0, 1.0)).view(1, 1, 4)
+    anchor_valid = valid_mask[:, 0]
+
+    cleaned[:, 0] = canonical[:, 0]
+    if (~anchor_valid).any():
+        cleaned[~anchor_valid] = canonical
+
+    for t in range(1, cleaned.shape[1]):
+        current_valid = valid_mask[:, t] & anchor_valid
+        cleaned[:, t] = torch.where(
+            current_valid.unsqueeze(-1),
+            cleaned[:, t],
+            cleaned[:, t - 1],
+        )
+    return cleaned
+
+
 def normalize_sincos(traj: Tensor, eps: float = 1e-6) -> Tensor:
     """`(sin, cos)` 두 값을 다시 길이 1로 맞춥니다.
 
@@ -218,6 +250,7 @@ def build_local_future_target(
     future_local[:, 0, 1] = 0.0
     future_local[:, 0, 2] = 0.0
     future_local[:, 0, 3] = 1.0
+    future_local = stabilize_invalid_future(future_local, valid_slice)
     future_local = normalize_sincos(future_local)
     return future_local, valid_slice
 
