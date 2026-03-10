@@ -1,0 +1,3 @@
+training_loss:
+  flow_weight: 1.0
+  consistency_weight: 0.5
