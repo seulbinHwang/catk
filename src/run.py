@@ -50,12 +50,18 @@ def get_wandb_logger(loggers: List[Logger]) -> WandbLogger | None:
     return None
 
 
+def is_wandb_logger_offline(wandb_logger: WandbLogger) -> bool:
+    if hasattr(wandb_logger, "offline"):
+        return bool(wandb_logger.offline)
+    return bool(getattr(wandb_logger, "_offline", False))
+
+
 def log_wandb_checkpoint_refs(cfg: DictConfig, loggers: List[Logger]) -> None:
     if int(os.environ.get("RANK", "0")) != 0:
         return
 
     wandb_logger = get_wandb_logger(loggers)
-    if wandb_logger is None or wandb_logger.offline:
+    if wandb_logger is None or is_wandb_logger_offline(wandb_logger):
         return
     if not wandb_logger.log_model:
         return
@@ -176,11 +182,14 @@ def build_trainer_kwargs(cfg: DictConfig, model: LightningModule) -> dict:
 
     clip_val = cfg.trainer.get("gradient_clip_val")
     clip_algorithm = cfg.trainer.get("gradient_clip_algorithm")
+    accumulate_grad_batches = cfg.trainer.get("accumulate_grad_batches", 1)
     if hasattr(model, "set_manual_gradient_clipping"):
         model.set_manual_gradient_clipping(clip_val, clip_algorithm)
+    if hasattr(model, "set_manual_accumulate_grad_batches"):
+        model.set_manual_accumulate_grad_batches(accumulate_grad_batches)
 
-    # Lightning rejects Trainer-level automatic clipping for manual optimization.
-    return {"gradient_clip_val": None}
+    # Lightning rejects Trainer-level automatic clipping and accumulation for manual optimization.
+    return {"gradient_clip_val": None, "accumulate_grad_batches": 1}
 
 
 def run(cfg: DictConfig) -> None:
@@ -208,7 +217,7 @@ def run(cfg: DictConfig) -> None:
     if not getattr(model, "automatic_optimization", True):
         log.info(
             "Manual optimization detected; disabling Trainer automatic gradient clipping "
-            "and delegating clipping to the model."
+            "and accumulation, and delegating both to the model."
         )
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")

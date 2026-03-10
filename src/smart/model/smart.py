@@ -66,6 +66,7 @@ class SMART(LightningModule):
         self.automatic_optimization = False
         self.manual_gradient_clip_val = None
         self.manual_gradient_clip_algorithm = None
+        self.manual_accumulate_grad_batches = None
 
     @property
     def anchor_steps(self) -> List[int]:
@@ -110,6 +111,8 @@ class SMART(LightningModule):
         )
 
     def _accumulate_grad_batches(self) -> int:
+        if self.manual_accumulate_grad_batches is not None:
+            return max(int(self.manual_accumulate_grad_batches), 1)
         return max(int(getattr(self.trainer, "accumulate_grad_batches", 1)), 1)
 
     def _is_last_train_batch(self, batch_idx: int) -> bool:
@@ -125,6 +128,9 @@ class SMART(LightningModule):
     def set_manual_gradient_clipping(self, clip_val, clip_algorithm) -> None:
         self.manual_gradient_clip_val = clip_val
         self.manual_gradient_clip_algorithm = clip_algorithm
+
+    def set_manual_accumulate_grad_batches(self, accumulate_grad_batches) -> None:
+        self.manual_accumulate_grad_batches = accumulate_grad_batches
 
     def _clip_gradients_if_needed(self, optimizer) -> None:
         clip_val = self.manual_gradient_clip_val
