@@ -1,35 +1,26 @@
-#!/bin/bash
-set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# ---------------- CPU 분리 설정 ----------------
-CPUSET="0-31,64-95"
-NUM_CPUS=64
-NUM_CPUS_FOR_USE=56
-PROGRESS_INTERVAL_SEC="${PROGRESS_INTERVAL_SEC:-60}"
+# ---------------- CPU / concurrency settings ----------------
+CPUSET="${CPUSET:-}"
+PROGRESS_INTERVAL_SEC="${PROGRESS_INTERVAL_SEC:-300}"
+MAX_UPLOAD_JOBS="${MAX_UPLOAD_JOBS:-16}"
+LARGE_TREE_THRESHOLD="${LARGE_TREE_THRESHOLD:-200000}"
+LARGE_TREE_PROGRESS_INTERVAL_SEC="${LARGE_TREE_PROGRESS_INTERVAL_SEC:-600}"
+REMOTE_PROGRESS="${REMOTE_PROGRESS:-1}"
+NUBES_RETRY="${NUBES_RETRY:-5}"
 
-export DP_MAX_CPUS=${NUM_CPUS}
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export BLIS_NUM_THREADS=1
-# ----------------------------------------------
-
-# 스크립트(현재 쉘) 자체를 CPUSET에 고정
-# 이후 실행되는 하위 작업들도 동일 CPUSET을 사용
-if command -v taskset >/dev/null 2>&1; then
-  taskset -cp "${CPUSET}" $$ >/dev/null
-fi
-
-CPU_USAGE_PERCENT=$(awk "BEGIN { printf \"%.1f\", 100 * $NUM_CPUS_FOR_USE / $NUM_CPUS }")
-
-echo "[SMART_CACHE_UPLOAD] CPUSET=${CPUSET}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
-echo "[SMART_CACHE_UPLOAD] available_cpus=${NUM_CPUS}, chosen_upload_jobs=${NUM_CPUS_FOR_USE}, cpu_usage_percent=${CPU_USAGE_PERCENT}%"
+# ------------------------------------------------------------
 
 LOCAL_DIR="${LOCAL_DIR:-/media/user/E/dataset/womd_v1_3/SMART_cache}"
 REMOTE_DIR="${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache}"
 
-if [ ! -d "$LOCAL_DIR" ]; then
+if [[ ! -d "$LOCAL_DIR" ]]; then
   echo "ERROR: Local directory not found: $LOCAL_DIR"
   exit 1
 fi
@@ -38,6 +29,108 @@ if ! command -v nubescli >/dev/null 2>&1; then
   echo "ERROR: nubescli not found in PATH"
   exit 1
 fi
+
+_detect_cpuset() {
+  if [[ -n "$CPUSET" ]]; then
+    echo "$CPUSET"
+    return
+  fi
+
+  if command -v taskset >/dev/null 2>&1; then
+    taskset -pc $$ 2>/dev/null | awk -F': ' 'NR==1 {print $2}'
+    return
+  fi
+
+  echo ""
+}
+
+_count_cpus_in_list() {
+  local cpu_list="$1"
+  local total=0
+  local part
+  local start
+  local end
+
+  if [[ -z "$cpu_list" ]]; then
+    echo "0"
+    return
+  fi
+
+  IFS=',' read -ra parts <<< "$cpu_list"
+  for part in "${parts[@]}"; do
+    if [[ "$part" == *-* ]]; then
+      start="${part%-*}"
+      end="${part#*-}"
+      total=$(( total + end - start + 1 ))
+    else
+      total=$(( total + 1 ))
+    fi
+  done
+
+  echo "$total"
+}
+
+_detect_available_cpus() {
+  local quota
+  local period
+  local cpus
+
+  if [[ -n "${NUM_CPUS:-}" ]]; then
+    CPU_DETECTION_SOURCE="NUM_CPUS"
+    AVAILABLE_CPUS="$NUM_CPUS"
+    return
+  fi
+
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max || true
+    if [[ -n "${quota:-}" && -n "${period:-}" && "$quota" != "max" && "$period" -gt 0 ]]; then
+      cpus=$(( quota / period ))
+      if [[ "$cpus" -gt 0 ]]; then
+        CPU_DETECTION_SOURCE="cgroup_cpu.max"
+        AVAILABLE_CPUS="$cpus"
+        return
+      fi
+    fi
+  fi
+
+  if [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    quota="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+    period="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+    if [[ -n "${quota:-}" && -n "${period:-}" && "$quota" -gt 0 && "$period" -gt 0 ]]; then
+      cpus=$(( quota / period ))
+      if [[ "$cpus" -gt 0 ]]; then
+        CPU_DETECTION_SOURCE="cgroup_cfs"
+        AVAILABLE_CPUS="$cpus"
+        return
+      fi
+    fi
+  fi
+
+  cpus="$(nproc 2>/dev/null || true)"
+  if [[ -n "${cpus:-}" && "$cpus" -gt 0 ]]; then
+    CPU_DETECTION_SOURCE="nproc"
+    AVAILABLE_CPUS="$cpus"
+    return
+  fi
+
+  cpus="$(_count_cpus_in_list "$ACTIVE_CPUSET")"
+  if [[ "$cpus" -gt 0 ]]; then
+    CPU_DETECTION_SOURCE="taskset"
+    AVAILABLE_CPUS="$cpus"
+    return
+  fi
+
+  CPU_DETECTION_SOURCE="fallback"
+  AVAILABLE_CPUS="1"
+}
+
+_run_pinned() {
+  if [[ -n "$ACTIVE_CPUSET" ]] && command -v taskset >/dev/null 2>&1; then
+    taskset -c "$ACTIVE_CPUSET" "$@"
+  else
+    "$@"
+  fi
+}
 
 _format_hours_minutes() {
   local seconds="$1"
@@ -61,8 +154,7 @@ _write_local_manifest() {
 }
 
 _write_remote_manifest() {
-  taskset -c "${CPUSET}" \
-  nubescli list "$REMOTE_DIR" -R -o -f | \
+  _run_pinned nubescli -r "$NUBES_RETRY" list "$REMOTE_DIR" -R -o -f | \
     awk -v remote_dir="$REMOTE_DIR" '
       NR == 1 && $0 == "Path" {next}
       !NF {next}
@@ -119,15 +211,55 @@ _monitor_progress() {
   local total_expected="$1"
   local start_count="$2"
   local start_epoch="$3"
+  local progress_interval="$4"
   local current_count
 
   while true; do
-    sleep "$PROGRESS_INTERVAL_SEC"
-    _write_remote_manifest
-    current_count=$(_count_uploaded_files)
-    _print_progress "$total_expected" "$current_count" "$start_count" "$start_epoch"
+    sleep "$progress_interval"
+    if _write_remote_manifest; then
+      current_count=$(_count_uploaded_files)
+      _print_progress "$total_expected" "$current_count" "$start_count" "$start_epoch"
+    else
+      echo "[upload-progress] remote manifest refresh failed; keeping previous progress snapshot"
+    fi
   done
 }
+
+ACTIVE_CPUSET="$(_detect_cpuset)"
+CPU_DETECTION_SOURCE=""
+AVAILABLE_CPUS=""
+_detect_available_cpus
+
+export DP_MAX_CPUS="${AVAILABLE_CPUS}"
+
+if [[ -n "$ACTIVE_CPUSET" ]] && command -v taskset >/dev/null 2>&1; then
+  taskset -cp "$ACTIVE_CPUSET" $$ >/dev/null 2>&1 || true
+fi
+
+if [[ -z "${NUBES_JOBS:-}" ]]; then
+  if [[ "$AVAILABLE_CPUS" -le 4 ]]; then
+    NUBES_JOBS="$AVAILABLE_CPUS"
+  elif [[ "$AVAILABLE_CPUS" -le 8 ]]; then
+    NUBES_JOBS=$(( AVAILABLE_CPUS - 1 ))
+  elif [[ "$AVAILABLE_CPUS" -le 16 ]]; then
+    NUBES_JOBS=$(( AVAILABLE_CPUS - 2 ))
+  else
+    NUBES_JOBS=$(( (AVAILABLE_CPUS * 4) / 5 ))
+  fi
+fi
+
+if [[ "$NUBES_JOBS" -lt 1 ]]; then
+  NUBES_JOBS=1
+fi
+
+if [[ "$MAX_UPLOAD_JOBS" -gt 0 && "$NUBES_JOBS" -gt "$MAX_UPLOAD_JOBS" ]]; then
+  NUBES_JOBS="$MAX_UPLOAD_JOBS"
+fi
+
+CPU_USAGE_PERCENT=$(awk "BEGIN { printf \"%.1f\", 100 * $NUBES_JOBS / $AVAILABLE_CPUS }")
+
+echo "[SMART_CACHE_UPLOAD] CPUSET=${ACTIVE_CPUSET:-auto}, PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC}"
+echo "[SMART_CACHE_UPLOAD] available_cpus=${AVAILABLE_CPUS}, chosen_upload_jobs=${NUBES_JOBS}, cpu_usage_percent=${CPU_USAGE_PERCENT}%, cpu_detection_source=${CPU_DETECTION_SOURCE}, max_upload_jobs=${MAX_UPLOAD_JOBS}, nubes_retry=${NUBES_RETRY}"
 
 LOCAL_MANIFEST="$(mktemp)"
 REMOTE_MANIFEST="$(mktemp)"
@@ -162,22 +294,39 @@ if [[ "$start_count" -ge "$total_expected" ]]; then
   exit 0
 fi
 
-_monitor_progress "$total_expected" "$start_count" "$start_epoch" &
-monitor_pid=$!
+effective_progress_interval="$PROGRESS_INTERVAL_SEC"
+if [[ "$total_expected" -ge "$LARGE_TREE_THRESHOLD" && "$effective_progress_interval" -lt "$LARGE_TREE_PROGRESS_INTERVAL_SEC" ]]; then
+  effective_progress_interval="$LARGE_TREE_PROGRESS_INTERVAL_SEC"
+  echo "[UPLOAD] large tree detected; progress interval raised to ${effective_progress_interval}s to reduce recursive list pressure"
+fi
+
+if [[ "$REMOTE_PROGRESS" == "1" ]]; then
+  _monitor_progress "$total_expected" "$start_count" "$start_epoch" "$effective_progress_interval" &
+  monitor_pid=$!
+else
+  echo "[UPLOAD] remote progress monitor disabled"
+fi
+
+upload_flags=(-e -j "$NUBES_JOBS" --no-progress)
+if [[ "$start_count" -gt 0 ]]; then
+  upload_flags+=(-s)
+  echo "[UPLOAD] enabling --skip because remote manifest already contains ${start_count} objects"
+else
+  echo "[UPLOAD] remote manifest is empty; omitting --skip to avoid per-file HEAD checks"
+fi
 
 echo "[UPLOAD] SMART_cache missing files -> $REMOTE_DIR [start]"
-taskset -c "${CPUSET}" \
-nubescli dir-upload "$REMOTE_DIR" \
+_run_pinned nubescli -r "$NUBES_RETRY" dir-upload \
+  "$REMOTE_DIR" \
   "$LOCAL_DIR" \
-  -e \
-  -s \
-  -j ${NUM_CPUS_FOR_USE} \
-  --no-progress
+  "${upload_flags[@]}"
 echo "[UPLOAD] SMART_cache missing files -> $REMOTE_DIR [end]"
 
-kill "$monitor_pid" >/dev/null 2>&1 || true
-wait "$monitor_pid" 2>/dev/null || true
-monitor_pid=""
+if [[ -n "$monitor_pid" ]]; then
+  kill "$monitor_pid" >/dev/null 2>&1 || true
+  wait "$monitor_pid" 2>/dev/null || true
+  monitor_pid=""
+fi
 
 _write_remote_manifest
 final_count=$(_count_uploaded_files)
