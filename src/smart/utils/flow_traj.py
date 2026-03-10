@@ -178,6 +178,11 @@ def segment_end_pose_global(
 def build_flow_path(x0: Tensor, x1: Tensor, tau: Tensor) -> Tuple[Tensor, Tensor]:
     """선형 conditional flow matching path를 만든다.
 
+    이 함수는 flow path와 target field가 같은 선형 상태공간에서 정의되도록
+    상태 자체에는 sin/cos 재정규화를 적용하지 않는다. sin/cos 재정규화는
+    world 좌표 변환이나 최종 trajectory 조립처럼 기하 해석이 필요한 곳에서만
+    별도로 수행한다.
+
     Args:
         x0: ``[N, 4, 6, 4]`` source noise.
         x1: ``[N, 4, 6, 4]`` clean target.
@@ -189,7 +194,6 @@ def build_flow_path(x0: Tensor, x1: Tensor, tau: Tensor) -> Tuple[Tensor, Tensor
             - u_t: ``[N, 4, 6, 4]`` target velocity field
     """
     x_tau = (1.0 - tau) * x0 + tau * x1
-    x_tau = renorm_sin_cos(x_tau)
     u_t = x1 - x0
     return x_tau, u_t
 
@@ -201,6 +205,10 @@ def midpoint_ode_integrate(
 ) -> Tensor:
     """4-step midpoint ODE 적분을 수행한다.
 
+    이 적분도 학습 때와 같은 선형 상태공간에서 진행한다. 따라서 적분 중간
+    상태에는 sin/cos 재정규화를 넣지 않고, world 좌표 변환이나 최종 결과
+    조립 단계에서만 재정규화를 적용한다.
+
     Args:
         x0: ``[N, 4, 6, 4]`` 초기 noise.
         ode_steps: 적분 step 수. 이번 구현에서는 4를 기본값으로 둔다.
@@ -209,15 +217,15 @@ def midpoint_ode_integrate(
     Returns:
         ``[N, 4, 6, 4]`` 최종 적분 결과.
     """
-    x = renorm_sin_cos(x0)
+    x = x0.clone()
     dt = 1.0 / float(ode_steps)
     for step in range(ode_steps):
         t = x.new_full((x.shape[0], 1), float(step) * dt)
         k1 = velocity_fn(x, t)
-        x_mid = renorm_sin_cos(x + 0.5 * dt * k1)
+        x_mid = x + 0.5 * dt * k1
         t_mid = x.new_full((x.shape[0], 1), (float(step) + 0.5) * dt)
         k2 = velocity_fn(x_mid, t_mid)
-        x = renorm_sin_cos(x + dt * k2)
+        x = x + dt * k2
     return x
 
 

@@ -27,7 +27,6 @@ from src.smart.utils.flow_traj import (
     executed_chunk_to_rollout_update,
     midpoint_ode_integrate,
     nearest_agent_token_idx,
-    renorm_sin_cos,
     segment_end_pose_global,
 )
 
@@ -404,6 +403,17 @@ class SMARTAgentDecoder(nn.Module):
         ctx_valid = torch.cat([state["hist_valid"], state["current_valid"].unsqueeze(1)], dim=1)
         return {"feat": ctx_feat, "pos": ctx_pos, "head": ctx_head, "valid": ctx_valid}
 
+    def _expand_agent_mask_to_future_segments(self, agent_mask: Tensor) -> Tensor:
+        """agent 단위 mask를 future segment 단위 mask로 늘린다.
+
+        Args:
+            agent_mask: ``[N]``. agent 단위 bool mask.
+
+        Returns:
+            ``[N, 4]``. 각 agent mask를 모든 future segment에 복사한 mask.
+        """
+        return agent_mask.bool().unsqueeze(1).expand(-1, self.future_num_segments)
+
     def _build_future_query(
         self,
         x_t: Tensor,
@@ -667,6 +677,7 @@ class SMARTAgentDecoder(nn.Module):
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
         state: Dict[str, Tensor],
+        future_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """현재 context에서 conditional flow velocity field를 예측한다.
 
@@ -676,12 +687,16 @@ class SMARTAgentDecoder(nn.Module):
             tokenized_agent: tokenized agent dict.
             map_feature: encoded map dict.
             state: history/current state.
+            future_mask: ``[N, 4]``. supervised future query에 실제로 참여시킬
+                agent-segment mask. ``None`` 이면 ``current_valid`` 를 사용한다.
 
         Returns:
             ``[N, 4, 6, 4]`` predicted velocity field.
         """
         n_agent = x_t.shape[0]
-        future_mask = state["current_valid"].unsqueeze(1).expand(-1, self.future_num_segments)
+        if future_mask is None:
+            future_mask = self._expand_agent_mask_to_future_segments(state["current_valid"])
+        future_mask = future_mask.bool()
         ctx = self._build_history_memory(tokenized_agent, state)
         future_feat = self._build_future_query(x_t, tau, tokenized_agent)
 
@@ -771,6 +786,11 @@ class SMARTAgentDecoder(nn.Module):
             future_window_steps=self.future_window_steps,
         )
         gt_segments = chunk_future_21_to_4x6(gt_future_local)
+        future_valid = agent_raw["valid_mask"][
+            :,
+            anchor_step : anchor_step + self.future_window_steps + 1,
+        ].all(dim=1)
+        future_mask = self._expand_agent_mask_to_future_segments(future_valid)
         x0 = torch.randn_like(gt_segments)
         tau = torch.rand(gt_segments.shape[0], 1, 1, 1, device=gt_segments.device, dtype=gt_segments.dtype)
         x_t, flow_target = build_flow_path(x0, gt_segments, tau)
@@ -780,10 +800,10 @@ class SMARTAgentDecoder(nn.Module):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             state=state,
+            future_mask=future_mask,
         )
-        pred_segments = renorm_sin_cos(x_t + (1.0 - tau) * flow_pred)
+        pred_segments = x_t + (1.0 - tau) * flow_pred
         pred_future_local = assemble_4x6_to_21(pred_segments)
-        future_valid = agent_raw["valid_mask"][:, anchor_step : anchor_step + self.future_window_steps + 1].all(dim=1)
         return {
             "flow_pred": flow_pred,
             "flow_target": flow_target,
@@ -823,6 +843,11 @@ class SMARTAgentDecoder(nn.Module):
                 future_window_steps=self.future_window_steps,
             )
             gt_segments = chunk_future_21_to_4x6(gt_future_local)
+            future_valid = agent_raw["valid_mask"][
+                :,
+                anchor_step : anchor_step + self.future_window_steps + 1,
+            ].all(dim=1)
+            future_mask = self._expand_agent_mask_to_future_segments(future_valid)
             x0 = torch.randn_like(gt_segments)
             tau = torch.rand(gt_segments.shape[0], 1, 1, 1, device=gt_segments.device, dtype=gt_segments.dtype)
             x_t, flow_target = build_flow_path(x0, gt_segments, tau)
@@ -832,10 +857,10 @@ class SMARTAgentDecoder(nn.Module):
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
                 state=state,
+                future_mask=future_mask,
             )
-            pred_segments = renorm_sin_cos(x_t + (1.0 - tau) * flow_pred)
+            pred_segments = x_t + (1.0 - tau) * flow_pred
             pred_future_local = assemble_4x6_to_21(pred_segments)
-            future_valid = agent_raw["valid_mask"][:, anchor_step : anchor_step + self.future_window_steps + 1].all(dim=1)
             outputs.append(
                 {
                     "flow_pred": flow_pred,
