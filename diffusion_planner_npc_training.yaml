@@ -22,7 +22,7 @@ spec:
   volumes:
     - name: nuplan-storage
       persistentVolumeClaim:
-        claimName: pvc-rbd-diffusion-planner-djkim
+        claimName: temp-volume # pvc-rbd-diffusion-planner-djkim
     - name: dshm2
       emptyDir:
         medium: Memory
