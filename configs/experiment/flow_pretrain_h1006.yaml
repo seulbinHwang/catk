@@ -7,7 +7,7 @@ model:
     lr: 5e-4
     lr_warmup_steps: 0
     lr_min_ratio: 1e-2
-    anchor_chunk_k: 4
+    anchor_chunk_k: 3
     use_closed_loop_finetune: false
     finetune: false
     val_open_loop: true
@@ -39,9 +39,9 @@ trainer:
 # effective batch = 8(per-device) * 6(gpu) * 2(accum) = 96
 # flow head가 기존 NTP head보다 무거워서, 공식 SMART-tiny 설정(batch 10)보다 한 단계 보수적으로 둔다.
 data:
-  train_batch_size: 8
-  val_batch_size: 8
-  test_batch_size: 8
+  train_batch_size: 1
+  val_batch_size: 1
+  test_batch_size: 1
   num_workers: 12
 
 action: fit
