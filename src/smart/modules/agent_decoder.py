@@ -564,26 +564,60 @@ class SMARTAgentDecoder(nn.Module):
         mask: Tensor,
         batch_s: Tensor,
         batch_pl: Tensor,
-    ) -> tuple[Tensor, Tensor]:
-        """future segment와 road token 사이 sparse edge를 만든다."""
+        token_index_pl: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """future segment와 road token 사이 sparse edge를 만든다.
+
+        Args:
+            pos_pl: ``[M, 2]``. map geometry 중심점.
+            orient_pl: ``[M]``. map geometry heading.
+            pos_a: ``[N, 4, 2]``. map lookup용 reference future 위치.
+            head_a: ``[N, 4]``. reference future heading.
+            head_vector_a: ``[N, 4, 2]``. reference future heading vector.
+            mask: ``[N, 4]``. 유효한 future query mask.
+            batch_s: ``[4*N]``. future query를 편 batch id.
+            batch_pl: ``[4*M]``. future segment별로 늘린 map geometry batch id.
+            token_index_pl: ``[M]``. 각 map geometry row가 실제로 읽어야 하는
+                ``pt_token`` row index. ``None`` 이면 ``[0, 1, ..., M-1]`` 로 본다.
+
+        Returns:
+            tuple:
+                - ``edge_index_pl2a``: ``[2, E]``. src는 반복된 map geometry row index,
+                  dst는 future query index.
+                - ``r_pl2a``: ``[E, 128]``. map-to-agent relation embedding.
+                - ``src_token_index``: ``[E]``. 각 edge의 source가 최종 ``pt_token`` 의
+                  어느 row를 읽어야 하는지 나타내는 index.
+        """
+        num_map_geom = pos_pl.shape[0]
+        if token_index_pl is None:
+            token_index_pl = torch.arange(num_map_geom, device=pos_pl.device, dtype=torch.long)
+        else:
+            token_index_pl = token_index_pl.long()
+
+        if num_map_geom == 0:
+            empty_edge_index = torch.empty((2, 0), device=pos_a.device, dtype=torch.long)
+            empty_rel = pos_a.new_zeros((0, self.hidden_dim))
+            empty_src_token_index = torch.empty((0,), device=pos_a.device, dtype=torch.long)
+            return empty_edge_index, empty_rel, empty_src_token_index
+
         n_step = pos_a.shape[1]
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        pos_pl = pos_pl.repeat(n_step, 1)
-        orient_pl = orient_pl.repeat(n_step)
+        pos_pl_rep = pos_pl.repeat(n_step, 1)
+        orient_pl_rep = orient_pl.repeat(n_step)
         edge_index_pl2a = radius(
             x=pos_s[:, :2],
-            y=pos_pl[:, :2],
+            y=pos_pl_rep[:, :2],
             r=self.pl2a_radius,
             batch_x=batch_s,
             batch_y=batch_pl,
             max_num_neighbors=300,
         )
         edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
-        rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
-        rel_orient_pl2a = wrap_angle(orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]])
+        rel_pos_pl2a = pos_pl_rep[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
+        rel_orient_pl2a = wrap_angle(orient_pl_rep[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]])
         r_pl2a = torch.stack(
             [
                 torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
@@ -596,7 +630,96 @@ class SMARTAgentDecoder(nn.Module):
             dim=-1,
         )
         r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
-        return edge_index_pl2a, r_pl2a
+        src_token_index = token_index_pl[edge_index_pl2a[0] % num_map_geom]
+        return edge_index_pl2a, r_pl2a, src_token_index
+
+    def _get_map_token_index(self, map_feature: Dict[str, Tensor]) -> Tensor:
+        """map geometry row마다 어떤 encoded token을 읽을지 알려주는 index를 만든다.
+
+        Args:
+            map_feature: map dict.
+                - ``pt_token``: ``[M_token, D]``.
+                - ``position``: ``[M_geom, 2]``.
+                - ``orientation``: ``[M_geom]``.
+                - ``batch``: ``[M_geom]``.
+                - optional ``token_index``: ``[M_geom]``.
+
+        Returns:
+            ``[M_geom]`` long tensor. 각 geometry row가 실제로 읽어야 하는
+            ``pt_token`` row index.
+        """
+        token_index = map_feature.get("token_index")
+        if token_index is not None:
+            return token_index.long()
+
+        num_token = map_feature["pt_token"].shape[0]
+        num_geom = map_feature["position"].shape[0]
+        if num_geom != num_token:
+            raise ValueError(
+                "map_feature geometry length differs from pt_token length, but token_index is missing."
+            )
+        return torch.arange(num_token, device=map_feature["pt_token"].device, dtype=torch.long)
+
+    def _build_compact_map_attention_inputs(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        state: Dict[str, Tensor],
+        future_mask: Tensor,
+        batch_s: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """실제로 edge가 생긴 map token만 남겨 map cross-attention 입력을 만든다.
+
+        Args:
+            tokenized_agent: agent dict.
+                - ``num_graphs``: 현재 decoder batch의 scene 개수.
+            map_feature: map dict.
+                - ``pt_token``: ``[M_token, D]``.
+                - ``position``: ``[M_geom, 2]``.
+                - ``orientation``: ``[M_geom]``.
+                - ``batch``: ``[M_geom]``.
+                - optional ``token_index``: ``[M_geom]``.
+            state: 현재 상태 dict.
+                - ``current_pos``: ``[N, 2]``.
+                - ``current_head``: ``[N]``.
+                - ``current_vel``: ``[N, 2]``.
+                - ``current_yaw_rate``: ``[N]``.
+            future_mask: ``[N, 4]``. map cross-attention에 참여시킬 future query mask.
+            batch_s: ``[4*N]``. future segment를 batch 축으로 편 batch id.
+
+        Returns:
+            tuple:
+                - ``feat_map``: ``[M_keep, D]``. 실제 edge가 생긴 map token feature.
+                - ``edge_index_pl2a``: ``[2, E]``. src는 ``feat_map`` 기준으로 다시 번호를
+                  매긴 edge index.
+                - ``r_pl2a``: ``[E, 128]``. map-to-agent relation embedding.
+        """
+        num_graphs = int(tokenized_agent["num_graphs"])
+        batch_pl = torch.cat(
+            [map_feature["batch"] + num_graphs * t for t in range(self.future_num_segments)],
+            dim=0,
+        )
+        map_ref_pos, map_ref_head = self._build_reference_future_pose(state)
+        map_ref_head_vec = torch.stack([map_ref_head.cos(), map_ref_head.sin()], dim=-1)
+        edge_index_pl2a_raw, r_pl2a, src_token_index = self.build_map2agent_edge(
+            pos_pl=map_feature["position"],
+            orient_pl=map_feature["orientation"],
+            pos_a=map_ref_pos,
+            head_a=map_ref_head,
+            head_vector_a=map_ref_head_vec,
+            mask=future_mask,
+            batch_s=batch_s,
+            batch_pl=batch_pl,
+            token_index_pl=self._get_map_token_index(map_feature),
+        )
+        unique_src_token_index, compact_src_index = torch.unique(
+            src_token_index,
+            sorted=True,
+            return_inverse=True,
+        )
+        edge_index_pl2a = torch.stack([compact_src_index, edge_index_pl2a_raw[1]], dim=0)
+        feat_map = map_feature["pt_token"].index_select(0, unique_src_token_index)
+        return feat_map, edge_index_pl2a, r_pl2a
 
     def build_hist2f_edge(
         self,
@@ -686,6 +809,8 @@ class SMARTAgentDecoder(nn.Module):
             tau: ``[N, 1]`` flow time.
             tokenized_agent: tokenized agent dict.
             map_feature: encoded map dict.
+                open-loop anchor batch에서는 geometry row 수와 ``pt_token`` row 수가 다를 수 있고,
+                이때는 ``token_index`` 로 geometry row가 어떤 token feature를 읽는지 연결한다.
             state: history/current state.
             future_mask: ``[N, 4]``. supervised future query에 실제로 참여시킬
                 agent-segment mask. ``None`` 이면 ``current_valid`` 를 사용한다.
@@ -720,12 +845,9 @@ class SMARTAgentDecoder(nn.Module):
             batch_agent=tokenized_agent["batch"],
         )
 
+        num_graphs = int(tokenized_agent["num_graphs"])
         batch_s = torch.cat(
-            [tokenized_agent["batch"] + tokenized_agent["num_graphs"] * t for t in range(self.future_num_segments)],
-            dim=0,
-        )
-        batch_pl = torch.cat(
-            [map_feature["batch"] + tokenized_agent["num_graphs"] * t for t in range(self.future_num_segments)],
+            [tokenized_agent["batch"] + num_graphs * t for t in range(self.future_num_segments)],
             dim=0,
         )
         edge_index_a2a, r_a2a = self.build_interaction_edge(
@@ -735,29 +857,36 @@ class SMARTAgentDecoder(nn.Module):
             batch_s=batch_s,
             mask=future_mask,
         )
-        map_ref_pos, map_ref_head = self._build_reference_future_pose(state)
-        map_ref_head_vec = torch.stack([map_ref_head.cos(), map_ref_head.sin()], dim=-1)
-        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
-            pos_pl=map_feature["position"],
-            orient_pl=map_feature["orientation"],
-            pos_a=map_ref_pos,
-            head_a=map_ref_head,
-            head_vector_a=map_ref_head_vec,
-            mask=future_mask,
+        feat_map, edge_index_pl2a, r_pl2a = self._build_compact_map_attention_inputs(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            state=state,
+            future_mask=future_mask,
             batch_s=batch_s,
-            batch_pl=batch_pl,
         )
-        feat_map = map_feature["pt_token"].unsqueeze(0).expand(self.future_num_segments, -1, -1).flatten(0, 1)
 
         for i in range(self.num_layers):
-            future_feat = self.t_attn_layers[i](future_feat.flatten(0, 1), r_t, edge_index_t).view(n_agent, self.future_num_segments, -1)
-            future_feat = self.hist2f_attn_layers[i]((ctx_flat, future_feat.flatten(0, 1)), r_hist, edge_index_hist).view(n_agent, self.future_num_segments, -1)
+            future_feat = self.t_attn_layers[i](future_feat.flatten(0, 1), r_t, edge_index_t).view(
+                n_agent,
+                self.future_num_segments,
+                -1,
+            )
+            future_feat = self.hist2f_attn_layers[i]((ctx_flat, future_feat.flatten(0, 1)), r_hist, edge_index_hist).view(
+                n_agent,
+                self.future_num_segments,
+                -1,
+            )
             future_tm = future_feat.transpose(0, 1).flatten(0, 1)
             future_tm = self.pt2a_attn_layers[i]((feat_map, future_tm), r_pl2a, edge_index_pl2a)
             future_tm = self.a2a_attn_layers[i](future_tm, r_a2a, edge_index_a2a)
             future_feat = future_tm.view(self.future_num_segments, n_agent, -1).transpose(0, 1)
 
-        flow_pred = self.segment_out_head(future_feat).view(n_agent, self.future_num_segments, self.future_segment_points, 4)
+        flow_pred = self.segment_out_head(future_feat).view(
+            n_agent,
+            self.future_num_segments,
+            self.future_segment_points,
+            4,
+        )
         return flow_pred
 
     def _stack_anchor_state_list(self, state_list: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
@@ -859,7 +988,7 @@ class SMARTAgentDecoder(nn.Module):
         n_anchor: int,
         num_graphs: int,
     ) -> Dict[str, Tensor]:
-        """map feature를 anchor batch 크기만큼 복제한다.
+        """map geometry만 anchor batch 크기만큼 늘리고 token feature는 공유한다.
 
         Args:
             map_feature: 인코딩된 map dict.
@@ -868,24 +997,32 @@ class SMARTAgentDecoder(nn.Module):
                 - ``position``: ``[M, 2]``
                 - ``orientation``: ``[M]``
                 - ``batch``: ``[M]``
+                - optional ``token_index``: ``[M]``
             n_anchor: anchor 개수 ``K``.
             num_graphs: 원래 scene 개수 ``B``.
 
         Returns:
             anchor 축이 batch 축으로 접힌 map dict.
-            - ``pt_token``: ``[K*M, D]``
+            - ``pt_token``: ``[M, D]``. encoded token feature는 복제하지 않는다.
             - ``position``: ``[K*M, 2]``
             - ``orientation``: ``[K*M]``
             - ``batch``: ``[K*M]``
+            - ``token_index``: ``[K*M]``. 각 geometry row가 ``pt_token`` 의 어느 row를 읽는지 나타낸다.
         """
         batch = map_feature["batch"]
         batch_offsets = torch.arange(n_anchor, device=batch.device, dtype=batch.dtype).unsqueeze(1) * num_graphs
         expanded_batch = (batch.unsqueeze(0) + batch_offsets).reshape(-1)
+        base_token_index = map_feature.get("token_index")
+        if base_token_index is None:
+            base_token_index = torch.arange(map_feature["pt_token"].shape[0], device=batch.device, dtype=torch.long)
+        else:
+            base_token_index = base_token_index.long()
         return {
-            "pt_token": map_feature["pt_token"].repeat(n_anchor, 1),
+            "pt_token": map_feature["pt_token"],
             "position": map_feature["position"].repeat(n_anchor, 1),
             "orientation": map_feature["orientation"].repeat(n_anchor),
             "batch": expanded_batch,
+            "token_index": base_token_index.repeat(n_anchor),
         }
 
     def forward_anchor_batch(
