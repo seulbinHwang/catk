@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch.nn as nn
 from omegaconf import DictConfig
@@ -98,6 +98,31 @@ class SMARTDecoder(nn.Module):
     ) -> Dict[str, Tensor]:
         """이미 계산된 map feature를 재사용한다."""
         return self.agent_encoder(tokenized_agent, map_feature, agent_raw, anchor_step)
+
+    def forward_anchor_batch_from_map(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        agent_raw: Dict[str, Tensor],
+        anchor_steps: Sequence[int] | Tensor,
+    ) -> Dict[str, Tensor]:
+        """이미 계산된 map feature로 여러 anchor를 한 번에 처리한다.
+
+        Args:
+            map_feature: 인코딩된 map dict.
+            tokenized_agent: tokenized agent dict.
+            agent_raw: raw ``data['agent']`` dict.
+            anchor_steps: 길이 ``K`` 인 raw 10Hz anchor step 목록.
+
+        Returns:
+            각 텐서가 ``[K, N, ...]`` shape인 batched prediction dict.
+        """
+        return self.agent_encoder.forward_anchor_batch(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            agent_raw=agent_raw,
+            anchor_steps=anchor_steps,
+        )
 
     def closed_loop_train(
         self,

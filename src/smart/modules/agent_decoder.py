@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -759,6 +759,252 @@ class SMARTAgentDecoder(nn.Module):
 
         flow_pred = self.segment_out_head(future_feat).view(n_agent, self.future_num_segments, self.future_segment_points, 4)
         return flow_pred
+
+    def _stack_anchor_state_list(self, state_list: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+        """anchor별 state dict를 한 번에 쌓는다.
+
+        Args:
+            state_list: 길이 ``K`` 인 state dict 목록.
+                각 dict의 값 shape은 아래와 같다.
+                - ``hist_idx``: ``[N, H]``
+                - ``hist_pos``: ``[N, H, 2]``
+                - ``hist_head``: ``[N, H]``
+                - ``hist_valid``: ``[N, H]``
+                - ``current_pos``: ``[N, 2]``
+                - ``current_head``: ``[N]``
+                - ``current_vel``: ``[N, 2]``
+                - ``current_yaw_rate``: ``[N]``
+                - ``current_valid``: ``[N]``
+
+        Returns:
+            anchor 축이 앞에 추가된 state dict.
+            각 값 shape은 ``[K, N, ...]`` 이다.
+        """
+        if len(state_list) == 0:
+            raise ValueError("state_list must not be empty.")
+        return {key: torch.stack([state[key] for state in state_list], dim=0) for key in state_list[0].keys()}
+
+    @staticmethod
+    def _flatten_anchor_tensor(tensor: Tensor) -> Tensor:
+        """anchor 축과 agent 축을 하나로 합친다.
+
+        Args:
+            tensor: ``[K, N, ...]`` 텐서.
+
+        Returns:
+            ``[K*N, ...]`` 텐서.
+        """
+        if tensor.dim() < 2:
+            raise ValueError(f"Expected tensor with at least 2 dims, got shape {tuple(tensor.shape)}.")
+        return tensor.reshape(-1, *tensor.shape[2:])
+
+    def _flatten_anchor_state(self, state: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """anchor batch state dict를 decoder 입력 shape로 평탄화한다.
+
+        Args:
+            state: 값 shape이 ``[K, N, ...]`` 인 state dict.
+
+        Returns:
+            값 shape이 ``[K*N, ...]`` 인 state dict.
+        """
+        return {key: self._flatten_anchor_tensor(value) for key, value in state.items()}
+
+    def _expand_open_loop_agent_context(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        n_anchor: int,
+    ) -> Dict[str, Tensor]:
+        """open-loop anchor batch용 agent 정적 정보를 늘린다.
+
+        Args:
+            tokenized_agent: 원본 tokenized agent dict.
+                이 함수에서 사용하는 key shape은 아래와 같다.
+                - ``type``: ``[N]``
+                - ``shape``: ``[N, 3]``
+                - ``ego_mask``: ``[N]``
+                - ``batch``: ``[N]``
+                - ``trajectory_token_veh``: ``[V_veh, 8]``
+                - ``trajectory_token_ped``: ``[V_ped, 8]``
+                - ``trajectory_token_cyc``: ``[V_cyc, 8]``
+            n_anchor: anchor 개수 ``K``.
+
+        Returns:
+            anchor 축이 batch 축으로 접힌 agent dict.
+            - ``type``: ``[K*N]``
+            - ``shape``: ``[K*N, 3]``
+            - ``ego_mask``: ``[K*N]``
+            - ``batch``: ``[K*N]``
+            - ``num_graphs``: ``B*K``
+        """
+        base_num_graphs = int(tokenized_agent["num_graphs"])
+        batch = tokenized_agent["batch"]
+        batch_offsets = (
+            torch.arange(n_anchor, device=batch.device, dtype=batch.dtype).unsqueeze(1) * base_num_graphs
+        )
+        expanded_batch = (batch.unsqueeze(0) + batch_offsets).reshape(-1)
+        return {
+            "num_graphs": base_num_graphs * n_anchor,
+            "type": tokenized_agent["type"].repeat(n_anchor),
+            "shape": tokenized_agent["shape"].repeat(n_anchor, 1),
+            "ego_mask": tokenized_agent["ego_mask"].repeat(n_anchor),
+            "batch": expanded_batch,
+            "trajectory_token_veh": tokenized_agent["trajectory_token_veh"],
+            "trajectory_token_ped": tokenized_agent["trajectory_token_ped"],
+            "trajectory_token_cyc": tokenized_agent["trajectory_token_cyc"],
+        }
+
+    def _expand_map_feature_for_anchor_batch(
+        self,
+        map_feature: Dict[str, Tensor],
+        n_anchor: int,
+        num_graphs: int,
+    ) -> Dict[str, Tensor]:
+        """map feature를 anchor batch 크기만큼 복제한다.
+
+        Args:
+            map_feature: 인코딩된 map dict.
+                이 함수에서 사용하는 key shape은 아래와 같다.
+                - ``pt_token``: ``[M, D]``
+                - ``position``: ``[M, 2]``
+                - ``orientation``: ``[M]``
+                - ``batch``: ``[M]``
+            n_anchor: anchor 개수 ``K``.
+            num_graphs: 원래 scene 개수 ``B``.
+
+        Returns:
+            anchor 축이 batch 축으로 접힌 map dict.
+            - ``pt_token``: ``[K*M, D]``
+            - ``position``: ``[K*M, 2]``
+            - ``orientation``: ``[K*M]``
+            - ``batch``: ``[K*M]``
+        """
+        batch = map_feature["batch"]
+        batch_offsets = torch.arange(n_anchor, device=batch.device, dtype=batch.dtype).unsqueeze(1) * num_graphs
+        expanded_batch = (batch.unsqueeze(0) + batch_offsets).reshape(-1)
+        return {
+            "pt_token": map_feature["pt_token"].repeat(n_anchor, 1),
+            "position": map_feature["position"].repeat(n_anchor, 1),
+            "orientation": map_feature["orientation"].repeat(n_anchor),
+            "batch": expanded_batch,
+        }
+
+    def forward_anchor_batch(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        agent_raw: Dict[str, Tensor],
+        anchor_steps: Sequence[int] | Tensor,
+    ) -> Dict[str, Tensor]:
+        """여러 anchor를 한 번의 decoder forward로 처리한다.
+
+        무거운 graph 생성과 attention 계산은 한 번만 수행하고,
+        loss 집계는 바깥에서 anchor별로 그대로 평균낼 수 있도록
+        출력만 ``[K, N, ...]`` shape로 돌려준다.
+
+        Args:
+            tokenized_agent: 원본 tokenized agent dict.
+            map_feature: 인코딩된 map dict.
+            agent_raw: raw ``data['agent']`` dict.
+            anchor_steps: 길이 ``K`` 인 raw 10Hz anchor step 목록.
+
+        Returns:
+            open-loop flow loss 계산에 필요한 batched dict.
+            각 값 shape은 아래와 같다.
+            - ``flow_pred``: ``[K, N, 4, 6, 4]``
+            - ``flow_target``: ``[K, N, 4, 6, 4]``
+            - ``pred_segments``: ``[K, N, 4, 6, 4]``
+            - ``gt_segments``: ``[K, N, 4, 6, 4]``
+            - ``pred_future_local``: ``[K, N, 21, 4]``
+            - ``gt_future_local``: ``[K, N, 21, 4]``
+            - ``future_valid``: ``[K, N]``
+        """
+        anchor_steps_tensor = torch.as_tensor(
+            anchor_steps,
+            device=agent_raw["position"].device,
+            dtype=torch.long,
+        ).flatten()
+        anchor_steps_list = [int(step) for step in anchor_steps_tensor.tolist()]
+        if len(anchor_steps_list) == 0:
+            raise ValueError("anchor_steps must not be empty.")
+
+        state_list = [
+            self._build_gt_state(tokenized_agent=tokenized_agent, agent_raw=agent_raw, anchor_step=anchor_step)
+            for anchor_step in anchor_steps_list
+        ]
+        state_batch = self._stack_anchor_state_list(state_list)
+
+        gt_future_local_list: List[Tensor] = []
+        gt_segments_list: List[Tensor] = []
+        future_valid_list: List[Tensor] = []
+        for anchor_step in anchor_steps_list:
+            gt_future_local, _, _, _ = build_local_future_target(
+                pos_global=agent_raw["position"][..., :2],
+                head_global=agent_raw["heading"],
+                anchor_step=anchor_step,
+                future_window_steps=self.future_window_steps,
+            )
+            gt_future_local_list.append(gt_future_local)
+            gt_segments_list.append(chunk_future_21_to_4x6(gt_future_local))
+            future_valid_list.append(
+                agent_raw["valid_mask"][:, anchor_step : anchor_step + self.future_window_steps + 1].all(dim=1)
+            )
+
+        gt_future_local = torch.stack(gt_future_local_list, dim=0)
+        gt_segments = torch.stack(gt_segments_list, dim=0)
+        future_valid = torch.stack(future_valid_list, dim=0)
+
+        x0 = torch.randn_like(gt_segments)
+        tau = torch.rand(
+            gt_segments.shape[0],
+            gt_segments.shape[1],
+            1,
+            1,
+            1,
+            device=gt_segments.device,
+            dtype=gt_segments.dtype,
+        )
+        x_t, flow_target = build_flow_path(x0=x0, x1=gt_segments, tau=tau)
+
+        state_flat = self._flatten_anchor_state(state_batch)
+        x_t_flat = self._flatten_anchor_tensor(x_t)
+        tau_flat = self._flatten_anchor_tensor(tau)
+        future_valid_flat = self._flatten_anchor_tensor(future_valid)
+        future_mask_flat = self._expand_agent_mask_to_future_segments(future_valid_flat)
+
+        batched_tokenized_agent = self._expand_open_loop_agent_context(
+            tokenized_agent=tokenized_agent,
+            n_anchor=len(anchor_steps_list),
+        )
+        batched_map_feature = self._expand_map_feature_for_anchor_batch(
+            map_feature=map_feature,
+            n_anchor=len(anchor_steps_list),
+            num_graphs=int(tokenized_agent["num_graphs"]),
+        )
+        flow_pred_flat = self._predict_velocity_field(
+            x_t=x_t_flat,
+            tau=tau_flat.reshape(-1, 1),
+            tokenized_agent=batched_tokenized_agent,
+            map_feature=batched_map_feature,
+            state=state_flat,
+            future_mask=future_mask_flat,
+        )
+        pred_segments_flat = x_t_flat + (1.0 - tau_flat) * flow_pred_flat
+        pred_future_local_flat = assemble_4x6_to_21(pred_segments_flat)
+
+        n_anchor, n_agent = gt_segments.shape[:2]
+        return {
+            "flow_pred": flow_pred_flat.reshape(n_anchor, n_agent, *flow_pred_flat.shape[1:]),
+            "flow_target": flow_target,
+            "pred_segments": pred_segments_flat.reshape(n_anchor, n_agent, *pred_segments_flat.shape[1:]),
+            "gt_segments": gt_segments,
+            "pred_future_local": pred_future_local_flat.reshape(
+                n_anchor,
+                n_agent,
+                *pred_future_local_flat.shape[1:],
+            ),
+            "gt_future_local": gt_future_local,
+            "future_valid": future_valid,
+        }
 
     def forward(
         self,

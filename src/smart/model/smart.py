@@ -105,6 +105,27 @@ class SMART(LightningModule):
             loss_mask=loss_mask,
         )
 
+    @staticmethod
+    def _select_anchor_pred(pred_batch: Dict[str, Tensor], anchor_idx: int) -> Dict[str, Tensor]:
+        """anchor batch 출력에서 한 anchor만 꺼낸다.
+
+        Args:
+            pred_batch: 각 텐서가 ``[K, N, ...]`` shape인 prediction dict.
+            anchor_idx: 꺼낼 anchor index.
+
+        Returns:
+            각 텐서가 ``[N, ...]`` shape인 single-anchor prediction dict.
+        """
+        return {
+            "flow_pred": pred_batch["flow_pred"][anchor_idx],
+            "flow_target": pred_batch["flow_target"][anchor_idx],
+            "pred_segments": pred_batch["pred_segments"][anchor_idx],
+            "gt_segments": pred_batch["gt_segments"][anchor_idx],
+            "pred_future_local": pred_batch["pred_future_local"][anchor_idx],
+            "gt_future_local": pred_batch["gt_future_local"][anchor_idx],
+            "future_valid": pred_batch["future_valid"][anchor_idx],
+        }
+
     def training_step(self, data: dict, batch_idx: int) -> Tensor:
         """학습 step을 수행한다.
 
@@ -140,13 +161,15 @@ class SMART(LightningModule):
                 total_consistency = total_consistency + log_dict["consistency"]
                 n_terms += 1
         else:
-            for anchor_step in self._select_train_anchor_steps():
-                pred = self.encoder.forward_from_map(
-                    map_feature=map_feature,
-                    tokenized_agent=tokenized_agent,
-                    agent_raw=data["agent"],
-                    anchor_step=anchor_step,
-                )
+            anchor_steps = self._select_train_anchor_steps()
+            pred_batch = self.encoder.forward_anchor_batch_from_map(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                agent_raw=data["agent"],
+                anchor_steps=anchor_steps,
+            )
+            for anchor_idx in range(len(anchor_steps)):
+                pred = self._select_anchor_pred(pred_batch, anchor_idx)
                 loss_mask = self._loss_mask_train(pred, data)
                 loss, log_dict = self._compute_single_loss(pred, loss_mask)
 
@@ -172,13 +195,15 @@ class SMART(LightningModule):
             total_loss = 0.0
             total_ade = 0.0
             n_terms = 0
-            for anchor_step in self.anchor_steps:
-                pred = self.encoder.forward_from_map(
-                    map_feature=map_feature,
-                    tokenized_agent=tokenized_agent,
-                    agent_raw=data["agent"],
-                    anchor_step=anchor_step,
-                )
+            anchor_steps = self.anchor_steps
+            pred_batch = self.encoder.forward_anchor_batch_from_map(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                agent_raw=data["agent"],
+                anchor_steps=anchor_steps,
+            )
+            for anchor_idx, anchor_step in enumerate(anchor_steps):
+                pred = self._select_anchor_pred(pred_batch, anchor_idx)
                 loss_mask = self._loss_mask_eval(pred, data, anchor_step)
                 loss, _ = self._compute_single_loss(pred, loss_mask)
                 ade = self._local_ade(pred["pred_future_local"], pred["gt_future_local"], loss_mask)
