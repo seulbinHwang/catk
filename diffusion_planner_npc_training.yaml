@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: hsb-npc-training
+  name: hsb-npc-training2
   namespace: p-pnc
   annotations:
     sidecar.istio.io/inject: "false"
@@ -22,14 +22,11 @@ spec:
   volumes:
     - name: nuplan-storage
       persistentVolumeClaim:
-        claimName: temp-volume # pvc-rbd-diffusion-planner-djkim
+        claimName: temp-volume
     - name: dshm2
       emptyDir:
         medium: Memory
         sizeLimit: 256Gi
-    - name: local-disk
-      emptyDir:
-        sizeLimit: 1800Gi
 
   initContainers:
     - name: install-nubescli
@@ -146,5 +143,3 @@ spec:
           mountPath: /mnt/nuplan
         - name: dshm2
           mountPath: /dev/shm
-        - name: local-cache
-          mountPath: /mnt/local_cache
