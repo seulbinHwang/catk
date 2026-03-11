@@ -20,6 +20,7 @@ from src.smart.metrics import FlowMatchingLoss, WOSACMetrics, WOSACSubmission, m
 from src.smart.modules.smart_decoder import SMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
+from src.smart.utils.geometry import wrap_angle
 from src.utils.vis_waymo import VisWaymo
 from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -84,6 +85,16 @@ class SMART(LightningModule):
         weight = mask[:, None].to(dist.dtype)
         denom = torch.clamp(weight.sum() * dist.shape[1], min=1.0)
         return (dist * weight).sum() / denom
+
+    @staticmethod
+    def _local_yaw_error_deg(pred_future_local: Tensor, gt_future_local: Tensor, mask: Tensor) -> Tensor:
+        """2초 local yaw 오차를 degree 단위로 계산한다."""
+        pred_yaw = torch.atan2(pred_future_local[..., 2], pred_future_local[..., 3])
+        gt_yaw = torch.atan2(gt_future_local[..., 2], gt_future_local[..., 3])
+        yaw_err_deg = torch.abs(wrap_angle(pred_yaw - gt_yaw)) * (180.0 / math.pi)
+        weight = mask[:, None].to(yaw_err_deg.dtype)
+        denom = torch.clamp(weight.sum() * yaw_err_deg.shape[1], min=1.0)
+        return (yaw_err_deg * weight).sum() / denom
 
     def _loss_mask_train(self, pred: Dict[str, Tensor], data) -> Tensor:
         """학습용 agent mask를 만든다."""
@@ -194,6 +205,7 @@ class SMART(LightningModule):
         if self.val_open_loop:
             total_loss = 0.0
             total_ade = 0.0
+            total_yaw = 0.0
             n_terms = 0
             anchor_steps = self.anchor_steps
             pred_batch = self.encoder.forward_anchor_batch_from_map(
@@ -207,11 +219,14 @@ class SMART(LightningModule):
                 loss_mask = self._loss_mask_eval(pred, data, anchor_step)
                 loss, _ = self._compute_single_loss(pred, loss_mask)
                 ade = self._local_ade(pred["pred_future_local"], pred["gt_future_local"], loss_mask)
+                yaw = self._local_yaw_error_deg(pred["pred_future_local"], pred["gt_future_local"], loss_mask)
                 total_loss = total_loss + loss
                 total_ade = total_ade + ade
+                total_yaw = total_yaw + yaw
                 n_terms += 1
             self.log("val_open/loss", total_loss / max(n_terms, 1), on_epoch=True, sync_dist=True, batch_size=1)
             self.log("val_open/ade2s", total_ade / max(n_terms, 1), on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("val_open/yaw_2s", total_yaw / max(n_terms, 1), on_epoch=True, sync_dist=True, batch_size=1)
 
         if self.val_closed_loop:
             pred_traj, pred_z, pred_head = [], [], []
