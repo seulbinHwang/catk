@@ -121,10 +121,10 @@ class FlowMatchingLoss(nn.Module):
         flow_pred: Tensor,
         flow_target: Tensor,
         pred_segments: Tensor,
-        gt_segments: Tensor,
-        pred_future_local: Tensor,
-        gt_future_local: Tensor,
         loss_mask: Tensor,
+        gt_segments: Optional[Tensor] = None,
+        pred_future_local: Optional[Tensor] = None,
+        gt_future_local: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """손실을 계산한다.
 
@@ -132,13 +132,13 @@ class FlowMatchingLoss(nn.Module):
             flow_pred: ``[N, 4, 6, 4]`` 예측 velocity field.
             flow_target: ``[N, 4, 6, 4]`` 목표 velocity field.
             pred_segments: ``[N, 4, 6, 4]`` clean future segment 예측값.
-            gt_segments: ``[N, 4, 6, 4]`` GT clean segment.
-                현재는 API 호환을 위해 받기만 하고 쓰지 않는다.
-            pred_future_local: ``[N, 21, 4]`` 조립된 clean future 예측값.
-                현재는 API 호환을 위해 받기만 하고 쓰지 않는다.
-            gt_future_local: ``[N, 21, 4]`` GT local future.
-                현재는 API 호환을 위해 받기만 하고 쓰지 않는다.
             loss_mask: ``[N]``. 학습 대상 agent 마스크.
+            gt_segments: ``[N, 4, 6, 4]`` GT clean segment.
+                train slim path에서는 ``None`` 일 수 있고, 현재는 받기만 하고 쓰지 않는다.
+            pred_future_local: ``[N, 21, 4]`` 조립된 clean future 예측값.
+                train slim path에서는 ``None`` 일 수 있고, 현재는 받기만 하고 쓰지 않는다.
+            gt_future_local: ``[N, 21, 4]`` GT local future.
+                train slim path에서는 ``None`` 일 수 있고, 현재는 받기만 하고 쓰지 않는다.
 
         Returns:
             다음 두 값을 담은 tuple.

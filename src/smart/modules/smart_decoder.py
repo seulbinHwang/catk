@@ -105,6 +105,7 @@ class SMARTDecoder(nn.Module):
         tokenized_agent: Dict[str, Tensor],
         agent_raw: Dict[str, Tensor],
         anchor_steps: Sequence[int] | Tensor,
+        return_full_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         """이미 계산된 map feature로 여러 anchor를 한 번에 처리한다.
 
@@ -113,6 +114,8 @@ class SMARTDecoder(nn.Module):
             tokenized_agent: tokenized agent dict.
             agent_raw: raw ``data['agent']`` dict.
             anchor_steps: 길이 ``K`` 인 raw 10Hz anchor step 목록.
+            return_full_outputs: ``True`` 이면 validation/분석용 auxiliary 출력까지
+                모두 반환하고, ``False`` 이면 train loss에 필요한 텐서만 반환한다.
 
         Returns:
             각 텐서가 ``[K, N, ...]`` shape인 batched prediction dict.
@@ -122,6 +125,7 @@ class SMARTDecoder(nn.Module):
             map_feature=map_feature,
             agent_raw=agent_raw,
             anchor_steps=anchor_steps,
+            return_full_outputs=return_full_outputs,
         )
 
     def closed_loop_train(

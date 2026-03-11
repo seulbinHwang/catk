@@ -1031,6 +1031,7 @@ class SMARTAgentDecoder(nn.Module):
         map_feature: Dict[str, Tensor],
         agent_raw: Dict[str, Tensor],
         anchor_steps: Sequence[int] | Tensor,
+        return_full_outputs: bool = True,
     ) -> Dict[str, Tensor]:
         """여러 anchor를 한 번의 decoder forward로 처리한다.
 
@@ -1043,17 +1044,20 @@ class SMARTAgentDecoder(nn.Module):
             map_feature: 인코딩된 map dict.
             agent_raw: raw ``data['agent']`` dict.
             anchor_steps: 길이 ``K`` 인 raw 10Hz anchor step 목록.
+            return_full_outputs: ``True`` 이면 validation/분석용 auxiliary 출력까지
+                모두 반환하고, ``False`` 이면 train loss에 필요한 텐서만 반환한다.
 
         Returns:
             open-loop flow loss 계산에 필요한 batched dict.
-            각 값 shape은 아래와 같다.
+            항상 아래 key는 포함된다.
             - ``flow_pred``: ``[K, N, 4, 6, 4]``
             - ``flow_target``: ``[K, N, 4, 6, 4]``
             - ``pred_segments``: ``[K, N, 4, 6, 4]``
+            - ``future_valid``: ``[K, N]``
+            그리고 ``return_full_outputs=True`` 일 때만 아래 key를 추가로 포함한다.
             - ``gt_segments``: ``[K, N, 4, 6, 4]``
             - ``pred_future_local``: ``[K, N, 21, 4]``
             - ``gt_future_local``: ``[K, N, 21, 4]``
-            - ``future_valid``: ``[K, N]``
         """
         anchor_steps_tensor = torch.as_tensor(
             anchor_steps,
@@ -1070,7 +1074,7 @@ class SMARTAgentDecoder(nn.Module):
         ]
         state_batch = self._stack_anchor_state_list(state_list)
 
-        gt_future_local_list: List[Tensor] = []
+        gt_future_local_list: Optional[List[Tensor]] = [] if return_full_outputs else None
         gt_segments_list: List[Tensor] = []
         future_valid_list: List[Tensor] = []
         for anchor_step in anchor_steps_list:
@@ -1080,15 +1084,20 @@ class SMARTAgentDecoder(nn.Module):
                 anchor_step=anchor_step,
                 future_window_steps=self.future_window_steps,
             )
-            gt_future_local_list.append(gt_future_local)
             gt_segments_list.append(chunk_future_21_to_4x6(gt_future_local))
+            if gt_future_local_list is not None:
+                gt_future_local_list.append(gt_future_local)
             future_valid_list.append(
                 agent_raw["valid_mask"][:, anchor_step : anchor_step + self.future_window_steps + 1].all(dim=1)
             )
 
-        gt_future_local = torch.stack(gt_future_local_list, dim=0)
         gt_segments = torch.stack(gt_segments_list, dim=0)
         future_valid = torch.stack(future_valid_list, dim=0)
+        gt_future_local = torch.stack(gt_future_local_list, dim=0) if gt_future_local_list is not None else None
+        del gt_segments_list
+        del future_valid_list
+        if gt_future_local_list is not None:
+            del gt_future_local_list
 
         x0 = torch.randn_like(gt_segments)
         tau = torch.rand(
@@ -1126,22 +1135,26 @@ class SMARTAgentDecoder(nn.Module):
             future_mask=future_mask_flat,
         )
         pred_segments_flat = x_t_flat + (1.0 - tau_flat) * flow_pred_flat
-        pred_future_local_flat = assemble_4x6_to_21(pred_segments_flat)
 
         n_anchor, n_agent = gt_segments.shape[:2]
-        return {
+        pred_batch = {
             "flow_pred": flow_pred_flat.reshape(n_anchor, n_agent, *flow_pred_flat.shape[1:]),
             "flow_target": flow_target,
             "pred_segments": pred_segments_flat.reshape(n_anchor, n_agent, *pred_segments_flat.shape[1:]),
-            "gt_segments": gt_segments,
-            "pred_future_local": pred_future_local_flat.reshape(
+            "future_valid": future_valid,
+        }
+        if return_full_outputs:
+            pred_future_local_flat = assemble_4x6_to_21(pred_segments_flat)
+            pred_batch["gt_segments"] = gt_segments
+            pred_batch["pred_future_local"] = pred_future_local_flat.reshape(
                 n_anchor,
                 n_agent,
                 *pred_future_local_flat.shape[1:],
-            ),
-            "gt_future_local": gt_future_local,
-            "future_valid": future_valid,
-        }
+            )
+            pred_batch["gt_future_local"] = gt_future_local
+        else:
+            del gt_segments
+        return pred_batch
 
     def forward(
         self,

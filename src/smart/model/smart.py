@@ -110,9 +110,9 @@ class SMART(LightningModule):
             flow_pred=pred["flow_pred"],
             flow_target=pred["flow_target"],
             pred_segments=pred["pred_segments"],
-            gt_segments=pred["gt_segments"],
-            pred_future_local=pred["pred_future_local"],
-            gt_future_local=pred["gt_future_local"],
+            gt_segments=pred.get("gt_segments"),
+            pred_future_local=pred.get("pred_future_local"),
+            gt_future_local=pred.get("gt_future_local"),
             loss_mask=loss_mask,
         )
 
@@ -127,15 +127,16 @@ class SMART(LightningModule):
         Returns:
             각 텐서가 ``[N, ...]`` shape인 single-anchor prediction dict.
         """
-        return {
+        pred = {
             "flow_pred": pred_batch["flow_pred"][anchor_idx],
             "flow_target": pred_batch["flow_target"][anchor_idx],
             "pred_segments": pred_batch["pred_segments"][anchor_idx],
-            "gt_segments": pred_batch["gt_segments"][anchor_idx],
-            "pred_future_local": pred_batch["pred_future_local"][anchor_idx],
-            "gt_future_local": pred_batch["gt_future_local"][anchor_idx],
             "future_valid": pred_batch["future_valid"][anchor_idx],
         }
+        for key in ("gt_segments", "pred_future_local", "gt_future_local"):
+            if key in pred_batch:
+                pred[key] = pred_batch[key][anchor_idx]
+        return pred
 
     def training_step(self, data: dict, batch_idx: int) -> Tensor:
         """학습 step을 수행한다.
@@ -178,6 +179,7 @@ class SMART(LightningModule):
                 tokenized_agent=tokenized_agent,
                 agent_raw=data["agent"],
                 anchor_steps=anchor_steps,
+                return_full_outputs=False,
             )
             for anchor_idx in range(len(anchor_steps)):
                 pred = self._select_anchor_pred(pred_batch, anchor_idx)
