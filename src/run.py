@@ -50,6 +50,52 @@ def get_wandb_logger(loggers: List[Logger]) -> WandbLogger | None:
     return None
 
 
+def get_total_gpu_count(trainer: Trainer) -> int:
+    world_size_env = os.environ.get("WORLD_SIZE")
+    if world_size_env and world_size_env.isdigit():
+        return max(int(world_size_env), 1)
+
+    world_size = getattr(trainer, "world_size", None)
+    if isinstance(world_size, int) and world_size > 0:
+        return world_size
+
+    num_devices = getattr(trainer, "num_devices", 0) or 0
+    num_nodes = getattr(trainer, "num_nodes", 1) or 1
+    if num_devices > 0:
+        return num_devices * num_nodes
+
+    return 1
+
+
+def log_wandb_training_setup(
+    cfg: DictConfig,
+    model: LightningModule,
+    datamodule: LightningDataModule,
+    trainer: Trainer,
+    loggers: List[Logger],
+) -> None:
+    if int(os.environ.get("RANK", "0")) != 0:
+        return
+
+    wandb_logger = get_wandb_logger(loggers)
+    if wandb_logger is None:
+        return
+
+    anchor_chunk_k = getattr(model, "anchor_chunk_k", None)
+    if anchor_chunk_k is None:
+        anchor_chunk_k = cfg.model.get("model_config", {}).get("anchor_chunk_k")
+
+    metrics = {
+        "train_setup/batch_size": datamodule.train_batch_size * get_total_gpu_count(trainer),
+        "train_setup/accumulate_grad_batches": cfg.trainer.accumulate_grad_batches,
+    }
+    if anchor_chunk_k is not None:
+        metrics["train_setup/anchor_chunk_k"] = anchor_chunk_k
+
+    wandb_logger.log_metrics(metrics, step=0)
+    log.info(f"Logged W&B train setup metrics: {metrics}")
+
+
 def log_wandb_checkpoint_refs(cfg: DictConfig, loggers: List[Logger]) -> None:
     if int(os.environ.get("RANK", "0")) != 0:
         return
@@ -214,9 +260,11 @@ def run(cfg: DictConfig) -> None:
         f"ckpt_artifact={cfg.get('ckpt_artifact')} resolved={resolved_ckpt_path}"
     )
     if cfg.action == "fit":
+        log_wandb_training_setup(cfg, model, datamodule, trainer, logger)
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=resolved_ckpt_path)
     elif cfg.action == "finetune":
+        log_wandb_training_setup(cfg, model, datamodule, trainer, logger)
         log.info("Starting finetuning!")
         if resolved_ckpt_path is None:
             raise ValueError("finetune action requires ckpt_path or ckpt_artifact")
