@@ -20,10 +20,10 @@ from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
 from src.smart.utils.flow_traj import (
-    assemble_4x6_to_21,
+    assemble_segments_to_future,
     build_flow_path,
     build_local_future_target,
-    chunk_future_21_to_4x6,
+    chunk_future_to_segments,
     executed_chunk_to_rollout_update,
     midpoint_ode_integrate,
     nearest_agent_token_idx,
@@ -35,9 +35,9 @@ class SMARTAgentDecoder(nn.Module):
     """SMART agent NTP head를 대체하는 sparse factorized flow decoder.
 
     구조 요약:
-        1. 기존 SMART token state space에서 과거 6개 slot을 읽는다.
+        1. 기존 SMART token state space에서 최근 history slot들을 읽는다.
         2. 현재 연속 상태 anchor token을 하나 더 붙인다.
-        3. 미래 2초를 4개의 0.5초 segment로 쪼갠다.
+        3. 미래 2초를 config로 정한 개수의 segment token으로 나눈다.
         4. future temporal -> history cross -> map cross -> future a2a 순서로
            sparse attention을 반복한다.
         5. conditional flow matching velocity field를 예측한다.
@@ -76,10 +76,29 @@ class SMARTAgentDecoder(nn.Module):
         self.num_layers = num_layers
         self.shift = 5
         self.hist_drop_prob = hist_drop_prob
+        if history_steps <= 0:
+            raise ValueError(f"history_steps must be positive, got {history_steps}.")
+        if future_num_segments <= 0:
+            raise ValueError(f"future_num_segments must be positive, got {future_num_segments}.")
+        if future_segment_points < 6:
+            raise ValueError(
+                "future_segment_points must be at least 6 because the rollout path executes "
+                "the first 0.5-second chunk with 6 points."
+            )
+
         self.history_steps = history_steps
         self.future_window_steps = future_window_steps
         self.future_num_segments = future_num_segments
         self.future_segment_points = future_segment_points
+        self.future_segment_stride_steps = future_segment_points - 1
+        if self.future_segment_stride_steps * self.future_num_segments != self.future_window_steps:
+            raise ValueError(
+                "future_window_steps must match future_num_segments * (future_segment_points - 1). "
+                f"Got future_window_steps={self.future_window_steps}, "
+                f"future_num_segments={self.future_num_segments}, "
+                f"future_segment_points={self.future_segment_points}."
+            )
+        self.future_segment_input_dim = self.future_segment_points * 4
         self.ode_steps = ode_steps
         self.current_step = num_historical_steps - 1
 
@@ -99,8 +118,11 @@ class SMARTAgentDecoder(nn.Module):
         self.token_emb_cyc = MLPEmbedding(input_dim=8, hidden_dim=hidden_dim)
         self.fusion_emb = MLPEmbedding(input_dim=hidden_dim * 2, hidden_dim=hidden_dim)
         self.current_anchor_emb = MLPEmbedding(input_dim=5, hidden_dim=hidden_dim)
-        self.future_segment_emb = MLPEmbedding(input_dim=24, hidden_dim=hidden_dim)
-        self.segment_out_head = MLPLayer(hidden_dim, hidden_dim, 24)
+        self.future_segment_emb = MLPEmbedding(
+            input_dim=self.future_segment_input_dim,
+            hidden_dim=hidden_dim,
+        )
+        self.segment_out_head = MLPLayer(hidden_dim, hidden_dim, self.future_segment_input_dim)
 
         self.t_attn_layers = nn.ModuleList(
             [
@@ -156,6 +178,68 @@ class SMARTAgentDecoder(nn.Module):
         )
         self.apply(weight_init)
 
+    def _future_segment_end_time_lookup(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """각 future segment 마지막 시각을 만든다.
+
+        Args:
+            device: 텐서를 만들 장치.
+            dtype: 텐서 자료형.
+
+        Returns:
+            ``[S]``. 각 future segment 끝 시각(초).
+        """
+        segment_dt = 0.1 * float(self.future_segment_stride_steps)
+        return torch.arange(
+            1,
+            self.future_num_segments + 1,
+            device=device,
+            dtype=dtype,
+        ) * segment_dt
+
+    def _history_context_time_lookup(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """history token과 현재 anchor의 시간을 만든다.
+
+        Args:
+            device: 텐서를 만들 장치.
+            dtype: 텐서 자료형.
+
+        Returns:
+            ``[H + 1]``. history token ``H``개와 현재 anchor 1개의 시간(초).
+        """
+        history_offsets = torch.arange(
+            -(self.history_steps - 1),
+            1,
+            device=device,
+            dtype=dtype,
+        ) * 0.5
+        return torch.cat([history_offsets, torch.zeros(1, device=device, dtype=dtype)], dim=0)
+
+    def _chunk_future_local_to_segments(self, future_local: Tensor) -> Tensor:
+        """전체 future trajectory를 현재 config에 맞는 segment 묶음으로 바꾼다.
+
+        Args:
+            future_local: ``[N, T, 4]`` 전체 local future trajectory.
+
+        Returns:
+            ``[N, S, P, 4]`` segment 텐서.
+        """
+        return chunk_future_to_segments(
+            future_local=future_local,
+            future_num_segments=self.future_num_segments,
+            future_segment_points=self.future_segment_points,
+        )
+
+    def _assemble_future_segments(self, segments: Tensor) -> Tensor:
+        """segment 묶음을 현재 config에 맞는 전체 future trajectory로 합친다.
+
+        Args:
+            segments: ``[N, S, P, 4]`` future segment 텐서.
+
+        Returns:
+            ``[N, T, 4]`` 전체 local future trajectory.
+        """
+        return assemble_segments_to_future(segments)
+
 
     def _embed_discrete_history_tokens(
         self,
@@ -169,7 +253,7 @@ class SMARTAgentDecoder(nn.Module):
         agent_type_emb: Tensor,
         agent_shape_emb: Tensor,
     ) -> Tensor:
-        """과거 discrete token 6개를 history feature 로 바꾼다.
+        """과거 discrete token 묶음을 history feature 로 바꾼다.
 
         Args:
             agent_token_index: ``[N, H]``. agent 별 과거 token id.
@@ -381,7 +465,7 @@ class SMARTAgentDecoder(nn.Module):
         tokenized_agent: Dict[str, Tensor],
         state: Dict[str, Tensor],
     ) -> Dict[str, Tensor]:
-        """history token 6개와 현재 anchor 1개를 memory 로 합친다.
+        """history token 묶음과 현재 anchor 1개를 memory 로 합친다.
 
         Args:
             tokenized_agent: tokenized agent dict.
@@ -389,10 +473,10 @@ class SMARTAgentDecoder(nn.Module):
 
         Returns:
             다음 key 를 가진 memory dict.
-            - ``feat``: ``[N, 7, D]``
-            - ``pos``: ``[N, 7, 2]``
-            - ``head``: ``[N, 7]``
-            - ``valid``: ``[N, 7]``
+            - ``feat``: ``[N, H + 1, D]``
+            - ``pos``: ``[N, H + 1, 2]``
+            - ``head``: ``[N, H + 1]``
+            - ``valid``: ``[N, H + 1]``
         """
         n_agent = state["current_pos"].shape[0]
         static_inputs = self._resolve_agent_static_inputs(tokenized_agent, n_agent)
@@ -430,7 +514,7 @@ class SMARTAgentDecoder(nn.Module):
             agent_mask: ``[N]``. agent 단위 bool mask.
 
         Returns:
-            ``[N, 4]``. 각 agent mask를 모든 future segment에 복사한 mask.
+            ``[N, S]``. 각 agent mask를 모든 future segment에 복사한 mask.
         """
         return agent_mask.bool().unsqueeze(1).expand(-1, self.future_num_segments)
 
@@ -444,7 +528,7 @@ class SMARTAgentDecoder(nn.Module):
         """noisy future segment 를 query token 으로 바꾼다.
 
         Args:
-            x_t: ``[N, 4, 6, 4]``. noisy future segment.
+            x_t: ``[N, S, P, 4]``. noisy future segment.
             tau: ``[N, 1]``. flow time.
             tokenized_agent: tokenized agent dict.
 
@@ -454,7 +538,9 @@ class SMARTAgentDecoder(nn.Module):
         n_agent = x_t.shape[0]
         static_inputs = self._resolve_agent_static_inputs(tokenized_agent, n_agent)
 
-        seg_feat = self.future_segment_emb(x_t.flatten(-2, -1).reshape(-1, 24)).view(
+        seg_feat = self.future_segment_emb(
+            x_t.flatten(-2, -1).reshape(-1, self.future_segment_input_dim)
+        ).view(
             n_agent,
             self.future_num_segments,
             -1,
@@ -474,7 +560,10 @@ class SMARTAgentDecoder(nn.Module):
         정적인 map cross-attention만 현재 상태 기반 reference를 사용해 graph support를
         안정화한다.
         """
-        dt = state["current_pos"].new_tensor([0.5, 1.0, 1.5, 2.0])
+        dt = self._future_segment_end_time_lookup(
+            device=state["current_pos"].device,
+            dtype=state["current_pos"].dtype,
+        )
         head_now = state["current_head"]
         vel_now = state["current_vel"]
         yaw_rate = state["current_yaw_rate"]
@@ -520,6 +609,10 @@ class SMARTAgentDecoder(nn.Module):
         pos_t = pos_a.flatten(0, 1)
         head_t = head_a.flatten(0, 1)
         head_vector_t = head_vector_a.flatten(0, 1)
+        time_t = self._future_segment_end_time_lookup(
+            device=pos_a.device,
+            dtype=pos_a.dtype,
+        ).unsqueeze(0).expand(pos_a.shape[0], -1).flatten(0, 1)
         if self.hist_drop_prob > 0 and self.training and inference_mask is None:
             keep = torch.bernoulli(torch.ones_like(mask, dtype=pos_a.dtype) * (1 - self.hist_drop_prob)).bool()
             mask = mask & keep
@@ -529,7 +622,9 @@ class SMARTAgentDecoder(nn.Module):
             mask_t = mask.unsqueeze(2) & mask.unsqueeze(1)
         edge_index_t = dense_to_sparse(mask_t)[0]
         edge_index_t = edge_index_t[:, edge_index_t[1] > edge_index_t[0]]
-        edge_index_t = edge_index_t[:, edge_index_t[1] - edge_index_t[0] <= self.time_span / self.shift]
+        rel_time_t = time_t[edge_index_t[0]] - time_t[edge_index_t[1]]
+        edge_index_t = edge_index_t[:, rel_time_t.abs() <= float(self.time_span) * 0.1]
+        rel_time_t = time_t[edge_index_t[0]] - time_t[edge_index_t[1]]
         rel_pos_t = pos_t[edge_index_t[0]] - pos_t[edge_index_t[1]]
         rel_head_t = wrap_angle(head_t[edge_index_t[0]] - head_t[edge_index_t[1]])
         r_t = torch.stack(
@@ -537,7 +632,7 @@ class SMARTAgentDecoder(nn.Module):
                 torch.norm(rel_pos_t[:, :2], p=2, dim=-1),
                 angle_between_2d_vectors(ctr_vector=head_vector_t[edge_index_t[1]], nbr_vector=rel_pos_t[:, :2]),
                 rel_head_t,
-                edge_index_t[0] - edge_index_t[1],
+                rel_time_t,
             ],
             dim=-1,
         )
@@ -593,10 +688,10 @@ class SMARTAgentDecoder(nn.Module):
 
         Args:
             pos_a: ``[N, 4, 2]``. future segment 끝점 위치.
-            head_a: ``[N, 4]``. future segment 끝점 heading.
+            head_a: ``[N, S]``. future segment 끝점 heading.
             head_vector_a: ``[N, 4, 2]``. future segment 끝점 heading 단위 벡터.
             batch_s: ``[4 * N]``. step-major 기준 future query batch id.
-            mask: ``[N, 4]``. 유효한 future query mask.
+            mask: ``[N, S]``. 유효한 future query mask.
 
         Returns:
             tuple:
@@ -673,9 +768,9 @@ class SMARTAgentDecoder(nn.Module):
             pos_pl: ``[M, 2]``. map geometry 중심점.
             orient_pl: ``[M]``. map geometry heading.
             pos_a: ``[N, 4, 2]``. map lookup용 reference future 위치.
-            head_a: ``[N, 4]``. reference future heading.
+            head_a: ``[N, S]``. reference future heading.
             head_vector_a: ``[N, 4, 2]``. reference future heading vector.
-            mask: ``[N, 4]``. 유효한 future query mask.
+            mask: ``[N, S]``. 유효한 future query mask.
             batch_s: ``[4*N]``. future query를 편 batch id.
             batch_pl: ``[4*M]``. future segment별로 늘린 map geometry batch id.
             token_index_pl: ``[M]``. 각 map geometry row가 실제로 읽어야 하는
@@ -783,9 +878,9 @@ class SMARTAgentDecoder(nn.Module):
             batch_pl: ``[M]``. 원본 scene 기준 map batch id.
             token_index_pl: ``[M]``. 각 geometry row가 읽을 token row index.
             pos_a: ``[N, 4, 2]``. future reference 위치.
-            head_a: ``[N, 4]``. future reference heading.
+            head_a: ``[N, S]``. future reference heading.
             head_vector_a: ``[N, 4, 2]``. future heading 단위 벡터.
-            mask: ``[N, 4]``. 유효한 future query mask.
+            mask: ``[N, S]``. 유효한 future query mask.
             batch_agent: ``[N]``. anchor batch까지 반영된 agent batch id.
             base_num_graphs: 원래 scene 개수 ``B``.
 
@@ -883,7 +978,7 @@ class SMARTAgentDecoder(nn.Module):
             tokenized_agent: agent dict.
             map_feature: map dict.
             state: 현재 상태 dict.
-            future_mask: ``[N, 4]``. map cross-attention 에 참여시킬 mask.
+            future_mask: ``[N, S]``. map cross-attention 에 참여시킬 mask.
             batch_s: ``[4*N]``. 기존 호출부와의 호환을 위해 받지만,
                 geometry 공유 경로에서는 직접 쓰지 않는다.
 
@@ -938,12 +1033,12 @@ class SMARTAgentDecoder(nn.Module):
         """유효한 history slot과 유효한 future query만으로 history-to-future edge를 만든다.
 
         Args:
-            ctx_pos: ``[N, 7, 2]``. history + current 위치.
-            ctx_head: ``[N, 7]``. history + current heading.
-            ctx_valid: ``[N, 7]``. history + current 유효 mask.
+            ctx_pos: ``[N, H + 1, 2]``. history + current 위치.
+            ctx_head: ``[N, H + 1]``. history + current heading.
+            ctx_valid: ``[N, H + 1]``. history + current 유효 mask.
             future_pos: ``[N, 4, 2]``. future segment 끝점 위치.
-            future_head: ``[N, 4]``. future segment 끝점 heading.
-            future_valid: ``[N, 4]``. future query 유효 mask.
+            future_head: ``[N, S]``. future segment 끝점 heading.
+            future_valid: ``[N, S]``. future query 유효 mask.
             batch_agent: ``[N]``. agent batch id.
 
         Returns:
@@ -986,8 +1081,8 @@ class SMARTAgentDecoder(nn.Module):
         ctx_head_vec = torch.stack([ctx_head_valid.cos(), ctx_head_valid.sin()], dim=-1)
         future_head_vec = torch.stack([future_head_valid.cos(), future_head_valid.sin()], dim=-1)
 
-        ctx_time_lookup = ctx_pos.new_tensor([-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.0])
-        future_time_lookup = ctx_pos.new_tensor([0.5, 1.0, 1.5, 2.0])
+        ctx_time_lookup = self._history_context_time_lookup(device=ctx_pos.device, dtype=ctx_pos.dtype)
+        future_time_lookup = self._future_segment_end_time_lookup(device=ctx_pos.device, dtype=ctx_pos.dtype)
         ctx_slot_index = torch.remainder(ctx_index, ctx_pos.shape[1])
         future_slot_index = torch.remainder(future_index, future_pos.shape[1])
         ctx_time_valid = ctx_time_lookup.index_select(0, ctx_slot_index)
@@ -1035,18 +1130,18 @@ class SMARTAgentDecoder(nn.Module):
         """현재 context에서 conditional flow velocity field를 예측한다.
 
         Args:
-            x_t: ``[N, 4, 6, 4]`` noisy future segment.
+            x_t: ``[N, S, P, 4]`` noisy future segment.
             tau: ``[N, 1]`` flow time.
             tokenized_agent: tokenized agent dict.
             map_feature: encoded map dict.
                 open-loop anchor batch에서는 geometry row 수와 ``pt_token`` row 수가 다를 수 있고,
                 이때는 ``token_index`` 로 geometry row가 어떤 token feature를 읽는지 연결한다.
             state: history/current state.
-            future_mask: ``[N, 4]``. supervised future query에 실제로 참여시킬
+            future_mask: ``[N, S]``. supervised future query에 실제로 참여시킬
                 agent-segment mask. ``None`` 이면 ``current_valid`` 를 사용한다.
 
         Returns:
-            ``[N, 4, 6, 4]`` predicted velocity field.
+            ``[N, S, P, 4]`` predicted velocity field.
         """
         n_agent = x_t.shape[0]
         if future_mask is None:
@@ -1330,14 +1425,14 @@ class SMARTAgentDecoder(nn.Module):
         Returns:
             open-loop flow loss 계산에 필요한 batched dict.
             항상 아래 key는 포함된다.
-            - ``flow_pred``: ``[K, N, 4, 6, 4]``
-            - ``flow_target``: ``[K, N, 4, 6, 4]``
-            - ``pred_segments``: ``[K, N, 4, 6, 4]``
+            - ``flow_pred``: ``[K, N, S, P, 4]``
+            - ``flow_target``: ``[K, N, S, P, 4]``
+            - ``pred_segments``: ``[K, N, S, P, 4]``
             - ``future_valid``: ``[K, N]``
             그리고 ``return_full_outputs=True`` 일 때만 아래 key를 추가로 포함한다.
-            - ``gt_segments``: ``[K, N, 4, 6, 4]``
-            - ``pred_future_local``: ``[K, N, 21, 4]``
-            - ``gt_future_local``: ``[K, N, 21, 4]``
+            - ``gt_segments``: ``[K, N, S, P, 4]``
+            - ``pred_future_local``: ``[K, N, T, 4]``
+            - ``gt_future_local``: ``[K, N, T, 4]``
         """
         anchor_steps_tensor = torch.as_tensor(
             anchor_steps,
@@ -1364,7 +1459,7 @@ class SMARTAgentDecoder(nn.Module):
                 anchor_step=anchor_step,
                 future_window_steps=self.future_window_steps,
             )
-            gt_segments_list.append(chunk_future_21_to_4x6(gt_future_local))
+            gt_segments_list.append(self._chunk_future_local_to_segments(gt_future_local))
             if gt_future_local_list is not None:
                 gt_future_local_list.append(gt_future_local)
             future_valid_list.append(
@@ -1424,7 +1519,7 @@ class SMARTAgentDecoder(nn.Module):
             "future_valid": future_valid,
         }
         if return_full_outputs:
-            pred_future_local_flat = assemble_4x6_to_21(pred_segments_flat)
+            pred_future_local_flat = self._assemble_future_segments(pred_segments_flat)
             pred_batch["gt_segments"] = gt_segments
             pred_batch["pred_future_local"] = pred_future_local_flat.reshape(
                 n_anchor,
@@ -1461,7 +1556,7 @@ class SMARTAgentDecoder(nn.Module):
             anchor_step=anchor_step,
             future_window_steps=self.future_window_steps,
         )
-        gt_segments = chunk_future_21_to_4x6(gt_future_local)
+        gt_segments = self._chunk_future_local_to_segments(gt_future_local)
         future_valid = agent_raw["valid_mask"][
             :,
             anchor_step : anchor_step + self.future_window_steps + 1,
@@ -1479,7 +1574,7 @@ class SMARTAgentDecoder(nn.Module):
             future_mask=future_mask,
         )
         pred_segments = x_t + (1.0 - tau) * flow_pred
-        pred_future_local = assemble_4x6_to_21(pred_segments)
+        pred_future_local = self._assemble_future_segments(pred_segments)
         return {
             "flow_pred": flow_pred,
             "flow_target": flow_target,
@@ -1518,7 +1613,7 @@ class SMARTAgentDecoder(nn.Module):
                 anchor_step=anchor_step,
                 future_window_steps=self.future_window_steps,
             )
-            gt_segments = chunk_future_21_to_4x6(gt_future_local)
+            gt_segments = self._chunk_future_local_to_segments(gt_future_local)
             future_valid = agent_raw["valid_mask"][
                 :,
                 anchor_step : anchor_step + self.future_window_steps + 1,
@@ -1536,7 +1631,7 @@ class SMARTAgentDecoder(nn.Module):
                 future_mask=future_mask,
             )
             pred_segments = x_t + (1.0 - tau) * flow_pred
-            pred_future_local = assemble_4x6_to_21(pred_segments)
+            pred_future_local = self._assemble_future_segments(pred_segments)
             outputs.append(
                 {
                     "flow_pred": flow_pred,
@@ -1617,7 +1712,7 @@ class SMARTAgentDecoder(nn.Module):
                 )
 
             pred_segments = midpoint_ode_integrate(x0=x0, ode_steps=self.ode_steps, velocity_fn=_velocity_fn)
-            pred_future_local = assemble_4x6_to_21(pred_segments)
+            pred_future_local = self._assemble_future_segments(pred_segments)
             rollout = executed_chunk_to_rollout_update(
                 future_local_21=pred_future_local,
                 pos_now=state["current_pos"],

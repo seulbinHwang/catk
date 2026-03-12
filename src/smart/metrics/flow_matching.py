@@ -85,8 +85,8 @@ class FlowMatchingLoss(nn.Module):
         """기본 conditional flow matching 손실을 계산한다.
 
         Args:
-            flow_pred: ``[N, 4, 6, 4]`` 예측 velocity field.
-            flow_target: ``[N, 4, 6, 4]`` 목표 velocity field.
+            flow_pred: ``[N, S, P, 4]`` 예측 velocity field.
+            flow_target: ``[N, S, P, 4]`` 목표 velocity field.
             loss_mask: ``[N]``. 학습 대상 agent 마스크.
 
         Returns:
@@ -102,7 +102,7 @@ class FlowMatchingLoss(nn.Module):
         즉, 경계 3개를 단순 합하지 않고 평균한다.
 
         Args:
-            pred_segments: ``[N, 4, 6, 4]`` clean future segment 예측값.
+            pred_segments: ``[N, S, P, 4]`` clean future segment 예측값.
             loss_mask: ``[N]``. 학습 대상 agent 마스크.
 
         Returns:
@@ -129,15 +129,15 @@ class FlowMatchingLoss(nn.Module):
         """손실을 계산한다.
 
         Args:
-            flow_pred: ``[N, 4, 6, 4]`` 예측 velocity field.
-            flow_target: ``[N, 4, 6, 4]`` 목표 velocity field.
-            pred_segments: ``[N, 4, 6, 4]`` clean future segment 예측값.
+            flow_pred: ``[N, S, P, 4]`` 예측 velocity field.
+            flow_target: ``[N, S, P, 4]`` 목표 velocity field.
+            pred_segments: ``[N, S, P, 4]`` clean future segment 예측값.
             loss_mask: ``[N]``. 학습 대상 agent 마스크.
-            gt_segments: ``[N, 4, 6, 4]`` GT clean segment.
+            gt_segments: ``[N, S, P, 4]`` GT clean segment.
                 train slim path에서는 ``None`` 일 수 있고, 현재는 받기만 하고 쓰지 않는다.
-            pred_future_local: ``[N, 21, 4]`` 조립된 clean future 예측값.
+            pred_future_local: ``[N, T, 4]`` 조립된 clean future 예측값.
                 train slim path에서는 ``None`` 일 수 있고, 현재는 받기만 하고 쓰지 않는다.
-            gt_future_local: ``[N, 21, 4]`` GT local future.
+            gt_future_local: ``[N, T, 4]`` GT local future.
                 train slim path에서는 ``None`` 일 수 있고, 현재는 받기만 하고 쓰지 않는다.
 
         Returns:

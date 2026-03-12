@@ -43,10 +43,10 @@ model_config:
     time_span: 30
     num_historical_steps: 11
     num_future_steps: 80
-    history_steps: 6
-    future_window_steps: 20
-    future_num_segments: 4
-    future_segment_points: 6
+    history_steps: 5  # past 2.0s with 0.5s token spacing
+    future_window_steps: 20  # keep the 2.0s supervision window at 10Hz
+    future_num_segments: 2  # 2 future tokens instead of 4
+    future_segment_points: 11  # each token covers 1.0s and shares 1 point with the next token
     ode_steps: 4
   wosac_submission:
     is_active: false
