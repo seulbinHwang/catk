@@ -7,7 +7,7 @@ model:
     lr: 5e-4
     lr_warmup_steps: 0
     lr_min_ratio: 1e-2
-    anchor_chunk_k: 3
+    anchor_chunk_k: 5
     use_closed_loop_finetune: false
     finetune: false
     val_open_loop: true
