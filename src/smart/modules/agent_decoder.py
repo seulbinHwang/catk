@@ -13,7 +13,7 @@ import torch.nn as nn
 from omegaconf import DictConfig
 from torch import Tensor
 from torch_cluster import radius, radius_graph
-from torch_geometric.utils import dense_to_sparse, subgraph
+from torch_geometric.utils import dense_to_sparse
 
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
@@ -544,6 +544,43 @@ class SMARTAgentDecoder(nn.Module):
         r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
         return edge_index_t, r_t
 
+    def _empty_edge_and_relation(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor]:
+        """빈 edge_index와 relation embedding을 만든다.
+
+        Args:
+            device: 텐서를 만들 장치.
+            dtype: relation embedding에 사용할 자료형.
+
+        Returns:
+            tuple:
+                - edge_index: ``[2, 0]``
+                - rel: ``[0, D]``
+        """
+        empty_edge = torch.empty((2, 0), device=device, dtype=torch.long)
+        empty_rel = torch.zeros((0, self.hidden_dim), device=device, dtype=dtype)
+        return empty_edge, empty_rel
+
+    @staticmethod
+    def _sort_by_batch_if_needed(
+        values: Sequence[Tensor],
+        batch: Tensor,
+    ) -> tuple[list[Tensor], Tensor]:
+        """batch가 비내림차순이 아닐 때만 같은 permutation으로 정렬한다.
+
+        ``torch_cluster``의 batch-aware radius 연산은 batch index가 정렬돼 있을 때를
+        가정하므로, 필요한 경우에만 입력 텐서를 함께 재배열한다.
+        """
+        if batch.numel() <= 1 or bool(torch.all(batch[:-1] <= batch[1:])):
+            return [value for value in values], batch
+
+        perm = torch.argsort(batch)
+        sorted_values = [value.index_select(0, perm) for value in values]
+        return sorted_values, batch.index_select(0, perm)
+
     def build_interaction_edge(
         self,
         pos_a: Tensor,
@@ -552,26 +589,56 @@ class SMARTAgentDecoder(nn.Module):
         batch_s: Tensor,
         mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """같은 future index끼리 agent-agent edge를 만든다."""
-        mask = mask.transpose(0, 1).reshape(-1)
-        pos_s = pos_a.transpose(0, 1).flatten(0, 1)
-        head_s = head_a.transpose(0, 1).reshape(-1)
-        head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        edge_index_a2a = radius_graph(
-            x=pos_s[:, :2],
+        """같은 future index끼리, 유효한 query만 사용해 agent-agent edge를 만든다.
+
+        Args:
+            pos_a: ``[N, 4, 2]``. future segment 끝점 위치.
+            head_a: ``[N, 4]``. future segment 끝점 heading.
+            head_vector_a: ``[N, 4, 2]``. future segment 끝점 heading 단위 벡터.
+            batch_s: ``[4 * N]``. step-major 기준 future query batch id.
+            mask: ``[N, 4]``. 유효한 future query mask.
+
+        Returns:
+            tuple:
+                - edge_index: ``[2, E]``. 기존 step-major future index 기준.
+                - r_a2a: ``[E, D]``. agent-agent relation embedding.
+        """
+        mask_flat = mask.transpose(0, 1).reshape(-1).bool()
+        valid_index = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
+        if valid_index.numel() == 0:
+            return self._empty_edge_and_relation(pos_a.device, pos_a.dtype)
+
+        pos_step_major = pos_a.transpose(0, 1).reshape(-1, pos_a.size(-1))
+        head_step_major = head_a.transpose(0, 1).reshape(-1)
+        head_vec_step_major = head_vector_a.transpose(0, 1).reshape(-1, head_vector_a.size(-1))
+
+        pos_valid = pos_step_major.index_select(0, valid_index)
+        head_valid = head_step_major.index_select(0, valid_index)
+        head_vec_valid = head_vec_step_major.index_select(0, valid_index)
+        batch_valid = batch_s.index_select(0, valid_index)
+
+        edge_local = radius_graph(
+            x=pos_valid[:, :2],
             r=self.a2a_radius,
-            batch=batch_s,
+            batch=batch_valid,
             loop=False,
             max_num_neighbors=300,
         )
-        edge_index_a2a = subgraph(subset=mask, edge_index=edge_index_a2a)[0]
-        rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
-        rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
+        if edge_local.numel() == 0:
+            return self._empty_edge_and_relation(pos_a.device, pos_a.dtype)
+
+        src_local = edge_local[0]
+        dst_local = edge_local[1]
+
+        rel_pos_a2a = pos_valid.index_select(0, src_local) - pos_valid.index_select(0, dst_local)
+        rel_head_a2a = wrap_angle(
+            head_valid.index_select(0, src_local) - head_valid.index_select(0, dst_local)
+        )
         r_a2a = torch.stack(
             [
                 torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
                 angle_between_2d_vectors(
-                    ctr_vector=head_vector_s[edge_index_a2a[1]],
+                    ctr_vector=head_vec_valid.index_select(0, dst_local),
                     nbr_vector=rel_pos_a2a[:, :2],
                 ),
                 rel_head_a2a,
@@ -579,7 +646,14 @@ class SMARTAgentDecoder(nn.Module):
             dim=-1,
         )
         r_a2a = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
-        return edge_index_a2a, r_a2a
+        edge_index = torch.stack(
+            [
+                valid_index.index_select(0, src_local),
+                valid_index.index_select(0, dst_local),
+            ],
+            dim=0,
+        )
+        return edge_index, r_a2a
 
     def build_map2agent_edge(
         self,
@@ -701,25 +775,25 @@ class SMARTAgentDecoder(nn.Module):
         batch_agent: Tensor,
         base_num_graphs: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """map geometry 복제 없이 map-to-agent edge 를 만든다.
+        """map geometry를 복제하지 않고, 유효한 future query만으로 map-to-agent edge를 만든다.
 
         Args:
             pos_pl: ``[M, 2]``. map geometry 중심점.
             orient_pl: ``[M]``. map geometry heading.
             batch_pl: ``[M]``. 원본 scene 기준 map batch id.
-            token_index_pl: ``[M]``. 각 geometry row 가 읽을 token row index.
+            token_index_pl: ``[M]``. 각 geometry row가 읽을 token row index.
             pos_a: ``[N, 4, 2]``. future reference 위치.
             head_a: ``[N, 4]``. future reference heading.
-            head_vector_a: ``[N, 4, 2]``. future heading unit vector.
+            head_vector_a: ``[N, 4, 2]``. future heading 단위 벡터.
             mask: ``[N, 4]``. 유효한 future query mask.
-            batch_agent: ``[N]``. anchor batch 까지 반영된 agent batch id.
+            batch_agent: ``[N]``. anchor batch까지 반영된 agent batch id.
             base_num_graphs: 원래 scene 개수 ``B``.
 
         Returns:
             tuple:
-                - ``src_token_index``: ``[E]``. source token row index.
-                - ``dst_index``: ``[E]``. step-major future query index.
-                - ``r_pl2a``: ``[E, D]``. map-to-agent relation embedding.
+                - src_token_index: ``[E]``. source token row index.
+                - dst_index: ``[E]``. 기존 step-major future query index.
+                - r_pl2a: ``[E, D]``. map-to-agent relation embedding.
         """
         num_map_geom = pos_pl.shape[0]
         if num_map_geom == 0:
@@ -727,74 +801,72 @@ class SMARTAgentDecoder(nn.Module):
             empty_rel = pos_a.new_zeros((0, self.hidden_dim))
             return empty_index, empty_index, empty_rel
 
-        n_agent, n_step = pos_a.shape[:2]
-        src_token_chunks: List[Tensor] = []
-        dst_chunks: List[Tensor] = []
-        rel_chunks: List[Tensor] = []
-        graph_ids = batch_agent.unique(sorted=True).tolist()
-
-        for step_idx in range(n_step):
-            pos_step = pos_a[:, step_idx]
-            head_step = head_a[:, step_idx]
-            head_vec_step = head_vector_a[:, step_idx]
-            valid_index = torch.nonzero(mask[:, step_idx].bool(), as_tuple=False).squeeze(1)
-            if valid_index.numel() == 0:
-                continue
-
-            valid_batch = batch_agent.index_select(0, valid_index)
-            for graph_id in graph_ids:
-                graph_mask = torch.nonzero(valid_batch == graph_id, as_tuple=False).squeeze(1)
-                if graph_mask.numel() == 0:
-                    continue
-                query_index = valid_index.index_select(0, graph_mask)
-                base_graph_id = int(graph_id % base_num_graphs)
-                map_index = torch.nonzero(batch_pl == base_graph_id, as_tuple=False).squeeze(1)
-                if map_index.numel() == 0:
-                    continue
-
-                pos_query = pos_step.index_select(0, query_index)
-                pos_map = pos_pl.index_select(0, map_index)
-                edge_local = radius(
-                    x=pos_query[:, :2],
-                    y=pos_map[:, :2],
-                    r=self.pl2a_radius,
-                    max_num_neighbors=300,
-                )
-                if edge_local.numel() == 0:
-                    continue
-
-                src_geom_index = map_index.index_select(0, edge_local[0])
-                dst_agent_index = query_index.index_select(0, edge_local[1])
-                rel_pos_pl2a = pos_pl.index_select(0, src_geom_index) - pos_step.index_select(0, dst_agent_index)
-                rel_orient_pl2a = wrap_angle(
-                    orient_pl.index_select(0, src_geom_index)
-                    - head_step.index_select(0, dst_agent_index)
-                )
-                rel_chunks.append(
-                    torch.stack(
-                        [
-                            torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
-                            angle_between_2d_vectors(
-                                ctr_vector=head_vec_step.index_select(0, dst_agent_index),
-                                nbr_vector=rel_pos_pl2a[:, :2],
-                            ),
-                            rel_orient_pl2a,
-                        ],
-                        dim=-1,
-                    )
-                )
-                src_token_chunks.append(token_index_pl.index_select(0, src_geom_index))
-                dst_chunks.append(dst_agent_index + step_idx * n_agent)
-
-        if len(src_token_chunks) == 0:
+        _, n_step = pos_a.shape[:2]
+        mask_flat = mask.transpose(0, 1).reshape(-1).bool()
+        valid_index = torch.nonzero(mask_flat, as_tuple=False).squeeze(1)
+        if valid_index.numel() == 0:
             empty_index = torch.empty((0,), device=pos_a.device, dtype=torch.long)
             empty_rel = pos_a.new_zeros((0, self.hidden_dim))
             return empty_index, empty_index, empty_rel
 
-        src_token_index = torch.cat(src_token_chunks, dim=0)
-        dst_index = torch.cat(dst_chunks, dim=0)
-        rel_cont = torch.cat(rel_chunks, dim=0)
+        pos_step_major = pos_a.transpose(0, 1).reshape(-1, pos_a.size(-1))
+        head_step_major = head_a.transpose(0, 1).reshape(-1)
+        head_vec_step_major = head_vector_a.transpose(0, 1).reshape(-1, head_vector_a.size(-1))
+        base_batch_step_major = torch.remainder(batch_agent, base_num_graphs).repeat(n_step)
+
+        pos_valid = pos_step_major.index_select(0, valid_index)
+        head_valid = head_step_major.index_select(0, valid_index)
+        head_vec_valid = head_vec_step_major.index_select(0, valid_index)
+        batch_valid = base_batch_step_major.index_select(0, valid_index)
+
+        [pos_valid, head_valid, head_vec_valid, valid_index], batch_valid = self._sort_by_batch_if_needed(
+            [pos_valid, head_valid, head_vec_valid, valid_index],
+            batch_valid,
+        )
+        [pos_pl_sorted, orient_pl_sorted, token_index_pl_sorted], batch_pl_sorted = self._sort_by_batch_if_needed(
+            [pos_pl, orient_pl, token_index_pl],
+            batch_pl,
+        )
+
+        edge_local = radius(
+            x=pos_valid[:, :2],
+            y=pos_pl_sorted[:, :2],
+            r=self.pl2a_radius,
+            batch_x=batch_valid,
+            batch_y=batch_pl_sorted,
+            max_num_neighbors=300,
+        )
+        if edge_local.numel() == 0:
+            empty_index = torch.empty((0,), device=pos_a.device, dtype=torch.long)
+            empty_rel = pos_a.new_zeros((0, self.hidden_dim))
+            return empty_index, empty_index, empty_rel
+
+        src_geom_index = edge_local[0]
+        dst_valid_index = edge_local[1]
+
+        rel_pos_pl2a = (
+            pos_pl_sorted.index_select(0, src_geom_index)
+            - pos_valid.index_select(0, dst_valid_index)
+        )
+        rel_orient_pl2a = wrap_angle(
+            orient_pl_sorted.index_select(0, src_geom_index)
+            - head_valid.index_select(0, dst_valid_index)
+        )
+        rel_cont = torch.stack(
+            [
+                torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vec_valid.index_select(0, dst_valid_index),
+                    nbr_vector=rel_pos_pl2a[:, :2],
+                ),
+                rel_orient_pl2a,
+            ],
+            dim=-1,
+        )
         r_pl2a = self.r_pt2a_emb(continuous_inputs=rel_cont, categorical_embs=None)
+
+        src_token_index = token_index_pl_sorted.index_select(0, src_geom_index)
+        dst_index = valid_index.index_select(0, dst_valid_index)
         return src_token_index, dst_index, r_pl2a
 
     def _build_compact_map_attention_inputs(
@@ -863,58 +935,77 @@ class SMARTAgentDecoder(nn.Module):
         future_valid: Tensor,
         batch_agent: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """future query가 scene-wide history memory를 읽기 위한 edge를 만든다.
+        """유효한 history slot과 유효한 future query만으로 history-to-future edge를 만든다.
 
         Args:
-            ctx_pos: ``[N, 7, 2]``.
-            ctx_head: ``[N, 7]``.
-            ctx_valid: ``[N, 7]``.
-            future_pos: ``[N, 4, 2]``.
-            future_head: ``[N, 4]``.
-            future_valid: ``[N, 4]``.
-            batch_agent: ``[N]``.
+            ctx_pos: ``[N, 7, 2]``. history + current 위치.
+            ctx_head: ``[N, 7]``. history + current heading.
+            ctx_valid: ``[N, 7]``. history + current 유효 mask.
+            future_pos: ``[N, 4, 2]``. future segment 끝점 위치.
+            future_head: ``[N, 4]``. future segment 끝점 heading.
+            future_valid: ``[N, 4]``. future query 유효 mask.
+            batch_agent: ``[N]``. agent batch id.
 
         Returns:
             tuple:
-                - edge_index: ``[2, E]`` with src=history, dst=future
-                - relation embedding: ``[E, 128]``
+                - edge_index: ``[2, E]``. src=history, dst=future, 기존 agent-major index 기준.
+                - r_hist2f: ``[E, D]``. history-to-future relation embedding.
         """
-        n_agent = ctx_pos.shape[0]
-        ctx_pos_flat = ctx_pos.flatten(0, 1)
-        ctx_head_flat = ctx_head.flatten(0, 1)
-        ctx_valid_flat = ctx_valid.flatten()
-        future_pos_flat = future_pos.flatten(0, 1)
-        future_head_flat = future_head.flatten(0, 1)
-        future_valid_flat = future_valid.flatten()
+        ctx_pos_flat = ctx_pos.reshape(-1, ctx_pos.size(-1))
+        ctx_head_flat = ctx_head.reshape(-1)
+        ctx_valid_flat = ctx_valid.reshape(-1).bool()
 
-        batch_ctx = batch_agent.repeat_interleave(ctx_pos.shape[1])
-        batch_future = batch_agent.repeat_interleave(future_pos.shape[1])
-        edge_index = radius(
-            x=future_pos_flat[:, :2],
-            y=ctx_pos_flat[:, :2],
+        future_pos_flat = future_pos.reshape(-1, future_pos.size(-1))
+        future_head_flat = future_head.reshape(-1)
+        future_valid_flat = future_valid.reshape(-1).bool()
+
+        ctx_index = torch.nonzero(ctx_valid_flat, as_tuple=False).squeeze(1)
+        future_index = torch.nonzero(future_valid_flat, as_tuple=False).squeeze(1)
+        if ctx_index.numel() == 0 or future_index.numel() == 0:
+            return self._empty_edge_and_relation(ctx_pos.device, ctx_pos.dtype)
+
+        ctx_pos_valid = ctx_pos_flat.index_select(0, ctx_index)
+        ctx_head_valid = ctx_head_flat.index_select(0, ctx_index)
+        future_pos_valid = future_pos_flat.index_select(0, future_index)
+        future_head_valid = future_head_flat.index_select(0, future_index)
+
+        batch_ctx = batch_agent.repeat_interleave(ctx_pos.shape[1]).index_select(0, ctx_index)
+        batch_future = batch_agent.repeat_interleave(future_pos.shape[1]).index_select(0, future_index)
+
+        edge_local = radius(
+            x=future_pos_valid[:, :2],
+            y=ctx_pos_valid[:, :2],
             r=self.hist2f_radius,
             batch_x=batch_future,
             batch_y=batch_ctx,
             max_num_neighbors=300,
         )
-        keep = ctx_valid_flat[edge_index[0]] & future_valid_flat[edge_index[1]]
-        edge_index = edge_index[:, keep]
+        if edge_local.numel() == 0:
+            return self._empty_edge_and_relation(ctx_pos.device, ctx_pos.dtype)
 
-        ctx_head_vec = torch.stack([ctx_head_flat.cos(), ctx_head_flat.sin()], dim=-1)
-        future_head_vec = torch.stack([future_head_flat.cos(), future_head_flat.sin()], dim=-1)
-        ctx_time = ctx_pos.new_tensor([-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.0])
-        future_time = ctx_pos.new_tensor([0.5, 1.0, 1.5, 2.0])
-        ctx_time_flat = ctx_time.unsqueeze(0).repeat(n_agent, 1).flatten(0, 1)
-        future_time_flat = future_time.unsqueeze(0).repeat(n_agent, 1).flatten(0, 1)
+        ctx_head_vec = torch.stack([ctx_head_valid.cos(), ctx_head_valid.sin()], dim=-1)
+        future_head_vec = torch.stack([future_head_valid.cos(), future_head_valid.sin()], dim=-1)
 
-        rel_pos = ctx_pos_flat[edge_index[0]] - future_pos_flat[edge_index[1]]
-        rel_head = wrap_angle(ctx_head_flat[edge_index[0]] - future_head_flat[edge_index[1]])
-        rel_time = ctx_time_flat[edge_index[0]] - future_time_flat[edge_index[1]]
+        ctx_time_lookup = ctx_pos.new_tensor([-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.0])
+        future_time_lookup = ctx_pos.new_tensor([0.5, 1.0, 1.5, 2.0])
+        ctx_slot_index = torch.remainder(ctx_index, ctx_pos.shape[1])
+        future_slot_index = torch.remainder(future_index, future_pos.shape[1])
+        ctx_time_valid = ctx_time_lookup.index_select(0, ctx_slot_index)
+        future_time_valid = future_time_lookup.index_select(0, future_slot_index)
+
+        src_local = edge_local[0]
+        dst_local = edge_local[1]
+
+        rel_pos = ctx_pos_valid.index_select(0, src_local) - future_pos_valid.index_select(0, dst_local)
+        rel_head = wrap_angle(
+            ctx_head_valid.index_select(0, src_local) - future_head_valid.index_select(0, dst_local)
+        )
+        rel_time = ctx_time_valid.index_select(0, src_local) - future_time_valid.index_select(0, dst_local)
         r_hist2f = torch.stack(
             [
                 torch.norm(rel_pos[:, :2], p=2, dim=-1),
                 angle_between_2d_vectors(
-                    ctr_vector=future_head_vec[edge_index[1]],
+                    ctr_vector=future_head_vec.index_select(0, dst_local),
                     nbr_vector=rel_pos[:, :2],
                 ),
                 rel_head,
@@ -923,6 +1014,13 @@ class SMARTAgentDecoder(nn.Module):
             dim=-1,
         )
         r_hist2f = self.r_hist2f_emb(continuous_inputs=r_hist2f, categorical_embs=None)
+        edge_index = torch.stack(
+            [
+                ctx_index.index_select(0, src_local),
+                future_index.index_select(0, dst_local),
+            ],
+            dim=0,
+        )
         return edge_index, r_hist2f
 
     def _predict_velocity_field(
