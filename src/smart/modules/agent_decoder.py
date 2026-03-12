@@ -1023,6 +1023,225 @@ class SMARTAgentDecoder(nn.Module):
         )
         return edge_index, r_hist2f
 
+
+    def _masked_mean_feature(self, feat: Tensor, mask: Tensor) -> Tensor:
+        """유효한 slot만 평균내어 대표 feature를 만든다.
+
+        Args:
+            feat: ``[N, S, D]`` 형태의 feature 텐서.
+            mask: ``[N, S]`` 형태의 유효 mask.
+
+        Returns:
+            ``[N, D]`` 형태의 평균 feature.
+        """
+        mask_f = mask.to(feat.dtype).unsqueeze(-1)
+        denom = mask_f.sum(dim=1).clamp_min(1.0)
+        return (feat * mask_f).sum(dim=1) / denom
+
+    def _build_scene_token(
+        self,
+        ctx: Dict[str, Tensor],
+        x_t: Tensor,
+        tau: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+        future_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """history와 noisy future를 anchor당 1개의 scene token으로 요약한다.
+
+        Args:
+            ctx: history memory dict.
+                - ``feat``: ``[N, 7, D]``
+                - ``valid``: ``[N, 7]``
+            x_t: ``[N, 4, 6, 4]`` noisy future segment.
+            tau: ``[N, 1]`` flow time.
+            tokenized_agent: tokenized agent dict.
+            future_mask: ``[N, 4]`` supervised future query mask.
+
+        Returns:
+            tuple:
+                - ``scene_feat``: ``[N, D]`` anchor당 1개의 scene token.
+                - ``seg_seed``: ``[N, 4, D]`` local segment seed feature.
+        """
+        hist_mean = self._masked_mean_feature(ctx["feat"], ctx["valid"])
+        hist_tail = ctx["feat"][:, -1]
+        hist_scene = self.fusion_emb(torch.cat([hist_mean, hist_tail], dim=-1))
+
+        seg_seed = self._build_future_query(x_t, tau, tokenized_agent)
+        seg_mean = self._masked_mean_feature(seg_seed, future_mask)
+        scene_feat = self.fusion_emb(torch.cat([hist_scene, seg_mean], dim=-1))
+        return scene_feat, seg_seed
+
+    def _build_scene_support_pose(
+        self,
+        state: Dict[str, Tensor],
+        future_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """scene-wide 상호작용에 사용할 대표 pose를 만든다.
+
+        Args:
+            state: 현재 state dict.
+                - ``current_pos``: ``[N, 2]``
+                - ``current_head``: ``[N]``
+            future_mask: ``[N, 4]`` future 유효 mask.
+
+        Returns:
+            tuple:
+                - ``scene_pos``: ``[N, 2]`` 대표 위치.
+                - ``scene_head``: ``[N]`` 대표 heading.
+                - ``scene_mask``: ``[N]`` 대표 token 유효 mask.
+        """
+        ref_pos, ref_head = self._build_reference_future_pose(state)
+        scene_pos = ref_pos[:, -1]
+        scene_head = ref_head[:, -1]
+        scene_mask = future_mask.any(dim=1)
+        return scene_pos, scene_head, scene_mask
+
+    def _build_scene_map_attention_inputs(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        scene_pos: Tensor,
+        scene_head: Tensor,
+        scene_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """scene token 하나에만 map cross-attention을 걸기 위한 compact 입력을 만든다.
+
+        Args:
+            tokenized_agent: tokenized agent dict.
+            map_feature: encoded map dict.
+                - ``position``: ``[M, 2]``
+                - ``orientation``: ``[M]``
+                - ``batch``: ``[M]``
+                - ``pt_token``: ``[M_token, D]``
+            scene_pos: ``[N, 2]`` 대표 위치.
+            scene_head: ``[N]`` 대표 heading.
+            scene_mask: ``[N]`` 대표 token 유효 mask.
+
+        Returns:
+            tuple:
+                - ``feat_map``: ``[M_keep, D]``
+                - ``edge_index_pl2scene``: ``[2, E]``
+                - ``r_pl2scene``: ``[E, D]``
+        """
+        base_num_graphs = int(tokenized_agent.get("base_num_graphs", int(tokenized_agent["num_graphs"])))
+        scene_head_vec = torch.stack([scene_head.cos(), scene_head.sin()], dim=-1)
+
+        src_token_index, dst_index, r_pl2scene = self._build_map2agent_edge_without_geometry_repeat(
+            pos_pl=map_feature["position"],
+            orient_pl=map_feature["orientation"],
+            batch_pl=map_feature["batch"],
+            token_index_pl=self._get_map_token_index(map_feature),
+            pos_a=scene_pos.unsqueeze(1),
+            head_a=scene_head.unsqueeze(1),
+            head_vector_a=scene_head_vec.unsqueeze(1),
+            mask=scene_mask.unsqueeze(1),
+            batch_agent=tokenized_agent["batch"],
+            base_num_graphs=base_num_graphs,
+        )
+
+        if src_token_index.numel() == 0:
+            feat_map = map_feature["pt_token"].new_zeros((0, map_feature["pt_token"].shape[-1]))
+            edge_index_pl2scene = torch.empty((2, 0), device=map_feature["pt_token"].device, dtype=torch.long)
+            return feat_map, edge_index_pl2scene, r_pl2scene
+
+        unique_src_token_index, compact_src_index = torch.unique(
+            src_token_index,
+            sorted=True,
+            return_inverse=True,
+        )
+        edge_index_pl2scene = torch.stack([compact_src_index, dst_index], dim=0)
+        feat_map = map_feature["pt_token"].index_select(0, unique_src_token_index)
+        return feat_map, edge_index_pl2scene, r_pl2scene
+
+    def _build_hist2scene_edge(
+        self,
+        ctx: Dict[str, Tensor],
+        scene_pos: Tensor,
+        scene_head: Tensor,
+        scene_mask: Tensor,
+        batch_agent: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """history slot에서 scene token 하나로 가는 sparse edge를 만든다.
+
+        Args:
+            ctx: history memory dict.
+                - ``pos``: ``[N, 7, 2]``
+                - ``head``: ``[N, 7]``
+                - ``valid``: ``[N, 7]``
+            scene_pos: ``[N, 2]`` 대표 위치.
+            scene_head: ``[N]`` 대표 heading.
+            scene_mask: ``[N]`` 대표 token 유효 mask.
+            batch_agent: ``[N]`` agent batch id.
+
+        Returns:
+            tuple:
+                - ``edge_index``: ``[2, E]``. src=history, dst=scene.
+                - ``r_hist2scene``: ``[E, D]`` relation embedding.
+        """
+        ctx_pos_flat = ctx["pos"].reshape(-1, ctx["pos"].size(-1))
+        ctx_head_flat = ctx["head"].reshape(-1)
+        ctx_valid_flat = ctx["valid"].reshape(-1).bool()
+
+        ctx_index = torch.nonzero(ctx_valid_flat, as_tuple=False).squeeze(1)
+        scene_index = torch.nonzero(scene_mask, as_tuple=False).squeeze(1)
+        if ctx_index.numel() == 0 or scene_index.numel() == 0:
+            return self._empty_edge_and_relation(scene_pos.device, scene_pos.dtype)
+
+        ctx_pos_valid = ctx_pos_flat.index_select(0, ctx_index)
+        ctx_head_valid = ctx_head_flat.index_select(0, ctx_index)
+        scene_pos_valid = scene_pos.index_select(0, scene_index)
+        scene_head_valid = scene_head.index_select(0, scene_index)
+
+        batch_ctx = batch_agent.repeat_interleave(ctx["pos"].shape[1]).index_select(0, ctx_index)
+        batch_scene = batch_agent.index_select(0, scene_index)
+        edge_local = radius(
+            x=scene_pos_valid[:, :2],
+            y=ctx_pos_valid[:, :2],
+            r=self.hist2f_radius,
+            batch_x=batch_scene,
+            batch_y=batch_ctx,
+            max_num_neighbors=300,
+        )
+        if edge_local.numel() == 0:
+            return self._empty_edge_and_relation(scene_pos.device, scene_pos.dtype)
+
+        ctx_head_vec = torch.stack([ctx_head_valid.cos(), ctx_head_valid.sin()], dim=-1)
+        scene_head_vec = torch.stack([scene_head_valid.cos(), scene_head_valid.sin()], dim=-1)
+        ctx_time_lookup = scene_pos.new_tensor([-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.0])
+        ctx_slot_index = torch.remainder(ctx_index, ctx["pos"].shape[1])
+        ctx_time_valid = ctx_time_lookup.index_select(0, ctx_slot_index)
+
+        src_local = edge_local[0]
+        dst_local = edge_local[1]
+        rel_pos = ctx_pos_valid.index_select(0, src_local) - scene_pos_valid.index_select(0, dst_local)
+        rel_head = wrap_angle(
+            ctx_head_valid.index_select(0, src_local) - scene_head_valid.index_select(0, dst_local)
+        )
+        scene_time = scene_pos.new_full((dst_local.numel(),), 2.0)
+        rel_time = ctx_time_valid.index_select(0, src_local) - scene_time
+
+        r_hist2scene = torch.stack(
+            [
+                torch.norm(rel_pos[:, :2], p=2, dim=-1),
+                angle_between_2d_vectors(
+                    ctr_vector=scene_head_vec.index_select(0, dst_local),
+                    nbr_vector=rel_pos[:, :2],
+                ),
+                rel_head,
+                rel_time,
+            ],
+            dim=-1,
+        )
+        r_hist2scene = self.r_hist2f_emb(continuous_inputs=r_hist2scene, categorical_embs=None)
+        edge_index = torch.stack(
+            [
+                ctx_index.index_select(0, src_local),
+                scene_index.index_select(0, dst_local),
+            ],
+            dim=0,
+        )
+        return edge_index, r_hist2scene
+
     def _predict_velocity_field(
         self,
         x_t: Tensor,
@@ -1034,16 +1253,17 @@ class SMARTAgentDecoder(nn.Module):
     ) -> Tensor:
         """현재 context에서 conditional flow velocity field를 예측한다.
 
+        이 구현은 scene-wide 상호작용을 future 4개 token 전체가 아니라
+        anchor당 1개의 scene token에서만 수행한다. 이후 local temporal mixer로
+        4개 segment를 다시 펼친다.
+
         Args:
             x_t: ``[N, 4, 6, 4]`` noisy future segment.
             tau: ``[N, 1]`` flow time.
             tokenized_agent: tokenized agent dict.
             map_feature: encoded map dict.
-                open-loop anchor batch에서는 geometry row 수와 ``pt_token`` row 수가 다를 수 있고,
-                이때는 ``token_index`` 로 geometry row가 어떤 token feature를 읽는지 연결한다.
-            state: history/current state.
-            future_mask: ``[N, 4]``. supervised future query에 실제로 참여시킬
-                agent-segment mask. ``None`` 이면 ``current_valid`` 를 사용한다.
+            state: history/current state dict.
+            future_mask: ``[N, 4]`` supervised future query mask.
 
         Returns:
             ``[N, 4, 6, 4]`` predicted velocity field.
@@ -1052,8 +1272,15 @@ class SMARTAgentDecoder(nn.Module):
         if future_mask is None:
             future_mask = self._expand_agent_mask_to_future_segments(state["current_valid"])
         future_mask = future_mask.bool()
+
         ctx = self._build_history_memory(tokenized_agent, state)
-        future_feat = self._build_future_query(x_t, tau, tokenized_agent)
+        scene_feat, seg_feat = self._build_scene_token(
+            ctx=ctx,
+            x_t=x_t,
+            tau=tau,
+            tokenized_agent=tokenized_agent,
+            future_mask=future_mask,
+        )
 
         future_pos, future_head = segment_end_pose_global(x_t, state["current_pos"], state["current_head"])
         future_head_vec = torch.stack([future_head.cos(), future_head.sin()], dim=-1)
@@ -1064,54 +1291,45 @@ class SMARTAgentDecoder(nn.Module):
             mask=future_mask,
         )
 
+        scene_pos, scene_head, scene_mask = self._build_scene_support_pose(state, future_mask)
+        scene_head_vec = torch.stack([scene_head.cos(), scene_head.sin()], dim=-1)
         ctx_flat = ctx["feat"].flatten(0, 1)
-        edge_index_hist, r_hist = self.build_hist2f_edge(
-            ctx_pos=ctx["pos"],
-            ctx_head=ctx["head"],
-            ctx_valid=ctx["valid"],
-            future_pos=future_pos,
-            future_head=future_head,
-            future_valid=future_mask,
+
+        edge_index_hist, r_hist = self._build_hist2scene_edge(
+            ctx=ctx,
+            scene_pos=scene_pos,
+            scene_head=scene_head,
+            scene_mask=scene_mask,
             batch_agent=tokenized_agent["batch"],
         )
-
-        num_graphs = int(tokenized_agent["num_graphs"])
-        batch_s = torch.cat(
-            [tokenized_agent["batch"] + num_graphs * t for t in range(self.future_num_segments)],
-            dim=0,
-        )
-        edge_index_a2a, r_a2a = self.build_interaction_edge(
-            pos_a=future_pos,
-            head_a=future_head,
-            head_vector_a=future_head_vec,
-            batch_s=batch_s,
-            mask=future_mask,
-        )
-        feat_map, edge_index_pl2a, r_pl2a = self._build_compact_map_attention_inputs(
+        feat_map, edge_index_pl2scene, r_pl2scene = self._build_scene_map_attention_inputs(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            state=state,
-            future_mask=future_mask,
-            batch_s=batch_s,
+            scene_pos=scene_pos,
+            scene_head=scene_head,
+            scene_mask=scene_mask,
+        )
+        edge_index_a2a, r_a2a = self.build_interaction_edge(
+            pos_a=scene_pos.unsqueeze(1),
+            head_a=scene_head.unsqueeze(1),
+            head_vector_a=scene_head_vec.unsqueeze(1),
+            batch_s=tokenized_agent["batch"],
+            mask=scene_mask.unsqueeze(1),
         )
 
         for i in range(self.num_layers):
-            future_feat = self.t_attn_layers[i](future_feat.flatten(0, 1), r_t, edge_index_t).view(
-                n_agent,
-                self.future_num_segments,
-                -1,
-            )
-            future_feat = self.hist2f_attn_layers[i]((ctx_flat, future_feat.flatten(0, 1)), r_hist, edge_index_hist).view(
-                n_agent,
-                self.future_num_segments,
-                -1,
-            )
-            future_tm = future_feat.transpose(0, 1).flatten(0, 1)
-            future_tm = self.pt2a_attn_layers[i]((feat_map, future_tm), r_pl2a, edge_index_pl2a)
-            future_tm = self.a2a_attn_layers[i](future_tm, r_a2a, edge_index_a2a)
-            future_feat = future_tm.view(self.future_num_segments, n_agent, -1).transpose(0, 1)
+            scene_feat = self.hist2f_attn_layers[i]((ctx_flat, scene_feat), r_hist, edge_index_hist)
+            scene_feat = self.pt2a_attn_layers[i]((feat_map, scene_feat), r_pl2scene, edge_index_pl2scene)
+            scene_feat = self.a2a_attn_layers[i](scene_feat, r_a2a, edge_index_a2a)
 
-        flow_pred = self.segment_out_head(future_feat).view(
+            seg_feat = seg_feat + scene_feat.unsqueeze(1)
+            seg_feat = self.t_attn_layers[i](seg_feat.flatten(0, 1), r_t, edge_index_t).view(
+                n_agent,
+                self.future_num_segments,
+                -1,
+            )
+
+        flow_pred = self.segment_out_head(seg_feat).view(
             n_agent,
             self.future_num_segments,
             self.future_segment_points,
