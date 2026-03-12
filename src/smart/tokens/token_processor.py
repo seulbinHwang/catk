@@ -30,6 +30,22 @@ from src.smart.utils import (
 
 
 class TokenProcessor(torch.nn.Module):
+    _AGENT_CONTEXT_OPEN_LOOP = "open_loop"
+    _AGENT_CONTEXT_ROLLOUT = "rollout"
+    _OPEN_LOOP_AGENT_KEYS = (
+        "num_graphs",
+        "type",
+        "shape",
+        "ego_mask",
+        "batch",
+        "valid_mask",
+        "gt_idx",
+        "gt_pos",
+        "gt_heading",
+        "trajectory_token_veh",
+        "trajectory_token_ped",
+        "trajectory_token_cyc",
+    )
 
     def __init__(
         self,
@@ -49,9 +65,13 @@ class TokenProcessor(torch.nn.Module):
         self.n_token_agent = self.agent_token_all_veh.shape[0]
 
     @torch.no_grad()
-    def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
+    def forward(
+        self,
+        data: HeteroData,
+        agent_context: str = _AGENT_CONTEXT_ROLLOUT,
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         tokenized_map = self.tokenize_map(data)
-        tokenized_agent = self.tokenize_agent(data)
+        tokenized_agent = self.tokenize_agent(data, agent_context=agent_context)
         return tokenized_map, tokenized_agent
 
     def init_map_token(self, map_token_traj_path, argmin_sample_len=3) -> None:
@@ -122,7 +142,11 @@ class TokenProcessor(torch.nn.Module):
         }
         return tokenized_map
 
-    def tokenize_agent(self, data: HeteroData) -> Dict[str, Tensor]:
+    def tokenize_agent(
+        self,
+        data: HeteroData,
+        agent_context: str = _AGENT_CONTEXT_ROLLOUT,
+    ) -> Dict[str, Tensor]:
         """
         Args: data["agent"]: Dict
             "valid_mask": [n_agent, n_step], bool
@@ -134,9 +158,12 @@ class TokenProcessor(torch.nn.Module):
             "velocity": [n_agent, n_step, 2], float32
             "shape": [n_agent, 3], float32
         """
+        include_rollout_context = self._requires_rollout_context(agent_context)
+
         # ! collate width/length, traj tokens for current batch
-        agent_shape, token_traj_all, token_traj = self._get_agent_shape_and_token_traj(
-            data["agent"]["type"]
+        agent_shape, token_traj, token_traj_all = self._get_agent_shape_and_token_traj(
+            data["agent"]["type"],
+            include_rollout_context=include_rollout_context,
         )
 
         valid_raw = data["agent"]["valid_mask"]  # [n_agent, n_step]
@@ -161,15 +188,7 @@ class TokenProcessor(torch.nn.Module):
             "type": data["agent"]["type"],
             "shape": data["agent"]["shape"],
             "ego_mask": data["agent"]["role"][:, 0],  # [n_agent]
-            "token_agent_shape": agent_shape,  # [n_agent, 2]
             "batch": data["agent"]["batch"],
-            "clean_heading_full": clean_heading_full,  # [n_agent, n_step]
-            "token_traj_all": token_traj_all,  # [n_agent, n_token, 6, 4, 2]
-            "token_traj": token_traj,  # [n_agent, n_token, 4, 2]
-            # for step {5, 10, ..., 90}
-            "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, n_step=18, 2]
-            "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, n_step=18]
-            "gt_valid_raw": valid[:, self.shift :: self.shift],  # [n_agent, n_step=18]
         }
         # [n_token, 8]
         for k in ["veh", "ped", "cyc"]:
@@ -177,10 +196,21 @@ class TokenProcessor(torch.nn.Module):
                 self, f"agent_token_all_{k}"
             )[:, -1].flatten(1, 2)
 
-        # ! match token for each agent
-        if not self.training:
-            # [n_agent]
-            tokenized_agent["gt_z_raw"] = data["agent"]["position"][:, 10, 2]
+        if include_rollout_context:
+            tokenized_agent.update(
+                {
+                    "token_agent_shape": agent_shape,  # [n_agent, 2]
+                    "clean_heading_full": clean_heading_full,  # [n_agent, n_step]
+                    "token_traj": token_traj,  # [n_agent, n_token, 4, 2]
+                    "token_traj_all": token_traj_all,  # [n_agent, n_token, 6, 4, 2]
+                    # for step {5, 10, ..., 90}
+                    "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, n_step=18, 2]
+                    "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, n_step=18]
+                    "gt_valid_raw": valid[:, self.shift :: self.shift],  # [n_agent, n_step=18]
+                }
+            )
+            if not self.training:
+                tokenized_agent["gt_z_raw"] = data["agent"]["position"][:, 10, 2]
 
         token_dict = self._match_agent_token(
             valid=valid,
@@ -191,6 +221,44 @@ class TokenProcessor(torch.nn.Module):
         )
         tokenized_agent.update(token_dict)
         return tokenized_agent
+
+    @classmethod
+    def to_open_loop_agent_dict(
+        cls,
+        tokenized_agent: Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        """Return only the agent fields needed by open-loop decoding.
+
+        Token matching needs rollout-only geometry tensors such as
+        ``token_traj_all`` and ``token_agent_shape``. Once ``gt_idx`` /
+        ``gt_pos`` / ``gt_heading`` are built, open-loop decoding no longer
+        uses those large tensors, so this helper drops them before the decoder
+        forward to reduce peak memory pressure.
+        """
+        return {
+            key: tokenized_agent[key]
+            for key in cls._OPEN_LOOP_AGENT_KEYS
+            if key in tokenized_agent
+        }
+
+    def tokenize_agent_open_loop(self, data: HeteroData) -> Dict[str, Tensor]:
+        """Tokenize agents for open-loop train/val without rollout-only banks."""
+        return self.tokenize_agent(data, agent_context=self._AGENT_CONTEXT_OPEN_LOOP)
+
+    def tokenize_agent_rollout(self, data: HeteroData) -> Dict[str, Tensor]:
+        """Tokenize agents for closed-loop train/inference with full rollout banks."""
+        return self.tokenize_agent(data, agent_context=self._AGENT_CONTEXT_ROLLOUT)
+
+    def _requires_rollout_context(self, agent_context: str) -> bool:
+        if agent_context == self._AGENT_CONTEXT_OPEN_LOOP:
+            return False
+        if agent_context == self._AGENT_CONTEXT_ROLLOUT:
+            return True
+        raise ValueError(
+            f"Unknown agent_context={agent_context!r}. "
+            f"Expected one of {self._AGENT_CONTEXT_OPEN_LOOP!r}, "
+            f"{self._AGENT_CONTEXT_ROLLOUT!r}."
+        )
 
     def _match_agent_token(
         self,
@@ -347,20 +415,31 @@ class TokenProcessor(torch.nn.Module):
         return valid, pos, heading, vel
 
     def _get_agent_shape_and_token_traj(
-        self, agent_type: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        self,
+        agent_type: Tensor,
+        include_rollout_context: bool,
+    ) -> Tuple[Tensor, Tensor, Tensor | None]:
         """
         agent_shape: [n_agent, 2]
-        token_traj_all: [n_agent, n_token, 6, 4, 2]
         token_traj: [n_agent, n_token, 4, 2]
+        token_traj_all: [n_agent, n_token, 6, 4, 2] or None
         """
+        n_agent = agent_type.shape[0]
+        n_token = self.n_token_agent
+        device = agent_type.device
+        dtype = self.agent_token_all_veh.dtype
         agent_type_masks = {
             "veh": agent_type == 0,
             "ped": agent_type == 1,
             "cyc": agent_type == 2,
         }
-        agent_shape = 0.0
-        token_traj_all = 0.0
+        agent_shape = torch.zeros((n_agent, 2), device=device, dtype=dtype)
+        token_traj = torch.zeros((n_agent, n_token, 4, 2), device=device, dtype=dtype)
+        token_traj_all = (
+            torch.zeros((n_agent, n_token, 6, 4, 2), device=device, dtype=dtype)
+            if include_rollout_context
+            else None
+        )
         for k, mask in agent_type_masks.items():
             if k == "veh":
                 width = 2.0
@@ -373,9 +452,9 @@ class TokenProcessor(torch.nn.Module):
                 length = 1.0
             agent_shape += torch.stack([width * mask, length * mask], dim=-1)
 
-            token_traj_all += mask[:, None, None, None, None] * (
-                getattr(self, f"agent_token_all_{k}").unsqueeze(0)
-            )
+            token_bank = getattr(self, f"agent_token_all_{k}")
+            token_traj += mask[:, None, None, None] * token_bank[:, -1].unsqueeze(0)
+            if token_traj_all is not None:
+                token_traj_all += mask[:, None, None, None, None] * token_bank.unsqueeze(0)
 
-        token_traj = token_traj_all[:, :, -1, :, :].contiguous()
-        return agent_shape, token_traj_all, token_traj
+        return agent_shape, token_traj.contiguous(), token_traj_all

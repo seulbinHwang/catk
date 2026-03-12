@@ -149,7 +149,11 @@ class SMART(LightningModule):
         Returns:
             스칼라 total loss.
         """
-        tokenized_map, tokenized_agent = self.token_processor(data)
+        tokenized_map = self.token_processor.tokenize_map(data)
+        if self.use_closed_loop_finetune:
+            tokenized_agent = self.token_processor.tokenize_agent_rollout(data)
+        else:
+            tokenized_agent = self.token_processor.tokenize_agent_open_loop(data)
         map_feature = self.encoder.encode_map(tokenized_map)
 
         total_loss = 0.0
@@ -201,8 +205,19 @@ class SMART(LightningModule):
         return total_loss
 
     def validation_step(self, data, batch_idx):
-        tokenized_map, tokenized_agent = self.token_processor(data)
+        tokenized_map = self.token_processor.tokenize_map(data)
         map_feature = self.encoder.encode_map(tokenized_map)
+
+        tokenized_agent_rollout = None
+        tokenized_agent_open_loop = None
+        if self.val_closed_loop:
+            tokenized_agent_rollout = self.token_processor.tokenize_agent_rollout(data)
+            if self.val_open_loop:
+                tokenized_agent_open_loop = self.token_processor.to_open_loop_agent_dict(
+                    tokenized_agent_rollout
+                )
+        elif self.val_open_loop:
+            tokenized_agent_open_loop = self.token_processor.tokenize_agent_open_loop(data)
 
         if self.val_open_loop:
             total_loss = 0.0
@@ -212,7 +227,7 @@ class SMART(LightningModule):
             anchor_steps = self.anchor_steps
             pred_batch = self.encoder.forward_anchor_batch_from_map(
                 map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
+                tokenized_agent=tokenized_agent_open_loop,
                 agent_raw=data["agent"],
                 anchor_steps=anchor_steps,
             )
@@ -234,7 +249,7 @@ class SMART(LightningModule):
             pred_traj, pred_z, pred_head = [], [], []
             for _ in range(self.n_rollout_closed_val):
                 pred = self.encoder.agent_encoder.inference(
-                    tokenized_agent=tokenized_agent,
+                    tokenized_agent=tokenized_agent_rollout,
                     map_feature=map_feature,
                     agent_raw=data["agent"],
                     sampling_scheme=self.validation_rollout_sampling,
@@ -329,7 +344,8 @@ class SMART(LightningModule):
         return [optimizer], [lr_scheduler]
 
     def test_step(self, data, batch_idx):
-        tokenized_map, tokenized_agent = self.token_processor(data)
+        tokenized_map = self.token_processor.tokenize_map(data)
+        tokenized_agent = self.token_processor.tokenize_agent_rollout(data)
         pred_traj, pred_z, pred_head = [], [], []
         for _ in range(self.n_rollout_closed_val):
             pred = self.encoder.inference(
