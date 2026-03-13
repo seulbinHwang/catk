@@ -48,6 +48,9 @@ model_config:
     future_num_segments: 4
     future_segment_points: 6
     ode_steps: 4
+    scene_support_times_s: [0.0, 1.0, 2.0]
+    temporal_bidirectional: true
+    segment_scene_modulation: true
   wosac_submission:
     is_active: false
     method_name: "SMART-tiny-Flow"

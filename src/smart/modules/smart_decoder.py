@@ -42,6 +42,9 @@ class SMARTDecoder(nn.Module):
         future_segment_points: int = 6,
         ode_steps: int = 4,
         hist2f_radius: Optional[float] = None,
+        scene_support_times_s: Optional[Sequence[float]] = None,
+        temporal_bidirectional: bool = True,
+        segment_scene_modulation: bool = True,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -73,6 +76,9 @@ class SMARTDecoder(nn.Module):
             future_segment_points=future_segment_points,
             ode_steps=ode_steps,
             hist2f_radius=hist2f_radius,
+            scene_support_times_s=scene_support_times_s,
+            temporal_bidirectional=temporal_bidirectional,
+            segment_scene_modulation=segment_scene_modulation,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:

@@ -64,6 +64,9 @@ class SMARTAgentDecoder(nn.Module):
         future_segment_points: int = 6,
         ode_steps: int = 4,
         hist2f_radius: Optional[float] = None,
+        scene_support_times_s: Optional[Sequence[float]] = None,
+        temporal_bidirectional: bool = True,
+        segment_scene_modulation: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -81,6 +84,17 @@ class SMARTAgentDecoder(nn.Module):
         self.future_num_segments = future_num_segments
         self.future_segment_points = future_segment_points
         self.ode_steps = ode_steps
+        if scene_support_times_s is None:
+            scene_support_times_s = (0.0, 1.0, 2.0)
+        if len(scene_support_times_s) == 0:
+            raise ValueError(
+                "scene_support_times_s must contain at least one support time."
+            )
+        self.scene_support_times_s = tuple(sorted({float(time_s) for time_s in scene_support_times_s}))
+        if self.scene_support_times_s[0] < 0.0:
+            raise ValueError("scene_support_times_s must be non-negative.")
+        self.temporal_bidirectional = temporal_bidirectional
+        self.segment_scene_modulation = segment_scene_modulation
         self.current_step = num_historical_steps - 1
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
@@ -99,7 +113,10 @@ class SMARTAgentDecoder(nn.Module):
         self.token_emb_cyc = MLPEmbedding(input_dim=8, hidden_dim=hidden_dim)
         self.fusion_emb = MLPEmbedding(input_dim=hidden_dim * 2, hidden_dim=hidden_dim)
         self.current_anchor_emb = MLPEmbedding(input_dim=5, hidden_dim=hidden_dim)
+        self.segment_time_emb = FourierEmbedding(input_dim=1, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
         self.future_segment_emb = MLPEmbedding(input_dim=24, hidden_dim=hidden_dim)
+        self.scene_to_segment_emb = MLPEmbedding(input_dim=hidden_dim * 2, hidden_dim=hidden_dim)
+        self.scene_to_segment_gate = MLPLayer(hidden_dim * 3, hidden_dim, hidden_dim)
         self.segment_out_head = MLPLayer(hidden_dim, hidden_dim, 24)
 
         self.t_attn_layers = nn.ModuleList(
@@ -467,14 +484,66 @@ class SMARTAgentDecoder(nn.Module):
         seg_feat = seg_feat + flow_t.unsqueeze(1)
         return seg_feat
 
-    def _build_reference_future_pose(self, state: Dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """현재 상태만으로 map lookup용 deterministic 2초 reference pose를 만든다.
+    def _get_segment_end_times(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """미래 segment 마지막 시각을 만든다.
 
-        Query feature와 dynamic future graph는 noisy ``x_t``를 그대로 사용하고,
-        정적인 map cross-attention만 현재 상태 기반 reference를 사용해 graph support를
-        안정화한다.
+        Args:
+            device: 결과 텐서를 만들 장치.
+            dtype: 결과 텐서 자료형.
+
+        Returns:
+            ``[S]`` 형태의 시각 텐서. 각 값은 초 단위이며
+            ``(0.5, 1.0, 1.5, 2.0)`` 같은 segment 끝 시각을 뜻한다.
         """
-        dt = state["current_pos"].new_tensor([0.5, 1.0, 1.5, 2.0])
+        segment_dt_s = 0.1 * float(self.future_segment_points - 1)
+        return torch.arange(
+            1,
+            self.future_num_segments + 1,
+            device=device,
+            dtype=dtype,
+        ) * segment_dt_s
+
+    def _get_scene_support_times(self, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """scene token이 문맥을 읽을 support 시각 목록을 만든다.
+
+        Args:
+            device: 결과 텐서를 만들 장치.
+            dtype: 결과 텐서 자료형.
+
+        Returns:
+            ``[S_support]`` 형태의 시각 텐서. 각 값은 초 단위다.
+        """
+        return torch.as_tensor(self.scene_support_times_s, device=device, dtype=dtype)
+
+    def _build_reference_future_pose(
+        self,
+        state: Dict[str, Tensor],
+        query_times_s: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor]:
+        """현재 상태만으로 support용 reference pose를 만든다.
+
+        Args:
+            state: 현재 state dict.
+                - ``current_pos``: ``[N, 2]``
+                - ``current_head``: ``[N]``
+                - ``current_vel``: ``[N, 2]``
+                - ``current_yaw_rate``: ``[N]``
+            query_times_s: ``[S_query]``. pose를 만들 시각 목록.
+                ``None``이면 각 future segment의 끝 시각을 사용한다.
+
+        Returns:
+            tuple:
+                - ``future_pos``: ``[N, S_query, 2]``
+                - ``future_head``: ``[N, S_query]``
+        """
+        if query_times_s is None:
+            dt = self._get_segment_end_times(
+                device=state["current_pos"].device,
+                dtype=state["current_pos"].dtype,
+            )
+        else:
+            dt = query_times_s.to(device=state["current_pos"].device, dtype=state["current_pos"].dtype)
+
         head_now = state["current_head"]
         vel_now = state["current_vel"]
         yaw_rate = state["current_yaw_rate"]
@@ -515,8 +584,27 @@ class SMARTAgentDecoder(nn.Module):
         head_vector_a: Tensor,
         mask: Tensor,
         inference_mask: Optional[Tensor] = None,
+        causal: Optional[bool] = None,
     ) -> tuple[Tensor, Tensor]:
-        """같은 agent 안의 causal temporal edge를 만든다."""
+        """같은 agent 안의 temporal edge를 만든다.
+
+        Args:
+            pos_a: ``[N, S, 2]``. 각 segment 대표 위치.
+            head_a: ``[N, S]``. 각 segment 대표 heading.
+            head_vector_a: ``[N, S, 2]``. 각 segment heading 단위 벡터.
+            mask: ``[N, S]``. 유효 mask.
+            inference_mask: ``[N, S]``. 선택된 query만 연결할 때 쓰는 mask.
+            causal: ``True``면 앞에서 뒤로만 연결하고, ``False``면
+                양방향으로 연결한다. ``None``이면 설정값을 따른다.
+
+        Returns:
+            tuple:
+                - ``edge_index_t``: ``[2, E]``
+                - ``r_t``: ``[E, D]``
+        """
+        if causal is None:
+            causal = not self.temporal_bidirectional
+
         pos_t = pos_a.flatten(0, 1)
         head_t = head_a.flatten(0, 1)
         head_vector_t = head_vector_a.flatten(0, 1)
@@ -528,8 +616,12 @@ class SMARTAgentDecoder(nn.Module):
         else:
             mask_t = mask.unsqueeze(2) & mask.unsqueeze(1)
         edge_index_t = dense_to_sparse(mask_t)[0]
-        edge_index_t = edge_index_t[:, edge_index_t[1] > edge_index_t[0]]
-        edge_index_t = edge_index_t[:, edge_index_t[1] - edge_index_t[0] <= self.time_span / self.shift]
+        edge_index_t = edge_index_t[:, edge_index_t[0] != edge_index_t[1]]
+        if causal:
+            edge_index_t = edge_index_t[:, edge_index_t[1] > edge_index_t[0]]
+        edge_delta = edge_index_t[0] - edge_index_t[1]
+        edge_index_t = edge_index_t[:, edge_delta.abs() <= self.time_span / self.shift]
+        edge_delta = edge_index_t[0] - edge_index_t[1]
         rel_pos_t = pos_t[edge_index_t[0]] - pos_t[edge_index_t[1]]
         rel_head_t = wrap_angle(head_t[edge_index_t[0]] - head_t[edge_index_t[1]])
         r_t = torch.stack(
@@ -537,7 +629,7 @@ class SMARTAgentDecoder(nn.Module):
                 torch.norm(rel_pos_t[:, :2], p=2, dim=-1),
                 angle_between_2d_vectors(ctr_vector=head_vector_t[edge_index_t[1]], nbr_vector=rel_pos_t[:, :2]),
                 rel_head_t,
-                edge_index_t[0] - edge_index_t[1],
+                edge_delta,
             ],
             dim=-1,
         )
@@ -1075,8 +1167,8 @@ class SMARTAgentDecoder(nn.Module):
         self,
         state: Dict[str, Tensor],
         future_mask: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """scene-wide 상호작용에 사용할 대표 pose를 만든다.
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """scene token이 문맥을 읽을 support pose 묶음을 만든다.
 
         Args:
             state: 현재 state dict.
@@ -1086,15 +1178,164 @@ class SMARTAgentDecoder(nn.Module):
 
         Returns:
             tuple:
-                - ``scene_pos``: ``[N, 2]`` 대표 위치.
-                - ``scene_head``: ``[N]`` 대표 heading.
-                - ``scene_mask``: ``[N]`` 대표 token 유효 mask.
+                - ``scene_pos``: ``[N, S_support, 2]`` support 위치 묶음.
+                - ``scene_head``: ``[N, S_support]`` support heading 묶음.
+                - ``scene_mask``: ``[N, S_support]`` support 유효 mask.
+                - ``scene_time_s``: ``[S_support]`` support 시각 목록.
         """
-        ref_pos, ref_head = self._build_reference_future_pose(state)
-        scene_pos = ref_pos[:, -1]
-        scene_head = ref_head[:, -1]
-        scene_mask = future_mask.any(dim=1)
-        return scene_pos, scene_head, scene_mask
+        scene_time_s = self._get_scene_support_times(
+            device=state["current_pos"].device,
+            dtype=state["current_pos"].dtype,
+        )
+        scene_pos, scene_head = self._build_reference_future_pose(state, query_times_s=scene_time_s)
+        scene_mask = future_mask.any(dim=1).unsqueeze(1).expand(-1, scene_time_s.numel())
+        return scene_pos, scene_head, scene_mask, scene_time_s
+
+    def _build_scene_support_graphs(
+        self,
+        ctx: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        state: Dict[str, Tensor],
+        future_mask: Tensor,
+    ) -> List[Dict[str, Tensor]]:
+        """여러 support pose에서 읽을 scene 문맥 그래프를 한 번에 만든다.
+
+        Args:
+            ctx: history memory dict.
+                - ``pos``: ``[N, 7, 2]``
+                - ``head``: ``[N, 7]``
+                - ``valid``: ``[N, 7]``
+            tokenized_agent: tokenized agent dict.
+            map_feature: encoded map dict.
+            state: 현재 state dict.
+            future_mask: ``[N, 4]`` future 유효 mask.
+
+        Returns:
+            support 개수만큼의 그래프 정보 dict 목록. 각 dict는 아래 key를 가진다.
+                - ``feat_map``: ``[M_keep, D]``
+                - ``edge_index_hist``: ``[2, E_hist]``
+                - ``r_hist``: ``[E_hist, D]``
+                - ``edge_index_pl2scene``: ``[2, E_map]``
+                - ``r_pl2scene``: ``[E_map, D]``
+                - ``edge_index_a2a``: ``[2, E_a2a]``
+                - ``r_a2a``: ``[E_a2a, D]``
+        """
+        scene_pos, scene_head, scene_mask, scene_time_s = self._build_scene_support_pose(state, future_mask)
+        support_graphs: List[Dict[str, Tensor]] = []
+
+        for support_idx in range(scene_time_s.numel()):
+            support_pos = scene_pos[:, support_idx]
+            support_head = scene_head[:, support_idx]
+            support_mask = scene_mask[:, support_idx]
+            support_head_vec = torch.stack([support_head.cos(), support_head.sin()], dim=-1)
+
+            edge_index_hist, r_hist = self._build_hist2scene_edge(
+                ctx=ctx,
+                scene_pos=support_pos,
+                scene_head=support_head,
+                scene_mask=support_mask,
+                batch_agent=tokenized_agent["batch"],
+                scene_time_s=float(scene_time_s[support_idx].item()),
+            )
+            feat_map, edge_index_pl2scene, r_pl2scene = self._build_scene_map_attention_inputs(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                scene_pos=support_pos,
+                scene_head=support_head,
+                scene_mask=support_mask,
+            )
+            edge_index_a2a, r_a2a = self.build_interaction_edge(
+                pos_a=support_pos.unsqueeze(1),
+                head_a=support_head.unsqueeze(1),
+                head_vector_a=support_head_vec.unsqueeze(1),
+                batch_s=tokenized_agent["batch"],
+                mask=support_mask.unsqueeze(1),
+            )
+            support_graphs.append(
+                {
+                    "feat_map": feat_map,
+                    "edge_index_hist": edge_index_hist,
+                    "r_hist": r_hist,
+                    "edge_index_pl2scene": edge_index_pl2scene,
+                    "r_pl2scene": r_pl2scene,
+                    "edge_index_a2a": edge_index_a2a,
+                    "r_a2a": r_a2a,
+                }
+            )
+        return support_graphs
+
+    def _apply_scene_support_attention(
+        self,
+        scene_feat: Tensor,
+        ctx_flat: Tensor,
+        support_graphs: List[Dict[str, Tensor]],
+        layer_idx: int,
+    ) -> Tensor:
+        """여러 support pose에서 읽은 scene 문맥을 하나의 token에 다시 모은다.
+
+        Args:
+            scene_feat: ``[N, D]`` 현재 scene token feature.
+            ctx_flat: ``[N * 7, D]`` history memory를 평탄화한 feature.
+            support_graphs: support별 그래프 정보 목록.
+            layer_idx: 현재 attention layer 번호.
+
+        Returns:
+            ``[N, D]`` 업데이트된 scene token feature.
+        """
+        support_scene_feat_list: List[Tensor] = []
+        for graph in support_graphs:
+            support_scene_feat = self.hist2f_attn_layers[layer_idx](
+                (ctx_flat, scene_feat),
+                graph["r_hist"],
+                graph["edge_index_hist"],
+            )
+            support_scene_feat = self.pt2a_attn_layers[layer_idx](
+                (graph["feat_map"], support_scene_feat),
+                graph["r_pl2scene"],
+                graph["edge_index_pl2scene"],
+            )
+            support_scene_feat = self.a2a_attn_layers[layer_idx](
+                support_scene_feat,
+                graph["r_a2a"],
+                graph["edge_index_a2a"],
+            )
+            support_scene_feat_list.append(support_scene_feat)
+
+        if len(support_scene_feat_list) == 1:
+            return support_scene_feat_list[0]
+        return torch.stack(support_scene_feat_list, dim=0).mean(dim=0)
+
+    def _inject_scene_context_to_segments(self, seg_feat: Tensor, scene_feat: Tensor) -> Tensor:
+        """scene 문맥을 segment마다 다르게 주입한다.
+
+        Args:
+            seg_feat: ``[N, 4, D]`` segment feature.
+            scene_feat: ``[N, D]`` scene token feature.
+
+        Returns:
+            ``[N, 4, D]`` scene 문맥이 반영된 segment feature.
+        """
+        if not self.segment_scene_modulation:
+            return seg_feat + scene_feat.unsqueeze(1)
+
+        n_agent = seg_feat.shape[0]
+        seg_idx = torch.arange(self.future_num_segments, device=seg_feat.device)
+        seg_time_s = self._get_segment_end_times(seg_feat.device, seg_feat.dtype).unsqueeze(-1)
+        seg_cond = self.segment_idx_emb(seg_idx).unsqueeze(0)
+        seg_cond = seg_cond + self.segment_time_emb(continuous_inputs=seg_time_s).unsqueeze(0)
+        seg_cond = seg_cond.expand(n_agent, -1, -1)
+
+        scene_expand = scene_feat.unsqueeze(1).expand(-1, self.future_num_segments, -1)
+        scene_mod = self.scene_to_segment_emb(
+            torch.cat([scene_expand, seg_cond], dim=-1).reshape(-1, self.hidden_dim * 2)
+        ).view(n_agent, self.future_num_segments, -1)
+        scene_gate = torch.sigmoid(
+            self.scene_to_segment_gate(
+                torch.cat([seg_feat, scene_expand, seg_cond], dim=-1).reshape(-1, self.hidden_dim * 3)
+            )
+        ).view(n_agent, self.future_num_segments, -1)
+        return seg_feat + scene_gate * scene_mod
 
     def _build_scene_map_attention_inputs(
         self,
@@ -1160,6 +1401,7 @@ class SMARTAgentDecoder(nn.Module):
         scene_head: Tensor,
         scene_mask: Tensor,
         batch_agent: Tensor,
+        scene_time_s: float,
     ) -> tuple[Tensor, Tensor]:
         """history slot에서 scene token 하나로 가는 sparse edge를 만든다.
 
@@ -1172,6 +1414,7 @@ class SMARTAgentDecoder(nn.Module):
             scene_head: ``[N]`` 대표 heading.
             scene_mask: ``[N]`` 대표 token 유효 mask.
             batch_agent: ``[N]`` agent batch id.
+            scene_time_s: scene support 시각. 단위는 초다.
 
         Returns:
             tuple:
@@ -1217,7 +1460,7 @@ class SMARTAgentDecoder(nn.Module):
         rel_head = wrap_angle(
             ctx_head_valid.index_select(0, src_local) - scene_head_valid.index_select(0, dst_local)
         )
-        scene_time = scene_pos.new_full((dst_local.numel(),), 2.0)
+        scene_time = scene_pos.new_full((dst_local.numel(),), float(scene_time_s))
         rel_time = ctx_time_valid.index_select(0, src_local) - scene_time
 
         r_hist2scene = torch.stack(
@@ -1254,8 +1497,10 @@ class SMARTAgentDecoder(nn.Module):
         """현재 context에서 conditional flow velocity field를 예측한다.
 
         이 구현은 scene-wide 상호작용을 future 4개 token 전체가 아니라
-        anchor당 1개의 scene token에서만 수행한다. 이후 local temporal mixer로
-        4개 segment를 다시 펼친다.
+        anchor당 1개의 scene token에서 수행한다. 다만 scene token이 문맥을
+        읽는 support pose는 하나가 아니라 여러 개를 쓰고, segment temporal은
+        양방향으로 다듬는다. 또한 scene 문맥은 segment마다 다른 방식으로
+        주입한다.
 
         Args:
             x_t: ``[N, 4, 6, 4]`` noisy future segment.
@@ -1289,40 +1534,26 @@ class SMARTAgentDecoder(nn.Module):
             head_a=future_head,
             head_vector_a=future_head_vec,
             mask=future_mask,
+            causal=False,
         )
 
-        scene_pos, scene_head, scene_mask = self._build_scene_support_pose(state, future_mask)
-        scene_head_vec = torch.stack([scene_head.cos(), scene_head.sin()], dim=-1)
         ctx_flat = ctx["feat"].flatten(0, 1)
-
-        edge_index_hist, r_hist = self._build_hist2scene_edge(
+        support_graphs = self._build_scene_support_graphs(
             ctx=ctx,
-            scene_pos=scene_pos,
-            scene_head=scene_head,
-            scene_mask=scene_mask,
-            batch_agent=tokenized_agent["batch"],
-        )
-        feat_map, edge_index_pl2scene, r_pl2scene = self._build_scene_map_attention_inputs(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            scene_pos=scene_pos,
-            scene_head=scene_head,
-            scene_mask=scene_mask,
-        )
-        edge_index_a2a, r_a2a = self.build_interaction_edge(
-            pos_a=scene_pos.unsqueeze(1),
-            head_a=scene_head.unsqueeze(1),
-            head_vector_a=scene_head_vec.unsqueeze(1),
-            batch_s=tokenized_agent["batch"],
-            mask=scene_mask.unsqueeze(1),
+            state=state,
+            future_mask=future_mask,
         )
 
         for i in range(self.num_layers):
-            scene_feat = self.hist2f_attn_layers[i]((ctx_flat, scene_feat), r_hist, edge_index_hist)
-            scene_feat = self.pt2a_attn_layers[i]((feat_map, scene_feat), r_pl2scene, edge_index_pl2scene)
-            scene_feat = self.a2a_attn_layers[i](scene_feat, r_a2a, edge_index_a2a)
-
-            seg_feat = seg_feat + scene_feat.unsqueeze(1)
+            scene_feat = self._apply_scene_support_attention(
+                scene_feat=scene_feat,
+                ctx_flat=ctx_flat,
+                support_graphs=support_graphs,
+                layer_idx=i,
+            )
+            seg_feat = self._inject_scene_context_to_segments(seg_feat, scene_feat)
             seg_feat = self.t_attn_layers[i](seg_feat.flatten(0, 1), r_t, edge_index_t).view(
                 n_agent,
                 self.future_num_segments,
