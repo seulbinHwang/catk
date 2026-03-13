@@ -39,9 +39,9 @@ trainer:
 # effective batch = 8(per-device) * 6(gpu) * 2(accum) = 96
 # flow head가 기존 NTP head보다 무거워서, 공식 SMART-tiny 설정(batch 10)보다 한 단계 보수적으로 둔다.
 data:
-  train_batch_size: 7
-  val_batch_size: 7
-  test_batch_size: 7
-  num_workers: 7
+  train_batch_size: 12
+  val_batch_size: 12
+  test_batch_size: 12
+  num_workers: 12
 
 action: fit
