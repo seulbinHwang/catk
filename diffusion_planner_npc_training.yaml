@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: hsb-npc-training2
+  name: hsb-npc-training
   namespace: p-pnc
   annotations:
     sidecar.istio.io/inject: "false"
@@ -22,7 +22,7 @@ spec:
   volumes:
     - name: nuplan-storage
       persistentVolumeClaim:
-        claimName: temp-volume
+        claimName: pvc-rbd-diffusion-planner-djkim
     - name: dshm2
       emptyDir:
         medium: Memory
