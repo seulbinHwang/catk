@@ -314,20 +314,30 @@ class SMARTAgentDecoder(nn.Module):
         """현재 anchor 상태만으로 a2a edge와 relation을 만든다.
 
         relation에는 기존 거리/방향/상대 heading에 더해,
-        target anchor local frame 기준 상대 속도 2개를 넣는다.
+        target anchor local frame 기준 상대 이동량 2개를 넣는다.
         """
-        vel_a = torch.cat(
+        # 이 backbone은 다른 continuous edge feature를 별도 정규화하지 않는다.
+        # 그래서 a2a motion feature도 m/s 대신 coarse 0.5초 step 이동량[m]으로 맞춘다.
+        motion_valid = torch.cat(
             [
-                pos_a.new_zeros(pos_a.shape[0], 1, 2),
-                (pos_a[:, 1:] - pos_a[:, :-1]) / (self.shift * 0.1),
+                mask.new_zeros(mask.shape[0], 1),
+                mask[:, 1:] & mask[:, :-1],
             ],
             dim=1,
-        )  # [n_agent, n_step, 2]
+        )
+        motion_a = torch.cat(
+            [
+                pos_a.new_zeros(pos_a.shape[0], 1, 2),
+                pos_a[:, 1:] - pos_a[:, :-1],
+            ],
+            dim=1,
+        )  # [n_agent, n_step, 2], coarse 0.5초 step displacement in meters
+        motion_a = motion_a.masked_fill(~motion_valid.unsqueeze(-1), 0.0)
         mask = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        vel_s = vel_a.transpose(0, 1).reshape(-1, 2)
+        motion_s = motion_a.transpose(0, 1).reshape(-1, 2)
 
         edge_index_a2a = radius_graph(
             x=pos_s[:, :2],
@@ -342,11 +352,11 @@ class SMARTAgentDecoder(nn.Module):
             head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]]
         )
 
-        rel_vel = vel_s[edge_index_a2a[0]] - vel_s[edge_index_a2a[1]]
+        rel_motion = motion_s[edge_index_a2a[0]] - motion_s[edge_index_a2a[1]]
         target_heading = head_vector_s[edge_index_a2a[1]]
         target_left = torch.stack([-target_heading[:, 1], target_heading[:, 0]], dim=-1)
-        rel_vel_long = (rel_vel * target_heading).sum(dim=-1)
-        rel_vel_lat = (rel_vel * target_left).sum(dim=-1)
+        rel_motion_long = (rel_motion * target_heading).sum(dim=-1)
+        rel_motion_lat = (rel_motion * target_left).sum(dim=-1)
 
         r_a2a = torch.stack(
             [
@@ -356,8 +366,8 @@ class SMARTAgentDecoder(nn.Module):
                     nbr_vector=rel_pos_a2a[:, :2],
                 ),
                 rel_head_a2a,
-                rel_vel_long,
-                rel_vel_lat,
+                rel_motion_long,
+                rel_motion_lat,
             ],
             dim=-1,
         )
