@@ -67,9 +67,9 @@ class SMARTFlow(LightningModule):
             anchor_mask_key="flow_train_mask",
         )
         loss, ade, fde = self._open_loop_loss_and_metrics(pred)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, batch_size=1)
-        self.log("train/ADE2s", ade, on_step=False, on_epoch=True, batch_size=1)
-        self.log("train/FDE2s", fde, on_step=False, on_epoch=True, batch_size=1)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/ADE2s", ade, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/FDE2s", fde, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         return loss
 
     def validation_step(self, data, batch_idx):

@@ -73,7 +73,10 @@ class FlowTokenProcessor(TokenProcessor):
             flow_clean_norm[:, anchor_offset, :, 2] = future_head_local.cos()
             flow_clean_norm[:, anchor_offset, :, 3] = future_head_local.sin()
 
-        train_mask = data["agent"]["train_mask"].bool()
+        if "train_mask" in data["agent"]:
+            train_mask = data["agent"]["train_mask"].bool()
+        else:
+            train_mask = torch.ones(num_agent, device=device, dtype=torch.bool)
         tokenized_agent.update(
             {
                 "ctx_sampled_idx": ctx_sampled_idx,

@@ -30,10 +30,20 @@ class MultiDataset(Dataset):
         tfrecord_dir: Optional[str] = None,
     ) -> None:
         raw_dir = Path(raw_dir)
+        if not raw_dir.exists():
+            raise FileNotFoundError(f"Dataset directory does not exist: {raw_dir}")
+        if not raw_dir.is_dir():
+            raise NotADirectoryError(f"Dataset path is not a directory: {raw_dir}")
         self._raw_paths = [p.as_posix() for p in sorted(raw_dir.glob("*"))]
         self._num_samples = len(self._raw_paths)
 
         self._tfrecord_dir = Path(tfrecord_dir) if tfrecord_dir is not None else None
+        if self._tfrecord_dir is not None and not self._tfrecord_dir.exists():
+            raise FileNotFoundError(
+                f"TFRecord directory does not exist: {self._tfrecord_dir}"
+            )
+        if self._num_samples == 0:
+            raise FileNotFoundError(f"No cached samples found under: {raw_dir}")
 
         log.info("Length of {} dataset is ".format(raw_dir) + str(self._num_samples))
         super(MultiDataset, self).__init__(

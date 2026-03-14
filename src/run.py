@@ -39,6 +39,16 @@ def run(cfg: DictConfig) -> None:
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
 
+    if cfg.trainer.get("accelerator") == "gpu":
+        requested_devices = cfg.trainer.get("devices")
+        if isinstance(requested_devices, int) and requested_devices > 0:
+            visible_cuda_devices = torch.cuda.device_count()
+            if visible_cuda_devices < requested_devices:
+                raise ValueError(
+                    f"Requested {requested_devices} GPU(s), but only {visible_cuda_devices} "
+                    "CUDA device(s) are visible. Check CUDA_VISIBLE_DEVICES and trainer.devices."
+                )
+
     log.info(f"Instantiating datamodule <{cfg.data._target_}>")
     datamodule: LightningDataModule = hydra.utils.instantiate(cfg.data)
 
