@@ -3,13 +3,8 @@
 # NVIDIA-proprietary are not a contribution and subject to the following terms and conditions:
 # SPDX-FileCopyrightText: Copyright (c) <year> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+
+from __future__ import annotations
 
 import torch
 
@@ -19,28 +14,29 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 
 def set_model_for_finetuning(model: torch.nn.Module, finetune: bool) -> None:
-    def _unfreeze(module: torch.nn.Module) -> None:
+    """Closed-loop fine-tuning용으로 필요한 부분만 학습 가능하게 바꾼다."""
+
+    def _unfreeze(module: torch.nn.Module, name: str) -> None:
         for p in module.parameters():
             p.requires_grad = True
+        log.info(f"Unfreezing {name}")
 
-    if finetune:
-        for p in model.parameters():
-            p.requires_grad = False
+    if not finetune:
+        return
 
-        try:
-            _unfreeze(model.agent_encoder.token_predict_head)
-            log.info("Unfreezing token_predict_head")
-        except:
-            log.info("No token_predict_head in model.agent_encoder")
+    for p in model.parameters():
+        p.requires_grad = False
 
-        try:
-            _unfreeze(model.agent_encoder.gmm_logits_head)
-            _unfreeze(model.agent_encoder.gmm_pose_head)
-            # _unfreeze(model.agent_encoder.gmm_gmm_covpose_head)
-            log.info("Unfreezing gmm heads")
-        except:
-            log.info("No gmm_logits_head in model.agent_encoder")
-
-        _unfreeze(model.agent_encoder.t_attn_layers)
-        _unfreeze(model.agent_encoder.pt2a_attn_layers)
-        _unfreeze(model.agent_encoder.a2a_attn_layers)
+    agent = model.agent_encoder
+    _unfreeze(agent.current_anchor_emb, "current_anchor_emb")
+    _unfreeze(agent.future_segment_emb, "future_segment_emb")
+    _unfreeze(agent.segment_out_head, "segment_out_head")
+    _unfreeze(agent.flow_time_emb, "flow_time_emb")
+    _unfreeze(agent.hist2f_attn_layers, "hist2f_attn_layers")
+    _unfreeze(agent.t_attn_layers, "t_attn_layers")
+    _unfreeze(agent.pt2a_attn_layers, "pt2a_attn_layers")
+    _unfreeze(agent.a2a_attn_layers, "a2a_attn_layers")
+    _unfreeze(agent.r_t_emb, "r_t_emb")
+    _unfreeze(agent.r_pt2a_emb, "r_pt2a_emb")
+    _unfreeze(agent.r_a2a_emb, "r_a2a_emb")
+    _unfreeze(agent.r_hist2f_emb, "r_hist2f_emb")

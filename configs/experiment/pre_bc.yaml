@@ -1,32 +1,30 @@
 # @package _global_
 
 defaults:
-  # - override /trainer: ddp
   - override /model: smart
 
 model:
   model_config:
     lr: 5e-4
     lr_min_ratio: 1e-2
-    token_processor:
-      map_token_sampling: # open-loop
-        num_k: 1 # for k nearest neighbors
-        temp: 1.0 # uniform sampling
-      agent_token_sampling: # closed-loop
-        num_k: 1 # for k nearest neighbors
-        temp: 1.0
+    anchor_chunk_k: 4
+    use_closed_loop_finetune: false
+    finetune: false
 
 ckpt_path: null
-# ckpt_path: CKPT_FOR_RESUME.ckpt # to resume training
 
 trainer:
   limit_train_batches: 1.0
   limit_val_batches: 0.1
   check_val_every_n_epoch: 1
   max_epochs: 64
+  accumulate_grad_batches: 2
 
+# H100 6장 기준 권장값
+# effective batch = 8(per-device) * 6(gpu) * 2(accum) = 96
+# flow head가 NTP보다 무거워서, 기존 A100x8 설정보다 per-device batch를 약간 보수적으로 둔다.
 data:
-  train_batch_size: 10
-  val_batch_size: 10
-  test_batch_size: 10
-  num_workers: 10
+  train_batch_size: 8
+  val_batch_size: 8
+  test_batch_size: 8
+  num_workers: 12
