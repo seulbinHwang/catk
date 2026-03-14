@@ -1,98 +1,122 @@
-# Closed-Loop Supervised Fine-Tuning of Tokenized Traffic Models
+# SMART-flow 7M on `brand_new`
 
+This patch adds a **Flow matching based 2-second trajectory decoder** on top of the existing SMART scene-context trunk.
 
-<p align="center">
-     <img src="docs/catk_banner.png" alt="Closest Among Top-K (CAT-K) rollouts unroll the policy during fine-tuning in a way that visited states remain close to the ground-truth.", width=760px>
-     <br/><strong>Closest Among Top-K (CAT-K) Rollouts</strong> unroll the policy during fine-tuning in a way that visited states remain close to the ground-truth (GT). At each time step, CAT-K first takes the top-K most likely action tokens according to the policy, then chooses the one leading to the state closest to the GT. As a result, CAT-K rollouts follow the mode of the GT (e.g., turning left), while random or top-K rollouts can lead to large deviations (e.g., going straight or right). Since the policy is essentially trained to minimize the distance between the rollout states and the GT states, the GT-based supervision remains effective for CAT-K rollouts, but not for random or top-K rollouts.
-</p>
+## What is included
 
-> **Closed-Loop Supervised Fine-Tuning of Tokenized Traffic Models**            
-> [Zhejun Zhang](https://zhejz.github.io/), [Peter Karkus](https://karkus.tilda.ws/), [Maximilian Igl](https://maximilianigl.com/), [Wenhao Ding](https://wenhao.pub/), [Yuxiao Chen](https://research.nvidia.com/labs/avg/author/yuxiao-chen/), [Boris Ivanovic](https://www.borisivanovic.com/) and [Marco Pavone](https://web.stanford.edu/~pavone/index.html).<br/>
-> 
-> [Project Page](https://zhejz.github.io/catk)<br/>
-> [arXiv Paper](https://arxiv.org/abs/2412.05334)
+The patch keeps the original `brand_new` map/context trunk intact and adds a new flow path:
 
-```bibtex
-@inproceedings{zhang2025closed,
-  title = {Closed-Loop Supervised Fine-Tuning of Tokenized Traffic Models},
-  author = {Zhang, Zhejun and Karkus, Peter and Igl, Maximilian and Ding, Wenhao and Chen, Yuxiao and Ivanovic, Boris and Pavone, Marco},
-  booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
-  year = {2025},
-}
+- `src/smart/model/smart_flow.py`
+- `src/smart/modules/smart_flow_decoder.py`
+- `src/smart/modules/flow_agent_decoder.py`
+- `src/smart/modules/flow_local_decoder.py`
+- `src/smart/tokens/flow_token_processor.py`
+- `src/smart/metrics/flow_metrics.py`
+- `configs/model/smart_flow.yaml`
+- `configs/experiment/pre_bc_flow.yaml`
+- `configs/experiment/local_val_flow.yaml`
+- `configs/experiment/wosac_sub_flow.yaml`
+- `configs/logger/wandb.yaml`
+- `scripts/train_flow.sh`
+- `scripts/local_val_flow.sh`
+- `scripts/wosac_sub_flow.sh`
+
+## Core design
+
+### Training
+
+1. Run the original tokenization first.
+2. Build a 14-slot causal context pack `{5,10,...,70}`.
+3. Build 13 valid supervision anchors `{10,15,...,70}`.
+4. Build normalized future targets `[x/20, y/20, cos(dyaw), sin(dyaw)]` for 20 future 10 Hz steps.
+5. Use the original SMART trunk to encode scene context.
+6. Use the new hierarchical flow decoder to predict velocity targets.
+7. Train with a single flow-matching MSE loss.
+
+### Inference
+
+1. Start from the observed coarse history.
+2. Run the SMART trunk once per 0.5-second rollout step.
+3. Run the local flow decoder inside a 4-step ODE sampler to generate 2 seconds.
+4. Commit only the first 0.5 seconds.
+5. Keep geometry as continuous state.
+6. Re-tokenize only to pick the next semantic token embedding.
+7. Repeat for 16 coarse steps to fill 80 future 10 Hz steps.
+
+## Important implementation choices
+
+- The ODE loop never re-runs the full scene trunk.
+- The new agent-to-agent relation adds two **relative coarse-motion** channels instead of raw m/s velocity. This keeps the added relation channels on a meter-scale comparable to the existing distance feature and avoids introducing a separate normalization rule into the main trunk.
+- `pred_traj_10hz`, `pred_head_10hz`, and `pred_z_10hz` stay unchanged so the existing WOSAC submission path remains usable.
+
+## Training
+
+Use the new flow config:
+
+```bash
+bash scripts/train_flow.sh
 ```
 
-## News & Updates
+This launches:
 
-Apr. 2025
-- **Oral at CVPR 2025**: Cheers!
-- **Top on the WOSAC Leaderboard 2024**: With the Waymo Challenges 2025 coming up, the WOSAC 2024 leaderboard is now closed and our method remains in the 1st place.
+```bash
+python -m src.run experiment=pre_bc_flow
+```
 
-Feb. 2025
-- **Paper accepted at CVPR 2025:** Cheers!
+Recommended starting point in `pre_bc_flow.yaml`:
 
-- **Model checkpoints for WOSAC:** You can obtain the checkpoints for our WOSAC submission (SMART-tiny-CLSFT) by sending an email to Zhejun (zhejun.zhang94@gmail.com). In accordance with Waymo's terms, you must attach a screenshot showing that you are registered and logged into the [My Submissions](https://waymo.com/open/challenges/submissions) page of the Waymo Open Dataset.
+- `precision=bf16-mixed`
+- `max_epochs=64`
+- `train_batch_size=12` per GPU on 6x H100
+- `val_batch_size=4`
+- `test_batch_size=4`
+- `lr=5e-4`
+- `lr_warmup_steps=2`
 
-- **SMART-mini and SMART-nano:** SMART-tiny with 7M parameters requires training on 8x A100 for a few days, which may be unaffordable in some cases. To address this, we have added config files for two smaller model, [smart_mini_3M.yaml](configs/model/smart_mini_3M.yaml) and [smart_nano_1M.yaml](configs/model/smart_nano_1M.yaml). Specifically, SMART-nano-1M can be trained on a single A100, but its performance is significantly worse. After pre-training and CAT-K fine-tuning, we achieved an RMM of 0.74 with SMART-nano-1M, which is 0.03 lower than that of SMART-tiny-7M. 
+## Local validation
 
-Jan. 2025
-- **SoTA performance on WOSAC:** CAT-K is now rank #1 on the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/)! We resolved an issue in the agent token vocabulary, and now our fine-tuned model achieves an RMM of **0.7702**. Even our reproduced SMART-tiny-7M (not published on the leaderboard, trained only for 32 epochs via BC) achieves an RMM of **0.7671**, which is comparable to the current second-place method. Reproducing our results should be straightforward. Give it a try!
+```bash
+bash scripts/local_val_flow.sh
+```
 
-- **Issue in the agent token vocabulary:** We discovered that the [agent token vocabulary file](src/smart/tokens/cluster_frame_5_2048_remove_duplicate.pkl) we were using (borrowed from the [SMART repository](https://github.com/rainmaker22/SMART/blob/main/smart/tokens/cluster_frame_5_2048.pkl)) was intended only for sanity checks and not for reproducing optimal performance. To resolve this, we added a [script](src/smart/tokens/traj_clustering.py) and used it to build an [appropriate agent token vocabulary](src/smart/tokens/agent_vocab_555_s2.pkl). Our script is based on the [k-disk clustering script from SMART](https://github.com/rainmaker22/SMART/blob/main/scripts/traj_clstering.py). Thanks to the updated agent tokens, all our traffic simulation models saw a significant performance improvement of approximately +0.0060 RMM!
+This uses `local_val_flow.yaml` with 32 closed-loop rollouts.
 
+## WOSAC submission
 
+1. Put your checkpoint path in `configs/experiment/wosac_sub_flow.yaml`.
+2. Fill the submission metadata fields.
+3. Run:
 
-## Installation
-- The easy way to setup the environment is to create a [conda](https://docs.conda.io/en/latest/miniconda.html) environment using the following commands
-  ```
-  conda create -y -n catk python=3.11.9
-  conda activate catk
-  conda install -y -c conda-forge ffmpeg=4.3.2
-  pip install -r install/requirements.txt
-  pip install torch_geometric
-  pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
-  pip install --no-deps waymo-open-dataset-tf-2-12-0==1.6.4
-  ```
-- Alternatively, a better way is to use the [Dockerfile](install/Dockerfile) and build your own docker. We found the code runs faster in the docker for some reasons.
-- We use [WandB](https://wandb.ai/) for logging. You can register an account for free.
-- **Be aware**
-  - We use 8 *NVIDIA A100 (80GB)* for training and validation, the training and fine-tuning take a few days, whereas the validation and testing take a few hours.
-  - We cannot share pre-trained models according to the [terms](https://waymo.com/open/terms) of the Waymo Open Motion Dataset.
+```bash
+bash scripts/wosac_sub_flow.sh
+```
 
+The output interface matches the original repository:
 
-## Dataset preparation
-- Download the [Waymo Open Motion Dataset](https://waymo.com/open/download/). We use v1.2.1.
-- Use [scripts/cache_womd.sh](scripts/cache_womd.sh) to preprocess the dataset into pickle files to accelerate data loading during the training and evaluation.
-- You should pack three datasets: `training`, `validation` and `testing`.
+- `pred_traj_10hz`
+- `pred_head_10hz`
+- `pred_z_10hz`
 
-## Run the code
-In the scripts, we provide
-- [scripts/train.sh](scripts/train.sh) for training and fine-tuning.
-- [scripts/local_val.sh](scripts/local_val.sh) for local validation.
-- [scripts/wosac_sub.sh](scripts/wosac_sub.sh) for packing submission files.
+so the existing WOSAC packing path stays intact.
 
-The default script runs with single GPU. We use DDP for multi GPU training and validation, and the codes are also found in the bash scripts.
-To reproduce our final results, you should follow the following steps
-1. Use [scripts/train.sh](scripts/train.sh) with the [BC pre-training config](configs/experiment/pre_bc.yaml) to pre-train the SMART-tiny 7M model.
-2. Use [scripts/train.sh](scripts/train.sh) with the [CLSFT with CAT-K config](configs/experiment/clsft.yaml) to fine-tune the SMART-tiny model pre-trained in step 1.
-3. Use [scripts/wosac_sub.sh](scripts/wosac_sub.sh) to pack the submission fille for `validate` or `test` split. Upload the `wosac_submission.tar.gz` file located in `logs` folder to the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) such that you can evaluate the model fine-tuned in step 2 on the WOSAC leaderboard.
-4. Alternatively, you can do local validation with [scripts/local_val.sh](scripts/local_val.sh).
+## Dataset and preprocessing
 
-For Gaussian Mixture Model (GMM) based ego policy, the procedure is similar, just use the following configs
-- [BC pre-training config for GMM-based ego policy](configs/experiment/ego_gmm_pre_bc.yaml)
-- [CLSFT with CAT-K config for GMM-based ego policy](configs/experiment/ego_gmm_clsft.yaml)
-- [Local validation config for GMM-based ego policy](configs/experiment/ego_gmm_local_val.yaml)
-- There is no submission option for ego-policy.
+This patch assumes the original `brand_new` dataset preparation flow remains unchanged:
 
-## Performance
+1. Download WOMD v1.2.1.
+2. Run the original cache script:
 
-The submission of our CAT-K fine-tuned SMART to the [WOSAC Leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) is found [here](https://waymo.com/open/challenges/sim-agents/results/5ea7a3eb-7337/1731338655639000/).
-The submission of our reproduced SMART to the test split is found [here](https://waymo.com/open/challenges/sim-agents/results/5ea7a3eb-7337/1731391949275000/), note that it is not published to the leaderboard.
+```bash
+bash scripts/cache_womd.sh
+```
 
-## Ablation configs
+3. Prepare `training`, `validation`, and `testing` caches exactly as in the base repository.
 
-Please refer to [docs/ablation_models.md](docs/ablation_models.md) for the configurations of ablation models.
-Specifically you will find the data augmentation methods used by [SMART](https://arxiv.org/abs/2207.05844) and [Trajeglish](https://arxiv.org/abs/2312.04535).
+## WandB
 
-## Acknowledgement
+`configs/logger/wandb.yaml` is switched to:
 
-Our code is based on [SMART](https://github.com/rainmaker22/SMART). We appreciate them for the valuable open-source code! Please don't forget to cite their amazing work as well!
+- `project=SMART-FLOW`
+- `entity=jksg01019-naver-labs`
+
+Adjust these if needed.
