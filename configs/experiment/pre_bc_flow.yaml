@@ -1,0 +1,34 @@
+# @package _global_
+
+defaults:
+  - override /model: smart
+
+model:
+  model_config:
+    lr: 5e-4
+    lr_min_ratio: 1e-2
+    val_open_loop: true
+    val_closed_loop: true
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    validation_rollout_sampling:
+      sample_steps: 4
+      sample_temperature: 1.0
+      sample_method: euler
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 1
+  max_epochs: 64
+  precision: bf16-mixed
+  accumulate_grad_batches: 1
+
+data:
+  train_batch_size: 10
+  val_batch_size: 4
+  test_batch_size: 4
+  num_workers: 10
