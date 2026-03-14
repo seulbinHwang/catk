@@ -1,448 +1,327 @@
-# SMART-flow 7M pre-BC
+# CAT-K Flow Matching
 
-이 저장소는 `brand_new` 브랜치를 바탕으로, 기존 SMART-tiny 7M의 **scene-shared 병렬 구조**와 **WOSAC 출력 인터페이스**는 유지하면서, agent 예측 부분만 **flow matching 기반 2초 연속 미래 예측**으로 바꾼 버전이다.
+- 이 저장소의 모델은 SMART의 scene-shared token encoder를 유지하면서, agent 예측만 flow matching head로 바꾼 multi-agent motion forecasting 구조다.
+- 각 agent는 0.5초 간격 anchor 13개에서 2초 길이의 연속 미래 `(x, y, cos(delta_yaw), sin(delta_yaw))`를 직접 예측한다.
+- `FutureConditioner`가 `noised future + tau`를 작은 조건 벡터로 바꿔 anchor query에만 주입하므로, backbone은 유지하면서 연속 타깃 학습이 가능하다.
+- `StructuredFlowHead`가 20 step 미래를 한 번에 출력해 시간축 구조를 보존하고, discrete next-token loss 없이 단일 flow loss로 학습한다.
+- closed-loop rollout은 매번 2초를 생성하되 처음 0.5초만 commit하고 다시 예측하는 방식이라 8초 horizon과 WOSAC 인터페이스를 안정적으로 유지한다.
 
-이 브랜치의 범위는 딱 하나다.
+이 저장소는 Waymo Open Motion Dataset(WOMD) scenario TFRecord를 캐시한 뒤, flow matching 기반 SMART 모델을 학습하고, closed-loop validation, WOSAC metric, submission export, visualization까지 수행하는 용도로 사용한다. 토큰 파일은 저장소에 이미 포함되어 있으므로 추가 다운로드가 필요 없다.
 
-- **SMART-flow 7M pre-BC 학습**
-- **closed-loop validation / WOSAC submission 유지**
-- **GMM 기반 경로와 CAT-K fine-tuning 경로는 사용하지 않음**
+- `src/smart/tokens/map_traj_token5.pkl`
+- `src/smart/tokens/agent_vocab_555_s2.pkl`
 
-학습 목표는 각 agent-anchor마다 2초 길이 10Hz 미래 하나를 맞추는 것이다. 표현은 아래 4개 값으로 통일했다.
+## 1. 환경 설치
 
-- `x_local`
-- `y_local`
-- `cos(delta_yaw)`
-- `sin(delta_yaw)`
+권장 환경:
 
-loss는 하나만 쓴다. `x, y`는 loss 계산 때만 `20`으로 나누고, `cos/sin`은 그대로 쓴다.
-
----
-
-## 1. 핵심 동작 방식
-
-### 1-1. 무엇이 바뀌었는가
-
-기존 `brand_new`는 NTP 방식으로 다음 token을 맞췄다. 이 버전은 마지막 token classification head를 제거하고, 대신 아래 구조를 사용한다.
-
-1. coarse token 기반 scene encoder는 유지한다.
-2. 각 valid anchor에 대해 2초 미래 GT를 local 좌표로 만든다.
-3. 학습 때는 clean future에 랜덤 noise를 섞는다.
-4. `future conditioner(noised future + tau)`가 작은 조건 벡터를 만든다.
-5. 이 조건 벡터를 anchor query 쪽에만 넣는다.
-6. structured flow head가 20 step의 velocity를 예측한다.
-7. loss는 masked MSE 하나만 사용한다.
-
-### 1-2. 어떤 anchor를 쓰는가
-
-anchor는 10Hz 전체 step을 다 쓰지 않고, 기존 SMART의 scene-level 병렬 구조를 살리기 위해 **0.5초 간격**으로 잡는다.
-
-- 현재 설정: `num_historical_steps=11`, `num_future_steps=80`
-- valid anchor step: `10, 15, 20, ..., 70`
-- 총 **13개 anchor**
-
-각 anchor는 자기 시점부터 앞으로 20 step(=2초, 10Hz)을 예측한다.
-
-### 1-3. closed-loop rollout은 어떻게 하는가
-
-추론은 매번 2초 미래를 생성하지만, 실제 상태 업데이트는 **첫 0.5초만 commit**한다.
-
-즉, 아래처럼 반복한다.
-
-1. 현재 state에서 2초 미래 생성
-2. 첫 0.5초만 사용
-3. 그 상태를 새 current state로 갱신
-4. 다시 2초 미래 생성
-
-이 과정을 16번 반복하면 8초 미래 80 step이 채워진다.
-
----
-
-## 2. 설치
-
-### 2-1. conda 환경
-
-기존 README와 같은 방식으로 시작하면 된다.
+- Linux
+- NVIDIA GPU
+- Python `3.11.9`
+- PyTorch `2.4.x`
+- `ffmpeg` 설치 완료 상태
 
 ```bash
-conda create -y -n catk python=3.11.9
+conda create -n catk python=3.11.9 -y
 conda activate catk
 conda install -y -c conda-forge ffmpeg=4.3.2
+
+pip install --upgrade pip
 pip install -r install/requirements.txt
 pip install torch_geometric
 pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
 pip install --no-deps waymo-open-dataset-tf-2-12-0==1.6.4
 ```
 
-### 2-2. 선택 사항: Docker
-
-기존 repo처럼 Docker를 써도 된다. 원래 repo 설명대로 Docker 쪽이 더 빠를 수 있다.
-
----
-
-## 3. 데이터 준비
-
-### 3-1. Waymo Open Motion Dataset 다운로드
-
-이 코드는 **Waymo Open Motion Dataset v1.2.1**을 기준으로 쓴다.
-
-Waymo 페이지에서 아래 3개 split을 준비해야 한다.
-
-- `training`
-- `validation`
-- `testing`
-
-압축을 푼 뒤 예시는 아래처럼 잡으면 된다.
-
-```text
-/scratch/data/womd/uncompressed/scenario/
-  training/
-  validation/
-  testing/
-```
-
-### 3-2. 기본 경로와 자동 감지
-
-지금 스크립트는 아래 순서로 경로를 자동 감지한다.
-
-- raw WOMD root: `/workspace/womd_v1_3/scenario` -> `/scratch/data/womd/uncompressed/scenario` -> `~/womd_v1_3/scenario`
-- cache root: `/workspace/womd_v1_3/SMART_cache` -> `/scratch/cache/SMART` -> `~/womd_v1_3/cache/SMART`
-
-현재 H100 서버에서는 캐시가 이미 아래에 있다고 가정하면 된다.
-
-```text
-/workspace/womd_v1_3/SMART_cache/
-  training/
-  validation/
-  testing/
-  validation_tfrecords_splitted/
-```
-
-다른 경로를 쓰고 싶으면 환경 변수로 override 하면 된다.
+기본 logger는 W&B다. 필요하면 실행 전에 아래를 설정한다.
 
 ```bash
-INPUT_DIR=/your/raw/scenario/root OUTPUT_DIR=/your/cache/root bash scripts/cache_womd.sh training
-SMART_CACHE_ROOT=/your/cache/root bash scripts/train.sh
-```
-
-### 3-3. 전처리 실행
-
-가장 쉬운 방법은 `scripts/cache_womd.sh`를 split별로 돌리는 것이다.
-
-기본값은 위 자동 감지 규칙을 따른다. split만 넘기면 된다.
-
-```bash
-bash scripts/cache_womd.sh training
-bash scripts/cache_womd.sh validation
-bash scripts/cache_womd.sh testing
-```
-
-worker 수를 바꾸고 싶으면 환경 변수만 주면 된다.
-
-```bash
-NUM_WORKERS=12 bash scripts/cache_womd.sh training
-```
-
-### 3-4. 전처리 후 확인할 것
-
-아래 경로가 채워졌는지 확인한다.
-
-- `${paths.cache_root}/training`
-- `${paths.cache_root}/validation`
-- `${paths.cache_root}/testing`
-- `${paths.cache_root}/validation_tfrecords_splitted`
-
-학습과 검증은 pickle 캐시를 읽고, WOSAC metric 계산 쪽은 validation tfrecord split 경로를 같이 쓴다.
-
----
-
-## 4. wandb 설정
-
-이 버전은 `test_new` 브랜치의 개인 wandb 설정을 그대로 따른다.
-
-기본값은 아래다.
-
-- `entity: jksg01019-naver-labs`
-- `project: SMART-FLOW`
-
-기본값 그대로 쓰려면 아무 것도 안 해도 된다.
-
-직접 바꾸고 싶으면 실행 전에 환경 변수만 넣으면 된다.
-
-```bash
-export WANDB_ENTITY=jksg01019-naver-labs
 export WANDB_PROJECT=SMART-FLOW
+export WANDB_ENTITY=jksg01019-naver-labs
 ```
 
-로그는 task 이름 아래로 저장된다.
-
----
-
-## 5. SMART-flow 7M pre-BC 학습
-
-### 5-1. 기본 학습 설정
-
-H100 6장 기준 기본값은 아래로 맞춰 두었다.
-
-- `precision: bf16-mixed`
-- `lr: 5e-4`
-- `max_epochs: 64`
-- `train_batch_size: 10 per GPU`
-- `val_batch_size: 4`
-- `test_batch_size: 4`
-- `num_workers: 10`
-- `accumulate_grad_batches: 1`
-
-메모리가 빠듯하면 가장 먼저 할 일은 `TRAIN_BATCH_SIZE=8`처럼 train batch를 더 낮추는 것이다.
-
-### 5-2. 6x H100에서 학습 시작
-
-H100 서버에서는 아래 한 줄이 기본 실행법이다.
+오프라인으로 실행하고 싶으면 아래를 추가한다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/train.sh
+export WANDB_MODE=offline
 ```
 
-이 스크립트는 visible GPU 수를 읽어서 자동으로:
+## 2. 데이터 다운로드와 캐시 준비
 
-- `torchrun --nproc_per_node=6`
-- `trainer=ddp`
-- `precision=bf16-mixed`
-- `train_batch_size=10 per GPU`
-- `val_batch_size=4`
-- `test_batch_size=4`
-- `data.num_workers=10`
+이 저장소는 Waymo Open Motion Dataset의 scenario split을 입력으로 사용한다.
 
-으로 맞춘다.
+- 다운로드 페이지: `https://waymo.com/open/download`
+- Motion dataset 설명: `https://waymo.com/open/data/motion/`
 
-이미 `/workspace/womd_v1_3/SMART_cache` 아래에 캐시가 있으면 그 캐시를 그대로 쓰고, 없을 때만 raw WOMD를 찾아서 `training`과 `validation` 전처리를 자동으로 수행한다.
+원본 데이터는 아래 구조로 준비하면 된다.
 
-### 5-3. train batch를 10으로 낮추고 싶을 때
+```text
+$RAW_ROOT/
+├── training/
+├── validation/
+└── testing/
+```
 
-아래처럼 override를 추가하면 된다.
+예시 환경 변수:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/train.sh \
-  task_name=smart_flow_7m_pre_bc_bs10 \
-  data.train_batch_size=10
+export RAW_ROOT=/path/to/womd/scenario
+export CACHE_ROOT=/path/to/SMART_cache
 ```
 
-### 5-4. 중간부터 이어서 학습할 때
+### 2.1 캐시 생성
 
-`ckpt_path`를 넣으면 된다.
+학습과 평가는 원본 TFRecord가 아니라 split별 `.pkl` 캐시를 읽는다. 가장 간단한 방법은 `scripts/cache_womd.sh`를 split별로 한 번씩 실행하는 것이다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/train.sh \
-  task_name=smart_flow_7m_pre_bc_resume \
-  ckpt_path=/path/to/last.ckpt
+INPUT_DIR="$RAW_ROOT" OUTPUT_DIR="$CACHE_ROOT" NUM_WORKERS=12 bash scripts/cache_womd.sh training
+INPUT_DIR="$RAW_ROOT" OUTPUT_DIR="$CACHE_ROOT" NUM_WORKERS=12 bash scripts/cache_womd.sh validation
+INPUT_DIR="$RAW_ROOT" OUTPUT_DIR="$CACHE_ROOT" NUM_WORKERS=12 bash scripts/cache_womd.sh testing
 ```
 
-### 5-5. 출력 위치
-
-Hydra 출력 폴더 아래에 체크포인트와 로그가 모인다.
-
-기본 로그 루트는 `configs/paths/default.yaml` 기준으로 `logs/` 아래다.
-
----
-
-## 6. 로컬 검증
-
-### 6-1. 기본 로컬 검증
-
-체크포인트 경로를 `configs/experiment/local_val.yaml`의 `ckpt_path`에 넣는다.
-
-```yaml
-ckpt_path: YOUR_MODEL.ckpt
-```
-
-그 다음 실행한다.
+직접 실행하고 싶으면 아래와 같이 호출할 수 있다.
 
 ```bash
-bash scripts/local_val.sh
+python -m src.data_preprocess \
+  --split training \
+  --num_workers 12 \
+  --input_dir "$RAW_ROOT" \
+  --output_dir "$CACHE_ROOT"
+
+python -m src.data_preprocess \
+  --split validation \
+  --num_workers 12 \
+  --input_dir "$RAW_ROOT" \
+  --output_dir "$CACHE_ROOT"
+
+python -m src.data_preprocess \
+  --split testing \
+  --num_workers 12 \
+  --input_dir "$RAW_ROOT" \
+  --output_dir "$CACHE_ROOT"
 ```
 
-기본 설정은 아래다.
+캐시가 준비되면 구조는 대략 아래와 같다.
 
-- `val_open_loop: false`
-- `val_closed_loop: true`
-- `n_rollout_closed_val: 32`
-- `sample_steps: 4`
-- `sample_method: euler`
+```text
+$CACHE_ROOT/
+├── training/
+├── validation/
+├── testing/
+└── validation_tfrecords_splitted/
+```
 
-### 6-2. 빠른 smoke test
+설명:
 
-로컬에서 가볍게만 보고 싶으면 rollout 수를 줄이면 된다.
+- `training/`, `validation/`, `testing/`에는 시나리오별 `.pkl`이 저장된다.
+- `validation_tfrecords_splitted/`는 `validation` 캐시 생성 시 함께 만들어진다.
+- local validation, WOSAC metric 계산, visualization은 `validation_tfrecords_splitted/`를 사용하므로 반드시 필요하다.
+
+### 2.2 `train.sh`의 자동 캐시 동작
+
+`scripts/train.sh`는 `training`과 `validation` 캐시가 없으면 자동으로 캐시 생성을 시도한다. 기본 탐색 순서는 아래와 같다.
+
+- raw data: `${RAW_DATA_ROOT}` -> `/workspace/womd_v1_3/scenario` -> `/scratch/data/womd/uncompressed/scenario` -> `~/womd_v1_3/scenario`
+- cache root: `${SMART_CACHE_ROOT}` -> `/workspace/womd_v1_3/SMART_cache` -> `/scratch/cache/SMART` -> `~/womd_v1_3/cache/SMART`
+
+명시적으로 경로를 고정하고 싶으면 `RAW_DATA_ROOT`, `SMART_CACHE_ROOT`를 직접 주는 편이 가장 안전하다.
+
+## 3. H100 GPU 6장 기준 학습
+
+이 저장소의 기본 flow matching 학습 실험은 `experiment=pre_bc`다. H100 6장 기준 권장값은 아래와 같다.
+
+- precision: `bf16-mixed`
+- DDP: `trainer=ddp`, `trainer.devices=6`
+- train batch size: `10` per GPU
+- val/test batch size: `4`
+- num workers: `10`
+- epochs: `64`
+
+### 3.1 권장 실행: `scripts/train.sh`
+
+```bash
+export RAW_DATA_ROOT="$RAW_ROOT"
+export SMART_CACHE_ROOT="$CACHE_ROOT"
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+
+bash scripts/train.sh task_name=flow_pretrain_h1006
+```
+
+이 스크립트는 visible GPU 수를 읽어 `torchrun --standalone --nproc_per_node=6`, `trainer=ddp`, batch size, precision, cache path를 자동으로 맞춘다.
+
+### 3.2 직접 실행: `torchrun`
+
+캐시가 이미 준비되어 있으면 아래 명령으로 바로 학습할 수 있다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun --standalone --nproc_per_node=6 -m src.run \
+  experiment=pre_bc \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_pretrain_h1006
+```
+
+batch size나 worker 수를 바꾸고 싶으면 override만 추가하면 된다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun --standalone --nproc_per_node=6 -m src.run \
+  experiment=pre_bc \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_pretrain_h1006_bs8 \
+  data.train_batch_size=8 \
+  data.val_batch_size=4 \
+  data.num_workers=8
+```
+
+중간부터 이어서 학습하려면 `ckpt_path`를 넘긴다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun --standalone --nproc_per_node=6 -m src.run \
+  experiment=pre_bc \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_pretrain_h1006_resume \
+  ckpt_path=/absolute/path/to/last.ckpt
+```
+
+출력은 Hydra 기준 아래 경로에 저장된다.
+
+- 로그 루트: `logs/<task_name>/runs/<YYYY-MM-DD>_<HH-MM-SS>/`
+- 체크포인트: `logs/<task_name>/runs/<...>/checkpoints/`
+- 실행 로그: `logs/<task_name>/runs/<...>/<task_name>.log`
+
+## 4. 평가와 추론
+
+이 저장소에는 별도 inference-only 엔트리포인트가 없다. closed-loop rollout을 생성하는 `validate` 또는 `test` 실행 자체가 추론 역할을 한다.
+
+- validation split에서 metric과 rollout을 보고 싶으면 `experiment=local_val`
+- submission용 rollout을 만들고 싶으면 `experiment=wosac_sub`
+
+### 4.1 Local validation
+
+아래 명령은 validation split에서 closed-loop rollout을 수행하고, `val_closed/ADE`와 WOSAC metric을 계산한다.
 
 ```bash
 python -m src.run \
   experiment=local_val \
   action=validate \
-  ckpt_path=/path/to/model.ckpt \
-  model.model_config.n_rollout_closed_val=4 \
+  ckpt_path=/absolute/path/to/model.ckpt \
+  trainer=default \
+  trainer.accelerator=gpu \
   trainer.devices=1 \
-  trainer.strategy=auto
+  trainer.strategy=auto \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_local_val
 ```
 
-### 6-3. open-loop loss까지 같이 보고 싶을 때
+기본 `local_val` 설정:
+
+- open-loop metric 비활성화
+- closed-loop rollout `32`회 샘플링
+- validation batch size `4`
+- WOSAC metric 계산용 batch `100`
+
+결과 metric은 Hydra output과 W&B에 함께 기록된다.
+
+## 5. Visualization
+
+비디오 저장은 `local_val`에서 시각화 관련 override를 켰을 때만 동작한다. `ffmpeg`가 반드시 설치되어 있어야 한다.
 
 ```bash
 python -m src.run \
   experiment=local_val \
   action=validate \
-  ckpt_path=/path/to/model.ckpt \
-  model.model_config.val_open_loop=true
+  ckpt_path=/absolute/path/to/model.ckpt \
+  trainer=default \
+  trainer.accelerator=gpu \
+  trainer.devices=1 \
+  trainer.strategy=auto \
+  trainer.limit_val_batches=1 \
+  data.val_batch_size=1 \
+  data.num_workers=0 \
+  data.pin_memory=false \
+  data.persistent_workers=false \
+  paths.cache_root="$CACHE_ROOT" \
+  model.model_config.n_rollout_closed_val=2 \
+  model.model_config.n_batch_wosac_metric=1 \
+  model.model_config.n_vis_batch=1 \
+  model.model_config.n_vis_scenario=1 \
+  model.model_config.n_vis_rollout=2 \
+  task_name=flow_local_val_video
 ```
 
----
+출력 예시:
 
-## 7. WOSAC submission 파일 만들기
+- `logs/flow_local_val_video/runs/<...>/videos/batch_00-scenario_00/gt.mp4`
+- `logs/flow_local_val_video/runs/<...>/videos/batch_00-scenario_00/rollout_00.mp4`
+- `logs/flow_local_val_video/runs/<...>/videos/batch_00-scenario_00/rollout_01.mp4`
 
-### 7-1. submission 메타 정보 수정
+주의:
 
-`configs/experiment/wosac_sub.yaml` 안의 아래 항목을 실제 값으로 바꾼다.
+- `model.model_config.n_vis_rollout <= model.model_config.n_rollout_closed_val`
+- `model.model_config.n_vis_scenario <= data.val_batch_size`로 두는 것이 가장 안전하다
+- `validation_tfrecords_splitted/`가 없으면 visualization이 동작하지 않는다
 
-```yaml
-authors: [Anonymous]
-affiliation: YOUR_AFFILIATION
-description: YOUR_DESCRIPTION
-method_link: YOUR_METHOD_LINK
-account_name: YOUR_ACCOUNT_NAME
-```
+## 6. WOSAC submission
 
-### 7-2. validation split submission 만들기
+WOSAC 제출 파일은 `experiment=wosac_sub`로 생성한다. 먼저 `configs/experiment/wosac_sub.yaml`의 아래 메타데이터를 실제 값으로 채운다.
+
+- `authors`
+- `affiliation`
+- `description`
+- `method_link`
+- `account_name`
+
+### 6.1 Validation split으로 submission 샘플 생성
 
 ```bash
-bash scripts/wosac_sub.sh
+python -m src.run \
+  experiment=wosac_sub \
+  action=validate \
+  ckpt_path=/absolute/path/to/model.ckpt \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_wosac_sub_validate
 ```
 
-기본 스크립트는 `ACTION=validate`로 되어 있다.
-
-### 7-3. test split submission 만들기
-
-`scripts/wosac_sub.sh` 안의 값을 바꾸거나, 직접 아래처럼 실행한다.
+### 6.2 Test split으로 최종 submission 생성
 
 ```bash
 python -m src.run \
   experiment=wosac_sub \
   action=test \
-  ckpt_path=/path/to/model.ckpt \
-  task_name=smart_flow_7m_wosac_test
+  ckpt_path=/absolute/path/to/model.ckpt \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_wosac_sub_test
 ```
 
-### 7-4. 업로드 파일 위치
+출력 위치:
 
-실행이 끝나면 `logs/` 아래 Hydra 출력 폴더 안에 `wosac_submission.tar.gz`가 생성된다.
+- shard binproto: `logs/<task_name>/runs/<...>/wosac_submission/`
+- 최종 압축 파일: `logs/<task_name>/runs/<...>/wosac_submission.tar.gz`
 
-이 파일을 Waymo WOSAC leaderboard 제출 페이지에 업로드하면 된다.
+## 7. 자주 확인할 점
 
----
+- `paths.cache_root`를 지정하지 않으면 기본값은 `data/cache/SMART`다.
+- `validation_tfrecords_splitted/`가 없으면 local validation, WOSAC metric, visualization이 실패한다.
+- 기본 logger는 W&B이므로, 계정을 쓰지 않을 경우 `WANDB_MODE=offline`을 주는 편이 편하다.
+- 6x H100에서 메모리가 빠듯하면 가장 먼저 `data.train_batch_size`를 줄여보면 된다.
+- visualization은 batch 크기와 시나리오 수를 작게 두는 것이 안정적이다.
 
-## 8. 시각화
+## 8. 가장 짧은 실행 순서
 
-이 repo는 validation 단계에서 자동으로 rollout 비디오를 저장할 수 있다.
+처음부터 끝까지 가장 일반적인 흐름은 아래와 같다.
 
-### 8-1. 비디오 저장 켜기
-
-아래 값을 0보다 크게 주면 된다.
-
-- `model.model_config.n_vis_batch`
-- `model.model_config.n_vis_scenario`
-- `model.model_config.n_vis_rollout`
-
-예시는 아래다.
-
-```bash
-python -m src.run \
-  experiment=local_val \
-  action=validate \
-  ckpt_path=/path/to/model.ckpt \
-  model.model_config.n_vis_batch=1 \
-  model.model_config.n_vis_scenario=2 \
-  model.model_config.n_vis_rollout=4 \
-  trainer.devices=1 \
-  trainer.strategy=auto
-```
-
-### 8-2. 저장 위치
-
-비디오는 각 실행 폴더 아래 `videos/`에 저장된다.
-
-예시:
-
-```text
-logs/.../videos/batch_00-scenario_00/
-```
-
-wandb를 켜 둔 경우, 저장된 비디오는 logger를 통해 같이 올라간다.
-
----
-
-## 9. 자주 바꾸는 설정
-
-### 9-1. solver step 수 바꾸기
-
-기본은 4 step이다.
-
-```bash
-python -m src.run \
-  experiment=local_val \
-  action=validate \
-  ckpt_path=/path/to/model.ckpt \
-  model.model_config.validation_rollout_sampling.sample_steps=6
-```
-
-### 9-2. heun으로 바꾸기
-
-```bash
-python -m src.run \
-  experiment=local_val \
-  action=validate \
-  ckpt_path=/path/to/model.ckpt \
-  model.model_config.validation_rollout_sampling.sample_method=heun
-```
-
-### 9-3. rollout 수 바꾸기
-
-```bash
-python -m src.run \
-  experiment=local_val \
-  action=validate \
-  ckpt_path=/path/to/model.ckpt \
-  model.model_config.n_rollout_closed_val=64
-```
-
----
-
-## 10. 이 브랜치에서 의도적으로 제외한 것
-
-이 버전은 아래 범위를 일부러 제외했다.
-
-- GMM 기반 ego policy
-- CAT-K fine-tuning
-- token overlap loss
-- token classification loss
-
-즉, 이 버전은 **SMART-flow 7M pre-BC + closed-loop validation + WOSAC submission**만 유지한다.
-
----
-
-## 11. 추천 실행 순서
-
-처음 보는 사람이 그대로 따라 하려면 아래 순서로 하면 된다.
-
-1. conda 환경 생성 및 패키지 설치
-2. Waymo dataset 다운로드
-3. `configs/paths/default.yaml`의 `cache_root` 확인
-4. `scripts/cache_womd.sh`로 `training / validation / testing` 캐시 생성
-5. `bash scripts/train.sh`로 pre-BC 학습
-6. `bash scripts/local_val.sh`로 로컬 검증
-7. 시각화가 필요하면 `n_vis_*` 값을 켜서 다시 검증
-8. `bash scripts/wosac_sub.sh`로 submission 파일 생성
-9. `wosac_submission.tar.gz` 업로드
-
----
-
-## 12. 참고
-
-이 버전은 원래 `brand_new`의 SMART-tiny 7M 구조를 바탕으로 하며,
-네트워크 폭과 깊이는 유지하고 head 예산만 flow matching 쪽으로 다시 배치했다.
+1. 환경을 만들고 의존성을 설치한다.
+2. WOMD scenario 데이터를 `training/validation/testing` 구조로 다운로드한다.
+3. `scripts/cache_womd.sh`로 `training`, `validation`, `testing` 캐시를 만든다.
+4. `scripts/train.sh` 또는 `torchrun`으로 `experiment=pre_bc` 학습을 수행한다.
+5. 완성된 checkpoint로 `experiment=local_val`을 실행해 validation metric과 rollout을 확인한다.
+6. 필요하면 visualization override를 켜서 mp4를 저장한다.
+7. 제출이 필요하면 `experiment=wosac_sub`로 validation/test submission 파일을 생성한다.
