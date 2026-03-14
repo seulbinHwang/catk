@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
