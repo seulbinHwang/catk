@@ -187,13 +187,13 @@ H100 6장 기준 기본값은 아래로 맞춰 두었다.
 - `precision: bf16-mixed`
 - `lr: 5e-4`
 - `max_epochs: 64`
-- `train_batch_size: 12 per GPU`
+- `train_batch_size: 10 per GPU`
 - `val_batch_size: 4`
 - `test_batch_size: 4`
 - `num_workers: 10`
 - `accumulate_grad_batches: 1`
 
-메모리가 빠듯하면 가장 먼저 할 일은 **train batch를 12에서 10으로 낮추는 것**이다.
+메모리가 빠듯하면 가장 먼저 할 일은 `TRAIN_BATCH_SIZE=8`처럼 train batch를 더 낮추는 것이다.
 
 ### 5-2. 6x H100에서 학습 시작
 
@@ -208,7 +208,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/train.sh
 - `torchrun --nproc_per_node=6`
 - `trainer=ddp`
 - `precision=bf16-mixed`
-- `train_batch_size=12 per GPU`
+- `train_batch_size=10 per GPU`
 - `val_batch_size=4`
 - `test_batch_size=4`
 - `data.num_workers=10`
