@@ -2,6 +2,7 @@ defaults:
   - model_checkpoint
   - model_summary
   - learning_rate_monitor
+  - wandb_runtime_metrics
   - _self_
 
 model_checkpoint:

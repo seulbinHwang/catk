@@ -15,6 +15,7 @@ from src.smart.metrics.wosac_metrics import WOSACMetrics
 from src.smart.metrics.wosac_submission import WOSACSubmission
 from src.smart.modules.smart_decoder import SMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
+from src.smart.utils import wrap_angle
 from src.utils.vis_waymo import VisWaymo
 from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -103,15 +104,18 @@ class SMART(LightningModule):
         return loss / denom.clamp_min(1.0)
 
     @staticmethod
-    def _future_ade(pred_dict: Dict[str, Tensor], anchor_mask: Optional[Tensor] = None) -> Tensor:
-        """open-loop 2초 ADE를 계산한다.
+    def _future_metrics(
+        pred_dict: Dict[str, Tensor],
+        anchor_mask: Optional[Tensor] = None,
+    ) -> Dict[str, Tensor]:
+        """open-loop 2초 위치/yaw 오차를 실제 단위로 계산한다.
 
         Args:
             pred_dict: decoder 출력이다.
             anchor_mask: [n_agent, n_anchor] 추가 마스크이다.
 
         Returns:
-            스칼라 ADE를 돌려준다.
+            meter 단위 위치 ADE와 degree 단위 yaw ADE를 돌려준다.
         """
         valid_mask = pred_dict["flow_future_valid"]
         if anchor_mask is not None:
@@ -121,13 +125,20 @@ class SMART(LightningModule):
             pred_dict["pred_future_pos"] - pred_dict["gt_future_pos"],
             dim=-1,
         )
-        return (pos_error * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
+        yaw_error_deg = torch.rad2deg(
+            wrap_angle(pred_dict["pred_future_head"] - pred_dict["gt_future_head"]).abs()
+        )
+        denom = valid_mask.sum().clamp_min(1.0)
+        return {
+            "ade_2s_m": (pos_error * valid_mask).sum() / denom,
+            "ade_yaw_2s_deg": (yaw_error_deg * valid_mask).sum() / denom,
+        }
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         pred = self.encoder(tokenized_map, tokenized_agent)
         loss = self._flow_loss(pred, train_mask=data["agent"]["train_mask"])
-        ade = self._future_ade(
+        future_metrics = self._future_metrics(
             pred,
             anchor_mask=self._merge_train_mask(
                 pred["flow_anchor_valid"],
@@ -135,7 +146,13 @@ class SMART(LightningModule):
             ),
         )
         self.log("train/loss", loss, on_step=True, batch_size=1)
-        self.log("train/ade_2s", ade, on_step=True, batch_size=1)
+        self.log("train/ade_2s_m", future_metrics["ade_2s_m"], on_step=True, batch_size=1)
+        self.log(
+            "train/ade_yaw_2s_deg",
+            future_metrics["ade_yaw_2s_deg"],
+            on_step=True,
+            batch_size=1,
+        )
         return loss
 
     def validation_step(self, data, batch_idx):
@@ -144,9 +161,22 @@ class SMART(LightningModule):
         if self.val_open_loop:
             pred = self.encoder(tokenized_map, tokenized_agent)
             loss = self._flow_loss(pred)
-            ade = self._future_ade(pred, anchor_mask=pred["flow_anchor_valid"])
+            future_metrics = self._future_metrics(pred, anchor_mask=pred["flow_anchor_valid"])
             self.log("val_open/loss", loss, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("val_open/ade_2s", ade, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log(
+                "val_open/ade_2s_m",
+                future_metrics["ade_2s_m"],
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                "val_open/ade_yaw_2s_deg",
+                future_metrics["ade_yaw_2s_deg"],
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
 
         if self.val_closed_loop:
             pred_traj, pred_z, pred_head = [], [], []
