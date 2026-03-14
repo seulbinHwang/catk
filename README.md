@@ -1,7 +1,7 @@
 # CAT-K Flow Matching
 
-이 문서는 `test_new` 브랜치의 구조를 참고해, **flow matching 경로만** 따로 정리한 README입니다.  
-`smart_flow` 계열만 다루며, token-classification SMART, closed-loop fine-tuning, ego GMM 경로는 설명하지 않습니다.
+이 저장소는 **flow matching 학습/추론/평가 전용**으로 정리된 버전입니다.  
+기본 실행 경로와 문서, 스크립트는 모두 `smart_flow` 계열만 사용하며 CrossEntropy 기반 next-token 경로는 제거했습니다.
 
 - 기존 SMART의 map/context trunk를 그대로 재사용하고, agent 쪽만 flow decoder로 바꿔 scene-context 품질을 유지합니다.
 - `FlowTokenProcessor`가 14-slot context pack과 13개 anchor를 만들어 2초 미래를 연속값으로 supervision 합니다.
@@ -23,6 +23,10 @@
 - `configs/experiment/pre_bc_flow.yaml`
 - `configs/experiment/local_val_flow.yaml`
 - `configs/experiment/wosac_sub_flow.yaml`
+- `configs/run.yaml`
+- `scripts/train.sh`
+- `scripts/local_val.sh`
+- `scripts/wosac_sub.sh`
 
 ## 2. 환경 설치
 

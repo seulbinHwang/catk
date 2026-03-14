@@ -8,7 +8,7 @@ from torch_cluster import radius_graph
 from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
-from src.smart.modules.agent_decoder import SMARTAgentDecoder
+from src.smart.modules.agent_encoder import SMARTAgentEncoder
 from src.smart.modules.flow_local_decoder import (
     ContinuousCommitBridge,
     FlowODE,
@@ -17,7 +17,7 @@ from src.smart.modules.flow_local_decoder import (
 from src.smart.utils import angle_between_2d_vectors, wrap_angle
 
 
-class SMARTFlowAgentDecoder(SMARTAgentDecoder):
+class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
     def __init__(
         self,
