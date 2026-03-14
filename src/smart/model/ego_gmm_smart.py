@@ -85,6 +85,12 @@ class EgoGMMSMART(LightningModule):
 
         return loss
 
+    @staticmethod
+    def _get_visualization_tfrecord_paths(tfrecord_path) -> list[str]:
+        if isinstance(tfrecord_path, (list, tuple)):
+            return list(tfrecord_path)
+        return [tfrecord_path]
+
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
@@ -182,7 +188,10 @@ class EgoGMMSMART(LightningModule):
                     pred_z=pred_z,
                     pred_head=pred_head,
                 )
-                self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
+                tfrecord_paths = self._get_visualization_tfrecord_paths(
+                    data["tfrecord_path"]
+                )
+                self.wosac_metrics.update(tfrecord_paths, scenario_rollouts)
 
             # ! visualization
             if self.global_rank == 0 and batch_idx < self.n_vis_batch:
@@ -195,9 +204,17 @@ class EgoGMMSMART(LightningModule):
                     pred_z=pred_z[tokenized_agent["ego_mask"]],
                     pred_head=pred_head[tokenized_agent["ego_mask"]],
                 )
-                for _i_sc in range(self.n_vis_scenario):
+                tfrecord_paths = self._get_visualization_tfrecord_paths(
+                    data["tfrecord_path"]
+                )
+                n_vis_scenario = min(
+                    self.n_vis_scenario,
+                    len(tfrecord_paths),
+                    len(scenario_rollouts),
+                )
+                for _i_sc in range(n_vis_scenario):
                     _vis = VisWaymo(
-                        scenario_path=data["tfrecord_path"][_i_sc],
+                        scenario_path=tfrecord_paths[_i_sc],
                         save_dir=self.video_dir
                         / f"batch_{batch_idx:02d}-scenario_{_i_sc:02d}",
                     )

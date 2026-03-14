@@ -134,6 +134,12 @@ class SMART(LightningModule):
             "ade_yaw_2s_deg": (yaw_error_deg * valid_mask).sum() / denom,
         }
 
+    @staticmethod
+    def _get_visualization_tfrecord_paths(tfrecord_path) -> list[str]:
+        if isinstance(tfrecord_path, (list, tuple)):
+            return list(tfrecord_path)
+        return [tfrecord_path]
+
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         pred = self.encoder(tokenized_map, tokenized_agent)
@@ -231,13 +237,24 @@ class SMART(LightningModule):
                         pred_z=pred_z,
                         pred_head=pred_head,
                     )
-                    self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
+                    tfrecord_paths = self._get_visualization_tfrecord_paths(
+                        data["tfrecord_path"]
+                    )
+                    self.wosac_metrics.update(tfrecord_paths, scenario_rollouts)
 
             if self.global_rank == 0 and batch_idx < self.n_vis_batch:
                 if scenario_rollouts is not None:
-                    for scenario_idx in range(self.n_vis_scenario):
+                    tfrecord_paths = self._get_visualization_tfrecord_paths(
+                        data["tfrecord_path"]
+                    )
+                    n_vis_scenario = min(
+                        self.n_vis_scenario,
+                        len(tfrecord_paths),
+                        len(scenario_rollouts),
+                    )
+                    for scenario_idx in range(n_vis_scenario):
                         vis = VisWaymo(
-                            scenario_path=data["tfrecord_path"][scenario_idx],
+                            scenario_path=tfrecord_paths[scenario_idx],
                             save_dir=self.video_dir / f"batch_{batch_idx:02d}-scenario_{scenario_idx:02d}",
                         )
                         vis.save_video_scenario_rollout(
