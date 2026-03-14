@@ -79,9 +79,36 @@ detect_default_cache_root() {
 
 count_visible_gpus() {
   local gpu_ids=()
+  local requested_count=0
+  local torch_visible_count=""
   if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
     IFS=',' read -r -a gpu_ids <<< "$CUDA_VISIBLE_DEVICES"
-    printf '%s\n' "${#gpu_ids[@]}"
+    requested_count="${#gpu_ids[@]}"
+
+    if command -v python >/dev/null 2>&1; then
+      torch_visible_count="$(python - <<'PY'
+import torch
+
+print(torch.cuda.device_count())
+PY
+)"
+
+      case "$torch_visible_count" in
+        ''|*[!0-9]*)
+          torch_visible_count=""
+          ;;
+      esac
+
+      if [ -n "$torch_visible_count" ] && [ "$torch_visible_count" -lt "$requested_count" ]; then
+        printf '%s\n' \
+          "CUDA_VISIBLE_DEVICES requested $requested_count device(s), but torch can use $torch_visible_count. Using $torch_visible_count." \
+          >&2
+        printf '%s\n' "$torch_visible_count"
+        return 0
+      fi
+    fi
+
+    printf '%s\n' "$requested_count"
     return 0
   fi
 
