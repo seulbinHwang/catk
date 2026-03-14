@@ -11,10 +11,11 @@ model:
     n_batch_wosac_metric: 100
     val_open_loop: false
     val_closed_loop: true
+    n_rollout_closed_val: 32
     validation_rollout_sampling:
-      criterium: topk_prob
-      num_k: 64 # for k most likely
-      temp: 1.0
+      sample_steps: 4
+      sample_temperature: 1.0
+      sample_method: euler
 
 ckpt_path: YOUR_MODEL.ckpt
 
@@ -23,11 +24,12 @@ trainer:
   limit_val_batches: 60
   limit_test_batches: 1.0
   check_val_every_n_epoch: 1
+  precision: bf16-mixed
 
 data:
-  train_batch_size: 16
-  val_batch_size: 16
-  test_batch_size: 16
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 4
   num_workers: 8
 
 action: validate

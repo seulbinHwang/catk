@@ -1,98 +1,451 @@
-# Closed-Loop Supervised Fine-Tuning of Tokenized Traffic Models
+# SMART-flow 7M pre-BC
 
+이 저장소는 `brand_new` 브랜치를 바탕으로, 기존 SMART-tiny 7M의 **scene-shared 병렬 구조**와 **WOSAC 출력 인터페이스**는 유지하면서, agent 예측 부분만 **flow matching 기반 2초 연속 미래 예측**으로 바꾼 버전이다.
 
-<p align="center">
-     <img src="docs/catk_banner.png" alt="Closest Among Top-K (CAT-K) rollouts unroll the policy during fine-tuning in a way that visited states remain close to the ground-truth.", width=760px>
-     <br/><strong>Closest Among Top-K (CAT-K) Rollouts</strong> unroll the policy during fine-tuning in a way that visited states remain close to the ground-truth (GT). At each time step, CAT-K first takes the top-K most likely action tokens according to the policy, then chooses the one leading to the state closest to the GT. As a result, CAT-K rollouts follow the mode of the GT (e.g., turning left), while random or top-K rollouts can lead to large deviations (e.g., going straight or right). Since the policy is essentially trained to minimize the distance between the rollout states and the GT states, the GT-based supervision remains effective for CAT-K rollouts, but not for random or top-K rollouts.
-</p>
+이 브랜치의 범위는 딱 하나다.
 
-> **Closed-Loop Supervised Fine-Tuning of Tokenized Traffic Models**            
-> [Zhejun Zhang](https://zhejz.github.io/), [Peter Karkus](https://karkus.tilda.ws/), [Maximilian Igl](https://maximilianigl.com/), [Wenhao Ding](https://wenhao.pub/), [Yuxiao Chen](https://research.nvidia.com/labs/avg/author/yuxiao-chen/), [Boris Ivanovic](https://www.borisivanovic.com/) and [Marco Pavone](https://web.stanford.edu/~pavone/index.html).<br/>
-> 
-> [Project Page](https://zhejz.github.io/catk)<br/>
-> [arXiv Paper](https://arxiv.org/abs/2412.05334)
+- **SMART-flow 7M pre-BC 학습**
+- **closed-loop validation / WOSAC submission 유지**
+- **GMM 기반 경로와 CAT-K fine-tuning 경로는 사용하지 않음**
 
-```bibtex
-@inproceedings{zhang2025closed,
-  title = {Closed-Loop Supervised Fine-Tuning of Tokenized Traffic Models},
-  author = {Zhang, Zhejun and Karkus, Peter and Igl, Maximilian and Ding, Wenhao and Chen, Yuxiao and Ivanovic, Boris and Pavone, Marco},
-  booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
-  year = {2025},
-}
+학습 목표는 각 agent-anchor마다 2초 길이 10Hz 미래 하나를 맞추는 것이다. 표현은 아래 4개 값으로 통일했다.
+
+- `x_local`
+- `y_local`
+- `cos(delta_yaw)`
+- `sin(delta_yaw)`
+
+loss는 하나만 쓴다. `x, y`는 loss 계산 때만 `20`으로 나누고, `cos/sin`은 그대로 쓴다.
+
+---
+
+## 1. 핵심 동작 방식
+
+### 1-1. 무엇이 바뀌었는가
+
+기존 `brand_new`는 NTP 방식으로 다음 token을 맞췄다. 이 버전은 마지막 token classification head를 제거하고, 대신 아래 구조를 사용한다.
+
+1. coarse token 기반 scene encoder는 유지한다.
+2. 각 valid anchor에 대해 2초 미래 GT를 local 좌표로 만든다.
+3. 학습 때는 clean future에 랜덤 noise를 섞는다.
+4. `future conditioner(noised future + tau)`가 작은 조건 벡터를 만든다.
+5. 이 조건 벡터를 anchor query 쪽에만 넣는다.
+6. structured flow head가 20 step의 velocity를 예측한다.
+7. loss는 masked MSE 하나만 사용한다.
+
+### 1-2. 어떤 anchor를 쓰는가
+
+anchor는 10Hz 전체 step을 다 쓰지 않고, 기존 SMART의 scene-level 병렬 구조를 살리기 위해 **0.5초 간격**으로 잡는다.
+
+- 현재 설정: `num_historical_steps=11`, `num_future_steps=80`
+- valid anchor step: `10, 15, 20, ..., 70`
+- 총 **13개 anchor**
+
+각 anchor는 자기 시점부터 앞으로 20 step(=2초, 10Hz)을 예측한다.
+
+### 1-3. closed-loop rollout은 어떻게 하는가
+
+추론은 매번 2초 미래를 생성하지만, 실제 상태 업데이트는 **첫 0.5초만 commit**한다.
+
+즉, 아래처럼 반복한다.
+
+1. 현재 state에서 2초 미래 생성
+2. 첫 0.5초만 사용
+3. 그 상태를 새 current state로 갱신
+4. 다시 2초 미래 생성
+
+이 과정을 16번 반복하면 8초 미래 80 step이 채워진다.
+
+---
+
+## 2. 설치
+
+### 2-1. conda 환경
+
+기존 README와 같은 방식으로 시작하면 된다.
+
+```bash
+conda create -y -n catk python=3.11.9
+conda activate catk
+conda install -y -c conda-forge ffmpeg=4.3.2
+pip install -r install/requirements.txt
+pip install torch_geometric
+pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+pip install --no-deps waymo-open-dataset-tf-2-12-0==1.6.4
 ```
 
-## News & Updates
+### 2-2. 선택 사항: Docker
 
-Apr. 2025
-- **Oral at CVPR 2025**: Cheers!
-- **Top on the WOSAC Leaderboard 2024**: With the Waymo Challenges 2025 coming up, the WOSAC 2024 leaderboard is now closed and our method remains in the 1st place.
+기존 repo처럼 Docker를 써도 된다. 원래 repo 설명대로 Docker 쪽이 더 빠를 수 있다.
 
-Feb. 2025
-- **Paper accepted at CVPR 2025:** Cheers!
+---
 
-- **Model checkpoints for WOSAC:** You can obtain the checkpoints for our WOSAC submission (SMART-tiny-CLSFT) by sending an email to Zhejun (zhejun.zhang94@gmail.com). In accordance with Waymo's terms, you must attach a screenshot showing that you are registered and logged into the [My Submissions](https://waymo.com/open/challenges/submissions) page of the Waymo Open Dataset.
+## 3. 데이터 준비
 
-- **SMART-mini and SMART-nano:** SMART-tiny with 7M parameters requires training on 8x A100 for a few days, which may be unaffordable in some cases. To address this, we have added config files for two smaller model, [smart_mini_3M.yaml](configs/model/smart_mini_3M.yaml) and [smart_nano_1M.yaml](configs/model/smart_nano_1M.yaml). Specifically, SMART-nano-1M can be trained on a single A100, but its performance is significantly worse. After pre-training and CAT-K fine-tuning, we achieved an RMM of 0.74 with SMART-nano-1M, which is 0.03 lower than that of SMART-tiny-7M. 
+### 3-1. Waymo Open Motion Dataset 다운로드
 
-Jan. 2025
-- **SoTA performance on WOSAC:** CAT-K is now rank #1 on the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/)! We resolved an issue in the agent token vocabulary, and now our fine-tuned model achieves an RMM of **0.7702**. Even our reproduced SMART-tiny-7M (not published on the leaderboard, trained only for 32 epochs via BC) achieves an RMM of **0.7671**, which is comparable to the current second-place method. Reproducing our results should be straightforward. Give it a try!
+이 코드는 **Waymo Open Motion Dataset v1.2.1**을 기준으로 쓴다.
 
-- **Issue in the agent token vocabulary:** We discovered that the [agent token vocabulary file](src/smart/tokens/cluster_frame_5_2048_remove_duplicate.pkl) we were using (borrowed from the [SMART repository](https://github.com/rainmaker22/SMART/blob/main/smart/tokens/cluster_frame_5_2048.pkl)) was intended only for sanity checks and not for reproducing optimal performance. To resolve this, we added a [script](src/smart/tokens/traj_clustering.py) and used it to build an [appropriate agent token vocabulary](src/smart/tokens/agent_vocab_555_s2.pkl). Our script is based on the [k-disk clustering script from SMART](https://github.com/rainmaker22/SMART/blob/main/scripts/traj_clstering.py). Thanks to the updated agent tokens, all our traffic simulation models saw a significant performance improvement of approximately +0.0060 RMM!
+Waymo 페이지에서 아래 3개 split을 준비해야 한다.
 
+- `training`
+- `validation`
+- `testing`
 
+압축을 푼 뒤 예시는 아래처럼 잡으면 된다.
 
-## Installation
-- The easy way to setup the environment is to create a [conda](https://docs.conda.io/en/latest/miniconda.html) environment using the following commands
-  ```
-  conda create -y -n catk python=3.11.9
-  conda activate catk
-  conda install -y -c conda-forge ffmpeg=4.3.2
-  pip install -r install/requirements.txt
-  pip install torch_geometric
-  pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
-  pip install --no-deps waymo-open-dataset-tf-2-12-0==1.6.4
-  ```
-- Alternatively, a better way is to use the [Dockerfile](install/Dockerfile) and build your own docker. We found the code runs faster in the docker for some reasons.
-- We use [WandB](https://wandb.ai/) for logging. You can register an account for free.
-- **Be aware**
-  - We use 8 *NVIDIA A100 (80GB)* for training and validation, the training and fine-tuning take a few days, whereas the validation and testing take a few hours.
-  - We cannot share pre-trained models according to the [terms](https://waymo.com/open/terms) of the Waymo Open Motion Dataset.
+```text
+/scratch/data/womd/uncompressed/scenario/
+  training/
+  validation/
+  testing/
+```
 
+### 3-2. 캐시 경로 확인
 
-## Dataset preparation
-- Download the [Waymo Open Motion Dataset](https://waymo.com/open/download/). We use v1.2.1.
-- Use [scripts/cache_womd.sh](scripts/cache_womd.sh) to preprocess the dataset into pickle files to accelerate data loading during the training and evaluation.
-- You should pack three datasets: `training`, `validation` and `testing`.
+기본 캐시 경로는 `configs/paths/default.yaml`에 있다.
 
-## Run the code
-In the scripts, we provide
-- [scripts/train.sh](scripts/train.sh) for training and fine-tuning.
-- [scripts/local_val.sh](scripts/local_val.sh) for local validation.
-- [scripts/wosac_sub.sh](scripts/wosac_sub.sh) for packing submission files.
+```yaml
+cache_root: /scratch/cache/SMART
+```
 
-The default script runs with single GPU. We use DDP for multi GPU training and validation, and the codes are also found in the bash scripts.
-To reproduce our final results, you should follow the following steps
-1. Use [scripts/train.sh](scripts/train.sh) with the [BC pre-training config](configs/experiment/pre_bc.yaml) to pre-train the SMART-tiny 7M model.
-2. Use [scripts/train.sh](scripts/train.sh) with the [CLSFT with CAT-K config](configs/experiment/clsft.yaml) to fine-tune the SMART-tiny model pre-trained in step 1.
-3. Use [scripts/wosac_sub.sh](scripts/wosac_sub.sh) to pack the submission fille for `validate` or `test` split. Upload the `wosac_submission.tar.gz` file located in `logs` folder to the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) such that you can evaluate the model fine-tuned in step 2 on the WOSAC leaderboard.
-4. Alternatively, you can do local validation with [scripts/local_val.sh](scripts/local_val.sh).
+원하는 경로를 쓰고 싶으면 이 값을 바꾸면 된다.
 
-For Gaussian Mixture Model (GMM) based ego policy, the procedure is similar, just use the following configs
-- [BC pre-training config for GMM-based ego policy](configs/experiment/ego_gmm_pre_bc.yaml)
-- [CLSFT with CAT-K config for GMM-based ego policy](configs/experiment/ego_gmm_clsft.yaml)
-- [Local validation config for GMM-based ego policy](configs/experiment/ego_gmm_local_val.yaml)
-- There is no submission option for ego-policy.
+예를 들면 최종 캐시 구조는 아래처럼 맞추면 된다.
 
-## Performance
+```text
+/scratch/cache/SMART/
+  training/
+  validation/
+  testing/
+  validation_tfrecords_splitted/
+```
 
-The submission of our CAT-K fine-tuned SMART to the [WOSAC Leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) is found [here](https://waymo.com/open/challenges/sim-agents/results/5ea7a3eb-7337/1731338655639000/).
-The submission of our reproduced SMART to the test split is found [here](https://waymo.com/open/challenges/sim-agents/results/5ea7a3eb-7337/1731391949275000/), note that it is not published to the leaderboard.
+### 3-3. 전처리 실행
 
-## Ablation configs
+가장 쉬운 방법은 `scripts/cache_womd.sh`를 split별로 돌리는 것이다.
 
-Please refer to [docs/ablation_models.md](docs/ablation_models.md) for the configurations of ablation models.
-Specifically you will find the data augmentation methods used by [SMART](https://arxiv.org/abs/2207.05844) and [Trajeglish](https://arxiv.org/abs/2312.04535).
+먼저 스크립트 안의 값을 환경에 맞게 바꾼다.
 
-## Acknowledgement
+```bash
+DATA_SPLIT=validation      # training, validation, testing
+INPUT_DIR=/scratch/data/womd/uncompressed/scenario
+OUTPUT_DIR=/scratch/cache/SMART
+NUM_WORKERS=12
+```
 
-Our code is based on [SMART](https://github.com/rainmaker22/SMART). We appreciate them for the valuable open-source code! Please don't forget to cite their amazing work as well!
+그 다음 split별로 세 번 돌린다.
+
+```bash
+bash scripts/cache_womd.sh
+```
+
+한 번에 하나의 split만 처리하므로, `DATA_SPLIT`를 아래처럼 바꿔서 각각 돌리면 된다.
+
+- `training`
+- `validation`
+- `testing`
+
+### 3-4. 전처리 후 확인할 것
+
+아래 경로가 채워졌는지 확인한다.
+
+- `${paths.cache_root}/training`
+- `${paths.cache_root}/validation`
+- `${paths.cache_root}/testing`
+- `${paths.cache_root}/validation_tfrecords_splitted`
+
+학습과 검증은 pickle 캐시를 읽고, WOSAC metric 계산 쪽은 validation tfrecord split 경로를 같이 쓴다.
+
+---
+
+## 4. wandb 설정
+
+이 버전은 `test_new` 브랜치의 개인 wandb 설정을 그대로 따른다.
+
+기본값은 아래다.
+
+- `entity: jksg01019-naver-labs`
+- `project: SMART-FLOW`
+
+기본값 그대로 쓰려면 아무 것도 안 해도 된다.
+
+직접 바꾸고 싶으면 실행 전에 환경 변수만 넣으면 된다.
+
+```bash
+export WANDB_ENTITY=jksg01019-naver-labs
+export WANDB_PROJECT=SMART-FLOW
+```
+
+로그는 task 이름 아래로 저장된다.
+
+---
+
+## 5. SMART-flow 7M pre-BC 학습
+
+### 5-1. 기본 학습 설정
+
+H100 6장 기준 기본값은 아래로 맞춰 두었다.
+
+- `precision: bf16-mixed`
+- `lr: 5e-4`
+- `max_epochs: 64`
+- `train_batch_size: 12 per GPU`
+- `val_batch_size: 4`
+- `test_batch_size: 4`
+- `num_workers: 10`
+- `accumulate_grad_batches: 1`
+
+메모리가 빠듯하면 가장 먼저 할 일은 **train batch를 12에서 10으로 낮추는 것**이다.
+
+### 5-2. 6x H100에서 학습 시작
+
+기본 스크립트는 아래다.
+
+```bash
+bash scripts/train.sh
+```
+
+이 스크립트는 내부에서 아래를 실행한다.
+
+```bash
+torchrun -m src.run experiment=pre_bc task_name=smart_flow_7m_pre_bc
+```
+
+서버에서 6개 GPU만 쓰고 싶으면 보통 아래처럼 실행하면 된다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/train.sh
+```
+
+### 5-3. train batch를 10으로 낮추고 싶을 때
+
+아래처럼 override를 추가하면 된다.
+
+```bash
+torchrun -m src.run \
+  experiment=pre_bc \
+  task_name=smart_flow_7m_pre_bc_bs10 \
+  data.train_batch_size=10
+```
+
+### 5-4. 중간부터 이어서 학습할 때
+
+`ckpt_path`를 넣으면 된다.
+
+```bash
+torchrun -m src.run \
+  experiment=pre_bc \
+  task_name=smart_flow_7m_pre_bc_resume \
+  ckpt_path=/path/to/last.ckpt
+```
+
+### 5-5. 출력 위치
+
+Hydra 출력 폴더 아래에 체크포인트와 로그가 모인다.
+
+기본 로그 루트는 `configs/paths/default.yaml` 기준으로 `logs/` 아래다.
+
+---
+
+## 6. 로컬 검증
+
+### 6-1. 기본 로컬 검증
+
+체크포인트 경로를 `configs/experiment/local_val.yaml`의 `ckpt_path`에 넣는다.
+
+```yaml
+ckpt_path: YOUR_MODEL.ckpt
+```
+
+그 다음 실행한다.
+
+```bash
+bash scripts/local_val.sh
+```
+
+기본 설정은 아래다.
+
+- `val_open_loop: false`
+- `val_closed_loop: true`
+- `n_rollout_closed_val: 32`
+- `sample_steps: 4`
+- `sample_method: euler`
+
+### 6-2. 빠른 smoke test
+
+로컬에서 가볍게만 보고 싶으면 rollout 수를 줄이면 된다.
+
+```bash
+python -m src.run \
+  experiment=local_val \
+  action=validate \
+  ckpt_path=/path/to/model.ckpt \
+  model.model_config.n_rollout_closed_val=4 \
+  trainer.devices=1 \
+  trainer.strategy=auto
+```
+
+### 6-3. open-loop loss까지 같이 보고 싶을 때
+
+```bash
+python -m src.run \
+  experiment=local_val \
+  action=validate \
+  ckpt_path=/path/to/model.ckpt \
+  model.model_config.val_open_loop=true
+```
+
+---
+
+## 7. WOSAC submission 파일 만들기
+
+### 7-1. submission 메타 정보 수정
+
+`configs/experiment/wosac_sub.yaml` 안의 아래 항목을 실제 값으로 바꾼다.
+
+```yaml
+authors: [Anonymous]
+affiliation: YOUR_AFFILIATION
+description: YOUR_DESCRIPTION
+method_link: YOUR_METHOD_LINK
+account_name: YOUR_ACCOUNT_NAME
+```
+
+### 7-2. validation split submission 만들기
+
+```bash
+bash scripts/wosac_sub.sh
+```
+
+기본 스크립트는 `ACTION=validate`로 되어 있다.
+
+### 7-3. test split submission 만들기
+
+`scripts/wosac_sub.sh` 안의 값을 바꾸거나, 직접 아래처럼 실행한다.
+
+```bash
+python -m src.run \
+  experiment=wosac_sub \
+  action=test \
+  ckpt_path=/path/to/model.ckpt \
+  task_name=smart_flow_7m_wosac_test
+```
+
+### 7-4. 업로드 파일 위치
+
+실행이 끝나면 `logs/` 아래 Hydra 출력 폴더 안에 `wosac_submission.tar.gz`가 생성된다.
+
+이 파일을 Waymo WOSAC leaderboard 제출 페이지에 업로드하면 된다.
+
+---
+
+## 8. 시각화
+
+이 repo는 validation 단계에서 자동으로 rollout 비디오를 저장할 수 있다.
+
+### 8-1. 비디오 저장 켜기
+
+아래 값을 0보다 크게 주면 된다.
+
+- `model.model_config.n_vis_batch`
+- `model.model_config.n_vis_scenario`
+- `model.model_config.n_vis_rollout`
+
+예시는 아래다.
+
+```bash
+python -m src.run \
+  experiment=local_val \
+  action=validate \
+  ckpt_path=/path/to/model.ckpt \
+  model.model_config.n_vis_batch=1 \
+  model.model_config.n_vis_scenario=2 \
+  model.model_config.n_vis_rollout=4 \
+  trainer.devices=1 \
+  trainer.strategy=auto
+```
+
+### 8-2. 저장 위치
+
+비디오는 각 실행 폴더 아래 `videos/`에 저장된다.
+
+예시:
+
+```text
+logs/.../videos/batch_00-scenario_00/
+```
+
+wandb를 켜 둔 경우, 저장된 비디오는 logger를 통해 같이 올라간다.
+
+---
+
+## 9. 자주 바꾸는 설정
+
+### 9-1. solver step 수 바꾸기
+
+기본은 4 step이다.
+
+```bash
+python -m src.run \
+  experiment=local_val \
+  action=validate \
+  ckpt_path=/path/to/model.ckpt \
+  model.model_config.validation_rollout_sampling.sample_steps=6
+```
+
+### 9-2. heun으로 바꾸기
+
+```bash
+python -m src.run \
+  experiment=local_val \
+  action=validate \
+  ckpt_path=/path/to/model.ckpt \
+  model.model_config.validation_rollout_sampling.sample_method=heun
+```
+
+### 9-3. rollout 수 바꾸기
+
+```bash
+python -m src.run \
+  experiment=local_val \
+  action=validate \
+  ckpt_path=/path/to/model.ckpt \
+  model.model_config.n_rollout_closed_val=64
+```
+
+---
+
+## 10. 이 브랜치에서 의도적으로 제외한 것
+
+이 버전은 아래 범위를 일부러 제외했다.
+
+- GMM 기반 ego policy
+- CAT-K fine-tuning
+- token overlap loss
+- token classification loss
+
+즉, 이 버전은 **SMART-flow 7M pre-BC + closed-loop validation + WOSAC submission**만 유지한다.
+
+---
+
+## 11. 추천 실행 순서
+
+처음 보는 사람이 그대로 따라 하려면 아래 순서로 하면 된다.
+
+1. conda 환경 생성 및 패키지 설치
+2. Waymo dataset 다운로드
+3. `configs/paths/default.yaml`의 `cache_root` 확인
+4. `scripts/cache_womd.sh`로 `training / validation / testing` 캐시 생성
+5. `bash scripts/train.sh`로 pre-BC 학습
+6. `bash scripts/local_val.sh`로 로컬 검증
+7. 시각화가 필요하면 `n_vis_*` 값을 켜서 다시 검증
+8. `bash scripts/wosac_sub.sh`로 submission 파일 생성
+9. `wosac_submission.tar.gz` 업로드
+
+---
+
+## 12. 참고
+
+이 버전은 원래 `brand_new`의 SMART-tiny 7M 구조를 바탕으로 하며,
+네트워크 폭과 깊이는 유지하고 head 예산만 flow matching 쪽으로 다시 배치했다.

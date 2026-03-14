@@ -1,15 +1,4 @@
-# Not a contribution
-# Changes made by NVIDIA CORPORATION & AFFILIATES enabling <CAT-K> or otherwise documented as
-# NVIDIA-proprietary are not a contribution and subject to the following terms and conditions:
-# SPDX-FileCopyrightText: Copyright (c) <year> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
+from __future__ import annotations
 
 from typing import Dict, Optional
 
@@ -22,6 +11,7 @@ from .map_decoder import SMARTMapDecoder
 
 
 class SMARTDecoder(nn.Module):
+    """맵 인코더와 agent flow decoder를 묶는 얇은 래퍼이다."""
 
     def __init__(
         self,
@@ -40,8 +30,13 @@ class SMARTDecoder(nn.Module):
         dropout: float,
         hist_drop_prob: float,
         n_token_agent: int,
+        flow_num_future_steps: int,
+        flow_num_anchors: int,
+        flow_anchor_stride: int,
+        commit_num_future_steps: int,
+        flow_tau_eps: float,
     ) -> None:
-        super(SMARTDecoder, self).__init__()
+        super().__init__()
         self.map_encoder = SMARTMapDecoder(
             hidden_dim=hidden_dim,
             pl2pl_radius=pl2pl_radius,
@@ -65,14 +60,21 @@ class SMARTDecoder(nn.Module):
             dropout=dropout,
             hist_drop_prob=hist_drop_prob,
             n_token_agent=n_token_agent,
+            flow_num_future_steps=flow_num_future_steps,
+            flow_num_anchors=flow_num_anchors,
+            flow_anchor_stride=flow_anchor_stride,
+            commit_num_future_steps=commit_num_future_steps,
+            flow_tau_eps=flow_tau_eps,
         )
 
     def forward(
-        self, tokenized_map: Dict[str, Tensor], tokenized_agent: Dict[str, Tensor]
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
     ) -> Dict[str, Tensor]:
+        """학습용 forward이다."""
         map_feature = self.map_encoder(tokenized_map)
-        pred_dict = self.agent_encoder(tokenized_agent, map_feature)
-        return pred_dict
+        return self.agent_encoder(tokenized_agent, map_feature)
 
     def inference(
         self,
@@ -80,8 +82,6 @@ class SMARTDecoder(nn.Module):
         tokenized_agent: Dict[str, Tensor],
         sampling_scheme: DictConfig,
     ) -> Dict[str, Tensor]:
+        """flow matching 기반 closed-loop inference이다."""
         map_feature = self.map_encoder(tokenized_map)
-        pred_dict = self.agent_encoder.inference(
-            tokenized_agent, map_feature, sampling_scheme
-        )
-        return pred_dict
+        return self.agent_encoder.inference(tokenized_agent, map_feature, sampling_scheme)

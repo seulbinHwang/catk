@@ -16,10 +16,10 @@ defaults:
   # e.g. best hyperparameters for given model and datamodule
   - experiment: pre_bc
 
-action: fit # fit, finetune, validate, test
+action: fit # fit, validate, test
 
 # task name, determines output directory path
-task_name: "debug_open_source"
+task_name: "smart_flow_7m_debug"
 
 # simply provide checkpoint path to resume training
 ckpt_path: null
