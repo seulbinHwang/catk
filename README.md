@@ -101,50 +101,47 @@ Waymo 페이지에서 아래 3개 split을 준비해야 한다.
   testing/
 ```
 
-### 3-2. 캐시 경로 확인
+### 3-2. 기본 경로와 자동 감지
 
-기본 캐시 경로는 `configs/paths/default.yaml`에 있다.
+지금 스크립트는 아래 순서로 경로를 자동 감지한다.
 
-```yaml
-cache_root: /scratch/cache/SMART
-```
+- raw WOMD root: `/workspace/womd_v1_3/scenario` -> `/scratch/data/womd/uncompressed/scenario` -> `~/womd_v1_3/scenario`
+- cache root: `/workspace/womd_v1_3/SMART_cache` -> `/scratch/cache/SMART` -> `~/womd_v1_3/cache/SMART`
 
-원하는 경로를 쓰고 싶으면 이 값을 바꾸면 된다.
-
-예를 들면 최종 캐시 구조는 아래처럼 맞추면 된다.
+현재 H100 서버에서는 캐시가 이미 아래에 있다고 가정하면 된다.
 
 ```text
-/scratch/cache/SMART/
+/workspace/womd_v1_3/SMART_cache/
   training/
   validation/
   testing/
   validation_tfrecords_splitted/
 ```
 
+다른 경로를 쓰고 싶으면 환경 변수로 override 하면 된다.
+
+```bash
+INPUT_DIR=/your/raw/scenario/root OUTPUT_DIR=/your/cache/root bash scripts/cache_womd.sh training
+SMART_CACHE_ROOT=/your/cache/root bash scripts/train.sh
+```
+
 ### 3-3. 전처리 실행
 
 가장 쉬운 방법은 `scripts/cache_womd.sh`를 split별로 돌리는 것이다.
 
-먼저 스크립트 안의 값을 환경에 맞게 바꾼다.
+기본값은 위 자동 감지 규칙을 따른다. split만 넘기면 된다.
 
 ```bash
-DATA_SPLIT=validation      # training, validation, testing
-INPUT_DIR=/scratch/data/womd/uncompressed/scenario
-OUTPUT_DIR=/scratch/cache/SMART
-NUM_WORKERS=12
+bash scripts/cache_womd.sh training
+bash scripts/cache_womd.sh validation
+bash scripts/cache_womd.sh testing
 ```
 
-그 다음 split별로 세 번 돌린다.
+worker 수를 바꾸고 싶으면 환경 변수만 주면 된다.
 
 ```bash
-bash scripts/cache_womd.sh
+NUM_WORKERS=12 bash scripts/cache_womd.sh training
 ```
-
-한 번에 하나의 split만 처리하므로, `DATA_SPLIT`를 아래처럼 바꿔서 각각 돌리면 된다.
-
-- `training`
-- `validation`
-- `testing`
 
 ### 3-4. 전처리 후 확인할 것
 
@@ -200,31 +197,32 @@ H100 6장 기준 기본값은 아래로 맞춰 두었다.
 
 ### 5-2. 6x H100에서 학습 시작
 
-기본 스크립트는 아래다.
-
-```bash
-bash scripts/train.sh
-```
-
-이 스크립트는 내부에서 아래를 실행한다.
-
-```bash
-torchrun -m src.run experiment=pre_bc task_name=smart_flow_7m_pre_bc
-```
-
-서버에서 6개 GPU만 쓰고 싶으면 보통 아래처럼 실행하면 된다.
+H100 서버에서는 아래 한 줄이 기본 실행법이다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/train.sh
 ```
+
+이 스크립트는 visible GPU 수를 읽어서 자동으로:
+
+- `torchrun --nproc_per_node=6`
+- `trainer=ddp`
+- `precision=bf16-mixed`
+- `train_batch_size=12 per GPU`
+- `val_batch_size=4`
+- `test_batch_size=4`
+- `data.num_workers=10`
+
+으로 맞춘다.
+
+이미 `/workspace/womd_v1_3/SMART_cache` 아래에 캐시가 있으면 그 캐시를 그대로 쓰고, 없을 때만 raw WOMD를 찾아서 `training`과 `validation` 전처리를 자동으로 수행한다.
 
 ### 5-3. train batch를 10으로 낮추고 싶을 때
 
 아래처럼 override를 추가하면 된다.
 
 ```bash
-torchrun -m src.run \
-  experiment=pre_bc \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/train.sh \
   task_name=smart_flow_7m_pre_bc_bs10 \
   data.train_batch_size=10
 ```
@@ -234,8 +232,7 @@ torchrun -m src.run \
 `ckpt_path`를 넣으면 된다.
 
 ```bash
-torchrun -m src.run \
-  experiment=pre_bc \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 bash scripts/train.sh \
   task_name=smart_flow_7m_pre_bc_resume \
   ckpt_path=/path/to/last.ckpt
 ```

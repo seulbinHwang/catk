@@ -7,9 +7,7 @@ export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
 
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-catk}"
 DATA_SPLIT="${1:-${DATA_SPLIT:-training}}" # training, validation, testing
-INPUT_DIR="${INPUT_DIR:-$HOME/womd_v1_3/scenario}"
-OUTPUT_DIR="${OUTPUT_DIR:-$HOME/womd_v1_3/cache/SMART}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+NUM_WORKERS="${NUM_WORKERS:-12}"
 MAX_FILES="${MAX_FILES:-}"
 
 resolve_conda_profile() {
@@ -38,6 +36,51 @@ resolve_conda_profile() {
   return 1
 }
 
+first_existing_dir() {
+  local candidate=""
+  for candidate in "$@"; do
+    if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+first_existing_parent() {
+  local candidate=""
+  for candidate in "$@"; do
+    if [ -n "$candidate" ] && { [ -d "$candidate" ] || [ -d "$(dirname "$candidate")" ]; }; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_default_input_dir() {
+  first_existing_dir \
+    "${RAW_DATA_ROOT:-}" \
+    "/workspace/womd_v1_3/scenario" \
+    "/scratch/data/womd/uncompressed/scenario" \
+    "$HOME/womd_v1_3/scenario" \
+    || printf '%s\n' "$HOME/womd_v1_3/scenario"
+}
+
+detect_default_output_dir() {
+  first_existing_parent \
+    "${OUTPUT_DIR:-}" \
+    "${SMART_CACHE_ROOT:-}" \
+    "/workspace/womd_v1_3/SMART_cache" \
+    "/scratch/cache/SMART" \
+    "$HOME/womd_v1_3/cache/SMART" \
+    "$(pwd)/data/cache/SMART" \
+    || printf '%s\n' "$HOME/womd_v1_3/cache/SMART"
+}
+
+INPUT_DIR="${INPUT_DIR:-$(detect_default_input_dir)}"
+OUTPUT_DIR="${OUTPUT_DIR:-$(detect_default_output_dir)}"
+
 source "$(resolve_conda_profile)"
 conda activate "$CONDA_ENV_NAME"
 
@@ -45,11 +88,17 @@ if [ "$(basename "$INPUT_DIR")" = "$DATA_SPLIT" ]; then
   INPUT_DIR="$(dirname "$INPUT_DIR")"
 fi
 
+if [ ! -d "$INPUT_DIR" ] && [ ! -d "$INPUT_DIR/$DATA_SPLIT" ]; then
+  printf '%s\n' "Input split directory not found. Set INPUT_DIR or RAW_DATA_ROOT. Tried: $INPUT_DIR/$DATA_SPLIT" >&2
+  exit 1
+fi
+
 mkdir -p "$OUTPUT_DIR"
 export SMART_CACHE_ROOT="$OUTPUT_DIR"
 
 cache_done_marker="$OUTPUT_DIR/.${DATA_SPLIT}_cache_complete"
-rm -f "$cache_done_marker"
+cache_partial_marker="$OUTPUT_DIR/.${DATA_SPLIT}_cache_partial"
+rm -f "$cache_done_marker" "$cache_partial_marker"
 
 args=(
   -m
@@ -73,6 +122,8 @@ fi
 
 python "${args[@]}"
 
-if [ -z "$MAX_FILES" ]; then
+if [ -n "$MAX_FILES" ]; then
+  date --iso-8601=seconds > "$cache_partial_marker"
+else
   date --iso-8601=seconds > "$cache_done_marker"
 fi
