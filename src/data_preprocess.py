@@ -480,7 +480,7 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
                 file_writer.write(tf_data)
 
 
-def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
+def batch_process9s_transformer(input_dir, output_dir, split, num_workers, max_files):
     output_dir = Path(output_dir)
     output_dir_tfrecords_splitted = None
     if split == "validation":
@@ -489,8 +489,21 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
     output_dir = output_dir / split
     output_dir.mkdir(exist_ok=True, parents=True)
 
-    input_dir = Path(input_dir) / split
-    packages = sorted([p.as_posix() for p in input_dir.glob("*")])
+    input_root = Path(input_dir)
+    input_dir = input_root if input_root.name == split else input_root / split
+    if not input_dir.is_dir():
+        raise FileNotFoundError(
+            f"Input split directory does not exist: {input_dir.as_posix()}"
+        )
+
+    packages = sorted([p.as_posix() for p in input_dir.glob("*") if p.is_file()])
+    if max_files is not None:
+        packages = packages[:max_files]
+    if not packages:
+        raise FileNotFoundError(
+            f"No tfrecord files found under {input_dir.as_posix()}"
+        )
+
     func = partial(
         wm2argo,
         split=split,
@@ -498,8 +511,13 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
         output_dir_tfrecords_splitted=output_dir_tfrecords_splitted,
     )
 
-    with multiprocessing.Pool(num_workers) as p:
-        r = list(tqdm(p.imap_unordered(func, packages), total=len(packages)))
+    if num_workers <= 1:
+        for package in tqdm(packages):
+            func(package)
+        return
+
+    with multiprocessing.Pool(min(num_workers, len(packages))) as p:
+        list(tqdm(p.imap_unordered(func, packages), total=len(packages)))
 
 
 if __name__ == "__main__":
@@ -514,8 +532,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--max_files", type=int, default=None)
     args = parser.parse_args()
 
     batch_process9s_transformer(
-        args.input_dir, args.output_dir, args.split, num_workers=args.num_workers
+        args.input_dir,
+        args.output_dir,
+        args.split,
+        num_workers=args.num_workers,
+        max_files=args.max_files,
     )

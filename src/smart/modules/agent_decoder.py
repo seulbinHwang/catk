@@ -211,7 +211,7 @@ class SMARTAgentDecoder(nn.Module):
         agent_token_emb = torch.zeros(
             (n_agent, n_step, self.hidden_dim),
             device=device,
-            dtype=pos_a.dtype,
+            dtype=agent_token_emb_veh.dtype,
         )
         agent_token_emb[veh_mask] = agent_token_emb_veh[agent_token_index[veh_mask]]
         agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]

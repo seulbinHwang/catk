@@ -41,7 +41,7 @@ class WaymoTargetBuilderTrain(BaseTransform):
             full_anchor = full_anchor | valid_mask[:, step : step + self.flow_num_future_steps + 1].all(dim=-1)
         return full_anchor
 
-    def __call__(self, data) -> HeteroData:
+    def forward(self, data) -> HeteroData:
         pos = data["agent"]["position"]
         av_index = torch.where(data["agent"]["role"][:, 0])[0].item()
         distance = torch.norm(pos - pos[av_index], dim=-1)
@@ -67,5 +67,5 @@ class WaymoTargetBuilderTrain(BaseTransform):
 class WaymoTargetBuilderVal(BaseTransform):
     """검증/테스트는 입력을 그대로 통과시킨다."""
 
-    def __call__(self, data) -> HeteroData:
+    def forward(self, data) -> HeteroData:
         return HeteroData(data)
