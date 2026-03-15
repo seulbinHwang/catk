@@ -13,3 +13,7 @@ wandb:
   tags: []
   job_type: ""
   resume: allow
+  settings:
+    _target_: wandb.Settings
+    x_stats_gpu_device_ids:
+      - 0
