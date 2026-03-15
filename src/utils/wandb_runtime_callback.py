@@ -76,15 +76,21 @@ class WandbRuntimeMetricsCallback(Callback):
         if pl_module.global_rank != 0 or not trainer.loggers:
             return
 
-        per_device_batch_size = getattr(getattr(trainer, "datamodule", None), "train_batch_size", None)
+        datamodule = getattr(trainer, "datamodule", None)
+        per_device_batch_size = getattr(datamodule, "train_batch_size", None)
+        num_workers = getattr(datamodule, "num_workers", None)
         if per_device_batch_size is None:
             return
 
+        train_setup_metrics = {
+            "train_setup/global_batch_size": int(per_device_batch_size) * int(trainer.world_size),
+        }
+        if num_workers is not None:
+            train_setup_metrics["train_setup/num_workers"] = int(num_workers)
+
         self._log_metrics(
             trainer,
-            {
-                "train_setup/global_batch_size": int(per_device_batch_size) * int(trainer.world_size),
-            },
+            train_setup_metrics,
             step=self._lightning_log_step(trainer),
         )
 
