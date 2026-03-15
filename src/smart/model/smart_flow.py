@@ -11,7 +11,7 @@ from lightning import LightningModule
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
-from src.smart.metrics import WOSACMetrics, WOSACSubmission, minADE
+from src.smart.metrics import SimAgentsMetrics, SimAgentsSubmission, minADE
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_2s,
@@ -24,7 +24,7 @@ from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
-from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
 
 class SMARTFlow(LightningModule):
@@ -49,17 +49,20 @@ class SMARTFlow(LightningModule):
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
         self.minADE = minADE()
-        self.wosac_metrics = WOSACMetrics("val_closed")
-        self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
+        self.sim_agents_metrics = SimAgentsMetrics("val_closed")
+        self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
-        self.val_closed_minade_name = f"val_closed/minADE_best_of_{self.n_rollout_closed_val}"
+        self.closed_loop_metric_name = "val_closed/sim_agents_2025/realism_meta_metric"
+        self.val_closed_minade_name = (
+            f"val_closed/sim_agents_2025/minADE_best_of_{self.n_rollout_closed_val}"
+        )
         self.validation_open_seed = int(model_config.validation_open_seed)
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
         self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
-        self.n_batch_wosac_metric = model_config.n_batch_wosac_metric
+        self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
@@ -285,8 +288,8 @@ class SMARTFlow(LightningModule):
             pred_head = torch.stack(pred_head, dim=1)
 
             scenario_rollouts = None
-            if self.wosac_submission.is_active:
-                self.wosac_submission.update(
+            if self.sim_agents_submission.is_active:
+                self.sim_agents_submission.update(
                     scenario_id=data["scenario_id"],
                     agent_id=data["agent"]["id"],
                     agent_batch=data["agent"]["batch"],
@@ -295,21 +298,21 @@ class SMARTFlow(LightningModule):
                     pred_head=pred_head,
                     global_rank=self.global_rank,
                 )
-                gpu_dict = self.wosac_submission.compute()
+                gpu_dict = self.sim_agents_submission.compute()
                 if self.global_rank == 0:
                     for k in gpu_dict.keys():
                         if isinstance(gpu_dict[k], list):
                             gpu_dict[k] = gpu_dict[k][0]
                     scenario_rollouts = get_scenario_rollouts(**gpu_dict)
-                    self.wosac_submission.aggregate_rollouts(scenario_rollouts)
-                self.wosac_submission.reset()
+                    self.sim_agents_submission.aggregate_rollouts(scenario_rollouts)
+                self.sim_agents_submission.reset()
             else:
                 self.minADE.update(
                     pred=pred_traj,
                     target=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]],
                     target_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
                 )
-                if batch_idx < self.n_batch_wosac_metric:
+                if batch_idx < self.n_batch_sim_agents_metric:
                     device = pred_traj.device
                     scenario_rollouts = get_scenario_rollouts(
                         scenario_id=get_scenario_id_int_tensor(data["scenario_id"], device),
@@ -319,7 +322,7 @@ class SMARTFlow(LightningModule):
                         pred_z=pred_z,
                         pred_head=pred_head,
                     )
-                    self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
+                    self.sim_agents_metrics.update(data["tfrecord_path"], scenario_rollouts)
 
             if self.global_rank == 0 and batch_idx < self.n_vis_batch and scenario_rollouts is not None:
                 video_logger = self._get_video_logger()
@@ -349,23 +352,25 @@ class SMARTFlow(LightningModule):
                 self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=False)
 
         if self.val_closed_loop:
-            if not self.wosac_submission.is_active:
-                epoch_wosac_metrics = self.wosac_metrics.compute()
-                epoch_wosac_metrics[self.val_closed_minade_name] = self.minADE.compute()
+            if not self.sim_agents_submission.is_active:
+                epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
+                epoch_sim_agents_metrics[self.val_closed_minade_name] = self.minADE.compute()
                 self.log(
-                    "val_closed/wosac/realism_meta_metric",
-                    epoch_wosac_metrics["val_closed/wosac/realism_meta_metric"],
+                    self.closed_loop_metric_name,
+                    epoch_sim_agents_metrics[self.closed_loop_metric_name],
                     on_step=False,
                     on_epoch=True,
                     sync_dist=False,
                 )
-                if self.global_rank == 0:
-                    epoch_wosac_metrics["epoch"] = self.log_epoch if self.log_epoch >= 0 else self.current_epoch
-                    self.logger.log_metrics(epoch_wosac_metrics)
-                self.wosac_metrics.reset()
+                if self.global_rank == 0 and self.logger is not None:
+                    epoch_sim_agents_metrics["epoch"] = (
+                        self.log_epoch if self.log_epoch >= 0 else self.current_epoch
+                    )
+                    self.logger.log_metrics(epoch_sim_agents_metrics)
+                self.sim_agents_metrics.reset()
                 self.minADE.reset()
-            if self.global_rank == 0 and self.wosac_submission.is_active:
-                self.wosac_submission.save_sub_file()
+            if self.global_rank == 0 and self.sim_agents_submission.is_active:
+                self.sim_agents_submission.save_sub_file()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -410,7 +415,7 @@ class SMARTFlow(LightningModule):
         pred_z = torch.stack(pred_z, dim=1)
         pred_head = torch.stack(pred_head, dim=1)
 
-        self.wosac_submission.update(
+        self.sim_agents_submission.update(
             scenario_id=data["scenario_id"],
             agent_id=data["agent"]["id"],
             agent_batch=data["agent"]["batch"],
@@ -419,15 +424,15 @@ class SMARTFlow(LightningModule):
             pred_head=pred_head,
             global_rank=self.global_rank,
         )
-        gpu_dict = self.wosac_submission.compute()
+        gpu_dict = self.sim_agents_submission.compute()
         if self.global_rank == 0:
             for k in gpu_dict.keys():
                 if isinstance(gpu_dict[k], list):
                     gpu_dict[k] = gpu_dict[k][0]
             scenario_rollouts = get_scenario_rollouts(**gpu_dict)
-            self.wosac_submission.aggregate_rollouts(scenario_rollouts)
-        self.wosac_submission.reset()
+            self.sim_agents_submission.aggregate_rollouts(scenario_rollouts)
+        self.sim_agents_submission.reset()
 
     def on_test_epoch_end(self):
         if self.global_rank == 0:
-            self.wosac_submission.save_sub_file()
+            self.sim_agents_submission.save_sub_file()

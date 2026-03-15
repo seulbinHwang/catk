@@ -4,7 +4,7 @@ export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 
 MY_EXPERIMENT="local_val_flow"
-MY_TASK_NAME=$MY_EXPERIMENT"-debug"
+MY_TASK_NAME="sim_agents_2025_local_val-debug"
 
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate catk

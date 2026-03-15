@@ -5,7 +5,7 @@ model_config:
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.01
   n_rollout_closed_val: 8
-  n_batch_wosac_metric: 10
+  n_batch_sim_agents_metric: 10
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0
@@ -47,7 +47,7 @@ model_config:
     flow_solver_steps: 4
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
-  wosac_submission:
+  sim_agents_submission:
     is_active: false
     method_name: "SMART-flow-7M"
     authors: [Anonymous]

@@ -25,7 +25,7 @@ trainer:
 
 callbacks:
   model_checkpoint:
-    monitor: val_closed/wosac/realism_meta_metric
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
     mode: max
 
 data:

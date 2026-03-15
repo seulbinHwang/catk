@@ -22,12 +22,15 @@ from torchmetrics.metric import Metric
 from waymo_open_dataset.protos import sim_agents_submission_pb2
 
 from src.utils import RankedLogger
-from src.utils.wosac_utils import get_scenario_id_int_tensor
+from src.utils.sim_agents_utils import get_scenario_id_int_tensor
 
 log = RankedLogger(__name__, rank_zero_only=False)
+_SIM_AGENTS_2025_SUBMISSION_DIRNAME = "sim_agents_2025_submission"
 
 
-class WOSACSubmission(Metric):
+class SimAgentsSubmission(Metric):
+    """Waymo 2025 Sim Agents 제출 파일을 shard와 tar.gz로 저장합니다."""
+
     def __init__(
         self,
         is_active: bool,
@@ -49,10 +52,8 @@ class WOSACSubmission(Metric):
             self.account_name = account_name
             self.buffer_scenario_rollouts = []
             self.i_file = 0
-            self.submission_dir = (
-                hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-            )
-            self.submission_dir = Path(self.submission_dir) / "wosac_submission"
+            self.submission_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+            self.submission_dir = Path(self.submission_dir) / _SIM_AGENTS_2025_SUBMISSION_DIRNAME
             self.submission_dir.mkdir(exist_ok=True)
             self.submission_scenario_id = []
 
@@ -105,18 +106,24 @@ class WOSACSubmission(Metric):
         self.i_file = 0
         tar_file_name = self.submission_dir.as_posix() + ".tar.gz"
 
-        log.info(f"Saving wosac submission files to {tar_file_name}")
-
         shard_files = sorted([p.as_posix() for p in self.submission_dir.glob("*")])
+        if len(shard_files) == 0:
+            log.info("No Sim Agents 2025 submission shards were produced. Skip tar.gz export.")
+            return
+
+        log.info(f"Saving Sim Agents 2025 submission files to {tar_file_name}")
         with tarfile.open(tar_file_name, "w:gz") as tar:
             for output_filename in shard_files:
                 tar.add(
                     output_filename,
                     arcname=output_filename + f"-of-{len(shard_files):05d}",
                 )
-        log.info(f"DONE: Saved wosac submission files to {tar_file_name}")
+        log.info(f"DONE: Saved Sim Agents 2025 submission files to {tar_file_name}")
 
     def _save_shard(self) -> None:
+        if len(self.buffer_scenario_rollouts) == 0:
+            return
+
         shard_submission = sim_agents_submission_pb2.SimAgentsChallengeSubmission(
             scenario_rollouts=self.buffer_scenario_rollouts,
             submission_type=sim_agents_submission_pb2.SimAgentsChallengeSubmission.SIM_AGENTS_SUBMISSION,
@@ -133,7 +140,7 @@ class WOSACSubmission(Metric):
             acknowledge_complies_with_closed_loop_requirement=True,
         )
         output_filename = self.submission_dir / f"submission.binproto-{self.i_file:05d}"
-        log.info(f"Saving wosac submission files to {output_filename}")
+        log.info(f"Saving Sim Agents 2025 submission shard to {output_filename}")
         with open(output_filename, "wb") as f:
             f.write(shard_submission.SerializeToString())
         self.i_file += 1

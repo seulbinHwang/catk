@@ -1,34 +1,32 @@
 # CAT-K Flow Matching
 
-이 저장소는 **flow matching 학습/추론/평가 전용**으로 정리된 버전입니다.  
-기본 실행 경로와 문서, 스크립트는 모두 `smart_flow` 계열만 사용하며 CrossEntropy 기반 next-token 경로는 제거했습니다.
+이 저장소는 **flow matching 학습/추론/평가 전용**으로 정리된 버전입니다.
+이 문서는 **Waymo 2025 Sim Agents 평가와 제출**만 설명합니다. 이 저장소의 평가는 2025 Sim Agents 기준만 사용합니다.
 
-- 기존 SMART의 map/context trunk를 그대로 재사용하고, agent 쪽만 flow decoder로 바꿔 scene-context 품질을 유지합니다.
-- `FlowTokenProcessor`가 14-slot context pack과 13개 anchor를 만들어 2초 미래를 연속값으로 supervision 합니다.
-- `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
-- closed-loop inference는 0.5초씩 commit 하며 `pred_traj_10hz`, `pred_head_10hz`, `pred_z_10hz`를 바로 내보내 WOSAC 경로와 바로 연결됩니다.
-- a2a relation에 coarse relative motion을 추가해 상호작용 정보를 강화하면서도 추가 정규화 규칙을 최소화합니다.
+## 1. 핵심 포인트
 
-## 1. 관련 파일
+- 학습/추론 본체는 `smart_flow` 계열만 사용합니다.
+- closed-loop local 평가는 **Waymo 공식 2025 Sim Agents scorer**를 그대로 사용합니다.
+- local metric namespace는 모두 `val_closed/sim_agents_2025/*` 로 기록됩니다.
+- scenario mean raw metric은 `val_closed/sim_agents_2025_mean/*` 로 기록됩니다.
+- submission export도 2025 Sim Agents 기준으로 저장되며 출력 폴더 이름은 `sim_agents_2025_submission/` 입니다.
 
-이 README에서 다루는 핵심 파일은 아래입니다.
+## 2. 관련 파일
 
 - `src/smart/model/smart_flow.py`
-- `src/smart/modules/smart_flow_decoder.py`
-- `src/smart/modules/flow_agent_decoder.py`
-- `src/smart/modules/flow_local_decoder.py`
-- `src/smart/tokens/flow_token_processor.py`
-- `src/smart/metrics/flow_metrics.py`
+- `src/smart/metrics/sim_agents_metrics.py`
+- `src/smart/metrics/sim_agents_submission.py`
+- `src/utils/sim_agents_utils.py`
 - `configs/model/smart_flow.yaml`
 - `configs/experiment/pre_bc_flow.yaml`
 - `configs/experiment/local_val_flow.yaml`
-- `configs/experiment/wosac_sub_flow.yaml`
+- `configs/experiment/sim_agents_sub_flow.yaml`
 - `configs/run.yaml`
-- `scripts/train.sh`
-- `scripts/local_val.sh`
-- `scripts/wosac_sub.sh`
+- `scripts/train_flow.sh`
+- `scripts/local_val_flow.sh`
+- `scripts/sim_agents_sub_flow.sh`
 
-## 2. 환경 설치
+## 3. 환경 설치
 
 권장 환경:
 
@@ -48,10 +46,10 @@ pip install --upgrade pip
 pip install -r install/requirements.txt
 pip install torch_geometric
 pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
-pip install --no-cache-dir --no-deps waymo-open-dataset-tf-2-12-0==1.6.4
+pip install --no-cache-dir --no-deps waymo-open-dataset-tf-2-12-0==1.6.7
 ```
 
-`ffmpeg`는 visualization용으로 필요합니다.
+`ffmpeg` 는 visualization 용으로 필요합니다.
 
 ```bash
 sudo apt-get update
@@ -66,11 +64,14 @@ export WANDB_PROJECT=SMART-FLOW
 export WANDB_ENTITY=<your_entity>
 ```
 
-## 3. WOMD 데이터 다운로드
+### 3.1 중요
 
-이 경로는 **WOMD scenario TFRecord**를 기준으로 합니다.
+이 저장소는 시작 시점에 **공식 2025 Sim Agents scorer** 와 **traffic light violation 관련 2025 필드** 가 실제로 있는지 바로 확인합니다.
+따라서 예전 Waymo 패키지를 설치하면 validation 시작 전에 명확하게 실패합니다.
 
-원하는 위치에 아래 구조가 되도록 준비합니다.
+## 4. WOMD 데이터 준비
+
+원본 TFRecord 는 아래 구조를 기준으로 둡니다.
 
 ```text
 $RAW_ROOT/
@@ -79,24 +80,24 @@ $RAW_ROOT/
 └── testing/
 ```
 
-예시 경로:
+예시:
 
 ```bash
 export RAW_ROOT=/workspace/womd_v1_3/scenario
 export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
 ```
 
-토큰 파일은 저장소에 이미 포함되어 있으므로 별도 다운로드가 필요 없습니다.
+토큰 파일은 저장소에 포함되어 있으므로 따로 받을 필요가 없습니다.
 
 - `src/smart/tokens/map_traj_token5.pkl`
 - `src/smart/tokens/agent_vocab_555_s2.pkl`
 
-## 4. 캐시 생성
+## 5. 캐시 생성
 
-학습과 평가는 원본 TFRecord가 아니라 시나리오별 `.pkl` 캐시를 사용합니다.  
-canonical 경로는 `src.data_preprocess`를 직접 호출하는 것입니다.
+학습과 추론은 scenario 별 `.pkl` 캐시를 사용합니다.
+canonical 경로는 `src.data_preprocess` 입니다.
 
-### 4.1 training 캐시
+### 5.1 training
 
 ```bash
 python -m src.data_preprocess \
@@ -106,7 +107,7 @@ python -m src.data_preprocess \
   --num_workers 56
 ```
 
-### 4.2 validation 캐시
+### 5.2 validation
 
 ```bash
 python -m src.data_preprocess \
@@ -116,7 +117,7 @@ python -m src.data_preprocess \
   --num_workers 56
 ```
 
-### 4.3 testing 캐시
+### 5.3 testing
 
 ```bash
 python -m src.data_preprocess \
@@ -126,7 +127,7 @@ python -m src.data_preprocess \
   --num_workers 56
 ```
 
-캐시가 끝나면 대략 아래처럼 생깁니다.
+완료 후 구조는 대략 아래와 같습니다.
 
 ```text
 $CACHE_ROOT/
@@ -138,13 +139,14 @@ $CACHE_ROOT/
 
 설명:
 
-- `training/`, `validation/`, `testing/`에는 시나리오별 `.pkl`이 저장됩니다.
-- `validation_tfrecords_splitted/`는 `validation` 캐시 생성 시 자동 생성됩니다.
-- `validation_tfrecords_splitted/`는 local evaluation, WOSAC metric 계산, mp4 visualization에 필요합니다.
+- `training/`, `validation/`, `testing/` 에는 scenario 별 `.pkl` 이 저장됩니다.
+- `validation_tfrecords_splitted/` 는 validation cache 생성 시 자동 생성됩니다.
+- **공식 local 2025 score 계산은 `validation_tfrecords_splitted/` 가 있어야만 가능합니다.**
+- test split 은 local numeric metric 을 계산하지 않고 submission export 만 합니다.
 
-## 5. 6x H100에서 Flow Matching 학습
+## 6. 6x H100에서 Flow Matching 학습
 
-이 경로의 기본 학습 설정은 `configs/experiment/pre_bc_flow.yaml`입니다.
+기본 학습 설정은 `configs/experiment/pre_bc_flow.yaml` 입니다.
 
 - `model=smart_flow`
 - `precision=bf16-mixed`
@@ -155,8 +157,9 @@ $CACHE_ROOT/
 - `num_workers=10`
 - `lr=5e-4`
 - `lr_warmup_steps=2`
+- best checkpoint monitor: `val_closed/sim_agents_2025/realism_meta_metric`
 
-H100 6장 기준 권장 실행:
+권장 실행 예시:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
@@ -171,168 +174,30 @@ torchrun \
   task_name=flow_pretrain_h1006
 ```
 
-### 5.1 학습 설정을 거칠게 이해하는 법
-
-- 기본 진입점은 `configs/run.yaml`이고, 여기서 `data/model/callbacks/logger/trainer/paths/hydra`를 조합합니다.
-- `experiment=pre_bc_flow`는 `configs/experiment/pre_bc_flow.yaml`을 읽어 학습용 하이퍼파라미터를 덮어씁니다.
-- `trainer=ddp`는 `configs/trainer/ddp.yaml`을 읽어 DDP 관련 옵션을 덮어씁니다.
-- `task_name=...`는 실험 이름이자 저장 폴더 이름입니다. 결과는 대략 `logs/<task_name>/runs/<timestamp>/` 아래에 생깁니다.
-- CLI override가 가장 우선입니다. 즉, 같은 파라미터라도 커맨드에 직접 적은 값이 최종 적용됩니다.
-
-예시:
-
-```bash
-torchrun ... -m src.run \
-  experiment=pre_bc_flow \
-  trainer=ddp \
-  task_name=flow_pretrain_h1006
-```
-
-### 5.2 Validation 주기와 val_open / val_closed 바꾸기
-
-- 학습 중 validation은 `trainer.check_val_every_n_epoch` 마다 실행됩니다.
-- `model.model_config.val_open_loop=true/false`로 open-loop validation on/off를 바꿉니다.
-- `model.model_config.val_closed_loop=true/false`로 closed-loop validation on/off를 바꿉니다.
-- validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
-- `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. `pre_bc_flow` 기본값은 `8`이고, `32`로 올리면 WOSAC 계열 설정과 같은 rollout 수가 됩니다. `val_open_loop`는 반복 rollout이 아니라 batch당 forward 1회입니다.
-- `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
-- `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
-- `val_closed_loop` 기준 총 rollout 수는 대략 `(실행한 val batch 수) x val_batch_size x n_rollout_closed_val` 입니다.
-
-예시:
-
-```bash
-# 매 epoch마다 validation
-... trainer.check_val_every_n_epoch=1
-
-# 5 epoch마다 validation
-... trainer.check_val_every_n_epoch=5
-
-# val_open만 실행
-... model.model_config.val_open_loop=true model.model_config.val_closed_loop=false
-
-# val_closed만 실행
-... model.model_config.val_open_loop=false model.model_config.val_closed_loop=true
-
-# val_closed에서 scene당 rollout 32회
-... model.model_config.n_rollout_closed_val=32
-
-# validation을 전체 val set에 대해 수행
-... trainer.limit_val_batches=1.0
-
-# validation batch size를 4 -> 2로 줄이기
-... data.val_batch_size=2
-```
-
-### 5.3 Checkpoint 저장 규칙 바꾸기
-
-- checkpoint 저장 시도는 validation이 도는 시점에 함께 일어납니다. 현재 `pre_bc_flow`는 `check_val_every_n_epoch=3` 이라 기본적으로 3 epoch마다 평가됩니다.
-- 현재 기본 기준은 `callbacks.model_checkpoint.monitor=val_closed/wosac/realism_meta_metric`, `mode=max`, `save_top_k=1` 입니다. 즉, `realism_meta_metric`이 가장 높은 checkpoint 1개를 유지합니다.
-- 저장 위치는 `callbacks.model_checkpoint.dirpath=${paths.output_dir}/checkpoints` 이고, 실제 경로는 `logs/<task_name>/runs/<timestamp>/checkpoints/` 입니다.
-- 파일명 규칙은 `callbacks.model_checkpoint.filename="epoch_{epoch:03d}"` 이라 `epoch_002.ckpt` 같은 이름이 됩니다.
-- `save_last=link` 이라 `last.ckpt`도 함께 생기며, 저장된 checkpoint를 가리키는 링크로 유지됩니다.
-
-자주 바꾸는 파라미터:
-
-- `callbacks.model_checkpoint.monitor`: 어떤 metric으로 best를 고를지
-- `callbacks.model_checkpoint.mode=min|max`: metric이 작을수록 좋은지, 클수록 좋은지
-- `callbacks.model_checkpoint.save_top_k`: best checkpoint를 몇 개 남길지
-- `callbacks.model_checkpoint.filename`: 저장 파일명 패턴
-- `callbacks.model_checkpoint.dirpath`: 저장 폴더
-- `callbacks.model_checkpoint.save_last=true|link|false`: `last.ckpt`를 어떻게 둘지
-
-예시:
-
-```bash
-# val_open/loss가 가장 낮은 checkpoint 3개 저장
-... callbacks.model_checkpoint.monitor=val_open/loss \
-    callbacks.model_checkpoint.mode=min \
-    callbacks.model_checkpoint.save_top_k=3
-
-# checkpoint 파일명을 바꾸기
-... callbacks.model_checkpoint.filename='epoch_{epoch:03d}_step_{step}'
-```
-
-### 5.4 `val_closed_loop` 비디오 저장하기
-
-- `pre_bc_flow` 기본값은 `n_vis_batch=0`, `n_vis_scenario=0`, `n_vis_rollout=0` 이라서 `val_closed_loop`가 돌아도 mp4는 저장하지 않습니다.
-- 전제: `model.model_config.val_closed_loop=true`
-- 꼭 필요한 파라미터:
-  - `model.model_config.n_vis_batch`: validation에서 비디오를 남길 앞쪽 batch 수. 보통 `1~2`부터 시작합니다.
-  - `model.model_config.n_vis_scenario`: 각 batch에서 저장할 scenario 수. 보통 `1~2`부터 시작하고, 현재 batch 크기 이하로 두면 됩니다.
-  - `model.model_config.n_vis_rollout`: 각 scenario에서 저장할 rollout 영상 수. 보통 `1~2`부터 시작하고, `n_rollout_closed_val` 이하로 두면 됩니다.
-  - `model.model_config.delete_local_videos_after_wandb_upload=true|false`: `wandb`에 비디오를 넘긴 뒤 `logs/.../videos/` 아래 원본 mp4를 지울지 결정합니다. `wandb` logger를 쓰지 않으면 지우지 않습니다.
-- 저장 위치는 `logs/<task_name>/runs/<timestamp>/videos/batch_XX-scenario_YY/` 이고, 각 폴더 아래에 `gt.mp4`, `rollout_00.mp4`, `rollout_01.mp4`, ... 형태로 생깁니다. `gt.mp4`는 GT, `rollout_XX.mp4`는 sampled closed-loop rollout입니다. 단, `delete_local_videos_after_wandb_upload=true`면 upload 직후 이 원본 mp4는 자동 삭제될 수 있습니다.
-- `logger=wandb` 상태면 생성된 mp4가 W&B에도 같이 기록됩니다. `logger.wandb.offline=True`면 먼저 로컬 `wandb/`에 저장되고, 이후 `wandb sync`로 올리면 됩니다.
-
-예시:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-torchrun \
-  --standalone \
-  --nproc_per_node=6 \
-  -m src.run \
-  experiment=pre_bc_flow \
-  trainer=ddp \
-  trainer.devices=6 \
-  paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_pretrain_h1006 \
-  model.model_config.n_vis_batch=1 \
-  model.model_config.n_vis_scenario=2 \
-  model.model_config.n_vis_rollout=2 \
-  model.model_config.delete_local_videos_after_wandb_upload=true
-```
-
-메모리가 부족하면 아래처럼 train batch를 줄이면 됩니다.
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-torchrun \
-  --standalone \
-  --nproc_per_node=6 \
-  -m src.run \
-  experiment=pre_bc_flow \
-  trainer=ddp \
-  trainer.devices=6 \
-  paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_pretrain_bs8 \
-  data.train_batch_size=8
-```
-
-학습 중 W&B에는 기본적으로 아래 metric이 기록됩니다.
+### 6.1 학습 중 W&B에 기록되는 주요 항목
 
 - `train/loss`
 - `train/ADE2s`
 - `train/FDE2s`
-- `val_open/loss`
+- `val_denoise/loss`
 - `val_open/ADE2s`
 - `val_open/FDE2s`
-- `val_closed/ADE`
-- `val_closed/wosac/*`
+- `val_closed/sim_agents_2025/realism_meta_metric`
+- `val_closed/sim_agents_2025/kinematic_metrics`
+- `val_closed/sim_agents_2025/interactive_metrics`
+- `val_closed/sim_agents_2025/map_based_metrics`
+- `val_closed/sim_agents_2025/simulated_collision_rate`
+- `val_closed/sim_agents_2025/simulated_offroad_rate`
+- `val_closed/sim_agents_2025/simulated_traffic_light_violation_rate`
+- `val_closed/sim_agents_2025/minADE_best_of_<n_rollout_closed_val>`
+- `val_closed/sim_agents_2025_mean/*`
 
-추가로 CUDA OOM 위험도 확인용으로 아래 memory metric이 기록됩니다.
+## 7. Local validation: Waymo 2025 Sim Agents score
 
-- `worst_peak_reserved_pct`: train batch 1개 기준의 실시간 지표입니다. 각 rank가 자기 GPU의 peak reserved memory 비율(%)을 계산한 뒤, rank 간 `max`로 합친 값입니다. 즉, "그 step에서 가장 위험했던 GPU"를 보여줍니다. W&B에는 20 step 간격으로 샘플링되어 기록됩니다.
-- `worst_peak_reserved_pct_epoch_max`: 한 epoch 동안 관측된 `worst_peak_reserved_pct`들 중 최대값입니다. OOM 위험 판단은 이 값을 가장 우선해서 보면 됩니다.
+`configs/experiment/local_val_flow.yaml` 은 validation split 에서 closed-loop rollout 을 수행하고,
+**Waymo 공식 2025 Sim Agents metric** 을 계산합니다.
 
-해석 기준은 우선 `worst_peak_reserved_pct_epoch_max`에 적용해서 보면 됩니다. 학습 중 실시간 추세를 볼 때는 `worst_peak_reserved_pct`를 같은 기준으로 봐도 되지만, 최종 판단은 `epoch_max` 기준으로 하는 편이 안전합니다.
-
-- `85%` 미만: 대체로 안정적
-- `85% ~ 92%`: 여유가 줄어드는 구간
-- `92% ~ 96%`: OOM 고위험 구간
-- `97%` 이상: batch 구성이나 입력 길이 스파이크에 따라 바로 OOM이 날 수 있음
-
-추가로 epoch마다 아래 W&B 그래프도 갱신됩니다.
-
-- `training_progress_vs_runtime`: x축은 지금까지 누적된 실제 학습 실행 시간(hours), y축은 전체 epoch 기준 진행률(%)입니다. checkpoint로 학습을 이어서 재개한 경우 이전 runtime도 누적해서 그립니다.
-
-## 6. 평가와 추론
-
-### 6.1 Validation set closed-loop 평가
-
-`configs/experiment/local_val_flow.yaml`은 validation split에서 closed-loop rollout을 수행하고, WOSAC metric을 계산합니다.  
-가장 단순한 사용법은 single GPU 평가입니다.
+single GPU 예시:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -344,17 +209,33 @@ python -m src.run \
   trainer.strategy=auto \
   paths.cache_root="$CACHE_ROOT" \
   ckpt_path=/path/to/model.ckpt \
-  task_name=flow_local_val
+  task_name=flow_sim_agents_2025_validate
 ```
 
-이 명령은 아래를 한 번에 수행합니다.
+6 GPU DDP 예시:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=local_val_flow \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path=/path/to/model.ckpt \
+  task_name=flow_sim_agents_2025_validate_ddp
+```
+
+이 경로는 아래를 한 번에 수행합니다.
 
 - validation split inference
 - closed-loop rollout
-- `val_closed/ADE`
-- `val_closed/wosac/*`
+- `val_closed/sim_agents_2025/*`
+- `val_closed/sim_agents_2025_mean/*`
 
-### 6.2 Validation set에서 open-loop만 보고 싶을 때
+### 7.1 open-loop만 보고 싶을 때
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -371,41 +252,26 @@ python -m src.run \
   model.model_config.val_closed_loop=false
 ```
 
-### 6.3 6 GPU로 validation inference를 병렬화하고 싶을 때
+## 8. Waymo 2025 Sim Agents submission export
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-torchrun \
-  --standalone \
-  --nproc_per_node=6 \
-  -m src.run \
-  experiment=local_val_flow \
-  trainer=ddp \
-  trainer.devices=6 \
-  paths.cache_root="$CACHE_ROOT" \
-  ckpt_path=/path/to/model.ckpt \
-  task_name=flow_local_val_ddp
-```
+`configs/experiment/sim_agents_sub_flow.yaml` 은 **2025 Sim Agents submission export** 용 설정입니다.
+local metric 을 계산하지 않고 rollout proto 와 tar.gz 를 저장합니다.
 
-## 7. WOSAC 제출 파일 생성
+채워야 하는 항목:
 
-`configs/experiment/wosac_sub_flow.yaml`은 WOSAC submission export용 설정입니다.  
-제출 전 아래 항목은 반드시 채워야 합니다.
+- `model.model_config.sim_agents_submission.method_name`
+- `model.model_config.sim_agents_submission.authors`
+- `model.model_config.sim_agents_submission.affiliation`
+- `model.model_config.sim_agents_submission.description`
+- `model.model_config.sim_agents_submission.method_link`
+- `model.model_config.sim_agents_submission.account_name`
 
-- `ckpt_path`
-- `model.model_config.wosac_submission.method_name`
-- `authors`
-- `affiliation`
-- `description`
-- `method_link`
-- `account_name`
-
-### 7.1 validation split으로 submission 형식 점검
+### 8.1 validation split 을 submission 형식으로 저장
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 python -m src.run \
-  experiment=wosac_sub_flow \
+  experiment=sim_agents_sub_flow \
   action=validate \
   trainer=default \
   trainer.accelerator=gpu \
@@ -413,119 +279,68 @@ python -m src.run \
   trainer.strategy=auto \
   paths.cache_root="$CACHE_ROOT" \
   ckpt_path=/path/to/model.ckpt \
-  task_name=flow_wosac_validate \
-  model.model_config.wosac_submission.method_name="SMART-flow-7M" \
-  model.model_config.wosac_submission.authors=[Anonymous] \
-  model.model_config.wosac_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.wosac_submission.description="YOUR_DESCRIPTION" \
-  model.model_config.wosac_submission.method_link="YOUR_METHOD_LINK" \
-  model.model_config.wosac_submission.account_name="YOUR_ACCOUNT_NAME"
+  task_name=flow_sim_agents_2025_validate_export \
+  model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
+  model.model_config.sim_agents_submission.authors=[Anonymous] \
+  model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
+  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
+  model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
 ```
 
-### 7.2 test split submission export
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-torchrun \
-  --standalone \
-  --nproc_per_node=6 \
-  -m src.run \
-  experiment=wosac_sub_flow \
-  action=test \
-  trainer=ddp \
-  trainer.devices=6 \
-  paths.cache_root="$CACHE_ROOT" \
-  ckpt_path=/path/to/model.ckpt \
-  task_name=flow_wosac_test \
-  model.model_config.wosac_submission.method_name="SMART-flow-7M" \
-  model.model_config.wosac_submission.authors=[Anonymous] \
-  model.model_config.wosac_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.wosac_submission.description="YOUR_DESCRIPTION" \
-  model.model_config.wosac_submission.method_link="YOUR_METHOD_LINK" \
-  model.model_config.wosac_submission.account_name="YOUR_ACCOUNT_NAME"
-```
-
-출력물:
-
-- `logs/<task_name>/runs/<timestamp>/wosac_submission/`
-- `logs/<task_name>/runs/<timestamp>/wosac_submission.tar.gz`
-
-## 8. Visualization
-
-학습 중 `val_closed_loop` 비디오 저장 방법은 위 `5.4 val_closed_loop 비디오 저장하기`를 참고하면 됩니다.
-checkpoint로 validation visualization만 따로 보고 싶으면 아래처럼 `local_val_flow`를 쓰면 됩니다.
+### 8.2 test split submission export
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 python -m src.run \
-  experiment=local_val_flow \
+  experiment=sim_agents_sub_flow \
+  action=test \
   trainer=default \
   trainer.accelerator=gpu \
   trainer.devices=1 \
   trainer.strategy=auto \
   paths.cache_root="$CACHE_ROOT" \
   ckpt_path=/path/to/model.ckpt \
-  task_name=flow_local_val_vis \
-  model.model_config.n_vis_batch=2 \
-  model.model_config.n_vis_scenario=5 \
-  model.model_config.n_vis_rollout=5 \
-  model.model_config.delete_local_videos_after_wandb_upload=true
+  task_name=flow_sim_agents_2025_test_export \
+  model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
+  model.model_config.sim_agents_submission.authors=[Anonymous] \
+  model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
+  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
+  model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
 ```
 
-비디오 저장 위치:
+출력:
 
-```text
-logs/<task_name>/runs/<timestamp>/videos/
-```
+- `logs/<task_name>/runs/<timestamp>/sim_agents_2025_submission/`
+- `logs/<task_name>/runs/<timestamp>/sim_agents_2025_submission.tar.gz`
 
-생성되는 파일:
+## 9. 자주 보는 설정 키
 
-- `gt.mp4`
-- `rollout_00.mp4`
-- `rollout_01.mp4`
-- ...
+- `model.model_config.val_open_loop`
+- `model.model_config.val_closed_loop`
+- `model.model_config.n_rollout_closed_val`
+- `model.model_config.n_batch_sim_agents_metric`
+- `model.model_config.n_vis_batch`
+- `model.model_config.n_vis_scenario`
+- `model.model_config.n_vis_rollout`
+- `model.model_config.delete_local_videos_after_wandb_upload`
+- `model.model_config.sim_agents_submission.*`
+- `callbacks.model_checkpoint.monitor`
 
-W&B logger를 켜 둔 경우 같은 mp4가 W&B에도 함께 업로드됩니다.
-
-## 9. 빠른 체크리스트
-
-학습 전:
-
-- `training/` 캐시 존재
-- `validation/` 캐시 존재
-- `validation_tfrecords_splitted/` 존재
-- `paths.cache_root="$CACHE_ROOT"` 확인
-
-WOSAC test submission 전:
-
-- `testing/` 캐시 존재
-- `ckpt_path` 확인
-- submission metadata 6개 필드 확인
-
-## 10. 자주 쓰는 명령 모음
-
-### 캐시 생성
+## 10. 기본 스크립트
 
 ```bash
-python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT" --split training --num_workers 56
-python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT" --split validation --num_workers 56
-python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT" --split testing --num_workers 56
+bash scripts/train_flow.sh
+bash scripts/local_val_flow.sh
+bash scripts/sim_agents_sub_flow.sh
 ```
 
-### 6x H100 학습
+`scripts/sim_agents_sub_flow.sh` 에서 `ACTION=validate` 또는 `ACTION=test` 를 바꾸면 됩니다.
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_pretrain_h1006
-```
+## 11. 동작 원리 한 줄 정리
 
-### validation 평가
+- local score: validation TFRecord + rollout 을 받아 **Waymo 공식 2025 Sim Agents scorer** 를 호출
+- submission export: rollout 을 `SimAgentsChallengeSubmission` 으로 묶어 shard 와 tar.gz 저장
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m src.run experiment=local_val_flow trainer=default trainer.accelerator=gpu trainer.devices=1 trainer.strategy=auto paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/model.ckpt task_name=flow_local_val
-```
-
-### test submission export
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=wosac_sub_flow action=test trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/model.ckpt task_name=flow_wosac_test
-```
+즉, 이 저장소에서 2025 metric 변경점인 **traffic light violation** 과 공식 scorer 안의 **2025 TTC 경로** 는 모두 저장소 자체 구현이 아니라 **Waymo 공식 scorer 경로** 를 그대로 따라갑니다.

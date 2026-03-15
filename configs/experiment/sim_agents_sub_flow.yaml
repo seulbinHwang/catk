@@ -8,7 +8,7 @@ model:
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
-    n_batch_wosac_metric: 0
+    n_batch_sim_agents_metric: 0
     val_open_loop: false
     val_closed_loop: true
     n_rollout_closed_val: 32
@@ -16,7 +16,7 @@ model:
       sample_steps: 4
       sample_method: midpoint
       noise_scale: 1.0
-    wosac_submission:
+    sim_agents_submission:
       is_active: true
       method_name: "SMART-flow-7M"
       authors: [Anonymous]
