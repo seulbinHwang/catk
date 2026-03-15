@@ -131,8 +131,6 @@ class WandbRuntimeMetricsCallback(Callback):
             trainer,
             {
                 "worst_peak_reserved_pct_epoch_max": float(values.max().item()),
-                "worst_peak_reserved_pct_epoch_p99": float(torch.quantile(values, 0.99).item()),
-                "worst_peak_reserved_pct_epoch_min": float(values.min().item()),
             },
             step=trainer.global_step,
         )

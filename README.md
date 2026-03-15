@@ -302,10 +302,8 @@ torchrun \
 
 - `worst_peak_reserved_pct`: train batch 1개 기준의 실시간 지표입니다. 각 rank가 자기 GPU의 peak reserved memory 비율(%)을 계산한 뒤, rank 간 `max`로 합친 값입니다. 즉, "그 step에서 가장 위험했던 GPU"를 보여줍니다. W&B에는 20 step 간격으로 샘플링되어 기록됩니다.
 - `worst_peak_reserved_pct_epoch_max`: 한 epoch 동안 관측된 `worst_peak_reserved_pct`들 중 최대값입니다. OOM 위험 판단은 이 값을 가장 우선해서 보면 됩니다.
-- `worst_peak_reserved_pct_epoch_p99`: 한 epoch 동안의 `worst_peak_reserved_pct` 분포에서 p99 값입니다. 단 한 번의 극단적 spike보다, "거의 최악에 가까운 평소 상한"을 보고 싶을 때 유용합니다.
-- `worst_peak_reserved_pct_epoch_min`: 한 epoch 동안의 `worst_peak_reserved_pct`들 중 최소값입니다. 가장 한가했던 시점을 보여주는 값이라, OOM 판단 기준으로는 거의 쓰지 않습니다.
 
-해석 기준은 우선 `worst_peak_reserved_pct_epoch_max`에 적용해서 보면 됩니다. 학습 중 실시간 추세를 볼 때는 `worst_peak_reserved_pct`를 같은 기준으로 봐도 되지만, 최종 판단은 `epoch_max` 기준으로 하는 편이 안전합니다. `epoch_p99`는 "단발성 1회 spike를 제외해도 계속 빡빡한지"를 보는 보조 지표로 생각하면 됩니다.
+해석 기준은 우선 `worst_peak_reserved_pct_epoch_max`에 적용해서 보면 됩니다. 학습 중 실시간 추세를 볼 때는 `worst_peak_reserved_pct`를 같은 기준으로 봐도 되지만, 최종 판단은 `epoch_max` 기준으로 하는 편이 안전합니다.
 
 - `85%` 미만: 대체로 안정적
 - `85% ~ 92%`: 여유가 줄어드는 구간
