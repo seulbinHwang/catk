@@ -537,6 +537,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
         sampling_scheme: DictConfig,
+        sampling_seed: int | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -545,6 +546,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent: 평가용 토큰 사전입니다.
             map_feature: 한 번 인코딩한 지도 특징 사전입니다.
             sampling_scheme: 샘플링 설정입니다.
+            sampling_seed: rollout 전체에서 사용할 고정 난수 seed입니다.
 
         Returns:
             Dict[str, torch.Tensor]:
@@ -588,6 +590,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dtype=head_window.dtype,
             device=head_window.device,
         )
+        generator = None
+        if sampling_seed is not None:
+            generator = torch.Generator(device=pos_window.device)
+            generator.manual_seed(int(sampling_seed))
 
         for t in range(n_step_future_2hz):
             n_step = pos_window.shape[1]
@@ -657,6 +663,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     4,
                     device=active_hidden.device,
                     dtype=active_hidden.dtype,
+                    generator=generator,
                 ) * getattr(sampling_scheme, "noise_scale", 1.0)
                 flow_sample_steps = getattr(
                     sampling_scheme,

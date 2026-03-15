@@ -58,6 +58,7 @@ class SMARTFlow(LightningModule):
             f"val_closed/sim_agents_2025/minADE_best_of_{self.n_rollout_closed_val}"
         )
         self.validation_open_seed = int(model_config.validation_open_seed)
+        self.validation_closed_seed = int(model_config.validation_closed_seed)
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
@@ -216,6 +217,10 @@ class SMARTFlow(LightningModule):
         """
         return self.validation_open_seed + int(batch_idx)
 
+    def _get_closed_loop_seed(self, batch_idx: int, rollout_idx: int) -> int:
+        """같은 batch/rollout 순서에서는 closed-loop 샘플을 재현 가능하게 만듭니다."""
+        return self.validation_closed_seed + int(batch_idx) * self.n_rollout_closed_val + int(rollout_idx)
+
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         pred = self.encoder(
@@ -272,12 +277,13 @@ class SMARTFlow(LightningModule):
                 map_feature=map_feature,
             )
             pred_traj, pred_z, pred_head = [], [], []
-            for _ in range(self.n_rollout_closed_val):
+            for rollout_idx in range(self.n_rollout_closed_val):
                 pred = self.encoder.rollout_from_cache(
                     rollout_cache=rollout_cache,
                     tokenized_agent=tokenized_agent,
                     map_feature=map_feature,
                     sampling_scheme=self.validation_rollout_sampling,
+                    sampling_seed=self._get_closed_loop_seed(batch_idx, rollout_idx),
                 )
                 pred_traj.append(pred["pred_traj_10hz"])
                 pred_z.append(pred["pred_z_10hz"])
@@ -400,12 +406,13 @@ class SMARTFlow(LightningModule):
             map_feature=map_feature,
         )
         pred_traj, pred_z, pred_head = [], [], []
-        for _ in range(self.n_rollout_closed_val):
+        for rollout_idx in range(self.n_rollout_closed_val):
             pred = self.encoder.rollout_from_cache(
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
                 sampling_scheme=self.validation_rollout_sampling,
+                sampling_seed=self._get_closed_loop_seed(batch_idx, rollout_idx),
             )
             pred_traj.append(pred["pred_traj_10hz"])
             pred_z.append(pred["pred_z_10hz"])

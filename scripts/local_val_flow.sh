@@ -6,8 +6,8 @@ export TF_CPP_MIN_LOG_LEVEL=2
 MY_EXPERIMENT="local_val_flow"
 MY_TASK_NAME="sim_agents_2025_local_val-debug"
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate catk
+CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
+. "$(dirname "$0")/_activate_conda.sh"
 
 python \
   -m src.run \

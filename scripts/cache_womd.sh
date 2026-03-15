@@ -5,8 +5,8 @@ export TF_CPP_MIN_LOG_LEVEL=2
 
 DATA_SPLIT=validation # training, validation, testing
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate catk
+CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
+. "$(dirname "$0")/_activate_conda.sh"
 python \
   -m src.data_preprocess \
   --split $DATA_SPLIT \

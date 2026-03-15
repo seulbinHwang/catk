@@ -117,12 +117,14 @@ class SMARTFlowDecoder(nn.Module):
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
         sampling_scheme: DictConfig,
+        sampling_seed: int | None = None,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             sampling_scheme=sampling_scheme,
+            sampling_seed=sampling_seed,
         )
 
 
