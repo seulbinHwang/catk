@@ -6,7 +6,7 @@ wandb:
   id: null
   anonymous: null
   project: SMART-FLOW
-  log_model: False
+  log_model: all
   prefix: ""
   entity: jksg01019-naver-labs
   group: ""

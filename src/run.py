@@ -11,6 +11,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import os
 from typing import List
 
 import hydra
@@ -19,7 +20,7 @@ import torch
 import wandb
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from src.utils import (
     RankedLogger,
@@ -32,6 +33,34 @@ from src.utils import (
 log = RankedLogger(__name__, rank_zero_only=True)
 
 torch.set_float32_matmul_precision("high")
+
+
+def _configure_wandb_checkpoint_upload(cfg: DictConfig) -> None:
+    logger_cfg = cfg.get("logger")
+    if not logger_cfg:
+        return
+
+    wandb_cfg = logger_cfg.get("wandb")
+    if not wandb_cfg or wandb_cfg.get("log_model") in (False, None):
+        return
+
+    wandb_mode = os.getenv("WANDB_MODE", "").strip().lower()
+    wandb_disabled = os.getenv("WANDB_DISABLED", "").strip().lower()
+    is_offline = bool(wandb_cfg.get("offline")) or wandb_mode in {
+        "offline",
+        "dryrun",
+        "disabled",
+    }
+    is_disabled = wandb_disabled in {"true", "1", "yes"}
+    if not is_offline and not is_disabled:
+        return
+
+    with open_dict(wandb_cfg):
+        wandb_cfg.log_model = False
+
+    log.warning(
+        "Disabled W&B checkpoint artifact upload because W&B is configured for offline/disabled mode."
+    )
 
 
 def run(cfg: DictConfig) -> None:
@@ -56,6 +85,8 @@ def run(cfg: DictConfig) -> None:
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
+
+    _configure_wandb_checkpoint_upload(cfg)
 
     log.info(f"Instantiating loggers...")
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))

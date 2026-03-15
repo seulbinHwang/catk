@@ -254,6 +254,7 @@ torchrun ... -m src.run \
 - 저장 위치는 `callbacks.model_checkpoint.dirpath=${paths.output_dir}/checkpoints` 이고, 실제 경로는 `logs/<task_name>/runs/<timestamp>/checkpoints/` 입니다.
 - 파일명 규칙은 `callbacks.model_checkpoint.filename="epoch_{epoch:03d}"` 이라 `epoch_002.ckpt` 같은 이름이 됩니다.
 - `save_last=link` 이라 `last.ckpt`도 함께 생기며, 저장된 checkpoint를 가리키는 링크로 유지됩니다.
+- 기본 `logger=wandb` 설정은 `logger.wandb.log_model=all` 이라 저장되는 checkpoint를 W&B model artifact로도 함께 올립니다. 단, `logger.wandb.offline=True` 이거나 `WANDB_MODE=offline|dryrun|disabled` 면 업로드는 자동으로 꺼지고 로컬 checkpoint만 남습니다.
 
 자주 바꾸는 파라미터:
 
@@ -276,7 +277,32 @@ torchrun ... -m src.run \
 ... callbacks.model_checkpoint.filename='epoch_{epoch:03d}_step_{step}'
 ```
 
-### 5.4 `val_closed_loop` 비디오 저장하기
+### 5.4 중단된 학습 재개하기
+
+- 학습 재개 여부는 `task_name`이 아니라 `ckpt_path`로 결정됩니다. 같은 설정으로 다시 실행하면서 이전 run의 checkpoint만 넘기면 됩니다.
+- 이 레포는 `trainer.fit(..., ckpt_path=...)`로 재개하므로 model weight뿐 아니라 optimizer, lr scheduler, epoch, global step도 함께 이어집니다.
+- 재개용으로는 보통 `logs/<task_name>/runs/<timestamp>/checkpoints/last.ckpt`를 쓰는 것이 가장 단순합니다.
+- 현재 `pre_bc_flow` 기본값은 validation이 `3` epoch마다 돌고, checkpoint 저장도 그 시점에 함께 일어납니다. 따라서 중단 직전 상태가 아니라 마지막으로 저장된 validation 시점부터 다시 시작합니다.
+
+예시:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=pre_bc_flow \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_pretrain_h1006 \
+  ckpt_path=/path/to/previous_run/checkpoints/last.ckpt
+```
+
+다른 PC에서 재개할 때는 그 PC에서 접근 가능한 checkpoint 경로를 `ckpt_path`로 주고, 그 PC의 캐시 위치에 맞게 `paths.cache_root`만 맞춰주면 됩니다. 새로 실행한 쪽의 output dir은 항상 새 timestamp 폴더로 생기므로 기존 run 폴더를 덮어쓰지 않습니다.
+
+### 5.5 `val_closed_loop` 비디오 저장하기
 
 - `pre_bc_flow` 기본값은 `n_vis_batch=0`, `n_vis_scenario=0`, `n_vis_rollout=0` 이라서 `val_closed_loop`가 돌아도 mp4는 저장하지 않습니다.
 - 전제: `model.model_config.val_closed_loop=true`
