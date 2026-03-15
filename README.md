@@ -12,27 +12,6 @@
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
-## 1. 관련 파일
-
-이 README에서 다루는 핵심 파일은 아래입니다.
-
-- `src/smart/model/smart_flow.py`
-- `src/smart/modules/smart_flow_decoder.py`
-- `src/smart/modules/flow_agent_decoder.py`
-- `src/smart/modules/flow_local_decoder.py`
-- `src/smart/tokens/flow_token_processor.py`
-- `src/smart/metrics/flow_metrics.py`
-- `src/smart/metrics/sim_agents_metrics.py`
-- `src/smart/metrics/sim_agents_submission.py`
-- `src/utils/sim_agents_utils.py`
-- `configs/model/smart_flow.yaml`
-- `configs/experiment/pre_bc_flow.yaml`
-- `configs/experiment/local_val_flow.yaml`
-- `configs/experiment/sim_agents_sub_flow.yaml`
-- `configs/run.yaml`
-- `scripts/train_flow.sh`
-- `scripts/local_val_flow.sh`
-- `scripts/sim_agents_sub_flow.sh`
 
 ## 2. 환경 설치
 
@@ -161,18 +140,6 @@ $CACHE_ROOT/
 ## 5. 6x H100에서 Flow Matching 학습
 
 이 경로의 기본 학습 설정은 `configs/experiment/pre_bc_flow.yaml`입니다.
-
-- `model=smart_flow`
-- `precision=bf16-mixed`
-- `max_epochs=64`
-- `train_batch_size=12 per GPU`
-- `val_batch_size=4`
-- `test_batch_size=4`
-- `num_workers=10`
-- `lr=5e-4`
-- `lr_warmup_steps=2`
-- `n_rollout_closed_val=32`
-- best checkpoint monitor: `val_closed/sim_agents_2025/realism_meta_metric`
 
 H100 6장 기준 권장 실행:
 
