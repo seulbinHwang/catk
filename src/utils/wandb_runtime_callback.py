@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import time
 from typing import List
 
 import torch
 import torch.distributed as dist
+import wandb
 from lightning import Callback, LightningModule, Trainer
 
 
@@ -13,6 +15,9 @@ class WandbRuntimeMetricsCallback(Callback):
     def __init__(self, log_every_n_steps: int = 20) -> None:
         self.log_every_n_steps = max(1, log_every_n_steps)
         self._epoch_values: List[float] = []
+        self._accumulated_runtime_sec = 0.0
+        self._fit_start_time: float | None = None
+        self._progress_points: List[list[float]] = []
 
     @staticmethod
     def _get_cuda_device(pl_module: LightningModule) -> torch.device | None:
@@ -32,6 +37,37 @@ class WandbRuntimeMetricsCallback(Callback):
     def _log_metrics(trainer: Trainer, metrics: dict[str, float], step: int) -> None:
         for logger in trainer.loggers:
             logger.log_metrics(metrics, step=step)
+
+    @staticmethod
+    def _get_wandb_logger(trainer: Trainer):
+        for logger in trainer.loggers:
+            if logger.__class__.__name__ == "WandbLogger":
+                return logger
+        return None
+
+    def _runtime_seconds(self) -> float:
+        if self._fit_start_time is None:
+            return self._accumulated_runtime_sec
+        return self._accumulated_runtime_sec + (time.monotonic() - self._fit_start_time)
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "accumulated_runtime_sec": self._runtime_seconds(),
+            "progress_points": self._progress_points,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        self._accumulated_runtime_sec = float(state_dict.get("accumulated_runtime_sec", 0.0))
+        self._progress_points = [list(point) for point in state_dict.get("progress_points", [])]
+
+    def on_fit_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        del trainer, pl_module
+        self._fit_start_time = time.monotonic()
+
+    def on_fit_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        del trainer, pl_module
+        self._accumulated_runtime_sec = self._runtime_seconds()
+        self._fit_start_time = None
 
     def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         if pl_module.global_rank == 0:
@@ -97,6 +133,29 @@ class WandbRuntimeMetricsCallback(Callback):
                 "worst_peak_reserved_pct_epoch_max": float(values.max().item()),
                 "worst_peak_reserved_pct_epoch_p99": float(torch.quantile(values, 0.99).item()),
                 "worst_peak_reserved_pct_epoch_min": float(values.min().item()),
+            },
+            step=trainer.global_step,
+        )
+
+        wandb_logger = self._get_wandb_logger(trainer)
+        if wandb_logger is None or trainer.max_epochs is None or trainer.max_epochs <= 0:
+            return
+
+        elapsed_training_hours = self._runtime_seconds() / 3600.0
+        epoch_progress_pct = min(100.0, 100.0 * (pl_module.current_epoch + 1) / trainer.max_epochs)
+        self._progress_points.append([elapsed_training_hours, epoch_progress_pct])
+        table = wandb.Table(
+            columns=["elapsed_training_hours", "epoch_progress_pct"],
+            data=self._progress_points,
+        )
+        wandb_logger.experiment.log(
+            {
+                "training_progress_vs_runtime": wandb.plot.line(
+                    table,
+                    "elapsed_training_hours",
+                    "epoch_progress_pct",
+                    title="Training Progress vs Runtime",
+                )
             },
             step=trainer.global_step,
         )

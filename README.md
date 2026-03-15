@@ -240,6 +240,37 @@ torchrun ... -m src.run \
 ... callbacks.model_checkpoint.filename='epoch_{epoch:03d}_step_{step}'
 ```
 
+### 5.4 `val_closed_loop` 비디오 저장하기
+
+- `pre_bc_flow` 기본값은 `n_vis_batch=0`, `n_vis_scenario=0`, `n_vis_rollout=0` 이라서 `val_closed_loop`가 돌아도 mp4는 저장하지 않습니다.
+- 전제: `model.model_config.val_closed_loop=true`
+- 꼭 필요한 파라미터:
+  - `model.model_config.n_vis_batch`: validation에서 비디오를 남길 앞쪽 batch 수. 보통 `1~2`부터 시작합니다.
+  - `model.model_config.n_vis_scenario`: 각 batch에서 저장할 scenario 수. 보통 `1~2`부터 시작하고, 현재 batch 크기 이하로 두면 됩니다.
+  - `model.model_config.n_vis_rollout`: 각 scenario에서 저장할 rollout 영상 수. 보통 `1~2`부터 시작하고, `n_rollout_closed_val` 이하로 두면 됩니다.
+  - `model.model_config.delete_local_videos_after_wandb_upload=true|false`: `wandb`에 비디오를 넘긴 뒤 `logs/.../videos/` 아래 원본 mp4를 지울지 결정합니다. `wandb` logger를 쓰지 않으면 지우지 않습니다.
+- 저장 위치는 `logs/<task_name>/runs/<timestamp>/videos/batch_XX-scenario_YY/` 이고, 각 폴더 아래에 `gt.mp4`, `rollout_00.mp4`, `rollout_01.mp4`, ... 형태로 생깁니다. `gt.mp4`는 GT, `rollout_XX.mp4`는 sampled closed-loop rollout입니다. 단, `delete_local_videos_after_wandb_upload=true`면 upload 직후 이 원본 mp4는 자동 삭제될 수 있습니다.
+- `logger=wandb` 상태면 생성된 mp4가 W&B에도 같이 기록됩니다. `logger.wandb.offline=True`면 먼저 로컬 `wandb/`에 저장되고, 이후 `wandb sync`로 올리면 됩니다.
+
+예시:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=pre_bc_flow \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_pretrain_h1006 \
+  model.model_config.n_vis_batch=1 \
+  model.model_config.n_vis_scenario=2 \
+  model.model_config.n_vis_rollout=2 \
+  model.model_config.delete_local_videos_after_wandb_upload=true
+```
+
 메모리가 부족하면 아래처럼 train batch를 줄이면 됩니다.
 
 ```bash
@@ -269,17 +300,21 @@ torchrun \
 
 추가로 CUDA OOM 위험도 확인용으로 아래 memory metric이 기록됩니다.
 
-- `worst_peak_reserved_pct`: 각 train batch에서 각 rank가 자기 GPU의 peak reserved memory 비율(%)을 측정한 뒤, rank 간 `max`로 합친 값입니다. DDP에서는 이 값이 가장 위험한 GPU를 직접 보여주므로 평균보다 훨씬 유용합니다. 이 값은 20 step 간격으로만 기록됩니다.
-- `worst_peak_reserved_pct_epoch_max`
-- `worst_peak_reserved_pct_epoch_p99`
-- `worst_peak_reserved_pct_epoch_min`
+- `worst_peak_reserved_pct`: train batch 1개 기준의 실시간 지표입니다. 각 rank가 자기 GPU의 peak reserved memory 비율(%)을 계산한 뒤, rank 간 `max`로 합친 값입니다. 즉, "그 step에서 가장 위험했던 GPU"를 보여줍니다. W&B에는 20 step 간격으로 샘플링되어 기록됩니다.
+- `worst_peak_reserved_pct_epoch_max`: 한 epoch 동안 관측된 `worst_peak_reserved_pct`들 중 최대값입니다. OOM 위험 판단은 이 값을 가장 우선해서 보면 됩니다.
+- `worst_peak_reserved_pct_epoch_p99`: 한 epoch 동안의 `worst_peak_reserved_pct` 분포에서 p99 값입니다. 단 한 번의 극단적 spike보다, "거의 최악에 가까운 평소 상한"을 보고 싶을 때 유용합니다.
+- `worst_peak_reserved_pct_epoch_min`: 한 epoch 동안의 `worst_peak_reserved_pct`들 중 최소값입니다. 가장 한가했던 시점을 보여주는 값이라, OOM 판단 기준으로는 거의 쓰지 않습니다.
 
-해석 기준은 대략 아래처럼 보면 됩니다.
+해석 기준은 우선 `worst_peak_reserved_pct_epoch_max`에 적용해서 보면 됩니다. 학습 중 실시간 추세를 볼 때는 `worst_peak_reserved_pct`를 같은 기준으로 봐도 되지만, 최종 판단은 `epoch_max` 기준으로 하는 편이 안전합니다. `epoch_p99`는 "단발성 1회 spike를 제외해도 계속 빡빡한지"를 보는 보조 지표로 생각하면 됩니다.
 
 - `85%` 미만: 대체로 안정적
 - `85% ~ 92%`: 여유가 줄어드는 구간
 - `92% ~ 96%`: OOM 고위험 구간
 - `97%` 이상: batch 구성이나 입력 길이 스파이크에 따라 바로 OOM이 날 수 있음
+
+추가로 epoch마다 아래 W&B 그래프도 갱신됩니다.
+
+- `training_progress_vs_runtime`: x축은 지금까지 누적된 실제 학습 실행 시간(hours), y축은 전체 epoch 기준 진행률(%)입니다. checkpoint로 학습을 이어서 재개한 경우 이전 runtime도 누적해서 그립니다.
 
 ## 6. 평가와 추론
 
@@ -406,8 +441,8 @@ torchrun \
 
 ## 8. Visualization
 
-visualization은 closed-loop validation 중에 같이 생성합니다.  
-기본 `local_val_flow.yaml`은 비디오를 끄고 있으므로 아래 override를 줘야 합니다.
+학습 중 `val_closed_loop` 비디오 저장 방법은 위 `5.4 val_closed_loop 비디오 저장하기`를 참고하면 됩니다.
+checkpoint로 validation visualization만 따로 보고 싶으면 아래처럼 `local_val_flow`를 쓰면 됩니다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -422,7 +457,8 @@ python -m src.run \
   task_name=flow_local_val_vis \
   model.model_config.n_vis_batch=2 \
   model.model_config.n_vis_scenario=5 \
-  model.model_config.n_vis_rollout=5
+  model.model_config.n_vis_rollout=5 \
+  model.model_config.delete_local_videos_after_wandb_upload=true
 ```
 
 비디오 저장 위치:

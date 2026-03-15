@@ -9,6 +9,7 @@ model_config:
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0
+  delete_local_videos_after_wandb_upload: false
   val_open_loop: true
   val_closed_loop: true
   token_processor:

@@ -46,12 +46,35 @@ class SMARTFlow(LightningModule):
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
+        self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
         self.n_batch_wosac_metric = model_config.n_batch_wosac_metric
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
+
+    def _get_video_logger(self):
+        if self.trainer is not None:
+            for logger in getattr(self.trainer, "loggers", []):
+                if hasattr(logger, "log_video"):
+                    return logger
+        if hasattr(self.logger, "log_video"):
+            return self.logger
+        return None
+
+    def _cleanup_local_video(self, video_path: str) -> None:
+        video_file = Path(video_path)
+        if video_file.exists():
+            video_file.unlink()
+
+        current_dir = video_file.parent
+        while current_dir != self.video_dir.parent:
+            try:
+                current_dir.rmdir()
+            except OSError:
+                break
+            current_dir = current_dir.parent
 
     def _open_loop_loss_and_metrics(self, pred_dict):
         loss = flow_matching_loss(pred_dict["flow_pred_norm"], pred_dict["flow_target_norm"])
@@ -140,6 +163,7 @@ class SMARTFlow(LightningModule):
                     self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
 
             if self.global_rank == 0 and batch_idx < self.n_vis_batch and scenario_rollouts is not None:
+                video_logger = self._get_video_logger()
                 for scen_idx in range(self.n_vis_scenario):
                     vis = VisWaymo(
                         scenario_path=data["tfrecord_path"][scen_idx],
@@ -147,7 +171,10 @@ class SMARTFlow(LightningModule):
                     )
                     vis.save_video_scenario_rollout(scenario_rollouts[scen_idx], self.n_vis_rollout)
                     for video_path in vis.video_paths:
-                        self.logger.log_video("/".join(video_path.split("/")[-3:]), [video_path])
+                        if video_logger is not None:
+                            video_logger.log_video("/".join(video_path.split("/")[-3:]), [video_path])
+                            if self.delete_local_videos_after_wandb_upload:
+                                self._cleanup_local_video(video_path)
 
     def on_validation_epoch_end(self):
         if self.val_closed_loop:
