@@ -8,7 +8,7 @@ model:
     lr: 5e-4
     lr_warmup_steps: 2
     lr_min_ratio: 1e-2
-    n_rollout_closed_val: 8
+    n_rollout_closed_val: 32
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
