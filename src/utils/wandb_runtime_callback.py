@@ -127,7 +127,7 @@ class WandbRuntimeMetricsCallback(Callback):
         batch,
         batch_idx: int,
     ) -> None:
-        del outputs, batch, batch_idx
+        del outputs, batch
 
         if not trainer.loggers:
             return
