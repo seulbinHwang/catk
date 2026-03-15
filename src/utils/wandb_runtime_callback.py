@@ -18,6 +18,9 @@ class WandbRuntimeMetricsCallback(Callback):
         self._accumulated_runtime_sec = 0.0
         self._fit_start_time: float | None = None
         self._progress_points: List[list[float]] = []
+        self._epoch_train_start_time: float | None = None
+        self._epoch_validation_sec = 0.0
+        self._validation_start_time: float | None = None
 
     @staticmethod
     def _get_cuda_device(pl_module: LightningModule) -> torch.device | None:
@@ -69,17 +72,37 @@ class WandbRuntimeMetricsCallback(Callback):
         self._progress_points = [list(point) for point in state_dict.get("progress_points", [])]
 
     def on_fit_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
-        del trainer, pl_module
         self._fit_start_time = time.monotonic()
+        if pl_module.global_rank != 0 or not trainer.loggers:
+            return
+
+        per_device_batch_size = getattr(getattr(trainer, "datamodule", None), "train_batch_size", None)
+        if per_device_batch_size is None:
+            return
+
+        self._log_metrics(
+            trainer,
+            {
+                "train_setup/global_batch_size": int(per_device_batch_size) * int(trainer.world_size),
+            },
+            step=self._lightning_log_step(trainer),
+        )
 
     def on_fit_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         del trainer, pl_module
         self._accumulated_runtime_sec = self._runtime_seconds()
         self._fit_start_time = None
+        self._epoch_train_start_time = None
+        self._epoch_validation_sec = 0.0
+        self._validation_start_time = None
 
     def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        del trainer
         if pl_module.global_rank == 0:
             self._epoch_values = []
+            self._epoch_train_start_time = time.monotonic()
+            self._epoch_validation_sec = 0.0
+            self._validation_start_time = None
 
     def on_train_batch_start(
         self,
@@ -136,20 +159,60 @@ class WandbRuntimeMetricsCallback(Callback):
                 {
                     "System/GPU Memory Allocated (%)": max_allocated_pct,
                     "worst_peak_reserved_pct": worst_peak_reserved_pct,
+                    "train/epoch_progress_pct": min(
+                        100.0,
+                        100.0 * float(batch_idx + 1) / max(float(trainer.num_training_batches), 1.0),
+                    ),
                 },
                 step=log_step,
             )
 
-    def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
-        if pl_module.global_rank != 0 or not trainer.loggers or not self._epoch_values:
+    def on_validation_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        del pl_module
+        if self._fit_start_time is None or trainer.sanity_checking or trainer.global_rank != 0:
+            return
+        self._validation_start_time = time.monotonic()
+
+    def on_validation_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        del pl_module
+        if self._validation_start_time is None or self._fit_start_time is None:
+            return
+        if trainer.sanity_checking or trainer.global_rank != 0 or not trainer.loggers:
+            self._validation_start_time = None
             return
 
-        values = torch.tensor(self._epoch_values, dtype=torch.float32)
+        validation_minutes = (time.monotonic() - self._validation_start_time) / 60.0
+        self._validation_start_time = None
+        self._epoch_validation_sec += validation_minutes * 60.0
         self._log_metrics(
             trainer,
             {
-                "worst_peak_reserved_pct_epoch_max": float(values.max().item()),
+                "time/validation_minutes": validation_minutes,
             },
+            step=self._lightning_log_step(trainer),
+        )
+
+    def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        if pl_module.global_rank != 0 or not trainer.loggers:
+            return
+
+        epoch_metrics: dict[str, float] = {
+            "train/epoch_progress_pct": 100.0,
+        }
+        if self._epoch_train_start_time is not None:
+            train_minutes = max(
+                time.monotonic() - self._epoch_train_start_time - self._epoch_validation_sec,
+                0.0,
+            ) / 60.0
+            epoch_metrics["time/train_epoch_minutes"] = train_minutes
+
+        if self._epoch_values:
+            values = torch.tensor(self._epoch_values, dtype=torch.float32)
+            epoch_metrics["worst_peak_reserved_pct_epoch_max"] = float(values.max().item())
+
+        self._log_metrics(
+            trainer,
+            epoch_metrics,
             step=self._lightning_log_step(trainer, epoch_end=True),
         )
 
