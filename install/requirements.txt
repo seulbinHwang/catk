@@ -32,11 +32,10 @@ rich==13.8.0 # MIT License: https://github.com/Textualize/rich/blob/master/LICEN
 # torch_geometric # MIT License: https://github.com/pyg-team/pytorch_geometric/blob/master/LICENSE
 # torch_scatter # MIT License: https://github.com/rusty1s/pytorch_scatter/blob/master/LICENSE
 # torch_cluster # MIT License: https://github.com/rusty1s/pytorch_cluster/blob/master/LICENSE
-# waymo-open-dataset-tf-2-12-0==1.6.4 # Apache License 2.0: https://github.com/waymo-research/waymo-open-dataset/blob/master/LICENSE
+# waymo-open-dataset-tf-2-12-0==1.6.7 # Apache License 2.0: https://github.com/waymo-research/waymo-open-dataset/blob/master/LICENSE
 
 # Our code is based on SMART
 # Apache License 2.0: https://github.com/rainmaker22/SMART/blob/main/LICENSE
 
 # Waymo Dataset
 # Waymo Dataset License Agreement for Non-Commercial Use: https://waymo.com/open/terms/
-

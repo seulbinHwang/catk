@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import hydra
+import torch.distributed as dist
 from omegaconf import ListConfig
 from torch import Tensor
 from torchmetrics.metric import Metric
@@ -86,7 +87,16 @@ class SimAgentsSubmission(Metric):
         self.pred_head.append(pred_head)
 
         batch_size = len(scenario_id)
-        self.agent_batch.append(agent_batch + batch_size * global_rank)
+        batch_offset = batch_size * global_rank
+        if dist.is_available() and dist.is_initialized():
+            local_batch_size = agent_batch.new_tensor([batch_size], dtype=agent_batch.dtype)
+            gathered_batch_sizes = [local_batch_size.clone() for _ in range(dist.get_world_size())]
+            dist.all_gather(gathered_batch_sizes, local_batch_size)
+            batch_offset = sum(
+                int(batch_size_tensor.item())
+                for batch_size_tensor in gathered_batch_sizes[:global_rank]
+            )
+        self.agent_batch.append(agent_batch + batch_offset)
 
     def compute(self) -> Dict[str, Tensor]:
         return {k: getattr(self, k) for k in self.data_keys}

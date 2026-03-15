@@ -19,6 +19,7 @@ from torch_geometric.loader import DataLoader
 
 from src.smart.datasets import MultiDataset
 
+from .exact_distributed_sampler import ExactDistributedSampler
 from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
 
 
@@ -85,11 +86,29 @@ class MultiDataModule(LightningDataModule):
             drop_last=False,
         )
 
+    def _build_eval_sampler(self, dataset):
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        if world_size <= 1:
+            return None
+
+        return ExactDistributedSampler(
+            dataset=dataset,
+            num_replicas=world_size,
+            rank=int(getattr(trainer, "global_rank", 0) or 0),
+            shuffle=False,
+        )
+
     def val_dataloader(self) -> EVAL_DATALOADERS:
+        sampler = self._build_eval_sampler(self.val_dataset)
         return DataLoader(
             self.val_dataset,
             batch_size=self.val_batch_size,
             shuffle=False,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,  # False
             persistent_workers=self.persistent_workers,
@@ -97,10 +116,12 @@ class MultiDataModule(LightningDataModule):
         )
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
+        sampler = self._build_eval_sampler(self.test_dataset)
         return DataLoader(
             self.test_dataset,
             batch_size=self.test_batch_size,
             shuffle=False,
+            sampler=sampler,
             num_workers=self.num_workers,  # 0
             pin_memory=self.pin_memory,  # False
             persistent_workers=self.persistent_workers,

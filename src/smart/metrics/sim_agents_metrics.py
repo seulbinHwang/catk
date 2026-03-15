@@ -11,14 +11,18 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import inspect
 import itertools
 import multiprocessing as mp
 import os
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import tensorflow as tf
 import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as official_sim_agents_metrics
 from google.protobuf.descriptor import Descriptor, FieldDescriptor
+from google.protobuf import text_format
 from torch import Tensor, tensor
 from torchmetrics import Metric
 from waymo_open_dataset.protos import (
@@ -29,7 +33,13 @@ from waymo_open_dataset.protos import (
 from waymo_open_dataset.utils.sim_agents import submission_specs
 
 _SIM_AGENTS_2025_NAMESPACE = "sim_agents_2025"
-_SIM_AGENTS_2025_CHALLENGE_TYPE = submission_specs.ChallengeType.SIM_AGENTS
+_SIM_AGENTS_2025_CHALLENGE_TYPE = getattr(
+    getattr(submission_specs, "ChallengeType", None),
+    "SIM_AGENTS",
+    None,
+)
+_WAYMO_SIM_AGENTS_METRICS_DIR = Path(official_sim_agents_metrics.__file__).resolve().parent
+_SIM_AGENTS_2025_CONFIG_FILENAME = "challenge_2025_sim_agents_config.textproto"
 _NUMERIC_FIELD_TYPES = {
     FieldDescriptor.TYPE_DOUBLE,
     FieldDescriptor.TYPE_FLOAT,
@@ -52,6 +62,30 @@ _REQUIRED_2025_SCENARIO_FIELDS = {
 _REQUIRED_2025_BUCKET_FIELDS = {
     "simulated_traffic_light_violation_rate",
 }
+
+
+def _get_waymo_version_string() -> str:
+    try:
+        return version("waymo-open-dataset-tf-2-12-0")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _load_textproto_metrics_config(
+    config_filename: str,
+) -> sim_agents_metrics_pb2.SimAgentMetricsConfig:
+    config_path = _WAYMO_SIM_AGENTS_METRICS_DIR / config_filename
+    if not config_path.exists():
+        raise RuntimeError(
+            "Waymo 2025 Sim Agents config 파일을 찾지 못했습니다. "
+            f"expected={config_path}. "
+            "README 기준으로 waymo-open-dataset-tf-2-12-0==1.6.7 이상을 다시 설치해야 합니다."
+        )
+
+    config = sim_agents_metrics_pb2.SimAgentMetricsConfig()
+    with config_path.open("r", encoding="utf-8") as handle:
+        text_format.Parse(handle.read(), config)
+    return config
 
 
 def _get_scalar_field_names(
@@ -93,13 +127,25 @@ def _load_waymo_sim_agents_2025_config(
     Raises:
         RuntimeError: 설치된 Waymo 패키지가 2025 Sim Agents 평가를 지원하지 않을 때 발생합니다.
     """
+    if _SIM_AGENTS_2025_CHALLENGE_TYPE is None:
+        raise RuntimeError(
+            "설치된 waymo-open-dataset 패키지가 2025 Sim Agents challenge type를 제공하지 않습니다. "
+            f"현재 버전={_get_waymo_version_string()}. "
+            "WOSAC 2024 평가는 허용되지 않으며, README 기준으로 "
+            "waymo-open-dataset-tf-2-12-0==1.6.7 이상이 필요합니다."
+        )
+
     try:
         config = official_sim_agents_metrics.load_metrics_config(
             _SIM_AGENTS_2025_CHALLENGE_TYPE
         )
+    except FileNotFoundError:
+        # 1.6.7 wheel에서는 공식 helper가 상대경로로 textproto를 찾다가 실패할 수 있습니다.
+        config = _load_textproto_metrics_config(_SIM_AGENTS_2025_CONFIG_FILENAME)
     except (AttributeError, TypeError, ValueError) as exc:
         raise RuntimeError(
             "설치된 waymo-open-dataset 패키지에서 공식 2025 Sim Agents 평가기를 찾지 못했습니다. "
+            f"현재 버전={_get_waymo_version_string()}. "
             "README에 맞춰 waymo-open-dataset-tf-2-12-0==1.6.7 이상을 설치해야 합니다."
         ) from exc
 
@@ -142,9 +188,33 @@ def _validate_waymo_sim_agents_2025_runtime_support() -> None:
     if missing_scenario_fields or missing_bucket_fields:
         raise RuntimeError(
             "설치된 waymo-open-dataset 패키지에 2025 Sim Agents 필드가 없습니다. "
+            f"현재 버전={_get_waymo_version_string()}. "
             f"scenario missing={missing_scenario_fields}, "
             f"bucket missing={missing_bucket_fields}."
         )
+
+
+def _compute_waymo_sim_agents_metrics_for_bundle(
+    config: sim_agents_metrics_pb2.SimAgentMetricsConfig,
+    scenario: scenario_pb2.Scenario,
+    scenario_rollout: sim_agents_submission_pb2.ScenarioRollouts,
+) -> sim_agents_metrics_pb2.SimAgentMetrics:
+    compute_fn = official_sim_agents_metrics.compute_scenario_metrics_for_bundle
+    signature = inspect.signature(compute_fn)
+
+    if "challenge_type" not in signature.parameters:
+        raise RuntimeError(
+            "설치된 waymo-open-dataset 패키지가 2025 Sim Agents scorer 시그니처를 제공하지 않습니다. "
+            f"현재 버전={_get_waymo_version_string()}. "
+            "WOSAC 2024 평가는 허용되지 않습니다."
+        )
+
+    return compute_fn(
+        config,
+        scenario,
+        scenario_rollout,
+        challenge_type=_SIM_AGENTS_2025_CHALLENGE_TYPE,
+    )
 
 
 class SimAgentsMetrics(Metric):
@@ -192,11 +262,10 @@ class SimAgentsMetrics(Metric):
                 scenario.tracks_to_predict.pop()
             scenario.tracks_to_predict[0].track_index = scenario.sdc_track_index
 
-        return official_sim_agents_metrics.compute_scenario_metrics_for_bundle(
+        return _compute_waymo_sim_agents_metrics_for_bundle(
             config,
             scenario,
             scenario_rollout,
-            challenge_type=_SIM_AGENTS_2025_CHALLENGE_TYPE,
         )
 
     def _update_metric_states(

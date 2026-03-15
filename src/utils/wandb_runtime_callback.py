@@ -160,6 +160,5 @@ class WandbRuntimeMetricsCallback(Callback):
                     "epoch_progress_pct",
                     title="Training Progress vs Runtime",
                 )
-            },
-            step=trainer.global_step,
+            }
         )

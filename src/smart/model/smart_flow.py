@@ -349,7 +349,7 @@ class SMARTFlow(LightningModule):
                 metric_store=self.val_denoise_epoch_metrics,
             )
             for metric_name, metric_value in {**epoch_denoise_metrics, **epoch_open_metrics}.items():
-                self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=False)
+                self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
 
         if self.val_closed_loop:
             if not self.sim_agents_submission.is_active:
@@ -360,7 +360,7 @@ class SMARTFlow(LightningModule):
                     epoch_sim_agents_metrics[self.closed_loop_metric_name],
                     on_step=False,
                     on_epoch=True,
-                    sync_dist=False,
+                    sync_dist=True,
                 )
                 if self.global_rank == 0 and self.logger is not None:
                     epoch_sim_agents_metrics["epoch"] = (

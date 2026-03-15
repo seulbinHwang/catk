@@ -15,4 +15,4 @@ wandb:
   resume: allow
   settings:
     _target_: wandb.Settings
-    x_disable_stats: true
+    _disable_stats: true
