@@ -198,6 +198,20 @@ torchrun \
 - `val_closed/ADE`
 - `val_closed/wosac/*`
 
+추가로 CUDA OOM 위험도 확인용으로 아래 memory metric이 기록됩니다.
+
+- `worst_peak_reserved_pct`: 각 train batch에서 각 rank가 자기 GPU의 peak reserved memory 비율(%)을 측정한 뒤, rank 간 `max`로 합친 값입니다. DDP에서는 이 값이 가장 위험한 GPU를 직접 보여주므로 평균보다 훨씬 유용합니다. 이 값은 20 step 간격으로만 기록됩니다.
+- `worst_peak_reserved_pct_epoch_max`
+- `worst_peak_reserved_pct_epoch_p99`
+- `worst_peak_reserved_pct_epoch_min`
+
+해석 기준은 대략 아래처럼 보면 됩니다.
+
+- `85%` 미만: 대체로 안정적
+- `85% ~ 92%`: 여유가 줄어드는 구간
+- `92% ~ 96%`: OOM 고위험 구간
+- `97%` 이상: batch 구성이나 입력 길이 스파이크에 따라 바로 OOM이 날 수 있음
+
 ## 6. 평가와 추론
 
 ### 6.1 Validation set closed-loop 평가
