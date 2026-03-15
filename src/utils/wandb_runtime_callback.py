@@ -106,8 +106,11 @@ class WandbRuntimeMetricsCallback(Callback):
             return
 
         total_memory = torch.cuda.get_device_properties(device).total_memory
+        allocated = torch.cuda.memory_allocated(device)
         peak_reserved = torch.cuda.max_memory_reserved(device)
+        local_allocated_pct = 100.0 * allocated / total_memory
         local_peak_reserved_pct = 100.0 * peak_reserved / total_memory
+        max_allocated_pct = self._reduce_max(local_allocated_pct, device)
         worst_peak_reserved_pct = self._reduce_max(local_peak_reserved_pct, device)
 
         if pl_module.global_rank != 0:
@@ -118,7 +121,10 @@ class WandbRuntimeMetricsCallback(Callback):
         if trainer.global_step > 0 and trainer.global_step % self.log_every_n_steps == 0:
             self._log_metrics(
                 trainer,
-                {"worst_peak_reserved_pct": worst_peak_reserved_pct},
+                {
+                    "System/GPU Memory Allocated (%)": max_allocated_pct,
+                    "worst_peak_reserved_pct": worst_peak_reserved_pct,
+                },
                 step=trainer.global_step,
             )
 
