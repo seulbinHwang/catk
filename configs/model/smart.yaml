@@ -25,7 +25,7 @@ model_config:
   validation_rollout_sampling:
     sample_steps: 4
     sample_temperature: 1.0
-    sample_method: euler
+    sample_method: midpoint
   decoder:
     hidden_dim: 128
     num_freq_bands: 64

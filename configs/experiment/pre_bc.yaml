@@ -1,5 +1,4 @@
 # @package _global_
-
 defaults:
   - override /model: smart
 
@@ -12,10 +11,9 @@ model:
     validation_rollout_sampling:
       sample_steps: 4
       sample_temperature: 1.0
-      sample_method: euler
+      sample_method: midpoint
 
 ckpt_path: null
-
 trainer:
   limit_train_batches: 1.0
   limit_val_batches: 0.1

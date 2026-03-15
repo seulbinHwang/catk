@@ -80,25 +80,27 @@ class SMART(LightningModule):
     def _flow_loss(
         self,
         pred_dict: Dict[str, Tensor],
-        train_mask: Optional[Tensor] = None,
+        anchor_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """flow matching 단일 loss를 계산한다.
 
         Args:
             pred_dict: decoder 출력이다.
-            train_mask: [n_agent] 모양의 학습 대상 agent 마스크이다.
+            anchor_mask: [n_agent, n_anchor] 모양의 실제 학습 anchor 마스크이다.
 
         Returns:
             스칼라 loss를 돌려준다.
         """
-        anchor_mask = self._merge_train_mask(pred_dict["flow_anchor_valid"], train_mask)
+        if anchor_mask is None:
+            anchor_mask = pred_dict.get("flow_train_mask", pred_dict["flow_anchor_valid"])
         step_mask = pred_dict["flow_future_valid"] & anchor_mask.unsqueeze(-1)
         step_mask = step_mask.unsqueeze(-1).to(pred_dict["pred_flow"].dtype)
 
         diff = pred_dict["pred_flow"] - pred_dict["target_flow"]
-        diff_xy = diff[..., :2] / self.xy_loss_scale
-        diff_rest = diff[..., 2:]
-        diff = torch.cat([diff_xy, diff_rest], dim=-1)
+        if not pred_dict.get("flow_state_normalized", False):
+            diff_xy = diff[..., :2] / self.xy_loss_scale
+            diff_rest = diff[..., 2:]
+            diff = torch.cat([diff_xy, diff_rest], dim=-1)
         loss = (diff.pow(2) * step_mask).sum()
         denom = step_mask.sum() * diff.shape[-1]
         return loss / denom.clamp_min(1.0)
@@ -143,13 +145,10 @@ class SMART(LightningModule):
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         pred = self.encoder(tokenized_map, tokenized_agent)
-        loss = self._flow_loss(pred, train_mask=data["agent"]["train_mask"])
+        loss = self._flow_loss(pred, anchor_mask=pred["flow_train_mask"])
         future_metrics = self._future_metrics(
             pred,
-            anchor_mask=self._merge_train_mask(
-                pred["flow_anchor_valid"],
-                data["agent"]["train_mask"],
-            ),
+            anchor_mask=pred["flow_train_mask"],
         )
         self.log("train/loss", loss, on_step=True, batch_size=1)
         self.log("train/ade_2s_m", future_metrics["ade_2s_m"], on_step=True, batch_size=1)
@@ -166,8 +165,8 @@ class SMART(LightningModule):
 
         if self.val_open_loop:
             pred = self.encoder(tokenized_map, tokenized_agent)
-            loss = self._flow_loss(pred)
-            future_metrics = self._future_metrics(pred, anchor_mask=pred["flow_anchor_valid"])
+            loss = self._flow_loss(pred, anchor_mask=pred["flow_eval_mask"])
+            future_metrics = self._future_metrics(pred, anchor_mask=pred["flow_eval_mask"])
             self.log("val_open/loss", loss, on_epoch=True, sync_dist=True, batch_size=1)
             self.log(
                 "val_open/ade_2s_m",

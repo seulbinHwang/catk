@@ -88,7 +88,7 @@ class FlowODE:
         model_fn: Callable[[Tensor, Tensor], Tensor],
         sample_steps: int,
         sample_temperature: float = 1.0,
-        sample_method: str = "euler",
+        sample_method: str = "midpoint",
     ) -> Tensor:
         """랜덤 잡음에서 시작해 미래 샘플을 만든다.
 
@@ -97,17 +97,17 @@ class FlowODE:
             model_fn: `(x_t, tau) -> velocity` 꼴의 함수이다.
             sample_steps: 고정 적분 step 수이다.
             sample_temperature: 시작 잡음 크기 조절 값이다.
-            sample_method: `euler` 또는 `heun`을 받는다.
+            sample_method: `midpoint`, `euler`, `heun` 중 하나를 받는다.
 
         Returns:
             [*, n_future_step, 4] 모양의 최종 샘플이다.
         """
         x_t = x_init * sample_temperature
-        dt = 1.0 / float(sample_steps)
+        dt = (1.0 - self.tau_eps) / float(sample_steps)
         batch_shape = x_init.shape[:-2]
 
         for step in range(sample_steps):
-            tau_value = self.tau_eps + (1.0 - self.tau_eps) * (step / sample_steps)
+            tau_value = self.tau_eps + dt * step
             tau = torch.full(
                 batch_shape,
                 fill_value=tau_value,
@@ -116,14 +116,21 @@ class FlowODE:
             )
             velocity = model_fn(x_t, tau)
 
-            if sample_method == "heun":
-                x_euler = x_t + dt * velocity
-                tau_next_value = self.tau_eps + (1.0 - self.tau_eps) * (
-                    (step + 1) / sample_steps
+            if sample_method == "midpoint":
+                tau_mid = torch.full(
+                    batch_shape,
+                    fill_value=tau_value + 0.5 * dt,
+                    device=x_init.device,
+                    dtype=x_init.dtype,
                 )
+                x_mid = x_t + 0.5 * dt * velocity
+                velocity_mid = model_fn(x_mid, tau_mid)
+                x_t = x_t + dt * velocity_mid
+            elif sample_method == "heun":
+                x_euler = x_t + dt * velocity
                 tau_next = torch.full(
                     batch_shape,
-                    fill_value=tau_next_value,
+                    fill_value=min(1.0, tau_value + dt),
                     device=x_init.device,
                     dtype=x_init.dtype,
                 )

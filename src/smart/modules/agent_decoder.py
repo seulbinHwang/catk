@@ -19,9 +19,92 @@ from src.smart.utils import (
     angle_between_2d_vectors,
     cal_polygon_contour,
     transform_to_global,
+    transform_to_local,
     weight_init,
     wrap_angle,
 )
+
+class ContinuousCommitBridge:
+    """연속 flow 출력을 SMART coarse rollout 상태로 잇는 보조 모듈이다.
+
+    이 모듈은 학습 파라미터를 늘리지 않는다. 첫 0.5초 구간을 global 좌표로
+    복원하고, 현재 contour + commit된 5개 미래 contour를 함께 비교해서
+    다음 coarse token을 고른다.
+    """
+
+    def __init__(self, flow_position_scale: float) -> None:
+        self.flow_position_scale = flow_position_scale
+
+    def commit(
+        self,
+        future_local_norm: Tensor,
+        current_pos: Tensor,
+        current_head: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """정규화된 2초 미래에서 첫 0.5초만 실제 좌표로 복원한다.
+
+        Args:
+            future_local_norm: [n_active, 20, 4] 모양의 정규화된 local 미래이다.
+            current_pos: [n_active, 2] 모양의 현재 global 위치이다.
+            current_head: [n_active] 모양의 현재 global heading이다.
+
+        Returns:
+            commit_pos: [n_active, 5, 2] 모양의 commit 위치이다.
+            commit_head: [n_active, 5] 모양의 commit heading이다.
+            next_pos: [n_active, 2] 모양의 다음 coarse 위치이다.
+            next_head: [n_active] 모양의 다음 coarse heading이다.
+        """
+        local_commit = future_local_norm[:, :5].clone()
+        local_commit[..., :2] = local_commit[..., :2] * self.flow_position_scale
+        commit_pos, _ = transform_to_global(
+            pos_local=local_commit[..., :2],
+            head_local=None,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        delta_head = torch.atan2(local_commit[..., 3], local_commit[..., 2])
+        commit_head = wrap_angle(current_head.unsqueeze(1) + delta_head)
+        next_pos = commit_pos[:, -1]
+        next_head = commit_head[:, -1]
+        return commit_pos, commit_head, next_pos, next_head
+
+    def retokenize(
+        self,
+        current_pos: Tensor,
+        current_head: Tensor,
+        commit_pos: Tensor,
+        commit_head: Tensor,
+        token_traj_all: Tensor,
+        token_agent_shape: Tensor,
+    ) -> Tensor:
+        """현재 contour와 commit된 5개 contour를 함께 써서 다음 token을 고른다.
+
+        Args:
+            current_pos: [n_active, 2] 모양의 현재 global 위치이다.
+            current_head: [n_active] 모양의 현재 global heading이다.
+            commit_pos: [n_active, 5, 2] 모양의 commit 위치이다.
+            commit_head: [n_active, 5] 모양의 commit heading이다.
+            token_traj_all: [n_active, n_token, 6, 4, 2] 모양의 contour token 사전이다.
+            token_agent_shape: [n_active, 2] 모양의 agent 폭/길이이다.
+
+        Returns:
+            [n_active] 모양의 다음 coarse token index이다.
+        """
+        current_contour = cal_polygon_contour(current_pos, current_head, token_agent_shape)
+        future_contours = [
+            cal_polygon_contour(commit_pos[:, step_idx], commit_head[:, step_idx], token_agent_shape)
+            for step_idx in range(commit_pos.shape[1])
+        ]
+        contour_global = torch.stack([current_contour] + future_contours, dim=1)
+        contour_local, _ = transform_to_local(
+            pos_global=contour_global.flatten(1, 2),
+            head_global=None,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        contour_local = contour_local.view_as(contour_global)
+        dist = torch.norm(token_traj_all - contour_local.unsqueeze(1), dim=-1).mean(dim=(-1, -2))
+        return torch.argmin(dist, dim=-1)
 
 
 class SMARTAgentDecoder(nn.Module):
@@ -51,6 +134,7 @@ class SMARTAgentDecoder(nn.Module):
         flow_anchor_stride: int,
         commit_num_future_steps: int,
         flow_tau_eps: float,
+        flow_position_scale: float = 20.0,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -69,6 +153,8 @@ class SMARTAgentDecoder(nn.Module):
         self.query_time_span_token = max(1, self.time_span // self.shift)
         self.step_current_token = num_historical_steps // self.shift
         self.flow_ode = FlowODE(tau_eps=flow_tau_eps)
+        self.flow_position_scale = flow_position_scale
+        self.commit_bridge = ContinuousCommitBridge(flow_position_scale=flow_position_scale)
 
         input_dim_x_a = 2
         input_dim_r_t = 4
@@ -569,62 +655,133 @@ class SMARTAgentDecoder(nn.Module):
         r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
         return edge_index, r_t
 
-    def predict_flow(
+    def build_sparse_anchor_temporal_edge(
+        self,
+        pos_a: Tensor,
+        head_a: Tensor,
+        head_vector_a: Tensor,
+        mask: Tensor,
+        agent_indices: Tensor,
+        anchor_indices: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """유효한 anchor query만 대상으로 sparse temporal edge를 만든다.
+
+        Args:
+            pos_a: [n_agent, n_step, 2] 모양의 coarse 위치이다.
+            head_a: [n_agent, n_step] 모양의 coarse heading이다.
+            head_vector_a: [n_agent, n_step, 2] 모양의 heading unit vector이다.
+            mask: [n_agent, n_step] 모양의 coarse step 유효 마스크이다.
+            agent_indices: [n_query] 모양의 query별 agent index이다.
+            anchor_indices: [n_query] 모양의 query별 coarse anchor index이다.
+
+        Returns:
+            sparse query attention용 edge index와 relation embedding을 돌려준다.
+        """
+        device = pos_a.device
+        _, n_step, _ = pos_a.shape
+        n_query = agent_indices.shape[0]
+        if n_query == 0:
+            empty_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+            empty_r = pos_a.new_zeros((0, self.hidden_dim))
+            return empty_index, empty_r
+
+        src_steps = torch.arange(n_step, device=device).view(1, n_step)
+        src_valid = mask[agent_indices]
+        dst_valid = mask[agent_indices, anchor_indices].unsqueeze(-1)
+        edge_mask = src_valid & dst_valid
+        edge_mask = edge_mask & (src_steps <= anchor_indices.unsqueeze(-1))
+        edge_mask = edge_mask & ((anchor_indices.unsqueeze(-1) - src_steps) <= self.query_time_span_token)
+
+        query_idx, src_step_idx = edge_mask.nonzero(as_tuple=True)
+        if query_idx.numel() == 0:
+            empty_index = torch.zeros((2, 0), dtype=torch.long, device=device)
+            empty_r = pos_a.new_zeros((0, self.hidden_dim))
+            return empty_index, empty_r
+
+        query_agent_idx = agent_indices[query_idx]
+        dst_step_idx = anchor_indices[query_idx]
+        src_index = query_agent_idx * n_step + src_step_idx
+        dst_index = query_idx
+        edge_index = torch.stack([src_index, dst_index], dim=0)
+
+        rel_pos = pos_a[query_agent_idx, src_step_idx] - pos_a[query_agent_idx, dst_step_idx]
+        rel_head = wrap_angle(head_a[query_agent_idx, src_step_idx] - head_a[query_agent_idx, dst_step_idx])
+        rel_time = (src_step_idx - dst_step_idx).to(pos_a.dtype)
+        anchor_head_vec = head_vector_a[query_agent_idx, dst_step_idx]
+        r_t = torch.stack(
+            [
+                torch.norm(rel_pos, p=2, dim=-1),
+                angle_between_2d_vectors(ctr_vector=anchor_head_vec, nbr_vector=rel_pos),
+                rel_head,
+                rel_time,
+            ],
+            dim=-1,
+        )
+        r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
+        return edge_index, r_t
+
+    def predict_flow_sparse(
         self,
         scene_feature: Tensor,
         pos_a: Tensor,
         head_a: Tensor,
         mask: Tensor,
+        agent_indices: Tensor,
         anchor_indices: Tensor,
         noised_future: Tensor,
         tau: Tensor,
     ) -> Tensor:
-        """현재 장면 문맥과 noised future에서 flow velocity를 예측한다.
+        """유효한 agent-anchor query만 골라 flow velocity를 예측한다.
 
         Args:
-            scene_feature: [n_agent, n_step, hidden_dim] 장면 문맥 특징이다.
-            pos_a: [n_agent, n_step, 2] 실제 위치이다.
-            head_a: [n_agent, n_step] heading이다.
-            mask: [n_agent, n_step] coarse step 유효 마스크이다.
-            anchor_indices: [n_anchor] coarse anchor index이다.
-            noised_future: [n_agent, n_anchor, 20, 4] 또는 [n_agent, 20, 4] 미래이다.
-            tau: [n_agent, n_anchor] 또는 [n_agent] 시간 값이다.
+            scene_feature: [n_agent, n_step, hidden_dim] 모양의 장면 문맥 특징이다.
+            pos_a: [n_agent, n_step, 2] 모양의 coarse 위치이다.
+            head_a: [n_agent, n_step] 모양의 coarse heading이다.
+            mask: [n_agent, n_step] 모양의 coarse 유효 마스크이다.
+            agent_indices: [n_query] 모양의 query별 agent index이다.
+            anchor_indices: [n_query] 모양의 query별 coarse anchor index이다.
+            noised_future: [n_query, 20, 4] 모양의 정규화된 noised future이다.
+            tau: [n_query] 모양의 시간 값이다.
 
         Returns:
-            [n_agent, n_anchor, 20, 4] 모양의 step별 flow velocity이다.
+            [n_query, 20, 4] 모양의 step별 flow velocity이다.
         """
-        if noised_future.dim() == 3:
-            noised_future = noised_future.unsqueeze(1)
-            tau = tau.unsqueeze(1)
-            squeeze_anchor = True
-        else:
-            squeeze_anchor = False
+        if noised_future.numel() == 0:
+            return noised_future.new_zeros((0, self.flow_num_future_steps, 4))
 
-        n_agent, n_anchor, _, _ = noised_future.shape
         head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
         condition_vec = self.future_conditioner(noised_future, tau)
-
-        anchor_feature = scene_feature[:, anchor_indices]  # [n_agent, n_anchor, hidden_dim]
+        anchor_feature = scene_feature[agent_indices, anchor_indices]
         anchor_query = anchor_feature + self.query_adapter(
             torch.cat([anchor_feature, condition_vec], dim=-1)
         )
-        edge_index_q, r_q = self.build_anchor_temporal_edge(
+        edge_index_q, r_q = self.build_sparse_anchor_temporal_edge(
             pos_a=pos_a,
             head_a=head_a,
             head_vector_a=head_vector_a,
             mask=mask,
+            agent_indices=agent_indices,
             anchor_indices=anchor_indices,
         )
         anchor_query = self.anchor_query_attn(
-            (scene_feature.flatten(0, 1), anchor_query.flatten(0, 1)),
+            (scene_feature.flatten(0, 1), anchor_query),
             r_q,
             edge_index_q,
         )
-        anchor_query = anchor_query.view(n_agent, n_anchor, self.hidden_dim)
-        pred_flow = self.flow_head(anchor_query)
-        if squeeze_anchor:
-            return pred_flow[:, 0]
-        return pred_flow
+        return self.flow_head(anchor_query)
+
+    def denormalize_future_local(self, future_local_norm: Tensor) -> Tensor:
+        """정규화된 local 미래를 meter 단위 local 미래로 되돌린다.
+
+        Args:
+            future_local_norm: [*, 20, 4] 모양의 정규화된 local 미래이다.
+
+        Returns:
+            [*, 20, 4] 모양의 meter 단위 local 미래이다.
+        """
+        future_local = future_local_norm.clone()
+        future_local[..., :2] = future_local[..., :2] * self.flow_position_scale
+        return future_local
 
     @staticmethod
     def decode_future(
@@ -700,7 +857,11 @@ class SMARTAgentDecoder(nn.Module):
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
     ) -> Dict[str, Tensor]:
-        """학습용 flow prediction을 만든다."""
+        """학습용 flow prediction을 만든다.
+
+        정규화된 flow state에서 ODE 샘플을 만들고, 실제로 유효한 anchor만 골라
+        decoder를 통과시킨 뒤 다시 dense 형태로 되돌린다.
+        """
         pos_a = tokenized_agent["coarse_pos"]
         head_a = tokenized_agent["coarse_head"]
         mask = tokenized_agent["valid_mask"]
@@ -713,21 +874,41 @@ class SMARTAgentDecoder(nn.Module):
             agent_token_index=tokenized_agent["gt_idx"],
         )
 
-        flow_sample = self.flow_ode.sample(tokenized_agent["flow_future_local"])
-        pred_flow = self.predict_flow(
-            scene_feature=scene_feature,
-            pos_a=pos_a,
-            head_a=head_a,
-            mask=mask,
-            anchor_indices=tokenized_agent["flow_anchor_token_idx"],
-            noised_future=flow_sample.noised,
-            tau=flow_sample.tau,
-        )
-        pred_future_local = self.flow_ode.reconstruct_start(
-            flow_sample.noised,
-            pred_flow,
-            flow_sample.tau,
-        )
+        anchor_mask = tokenized_agent["flow_train_mask"] if self.training else tokenized_agent["flow_eval_mask"]
+        flow_clean_norm = tokenized_agent["flow_clean_norm"]
+        pred_flow = flow_clean_norm.new_zeros(flow_clean_norm.shape)
+        target_flow = flow_clean_norm.new_zeros(flow_clean_norm.shape)
+        noised_future_norm = flow_clean_norm.new_zeros(flow_clean_norm.shape)
+        pred_future_local_norm = flow_clean_norm.new_zeros(flow_clean_norm.shape)
+        tau = flow_clean_norm.new_zeros(flow_clean_norm.shape[:2])
+
+        if anchor_mask.any():
+            agent_idx, anchor_local_idx = anchor_mask.nonzero(as_tuple=True)
+            query_anchor_idx = tokenized_agent["flow_anchor_token_idx"][anchor_local_idx]
+            flow_sample = self.flow_ode.sample(flow_clean_norm[anchor_mask])
+            pred_flow_valid = self.predict_flow_sparse(
+                scene_feature=scene_feature,
+                pos_a=pos_a,
+                head_a=head_a,
+                mask=mask,
+                agent_indices=agent_idx,
+                anchor_indices=query_anchor_idx,
+                noised_future=flow_sample.noised,
+                tau=flow_sample.tau,
+            )
+            pred_future_local_norm_valid = self.flow_ode.reconstruct_start(
+                flow_sample.noised,
+                pred_flow_valid,
+                flow_sample.tau,
+            )
+            pred_flow[anchor_mask] = pred_flow_valid
+            target_flow[anchor_mask] = flow_sample.target
+            noised_future_norm[anchor_mask] = flow_sample.noised
+            pred_future_local_norm[anchor_mask] = pred_future_local_norm_valid
+            tau[anchor_mask] = flow_sample.tau
+
+        pred_future_local = self.denormalize_future_local(pred_future_local_norm)
+        gt_future_local = tokenized_agent["flow_future_local"]
         pred_future_pos, pred_future_head = self.decode_future(
             future_local=pred_future_local,
             anchor_pos=tokenized_agent["flow_anchor_pos"],
@@ -735,17 +916,25 @@ class SMARTAgentDecoder(nn.Module):
         )
         return {
             "pred_flow": pred_flow,
-            "target_flow": flow_sample.target,
-            "noised_future": flow_sample.noised,
-            "tau": flow_sample.tau,
+            "target_flow": target_flow,
+            "pred_flow_norm": pred_flow,
+            "target_flow_norm": target_flow,
+            "noised_future": self.denormalize_future_local(noised_future_norm),
+            "noised_future_norm": noised_future_norm,
+            "tau": tau,
             "pred_future_local": pred_future_local,
-            "gt_future_local": tokenized_agent["flow_future_local"],
+            "pred_future_local_norm": pred_future_local_norm,
+            "gt_future_local": gt_future_local,
+            "gt_future_local_norm": flow_clean_norm,
             "pred_future_pos": pred_future_pos,
             "pred_future_head": pred_future_head,
             "gt_future_pos": tokenized_agent["flow_future_pos"],
             "gt_future_head": tokenized_agent["flow_future_head"],
             "flow_anchor_valid": tokenized_agent["flow_anchor_valid"],
+            "flow_train_mask": tokenized_agent["flow_train_mask"],
+            "flow_eval_mask": tokenized_agent["flow_eval_mask"],
             "flow_future_valid": tokenized_agent["flow_future_valid"],
+            "flow_state_normalized": True,
         }
 
     def inference(
@@ -756,14 +945,9 @@ class SMARTAgentDecoder(nn.Module):
     ) -> Dict[str, Tensor]:
         """random noise에서 시작해 2초 미래를 만들고 0.5초씩 commit한다.
 
-        Args:
-            tokenized_agent: agent 관련 입력 딕셔너리이다.
-            map_feature: map encoder 출력이다.
-            sampling_scheme: `sample_steps`, `sample_temperature`, `sample_method`
-                를 담은 설정이다.
-
-        Returns:
-            WOSAC 평가와 제출에 필요한 10Hz 결과를 담은 딕셔너리이다.
+        구조는 그대로 두되, 실제로 현재 살아 있는 agent만 flow 샘플을 만든다.
+        retokenization은 마지막 한 점이 아니라 현재 contour + commit된 5개 contour를
+        함께 써서 다음 coarse token을 고른다.
         """
         n_agent = tokenized_agent["valid_mask"].shape[0]
         rollout_segments = self.num_future_steps // self.commit_num_future_steps
@@ -785,61 +969,83 @@ class SMARTAgentDecoder(nn.Module):
                 mask=valid_seq,
                 agent_token_index=token_idx_seq,
             )
-            anchor_index = torch.tensor(
-                [pos_seq.shape[1] - 1],
-                device=pos_seq.device,
-                dtype=torch.long,
-            )
-
-            def model_fn(x_t: Tensor, tau: Tensor) -> Tensor:
-                return self.predict_flow(
-                    scene_feature=scene_feature,
-                    pos_a=pos_seq,
-                    head_a=head_seq,
-                    mask=valid_seq,
-                    anchor_indices=anchor_index,
-                    noised_future=x_t,
-                    tau=tau,
-                )
-
-            x_init = torch.randn(
-                n_agent,
-                self.flow_num_future_steps,
-                4,
-                device=pos_seq.device,
-                dtype=pos_seq.dtype,
-            )
-            future_local = self.flow_ode.generate(
-                x_init=x_init,
-                model_fn=model_fn,
-                sample_steps=sampling_scheme.sample_steps,
-                sample_temperature=sampling_scheme.sample_temperature,
-                sample_method=sampling_scheme.sample_method,
-            )
-            future_pos, future_head = self.decode_future(
-                future_local=future_local,
-                anchor_pos=pos_seq[:, -1],
-                anchor_head=head_seq[:, -1],
-            )
+            active_mask = valid_seq[:, -1]
             step_start = segment_idx * self.commit_num_future_steps
             step_end = step_start + self.commit_num_future_steps
-            pred_traj_10hz[:, step_start:step_end] = future_pos[:, : self.commit_num_future_steps]
-            pred_head_10hz[:, step_start:step_end] = future_head[:, : self.commit_num_future_steps]
 
-            next_pos = future_pos[:, self.commit_num_future_steps - 1]
-            next_head = future_head[:, self.commit_num_future_steps - 1]
-            next_idx = self.match_token_index(
-                token_traj=tokenized_agent["token_traj"],
-                token_agent_shape=tokenized_agent["token_agent_shape"],
-                pos_now=pos_seq[:, -1],
-                head_now=head_seq[:, -1],
-                pos_next=next_pos,
-                head_next=next_head,
-            )
+            next_pos = pos_seq[:, -1].clone()
+            next_head = head_seq[:, -1].clone()
+            next_idx = token_idx_seq[:, -1].clone()
+            commit_pos = pred_traj_10hz.new_zeros((n_agent, self.commit_num_future_steps, 2))
+            commit_head = pred_head_10hz.new_zeros((n_agent, self.commit_num_future_steps))
+
+            if active_mask.any():
+                pos_seq_active = pos_seq[active_mask]
+                head_seq_active = head_seq[active_mask]
+                valid_seq_active = valid_seq[active_mask]
+                scene_feature_active = scene_feature[active_mask]
+                n_active = pos_seq_active.shape[0]
+                agent_indices = torch.arange(n_active, device=pos_seq.device, dtype=torch.long)
+                anchor_indices = torch.full(
+                    (n_active,),
+                    fill_value=pos_seq_active.shape[1] - 1,
+                    device=pos_seq.device,
+                    dtype=torch.long,
+                )
+
+                def model_fn(x_t: Tensor, tau: Tensor) -> Tensor:
+                    return self.predict_flow_sparse(
+                        scene_feature=scene_feature_active,
+                        pos_a=pos_seq_active,
+                        head_a=head_seq_active,
+                        mask=valid_seq_active,
+                        agent_indices=agent_indices,
+                        anchor_indices=anchor_indices,
+                        noised_future=x_t,
+                        tau=tau,
+                    )
+
+                x_init = torch.randn(
+                    n_active,
+                    self.flow_num_future_steps,
+                    4,
+                    device=pos_seq.device,
+                    dtype=pos_seq.dtype,
+                )
+                future_local_norm = self.flow_ode.generate(
+                    x_init=x_init,
+                    model_fn=model_fn,
+                    sample_steps=sampling_scheme.sample_steps,
+                    sample_temperature=sampling_scheme.sample_temperature,
+                    sample_method=sampling_scheme.sample_method,
+                )
+                commit_pos_active, commit_head_active, next_pos_active, next_head_active = self.commit_bridge.commit(
+                    future_local_norm=future_local_norm,
+                    current_pos=pos_seq_active[:, -1],
+                    current_head=head_seq_active[:, -1],
+                )
+                next_idx_active = self.commit_bridge.retokenize(
+                    current_pos=pos_seq_active[:, -1],
+                    current_head=head_seq_active[:, -1],
+                    commit_pos=commit_pos_active,
+                    commit_head=commit_head_active,
+                    token_traj_all=tokenized_agent["token_traj_all"][active_mask],
+                    token_agent_shape=tokenized_agent["token_agent_shape"][active_mask],
+                )
+                commit_pos[active_mask] = commit_pos_active
+                commit_head[active_mask] = commit_head_active
+                next_pos[active_mask] = next_pos_active
+                next_head[active_mask] = next_head_active
+                next_idx[active_mask] = next_idx_active
+
+            pred_traj_10hz[:, step_start:step_end] = commit_pos
+            pred_head_10hz[:, step_start:step_end] = commit_head
+
+            next_valid = active_mask.clone()
             token_idx_seq = torch.cat([token_idx_seq, next_idx.unsqueeze(1)], dim=1)
             pos_seq = torch.cat([pos_seq, next_pos.unsqueeze(1)], dim=1)
             head_seq = torch.cat([head_seq, next_head.unsqueeze(1)], dim=1)
-            valid_seq = torch.cat([valid_seq, valid_seq[:, -1:]], dim=1)
+            valid_seq = torch.cat([valid_seq, next_valid.unsqueeze(1)], dim=1)
 
         pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)
         return {

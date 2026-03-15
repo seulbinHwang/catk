@@ -34,6 +34,7 @@ class TokenProcessor(torch.nn.Module):
         flow_num_future_steps: int = 20,
         flow_anchor_stride: int = 5,
         flow_num_anchors: int = 13,
+        flow_position_scale: float = 20.0,
     ) -> None:
         super().__init__()
         self.map_token_sampling = map_token_sampling
@@ -43,6 +44,7 @@ class TokenProcessor(torch.nn.Module):
         self.flow_num_future_steps = flow_num_future_steps
         self.flow_anchor_stride = flow_anchor_stride
         self.flow_num_anchors = flow_num_anchors
+        self.flow_position_scale = flow_position_scale
 
         module_dir = os.path.dirname(__file__)
         self.init_agent_token(os.path.join(module_dir, agent_token_file))
@@ -142,8 +144,10 @@ class TokenProcessor(torch.nn.Module):
                 - `valid_mask`: [n_agent, 18] coarse step 유효 여부.
                 - `coarse_pos`: [n_agent, 18, 2] coarse step 실제 위치.
                 - `coarse_head`: [n_agent, 18] coarse step 실제 heading.
-                - `flow_future_local`: [n_agent, 13, 20, 4] local GT 미래.
+                - `flow_future_local`: [n_agent, 13, 20, 4] meter 단위 local GT 미래.
+                - `flow_clean_norm`: [n_agent, 13, 20, 4] 정규화된 flow 상태이다.
                 - `flow_anchor_valid`: [n_agent, 13] full 2초 GT 유효 여부.
+                - `flow_train_mask`: [n_agent, 13] 학습에 실제로 쓸 anchor 마스크이다.
         """
         agent_shape, token_traj_all, token_traj = self._get_agent_shape_and_token_traj(
             data["agent"]["type"]
@@ -190,13 +194,27 @@ class TokenProcessor(torch.nn.Module):
         tokenized_agent["coarse_pos"] = pos[:, self.shift :: self.shift]
         tokenized_agent["coarse_head"] = heading[:, self.shift :: self.shift]
 
-        tokenized_agent.update(
-            self._build_flow_targets(
-                valid=valid,
-                pos=pos,
-                heading=heading,
-            )
+        flow_targets = self._build_flow_targets(
+            valid=valid,
+            pos=pos,
+            heading=heading,
         )
+        flow_clean_norm = flow_targets["flow_future_local"].clone()
+        flow_clean_norm[..., :2] = flow_clean_norm[..., :2] / self.flow_position_scale
+
+        if "train_mask" in data["agent"]:
+            train_mask = data["agent"]["train_mask"].bool()
+        else:
+            train_mask = torch.ones(
+                flow_targets["flow_anchor_valid"].shape[0],
+                device=flow_targets["flow_anchor_valid"].device,
+                dtype=torch.bool,
+            )
+
+        flow_targets["flow_clean_norm"] = flow_clean_norm
+        flow_targets["flow_train_mask"] = flow_targets["flow_anchor_valid"] & train_mask.unsqueeze(-1)
+        flow_targets["flow_eval_mask"] = flow_targets["flow_anchor_valid"]
+        tokenized_agent.update(flow_targets)
         return tokenized_agent
 
     def _build_flow_targets(
