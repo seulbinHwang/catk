@@ -39,6 +39,14 @@ class WandbRuntimeMetricsCallback(Callback):
             logger.log_metrics(metrics, step=step)
 
     @staticmethod
+    def _lightning_log_step(trainer: Trainer, *, epoch_end: bool = False) -> int:
+        """Match Lightning's internal logger step so W&B history stays monotonic."""
+        step = trainer.fit_loop.epoch_loop._batches_that_stepped
+        if epoch_end:
+            step -= 1
+        return max(step, 0)
+
+    @staticmethod
     def _get_wandb_logger(trainer: Trainer):
         for logger in trainer.loggers:
             if logger.__class__.__name__ == "WandbLogger":
@@ -118,14 +126,18 @@ class WandbRuntimeMetricsCallback(Callback):
 
         self._epoch_values.append(worst_peak_reserved_pct)
 
-        if trainer.global_step > 0 and trainer.global_step % self.log_every_n_steps == 0:
+        if trainer.fit_loop._should_accumulate() and trainer.lightning_module.automatic_optimization:
+            return
+
+        log_step = self._lightning_log_step(trainer)
+        if (log_step + 1) % self.log_every_n_steps == 0:
             self._log_metrics(
                 trainer,
                 {
                     "System/GPU Memory Allocated (%)": max_allocated_pct,
                     "worst_peak_reserved_pct": worst_peak_reserved_pct,
                 },
-                step=trainer.global_step,
+                step=log_step,
             )
 
     def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
@@ -138,7 +150,7 @@ class WandbRuntimeMetricsCallback(Callback):
             {
                 "worst_peak_reserved_pct_epoch_max": float(values.max().item()),
             },
-            step=trainer.global_step,
+            step=self._lightning_log_step(trainer, epoch_end=True),
         )
 
         wandb_logger = self._get_wandb_logger(trainer)
