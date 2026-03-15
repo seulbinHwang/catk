@@ -17,10 +17,10 @@ model_config:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
     map_token_sampling:
-      num_k: 3
+      num_k: 1
       temp: 1.0
     agent_token_sampling:
-      num_k: 3
+      num_k: 1
       temp: 1.0
   validation_rollout_sampling:
     sample_steps: 4
