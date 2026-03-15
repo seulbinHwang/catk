@@ -10,9 +10,12 @@ from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils import transform_to_local
 
 
-class FlowTokenProcessor(TokenProcessor):
-    """Extends the original token processor with 14-slot context packs and
-    13-anchor flow-matching targets.
+class HybridFlowTokenProcessor(TokenProcessor):
+    """Builds a hybrid context pack for SMART-flow training and inference.
+
+    The base token processor still creates the standard coarse tokens. This
+    wrapper then slices only the causal 14-slot context used by the shared
+    scene trunk and prepares normalized 13-anchor / 20-step flow targets.
     """
 
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
@@ -90,3 +93,7 @@ class FlowTokenProcessor(TokenProcessor):
             }
         )
         return tokenized_agent
+
+
+# Keep the old import path working.
+FlowTokenProcessor = HybridFlowTokenProcessor

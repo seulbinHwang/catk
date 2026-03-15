@@ -9,9 +9,15 @@ from lightning import LightningModule
 from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import WOSACMetrics, WOSACSubmission, minADE
-from src.smart.metrics.flow_metrics import ade_2s, fde_2s, flow_matching_loss
+from src.smart.metrics.flow_metrics import (
+    ade_2s,
+    fde_2s,
+    flow_matching_loss,
+    yaw_ade_2s_deg,
+    yaw_fde_2s_deg,
+)
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
-from src.smart.tokens.flow_token_processor import FlowTokenProcessor
+from src.smart.tokens.flow_token_processor import HybridFlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
 from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
@@ -30,7 +36,7 @@ class SMARTFlow(LightningModule):
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
-        self.token_processor = FlowTokenProcessor(**model_config.token_processor)
+        self.token_processor = HybridFlowTokenProcessor(**model_config.token_processor)
 
         self.encoder = SMARTFlowDecoder(
             **model_config.decoder,
@@ -57,7 +63,9 @@ class SMARTFlow(LightningModule):
         loss = flow_matching_loss(pred_dict["flow_pred_norm"], pred_dict["flow_target_norm"])
         ade = ade_2s(pred_dict["flow_pred_clean_norm"], pred_dict["flow_clean_norm"])
         fde = fde_2s(pred_dict["flow_pred_clean_norm"], pred_dict["flow_clean_norm"])
-        return loss, ade, fde
+        yaw_ade = yaw_ade_2s_deg(pred_dict["flow_pred_clean_norm"], pred_dict["flow_clean_norm"])
+        yaw_fde = yaw_fde_2s_deg(pred_dict["flow_pred_clean_norm"], pred_dict["flow_clean_norm"])
+        return loss, ade, fde, yaw_ade, yaw_fde
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -66,10 +74,12 @@ class SMARTFlow(LightningModule):
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
-        loss, ade, fde = self._open_loop_loss_and_metrics(pred)
+        loss, ade, fde, yaw_ade, yaw_fde = self._open_loop_loss_and_metrics(pred)
         self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/ADE2s", ade, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/FDE2s", fde, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/YawADE2sDeg", yaw_ade, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/YawFDE2sDeg", yaw_fde, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         return loss
 
     def validation_step(self, data, batch_idx):
@@ -81,10 +91,12 @@ class SMARTFlow(LightningModule):
                 tokenized_agent,
                 anchor_mask_key="flow_eval_mask",
             )
-            loss, ade, fde = self._open_loop_loss_and_metrics(pred)
+            loss, ade, fde, yaw_ade, yaw_fde = self._open_loop_loss_and_metrics(pred)
             self.log("val_open/loss", loss, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("val_open/ADE2s", ade, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("val_open/FDE2s", fde, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("val_open/YawADE2sDeg", yaw_ade, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("val_open/YawFDE2sDeg", yaw_fde, on_epoch=True, sync_dist=True, batch_size=1)
 
         if self.val_closed_loop:
             pred_traj, pred_z, pred_head = [], [], []

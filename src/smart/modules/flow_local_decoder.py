@@ -18,17 +18,7 @@ class FlowSample:
 
 
 class FlowODE:
-    """Minimal linear-path flow ODE helper.
-
-    The clean sample ``x_1`` lives in normalized trajectory space and the base
-    noise ``x_0`` is Gaussian. We use the linear interpolation path
-
-        x_t = (1 - t) * x_0 + t * x_1
-
-    and train the decoder to predict the velocity target
-
-        v = x_1 - x_0.
-    """
+    """Minimal linear-path flow ODE helper in normalized trajectory space."""
 
     def __init__(
         self,
@@ -103,7 +93,75 @@ class AnchorContextProjector(nn.Module):
         return self.net(anchor_hidden)
 
 
-class NormalizedNoisyFutureEncoder(nn.Module):
+class AnchorPrefixMemoryBuilder(nn.Module):
+    """Builds a short causal prefix memory for each valid anchor.
+
+    Each anchor sees at most the current slot and the six immediately preceding
+    coarse slots, giving a fixed 7-token memory with left padding when history
+    is shorter.
+    """
+
+    def __init__(self, prefix_len: int = 7) -> None:
+        super().__init__()
+        self.prefix_len = prefix_len
+
+    def forward(
+        self,
+        ctx_hidden_pack: torch.Tensor,
+        ctx_valid: torch.Tensor,
+        anchor_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_agent, num_slots, hidden_dim = ctx_hidden_pack.shape
+        num_anchor = num_slots - 1
+        prefix_memory_full = ctx_hidden_pack.new_zeros(num_agent, num_anchor, self.prefix_len, hidden_dim)
+        prefix_memory_mask_full = torch.zeros(
+            num_agent,
+            num_anchor,
+            self.prefix_len,
+            dtype=torch.bool,
+            device=ctx_hidden_pack.device,
+        )
+        for anchor_offset in range(num_anchor):
+            current_slot = anchor_offset + 1
+            start_slot = max(0, current_slot - self.prefix_len + 1)
+            prefix_hidden = ctx_hidden_pack[:, start_slot : current_slot + 1]
+            prefix_valid = ctx_valid[:, start_slot : current_slot + 1]
+            pad = self.prefix_len - prefix_hidden.shape[1]
+            prefix_memory_full[:, anchor_offset, pad:] = prefix_hidden
+            prefix_memory_mask_full[:, anchor_offset, pad:] = prefix_valid
+
+        anchor_hidden_full = ctx_hidden_pack[:, 1:, :]
+        anchor_hidden = anchor_hidden_full[anchor_mask]
+        prefix_memory = prefix_memory_full[anchor_mask]
+        prefix_memory_mask = prefix_memory_mask_full[anchor_mask]
+        return anchor_hidden, prefix_memory, prefix_memory_mask
+
+    def current(
+        self,
+        ctx_hidden_cache: torch.Tensor,
+        ctx_valid: torch.Tensor,
+        active_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if active_mask.sum() == 0:
+            empty_hidden = ctx_hidden_cache.new_zeros((0, ctx_hidden_cache.shape[-1]))
+            empty_memory = ctx_hidden_cache.new_zeros((0, self.prefix_len, ctx_hidden_cache.shape[-1]))
+            empty_mask = torch.zeros((0, self.prefix_len), dtype=torch.bool, device=ctx_hidden_cache.device)
+            return empty_hidden, empty_memory, empty_mask
+
+        hidden_active = ctx_hidden_cache[active_mask]
+        valid_active = ctx_valid[active_mask]
+        anchor_hidden = hidden_active[:, -1]
+
+        prefix_hidden = hidden_active[:, -self.prefix_len :]
+        prefix_valid = valid_active[:, -self.prefix_len :]
+        if prefix_hidden.shape[1] < self.prefix_len:
+            pad = self.prefix_len - prefix_hidden.shape[1]
+            prefix_hidden = F.pad(prefix_hidden, (0, 0, pad, 0))
+            prefix_valid = F.pad(prefix_valid, (pad, 0), value=False)
+        return anchor_hidden, prefix_hidden, prefix_valid
+
+
+class NormalizedNoisyFutureChunkEncoder(nn.Module):
 
     def __init__(self, flow_dim: int, num_chunks: int = 4, chunk_size: int = 5) -> None:
         super().__init__()
@@ -141,15 +199,42 @@ class NormalizedNoisyFutureEncoder(nn.Module):
         return step_tokens, chunk_tokens, tau_emb
 
 
-class HalfSecondChunkMixerBlock(nn.Module):
+# Backward-compatible alias name used in earlier new_2 design notes.
+NormalizedNoisyFutureEncoder = NormalizedNoisyFutureChunkEncoder
 
-    def __init__(self, flow_dim: int, num_heads: int) -> None:
+
+class ChunkMemoryCrossBlock(nn.Module):
+    """Shared chunk-level block that mixes future chunks and prefix memory.
+
+    The same block is reused multiple times so the model can strengthen memory
+    re-querying without growing parameter count much.
+    """
+
+    def __init__(
+        self,
+        flow_dim: int,
+        prefix_dim: int,
+        num_heads: int,
+    ) -> None:
         super().__init__()
-        self.attn_norm = nn.LayerNorm(flow_dim)
-        self.attn = nn.MultiheadAttention(
+        self.chunk_attn_norm = nn.LayerNorm(flow_dim)
+        self.chunk_attn = nn.MultiheadAttention(
             embed_dim=flow_dim,
             num_heads=num_heads,
             batch_first=True,
+        )
+        self.prefix_norm = nn.LayerNorm(prefix_dim)
+        self.prefix_proj = nn.Linear(prefix_dim, flow_dim)
+        self.cross_attn_norm = nn.LayerNorm(flow_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=flow_dim,
+            num_heads=num_heads,
+            batch_first=True,
+        )
+        self.cross_gate_mlp = nn.Sequential(
+            nn.Linear(flow_dim * 2, flow_dim),
+            nn.SiLU(),
+            nn.Linear(flow_dim, flow_dim),
         )
         self.cond_mlp = nn.Sequential(
             nn.Linear(flow_dim * 2, flow_dim * 2),
@@ -163,27 +248,35 @@ class HalfSecondChunkMixerBlock(nn.Module):
             nn.Linear(flow_dim * 2, flow_dim),
         )
 
-    def _modulate(
-        self,
-        x: torch.Tensor,
-        cond: torch.Tensor,
-    ) -> torch.Tensor:
-        scale, bias, gate = cond.chunk(3, dim=-1)
-        return x + torch.sigmoid(gate).unsqueeze(1) * (x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1))
-
     def forward(
         self,
         chunk_tokens: torch.Tensor,
+        prefix_memory: torch.Tensor,
+        prefix_memory_mask: torch.Tensor,
         context: torch.Tensor,
         tau_emb: torch.Tensor,
     ) -> torch.Tensor:
-        attn_in = self.attn_norm(chunk_tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        attn_in = self.chunk_attn_norm(chunk_tokens)
+        attn_out, _ = self.chunk_attn(attn_in, attn_in, attn_in, need_weights=False)
         chunk_tokens = chunk_tokens + attn_out
 
+        prefix_tokens = self.prefix_proj(self.prefix_norm(prefix_memory))
+        cross_in = self.cross_attn_norm(chunk_tokens)
+        cross_out, _ = self.cross_attn(
+            cross_in,
+            prefix_tokens,
+            prefix_tokens,
+            key_padding_mask=~prefix_memory_mask,
+            need_weights=False,
+        )
+        cross_gate = torch.sigmoid(self.cross_gate_mlp(torch.cat([context, tau_emb], dim=-1))).unsqueeze(1)
+        chunk_tokens = chunk_tokens + cross_gate * cross_out
+
         cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
-        mlp_in = self._modulate(self.mlp_norm(chunk_tokens), cond)
-        chunk_tokens = chunk_tokens + self.mlp(mlp_in)
+        scale, bias, gate = cond.chunk(3, dim=-1)
+        mlp_in = self.mlp_norm(chunk_tokens)
+        mlp_in = mlp_in * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1)
+        chunk_tokens = chunk_tokens + torch.sigmoid(gate).unsqueeze(1) * self.mlp(mlp_in)
         return chunk_tokens
 
 
@@ -241,6 +334,13 @@ class FlowVelocityHead(nn.Module):
 
 
 class HierarchicalFlowDecoder(nn.Module):
+    """Hybrid local flow decoder.
+
+    The decoder preserves new_2's normalized 4x5 future representation while
+    adding a lightweight chunk-to-prefix-memory re-query path. The cross block
+    weights are shared across repeats so total parameter count stays close to
+    the original 7M-class model budget.
+    """
 
     def __init__(
         self,
@@ -248,26 +348,38 @@ class HierarchicalFlowDecoder(nn.Module):
         flow_dim: int,
         num_chunk_heads: int = 4,
         num_chunk_layers: int = 2,
+        prefix_dim: int = 128,
     ) -> None:
         super().__init__()
         self.context_projector = AnchorContextProjector(context_dim, flow_dim)
-        self.noisy_future_encoder = NormalizedNoisyFutureEncoder(flow_dim=flow_dim)
-        self.chunk_mixers = nn.ModuleList(
-            [HalfSecondChunkMixerBlock(flow_dim=flow_dim, num_heads=num_chunk_heads) for _ in range(num_chunk_layers)]
+        self.noisy_future_encoder = NormalizedNoisyFutureChunkEncoder(flow_dim=flow_dim)
+        self.chunk_memory_block = ChunkMemoryCrossBlock(
+            flow_dim=flow_dim,
+            prefix_dim=prefix_dim,
+            num_heads=num_chunk_heads,
         )
+        self.num_chunk_layers = num_chunk_layers
         self.step_refiner = ChunkStepRefiner(flow_dim=flow_dim, num_heads=num_chunk_heads)
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
 
     def forward(
         self,
         anchor_hidden: torch.Tensor,
+        prefix_memory: torch.Tensor,
+        prefix_memory_mask: torch.Tensor,
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
     ) -> torch.Tensor:
         context = self.context_projector(anchor_hidden)
         step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
-        for block in self.chunk_mixers:
-            chunk_tokens = block(chunk_tokens, context, tau_emb)
+        for _ in range(self.num_chunk_layers):
+            chunk_tokens = self.chunk_memory_block(
+                chunk_tokens=chunk_tokens,
+                prefix_memory=prefix_memory,
+                prefix_memory_mask=prefix_memory_mask,
+                context=context,
+                tau_emb=tau_emb,
+            )
         step_tokens = self.step_refiner(step_tokens, chunk_tokens, context)
         return self.velocity_head(step_tokens)
 
@@ -284,7 +396,7 @@ class ContinuousCommitBridge:
         first_chunk = y_hat_norm[:, :5].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * 20.0
 
-        cos_sin = F.normalize(first_chunk[..., 2:4], dim=-1)
+        cos_sin = F.normalize(first_chunk[..., 2:4], dim=-1, eps=1e-6)
         delta_head = torch.atan2(cos_sin[..., 1], cos_sin[..., 0])
 
         commit_pos, _ = transform_to_global(

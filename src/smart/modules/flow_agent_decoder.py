@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict
 
 import torch
@@ -10,6 +11,7 @@ from torch_geometric.utils import subgraph
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
 from src.smart.modules.flow_local_decoder import (
+    AnchorPrefixMemoryBuilder,
     ContinuousCommitBridge,
     FlowODE,
     HierarchicalFlowDecoder,
@@ -17,7 +19,75 @@ from src.smart.modules.flow_local_decoder import (
 from src.smart.utils import angle_between_2d_vectors, wrap_angle
 
 
+@dataclass
+class IncrementalContextCache:
+    max_context_steps: int = 14
+
+    def append(
+        self,
+        pos_window: torch.Tensor,
+        head_window: torch.Tensor,
+        head_vector_window: torch.Tensor,
+        valid_window: torch.Tensor,
+        pred_idx_window: torch.Tensor,
+        agent_token_emb: torch.Tensor,
+        feat_a: torch.Tensor,
+        feat_a_t_dict: Dict[int, torch.Tensor],
+        ctx_hidden_cache: torch.Tensor,
+        next_pos: torch.Tensor,
+        next_head: torch.Tensor,
+        next_valid: torch.Tensor,
+        next_token_idx: torch.Tensor,
+        agent_token_emb_next: torch.Tensor,
+        feat_a_next: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Dict[int, torch.Tensor],
+        torch.Tensor,
+    ]:
+        head_vector_next = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+
+        pred_idx_window = torch.cat([pred_idx_window, next_token_idx.unsqueeze(1)], dim=1)
+        valid_window = torch.cat([valid_window, next_valid.unsqueeze(1)], dim=1)
+        pos_window = torch.cat([pos_window, next_pos.unsqueeze(1)], dim=1)
+        head_window = torch.cat([head_window, next_head.unsqueeze(1)], dim=1)
+        head_vector_window = torch.cat([head_vector_window, head_vector_next.unsqueeze(1)], dim=1)
+        agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next.unsqueeze(1)], dim=1)
+        feat_a = torch.cat([feat_a, feat_a_next], dim=1)
+
+        if pos_window.shape[1] > self.max_context_steps:
+            pos_window = pos_window[:, -self.max_context_steps :]
+            head_window = head_window[:, -self.max_context_steps :]
+            head_vector_window = head_vector_window[:, -self.max_context_steps :]
+            valid_window = valid_window[:, -self.max_context_steps :]
+            pred_idx_window = pred_idx_window[:, -self.max_context_steps :]
+            agent_token_emb = agent_token_emb[:, -self.max_context_steps :]
+            feat_a = feat_a[:, -self.max_context_steps :]
+            ctx_hidden_cache = ctx_hidden_cache[:, -self.max_context_steps :]
+            for key in feat_a_t_dict:
+                feat_a_t_dict[key] = feat_a_t_dict[key][:, -self.max_context_steps :]
+
+        return (
+            pos_window,
+            head_window,
+            head_vector_window,
+            valid_window,
+            pred_idx_window,
+            agent_token_emb,
+            feat_a,
+            feat_a_t_dict,
+            ctx_hidden_cache,
+        )
+
+
 class SMARTFlowAgentDecoder(SMARTAgentEncoder):
+    """Shared scene trunk + hybrid local flow decoder."""
 
     def __init__(
         self,
@@ -40,6 +110,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
+        flow_prefix_memory_steps: int = 7,
     ) -> None:
         super().__init__(
             hidden_dim=hidden_dim,
@@ -61,8 +132,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
+        self.prefix_builder = AnchorPrefixMemoryBuilder(prefix_len=flow_prefix_memory_steps)
         self.flow_decoder = HierarchicalFlowDecoder(
             context_dim=hidden_dim,
+            prefix_dim=hidden_dim,
             flow_dim=flow_dim,
             num_chunk_heads=flow_num_chunk_heads,
             num_chunk_layers=flow_num_chunk_layers,
@@ -73,6 +146,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             solver_method=flow_solver_method,
         )
         self.commit_bridge = ContinuousCommitBridge()
+        self.context_cache = IncrementalContextCache(max_context_steps=14)
 
     def build_interaction_edge(
         self,
@@ -108,8 +182,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
 
         # Use coarse-step relative displacement instead of raw m/s velocity so the
-        # added relation channels stay on a meter-scale comparable to the existing
-        # distance feature without introducing another global normalization rule.
+        # extra relation channels remain on the same meter-scale as distance.
         rel_motion = motion_s[edge_index_a2a[0]] - motion_s[edge_index_a2a[1]]
         recv_head = head_s[edge_index_a2a[1]]
         recv_cos = recv_head.cos()
@@ -217,8 +290,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
-        anchor_hidden_valid = anchor_hidden[anchor_mask]
+        anchor_hidden_valid, prefix_memory, prefix_memory_mask = self.prefix_builder(
+            ctx_hidden_pack=ctx_hidden_pack,
+            ctx_valid=tokenized_agent["ctx_valid"],
+            anchor_mask=anchor_mask,
+        )
         flow_clean_norm = tokenized_agent["flow_clean_norm"][anchor_mask]
 
         if flow_clean_norm.numel() == 0:
@@ -229,12 +305,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 "flow_pred_clean_norm": empty,
                 "flow_clean_norm": empty,
                 "ctx_hidden_pack": ctx_hidden_pack,
-                "anchor_hidden": anchor_hidden,
                 "anchor_mask": anchor_mask,
             }
 
         flow_sample = self.flow_ode.sample(flow_clean_norm, target_type="velocity")
-        flow_pred_norm = self.flow_decoder(anchor_hidden_valid, flow_sample.x_t, flow_sample.tau)
+        flow_pred_norm = self.flow_decoder(
+            anchor_hidden=anchor_hidden_valid,
+            prefix_memory=prefix_memory,
+            prefix_memory_mask=prefix_memory_mask,
+            x_t_norm=flow_sample.x_t,
+            tau=flow_sample.tau,
+        )
         flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
             flow_sample.x_t,
             flow_pred_norm,
@@ -246,7 +327,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "flow_pred_clean_norm": flow_pred_clean_norm,
             "flow_clean_norm": flow_clean_norm,
             "ctx_hidden_pack": ctx_hidden_pack,
-            "anchor_hidden": anchor_hidden,
             "anchor_mask": anchor_mask,
         }
 
@@ -262,7 +342,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         n_step_future_2hz = n_step_future_10hz // self.shift
         step_current_10hz = self.num_historical_steps - 1
         step_current_2hz = step_current_10hz // self.shift
-        max_context_steps = 14
 
         pos_window = tokenized_agent["gt_pos"][:, :step_current_2hz].clone()
         head_window = tokenized_agent["gt_heading"][:, :step_current_2hz].clone()
@@ -275,7 +354,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         coarse_valid_list = [valid_window[:, i].clone() for i in range(step_current_2hz)]
         coarse_idx_list = [pred_idx_window[:, i].clone() for i in range(step_current_2hz)]
 
-        feat_a, agent_token_emb, agent_token_emb_veh, agent_token_emb_ped, agent_token_emb_cyc, veh_mask, ped_mask, cyc_mask, categorical_embs = self.agent_token_embedding(
+        (
+            feat_a,
+            agent_token_emb,
+            agent_token_emb_veh,
+            agent_token_emb_ped,
+            agent_token_emb_cyc,
+            veh_mask,
+            ped_mask,
+            cyc_mask,
+            categorical_embs,
+        ) = self.agent_token_embedding(
             agent_token_index=pred_idx_window,
             trajectory_token_veh=tokenized_agent["trajectory_token_veh"],
             trajectory_token_ped=tokenized_agent["trajectory_token_ped"],
@@ -299,6 +388,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
 
         feat_a_t_dict: Dict[int, torch.Tensor] = {}
+        ctx_hidden_cache: torch.Tensor | None = None
         for t in range(n_step_future_2hz):
             n_step = pos_window.shape[1]
             if t == 0:
@@ -351,6 +441,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 mask=inference_mask[:, -hist_step:],
             )
 
+            final_hidden_step = None
             for i in range(self.num_layers):
                 temporal_feat = feat_a if i == 0 else feat_a_t_dict[i]
                 if t == 0:
@@ -367,6 +458,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     feat_a_now = temporal_feat[:, -1]
                     if i + 1 < self.num_layers:
                         feat_a_t_dict[i + 1] = temporal_feat
+                    else:
+                        final_hidden_step = temporal_feat
                 else:
                     feat_a_now = self.t_attn_layers[i](
                         (temporal_feat.flatten(0, 1), temporal_feat[:, -1]),
@@ -384,6 +477,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                             [feat_a_t_dict[i + 1], feat_a_now.unsqueeze(1)],
                             dim=1,
                         )
+                    else:
+                        final_hidden_step = feat_a_now.unsqueeze(1)
+
+            assert final_hidden_step is not None
+            if t == 0:
+                ctx_hidden_cache = final_hidden_step
+            else:
+                assert ctx_hidden_cache is not None
+                ctx_hidden_cache = torch.cat([ctx_hidden_cache, final_hidden_step], dim=1)
 
             active_mask = valid_window[:, -1]
             next_pos = pos_window[:, -1].clone()
@@ -393,7 +495,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             commit_head_step = pred_head_10hz.new_zeros((n_agent, 5))
 
             if active_mask.any():
-                active_hidden = feat_a_now[active_mask]
+                assert ctx_hidden_cache is not None
+                active_hidden, prefix_memory, prefix_memory_mask = self.prefix_builder.current(
+                    ctx_hidden_cache=ctx_hidden_cache,
+                    ctx_valid=valid_window,
+                    active_mask=active_mask,
+                )
                 x_init_norm = torch.randn(
                     active_hidden.shape[0],
                     20,
@@ -405,7 +512,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 flow_sample_method = getattr(sampling_scheme, "sample_method", self.flow_ode.solver_method)
                 y_hat_norm = self.flow_ode.generate(
                     x_init=x_init_norm,
-                    model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
+                    model_fn=lambda x_t, tau: self.flow_decoder(
+                        anchor_hidden=active_hidden,
+                        prefix_memory=prefix_memory,
+                        prefix_memory_mask=prefix_memory_mask,
+                        x_t_norm=x_t,
+                        tau=tau,
+                    ),
                     steps=flow_sample_steps,
                     method=flow_sample_method,
                 )
@@ -437,25 +550,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             coarse_valid_list.append(next_valid.clone())
             coarse_idx_list.append(next_token_idx.clone())
 
-            pred_idx_window = torch.cat([pred_idx_window, next_token_idx.unsqueeze(1)], dim=1)
-            valid_window = torch.cat([valid_window, next_valid.unsqueeze(1)], dim=1)
-            pos_window = torch.cat([pos_window, next_pos.unsqueeze(1)], dim=1)
-            head_window = torch.cat([head_window, next_head.unsqueeze(1)], dim=1)
-            head_vector_next = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
-            head_vector_window = torch.cat([head_vector_window, head_vector_next.unsqueeze(1)], dim=1)
-
             agent_token_emb_next = torch.zeros_like(agent_token_emb[:, 0])
             agent_token_emb_next[veh_mask] = agent_token_emb_veh[next_token_idx[veh_mask]]
             agent_token_emb_next[ped_mask] = agent_token_emb_ped[next_token_idx[ped_mask]]
             agent_token_emb_next[cyc_mask] = agent_token_emb_cyc[next_token_idx[cyc_mask]]
-            agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next.unsqueeze(1)], dim=1)
 
-            motion_vector_a = pos_window[:, -1] - pos_window[:, -2]
+            motion_vector_a = next_pos - pos_window[:, -1]
             x_a = torch.stack(
                 [
                     torch.norm(motion_vector_a, p=2, dim=-1),
                     angle_between_2d_vectors(
-                        ctr_vector=head_vector_window[:, -1],
+                        ctr_vector=torch.stack([next_head.cos(), next_head.sin()], dim=-1),
                         nbr_vector=motion_vector_a,
                     ),
                 ],
@@ -463,18 +568,35 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             )
             x_a = self.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)
             feat_a_next = self.fusion_emb(torch.cat([agent_token_emb_next, x_a], dim=-1).unsqueeze(1))
-            feat_a = torch.cat([feat_a, feat_a_next], dim=1)
 
-            if pos_window.shape[1] > max_context_steps:
-                pos_window = pos_window[:, -max_context_steps:]
-                head_window = head_window[:, -max_context_steps:]
-                head_vector_window = head_vector_window[:, -max_context_steps:]
-                valid_window = valid_window[:, -max_context_steps:]
-                pred_idx_window = pred_idx_window[:, -max_context_steps:]
-                agent_token_emb = agent_token_emb[:, -max_context_steps:]
-                feat_a = feat_a[:, -max_context_steps:]
-                for key in feat_a_t_dict:
-                    feat_a_t_dict[key] = feat_a_t_dict[key][:, -max_context_steps:]
+            assert ctx_hidden_cache is not None
+            (
+                pos_window,
+                head_window,
+                head_vector_window,
+                valid_window,
+                pred_idx_window,
+                agent_token_emb,
+                feat_a,
+                feat_a_t_dict,
+                ctx_hidden_cache,
+            ) = self.context_cache.append(
+                pos_window=pos_window,
+                head_window=head_window,
+                head_vector_window=head_vector_window,
+                valid_window=valid_window,
+                pred_idx_window=pred_idx_window,
+                agent_token_emb=agent_token_emb,
+                feat_a=feat_a,
+                feat_a_t_dict=feat_a_t_dict,
+                ctx_hidden_cache=ctx_hidden_cache,
+                next_pos=next_pos,
+                next_head=next_head,
+                next_valid=next_valid,
+                next_token_idx=next_token_idx,
+                agent_token_emb_next=agent_token_emb_next,
+                feat_a_next=feat_a_next,
+            )
 
         pred_pos = torch.stack(coarse_pos_list, dim=1)
         pred_head = torch.stack(coarse_head_list, dim=1)

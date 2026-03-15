@@ -35,6 +35,7 @@ class SMARTFlowDecoder(nn.Module):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
+        flow_prefix_memory_steps: int = 7,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -66,6 +67,7 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_steps=flow_solver_steps,
             flow_solver_method=flow_solver_method,
             flow_solver_eps=flow_solver_eps,
+            flow_prefix_memory_steps=flow_prefix_memory_steps,
         )
 
     def forward(
