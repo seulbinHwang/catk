@@ -171,6 +171,75 @@ torchrun \
   task_name=flow_pretrain_h1006
 ```
 
+### 5.1 학습 설정을 거칠게 이해하는 법
+
+- 기본 진입점은 `configs/run.yaml`이고, 여기서 `data/model/callbacks/logger/trainer/paths/hydra`를 조합합니다.
+- `experiment=pre_bc_flow`는 `configs/experiment/pre_bc_flow.yaml`을 읽어 학습용 하이퍼파라미터를 덮어씁니다.
+- `trainer=ddp`는 `configs/trainer/ddp.yaml`을 읽어 DDP 관련 옵션을 덮어씁니다.
+- `task_name=...`는 실험 이름이자 저장 폴더 이름입니다. 결과는 대략 `logs/<task_name>/runs/<timestamp>/` 아래에 생깁니다.
+- CLI override가 가장 우선입니다. 즉, 같은 파라미터라도 커맨드에 직접 적은 값이 최종 적용됩니다.
+
+예시:
+
+```bash
+torchrun ... -m src.run \
+  experiment=pre_bc_flow \
+  trainer=ddp \
+  task_name=flow_pretrain_h1006
+```
+
+### 5.2 Validation 주기와 val_open / val_closed 바꾸기
+
+- 학습 중 validation은 `trainer.check_val_every_n_epoch` 마다 실행됩니다.
+- `model.model_config.val_open_loop=true/false`로 open-loop validation on/off를 바꿉니다.
+- `model.model_config.val_closed_loop=true/false`로 closed-loop validation on/off를 바꿉니다.
+- validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
+
+예시:
+
+```bash
+# 매 epoch마다 validation
+... trainer.check_val_every_n_epoch=1
+
+# 5 epoch마다 validation
+... trainer.check_val_every_n_epoch=5
+
+# val_open만 실행
+... model.model_config.val_open_loop=true model.model_config.val_closed_loop=false
+
+# val_closed만 실행
+... model.model_config.val_open_loop=false model.model_config.val_closed_loop=true
+```
+
+### 5.3 Checkpoint 저장 규칙 바꾸기
+
+- checkpoint 저장 시도는 validation이 도는 시점에 함께 일어납니다. 현재 `pre_bc_flow`는 `check_val_every_n_epoch=3` 이라 기본적으로 3 epoch마다 평가됩니다.
+- 현재 기본 기준은 `callbacks.model_checkpoint.monitor=val_closed/wosac/realism_meta_metric`, `mode=max`, `save_top_k=1` 입니다. 즉, `realism_meta_metric`이 가장 높은 checkpoint 1개를 유지합니다.
+- 저장 위치는 `callbacks.model_checkpoint.dirpath=${paths.output_dir}/checkpoints` 이고, 실제 경로는 `logs/<task_name>/runs/<timestamp>/checkpoints/` 입니다.
+- 파일명 규칙은 `callbacks.model_checkpoint.filename="epoch_{epoch:03d}"` 이라 `epoch_002.ckpt` 같은 이름이 됩니다.
+- `save_last=link` 이라 `last.ckpt`도 함께 생기며, 저장된 checkpoint를 가리키는 링크로 유지됩니다.
+
+자주 바꾸는 파라미터:
+
+- `callbacks.model_checkpoint.monitor`: 어떤 metric으로 best를 고를지
+- `callbacks.model_checkpoint.mode=min|max`: metric이 작을수록 좋은지, 클수록 좋은지
+- `callbacks.model_checkpoint.save_top_k`: best checkpoint를 몇 개 남길지
+- `callbacks.model_checkpoint.filename`: 저장 파일명 패턴
+- `callbacks.model_checkpoint.dirpath`: 저장 폴더
+- `callbacks.model_checkpoint.save_last=true|link|false`: `last.ckpt`를 어떻게 둘지
+
+예시:
+
+```bash
+# val_open/loss가 가장 낮은 checkpoint 3개 저장
+... callbacks.model_checkpoint.monitor=val_open/loss \
+    callbacks.model_checkpoint.mode=min \
+    callbacks.model_checkpoint.save_top_k=3
+
+# checkpoint 파일명을 바꾸기
+... callbacks.model_checkpoint.filename='epoch_{epoch:03d}_step_{step}'
+```
+
 메모리가 부족하면 아래처럼 train batch를 줄이면 됩니다.
 
 ```bash
