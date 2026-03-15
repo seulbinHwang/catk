@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import math
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Sequence
 
 import hydra
 import torch
@@ -217,9 +218,95 @@ class SMARTFlow(LightningModule):
         """
         return self.validation_open_seed + int(batch_idx)
 
-    def _get_closed_loop_seed(self, batch_idx: int, rollout_idx: int) -> int:
-        """같은 batch/rollout 순서에서는 closed-loop 샘플을 재현 가능하게 만듭니다."""
-        return self.validation_closed_seed + int(batch_idx) * self.n_rollout_closed_val + int(rollout_idx)
+    def _make_closed_loop_seed(self, scenario_id: str, rollout_idx: int) -> int:
+        """시나리오 문자열과 rollout 번호를 섞어 어디서 돌려도 같은 seed를 만듭니다.
+
+        Args:
+            scenario_id: Waymo 시나리오 문자열입니다.
+            rollout_idx: 같은 시나리오 안 rollout 번호입니다.
+
+        Returns:
+            int: 0 이상 63비트 범위의 고정 seed입니다.
+        """
+        seed_payload = (
+            f"{self.validation_closed_seed}:{scenario_id}:{int(rollout_idx)}".encode("utf-8")
+        )
+        digest = hashlib.blake2b(seed_payload, digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
+
+    def _get_closed_loop_scenario_seeds(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_idx: int,
+        device: torch.device,
+    ) -> Tensor:
+        """배치 안 각 시나리오용 closed-loop seed를 만듭니다.
+
+        Args:
+            scenario_ids: 현재 batch의 시나리오 문자열 목록입니다.
+                길이는 ``[n_scenario]`` 입니다.
+            rollout_idx: 같은 시나리오 안 rollout 번호입니다.
+            device: seed 텐서를 올릴 장치입니다.
+
+        Returns:
+            Tensor:
+                시나리오별 고정 seed입니다.
+                shape은 ``[n_scenario]`` 입니다.
+        """
+        scenario_seeds = [
+            self._make_closed_loop_seed(scenario_id=scenario_id, rollout_idx=rollout_idx)
+            for scenario_id in scenario_ids
+        ]
+        return torch.tensor(scenario_seeds, dtype=torch.long, device=device)
+
+    def _run_closed_loop_rollouts(
+        self,
+        data,
+        tokenized_agent,
+        map_feature: Dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """한 batch의 모든 closed-loop rollout을 같은 규칙으로 생성합니다.
+
+        Args:
+            data: dataloader가 준 원본 batch입니다.
+            tokenized_agent: 평가용 agent 토큰 사전입니다.
+            map_feature: 한 번 인코딩한 지도 특징입니다.
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor]:
+                위치, 높이, 방향 예측입니다.
+                shape은 각각 ``[n_agent, n_rollout, 80, 2]``,
+                ``[n_agent, n_rollout, 80]``,
+                ``[n_agent, n_rollout, 80]`` 입니다.
+        """
+        rollout_cache = self.encoder.prepare_inference_cache(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        scenario_device = tokenized_agent["batch"].device
+        pred_traj, pred_z, pred_head = [], [], []
+        for rollout_idx in range(self.n_rollout_closed_val):
+            scenario_sampling_seeds = self._get_closed_loop_scenario_seeds(
+                scenario_ids=data["scenario_id"],
+                rollout_idx=rollout_idx,
+                device=scenario_device,
+            )
+            pred = self.encoder.rollout_from_cache(
+                rollout_cache=rollout_cache,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                sampling_scheme=self.validation_rollout_sampling,
+                scenario_sampling_seeds=scenario_sampling_seeds,
+            )
+            pred_traj.append(pred["pred_traj_10hz"])
+            pred_z.append(pred["pred_z_10hz"])
+            pred_head.append(pred["pred_head_10hz"])
+
+        return (
+            torch.stack(pred_traj, dim=1),
+            torch.stack(pred_z, dim=1),
+            torch.stack(pred_head, dim=1),
+        )
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -272,26 +359,11 @@ class SMARTFlow(LightningModule):
             )
 
         if self.val_closed_loop:
-            rollout_cache = self.encoder.prepare_inference_cache(
+            pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
+                data=data,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
             )
-            pred_traj, pred_z, pred_head = [], [], []
-            for rollout_idx in range(self.n_rollout_closed_val):
-                pred = self.encoder.rollout_from_cache(
-                    rollout_cache=rollout_cache,
-                    tokenized_agent=tokenized_agent,
-                    map_feature=map_feature,
-                    sampling_scheme=self.validation_rollout_sampling,
-                    sampling_seed=self._get_closed_loop_seed(batch_idx, rollout_idx),
-                )
-                pred_traj.append(pred["pred_traj_10hz"])
-                pred_z.append(pred["pred_z_10hz"])
-                pred_head.append(pred["pred_head_10hz"])
-
-            pred_traj = torch.stack(pred_traj, dim=1)
-            pred_z = torch.stack(pred_z, dim=1)
-            pred_head = torch.stack(pred_head, dim=1)
 
             scenario_rollouts = None
             if self.sim_agents_submission.is_active:
@@ -401,26 +473,11 @@ class SMARTFlow(LightningModule):
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         map_feature = self.encoder.encode_map(tokenized_map)
-        rollout_cache = self.encoder.prepare_inference_cache(
+        pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
+            data=data,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        pred_traj, pred_z, pred_head = [], [], []
-        for rollout_idx in range(self.n_rollout_closed_val):
-            pred = self.encoder.rollout_from_cache(
-                rollout_cache=rollout_cache,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                sampling_scheme=self.validation_rollout_sampling,
-                sampling_seed=self._get_closed_loop_seed(batch_idx, rollout_idx),
-            )
-            pred_traj.append(pred["pred_traj_10hz"])
-            pred_z.append(pred["pred_z_10hz"])
-            pred_head.append(pred["pred_head_10hz"])
-
-        pred_traj = torch.stack(pred_traj, dim=1)
-        pred_z = torch.stack(pred_z, dim=1)
-        pred_head = torch.stack(pred_head, dim=1)
 
         self.sim_agents_submission.update(
             scenario_id=data["scenario_id"],

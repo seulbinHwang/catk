@@ -264,6 +264,75 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed=sampling_seed,
         )
 
+
+    def _build_rollout_noise_tape(
+        self,
+        num_agent: int,
+        tape_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        sampling_scheme: DictConfig,
+        sampling_seed: int | None = None,
+        scenario_sampling_seeds: torch.Tensor | None = None,
+        agent_batch: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
+
+        Args:
+            num_agent: 현재 batch 안 전체 agent 수입니다.
+            tape_steps: 긴 잡음 테이프의 시간 길이입니다.
+            device: 잡음 테이프를 만들 장치입니다.
+            dtype: 잡음 테이프 자료형입니다.
+            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 seed입니다.
+            scenario_sampling_seeds: 시나리오별 고정 seed입니다.
+                shape은 ``[n_scenario]`` 입니다.
+            agent_batch: 각 agent가 어느 시나리오에 속하는지 나타냅니다.
+                shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            torch.Tensor:
+                각 agent가 rollout 전체에서 공유할 긴 Gaussian 잡음입니다.
+                shape은 ``[n_agent, tape_steps, 4]`` 입니다.
+        """
+        noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
+        if num_agent == 0:
+            return torch.zeros((0, tape_steps, 4), device=device, dtype=dtype)
+
+        if scenario_sampling_seeds is not None:
+            if agent_batch is None:
+                raise ValueError("scenario별 잡음 테이프를 만들려면 agent_batch가 필요합니다.")
+            noise_tape = torch.empty((num_agent, tape_steps, 4), device=device, dtype=dtype)
+            scenario_seed_list = scenario_sampling_seeds.detach().cpu().tolist()
+            for scenario_idx, scenario_seed in enumerate(scenario_seed_list):
+                scenario_mask = agent_batch == scenario_idx
+                if not bool(scenario_mask.any()):
+                    continue
+                generator = torch.Generator(device=device)
+                generator.manual_seed(int(scenario_seed))
+                noise_tape[scenario_mask] = torch.randn(
+                    int(scenario_mask.sum().item()),
+                    tape_steps,
+                    4,
+                    device=device,
+                    dtype=dtype,
+                    generator=generator,
+                )
+            return noise_tape * noise_scale
+
+        generator = None
+        if sampling_seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(sampling_seed))
+        return torch.randn(
+            num_agent,
+            tape_steps,
+            4,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        ) * noise_scale
+
     def _encode_context(
         self,
         agent_token_index: torch.Tensor,
@@ -538,6 +607,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         map_feature: Dict[str, torch.Tensor],
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
+        scenario_sampling_seeds: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -546,7 +616,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent: 평가용 토큰 사전입니다.
             map_feature: 한 번 인코딩한 지도 특징 사전입니다.
             sampling_scheme: 샘플링 설정입니다.
-            sampling_seed: rollout 전체에서 사용할 고정 난수 seed입니다.
+            sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 고정 난수 seed입니다.
+            scenario_sampling_seeds: 시나리오별 고정 seed입니다.
+                shape은 ``[n_scenario]`` 입니다.
 
         Returns:
             Dict[str, torch.Tensor]:
@@ -590,10 +662,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dtype=head_window.dtype,
             device=head_window.device,
         )
-        generator = None
-        if sampling_seed is not None:
-            generator = torch.Generator(device=pos_window.device)
-            generator.manual_seed(int(sampling_seed))
+        sample_window_steps = 20
+        rollout_noise_tape = self._build_rollout_noise_tape(
+            num_agent=n_agent,
+            tape_steps=n_step_future_10hz + sample_window_steps - self.shift,
+            device=feat_a_now.device,
+            dtype=feat_a_now.dtype,
+            sampling_scheme=sampling_scheme,
+            sampling_seed=sampling_seed,
+            scenario_sampling_seeds=scenario_sampling_seeds,
+            agent_batch=tokenized_agent["batch"],
+        )
 
         for t in range(n_step_future_2hz):
             n_step = pos_window.shape[1]
@@ -657,14 +736,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
             if active_mask.any():
                 active_hidden = current_hidden[active_mask]
-                x_init_norm = torch.randn(
-                    active_hidden.shape[0],
-                    20,
-                    4,
-                    device=active_hidden.device,
-                    dtype=active_hidden.dtype,
-                    generator=generator,
-                ) * getattr(sampling_scheme, "noise_scale", 1.0)
+                noise_start = t * self.shift
+                x_init_norm = rollout_noise_tape[
+                    active_mask,
+                    noise_start : noise_start + sample_window_steps,
+                ].contiguous()
                 flow_sample_steps = getattr(
                     sampling_scheme,
                     "sample_steps",
