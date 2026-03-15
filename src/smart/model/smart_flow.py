@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import Dict
 
 import hydra
 import torch
+import torch.nn as nn
 from lightning import LightningModule
+from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import WOSACMetrics, WOSACSubmission, minADE
-from src.smart.metrics.flow_metrics import ade_2s, fde_2s, flow_matching_loss
+from src.smart.metrics.flow_metrics import (
+    WeightedMeanMetric,
+    ade_2s,
+    fde_2s,
+    flow_matching_loss,
+    yaw_ade_2s,
+    yaw_fde_2s,
+)
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -43,6 +53,8 @@ class SMARTFlow(LightningModule):
         self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
+        self.val_closed_minade_name = f"val_closed/minADE_best_of_{self.n_rollout_closed_val}"
+        self.validation_open_seed = int(model_config.validation_open_seed)
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
@@ -53,6 +65,23 @@ class SMARTFlow(LightningModule):
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
+        self.val_denoise_epoch_metrics = nn.ModuleDict(
+            {
+                "loss": WeightedMeanMetric(),
+                "ADE2s": WeightedMeanMetric(),
+                "FDE2s": WeightedMeanMetric(),
+                "yaw_ADE2s": WeightedMeanMetric(),
+                "yaw_FDE2s": WeightedMeanMetric(),
+            }
+        )
+        self.val_open_epoch_metrics = nn.ModuleDict(
+            {
+                "ADE2s": WeightedMeanMetric(),
+                "FDE2s": WeightedMeanMetric(),
+                "yaw_ADE2s": WeightedMeanMetric(),
+                "yaw_FDE2s": WeightedMeanMetric(),
+            }
+        )
 
     def _get_video_logger(self):
         if self.trainer is not None:
@@ -76,18 +105,113 @@ class SMARTFlow(LightningModule):
                 break
             current_dir = current_dir.parent
 
-    def _open_loop_loss_and_metrics(self, pred_dict):
-        loss = flow_matching_loss(pred_dict["flow_pred_norm"], pred_dict["flow_target_norm"])
+    def _build_open_loop_metric_dict(
+        self,
+        pred_clean_norm: Tensor,
+        target_clean_norm: Tensor,
+    ) -> Dict[str, Tensor]:
+        """2초 open-loop 위치와 방향 오차를 계산합니다.
+
+        Args:
+            pred_clean_norm: 모델이 만든 정규화된 미래입니다.
+                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            target_clean_norm: 정답 정규화 미래입니다.
+                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                meter 단위 위치 오차와 degree 단위 방향 오차를 담은 사전입니다.
+        """
         with torch.no_grad():
-            ade = ade_2s(
-                pred_dict["flow_pred_clean_norm"].detach(),
-                pred_dict["flow_clean_norm"].detach(),
-            )
-            fde = fde_2s(
-                pred_dict["flow_pred_clean_norm"].detach(),
-                pred_dict["flow_clean_norm"].detach(),
-            )
-        return loss, ade, fde
+            return {
+                "ADE2s": ade_2s(
+                    pred_clean_norm.detach(),
+                    target_clean_norm.detach(),
+                ),
+                "FDE2s": fde_2s(
+                    pred_clean_norm.detach(),
+                    target_clean_norm.detach(),
+                ),
+                "yaw_ADE2s": yaw_ade_2s(
+                    pred_clean_norm.detach(),
+                    target_clean_norm.detach(),
+                ),
+                "yaw_FDE2s": yaw_fde_2s(
+                    pred_clean_norm.detach(),
+                    target_clean_norm.detach(),
+                ),
+            }
+
+    def _open_loop_denoise_metrics(
+        self,
+        pred_dict: Dict[str, Tensor],
+    ) -> tuple[Tensor, Dict[str, Tensor], int]:
+        """잡음 제거 방식 검증 점수와 유효 표본 수를 계산합니다.
+
+        Args:
+            pred_dict: flow decoder가 낸 출력 사전입니다.
+                ``flow_pred_norm`` 과 ``flow_target_norm`` 의 shape은
+                ``[n_valid_anchor, 20, 4]`` 입니다.
+
+        Returns:
+            tuple[Tensor, Dict[str, Tensor], int]:
+                flow matching loss, meter/degree 단위 지표 사전,
+                그리고 유효 anchor 개수입니다.
+        """
+        loss = flow_matching_loss(pred_dict["flow_pred_norm"], pred_dict["flow_target_norm"])
+        metric_dict = self._build_open_loop_metric_dict(
+            pred_clean_norm=pred_dict["flow_pred_clean_norm"],
+            target_clean_norm=pred_dict["flow_clean_norm"],
+        )
+        sample_count = int(pred_dict["flow_clean_norm"].shape[0])
+        return loss, metric_dict, sample_count
+
+    def _update_weighted_validation_metrics(
+        self,
+        metric_store: nn.ModuleDict,
+        metric_dict: Dict[str, Tensor],
+        sample_count: int,
+    ) -> None:
+        """batch 평균을 유효 표본 수로 가중해 epoch 누적 상태에 반영합니다.
+
+        Args:
+            metric_store: ``WeightedMeanMetric`` 들을 담은 저장소입니다.
+            metric_dict: 이번 batch에서 계산한 스칼라 지표 사전입니다.
+            sample_count: 이번 batch에서 실제로 채점된 anchor 개수입니다.
+        """
+        for metric_name, metric_value in metric_dict.items():
+            metric_store[metric_name].update(metric_value.detach(), sample_count)
+
+    def _compute_and_reset_validation_metrics(
+        self,
+        prefix: str,
+        metric_store: nn.ModuleDict,
+    ) -> Dict[str, Tensor]:
+        """누적된 validation 지표를 계산한 뒤 다음 epoch를 위해 초기화합니다.
+
+        Args:
+            prefix: 로그 이름 앞부분입니다.
+            metric_store: ``WeightedMeanMetric`` 들을 담은 저장소입니다.
+
+        Returns:
+            Dict[str, Tensor]: ``prefix/metric_name`` 형태의 최종 스칼라 지표 사전입니다.
+        """
+        computed_metrics: Dict[str, Tensor] = {}
+        for metric_name, metric in metric_store.items():
+            computed_metrics[f"{prefix}/{metric_name}"] = metric.compute()
+            metric.reset()
+        return computed_metrics
+
+    def _get_validation_open_seed(self, batch_idx: int) -> int:
+        """배치 순서가 같으면 매 epoch 같은 open 샘플이 나오도록 seed를 만듭니다.
+
+        Args:
+            batch_idx: 현재 validation batch 순번입니다.
+
+        Returns:
+            int: 이번 batch에서 사용할 고정 seed입니다.
+        """
+        return self.validation_open_seed + int(batch_idx)
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -96,10 +220,10 @@ class SMARTFlow(LightningModule):
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
-        loss, ade, fde = self._open_loop_loss_and_metrics(pred)
+        loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
         self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/ADE2s", ade, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/FDE2s", fde, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/ADE2s", open_metric_dict["ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/FDE2s", open_metric_dict["FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         return loss
 
     def validation_step(self, data, batch_idx):
@@ -109,15 +233,35 @@ class SMARTFlow(LightningModule):
             map_feature = self.encoder.encode_map(tokenized_map)
 
         if self.val_open_loop:
-            pred = self.encoder.forward_from_map_feature(
+            denoise_pred = self.encoder.forward_from_map_feature(
                 map_feature=map_feature,
                 tokenized_agent=tokenized_agent,
                 anchor_mask_key="flow_eval_mask",
             )
-            loss, ade, fde = self._open_loop_loss_and_metrics(pred)
-            self.log("val_open/loss", loss, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("val_open/ADE2s", ade, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("val_open/FDE2s", fde, on_epoch=True, sync_dist=True, batch_size=1)
+            denoise_loss, denoise_metric_dict, open_sample_count = self._open_loop_denoise_metrics(
+                denoise_pred
+            )
+            self._update_weighted_validation_metrics(
+                metric_store=self.val_denoise_epoch_metrics,
+                metric_dict={"loss": denoise_loss, **denoise_metric_dict},
+                sample_count=open_sample_count,
+            )
+
+            open_pred_clean_norm = self.encoder.sample_open_loop_future(
+                anchor_hidden=denoise_pred["anchor_hidden"],
+                anchor_mask=denoise_pred["anchor_mask"],
+                sampling_scheme=self.validation_rollout_sampling,
+                sampling_seed=self._get_validation_open_seed(batch_idx),
+            )
+            open_metric_dict = self._build_open_loop_metric_dict(
+                pred_clean_norm=open_pred_clean_norm,
+                target_clean_norm=denoise_pred["flow_clean_norm"],
+            )
+            self._update_weighted_validation_metrics(
+                metric_store=self.val_open_epoch_metrics,
+                metric_dict=open_metric_dict,
+                sample_count=open_sample_count,
+            )
 
         if self.val_closed_loop:
             rollout_cache = self.encoder.prepare_inference_cache(
@@ -192,10 +336,22 @@ class SMARTFlow(LightningModule):
                                 self._cleanup_local_video(video_path)
 
     def on_validation_epoch_end(self):
+        if self.val_open_loop:
+            epoch_open_metrics = self._compute_and_reset_validation_metrics(
+                prefix="val_open",
+                metric_store=self.val_open_epoch_metrics,
+            )
+            epoch_denoise_metrics = self._compute_and_reset_validation_metrics(
+                prefix="val_denoise",
+                metric_store=self.val_denoise_epoch_metrics,
+            )
+            for metric_name, metric_value in {**epoch_denoise_metrics, **epoch_open_metrics}.items():
+                self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=False)
+
         if self.val_closed_loop:
             if not self.wosac_submission.is_active:
                 epoch_wosac_metrics = self.wosac_metrics.compute()
-                epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
+                epoch_wosac_metrics[self.val_closed_minade_name] = self.minADE.compute()
                 self.log(
                     "val_closed/wosac/realism_meta_metric",
                     epoch_wosac_metrics["val_closed/wosac/realism_meta_metric"],

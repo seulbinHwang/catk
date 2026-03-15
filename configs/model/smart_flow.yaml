@@ -12,6 +12,7 @@ model_config:
   delete_local_videos_after_wandb_upload: false
   val_open_loop: true
   val_closed_loop: true
+  validation_open_seed: 0
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"

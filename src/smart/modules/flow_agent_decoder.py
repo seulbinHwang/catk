@@ -184,6 +184,86 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             return anchor_hidden.new_zeros((0, anchor_hidden.shape[-1]))
         return torch.cat(packed_hidden, dim=0)
 
+
+    def _sample_open_loop_future_from_hidden(
+        self,
+        anchor_hidden_valid: torch.Tensor,
+        sampling_scheme: DictConfig,
+        sampling_seed: int | None = None,
+    ) -> torch.Tensor:
+        """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
+
+        Args:
+            anchor_hidden_valid: 유효 anchor만 모은 문맥입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
+
+        Returns:
+            torch.Tensor: 생성된 정규화 2초 미래입니다.
+                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        """
+        if anchor_hidden_valid.numel() == 0:
+            return anchor_hidden_valid.new_zeros((0, 20, 4))
+
+        generator = None
+        if sampling_seed is not None:
+            generator = torch.Generator(device=anchor_hidden_valid.device)
+            generator.manual_seed(int(sampling_seed))
+
+        x_init_norm = torch.randn(
+            anchor_hidden_valid.shape[0],
+            20,
+            4,
+            device=anchor_hidden_valid.device,
+            dtype=anchor_hidden_valid.dtype,
+            generator=generator,
+        ) * getattr(sampling_scheme, "noise_scale", 1.0)
+        flow_sample_steps = getattr(
+            sampling_scheme,
+            "sample_steps",
+            self.flow_ode.solver_steps,
+        )
+        flow_sample_method = getattr(
+            sampling_scheme,
+            "sample_method",
+            self.flow_ode.solver_method,
+        )
+        return self.flow_ode.generate(
+            x_init=x_init_norm,
+            model_fn=lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau),
+            steps=flow_sample_steps,
+            method=flow_sample_method,
+        )
+
+    def sample_open_loop_future(
+        self,
+        anchor_hidden: torch.Tensor,
+        anchor_mask: torch.Tensor,
+        sampling_scheme: DictConfig,
+        sampling_seed: int | None = None,
+    ) -> torch.Tensor:
+        """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
+
+        Args:
+            anchor_hidden: 모든 anchor 문맥입니다.
+                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+            anchor_mask: 실제로 평가할 anchor 여부입니다.
+                shape은 ``[n_agent, 13]`` 입니다.
+            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
+
+        Returns:
+            torch.Tensor: 생성된 정규화 2초 미래입니다.
+                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        """
+        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
+        return self._sample_open_loop_future_from_hidden(
+            anchor_hidden_valid=anchor_hidden_valid,
+            sampling_scheme=sampling_scheme,
+            sampling_seed=sampling_seed,
+        )
+
     def _encode_context(
         self,
         agent_token_index: torch.Tensor,
