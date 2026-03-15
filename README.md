@@ -194,6 +194,10 @@ torchrun ... -m src.run \
 - `model.model_config.val_open_loop=true/false`로 open-loop validation on/off를 바꿉니다.
 - `model.model_config.val_closed_loop=true/false`로 closed-loop validation on/off를 바꿉니다.
 - validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
+- `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. `pre_bc_flow` 기본값은 `8`이고, `32`로 올리면 WOSAC 계열 설정과 같은 rollout 수가 됩니다. `val_open_loop`는 반복 rollout이 아니라 batch당 forward 1회입니다.
+- `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
+- `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
+- `val_closed_loop` 기준 총 rollout 수는 대략 `(실행한 val batch 수) x val_batch_size x n_rollout_closed_val` 입니다.
 
 예시:
 
@@ -209,6 +213,15 @@ torchrun ... -m src.run \
 
 # val_closed만 실행
 ... model.model_config.val_open_loop=false model.model_config.val_closed_loop=true
+
+# val_closed에서 scene당 rollout 32회
+... model.model_config.n_rollout_closed_val=32
+
+# validation을 전체 val set에 대해 수행
+... trainer.limit_val_batches=1.0
+
+# validation batch size를 4 -> 2로 줄이기
+... data.val_batch_size=2
 ```
 
 ### 5.3 Checkpoint 저장 규칙 바꾸기
