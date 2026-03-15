@@ -78,8 +78,15 @@ class SMARTFlow(LightningModule):
 
     def _open_loop_loss_and_metrics(self, pred_dict):
         loss = flow_matching_loss(pred_dict["flow_pred_norm"], pred_dict["flow_target_norm"])
-        ade = ade_2s(pred_dict["flow_pred_clean_norm"], pred_dict["flow_clean_norm"])
-        fde = fde_2s(pred_dict["flow_pred_clean_norm"], pred_dict["flow_clean_norm"])
+        with torch.no_grad():
+            ade = ade_2s(
+                pred_dict["flow_pred_clean_norm"].detach(),
+                pred_dict["flow_clean_norm"].detach(),
+            )
+            fde = fde_2s(
+                pred_dict["flow_pred_clean_norm"].detach(),
+                pred_dict["flow_clean_norm"].detach(),
+            )
         return loss, ade, fde
 
     def training_step(self, data, batch_idx):
@@ -97,11 +104,14 @@ class SMARTFlow(LightningModule):
 
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+        map_feature = None
+        if self.val_open_loop or self.val_closed_loop:
+            map_feature = self.encoder.encode_map(tokenized_map)
 
         if self.val_open_loop:
-            pred = self.encoder(
-                tokenized_map,
-                tokenized_agent,
+            pred = self.encoder.forward_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
                 anchor_mask_key="flow_eval_mask",
             )
             loss, ade, fde = self._open_loop_loss_and_metrics(pred)
@@ -110,12 +120,17 @@ class SMARTFlow(LightningModule):
             self.log("val_open/FDE2s", fde, on_epoch=True, sync_dist=True, batch_size=1)
 
         if self.val_closed_loop:
+            rollout_cache = self.encoder.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
             pred_traj, pred_z, pred_head = [], [], []
             for _ in range(self.n_rollout_closed_val):
-                pred = self.encoder.inference(
-                    tokenized_map,
-                    tokenized_agent,
-                    self.validation_rollout_sampling,
+                pred = self.encoder.rollout_from_cache(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_scheme=self.validation_rollout_sampling,
                 )
                 pred_traj.append(pred["pred_traj_10hz"])
                 pred_z.append(pred["pred_z_10hz"])
@@ -218,12 +233,18 @@ class SMARTFlow(LightningModule):
 
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+        map_feature = self.encoder.encode_map(tokenized_map)
+        rollout_cache = self.encoder.prepare_inference_cache(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
         pred_traj, pred_z, pred_head = [], [], []
         for _ in range(self.n_rollout_closed_val):
-            pred = self.encoder.inference(
-                tokenized_map,
-                tokenized_agent,
-                self.validation_rollout_sampling,
+            pred = self.encoder.rollout_from_cache(
+                rollout_cache=rollout_cache,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                sampling_scheme=self.validation_rollout_sampling,
             )
             pred_traj.append(pred["pred_traj_10hz"])
             pred_z.append(pred["pred_z_10hz"])

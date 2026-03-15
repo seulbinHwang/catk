@@ -68,17 +68,61 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_eps=flow_solver_eps,
         )
 
+    def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        return self.map_encoder(tokenized_map)
+
+    def forward_from_map_feature(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask_key: str = "flow_eval_mask",
+    ) -> Dict[str, Tensor]:
+        flow_clean_norm_key = {
+            "flow_train_mask": "flow_train_clean_norm",
+            "flow_eval_mask": "flow_eval_clean_norm",
+        }[anchor_mask_key]
+        return self.agent_encoder(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            anchor_mask=tokenized_agent[anchor_mask_key],
+            flow_clean_norm=tokenized_agent[flow_clean_norm_key],
+        )
+
     def forward(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_mask_key: str = "flow_eval_mask",
     ) -> Dict[str, Tensor]:
-        map_feature = self.map_encoder(tokenized_map)
-        return self.agent_encoder(
+        map_feature = self.encode_map(tokenized_map)
+        return self.forward_from_map_feature(
+            map_feature=map_feature,
+            tokenized_agent=tokenized_agent,
+            anchor_mask_key=anchor_mask_key,
+        )
+
+    def prepare_inference_cache(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+    ) -> Dict[str, object]:
+        return self.agent_encoder.prepare_inference_cache(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            anchor_mask=tokenized_agent[anchor_mask_key],
+        )
+
+    def rollout_from_cache(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        sampling_scheme: DictConfig,
+    ) -> Dict[str, Tensor]:
+        return self.agent_encoder.rollout_from_cache(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_scheme=sampling_scheme,
         )
 
     def inference(
@@ -87,8 +131,10 @@ class SMARTFlowDecoder(nn.Module):
         tokenized_agent: Dict[str, Tensor],
         sampling_scheme: DictConfig,
     ) -> Dict[str, Tensor]:
-        map_feature = self.map_encoder(tokenized_map)
-        return self.agent_encoder.inference(
+        map_feature = self.encode_map(tokenized_map)
+        rollout_cache = self.prepare_inference_cache(tokenized_agent, map_feature)
+        return self.rollout_from_cache(
+            rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             sampling_scheme=sampling_scheme,

@@ -306,13 +306,10 @@ class SMARTAgentEncoder(nn.Module):
         batch_s,
         batch_pl,
     ):
-        n_step = pos_a.shape[1]
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        pos_pl = pos_pl.repeat(n_step, 1)
-        orient_pl = orient_pl.repeat(n_step)
         edge_index_pl2a = radius(
             x=pos_s[:, :2],
             y=pos_pl[:, :2],

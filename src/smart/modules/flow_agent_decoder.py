@@ -133,6 +133,57 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         r_a2a = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
         return edge_index_a2a, r_a2a
 
+    def _build_step_offset_batch(
+        self,
+        batch: torch.Tensor,
+        num_steps: int,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        """시간축이 다른 agent 노드가 서로 섞이지 않도록 batch 번호를 벌립니다.
+
+        Args:
+            batch: 장면 번호입니다. shape은 ``[n_agent]`` 입니다.
+            num_steps: 펼칠 coarse step 개수입니다.
+            num_graphs: 한 배치 안의 장면 개수입니다.
+
+        Returns:
+            torch.Tensor:
+                step마다 다른 영역으로 밀어낸 batch 번호입니다.
+                shape은 ``[num_steps * n_agent]`` 입니다.
+        """
+        step_offsets = (
+            torch.arange(num_steps, device=batch.device, dtype=batch.dtype)
+            .repeat_interleave(batch.shape[0])
+            * num_graphs
+        )
+        return batch.repeat(num_steps) + step_offsets
+
+    def _pack_anchor_hidden(
+        self,
+        anchor_hidden: torch.Tensor,
+        anchor_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """유효한 anchor hidden만 anchor 순서대로 압축합니다.
+
+        Args:
+            anchor_hidden: context encoder 출력입니다.
+                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+            anchor_mask: 유효 anchor 여부입니다. shape은 ``[n_agent, 13]`` 입니다.
+
+        Returns:
+            torch.Tensor:
+                유효한 anchor만 모은 hidden입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+        """
+        packed_hidden = [
+            anchor_hidden[:, anchor_idx][anchor_mask[:, anchor_idx]]
+            for anchor_idx in range(anchor_hidden.shape[1])
+            if anchor_mask[:, anchor_idx].any()
+        ]
+        if len(packed_hidden) == 0:
+            return anchor_hidden.new_zeros((0, anchor_hidden.shape[-1]))
+        return torch.cat(packed_hidden, dim=0)
+
     def _encode_context(
         self,
         agent_token_index: torch.Tensor,
@@ -161,25 +212,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_vector_a=head_vector_a,
             mask=mask,
         )
-        batch_s = torch.cat(
-            [
-                tokenized_agent["batch"] + tokenized_agent["num_graphs"] * t
-                for t in range(n_step)
-            ],
-            dim=0,
+        batch_s_a2a = self._build_step_offset_batch(
+            batch=tokenized_agent["batch"],
+            num_steps=n_step,
+            num_graphs=tokenized_agent["num_graphs"],
         )
-        batch_pl = torch.cat(
-            [
-                map_feature["batch"] + tokenized_agent["num_graphs"] * t
-                for t in range(n_step)
-            ],
-            dim=0,
-        )
+        batch_s_pl2a = tokenized_agent["batch"].repeat(n_step)
         edge_index_a2a, r_a2a = self.build_interaction_edge(
             pos_a=pos_a,
             head_a=head_a,
             head_vector_a=head_vector_a,
-            batch_s=batch_s,
+            batch_s=batch_s_a2a,
             mask=mask,
         )
         edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
@@ -189,11 +232,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_a=head_a,
             head_vector_a=head_vector_a,
             mask=mask,
-            batch_s=batch_s,
-            batch_pl=batch_pl,
+            batch_s=batch_s_pl2a,
+            batch_pl=map_feature["batch"],
         )
 
-        feat_map = map_feature["pt_token"].unsqueeze(0).expand(n_step, -1, -1).flatten(0, 1)
+        feat_map = map_feature["pt_token"]
         for i in range(self.num_layers):
             feat_a = feat_a.flatten(0, 1)
             feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
@@ -208,6 +251,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
         anchor_mask: torch.Tensor,
+        flow_clean_norm: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         ctx_hidden_pack = self._encode_context(
             agent_token_index=tokenized_agent["ctx_sampled_idx"],
@@ -218,8 +262,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             map_feature=map_feature,
         )
         anchor_hidden = ctx_hidden_pack[:, 1:, :]
-        anchor_hidden_valid = anchor_hidden[anchor_mask]
-        flow_clean_norm = tokenized_agent["flow_clean_norm"][anchor_mask]
+        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
 
         if flow_clean_norm.numel() == 0:
             empty = flow_clean_norm.new_zeros((0, 20, 4))
@@ -251,12 +294,23 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         }
 
     @torch.no_grad()
-    def inference(
+    def prepare_inference_cache(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
-        sampling_scheme: DictConfig,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, object]:
+        """여러 rollout이 공통으로 쓰는 초기 문맥을 한 번만 만듭니다.
+
+        Args:
+            tokenized_agent: 평가용 토큰 사전입니다.
+            map_feature: 한 번 인코딩한 지도 특징 사전입니다.
+
+        Returns:
+            Dict[str, object]:
+                첫 rollout 직전 상태를 담은 캐시입니다.
+                창 상태 텐서는 ``[n_agent, n_hist, ...]`` 꼴이고,
+                layer별 시계열 캐시는 ``feat_a_t_dict[layer]`` 형태로 저장됩니다.
+        """
         n_agent = tokenized_agent["valid_mask"].shape[0]
         n_step_future_10hz = self.num_future_steps
         n_step_future_2hz = n_step_future_10hz // self.shift
@@ -270,12 +324,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         valid_window = tokenized_agent["valid_mask"][:, :step_current_2hz].clone()
         pred_idx_window = tokenized_agent["gt_idx"][:, :step_current_2hz].clone()
 
-        coarse_pos_list = [pos_window[:, i].clone() for i in range(step_current_2hz)]
-        coarse_head_list = [head_window[:, i].clone() for i in range(step_current_2hz)]
-        coarse_valid_list = [valid_window[:, i].clone() for i in range(step_current_2hz)]
-        coarse_idx_list = [pred_idx_window[:, i].clone() for i in range(step_current_2hz)]
-
-        feat_a, agent_token_emb, agent_token_emb_veh, agent_token_emb_ped, agent_token_emb_cyc, veh_mask, ped_mask, cyc_mask, categorical_embs = self.agent_token_embedding(
+        (
+            feat_a,
+            agent_token_emb,
+            agent_token_emb_veh,
+            agent_token_emb_ped,
+            agent_token_emb_cyc,
+            veh_mask,
+            ped_mask,
+            cyc_mask,
+            categorical_embs,
+        ) = self.agent_token_embedding(
             agent_token_index=pred_idx_window,
             trajectory_token_veh=tokenized_agent["trajectory_token_veh"],
             trajectory_token_ped=tokenized_agent["trajectory_token_ped"],
@@ -286,6 +345,158 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             agent_shape=tokenized_agent["shape"],
             inference=True,
         )
+
+        n_step = pos_window.shape[1]
+        batch_s_a2a = self._build_step_offset_batch(
+            batch=tokenized_agent["batch"],
+            num_steps=n_step,
+            num_graphs=tokenized_agent["num_graphs"],
+        )
+        batch_s_pl2a = tokenized_agent["batch"].repeat(n_step)
+        edge_index_t, r_t = self.build_temporal_edge(
+            pos_a=pos_window,
+            head_a=head_window,
+            head_vector_a=head_vector_window,
+            mask=valid_window,
+        )
+        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+            pos_pl=map_feature["position"],
+            orient_pl=map_feature["orientation"],
+            pos_a=pos_window,
+            head_a=head_window,
+            head_vector_a=head_vector_window,
+            mask=valid_window,
+            batch_s=batch_s_pl2a,
+            batch_pl=map_feature["batch"],
+        )
+        edge_index_a2a, r_a2a = self.build_interaction_edge(
+            pos_a=pos_window,
+            head_a=head_window,
+            head_vector_a=head_vector_window,
+            batch_s=batch_s_a2a,
+            mask=valid_window,
+        )
+
+        feat_map = map_feature["pt_token"]
+        feat_a_t_dict: Dict[int, torch.Tensor] = {}
+        feat_a_now = feat_a[:, -1].clone()
+        for i in range(self.num_layers):
+            temporal_feat = feat_a if i == 0 else feat_a_t_dict[i]
+            temporal_feat = self.t_attn_layers[i](
+                temporal_feat.flatten(0, 1),
+                r_t,
+                edge_index_t,
+            ).view(n_agent, n_step, -1)
+            temporal_feat = temporal_feat.transpose(0, 1).flatten(0, 1)
+            temporal_feat = self.pt2a_attn_layers[i]((feat_map, temporal_feat), r_pl2a, edge_index_pl2a)
+            temporal_feat = self.a2a_attn_layers[i](temporal_feat, r_a2a, edge_index_a2a)
+            temporal_feat = temporal_feat.view(n_step, n_agent, -1).transpose(0, 1)
+            feat_a_now = temporal_feat[:, -1]
+            if i + 1 < self.num_layers:
+                feat_a_t_dict[i + 1] = temporal_feat
+
+        return {
+            "n_agent": n_agent,
+            "n_step_future_10hz": n_step_future_10hz,
+            "n_step_future_2hz": n_step_future_2hz,
+            "max_context_steps": max_context_steps,
+            "pos_window": pos_window,
+            "head_window": head_window,
+            "head_vector_window": head_vector_window,
+            "valid_window": valid_window,
+            "pred_idx_window": pred_idx_window,
+            "feat_a": feat_a,
+            "agent_token_emb": agent_token_emb,
+            "agent_token_emb_veh": agent_token_emb_veh,
+            "agent_token_emb_ped": agent_token_emb_ped,
+            "agent_token_emb_cyc": agent_token_emb_cyc,
+            "veh_mask": veh_mask,
+            "ped_mask": ped_mask,
+            "cyc_mask": cyc_mask,
+            "categorical_embs": categorical_embs,
+            "feat_a_now": feat_a_now,
+            "feat_a_t_dict": feat_a_t_dict,
+        }
+
+    def _clone_rollout_cache(self, rollout_cache: Dict[str, object]) -> Dict[str, object]:
+        """rollout마다 달라지는 상태만 안전하게 복사합니다.
+
+        Args:
+            rollout_cache: ``prepare_inference_cache`` 가 만든 원본 캐시입니다.
+
+        Returns:
+            Dict[str, object]:
+                현재 rollout에서만 쓸 복사본입니다.
+        """
+        cloned_cache = dict(rollout_cache)
+        for key in [
+            "pos_window",
+            "head_window",
+            "head_vector_window",
+            "valid_window",
+            "pred_idx_window",
+            "feat_a",
+            "agent_token_emb",
+            "feat_a_now",
+        ]:
+            value = rollout_cache[key]
+            if torch.is_tensor(value):
+                cloned_cache[key] = value.clone()
+        feat_a_t_dict = rollout_cache["feat_a_t_dict"]
+        if isinstance(feat_a_t_dict, dict):
+            cloned_cache["feat_a_t_dict"] = {
+                layer_idx: layer_value.clone()
+                for layer_idx, layer_value in feat_a_t_dict.items()
+            }
+        return cloned_cache
+
+    @torch.no_grad()
+    def rollout_from_cache(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        sampling_scheme: DictConfig,
+    ) -> Dict[str, torch.Tensor]:
+        """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
+
+        Args:
+            rollout_cache: ``prepare_inference_cache`` 가 만든 원본 캐시입니다.
+            tokenized_agent: 평가용 토큰 사전입니다.
+            map_feature: 한 번 인코딩한 지도 특징 사전입니다.
+            sampling_scheme: 샘플링 설정입니다.
+
+        Returns:
+            Dict[str, torch.Tensor]:
+                한 번의 rollout 결과입니다. 기존 inference 반환과 같은 키를 가집니다.
+        """
+        state = self._clone_rollout_cache(rollout_cache)
+
+        n_agent = int(state["n_agent"])
+        n_step_future_10hz = int(state["n_step_future_10hz"])
+        n_step_future_2hz = int(state["n_step_future_2hz"])
+        max_context_steps = int(state["max_context_steps"])
+        pos_window = state["pos_window"]
+        head_window = state["head_window"]
+        head_vector_window = state["head_vector_window"]
+        valid_window = state["valid_window"]
+        pred_idx_window = state["pred_idx_window"]
+        feat_a = state["feat_a"]
+        agent_token_emb = state["agent_token_emb"]
+        agent_token_emb_veh = state["agent_token_emb_veh"]
+        agent_token_emb_ped = state["agent_token_emb_ped"]
+        agent_token_emb_cyc = state["agent_token_emb_cyc"]
+        veh_mask = state["veh_mask"]
+        ped_mask = state["ped_mask"]
+        cyc_mask = state["cyc_mask"]
+        categorical_embs = state["categorical_embs"]
+        feat_a_now = state["feat_a_now"]
+        feat_a_t_dict = state["feat_a_t_dict"]
+
+        coarse_pos_list = [pos_window[:, i].clone() for i in range(pos_window.shape[1])]
+        coarse_head_list = [head_window[:, i].clone() for i in range(head_window.shape[1])]
+        coarse_valid_list = [valid_window[:, i].clone() for i in range(valid_window.shape[1])]
+        coarse_idx_list = [pred_idx_window[:, i].clone() for i in range(pred_idx_window.shape[1])]
 
         pred_traj_10hz = torch.zeros(
             (n_agent, n_step_future_10hz, 2),
@@ -298,30 +509,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             device=head_window.device,
         )
 
-        feat_a_t_dict: Dict[int, torch.Tensor] = {}
         for t in range(n_step_future_2hz):
             n_step = pos_window.shape[1]
             if t == 0:
-                hist_step = n_step
-                batch_s = torch.cat(
-                    [tokenized_agent["batch"] + tokenized_agent["num_graphs"] * s for s in range(hist_step)],
-                    dim=0,
-                )
-                batch_pl = torch.cat(
-                    [map_feature["batch"] + tokenized_agent["num_graphs"] * s for s in range(hist_step)],
-                    dim=0,
-                )
-                inference_mask = valid_window
-                edge_index_t, r_t = self.build_temporal_edge(
-                    pos_a=pos_window,
-                    head_a=head_window,
-                    head_vector_a=head_vector_window,
-                    mask=valid_window,
-                )
+                current_hidden = feat_a_now
             else:
-                hist_step = 1
-                batch_s = tokenized_agent["batch"]
-                batch_pl = map_feature["batch"]
                 inference_mask = valid_window.clone()
                 inference_mask[:, :-1] = False
                 edge_index_t, r_t = self.build_temporal_edge(
@@ -333,55 +525,40 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 )
                 edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
 
-            edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
-                pos_pl=map_feature["position"],
-                orient_pl=map_feature["orientation"],
-                pos_a=pos_window[:, -hist_step:],
-                head_a=head_window[:, -hist_step:],
-                head_vector_a=head_vector_window[:, -hist_step:],
-                mask=inference_mask[:, -hist_step:],
-                batch_s=batch_s,
-                batch_pl=batch_pl,
-            )
-            edge_index_a2a, r_a2a = self.build_interaction_edge(
-                pos_a=pos_window[:, -hist_step:],
-                head_a=head_window[:, -hist_step:],
-                head_vector_a=head_vector_window[:, -hist_step:],
-                batch_s=batch_s,
-                mask=inference_mask[:, -hist_step:],
-            )
+                edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+                    pos_pl=map_feature["position"],
+                    orient_pl=map_feature["orientation"],
+                    pos_a=pos_window[:, -1:],
+                    head_a=head_window[:, -1:],
+                    head_vector_a=head_vector_window[:, -1:],
+                    mask=inference_mask[:, -1:],
+                    batch_s=tokenized_agent["batch"],
+                    batch_pl=map_feature["batch"],
+                )
+                edge_index_a2a, r_a2a = self.build_interaction_edge(
+                    pos_a=pos_window[:, -1:],
+                    head_a=head_window[:, -1:],
+                    head_vector_a=head_vector_window[:, -1:],
+                    batch_s=tokenized_agent["batch"],
+                    mask=inference_mask[:, -1:],
+                )
 
-            for i in range(self.num_layers):
-                temporal_feat = feat_a if i == 0 else feat_a_t_dict[i]
-                if t == 0:
-                    temporal_feat = self.t_attn_layers[i](
-                        temporal_feat.flatten(0, 1),
-                        r_t,
-                        edge_index_t,
-                    ).view(n_agent, n_step, -1)
-                    temporal_feat = temporal_feat.transpose(0, 1).flatten(0, 1)
-                    feat_map = map_feature["pt_token"].unsqueeze(0).expand(hist_step, -1, -1).flatten(0, 1)
-                    temporal_feat = self.pt2a_attn_layers[i]((feat_map, temporal_feat), r_pl2a, edge_index_pl2a)
-                    temporal_feat = self.a2a_attn_layers[i](temporal_feat, r_a2a, edge_index_a2a)
-                    temporal_feat = temporal_feat.view(n_step, n_agent, -1).transpose(0, 1)
-                    feat_a_now = temporal_feat[:, -1]
-                    if i + 1 < self.num_layers:
-                        feat_a_t_dict[i + 1] = temporal_feat
-                else:
-                    feat_a_now = self.t_attn_layers[i](
+                for i in range(self.num_layers):
+                    temporal_feat = feat_a if i == 0 else feat_a_t_dict[i]
+                    current_hidden = self.t_attn_layers[i](
                         (temporal_feat.flatten(0, 1), temporal_feat[:, -1]),
                         r_t,
                         edge_index_t,
                     )
-                    feat_a_now = self.pt2a_attn_layers[i](
-                        (map_feature["pt_token"], feat_a_now),
+                    current_hidden = self.pt2a_attn_layers[i](
+                        (map_feature["pt_token"], current_hidden),
                         r_pl2a,
                         edge_index_pl2a,
                     )
-                    feat_a_now = self.a2a_attn_layers[i](feat_a_now, r_a2a, edge_index_a2a)
+                    current_hidden = self.a2a_attn_layers[i](current_hidden, r_a2a, edge_index_a2a)
                     if i + 1 < self.num_layers:
                         feat_a_t_dict[i + 1] = torch.cat(
-                            [feat_a_t_dict[i + 1], feat_a_now.unsqueeze(1)],
+                            [feat_a_t_dict[i + 1], current_hidden.unsqueeze(1)],
                             dim=1,
                         )
 
@@ -393,7 +570,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             commit_head_step = pred_head_10hz.new_zeros((n_agent, 5))
 
             if active_mask.any():
-                active_hidden = feat_a_now[active_mask]
+                active_hidden = current_hidden[active_mask]
                 x_init_norm = torch.randn(
                     active_hidden.shape[0],
                     20,
@@ -401,8 +578,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     device=active_hidden.device,
                     dtype=active_hidden.dtype,
                 ) * getattr(sampling_scheme, "noise_scale", 1.0)
-                flow_sample_steps = getattr(sampling_scheme, "sample_steps", self.flow_ode.solver_steps)
-                flow_sample_method = getattr(sampling_scheme, "sample_method", self.flow_ode.solver_method)
+                flow_sample_steps = getattr(
+                    sampling_scheme,
+                    "sample_steps",
+                    self.flow_ode.solver_steps,
+                )
+                flow_sample_method = getattr(
+                    sampling_scheme,
+                    "sample_method",
+                    self.flow_ode.solver_method,
+                )
                 y_hat_norm = self.flow_ode.generate(
                     x_init=x_init_norm,
                     model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
@@ -419,8 +604,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     current_head=head_window[active_mask, -1],
                     commit_pos=commit_pos_act,
                     commit_head=commit_head_act,
-                    token_traj_all=tokenized_agent["token_traj_all"][active_mask],
+                    agent_type=tokenized_agent["type"][active_mask],
                     token_agent_shape=tokenized_agent["token_agent_shape"][active_mask],
+                    token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                    token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                    token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
                 )
                 commit_traj_step[active_mask] = commit_pos_act
                 commit_head_step[active_mask] = commit_head_act
@@ -497,3 +685,21 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)
         out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz.shape[1])
         return out_dict
+
+    @torch.no_grad()
+    def inference(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        sampling_scheme: DictConfig,
+    ) -> Dict[str, torch.Tensor]:
+        rollout_cache = self.prepare_inference_cache(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        return self.rollout_from_cache(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_scheme=sampling_scheme,
+        )

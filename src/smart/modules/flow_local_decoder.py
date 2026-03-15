@@ -304,8 +304,11 @@ class ContinuousCommitBridge:
         current_head: torch.Tensor,
         commit_pos: torch.Tensor,
         commit_head: torch.Tensor,
-        token_traj_all: torch.Tensor,
+        agent_type: torch.Tensor,
         token_agent_shape: torch.Tensor,
+        token_bank_all_veh: torch.Tensor,
+        token_bank_all_ped: torch.Tensor,
+        token_bank_all_cyc: torch.Tensor,
     ) -> torch.Tensor:
         current_contour = cal_polygon_contour(current_pos, current_head, token_agent_shape)
         future_contours = [
@@ -320,5 +323,23 @@ class ContinuousCommitBridge:
             head_now=current_head,
         )
         contour_local = contour_local.view(contour_global.shape)
-        dist = torch.norm(token_traj_all - contour_local.unsqueeze(1), dim=-1).mean(dim=(-1, -2))
-        return torch.argmin(dist, dim=-1)
+
+        token_idx = torch.zeros(
+            agent_type.shape[0],
+            device=agent_type.device,
+            dtype=torch.long,
+        )
+        token_banks = {
+            "veh": (agent_type == 0, token_bank_all_veh),
+            "ped": (agent_type == 1, token_bank_all_ped),
+            "cyc": (agent_type == 2, token_bank_all_cyc),
+        }
+        for _, (mask, token_bank) in token_banks.items():
+            if not mask.any():
+                continue
+            dist = torch.norm(
+                token_bank.unsqueeze(0) - contour_local[mask].unsqueeze(1),
+                dim=-1,
+            ).mean(dim=(-1, -2))
+            token_idx[mask] = torch.argmin(dist, dim=-1)
+        return token_idx
