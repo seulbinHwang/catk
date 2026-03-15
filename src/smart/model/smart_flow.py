@@ -55,7 +55,7 @@ class SMARTFlow(LightningModule):
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
         self.closed_loop_metric_name = "val_closed/sim_agents_2025/realism_meta_metric"
         self.val_closed_minade_name = (
-            f"val_closed/sim_agents_2025/minADE_best_of_{self.n_rollout_closed_val}"
+            f"val_closed/sim_agents_2025/minADE_best_of_n_rollout_closed_val"
         )
         self.validation_open_seed = int(model_config.validation_open_seed)
         self.validation_closed_seed = int(model_config.validation_closed_seed)
