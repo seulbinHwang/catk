@@ -19,7 +19,6 @@ import torch
 import wandb
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
-from lightning.pytorch.loggers.wandb import WandbLogger
 from omegaconf import DictConfig
 
 from src.utils import (
@@ -60,10 +59,6 @@ def run(cfg: DictConfig) -> None:
 
     log.info(f"Instantiating loggers...")
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
-    # setup model watching
-    for _logger in logger:
-        if isinstance(_logger, WandbLogger):
-            _logger.watch(model, log="all")
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
     trainer: Trainer = hydra.utils.instantiate(
