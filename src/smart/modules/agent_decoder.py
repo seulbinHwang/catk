@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
@@ -105,6 +105,37 @@ class ContinuousCommitBridge:
         contour_local = contour_local.view_as(contour_global)
         dist = torch.norm(token_traj_all - contour_local.unsqueeze(1), dim=-1).mean(dim=(-1, -2))
         return torch.argmin(dist, dim=-1)
+
+
+@dataclass
+class InferenceFeatureBundle:
+    """추론에서 재사용하는 agent 입력 특징과 layer cache 묶음이다.
+
+    Attributes:
+        feat_a: [n_agent, n_step, hidden_dim] 모양의 coarse 입력 특징이다.
+        agent_token_emb: [n_agent, n_step, hidden_dim] 모양의 coarse token 임베딩이다.
+        agent_token_emb_veh: [n_token, hidden_dim] 모양의 차량 token 사전 임베딩이다.
+        agent_token_emb_ped: [n_token, hidden_dim] 모양의 보행자 token 사전 임베딩이다.
+        agent_token_emb_cyc: [n_token, hidden_dim] 모양의 자전거 token 사전 임베딩이다.
+        veh_mask: [n_agent] 모양의 차량 agent 마스크이다.
+        ped_mask: [n_agent] 모양의 보행자 agent 마스크이다.
+        cyc_mask: [n_agent] 모양의 자전거 agent 마스크이다.
+        categorical_embs: 길이 2인 튜플이며 각 원소는 [n_agent, hidden_dim] 모양이다.
+        scene_feature: [n_agent, n_step, hidden_dim] 모양의 최종 장면 문맥 cache이다.
+        feat_a_t_dict: key는 layer index이고 값은 [n_agent, n_step, hidden_dim] cache이다.
+    """
+
+    feat_a: Tensor
+    agent_token_emb: Tensor
+    agent_token_emb_veh: Tensor
+    agent_token_emb_ped: Tensor
+    agent_token_emb_cyc: Tensor
+    veh_mask: Tensor
+    ped_mask: Tensor
+    cyc_mask: Tensor
+    categorical_embs: Tuple[Tensor, Tensor]
+    scene_feature: Optional[Tensor] = None
+    feat_a_t_dict: Dict[int, Tensor] = field(default_factory=dict)
 
 
 class SMARTAgentDecoder(nn.Module):
@@ -269,21 +300,24 @@ class SMARTAgentDecoder(nn.Module):
         head_vector_a: Tensor,
         agent_type: Tensor,
         agent_shape: Tensor,
-    ) -> Tensor:
+        inference: bool = False,
+    ) -> Tensor | InferenceFeatureBundle:
         """coarse token과 실제 motion을 합쳐 agent 입력 특징을 만든다.
 
         Args:
-            agent_token_index: [n_agent, n_step] coarse token id이다.
-            trajectory_token_veh: [n_token, 8] 차량용 coarse token 사전이다.
-            trajectory_token_ped: [n_token, 8] 보행자용 coarse token 사전이다.
-            trajectory_token_cyc: [n_token, 8] 자전거용 coarse token 사전이다.
-            pos_a: [n_agent, n_step, 2] 실제 위치이다.
-            head_vector_a: [n_agent, n_step, 2] heading unit vector이다.
-            agent_type: [n_agent] agent 종류이다.
-            agent_shape: [n_agent, 3] agent 크기이다.
+            agent_token_index: [n_agent, n_step] 모양의 coarse token id이다.
+            trajectory_token_veh: [n_token, 8] 모양의 차량용 coarse token 사전이다.
+            trajectory_token_ped: [n_token, 8] 모양의 보행자용 coarse token 사전이다.
+            trajectory_token_cyc: [n_token, 8] 모양의 자전거용 coarse token 사전이다.
+            pos_a: [n_agent, n_step, 2] 모양의 실제 위치이다.
+            head_vector_a: [n_agent, n_step, 2] 모양의 heading unit vector이다.
+            agent_type: [n_agent] 모양의 agent 종류이다.
+            agent_shape: [n_agent, 3] 모양의 agent 크기이다.
+            inference: 추론용 cache 묶음을 함께 돌려줄지 여부이다.
 
         Returns:
-            [n_agent, n_step, hidden_dim] 모양의 입력 특징이다.
+            inference=False이면 [n_agent, n_step, hidden_dim] 모양의 입력 특징을 돌려준다.
+            inference=True이면 추론 cache를 위한 InferenceFeatureBundle을 돌려준다.
         """
         n_agent, n_step, traj_dim = pos_a.shape
         device = pos_a.device
@@ -321,10 +355,10 @@ class SMARTAgentDecoder(nn.Module):
             ],
             dim=-1,
         )  # [n_agent, n_step, 2]
-        categorical_embs = [
+        categorical_embs = (
             self.type_a_emb(agent_type.long()),
             self.shape_emb(agent_shape),
-        ]
+        )
         x_a = self.x_a_emb(
             continuous_inputs=feature_a.view(-1, feature_a.size(-1)),
             categorical_embs=[
@@ -336,7 +370,19 @@ class SMARTAgentDecoder(nn.Module):
 
         feat_a = torch.cat((agent_token_emb, x_a), dim=-1)
         feat_a = self.fusion_emb(feat_a)
-        return feat_a
+        if not inference:
+            return feat_a
+        return InferenceFeatureBundle(
+            feat_a=feat_a,
+            agent_token_emb=agent_token_emb,
+            agent_token_emb_veh=agent_token_emb_veh,
+            agent_token_emb_ped=agent_token_emb_ped,
+            agent_token_emb_cyc=agent_token_emb_cyc,
+            veh_mask=veh_mask,
+            ped_mask=ped_mask,
+            cyc_mask=cyc_mask,
+            categorical_embs=categorical_embs,
+        )
 
     def build_temporal_edge(
         self,
@@ -344,17 +390,21 @@ class SMARTAgentDecoder(nn.Module):
         head_a: Tensor,
         head_vector_a: Tensor,
         mask: Tensor,
+        inference_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """장면 인코더용 same-agent 시간 edge를 만든다.
 
         Args:
-            pos_a: [n_agent, n_step, 2] 실제 위치이다.
-            head_a: [n_agent, n_step] heading이다.
-            head_vector_a: [n_agent, n_step, 2] heading unit vector이다.
-            mask: [n_agent, n_step] coarse step 유효 마스크이다.
+            pos_a: [n_agent, n_step, 2] 모양의 실제 위치이다.
+            head_a: [n_agent, n_step] 모양의 heading이다.
+            head_vector_a: [n_agent, n_step, 2] 모양의 heading unit vector이다.
+            mask: [n_agent, n_step] 모양의 coarse step 유효 마스크이다.
+            inference_mask: [n_agent, n_step] 모양의 query용 마스크이다.
+                None이면 전체 step끼리 edge를 만들고, 주어지면 True인 step만
+                query로 두고 나머지는 history source로만 남긴다.
 
         Returns:
-            edge index와 relation embedding을 돌려준다.
+            edge index와 relation embedding을 순서대로 돌려준다.
         """
         pos_t = pos_a.flatten(0, 1)
         head_t = head_a.flatten(0, 1)
@@ -366,7 +416,10 @@ class SMARTAgentDecoder(nn.Module):
             ).bool()
             mask = mask & keep_mask
 
-        mask_t = mask.unsqueeze(2) & mask.unsqueeze(1)
+        if inference_mask is not None:
+            mask_t = mask.unsqueeze(2) & inference_mask.unsqueeze(1)
+        else:
+            mask_t = mask.unsqueeze(2) & mask.unsqueeze(1)
         edge_index_t = dense_to_sparse(mask_t)[0]
         edge_index_t = edge_index_t[:, edge_index_t[1] > edge_index_t[0]]
         edge_index_t = edge_index_t[
@@ -589,6 +642,253 @@ class SMARTAgentDecoder(nn.Module):
             feat_a = self.a2a_attn_layers[layer_idx](feat_a, r_a2a, edge_index_a2a)
             feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
         return feat_a
+
+    def _encode_scene_initial_inference(
+        self,
+        feature_bundle: InferenceFeatureBundle,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        pos_a: Tensor,
+        head_a: Tensor,
+        head_vector_a: Tensor,
+        mask: Tensor,
+    ) -> None:
+        """현재 coarse window 전체를 한 번 통과시켜 추론 cache를 채운다.
+
+        Args:
+            feature_bundle: 추론용 입력 특징과 cache 묶음이다.
+            tokenized_agent: agent 관련 입력 딕셔너리이다.
+            map_feature: map encoder 출력이다.
+            pos_a: [n_agent, n_step, 2] 모양의 coarse 위치이다.
+            head_a: [n_agent, n_step] 모양의 coarse heading이다.
+            head_vector_a: [n_agent, n_step, 2] 모양의 heading unit vector이다.
+            mask: [n_agent, n_step] 모양의 coarse 유효 마스크이다.
+        """
+        n_agent, n_step = head_a.shape
+        edge_index_t, r_t = self.build_temporal_edge(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            mask=mask,
+        )
+        batch_s = torch.cat(
+            [
+                tokenized_agent["batch"] + tokenized_agent["num_graphs"] * step_idx
+                for step_idx in range(n_step)
+            ],
+            dim=0,
+        )
+        batch_pl = torch.cat(
+            [
+                map_feature["batch"] + tokenized_agent["num_graphs"] * step_idx
+                for step_idx in range(n_step)
+            ],
+            dim=0,
+        )
+        edge_index_a2a, r_a2a = self.build_interaction_edge(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            batch_s=batch_s,
+            mask=mask,
+        )
+        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+            pos_pl=map_feature["position"],
+            orient_pl=map_feature["orientation"],
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            mask=mask,
+            batch_s=batch_s,
+            batch_pl=batch_pl,
+        )
+
+        feat_a = feature_bundle.feat_a
+        feat_map = map_feature["pt_token"].unsqueeze(0).expand(n_step, -1, -1).flatten(0, 1)
+        feature_bundle.feat_a_t_dict = {}
+        for layer_idx in range(self.num_layers):
+            feat_a = feat_a.flatten(0, 1)
+            feat_a = self.t_attn_layers[layer_idx](feat_a, r_t, edge_index_t)
+            feat_a = feat_a.view(n_agent, n_step, -1).transpose(0, 1).flatten(0, 1)
+            feat_a = self.pt2a_attn_layers[layer_idx]((feat_map, feat_a), r_pl2a, edge_index_pl2a)
+            feat_a = self.a2a_attn_layers[layer_idx](feat_a, r_a2a, edge_index_a2a)
+            feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
+            if layer_idx + 1 < self.num_layers:
+                feature_bundle.feat_a_t_dict[layer_idx + 1] = feat_a
+        feature_bundle.scene_feature = feat_a
+
+    def _encode_scene_incremental_inference(
+        self,
+        feature_bundle: InferenceFeatureBundle,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        pos_a: Tensor,
+        head_a: Tensor,
+        head_vector_a: Tensor,
+        mask: Tensor,
+    ) -> None:
+        """새로 붙은 마지막 coarse step만 증분 방식으로 문맥을 갱신한다.
+
+        Args:
+            feature_bundle: 이전 step까지의 추론 cache 묶음이다.
+            tokenized_agent: agent 관련 입력 딕셔너리이다.
+            map_feature: map encoder 출력이다.
+            pos_a: [n_agent, n_step, 2] 모양의 현재 coarse 위치 window이다.
+            head_a: [n_agent, n_step] 모양의 현재 coarse heading window이다.
+            head_vector_a: [n_agent, n_step, 2] 모양의 heading unit vector window이다.
+            mask: [n_agent, n_step] 모양의 coarse 유효 마스크 window이다.
+        """
+        if feature_bundle.scene_feature is None:
+            raise ValueError("scene_feature cache가 비어 있다.")
+
+        n_step = pos_a.shape[1]
+        inference_mask = mask.clone()
+        inference_mask[:, :-1] = False
+        edge_index_t, r_t = self.build_temporal_edge(
+            pos_a=pos_a,
+            head_a=head_a,
+            head_vector_a=head_vector_a,
+            mask=mask,
+            inference_mask=inference_mask,
+        )
+        edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
+
+        edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+            pos_pl=map_feature["position"],
+            orient_pl=map_feature["orientation"],
+            pos_a=pos_a[:, -1:],
+            head_a=head_a[:, -1:],
+            head_vector_a=head_vector_a[:, -1:],
+            mask=inference_mask[:, -1:],
+            batch_s=tokenized_agent["batch"],
+            batch_pl=map_feature["batch"],
+        )
+        edge_index_a2a, r_a2a = self.build_interaction_edge(
+            pos_a=pos_a[:, -1:],
+            head_a=head_a[:, -1:],
+            head_vector_a=head_vector_a[:, -1:],
+            batch_s=tokenized_agent["batch"],
+            mask=inference_mask[:, -1:],
+        )
+
+        scene_feature_now = None
+        for layer_idx in range(self.num_layers):
+            temporal_feat = feature_bundle.feat_a if layer_idx == 0 else feature_bundle.feat_a_t_dict[layer_idx]
+            feat_a_now = self.t_attn_layers[layer_idx](
+                (temporal_feat.flatten(0, 1), temporal_feat[:, -1]),
+                r_t,
+                edge_index_t,
+            )
+            feat_a_now = self.pt2a_attn_layers[layer_idx](
+                (map_feature["pt_token"], feat_a_now),
+                r_pl2a,
+                edge_index_pl2a,
+            )
+            feat_a_now = self.a2a_attn_layers[layer_idx](feat_a_now, r_a2a, edge_index_a2a)
+            if layer_idx + 1 < self.num_layers:
+                feature_bundle.feat_a_t_dict[layer_idx + 1] = torch.cat(
+                    [feature_bundle.feat_a_t_dict[layer_idx + 1], feat_a_now.unsqueeze(1)],
+                    dim=1,
+                )
+            else:
+                scene_feature_now = feat_a_now
+
+        if scene_feature_now is None:
+            raise ValueError("마지막 layer 출력 계산에 실패했다.")
+        feature_bundle.scene_feature = torch.cat(
+            [feature_bundle.scene_feature, scene_feature_now.unsqueeze(1)],
+            dim=1,
+        )
+
+    def _append_inference_step_feature(
+        self,
+        feature_bundle: InferenceFeatureBundle,
+        next_token_idx: Tensor,
+        pos_a: Tensor,
+        head_vector_a: Tensor,
+    ) -> None:
+        """새 coarse step의 입력 특징만 계산해서 추론 cache 뒤에 붙인다.
+
+        Args:
+            feature_bundle: 추론용 입력 특징과 cache 묶음이다.
+            next_token_idx: [n_agent] 모양의 새 coarse token id이다.
+            pos_a: [n_agent, n_step, 2] 모양의 append 이후 coarse 위치 window이다.
+            head_vector_a: [n_agent, n_step, 2] 모양의 append 이후 heading unit vector window이다.
+        """
+        agent_token_emb_next = torch.zeros_like(feature_bundle.agent_token_emb[:, 0])
+        agent_token_emb_next[feature_bundle.veh_mask] = feature_bundle.agent_token_emb_veh[
+            next_token_idx[feature_bundle.veh_mask]
+        ]
+        agent_token_emb_next[feature_bundle.ped_mask] = feature_bundle.agent_token_emb_ped[
+            next_token_idx[feature_bundle.ped_mask]
+        ]
+        agent_token_emb_next[feature_bundle.cyc_mask] = feature_bundle.agent_token_emb_cyc[
+            next_token_idx[feature_bundle.cyc_mask]
+        ]
+        feature_bundle.agent_token_emb = torch.cat(
+            [feature_bundle.agent_token_emb, agent_token_emb_next.unsqueeze(1)],
+            dim=1,
+        )
+
+        motion_vector_a = pos_a[:, -1] - pos_a[:, -2]
+        x_a = torch.stack(
+            [
+                torch.norm(motion_vector_a, p=2, dim=-1),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vector_a[:, -1],
+                    nbr_vector=motion_vector_a,
+                ),
+            ],
+            dim=-1,
+        )  # [n_agent, 2]
+        x_a = self.x_a_emb(
+            continuous_inputs=x_a,
+            categorical_embs=list(feature_bundle.categorical_embs),
+        )
+        feat_a_next = self.fusion_emb(
+            torch.cat([agent_token_emb_next, x_a], dim=-1).unsqueeze(1)
+        )  # [n_agent, 1, hidden_dim]
+        feature_bundle.feat_a = torch.cat([feature_bundle.feat_a, feat_a_next], dim=1)
+
+    def _trim_inference_window(
+        self,
+        pos_window: Tensor,
+        head_window: Tensor,
+        head_vector_window: Tensor,
+        valid_window: Tensor,
+        token_idx_window: Tensor,
+        feature_bundle: InferenceFeatureBundle,
+        max_context_steps: int,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """추론 window가 너무 길어지면 마지막 구간만 남기고 cache도 같이 자른다.
+
+        Args:
+            pos_window: [n_agent, n_step, 2] 모양의 coarse 위치 window이다.
+            head_window: [n_agent, n_step] 모양의 coarse heading window이다.
+            head_vector_window: [n_agent, n_step, 2] 모양의 heading unit vector window이다.
+            valid_window: [n_agent, n_step] 모양의 coarse 유효 마스크 window이다.
+            token_idx_window: [n_agent, n_step] 모양의 coarse token id window이다.
+            feature_bundle: 추론용 입력 특징과 layer cache 묶음이다.
+            max_context_steps: 남길 최대 coarse step 수이다.
+
+        Returns:
+            잘린 coarse 위치, heading, heading vector, valid mask, token id window를 순서대로 돌려준다.
+        """
+        if pos_window.shape[1] <= max_context_steps:
+            return pos_window, head_window, head_vector_window, valid_window, token_idx_window
+
+        pos_window = pos_window[:, -max_context_steps:]
+        head_window = head_window[:, -max_context_steps:]
+        head_vector_window = head_vector_window[:, -max_context_steps:]
+        valid_window = valid_window[:, -max_context_steps:]
+        token_idx_window = token_idx_window[:, -max_context_steps:]
+        feature_bundle.agent_token_emb = feature_bundle.agent_token_emb[:, -max_context_steps:]
+        feature_bundle.feat_a = feature_bundle.feat_a[:, -max_context_steps:]
+        if feature_bundle.scene_feature is not None:
+            feature_bundle.scene_feature = feature_bundle.scene_feature[:, -max_context_steps:]
+        for key in feature_bundle.feat_a_t_dict:
+            feature_bundle.feat_a_t_dict[key] = feature_bundle.feat_a_t_dict[key][:, -max_context_steps:]
+        return pos_window, head_window, head_vector_window, valid_window, token_idx_window
 
     def build_anchor_temporal_edge(
         self,
@@ -937,6 +1237,7 @@ class SMARTAgentDecoder(nn.Module):
             "flow_state_normalized": True,
         }
 
+    @torch.no_grad()
     def inference(
         self,
         tokenized_agent: Dict[str, Tensor],
@@ -945,60 +1246,97 @@ class SMARTAgentDecoder(nn.Module):
     ) -> Dict[str, Tensor]:
         """random noise에서 시작해 2초 미래를 만들고 0.5초씩 commit한다.
 
-        구조는 그대로 두되, 실제로 현재 살아 있는 agent만 flow 샘플을 만든다.
-        retokenization은 마지막 한 점이 아니라 현재 contour + commit된 5개 contour를
-        함께 써서 다음 coarse token을 고른다.
+        같은 coarse history를 매 segment마다 처음부터 다시 인코딩하지 않고,
+        마지막 coarse step만 증분으로 갱신한다. flow 샘플 생성은 현재 살아 있는
+        agent만 대상으로 유지한다.
+
+        Args:
+            tokenized_agent: agent 관련 입력 딕셔너리이다.
+            map_feature: map encoder 출력이다.
+            sampling_scheme: ODE 샘플링 설정이다.
+
+        Returns:
+            coarse rollout 결과와 10Hz 예측 결과를 담은 딕셔너리이다.
         """
         n_agent = tokenized_agent["valid_mask"].shape[0]
         rollout_segments = self.num_future_steps // self.commit_num_future_steps
+        max_context_steps = int(getattr(sampling_scheme, "max_context_steps", 14))
 
-        token_idx_seq = tokenized_agent["gt_idx"][:, : self.step_current_token].clone()
-        pos_seq = tokenized_agent["coarse_pos"][:, : self.step_current_token].clone()
-        head_seq = tokenized_agent["coarse_head"][:, : self.step_current_token].clone()
-        valid_seq = tokenized_agent["valid_mask"][:, : self.step_current_token].clone()
+        token_idx_window = tokenized_agent["gt_idx"][:, : self.step_current_token].clone()
+        pos_window = tokenized_agent["coarse_pos"][:, : self.step_current_token].clone()
+        head_window = tokenized_agent["coarse_head"][:, : self.step_current_token].clone()
+        valid_window = tokenized_agent["valid_mask"][:, : self.step_current_token].clone()
+        head_vector_window = torch.stack([head_window.cos(), head_window.sin()], dim=-1)
 
-        pred_traj_10hz = pos_seq.new_zeros(n_agent, self.num_future_steps, 2)
-        pred_head_10hz = head_seq.new_zeros(n_agent, self.num_future_steps)
+        coarse_idx_list = [token_idx_window[:, step_idx].clone() for step_idx in range(token_idx_window.shape[1])]
+        coarse_pos_list = [pos_window[:, step_idx].clone() for step_idx in range(pos_window.shape[1])]
+        coarse_head_list = [head_window[:, step_idx].clone() for step_idx in range(head_window.shape[1])]
+        coarse_valid_list = [valid_window[:, step_idx].clone() for step_idx in range(valid_window.shape[1])]
+
+        feature_bundle = self.agent_token_embedding(
+            agent_token_index=token_idx_window,
+            trajectory_token_veh=tokenized_agent["trajectory_token_veh"],
+            trajectory_token_ped=tokenized_agent["trajectory_token_ped"],
+            trajectory_token_cyc=tokenized_agent["trajectory_token_cyc"],
+            pos_a=pos_window,
+            head_vector_a=head_vector_window,
+            agent_type=tokenized_agent["type"],
+            agent_shape=tokenized_agent["shape"],
+            inference=True,
+        )
+        if not isinstance(feature_bundle, InferenceFeatureBundle):
+            raise TypeError("추론용 feature bundle 생성에 실패했다.")
+        self._encode_scene_initial_inference(
+            feature_bundle=feature_bundle,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            pos_a=pos_window,
+            head_a=head_window,
+            head_vector_a=head_vector_window,
+            mask=valid_window,
+        )
+
+        pred_traj_10hz = pos_window.new_zeros(n_agent, self.num_future_steps, 2)
+        pred_head_10hz = head_window.new_zeros(n_agent, self.num_future_steps)
 
         for segment_idx in range(rollout_segments):
-            scene_feature = self.encode_scene(
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                pos_a=pos_seq,
-                head_a=head_seq,
-                mask=valid_seq,
-                agent_token_index=token_idx_seq,
-            )
-            active_mask = valid_seq[:, -1]
+            if feature_bundle.scene_feature is None:
+                raise ValueError("scene_feature cache가 비어 있다.")
+
+            active_mask = valid_window[:, -1]
             step_start = segment_idx * self.commit_num_future_steps
             step_end = step_start + self.commit_num_future_steps
 
-            next_pos = pos_seq[:, -1].clone()
-            next_head = head_seq[:, -1].clone()
-            next_idx = token_idx_seq[:, -1].clone()
+            next_pos = pos_window[:, -1].clone()
+            next_head = head_window[:, -1].clone()
+            next_idx = token_idx_window[:, -1].clone()
             commit_pos = pred_traj_10hz.new_zeros((n_agent, self.commit_num_future_steps, 2))
             commit_head = pred_head_10hz.new_zeros((n_agent, self.commit_num_future_steps))
 
             if active_mask.any():
-                pos_seq_active = pos_seq[active_mask]
-                head_seq_active = head_seq[active_mask]
-                valid_seq_active = valid_seq[active_mask]
-                scene_feature_active = scene_feature[active_mask]
-                n_active = pos_seq_active.shape[0]
-                agent_indices = torch.arange(n_active, device=pos_seq.device, dtype=torch.long)
+                pos_window_active = pos_window[active_mask]
+                head_window_active = head_window[active_mask]
+                valid_window_active = valid_window[active_mask]
+                scene_feature_active = feature_bundle.scene_feature[active_mask]
+                n_active = pos_window_active.shape[0]
+                agent_indices = torch.arange(
+                    n_active,
+                    device=pos_window.device,
+                    dtype=torch.long,
+                )
                 anchor_indices = torch.full(
                     (n_active,),
-                    fill_value=pos_seq_active.shape[1] - 1,
-                    device=pos_seq.device,
+                    fill_value=pos_window_active.shape[1] - 1,
+                    device=pos_window.device,
                     dtype=torch.long,
                 )
 
                 def model_fn(x_t: Tensor, tau: Tensor) -> Tensor:
                     return self.predict_flow_sparse(
                         scene_feature=scene_feature_active,
-                        pos_a=pos_seq_active,
-                        head_a=head_seq_active,
-                        mask=valid_seq_active,
+                        pos_a=pos_window_active,
+                        head_a=head_window_active,
+                        mask=valid_window_active,
                         agent_indices=agent_indices,
                         anchor_indices=anchor_indices,
                         noised_future=x_t,
@@ -1009,8 +1347,8 @@ class SMARTAgentDecoder(nn.Module):
                     n_active,
                     self.flow_num_future_steps,
                     4,
-                    device=pos_seq.device,
-                    dtype=pos_seq.dtype,
+                    device=pos_window.device,
+                    dtype=pos_window.dtype,
                 )
                 future_local_norm = self.flow_ode.generate(
                     x_init=x_init,
@@ -1021,12 +1359,12 @@ class SMARTAgentDecoder(nn.Module):
                 )
                 commit_pos_active, commit_head_active, next_pos_active, next_head_active = self.commit_bridge.commit(
                     future_local_norm=future_local_norm,
-                    current_pos=pos_seq_active[:, -1],
-                    current_head=head_seq_active[:, -1],
+                    current_pos=pos_window_active[:, -1],
+                    current_head=head_window_active[:, -1],
                 )
                 next_idx_active = self.commit_bridge.retokenize(
-                    current_pos=pos_seq_active[:, -1],
-                    current_head=head_seq_active[:, -1],
+                    current_pos=pos_window_active[:, -1],
+                    current_head=head_window_active[:, -1],
                     commit_pos=commit_pos_active,
                     commit_head=commit_head_active,
                     token_traj_all=tokenized_agent["token_traj_all"][active_mask],
@@ -1042,17 +1380,50 @@ class SMARTAgentDecoder(nn.Module):
             pred_head_10hz[:, step_start:step_end] = commit_head
 
             next_valid = active_mask.clone()
-            token_idx_seq = torch.cat([token_idx_seq, next_idx.unsqueeze(1)], dim=1)
-            pos_seq = torch.cat([pos_seq, next_pos.unsqueeze(1)], dim=1)
-            head_seq = torch.cat([head_seq, next_head.unsqueeze(1)], dim=1)
-            valid_seq = torch.cat([valid_seq, next_valid.unsqueeze(1)], dim=1)
+            coarse_idx_list.append(next_idx.clone())
+            coarse_pos_list.append(next_pos.clone())
+            coarse_head_list.append(next_head.clone())
+            coarse_valid_list.append(next_valid.clone())
+
+            token_idx_window = torch.cat([token_idx_window, next_idx.unsqueeze(1)], dim=1)
+            pos_window = torch.cat([pos_window, next_pos.unsqueeze(1)], dim=1)
+            head_window = torch.cat([head_window, next_head.unsqueeze(1)], dim=1)
+            valid_window = torch.cat([valid_window, next_valid.unsqueeze(1)], dim=1)
+            head_vector_next = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+            head_vector_window = torch.cat([head_vector_window, head_vector_next.unsqueeze(1)], dim=1)
+            self._append_inference_step_feature(
+                feature_bundle=feature_bundle,
+                next_token_idx=next_idx,
+                pos_a=pos_window,
+                head_vector_a=head_vector_window,
+            )
+
+            if segment_idx + 1 < rollout_segments and next_valid.any():
+                self._encode_scene_incremental_inference(
+                    feature_bundle=feature_bundle,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    pos_a=pos_window,
+                    head_a=head_window,
+                    head_vector_a=head_vector_window,
+                    mask=valid_window,
+                )
+                pos_window, head_window, head_vector_window, valid_window, token_idx_window = self._trim_inference_window(
+                    pos_window=pos_window,
+                    head_window=head_window,
+                    head_vector_window=head_vector_window,
+                    valid_window=valid_window,
+                    token_idx_window=token_idx_window,
+                    feature_bundle=feature_bundle,
+                    max_context_steps=max_context_steps,
+                )
 
         pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)
         return {
-            "pred_idx": token_idx_seq,
-            "pred_pos": pos_seq,
-            "pred_head": head_seq,
-            "pred_valid": valid_seq,
+            "pred_idx": torch.stack(coarse_idx_list, dim=1),
+            "pred_pos": torch.stack(coarse_pos_list, dim=1),
+            "pred_head": torch.stack(coarse_head_list, dim=1),
+            "pred_valid": torch.stack(coarse_valid_list, dim=1),
             "pred_traj_10hz": pred_traj_10hz,
             "pred_head_10hz": pred_head_10hz,
             "pred_z_10hz": pred_z.expand(-1, pred_traj_10hz.shape[1]),
