@@ -66,6 +66,60 @@ _REQUIRED_2025_BUCKET_FIELDS = {
 }
 _WORKER_SIM_AGENTS_CONFIG: sim_agents_metrics_pb2.SimAgentMetricsConfig | None = None
 _WORKER_EGO_ONLY = False
+_TF_RUNTIME_CONFIGURED = False
+
+
+def _read_nonnegative_int_env(var_name: str, default: int) -> int:
+    raw_value = os.environ.get(var_name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return max(0, int(raw_value))
+    except ValueError as exc:
+        raise RuntimeError(f"{var_name} must be an integer, got {raw_value!r}.") from exc
+
+
+def _configure_tensorflow_runtime() -> None:
+    global _TF_RUNTIME_CONFIGURED
+    if _TF_RUNTIME_CONFIGURED:
+        return
+
+    intra_op_threads = max(1, _read_nonnegative_int_env("CATK_TF_INTRA_OP_THREADS", 1))
+    inter_op_threads = max(1, _read_nonnegative_int_env("CATK_TF_INTER_OP_THREADS", 1))
+
+    try:
+        tf.config.set_visible_devices([], "GPU")
+    except RuntimeError:
+        pass
+
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(intra_op_threads)
+    except RuntimeError:
+        pass
+
+    try:
+        tf.config.threading.set_inter_op_parallelism_threads(inter_op_threads)
+    except RuntimeError:
+        pass
+
+    _TF_RUNTIME_CONFIGURED = True
+
+
+def _read_single_record_tfrecord(record_path: str) -> bytes:
+    tf_record_iterator = getattr(tf.compat.v1.io, "tf_record_iterator", None)
+    if tf_record_iterator is not None:
+        for record in tf_record_iterator(record_path):
+            return bytes(record)
+        raise RuntimeError(f"TFRecord file is empty: {record_path}")
+
+    dataset = tf.data.TFRecordDataset([record_path], compression_type="")
+    options = tf.data.Options()
+    options.threading.private_threadpool_size = 1
+    options.threading.max_intra_op_parallelism = 1
+    dataset = dataset.with_options(options)
+    for data in dataset:
+        return bytes(data.numpy())
+    raise RuntimeError(f"TFRecord file is empty: {record_path}")
 
 
 def _get_waymo_version_string() -> str:
@@ -227,10 +281,9 @@ def _compute_scenario_metrics(
     scenario_rollout: sim_agents_submission_pb2.ScenarioRollouts,
     ego_only: bool,
 ) -> sim_agents_metrics_pb2.SimAgentMetrics:
+    _configure_tensorflow_runtime()
     scenario = scenario_pb2.Scenario()
-    for data in tf.data.TFRecordDataset([scenario_file], compression_type=""):
-        scenario.ParseFromString(bytes(data.numpy()))
-        break
+    scenario.ParseFromString(_read_single_record_tfrecord(scenario_file))
     if ego_only:
         for i in range(len(scenario.tracks)):
             if i != scenario.sdc_track_index:
@@ -252,7 +305,7 @@ def _init_sim_agents_metrics_worker(config_bytes: bytes, ego_only: bool) -> None
     _WORKER_SIM_AGENTS_CONFIG = sim_agents_metrics_pb2.SimAgentMetricsConfig()
     _WORKER_SIM_AGENTS_CONFIG.ParseFromString(config_bytes)
     _WORKER_EGO_ONLY = ego_only
-    tf.config.set_visible_devices([], "GPU")
+    _configure_tensorflow_runtime()
 
 
 def _compute_scenario_metrics_worker(
@@ -283,9 +336,15 @@ def _resolve_sim_agents_metric_workers() -> int:
                 f"CATK_SIM_AGENTS_METRIC_WORKERS must be an integer, got {override!r}."
             ) from exc
 
-    cpu_count = os.cpu_count() or 1
-    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1") or 1))
-    return max(1, min(8, cpu_count // world_size))
+    cpu_count = max(1, os.cpu_count() or 1)
+    local_world_size = max(1, _read_nonnegative_int_env("LOCAL_WORLD_SIZE", 0) or 1)
+    data_workers = _read_nonnegative_int_env("CATK_DATA_WORKERS", 0)
+
+    reserved_cpu_budget = local_world_size * max(1, data_workers + 1)
+    free_cpu_budget = max(1, cpu_count - reserved_cpu_budget)
+    per_rank_budget = max(1, free_cpu_budget // local_world_size)
+    worker_cap = 4 if local_world_size > 1 else 8
+    return max(1, min(worker_cap, per_rank_budget))
 
 
 class SimAgentsMetrics(Metric):
@@ -298,6 +357,7 @@ class SimAgentsMetrics(Metric):
         self.metric_namespace = f"{self.prefix}/{_SIM_AGENTS_2025_NAMESPACE}"
         self.metric_mean_namespace = f"{self.prefix}/{_SIM_AGENTS_2025_NAMESPACE}_mean"
 
+        _configure_tensorflow_runtime()
         _validate_waymo_sim_agents_2025_runtime_support()
         self.sim_agents_config = _load_waymo_sim_agents_2025_config()
         self.scenario_metric_field_names = _get_scalar_field_names(
@@ -310,7 +370,6 @@ class SimAgentsMetrics(Metric):
         for field_name in self.scenario_metric_field_names:
             self.add_state(field_name, default=tensor(0.0), dist_reduce_fx="sum")
         self.add_state("scenario_counter", default=tensor(0.0), dist_reduce_fx="sum")
-        tf.config.set_visible_devices([], "GPU")
         self._max_workers = _resolve_sim_agents_metric_workers()
         self._max_pending_futures = max(self._max_workers * 4, self._max_workers)
         self._executor: cf.ProcessPoolExecutor | None = None
@@ -345,6 +404,13 @@ class SimAgentsMetrics(Metric):
             initargs=(self._worker_config_bytes, self.ego_only),
         )
 
+    def _shutdown_executor(self) -> None:
+        executor = getattr(self, "_executor", None)
+        if executor is None:
+            return
+        executor.shutdown(wait=False, cancel_futures=True)
+        self._executor = None
+
     def _update_metric_states_from_bytes(self, metric_bytes: bytes) -> None:
         scenario_metrics = sim_agents_metrics_pb2.SimAgentMetrics()
         scenario_metrics.ParseFromString(metric_bytes)
@@ -375,9 +441,17 @@ class SimAgentsMetrics(Metric):
             self._next_result_index += 1
 
     def __del__(self) -> None:
-        executor = getattr(self, "_executor", None)
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+        self._shutdown_executor()
+
+    def reset(self) -> None:
+        super().reset()
+        self._shutdown_executor()
+        if hasattr(self, "_pending_futures"):
+            self._pending_futures.clear()
+        if hasattr(self, "_completed_results"):
+            self._completed_results.clear()
+        self._next_submission_index = 0
+        self._next_result_index = 0
 
     def _update_metric_states(
         self,

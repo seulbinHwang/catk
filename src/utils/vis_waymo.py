@@ -43,6 +43,23 @@ COLOR_ALUMINIUM_1 = (211, 215, 207)
 COLOR_ALUMINIUM_2 = (66, 62, 64)
 
 
+def _read_single_record_tfrecord(record_path: str) -> bytes:
+    tf_record_iterator = getattr(tf.compat.v1.io, "tf_record_iterator", None)
+    if tf_record_iterator is not None:
+        for record in tf_record_iterator(record_path):
+            return bytes(record)
+        raise RuntimeError(f"TFRecord file is empty: {record_path}")
+
+    dataset = tf.data.TFRecordDataset([record_path], compression_type="")
+    options = tf.data.Options()
+    options.threading.private_threadpool_size = 1
+    options.threading.max_intra_op_parallelism = 1
+    dataset = dataset.with_options(options)
+    for data in dataset:
+        return bytes(data.numpy())
+    raise RuntimeError(f"TFRecord file is empty: {record_path}")
+
+
 class VisWaymo:
     def __init__(
         self,
@@ -99,9 +116,7 @@ class VisWaymo:
 
         # load tfrecord scenario
         scenario = scenario_pb2.Scenario()
-        for data in tf.data.TFRecordDataset([scenario_path], compression_type=""):
-            scenario.ParseFromString(bytes(data.numpy()))
-            break
+        scenario.ParseFromString(_read_single_record_tfrecord(scenario_path))
 
         # make output dir
         self.save_dir = save_dir
