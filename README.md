@@ -235,8 +235,8 @@ torchrun ... -m src.run \
 예시:
 
 ```bash
-# val_denoise/loss가 가장 낮은 checkpoint 3개 저장
-... callbacks.model_checkpoint.monitor=val_denoise/loss \
+# val_open/ADE2s가 가장 낮은 checkpoint 3개 저장
+... callbacks.model_checkpoint.monitor=val_open/ADE2s \
     callbacks.model_checkpoint.mode=min \
     callbacks.model_checkpoint.save_top_k=3
 
@@ -323,9 +323,6 @@ torchrun \
 - `train/loss`
 - `train/ADE2s`
 - `train/FDE2s`
-- `val_denoise/loss`
-- `val_denoise/ADE2s`
-- `val_denoise/FDE2s`
 - `val_open/ADE2s`
 - `val_open/FDE2s`
 - `val_closed/sim_agents_2025/*`

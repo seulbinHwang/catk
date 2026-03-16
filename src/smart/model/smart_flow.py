@@ -70,15 +70,6 @@ class SMARTFlow(LightningModule):
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
-        self.val_denoise_epoch_metrics = nn.ModuleDict(
-            {
-                "loss": WeightedMeanMetric(),
-                "ADE2s": WeightedMeanMetric(),
-                "FDE2s": WeightedMeanMetric(),
-                "yaw_ADE2s": WeightedMeanMetric(),
-                "yaw_FDE2s": WeightedMeanMetric(),
-            }
-        )
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
                 "ADE2s": WeightedMeanMetric(),
@@ -333,15 +324,7 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent,
                 anchor_mask_key="flow_eval_mask",
             )
-            denoise_loss, denoise_metric_dict, open_sample_count = self._open_loop_denoise_metrics(
-                denoise_pred
-            )
-            self._update_weighted_validation_metrics(
-                metric_store=self.val_denoise_epoch_metrics,
-                metric_dict={"loss": denoise_loss, **denoise_metric_dict},
-                sample_count=open_sample_count,
-            )
-
+            open_sample_count = int(denoise_pred["flow_clean_norm"].shape[0])
             open_pred_clean_norm = self.encoder.sample_open_loop_future(
                 anchor_hidden=denoise_pred["anchor_hidden"],
                 anchor_mask=denoise_pred["anchor_mask"],
@@ -422,11 +405,7 @@ class SMARTFlow(LightningModule):
                 prefix="val_open",
                 metric_store=self.val_open_epoch_metrics,
             )
-            epoch_denoise_metrics = self._compute_and_reset_validation_metrics(
-                prefix="val_denoise",
-                metric_store=self.val_denoise_epoch_metrics,
-            )
-            for metric_name, metric_value in {**epoch_denoise_metrics, **epoch_open_metrics}.items():
+            for metric_name, metric_value in epoch_open_metrics.items():
                 self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
 
         if self.val_closed_loop:
