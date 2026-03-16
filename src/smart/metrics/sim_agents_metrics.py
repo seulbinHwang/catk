@@ -11,8 +11,8 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import concurrent.futures as cf
 import inspect
-import itertools
 import multiprocessing as mp
 import os
 from importlib.metadata import PackageNotFoundError, version
@@ -64,6 +64,8 @@ _REQUIRED_2025_SCENARIO_FIELDS = {
 _REQUIRED_2025_BUCKET_FIELDS = {
     "simulated_traffic_light_violation_rate",
 }
+_WORKER_SIM_AGENTS_CONFIG: sim_agents_metrics_pb2.SimAgentMetricsConfig | None = None
+_WORKER_EGO_ONLY = False
 
 
 def _get_waymo_version_string() -> str:
@@ -219,12 +221,78 @@ def _compute_waymo_sim_agents_metrics_for_bundle(
     )
 
 
+def _compute_scenario_metrics(
+    config: sim_agents_metrics_pb2.SimAgentMetricsConfig,
+    scenario_file: str,
+    scenario_rollout: sim_agents_submission_pb2.ScenarioRollouts,
+    ego_only: bool,
+) -> sim_agents_metrics_pb2.SimAgentMetrics:
+    scenario = scenario_pb2.Scenario()
+    for data in tf.data.TFRecordDataset([scenario_file], compression_type=""):
+        scenario.ParseFromString(bytes(data.numpy()))
+        break
+    if ego_only:
+        for i in range(len(scenario.tracks)):
+            if i != scenario.sdc_track_index:
+                for t in range(91):
+                    scenario.tracks[i].states[t].valid = False
+        while len(scenario.tracks_to_predict) > 1:
+            scenario.tracks_to_predict.pop()
+        scenario.tracks_to_predict[0].track_index = scenario.sdc_track_index
+
+    return _compute_waymo_sim_agents_metrics_for_bundle(
+        config,
+        scenario,
+        scenario_rollout,
+    )
+
+
+def _init_sim_agents_metrics_worker(config_bytes: bytes, ego_only: bool) -> None:
+    global _WORKER_SIM_AGENTS_CONFIG, _WORKER_EGO_ONLY
+    _WORKER_SIM_AGENTS_CONFIG = sim_agents_metrics_pb2.SimAgentMetricsConfig()
+    _WORKER_SIM_AGENTS_CONFIG.ParseFromString(config_bytes)
+    _WORKER_EGO_ONLY = ego_only
+    tf.config.set_visible_devices([], "GPU")
+
+
+def _compute_scenario_metrics_worker(
+    scenario_file: str,
+    scenario_rollout_bytes: bytes,
+) -> bytes:
+    if _WORKER_SIM_AGENTS_CONFIG is None:
+        raise RuntimeError("Sim Agents metrics worker was used before it was initialized.")
+
+    scenario_rollout = sim_agents_submission_pb2.ScenarioRollouts()
+    scenario_rollout.ParseFromString(scenario_rollout_bytes)
+    scenario_metrics = _compute_scenario_metrics(
+        config=_WORKER_SIM_AGENTS_CONFIG,
+        scenario_file=scenario_file,
+        scenario_rollout=scenario_rollout,
+        ego_only=_WORKER_EGO_ONLY,
+    )
+    return scenario_metrics.SerializeToString()
+
+
+def _resolve_sim_agents_metric_workers() -> int:
+    override = os.environ.get("CATK_SIM_AGENTS_METRIC_WORKERS", "").strip()
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError as exc:
+            raise RuntimeError(
+                f"CATK_SIM_AGENTS_METRIC_WORKERS must be an integer, got {override!r}."
+            ) from exc
+
+    cpu_count = os.cpu_count() or 1
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1") or 1))
+    return max(1, min(8, cpu_count // world_size))
+
+
 class SimAgentsMetrics(Metric):
     """Waymo 공식 2025 Sim Agents 평가기를 torchmetrics 형태로 감싼 클래스입니다."""
 
     def __init__(self, prefix: str, ego_only: bool = False) -> None:
         super().__init__()
-        self.is_mp_init = False
         self.prefix = prefix
         self.ego_only = ego_only
         self.metric_namespace = f"{self.prefix}/{_SIM_AGENTS_2025_NAMESPACE}"
@@ -243,6 +311,14 @@ class SimAgentsMetrics(Metric):
             self.add_state(field_name, default=tensor(0.0), dist_reduce_fx="sum")
         self.add_state("scenario_counter", default=tensor(0.0), dist_reduce_fx="sum")
         tf.config.set_visible_devices([], "GPU")
+        self._max_workers = _resolve_sim_agents_metric_workers()
+        self._max_pending_futures = max(self._max_workers * 4, self._max_workers)
+        self._executor: cf.ProcessPoolExecutor | None = None
+        self._pending_futures: Dict[cf.Future[bytes], int] = {}
+        self._completed_results: Dict[int, bytes] = {}
+        self._next_submission_index = 0
+        self._next_result_index = 0
+        self._worker_config_bytes = self.sim_agents_config.SerializeToString()
 
     @staticmethod
     def _compute_scenario_metrics(
@@ -251,24 +327,57 @@ class SimAgentsMetrics(Metric):
         scenario_rollout: sim_agents_submission_pb2.ScenarioRollouts,
         ego_only: bool,
     ) -> sim_agents_metrics_pb2.SimAgentMetrics:
-        scenario = scenario_pb2.Scenario()
-        for data in tf.data.TFRecordDataset([scenario_file], compression_type=""):
-            scenario.ParseFromString(bytes(data.numpy()))
-            break
-        if ego_only:
-            for i in range(len(scenario.tracks)):
-                if i != scenario.sdc_track_index:
-                    for t in range(91):
-                        scenario.tracks[i].states[t].valid = False
-            while len(scenario.tracks_to_predict) > 1:
-                scenario.tracks_to_predict.pop()
-            scenario.tracks_to_predict[0].track_index = scenario.sdc_track_index
-
-        return _compute_waymo_sim_agents_metrics_for_bundle(
+        return _compute_scenario_metrics(
             config,
-            scenario,
+            scenario_file,
             scenario_rollout,
+            ego_only,
         )
+
+    def _ensure_executor(self) -> None:
+        if self._max_workers <= 1 or self._executor is not None:
+            return
+
+        self._executor = cf.ProcessPoolExecutor(
+            max_workers=self._max_workers,
+            mp_context=mp.get_context("spawn"),
+            initializer=_init_sim_agents_metrics_worker,
+            initargs=(self._worker_config_bytes, self.ego_only),
+        )
+
+    def _update_metric_states_from_bytes(self, metric_bytes: bytes) -> None:
+        scenario_metrics = sim_agents_metrics_pb2.SimAgentMetrics()
+        scenario_metrics.ParseFromString(metric_bytes)
+        self._update_metric_states(scenario_metrics)
+
+    def _drain_completed_futures(self, wait: bool, drain_all: bool = False) -> None:
+        if not self._pending_futures:
+            return
+
+        if wait:
+            done, not_done = cf.wait(
+                tuple(self._pending_futures),
+                return_when=cf.ALL_COMPLETED if drain_all else cf.FIRST_COMPLETED,
+            )
+        else:
+            done = {future for future in self._pending_futures if future.done()}
+            if not done:
+                return
+
+        for future in done:
+            result_index = self._pending_futures.pop(future)
+            self._completed_results[result_index] = future.result()
+
+        while self._next_result_index in self._completed_results:
+            self._update_metric_states_from_bytes(
+                self._completed_results.pop(self._next_result_index)
+            )
+            self._next_result_index += 1
+
+    def __del__(self) -> None:
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _update_metric_states(
         self,
@@ -313,37 +422,34 @@ class SimAgentsMetrics(Metric):
         if len(scenario_rollouts) == 0:
             return
 
-        use_single_process = os.environ.get("CUDA_VISIBLE_DEVICES", "") not in ["", "0"]
-        if use_single_process or len(scenario_rollouts) == 1:
-            pool_scenario_metrics = []
+        if self._max_workers <= 1 or len(scenario_rollouts) == 1:
             for scenario_file, scenario_rollout in zip(scenario_files, scenario_rollouts):
-                pool_scenario_metrics.append(
-                    self._compute_scenario_metrics(
-                        self.sim_agents_config,
-                        scenario_file,
-                        scenario_rollout,
-                        self.ego_only,
-                    )
+                scenario_metrics = self._compute_scenario_metrics(
+                    self.sim_agents_config,
+                    scenario_file,
+                    scenario_rollout,
+                    self.ego_only,
                 )
-        else:
-            if not self.is_mp_init:
-                self.is_mp_init = True
-                mp.set_start_method("forkserver", force=True)
-            with mp.Pool(processes=len(scenario_rollouts)) as pool:
-                pool_scenario_metrics = pool.starmap(
-                    self._compute_scenario_metrics,
-                    zip(
-                        itertools.repeat(self.sim_agents_config),
-                        scenario_files,
-                        scenario_rollouts,
-                        itertools.repeat(self.ego_only),
-                    ),
-                )
+                self._update_metric_states(scenario_metrics)
+            return
 
-        for scenario_metrics in pool_scenario_metrics:
-            self._update_metric_states(scenario_metrics)
+        self._ensure_executor()
+        for scenario_file, scenario_rollout in zip(scenario_files, scenario_rollouts):
+            self._pending_futures[
+                self._executor.submit(
+                    _compute_scenario_metrics_worker,
+                    scenario_file,
+                    scenario_rollout.SerializeToString(),
+                )
+            ] = self._next_submission_index
+            self._next_submission_index += 1
+
+        self._drain_completed_futures(wait=False)
+        while len(self._pending_futures) > self._max_pending_futures:
+            self._drain_completed_futures(wait=True)
 
     def compute(self) -> Dict[str, Tensor]:
+        self._drain_completed_futures(wait=True, drain_all=True)
         if self.scenario_counter.item() == 0:
             return self._build_zero_output_dict()
 
