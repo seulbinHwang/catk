@@ -14,6 +14,8 @@
 import os
 from typing import List
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import hydra
 import lightning as L
 import torch

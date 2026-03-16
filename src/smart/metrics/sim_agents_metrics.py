@@ -19,6 +19,8 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import tensorflow as tf
 import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as official_sim_agents_metrics
 from google.protobuf.descriptor import Descriptor, FieldDescriptor
