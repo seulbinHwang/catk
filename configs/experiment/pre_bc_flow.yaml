@@ -33,4 +33,4 @@ data:
   val_batch_size: 4
   test_batch_size: 4
   num_workers: 8
-  prefetch_factor: 1
+  prefetch_factor: 2
