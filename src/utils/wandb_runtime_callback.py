@@ -229,17 +229,17 @@ class WandbRuntimeMetricsCallback(Callback):
         elapsed_training_hours = self._runtime_seconds() / 3600.0
         epoch_progress_pct = min(100.0, 100.0 * (pl_module.current_epoch + 1) / trainer.max_epochs)
         self._progress_points.append([elapsed_training_hours, epoch_progress_pct])
-        table = wandb.Table(
-            columns=["elapsed_training_hours", "epoch_progress_pct"],
-            data=self._progress_points,
-        )
+        elapsed_hours = [point[0] for point in self._progress_points]
+        epoch_progress = [point[1] for point in self._progress_points]
         wandb_logger.experiment.log(
             {
-                "training_progress_vs_runtime": wandb.plot.line(
-                    table,
-                    "elapsed_training_hours",
-                    "epoch_progress_pct",
+                "training_progress_vs_runtime": wandb.plot.line_series(
+                    xs=elapsed_hours,
+                    ys=[epoch_progress],
+                    keys=["epoch_progress_pct"],
                     title="Training Progress vs Runtime",
+                    xname="elapsed_training_hours",
+                    split_table=True,
                 )
             }
         )
