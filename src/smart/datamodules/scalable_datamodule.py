@@ -35,6 +35,7 @@ class MultiDataModule(LightningDataModule):
         val_tfrecords_splitted: str,
         shuffle: bool,
         num_workers: int,
+        prefetch_factor: Optional[int],
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
@@ -45,6 +46,7 @@ class MultiDataModule(LightningDataModule):
         self.test_batch_size = test_batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor if num_workers > 0 else None
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
         self.train_raw_dir = train_raw_dir
@@ -76,14 +78,20 @@ class MultiDataModule(LightningDataModule):
             raise ValueError(f"{stage} should be one of [fit, validate, test]")
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
+        loader_kwargs = {
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
+            "drop_last": False,
+        }
+        if self.prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
             shuffle=self.shuffle,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            drop_last=False,
+            **loader_kwargs,
         )
 
     def _build_eval_sampler(self, dataset):
@@ -104,26 +112,38 @@ class MultiDataModule(LightningDataModule):
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
         sampler = self._build_eval_sampler(self.val_dataset)
+        loader_kwargs = {
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
+            "drop_last": False,
+        }
+        if self.prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+
         return DataLoader(
             self.val_dataset,
             batch_size=self.val_batch_size,
             shuffle=False,
             sampler=sampler,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,  # False
-            persistent_workers=self.persistent_workers,
-            drop_last=False,
+            **loader_kwargs,
         )
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
         sampler = self._build_eval_sampler(self.test_dataset)
+        loader_kwargs = {
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
+            "drop_last": False,
+        }
+        if self.prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+
         return DataLoader(
             self.test_dataset,
             batch_size=self.test_batch_size,
             shuffle=False,
             sampler=sampler,
-            num_workers=self.num_workers,  # 0
-            pin_memory=self.pin_memory,  # False
-            persistent_workers=self.persistent_workers,
-            drop_last=False,
+            **loader_kwargs,
         )
