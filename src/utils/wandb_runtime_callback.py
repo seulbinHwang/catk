@@ -78,6 +78,7 @@ class WandbRuntimeMetricsCallback(Callback):
 
         datamodule = getattr(trainer, "datamodule", None)
         per_device_batch_size = getattr(datamodule, "train_batch_size", None)
+        val_batch_size = getattr(datamodule, "val_batch_size", None)
         num_workers = getattr(datamodule, "num_workers", None)
         if per_device_batch_size is None:
             return
@@ -85,8 +86,14 @@ class WandbRuntimeMetricsCallback(Callback):
         train_setup_metrics = {
             "train_setup/global_batch_size": int(per_device_batch_size) * int(trainer.world_size),
         }
+        if val_batch_size is not None:
+            train_setup_metrics["train_setup/val_batch_size"] = int(val_batch_size)
         if num_workers is not None:
             train_setup_metrics["train_setup/num_workers"] = int(num_workers)
+
+        n_rollout_closed_val = getattr(pl_module, "n_rollout_closed_val", None)
+        if n_rollout_closed_val is not None:
+            train_setup_metrics["train_setup/n_rollout_closed_val"] = int(n_rollout_closed_val)
 
         self._log_metrics(
             trainer,
