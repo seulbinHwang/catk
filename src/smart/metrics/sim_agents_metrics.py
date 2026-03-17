@@ -1103,6 +1103,55 @@ class SimAgentsMetrics(Metric):
             out_dict[f"{self.metric_mean_namespace}/{field_name}"] = zero_value.clone()
         return out_dict
 
+    def get_state_tensor(self, device: torch.device) -> Tensor:
+        state_values = [self.scenario_counter.detach().to(device=device)]
+        state_values.extend(
+            getattr(self, field_name).detach().to(device=device)
+            for field_name in self.scenario_metric_field_names
+        )
+        return torch.stack(state_values)
+
+    def compute_from_state_tensor(self, state_tensor: Tensor) -> Dict[str, Tensor]:
+        scenario_counter = state_tensor[0]
+        if scenario_counter.item() == 0:
+            zero_value = scenario_counter * 0.0
+            out_dict: Dict[str, Tensor] = {
+                f"{self.metric_namespace}/scenario_counter": zero_value.clone(),
+            }
+            for field_name in self.bucket_metric_field_names:
+                out_dict[f"{self.metric_namespace}/{field_name}"] = zero_value.clone()
+            for field_name in self.scenario_metric_field_names:
+                out_dict[f"{self.metric_mean_namespace}/{field_name}"] = zero_value.clone()
+            return out_dict
+
+        mean_metric_tensors = {
+            field_name: state_tensor[field_idx + 1] / scenario_counter
+            for field_idx, field_name in enumerate(self.scenario_metric_field_names)
+        }
+        mean_metric_scalars = {
+            field_name: float(metric_value.item())
+            for field_name, metric_value in mean_metric_tensors.items()
+        }
+        mean_metrics = sim_agents_metrics_pb2.SimAgentMetrics(
+            scenario_id="",
+            **mean_metric_scalars,
+        )
+        bucket_metrics = official_sim_agents_metrics.aggregate_metrics_to_buckets(
+            self.sim_agents_config,
+            mean_metrics,
+        )
+
+        out_dict: Dict[str, Tensor] = {
+            f"{self.metric_namespace}/scenario_counter": scenario_counter.clone(),
+        }
+        for field_name in self.bucket_metric_field_names:
+            out_dict[f"{self.metric_namespace}/{field_name}"] = scenario_counter.new_tensor(
+                float(getattr(bucket_metrics, field_name))
+            )
+        for field_name, metric_value in mean_metric_tensors.items():
+            out_dict[f"{self.metric_mean_namespace}/{field_name}"] = metric_value
+        return out_dict
+
     def update(
         self,
         scenario_files: List[str],
@@ -1232,33 +1281,4 @@ class SimAgentsMetrics(Metric):
 
     def compute(self) -> Dict[str, Tensor]:
         self._drain_completed_futures(wait=True, drain_all=True)
-        if self.scenario_counter.item() == 0:
-            return self._build_zero_output_dict()
-
-        mean_metric_tensors = {
-            field_name: getattr(self, field_name) / self.scenario_counter
-            for field_name in self.scenario_metric_field_names
-        }
-        mean_metric_scalars = {
-            field_name: float(metric_value.item())
-            for field_name, metric_value in mean_metric_tensors.items()
-        }
-        mean_metrics = sim_agents_metrics_pb2.SimAgentMetrics(
-            scenario_id="",
-            **mean_metric_scalars,
-        )
-        bucket_metrics = official_sim_agents_metrics.aggregate_metrics_to_buckets(
-            self.sim_agents_config,
-            mean_metrics,
-        )
-
-        out_dict: Dict[str, Tensor] = {
-            f"{self.metric_namespace}/scenario_counter": self.scenario_counter.clone(),
-        }
-        for field_name in self.bucket_metric_field_names:
-            out_dict[f"{self.metric_namespace}/{field_name}"] = (
-                self.scenario_counter.new_tensor(float(getattr(bucket_metrics, field_name)))
-            )
-        for field_name, metric_value in mean_metric_tensors.items():
-            out_dict[f"{self.metric_mean_namespace}/{field_name}"] = metric_value
-        return out_dict
+        return self.compute_from_state_tensor(self.get_state_tensor(device=self.scenario_counter.device))
