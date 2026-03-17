@@ -29,7 +29,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 35
+  train_batch_size: 32
   val_batch_size: 24
   test_batch_size: 24
   num_workers: 6
