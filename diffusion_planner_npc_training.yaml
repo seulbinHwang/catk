@@ -58,6 +58,13 @@ spec:
       image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
       securityContext:
         allowPrivilegeEscalation: false
+      resources:
+        requests:
+          cpu: "2"
+          memory: "8Gi"
+        limits:
+          cpu: "2"
+          memory: "8Gi"
       command:
         - /bin/bash
         - -c
@@ -72,6 +79,7 @@ spec:
           CODEX_NODE="$CODEX_ENV_PATH/bin/node"
           CODEX_NPM="$CODEX_ENV_PATH/bin/npm"
           CODEX_JS=/mnt/nuplan/.npm-global/lib/node_modules/@openai/codex/bin/codex.js
+          export PATH="$CODEX_ENV_PATH/bin:$PATH"
 
           mkdir -p /mnt/nuplan/tools
           mkdir -p "$CODEX_HOME"
