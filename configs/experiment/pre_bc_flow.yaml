@@ -21,7 +21,7 @@ trainer:
   check_val_every_n_epoch: 8
   max_epochs: 64
   precision: bf16-mixed
-  gradient_clip_val: 5.0
+  gradient_clip_val: 2.0
 
 callbacks:
   model_checkpoint:
