@@ -374,16 +374,45 @@ class SMARTFlow(LightningModule):
                     target_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
                 )
                 if batch_idx < self.n_batch_sim_agents_metric:
-                    device = pred_traj.device
-                    scenario_rollouts = get_scenario_rollouts(
-                        scenario_id=get_scenario_id_int_tensor(data["scenario_id"], device),
-                        agent_id=data["agent"]["id"],
-                        agent_batch=data["agent"]["batch"],
-                        pred_traj=pred_traj,
-                        pred_z=pred_z,
-                        pred_head=pred_head,
-                    )
-                    self.sim_agents_metrics.update(data["tfrecord_path"], scenario_rollouts)
+                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                        local_payloads = self.sim_agents_metrics.build_prediction_payloads(
+                            scenario_files=data["tfrecord_path"],
+                            agent_id=data["agent"]["id"],
+                            agent_batch=data["agent"]["batch"],
+                            pred_traj=pred_traj,
+                            pred_z=pred_z,
+                            pred_head=pred_head,
+                        )
+                        gathered_payloads = [None] * torch.distributed.get_world_size()
+                        torch.distributed.all_gather_object(gathered_payloads, local_payloads)
+                        if self.global_rank == 0:
+                            merged_payloads = [
+                                payload
+                                for rank_payloads in gathered_payloads
+                                for payload in rank_payloads
+                            ]
+                            self.sim_agents_metrics.update_from_prediction_payloads(
+                                merged_payloads
+                            )
+                    else:
+                        self.sim_agents_metrics.update_from_prediction_tensors(
+                            scenario_files=data["tfrecord_path"],
+                            agent_id=data["agent"]["id"],
+                            agent_batch=data["agent"]["batch"],
+                            pred_traj=pred_traj,
+                            pred_z=pred_z,
+                            pred_head=pred_head,
+                        )
+                    if batch_idx < self.n_vis_batch:
+                        device = pred_traj.device
+                        scenario_rollouts = get_scenario_rollouts(
+                            scenario_id=get_scenario_id_int_tensor(data["scenario_id"], device),
+                            agent_id=data["agent"]["id"],
+                            agent_batch=data["agent"]["batch"],
+                            pred_traj=pred_traj,
+                            pred_z=pred_z,
+                            pred_head=pred_head,
+                        )
 
             if self.global_rank == 0 and batch_idx < self.n_vis_batch and scenario_rollouts is not None:
                 video_logger = self._get_video_logger()
@@ -410,14 +439,26 @@ class SMARTFlow(LightningModule):
 
         if self.val_closed_loop:
             if not self.sim_agents_submission.is_active:
-                epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
-                epoch_sim_agents_metrics[self.val_closed_minade_name] = self.minADE.compute()
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    if self.global_rank == 0:
+                        epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
+                        closed_loop_metric = epoch_sim_agents_metrics[self.closed_loop_metric_name]
+                    else:
+                        epoch_sim_agents_metrics = {}
+                        closed_loop_metric = torch.zeros((), device=self.device)
+                    torch.distributed.broadcast(closed_loop_metric, src=0)
+                else:
+                    epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
+                    closed_loop_metric = epoch_sim_agents_metrics[self.closed_loop_metric_name]
+                minade_value = self.minADE.compute()
+                if self.global_rank == 0:
+                    epoch_sim_agents_metrics[self.val_closed_minade_name] = minade_value
                 self.log(
                     self.closed_loop_metric_name,
-                    epoch_sim_agents_metrics[self.closed_loop_metric_name],
+                    closed_loop_metric,
                     on_step=False,
                     on_epoch=True,
-                    sync_dist=True,
+                    sync_dist=False,
                 )
                 if self.global_rank == 0 and self.logger is not None:
                     epoch_sim_agents_metrics["epoch"] = (
