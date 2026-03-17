@@ -169,7 +169,7 @@ spec:
           value: "xterm-256color"
 
         - name: PROJECT_ROOT
-          value: "/mnt/nuplan/Projects/catk"
+          value: "/mnt/nuplan/projects/catk"
 
         - name: CODEX_HOME
           value: "/mnt/nuplan/.codex"
@@ -240,12 +240,16 @@ spec:
           cd "$PROJECT_ROOT"
           git fetch
           git stash
-          if [ "$(git rev-parse --abbrev-ref HEAD)" = "feature/womd" ]; then
-            git checkout main
+          if git show-ref --verify --quiet refs/remotes/origin/feature/womd; then
+            if [ "$(git rev-parse --abbrev-ref HEAD)" = "feature/womd" ]; then
+              git checkout main
+            fi
+            git branch -D feature/womd 2>/dev/null || true
+            git checkout -b feature/womd origin/feature/womd
+            git pull
+          else
+            echo "[startup] origin/feature/womd not found - keeping current branch $(git rev-parse --abbrev-ref HEAD)"
           fi
-          git branch -D feature/womd 2>/dev/null || true
-          git checkout -b feature/womd origin/feature/womd
-          git pull
 
           SESSION_NAME="npc-training"
           tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT"
