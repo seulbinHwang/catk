@@ -323,6 +323,8 @@ torchrun \
 - `train/loss`
 - `train/ADE2s`
 - `train/FDE2s`
+- `train/ADEyaw2s`
+- `train/FDEyaw2s`
 - `val_open/ADE2s`
 - `val_open/FDE2s`
 - `val_closed/sim_agents_2025/*`

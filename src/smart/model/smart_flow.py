@@ -345,6 +345,22 @@ class SMARTFlow(LightningModule):
         self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/ADE2s", open_metric_dict["ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/FDE2s", open_metric_dict["FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log(
+            "train/ADEyaw2s",
+            open_metric_dict["yaw_ADE2s"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/FDEyaw2s",
+            open_metric_dict["yaw_FDE2s"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
         return loss
 
     def validation_step(self, data, batch_idx):
