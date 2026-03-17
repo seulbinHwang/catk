@@ -6,7 +6,7 @@ defaults:
 model:
   model_config:
     lr: 4e-4
-    lr_warmup_steps: 3
+    lr_warmup_steps: 4
     lr_min_ratio: 1e-2
     n_rollout_closed_val: 8
     n_vis_batch: 0
