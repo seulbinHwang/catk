@@ -149,18 +149,12 @@ def _configure_tensorflow_runtime() -> None:
 
 
 def _read_single_record_tfrecord(record_path: str) -> bytes:
-    tf_record_iterator = getattr(tf.compat.v1.io, "tf_record_iterator", None)
-    if tf_record_iterator is not None:
-        for record in tf_record_iterator(record_path):
-            return bytes(record)
-        raise RuntimeError(f"TFRecord file is empty: {record_path}")
-
-    dataset = tf.data.TFRecordDataset([record_path], compression_type="")
+    dataset = tf.data.TFRecordDataset(record_path, compression_type="")
     options = tf.data.Options()
     options.threading.private_threadpool_size = 1
     options.threading.max_intra_op_parallelism = 1
     dataset = dataset.with_options(options)
-    for data in dataset:
+    for data in dataset.take(1):
         return bytes(data.numpy())
     raise RuntimeError(f"TFRecord file is empty: {record_path}")
 
