@@ -7,7 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.smart.utils import cal_polygon_contour, transform_to_local, transform_to_global, wrap_angle
+from src.smart.utils import (
+    cal_polygon_contour,
+    transform_to_global,
+    transform_to_local,
+    wrap_angle,
+)
 
 
 @dataclass
@@ -18,16 +23,17 @@ class FlowSample:
 
 
 class FlowODE:
-    """Minimal linear-path flow ODE helper.
+    """Flow matching helper with backward-compatible linear/OT paths.
 
-    The clean sample ``x_1`` lives in normalized trajectory space and the base
-    noise ``x_0`` is Gaussian. We use the linear interpolation path
+    Notes:
+        - ``path_type="linear"`` reproduces the current repo behavior:
+          ``x_t = (1 - t) * x_0 + t * x_1`` and ``v = x_1 - x_0``.
+        - ``path_type="ot"`` uses the affine OT path used in FM papers:
+          ``x_t = sigma_t * x_0 + t * x_1``,
+          ``sigma_t = 1 - (1 - sigma_min) * t``,
+          ``v = x_1 - (1 - sigma_min) * x_0``.
 
-        x_t = (1 - t) * x_0 + t * x_1
-
-    and train the decoder to predict the velocity target
-
-        v = x_1 - x_0.
+    With ``sigma_min = 0``, the OT path reduces exactly to the current linear path.
     """
 
     def __init__(
@@ -35,29 +41,54 @@ class FlowODE:
         eps: float = 1e-3,
         solver_steps: int = 4,
         solver_method: str = "midpoint",
+        path_type: str = "ot",
+        sigma_min: float = 1e-3,
     ) -> None:
+        if path_type not in {"linear", "ot"}:
+            raise ValueError(f"Unsupported path_type: {path_type}")
+        if not 0.0 <= sigma_min < 1.0:
+            raise ValueError("sigma_min must satisfy 0 <= sigma_min < 1")
+
         self.eps = eps
         self.solver_steps = solver_steps
         self.solver_method = solver_method
+        self.path_type = path_type
+        self.sigma_min = sigma_min
+
+    def _beta(self) -> float:
+        if self.path_type == "linear":
+            return 1.0
+        return 1.0 - self.sigma_min
+
+    def _sigma_t(self, tau: torch.Tensor) -> torch.Tensor:
+        beta = self._beta()
+        return 1.0 - beta * tau
 
     def sample(self, clean: torch.Tensor, target_type: str = "velocity") -> FlowSample:
         if target_type != "velocity":
             raise ValueError(f"Unsupported target_type: {target_type}")
+
         tau = torch.rand(clean.shape[0], device=clean.device, dtype=clean.dtype)
         tau = tau * (1.0 - self.eps) + self.eps
+
         noise = torch.randn_like(clean)
         view_tau = tau.view(-1, 1, 1)
-        x_t = (1.0 - view_tau) * noise + view_tau * clean
-        target = clean - noise
+        view_sigma = self._sigma_t(tau).view(-1, 1, 1)
+        beta = self._beta()
+
+        x_t = view_sigma * noise + view_tau * clean
+        target = clean - beta * noise
         return FlowSample(x_t=x_t, target=target, tau=tau)
 
-    @staticmethod
     def predict_clean_from_velocity(
+        self,
         x_t: torch.Tensor,
         velocity: torch.Tensor,
         tau: torch.Tensor,
     ) -> torch.Tensor:
-        return x_t + (1.0 - tau).view(-1, 1, 1) * velocity
+        beta = self._beta()
+        sigma_t = self._sigma_t(tau).view(-1, 1, 1)
+        return beta * x_t + sigma_t * velocity
 
     def generate(
         self,
@@ -68,12 +99,15 @@ class FlowODE:
     ) -> torch.Tensor:
         steps = self.solver_steps if steps is None else steps
         method = self.solver_method if method is None else method
+
         x_t = x_init
         t0 = self.eps
         dt = (1.0 - t0) / float(steps)
+
         for i in range(steps):
             t = t0 + i * dt
             tau = x_t.new_full((x_t.shape[0],), t)
+
             if method == "midpoint":
                 v1 = model_fn(x_t, tau)
                 x_mid = x_t + 0.5 * dt * v1
@@ -85,11 +119,11 @@ class FlowODE:
                 x_t = x_t + dt * v
             else:
                 raise ValueError(f"Unsupported solver method: {method}")
+
         return x_t
 
 
 class AnchorContextProjector(nn.Module):
-
     def __init__(self, input_dim: int, hidden_dim: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
@@ -104,7 +138,6 @@ class AnchorContextProjector(nn.Module):
 
 
 class NormalizedNoisyFutureEncoder(nn.Module):
-
     def __init__(self, flow_dim: int, num_chunks: int = 4, chunk_size: int = 5) -> None:
         super().__init__()
         self.flow_dim = flow_dim
@@ -131,18 +164,24 @@ class NormalizedNoisyFutureEncoder(nn.Module):
         tau: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = x_t_norm.shape[0]
+
         tau_emb = self.tau_mlp(tau.unsqueeze(-1))
         step_tokens = self.step_proj(x_t_norm)
         step_ids = torch.arange(self.num_steps, device=x_t_norm.device)
         step_tokens = step_tokens + self.step_embed(step_ids).unsqueeze(0)
         step_tokens = step_tokens + tau_emb.unsqueeze(1)
-        step_tokens = step_tokens.view(batch_size, self.num_chunks, self.chunk_size, self.flow_dim)
+
+        step_tokens = step_tokens.view(
+            batch_size,
+            self.num_chunks,
+            self.chunk_size,
+            self.flow_dim,
+        )
         chunk_tokens = self.chunk_pool(step_tokens.mean(dim=2))
         return step_tokens, chunk_tokens, tau_emb
 
 
 class HalfSecondChunkMixerBlock(nn.Module):
-
     def __init__(self, flow_dim: int, num_heads: int) -> None:
         super().__init__()
         self.attn_norm = nn.LayerNorm(flow_dim)
@@ -151,11 +190,13 @@ class HalfSecondChunkMixerBlock(nn.Module):
             num_heads=num_heads,
             batch_first=True,
         )
+
         self.cond_mlp = nn.Sequential(
             nn.Linear(flow_dim * 2, flow_dim * 2),
             nn.SiLU(),
             nn.Linear(flow_dim * 2, flow_dim * 3),
         )
+
         self.mlp_norm = nn.LayerNorm(flow_dim)
         self.mlp = nn.Sequential(
             nn.Linear(flow_dim, flow_dim * 2),
@@ -163,13 +204,11 @@ class HalfSecondChunkMixerBlock(nn.Module):
             nn.Linear(flow_dim * 2, flow_dim),
         )
 
-    def _modulate(
-        self,
-        x: torch.Tensor,
-        cond: torch.Tensor,
-    ) -> torch.Tensor:
+    def _modulate(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         scale, bias, gate = cond.chunk(3, dim=-1)
-        return x + torch.sigmoid(gate).unsqueeze(1) * (x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1))
+        return x + torch.sigmoid(gate).unsqueeze(1) * (
+            x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1)
+        )
 
     def forward(
         self,
@@ -188,17 +227,18 @@ class HalfSecondChunkMixerBlock(nn.Module):
 
 
 class ChunkStepRefiner(nn.Module):
-
     def __init__(self, flow_dim: int, num_heads: int) -> None:
         super().__init__()
         self.context_proj = nn.Linear(flow_dim, flow_dim)
         self.pre_proj = nn.Linear(flow_dim, flow_dim)
+
         self.attn_norm = nn.LayerNorm(flow_dim)
         self.attn = nn.MultiheadAttention(
             embed_dim=flow_dim,
             num_heads=num_heads,
             batch_first=True,
         )
+
         self.mlp_norm = nn.LayerNorm(flow_dim)
         self.mlp = nn.Sequential(
             nn.Linear(flow_dim, flow_dim * 2),
@@ -213,6 +253,7 @@ class ChunkStepRefiner(nn.Module):
         context: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, num_chunks, chunk_size, dim = step_tokens.shape
+
         step_tokens = step_tokens + chunk_tokens.unsqueeze(2)
         step_tokens = step_tokens + self.context_proj(context).view(batch_size, 1, 1, dim)
         step_tokens = self.pre_proj(step_tokens)
@@ -227,7 +268,6 @@ class ChunkStepRefiner(nn.Module):
 
 
 class FlowVelocityHead(nn.Module):
-
     def __init__(self, flow_dim: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
@@ -241,7 +281,6 @@ class FlowVelocityHead(nn.Module):
 
 
 class HierarchicalFlowDecoder(nn.Module):
-
     def __init__(
         self,
         context_dim: int,
@@ -253,9 +292,15 @@ class HierarchicalFlowDecoder(nn.Module):
         self.context_projector = AnchorContextProjector(context_dim, flow_dim)
         self.noisy_future_encoder = NormalizedNoisyFutureEncoder(flow_dim=flow_dim)
         self.chunk_mixers = nn.ModuleList(
-            [HalfSecondChunkMixerBlock(flow_dim=flow_dim, num_heads=num_chunk_heads) for _ in range(num_chunk_layers)]
+            [
+                HalfSecondChunkMixerBlock(flow_dim=flow_dim, num_heads=num_chunk_heads)
+                for _ in range(num_chunk_layers)
+            ]
         )
-        self.step_refiner = ChunkStepRefiner(flow_dim=flow_dim, num_heads=num_chunk_heads)
+        self.step_refiner = ChunkStepRefiner(
+            flow_dim=flow_dim,
+            num_heads=num_chunk_heads,
+        )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
 
     def forward(
@@ -266,8 +311,10 @@ class HierarchicalFlowDecoder(nn.Module):
     ) -> torch.Tensor:
         context = self.context_projector(anchor_hidden)
         step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
+
         for block in self.chunk_mixers:
             chunk_tokens = block(chunk_tokens, context, tau_emb)
+
         step_tokens = self.step_refiner(step_tokens, chunk_tokens, context)
         return self.velocity_head(step_tokens)
 
@@ -294,6 +341,7 @@ class ContinuousCommitBridge:
             head_now=current_head,
         )
         commit_head = wrap_angle(current_head.unsqueeze(1) + delta_head)
+
         next_pos = commit_pos[:, -1]
         next_head = commit_head[:, -1]
         return commit_pos, commit_head, next_pos, next_head
@@ -316,6 +364,7 @@ class ContinuousCommitBridge:
             for i in range(commit_pos.shape[1])
         ]
         contour_global = torch.stack([current_contour] + future_contours, dim=1)
+
         contour_local, _ = transform_to_local(
             pos_global=contour_global.flatten(1, 2),
             head_global=None,
@@ -329,6 +378,7 @@ class ContinuousCommitBridge:
             device=agent_type.device,
             dtype=torch.long,
         )
+
         token_banks = {
             "veh": (agent_type == 0, token_bank_all_veh),
             "ped": (agent_type == 1, token_bank_all_ped),
@@ -337,9 +387,11 @@ class ContinuousCommitBridge:
         for _, (mask, token_bank) in token_banks.items():
             if not mask.any():
                 continue
+
             dist = torch.norm(
                 token_bank.unsqueeze(0) - contour_local[mask].unsqueeze(1),
                 dim=-1,
             ).mean(dim=(-1, -2))
             token_idx[mask] = torch.argmin(dist, dim=-1)
+
         return token_idx
