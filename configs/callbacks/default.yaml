@@ -1,5 +1,6 @@
 defaults:
   - model_checkpoint
+  - epoch_last_checkpoint
   - model_summary
   - learning_rate_monitor
   - _self_
