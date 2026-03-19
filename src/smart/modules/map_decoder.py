@@ -20,6 +20,10 @@ from torch_cluster import radius_graph
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
+from src.smart.utils.length_normalization import (
+    DEFAULT_LENGTH_SCALE,
+    normalize_length_values,
+)
 
 
 class SMARTMapDecoder(nn.Module):
@@ -37,6 +41,7 @@ class SMARTMapDecoder(nn.Module):
         super(SMARTMapDecoder, self).__init__()
         self.pl2pl_radius = pl2pl_radius
         self.num_layers = num_layers
+        self.length_scale = DEFAULT_LENGTH_SCALE
 
         self.type_pt_emb = nn.Embedding(12, hidden_dim)
         self.polygon_type_emb = nn.Embedding(6, hidden_dim)
@@ -90,9 +95,13 @@ class SMARTMapDecoder(nn.Module):
         rel_orient_pt2pt = wrap_angle(
             orient_pt[edge_index_pt2pt[0]] - orient_pt[edge_index_pt2pt[1]]
         )
+        rel_dist_pt2pt = normalize_length_values(
+            torch.norm(rel_pos_pt2pt[:, :2], p=2, dim=-1),
+            self.length_scale,
+        )
         r_pt2pt = torch.stack(
             [
-                torch.norm(rel_pos_pt2pt[:, :2], p=2, dim=-1),
+                rel_dist_pt2pt,
                 angle_between_2d_vectors(
                     ctr_vector=orient_vector_pt[edge_index_pt2pt[1]],
                     nbr_vector=rel_pos_pt2pt[:, :2],

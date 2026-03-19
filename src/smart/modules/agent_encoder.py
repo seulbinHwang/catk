@@ -22,6 +22,10 @@ from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
+from src.smart.utils.length_normalization import (
+    DEFAULT_LENGTH_SCALE,
+    normalize_length_values,
+)
 
 
 class SMARTAgentEncoder(nn.Module):
@@ -52,6 +56,7 @@ class SMARTAgentEncoder(nn.Module):
         self.a2a_radius = a2a_radius
         self.num_layers = num_layers
         self.shift = 5
+        self.length_scale = DEFAULT_LENGTH_SCALE
         self.hist_drop_prob = hist_drop_prob
         self.n_token_agent = n_token_agent
 
@@ -171,9 +176,13 @@ class SMARTAgentEncoder(nn.Module):
             ],
             dim=1,
         )
+        motion_norm_a = normalize_length_values(
+            torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
+            self.length_scale,
+        )
         feature_a = torch.stack(
             [
-                torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
+                motion_norm_a,
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_a,
                     nbr_vector=motion_vector_a[:, :, :2],
@@ -181,9 +190,10 @@ class SMARTAgentEncoder(nn.Module):
             ],
             dim=-1,
         )
+        normalized_shape = normalize_length_values(agent_shape, self.length_scale)
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
-            self.shape_emb(agent_shape),
+            self.shape_emb(normalized_shape),
         ]
 
         x_a = self.x_a_emb(
@@ -244,9 +254,13 @@ class SMARTAgentEncoder(nn.Module):
         rel_pos_t = pos_t[edge_index_t[0]] - pos_t[edge_index_t[1]]
         rel_pos_t = rel_pos_t[:, :2]
         rel_head_t = wrap_angle(head_t[edge_index_t[0]] - head_t[edge_index_t[1]])
+        rel_dist_t = normalize_length_values(
+            torch.norm(rel_pos_t, p=2, dim=-1),
+            self.length_scale,
+        )
         r_t = torch.stack(
             [
-                torch.norm(rel_pos_t, p=2, dim=-1),
+                rel_dist_t,
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_t[edge_index_t[1]],
                     nbr_vector=rel_pos_t,
@@ -281,9 +295,13 @@ class SMARTAgentEncoder(nn.Module):
         edge_index_a2a = subgraph(subset=mask, edge_index=edge_index_a2a)[0]
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
+        rel_dist_a2a = normalize_length_values(
+            torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
+            self.length_scale,
+        )
         r_a2a = torch.stack(
             [
-                torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
+                rel_dist_a2a,
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_s[edge_index_a2a[1]],
                     nbr_vector=rel_pos_a2a[:, :2],
@@ -323,9 +341,13 @@ class SMARTAgentEncoder(nn.Module):
         rel_orient_pl2a = wrap_angle(
             orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]]
         )
+        rel_dist_pl2a = normalize_length_values(
+            torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
+            self.length_scale,
+        )
         r_pl2a = torch.stack(
             [
-                torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
+                rel_dist_pl2a,
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_s[edge_index_pl2a[1]],
                     nbr_vector=rel_pos_pl2a[:, :2],

@@ -15,6 +15,7 @@ from src.smart.modules.flow_local_decoder import (
     HierarchicalFlowDecoder,
 )
 from src.smart.utils import angle_between_2d_vectors, wrap_angle
+from src.smart.utils.length_normalization import normalize_length_values
 
 
 class SMARTFlowAgentDecoder(SMARTAgentEncoder):
@@ -115,19 +116,25 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
 
-        # Use coarse-step relative displacement instead of raw m/s velocity so the
-        # added relation channels stay on a meter-scale comparable to the existing
-        # distance feature without introducing another global normalization rule.
+        # Relative displacement is still computed in coarse-step meter space, but
+        # the actual network input uses the same 20m rule as the decoder target so
+        # all length-like channels share one common scale.
         rel_motion = motion_s[edge_index_a2a[0]] - motion_s[edge_index_a2a[1]]
         recv_head = head_s[edge_index_a2a[1]]
         recv_cos = recv_head.cos()
         recv_sin = recv_head.sin()
         rel_motion_long = rel_motion[:, 0] * recv_cos + rel_motion[:, 1] * recv_sin
         rel_motion_lat = -rel_motion[:, 0] * recv_sin + rel_motion[:, 1] * recv_cos
+        rel_dist_a2a = normalize_length_values(
+            torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
+            self.length_scale,
+        )
+        rel_motion_long = normalize_length_values(rel_motion_long, self.length_scale)
+        rel_motion_lat = normalize_length_values(rel_motion_lat, self.length_scale)
 
         r_a2a = torch.stack(
             [
-                torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
+                rel_dist_a2a,
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_s[edge_index_a2a[1]],
                     nbr_vector=rel_pos_a2a[:, :2],
@@ -845,9 +852,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next.unsqueeze(1)], dim=1)
 
             motion_vector_a = pos_window[:, -1] - pos_window[:, -2]
+            motion_norm_a = normalize_length_values(
+                torch.norm(motion_vector_a, p=2, dim=-1),
+                self.length_scale,
+            )
             x_a = torch.stack(
                 [
-                    torch.norm(motion_vector_a, p=2, dim=-1),
+                    motion_norm_a,
                     angle_between_2d_vectors(
                         ctr_vector=head_vector_window[:, -1],
                         nbr_vector=motion_vector_a,
