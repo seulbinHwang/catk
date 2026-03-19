@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import math
 from pathlib import Path
@@ -325,13 +326,423 @@ class SMARTFlow(LightningModule):
         ]
         return torch.tensor(scenario_seeds, dtype=torch.long, device=device)
 
+    def _build_closed_loop_seed_table(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_indices: Sequence[int],
+        device: torch.device,
+    ) -> Tensor:
+        """여러 rollout의 scenario seed를 한 번에 모읍니다.
+
+        Args:
+            scenario_ids: 현재 batch의 시나리오 문자열 목록입니다.
+                길이는 ``[n_scenario]`` 입니다.
+            rollout_indices: 이번에 함께 돌릴 rollout 번호 목록입니다.
+                길이는 ``[n_rollout_chunk]`` 입니다.
+            device: seed 텐서를 올릴 장치입니다.
+
+        Returns:
+            Tensor:
+                rollout별, scenario별 고정 seed 표입니다.
+                shape은 ``[n_rollout_chunk, n_scenario]`` 입니다.
+        """
+        seed_rows = [
+            self._get_closed_loop_scenario_seeds(
+                scenario_ids=scenario_ids,
+                rollout_idx=rollout_idx,
+                device=device,
+            )
+            for rollout_idx in rollout_indices
+        ]
+        if len(seed_rows) == 0:
+            return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
+        return torch.stack(seed_rows, dim=0)
+
+    def _repeat_tensor_on_first_dim(self, tensor: Tensor, repeat_count: int) -> Tensor:
+        """첫 번째 축을 rollout 수만큼 반복합니다.
+
+        Args:
+            tensor: 원본 텐서입니다. shape은 ``[n_item, ...]`` 입니다.
+            repeat_count: 반복 횟수입니다.
+
+        Returns:
+            Tensor:
+                첫 번째 축만 늘어난 텐서입니다.
+                shape은 ``[repeat_count * n_item, ...]`` 입니다.
+        """
+        if repeat_count == 1:
+            return tensor
+        repeat_pattern = (repeat_count,) + (1,) * tensor.dim()
+        return tensor.unsqueeze(0).repeat(repeat_pattern).flatten(0, 1).contiguous()
+
+    def _expand_batch_index_for_rollouts(
+        self,
+        batch_index: Tensor,
+        repeat_count: int,
+        num_graphs: int,
+    ) -> Tensor:
+        """rollout마다 다른 장면 번호를 갖도록 batch 번호를 벌립니다.
+
+        Args:
+            batch_index: 원본 장면 번호입니다. shape은 ``[n_item]`` 입니다.
+            repeat_count: 반복할 rollout 개수입니다.
+            num_graphs: 원본 batch 안 장면 개수입니다.
+
+        Returns:
+            Tensor:
+                rollout 축까지 붙은 새 장면 번호입니다.
+                shape은 ``[repeat_count * n_item]`` 입니다.
+        """
+        if repeat_count == 1:
+            return batch_index
+        rollout_offsets = (
+            torch.arange(repeat_count, device=batch_index.device, dtype=batch_index.dtype)
+            * int(num_graphs)
+        )
+        expanded_batch = batch_index.unsqueeze(0).repeat(repeat_count, 1)
+        expanded_batch = expanded_batch + rollout_offsets.unsqueeze(1)
+        return expanded_batch.reshape(-1).contiguous()
+
+    def _build_parallel_rollout_map_feature(
+        self,
+        map_feature: Dict[str, Tensor],
+        repeat_count: int,
+        num_graphs: int,
+    ) -> Dict[str, Tensor]:
+        """지도 특징을 rollout 병렬 실행용 큰 batch로 펼칩니다.
+
+        Args:
+            map_feature: 지도 인코더 출력입니다.
+                ``pt_token`` 과 ``position`` 은 ``[n_map_token, ...]`` 이고,
+                ``batch`` 는 ``[n_map_token]`` 입니다.
+            repeat_count: 이번에 동시에 돌릴 rollout 개수입니다.
+            num_graphs: 원본 batch 안 장면 개수입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                rollout까지 펼친 지도 특징입니다.
+                지도 토큰 축은 ``[repeat_count * n_map_token, ...]`` 입니다.
+        """
+        if repeat_count == 1:
+            return map_feature
+        return {
+            "pt_token": self._repeat_tensor_on_first_dim(map_feature["pt_token"], repeat_count),
+            "position": self._repeat_tensor_on_first_dim(map_feature["position"], repeat_count),
+            "orientation": self._repeat_tensor_on_first_dim(
+                map_feature["orientation"], repeat_count
+            ),
+            "batch": self._expand_batch_index_for_rollouts(
+                map_feature["batch"],
+                repeat_count=repeat_count,
+                num_graphs=num_graphs,
+            ),
+        }
+
+    def _build_parallel_rollout_tokenized_agent(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        repeat_count: int,
+        num_graphs: int,
+    ) -> Dict[str, Tensor]:
+        """rollout 병렬 실행에 필요한 agent 입력만 늘려서 만듭니다.
+
+        Args:
+            tokenized_agent: 평가용 agent 토큰 사전입니다.
+                agent 축 텐서는 대체로 ``[n_agent, ...]`` 입니다.
+            repeat_count: 이번에 동시에 돌릴 rollout 개수입니다.
+            num_graphs: 원본 batch 안 장면 개수입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                rollout까지 펼친 입력 사전입니다.
+                agent 축 텐서는 ``[repeat_count * n_agent, ...]`` 입니다.
+        """
+        if repeat_count == 1:
+            return tokenized_agent
+
+        runtime_tokenized_agent = {
+            "batch": self._expand_batch_index_for_rollouts(
+                tokenized_agent["batch"],
+                repeat_count=repeat_count,
+                num_graphs=num_graphs,
+            ),
+            "type": self._repeat_tensor_on_first_dim(tokenized_agent["type"], repeat_count),
+            "token_agent_shape": self._repeat_tensor_on_first_dim(
+                tokenized_agent["token_agent_shape"], repeat_count
+            ),
+            "token_bank_all_veh": tokenized_agent["token_bank_all_veh"],
+            "token_bank_all_ped": tokenized_agent["token_bank_all_ped"],
+            "token_bank_all_cyc": tokenized_agent["token_bank_all_cyc"],
+            "gt_pos_raw": self._repeat_tensor_on_first_dim(tokenized_agent["gt_pos_raw"], repeat_count),
+            "gt_head_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_head_raw"], repeat_count
+            ),
+            "gt_valid_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_valid_raw"], repeat_count
+            ),
+            "gt_pos": self._repeat_tensor_on_first_dim(tokenized_agent["gt_pos"], repeat_count),
+            "gt_heading": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_heading"], repeat_count
+            ),
+            "valid_mask": self._repeat_tensor_on_first_dim(
+                tokenized_agent["valid_mask"], repeat_count
+            ),
+            "gt_z_raw": self._repeat_tensor_on_first_dim(tokenized_agent["gt_z_raw"], repeat_count),
+        }
+
+        if "shape" in tokenized_agent:
+            runtime_tokenized_agent["shape"] = self._repeat_tensor_on_first_dim(
+                tokenized_agent["shape"],
+                repeat_count,
+            )
+
+        return runtime_tokenized_agent
+
+    def _build_parallel_rollout_cache(
+        self,
+        rollout_cache: Dict[str, object],
+        repeat_count: int,
+    ) -> Dict[str, object]:
+        """rollout cache의 agent 축 상태를 rollout 수만큼 펼칩니다.
+
+        Args:
+            rollout_cache: ``prepare_inference_cache`` 가 만든 원본 캐시입니다.
+                agent 축 상태 텐서는 ``[n_agent, ...]`` 입니다.
+            repeat_count: 이번에 동시에 돌릴 rollout 개수입니다.
+
+        Returns:
+            Dict[str, object]:
+                rollout 병렬 실행용 큰 캐시입니다.
+                agent 축 상태 텐서는 ``[repeat_count * n_agent, ...]`` 입니다.
+        """
+        if repeat_count == 1:
+            return rollout_cache
+
+        categorical_embs = rollout_cache["categorical_embs"]
+        if isinstance(categorical_embs, tuple):
+            expanded_categorical_embs = tuple(
+                self._repeat_tensor_on_first_dim(emb, repeat_count) if torch.is_tensor(emb) else emb
+                for emb in categorical_embs
+            )
+        else:
+            expanded_categorical_embs = [
+                self._repeat_tensor_on_first_dim(emb, repeat_count) if torch.is_tensor(emb) else emb
+                for emb in categorical_embs
+            ]
+
+        feat_a_t_dict = rollout_cache["feat_a_t_dict"]
+        expanded_feat_a_t_dict = {
+            layer_idx: self._repeat_tensor_on_first_dim(layer_value, repeat_count)
+            for layer_idx, layer_value in feat_a_t_dict.items()
+        }
+
+        return {
+            "n_agent": int(rollout_cache["n_agent"]) * repeat_count,
+            "n_step_future_10hz": int(rollout_cache["n_step_future_10hz"]),
+            "n_step_future_2hz": int(rollout_cache["n_step_future_2hz"]),
+            "max_context_steps": int(rollout_cache["max_context_steps"]),
+            "pos_window": self._repeat_tensor_on_first_dim(rollout_cache["pos_window"], repeat_count),
+            "head_window": self._repeat_tensor_on_first_dim(rollout_cache["head_window"], repeat_count),
+            "head_vector_window": self._repeat_tensor_on_first_dim(
+                rollout_cache["head_vector_window"], repeat_count
+            ),
+            "valid_window": self._repeat_tensor_on_first_dim(
+                rollout_cache["valid_window"], repeat_count
+            ),
+            "pred_idx_window": self._repeat_tensor_on_first_dim(
+                rollout_cache["pred_idx_window"], repeat_count
+            ),
+            "feat_a": self._repeat_tensor_on_first_dim(rollout_cache["feat_a"], repeat_count),
+            "agent_token_emb": self._repeat_tensor_on_first_dim(
+                rollout_cache["agent_token_emb"], repeat_count
+            ),
+            "agent_token_emb_veh": rollout_cache["agent_token_emb_veh"],
+            "agent_token_emb_ped": rollout_cache["agent_token_emb_ped"],
+            "agent_token_emb_cyc": rollout_cache["agent_token_emb_cyc"],
+            "veh_mask": self._repeat_tensor_on_first_dim(rollout_cache["veh_mask"], repeat_count),
+            "ped_mask": self._repeat_tensor_on_first_dim(rollout_cache["ped_mask"], repeat_count),
+            "cyc_mask": self._repeat_tensor_on_first_dim(rollout_cache["cyc_mask"], repeat_count),
+            "categorical_embs": expanded_categorical_embs,
+            "feat_a_now": self._repeat_tensor_on_first_dim(
+                rollout_cache["feat_a_now"], repeat_count
+            ),
+            "feat_a_t_dict": expanded_feat_a_t_dict,
+        }
+
+    def _reshape_parallel_rollout_prediction(
+        self,
+        pred_tensor: Tensor,
+        repeat_count: int,
+        num_agent: int,
+    ) -> Tensor:
+        """병렬 rollout 출력을 기존 metric shape로 되돌립니다.
+
+        Args:
+            pred_tensor: rollout 축을 agent 축에 붙여서 만든 출력입니다.
+                shape은 ``[repeat_count * n_agent, ...]`` 입니다.
+            repeat_count: 이번 chunk의 rollout 개수입니다.
+            num_agent: 원래 batch의 agent 개수입니다.
+
+        Returns:
+            Tensor:
+                rollout 축이 다시 분리된 출력입니다.
+                shape은 ``[n_agent, repeat_count, ...]`` 입니다.
+        """
+        pred_tensor = pred_tensor.reshape(repeat_count, num_agent, *pred_tensor.shape[1:])
+        permute_order = (1, 0) + tuple(range(2, pred_tensor.dim()))
+        return pred_tensor.permute(*permute_order).contiguous()
+
+    def _run_parallel_rollout_chunk(
+        self,
+        data,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        rollout_cache: Dict[str, object],
+        rollout_indices: Sequence[int],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
+
+        Args:
+            data: dataloader가 준 원본 batch입니다.
+            tokenized_agent: 평가용 agent 토큰 사전입니다.
+                agent 축 텐서는 ``[n_agent, ...]`` 입니다.
+            map_feature: 한 번 인코딩한 지도 특징입니다.
+                지도 토큰 축 텐서는 ``[n_map_token, ...]`` 입니다.
+            rollout_cache: 원본 closed-loop cache 입니다.
+            rollout_indices: 이번에 한꺼번에 돌릴 rollout 번호 목록입니다.
+                길이는 ``[n_rollout_chunk]`` 입니다.
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor]:
+                위치, 높이, 방향 예측입니다.
+                shape은 각각 ``[n_agent, n_rollout_chunk, 80, 2]``,
+                ``[n_agent, n_rollout_chunk, 80]``,
+                ``[n_agent, n_rollout_chunk, 80]`` 입니다.
+        """
+        chunk_size = int(len(rollout_indices))
+        scenario_device = tokenized_agent["batch"].device
+        if chunk_size == 1:
+            scenario_sampling_seeds = self._get_closed_loop_scenario_seeds(
+                scenario_ids=data["scenario_id"],
+                rollout_idx=int(rollout_indices[0]),
+                device=scenario_device,
+            )
+            pred = self.encoder.rollout_from_cache(
+                rollout_cache=rollout_cache,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                sampling_scheme=self.validation_rollout_sampling,
+                scenario_sampling_seeds=scenario_sampling_seeds,
+            )
+            return (
+                pred["pred_traj_10hz"].unsqueeze(1),
+                pred["pred_z_10hz"].unsqueeze(1),
+                pred["pred_head_10hz"].unsqueeze(1),
+            )
+
+        num_agent = int(tokenized_agent["batch"].shape[0])
+        num_graphs = len(data["scenario_id"])
+        scenario_seed_table = self._build_closed_loop_seed_table(
+            scenario_ids=data["scenario_id"],
+            rollout_indices=rollout_indices,
+            device=scenario_device,
+        )
+        expanded_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
+            tokenized_agent=tokenized_agent,
+            repeat_count=chunk_size,
+            num_graphs=num_graphs,
+        )
+        expanded_map_feature = self._build_parallel_rollout_map_feature(
+            map_feature=map_feature,
+            repeat_count=chunk_size,
+            num_graphs=num_graphs,
+        )
+        expanded_rollout_cache = self._build_parallel_rollout_cache(
+            rollout_cache=rollout_cache,
+            repeat_count=chunk_size,
+        )
+        pred = self.encoder.rollout_from_cache(
+            rollout_cache=expanded_rollout_cache,
+            tokenized_agent=expanded_tokenized_agent,
+            map_feature=expanded_map_feature,
+            sampling_scheme=self.validation_rollout_sampling,
+            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+        )
+        return (
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_traj_10hz"],
+                repeat_count=chunk_size,
+                num_agent=num_agent,
+            ),
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_z_10hz"],
+                repeat_count=chunk_size,
+                num_agent=num_agent,
+            ),
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_head_10hz"],
+                repeat_count=chunk_size,
+                num_agent=num_agent,
+            ),
+        )
+
+    def _build_rollout_chunk_size_candidates(self) -> list[int]:
+        """한 번에 같이 돌릴 rollout 개수 후보를 큰 값부터 만듭니다.
+
+        Returns:
+            list[int]:
+                가장 공격적인 값부터 안전한 값까지의 후보 목록입니다.
+                예를 들면 ``8 -> [8, 4, 2, 1]`` 입니다.
+        """
+        chunk_sizes: list[int] = []
+        current = max(1, int(self.n_rollout_closed_val))
+        while True:
+            if current not in chunk_sizes:
+                chunk_sizes.append(current)
+            if current == 1:
+                break
+            current = max(1, math.ceil(current / 2))
+        return chunk_sizes
+
+    def _is_cuda_out_of_memory(self, error: RuntimeError) -> bool:
+        """CUDA 메모리 부족 예외인지 문자열로 판별합니다.
+
+        Args:
+            error: rollout 실행 중 잡은 예외입니다.
+
+        Returns:
+            bool:
+                메모리 부족으로 보는 게 맞으면 ``True`` 입니다.
+        """
+        error_message = str(error).lower()
+        oom_patterns = (
+            "out of memory",
+            "cuda error: out of memory",
+            "cublas_status_alloc_failed",
+        )
+        return any(pattern in error_message for pattern in oom_patterns)
+
+    def _cleanup_after_rollout_oom(self) -> None:
+        """병렬 rollout 시도 실패 뒤 남은 임시 메모리를 정리합니다.
+
+        Returns:
+            None
+        """
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _run_closed_loop_rollouts(
         self,
         data,
         tokenized_agent,
         map_feature: Dict[str, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """한 batch의 모든 closed-loop rollout을 같은 규칙으로 생성합니다.
+        """한 batch의 모든 closed-loop rollout을 가능한 크게 묶어 생성합니다.
+
+        기본은 모든 rollout을 한 번에 큰 batch로 처리합니다.
+        다만 메모리가 부족하면 자동으로 묶음 크기를 절반 정도씩 줄여
+        같은 결과 shape을 유지한 채 다시 시도합니다.
 
         Args:
             data: dataloader가 준 원본 batch입니다.
@@ -349,30 +760,42 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        scenario_device = tokenized_agent["batch"].device
-        pred_traj, pred_z, pred_head = [], [], []
-        for rollout_idx in range(self.n_rollout_closed_val):
-            scenario_sampling_seeds = self._get_closed_loop_scenario_seeds(
-                scenario_ids=data["scenario_id"],
-                rollout_idx=rollout_idx,
-                device=scenario_device,
-            )
-            pred = self.encoder.rollout_from_cache(
-                rollout_cache=rollout_cache,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                sampling_scheme=self.validation_rollout_sampling,
-                scenario_sampling_seeds=scenario_sampling_seeds,
-            )
-            pred_traj.append(pred["pred_traj_10hz"])
-            pred_z.append(pred["pred_z_10hz"])
-            pred_head.append(pred["pred_head_10hz"])
+        rollout_indices = list(range(int(self.n_rollout_closed_val)))
+        last_oom_error: RuntimeError | None = None
 
-        return (
-            torch.stack(pred_traj, dim=1),
-            torch.stack(pred_z, dim=1),
-            torch.stack(pred_head, dim=1),
-        )
+        for chunk_size in self._build_rollout_chunk_size_candidates():
+            pred_traj_chunks: list[Tensor] = []
+            pred_z_chunks: list[Tensor] = []
+            pred_head_chunks: list[Tensor] = []
+            try:
+                for chunk_start in range(0, len(rollout_indices), chunk_size):
+                    chunk_rollout_indices = rollout_indices[chunk_start : chunk_start + chunk_size]
+                    chunk_pred_traj, chunk_pred_z, chunk_pred_head = self._run_parallel_rollout_chunk(
+                        data=data,
+                        tokenized_agent=tokenized_agent,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache,
+                        rollout_indices=chunk_rollout_indices,
+                    )
+                    pred_traj_chunks.append(chunk_pred_traj)
+                    pred_z_chunks.append(chunk_pred_z)
+                    pred_head_chunks.append(chunk_pred_head)
+                return (
+                    torch.cat(pred_traj_chunks, dim=1),
+                    torch.cat(pred_z_chunks, dim=1),
+                    torch.cat(pred_head_chunks, dim=1),
+                )
+            except RuntimeError as error:
+                if (not self._is_cuda_out_of_memory(error)) or chunk_size == 1:
+                    raise
+                last_oom_error = error
+                del pred_traj_chunks, pred_z_chunks, pred_head_chunks
+                self._cleanup_after_rollout_oom()
+                continue
+
+        if last_oom_error is not None:
+            raise last_oom_error
+        raise RuntimeError("closed-loop rollout 실행 중 알 수 없는 오류가 발생했습니다.")
 
     def _update_closed_loop_metric_states(
         self,
