@@ -50,7 +50,10 @@ class SMARTFlow(LightningModule):
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
         self.minADE = minADE()
-        self.sim_agents_metrics = SimAgentsMetrics("val_closed")
+        self.sim_agents_metrics = SimAgentsMetrics(
+            "val_closed",
+            max_workers=model_config.sim_agents_metric_workers,
+        )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val

@@ -930,25 +930,13 @@ def _compute_scenario_metrics_from_arrays_worker(
     return scenario_metrics.SerializeToString()
 
 
-def _resolve_sim_agents_metric_workers() -> int:
-    override = os.environ.get("CATK_SIM_AGENTS_METRIC_WORKERS", "").strip()
-    if override:
-        try:
-            return max(1, int(override))
-        except ValueError as exc:
-            raise RuntimeError(
-                f"CATK_SIM_AGENTS_METRIC_WORKERS must be an integer, got {override!r}."
-            ) from exc
-
-    cpu_count = max(1, os.cpu_count() or 1)
-    local_world_size = max(1, _read_nonnegative_int_env("LOCAL_WORLD_SIZE", 0) or 1)
-    data_workers = _read_nonnegative_int_env("CATK_DATA_WORKERS", 0)
-
-    reserved_cpu_budget = local_world_size * max(1, data_workers + 1)
-    free_cpu_budget = max(1, cpu_count - reserved_cpu_budget)
-    per_rank_budget = max(1, free_cpu_budget // local_world_size)
-    worker_cap = 12 if local_world_size > 1 else 16
-    return max(1, min(worker_cap, per_rank_budget))
+def _resolve_sim_agents_metric_workers(configured_workers: int) -> int:
+    try:
+        return max(1, int(configured_workers))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"sim_agents_metric_workers must be an integer, got {configured_workers!r}."
+        ) from exc
 
 
 def _get_sim_agents_mp_context() -> mp.context.BaseContext:
@@ -960,7 +948,7 @@ def _get_sim_agents_mp_context() -> mp.context.BaseContext:
 class SimAgentsMetrics(Metric):
     """Waymo 공식 2025 Sim Agents 평가기를 torchmetrics 형태로 감싼 클래스입니다."""
 
-    def __init__(self, prefix: str, ego_only: bool = False) -> None:
+    def __init__(self, prefix: str, ego_only: bool = False, max_workers: int = 4) -> None:
         super().__init__()
         self.prefix = prefix
         self.ego_only = ego_only
@@ -980,7 +968,7 @@ class SimAgentsMetrics(Metric):
         for field_name in self.scenario_metric_field_names:
             self.add_state(field_name, default=tensor(0.0), dist_reduce_fx="sum")
         self.add_state("scenario_counter", default=tensor(0.0), dist_reduce_fx="sum")
-        self._max_workers = _resolve_sim_agents_metric_workers()
+        self._max_workers = _resolve_sim_agents_metric_workers(max_workers)
         self._max_pending_futures = max(self._max_workers * 4, self._max_workers)
         self._executor: cf.ProcessPoolExecutor | None = None
         self._pending_futures: Dict[cf.Future[bytes], int] = {}

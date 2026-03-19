@@ -28,7 +28,8 @@ def main(cfg: DictConfig) -> None:
     pred_z = future_z[:, None].repeat(1, n_rollout, 1)
     pred_head = future_head[:, None].repeat(1, n_rollout, 1)
 
-    metrics = SimAgentsMetrics("val_closed")
+    metric_workers = int(cfg.model.model_config.sim_agents_metric_workers)
+    metrics = SimAgentsMetrics("val_closed", max_workers=metric_workers)
     t0 = time.perf_counter()
     metrics.update_from_prediction_tensors(
         scenario_files=batch["tfrecord_path"],
@@ -46,7 +47,7 @@ def main(cfg: DictConfig) -> None:
     print(
         json.dumps(
             {
-                "workers_env": os.environ.get("CATK_SIM_AGENTS_METRIC_WORKERS", ""),
+                "configured_workers": metric_workers,
                 "batch_size": batch_size,
                 "resolved_workers": metrics._max_workers,
                 "update_seconds": round(t1 - t0, 4),
