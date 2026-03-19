@@ -932,11 +932,24 @@ def _compute_scenario_metrics_from_arrays_worker(
 
 def _resolve_sim_agents_metric_workers(configured_workers: int) -> int:
     try:
-        return max(1, int(configured_workers))
+        configured_workers = int(configured_workers)
     except (TypeError, ValueError) as exc:
         raise RuntimeError(
             f"sim_agents_metric_workers must be an integer, got {configured_workers!r}."
         ) from exc
+
+    if configured_workers > 0:
+        return configured_workers
+
+    cpu_count = max(1, os.cpu_count() or 1)
+    local_world_size = max(1, _read_nonnegative_int_env("LOCAL_WORLD_SIZE", 0) or 1)
+    data_workers = _read_nonnegative_int_env("CATK_DATA_WORKERS", 0)
+
+    reserved_cpu_budget = local_world_size * max(1, data_workers + 1)
+    free_cpu_budget = max(1, cpu_count - reserved_cpu_budget)
+    per_rank_budget = max(1, free_cpu_budget // local_world_size)
+    worker_cap = 12 if local_world_size > 1 else 16
+    return max(1, min(worker_cap, per_rank_budget))
 
 
 def _get_sim_agents_mp_context() -> mp.context.BaseContext:
