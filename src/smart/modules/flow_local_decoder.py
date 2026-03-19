@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.smart.tokens.agent_token_matching import match_token_idx_from_local_contour
 from src.smart.utils import (
     cal_polygon_contour,
     transform_to_global,
@@ -358,40 +359,47 @@ class ContinuousCommitBridge:
         token_bank_all_ped: torch.Tensor,
         token_bank_all_cyc: torch.Tensor,
     ) -> torch.Tensor:
-        current_contour = cal_polygon_contour(current_pos, current_head, token_agent_shape)
-        future_contours = [
-            cal_polygon_contour(commit_pos[:, i], commit_head[:, i], token_agent_shape)
-            for i in range(commit_pos.shape[1])
-        ]
-        contour_global = torch.stack([current_contour] + future_contours, dim=1)
+        """학습과 같은 기준으로 다음 coarse 토큰 번호를 다시 고릅니다.
 
-        contour_local, _ = transform_to_local(
-            pos_global=contour_global.flatten(1, 2),
+        Args:
+            current_pos: 현재 coarse 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 coarse 방향입니다. shape은 ``[n_agent]`` 입니다.
+            commit_pos: 이번 0.5초 구간의 10Hz 중심점 예측입니다.
+                shape은 ``[n_agent, 5, 2]`` 입니다.
+            commit_head: 이번 0.5초 구간의 10Hz 방향 예측입니다.
+                shape은 ``[n_agent, 5]`` 입니다.
+            agent_type: 차종 번호입니다. shape은 ``[n_agent]`` 입니다.
+            token_agent_shape: 토큰 매칭에 쓸 고정 박스 크기입니다.
+                shape은 ``[n_agent, 2]`` 입니다.
+            token_bank_all_veh: 차량 토큰 은행입니다.
+                shape은 ``[n_token, 6, 4, 2]`` 입니다.
+            token_bank_all_ped: 보행자 토큰 은행입니다.
+                shape은 ``[n_token, 6, 4, 2]`` 입니다.
+            token_bank_all_cyc: 자전거 토큰 은행입니다.
+                shape은 ``[n_token, 6, 4, 2]`` 입니다.
+
+        Returns:
+            torch.Tensor:
+                다음 coarse 상태에 붙일 토큰 번호입니다. shape은 ``[n_agent]`` 입니다.
+        """
+        next_contour = cal_polygon_contour(
+            commit_pos[:, -1],
+            commit_head[:, -1],
+            token_agent_shape,
+        )
+        next_contour_local, _ = transform_to_local(
+            pos_global=next_contour,
             head_global=None,
             pos_now=current_pos,
             head_now=current_head,
         )
-        contour_local = contour_local.view(contour_global.shape)
-
-        token_idx = torch.zeros(
-            agent_type.shape[0],
-            device=agent_type.device,
-            dtype=torch.long,
+        return match_token_idx_from_local_contour(
+            agent_type=agent_type,
+            contour_local=next_contour_local,
+            token_bank_all_veh=token_bank_all_veh,
+            token_bank_all_ped=token_bank_all_ped,
+            token_bank_all_cyc=token_bank_all_cyc,
+            reduction="sum",
+            num_k=1,
+            sample_topk=False,
         )
-
-        token_banks = {
-            "veh": (agent_type == 0, token_bank_all_veh),
-            "ped": (agent_type == 1, token_bank_all_ped),
-            "cyc": (agent_type == 2, token_bank_all_cyc),
-        }
-        for _, (mask, token_bank) in token_banks.items():
-            if not mask.any():
-                continue
-
-            dist = torch.norm(
-                token_bank.unsqueeze(0) - contour_local[mask].unsqueeze(1),
-                dim=-1,
-            ).mean(dim=(-1, -2))
-            token_idx[mask] = torch.argmin(dist, dim=-1)
-
-        return token_idx

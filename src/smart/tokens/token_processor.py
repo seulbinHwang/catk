@@ -21,6 +21,10 @@ from torch import Tensor
 from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
+from src.smart.tokens.agent_token_matching import (
+    build_agent_type_masks,
+    match_token_idx_from_local_contour,
+)
 from src.smart.utils import (
     cal_polygon_contour,
     transform_to_global,
@@ -322,11 +326,7 @@ class TokenProcessor(torch.nn.Module):
                 ``veh``, ``ped``, ``cyc`` 키를 가지는 bool 마스크 사전입니다.
                 각 마스크 shape은 ``[n_agent]`` 입니다.
         """
-        return {
-            "veh": agent_type == 0,
-            "ped": agent_type == 1,
-            "cyc": agent_type == 2,
-        }
+        return build_agent_type_masks(agent_type)
 
     def _get_agent_shape(self, agent_type: Tensor) -> Tensor:
         """토큰화에 쓰는 고정 가로, 세로 크기를 차종별로 붙입니다.
@@ -373,45 +373,17 @@ class TokenProcessor(torch.nn.Module):
             Tensor:
                 선택된 토큰 번호입니다. shape은 ``[n_agent]`` 입니다.
         """
-        token_idx = torch.zeros(
-            agent_type.shape[0],
-            device=agent_type.device,
-            dtype=torch.long,
+        return match_token_idx_from_local_contour(
+            agent_type=agent_type,
+            contour_local=contour_local,
+            token_bank_all_veh=self.agent_token_all_veh,
+            token_bank_all_ped=self.agent_token_all_ped,
+            token_bank_all_cyc=self.agent_token_all_cyc,
+            reduction=reduction,
+            num_k=num_k,
+            sample_topk=sample_topk,
+            sampling_temp=float(self.agent_token_sampling.temp),
         )
-        for token_key, mask in self._build_agent_type_masks(agent_type).items():
-            if not mask.any():
-                continue
-
-            token_bank = getattr(self, f"agent_token_all_{token_key}")[:, -1]
-            dist = torch.norm(
-                token_bank.unsqueeze(0) - contour_local[mask].unsqueeze(1),
-                dim=-1,
-            )
-            if reduction == "sum":
-                dist = dist.sum(-1)
-            elif reduction == "mean":
-                dist = dist.mean(-1)
-            else:
-                raise ValueError(f"Unsupported reduction: {reduction}")
-
-            if sample_topk and (num_k > 1):
-                top_k = min(num_k, dist.shape[1])
-                topk_dists, topk_indices = torch.topk(
-                    dist,
-                    top_k,
-                    dim=-1,
-                    largest=False,
-                    sorted=False,
-                )
-                topk_logits = (-1.0 * topk_dists) / self.agent_token_sampling.temp
-                samples = Categorical(logits=topk_logits).sample()
-                token_idx[mask] = topk_indices[
-                    torch.arange(samples.shape[0], device=samples.device),
-                    samples,
-                ]
-            else:
-                token_idx[mask] = torch.argmin(dist, dim=-1)
-        return token_idx
 
     def _token_pose_from_index(
         self,

@@ -81,19 +81,27 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         head_vector_a: torch.Tensor,
         batch_s: torch.Tensor,
         mask: torch.Tensor,
+        motion_a: torch.Tensor | None = None,
     ):
         mask_flat = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
 
-        motion_a = torch.cat(
-            [
-                pos_a.new_zeros(pos_a.shape[0], 1, pos_a.shape[-1]),
-                pos_a[:, 1:] - pos_a[:, :-1],
-            ],
-            dim=1,
-        )
+        if motion_a is None:
+            motion_a = torch.cat(
+                [
+                    pos_a.new_zeros(pos_a.shape[0], 1, pos_a.shape[-1]),
+                    pos_a[:, 1:] - pos_a[:, :-1],
+                ],
+                dim=1,
+            )
+        else:
+            if motion_a.shape != pos_a.shape:
+                raise ValueError(
+                    "motion_a shape must match pos_a shape, "
+                    f"got {tuple(motion_a.shape)} and {tuple(pos_a.shape)}"
+                )
         motion_s = motion_a.transpose(0, 1).reshape(-1, 2)
 
         edge_index_a2a = radius_graph(
@@ -157,6 +165,36 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             * num_graphs
         )
         return batch.repeat(num_steps) + step_offsets
+
+    def _build_recent_coarse_motion(
+        self,
+        pos_window: torch.Tensor,
+        valid_window: torch.Tensor,
+    ) -> torch.Tensor:
+        """마지막 두 coarse 상태 차이로 최근 이동량을 만듭니다.
+
+        Args:
+            pos_window: 최근 coarse 중심점 창입니다.
+                shape은 ``[n_agent, n_step, 2]`` 입니다.
+            valid_window: 같은 창의 유효 여부입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+
+        Returns:
+            torch.Tensor:
+                각 agent의 최근 coarse 이동량입니다.
+                shape은 ``[n_agent, 2]`` 입니다.
+                마지막 두 상태가 모두 유효하지 않으면 0으로 둡니다.
+        """
+        recent_motion = pos_window.new_zeros((pos_window.shape[0], pos_window.shape[-1]))
+        if pos_window.shape[1] < 2:
+            return recent_motion
+
+        recent_motion_valid = valid_window[:, -1] & valid_window[:, -2]
+        recent_motion[recent_motion_valid] = (
+            pos_window[recent_motion_valid, -1] - pos_window[recent_motion_valid, -2]
+        )
+        return recent_motion
+
 
     def _pack_anchor_hidden(
         self,
@@ -700,12 +738,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     batch_s=tokenized_agent["batch"],
                     batch_pl=map_feature["batch"],
                 )
+                recent_motion = self._build_recent_coarse_motion(
+                    pos_window=pos_window,
+                    valid_window=valid_window,
+                )
                 edge_index_a2a, r_a2a = self.build_interaction_edge(
                     pos_a=pos_window[:, -1:],
                     head_a=head_window[:, -1:],
                     head_vector_a=head_vector_window[:, -1:],
                     batch_s=tokenized_agent["batch"],
                     mask=inference_mask[:, -1:],
+                    motion_a=recent_motion.unsqueeze(1),
                 )
 
                 for i in range(self.num_layers):
