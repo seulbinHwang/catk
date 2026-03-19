@@ -13,7 +13,7 @@ model:
     val_closed_loop: true
     n_rollout_closed_val: 32
     validation_rollout_sampling:
-      sample_steps: 10
+      sample_steps: 4
       sample_method: midpoint
       noise_scale: 1.0
     sim_agents_submission:
