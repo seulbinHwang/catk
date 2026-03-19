@@ -1220,6 +1220,13 @@ class SimAgentsMetrics(Metric):
         if len(scenario_payloads) == 0:
             return
 
+        # TorchMetrics only tracks `update()` calls automatically.
+        # This metric also exposes prediction-tensor entrypoints for performance,
+        # so we need to mark state mutations here as well to avoid false
+        # "compute before update" warnings and stale compute caches.
+        self._computed = None
+        self._update_count += 1
+
         if self._max_workers <= 1 or len(scenario_payloads) == 1:
             for scenario_file, scenario_agent_id, scenario_pred_traj, scenario_pred_z, scenario_pred_head in scenario_payloads:
                 scenario_metrics = _compute_scenario_metrics_from_arrays(
