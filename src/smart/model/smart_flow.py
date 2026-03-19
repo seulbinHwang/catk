@@ -68,6 +68,8 @@ class SMARTFlow(LightningModule):
         self.n_vis_rollout = model_config.n_vis_rollout
         self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
+        self._fit_time_original_limit_val_batches: int | float | None = None
+        self._fit_time_checkpoint_only_validation_enabled = False
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
@@ -81,6 +83,76 @@ class SMARTFlow(LightningModule):
                 "yaw_FDE2s": WeightedMeanMetric(),
             }
         )
+
+    def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
+        """학습 중 validation을 체크포인트 점수 전용으로 줄일지 판단합니다.
+
+        Returns:
+            bool:
+                아래 조건을 모두 만족하면 ``True`` 를 돌려줍니다.
+                1) closed-loop validation을 사용함
+                2) open-loop validation을 같이 쓰지 않음
+                3) submission 저장 모드가 아님
+                4) official 점수에 사용할 batch 개수가 1 이상임
+        """
+        return (
+            self.val_closed_loop
+            and not self.val_open_loop
+            and not self.sim_agents_submission.is_active
+            and int(self.n_batch_sim_agents_metric) > 0
+        )
+
+    def _apply_fit_time_validation_batch_limit(self) -> None:
+        """학습 중 validation에서 앞쪽 일부 batch만 돌도록 trainer 값을 바꿉니다.
+
+        이 함수는 학습 시작 시 한 번 호출됩니다.
+        사용자가 넘긴 config 파일은 그대로 두고, 실행 중 trainer 객체의
+        validation batch 제한만 잠깐 바꿉니다.
+
+        Returns:
+            None
+        """
+        if not self._should_enable_fit_time_checkpoint_only_validation():
+            self._fit_time_checkpoint_only_validation_enabled = False
+            return
+
+        if self.trainer is None:
+            return
+
+        if self._fit_time_original_limit_val_batches is None:
+            self._fit_time_original_limit_val_batches = self.trainer.limit_val_batches
+
+        target_batches = int(self.n_batch_sim_agents_metric)
+        self.trainer.limit_val_batches = target_batches
+        self._fit_time_checkpoint_only_validation_enabled = True
+
+    def _restore_fit_time_validation_batch_limit(self) -> None:
+        """학습이 끝나면 trainer의 validation 제한 값을 원래대로 돌립니다.
+
+        Returns:
+            None
+        """
+        if self.trainer is None:
+            self._fit_time_checkpoint_only_validation_enabled = False
+            return
+
+        if self._fit_time_original_limit_val_batches is not None:
+            self.trainer.limit_val_batches = self._fit_time_original_limit_val_batches
+
+        self._fit_time_original_limit_val_batches = None
+        self._fit_time_checkpoint_only_validation_enabled = False
+
+    def _should_compute_closed_loop_minade(self) -> bool:
+        """현재 validation에서 closed-loop minADE를 계산할지 판단합니다.
+
+        학습 중 빠른 validation에서는 checkpoint 선택에 쓰는 official 점수만
+        남기고 minADE 계산은 끕니다.
+
+        Returns:
+            bool:
+                minADE를 계산해야 하면 ``True`` 입니다.
+        """
+        return not self._fit_time_checkpoint_only_validation_enabled
 
     def _get_video_logger(self):
         if self.trainer is not None:
@@ -311,11 +383,12 @@ class SMARTFlow(LightningModule):
         pred_head: Tensor,
     ) -> object:
         scenario_rollouts = None
-        self.minADE.update(
-            pred=pred_traj,
-            target=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]],
-            target_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
-        )
+        if self._should_compute_closed_loop_minade():
+            self.minADE.update(
+                pred=pred_traj,
+                target=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]],
+                target_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
+            )
         if batch_idx < self.n_batch_sim_agents_metric:
             self.sim_agents_metrics.update_from_prediction_tensors(
                 scenario_files=data["tfrecord_path"],
@@ -336,6 +409,26 @@ class SMARTFlow(LightningModule):
                     pred_head=pred_head,
                 )
         return scenario_rollouts
+
+    def on_fit_start(self) -> None:
+        """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.
+
+        Lightning은 ``on_fit_start`` 를 sanity check 전에 호출합니다.
+        그래서 여기서 validation batch 개수를 줄이면 학습 전 sanity check와
+        학습 중 validation 둘 다 같은 빠른 규칙을 사용하게 됩니다.
+
+        Returns:
+            None
+        """
+        self._apply_fit_time_validation_batch_limit()
+
+    def on_fit_end(self) -> None:
+        """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.
+
+        Returns:
+            None
+        """
+        self._restore_fit_time_validation_batch_limit()
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -462,19 +555,23 @@ class SMARTFlow(LightningModule):
                     epoch_sim_agents_metrics = self.sim_agents_metrics.compute_from_state_tensor(
                         reduced_metric_state
                     )
-                    reduced_minade_state = torch.stack(
-                        [
-                            self.minADE.sum.detach().to(device=self.device),
-                            self.minADE.count.detach().to(device=self.device),
-                        ]
-                    )
-                    torch.distributed.all_reduce(reduced_minade_state)
-                    minade_value = reduced_minade_state[0] / reduced_minade_state[1].clamp_min(1e-6)
+                    minade_value: Tensor | None = None
+                    if self._should_compute_closed_loop_minade():
+                        reduced_minade_state = torch.stack(
+                            [
+                                self.minADE.sum.detach().to(device=self.device),
+                                self.minADE.count.detach().to(device=self.device),
+                            ]
+                        )
+                        torch.distributed.all_reduce(reduced_minade_state)
+                        minade_value = reduced_minade_state[0] / reduced_minade_state[1].clamp_min(1e-6)
                 else:
                     epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
-                    minade_value = self.minADE.compute()
+                    minade_value = None
+                    if self._should_compute_closed_loop_minade():
+                        minade_value = self.minADE.compute()
                 closed_loop_metric = epoch_sim_agents_metrics[self.closed_loop_metric_name]
-                if self.global_rank == 0:
+                if self.global_rank == 0 and minade_value is not None:
                     epoch_sim_agents_metrics[self.val_closed_minade_name] = minade_value
                 self.log(
                     self.closed_loop_metric_name,
