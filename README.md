@@ -79,6 +79,7 @@ $RAW_ROOT/
 ```bash
 export RAW_ROOT=/workspace/womd_v1_3/scenario
 export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export CACHE_ROOT=/mnt/nuplan/womd_v1_3/SMART_cache
 ```
 
 토큰 파일은 저장소에 이미 포함되어 있으므로 별도 다운로드가 필요 없습니다.
