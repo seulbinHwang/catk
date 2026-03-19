@@ -137,6 +137,32 @@ $CACHE_ROOT/
 - `validation_tfrecords_splitted/`는 `validation` 캐시 생성 시 자동 생성됩니다.
 - `validation_tfrecords_splitted/`는 local evaluation, 2025 Sim Agents metric 계산, mp4 visualization에 필요합니다.
 
+### 4.4 Nubes 에서 캐시 다운로드
+
+이미 만들어진 pkl 캐시를 쓰고 싶다면 `scripts/download_smart_cache_from_nubes.sh` 를 사용할 수 있습니다.
+
+기본 사용법:
+
+```bash
+bash scripts/download_smart_cache_from_nubes.sh <remote_dir> <local_dir>
+```
+
+예시:
+
+```bash
+bash scripts/download_smart_cache_from_nubes.sh \
+  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
+  "$CACHE_ROOT"
+```
+
+또는 환경변수로 넘겨도 됩니다.
+
+```bash
+REMOTE_DIR=labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
+LOCAL_DIR="$CACHE_ROOT" \
+bash scripts/download_smart_cache_from_nubes.sh
+```
+
 ## 5. 6x H100에서 Flow Matching 학습
 
 이 경로의 기본 학습 설정은 `configs/experiment/pre_bc_flow.yaml`입니다.
