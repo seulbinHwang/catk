@@ -177,7 +177,7 @@ spec:
           value: "xterm-256color"
 
         - name: PROJECT_ROOT
-          value: "/mnt/nuplan/Projects/catk"
+          value: "/mnt/nuplan/projects/catk"
 
         - name: CODEX_HOME
           value: "/mnt/nuplan/.codex"
