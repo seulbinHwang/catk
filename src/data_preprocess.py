@@ -12,20 +12,11 @@
 # its affiliates is strictly prohibited.
 
 import multiprocessing
-import os
 import pickle
 from argparse import ArgumentParser
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-os.environ.setdefault("BLIS_NUM_THREADS", "1")
 
 import numpy as np
 import pandas as pd
@@ -78,48 +69,6 @@ _polygon_light_type = [
     "LANE_STATE_GO",
     "LANE_STATE_CAUTION",
 ]
-_INTERNAL_THREADS = 1
-_TF_NUM_PARALLEL_READS = 1
-_RUNTIME_THREADS_CONFIGURED = False
-
-
-def _configure_runtime_threads() -> None:
-    global _RUNTIME_THREADS_CONFIGURED
-    if _RUNTIME_THREADS_CONFIGURED:
-        return
-
-    torch.set_num_threads(_INTERNAL_THREADS)
-    try:
-        torch.set_num_interop_threads(_INTERNAL_THREADS)
-    except RuntimeError:
-        pass
-
-    try:
-        tf.config.threading.set_intra_op_parallelism_threads(_INTERNAL_THREADS)
-    except RuntimeError:
-        pass
-
-    try:
-        tf.config.threading.set_inter_op_parallelism_threads(_INTERNAL_THREADS)
-    except RuntimeError:
-        pass
-
-    _RUNTIME_THREADS_CONFIGURED = True
-
-
-def _build_tfrecord_dataset(file_path: str) -> tf.data.TFRecordDataset:
-    dataset = tf.data.TFRecordDataset(
-        file_path,
-        compression_type="",
-        num_parallel_reads=_TF_NUM_PARALLEL_READS,
-    )
-    options = tf.data.Options()
-    options.threading.private_threadpool_size = _INTERNAL_THREADS
-    options.threading.max_intra_op_parallelism = _INTERNAL_THREADS
-    return dataset.with_options(options)
-
-
-_configure_runtime_threads()
 
 
 def get_agent_features(
@@ -508,7 +457,9 @@ def decode_dynamic_map_states_from_proto(dynamic_map_states):
 
 
 def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
-    dataset = _build_tfrecord_dataset(file_path)
+    dataset = tf.data.TFRecordDataset(
+        file_path, compression_type="", num_parallel_reads=3
+    )
     for tf_data in dataset:
         tf_data = tf_data.numpy()
         scenario = scenario_pb2.Scenario()
@@ -562,10 +513,7 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
         output_dir_tfrecords_splitted=output_dir_tfrecords_splitted,
     )
 
-    with multiprocessing.Pool(
-        num_workers,
-        initializer=_configure_runtime_threads,
-    ) as p:
+    with multiprocessing.Pool(num_workers) as p:
         r = list(tqdm(p.imap_unordered(func, packages), total=len(packages)))
 
 
