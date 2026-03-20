@@ -125,11 +125,24 @@ class TokenProcessor(torch.nn.Module):
             - ``polygon_batch``: ``[n_poly]``
         """
         device = data["map_save"]["traj_pos"].device
-        if "polygon_token" not in data:
-            return self._empty_polygon_tokenized_map(device=device)
+        if "polygon_token" not in data.node_types:
+            raise RuntimeError(
+                "Batched input is missing polygon_token. "
+                "Regenerate every cache split with the current src.data_preprocess "
+                "so training and inference use the same polygon-map schema."
+            )
 
         polygon_store = data["polygon_token"]
-        if "position" not in polygon_store or polygon_store["position"].numel() == 0:
+        required_keys = {"position", "orientation", "boundary", "size", "type"}
+        missing_keys = sorted(required_keys.difference(polygon_store.keys()))
+        if missing_keys:
+            missing_str = ", ".join(missing_keys)
+            raise RuntimeError(
+                f"polygon_token store is missing required fields ({missing_str}). "
+                "Regenerate every cache split with the current src.data_preprocess."
+            )
+
+        if polygon_store["position"].numel() == 0:
             return self._empty_polygon_tokenized_map(device=device)
 
         if (
