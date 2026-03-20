@@ -22,6 +22,7 @@ trainer:
   max_epochs: 64
   precision: bf16-mixed
   gradient_clip_val: 1.0
+  sync_batchnorm: false
 
 callbacks:
   model_checkpoint:
