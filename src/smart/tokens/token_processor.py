@@ -83,10 +83,81 @@ class TokenProcessor(torch.nn.Module):
             # [n_token, 6, 4, 2], countour, 10 hz
             self.register_buffer(f"agent_token_all_{k}", v, persistent=False)
 
+    def _empty_polygon_tokenized_map(self, device: torch.device) -> Dict[str, Tensor]:
+        """polygon branch가 없을 때 쓰는 빈 입력을 만듭니다.
+
+        Args:
+            device: 반환 tensor를 올릴 장치입니다. shape은 scalar 입니다.
+
+        Returns:
+            Dict[str, Tensor]: polygon branch 기본 입력입니다.
+            - ``polygon_position``: ``[0, 2]``
+            - ``polygon_orientation``: ``[0]``
+            - ``polygon_boundary``: ``[0, 8, 2]``
+            - ``polygon_size``: ``[0, 2]``
+            - ``polygon_type``: ``[0]``
+            - ``polygon_batch``: ``[0]``
+        """
+        return {
+            "polygon_position": torch.zeros((0, 2), dtype=torch.float32, device=device),
+            "polygon_orientation": torch.zeros((0,), dtype=torch.float32, device=device),
+            "polygon_boundary": torch.zeros(
+                (0, 8, 2), dtype=torch.float32, device=device
+            ),
+            "polygon_size": torch.zeros((0, 2), dtype=torch.float32, device=device),
+            "polygon_type": torch.zeros((0,), dtype=torch.long, device=device),
+            "polygon_batch": torch.zeros((0,), dtype=torch.long, device=device),
+        }
+
+    def _tokenize_polygon_map(self, data: HeteroData) -> Dict[str, Tensor]:
+        """전처리된 polygon store를 map decoder용 입력으로 옮깁니다.
+
+        Args:
+            data: 배치된 입력입니다.
+
+        Returns:
+            Dict[str, Tensor]: polygon branch 입력 사전입니다.
+            - ``polygon_position``: ``[n_poly, 2]``
+            - ``polygon_orientation``: ``[n_poly]``
+            - ``polygon_boundary``: ``[n_poly, 8, 2]``
+            - ``polygon_size``: ``[n_poly, 2]``
+            - ``polygon_type``: ``[n_poly]``
+            - ``polygon_batch``: ``[n_poly]``
+        """
+        device = data["map_save"]["traj_pos"].device
+        if "polygon_token" not in data:
+            return self._empty_polygon_tokenized_map(device=device)
+
+        polygon_store = data["polygon_token"]
+        if "position" not in polygon_store or polygon_store["position"].numel() == 0:
+            return self._empty_polygon_tokenized_map(device=device)
+
+        if (
+            "batch" in polygon_store
+            and polygon_store["batch"].numel() == polygon_store["position"].shape[0]
+        ):
+            polygon_batch = polygon_store["batch"].long()
+        else:
+            polygon_batch = torch.zeros(
+                polygon_store["position"].shape[0],
+                dtype=torch.long,
+                device=polygon_store["position"].device,
+            )
+
+        return {
+            "polygon_position": polygon_store["position"].to(torch.float32).contiguous(),
+            "polygon_orientation": polygon_store["orientation"]
+            .to(torch.float32)
+            .contiguous(),
+            "polygon_boundary": polygon_store["boundary"].to(torch.float32).contiguous(),
+            "polygon_size": polygon_store["size"].to(torch.float32).contiguous(),
+            "polygon_type": polygon_store["type"].long().contiguous(),
+            "polygon_batch": polygon_batch.contiguous(),
+        }
+
     def tokenize_map(self, data: HeteroData) -> Dict[str, Tensor]:
         traj_pos = data["map_save"]["traj_pos"]  # [n_pl, 3, 2]
         traj_theta = data["map_save"]["traj_theta"]  # [n_pl]
-
         traj_pos_local, _ = transform_to_local(
             pos_global=traj_pos,  # [n_pl, 3, 2]
             head_global=None,  # [n_pl, 1]
@@ -107,7 +178,6 @@ class TokenProcessor(torch.nn.Module):
                 largest=False,
                 sorted=False,
             )  # [n_pl, K]
-
             topk_logits = (-1e-6 - topk_dists) / self.map_token_sampling.temp
             _samples = Categorical(logits=topk_logits).sample()  # [n_pl] in K
             token_idx = topk_indices[torch.arange(len(_samples)), _samples].contiguous()
@@ -124,6 +194,7 @@ class TokenProcessor(torch.nn.Module):
             "light_type": data["pt_token"]["light_type"].long(),  # [n_pl]
             "batch": data["pt_token"]["batch"],  # [n_pl]
         }
+        tokenized_map.update(self._tokenize_polygon_map(data))
         return tokenized_map
 
     def tokenize_agent(

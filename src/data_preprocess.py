@@ -16,7 +16,7 @@ import pickle
 from argparse import ArgumentParser
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -62,6 +62,92 @@ _surface_point_type = {
     "speed_bump": 10,
     "driveway": 11,
 }
+_road_polygon_types = ["lane", "road_edge", "road_line"]
+_semantic_polygon_types = ["crosswalk", "speed_bump", "driveway"]
+_semantic_polygon_label = {
+    "crosswalk": 0,
+    "speed_bump": 1,
+    "driveway": 2,
+}
+
+
+def _normalize_angle_np(angle: float) -> float:
+    """numpy scalar 각도를 [-pi, pi) 범위로 정리합니다.
+
+    Args:
+        angle: 하나의 각도 값입니다. shape은 scalar 입니다.
+
+    Returns:
+        float: 정리된 각도 값입니다. shape은 scalar 입니다.
+    """
+    return float(np.arctan2(np.sin(angle), np.cos(angle)))
+
+
+def _compute_short_axis_heading_and_size(
+    polygon_xy: np.ndarray,
+) -> Tuple[np.ndarray, float, float, float]:
+    """polygon 경계에서 중심, 짧은 축 방향, 짧은 축 길이, 긴 축 길이를 구합니다.
+
+    Args:
+        polygon_xy: 원래 경계점입니다. shape은 ``[num_vertex, 2]`` 입니다.
+
+    Returns:
+        Tuple[np.ndarray, float, float, float]:
+            - center_xy: polygon 중심점입니다. shape은 ``[2]`` 입니다.
+            - short_heading: 짧은 축 방향입니다. shape은 scalar 입니다.
+            - short_length: 짧은 축 길이입니다. shape은 scalar 입니다.
+            - long_length: 긴 축 길이입니다. shape은 scalar 입니다.
+    """
+    if polygon_xy.shape[0] == 0:
+        return np.zeros(2, dtype=np.float32), 0.0, 0.0, 0.0
+
+    if polygon_xy.shape[0] > 1 and np.allclose(polygon_xy[0], polygon_xy[-1]):
+        polygon_xy = polygon_xy[:-1]
+
+    center_xy = polygon_xy.mean(axis=0).astype(np.float32)
+    if polygon_xy.shape[0] < 2:
+        return center_xy, 0.0, 0.0, 0.0
+
+    centered_xy = polygon_xy - center_xy[None]
+    closed_xy = np.concatenate([centered_xy, centered_xy[:1]], axis=0)
+    edge_xy = closed_xy[1:] - closed_xy[:-1]
+    edge_len = np.linalg.norm(edge_xy, axis=-1)
+    valid_mask = edge_len > 1e-6
+    if not valid_mask.any():
+        return center_xy, 0.0, 0.0, 0.0
+
+    candidate_angles = np.arctan2(edge_xy[valid_mask, 1], edge_xy[valid_mask, 0])
+    best_area = None
+    best_short_heading = 0.0
+    best_short_length = 0.0
+    best_long_length = 0.0
+    for angle in candidate_angles:
+        cos_val = np.cos(angle)
+        sin_val = np.sin(angle)
+        rot_mat = np.array(
+            [[cos_val, sin_val], [-sin_val, cos_val]],
+            dtype=np.float32,
+        )
+        local_xy = centered_xy @ rot_mat.T
+        extent_xy = local_xy.max(axis=0) - local_xy.min(axis=0)
+        area = float(extent_xy[0] * extent_xy[1])
+        if best_area is None or area < best_area:
+            best_area = area
+            if extent_xy[0] <= extent_xy[1]:
+                best_short_heading = angle
+                best_short_length = float(extent_xy[0])
+                best_long_length = float(extent_xy[1])
+            else:
+                best_short_heading = angle + np.pi / 2.0
+                best_short_length = float(extent_xy[1])
+                best_long_length = float(extent_xy[0])
+
+    return (
+        center_xy,
+        _normalize_angle_np(best_short_heading),
+        best_short_length,
+        best_long_length,
+    )
 _polygon_light_type = [
     "NO_LANE_STATE",
     "LANE_STATE_UNKNOWN",
@@ -141,75 +227,105 @@ def get_agent_features(
 
 
 def get_map_features(map_infos, tf_current_light, dim=2):
-    polygon_ids = [x["id"] for k in _polygon_types for x in map_infos[k]]
-    num_polygons = len(polygon_ids)
+    road_polygon_ids = [x["id"] for k in _road_polygon_types for x in map_infos[k]]
+    num_road_polygons = len(road_polygon_ids)
 
-    # initialization
-    polygon_type = torch.zeros(num_polygons, dtype=torch.uint8)
-    polygon_light_type = torch.zeros(num_polygons, dtype=torch.uint8)
-    point_position: List[Optional[torch.Tensor]] = [None] * num_polygons
-    # point_orientation: List[Optional[torch.Tensor]] = [None] * num_polygons
-    point_type: List[Optional[torch.Tensor]] = [None] * num_polygons
+    road_polygon_type = torch.zeros(num_road_polygons, dtype=torch.uint8)
+    road_polygon_light_type = torch.zeros(num_road_polygons, dtype=torch.uint8)
+    point_position: List[Optional[torch.Tensor]] = [None] * num_road_polygons
+    point_type: List[Optional[torch.Tensor]] = [None] * num_road_polygons
 
-    for _key in _polygon_types:
+    for _key in _road_polygon_types:
         for _seg in map_infos[_key]:
-            _idx = polygon_ids.index(_seg["id"])
+            _idx = road_polygon_ids.index(_seg["id"])
             centerline = map_infos["all_polylines"][
                 _seg["polyline_index"][0] : _seg["polyline_index"][1]
             ]
             centerline = torch.from_numpy(centerline).float()
-            polygon_type[_idx] = _polygon_types.index(_key)
 
+            road_polygon_type[_idx] = _polygon_types.index(_key)
             point_position[_idx] = centerline[:-1, :dim]
             center_vectors = centerline[1:] - centerline[:-1]
-            # point_orientation[_idx] = torch.cat(
-            #     [torch.atan2(center_vectors[:, 1], center_vectors[:, 0])], dim=0
-            # )
             point_type[_idx] = torch.full(
-                (len(center_vectors),), _seg["type"], dtype=torch.uint8
+                (len(center_vectors),),
+                _seg["type"],
+                dtype=torch.uint8,
             )
 
             if _key == "lane":
                 res = tf_current_light[tf_current_light["lane_id"] == _seg["id"]]
                 if len(res) != 0:
-                    polygon_light_type[_idx] = _polygon_light_type.index(
+                    road_polygon_light_type[_idx] = _polygon_light_type.index(
                         res["state"].item()
                     )
 
-    num_points = torch.tensor(
-        [point.size(0) for point in point_position], dtype=torch.long
-    )
-    point_to_polygon_edge_index = torch.stack(
-        [
-            torch.arange(num_points.sum(), dtype=torch.long),
-            torch.arange(num_polygons, dtype=torch.long).repeat_interleave(num_points),
-        ],
-        dim=0,
-    )
+    if len(point_position) == 0:
+        num_points = torch.tensor([], dtype=torch.long)
+        point_to_polygon_edge_index = torch.zeros((2, 0), dtype=torch.long)
+    else:
+        num_points = torch.tensor(
+            [point.size(0) for point in point_position], dtype=torch.long
+        )
+        point_to_polygon_edge_index = torch.stack(
+            [
+                torch.arange(num_points.sum(), dtype=torch.long),
+                torch.arange(num_road_polygons, dtype=torch.long).repeat_interleave(
+                    num_points
+                ),
+            ],
+            dim=0,
+        )
 
     map_data = {
         "map_polygon": {},
         "map_point": {},
         ("map_point", "to", "map_polygon"): {},
     }
-    map_data["map_polygon"]["num_nodes"] = num_polygons
-    map_data["map_polygon"]["type"] = polygon_type
-    map_data["map_polygon"]["light_type"] = polygon_light_type
+    map_data["map_polygon"]["num_nodes"] = num_road_polygons
+    map_data["map_polygon"]["type"] = road_polygon_type
+    map_data["map_polygon"]["light_type"] = road_polygon_light_type
+    map_data["map_point", "to", "map_polygon"]["edge_index"] = (
+        point_to_polygon_edge_index
+    )
+
     if len(num_points) == 0:
         map_data["map_point"]["num_nodes"] = 0
-        map_data["map_point"]["position"] = torch.tensor([], dtype=torch.float)
-        # map_data["map_point"]["orientation"] = torch.tensor([], dtype=torch.float)
-        map_data["map_point"]["type"] = torch.tensor([], dtype=torch.uint8)
+        map_data["map_point"]["position"] = torch.zeros((0, dim), dtype=torch.float32)
+        map_data["map_point"]["type"] = torch.zeros((0,), dtype=torch.uint8)
     else:
         map_data["map_point"]["num_nodes"] = num_points.sum().item()
         map_data["map_point"]["position"] = torch.cat(point_position, dim=0)
-        # map_data["map_point"]["orientation"] = wrap_angle(
-        #     torch.cat(point_orientation, dim=0)
-        # )
         map_data["map_point"]["type"] = torch.cat(point_type, dim=0)
-    map_data["map_point", "to", "map_polygon"][
-        "edge_index"
-    ] = point_to_polygon_edge_index
+
+    semantic_segments = [seg for key in _semantic_polygon_types for seg in map_infos[key]]
+    if len(semantic_segments) == 0:
+        map_data["semantic_polygon"] = {
+            "num_nodes": 0,
+            "position": torch.zeros((0, 2), dtype=torch.float32),
+            "orientation": torch.zeros((0,), dtype=torch.float32),
+            "size": torch.zeros((0, 2), dtype=torch.float32),
+            "type": torch.zeros((0,), dtype=torch.uint8),
+            "raw_boundary": [],
+        }
+    else:
+        map_data["semantic_polygon"] = {
+            "num_nodes": len(semantic_segments),
+            "position": torch.from_numpy(
+                np.stack([seg["center"] for seg in semantic_segments], axis=0)
+            ).to(torch.float32),
+            "orientation": torch.from_numpy(
+                np.array([seg["heading"] for seg in semantic_segments], dtype=np.float32)
+            ).to(torch.float32),
+            "size": torch.from_numpy(
+                np.stack([seg["size"] for seg in semantic_segments], axis=0)
+            ).to(torch.float32),
+            "type": torch.tensor(
+                [seg["semantic_type"] for seg in semantic_segments],
+                dtype=torch.uint8,
+            ),
+            "raw_boundary": [seg["raw_polygon"] for seg in semantic_segments],
+        }
+
     return map_data
 
 
@@ -384,23 +500,20 @@ def decode_map_features_from_proto(map_features):
 
 
         elif feature_data_type in _surface_point_type:
-            xyz = np.array([[p.x, p.y, p.z] for p in feature.polygon])
-            polygon_idx = np.linspace(0, xyz.shape[0], 4, endpoint=False, dtype=int)
-            pl_polygon = get_polylines_from_polygon(xyz[polygon_idx])
-            cur_info = {"id": mf.id, "type": _surface_point_type[feature_data_type]}
-
-            cur_polyline = np.stack(
-                [
-                    np.array([p[0], p[1], p[2], cur_info["type"], cur_info["id"]])
-                    for p in pl_polygon
-                ],
-                axis=0,
+            xy = np.array([[p.x, p.y] for p in feature.polygon], dtype=np.float32)
+            center_xy, short_heading, short_length, long_length = (
+                _compute_short_axis_heading_and_size(xy)
             )
-
-            cur_info["polyline_index"] = (point_cnt, point_cnt + len(cur_polyline))
+            cur_info = {
+                "id": mf.id,
+                "type": _surface_point_type[feature_data_type],
+                "semantic_type": _semantic_polygon_label[feature_data_type],
+                "raw_polygon": xy,
+                "center": center_xy,
+                "heading": np.float32(short_heading),
+                "size": np.array([short_length, long_length], dtype=np.float32),
+            }
             map_infos[feature_data_type].append(cur_info)
-            polylines.append(cur_polyline)
-            point_cnt += len(cur_polyline)
 
     for mf in map_features:
         feature_data_type = mf.WhichOneof("feature_data")
