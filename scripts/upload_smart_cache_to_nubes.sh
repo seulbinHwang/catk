@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # ---------------- CPU 분리 설정 ----------------
-CPUSET="0-31,64-95"
-NUM_CPUS=64
-NUM_CPUS_FOR_USE=32
+CPUSET="0-119"
+NUM_CPUS=120
+NUM_CPUS_FOR_USE=112
 
 export DP_MAX_CPUS=${NUM_CPUS}
 export OMP_NUM_THREADS=1
@@ -22,8 +22,8 @@ fi
 
 echo "[SMART_CACHE_UPLOAD] Using CPUSET=${CPUSET}, NUM_CPUS=${NUM_CPUS}"
 
-LOCAL_DIR="/media/user/E/dataset/womd_v1_3/SMART_cache"
-REMOTE_DIR="labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache"
+LOCAL_DIR="/media/user/E/dataset/womd_v1_3/SMART_cache_road"
+REMOTE_DIR="labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache_road"
 
 if [ ! -d "$LOCAL_DIR" ]; then
   echo "ERROR: Local directory not found: $LOCAL_DIR"
