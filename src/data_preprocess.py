@@ -12,6 +12,7 @@
 # its affiliates is strictly prohibited.
 
 import multiprocessing
+import os
 import pickle
 from argparse import ArgumentParser
 from functools import partial
@@ -20,6 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+# data_preprocess는 TFRecord I/O만 사용하므로 TensorFlow GPU 초기화를 막아
+# 호스트 CUDA/driver 조합에 따른 불필요한 에러 로그를 피합니다.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 import tensorflow as tf
 import torch
 from scipy.interpolate import interp1d
@@ -28,6 +35,11 @@ from waymo_open_dataset.protos import scenario_pb2
 
 from src.smart.utils.geometry import wrap_angle
 from src.smart.utils.preprocess import get_polylines_from_polygon, preprocess_map
+
+try:
+    tf.config.set_visible_devices([], "GPU")
+except (RuntimeError, ValueError):
+    pass
 
 # agent_types = {0: "vehicle", 1: "pedestrian", 2: "cyclist"}
 # agent_roles = {0: "ego_vehicle", 1: "interest", 2: "predict"}
