@@ -19,6 +19,20 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# multiprocessing worker 수를 크게 잡을 때 프로세스당 내부 스레드가 늘어나는 것을 막습니다.
+_THREAD_ENV_DEFAULTS = {
+    "OMP_NUM_THREADS": os.environ.get("CATK_OMP_NUM_THREADS", "1"),
+    "OPENBLAS_NUM_THREADS": os.environ.get("CATK_OPENBLAS_NUM_THREADS", "1"),
+    "MKL_NUM_THREADS": os.environ.get("CATK_MKL_NUM_THREADS", "1"),
+    "NUMEXPR_NUM_THREADS": os.environ.get("CATK_NUMEXPR_NUM_THREADS", "1"),
+    "VECLIB_MAXIMUM_THREADS": os.environ.get("CATK_VECLIB_MAXIMUM_THREADS", "1"),
+    "TF_NUM_INTRAOP_THREADS": os.environ.get("CATK_TF_INTRA_OP_THREADS", "1"),
+    "TF_NUM_INTEROP_THREADS": os.environ.get("CATK_TF_INTER_OP_THREADS", "1"),
+}
+for _env_name, _env_value in _THREAD_ENV_DEFAULTS.items():
+    os.environ[_env_name] = _env_value
+del _env_name, _env_value
+
 import numpy as np
 import pandas as pd
 
@@ -40,6 +54,83 @@ try:
     tf.config.set_visible_devices([], "GPU")
 except (RuntimeError, ValueError):
     pass
+
+_TF_RUNTIME_CONFIGURED = False
+
+
+def _read_nonnegative_int_env(var_name: str, default: int) -> int:
+    raw_value = os.environ.get(var_name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return max(0, int(raw_value))
+    except ValueError as exc:
+        raise RuntimeError(f"{var_name} must be an integer, got {raw_value!r}.") from exc
+
+
+def _configure_runtime() -> None:
+    global _TF_RUNTIME_CONFIGURED
+    if _TF_RUNTIME_CONFIGURED:
+        return
+
+    tf_intra_op_threads = max(
+        1, _read_nonnegative_int_env("CATK_TF_INTRA_OP_THREADS", 1)
+    )
+    tf_inter_op_threads = max(
+        1, _read_nonnegative_int_env("CATK_TF_INTER_OP_THREADS", 1)
+    )
+    torch_num_threads = max(1, _read_nonnegative_int_env("CATK_TORCH_NUM_THREADS", 1))
+    torch_num_interop_threads = max(
+        1, _read_nonnegative_int_env("CATK_TORCH_NUM_INTEROP_THREADS", 1)
+    )
+
+    try:
+        tf.config.set_visible_devices([], "GPU")
+    except (RuntimeError, ValueError):
+        pass
+
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(tf_intra_op_threads)
+    except RuntimeError:
+        pass
+
+    try:
+        tf.config.threading.set_inter_op_parallelism_threads(tf_inter_op_threads)
+    except RuntimeError:
+        pass
+
+    try:
+        torch.set_num_threads(torch_num_threads)
+    except RuntimeError:
+        pass
+
+    try:
+        torch.set_num_interop_threads(torch_num_interop_threads)
+    except RuntimeError:
+        pass
+
+    _TF_RUNTIME_CONFIGURED = True
+
+
+def _resolve_tf_num_parallel_reads(num_workers: int) -> int:
+    configured = _read_nonnegative_int_env("CATK_TF_NUM_PARALLEL_READS", 0)
+    if configured > 0:
+        return configured
+    return 1 if num_workers > 1 else 3
+
+
+def _get_tf_dataset_options() -> tf.data.Options:
+    options = tf.data.Options()
+    options.threading.private_threadpool_size = max(
+        1, _read_nonnegative_int_env("CATK_TF_PRIVATE_THREADPOOL_SIZE", 1)
+    )
+    options.threading.max_intra_op_parallelism = 1
+    return options
+
+
+def _init_preprocess_worker() -> None:
+    _configure_runtime()
+
 
 # agent_types = {0: "vehicle", 1: "pedestrian", 2: "cyclist"}
 # agent_roles = {0: "ego_vehicle", 1: "interest", 2: "predict"}
@@ -581,10 +672,20 @@ def decode_dynamic_map_states_from_proto(dynamic_map_states):
     return dynamic_map_infos
 
 
-def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
+def wm2argo(
+    file_path,
+    split,
+    output_dir,
+    output_dir_tfrecords_splitted,
+    tf_num_parallel_reads,
+):
+    _configure_runtime()
     dataset = tf.data.TFRecordDataset(
-        file_path, compression_type="", num_parallel_reads=3
+        file_path,
+        compression_type="",
+        num_parallel_reads=tf_num_parallel_reads,
     )
+    dataset = dataset.with_options(_get_tf_dataset_options())
     for tf_data in dataset:
         tf_data = tf_data.numpy()
         scenario = scenario_pb2.Scenario()
@@ -621,6 +722,7 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
 
 
 def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
+    _configure_runtime()
     output_dir = Path(output_dir)
     output_dir_tfrecords_splitted = None
     if split == "validation":
@@ -636,9 +738,10 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
         split=split,
         output_dir=output_dir,
         output_dir_tfrecords_splitted=output_dir_tfrecords_splitted,
+        tf_num_parallel_reads=_resolve_tf_num_parallel_reads(num_workers),
     )
 
-    with multiprocessing.Pool(num_workers) as p:
+    with multiprocessing.Pool(num_workers, initializer=_init_preprocess_worker) as p:
         r = list(tqdm(p.imap_unordered(func, packages), total=len(packages)))
 
 
