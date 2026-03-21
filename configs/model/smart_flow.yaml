@@ -6,7 +6,7 @@ model_config:
   lr_min_ratio: 0.01
   n_rollout_closed_val: 8
   n_batch_sim_agents_metric: 10
-  sim_agents_metric_workers: 1
+  sim_agents_metric_workers: 2
   sim_agents_context_cache_size: null
   sim_agents_agent_layout_cache_size: null
   n_vis_batch: 0
