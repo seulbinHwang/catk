@@ -35,7 +35,7 @@ model_config:
     head_dim: 15
     dropout: 0.1
     hist_drop_prob: 0.1
-    num_map_layers: 3
+    num_map_layers: 2
     num_agent_layers: 6
     pl2pl_radius: 10
     pl2a_radius: 30
@@ -45,7 +45,7 @@ model_config:
     num_future_steps: 80
     flow_dim: 96
     flow_num_chunk_heads: 4
-    flow_num_chunk_layers: 2
+    flow_num_chunk_layers: 1
     flow_solver_steps: 4
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
