@@ -183,6 +183,76 @@ _count_local_files() {
   find "$LOCAL_DIR" -type f 2>/dev/null | wc -l | awk '{print $1}'
 }
 
+_count_local_files_matching_manifest() {
+  local manifest_relpaths_path="$1"
+
+  if [[ ! -s "$manifest_relpaths_path" || ! -d "$LOCAL_DIR" ]]; then
+    echo "0"
+    return
+  fi
+
+  awk -v local_dir="$LOCAL_DIR" '
+    {
+      candidate = local_dir "/" $0
+      if ((getline < candidate) >= 0) {
+        count++
+      }
+      close(candidate)
+    }
+    END { print count + 0 }
+  ' "$manifest_relpaths_path"
+}
+
+_extract_manifest_relpaths() {
+  local manifest_path="$1"
+  local relpaths_path="$2"
+
+  awk -v remote_dir="$REMOTE_DIR" '
+    NR == 1 && $0 == "Path" { next }
+    NF == 0 { next }
+    {
+      path = $0
+      rel = path
+
+      remote_without_bucket = remote_dir
+      sub(/^[^\/]+\//, "", remote_without_bucket)
+
+      remote_base = remote_dir
+      sub(/^.*\//, "", remote_base)
+
+      if (path == remote_dir) {
+        rel = "."
+      } else if (index(path, remote_dir "/") == 1) {
+        rel = substr(path, length(remote_dir) + 2)
+      } else if (index(path, "/" remote_without_bucket "/") == 1) {
+        rel = substr(path, length(remote_without_bucket) + 3)
+      } else if (match(path, "/" remote_base "/")) {
+        rel = substr(path, RSTART + RLENGTH)
+      }
+
+      if (rel != "." && rel != "") {
+        print rel
+      }
+    }
+  ' "$manifest_path" | sort -u > "$relpaths_path"
+}
+
+_build_missing_relpaths() {
+  local manifest_relpaths_path="$1"
+  local missing_relpaths_path="$2"
+  local local_relpaths_path
+
+  local_relpaths_path="$(mktemp)"
+  if [[ -d "$LOCAL_DIR" ]]; then
+    find "$LOCAL_DIR" -type f -printf '%P\n' | sort -u > "$local_relpaths_path"
+  else
+    : > "$local_relpaths_path"
+  fi
+
+  comm -23 "$manifest_relpaths_path" "$local_relpaths_path" > "$missing_relpaths_path"
+  rm -f "$local_relpaths_path"
+}
+
 _print_progress() {
   local total_expected="$1"
   local current_count="$2"
@@ -225,19 +295,22 @@ _print_progress() {
 
 _monitor_progress() {
   local total_expected="$1"
-  local start_count="$2"
+  local manifest_relpaths_path="$2"
   local start_epoch="$3"
   local current_count
 
   while true; do
     sleep "$PROGRESS_INTERVAL_SEC"
-    current_count=$(_count_local_files)
-    _print_progress "$total_expected" "$current_count" "$start_count" "$start_epoch"
+    current_count=$(_count_local_files_matching_manifest "$manifest_relpaths_path")
+    _print_progress "$total_expected" "$current_count" "$START_COUNT" "$start_epoch"
   done
 }
 
 manifest_path="$(mktemp)"
+manifest_relpaths_path="$(mktemp)"
+missing_relpaths_path="$(mktemp)"
 monitor_pid=""
+START_COUNT=0
 
 cleanup() {
   if [[ -n "$monitor_pid" ]]; then
@@ -245,6 +318,8 @@ cleanup() {
     wait "$monitor_pid" 2>/dev/null || true
   fi
   rm -f "$manifest_path"
+  rm -f "$manifest_relpaths_path"
+  rm -f "$missing_relpaths_path"
 }
 trap cleanup EXIT
 
@@ -253,22 +328,26 @@ _run_pinned nubescli list "$REMOTE_DIR" -R -o -f > "$manifest_path"
 echo "[LIST] reading remote object list from $REMOTE_DIR [end]"
 
 if [[ -s "$manifest_path" ]]; then
-  total_expected=$(awk 'NR == 1 && $0 == "Path" {next} NF {count++} END {print count + 0}' "$manifest_path")
+  _extract_manifest_relpaths "$manifest_path" "$manifest_relpaths_path"
+  total_expected=$(awk 'END {print NR + 0}' "$manifest_relpaths_path")
 else
   total_expected=0
 fi
-start_count=$(_count_local_files)
+_build_missing_relpaths "$manifest_relpaths_path" "$missing_relpaths_path"
+missing_count=$(awk 'END {print NR + 0}' "$missing_relpaths_path")
+start_count=$(( total_expected - missing_count ))
+START_COUNT="$start_count"
 start_epoch=$(date +%s)
 
-echo "[PRECHECK] total_expected=${total_expected}, already_existing=${start_count}, missing=$(( total_expected - start_count ))"
+echo "[PRECHECK] total_expected=${total_expected}, already_existing=${start_count}, missing=${missing_count}"
 _print_progress "$total_expected" "$start_count" "$start_count" "$start_epoch"
 
-if [[ "$start_count" -ge "$total_expected" ]]; then
+if [[ "$missing_count" -eq 0 ]]; then
   echo "[DOWNLOAD] skipped because all files already exist under $LOCAL_DIR"
   exit 0
 fi
 
-_monitor_progress "$total_expected" "$start_count" "$start_epoch" &
+_monitor_progress "$total_expected" "$manifest_relpaths_path" "$start_epoch" &
 monitor_pid=$!
 
 echo "[DOWNLOAD] NUBES SMART_cache missing files -> $LOCAL_DIR [start]"
@@ -280,6 +359,6 @@ _run_pinned nubescli dir-download \
   --no-progress
 echo "[DOWNLOAD] NUBES SMART_cache missing files -> $LOCAL_DIR [end]"
 
-final_count=$(_count_local_files)
+final_count=$(_count_local_files_matching_manifest "$manifest_relpaths_path")
 _print_progress "$total_expected" "$final_count" "$start_count" "$start_epoch"
 echo "Download complete."
