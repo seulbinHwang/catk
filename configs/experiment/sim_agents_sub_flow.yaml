@@ -42,6 +42,6 @@ data:
   train_batch_size: 4
   val_batch_size: 4
   test_batch_size: 4
-  num_workers: 8
+  num_workers: 4
   shuffle: false
   pin_memory: false
