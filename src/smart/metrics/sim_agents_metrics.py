@@ -19,7 +19,7 @@ import multiprocessing as mp
 import os
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -83,12 +83,8 @@ _REQUIRED_2025_BUCKET_FIELDS = {
 _WORKER_SIM_AGENTS_CONFIG: sim_agents_metrics_pb2.SimAgentMetricsConfig | None = None
 _WORKER_EGO_ONLY = False
 _TF_RUNTIME_CONFIGURED = False
-_SCENARIO_CONTEXT_CACHE: Dict[tuple[str, bool], "_PreparedScenarioContext"] = collections.OrderedDict()
-_AGENT_LAYOUT_CACHE: Dict[
-    tuple[str, bool, tuple[int, ...]], "_PreparedAgentLayout"
-] = collections.OrderedDict()
-_SCENARIO_CONTEXT_CACHE_MAX_SIZE: Optional[int] = None
-_AGENT_LAYOUT_CACHE_MAX_SIZE: Optional[int] = None
+_SCENARIO_CONTEXT_CACHE: Dict[tuple[str, bool], "_PreparedScenarioContext"] = {}
+_AGENT_LAYOUT_CACHE: Dict[tuple[str, bool, tuple[int, ...]], "_PreparedAgentLayout"] = {}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,6 +112,11 @@ class _PreparedAgentLayout:
     evaluated_object_mask: tf.Tensor
 
 
+def _clear_sim_agents_caches() -> None:
+    _SCENARIO_CONTEXT_CACHE.clear()
+    _AGENT_LAYOUT_CACHE.clear()
+
+
 def _read_nonnegative_int_env(var_name: str, default: int) -> int:
     raw_value = os.environ.get(var_name, "").strip()
     if not raw_value:
@@ -124,69 +125,6 @@ def _read_nonnegative_int_env(var_name: str, default: int) -> int:
         return max(0, int(raw_value))
     except ValueError as exc:
         raise RuntimeError(f"{var_name} must be an integer, got {raw_value!r}.") from exc
-
-
-def _resolve_cache_max_size(
-    configured_size: Optional[int],
-    cache_name: str,
-) -> Optional[int]:
-    if configured_size is None:
-        return None
-
-    try:
-        cache_size = int(configured_size)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"{cache_name} must be an integer or null, got {configured_size!r}.") from exc
-
-    if cache_size < 0:
-        raise RuntimeError(f"{cache_name} must be >= 0 or null, got {configured_size!r}.")
-    return cache_size
-
-
-def _trim_lru_cache(cache, max_size: Optional[int]) -> None:
-    if max_size is None:
-        return
-    while len(cache) > max_size:
-        cache.popitem(last=False)
-
-
-def _get_from_lru_cache(cache, key):
-    cached = cache.get(key)
-    if cached is None:
-        return None
-    cache.move_to_end(key)
-    return cached
-
-
-def _put_into_lru_cache(cache, key, value, max_size: Optional[int]) -> None:
-    if max_size == 0:
-        return
-    if key in cache:
-        cache.move_to_end(key)
-    cache[key] = value
-    _trim_lru_cache(cache, max_size)
-
-
-def _configure_sim_agents_caches(
-    scenario_context_cache_size: Optional[int],
-    agent_layout_cache_size: Optional[int],
-) -> None:
-    global _SCENARIO_CONTEXT_CACHE_MAX_SIZE, _AGENT_LAYOUT_CACHE_MAX_SIZE
-    _SCENARIO_CONTEXT_CACHE_MAX_SIZE = _resolve_cache_max_size(
-        scenario_context_cache_size,
-        "sim_agents_context_cache_size",
-    )
-    _AGENT_LAYOUT_CACHE_MAX_SIZE = _resolve_cache_max_size(
-        agent_layout_cache_size,
-        "sim_agents_agent_layout_cache_size",
-    )
-    _trim_lru_cache(_SCENARIO_CONTEXT_CACHE, _SCENARIO_CONTEXT_CACHE_MAX_SIZE)
-    _trim_lru_cache(_AGENT_LAYOUT_CACHE, _AGENT_LAYOUT_CACHE_MAX_SIZE)
-
-
-def _clear_sim_agents_caches() -> None:
-    _SCENARIO_CONTEXT_CACHE.clear()
-    _AGENT_LAYOUT_CACHE.clear()
 
 
 def _configure_tensorflow_runtime() -> None:
@@ -434,7 +372,7 @@ def _load_scenario_context(
     ego_only: bool,
 ) -> _PreparedScenarioContext:
     cache_key = (scenario_file, ego_only)
-    cached = _get_from_lru_cache(_SCENARIO_CONTEXT_CACHE, cache_key)
+    cached = _SCENARIO_CONTEXT_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -453,12 +391,7 @@ def _load_scenario_context(
         scenario=scenario,
         challenge_type=_SIM_AGENTS_2025_CHALLENGE_TYPE,
     )
-    _put_into_lru_cache(
-        _SCENARIO_CONTEXT_CACHE,
-        cache_key,
-        prepared,
-        _SCENARIO_CONTEXT_CACHE_MAX_SIZE,
-    )
+    _SCENARIO_CONTEXT_CACHE[cache_key] = prepared
     return prepared
 
 
@@ -470,7 +403,7 @@ def _load_agent_layout(
 ) -> _PreparedAgentLayout:
     agent_ids_tuple = tuple(int(x) for x in agent_id)
     cache_key = (scenario_file, ego_only, agent_ids_tuple)
-    cached = _get_from_lru_cache(_AGENT_LAYOUT_CACHE, cache_key)
+    cached = _AGENT_LAYOUT_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
@@ -508,12 +441,7 @@ def _load_agent_layout(
         reordered_indices=reordered_indices,
         evaluated_object_mask=evaluated_object_mask,
     )
-    _put_into_lru_cache(
-        _AGENT_LAYOUT_CACHE,
-        cache_key,
-        prepared,
-        _AGENT_LAYOUT_CACHE_MAX_SIZE,
-    )
+    _AGENT_LAYOUT_CACHE[cache_key] = prepared
     return prepared
 
 
@@ -959,21 +887,12 @@ def _compute_scenario_metrics(
     )
 
 
-def _init_sim_agents_metrics_worker(
-    config_bytes: bytes,
-    ego_only: bool,
-    scenario_context_cache_size: Optional[int],
-    agent_layout_cache_size: Optional[int],
-) -> None:
+def _init_sim_agents_metrics_worker(config_bytes: bytes, ego_only: bool) -> None:
     global _WORKER_SIM_AGENTS_CONFIG, _WORKER_EGO_ONLY
     _WORKER_SIM_AGENTS_CONFIG = sim_agents_metrics_pb2.SimAgentMetricsConfig()
     _WORKER_SIM_AGENTS_CONFIG.ParseFromString(config_bytes)
     _WORKER_EGO_ONLY = ego_only
     _clear_sim_agents_caches()
-    _configure_sim_agents_caches(
-        scenario_context_cache_size=scenario_context_cache_size,
-        agent_layout_cache_size=agent_layout_cache_size,
-    )
     _configure_tensorflow_runtime()
 
 
@@ -984,15 +903,18 @@ def _compute_scenario_metrics_worker(
     if _WORKER_SIM_AGENTS_CONFIG is None:
         raise RuntimeError("Sim Agents metrics worker was used before it was initialized.")
 
-    scenario_rollout = sim_agents_submission_pb2.ScenarioRollouts()
-    scenario_rollout.ParseFromString(scenario_rollout_bytes)
-    scenario_metrics = _compute_scenario_metrics(
-        config=_WORKER_SIM_AGENTS_CONFIG,
-        scenario_file=scenario_file,
-        scenario_rollout=scenario_rollout,
-        ego_only=_WORKER_EGO_ONLY,
-    )
-    return scenario_metrics.SerializeToString()
+    try:
+        scenario_rollout = sim_agents_submission_pb2.ScenarioRollouts()
+        scenario_rollout.ParseFromString(scenario_rollout_bytes)
+        scenario_metrics = _compute_scenario_metrics(
+            config=_WORKER_SIM_AGENTS_CONFIG,
+            scenario_file=scenario_file,
+            scenario_rollout=scenario_rollout,
+            ego_only=_WORKER_EGO_ONLY,
+        )
+        return scenario_metrics.SerializeToString()
+    finally:
+        _clear_sim_agents_caches()
 
 
 def _compute_scenario_metrics_from_arrays_worker(
@@ -1005,15 +927,18 @@ def _compute_scenario_metrics_from_arrays_worker(
     if _WORKER_SIM_AGENTS_CONFIG is None:
         raise RuntimeError("Sim Agents metrics worker was used before it was initialized.")
 
-    scenario_metrics = _compute_scenario_metrics_from_arrays(
-        config=_WORKER_SIM_AGENTS_CONFIG,
-        context=_load_scenario_context(scenario_file, _WORKER_EGO_ONLY),
-        agent_id=agent_id,
-        pred_traj=pred_traj,
-        pred_z=pred_z,
-        pred_head=pred_head,
-    )
-    return scenario_metrics.SerializeToString()
+    try:
+        scenario_metrics = _compute_scenario_metrics_from_arrays(
+            config=_WORKER_SIM_AGENTS_CONFIG,
+            context=_load_scenario_context(scenario_file, _WORKER_EGO_ONLY),
+            agent_id=agent_id,
+            pred_traj=pred_traj,
+            pred_z=pred_z,
+            pred_head=pred_head,
+        )
+        return scenario_metrics.SerializeToString()
+    finally:
+        _clear_sim_agents_caches()
 
 
 def _resolve_sim_agents_metric_workers(configured_workers: int) -> int:
@@ -1047,14 +972,7 @@ def _get_sim_agents_mp_context() -> mp.context.BaseContext:
 class SimAgentsMetrics(Metric):
     """Waymo 공식 2025 Sim Agents 평가기를 torchmetrics 형태로 감싼 클래스입니다."""
 
-    def __init__(
-        self,
-        prefix: str,
-        ego_only: bool = False,
-        max_workers: int = 4,
-        scenario_context_cache_size: Optional[int] = None,
-        agent_layout_cache_size: Optional[int] = None,
-    ) -> None:
+    def __init__(self, prefix: str, ego_only: bool = False, max_workers: int = 4) -> None:
         super().__init__()
         self.prefix = prefix
         self.ego_only = ego_only
@@ -1076,18 +994,6 @@ class SimAgentsMetrics(Metric):
         self.add_state("scenario_counter", default=tensor(0.0), dist_reduce_fx="sum")
         self._max_workers = _resolve_sim_agents_metric_workers(max_workers)
         self._max_pending_futures = max(self._max_workers * 4, self._max_workers)
-        self._scenario_context_cache_size = _resolve_cache_max_size(
-            scenario_context_cache_size,
-            "sim_agents_context_cache_size",
-        )
-        self._agent_layout_cache_size = _resolve_cache_max_size(
-            agent_layout_cache_size,
-            "sim_agents_agent_layout_cache_size",
-        )
-        _configure_sim_agents_caches(
-            scenario_context_cache_size=self._scenario_context_cache_size,
-            agent_layout_cache_size=self._agent_layout_cache_size,
-        )
         self._executor: cf.ProcessPoolExecutor | None = None
         self._pending_futures: Dict[cf.Future[bytes], int] = {}
         self._completed_results: Dict[int, bytes] = {}
@@ -1117,12 +1023,7 @@ class SimAgentsMetrics(Metric):
             max_workers=self._max_workers,
             mp_context=_get_sim_agents_mp_context(),
             initializer=_init_sim_agents_metrics_worker,
-            initargs=(
-                self._worker_config_bytes,
-                self.ego_only,
-                self._scenario_context_cache_size,
-                self._agent_layout_cache_size,
-            ),
+            initargs=(self._worker_config_bytes, self.ego_only),
         )
 
     def _shutdown_executor(self) -> None:
@@ -1172,6 +1073,7 @@ class SimAgentsMetrics(Metric):
             self._completed_results.clear()
         self._next_submission_index = 0
         self._next_result_index = 0
+        _clear_sim_agents_caches()
 
     def _update_metric_states(
         self,
@@ -1266,14 +1168,17 @@ class SimAgentsMetrics(Metric):
             return
 
         if self._max_workers <= 1 or len(scenario_rollouts) == 1:
-            for scenario_file, scenario_rollout in zip(scenario_files, scenario_rollouts):
-                scenario_metrics = self._compute_scenario_metrics(
-                    self.sim_agents_config,
-                    scenario_file,
-                    scenario_rollout,
-                    self.ego_only,
-                )
-                self._update_metric_states(scenario_metrics)
+            try:
+                for scenario_file, scenario_rollout in zip(scenario_files, scenario_rollouts):
+                    scenario_metrics = self._compute_scenario_metrics(
+                        self.sim_agents_config,
+                        scenario_file,
+                        scenario_rollout,
+                        self.ego_only,
+                    )
+                    self._update_metric_states(scenario_metrics)
+            finally:
+                _clear_sim_agents_caches()
             return
 
         self._ensure_executor()
@@ -1290,6 +1195,7 @@ class SimAgentsMetrics(Metric):
         self._drain_completed_futures(wait=False)
         while len(self._pending_futures) > self._max_pending_futures:
             self._drain_completed_futures(wait=True)
+        _clear_sim_agents_caches()
 
     @staticmethod
     def build_prediction_payloads(
@@ -1338,16 +1244,19 @@ class SimAgentsMetrics(Metric):
         self._update_count += 1
 
         if self._max_workers <= 1 or len(scenario_payloads) == 1:
-            for scenario_file, scenario_agent_id, scenario_pred_traj, scenario_pred_z, scenario_pred_head in scenario_payloads:
-                scenario_metrics = _compute_scenario_metrics_from_arrays(
-                    config=self.sim_agents_config,
-                    context=_load_scenario_context(scenario_file, self.ego_only),
-                    agent_id=scenario_agent_id,
-                    pred_traj=scenario_pred_traj,
-                    pred_z=scenario_pred_z,
-                    pred_head=scenario_pred_head,
-                )
-                self._update_metric_states(scenario_metrics)
+            try:
+                for scenario_file, scenario_agent_id, scenario_pred_traj, scenario_pred_z, scenario_pred_head in scenario_payloads:
+                    scenario_metrics = _compute_scenario_metrics_from_arrays(
+                        config=self.sim_agents_config,
+                        context=_load_scenario_context(scenario_file, self.ego_only),
+                        agent_id=scenario_agent_id,
+                        pred_traj=scenario_pred_traj,
+                        pred_z=scenario_pred_z,
+                        pred_head=scenario_pred_head,
+                    )
+                    self._update_metric_states(scenario_metrics)
+            finally:
+                _clear_sim_agents_caches()
             return
 
         self._ensure_executor()
@@ -1367,6 +1276,7 @@ class SimAgentsMetrics(Metric):
         self._drain_completed_futures(wait=False)
         while len(self._pending_futures) > self._max_pending_futures:
             self._drain_completed_futures(wait=True)
+        _clear_sim_agents_caches()
 
     def update_from_prediction_tensors(
         self,
