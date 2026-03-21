@@ -11,8 +11,8 @@ export NUMEXPR_NUM_THREADS=1
 export BLIS_NUM_THREADS=1
 # ------------------------------------------------------------------------
 
-REMOTE_DIR="${1:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache}}"
-LOCAL_DIR="${2:-${LOCAL_DIR:-/workspace/womd_v1_3/SMART_cache}}"
+REMOTE_DIR="${1:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache_road_real}}"
+LOCAL_DIR="${2:-${LOCAL_DIR:-/mnt/nuplan/womd_v1_3/SMART_cache_road}}"
 
 if ! command -v nubescli >/dev/null 2>&1; then
   echo "ERROR: nubescli not found in PATH"
