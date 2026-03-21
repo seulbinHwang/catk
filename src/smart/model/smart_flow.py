@@ -54,6 +54,16 @@ class SMARTFlow(LightningModule):
         self.sim_agents_metrics = SimAgentsMetrics(
             "val_closed",
             max_workers=model_config.sim_agents_metric_workers,
+            scenario_context_cache_size=getattr(
+                model_config,
+                "sim_agents_context_cache_size",
+                None,
+            ),
+            agent_layout_cache_size=getattr(
+                model_config,
+                "sim_agents_agent_layout_cache_size",
+                None,
+            ),
         )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
 
