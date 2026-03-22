@@ -33,6 +33,7 @@ class EpochLastCheckpointCallback(Callback):
         self._resume_validation_pending = False
         self._resume_validation_epoch: int | None = None
         self._resume_check_val_every_n_epoch: Any = _CHECK_VAL_INTERVAL_UNSET
+        self._post_validation_save_epoch: int | None = None
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:
@@ -78,6 +79,7 @@ class EpochLastCheckpointCallback(Callback):
         self._resume_validation_pending = self._pending_validation
         self._resume_validation_epoch = self._pending_validation_epoch
         self._resume_check_val_every_n_epoch = _CHECK_VAL_INTERVAL_UNSET
+        self._post_validation_save_epoch = None
 
     def _save_checkpoint(self, trainer: Trainer, *, pending_validation: bool) -> None:
         self._pending_validation = pending_validation
@@ -186,6 +188,7 @@ class EpochLastCheckpointCallback(Callback):
         if self._is_last_train_batch(trainer, batch_idx) and self._should_run_validation_after_epoch(
             trainer
         ):
+            self._post_validation_save_epoch = None
             self._save_checkpoint(trainer, pending_validation=True)
 
     def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
@@ -206,10 +209,21 @@ class EpochLastCheckpointCallback(Callback):
     def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         del pl_module
         self._restore_forced_validation_interval(trainer)
-        if trainer.sanity_checking or self._already_saved_for_epoch(trainer):
+        current_epoch = int(trainer.current_epoch)
+        if (
+            self._post_validation_save_epoch is not None
+            and current_epoch != int(self._post_validation_save_epoch)
+        ):
+            self._post_validation_save_epoch = None
+
+        needs_post_validation_save = self._post_validation_save_epoch == current_epoch
+        if trainer.sanity_checking or (
+            self._already_saved_for_epoch(trainer) and not needs_post_validation_save
+        ):
             return
 
         self._save_checkpoint(trainer, pending_validation=False)
+        self._post_validation_save_epoch = None
 
     def on_validation_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         del pl_module
@@ -223,5 +237,4 @@ class EpochLastCheckpointCallback(Callback):
         self._pending_validation = False
         self._pending_validation_epoch = None
         self._clear_resume_validation_state(trainer)
-        if should_persist_completed_validation:
-            self._save_checkpoint(trainer, pending_validation=False)
+        self._post_validation_save_epoch = int(trainer.current_epoch) if should_persist_completed_validation else None
