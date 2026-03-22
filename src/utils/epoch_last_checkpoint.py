@@ -112,6 +112,37 @@ class EpochLastCheckpointCallback(Callback):
     def _already_saved_for_epoch(self, trainer: Trainer) -> bool:
         return self._last_saved_epoch == int(trainer.current_epoch)
 
+    @staticmethod
+    def _has_validation_batches(trainer: Trainer) -> bool:
+        num_val_batches = getattr(trainer, "num_val_batches", None)
+        if isinstance(num_val_batches, list):
+            return sum(num_val_batches) > 0
+        if isinstance(num_val_batches, (int, float)):
+            return not math.isinf(num_val_batches) and num_val_batches > 0
+
+        limit_val_batches = getattr(trainer, "limit_val_batches", None)
+        if isinstance(limit_val_batches, (int, float)):
+            return limit_val_batches > 0
+
+        return True
+
+    @staticmethod
+    def _should_run_validation_after_epoch(trainer: Trainer) -> bool:
+        check_val_every_n_epoch = getattr(trainer, "check_val_every_n_epoch", 1)
+        if check_val_every_n_epoch is None:
+            return False
+        if int(check_val_every_n_epoch) <= 0:
+            return False
+
+        val_check_interval = getattr(trainer, "val_check_interval", 1.0)
+        if val_check_interval != 1.0:
+            return False
+
+        if not EpochLastCheckpointCallback._has_validation_batches(trainer):
+            return False
+
+        return (int(trainer.current_epoch) + 1) % int(check_val_every_n_epoch) == 0
+
     def _restore_forced_validation_interval(self, trainer: Trainer) -> None:
         if self._resume_check_val_every_n_epoch is _CHECK_VAL_INTERVAL_UNSET:
             return
@@ -152,7 +183,9 @@ class EpochLastCheckpointCallback(Callback):
 
         # Save before fit-time validation begins so epoch_last.ckpt stays resumable
         # at the latest training state even when validation runs before epoch end hooks.
-        if self._is_last_train_batch(trainer, batch_idx):
+        if self._is_last_train_batch(trainer, batch_idx) and self._should_run_validation_after_epoch(
+            trainer
+        ):
             self._save_checkpoint(trainer, pending_validation=True)
 
     def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
@@ -183,6 +216,12 @@ class EpochLastCheckpointCallback(Callback):
         if trainer.sanity_checking:
             return
 
+        should_persist_completed_validation = self._pending_validation and (
+            self._pending_validation_epoch is None
+            or int(trainer.current_epoch) == int(self._pending_validation_epoch)
+        )
         self._pending_validation = False
         self._pending_validation_epoch = None
         self._clear_resume_validation_state(trainer)
+        if should_persist_completed_validation:
+            self._save_checkpoint(trainer, pending_validation=False)
