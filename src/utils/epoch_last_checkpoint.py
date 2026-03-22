@@ -8,6 +8,8 @@ from typing import Any
 import wandb
 from lightning import Callback, LightningModule, Trainer
 
+_CHECK_VAL_INTERVAL_UNSET = object()
+
 
 class EpochLastCheckpointCallback(Callback):
     """Save a single latest-epoch checkpoint and optionally upload it to W&B."""
@@ -26,6 +28,15 @@ class EpochLastCheckpointCallback(Callback):
         self.upload_to_wandb = upload_to_wandb
         self.artifact_name = artifact_name
         self._last_saved_epoch: int | None = None
+        self._pending_validation = False
+        self._pending_validation_epoch: int | None = None
+        self._resume_validation_pending = False
+        self._resume_validation_epoch: int | None = None
+        self._resume_check_val_every_n_epoch: Any = _CHECK_VAL_INTERVAL_UNSET
+
+    @staticmethod
+    def _optional_int(value: Any) -> int | None:
+        return None if value is None else int(value)
 
     @staticmethod
     def _get_wandb_logger(trainer: Trainer):
@@ -51,7 +62,28 @@ class EpochLastCheckpointCallback(Callback):
     def _checkpoint_path(self) -> Path:
         return self.dirpath / self.filename
 
-    def _save_checkpoint(self, trainer: Trainer) -> None:
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "last_saved_epoch": self._last_saved_epoch,
+            "pending_validation": self._pending_validation,
+            "pending_validation_epoch": self._pending_validation_epoch,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._last_saved_epoch = self._optional_int(state_dict.get("last_saved_epoch"))
+        self._pending_validation = bool(state_dict.get("pending_validation", False))
+        self._pending_validation_epoch = self._optional_int(
+            state_dict.get("pending_validation_epoch")
+        )
+        self._resume_validation_pending = self._pending_validation
+        self._resume_validation_epoch = self._pending_validation_epoch
+        self._resume_check_val_every_n_epoch = _CHECK_VAL_INTERVAL_UNSET
+
+    def _save_checkpoint(self, trainer: Trainer, *, pending_validation: bool) -> None:
+        self._pending_validation = pending_validation
+        self._pending_validation_epoch = (
+            int(trainer.current_epoch) if pending_validation else None
+        )
         self.dirpath.mkdir(parents=True, exist_ok=True)
         checkpoint_path = self._checkpoint_path()
         trainer.save_checkpoint(checkpoint_path, weights_only=self.save_weights_only)
@@ -79,6 +111,18 @@ class EpochLastCheckpointCallback(Callback):
 
     def _already_saved_for_epoch(self, trainer: Trainer) -> bool:
         return self._last_saved_epoch == int(trainer.current_epoch)
+
+    def _restore_forced_validation_interval(self, trainer: Trainer) -> None:
+        if self._resume_check_val_every_n_epoch is _CHECK_VAL_INTERVAL_UNSET:
+            return
+
+        trainer.check_val_every_n_epoch = self._resume_check_val_every_n_epoch
+        self._resume_check_val_every_n_epoch = _CHECK_VAL_INTERVAL_UNSET
+
+    def _clear_resume_validation_state(self, trainer: Trainer) -> None:
+        self._restore_forced_validation_interval(trainer)
+        self._resume_validation_pending = False
+        self._resume_validation_epoch = None
 
     @staticmethod
     def _is_last_train_batch(trainer: Trainer, batch_idx: int) -> bool:
@@ -109,11 +153,36 @@ class EpochLastCheckpointCallback(Callback):
         # Save before fit-time validation begins so epoch_last.ckpt stays resumable
         # at the latest training state even when validation runs before epoch end hooks.
         if self._is_last_train_batch(trainer, batch_idx):
-            self._save_checkpoint(trainer)
+            self._save_checkpoint(trainer, pending_validation=True)
+
+    def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        del pl_module
+        if trainer.sanity_checking or not self._resume_validation_pending:
+            return
+
+        if self._resume_validation_epoch is not None and int(trainer.current_epoch) != int(
+            self._resume_validation_epoch
+        ):
+            self._clear_resume_validation_state(trainer)
+            return
+
+        if self._resume_check_val_every_n_epoch is _CHECK_VAL_INTERVAL_UNSET:
+            self._resume_check_val_every_n_epoch = trainer.check_val_every_n_epoch
+        trainer.check_val_every_n_epoch = 1
 
     def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         del pl_module
+        self._restore_forced_validation_interval(trainer)
         if trainer.sanity_checking or self._already_saved_for_epoch(trainer):
             return
 
-        self._save_checkpoint(trainer)
+        self._save_checkpoint(trainer, pending_validation=False)
+
+    def on_validation_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        del pl_module
+        if trainer.sanity_checking:
+            return
+
+        self._pending_validation = False
+        self._pending_validation_epoch = None
+        self._clear_resume_validation_state(trainer)
