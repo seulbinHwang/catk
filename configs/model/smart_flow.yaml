@@ -52,9 +52,9 @@ model_config:
   sim_agents_submission:
     is_active: false
     method_name: "SMART-flow-7M"
-    authors: [Anonymous]
-    affiliation: YOUR_AFFILIATION
-    description: YOUR_DESCRIPTION
-    method_link: YOUR_METHOD_LINK
-    account_name: YOUR_ACCOUNT_NAME
+    authors: [Seulbin Hwang, Kiyoung Om]
+    affiliation: NaverLabs
+    description: Flow-based generative model for simulating realistic agents.
+    method_link: "not available yet"
+    account_name: "h.sb@naverlabs.com"
   finetune: false
