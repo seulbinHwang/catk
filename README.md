@@ -450,6 +450,17 @@ torchrun \
 
 `configs/experiment/sim_agents_sub_flow.yaml`은 WOSAC 2025 / Waymo 2025 Sim Agents submission export용 설정입니다.  
 예전 `wosac_sub_flow` 대신 이 config를 사용합니다.  
+이 config는 local scorer를 돌리는 설정이 아니라 **submission format tar.gz를 만드는 설정**입니다.  
+validation split에 대해 submission 형식 결과물을 만들고 싶으면 `action=validate`, test split에 대해 최종 제출 파일을 만들고 싶으면 `action=test`를 사용하면 됩니다.  
+즉, validation과 test의 차이는 주로 `action`과 읽는 split이고, 최종 산출물 포맷은 동일합니다.  
+반대로 `configs/experiment/local_val_flow.yaml`은 validation 점수 계산용이므로 submission tar.gz가 필요할 때는 쓰지 않습니다.
+
+`sim_agents_sub_flow`의 기본 의도:
+
+- `sim_agents_submission.is_active=true` 라서 submission export 모드로 동작합니다.
+- `n_batch_sim_agents_metric=0` 이라 local WOSAC / Sim Agents 점수는 계산하지 않습니다.
+- `trainer.limit_val_batches=1.0`, `trainer.limit_test_batches=1.0`, `data.shuffle=false` 라서 전체 split export용 기본값이 이미 잡혀 있습니다.
+
 제출 전 아래 항목은 반드시 채워야 합니다.
 
 - `ckpt_path`
@@ -460,7 +471,17 @@ torchrun \
 - `model.model_config.sim_agents_submission.method_link`
 - `model.model_config.sim_agents_submission.account_name`
 
+실무적으로 `ckpt_path`에는 아래 중 하나를 넣으면 됩니다.
+
+- 마지막 상태를 내고 싶으면 `last.ckpt` 또는 `epoch_last.ckpt`
+- 가장 좋은 checkpoint를 내고 싶으면 monitored `epoch_XXX.ckpt`
+
 ### 7.1 validation split으로 submission 형식 점검
+
+validation split은 GT가 있는 split이지만, **아래 명령은 점수 계산용이 아니라 submission format export용**입니다.  
+즉, validation split 전체를 읽어서 `sim_agents_2025_submission.tar.gz`를 만들어 주며, local 점수까지 같이 보고 싶다면 `local_val_flow`를 별도로 한 번 더 실행해야 합니다.
+
+빠르게 1 GPU로 형식만 확인하고 싶으면:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -482,7 +503,47 @@ python -m src.run \
   model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
 ```
 
-### 7.2 test split submission export
+### 7.2 validation split 전체를 6 GPU로 submission export
+
+학습을 6 GPU로 했고 validation split 전체를 DDP로 submission 형식 출력하고 싶다면 아래처럼 실행하면 됩니다.  
+이 명령을 그대로 따라 하면 validation split 전체를 6 GPU로 shard해서 중복 없이 처리한 뒤, 최종적으로 validation 기준 submission tar.gz를 생성합니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=sim_agents_sub_flow \
+  action=validate \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path=/path/to/model.ckpt \
+  task_name=flow_sim_agents_val_ddp6 \
+  trainer.limit_val_batches=1.0 \
+  model.model_config.val_open_loop=false \
+  model.model_config.val_closed_loop=true \
+  model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
+  model.model_config.sim_agents_submission.authors=[Anonymous] \
+  model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
+  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
+  model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
+```
+
+위 명령의 의미:
+
+- `action=validate` 이므로 validation split을 읽습니다.
+- `trainer=ddp`, `trainer.devices=6` 이므로 6 GPU가 validation set을 분산 처리합니다.
+- `trainer.limit_val_batches=1.0` 이므로 validation split 전체를 끝까지 돕니다.
+- `model.model_config.val_open_loop=false` 이므로 open-loop 계산은 생략하고 submission format export에 필요한 closed-loop rollout만 수행합니다.
+- `model.model_config.val_closed_loop=true` 이므로 submission에 필요한 rollout은 유지합니다.
+
+### 7.3 test split submission export
+
+최종 WOSAC / Sim Agents 제출용 test split tar.gz를 만들고 싶다면 아래처럼 `action=test`를 사용합니다.  
+validation export와 비교하면 핵심 차이는 `action=test`라는 점뿐입니다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
@@ -509,6 +570,17 @@ torchrun \
 
 - `logs/<task_name>/runs/<timestamp>/sim_agents_2025_submission/`
 - `logs/<task_name>/runs/<timestamp>/sim_agents_2025_submission.tar.gz`
+
+validation export와 test export 모두 동일한 위치와 형식으로 저장됩니다.  
+차이는 어떤 split을 읽었는지뿐입니다.
+
+주의:
+
+- `sim_agents_sub_flow`는 submission export용이라 `val_closed/sim_agents_2025/*` 같은 local 점수는 계산하지 않습니다.
+- validation 점수와 submission tar.gz가 둘 다 필요하면 `local_val_flow`로 점수 계산을 한 번, `sim_agents_sub_flow`로 export를 한 번 따로 실행해야 합니다.
+- 기본 `n_rollout_closed_val=32`는 submission format 쪽 기본값이라 웬만하면 그대로 두는 편이 안전합니다.
+- OOM이 나면 먼저 `data.val_batch_size=4 -> 2 -> 1` 또는 `data.test_batch_size=4 -> 2 -> 1` 순으로 줄이는 게 안전합니다.
+- validation split export는 포맷 점검이나 내부 검수용으로 좋고, 실제 challenge 업로드는 보통 test split tar.gz를 사용합니다.
 
 ## 8. Visualization
 
@@ -564,6 +636,15 @@ WOSAC 2025 test submission 전:
 - submission metadata 6개 필드 확인
 - `experiment=sim_agents_sub_flow` 확인
 
+WOSAC 2025 validation submission export 전:
+
+- `validation/` 캐시 존재
+- `validation_tfrecords_splitted/` 존재
+- `ckpt_path` 확인
+- submission metadata 6개 필드 확인
+- `experiment=sim_agents_sub_flow action=validate` 확인
+- `trainer.limit_val_batches=1.0` 확인
+
 ## 10. 자주 쓰는 명령 모음
 
 ### 캐시 생성
@@ -590,4 +671,10 @@ CUDA_VISIBLE_DEVICES=0 python -m src.run experiment=local_val_flow trainer=defau
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=sim_agents_sub_flow action=test trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/model.ckpt task_name=flow_sim_agents_test
+```
+
+### validation submission export
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=sim_agents_sub_flow action=validate trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/model.ckpt task_name=flow_sim_agents_val_ddp6 trainer.limit_val_batches=1.0 model.model_config.val_open_loop=false model.model_config.val_closed_loop=true
 ```
