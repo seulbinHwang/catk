@@ -520,7 +520,7 @@ torchrun \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
   ckpt_path=/path/to/model.ckpt \
-  task_name=flow_sim_agents_val_ddp6 \
+  task_name=flow_sim_agents_val_ddp6_step_16 \
   trainer.limit_val_batches=1.0 \
   model.model_config.val_open_loop=false \
   model.model_config.val_closed_loop=true \
@@ -529,7 +529,8 @@ torchrun \
   model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
   model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
   model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
-  model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
+  model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME" \
+  paths.log_dir=/workspace/exp_logs
 ```
 
 위 명령의 의미:
@@ -559,11 +560,7 @@ torchrun \
   ckpt_path=/path/to/model.ckpt \
   task_name=flow_sim_agents_test \
   model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
-  model.model_config.sim_agents_submission.authors=[Anonymous] \
-  model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
-  model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
-  model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
+  paths.log_dir=/workspace/exp_logs
 ```
 
 출력물:
