@@ -29,11 +29,11 @@
 conda create -n catk python=3.11.9 -y
 conda activate catk
 
-pip install --upgrade pip
-pip install -r install/requirements.txt
-pip install torch_geometric
-pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
-pip install --no-cache-dir --no-deps waymo-open-dataset-tf-2-12-0==1.6.7
+python -m pip install --upgrade pip
+python -m pip install -r install/requirements.txt
+python -m pip install torch_geometric
+python -m pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
+python -m pip install --no-cache-dir --no-deps waymo-open-dataset-tf-2-12-0==1.6.7
 ```
 
 `ffmpeg`는 visualization용으로 필요합니다.
@@ -596,17 +596,21 @@ secrets/waymo/waymo_storage_state.json
 준비:
 
 ```bash
-pip install -r install/requirements.txt
+python -m pip install -r install/requirements.txt
 python -m playwright install chromium
 ```
 
 GUI가 있는 PC에서 세션 저장:
 
 ```bash
-python scripts/waymo_save_storage_state.py
+python scripts/waymo_save_storage_state.py --browser-channel chrome
 ```
 
 기본 저장 위치는 `secrets/waymo/waymo_storage_state.json` 입니다.  
+로그인용 브라우저 프로필은 기본적으로 **매 실행마다 새 임시 디렉터리로 생성되고 종료 시 정리됩니다.**  
+Google 계정 로그인은 Playwright 번들 Chromium보다 **설치된 Chrome/Edge stable 채널**에서 더 잘 동작하므로, GUI PC에서는 `--browser-channel chrome` 또는 `--browser-channel msedge` 사용을 권장합니다.  
+`--user-data-dir` 를 직접 주고 싶다면 Playwright 전용의 빈 디렉터리로 두는 편이 안전하며, **평소 쓰는 기본 Chrome 프로필 경로를 직접 지정하지 않는 편이 좋습니다.**  
+예전 실행에서 만든 프로필 디렉터리를 재사용하다가 Chrome이 바로 종료되면, `--user-data-dir` 를 빼고 다시 실행해서 새 임시 프로필을 쓰면 됩니다.  
 GUI PC와 서버가 같은 git working tree를 공유하지 않으면, 이 파일만 서버의 같은 경로로 복사하면 됩니다.
 
 자동 업로드까지 포함한 validation 예시:
