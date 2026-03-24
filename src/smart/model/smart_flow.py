@@ -308,6 +308,9 @@ class SMARTFlow(LightningModule):
             Tensor:
                 현재 모델 장치 위의 0 스칼라입니다.
         """
+        trainable_zero_terms = [p.sum() * 0.0 for p in self.parameters() if p.requires_grad]
+        if len(trainable_zero_terms) > 0:
+            return torch.stack(trainable_zero_terms).sum()
         return next(self.parameters()).sum() * 0.0
 
     def _run_am_rollout(self, anchor_hidden_valid: Tensor) -> Dict[str, object]:
