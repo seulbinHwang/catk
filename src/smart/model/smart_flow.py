@@ -82,11 +82,10 @@ class SMARTFlow(LightningModule):
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
-        self.validation_rollout_sampling = getattr(
-            model_config,
-            "validation_rollout_sampling",
-            getattr(model_config, "eval_sampling_noise"),
-        )
+        self.eval_sampling_noise = getattr(model_config, "eval_sampling_noise", None)
+        if self.eval_sampling_noise is None:
+            self.eval_sampling_noise = getattr(model_config, "validation_rollout_sampling")
+        self.validation_rollout_sampling = self.eval_sampling_noise
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
                 "ADE2s": WeightedMeanMetric(),
@@ -949,7 +948,7 @@ class SMARTFlow(LightningModule):
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
-                sampling_scheme=self.validation_rollout_sampling,
+                sampling_noise=self.eval_sampling_noise,
                 scenario_sampling_seeds=scenario_sampling_seeds,
             )
             return (
@@ -983,7 +982,7 @@ class SMARTFlow(LightningModule):
             rollout_cache=expanded_rollout_cache,
             tokenized_agent=expanded_tokenized_agent,
             map_feature=expanded_map_feature,
-            sampling_scheme=self.validation_rollout_sampling,
+            sampling_noise=self.eval_sampling_noise,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
         )
         return (
@@ -1237,7 +1236,7 @@ class SMARTFlow(LightningModule):
             open_pred_clean_norm = self.encoder.sample_open_loop_future(
                 anchor_hidden=denoise_pred["anchor_hidden"],
                 anchor_mask=denoise_pred["anchor_mask"],
-                sampling_scheme=self.validation_rollout_sampling,
+                sampling_noise=self.eval_sampling_noise,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
             )
             open_metric_dict = self._build_open_loop_metric_dict(

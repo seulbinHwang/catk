@@ -895,8 +895,9 @@ AM fine-tuning에서는 validation에서 아래만 사용합니다.
 
 - `model.model_config.val_open_loop=true`
 - `model.model_config.val_closed_loop=true`
-- `model.model_config.eval_sampling_noise.sample_steps=16`
-- `model.model_config.eval_sampling_noise.sample_method=midpoint`
+- `model.model_config.eval_sampling_noise.noise_scale=1.0`
+- `model.model_config.decoder.flow_solver_steps=16`
+- `model.model_config.decoder.flow_solver_method=midpoint`
 
 즉, stochastic training rollout은 **학습 loss를 만들 때** 쓰고,
 validation은 **고정 seed 기반 open-loop / closed-loop 경로**를 함께 사용합니다.

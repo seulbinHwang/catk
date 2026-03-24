@@ -203,6 +203,18 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         return recent_motion
 
+    @staticmethod
+    def _resolve_sampling_noise(
+        sampling_noise: DictConfig | None = None,
+        sampling_scheme: DictConfig | None = None,
+    ) -> DictConfig:
+        if sampling_noise is not None and sampling_scheme is not None and sampling_noise is not sampling_scheme:
+            raise ValueError("Pass only one of sampling_noise or sampling_scheme.")
+        resolved_sampling_noise = sampling_noise if sampling_noise is not None else sampling_scheme
+        if resolved_sampling_noise is None:
+            raise ValueError("sampling_noise is required.")
+        return resolved_sampling_noise
+
 
     def _pack_anchor_hidden(
         self,
@@ -254,15 +266,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
     def sample_open_loop_future_from_hidden(
         self,
         anchor_hidden_valid: torch.Tensor,
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
         sampling_seed: int | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> torch.Tensor:
         """이미 압축된 anchor 문맥에서 바로 2초 미래를 만듭니다.
 
         Args:
             anchor_hidden_valid: 유효 anchor만 모은 문맥입니다.
                 shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_noise: 평가 rollout용 초기 잡음 설정입니다.
             sampling_seed: 같은 seed에서 같은 출발 잡음을 만들기 위한 값입니다.
 
         Returns:
@@ -272,28 +285,34 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         """
         return self._sample_open_loop_future_from_hidden(
             anchor_hidden_valid=anchor_hidden_valid,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
+            sampling_scheme=sampling_scheme,
         )
 
     def _sample_open_loop_future_from_hidden(
         self,
         anchor_hidden_valid: torch.Tensor,
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
         sampling_seed: int | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
         Args:
             anchor_hidden_valid: 유효 anchor만 모은 문맥입니다.
                 shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_noise: 평가 rollout용 초기 잡음 설정입니다.
             sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
 
         Returns:
             torch.Tensor: 생성된 정규화 2초 미래입니다.
                 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
+        sampling_noise = SMARTFlowAgentDecoder._resolve_sampling_noise(
+            sampling_noise=sampling_noise,
+            sampling_scheme=sampling_scheme,
+        )
         if anchor_hidden_valid.numel() == 0:
             return anchor_hidden_valid.new_zeros((0, 20, 4))
 
@@ -309,30 +328,19 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             device=anchor_hidden_valid.device,
             dtype=anchor_hidden_valid.dtype,
             generator=generator,
-        ) * getattr(sampling_scheme, "noise_scale", 1.0)
-        flow_sample_steps = getattr(
-            sampling_scheme,
-            "sample_steps",
-            self.flow_ode.solver_steps,
-        )
-        flow_sample_method = getattr(
-            sampling_scheme,
-            "sample_method",
-            self.flow_ode.solver_method,
-        )
+        ) * getattr(sampling_noise, "noise_scale", 1.0)
         return self.flow_ode.generate(
             x_init=x_init_norm,
             model_fn=lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau),
-            steps=flow_sample_steps,
-            method=flow_sample_method,
         )
 
     def sample_open_loop_future(
         self,
         anchor_hidden: torch.Tensor,
         anchor_mask: torch.Tensor,
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
         sampling_seed: int | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
@@ -341,7 +349,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
             anchor_mask: 실제로 평가할 anchor 여부입니다.
                 shape은 ``[n_agent, 13]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_noise: 평가 rollout용 초기 잡음 설정입니다.
             sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
 
         Returns:
@@ -351,8 +359,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
         return self._sample_open_loop_future_from_hidden(
             anchor_hidden_valid=anchor_hidden_valid,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
+            sampling_scheme=sampling_scheme,
         )
 
 
@@ -362,10 +371,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         tape_steps: int,
         device: torch.device,
         dtype: torch.dtype,
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         agent_batch: torch.Tensor | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
 
@@ -374,7 +384,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tape_steps: 긴 잡음 테이프의 시간 길이입니다.
             device: 잡음 테이프를 만들 장치입니다.
             dtype: 잡음 테이프 자료형입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_noise: 평가 rollout용 초기 잡음 설정입니다.
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
@@ -386,7 +396,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 각 agent가 rollout 전체에서 공유할 긴 Gaussian 잡음입니다.
                 shape은 ``[n_agent, tape_steps, 4]`` 입니다.
         """
-        noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
+        sampling_noise = SMARTFlowAgentDecoder._resolve_sampling_noise(
+            sampling_noise=sampling_noise,
+            sampling_scheme=sampling_scheme,
+        )
+        noise_scale = float(getattr(sampling_noise, "noise_scale", 1.0))
         if num_agent == 0:
             return torch.zeros((0, tape_steps, 4), device=device, dtype=dtype)
 
@@ -696,9 +710,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         rollout_cache: Dict[str, object],
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -706,7 +721,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             rollout_cache: ``prepare_inference_cache`` 가 만든 원본 캐시입니다.
             tokenized_agent: 평가용 토큰 사전입니다.
             map_feature: 한 번 인코딩한 지도 특징 사전입니다.
-            sampling_scheme: 샘플링 설정입니다.
+            sampling_noise: 평가 rollout용 초기 잡음 설정입니다.
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 고정 난수 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
@@ -715,6 +730,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             Dict[str, torch.Tensor]:
                 한 번의 rollout 결과입니다. 기존 inference 반환과 같은 키를 가집니다.
         """
+        sampling_noise = SMARTFlowAgentDecoder._resolve_sampling_noise(
+            sampling_noise=sampling_noise,
+            sampling_scheme=sampling_scheme,
+        )
         state = self._clone_rollout_cache(rollout_cache)
 
         n_agent = int(state["n_agent"])
@@ -759,7 +778,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tape_steps=n_step_future_10hz + sample_window_steps - self.shift,
             device=feat_a_now.device,
             dtype=feat_a_now.dtype,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             agent_batch=tokenized_agent["batch"],
@@ -837,21 +856,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     active_mask,
                     noise_start : noise_start + sample_window_steps,
                 ].contiguous()
-                flow_sample_steps = getattr(
-                    sampling_scheme,
-                    "sample_steps",
-                    self.flow_ode.solver_steps,
-                )
-                flow_sample_method = getattr(
-                    sampling_scheme,
-                    "sample_method",
-                    self.flow_ode.solver_method,
-                )
                 y_hat_norm = self.flow_ode.generate(
                     x_init=x_init_norm,
                     model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
-                    steps=flow_sample_steps,
-                    method=flow_sample_method,
                 )
                 commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
                     y_hat_norm=y_hat_norm,
@@ -950,7 +957,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> Dict[str, torch.Tensor]:
         rollout_cache = self.prepare_inference_cache(
             tokenized_agent=tokenized_agent,
@@ -960,5 +968,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            sampling_noise=sampling_noise,
             sampling_scheme=sampling_scheme,
         )

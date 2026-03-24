@@ -124,17 +124,19 @@ class SMARTFlowDecoder(nn.Module):
         rollout_cache: Dict[str, object],
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            sampling_scheme=sampling_scheme,
         )
 
 
@@ -142,8 +144,9 @@ class SMARTFlowDecoder(nn.Module):
         self,
         anchor_hidden: Tensor,
         anchor_mask: Tensor,
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
         sampling_seed: int | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -152,7 +155,7 @@ class SMARTFlowDecoder(nn.Module):
                 shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
             anchor_mask: 실제로 평가할 anchor 여부입니다.
                 shape은 ``[n_agent, 13]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_noise: 평가 rollout용 초기 잡음 설정입니다.
             sampling_seed: validation마다 같은 샘플을 만들기 위한 고정 seed입니다.
 
         Returns:
@@ -162,8 +165,9 @@ class SMARTFlowDecoder(nn.Module):
         return self.agent_encoder.sample_open_loop_future(
             anchor_hidden=anchor_hidden,
             anchor_mask=anchor_mask,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
+            sampling_scheme=sampling_scheme,
         )
 
     def pack_anchor_hidden(
@@ -189,15 +193,16 @@ class SMARTFlowDecoder(nn.Module):
     def sample_open_loop_future_from_hidden(
         self,
         anchor_hidden_valid: Tensor,
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
         sampling_seed: int | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> Tensor:
         """압축된 anchor 문맥에서 바로 2초 미래를 생성합니다.
 
         Args:
             anchor_hidden_valid: 유효 anchor만 모은 문맥입니다.
                 shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_noise: 평가 rollout용 초기 잡음 설정입니다.
             sampling_seed: 같은 seed에서 같은 출발 잡음을 만들기 위한 값입니다.
 
         Returns:
@@ -207,15 +212,17 @@ class SMARTFlowDecoder(nn.Module):
         """
         return self.agent_encoder.sample_open_loop_future_from_hidden(
             anchor_hidden_valid=anchor_hidden_valid,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
+            sampling_scheme=sampling_scheme,
         )
 
     def inference(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig | None = None,
+        sampling_scheme: DictConfig | None = None,
     ) -> Dict[str, Tensor]:
         map_feature = self.encode_map(tokenized_map)
         rollout_cache = self.prepare_inference_cache(tokenized_agent, map_feature)
@@ -223,5 +230,6 @@ class SMARTFlowDecoder(nn.Module):
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            sampling_noise=sampling_noise,
             sampling_scheme=sampling_scheme,
         )
