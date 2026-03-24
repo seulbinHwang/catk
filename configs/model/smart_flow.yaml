@@ -24,9 +24,7 @@ model_config:
     agent_token_sampling:
       num_k: 1
       temp: 1.0
-  validation_rollout_sampling:
-    sample_steps: 16
-    sample_method: midpoint
+  eval_sampling_noise:
     noise_scale: 1.0
   decoder:
     hidden_dim: 128
@@ -46,7 +44,7 @@ model_config:
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 1
-    flow_solver_steps: 4
+    flow_solver_steps: 16
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
   sim_agents_submission:

@@ -15,9 +15,7 @@ model:
     val_open_loop: true
     val_closed_loop: true
     n_rollout_closed_val: 32
-    validation_rollout_sampling:
-      sample_steps: 16
-      sample_method: midpoint
+    eval_sampling_noise:
       noise_scale: 1.0
 
 ckpt_path: YOUR_MODEL.ckpt
