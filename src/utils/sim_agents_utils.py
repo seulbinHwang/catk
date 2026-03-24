@@ -74,7 +74,10 @@ def get_scenario_rollouts(
                 )
             )
 
-        _str_scenario_id = np.bytes_(scenario_id_np[i_scenario][scenario_id_np[i_scenario] > 0]).tobytes().decode("ascii")
+        scenario_id_bytes = bytes(
+            int(value) for value in scenario_id_np[i_scenario] if int(value) > 0
+        )
+        _str_scenario_id = scenario_id_bytes.decode("ascii")
         scenario_rollouts.append(
             sim_agents_submission_pb2.ScenarioRollouts(
                 joint_scenes=joint_scenes, scenario_id=_str_scenario_id
@@ -87,10 +90,15 @@ def get_scenario_rollouts(
 def get_scenario_id_int_tensor(scenario_id: List[str], device: torch.device) -> Tensor:
     scenario_id_int_tensor = []
     for str_id in scenario_id:
-        int_id = [-1] * 16  # max_len of scenario_id string is 16
-        for i, c in enumerate(str_id):
-            int_id[i] = ord(c)
+        encoded = str_id.encode("ascii")
+        int_id = [0] * 16  # max_len of scenario_id string is 16
+        if len(encoded) > len(int_id):
+            raise ValueError(
+                f"Scenario id {str_id!r} is longer than the supported {len(int_id)} bytes."
+            )
+        for i, value in enumerate(encoded):
+            int_id[i] = value
         scenario_id_int_tensor.append(
-            torch.tensor(int_id, dtype=torch.int32, device=device)
+            torch.tensor(int_id, dtype=torch.uint8, device=device)
         )
     return torch.stack(scenario_id_int_tensor, dim=0)  # [n_scenario, 16]

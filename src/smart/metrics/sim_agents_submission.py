@@ -23,7 +23,7 @@ from torchmetrics.metric import Metric
 from waymo_open_dataset.protos import sim_agents_submission_pb2
 
 from src.utils import RankedLogger
-from src.utils.sim_agents_utils import get_scenario_id_int_tensor
+from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
 log = RankedLogger(__name__, rank_zero_only=False)
 _SIM_AGENTS_2025_SUBMISSION_DIRNAME = "sim_agents_2025_submission"
@@ -42,7 +42,9 @@ class SimAgentsSubmission(Metric):
         method_link: str,
         account_name: str,
     ) -> None:
-        super().__init__()
+        # Evaluation data is already sharded exactly once per rank by ExactDistributedSampler.
+        # Submission export must therefore stay rank-local and only pack shards together at epoch end.
+        super().__init__(sync_on_compute=False)
         self.is_active = is_active
         if self.is_active:
             self.method_name = method_name
@@ -77,7 +79,6 @@ class SimAgentsSubmission(Metric):
         pred_traj: Tensor,
         pred_z: Tensor,
         pred_head: Tensor,
-        global_rank: int,
     ) -> None:
         _device = pred_traj.device
         self.agent_id.append(agent_id)
@@ -85,21 +86,24 @@ class SimAgentsSubmission(Metric):
         self.pred_traj.append(pred_traj)
         self.pred_z.append(pred_z)
         self.pred_head.append(pred_head)
-
-        batch_size = len(scenario_id)
-        batch_offset = batch_size * global_rank
-        if dist.is_available() and dist.is_initialized():
-            local_batch_size = agent_batch.new_tensor([batch_size], dtype=agent_batch.dtype)
-            gathered_batch_sizes = [local_batch_size.clone() for _ in range(dist.get_world_size())]
-            dist.all_gather(gathered_batch_sizes, local_batch_size)
-            batch_offset = sum(
-                int(batch_size_tensor.item())
-                for batch_size_tensor in gathered_batch_sizes[:global_rank]
-            )
-        self.agent_batch.append(agent_batch + batch_offset)
+        self.agent_batch.append(agent_batch)
 
     def compute(self) -> Dict[str, Tensor]:
         return {k: getattr(self, k) for k in self.data_keys}
+
+    def aggregate_current_batch(self) -> List[sim_agents_submission_pb2.ScenarioRollouts]:
+        local_batch = self.compute()
+        for key, value in local_batch.items():
+            if isinstance(value, list):
+                if len(value) != 1:
+                    raise RuntimeError(
+                        f"Expected a single local submission state for {key}, got {len(value)}."
+                    )
+                local_batch[key] = value[0]
+        scenario_rollouts = get_scenario_rollouts(**local_batch)
+        self.aggregate_rollouts(scenario_rollouts)
+        self.reset()
+        return scenario_rollouts
 
     def aggregate_rollouts(
         self, scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts]
@@ -113,8 +117,12 @@ class SimAgentsSubmission(Metric):
 
     def save_sub_file(self) -> None:
         self._save_shard()
-        self.i_file = 0
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
         tar_file_name = self.submission_dir.as_posix() + ".tar.gz"
+        if self._get_global_rank() != 0:
+            return
 
         shard_files = sorted([p.as_posix() for p in self.submission_dir.glob("*")])
         if len(shard_files) == 0:
@@ -126,9 +134,10 @@ class SimAgentsSubmission(Metric):
             for output_filename in shard_files:
                 tar.add(
                     output_filename,
-                    arcname=output_filename + f"-of-{len(shard_files):05d}",
+                    arcname=Path(output_filename).name + f"-of-{len(shard_files):05d}",
                 )
         log.info(f"DONE: Saved Sim Agents 2025 submission files to {tar_file_name}")
+        self.i_file = 0
 
     def _save_shard(self) -> None:
         if len(self.buffer_scenario_rollouts) == 0:
@@ -149,9 +158,17 @@ class SimAgentsSubmission(Metric):
             num_model_parameters="7M",
             acknowledge_complies_with_closed_loop_requirement=True,
         )
-        output_filename = self.submission_dir / f"submission.binproto-{self.i_file:05d}"
+        output_filename = self.submission_dir / (
+            f"submission-rank{self._get_global_rank():02d}-{self.i_file:05d}.binproto"
+        )
         log.info(f"Saving Sim Agents 2025 submission shard to {output_filename}")
         with open(output_filename, "wb") as f:
             f.write(shard_submission.SerializeToString())
         self.i_file += 1
         self.buffer_scenario_rollouts = []
+
+    @staticmethod
+    def _get_global_rank() -> int:
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+        return 0
