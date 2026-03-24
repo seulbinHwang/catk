@@ -144,7 +144,7 @@ class SMARTFlowDecoder(nn.Module):
                 shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
             anchor_mask: 실제로 평가할 anchor 여부입니다.
                 shape은 ``[n_agent, 13]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_scheme: validation 샘플링 잡음 설정입니다.
             sampling_seed: validation마다 같은 샘플을 만들기 위한 고정 seed입니다.
 
         Returns:
