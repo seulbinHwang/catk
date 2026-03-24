@@ -36,6 +36,7 @@ from src.utils import (
     log_hyperparameters,
     print_config_tree,
 )
+from src.utils.trainer_config import maybe_enable_ddp_find_unused_parameters
 from src.utils.waymo_submission import (
     cleanup_prepared_waymo_storage_state,
     maybe_prepare_waymo_storage_state,
@@ -101,6 +102,7 @@ def run(cfg: DictConfig) -> None:
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
 
     _configure_wandb_checkpoint_upload(cfg)
+    maybe_enable_ddp_find_unused_parameters(cfg)
 
     log.info(f"Instantiating loggers...")
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
