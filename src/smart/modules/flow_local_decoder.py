@@ -61,9 +61,20 @@ class FlowODE:
             return 1.0
         return 1.0 - self.sigma_min
 
-    def _sigma_t(self, tau: torch.Tensor) -> torch.Tensor:
+    def sigma_t(self, tau: torch.Tensor) -> torch.Tensor:
+        """현재 OT path에서 ``x_0`` 앞에 곱해지는 계수를 계산합니다.
+
+        Args:
+            tau: 생성 진행률입니다. shape은 ``[batch]`` 입니다.
+
+        Returns:
+            torch.Tensor: 각 샘플의 ``sigma_t`` 입니다. shape은 ``[batch]`` 입니다.
+        """
         beta = self._beta()
         return 1.0 - beta * tau
+
+    def _sigma_t(self, tau: torch.Tensor) -> torch.Tensor:
+        return self.sigma_t(tau)
 
     def sample(self, clean: torch.Tensor, target_type: str = "velocity") -> FlowSample:
         if target_type != "velocity":
@@ -90,6 +101,37 @@ class FlowODE:
         beta = self._beta()
         sigma_t = self._sigma_t(tau).view(-1, 1, 1)
         return beta * x_t + sigma_t * velocity
+
+    def drift_from_velocity(
+        self,
+        x_t: torch.Tensor,
+        velocity: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> torch.Tensor:
+        """AM stochastic rollout에 쓰는 drift 를 계산합니다.
+
+        Args:
+            x_t: 현재 상태입니다. shape은 ``[batch, 20, 4]`` 입니다.
+            velocity: velocity field 값입니다. shape은 ``[batch, 20, 4]`` 입니다.
+            tau: 현재 진행률입니다. shape은 ``[batch]`` 입니다.
+
+        Returns:
+            torch.Tensor: drift 입니다. shape은 ``[batch, 20, 4]`` 입니다.
+        """
+        tau_view = tau.view(-1, 1, 1).clamp_min(self.eps)
+        return 2.0 * velocity - x_t / tau_view
+
+    def memoryless_sigma(self, tau: torch.Tensor) -> torch.Tensor:
+        """Adjoint Matching fine-tuning에 맞는 memoryless noise 크기를 계산합니다.
+
+        Args:
+            tau: 현재 진행률입니다. shape은 ``[batch]`` 입니다.
+
+        Returns:
+            torch.Tensor: 각 샘플의 noise scale 입니다. shape은 ``[batch]`` 입니다.
+        """
+        sigma_t = self._sigma_t(tau)
+        return torch.sqrt((2.0 * sigma_t).clamp_min(0.0) / tau.clamp_min(self.eps))
 
     def generate(
         self,
@@ -281,6 +323,25 @@ class FlowVelocityHead(nn.Module):
         return self.net(step_tokens)
 
 
+class ResidualFlowVelocityHead(nn.Module):
+    """Fine-tuning 때만 움직이는 작은 residual velocity head 입니다."""
+
+    def __init__(self, flow_dim: int, bottleneck_dim: int | None = None) -> None:
+        super().__init__()
+        hidden_dim = flow_dim // 2 if bottleneck_dim is None else bottleneck_dim
+        self.net = nn.Sequential(
+            nn.LayerNorm(flow_dim),
+            nn.Linear(flow_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 4),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, step_tokens: torch.Tensor) -> torch.Tensor:
+        return self.net(step_tokens)
+
+
 class HierarchicalFlowDecoder(nn.Module):
     def __init__(
         self,
@@ -303,6 +364,62 @@ class HierarchicalFlowDecoder(nn.Module):
             num_heads=num_chunk_heads,
         )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
+        self.residual_velocity_head = ResidualFlowVelocityHead(flow_dim=flow_dim)
+
+    def _build_step_tokens(
+        self,
+        anchor_hidden: torch.Tensor,
+        x_t_norm: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> torch.Tensor:
+        """Velocity head 직전의 step feature 를 만듭니다.
+
+        Args:
+            anchor_hidden: anchor 문맥입니다. shape은 ``[batch, hidden_dim]`` 입니다.
+            x_t_norm: 현재 noisy trajectory 입니다. shape은 ``[batch, 20, 4]`` 입니다.
+            tau: 생성 진행률입니다. shape은 ``[batch]`` 입니다.
+
+        Returns:
+            torch.Tensor: 정제된 step feature 입니다. shape은 ``[batch, 20, flow_dim]`` 입니다.
+        """
+        context = self.context_projector(anchor_hidden)
+        step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
+
+        for block in self.chunk_mixers:
+            chunk_tokens = block(chunk_tokens, context, tau_emb)
+
+        return self.step_refiner(step_tokens, chunk_tokens, context)
+
+    def forward_components(
+        self,
+        anchor_hidden: torch.Tensor,
+        x_t_norm: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Base velocity 와 residual velocity 를 함께 계산합니다.
+
+        Args:
+            anchor_hidden: anchor 문맥입니다. shape은 ``[batch, hidden_dim]`` 입니다.
+            x_t_norm: 현재 noisy trajectory 입니다. shape은 ``[batch, 20, 4]`` 입니다.
+            tau: 생성 진행률입니다. shape은 ``[batch]`` 입니다.
+
+        Returns:
+            dict[str, torch.Tensor]: 아래 키를 담은 사전입니다.
+                - ``velocity``: base와 residual을 더한 최종 velocity 입니다.
+                  shape은 ``[batch, 20, 4]`` 입니다.
+                - ``base_velocity``: base velocity 입니다. shape은 ``[batch, 20, 4]`` 입니다.
+                - ``residual_velocity``: residual velocity 입니다. shape은 ``[batch, 20, 4]`` 입니다.
+                - ``step_tokens``: 마지막 step feature 입니다. shape은 ``[batch, 20, flow_dim]`` 입니다.
+        """
+        step_tokens = self._build_step_tokens(anchor_hidden, x_t_norm, tau)
+        base_velocity = self.velocity_head(step_tokens)
+        residual_velocity = self.residual_velocity_head(step_tokens)
+        return {
+            "velocity": base_velocity + residual_velocity,
+            "base_velocity": base_velocity,
+            "residual_velocity": residual_velocity,
+            "step_tokens": step_tokens,
+        }
 
     def forward(
         self,
@@ -310,14 +427,7 @@ class HierarchicalFlowDecoder(nn.Module):
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
     ) -> torch.Tensor:
-        context = self.context_projector(anchor_hidden)
-        step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
-
-        for block in self.chunk_mixers:
-            chunk_tokens = block(chunk_tokens, context, tau_emb)
-
-        step_tokens = self.step_refiner(step_tokens, chunk_tokens, context)
-        return self.velocity_head(step_tokens)
+        return self.forward_components(anchor_hidden, x_t_norm, tau)["velocity"]
 
 
 class ContinuousCommitBridge:

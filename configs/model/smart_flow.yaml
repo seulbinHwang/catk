@@ -4,6 +4,8 @@ model_config:
   lr_warmup_steps: 2
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.01
+  weight_decay: 0.01
+  lr_scheduler_unit: epoch
   n_rollout_closed_val: 8
   n_batch_sim_agents_metric: 10
   sim_agents_metric_workers: 3
@@ -55,4 +57,11 @@ model_config:
     description: Flow-based generative model for simulating realistic agents.
     method_link: "not available yet"
     account_name: "h.sb@naverlabs.com"
-  finetune: false
+  finetune:
+    enabled: false
+    mode: adjoint_matching
+    rollout_steps: 16
+    rollout_noise_scale: 1.0
+    feasible_weight: 1.0
+    smooth_deadzone_epsilon: [0.01, 0.01, 0.01]
+    smooth_deadzone_tau: 0.002

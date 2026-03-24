@@ -71,6 +71,34 @@ class SMARTFlowDecoder(nn.Module):
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
         return self.map_encoder(tokenized_map)
 
+    def encode_anchor_context_from_map_feature(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask_key: str = "flow_eval_mask",
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """한 번 인코딩한 지도 특징에서 anchor 문맥만 뽑습니다.
+
+        Args:
+            map_feature: 지도 인코더 출력입니다.
+            tokenized_agent: agent 토큰 사전입니다.
+            anchor_mask_key: 어떤 anchor 마스크를 쓸지 나타내는 키입니다.
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor]:
+                - ``ctx_hidden_pack``: context encoder 전체 출력입니다.
+                  shape은 ``[n_agent, 14, hidden_dim]`` 입니다.
+                - ``anchor_hidden``: 13개 anchor 문맥입니다.
+                  shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+                - ``anchor_hidden_valid``: 유효 anchor만 모은 문맥입니다.
+                  shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+        """
+        return self.agent_encoder.encode_anchor_context(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            anchor_mask=tokenized_agent[anchor_mask_key],
+        )
+
     def forward_from_map_feature(
         self,
         map_feature: Dict[str, Tensor],

@@ -223,6 +223,40 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         return torch.cat(packed_hidden, dim=0)
 
 
+    def encode_anchor_context(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        anchor_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """14-slot 문맥에서 anchor hidden과 packed hidden을 만듭니다.
+
+        Args:
+            tokenized_agent: agent 토큰 사전입니다.
+            map_feature: 한 번 인코딩한 지도 특징 사전입니다.
+            anchor_mask: 실제로 쓸 anchor 여부입니다. shape은 ``[n_agent, 13]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - ``ctx_hidden_pack``: context encoder 전체 출력입니다.
+                  shape은 ``[n_agent, 14, hidden_dim]`` 입니다.
+                - ``anchor_hidden``: 13개 anchor 문맥입니다.
+                  shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+                - ``anchor_hidden_valid``: 유효 anchor만 모은 문맥입니다.
+                  shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+        """
+        ctx_hidden_pack = self._encode_context(
+            agent_token_index=tokenized_agent["ctx_sampled_idx"],
+            pos_a=tokenized_agent["ctx_sampled_pos"],
+            head_a=tokenized_agent["ctx_sampled_heading"],
+            mask=tokenized_agent["ctx_valid"],
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
+        return ctx_hidden_pack, anchor_hidden, anchor_hidden_valid
+
     def _sample_open_loop_future_from_hidden(
         self,
         anchor_hidden_valid: torch.Tensor,
@@ -428,16 +462,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_mask: torch.Tensor,
         flow_clean_norm: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        ctx_hidden_pack = self._encode_context(
-            agent_token_index=tokenized_agent["ctx_sampled_idx"],
-            pos_a=tokenized_agent["ctx_sampled_pos"],
-            head_a=tokenized_agent["ctx_sampled_heading"],
-            mask=tokenized_agent["ctx_valid"],
+        ctx_hidden_pack, anchor_hidden, anchor_hidden_valid = self.encode_anchor_context(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            anchor_mask=anchor_mask,
         )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
-        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
 
         if flow_clean_norm.numel() == 0:
             empty = flow_clean_norm.new_zeros((0, 20, 4))

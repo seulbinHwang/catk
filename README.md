@@ -406,6 +406,47 @@ torchrun \
 
 - `training_progress_vs_runtime`: x축은 지금까지 누적된 실제 학습 실행 시간(hours), y축은 전체 epoch 기준 진행률(%)입니다. checkpoint로 학습을 이어서 재개한 경우 이전 runtime도 누적해서 그립니다.
 
+### 5.6 Adjoint Matching feasible fine-tuning
+
+이 저장소에는 pretrained flow checkpoint 위에 **residual velocity head 하나만 추가로 조정하는** fine-tuning 경로가 들어 있습니다.
+학습 쪽은 memoryless Euler–Maruyama rollout을 쓰고, validation / 최종 inference는 기존과 동일하게 **deterministic midpoint sampler**를 그대로 사용합니다.
+
+핵심 규칙은 아래와 같습니다.
+
+- pretraining 단계에서는 residual head를 얼려 두고 기존 flow matching만 학습합니다.
+- fine-tuning 단계에서는 base encoder / decoder / 기존 velocity head를 모두 고정하고 `residual_velocity_head`만 학습합니다.
+- feasible terminal cost는 trajectory를 body-control `(vx_b, vy_b, omega)`로 바꾼 뒤 hand-crafted constraint projector와의 차이만 사용합니다.
+- projector 제한값은 외부 `Diffusion-Planner`의 `feasible.py` 값과 동일하게 사용합니다.
+- checkpoint 선택은 기존과 동일하게 `val_closed/sim_agents_2025/realism_meta_metric` 기준입니다.
+
+권장 실행 예시는 아래와 같습니다. `ckpt_path`에는 먼저 학습한 `pre_bc_flow` checkpoint를 넣어야 합니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=am_finetune_flow \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path=/path/to/pretrained_flow.ckpt \
+  task_name=flow_am_finetune_h1006
+```
+
+기본 fine-tuning 하이퍼파라미터는 아래처럼 잡혀 있습니다.
+
+- lr: `1e-4`
+- weight decay: `1e-4`
+- warmup: `1000` optimizer step
+- max epochs: `8`
+- grad clip: `1.0`
+- AM rollout steps: `16`
+
+학습 중 기본 로그는 `train/loss`, `train/terminal_cost`, `train/projection_gap`, `train/residual_norm` 입니다.
+validation과 test 명령은 기존 `local_val_flow`, `sim_agents_sub_flow`를 그대로 쓰면 됩니다.
+
 ## 6. 평가와 추론
 
 ### 6.1 Validation set closed-loop 평가
@@ -811,6 +852,12 @@ python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT"
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_pretrain_h1006
+```
+
+### Adjoint Matching fine-tuning
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=am_finetune_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/pretrained_flow.ckpt task_name=flow_am_finetune_h1006
 ```
 
 ### validation 평가

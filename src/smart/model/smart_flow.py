@@ -22,9 +22,10 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_2s,
     yaw_fde_2s,
 )
+from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
-from src.smart.utils.finetune import set_model_for_finetuning
+from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -35,9 +36,13 @@ class SMARTFlow(LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.lr = model_config.lr
-        self.lr_warmup_steps = model_config.lr_warmup_steps
-        self.lr_total_steps = model_config.lr_total_steps
-        self.lr_min_ratio = model_config.lr_min_ratio
+        self.lr_warmup_steps = int(model_config.lr_warmup_steps)
+        self.lr_total_steps = int(model_config.lr_total_steps)
+        self.lr_min_ratio = float(model_config.lr_min_ratio)
+        self.weight_decay = float(getattr(model_config, "weight_decay", 0.01))
+        self.lr_scheduler_unit = str(getattr(model_config, "lr_scheduler_unit", "epoch"))
+        if self.lr_scheduler_unit not in {"epoch", "step"}:
+            raise ValueError(f"Unsupported lr_scheduler_unit: {self.lr_scheduler_unit}")
         self.num_historical_steps = model_config.decoder.num_historical_steps
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
@@ -48,7 +53,19 @@ class SMARTFlow(LightningModule):
             **model_config.decoder,
             n_token_agent=self.token_processor.n_token_agent,
         )
-        set_model_for_finetuning(self.encoder, model_config.finetune)
+        self.finetune_config: FinetuneConfig = set_model_for_finetuning(
+            self.encoder,
+            model_config.finetune,
+        )
+        self.adjoint_matching_loss = None
+        if self.finetune_config.enabled:
+            self.adjoint_matching_loss = AdjointMatchingLoss(
+                rollout_steps=self.finetune_config.rollout_steps,
+                rollout_noise_scale=self.finetune_config.rollout_noise_scale,
+                feasible_weight=self.finetune_config.feasible_weight,
+                smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
+                smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
+            )
 
         self.minADE = minADE()
         self.sim_agents_metrics = SimAgentsMetrics(
@@ -853,8 +870,79 @@ class SMARTFlow(LightningModule):
         """
         self._restore_fit_time_validation_batch_limit()
 
+    def _is_adjoint_matching_enabled(self) -> bool:
+        """현재 학습이 Adjoint Matching 분기인지 확인합니다.
+
+        Returns:
+            bool: residual head만 학습하는 fine-tuning 단계면 ``True`` 입니다.
+        """
+        return bool(self.finetune_config.enabled and self.adjoint_matching_loss is not None)
+
+    def _run_adjoint_matching_training_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ):
+        """Frozen base 문맥으로 Adjoint Matching loss를 계산합니다.
+
+        Args:
+            tokenized_map: 지도 토큰 사전입니다.
+            tokenized_agent: agent 토큰 사전입니다.
+
+        Returns:
+            AdjointMatchingResult: loss와 logging용 스칼라 묶음입니다.
+        """
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+
+        return self.adjoint_matching_loss(
+            flow_decoder=self.encoder.agent_encoder.flow_decoder,
+            flow_ode=self.encoder.agent_encoder.flow_ode,
+            anchor_hidden_valid=anchor_hidden_valid.detach(),
+            agent_type=tokenized_agent["flow_train_agent_type"],
+            current_control=tokenized_agent["flow_train_current_control"],
+            current_control_valid=tokenized_agent["flow_train_current_control_valid"],
+        )
+
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+        if self._is_adjoint_matching_enabled():
+            am_result = self._run_adjoint_matching_training_step(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+            )
+            self.log("train/loss", am_result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log(
+                "train/terminal_cost",
+                am_result.terminal_cost,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                "train/projection_gap",
+                am_result.projection_gap,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                "train/residual_norm",
+                am_result.residual_norm,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            return am_result.loss
+
         pred = self.encoder(
             tokenized_map,
             tokenized_agent,
@@ -1005,11 +1093,36 @@ class SMARTFlow(LightningModule):
             if self.sim_agents_submission.is_active:
                 self.sim_agents_submission.save_sub_file()
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+    def _resolve_lr_total_steps(self) -> int:
+        """현재 스케줄 단위에 맞는 전체 step 수를 정합니다.
 
-        def lr_lambda(_current_step):
-            current_step = self.current_epoch + 1
+        Returns:
+            int: cosine schedule 전체 길이입니다.
+        """
+        if self.lr_total_steps > 0:
+            return self.lr_total_steps
+        if self.lr_scheduler_unit == "step" and self.trainer is not None:
+            estimated_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0))
+            if estimated_steps > 0:
+                return estimated_steps
+        if self.trainer is not None:
+            return max(int(self.trainer.max_epochs), 1)
+        return 1
+
+    def configure_optimizers(self):
+        trainable_params = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        if len(trainable_params) == 0:
+            raise RuntimeError("No trainable parameters were found.")
+
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        total_steps = self._resolve_lr_total_steps()
+
+        def lr_lambda(current_index: int) -> float:
+            current_step = current_index + 1
             if current_step < self.lr_warmup_steps:
                 return self.lr_min_ratio + (1.0 - self.lr_min_ratio) * current_step / max(self.lr_warmup_steps, 1)
             return self.lr_min_ratio + 0.5 * (1.0 - self.lr_min_ratio) * (
@@ -1017,13 +1130,54 @@ class SMARTFlow(LightningModule):
                 + math.cos(
                     math.pi * min(
                         1.0,
-                        (current_step - self.lr_warmup_steps) / max(self.lr_total_steps - self.lr_warmup_steps, 1),
+                        (current_step - self.lr_warmup_steps) / max(total_steps - self.lr_warmup_steps, 1),
                     )
                 )
             )
 
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-        return [optimizer], [lr_scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": lr_scheduler,
+                "interval": self.lr_scheduler_unit,
+                "frequency": 1,
+            },
+        }
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, Tensor],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        """기존 checkpoint를 새 residual head 구조와 호환되게 읽습니다.
+
+        Args:
+            state_dict: 불러올 state dict 입니다.
+            strict: True면 residual head를 뺀 나머지 키는 엄격히 검사합니다.
+            assign: PyTorch 기본 ``load_state_dict`` 옵션을 그대로 전달합니다.
+
+        Returns:
+            _IncompatibleKeys: PyTorch가 돌려주는 키 검사 결과입니다.
+        """
+        incompatible_keys = super().load_state_dict(state_dict, strict=False, assign=assign)
+        if not strict:
+            return incompatible_keys
+
+        missing_keys = [
+            key
+            for key in incompatible_keys.missing_keys
+            if "residual_velocity_head" not in key
+        ]
+        unexpected_keys = list(incompatible_keys.unexpected_keys)
+        if len(missing_keys) > 0 or len(unexpected_keys) > 0:
+            raise RuntimeError(
+                "Error(s) in loading state_dict for SMARTFlow:\n"
+                f"Missing key(s): {missing_keys}\n"
+                f"Unexpected key(s): {unexpected_keys}"
+            )
+        return incompatible_keys
 
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
