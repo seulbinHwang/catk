@@ -128,7 +128,22 @@ def run(cfg: DictConfig) -> None:
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
     elif cfg.action == "finetune":
         log.info("Starting finetuning!")
-        model.load_state_dict(torch.load(cfg.ckpt_path)["state_dict"], strict=False)
+        checkpoint = torch.load(cfg.ckpt_path, map_location="cpu")
+        incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+        if incompatible.missing_keys:
+            preview = ", ".join(incompatible.missing_keys[:8])
+            suffix = " ..." if len(incompatible.missing_keys) > 8 else ""
+            log.warning(
+                f"Finetune checkpoint is missing {len(incompatible.missing_keys)} key(s): "
+                f"{preview}{suffix}"
+            )
+        if incompatible.unexpected_keys:
+            preview = ", ".join(incompatible.unexpected_keys[:8])
+            suffix = " ..." if len(incompatible.unexpected_keys) > 8 else ""
+            log.warning(
+                f"Finetune checkpoint has {len(incompatible.unexpected_keys)} unexpected key(s): "
+                f"{preview}{suffix}"
+            )
         trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")

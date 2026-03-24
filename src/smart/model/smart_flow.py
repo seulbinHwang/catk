@@ -892,22 +892,25 @@ class SMARTFlow(LightningModule):
         Returns:
             AdjointMatchingResult: loss와 logging용 스칼라 묶음입니다.
         """
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
+        device_type = self.device.type if self.device.type else "cpu"
+        # Adjoint loss는 작은 tau 분모와 autograd.grad를 같이 써서 mixed precision에 민감합니다.
+        with torch.autocast(device_type=device_type, enabled=False):
+            with torch.no_grad():
+                map_feature = self.encoder.encode_map(tokenized_map)
+                _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                    map_feature=map_feature,
+                    tokenized_agent=tokenized_agent,
+                    anchor_mask_key="flow_train_mask",
+                )
 
-        return self.adjoint_matching_loss(
-            flow_decoder=self.encoder.agent_encoder.flow_decoder,
-            flow_ode=self.encoder.agent_encoder.flow_ode,
-            anchor_hidden_valid=anchor_hidden_valid.detach(),
-            agent_type=tokenized_agent["flow_train_agent_type"],
-            current_control=tokenized_agent["flow_train_current_control"],
-            current_control_valid=tokenized_agent["flow_train_current_control_valid"],
-        )
+            return self.adjoint_matching_loss(
+                flow_decoder=self.encoder.agent_encoder.flow_decoder,
+                flow_ode=self.encoder.agent_encoder.flow_ode,
+                anchor_hidden_valid=anchor_hidden_valid.detach().to(dtype=torch.float32),
+                agent_type=tokenized_agent["flow_train_agent_type"],
+                current_control=tokenized_agent["flow_train_current_control"].to(dtype=torch.float32),
+                current_control_valid=tokenized_agent["flow_train_current_control_valid"],
+            )
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)

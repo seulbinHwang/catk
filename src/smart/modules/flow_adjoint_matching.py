@@ -157,6 +157,13 @@ class SmoothControlProjector(nn.Module):
         if agent_type.dim() != 1:
             raise ValueError(f"agent_type must be 1D, got shape={tuple(agent_type.shape)}")
 
+        supported_mask = torch.zeros_like(agent_type, dtype=torch.bool)
+        for class_id in self._limits:
+            supported_mask |= agent_type == class_id
+        if bool((~supported_mask).any()):
+            unknown_types = agent_type[~supported_mask].detach().unique().cpu().tolist()
+            raise ValueError(f"Unsupported agent_type values: {unknown_types}")
+
         def _gather(attr_name: str) -> Tensor:
             values = torch.empty(agent_type.shape[0], device=device, dtype=dtype)
             for class_id, limit in self._limits.items():
@@ -625,6 +632,23 @@ class AdjointMatchingLoss(nn.Module):
             smooth_deadzone_tau=smooth_deadzone_tau,
         )
 
+    @staticmethod
+    def _assert_finite_tensor(name: str, value: Tensor) -> None:
+        """중간 텐서가 NaN/Inf면 바로 실패시킵니다."""
+        if value.numel() == 0:
+            return
+        finite_mask = torch.isfinite(value)
+        if bool(finite_mask.all()):
+            return
+        bad_values = value.detach()[~finite_mask].flatten()[:8].cpu().tolist()
+        raise RuntimeError(f"{name} contains non-finite values: {bad_values}")
+
+    @classmethod
+    def _assert_finite_tensor_list(cls, name: str, values: Sequence[Tensor]) -> None:
+        """여러 rollout 텐서를 순서대로 검사합니다."""
+        for idx, value in enumerate(values):
+            cls._assert_finite_tensor(f"{name}[{idx}]", value)
+
     def _build_step_times(self, flow_ode: nn.Module, batch_size: int, device: torch.device, dtype: torch.dtype) -> List[Tensor]:
         """Euler–Maruyama rollout 과 adjoint 계산에 쓸 시간값을 만듭니다.
 
@@ -896,37 +920,58 @@ class AdjointMatchingLoss(nn.Module):
                 final_sample=empty_sample,
             )
 
-        states, times = self._rollout_memoryless_sde(
-            flow_decoder=flow_decoder,
-            flow_ode=flow_ode,
-            anchor_hidden_valid=anchor_hidden_valid,
-        )
-        terminal_cost, terminal_grad, metrics = self._compute_terminal_gradient(
-            final_state=states[-1],
-            agent_type=agent_type,
-            current_control=current_control,
-            current_control_valid=current_control_valid,
-        )
-        lean_adjoints = self._build_lean_adjoints(
-            flow_decoder=flow_decoder,
-            flow_ode=flow_ode,
-            anchor_hidden_valid=anchor_hidden_valid,
-            states=states,
-            times=times,
-            terminal_grad=terminal_grad,
-        )
-        regression_loss, residual_norm = self._build_regression_loss(
-            flow_decoder=flow_decoder,
-            flow_ode=flow_ode,
-            anchor_hidden_valid=anchor_hidden_valid,
-            states=states,
-            times=times,
-            lean_adjoints=lean_adjoints,
-        )
-        return AdjointMatchingResult(
-            loss=regression_loss,
-            terminal_cost=metrics["terminal_cost"],
-            projection_gap=metrics["projection_gap"],
-            residual_norm=residual_norm.detach(),
-            final_sample=states[-1],
-        )
+        device_type = anchor_hidden_valid.device.type if anchor_hidden_valid.device.type else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
+            if current_control is not None:
+                current_control = current_control.to(
+                    device=anchor_hidden_valid.device,
+                    dtype=torch.float32,
+                )
+
+            states, times = self._rollout_memoryless_sde(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden_valid,
+            )
+            self._assert_finite_tensor_list("am/states", states)
+
+            terminal_cost, terminal_grad, metrics = self._compute_terminal_gradient(
+                final_state=states[-1],
+                agent_type=agent_type,
+                current_control=current_control,
+                current_control_valid=current_control_valid,
+            )
+            self._assert_finite_tensor("am/terminal_cost", terminal_cost)
+            self._assert_finite_tensor("am/terminal_grad", terminal_grad)
+            self._assert_finite_tensor("am/projection_gap", metrics["projection_gap"])
+
+            lean_adjoints = self._build_lean_adjoints(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden_valid,
+                states=states,
+                times=times,
+                terminal_grad=terminal_grad,
+            )
+            self._assert_finite_tensor_list("am/lean_adjoints", lean_adjoints)
+
+            regression_loss, residual_norm = self._build_regression_loss(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden_valid,
+                states=states,
+                times=times,
+                lean_adjoints=lean_adjoints,
+            )
+            self._assert_finite_tensor("am/regression_loss", regression_loss)
+            self._assert_finite_tensor("am/residual_norm", residual_norm)
+            self._assert_finite_tensor("am/final_sample", states[-1])
+
+            return AdjointMatchingResult(
+                loss=regression_loss,
+                terminal_cost=metrics["terminal_cost"],
+                projection_gap=metrics["projection_gap"],
+                residual_norm=residual_norm.detach(),
+                final_sample=states[-1],
+            )
