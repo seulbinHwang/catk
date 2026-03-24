@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -41,6 +42,13 @@ _WAYMO_STORAGE_STATE_RUNTIME_FILENAME = "waymo_storage_state.runtime.json"
 _WAYMO_STORAGE_STATE_STATUS_FILENAME = "waymo_storage_state.status.json"
 _WAYMO_STORAGE_STATE_WAIT_POLL_SECONDS = 1.0
 _WAYMO_STORAGE_STATE_WAIT_TIMEOUT_SECONDS = 3600.0
+_SYSTEM_CHROMIUM_CANDIDATES = (
+    "/opt/google/chrome/chrome",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+)
 
 
 def _playwright_install_hint(prefix: str) -> str:
@@ -95,6 +103,12 @@ class _WaymoSubmissionRuntime:
 class PreparedWaymoStorageState:
     storage_state_path: Path
     cleanup_paths: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
+class _BrowserLaunchCandidate:
+    launch_kwargs: dict[str, object]
+    description: str
 
 
 def is_primary_process(env: Mapping[str, str] | None = None) -> bool:
@@ -778,18 +792,151 @@ class _WaymoSubmissionUploader:
             raise ValueError(
                 f"Unsupported Playwright browser: {self.runtime.browser_name!r}."
             )
+        launch_errors: list[str] = []
+        for candidate in self._build_browser_launch_candidates():
+            try:
+                return browser_type.launch(**candidate.launch_kwargs)
+            except Exception as exc:
+                launch_errors.append(f"{candidate.description}: {exc}")
 
-        launch_kwargs = {
+        if launch_errors:
+            raise RuntimeError(
+                "All browser launch attempts failed:\n- " + "\n- ".join(launch_errors)
+            )
+        raise RuntimeError("No browser launch candidates were available.")
+
+    def _build_browser_launch_candidates(self) -> list[_BrowserLaunchCandidate]:
+        launch_kwargs: dict[str, object] = {
             "headless": self.runtime.headless,
         }
-        if self.runtime.browser_channel:
-            launch_kwargs["channel"] = str(self.runtime.browser_channel)
-        if self.runtime.browser_executable_path is not None:
-            launch_kwargs["executable_path"] = self.runtime.browser_executable_path.as_posix()
+        launch_env = self._build_browser_launch_env()
+        if launch_env is not None:
+            launch_kwargs["env"] = launch_env
+
         if self.runtime.browser_name == "chromium":
             launch_kwargs["chromium_sandbox"] = self.runtime.chromium_sandbox
 
-        return browser_type.launch(**launch_kwargs)
+        candidates: list[_BrowserLaunchCandidate] = []
+
+        if self.runtime.browser_channel:
+            candidates.append(
+                _BrowserLaunchCandidate(
+                    launch_kwargs={**launch_kwargs, "channel": str(self.runtime.browser_channel)},
+                    description=f"Playwright channel={self.runtime.browser_channel}",
+                )
+            )
+
+        if self.runtime.browser_executable_path is not None:
+            candidates.append(
+                _BrowserLaunchCandidate(
+                    launch_kwargs={
+                        **launch_kwargs,
+                        "executable_path": self.runtime.browser_executable_path.as_posix(),
+                    },
+                    description=(
+                        "configured executable_path="
+                        f"{self.runtime.browser_executable_path.as_posix()}"
+                    ),
+                )
+            )
+
+        if not candidates:
+            candidates.append(
+                _BrowserLaunchCandidate(
+                    launch_kwargs=dict(launch_kwargs),
+                    description=f"Playwright bundled {self.runtime.browser_name}",
+                )
+            )
+
+        if self.runtime.browser_name == "chromium":
+            for executable_path in self._detect_chromium_executable_candidates():
+                executable_path_str = executable_path.as_posix()
+                if any(
+                    candidate.launch_kwargs.get("executable_path") == executable_path_str
+                    for candidate in candidates
+                ):
+                    continue
+                candidates.append(
+                    _BrowserLaunchCandidate(
+                        launch_kwargs={**launch_kwargs, "executable_path": executable_path_str},
+                        description=f"detected chromium executable={executable_path_str}",
+                    )
+                )
+
+        return candidates
+
+    def _build_browser_launch_env(self) -> dict[str, str] | None:
+        env = dict(os.environ)
+        conda_prefix = str(env.get("CONDA_PREFIX", "")).strip()
+        if not conda_prefix:
+            return None
+
+        conda_lib = Path(conda_prefix).expanduser().resolve() / "lib"
+        if not conda_lib.is_dir():
+            return None
+
+        existing_ld_library_path = str(env.get("LD_LIBRARY_PATH", "")).strip()
+        ld_library_entries = [
+            entry for entry in existing_ld_library_path.split(":") if entry
+        ]
+        conda_lib_str = conda_lib.as_posix()
+        if conda_lib_str not in ld_library_entries:
+            ld_library_entries.insert(0, conda_lib_str)
+        env["LD_LIBRARY_PATH"] = ":".join(ld_library_entries)
+        return env
+
+    def _detect_chromium_executable_candidates(self) -> list[Path]:
+        candidates: list[Path] = []
+        seen: set[str] = set()
+
+        env_candidates = (
+            os.environ.get("WAYMO_SUBMISSION_BROWSER"),
+            os.environ.get("CHROME_BIN"),
+            os.environ.get("GOOGLE_CHROME_BIN"),
+        )
+        for candidate in env_candidates:
+            self._append_executable_candidate(candidates, seen, candidate)
+
+        for candidate in _SYSTEM_CHROMIUM_CANDIDATES:
+            self._append_executable_candidate(candidates, seen, candidate)
+
+        for binary_name in (
+            "google-chrome",
+            "google-chrome-stable",
+            "chrome",
+            "chromium",
+            "chromium-browser",
+        ):
+            resolved = shutil.which(binary_name)
+            self._append_executable_candidate(candidates, seen, resolved)
+
+        playwright_cache_root = Path.home() / ".cache" / "ms-playwright"
+        if playwright_cache_root.is_dir():
+            for binary_path in sorted(playwright_cache_root.glob("chromium-*/chrome-linux/chrome")):
+                self._append_executable_candidate(candidates, seen, binary_path)
+
+        return candidates
+
+    @staticmethod
+    def _append_executable_candidate(
+        candidates: list[Path],
+        seen: set[str],
+        candidate: str | Path | None,
+    ) -> None:
+        if not candidate:
+            return
+
+        path = Path(str(candidate)).expanduser()
+        if not path.is_file():
+            return
+
+        resolved = path.resolve()
+        resolved_str = resolved.as_posix()
+        if resolved_str in seen:
+            return
+
+        seen.add(resolved_str)
+        candidates.append(resolved)
 
     def _goto(self, page, url: str) -> None:
         page.goto(url, wait_until="domcontentloaded", timeout=self.runtime.navigation_timeout_ms)
