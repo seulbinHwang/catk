@@ -4,6 +4,7 @@ model_config:
   lr_warmup_steps: 2
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.01
+  weight_decay: 1.0e-2
   n_rollout_closed_val: 8
   n_batch_sim_agents_metric: 10
   sim_agents_metric_workers: 3
@@ -15,6 +16,11 @@ model_config:
   val_closed_loop: true
   validation_open_seed: 0
   validation_closed_seed: 0
+  am_finetune:
+    enabled: false
+    init_noise_scale: 1.0
+    deadzone: 0.01
+    step_end_noise: true
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
@@ -25,6 +31,8 @@ model_config:
       num_k: 1
       temp: 1.0
   eval_sampling_noise:
+    sample_steps: 16
+    sample_method: midpoint
     noise_scale: 1.0
   decoder:
     hidden_dim: 128
@@ -47,6 +55,10 @@ model_config:
     flow_solver_steps: 16
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
+    flow_solver_path_type: ot
+    flow_solver_sigma_min: 1.0e-3
+    flow_use_residual_velocity_head: false
+    flow_residual_bottleneck_dim: null
   sim_agents_submission:
     is_active: false
     method_name: "SMART-flow-7M"
@@ -55,4 +67,6 @@ model_config:
     description: Flow-based generative model for simulating realistic agents.
     method_link: "not available yet"
     account_name: "h.sb@naverlabs.com"
-  finetune: false
+  finetune:
+    enabled: false
+    mode: legacy

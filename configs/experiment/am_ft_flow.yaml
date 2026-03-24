@@ -1,0 +1,56 @@
+# @package _global_
+
+defaults:
+  - override /model: smart_flow
+
+model:
+  model_config:
+    lr: 1.0e-4
+    lr_warmup_steps: 2
+    lr_min_ratio: 1.0e-2
+    weight_decay: 1.0e-4
+    val_open_loop: true
+    val_closed_loop: false
+    am_finetune:
+      enabled: true
+      init_noise_scale: 1.0
+      deadzone: 0.01
+      step_end_noise: true
+    eval_sampling_noise:
+      sample_steps: 16
+      sample_method: midpoint
+      noise_scale: 1.0
+    decoder:
+      flow_solver_steps: 16
+      flow_solver_method: midpoint
+      flow_solver_eps: 1.0e-3
+      flow_solver_path_type: ot
+      flow_solver_sigma_min: 1.0e-3
+      flow_use_residual_velocity_head: true
+      flow_residual_bottleneck_dim: 48
+    finetune:
+      enabled: true
+      mode: flow_residual_only
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
+  check_val_every_n_epoch: 2
+  max_epochs: 16
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_open/feasible_projection_gap
+    mode: min
+
+data:
+  train_batch_size: 26
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1

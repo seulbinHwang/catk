@@ -35,6 +35,10 @@ class SMARTFlowDecoder(nn.Module):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
+        flow_solver_path_type: str,
+        flow_solver_sigma_min: float,
+        flow_use_residual_velocity_head: bool,
+        flow_residual_bottleneck_dim: int | None,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -66,6 +70,10 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_steps=flow_solver_steps,
             flow_solver_method=flow_solver_method,
             flow_solver_eps=flow_solver_eps,
+            flow_solver_path_type=flow_solver_path_type,
+            flow_solver_sigma_min=flow_solver_sigma_min,
+            flow_use_residual_velocity_head=flow_use_residual_velocity_head,
+            flow_residual_bottleneck_dim=flow_residual_bottleneck_dim,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
@@ -116,7 +124,7 @@ class SMARTFlowDecoder(nn.Module):
         rollout_cache: Dict[str, object],
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
-        sampling_noise: DictConfig,
+        sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
     ) -> Dict[str, Tensor]:
@@ -124,7 +132,7 @@ class SMARTFlowDecoder(nn.Module):
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            sampling_noise=sampling_noise,
+            sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
         )
@@ -134,7 +142,7 @@ class SMARTFlowDecoder(nn.Module):
         self,
         anchor_hidden: Tensor,
         anchor_mask: Tensor,
-        sampling_noise: DictConfig,
+        sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
@@ -144,8 +152,8 @@ class SMARTFlowDecoder(nn.Module):
                 shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
             anchor_mask: 실제로 평가할 anchor 여부입니다.
                 shape은 ``[n_agent, 13]`` 입니다.
-            sampling_noise: 평가 시 샘플링 초기 잡음 설정입니다.
-            sampling_seed: 평가마다 같은 샘플을 만들기 위한 고정 seed입니다.
+            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_seed: validation마다 같은 샘플을 만들기 위한 고정 seed입니다.
 
         Returns:
             Tensor: 생성된 정규화 2초 미래입니다.
@@ -154,7 +162,52 @@ class SMARTFlowDecoder(nn.Module):
         return self.agent_encoder.sample_open_loop_future(
             anchor_hidden=anchor_hidden,
             anchor_mask=anchor_mask,
-            sampling_noise=sampling_noise,
+            sampling_scheme=sampling_scheme,
+            sampling_seed=sampling_seed,
+        )
+
+    def pack_anchor_hidden(
+        self,
+        anchor_hidden: Tensor,
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """유효 anchor 문맥만 압축해 돌려줍니다.
+
+        Args:
+            anchor_hidden: 모든 anchor 문맥입니다.
+                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+            anchor_mask: 유효 anchor 여부입니다.
+                shape은 ``[n_agent, 13]`` 입니다.
+
+        Returns:
+            Tensor:
+                유효 anchor만 모은 문맥입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+        """
+        return self.agent_encoder.pack_anchor_hidden(anchor_hidden=anchor_hidden, anchor_mask=anchor_mask)
+
+    def sample_open_loop_future_from_hidden(
+        self,
+        anchor_hidden_valid: Tensor,
+        sampling_scheme: DictConfig,
+        sampling_seed: int | None = None,
+    ) -> Tensor:
+        """압축된 anchor 문맥에서 바로 2초 미래를 생성합니다.
+
+        Args:
+            anchor_hidden_valid: 유효 anchor만 모은 문맥입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
+            sampling_seed: 같은 seed에서 같은 출발 잡음을 만들기 위한 값입니다.
+
+        Returns:
+            Tensor:
+                생성된 정규화 2초 미래입니다.
+                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        """
+        return self.agent_encoder.sample_open_loop_future_from_hidden(
+            anchor_hidden_valid=anchor_hidden_valid,
+            sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
         )
 
@@ -162,7 +215,7 @@ class SMARTFlowDecoder(nn.Module):
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-        sampling_noise: DictConfig,
+        sampling_scheme: DictConfig,
     ) -> Dict[str, Tensor]:
         map_feature = self.encode_map(tokenized_map)
         rollout_cache = self.prepare_inference_cache(tokenized_agent, map_feature)
@@ -170,5 +223,5 @@ class SMARTFlowDecoder(nn.Module):
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            sampling_noise=sampling_noise,
+            sampling_scheme=sampling_scheme,
         )

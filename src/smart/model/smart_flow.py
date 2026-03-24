@@ -22,6 +22,7 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_2s,
     yaw_fde_2s,
 )
+from src.smart.modules.flow_feasible_projection import FlowFeasibleProjector
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -38,11 +39,17 @@ class SMARTFlow(LightningModule):
         self.lr_warmup_steps = model_config.lr_warmup_steps
         self.lr_total_steps = model_config.lr_total_steps
         self.lr_min_ratio = model_config.lr_min_ratio
+        self.weight_decay = float(getattr(model_config, "weight_decay", 1e-2))
+        self.am_finetune = model_config.am_finetune
+        self.am_enabled = bool(getattr(self.am_finetune, "enabled", False))
         self.num_historical_steps = model_config.decoder.num_historical_steps
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
         self.token_processor = FlowTokenProcessor(**model_config.token_processor)
+        self.flow_feasible_projector = FlowFeasibleProjector(
+            deadzone=float(getattr(self.am_finetune, "deadzone", 0.01))
+        )
 
         self.encoder = SMARTFlowDecoder(
             **model_config.decoder,
@@ -75,13 +82,18 @@ class SMARTFlow(LightningModule):
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
-        self.eval_sampling_noise = model_config.eval_sampling_noise
+        self.validation_rollout_sampling = getattr(
+            model_config,
+            "validation_rollout_sampling",
+            getattr(model_config, "eval_sampling_noise"),
+        )
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
                 "ADE2s": WeightedMeanMetric(),
                 "FDE2s": WeightedMeanMetric(),
                 "yaw_ADE2s": WeightedMeanMetric(),
                 "yaw_FDE2s": WeightedMeanMetric(),
+                "feasible_projection_gap": WeightedMeanMetric(),
             }
         )
 
@@ -195,6 +207,14 @@ class SMARTFlow(LightningModule):
                 meter 단위 위치 오차와 degree 단위 방향 오차를 담은 사전입니다.
         """
         with torch.no_grad():
+            if pred_clean_norm.numel() == 0 or target_clean_norm.numel() == 0:
+                zero = pred_clean_norm.new_zeros(())
+                return {
+                    "ADE2s": zero,
+                    "FDE2s": zero,
+                    "yaw_ADE2s": zero,
+                    "yaw_FDE2s": zero,
+                }
             return {
                 "ADE2s": ade_2s(
                     pred_clean_norm.detach(),
@@ -237,6 +257,304 @@ class SMARTFlow(LightningModule):
         )
         sample_count = int(pred_dict["flow_clean_norm"].shape[0])
         return loss, metric_dict, sample_count
+
+    def _build_feasible_projection_metric(
+        self,
+        pred_clean_norm: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+        split_prefix: str,
+    ) -> Tensor:
+        """현재 예측 2초 미래의 feasible projection gap 평균을 계산합니다.
+
+        Args:
+            pred_clean_norm: 정규화된 2초 미래입니다.
+                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            tokenized_agent: 현재 batch의 agent 토큰 사전입니다.
+            split_prefix: ``flow_train`` 또는 ``flow_eval`` 입니다.
+
+        Returns:
+            Tensor:
+                유효 anchor 평균 feasible gap 입니다.
+                유효 anchor가 없으면 0 스칼라를 돌려줍니다.
+        """
+        if pred_clean_norm.numel() == 0:
+            return pred_clean_norm.new_zeros(())
+        gap = self.flow_feasible_projector.projection_gap(
+            traj_norm=pred_clean_norm,
+            actor_type=tokenized_agent[f"{split_prefix}_actor_type"],
+            current_control=tokenized_agent[f"{split_prefix}_current_control"],
+            current_control_valid=tokenized_agent[f"{split_prefix}_current_control_valid"],
+        )
+        if gap.numel() == 0:
+            return pred_clean_norm.new_zeros(())
+        return gap.mean()
+
+    def _set_am_finetune_module_mode(self) -> None:
+        """AM fine-tuning 때 freeze된 backbone은 eval, residual head만 train으로 둡니다.
+
+        Returns:
+            None
+        """
+        if not self.am_enabled:
+            return
+        self.encoder.eval()
+        residual_head = self.encoder.agent_encoder.flow_decoder.residual_velocity_head
+        if residual_head is not None:
+            residual_head.train()
+
+    def _zero_loss(self) -> Tensor:
+        """유효 표본이 없을 때도 학습 루프를 유지할 0 loss를 만듭니다.
+
+        Returns:
+            Tensor:
+                현재 모델 장치 위의 0 스칼라입니다.
+        """
+        return next(self.parameters()).sum() * 0.0
+
+    def _run_am_rollout(self, anchor_hidden_valid: Tensor) -> Dict[str, object]:
+        """현재 residual이 더해진 field로 AM 학습용 rollout을 만듭니다.
+
+        Args:
+            anchor_hidden_valid: 유효 anchor만 모은 문맥입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+
+        Returns:
+            Dict[str, object]:
+                ``x_final`` 은 최종 정규화 미래이고 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                ``states`` 는 각 solver step 시작 상태 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                ``taus`` 는 각 solver step 시작 시각 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+        """
+        if anchor_hidden_valid.numel() == 0:
+            return {"x_final": anchor_hidden_valid.new_zeros((0, 20, 4)), "states": [], "taus": []}
+
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        num_anchor = anchor_hidden_valid.shape[0]
+        init_noise_scale = float(getattr(self.am_finetune, "init_noise_scale", 1.0))
+        step_end_noise = bool(getattr(self.am_finetune, "step_end_noise", True))
+
+        x_t = torch.randn(
+            num_anchor,
+            20,
+            4,
+            device=anchor_hidden_valid.device,
+            dtype=anchor_hidden_valid.dtype,
+        ) * init_noise_scale
+        states: list[Tensor] = []
+        taus: list[Tensor] = []
+        dt = (1.0 - flow_ode.eps) / float(flow_ode.solver_steps)
+        with torch.no_grad():
+            for step_idx in range(flow_ode.solver_steps):
+                tau_value = flow_ode.eps + step_idx * dt
+                tau = x_t.new_full((num_anchor,), tau_value)
+                states.append(x_t.detach().clone())
+                taus.append(tau)
+
+                if flow_ode.solver_method == "midpoint":
+                    v_start = flow_decoder(anchor_hidden_valid, x_t, tau)
+                    b_start = flow_ode.velocity_to_drift(x_t=x_t, velocity=v_start, tau=tau)
+                    tau_mid = x_t.new_full((num_anchor,), tau_value + 0.5 * dt)
+                    x_mid = x_t + 0.5 * dt * b_start
+                    v_mid = flow_decoder(anchor_hidden_valid, x_mid, tau_mid)
+                    b_mid = flow_ode.velocity_to_drift(x_t=x_mid, velocity=v_mid, tau=tau_mid)
+                    x_det = x_t + dt * b_mid
+                elif flow_ode.solver_method == "euler":
+                    v_start = flow_decoder(anchor_hidden_valid, x_t, tau)
+                    b_start = flow_ode.velocity_to_drift(x_t=x_t, velocity=v_start, tau=tau)
+                    x_det = x_t + dt * b_start
+                else:
+                    raise ValueError(f"Unsupported solver method: {flow_ode.solver_method}")
+
+                if step_end_noise:
+                    tau_next = x_t.new_full((num_anchor,), tau_value + dt)
+                    noise_scale = flow_ode.memoryless_noise_scale(tau_next).view(-1, 1, 1)
+                    x_t = x_det + noise_scale * math.sqrt(dt) * torch.randn_like(x_det)
+                else:
+                    x_t = x_det
+
+        return {"x_final": x_t.detach(), "states": states, "taus": taus}
+
+    def _build_am_adjoint_targets(
+        self,
+        anchor_hidden_valid: Tensor,
+        states: list[Tensor],
+        taus: list[Tensor],
+        terminal_grad: Tensor,
+    ) -> list[Tensor]:
+        """base drift만 써서 각 solver step의 lean adjoint target을 만듭니다.
+
+        Args:
+            anchor_hidden_valid: 유효 anchor 문맥입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+            states: solver step 시작 상태 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            taus: solver step 시작 시각 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+            terminal_grad: terminal feasible cost의 마지막 상태 미분입니다.
+                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+
+        Returns:
+            list[Tensor]:
+                각 solver step 시작 상태에서의 adjoint target 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        """
+        if len(states) == 0:
+            return []
+
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        anchor_hidden_detached = anchor_hidden_valid.detach()
+        dt = (1.0 - flow_ode.eps) / float(flow_ode.solver_steps)
+        adjoint_next = terminal_grad.detach()
+        adjoint_targets: list[Tensor] = [terminal_grad.detach().clone() for _ in states]
+
+        for step_idx in reversed(range(len(states))):
+            state_k = states[step_idx].detach().requires_grad_(True)
+            tau_k = taus[step_idx]
+            base_velocity = flow_decoder.forward_base(
+                anchor_hidden=anchor_hidden_detached,
+                x_t_norm=state_k,
+                tau=tau_k,
+            )
+            base_drift = flow_ode.velocity_to_drift(
+                x_t=state_k,
+                velocity=base_velocity,
+                tau=tau_k,
+            )
+            jtv = torch.autograd.grad(
+                outputs=base_drift,
+                inputs=state_k,
+                grad_outputs=adjoint_next,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+            adjoint_k = (adjoint_next + dt * jtv).detach()
+            adjoint_targets[step_idx] = adjoint_k
+            adjoint_next = adjoint_k
+        return adjoint_targets
+
+    def _compute_am_residual_regression_loss(
+        self,
+        anchor_hidden_valid: Tensor,
+        states: list[Tensor],
+        taus: list[Tensor],
+        adjoint_targets: list[Tensor],
+    ) -> Tensor:
+        """residual velocity head가 adjoint 방향을 맞추도록 회귀 loss를 계산합니다.
+
+        Args:
+            anchor_hidden_valid: 유효 anchor 문맥입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+            states: solver step 시작 상태 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            taus: solver step 시작 시각 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+            adjoint_targets: 각 step의 adjoint target 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+
+        Returns:
+            Tensor:
+                step 평균 regression loss 스칼라입니다.
+        """
+        if len(states) == 0:
+            return self._zero_loss()
+
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        anchor_hidden_detached = anchor_hidden_valid.detach()
+        step_losses: list[Tensor] = []
+
+        for state_k, tau_k, adjoint_k in zip(states, taus, adjoint_targets):
+            state_detached = state_k.detach()
+            _, residual_velocity, _ = flow_decoder.forward_components(
+                anchor_hidden=anchor_hidden_detached,
+                x_t_norm=state_detached,
+                tau=tau_k,
+            )
+            sigma_t = flow_ode.sigma_t(tau_k).view(-1, 1, 1)
+            tau_view = tau_k.view(-1, 1, 1).clamp_min(flow_ode.eps)
+            target_velocity = -(sigma_t / tau_view) * adjoint_k.detach()
+            weight = tau_view / sigma_t.clamp_min(flow_ode.eps)
+            step_losses.append((weight * (residual_velocity - target_velocity).square()).mean())
+
+        return torch.stack(step_losses).mean()
+
+    def _am_finetune_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> tuple[Tensor, Dict[str, Tensor]]:
+        """AM fine-tuning용 학습 loss와 모니터링 지표를 한 번에 계산합니다.
+
+        Args:
+            tokenized_map: 지도 토큰 사전입니다.
+            tokenized_agent: agent 토큰 사전입니다.
+
+        Returns:
+            tuple[Tensor, Dict[str, Tensor]]:
+                첫 번째는 최종 학습 loss 스칼라입니다.
+                두 번째는 로그용 지표 사전입니다.
+        """
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            teacher_pack = self.encoder.forward_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+            anchor_hidden_valid = self.encoder.pack_anchor_hidden(
+                anchor_hidden=teacher_pack["anchor_hidden"],
+                anchor_mask=teacher_pack["anchor_mask"],
+            )
+            flow_clean_norm = teacher_pack["flow_clean_norm"]
+
+        if flow_clean_norm.numel() == 0:
+            zero_loss = self._zero_loss()
+            zero_metric = zero_loss.detach()
+            return zero_loss, {
+                "ADE2s": zero_metric,
+                "FDE2s": zero_metric,
+                "yaw_ADE2s": zero_metric,
+                "yaw_FDE2s": zero_metric,
+                "feasible_projection_gap": zero_metric,
+            }
+
+        rollout = self._run_am_rollout(anchor_hidden_valid=anchor_hidden_valid)
+        x_final = rollout["x_final"]
+        x_final_for_grad = x_final.detach().requires_grad_(True)
+        feasible_gap = self.flow_feasible_projector.projection_gap(
+            traj_norm=x_final_for_grad,
+            actor_type=tokenized_agent["flow_train_actor_type"],
+            current_control=tokenized_agent["flow_train_current_control"],
+            current_control_valid=tokenized_agent["flow_train_current_control_valid"],
+        )
+        feasible_gap_mean = feasible_gap.mean() if feasible_gap.numel() > 0 else x_final_for_grad.new_zeros(())
+        terminal_grad = torch.autograd.grad(
+            outputs=feasible_gap_mean,
+            inputs=x_final_for_grad,
+            retain_graph=False,
+            create_graph=False,
+        )[0]
+        adjoint_targets = self._build_am_adjoint_targets(
+            anchor_hidden_valid=anchor_hidden_valid,
+            states=rollout["states"],
+            taus=rollout["taus"],
+            terminal_grad=terminal_grad,
+        )
+        loss = self._compute_am_residual_regression_loss(
+            anchor_hidden_valid=anchor_hidden_valid,
+            states=rollout["states"],
+            taus=rollout["taus"],
+            adjoint_targets=adjoint_targets,
+        )
+        open_metric_dict = self._build_open_loop_metric_dict(
+            pred_clean_norm=x_final.detach(),
+            target_clean_norm=flow_clean_norm.detach(),
+        )
+        open_metric_dict["feasible_projection_gap"] = feasible_gap_mean.detach()
+        return loss, open_metric_dict
 
     def _update_weighted_validation_metrics(
         self,
@@ -631,7 +949,7 @@ class SMARTFlow(LightningModule):
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
-                sampling_noise=self.eval_sampling_noise,
+                sampling_scheme=self.validation_rollout_sampling,
                 scenario_sampling_seeds=scenario_sampling_seeds,
             )
             return (
@@ -665,7 +983,7 @@ class SMARTFlow(LightningModule):
             rollout_cache=expanded_rollout_cache,
             tokenized_agent=expanded_tokenized_agent,
             map_feature=expanded_map_feature,
-            sampling_noise=self.eval_sampling_noise,
+            sampling_scheme=self.validation_rollout_sampling,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
         )
         return (
@@ -855,12 +1173,25 @@ class SMARTFlow(LightningModule):
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
-        pred = self.encoder(
-            tokenized_map,
-            tokenized_agent,
-            anchor_mask_key="flow_train_mask",
-        )
-        loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+        if self.am_enabled:
+            self._set_am_finetune_module_mode()
+            loss, open_metric_dict = self._am_finetune_step(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+            )
+        else:
+            pred = self.encoder(
+                tokenized_map,
+                tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+            loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+            open_metric_dict["feasible_projection_gap"] = self._build_feasible_projection_metric(
+                pred_clean_norm=pred["flow_pred_clean_norm"].detach(),
+                tokenized_agent=tokenized_agent,
+                split_prefix="flow_train",
+            )
+
         self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/ADE2s", open_metric_dict["ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/FDE2s", open_metric_dict["FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
@@ -875,6 +1206,14 @@ class SMARTFlow(LightningModule):
         self.log(
             "train/FDEyaw2s",
             open_metric_dict["yaw_FDE2s"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/feasible_projection_gap",
+            open_metric_dict["feasible_projection_gap"],
             on_step=False,
             on_epoch=True,
             sync_dist=True,
@@ -898,18 +1237,24 @@ class SMARTFlow(LightningModule):
             open_pred_clean_norm = self.encoder.sample_open_loop_future(
                 anchor_hidden=denoise_pred["anchor_hidden"],
                 anchor_mask=denoise_pred["anchor_mask"],
-                sampling_noise=self.eval_sampling_noise,
+                sampling_scheme=self.validation_rollout_sampling,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
             )
             open_metric_dict = self._build_open_loop_metric_dict(
                 pred_clean_norm=open_pred_clean_norm,
                 target_clean_norm=denoise_pred["flow_clean_norm"],
             )
-            self._update_weighted_validation_metrics(
-                metric_store=self.val_open_epoch_metrics,
-                metric_dict=open_metric_dict,
-                sample_count=open_sample_count,
+            open_metric_dict["feasible_projection_gap"] = self._build_feasible_projection_metric(
+                pred_clean_norm=open_pred_clean_norm,
+                tokenized_agent=tokenized_agent,
+                split_prefix="flow_eval",
             )
+            if open_sample_count > 0:
+                self._update_weighted_validation_metrics(
+                    metric_store=self.val_open_epoch_metrics,
+                    metric_dict=open_metric_dict,
+                    sample_count=open_sample_count,
+                )
 
         if self.val_closed_loop:
             pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
@@ -1006,7 +1351,14 @@ class SMARTFlow(LightningModule):
                 self.sim_agents_submission.save_sub_file()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError("학습 가능한 파라미터가 없습니다.")
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
 
         def lr_lambda(_current_step):
             current_step = self.current_epoch + 1

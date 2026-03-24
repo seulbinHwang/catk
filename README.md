@@ -830,3 +830,84 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=sim_agents_sub_flow action=validate trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/model.ckpt task_name=flow_sim_agents_val_ddp6 trainer.limit_val_batches=1.0 model.model_config.val_open_loop=false model.model_config.val_closed_loop=true
 ```
+
+
+## 11. Residual AM fine-tuning
+
+이 저장소에는 pretrained flow checkpoint 위에 **작은 residual velocity head 하나만 추가해서** open-loop Adjoint Matching fine-tuning을 하는 경로가 포함되어 있습니다.
+
+핵심 원칙:
+
+- pretrained FM 분포는 최대한 유지합니다.
+- base encoder / decoder / 기존 velocity head는 freeze 합니다.
+- `flow_decoder.residual_velocity_head` 만 학습합니다.
+- terminal cost는 `class-wise dead-zone control projection gap` 하나만 사용합니다.
+- validation과 checkpoint 선택은 deterministic open-loop branch 하나만 사용합니다.
+
+추가된 주요 설정 파일:
+
+- `configs/experiment/am_ft_flow.yaml`
+- `configs/model/smart_flow.yaml`
+
+추가된 주요 코드 경로:
+
+- `src/smart/modules/flow_feasible_projection.py`
+- `src/smart/modules/flow_local_decoder.py`
+- `src/smart/model/smart_flow.py`
+- `src/smart/tokens/flow_token_processor.py`
+
+### 11.1 fine-tuning 실행 예시
+
+`action=finetune` 는 기존 코드 경로를 그대로 사용하고, `ckpt_path` 로 준 pretrained checkpoint를 `strict=False` 로 읽은 뒤 학습을 시작합니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  action=finetune \
+  experiment=am_ft_flow \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path=/path/to/flow_pretrain.ckpt \
+  task_name=flow_am_ft_h1006
+```
+
+### 11.2 기본 fine-tuning 하이퍼파라미터
+
+`configs/experiment/am_ft_flow.yaml` 기본값:
+
+- learning rate: `1e-4`
+- warmup: `2` epoch 스케줄
+- max epochs: `16`
+- optimizer: `AdamW`
+- weight decay: `1e-4`
+- grad clip: `1.0`
+- validation 주기: `2` epoch마다
+- checkpoint monitor: `val_open/feasible_projection_gap`
+- checkpoint mode: `min`
+
+### 11.3 validation / checkpoint 선택 규칙
+
+AM fine-tuning에서는 validation에서 아래만 사용합니다.
+
+- `model.model_config.val_open_loop=true`
+- `model.model_config.val_closed_loop=false`
+- `model.model_config.eval_sampling_noise.sample_steps=16`
+- `model.model_config.eval_sampling_noise.sample_method=midpoint`
+
+즉, stochastic training rollout은 **학습 loss를 만들 때만** 쓰고,
+validation과 checkpoint 선택은 **noise 없는 deterministic open-loop 생성 경로**만 사용합니다.
+
+### 11.4 packed anchor 부가 정보
+
+`FlowTokenProcessor` 는 기존 `flow_*_clean_norm` 외에 아래도 같이 만듭니다.
+
+- `flow_train_current_control`, `flow_eval_current_control`
+- `flow_train_current_control_valid`, `flow_eval_current_control_valid`
+- `flow_train_actor_type`, `flow_eval_actor_type`
+
+이 값들은 anchor 직전 0.1초 구간의 body-control 과 actor type 이고,
+feasible projection gap 계산에 사용됩니다.

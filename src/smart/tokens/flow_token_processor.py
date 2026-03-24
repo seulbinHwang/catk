@@ -7,7 +7,7 @@ from torch import Tensor
 from torch_geometric.data import HeteroData
 
 from src.smart.tokens.token_processor import TokenProcessor
-from src.smart.utils import transform_to_local
+from src.smart.utils import transform_to_local, wrap_angle
 
 
 class FlowTokenProcessor(TokenProcessor):
@@ -66,6 +66,9 @@ class FlowTokenProcessor(TokenProcessor):
         if self.training:
             flow_train_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
             flow_train_chunks: List[Tensor] = []
+            flow_train_current_control_chunks: List[Tensor] = []
+            flow_train_current_control_valid_chunks: List[Tensor] = []
+            flow_train_actor_type_chunks: List[Tensor] = []
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
                 future_valid = valid[:, raw_step + 1 : raw_step + 21].all(dim=1)
@@ -83,8 +86,21 @@ class FlowTokenProcessor(TokenProcessor):
                     anchor_mask=anchor_mask,
                     raw_step=raw_step,
                 )
+                anchor_current_control, anchor_current_control_valid = self._build_anchor_current_control(
+                    pos=pos,
+                    heading=heading,
+                    valid=valid,
+                    anchor_mask=anchor_mask,
+                    raw_step=raw_step,
+                )
+                anchor_actor_type = tokenized_agent["type"][anchor_mask]
                 train_keep_local = train_mask[anchor_mask]
                 flow_train_chunks.append(anchor_clean_norm[train_keep_local])
+                flow_train_current_control_chunks.append(anchor_current_control[train_keep_local])
+                flow_train_current_control_valid_chunks.append(
+                    anchor_current_control_valid[train_keep_local]
+                )
+                flow_train_actor_type_chunks.append(anchor_actor_type[train_keep_local])
 
             tokenized_agent.update(
                 {
@@ -92,6 +108,22 @@ class FlowTokenProcessor(TokenProcessor):
                     "flow_train_clean_norm": self._concat_flow_chunks(
                         chunks=flow_train_chunks,
                         dtype=dtype,
+                        device=device,
+                    ),
+                    "flow_train_current_control": self._concat_anchor_chunks(
+                        chunks=flow_train_current_control_chunks,
+                        trailing_shape=(3,),
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "flow_train_current_control_valid": self._concat_anchor_bool_chunks(
+                        chunks=flow_train_current_control_valid_chunks,
+                        device=device,
+                    ),
+                    "flow_train_actor_type": self._concat_anchor_chunks(
+                        chunks=flow_train_actor_type_chunks,
+                        trailing_shape=(),
+                        dtype=tokenized_agent["type"].dtype,
                         device=device,
                     ),
                 }
@@ -110,6 +142,9 @@ class FlowTokenProcessor(TokenProcessor):
 
         flow_eval_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
         flow_eval_chunks: List[Tensor] = []
+        flow_eval_current_control_chunks: List[Tensor] = []
+        flow_eval_current_control_valid_chunks: List[Tensor] = []
+        flow_eval_actor_type_chunks: List[Tensor] = []
         for anchor_offset, raw_step in enumerate(raw_current_steps):
             current_valid = valid[:, raw_step]
             future_valid = valid[:, raw_step + 1 : raw_step + 21].all(dim=1)
@@ -126,7 +161,18 @@ class FlowTokenProcessor(TokenProcessor):
                 anchor_mask=anchor_mask,
                 raw_step=raw_step,
             )
+            anchor_current_control, anchor_current_control_valid = self._build_anchor_current_control(
+                pos=pos,
+                heading=heading,
+                valid=valid,
+                anchor_mask=anchor_mask,
+                raw_step=raw_step,
+            )
+            anchor_actor_type = tokenized_agent["type"][anchor_mask]
             flow_eval_chunks.append(anchor_clean_norm)
+            flow_eval_current_control_chunks.append(anchor_current_control)
+            flow_eval_current_control_valid_chunks.append(anchor_current_control_valid)
+            flow_eval_actor_type_chunks.append(anchor_actor_type)
 
         tokenized_agent.update(
             {
@@ -134,6 +180,22 @@ class FlowTokenProcessor(TokenProcessor):
                 "flow_eval_clean_norm": self._concat_flow_chunks(
                     chunks=flow_eval_chunks,
                     dtype=dtype,
+                    device=device,
+                ),
+                "flow_eval_current_control": self._concat_anchor_chunks(
+                    chunks=flow_eval_current_control_chunks,
+                    trailing_shape=(3,),
+                    dtype=dtype,
+                    device=device,
+                ),
+                "flow_eval_current_control_valid": self._concat_anchor_bool_chunks(
+                    chunks=flow_eval_current_control_valid_chunks,
+                    device=device,
+                ),
+                "flow_eval_actor_type": self._concat_anchor_chunks(
+                    chunks=flow_eval_actor_type_chunks,
+                    trailing_shape=(),
+                    dtype=tokenized_agent["type"].dtype,
                     device=device,
                 ),
             }
@@ -182,6 +244,97 @@ class FlowTokenProcessor(TokenProcessor):
             ],
             dim=-1,
         )
+
+    def _build_anchor_current_control(
+        self,
+        pos: Tensor,
+        heading: Tensor,
+        valid: Tensor,
+        anchor_mask: Tensor,
+        raw_step: int,
+    ) -> tuple[Tensor, Tensor]:
+        """anchor 직전 0.1초 구간의 body control을 만듭니다.
+
+        Args:
+            pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전처리된 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            valid: 각 10Hz 시점 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            anchor_mask: 이번 anchor를 실제로 쓰는 agent 마스크입니다.
+                shape은 ``[n_agent]`` 입니다.
+            raw_step: 현재 anchor가 가리키는 10Hz 시점 번호입니다.
+
+        Returns:
+            tuple[Tensor, Tensor]:
+                순서대로 ``current_control`` 과 ``current_control_valid`` 입니다.
+                ``current_control`` 의 shape은 ``[n_valid_anchor, 3]`` 이고,
+                마지막 축은 ``[v_x^b, v_y^b, omega]`` 순서입니다.
+                ``current_control_valid`` 의 shape은 ``[n_valid_anchor]`` 입니다.
+        """
+        num_valid_anchor = int(anchor_mask.sum().item())
+        current_control = pos.new_zeros((num_valid_anchor, 3))
+        current_control_valid = valid[anchor_mask, raw_step] & valid[anchor_mask, raw_step - 1]
+        if num_valid_anchor == 0 or not bool(current_control_valid.any()):
+            return current_control, current_control_valid
+
+        dt = 0.1
+        pos_prev = pos[anchor_mask, raw_step - 1]
+        pos_now = pos[anchor_mask, raw_step]
+        head_prev = heading[anchor_mask, raw_step - 1]
+        head_now = heading[anchor_mask, raw_step]
+        delta_head = wrap_angle(head_now - head_prev)
+        head_mid = head_prev + 0.5 * delta_head
+        vel_world = (pos_now - pos_prev) / dt
+
+        cos_mid = head_mid.cos()
+        sin_mid = head_mid.sin()
+        current_control[:, 0] = vel_world[:, 0] * cos_mid + vel_world[:, 1] * sin_mid
+        current_control[:, 1] = -vel_world[:, 0] * sin_mid + vel_world[:, 1] * cos_mid
+        current_control[:, 2] = delta_head / dt
+        current_control = current_control * current_control_valid.unsqueeze(-1).to(current_control.dtype)
+        return current_control, current_control_valid
+
+    def _concat_anchor_chunks(
+        self,
+        chunks: List[Tensor],
+        trailing_shape: Tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        """anchor 순서로 만든 일반 텐서 조각을 하나로 합칩니다.
+
+        Args:
+            chunks: 각 anchor에서 만든 텐서 조각 목록입니다.
+            trailing_shape: 첫 축 뒤에 붙는 모양입니다.
+            dtype: 반환 텐서 자료형입니다.
+            device: 반환 텐서 장치입니다.
+
+        Returns:
+            Tensor:
+                이어 붙인 텐서입니다. shape은 ``[n_total_valid_anchor, *trailing_shape]`` 입니다.
+        """
+        if len(chunks) == 0:
+            return torch.zeros((0, *trailing_shape), device=device, dtype=dtype)
+        return torch.cat(chunks, dim=0)
+
+    def _concat_anchor_bool_chunks(
+        self,
+        chunks: List[Tensor],
+        device: torch.device,
+    ) -> Tensor:
+        """anchor 순서로 만든 bool 조각을 하나로 합칩니다.
+
+        Args:
+            chunks: 각 anchor에서 만든 bool 조각 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+            device: 반환 텐서 장치입니다.
+
+        Returns:
+            Tensor:
+                이어 붙인 bool 텐서입니다. shape은 ``[n_total_valid_anchor]`` 입니다.
+        """
+        if len(chunks) == 0:
+            return torch.zeros((0,), device=device, dtype=torch.bool)
+        return torch.cat(chunks, dim=0)
 
     def _concat_flow_chunks(
         self,
