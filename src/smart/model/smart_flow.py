@@ -313,6 +313,21 @@ class SMARTFlow(LightningModule):
             return torch.stack(trainable_zero_terms).sum()
         return next(self.parameters()).sum() * 0.0
 
+    def _assert_finite_tensor(self, name: str, value: Tensor) -> None:
+        """중간 텐서가 NaN/Inf면 즉시 학습을 멈춥니다."""
+        if value.numel() == 0:
+            return
+        finite_mask = torch.isfinite(value)
+        if bool(finite_mask.all()):
+            return
+        bad_values = value.detach()[~finite_mask].flatten()[:8].cpu().tolist()
+        raise RuntimeError(f"{name} contains non-finite values: {bad_values}")
+
+    def _assert_finite_tensor_list(self, name: str, values: Sequence[Tensor]) -> None:
+        """여러 텐서를 순서대로 검사합니다."""
+        for idx, value in enumerate(values):
+            self._assert_finite_tensor(f"{name}[{idx}]", value)
+
     def _run_am_rollout(self, anchor_hidden_valid: Tensor) -> Dict[str, object]:
         """현재 residual이 더해진 field로 AM 학습용 rollout을 만듭니다.
 
@@ -499,64 +514,79 @@ class SMARTFlow(LightningModule):
                 첫 번째는 최종 학습 loss 스칼라입니다.
                 두 번째는 로그용 지표 사전입니다.
         """
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            teacher_pack = self.encoder.forward_from_map_feature(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
-            anchor_hidden_valid = self.encoder.pack_anchor_hidden(
-                anchor_hidden=teacher_pack["anchor_hidden"],
-                anchor_mask=teacher_pack["anchor_mask"],
-            )
-            flow_clean_norm = teacher_pack["flow_clean_norm"]
+        device_type = self.device.type if self.device.type else "cpu"
+        # AM loss 경로는 작은 tau 분모와 autograd.grad를 함께 써서 mixed precision에서 쉽게 깨집니다.
+        with torch.autocast(device_type=device_type, enabled=False):
+            with torch.no_grad():
+                map_feature = self.encoder.encode_map(tokenized_map)
+                teacher_pack = self.encoder.forward_from_map_feature(
+                    map_feature=map_feature,
+                    tokenized_agent=tokenized_agent,
+                    anchor_mask_key="flow_train_mask",
+                )
+                anchor_hidden_valid = self.encoder.pack_anchor_hidden(
+                    anchor_hidden=teacher_pack["anchor_hidden"],
+                    anchor_mask=teacher_pack["anchor_mask"],
+                )
+                flow_clean_norm = teacher_pack["flow_clean_norm"]
 
-        if flow_clean_norm.numel() == 0:
-            zero_loss = self._zero_loss()
-            zero_metric = zero_loss.detach()
-            return zero_loss, {
-                "ADE2s": zero_metric,
-                "FDE2s": zero_metric,
-                "yaw_ADE2s": zero_metric,
-                "yaw_FDE2s": zero_metric,
-                "feasible_projection_gap": zero_metric,
-            }
+            if flow_clean_norm.numel() == 0:
+                zero_loss = self._zero_loss()
+                zero_metric = zero_loss.detach()
+                return zero_loss, {
+                    "ADE2s": zero_metric,
+                    "FDE2s": zero_metric,
+                    "yaw_ADE2s": zero_metric,
+                    "yaw_FDE2s": zero_metric,
+                    "feasible_projection_gap": zero_metric,
+                }
 
-        rollout = self._run_am_rollout(anchor_hidden_valid=anchor_hidden_valid)
-        x_final = rollout["x_final"]
-        x_final_for_grad = x_final.detach().requires_grad_(True)
-        feasible_gap = self.flow_feasible_projector.projection_gap(
-            traj_norm=x_final_for_grad,
-            actor_type=tokenized_agent["flow_train_actor_type"],
-            current_control=tokenized_agent["flow_train_current_control"],
-            current_control_valid=tokenized_agent["flow_train_current_control_valid"],
-        )
-        feasible_gap_mean = feasible_gap.mean() if feasible_gap.numel() > 0 else x_final_for_grad.new_zeros(())
-        terminal_grad = torch.autograd.grad(
-            outputs=feasible_gap_mean,
-            inputs=x_final_for_grad,
-            retain_graph=False,
-            create_graph=False,
-        )[0]
-        adjoint_targets = self._build_am_adjoint_targets(
-            anchor_hidden_valid=anchor_hidden_valid,
-            states=rollout["states"],
-            taus=rollout["taus"],
-            terminal_grad=terminal_grad,
-        )
-        loss = self._compute_am_residual_regression_loss(
-            anchor_hidden_valid=anchor_hidden_valid,
-            states=rollout["states"],
-            taus=rollout["taus"],
-            adjoint_targets=adjoint_targets,
-        )
-        open_metric_dict = self._build_open_loop_metric_dict(
-            pred_clean_norm=x_final.detach(),
-            target_clean_norm=flow_clean_norm.detach(),
-        )
-        open_metric_dict["feasible_projection_gap"] = feasible_gap_mean.detach()
-        return loss, open_metric_dict
+            rollout = self._run_am_rollout(anchor_hidden_valid=anchor_hidden_valid)
+            x_final = rollout["x_final"]
+            self._assert_finite_tensor("am/x_final", x_final)
+
+            x_final_for_grad = x_final.detach().requires_grad_(True)
+            feasible_gap = self.flow_feasible_projector.projection_gap(
+                traj_norm=x_final_for_grad,
+                actor_type=tokenized_agent["flow_train_actor_type"],
+                current_control=tokenized_agent["flow_train_current_control"],
+                current_control_valid=tokenized_agent["flow_train_current_control_valid"],
+            )
+            feasible_gap_mean = (
+                feasible_gap.mean() if feasible_gap.numel() > 0 else x_final_for_grad.new_zeros(())
+            )
+            self._assert_finite_tensor("am/feasible_gap_mean", feasible_gap_mean)
+
+            terminal_grad = torch.autograd.grad(
+                outputs=feasible_gap_mean,
+                inputs=x_final_for_grad,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+            self._assert_finite_tensor("am/terminal_grad", terminal_grad)
+
+            adjoint_targets = self._build_am_adjoint_targets(
+                anchor_hidden_valid=anchor_hidden_valid,
+                states=rollout["states"],
+                taus=rollout["taus"],
+                terminal_grad=terminal_grad,
+            )
+            self._assert_finite_tensor_list("am/adjoint_targets", adjoint_targets)
+
+            loss = self._compute_am_residual_regression_loss(
+                anchor_hidden_valid=anchor_hidden_valid,
+                states=rollout["states"],
+                taus=rollout["taus"],
+                adjoint_targets=adjoint_targets,
+            )
+            self._assert_finite_tensor("am/loss", loss)
+
+            open_metric_dict = self._build_open_loop_metric_dict(
+                pred_clean_norm=x_final.detach(),
+                target_clean_norm=flow_clean_norm.detach(),
+            )
+            open_metric_dict["feasible_projection_gap"] = feasible_gap_mean.detach()
+            return loss, open_metric_dict
 
     def _update_weighted_validation_metrics(
         self,

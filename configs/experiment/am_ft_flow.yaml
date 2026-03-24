@@ -37,7 +37,7 @@ trainer:
   limit_val_batches: 0.1
   check_val_every_n_epoch: 2
   max_epochs: 16
-  precision: bf16-mixed
+  precision: 32-true
   gradient_clip_val: 1.0
   sync_batchnorm: false
 
