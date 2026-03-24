@@ -24,7 +24,7 @@ model_config:
     agent_token_sampling:
       num_k: 1
       temp: 1.0
-  validation_rollout_sampling:
+  eval_sampling_noise:
     noise_scale: 1.0
   decoder:
     hidden_dim: 128

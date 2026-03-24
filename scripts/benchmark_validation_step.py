@@ -67,7 +67,7 @@ def main(cfg: DictConfig) -> None:
         _ = model.encoder.sample_open_loop_future(
             anchor_hidden=denoise_pred["anchor_hidden"],
             anchor_mask=denoise_pred["anchor_mask"],
-            sampling_scheme=model.validation_rollout_sampling,
+            sampling_noise=model.eval_sampling_noise,
             sampling_seed=model._get_validation_open_seed(0),
         )
         torch.cuda.synchronize()
