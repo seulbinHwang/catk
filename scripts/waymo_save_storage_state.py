@@ -29,6 +29,8 @@ from pathlib import Path
 _DEFAULT_OUTPUT_PATH = (
     Path(__file__).resolve().parents[1] / "secrets" / "waymo" / "waymo_storage_state.json"
 )
+_WAYMO_ORIGIN = "https://waymo.com"
+_WAYMO_TERMS_LOCAL_STORAGE_KEY = "datasetChallengeTermsAgreementAccepted"
 _SYSTEM_BROWSER_CANDIDATES = {
     "chrome": (
         "/opt/google/chrome/chrome",
@@ -265,6 +267,118 @@ def _prepare_user_data_dir(args: argparse.Namespace) -> tuple[Path, bool]:
     return temp_dir.resolve(), True
 
 
+def _wait_for_page_ready(page) -> None:
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        page.wait_for_timeout(1000)
+
+
+def _read_waymo_local_storage(page) -> list[dict[str, str]]:
+    if not page.url.startswith(_WAYMO_ORIGIN):
+        return []
+
+    entries = page.evaluate(
+        """() =>
+            Object.entries(window.localStorage).map(([name, value]) => ({ name, value }))
+        """
+    )
+    if not isinstance(entries, list):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        value = item.get("value")
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        normalized.append({"name": name, "value": value})
+    return normalized
+
+
+def _upsert_waymo_origin_local_storage(
+    output_path: Path,
+    local_storage_entries: list[dict[str, str]],
+) -> None:
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    origins = []
+    for origin_entry in payload.get("origins", []):
+        if not isinstance(origin_entry, dict):
+            continue
+        if origin_entry.get("origin") == _WAYMO_ORIGIN:
+            continue
+        origins.append(origin_entry)
+
+    if local_storage_entries:
+        origins.append(
+            {
+                "origin": _WAYMO_ORIGIN,
+                "localStorage": local_storage_entries,
+            }
+        )
+
+    payload["origins"] = origins
+    output_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _validate_waymo_submission_page(page) -> tuple[bool, list[dict[str, str]]]:
+    body_text = page.locator("body").inner_text(timeout=10000).lower()
+    current_url = page.url.lower()
+
+    if "accounts.google.com" in current_url or "/open/auth/login" in current_url:
+        raise RuntimeError(
+            "The browser is still on the Google / Waymo sign-in page. "
+            "Finish sign-in first, then re-run the save script."
+        )
+
+    if "sign in to submit" in body_text or "please sign in to continue" in body_text:
+        raise RuntimeError(
+            "The challenge page still shows the sign-in gate. "
+            "Sign in with the target account and make sure the Sim Agents page loads "
+            "the upload UI before saving storage_state.json."
+        )
+
+    has_review_rules_gate = page.get_by_text("Review rules", exact=False).count() > 0
+    if has_review_rules_gate:
+        raise RuntimeError(
+            "The challenge page still shows `Review rules`. "
+            "Open that page on the GUI machine, accept the challenge terms once, wait "
+            "until the Sim Agents page shows the upload form, and then save the state again."
+        )
+
+    file_input_count = page.locator("input[type='file']").count()
+    if file_input_count == 0:
+        raise RuntimeError(
+            "Could not find a Waymo upload form on the Sim Agents page. "
+            "Only save storage_state.json after the page shows the validation / test "
+            "submission boxes."
+        )
+
+    local_storage_entries = _read_waymo_local_storage(page)
+    if not any(
+        item.get("name") == _WAYMO_TERMS_LOCAL_STORAGE_KEY and item.get("value") == "true"
+        for item in local_storage_entries
+    ):
+        local_storage_entries = [
+            item
+            for item in local_storage_entries
+            if item.get("name") != _WAYMO_TERMS_LOCAL_STORAGE_KEY
+        ]
+        local_storage_entries.append(
+            {
+                "name": _WAYMO_TERMS_LOCAL_STORAGE_KEY,
+                "value": "true",
+            }
+        )
+
+    return True, local_storage_entries
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -311,6 +425,7 @@ def main() -> None:
 
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(args.url, wait_until="domcontentloaded")
+            _wait_for_page_ready(page)
 
             profile_mode = "temporary" if remove_user_data_dir else "persistent"
             print(f"Using {profile_mode} browser profile directory: {user_data_dir}")
@@ -325,8 +440,17 @@ def main() -> None:
             print("3. Confirm the Sim Agents page shows the submission UI instead of the sign-in gate.")
             input("Press Enter here after the page is fully ready to save storage_state.json...")
 
+            page.goto(args.url, wait_until="domcontentloaded")
+            _wait_for_page_ready(page)
+            _, waymo_local_storage = _validate_waymo_submission_page(page)
+
             context.storage_state(path=output_path.as_posix())
+            _upsert_waymo_origin_local_storage(output_path, waymo_local_storage)
             print(f"Saved Waymo storage state to {output_path}")
+            print(
+                "Verified that the Sim Agents page showed the upload form and stored the "
+                f"`{_WAYMO_TERMS_LOCAL_STORAGE_KEY}` Waymo localStorage flag for headless uploads."
+            )
         finally:
             if browser is not None:
                 try:

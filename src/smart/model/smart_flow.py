@@ -927,16 +927,8 @@ class SMARTFlow(LightningModule):
                     pred_traj=pred_traj,
                     pred_z=pred_z,
                     pred_head=pred_head,
-                    global_rank=self.global_rank,
                 )
-                gpu_dict = self.sim_agents_submission.compute()
-                if self.global_rank == 0:
-                    for k in gpu_dict.keys():
-                        if isinstance(gpu_dict[k], list):
-                            gpu_dict[k] = gpu_dict[k][0]
-                    scenario_rollouts = get_scenario_rollouts(**gpu_dict)
-                    self.sim_agents_submission.aggregate_rollouts(scenario_rollouts)
-                self.sim_agents_submission.reset()
+                scenario_rollouts = self.sim_agents_submission.aggregate_current_batch()
             else:
                 scenario_rollouts = self._update_closed_loop_metric_states(
                     data=data,
@@ -1010,7 +1002,7 @@ class SMARTFlow(LightningModule):
                     self.logger.log_metrics(epoch_sim_agents_metrics)
                 self.sim_agents_metrics.reset()
                 self.minADE.reset()
-            if self.global_rank == 0 and self.sim_agents_submission.is_active:
+            if self.sim_agents_submission.is_active:
                 self.sim_agents_submission.save_sub_file()
 
     def configure_optimizers(self):
@@ -1049,17 +1041,8 @@ class SMARTFlow(LightningModule):
             pred_traj=pred_traj,
             pred_z=pred_z,
             pred_head=pred_head,
-            global_rank=self.global_rank,
         )
-        gpu_dict = self.sim_agents_submission.compute()
-        if self.global_rank == 0:
-            for k in gpu_dict.keys():
-                if isinstance(gpu_dict[k], list):
-                    gpu_dict[k] = gpu_dict[k][0]
-            scenario_rollouts = get_scenario_rollouts(**gpu_dict)
-            self.sim_agents_submission.aggregate_rollouts(scenario_rollouts)
-        self.sim_agents_submission.reset()
+        self.sim_agents_submission.aggregate_current_batch()
 
     def on_test_epoch_end(self):
-        if self.global_rank == 0:
-            self.sim_agents_submission.save_sub_file()
+        self.sim_agents_submission.save_sub_file()

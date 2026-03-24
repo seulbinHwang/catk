@@ -20,8 +20,6 @@ import numpy as np
 import tensorflow as tf
 from waymo_open_dataset.protos import scenario_pb2, sim_agents_submission_pb2
 
-from .video_recorder import ImageEncoder
-
 COLOR_BLACK = (0, 0, 0)
 COLOR_WHITE = (255, 255, 255)
 COLOR_RED = (255, 0, 0)
@@ -371,11 +369,53 @@ class VisWaymo:
 
 
 def save_images_to_mp4(images: List[np.ndarray], out_path: str, fps=20) -> None:
-    encoder = ImageEncoder(out_path, images[0].shape, fps, fps)
-    for im in images:
-        encoder.capture_frame(im)
-    encoder.close()
-    encoder = None
+    if not images:
+        raise ValueError("save_images_to_mp4 received an empty image list.")
+
+    reference_shape = images[0].shape
+    if len(reference_shape) != 3 or reference_shape[2] != 3:
+        raise RuntimeError(
+            f"Expected RGB frames with shape [H, W, 3], got {reference_shape}."
+        )
+
+    frame_h, frame_w = reference_shape[:2]
+    pad_bottom = frame_h % 2
+    pad_right = frame_w % 2
+    output_size = (frame_w + pad_right, frame_h + pad_bottom)
+
+    writer = cv2.VideoWriter(
+        out_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        output_size,
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {out_path}.")
+
+    try:
+        for im in images:
+            if im.shape != reference_shape:
+                raise RuntimeError(
+                    f"Inconsistent frame shape {im.shape}; expected {reference_shape}."
+                )
+            if im.dtype != np.uint8:
+                raise RuntimeError(
+                    f"Expected uint8 frames for video export, got {im.dtype}."
+                )
+
+            if pad_bottom or pad_right:
+                im = cv2.copyMakeBorder(
+                    im,
+                    0,
+                    pad_bottom,
+                    0,
+                    pad_right,
+                    cv2.BORDER_CONSTANT,
+                    value=(0, 0, 0),
+                )
+            writer.write(cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
 
 
 def get_agent_features(

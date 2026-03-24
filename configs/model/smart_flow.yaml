@@ -25,7 +25,7 @@ model_config:
       num_k: 1
       temp: 1.0
   validation_rollout_sampling:
-    sample_steps: 4
+    sample_steps: 16
     sample_method: midpoint
     noise_scale: 1.0
   decoder:
