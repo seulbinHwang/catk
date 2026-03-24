@@ -36,6 +36,7 @@ from src.utils import (
     log_hyperparameters,
     print_config_tree,
 )
+from src.utils.waymo_submission import maybe_submit_waymo_submission
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -142,10 +143,12 @@ def main(cfg: DictConfig) -> None:
     log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
     print_config_tree(cfg, resolve=True, save_to_file=True)
 
-    run(cfg)  # train/val/test the model
-
-    log.info("Closing wandb!")
-    wandb.finish()
+    try:
+        run(cfg)  # train/val/test the model
+        maybe_submit_waymo_submission(cfg)
+    finally:
+        log.info("Closing wandb!")
+        wandb.finish()
     log.info(f"Output dir: {cfg.paths.output_dir}")
 
 
