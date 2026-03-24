@@ -448,20 +448,23 @@ torchrun \
 
 ## 7. WOSAC 2025 제출 파일 생성
 
-`configs/experiment/sim_agents_sub_flow.yaml`은 WOSAC 2025 / Waymo 2025 Sim Agents submission export용 설정입니다.  
-예전 `wosac_sub_flow` 대신 이 config를 사용합니다.  
-이 config는 local scorer를 돌리는 설정이 아니라 **submission format tar.gz를 만드는 설정**입니다.  
-validation split에 대해 submission 형식 결과물을 만들고 싶으면 `action=validate`, test split에 대해 최종 제출 파일을 만들고 싶으면 `action=test`를 사용하면 됩니다.  
-즉, validation과 test의 차이는 주로 `action`과 읽는 split이고, 최종 산출물 포맷은 동일합니다.  
-반대로 `configs/experiment/local_val_flow.yaml`은 validation 점수 계산용이므로 submission tar.gz가 필요할 때는 쓰지 않습니다.
+`configs/experiment/sim_agents_sub_flow.yaml`은 **Waymo/WOSAC에 올릴 제출 파일을 만드는 설정**입니다.
+점수를 계산하는 설정이 아니라, 최종 제출용 `tar.gz`를 만드는 설정이라고 생각하면 됩니다.
 
-`sim_agents_sub_flow`의 기본 의도:
+헷갈리기 쉬운 차이는 아래처럼 보면 됩니다.
 
-- `sim_agents_submission.is_active=true` 라서 submission export 모드로 동작합니다.
-- `n_batch_sim_agents_metric=0` 이라 local WOSAC / Sim Agents 점수는 계산하지 않습니다.
-- `trainer.limit_val_batches=1.0`, `trainer.limit_test_batches=1.0`, `data.shuffle=false` 라서 전체 split export용 기본값이 이미 잡혀 있습니다.
+- `local_val_flow`: validation 점수를 보고 싶을 때
+- `sim_agents_sub_flow`: 제출 파일을 만들고 싶을 때
+- `action=validate`: validation split으로 제출 형식이 잘 나오는지 미리 확인할 때
+- `action=test`: test split으로 최종 제출 파일을 만들 때
 
-제출 전 아래 항목은 반드시 채워야 합니다.
+`sim_agents_sub_flow`는 기본적으로 아래처럼 동작합니다.
+
+- 제출 파일 생성 모드로 실행됩니다.
+- 로컬 점수는 계산하지 않습니다.
+- validation/test split 전체를 읽도록 기본값이 잡혀 있습니다.
+
+실행 전에 아래 값은 꼭 채워 주세요.
 
 - `ckpt_path`
 - `model.model_config.sim_agents_submission.method_name`
@@ -471,17 +474,17 @@ validation split에 대해 submission 형식 결과물을 만들고 싶으면 `a
 - `model.model_config.sim_agents_submission.method_link`
 - `model.model_config.sim_agents_submission.account_name`
 
-실무적으로 `ckpt_path`에는 아래 중 하나를 넣으면 됩니다.
+`ckpt_path`에는 보통 아래 중 하나를 넣으면 됩니다.
 
-- 마지막 상태를 내고 싶으면 `last.ckpt` 또는 `epoch_last.ckpt`
-- 가장 좋은 checkpoint를 내고 싶으면 monitored `epoch_XXX.ckpt`
+- 가장 최근 학습 상태를 쓰려면 `last.ckpt` 또는 `epoch_last.ckpt`
+- 가장 성능이 좋았던 checkpoint를 쓰려면 `epoch_XXX.ckpt`
 
-### 7.1 validation split으로 submission 형식 점검
+### 7.1 validation split으로 제출 형식 먼저 확인하기
 
-validation split은 GT가 있는 split이지만, **아래 명령은 점수 계산용이 아니라 submission format export용**입니다.  
-즉, validation split 전체를 읽어서 `sim_agents_2025_submission.tar.gz`를 만들어 주며, local 점수까지 같이 보고 싶다면 `local_val_flow`를 별도로 한 번 더 실행해야 합니다.
+`action=validate`는 validation 데이터를 읽어서 제출 파일이 잘 만들어지는지 확인하는 용도입니다.
+점수를 계산하는 명령은 아니므로, validation 점수도 함께 보고 싶다면 `local_val_flow`를 따로 한 번 더 실행해야 합니다.
 
-빠르게 1 GPU로 형식만 확인하고 싶으면:
+빠르게 1 GPU로 형식만 확인하고 싶다면:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -503,10 +506,10 @@ python -m src.run \
   model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
 ```
 
-### 7.2 validation split 전체를 6 GPU로 submission export
+### 7.2 validation split 전체를 6 GPU로 제출 파일 만들기
 
-학습을 6 GPU로 했고 validation split 전체를 DDP로 submission 형식 출력하고 싶다면 아래처럼 실행하면 됩니다.  
-이 명령을 그대로 따라 하면 validation split 전체를 6 GPU로 shard해서 중복 없이 처리한 뒤, 최종적으로 validation 기준 submission tar.gz를 생성합니다.
+validation split 전체를 6 GPU로 나눠서 빠르게 처리하고 싶다면 아래 명령을 쓰면 됩니다.
+실행이 끝나면 validation 기준 제출 파일 `tar.gz`가 만들어집니다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
@@ -533,18 +536,19 @@ torchrun \
   paths.log_dir=/workspace/exp_logs
 ```
 
-위 명령의 의미:
+이 명령에서 중요한 옵션만 보면 아래와 같습니다.
 
-- `action=validate` 이므로 validation split을 읽습니다.
-- `trainer=ddp`, `trainer.devices=6` 이므로 6 GPU가 validation set을 분산 처리합니다.
-- `trainer.limit_val_batches=1.0` 이므로 validation split 전체를 끝까지 돕니다.
-- `model.model_config.val_open_loop=false` 이므로 open-loop 계산은 생략하고 submission format export에 필요한 closed-loop rollout만 수행합니다.
-- `model.model_config.val_closed_loop=true` 이므로 submission에 필요한 rollout은 유지합니다.
+- `action=validate`: validation split을 사용합니다.
+- `trainer=ddp`, `trainer.devices=6`: GPU 6장을 함께 사용합니다.
+- `trainer.limit_val_batches=1.0`: validation split 전체를 끝까지 읽습니다.
+- `model.model_config.val_open_loop=false`: open-loop 계산은 생략합니다.
+- `model.model_config.val_closed_loop=true`: 제출 파일 생성에 필요한 closed-loop rollout은 유지합니다.
+- `paths.log_dir=/workspace/exp_logs`: 로그를 저장할 위치입니다.
 
-### 7.3 test split submission export
+### 7.3 test split으로 최종 제출 파일 만들기
 
-최종 WOSAC / Sim Agents 제출용 test split tar.gz를 만들고 싶다면 아래처럼 `action=test`를 사용합니다.  
-validation export와 비교하면 핵심 차이는 `action=test`라는 점뿐입니다.
+실제로 Waymo/WOSAC에 올릴 test split 결과를 만들 때는 `action=test`를 사용합니다.
+validation 예시와 비교하면 핵심 차이는 `action=test` 하나입니다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
@@ -563,35 +567,35 @@ torchrun \
   paths.log_dir=/workspace/exp_logs
 ```
 
-출력물:
+실행이 끝나면 아래 파일이 생성됩니다.
 
 - `logs/<task_name>/runs/<timestamp>/sim_agents_2025_submission/`
 - `logs/<task_name>/runs/<timestamp>/sim_agents_2025_submission.tar.gz`
 
-validation export와 test export 모두 동일한 위치와 형식으로 저장됩니다.  
-차이는 어떤 split을 읽었는지뿐입니다.
+validation export와 test export는 저장 위치와 파일 형식이 같습니다.
+차이는 validation 데이터를 읽었는지, test 데이터를 읽었는지만 다릅니다.
 
-주의:
+알아둘 점:
 
-- `sim_agents_sub_flow`는 submission export용이라 `val_closed/sim_agents_2025/*` 같은 local 점수는 계산하지 않습니다.
-- validation 점수와 submission tar.gz가 둘 다 필요하면 `local_val_flow`로 점수 계산을 한 번, `sim_agents_sub_flow`로 export를 한 번 따로 실행해야 합니다.
-- 기본 `n_rollout_closed_val=32`는 submission format 쪽 기본값이라 웬만하면 그대로 두는 편이 안전합니다.
-- OOM이 나면 먼저 `data.val_batch_size=4 -> 2 -> 1` 또는 `data.test_batch_size=4 -> 2 -> 1` 순으로 줄이는 게 안전합니다.
-- validation split export는 포맷 점검이나 내부 검수용으로 좋고, 실제 challenge 업로드는 보통 test split tar.gz를 사용합니다.
+- `sim_agents_sub_flow`는 제출 파일 생성용이라 로컬 점수는 계산하지 않습니다.
+- 점수와 제출 파일이 둘 다 필요하면 `local_val_flow`와 `sim_agents_sub_flow`를 각각 한 번씩 실행해야 합니다.
+- 특별한 이유가 없으면 `n_rollout_closed_val=32`는 그대로 두는 편이 안전합니다.
+- 메모리가 부족하면 `data.val_batch_size` 또는 `data.test_batch_size`를 `4 -> 2 -> 1` 순서로 줄여 보세요.
+- validation split export는 형식 확인용으로 좋고, 실제 업로드는 보통 test split에서 만든 `tar.gz`를 사용합니다.
 
 ### 7.4 SSH 서버에서 Waymo 사이트로 자동 업로드
 
-이제 validation/test export가 끝난 뒤 Waymo 사이트 업로드까지 이어서 자동 실행할 수 있습니다.  
-다만 Waymo 제출 페이지는 Google 로그인 세션이 필요하므로, **비밀번호를 코드에 넣는 방식이 아니라 Playwright `storage_state.json` 세션 파일을 재사용**합니다.  
-즉, 서버가 GUI가 없어도 괜찮지만, **처음 한 번은 GUI가 있는 PC에서 로그인 세션을 저장한 뒤 서버로 옮겨야 합니다.**
+SSH 서버에서도 제출 파일을 만든 뒤 바로 Waymo 사이트에 업로드할 수 있습니다.
+다만 Google 로그인은 한 번 필요하므로, **GUI가 있는 PC에서 로그인 상태를 저장한 뒤 그 파일을 서버로 옮기는 방식**을 사용합니다.
 
-이 레포의 canonical 세션 경로는 아래입니다.
+로그인 상태 파일의 기본 위치는 아래와 같습니다.
 
 ```text
 secrets/waymo/waymo_storage_state.json
 ```
 
-이 파일은 사실상 로그인 쿠키와 비슷한 권한을 가지므로, raw JSON을 git에 넣는다면 private repo에서만 다루는 편이 맞습니다.
+이 파일은 로그인된 상태를 그대로 담고 있으므로 비밀번호처럼 조심해서 다뤄야 합니다.
+공개 저장소에는 올리지 않는 편이 안전합니다.
 
 준비:
 
@@ -600,20 +604,27 @@ python -m pip install -r install/requirements.txt
 python -m playwright install chromium
 ```
 
-GUI가 있는 PC에서 세션 저장:
+1. GUI가 있는 PC에서 로그인 상태를 저장합니다.
 
 ```bash
 python scripts/waymo_save_storage_state.py --browser-channel chrome
 ```
 
 기본 저장 위치는 `secrets/waymo/waymo_storage_state.json` 입니다.  
-로그인용 브라우저 프로필은 기본적으로 **매 실행마다 새 임시 디렉터리로 생성되고 종료 시 정리됩니다.**  
-Google 계정 로그인은 Playwright 번들 Chromium보다 **설치된 Chrome/Edge stable 채널**에서 더 잘 동작하므로, GUI PC에서는 `--browser-channel chrome` 또는 `--browser-channel msedge` 사용을 권장합니다.  
-`--user-data-dir` 를 직접 주고 싶다면 Playwright 전용의 빈 디렉터리로 두는 편이 안전하며, **평소 쓰는 기본 Chrome 프로필 경로를 직접 지정하지 않는 편이 좋습니다.**  
-예전 실행에서 만든 프로필 디렉터리를 재사용하다가 Chrome이 바로 종료되면, `--user-data-dir` 를 빼고 다시 실행해서 새 임시 프로필을 쓰면 됩니다.  
-GUI PC와 서버가 같은 git working tree를 공유하지 않으면, 이 파일만 서버의 같은 경로로 복사하면 됩니다.
+로그인이 잘 안 되면 Playwright 기본 Chromium보다 설치된 Chrome이나 Edge를 쓰는 편이 더 안정적입니다.
+그래서 GUI PC에서는 `--browser-channel chrome` 또는 `--browser-channel msedge`를 권장합니다.
 
-자동 업로드까지 포함한 validation 예시:
+추가로 기억할 점:
+
+- 브라우저 프로필은 실행할 때마다 임시로 만들고, 종료하면 정리합니다.
+- `--user-data-dir`를 직접 줄 때는 Playwright 전용의 빈 폴더를 쓰는 편이 안전합니다.
+- 평소 쓰는 기본 Chrome 프로필 폴더를 그대로 넣는 건 권장하지 않습니다.
+- 예전에 만든 프로필을 재사용하다가 브라우저가 바로 꺼지면 `--user-data-dir` 없이 다시 실행해 보세요.
+- GUI PC와 서버가 같은 작업 폴더를 쓰지 않는다면, 이 파일만 서버의 같은 경로로 복사하면 됩니다.
+
+2. 서버에서 자동 업로드를 켠 상태로 validation 또는 test를 실행합니다.
+
+validation 예시는 아래와 같습니다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
@@ -642,17 +653,22 @@ torchrun \
   paths.log_dir=/workspace/exp_logs
 ```
 
-설명:
+핵심 옵션은 아래만 기억하면 됩니다.
 
-- `waymo_submission.enabled=true` 는 master switch 입니다.
-- `waymo_submission.submit_validate=true` 이므로 validation run에서는 `enabled=true` 만 주면 rank 0 프로세스가 `sim_agents_2025_submission.tar.gz`를 자동 업로드합니다.
-- `waymo_submission.storage_state_path` 기본값은 `secrets/waymo/waymo_storage_state.json` 입니다.
-- 기본은 headless Chromium이며, 서버에 system Chrome 경로가 따로 있으면 `waymo_submission.browser_channel=chrome` 또는 `waymo_submission.browser_executable_path=/path/to/chrome` 로 바꿀 수 있습니다.
-- DOM이 바뀌거나 세션이 만료되면 `logs/<task_name>/runs/<timestamp>/waymo_submission_debug/` 아래에 HTML/PNG를 남기고 실패합니다.
-- 점수 페이지 polling은 `waymo_submission.poll_submission_status=true` 로 켤 수 있지만, Waymo 제출 UI 구조가 바뀌면 매칭이 약할 수 있어 기본값은 `false` 입니다.
+- `waymo_submission.enabled=true`: 자동 업로드를 켭니다.
+- `waymo_submission.storage_state_path`: 로그인 상태 파일 경로입니다. 기본값은 `secrets/waymo/waymo_storage_state.json` 입니다.
+- `waymo_submission.poll_submission_status=false`: 업로드 후 점수 페이지를 계속 확인하지는 않습니다.
 
-test 자동 제출은 기본적으로 막아뒀습니다.  
-Waymo test set은 계정당 30일에 3회 제한이 있으므로, test run에서 자동 제출하려면 아래처럼 명시적으로 한 번 더 arm 해야 합니다.
+추가 참고:
+
+- validation 실행에서는 `waymo_submission.enabled=true`만 주면 업로드까지 진행됩니다.
+- 서버에서 기본으로 headless Chromium을 사용합니다.
+- 서버에 설치된 Chrome을 쓰고 싶으면 `waymo_submission.browser_channel=chrome` 또는 `waymo_submission.browser_executable_path=/path/to/chrome`를 지정하면 됩니다.
+- 로그인 만료나 페이지 구조 변경으로 실패하면 `logs/<task_name>/runs/<timestamp>/waymo_submission_debug/` 아래에 디버그 파일이 남습니다.
+- 점수 페이지까지 자동 확인하고 싶으면 `waymo_submission.poll_submission_status=true`를 줄 수 있지만, UI 변경에 영향을 받을 수 있어 기본값은 `false`입니다.
+
+test 자동 제출은 실수 방지를 위해 기본으로 꺼져 있습니다.
+Waymo test set은 계정당 30일에 3번만 제출할 수 있으므로, test 업로드를 할 때는 아래 옵션을 추가로 넣어야 합니다.
 
 ```bash
 ... action=test \
@@ -660,7 +676,7 @@ Waymo test set은 계정당 30일에 3회 제한이 있으므로, test run에서
     waymo_submission.submit_test=true
 ```
 
-즉, `waymo_submission.enabled=true` 만으로는 test 제출이 나가지 않습니다.
+즉, `waymo_submission.enabled=true`만으로는 test 제출이 올라가지 않습니다.
 
 ## 8. Visualization
 
