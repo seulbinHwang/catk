@@ -10,7 +10,7 @@ model:
     lr_min_ratio: 1.0e-2
     weight_decay: 1.0e-4
     val_open_loop: true
-    val_closed_loop: false
+    val_closed_loop: true
     am_finetune:
       enabled: true
       init_noise_scale: 1.0
@@ -45,8 +45,8 @@ trainer:
 
 callbacks:
   model_checkpoint:
-    monitor: val_open/feasible_projection_gap
-    mode: min
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
 
 data:
   train_batch_size: 26

@@ -842,7 +842,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src
 - base encoder / decoder / 기존 velocity head는 freeze 합니다.
 - `flow_decoder.residual_velocity_head` 만 학습합니다.
 - terminal cost는 `class-wise dead-zone control projection gap` 하나만 사용합니다.
-- validation과 checkpoint 선택은 deterministic open-loop branch 하나만 사용합니다.
+- validation은 fixed-seed open-loop / closed-loop 둘 다 돌리고, checkpoint 선택은 closed-loop realism metric을 사용합니다.
 
 추가된 주요 설정 파일:
 
@@ -886,20 +886,22 @@ torchrun \
 - weight decay: `1e-4`
 - grad clip: `1.0`
 - validation 주기: `2` epoch마다
-- checkpoint monitor: `val_open/feasible_projection_gap`
-- checkpoint mode: `min`
+- checkpoint monitor: `val_closed/sim_agents_2025/realism_meta_metric`
+- checkpoint mode: `max`
 
 ### 11.3 validation / checkpoint 선택 규칙
 
 AM fine-tuning에서는 validation에서 아래만 사용합니다.
 
 - `model.model_config.val_open_loop=true`
-- `model.model_config.val_closed_loop=false`
+- `model.model_config.val_closed_loop=true`
 - `model.model_config.eval_sampling_noise.sample_steps=16`
 - `model.model_config.eval_sampling_noise.sample_method=midpoint`
 
-즉, stochastic training rollout은 **학습 loss를 만들 때만** 쓰고,
-validation과 checkpoint 선택은 **noise 없는 deterministic open-loop 생성 경로**만 사용합니다.
+즉, stochastic training rollout은 **학습 loss를 만들 때** 쓰고,
+validation은 **고정 seed 기반 open-loop / closed-loop 경로**를 함께 사용합니다.
+checkpoint 선택은 `pre_bc_flow`와 마찬가지로
+`val_closed/sim_agents_2025/realism_meta_metric` 최대값 기준입니다.
 
 ### 11.4 packed anchor 부가 정보
 
