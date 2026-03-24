@@ -57,7 +57,7 @@ class SimAgentsSubmission(Metric):
             self.i_file = 0
             self.submission_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
             self.submission_dir = Path(self.submission_dir) / _SIM_AGENTS_2025_SUBMISSION_DIRNAME
-            self.submission_dir.mkdir(exist_ok=True)
+            self.submission_dir.mkdir(parents=True, exist_ok=True)
             self.submission_scenario_id = []
 
             self.data_keys = [
@@ -116,6 +116,11 @@ class SimAgentsSubmission(Metric):
                     self._save_shard()
 
     def save_sub_file(self) -> None:
+        """모든 rank가 만든 shard를 모아 Waymo 제출용 tar.gz를 만듭니다.
+
+        Returns:
+            None: 파일 저장만 하고 값을 돌려주지 않습니다.
+        """
         self._save_shard()
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
@@ -124,17 +129,21 @@ class SimAgentsSubmission(Metric):
         if self._get_global_rank() != 0:
             return
 
-        shard_files = sorted([p.as_posix() for p in self.submission_dir.glob("*")])
+        shard_files = sorted(self.submission_dir.glob("*.binproto"))
         if len(shard_files) == 0:
             log.info("No Sim Agents 2025 submission shards were produced. Skip tar.gz export.")
             return
 
+        num_shards = len(shard_files)
         log.info(f"Saving Sim Agents 2025 submission files to {tar_file_name}")
         with tarfile.open(tar_file_name, "w:gz") as tar:
-            for output_filename in shard_files:
+            for shard_index, shard_path in enumerate(shard_files):
                 tar.add(
-                    output_filename,
-                    arcname=Path(output_filename).name + f"-of-{len(shard_files):05d}",
+                    shard_path.as_posix(),
+                    arcname=self._build_archive_member_name(
+                        shard_index=shard_index,
+                        num_shards=num_shards,
+                    ),
                 )
         log.info(f"DONE: Saved Sim Agents 2025 submission files to {tar_file_name}")
         self.i_file = 0
@@ -166,6 +175,19 @@ class SimAgentsSubmission(Metric):
             f.write(shard_submission.SerializeToString())
         self.i_file += 1
         self.buffer_scenario_rollouts = []
+
+    @staticmethod
+    def _build_archive_member_name(shard_index: int, num_shards: int) -> str:
+        """tar 안에 들어갈 binproto 이름을 Waymo 규격에 맞게 만듭니다.
+
+        Args:
+            shard_index: 현재 shard 순번입니다.
+            num_shards: 전체 shard 개수입니다.
+
+        Returns:
+            str: ``submission.binproto-00000-of-00006`` 형태의 이름입니다.
+        """
+        return f"submission.binproto-{shard_index:05d}-of-{num_shards:05d}"
 
     @staticmethod
     def _get_global_rank() -> int:
