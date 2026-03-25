@@ -20,7 +20,7 @@ model:
     finetune:
       enabled: true
       mode: adjoint_matching
-      rollout_steps: 16
+      rollout_steps: 64
       rollout_noise_scale: 1.0
       rollout_start_tau: 0.05
       rollout_init_noise_scale: null
