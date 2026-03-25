@@ -364,14 +364,14 @@ class SmoothControlProjector(nn.Module):
             omega_old = omega
         else:
             ds = s_signed[:, 1:] - s_signed[:, :-1]
-            ds = torch.clamp(ds, min=-accel_limit[:, :-1], max=accel_limit[:, :-1])
+            ds = torch.clamp(ds, min=-accel_limit, max=accel_limit)
             s_old = torch.cat([s_signed[:, :1], s_signed[:, :1] + torch.cumsum(ds, dim=1)], dim=1)
 
             d_omega = omega[:, 1:] - omega[:, :-1]
             d_omega = torch.clamp(
                 d_omega,
-                min=-alpha_limit[:, :-1],
-                max=alpha_limit[:, :-1],
+                min=-alpha_limit,
+                max=alpha_limit,
             )
             omega_old = torch.cat(
                 [omega[:, :1], omega[:, :1] + torch.cumsum(d_omega, dim=1)],
@@ -552,7 +552,7 @@ class SmoothControlProjector(nn.Module):
         """
         tau = float(self.smooth_deadzone_tau)
         epsilon = self.smooth_deadzone_epsilon.view(1, 1, 3).to(value)
-        return tau * torch.log1p(torch.exp((self._smooth_abs(value) - epsilon) / tau))
+        return tau * F.softplus((self._smooth_abs(value) - epsilon) / tau)
 
     def compute_terminal_cost(
         self,
