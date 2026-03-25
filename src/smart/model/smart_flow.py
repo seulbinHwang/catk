@@ -951,6 +951,30 @@ class SMARTFlow(LightningModule):
                 batch_size=1,
             )
             self.log(
+                "train/projection_gap_vx_b_mps",
+                am_result.projection_gap_vx_b_mps,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                "train/projection_gap_vy_b_mps",
+                am_result.projection_gap_vy_b_mps,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                "train/projection_gap_yaw_rate_degps",
+                am_result.projection_gap_yaw_rate_degps,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
                 "train/residual_norm",
                 am_result.residual_norm, # residual_velocity 의 출력 값
                 on_step=True,

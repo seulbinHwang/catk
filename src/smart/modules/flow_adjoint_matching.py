@@ -67,6 +67,9 @@ class AdjointMatchingResult:
         loss: 실제로 역전파할 regression loss 입니다. shape은 ``[]`` 입니다.
         terminal_cost: 마지막 feasible cost 평균입니다. shape은 ``[]`` 입니다.
         projection_gap: 정규화된 projector gap의 평균 절대값입니다. shape은 ``[]`` 입니다.
+        projection_gap_vx_b_mps: body x 속도 gap의 평균 절대값입니다. 단위는 m/s 입니다.
+        projection_gap_vy_b_mps: body y 속도 gap의 평균 절대값입니다. 단위는 m/s 입니다.
+        projection_gap_yaw_rate_degps: yaw-rate gap의 평균 절대값입니다. 단위는 deg/s 입니다.
         residual_norm: residual velocity의 평균 제곱 크기입니다. shape은 ``[]`` 입니다.
         final_sample: rollout 마지막 상태입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
     """
@@ -74,6 +77,9 @@ class AdjointMatchingResult:
     loss: Tensor
     terminal_cost: Tensor
     projection_gap: Tensor
+    projection_gap_vx_b_mps: Tensor
+    projection_gap_vy_b_mps: Tensor
+    projection_gap_yaw_rate_degps: Tensor
     residual_norm: Tensor
     final_sample: Tensor
 
@@ -82,7 +88,7 @@ class SmoothControlProjector(nn.Module):
     """미분 가능한 feasible terminal cost를 만드는 projector 입니다.
 
     이 클래스는 외부 feasible 구현의 제한값과 제약 순서를 그대로 가져오되,
-    reward 쪽에서는 detach 기반 STE를 쓰지 않고 실제 미분이 흐르는 연산만 사용합니다.
+    reward 쪽에서는 det ach 기반 STE를 쓰지 않고 실제 미분이 흐르는 연산만 사용합니다.
     그래서 terminal cost는 batch 전체에 대해 바로 autograd로 미분할 수 있습니다.
     """
 
@@ -577,10 +583,19 @@ class SmoothControlProjector(nn.Module):
                 logging용 스칼라 사전입니다.
                 "terminal_cost" : 값 1개
                 "projection_gap" : [n_valid_anchor, 20, 3] 의 평균
+                "projection_gap_vx_b_mps" : body x 속도 gap 평균 절대값
+                "projection_gap_vy_b_mps" : body y 속도 gap 평균 절대값
+                "projection_gap_yaw_rate_degps" : yaw-rate gap 평균 절대값
         """
         if pred_clean_norm.numel() == 0:
             zero = pred_clean_norm.sum() * 0.0
-            return zero, {"terminal_cost": zero.detach(), "projection_gap": zero.detach()}
+            return zero, {
+                "terminal_cost": zero.detach(),
+                "projection_gap": zero.detach(),
+                "projection_gap_vx_b_mps": zero.detach(),
+                "projection_gap_vy_b_mps": zero.detach(),
+                "projection_gap_yaw_rate_degps": zero.detach(),
+            }
         """ controls Dict[str, Tensor]
             : 아래 텐서를 담은 사전입니다. ( 비 정규화)
                 - ``vx_b``: body x 속도. shape은 ``[n_valid_anchor, 20]`` 
@@ -625,11 +640,15 @@ class SmoothControlProjector(nn.Module):
         smooth_gap = self._smooth_deadzone(normalized_gap)
         # per_anchor_cost: ``[n_valid_anchor]``
         per_anchor_cost = smooth_gap.pow(2).sum(dim=-1).mean(dim=-1)
+        gap_abs_mean = gap.abs().mean(dim=(0, 1))
         # terminal_cost: shape: ``[1]``
         terminal_cost = self.feasible_weight * per_anchor_cost.mean()
         metrics = {
             "terminal_cost": terminal_cost.detach(), #
             "projection_gap": normalized_gap.abs().mean().detach(), # [n_valid_anchor, 20, 3]
+            "projection_gap_vx_b_mps": gap_abs_mean[0].detach(),
+            "projection_gap_vy_b_mps": gap_abs_mean[1].detach(),
+            "projection_gap_yaw_rate_degps": gap_abs_mean[2].mul(180.0 / torch.pi).detach(),
         }
         return terminal_cost, metrics
 
@@ -804,6 +823,9 @@ class AdjointMatchingLoss(nn.Module):
                 "terminal_cost" : 값 1개
                 "projection_gap" : [n_valid_anchor, 20, 3]
                     : terminal_cost 를 평균하기 전 값
+                "projection_gap_vx_b_mps" : body x 속도 gap 평균 절대값
+                "projection_gap_vy_b_mps" : body y 속도 gap 평균 절대값
+                "projection_gap_yaw_rate_degps" : yaw-rate gap 평균 절대값
         """
         final_state_for_grad = final_state.detach().requires_grad_(True)
         terminal_cost, metrics = self.projector.compute_terminal_cost(
@@ -948,7 +970,8 @@ class AdjointMatchingLoss(nn.Module):
 
             # regression_target: ( n_valid_anchor, 20, 4 )
             regression_target = (2.0 / sigma) * residual_velocity + sigma * lean_adjoints[step_idx]
-            step_losses.append(regression_target.flatten(1).pow(2).sum(dim=1).mean())
+            # Keep AM regression on the same mean-MSE scale used by pre-bc training.
+            step_losses.append(regression_target.flatten(1).pow(2).mean(dim=1).mean())
 
         if len(step_losses) == 0:
             zero = self._zero_loss_with_trainable_dependency(
@@ -990,7 +1013,7 @@ class AdjointMatchingLoss(nn.Module):
 
         Returns:
             AdjointMatchingResult:
-                loss, terminal cost, gap, residual norm, 최종 sample
+                loss, terminal cost, normalized gap, physical-unit gap 통계, residual norm, 최종 sample
         """
         if anchor_hidden_valid.numel() == 0:
             zero = self._zero_loss_with_trainable_dependency(
@@ -1002,6 +1025,9 @@ class AdjointMatchingLoss(nn.Module):
                 loss=zero,
                 terminal_cost=zero.detach(),
                 projection_gap=zero.detach(),
+                projection_gap_vx_b_mps=zero.detach(),
+                projection_gap_vy_b_mps=zero.detach(),
+                projection_gap_yaw_rate_degps=zero.detach(),
                 residual_norm=zero.detach(),
                 final_sample=empty_sample,
             )
@@ -1036,6 +1062,9 @@ class AdjointMatchingLoss(nn.Module):
                 logging용 스칼라 사전입니다.
                 "terminal_cost" : 값 1개
                 "projection_gap" : [n_valid_anchor, 20, 3]
+                "projection_gap_vx_b_mps" : body x 속도 gap 평균 절대값
+                "projection_gap_vy_b_mps" : body y 속도 gap 평균 절대값
+                "projection_gap_yaw_rate_degps" : yaw-rate gap 평균 절대값
             """
             terminal_cost, terminal_grad, metrics = self._compute_terminal_gradient(
                 final_state=states[-1], # shape : [n_valid_anchor, 20, 4]
@@ -1046,6 +1075,12 @@ class AdjointMatchingLoss(nn.Module):
             self._assert_finite_tensor("am/terminal_cost", terminal_cost)
             self._assert_finite_tensor("am/terminal_grad", terminal_grad)
             self._assert_finite_tensor("am/projection_gap", metrics["projection_gap"])
+            self._assert_finite_tensor("am/projection_gap_vx_b_mps", metrics["projection_gap_vx_b_mps"])
+            self._assert_finite_tensor("am/projection_gap_vy_b_mps", metrics["projection_gap_vy_b_mps"])
+            self._assert_finite_tensor(
+                "am/projection_gap_yaw_rate_degps",
+                metrics["projection_gap_yaw_rate_degps"],
+            )
             """ lean_adjoints
             List[Tensor]: 각 rollout step의 lean adjoint 입니다.
                 길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
@@ -1083,6 +1118,9 @@ class AdjointMatchingLoss(nn.Module):
                 terminal_cost=metrics["terminal_cost"], # shape : ( )
                 # projection_gap: terminal_cost 를 평균하기 전 값
                 projection_gap=metrics["projection_gap"], # [n_valid_anchor, 20, 3]
+                projection_gap_vx_b_mps=metrics["projection_gap_vx_b_mps"],
+                projection_gap_vy_b_mps=metrics["projection_gap_vy_b_mps"],
+                projection_gap_yaw_rate_degps=metrics["projection_gap_yaw_rate_degps"],
                 residual_norm=residual_norm.detach(), # shape : ( )
                 final_sample=states[-1], # shape : [n_valid_anchor, 20, 4]
             )
