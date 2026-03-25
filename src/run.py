@@ -127,23 +127,25 @@ def run(cfg: DictConfig) -> None:
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
     elif cfg.action == "finetune":
+        if not cfg.get("ckpt_path"):
+            raise ValueError("ckpt_path must be provided for finetune action.")
         log.info("Starting finetuning!")
         checkpoint = torch.load(cfg.ckpt_path, map_location="cpu")
-        incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
-        if incompatible.missing_keys:
-            preview = ", ".join(incompatible.missing_keys[:8])
-            suffix = " ..." if len(incompatible.missing_keys) > 8 else ""
+        state_dict = checkpoint["state_dict"]
+        if hasattr(model, "inspect_finetune_checkpoint_compatibility"):
+            compatibility_report = model.inspect_finetune_checkpoint_compatibility(state_dict)
+            log.info(compatibility_report.format_multiline())
+            if compatibility_report.has_blocking_issues:
+                raise RuntimeError(
+                    "Finetune checkpoint failed compatibility dry-run.\n"
+                    f"{compatibility_report.format_multiline()}"
+                )
+        else:
             log.warning(
-                f"Finetune checkpoint is missing {len(incompatible.missing_keys)} key(s): "
-                f"{preview}{suffix}"
+                "Model does not provide finetune checkpoint compatibility dry-run; "
+                "falling back to strict state_dict loading."
             )
-        if incompatible.unexpected_keys:
-            preview = ", ".join(incompatible.unexpected_keys[:8])
-            suffix = " ..." if len(incompatible.unexpected_keys) > 8 else ""
-            log.warning(
-                f"Finetune checkpoint has {len(incompatible.unexpected_keys)} unexpected key(s): "
-                f"{preview}{suffix}"
-            )
+        model.load_state_dict(state_dict, strict=True)
         trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")

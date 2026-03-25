@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import gc
 import hashlib
 import math
@@ -28,6 +29,57 @@ from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+
+
+@dataclass(frozen=True)
+class FinetuneCheckpointCompatibilityReport:
+    allowed_missing_keys: tuple[str, ...] = ()
+    disallowed_missing_keys: tuple[str, ...] = ()
+    allowed_unexpected_keys: tuple[str, ...] = ()
+    disallowed_unexpected_keys: tuple[str, ...] = ()
+    allowed_shape_mismatches: tuple[tuple[str, tuple[int, ...], tuple[int, ...]], ...] = ()
+    disallowed_shape_mismatches: tuple[tuple[str, tuple[int, ...], tuple[int, ...]], ...] = ()
+
+    @property
+    def has_blocking_issues(self) -> bool:
+        return bool(
+            self.disallowed_missing_keys
+            or self.disallowed_unexpected_keys
+            or self.disallowed_shape_mismatches
+        )
+
+    @staticmethod
+    def _format_shape_mismatch_lines(
+        entries: tuple[tuple[str, tuple[int, ...], tuple[int, ...]], ...],
+    ) -> list[str]:
+        return [
+            f"{key} (model_shape={model_shape}, checkpoint_shape={checkpoint_shape})"
+            for key, model_shape, checkpoint_shape in entries
+        ]
+
+    def format_multiline(self) -> str:
+        lines = [
+            "Finetune checkpoint compatibility dry-run:",
+            f"  allowed_missing_keys ({len(self.allowed_missing_keys)}):",
+        ]
+        lines.extend([f"    - {key}" for key in self.allowed_missing_keys] or ["    - none"])
+        lines.append(f"  disallowed_missing_keys ({len(self.disallowed_missing_keys)}):")
+        lines.extend([f"    - {key}" for key in self.disallowed_missing_keys] or ["    - none"])
+        lines.append(f"  allowed_unexpected_keys ({len(self.allowed_unexpected_keys)}):")
+        lines.extend([f"    - {key}" for key in self.allowed_unexpected_keys] or ["    - none"])
+        lines.append(f"  disallowed_unexpected_keys ({len(self.disallowed_unexpected_keys)}):")
+        lines.extend([f"    - {key}" for key in self.disallowed_unexpected_keys] or ["    - none"])
+        lines.append(f"  allowed_shape_mismatches ({len(self.allowed_shape_mismatches)}):")
+        lines.extend(
+            [f"    - {entry}" for entry in self._format_shape_mismatch_lines(self.allowed_shape_mismatches)]
+            or ["    - none"]
+        )
+        lines.append(f"  disallowed_shape_mismatches ({len(self.disallowed_shape_mismatches)}):")
+        lines.extend(
+            [f"    - {entry}" for entry in self._format_shape_mismatch_lines(self.disallowed_shape_mismatches)]
+            or ["    - none"]
+        )
+        return "\n".join(lines)
 
 
 class SMARTFlow(LightningModule):
@@ -1202,23 +1254,98 @@ class SMARTFlow(LightningModule):
         Returns:
             _IncompatibleKeys: PyTorch가 돌려주는 키 검사 결과입니다.
         """
-        incompatible_keys = super().load_state_dict(state_dict, strict=False, assign=assign)
         if not strict:
-            return incompatible_keys
+            return super().load_state_dict(state_dict, strict=False, assign=assign)
 
-        missing_keys = [
-            key
-            for key in incompatible_keys.missing_keys
-            if "residual_velocity_head" not in key
-        ]
-        unexpected_keys = list(incompatible_keys.unexpected_keys)
-        if len(missing_keys) > 0 or len(unexpected_keys) > 0:
+        compatibility_report = self.inspect_finetune_checkpoint_compatibility(state_dict)
+        if compatibility_report.has_blocking_issues:
             raise RuntimeError(
                 "Error(s) in loading state_dict for SMARTFlow:\n"
-                f"Missing key(s): {missing_keys}\n"
-                f"Unexpected key(s): {unexpected_keys}"
+                f"{compatibility_report.format_multiline()}"
+            )
+
+        allowed_shape_mismatch_keys = {
+            key for key, _, _ in compatibility_report.allowed_shape_mismatches
+        }
+        filtered_state_dict = {
+            key: value
+            for key, value in state_dict.items()
+            if key not in allowed_shape_mismatch_keys
+        }
+        incompatible_keys = super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
+
+        remaining_missing_keys = [
+            key
+            for key in incompatible_keys.missing_keys
+            if not self._is_allowed_finetune_checkpoint_mismatch(key)
+        ]
+        remaining_unexpected_keys = [
+            key
+            for key in incompatible_keys.unexpected_keys
+            if not self._is_allowed_finetune_checkpoint_mismatch(key)
+        ]
+        if remaining_missing_keys or remaining_unexpected_keys:
+            raise RuntimeError(
+                "Error(s) in loading state_dict for SMARTFlow after filtering allowed "
+                "finetune mismatches:\n"
+                f"Missing key(s): {remaining_missing_keys}\n"
+                f"Unexpected key(s): {remaining_unexpected_keys}"
             )
         return incompatible_keys
+
+    @staticmethod
+    def _is_allowed_finetune_checkpoint_mismatch(key: str) -> bool:
+        return "residual_velocity_head" in key
+
+    def inspect_finetune_checkpoint_compatibility(
+        self,
+        state_dict: Dict[str, Tensor],
+    ) -> FinetuneCheckpointCompatibilityReport:
+        model_state = self.state_dict()
+        model_keys = set(model_state.keys())
+        checkpoint_keys = set(state_dict.keys())
+
+        missing_keys = sorted(model_keys - checkpoint_keys)
+        unexpected_keys = sorted(checkpoint_keys - model_keys)
+
+        shape_mismatches: list[tuple[str, tuple[int, ...], tuple[int, ...]]] = []
+        for key in sorted(model_keys & checkpoint_keys):
+            model_shape = tuple(model_state[key].shape)
+            checkpoint_shape = tuple(state_dict[key].shape)
+            if model_shape != checkpoint_shape:
+                shape_mismatches.append((key, model_shape, checkpoint_shape))
+
+        allowed_missing_keys = tuple(
+            key for key in missing_keys if self._is_allowed_finetune_checkpoint_mismatch(key)
+        )
+        disallowed_missing_keys = tuple(
+            key for key in missing_keys if not self._is_allowed_finetune_checkpoint_mismatch(key)
+        )
+        allowed_unexpected_keys = tuple(
+            key for key in unexpected_keys if self._is_allowed_finetune_checkpoint_mismatch(key)
+        )
+        disallowed_unexpected_keys = tuple(
+            key for key in unexpected_keys if not self._is_allowed_finetune_checkpoint_mismatch(key)
+        )
+        allowed_shape_mismatches = tuple(
+            entry
+            for entry in shape_mismatches
+            if self._is_allowed_finetune_checkpoint_mismatch(entry[0])
+        )
+        disallowed_shape_mismatches = tuple(
+            entry
+            for entry in shape_mismatches
+            if not self._is_allowed_finetune_checkpoint_mismatch(entry[0])
+        )
+
+        return FinetuneCheckpointCompatibilityReport(
+            allowed_missing_keys=allowed_missing_keys,
+            disallowed_missing_keys=disallowed_missing_keys,
+            allowed_unexpected_keys=allowed_unexpected_keys,
+            disallowed_unexpected_keys=disallowed_unexpected_keys,
+            allowed_shape_mismatches=allowed_shape_mismatches,
+            disallowed_shape_mismatches=disallowed_shape_mismatches,
+        )
 
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)

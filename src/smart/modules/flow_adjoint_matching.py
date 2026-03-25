@@ -636,7 +636,7 @@ class SmoothControlProjector(nn.Module):
         ).unsqueeze(1)
         # normalized_gap: ``[n_valid_anchor, 20, 3]``
         normalized_gap = gap / scale.clamp_min(float(self.hparams.eps))
-        # smooth_gap: ``[n_valid_anchor, 20, 3]``
+        # smooth_gap: ``[n_valid_anchor, 20, 3]``d
         smooth_gap = self._smooth_deadzone(normalized_gap)
         # per_anchor_cost: ``[n_valid_anchor]``
         per_anchor_cost = smooth_gap.pow(2).sum(dim=-1).mean(dim=-1)
