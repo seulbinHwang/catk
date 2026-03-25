@@ -108,7 +108,7 @@ class FlowODE:
         velocity: torch.Tensor,
         tau: torch.Tensor,
     ) -> torch.Tensor:
-        """AM stochastic rollout에 쓰는 drift 를 계산합니다.
+        """AM stochastic rollout 에 쓰는 drift 를 계산합니다.
 
         Args:
             x_t: 현재 상태입니다. shape은 ``[batch, 20, 4]`` 입니다.
@@ -130,6 +130,7 @@ class FlowODE:
         Returns:
             torch.Tensor: 각 샘플의 noise scale 입니다. shape은 ``[batch]`` 입니다.
         """
+
         sigma_t = self._sigma_t(tau)
         return torch.sqrt((2.0 * sigma_t).clamp_min(0.0) / tau.clamp_min(self.eps))
 
@@ -411,6 +412,7 @@ class HierarchicalFlowDecoder(nn.Module):
                 - ``residual_velocity``: residual velocity 입니다. shape은 ``[batch, 20, 4]`` 입니다.
                 - ``step_tokens``: 마지막 step feature 입니다. shape은 ``[batch, 20, flow_dim]`` 입니다.
         """
+        # step_tokens: [batch, 20, flow_dim]
         step_tokens = self._build_step_tokens(anchor_hidden, x_t_norm, tau)
         base_velocity = self.velocity_head(step_tokens)
         residual_velocity = self.residual_velocity_head(step_tokens)

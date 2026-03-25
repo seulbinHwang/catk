@@ -897,12 +897,25 @@ class SMARTFlow(LightningModule):
         with torch.autocast(device_type=device_type, enabled=False):
             with torch.no_grad():
                 map_feature = self.encoder.encode_map(tokenized_map)
+
                 _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
                     map_feature=map_feature,
                     tokenized_agent=tokenized_agent,
                     anchor_mask_key="flow_train_mask",
                 )
-
+            """
+            - ``anchor_hidden_valid``: 유효 anchor만 모은 문맥입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+            - flow_train_agent_type :  [n_valid_anchor] 
+                vehicle / pedestrian / cyclist를 구분하는 용도
+            - flow_train_current_control : [n_valid_anchor, 3]
+                - “anchor 직전 0.1초 동안의 현재 운동 상태를 body frame으로 표현한 값”
+                - 정규화된 값도 아니다.
+            - flow_train_current_control_valid : [n_valid_anchor]
+                - “방금 만든 current_control을 실제로 믿을 수 있는가”를 나타내는 bool 마스크
+                - raw_step-1과 raw_step이 둘 다 valid일 때만 True
+                - “현재 운동과의 연속성 제약을 적용할지 여부”
+            """
             return self.adjoint_matching_loss(
                 flow_decoder=self.encoder.agent_encoder.flow_decoder,
                 flow_ode=self.encoder.agent_encoder.flow_ode,
@@ -911,6 +924,7 @@ class SMARTFlow(LightningModule):
                 current_control=tokenized_agent["flow_train_current_control"].to(dtype=torch.float32),
                 current_control_valid=tokenized_agent["flow_train_current_control_valid"],
             )
+
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -922,7 +936,7 @@ class SMARTFlow(LightningModule):
             self.log("train/loss", am_result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log(
                 "train/terminal_cost",
-                am_result.terminal_cost,
+                am_result.terminal_cost, # (마지막 궤적과 projector 간의 gap) 의 평균값
                 on_step=True,
                 on_epoch=True,
                 sync_dist=True,
@@ -930,7 +944,7 @@ class SMARTFlow(LightningModule):
             )
             self.log(
                 "train/projection_gap",
-                am_result.projection_gap,
+                am_result.projection_gap, # (마지막 궤적과 projector 간의 gap) 의 평균값
                 on_step=True,
                 on_epoch=True,
                 sync_dist=True,
@@ -938,7 +952,7 @@ class SMARTFlow(LightningModule):
             )
             self.log(
                 "train/residual_norm",
-                am_result.residual_norm,
+                am_result.residual_norm, # residual_velocity 의 출력 값
                 on_step=True,
                 on_epoch=True,
                 sync_dist=True,

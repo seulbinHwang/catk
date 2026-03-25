@@ -206,7 +206,7 @@ class SmoothControlProjector(nn.Module):
             pred_clean_norm: 정규화된 미래입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
 
         Returns:
-            Dict[str, Tensor]: 아래 텐서를 담은 사전입니다.
+            Dict[str, Tensor]: 아래 텐서를 담은 사전입니다. ( 비 정규화)
                 - ``vx_b``: body x 속도. shape은 ``[n_valid_anchor, 20]`` 입니다.
                 - ``vy_b``: body y 속도. shape은 ``[n_valid_anchor, 20]`` 입니다.
                 - ``omega``: yaw-rate. shape은 ``[n_valid_anchor, 20]`` 입니다.
@@ -216,6 +216,7 @@ class SmoothControlProjector(nn.Module):
                 "pred_clean_norm must have shape [n_valid_anchor, 20, 4], "
                 f"got {tuple(pred_clean_norm.shape)}"
             )
+
 
         dt = float(self.hparams.dt)
         eps = float(self.hparams.eps)
@@ -487,7 +488,8 @@ class SmoothControlProjector(nn.Module):
         Returns:
             tuple[Tensor, Tensor, Tensor, Dict[str, Tensor]]:
                 projector 출력 ``vx_b``, ``vy_b``, ``omega`` 와
-                정규화에 쓸 제한값 사전입니다.
+                    - shape: ( ``[n_valid_anchor, 20, 3]`` )
+                limits: 정규화에 쓸 제한값 사전
         """
         limits = self._build_per_anchor_limits(
             agent_type=agent_type,
@@ -546,6 +548,7 @@ class SmoothControlProjector(nn.Module):
 
         Returns:
             Tensor: smooth dead-zone 이 적용된 gap 입니다. shape은 입력과 같습니다.
+                ``[n_valid_anchor, 20, 3]``
         """
         tau = float(self.smooth_deadzone_tau)
         epsilon = self.smooth_deadzone_epsilon.view(1, 1, 3).to(value)
@@ -562,19 +565,33 @@ class SmoothControlProjector(nn.Module):
 
         Args:
             pred_clean_norm: rollout 마지막 정규화 미래입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
-            agent_type: anchor별 객체 종류 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
+            agent_type: anchor별 객체 종류 번호. shape은 ``[n_valid_anchor]`` 입니다.
             current_control: anchor 직전 0.1초 body control 입니다. shape은 ``[n_valid_anchor, 3]`` 입니다.
             current_control_valid: current control 유효 여부입니다. shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
-            tuple[Tensor, Dict[str, Tensor]]:
-                batch 평균 terminal cost 와 logging용 스칼라 사전입니다.
+            terminal_cost : Tensor : shape : [ ]
+                batch 평균 terminal cost (가중치 같은거 곱해짐)
+            metrics : Dict[str, Tensor]
+                logging용 스칼라 사전입니다.
+                "terminal_cost" : 값 1개
+                "projection_gap" : [n_valid_anchor, 20, 3] 의 평균
         """
         if pred_clean_norm.numel() == 0:
             zero = pred_clean_norm.sum() * 0.0
             return zero, {"terminal_cost": zero.detach(), "projection_gap": zero.detach()}
-
+        """ controls Dict[str, Tensor]
+            : 아래 텐서를 담은 사전입니다. ( 비 정규화)
+                - ``vx_b``: body x 속도. shape은 ``[n_valid_anchor, 20]`` 
+                - ``vy_b``: body y 속도. shape은 ``[n_valid_anchor, 20]`` 
+                - ``omega``: yaw-rate. shape은 ``[n_valid_anchor, 20]``
+        
+        """
         controls = self.trajectory_to_controls(pred_clean_norm)
+        """
+        vx_proj, vy_proj, omega_proj: ``[n_valid_anchor, 20, 3]`` 
+        limits : Dict[str, Tensor]
+        """
         vx_proj, vy_proj, omega_proj, limits = self.project_controls(
             vx_b=controls["vx_b"],
             vy_b=controls["vy_b"],
@@ -583,7 +600,7 @@ class SmoothControlProjector(nn.Module):
             current_control=current_control,
             current_control_valid=current_control_valid,
         )
-
+        # gap : ``[n_valid_anchor, 20, 3]``
         gap = torch.stack(
             [
                 controls["vx_b"] - vx_proj,
@@ -592,6 +609,7 @@ class SmoothControlProjector(nn.Module):
             ],
             dim=-1,
         )
+        # scale: ``[n_valid_anchor, 3]``
         scale = torch.stack(
             [
                 limits["v_max"],
@@ -600,14 +618,17 @@ class SmoothControlProjector(nn.Module):
             ],
             dim=-1,
         ).unsqueeze(1)
+        # normalized_gap: ``[n_valid_anchor, 20, 3]``
         normalized_gap = gap / scale.clamp_min(float(self.hparams.eps))
+        # smooth_gap: ``[n_valid_anchor, 20, 3]``
         smooth_gap = self._smooth_deadzone(normalized_gap)
-
+        # per_anchor_cost: ``[n_valid_anchor]``
         per_anchor_cost = smooth_gap.pow(2).sum(dim=-1).mean(dim=-1)
+        # terminal_cost: shape: ``[1]``
         terminal_cost = self.feasible_weight * per_anchor_cost.mean()
         metrics = {
-            "terminal_cost": terminal_cost.detach(),
-            "projection_gap": normalized_gap.abs().mean().detach(),
+            "terminal_cost": terminal_cost.detach(), #
+            "projection_gap": normalized_gap.abs().mean().detach(), # [n_valid_anchor, 20, 3]
         }
         return terminal_cost, metrics
 
@@ -631,6 +652,15 @@ class AdjointMatchingLoss(nn.Module):
             smooth_deadzone_epsilon=smooth_deadzone_epsilon,
             smooth_deadzone_tau=smooth_deadzone_tau,
         )
+
+    @staticmethod
+    def _zero_loss_with_trainable_dependency(reference: Tensor, module: nn.Module) -> Tensor:
+        """빈 anchor batch에서도 trainable parameter graph를 유지하는 0 loss를 만듭니다."""
+        zero = reference.sum() * 0.0
+        for parameter in module.parameters():
+            if parameter.requires_grad:
+                zero = zero + parameter.sum() * 0.0
+        return zero
 
     @staticmethod
     def _assert_finite_tensor(name: str, value: Tensor) -> None:
@@ -679,9 +709,15 @@ class AdjointMatchingLoss(nn.Module):
         """Memoryless Euler–Maruyama SDE로 학습용 rollout 을 만듭니다.
 
         Args:
-            flow_decoder: velocity field decoder 입니다.
-            flow_ode: OT path helper 입니다.
-            anchor_hidden_valid: 유효 anchor 문맥입니다. shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+            flow_decoder:
+                velocity field decoder 입니다.
+            flow_ode:
+                OT path helper 입니다.
+            anchor_hidden_valid:
+                유효 anchor 문맥입니다. shape은 ``[n_valid_anchor, hidden_dim]``
+
+        여기서 말하는 상태 (state)
+            “정규화된 미래 궤적”
 
         Returns:
             tuple[List[Tensor], List[Tensor]]:
@@ -693,7 +729,12 @@ class AdjointMatchingLoss(nn.Module):
         batch_size = int(anchor_hidden_valid.shape[0])
         dtype = anchor_hidden_valid.dtype
         device = anchor_hidden_valid.device
+
         dt = (1.0 - float(flow_ode.eps)) / float(self.rollout_steps)
+        """ times : List[Tensor]
+            ``t_0`` 부터 ``t_K`` 까지의 시간 텐서 목록
+            각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+        """
         times = self._build_step_times(
             flow_ode=flow_ode,
             batch_size=batch_size,
@@ -711,16 +752,25 @@ class AdjointMatchingLoss(nn.Module):
         states: List[Tensor] = [current_state.detach()]
 
         for step_idx in range(self.rollout_steps):
-            tau = times[step_idx]
+            tau = times[step_idx] # shape : ``[n_valid_anchor]
+            """ velocity_dict
+            base_velocity : "기존 모델이 원래 가고 싶어하는 방향"
+            residual_velocity : "fine-tuning이 추가하는 보정 "
+            velocity : " 둘을 합친 최종 이동 방향 "
+            
+            3개 다 전부 shape : [n_valid_anchor, 20, 4]
+            """
+
             velocity_dict = flow_decoder.forward_components(
                 anchor_hidden=anchor_hidden_valid,
                 x_t_norm=current_state,
                 tau=tau,
             )
+            # drift : [batch, 20, 4]
             drift = flow_ode.drift_from_velocity(
-                x_t=current_state,
-                velocity=velocity_dict["velocity"],
-                tau=tau,
+                x_t=current_state, # [n_valid_anchor, 20, 4]
+                velocity=velocity_dict["velocity"], # [n_valid_anchor, 20, 4]
+                tau=tau, # [n_valid_anchor]
             )
             noise = torch.randn_like(current_state)
             sigma = flow_ode.memoryless_sigma(tau).view(-1, 1, 1)
@@ -739,23 +789,29 @@ class AdjointMatchingLoss(nn.Module):
         """마지막 feasible cost 와 그 gradient 를 계산합니다.
 
         Args:
-            final_state: rollout 마지막 상태입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
-            agent_type: anchor별 객체 종류 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
-            current_control: anchor 직전 0.1초 control 입니다. shape은 ``[n_valid_anchor, 3]`` 입니다.
-            current_control_valid: current control 유효 여부입니다. shape은 ``[n_valid_anchor]`` 입니다.
+            final_state: rollout 마지막 상태입니다. shape은 ``[n_valid_anchor, 20, 4]``
+            agent_type: anchor별 객체 종류 번호입니다. shape은 ``[n_valid_anchor]``
+            current_control: anchor 직전 0.1초 control 입니다. shape은 ``[n_valid_anchor, 3]``
+            current_control_valid: current control 유효 여부입니다. shape은 ``[n_valid_anchor]``
 
         Returns:
-            tuple[Tensor, Tensor, Dict[str, Tensor]]:
-                평균 terminal cost, 마지막 상태에 대한 gradient,
-                그리고 logging용 스칼라 사전입니다.
+            terminal_cost : Tensor  : shape : [ ]
+                batch 평균 terminal cost (마지막 궤적과 projector 간의 gap)
+            terminal_grad : Tensor : shape : [n_valid_anchor, 20, 4]
+            metrics : Dict[str, Tensor]
+                logging용 스칼라 사전입니다.
+                "terminal_cost" : 값 1개
+                "projection_gap" : [n_valid_anchor, 20, 3]
+                    : terminal_cost 를 평균하기 전 값
         """
         final_state_for_grad = final_state.detach().requires_grad_(True)
         terminal_cost, metrics = self.projector.compute_terminal_cost(
-            pred_clean_norm=final_state_for_grad,
-            agent_type=agent_type,
-            current_control=current_control,
-            current_control_valid=current_control_valid,
+            pred_clean_norm=final_state_for_grad, # [n_valid_anchor, 20, 4]
+            agent_type=agent_type, # [n_valid_anchor]
+            current_control=current_control, # [n_valid_anchor, 3]
+            current_control_valid=current_control_valid, # [n_valid_anchor]
         )
+        # terminal_grad : shape : [n_valid_anchor, 20, 4]
         terminal_grad = torch.autograd.grad(terminal_cost, final_state_for_grad)[0].detach()
         return terminal_cost, terminal_grad, metrics
 
@@ -814,13 +870,19 @@ class AdjointMatchingLoss(nn.Module):
             List[Tensor]: 각 rollout step의 lean adjoint 입니다.
                 길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
+
         dt = (1.0 - float(flow_ode.eps)) / float(self.rollout_steps)
         adjoints: List[Tensor] = [terminal_grad]
-
+        """
+        if self.rollout_steps = 16, step_idx : 15, 14, ..., 0
+        """
         for step_idx in range(self.rollout_steps - 1, -1, -1):
+            # next_state: shape ( n_valid_anchor, 20, 4 )
             next_state = states[step_idx + 1].detach().requires_grad_(True)
+            # tau_next: shape ( n_valid_anchor, )
             tau_next = times[step_idx + 1]
             with torch.enable_grad():
+                # base_drift: shape ( n_valid_anchor, 20, 4 )
                 base_drift = self._build_base_drift(
                     flow_decoder=flow_decoder,
                     flow_ode=flow_ode,
@@ -829,9 +891,9 @@ class AdjointMatchingLoss(nn.Module):
                     tau=tau_next,
                 )
                 j_t_a = torch.autograd.grad(
-                    outputs=base_drift,
-                    inputs=next_state,
-                    grad_outputs=adjoints[-1],
+                    outputs=base_drift, # ( n_valid_anchor, 20, 4 )
+                    inputs=next_state, # ( n_valid_anchor, 20, 4 )
+                    grad_outputs=adjoints[-1], # ( n_valid_anchor, 20, 4 )
                     retain_graph=False,
                     create_graph=False,
                 )[0]
@@ -845,7 +907,7 @@ class AdjointMatchingLoss(nn.Module):
         flow_decoder: nn.Module,
         flow_ode: nn.Module,
         anchor_hidden_valid: Tensor,
-        states: Sequence[Tensor],
+        states: Sequence[Tensor],  # List[Tensor] len: rollout_steps + 1 # shape : [, n_valid_anchor, 20, 4]
         times: Sequence[Tensor],
         lean_adjoints: Sequence[Tensor],
     ) -> tuple[Tensor, Tensor]:
@@ -857,11 +919,16 @@ class AdjointMatchingLoss(nn.Module):
             anchor_hidden_valid: 유효 anchor 문맥입니다. shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
             states: rollout 상태 목록입니다. 각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
             times: 상태별 시간 목록입니다. 각 원소 shape은 ``[n_valid_anchor]`` 입니다.
-            lean_adjoints: 각 rollout step의 lean adjoint 목록입니다.
-                각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            lean_adjoints: List[Tensor]: 각 rollout step의 lean adjoint 입니다.
+                길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
 
         Returns:
-            tuple[Tensor, Tensor]: 평균 regression loss 와 평균 residual norm 입니다.
+            tuple[Tensor, Tensor]:
+
+            1. 평균 regression loss
+                shape : ( )
+            2. 평균 residual norm
+                    shape : ( )
         """
         step_losses: List[Tensor] = []
         residual_norms: List[Tensor] = []
@@ -874,15 +941,19 @@ class AdjointMatchingLoss(nn.Module):
                 x_t_norm=x_state,
                 tau=tau,
             )
-            residual_velocity = velocity_dict["residual_velocity"]
+            residual_velocity = velocity_dict["residual_velocity"] # ( n_valid_anchor, 20, 4 )
             sigma = flow_ode.memoryless_sigma(tau).view(-1, 1, 1)
             residual_norms.append(residual_velocity.pow(2).mean())
 
+            # regression_target: ( n_valid_anchor, 20, 4 )
             regression_target = (2.0 / sigma) * residual_velocity + sigma * lean_adjoints[step_idx]
             step_losses.append(regression_target.flatten(1).pow(2).sum(dim=1).mean())
 
         if len(step_losses) == 0:
-            zero = anchor_hidden_valid.sum() * 0.0
+            zero = self._zero_loss_with_trainable_dependency(
+                reference=anchor_hidden_valid,
+                module=flow_decoder,
+            )
             return zero, zero
 
         return torch.stack(step_losses).mean(), torch.stack(residual_norms).mean()
@@ -901,16 +972,30 @@ class AdjointMatchingLoss(nn.Module):
         Args:
             flow_decoder: velocity field decoder 입니다.
             flow_ode: OT path helper 입니다.
-            anchor_hidden_valid: 유효 anchor 문맥입니다. shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
-            agent_type: anchor별 객체 종류 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
-            current_control: anchor 직전 0.1초 control 입니다. shape은 ``[n_valid_anchor, 3]`` 입니다.
-            current_control_valid: current control 유효 여부입니다. shape은 ``[n_valid_anchor]`` 입니다.
+            anchor_hidden_valid:
+                유효 anchor 문맥입니다.
+                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+            agent_type:
+                anchor별 객체 종류 번호입니다.
+                shape은 ``[n_valid_anchor]`` 입니다.
+            current_control:
+                “anchor 직전 0.1초 동안의 현재 운동 상태를 body frame으로 표현한 값”
+                정규화된 값도 아니다.
+                shape은 ``[n_valid_anchor, 3]`` 입니다.
+
+            current_control_valid:
+                current control 유효 여부입니다.
+                shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
-            AdjointMatchingResult: loss, terminal cost, gap, residual norm, 최종 sample 입니다.
+            AdjointMatchingResult:
+                loss, terminal cost, gap, residual norm, 최종 sample
         """
         if anchor_hidden_valid.numel() == 0:
-            zero = anchor_hidden_valid.sum() * 0.0
+            zero = self._zero_loss_with_trainable_dependency(
+                reference=anchor_hidden_valid,
+                module=flow_decoder,
+            )
             empty_sample = anchor_hidden_valid.new_zeros((0, 20, 4))
             return AdjointMatchingResult(
                 loss=zero,
@@ -928,39 +1013,62 @@ class AdjointMatchingLoss(nn.Module):
                     device=anchor_hidden_valid.device,
                     dtype=torch.float32,
                 )
-
+            """
+            states : List[Tensor]
+                - 상태 목록입니다. 길이는 ``rollout_steps + 1`` 이고,
+                  각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            times : List[Tensor]
+                - 시간 목록입니다. 길이는 ``rollout_steps + 1`` 이고,
+                  각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+            """
             states, times = self._rollout_memoryless_sde(
                 flow_decoder=flow_decoder,
                 flow_ode=flow_ode,
                 anchor_hidden_valid=anchor_hidden_valid,
             )
             self._assert_finite_tensor_list("am/states", states)
-
+            """
+            terminal_cost : Tensor  : shape : [ ]
+                batch 평균 terminal cost
+            terminal_grad : Tensor : shape : [n_valid_anchor, 20, 4]
+            metrics : Dict[str, Tensor]
+                logging용 스칼라 사전입니다.
+                "terminal_cost" : 값 1개
+                "projection_gap" : [n_valid_anchor, 20, 3]
+            """
             terminal_cost, terminal_grad, metrics = self._compute_terminal_gradient(
-                final_state=states[-1],
-                agent_type=agent_type,
-                current_control=current_control,
-                current_control_valid=current_control_valid,
+                final_state=states[-1], # shape : [n_valid_anchor, 20, 4]
+                agent_type=agent_type, # shape : [n_valid_anchor]
+                current_control=current_control, # shape : [n_valid_anchor, 3]
+                current_control_valid=current_control_valid, # shape : [n_valid_anchor]
             )
             self._assert_finite_tensor("am/terminal_cost", terminal_cost)
             self._assert_finite_tensor("am/terminal_grad", terminal_grad)
             self._assert_finite_tensor("am/projection_gap", metrics["projection_gap"])
-
+            """ lean_adjoints
+            List[Tensor]: 각 rollout step의 lean adjoint 입니다.
+                길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            """
             lean_adjoints = self._build_lean_adjoints(
                 flow_decoder=flow_decoder,
                 flow_ode=flow_ode,
-                anchor_hidden_valid=anchor_hidden_valid,
-                states=states,
-                times=times,
-                terminal_grad=terminal_grad,
+                anchor_hidden_valid=anchor_hidden_valid, # shape : [n_valid_anchor, hidden_dim]
+                states=states, # List[Tensor] len: rollout_steps + 1 # shape : [, n_valid_anchor, 20, 4]
+                times=times, # List[Tensor] len: rollout_steps + 1 # shape : [, n_valid_anchor]
+                terminal_grad=terminal_grad, # [n_valid_anchor, 20, 4]
             )
             self._assert_finite_tensor_list("am/lean_adjoints", lean_adjoints)
-
+            """
+            1. 평균 regression loss
+                shape : ( ) 
+            2. 평균 residual norm
+                    shape : ( )
+            """
             regression_loss, residual_norm = self._build_regression_loss(
                 flow_decoder=flow_decoder,
                 flow_ode=flow_ode,
                 anchor_hidden_valid=anchor_hidden_valid,
-                states=states,
+                states=states,  # List[Tensor] len: rollout_steps + 1 # shape : [, n_valid_anchor, 20, 4]
                 times=times,
                 lean_adjoints=lean_adjoints,
             )
@@ -969,9 +1077,11 @@ class AdjointMatchingLoss(nn.Module):
             self._assert_finite_tensor("am/final_sample", states[-1])
 
             return AdjointMatchingResult(
-                loss=regression_loss,
-                terminal_cost=metrics["terminal_cost"],
-                projection_gap=metrics["projection_gap"],
-                residual_norm=residual_norm.detach(),
-                final_sample=states[-1],
+                loss=regression_loss, # shape : ( )
+                # terminal_cost: (마지막 궤적과 projector 간의 gap)
+                terminal_cost=metrics["terminal_cost"], # shape : ( )
+                # projection_gap: terminal_cost 를 평균하기 전 값
+                projection_gap=metrics["projection_gap"], # [n_valid_anchor, 20, 3]
+                residual_norm=residual_norm.detach(), # shape : ( )
+                final_sample=states[-1], # shape : [n_valid_anchor, 20, 4]
             )
