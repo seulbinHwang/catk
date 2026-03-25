@@ -969,7 +969,7 @@ class SMARTFlow(LightningModule):
                 - raw_step-1과 raw_step이 둘 다 valid일 때만 True
                 - “현재 운동과의 연속성 제약을 적용할지 여부”
             """
-            return self.adjoint_matching_loss(
+            am_result = self.adjoint_matching_loss(
                 flow_decoder=self.encoder.agent_encoder.flow_decoder,
                 flow_ode=self.encoder.agent_encoder.flow_ode,
                 anchor_hidden_valid=anchor_hidden_valid.detach().to(dtype=torch.float32),
@@ -977,6 +977,54 @@ class SMARTFlow(LightningModule):
                 current_control=tokenized_agent["flow_train_current_control"].to(dtype=torch.float32),
                 current_control_valid=tokenized_agent["flow_train_current_control_valid"],
             )
+            am_result.diagnostic_metrics.update(
+                self._build_adjoint_matching_projector_diagnostics(
+                    anchor_hidden_valid=anchor_hidden_valid.detach().to(dtype=torch.float32),
+                    tokenized_agent=tokenized_agent,
+                )
+            )
+            return am_result
+
+    def _build_adjoint_matching_projector_diagnostics(
+        self,
+        anchor_hidden_valid: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        """GT / deterministic sampler 기준 projector gap을 추가로 계산합니다."""
+        if self.adjoint_matching_loss is None:
+            return {}
+
+        projector = self.adjoint_matching_loss.projector
+        device = anchor_hidden_valid.device
+        dtype = anchor_hidden_valid.dtype
+        agent_type = tokenized_agent["flow_train_agent_type"].to(device=device)
+        current_control = tokenized_agent["flow_train_current_control"].to(device=device, dtype=dtype)
+        current_control_valid = tokenized_agent["flow_train_current_control_valid"].to(device=device)
+        gt_clean_norm = tokenized_agent["flow_train_clean_norm"].to(device=device, dtype=dtype)
+
+        with torch.no_grad():
+            _, gt_metrics = projector.compute_terminal_cost(
+                pred_clean_norm=gt_clean_norm,
+                agent_type=agent_type,
+                current_control=current_control,
+                current_control_valid=current_control_valid,
+            )
+            deterministic_sample = self.encoder.agent_encoder._sample_open_loop_future_from_hidden(
+                anchor_hidden_valid=anchor_hidden_valid,
+                sampling_noise=self.eval_sampling_noise,
+                sampling_seed=self.validation_open_seed,
+            )
+            _, deterministic_metrics = projector.compute_terminal_cost(
+                pred_clean_norm=deterministic_sample,
+                agent_type=agent_type,
+                current_control=current_control,
+                current_control_valid=current_control_valid,
+            )
+
+        diagnostic_metrics: Dict[str, Tensor] = {}
+        diagnostic_metrics.update(projector.prefix_metric_keys("gt", gt_metrics))
+        diagnostic_metrics.update(projector.prefix_metric_keys("deterministic", deterministic_metrics))
+        return diagnostic_metrics
 
 
     def training_step(self, data, batch_idx):
@@ -1035,6 +1083,15 @@ class SMARTFlow(LightningModule):
                 sync_dist=True,
                 batch_size=1,
             )
+            for metric_name, metric_value in sorted(am_result.diagnostic_metrics.items()):
+                self.log(
+                    f"train/{metric_name}",
+                    metric_value,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
             return am_result.loss
 
         pred = self.encoder(
