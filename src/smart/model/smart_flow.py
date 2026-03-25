@@ -117,6 +117,7 @@ class SMARTFlow(LightningModule):
                 feasible_weight=self.finetune_config.feasible_weight,
                 smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
                 smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
+                rollout_time_grid=self.finetune_config.rollout_time_grid,
             )
 
         self.minADE = minADE()

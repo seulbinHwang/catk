@@ -22,6 +22,8 @@ class FinetuneConfig:
         feasible_weight: terminal feasible cost 가중치입니다.
         smooth_deadzone_epsilon: 정규화 gap dead-zone 크기입니다.
         smooth_deadzone_tau: smooth dead-zone의 매끈한 정도입니다.
+        rollout_time_grid: 학습용 시간축 배치 방식입니다.
+            ``logspace`` 는 0 근처를 더 촘촘히 쪼갭니다.
     """
 
     enabled: bool = False
@@ -31,6 +33,7 @@ class FinetuneConfig:
     feasible_weight: float = 1.0
     smooth_deadzone_epsilon: tuple[float, float, float] = (0.01, 0.01, 0.01)
     smooth_deadzone_tau: float = 0.002
+    rollout_time_grid: str = "logspace"
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -77,6 +80,13 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
             "smooth_deadzone_epsilon must contain exactly 3 values for [vx, vy, omega]."
         )
 
+    rollout_time_grid = str(_read_config_value(finetune, "rollout_time_grid", "logspace"))
+    if rollout_time_grid not in {"uniform", "logspace"}:
+        raise ValueError(
+            "rollout_time_grid must be either 'uniform' or 'logspace'. "
+            f"Got: {rollout_time_grid}"
+        )
+
     return FinetuneConfig(
         enabled=bool(_read_config_value(finetune, "enabled", True)),
         mode=str(_read_config_value(finetune, "mode", "adjoint_matching")),
@@ -85,6 +95,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         feasible_weight=float(_read_config_value(finetune, "feasible_weight", 1.0)),
         smooth_deadzone_epsilon=epsilon_tuple,
         smooth_deadzone_tau=float(_read_config_value(finetune, "smooth_deadzone_tau", 0.002)),
+        rollout_time_grid=rollout_time_grid,
     )
 
 

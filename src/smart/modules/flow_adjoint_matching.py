@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List, Optional, Sequence
 
 import torch
@@ -663,10 +664,17 @@ class AdjointMatchingLoss(nn.Module):
         feasible_weight: float = 1.0,
         smooth_deadzone_epsilon: Sequence[float] = (0.01, 0.01, 0.01),
         smooth_deadzone_tau: float = 0.002,
+        rollout_time_grid: str = "logspace",
     ) -> None:
         super().__init__()
         self.rollout_steps = int(rollout_steps)
         self.rollout_noise_scale = float(rollout_noise_scale)
+        self.rollout_time_grid = str(rollout_time_grid)
+        if self.rollout_time_grid not in {"uniform", "logspace"}:
+            raise ValueError(
+                "rollout_time_grid must be either 'uniform' or 'logspace'. "
+                f"Got: {self.rollout_time_grid}"
+            )
         self.projector = SmoothControlProjector(
             feasible_weight=feasible_weight,
             smooth_deadzone_epsilon=smooth_deadzone_epsilon,
@@ -699,25 +707,92 @@ class AdjointMatchingLoss(nn.Module):
         for idx, value in enumerate(values):
             cls._assert_finite_tensor(f"{name}[{idx}]", value)
 
-    def _build_step_times(self, flow_ode: nn.Module, batch_size: int, device: torch.device, dtype: torch.dtype) -> List[Tensor]:
-        """Euler–Maruyama rollout 과 adjoint 계산에 쓸 시간값을 만듭니다.
+    def _build_step_schedule(
+        self,
+        flow_ode: nn.Module,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[List[Tensor], List[Tensor], List[Tensor]]:
+        """학습 rollout에 쓸 시간축과 구간별 가중치를 만듭니다.
 
         Args:
-            flow_ode: ODE helper 입니다. ``eps`` 값을 읽습니다.
+            flow_ode: ODE helper 입니다. 시작 시각 ``eps`` 를 읽습니다.
             batch_size: 유효 anchor 개수입니다.
             device: 시간 텐서를 둘 장치입니다.
             dtype: 시간 텐서 자료형입니다.
 
         Returns:
-            List[Tensor]: ``t_0`` 부터 ``t_K`` 까지의 시간 텐서 목록입니다.
-                각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+            tuple[List[Tensor], List[Tensor], List[Tensor]]:
+                1. 시간 목록입니다. 길이는 ``rollout_steps + 1`` 이고,
+                   각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+                2. 구간 길이 목록입니다. 길이는 ``rollout_steps`` 이고,
+                   각 원소 shape은 ``[]`` 입니다.
+                3. step 손실 가중치 목록입니다. 길이는 ``rollout_steps`` 이고,
+                   각 원소 shape은 ``[]`` 입니다.
+
+        이 함수의 목적은 0 근처 구간을 더 촘촘하게 쪼개는 것입니다.
+        ``logspace`` 모드에서는 시작 시각은 그대로 두고, 초반에는 짧은 구간을,
+        뒤로 갈수록 긴 구간을 배치합니다. 이렇게 하면 ``1 / t`` 와 memoryless
+        noise가 강한 초반 구간을 더 부드럽게 적분할 수 있습니다.
         """
+        if self.rollout_steps < 1:
+            raise ValueError(f"rollout_steps must be positive, got {self.rollout_steps}")
+
         t0 = float(flow_ode.eps)
-        dt = (1.0 - t0) / float(self.rollout_steps)
-        return [
-            torch.full((batch_size,), t0 + step_idx * dt, device=device, dtype=dtype)
+        if not 0.0 < t0 < 1.0:
+            raise ValueError(f"flow_ode.eps must satisfy 0 < eps < 1, got {t0}")
+
+        schedule_dtype = torch.float64
+        if self.rollout_time_grid == "uniform":
+            scalar_times = torch.linspace(
+                t0,
+                1.0,
+                self.rollout_steps + 1,
+                device=device,
+                dtype=schedule_dtype,
+            )
+        else:
+            normalized = torch.linspace(
+                0.0,
+                1.0,
+                self.rollout_steps + 1,
+                device=device,
+                dtype=schedule_dtype,
+            )
+            scalar_times = torch.exp(math.log(t0) * (1.0 - normalized))
+            scalar_times[0] = t0
+            scalar_times[-1] = 1.0
+
+        scalar_step_sizes = scalar_times[1:] - scalar_times[:-1]
+        scalar_step_weights = scalar_step_sizes / scalar_step_sizes.sum().clamp_min(1e-12)
+
+        times = [
+            torch.full(
+                (batch_size,),
+                float(scalar_times[step_idx].item()),
+                device=device,
+                dtype=dtype,
+            )
             for step_idx in range(self.rollout_steps + 1)
         ]
+        step_sizes = [
+            torch.tensor(
+                float(scalar_step_sizes[step_idx].item()),
+                device=device,
+                dtype=dtype,
+            )
+            for step_idx in range(self.rollout_steps)
+        ]
+        step_weights = [
+            torch.tensor(
+                float(scalar_step_weights[step_idx].item()),
+                device=device,
+                dtype=dtype,
+            )
+            for step_idx in range(self.rollout_steps)
+        ]
+        return times, step_sizes, step_weights
 
     @torch.no_grad()
     def _rollout_memoryless_sde(
@@ -725,7 +800,7 @@ class AdjointMatchingLoss(nn.Module):
         flow_decoder: nn.Module,
         flow_ode: nn.Module,
         anchor_hidden_valid: Tensor,
-    ) -> tuple[List[Tensor], List[Tensor]]:
+    ) -> tuple[List[Tensor], List[Tensor], List[Tensor], List[Tensor]]:
         """Memoryless Euler–Maruyama SDE로 학습용 rollout 을 만듭니다.
 
         Args:
@@ -740,22 +815,31 @@ class AdjointMatchingLoss(nn.Module):
             “정규화된 미래 궤적”
 
         Returns:
-            tuple[List[Tensor], List[Tensor]]:
-                - 상태 목록입니다. 길이는 ``rollout_steps + 1`` 이고,
-                  각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
-                - 시간 목록입니다. 길이는 ``rollout_steps + 1`` 이고,
-                  각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+            tuple[List[Tensor], List[Tensor], List[Tensor], List[Tensor]]:
+                1. 상태 목록입니다. 길이는 ``rollout_steps + 1`` 이고,
+                   각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                2. 시간 목록입니다. 길이는 ``rollout_steps + 1`` 이고,
+                   각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+                3. 구간 길이 목록입니다. 길이는 ``rollout_steps`` 이고,
+                   각 원소 shape은 ``[]`` 입니다.
+                4. 구간 가중치 목록입니다. 길이는 ``rollout_steps`` 이고,
+                   각 원소 shape은 ``[]`` 입니다.
         """
         batch_size = int(anchor_hidden_valid.shape[0])
         dtype = anchor_hidden_valid.dtype
         device = anchor_hidden_valid.device
 
-        dt = (1.0 - float(flow_ode.eps)) / float(self.rollout_steps)
         """ times : List[Tensor]
             ``t_0`` 부터 ``t_K`` 까지의 시간 텐서 목록
             각 원소 shape은 ``[n_valid_anchor]`` 입니다.
+        step_sizes : List[Tensor]
+            각 구간 길이 목록입니다.
+            길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[]`` 입니다.
+        step_weights : List[Tensor]
+            구간 길이를 전체 길이로 나눈 loss 가중치입니다.
+            길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[]`` 입니다.
         """
-        times = self._build_step_times(
+        times, step_sizes, step_weights = self._build_step_schedule(
             flow_ode=flow_ode,
             batch_size=batch_size,
             device=device,
@@ -794,10 +878,11 @@ class AdjointMatchingLoss(nn.Module):
             )
             noise = torch.randn_like(current_state)
             sigma = flow_ode.memoryless_sigma(tau).view(-1, 1, 1)
-            current_state = current_state + dt * drift + (dt ** 0.5) * sigma * noise
+            step_size = step_sizes[step_idx]
+            current_state = current_state + step_size * drift + torch.sqrt(step_size) * sigma * noise
             states.append(current_state.detach())
 
-        return states, times
+        return states, times, step_sizes, step_weights
 
     def _compute_terminal_gradient(
         self,
@@ -877,6 +962,7 @@ class AdjointMatchingLoss(nn.Module):
         states: Sequence[Tensor],
         times: Sequence[Tensor],
         terminal_grad: Tensor,
+        step_sizes: Sequence[Tensor],
     ) -> List[Tensor]:
         """Base drift 로 lean adjoint 를 뒤로 풉니다.
 
@@ -888,13 +974,14 @@ class AdjointMatchingLoss(nn.Module):
             times: 상태별 시간 목록입니다. 각 원소 shape은 ``[n_valid_anchor]`` 입니다.
             terminal_grad: 마지막 상태에 대한 terminal gradient 입니다.
                 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            step_sizes: rollout 구간 길이 목록입니다.
+                길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[]`` 입니다.
 
         Returns:
             List[Tensor]: 각 rollout step의 lean adjoint 입니다.
                 길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
 
-        dt = (1.0 - float(flow_ode.eps)) / float(self.rollout_steps)
         adjoints: List[Tensor] = [terminal_grad]
         """
         if self.rollout_steps = 16, step_idx : 15, 14, ..., 0
@@ -920,7 +1007,8 @@ class AdjointMatchingLoss(nn.Module):
                     retain_graph=False,
                     create_graph=False,
                 )[0]
-            adjoints.append((adjoints[-1] + dt * j_t_a).detach())
+            step_size = step_sizes[step_idx].to(device=j_t_a.device, dtype=j_t_a.dtype)
+            adjoints.append((adjoints[-1] + step_size * j_t_a).detach())
 
         adjoints.reverse()
         return adjoints[:-1]
@@ -933,6 +1021,7 @@ class AdjointMatchingLoss(nn.Module):
         states: Sequence[Tensor],  # List[Tensor] len: rollout_steps + 1 # shape : [, n_valid_anchor, 20, 4]
         times: Sequence[Tensor],
         lean_adjoints: Sequence[Tensor],
+        step_weights: Sequence[Tensor],
     ) -> tuple[Tensor, Tensor]:
         """Residual velocity 를 lean adjoint target 에 맞춥니다.
 
@@ -944,6 +1033,8 @@ class AdjointMatchingLoss(nn.Module):
             times: 상태별 시간 목록입니다. 각 원소 shape은 ``[n_valid_anchor]`` 입니다.
             lean_adjoints: List[Tensor]: 각 rollout step의 lean adjoint 입니다.
                 길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            step_weights: 각 rollout step의 시간 길이 비율입니다.
+                길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[]`` 입니다.
 
         Returns:
             tuple[Tensor, Tensor]:
@@ -966,12 +1057,15 @@ class AdjointMatchingLoss(nn.Module):
             )
             residual_velocity = velocity_dict["residual_velocity"] # ( n_valid_anchor, 20, 4 )
             sigma = flow_ode.memoryless_sigma(tau).view(-1, 1, 1)
-            residual_norms.append(residual_velocity.pow(2).mean())
+            step_weight = step_weights[step_idx].to(device=residual_velocity.device, dtype=residual_velocity.dtype)
+            residual_norms.append(step_weight * residual_velocity.pow(2).mean())
 
             # regression_target: ( n_valid_anchor, 20, 4 )
             regression_target = (2.0 / sigma) * residual_velocity + sigma * lean_adjoints[step_idx]
-            # Keep AM regression on the same mean-MSE scale used by pre-bc training.
-            step_losses.append(regression_target.flatten(1).pow(2).mean(dim=1).mean())
+            # 비균일 시간축에서는 각 step loss를 같은 비율로 더하면 안 됩니다.
+            # 연속시간 적분을 더 가깝게 따르도록, 구간 길이 비율만큼 가중 평균합니다.
+            step_loss = regression_target.flatten(1).pow(2).mean(dim=1).mean()
+            step_losses.append(step_weight * step_loss)
 
         if len(step_losses) == 0:
             zero = self._zero_loss_with_trainable_dependency(
@@ -980,7 +1074,7 @@ class AdjointMatchingLoss(nn.Module):
             )
             return zero, zero
 
-        return torch.stack(step_losses).mean(), torch.stack(residual_norms).mean()
+        return torch.stack(step_losses).sum(), torch.stack(residual_norms).sum()
 
     def forward(
         self,
@@ -1048,7 +1142,7 @@ class AdjointMatchingLoss(nn.Module):
                 - 시간 목록입니다. 길이는 ``rollout_steps + 1`` 이고,
                   각 원소 shape은 ``[n_valid_anchor]`` 입니다.
             """
-            states, times = self._rollout_memoryless_sde(
+            states, times, step_sizes, step_weights = self._rollout_memoryless_sde(
                 flow_decoder=flow_decoder,
                 flow_ode=flow_ode,
                 anchor_hidden_valid=anchor_hidden_valid,
@@ -1092,6 +1186,7 @@ class AdjointMatchingLoss(nn.Module):
                 states=states, # List[Tensor] len: rollout_steps + 1 # shape : [, n_valid_anchor, 20, 4]
                 times=times, # List[Tensor] len: rollout_steps + 1 # shape : [, n_valid_anchor]
                 terminal_grad=terminal_grad, # [n_valid_anchor, 20, 4]
+                step_sizes=step_sizes,
             )
             self._assert_finite_tensor_list("am/lean_adjoints", lean_adjoints)
             """
@@ -1107,6 +1202,7 @@ class AdjointMatchingLoss(nn.Module):
                 states=states,  # List[Tensor] len: rollout_steps + 1 # shape : [, n_valid_anchor, 20, 4]
                 times=times,
                 lean_adjoints=lean_adjoints,
+                step_weights=step_weights,
             )
             self._assert_finite_tensor("am/regression_loss", regression_loss)
             self._assert_finite_tensor("am/residual_norm", residual_norm)

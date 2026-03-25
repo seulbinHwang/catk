@@ -417,6 +417,8 @@ torchrun \
 - fine-tuning 단계에서는 base encoder / decoder / 기존 velocity head를 모두 고정하고 `residual_velocity_head`만 학습합니다.
 - feasible terminal cost는 trajectory를 body-control `(vx_b, vy_b, omega)`로 바꾼 뒤 hand-crafted constraint projector와의 차이만 사용합니다.
 - projector 제한값은 외부 `Diffusion-Planner`의 `feasible.py` 값과 동일하게 사용합니다.
+- 학습 rollout 시간축은 **배포 sampler와 분리**해서, `0.001 -> 1.0` 전체 구간을 균일 분할하지 않고 **앞쪽이 더 촘촘한 log-space 시간축**으로 적분합니다. 그래서 0 근처의 `1 / t` 항과 memoryless noise가 첫 step에서 과하게 폭주하지 않습니다.
+- non-uniform 시간축을 쓰므로, rollout / lean adjoint / AM regression loss 합산은 모두 같은 구간 길이를 기준으로 맞춰집니다.
 - checkpoint 선택은 기존과 동일하게 `val_closed/sim_agents_2025/realism_meta_metric` 기준입니다.
 
 권장 실행 예시는 아래와 같습니다. `ckpt_path`에는 먼저 학습한 `pre_bc_flow` checkpoint를 넣어야 합니다.
@@ -443,6 +445,7 @@ torchrun \
 - max epochs: `8`
 - grad clip: `1.0`
 - AM rollout steps: `16`
+- AM training time grid: `logspace` (`flow_solver_eps=1e-3` 시작은 유지, 초반 구간만 더 촘촘하게 적분)
 
 학습 중 기본 로그는 `train/loss`, `train/terminal_cost`, `train/projection_gap`, `train/residual_norm` 입니다.
 validation과 test 명령은 기존 `local_val_flow`, `sim_agents_sub_flow`를 그대로 쓰면 됩니다.
