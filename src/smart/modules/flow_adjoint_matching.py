@@ -660,13 +660,27 @@ class AdjointMatchingLoss(nn.Module):
         self,
         rollout_steps: int = 4,
         rollout_noise_scale: float = 1.0,
+        rollout_start_tau: float | None = None,
+        rollout_init_noise_scale: float | None = None,
         feasible_weight: float = 1.0,
         smooth_deadzone_epsilon: Sequence[float] = (0.01, 0.01, 0.01),
         smooth_deadzone_tau: float = 0.002,
     ) -> None:
         super().__init__()
         self.rollout_steps = int(rollout_steps)
+        if self.rollout_steps <= 0:
+            raise ValueError("rollout_steps must be positive.")
         self.rollout_noise_scale = float(rollout_noise_scale)
+        if self.rollout_noise_scale < 0.0:
+            raise ValueError("rollout_noise_scale must be non-negative.")
+        self.rollout_start_tau = (
+            None if rollout_start_tau is None else float(rollout_start_tau)
+        )
+        self.rollout_init_noise_scale = (
+            None if rollout_init_noise_scale is None else float(rollout_init_noise_scale)
+        )
+        if self.rollout_init_noise_scale is not None and self.rollout_init_noise_scale < 0.0:
+            raise ValueError("rollout_init_noise_scale must be non-negative.")
         self.projector = SmoothControlProjector(
             feasible_weight=feasible_weight,
             smooth_deadzone_epsilon=smooth_deadzone_epsilon,
@@ -699,7 +713,41 @@ class AdjointMatchingLoss(nn.Module):
         for idx, value in enumerate(values):
             cls._assert_finite_tensor(f"{name}[{idx}]", value)
 
-    def _build_step_times(self, flow_ode: nn.Module, batch_size: int, device: torch.device, dtype: torch.dtype) -> List[Tensor]:
+    def _resolve_rollout_start_tau(self, flow_ode: nn.Module) -> float:
+        """AM rollout 시작 시각을 결정하고 범위를 검증합니다."""
+        default_start_tau = float(flow_ode.eps)
+        start_tau = (
+            default_start_tau
+            if self.rollout_start_tau is None
+            else float(self.rollout_start_tau)
+        )
+        if not 0.0 < start_tau < 1.0:
+            raise ValueError(f"rollout_start_tau must satisfy 0 < tau < 1, got {start_tau}.")
+        if start_tau < default_start_tau:
+            raise ValueError(
+                "rollout_start_tau must be greater than or equal to flow_ode.eps. "
+                f"Got rollout_start_tau={start_tau}, flow_ode.eps={default_start_tau}."
+            )
+        return start_tau
+
+    def _build_initial_state_scale(self, flow_ode: nn.Module, tau: Tensor) -> Tensor:
+        """첫 rollout 상태의 noise scale을 설정값과 sigma_t로 결정합니다."""
+        if self.rollout_init_noise_scale is not None:
+            return tau.new_full(tau.shape, float(self.rollout_init_noise_scale))
+        if self.rollout_start_tau is None:
+            return tau.new_full(tau.shape, self.rollout_noise_scale)
+        return (
+            flow_ode.sigma_t(tau).to(device=tau.device, dtype=tau.dtype)
+            * self.rollout_noise_scale
+        )
+
+    def _build_step_times(
+        self,
+        flow_ode: nn.Module,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> List[Tensor]:
         """Euler–Maruyama rollout 과 adjoint 계산에 쓸 시간값을 만듭니다.
 
         Args:
@@ -712,7 +760,7 @@ class AdjointMatchingLoss(nn.Module):
             List[Tensor]: ``t_0`` 부터 ``t_K`` 까지의 시간 텐서 목록입니다.
                 각 원소 shape은 ``[n_valid_anchor]`` 입니다.
         """
-        t0 = float(flow_ode.eps)
+        t0 = self._resolve_rollout_start_tau(flow_ode)
         dt = (1.0 - t0) / float(self.rollout_steps)
         return [
             torch.full((batch_size,), t0 + step_idx * dt, device=device, dtype=dtype)
@@ -750,17 +798,17 @@ class AdjointMatchingLoss(nn.Module):
         dtype = anchor_hidden_valid.dtype
         device = anchor_hidden_valid.device
 
-        dt = (1.0 - float(flow_ode.eps)) / float(self.rollout_steps)
-        """ times : List[Tensor]
-            ``t_0`` 부터 ``t_K`` 까지의 시간 텐서 목록
-            각 원소 shape은 ``[n_valid_anchor]`` 입니다.
-        """
         times = self._build_step_times(
             flow_ode=flow_ode,
             batch_size=batch_size,
             device=device,
             dtype=dtype,
         )
+        dt = (1.0 - float(times[0][0].item())) / float(self.rollout_steps)
+        initial_state_scale = self._build_initial_state_scale(
+            flow_ode=flow_ode,
+            tau=times[0],
+        ).view(-1, 1, 1)
 
         current_state = torch.randn(
             batch_size,
@@ -768,29 +816,20 @@ class AdjointMatchingLoss(nn.Module):
             4,
             device=device,
             dtype=dtype,
-        ) * self.rollout_noise_scale
+        ) * initial_state_scale
         states: List[Tensor] = [current_state.detach()]
 
         for step_idx in range(self.rollout_steps):
-            tau = times[step_idx] # shape : ``[n_valid_anchor]
-            """ velocity_dict
-            base_velocity : "기존 모델이 원래 가고 싶어하는 방향"
-            residual_velocity : "fine-tuning이 추가하는 보정 "
-            velocity : " 둘을 합친 최종 이동 방향 "
-            
-            3개 다 전부 shape : [n_valid_anchor, 20, 4]
-            """
-
+            tau = times[step_idx]
             velocity_dict = flow_decoder.forward_components(
                 anchor_hidden=anchor_hidden_valid,
                 x_t_norm=current_state,
                 tau=tau,
             )
-            # drift : [batch, 20, 4]
             drift = flow_ode.drift_from_velocity(
-                x_t=current_state, # [n_valid_anchor, 20, 4]
-                velocity=velocity_dict["velocity"], # [n_valid_anchor, 20, 4]
-                tau=tau, # [n_valid_anchor]
+                x_t=current_state,
+                velocity=velocity_dict["velocity"],
+                tau=tau,
             )
             noise = torch.randn_like(current_state)
             sigma = flow_ode.memoryless_sigma(tau).view(-1, 1, 1)
@@ -893,19 +932,14 @@ class AdjointMatchingLoss(nn.Module):
             List[Tensor]: 각 rollout step의 lean adjoint 입니다.
                 길이는 ``rollout_steps`` 이고, 각 원소 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
-
-        dt = (1.0 - float(flow_ode.eps)) / float(self.rollout_steps)
+        dt = (float(times[-1][0].item()) - float(times[0][0].item())) / float(
+            self.rollout_steps
+        )
         adjoints: List[Tensor] = [terminal_grad]
-        """
-        if self.rollout_steps = 16, step_idx : 15, 14, ..., 0
-        """
         for step_idx in range(self.rollout_steps - 1, -1, -1):
-            # next_state: shape ( n_valid_anchor, 20, 4 )
             next_state = states[step_idx + 1].detach().requires_grad_(True)
-            # tau_next: shape ( n_valid_anchor, )
             tau_next = times[step_idx + 1]
             with torch.enable_grad():
-                # base_drift: shape ( n_valid_anchor, 20, 4 )
                 base_drift = self._build_base_drift(
                     flow_decoder=flow_decoder,
                     flow_ode=flow_ode,
@@ -914,9 +948,9 @@ class AdjointMatchingLoss(nn.Module):
                     tau=tau_next,
                 )
                 j_t_a = torch.autograd.grad(
-                    outputs=base_drift, # ( n_valid_anchor, 20, 4 )
-                    inputs=next_state, # ( n_valid_anchor, 20, 4 )
-                    grad_outputs=adjoints[-1], # ( n_valid_anchor, 20, 4 )
+                    outputs=base_drift,
+                    inputs=next_state,
+                    grad_outputs=adjoints[-1],
                     retain_graph=False,
                     create_graph=False,
                 )[0]

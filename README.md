@@ -443,9 +443,16 @@ torchrun \
 - max epochs: `8`
 - grad clip: `1.0`
 - AM rollout steps: `16`
+- AM rollout start tau: `0.05`
+- AM initial noise scale: `null` (`sigma_t(0.05) * rollout_noise_scale` 자동 사용)
 
 학습 중 기본 로그는 `train/loss`, `train/terminal_cost`, `train/projection_gap`, `train/residual_norm` 입니다.
 validation과 test 명령은 기존 `local_val_flow`, `sim_agents_sub_flow`를 그대로 쓰면 됩니다.
+
+`model.model_config.finetune` 에서는 아래 두 옵션을 추가로 조절할 수 있습니다.
+
+- `rollout_start_tau`: 학습용 Euler-Maruyama rollout 시작 시각입니다. `null` 이면 기존처럼 `flow_ode.eps` 부터 시작합니다.
+- `rollout_init_noise_scale`: 첫 rollout 상태의 noise scale 절대값입니다. `null` 이면 `rollout_start_tau` 가 없을 때는 `rollout_noise_scale` 를 그대로 쓰고, `rollout_start_tau` 가 있으면 `sigma_t(rollout_start_tau) * rollout_noise_scale` 를 자동 사용합니다.
 
 ## 6. 평가와 추론
 

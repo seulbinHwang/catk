@@ -18,7 +18,19 @@ class FinetuneConfig:
         enabled: fine-tuning 분기를 켤지 나타냅니다.
         mode: 현재 지원하는 fine-tuning 방식 이름입니다.
         rollout_steps: 학습 rollout step 수입니다.
-        rollout_noise_scale: 초기 Gaussian 잡음 크기입니다.
+        rollout_noise_scale:
+            초기 무작위 상태에 곱하는 배율입니다.
+            ``rollout_start_tau`` 를 따로 주지 않으면 예전과 같은 절대 크기로 동작합니다.
+            ``rollout_start_tau`` 를 주고 ``rollout_init_noise_scale`` 을 비워 두면,
+            학습 시작 시각의 ``sigma_t`` 에 이 값을 한 번 더 곱합니다.
+        rollout_start_tau:
+            학습용 AM rollout이 시작할 진행 시각입니다.
+            ``None`` 이면 기존처럼 ``flow_ode.eps`` 에서 시작합니다.
+        rollout_init_noise_scale:
+            첫 rollout 상태의 무작위 크기를 직접 지정합니다.
+            ``None`` 이면 ``rollout_start_tau`` 가 없을 때는 예전 scale을 그대로 쓰고,
+            ``rollout_start_tau`` 가 있으면
+            ``sigma_t(rollout_start_tau) * rollout_noise_scale`` 을 자동으로 사용합니다.
         feasible_weight: terminal feasible cost 가중치입니다.
         smooth_deadzone_epsilon: 정규화 gap dead-zone 크기입니다.
         smooth_deadzone_tau: smooth dead-zone의 매끈한 정도입니다.
@@ -28,6 +40,8 @@ class FinetuneConfig:
     mode: str = "adjoint_matching"
     rollout_steps: int = 4
     rollout_noise_scale: float = 1.0
+    rollout_start_tau: float | None = None
+    rollout_init_noise_scale: float | None = None
     feasible_weight: float = 1.0
     smooth_deadzone_epsilon: tuple[float, float, float] = (0.01, 0.01, 0.01)
     smooth_deadzone_tau: float = 0.002
@@ -56,6 +70,22 @@ def _read_config_value(config: Any, key: str, default: Any) -> Any:
         return default
 
 
+def _read_optional_float_config_value(config: Any, key: str) -> float | None:
+    """옵션으로 들어오는 실수 값을 읽어 옵니다.
+
+    Args:
+        config: 키 접근 또는 속성 접근이 가능한 설정 객체입니다.
+        key: 읽을 이름입니다.
+
+    Returns:
+        float | None: 값이 없으면 ``None`` 이고, 있으면 ``float`` 로 바꾼 값입니다.
+    """
+    value = _read_config_value(config, key, None)
+    if value is None:
+        return None
+    return float(value)
+
+
 def parse_finetune_config(finetune: Any) -> FinetuneConfig:
     """입력 형태가 달라도 같은 fine-tuning 설정 객체로 바꿉니다.
 
@@ -77,11 +107,19 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
             "smooth_deadzone_epsilon must contain exactly 3 values for [vx, vy, omega]."
         )
 
+    rollout_start_tau = _read_optional_float_config_value(finetune, "rollout_start_tau")
+    rollout_init_noise_scale = _read_optional_float_config_value(
+        finetune,
+        "rollout_init_noise_scale",
+    )
+
     return FinetuneConfig(
         enabled=bool(_read_config_value(finetune, "enabled", True)),
         mode=str(_read_config_value(finetune, "mode", "adjoint_matching")),
         rollout_steps=int(_read_config_value(finetune, "rollout_steps", 4)),
         rollout_noise_scale=float(_read_config_value(finetune, "rollout_noise_scale", 1.0)),
+        rollout_start_tau=rollout_start_tau,
+        rollout_init_noise_scale=rollout_init_noise_scale,
         feasible_weight=float(_read_config_value(finetune, "feasible_weight", 1.0)),
         smooth_deadzone_epsilon=epsilon_tuple,
         smooth_deadzone_tau=float(_read_config_value(finetune, "smooth_deadzone_tau", 0.002)),

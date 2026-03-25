@@ -114,6 +114,8 @@ class SMARTFlow(LightningModule):
             self.adjoint_matching_loss = AdjointMatchingLoss(
                 rollout_steps=self.finetune_config.rollout_steps,
                 rollout_noise_scale=self.finetune_config.rollout_noise_scale,
+                rollout_start_tau=self.finetune_config.rollout_start_tau,
+                rollout_init_noise_scale=self.finetune_config.rollout_init_noise_scale,
                 feasible_weight=self.finetune_config.feasible_weight,
                 smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
                 smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,

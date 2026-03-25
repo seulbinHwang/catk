@@ -22,6 +22,8 @@ model:
       mode: adjoint_matching
       rollout_steps: 16
       rollout_noise_scale: 1.0
+      rollout_start_tau: 0.05
+      rollout_init_noise_scale: null
       feasible_weight: 1.0
       smooth_deadzone_epsilon: [0.01, 0.01, 0.01]
       smooth_deadzone_tau: 0.002
