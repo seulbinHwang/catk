@@ -1,4 +1,5 @@
 _target_: src.smart.model.smart_flow.SMARTFlow
+
 model_config:
   lr: 0.0005
   lr_warmup_steps: 2
@@ -6,17 +7,21 @@ model_config:
   lr_min_ratio: 0.01
   weight_decay: 0.01
   lr_scheduler_unit: epoch
+
   n_rollout_closed_val: 8
   n_batch_sim_agents_metric: 10
   sim_agents_metric_workers: 3
+
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0
   delete_local_videos_after_wandb_upload: false
+
   val_open_loop: true
   val_closed_loop: true
   validation_open_seed: 0
   validation_closed_seed: 0
+
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
@@ -26,8 +31,10 @@ model_config:
     agent_token_sampling:
       num_k: 1
       temp: 1.0
+
   eval_sampling_noise:
     noise_scale: 1.0
+
   decoder:
     hidden_dim: 128
     num_freq_bands: 64
@@ -49,6 +56,7 @@ model_config:
     flow_solver_steps: 16
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
+
   sim_agents_submission:
     is_active: false
     method_name: "SMART-flow-7M"
@@ -57,10 +65,11 @@ model_config:
     description: Flow-based generative model for simulating realistic agents.
     method_link: "not available yet"
     account_name: "h.sb@naverlabs.com"
+
   finetune:
     enabled: false
     mode: adjoint_matching
-    rollout_steps: 16
+    rollout_steps: 4
     rollout_noise_scale: 1.0
     feasible_weight: 1.0
     smooth_deadzone_epsilon: [0.01, 0.01, 0.01]

@@ -926,7 +926,7 @@ class SMARTFlow(LightningModule):
         """현재 학습이 Adjoint Matching 분기인지 확인합니다.
 
         Returns:
-            bool: residual head만 학습하는 fine-tuning 단계면 ``True`` 입니다.
+            bool: late local decoder block만 학습하는 fine-tuning 단계면 ``True`` 입니다.
         """
         return bool(self.finetune_config.enabled and self.adjoint_matching_loss is not None)
 
@@ -968,8 +968,14 @@ class SMARTFlow(LightningModule):
                 - raw_step-1과 raw_step이 둘 다 valid일 때만 True
                 - “현재 운동과의 연속성 제약을 적용할지 여부”
             """
+            teacher_flow_decoder = self.encoder.agent_encoder.teacher_flow_decoder
+            if teacher_flow_decoder is None:
+                raise RuntimeError(
+                    "Adjoint Matching fine-tuning requires a frozen teacher_flow_decoder, but it is missing."
+                )
             am_result = self.adjoint_matching_loss(
-                flow_decoder=self.encoder.agent_encoder.flow_decoder,
+                teacher_flow_decoder=teacher_flow_decoder,
+                student_flow_decoder=self.encoder.agent_encoder.flow_decoder,
                 flow_ode=self.encoder.agent_encoder.flow_ode,
                 anchor_hidden_valid=anchor_hidden_valid.detach().to(dtype=torch.float32),
                 agent_type=tokenized_agent["flow_train_agent_type"],
@@ -1075,8 +1081,8 @@ class SMARTFlow(LightningModule):
                 batch_size=1,
             )
             self.log(
-                "train/residual_norm",
-                am_result.residual_norm, # residual_velocity 의 출력 값
+                "train/delta_velocity_norm",
+                am_result.delta_velocity_norm,
                 on_step=True,
                 on_epoch=True,
                 sync_dist=True,
@@ -1301,18 +1307,29 @@ class SMARTFlow(LightningModule):
         strict: bool = True,
         assign: bool = False,
     ):
-        """기존 checkpoint를 새 residual head 구조와 호환되게 읽습니다.
+        """기존 checkpoint를 teacher/student fine-tuning 구조와 호환되게 읽습니다.
 
         Args:
             state_dict: 불러올 state dict 입니다.
-            strict: True면 residual head를 뺀 나머지 키는 엄격히 검사합니다.
+            strict: True면 teacher decoder와 호환용 residual head를 뺀 나머지 키는 엄격히 검사합니다.
             assign: PyTorch 기본 ``load_state_dict`` 옵션을 그대로 전달합니다.
 
         Returns:
             _IncompatibleKeys: PyTorch가 돌려주는 키 검사 결과입니다.
         """
         if not strict:
-            return super().load_state_dict(state_dict, strict=False, assign=assign)
+            incompatible_keys = super().load_state_dict(state_dict, strict=False, assign=assign)
+            has_teacher_checkpoint = any(
+                key.startswith("encoder.agent_encoder.teacher_flow_decoder.")
+                for key in state_dict.keys()
+            )
+            if (
+                self.finetune_config.enabled
+                and self.encoder.agent_encoder.teacher_flow_decoder is not None
+                and not has_teacher_checkpoint
+            ):
+                self.encoder.agent_encoder.sync_teacher_flow_decoder_from_student()
+            return incompatible_keys
 
         compatibility_report = self.inspect_finetune_checkpoint_compatibility(state_dict)
         if compatibility_report.has_blocking_issues:
@@ -1330,6 +1347,17 @@ class SMARTFlow(LightningModule):
             if key not in allowed_shape_mismatch_keys
         }
         incompatible_keys = super().load_state_dict(filtered_state_dict, strict=False, assign=assign)
+
+        has_teacher_checkpoint = any(
+            key.startswith("encoder.agent_encoder.teacher_flow_decoder.")
+            for key in state_dict.keys()
+        )
+        if (
+            self.finetune_config.enabled
+            and self.encoder.agent_encoder.teacher_flow_decoder is not None
+            and not has_teacher_checkpoint
+        ):
+            self.encoder.agent_encoder.sync_teacher_flow_decoder_from_student()
 
         remaining_missing_keys = [
             key
@@ -1352,7 +1380,7 @@ class SMARTFlow(LightningModule):
 
     @staticmethod
     def _is_allowed_finetune_checkpoint_mismatch(key: str) -> bool:
-        return "residual_velocity_head" in key
+        return ("residual_velocity_head" in key) or ("teacher_flow_decoder" in key)
 
     def inspect_finetune_checkpoint_compatibility(
         self,

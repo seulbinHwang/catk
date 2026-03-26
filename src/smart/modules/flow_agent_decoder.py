@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Dict
 
 import torch
@@ -73,6 +74,64 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             solver_method=flow_solver_method,
         )
         self.commit_bridge = ContinuousCommitBridge()
+        self.teacher_flow_decoder: HierarchicalFlowDecoder | None = None
+        self.teacher_prefix_steps: int = 0
+
+    def _freeze_teacher_flow_decoder(self) -> None:
+        """Teacher local decoder를 항상 frozen 상태로 유지합니다."""
+        if self.teacher_flow_decoder is None:
+            return
+        self.teacher_flow_decoder.eval()
+        for parameter in self.teacher_flow_decoder.parameters():
+            parameter.requires_grad = False
+
+    def enable_teacher_student_hybrid(self, prefix_steps: int) -> None:
+        """Teacher/student hybrid ODE 생성을 위한 frozen teacher decoder를 준비합니다."""
+        prefix_steps = int(prefix_steps)
+        if prefix_steps < 0 or prefix_steps > int(self.flow_ode.solver_steps):
+            raise ValueError(
+                "prefix_steps must satisfy 0 <= prefix_steps <= flow_solver_steps. "
+                f"Got prefix_steps={prefix_steps}, flow_solver_steps={self.flow_ode.solver_steps}."
+            )
+        if self.teacher_flow_decoder is None:
+            self.teacher_flow_decoder = copy.deepcopy(self.flow_decoder)
+        self.teacher_prefix_steps = prefix_steps
+        self._freeze_teacher_flow_decoder()
+
+    def disable_teacher_student_hybrid(self) -> None:
+        """Teacher/student hybrid 생성을 끕니다."""
+        self.teacher_flow_decoder = None
+        self.teacher_prefix_steps = 0
+
+    def sync_teacher_flow_decoder_from_student(self) -> None:
+        """Teacher local decoder를 현재 student decoder 가중치로 다시 맞춥니다."""
+        if self.teacher_flow_decoder is None:
+            return
+        self.teacher_flow_decoder.load_state_dict(self.flow_decoder.state_dict())
+        self._freeze_teacher_flow_decoder()
+
+    def _generate_future_from_hidden(
+        self,
+        anchor_hidden_valid: torch.Tensor,
+        x_init_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        """유효 anchor 문맥에서 hybrid teacher/student ODE로 2초 미래를 생성합니다."""
+        if self.teacher_flow_decoder is None or self.teacher_prefix_steps <= 0:
+            return self.flow_ode.generate(
+                x_init=x_init_norm,
+                model_fn=lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau),
+            )
+
+        teacher_flow_decoder = self.teacher_flow_decoder
+        teacher_prefix_steps = int(self.teacher_prefix_steps)
+        return self.flow_ode.generate(
+            x_init=x_init_norm,
+            step_model_fn=lambda x_t, tau, step_idx: (
+                teacher_flow_decoder(anchor_hidden_valid, x_t, tau)
+                if step_idx < teacher_prefix_steps
+                else self.flow_decoder(anchor_hidden_valid, x_t, tau)
+            ),
+        )
 
     def build_interaction_edge(
         self,
@@ -291,9 +350,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dtype=anchor_hidden_valid.dtype,
             generator=generator,
         ) * getattr(sampling_noise, "noise_scale", 1.0)
-        return self.flow_ode.generate(
-            x_init=x_init_norm,
-            model_fn=lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau),
+        return self._generate_future_from_hidden(
+            anchor_hidden_valid=anchor_hidden_valid,
+            x_init_norm=x_init_norm,
         )
 
     def sample_open_loop_future(
@@ -801,9 +860,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     active_mask,
                     noise_start : noise_start + sample_window_steps,
                 ].contiguous()
-                y_hat_norm = self.flow_ode.generate(
-                    x_init=x_init_norm,
-                    model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
+                y_hat_norm = self._generate_future_from_hidden(
+                    anchor_hidden_valid=active_hidden,
+                    x_init_norm=x_init_norm,
                 )
                 commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
                     y_hat_norm=y_hat_norm,

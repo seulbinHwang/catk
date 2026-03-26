@@ -17,7 +17,7 @@ class FinetuneConfig:
     Attributes:
         enabled: fine-tuning 분기를 켤지 나타냅니다.
         mode: 현재 지원하는 fine-tuning 방식 이름입니다.
-        rollout_steps: 학습 rollout step 수입니다.
+        rollout_steps: suffix-only AM에서 stochastic rollout을 적용할 마지막 step 수입니다.
         rollout_noise_scale: 초기 Gaussian 잡음 크기입니다.
         feasible_weight: terminal feasible cost 가중치입니다.
         smooth_deadzone_epsilon: 정규화 gap dead-zone 크기입니다.
@@ -103,7 +103,7 @@ def _set_requires_grad(module: torch.nn.Module, requires_grad: bool) -> None:
 
 
 def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneConfig:
-    """현재 단계에 맞게 파라미터를 깔끔하게 얼리고 풉니다.
+    """현재 단계에 맞게 teacher/student와 학습 파라미터를 설정합니다.
 
     Args:
         model: ``SMARTFlowDecoder`` 인스턴스입니다.
@@ -113,18 +113,47 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         FinetuneConfig: 실제로 적용된 fine-tuning 설정입니다.
     """
     config = parse_finetune_config(finetune)
-    residual_head = model.agent_encoder.flow_decoder.residual_velocity_head
+    flow_agent_decoder = model.agent_encoder
+    flow_decoder = flow_agent_decoder.flow_decoder
+    total_solver_steps = int(flow_agent_decoder.flow_ode.solver_steps)
+
+    if config.rollout_steps < 1:
+        raise ValueError("finetune.rollout_steps must be at least 1.")
+    if config.rollout_steps > total_solver_steps:
+        raise ValueError(
+            "finetune.rollout_steps must be smaller than or equal to flow_solver_steps. "
+            f"Got rollout_steps={config.rollout_steps}, flow_solver_steps={total_solver_steps}."
+        )
 
     if not config.enabled:
         _set_requires_grad(model, True)
-        _set_requires_grad(residual_head, False)
-        log.info("Pretraining mode: residual_velocity_head is frozen.")
+        _set_requires_grad(flow_decoder.residual_velocity_head, False)
+        if hasattr(flow_agent_decoder, "disable_teacher_student_hybrid"):
+            flow_agent_decoder.disable_teacher_student_hybrid()
+        log.info(
+            "Pretraining mode: all base parameters are trainable and the compatibility residual head stays frozen."
+        )
         return config
 
     if config.mode != "adjoint_matching":
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 
+    teacher_prefix_steps = total_solver_steps - config.rollout_steps
+    if not hasattr(flow_agent_decoder, "enable_teacher_student_hybrid"):
+        raise AttributeError(
+            "SMARTFlowAgentDecoder must provide enable_teacher_student_hybrid() for fine-tuning."
+        )
+
+    flow_agent_decoder.enable_teacher_student_hybrid(prefix_steps=teacher_prefix_steps)
+    flow_agent_decoder.sync_teacher_flow_decoder_from_student()
+
     _set_requires_grad(model, False)
-    _set_requires_grad(residual_head, True)
-    log.info("Finetuning mode: only residual_velocity_head is trainable.")
+    _set_requires_grad(flow_decoder.step_refiner, True)
+    _set_requires_grad(flow_decoder.velocity_head, True)
+    _set_requires_grad(flow_decoder.residual_velocity_head, False)
+
+    log.info(
+        "Finetuning mode: only flow_decoder.step_refiner and flow_decoder.velocity_head are trainable. "
+        f"Teacher prefix steps={teacher_prefix_steps}, suffix AM steps={config.rollout_steps}."
+    )
     return config

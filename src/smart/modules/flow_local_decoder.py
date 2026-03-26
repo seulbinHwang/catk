@@ -137,29 +137,75 @@ class FlowODE:
     def generate(
         self,
         x_init: torch.Tensor,
-        model_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        model_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         steps: Optional[int] = None,
         method: Optional[str] = None,
+        *,
+        start_step: int = 0,
+        total_steps: Optional[int] = None,
+        step_model_fn: Optional[Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]] = None,
     ) -> torch.Tensor:
-        steps = self.solver_steps if steps is None else steps
+        """고정된 ODE grid에서 trajectory를 적분합니다.
+
+        Args:
+            x_init: 시작 상태입니다. shape은 ``[batch, 20, 4]`` 입니다.
+            model_fn: 모든 step에서 같은 velocity field를 쓸 때의 함수입니다.
+            steps: 실제로 전진할 step 수입니다.
+            method: ``midpoint`` 또는 ``euler`` 입니다.
+            start_step: 전체 grid 기준 시작 step 번호입니다.
+            total_steps: 전체 grid의 step 수입니다. ``steps`` 와 다를 수 있습니다.
+            step_model_fn: step 번호마다 다른 velocity field를 고를 때 쓰는 함수입니다.
+
+        Returns:
+            torch.Tensor: 마지막 상태입니다. shape은 ``[batch, 20, 4]`` 입니다.
+        """
+        steps = self.solver_steps if steps is None else int(steps)
         method = self.solver_method if method is None else method
+        total_steps = steps if total_steps is None else int(total_steps)
+        start_step = int(start_step)
+
+        if steps < 0:
+            raise ValueError(f"steps must be non-negative, got {steps}")
+        if total_steps <= 0:
+            raise ValueError(f"total_steps must be positive, got {total_steps}")
+        if start_step < 0:
+            raise ValueError(f"start_step must be non-negative, got {start_step}")
+        if start_step + steps > total_steps:
+            raise ValueError(
+                "start_step + steps must be smaller than or equal to total_steps. "
+                f"Got start_step={start_step}, steps={steps}, total_steps={total_steps}."
+            )
+        if model_fn is None and step_model_fn is None:
+            raise ValueError("Either model_fn or step_model_fn must be provided.")
 
         x_t = x_init
         t0 = self.eps
-        dt = (1.0 - t0) / float(steps)
+        dt = (1.0 - t0) / float(total_steps)
 
-        for i in range(steps):
-            t = t0 + i * dt
+        def _call_model(
+            state: torch.Tensor,
+            tau: torch.Tensor,
+            step_idx: int,
+        ) -> torch.Tensor:
+            if step_model_fn is not None:
+                return step_model_fn(state, tau, step_idx)
+            if model_fn is None:
+                raise ValueError("model_fn is required when step_model_fn is not provided.")
+            return model_fn(state, tau)
+
+        for local_step in range(steps):
+            step_idx = start_step + local_step
+            t = t0 + step_idx * dt
             tau = x_t.new_full((x_t.shape[0],), t)
 
             if method == "midpoint":
-                v1 = model_fn(x_t, tau)
+                v1 = _call_model(x_t, tau, step_idx)
                 x_mid = x_t + 0.5 * dt * v1
                 tau_mid = x_t.new_full((x_t.shape[0],), t + 0.5 * dt)
-                v2 = model_fn(x_mid, tau_mid)
+                v2 = _call_model(x_mid, tau_mid, step_idx)
                 x_t = x_t + dt * v2
             elif method == "euler":
-                v = model_fn(x_t, tau)
+                v = _call_model(x_t, tau, step_idx)
                 x_t = x_t + dt * v
             else:
                 raise ValueError(f"Unsupported solver method: {method}")
@@ -397,7 +443,10 @@ class HierarchicalFlowDecoder(nn.Module):
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Base velocity 와 residual velocity 를 함께 계산합니다.
+        """현재 local decoder가 내는 velocity와 마지막 step feature를 계산합니다.
+
+        residual head 모듈은 예전 checkpoint 호환을 위해 남겨 두지만,
+        실제 생성과 fine-tuning에는 사용하지 않습니다.
 
         Args:
             anchor_hidden: anchor 문맥입니다. shape은 ``[batch, hidden_dim]`` 입니다.
@@ -406,18 +455,19 @@ class HierarchicalFlowDecoder(nn.Module):
 
         Returns:
             dict[str, torch.Tensor]: 아래 키를 담은 사전입니다.
-                - ``velocity``: base와 residual을 더한 최종 velocity 입니다.
+                - ``velocity``: 현재 student decoder의 velocity 입니다.
                   shape은 ``[batch, 20, 4]`` 입니다.
-                - ``base_velocity``: base velocity 입니다. shape은 ``[batch, 20, 4]`` 입니다.
-                - ``residual_velocity``: residual velocity 입니다. shape은 ``[batch, 20, 4]`` 입니다.
+                - ``base_velocity``: ``velocity`` 와 같은 값입니다.
+                  shape은 ``[batch, 20, 4]`` 입니다.
+                - ``residual_velocity``: 호환용 0 텐서입니다.
+                  shape은 ``[batch, 20, 4]`` 입니다.
                 - ``step_tokens``: 마지막 step feature 입니다. shape은 ``[batch, 20, flow_dim]`` 입니다.
         """
-        # step_tokens: [batch, 20, flow_dim]
         step_tokens = self._build_step_tokens(anchor_hidden, x_t_norm, tau)
         base_velocity = self.velocity_head(step_tokens)
-        residual_velocity = self.residual_velocity_head(step_tokens)
+        residual_velocity = torch.zeros_like(base_velocity)
         return {
-            "velocity": base_velocity + residual_velocity,
+            "velocity": base_velocity,
             "base_velocity": base_velocity,
             "residual_velocity": residual_velocity,
             "step_tokens": step_tokens,
