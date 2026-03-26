@@ -23,6 +23,7 @@ model:
         noise_scale: 1.0
         backprop_last_k: 4
       physics:
+        force_fp32: true
         dt: 0.1
         pos_scale_m: 20.0
         deadzone_ratio: 0.02

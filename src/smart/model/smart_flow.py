@@ -84,9 +84,11 @@ class SMARTFlow(LightningModule):
         self.draft_start_epoch = int(getattr(draft_config, "start_epoch", 0)) if draft_config is not None else 0
         self.draft_ramp_epochs = int(getattr(draft_config, "ramp_epochs", 1)) if draft_config is not None else 1
         self.draft_max_weight = float(getattr(draft_config, "max_weight", 0.0)) if draft_config is not None else 0.0
+        self.draft_physics_force_fp32 = False
 
         if self.draft_enabled:
             draft_physics = getattr(draft_config, "physics")
+            self.draft_physics_force_fp32 = bool(getattr(draft_physics, "force_fp32", True))
             self.draft_regularizer = DraftPhysicsRegularizer(
                 dt=float(getattr(draft_physics, "dt", 0.1)),
                 pos_scale_m=float(getattr(draft_physics, "pos_scale_m", 20.0)),
@@ -951,13 +953,25 @@ class SMARTFlow(LightningModule):
                 f"got {pred_sample_norm.shape[0]} and {tokenized_agent['flow_train_agent_type'].shape[0]}"
             )
 
-        return self.draft_regularizer(
-            pred_future_norm=pred_sample_norm,
-            target_future_norm=pred_dict["flow_clean_norm"],
-            packed_agent_type=tokenized_agent["flow_train_agent_type"],
-            packed_prev_control=tokenized_agent["flow_train_prev_control"],
-            packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-        )
+        if not self.draft_physics_force_fp32:
+            return self.draft_regularizer(
+                pred_future_norm=pred_sample_norm,
+                target_future_norm=pred_dict["flow_clean_norm"],
+                packed_agent_type=tokenized_agent["flow_train_agent_type"],
+                packed_prev_control=tokenized_agent["flow_train_prev_control"],
+                packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+            )
+
+        # Keep the threshold-heavy physics penalty in fp32 even when the trainer
+        # runs with bf16 autocast, while preserving gradients to pred_sample_norm.
+        with torch.autocast(device_type=pred_sample_norm.device.type, enabled=False):
+            return self.draft_regularizer(
+                pred_future_norm=pred_sample_norm.float(),
+                target_future_norm=pred_dict["flow_clean_norm"].float(),
+                packed_agent_type=tokenized_agent["flow_train_agent_type"],
+                packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
+                packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+            )
 
     def _log_draft_training_metrics(
         self,

@@ -40,6 +40,7 @@ model_config:
       noise_scale: 1.0
       backprop_last_k: null
     physics:
+      force_fp32: true
       dt: 0.1
       pos_scale_m: 20.0
       deadzone_ratio: 0.02
@@ -69,7 +70,7 @@ model_config:
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
-    flow_solver_steps: 4
+    flow_solver_steps: 16
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
   sim_agents_submission:
