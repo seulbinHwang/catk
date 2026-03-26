@@ -15,8 +15,8 @@ model:
       enabled: true
       start_epoch: 0
       ramp_epochs: 4
-      max_weight: 0.05
-      gt_excess_only: true
+      max_weight: 0.1
+      gt_excess_only: false
       sampling:
         sample_steps: 16
         sample_method: midpoint

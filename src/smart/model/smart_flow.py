@@ -22,7 +22,11 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_2s,
     yaw_fde_2s,
 )
-from src.smart.modules.draft_physics import DraftPhysicsRegularizer
+from src.smart.modules.draft_physics import (
+    DRAFT_PHYSICS_ACTUAL_UNIT_KEYS,
+    DRAFT_PHYSICS_COMPONENT_KEYS,
+    DraftPhysicsRegularizer,
+)
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -906,6 +910,21 @@ class SMARTFlow(LightningModule):
         progress = min(max(progress, 0.0), 1.0)
         return self.draft_max_weight * progress
 
+    def _build_zero_draft_metrics(self, reference: Tensor) -> Dict[str, Tensor]:
+        """DRaFT logging에 필요한 0 metric 사전을 만듭니다."""
+        zero = reference.new_zeros(())
+        metric_dict = {
+            "loss": zero,
+            "raw_pred_loss": zero,
+        }
+        for key in DRAFT_PHYSICS_COMPONENT_KEYS:
+            metric_dict[key] = zero
+        for key in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
+            metric_dict[key] = zero
+            metric_dict[f"pred_{key}"] = zero
+            metric_dict[f"gt_{key}"] = zero
+        return metric_dict
+
     def _compute_draft_training_loss(
         self,
         pred_dict: Dict[str, Tensor],
@@ -929,17 +948,7 @@ class SMARTFlow(LightningModule):
             or self.draft_regularizer is None
             or pred_dict["flow_clean_norm"].numel() == 0
         ):
-            zero = pred_dict["flow_clean_norm"].new_zeros(())
-            return {
-                "loss": zero,
-                "raw_pred_loss": zero,
-                "speed": zero,
-                "slip": zero,
-                "start": zero,
-                "accel": zero,
-                "yaw_accel": zero,
-                "turn": zero,
-            }
+            return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
 
         pred_sample_norm = self.encoder.sample_open_loop_future(
             anchor_hidden=pred_dict["anchor_hidden"],
@@ -1011,7 +1020,7 @@ class SMARTFlow(LightningModule):
             sync_dist=True,
             batch_size=1,
         )
-        for metric_name in ["speed", "slip", "start", "accel", "yaw_accel", "turn"]:
+        for metric_name in DRAFT_PHYSICS_COMPONENT_KEYS:
             self.log(
                 f"train/phys_{metric_name}",
                 physics_dict[metric_name],
@@ -1020,6 +1029,16 @@ class SMARTFlow(LightningModule):
                 sync_dist=True,
                 batch_size=1,
             )
+        for metric_name in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
+            for prefix in ("", "pred_", "gt_"):
+                self.log(
+                    f"train/phys_{prefix}{metric_name}",
+                    physics_dict[f"{prefix}{metric_name}"],
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
 
     def training_step(self, data, batch_idx):
         """한 batch의 FM loss와 DRaFT physics loss를 함께 계산합니다.
@@ -1040,16 +1059,7 @@ class SMARTFlow(LightningModule):
         fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
 
         draft_weight = self._get_draft_loss_weight()
-        physics_dict = {
-            "loss": fm_loss.new_zeros(()),
-            "raw_pred_loss": fm_loss.new_zeros(()),
-            "speed": fm_loss.new_zeros(()),
-            "slip": fm_loss.new_zeros(()),
-            "start": fm_loss.new_zeros(()),
-            "accel": fm_loss.new_zeros(()),
-            "yaw_accel": fm_loss.new_zeros(()),
-            "turn": fm_loss.new_zeros(()),
-        }
+        physics_dict = self._build_zero_draft_metrics(fm_loss)
         total_loss = fm_loss
         if draft_weight > 0.0:
             physics_dict = self._compute_draft_training_loss(

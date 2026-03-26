@@ -47,6 +47,46 @@ DEFAULT_LIMITS = DynamicLimitTable(
 )
 
 
+DRAFT_PHYSICS_COMPONENT_KEYS = (
+    "speed",
+    "slip",
+    "start",
+    "accel",
+    "yaw_accel",
+    "turn",
+)
+
+DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
+    "speed_excess_mps",
+    "slip_vy_excess_mps",
+    "slip_beta_excess_deg",
+    "start_accel_excess_mps2",
+    "start_yaw_accel_excess_degps2",
+    "accel_excess_mps2",
+    "yaw_accel_excess_degps2",
+    "turn_yaw_rate_excess_degps",
+    "turn_lat_accel_excess_mps2",
+    "turn_radius_shortfall_m",
+)
+
+
+def _build_zero_output(reference: Tensor) -> Dict[str, Tensor]:
+    zero = reference.new_zeros(())
+    output = {
+        "loss": zero,
+        "raw_pred_loss": zero,
+    }
+    for key in DRAFT_PHYSICS_COMPONENT_KEYS:
+        output[key] = zero
+        output[f"pred_{key}"] = zero
+        output[f"gt_{key}"] = zero
+    for key in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
+        output[key] = zero
+        output[f"pred_{key}"] = zero
+        output[f"gt_{key}"] = zero
+    return output
+
+
 class DraftPhysicsRegularizer(nn.Module):
     """최종 샘플 기준 physics penalty를 계산합니다.
 
@@ -128,29 +168,7 @@ class DraftPhysicsRegularizer(nn.Module):
                 총 physics loss와 각 세부 항의 평균값을 담은 사전입니다.
         """
         if pred_future_norm.numel() == 0:
-            zero = pred_future_norm.new_zeros(())
-            return {
-                "loss": zero,
-                "raw_pred_loss": zero,
-                "speed": zero,
-                "slip": zero,
-                "start": zero,
-                "accel": zero,
-                "yaw_accel": zero,
-                "turn": zero,
-                "pred_speed": zero,
-                "pred_slip": zero,
-                "pred_start": zero,
-                "pred_accel": zero,
-                "pred_yaw_accel": zero,
-                "pred_turn": zero,
-                "gt_speed": zero,
-                "gt_slip": zero,
-                "gt_start": zero,
-                "gt_accel": zero,
-                "gt_yaw_accel": zero,
-                "gt_turn": zero,
-            }
+            return _build_zero_output(pred_future_norm)
 
         limits = self._gather_limits(
             packed_agent_type=packed_agent_type,
@@ -182,6 +200,9 @@ class DraftPhysicsRegularizer(nn.Module):
         loss_terms: Dict[str, Tensor] = {}
         pred_means: Dict[str, Tensor] = {}
         gt_means: Dict[str, Tensor] = {}
+        actual_unit_terms: Dict[str, Tensor] = {}
+        pred_actual_unit_means: Dict[str, Tensor] = {}
+        gt_actual_unit_means: Dict[str, Tensor] = {}
         raw_pred_loss = pred_future_norm.new_zeros(())
         total_loss = pred_future_norm.new_zeros(())
 
@@ -203,12 +224,27 @@ class DraftPhysicsRegularizer(nn.Module):
             total_loss = total_loss + weight * effective_mean
             raw_pred_loss = raw_pred_loss + weight * pred_mean
 
+        for name in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
+            pred_value = pred_stats[name]
+            gt_value = gt_stats[name].detach()
+            pred_actual_unit_means[f"pred_{name}"] = pred_value.mean()
+            gt_actual_unit_means[f"gt_{name}"] = gt_value.mean()
+
+            if self.gt_excess_only:
+                effective = torch.relu(pred_value - gt_value)
+            else:
+                effective = pred_value
+            actual_unit_terms[name] = effective.mean()
+
         return {
             "loss": total_loss,
             "raw_pred_loss": raw_pred_loss,
             **loss_terms,
             **pred_means,
             **gt_means,
+            **actual_unit_terms,
+            **pred_actual_unit_means,
+            **gt_actual_unit_means,
         }
 
     def _compute_proxy_penalties(
@@ -240,6 +276,8 @@ class DraftPhysicsRegularizer(nn.Module):
 
         speed = torch.sqrt(vx_body.square() + vy_body.square() + self.eps)
         nonholonomic = limits["is_nonholonomic"].unsqueeze(-1)
+        accel_limit = limits["a_max_mps2"] * self.dt
+        yaw_accel_limit = limits["alpha_max_radps2"] * self.dt
 
         speed_pen = self._mean_over_time(
             self._normalized_square_penalty(
@@ -247,11 +285,15 @@ class DraftPhysicsRegularizer(nn.Module):
                 limit=limits["v_max_mps"].unsqueeze(-1),
             )
         )
+        speed_excess_mps = self._mean_over_time(
+            torch.relu(speed - limits["v_max_mps"].unsqueeze(-1))
+        )
 
         vy_pen = self._normalized_square_penalty(
             value=vy_body.abs(),
             limit=limits["v_b_y_max"].unsqueeze(-1),
         )
+        vy_excess = torch.relu(vy_body.abs() - limits["v_b_y_max"].unsqueeze(-1))
         beta = torch.atan2(vy_body.abs(), vx_body.abs() + self.eps)
         beta_limit = limits["beta_max_rad"].unsqueeze(-1)
         beta_pen = self._normalized_square_penalty(
@@ -259,10 +301,19 @@ class DraftPhysicsRegularizer(nn.Module):
             limit=beta_limit,
             enabled=beta_limit > 0.0,
         )
-        slip_pen = self._mean_over_time(torch.where(nonholonomic, vy_pen + beta_pen, vy_pen.new_zeros(())))
+        slip_pen = self._mean_over_time(torch.where(nonholonomic, vy_pen + beta_pen, torch.zeros_like(vy_pen)))
+        slip_vy_excess_mps = self._mean_over_time(
+            torch.where(nonholonomic, vy_excess, torch.zeros_like(vy_excess))
+        )
+        beta_excess_deg = torch.rad2deg(torch.relu(beta - beta_limit))
+        slip_beta_excess_deg = self._mean_over_time(
+            torch.where(
+                nonholonomic & (beta_limit > 0.0),
+                beta_excess_deg,
+                torch.zeros_like(beta_excess_deg),
+            )
+        )
 
-        accel_limit = limits["a_max_mps2"] * self.dt
-        yaw_accel_limit = limits["alpha_max_radps2"] * self.dt
         speed_x = vx_body
 
         start_dv = (speed_x[:, 0] - prev_control[:, 0]).abs()
@@ -276,6 +327,16 @@ class DraftPhysicsRegularizer(nn.Module):
             start_pen,
             start_pen.new_zeros(start_pen.shape),
         )
+        start_accel_excess_mps2 = torch.where(
+            limits["is_nonholonomic"] & prev_control_valid,
+            torch.relu(start_dv / self.dt - limits["a_max_mps2"]),
+            torch.zeros_like(start_dv),
+        )
+        start_yaw_accel_excess_degps2 = torch.where(
+            limits["is_nonholonomic"] & prev_control_valid,
+            torch.rad2deg(torch.relu(start_dw / self.dt - limits["alpha_max_radps2"])),
+            torch.zeros_like(start_dw),
+        )
 
         if vx_body.shape[1] > 1:
             dv = (speed_x[:, 1:] - speed_x[:, :-1]).abs()
@@ -285,37 +346,66 @@ class DraftPhysicsRegularizer(nn.Module):
                 torch.where(
                     nonholonomic_step,
                     self._normalized_square_penalty(dv, accel_limit.unsqueeze(-1)),
-                    dv.new_zeros(()),
+                    torch.zeros_like(dv),
                 )
             )
             yaw_accel_pen = self._mean_over_time(
                 torch.where(
                     nonholonomic_step,
                     self._normalized_square_penalty(dw, yaw_accel_limit.unsqueeze(-1)),
-                    dw.new_zeros(()),
+                    torch.zeros_like(dw),
+                )
+            )
+            accel_excess_mps2 = self._mean_over_time(
+                torch.where(
+                    nonholonomic_step,
+                    torch.relu(dv / self.dt - limits["a_max_mps2"].unsqueeze(-1)),
+                    torch.zeros_like(dv),
+                )
+            )
+            yaw_accel_excess_degps2 = self._mean_over_time(
+                torch.where(
+                    nonholonomic_step,
+                    torch.rad2deg(torch.relu(dw / self.dt - limits["alpha_max_radps2"].unsqueeze(-1))),
+                    torch.zeros_like(dw),
                 )
             )
         else:
             accel_pen = speed_pen.new_zeros(speed_pen.shape)
             yaw_accel_pen = speed_pen.new_zeros(speed_pen.shape)
+            accel_excess_mps2 = speed_pen.new_zeros(speed_pen.shape)
+            yaw_accel_excess_degps2 = speed_pen.new_zeros(speed_pen.shape)
 
         omega_abs_pen = self._normalized_square_penalty(
             value=omega.abs(),
             limit=limits["omega_max_abs_radps"].unsqueeze(-1),
+        )
+        turn_yaw_rate_excess_degps = self._mean_over_time(
+            torch.rad2deg(torch.relu(omega.abs() - limits["omega_max_abs_radps"].unsqueeze(-1)))
         )
         lat_acc_value = speed * omega.abs()
         lat_acc_pen = self._normalized_square_penalty(
             value=lat_acc_value,
             limit=limits["a_lat_max_mps2"].unsqueeze(-1),
         )
+        turn_lat_accel_excess_mps2 = self._mean_over_time(
+            torch.where(
+                nonholonomic,
+                torch.relu(lat_acc_value - limits["a_lat_max_mps2"].unsqueeze(-1)),
+                torch.zeros_like(lat_acc_value),
+            )
+        )
         radius_value = vx_body.abs() / (omega.abs() + self.eps)
         radius_shortfall = torch.relu(limits["r_min_m"].unsqueeze(-1) - radius_value)
+        turn_radius_shortfall_m = self._mean_over_time(
+            torch.where(nonholonomic, radius_shortfall, torch.zeros_like(radius_shortfall))
+        )
         radius_pen = self._square_from_normalized_excess(
             radius_shortfall / (limits["r_min_m"].unsqueeze(-1) + self.eps)
         )
         turn_pen = self._mean_over_time(
             omega_abs_pen
-            + torch.where(nonholonomic, lat_acc_pen + radius_pen, lat_acc_pen.new_zeros(()))
+            + torch.where(nonholonomic, lat_acc_pen + radius_pen, torch.zeros_like(lat_acc_pen))
         )
 
         return {
@@ -325,6 +415,16 @@ class DraftPhysicsRegularizer(nn.Module):
             "accel": accel_pen,
             "yaw_accel": yaw_accel_pen,
             "turn": turn_pen,
+            "speed_excess_mps": speed_excess_mps,
+            "slip_vy_excess_mps": slip_vy_excess_mps,
+            "slip_beta_excess_deg": slip_beta_excess_deg,
+            "start_accel_excess_mps2": start_accel_excess_mps2,
+            "start_yaw_accel_excess_degps2": start_yaw_accel_excess_degps2,
+            "accel_excess_mps2": accel_excess_mps2,
+            "yaw_accel_excess_degps2": yaw_accel_excess_degps2,
+            "turn_yaw_rate_excess_degps": turn_yaw_rate_excess_degps,
+            "turn_lat_accel_excess_mps2": turn_lat_accel_excess_mps2,
+            "turn_radius_shortfall_m": turn_radius_shortfall_m,
         }
 
     def _gather_limits(

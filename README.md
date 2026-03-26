@@ -456,15 +456,7 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 - train batch size: `20`
 - val batch size: `16`
 - validation 주기: `4` epoch마다
-- `draft.enabled=true`
-- `draft.max_weight=0.05`
-- `draft.start_epoch=0`
-- `draft.ramp_epochs=4`
-- `draft.gt_excess_only=true`
-- `draft.physics.force_fp32=true`
-- `draft.sampling.sample_steps=16`
-- `draft.sampling.sample_method=midpoint`
-- `draft.sampling.backprop_last_k=4`
+
 
 loss와 로그는 아래처럼 보면 됩니다.
 
@@ -475,6 +467,9 @@ loss와 로그는 아래처럼 보면 됩니다.
 - 기본 구현은 trainer가 `bf16-mixed`여도 DRaFT physics regularizer 계산 구간만 fp32 subregion에서 수행합니다.
 - `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
 - 세부 physics 항은 `train/phys_speed`, `train/phys_slip`, `train/phys_start`, `train/phys_accel`, `train/phys_yaw_accel`, `train/phys_turn`으로 기록됩니다.
+- 실제 단위 위반량도 함께 기록됩니다. 예를 들어 `train/phys_speed_excess_mps`, `train/phys_accel_excess_mps2`, `train/phys_yaw_accel_excess_degps2` 같은 값은 normalized penalty가 아니라 실제 초과량입니다.
+- 합성 항은 하위 물리량으로 나뉘어 기록됩니다. 예를 들어 `slip`은 `train/phys_slip_vy_excess_mps`, `train/phys_slip_beta_excess_deg`, `start`는 `train/phys_start_accel_excess_mps2`, `train/phys_start_yaw_accel_excess_degps2`, `turn`은 `train/phys_turn_yaw_rate_excess_degps`, `train/phys_turn_lat_accel_excess_mps2`, `train/phys_turn_radius_shortfall_m`으로 볼 수 있습니다.
+- 각 실제 단위 metric에는 현재 학습 loss와 같은 semantics의 기본값 외에, raw 예측 위반량 `train/phys_pred_*` 와 GT 위반량 `train/phys_gt_*` 도 같이 기록됩니다.
 
 자주 바꾸는 override 예시는 아래와 같습니다.
 
