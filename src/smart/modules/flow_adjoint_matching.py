@@ -65,13 +65,15 @@ class AdjointMatchingResult:
 
     Attributes:
         loss: 실제로 역전파할 regression loss 입니다. shape은 ``[]`` 입니다.
-        terminal_cost: 마지막 feasible cost 평균입니다. shape은 ``[]`` 입니다.
-        projection_gap: 정규화된 projector gap의 평균 절대값입니다. shape은 ``[]`` 입니다.
-        projection_gap_vx_b_mps: body x 속도 gap의 평균 절대값입니다. 단위는 m/s 입니다.
-        projection_gap_vy_b_mps: body y 속도 gap의 평균 절대값입니다. 단위는 m/s 입니다.
-        projection_gap_yaw_rate_degps: yaw-rate gap의 평균 절대값입니다. 단위는 deg/s 입니다.
+        terminal_cost: 학습용 stochastic rollout 마지막 feasible cost 평균입니다. shape은 ``[]`` 입니다.
+        projection_gap: stochastic rollout의 정규화된 projector gap 평균 절대값입니다. shape은 ``[]`` 입니다.
+        projection_gap_vx_b_mps: stochastic rollout의 body x 속도 gap 평균 절대값입니다. 단위는 m/s 입니다.
+        projection_gap_vy_b_mps: stochastic rollout의 body y 속도 gap 평균 절대값입니다. 단위는 m/s 입니다.
+        projection_gap_yaw_rate_degps: stochastic rollout의 yaw-rate gap 평균 절대값입니다. 단위는 deg/s 입니다.
         residual_norm: residual velocity의 평균 제곱 크기입니다. shape은 ``[]`` 입니다.
         final_sample: rollout 마지막 상태입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        diagnostic_metrics: 추가 projector 진단 로그입니다.
+            ``gt_*``, ``deterministic_*``, ``stochastic_*`` 접두사를 사용합니다.
     """
 
     loss: Tensor
@@ -82,6 +84,7 @@ class AdjointMatchingResult:
     projection_gap_yaw_rate_degps: Tensor
     residual_norm: Tensor
     final_sample: Tensor
+    diagnostic_metrics: Dict[str, Tensor]
 
 
 class SmoothControlProjector(nn.Module):
@@ -561,6 +564,11 @@ class SmoothControlProjector(nn.Module):
         epsilon = self.smooth_deadzone_epsilon.view(1, 1, 3).to(value)
         return tau * F.softplus((self._smooth_abs(value) - epsilon) / tau)
 
+    @staticmethod
+    def prefix_metric_keys(prefix: str, metrics: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """Projector metric dict에 접두사를 붙여 logging 키로 바꿉니다."""
+        return {f"{prefix}_{name}": value.detach() for name, value in metrics.items()}
+
     def compute_terminal_cost(
         self,
         pred_clean_norm: Tensor,
@@ -1030,6 +1038,16 @@ class AdjointMatchingLoss(nn.Module):
                 projection_gap_yaw_rate_degps=zero.detach(),
                 residual_norm=zero.detach(),
                 final_sample=empty_sample,
+                diagnostic_metrics=self.projector.prefix_metric_keys(
+                    "stochastic",
+                    {
+                        "terminal_cost": zero.detach(),
+                        "projection_gap": zero.detach(),
+                        "projection_gap_vx_b_mps": zero.detach(),
+                        "projection_gap_vy_b_mps": zero.detach(),
+                        "projection_gap_yaw_rate_degps": zero.detach(),
+                    },
+                ),
             )
 
         device_type = anchor_hidden_valid.device.type if anchor_hidden_valid.device.type else "cpu"
@@ -1123,4 +1141,5 @@ class AdjointMatchingLoss(nn.Module):
                 projection_gap_yaw_rate_degps=metrics["projection_gap_yaw_rate_degps"],
                 residual_norm=residual_norm.detach(), # shape : ( )
                 final_sample=states[-1], # shape : [n_valid_anchor, 20, 4]
+                diagnostic_metrics=self.projector.prefix_metric_keys("stochastic", metrics),
             )
