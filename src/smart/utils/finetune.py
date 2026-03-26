@@ -127,12 +127,9 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
 
     if not config.enabled:
         _set_requires_grad(model, True)
-        _set_requires_grad(flow_decoder.residual_velocity_head, False)
         if hasattr(flow_agent_decoder, "disable_teacher_student_hybrid"):
             flow_agent_decoder.disable_teacher_student_hybrid()
-        log.info(
-            "Pretraining mode: all base parameters are trainable and the compatibility residual head stays frozen."
-        )
+        log.info("Pretraining mode: all base parameters are trainable.")
         return config
 
     if config.mode != "adjoint_matching":
@@ -150,7 +147,6 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
     _set_requires_grad(model, False)
     _set_requires_grad(flow_decoder.step_refiner, True)
     _set_requires_grad(flow_decoder.velocity_head, True)
-    _set_requires_grad(flow_decoder.residual_velocity_head, False)
 
     log.info(
         "Finetuning mode: only flow_decoder.step_refiner and flow_decoder.velocity_head are trainable. "

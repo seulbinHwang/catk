@@ -370,25 +370,6 @@ class FlowVelocityHead(nn.Module):
         return self.net(step_tokens)
 
 
-class ResidualFlowVelocityHead(nn.Module):
-    """Fine-tuning 때만 움직이는 작은 residual velocity head 입니다."""
-
-    def __init__(self, flow_dim: int, bottleneck_dim: int | None = None) -> None:
-        super().__init__()
-        hidden_dim = flow_dim // 2 if bottleneck_dim is None else bottleneck_dim
-        self.net = nn.Sequential(
-            nn.LayerNorm(flow_dim),
-            nn.Linear(flow_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 4),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, step_tokens: torch.Tensor) -> torch.Tensor:
-        return self.net(step_tokens)
-
-
 class HierarchicalFlowDecoder(nn.Module):
     def __init__(
         self,
@@ -411,7 +392,6 @@ class HierarchicalFlowDecoder(nn.Module):
             num_heads=num_chunk_heads,
         )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
-        self.residual_velocity_head = ResidualFlowVelocityHead(flow_dim=flow_dim)
 
     def _build_step_tokens(
         self,
@@ -437,49 +417,14 @@ class HierarchicalFlowDecoder(nn.Module):
 
         return self.step_refiner(step_tokens, chunk_tokens, context)
 
-    def forward_components(
-        self,
-        anchor_hidden: torch.Tensor,
-        x_t_norm: torch.Tensor,
-        tau: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """현재 local decoder가 내는 velocity와 마지막 step feature를 계산합니다.
-
-        residual head 모듈은 예전 checkpoint 호환을 위해 남겨 두지만,
-        실제 생성과 fine-tuning에는 사용하지 않습니다.
-
-        Args:
-            anchor_hidden: anchor 문맥입니다. shape은 ``[batch, hidden_dim]`` 입니다.
-            x_t_norm: 현재 noisy trajectory 입니다. shape은 ``[batch, 20, 4]`` 입니다.
-            tau: 생성 진행률입니다. shape은 ``[batch]`` 입니다.
-
-        Returns:
-            dict[str, torch.Tensor]: 아래 키를 담은 사전입니다.
-                - ``velocity``: 현재 student decoder의 velocity 입니다.
-                  shape은 ``[batch, 20, 4]`` 입니다.
-                - ``base_velocity``: ``velocity`` 와 같은 값입니다.
-                  shape은 ``[batch, 20, 4]`` 입니다.
-                - ``residual_velocity``: 호환용 0 텐서입니다.
-                  shape은 ``[batch, 20, 4]`` 입니다.
-                - ``step_tokens``: 마지막 step feature 입니다. shape은 ``[batch, 20, flow_dim]`` 입니다.
-        """
-        step_tokens = self._build_step_tokens(anchor_hidden, x_t_norm, tau)
-        base_velocity = self.velocity_head(step_tokens)
-        residual_velocity = torch.zeros_like(base_velocity)
-        return {
-            "velocity": base_velocity,
-            "base_velocity": base_velocity,
-            "residual_velocity": residual_velocity,
-            "step_tokens": step_tokens,
-        }
-
     def forward(
         self,
         anchor_hidden: torch.Tensor,
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_components(anchor_hidden, x_t_norm, tau)["velocity"]
+        step_tokens = self._build_step_tokens(anchor_hidden, x_t_norm, tau)
+        return self.velocity_head(step_tokens)
 
 
 class ContinuousCommitBridge:

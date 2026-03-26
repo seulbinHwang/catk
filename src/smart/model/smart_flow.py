@@ -1311,7 +1311,7 @@ class SMARTFlow(LightningModule):
 
         Args:
             state_dict: 불러올 state dict 입니다.
-            strict: True면 teacher decoder와 호환용 residual head를 뺀 나머지 키는 엄격히 검사합니다.
+            strict: True면 teacher decoder를 뺀 나머지 키는 엄격히 검사합니다.
             assign: PyTorch 기본 ``load_state_dict`` 옵션을 그대로 전달합니다.
 
         Returns:
@@ -1380,7 +1380,7 @@ class SMARTFlow(LightningModule):
 
     @staticmethod
     def _is_allowed_finetune_checkpoint_mismatch(key: str) -> bool:
-        return ("residual_velocity_head" in key) or ("teacher_flow_decoder" in key)
+        return "teacher_flow_decoder" in key
 
     def inspect_finetune_checkpoint_compatibility(
         self,
