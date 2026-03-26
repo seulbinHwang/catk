@@ -24,8 +24,33 @@ model_config:
     agent_token_sampling:
       num_k: 1
       temp: 1.0
-  eval_sampling_noise:
+  validation_rollout_sampling:
+    sample_steps: 16
+    sample_method: midpoint
     noise_scale: 1.0
+  draft:
+    enabled: false
+    start_epoch: 0
+    ramp_epochs: 4
+    max_weight: 0.05
+    gt_excess_only: true
+    sampling:
+      sample_steps: 16
+      sample_method: midpoint
+      noise_scale: 1.0
+      backprop_last_k: null
+    physics:
+      dt: 0.1
+      pos_scale_m: 20.0
+      deadzone_ratio: 0.02
+      deadzone_softness: 0.02
+      speed_weight: 1.0
+      slip_weight: 1.0
+      start_weight: 1.0
+      accel_weight: 1.0
+      yaw_accel_weight: 1.0
+      turn_weight: 1.0
+      eps: 1.0e-6
   decoder:
     hidden_dim: 128
     num_freq_bands: 64
@@ -44,7 +69,7 @@ model_config:
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
-    flow_solver_steps: 16
+    flow_solver_steps: 4
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
   sim_agents_submission:

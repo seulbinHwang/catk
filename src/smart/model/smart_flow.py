@@ -22,6 +22,7 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_2s,
     yaw_fde_2s,
 )
+from src.smart.modules.draft_physics import DraftPhysicsRegularizer
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -75,7 +76,34 @@ class SMARTFlow(LightningModule):
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
-        self.eval_sampling_noise = model_config.eval_sampling_noise
+        self.validation_rollout_sampling = model_config.validation_rollout_sampling
+
+        draft_config = getattr(model_config, "draft", None)
+        self.draft_enabled = bool(draft_config is not None and getattr(draft_config, "enabled", False))
+        self.draft_sampling = getattr(draft_config, "sampling", None)
+        self.draft_start_epoch = int(getattr(draft_config, "start_epoch", 0)) if draft_config is not None else 0
+        self.draft_ramp_epochs = int(getattr(draft_config, "ramp_epochs", 1)) if draft_config is not None else 1
+        self.draft_max_weight = float(getattr(draft_config, "max_weight", 0.0)) if draft_config is not None else 0.0
+
+        if self.draft_enabled:
+            draft_physics = getattr(draft_config, "physics")
+            self.draft_regularizer = DraftPhysicsRegularizer(
+                dt=float(getattr(draft_physics, "dt", 0.1)),
+                pos_scale_m=float(getattr(draft_physics, "pos_scale_m", 20.0)),
+                deadzone_ratio=float(getattr(draft_physics, "deadzone_ratio", 0.02)),
+                deadzone_softness=float(getattr(draft_physics, "deadzone_softness", 0.02)),
+                gt_excess_only=bool(getattr(draft_config, "gt_excess_only", True)),
+                speed_weight=float(getattr(draft_physics, "speed_weight", 1.0)),
+                slip_weight=float(getattr(draft_physics, "slip_weight", 1.0)),
+                start_weight=float(getattr(draft_physics, "start_weight", 1.0)),
+                accel_weight=float(getattr(draft_physics, "accel_weight", 1.0)),
+                yaw_accel_weight=float(getattr(draft_physics, "yaw_accel_weight", 1.0)),
+                turn_weight=float(getattr(draft_physics, "turn_weight", 1.0)),
+                eps=float(getattr(draft_physics, "eps", 1e-6)),
+            )
+        else:
+            self.draft_regularizer = None
+
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
                 "ADE2s": WeightedMeanMetric(),
@@ -631,7 +659,7 @@ class SMARTFlow(LightningModule):
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
-                sampling_noise=self.eval_sampling_noise,
+                sampling_scheme=self.validation_rollout_sampling,
                 scenario_sampling_seeds=scenario_sampling_seeds,
             )
             return (
@@ -665,7 +693,7 @@ class SMARTFlow(LightningModule):
             rollout_cache=expanded_rollout_cache,
             tokenized_agent=expanded_tokenized_agent,
             map_feature=expanded_map_feature,
-            sampling_noise=self.eval_sampling_noise,
+            sampling_scheme=self.validation_rollout_sampling,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
         )
         return (
@@ -853,15 +881,171 @@ class SMARTFlow(LightningModule):
         """
         self._restore_fit_time_validation_batch_limit()
 
+
+    def _get_draft_loss_weight(self) -> float:
+        """현재 epoch에서 사용할 DRaFT physics 가중치를 계산합니다.
+
+        Returns:
+            float:
+                warm-up 이전이면 ``0.0`` 이고,
+                그 뒤에는 설정한 최대값까지 선형으로 올라갑니다.
+        """
+        if not self.draft_enabled or self.draft_max_weight <= 0.0:
+            return 0.0
+
+        current_epoch = int(self.current_epoch)
+        if current_epoch < self.draft_start_epoch:
+            return 0.0
+
+        if self.draft_ramp_epochs <= 1:
+            return self.draft_max_weight
+
+        progress = (current_epoch - self.draft_start_epoch + 1) / float(self.draft_ramp_epochs)
+        progress = min(max(progress, 0.0), 1.0)
+        return self.draft_max_weight * progress
+
+    def _compute_draft_training_loss(
+        self,
+        pred_dict: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        """실제 샘플러를 돌린 최종 미래에 physics loss를 계산합니다.
+
+        Args:
+            pred_dict: flow decoder 출력 사전입니다.
+                ``anchor_hidden`` 은 ``[n_agent, 13, hidden_dim]`` 이고,
+                ``flow_clean_norm`` 은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            tokenized_agent: 학습용 에이전트 토큰 사전입니다.
+                DRaFT용 packed 메타데이터가 들어 있어야 합니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                총 physics loss와 세부 항을 담은 사전입니다.
+        """
+        if (
+            not self.draft_enabled
+            or self.draft_regularizer is None
+            or pred_dict["flow_clean_norm"].numel() == 0
+        ):
+            zero = pred_dict["flow_clean_norm"].new_zeros(())
+            return {
+                "loss": zero,
+                "raw_pred_loss": zero,
+                "speed": zero,
+                "slip": zero,
+                "start": zero,
+                "accel": zero,
+                "yaw_accel": zero,
+                "turn": zero,
+            }
+
+        pred_sample_norm = self.encoder.sample_open_loop_future(
+            anchor_hidden=pred_dict["anchor_hidden"],
+            anchor_mask=pred_dict["anchor_mask"],
+            sampling_scheme=self.draft_sampling,
+        )
+
+        if pred_sample_norm.shape[0] != tokenized_agent["flow_train_agent_type"].shape[0]:
+            raise ValueError(
+                "DRaFT 샘플 개수와 packed anchor 메타데이터 개수가 다릅니다. "
+                f"got {pred_sample_norm.shape[0]} and {tokenized_agent['flow_train_agent_type'].shape[0]}"
+            )
+
+        return self.draft_regularizer(
+            pred_future_norm=pred_sample_norm,
+            target_future_norm=pred_dict["flow_clean_norm"],
+            packed_agent_type=tokenized_agent["flow_train_agent_type"],
+            packed_prev_control=tokenized_agent["flow_train_prev_control"],
+            packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+        )
+
+    def _log_draft_training_metrics(
+        self,
+        draft_weight: float,
+        physics_dict: Dict[str, Tensor],
+    ) -> None:
+        """DRaFT fine-tuning용 학습 로그를 기록합니다.
+
+        Args:
+            draft_weight: 현재 batch에 적용한 physics loss 가중치입니다.
+            physics_dict: physics loss 계산 결과 사전입니다.
+
+        Returns:
+            None
+        """
+        self.log(
+            "train/draft_weight",
+            float(draft_weight),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/loss_phys",
+            physics_dict["loss"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/loss_phys_raw",
+            physics_dict["raw_pred_loss"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        for metric_name in ["speed", "slip", "start", "accel", "yaw_accel", "turn"]:
+            self.log(
+                f"train/phys_{metric_name}",
+                physics_dict[metric_name],
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+
     def training_step(self, data, batch_idx):
+        """한 batch의 FM loss와 DRaFT physics loss를 함께 계산합니다.
+
+        Args:
+            data: 학습용 장면 배치입니다.
+            batch_idx: 현재 batch 번호입니다.
+
+        Returns:
+            Tensor: 최종 학습 loss입니다.
+        """
         tokenized_map, tokenized_agent = self.token_processor(data)
         pred = self.encoder(
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
-        loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+
+        draft_weight = self._get_draft_loss_weight()
+        physics_dict = {
+            "loss": fm_loss.new_zeros(()),
+            "raw_pred_loss": fm_loss.new_zeros(()),
+            "speed": fm_loss.new_zeros(()),
+            "slip": fm_loss.new_zeros(()),
+            "start": fm_loss.new_zeros(()),
+            "accel": fm_loss.new_zeros(()),
+            "yaw_accel": fm_loss.new_zeros(()),
+            "turn": fm_loss.new_zeros(()),
+        }
+        total_loss = fm_loss
+        if draft_weight > 0.0:
+            physics_dict = self._compute_draft_training_loss(
+                pred_dict=pred,
+                tokenized_agent=tokenized_agent,
+            )
+            total_loss = total_loss + draft_weight * physics_dict["loss"]
+
+        self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/loss_fm", fm_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/ADE2s", open_metric_dict["ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/FDE2s", open_metric_dict["FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log(
@@ -880,7 +1064,12 @@ class SMARTFlow(LightningModule):
             sync_dist=True,
             batch_size=1,
         )
-        return loss
+        if self.draft_enabled:
+            self._log_draft_training_metrics(
+                draft_weight=draft_weight,
+                physics_dict=physics_dict,
+            )
+        return total_loss
 
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -898,7 +1087,7 @@ class SMARTFlow(LightningModule):
             open_pred_clean_norm = self.encoder.sample_open_loop_future(
                 anchor_hidden=denoise_pred["anchor_hidden"],
                 anchor_mask=denoise_pred["anchor_mask"],
-                sampling_noise=self.eval_sampling_noise,
+                sampling_scheme=self.validation_rollout_sampling,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
             )
             open_metric_dict = self._build_open_loop_metric_dict(

@@ -41,6 +41,12 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: bool) -> None:
         except:
             log.info("No gmm_logits_head in model.agent_encoder")
 
+        try:
+            _unfreeze(model.agent_encoder.flow_decoder)
+            log.info("Unfreezing flow_decoder")
+        except:
+            log.info("No flow_decoder in model.agent_encoder")
+
         _unfreeze(model.agent_encoder.t_attn_layers)
         _unfreeze(model.agent_encoder.pt2a_attn_layers)
         _unfreeze(model.agent_encoder.a2a_attn_layers)

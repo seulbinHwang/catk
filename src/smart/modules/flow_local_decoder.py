@@ -97,7 +97,21 @@ class FlowODE:
         model_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         steps: Optional[int] = None,
         method: Optional[str] = None,
+        backprop_last_k: Optional[int] = None,
     ) -> torch.Tensor:
+        """ODE 샘플링으로 최종 clean future를 만듭니다.
+
+        Args:
+            x_init: 시작 잡음 상태입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            model_fn: 현재 상태와 시간 ``tau`` 를 받아 속도를 돌려주는 함수입니다.
+            steps: 샘플링 step 수입니다. ``None`` 이면 기본 solver step을 씁니다.
+            method: 적분 방식입니다. ``None`` 이면 기본 solver 방식을 씁니다.
+            backprop_last_k: 마지막 몇 step에만 gradient를 남길지 정합니다.
+                ``None`` 이면 전체 step을 역전파합니다.
+
+        Returns:
+            torch.Tensor: 최종 정규화 미래입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        """
         steps = self.solver_steps if steps is None else steps
         method = self.solver_method if method is None else method
 
@@ -105,23 +119,67 @@ class FlowODE:
         t0 = self.eps
         dt = (1.0 - t0) / float(steps)
 
+        if backprop_last_k is None or int(backprop_last_k) >= int(steps):
+            grad_start_step = 0
+        else:
+            grad_start_step = max(0, int(steps) - max(0, int(backprop_last_k)))
+
         for i in range(steps):
             t = t0 + i * dt
             tau = x_t.new_full((x_t.shape[0],), t)
+            use_grad = i >= grad_start_step
 
-            if method == "midpoint":
-                v1 = model_fn(x_t, tau)
-                x_mid = x_t + 0.5 * dt * v1
-                tau_mid = x_t.new_full((x_t.shape[0],), t + 0.5 * dt)
-                v2 = model_fn(x_mid, tau_mid)
-                x_t = x_t + dt * v2
-            elif method == "euler":
-                v = model_fn(x_t, tau)
-                x_t = x_t + dt * v
+            if use_grad:
+                x_t = self._integrate_one_step(
+                    x_t=x_t,
+                    tau=tau,
+                    dt=dt,
+                    method=method,
+                    model_fn=model_fn,
+                )
             else:
-                raise ValueError(f"Unsupported solver method: {method}")
+                with torch.no_grad():
+                    x_t = self._integrate_one_step(
+                        x_t=x_t,
+                        tau=tau,
+                        dt=dt,
+                        method=method,
+                        model_fn=model_fn,
+                    )
+                x_t = x_t.detach()
 
         return x_t
+
+    def _integrate_one_step(
+        self,
+        x_t: torch.Tensor,
+        tau: torch.Tensor,
+        dt: float,
+        method: str,
+        model_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    ) -> torch.Tensor:
+        """한 ODE step만 적분합니다.
+
+        Args:
+            x_t: 현재 상태입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            tau: 현재 시간입니다. shape은 ``[n_valid_anchor]`` 입니다.
+            dt: 이번 step 길이입니다.
+            method: ``midpoint`` 또는 ``euler`` 입니다.
+            model_fn: 속도 예측 함수입니다.
+
+        Returns:
+            torch.Tensor: 다음 상태입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        """
+        if method == "midpoint":
+            v1 = model_fn(x_t, tau)
+            x_mid = x_t + 0.5 * dt * v1
+            tau_mid = tau + 0.5 * dt
+            v2 = model_fn(x_mid, tau_mid)
+            return x_t + dt * v2
+        if method == "euler":
+            v = model_fn(x_t, tau)
+            return x_t + dt * v
+        raise ValueError(f"Unsupported solver method: {method}")
 
 
 class AnchorContextProjector(nn.Module):
