@@ -47,7 +47,6 @@ DEFAULT_LIMITS = DynamicLimitTable(
 DRAFT_PHYSICS_COMPONENT_KEYS = (
     "speed",
     "slip",
-    "start",
     "accel",
     "yaw_accel",
     "turn",
@@ -56,8 +55,6 @@ DRAFT_PHYSICS_COMPONENT_KEYS = (
 DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
     "speed_excess_mps",
     "slip_beta_excess_deg",
-    "start_accel_excess_mps2",
-    "start_yaw_accel_excess_degps2",
     "accel_excess_mps2",
     "yaw_accel_excess_degps2",
     "turn_yaw_rate_excess_degps",
@@ -100,9 +97,10 @@ class DraftPhysicsRegularizer(nn.Module):
         gt_excess_only: ``True`` 이면 GT보다 더 나쁜 만큼만 loss에 넣습니다.
         speed_weight: 최고 속도 항 가중치입니다.
         slip_weight: slip angle 위반 항 가중치입니다.
-        start_weight: 시작 순간 튐 항 가중치입니다.
         accel_weight: step 간 앞방향 속도 변화 항 가중치입니다.
+            첫 delta는 직전 anchor 제어와의 차이로 함께 계산합니다.
         yaw_accel_weight: step 간 회전 변화 항 가중치입니다.
+            첫 delta는 직전 anchor 제어와의 차이로 함께 계산합니다.
         turn_weight: 선회 가능성 항 가중치입니다.
         eps: 수치 안정용 작은 값입니다.
     """
@@ -116,7 +114,6 @@ class DraftPhysicsRegularizer(nn.Module):
         gt_excess_only: bool = True,
         speed_weight: float = 1.0,
         slip_weight: float = 1.0,
-        start_weight: float = 1.0,
         accel_weight: float = 1.0,
         yaw_accel_weight: float = 1.0,
         turn_weight: float = 1.0,
@@ -130,7 +127,6 @@ class DraftPhysicsRegularizer(nn.Module):
         self.gt_excess_only = bool(gt_excess_only)
         self.speed_weight = float(speed_weight)
         self.slip_weight = float(slip_weight)
-        self.start_weight = float(start_weight)
         self.accel_weight = float(accel_weight)
         self.yaw_accel_weight = float(yaw_accel_weight)
         self.turn_weight = float(turn_weight)
@@ -187,7 +183,6 @@ class DraftPhysicsRegularizer(nn.Module):
         component_to_weight = {
             "speed": self.speed_weight,
             "slip": self.slip_weight,
-            "start": self.start_weight,
             "accel": self.accel_weight,
             "yaw_accel": self.yaw_accel_weight,
             "turn": self.turn_weight,
@@ -302,61 +297,34 @@ class DraftPhysicsRegularizer(nn.Module):
             )
         )
 
-        speed_x = vx_body
+        if vx_body.shape[1] > 0:
+            speed_x = vx_body
+            # 첫 delta는 직전 anchor 제어와 이어 붙인 경계차분으로 계산합니다.
+            dv = torch.empty_like(speed_x)
+            dw = torch.empty_like(omega)
+            dv[:, 0] = (speed_x[:, 0] - prev_control[:, 0]).abs()
+            dw[:, 0] = (omega[:, 0] - prev_control[:, 2]).abs()
+            if speed_x.shape[1] > 1:
+                dv[:, 1:] = (speed_x[:, 1:] - speed_x[:, :-1]).abs()
+                dw[:, 1:] = (omega[:, 1:] - omega[:, :-1]).abs()
+            delta_enabled = nonholonomic.expand(-1, dv.shape[1]).clone()
+            delta_enabled[:, 0] = delta_enabled[:, 0] & prev_control_valid
 
-        start_dv = (speed_x[:, 0] - prev_control[:, 0]).abs()
-        start_dw = (omega[:, 0] - prev_control[:, 2]).abs()
-        start_pen = self._normalized_square_penalty(start_dv, accel_limit) + self._normalized_square_penalty(
-            start_dw,
-            yaw_accel_limit,
-        )
-        start_pen = torch.where(
-            limits["is_nonholonomic"] & prev_control_valid,
-            start_pen,
-            start_pen.new_zeros(start_pen.shape),
-        )
-        start_accel_excess_mps2 = torch.where(
-            limits["is_nonholonomic"] & prev_control_valid,
-            torch.relu(start_dv / self.dt - limits["a_max_mps2"]),
-            torch.zeros_like(start_dv),
-        )
-        start_yaw_accel_excess_degps2 = torch.where(
-            limits["is_nonholonomic"] & prev_control_valid,
-            torch.rad2deg(torch.relu(start_dw / self.dt - limits["alpha_max_radps2"])),
-            torch.zeros_like(start_dw),
-        )
-
-        if vx_body.shape[1] > 1:
-            dv = (speed_x[:, 1:] - speed_x[:, :-1]).abs()
-            dw = (omega[:, 1:] - omega[:, :-1]).abs()
-            nonholonomic_step = nonholonomic.expand(-1, dv.shape[1])
-            accel_pen = self._mean_over_time(
-                torch.where(
-                    nonholonomic_step,
-                    self._normalized_square_penalty(dv, accel_limit.unsqueeze(-1)),
-                    torch.zeros_like(dv),
-                )
+            accel_pen = self._masked_mean_over_time(
+                self._normalized_square_penalty(dv, accel_limit.unsqueeze(-1)),
+                enabled=delta_enabled,
             )
-            yaw_accel_pen = self._mean_over_time(
-                torch.where(
-                    nonholonomic_step,
-                    self._normalized_square_penalty(dw, yaw_accel_limit.unsqueeze(-1)),
-                    torch.zeros_like(dw),
-                )
+            yaw_accel_pen = self._masked_mean_over_time(
+                self._normalized_square_penalty(dw, yaw_accel_limit.unsqueeze(-1)),
+                enabled=delta_enabled,
             )
-            accel_excess_mps2 = self._mean_over_time(
-                torch.where(
-                    nonholonomic_step,
-                    torch.relu(dv / self.dt - limits["a_max_mps2"].unsqueeze(-1)),
-                    torch.zeros_like(dv),
-                )
+            accel_excess_mps2 = self._masked_mean_over_time(
+                torch.relu(dv / self.dt - limits["a_max_mps2"].unsqueeze(-1)),
+                enabled=delta_enabled,
             )
-            yaw_accel_excess_degps2 = self._mean_over_time(
-                torch.where(
-                    nonholonomic_step,
-                    torch.rad2deg(torch.relu(dw / self.dt - limits["alpha_max_radps2"].unsqueeze(-1))),
-                    torch.zeros_like(dw),
-                )
+            yaw_accel_excess_degps2 = self._masked_mean_over_time(
+                torch.rad2deg(torch.relu(dw / self.dt - limits["alpha_max_radps2"].unsqueeze(-1))),
+                enabled=delta_enabled,
             )
         else:
             accel_pen = speed_pen.new_zeros(speed_pen.shape)
@@ -399,14 +367,11 @@ class DraftPhysicsRegularizer(nn.Module):
         return {
             "speed": speed_pen,
             "slip": slip_pen,
-            "start": start_pen,
             "accel": accel_pen,
             "yaw_accel": yaw_accel_pen,
             "turn": turn_pen,
             "speed_excess_mps": speed_excess_mps,
             "slip_beta_excess_deg": slip_beta_excess_deg,
-            "start_accel_excess_mps2": start_accel_excess_mps2,
-            "start_yaw_accel_excess_degps2": start_yaw_accel_excess_degps2,
             "accel_excess_mps2": accel_excess_mps2,
             "yaw_accel_excess_degps2": yaw_accel_excess_degps2,
             "turn_yaw_rate_excess_degps": turn_yaw_rate_excess_degps,
@@ -556,6 +521,14 @@ class DraftPhysicsRegularizer(nn.Module):
         if value.dim() == 1:
             return value
         return value.mean(dim=-1)
+
+    def _masked_mean_over_time(self, value: Tensor, enabled: Tensor) -> Tensor:
+        """시간축에서 활성화된 위치만 평균합니다."""
+        masked_value = torch.where(enabled, value, torch.zeros_like(value))
+        if value.dim() == 1:
+            return masked_value
+        enabled_count = enabled.to(dtype=value.dtype).sum(dim=-1).clamp_min(1.0)
+        return masked_value.sum(dim=-1) / enabled_count
 
     def _wrap_angle(self, angle: Tensor) -> Tensor:
         """각도를 ``[-pi, pi]`` 범위로 접습니다.

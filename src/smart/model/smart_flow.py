@@ -101,7 +101,6 @@ class SMARTFlow(LightningModule):
                 gt_excess_only=bool(getattr(draft_config, "gt_excess_only", True)),
                 speed_weight=float(getattr(draft_physics, "speed_weight", 1.0)),
                 slip_weight=float(getattr(draft_physics, "slip_weight", 1.0)),
-                start_weight=float(getattr(draft_physics, "start_weight", 1.0)),
                 accel_weight=float(getattr(draft_physics, "accel_weight", 1.0)),
                 yaw_accel_weight=float(getattr(draft_physics, "yaw_accel_weight", 1.0)),
                 turn_weight=float(getattr(draft_physics, "turn_weight", 1.0)),
@@ -1084,11 +1083,10 @@ open_metric_dict:
         
         loss, raw_pred_loss
         
-        speed, slip, start, accel, yaw_accel, turn
+        speed, slip, accel, yaw_accel, turn
         
         speed_excess_mps, slip_beta_excess_deg,
-        start_accel_excess_mps2, start_yaw_accel_excess_degps2, accel_excess_mps2, 
-        yaw_accel_excess_degps2, turn_yaw_rate_excess_degps, 
+        accel_excess_mps2, yaw_accel_excess_degps2, turn_yaw_rate_excess_degps, 
         turn_lat_accel_excess_mps2, turn_radius_shortfall_m
         
         """
