@@ -950,6 +950,7 @@ class SMARTFlow(LightningModule):
         ):
             return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
 
+        # pred_sample_norm : [n_valid_anchor, 20, 4]
         pred_sample_norm = self.encoder.sample_open_loop_future(
             anchor_hidden=pred_dict["anchor_hidden"],
             anchor_mask=pred_dict["anchor_mask"],
@@ -1050,15 +1051,47 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: 최종 학습 loss입니다.
         """
+        """ tokenized_agent
+flow_train_agent_type [n_valid_anchor]
+flow_train_prev_control [n_valid_anchor, 3]
+flow_train_prev_control_valid [n_valid_anchor]
+
+        """
         tokenized_map, tokenized_agent = self.token_processor(data)
+        """ pred
+flow_pred_norm [n_valid_anchor, 20, 4]
+flow_target_norm [n_valid_anchor, 20, 4]
+    -> flow_pred_norm / flow_target_norm 을 비교해 FM loss 계산
+flow_pred_clean_norm [n_valid_anchor, 20, 4] -> 속도 예측을 clean trajectory 공간으로 복원한 값
+flow_clean_norm [n_valid_anchor, 20, 4]
+    -> 정답 궤적 (flow_pred_clean_norm / flow_clean_norm 릴 비교해서 ADE/FDE/yaw error 계산)
+        """
         pred = self.encoder(
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
+        """
+fm_loss: 
+    Tensor shape []
+open_metric_dict: 
+    Dict[str, Tensor]
+        """
         fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
 
         draft_weight = self._get_draft_loss_weight()
+        """ physics_dict : Dict[str, Tensor] #  모든 값은 scalar tensor 
+        
+        loss, raw_pred_loss
+        
+        speed, slip, start, accel, yaw_accel, turn
+        
+        peed_excess_mps, slip_vy_excess_mps, slip_beta_excess_deg, 
+        start_accel_excess_mps2, start_yaw_accel_excess_degps2, accel_excess_mps2, 
+        yaw_accel_excess_degps2, turn_yaw_rate_excess_degps, 
+        turn_lat_accel_excess_mps2, turn_radius_shortfall_m
+        
+        """
         physics_dict = self._build_zero_draft_metrics(fm_loss)
         total_loss = fm_loss
         if draft_weight > 0.0:
