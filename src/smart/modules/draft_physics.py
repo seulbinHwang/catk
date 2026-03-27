@@ -19,7 +19,6 @@ class DynamicLimitTable:
         a_lat_max_mps2: 횡가속 제한입니다. shape은 ``[3]`` 입니다.
         r_min_m: 최소 선회 반경 제한입니다. shape은 ``[3]`` 입니다.
         omega_max_abs_radps: 절대 회전속도 제한입니다. shape은 ``[3]`` 입니다.
-        v_b_y_max: 몸체 기준 옆방향 속도 제한입니다. shape은 ``[3]`` 입니다.
         beta_max_rad: 사이드슬립 각도 제한입니다. shape은 ``[3]`` 입니다.
     """
 
@@ -29,7 +28,6 @@ class DynamicLimitTable:
     a_lat_max_mps2: Tuple[float, float, float]
     r_min_m: Tuple[float, float, float]
     omega_max_abs_radps: Tuple[float, float, float]
-    v_b_y_max: Tuple[float, float, float]
     beta_max_rad: Tuple[float, float, float]
 
 
@@ -42,7 +40,6 @@ DEFAULT_LIMITS = DynamicLimitTable(
     a_lat_max_mps2=(4.2, 3.2, 4.4),
     r_min_m=(4.50, 0.00001, 0.5),
     omega_max_abs_radps=(0.9, 3.3, 2.0),
-    v_b_y_max=(1.0, 1.3, 1.3),
     beta_max_rad=(0.27, 10.0, 0.7),
 )
 
@@ -58,7 +55,6 @@ DRAFT_PHYSICS_COMPONENT_KEYS = (
 
 DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
     "speed_excess_mps",
-    "slip_vy_excess_mps",
     "slip_beta_excess_deg",
     "start_accel_excess_mps2",
     "start_yaw_accel_excess_degps2",
@@ -103,7 +99,7 @@ class DraftPhysicsRegularizer(nn.Module):
         deadzone_softness: dead-zone 경계를 부드럽게 만들기 위한 값입니다.
         gt_excess_only: ``True`` 이면 GT보다 더 나쁜 만큼만 loss에 넣습니다.
         speed_weight: 최고 속도 항 가중치입니다.
-        slip_weight: 옆미끄럼 항 가중치입니다.
+        slip_weight: slip angle 위반 항 가중치입니다.
         start_weight: 시작 순간 튐 항 가중치입니다.
         accel_weight: step 간 앞방향 속도 변화 항 가중치입니다.
         yaw_accel_weight: step 간 회전 변화 항 가중치입니다.
@@ -289,11 +285,6 @@ class DraftPhysicsRegularizer(nn.Module):
             torch.relu(speed - limits["v_max_mps"].unsqueeze(-1))
         )
 
-        vy_pen = self._normalized_square_penalty(
-            value=vy_body.abs(),
-            limit=limits["v_b_y_max"].unsqueeze(-1),
-        )
-        vy_excess = torch.relu(vy_body.abs() - limits["v_b_y_max"].unsqueeze(-1))
         beta = torch.atan2(vy_body.abs(), vx_body.abs() + self.eps)
         beta_limit = limits["beta_max_rad"].unsqueeze(-1)
         beta_pen = self._normalized_square_penalty(
@@ -301,10 +292,7 @@ class DraftPhysicsRegularizer(nn.Module):
             limit=beta_limit,
             enabled=beta_limit > 0.0,
         )
-        slip_pen = self._mean_over_time(torch.where(nonholonomic, vy_pen + beta_pen, torch.zeros_like(vy_pen)))
-        slip_vy_excess_mps = self._mean_over_time(
-            torch.where(nonholonomic, vy_excess, torch.zeros_like(vy_excess))
-        )
+        slip_pen = self._mean_over_time(torch.where(nonholonomic, beta_pen, torch.zeros_like(beta_pen)))
         beta_excess_deg = torch.rad2deg(torch.relu(beta - beta_limit))
         slip_beta_excess_deg = self._mean_over_time(
             torch.where(
@@ -416,7 +404,6 @@ class DraftPhysicsRegularizer(nn.Module):
             "yaw_accel": yaw_accel_pen,
             "turn": turn_pen,
             "speed_excess_mps": speed_excess_mps,
-            "slip_vy_excess_mps": slip_vy_excess_mps,
             "slip_beta_excess_deg": slip_beta_excess_deg,
             "start_accel_excess_mps2": start_accel_excess_mps2,
             "start_yaw_accel_excess_degps2": start_yaw_accel_excess_degps2,
@@ -459,7 +446,6 @@ class DraftPhysicsRegularizer(nn.Module):
             "a_lat_max_mps2": _select(DEFAULT_LIMITS.a_lat_max_mps2),
             "r_min_m": _select(DEFAULT_LIMITS.r_min_m),
             "omega_max_abs_radps": _select(DEFAULT_LIMITS.omega_max_abs_radps),
-            "v_b_y_max": _select(DEFAULT_LIMITS.v_b_y_max),
             "beta_max_rad": _select(DEFAULT_LIMITS.beta_max_rad),
             "is_nonholonomic": agent_type != 1,
         }

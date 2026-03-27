@@ -1086,7 +1086,7 @@ open_metric_dict:
         
         speed, slip, start, accel, yaw_accel, turn
         
-        peed_excess_mps, slip_vy_excess_mps, slip_beta_excess_deg, 
+        speed_excess_mps, slip_beta_excess_deg,
         start_accel_excess_mps2, start_yaw_accel_excess_degps2, accel_excess_mps2, 
         yaw_accel_excess_degps2, turn_yaw_rate_excess_degps, 
         turn_lat_accel_excess_mps2, turn_radius_shortfall_m
