@@ -1022,7 +1022,7 @@ class SMARTFlow(LightningModule):
         )
         for metric_name in DRAFT_PHYSICS_COMPONENT_KEYS:
             self.log(
-                f"train/phys_{metric_name}",
+                f"raw_feaisble_gap/{metric_name}",
                 physics_dict[metric_name],
                 on_step=False,
                 on_epoch=True,
@@ -1030,15 +1030,30 @@ class SMARTFlow(LightningModule):
                 batch_size=1,
             )
         for metric_name in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
-            for prefix in ("", "pred_", "gt_"):
-                self.log(
-                    f"train/phys_{prefix}{metric_name}",
-                    physics_dict[f"{prefix}{metric_name}"],
-                    on_step=False,
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
+            self.log(
+                f"raw_feaisble_gap/{metric_name}",
+                physics_dict[metric_name],
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"raw_feaisble_gap/pred_{metric_name}",
+                physics_dict[f"pred_{metric_name}"],
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"gt_feasible_gap/{metric_name}",
+                physics_dict[f"gt_{metric_name}"],
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
 
     def training_step(self, data, batch_idx):
         """한 batch의 FM loss와 DRaFT physics loss를 함께 계산합니다.
