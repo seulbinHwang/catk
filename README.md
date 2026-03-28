@@ -455,18 +455,35 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 - max epochs: `16`
 - train batch size: `20`
 - val batch size: `16`
-- validation 주기: `4` epoch마다
+- validation 주기: `2` epoch마다
+- DRaFT physics 외부 스케일: `loss_scale=0.005`
+- training DRaFT seed 평균 개수: `train_sampling.num_samples=2`
+- FM 보호 cap 비율: `fm_guard.cap_ratio=0.1`
 
+이 fine-tuning은 이제 **단순 가중합 backward**가 아니라,
+**FM gradient를 먼저 구한 뒤 physics gradient에서 FM을 정면으로 거스르는 성분만 제거해서** 
+업데이트합니다.
+즉, physics는 계속 줄이되 FM을 밀어 올리는 방향으로는 못 쓰게 막는 방식입니다.
+
+또 training DRaFT sample은 매 batch마다 완전히 새 noise를 쓰지 않고,
+**현재 epoch + batch의 scenario_id 목록을 해시한 고정 seed 2개**로 sample을 만든 뒤 physics를 평균냅니다.
+이렇게 하면 training physics gradient 분산을 줄이면서도,
+특정 noise 1개에만 과하게 맞춰지는 문제를 완화할 수 있습니다.
 
 loss와 로그는 아래처럼 보면 됩니다.
 
-- `train/loss`는 최종 학습 loss입니다.
 - `train/loss_fm`는 원래 flow matching loss입니다.
-- `train/loss_phys`는 DRaFT physics penalty입니다.
-- 실제로는 `train/loss = train/loss_fm + train/draft_weight * train/loss_phys` 형태로 합쳐집니다.
+- `train/loss_phys`는 **2개 고정 seed에서 계산한 DRaFT physics penalty 평균값**입니다.
+- `train/loss_phys_scaled`는 실제 physics 쪽에 들어가는 스케일이 반영된 값으로, `draft_weight * loss_scale * train/loss_phys` 입니다.
+- `train/loss`는 `train/loss_fm + train/loss_phys_scaled`를 로그용으로 적어둔 값입니다.
+- 실제 파라미터 update는 이 스칼라를 그대로 backward하지 않고, `FM gradient + 보호된 physics gradient`로 직접 수행합니다.
+- `train/fm_guard_conflict`는 현재 batch에서 physics gradient가 FM과 정면 충돌했는지 보여줍니다. `1`이면 충돌이 있었고 projection이 작동했다는 뜻입니다.
+- `train/fm_guard_cosine`은 FM gradient와 원래 physics gradient의 방향 유사도입니다.
+- `train/fm_guard_fm_grad_norm`, `train/fm_guard_phys_grad_norm`, `train/fm_guard_phys_safe_grad_norm`은 projection 전후 gradient 크기를 보여줍니다.
+- `train/fm_guard_phys_safe_to_fm_ratio`는 최종적으로 남긴 physics gradient가 FM gradient의 몇 배인지 보여줍니다. 기본 목표는 이 값이 `0.1` 근처를 넘지 않게 두는 것입니다.
 - 기본 구현은 trainer가 `bf16-mixed`여도 DRaFT physics regularizer 계산 구간만 fp32 subregion에서 수행합니다.
 - `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
-- `train/*`에는 요약 지표만 남습니다. 세부 physics gap은 `raw_feaisble_gap/speed`, `raw_feaisble_gap/accel` 같은 prefix로 기록됩니다.
+- 세부 physics gap은 `raw_feaisble_gap/speed`, `raw_feaisble_gap/accel` 같은 prefix로 기록됩니다.
 - 실제 단위 위반량도 함께 기록됩니다. 예를 들어 gap 기준 값은 `raw_feaisble_gap/speed_excess_mps`, `raw_feaisble_gap/accel_excess_mps2`, raw 예측값은 `raw_feaisble_gap/pred_accel_excess_mps2`, GT 기준값은 `gt_feasible_gap/accel_excess_mps2`처럼 기록됩니다.
 - 첫 delta는 `accel`, `yaw_accel`에 함께 포함됩니다. `prev_control_valid`가 `False`면 첫 delta만 마스킹되고, 별도 `start` metric은 기록하지 않습니다.
 - 합성 항은 하위 물리량으로 나뉘어 기록됩니다. 예를 들어 `slip`은 `raw_feaisble_gap/slip_beta_excess_deg`, `turn`은 `raw_feaisble_gap/turn_yaw_rate_excess_degps`, `raw_feaisble_gap/turn_lat_accel_excess_mps2`, `raw_feaisble_gap/turn_radius_shortfall_m`으로 볼 수 있습니다.
@@ -474,14 +491,17 @@ loss와 로그는 아래처럼 보면 됩니다.
 자주 바꾸는 override 예시는 아래와 같습니다.
 
 ```bash
-# physics 가중치를 더 강하게
+# physics ramp 최대치를 더 강하게
 ... model.model_config.draft.max_weight=0.1
 
-# ramp를 2 epoch 동안만 수행
-... model.model_config.draft.ramp_epochs=2
+# physics raw loss에 곱하는 내부 스케일을 줄이기
+... model.model_config.draft.loss_scale=0.0025
 
-# GT보다 더 나쁜 만큼만 벌주지 않고 절대 penalty 자체를 사용
-... model.model_config.draft.gt_excess_only=false
+# FM 보호를 더 강하게 해서 physics gradient를 더 작게 남기기
+... model.model_config.draft.fm_guard.cap_ratio=0.05
+
+# training DRaFT sample을 4개 고정 seed 평균으로 바꾸기
+... model.model_config.draft.train_sampling.num_samples=4
 
 # physics penalty도 mixed precision으로 그대로 계산
 ... model.model_config.draft.physics.force_fp32=false

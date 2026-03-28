@@ -33,15 +33,7 @@ model_config:
     start_epoch: 0
     ramp_epochs: 4
     max_weight: 0.1
-    loss_scale: 0.005
     gt_excess_only: false
-    train_sampling:
-      num_samples: 2
-      seed_base: 0
-    fm_guard:
-      enabled: true
-      cap_ratio: 0.1
-      eps: 1.0e-12
     sampling:
       sample_steps: 16
       sample_method: midpoint

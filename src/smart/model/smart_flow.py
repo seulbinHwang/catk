@@ -88,6 +88,27 @@ class SMARTFlow(LightningModule):
         self.draft_start_epoch = int(getattr(draft_config, "start_epoch", 0)) if draft_config is not None else 0
         self.draft_ramp_epochs = int(getattr(draft_config, "ramp_epochs", 1)) if draft_config is not None else 1
         self.draft_max_weight = float(getattr(draft_config, "max_weight", 0.0)) if draft_config is not None else 0.0
+        self.draft_loss_scale = float(getattr(draft_config, "loss_scale", 0.005)) if draft_config is not None else 0.005
+        draft_train_sampling = getattr(draft_config, "train_sampling", None) if draft_config is not None else None
+        self.draft_train_num_samples = max(
+            1,
+            int(getattr(draft_train_sampling, "num_samples", 2)) if draft_train_sampling is not None else 2,
+        )
+        self.draft_train_seed_base = (
+            int(getattr(draft_train_sampling, "seed_base", 0)) if draft_train_sampling is not None else 0
+        )
+        draft_fm_guard = getattr(draft_config, "fm_guard", None) if draft_config is not None else None
+        self.draft_fm_guard_enabled = bool(
+            getattr(draft_fm_guard, "enabled", True) if draft_fm_guard is not None else self.draft_enabled
+        )
+        self.draft_fm_guard_cap_ratio = (
+            float(getattr(draft_fm_guard, "cap_ratio", 0.1)) if draft_fm_guard is not None else 0.1
+        )
+        self.draft_fm_guard_eps = (
+            float(getattr(draft_fm_guard, "eps", 1e-12)) if draft_fm_guard is not None else 1e-12
+        )
+        self.use_draft_manual_optimization = bool(self.draft_enabled and self.draft_fm_guard_enabled)
+        self.automatic_optimization = not self.use_draft_manual_optimization
         self.draft_physics_force_fp32 = False
 
         if self.draft_enabled:
@@ -924,12 +945,301 @@ class SMARTFlow(LightningModule):
             metric_dict[f"gt_{key}"] = zero
         return metric_dict
 
+    def _build_zero_fm_guard_metrics(self, reference: Tensor) -> Dict[str, Tensor]:
+        """FM 보호형 gradient 합성 로그용 0 metric 사전을 만듭니다.
+
+        Args:
+            reference: 장치와 dtype을 맞추기 위한 기준 스칼라 텐서입니다.
+                shape은 ``[]`` 입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                gradient 충돌 여부와 크기 관련 기본 로그 값을 담은 사전입니다.
+        """
+        zero = reference.new_zeros(())
+        return {
+            "cosine": zero,
+            "conflict": zero,
+            "fm_grad_norm": zero,
+            "phys_grad_norm": zero,
+            "phys_safe_grad_norm": zero,
+            "phys_safe_to_fm_ratio": zero,
+        }
+
+    def _get_trainable_parameters(self) -> list[nn.Parameter]:
+        """현재 step에서 실제로 gradient를 받을 파라미터만 모읍니다.
+
+        Returns:
+            list[nn.Parameter]:
+                ``requires_grad=True`` 인 파라미터 목록입니다.
+                각 텐서 shape은 해당 모듈 파라미터 shape과 같습니다.
+        """
+        return [parameter for parameter in self.parameters() if parameter.requires_grad]
+
+    def _capture_current_gradients(
+        self,
+        parameters: Sequence[nn.Parameter],
+    ) -> list[Tensor | None]:
+        """파라미터에 쌓인 현재 gradient를 복사합니다.
+
+        Args:
+            parameters: gradient를 읽을 파라미터 목록입니다.
+                길이는 ``[n_trainable_param]`` 입니다.
+
+        Returns:
+            list[Tensor | None]:
+                각 파라미터와 같은 순서의 gradient 복사본입니다.
+                각 텐서 shape은 대응되는 파라미터 shape과 같습니다.
+        """
+        copied_gradients: list[Tensor | None] = []
+        for parameter in parameters:
+            if parameter.grad is None:
+                copied_gradients.append(None)
+            else:
+                copied_gradients.append(parameter.grad.detach().clone())
+        return copied_gradients
+
+    def _assign_manual_gradients(
+        self,
+        parameters: Sequence[nn.Parameter],
+        gradients: Sequence[Tensor | None],
+    ) -> None:
+        """합성한 최종 gradient를 파라미터에 다시 써 넣습니다.
+
+        Args:
+            parameters: gradient를 받을 파라미터 목록입니다.
+                길이는 ``[n_trainable_param]`` 입니다.
+            gradients: 쓸 gradient 목록입니다.
+                길이는 ``[n_trainable_param]`` 이고,
+                각 텐서 shape은 대응되는 파라미터 shape과 같습니다.
+
+        Returns:
+            None
+        """
+        for parameter, gradient in zip(parameters, gradients):
+            parameter.grad = gradient
+
+    def _compute_gradient_inner_product(
+        self,
+        first_gradients: Sequence[Tensor | None],
+        second_gradients: Sequence[Tensor | None],
+        reference: Tensor,
+    ) -> Tensor:
+        """두 gradient 묶음의 전체 내적을 계산합니다.
+
+        Args:
+            first_gradients: 첫 번째 gradient 목록입니다.
+                각 텐서 shape은 대응되는 파라미터 shape과 같습니다.
+            second_gradients: 두 번째 gradient 목록입니다.
+                각 텐서 shape은 대응되는 파라미터 shape과 같습니다.
+            reference: 장치와 dtype을 맞추기 위한 기준 스칼라 텐서입니다.
+                shape은 ``[]`` 입니다.
+
+        Returns:
+            Tensor:
+                전체 파라미터 공간에서의 내적 스칼라입니다.
+                shape은 ``[]`` 입니다.
+        """
+        inner_product = reference.new_zeros(())
+        for first_gradient, second_gradient in zip(first_gradients, second_gradients):
+            if first_gradient is None or second_gradient is None:
+                continue
+            inner_product = inner_product + torch.sum(first_gradient * second_gradient)
+        return inner_product
+
+    def _compute_gradient_l2_norm(
+        self,
+        gradients: Sequence[Tensor | None],
+        reference: Tensor,
+    ) -> Tensor:
+        """gradient 묶음의 전체 L2 크기를 계산합니다.
+
+        Args:
+            gradients: gradient 목록입니다.
+                각 텐서 shape은 대응되는 파라미터 shape과 같습니다.
+            reference: 장치와 dtype을 맞추기 위한 기준 스칼라 텐서입니다.
+                shape은 ``[]`` 입니다.
+
+        Returns:
+            Tensor:
+                전체 gradient의 L2 norm 입니다.
+                shape은 ``[]`` 입니다.
+        """
+        total_squared_norm = reference.new_zeros(())
+        for gradient in gradients:
+            if gradient is None:
+                continue
+            total_squared_norm = total_squared_norm + torch.sum(gradient * gradient)
+        return torch.sqrt(total_squared_norm)
+
+    def _project_physics_gradients(
+        self,
+        fm_gradients: Sequence[Tensor | None],
+        physics_gradients: Sequence[Tensor | None],
+        reference: Tensor,
+    ) -> tuple[list[Tensor | None], Dict[str, Tensor]]:
+        """physics gradient에서 FM을 직접 거스르는 성분만 제거합니다.
+
+        Args:
+            fm_gradients: FM loss에서 나온 gradient 목록입니다.
+                각 텐서 shape은 대응되는 파라미터 shape과 같습니다.
+            physics_gradients: physics loss에서 나온 gradient 목록입니다.
+                각 텐서 shape은 대응되는 파라미터 shape과 같습니다.
+            reference: 장치와 dtype을 맞추기 위한 기준 스칼라 텐서입니다.
+                shape은 ``[]`` 입니다.
+
+        Returns:
+            tuple[list[Tensor | None], Dict[str, Tensor]]:
+                첫 번째 값은 FM을 직접 방해하지 않도록 정리한 physics gradient 목록입니다.
+                두 번째 값은 cosine, conflict, 각 gradient norm 같은 로그용 스칼라 사전입니다.
+        """
+        guard_metrics = self._build_zero_fm_guard_metrics(reference)
+        fm_grad_norm = self._compute_gradient_l2_norm(fm_gradients, reference)
+        phys_grad_norm = self._compute_gradient_l2_norm(physics_gradients, reference)
+        inner_product = self._compute_gradient_inner_product(fm_gradients, physics_gradients, reference)
+        cosine = reference.new_zeros(())
+        if fm_grad_norm > 0 and phys_grad_norm > 0:
+            cosine = inner_product / (fm_grad_norm * phys_grad_norm + self.draft_fm_guard_eps)
+
+        safe_physics_gradients: list[Tensor | None] = [
+            None if gradient is None else gradient.clone() for gradient in physics_gradients
+        ]
+        conflict = bool(inner_product.item() < 0.0) if inner_product.numel() == 1 else False
+        if conflict and fm_grad_norm > 0:
+            projection_scale = inner_product / (fm_grad_norm * fm_grad_norm + self.draft_fm_guard_eps)
+            projected_gradients: list[Tensor | None] = []
+            for physics_gradient, fm_gradient in zip(safe_physics_gradients, fm_gradients):
+                if physics_gradient is None:
+                    projected_gradients.append(None)
+                    continue
+                if fm_gradient is None:
+                    projected_gradients.append(physics_gradient)
+                    continue
+                projected_gradients.append(physics_gradient - projection_scale * fm_gradient)
+            safe_physics_gradients = projected_gradients
+
+        safe_phys_grad_norm = self._compute_gradient_l2_norm(safe_physics_gradients, reference)
+        max_safe_phys_norm = self.draft_fm_guard_cap_ratio * fm_grad_norm
+        if self.draft_fm_guard_cap_ratio <= 0.0:
+            safe_physics_gradients = [None if gradient is None else gradient.new_zeros(gradient.shape) for gradient in safe_physics_gradients]
+            safe_phys_grad_norm = reference.new_zeros(())
+        elif safe_phys_grad_norm > max_safe_phys_norm and safe_phys_grad_norm > 0:
+            shrink_ratio = max_safe_phys_norm / (safe_phys_grad_norm + self.draft_fm_guard_eps)
+            safe_physics_gradients = [
+                None if gradient is None else gradient * shrink_ratio for gradient in safe_physics_gradients
+            ]
+            safe_phys_grad_norm = self._compute_gradient_l2_norm(safe_physics_gradients, reference)
+
+        guard_metrics["cosine"] = cosine.detach()
+        guard_metrics["conflict"] = reference.new_tensor(float(conflict))
+        guard_metrics["fm_grad_norm"] = fm_grad_norm.detach()
+        guard_metrics["phys_grad_norm"] = phys_grad_norm.detach()
+        guard_metrics["phys_safe_grad_norm"] = safe_phys_grad_norm.detach()
+        if fm_grad_norm > 0:
+            guard_metrics["phys_safe_to_fm_ratio"] = (safe_phys_grad_norm / (fm_grad_norm + self.draft_fm_guard_eps)).detach()
+        return safe_physics_gradients, guard_metrics
+
+    def _make_training_draft_seed(
+        self,
+        scenario_ids: Sequence[str],
+        sample_idx: int,
+    ) -> int:
+        """현재 epoch와 batch 내용을 섞어 DRaFT training seed를 만듭니다.
+
+        Args:
+            scenario_ids: 현재 batch에 들어 있는 시나리오 문자열 목록입니다.
+                길이는 ``[n_scenario]`` 입니다.
+            sample_idx: 같은 batch 안에서 몇 번째 고정 샘플인지 나타내는 번호입니다.
+
+        Returns:
+            int:
+                현재 epoch와 batch 조합에서 항상 같은 값이 나오는 고정 seed입니다.
+        """
+        scenario_payload = "|".join(str(scenario_id) for scenario_id in scenario_ids)
+        seed_payload = (
+            f"{self.draft_train_seed_base}:{int(self.current_epoch)}:{int(sample_idx)}:{scenario_payload}"
+            .encode("utf-8")
+        )
+        digest = hashlib.blake2b(seed_payload, digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
+
+    def _apply_fm_guarded_optimization_step(
+        self,
+        fm_loss: Tensor,
+        physics_loss_scaled: Tensor,
+    ) -> Dict[str, Tensor]:
+        """FM gradient를 보호한 상태로 optimizer step을 직접 수행합니다.
+
+        Args:
+            fm_loss: flow matching loss 스칼라입니다.
+                shape은 ``[]`` 입니다.
+            physics_loss_scaled: 현재 batch에 실제로 적용할 physics loss 스칼라입니다.
+                shape은 ``[]`` 입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                gradient 충돌과 크기 로그를 담은 사전입니다.
+        """
+        guard_metrics = self._build_zero_fm_guard_metrics(fm_loss)
+        trainable_parameters = self._get_trainable_parameters()
+        if len(trainable_parameters) == 0:
+            return guard_metrics
+
+        optimizer = self.optimizers()
+        if isinstance(optimizer, list):
+            optimizer = optimizer[0]
+
+        optimizer.zero_grad(set_to_none=True)
+        retain_graph = bool(physics_loss_scaled.requires_grad)
+        self.manual_backward(fm_loss, retain_graph=retain_graph)
+        fm_gradients = self._capture_current_gradients(trainable_parameters)
+        optimizer.zero_grad(set_to_none=True)
+
+        if physics_loss_scaled.requires_grad:
+            self.manual_backward(physics_loss_scaled)
+            physics_gradients = self._capture_current_gradients(trainable_parameters)
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            physics_gradients = [None] * len(trainable_parameters)
+
+        safe_physics_gradients, guard_metrics = self._project_physics_gradients(
+            fm_gradients=fm_gradients,
+            physics_gradients=physics_gradients,
+            reference=fm_loss,
+        )
+
+        final_gradients: list[Tensor | None] = []
+        for fm_gradient, physics_gradient in zip(fm_gradients, safe_physics_gradients):
+            if fm_gradient is None and physics_gradient is None:
+                final_gradients.append(None)
+            elif fm_gradient is None:
+                final_gradients.append(physics_gradient)
+            elif physics_gradient is None:
+                final_gradients.append(fm_gradient)
+            else:
+                final_gradients.append(fm_gradient + physics_gradient)
+
+        self._assign_manual_gradients(trainable_parameters, final_gradients)
+
+        gradient_clip_val = getattr(self.trainer, "gradient_clip_val", None)
+        if gradient_clip_val is not None and float(gradient_clip_val) > 0.0:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=float(gradient_clip_val),
+                gradient_clip_algorithm=getattr(self.trainer, "gradient_clip_algorithm", "norm"),
+            )
+
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        return guard_metrics
+
     def _compute_draft_training_loss(
         self,
         pred_dict: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
+        scenario_ids: Sequence[str],
     ) -> Dict[str, Tensor]:
-        """실제 샘플러를 돌린 최종 미래에 physics loss를 계산합니다.
+        """고정 seed 여러 개의 평균으로 DRaFT physics loss를 계산합니다.
 
         Args:
             pred_dict: flow decoder 출력 사전입니다.
@@ -937,10 +1247,12 @@ class SMARTFlow(LightningModule):
                 ``flow_clean_norm`` 은 ``[n_valid_anchor, 20, 4]`` 입니다.
             tokenized_agent: 학습용 에이전트 토큰 사전입니다.
                 DRaFT용 packed 메타데이터가 들어 있어야 합니다.
+            scenario_ids: 현재 batch 시나리오 문자열 목록입니다.
+                길이는 ``[n_scenario]`` 입니다.
 
         Returns:
             Dict[str, Tensor]:
-                총 physics loss와 세부 항을 담은 사전입니다.
+                여러 고정 샘플을 평균낸 총 physics loss와 세부 항을 담은 사전입니다.
         """
         if (
             not self.draft_enabled
@@ -949,49 +1261,74 @@ class SMARTFlow(LightningModule):
         ):
             return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
 
-        # pred_sample_norm : [n_valid_anchor, 20, 4]
-        pred_sample_norm = self.encoder.sample_open_loop_future(
-            anchor_hidden=pred_dict["anchor_hidden"],
-            anchor_mask=pred_dict["anchor_mask"],
-            sampling_scheme=self.draft_sampling,
-        )
-
-        if pred_sample_norm.shape[0] != tokenized_agent["flow_train_agent_type"].shape[0]:
-            raise ValueError(
-                "DRaFT 샘플 개수와 packed anchor 메타데이터 개수가 다릅니다. "
-                f"got {pred_sample_norm.shape[0]} and {tokenized_agent['flow_train_agent_type'].shape[0]}"
+        averaged_physics_dict: Dict[str, Tensor] | None = None
+        for sample_idx in range(self.draft_train_num_samples):
+            pred_sample_norm = self.encoder.sample_open_loop_future(
+                anchor_hidden=pred_dict["anchor_hidden"],
+                anchor_mask=pred_dict["anchor_mask"],
+                sampling_scheme=self.draft_sampling,
+                sampling_seed=self._make_training_draft_seed(
+                    scenario_ids=scenario_ids,
+                    sample_idx=sample_idx,
+                ),
             )
 
-        if not self.draft_physics_force_fp32:
-            return self.draft_regularizer(
-                pred_future_norm=pred_sample_norm,
-                target_future_norm=pred_dict["flow_clean_norm"],
-                packed_agent_type=tokenized_agent["flow_train_agent_type"],
-                packed_prev_control=tokenized_agent["flow_train_prev_control"],
-                packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-            )
+            if pred_sample_norm.shape[0] != tokenized_agent["flow_train_agent_type"].shape[0]:
+                raise ValueError(
+                    "DRaFT 샘플 개수와 packed anchor 메타데이터 개수가 다릅니다. "
+                    f"got {pred_sample_norm.shape[0]} and {tokenized_agent['flow_train_agent_type'].shape[0]}"
+                )
 
-        # Keep the threshold-heavy physics penalty in fp32 even when the trainer
-        # runs with bf16 autocast, while preserving gradients to pred_sample_norm.
-        with torch.autocast(device_type=pred_sample_norm.device.type, enabled=False):
-            return self.draft_regularizer(
-                pred_future_norm=pred_sample_norm.float(),
-                target_future_norm=pred_dict["flow_clean_norm"].float(),
-                packed_agent_type=tokenized_agent["flow_train_agent_type"],
-                packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
-                packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-            )
+            if not self.draft_physics_force_fp32:
+                sample_physics_dict = self.draft_regularizer(
+                    pred_future_norm=pred_sample_norm,
+                    target_future_norm=pred_dict["flow_clean_norm"],
+                    packed_agent_type=tokenized_agent["flow_train_agent_type"],
+                    packed_prev_control=tokenized_agent["flow_train_prev_control"],
+                    packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+                )
+            else:
+                # Keep the threshold-heavy physics penalty in fp32 even when the trainer
+                # runs with bf16 autocast, while preserving gradients to pred_sample_norm.
+                with torch.autocast(device_type=pred_sample_norm.device.type, enabled=False):
+                    sample_physics_dict = self.draft_regularizer(
+                        pred_future_norm=pred_sample_norm.float(),
+                        target_future_norm=pred_dict["flow_clean_norm"].float(),
+                        packed_agent_type=tokenized_agent["flow_train_agent_type"],
+                        packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
+                        packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+                    )
+
+            if averaged_physics_dict is None:
+                averaged_physics_dict = {name: value for name, value in sample_physics_dict.items()}
+            else:
+                for name, value in sample_physics_dict.items():
+                    averaged_physics_dict[name] = averaged_physics_dict[name] + value
+
+        if averaged_physics_dict is None:
+            return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
+
+        averaging_ratio = 1.0 / float(self.draft_train_num_samples)
+        return {
+            name: value * averaging_ratio
+            for name, value in averaged_physics_dict.items()
+        }
 
     def _log_draft_training_metrics(
         self,
         draft_weight: float,
         physics_dict: Dict[str, Tensor],
+        physics_loss_scaled: Tensor,
+        guard_metrics: Dict[str, Tensor],
     ) -> None:
-        """DRaFT fine-tuning용 학습 로그를 기록합니다.
+        """DRaFT fine-tuning용 physics와 gradient 보호 로그를 기록합니다.
 
         Args:
             draft_weight: 현재 batch에 적용한 physics loss 가중치입니다.
             physics_dict: physics loss 계산 결과 사전입니다.
+            physics_loss_scaled: 실제 optimizer가 받는 physics loss 스칼라입니다.
+                shape은 ``[]`` 입니다.
+            guard_metrics: FM 보호형 gradient 합성 로그 사전입니다.
 
         Returns:
             None
@@ -1007,6 +1344,14 @@ class SMARTFlow(LightningModule):
         self.log(
             "train/loss_phys",
             physics_dict["loss"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/loss_phys_scaled",
+            physics_loss_scaled.detach(),
             on_step=False,
             on_epoch=True,
             sync_dist=True,
@@ -1055,69 +1400,85 @@ class SMARTFlow(LightningModule):
                 batch_size=1,
             )
 
+        for metric_name, metric_value in guard_metrics.items():
+            self.log(
+                f"train/fm_guard_{metric_name}",
+                metric_value,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+
     def training_step(self, data, batch_idx):
-        """한 batch의 FM loss와 DRaFT physics loss를 함께 계산합니다.
+        """한 batch의 FM loss와 DRaFT physics loss를 계산하고 학습 step을 수행합니다.
 
         Args:
             data: 학습용 장면 배치입니다.
             batch_idx: 현재 batch 번호입니다.
 
         Returns:
-            Tensor: 최종 학습 loss입니다.
-        """
-        """ tokenized_agent
-flow_train_agent_type [n_valid_anchor]
-flow_train_prev_control [n_valid_anchor, 3]
-flow_train_prev_control_valid [n_valid_anchor]
-
+            Tensor: 로그용 최종 loss 스칼라입니다.
         """
         tokenized_map, tokenized_agent = self.token_processor(data)
-        """ pred
-flow_pred_norm [n_valid_anchor, 20, 4]
-flow_target_norm [n_valid_anchor, 20, 4]
-    -> flow_pred_norm / flow_target_norm 을 비교해 FM loss 계산
-flow_pred_clean_norm [n_valid_anchor, 20, 4] -> 속도 예측을 clean trajectory 공간으로 복원한 값
-flow_clean_norm [n_valid_anchor, 20, 4]
-    -> 정답 궤적 (flow_pred_clean_norm / flow_clean_norm 릴 비교해서 ADE/FDE/yaw error 계산)
-        """
         pred = self.encoder(
             tokenized_map,
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
-        """
-fm_loss: 
-    Tensor shape []
-open_metric_dict: 
-    Dict[str, Tensor]
-        """
         fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
 
         draft_weight = self._get_draft_loss_weight()
-        """ physics_dict : Dict[str, Tensor] #  모든 값은 scalar tensor 
-        
-        loss, raw_pred_loss
-        
-        speed, slip, accel, yaw_accel, turn
-        
-        speed_excess_mps, slip_beta_excess_deg,
-        accel_excess_mps2, yaw_accel_excess_degps2, turn_yaw_rate_excess_degps, 
-        turn_lat_accel_excess_mps2, turn_radius_shortfall_m
-        
-        """
         physics_dict = self._build_zero_draft_metrics(fm_loss)
-        total_loss = fm_loss
+        guard_metrics = self._build_zero_fm_guard_metrics(fm_loss)
+        physics_loss_scaled = fm_loss.new_zeros(())
         if draft_weight > 0.0:
             physics_dict = self._compute_draft_training_loss(
                 pred_dict=pred,
                 tokenized_agent=tokenized_agent,
+                scenario_ids=data["scenario_id"],
             )
-            total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
+            physics_loss_scaled = draft_weight * self.draft_loss_scale * physics_dict["loss"]
 
-        self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/loss_fm", fm_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/ADE2s", open_metric_dict["ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/FDE2s", open_metric_dict["FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        total_loss = fm_loss + physics_loss_scaled
+        if self.use_draft_manual_optimization:
+            guard_metrics = self._apply_fm_guarded_optimization_step(
+                fm_loss=fm_loss,
+                physics_loss_scaled=physics_loss_scaled,
+            )
+
+        self.log(
+            "train/loss",
+            total_loss.detach(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/loss_fm",
+            fm_loss.detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/ADE2s",
+            open_metric_dict["ADE2s"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/FDE2s",
+            open_metric_dict["FDE2s"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
         self.log(
             "train/ADEyaw2s",
             open_metric_dict["yaw_ADE2s"],
@@ -1138,8 +1499,29 @@ open_metric_dict:
             self._log_draft_training_metrics(
                 draft_weight=draft_weight,
                 physics_dict=physics_dict,
+                physics_loss_scaled=physics_loss_scaled,
+                guard_metrics=guard_metrics,
             )
-        return total_loss
+
+        return total_loss.detach() if self.use_draft_manual_optimization else total_loss
+
+    def on_train_epoch_end(self) -> None:
+        """수동 최적화 모드에서는 epoch 끝에서 학습률 스케줄러를 직접 한 번 움직입니다.
+
+        Returns:
+            None
+        """
+        if not self.use_draft_manual_optimization:
+            return
+
+        lr_schedulers = self.lr_schedulers()
+        if lr_schedulers is None:
+            return
+        if isinstance(lr_schedulers, list):
+            for scheduler in lr_schedulers:
+                scheduler.step()
+        else:
+            lr_schedulers.step()
 
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)

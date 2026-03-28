@@ -16,8 +16,16 @@ model:
       enabled: true
       start_epoch: 0
       ramp_epochs: 16
-      max_weight: 0.05 # 0.005 가 1:1 비율임.
+      max_weight: 0.05 # raw physics loss에 곱해지는 외부 ramp 계수입니다.
+      loss_scale: 0.005
       gt_excess_only: false
+      train_sampling:
+        num_samples: 2
+        seed_base: 0
+      fm_guard:
+        enabled: true
+        cap_ratio: 0.1
+        eps: 1.0e-12
       sampling:
         sample_steps: 16
         sample_method: midpoint
