@@ -455,21 +455,60 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 - max epochs: `16`
 - train batch size: `20`
 - val batch size: `16`
-- validation 주기: `4` epoch마다
-
+- validation 주기: `2` epoch마다
 
 loss와 로그는 아래처럼 보면 됩니다.
 
 - `train/loss`는 최종 학습 loss입니다.
 - `train/loss_fm`는 원래 flow matching loss입니다.
-- `train/loss_phys`는 DRaFT physics penalty입니다.
-- 실제로는 `train/loss = train/loss_fm + train/draft_weight * train/loss_phys` 형태로 합쳐집니다.
-- 기본 구현은 trainer가 `bf16-mixed`여도 DRaFT physics regularizer 계산 구간만 fp32 subregion에서 수행합니다.
+- `train/loss_phys`는 새 DRaFT feasible penalty입니다.
+- 실제로는 `train/loss = train/loss_fm + train/draft_weight * 0.005 * train/loss_phys` 형태로 합쳐집니다.
+- trainer가 `bf16-mixed`여도 DRaFT regularizer 계산 구간은 기본적으로 fp32 subregion에서 수행합니다.
 - `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
-- `train/*`에는 요약 지표만 남습니다. 세부 physics gap은 `raw_feaisble_gap/speed`, `raw_feaisble_gap/accel` 같은 prefix로 기록됩니다.
-- 실제 단위 위반량도 함께 기록됩니다. 예를 들어 gap 기준 값은 `raw_feaisble_gap/speed_excess_mps`, `raw_feaisble_gap/accel_excess_mps2`, raw 예측값은 `raw_feaisble_gap/pred_accel_excess_mps2`, GT 기준값은 `gt_feasible_gap/accel_excess_mps2`처럼 기록됩니다.
-- 첫 delta는 `accel`, `yaw_accel`에 함께 포함됩니다. `prev_control_valid`가 `False`면 첫 delta만 마스킹되고, 별도 `start` metric은 기록하지 않습니다.
-- 합성 항은 하위 물리량으로 나뉘어 기록됩니다. 예를 들어 `slip`은 `raw_feaisble_gap/slip_beta_excess_deg`, `turn`은 `raw_feaisble_gap/turn_yaw_rate_excess_degps`, `raw_feaisble_gap/turn_lat_accel_excess_mps2`, `raw_feaisble_gap/turn_radius_shortfall_m`으로 볼 수 있습니다.
+
+새 DRaFT regularizer의 핵심은 아래와 같습니다.
+
+- vehicle / bicycle:
+  - 2초 미래를 `4`개의 반초 knot로 요약합니다.
+  - 각 knot는 `[v, omega]`이며, 시작점은 `flow_train_prev_control[:, [0, 2]]` 입니다.
+  - 각 knot 사이는 10Hz로 선형 보간해 `20` step 제어열을 만듭니다.
+  - 안쪽 solver가 이 knot를 몇 번 gradient descent로 맞춘 뒤,
+    `C_track + C_limit`을 penalty로 사용합니다.
+  - `C_limit`에는 speed / abs yaw-rate / accel / yaw-accel / lateral-accel /
+    minimum-radius 제한이 들어갑니다.
+- pedestrian:
+  - 2초 미래를 `4`개의 반초 knot로 요약합니다.
+  - 각 knot는 local 2D velocity `[vx_local, vy_local]`이며,
+    시작점은 새로 추가된 `flow_train_prev_vel_local_xy` 입니다.
+  - 이동 feasibility는 `position tracking + speed norm + acceleration norm` 으로 계산합니다.
+  - heading은 이동과 분리해서 `yaw-rate + yaw-accel` 제한만 따로 regularize 합니다.
+- limit threshold는 기존 repo에서 쓰던 99.3% percentile table을 그대로 재사용합니다.
+  즉, 새 방식이어도 threshold 정의 자체는 바꾸지 않습니다.
+- `gt_excess_only=true`면 GT보다 더 나쁜 만큼만, `false`면 절대 penalty 자체를 사용합니다.
+
+주요 학습 로그는 아래처럼 바뀝니다.
+
+- component gap:
+  - `raw_feaisble_gap/veh_track`
+  - `raw_feaisble_gap/veh_limit`
+  - `raw_feaisble_gap/ped_track`
+  - `raw_feaisble_gap/ped_limit`
+  - `raw_feaisble_gap/ped_heading`
+- vehicle / bicycle 실제 단위 위반량:
+  - `raw_feaisble_gap/veh_track_mse_norm`
+  - `raw_feaisble_gap/veh_speed_excess_mps`
+  - `raw_feaisble_gap/veh_yaw_rate_excess_degps`
+  - `raw_feaisble_gap/veh_accel_excess_mps2`
+  - `raw_feaisble_gap/veh_yaw_accel_excess_degps2`
+  - `raw_feaisble_gap/veh_lat_accel_excess_mps2`
+  - `raw_feaisble_gap/veh_radius_shortfall_m`
+- pedestrian 실제 단위 위반량:
+  - `raw_feaisble_gap/ped_track_mse_norm`
+  - `raw_feaisble_gap/ped_speed_excess_mps`
+  - `raw_feaisble_gap/ped_accel_excess_mps2`
+  - `raw_feaisble_gap/ped_yaw_rate_excess_degps`
+  - `raw_feaisble_gap/ped_yaw_accel_excess_degps2`
+- `pred_*` / `gt_*` prefix는 위 실제 단위 metric에 대해 그대로 함께 남습니다.
 
 자주 바꾸는 override 예시는 아래와 같습니다.
 
@@ -485,6 +524,18 @@ loss와 로그는 아래처럼 보면 됩니다.
 
 # physics penalty도 mixed precision으로 그대로 계산
 ... model.model_config.draft.physics.force_fp32=false
+
+# 안쪽 knot solver 반복 횟수 늘리기
+... model.model_config.draft.physics.inner_steps=8
+
+# 안쪽 knot solver step 크기 줄이기
+... model.model_config.draft.physics.inner_step_size=0.02
+
+# limit 항을 더 세게
+... model.model_config.draft.physics.limit_weight=2.0
+
+# 보행자 heading regularizer만 더 세게
+... model.model_config.draft.physics.ped_heading_weight=2.0
 
 # 샘플러 역전파를 마지막 2 step에만 남겨 메모리 사용량 줄이기
 ... model.model_config.draft.sampling.backprop_last_k=2

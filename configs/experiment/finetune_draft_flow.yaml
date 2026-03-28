@@ -29,11 +29,13 @@ model:
         pos_scale_m: 20.0
         deadzone_ratio: 0.02
         deadzone_softness: 0.02
-        speed_weight: 1.0
-        slip_weight: 1.0
-        accel_weight: 1.0
-        yaw_accel_weight: 1.0
-        turn_weight: 0.33
+        track_weight: 1.0
+        limit_weight: 1.0
+        ped_heading_weight: 1.0
+        num_chunks: 4
+        chunk_size: 5
+        inner_steps: 5
+        inner_step_size: 0.05
         eps: 1.0e-6
 
 ckpt_path: null

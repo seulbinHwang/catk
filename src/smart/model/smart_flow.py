@@ -99,11 +99,13 @@ class SMARTFlow(LightningModule):
                 deadzone_ratio=float(getattr(draft_physics, "deadzone_ratio", 0.02)),
                 deadzone_softness=float(getattr(draft_physics, "deadzone_softness", 0.02)),
                 gt_excess_only=bool(getattr(draft_config, "gt_excess_only", True)),
-                speed_weight=float(getattr(draft_physics, "speed_weight", 1.0)),
-                slip_weight=float(getattr(draft_physics, "slip_weight", 1.0)),
-                accel_weight=float(getattr(draft_physics, "accel_weight", 1.0)),
-                yaw_accel_weight=float(getattr(draft_physics, "yaw_accel_weight", 1.0)),
-                turn_weight=float(getattr(draft_physics, "turn_weight", 1.0)),
+                track_weight=float(getattr(draft_physics, "track_weight", 1.0)),
+                limit_weight=float(getattr(draft_physics, "limit_weight", 1.0)),
+                ped_heading_weight=float(getattr(draft_physics, "ped_heading_weight", 1.0)),
+                num_chunks=int(getattr(draft_physics, "num_chunks", 4)),
+                chunk_size=int(getattr(draft_physics, "chunk_size", 5)),
+                inner_steps=int(getattr(draft_physics, "inner_steps", 5)),
+                inner_step_size=float(getattr(draft_physics, "inner_step_size", 0.05)),
                 eps=float(getattr(draft_physics, "eps", 1e-6)),
             )
         else:
@@ -969,6 +971,7 @@ class SMARTFlow(LightningModule):
                 packed_agent_type=tokenized_agent["flow_train_agent_type"],
                 packed_prev_control=tokenized_agent["flow_train_prev_control"],
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+                packed_prev_vel_local_xy=tokenized_agent["flow_train_prev_vel_local_xy"],
             )
 
         # Keep the threshold-heavy physics penalty in fp32 even when the trainer
@@ -980,6 +983,7 @@ class SMARTFlow(LightningModule):
                 packed_agent_type=tokenized_agent["flow_train_agent_type"],
                 packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+                packed_prev_vel_local_xy=tokenized_agent["flow_train_prev_vel_local_xy"].float(),
             )
 
     def _log_draft_training_metrics(
@@ -1069,6 +1073,7 @@ class SMARTFlow(LightningModule):
 flow_train_agent_type [n_valid_anchor]
 flow_train_prev_control [n_valid_anchor, 3]
 flow_train_prev_control_valid [n_valid_anchor]
+flow_train_prev_vel_local_xy [n_valid_anchor, 2]
 
         """
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -1094,16 +1099,17 @@ open_metric_dict:
         fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
 
         draft_weight = self._get_draft_loss_weight()
-        """ physics_dict : Dict[str, Tensor] #  모든 값은 scalar tensor 
-        
+        """ physics_dict : Dict[str, Tensor] # 모든 값은 scalar tensor
+
         loss, raw_pred_loss
-        
-        speed, slip, accel, yaw_accel, turn
-        
-        speed_excess_mps, slip_beta_excess_deg,
-        accel_excess_mps2, yaw_accel_excess_degps2, turn_yaw_rate_excess_degps, 
-        turn_lat_accel_excess_mps2, turn_radius_shortfall_m
-        
+
+        veh_track, veh_limit, ped_track, ped_limit, ped_heading
+
+        veh_track_mse_norm, veh_speed_excess_mps, veh_yaw_rate_excess_degps,
+        veh_accel_excess_mps2, veh_yaw_accel_excess_degps2, veh_lat_accel_excess_mps2,
+        veh_radius_shortfall_m, ped_track_mse_norm, ped_speed_excess_mps,
+        ped_accel_excess_mps2, ped_yaw_rate_excess_degps, ped_yaw_accel_excess_degps2
+
         """
         physics_dict = self._build_zero_draft_metrics(fm_loss)
         total_loss = fm_loss

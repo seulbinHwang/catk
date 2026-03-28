@@ -87,6 +87,7 @@ class FlowTokenProcessor(TokenProcessor):
             flow_train_agent_type_chunks: List[Tensor] = []
             flow_train_prev_control_chunks: List[Tensor] = []
             flow_train_prev_control_valid_chunks: List[Tensor] = []
+            flow_train_prev_vel_local_xy_chunks: List[Tensor] = []
 
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
@@ -109,7 +110,7 @@ class FlowTokenProcessor(TokenProcessor):
                         raw_step=raw_step,
                     )
                 )
-                prev_control, prev_control_valid = self._build_anchor_prev_control(
+                prev_control, prev_control_valid, prev_vel_local_xy = self._build_anchor_prev_control(
                     pos=pos,
                     heading=heading,
                     valid=valid,
@@ -121,6 +122,7 @@ class FlowTokenProcessor(TokenProcessor):
                 flow_train_agent_type_chunks.append(tokenized_agent["type"][train_anchor_mask])
                 flow_train_prev_control_chunks.append(prev_control)
                 flow_train_prev_control_valid_chunks.append(prev_control_valid)
+                flow_train_prev_vel_local_xy_chunks.append(prev_vel_local_xy)
 
             tokenized_agent.update(
                 {
@@ -144,6 +146,12 @@ class FlowTokenProcessor(TokenProcessor):
                     "flow_train_prev_control_valid": self._concat_vector_chunks(
                         chunks=flow_train_prev_control_valid_chunks,
                         dtype=torch.bool,
+                        device=device,
+                    ),
+                    "flow_train_prev_vel_local_xy": self._concat_matrix_chunks(
+                        chunks=flow_train_prev_vel_local_xy_chunks,
+                        width=2,
+                        dtype=dtype,
                         device=device,
                     ),
                 }
@@ -245,8 +253,8 @@ class FlowTokenProcessor(TokenProcessor):
         current_head: Tensor,
         anchor_mask: Tensor,
         raw_step: int,
-    ) -> Tuple[Tensor, Tensor]:
-        """anchor 직전 구간의 단순 제어를 local frame 기준으로 만듭니다.
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """anchor 직전 구간의 단순 제어와 local 2D 속도를 만듭니다.
 
         Args:
             pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
@@ -258,21 +266,26 @@ class FlowTokenProcessor(TokenProcessor):
             raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
 
         Returns:
-            Tuple[Tensor, Tensor]:
-                직전 제어 ``[v_x^b, v_y^b, omega]`` 와 유효 마스크입니다.
-                shape은 각각 ``[n_valid_anchor, 3]`` 과 ``[n_valid_anchor]`` 입니다.
+            Tuple[Tensor, Tensor, Tensor]:
+                직전 제어 ``[v_x^b, v_y^b, omega]`` ,
+                유효 마스크,
+                직전 local 2D 속도 ``[v_x^{local}, v_y^{local}]`` 입니다.
+                shape은 각각 ``[n_valid_anchor, 3]``, ``[n_valid_anchor]``,
+                ``[n_valid_anchor, 2]`` 입니다.
         """
         num_valid_anchor = int(anchor_mask.sum().item())
         if num_valid_anchor == 0:
             return (
                 pos.new_zeros((0, 3)),
                 torch.zeros((0,), device=pos.device, dtype=torch.bool),
+                pos.new_zeros((0, 2)),
             )
 
         prev_control_valid = valid[anchor_mask, raw_step] & valid[anchor_mask, raw_step - 1]
         prev_control = pos.new_zeros((num_valid_anchor, 3))
+        prev_vel_local_xy = pos.new_zeros((num_valid_anchor, 2))
         if not prev_control_valid.any():
-            return prev_control, prev_control_valid
+            return prev_control, prev_control_valid, prev_vel_local_xy
 
         pos_pair = pos[anchor_mask, raw_step - 1 : raw_step + 1]
         head_pair = heading[anchor_mask, raw_step - 1 : raw_step + 1]
@@ -284,6 +297,7 @@ class FlowTokenProcessor(TokenProcessor):
         )
 
         delta_pos = pos_pair_local[:, 1] - pos_pair_local[:, 0]
+        prev_vel_local_xy = delta_pos / 0.1
         prev_head_local = head_pair_local[:, 0]
         delta_head = self._wrap_angle(head_pair_local[:, 1] - head_pair_local[:, 0])
 
@@ -293,7 +307,8 @@ class FlowTokenProcessor(TokenProcessor):
         prev_control[:, 1] = (-delta_pos[:, 0] * sin_prev + delta_pos[:, 1] * cos_prev) / 0.1
         prev_control[:, 2] = delta_head / 0.1
         prev_control[~prev_control_valid] = 0.0
-        return prev_control, prev_control_valid
+        prev_vel_local_xy[~prev_control_valid] = 0.0
+        return prev_control, prev_control_valid, prev_vel_local_xy
 
     def _concat_flow_chunks(
         self,
