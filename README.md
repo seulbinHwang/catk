@@ -452,9 +452,8 @@ torchrun \
 fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 
 - 기본적으로 encoder 전체를 먼저 freeze합니다.
-- 그 다음 `agent_encoder.flow_decoder.step_refiner`만 unfreeze합니다.
-- 추가로 `agent_encoder.flow_decoder.velocity_head`만 unfreeze합니다.
-- 즉 fine-tuning에서는 map encoder, agent embedding, attention layers는 그대로 frozen 상태를 유지합니다.
+- 그 다음 `agent_encoder.flow_decoder` 전체, 즉 `HierarchicalFlowDecoder` 전체를 unfreeze합니다.
+- 즉 fine-tuning에서는 map encoder와 flow decoder 바깥의 나머지 encoder 블록은 그대로 frozen 상태를 유지합니다.
 
 `finetune_draft_flow` 기본 설정은 아래와 같습니다.
 

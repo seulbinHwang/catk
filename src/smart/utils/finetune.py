@@ -28,13 +28,7 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: bool) -> None:
             p.requires_grad = False
 
         try:
-            _unfreeze(model.agent_encoder.flow_decoder.step_refiner)
-            log.info("Unfreezing flow_decoder.step_refiner")
+            _unfreeze(model.agent_encoder.flow_decoder)
+            log.info("Unfreezing flow_decoder (full HierarchicalFlowDecoder)")
         except Exception:
-            log.info("No flow_decoder.step_refiner in model.agent_encoder")
-
-        try:
-            _unfreeze(model.agent_encoder.flow_decoder.velocity_head)
-            log.info("Unfreezing flow_decoder.velocity_head")
-        except Exception:
-            log.info("No flow_decoder.velocity_head in model.agent_encoder")
+            log.info("No flow_decoder in model.agent_encoder")
