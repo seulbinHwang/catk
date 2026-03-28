@@ -8,9 +8,16 @@
 - `FlowTokenProcessor`가 14-slot context pack과 13개 anchor를 만들어 2초 미래를 연속값으로 supervision 합니다.
 - `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
 - closed-loop inference는 0.5초씩 commit 하며 `pred_traj_10hz`, `pred_head_10hz`, `pred_z_10hz`를 바로 내보내 2025 Sim Agents rollout proto와 바로 연결됩니다.
+- closed-loop inference에서는 외부로 내보내는 `pred_traj_10hz`, `pred_head_10hz`를 raw FM 출력 그대로 유지하고, `retokenize` 뒤에 복원한 coarse state는 다음 문맥 갱신에만 사용합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
+
+### Closed-loop Retokenize Rule
+
+- `retokenize` 직후의 coarse 상태는 반드시 token bank에서 복원한 `next_pos`, `next_head`를 사용합니다.
+- `pos_window`, `head_window`, `coarse_pos/head`, 그리고 다음 step motion feature는 모두 이 token-restored state 기준으로 갱신합니다.
+- 반대로 `pred_traj_10hz`, `pred_head_10hz`는 raw FM 출력 그대로 유지합니다. 따라서 WOSAC metric, submission proto, video visualization은 post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
 
 
 ## 2. 환경 설치
