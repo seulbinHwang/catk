@@ -43,7 +43,7 @@ ckpt_path: null
 trainer:
   limit_train_batches: 1.0
   limit_val_batches: 0.1
-  check_val_every_n_epoch: 2
+  check_val_every_n_epoch: 4
   max_epochs: 16
   precision: bf16-mixed
   gradient_clip_val: 1.0
@@ -55,7 +55,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 20
+  train_batch_size: 48
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
