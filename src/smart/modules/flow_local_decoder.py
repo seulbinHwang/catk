@@ -7,7 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.smart.tokens.agent_token_matching import match_token_idx_from_local_contour
+from src.smart.tokens.agent_token_matching import (
+    build_agent_type_masks,
+    match_token_idx_from_local_contour,
+)
 from src.smart.utils import (
     cal_polygon_contour,
     transform_to_global,
@@ -461,3 +464,42 @@ class ContinuousCommitBridge:
             num_k=1,
             sample_topk=False,
         )
+
+    def restore_token_state(
+        self,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        next_token_idx: torch.Tensor,
+        agent_type: torch.Tensor,
+        token_bank_all_veh: torch.Tensor,
+        token_bank_all_ped: torch.Tensor,
+        token_bank_all_cyc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """고른 coarse 토큰을 학습과 같은 방식으로 pose/head로 복원합니다."""
+        next_pos = current_pos.clone()
+        next_head = current_head.clone()
+        token_banks = {
+            "veh": token_bank_all_veh[:, -1],
+            "ped": token_bank_all_ped[:, -1],
+            "cyc": token_bank_all_cyc[:, -1],
+        }
+
+        for token_key, mask in build_agent_type_masks(agent_type).items():
+            if not mask.any():
+                continue
+
+            token_contour_local = token_banks[token_key][next_token_idx[mask]]
+            token_center_local = token_contour_local.mean(dim=1)
+            token_center_global, _ = transform_to_global(
+                pos_local=token_center_local.unsqueeze(1),
+                head_local=None,
+                pos_now=current_pos[mask],
+                head_now=current_head[mask],
+            )
+            next_pos[mask] = token_center_global.squeeze(1)
+
+            token_dxy_local = token_contour_local[:, 0] - token_contour_local[:, 3]
+            token_head_local = torch.atan2(token_dxy_local[:, 1], token_dxy_local[:, 0])
+            next_head[mask] = wrap_angle(current_head[mask] + token_head_local)
+
+        return next_pos, next_head

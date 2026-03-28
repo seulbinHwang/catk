@@ -811,14 +811,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     steps=flow_sample_steps,
                     method=flow_sample_method,
                 )
-                commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
+                current_pos_act = pos_window[active_mask, -1]
+                current_head_act = head_window[active_mask, -1]
+                commit_pos_act, commit_head_act, _, _ = self.commit_bridge.commit(
                     y_hat_norm=y_hat_norm,
-                    current_pos=pos_window[active_mask, -1],
-                    current_head=head_window[active_mask, -1],
+                    current_pos=current_pos_act,
+                    current_head=current_head_act,
                 )
                 next_token_idx_act = self.commit_bridge.retokenize(
-                    current_pos=pos_window[active_mask, -1],
-                    current_head=head_window[active_mask, -1],
+                    current_pos=current_pos_act,
+                    current_head=current_head_act,
                     commit_pos=commit_pos_act,
                     commit_head=commit_head_act,
                     agent_type=tokenized_agent["type"][active_mask],
@@ -827,10 +829,21 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
                     token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
                 )
+                next_pos_tok_act, next_head_tok_act = self.commit_bridge.restore_token_state(
+                    current_pos=current_pos_act,
+                    current_head=current_head_act,
+                    next_token_idx=next_token_idx_act,
+                    agent_type=tokenized_agent["type"][active_mask],
+                    token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                    token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                    token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
+                )
+                # Exported/scored 10 Hz rollout stays as raw FM output.
+                # Token-restored state is used only for internal closed-loop context.
                 commit_traj_step[active_mask] = commit_pos_act
                 commit_head_step[active_mask] = commit_head_act
-                next_pos[active_mask] = next_pos_act
-                next_head[active_mask] = next_head_act
+                next_pos[active_mask] = next_pos_tok_act
+                next_head[active_mask] = next_head_tok_act
                 next_token_idx[active_mask] = next_token_idx_act
 
             pred_traj_10hz[:, t * 5 : (t + 1) * 5] = commit_traj_step
