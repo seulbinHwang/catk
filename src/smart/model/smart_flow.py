@@ -1112,7 +1112,7 @@ open_metric_dict:
                 pred_dict=pred,
                 tokenized_agent=tokenized_agent,
             )
-            total_loss = total_loss + draft_weight * physics_dict["loss"]
+            total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
 
         self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/loss_fm", fm_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
