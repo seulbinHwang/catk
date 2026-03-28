@@ -1,0 +1,74 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug run.py (Pretraining - slow)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/run.py",
+      "python": "/home2/pnc2/miniforge3/envs/catk/bin/python",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "HYDRA_FULL_ERROR": "1",
+        "PYTHONPATH": "${workspaceFolder}",
+        "CUDA_VISIBLE_DEVICES": "2,3",
+        "WANDB_MODE": "offline",
+        "WANDB_SILENT": "true"
+      },
+      "args": [
+        "action=fit",
+        "experiment=pre_bc",
+        "trainer.max_epochs=1",
+        "trainer.limit_train_batches=2",
+        "trainer.limit_val_batches=1",
+        "trainer.accelerator=gpu",
+        "trainer.devices=2",
+        "paths.cache_root=/home2/pnc2/repos_python/datasets/catk_cache",
+        "data.num_workers=1",
+        "+data.prefetch_factor=2",
+        "data.train_batch_size=1",
+        "data.val_batch_size=1",
+        "logger.wandb.offline=true",
+        "task_name=debug_pretrain_slow"
+      ],
+      "subProcess": true
+    },
+    {
+      "name": "Debug run.py (Fine-tuning - slow)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/run.py",
+      "python": "/home2/pnc2/miniforge3/envs/catk/bin/python",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "HYDRA_FULL_ERROR": "1",
+        "PYTHONPATH": "${workspaceFolder}",
+        "CUDA_VISIBLE_DEVICES": "2,3",
+        "WANDB_MODE": "offline",
+        "WANDB_SILENT": "true"
+      },
+      "args": [
+        "experiment=clsft",
+        "action=finetune",
+        "ckpt_path=null",
+        "trainer.max_epochs=1",
+        "trainer.limit_train_batches=2",
+        "trainer.limit_val_batches=1",
+        "trainer.accelerator=gpu",
+        "trainer.devices=2",
+        "paths.cache_root=/home2/pnc2/repos_python/datasets/catk_cache",
+        "data.num_workers=1",
+        "+data.prefetch_factor=2",
+        "data.train_batch_size=1",
+        "data.val_batch_size=1",
+        "logger.wandb.offline=true",
+        "task_name=debug_finetune_slow"
+      ],
+      "subProcess": true
+    }
+  ]
+}

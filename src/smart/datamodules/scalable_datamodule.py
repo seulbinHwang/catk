@@ -34,6 +34,7 @@ class MultiDataModule(LightningDataModule):
         val_tfrecords_splitted: str,
         shuffle: bool,
         num_workers: int,
+        prefetch_factor: int,
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
@@ -44,6 +45,7 @@ class MultiDataModule(LightningDataModule):
         self.test_batch_size = test_batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
+        self.prefetch_factor = int(prefetch_factor)
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
         self.train_raw_dir = train_raw_dir
@@ -80,6 +82,7 @@ class MultiDataModule(LightningDataModule):
             batch_size=self.train_batch_size,
             shuffle=self.shuffle,
             num_workers=self.num_workers,
+            prefetch_factor=self.prefetch_factor,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             drop_last=False,
@@ -91,6 +94,7 @@ class MultiDataModule(LightningDataModule):
             batch_size=self.val_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
+            prefetch_factor=self.prefetch_factor,
             pin_memory=self.pin_memory,  # False
             persistent_workers=self.persistent_workers,
             drop_last=False,
@@ -102,6 +106,7 @@ class MultiDataModule(LightningDataModule):
             batch_size=self.test_batch_size,
             shuffle=False,
             num_workers=self.num_workers,  # 0
+            prefetch_factor=self.prefetch_factor,
             pin_memory=self.pin_memory,  # False
             persistent_workers=self.persistent_workers,
             drop_last=False,

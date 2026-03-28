@@ -80,8 +80,26 @@ class TokenProcessor(torch.nn.Module):
             self.register_buffer(f"agent_token_all_{k}", v, persistent=False)
 
     def tokenize_map(self, data: HeteroData) -> Dict[str, Tensor]:
-        traj_pos = data["map_save"]["traj_pos"]  # [n_pl, 3, 2]
-        traj_theta = data["map_save"]["traj_theta"]  # [n_pl]
+        # 일부 캐시(PKL)에서는 `map_save` 스키마가 다를 수 있습니다.
+        # (예: `traj_pos`/`traj_theta` 누락) 이 경우에도 학습 파이프라인이
+        # 바로 죽지 않도록 더미 맵을 사용해 후속 코드 경로를 확인할 수 있게 합니다.
+        try:
+            traj_pos = data["map_save"]["traj_pos"]  # [n_pl, 3, 2]
+            traj_theta = data["map_save"]["traj_theta"]  # [n_pl]
+            pt_token = data["pt_token"]
+        except KeyError:
+            device = data["agent"]["position"].device
+            traj_pos = (
+                torch.zeros((1, 3, 2), dtype=torch.float32, device=device) + 6e4
+            )  # [1, 3, 2] - float16 범위 내
+            traj_theta = torch.zeros((1,), dtype=torch.float32, device=device)
+            pt_token = {
+                "type": torch.zeros((1,), dtype=torch.uint8, device=device),
+                "pl_type": torch.zeros((1,), dtype=torch.uint8, device=device),
+                "light_type": torch.zeros((1,), dtype=torch.uint8, device=device),
+                "num_nodes": torch.tensor([1], dtype=torch.long, device=device),
+                "batch": torch.zeros((1,), dtype=torch.long, device=device),
+            }
 
         traj_pos_local, _ = transform_to_local(
             pos_global=traj_pos,  # [n_pl, 3, 2]
@@ -115,14 +133,24 @@ class TokenProcessor(torch.nn.Module):
             "orientation": traj_theta,  # [n_pl]
             "token_idx": token_idx,  # [n_pl]
             "token_traj_src": self.map_token_traj_src,  # [n_token, 11*2]
-            "type": data["pt_token"]["type"].long(),  # [n_pl]
-            "pl_type": data["pt_token"]["pl_type"].long(),  # [n_pl]
-            "light_type": data["pt_token"]["light_type"].long(),  # [n_pl]
-            "batch": data["pt_token"]["batch"],  # [n_pl]
+            "type": pt_token["type"].long(),  # [n_pl]
+            "pl_type": pt_token["pl_type"].long(),  # [n_pl]
+            "light_type": pt_token["light_type"].long(),  # [n_pl]
+            "batch": (
+                pt_token["batch"]
+                if "batch" in pt_token
+                else torch.zeros(
+                    (traj_pos.shape[0],), dtype=torch.long, device=traj_pos.device
+                )
+            ),  # [n_pl]
         }
         return tokenized_map
 
-    def tokenize_agent(self, data: HeteroData) -> Dict[str, Tensor]:
+    def tokenize_agent(
+        self,
+        data: HeteroData,
+        return_preprocessed: bool = False,
+    ) -> Dict[str, Tensor] | tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         """
         Args: data["agent"]: Dict
             "valid_mask": [n_agent, n_step], bool
@@ -135,15 +163,28 @@ class TokenProcessor(torch.nn.Module):
             "shape": [n_agent, 3], float32
         """
         # ! collate width/length, traj tokens for current batch
+        agent_type = data["agent"]["type"]
+        # 일부 캐시에서는 agent_type에 추가 차원이 붙을 수 있어 1D로 축소합니다.
+        if isinstance(agent_type, torch.Tensor) and agent_type.dim() > 1:
+            agent_type = agent_type[:, 0]
+
         agent_shape, token_traj_all, token_traj = self._get_agent_shape_and_token_traj(
-            data["agent"]["type"]
+            agent_type
         )
+
+        shape = data["agent"]["shape"]
+        # 일부 캐시에서는 [n_agent, T, 3] 같은 형태로 들어오므로 [n_agent, 3]으로 정규화합니다.
+        if isinstance(shape, torch.Tensor) and shape.dim() > 2:
+            shape = shape[:, 0, :]
 
         # ! get raw trajectory data
         valid = data["agent"]["valid_mask"]  # [n_agent, n_step]
         heading = data["agent"]["heading"]  # [n_agent, n_step]
         pos = data["agent"]["position"][..., :2].contiguous()  # [n_agent, n_step, 2]
-        vel = data["agent"]["velocity"]  # [n_agent, n_step, 2]
+        vel = data["agent"]["velocity"]  # [n_agent, n_step, D] (D should be 2)
+        # 일부 데이터/캐시에서는 velocity가 (x, y, z)처럼 3D로 들어올 수 있습니다.
+        # 토큰 처리/엑스트라폴레이션은 (x, y)만 사용하므로 앞 2차원만 취합니다.
+        vel = vel[..., :2].contiguous()
 
         # ! agent, specifically vehicle's heading can be 180 degree off. We fix it here.
         heading = self._clean_heading(valid, heading)
@@ -153,15 +194,26 @@ class TokenProcessor(torch.nn.Module):
         )
 
         # ! prepare output dict
+        try:
+            ego_mask = data["agent"]["role"][:, 0]  # [n_agent]
+        except KeyError:
+            # 일부 캐시에서는 `role`이 없을 수 있습니다.
+            # ego_mask를 모두 False로 두고 나머지 토큰화를 진행합니다.
+            ego_mask = torch.zeros((pos.shape[0],), dtype=torch.bool, device=pos.device)
+
         tokenized_agent = {
             "num_graphs": data.num_graphs,
-            "type": data["agent"]["type"],
-            "shape": data["agent"]["shape"],
-            "ego_mask": data["agent"]["role"][:, 0],  # [n_agent]
+            "type": agent_type,
+            "shape": shape,
+            "ego_mask": ego_mask,  # [n_agent]
             "token_agent_shape": agent_shape,  # [n_agent, 2]
             "batch": data["agent"]["batch"],
             "token_traj_all": token_traj_all,  # [n_agent, n_token, 6, 4, 2]
             "token_traj": token_traj,  # [n_agent, n_token, 4, 2]
+            # Flow finetuning의 commit/retokenize 단계에서 요구하는 토큰 뱅크들입니다.
+            "token_bank_all_veh": self.agent_token_all_veh,  # [n_token, 6, 4, 2]
+            "token_bank_all_ped": self.agent_token_all_ped,  # [n_token, 6, 4, 2]
+            "token_bank_all_cyc": self.agent_token_all_cyc,  # [n_token, 6, 4, 2]
             # for step {5, 10, ..., 90}
             "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, n_step=18, 2]
             "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, n_step=18]
@@ -186,6 +238,8 @@ class TokenProcessor(torch.nn.Module):
             token_traj=token_traj,
         )
         tokenized_agent.update(token_dict)
+        if return_preprocessed:
+            return tokenized_agent, {"valid": valid, "pos": pos, "heading": heading}
         return tokenized_agent
 
     def _match_agent_token(

@@ -1,0 +1,287 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hsb-npc-training2
+  namespace: p-pnc
+  annotations:
+    sidecar.istio.io/inject: "false"
+
+spec:
+  terminationGracePeriodSeconds: 120
+  restartPolicy: OnFailure
+  nodeSelector:
+    mlx.navercorp.com/zone: private-h100-ib-naverlabs-0
+
+  imagePullSecrets:
+    - name: pnc-secret
+
+  securityContext:
+    fsGroup: 1000
+
+  volumes:
+    - name: nuplan-storage
+      persistentVolumeClaim:
+        claimName: temp-volume
+    - name: dshm2
+      emptyDir:
+        medium: Memory
+        sizeLimit: 256Gi
+
+  initContainers:
+    - name: install-nubescli
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -Eeuo pipefail
+          umask 002
+
+          mkdir -p /mnt/nuplan/tools
+          mkdir -p /mnt/nuplan/logs
+
+          if [ ! -s /mnt/nuplan/tools/nubescli ]; then
+            echo "[init] nubescli not found - downloading..."
+            curl -fsSL -o /mnt/nuplan/tools/nubescli \
+              http://owfsrepo.navercorp.com/nubes/dist/nubescli_latest/linux/nubescli
+            chmod +x /mnt/nuplan/tools/nubescli
+          else
+            echo "[init] nubescli already exists - skip download"
+          fi
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+
+    - name: setup-codex
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+      resources:
+        requests:
+          cpu: "2"
+          memory: "8Gi"
+        limits:
+          cpu: "2"
+          memory: "8Gi"
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -Eeuo pipefail
+          umask 002
+
+          export CODEX_HOME=/mnt/nuplan/.codex
+          export NPM_CONFIG_PREFIX=/mnt/nuplan/.npm-global
+
+          CODEX_ENV_PATH=/mnt/nuplan/miniforge/envs/codexcli
+          CODEX_NODE="$CODEX_ENV_PATH/bin/node"
+          CODEX_NPM="$CODEX_ENV_PATH/bin/npm"
+          CODEX_JS=/mnt/nuplan/.npm-global/lib/node_modules/@openai/codex/bin/codex.js
+          export PATH="$CODEX_ENV_PATH/bin:$PATH"
+
+          mkdir -p /mnt/nuplan/tools
+          mkdir -p "$CODEX_HOME"
+          mkdir -p "$NPM_CONFIG_PREFIX/bin"
+          chmod 700 "$CODEX_HOME"
+
+          source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
+          conda activate base
+
+          if [ ! -x "$CODEX_NODE" ]; then
+            echo "[init] creating codexcli conda env..."
+            conda create -y -n codexcli -c conda-forge "nodejs>=22.22,<23"
+          else
+            echo "[init] codexcli env already exists - skip create"
+          fi
+
+          touch "$CODEX_HOME/config.toml"
+          if grep -q '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=' "$CODEX_HOME/config.toml"; then
+            sed -i 's|^[[:space:]]*cli_auth_credentials_store[[:space:]]*=.*|cli_auth_credentials_store = "file"|' "$CODEX_HOME/config.toml"
+          else
+            printf '\ncli_auth_credentials_store = "file"\n' >> "$CODEX_HOME/config.toml"
+          fi
+
+          GUIDE_FILE="$CODEX_HOME/AGENTS.md"
+          if [ -s "$CODEX_HOME/AGENTS.override.md" ]; then
+            GUIDE_FILE="$CODEX_HOME/AGENTS.override.md"
+          fi
+
+          touch "$GUIDE_FILE"
+          if ! grep -q 'BEGIN_PERSISTENT_KOREAN_RESPONSE_RULE' "$GUIDE_FILE"; then
+            cat >> "$GUIDE_FILE" <<'EOF'
+
+          <!-- BEGIN_PERSISTENT_KOREAN_RESPONSE_RULE -->
+          ## 기본 응답 규칙
+          - 사용자가 명시적으로 다른 언어를 요청하지 않는 한 항상 한국어로 답변한다.
+          - 코드, 명령어, 파일 경로, 에러 메시지, API 이름, 브랜치 이름은 원문 그대로 유지한다.
+          - 답변은 짧고 명확하게 작성한다.
+          <!-- END_PERSISTENT_KOREAN_RESPONSE_RULE -->
+          EOF
+          fi
+
+          if [ ! -f "$CODEX_JS" ] || ! "$CODEX_NODE" "$CODEX_JS" --version >/dev/null 2>&1; then
+            echo "[init] installing or repairing Codex CLI..."
+            NPM_CONFIG_PREFIX="$NPM_CONFIG_PREFIX" "$CODEX_NPM" i -g @openai/codex@latest
+          else
+            echo "[init] Codex CLI already works - skip install"
+          fi
+
+          cat > /mnt/nuplan/tools/codex <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          CODEX_HOME_DEFAULT=/mnt/nuplan/.codex
+          CODEX_NODE=/mnt/nuplan/miniforge/envs/codexcli/bin/node
+          CODEX_JS=/mnt/nuplan/.npm-global/lib/node_modules/@openai/codex/bin/codex.js
+
+          export CODEX_HOME="${CODEX_HOME:-$CODEX_HOME_DEFAULT}"
+
+          if [ ! -x "$CODEX_NODE" ]; then
+            echo "[codex wrapper] missing node runtime: $CODEX_NODE" >&2
+            exit 1
+          fi
+
+          if [ ! -f "$CODEX_JS" ]; then
+            echo "[codex wrapper] missing codex cli entry: $CODEX_JS" >&2
+            exit 1
+          fi
+
+          exec "$CODEX_NODE" "$CODEX_JS" "$@"
+          EOF
+          chmod +x /mnt/nuplan/tools/codex
+
+          echo "[init] codex wrapper ready"
+          /mnt/nuplan/tools/codex --version
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+
+  containers:
+    - name: main
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+
+      env:
+        - name: LANG
+          value: "ko_KR.utf8"
+        - name: LANGUAGE
+          value: "ko_KR:ko"
+        - name: LC_ALL
+          value: "ko_KR.utf8"
+        - name: LC_CTYPE
+          value: "ko_KR.utf8"
+        - name: TERM
+          value: "xterm-256color"
+
+        - name: PROJECT_ROOT
+          value: "/mnt/nuplan/projects/catk"
+
+        - name: CODEX_HOME
+          value: "/mnt/nuplan/.codex"
+        - name: NPM_CONFIG_PREFIX
+          value: "/mnt/nuplan/.npm-global"
+
+        - name: PATH
+          value: "/mnt/nuplan/tools:/mnt/nuplan/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+        - name: NUBES_GATEWAY_ADDRESS
+          value: "c.nubes.sto.navercorp.com:8000"
+
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-secret
+              key: api-key
+        - name: WANDB_ENTITY
+          value: "jksg01019-naver-labs"
+        - name: WANDB_PROJECT
+          value: "SMART-FLOW"
+        - name: WANDB_MODE
+          value: "online"
+
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -Eeo pipefail
+          umask 002
+          trap 'echo "Exit (code $?) - keeping pod alive for inspection"; sleep infinity' EXIT
+
+          export LANG=ko_KR.utf8
+          export LANGUAGE=ko_KR:ko
+          export LC_ALL=ko_KR.utf8
+          export LC_CTYPE=ko_KR.utf8
+          export TERM=xterm-256color
+
+          export PATH=/mnt/nuplan/miniforge/bin:$PATH
+          source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
+          conda activate base
+          conda activate catk
+
+          pip install --no-cache-dir wandb
+          wandb login --relogin "$WANDB_API_KEY"
+
+          mkdir -p "$HOME"
+
+          if infocmp tmux-256color >/dev/null 2>&1; then
+            TMUX_TERM="tmux-256color"
+          else
+            TMUX_TERM="screen-256color"
+          fi
+
+          cat > "$HOME/.tmux.conf" <<EOF
+          set -g mouse on
+          set -g history-limit 100000
+          setw -g mode-keys vi
+          set -g default-terminal "$TMUX_TERM"
+          EOF
+
+          if [ ! -d "$PROJECT_ROOT/.git" ]; then
+            echo "[startup] PROJECT_ROOT is invalid: $PROJECT_ROOT"
+            exit 1
+          fi
+
+          git config --global --add safe.directory "$PROJECT_ROOT"
+
+          cd "$PROJECT_ROOT"
+          git fetch
+          git stash
+          if git show-ref --verify --quiet refs/remotes/origin/feature/womd; then
+            if [ "$(git rev-parse --abbrev-ref HEAD)" = "feature/womd" ]; then
+              git checkout main
+            fi
+            git branch -D feature/womd 2>/dev/null || true
+            git checkout -b feature/womd origin/feature/womd
+            git pull
+          else
+            echo "[startup] origin/feature/womd not found - keeping current branch $(git rev-parse --abbrev-ref HEAD)"
+          fi
+
+          SESSION_NAME="npc-training"
+          tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT"
+          tmux split-window -h -t "$SESSION_NAME:0" -c "$PROJECT_ROOT"
+          tmux select-layout -t "$SESSION_NAME" even-horizontal
+
+          echo "Started tmux session '$SESSION_NAME'."
+          echo "Codex wrapper path: $(command -v codex)"
+          codex --version || true
+
+          sleep infinity
+
+      resources:
+        requests:
+          cpu: "32"
+          memory: "1000Gi"
+          nvidia.com/gpu: "6"
+        limits:
+          cpu: "32"
+          memory: "1000Gi"
+          nvidia.com/gpu: "6"
+
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+        - name: dshm2
+          mountPath: /dev/shm

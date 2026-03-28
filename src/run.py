@@ -11,6 +11,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import pickle
 from typing import List
 
 import hydra
@@ -78,7 +79,25 @@ def run(cfg: DictConfig) -> None:
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
     elif cfg.action == "finetune":
         log.info("Starting finetuning!")
-        model.load_state_dict(torch.load(cfg.ckpt_path)["state_dict"], strict=False)
+        ckpt_path = cfg.get("ckpt_path")
+        if ckpt_path is not None:
+            log.info(f"Loading finetune checkpoint: {ckpt_path}")
+            try:
+                ckpt_state_dict = torch.load(
+                    ckpt_path, map_location="cpu", weights_only=True
+                )["state_dict"]
+            except pickle.UnpicklingError:
+                log.warning(
+                    "Checkpoint contains non-tensor objects. Falling back to weights_only=False "
+                    "for trusted checkpoint loading."
+                )
+                ckpt_state_dict = torch.load(
+                    ckpt_path, map_location="cpu", weights_only=False
+                )["state_dict"]
+            model.load_state_dict(
+                ckpt_state_dict,
+                strict=False,
+            )
         trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")

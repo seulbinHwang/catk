@@ -1,0 +1,54 @@
+# @package _global_
+
+defaults:
+  - override /model: smart_flow
+  - override /trainer: ddp
+
+action: finetune
+
+model:
+  model_config:
+    lr: 1e-4
+    lr_warmup_steps: 1000
+    lr_total_steps: -1
+    lr_min_ratio: 1e-2
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+    n_rollout_closed_val: 16
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    finetune:
+      enabled: true
+      mode: terminal_cost_final_step
+      rollout_steps: 16
+      rollout_noise_scale: 1.0
+      feasible_weight: 1.0
+      smooth_deadzone_epsilon: [0.01, 0.01, 0.01]
+      smooth_deadzone_tau: 0.002
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.01
+  check_val_every_n_epoch: 1
+  max_epochs: 8
+  # A100은 bf16 Tensor Core를 지원 → ~1.5-2x 속도 향상
+  # SDE rollout 내부는 autocast(enabled=False)로 보호되어 fp32 유지
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  train_batch_size: 8
+  val_batch_size: 4
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
+

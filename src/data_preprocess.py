@@ -480,7 +480,14 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
                 file_writer.write(tf_data)
 
 
-def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
+def batch_process9s_transformer(
+    input_dir,
+    output_dir,
+    split,
+    num_workers,
+    num_jobs: int = 1,
+    job_rank: int = 0,
+):
     output_dir = Path(output_dir)
     output_dir_tfrecords_splitted = None
     if split == "validation":
@@ -491,6 +498,17 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
+    if num_jobs < 1:
+        raise ValueError(f"num_jobs should be >= 1, got {num_jobs}")
+    if not (0 <= job_rank < num_jobs):
+        raise ValueError(
+            f"job_rank should satisfy 0 <= job_rank < num_jobs, got job_rank={job_rank}, num_jobs={num_jobs}"
+        )
+    if num_jobs > 1:
+        packages = packages[job_rank::num_jobs]
+        print(
+            f"[split={split}] job {job_rank}/{num_jobs} assigned {len(packages)} shards."
+        )
     func = partial(
         wm2argo,
         split=split,
@@ -514,8 +532,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_jobs", type=int, default=1)
+    parser.add_argument("--job_rank", type=int, default=0)
     args = parser.parse_args()
 
     batch_process9s_transformer(
-        args.input_dir, args.output_dir, args.split, num_workers=args.num_workers
+        args.input_dir,
+        args.output_dir,
+        args.split,
+        num_workers=args.num_workers,
+        num_jobs=args.num_jobs,
+        job_rank=args.job_rank,
     )
