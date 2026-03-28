@@ -97,6 +97,17 @@ def run(cfg: DictConfig) -> None:
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model, _recursive_=False)
 
+    if not getattr(model, "automatic_optimization", True):
+        gradient_clip_val = cfg.trainer.get("gradient_clip_val")
+        if gradient_clip_val is not None and float(gradient_clip_val) > 0.0:
+            model.manual_optimization_gradient_clip_val = float(gradient_clip_val)
+            with open_dict(cfg.trainer):
+                cfg.trainer.gradient_clip_val = 0.0
+            log.warning(
+                "Disabled Trainer gradient clipping for manual optimization and moved "
+                f"the configured value to model-side clipping: {gradient_clip_val}"
+            )
+
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
 

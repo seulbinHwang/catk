@@ -109,6 +109,7 @@ class SMARTFlow(LightningModule):
         )
         self.use_draft_manual_optimization = bool(self.draft_enabled and self.draft_fm_guard_enabled)
         self.automatic_optimization = not self.use_draft_manual_optimization
+        self.manual_optimization_gradient_clip_val: float | None = None
         self.draft_physics_force_fp32 = False
 
         if self.draft_enabled:
@@ -1221,13 +1222,16 @@ class SMARTFlow(LightningModule):
 
         self._assign_manual_gradients(trainable_parameters, final_gradients)
 
-        gradient_clip_val = getattr(self.trainer, "gradient_clip_val", None)
+        gradient_clip_val = self.manual_optimization_gradient_clip_val
+        if gradient_clip_val is None:
+            gradient_clip_val = getattr(self.trainer, "gradient_clip_val", None)
         if gradient_clip_val is not None and float(gradient_clip_val) > 0.0:
-            self.clip_gradients(
-                optimizer,
-                gradient_clip_val=float(gradient_clip_val),
-                gradient_clip_algorithm=getattr(self.trainer, "gradient_clip_algorithm", "norm"),
-            )
+            clip_parameters = [parameter for parameter in trainable_parameters if parameter.grad is not None]
+            clip_algorithm = getattr(self.trainer, "gradient_clip_algorithm", "norm")
+            if clip_algorithm == "value":
+                torch.nn.utils.clip_grad_value_(clip_parameters, clip_value=float(gradient_clip_val))
+            else:
+                torch.nn.utils.clip_grad_norm_(clip_parameters, max_norm=float(gradient_clip_val))
 
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
