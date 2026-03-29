@@ -34,7 +34,7 @@ model:
         ped_heading_weight: 1.0
         num_chunks: 4
         chunk_size: 5
-        inner_steps: 5
+        inner_steps: 10
         inner_step_size: 0.05
         eps: 1.0e-6
 
@@ -55,7 +55,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 48
+  train_batch_size: 96
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
