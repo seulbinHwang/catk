@@ -33,7 +33,7 @@ model:
         slip_weight: 2.0
         accel_weight: 1.0
         yaw_accel_weight: 1.0
-        turn_weight: 0.33
+        turn_weight: 0.5
         eps: 1.0e-6
 
 ckpt_path: null
