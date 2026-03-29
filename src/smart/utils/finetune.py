@@ -27,14 +27,9 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: bool) -> None:
         for p in model.parameters():
             p.requires_grad = False
 
-        try:
-            _unfreeze(model.agent_encoder.flow_decoder.step_refiner)
-            log.info("Unfreezing flow_decoder.step_refiner")
-        except Exception:
-            log.info("No flow_decoder.step_refiner in model.agent_encoder")
-
-        try:
-            _unfreeze(model.agent_encoder.flow_decoder.velocity_head)
-            log.info("Unfreezing flow_decoder.velocity_head")
-        except Exception:
-            log.info("No flow_decoder.velocity_head in model.agent_encoder")
+        flow_decoder = getattr(getattr(model, "agent_encoder", None), "flow_decoder", None)
+        if isinstance(flow_decoder, torch.nn.Module):
+            _unfreeze(flow_decoder)
+            log.info("Unfreezing full agent_encoder.flow_decoder")
+        else:
+            log.info("No flow_decoder in model.agent_encoder")
