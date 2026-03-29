@@ -65,7 +65,6 @@ DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
     "ped_speed_excess_mps",
     "ped_accel_excess_mps2",
     "ped_yaw_rate_excess_degps",
-    "ped_yaw_accel_excess_degps2",
 )
 
 
@@ -116,7 +115,7 @@ class DraftPhysicsRegularizer(nn.Module):
         gt_excess_only: ``True`` 이면 GT보다 더 나쁜 만큼만 loss에 남깁니다.
         track_weight: 추종 항 가중치입니다.
         limit_weight: 이동 limit 항 가중치입니다.
-        ped_heading_weight: 보행자 heading 부드러움 항 가중치입니다.
+        ped_heading_weight: 보행자 heading yaw-rate 항 가중치입니다.
         num_chunks: 2초를 몇 개 knot 구간으로 나눌지 정합니다. 기본값은 ``4`` 입니다.
         chunk_size: 한 knot 구간이 몇 개 10Hz step으로 구성되는지 정합니다. 기본값은 ``5`` 입니다.
         inner_steps: 안쪽 gradient descent 반복 횟수입니다.
@@ -445,8 +444,6 @@ class DraftPhysicsRegularizer(nn.Module):
         heading_objective = self._pedestrian_heading_objective(
             future_norm=future_norm,
             limits=limits,
-            prev_control=prev_control,
-            prev_control_valid=prev_control_valid,
         )
         return {
             "ped_track": motion_objective["track"],
@@ -456,7 +453,6 @@ class DraftPhysicsRegularizer(nn.Module):
             "ped_speed_excess_mps": motion_objective["speed_excess_mps"],
             "ped_accel_excess_mps2": motion_objective["accel_excess_mps2"],
             "ped_yaw_rate_excess_degps": heading_objective["yaw_rate_excess_degps"],
-            "ped_yaw_accel_excess_degps2": heading_objective["yaw_accel_excess_degps2"],
         }
 
     def _solve_inner_knots(
@@ -658,16 +654,12 @@ class DraftPhysicsRegularizer(nn.Module):
         self,
         future_norm: Tensor,
         limits: Dict[str, Tensor],
-        prev_control: Tensor,
-        prev_control_valid: Tensor,
     ) -> Dict[str, Tensor]:
-        """보행자 heading 자체의 부드러움을 계산합니다.
+        """보행자 heading의 회전속도 penalty를 계산합니다.
 
         Args:
             future_norm: 정규화 미래입니다. shape은 ``[n_anchor, 20, 4]`` 입니다.
             limits: anchor별 제한값 사전입니다. 각 값의 shape은 ``[n_anchor]`` 입니다.
-            prev_control: 직전 제어입니다. shape은 ``[n_anchor, 3]`` 입니다.
-            prev_control_valid: 직전 제어 유효 여부입니다. shape은 ``[n_anchor]`` 입니다.
 
         Returns:
             Dict[str, Tensor]: anchor별 heading penalty와 실제 단위 위반량 사전입니다.
@@ -677,37 +669,18 @@ class DraftPhysicsRegularizer(nn.Module):
         heading_seq = torch.cat([heading_zero, heading_local], dim=1)
         omega = self._wrap_angle(heading_seq[:, 1:] - heading_seq[:, :-1]) / self.dt
 
-        prev_omega = torch.cat([prev_control[:, 2:3], omega[:, :-1]], dim=1)
-        yaw_accel_value = (omega - prev_omega).abs() / self.dt
-        delta_enabled = torch.ones_like(omega, dtype=torch.bool)
-        delta_enabled[:, 0] = prev_control_valid
-
         yaw_rate_pen = self._mean_over_time(
             self._normalized_square_penalty(
                 omega.abs(),
                 limits["omega_max_abs_radps"].unsqueeze(-1),
             )
         )
-        yaw_accel_pen = self._masked_mean_over_time(
-            self._normalized_square_penalty(
-                yaw_accel_value,
-                limits["alpha_max_radps2"].unsqueeze(-1),
-            ),
-            enabled=delta_enabled,
-        )
-        heading = yaw_rate_pen + yaw_accel_pen
         return {
-            "heading": heading,
+            "heading": yaw_rate_pen,
             "yaw_rate_excess_degps": self._mean_over_time(
                 torch.rad2deg(
                     torch.relu(omega.abs() - limits["omega_max_abs_radps"].unsqueeze(-1))
                 )
-            ),
-            "yaw_accel_excess_degps2": self._masked_mean_over_time(
-                torch.rad2deg(
-                    torch.relu(yaw_accel_value - limits["alpha_max_radps2"].unsqueeze(-1))
-                ),
-                enabled=delta_enabled,
             ),
         }
 

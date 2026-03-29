@@ -1108,7 +1108,7 @@ open_metric_dict:
         veh_track_mse_norm, veh_speed_excess_mps, veh_yaw_rate_excess_degps,
         veh_accel_excess_mps2, veh_yaw_accel_excess_degps2, veh_lat_accel_excess_mps2,
         veh_radius_shortfall_m, ped_track_mse_norm, ped_speed_excess_mps,
-        ped_accel_excess_mps2, ped_yaw_rate_excess_degps, ped_yaw_accel_excess_degps2
+        ped_accel_excess_mps2, ped_yaw_rate_excess_degps
 
         """
         physics_dict = self._build_zero_draft_metrics(fm_loss)

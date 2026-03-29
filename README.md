@@ -513,7 +513,6 @@ loss와 로그는 아래처럼 보면 됩니다.
   - `raw_feaisble_gap/ped_speed_excess_mps`
   - `raw_feaisble_gap/ped_accel_excess_mps2`
   - `raw_feaisble_gap/ped_yaw_rate_excess_degps`
-  - `raw_feaisble_gap/ped_yaw_accel_excess_degps2`
 - `pred_*` / `gt_*` prefix는 위 실제 단위 metric에 대해 그대로 함께 남습니다.
 
 자주 바꾸는 override 예시는 아래와 같습니다.
@@ -540,7 +539,7 @@ loss와 로그는 아래처럼 보면 됩니다.
 # limit 항을 더 세게
 ... model.model_config.draft.physics.limit_weight=2.0
 
-# 보행자 heading regularizer만 더 세게
+# 보행자 heading yaw-rate regularizer만 더 세게
 ... model.model_config.draft.physics.ped_heading_weight=2.0
 
 # 샘플러 역전파를 마지막 2 step에만 남겨 메모리 사용량 줄이기
