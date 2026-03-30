@@ -76,6 +76,7 @@ class SMARTFlow(LightningModule):
                     feasible_weight=self.finetune_config.feasible_weight,
                     smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
                     smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
+                    flow_reg_lambda=0.0,  # BC loss는 training_step에서 직접 처리
                 )
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
@@ -949,85 +950,42 @@ class SMARTFlow(LightningModule):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
         if self._is_terminal_cost_final_step_enabled():
-            # 0.5/0.5 open-loop vs closed-loop
-            open_loop = (int(batch_idx) % 2 == 0)
-            if open_loop:
-                with torch.no_grad():
-                    map_feature = self.encoder.encode_map(tokenized_map)
-                    _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
-                        map_feature=map_feature,
-                        tokenized_agent=tokenized_agent,
-                        anchor_mask_key="flow_train_mask",
-                    )
-                tc_result = self.terminal_cost_final_step_loss.forward_open_loop(
-                    flow_decoder=self.encoder.agent_encoder.flow_decoder,
-                    flow_ode=self.encoder.agent_encoder.flow_ode,
-                    anchor_hidden_valid=anchor_hidden_valid.detach().to(dtype=torch.float32),
-                    agent_type=tokenized_agent["flow_train_agent_type"],
-                    current_control=tokenized_agent["flow_train_current_control"].to(dtype=torch.float32),
-                    current_control_valid=tokenized_agent["flow_train_current_control_valid"],
-                )
-                self.log(
-                    "train/loss",
-                    tc_result.loss,
-                    on_step=True,
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
-                self.log(
-                    "train/open_terminal_cost",
-                    tc_result.terminal_cost,
-                    on_step=True,
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
-                self.log(
-                    "train/open_projection_gap",
-                    tc_result.projection_gap,
-                    on_step=True,
-                    on_epoch=True,
-                    sync_dist=True,
-                    batch_size=1,
-                )
-                return tc_result.loss
-
             with torch.no_grad():
                 map_feature = self.encoder.encode_map(tokenized_map)
-            tc_result = self.terminal_cost_final_step_loss.forward_closed_loop(
-                agent_decoder=self.encoder.agent_encoder,
+                _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                    map_feature=map_feature,
+                    tokenized_agent=tokenized_agent,
+                    anchor_mask_key="flow_train_mask",
+                )
+            anchor_hidden_fp32 = anchor_hidden_valid.detach().to(dtype=torch.float32)
+            tc_result = self.terminal_cost_final_step_loss.forward_open_loop(
                 flow_decoder=self.encoder.agent_encoder.flow_decoder,
                 flow_ode=self.encoder.agent_encoder.flow_ode,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                sampling_seed=int(batch_idx),
+                anchor_hidden_valid=anchor_hidden_fp32,
+                agent_type=tokenized_agent["flow_train_agent_type"],
+                current_control=tokenized_agent["flow_train_current_control"].to(dtype=torch.float32),
+                current_control_valid=tokenized_agent["flow_train_current_control_valid"],
             )
-            self.log(
-                "train/loss",
-                tc_result.loss,
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            self.log(
-                "train/closed_terminal_cost",
-                tc_result.terminal_cost,
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            self.log(
-                "train/closed_projection_gap",
-                tc_result.projection_gap,
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            return tc_result.loss
+
+            # BC loss: flow matching loss on GT trajectories (pretrained distribution 유지)
+            bc_loss = torch.zeros((), device=anchor_hidden_fp32.device, dtype=torch.float32)
+            if self.finetune_config.flow_reg_lambda > 0.0 and anchor_hidden_fp32.shape[0] > 0:
+                flow_clean_norm = tokenized_agent["flow_train_clean_norm"][tokenized_agent["flow_train_mask"]]
+                if flow_clean_norm.numel() > 0:
+                    flow_ode = self.encoder.agent_encoder.flow_ode
+                    flow_decoder = self.encoder.agent_encoder.flow_decoder
+                    flow_sample = flow_ode.sample(
+                        flow_clean_norm.to(dtype=torch.float32), target_type="velocity"
+                    )
+                    flow_pred = flow_decoder(anchor_hidden_fp32, flow_sample.x_t, flow_sample.tau)
+                    bc_loss = flow_matching_loss(flow_pred, flow_sample.target)
+
+            loss = tc_result.loss + self.finetune_config.flow_reg_lambda * bc_loss
+            self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/terminal_cost", tc_result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/projection_gap", tc_result.projection_gap, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/bc_loss", bc_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            return loss
 
         if self._is_adjoint_matching_enabled():
             am_result = self._run_adjoint_matching_training_step(

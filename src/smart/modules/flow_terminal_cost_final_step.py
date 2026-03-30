@@ -18,6 +18,7 @@ class TerminalCostFinalStepResult:
     terminal_cost: Tensor
     projection_gap: Tensor
     final_count: Tensor
+    flow_reg_loss: Tensor = None
 
 
 class TerminalCostFinalStepLoss(nn.Module):
@@ -33,10 +34,12 @@ class TerminalCostFinalStepLoss(nn.Module):
         feasible_weight: float = 1.0,
         smooth_deadzone_epsilon: Tuple[float, float, float] = (0.01, 0.01, 0.01),
         smooth_deadzone_tau: float = 0.002,
+        flow_reg_lambda: float = 0.0,
     ) -> None:
         super().__init__()
         self.rollout_steps = int(rollout_steps)
         self.rollout_noise_scale = float(rollout_noise_scale)
+        self.flow_reg_lambda = float(flow_reg_lambda)
         self.projector = SmoothControlProjector(
             feasible_weight=feasible_weight,
             smooth_deadzone_epsilon=smooth_deadzone_epsilon,
@@ -130,6 +133,59 @@ class TerminalCostFinalStepLoss(nn.Module):
         self._assert_finite_tensor("final_state", current_state)
         return current_state, times
 
+    def _rollout_ode_last_step_grad(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """결정론적 ODE rollout. 마지막 step에서만 autograd graph를 유지합니다.
+
+        SDE 노이즈 없이 순수 drift로 적분하므로 trajectory가 안정적입니다.
+        gradient는 마지막 step의 forward_components를 통해서만 전파됩니다.
+
+        Returns:
+            Tuple[Tensor, Tensor]:
+                - final_state: [n_anchor, 20, 4]
+                - residual_velocity: 마지막 step의 residual_velocity_head 출력 [n_anchor, 20, 4]
+        """
+        batch_size = int(anchor_hidden_valid.shape[0])
+        device = anchor_hidden_valid.device
+        dtype = anchor_hidden_valid.dtype
+
+        dt = (1.0 - float(flow_ode.eps)) / float(self.rollout_steps)
+        times = self._build_step_times(flow_ode, batch_size, device, dtype)
+
+        x_t = torch.randn(batch_size, 20, 4, device=device, dtype=dtype)
+
+        # DDP unused-parameter 방지: no_grad 대신 state detach로 중간 그래프를 끊습니다.
+        # 매 step에서 forward_components를 autograd 활성 상태로 호출하면,
+        # residual_velocity_head 파라미터가 DDP bucket에 항상 연결됩니다.
+        velocity_dict: dict = {}
+        for step_idx in range(self.rollout_steps):
+            tau = times[step_idx]
+            velocity_dict = flow_decoder.forward_components(
+                anchor_hidden=anchor_hidden_valid,
+                x_t_norm=x_t,
+                tau=tau,
+            )
+            drift = flow_ode.drift_from_velocity(
+                x_t=x_t,
+                velocity=velocity_dict["velocity"],
+                tau=tau,
+            )
+            next_x_t = x_t + dt * drift
+            if step_idx < self.rollout_steps - 1:
+                # 중간 step: state는 detach해 그래프가 다음 step으로 누적되지 않게 합니다.
+                x_t = next_x_t.detach()
+            else:
+                # 마지막 step: gradient graph 유지
+                x_t = next_x_t
+
+        self._assert_finite_tensor("ode_final_state", x_t)
+        return x_t, velocity_dict["residual_velocity"]
+
     def forward_open_loop(
         self,
         *,
@@ -161,13 +217,13 @@ class TerminalCostFinalStepLoss(nn.Module):
         if current_control is not None:
             current_control = current_control.to(dtype=torch.float32, device=anchor_hidden_valid.device)
 
+        final_state, residual_velocity = self._rollout_ode_last_step_grad(
+            flow_decoder=flow_decoder,
+            flow_ode=flow_ode,
+            anchor_hidden_valid=anchor_hidden_valid,
+        )
         terminal_cost, metrics = self.projector.compute_terminal_cost(
-            pred_clean_norm=self._rollout_memoryless_sde_last_step_grad(
-                flow_decoder=flow_decoder,
-                flow_ode=flow_ode,
-                anchor_hidden_valid=anchor_hidden_valid,
-                x_init_norm=None,
-            )[0],
+            pred_clean_norm=final_state,
             agent_type=agent_type,
             current_control=current_control,
             current_control_valid=current_control_valid,
@@ -175,12 +231,16 @@ class TerminalCostFinalStepLoss(nn.Module):
         self._assert_finite_tensor("open_loop/terminal_cost", terminal_cost)
         self._assert_finite_tensor("open_loop/projection_gap", metrics["projection_gap"])
 
-        # loss는 terminal_cost 자체를 minimize합니다. (연속 reward penalty)
+        # flow regularization: residual_velocity → 0 으로 당겨 pretrained 분포 유지
+        flow_reg_loss = self.flow_reg_lambda * residual_velocity.pow(2).mean()
+        loss = terminal_cost + flow_reg_loss
+
         return TerminalCostFinalStepResult(
-            loss=terminal_cost,
+            loss=loss,
             terminal_cost=terminal_cost.detach(),
             projection_gap=metrics["projection_gap"].detach(),
             final_count=torch.tensor(anchor_hidden_valid.shape[0], device=terminal_cost.device),
+            flow_reg_loss=flow_reg_loss.detach(),
         )
 
     @staticmethod

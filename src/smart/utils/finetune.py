@@ -31,6 +31,7 @@ class FinetuneConfig:
     feasible_weight: float = 1.0
     smooth_deadzone_epsilon: tuple[float, float, float] = (0.01, 0.01, 0.01)
     smooth_deadzone_tau: float = 0.002
+    flow_reg_lambda: float = 0.0
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -85,6 +86,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         feasible_weight=float(_read_config_value(finetune, "feasible_weight", 1.0)),
         smooth_deadzone_epsilon=epsilon_tuple,
         smooth_deadzone_tau=float(_read_config_value(finetune, "smooth_deadzone_tau", 0.002)),
+        flow_reg_lambda=float(_read_config_value(finetune, "flow_reg_lambda", 0.0)),
     )
 
 
@@ -137,12 +139,23 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
     if config.mode not in {"adjoint_matching", "terminal_cost_final_step"}:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 
+    # 전체 모델 freeze 후 flow_decoder만 unfreeze
     _set_requires_grad(model, False)
-    if residual_head is None:
+    try:
+        flow_decoder = model.agent_encoder.flow_decoder
+    except AttributeError:
         raise AttributeError(
-            "Finetuning enabled but residual_velocity_head is missing. "
+            "Finetuning enabled but flow_decoder not found. "
             "Use the flow-based model (e.g., SMARTFlow) or fix the model config."
         )
-    _set_requires_grad(residual_head, True)
-    log.info("Finetuning mode: only residual_velocity_head is trainable.")
+    _set_requires_grad(flow_decoder, True)
+
+    # residual_velocity_head는 0으로 초기화 후 freeze (base velocity만 학습)
+    if residual_head is not None:
+        for p in residual_head.parameters():
+            p.data.zero_()
+        _set_requires_grad(residual_head, False)
+        log.info("Finetuning mode: full flow_decoder is trainable, residual_velocity_head zeroed+frozen.")
+    else:
+        log.info("Finetuning mode: full flow_decoder is trainable.")
     return config

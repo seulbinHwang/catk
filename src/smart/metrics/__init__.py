@@ -19,47 +19,171 @@ from src.smart.metrics.next_token_cls import TokenCls
 from src.smart.metrics.wosac_metrics import WOSACMetrics
 from src.smart.metrics.wosac_submission import WOSACSubmission
 
-# NOTE:
-# `SMARTFlow`는 SimAgents 기반 metric/submission 인터페이스를 기대하지만,
-# 현재 코드베이스에는 해당 심볼들이 직접 정의되어 있지 않습니다.
-# 학습/스모크 목적에서는 `is_active=false` 및 `n_vis_batch=0` 환경이 많으므로,
-# 아래 placeholder는 필요한 메서드/속성을 최소 제공하기 위해 포함합니다.
-import torch
+import multiprocessing as mp
+from pathlib import Path
 from typing import Any, Dict, List
+
+import numpy as np
+import torch
+from torch_geometric.utils import degree as _tg_degree
+
+
+def _sim_agents_worker(
+    config_bytes: bytes,
+    scenario_file: str,
+    agent_ids: np.ndarray,
+    pred_traj_np: np.ndarray,
+    pred_z_np: np.ndarray,
+    pred_head_np: np.ndarray,
+) -> float:
+    """Subprocess worker: 모든 TF/proto 연산을 격리된 프로세스에서 실행합니다."""
+    import tensorflow as tf
+    import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as wm
+    from waymo_open_dataset.protos import (
+        scenario_pb2,
+        sim_agents_metrics_pb2,
+        sim_agents_submission_pb2,
+    )
+
+    tf.config.set_visible_devices([], "GPU")
+
+    config = sim_agents_metrics_pb2.SimAgentMetricsConfig()
+    config.ParseFromString(config_bytes)
+
+    scenario = scenario_pb2.Scenario()
+    for tfdata in tf.data.TFRecordDataset([scenario_file], compression_type=""):
+        scenario.ParseFromString(bytes(tfdata.numpy()))
+        break
+
+    n_agents, n_rollout = pred_traj_np.shape[:2]
+    joint_scenes = []
+    for i_rollout in range(n_rollout):
+        simulated_trajectories = []
+        for i_agent in range(n_agents):
+            simulated_trajectories.append(
+                sim_agents_submission_pb2.SimulatedTrajectory(
+                    center_x=pred_traj_np[i_agent, i_rollout, :, 0],
+                    center_y=pred_traj_np[i_agent, i_rollout, :, 1],
+                    center_z=pred_z_np[i_agent, i_rollout],
+                    heading=pred_head_np[i_agent, i_rollout],
+                    object_id=int(agent_ids[i_agent]),
+                )
+            )
+        joint_scenes.append(
+            sim_agents_submission_pb2.JointScene(simulated_trajectories=simulated_trajectories)
+        )
+
+    scenario_rollout = sim_agents_submission_pb2.ScenarioRollouts(
+        joint_scenes=joint_scenes,
+        scenario_id=scenario.scenario_id,
+    )
+    result = wm.compute_scenario_metrics_for_bundle(config, scenario, scenario_rollout)
+    return float(result.metametric)
 
 
 class SimAgentsMetrics:
+    """Waymo Sim Agents 2025 Challenge 기준 realism_meta_metric 계산기.
+
+    TF 연산을 subprocess(forkserver)에서 실행해 PyTorch DDP CUDA context와
+    충돌하지 않도록 격리합니다.
+    """
+
     def __init__(self, prefix: str, max_workers: int = 0) -> None:
         self.prefix = prefix
         self._metric_key = f"{prefix}/sim_agents_2025/realism_meta_metric"
+        self._config_bytes = self._load_config_bytes()
+        self._metametric_sum: float = 0.0
+        self._count: int = 0
+        self._is_mp_init: bool = False
+
+    @staticmethod
+    def _load_config_bytes() -> bytes:
+        from google.protobuf import text_format
+        from waymo_open_dataset.protos import sim_agents_metrics_pb2
+        import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as wm
+
+        config_path = Path(wm.__file__).parent / "challenge_2025_sim_agents_config.textproto"
+        with open(config_path, "r") as f:
+            cfg = sim_agents_metrics_pb2.SimAgentMetricsConfig()
+            text_format.Parse(f.read(), cfg)
+        return cfg.SerializeToString()
+
+    def _ensure_mp_init(self) -> None:
+        if not self._is_mp_init:
+            self._is_mp_init = True
+            try:
+                mp.set_start_method("forkserver", force=True)
+            except RuntimeError:
+                pass  # 이미 설정됨
 
     def update_from_prediction_tensors(
         self,
         *,
         scenario_files: List[str],
-        agent_id: Any,
-        agent_batch: Any,
+        agent_id: torch.Tensor,
+        agent_batch: torch.Tensor,
         pred_traj: torch.Tensor,
         pred_z: torch.Tensor,
         pred_head: torch.Tensor,
     ) -> None:
-        # terminal_cost_final_step 스모크에서는 메트릭 계산이 필수가 아니므로 no-op 처리
-        return None
+        sizes = [int(s) for s in _tg_degree(agent_batch, dtype=torch.long).tolist()]
+        agent_id_list = [t.cpu().numpy() for t in agent_id.cpu().split(sizes)]
+        pred_traj_list = [t.cpu().numpy() for t in pred_traj.cpu().split(sizes)]
+        pred_z_list = [t.cpu().numpy() for t in pred_z.cpu().split(sizes)]
+        pred_head_list = [t.cpu().numpy() for t in pred_head.cpu().split(sizes)]
+
+        n_scenarios = len(scenario_files)
+        args = [
+            (
+                self._config_bytes,
+                scenario_files[i],
+                agent_id_list[i],
+                pred_traj_list[i],
+                pred_z_list[i],
+                pred_head_list[i],
+            )
+            for i in range(n_scenarios)
+        ]
+
+        self._ensure_mp_init()
+        with mp.Pool(processes=max(1, n_scenarios)) as pool:
+            results = pool.starmap(_sim_agents_worker, args)
+            pool.close()
+            pool.join()
+
+        for metametric in results:
+            self._metametric_sum += metametric
+            self._count += 1
 
     def _drain_completed_futures(self, wait: bool = True, drain_all: bool = True) -> None:
         return None
 
     def get_state_tensor(self, device: torch.device) -> torch.Tensor:
-        return torch.zeros((), device=device, dtype=torch.float32)
+        """DDP all_reduce 용으로 [metametric_sum, count] 2-element tensor 반환."""
+        return torch.tensor(
+            [self._metametric_sum, float(self._count)],
+            device=device,
+            dtype=torch.float64,
+        )
 
     def compute_from_state_tensor(self, reduced_metric_state: torch.Tensor) -> Dict[str, Any]:
-        return {self._metric_key: reduced_metric_state.detach().clone()}
+        """all_reduce 이후 [total_sum, total_count]로부터 평균 메트릭 계산."""
+        total_count = reduced_metric_state[1].clamp_min(1.0)
+        value = (reduced_metric_state[0] / total_count).to(torch.float32)
+        return {self._metric_key: value}
 
     def compute(self) -> Dict[str, Any]:
-        return {self._metric_key: torch.tensor(0.0)}
+        if self._count == 0:
+            return {self._metric_key: torch.tensor(0.0)}
+        return {
+            self._metric_key: torch.tensor(
+                self._metametric_sum / self._count, dtype=torch.float32
+            )
+        }
 
     def reset(self) -> None:
-        return None
+        self._metametric_sum = 0.0
+        self._count = 0
 
 
 class SimAgentsSubmission:
