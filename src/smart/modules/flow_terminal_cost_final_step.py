@@ -240,6 +240,57 @@ class TerminalCostFinalStepLoss(nn.Module):
             flow_reg_loss=flow_reg_loss.detach(),
         )
 
+    def _rollout_ode_from_noisy_gt(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+        gt_clean_norm: Tensor,
+    ) -> Tensor:
+        """GT에 noise를 추가한 x_t에서 ODE를 시작합니다.
+
+        flow_ode.sample로 GT → (x_t, tau_start)를 만들고,
+        각 sample마다 dt = (1 - tau_start) / rollout_steps로
+        tau_start → 1까지 OT-ODE를 적분합니다.
+        마지막 step에서만 gradient graph를 유지합니다.
+
+        Args:
+            gt_clean_norm: GT normalized trajectory입니다. shape은 ``[batch, 20, 4]``.
+
+        Returns:
+            Tensor: ODE final state, shape ``[batch, 20, 4]``.
+        """
+        anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
+        gt_clean_norm = gt_clean_norm.to(dtype=torch.float32, device=anchor_hidden_valid.device)
+
+        # GT → x_t 샘플링 (random tau per sample)
+        flow_sample = flow_ode.sample(gt_clean_norm, target_type="velocity")
+        x_t = flow_sample.x_t.detach()       # [batch, 20, 4]
+        tau_start = flow_sample.tau.detach()  # [batch]
+
+        # per-sample dt: (1 - tau_start) / rollout_steps
+        dt = (1.0 - tau_start) / float(self.rollout_steps)  # [batch]
+        dt_view = dt.view(-1, 1, 1)
+
+        velocity_dict: dict = {}
+        for step_idx in range(self.rollout_steps):
+            tau = tau_start + step_idx * dt  # [batch]
+            velocity_dict = flow_decoder.forward_components(
+                anchor_hidden=anchor_hidden_valid,
+                x_t_norm=x_t,
+                tau=tau,
+            )
+            # OT-ODE: x_{t+dt} = x_t + dt * v_θ
+            next_x_t = x_t + dt_view * velocity_dict["velocity"]
+            if step_idx < self.rollout_steps - 1:
+                x_t = next_x_t.detach()
+            else:
+                x_t = next_x_t  # 마지막 step: gradient 유지
+
+        self._assert_finite_tensor("noisy_gt_ode/final_state", x_t)
+        return x_t
+
     def forward_l2(
         self,
         *,
@@ -277,10 +328,11 @@ class TerminalCostFinalStepLoss(nn.Module):
         anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
         gt_clean_norm = gt_clean_norm.to(dtype=torch.float32, device=anchor_hidden_valid.device)
 
-        final_state, _ = self._rollout_ode_last_step_grad(
+        final_state = self._rollout_ode_from_noisy_gt(
             flow_decoder=flow_decoder,
             flow_ode=flow_ode,
             anchor_hidden_valid=anchor_hidden_valid,
+            gt_clean_norm=gt_clean_norm,
         )
         self._assert_finite_tensor("l2/final_state", final_state)
 
