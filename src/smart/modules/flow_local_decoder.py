@@ -384,6 +384,36 @@ class HierarchicalFlowDecoder(nn.Module):
 class ContinuousCommitBridge:
     """Bridge continuous flow output back to SMART coarse rollout state."""
 
+    @staticmethod
+    def _select_token_chunk_local(
+        next_token_idx: torch.Tensor,
+        agent_type: torch.Tensor,
+        token_bank_all_veh: torch.Tensor,
+        token_bank_all_ped: torch.Tensor,
+        token_bank_all_cyc: torch.Tensor,
+    ) -> torch.Tensor:
+        """선택한 token id에 대응하는 0.5초 local contour chunk를 꺼냅니다."""
+        token_chunk_local = token_bank_all_veh.new_zeros((agent_type.shape[0], 6, 4, 2))
+        token_banks = {
+            "veh": token_bank_all_veh,
+            "ped": token_bank_all_ped,
+            "cyc": token_bank_all_cyc,
+        }
+
+        for token_key, mask in build_agent_type_masks(agent_type).items():
+            if not mask.any():
+                continue
+
+            token_bank = token_banks[token_key]
+            if token_bank.dim() != 4:
+                raise ValueError(
+                    "Token chunk restore expects full trajectory token banks with shape "
+                    f"[n_token, 6, 4, 2], got {tuple(token_bank.shape)} for {token_key}."
+                )
+            token_chunk_local[mask] = token_bank[next_token_idx[mask]]
+
+        return token_chunk_local
+
     def commit(
         self,
         y_hat_norm: torch.Tensor,
@@ -503,3 +533,38 @@ class ContinuousCommitBridge:
             next_head[mask] = wrap_angle(current_head[mask] + token_head_local)
 
         return next_pos, next_head
+
+    def restore_token_chunk(
+        self,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        next_token_idx: torch.Tensor,
+        agent_type: torch.Tensor,
+        token_bank_all_veh: torch.Tensor,
+        token_bank_all_ped: torch.Tensor,
+        token_bank_all_cyc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """고른 coarse 토큰의 전체 0.5초 chunk를 전역 중심점과 방향으로 복원합니다."""
+        token_chunk_local = self._select_token_chunk_local(
+            next_token_idx=next_token_idx,
+            agent_type=agent_type,
+            token_bank_all_veh=token_bank_all_veh,
+            token_bank_all_ped=token_bank_all_ped,
+            token_bank_all_cyc=token_bank_all_cyc,
+        )
+        token_center_local = token_chunk_local.mean(dim=2)
+        token_dxy_local = token_chunk_local[:, :, 0] - token_chunk_local[:, :, 3]
+        token_head_local = torch.atan2(token_dxy_local[:, :, 1], token_dxy_local[:, :, 0])
+        token_center_global, token_head_global = transform_to_global(
+            pos_local=token_center_local,
+            head_local=token_head_local,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        token_head_global = wrap_angle(token_head_global)
+
+        commit_pos = token_center_global[:, 1:]
+        commit_head = token_head_global[:, 1:]
+        next_pos = commit_pos[:, -1]
+        next_head = commit_head[:, -1]
+        return commit_pos, commit_head, next_pos, next_head

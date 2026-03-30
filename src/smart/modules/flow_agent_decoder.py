@@ -40,6 +40,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
+        closed_loop_rollout_mode: str = "raw_fm",
     ) -> None:
         super().__init__(
             hidden_dim=hidden_dim,
@@ -72,6 +73,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             solver_steps=flow_solver_steps,
             solver_method=flow_solver_method,
         )
+        if closed_loop_rollout_mode not in {"raw_fm", "matched_token_chunk"}:
+            raise ValueError(
+                "closed_loop_rollout_mode must be one of {'raw_fm', 'matched_token_chunk'}, "
+                f"got {closed_loop_rollout_mode!r}."
+            )
+        self.closed_loop_rollout_mode = closed_loop_rollout_mode
         self.commit_bridge = ContinuousCommitBridge()
 
     def build_interaction_edge(
@@ -829,19 +836,37 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
                     token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
                 )
-                next_pos_tok_act, next_head_tok_act = self.commit_bridge.restore_token_state(
-                    current_pos=current_pos_act,
-                    current_head=current_head_act,
-                    next_token_idx=next_token_idx_act,
-                    agent_type=tokenized_agent["type"][active_mask],
-                    token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
-                    token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
-                    token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
-                )
-                # Keep exported/scored 10 Hz rollout as raw FM output.
-                # The token-restored state is only for internal closed-loop context.
-                commit_traj_step[active_mask] = commit_pos_act
-                commit_head_step[active_mask] = commit_head_act
+                if self.closed_loop_rollout_mode == "matched_token_chunk":
+                    (
+                        commit_pos_export_act,
+                        commit_head_export_act,
+                        next_pos_tok_act,
+                        next_head_tok_act,
+                    ) = self.commit_bridge.restore_token_chunk(
+                        current_pos=current_pos_act,
+                        current_head=current_head_act,
+                        next_token_idx=next_token_idx_act,
+                        agent_type=tokenized_agent["type"][active_mask],
+                        token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                        token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                        token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
+                    )
+                else:
+                    next_pos_tok_act, next_head_tok_act = self.commit_bridge.restore_token_state(
+                        current_pos=current_pos_act,
+                        current_head=current_head_act,
+                        next_token_idx=next_token_idx_act,
+                        agent_type=tokenized_agent["type"][active_mask],
+                        token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                        token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                        token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
+                    )
+                    # Default behavior keeps exported/scored 10 Hz rollout as raw FM output.
+                    # The token-restored state is only for internal closed-loop context.
+                    commit_pos_export_act = commit_pos_act
+                    commit_head_export_act = commit_head_act
+                commit_traj_step[active_mask] = commit_pos_export_act
+                commit_head_step[active_mask] = commit_head_export_act
                 next_pos[active_mask] = next_pos_tok_act
                 next_head[active_mask] = next_head_tok_act
                 next_token_idx[active_mask] = next_token_idx_act

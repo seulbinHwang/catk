@@ -8,7 +8,8 @@
 - `FlowTokenProcessor`가 14-slot context pack과 13개 anchor를 만들어 2초 미래를 연속값으로 supervision 합니다.
 - `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
 - closed-loop inference는 0.5초씩 commit 하며 `pred_traj_10hz`, `pred_head_10hz`, `pred_z_10hz`를 바로 내보내 2025 Sim Agents rollout proto와 바로 연결됩니다.
-- closed-loop inference에서는 외부로 내보내는 `pred_traj_10hz`, `pred_head_10hz`를 raw FM 출력 그대로 유지하고, `retokenize` 뒤에 복원한 coarse state는 다음 문맥 갱신에만 사용합니다.
+- `model.model_config.decoder.closed_loop_rollout_mode=raw_fm` 이 기본값이며, 이때 외부로 내보내는 `pred_traj_10hz`, `pred_head_10hz`는 raw FM 출력 그대로 유지합니다.
+- `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면 `retokenize`로 고른 token의 0.5초 chunk를 실제 rollout 10Hz 출력으로 내보냅니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
@@ -17,7 +18,8 @@
 
 - `retokenize` 직후의 coarse 상태는 반드시 token bank에서 복원한 `next_pos`, `next_head`를 사용합니다.
 - `pos_window`, `head_window`, `coarse_pos/head`, 그리고 다음 step motion feature는 모두 이 token-restored state 기준으로 갱신합니다.
-- 반대로 `pred_traj_10hz`, `pred_head_10hz`는 raw FM 출력 그대로 유지합니다. 따라서 WOSAC metric, submission proto, video visualization은 post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
+- 기본값 `raw_fm` 에서는 `pred_traj_10hz`, `pred_head_10hz`를 raw FM 출력 그대로 유지합니다. 따라서 WOSAC metric, submission proto, video visualization은 post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
+- `matched_token_chunk` 에서는 같은 endpoint-contour 매칭으로 고른 token chunk가 외부 rollout에도 반영되어, 내부 closed-loop context와 외부 평가 trajectory를 더 일치시킵니다.
 
 
 ## 2. 환경 설치
@@ -241,6 +243,7 @@ torchrun ... -m src.run \
 - `model.model_config.val_closed_loop=true/false`로 closed-loop validation on/off를 바꿉니다.
 - validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
 - `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. 현재 `pre_bc_flow` 기본값은 `32`입니다.
+- `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`입니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
@@ -264,6 +267,9 @@ torchrun ... -m src.run \
 
 # val_closed에서 scene당 rollout 64회
 ... model.model_config.n_rollout_closed_val=64
+
+# matched token chunk를 실제 closed-loop rollout/video/score에 사용
+... model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
 # training validation에서 공식 2025 scorer를 앞 20 batch에만 적용
 ... model.model_config.n_batch_sim_agents_metric=20

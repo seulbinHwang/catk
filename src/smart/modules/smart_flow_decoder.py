@@ -35,6 +35,7 @@ class SMARTFlowDecoder(nn.Module):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
+        closed_loop_rollout_mode: str,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -66,6 +67,7 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_steps=flow_solver_steps,
             flow_solver_method=flow_solver_method,
             flow_solver_eps=flow_solver_eps,
+            closed_loop_rollout_mode=closed_loop_rollout_mode,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
