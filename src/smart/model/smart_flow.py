@@ -22,7 +22,8 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_2s,
     yaw_fde_2s,
 )
-from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss
+from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
+from src.smart.modules.flow_projected_generation import ProjectedFlowGenerator
 from src.smart.modules.flow_terminal_cost_final_step import TerminalCostFinalStepLoss
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
@@ -107,6 +108,28 @@ class SMARTFlow(LightningModule):
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.eval_sampling_noise = model_config.eval_sampling_noise
+
+        # Projected Diffusion generation (inference-time feasibility projection)
+        proj_cfg = getattr(model_config, "projected_generation", None)
+        self.projected_generator: ProjectedFlowGenerator | None = None
+        if proj_cfg is not None and getattr(proj_cfg, "enabled", False):
+            _projector = SmoothControlProjector(
+                **model_config.projector,
+            )
+            self.projected_generator = ProjectedFlowGenerator(
+                projector=_projector,
+                n_proj_steps=int(getattr(proj_cfg, "n_proj_steps", 3)),
+                proj_lr=float(getattr(proj_cfg, "proj_lr", 0.01)),
+            )
+            self.val_projected_epoch_metrics = nn.ModuleDict(
+                {
+                    "proj_ADE2s": WeightedMeanMetric(),
+                    "proj_FDE2s": WeightedMeanMetric(),
+                    "proj_yaw_ADE2s": WeightedMeanMetric(),
+                    "proj_yaw_FDE2s": WeightedMeanMetric(),
+                }
+            )
+
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
                 "ADE2s": WeightedMeanMetric(),
@@ -1029,6 +1052,66 @@ class SMARTFlow(LightningModule):
         )
         return loss
 
+    def _projected_generation_val_step(
+        self,
+        tokenized_map: Dict,
+        tokenized_agent: Dict,
+        batch_idx: int,
+    ) -> None:
+        """Projected Diffusion ODE로 open-loop trajectory를 생성하고 ADE/FDE를 기록합니다.
+
+        매 ODE step 후 kinematic feasibility gap에 대해 gradient descent를 수행합니다.
+        """
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+
+        if anchor_hidden_valid.numel() == 0:
+            return
+
+        anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        flow_ode = self.encoder.agent_encoder.flow_ode
+
+        x_init = torch.randn(
+            anchor_hidden_valid.shape[0], 20, 4,
+            device=anchor_hidden_valid.device,
+            dtype=torch.float32,
+        )
+
+        def model_fn(x_t: Tensor, tau: Tensor) -> Tensor:
+            with torch.no_grad():
+                return flow_decoder(anchor_hidden_valid, x_t, tau)
+
+        pred_clean_norm = self.projected_generator.generate(
+            flow_ode=flow_ode,
+            model_fn=model_fn,
+            x_init=x_init,
+            agent_type=tokenized_agent["flow_train_agent_type"],
+            current_control=tokenized_agent.get("flow_train_current_control"),
+            current_control_valid=tokenized_agent.get("flow_train_current_control_valid"),
+            steps=16,
+        )
+
+        target_clean_norm = tokenized_agent["flow_train_clean_norm"].to(
+            device=pred_clean_norm.device, dtype=pred_clean_norm.dtype
+        )
+        proj_metric_dict = self._build_open_loop_metric_dict(
+            pred_clean_norm=pred_clean_norm,
+            target_clean_norm=target_clean_norm,
+        )
+        # key 앞에 proj_ prefix 붙여 저장
+        proj_metric_dict = {f"proj_{k}": v for k, v in proj_metric_dict.items()}
+        self._update_weighted_validation_metrics(
+            metric_store=self.val_projected_epoch_metrics,
+            metric_dict=proj_metric_dict,
+            sample_count=int(target_clean_norm.shape[0]),
+        )
+
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         map_feature = None
@@ -1056,6 +1139,14 @@ class SMARTFlow(LightningModule):
                 metric_store=self.val_open_epoch_metrics,
                 metric_dict=open_metric_dict,
                 sample_count=open_sample_count,
+            )
+
+        # Projected Diffusion open-loop generation (feasibility projection at each ODE step)
+        if self.projected_generator is not None:
+            self._projected_generation_val_step(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                batch_idx=batch_idx,
             )
 
         if self.val_closed_loop:
@@ -1106,6 +1197,14 @@ class SMARTFlow(LightningModule):
                 metric_store=self.val_open_epoch_metrics,
             )
             for metric_name, metric_value in epoch_open_metrics.items():
+                self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
+
+        if self.projected_generator is not None:
+            epoch_proj_metrics = self._compute_and_reset_validation_metrics(
+                prefix="val_projected",
+                metric_store=self.val_projected_epoch_metrics,
+            )
+            for metric_name, metric_value in epoch_proj_metrics.items():
                 self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
 
         if self.val_closed_loop:

@@ -18,6 +18,10 @@ model:
     n_vis_batch: 1
     n_vis_scenario: 2
     n_vis_rollout: 4
+    projected_generation:
+      enabled: false   # true로 바꾸면 validation 시 projected ODE generation 활성화
+      n_proj_steps: 3  # 매 ODE step 후 feasibility grad descent 반복 횟수
+      proj_lr: 0.01    # gradient descent step size
     finetune:
       enabled: true
       mode: terminal_cost_final_step

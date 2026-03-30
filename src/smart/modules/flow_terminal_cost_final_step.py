@@ -328,11 +328,10 @@ class TerminalCostFinalStepLoss(nn.Module):
         anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
         gt_clean_norm = gt_clean_norm.to(dtype=torch.float32, device=anchor_hidden_valid.device)
 
-        final_state = self._rollout_ode_from_noisy_gt(
+        final_state, _ = self._rollout_ode_last_step_grad(
             flow_decoder=flow_decoder,
             flow_ode=flow_ode,
             anchor_hidden_valid=anchor_hidden_valid,
-            gt_clean_norm=gt_clean_norm,
         )
         self._assert_finite_tensor("l2/final_state", final_state)
 
