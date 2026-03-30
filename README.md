@@ -6,6 +6,8 @@
 
 - 기존 SMART의 map/context trunk를 그대로 재사용하고, agent 쪽만 flow decoder로 바꿔 scene-context 품질을 유지합니다.
 - `FlowTokenProcessor`가 14-slot context pack과 13개 anchor를 만들어 2초 미래를 연속값으로 supervision 합니다.
+- agent history는 discrete motion vocab 대신 **0.5초 구간당 local 5점**으로 표현합니다. 
+- 각 slot은 `0.1 / 0.2 / 0.3 / 0.4 / 0.5초` 중심점으로 구성됩니다.
 - `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
 - closed-loop inference는 0.5초씩 commit 하며 `pred_traj_10hz`, `pred_head_10hz`, `pred_z_10hz`를 바로 내보내 2025 Sim Agents rollout proto와 바로 연결됩니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm` 이 기본값이며, 이때 외부로 내보내는 `pred_traj_10hz`, `pred_head_10hz`는 raw FM 출력 그대로 유지합니다.
@@ -14,12 +16,19 @@
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
-### Closed-loop Retokenize Rule
+### Continuous 5-point Closed-loop Context
 
-- `retokenize` 직후의 coarse 상태는 반드시 token bank에서 복원한 `next_pos`, `next_head`를 사용합니다.
-- `pos_window`, `head_window`, `coarse_pos/head`, 그리고 다음 step motion feature는 모두 이 token-restored state 기준으로 갱신합니다.
-- 기본값 `raw_fm` 에서는 `pred_traj_10hz`, `pred_head_10hz`를 raw FM 출력 그대로 유지합니다. 따라서 WOSAC metric, submission proto, video visualization은 post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
-- `matched_token_chunk` 에서는 같은 endpoint-contour 매칭으로 고른 token chunk가 외부 rollout에도 반영되어, 내부 closed-loop context와 외부 평가 trajectory를 더 일치시킵니다.
+- 내부 closed-loop 문맥은 더 이상 `retokenize`나 token-restored coarse state를 쓰지 않습니다.
+- 각 coarse slot은 구간 시작 시점 기준 local 좌표의 5개 점으로 유지됩니다.
+- slot 끝 위치는 `0.5초` 점을 그대로 씁니다.
+- slot 끝 방향은 **기본적으로 0.5초 전체 변위 방향**으로 계산합니다. 
+- 다만 전체 변위가 너무 작을 때만 마지막 `0.4 -> 0.5초` 꼬리를 보고, 그것도 작으면 이전 방향을 유지합니다.
+- 이 규칙은 순간 노이즈보다 closed-loop 안정성을 더 우선합니다. 
+- 그래서 WOSAC에서 영향이 큰 collision / offroad 누적 악화를 줄이는 쪽에 맞췄습니다.
+- 외부로 내보내는 `pred_traj_10hz`, `pred_head_10hz`, `pred_z_10hz`도 
+- 내부 문맥과 같은 raw continuous rollout을 기준으로 유지합니다.
+- 기존 `closed_loop_rollout_mode=matched_token_chunk` 값은 config 호환성만 유지하며, 
+- 연속 5-point 문맥에서는 실제 동작이 `raw_fm`과 같습니다.
 
 
 ## 2. 환경 설치

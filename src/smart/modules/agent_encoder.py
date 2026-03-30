@@ -1,7 +1,7 @@
 # Not a contribution
-# Changes made by NVIDIA CORPORATION & AFFILIATES enabling <CAT-K> or otherwise documented as
-# NVIDIA-proprietary are not a contribution and subject to the following terms and conditions:
-# SPDX-FileCopyrightText: Copyright (c) <year> NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Changes made by NVIDIA CORPORATION & AFFILIATES enabling
+# or otherwise documented as NVIDIA-proprietary are not a contribution and subject to the following terms and conditions:
+# SPDX-FileCopyrightText: Copyright (c)  NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 #
 # NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
@@ -21,6 +21,10 @@ from torch_geometric.utils import dense_to_sparse, subgraph
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
+from src.smart.modules.continuous_motion_history import (
+    build_motion_curve_token_features,
+    build_motion_scalar_features,
+)
 from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
 
 
@@ -63,7 +67,6 @@ class SMARTAgentEncoder(nn.Module):
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
-
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
             hidden_dim=hidden_dim,
@@ -84,6 +87,8 @@ class SMARTAgentEncoder(nn.Module):
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
+
+        # 기존 checkpoint와의 연결성을 최대한 유지하기 위해 type별 MLP branch를 그대로 재사용합니다.
         self.token_emb_veh = MLPEmbedding(input_dim=input_dim_token, hidden_dim=hidden_dim)
         self.token_emb_ped = MLPEmbedding(input_dim=input_dim_token, hidden_dim=hidden_dim)
         self.token_emb_cyc = MLPEmbedding(input_dim=input_dim_token, hidden_dim=hidden_dim)
@@ -145,66 +150,76 @@ class SMARTAgentEncoder(nn.Module):
         agent_shape,
         inference=False,
     ):
-        n_agent, n_step, traj_dim = pos_a.shape
-        device = pos_a.device
+        """Discrete motion token 대신 0.5초 5점 구간 표현으로 agent embedding을 만듭니다.
+
+        ``agent_token_index`` 는 이제 정수 토큰 id가 아니라 local 5개 점을 담은 텐서일 수
+        있습니다. 하위 코드 호환성을 위해 인자 이름은 그대로 유지합니다.
+        """
+        del trajectory_token_veh, trajectory_token_ped, trajectory_token_cyc, pos_a, head_vector_a
+
+        motion_points_local = agent_token_index
+        if motion_points_local.ndim != 4 or motion_points_local.size(-2) != 5 or motion_points_local.size(-1) != 2:
+            raise ValueError(
+                "agent_token_index must carry local 5-point motion segments with shape "
+                f"[n_agent, n_step, 5, 2], got {tuple(motion_points_local.shape)}"
+            )
+
+        n_agent, n_step, _, _ = motion_points_local.shape
+        device = motion_points_local.device
 
         veh_mask = agent_type == 0
         ped_mask = agent_type == 1
         cyc_mask = agent_type == 2
 
-        agent_token_emb_veh = self.token_emb_veh(trajectory_token_veh)
-        agent_token_emb_ped = self.token_emb_ped(trajectory_token_ped)
-        agent_token_emb_cyc = self.token_emb_cyc(trajectory_token_cyc)
-        agent_token_emb = torch.zeros(
-            (n_agent, n_step, self.hidden_dim),
-            device=device,
-            dtype=agent_token_emb_veh.dtype,
-        )
-        agent_token_emb[veh_mask] = agent_token_emb_veh[agent_token_index[veh_mask]]
-        agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]
-        agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]]
+        motion_points_flat = motion_points_local.reshape(n_agent * n_step, 5, 2)
+        curve_feature = build_motion_curve_token_features(motion_points_flat)
+        scalar_feature = build_motion_scalar_features(motion_points_flat)
 
-        motion_vector_a = torch.cat(
-            [
-                pos_a.new_zeros(agent_token_index.shape[0], 1, traj_dim),
-                pos_a[:, 1:] - pos_a[:, :-1],
-            ],
-            dim=1,
+        flat_agent_type = agent_type.unsqueeze(1).expand(-1, n_step).reshape(-1)
+        flat_veh_mask = flat_agent_type == 0
+        flat_ped_mask = flat_agent_type == 1
+        flat_cyc_mask = flat_agent_type == 2
+
+        agent_token_emb_flat = torch.zeros(
+            (n_agent * n_step, self.hidden_dim),
+            device=device,
+            dtype=curve_feature.dtype,
         )
-        feature_a = torch.stack(
-            [
-                torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_a,
-                    nbr_vector=motion_vector_a[:, :, :2],
-                ),
-            ],
-            dim=-1,
-        )
+        if flat_veh_mask.any():
+            agent_token_emb_flat[flat_veh_mask] = self.token_emb_veh(curve_feature[flat_veh_mask])
+        if flat_ped_mask.any():
+            agent_token_emb_flat[flat_ped_mask] = self.token_emb_ped(curve_feature[flat_ped_mask])
+        if flat_cyc_mask.any():
+            agent_token_emb_flat[flat_cyc_mask] = self.token_emb_cyc(curve_feature[flat_cyc_mask])
+        agent_token_emb = agent_token_emb_flat.view(n_agent, n_step, self.hidden_dim)
+
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
             self.shape_emb(agent_shape),
         ]
-
         x_a = self.x_a_emb(
-            continuous_inputs=feature_a.view(-1, feature_a.size(-1)),
+            continuous_inputs=scalar_feature,
             categorical_embs=[
                 emb.repeat_interleave(repeats=n_step, dim=0)
                 for emb in categorical_embs
             ],
         )
-        x_a = x_a.view(-1, n_step, self.hidden_dim)
+        x_a = x_a.view(n_agent, n_step, self.hidden_dim)
 
         feat_a = torch.cat((agent_token_emb, x_a), dim=-1)
         feat_a = self.fusion_emb(feat_a)
-
         if inference:
+            dummy_bank = torch.zeros(
+                (1, self.hidden_dim),
+                device=device,
+                dtype=agent_token_emb.dtype,
+            )
             return (
                 feat_a,
                 agent_token_emb,
-                agent_token_emb_veh,
-                agent_token_emb_ped,
-                agent_token_emb_cyc,
+                dummy_bank,
+                dummy_bank.clone(),
+                dummy_bank.clone(),
                 veh_mask,
                 ped_mask,
                 cyc_mask,
@@ -223,18 +238,15 @@ class SMARTAgentEncoder(nn.Module):
         pos_t = pos_a.flatten(0, 1)
         head_t = head_a.flatten(0, 1)
         head_vector_t = head_vector_a.flatten(0, 1)
-
         if self.hist_drop_prob > 0 and self.training:
             mask_keep = torch.bernoulli(
                 torch.ones_like(mask) * (1 - self.hist_drop_prob)
             ).bool()
             mask = mask & mask_keep
-
         if inference_mask is not None:
             mask_t = mask.unsqueeze(2) & inference_mask.unsqueeze(1)
         else:
             mask_t = mask.unsqueeze(2) & mask.unsqueeze(1)
-
         edge_index_t = dense_to_sparse(mask_t)[0]
         edge_index_t = edge_index_t[:, edge_index_t[1] > edge_index_t[0]]
         edge_index_t = edge_index_t[
