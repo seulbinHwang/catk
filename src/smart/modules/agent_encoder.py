@@ -180,17 +180,24 @@ class SMARTAgentEncoder(nn.Module):
         flat_ped_mask = flat_agent_type == 1
         flat_cyc_mask = flat_agent_type == 2
 
-        agent_token_emb_flat = torch.zeros(
-            (n_agent * n_step, self.hidden_dim),
-            device=device,
-            dtype=curve_feature.dtype,
-        )
+        agent_token_emb_flat = None
         if flat_veh_mask.any():
-            agent_token_emb_flat[flat_veh_mask] = self.token_emb_veh(curve_feature[flat_veh_mask])
+            veh_emb = self.token_emb_veh(curve_feature[flat_veh_mask])
+            if agent_token_emb_flat is None:
+                agent_token_emb_flat = veh_emb.new_zeros((n_agent * n_step, self.hidden_dim))
+            agent_token_emb_flat[flat_veh_mask] = veh_emb
         if flat_ped_mask.any():
-            agent_token_emb_flat[flat_ped_mask] = self.token_emb_ped(curve_feature[flat_ped_mask])
+            ped_emb = self.token_emb_ped(curve_feature[flat_ped_mask])
+            if agent_token_emb_flat is None:
+                agent_token_emb_flat = ped_emb.new_zeros((n_agent * n_step, self.hidden_dim))
+            agent_token_emb_flat[flat_ped_mask] = ped_emb
         if flat_cyc_mask.any():
-            agent_token_emb_flat[flat_cyc_mask] = self.token_emb_cyc(curve_feature[flat_cyc_mask])
+            cyc_emb = self.token_emb_cyc(curve_feature[flat_cyc_mask])
+            if agent_token_emb_flat is None:
+                agent_token_emb_flat = cyc_emb.new_zeros((n_agent * n_step, self.hidden_dim))
+            agent_token_emb_flat[flat_cyc_mask] = cyc_emb
+        if agent_token_emb_flat is None:
+            agent_token_emb_flat = curve_feature.new_zeros((n_agent * n_step, self.hidden_dim))
         agent_token_emb = agent_token_emb_flat.view(n_agent, n_step, self.hidden_dim)
 
         categorical_embs = [
