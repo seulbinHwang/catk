@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from src.smart.modules.flow_adjoint_matching import SmoothControlProjector
@@ -237,6 +238,60 @@ class TerminalCostFinalStepLoss(nn.Module):
             projection_gap=metrics["projection_gap"].detach(),
             final_count=torch.tensor(anchor_hidden_valid.shape[0], device=terminal_cost.device),
             flow_reg_loss=flow_reg_loss.detach(),
+        )
+
+    def forward_l2(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+        gt_clean_norm: Tensor,
+    ) -> TerminalCostFinalStepResult:
+        """GT trajectory와의 L2 거리를 loss로 사용합니다.
+
+        OT-ODE rollout으로 생성한 final state와 GT normalized trajectory 사이의
+        MSE를 최소화합니다. gradient는 마지막 step에서만 흐릅니다.
+
+        Args:
+            flow_decoder: flow decoder 모듈입니다.
+            flow_ode: ODE/flow 모듈입니다.
+            anchor_hidden_valid: GT history로 인코딩된 anchor 컨텍스트입니다.
+                shape은 ``[n_valid, hidden_dim]`` 입니다.
+            gt_clean_norm: normalized GT future trajectory입니다.
+                shape은 ``[n_valid, 20, 4]`` 입니다.
+        """
+        if anchor_hidden_valid.numel() == 0:
+            zero = self._zero_loss_with_trainable_dependency(
+                flow_decoder=flow_decoder,
+                device=anchor_hidden_valid.device,
+                dtype=torch.float32,
+            )
+            return TerminalCostFinalStepResult(
+                loss=zero,
+                terminal_cost=zero.detach(),
+                projection_gap=zero.detach(),
+                final_count=zero.detach(),
+            )
+
+        anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
+        gt_clean_norm = gt_clean_norm.to(dtype=torch.float32, device=anchor_hidden_valid.device)
+
+        final_state, _ = self._rollout_ode_last_step_grad(
+            flow_decoder=flow_decoder,
+            flow_ode=flow_ode,
+            anchor_hidden_valid=anchor_hidden_valid,
+        )
+        self._assert_finite_tensor("l2/final_state", final_state)
+
+        loss = F.mse_loss(final_state, gt_clean_norm)
+        return TerminalCostFinalStepResult(
+            loss=loss,
+            terminal_cost=loss.detach(),
+            projection_gap=torch.zeros((), device=loss.device),
+            final_count=torch.tensor(
+                anchor_hidden_valid.shape[0], device=loss.device, dtype=torch.float32
+            ),
         )
 
     @staticmethod
