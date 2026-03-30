@@ -159,9 +159,9 @@ class TerminalCostFinalStepLoss(nn.Module):
 
         x_t = torch.randn(batch_size, 20, 4, device=device, dtype=dtype)
 
-        # DDP unused-parameter 방지: no_grad 대신 state detach로 중간 그래프를 끊습니다.
-        # 매 step에서 forward_components를 autograd 활성 상태로 호출하면,
-        # residual_velocity_head 파라미터가 DDP bucket에 항상 연결됩니다.
+        # OT flow ODE: dx = v_θ(x_t, tau) * dt
+        # drift_from_velocity (SDE-equivalent)를 쓰지 않고 velocity를 직접 적분합니다.
+        # DDP unused-parameter 방지: 매 step에서 autograd 활성 상태로 forward합니다.
         velocity_dict: dict = {}
         for step_idx in range(self.rollout_steps):
             tau = times[step_idx]
@@ -170,14 +170,10 @@ class TerminalCostFinalStepLoss(nn.Module):
                 x_t_norm=x_t,
                 tau=tau,
             )
-            drift = flow_ode.drift_from_velocity(
-                x_t=x_t,
-                velocity=velocity_dict["velocity"],
-                tau=tau,
-            )
-            next_x_t = x_t + dt * drift
+            # OT flow ODE: x_{t+dt} = x_t + dt * v_θ
+            next_x_t = x_t + dt * velocity_dict["velocity"]
             if step_idx < self.rollout_steps - 1:
-                # 중간 step: state는 detach해 그래프가 다음 step으로 누적되지 않게 합니다.
+                # 중간 step: state는 detach해 그래프가 누적되지 않게 합니다.
                 x_t = next_x_t.detach()
             else:
                 # 마지막 step: gradient graph 유지

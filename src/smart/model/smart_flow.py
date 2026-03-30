@@ -970,7 +970,7 @@ class SMARTFlow(LightningModule):
             # BC loss: flow matching loss on GT trajectories (pretrained distribution 유지)
             bc_loss = torch.zeros((), device=anchor_hidden_fp32.device, dtype=torch.float32)
             if self.finetune_config.flow_reg_lambda > 0.0 and anchor_hidden_fp32.shape[0] > 0:
-                flow_clean_norm = tokenized_agent["flow_train_clean_norm"][tokenized_agent["flow_train_mask"]]
+                flow_clean_norm = tokenized_agent["flow_train_clean_norm"]  # 이미 valid anchor만 포함
                 if flow_clean_norm.numel() > 0:
                     flow_ode = self.encoder.agent_encoder.flow_ode
                     flow_decoder = self.encoder.agent_encoder.flow_decoder
