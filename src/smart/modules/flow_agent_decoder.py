@@ -21,6 +21,48 @@ from src.smart.modules.flow_local_decoder import (
 from src.smart.utils import angle_between_2d_vectors, wrap_angle
 
 
+def build_observed_rollout_context_from_raw(
+    pos_raw: torch.Tensor,
+    head_raw: torch.Tensor,
+    valid_raw: torch.Tensor,
+    observed_history_steps: int,
+    shift: int,
+    max_context_steps: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Closed-loop rollout 시작 문맥을 관측된 history 범위 안에서만 만듭니다.
+
+    Official closed-loop validation에서는 첫 ``num_historical_steps`` 구간만 관측됩니다.
+    따라서 초기 문맥은 그 안에서 만들 수 있는 complete 0.5초 segment 수만큼만
+    사용하고, rollout이 진행되면서 window를 ``max_context_steps`` 까지 키웁니다.
+    """
+    observed_history_steps = int(
+        min(
+            observed_history_steps,
+            pos_raw.shape[1],
+            head_raw.shape[1],
+            valid_raw.shape[1],
+        )
+    )
+    available_context_steps = min(
+        max_context_steps,
+        max(0, (observed_history_steps - 1) // shift),
+    )
+    if available_context_steps < 1:
+        raise ValueError(
+            "closed-loop rollout needs at least one full observed coarse segment: "
+            f"need at least {shift + 1} observed 10Hz steps, got {observed_history_steps}"
+        )
+
+    observed_raw_steps = available_context_steps * shift + 1
+    return build_context_from_raw(
+        pos_raw=pos_raw[:, :observed_raw_steps].clone(),
+        head_raw=head_raw[:, :observed_raw_steps].clone(),
+        valid_raw=valid_raw[:, :observed_raw_steps].clone(),
+        shift=shift,
+        num_context_steps=available_context_steps,
+    )
+
+
 class SMARTFlowAgentDecoder(SMARTAgentEncoder):
     def __init__(
         self,
@@ -502,15 +544,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         n_agent = tokenized_agent["valid_mask"].shape[0]
         n_step_future_10hz = self.num_future_steps
         n_step_future_2hz = n_step_future_10hz // self.shift
-        step_current_10hz = self.num_historical_steps - 1
-        max_context_steps = 14
+        max_context_steps = int(tokenized_agent["ctx_motion_local"].shape[1]) if "ctx_motion_local" in tokenized_agent else 14
 
-        motion_local_window, pos_window, head_window, valid_window = build_context_from_raw(
-            pos_raw=tokenized_agent["gt_pos_raw"][:, : step_current_10hz + 1].clone(),
-            head_raw=tokenized_agent["gt_head_raw"][:, : step_current_10hz + 1].clone(),
-            valid_raw=tokenized_agent["gt_valid_raw"][:, : step_current_10hz + 1].clone(),
+        motion_local_window, pos_window, head_window, valid_window = build_observed_rollout_context_from_raw(
+            pos_raw=tokenized_agent["gt_pos_raw"],
+            head_raw=tokenized_agent["gt_head_raw"],
+            valid_raw=tokenized_agent["gt_valid_raw"],
+            observed_history_steps=self.num_historical_steps,
             shift=self.shift,
-            num_context_steps=max_context_steps,
+            max_context_steps=max_context_steps,
         )
         head_vector_window = torch.stack([head_window.cos(), head_window.sin()], dim=-1)
         pred_idx_window = torch.zeros(
