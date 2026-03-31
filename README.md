@@ -216,7 +216,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_pretrain_h1006
+  task_name=flow_continuous_pretrain_h1006
 ```
 
 ### 5.1 학습 설정을 거칠게 이해하는 법
@@ -233,7 +233,7 @@ torchrun \
 torchrun ... -m src.run \
   experiment=pre_bc_flow \
   trainer=ddp \
-  task_name=flow_pretrain_h1006
+  task_name=flow_continuous_pretrain_h1006
 ```
 
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
@@ -335,7 +335,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_pretrain_h1006 \
+  task_name=flow_continuous_pretrain_h1006 \
   ckpt_path=/path/to/previous_run/checkpoints/last.ckpt
 ```
 
@@ -367,7 +367,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_pretrain_h1006 \
+  task_name=flow_continuous_pretrain_h1006 \
   model.model_config.n_vis_batch=1 \
   model.model_config.n_vis_scenario=2 \
   model.model_config.n_vis_rollout=2 \
@@ -938,7 +938,7 @@ python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT"
 ### 6x H100 학습
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_pretrain_h1006
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_continuous_pretrain_h1006
 ```
 
 ### validation 평가
