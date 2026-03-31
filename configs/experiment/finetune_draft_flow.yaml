@@ -24,7 +24,7 @@ model:
         sample_steps: 16
         sample_method: midpoint
         noise_scale: 1.0
-        backprop_last_k: 4
+        backprop_last_k: 8
       physics:
         force_fp32: true
         dt: 0.1
