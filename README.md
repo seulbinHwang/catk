@@ -455,12 +455,34 @@ torchrun \
 - 시작한 fine-tuning run이 중단됐으면 그 다음부터는 위 `5.4 중단된 학습 재개하기` 
 - 방식대로 `action=fit` + fine-tuning run의 `last.ckpt` 또는 `epoch_last.ckpt`를 쓰면 됩니다.
 
-fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
+fine-tuning에서 실제로 trainable인 모듈은 기본적으로 아래와 같습니다.
 
-- 기본적으로 encoder 전체를 먼저 freeze합니다.
-- 그 다음 `agent_encoder.flow_decoder.step_refiner`만 unfreeze합니다.
-- 추가로 `agent_encoder.flow_decoder.velocity_head`만 unfreeze합니다.
-- 즉 fine-tuning에서는 map encoder, agent embedding, attention layers는 그대로 frozen 상태를 유지합니다.
+- `model.model_config.finetune.enabled=true`면 encoder 전체를 먼저 freeze합니다.
+- 기본값 `model.model_config.finetune.train_full_flow_decoder_only=false`에서는 
+- `agent_encoder.flow_decoder.step_refiner`와 `agent_encoder.flow_decoder.velocity_head`만 
+- unfreeze합니다.
+- 즉 기본 fine-tuning에서는 map encoder, agent embedding, attention layers, 
+- 그리고 flow decoder의 앞단 block들은 frozen 상태를 유지합니다.
+
+필요하면 `HierarchicalFlowDecoder` 전체만 학습하도록 바꿀 수 있습니다.
+
+- `model.model_config.finetune.train_full_flow_decoder_only=true`를 주면 
+- `agent_encoder.flow_decoder` 전체를 unfreeze합니다.
+- 이 경우에도 나머지 모듈은 계속 frozen 상태입니다. 
+- 즉 `map_encoder`, agent token/context encoder, attention trunk는 학습하지 않고 
+- `HierarchicalFlowDecoder`만 학습합니다.
+
+예시:
+
+```bash
+# 기본 fine-tuning: step_refiner + velocity_head만 학습
+... model.model_config.finetune.enabled=true \
+    model.model_config.finetune.train_full_flow_decoder_only=false
+
+# HierarchicalFlowDecoder 전체만 학습
+... model.model_config.finetune.enabled=true \
+    model.model_config.finetune.train_full_flow_decoder_only=true
+```
 
 `finetune_draft_flow` 기본 설정은 아래와 같습니다.
 

@@ -11,7 +11,9 @@ model:
     n_rollout_closed_val: 16
     val_open_loop: true
     val_closed_loop: true
-    finetune: true
+    finetune:
+      enabled: true
+      train_full_flow_decoder_only: true
     draft:
       enabled: true
       start_epoch: 0

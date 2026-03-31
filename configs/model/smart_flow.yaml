@@ -81,4 +81,6 @@ model_config:
     description: Flow-based generative model for simulating realistic agents.
     method_link: "not available yet"
     account_name: "h.sb@naverlabs.com"
-  finetune: false
+  finetune:
+    enabled: false
+    train_full_flow_decoder_only: false
