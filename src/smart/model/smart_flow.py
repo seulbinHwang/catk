@@ -70,14 +70,17 @@ class SMARTFlow(LightningModule):
                     smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
                     smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
                 )
-            elif self.finetune_config.mode == "terminal_cost_final_step":
+            elif self.finetune_config.mode in {
+                "terminal_cost_final_step",
+                "terminal_cost_full_grad",
+            }:
                 self.terminal_cost_final_step_loss = TerminalCostFinalStepLoss(
                     rollout_steps=self.finetune_config.rollout_steps,
                     rollout_noise_scale=self.finetune_config.rollout_noise_scale,
                     feasible_weight=self.finetune_config.feasible_weight,
                     smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
                     smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
-                    flow_reg_lambda=0.0,  # BC loss는 training_step에서 직접 처리
+                    flow_reg_lambda=self.finetune_config.flow_reg_lambda,
                 )
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
@@ -114,7 +117,9 @@ class SMARTFlow(LightningModule):
         self.projected_generator: ProjectedFlowGenerator | None = None
         if proj_cfg is not None and getattr(proj_cfg, "enabled", False):
             _projector = SmoothControlProjector(
-                **model_config.projector,
+                feasible_weight=self.finetune_config.feasible_weight,
+                smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
+                smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
             )
             self.projected_generator = ProjectedFlowGenerator(
                 projector=_projector,
@@ -983,14 +988,30 @@ class SMARTFlow(LightningModule):
             anchor_hidden_fp32 = anchor_hidden_valid.detach().to(dtype=torch.float32)
             gt_clean_norm = tokenized_agent["flow_train_clean_norm"].to(dtype=torch.float32)
 
-            result = self.terminal_cost_final_step_loss.forward_l2(
-                flow_decoder=self.encoder.agent_encoder.flow_decoder,
-                flow_ode=self.encoder.agent_encoder.flow_ode,
-                anchor_hidden_valid=anchor_hidden_fp32,
-                gt_clean_norm=gt_clean_norm,
-            )
-            self.log("train/loss", result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/l2_loss", result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            if self.finetune_config.mode == "terminal_cost_full_grad":
+                result = self.terminal_cost_final_step_loss.forward_feasibility_with_bc(
+                    flow_decoder=self.encoder.agent_encoder.flow_decoder,
+                    flow_ode=self.encoder.agent_encoder.flow_ode,
+                    anchor_hidden_valid=anchor_hidden_fp32,
+                    gt_clean_norm=gt_clean_norm,
+                    agent_type=tokenized_agent["flow_train_agent_type"],
+                    current_control=tokenized_agent["flow_train_current_control"].to(dtype=torch.float32),
+                    current_control_valid=tokenized_agent["flow_train_current_control_valid"],
+                )
+                self.log("train/loss", result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("train/feasibility_cost", result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("train/projection_gap", result.projection_gap, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                if result.flow_reg_loss is not None:
+                    self.log("train/bc_loss", result.flow_reg_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            else:
+                result = self.terminal_cost_final_step_loss.forward_l2(
+                    flow_decoder=self.encoder.agent_encoder.flow_decoder,
+                    flow_ode=self.encoder.agent_encoder.flow_ode,
+                    anchor_hidden_valid=anchor_hidden_fp32,
+                    gt_clean_norm=gt_clean_norm,
+                )
+                self.log("train/loss", result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("train/l2_loss", result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             return result.loss
 
         if self._is_adjoint_matching_enabled():
@@ -1062,12 +1083,28 @@ class SMARTFlow(LightningModule):
 
         매 ODE step 후 kinematic feasibility gap에 대해 gradient descent를 수행합니다.
         """
+        # train/val에 따라 mask key 결정 (train: flow_train_*, val: flow_eval_*)
+        if "flow_eval_mask" in tokenized_agent:
+            anchor_mask_key = "flow_eval_mask"
+            clean_norm_key = "flow_eval_clean_norm"
+            agent_type_key = "flow_eval_agent_type"
+            ctrl_key = "flow_eval_current_control"
+            ctrl_valid_key = "flow_eval_current_control_valid"
+        elif "flow_train_mask" in tokenized_agent:
+            anchor_mask_key = "flow_train_mask"
+            clean_norm_key = "flow_train_clean_norm"
+            agent_type_key = "flow_train_agent_type"
+            ctrl_key = "flow_train_current_control"
+            ctrl_valid_key = "flow_train_current_control_valid"
+        else:
+            return
+
         with torch.no_grad():
             map_feature = self.encoder.encode_map(tokenized_map)
             _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
                 map_feature=map_feature,
                 tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
+                anchor_mask_key=anchor_mask_key,
             )
 
         if anchor_hidden_valid.numel() == 0:
@@ -1091,13 +1128,13 @@ class SMARTFlow(LightningModule):
             flow_ode=flow_ode,
             model_fn=model_fn,
             x_init=x_init,
-            agent_type=tokenized_agent["flow_train_agent_type"],
-            current_control=tokenized_agent.get("flow_train_current_control"),
-            current_control_valid=tokenized_agent.get("flow_train_current_control_valid"),
+            agent_type=tokenized_agent[agent_type_key],
+            current_control=tokenized_agent.get(ctrl_key),
+            current_control_valid=tokenized_agent.get(ctrl_valid_key),
             steps=16,
         )
 
-        target_clean_norm = tokenized_agent["flow_train_clean_norm"].to(
+        target_clean_norm = tokenized_agent[clean_norm_key].to(
             device=pred_clean_norm.device, dtype=pred_clean_norm.dtype
         )
         proj_metric_dict = self._build_open_loop_metric_dict(

@@ -291,6 +291,200 @@ class TerminalCostFinalStepLoss(nn.Module):
         self._assert_finite_tensor("noisy_gt_ode/final_state", x_t)
         return x_t
 
+    def _rollout_ode_full_grad(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+        noise: Tensor,
+    ) -> Tensor:
+        """전체 rollout_steps에 걸쳐 gradient가 흐르는 OT-ODE rollout입니다.
+
+        모든 step에서 state를 detach하지 않으므로 BPTT로 모든 step의
+        velocity 파라미터에 gradient가 전달됩니다.
+
+        Args:
+            flow_decoder: flow decoder 모듈입니다.
+            flow_ode: ODE/flow 모듈입니다.
+            anchor_hidden_valid: GT history 컨텍스트입니다. shape ``[n, hidden_dim]``.
+            noise: 시작 noise입니다. shape ``[n, 20, 4]``.
+
+        Returns:
+            Tensor: 최종 ODE state. shape ``[n, 20, 4]``.
+        """
+        batch_size = int(anchor_hidden_valid.shape[0])
+        device = anchor_hidden_valid.device
+        dtype = anchor_hidden_valid.dtype
+
+        dt = (1.0 - float(flow_ode.eps)) / float(self.rollout_steps)
+        times = self._build_step_times(flow_ode, batch_size, device, dtype)
+
+        x_t = noise.to(device=device, dtype=dtype)
+        for step_idx in range(self.rollout_steps):
+            tau = times[step_idx]
+            velocity_dict = flow_decoder.forward_components(
+                anchor_hidden=anchor_hidden_valid,
+                x_t_norm=x_t,
+                tau=tau,
+            )
+            # OT-ODE: x_{t+dt} = x_t + dt * v_θ  (NO detach — full BPTT)
+            x_t = x_t + dt * velocity_dict["velocity"]
+
+        self._assert_finite_tensor("full_grad_ode/final_state", x_t)
+        return x_t
+
+    def _bc_loss_flowmatching(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+        gt_clean_norm: Tensor,
+    ) -> Tensor:
+        """Flow Matching BC loss를 계산합니다.
+
+        표준 OT-Flow Matching 목적함수입니다::
+
+            L_BC = E_{t, x0, x1}[ ||v_θ(x_t, t) - (x1 - x0)||² ]
+
+        여기서 x0 ~ N(0,I), x1 = GT, x_t = (1-t)*x0 + t*x1 입니다.
+
+        Args:
+            flow_decoder: flow decoder 모듈입니다.
+            flow_ode: ODE/flow 모듈입니다.
+            anchor_hidden_valid: shape ``[n, hidden_dim]``.
+            gt_clean_norm: GT normalized trajectory. shape ``[n, 20, 4]``.
+
+        Returns:
+            Tensor: scalar BC loss.
+        """
+        device = gt_clean_norm.device
+        dtype = gt_clean_norm.dtype
+        n = gt_clean_norm.shape[0]
+
+        t0 = float(flow_ode.eps)
+        t = t0 + (1.0 - t0) * torch.rand(1, device=device, dtype=dtype)  # scalar
+        tau = t.expand(n)  # [n]
+
+        x0 = torch.randn_like(gt_clean_norm)  # independent noise for BC
+        x_t = (1.0 - t) * x0 + t * gt_clean_norm  # OT interpolation
+
+        velocity_dict = flow_decoder.forward_components(
+            anchor_hidden=anchor_hidden_valid,
+            x_t_norm=x_t,
+            tau=tau,
+        )
+        v_pred = velocity_dict["velocity"]
+        v_target = (gt_clean_norm - x0).detach()  # conditional vector field
+
+        return F.mse_loss(v_pred, v_target)
+
+    def forward_feasibility_with_bc(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+        gt_clean_norm: Tensor,
+        agent_type: Tensor,
+        current_control: Optional[Tensor] = None,
+        current_control_valid: Optional[Tensor] = None,
+    ) -> "TerminalCostFinalStepResult":
+        """Feasibility loss + BC (Flow Matching) 정규화를 결합한 open-loop fine-tuning입니다.
+
+        전체 rollout_steps에 걸쳐 gradient가 흐르도록 BPTT를 사용하며,
+        추가 head 없이 flow_decoder 파라미터에 직접 gradient를 전달합니다.
+
+        loss = feasibility_cost + flow_reg_lambda * bc_loss
+
+        Args:
+            flow_decoder: flow decoder 모듈입니다.
+            flow_ode: ODE/flow 모듈입니다.
+            anchor_hidden_valid: shape ``[n_valid, hidden_dim]``.
+            gt_clean_norm: GT normalized trajectory. shape ``[n_valid, 20, 4]``.
+            agent_type: shape ``[n_valid]``.
+            current_control: shape ``[n_valid, 3]`` 또는 None.
+            current_control_valid: shape ``[n_valid]`` 또는 None.
+
+        Returns:
+            TerminalCostFinalStepResult: loss와 logging용 스칼라들입니다.
+        """
+        if anchor_hidden_valid.numel() == 0:
+            zero = self._zero_loss_with_trainable_dependency(
+                flow_decoder=flow_decoder,
+                device=anchor_hidden_valid.device,
+                dtype=torch.float32,
+            )
+            return TerminalCostFinalStepResult(
+                loss=zero,
+                terminal_cost=zero.detach(),
+                projection_gap=zero.detach(),
+                final_count=zero.detach(),
+            )
+
+        anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
+        gt_clean_norm = gt_clean_norm.to(dtype=torch.float32, device=anchor_hidden_valid.device)
+        if current_control is not None:
+            current_control = current_control.to(
+                dtype=torch.float32, device=anchor_hidden_valid.device
+            )
+
+        # 1. Pure noise (scale 적용)
+        noise = (
+            torch.randn(
+                anchor_hidden_valid.shape[0], 20, 4,
+                device=anchor_hidden_valid.device,
+                dtype=torch.float32,
+            )
+            * self.rollout_noise_scale
+        )
+
+        # 2. 전체 step BPTT OT-ODE rollout
+        final_state = self._rollout_ode_full_grad(
+            flow_decoder=flow_decoder,
+            flow_ode=flow_ode,
+            anchor_hidden_valid=anchor_hidden_valid,
+            noise=noise,
+        )
+
+        # 3. Feasibility loss
+        terminal_cost, metrics = self.projector.compute_terminal_cost(
+            pred_clean_norm=final_state,
+            agent_type=agent_type,
+            current_control=current_control,
+            current_control_valid=current_control_valid,
+        )
+        self._assert_finite_tensor("feasibility_bc/terminal_cost", terminal_cost)
+
+        # 4. BC loss (Flow Matching) — flow_reg_lambda=0이면 스킵
+        if self.flow_reg_lambda > 0.0:
+            bc_loss = self._bc_loss_flowmatching(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden_valid,
+                gt_clean_norm=gt_clean_norm,
+            )
+            self._assert_finite_tensor("feasibility_bc/bc_loss", bc_loss)
+            flow_reg_loss = self.flow_reg_lambda * bc_loss
+        else:
+            bc_loss = torch.zeros((), device=terminal_cost.device, dtype=torch.float32)
+            flow_reg_loss = bc_loss
+
+        total_loss = terminal_cost + flow_reg_loss
+
+        return TerminalCostFinalStepResult(
+            loss=total_loss,
+            terminal_cost=terminal_cost.detach(),
+            projection_gap=metrics["projection_gap"].detach(),
+            final_count=torch.tensor(
+                anchor_hidden_valid.shape[0],
+                device=total_loss.device,
+                dtype=torch.float32,
+            ),
+            flow_reg_loss=bc_loss.detach(),
+        )
+
     def forward_l2(
         self,
         *,
