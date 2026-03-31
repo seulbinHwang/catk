@@ -5,21 +5,24 @@
 현재 closed-loop local 평가와 제출 export는 **WOSAC 2025 / Waymo 2025 Sim Agents 기준**만 사용합니다.
 
 - 기존 SMART의 map/context trunk를 그대로 재사용하고, agent 쪽만 flow decoder로 바꿔 scene-context 품질을 유지합니다.
-- `FlowTokenProcessor`가 14-slot context pack과 13개 anchor를 만들어 2초 미래를 연속값으로 supervision 합니다.
+- `FlowTokenProcessor`는 14-slot context pack과 13개 anchor를 만들되, 
+- **context 위치/방향과 flow target 원점은 token-restored 상태가 아니라 실제 coarse 상태**를 사용합니다.
+- agent coarse token id는 **마지막 점 1개가 아니라 0.5초 전체 6개 점 사각형 경로**를 기준으로 매칭합니다.
+- `trajectory_token_veh/ped/cyc` 임베딩은 마지막 contour 1개 대신 **`agent_token_all_*` 전체 chunk(6 x 4 x 2)** 를 그대로 펼쳐 사용합니다.
 - `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
 - closed-loop inference는 0.5초씩 commit 하며 `pred_traj_10hz`, `pred_head_10hz`, `pred_z_10hz`를 바로 내보내 2025 Sim Agents rollout proto와 바로 연결됩니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm` 이 기본값이며, 이때 외부로 내보내는 `pred_traj_10hz`, `pred_head_10hz`는 raw FM 출력 그대로 유지합니다.
-- `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면 `retokenize`로 고른 token의 0.5초 chunk를 실제 rollout 10Hz 출력으로 내보냅니다.
+- `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면 `retokenize`로 고른 token의 0.5초 chunk를 **외부 rollout 10Hz 출력에만** 반영합니다. 내부 closed-loop context는 계속 실제 FM commit 상태를 유지합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
 ### Closed-loop Retokenize Rule
 
-- `retokenize` 직후의 coarse 상태는 반드시 token bank에서 복원한 `next_pos`, `next_head`를 사용합니다.
-- `pos_window`, `head_window`, `coarse_pos/head`, 그리고 다음 step motion feature는 모두 이 token-restored state 기준으로 갱신합니다.
+- `retokenize` 자체는 **현재 실제 coarse 상태 + 이번 0.5초 raw FM commit 5점**을 합친 6개 점 경로를 기준으로 다음 token id를 다시 고릅니다.
+- `pos_window`, `head_window`, `coarse_pos/head`, 그리고 다음 step motion feature는 모두 **token bank 복원값이 아니라 실제 FM commit의 마지막 상태** 기준으로 갱신합니다.
 - 기본값 `raw_fm` 에서는 `pred_traj_10hz`, `pred_head_10hz`를 raw FM 출력 그대로 유지합니다. 따라서 WOSAC metric, submission proto, video visualization은 post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
-- `matched_token_chunk` 에서는 같은 endpoint-contour 매칭으로 고른 token chunk가 외부 rollout에도 반영되어, 내부 closed-loop context와 외부 평가 trajectory를 더 일치시킵니다.
+- `matched_token_chunk` 에서는 같은 6점 경로 매칭으로 고른 token chunk가 외부 rollout에도 반영됩니다. 다만 내부 closed-loop context는 계속 실제 상태를 유지합니다.
 
 
 ## 2. 환경 설치
@@ -216,7 +219,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_semi_continuous_pretrain_h1006
+  task_name=flow_pretrain_h1006
 ```
 
 ### 5.1 학습 설정을 거칠게 이해하는 법
@@ -233,7 +236,7 @@ torchrun \
 torchrun ... -m src.run \
   experiment=pre_bc_flow \
   trainer=ddp \
-  task_name=flow_semi_continuous_pretrain_h1006
+  task_name=flow_pretrain_h1006
 ```
 
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
@@ -243,7 +246,7 @@ torchrun ... -m src.run \
 - `model.model_config.val_closed_loop=true/false`로 closed-loop validation on/off를 바꿉니다.
 - validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
 - `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. 현재 `pre_bc_flow` 기본값은 `32`입니다.
-- `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`입니다.
+- `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
@@ -268,7 +271,7 @@ torchrun ... -m src.run \
 # val_closed에서 scene당 rollout 64회
 ... model.model_config.n_rollout_closed_val=64
 
-# matched token chunk를 실제 closed-loop rollout/video/score에 사용
+# matched token chunk를 실제 closed-loop rollout/video/score 출력에만 사용
 ... model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
 # training validation에서 공식 2025 scorer를 앞 20 batch에만 적용
@@ -335,7 +338,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_semi_continuous_pretrain_h1006 \
+  task_name=flow_pretrain_h1006 \
   ckpt_path=/path/to/previous_run/checkpoints/last.ckpt
 ```
 
@@ -367,7 +370,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_semi_continuous_pretrain_h1006 \
+  task_name=flow_pretrain_h1006 \
   model.model_config.n_vis_batch=1 \
   model.model_config.n_vis_scenario=2 \
   model.model_config.n_vis_rollout=2 \
@@ -455,34 +458,12 @@ torchrun \
 - 시작한 fine-tuning run이 중단됐으면 그 다음부터는 위 `5.4 중단된 학습 재개하기` 
 - 방식대로 `action=fit` + fine-tuning run의 `last.ckpt` 또는 `epoch_last.ckpt`를 쓰면 됩니다.
 
-fine-tuning에서 실제로 trainable인 모듈은 기본적으로 아래와 같습니다.
+fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 
-- `model.model_config.finetune.enabled=true`면 encoder 전체를 먼저 freeze합니다.
-- 기본값 `model.model_config.finetune.train_full_flow_decoder_only=false`에서는 
-- `agent_encoder.flow_decoder.step_refiner`와 `agent_encoder.flow_decoder.velocity_head`만 
-- unfreeze합니다.
-- 즉 기본 fine-tuning에서는 map encoder, agent embedding, attention layers, 
-- 그리고 flow decoder의 앞단 block들은 frozen 상태를 유지합니다.
-
-필요하면 `HierarchicalFlowDecoder` 전체만 학습하도록 바꿀 수 있습니다.
-
-- `model.model_config.finetune.train_full_flow_decoder_only=true`를 주면 
-- `agent_encoder.flow_decoder` 전체를 unfreeze합니다.
-- 이 경우에도 나머지 모듈은 계속 frozen 상태입니다. 
-- 즉 `map_encoder`, agent token/context encoder, attention trunk는 학습하지 않고 
-- `HierarchicalFlowDecoder`만 학습합니다.
-
-예시:
-
-```bash
-# 기본 fine-tuning: step_refiner + velocity_head만 학습
-... model.model_config.finetune.enabled=true \
-    model.model_config.finetune.train_full_flow_decoder_only=false
-
-# HierarchicalFlowDecoder 전체만 학습
-... model.model_config.finetune.enabled=true \
-    model.model_config.finetune.train_full_flow_decoder_only=true
-```
+- 기본적으로 encoder 전체를 먼저 freeze합니다.
+- 그 다음 `agent_encoder.flow_decoder.step_refiner`만 unfreeze합니다.
+- 추가로 `agent_encoder.flow_decoder.velocity_head`만 unfreeze합니다.
+- 즉 fine-tuning에서는 map encoder, agent embedding, attention layers는 그대로 frozen 상태를 유지합니다.
 
 `finetune_draft_flow` 기본 설정은 아래와 같습니다.
 
@@ -938,7 +919,7 @@ python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT"
 ### 6x H100 학습
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_semi_continuous_pretrain_h1006
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_pretrain_h1006
 ```
 
 ### validation 평가

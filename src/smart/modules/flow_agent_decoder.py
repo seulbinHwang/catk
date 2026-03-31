@@ -820,7 +820,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 )
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
-                commit_pos_act, commit_head_act, _, _ = self.commit_bridge.commit(
+                (
+                    commit_pos_act,
+                    commit_head_act,
+                    next_pos_act,
+                    next_head_act,
+                ) = self.commit_bridge.commit(
                     y_hat_norm=y_hat_norm,
                     current_pos=current_pos_act,
                     current_head=current_head_act,
@@ -840,8 +845,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     (
                         commit_pos_export_act,
                         commit_head_export_act,
-                        next_pos_tok_act,
-                        next_head_tok_act,
+                        _,
+                        _,
                     ) = self.commit_bridge.restore_token_chunk(
                         current_pos=current_pos_act,
                         current_head=current_head_act,
@@ -852,23 +857,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
                     )
                 else:
-                    next_pos_tok_act, next_head_tok_act = self.commit_bridge.restore_token_state(
-                        current_pos=current_pos_act,
-                        current_head=current_head_act,
-                        next_token_idx=next_token_idx_act,
-                        agent_type=tokenized_agent["type"][active_mask],
-                        token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
-                        token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
-                        token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
-                    )
                     # Default behavior keeps exported/scored 10 Hz rollout as raw FM output.
-                    # The token-restored state is only for internal closed-loop context.
+                    # Regardless of export mode, the next closed-loop context keeps the real FM commit state.
                     commit_pos_export_act = commit_pos_act
                     commit_head_export_act = commit_head_act
                 commit_traj_step[active_mask] = commit_pos_export_act
                 commit_head_step[active_mask] = commit_head_export_act
-                next_pos[active_mask] = next_pos_tok_act
-                next_head[active_mask] = next_head_tok_act
+                next_pos[active_mask] = next_pos_act
+                next_head[active_mask] = next_head_act
                 next_token_idx[active_mask] = next_token_idx_act
 
             pred_traj_10hz[:, t * 5 : (t + 1) * 5] = commit_traj_step

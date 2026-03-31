@@ -97,8 +97,8 @@ class FlowTokenProcessor(TokenProcessor):
                 if not train_anchor_mask.any():
                     continue
 
-                current_pos = tokenized_agent["sampled_pos"][:, anchor_offset + 1]
-                current_head = tokenized_agent["sampled_heading"][:, anchor_offset + 1]
+                current_pos = pos[:, raw_step]
+                current_head = heading[:, raw_step]
                 flow_train_chunks.append(
                     self._build_anchor_clean_norm(
                         pos=pos,
@@ -174,8 +174,8 @@ class FlowTokenProcessor(TokenProcessor):
                 self._build_anchor_clean_norm(
                     pos=pos,
                     heading=heading,
-                    current_pos=tokenized_agent["sampled_pos"][:, anchor_offset + 1],
-                    current_head=tokenized_agent["sampled_heading"][:, anchor_offset + 1],
+                    current_pos=pos[:, raw_step],
+                    current_head=heading[:, raw_step],
                     anchor_mask=anchor_mask,
                     raw_step=raw_step,
                 )

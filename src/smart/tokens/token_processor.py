@@ -169,7 +169,7 @@ class TokenProcessor(torch.nn.Module):
         for k in ["veh", "ped", "cyc"]:
             tokenized_agent[f"trajectory_token_{k}"] = getattr(
                 self, f"agent_token_all_{k}"
-            )[:, -1].flatten(1, 2)
+            ).flatten(1, 3)
             tokenized_agent[f"token_bank_all_{k}"] = getattr(self, f"agent_token_all_{k}")
 
         if not self.training:
@@ -207,7 +207,7 @@ class TokenProcessor(torch.nn.Module):
         agent_type: Tensor,  # [n_agent]
         agent_shape: Tensor,  # [n_agent, 2]
     ) -> Dict[str, Tensor]:
-        """에이전트별 큰 토큰 묶음을 만들지 않고 마지막 토큰만 바로 찾습니다.
+        """6개 점 경로 전체를 기준으로 토큰 번호를 찾고 실제 coarse 상태를 보존합니다.
 
         Args:
             valid: 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
@@ -218,11 +218,11 @@ class TokenProcessor(torch.nn.Module):
 
         Returns:
             Dict[str, Tensor]:
-                coarse 간격 기준의 정답 토큰과 샘플 토큰을 담은 사전입니다.
+                coarse 간격 기준의 정답 토큰과 샘플 토큰, 그리고 실제 coarse 상태를 담은 사전입니다.
                 모든 항목의 첫 차원은 ``n_agent`` 이고 두 번째 차원은 ``n_step_token`` 입니다.
         """
         num_k = self.agent_token_sampling.num_k if self.training else 1
-        n_agent, n_step = valid.shape
+        _, n_step = valid.shape
 
         prev_pos = pos[:, 0].clone()  # [n_agent, 2]
         prev_head = heading[:, 0].clone()  # [n_agent]
@@ -240,16 +240,16 @@ class TokenProcessor(torch.nn.Module):
         }
 
         for i in range(self.shift, n_step, self.shift):
-            valid_mask = valid[:, i - self.shift] & valid[:, i]
-            invalid_mask = ~valid_mask
-            out_dict["valid_mask"].append(valid_mask)
+            segment_valid_mask = valid[:, i - self.shift : i + 1].all(dim=1)
+            invalid_mask = ~segment_valid_mask
+            out_dict["valid_mask"].append(segment_valid_mask)
 
-            gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
-            gt_contour_local, _ = transform_to_local(
-                pos_global=gt_contour,
-                head_global=None,
-                pos_now=prev_pos,
-                head_now=prev_head,
+            gt_contour_local = self._build_local_contour_sequence(
+                pos_seq=pos[:, i - self.shift : i + 1],
+                heading_seq=heading[:, i - self.shift : i + 1],
+                ref_pos=prev_pos,
+                ref_head=prev_head,
+                agent_shape=agent_shape,
             )
             token_idx_gt = self._match_token_idx_from_local_contour(
                 agent_type=agent_type,
@@ -257,18 +257,10 @@ class TokenProcessor(torch.nn.Module):
                 reduction="sum",
                 num_k=1,
                 sample_topk=False,
-            )
-            token_pos_gt, token_head_gt = self._token_pose_from_index(
-                agent_type=agent_type,
-                token_idx=token_idx_gt,
-                ref_pos=prev_pos,
-                ref_head=prev_head,
-            )
+            ).masked_fill(invalid_mask, 0)
 
             prev_head = heading[:, i].clone()
-            prev_head[valid_mask] = token_head_gt[valid_mask]
             prev_pos = pos[:, i].clone()
-            prev_pos[valid_mask] = token_pos_gt[valid_mask]
 
             out_dict["gt_idx"].append(token_idx_gt)
             out_dict["gt_pos"].append(prev_pos.masked_fill(invalid_mask.unsqueeze(1), 0.0))
@@ -278,32 +270,27 @@ class TokenProcessor(torch.nn.Module):
                 out_dict["sampled_idx"].append(out_dict["gt_idx"][-1])
                 out_dict["sampled_pos"].append(out_dict["gt_pos"][-1])
                 out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
+                prev_pos_sample = pos[:, i].clone()
+                prev_head_sample = heading[:, i].clone()
                 continue
 
-            gt_contour_local_sample, _ = transform_to_local(
-                pos_global=gt_contour,
-                head_global=None,
-                pos_now=prev_pos_sample,
-                head_now=prev_head_sample,
+            sampled_contour_local = self._build_local_contour_sequence(
+                pos_seq=pos[:, i - self.shift : i + 1],
+                heading_seq=heading[:, i - self.shift : i + 1],
+                ref_pos=prev_pos_sample,
+                ref_head=prev_head_sample,
+                agent_shape=agent_shape,
             )
             token_idx_sample = self._match_token_idx_from_local_contour(
                 agent_type=agent_type,
-                contour_local=gt_contour_local_sample,
+                contour_local=sampled_contour_local,
                 reduction="mean",
                 num_k=num_k,
                 sample_topk=True,
-            )
-            token_pos_sample, token_head_sample = self._token_pose_from_index(
-                agent_type=agent_type,
-                token_idx=token_idx_sample,
-                ref_pos=prev_pos_sample,
-                ref_head=prev_head_sample,
-            )
+            ).masked_fill(invalid_mask, 0)
 
             prev_head_sample = heading[:, i].clone()
-            prev_head_sample[valid_mask] = token_head_sample[valid_mask]
             prev_pos_sample = pos[:, i].clone()
-            prev_pos_sample[valid_mask] = token_pos_sample[valid_mask]
 
             out_dict["sampled_idx"].append(token_idx_sample)
             out_dict["sampled_pos"].append(
@@ -351,6 +338,46 @@ class TokenProcessor(torch.nn.Module):
         agent_shape[agent_type_masks["cyc"]] = agent_shape.new_tensor([1.0, 2.0])
         return agent_shape
 
+
+    def _build_local_contour_sequence(
+        self,
+        pos_seq: Tensor,
+        heading_seq: Tensor,
+        ref_pos: Tensor,
+        ref_head: Tensor,
+        agent_shape: Tensor,
+    ) -> Tensor:
+        """현재 coarse 시작 상태를 기준으로 경로 전체 사각형을 local 좌표로 만듭니다.
+
+        Args:
+            pos_seq: 이번 coarse 구간의 중심점 시퀀스입니다.
+                shape은 ``[n_agent, n_seq, 2]`` 입니다.
+            heading_seq: 이번 coarse 구간의 진행 방향 시퀀스입니다.
+                shape은 ``[n_agent, n_seq]`` 입니다.
+            ref_pos: local 좌표의 원점으로 쓸 실제 중심점입니다.
+                shape은 ``[n_agent, 2]`` 입니다.
+            ref_head: local 좌표의 원점으로 쓸 실제 방향입니다.
+                shape은 ``[n_agent]`` 입니다.
+            agent_shape: 토큰화에 쓰는 고정 가로, 세로 크기입니다.
+                shape은 ``[n_agent, 2]`` 입니다.
+
+        Returns:
+            Tensor:
+                local 좌표의 사각형 경로입니다. shape은 ``[n_agent, n_seq, 4, 2]`` 입니다.
+        """
+        contour_global = cal_polygon_contour(
+            pos=pos_seq,
+            head=heading_seq,
+            width_length=agent_shape.unsqueeze(1),
+        )
+        contour_local_flat, _ = transform_to_local(
+            pos_global=contour_global.flatten(1, 2),
+            head_global=None,
+            pos_now=ref_pos,
+            head_now=ref_head,
+        )
+        return contour_local_flat.view(pos_seq.shape[0], pos_seq.shape[1], 4, 2)
+
     def _match_token_idx_from_local_contour(
         self,
         agent_type: Tensor,
@@ -363,8 +390,9 @@ class TokenProcessor(torch.nn.Module):
 
         Args:
             agent_type: 차종 번호입니다. shape은 ``[n_agent]`` 입니다.
-            contour_local: 현재 기준 좌표로 옮긴 사각형 점들입니다.
-                shape은 ``[n_agent, 4, 2]`` 입니다.
+            contour_local: 현재 기준 좌표로 옮긴 사각형 경로입니다.
+                기본 shape은 ``[n_agent, 6, 4, 2]`` 이고, 호환을 위해
+                ``[n_agent, 4, 2]`` 도 받을 수 있습니다.
             reduction: 점별 거리를 ``sum`` 또는 ``mean`` 으로 줄이는 방법입니다.
             num_k: 샘플 후보 개수입니다.
             sample_topk: True면 top-k 안에서 하나를 뽑고, False면 가장 가까운 하나만 고릅니다.

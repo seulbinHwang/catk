@@ -438,6 +438,47 @@ class ContinuousCommitBridge:
         next_head = commit_head[:, -1]
         return commit_pos, commit_head, next_pos, next_head
 
+
+    def _build_local_commit_contour_chunk(
+        self,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        commit_pos: torch.Tensor,
+        commit_head: torch.Tensor,
+        token_agent_shape: torch.Tensor,
+    ) -> torch.Tensor:
+        """현재 coarse 상태를 원점으로 한 6개 점 local 사각형 경로를 만듭니다.
+
+        Args:
+            current_pos: 현재 coarse 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 coarse 방향입니다. shape은 ``[n_agent]`` 입니다.
+            commit_pos: 이번 0.5초 구간의 10Hz 중심점 예측입니다.
+                shape은 ``[n_agent, 5, 2]`` 입니다.
+            commit_head: 이번 0.5초 구간의 10Hz 방향 예측입니다.
+                shape은 ``[n_agent, 5]`` 입니다.
+            token_agent_shape: 토큰 매칭에 쓸 고정 박스 크기입니다.
+                shape은 ``[n_agent, 2]`` 입니다.
+
+        Returns:
+            torch.Tensor:
+                현재 상태를 포함한 local 사각형 경로입니다.
+                shape은 ``[n_agent, 6, 4, 2]`` 입니다.
+        """
+        pos_seq = torch.cat([current_pos.unsqueeze(1), commit_pos], dim=1)
+        head_seq = torch.cat([current_head.unsqueeze(1), commit_head], dim=1)
+        contour_global = cal_polygon_contour(
+            pos=pos_seq,
+            head=head_seq,
+            width_length=token_agent_shape.unsqueeze(1),
+        )
+        contour_local_flat, _ = transform_to_local(
+            pos_global=contour_global.flatten(1, 2),
+            head_global=None,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        return contour_local_flat.view(pos_seq.shape[0], pos_seq.shape[1], 4, 2)
+
     def retokenize(
         self,
         current_pos: torch.Tensor,
@@ -450,7 +491,7 @@ class ContinuousCommitBridge:
         token_bank_all_ped: torch.Tensor,
         token_bank_all_cyc: torch.Tensor,
     ) -> torch.Tensor:
-        """학습과 같은 기준으로 다음 coarse 토큰 번호를 다시 고릅니다.
+        """학습과 같은 6개 점 경로 기준으로 다음 coarse 토큰 번호를 다시 고릅니다.
 
         Args:
             current_pos: 현재 coarse 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
@@ -473,20 +514,16 @@ class ContinuousCommitBridge:
             torch.Tensor:
                 다음 coarse 상태에 붙일 토큰 번호입니다. shape은 ``[n_agent]`` 입니다.
         """
-        next_contour = cal_polygon_contour(
-            commit_pos[:, -1],
-            commit_head[:, -1],
-            token_agent_shape,
-        )
-        next_contour_local, _ = transform_to_local(
-            pos_global=next_contour,
-            head_global=None,
-            pos_now=current_pos,
-            head_now=current_head,
+        contour_chunk_local = self._build_local_commit_contour_chunk(
+            current_pos=current_pos,
+            current_head=current_head,
+            commit_pos=commit_pos,
+            commit_head=commit_head,
+            token_agent_shape=token_agent_shape,
         )
         return match_token_idx_from_local_contour(
             agent_type=agent_type,
-            contour_local=next_contour_local,
+            contour_local=contour_chunk_local,
             token_bank_all_veh=token_bank_all_veh,
             token_bank_all_ped=token_bank_all_ped,
             token_bank_all_cyc=token_bank_all_cyc,
