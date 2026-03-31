@@ -12,8 +12,9 @@ from lightning import Callback, LightningModule, Trainer
 class WandbRuntimeMetricsCallback(Callback):
     """Logs the worst peak CUDA reserved-memory percentage during training."""
 
-    def __init__(self, log_every_n_steps: int = 20) -> None:
+    def __init__(self, log_every_n_steps: int = 20, sync_across_ranks: bool = False) -> None:
         self.log_every_n_steps = max(1, log_every_n_steps)
+        self.sync_across_ranks = sync_across_ranks
         self._epoch_values: List[float] = []
         self._accumulated_runtime_sec = 0.0
         self._fit_start_time: float | None = None
@@ -30,9 +31,9 @@ class WandbRuntimeMetricsCallback(Callback):
         return device
 
     @staticmethod
-    def _reduce_max(value: float, device: torch.device) -> float:
+    def _reduce_max(value: float, device: torch.device, sync_across_ranks: bool) -> float:
         reduced = torch.tensor(value, device=device, dtype=torch.float32)
-        if dist.is_available() and dist.is_initialized():
+        if sync_across_ranks and dist.is_available() and dist.is_initialized():
             dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
         return float(reduced.item())
 
@@ -149,36 +150,48 @@ class WandbRuntimeMetricsCallback(Callback):
         if device is None:
             return
 
-        total_memory = torch.cuda.get_device_properties(device).total_memory
-        allocated = torch.cuda.memory_allocated(device)
-        peak_reserved = torch.cuda.max_memory_reserved(device)
-        local_allocated_pct = 100.0 * allocated / total_memory
-        local_peak_reserved_pct = 100.0 * peak_reserved / total_memory
-        max_allocated_pct = self._reduce_max(local_allocated_pct, device)
-        worst_peak_reserved_pct = self._reduce_max(local_peak_reserved_pct, device)
-
-        if pl_module.global_rank != 0:
+        if pl_module.global_rank != 0 and not self.sync_across_ranks:
             return
-
-        self._epoch_values.append(worst_peak_reserved_pct)
 
         if trainer.fit_loop._should_accumulate() and trainer.lightning_module.automatic_optimization:
             return
 
         log_step = self._lightning_log_step(trainer)
-        if (log_step + 1) % self.log_every_n_steps == 0:
-            self._log_metrics(
-                trainer,
-                {
-                    "System/GPU Memory Allocated (%)": max_allocated_pct,
-                    "worst_peak_reserved_pct": worst_peak_reserved_pct,
-                    "train/epoch_progress_pct": min(
-                        100.0,
-                        100.0 * float(batch_idx + 1) / max(float(trainer.num_training_batches), 1.0),
-                    ),
-                },
-                step=log_step,
-            )
+        if (log_step + 1) % self.log_every_n_steps != 0:
+            return
+
+        total_memory = torch.cuda.get_device_properties(device).total_memory
+        allocated = torch.cuda.memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
+        local_allocated_pct = 100.0 * allocated / total_memory
+        local_peak_reserved_pct = 100.0 * peak_reserved / total_memory
+        max_allocated_pct = self._reduce_max(
+            local_allocated_pct,
+            device,
+            sync_across_ranks=self.sync_across_ranks,
+        )
+        worst_peak_reserved_pct = self._reduce_max(
+            local_peak_reserved_pct,
+            device,
+            sync_across_ranks=self.sync_across_ranks,
+        )
+
+        if pl_module.global_rank != 0:
+            return
+
+        self._epoch_values.append(worst_peak_reserved_pct)
+        self._log_metrics(
+            trainer,
+            {
+                "System/GPU Memory Allocated (%)": max_allocated_pct,
+                "worst_peak_reserved_pct": worst_peak_reserved_pct,
+                "train/epoch_progress_pct": min(
+                    100.0,
+                    100.0 * float(batch_idx + 1) / max(float(trainer.num_training_batches), 1.0),
+                ),
+            },
+            step=log_step,
+        )
 
     def on_validation_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         del pl_module
