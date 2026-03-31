@@ -8,21 +8,30 @@
 - `FlowTokenProcessor`는 14-slot context pack과 13개 anchor를 만들되, 
 - **context 위치/방향과 flow target 원점은 token-restored 상태가 아니라 실제 coarse 상태**를 사용합니다.
 - agent coarse token id는 **마지막 점 1개가 아니라 0.5초 전체 6개 점 사각형 경로**를 기준으로 매칭합니다.
-- `trajectory_token_veh/ped/cyc` 임베딩은 마지막 contour 1개 대신 **`agent_token_all_*` 전체 chunk(6 x 4 x 2)** 를 그대로 펼쳐 사용합니다.
+- `trajectory_token_veh/ped/cyc` 임베딩은 마지막 contour 1개 대신 
+- **`agent_token_all_*` 전체 chunk(6 x 4 x 2)** 를 그대로 펼쳐 사용합니다.
 - `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
 - closed-loop inference는 0.5초씩 commit 하며 `pred_traj_10hz`, `pred_head_10hz`, `pred_z_10hz`를 바로 내보내 2025 Sim Agents rollout proto와 바로 연결됩니다.
-- `model.model_config.decoder.closed_loop_rollout_mode=raw_fm` 이 기본값이며, 이때 외부로 내보내는 `pred_traj_10hz`, `pred_head_10hz`는 raw FM 출력 그대로 유지합니다.
-- `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면 `retokenize`로 고른 token의 0.5초 chunk를 **외부 rollout 10Hz 출력에만** 반영합니다. 내부 closed-loop context는 계속 실제 FM commit 상태를 유지합니다.
+- `model.model_config.decoder.closed_loop_rollout_mode=raw_fm` 이 기본값이며, 
+- 이때 외부로 내보내는 `pred_traj_10hz`, `pred_head_10hz`는 raw FM 출력 그대로 유지합니다.
+- `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면 
+- `retokenize`로 고른 token의 0.5초 chunk를 **외부 rollout 10Hz 출력에만** 반영합니다.
+- 내부 closed-loop context는 계속 실제 FM commit 상태를 유지합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
 ### Closed-loop Retokenize Rule
 
-- `retokenize` 자체는 **현재 실제 coarse 상태 + 이번 0.5초 raw FM commit 5점**을 합친 6개 점 경로를 기준으로 다음 token id를 다시 고릅니다.
-- `pos_window`, `head_window`, `coarse_pos/head`, 그리고 다음 step motion feature는 모두 **token bank 복원값이 아니라 실제 FM commit의 마지막 상태** 기준으로 갱신합니다.
-- 기본값 `raw_fm` 에서는 `pred_traj_10hz`, `pred_head_10hz`를 raw FM 출력 그대로 유지합니다. 따라서 WOSAC metric, submission proto, video visualization은 post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
-- `matched_token_chunk` 에서는 같은 6점 경로 매칭으로 고른 token chunk가 외부 rollout에도 반영됩니다. 다만 내부 closed-loop context는 계속 실제 상태를 유지합니다.
+- `retokenize` 자체는 **현재 실제 coarse 상태 + 이번 0.5초 raw FM commit 5점**을 합친 6개 점 경로를 기준으로 
+- 다음 token id를 다시 고릅니다.
+- `pos_window`, `head_window`, `coarse_pos/head`, 그리고 다음 step motion feature는 
+- 모두 **token bank 복원값이 아니라 실제 FM commit의 마지막 상태** 기준으로 갱신합니다.
+- 기본값 `raw_fm` 에서는 `pred_traj_10hz`, `pred_head_10hz`를 raw FM 출력 그대로 유지합니다. 
+- 따라서 WOSAC metric, submission proto, video visualization은 
+- post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
+- `matched_token_chunk` 에서는 같은 6점 경로 매칭으로 고른 token chunk가 외부 rollout에도 반영됩니다. 
+- 다만 내부 closed-loop context는 계속 실제 상태를 유지합니다.
 
 
 ## 2. 환경 설치
@@ -219,7 +228,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_pretrain_h1006
+  task_name=flow_semi_continuous_pretrain_h1006
 ```
 
 ### 5.1 학습 설정을 거칠게 이해하는 법
@@ -236,7 +245,7 @@ torchrun \
 torchrun ... -m src.run \
   experiment=pre_bc_flow \
   trainer=ddp \
-  task_name=flow_pretrain_h1006
+  task_name=flow_semi_continuous_pretrain_h1006
 ```
 
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
@@ -338,7 +347,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_pretrain_h1006 \
+  task_name=flow_semi_continuous_pretrain_h1006 \
   ckpt_path=/path/to/previous_run/checkpoints/last.ckpt
 ```
 
@@ -370,7 +379,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_pretrain_h1006 \
+  task_name=flow_semi_continuous_pretrain_h1006 \
   model.model_config.n_vis_batch=1 \
   model.model_config.n_vis_scenario=2 \
   model.model_config.n_vis_rollout=2 \
@@ -919,7 +928,7 @@ python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT"
 ### 6x H100 학습
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_pretrain_h1006
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_semi_continuous_pretrain_h1006
 ```
 
 ### validation 평가
