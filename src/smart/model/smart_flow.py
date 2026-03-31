@@ -178,8 +178,14 @@ class SMARTFlow(LightningModule):
         kin_cfg = getattr(model_config, "kinematic_projection", None)
         if kin_cfg is not None and getattr(kin_cfg, "enabled", False):
             _kin_proj = KinematicProjection(
+                use_bicycle_model=bool(getattr(kin_cfg, "use_bicycle_model", False)),
+                wheelbase=float(getattr(kin_cfg, "wheelbase", 2.7)),
+                delta_max=float(getattr(kin_cfg, "delta_max", 0.52)),
+                a_max=float(getattr(kin_cfg, "a_max", 4.0)),
+                d_max=float(getattr(kin_cfg, "d_max", 8.0)),
+                ped_a_max=float(getattr(kin_cfg, "ped_a_max", 2.0)),
                 vehicle_deadzone=float(getattr(kin_cfg, "vehicle_deadzone", 0.05)),
-                ped_deadzone=float(getattr(kin_cfg, "ped_deadzone", 0.03)),
+                ped_deadzone=float(getattr(kin_cfg, "ped_deadzone", 0.025)),
                 ped_max_speed=float(getattr(kin_cfg, "ped_max_speed", 0.5)),
                 eps=float(getattr(kin_cfg, "eps", 1e-6)),
             )

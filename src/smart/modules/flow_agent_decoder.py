@@ -754,6 +754,25 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             agent_batch=tokenized_agent["batch"],
         )
 
+        # Bicycle model velocity state: chunk 간 속도 연속성을 위한 per-agent 버퍼.
+        # pos_window 차이로 초기 속도를 추정하여 시작합니다.
+        _use_bm = (
+            self.kinematic_projector is not None
+            and getattr(self.kinematic_projector, "use_bicycle_model", False)
+        )
+        if _use_bm:
+            if pos_window.shape[1] >= 2:
+                _dp = pos_window[:, -1] - pos_window[:, -2]  # [n, 2], 2Hz window → 0.5s 이동
+                # pos_window는 2Hz (shift=5 × dt=0.1s = 0.5s 간격)이므로 shift*dt로 나눔
+                _coarse_dt = self.shift * self.kinematic_projector.dt
+                v_state = _dp.norm(dim=-1) / _coarse_dt  # m/s [n]
+            else:
+                v_state = torch.zeros(
+                    n_agent, device=pos_window.device, dtype=pos_window.dtype
+                )
+        else:
+            v_state = None
+
         for t in range(n_step_future_2hz):
             n_step = pos_window.shape[1]
             if t == 0:
@@ -828,12 +847,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 ].contiguous()
                 _active_type = tokenized_agent["type"][active_mask]
                 _model_fn_cl = lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau)
+                _v_init_cl = v_state[active_mask] if v_state is not None else None
                 if self.use_predict_project_renoise and self.kinematic_projector is not None:
                     _at_cl = _active_type
                     y_hat_norm = self.flow_ode.generate_predict_project_renoise(
                         x_init=x_init_norm,
                         model_fn=_model_fn_cl,
-                        project_fn=lambda x1, pw: self.kinematic_projector(x1, _at_cl, proj_weight=pw),
+                        project_fn=lambda x1, pw: self.kinematic_projector(
+                            x1, _at_cl, proj_weight=pw, v_init=_v_init_cl
+                        ),
                         steps=self.ppr_steps,
                     )
                 else:
@@ -841,7 +863,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         x_init=x_init_norm, model_fn=_model_fn_cl
                     )
                     if self.kinematic_projector is not None:
-                        y_hat_norm = self.kinematic_projector(y_hat_norm, _active_type)
+                        y_hat_norm = self.kinematic_projector(
+                            y_hat_norm, _active_type, v_init=_v_init_cl
+                        )
+                # v_state 업데이트: committed portion 마지막 스텝의 속도로 갱신
+                if v_state is not None:
+                    _commit_last = self.shift - 1  # = 4 (0-indexed, 0.5s 청크 마지막)
+                    _dx_c = y_hat_norm[:, _commit_last, 0] * self.kinematic_projector.coord_scale
+                    _dy_c = y_hat_norm[:, _commit_last, 1] * self.kinematic_projector.coord_scale
+                    v_state[active_mask] = (
+                        (_dx_c**2 + _dy_c**2).sqrt() / self.kinematic_projector.dt
+                    )
                 commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
                     y_hat_norm=y_hat_norm,
                     current_pos=pos_window[active_mask, -1],
