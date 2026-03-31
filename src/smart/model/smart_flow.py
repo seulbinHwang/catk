@@ -574,6 +574,9 @@ class SMARTFlow(LightningModule):
             "n_step_future_10hz": int(rollout_cache["n_step_future_10hz"]),
             "n_step_future_2hz": int(rollout_cache["n_step_future_2hz"]),
             "max_context_steps": int(rollout_cache["max_context_steps"]),
+            "motion_local_window": self._repeat_tensor_on_first_dim(
+                rollout_cache["motion_local_window"], repeat_count
+            ),
             "pos_window": self._repeat_tensor_on_first_dim(rollout_cache["pos_window"], repeat_count),
             "head_window": self._repeat_tensor_on_first_dim(rollout_cache["head_window"], repeat_count),
             "head_vector_window": self._repeat_tensor_on_first_dim(

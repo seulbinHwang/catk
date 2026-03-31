@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Tuple
 
 import torch
@@ -8,27 +9,55 @@ from torch_geometric.data import HeteroData
 
 from src.smart.modules.continuous_motion_history import build_context_from_raw
 from src.smart.tokens.token_processor import TokenProcessor
-from src.smart.utils import transform_to_local
+from src.smart.utils import transform_to_local, wrap_angle
 
 
 class FlowTokenProcessor(TokenProcessor):
-    """Flow 학습용 목표와 DRaFT용 보조 메타데이터를 만듭니다."""
+    """연속 5-point agent history만 쓰는 flow 전용 토큰 처리기입니다.
 
+    map token은 기존과 같이 유지하지만, agent 움직임은 더 이상 2048개 어휘집과
+    매칭하지 않습니다. 대신 실제 10Hz 좌표를 바로 정리해서 0.5초 구간 5점 문맥과
+    flow supervision을 만듭니다.
+    """
+
+    def __init__(
+        self,
+        map_token_file: str,
+        agent_token_file: str,
+        map_token_sampling,
+        agent_token_sampling,
+    ) -> None:
+        """map token만 초기화하고 agent vocab 로드는 생략합니다.
+
+        Args:
+            map_token_file: map token 파일 경로입니다.
+            agent_token_file: 기존 설정 호환용 인자입니다. 더 이상 쓰지 않습니다.
+            map_token_sampling: map token 샘플링 설정입니다.
+            agent_token_sampling: 기존 설정 호환용 인자입니다. 더 이상 쓰지 않습니다.
+        """
+        del agent_token_file
+        torch.nn.Module.__init__(self)
+        self.map_token_sampling = map_token_sampling
+        self.agent_token_sampling = agent_token_sampling
+        self.shift = 5
+        self.num_context_steps = 14
+        self.num_anchor_steps = 13
+        module_dir = os.path.dirname(__file__)
+        self.init_map_token(os.path.join(module_dir, map_token_file))
+        self.n_token_agent = 0
+
+    @torch.no_grad()
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
-        """지도 토큰과 에이전트 토큰을 만들고 flow 목표를 붙입니다.
+        """지도 토큰과 연속 agent 문맥/목표를 만듭니다.
 
         Args:
             data: 원본 장면 배치입니다.
 
         Returns:
-            Tuple[Dict[str, Tensor], Dict[str, Tensor]]: 지도 토큰 사전과 에이전트 토큰
-            사전입니다.
+            Tuple[Dict[str, Tensor], Dict[str, Tensor]]: 지도 토큰 사전과 agent 사전입니다.
         """
         tokenized_map = self.tokenize_map(data)
-        tokenized_agent, processed_agent = self.tokenize_agent(
-            data,
-            return_preprocessed=True,
-        )
+        tokenized_agent, processed_agent = self._tokenize_agent_continuous(data)
         tokenized_agent = self._build_flow_targets(
             data=data,
             tokenized_agent=tokenized_agent,
@@ -36,21 +65,83 @@ class FlowTokenProcessor(TokenProcessor):
         )
         return tokenized_map, tokenized_agent
 
+    def _tokenize_agent_continuous(
+        self,
+        data: HeteroData,
+    ) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
+        """agent 원본 시계열을 연속 좌표 기반 사전으로 바꿉니다.
+
+        Args:
+            data: 원본 장면 배치입니다.
+
+        Returns:
+            Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
+                - tokenized_agent: 학습/추론 공통 메타데이터 사전입니다.
+                - processed_agent: 10Hz 전처리 결과 사전입니다.
+        """
+        valid = data["agent"]["valid_mask"].clone()
+        heading = data["agent"]["heading"].clone()
+        pos = data["agent"]["position"][..., :2].clone().contiguous()
+        vel = data["agent"]["velocity"].clone()
+
+        heading = self._clean_heading(valid=valid, heading=heading)
+        valid, pos, heading, vel = self._extrapolate_agent_to_prev_token_step(
+            valid=valid,
+            pos=pos,
+            heading=heading,
+            vel=vel,
+        )
+
+        coarse_pos = pos[:, self.shift :: self.shift].contiguous()
+        coarse_heading = heading[:, self.shift :: self.shift].contiguous()
+        coarse_valid = valid[:, self.shift :: self.shift].contiguous()
+
+        current_step_10hz = min(self.num_context_steps * self.shift, data["agent"]["position"].shape[1] - 1)
+        gt_z_raw = data["agent"]["position"][:, current_step_10hz, 2].contiguous()
+
+        tokenized_agent = {
+            "num_graphs": data.num_graphs,
+            "type": data["agent"]["type"],
+            "shape": data["agent"]["shape"],
+            "ego_mask": data["agent"]["role"][:, 0],
+            "batch": data["agent"]["batch"],
+            # full 10Hz trajectory for continuous rollout and target construction
+            "gt_pos_raw": pos,
+            "gt_head_raw": heading,
+            "gt_valid_raw": valid,
+            # coarse view kept for downstream reporting compatibility
+            "gt_pos": coarse_pos,
+            "gt_heading": coarse_heading,
+            "valid_mask": coarse_valid,
+            "gt_z_raw": gt_z_raw,
+            # legacy placeholder only; there is no motion vocab anymore.
+            "trajectory_token_veh": pos.new_zeros((0, 8)),
+            "trajectory_token_ped": pos.new_zeros((0, 8)),
+            "trajectory_token_cyc": pos.new_zeros((0, 8)),
+        }
+        processed_agent = {
+            "valid": valid,
+            "pos": pos,
+            "heading": heading,
+            "vel": vel,
+        }
+        return tokenized_agent, processed_agent
+
     def _build_flow_targets(
         self,
         data: HeteroData,
         tokenized_agent: Dict[str, Tensor],
         processed_agent: Dict[str, Tensor],
     ) -> Dict[str, Tensor]:
-        """학습/평가에 필요한 anchor별 미래와 메타데이터를 만듭니다.
+        """학습/평가에 필요한 anchor별 미래와 문맥을 만듭니다.
 
         Args:
             data: 원본 장면 배치입니다.
-            tokenized_agent: coarse token 기반 에이전트 토큰 사전입니다.
-            processed_agent: 전처리된 실제 좌표와 방향 사전입니다.
+            tokenized_agent: 공통 agent 메타데이터 사전입니다.
+            processed_agent: 10Hz 전처리 결과 사전입니다.
 
         Returns:
-            Dict[str, Tensor]: flow 관련 필드가 추가된 에이전트 토큰 사전입니다.
+            Dict[str, Tensor]: flow 관련 필드가 추가된 agent 사전입니다.
         """
         valid = processed_agent["valid"]
         pos = processed_agent["pos"]
@@ -61,13 +152,12 @@ class FlowTokenProcessor(TokenProcessor):
             head_raw=heading,
             valid_raw=valid,
             shift=self.shift,
-            num_context_steps=14,
+            num_context_steps=self.num_context_steps,
         )
 
         num_agent = pos.shape[0]
         device = pos.device
         dtype = pos.dtype
-        num_anchor = 13
         raw_current_steps = list(range(10, 71, self.shift))
 
         if "train_mask" in data["agent"]:
@@ -80,16 +170,17 @@ class FlowTokenProcessor(TokenProcessor):
                 "ctx_motion_local": ctx_motion_local,
                 "ctx_pos": ctx_pos,
                 "ctx_heading": ctx_heading,
-                # 하위 코드 안정성을 위해 기존 키도 함께 둡니다.
-                "ctx_sampled_idx": ctx_motion_local,
-                "ctx_sampled_pos": ctx_pos,
-                "ctx_sampled_heading": ctx_heading,
                 "ctx_valid": ctx_valid,
             }
         )
 
         if self.training:
-            flow_train_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
+            flow_train_mask = torch.zeros(
+                num_agent,
+                self.num_anchor_steps,
+                device=device,
+                dtype=torch.bool,
+            )
             flow_train_chunks: List[Tensor] = []
             flow_train_agent_type_chunks: List[Tensor] = []
             flow_train_prev_control_chunks: List[Tensor] = []
@@ -155,19 +246,14 @@ class FlowTokenProcessor(TokenProcessor):
                     ),
                 }
             )
-            for key in [
-                "valid_mask",
-                "gt_idx",
-                "gt_pos",
-                "gt_heading",
-                "sampled_idx",
-                "sampled_pos",
-                "sampled_heading",
-            ]:
-                tokenized_agent.pop(key, None)
             return tokenized_agent
 
-        flow_eval_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
+        flow_eval_mask = torch.zeros(
+            num_agent,
+            self.num_anchor_steps,
+            device=device,
+            dtype=torch.bool,
+        )
         flow_eval_chunks: List[Tensor] = []
         for anchor_offset, raw_step in enumerate(raw_current_steps):
             current_valid = ctx_valid[:, anchor_offset + 1]
@@ -209,21 +295,18 @@ class FlowTokenProcessor(TokenProcessor):
         anchor_mask: Tensor,
         raw_step: int,
     ) -> Tensor:
-        """한 anchor에서 실제로 쓰는 에이전트만 골라 목표를 만듭니다.
+        """한 anchor에서 실제로 쓰는 agent만 골라 2초 미래 목표를 만듭니다.
 
         Args:
-            pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
-            heading: 전처리된 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            pos: 전처리된 10Hz 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전처리된 10Hz 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
             current_pos: 현재 coarse anchor 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 coarse anchor 방향입니다. shape은 ``[n_agent]`` 입니다.
-            anchor_mask: 이번 anchor를 실제로 학습 또는 평가에 쓰는지 나타냅니다.
-                shape은 ``[n_agent]`` 입니다.
+            anchor_mask: 이번 anchor를 실제로 쓰는지 나타냅니다. shape은 ``[n_agent]`` 입니다.
             raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
 
         Returns:
-            Tensor: 정규화된 2초 미래 목표입니다.
-            shape은 ``[n_valid_anchor, 20, 4]`` 입니다. 마지막 차원은
-            ``[x, y, cos, sin]`` 순서입니다.
+            Tensor: 정규화된 2초 미래 목표입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
         future_pos = pos[anchor_mask, raw_step + 1 : raw_step + 21]
         future_head = heading[anchor_mask, raw_step + 1 : raw_step + 21]
@@ -256,13 +339,12 @@ class FlowTokenProcessor(TokenProcessor):
         """anchor 직전 구간의 단순 제어를 local frame 기준으로 만듭니다.
 
         Args:
-            pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
-            heading: 전처리된 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            pos: 전처리된 10Hz 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전처리된 10Hz 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
             valid: 각 시점 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
             current_pos: 현재 coarse anchor 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 coarse anchor 방향입니다. shape은 ``[n_agent]`` 입니다.
-            anchor_mask: 이번 anchor를 실제로 쓰는 에이전트입니다.
-                shape은 ``[n_agent]`` 입니다.
+            anchor_mask: 이번 anchor를 실제로 쓰는 agent입니다. shape은 ``[n_agent]`` 입니다.
             raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
 
         Returns:
@@ -300,77 +382,88 @@ class FlowTokenProcessor(TokenProcessor):
         prev_control[~prev_control_valid] = 0.0
         return prev_control, prev_control_valid
 
+    @staticmethod
     def _concat_flow_chunks(
-        self,
         chunks: List[Tensor],
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tensor:
-        """빈 경우까지 포함해서 flow 목표 조각을 하나로 합칩니다.
-
-        Args:
-            chunks: 각 anchor에서 만든 목표 조각 목록입니다. 각 원소 shape은
-                ``[n_valid_anchor, 20, 4]`` 입니다.
-            dtype: 반환 텐서 자료형입니다.
-            device: 반환 텐서 장치입니다.
-
-        Returns:
-            Tensor: 이어 붙인 목표입니다. shape은 ``[n_total_valid_anchor, 20, 4]`` 입니다.
-            유효한 anchor가 없으면 ``[0, 20, 4]`` 빈 텐서를 돌려줍니다.
-        """
+        """flow 목표 조각을 하나로 합칩니다."""
         if len(chunks) == 0:
             return torch.zeros((0, 20, 4), device=device, dtype=dtype)
         return torch.cat(chunks, dim=0)
 
+    @staticmethod
     def _concat_vector_chunks(
-        self,
         chunks: List[Tensor],
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tensor:
-        """1차원 조각 목록을 하나의 벡터로 잇습니다.
-
-        Args:
-            chunks: 각 조각은 ``[n_valid_anchor]`` 입니다.
-            dtype: 반환 텐서 자료형입니다.
-            device: 반환 텐서 장치입니다.
-
-        Returns:
-            Tensor: 이어 붙인 벡터입니다. shape은 ``[n_total_valid_anchor]`` 입니다.
-        """
+        """1차원 조각 목록을 하나의 벡터로 잇습니다."""
         if len(chunks) == 0:
             return torch.zeros((0,), device=device, dtype=dtype)
         return torch.cat([chunk.to(device=device, dtype=dtype) for chunk in chunks], dim=0)
 
+    @staticmethod
     def _concat_matrix_chunks(
-        self,
         chunks: List[Tensor],
         width: int,
         dtype: torch.dtype,
         device: torch.device,
     ) -> Tensor:
-        """2차원 조각 목록을 하나의 행렬로 잇습니다.
-
-        Args:
-            chunks: 각 조각은 ``[n_valid_anchor, width]`` 입니다.
-            width: 마지막 축 너비입니다.
-            dtype: 반환 텐서 자료형입니다.
-            device: 반환 텐서 장치입니다.
-
-        Returns:
-            Tensor: 이어 붙인 행렬입니다. shape은 ``[n_total_valid_anchor, width]`` 입니다.
-        """
+        """2차원 조각 목록을 하나의 행렬로 잇습니다."""
         if len(chunks) == 0:
             return torch.zeros((0, width), device=device, dtype=dtype)
         return torch.cat([chunk.to(device=device, dtype=dtype) for chunk in chunks], dim=0)
 
-    def _wrap_angle(self, angle: Tensor) -> Tensor:
-        """각도를 ``[-pi, pi]`` 범위로 접습니다.
+    @staticmethod
+    def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
+        """갑자기 180도 뒤집히는 heading 값을 완만하게 정리합니다."""
+        valid_pairs = valid[:, :-1] & valid[:, 1:]
+        heading = heading.clone()
+        for i in range(heading.shape[1] - 1):
+            heading_diff = torch.abs(wrap_angle(heading[:, i] - heading[:, i + 1]))
+            change_needed = (heading_diff > 1.5) & valid_pairs[:, i]
+            heading[:, i + 1][change_needed] = heading[:, i][change_needed]
+        return heading
+
+    def _extrapolate_agent_to_prev_token_step(
+        self,
+        valid: Tensor,
+        pos: Tensor,
+        heading: Tensor,
+        vel: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """첫 유효 시점 앞쪽을 0.5초 경계까지 짧게 메꿉니다.
 
         Args:
-            angle: 각도 텐서입니다. shape은 임의입니다.
+            valid: 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            pos: 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            vel: 속도입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
 
         Returns:
-            Tensor: 같은 shape의 접힌 각도입니다.
+            Tuple[Tensor, Tensor, Tensor, Tensor]: 보정된 ``valid, pos, heading, vel`` 입니다.
         """
+        valid = valid.clone()
+        pos = pos.clone()
+        heading = heading.clone()
+        vel = vel.clone()
+        first_valid_step = torch.max(valid, dim=1).indices
+        for agent_idx, step_idx in enumerate(first_valid_step.tolist()):
+            n_step_to_extrapolate = step_idx % self.shift
+            if (step_idx == 10) and (not bool(valid[agent_idx, 10 - self.shift])):
+                n_step_to_extrapolate = self.shift
+            if n_step_to_extrapolate <= 0:
+                continue
+            vel[agent_idx, step_idx - n_step_to_extrapolate : step_idx] = vel[agent_idx, step_idx]
+            valid[agent_idx, step_idx - n_step_to_extrapolate : step_idx] = True
+            heading[agent_idx, step_idx - n_step_to_extrapolate : step_idx] = heading[agent_idx, step_idx]
+            for j in range(n_step_to_extrapolate):
+                pos[agent_idx, step_idx - j - 1] = pos[agent_idx, step_idx - j] - vel[agent_idx, step_idx] * 0.1
+        return valid, pos, heading, vel
+
+    @staticmethod
+    def _wrap_angle(angle: Tensor) -> Tensor:
+        """각도를 ``[-pi, pi]`` 범위로 접습니다."""
         return torch.atan2(angle.sin(), angle.cos())

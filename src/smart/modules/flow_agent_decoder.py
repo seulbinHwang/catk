@@ -389,13 +389,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         n_agent, n_step = head_a.shape
         feat_a = self.agent_token_embedding(
             agent_token_index=agent_token_index,
-            trajectory_token_veh=tokenized_agent["trajectory_token_veh"],
-            trajectory_token_ped=tokenized_agent["trajectory_token_ped"],
-            trajectory_token_cyc=tokenized_agent["trajectory_token_cyc"],
+            trajectory_token_veh=tokenized_agent.get("trajectory_token_veh"),
+            trajectory_token_ped=tokenized_agent.get("trajectory_token_ped"),
+            trajectory_token_cyc=tokenized_agent.get("trajectory_token_cyc"),
             pos_a=pos_a,
             head_vector_a=head_vector_a,
             agent_type=tokenized_agent["type"],
             agent_shape=tokenized_agent["shape"],
+            mask=mask,
         )
         edge_index_t, r_t = self.build_temporal_edge(
             pos_a=pos_a,
@@ -536,6 +537,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_vector_a=head_vector_window,
             agent_type=tokenized_agent["type"],
             agent_shape=tokenized_agent["shape"],
+            mask=valid_window,
             inference=True,
         )
         n_step = pos_window.shape[1]
@@ -864,6 +866,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     head_vector_a=head_vector_next.unsqueeze(1),
                     agent_type=tokenized_agent["type"],
                     agent_shape=tokenized_agent["shape"],
+                    mask=next_valid.unsqueeze(1),
                     inference=True,
                 )
                 agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next], dim=1)
@@ -909,6 +912,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     head_vector_a=head_vector_next.unsqueeze(1),
                     agent_type=tokenized_agent["type"],
                     agent_shape=tokenized_agent["shape"],
+                    mask=next_valid.unsqueeze(1),
                     inference=True,
                 )
                 agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next], dim=1)

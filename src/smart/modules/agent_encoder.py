@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -22,169 +21,94 @@ from torch import Tensor
 from torch_cluster import radius, radius_graph
 from torch_geometric.utils import dense_to_sparse, subgraph
 
-from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
-from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
+from src.smart.layers.fourier_embedding import FourierEmbedding
+from src.smart.modules.continuous_motion_history import (
+    build_motion_point_sequence_features,
+    build_motion_summary_features,
+)
 from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
 
 
-def build_motion_point_sequence_features(motion_points_local: Tensor) -> Tensor:
-    """0.5초 5개 점을 순서가 있는 점 특징으로 바꿉니다.
+class LightweightContinuousMotionEncoder(nn.Module):
+    """연속 5개 점을 가볍게 압축하는 경량 인코더입니다.
 
-    Args:
-        motion_points_local: 구간 시작 시점 기준 local 5개 점입니다.
-            shape은 ``[n_item, 5, 2]`` 입니다.
-
-    Returns:
-        Tensor: 각 점마다 위치, 직전 점 대비 이동량, 이동 길이, 누적 이동 길이,
-        시간 진행률을 붙인 값입니다. shape은 ``[n_item, 5, 7]`` 입니다.
+    이 인코더는 무거운 attention이나 transformer 없이, 점별 특징을 짧은 MLP로 읽고
+    평균값 / 최댓값 / 마지막 점 요약을 합쳐 구간 임베딩 하나를 만듭니다.
     """
-    if motion_points_local.ndim != 3 or motion_points_local.size(-2) != 5 or motion_points_local.size(-1) != 2:
-        raise ValueError(
-            "motion_points_local must have shape [n_item, 5, 2], "
-            f"got {tuple(motion_points_local.shape)}"
-        )
-
-    origin = motion_points_local.new_zeros((motion_points_local.shape[0], 1, 2))
-    path_points = torch.cat([origin, motion_points_local], dim=1)
-    delta = path_points[:, 1:] - path_points[:, :-1]
-    step_length = torch.norm(delta, p=2, dim=-1, keepdim=True)
-    cumulative_length = torch.cumsum(step_length, dim=1)
-    progress = torch.linspace(
-        0.2,
-        1.0,
-        steps=5,
-        device=motion_points_local.device,
-        dtype=motion_points_local.dtype,
-    ).view(1, 5, 1)
-    progress = progress.expand(motion_points_local.shape[0], -1, -1)
-    return torch.cat(
-        [motion_points_local, delta, step_length, cumulative_length, progress],
-        dim=-1,
-    )
-
-
-
-def build_motion_global_features(motion_points_local: Tensor) -> Tensor:
-    """0.5초 5개 점을 구간 요약값으로 바꿉니다.
-
-    Args:
-        motion_points_local: 구간 시작 시점 기준 local 5개 점입니다.
-            shape은 ``[n_item, 5, 2]`` 입니다.
-
-    Returns:
-        Tensor: 구간 끝점, 전체 이동 길이, 마지막 이동 길이, 옆방향 흔들림,
-        직진성, 좌우 회전 방향을 담은 값입니다. shape은 ``[n_item, 8]`` 입니다.
-    """
-    if motion_points_local.ndim != 3 or motion_points_local.size(-2) != 5 or motion_points_local.size(-1) != 2:
-        raise ValueError(
-            "motion_points_local must have shape [n_item, 5, 2], "
-            f"got {tuple(motion_points_local.shape)}"
-        )
-
-    origin = motion_points_local.new_zeros((motion_points_local.shape[0], 1, 2))
-    path_points = torch.cat([origin, motion_points_local], dim=1)
-    delta = path_points[:, 1:] - path_points[:, :-1]
-    step_length = torch.norm(delta, p=2, dim=-1)
-    total_length = step_length.sum(dim=-1)
-    mean_step_length = step_length.mean(dim=-1)
-    tail_length = step_length[:, -1]
-    end_point = motion_points_local[:, -1]
-    end_disp = torch.norm(end_point, p=2, dim=-1)
-    straightness = end_disp / total_length.clamp_min(1e-3)
-    max_abs_lat = motion_points_local[..., 1].abs().amax(dim=-1)
-    poly_cross = (
-        path_points[:, :-1, 0] * path_points[:, 1:, 1]
-        - path_points[:, :-1, 1] * path_points[:, 1:, 0]
-    )
-    signed_area = 0.5 * poly_cross.sum(dim=-1)
-    return torch.stack(
-        [
-            end_point[:, 0],
-            end_point[:, 1],
-            total_length,
-            mean_step_length,
-            tail_length,
-            max_abs_lat,
-            straightness,
-            signed_area,
-        ],
-        dim=-1,
-    )
-
-
-class ContinuousMotionSegmentEncoder(nn.Module):
-    """5개 연속 점을 하나의 구간 표현으로 압축합니다."""
 
     def __init__(
         self,
         hidden_dim: int,
-        num_heads: int,
-        dropout: float,
+        point_hidden_dim: int = 96,
+        pooled_hidden_dim: int = 256,
     ) -> None:
-        """짧은 점 시퀀스를 읽는 작은 인코더를 만듭니다.
+        """경량 5-point 인코더를 만듭니다.
 
         Args:
-            hidden_dim: 출력 특징 크기입니다.
-            num_heads: self-attention head 수입니다.
-            dropout: dropout 비율입니다.
+            hidden_dim: 최종 구간 임베딩 크기입니다.
+            point_hidden_dim: 각 점을 읽을 때 내부에서 쓰는 특징 크기입니다.
+            pooled_hidden_dim: 여러 점을 합친 뒤 한 번 더 섞을 때 쓰는 특징 크기입니다.
         """
         super().__init__()
-        point_feature_dim = 7
-        motion_num_heads = math.gcd(hidden_dim, num_heads)
-        motion_num_heads = max(1, motion_num_heads)
-
-        self.point_proj = MLPEmbedding(
-            input_dim=point_feature_dim,
-            hidden_dim=hidden_dim,
+        self.point_proj = nn.Sequential(
+            nn.Linear(7, 64),
+            nn.GELU(),
+            nn.Linear(64, point_hidden_dim),
+            nn.GELU(),
         )
-        self.step_emb = nn.Embedding(5, hidden_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=motion_num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
+        self.curve_mlp = nn.Sequential(
+            nn.Linear(point_hidden_dim * 3, pooled_hidden_dim),
+            nn.GELU(),
+            nn.Linear(pooled_hidden_dim, hidden_dim),
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        self.out_norm = nn.LayerNorm(hidden_dim)
 
-    def reset_parameters(self) -> None:
-        """학습 가능한 토큰을 다시 초기화합니다."""
-        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
-        nn.init.normal_(self.step_emb.weight, mean=0.0, std=0.02)
-
-    def forward(
-        self,
-        motion_points_local: Tensor,
-        static_context: Tensor,
-    ) -> Tensor:
-        """5개 점 시퀀스를 읽어 구간 임베딩 하나를 만듭니다.
+    def forward(self, motion_points_local: Tensor) -> Tensor:
+        """5개 local 점을 하나의 구간 임베딩으로 압축합니다.
 
         Args:
-            motion_points_local: local 5개 점입니다. shape은 ``[n_item, 5, 2]`` 입니다.
-            static_context: 차종과 크기에서 만든 고정 문맥입니다.
-                shape은 ``[n_item, hidden_dim]`` 입니다.
+            motion_points_local: 구간 시작 시점 기준 local 5개 점입니다.
+                shape은 ``[n_item, 5, 2]`` 입니다.
 
         Returns:
             Tensor: 구간 전체를 대표하는 임베딩입니다.
             shape은 ``[n_item, hidden_dim]`` 입니다.
         """
         point_feature = build_motion_point_sequence_features(motion_points_local)
-        n_item, n_point, _ = point_feature.shape
-        point_token = self.point_proj(point_feature.reshape(-1, point_feature.shape[-1]))
-        point_token = point_token.view(n_item, n_point, -1)
+        point_token = self.point_proj(point_feature)
+        pooled_mean = point_token.mean(dim=1)
+        pooled_max = point_token.amax(dim=1)
+        pooled_last = point_token[:, -1]
+        pooled = torch.cat([pooled_mean, pooled_max, pooled_last], dim=-1)
+        return self.curve_mlp(pooled)
 
-        step_index = torch.arange(n_point, device=motion_points_local.device)
-        step_token = self.step_emb(step_index).unsqueeze(0).expand(n_item, -1, -1)
-        point_token = point_token + step_token + static_context.unsqueeze(1)
 
-        cls_token = self.cls_token.expand(n_item, -1, -1) + static_context.unsqueeze(1)
-        encoded = self.encoder(torch.cat([cls_token, point_token], dim=1))
-        return self.out_norm(encoded[:, 0])
+class SmallShapeEncoder(nn.Module):
+    """차량 크기처럼 작은 정적 값을 가볍게 읽는 MLP입니다."""
+
+    def __init__(self, out_dim: int) -> None:
+        """정적 값 인코더를 만듭니다.
+
+        Args:
+            out_dim: 출력 특징 크기입니다.
+        """
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.GELU(),
+            nn.Linear(32, out_dim),
+        )
+
+    def forward(self, agent_shape: Tensor) -> Tensor:
+        """shape 값을 경량 특징으로 바꿉니다.
+
+        Args:
+            agent_shape: 에이전트 크기 값입니다. shape은 ``[n_item, 3]`` 입니다.
+
+        Returns:
+            Tensor: shape에서 만든 특징입니다. shape은 ``[n_item, out_dim]`` 입니다.
+        """
+        return self.net(agent_shape)
 
 
 class SMARTAgentEncoder(nn.Module):
@@ -216,24 +140,26 @@ class SMARTAgentEncoder(nn.Module):
         self.num_layers = num_layers
         self.shift = 5
         self.hist_drop_prob = hist_drop_prob
-        self.n_token_agent = n_token_agent
+        # 연속 표현만 쓰므로 실제 agent vocab 크기는 더 이상 의미가 없습니다.
+        self.n_token_agent = 0 if n_token_agent is None else int(n_token_agent)
 
-        input_dim_global_motion = 8
         input_dim_r_t = 4
         input_dim_r_pt2a = 3
         input_dim_r_a2a = 3
+        input_dim_motion_summary = 8
 
-        self.type_a_emb = nn.Embedding(3, hidden_dim)
-        self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
-        self.motion_segment_encoder = ContinuousMotionSegmentEncoder(
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
+        self.motion_segment_encoder = LightweightContinuousMotionEncoder(hidden_dim=hidden_dim)
+        self.motion_summary_mlp = nn.Sequential(
+            nn.Linear(input_dim_motion_summary, 128),
+            nn.GELU(),
+            nn.Linear(128, hidden_dim),
         )
-        self.motion_global_emb = FourierEmbedding(
-            input_dim=input_dim_global_motion,
-            hidden_dim=hidden_dim,
-            num_freq_bands=num_freq_bands,
+        self.type_context_emb = nn.Embedding(3, 16)
+        self.shape_context_mlp = SmallShapeEncoder(out_dim=32)
+        self.motion_fusion_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 16 + 32, 320),
+            nn.GELU(),
+            nn.Linear(320, hidden_dim),
         )
         self.r_t_emb = FourierEmbedding(
             input_dim=input_dim_r_t,
@@ -249,10 +175,6 @@ class SMARTAgentEncoder(nn.Module):
             input_dim=input_dim_r_a2a,
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
-        )
-        self.fusion_emb = MLPEmbedding(
-            input_dim=self.hidden_dim * 2,
-            hidden_dim=self.hidden_dim,
         )
 
         self.t_attn_layers = nn.ModuleList(
@@ -295,32 +217,33 @@ class SMARTAgentEncoder(nn.Module):
             ]
         )
         self.apply(weight_init)
-        self.motion_segment_encoder.reset_parameters()
 
     def agent_token_embedding(
         self,
-        agent_token_index,
-        trajectory_token_veh,
-        trajectory_token_ped,
-        trajectory_token_cyc,
-        pos_a,
-        head_vector_a,
-        agent_type,
-        agent_shape,
+        agent_token_index: Tensor,
+        trajectory_token_veh: Tensor | None,
+        trajectory_token_ped: Tensor | None,
+        trajectory_token_cyc: Tensor | None,
+        pos_a: Tensor,
+        head_vector_a: Tensor,
+        agent_type: Tensor,
+        agent_shape: Tensor,
+        mask: Tensor | None = None,
         inference: bool = False,
     ):
-        """연속 5개 점을 직접 읽어 agent embedding을 만듭니다.
+        """연속 5개 점을 경량 네트워크로 직접 읽어 agent embedding을 만듭니다.
 
         Args:
             agent_token_index: local 5개 점 구간입니다.
                 shape은 ``[n_agent, n_step, 5, 2]`` 입니다.
-            trajectory_token_veh: 기존 호출부 호환용 인자입니다.
-            trajectory_token_ped: 기존 호출부 호환용 인자입니다.
-            trajectory_token_cyc: 기존 호출부 호환용 인자입니다.
+            trajectory_token_veh: 더 이상 쓰지 않는 기존 호출부 인자입니다.
+            trajectory_token_ped: 더 이상 쓰지 않는 기존 호출부 인자입니다.
+            trajectory_token_cyc: 더 이상 쓰지 않는 기존 호출부 인자입니다.
             pos_a: 기존 호출부 호환용 인자입니다.
             head_vector_a: 기존 호출부 호환용 인자입니다.
             agent_type: agent 종류입니다. shape은 ``[n_agent]`` 입니다.
             agent_shape: agent 크기 정보입니다. shape은 ``[n_agent, 3]`` 입니다.
+            mask: 각 coarse slot의 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
             inference: 추론용 부가 반환값을 함께 낼지 정합니다.
 
         Returns:
@@ -338,34 +261,28 @@ class SMARTAgentEncoder(nn.Module):
 
         n_agent, n_step, _, _ = motion_points_local.shape
         device = motion_points_local.device
+        flat_motion = motion_points_local.reshape(n_agent * n_step, 5, 2)
+        flat_type = agent_type.unsqueeze(1).expand(-1, n_step).reshape(-1)
+        flat_shape = agent_shape.unsqueeze(1).expand(-1, n_step, -1).reshape(-1, agent_shape.shape[-1])
 
-        veh_mask = agent_type == 0
-        ped_mask = agent_type == 1
-        cyc_mask = agent_type == 2
+        segment_emb_flat = self.motion_segment_encoder(flat_motion)
+        summary_feat_flat = build_motion_summary_features(flat_motion)
+        summary_emb_flat = self.motion_summary_mlp(summary_feat_flat)
+        type_context_flat = self.type_context_emb(flat_type.long())
+        shape_context_flat = self.shape_context_mlp(flat_shape)
 
-        motion_points_flat = motion_points_local.reshape(n_agent * n_step, 5, 2)
-        flat_agent_type = agent_type.unsqueeze(1).expand(-1, n_step).reshape(-1)
-        flat_agent_shape = agent_shape.unsqueeze(1).expand(-1, n_step, -1).reshape(-1, agent_shape.shape[-1])
-
-        type_emb_flat = self.type_a_emb(flat_agent_type.long())
-        shape_emb_flat = self.shape_emb(flat_agent_shape)
-        static_context_flat = type_emb_flat + shape_emb_flat
-
-        motion_segment_emb_flat = self.motion_segment_encoder(
-            motion_points_local=motion_points_flat,
-            static_context=static_context_flat,
+        fused_flat = self.motion_fusion_mlp(
+            torch.cat(
+                [segment_emb_flat, summary_emb_flat, type_context_flat, shape_context_flat],
+                dim=-1,
+            )
         )
-        motion_global_feature = build_motion_global_features(motion_points_flat)
-        motion_global_emb_flat = self.motion_global_emb(
-            continuous_inputs=motion_global_feature,
-            categorical_embs=[type_emb_flat, shape_emb_flat],
-        )
+        feat_a = fused_flat.view(n_agent, n_step, self.hidden_dim)
+        agent_token_emb = segment_emb_flat.view(n_agent, n_step, self.hidden_dim)
 
-        feat_a_flat = self.fusion_emb(
-            torch.cat([motion_segment_emb_flat, motion_global_emb_flat], dim=-1)
-        )
-        feat_a = feat_a_flat.view(n_agent, n_step, self.hidden_dim)
-        agent_token_emb = motion_segment_emb_flat.view(n_agent, n_step, self.hidden_dim)
+        if mask is not None:
+            feat_a = feat_a * mask.unsqueeze(-1).to(feat_a.dtype)
+            agent_token_emb = agent_token_emb * mask.unsqueeze(-1).to(agent_token_emb.dtype)
 
         if inference:
             dummy_bank = torch.zeros(
@@ -373,9 +290,12 @@ class SMARTAgentEncoder(nn.Module):
                 device=device,
                 dtype=agent_token_emb.dtype,
             )
+            veh_mask = agent_type == 0
+            ped_mask = agent_type == 1
+            cyc_mask = agent_type == 2
             categorical_embs = [
-                self.type_a_emb(agent_type.long()),
-                self.shape_emb(agent_shape),
+                self.type_context_emb(agent_type.long()),
+                self.shape_context_mlp(agent_shape),
             ]
             return (
                 feat_a,

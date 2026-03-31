@@ -1,5 +1,21 @@
 # CAT-K Flow Matching
 
+## Continuous agent motion pipeline
+- agent motion은 더 이상 2048개 어휘집 중 하나로 매칭하지 않습니다.
+- `FlowTokenProcessor`는 agent vocab 파일을 읽지 않고, 10Hz 실제 좌표에서 바로 문맥과 flow supervision을 만듭니다.
+- agent history는 각 0.5초 구간을 local 좌표의 **5개 점**으로 표현합니다.
+- slot 끝 방향은 **기본적으로 0.5초 전체 변위 방향**으로 계산하고, 
+  - 전체 변위가 너무 작을 때만 마지막 `0.4 -> 0.5초` 꼬리를 보고, 그것도 작으면 이전 방향을 유지합니다.
+- closed-loop 내부 상태는 raw continuous 5-point 구간을 그대로 유지하며, 
+  - motion vocab matching / retokenize / restore-token-state 경로를 쓰지 않습니다.
+- `agent_token_embedding`은 transformer 없이 동작하는 **경량 MLP + pooling** 구조로 바뀌었습니다.
+- 이 경량 인코더는 `hidden_dim=128` 기준 대략 **0.27M** 수준이며, `hidden_dim=160` 기준으로도 대략 **0.31M** 수준입니다.
+- map tokenization은 그대로 유지하지만, agent 쪽 discrete motion vocab 관련 로직과 파라미터는 제거되었습니다.
+- 바깥쪽 호출부가 아직 읽는 경우를 위해 `pred_idx` 같은 일부 필드는 **0으로 채운 호환용 값**만 유지될 수 있습니다. 이 값은 학습/추론 의사결정에는 사용되지 않습니다.
+<!-- /continuous-agent-motion-pipeline -->
+
+
+
 이 저장소는 **flow matching 학습/추론/평가 전용**으로 정리된 버전입니다.  
 기본 실행 경로와 문서, 스크립트는 모두 `smart_flow` 계열만 사용하며 CrossEntropy 기반 next-token 경로는 제거했습니다.  
 현재 closed-loop local 평가와 제출 export는 **WOSAC 2025 / Waymo 2025 Sim Agents 기준**만 사용합니다.
