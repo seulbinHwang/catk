@@ -160,28 +160,37 @@ class TerminalCostFinalStepLoss(nn.Module):
 
         x_t = torch.randn(batch_size, 20, 4, device=device, dtype=dtype)
 
-        # OT flow ODE: dx = v_θ(x_t, tau) * dt
-        # drift_from_velocity (SDE-equivalent)를 쓰지 않고 velocity를 직접 적분합니다.
+        # OT flow ODE — midpoint method (inference와 동일)
         # DDP unused-parameter 방지: 매 step에서 autograd 활성 상태로 forward합니다.
-        velocity_dict: dict = {}
+        last_residual: torch.Tensor | None = None
         for step_idx in range(self.rollout_steps):
             tau = times[step_idx]
-            velocity_dict = flow_decoder.forward_components(
+            tau_mid = tau + 0.5 * dt
+
+            v1_dict = flow_decoder.forward_components(
                 anchor_hidden=anchor_hidden_valid,
                 x_t_norm=x_t,
                 tau=tau,
             )
-            # OT flow ODE: x_{t+dt} = x_t + dt * v_θ
-            next_x_t = x_t + dt * velocity_dict["velocity"]
+            x_mid = (x_t + 0.5 * dt * v1_dict["velocity"])
             if step_idx < self.rollout_steps - 1:
-                # 중간 step: state는 detach해 그래프가 누적되지 않게 합니다.
+                x_mid = x_mid.detach()
+
+            v2_dict = flow_decoder.forward_components(
+                anchor_hidden=anchor_hidden_valid,
+                x_t_norm=x_mid,
+                tau=tau_mid,
+            )
+            next_x_t = x_t + dt * v2_dict["velocity"]
+            last_residual = v2_dict["residual_velocity"]
+
+            if step_idx < self.rollout_steps - 1:
                 x_t = next_x_t.detach()
             else:
-                # 마지막 step: gradient graph 유지
                 x_t = next_x_t
 
         self._assert_finite_tensor("ode_final_state", x_t)
-        return x_t, velocity_dict["residual_velocity"]
+        return x_t, last_residual
 
     def forward_open_loop(
         self,
@@ -273,16 +282,26 @@ class TerminalCostFinalStepLoss(nn.Module):
         dt = (1.0 - tau_start) / float(self.rollout_steps)  # [batch]
         dt_view = dt.view(-1, 1, 1)
 
-        velocity_dict: dict = {}
         for step_idx in range(self.rollout_steps):
-            tau = tau_start + step_idx * dt  # [batch]
-            velocity_dict = flow_decoder.forward_components(
+            tau = tau_start + step_idx * dt           # [batch]
+            tau_mid = tau + 0.5 * dt                  # [batch]
+
+            # midpoint method
+            v1_dict = flow_decoder.forward_components(
                 anchor_hidden=anchor_hidden_valid,
                 x_t_norm=x_t,
                 tau=tau,
             )
-            # OT-ODE: x_{t+dt} = x_t + dt * v_θ
-            next_x_t = x_t + dt_view * velocity_dict["velocity"]
+            x_mid = x_t + 0.5 * dt_view * v1_dict["velocity"]
+            if step_idx < self.rollout_steps - 1:
+                x_mid = x_mid.detach()
+
+            v2_dict = flow_decoder.forward_components(
+                anchor_hidden=anchor_hidden_valid,
+                x_t_norm=x_mid,
+                tau=tau_mid,
+            )
+            next_x_t = x_t + dt_view * v2_dict["velocity"]
             if step_idx < self.rollout_steps - 1:
                 x_t = next_x_t.detach()
             else:
@@ -321,15 +340,25 @@ class TerminalCostFinalStepLoss(nn.Module):
         times = self._build_step_times(flow_ode, batch_size, device, dtype)
 
         x_t = noise.to(device=device, dtype=dtype)
+        t0 = float(flow_ode.eps)
         for step_idx in range(self.rollout_steps):
             tau = times[step_idx]
-            velocity_dict = flow_decoder.forward_components(
+            tau_mid = tau + 0.5 * dt  # midpoint time
+
+            # midpoint method (2nd-order RK) — inference와 동일
+            v1 = flow_decoder.forward_components(
                 anchor_hidden=anchor_hidden_valid,
                 x_t_norm=x_t,
                 tau=tau,
-            )
-            # OT-ODE: x_{t+dt} = x_t + dt * v_θ  (NO detach — full BPTT)
-            x_t = x_t + dt * velocity_dict["velocity"]
+            )["velocity"]
+            x_mid = x_t + 0.5 * dt * v1
+            v2 = flow_decoder.forward_components(
+                anchor_hidden=anchor_hidden_valid,
+                x_t_norm=x_mid,
+                tau=tau_mid,
+            )["velocity"]
+            # OT-ODE midpoint step: NO detach — full BPTT
+            x_t = x_t + dt * v2
 
         self._assert_finite_tensor("full_grad_ode/final_state", x_t)
         return x_t

@@ -111,10 +111,13 @@ class ProjectedFlowGenerator(nn.Module):
         for i in range(steps):
             tau_val = t0 + i * dt
             tau = x_t.new_full((x_t.shape[0],), tau_val)
+            tau_mid = x_t.new_full((x_t.shape[0],), tau_val + 0.5 * dt)
 
-            # ODE step: x_{t+dt} = x_t + dt * v_θ(x_t, tau)
-            v = model_fn(x_t, tau)
-            x_t = (x_t + dt * v).detach()
+            # midpoint method (2nd-order RK) — inference와 동일
+            v1 = model_fn(x_t, tau)
+            x_mid = (x_t + 0.5 * dt * v1).detach()
+            v2 = model_fn(x_mid, tau_mid)
+            x_t = (x_t + dt * v2).detach()
 
             # Feasibility grad descent
             if self.n_proj_steps > 0:
