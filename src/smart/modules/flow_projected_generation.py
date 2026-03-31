@@ -135,3 +135,90 @@ class ProjectedFlowGenerator(nn.Module):
                 )
 
         return x_t
+
+    def generate_with_final_projection(
+        self,
+        flow_ode: nn.Module,
+        model_fn: Callable[[Tensor, Tensor], Tensor],
+        x_init: Tensor,
+        agent_type: Tensor,
+        current_control: Optional[Tensor],
+        current_control_valid: Optional[Tensor],
+        steps: int = 16,
+        n_final_proj_steps: int = 100,
+    ) -> Tensor:
+        """표준 OT-ODE로 생성 후, 마지막에 한 번만 feasible region으로 projection합니다.
+
+        per-step projection 없이 순수 ODE 생성 후,
+        n_final_proj_steps 번 gradient descent로 가장 가까운 feasible point를 찾습니다.
+
+        Args:
+            flow_ode: FlowODE 모듈입니다.
+            model_fn: ``(x_t, tau) -> velocity`` callable입니다.
+            x_init: 시작 noise. shape ``[n, 20, 4]``.
+            agent_type: shape ``[n]``.
+            current_control: shape ``[n, 3]`` 또는 None.
+            current_control_valid: shape ``[n]`` 또는 None.
+            steps: ODE 적분 스텝 수입니다.
+            n_final_proj_steps: 최종 projection gradient descent 반복 횟수입니다.
+
+        Returns:
+            Tensor: projection 후 normalized trajectory. shape ``[n, 20, 4]``.
+        """
+        # 1. 표준 midpoint ODE — per-step projection 없음
+        with torch.no_grad():
+            x_t = x_init
+            t0 = float(getattr(flow_ode, "eps", 1e-3))
+            dt = (1.0 - t0) / float(steps)
+
+            for i in range(steps):
+                tau_val = t0 + i * dt
+                tau = x_t.new_full((x_t.shape[0],), tau_val)
+                tau_mid = x_t.new_full((x_t.shape[0],), tau_val + 0.5 * dt)
+
+                v1 = model_fn(x_t, tau)
+                x_mid = (x_t + 0.5 * dt * v1).detach()
+                v2 = model_fn(x_mid, tau_mid)
+                x_t = (x_t + dt * v2).detach()
+
+        # 2. 마지막 한 번만 feasible region으로 gradient descent projection
+        if n_final_proj_steps > 0:
+            x_t = self._feasibility_grad_step_n(
+                x_t,
+                agent_type=agent_type.to(x_t.device),
+                current_control=(
+                    current_control.to(x_t.device, dtype=torch.float32)
+                    if current_control is not None else None
+                ),
+                current_control_valid=(
+                    current_control_valid.to(x_t.device)
+                    if current_control_valid is not None else None
+                ),
+                n_steps=n_final_proj_steps,
+            )
+
+        return x_t
+
+    def _feasibility_grad_step_n(
+        self,
+        x: Tensor,
+        agent_type: Tensor,
+        current_control: Optional[Tensor],
+        current_control_valid: Optional[Tensor],
+        n_steps: int,
+    ) -> Tensor:
+        """임의의 step 수로 feasibility gradient descent를 수행합니다."""
+        for _ in range(n_steps):
+            x_req = x.detach().requires_grad_(True)
+            with torch.enable_grad():
+                gap, _ = self.projector.compute_terminal_cost(
+                    pred_clean_norm=x_req,
+                    agent_type=agent_type,
+                    current_control=current_control,
+                    current_control_valid=current_control_valid,
+                )
+            if not gap.requires_grad:
+                break
+            (grad,) = torch.autograd.grad(gap, x_req)
+            x = (x - self.proj_lr * grad).detach()
+        return x

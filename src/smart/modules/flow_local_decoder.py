@@ -140,6 +140,7 @@ class FlowODE:
         model_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         steps: Optional[int] = None,
         method: Optional[str] = None,
+        post_process_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> torch.Tensor:
         steps = self.solver_steps if steps is None else steps
         method = self.solver_method if method is None else method
@@ -163,6 +164,73 @@ class FlowODE:
                 x_t = x_t + dt * v
             else:
                 raise ValueError(f"Unsupported solver method: {method}")
+
+            if post_process_fn is not None:
+                x_t = post_process_fn(x_t)
+
+        return x_t
+
+    @torch.no_grad()
+    def generate_predict_project_renoise(
+        self,
+        x_init: torch.Tensor,
+        model_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        project_fn: Callable[[torch.Tensor, float], torch.Tensor],
+        steps: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Predict-Project-Renoise generation loop.
+
+        매 step:
+          1. v_θ(x_t, t) 로 x_1 예측
+          2. x_1 을 feasible region으로 projection (강도는 t_next로 결정)
+          3. x_0(noise)를 역산하고 projected x_1과 재결합(re-noise)하여 x_{t+dt} 생성
+
+        ODE path: x_t = σ_t · x_0 + t · x_1,  σ_t = 1 - β·t,  β = 1 - σ_min
+
+        Projection 강도(proj_weight):
+          ``t_next`` 를 그대로 사용합니다. 마지막 step에서 ``t_next=1.0`` 이므로
+          최종 출력은 완전 projection 됩니다. 초반 step은 t_next 가 작아서
+          projection 영향이 적습니다. (noisy x_1_pred 를 강제로 project 하는
+          부작용을 줄이는 time-adaptive schedule)
+
+        Args:
+            x_init: 초기 noise. shape ``[n, 20, 4]``.
+            model_fn: ``(x_t, tau) -> velocity`` callable.
+            project_fn: ``(x_1, proj_weight: float) -> x_1_feasible`` callable.
+                ``proj_weight`` 는 0.0(projection 없음) ~ 1.0(완전 projection).
+            steps: ODE step 수. None이면 self.solver_steps 사용.
+
+        Returns:
+            Tensor: 생성된 feasible trajectory. shape ``[n, 20, 4]``.
+        """
+        steps = self.solver_steps if steps is None else steps
+        beta = self._beta()
+
+        x_t = x_init
+        t0 = self.eps
+        dt = (1.0 - t0) / float(steps)
+
+        for i in range(steps):
+            t = t0 + i * dt
+            t_next = t + dt
+            tau = x_t.new_full((x_t.shape[0],), t)
+            sigma_t = 1.0 - beta * t
+
+            # 1. velocity 예측 → x_1 예측
+            v = model_fn(x_t, tau)
+            x_1_pred = beta * x_t + sigma_t * v  # predict_clean_from_velocity
+
+            # 2. x_1 → feasible region으로 projection
+            #    t_next 를 proj_weight 로 사용: 마지막 step(t_next=1.0)에서 완전 projection
+            x_1_proj = project_fn(x_1_pred, t_next)
+
+            # 3. x_0(noise) 역산: x_t = σ_t·x_0 + t·x_1_pred → x_0 = (x_t - t·x_1_pred) / σ_t
+            sigma_t_safe = max(sigma_t, self.eps)
+            x_0_est = (x_t - t * x_1_pred) / sigma_t_safe
+
+            # 4. re-noise: x_{t+dt} = σ_{t+dt}·x_0 + (t+dt)·x_1_proj
+            sigma_t_next = 1.0 - beta * t_next
+            x_t = sigma_t_next * x_0_est + t_next * x_1_proj
 
         return x_t
 

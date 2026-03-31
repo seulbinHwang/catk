@@ -73,6 +73,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             solver_method=flow_solver_method,
         )
         self.commit_bridge = ContinuousCommitBridge()
+        # Optional kinematic projection applied at inference time.
+        # Set externally (e.g. from SMARTFlow.__init__) to enable; None = disabled.
+        self.kinematic_projector = None
+        # If True, use predict-project-renoise loop instead of standard ODE + final projection.
+        self.use_predict_project_renoise: bool = False
+        # Number of steps for PPR loop. None = use flow_ode.solver_steps default.
+        self.ppr_steps: int | None = None
 
     def build_interaction_edge(
         self,
@@ -262,6 +269,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_hidden_valid: torch.Tensor,
         sampling_noise: DictConfig,
         sampling_seed: int | None = None,
+        agent_type: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -270,6 +278,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
             sampling_noise: 평가 시 샘플링 초기 잡음 설정입니다.
             sampling_seed: 평가마다 같은 출발 잡음을 만들기 위한 seed입니다.
+            agent_type: 유효 anchor의 agent type입니다. shape ``[n_valid_anchor]``.
+                None이면 kinematic projection이 비활성화됩니다.
 
         Returns:
             torch.Tensor: 생성된 정규화 2초 미래입니다.
@@ -291,10 +301,22 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dtype=anchor_hidden_valid.dtype,
             generator=generator,
         ) * getattr(sampling_noise, "noise_scale", 1.0)
-        return self.flow_ode.generate(
-            x_init=x_init_norm,
-            model_fn=lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau),
-        )
+
+        _model_fn = lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau)
+
+        if self.use_predict_project_renoise and self.kinematic_projector is not None and agent_type is not None:
+            _at = agent_type
+            result = self.flow_ode.generate_predict_project_renoise(
+                x_init=x_init_norm,
+                model_fn=_model_fn,
+                project_fn=lambda x1, pw: self.kinematic_projector(x1, _at, proj_weight=pw),
+                steps=self.ppr_steps,
+            )
+        else:
+            result = self.flow_ode.generate(x_init=x_init_norm, model_fn=_model_fn)
+            if self.kinematic_projector is not None and agent_type is not None:
+                result = self.kinematic_projector(result, agent_type)
+        return result
 
     def sample_open_loop_future(
         self,
@@ -302,6 +324,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_mask: torch.Tensor,
         sampling_noise: DictConfig,
         sampling_seed: int | None = None,
+        agent_type: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
@@ -312,6 +335,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_agent, 13]`` 입니다.
             sampling_noise: 평가 시 샘플링 초기 잡음 설정입니다.
             sampling_seed: 평가마다 같은 출발 잡음을 만들기 위한 seed입니다.
+            agent_type: 유효 anchor의 agent type입니다. shape ``[n_valid_anchor]``.
 
         Returns:
             torch.Tensor: 생성된 정규화 2초 미래입니다.
@@ -322,6 +346,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             anchor_hidden_valid=anchor_hidden_valid,
             sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
+            agent_type=agent_type,
         )
 
 
@@ -801,10 +826,22 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     active_mask,
                     noise_start : noise_start + sample_window_steps,
                 ].contiguous()
-                y_hat_norm = self.flow_ode.generate(
-                    x_init=x_init_norm,
-                    model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
-                )
+                _active_type = tokenized_agent["type"][active_mask]
+                _model_fn_cl = lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau)
+                if self.use_predict_project_renoise and self.kinematic_projector is not None:
+                    _at_cl = _active_type
+                    y_hat_norm = self.flow_ode.generate_predict_project_renoise(
+                        x_init=x_init_norm,
+                        model_fn=_model_fn_cl,
+                        project_fn=lambda x1, pw: self.kinematic_projector(x1, _at_cl, proj_weight=pw),
+                        steps=self.ppr_steps,
+                    )
+                else:
+                    y_hat_norm = self.flow_ode.generate(
+                        x_init=x_init_norm, model_fn=_model_fn_cl
+                    )
+                    if self.kinematic_projector is not None:
+                        y_hat_norm = self.kinematic_projector(y_hat_norm, _active_type)
                 commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
                     y_hat_norm=y_hat_norm,
                     current_pos=pos_window[active_mask, -1],

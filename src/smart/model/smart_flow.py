@@ -23,6 +23,7 @@ from src.smart.metrics.flow_metrics import (
     yaw_fde_2s,
 )
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
+from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.modules.flow_projected_generation import ProjectedFlowGenerator
 from src.smart.modules.flow_terminal_cost_final_step import TerminalCostFinalStepLoss
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
@@ -135,6 +136,33 @@ class SMARTFlow(LightningModule):
                 }
             )
 
+        # Final projection generation (standard ODE → post-hoc gradient descent to feasible region)
+        final_proj_cfg = getattr(model_config, "final_projection", None)
+        self.final_proj_generator: ProjectedFlowGenerator | None = None
+        self.n_final_proj_steps: int = 100
+        if final_proj_cfg is not None and getattr(final_proj_cfg, "enabled", False):
+            _fp_projector = SmoothControlProjector(
+                feasible_weight=float(getattr(final_proj_cfg, "feasible_weight", 1.0)),
+                smooth_deadzone_epsilon=list(
+                    getattr(final_proj_cfg, "smooth_deadzone_epsilon", [0.01, 0.01, 0.01])
+                ),
+                smooth_deadzone_tau=float(getattr(final_proj_cfg, "smooth_deadzone_tau", 0.002)),
+            )
+            self.final_proj_generator = ProjectedFlowGenerator(
+                projector=_fp_projector,
+                n_proj_steps=0,  # no per-step projection
+                proj_lr=float(getattr(final_proj_cfg, "proj_lr", 0.01)),
+            )
+            self.n_final_proj_steps = int(getattr(final_proj_cfg, "n_final_proj_steps", 100))
+            self.val_final_proj_epoch_metrics = nn.ModuleDict(
+                {
+                    "final_proj_ADE2s": WeightedMeanMetric(),
+                    "final_proj_FDE2s": WeightedMeanMetric(),
+                    "final_proj_yaw_ADE2s": WeightedMeanMetric(),
+                    "final_proj_yaw_FDE2s": WeightedMeanMetric(),
+                }
+            )
+
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
                 "ADE2s": WeightedMeanMetric(),
@@ -143,6 +171,33 @@ class SMARTFlow(LightningModule):
                 "yaw_FDE2s": WeightedMeanMetric(),
             }
         )
+
+        # Kinematic projection: per-step post-processing inside FlowODE.generate
+        # Vehicle/Cyclist → non-holonomic heading projection + deadzone
+        # Pedestrian → point-mass magnitude deadzone + speed clipping
+        kin_cfg = getattr(model_config, "kinematic_projection", None)
+        if kin_cfg is not None and getattr(kin_cfg, "enabled", False):
+            _kin_proj = KinematicProjection(
+                vehicle_deadzone=float(getattr(kin_cfg, "vehicle_deadzone", 0.05)),
+                ped_deadzone=float(getattr(kin_cfg, "ped_deadzone", 0.03)),
+                ped_max_speed=float(getattr(kin_cfg, "ped_max_speed", 0.5)),
+                eps=float(getattr(kin_cfg, "eps", 1e-6)),
+            )
+            # attach to the agent encoder so both open-loop and closed-loop paths use it
+            self.encoder.agent_encoder.kinematic_projector = _kin_proj
+            self.encoder.agent_encoder.use_predict_project_renoise = bool(
+                getattr(kin_cfg, "predict_project_renoise", False)
+            )
+            _ppr_steps = getattr(kin_cfg, "ppr_steps", None)
+            self.encoder.agent_encoder.ppr_steps = int(_ppr_steps) if _ppr_steps is not None else None
+            self.val_kinematic_proj_epoch_metrics = nn.ModuleDict(
+                {
+                    "kin_ADE2s": WeightedMeanMetric(),
+                    "kin_FDE2s": WeightedMeanMetric(),
+                    "kin_yaw_ADE2s": WeightedMeanMetric(),
+                    "kin_yaw_FDE2s": WeightedMeanMetric(),
+                }
+            )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
         """학습 중 validation을 체크포인트 점수 전용으로 줄일지 판단합니다.
@@ -1149,6 +1204,77 @@ class SMARTFlow(LightningModule):
             sample_count=int(target_clean_norm.shape[0]),
         )
 
+    def _final_projection_val_step(
+        self,
+        tokenized_map: Dict,
+        tokenized_agent: Dict,
+    ) -> None:
+        """표준 ODE 생성 후 마지막에 feasible region으로 gradient descent projection하고 ADE/FDE를 기록합니다."""
+        if "flow_eval_mask" in tokenized_agent:
+            anchor_mask_key = "flow_eval_mask"
+            clean_norm_key = "flow_eval_clean_norm"
+            agent_type_key = "flow_eval_agent_type"
+            ctrl_key = "flow_eval_current_control"
+            ctrl_valid_key = "flow_eval_current_control_valid"
+        elif "flow_train_mask" in tokenized_agent:
+            anchor_mask_key = "flow_train_mask"
+            clean_norm_key = "flow_train_clean_norm"
+            agent_type_key = "flow_train_agent_type"
+            ctrl_key = "flow_train_current_control"
+            ctrl_valid_key = "flow_train_current_control_valid"
+        else:
+            return
+
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key=anchor_mask_key,
+            )
+
+        if anchor_hidden_valid.numel() == 0:
+            return
+
+        anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        flow_ode = self.encoder.agent_encoder.flow_ode
+
+        x_init = torch.randn(
+            anchor_hidden_valid.shape[0], 20, 4,
+            device=anchor_hidden_valid.device,
+            dtype=torch.float32,
+        )
+
+        def model_fn(x_t: Tensor, tau: Tensor) -> Tensor:
+            with torch.no_grad():
+                return flow_decoder(anchor_hidden_valid, x_t, tau)
+
+        pred_clean_norm = self.final_proj_generator.generate_with_final_projection(
+            flow_ode=flow_ode,
+            model_fn=model_fn,
+            x_init=x_init,
+            agent_type=tokenized_agent[agent_type_key],
+            current_control=tokenized_agent.get(ctrl_key),
+            current_control_valid=tokenized_agent.get(ctrl_valid_key),
+            steps=16,
+            n_final_proj_steps=self.n_final_proj_steps,
+        )
+
+        target_clean_norm = tokenized_agent[clean_norm_key].to(
+            device=pred_clean_norm.device, dtype=pred_clean_norm.dtype
+        )
+        fp_metric_dict = self._build_open_loop_metric_dict(
+            pred_clean_norm=pred_clean_norm,
+            target_clean_norm=target_clean_norm,
+        )
+        fp_metric_dict = {f"final_proj_{k}": v for k, v in fp_metric_dict.items()}
+        self._update_weighted_validation_metrics(
+            metric_store=self.val_final_proj_epoch_metrics,
+            metric_dict=fp_metric_dict,
+            sample_count=int(target_clean_norm.shape[0]),
+        )
+
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         map_feature = None
@@ -1167,6 +1293,7 @@ class SMARTFlow(LightningModule):
                 anchor_mask=denoise_pred["anchor_mask"],
                 sampling_noise=self.eval_sampling_noise,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
+                agent_type=tokenized_agent.get("flow_eval_agent_type"),
             )
             open_metric_dict = self._build_open_loop_metric_dict(
                 pred_clean_norm=open_pred_clean_norm,
@@ -1178,12 +1305,28 @@ class SMARTFlow(LightningModule):
                 sample_count=open_sample_count,
             )
 
+            # kinematic projection open-loop metrics (separate tracker for before/after comparison)
+            if hasattr(self, "val_kinematic_proj_epoch_metrics"):
+                kin_metric_dict = {f"kin_{k}": v for k, v in open_metric_dict.items()}
+                self._update_weighted_validation_metrics(
+                    metric_store=self.val_kinematic_proj_epoch_metrics,
+                    metric_dict=kin_metric_dict,
+                    sample_count=open_sample_count,
+                )
+
         # Projected Diffusion open-loop generation (feasibility projection at each ODE step)
         if self.projected_generator is not None:
             self._projected_generation_val_step(
                 tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,
                 batch_idx=batch_idx,
+            )
+
+        # Final projection: standard ODE → post-hoc gradient descent to feasible region
+        if self.final_proj_generator is not None:
+            self._final_projection_val_step(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
             )
 
         if self.val_closed_loop:
@@ -1242,6 +1385,22 @@ class SMARTFlow(LightningModule):
                 metric_store=self.val_projected_epoch_metrics,
             )
             for metric_name, metric_value in epoch_proj_metrics.items():
+                self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
+
+        if self.final_proj_generator is not None:
+            epoch_fp_metrics = self._compute_and_reset_validation_metrics(
+                prefix="val_final_proj",
+                metric_store=self.val_final_proj_epoch_metrics,
+            )
+            for metric_name, metric_value in epoch_fp_metrics.items():
+                self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
+
+        if hasattr(self, "val_kinematic_proj_epoch_metrics"):
+            epoch_kin_metrics = self._compute_and_reset_validation_metrics(
+                prefix="val_kinematic",
+                metric_store=self.val_kinematic_proj_epoch_metrics,
+            )
+            for metric_name, metric_value in epoch_kin_metrics.items():
                 self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
 
         if self.val_closed_loop:

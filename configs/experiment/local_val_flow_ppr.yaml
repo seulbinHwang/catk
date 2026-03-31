@@ -1,0 +1,44 @@
+# @package _global_
+# Validation: Predict-Project-Renoise generation.
+# 매 ODE step: x_t → x_1 예측 → kinematic projection → re-noise → x_{t+dt}
+# Vehicle/Cyclist: non-holonomic heading projection + deadzone
+# Pedestrian: point-mass magnitude deadzone + speed clipping
+
+defaults:
+  - override /model: smart_flow
+
+model:
+  model_config:
+    n_vis_batch: 1
+    n_vis_scenario: 2
+    n_vis_rollout: 4
+    n_batch_sim_agents_metric: 50
+    val_open_loop: true
+    val_closed_loop: true
+    n_rollout_closed_val: 16
+    eval_sampling_noise:
+      noise_scale: 1.0
+    kinematic_projection:
+      enabled: true
+      predict_project_renoise: true   # ← predict-project-renoise loop 활성화
+      vehicle_deadzone: 0.05          # 0.05 m/step = 0.5 m/s (정지 판별 임계값)
+      ped_deadzone: 0.025             # 0.025 m/step = 0.25 m/s
+      ped_max_speed: 0.5
+      eps: 1.0e-6
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 50
+  check_val_every_n_epoch: 1
+  precision: 32-true
+
+data:
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 2
+
+action: validate
