@@ -26,6 +26,7 @@ class FlowTokenProcessor(TokenProcessor):
         agent_token_file: str,
         map_token_sampling,
         agent_token_sampling,
+        num_historical_steps: int,
     ) -> None:
         """map token만 초기화하고 agent vocab 로드는 생략합니다.
 
@@ -34,6 +35,7 @@ class FlowTokenProcessor(TokenProcessor):
             agent_token_file: 기존 설정 호환용 인자입니다. 더 이상 쓰지 않습니다.
             map_token_sampling: map token 샘플링 설정입니다.
             agent_token_sampling: 기존 설정 호환용 인자입니다. 더 이상 쓰지 않습니다.
+            num_historical_steps: closed-loop rollout이 시작되는 observed history 길이입니다.
         """
         del agent_token_file
         torch.nn.Module.__init__(self)
@@ -42,6 +44,7 @@ class FlowTokenProcessor(TokenProcessor):
         self.shift = 5
         self.num_context_steps = 14
         self.num_anchor_steps = 13
+        self.num_historical_steps = int(num_historical_steps)
         module_dir = os.path.dirname(__file__)
         self.init_map_token(os.path.join(module_dir, map_token_file))
         self.n_token_agent = 0
@@ -96,7 +99,10 @@ class FlowTokenProcessor(TokenProcessor):
         coarse_heading = heading[:, self.shift :: self.shift].contiguous()
         coarse_valid = valid[:, self.shift :: self.shift].contiguous()
 
-        current_step_10hz = min(self.num_context_steps * self.shift, data["agent"]["position"].shape[1] - 1)
+        current_step_10hz = min(
+            max(self.num_historical_steps - 1, 0),
+            data["agent"]["position"].shape[1] - 1,
+        )
         gt_z_raw = data["agent"]["position"][:, current_step_10hz, 2].contiguous()
 
         tokenized_agent = {

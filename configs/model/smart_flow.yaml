@@ -18,6 +18,7 @@ model_config:
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
+    num_historical_steps: ${..decoder.num_historical_steps}
     map_token_sampling:
       num_k: 1
       temp: 1.0
