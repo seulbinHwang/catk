@@ -320,7 +320,7 @@ class KinematicProjection(nn.Module):
 
         a_hi = self.a_max * dt
         d_hi = self.d_max * dt
-        for t in range(T):
+        for t in range(T): # 매 step 가능한 velocity의 범위를 계산한다.
             v_lo = (v_ref[:, t] - d_hi).clamp_min(0.0)
             v_hi = v_ref[:, t] + a_hi
             v_ref[:, t + 1] = torch.max(torch.min(v_pred[:, t], v_hi), v_lo)

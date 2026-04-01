@@ -53,7 +53,7 @@
       },
       "args": [
         "action=validate",
-        "experiment=local_val_flow_ppr_16step",
+        "experiment=local_val_flow_final_proj",
         "trainer.max_epochs=1",
         "trainer.limit_val_batches=1",
         "trainer.accelerator=gpu",
