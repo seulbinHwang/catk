@@ -42,18 +42,12 @@ class KinematicProjection(nn.Module):
       - 좌표 채널은 **누적** 로컬 위치(정규화); 프로젝션은 차분해 자전거/보행자를 적용한 뒤
         다시 누적 형식으로 내보냄.
       - heading 채널은 해당 시점의 로컬 절대 헤딩(기존과 동일).
-
-    두 모드:
-        use_bicycle_model=True  : Vehicle/Cyclist → TV-LQR + Bicycle (batched)
-                                  Pedestrian      → Point-mass speed clamp (batched)
-        use_bicycle_model=False : identity (passthrough)
     """
 
     def __init__(
         self,
         coord_scale: float = 20.0,
         dt: float = 0.1,
-        use_bicycle_model: bool = True,
         # Bicycle model
         wheelbase: float = 2.7,
         delta_max: float = 0.52,
@@ -77,7 +71,6 @@ class KinematicProjection(nn.Module):
         super().__init__()
         self.coord_scale = float(coord_scale)
         self.dt = float(dt)
-        self.use_bicycle_model = bool(use_bicycle_model)
         self.wheelbase = float(wheelbase)
         self.delta_max = float(delta_max)
         self.a_max = float(a_max)
@@ -116,7 +109,7 @@ class KinematicProjection(nn.Module):
         Returns:
             Tensor [n, T, 4].
         """
-        if x.numel() == 0 or not self.use_bicycle_model:
+        if x.numel() == 0:
             return x
 
         projected = x.clone()
@@ -126,7 +119,7 @@ class KinematicProjection(nn.Module):
             if n > 0:
                 projected = self._project_bicycle_batch(x, v_init, delta_init=None)
         else:
-            ped_mask = (agent_type == 1)
+            ped_mask = (agent_type == 1) # pedestrian
             veh_mask = ~ped_mask
 
             if veh_mask.any():
@@ -163,7 +156,7 @@ class KinematicProjection(nn.Module):
             v_final[i]:     step commit_steps-1 종료 시 속도 (다음 chunk 시작).
             delta_final[i]: 동일 시점 조향각.
         """
-        if x.numel() == 0 or not self.use_bicycle_model:
+        if x.numel() == 0:
             n = x.shape[0]
             zeros = x.new_zeros(n)
             return x, zeros, zeros
@@ -294,6 +287,11 @@ class KinematicProjection(nn.Module):
             delta_init: [B] or None. chunk 시작 조향각 (rad).
                         None → steering_target[:, 0] 으로 초기화.
 
+            x[B, T, 0] = 시작점 anchor를 기준으로 현재 시점 x좌표 기준 얼마나 떨어져 있는가. 를 /20으로 normalized 된 값.
+            x[B, T, 1] = 시작점 anchor를 기준으로 현재 시점 y좌표 기준 얼마나 떨어져 있는가. 를 /20으로 normalized 된 값.
+            x[B, T, 2] = 시작점 anchor를 기준으로 현재 시점 heading 차이의 cos값
+            x[B, T, 3] = 시작점 anchor를 기준으로 현재 시점 heading 차이의 sin값
+
         Returns:
             (out [B, T, 4], v_seq [B, T+1], delta_seq [B, T+1])
             v_seq[:, 0] = v_init, v_seq[:, t+1] = velocity after step t.
@@ -305,13 +303,13 @@ class KinematicProjection(nn.Module):
 
         # ── 1. 토큰 디코딩 (좌표는 누적 로컬 → 스텝 변위) ────────────────────
         dx_m, dy_m = self._step_delta_m_from_cumulative_xy(x)
-        disp_m = (dx_m ** 2 + dy_m ** 2 + eps).sqrt()
+        disp_m = (dx_m ** 2 + dy_m ** 2 + eps).sqrt() #매 스텝마다 이동한 거리.
         v_pred = disp_m / dt                     # [B, T], m/s
 
-        norm_h = (x[:, :, 2] ** 2 + x[:, :, 3] ** 2 + eps).sqrt()
-        theta_cum = torch.atan2(x[:, :, 3] / norm_h, x[:, :, 2] / norm_h)   # [B, T]
-        theta_prev = torch.cat([theta_cum.new_zeros(B, 1), theta_cum[:, :-1]], dim=1)
-        dtheta_pred = _wrap_to_pi(theta_cum - theta_prev)   # [B, T]
+        norm_h = (x[:, :, 2] ** 2 + x[:, :, 3] ** 2 + eps).sqrt() #model output cos, sin의 norm이 1이 아닐 수 있으므로 보정용.
+        theta_cum = torch.atan2(x[:, :, 3] / norm_h, x[:, :, 2] / norm_h)   # [B, T] #보정한 cos, sin을 기반으로 heading 계산
+        theta_prev = torch.cat([theta_cum.new_zeros(B, 1), theta_cum[:, :-1]], dim=1) #-1시점씩 sliding시킨 뒤
+        dtheta_pred = _wrap_to_pi(theta_cum - theta_prev)   # [B, T] # 현재 시점 heading과 이전 시점 heading의 차이를 빼서 step단위 \theta 차이 계산.
 
         # ── 2. 참조 속도 v_ref [B, T+1] ─────────────────────────────────
         v_ref = torch.empty(B, T + 1, device=device, dtype=dtype)

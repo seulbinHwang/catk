@@ -180,7 +180,6 @@ class SMARTFlow(LightningModule):
             _kin_proj = KinematicProjection(
                 coord_scale=20.0,  # flow target에서 사용하는 스케일과 동일
                 dt=0.1,
-                use_bicycle_model=bool(getattr(kin_cfg, "use_bicycle_model", False)),
                 wheelbase=float(getattr(kin_cfg, "wheelbase", 2.7)),
                 delta_max=float(getattr(kin_cfg, "delta_max", 0.52)),
                 a_max=float(getattr(kin_cfg, "a_max", 4.0)),
@@ -1307,12 +1306,36 @@ class SMARTFlow(LightningModule):
                 anchor_mask_key="flow_eval_mask",
             )
             open_sample_count = int(denoise_pred["flow_clean_norm"].shape[0])
+            open_v_init = None
+            if (
+                "ctx_sampled_pos" in tokenized_agent
+                and denoise_pred["anchor_mask"].numel() > 0
+                and self.encoder.agent_encoder.kinematic_projector is not None
+            ):
+                ctx_pos = tokenized_agent["ctx_sampled_pos"]
+                anchor_mask = denoise_pred["anchor_mask"]
+                dt_coarse = (
+                    float(self.encoder.agent_encoder.shift)
+                    * float(self.encoder.agent_encoder.kinematic_projector.dt)
+                )
+                packed_v_init: list[Tensor] = []
+                for anchor_idx in range(anchor_mask.shape[1]):
+                    mask_i = anchor_mask[:, anchor_idx]
+                    if not bool(mask_i.any()):
+                        continue
+                    dp = ctx_pos[:, anchor_idx + 1] - ctx_pos[:, anchor_idx]
+                    packed_v_init.append(dp[mask_i].norm(dim=-1) / dt_coarse)
+                if len(packed_v_init) > 0:
+                    open_v_init = torch.cat(packed_v_init, dim=0)
             open_pred_clean_norm = self.encoder.sample_open_loop_future(
                 anchor_hidden=denoise_pred["anchor_hidden"],
                 anchor_mask=denoise_pred["anchor_mask"],
                 sampling_noise=self.eval_sampling_noise,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
                 agent_type=tokenized_agent.get("flow_eval_agent_type"),
+                v_init=open_v_init,
+                current_control=tokenized_agent.get("flow_eval_current_control"),
+                current_control_valid=tokenized_agent.get("flow_eval_current_control_valid"),
             )
             open_metric_dict = self._build_open_loop_metric_dict(
                 pred_clean_norm=open_pred_clean_norm,

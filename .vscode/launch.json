@@ -59,9 +59,11 @@
         "trainer.accelerator=gpu",
         "trainer.devices=1",
         "paths.cache_root=/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1",
-        "data.num_workers=0",
-        "data.prefetch_factor=2",
+        "data.num_workers=1",
         "data.val_batch_size=1",
+        "model.model_config.val_open_loop=true",
+        "model.model_config.val_closed_loop=true",
+        "model.model_config.kinematic_projection.predict_project_renoise=false",
         "logger.wandb.offline=true",
         "task_name=debug_val_flow_ppr_16step_dbg"
       ],

@@ -165,6 +165,9 @@ class SMARTFlowDecoder(nn.Module):
         sampling_noise: DictConfig,
         sampling_seed: int | None = None,
         agent_type: Tensor | None = None,
+        v_init: Tensor | None = None,
+        current_control: Tensor | None = None,
+        current_control_valid: Tensor | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -176,6 +179,10 @@ class SMARTFlowDecoder(nn.Module):
             sampling_noise: 평가 시 샘플링 초기 잡음 설정입니다.
             sampling_seed: 평가마다 같은 샘플을 만들기 위한 고정 seed입니다.
             agent_type: 유효 anchor의 agent type입니다. shape ``[n_valid_anchor]``.
+            current_control: 유효 anchor의 직전 body-frame control입니다.
+                shape은 ``[n_valid_anchor, 3]`` 입니다.
+            current_control_valid: 위 control의 신뢰도 마스크입니다.
+                shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
             Tensor: 생성된 정규화 2초 미래입니다.
@@ -187,6 +194,9 @@ class SMARTFlowDecoder(nn.Module):
             sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             agent_type=agent_type,
+            v_init=v_init,
+            current_control=current_control,
+            current_control_valid=current_control_valid,
         )
 
     def inference(

@@ -272,6 +272,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_noise: DictConfig,
         sampling_seed: int | None = None,
         agent_type: torch.Tensor | None = None,
+        v_init: torch.Tensor | None = None,
+        current_control: torch.Tensor | None = None,
+        current_control_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -306,19 +309,28 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
 
         _model_fn = lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau)
+        if v_init is None and current_control is not None:
+            v_init = current_control[:, :2].norm(dim=-1)
+            if current_control_valid is not None:
+                v_init = v_init.masked_fill(~current_control_valid, 0.0)
 
         if self.use_predict_project_renoise and self.kinematic_projector is not None and agent_type is not None:
             _at = agent_type
             result = self.flow_ode.generate_predict_project_renoise(
                 x_init=x_init_norm,
                 model_fn=_model_fn,
-                project_fn=lambda x1, pw: self.kinematic_projector(x1, _at, proj_weight=pw),
+                project_fn=lambda x1, pw: self.kinematic_projector(
+                    x1,
+                    _at,
+                    proj_weight=pw,
+                    v_init=v_init,
+                ),
                 steps=self.ppr_steps,
             )
         else:
             result = self.flow_ode.generate(x_init=x_init_norm, model_fn=_model_fn)
             if self.kinematic_projector is not None and agent_type is not None:
-                result = self.kinematic_projector(result, agent_type)
+                result = self.kinematic_projector(result, agent_type, v_init=v_init)
         return result
 
     def sample_open_loop_future(
@@ -328,6 +340,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_noise: DictConfig,
         sampling_seed: int | None = None,
         agent_type: torch.Tensor | None = None,
+        v_init: torch.Tensor | None = None,
+        current_control: torch.Tensor | None = None,
+        current_control_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
@@ -350,6 +365,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             agent_type=agent_type,
+            v_init=v_init,
+            current_control=current_control,
+            current_control_valid=current_control_valid,
         )
 
 
