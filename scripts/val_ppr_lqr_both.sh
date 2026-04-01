@@ -1,12 +1,10 @@
 #!/bin/sh
-# PPR 16-step 두 실험 동시 실행:
-#   - projection ON  (GPU_PROJ)
-#   - projection OFF (GPU_NOPROJ)
-# projection 외 세팅은 완전히 동일하게 유지.
+# PPR 16-step 두 실험 동시 실행 (kinematic projection ON 고정):
+#   - TV-LQR ON  (GPU_LQR_ON)
+#   - TV-LQR OFF (GPU_LQR_OFF)
+# projection·그 외 세팅은 동일하게 유지하고 LQR 피드백만 비교.
 #
-# Deadzone 설정:
-#   VEHICLE_DEADZONE  — Vehicle / Cyclist 종방향 속도 threshold (기본 0.05, 0이면 비활성)
-#   PED_DEADZONE      — Pedestrian 이동 크기 threshold        (기본 0.03, 0이면 비활성)
+# Deadzone 등은 val_ppr_both.sh 와 동일하게 환경변수로 줄 수 있음.
 
 export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
@@ -26,8 +24,8 @@ CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_pro
 CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt}"
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 
-GPU_PROJ="${GPU_PROJ:-2}"
-GPU_NOPROJ="${GPU_NOPROJ:-3}"
+GPU_LQR_ON="${GPU_LQR_ON:-2}"
+GPU_LQR_OFF="${GPU_LQR_OFF:-3}"
 
 VAL_B="${VAL_B:-4}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-1}"
@@ -49,31 +47,32 @@ COMMON_ARGS="
   model.model_config.n_vis_scenario=${N_VIS_SCENARIO}
   model.model_config.n_vis_rollout=${N_VIS_ROLLOUT}
   logger.wandb.entity=${WANDB_ENTITY}
+  model.model_config.kinematic_projection.enabled=true
 "
 
 echo "CKPT_PATH=${CKPT_PATH}"
-echo "Launching 16-step proj ON on GPU ${GPU_PROJ}, proj OFF on GPU ${GPU_NOPROJ} ..."
+echo "Launching 16-step LQR ON on GPU ${GPU_LQR_ON}, LQR OFF on GPU ${GPU_LQR_OFF} ..."
 
-CUDA_VISIBLE_DEVICES=${GPU_PROJ} python -m src.run \
+CUDA_VISIBLE_DEVICES=${GPU_LQR_ON} python -m src.run \
   experiment=local_val_flow_ppr_16step \
-  task_name=val_ppr_16step_proj_on \
+  task_name=val_ppr_16step_lqr_on \
   ${COMMON_ARGS} \
-  model.model_config.kinematic_projection.enabled=true \
-  > /tmp/val_ppr_16step_proj_on.log 2>&1 &
-PID_PROJ=$!
+  model.model_config.kinematic_projection.use_lqr=true \
+  > /tmp/val_ppr_16step_lqr_on.log 2>&1 &
+PID_LQR_ON=$!
 
-CUDA_VISIBLE_DEVICES=${GPU_NOPROJ} python -m src.run \
+CUDA_VISIBLE_DEVICES=${GPU_LQR_OFF} python -m src.run \
   experiment=local_val_flow_ppr_16step \
-  task_name=val_ppr_16step_proj_off \
+  task_name=val_ppr_16step_lqr_off \
   ${COMMON_ARGS} \
-  model.model_config.kinematic_projection.enabled=false \
-  > /tmp/val_ppr_16step_vid.log 2>&1 &
-PID_NOPROJ=$!
+  model.model_config.kinematic_projection.use_lqr=false \
+  > /tmp/val_ppr_16step_lqr_off.log 2>&1 &
+PID_LQR_OFF=$!
 
-echo "16-step proj ON  PID=${PID_PROJ}   → /tmp/val_ppr_16step_proj_on.log"
-echo "16-step proj OFF PID=${PID_NOPROJ} → /tmp/val_ppr_16step_vid.log"
+echo "16-step LQR ON  PID=${PID_LQR_ON}   → /tmp/val_ppr_16step_lqr_on.log"
+echo "16-step LQR OFF PID=${PID_LQR_OFF} → /tmp/val_ppr_16step_lqr_off.log"
 
-wait ${PID_PROJ}
-echo "16-step proj ON  done (exit $?)"
-wait ${PID_NOPROJ}
-echo "16-step proj OFF done (exit $?)"
+wait ${PID_LQR_ON}
+echo "16-step LQR ON  done (exit $?)"
+wait ${PID_LQR_OFF}
+echo "16-step LQR OFF done (exit $?)"

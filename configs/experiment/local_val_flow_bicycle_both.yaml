@@ -1,7 +1,6 @@
 # @package _global_
-# Validation: PPR 16-step + Kinematic Bicycle Model projection.
-# 매 ODE step: x_1 예측 → bicycle model projection (time-weighted) → re-noise
-# Chunk 간 속도 상태(v_state) 유지로 물리적 연속성 보장.
+# Experiment C: PPR 16-step + closed-loop kinematic post-processing.
+# Bicycle LQR both inside ODE (PPR) and after each chunk (post-proc).
 
 defaults:
   - override /model: smart_flow
@@ -12,7 +11,7 @@ model:
     n_vis_scenario: 2
     n_vis_rollout: 4
     n_batch_sim_agents_metric: 50
-    val_open_loop: true
+    val_open_loop: false
     val_closed_loop: true
     n_rollout_closed_val: 16
     eval_sampling_noise:
@@ -21,15 +20,14 @@ model:
       enabled: true
       predict_project_renoise: true
       ppr_steps: 16
-      use_bicycle_model: true       # TV-LQR + Kinematic Bicycle Model
-      wheelbase: 2.7                # 축간거리 (m)
-      delta_max: 0.52               # 최대 조향각 (rad, ~30°)
-      a_max: 4.0                    # 최대 가속도 (m/s²)
-      d_max: 8.0                    # 최대 감속도 (m/s²)
-      delta_rate_max: 0.6           # 최대 조향 속도 (rad/s)
-      ped_a_max: 2.0                # 보행자 최대 가속/감속 (m/s²)
+      use_bicycle_model: true
+      wheelbase: 2.7
+      delta_max: 0.52
+      a_max: 4.0
+      d_max: 8.0
+      delta_rate_max: 0.6
+      ped_a_max: 2.0
       eps: 1.0e-6
-      # TV-LQR 가중치
       use_lqr: true
       lqr_q_xy: 2.0
       lqr_q_yaw: 2.0
@@ -38,6 +36,8 @@ model:
       lqr_r_a: 0.2
       lqr_r_delta_rate: 0.2
       lqr_qf_scale: 2.0
+    kinematic_postproc:
+      enabled: true
 
 ckpt_path: null
 

@@ -1,7 +1,6 @@
 # @package _global_
-# Validation: kinematic projection applied at each ODE step.
-# Vehicle/Cyclist: non-holonomic heading projection + deadzone
-# Pedestrian: point-mass magnitude deadzone + speed clipping
+# Experiment B: Closed-loop kinematic post-processing only.
+# Standard 16-step ODE (no PPR). Bicycle LQR applied after each chunk generation.
 
 defaults:
   - override /model: smart_flow
@@ -12,14 +11,32 @@ model:
     n_vis_scenario: 2
     n_vis_rollout: 4
     n_batch_sim_agents_metric: 50
-    val_open_loop: true
+    val_open_loop: false
     val_closed_loop: true
     n_rollout_closed_val: 16
     eval_sampling_noise:
       noise_scale: 1.0
     kinematic_projection:
       enabled: true
+      predict_project_renoise: false   # ODE without PPR
+      use_bicycle_model: true
+      wheelbase: 2.7
+      delta_max: 0.52
+      a_max: 4.0
+      d_max: 8.0
+      delta_rate_max: 0.6
+      ped_a_max: 2.0
       eps: 1.0e-6
+      use_lqr: true
+      lqr_q_xy: 2.0
+      lqr_q_yaw: 2.0
+      lqr_q_v: 0.5
+      lqr_q_delta: 0.2
+      lqr_r_a: 0.2
+      lqr_r_delta_rate: 0.2
+      lqr_qf_scale: 2.0
+    kinematic_postproc:
+      enabled: true
 
 ckpt_path: null
 

@@ -80,6 +80,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.use_predict_project_renoise: bool = False
         # Number of steps for PPR loop. None = use flow_ode.solver_steps default.
         self.ppr_steps: int | None = None
+        # If True, apply kinematic post-processing after each chunk (closed-loop only).
+        self.use_kinematic_postproc: bool = False
 
     def build_interaction_edge(
         self,
@@ -301,6 +303,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dtype=anchor_hidden_valid.dtype,
             generator=generator,
         ) * getattr(sampling_noise, "noise_scale", 1.0)
+
 
         _model_fn = lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau)
 
@@ -761,17 +764,33 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             and getattr(self.kinematic_projector, "use_bicycle_model", False)
         )
         if _use_bm:
+            _coarse_dt = self.shift * self.kinematic_projector.dt
             if pos_window.shape[1] >= 2:
                 _dp = pos_window[:, -1] - pos_window[:, -2]  # [n, 2], 2Hz window → 0.5s 이동
                 # pos_window는 2Hz (shift=5 × dt=0.1s = 0.5s 간격)이므로 shift*dt로 나눔
-                _coarse_dt = self.shift * self.kinematic_projector.dt
                 v_state = _dp.norm(dim=-1) / _coarse_dt  # m/s [n]
             else:
                 v_state = torch.zeros(
                     n_agent, device=pos_window.device, dtype=pos_window.dtype
                 )
         else:
+            _coarse_dt = None
             v_state = None
+
+        _use_pp = _use_bm and self.use_kinematic_postproc
+        if _use_pp:
+            # Estimate initial steering from 2Hz trajectory history
+            if head_window.shape[1] >= 2 and v_state is not None:
+                _dtheta = wrap_angle(head_window[:, -1] - head_window[:, -2])  # 2Hz delta heading
+                _v_c = v_state.clamp_min(1e-6)
+                _kappa = _dtheta / (_v_c * _coarse_dt + 1e-6)
+                _L = self.kinematic_projector.wheelbase
+                _dmax = self.kinematic_projector.delta_max
+                delta_state = torch.atan(_L * _kappa).clamp(-_dmax, _dmax)
+            else:
+                delta_state = torch.zeros(n_agent, device=pos_window.device, dtype=pos_window.dtype)
+        else:
+            delta_state = None
 
         for t in range(n_step_future_2hz):
             n_step = pos_window.shape[1]
@@ -848,6 +867,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 _active_type = tokenized_agent["type"][active_mask]
                 _model_fn_cl = lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau)
                 _v_init_cl = v_state[active_mask] if v_state is not None else None
+                _delta_init_cl = delta_state[active_mask] if delta_state is not None else None
                 if self.use_predict_project_renoise and self.kinematic_projector is not None:
                     _at_cl = _active_type
                     y_hat_norm = self.flow_ode.generate_predict_project_renoise(
@@ -862,18 +882,35 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     y_hat_norm = self.flow_ode.generate(
                         x_init=x_init_norm, model_fn=_model_fn_cl
                     )
-                    if self.kinematic_projector is not None:
+                    # Apply inline projection only when post-processing is NOT handling it
+                    if self.kinematic_projector is not None and not self.use_kinematic_postproc:
                         y_hat_norm = self.kinematic_projector(
                             y_hat_norm, _active_type, v_init=_v_init_cl
                         )
-                # v_state 업데이트: committed portion 마지막 스텝의 속도로 갱신
-                if v_state is not None:
-                    _commit_last = self.shift - 1  # = 4 (0-indexed, 0.5s 청크 마지막)
-                    _dx_c = y_hat_norm[:, _commit_last, 0] * self.kinematic_projector.coord_scale
-                    _dy_c = y_hat_norm[:, _commit_last, 1] * self.kinematic_projector.coord_scale
-                    v_state[active_mask] = (
-                        (_dx_c**2 + _dy_c**2).sqrt() / self.kinematic_projector.dt
+                # Kinematic post-processing (if enabled) OR v_state update from raw output
+                if delta_state is not None and self.kinematic_projector is not None:
+                    # Post-processing with full state tracking
+                    y_hat_norm, _v_new, _d_new = self.kinematic_projector.project_with_state(
+                        y_hat_norm, _active_type,
+                        v_init=_v_init_cl, delta_init=_delta_init_cl,
+                        commit_steps=self.shift,
                     )
+                    v_state[active_mask] = _v_new
+                    delta_state[active_mask] = _d_new
+                elif v_state is not None:
+                    # 누적 로컬 xy → 마지막 commit 스텝의 변위로 속도 추정
+                    _commit_last = self.shift - 1  # = 4 (0-indexed, 0.5s 청크 마지막)
+                    _cs = self.kinematic_projector.coord_scale
+                    _dt = self.kinematic_projector.dt
+                    _cx = y_hat_norm[:, _commit_last, 0] * _cs
+                    _cy = y_hat_norm[:, _commit_last, 1] * _cs
+                    if _commit_last > 0:
+                        _px = y_hat_norm[:, _commit_last - 1, 0] * _cs
+                        _py = y_hat_norm[:, _commit_last - 1, 1] * _cs
+                    else:
+                        _px = _cx.new_zeros(_cx.shape)
+                        _py = _cy.new_zeros(_cy.shape)
+                    v_state[active_mask] = ((_cx - _px) ** 2 + (_cy - _py) ** 2).sqrt() / _dt
                 commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
                     y_hat_norm=y_hat_norm,
                     current_pos=pos_window[active_mask, -1],

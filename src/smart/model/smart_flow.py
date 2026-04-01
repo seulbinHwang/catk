@@ -178,16 +178,24 @@ class SMARTFlow(LightningModule):
         kin_cfg = getattr(model_config, "kinematic_projection", None)
         if kin_cfg is not None and getattr(kin_cfg, "enabled", False):
             _kin_proj = KinematicProjection(
+                coord_scale=20.0,  # flow target에서 사용하는 스케일과 동일
+                dt=0.1,
                 use_bicycle_model=bool(getattr(kin_cfg, "use_bicycle_model", False)),
                 wheelbase=float(getattr(kin_cfg, "wheelbase", 2.7)),
                 delta_max=float(getattr(kin_cfg, "delta_max", 0.52)),
                 a_max=float(getattr(kin_cfg, "a_max", 4.0)),
                 d_max=float(getattr(kin_cfg, "d_max", 8.0)),
+                delta_rate_max=float(getattr(kin_cfg, "delta_rate_max", 0.6)),
                 ped_a_max=float(getattr(kin_cfg, "ped_a_max", 2.0)),
-                vehicle_deadzone=float(getattr(kin_cfg, "vehicle_deadzone", 0.05)),
-                ped_deadzone=float(getattr(kin_cfg, "ped_deadzone", 0.025)),
-                ped_max_speed=float(getattr(kin_cfg, "ped_max_speed", 0.5)),
                 eps=float(getattr(kin_cfg, "eps", 1e-6)),
+                use_lqr=bool(getattr(kin_cfg, "use_lqr", True)),
+                lqr_q_xy=float(getattr(kin_cfg, "lqr_q_xy", 2.0)),
+                lqr_q_yaw=float(getattr(kin_cfg, "lqr_q_yaw", 2.0)),
+                lqr_q_v=float(getattr(kin_cfg, "lqr_q_v", 0.5)),
+                lqr_q_delta=float(getattr(kin_cfg, "lqr_q_delta", 0.2)),
+                lqr_r_a=float(getattr(kin_cfg, "lqr_r_a", 0.2)),
+                lqr_r_delta_rate=float(getattr(kin_cfg, "lqr_r_delta_rate", 0.2)),
+                lqr_qf_scale=float(getattr(kin_cfg, "lqr_qf_scale", 2.0)),
             )
             # attach to the agent encoder so both open-loop and closed-loop paths use it
             self.encoder.agent_encoder.kinematic_projector = _kin_proj
@@ -196,6 +204,11 @@ class SMARTFlow(LightningModule):
             )
             _ppr_steps = getattr(kin_cfg, "ppr_steps", None)
             self.encoder.agent_encoder.ppr_steps = int(_ppr_steps) if _ppr_steps is not None else None
+            # Kinematic post-processing option (closed-loop, separate from PPR)
+            _pp_cfg = getattr(model_config, "kinematic_postproc", None)
+            self.encoder.agent_encoder.use_kinematic_postproc = bool(
+                getattr(_pp_cfg, "enabled", False)
+            ) if _pp_cfg is not None else False
             self.val_kinematic_proj_epoch_metrics = nn.ModuleDict(
                 {
                     "kin_ADE2s": WeightedMeanMetric(),
@@ -1364,7 +1377,12 @@ class SMARTFlow(LightningModule):
 
             if self.global_rank == 0 and batch_idx < self.n_vis_batch and scenario_rollouts is not None:
                 video_logger = self._get_video_logger()
-                for scen_idx in range(self.n_vis_scenario):
+                max_scenarios = min(
+                    int(self.n_vis_scenario),
+                    len(data.get("tfrecord_path", [])),
+                    len(scenario_rollouts),
+                )
+                for scen_idx in range(max_scenarios):
                     vis = VisWaymo(
                         scenario_path=data["tfrecord_path"][scen_idx],
                         save_dir=self.video_dir / f"batch_{batch_idx:02d}-scenario_{scen_idx:02d}",
