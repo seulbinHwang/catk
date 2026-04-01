@@ -500,12 +500,6 @@ class SMARTFlow(LightningModule):
                 num_graphs=num_graphs,
             ),
             "type": self._repeat_tensor_on_first_dim(tokenized_agent["type"], repeat_count),
-            "token_agent_shape": self._repeat_tensor_on_first_dim(
-                tokenized_agent["token_agent_shape"], repeat_count
-            ),
-            "token_bank_all_veh": tokenized_agent["token_bank_all_veh"],
-            "token_bank_all_ped": tokenized_agent["token_bank_all_ped"],
-            "token_bank_all_cyc": tokenized_agent["token_bank_all_cyc"],
             "gt_pos_raw": self._repeat_tensor_on_first_dim(tokenized_agent["gt_pos_raw"], repeat_count),
             "gt_head_raw": self._repeat_tensor_on_first_dim(
                 tokenized_agent["gt_head_raw"], repeat_count
@@ -528,6 +522,16 @@ class SMARTFlow(LightningModule):
                 tokenized_agent["shape"],
                 repeat_count,
             )
+
+        if "token_agent_shape" in tokenized_agent:
+            runtime_tokenized_agent["token_agent_shape"] = self._repeat_tensor_on_first_dim(
+                tokenized_agent["token_agent_shape"],
+                repeat_count,
+            )
+
+        for key in ["token_bank_all_veh", "token_bank_all_ped", "token_bank_all_cyc"]:
+            if key in tokenized_agent:
+                runtime_tokenized_agent[key] = tokenized_agent[key]
 
         return runtime_tokenized_agent
 
