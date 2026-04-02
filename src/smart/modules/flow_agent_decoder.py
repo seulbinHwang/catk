@@ -273,6 +273,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         agent_type: torch.Tensor | None = None,
         v_init: torch.Tensor | None = None,
+        delta_init: torch.Tensor | None = None,
         current_control: torch.Tensor | None = None,
         current_control_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -309,10 +310,20 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
 
         _model_fn = lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau)
+        # v_init / delta_init fallback: current_control (vx_b, vy_b, omega) 사용
         if v_init is None and current_control is not None:
             v_init = current_control[:, :2].norm(dim=-1)
             if current_control_valid is not None:
                 v_init = v_init.masked_fill(~current_control_valid, 0.0)
+        if delta_init is None and current_control is not None and self.kinematic_projector is not None:
+            omega = current_control[:, 2]
+            _v = (v_init if v_init is not None else current_control[:, :2].norm(dim=-1)).clamp_min(1e-6)
+            _kappa = omega / _v
+            _L = self.kinematic_projector.wheelbase
+            _dmax = self.kinematic_projector.delta_max
+            delta_init = torch.atan(_L * _kappa).clamp(-_dmax, _dmax)
+            if current_control_valid is not None:
+                delta_init = delta_init.masked_fill(~current_control_valid, 0.0)
 
         if self.use_predict_project_renoise and self.kinematic_projector is not None and agent_type is not None:
             _at = agent_type
@@ -324,13 +335,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     _at,
                     proj_weight=pw,
                     v_init=v_init,
+                    delta_init=delta_init,
                 ),
                 steps=self.ppr_steps,
             )
         else:
             result = self.flow_ode.generate(x_init=x_init_norm, model_fn=_model_fn)
             if self.kinematic_projector is not None and agent_type is not None:
-                result = self.kinematic_projector(result, agent_type, v_init=v_init)
+                result = self.kinematic_projector(result, agent_type, v_init=v_init, delta_init=delta_init)
         return result
 
     def sample_open_loop_future(
@@ -341,6 +353,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         agent_type: torch.Tensor | None = None,
         v_init: torch.Tensor | None = None,
+        delta_init: torch.Tensor | None = None,
         current_control: torch.Tensor | None = None,
         current_control_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -366,6 +379,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed=sampling_seed,
             agent_type=agent_type,
             v_init=v_init,
+            delta_init=delta_init,
             current_control=current_control,
             current_control_valid=current_control_valid,
         )

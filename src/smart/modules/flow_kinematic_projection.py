@@ -99,6 +99,7 @@ class KinematicProjection(nn.Module):
         agent_type: Tensor | None = None,
         proj_weight: float = 1.0,
         v_init: Tensor | None = None,
+        delta_init: Tensor | None = None,
     ) -> Tensor:
         """Kinematic projection (PPR 및 단일 후처리용).
 
@@ -107,6 +108,7 @@ class KinematicProjection(nn.Module):
             agent_type: [n]. 0=Vehicle, 1=Pedestrian, 2=Cyclist. None → 전체 vehicle.
             proj_weight: 0=identity, 1=완전 projection.
             v_init:     [n]. chunk 시작 속도 (m/s).
+            delta_init: [n]. chunk 시작 조향각 (rad). None → steering_target[:, 0]으로 초기화.
 
         Returns:
             Tensor [n, T, 4].
@@ -119,14 +121,15 @@ class KinematicProjection(nn.Module):
 
         if agent_type is None:
             if n > 0:
-                projected = self._project_bicycle_batch(x, v_init, delta_init=None)
+                projected = self._project_bicycle_batch(x, v_init, delta_init=delta_init)
         else:
             ped_mask = (agent_type == 1) # pedestrian
             veh_mask = ~ped_mask
 
             if veh_mask.any():
                 v0 = v_init[veh_mask] if v_init is not None else None
-                projected[veh_mask] = self._project_bicycle_batch(x[veh_mask], v0)
+                d0 = delta_init[veh_mask] if delta_init is not None else None
+                projected[veh_mask] = self._project_bicycle_batch(x[veh_mask], v0, delta_init=d0)
 
             if ped_mask.any():
                 v0 = v_init[ped_mask] if v_init is not None else None

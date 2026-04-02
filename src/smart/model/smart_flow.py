@@ -24,6 +24,7 @@ from src.smart.metrics.flow_metrics import (
 )
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
+from src.smart.utils.geometry import wrap_angle
 from src.smart.modules.flow_projected_generation import ProjectedFlowGenerator
 from src.smart.modules.flow_terminal_cost_final_step import TerminalCostFinalStepLoss
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
@@ -1281,16 +1282,52 @@ class SMARTFlow(LightningModule):
             with torch.no_grad():
                 return flow_decoder(anchor_hidden_valid, x_t, tau)
 
-        # v_init: generate_anchor_future_open_loop 와 동일한 방식 (PPR 참조)
-        current_control = tokenized_agent.get(ctrl_key)
-        current_control_valid = tokenized_agent.get(ctrl_valid_key)
+        # v_init / delta_init: closed-loop chunk 초기화와 동일한 방식으로 계산.
+        anchor_mask_tensor = tokenized_agent.get(anchor_mask_key)
         v_init = None
-        if current_control is not None:
-            v_init = current_control[..., :2].norm(dim=-1)
-            if current_control_valid is not None:
-                v_init = v_init.masked_fill(
-                    ~current_control_valid.to(x_init.device), 0.0
-                )
+        delta_init = None
+        if (
+            "ctx_sampled_pos" in tokenized_agent
+            and "ctx_sampled_heading" in tokenized_agent
+            and anchor_mask_tensor is not None
+            and self._final_proj_kin_projector is not None
+        ):
+            ctx_pos = tokenized_agent["ctx_sampled_pos"]
+            ctx_head = tokenized_agent["ctx_sampled_heading"]
+            kp = self._final_proj_kin_projector
+            _coarse_dt = float(self.encoder.agent_encoder.shift) * float(kp.dt)
+            packed_v: list[Tensor] = []
+            packed_d: list[Tensor] = []
+            for anchor_idx in range(anchor_mask_tensor.shape[1]):
+                mask_i = anchor_mask_tensor[:, anchor_idx]
+                if not bool(mask_i.any()):
+                    continue
+                dp = ctx_pos[:, anchor_idx + 1] - ctx_pos[:, anchor_idx]
+                v_i = dp[mask_i].norm(dim=-1) / _coarse_dt
+                packed_v.append(v_i)
+                dtheta = wrap_angle(ctx_head[:, anchor_idx + 1] - ctx_head[:, anchor_idx])
+                _v_c = v_i.clamp_min(1e-6)
+                _kappa = dtheta[mask_i] / (_v_c * _coarse_dt + 1e-6)
+                delta_i = torch.atan(kp.wheelbase * _kappa).clamp(-kp.delta_max, kp.delta_max)
+                packed_d.append(delta_i)
+            if len(packed_v) > 0:
+                v_init = torch.cat(packed_v, dim=0)
+                delta_init = torch.cat(packed_d, dim=0)
+        # ctx 정보가 없으면 current_control fallback
+        if v_init is None:
+            current_control = tokenized_agent.get(ctrl_key)
+            current_control_valid = tokenized_agent.get(ctrl_valid_key)
+            if current_control is not None:
+                v_init = current_control[..., :2].norm(dim=-1)
+                if current_control_valid is not None:
+                    v_init = v_init.masked_fill(~current_control_valid.to(x_init.device), 0.0)
+                if delta_init is None and self._final_proj_kin_projector is not None:
+                    omega = current_control[..., 2]
+                    _v = v_init.clamp_min(1e-6)
+                    kp = self._final_proj_kin_projector
+                    delta_init = torch.atan(kp.wheelbase * (omega / _v)).clamp(-kp.delta_max, kp.delta_max)
+                    if current_control_valid is not None:
+                        delta_init = delta_init.masked_fill(~current_control_valid.to(x_init.device), 0.0)
 
         agent_type = tokenized_agent[agent_type_key]
 
@@ -1305,11 +1342,13 @@ class SMARTFlow(LightningModule):
             _pre_disp = (pred_clean_norm[..., :2] * 20.0).norm(dim=-1).mean().item()
             print(f"[final_proj] pre-proj  mean_disp={_pre_disp:.4f}m")
 
-            # 2. 마지막 한 번만 kinematic projection (PPR final-step only)
+            # 2. 마지막 한 번만 kinematic projection
+            _dev = pred_clean_norm.device
             pred_clean_norm = self._final_proj_kin_projector(
                 pred_clean_norm,
-                agent_type.to(pred_clean_norm.device),
-                v_init=v_init.to(pred_clean_norm.device) if v_init is not None else None,
+                agent_type.to(_dev),
+                v_init=v_init.to(_dev) if v_init is not None else None,
+                delta_init=delta_init.to(_dev) if delta_init is not None else None,
             )
             _post_disp = (pred_clean_norm[..., :2] * 20.0).norm(dim=-1).mean().item()
             print(f"[final_proj] post-proj mean_disp={_post_disp:.4f}m  delta={_post_disp - _pre_disp:+.4f}m")
@@ -1341,27 +1380,49 @@ class SMARTFlow(LightningModule):
                 anchor_mask_key="flow_eval_mask",
             )
             open_sample_count = int(denoise_pred["flow_clean_norm"].shape[0])
+            # v_init / delta_init: closed-loop chunk 초기화와 동일한 방식으로 계산.
+            # ctx_sampled_pos/heading을 coarse dt로 차분해 속도/조향각을 추정.
             open_v_init = None
+            open_delta_init = None
             if (
                 "ctx_sampled_pos" in tokenized_agent
+                and "ctx_sampled_heading" in tokenized_agent
                 and denoise_pred["anchor_mask"].numel() > 0
                 and self.encoder.agent_encoder.kinematic_projector is not None
             ):
-                ctx_pos = tokenized_agent["ctx_sampled_pos"]
-                anchor_mask = denoise_pred["anchor_mask"]
-                dt_coarse = (
-                    float(self.encoder.agent_encoder.shift)
-                    * float(self.encoder.agent_encoder.kinematic_projector.dt)
-                )
-                packed_v_init: list[Tensor] = []
-                for anchor_idx in range(anchor_mask.shape[1]):
-                    mask_i = anchor_mask[:, anchor_idx]
+                ctx_pos = tokenized_agent["ctx_sampled_pos"]       # [n_agent, 14, 2]
+                ctx_head = tokenized_agent["ctx_sampled_heading"]  # [n_agent, 14]
+                anchor_mask_ol = denoise_pred["anchor_mask"]       # [n_agent, 13]
+                kp = self.encoder.agent_encoder.kinematic_projector
+                _coarse_dt = float(self.encoder.agent_encoder.shift) * float(kp.dt)
+                packed_v: list[Tensor] = []
+                packed_d: list[Tensor] = []
+                for anchor_idx in range(anchor_mask_ol.shape[1]):
+                    mask_i = anchor_mask_ol[:, anchor_idx]
                     if not bool(mask_i.any()):
                         continue
-                    dp = ctx_pos[:, anchor_idx + 1] - ctx_pos[:, anchor_idx]
-                    packed_v_init.append(dp[mask_i].norm(dim=-1) / dt_coarse)
-                if len(packed_v_init) > 0:
-                    open_v_init = torch.cat(packed_v_init, dim=0)
+                    # 속도: coarse 변위 / coarse_dt  (closed-loop 와 동일)
+                    dp = ctx_pos[:, anchor_idx + 1] - ctx_pos[:, anchor_idx]  # [n, 2]
+                    v_i = dp[mask_i].norm(dim=-1) / _coarse_dt                # [n_valid]
+                    packed_v.append(v_i)
+                    # 조향각: heading 변화량으로 곡률 추정 (closed-loop 와 동일 공식)
+                    dtheta = wrap_angle(ctx_head[:, anchor_idx + 1] - ctx_head[:, anchor_idx])
+                    _v_c = v_i.clamp_min(1e-6)
+                    _kappa = dtheta[mask_i] / (_v_c * _coarse_dt + 1e-6)
+                    delta_i = torch.atan(kp.wheelbase * _kappa).clamp(-kp.delta_max, kp.delta_max)
+                    packed_d.append(delta_i)
+                if len(packed_v) > 0:
+                    open_v_init = torch.cat(packed_v, dim=0)
+                    open_delta_init = torch.cat(packed_d, dim=0)
+            # ── 검증용 print (ctx 경로 vs fallback 여부 확인) ──
+            print(
+                f"[open_loop_init] batch={batch_idx} "
+                f"ctx_pos={'OK' if 'ctx_sampled_pos' in tokenized_agent else 'MISSING'} "
+                f"ctx_head={'OK' if 'ctx_sampled_heading' in tokenized_agent else 'MISSING'} "
+                f"kin_proj={'OK' if self.encoder.agent_encoder.kinematic_projector is not None else 'None'} "
+                f"v_init={'ctx({:.3f})'.format(open_v_init.mean().item()) if open_v_init is not None else 'None→fallback'} "
+                f"delta_init={'ctx({:.4f})'.format(open_delta_init.mean().item()) if open_delta_init is not None else 'None→fallback'}"
+            )
             open_pred_clean_norm = self.encoder.sample_open_loop_future(
                 anchor_hidden=denoise_pred["anchor_hidden"],
                 anchor_mask=denoise_pred["anchor_mask"],
@@ -1369,6 +1430,7 @@ class SMARTFlow(LightningModule):
                 sampling_seed=self._get_validation_open_seed(batch_idx),
                 agent_type=tokenized_agent.get("flow_eval_agent_type"),
                 v_init=open_v_init,
+                delta_init=open_delta_init,
                 current_control=tokenized_agent.get("flow_eval_current_control"),
                 current_control_valid=tokenized_agent.get("flow_eval_current_control_valid"),
             )
