@@ -86,6 +86,8 @@ class KinematicProjection(nn.Module):
         self.lqr_r_a = float(lqr_r_a)
         self.lqr_r_delta_rate = float(lqr_r_delta_rate)
         self.lqr_qf_scale = float(lqr_qf_scale)
+        # closed-loop state tracking 활성화 마커 (flow_agent_decoder에서 참조)
+        self.use_bicycle_model: bool = True
 
     # ──────────────────────────────────────────────────────────────────────
     # Public interface

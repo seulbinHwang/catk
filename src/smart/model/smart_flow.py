@@ -136,24 +136,34 @@ class SMARTFlow(LightningModule):
                 }
             )
 
-        # Final projection generation (standard ODE → post-hoc gradient descent to feasible region)
+        # Final projection: ODE 완료 후 마지막 한 번만 kinematic projection 적용 (PPR final-step only 버전)
         final_proj_cfg = getattr(model_config, "final_projection", None)
-        self.final_proj_generator: ProjectedFlowGenerator | None = None
-        self.n_final_proj_steps: int = 100
+        self._final_proj_kin_projector: KinematicProjection | None = None
+        self.final_proj_generator: ProjectedFlowGenerator | None = None  # deprecated, no longer used
         if final_proj_cfg is not None and getattr(final_proj_cfg, "enabled", False):
-            _fp_projector = SmoothControlProjector(
-                feasible_weight=float(getattr(final_proj_cfg, "feasible_weight", 1.0)),
-                smooth_deadzone_epsilon=list(
-                    getattr(final_proj_cfg, "smooth_deadzone_epsilon", [0.01, 0.01, 0.01])
-                ),
-                smooth_deadzone_tau=float(getattr(final_proj_cfg, "smooth_deadzone_tau", 0.002)),
+            # kinematic_projection 설정이 있으면 그 파라미터를 재사용, 없으면 기본값
+            kin_cfg = getattr(model_config, "kinematic_projection", None)
+            def _kp(attr: str, default):
+                return getattr(kin_cfg, attr, default) if kin_cfg is not None else default
+            self._final_proj_kin_projector = KinematicProjection(
+                coord_scale=20.0,
+                dt=0.1,
+                wheelbase=float(_kp("wheelbase", 2.7)),
+                delta_max=float(_kp("delta_max", 0.52)),
+                a_max=float(_kp("a_max", 4.0)),
+                d_max=float(_kp("d_max", 8.0)),
+                delta_rate_max=float(_kp("delta_rate_max", 0.6)),
+                ped_a_max=float(_kp("ped_a_max", 2.0)),
+                eps=float(_kp("eps", 1e-6)),
+                use_lqr=bool(_kp("use_lqr", True)),
+                lqr_q_xy=float(_kp("lqr_q_xy", 2.0)),
+                lqr_q_yaw=float(_kp("lqr_q_yaw", 2.0)),
+                lqr_q_v=float(_kp("lqr_q_v", 0.5)),
+                lqr_q_delta=float(_kp("lqr_q_delta", 0.2)),
+                lqr_r_a=float(_kp("lqr_r_a", 0.2)),
+                lqr_r_delta_rate=float(_kp("lqr_r_delta_rate", 0.2)),
+                lqr_qf_scale=float(_kp("lqr_qf_scale", 2.0)),
             )
-            self.final_proj_generator = ProjectedFlowGenerator(
-                projector=_fp_projector,
-                n_proj_steps=0,  # no per-step projection
-                proj_lr=float(getattr(final_proj_cfg, "proj_lr", 0.01)),
-            )
-            self.n_final_proj_steps = int(getattr(final_proj_cfg, "n_final_proj_steps", 100))
             self.val_final_proj_epoch_metrics = nn.ModuleDict(
                 {
                     "final_proj_ADE2s": WeightedMeanMetric(),
@@ -1227,7 +1237,10 @@ class SMARTFlow(LightningModule):
         tokenized_map: Dict,
         tokenized_agent: Dict,
     ) -> None:
-        """표준 ODE 생성 후 마지막에 feasible region으로 gradient descent projection하고 ADE/FDE를 기록합니다."""
+        """표준 ODE 생성 후 마지막에 한 번만 kinematic projection 적용하고 ADE/FDE를 기록합니다.
+
+        PPR과 달리 매 step이 아닌 ODE 완료 후 최종 결과에만 KinematicProjection을 적용합니다.
+        """
         if "flow_eval_mask" in tokenized_agent:
             anchor_mask_key = "flow_eval_mask"
             clean_norm_key = "flow_eval_clean_norm"
@@ -1268,16 +1281,38 @@ class SMARTFlow(LightningModule):
             with torch.no_grad():
                 return flow_decoder(anchor_hidden_valid, x_t, tau)
 
-        pred_clean_norm = self.final_proj_generator.generate_with_final_projection(
-            flow_ode=flow_ode,
-            model_fn=model_fn,
-            x_init=x_init,
-            agent_type=tokenized_agent[agent_type_key],
-            current_control=tokenized_agent.get(ctrl_key),
-            current_control_valid=tokenized_agent.get(ctrl_valid_key),
-            steps=16,
-            n_final_proj_steps=self.n_final_proj_steps,
+        # v_init: generate_anchor_future_open_loop 와 동일한 방식 (PPR 참조)
+        current_control = tokenized_agent.get(ctrl_key)
+        current_control_valid = tokenized_agent.get(ctrl_valid_key)
+        v_init = None
+        if current_control is not None:
+            v_init = current_control[..., :2].norm(dim=-1)
+            if current_control_valid is not None:
+                v_init = v_init.masked_fill(
+                    ~current_control_valid.to(x_init.device), 0.0
+                )
+
+        agent_type = tokenized_agent[agent_type_key]
+
+        print(
+            f"[final_proj] n_agents={anchor_hidden_valid.shape[0]} "
+            f"v_init={'None' if v_init is None else f'mean={v_init.mean():.3f}'}"
         )
+
+        with torch.no_grad():
+            # 1. 표준 ODE (per-step projection 없음)
+            pred_clean_norm = flow_ode.generate(x_init=x_init, model_fn=model_fn)
+            _pre_disp = (pred_clean_norm[..., :2] * 20.0).norm(dim=-1).mean().item()
+            print(f"[final_proj] pre-proj  mean_disp={_pre_disp:.4f}m")
+
+            # 2. 마지막 한 번만 kinematic projection (PPR final-step only)
+            pred_clean_norm = self._final_proj_kin_projector(
+                pred_clean_norm,
+                agent_type.to(pred_clean_norm.device),
+                v_init=v_init.to(pred_clean_norm.device) if v_init is not None else None,
+            )
+            _post_disp = (pred_clean_norm[..., :2] * 20.0).norm(dim=-1).mean().item()
+            print(f"[final_proj] post-proj mean_disp={_post_disp:.4f}m  delta={_post_disp - _pre_disp:+.4f}m")
 
         target_clean_norm = tokenized_agent[clean_norm_key].to(
             device=pred_clean_norm.device, dtype=pred_clean_norm.dtype
@@ -1365,7 +1400,7 @@ class SMARTFlow(LightningModule):
             )
 
         # Final projection: standard ODE → post-hoc gradient descent to feasible region
-        if self.final_proj_generator is not None:
+        if self._final_proj_kin_projector is not None:
             self._final_projection_val_step(
                 tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,
@@ -1434,7 +1469,7 @@ class SMARTFlow(LightningModule):
             for metric_name, metric_value in epoch_proj_metrics.items():
                 self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
 
-        if self.final_proj_generator is not None:
+        if self._final_proj_kin_projector is not None:
             epoch_fp_metrics = self._compute_and_reset_validation_metrics(
                 prefix="val_final_proj",
                 metric_store=self.val_final_proj_epoch_metrics,
