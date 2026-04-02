@@ -166,6 +166,7 @@ class SMARTFlowDecoder(nn.Module):
         sampling_seed: int | None = None,
         agent_type: Tensor | None = None,
         v_init: Tensor | None = None,
+        delta_init: Tensor | None = None,
         current_control: Tensor | None = None,
         current_control_valid: Tensor | None = None,
     ) -> Tensor:
@@ -195,6 +196,7 @@ class SMARTFlowDecoder(nn.Module):
             sampling_seed=sampling_seed,
             agent_type=agent_type,
             v_init=v_init,
+            delta_init=delta_init,
             current_control=current_control,
             current_control_valid=current_control_valid,
         )

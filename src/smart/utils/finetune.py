@@ -136,7 +136,12 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             )
         return config
 
-    if config.mode not in {"adjoint_matching", "terminal_cost_final_step", "terminal_cost_full_grad"}:
+    if config.mode not in {
+        "adjoint_matching",
+        "terminal_cost_final_step",
+        "terminal_cost_full_grad",
+        "kinematic_proj_ft",   # ODE generate → KinematicProjection → FM target
+    }:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 
     # 전체 모델 freeze 후 flow_decoder만 unfreeze
