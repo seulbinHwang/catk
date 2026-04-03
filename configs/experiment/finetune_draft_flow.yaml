@@ -28,6 +28,7 @@ model:
       physics:
         force_fp32: true
         dt: 0.1
+        chunk_size_steps: 5
         pos_scale_m: 20.0
         deadzone_ratio: 0.02
         deadzone_softness: 0.02
@@ -36,6 +37,7 @@ model:
         accel_weight: 1.0
         yaw_accel_weight: 1.0
         turn_weight: 0.5
+        shape_weight: 0.1
         eps: 1.0e-6
 
 ckpt_path: null

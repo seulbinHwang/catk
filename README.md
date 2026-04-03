@@ -477,24 +477,36 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 `finetune_draft_flow` 기본 설정은 아래와 같습니다.
 
 - learning rate: `2e-4`
-- max epochs: `16`
-- train batch size: `20`
+- max epochs: `32`
+- train batch size: `48`
 - val batch size: `16`
-- validation 주기: `4` epoch마다
+- validation 주기: `16` epoch마다
 
+DRaFT physics regularizer는 현재 **0.5초 main + 10Hz soft shape tie** 구조입니다.
+
+- 입력 미래는 여전히 raw 10Hz 20점입니다.
+- 먼저 10Hz 점들로 몸체 기준 제어 ` [v_x^b, v_y^b, omega] ` 를 만듭니다.
+- 그 다음 5개씩 묶어 `0.5초 대표 제어` 4개를 만들고,
+- `speed / slip / accel / yaw_accel / turn` 은 이 0.5초 대표 제어로 계산합니다.
+- 첫 `accel`, `yaw_accel` 경계는 직전 한 프레임 snapshot이 아니라 **직전 0.5초 평균 제어**와 비교합니다.
+- 과거 0.5초가 모두 valid하지 않으면 첫 경계 항만 자동으로 빼고 계산합니다.
+- chunk 안 10Hz 제어가 과하게 흔들리지 않도록 `shape` 항을 약하게 추가합니다.
+- 기본값은 `model.model_config.draft.physics.chunk_size_steps=5`, `shape_weight=0.1` 입니다.
+- agent type별 limit table과 `speed/slip/accel/yaw_accel/turn` 내부 비율은 그대로 유지합니다.
 
 loss와 로그는 아래처럼 보면 됩니다.
 
 - `train/loss`는 최종 학습 loss입니다.
 - `train/loss_fm`는 원래 flow matching loss입니다.
 - `train/loss_phys`는 DRaFT physics penalty입니다.
-- 실제로는 `train/loss = train/loss_fm + train/draft_weight * train/loss_phys` 형태로 합쳐집니다.
+- 실제로는 `train/loss = train/loss_fm + train/draft_weight * 0.005 * train/loss_phys` 형태로 합쳐집니다.
 - 기본 구현은 trainer가 `bf16-mixed`여도 DRaFT physics regularizer 계산 구간만 fp32 subregion에서 수행합니다.
 - `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
-- `train/*`에는 요약 지표만 남습니다. 세부 physics gap은 `raw_feaisble_gap/speed`, `raw_feaisble_gap/accel` 같은 prefix로 기록됩니다.
-- 실제 단위 위반량도 함께 기록됩니다. 예를 들어 gap 기준 값은 `raw_feaisble_gap/speed_excess_mps`, `raw_feaisble_gap/accel_excess_mps2`, raw 예측값은 `raw_feaisble_gap/pred_accel_excess_mps2`, GT 기준값은 `gt_feasible_gap/accel_excess_mps2`처럼 기록됩니다.
-- 첫 delta는 `accel`, `yaw_accel`에 함께 포함됩니다. `prev_control_valid`가 `False`면 첫 delta만 마스킹되고, 별도 `start` metric은 기록하지 않습니다.
-- 합성 항은 하위 물리량으로 나뉘어 기록됩니다. 예를 들어 `slip`은 `raw_feaisble_gap/slip_beta_excess_deg`, `turn`은 `raw_feaisble_gap/turn_yaw_rate_excess_degps`, `raw_feaisble_gap/turn_lat_accel_excess_mps2`, `raw_feaisble_gap/turn_radius_shortfall_m`으로 볼 수 있습니다.
+- `raw_feaisble_gap/speed`, `raw_feaisble_gap/accel`, `raw_feaisble_gap/yaw_accel`, `raw_feaisble_gap/turn`, `raw_feaisble_gap/shape` 로 요약 physics gap이 기록됩니다.
+- 실제 단위 위반량도 함께 기록됩니다. 예를 들어 `raw_feaisble_gap/speed_excess_mps`, `raw_feaisble_gap/accel_excess_mps2`, `raw_feaisble_gap/turn_radius_shortfall_m` 같은 값이 남습니다.
+- 이 actual-unit 값들은 이제 **0.1초 한 프레임 기준이 아니라 0.5초 대표 제어 기준 평균 위반량**입니다.
+- 첫 `accel`, `yaw_accel` 경계는 `prev_control_valid=False`면 자동으로 빠지고, 별도 `start` metric은 기록하지 않습니다.
+- `turn` 항은 `yaw rate / lateral accel / turning radius` 세 하위 값으로 나뉘어 기록됩니다.
 
 자주 바꾸는 override 예시는 아래와 같습니다.
 
@@ -510,6 +522,12 @@ loss와 로그는 아래처럼 보면 됩니다.
 
 # physics penalty도 mixed precision으로 그대로 계산
 ... model.model_config.draft.physics.force_fp32=false
+
+# chunk 안 10Hz shape tie를 더 강하게 또는 약하게 바꾸기
+... model.model_config.draft.physics.shape_weight=0.05
+
+# 0.5초 대표 제어 길이를 바꾸기 (기본 5 step = 0.5초)
+... model.model_config.draft.physics.chunk_size_steps=5
 
 # 샘플러 역전파를 마지막 2 step에만 남겨 메모리 사용량 줄이기
 ... model.model_config.draft.sampling.backprop_last_k=2

@@ -246,7 +246,11 @@ class FlowTokenProcessor(TokenProcessor):
         anchor_mask: Tensor,
         raw_step: int,
     ) -> Tuple[Tensor, Tensor]:
-        """anchor 직전 구간의 단순 제어를 local frame 기준으로 만듭니다.
+        """anchor 직전 0.5초 평균 제어를 local frame 기준으로 만듭니다.
+
+        여기서는 직전 한 프레임 snapshot이 아니라,
+        직전 5개 0.1초 제어를 평균한 ``[v_x^b, v_y^b, omega]`` 를 만듭니다.
+        과거 0.5초와 미래 첫 0.5초를 같은 시간 길이로 비교하려는 목적입니다.
 
         Args:
             pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
@@ -259,9 +263,10 @@ class FlowTokenProcessor(TokenProcessor):
 
         Returns:
             Tuple[Tensor, Tensor]:
-                직전 제어 ``[v_x^b, v_y^b, omega]`` 와 유효 마스크입니다.
+                직전 0.5초 평균 제어 ``[v_x^b, v_y^b, omega]`` 와 유효 마스크입니다.
                 shape은 각각 ``[n_valid_anchor, 3]`` 과 ``[n_valid_anchor]`` 입니다.
         """
+        history_steps = 5
         num_valid_anchor = int(anchor_mask.sum().item())
         if num_valid_anchor == 0:
             return (
@@ -269,31 +274,62 @@ class FlowTokenProcessor(TokenProcessor):
                 torch.zeros((0,), device=pos.device, dtype=torch.bool),
             )
 
-        prev_control_valid = valid[anchor_mask, raw_step] & valid[anchor_mask, raw_step - 1]
         prev_control = pos.new_zeros((num_valid_anchor, 3))
+        if raw_step < history_steps:
+            return prev_control, torch.zeros((num_valid_anchor,), device=pos.device, dtype=torch.bool)
+
+        history_valid = valid[anchor_mask, raw_step - history_steps : raw_step + 1]
+        prev_control_valid = history_valid.all(dim=1)
         if not prev_control_valid.any():
             return prev_control, prev_control_valid
 
-        pos_pair = pos[anchor_mask, raw_step - 1 : raw_step + 1]
-        head_pair = heading[anchor_mask, raw_step - 1 : raw_step + 1]
-        pos_pair_local, head_pair_local = transform_to_local(
-            pos_global=pos_pair,
-            head_global=head_pair,
+        pos_window = pos[anchor_mask, raw_step - history_steps : raw_step + 1]
+        head_window = heading[anchor_mask, raw_step - history_steps : raw_step + 1]
+        pos_window_local, head_window_local = transform_to_local(
+            pos_global=pos_window,
+            head_global=head_window,
             pos_now=current_pos[anchor_mask],
             head_now=current_head[anchor_mask],
         )
-
-        delta_pos = pos_pair_local[:, 1] - pos_pair_local[:, 0]
-        prev_head_local = head_pair_local[:, 0]
-        delta_head = self._wrap_angle(head_pair_local[:, 1] - head_pair_local[:, 0])
-
-        cos_prev = prev_head_local.cos()
-        sin_prev = prev_head_local.sin()
-        prev_control[:, 0] = (delta_pos[:, 0] * cos_prev + delta_pos[:, 1] * sin_prev) / 0.1
-        prev_control[:, 1] = (-delta_pos[:, 0] * sin_prev + delta_pos[:, 1] * cos_prev) / 0.1
-        prev_control[:, 2] = delta_head / 0.1
+        vx_body, vy_body, omega = self._local_sequence_to_body_controls(
+            pos_local=pos_window_local,
+            heading_local=head_window_local,
+            dt=0.1,
+        )
+        prev_control[:, 0] = vx_body.mean(dim=-1)
+        prev_control[:, 1] = vy_body.mean(dim=-1)
+        prev_control[:, 2] = omega.mean(dim=-1)
         prev_control[~prev_control_valid] = 0.0
         return prev_control, prev_control_valid
+
+    def _local_sequence_to_body_controls(
+        self,
+        pos_local: Tensor,
+        heading_local: Tensor,
+        dt: float,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """local 좌표 시퀀스를 몸체 기준 제어 시퀀스로 바꿉니다.
+
+        Args:
+            pos_local: local 중심점 시퀀스입니다. shape은 ``[n_valid_anchor, 6, 2]`` 입니다.
+            heading_local: local 방향 시퀀스입니다. shape은 ``[n_valid_anchor, 6]`` 입니다.
+            dt: 점 간 시간 간격입니다. 기본 사용값은 ``0.1`` 초입니다.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor]:
+                앞방향 속도, 옆방향 속도, 회전속도입니다.
+                각 shape은 ``[n_valid_anchor, 5]`` 입니다.
+        """
+        delta_pos = pos_local[:, 1:] - pos_local[:, :-1]
+        heading_start = heading_local[:, :-1]
+        delta_heading = self._wrap_angle(heading_local[:, 1:] - heading_local[:, :-1])
+
+        cos_prev = heading_start.cos()
+        sin_prev = heading_start.sin()
+        vx_body = (delta_pos[..., 0] * cos_prev + delta_pos[..., 1] * sin_prev) / dt
+        vy_body = (-delta_pos[..., 0] * sin_prev + delta_pos[..., 1] * cos_prev) / dt
+        omega = delta_heading / dt
+        return vx_body, vy_body, omega
 
     def _concat_flow_chunks(
         self,

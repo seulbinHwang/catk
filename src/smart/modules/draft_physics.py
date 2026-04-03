@@ -50,6 +50,7 @@ DRAFT_PHYSICS_COMPONENT_KEYS = (
     "accel",
     "yaw_accel",
     "turn",
+    "shape",
 )
 
 DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
@@ -64,6 +65,15 @@ DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
 
 
 def _build_zero_output(reference: Tensor) -> Dict[str, Tensor]:
+    """빈 입력일 때 쓸 0 결과 사전을 만듭니다.
+
+    Args:
+        reference: 반환 텐서의 장치와 자료형을 맞추기 위한 기준 텐서입니다.
+            shape은 임의입니다.
+
+    Returns:
+        Dict[str, Tensor]: 모든 항목이 0인 결과 사전입니다.
+    """
     zero = reference.new_zeros(())
     output = {
         "loss": zero,
@@ -81,15 +91,21 @@ def _build_zero_output(reference: Tensor) -> Dict[str, Tensor]:
 
 
 class DraftPhysicsRegularizer(nn.Module):
-    """최종 샘플 기준 physics penalty를 계산합니다.
+    """최종 샘플 기준 DRaFT physics penalty를 계산합니다.
 
-    이 모듈은 DRaFT의 핵심처럼, 중간 noisy state가 아니라
-    "최종으로 생성된 2초 미래"에 대해 물리 penalty를 계산합니다.
-    penalty는 GT와 같은 기준으로 같이 계산한 뒤,
-    필요하면 "GT보다 더 나쁜 만큼만" 남기도록 만들 수 있습니다.
+    이 구현은 10Hz 미래 20점을 그대로 보존하면서,
+    물리 feasibility의 주 판단은 0.5초 평균 제어로 계산합니다.
+    다시 말해,
+    1) 10Hz 점으로 몸체 기준 제어 ``[v_x^b, v_y^b, omega]`` 를 만들고,
+    2) 5개씩 묶어 0.5초 대표 제어 4개를 만든 뒤,
+    3) speed / slip / accel / yaw_accel / turn 은 이 0.5초 대표 제어로 계산합니다.
+    추가로,
+    4) chunk 안 10Hz 제어가 너무 들쭉날쭉하지 않도록 약한 ``shape`` 항을 더합니다.
 
     Args:
         dt: 미래 점 간 시간 간격입니다. 기본값은 ``0.1`` 초입니다.
+        chunk_size_steps: 0.5초 대표 제어를 만들 때 평균낼 10Hz step 수입니다.
+            기본값 ``5`` 이면 0.5초입니다.
         pos_scale_m: 정규화된 ``x, y`` 를 meter로 되돌릴 때 쓸 배율입니다.
             기본값은 ``20.0`` 입니다.
         deadzone_ratio: 작은 초과량은 바로 크게 벌주지 않기 위한 여유 폭입니다.
@@ -97,17 +113,17 @@ class DraftPhysicsRegularizer(nn.Module):
         gt_excess_only: ``True`` 이면 GT보다 더 나쁜 만큼만 loss에 넣습니다.
         speed_weight: 최고 속도 항 가중치입니다.
         slip_weight: slip angle 위반 항 가중치입니다.
-        accel_weight: step 간 앞방향 속도 변화 항 가중치입니다.
-            첫 delta는 직전 anchor 제어와의 차이로 함께 계산합니다.
-        yaw_accel_weight: step 간 회전 변화 항 가중치입니다.
-            첫 delta는 직전 anchor 제어와의 차이로 함께 계산합니다.
+        accel_weight: 0.5초 대표 제어 사이의 앞방향 속도 변화 항 가중치입니다.
+        yaw_accel_weight: 0.5초 대표 제어 사이의 회전 변화 항 가중치입니다.
         turn_weight: 선회 가능성 항 가중치입니다.
+        shape_weight: chunk 내부 10Hz 모양을 약하게 묶는 항 가중치입니다.
         eps: 수치 안정용 작은 값입니다.
     """
 
     def __init__(
         self,
         dt: float = 0.1,
+        chunk_size_steps: int = 5,
         pos_scale_m: float = 20.0,
         deadzone_ratio: float = 0.02,
         deadzone_softness: float = 0.02,
@@ -117,10 +133,18 @@ class DraftPhysicsRegularizer(nn.Module):
         accel_weight: float = 1.0,
         yaw_accel_weight: float = 1.0,
         turn_weight: float = 1.0,
+        shape_weight: float = 0.1,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        if dt <= 0.0:
+            raise ValueError(f"dt must be positive, got {dt}")
+        if int(chunk_size_steps) <= 0:
+            raise ValueError(
+                f"chunk_size_steps must be positive, got {chunk_size_steps}"
+            )
         self.dt = float(dt)
+        self.chunk_size_steps = int(chunk_size_steps)
         self.pos_scale_m = float(pos_scale_m)
         self.deadzone_ratio = float(deadzone_ratio)
         self.deadzone_softness = float(deadzone_softness)
@@ -130,6 +154,7 @@ class DraftPhysicsRegularizer(nn.Module):
         self.accel_weight = float(accel_weight)
         self.yaw_accel_weight = float(yaw_accel_weight)
         self.turn_weight = float(turn_weight)
+        self.shape_weight = float(shape_weight)
         self.eps = float(eps)
 
     def forward(
@@ -149,10 +174,10 @@ class DraftPhysicsRegularizer(nn.Module):
                 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
             packed_agent_type: anchor 순서대로 압축한 에이전트 종류입니다.
                 shape은 ``[n_valid_anchor]`` 입니다.
-            packed_prev_control: anchor 직전 구간의 제어입니다.
+            packed_prev_control: anchor 직전 0.5초 평균 제어입니다.
                 마지막 차원은 ``[v_x^b, v_y^b, omega]`` 이고,
                 shape은 ``[n_valid_anchor, 3]`` 입니다.
-            packed_prev_control_valid: 직전 구간 제어를 믿을 수 있는지 표시합니다.
+            packed_prev_control_valid: 직전 0.5초 평균 제어를 믿을 수 있는지 표시합니다.
                 shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
@@ -186,6 +211,7 @@ class DraftPhysicsRegularizer(nn.Module):
             "accel": self.accel_weight,
             "yaw_accel": self.yaw_accel_weight,
             "turn": self.turn_weight,
+            "shape": self.shape_weight,
         }
 
         loss_terms: Dict[str, Tensor] = {}
@@ -204,14 +230,12 @@ class DraftPhysicsRegularizer(nn.Module):
             gt_mean = gt_value.mean()
             pred_means[f"pred_{name}"] = pred_mean
             gt_means[f"gt_{name}"] = gt_mean
-
             if self.gt_excess_only:
                 effective = torch.relu(pred_value - gt_value)
             else:
                 effective = pred_value
             effective_mean = effective.mean()
             loss_terms[name] = effective_mean
-
             total_loss = total_loss + weight * effective_mean
             raw_pred_loss = raw_pred_loss + weight * pred_mean
 
@@ -220,7 +244,6 @@ class DraftPhysicsRegularizer(nn.Module):
             gt_value = gt_stats[name].detach()
             pred_actual_unit_means[f"pred_{name}"] = pred_value.mean()
             gt_actual_unit_means[f"gt_{name}"] = gt_value.mean()
-
             if self.gt_excess_only:
                 effective = torch.relu(pred_value - gt_value)
             else:
@@ -248,27 +271,34 @@ class DraftPhysicsRegularizer(nn.Module):
         """한 미래 궤적 묶음의 physics proxy penalty를 계산합니다.
 
         Args:
-            future_norm: 정규화 미래 궤적입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
-            limits: anchor별 제한값 사전입니다.
-                각 값의 shape은 ``[n_valid_anchor]`` 입니다.
-            prev_control: anchor 직전 구간 제어입니다.
+            future_norm: 정규화 미래 궤적입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            limits: anchor별 제한값 사전입니다. 각 값의 shape은 ``[n_valid_anchor]`` 입니다.
+            prev_control: anchor 직전 0.5초 평균 제어입니다.
                 shape은 ``[n_valid_anchor, 3]`` 입니다.
-            prev_control_valid: 직전 구간 제어 유효 여부입니다.
+            prev_control_valid: 직전 0.5초 평균 제어 유효 여부입니다.
                 shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
-            Dict[str, Tensor]:
-                각 항목별 anchor 단위 penalty입니다.
+            Dict[str, Tensor]: 각 항목별 anchor 단위 penalty입니다.
                 각 값의 shape은 ``[n_valid_anchor]`` 입니다.
         """
         pos_local_m, heading_local = self._denormalize_future(future_norm)
         vx_body, vy_body, omega = self._trajectory_to_body_controls(pos_local_m, heading_local)
+        chunk_controls, chunk_mean_controls = self._build_chunk_controls(
+            vx_body=vx_body,
+            vy_body=vy_body,
+            omega=omega,
+        )
 
-        speed = torch.sqrt(vx_body.square() + vy_body.square() + self.eps)
+        vx_chunk = chunk_mean_controls[..., 0]
+        vy_chunk = chunk_mean_controls[..., 1]
+        omega_chunk = chunk_mean_controls[..., 2]
+        chunk_dt = self._chunk_dt()
+
+        speed = torch.sqrt(vx_chunk.square() + vy_chunk.square() + self.eps)
         nonholonomic = limits["is_nonholonomic"].unsqueeze(-1)
-        accel_limit = limits["a_max_mps2"] * self.dt
-        yaw_accel_limit = limits["alpha_max_radps2"] * self.dt
+        accel_limit = limits["a_max_mps2"] * chunk_dt
+        yaw_accel_limit = limits["alpha_max_radps2"] * chunk_dt
 
         speed_pen = self._mean_over_time(
             self._normalized_square_penalty(
@@ -280,14 +310,16 @@ class DraftPhysicsRegularizer(nn.Module):
             torch.relu(speed - limits["v_max_mps"].unsqueeze(-1))
         )
 
-        beta = torch.atan2(vy_body.abs(), vx_body.abs() + self.eps)
+        beta = torch.atan2(vy_chunk.abs(), vx_chunk.abs() + self.eps)
         beta_limit = limits["beta_max_rad"].unsqueeze(-1)
         beta_pen = self._normalized_square_penalty(
             value=beta,
             limit=beta_limit,
             enabled=beta_limit > 0.0,
         )
-        slip_pen = self._mean_over_time(torch.where(nonholonomic, beta_pen, torch.zeros_like(beta_pen)))
+        slip_pen = self._mean_over_time(
+            torch.where(nonholonomic, beta_pen, torch.zeros_like(beta_pen))
+        )
         beta_excess_deg = torch.rad2deg(torch.relu(beta - beta_limit))
         slip_beta_excess_deg = self._mean_over_time(
             torch.where(
@@ -297,16 +329,11 @@ class DraftPhysicsRegularizer(nn.Module):
             )
         )
 
-        if vx_body.shape[1] > 0:
-            speed_x = vx_body
-            # 첫 delta는 직전 anchor 제어와 이어 붙인 경계차분으로 계산합니다.
-            dv = torch.empty_like(speed_x)
-            dw = torch.empty_like(omega)
-            dv[:, 0] = (speed_x[:, 0] - prev_control[:, 0]).abs()
-            dw[:, 0] = (omega[:, 0] - prev_control[:, 2]).abs()
-            if speed_x.shape[1] > 1:
-                dv[:, 1:] = (speed_x[:, 1:] - speed_x[:, :-1]).abs()
-                dw[:, 1:] = (omega[:, 1:] - omega[:, :-1]).abs()
+        if vx_chunk.shape[1] > 0:
+            prev_speed_x = torch.cat([prev_control[:, 0:1], vx_chunk[:, :-1]], dim=1)
+            prev_omega = torch.cat([prev_control[:, 2:3], omega_chunk[:, :-1]], dim=1)
+            dv = (vx_chunk - prev_speed_x).abs()
+            dw = (omega_chunk - prev_omega).abs()
             delta_enabled = nonholonomic.expand(-1, dv.shape[1]).clone()
             delta_enabled[:, 0] = delta_enabled[:, 0] & prev_control_valid
 
@@ -319,11 +346,13 @@ class DraftPhysicsRegularizer(nn.Module):
                 enabled=delta_enabled,
             )
             accel_excess_mps2 = self._masked_mean_over_time(
-                torch.relu(dv / self.dt - limits["a_max_mps2"].unsqueeze(-1)),
+                torch.relu(dv / chunk_dt - limits["a_max_mps2"].unsqueeze(-1)),
                 enabled=delta_enabled,
             )
             yaw_accel_excess_degps2 = self._masked_mean_over_time(
-                torch.rad2deg(torch.relu(dw / self.dt - limits["alpha_max_radps2"].unsqueeze(-1))),
+                torch.rad2deg(
+                    torch.relu(dw / chunk_dt - limits["alpha_max_radps2"].unsqueeze(-1))
+                ),
                 enabled=delta_enabled,
             )
         else:
@@ -333,13 +362,15 @@ class DraftPhysicsRegularizer(nn.Module):
             yaw_accel_excess_degps2 = speed_pen.new_zeros(speed_pen.shape)
 
         omega_abs_pen = self._normalized_square_penalty(
-            value=omega.abs(),
+            value=omega_chunk.abs(),
             limit=limits["omega_max_abs_radps"].unsqueeze(-1),
         )
         turn_yaw_rate_excess_degps = self._mean_over_time(
-            torch.rad2deg(torch.relu(omega.abs() - limits["omega_max_abs_radps"].unsqueeze(-1)))
+            torch.rad2deg(
+                torch.relu(omega_chunk.abs() - limits["omega_max_abs_radps"].unsqueeze(-1))
+            )
         )
-        lat_acc_value = speed * omega.abs()
+        lat_acc_value = speed * omega_chunk.abs()
         lat_acc_pen = self._normalized_square_penalty(
             value=lat_acc_value,
             limit=limits["a_lat_max_mps2"].unsqueeze(-1),
@@ -351,7 +382,7 @@ class DraftPhysicsRegularizer(nn.Module):
                 torch.zeros_like(lat_acc_value),
             )
         )
-        radius_value = vx_body.abs() / (omega.abs() + self.eps)
+        radius_value = vx_chunk.abs() / (omega_chunk.abs() + self.eps)
         radius_shortfall = torch.relu(limits["r_min_m"].unsqueeze(-1) - radius_value)
         turn_radius_shortfall_m = self._mean_over_time(
             torch.where(nonholonomic, radius_shortfall, torch.zeros_like(radius_shortfall))
@@ -364,12 +395,21 @@ class DraftPhysicsRegularizer(nn.Module):
             + torch.where(nonholonomic, lat_acc_pen + radius_pen, torch.zeros_like(lat_acc_pen))
         )
 
+        shape_pen = self._compute_shape_tie_penalty(
+            chunk_controls=chunk_controls,
+            chunk_mean_controls=chunk_mean_controls,
+            prev_control=prev_control,
+            prev_control_valid=prev_control_valid,
+            limits=limits,
+        )
+
         return {
             "speed": speed_pen,
             "slip": slip_pen,
             "accel": accel_pen,
             "yaw_accel": yaw_accel_pen,
             "turn": turn_pen,
+            "shape": shape_pen,
             "speed_excess_mps": speed_excess_mps,
             "slip_beta_excess_deg": slip_beta_excess_deg,
             "accel_excess_mps2": accel_excess_mps2,
@@ -378,6 +418,116 @@ class DraftPhysicsRegularizer(nn.Module):
             "turn_lat_accel_excess_mps2": turn_lat_accel_excess_mps2,
             "turn_radius_shortfall_m": turn_radius_shortfall_m,
         }
+
+    def _build_chunk_controls(
+        self,
+        vx_body: Tensor,
+        vy_body: Tensor,
+        omega: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """10Hz 제어를 0.5초 chunk 단위로 다시 묶습니다.
+
+        Args:
+            vx_body: 앞방향 속도입니다. shape은 ``[n_valid_anchor, 20]`` 입니다.
+            vy_body: 옆방향 속도입니다. shape은 ``[n_valid_anchor, 20]`` 입니다.
+            omega: 회전속도입니다. shape은 ``[n_valid_anchor, 20]`` 입니다.
+
+        Returns:
+            Tuple[Tensor, Tensor]:
+                ``chunk_controls`` 는 ``[n_valid_anchor, 4, 5, 3]`` 이고,
+                ``chunk_mean_controls`` 는 ``[n_valid_anchor, 4, 3]`` 입니다.
+        """
+        control_10hz = torch.stack([vx_body, vy_body, omega], dim=-1)
+        if control_10hz.shape[1] % self.chunk_size_steps != 0:
+            raise ValueError(
+                "future control length must be divisible by chunk_size_steps, "
+                f"got {control_10hz.shape[1]} and {self.chunk_size_steps}"
+            )
+        num_anchor = control_10hz.shape[0]
+        num_chunk = control_10hz.shape[1] // self.chunk_size_steps
+        chunk_controls = control_10hz.reshape(
+            num_anchor,
+            num_chunk,
+            self.chunk_size_steps,
+            3,
+        )
+        chunk_mean_controls = chunk_controls.mean(dim=2)
+        return chunk_controls, chunk_mean_controls
+
+    def _compute_shape_tie_penalty(
+        self,
+        chunk_controls: Tensor,
+        chunk_mean_controls: Tensor,
+        prev_control: Tensor,
+        prev_control_valid: Tensor,
+        limits: Dict[str, Tensor],
+    ) -> Tensor:
+        """chunk 안 10Hz 제어가 과하게 흔들리지 않도록 약한 penalty를 계산합니다.
+
+        각 0.5초 chunk 안의 5개 10Hz 제어가,
+        해당 chunk 평균 제어를 중심으로 천천히 변하는 가장 단순한 기준선에
+        너무 멀어지지 않도록 묶습니다.
+
+        Args:
+            chunk_controls: chunk 안 실제 10Hz 제어입니다.
+                shape은 ``[n_valid_anchor, 4, 5, 3]`` 입니다.
+            chunk_mean_controls: chunk 평균 제어입니다.
+                shape은 ``[n_valid_anchor, 4, 3]`` 입니다.
+            prev_control: 직전 0.5초 평균 제어입니다.
+                shape은 ``[n_valid_anchor, 3]`` 입니다.
+            prev_control_valid: 직전 0.5초 평균 제어 유효 여부입니다.
+                shape은 ``[n_valid_anchor]`` 입니다.
+            limits: anchor별 제한값 사전입니다. 각 값의 shape은 ``[n_valid_anchor]`` 입니다.
+
+        Returns:
+            Tensor: anchor별 shape penalty입니다. shape은 ``[n_valid_anchor]`` 입니다.
+        """
+        if chunk_controls.numel() == 0:
+            return prev_control.new_zeros((prev_control.shape[0],))
+
+        prev_chunk_mean = torch.cat(
+            [prev_control.unsqueeze(1), chunk_mean_controls[:, :-1]],
+            dim=1,
+        )
+        chunk_delta = chunk_mean_controls - prev_chunk_mean
+        if chunk_delta.shape[1] > 0:
+            first_chunk_valid = prev_control_valid.unsqueeze(-1)
+            chunk_delta[:, 0] = torch.where(
+                first_chunk_valid,
+                chunk_delta[:, 0],
+                torch.zeros_like(chunk_delta[:, 0]),
+            )
+
+        offsets = (
+            torch.arange(
+                self.chunk_size_steps,
+                device=chunk_controls.device,
+                dtype=chunk_controls.dtype,
+            )
+            - (self.chunk_size_steps - 1) / 2.0
+        ) / float(self.chunk_size_steps)
+        reference_controls = (
+            chunk_mean_controls.unsqueeze(2)
+            + offsets.view(1, 1, self.chunk_size_steps, 1) * chunk_delta.unsqueeze(2)
+        )
+
+        control_diff = chunk_controls - reference_controls
+        vx_scale = (limits["v_max_mps"].view(-1, 1, 1) + self.eps).square()
+        omega_scale = (limits["omega_max_abs_radps"].view(-1, 1, 1) + self.eps).square()
+        shape_error = (
+            control_diff[..., 0].square() / vx_scale
+            + control_diff[..., 1].square() / vx_scale
+            + control_diff[..., 2].square() / omega_scale
+        )
+        return shape_error.mean(dim=(-1, -2))
+
+    def _chunk_dt(self) -> float:
+        """대표 제어 하나가 뜻하는 시간 길이를 돌려줍니다.
+
+        Returns:
+            float: 0.5초 대표 제어의 시간 길이입니다.
+        """
+        return self.dt * float(self.chunk_size_steps)
 
     def _gather_limits(
         self,
@@ -435,7 +585,7 @@ class DraftPhysicsRegularizer(nn.Module):
         pos_local_m: Tensor,
         heading_local: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        """local 미래 궤적을 몸체 기준 제어 시퀀스로 바꿉니다.
+        """local 미래 궤적을 몸체 기준 10Hz 제어 시퀀스로 바꿉니다.
 
         현재 시점은 ``[0, 0, 0]`` 으로 두고,
         각 구간마다 ``[v_x^b, v_y^b, omega]`` 를 단순 차분으로 구합니다.
@@ -475,7 +625,7 @@ class DraftPhysicsRegularizer(nn.Module):
         limit: Tensor,
         enabled: Tensor | None = None,
     ) -> Tensor:
-        """값이 제한을 넘은 정도를 부드럽게 제곱 penalty로 바꿉니다.
+        """값이 제한을 넘은 정도를 부드러운 제곱 penalty로 바꿉니다.
 
         Args:
             value: 실제값입니다. shape은 ``[...,]`` 입니다.
@@ -484,8 +634,7 @@ class DraftPhysicsRegularizer(nn.Module):
                 shape은 ``[...,]`` 또는 브로드캐스트 가능한 shape입니다.
 
         Returns:
-            Tensor:
-                같은 shape의 penalty입니다.
+            Tensor: 같은 shape의 penalty입니다.
         """
         normalized_excess = torch.relu(value - limit) / (limit.abs() + self.eps)
         penalty = self._square_from_normalized_excess(normalized_excess)
@@ -501,8 +650,7 @@ class DraftPhysicsRegularizer(nn.Module):
                 shape은 ``[...,]`` 입니다.
 
         Returns:
-            Tensor:
-                같은 shape의 penalty입니다.
+            Tensor: 같은 shape의 penalty입니다.
         """
         shifted = (normalized_excess - self.deadzone_ratio) / max(self.deadzone_softness, self.eps)
         smooth = torch.nn.functional.softplus(shifted) * max(self.deadzone_softness, self.eps)
@@ -515,15 +663,22 @@ class DraftPhysicsRegularizer(nn.Module):
             value: 마지막 축이 시간인 텐서입니다. shape은 ``[n_valid_anchor, T]`` 입니다.
 
         Returns:
-            Tensor:
-                anchor별 평균값입니다. shape은 ``[n_valid_anchor]`` 입니다.
+            Tensor: anchor별 평균값입니다. shape은 ``[n_valid_anchor]`` 입니다.
         """
         if value.dim() == 1:
             return value
         return value.mean(dim=-1)
 
     def _masked_mean_over_time(self, value: Tensor, enabled: Tensor) -> Tensor:
-        """시간축에서 활성화된 위치만 평균합니다."""
+        """시간축에서 활성화된 위치만 평균합니다.
+
+        Args:
+            value: 마지막 축이 시간인 값입니다. shape은 ``[n_valid_anchor, T]`` 입니다.
+            enabled: 평균에 포함할 위치입니다. shape은 ``[n_valid_anchor, T]`` 입니다.
+
+        Returns:
+            Tensor: anchor별 평균값입니다. shape은 ``[n_valid_anchor]`` 입니다.
+        """
         masked_value = torch.where(enabled, value, torch.zeros_like(value))
         if value.dim() == 1:
             return masked_value

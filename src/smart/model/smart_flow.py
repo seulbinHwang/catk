@@ -95,6 +95,7 @@ class SMARTFlow(LightningModule):
             self.draft_physics_force_fp32 = bool(getattr(draft_physics, "force_fp32", True))
             self.draft_regularizer = DraftPhysicsRegularizer(
                 dt=float(getattr(draft_physics, "dt", 0.1)),
+                chunk_size_steps=int(getattr(draft_physics, "chunk_size_steps", 5)),
                 pos_scale_m=float(getattr(draft_physics, "pos_scale_m", 20.0)),
                 deadzone_ratio=float(getattr(draft_physics, "deadzone_ratio", 0.02)),
                 deadzone_softness=float(getattr(draft_physics, "deadzone_softness", 0.02)),
@@ -104,6 +105,7 @@ class SMARTFlow(LightningModule):
                 accel_weight=float(getattr(draft_physics, "accel_weight", 1.0)),
                 yaw_accel_weight=float(getattr(draft_physics, "yaw_accel_weight", 1.0)),
                 turn_weight=float(getattr(draft_physics, "turn_weight", 1.0)),
+                shape_weight=float(getattr(draft_physics, "shape_weight", 0.1)),
                 eps=float(getattr(draft_physics, "eps", 1e-6)),
             )
         else:
