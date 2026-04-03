@@ -514,6 +514,110 @@ class TerminalCostFinalStepLoss(nn.Module):
             flow_reg_loss=bc_loss.detach(),
         )
 
+    def forward_reward_grad(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+        reward_fn,
+        gt_clean_norm: Optional[Tensor] = None,
+        **reward_kwargs,
+    ) -> "TerminalCostFinalStepResult":
+        """Full-BPTT ODE rollout followed by a pluggable reward function.
+
+        The reward is computed from the final ODE state and gradient flows
+        back through all rollout steps into ``flow_decoder`` (BPTT).  The
+        reward function itself should use soft operations (no hard clamps) so
+        that gradients are non-zero everywhere.
+
+        Args:
+            flow_decoder: flow decoder module (must have ``requires_grad=True``).
+            flow_ode: ODE / flow module.
+            anchor_hidden_valid: encoded context. shape ``[n, hidden_dim]``.
+            reward_fn: callable ``(y_hat, **reward_kwargs) -> (loss, metrics_dict)``.
+                ``loss`` is a scalar to minimise; ``metrics_dict`` may contain
+                ``"projection_gap"`` for logging.
+            gt_clean_norm: GT normalised trajectory for optional BC regularisation.
+                shape ``[n, 20, 4]`` or None.
+            **reward_kwargs: forwarded verbatim to ``reward_fn``.
+
+        Returns:
+            TerminalCostFinalStepResult: loss and logging scalars.
+        """
+        if anchor_hidden_valid.numel() == 0:
+            zero = self._zero_loss_with_trainable_dependency(
+                flow_decoder=flow_decoder,
+                device=anchor_hidden_valid.device,
+                dtype=torch.float32,
+            )
+            return TerminalCostFinalStepResult(
+                loss=zero,
+                terminal_cost=zero.detach(),
+                projection_gap=zero.detach(),
+                final_count=zero.detach(),
+            )
+
+        anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
+        if gt_clean_norm is not None:
+            gt_clean_norm = gt_clean_norm.to(
+                dtype=torch.float32, device=anchor_hidden_valid.device
+            )
+
+        noise = (
+            torch.randn(
+                anchor_hidden_valid.shape[0], 20, 4,
+                device=anchor_hidden_valid.device,
+                dtype=torch.float32,
+            )
+            * self.rollout_noise_scale
+        )
+
+        # Full BPTT OT-ODE rollout — gradient flows through all steps
+        final_state = self._rollout_ode_full_grad(
+            flow_decoder=flow_decoder,
+            flow_ode=flow_ode,
+            anchor_hidden_valid=anchor_hidden_valid,
+            noise=noise,
+        )
+
+        # Pluggable reward: soft operations, no hard clamp
+        reward_loss, reward_metrics = reward_fn(final_state, **reward_kwargs)
+        self._assert_finite_tensor("reward_grad/reward_loss", reward_loss)
+
+        # Optional BC regularisation (keeps model close to pretrained distribution)
+        if self.flow_reg_lambda > 0.0 and gt_clean_norm is not None:
+            bc_loss = self._bc_loss_flowmatching(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden_valid,
+                gt_clean_norm=gt_clean_norm,
+            )
+            self._assert_finite_tensor("reward_grad/bc_loss", bc_loss)
+            flow_reg_loss = self.flow_reg_lambda * bc_loss
+        else:
+            bc_loss = torch.zeros((), device=reward_loss.device, dtype=torch.float32)
+            flow_reg_loss = bc_loss
+
+        total_loss = reward_loss + flow_reg_loss
+
+        projection_gap = reward_metrics.get(
+            "projection_gap",
+            torch.zeros((), device=reward_loss.device, dtype=torch.float32),
+        )
+
+        return TerminalCostFinalStepResult(
+            loss=total_loss,
+            terminal_cost=reward_loss.detach(),
+            projection_gap=projection_gap.detach(),
+            final_count=torch.tensor(
+                anchor_hidden_valid.shape[0],
+                device=total_loss.device,
+                dtype=torch.float32,
+            ),
+            flow_reg_loss=bc_loss.detach(),
+        )
+
     def forward_l2(
         self,
         *,

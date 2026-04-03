@@ -24,6 +24,7 @@ from src.smart.metrics.flow_metrics import (
 )
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
+from src.smart.modules.flow_reward import KinematicProjectionReward
 from src.smart.utils.geometry import wrap_angle
 from src.smart.modules.flow_projected_generation import ProjectedFlowGenerator
 from src.smart.modules.flow_terminal_cost_final_step import TerminalCostFinalStepLoss
@@ -63,6 +64,7 @@ class SMARTFlow(LightningModule):
         )
         self.adjoint_matching_loss = None
         self.terminal_cost_final_step_loss: TerminalCostFinalStepLoss | None = None
+        self.kinematic_reward_fn: KinematicProjectionReward | None = None
         if self.finetune_config.enabled:
             if self.finetune_config.mode == "adjoint_matching":
                 self.adjoint_matching_loss = AdjointMatchingLoss(
@@ -87,6 +89,19 @@ class SMARTFlow(LightningModule):
             elif self.finetune_config.mode == "kinematic_proj_ft":
                 # 별도 loss 모듈 없음 — _run_kinematic_proj_ft_step이 직접 처리
                 pass
+            elif self.finetune_config.mode == "kinematic_reward_ft":
+                # KinematicProjectionReward는 plain callable — TerminalCostFinalStepLoss가
+                # BPTT ODE 인프라를 제공하고 forward_reward_grad로 reward를 연결합니다.
+                # SmoothControlProjector를 만들지만 forward_feasibility_with_bc는 호출 안 합니다.
+                self.terminal_cost_final_step_loss = TerminalCostFinalStepLoss(
+                    rollout_steps=self.finetune_config.rollout_steps,
+                    rollout_noise_scale=self.finetune_config.rollout_noise_scale,
+                    feasible_weight=self.finetune_config.feasible_weight,
+                    smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
+                    smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
+                    flow_reg_lambda=self.finetune_config.flow_reg_lambda,
+                )
+                # kinematic_reward_fn은 kinematic_projector가 설정된 후 (아래) 초기화됩니다.
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
 
@@ -229,6 +244,23 @@ class SMARTFlow(LightningModule):
                     "kin_yaw_ADE2s": WeightedMeanMetric(),
                     "kin_yaw_FDE2s": WeightedMeanMetric(),
                 }
+            )
+            # kinematic_reward_ft: kinematic_projector가 이제 설정됐으므로 reward fn 초기화
+            if (
+                self.finetune_config.enabled
+                and self.finetune_config.mode == "kinematic_reward_ft"
+                and self.kinematic_reward_fn is None
+            ):
+                self.kinematic_reward_fn = KinematicProjectionReward(
+                    kinematic_projector=self.encoder.agent_encoder.kinematic_projector,
+                    huber_beta=self.finetune_config.reward_huber_beta,
+                )
+        elif (
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "kinematic_reward_ft"
+        ):
+            raise ValueError(
+                "kinematic_reward_ft requires kinematic_projection.enabled=True"
             )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
@@ -1078,6 +1110,78 @@ class SMARTFlow(LightningModule):
             and self.encoder.agent_encoder.kinematic_projector is not None
         )
 
+    def _is_kinematic_reward_ft_enabled(self) -> bool:
+        """kinematic_reward_ft 분기인지 확인합니다."""
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "kinematic_reward_ft"
+            and self.kinematic_reward_fn is not None
+            and self.terminal_cost_final_step_loss is not None
+        )
+
+    def _run_kinematic_reward_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> dict:
+        """ODE full-grad rollout → KinematicProjection reward → reward gradient.
+
+        Steps:
+          1. encoder (no_grad) → anchor_hidden_valid
+          2. ctx_sampled_pos/heading → v_init, delta_init
+          3. ODE full-BPTT rollout → y_hat  (gradient flows through all steps)
+          4. KinematicProjectionReward(y_hat) → Huber(y_hat, y_proj.detach())
+          5. (optional) BC regularisation on GT via flow_reg_lambda
+        """
+        kp = self.encoder.agent_encoder.kinematic_projector
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+
+        # 1. Encode context (no_grad; encoder is frozen)
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+
+        if anchor_hidden_valid.numel() == 0:
+            dummy = next(iter(flow_decoder.parameters()))
+            return {"loss": dummy.sum() * 0.0}
+
+        anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
+
+        # 2. v_init / delta_init (closed-loop chunk 초기화와 동일 공식)
+        anchor_mask_tensor = tokenized_agent.get("flow_train_mask")
+        v_init, delta_init = self._compute_kinematic_init(tokenized_agent, anchor_mask_tensor, kp)
+        agent_type = tokenized_agent["flow_train_agent_type"]
+
+        # 3–4. Full-BPTT ODE + KinematicProjection reward (soft Huber loss)
+        gt_clean_norm = tokenized_agent.get("flow_train_clean_norm")
+        _dev = anchor_hidden.device
+        result = self.terminal_cost_final_step_loss.forward_reward_grad(
+            flow_decoder=flow_decoder,
+            flow_ode=flow_ode,
+            anchor_hidden_valid=anchor_hidden,
+            reward_fn=self.kinematic_reward_fn,
+            gt_clean_norm=gt_clean_norm.to(dtype=torch.float32, device=_dev) if gt_clean_norm is not None else None,
+            # reward_fn kwargs:
+            agent_type=agent_type.to(_dev),
+            v_init=v_init.to(_dev) if v_init is not None else None,
+            delta_init=delta_init.to(_dev) if delta_init is not None else None,
+        )
+
+        log_dict = {
+            "train/reward_loss": result.terminal_cost,
+            "train/projection_gap": result.projection_gap,
+            "train/v_init_mean": v_init.mean().item() if v_init is not None else 0.0,
+        }
+        if result.flow_reg_loss is not None:
+            log_dict["train/bc_loss"] = result.flow_reg_loss
+        log_dict["train/loss"] = result.loss.detach()
+        return {"loss": result.loss, **log_dict}
+
     def _run_kinematic_proj_ft_step(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -1215,6 +1319,16 @@ class SMARTFlow(LightningModule):
 
         if self._is_kinematic_proj_ft_enabled():
             result = self._run_kinematic_proj_ft_step(tokenized_map, tokenized_agent)
+            for k, v in result.items():
+                if k != "loss" and isinstance(v, Tensor):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                elif k != "loss" and isinstance(v, float):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            return result["loss"]
+
+        if self._is_kinematic_reward_ft_enabled():
+            result = self._run_kinematic_reward_ft_step(tokenized_map, tokenized_agent)
             for k, v in result.items():
                 if k != "loss" and isinstance(v, Tensor):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)

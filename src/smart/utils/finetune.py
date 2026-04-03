@@ -32,6 +32,7 @@ class FinetuneConfig:
     smooth_deadzone_epsilon: tuple[float, float, float] = (0.01, 0.01, 0.01)
     smooth_deadzone_tau: float = 0.002
     flow_reg_lambda: float = 0.0
+    reward_huber_beta: float = 0.05
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -87,6 +88,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         smooth_deadzone_epsilon=epsilon_tuple,
         smooth_deadzone_tau=float(_read_config_value(finetune, "smooth_deadzone_tau", 0.002)),
         flow_reg_lambda=float(_read_config_value(finetune, "flow_reg_lambda", 0.0)),
+        reward_huber_beta=float(_read_config_value(finetune, "reward_huber_beta", 0.05)),
     )
 
 
@@ -140,7 +142,8 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         "adjoint_matching",
         "terminal_cost_final_step",
         "terminal_cost_full_grad",
-        "kinematic_proj_ft",   # ODE generate → KinematicProjection → FM target
+        "kinematic_proj_ft",    # ODE generate → KinematicProjection → FM target
+        "kinematic_reward_ft",  # ODE full-grad → KinematicProjection as reward → reward grad
     }:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 
