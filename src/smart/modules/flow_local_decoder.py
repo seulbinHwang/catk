@@ -491,7 +491,7 @@ class ContinuousCommitBridge:
         token_bank_all_ped: torch.Tensor,
         token_bank_all_cyc: torch.Tensor,
     ) -> torch.Tensor:
-        """학습과 같은 6개 점 경로 기준으로 다음 coarse 토큰 번호를 다시 고릅니다.
+        """학습과 같은 마지막 한 시점 기준으로 다음 coarse 토큰 번호를 다시 고릅니다.
 
         Args:
             current_pos: 현재 coarse 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
@@ -514,16 +514,20 @@ class ContinuousCommitBridge:
             torch.Tensor:
                 다음 coarse 상태에 붙일 토큰 번호입니다. shape은 ``[n_agent]`` 입니다.
         """
-        contour_chunk_local = self._build_local_commit_contour_chunk(
-            current_pos=current_pos,
-            current_head=current_head,
-            commit_pos=commit_pos,
-            commit_head=commit_head,
-            token_agent_shape=token_agent_shape,
+        next_contour = cal_polygon_contour(
+            commit_pos[:, -1],
+            commit_head[:, -1],
+            token_agent_shape,
+        )
+        next_contour_local, _ = transform_to_local(
+            pos_global=next_contour,
+            head_global=None,
+            pos_now=current_pos,
+            head_now=current_head,
         )
         return match_token_idx_from_local_contour(
             agent_type=agent_type,
-            contour_local=contour_chunk_local,
+            contour_local=next_contour_local,
             token_bank_all_veh=token_bank_all_veh,
             token_bank_all_ped=token_bank_all_ped,
             token_bank_all_cyc=token_bank_all_cyc,

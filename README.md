@@ -7,9 +7,8 @@
 - 기존 SMART의 map/context trunk를 그대로 재사용하고, agent 쪽만 flow decoder로 바꿔 scene-context 품질을 유지합니다.
 - `FlowTokenProcessor`는 14-slot context pack과 13개 anchor를 만들되, 
 - **context 위치/방향과 flow target 원점은 token-restored 상태가 아니라 실제 coarse 상태**를 사용합니다.
-- agent coarse token id는 **마지막 점 1개가 아니라 0.5초 전체 6개 점 사각형 경로**를 기준으로 매칭합니다.
-- `trajectory_token_veh/ped/cyc` 임베딩은 마지막 contour 1개 대신 
-- **`agent_token_all_*` 전체 chunk(6 x 4 x 2)** 를 그대로 펼쳐 사용합니다.
+- agent coarse token id는 **0.5초 구간의 마지막 한 시점 사각형**을 기준으로 매칭합니다.
+- `trajectory_token_veh/ped/cyc` 임베딩은 **마지막 contour 1개(4 x 2)** 를 펼쳐 사용합니다.
 - `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
 - closed-loop inference는 0.5초씩 commit 하며 `pred_traj_10hz`, `pred_head_10hz`, `pred_z_10hz`를 바로 내보내 2025 Sim Agents rollout proto와 바로 연결됩니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm` 이 기본값이며, 
@@ -23,14 +22,14 @@
 
 ### Closed-loop Retokenize Rule
 
-- `retokenize` 자체는 **현재 실제 coarse 상태 + 이번 0.5초 raw FM commit 5점**을 합친 6개 점 경로를 기준으로 
+- `retokenize` 자체는 **현재 실제 coarse 상태를 기준으로 본 이번 0.5초 raw FM commit의 마지막 한 시점 사각형**으로 
 - 다음 token id를 다시 고릅니다.
 - `pos_window`, `head_window`, `coarse_pos/head`, 그리고 다음 step motion feature는 
 - 모두 **token bank 복원값이 아니라 실제 FM commit의 마지막 상태** 기준으로 갱신합니다.
 - 기본값 `raw_fm` 에서는 `pred_traj_10hz`, `pred_head_10hz`를 raw FM 출력 그대로 유지합니다. 
 - 따라서 WOSAC metric, submission proto, video visualization은 
 - post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
-- `matched_token_chunk` 에서는 같은 6점 경로 매칭으로 고른 token chunk가 외부 rollout에도 반영됩니다. 
+- `matched_token_chunk` 에서는 같은 마지막 시점 매칭으로 고른 token chunk가 외부 rollout에도 반영됩니다. 
 - 다만 내부 closed-loop context는 계속 실제 상태를 유지합니다.
 
 

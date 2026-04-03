@@ -59,10 +59,7 @@ class SMARTAgentEncoder(nn.Module):
         input_dim_r_t = 4
         input_dim_r_pt2a = 3
         input_dim_r_a2a = 3
-        token_num_steps = 6
-        token_num_vertices = 4
-        token_xy_dim = 2
-        input_dim_token = token_num_steps * token_num_vertices * token_xy_dim
+        input_dim_token = 8
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
