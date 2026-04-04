@@ -454,7 +454,7 @@ torchrun \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
   ckpt_path="$PRETRAIN_CKPT" \
-  task_name=flow_finetune_draft_h1006
+  task_name=flow_semi_continuous_finetune_h1006
 ```
 
 중요한 차이:
