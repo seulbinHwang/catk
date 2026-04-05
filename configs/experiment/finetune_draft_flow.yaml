@@ -13,7 +13,7 @@ model:
     val_closed_loop: true
     finetune:
       enabled: true
-      train_full_flow_decoder_only: false
+      train_full_flow_decoder_only: true
     draft:
       enabled: true
       start_epoch: 0
