@@ -24,6 +24,7 @@ from src.smart.metrics.flow_metrics import (
 )
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
 from src.smart.modules.flow_dice_critic import DICECritic
+from src.smart.modules.flow_dpo import flow_dpo_loss as _flow_dpo_loss
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.modules.flow_reward import KinematicProjectionReward
 from src.smart.utils.geometry import wrap_angle
@@ -67,6 +68,8 @@ class SMARTFlow(LightningModule):
         self.terminal_cost_final_step_loss: TerminalCostFinalStepLoss | None = None
         self.kinematic_reward_fn: KinematicProjectionReward | None = None
         self.dice_critic: DICECritic | None = None
+        self.ref_flow_decoder: nn.Module | None = None  # frozen ref for Flow-DPO
+        self._dpo_debug_path: str | None = None         # JSONL debug log path
         if self.finetune_config.enabled:
             if self.finetune_config.mode == "adjoint_matching":
                 self.adjoint_matching_loss = AdjointMatchingLoss(
@@ -124,6 +127,18 @@ class SMARTFlow(LightningModule):
                 )
                 # kinematic_reward_fn은 dice_reward_enabled=True이고
                 # kinematic_projector가 설정된 후 초기화됩니다.
+            elif self.finetune_config.mode == "flow_dpo_ft":
+                # Flow-DPO: GT vs policy rollout pairwise DPO.
+                # TerminalCostFinalStepLoss가 policy rollout (y_l) 생성 인프라를 제공합니다.
+                # ref_flow_decoder는 on_train_start()에서 checkpoint 로드 후 복사합니다.
+                self.terminal_cost_final_step_loss = TerminalCostFinalStepLoss(
+                    rollout_steps=self.finetune_config.rollout_steps,
+                    rollout_noise_scale=self.finetune_config.rollout_noise_scale,
+                    feasible_weight=self.finetune_config.feasible_weight,
+                    smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
+                    smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
+                    flow_reg_lambda=0.0,
+                )
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
 
@@ -1161,6 +1176,170 @@ class SMARTFlow(LightningModule):
     # DICE / IQ-Learn fine-tuning
     # ──────────────────────────────────────────────────────────────────────
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Flow-DPO
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def on_train_start(self) -> None:
+        """checkpoint 로드 후 frozen reference model 생성 (Flow-DPO 전용)."""
+        if (
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "flow_dpo_ft"
+            and self.finetune_config.dpo_use_ref_model
+            and self.ref_flow_decoder is None
+        ):
+            from copy import deepcopy
+            flow_decoder = self.encoder.agent_encoder.flow_decoder
+            self.ref_flow_decoder = deepcopy(flow_decoder)
+            for p in self.ref_flow_decoder.parameters():
+                p.requires_grad_(False)
+            print("[Flow-DPO] frozen reference model created from pretrained checkpoint.")
+
+        # DPO debug JSONL path — use Lightning logger dir if available
+        if (
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "flow_dpo_ft"
+            and self.global_rank == 0
+        ):
+            try:
+                log_dir = self.logger.experiment.dir  # wandb
+            except Exception:
+                try:
+                    log_dir = self.logger.log_dir  # csv / tensorboard
+                except Exception:
+                    log_dir = "/tmp"
+            import os
+            self._dpo_debug_path = os.path.join(str(log_dir), "dpo_debug.jsonl")
+            print(f"[Flow-DPO] debug log → {self._dpo_debug_path}")
+
+    def _is_flow_dpo_ft_enabled(self) -> bool:
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "flow_dpo_ft"
+        )
+
+    def _maybe_write_dpo_debug(
+        self,
+        batch_idx: int,
+        anchor_hidden: Tensor,
+        y_w: Tensor,
+        y_l: Tensor,
+        metrics: dict,
+    ) -> None:
+        """DPO 학습 상태를 JSONL 파일에 기록합니다 (rank-0, 10 step마다)."""
+        if self._dpo_debug_path is None or self.global_rank != 0:
+            return
+        step = int(self.global_step)
+        if step % 10 != 0:
+            return
+        import json
+        record: dict = {
+            "step": step,
+            "batch_idx": int(batch_idx),
+            "n_agents": int(anchor_hidden.shape[0]),
+            "dpo_loss": float(metrics.get("train/dpo_loss", float("nan"))),
+            "log_p_w": float(metrics.get("train/dpo_log_p_w", float("nan"))),
+            "log_p_l": float(metrics.get("train/dpo_log_p_l", float("nan"))),
+            "margin": float(metrics.get("train/dpo_margin", float("nan"))),
+            "pref_acc": float(metrics.get("train/dpo_pref_acc", float("nan"))),
+        }
+        if "train/dpo_log_ratio_w" in metrics:
+            record["log_ratio_w"] = float(metrics["train/dpo_log_ratio_w"])
+            record["log_ratio_l"] = float(metrics["train/dpo_log_ratio_l"])
+        # Snapshot trajectory norms for lightweight sanity check
+        with torch.no_grad():
+            record["y_w_norm_mean"] = float(y_w.norm(dim=-1).mean())
+            record["y_l_norm_mean"] = float(y_l.norm(dim=-1).mean())
+            record["y_w_l2_mean"] = float((y_w - y_l).norm(dim=-1).mean())
+        try:
+            with open(self._dpo_debug_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            pass
+
+    def _run_flow_dpo_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        batch_idx: int = 0,
+    ) -> dict:
+        """Flow-DPO fine-tuning step.
+
+        y_w = GT clean trajectory (expert, always assumed better).
+        y_l = policy ODE rollout from the same initial state (online, detached).
+
+        FM log-prob proxy:
+            log π_θ(y | s) ≈ -E_{t,x0}[ ||v_θ(x_t, t, s) - (y - x0)||² ]
+
+        DPO loss (with optional frozen reference model):
+            L = -log σ( β · [ (log π_θ(y_w) - log π_ref(y_w))
+                              - (log π_θ(y_l) - log π_ref(y_l)) ] )
+        """
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+
+        # ── 1. Encode context (frozen encoder) ────────────────────────────────
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+
+        if anchor_hidden_valid.numel() == 0:
+            dummy = next(iter(flow_decoder.parameters()))
+            return {"loss": dummy.sum() * 0.0}
+
+        anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
+        dev = anchor_hidden.device
+
+        # ── 2. y_w: GT trajectory (winner) ────────────────────────────────────
+        y_w = tokenized_agent["flow_train_clean_norm"].to(dtype=torch.float32, device=dev)
+
+        # ── 3. y_l: policy rollout from same initial state (loser, detached) ──
+        # Same v_init / delta_init (from context) → same initial kinematic state.
+        # Detached: DPO evaluates fixed trajectories; gradient flows through v_θ only.
+        with torch.no_grad():
+            y_l = self.terminal_cost_final_step_loss.generate_policy_trajectory(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden,
+            ).detach()  # [n, 20, 4]
+
+        # ── 4. FM-DPO loss ─────────────────────────────────────────────────────
+        ref_decoder = self.ref_flow_decoder if self.finetune_config.dpo_use_ref_model else None
+        loss, metrics = _flow_dpo_loss(
+            flow_decoder=flow_decoder,
+            ref_flow_decoder=ref_decoder,
+            anchor_hidden=anchor_hidden,
+            y_w=y_w.detach(),
+            y_l=y_l,
+            flow_ode=flow_ode,
+            beta=self.finetune_config.dpo_beta,
+            n_samples=self.finetune_config.dpo_n_samples,
+        )
+
+        # ── 5. Optional BC regularization ──────────────────────────────────────
+        bc_loss_val = anchor_hidden.new_zeros(1)
+        if self.finetune_config.dpo_bc_lambda > 0.0:
+            bc_loss = self.terminal_cost_final_step_loss.bc_flow_loss(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden,
+                gt_clean_norm=y_w,
+            )
+            loss = loss + self.finetune_config.dpo_bc_lambda * bc_loss
+            bc_loss_val = bc_loss.detach()
+
+        metrics["loss"] = loss
+        metrics["train/dpo_bc_loss"] = bc_loss_val
+
+        # ── 6. Debug JSONL logging (rank-0, every 10 steps) ────────────────────
+        self._maybe_write_dpo_debug(batch_idx, anchor_hidden, y_w, y_l, metrics)
+
+        return metrics
+
     def _is_dice_ft_enabled(self) -> bool:
         """dice_ft 분기인지 확인합니다."""
         return bool(
@@ -1504,6 +1683,14 @@ class SMARTFlow(LightningModule):
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+
+        if self._is_flow_dpo_ft_enabled():
+            result = self._run_flow_dpo_ft_step(tokenized_map, tokenized_agent, batch_idx)
+            for k, v in result.items():
+                if k != "loss" and isinstance(v, (Tensor, float)):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            return result["loss"]
 
         if self._is_dice_ft_enabled():
             result = self._run_dice_ft_step(tokenized_map, tokenized_agent)
