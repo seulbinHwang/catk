@@ -16,11 +16,33 @@ from typing import Optional
 from lightning import LightningDataModule
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 from torch_geometric.loader import DataLoader
+from torch_geometric.transforms import BaseTransform
 
 from src.smart.datasets import MultiDataset
 
 from .exact_distributed_sampler import ExactDistributedSampler
 from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
+
+
+def build_train_agent_target_builder(
+    train_max_num: int,
+    train_use_eval_agent_selection: bool,
+) -> BaseTransform:
+    """학습용 agent 선택 규칙에 맞는 transform을 고릅니다.
+
+    Args:
+        train_max_num: 기존 학습 규칙에서 사용할 최대 학습 대상 agent 수입니다.
+        train_use_eval_agent_selection: ``True``면 학습에서도 validation/추론과 같은
+            agent 기준을 그대로 씁니다. 이 경우 입력 agent를 150m로 자르지 않고
+            추가 ``train_mask``도 만들지 않습니다. ``False``면 기존 학습 규칙을
+            그대로 사용합니다.
+
+    Returns:
+        BaseTransform: 학습 데이터셋에 붙일 transform 객체입니다.
+    """
+    if train_use_eval_agent_selection:
+        return WaymoTargetBuilderVal()
+    return WaymoTargetBuilderTrain(train_max_num)
 
 
 class MultiDataModule(LightningDataModule):
@@ -39,6 +61,7 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        train_use_eval_agent_selection: bool = False,
     ) -> None:
         super(MultiDataModule, self).__init__()
         self.train_batch_size = train_batch_size
@@ -54,7 +77,10 @@ class MultiDataModule(LightningDataModule):
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
 
-        self.train_transform = WaymoTargetBuilderTrain(train_max_num)
+        self.train_transform = build_train_agent_target_builder(
+            train_max_num=train_max_num,
+            train_use_eval_agent_selection=train_use_eval_agent_selection,
+        )
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
 

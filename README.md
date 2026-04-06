@@ -248,6 +248,21 @@ torchrun ... -m src.run \
   task_name=flow_semi_continuous_pretrain_h1006
 ```
 
+### 5.1.1 학습 agent 선택을 validation/추론과 같게 맞추기
+
+기본값은 `data.train_use_eval_agent_selection=false` 입니다.
+
+- `false`면 기존과 같습니다. 학습 입력 agent는 ego 기준 150m 안만 남기고, 학습 대상은 ego/예측 특별 대상과 ego 기준 100m 안이면서 미래 유효 길이가 충분한 agent 중 최대 `data.train_max_num`개를 사용합니다.
+- `true`면 학습에서도 validation/추론용 transform을 그대로 사용합니다. 따라서 별도의 150m 입력 제한과 `train_mask` / `train_max_num` 제한을 추가하지 않습니다. 이 경우 학습 입력 agent와 학습 대상 anchor가 validation/추론과 같은 기준으로 정해집니다.
+- 이 설정은 pretrain과 DRaFT fine-tuning 둘 다 동일하게 적용됩니다.
+
+예시:
+
+```bash
+# pretrain에서 validation/추론과 같은 agent 기준 사용
+... data.train_use_eval_agent_selection=true
+```
+
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
 
 - 학습 중 validation은 `trainer.check_val_every_n_epoch` 마다 실행됩니다.
@@ -499,6 +514,9 @@ loss와 로그는 아래처럼 보면 됩니다.
 자주 바꾸는 override 예시는 아래와 같습니다.
 
 ```bash
+# fine-tuning에서도 validation/추론과 같은 agent 기준 사용
+... data.train_use_eval_agent_selection=true
+
 # physics 가중치를 더 강하게
 ... model.model_config.draft.max_weight=0.1
 
