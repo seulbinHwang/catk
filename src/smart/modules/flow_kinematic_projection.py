@@ -66,6 +66,11 @@ class KinematicProjection(nn.Module):
         lqr_r_a: float = 0.2,
         lqr_r_delta_rate: float = 0.2,
         lqr_qf_scale: float = 2.0,
+        # Velocity-gated dual-mode: stationary regime handling
+        # v_gate_threshold > 0 → smoothly blend bicycle projection (moving)
+        # with zero-displacement constraint (stationary) via tanh² gate.
+        # Set to 0.0 to disable (pure bicycle model for all agents).
+        v_gate_threshold: float = 0.0,
         **_unused: object,
     ) -> None:
         super().__init__()
@@ -86,6 +91,7 @@ class KinematicProjection(nn.Module):
         self.lqr_r_a = float(lqr_r_a)
         self.lqr_r_delta_rate = float(lqr_r_delta_rate)
         self.lqr_qf_scale = float(lqr_qf_scale)
+        self.v_gate_threshold = float(v_gate_threshold)
         # closed-loop state tracking 활성화 마커 (flow_agent_decoder에서 참조)
         self.use_bicycle_model: bool = True
 
@@ -135,9 +141,28 @@ class KinematicProjection(nn.Module):
                 v0 = v_init[ped_mask] if v_init is not None else None
                 projected[ped_mask] = self._project_ped_batch(x[ped_mask], v0)
 
-        if proj_weight >= 1.0 - self.eps:
-            return projected
-        return proj_weight * projected + (1.0 - proj_weight) * x
+        if proj_weight < 1.0 - self.eps:
+            projected = proj_weight * projected + (1.0 - proj_weight) * x
+
+        # Velocity-gated dual-mode: blend bicycle projection with
+        # zero-displacement stationary constraint.
+        # alpha(v) = tanh²(v / v0) — smooth gate in [0, 1].
+        #   v ≈ 0  → alpha ≈ 0 → stationary target (no displacement)
+        #   v >> v0 → alpha ≈ 1 → full bicycle projection
+        if self.v_gate_threshold > 0.0 and v_init is not None:
+            v0 = torch.as_tensor(
+                self.v_gate_threshold, dtype=projected.dtype, device=projected.device
+            )
+            _v = v_init.to(dtype=projected.dtype, device=projected.device)
+            alpha = torch.tanh(_v / v0).pow(2).view(-1, 1, 1)  # [n, 1, 1]
+
+            # Stationary target: zero position, heading unchanged (cos=1, sin=0 in local frame)
+            stationary = torch.zeros_like(projected)
+            stationary[..., 2] = 1.0  # cos θ
+
+            projected = alpha * projected + (1.0 - alpha) * stationary
+
+        return projected
 
     def project_with_state(
         self,
@@ -200,6 +225,23 @@ class KinematicProjection(nn.Module):
                 projected[ped_mask] = out_p
                 v_final[ped_mask] = v_seq_p[:, commit_idx]
                 # pedestrian: delta = 0 (holonomic)
+
+        # v_gate: stationary vehicle clamping (same gate as forward())
+        if self.v_gate_threshold > 0.0 and v_init is not None:
+            v0 = torch.as_tensor(
+                self.v_gate_threshold, dtype=projected.dtype, device=projected.device
+            )
+            _v = v_init.to(dtype=projected.dtype, device=projected.device)
+            alpha = torch.tanh(_v / v0).pow(2)  # [n]
+            alpha3 = alpha.view(-1, 1, 1)  # broadcast over [n, T, 4]
+
+            stationary = torch.zeros_like(projected)
+            stationary[..., 2] = 1.0  # cos θ = 1, sin θ = 0 (local frame, no movement)
+
+            projected = alpha3 * projected + (1.0 - alpha3) * stationary
+            # Clamp kinematic state so next chunk also starts stationary
+            v_final = alpha * v_final
+            delta_final = alpha * delta_final
 
         return projected, v_final, delta_final
 

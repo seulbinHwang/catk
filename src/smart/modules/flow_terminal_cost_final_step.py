@@ -409,6 +409,67 @@ class TerminalCostFinalStepLoss(nn.Module):
 
         return F.mse_loss(v_pred, v_target)
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Public wrappers for DICE / external callers
+    # ──────────────────────────────────────────────────────────────────────
+
+    def generate_policy_trajectory(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+    ) -> Tensor:
+        """Sample Gaussian noise and run full-BPTT ODE to produce a policy trajectory.
+
+        Gradient flows through all rollout steps, enabling BPTT-based actor updates.
+
+        Args:
+            flow_decoder: flow decoder module.
+            flow_ode: ODE/flow module.
+            anchor_hidden_valid: [n, hidden_dim].
+
+        Returns:
+            Tensor: policy trajectory with full gradient graph. shape [n, 20, 4].
+        """
+        n = anchor_hidden_valid.shape[0]
+        noise = (
+            torch.randn(n, 20, 4, device=anchor_hidden_valid.device, dtype=anchor_hidden_valid.dtype)
+            * self.rollout_noise_scale
+        )
+        return self._rollout_ode_full_grad(
+            flow_decoder=flow_decoder,
+            flow_ode=flow_ode,
+            anchor_hidden_valid=anchor_hidden_valid,
+            noise=noise,
+        )
+
+    def bc_flow_loss(
+        self,
+        *,
+        flow_decoder: nn.Module,
+        flow_ode: nn.Module,
+        anchor_hidden_valid: Tensor,
+        gt_clean_norm: Tensor,
+    ) -> Tensor:
+        """Public wrapper: flow-matching BC loss against GT.
+
+        Args:
+            flow_decoder: flow decoder module.
+            flow_ode: ODE/flow module.
+            anchor_hidden_valid: [n, hidden_dim].
+            gt_clean_norm: GT trajectory. [n, 20, 4].
+
+        Returns:
+            Scalar BC loss (gradient-enabled for actor update).
+        """
+        return self._bc_loss_flowmatching(
+            flow_decoder=flow_decoder,
+            flow_ode=flow_ode,
+            anchor_hidden_valid=anchor_hidden_valid,
+            gt_clean_norm=gt_clean_norm,
+        )
+
     def forward_feasibility_with_bc(
         self,
         *,

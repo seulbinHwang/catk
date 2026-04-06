@@ -23,6 +23,7 @@ from src.smart.metrics.flow_metrics import (
     yaw_fde_2s,
 )
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
+from src.smart.modules.flow_dice_critic import DICECritic
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.modules.flow_reward import KinematicProjectionReward
 from src.smart.utils.geometry import wrap_angle
@@ -65,6 +66,7 @@ class SMARTFlow(LightningModule):
         self.adjoint_matching_loss = None
         self.terminal_cost_final_step_loss: TerminalCostFinalStepLoss | None = None
         self.kinematic_reward_fn: KinematicProjectionReward | None = None
+        self.dice_critic: DICECritic | None = None
         if self.finetune_config.enabled:
             if self.finetune_config.mode == "adjoint_matching":
                 self.adjoint_matching_loss = AdjointMatchingLoss(
@@ -102,6 +104,26 @@ class SMARTFlow(LightningModule):
                     flow_reg_lambda=self.finetune_config.flow_reg_lambda,
                 )
                 # kinematic_reward_fn은 kinematic_projector가 설정된 후 (아래) 초기화됩니다.
+            elif self.finetune_config.mode == "dice_ft":
+                # DICE / IQ-Learn: TerminalCostFinalStepLoss는 BPTT ODE 인프라 제공용.
+                # DICECritic은 hidden_dim이 필요해서 여기서 초기화.
+                self.terminal_cost_final_step_loss = TerminalCostFinalStepLoss(
+                    rollout_steps=self.finetune_config.rollout_steps,
+                    rollout_noise_scale=self.finetune_config.rollout_noise_scale,
+                    feasible_weight=self.finetune_config.feasible_weight,
+                    smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
+                    smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
+                    flow_reg_lambda=0.0,  # BC는 dice_bc_lambda로 별도 제어
+                )
+                _hidden_dim = int(model_config.decoder.hidden_dim)
+                self.dice_critic = DICECritic(
+                    d_state=_hidden_dim,
+                    T=20,
+                    action_hidden=self.finetune_config.dice_action_hidden,
+                    critic_hidden=self.finetune_config.dice_critic_hidden,
+                )
+                # kinematic_reward_fn은 dice_reward_enabled=True이고
+                # kinematic_projector가 설정된 후 초기화됩니다.
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
 
@@ -245,12 +267,20 @@ class SMARTFlow(LightningModule):
                     "kin_yaw_FDE2s": WeightedMeanMetric(),
                 }
             )
-            # kinematic_reward_ft: kinematic_projector가 이제 설정됐으므로 reward fn 초기화
-            if (
+            # kinematic_reward_ft / dice_ft(reward_enabled): kinematic_projector가
+            # 이제 설정됐으므로 reward fn 초기화
+            _needs_kin_reward = (
                 self.finetune_config.enabled
-                and self.finetune_config.mode == "kinematic_reward_ft"
                 and self.kinematic_reward_fn is None
-            ):
+                and (
+                    self.finetune_config.mode == "kinematic_reward_ft"
+                    or (
+                        self.finetune_config.mode == "dice_ft"
+                        and self.finetune_config.dice_reward_enabled
+                    )
+                )
+            )
+            if _needs_kin_reward:
                 self.kinematic_reward_fn = KinematicProjectionReward(
                     kinematic_projector=self.encoder.agent_encoder.kinematic_projector,
                     huber_beta=self.finetune_config.reward_huber_beta,
@@ -261,6 +291,14 @@ class SMARTFlow(LightningModule):
         ):
             raise ValueError(
                 "kinematic_reward_ft requires kinematic_projection.enabled=True"
+            )
+        elif (
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "dice_ft"
+            and self.finetune_config.dice_reward_enabled
+        ):
+            raise ValueError(
+                "dice_ft with dice_reward_enabled=True requires kinematic_projection.enabled=True"
             )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
@@ -1119,6 +1157,156 @@ class SMARTFlow(LightningModule):
             and self.terminal_cost_final_step_loss is not None
         )
 
+    # ──────────────────────────────────────────────────────────────────────
+    # DICE / IQ-Learn fine-tuning
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _is_dice_ft_enabled(self) -> bool:
+        """dice_ft 분기인지 확인합니다."""
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "dice_ft"
+            and self.dice_critic is not None
+            and self.terminal_cost_final_step_loss is not None
+        )
+
+    def _run_dice_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> dict:
+        """DICE (Chi^2 f-divergence / IQ-Learn) imitation learning fine-tuning.
+
+        Both critic and actor are updated via a single combined loss returned to
+        Lightning, avoiding DDP / manual-backward conflicts:
+
+            loss = L_actor + L_critic
+
+        where:
+            L_critic = E_π[Q²/4 + Q] − E_E[Q]   (Chi^2 f-DICE, y_hat detached)
+            L_actor  = −E_π[Q(s, y_hat)]          (BPTT grad through ODE)
+                     + optional reward / BC terms
+
+        Gradient routing (disjoint by construction):
+          • L_critic flows only to dice_critic params  (actor BPTT graph excluded)
+          • L_actor  flows only to flow_decoder params (critic frozen during forward)
+        configure_optimizers registers both as separate param groups so each
+        group's LR can be set independently.
+
+        Steps:
+          1. encoder (no_grad) → anchor_hidden
+          2. ctx → v_init, delta_init
+          3. ODE full-BPTT rollout → y_hat
+          4. q_expert = Q(s, gt_clean.detach())   ← expert side (no y_hat)
+             q_policy = Q(s, y_hat.detach())       ← policy side (y_hat detached)
+             L_critic = Chi^2 DICE loss
+          5. critic frozen → q_actor = Q(s, y_hat)  ← grad through y_hat only
+             L_actor = −q_actor + optional reward + optional BC
+          6. return L_actor + L_critic  → Lightning backward + step
+        """
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+
+        # ── 1. Encode context (frozen encoder) ────────────────────────────
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+
+        if anchor_hidden_valid.numel() == 0:
+            dummy = next(iter(flow_decoder.parameters()))
+            return {"loss": dummy.sum() * 0.0}
+
+        anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
+        n = anchor_hidden.shape[0]
+        dev = anchor_hidden.device
+
+        # ── 2. Kinematic init ──────────────────────────────────────────────
+        kp = self.encoder.agent_encoder.kinematic_projector
+        anchor_mask_tensor = tokenized_agent.get("flow_train_mask")
+        v_init, delta_init = self._compute_kinematic_init(tokenized_agent, anchor_mask_tensor, kp)
+        if v_init is None:
+            v_init = anchor_hidden.new_zeros(n)
+            delta_init = anchor_hidden.new_zeros(n)
+        else:
+            v_init = v_init.to(device=dev, dtype=torch.float32)
+            delta_init = delta_init.to(device=dev, dtype=torch.float32)
+
+        agent_type = tokenized_agent["flow_train_agent_type"].to(dev)
+        gt_clean = tokenized_agent["flow_train_clean_norm"].to(dtype=torch.float32, device=dev)
+
+        # ── 3. ODE rollout (full BPTT → y_hat with grad) ──────────────────
+        y_hat = self.terminal_cost_final_step_loss.generate_policy_trajectory(
+            flow_decoder=flow_decoder,
+            flow_ode=flow_ode,
+            anchor_hidden_valid=anchor_hidden,
+        )  # [n, 20, 4]
+
+        # ── 4. Critic loss  (y_hat detached → grad only to dice_critic) ───
+        # Run multiple critic updates via gradient accumulation.
+        # Each iteration recomputes Q on fresh detached samples and accumulates
+        # the loss. Combined with the actor below in a single backward pass.
+        loss_critic = anchor_hidden.new_zeros(1)
+        for _ in range(self.finetune_config.dice_critic_updates_per_actor):
+            q_expert = self.dice_critic(
+                anchor_hidden.detach(), v_init.detach(), delta_init.detach(), gt_clean.detach()
+            )
+            q_policy_c = self.dice_critic(
+                anchor_hidden.detach(), v_init.detach(), delta_init.detach(), y_hat.detach()
+            )
+            loss_critic = loss_critic + DICECritic.critic_loss(q_policy_c, q_expert)
+        loss_critic = loss_critic / max(self.finetune_config.dice_critic_updates_per_actor, 1)
+
+        # ── 5. Actor loss  (critic frozen → grad only to flow_decoder) ────
+        for p in self.dice_critic.parameters():
+            p.requires_grad_(False)
+        try:
+            q_policy_a = self.dice_critic(anchor_hidden, v_init, delta_init, y_hat)
+        finally:
+            for p in self.dice_critic.parameters():
+                p.requires_grad_(True)
+
+        loss_actor = -q_policy_a.mean()
+
+        # Optional: kinematic reward (on/off via dice_reward_enabled)
+        kin_loss_val = anchor_hidden.new_zeros(1)
+        if self.finetune_config.dice_reward_enabled and self.kinematic_reward_fn is not None:
+            kin_loss, _ = self.kinematic_reward_fn(
+                y_hat, agent_type=agent_type, v_init=v_init, delta_init=delta_init,
+            )
+            loss_actor = loss_actor + self.finetune_config.dice_reward_weight * kin_loss
+            kin_loss_val = kin_loss.detach()
+
+        # Optional: BC regularization (>0 → add GT flow-matching loss)
+        bc_loss_val = anchor_hidden.new_zeros(1)
+        if self.finetune_config.dice_bc_lambda > 0.0:
+            bc_loss = self.terminal_cost_final_step_loss.bc_flow_loss(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden,
+                gt_clean_norm=gt_clean,
+            )
+            loss_actor = loss_actor + self.finetune_config.dice_bc_lambda * bc_loss
+            bc_loss_val = bc_loss.detach()
+
+        # ── 6. Combined loss: disjoint gradients → safe single backward ───
+        # L_critic → dice_critic params; L_actor → flow_decoder params.
+        loss_combined = loss_actor + loss_critic
+
+        return {
+            "loss": loss_combined,
+            "train/dice_critic_loss": loss_critic.detach(),
+            "train/dice_q_expert": q_expert.mean().detach(),
+            "train/dice_q_policy": q_policy_c.mean().detach(),
+            "train/dice_actor_loss": loss_actor.detach(),
+            "train/dice_kin_reward": kin_loss_val,
+            "train/dice_bc_loss": bc_loss_val,
+            "train/v_init_mean": v_init.mean().item(),
+        }
+
     def _run_kinematic_reward_ft_step(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -1316,6 +1504,14 @@ class SMARTFlow(LightningModule):
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+
+        if self._is_dice_ft_enabled():
+            result = self._run_dice_ft_step(tokenized_map, tokenized_agent)
+            for k, v in result.items():
+                if k != "loss" and isinstance(v, (Tensor, float)):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            return result["loss"]
 
         if self._is_kinematic_proj_ft_enabled():
             result = self._run_kinematic_proj_ft_step(tokenized_map, tokenized_agent)
@@ -1829,15 +2025,6 @@ class SMARTFlow(LightningModule):
         return 1
 
     def configure_optimizers(self):
-        trainable_params = [parameter for parameter in self.parameters() if parameter.requires_grad]
-        if len(trainable_params) == 0:
-            raise RuntimeError("No trainable parameters were found.")
-
-        optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.lr,
-            weight_decay=self.weight_decay,
-        )
         total_steps = self._resolve_lr_total_steps()
 
         def lr_lambda(current_index: int) -> float:
@@ -1852,6 +2039,36 @@ class SMARTFlow(LightningModule):
                         (current_step - self.lr_warmup_steps) / max(total_steps - self.lr_warmup_steps, 1),
                     )
                 )
+            )
+
+        if (
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "dice_ft"
+            and self.dice_critic is not None
+        ):
+            # DICE mode: two param groups in a single optimizer.
+            # • Group 0 (actor): flow_decoder — updated by L_actor gradient
+            # • Group 1 (critic): dice_critic — updated by L_critic gradient
+            # Gradients are disjoint by construction (see _run_dice_ft_step).
+            actor_params = [p for p in self.encoder.agent_encoder.flow_decoder.parameters() if p.requires_grad]
+            critic_params = list(self.dice_critic.parameters())
+            if not actor_params:
+                raise RuntimeError("dice_ft: no trainable actor (flow_decoder) parameters found.")
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": actor_params, "lr": self.lr},
+                    {"params": critic_params, "lr": self.finetune_config.dice_critic_lr},
+                ],
+                weight_decay=self.weight_decay,
+            )
+        else:
+            trainable_params = [p for p in self.parameters() if p.requires_grad]
+            if not trainable_params:
+                raise RuntimeError("No trainable parameters were found.")
+            optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
             )
 
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)

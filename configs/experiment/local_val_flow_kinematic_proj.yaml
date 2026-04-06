@@ -20,6 +20,7 @@ model:
     kinematic_projection:
       enabled: true
       eps: 1.0e-6
+      v_gate_threshold: 1.0   # tanh² gate: v<1m/s → stationary, v>>1m/s → bicycle
 
 ckpt_path: null
 

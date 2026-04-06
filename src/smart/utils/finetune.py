@@ -33,6 +33,14 @@ class FinetuneConfig:
     smooth_deadzone_tau: float = 0.002
     flow_reg_lambda: float = 0.0
     reward_huber_beta: float = 0.05
+    # ── DICE / IQ-Learn ────────────────────────────────────────────────────
+    dice_critic_hidden: int = 256       # critic MLP hidden dim
+    dice_action_hidden: int = 128       # action encoder hidden dim
+    dice_critic_lr: float = 3e-4        # critic (sidecar) optimizer LR
+    dice_critic_updates_per_actor: int = 1  # critic steps per actor step
+    dice_reward_enabled: bool = False   # on/off switch for external reward
+    dice_reward_weight: float = 1.0     # scale of external reward term
+    dice_bc_lambda: float = 0.0         # BC (flow-matching) regularization weight
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -89,6 +97,13 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         smooth_deadzone_tau=float(_read_config_value(finetune, "smooth_deadzone_tau", 0.002)),
         flow_reg_lambda=float(_read_config_value(finetune, "flow_reg_lambda", 0.0)),
         reward_huber_beta=float(_read_config_value(finetune, "reward_huber_beta", 0.05)),
+        dice_critic_hidden=int(_read_config_value(finetune, "dice_critic_hidden", 256)),
+        dice_action_hidden=int(_read_config_value(finetune, "dice_action_hidden", 128)),
+        dice_critic_lr=float(_read_config_value(finetune, "dice_critic_lr", 3e-4)),
+        dice_critic_updates_per_actor=int(_read_config_value(finetune, "dice_critic_updates_per_actor", 1)),
+        dice_reward_enabled=bool(_read_config_value(finetune, "dice_reward_enabled", False)),
+        dice_reward_weight=float(_read_config_value(finetune, "dice_reward_weight", 1.0)),
+        dice_bc_lambda=float(_read_config_value(finetune, "dice_bc_lambda", 0.0)),
     )
 
 
@@ -144,6 +159,7 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         "terminal_cost_full_grad",
         "kinematic_proj_ft",    # ODE generate → KinematicProjection → FM target
         "kinematic_reward_ft",  # ODE full-grad → KinematicProjection as reward → reward grad
+        "dice_ft",              # DICE / IQ-Learn imitation learning (Chi^2 f-divergence)
     }:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 
