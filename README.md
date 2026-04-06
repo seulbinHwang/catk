@@ -254,7 +254,7 @@ torchrun ... -m src.run \
 
 - `false`면 기존과 같습니다. 학습 입력 agent는 ego 기준 150m 안만 남기고, 학습 대상은 ego/예측 특별 대상과 ego 기준 100m 안이면서 미래 유효 길이가 충분한 agent 중 최대 `data.train_max_num`개를 사용합니다.
 - `true`면 학습에서도 validation/추론용 transform을 그대로 사용합니다. 따라서 별도의 150m 입력 제한과 `train_mask` / `train_max_num` 제한을 추가하지 않습니다. 이 경우 학습 입력 agent와 학습 대상 anchor가 validation/추론과 같은 기준으로 정해집니다.
-- 이 설정은 pretrain과 DRaFT fine-tuning 둘 다 동일하게 적용됩니다.
+- 이 설정은 pretrain, Flow Matching range fine-tuning, DRaFT fine-tuning에 동일하게 적용됩니다.
 
 예시:
 
@@ -446,7 +446,86 @@ torchrun \
 
 - `training_progress_vs_runtime`: x축은 지금까지 누적된 실제 학습 실행 시간(hours), y축은 전체 epoch 기준 진행률(%)입니다. checkpoint로 학습을 이어서 재개한 경우 이전 runtime도 누적해서 그립니다.
 
-### 5.6 6x H100에서 DRaFT fine-tuning
+### 5.6 6x H100에서 Flow Matching 학습 범위를 넓혀 fine-tuning
+
+`configs/experiment/finetune_flow_range.yaml`은
+**기존 flow checkpoint를 pure Flow Matching loss로 이어서, 학습 범위만 넓혀 새 fine-tuning run을 시작하는 설정**입니다.
+
+핵심은 `data.train_use_eval_agent_selection=true` 입니다.
+이 값이 켜지면 학습에서도 validation/추론과 같은 transform을 그대로 써서
+기존 학습 경로의 150m 입력 제한과 `train_mask` / `train_max_num` 제한 없이
+더 넓은 agent/anchor 범위로 FM loss를 다시 학습합니다.
+
+가장 단순한 6 GPU 실행 예시는 아래와 같습니다.
+
+```bash
+export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=finetune_flow_range \
+  action=finetune \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path="$PRETRAIN_CKPT" \
+  task_name=flow_range_finetune_h1006
+```
+
+중요한 차이:
+
+- 이 경로는 `experiment=pre_bc_flow` + `data.train_use_eval_agent_selection=true`를 매번 길게 적지 않도록 묶어둔 preset입니다.
+- `model.model_config.draft.enabled=false` 상태라서 DRaFT physics regularizer는 전혀 쓰지 않습니다. 즉, **pure FM fine-tuning** 입니다.
+- 첫 시작은 반드시 `action=finetune`를 사용합니다.
+- 현재 구현은 `torch.load(ckpt)["state_dict"]`만 읽고 새 optimizer / lr scheduler / epoch / global step으로 다시 시작합니다.
+- 따라서 pretrained checkpoint에서 새 FM fine-tuning run을 시작할 때만 `action=finetune`를 쓰고,
+- 시작한 fine-tuning run이 중단됐으면 그 다음부터는 위 `5.4 중단된 학습 재개하기` 방식대로 `action=fit` + 이 fine-tuning run의 `last.ckpt` 또는 `epoch_last.ckpt`를 써야 합니다.
+- `data.train_use_eval_agent_selection=true`일 때는 `WaymoTargetBuilderVal()`을 학습 transform으로 쓰므로 `data.train_max_num`은 실제로 사용되지 않습니다.
+
+`finetune_flow_range` 기본 설정은 아래와 같습니다.
+
+- learning rate: `2e-4`
+- max epochs: `16`
+- train batch size: `20`
+- val batch size: `16`
+- validation 주기: `4` epoch마다
+- `data.train_use_eval_agent_selection=true`
+
+메모리 관련 주의:
+
+- 이 fine-tuning은 기존 pretrain보다 한 batch 안에 들어오는 agent 수와 학습 대상 anchor 수가 늘 수 있으므로 GPU memory 사용량이 더 커질 수 있습니다.
+- 그래서 6x H100 기본 train batch size를 `26 -> 20`으로 낮춰 둔 preset입니다.
+- 그래도 OOM이 나면 가장 먼저 `data.train_batch_size`를 `16`, `12`처럼 더 줄이는 편이 안전합니다.
+
+자주 바꾸는 override 예시는 아래와 같습니다.
+
+```bash
+# 메모리가 빠듯하면 batch를 더 줄이기
+... data.train_batch_size=16
+
+# fine-tuning learning rate를 더 낮추기
+... model.model_config.lr=1e-4
+
+# validation을 매 epoch마다 수행
+... trainer.check_val_every_n_epoch=1
+
+# 전체 validation set으로 보기
+... trainer.limit_val_batches=1.0
+```
+
+학습 범위를 "validation/추론과 완전히 같은 기준"으로 넓히는 것이 아니라,
+기존 train 규칙 안에서 학습 대상 수만 늘리고 싶다면 아래처럼 하면 됩니다.
+
+```bash
+... data.train_use_eval_agent_selection=false data.train_max_num=48
+```
+
+다만 이 경우에도 150m 입력 제한과 ego 기준 100m 학습 대상 제한은 그대로 남습니다.
+
+### 5.7 6x H100에서 DRaFT fine-tuning
 
 `configs/experiment/finetune_draft_flow.yaml`을 써서
 **기존 flow checkpoint 위에 DRaFT physics regularizer를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
