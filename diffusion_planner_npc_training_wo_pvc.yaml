@@ -1,0 +1,284 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hsb-npc-training
+  namespace: p-pnc
+  annotations:
+    sidecar.istio.io/inject: "false"
+
+spec:
+  terminationGracePeriodSeconds: 120
+  restartPolicy: OnFailure
+  nodeSelector:
+    mlx.navercorp.com/zone: private-h100-ib-naverlabs-0
+
+  imagePullSecrets:
+    - name: pnc-secret
+
+  securityContext:
+    fsGroup: 1000
+
+  volumes:
+    - name: nuplan-storage
+      emptyDir: {}
+    - name: dshm2
+      emptyDir:
+        medium: Memory
+        sizeLimit: 256Gi
+
+  initContainers:
+    - name: install-nubescli
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -Eeuo pipefail
+          umask 002
+
+          mkdir -p /mnt/nuplan/tools
+          mkdir -p /mnt/nuplan/logs
+
+          if [ ! -s /mnt/nuplan/tools/nubescli ]; then
+            echo "[init] nubescli not found - downloading..."
+            if curl -fsSL -o /mnt/nuplan/tools/nubescli \
+              http://owfsrepo.navercorp.com/nubes/dist/nubescli_latest/linux/nubescli; then
+              chmod +x /mnt/nuplan/tools/nubescli
+            else
+              echo "[init] failed to download nubescli - continuing with a stub wrapper"
+              cat > /mnt/nuplan/tools/nubescli <<'EOF'
+          #!/usr/bin/env bash
+          echo "[nubescli wrapper] nubescli is unavailable in this pod." >&2
+          exit 1
+          EOF
+              chmod +x /mnt/nuplan/tools/nubescli
+            fi
+          else
+            echo "[init] nubescli already exists - skip download"
+          fi
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+
+    - name: setup-claude-code
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+      resources:
+        requests:
+          cpu: "2"
+          memory: "8Gi"
+        limits:
+          cpu: "2"
+          memory: "8Gi"
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -Eeuo pipefail
+          umask 002
+
+          export HOME=/mnt/nuplan/home
+          export PATH="$HOME/.local/bin:/mnt/nuplan/tools:$PATH"
+
+          mkdir -p /mnt/nuplan/tools
+          mkdir -p "$HOME/.local/bin"
+          mkdir -p "$HOME/.claude"
+          chmod 700 "$HOME/.claude"
+
+          INSTALL_LOG=$(mktemp)
+          if ! curl -fsSL https://claude.ai/install.sh | bash 2>&1 | tee "$INSTALL_LOG"; then
+            echo "[init] Claude Code installation failed" >&2
+            exit 1
+          fi
+
+          for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+            touch "$rc"
+            if ! grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$rc"; then
+              printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
+            fi
+          done
+
+          if [ ! -x "$HOME/.local/bin/claude" ]; then
+            echo "[init] expected Claude Code launcher not found at $HOME/.local/bin/claude" >&2
+            find "$HOME" -maxdepth 5 -type f -name claude -perm -111 || true
+            exit 1
+          fi
+
+          ln -sf "$HOME/.local/bin/claude" /mnt/nuplan/tools/claude
+
+          cat > /mnt/nuplan/tools/claude-login-help <<'EOF'
+          #!/usr/bin/env bash
+          cat <<'EOT'
+          Claude Code headless first login:
+          1. Run: claude
+          2. Select: Claude account with subscription
+          3. Open the printed login URL on a separate browser-enabled device
+          4. Finish SSO there and copy the returned code
+          5. Paste that code back into this terminal
+          6. Verify with: claude
+             Then run /status inside Claude Code if needed
+          EOT
+          EOF
+          chmod +x /mnt/nuplan/tools/claude-login-help
+
+          if grep -q 'Setup notes:' "$INSTALL_LOG"; then
+            echo "[init] setup notes detected; PATH was preconfigured for /mnt/nuplan/home/.local/bin"
+          fi
+
+          echo "[init] Claude Code ready"
+          /mnt/nuplan/tools/claude --version
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+
+  containers:
+    - name: main
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+
+      env:
+        - name: LANG
+          value: "ko_KR.utf8"
+        - name: LANGUAGE
+          value: "ko_KR:ko"
+        - name: LC_ALL
+          value: "ko_KR.utf8"
+        - name: LC_CTYPE
+          value: "ko_KR.utf8"
+        - name: TERM
+          value: "xterm-256color"
+
+        - name: PROJECT_ROOT
+          value: "/mnt/nuplan/projects/catk"
+
+        - name: HOME
+          value: "/mnt/nuplan/home"
+
+        - name: PATH
+          value: "/mnt/nuplan/tools:/mnt/nuplan/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+        - name: NUBES_GATEWAY_ADDRESS
+          value: "c.nubes.sto.navercorp.com:8000"
+
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-secret
+              key: api-key
+        - name: WANDB_ENTITY
+          value: "jksg01019-naver-labs"
+        - name: WANDB_PROJECT
+          value: "SMART-FLOW"
+        - name: WANDB_MODE
+          value: "online"
+
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -Eeo pipefail
+          umask 002
+          trap 'echo "Exit (code $?) - keeping pod alive for inspection"; sleep infinity' EXIT
+
+          export LANG=ko_KR.utf8
+          export LANGUAGE=ko_KR:ko
+          export LC_ALL=ko_KR.utf8
+          export LC_CTYPE=ko_KR.utf8
+          export TERM=xterm-256color
+
+          if [ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]; then
+            export PATH=/mnt/nuplan/miniforge/bin:$PATH
+            # shellcheck disable=SC1091
+            source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
+            if conda activate base; then
+              if conda env list | awk '{print $1}' | grep -qx catk; then
+                conda activate catk
+              else
+                echo "[startup] catk conda env not found - using base environment"
+              fi
+            else
+              echo "[startup] failed to activate base conda env - using image default python"
+            fi
+          else
+            echo "[startup] /mnt/nuplan/miniforge not found - using image default python"
+          fi
+
+          pip install --no-cache-dir wandb
+          wandb login --relogin "$WANDB_API_KEY"
+
+          mkdir -p "$HOME"
+
+          if infocmp tmux-256color >/dev/null 2>&1; then
+            TMUX_TERM="tmux-256color"
+          else
+            TMUX_TERM="screen-256color"
+          fi
+
+          cat > "$HOME/.tmux.conf" <<EOF
+          set -g mouse on
+          set -g history-limit 100000
+          setw -g mode-keys vi
+          set -g default-terminal "$TMUX_TERM"
+          EOF
+
+          if [ ! -d "$PROJECT_ROOT/.git" ]; then
+            echo "[startup] PROJECT_ROOT not found - attempting to clone repository into emptyDir"
+            mkdir -p "$(dirname "$PROJECT_ROOT")"
+            git clone --depth 1 https://github.com/seulbinHwang/catk.git "$PROJECT_ROOT" || true
+          fi
+
+          if [ ! -d "$PROJECT_ROOT/.git" ]; then
+            echo "[startup] PROJECT_ROOT is invalid: $PROJECT_ROOT"
+            exit 1
+          fi
+
+          git config --global --add safe.directory "$PROJECT_ROOT"
+
+          cd "$PROJECT_ROOT"
+          if git fetch; then
+            git stash || true
+            if git show-ref --verify --quiet refs/remotes/origin/feature/womd; then
+              if [ "$(git rev-parse --abbrev-ref HEAD)" = "feature/womd" ]; then
+                git checkout main
+              fi
+              git branch -D feature/womd 2>/dev/null || true
+              git checkout -b feature/womd origin/feature/womd
+              git pull
+            else
+              echo "[startup] origin/feature/womd not found - keeping current branch $(git rev-parse --abbrev-ref HEAD)"
+            fi
+          else
+            echo "[startup] git fetch failed - keeping current checkout"
+          fi
+
+          SESSION_NAME="npc-training"
+          tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_ROOT"
+          tmux split-window -h -t "$SESSION_NAME:0" -c "$PROJECT_ROOT"
+          tmux select-layout -t "$SESSION_NAME" even-horizontal
+
+          echo "Started tmux session '$SESSION_NAME'."
+          echo "Claude path: $(command -v claude || echo unavailable)"
+          claude --version
+          echo "Headless login help: /mnt/nuplan/tools/claude-login-help"
+          /mnt/nuplan/tools/claude-login-help
+
+          sleep infinity
+
+      resources:
+        requests:
+          cpu: "32"
+          memory: "1000Gi"
+          nvidia.com/gpu: "6"
+        limits:
+          cpu: "32"
+          memory: "1000Gi"
+          nvidia.com/gpu: "6"
+
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+        - name: dshm2
+          mountPath: /dev/shm
