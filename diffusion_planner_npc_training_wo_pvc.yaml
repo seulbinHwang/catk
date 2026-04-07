@@ -62,6 +62,58 @@ spec:
         - name: nuplan-storage
           mountPath: /mnt/nuplan
 
+    - name: setup-miniforge
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+        limits:
+          cpu: "4"
+          memory: "16Gi"
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -Eeuo pipefail
+          umask 002
+
+          MINIFORGE_DIR=/mnt/nuplan/miniforge
+
+          if [ -x "$MINIFORGE_DIR/bin/conda" ]; then
+            echo "[init] miniforge already installed - skip"
+          else
+            echo "[init] Installing Miniforge..."
+            curl -fsSL -o /tmp/miniforge.sh \
+              https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+            bash /tmp/miniforge.sh -b -p "$MINIFORGE_DIR"
+            rm -f /tmp/miniforge.sh
+            echo "[init] Miniforge installed at $MINIFORGE_DIR"
+          fi
+
+          export PATH="$MINIFORGE_DIR/bin:$PATH"
+          source "$MINIFORGE_DIR/etc/profile.d/conda.sh"
+          conda activate base
+
+          if conda env list | awk '{print $1}' | grep -qx catk; then
+            echo "[init] catk env already exists - skip creation"
+          else
+            echo "[init] Creating catk conda environment (python 3.11)..."
+            conda create -y -n catk python=3.11
+          fi
+
+          conda activate catk
+          echo "[init] Installing requirements..."
+          pip install --no-cache-dir wandb || echo "[init] wandb install failed - continuing"
+
+          echo "[init] Miniforge + catk env ready"
+          conda info --envs
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+
     - name: setup-claude-code
       image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
       securityContext:
@@ -159,7 +211,7 @@ spec:
           value: "/mnt/nuplan/home"
 
         - name: PATH
-          value: "/mnt/nuplan/tools:/mnt/nuplan/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          value: "/mnt/nuplan/miniforge/envs/catk/bin:/mnt/nuplan/miniforge/bin:/mnt/nuplan/tools:/mnt/nuplan/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
         - name: NUBES_GATEWAY_ADDRESS
           value: "c.nubes.sto.navercorp.com:8000"
@@ -189,27 +241,31 @@ spec:
           export LC_CTYPE=ko_KR.utf8
           export TERM=xterm-256color
 
+          export PATH=/mnt/nuplan/miniforge/bin:$PATH
           if [ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]; then
-            export PATH=/mnt/nuplan/miniforge/bin:$PATH
-            # shellcheck disable=SC1091
             source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
-            if conda activate base; then
-              if conda env list | awk '{print $1}' | grep -qx catk; then
-                conda activate catk
-              else
-                echo "[startup] catk conda env not found - using base environment"
-              fi
-            else
-              echo "[startup] failed to activate base conda env - using image default python"
-            fi
+            conda activate catk 2>/dev/null || conda activate base 2>/dev/null || true
+            echo "[startup] conda activated: $(conda info --envs | grep '*')"
           else
             echo "[startup] /mnt/nuplan/miniforge not found - using image default python"
           fi
 
-          pip install --no-cache-dir wandb
-          wandb login --relogin "$WANDB_API_KEY"
+          if command -v pip &>/dev/null; then
+            pip install --no-cache-dir wandb || echo "[startup] pip install wandb failed - continuing"
+            wandb login --relogin "$WANDB_API_KEY" || echo "[startup] wandb login failed - continuing"
+          else
+            echo "[startup] pip not found - skipping wandb setup"
+          fi
 
           mkdir -p "$HOME"
+
+          # Configure .bashrc so tmux sessions also get conda activated
+          cat >> "$HOME/.bashrc" <<'RCEOF'
+          if [ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]; then
+            source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
+            conda activate catk 2>/dev/null || conda activate base 2>/dev/null || true
+          fi
+          RCEOF
 
           if infocmp tmux-256color >/dev/null 2>&1; then
             TMUX_TERM="tmux-256color"
@@ -222,6 +278,7 @@ spec:
           set -g history-limit 100000
           setw -g mode-keys vi
           set -g default-terminal "$TMUX_TERM"
+          set -g default-command "/bin/bash"
           EOF
 
           if [ ! -d "$PROJECT_ROOT/.git" ]; then
