@@ -9,6 +9,9 @@ from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
+from src.smart.modules.dynamics_feasible_commit_bridge import (
+    DynamicsAwareFeasibleCommitBridge,
+)
 from src.smart.modules.flow_local_decoder import (
     ContinuousCommitBridge,
     FlowODE,
@@ -41,6 +44,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_method: str,
         flow_solver_eps: float,
         closed_loop_rollout_mode: str = "raw_fm",
+        use_dynamics_feasible_commit_bridge: bool = False,
     ) -> None:
         super().__init__(
             hidden_dim=hidden_dim,
@@ -79,7 +83,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 f"got {closed_loop_rollout_mode!r}."
             )
         self.closed_loop_rollout_mode = closed_loop_rollout_mode
+        self.use_dynamics_feasible_commit_bridge = bool(use_dynamics_feasible_commit_bridge)
         self.commit_bridge = ContinuousCommitBridge()
+        self.dynamics_commit_bridge = (
+            DynamicsAwareFeasibleCommitBridge()
+            if self.use_dynamics_feasible_commit_bridge
+            else None
+        )
 
     def build_interaction_edge(
         self,
@@ -202,6 +212,56 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         return recent_motion
 
+
+    def _build_initial_exec_state_pair(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """closed-loop 첫 block에서 쓸 최근 fine 실행 상태 2개를 준비합니다.
+
+        우선 10Hz 실제 history 마지막 두 점을 그대로 쓰고,
+        그 정보가 없으면 현재 coarse 창의 마지막 두 상태를 fallback으로 씁니다.
+
+        Args:
+            tokenized_agent: 평가용 토큰 사전입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - exec_pos_pair: 최근 fine 중심점 2개입니다.
+                  shape은 ``[n_agent, 2, 2]`` 입니다.
+                - exec_head_pair: 최근 fine 방향 2개입니다.
+                  shape은 ``[n_agent, 2]`` 입니다.
+                - exec_valid_pair: 최근 fine 상태 유효 여부입니다.
+                  shape은 ``[n_agent, 2]`` 입니다.
+        """
+        if all(
+            key in tokenized_agent
+            for key in [
+                "rollout_init_fine_pos_pair",
+                "rollout_init_fine_head_pair",
+                "rollout_init_fine_valid_pair",
+            ]
+        ):
+            return (
+                tokenized_agent["rollout_init_fine_pos_pair"].clone(),
+                tokenized_agent["rollout_init_fine_head_pair"].clone(),
+                tokenized_agent["rollout_init_fine_valid_pair"].clone(),
+            )
+
+        coarse_pos = tokenized_agent["gt_pos"]
+        coarse_head = tokenized_agent["gt_heading"]
+        coarse_valid = tokenized_agent["valid_mask"]
+        if coarse_pos.shape[1] >= 2:
+            return (
+                coarse_pos[:, -2:].clone(),
+                coarse_head[:, -2:].clone(),
+                coarse_valid[:, -2:].clone(),
+            )
+
+        exec_pos_pair = torch.cat([coarse_pos[:, -1:], coarse_pos[:, -1:]], dim=1)
+        exec_head_pair = torch.cat([coarse_head[:, -1:], coarse_head[:, -1:]], dim=1)
+        exec_valid_pair = torch.cat([coarse_valid[:, -1:], coarse_valid[:, -1:]], dim=1)
+        return exec_pos_pair, exec_head_pair, exec_valid_pair
 
     def _pack_anchor_hidden(
         self,
@@ -528,6 +588,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         head_vector_window = torch.stack([head_window.cos(), head_window.sin()], dim=-1)
         valid_window = tokenized_agent["valid_mask"][:, :step_current_2hz].clone()
         pred_idx_window = tokenized_agent["gt_idx"][:, :step_current_2hz].clone()
+        exec_pos_pair_10hz, exec_head_pair_10hz, exec_valid_pair_10hz = (
+            self._build_initial_exec_state_pair(tokenized_agent=tokenized_agent)
+        )
 
         (
             feat_a,
@@ -610,6 +673,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "head_vector_window": head_vector_window,
             "valid_window": valid_window,
             "pred_idx_window": pred_idx_window,
+            "exec_pos_pair_10hz": exec_pos_pair_10hz,
+            "exec_head_pair_10hz": exec_head_pair_10hz,
+            "exec_valid_pair_10hz": exec_valid_pair_10hz,
             "feat_a": feat_a,
             "agent_token_emb": agent_token_emb,
             "agent_token_emb_veh": agent_token_emb_veh,
@@ -640,6 +706,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "head_vector_window",
             "valid_window",
             "pred_idx_window",
+            "exec_pos_pair_10hz",
+            "exec_head_pair_10hz",
+            "exec_valid_pair_10hz",
             "feat_a",
             "agent_token_emb",
             "feat_a_now",
@@ -691,6 +760,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         head_vector_window = state["head_vector_window"]
         valid_window = state["valid_window"]
         pred_idx_window = state["pred_idx_window"]
+        exec_pos_pair_10hz = state["exec_pos_pair_10hz"]
+        exec_head_pair_10hz = state["exec_head_pair_10hz"]
+        exec_valid_pair_10hz = state["exec_valid_pair_10hz"]
         feat_a = state["feat_a"]
         agent_token_emb = state["agent_token_emb"]
         agent_token_emb_veh = state["agent_token_emb_veh"]
@@ -820,52 +892,92 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 )
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
-                (
-                    commit_pos_act,
-                    commit_head_act,
-                    next_pos_act,
-                    next_head_act,
-                ) = self.commit_bridge.commit(
-                    y_hat_norm=y_hat_norm,
-                    current_pos=current_pos_act,
-                    current_head=current_head_act,
-                )
+                active_agent_type = tokenized_agent["type"][active_mask]
+                if self.use_dynamics_feasible_commit_bridge and self.dynamics_commit_bridge is not None:
+                    (
+                        commit_pos_act,
+                        commit_head_act,
+                        next_pos_act,
+                        next_head_act,
+                    ) = self.dynamics_commit_bridge.commit(
+                        y_hat_norm=y_hat_norm,
+                        current_pos=current_pos_act,
+                        current_head=current_head_act,
+                        agent_type=active_agent_type,
+                        agent_shape=tokenized_agent["shape"][active_mask],
+                        exec_pos_pair=exec_pos_pair_10hz[active_mask],
+                        exec_head_pair=exec_head_pair_10hz[active_mask],
+                        exec_valid_pair=exec_valid_pair_10hz[active_mask],
+                    )
+                else:
+                    (
+                        commit_pos_act,
+                        commit_head_act,
+                        next_pos_act,
+                        next_head_act,
+                    ) = self.commit_bridge.commit(
+                        y_hat_norm=y_hat_norm,
+                        current_pos=current_pos_act,
+                        current_head=current_head_act,
+                    )
                 next_token_idx_act = self.commit_bridge.retokenize(
                     current_pos=current_pos_act,
                     current_head=current_head_act,
                     commit_pos=commit_pos_act,
                     commit_head=commit_head_act,
-                    agent_type=tokenized_agent["type"][active_mask],
+                    agent_type=active_agent_type,
                     token_agent_shape=tokenized_agent["token_agent_shape"][active_mask],
                     token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
                     token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
                     token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
                 )
+                commit_pos_export_act = commit_pos_act
+                commit_head_export_act = commit_head_act
                 if self.closed_loop_rollout_mode == "matched_token_chunk":
-                    (
-                        commit_pos_export_act,
-                        commit_head_export_act,
-                        _,
-                        _,
-                    ) = self.commit_bridge.restore_token_chunk(
-                        current_pos=current_pos_act,
-                        current_head=current_head_act,
-                        next_token_idx=next_token_idx_act,
-                        agent_type=tokenized_agent["type"][active_mask],
-                        token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
-                        token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
-                        token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
-                    )
-                else:
-                    # Default behavior keeps exported/scored 10 Hz rollout as raw FM output.
-                    # Regardless of export mode, the next closed-loop context keeps the real FM commit state.
-                    commit_pos_export_act = commit_pos_act
-                    commit_head_export_act = commit_head_act
+                    if self.use_dynamics_feasible_commit_bridge:
+                        ped_active_mask = active_agent_type == 1
+                        if ped_active_mask.any():
+                            (
+                                ped_commit_pos_export,
+                                ped_commit_head_export,
+                                _,
+                                _,
+                            ) = self.commit_bridge.restore_token_chunk(
+                                current_pos=current_pos_act[ped_active_mask],
+                                current_head=current_head_act[ped_active_mask],
+                                next_token_idx=next_token_idx_act[ped_active_mask],
+                                agent_type=active_agent_type[ped_active_mask],
+                                token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                                token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                                token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
+                            )
+                            commit_pos_export_act[ped_active_mask] = ped_commit_pos_export
+                            commit_head_export_act[ped_active_mask] = ped_commit_head_export
+                    else:
+                        (
+                            commit_pos_export_act,
+                            commit_head_export_act,
+                            _,
+                            _,
+                        ) = self.commit_bridge.restore_token_chunk(
+                            current_pos=current_pos_act,
+                            current_head=current_head_act,
+                            next_token_idx=next_token_idx_act,
+                            agent_type=active_agent_type,
+                            token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                            token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                            token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
+                        )
                 commit_traj_step[active_mask] = commit_pos_export_act
                 commit_head_step[active_mask] = commit_head_export_act
                 next_pos[active_mask] = next_pos_act
                 next_head[active_mask] = next_head_act
                 next_token_idx[active_mask] = next_token_idx_act
+                exec_pos_pair_10hz[active_mask, 0] = commit_pos_act[:, -2]
+                exec_pos_pair_10hz[active_mask, 1] = commit_pos_act[:, -1]
+                exec_head_pair_10hz[active_mask, 0] = commit_head_act[:, -2]
+                exec_head_pair_10hz[active_mask, 1] = commit_head_act[:, -1]
+                exec_valid_pair_10hz[active_mask] = True
 
             pred_traj_10hz[:, t * 5 : (t + 1) * 5] = commit_traj_step
             pred_head_10hz[:, t * 5 : (t + 1) * 5] = commit_head_step

@@ -173,12 +173,24 @@ class TokenProcessor(torch.nn.Module):
             tokenized_agent[f"token_bank_all_{k}"] = getattr(self, f"agent_token_all_{k}")
 
         if not self.training:
+            (
+                rollout_init_fine_pos_pair,
+                rollout_init_fine_head_pair,
+                rollout_init_fine_valid_pair,
+            ) = self._build_rollout_init_fine_pair(
+                valid=valid,
+                pos=pos,
+                heading=heading,
+            )
             tokenized_agent.update(
                 {
                     "gt_pos_raw": pos[:, self.shift :: self.shift],
                     "gt_head_raw": heading[:, self.shift :: self.shift],
                     "gt_valid_raw": valid[:, self.shift :: self.shift],
                     "gt_z_raw": data["agent"]["position"][:, 10, 2],
+                    "rollout_init_fine_pos_pair": rollout_init_fine_pos_pair,
+                    "rollout_init_fine_head_pair": rollout_init_fine_head_pair,
+                    "rollout_init_fine_valid_pair": rollout_init_fine_valid_pair,
                 }
             )
 
@@ -198,6 +210,42 @@ class TokenProcessor(torch.nn.Module):
                 "heading": heading,
             }
         return tokenized_agent
+
+    def _build_rollout_init_fine_pair(
+        self,
+        valid: Tensor,
+        pos: Tensor,
+        heading: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """closed-loop 첫 block에서 쓸 10Hz 마지막 두 실제 상태를 만듭니다.
+
+        현재 semi-continuous closed-loop는 raw step 10을 현재 coarse 시점으로 씁니다.
+        그래서 첫 dynamics-aware commit은 raw step 9와 10 사이의 실제 변화량을
+        바로 시작 상태로 쓰는 것이 가장 자연스럽습니다.
+
+        Args:
+            valid: 전체 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            pos: 전체 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전체 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor]:
+                - 최근 fine 중심점 2개 ``[n_agent, 2, 2]``
+                - 최근 fine 방향 2개 ``[n_agent, 2]``
+                - 최근 fine 유효 여부 2개 ``[n_agent, 2]``
+        """
+        current_raw_step = min(self.shift * 2, pos.shape[1] - 1)
+        start_step = max(current_raw_step - 1, 0)
+        pos_pair = pos[:, start_step : current_raw_step + 1].contiguous()
+        head_pair = heading[:, start_step : current_raw_step + 1].contiguous()
+        valid_pair = valid[:, start_step : current_raw_step + 1].contiguous()
+        if pos_pair.shape[1] == 2:
+            return pos_pair, head_pair, valid_pair
+
+        pos_pair = torch.cat([pos_pair, pos_pair], dim=1)
+        head_pair = torch.cat([head_pair, head_pair], dim=1)
+        valid_pair = torch.cat([valid_pair, valid_pair], dim=1)
+        return pos_pair, head_pair, valid_pair
 
     def _match_agent_token(
         self,

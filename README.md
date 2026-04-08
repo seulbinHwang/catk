@@ -17,6 +17,14 @@
 - `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면 
 - `retokenize`로 고른 token의 0.5초 chunk를 **외부 rollout 10Hz 출력에만** 반영합니다.
 - 내부 closed-loop context는 계속 실제 FM commit 상태를 유지합니다.
+- `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true`를 켜면 vehicle / bicycle에만
+  dynamics-aware feasible commit bridge를 적용합니다. 이 모드에서는 2초 FM 미래 중 앞 1초를
+  기준선으로 보고, 실제 반영은 0.5초 / 5점만 speed-yaw-rate 추종으로 실행합니다.
+- 이 bridge는 최근 실제 10Hz 두 점으로 현재 speed / yaw-rate를 잡고, `draft_physics.py`의
+  차종별 속도, 가감속, yaw-rate, yaw-accel, 횡가속, 최소 선회 반경 제한을 같이 씁니다.
+- wheelbase가 없는 WOMD multi-agent 특성을 고려해 steering angle 대신 yaw-rate 형태의
+  kinematic bicycle 계열 적분을 쓰며, 실제 에이전트 footprint 크기로 최소 선회 반경 하한을
+  한 번 더 보정합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
@@ -32,6 +40,11 @@
 - post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
 - `matched_token_chunk` 에서는 같은 6점 경로 매칭으로 고른 token chunk가 외부 rollout에도 반영됩니다. 
 - 다만 내부 closed-loop context는 계속 실제 상태를 유지합니다.
+- dynamics-aware feasible commit bridge를 켠 경우에도 `retokenize`와 내부 문맥 갱신은
+  항상 실행된 5개 fine 상태를 기준으로 이뤄집니다.
+- 같은 모드에서 `matched_token_chunk`를 써도 vehicle / bicycle의 외부 10Hz 출력은
+  token chunk로 다시 덮지 않고 실제 실행 chunk를 유지합니다. pedestrian만 기존 방식대로
+  token chunk export를 유지합니다.
 
 
 ## 2. 환경 설치
@@ -271,6 +284,9 @@ torchrun ... -m src.run \
 - validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
 - `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. 현재 `pre_bc_flow` 기본값은 `32`입니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
+- `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true/false`로 
+- vehicle / bicycle용 dynamics-aware feasible commit bridge를 켜거나 끕니다. 
+- 켜면 2초 미래를 바로 commit하지 않고, 앞 1초 기준선을 상수 accel / 상수 yaw-rate 추종으로 0.5초만 실행합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
@@ -297,6 +313,14 @@ torchrun ... -m src.run \
 
 # matched token chunk를 실제 closed-loop rollout/video/score 출력에만 사용
 ... model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
+
+# vehicle / bicycle에 dynamics-aware feasible commit bridge 적용
+... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true
+
+# dynamics-aware feasible commit + matched token chunk를 함께 쓸 때도
+# vehicle / bicycle export는 실행된 5점 chunk를 유지하고 pedestrian만 token chunk를 씁니다.
+... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true \
+    model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
 # training validation에서 공식 2025 scorer를 앞 20 batch에만 적용
 ... model.model_config.n_batch_sim_agents_metric=20
