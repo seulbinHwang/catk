@@ -854,16 +854,16 @@ class SMARTFlow(LightningModule):
                 pred_z=pred_z,
                 pred_head=pred_head,
             )
-            if batch_idx < self.n_vis_batch:
-                device = pred_traj.device
-                scenario_rollouts = get_scenario_rollouts(
-                    scenario_id=get_scenario_id_int_tensor(data["scenario_id"], device),
-                    agent_id=data["agent"]["id"],
-                    agent_batch=data["agent"]["batch"],
-                    pred_traj=pred_traj,
-                    pred_z=pred_z,
-                    pred_head=pred_head,
-                )
+        if batch_idx < self.n_vis_batch:
+            device = pred_traj.device
+            scenario_rollouts = get_scenario_rollouts(
+                scenario_id=get_scenario_id_int_tensor(data["scenario_id"], device),
+                agent_id=data["agent"]["id"],
+                agent_batch=data["agent"]["batch"],
+                pred_traj=pred_traj,
+                pred_z=pred_z,
+                pred_head=pred_head,
+            )
         return scenario_rollouts
 
     def on_fit_start(self) -> None:
