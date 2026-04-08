@@ -24,14 +24,14 @@ class DynamicsAwareFeasibleCommitBridge:
     2. WOMD에 wheelbase가 없으므로 steering angle 대신 speed / yaw-rate 형태로
        추적합니다.
     3. 에이전트 축에 대한 계산은 전부 배치 병렬로 처리하고, 시간축의 짧은
-       고정 길이(미리보기 10 step, 실행 5 step)만 작은 반복으로 풉니다.
+       고정 길이(미리보기 20 step, 실행 5 step)만 작은 반복으로 풉니다.
 
     Args:
         dt: 내부 10Hz 적분 간격입니다. 기본값은 ``0.1`` 초입니다.
         pos_scale_m: flow decoder가 낸 정규화 좌표를 meter로 되돌릴 배율입니다.
             기본값은 ``20.0`` 입니다.
-        preview_steps: 제어 기준으로 볼 미래 길이입니다. 기본값은 ``10`` step,
-            즉 1초입니다.
+        preview_steps: 제어 기준으로 볼 미래 길이입니다. 기본값은 ``20`` step,
+            즉 2초입니다.
         commit_steps: 실제로 실행해 context에 반영할 길이입니다. 기본값은
             ``5`` step, 즉 0.5초입니다.
         speed_smoothing_alpha: 기준 속도 시퀀스를 한 번 부드럽게 만들 때 쓰는
@@ -44,7 +44,20 @@ class DynamicsAwareFeasibleCommitBridge:
         q_terminal_heading: 횡방향 종단 방향 오차 가중치입니다.
         r_yaw_rate: 목표 yaw-rate 크기 가중치입니다.
         low_speed_threshold_mps: 정지 근처 special handling 기준 속도입니다.
-        low_speed_gain: 저속 모드에서 목표 속도로 천천히 맞출 때 쓰는 비례 이득입니다.
+        low_speed_gain: 저속 모드에서 current 0.5초 motion intent에 맞출 때
+            쓰는 비례 이득입니다.
+        stationary_speed_enter_mps: 정지 hold 모드 진입용 현재 속도 임계값입니다.
+        stationary_speed_exit_mps: 정지 hold 모드 유지용 현재 속도 임계값입니다.
+        stationary_yaw_rate_enter_radps: 정지 hold 모드 진입용 현재 yaw-rate 임계값입니다.
+        stationary_yaw_rate_exit_radps: 정지 hold 모드 유지용 현재 yaw-rate 임계값입니다.
+        stationary_displacement_enter_m: 정지 hold 모드 진입용 0.5초 net displacement 임계값입니다.
+        stationary_displacement_exit_m: 정지 hold 모드 유지용 0.5초 net displacement 임계값입니다.
+        stationary_path_length_enter_m: 정지 hold 모드 진입용 0.5초 path length 임계값입니다.
+        stationary_path_length_exit_m: 정지 hold 모드 유지용 0.5초 path length 임계값입니다.
+        stationary_heading_enter_rad: 정지 hold 모드 진입용 0.5초 heading envelope 임계값입니다.
+        stationary_heading_exit_rad: 정지 hold 모드 유지용 0.5초 heading envelope 임계값입니다.
+        longitudinal_intent_deadzone_m: 0.5초 block의 종방향 motion intent를
+            판정할 때 쓰는 dead-zone입니다.
         v_floor_mps: 곡률 계열 제한을 계산할 때 0으로 나누지 않도록 쓰는 작은 값입니다.
     """
 
@@ -63,6 +76,19 @@ class DynamicsAwareFeasibleCommitBridge:
         r_yaw_rate: float = 1.0,
         low_speed_threshold_mps: float = 0.2,
         low_speed_gain: float = 0.5,
+        stationary_speed_enter_mps: float = 0.05,
+        stationary_speed_exit_mps: float = 0.1,
+        stationary_yaw_rate_enter_radps: float = 0.1,
+        stationary_yaw_rate_exit_radps: float = 0.2,
+        stationary_displacement_enter_m: float = 0.04,
+        stationary_displacement_exit_m: float = 0.08,
+        stationary_path_length_enter_m: float = 0.08,
+        stationary_path_length_exit_m: float = 0.16,
+        stationary_heading_enter_rad: float = 0.05,
+        stationary_heading_exit_rad: float = 0.1,
+        stationary_pair_reuse_displacement_epsilon_m: float = 1e-3,
+        stationary_pair_reuse_heading_epsilon_rad: float = 1e-3,
+        longitudinal_intent_deadzone_m: float = 0.05,
         v_floor_mps: float = 0.1,
     ) -> None:
         self.dt = float(dt)
@@ -78,6 +104,23 @@ class DynamicsAwareFeasibleCommitBridge:
         self.r_yaw_rate = float(r_yaw_rate)
         self.low_speed_threshold_mps = float(low_speed_threshold_mps)
         self.low_speed_gain = float(low_speed_gain)
+        self.stationary_speed_enter_mps = float(stationary_speed_enter_mps)
+        self.stationary_speed_exit_mps = float(stationary_speed_exit_mps)
+        self.stationary_yaw_rate_enter_radps = float(stationary_yaw_rate_enter_radps)
+        self.stationary_yaw_rate_exit_radps = float(stationary_yaw_rate_exit_radps)
+        self.stationary_displacement_enter_m = float(stationary_displacement_enter_m)
+        self.stationary_displacement_exit_m = float(stationary_displacement_exit_m)
+        self.stationary_path_length_enter_m = float(stationary_path_length_enter_m)
+        self.stationary_path_length_exit_m = float(stationary_path_length_exit_m)
+        self.stationary_heading_enter_rad = float(stationary_heading_enter_rad)
+        self.stationary_heading_exit_rad = float(stationary_heading_exit_rad)
+        self.stationary_pair_reuse_displacement_epsilon_m = float(
+            stationary_pair_reuse_displacement_epsilon_m
+        )
+        self.stationary_pair_reuse_heading_epsilon_rad = float(
+            stationary_pair_reuse_heading_epsilon_rad
+        )
+        self.longitudinal_intent_deadzone_m = float(longitudinal_intent_deadzone_m)
         self.v_floor_mps = float(v_floor_mps)
 
     def commit(
@@ -223,11 +266,42 @@ class DynamicsAwareFeasibleCommitBridge:
             v_max=limits["v_max_mps"],
             yaw_rate_max_abs=limits["omega_max_abs_radps"],
         )
+        commit_window_motion = self._build_commit_window_motion(
+            preview_pos_local=preview_pos_local,
+            preview_head_local=preview_head_local,
+        )
+        stationary_hold_mask = self._build_stationary_hold_mask(
+            speed_0=speed_0,
+            yaw_rate_0=yaw_rate_0,
+            exec_pos_pair=exec_pos_pair,
+            exec_head_pair=exec_head_pair,
+            exec_valid_pair=exec_valid_pair,
+            commit_window_motion=commit_window_motion,
+        )
         accel_target = self._solve_longitudinal_command(
             speed_0=speed_0,
             ref_speed=ref_speed,
             a_max=limits["a_max_mps2"],
         )
+        window_dt = max(float(self.commit_steps) * self.dt, 1e-6)
+        coherent_longitudinal_motion = (
+            commit_window_motion["longitudinal_displacement_m"].abs()
+            >= self.longitudinal_intent_deadzone_m
+        )
+        window_signed_speed = torch.where(
+            coherent_longitudinal_motion,
+            commit_window_motion["longitudinal_displacement_m"] / window_dt,
+            torch.zeros_like(speed_0),
+        )
+        low_speed_mask = (
+            speed_0.abs() <= self.low_speed_threshold_mps
+        ) & (~stationary_hold_mask)
+        low_speed_accel = torch.clamp(
+            self.low_speed_gain * (window_signed_speed - speed_0),
+            min=-limits["a_max_mps2"],
+            max=limits["a_max_mps2"],
+        )
+        accel_target = torch.where(low_speed_mask, low_speed_accel, accel_target)
         speed_profile = self._build_speed_profile(
             speed_0=speed_0,
             accel_target=accel_target,
@@ -240,21 +314,6 @@ class DynamicsAwareFeasibleCommitBridge:
             yaw_rate_max_abs=limits["omega_max_abs_radps"],
         )
 
-        preview_speed_mean = ref_speed.mean(dim=-1)
-        preview_speed_mean_abs = ref_speed.abs().mean(dim=-1)
-        low_speed_mask = (
-            speed_0.abs() <= self.low_speed_threshold_mps
-        ) & (
-            preview_speed_mean_abs <= self.low_speed_threshold_mps
-        )
-        low_speed_accel = torch.clamp(
-            self.low_speed_gain * (preview_speed_mean - speed_0),
-            min=-limits["a_max_mps2"],
-            max=limits["a_max_mps2"],
-        )
-        accel_target = torch.where(low_speed_mask, low_speed_accel, accel_target)
-        yaw_rate_target = torch.where(low_speed_mask, torch.zeros_like(yaw_rate_target), yaw_rate_target)
-
         commit_pos_local, commit_head_local = self._propagate_commit(
             speed_0=speed_0,
             yaw_rate_0=yaw_rate_0,
@@ -262,6 +321,9 @@ class DynamicsAwareFeasibleCommitBridge:
             yaw_rate_target=yaw_rate_target,
             limits=limits,
         )
+        if stationary_hold_mask.any():
+            commit_pos_local[stationary_hold_mask] = 0.0
+            commit_head_local[stationary_hold_mask] = 0.0
         commit_pos_global, _ = transform_to_global(
             pos_local=commit_pos_local,
             head_local=None,
@@ -328,6 +390,95 @@ class DynamicsAwareFeasibleCommitBridge:
         ref_speed = self._smooth_sequence(ref_speed, alpha=self.speed_smoothing_alpha)
         ref_yaw_rate = self._smooth_sequence(ref_yaw_rate, alpha=self.yaw_rate_smoothing_alpha)
         return ref_speed, ref_yaw_rate
+
+    def _build_commit_window_motion(
+        self,
+        preview_pos_local: Tensor,
+        preview_head_local: Tensor,
+    ) -> Dict[str, Tensor]:
+        """다음 0.5초 commit window의 정지/출발 증거를 요약합니다."""
+        window_pos = preview_pos_local[:, : self.commit_steps]
+        window_head = preview_head_local[:, : self.commit_steps]
+        num_agent = preview_pos_local.shape[0]
+        zero_pos = preview_pos_local.new_zeros((num_agent, 1, 2))
+        pos_seq = torch.cat([zero_pos, window_pos], dim=1)
+        delta_pos = pos_seq[:, 1:] - pos_seq[:, :-1]
+        delta_norm = torch.linalg.norm(delta_pos, dim=-1)
+
+        if window_pos.shape[1] == 0:
+            zeros = preview_pos_local.new_zeros(num_agent)
+            return {
+                "net_displacement_m": zeros,
+                "path_length_m": zeros,
+                "heading_envelope_rad": zeros,
+                "longitudinal_displacement_m": zeros,
+            }
+
+        return {
+            "net_displacement_m": torch.linalg.norm(window_pos[:, -1], dim=-1),
+            "path_length_m": delta_norm.sum(dim=-1),
+            "heading_envelope_rad": wrap_angle(window_head).abs().amax(dim=-1),
+            "longitudinal_displacement_m": delta_pos[..., 0].sum(dim=-1),
+        }
+
+    def _build_stationary_hold_mask(
+        self,
+        speed_0: Tensor,
+        yaw_rate_0: Tensor,
+        exec_pos_pair: Tensor,
+        exec_head_pair: Tensor,
+        exec_valid_pair: Tensor,
+        commit_window_motion: Dict[str, Tensor],
+    ) -> Tensor:
+        """현재 상태와 다음 0.5초 preview가 모두 정지 tube 안에 있으면 hold합니다."""
+        pair_valid = exec_valid_pair.all(dim=-1)
+        pair_delta_pos = exec_pos_pair[:, 1] - exec_pos_pair[:, 0]
+        pair_delta_head = wrap_angle(exec_head_pair[:, 1] - exec_head_pair[:, 0]).abs()
+        prev_hold_like = pair_valid & (
+            torch.linalg.norm(pair_delta_pos, dim=-1)
+            <= self.stationary_pair_reuse_displacement_epsilon_m
+        ) & (
+            pair_delta_head <= self.stationary_pair_reuse_heading_epsilon_rad
+        )
+
+        speed_threshold = torch.where(
+            prev_hold_like,
+            speed_0.new_full(speed_0.shape, self.stationary_speed_exit_mps),
+            speed_0.new_full(speed_0.shape, self.stationary_speed_enter_mps),
+        )
+        yaw_rate_threshold = torch.where(
+            prev_hold_like,
+            yaw_rate_0.new_full(yaw_rate_0.shape, self.stationary_yaw_rate_exit_radps),
+            yaw_rate_0.new_full(yaw_rate_0.shape, self.stationary_yaw_rate_enter_radps),
+        )
+        displacement_threshold = torch.where(
+            prev_hold_like,
+            speed_0.new_full(speed_0.shape, self.stationary_displacement_exit_m),
+            speed_0.new_full(speed_0.shape, self.stationary_displacement_enter_m),
+        )
+        path_length_threshold = torch.where(
+            prev_hold_like,
+            speed_0.new_full(speed_0.shape, self.stationary_path_length_exit_m),
+            speed_0.new_full(speed_0.shape, self.stationary_path_length_enter_m),
+        )
+        heading_threshold = torch.where(
+            prev_hold_like,
+            speed_0.new_full(speed_0.shape, self.stationary_heading_exit_rad),
+            speed_0.new_full(speed_0.shape, self.stationary_heading_enter_rad),
+        )
+
+        current_speed_abs = torch.where(pair_valid, speed_0.abs(), torch.zeros_like(speed_0))
+        current_yaw_rate_abs = torch.where(pair_valid, yaw_rate_0.abs(), torch.zeros_like(yaw_rate_0))
+        current_near_rest = (
+            (current_speed_abs <= speed_threshold)
+            & (current_yaw_rate_abs <= yaw_rate_threshold)
+        )
+        preview_in_stationary_tube = (
+            (commit_window_motion["net_displacement_m"] <= displacement_threshold)
+            & (commit_window_motion["path_length_m"] <= path_length_threshold)
+            & (commit_window_motion["heading_envelope_rad"] <= heading_threshold)
+        )
+        return current_near_rest & preview_in_stationary_tube
 
     def _smooth_sequence(
         self,
@@ -526,7 +677,7 @@ class DynamicsAwareFeasibleCommitBridge:
         accel_target: Tensor,
         yaw_rate_target: Tensor,
         limits: Dict[str, Tensor],
-        use_limits: bool = False,
+        use_limits: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """상수 목표 명령을 5개의 10Hz 실행 상태로 적분합니다.
 
@@ -538,7 +689,7 @@ class DynamicsAwareFeasibleCommitBridge:
             limits: agent별 제한값 사전입니다. 각 값 shape은 ``[n_agent]`` 입니다.
             use_limits: ``True`` 이면 물리 제한(속도, yaw-rate, 횡가속도,
                 최소 회전반경 등)을 적용합니다. ``False`` 이면 제한 없이
-                순수 적분만 수행합니다. 기본값은 ``False`` 입니다.
+                순수 적분만 수행합니다. 기본값은 ``True`` 입니다.
 
         Returns:
             tuple[Tensor, Tensor]:
