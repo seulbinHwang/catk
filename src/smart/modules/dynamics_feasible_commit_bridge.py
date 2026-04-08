@@ -52,7 +52,7 @@ class DynamicsAwareFeasibleCommitBridge:
         self,
         dt: float = 0.1,
         pos_scale_m: float = 20.0,
-        preview_steps: int = 10,
+        preview_steps: int = 20,
         commit_steps: int = 5,
         speed_smoothing_alpha: float = 0.65,
         yaw_rate_smoothing_alpha: float = 0.65,
@@ -526,6 +526,7 @@ class DynamicsAwareFeasibleCommitBridge:
         accel_target: Tensor,
         yaw_rate_target: Tensor,
         limits: Dict[str, Tensor],
+        use_limits: bool = False,
     ) -> tuple[Tensor, Tensor]:
         """상수 목표 명령을 5개의 10Hz 실행 상태로 적분합니다.
 
@@ -535,6 +536,9 @@ class DynamicsAwareFeasibleCommitBridge:
             accel_target: 목표 가속도입니다. shape은 ``[n_agent]`` 입니다.
             yaw_rate_target: 목표 yaw-rate입니다. shape은 ``[n_agent]`` 입니다.
             limits: agent별 제한값 사전입니다. 각 값 shape은 ``[n_agent]`` 입니다.
+            use_limits: ``True`` 이면 물리 제한(속도, yaw-rate, 횡가속도,
+                최소 회전반경 등)을 적용합니다. ``False`` 이면 제한 없이
+                순수 적분만 수행합니다. 기본값은 ``False`` 입니다.
 
         Returns:
             tuple[Tensor, Tensor]:
@@ -548,38 +552,46 @@ class DynamicsAwareFeasibleCommitBridge:
         pos_x = speed_0.new_zeros(num_agent)
         pos_y = speed_0.new_zeros(num_agent)
         head = speed_0.new_zeros(num_agent)
-        speed = torch.clamp(speed_0, min=-limits["v_max_mps"], max=limits["v_max_mps"])
-        yaw_rate = torch.clamp(
-            yaw_rate_0,
-            min=-limits["omega_max_abs_radps"],
-            max=limits["omega_max_abs_radps"],
-        )
 
-        yaw_accel_step_limit = limits["alpha_max_radps2"] * self.dt
+        if use_limits:
+            speed = torch.clamp(speed_0, min=-limits["v_max_mps"], max=limits["v_max_mps"])
+            yaw_rate = torch.clamp(
+                yaw_rate_0,
+                min=-limits["omega_max_abs_radps"],
+                max=limits["omega_max_abs_radps"],
+            )
+            yaw_accel_step_limit = limits["alpha_max_radps2"] * self.dt
+        else:
+            speed = speed_0.clone()
+            yaw_rate = yaw_rate_0.clone()
 
         for step_idx in range(self.commit_steps):
-            yaw_rate_candidate = yaw_rate + torch.clamp(
-                yaw_rate_target - yaw_rate,
-                min=-yaw_accel_step_limit,
-                max=yaw_accel_step_limit,
-            )
-            speed_next = torch.clamp(
-                speed + accel_target * self.dt,
-                min=-limits["v_max_mps"],
-                max=limits["v_max_mps"],
-            )
-            speed_bound = torch.maximum(speed.abs(), speed_next.abs())
-            omega_from_lat_acc = limits["a_lat_max_mps2"] / speed_bound.clamp_min(self.v_floor_mps)
-            omega_from_radius = speed_bound / limits["r_min_m"].clamp_min(self.v_floor_mps)
-            yaw_rate_step_limit = torch.minimum(
-                limits["omega_max_abs_radps"],
-                torch.minimum(omega_from_lat_acc, omega_from_radius),
-            )
-            yaw_rate = torch.clamp(
-                yaw_rate_candidate,
-                min=-yaw_rate_step_limit,
-                max=yaw_rate_step_limit,
-            )
+            if use_limits:
+                yaw_rate_candidate = yaw_rate + torch.clamp(
+                    yaw_rate_target - yaw_rate,
+                    min=-yaw_accel_step_limit,
+                    max=yaw_accel_step_limit,
+                )
+                speed_next = torch.clamp(
+                    speed + accel_target * self.dt,
+                    min=-limits["v_max_mps"],
+                    max=limits["v_max_mps"],
+                )
+                speed_bound = torch.maximum(speed.abs(), speed_next.abs())
+                omega_from_lat_acc = limits["a_lat_max_mps2"] / speed_bound.clamp_min(self.v_floor_mps)
+                omega_from_radius = speed_bound / limits["r_min_m"].clamp_min(self.v_floor_mps)
+                yaw_rate_step_limit = torch.minimum(
+                    limits["omega_max_abs_radps"],
+                    torch.minimum(omega_from_lat_acc, omega_from_radius),
+                )
+                yaw_rate = torch.clamp(
+                    yaw_rate_candidate,
+                    min=-yaw_rate_step_limit,
+                    max=yaw_rate_step_limit,
+                )
+            else:
+                yaw_rate = yaw_rate_target.clone()
+                speed_next = speed + accel_target * self.dt
 
             speed_mid = 0.5 * (speed + speed_next)
             head_mid = head + 0.5 * yaw_rate * self.dt
