@@ -144,7 +144,9 @@ class SMARTFlow(LightningModule):
             elif self.finetune_config.mode == "flow_epg_ft":
                 # Flow-EPG: Exact Policy Gradient with ELBO likelihood + RMM reward.
                 # ref_flow_decoder는 on_train_start()에서 checkpoint 로드 후 복사합니다.
-                pass
+                # PPO K>1 epochs requires manual optimization (Lightning automatic opt off).
+                if self.finetune_config.epg_ppo_epochs > 1:
+                    self.automatic_optimization = False
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
 
@@ -1515,86 +1517,95 @@ class SMARTFlow(LightningModule):
         advantages_sc = (rmm_scores_d - adv_mean) / adv_std           # [n_scenarios, G]
 
         # ── 5. Determine usable anchor steps ──────────────────────────────────
-        # Anchor k uses rollout 10Hz slice [5+k*5 : 25+k*5] and ref = ctx_sampled_pos[:, k+1].
-        # Need 25+k*5 <= n_pred_steps → k_max = (n_pred_steps - 25) // 5.
+        # Training anchor k: reference at abs 10Hz step 10+5k, target = steps 11+5k to 30+5k.
+        # pred_traj_10hz[:, j] = abs step 11+j  (committed from rollout step j//5).
+        # Correct target for anchor k: pred_traj[:, 5k : 5k+20] = abs steps 11+5k to 30+5k.
+        # Correct anchor_hidden: pred_anchor_hidden_2hz[:, k]  (conditioned on state at 10+5k).
+        # Correct reference:
+        #   k=0  → ctx_sampled_pos[:, 1]          (GT initial context pos, abs step 10)
+        #   k≥1  → pred_traj[:, 5k-1]             (rollout pos at abs step 10+5k)
         ANCHOR_STRIDE = 5       # 2Hz = 5 10Hz steps
         ANCHOR_FUTURE_LEN = 20  # 2s at 10Hz
         n_pred_steps = pred_traj.shape[2]  # 80
         n_anchors_total = anchor_hidden_all.shape[1]  # 13
-        n_hidden_steps = pred_anchor_hidden_2hz.shape[2]
+        n_hidden_steps = pred_anchor_hidden_2hz.shape[2]  # n_step_future_2hz (16)
         n_anchors_usable = min(
-            n_anchors_total,
-            (n_pred_steps - ANCHOR_STRIDE - ANCHOR_FUTURE_LEN) // ANCHOR_STRIDE + 1,
-            max(0, n_hidden_steps - 1),
-        )  # min(13, 12) = 12
+            n_anchors_total,                                                    # 13
+            (n_pred_steps - ANCHOR_FUTURE_LEN) // ANCHOR_STRIDE + 1,           # (80-20)//5+1=13
+            n_hidden_steps,                                                     # 16
+        )  # = 13
 
         pred_traj_f = pred_traj.to(dtype=torch.float32, device=dev)
         pred_head_f = pred_head_traj.to(dtype=torch.float32, device=dev)
 
-        # ── 6. EPG loss: all usable anchor steps → gradient signal × n_anchors ─
-        # Each anchor step k contributes an independent EPG term with the same
-        # per-scenario advantage (RMM is full-trajectory reward).
-        # anchor_hidden is stop-gradient (detach) → no BPTT through closed-loop.
+        # ctx_sampled_pos[:, 1] = GT pos at abs step 10 = anchor-0 reference.
+        ctx_sampled_pos = tokenized_agent["ctx_sampled_pos"].to(dtype=torch.float32, device=dev)
+        ctx_sampled_heading = tokenized_agent["ctx_sampled_heading"].to(dtype=torch.float32, device=dev)
+
+        # ── 6. Precompute rollout data for all anchors (shared across PPO epochs) ─
+        # Data collected once (expensive); gradient steps reuse it K times.
+        from src.smart.modules.flow_dpo import compute_fm_log_prob as _compute_log_prob
+        from copy import deepcopy
+
         _K = self.finetune_config.epg_n_samples
         t0 = float(flow_ode.eps)
         ref_decoder = self.ref_flow_decoder if self.finetune_config.epg_use_ref_model else None
-        from src.smart.modules.flow_dpo import compute_fm_log_prob as _compute_log_prob
-        # Explicit old-policy snapshot for this optimization step.
-        # log_p_old is computed against this frozen snapshot, not the live decoder module.
-        from copy import deepcopy
+
+        # Snapshot θ_old ONCE before any gradient steps (PPO-style).
         old_flow_decoder = deepcopy(flow_decoder).eval()
         for p in old_flow_decoder.parameters():
             p.requires_grad_(False)
 
-        total_loss = anchor_hidden_all.new_zeros(())
-        accum: Dict[str, list] = {
-            "pg": [], "kl": [], "log_p_theta": [], "log_p_old": [],
-            "rho_mean": [], "rho_max": [], "pref_acc": [], "log_p_ref": [],
-        }
-        n_steps_accumulated = 0
-        anchor_hidden_0 = None  # saved for BC and debug
+        # Per-anchor precomputed tensors: anchor_hidden, trajectories, advantages, log_p_old, MC samples
+        anchor_data_list = []
+        anchor_hidden_0 = None
 
         for k in range(n_anchors_usable):
-            # Agents valid at anchor k
-            valid_idx_k = flow_train_mask[:, k].nonzero(as_tuple=False).squeeze(-1) #NOTE: Rollout에서 필요한 애들이 짤릴 수 있음.
+            valid_idx_k = flow_train_mask[:, k].nonzero(as_tuple=False).squeeze(-1)
             if valid_idx_k.numel() == 0:
                 continue
 
             n_valid_k = valid_idx_k.shape[0]
-            # Use rollout-online hidden as anchor condition:
-            # k-th training anchor corresponds to coarse step (k+1) hidden.
+
+            # FIXED: anchor_hidden at rollout step k (not k+1) → conditioned on abs step 10+5k.
             anchor_hidden_k = (
-                pred_anchor_hidden_2hz[valid_idx_k, :, k + 1, :]
+                pred_anchor_hidden_2hz[valid_idx_k, :, k, :]
                 .detach()
                 .to(dtype=torch.float32)
-            )
+            )  # [n_valid_k, G, d_model]
             if k == 0:
-                anchor_hidden_0 = anchor_hidden_k[:, 0, :]  # kept for BC / debug
+                anchor_hidden_0 = anchor_hidden_k[:, 0, :]  # saved for BC / debug
 
             advantages_k = advantages_sc[agent_batch[valid_idx_k]]  # [n_valid_k, G]
 
-            # Normalised trajectories for anchor k: [n_valid_k, G, 20, 4]
-            future_start = ANCHOR_STRIDE + k * ANCHOR_STRIDE  # 5, 10, 15, ...
+            # FIXED: target window = pred_traj[:, 5k : 5k+20] = abs steps 11+5k to 30+5k.
+            future_start = k * ANCHOR_STRIDE                          # 0, 5, 10, ...
             future_slice = slice(future_start, future_start + ANCHOR_FUTURE_LEN)
+
             traj_norm_list_k = []
             for g in range(G):
-                y_world = pred_traj_f[valid_idx_k, g, future_slice, :] 
+                y_world = pred_traj_f[valid_idx_k, g, future_slice, :]
                 h_world = pred_head_f[valid_idx_k, g, future_slice]
-                # Use rollout-generated anchor state (not GT ctx_sampled_*) as local reference.
-                # Anchor-k reference is the state right before this 2s window starts.
-                ref_pos_k_g = pred_traj_f[valid_idx_k, g, future_start - 1, :]
-                ref_head_k_g = pred_head_f[valid_idx_k, g, future_start - 1]
+                # FIXED: reference position at abs step 10+5k.
+                #   k=0 → GT context position (rollout hasn't started yet, same as GT)
+                #   k≥1 → pred_traj[:, 5k-1] = abs step 11+5k-1 = 10+5k
+                if k == 0:
+                    ref_pos_k_g = ctx_sampled_pos[valid_idx_k, 1, :]
+                    ref_head_k_g = ctx_sampled_heading[valid_idx_k, 1]
+                else:
+                    ref_pos_k_g = pred_traj_f[valid_idx_k, g, future_start - 1, :]
+                    ref_head_k_g = pred_head_f[valid_idx_k, g, future_start - 1]
                 traj_norm_list_k.append(
                     self._world_traj_to_flow_norm(y_world, h_world, ref_pos_k_g, ref_head_k_g)
                 )
             trajectories_k = torch.stack(traj_norm_list_k, dim=1)  # [n_valid_k, G, 20, 4]
 
-            # Shared MC samples (generated once per anchor, shared between log_p_old and log_p_theta)
+            # Shared MC samples (fixed across PPO epochs → stable rho comparison)
             _n_k = n_valid_k * G
             shared_t_k = t0 + (1.0 - t0) * torch.rand(_K, _n_k, device=dev, dtype=torch.float32)
             shared_x0_k = torch.randn(_n_k, 20, 4, device=dev, dtype=torch.float32)
 
-            # log π_{θ_old} — no_grad, same MC samples as log_p_theta
+            # log π_{θ_old}: computed once with frozen snapshot, same MC as log_p_theta
             with torch.no_grad():
                 _traj_flat_k = trajectories_k.detach().reshape(_n_k, 20, 4)
                 _anchor_rep_k = anchor_hidden_k.reshape(_n_k, -1)
@@ -1602,62 +1613,100 @@ class SMARTFlow(LightningModule):
                     old_flow_decoder, _anchor_rep_k, _traj_flat_k, flow_ode,
                     n_samples=_K, shared_t=shared_t_k, shared_x0=shared_x0_k,
                 )
-            log_p_old_k = log_p_old_flat_k.reshape(n_valid_k, G)
 
-            loss_k, metrics_k = _flow_epg_loss(
-                flow_decoder=flow_decoder,
-                ref_flow_decoder=ref_decoder,
-                anchor_hidden=anchor_hidden_k,
-                trajectories=trajectories_k.detach(),
-                advantages=advantages_k,
-                log_p_old=log_p_old_k,
-                shared_t=shared_t_k,
-                shared_x0=shared_x0_k,
-                flow_ode=flow_ode,
-                beta=self.finetune_config.epg_beta,
-                n_samples=_K,
-            )
-            total_loss = total_loss + loss_k
-            n_steps_accumulated += 1
-            accum["pg"].append(metrics_k["train/epg_pg_loss"])
-            accum["kl"].append(metrics_k["train/epg_kl"])
-            accum["log_p_theta"].append(metrics_k["train/epg_log_p_theta"])
-            accum["log_p_old"].append(metrics_k["train/epg_log_p_old"])
-            accum["rho_mean"].append(metrics_k["train/epg_rho_mean"])
-            accum["rho_max"].append(metrics_k["train/epg_rho_max"])
-            accum["pref_acc"].append(metrics_k["train/epg_pref_acc"])
-            if "train/epg_log_p_ref" in metrics_k:
-                accum["log_p_ref"].append(metrics_k["train/epg_log_p_ref"])
+            anchor_data_list.append({
+                "anchor_hidden_k":  anchor_hidden_k,                   # [n_valid_k, G, d]
+                "trajectories_k":   trajectories_k.detach(),           # [n_valid_k, G, 20, 4]
+                "advantages_k":     advantages_k,                      # [n_valid_k, G]
+                "log_p_old_k":      log_p_old_flat_k.reshape(n_valid_k, G),  # [n_valid_k, G]
+                "shared_t_k":       shared_t_k,                        # [K, n_valid_k*G]
+                "shared_x0_k":      shared_x0_k,                       # [n_valid_k*G, 20, 4]
+            })
 
-        if n_steps_accumulated == 0:
+        if not anchor_data_list:
             dummy = next(iter(flow_decoder.parameters()))
             return {"loss": dummy.sum() * 0.0}
 
-        def _mean(lst: list) -> Tensor:
-            return torch.stack(lst).mean()
-
-        loss = total_loss / n_steps_accumulated
-        metrics: Dict[str, Tensor] = {
-            "train/epg_loss": loss.detach(),
-            "train/epg_pg_loss": _mean(accum["pg"]),
-            "train/epg_kl": _mean(accum["kl"]),
-            "train/epg_log_p_theta": _mean(accum["log_p_theta"]),
-            "train/epg_log_p_old": _mean(accum["log_p_old"]),
-            "train/epg_rho_mean": _mean(accum["rho_mean"]),
-            "train/epg_rho_max": _mean(accum["rho_max"]),
-            "train/epg_advantage_mean": advantages_sc.mean().detach(),
-            "train/epg_advantage_std": advantages_sc.std().detach() if advantages_sc.numel() > 1 else advantages_sc.new_zeros(1),
-            "train/epg_pref_acc": _mean(accum["pref_acc"]),
-            "train/epg_n_anchor_steps": torch.tensor(float(n_steps_accumulated), device=dev),
-        }
-        if accum["log_p_ref"]:
-            metrics["train/epg_log_p_ref"] = _mean(accum["log_p_ref"])
-
-        # Fallback if anchor 0 had no valid agents (should not happen in practice)
         if anchor_hidden_0 is None:
             anchor_hidden_0 = anchor_hidden_all[:, 0, :].detach().to(dtype=torch.float32)
 
-        # ── 7. Optional BC regularisation (anchor 0 only) ─────────────────────
+        # ── 7. PPO K-epoch gradient loop (K=1 → same as before) ──────────────
+        K_epochs = self.finetune_config.epg_ppo_epochs
+
+        def _compute_epg_loss_for_epoch() -> Tuple[Tensor, Dict[str, Tensor]]:
+            """One forward pass over all anchor steps → aggregate loss + metrics."""
+            total = anchor_hidden_all.new_zeros(())
+            accum: Dict[str, list] = {
+                "pg": [], "kl": [], "log_p_theta": [], "log_p_old": [],
+                "rho_mean": [], "rho_max": [], "pref_acc": [], "log_p_ref": [],
+            }
+            for ad in anchor_data_list:
+                l_k, m_k = _flow_epg_loss(
+                    flow_decoder=flow_decoder,
+                    ref_flow_decoder=ref_decoder,
+                    anchor_hidden=ad["anchor_hidden_k"],
+                    trajectories=ad["trajectories_k"],
+                    advantages=ad["advantages_k"],
+                    log_p_old=ad["log_p_old_k"],
+                    shared_t=ad["shared_t_k"],
+                    shared_x0=ad["shared_x0_k"],
+                    flow_ode=flow_ode,
+                    beta=self.finetune_config.epg_beta,
+                    n_samples=_K,
+                )
+                total = total + l_k
+                accum["pg"].append(m_k["train/epg_pg_loss"])
+                accum["kl"].append(m_k["train/epg_kl"])
+                accum["log_p_theta"].append(m_k["train/epg_log_p_theta"])
+                accum["log_p_old"].append(m_k["train/epg_log_p_old"])
+                accum["rho_mean"].append(m_k["train/epg_rho_mean"])
+                accum["rho_max"].append(m_k["train/epg_rho_max"])
+                accum["pref_acc"].append(m_k["train/epg_pref_acc"])
+                if "train/epg_log_p_ref" in m_k:
+                    accum["log_p_ref"].append(m_k["train/epg_log_p_ref"])
+
+            def _mean(lst: list) -> Tensor:
+                return torch.stack(lst).mean()
+
+            n = len(anchor_data_list)
+            ep_loss = total / n
+            ep_metrics: Dict[str, Tensor] = {
+                "train/epg_pg_loss":    _mean(accum["pg"]),
+                "train/epg_kl":         _mean(accum["kl"]),
+                "train/epg_log_p_theta":_mean(accum["log_p_theta"]),
+                "train/epg_log_p_old":  _mean(accum["log_p_old"]),
+                "train/epg_rho_mean":   _mean(accum["rho_mean"]),
+                "train/epg_rho_max":    _mean(accum["rho_max"]),
+                "train/epg_pref_acc":   _mean(accum["pref_acc"]),
+                "train/epg_n_anchor_steps": torch.tensor(float(n), device=dev),
+            }
+            if accum["log_p_ref"]:
+                ep_metrics["train/epg_log_p_ref"] = _mean(accum["log_p_ref"])
+            return ep_loss, ep_metrics
+
+        if not self.automatic_optimization:
+            # ── Manual PPO K-epoch loop ────────────────────────────────────────
+            opt = self.optimizers()
+            sch = self.lr_schedulers()
+            grad_clip = getattr(self.trainer, "gradient_clip_val", 1.0)
+
+            for epoch_i in range(K_epochs):
+                ep_loss, ep_metrics = _compute_epg_loss_for_epoch()
+                opt.zero_grad()
+                self.manual_backward(ep_loss)
+                if grad_clip:
+                    self.clip_gradients(opt, gradient_clip_val=grad_clip, gradient_clip_algorithm="norm")
+                opt.step()
+                if sch is not None and epoch_i == K_epochs - 1:
+                    sch.step()
+
+            loss = ep_loss
+            metrics_ep = ep_metrics
+        else:
+            # ── Automatic optimization (K=1) ──────────────────────────────────
+            loss, metrics_ep = _compute_epg_loss_for_epoch()
+
+        # ── 8. Optional BC regularisation (anchor 0 only) ─────────────────────
         bc_loss_val = anchor_hidden_0.new_zeros(1)
         if self.finetune_config.epg_bc_lambda > 0.0:
             gt_clean = tokenized_agent["flow_train_clean_norm"].to(
@@ -1674,12 +1723,22 @@ class SMARTFlow(LightningModule):
             loss = loss + self.finetune_config.epg_bc_lambda * bc_loss
             bc_loss_val = bc_loss.detach()
 
-        # RMM diagnostics
-        metrics["train/rmm_mean"] = rmm_scores_d.mean().to(device=dev)
-        metrics["train/rmm_max"] = rmm_scores_d.max(dim=-1).values.mean().to(device=dev)
-        metrics["train/rmm_min"] = rmm_scores_d.min(dim=-1).values.mean().to(device=dev)
-        metrics["train/rmm_margin"] = (rmm_scores_d.max(dim=-1).values - rmm_scores_d.min(dim=-1).values).mean()
-        metrics["train/epg_bc_loss"] = bc_loss_val
+        # ── Aggregate metrics ─────────────────────────────────────────────────
+        metrics: Dict[str, Tensor] = {
+            "train/epg_loss":           loss.detach(),
+            "train/epg_advantage_mean": advantages_sc.mean().detach(),
+            "train/epg_advantage_std":  (
+                advantages_sc.std().detach() if advantages_sc.numel() > 1
+                else advantages_sc.new_zeros(1)
+            ),
+            "train/rmm_mean":    rmm_scores_d.mean().to(device=dev),
+            "train/rmm_max":     rmm_scores_d.max(dim=-1).values.mean().to(device=dev),
+            "train/rmm_min":     rmm_scores_d.min(dim=-1).values.mean().to(device=dev),
+            "train/rmm_margin":  (rmm_scores_d.max(dim=-1).values - rmm_scores_d.min(dim=-1).values).mean(),
+            "train/epg_bc_loss": bc_loss_val,
+            "train/epg_ppo_epochs": torch.tensor(float(K_epochs), device=dev),
+        }
+        metrics.update(metrics_ep)
         metrics["loss"] = loss
 
         # debug JSONL
@@ -2230,6 +2289,9 @@ class SMARTFlow(LightningModule):
                 if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            if not self.automatic_optimization:
+                # Manual opt already stepped inside _run_flow_epg_ft_step; nothing to return.
+                return result["loss"]
             return result["loss"]
 
         if self._is_dice_ft_enabled():

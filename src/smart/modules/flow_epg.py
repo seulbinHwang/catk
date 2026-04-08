@@ -103,6 +103,8 @@ def flow_epg_loss(
     rho_sg = (log_p_theta.detach() - log_p_old_flat).exp().clamp(max=10.0)  # [n_valid*G]
 
     # ── π_ref: frozen reference, for KL term ──────────────────────────────────
+    # KL(π_θ || π_ref) ≈ E_{y~π_old}[ρ_θ(y) · (log π_θ(y) - log π_ref(y))]
+    # IS weight ρ_θ (stop-grad) corrects for distribution shift π_old→π_θ.
     if ref_flow_decoder is not None:
         with torch.no_grad():
             log_p_ref = compute_fm_log_prob(
@@ -110,7 +112,8 @@ def flow_epg_loss(
                 anchor_rep.detach(), traj_flat.detach(), flow_ode,
                 n_samples=n_samples, shared_t=shared_t, shared_x0=shared_x0,
             )  # [n_valid*G], no grad
-        kl = log_p_theta - log_p_ref   # [n_valid*G], grad via log_p_theta
+        # IS-weighted KL: rho_sg reweights samples from π_old to π_θ
+        kl = rho_sg * (log_p_theta - log_p_ref)   # [n_valid*G], grad via log_p_theta
     else:
         kl = torch.zeros_like(log_p_theta)
         log_p_ref = None

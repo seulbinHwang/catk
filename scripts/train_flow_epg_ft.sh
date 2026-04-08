@@ -130,6 +130,10 @@ EPG_N_SAMPLES="${EPG_N_SAMPLES:-4}"
 EPG_USE_REF_MODEL="${EPG_USE_REF_MODEL:-true}"
 # >0 이면 GT flow-matching BC 보조 손실
 EPG_BC_LAMBDA="${EPG_BC_LAMBDA:-0.0}"
+# K gradient steps per RMM evaluation (PPO-style reuse; >1 → automatic_optimization=False)
+EPG_PPO_EPOCHS="${EPG_PPO_EPOCHS:-1}"
+# true면 residual_velocity_head만 학습 (trunk 동결, zero-initialized)
+EPG_HEAD_ONLY="${EPG_HEAD_ONLY:-false}"
 
 # -----------------------------------------------------------------------------
 # W&B
@@ -168,7 +172,7 @@ echo "CKPT_PATH=${CKPT_PATH}"
 echo "TRAIN_B=${TRAIN_B} VAL_B=${VAL_B} NUM_WORKERS=${NUM_WORKERS}"
 echo "LIMIT_TRAIN_BATCHES=${LIMIT_TRAIN_BATCHES} LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} MAX_EPOCHS=${MAX_EPOCHS}"
 echo "EPG_N_ROLLOUTS=${EPG_N_ROLLOUTS} EPG_BETA=${EPG_BETA} EPG_N_SAMPLES=${EPG_N_SAMPLES}"
-echo "EPG_USE_REF_MODEL=${EPG_USE_REF_MODEL} EPG_BC_LAMBDA=${EPG_BC_LAMBDA}"
+echo "EPG_USE_REF_MODEL=${EPG_USE_REF_MODEL} EPG_BC_LAMBDA=${EPG_BC_LAMBDA} EPG_PPO_EPOCHS=${EPG_PPO_EPOCHS} EPG_HEAD_ONLY=${EPG_HEAD_ONLY}"
 echo "N_VIS_BATCH=${N_VIS_BATCH} N_VIS_SCENARIO=${N_VIS_SCENARIO} N_VIS_ROLLOUT=${N_VIS_ROLLOUT}"
 echo "WANDB_MODE=${WANDB_MODE} WANDB_ENTITY=${WANDB_ENTITY}"
 
@@ -214,4 +218,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.epg_n_samples="${EPG_N_SAMPLES}" \
   model.model_config.finetune.epg_use_ref_model="${EPG_USE_REF_MODEL}" \
   model.model_config.finetune.epg_bc_lambda="${EPG_BC_LAMBDA}" \
+  model.model_config.finetune.epg_ppo_epochs="${EPG_PPO_EPOCHS}" \
+  model.model_config.finetune.epg_head_only="${EPG_HEAD_ONLY}" \
   ${EXTRA_ARGS}

@@ -52,6 +52,8 @@ class FinetuneConfig:
     epg_n_samples: int = 8            # MC samples for ELBO log-prob estimation
     epg_use_ref_model: bool = True    # True → use frozen pretrained as reference
     epg_bc_lambda: float = 0.0        # optional BC regularization weight
+    epg_ppo_epochs: int = 1           # K gradient steps per RMM evaluation (PPO-style)
+    epg_head_only: bool = False       # True → only train residual_velocity_head (frozen trunk)
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -124,6 +126,8 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         epg_n_samples=int(_read_config_value(finetune, "epg_n_samples", 8)),
         epg_use_ref_model=bool(_read_config_value(finetune, "epg_use_ref_model", True)),
         epg_bc_lambda=float(_read_config_value(finetune, "epg_bc_lambda", 0.0)),
+        epg_ppo_epochs=int(_read_config_value(finetune, "epg_ppo_epochs", 1)),
+        epg_head_only=bool(_read_config_value(finetune, "epg_head_only", False)),
     )
 
 
@@ -194,6 +198,25 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             "Finetuning enabled but flow_decoder not found. "
             "Use the flow-based model (e.g., SMARTFlow) or fix the model config."
         )
+
+    # ── epg_head_only: residual_velocity_head만 학습 (트렁크 완전 동결) ──────
+    is_epg_head_only = (config.mode == "flow_epg_ft" and config.epg_head_only)
+    if is_epg_head_only:
+        if residual_head is None:
+            raise AttributeError(
+                "epg_head_only=True requires residual_velocity_head in flow_decoder."
+            )
+        # residual head only: zero-init + unfreeze only that head
+        for p in residual_head.parameters():
+            p.data.zero_()
+        _set_requires_grad(residual_head, True)
+        log.info(
+            "EPG head-only mode: flow_decoder trunk frozen, "
+            "only residual_velocity_head is trainable (zero-initialized)."
+        )
+        return config
+
+    # ── 기본: 전체 flow_decoder 학습 ─────────────────────────────────────────
     _set_requires_grad(flow_decoder, True)
 
     # residual_velocity_head는 0으로 초기화 후 freeze (base velocity만 학습)

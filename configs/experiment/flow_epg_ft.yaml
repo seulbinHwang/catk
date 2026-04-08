@@ -51,6 +51,8 @@ model:
       epg_n_samples: 8           # MC samples for ELBO log-prob
       epg_use_ref_model: true    # frozen pretrained reference (prevents collapse)
       epg_bc_lambda: 0.0         # >0 → add GT flow-matching BC loss
+      epg_ppo_epochs: 1          # K gradient steps per RMM evaluation (>1 → manual opt)
+      epg_head_only: false       # true → only residual_velocity_head trained (frozen trunk)
 
 ckpt_path: null
 
