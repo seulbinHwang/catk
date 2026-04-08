@@ -46,6 +46,12 @@ class FinetuneConfig:
     dpo_n_samples: int = 8             # MC samples for FM log-prob estimation
     dpo_use_ref_model: bool = True     # True → use frozen pretrained as reference
     dpo_bc_lambda: float = 0.0         # optional BC regularization weight
+    # ── Flow-EPG ──────────────────────────────────────────────────────────────
+    epg_n_rollouts: int = 4            # G: number of rollouts per scenario
+    epg_beta: float = 0.1             # KL regularisation weight β
+    epg_n_samples: int = 8            # MC samples for ELBO log-prob estimation
+    epg_use_ref_model: bool = True    # True → use frozen pretrained as reference
+    epg_bc_lambda: float = 0.0        # optional BC regularization weight
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -113,6 +119,11 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         dpo_n_samples=int(_read_config_value(finetune, "dpo_n_samples", 8)),
         dpo_use_ref_model=bool(_read_config_value(finetune, "dpo_use_ref_model", True)),
         dpo_bc_lambda=float(_read_config_value(finetune, "dpo_bc_lambda", 0.0)),
+        epg_n_rollouts=int(_read_config_value(finetune, "epg_n_rollouts", 4)),
+        epg_beta=float(_read_config_value(finetune, "epg_beta", 0.1)),
+        epg_n_samples=int(_read_config_value(finetune, "epg_n_samples", 8)),
+        epg_use_ref_model=bool(_read_config_value(finetune, "epg_use_ref_model", True)),
+        epg_bc_lambda=float(_read_config_value(finetune, "epg_bc_lambda", 0.0)),
     )
 
 
@@ -170,6 +181,7 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         "kinematic_reward_ft",  # ODE full-grad → KinematicProjection as reward → reward grad
         "dice_ft",              # DICE / IQ-Learn imitation learning (Chi^2 f-divergence)
         "flow_dpo_ft",          # Flow-DPO: GT vs policy rollout pairwise DPO
+        "flow_epg_ft",          # Flow-EPG: Exact Policy Gradient with ELBO + RMM reward
     }:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 

@@ -25,9 +25,11 @@ from src.smart.metrics.flow_metrics import (
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
 from src.smart.modules.flow_dice_critic import DICECritic
 from src.smart.modules.flow_dpo import flow_dpo_loss as _flow_dpo_loss
+from src.smart.modules.flow_epg import flow_epg_loss as _flow_epg_loss
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.modules.flow_reward import KinematicProjectionReward
 from src.smart.utils.geometry import wrap_angle
+from src.smart.utils.rollout import transform_to_local
 from src.smart.modules.flow_projected_generation import ProjectedFlowGenerator
 from src.smart.modules.flow_terminal_cost_final_step import TerminalCostFinalStepLoss
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
@@ -139,6 +141,10 @@ class SMARTFlow(LightningModule):
                     smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
                     flow_reg_lambda=0.0,
                 )
+            elif self.finetune_config.mode == "flow_epg_ft":
+                # Flow-EPG: Exact Policy Gradient with ELBO likelihood + RMM reward.
+                # ref_flow_decoder는 on_train_start()에서 checkpoint 로드 후 복사합니다.
+                pass
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
 
@@ -830,7 +836,8 @@ class SMARTFlow(LightningModule):
         map_feature: Dict[str, Tensor],
         rollout_cache: Dict[str, object],
         rollout_indices: Sequence[int],
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        return_anchor_hidden: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
         Args:
@@ -865,11 +872,14 @@ class SMARTFlow(LightningModule):
                 sampling_noise=self.eval_sampling_noise,
                 scenario_sampling_seeds=scenario_sampling_seeds,
             )
-            return (
+            base_ret = (
                 pred["pred_traj_10hz"].unsqueeze(1),
                 pred["pred_z_10hz"].unsqueeze(1),
                 pred["pred_head_10hz"].unsqueeze(1),
             )
+            if not return_anchor_hidden:
+                return base_ret
+            return base_ret + (pred["anchor_hidden_2hz"].unsqueeze(1),)
 
         num_agent = int(tokenized_agent["batch"].shape[0])
         num_graphs = len(data["scenario_id"])
@@ -899,7 +909,7 @@ class SMARTFlow(LightningModule):
             sampling_noise=self.eval_sampling_noise,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
         )
-        return (
+        base_ret = (
             self._reshape_parallel_rollout_prediction(
                 pred["pred_traj_10hz"],
                 repeat_count=chunk_size,
@@ -912,6 +922,15 @@ class SMARTFlow(LightningModule):
             ),
             self._reshape_parallel_rollout_prediction(
                 pred["pred_head_10hz"],
+                repeat_count=chunk_size,
+                num_agent=num_agent,
+            ),
+        )
+        if not return_anchor_hidden:
+            return base_ret
+        return base_ret + (
+            self._reshape_parallel_rollout_prediction(
+                pred["anchor_hidden_2hz"],
                 repeat_count=chunk_size,
                 num_agent=num_agent,
             ),
@@ -1181,24 +1200,27 @@ class SMARTFlow(LightningModule):
     # ──────────────────────────────────────────────────────────────────────────
 
     def on_train_start(self) -> None:
-        """checkpoint 로드 후 frozen reference model 생성 (Flow-DPO 전용)."""
-        if (
+        """checkpoint 로드 후 frozen reference model 생성 (Flow-DPO / Flow-EPG 전용)."""
+        _needs_ref = (
             self.finetune_config.enabled
-            and self.finetune_config.mode == "flow_dpo_ft"
-            and self.finetune_config.dpo_use_ref_model
             and self.ref_flow_decoder is None
-        ):
+            and (
+                (self.finetune_config.mode == "flow_dpo_ft" and self.finetune_config.dpo_use_ref_model)
+                or (self.finetune_config.mode == "flow_epg_ft" and self.finetune_config.epg_use_ref_model)
+            )
+        )
+        if _needs_ref:
             from copy import deepcopy
             flow_decoder = self.encoder.agent_encoder.flow_decoder
             self.ref_flow_decoder = deepcopy(flow_decoder)
             for p in self.ref_flow_decoder.parameters():
                 p.requires_grad_(False)
-            print("[Flow-DPO] frozen reference model created from pretrained checkpoint.")
+            print(f"[{self.finetune_config.mode}] frozen reference model created from pretrained checkpoint.")
 
-        # DPO debug JSONL path — use Lightning logger dir if available
+        # debug JSONL path — use Lightning logger dir if available
         if (
             self.finetune_config.enabled
-            and self.finetune_config.mode == "flow_dpo_ft"
+            and self.finetune_config.mode in {"flow_dpo_ft", "flow_epg_ft"}
             and self.global_rank == 0
         ):
             try:
@@ -1209,13 +1231,20 @@ class SMARTFlow(LightningModule):
                 except Exception:
                     log_dir = "/tmp"
             import os
-            self._dpo_debug_path = os.path.join(str(log_dir), "dpo_debug.jsonl")
-            print(f"[Flow-DPO] debug log → {self._dpo_debug_path}")
+            prefix = "dpo" if self.finetune_config.mode == "flow_dpo_ft" else "epg"
+            self._dpo_debug_path = os.path.join(str(log_dir), f"{prefix}_debug.jsonl")
+            print(f"[{self.finetune_config.mode}] debug log → {self._dpo_debug_path}")
 
     def _is_flow_dpo_ft_enabled(self) -> bool:
         return bool(
             self.finetune_config.enabled
             and self.finetune_config.mode == "flow_dpo_ft"
+        )
+
+    def _is_flow_epg_ft_enabled(self) -> bool:
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "flow_epg_ft"
         )
 
     def _maybe_write_dpo_debug(
@@ -1246,6 +1275,9 @@ class SMARTFlow(LightningModule):
         if "train/dpo_log_ratio_w" in metrics:
             record["log_ratio_w"] = float(metrics["train/dpo_log_ratio_w"])
             record["log_ratio_l"] = float(metrics["train/dpo_log_ratio_l"])
+        record["rmm_winner"] = float(metrics.get("train/rmm_winner", float("nan")))
+        record["rmm_loser"] = float(metrics.get("train/rmm_loser", float("nan")))
+        record["rmm_margin"] = float(metrics.get("train/rmm_margin", float("nan")))
         # Snapshot trajectory norms for lightweight sanity check
         with torch.no_grad():
             record["y_w_norm_mean"] = float(y_w.norm(dim=-1).mean())
@@ -1257,19 +1289,453 @@ class SMARTFlow(LightningModule):
         except OSError:
             pass
 
+    def _world_traj_to_flow_norm(
+        self,
+        pred_traj: Tensor,   # [n, 20, 2]  world XY at 10Hz
+        pred_head: Tensor,   # [n, 20]     world heading
+        current_pos: Tensor, # [n, 2]      reference position
+        current_head: Tensor, # [n]        reference heading
+    ) -> Tensor:             # [n, 20, 4]  normalized [x/20, y/20, cos, sin]
+        """Convert world-coordinate 20-step trajectory to normalized flow-space."""
+        pos_local, head_local = transform_to_local(
+            pos_global=pred_traj,
+            head_global=pred_head,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        return torch.stack(
+            [
+                pos_local[..., 0] / 20.0,
+                pos_local[..., 1] / 20.0,
+                head_local.cos(),
+                head_local.sin(),
+            ],
+            dim=-1,
+        )
+
+    def _compute_rmm_pair(
+        self,
+        data: dict,
+        agent_ids: Tensor,   # [n_agents]
+        agent_batch: Tensor, # [n_agents] scenario index
+        pred_traj: Tensor,   # [n_agents, 2, 80, 2]
+        pred_z: Tensor,      # [n_agents, 2, 80]
+        pred_head: Tensor,   # [n_agents, 2, 80]
+    ):
+        """Compute RMM for rollout-0 and rollout-1 separately.
+
+        Returns:
+            Tuple of two float Tensors, each [n_scenarios].
+        """
+        import multiprocessing as mp
+        from src.smart.metrics import _sim_agents_worker, SimAgentsMetrics
+
+        scenario_files = data.get("tfrecord_path", None)
+        if scenario_files is None:
+            n_sc = len(data["scenario_id"])
+            zeros = torch.zeros(n_sc)
+            return zeros, zeros
+
+        n_scenarios = len(scenario_files)
+        agent_batch_cpu = agent_batch.cpu()
+
+        # Split tensors by scenario
+        sizes = [int((agent_batch_cpu == i).sum()) for i in range(n_scenarios)]
+        ids_list = agent_ids.cpu().split(sizes)
+        traj_list = pred_traj.cpu().split(sizes)
+        z_list = pred_z.cpu().split(sizes)
+        head_list = pred_head.cpu().split(sizes)
+
+        config_bytes = SimAgentsMetrics._load_config_bytes()
+
+        # Build args: rollout 0 and rollout 1 for all scenarios (interleaved)
+        args_all = []
+        for i in range(n_scenarios):
+            ids_np = ids_list[i].numpy()
+            t_np = traj_list[i].numpy()   # [n_i, 2, 80, 2]
+            z_np = z_list[i].numpy()
+            h_np = head_list[i].numpy()
+            args_all.append((config_bytes, scenario_files[i], ids_np,
+                             t_np[:, 0:1, :, :], z_np[:, 0:1, :], h_np[:, 0:1, :]))
+            args_all.append((config_bytes, scenario_files[i], ids_np,
+                             t_np[:, 1:2, :, :], z_np[:, 1:2, :], h_np[:, 1:2, :]))
+
+        try:
+            mp.set_start_method("forkserver", force=True)
+        except RuntimeError:
+            pass
+
+        import os
+        n_pool = min(len(args_all), max(1, (os.cpu_count() or 8) // 4))
+        with mp.Pool(processes=n_pool) as pool:
+            results = pool.starmap(_sim_agents_worker, args_all)
+            pool.close()
+            pool.join()
+
+        # Deinterleave: [r0_sc0, r1_sc0, r0_sc1, r1_sc1, ...]
+        rmm_0 = torch.tensor([results[2 * i] for i in range(n_scenarios)], dtype=torch.float32)
+        rmm_1 = torch.tensor([results[2 * i + 1] for i in range(n_scenarios)], dtype=torch.float32)
+        return rmm_0, rmm_1
+
+    def _compute_rmm_group(
+        self,
+        data: dict,
+        agent_ids: Tensor,    # [n_agents]
+        agent_batch: Tensor,  # [n_agents]
+        pred_traj: Tensor,    # [n_agents, G, 80, 2]
+        pred_z: Tensor,       # [n_agents, G, 80]
+        pred_head: Tensor,    # [n_agents, G, 80]
+    ) -> Tensor:              # [n_scenarios, G]
+        """Compute RMM for each of G rollouts, for each scenario.
+
+        Returns:
+            Float Tensor ``[n_scenarios, G]``. Returns zeros if tfrecord_path unavailable.
+        """
+        import multiprocessing as mp
+        from src.smart.metrics import _sim_agents_worker, SimAgentsMetrics
+
+        scenario_files = data.get("tfrecord_path", None)
+        G = pred_traj.shape[1]
+        n_scenarios = int(agent_batch.max().item()) + 1 if agent_batch.numel() > 0 else 0
+
+        if scenario_files is None or n_scenarios == 0:
+            return torch.zeros(n_scenarios, G)
+
+        agent_batch_cpu = agent_batch.cpu()
+        sizes = [int((agent_batch_cpu == i).sum()) for i in range(n_scenarios)]
+        ids_list = agent_ids.cpu().split(sizes)
+        traj_list = pred_traj.cpu().split(sizes)
+        z_list = pred_z.cpu().split(sizes)
+        head_list = pred_head.cpu().split(sizes)
+
+        config_bytes = SimAgentsMetrics._load_config_bytes()
+
+        # Build args: scenario × rollout (interleaved as sc0_r0, sc0_r1, ..., sc1_r0, ...)
+        args_all = []
+        for i in range(n_scenarios):
+            ids_np = ids_list[i].numpy()
+            t_np = traj_list[i].numpy()   # [n_i, G, 80, 2]
+            z_np = z_list[i].numpy()
+            h_np = head_list[i].numpy()
+            for g in range(G):
+                args_all.append((config_bytes, scenario_files[i], ids_np,
+                                 t_np[:, g:g+1, :, :], z_np[:, g:g+1, :], h_np[:, g:g+1, :]))
+
+        try:
+            mp.set_start_method("forkserver", force=True)
+        except RuntimeError:
+            pass
+
+        import os
+        n_pool = min(len(args_all), max(1, (os.cpu_count() or 8) // 4))
+        with mp.Pool(processes=n_pool) as pool:
+            results = pool.starmap(_sim_agents_worker, args_all)
+            pool.close()
+            pool.join()
+
+        # Reshape: results are [sc0_r0, sc0_r1, ..., sc1_r0, ...] → [n_scenarios, G]
+        rmm = torch.tensor(results, dtype=torch.float32).reshape(n_scenarios, G)
+        return rmm
+
+    def _run_flow_epg_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        batch_idx: int = 0,
+        data: dict | None = None,
+    ) -> dict:
+        """Flow-EPG fine-tuning step (Exact Policy Gradient + ELBO + RMM reward).
+
+        Generates G closed-loop rollouts from the same initial state, scores each
+        with RMM, computes group-normalised advantages, and updates the flow decoder
+        via the EPG objective:
+
+            L = -E[ A^i · log π_θ(y^i) ] + β · KL(π_θ || π_ref)
+
+        where A^i = (R^i - mean(R)) / (std(R) + ε) (std-normalised for β balance).
+        """
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        G = self.finetune_config.epg_n_rollouts
+
+        # ── 1. Encode map + all 13 anchors ────────────────────────────────────
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            _, anchor_hidden_all, _ = self.encoder.encode_anchor_context_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+            # anchor_hidden_all: [n_agents, 13, hidden_dim]
+
+        flow_train_mask = tokenized_agent["flow_train_mask"]   # [n_agents, 13]
+        first_anchor_mask = flow_train_mask[:, 0]              # [n_agents] bool
+
+        if not first_anchor_mask.any():
+            dummy = next(iter(flow_decoder.parameters()))
+            return {"loss": dummy.sum() * 0.0}
+
+        # ── 2. Generate G closed-loop rollouts ────────────────────────────────
+        with torch.no_grad():
+            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
+            pred_traj, pred_z, pred_head_traj, pred_anchor_hidden_2hz = self._run_parallel_rollout_chunk(
+                data=data,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                rollout_cache=rollout_cache,
+                rollout_indices=list(range(G)),
+                return_anchor_hidden=True,
+            )
+            # pred_traj: [n_agents, G, 80, 2]  world XY at 10Hz
+
+        # ── 3. Compute RMM for each rollout per scenario ──────────────────────
+        agent_batch = tokenized_agent["batch"]   # [n_agents]
+        agent_ids = data["agent"]["id"] if data is not None else agent_batch
+
+        rmm_scores = self._compute_rmm_group(
+            data=data if data is not None else {},
+            agent_ids=agent_ids,
+            agent_batch=agent_batch,
+            pred_traj=pred_traj,
+            pred_z=pred_z,
+            pred_head=pred_head_traj,
+        )  # [n_scenarios, G]
+
+        # ── 4. Compute advantages: A^i = (R^i - mean(R)) / (std(R) + ε) ─────────
+        # Std-normalise within each group so advantage scale is O(1) regardless of
+        # how tightly the G rollout scores cluster.  This prevents the KL term from
+        # dominating when RMM scores are nearly identical (β · KL >> A without norm).
+        dev = anchor_hidden_all.device
+        rmm_scores_d = rmm_scores.to(device=dev)                      # [n_scenarios, G]
+        adv_mean = rmm_scores_d.mean(dim=-1, keepdim=True)
+        adv_std  = rmm_scores_d.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        advantages_sc = (rmm_scores_d - adv_mean) / adv_std           # [n_scenarios, G]
+
+        # ── 5. Determine usable anchor steps ──────────────────────────────────
+        # Anchor k uses rollout 10Hz slice [5+k*5 : 25+k*5] and ref = ctx_sampled_pos[:, k+1].
+        # Need 25+k*5 <= n_pred_steps → k_max = (n_pred_steps - 25) // 5.
+        ANCHOR_STRIDE = 5       # 2Hz = 5 10Hz steps
+        ANCHOR_FUTURE_LEN = 20  # 2s at 10Hz
+        n_pred_steps = pred_traj.shape[2]  # 80
+        n_anchors_total = anchor_hidden_all.shape[1]  # 13
+        n_hidden_steps = pred_anchor_hidden_2hz.shape[2]
+        n_anchors_usable = min(
+            n_anchors_total,
+            (n_pred_steps - ANCHOR_STRIDE - ANCHOR_FUTURE_LEN) // ANCHOR_STRIDE + 1,
+            max(0, n_hidden_steps - 1),
+        )  # min(13, 12) = 12
+
+        pred_traj_f = pred_traj.to(dtype=torch.float32, device=dev)
+        pred_head_f = pred_head_traj.to(dtype=torch.float32, device=dev)
+
+        # ── 6. EPG loss: all usable anchor steps → gradient signal × n_anchors ─
+        # Each anchor step k contributes an independent EPG term with the same
+        # per-scenario advantage (RMM is full-trajectory reward).
+        # anchor_hidden is stop-gradient (detach) → no BPTT through closed-loop.
+        _K = self.finetune_config.epg_n_samples
+        t0 = float(flow_ode.eps)
+        ref_decoder = self.ref_flow_decoder if self.finetune_config.epg_use_ref_model else None
+        from src.smart.modules.flow_dpo import compute_fm_log_prob as _compute_log_prob
+        # Explicit old-policy snapshot for this optimization step.
+        # log_p_old is computed against this frozen snapshot, not the live decoder module.
+        from copy import deepcopy
+        old_flow_decoder = deepcopy(flow_decoder).eval()
+        for p in old_flow_decoder.parameters():
+            p.requires_grad_(False)
+
+        total_loss = anchor_hidden_all.new_zeros(())
+        accum: Dict[str, list] = {
+            "pg": [], "kl": [], "log_p_theta": [], "log_p_old": [],
+            "rho_mean": [], "rho_max": [], "pref_acc": [], "log_p_ref": [],
+        }
+        n_steps_accumulated = 0
+        anchor_hidden_0 = None  # saved for BC and debug
+
+        for k in range(n_anchors_usable):
+            # Agents valid at anchor k
+            valid_idx_k = flow_train_mask[:, k].nonzero(as_tuple=False).squeeze(-1) #NOTE: Rollout에서 필요한 애들이 짤릴 수 있음.
+            if valid_idx_k.numel() == 0:
+                continue
+
+            n_valid_k = valid_idx_k.shape[0]
+            # Use rollout-online hidden as anchor condition:
+            # k-th training anchor corresponds to coarse step (k+1) hidden.
+            anchor_hidden_k = (
+                pred_anchor_hidden_2hz[valid_idx_k, :, k + 1, :]
+                .detach()
+                .to(dtype=torch.float32)
+            )
+            if k == 0:
+                anchor_hidden_0 = anchor_hidden_k[:, 0, :]  # kept for BC / debug
+
+            advantages_k = advantages_sc[agent_batch[valid_idx_k]]  # [n_valid_k, G]
+
+            # Normalised trajectories for anchor k: [n_valid_k, G, 20, 4]
+            future_start = ANCHOR_STRIDE + k * ANCHOR_STRIDE  # 5, 10, 15, ...
+            future_slice = slice(future_start, future_start + ANCHOR_FUTURE_LEN)
+            traj_norm_list_k = []
+            for g in range(G):
+                y_world = pred_traj_f[valid_idx_k, g, future_slice, :] 
+                h_world = pred_head_f[valid_idx_k, g, future_slice]
+                # Use rollout-generated anchor state (not GT ctx_sampled_*) as local reference.
+                # Anchor-k reference is the state right before this 2s window starts.
+                ref_pos_k_g = pred_traj_f[valid_idx_k, g, future_start - 1, :]
+                ref_head_k_g = pred_head_f[valid_idx_k, g, future_start - 1]
+                traj_norm_list_k.append(
+                    self._world_traj_to_flow_norm(y_world, h_world, ref_pos_k_g, ref_head_k_g)
+                )
+            trajectories_k = torch.stack(traj_norm_list_k, dim=1)  # [n_valid_k, G, 20, 4]
+
+            # Shared MC samples (generated once per anchor, shared between log_p_old and log_p_theta)
+            _n_k = n_valid_k * G
+            shared_t_k = t0 + (1.0 - t0) * torch.rand(_K, _n_k, device=dev, dtype=torch.float32)
+            shared_x0_k = torch.randn(_n_k, 20, 4, device=dev, dtype=torch.float32)
+
+            # log π_{θ_old} — no_grad, same MC samples as log_p_theta
+            with torch.no_grad():
+                _traj_flat_k = trajectories_k.detach().reshape(_n_k, 20, 4)
+                _anchor_rep_k = anchor_hidden_k.reshape(_n_k, -1)
+                log_p_old_flat_k = _compute_log_prob(
+                    old_flow_decoder, _anchor_rep_k, _traj_flat_k, flow_ode,
+                    n_samples=_K, shared_t=shared_t_k, shared_x0=shared_x0_k,
+                )
+            log_p_old_k = log_p_old_flat_k.reshape(n_valid_k, G)
+
+            loss_k, metrics_k = _flow_epg_loss(
+                flow_decoder=flow_decoder,
+                ref_flow_decoder=ref_decoder,
+                anchor_hidden=anchor_hidden_k,
+                trajectories=trajectories_k.detach(),
+                advantages=advantages_k,
+                log_p_old=log_p_old_k,
+                shared_t=shared_t_k,
+                shared_x0=shared_x0_k,
+                flow_ode=flow_ode,
+                beta=self.finetune_config.epg_beta,
+                n_samples=_K,
+            )
+            total_loss = total_loss + loss_k
+            n_steps_accumulated += 1
+            accum["pg"].append(metrics_k["train/epg_pg_loss"])
+            accum["kl"].append(metrics_k["train/epg_kl"])
+            accum["log_p_theta"].append(metrics_k["train/epg_log_p_theta"])
+            accum["log_p_old"].append(metrics_k["train/epg_log_p_old"])
+            accum["rho_mean"].append(metrics_k["train/epg_rho_mean"])
+            accum["rho_max"].append(metrics_k["train/epg_rho_max"])
+            accum["pref_acc"].append(metrics_k["train/epg_pref_acc"])
+            if "train/epg_log_p_ref" in metrics_k:
+                accum["log_p_ref"].append(metrics_k["train/epg_log_p_ref"])
+
+        if n_steps_accumulated == 0:
+            dummy = next(iter(flow_decoder.parameters()))
+            return {"loss": dummy.sum() * 0.0}
+
+        def _mean(lst: list) -> Tensor:
+            return torch.stack(lst).mean()
+
+        loss = total_loss / n_steps_accumulated
+        metrics: Dict[str, Tensor] = {
+            "train/epg_loss": loss.detach(),
+            "train/epg_pg_loss": _mean(accum["pg"]),
+            "train/epg_kl": _mean(accum["kl"]),
+            "train/epg_log_p_theta": _mean(accum["log_p_theta"]),
+            "train/epg_log_p_old": _mean(accum["log_p_old"]),
+            "train/epg_rho_mean": _mean(accum["rho_mean"]),
+            "train/epg_rho_max": _mean(accum["rho_max"]),
+            "train/epg_advantage_mean": advantages_sc.mean().detach(),
+            "train/epg_advantage_std": advantages_sc.std().detach() if advantages_sc.numel() > 1 else advantages_sc.new_zeros(1),
+            "train/epg_pref_acc": _mean(accum["pref_acc"]),
+            "train/epg_n_anchor_steps": torch.tensor(float(n_steps_accumulated), device=dev),
+        }
+        if accum["log_p_ref"]:
+            metrics["train/epg_log_p_ref"] = _mean(accum["log_p_ref"])
+
+        # Fallback if anchor 0 had no valid agents (should not happen in practice)
+        if anchor_hidden_0 is None:
+            anchor_hidden_0 = anchor_hidden_all[:, 0, :].detach().to(dtype=torch.float32)
+
+        # ── 7. Optional BC regularisation (anchor 0 only) ─────────────────────
+        bc_loss_val = anchor_hidden_0.new_zeros(1)
+        if self.finetune_config.epg_bc_lambda > 0.0:
+            gt_clean = tokenized_agent["flow_train_clean_norm"].to(
+                dtype=torch.float32, device=dev
+            )
+            n_first = int(first_anchor_mask.sum().item())
+            gt_clean_first = gt_clean[:n_first]
+            bc_loss = self.terminal_cost_final_step_loss.bc_flow_loss(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden_valid=anchor_hidden_0,
+                gt_clean_norm=gt_clean_first,
+            )
+            loss = loss + self.finetune_config.epg_bc_lambda * bc_loss
+            bc_loss_val = bc_loss.detach()
+
+        # RMM diagnostics
+        metrics["train/rmm_mean"] = rmm_scores_d.mean().to(device=dev)
+        metrics["train/rmm_max"] = rmm_scores_d.max(dim=-1).values.mean().to(device=dev)
+        metrics["train/rmm_min"] = rmm_scores_d.min(dim=-1).values.mean().to(device=dev)
+        metrics["train/rmm_margin"] = (rmm_scores_d.max(dim=-1).values - rmm_scores_d.min(dim=-1).values).mean()
+        metrics["train/epg_bc_loss"] = bc_loss_val
+        metrics["loss"] = loss
+
+        # debug JSONL
+        self._maybe_write_epg_debug(batch_idx, anchor_hidden_0, rmm_scores, advantages_sc, metrics)
+
+        return metrics
+
+    def _maybe_write_epg_debug(
+        self,
+        batch_idx: int,
+        anchor_hidden: Tensor,
+        rmm_scores: Tensor,   # [n_scenarios, G]
+        advantages: Tensor,   # [n_scenarios, G]
+        metrics: dict,
+    ) -> None:
+        if self._dpo_debug_path is None or self.global_rank != 0:
+            return
+        step = int(self.global_step)
+        if step % 10 != 0:
+            return
+        import json
+        record = {
+            "step": step,
+            "batch_idx": int(batch_idx),
+            "n_agents": int(anchor_hidden.shape[0]),
+            "epg_loss": float(metrics.get("train/epg_loss", float("nan"))),
+            "epg_pg_loss": float(metrics.get("train/epg_pg_loss", float("nan"))),
+            "epg_kl": float(metrics.get("train/epg_kl", float("nan"))),
+            "epg_log_p": float(metrics.get("train/epg_log_p", float("nan"))),
+            "epg_pref_acc": float(metrics.get("train/epg_pref_acc", float("nan"))),
+            "adv_mean": float(advantages.mean()),
+            "adv_std": float(advantages.std()) if advantages.numel() > 1 else 0.0,
+            "rmm_mean": float(rmm_scores.mean()),
+            "rmm_max": float(rmm_scores.max(dim=-1).values.mean()),
+            "rmm_min": float(rmm_scores.min(dim=-1).values.mean()),
+            "rmm_margin": float((rmm_scores.max(dim=-1).values - rmm_scores.min(dim=-1).values).mean()),
+        }
+        try:
+            with open(self._dpo_debug_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            pass
+
     def _run_flow_dpo_ft_step(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         batch_idx: int = 0,
+        data: dict | None = None,
     ) -> dict:
-        """Flow-DPO fine-tuning step.
+        """Flow-DPO fine-tuning step (RMM-ranked pairwise DPO).
 
-        y_w = GT clean trajectory (expert, always assumed better).
-        y_l = policy ODE rollout from the same initial state (online, detached).
-
-        FM log-prob proxy:
-            log π_θ(y | s) ≈ -E_{t,x0}[ ||v_θ(x_t, t, s) - (y - x0)||² ]
+        Two policy rollouts are generated from the same initial state.
+        Rollouts are ranked by RMM (realism meta-metric).  The higher-RMM
+        trajectory becomes y_w (winner) and the lower-RMM trajectory becomes
+        y_l (loser).  DPO then trains the flow model to prefer y_w.
 
         DPO loss (with optional frozen reference model):
             L = -log σ( β · [ (log π_θ(y_w) - log π_ref(y_w))
@@ -1278,64 +1744,130 @@ class SMARTFlow(LightningModule):
         flow_ode = self.encoder.agent_encoder.flow_ode
         flow_decoder = self.encoder.agent_encoder.flow_decoder
 
-        # ── 1. Encode context (frozen encoder) ────────────────────────────────
+        # ── 1. Encode map & full anchor context (all 13 anchors) ──────────────
         with torch.no_grad():
             map_feature = self.encoder.encode_map(tokenized_map)
-            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+            _, anchor_hidden_all, _ = self.encoder.encode_anchor_context_from_map_feature(
                 map_feature=map_feature,
                 tokenized_agent=tokenized_agent,
                 anchor_mask_key="flow_train_mask",
             )
+            # anchor_hidden_all: [n_agents, 13, hidden_dim]
 
-        if anchor_hidden_valid.numel() == 0:
+        flow_train_mask = tokenized_agent["flow_train_mask"]   # [n_agents, 13]
+        first_anchor_mask = flow_train_mask[:, 0]              # [n_agents] bool
+
+        if not first_anchor_mask.any():
             dummy = next(iter(flow_decoder.parameters()))
             return {"loss": dummy.sum() * 0.0}
 
-        anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
-        dev = anchor_hidden.device
-
-        # ── 2. y_w: GT trajectory (winner) ────────────────────────────────────
-        y_w = tokenized_agent["flow_train_clean_norm"].to(dtype=torch.float32, device=dev)
-
-        # ── 3. y_l: policy rollout from same initial state (loser, detached) ──
-        # Same v_init / delta_init (from context) → same initial kinematic state.
-        # Detached: DPO evaluates fixed trajectories; gradient flows through v_θ only.
+        # ── 2. Generate 2 closed-loop rollouts from same initial state ─────────
         with torch.no_grad():
-            y_l = self.terminal_cost_final_step_loss.generate_policy_trajectory(
-                flow_decoder=flow_decoder,
-                flow_ode=flow_ode,
-                anchor_hidden_valid=anchor_hidden,
-            ).detach()  # [n, 20, 4]
+            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
+            pred_traj, pred_z, pred_head_traj = self._run_parallel_rollout_chunk(
+                data=data,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                rollout_cache=rollout_cache,
+                rollout_indices=[0, 1],
+            )
+            # pred_traj: [n_agents, 2, 80, 2]  world XY at 10Hz
+            # pred_head_traj: [n_agents, 2, 80]  world heading
 
-        # ── 4. FM-DPO loss ─────────────────────────────────────────────────────
+        # ── 3. Compute RMM per rollout per scenario ─────────────────────────────
+        agent_batch = tokenized_agent["batch"]   # [n_agents]
+        agent_ids = data["agent"]["id"] if data is not None else tokenized_agent.get("id", agent_batch)
+
+        rmm_0, rmm_1 = self._compute_rmm_pair(
+            data=data if data is not None else {},
+            agent_ids=agent_ids,
+            agent_batch=agent_batch,
+            pred_traj=pred_traj,
+            pred_z=pred_z,
+            pred_head=pred_head_traj,
+        )
+
+        # ── 4. Determine winner/loser rollout per scenario ──────────────────────
+        dev = anchor_hidden_all.device
+        winner_is_0 = (rmm_0 >= rmm_1).to(device=dev)  # [n_scenarios]
+
+        # ── 5. Extract & normalize first-anchor trajectories from rollouts ──────
+        # Rollout starts from 2Hz step 1 (pos_window[-1]).
+        # Anchor 0 (raw_step=10) future = rollout 10Hz indices 5:25 (steps 11-30).
+        # Reference position for normalization = ctx_sampled_pos[:, 1] (anchor 0 time).
+        ANCHOR0_FUTURE_SLICE = slice(5, 25)   # rollout 10Hz indices for anchor-0 future
+
+        valid_idx = first_anchor_mask.nonzero(as_tuple=False).squeeze(-1)  # [n_valid]
+
+        ctx_pos = tokenized_agent["ctx_sampled_pos"].to(dtype=torch.float32, device=dev)
+        ctx_head = tokenized_agent["ctx_sampled_heading"].to(dtype=torch.float32, device=dev)
+        ref_pos = ctx_pos[valid_idx, 1]    # [n_valid, 2]  anchor-0 reference position
+        ref_head = ctx_head[valid_idx, 1]  # [n_valid]     anchor-0 reference heading
+
+        pred_traj_f = pred_traj.to(dtype=torch.float32, device=dev)
+        pred_head_f = pred_head_traj.to(dtype=torch.float32, device=dev)
+
+        y0_world = pred_traj_f[valid_idx, 0, ANCHOR0_FUTURE_SLICE, :]   # [n_valid, 20, 2]
+        y1_world = pred_traj_f[valid_idx, 1, ANCHOR0_FUTURE_SLICE, :]
+        h0_world = pred_head_f[valid_idx, 0, ANCHOR0_FUTURE_SLICE]      # [n_valid, 20]
+        h1_world = pred_head_f[valid_idx, 1, ANCHOR0_FUTURE_SLICE]
+
+        y0_norm = self._world_traj_to_flow_norm(y0_world, h0_world, ref_pos, ref_head)
+        y1_norm = self._world_traj_to_flow_norm(y1_world, h1_world, ref_pos, ref_head)
+
+        # Assign winner/loser per agent based on scenario-level RMM
+        agent_winner_is_0 = winner_is_0[agent_batch[valid_idx]]  # [n_valid]
+        mask_w0 = agent_winner_is_0.view(-1, 1, 1)
+        y_w = torch.where(mask_w0, y0_norm, y1_norm)  # [n_valid, 20, 4]
+        y_l = torch.where(mask_w0, y1_norm, y0_norm)
+
+        # ── 6. anchor_hidden for first anchor ──────────────────────────────────
+        anchor_hidden = anchor_hidden_all[valid_idx, 0, :].detach().to(dtype=torch.float32)
+
+        # ── 7. FM-DPO loss ─────────────────────────────────────────────────────
         ref_decoder = self.ref_flow_decoder if self.finetune_config.dpo_use_ref_model else None
         loss, metrics = _flow_dpo_loss(
             flow_decoder=flow_decoder,
             ref_flow_decoder=ref_decoder,
             anchor_hidden=anchor_hidden,
             y_w=y_w.detach(),
-            y_l=y_l,
+            y_l=y_l.detach(),
             flow_ode=flow_ode,
             beta=self.finetune_config.dpo_beta,
             n_samples=self.finetune_config.dpo_n_samples,
         )
 
-        # ── 5. Optional BC regularization ──────────────────────────────────────
+        # ── 8. Optional BC regularization ──────────────────────────────────────
         bc_loss_val = anchor_hidden.new_zeros(1)
         if self.finetune_config.dpo_bc_lambda > 0.0:
+            gt_clean = tokenized_agent["flow_train_clean_norm"].to(
+                dtype=torch.float32, device=dev
+            )
+            # Only first-anchor portion: first sum(first_anchor_mask) entries
+            n_first = int(first_anchor_mask.sum().item())
+            gt_clean_first = gt_clean[:n_first]
             bc_loss = self.terminal_cost_final_step_loss.bc_flow_loss(
                 flow_decoder=flow_decoder,
                 flow_ode=flow_ode,
                 anchor_hidden_valid=anchor_hidden,
-                gt_clean_norm=y_w,
+                gt_clean_norm=gt_clean_first,
             )
             loss = loss + self.finetune_config.dpo_bc_lambda * bc_loss
             bc_loss_val = bc_loss.detach()
 
+        # RMM diagnostic metrics (move to GPU so DDP all_reduce works)
+        rmm_0_d = rmm_0.to(device=dev)
+        rmm_1_d = rmm_1.to(device=dev)
+        metrics["train/rmm_winner"] = torch.max(rmm_0_d, rmm_1_d).mean()
+        metrics["train/rmm_loser"] = torch.min(rmm_0_d, rmm_1_d).mean()
+        metrics["train/rmm_margin"] = (rmm_0_d - rmm_1_d).abs().mean()
         metrics["loss"] = loss
         metrics["train/dpo_bc_loss"] = bc_loss_val
 
-        # ── 6. Debug JSONL logging (rank-0, every 10 steps) ────────────────────
+        # ── 9. Debug JSONL logging (rank-0, every 10 steps) ────────────────────
         self._maybe_write_dpo_debug(batch_idx, anchor_hidden, y_w, y_l, metrics)
 
         return metrics
@@ -1685,7 +2217,15 @@ class SMARTFlow(LightningModule):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
         if self._is_flow_dpo_ft_enabled():
-            result = self._run_flow_dpo_ft_step(tokenized_map, tokenized_agent, batch_idx)
+            result = self._run_flow_dpo_ft_step(tokenized_map, tokenized_agent, batch_idx, data)
+            for k, v in result.items():
+                if k != "loss" and isinstance(v, (Tensor, float)):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            return result["loss"]
+
+        if self._is_flow_epg_ft_enabled():
+            result = self._run_flow_epg_ft_step(tokenized_map, tokenized_agent, batch_idx, data)
             for k, v in result.items():
                 if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)

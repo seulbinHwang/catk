@@ -777,6 +777,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dtype=head_window.dtype,
             device=head_window.device,
         )
+        # Hidden state used to generate each coarse 0.5s step.
+        # shape: [n_agent, n_step_future_2hz, hidden_dim]
+        anchor_hidden_2hz_list = []
         sample_window_steps = 20
         rollout_noise_tape = self._build_rollout_noise_tape(
             num_agent=n_agent,
@@ -876,6 +879,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                             [feat_a_t_dict[i + 1], current_hidden.unsqueeze(1)],
                             dim=1,
                         )
+            anchor_hidden_2hz_list.append(current_hidden.clone())
 
             active_mask = valid_window[:, -1]
             next_pos = pos_window[:, -1].clone()
@@ -1006,6 +1010,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "gt_valid": tokenized_agent["valid_mask"],
             "pred_traj_10hz": pred_traj_10hz,
             "pred_head_10hz": pred_head_10hz,
+            "anchor_hidden_2hz": torch.stack(anchor_hidden_2hz_list, dim=1),
         }
         pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)
         out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz.shape[1])

@@ -29,10 +29,16 @@ def compute_fm_log_prob(
     flow_ode: nn.Module,           # for flow_ode.eps
     n_samples: int = 8,
     shared_x0: Optional[Tensor] = None,  # [n, 20, 4] shared noise (reduces variance)
+    shared_t: Optional[Tensor] = None,   # [K, n] shared time steps (reduces variance for ρ_θ)
+    max_forward_batch: int = 256,  # max [K*n] per forward to avoid CUDA SDPA kernel limits
 ) -> Tensor:                       # [n]
     """Compute the FM log-probability proxy for a batch of trajectories.
 
-    Uses a single batched forward pass for all MC samples (efficient).
+    Processes MC samples in chunks of at most ``max_forward_batch`` to avoid
+    CUDA SDPA kernel failures caused by very large batch dimensions (the
+    ChunkStepRefiner reshapes to [batch*4, 5, dim] before attention, which
+    exceeds CUDA block-config limits beyond ~1024).
+
     Higher return value = model assigns higher probability to ``trajectory``.
 
     Args:
@@ -41,8 +47,12 @@ def compute_fm_log_prob(
         trajectory: the trajectory to evaluate (x₁). ``[n, 20, 4]``.
         flow_ode: provides ``flow_ode.eps`` (minimum time step).
         n_samples: number of (t, x₀) Monte-Carlo samples.
-        shared_x0: if supplied, use this as the noise x₀ (same across y_w and y_l
-            reduces variance when comparing two trajectories).
+        shared_x0: if supplied, use this as the noise x₀ (same across calls
+            reduces variance when computing ratios like ρ_θ).
+        shared_t: if supplied, use this as the time samples ``[K, n]`` (same across
+            calls reduces variance for ρ_θ = π_θ / π_{θ_old} computation).
+        max_forward_batch: maximum K*n size per forward pass. Samples are chunked
+            so that no single call exceeds this limit.
 
     Returns:
         Tensor: per-sample log-prob proxy ``[n]``.
@@ -52,19 +62,19 @@ def compute_fm_log_prob(
     dtype = trajectory.dtype
     t0 = float(flow_ode.eps)
 
-    # Sample K times, then flatten to [K*n, ...] for a single forward pass.
     K = n_samples
 
     # t ∈ [eps, 1], shape [K, n]
-    t_k = t0 + (1.0 - t0) * torch.rand(K, n, device=device, dtype=dtype)
+    if shared_t is not None:
+        t_k = shared_t.to(device=device, dtype=dtype)
+    else:
+        t_k = t0 + (1.0 - t0) * torch.rand(K, n, device=device, dtype=dtype)
 
     if shared_x0 is not None:
-        # [K, n, 20, 4] — same x0 for all K repetitions
         x0_k = shared_x0.unsqueeze(0).expand(K, -1, -1, -1)
     else:
         x0_k = torch.randn(K, n, 20, 4, device=device, dtype=dtype)
 
-    # Expand trajectory to [K, n, 20, 4]
     y_k = trajectory.unsqueeze(0).expand(K, -1, -1, -1)
 
     # OT interpolation: x_t = (1-t)*x0 + t*y
@@ -80,12 +90,26 @@ def compute_fm_log_prob(
     tau_flat = t_k.reshape(K * n)
     v_target_flat = v_target_k.reshape(K * n, 20, 4)
 
-    # Single batched forward pass through flow decoder
-    v_pred_flat = flow_decoder.forward_components(
-        anchor_hidden=anchor_rep,
-        x_t_norm=x_t_flat,
-        tau=tau_flat,
-    )["velocity"]  # [K*n, 20, 4]
+    total = K * n
+    if total <= max_forward_batch:
+        # Single forward pass (common case for small batches)
+        v_pred_flat = flow_decoder.forward_components(
+            anchor_hidden=anchor_rep,
+            x_t_norm=x_t_flat,
+            tau=tau_flat,
+        )["velocity"]
+    else:
+        # Chunked forward to keep SDPA batch within CUDA kernel limits
+        chunks = []
+        for start in range(0, total, max_forward_batch):
+            end = min(start + max_forward_batch, total)
+            v_chunk = flow_decoder.forward_components(
+                anchor_hidden=anchor_rep[start:end],
+                x_t_norm=x_t_flat[start:end],
+                tau=tau_flat[start:end],
+            )["velocity"]
+            chunks.append(v_chunk)
+        v_pred_flat = torch.cat(chunks, dim=0)
 
     # Negative MSE = log-prob proxy, averaged over (T=20, D=4) dims
     neg_mse_flat = -F.mse_loss(v_pred_flat, v_target_flat, reduction="none").mean(
