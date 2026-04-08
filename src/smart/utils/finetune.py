@@ -54,6 +54,15 @@ class FinetuneConfig:
     epg_bc_lambda: float = 0.0        # optional BC regularization weight
     epg_ppo_epochs: int = 1           # K gradient steps per RMM evaluation (PPO-style)
     epg_head_only: bool = False       # True → only train residual_velocity_head (frozen trunk)
+    #: G==1일 때만: RMM에서 뺄 baseline(스칼라). None이면 그룹 평균(=단일 rollout이면 R)을 쓰고
+    #: 표준편차는 1로 두어 NaN을 피함 → advantage는 0. float를 주면 (R−baseline)/1 로 정규화.
+    epg_single_rollout_baseline: float | None = None
+    # ── Flow-RWR ──────────────────────────────────────────────────────────────
+    rwr_n_rollouts: int = 4          # G: rollouts per scenario
+    rwr_beta: float = 0.1            # temperature β for exp(R/β) weighting
+    rwr_n_samples: int = 8           # MC samples for FM log-prob (ELBO)
+    rwr_anchor_discount: float = 1.0  # γ: temporal discount per anchor step (1=uniform)
+    rwr_head_only: bool = False      # True → only residual_velocity_head trained
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -100,6 +109,9 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
             "smooth_deadzone_epsilon must contain exactly 3 values for [vx, vy, omega]."
         )
 
+    epg_srb_raw = _read_config_value(finetune, "epg_single_rollout_baseline", None)
+    epg_single_rollout_baseline = float(epg_srb_raw) if epg_srb_raw is not None else None
+
     return FinetuneConfig(
         enabled=bool(_read_config_value(finetune, "enabled", True)),
         mode=str(_read_config_value(finetune, "mode", "adjoint_matching")),
@@ -128,6 +140,12 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         epg_bc_lambda=float(_read_config_value(finetune, "epg_bc_lambda", 0.0)),
         epg_ppo_epochs=int(_read_config_value(finetune, "epg_ppo_epochs", 1)),
         epg_head_only=bool(_read_config_value(finetune, "epg_head_only", False)),
+        epg_single_rollout_baseline=epg_single_rollout_baseline,
+        rwr_n_rollouts=int(_read_config_value(finetune, "rwr_n_rollouts", 4)),
+        rwr_beta=float(_read_config_value(finetune, "rwr_beta", 0.1)),
+        rwr_n_samples=int(_read_config_value(finetune, "rwr_n_samples", 8)),
+        rwr_anchor_discount=float(_read_config_value(finetune, "rwr_anchor_discount", 1.0)),
+        rwr_head_only=bool(_read_config_value(finetune, "rwr_head_only", False)),
     )
 
 
@@ -186,6 +204,7 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         "dice_ft",              # DICE / IQ-Learn imitation learning (Chi^2 f-divergence)
         "flow_dpo_ft",          # Flow-DPO: GT vs policy rollout pairwise DPO
         "flow_epg_ft",          # Flow-EPG: Exact Policy Gradient with ELBO + RMM reward
+        "flow_rwr_ft",          # Flow-RWR: Reward-Weighted Regression with GPU RMM
     }:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 
@@ -199,9 +218,10 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             "Use the flow-based model (e.g., SMARTFlow) or fix the model config."
         )
 
-    # ── epg_head_only: residual_velocity_head만 학습 (트렁크 완전 동결) ──────
+    # ── head_only: residual_velocity_head만 학습 (트렁크 완전 동결) ──────────
     is_epg_head_only = (config.mode == "flow_epg_ft" and config.epg_head_only)
-    if is_epg_head_only:
+    is_rwr_head_only = (config.mode == "flow_rwr_ft" and config.rwr_head_only)
+    if is_epg_head_only or is_rwr_head_only:
         if residual_head is None:
             raise AttributeError(
                 "epg_head_only=True requires residual_velocity_head in flow_decoder."
@@ -210,8 +230,9 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         for p in residual_head.parameters():
             p.data.zero_()
         _set_requires_grad(residual_head, True)
+        mode_tag = "EPG" if is_epg_head_only else "RWR"
         log.info(
-            "EPG head-only mode: flow_decoder trunk frozen, "
+            f"{mode_tag} head-only mode: flow_decoder trunk frozen, "
             "only residual_velocity_head is trainable (zero-initialized)."
         )
         return config
