@@ -17,7 +17,7 @@ from src.smart.modules.flow_local_decoder import (
     FlowODE,
     HierarchicalFlowDecoder,
 )
-from src.smart.utils import angle_between_2d_vectors, wrap_angle
+from src.smart.utils import angle_between_2d_vectors, transform_to_global, wrap_angle
 
 
 class SMARTFlowAgentDecoder(SMARTAgentEncoder):
@@ -733,6 +733,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        return_flow_2s_preview: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -748,6 +749,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         Returns:
             Dict[str, torch.Tensor]:
                 한 번의 rollout 결과입니다. 기존 inference 반환과 같은 키를 가집니다.
+                ``return_flow_2s_preview=True`` 이면 step별 raw 2초 preview도
+                함께 반환합니다.
         """
         state = self._clone_rollout_cache(rollout_cache)
 
@@ -790,6 +793,19 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dtype=head_window.dtype,
             device=head_window.device,
         )
+        pred_flow_2s_traj = None
+        pred_flow_2s_valid = None
+        if return_flow_2s_preview:
+            pred_flow_2s_traj = torch.zeros(
+                (n_agent, n_step_future_2hz, 20, 2),
+                dtype=pos_window.dtype,
+                device=pos_window.device,
+            )
+            pred_flow_2s_valid = torch.zeros(
+                (n_agent, n_step_future_2hz),
+                dtype=torch.bool,
+                device=pos_window.device,
+            )
         sample_window_steps = 20
         rollout_noise_tape = self._build_rollout_noise_tape(
             num_agent=n_agent,
@@ -893,6 +909,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
                 active_agent_type = tokenized_agent["type"][active_mask]
+                if return_flow_2s_preview:
+                    preview_pos_local = y_hat_norm[..., :2] * 20.0
+                    preview_pos_global, _ = transform_to_global(
+                        pos_local=preview_pos_local,
+                        head_local=None,
+                        pos_now=current_pos_act,
+                        head_now=current_head_act,
+                    )
+                    pred_flow_2s_traj[active_mask, t] = preview_pos_global
+                    pred_flow_2s_valid[active_mask, t] = True
                 if self.use_dynamics_feasible_commit_bridge and self.dynamics_commit_bridge is not None:
                     (
                         commit_pos_act,
@@ -1047,6 +1073,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         }
         pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)
         out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz.shape[1])
+        if return_flow_2s_preview:
+            out_dict["pred_flow_2s_traj"] = pred_flow_2s_traj
+            out_dict["pred_flow_2s_valid"] = pred_flow_2s_valid
         return out_dict
 
     @torch.no_grad()

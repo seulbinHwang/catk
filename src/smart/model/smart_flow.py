@@ -72,6 +72,8 @@ class SMARTFlow(LightningModule):
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
+        self.vis_ghost_gt = bool(getattr(model_config, "vis_ghost_gt", True))
+        self.vis_flow_2s_preview = bool(getattr(model_config, "vis_flow_2s_preview", False))
         self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
         self._fit_time_original_limit_val_batches: int | float | None = None
@@ -209,6 +211,26 @@ class SMARTFlow(LightningModule):
             except OSError:
                 break
             current_dir = current_dir.parent
+
+    def _get_scenario_flow_preview(
+        self,
+        agent_id: Tensor,
+        agent_batch: Tensor,
+        scenario_index: int,
+        flow_preview: Dict[str, Tensor] | None,
+    ) -> Dict[str, object] | None:
+        if flow_preview is None:
+            return None
+
+        scenario_mask = agent_batch == scenario_index
+        if not scenario_mask.any():
+            return None
+
+        return {
+            "object_id": agent_id[scenario_mask].detach().cpu().numpy(),
+            "traj": flow_preview["traj"][scenario_mask].detach().cpu().numpy(),
+            "valid": flow_preview["valid"][scenario_mask].detach().cpu().numpy(),
+        }
 
     def _build_open_loop_metric_dict(
         self,
@@ -632,7 +654,8 @@ class SMARTFlow(LightningModule):
         map_feature: Dict[str, Tensor],
         rollout_cache: Dict[str, object],
         rollout_indices: Sequence[int],
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        return_flow_2s_preview: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor, Dict[str, Tensor] | None]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
         Args:
@@ -646,11 +669,12 @@ class SMARTFlow(LightningModule):
                 길이는 ``[n_rollout_chunk]`` 입니다.
 
         Returns:
-            tuple[Tensor, Tensor, Tensor]:
+            tuple[Tensor, Tensor, Tensor, Dict[str, Tensor] | None]:
                 위치, 높이, 방향 예측입니다.
                 shape은 각각 ``[n_agent, n_rollout_chunk, 80, 2]``,
                 ``[n_agent, n_rollout_chunk, 80]``,
                 ``[n_agent, n_rollout_chunk, 80]`` 입니다.
+                마지막 값은 선택적 2초 preview 사전입니다.
         """
         chunk_size = int(len(rollout_indices))
         scenario_device = tokenized_agent["batch"].device
@@ -666,11 +690,19 @@ class SMARTFlow(LightningModule):
                 map_feature=map_feature,
                 sampling_scheme=self.validation_rollout_sampling,
                 scenario_sampling_seeds=scenario_sampling_seeds,
+                return_flow_2s_preview=return_flow_2s_preview,
             )
+            flow_preview = None
+            if return_flow_2s_preview:
+                flow_preview = {
+                    "traj": pred["pred_flow_2s_traj"].unsqueeze(1),
+                    "valid": pred["pred_flow_2s_valid"].unsqueeze(1),
+                }
             return (
                 pred["pred_traj_10hz"].unsqueeze(1),
                 pred["pred_z_10hz"].unsqueeze(1),
                 pred["pred_head_10hz"].unsqueeze(1),
+                flow_preview,
             )
 
         num_agent = int(tokenized_agent["batch"].shape[0])
@@ -700,7 +732,22 @@ class SMARTFlow(LightningModule):
             map_feature=expanded_map_feature,
             sampling_scheme=self.validation_rollout_sampling,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+            return_flow_2s_preview=return_flow_2s_preview,
         )
+        flow_preview = None
+        if return_flow_2s_preview:
+            flow_preview = {
+                "traj": self._reshape_parallel_rollout_prediction(
+                    pred["pred_flow_2s_traj"],
+                    repeat_count=chunk_size,
+                    num_agent=num_agent,
+                ),
+                "valid": self._reshape_parallel_rollout_prediction(
+                    pred["pred_flow_2s_valid"],
+                    repeat_count=chunk_size,
+                    num_agent=num_agent,
+                ),
+            }
         return (
             self._reshape_parallel_rollout_prediction(
                 pred["pred_traj_10hz"],
@@ -717,6 +764,7 @@ class SMARTFlow(LightningModule):
                 repeat_count=chunk_size,
                 num_agent=num_agent,
             ),
+            flow_preview,
         )
 
     def _build_rollout_chunk_size_candidates(self) -> list[int]:
@@ -770,7 +818,8 @@ class SMARTFlow(LightningModule):
         data,
         tokenized_agent,
         map_feature: Dict[str, Tensor],
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        return_flow_2s_preview: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor, Dict[str, Tensor] | None]:
         """한 batch의 모든 closed-loop rollout을 가능한 크게 묶어 생성합니다.
 
         기본은 모든 rollout을 한 번에 큰 batch로 처리합니다.
@@ -783,11 +832,12 @@ class SMARTFlow(LightningModule):
             map_feature: 한 번 인코딩한 지도 특징입니다.
 
         Returns:
-            tuple[Tensor, Tensor, Tensor]:
+            tuple[Tensor, Tensor, Tensor, Dict[str, Tensor] | None]:
                 위치, 높이, 방향 예측입니다.
                 shape은 각각 ``[n_agent, n_rollout, 80, 2]``,
                 ``[n_agent, n_rollout, 80]``,
                 ``[n_agent, n_rollout, 80]`` 입니다.
+                마지막 값은 선택적 2초 preview 사전입니다.
         """
         rollout_cache = self.encoder.prepare_inference_cache(
             tokenized_agent=tokenized_agent,
@@ -800,29 +850,43 @@ class SMARTFlow(LightningModule):
             pred_traj_chunks: list[Tensor] = []
             pred_z_chunks: list[Tensor] = []
             pred_head_chunks: list[Tensor] = []
+            flow_preview_traj_chunks: list[Tensor] = []
+            flow_preview_valid_chunks: list[Tensor] = []
             try:
                 for chunk_start in range(0, len(rollout_indices), chunk_size):
                     chunk_rollout_indices = rollout_indices[chunk_start : chunk_start + chunk_size]
-                    chunk_pred_traj, chunk_pred_z, chunk_pred_head = self._run_parallel_rollout_chunk(
+                    chunk_pred_traj, chunk_pred_z, chunk_pred_head, chunk_flow_preview = self._run_parallel_rollout_chunk(
                         data=data,
                         tokenized_agent=tokenized_agent,
                         map_feature=map_feature,
                         rollout_cache=rollout_cache,
                         rollout_indices=chunk_rollout_indices,
+                        return_flow_2s_preview=return_flow_2s_preview,
                     )
                     pred_traj_chunks.append(chunk_pred_traj)
                     pred_z_chunks.append(chunk_pred_z)
                     pred_head_chunks.append(chunk_pred_head)
+                    if return_flow_2s_preview and chunk_flow_preview is not None:
+                        flow_preview_traj_chunks.append(chunk_flow_preview["traj"])
+                        flow_preview_valid_chunks.append(chunk_flow_preview["valid"])
+                flow_preview = None
+                if return_flow_2s_preview:
+                    flow_preview = {
+                        "traj": torch.cat(flow_preview_traj_chunks, dim=1),
+                        "valid": torch.cat(flow_preview_valid_chunks, dim=1),
+                    }
                 return (
                     torch.cat(pred_traj_chunks, dim=1),
                     torch.cat(pred_z_chunks, dim=1),
                     torch.cat(pred_head_chunks, dim=1),
+                    flow_preview,
                 )
             except RuntimeError as error:
                 if (not self._is_cuda_out_of_memory(error)) or chunk_size == 1:
                     raise
                 last_oom_error = error
                 del pred_traj_chunks, pred_z_chunks, pred_head_chunks
+                del flow_preview_traj_chunks, flow_preview_valid_chunks
                 self._cleanup_after_rollout_oom()
                 continue
 
@@ -1171,10 +1235,12 @@ open_metric_dict:
             )
 
         if self.val_closed_loop:
-            pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
+            return_flow_2s_preview = self.vis_flow_2s_preview and batch_idx < self.n_vis_batch
+            pred_traj, pred_z, pred_head, flow_preview = self._run_closed_loop_rollouts(
                 data=data,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
+                return_flow_2s_preview=return_flow_2s_preview,
             )
 
             scenario_rollouts = None
@@ -1203,8 +1269,19 @@ open_metric_dict:
                     vis = VisWaymo(
                         scenario_path=data["tfrecord_path"][scen_idx],
                         save_dir=self.video_dir / f"batch_{batch_idx:02d}-scenario_{scen_idx:02d}",
+                        vis_ghost_gt=self.vis_ghost_gt,
+                        vis_flow_2s_preview=self.vis_flow_2s_preview,
                     )
-                    vis.save_video_scenario_rollout(scenario_rollouts[scen_idx], self.n_vis_rollout)
+                    vis.save_video_scenario_rollout(
+                        scenario_rollouts[scen_idx],
+                        self.n_vis_rollout,
+                        flow_preview=self._get_scenario_flow_preview(
+                            agent_id=data["agent"]["id"],
+                            agent_batch=data["agent"]["batch"],
+                            scenario_index=scen_idx,
+                            flow_preview=flow_preview,
+                        ),
+                    )
                     for video_path in vis.video_paths:
                         if video_logger is not None:
                             video_logger.log_video("/".join(video_path.split("/")[-3:]), [video_path])
@@ -1287,7 +1364,7 @@ open_metric_dict:
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         map_feature = self.encoder.encode_map(tokenized_map)
-        pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
+        pred_traj, pred_z, pred_head, _ = self._run_closed_loop_rollouts(
             data=data,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,

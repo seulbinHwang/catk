@@ -13,7 +13,7 @@
 
 from copy import deepcopy
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -62,6 +62,7 @@ class VisWaymo:
         n_step: int = 91,
         step_current: int = 10,
         vis_ghost_gt: bool = True,
+        vis_flow_2s_preview: bool = False,
     ) -> None:
         self.px_per_m = px_per_m
         self.video_size = video_size
@@ -69,6 +70,7 @@ class VisWaymo:
         self.step_current = step_current
         self.px_agent2bottom = video_size // 2
         self.vis_ghost_gt = vis_ghost_gt
+        self.vis_flow_2s_preview = vis_flow_2s_preview
 
         # colors
         self.lane_style = [
@@ -287,6 +289,7 @@ class VisWaymo:
         self,
         scenario_rollout: sim_agents_submission_pb2.ScenarioRollouts,
         n_vis_rollout: int,
+        flow_preview: Dict[str, np.ndarray] | None = None,
     ):
         for i_rollout in range(n_vis_rollout):
             images = deepcopy(self.im_gt_blended)
@@ -301,9 +304,61 @@ class VisWaymo:
                 ag_size,
                 ag_role,
             )
+            if self.vis_flow_2s_preview and flow_preview is not None:
+                self._draw_flow_2s_preview(
+                    images=images,
+                    flow_preview_traj=flow_preview["traj"][:, i_rollout],
+                    flow_preview_valid=flow_preview["valid"][:, i_rollout],
+                    object_id=flow_preview["object_id"],
+                )
             _video_path = (self.save_dir / f"rollout_{i_rollout:02d}.mp4").as_posix()
             self.video_paths.append(_video_path)
             save_images_to_mp4(images, _video_path)
+
+    def _draw_flow_2s_preview(
+        self,
+        images: List[np.ndarray],
+        flow_preview_traj: np.ndarray,
+        flow_preview_valid: np.ndarray,
+        object_id: np.ndarray,
+    ) -> None:
+        if flow_preview_traj.size == 0 or flow_preview_valid.size == 0:
+            return
+
+        num_future_frames = len(images) - (self.step_current + 1)
+        num_blocks = int(flow_preview_traj.shape[1])
+        if num_blocks == 0 or num_future_frames <= 0:
+            return
+
+        for future_frame_idx in range(num_future_frames):
+            block_idx = min(future_frame_idx // 5, num_blocks - 1)
+            frame = images[self.step_current + 1 + future_frame_idx]
+            for agent_idx in range(flow_preview_traj.shape[0]):
+                if not bool(flow_preview_valid[agent_idx, block_idx]):
+                    continue
+
+                preview_points = flow_preview_traj[agent_idx, block_idx]
+                preview_px = self._to_pixel(preview_points)
+                color = COLOR_WHITE
+
+                cv2.polylines(
+                    frame,
+                    [preview_px],
+                    isClosed=False,
+                    color=color,
+                    thickness=2,
+                    lineType=cv2.LINE_AA,
+                )
+                for point_idx, point in enumerate(preview_px):
+                    radius = 4 if point_idx == 0 else 2
+                    cv2.circle(
+                        frame,
+                        tuple(point),
+                        radius=radius,
+                        color=color,
+                        thickness=-1,
+                        lineType=cv2.LINE_AA,
+                    )
 
     def _get_features_from_trajs(
         self, trajs: List[sim_agents_submission_pb2.SimulatedTrajectory]
