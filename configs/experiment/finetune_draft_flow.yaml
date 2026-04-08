@@ -18,7 +18,7 @@ model:
       enabled: true
       start_epoch: 0
       ramp_epochs: 32
-      max_weight: 0.1 # 0.05 가 1:1 비율임.
+      max_weight: 0.125 # 0.05 가 1:1 비율임.
       gt_excess_only: false
       sampling:
         sample_steps: 16
