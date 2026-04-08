@@ -18,13 +18,13 @@ model:
       enabled: true
       start_epoch: 0
       ramp_epochs: 32
-      max_weight: 0.05 # 0.05 가 1:1 비율임.
+      max_weight: 0.1 # 0.05 가 1:1 비율임.
       gt_excess_only: false
       sampling:
         sample_steps: 16
         sample_method: midpoint
         noise_scale: 1.0
-        backprop_last_k: 16
+        backprop_last_k: 12
       physics:
         force_fp32: true
         dt: 0.1
@@ -55,9 +55,9 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 24
+  train_batch_size: 48
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
   prefetch_factor: 1
-  train_use_eval_agent_selection: true
+  train_use_eval_agent_selection: false
