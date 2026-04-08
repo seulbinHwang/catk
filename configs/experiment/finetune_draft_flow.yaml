@@ -18,8 +18,7 @@ model:
       enabled: true
       start_epoch: 0
       ramp_epochs: 32
-      max_weight: 0.05 # 0.05 가 1:1 비율임.
-      gt_excess_only: false
+      max_weight: 1.0
       sampling:
         sample_steps: 16
         sample_method: midpoint
@@ -29,13 +28,26 @@ model:
         force_fp32: true
         dt: 0.1
         pos_scale_m: 20.0
-        deadzone_ratio: 0.02
-        deadzone_softness: 0.02
-        speed_weight: 1.0
-        slip_weight: 2.0
-        accel_weight: 1.0
-        yaw_accel_weight: 1.0
-        turn_weight: 0.5
+        speed_floor_mps: 0.5
+        vehicle_v_max_mps: 35.0
+        vehicle_a_max_mps2: 8.0
+        vehicle_lat_accel_max_mps2: 4.2
+        bicycle_v_max_mps: 22.0
+        bicycle_a_max_mps2: 5.5
+        bicycle_lat_accel_max_mps2: 4.4
+        pedestrian_v_max_mps: 5.0
+        pedestrian_a_max_mps2: 4.7
+        vehicle_wheelbase_scale: 0.60
+        bicycle_wheelbase_scale: 0.85
+        vehicle_steer_max_rad: 0.55
+        bicycle_steer_max_rad: 1.00
+        vehicle_steer_rate_max_radps: 0.8
+        bicycle_steer_rate_max_radps: 1.5
+        vehicle_soft_weight: 0.25
+        bicycle_soft_weight: 0.25
+        pedestrian_soft_weight: 0.25
+        pedestrian_heading_weight: 0.05
+        pedestrian_heading_speed_threshold_mps: 0.5
         eps: 1.0e-6
 
 ckpt_path: null

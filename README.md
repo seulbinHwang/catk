@@ -478,7 +478,8 @@ torchrun \
 중요한 차이:
 
 - 이 경로는 `experiment=pre_bc_flow` + `data.train_use_eval_agent_selection=true`를 매번 길게 적지 않도록 묶어둔 preset입니다.
-- `model.model_config.draft.enabled=false` 상태라서 DRaFT physics regularizer는 전혀 쓰지 않습니다. 즉, **pure FM fine-tuning** 입니다.
+- `model.model_config.draft.enabled=false` 상태라서 DRaFT inverse feasibility regularizer는 전혀 쓰지 않습니다. 
+- 즉, **pure FM fine-tuning** 입니다.
 - 첫 시작은 반드시 `action=finetune`를 사용합니다.
 - 현재 구현은 `torch.load(ckpt)["state_dict"]`만 읽고 새 optimizer / lr scheduler / epoch / global step으로 다시 시작합니다.
 - 따라서 pretrained checkpoint에서 새 FM fine-tuning run을 시작할 때만 `action=finetune`를 쓰고,
@@ -528,7 +529,7 @@ torchrun \
 ### 5.7 6x H100에서 DRaFT fine-tuning
 
 `configs/experiment/finetune_draft_flow.yaml`을 써서
-**기존 flow checkpoint 위에 DRaFT physics regularizer를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
+**기존 flow checkpoint 위에 DRaFT inverse feasibility regularizer를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
 이 경로는 pretrain을 이어서 resume하는 용도가 아니라,
 **이미 학습된 checkpoint의 weight만 읽어서 새 fine-tuning run을 시작하는 용도**입니다.
 
@@ -571,24 +572,43 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 `finetune_draft_flow` 기본 설정은 아래와 같습니다.
 
 - learning rate: `2e-4`
-- max epochs: `16`
-- train batch size: `20`
+- max epochs: `32`
+- train batch size: `24`
 - val batch size: `16`
-- validation 주기: `4` epoch마다
-
+- validation 주기: `16` epoch마다
 
 loss와 로그는 아래처럼 보면 됩니다.
 
 - `train/loss`는 최종 학습 loss입니다.
 - `train/loss_fm`는 원래 flow matching loss입니다.
-- `train/loss_phys`는 DRaFT physics penalty입니다.
-- 실제로는 `train/loss = train/loss_fm + train/draft_weight * train/loss_phys` 형태로 합쳐집니다.
-- 기본 구현은 trainer가 `bf16-mixed`여도 DRaFT physics regularizer 계산 구간만 fp32 subregion에서 수행합니다.
-- `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
-- `train/*`에는 요약 지표만 남습니다. 세부 physics gap은 `raw_feaisble_gap/speed`, `raw_feaisble_gap/accel` 같은 prefix로 기록됩니다.
-- 실제 단위 위반량도 함께 기록됩니다. 예를 들어 gap 기준 값은 `raw_feaisble_gap/speed_excess_mps`, `raw_feaisble_gap/accel_excess_mps2`, raw 예측값은 `raw_feaisble_gap/pred_accel_excess_mps2`, GT 기준값은 `gt_feasible_gap/accel_excess_mps2`처럼 기록됩니다.
-- 첫 delta는 `accel`, `yaw_accel`에 함께 포함됩니다. `prev_control_valid`가 `False`면 첫 delta만 마스킹되고, 별도 `start` metric은 기록하지 않습니다.
-- 합성 항은 하위 물리량으로 나뉘어 기록됩니다. 예를 들어 `slip`은 `raw_feaisble_gap/slip_beta_excess_deg`, `turn`은 `raw_feaisble_gap/turn_yaw_rate_excess_degps`, `raw_feaisble_gap/turn_lat_accel_excess_mps2`, `raw_feaisble_gap/turn_radius_shortfall_m`으로 볼 수 있습니다.
+- `train/loss_phys`와 `train/loss_if`는 같은 값이고, 새 inverse feasibility penalty `L_if`를 뜻합니다.
+- 실제 학습식은 `train/loss = train/loss_fm + train/draft_weight * 0.005 * train/loss_if` 입니다.
+- `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다. 
+- 현재 설정은 `max_weight=1.0`이라서 바깥 가중치 `gamma_draft` 역할만 맡고, 실제 scale `0.005`는 코드에 고정으로 들어갑니다.
+- 기본 구현은 trainer가 `bf16-mixed`여도 inverse feasibility 계산 구간만 fp32 subregion에서 수행합니다.
+- 차량 / 자전거는 예측 20개 점을 다시 
+- `forward speed`, `curvature`, `steering angle`, `steering rate`, `forward acceleration`으로 바꿔 penalty를 계산합니다.
+- wheelbase는 agent box length에 각각 `0.60`, `0.85`를 곱해서 만듭니다.
+- 사람은 steering state를 두지 않고, 2차원 속도와 2차원 가속도만으로 hard / soft 항을 계산합니다. 
+- heading은 속도가 `0.5 m/s`보다 클 때만 약하게 봅니다.
+- 첫 제어량은 모두 `prev_control`을 사용합니다. 
+- 차량 / 자전거는 `v_pre`와 `delta_pre`를 복원해서 첫 가속도와 첫 steering rate를 만들고, 
+- 사람은 `prev_control[..., :2]`를 그대로 첫 2차원 가속도 계산에 씁니다.
+- hard 항은 속도, 가속도, steering angle, steering rate, lateral acceleration 제한을 넘는 만큼 `relu(z)^2`로 계산합니다.
+- soft 항은 jerk에 가까운 거칠기 값이고, **GT roughness보다 큰 만큼만** loss에 반영합니다. 
+- 그래서 `train/loss_phys_raw`와 `train/loss_if_raw`는 GT 비교 전의 raw prediction 기준 값입니다.
+- 최종 `L_if`는 agent 전체 평균이 아니라, **batch 안에 실제로 존재하는 class별 평균을 먼저 구한 뒤 다시 class 평균**을 내는 방식입니다. 
+- 그래서 vehicle이 많아도 pedestrian / bicycle 항이 묻히지 않습니다.
+- class별 세부 loss는 `draft_component/*`에 기록됩니다. 
+- 현재는 `vehicle_hard`, `vehicle_soft`, `vehicle_total`, `bicycle_*`, `pedestrian_hard`, `pedestrian_soft`, `pedestrian_head`, `pedestrian_total`을 봐두면 됩니다.
+- 실제 단위 평균값은 `draft_actual_pred/*`, GT 기준값은 `draft_actual_gt/*`에 기록됩니다. 
+- 현재는 `speed_excess_mps`, `accel_excess_mps2`, `steer_excess_deg`, `steer_rate_excess_degps`, `lat_accel_excess_mps2`, `heading_error_deg`를 남깁니다.
+
+현재 inverse feasibility 기본 하이퍼파라미터는 아래와 같습니다.
+
+- vehicle: `v_max=35.0`, `a_max=8.0`, `a_lat_max=4.2`, `wheelbase_scale=0.60`, `steer_max=0.55 rad`, `steer_rate_max=0.8 rad/s`, `soft_weight=0.25`
+- bicycle: `v_max=22.0`, `a_max=5.5`, `a_lat_max=4.4`, `wheelbase_scale=0.85`, `steer_max=1.00 rad`, `steer_rate_max=1.5 rad/s`, `soft_weight=0.25`
+- pedestrian: `v_max=5.0`, `a_max=4.7`, `heading_speed_threshold=0.5 m/s`, `soft_weight=0.25`, `heading_weight=0.05`
 
 자주 바꾸는 override 예시는 아래와 같습니다.
 
@@ -596,17 +616,17 @@ loss와 로그는 아래처럼 보면 됩니다.
 # fine-tuning에서도 validation/추론과 같은 agent 기준 사용
 ... data.train_use_eval_agent_selection=true
 
-# physics 가중치를 더 강하게
-... model.model_config.draft.max_weight=0.1
+# gamma_draft를 더 빨리/강하게 올리기
+... model.model_config.draft.max_weight=1.0     model.model_config.draft.ramp_epochs=2
 
-# ramp를 2 epoch 동안만 수행
-... model.model_config.draft.ramp_epochs=2
-
-# GT보다 더 나쁜 만큼만 벌주지 않고 절대 penalty 자체를 사용
-... model.model_config.draft.gt_excess_only=false
-
-# physics penalty도 mixed precision으로 그대로 계산
+# inverse feasibility도 mixed precision으로 그대로 계산
 ... model.model_config.draft.physics.force_fp32=false
+
+# 차량 steering rate 제한을 더 느슨하게
+... model.model_config.draft.physics.vehicle_steer_rate_max_radps=1.0
+
+# 사람 heading 항을 더 약하게
+... model.model_config.draft.physics.pedestrian_heading_weight=0.02
 
 # 샘플러 역전파를 마지막 2 step에만 남겨 메모리 사용량 줄이기
 ... model.model_config.draft.sampling.backprop_last_k=2
