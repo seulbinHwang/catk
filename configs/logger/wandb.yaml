@@ -10,7 +10,7 @@ wandb:
   project: clsft-catk
   log_model: False # upload lightning ckpts
   prefix: "" # a string to put at the beginning of metric keys
-  entity: YOUR_ENTITY
+  entity: se99an
   group: ""
   tags: []
   job_type: ""

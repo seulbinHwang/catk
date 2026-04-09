@@ -77,3 +77,8 @@ data:
   val_batch_size: 4
   num_workers: 4
   prefetch_factor: 1
+  # DPO: val split as training data (has tfrecords for RMM scoring)
+  # val transform required so all tracks_to_predict agents are included (for accurate RMM)
+  train_raw_dir: ${paths.cache_root}/validation
+  train_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
+  train_use_val_transform: true

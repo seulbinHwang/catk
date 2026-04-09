@@ -234,7 +234,8 @@ def call_gpu_rmm(
     pred_z: torch.Tensor,
     pred_head: torch.Tensor,
     device: torch.device,
-) -> torch.Tensor:
+    return_subscores: bool = False,
+):
     from src.smart.metrics.gpu_rmm import compute_gpu_rmm
 
     agent = data["agent"]
@@ -249,6 +250,12 @@ def call_gpu_rmm(
     map_save = data["map_save"]
     map_pos = map_save["traj_pos"].to(device, dtype=torch.float32)
 
+    # Pass road-edge token types if available (pt_token["type"])
+    map_token_type = None
+    pt_token = data.get("pt_token", None)
+    if pt_token is not None and "type" in pt_token:
+        map_token_type = pt_token["type"].to(device)
+
     return compute_gpu_rmm(
         pred_traj=pred_traj,
         pred_z=pred_z,
@@ -261,6 +268,8 @@ def call_gpu_rmm(
         eval_mask=eval_mask,
         map_token_pos=map_pos,
         dt=0.1,
+        map_token_type=map_token_type,
+        return_subscores=return_subscores,
     )
 
 
@@ -274,6 +283,7 @@ def main() -> None:
     parser.add_argument("--noise", type=float, default=2.0, help="Gaussian noise std (m)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-official", action="store_true", help="GPU-only; no correlation vs official")
+    parser.add_argument("--subscores", action="store_true", help="Print GPU sub-scores per scenario")
     parser.add_argument(
         "--refresh-official-cache",
         action="store_true",
@@ -339,10 +349,18 @@ def main() -> None:
 
         t0 = time.time()
         with torch.no_grad():
-            gpu_scores = call_gpu_rmm(data, pred_traj, pred_z, pred_head, device)
+            if args.subscores:
+                gpu_scores, gpu_sub = call_gpu_rmm(data, pred_traj, pred_z, pred_head, device, return_subscores=True)
+            else:
+                gpu_scores = call_gpu_rmm(data, pred_traj, pred_z, pred_head, device)
+                gpu_sub = None
         total_gpu_time += time.time() - t0
         gpu_scores_np = gpu_scores.cpu().numpy()
         print(f"GPU={gpu_scores_np}", end=" ", flush=True)
+        if args.subscores and gpu_sub is not None:
+            print()
+            for k, v in gpu_sub.items():
+                print(f"  {k:35s}: {v.cpu().numpy().mean():.4f}")
 
         if args.no_official:
             official_scores = np.full(G, float("nan"), dtype=np.float32)

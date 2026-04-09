@@ -757,23 +757,59 @@ def _point_to_segment_distance_2d(
     return torch.norm(pts - closest, dim=-1)    # [...]
 
 
+def _box_corners_2d(
+    xy: Tensor,          # [..., 2]  center positions
+    heading: Tensor,     # [...]     headings in radians
+    half_length: Tensor, # [...]     half-length
+    half_width: Tensor,  # [...]     half-width
+) -> Tensor:
+    """Compute 4 corner positions of axis-aligned boxes rotated by heading.
+
+    Returns:
+        corners: [..., 4, 2]
+    """
+    cos_h = heading.cos()   # [...]
+    sin_h = heading.sin()
+
+    # Local corners: (±hl, ±hw) in box frame
+    # Order: (+l,+w), (+l,-w), (-l,-w), (-l,+w)
+    lx = torch.stack([half_length, half_length, -half_length, -half_length], dim=-1)   # [..., 4]
+    ly = torch.stack([half_width, -half_width, -half_width, half_width], dim=-1)
+
+    # Rotate to world frame
+    wx = xy[..., 0:1] + lx * cos_h.unsqueeze(-1) - ly * sin_h.unsqueeze(-1)   # [..., 4]
+    wy = xy[..., 1:2] + lx * sin_h.unsqueeze(-1) + ly * cos_h.unsqueeze(-1)
+    return torch.stack([wx, wy], dim=-1)   # [..., 4, 2]
+
+
 def _compute_distance_to_road_edge(
     sim_xy: Tensor,        # [n_agents, G, T, 2]
     map_token_pos: Tensor, # [n_map, 3, 2]  (start, mid, end per token)
     valid: Tensor,         # [n_agents, T] bool
     eval_mask: Tensor,     # [n_agents] bool
+    map_token_type: Optional[Tensor] = None,  # [n_map] uint8, type per token
+    agent_shape: Optional[Tensor] = None,     # [n_agents, 3] for box corners
+    sim_head: Optional[Tensor] = None,        # [n_agents, G, T] for box corners
+    gt_ref_xy: Optional[Tensor] = None,       # [n_ref, 2] known on-road positions for orientation
 ) -> Tuple[Tensor, Tensor]:
-    """Approximate distance to road edge from lane token positions.
+    """Compute signed distance to road edge.
 
-    Approximation (same sign as Waymo ``map_metric_features``):
-        signed_distance ≈ dist_to_lane_reference − lane_half_width
-        Negative ⇒ inside / on drivable; **positive ⇒ off-road**.
+    When map_token_type is provided, uses actual road edge tokens (type 6, 7)
+    with proper sign determination using lane center tokens (type 1, 3, 4).
+    Computes over 4 box corners and takes max (most off-road corner).
+
+    Otherwise falls back to approximate lane-center-based distance.
+
+    Sign convention: positive = off-road (outside road edge).
 
     Args:
-        sim_xy:        positions, shape [n_agents, G, T, 2].
-        map_token_pos: map token positions, shape [n_map, 3, 2].
-        valid:         GT validity, shape [n_agents, T].
-        eval_mask:     which agents to compute metric for, shape [n_agents].
+        sim_xy:         positions, shape [n_agents, G, T, 2].
+        map_token_pos:  map token positions, shape [n_map, 3, 2].
+        valid:          GT validity, shape [n_agents, T].
+        eval_mask:      which agents to compute metric for, shape [n_agents].
+        map_token_type: optional token type per map token, shape [n_map].
+        agent_shape:    optional (length, width, height), shape [n_agents, 3].
+        sim_head:       optional headings, shape [n_agents, G, T].
 
     Returns:
         dist_to_road_edge: [n_eval, G, T]
@@ -799,8 +835,31 @@ def _compute_distance_to_road_edge(
         )
         return dist, dist > 0
 
-    n_map = map_token_pos.shape[0]
     map_token_pos = map_token_pos.to(device=device, dtype=dtype)
+
+    # Try road-edge aware computation if token types are provided
+    if map_token_type is not None:
+        map_token_type = map_token_type.to(device=device)
+        # Lane center token types: 1=FREEWAY, 3=SURFACE_STREET, 4=BIKE_LANE
+        lc_mask = (map_token_type == 1) | (map_token_type == 3) | (map_token_type == 4)
+        lc_tokens = map_token_pos[lc_mask]   # [n_lc, 3, 2]
+
+        # Use ONLY type-6 BOUNDARY (not type-7 MEDIAN) for signed distance.
+        # MEDIAN segments have road surface on BOTH sides → orientation is
+        # ambiguous.  Including them causes spurious off-road detections.
+        re6_mask = (map_token_type == 6)
+        re6_tokens = map_token_pos[re6_mask]   # [n_re6, 3, 2]
+
+        if re6_tokens.shape[0] > 0:
+            # Use road-edge signed distance with proper sign determination
+            return _compute_signed_road_edge_distance(
+                sim_xy, valid, eval_mask, eval_idx, re6_tokens, lc_tokens,
+                agent_shape, sim_head, device, dtype, n_eval, G, T,
+                gt_ref_xy=gt_ref_xy,
+            )
+
+    # Fallback: approximate using all lane centerlines with fixed half-width offset
+    n_map = map_token_pos.shape[0]
 
     # Use start-mid and mid-end segments (2 segments per token)
     seg_a = torch.cat([map_token_pos[:, 0], map_token_pos[:, 1]], dim=0)   # [2*n_map, 2]
@@ -842,6 +901,163 @@ def _compute_distance_to_road_edge(
     return dist_to_edge, offroad
 
 
+def _compute_signed_road_edge_distance(
+    sim_xy: Tensor,       # [n_agents, G, T, 2]
+    valid: Tensor,        # [n_agents, T] bool
+    eval_mask: Tensor,    # [n_agents] bool
+    eval_idx: Tensor,     # [n_eval] indices
+    re_tokens: Tensor,    # [n_re, 3, 2]  road edge tokens (start, mid, end)
+    lc_tokens: Tensor,    # [n_lc, 3, 2]  lane center tokens
+    agent_shape: Optional[Tensor],  # [n_agents, 3] or None
+    sim_head: Optional[Tensor],     # [n_agents, G, T] or None
+    device: torch.device,
+    dtype: torch.dtype,
+    n_eval: int,
+    G: int,
+    T: int,
+    gt_ref_xy: Optional[Tensor] = None,  # [n_ref, 2] known on-road positions
+) -> Tuple[Tensor, Tensor]:
+    """Signed road-edge distance using GT-corrected left-normal orientation.
+
+    Road edge tokens in the PKL have INCONSISTENT orientation (some have road
+    surface on left, others on right).  We correct this by reorienting each
+    segment so its left-normal points toward the nearest KNOWN ON-ROAD position
+    (GT trajectory points) — GT agents are always on-road by definition.
+
+    If no GT reference positions are provided, fall back to nearest lane-center
+    midpoint for orientation (less reliable).
+
+    Signed distance convention:
+        negative → on-road (left side of corrected segment)
+        positive → off-road (right side of corrected segment)
+
+    Box corners are used so that the full vehicle extent is checked.
+    """
+    eval_xy = sim_xy[eval_idx]   # [n_eval, G, T, 2]
+
+    # ── Fix road-edge segment orientation ────────────────────────────────────
+    # Token direction: end − start
+    re_dir  = re_tokens[:, 2] - re_tokens[:, 0]                           # [n_re, 2]
+    # Left normal: n = (−dy, dx)
+    re_n_left = torch.stack([-re_dir[:, 1], re_dir[:, 0]], dim=-1)        # [n_re, 2]
+    # Token midpoint (used as the reference point for orientation check)
+    re_tmid = re_tokens[:, 1]                                              # [n_re, 2]
+
+    if gt_ref_xy is not None and gt_ref_xy.shape[0] > 0:
+        # Use known on-road GT positions for orientation.
+        # For each road edge token, find the nearest GT position.
+        # Road surface is toward that GT position → its side should be LEFT (dot > 0).
+        ref_pts = gt_ref_xy.to(device=device, dtype=dtype)                # [n_ref, 2]
+        dist_re_ref = torch.cdist(re_tmid, ref_pts)                       # [n_re, n_ref]
+        nn_ref  = dist_re_ref.argmin(-1)                                   # [n_re]
+        v_to_ref = ref_pts[nn_ref] - re_tmid                              # [n_re, 2]
+        dot_ref  = (v_to_ref * re_n_left).sum(-1)                         # [n_re]: +ve → on-road on left
+        flip     = dot_ref < 0
+    elif lc_tokens.shape[0] > 0:
+        # Fallback: nearest lane-center midpoint (less reliable at intersections)
+        lc_mid  = lc_tokens[:, 1]                                          # [n_lc, 2]
+        dist_re_lc = torch.cdist(re_tmid, lc_mid)                         # [n_re, n_lc]
+        nn_lc   = dist_re_lc.argmin(-1)                                    # [n_re]
+        v_to_lc = lc_mid[nn_lc] - re_tmid                                 # [n_re, 2]
+        dot_lc  = (v_to_lc * re_n_left).sum(-1)                           # [n_re]
+        flip    = dot_lc < 0
+    else:
+        flip = torch.zeros(re_tokens.shape[0], dtype=torch.bool, device=device)
+
+    # Apply flip: reversed token = [end, mid, start]
+    re_tokens_c = re_tokens.clone()
+    if flip.any():
+        re_tokens_c[flip] = re_tokens[flip][:, [2, 1, 0], :]
+
+    # Build segments from corrected tokens
+    re_seg_a = torch.cat([re_tokens_c[:, 0], re_tokens_c[:, 1]], dim=0)  # [2*n_re, 2]
+    re_seg_b = torch.cat([re_tokens_c[:, 1], re_tokens_c[:, 2]], dim=0)
+    re_ab    = re_seg_b - re_seg_a                                         # [2*n_re, 2]
+    re_ab2   = (re_ab ** 2).sum(-1).clamp(min=1e-8)
+    # Left normals for corrected segments
+    re_n = torch.stack([-re_ab[:, 1], re_ab[:, 0]], dim=-1)              # [2*n_re, 2]
+
+    # ── Determine query points ──────────────────────────────────────────────
+    use_corners = (
+        agent_shape is not None
+        and sim_head is not None
+        and agent_shape.shape[0] > 0
+    )
+    if use_corners:
+        eval_head   = sim_head[eval_idx]
+        half_length = agent_shape[eval_idx, 0] / 2.0
+        half_width  = agent_shape[eval_idx, 1] / 2.0
+        hl = half_length.view(n_eval, 1, 1).expand(n_eval, G, T)
+        hw = half_width.view(n_eval, 1, 1).expand(n_eval, G, T)
+        corners  = _box_corners_2d(eval_xy, eval_head, hl, hw)   # [n_eval, G, T, 4, 2]
+        flat_pts = corners.reshape(-1, 2)                          # [n_eval*G*T*4, 2]
+        n_pts_per_step = 4
+    else:
+        flat_pts = eval_xy.reshape(-1, 2)   # [n_eval*G*T, 2]
+        n_pts_per_step = 1
+
+    N = flat_pts.shape[0]
+    chunk_size = 512
+
+    # ── Signed distance: find nearest corrected road-edge segment ──────────
+    best_d   = torch.full((N,), float("inf"), device=device, dtype=dtype)
+    best_sgn = torch.full((N,), -1.0,          device=device, dtype=dtype)
+
+    n_seg = re_seg_a.shape[0]
+    for s_ in range(0, n_seg, chunk_size):
+        e_    = min(s_ + chunk_size, n_seg)
+        sa_   = re_seg_a[s_:e_]
+        ab_   = re_ab[s_:e_]
+        ab2_  = re_ab2[s_:e_]
+        n_    = re_n[s_:e_]
+
+        ap    = flat_pts.unsqueeze(1) - sa_.unsqueeze(0)                    # [N, c, 2]
+        t     = (ap * ab_.unsqueeze(0)).sum(-1) / ab2_                      # [N, c]
+        clo   = sa_.unsqueeze(0) + t.clamp(0.0, 1.0).unsqueeze(-1) * ab_.unsqueeze(0)
+        d     = (flat_pts.unsqueeze(1) - clo).norm(dim=-1)                  # [N, c]
+        dot_n = (ap * n_.unsqueeze(0)).sum(-1)                              # [N, c]: +ve=on-road
+
+        d_min, idx = d.min(-1)   # [N]
+        better = d_min < best_d
+        best_d[better] = d_min[better]
+
+        # sign: on-road (dot>0) → −1 (on-road), off-road (dot<0) → +1
+        dot_best = dot_n[torch.arange(N, device=device), idx]               # [N]
+        sgn_new  = torch.where(dot_best >= 0,
+                               torch.full((N,), -1.0, device=device, dtype=dtype),
+                               torch.full((N,), +1.0, device=device, dtype=dtype))
+        best_sgn[better] = sgn_new[better]
+
+    signed_flat = best_d * best_sgn   # [N]: negative=on-road, positive=off-road
+
+    # ── Reshape back ────────────────────────────────────────────────────────
+    if use_corners:
+        signed_corners = signed_flat.reshape(n_eval, G, T, 4)
+        dist_to_edge   = signed_corners.max(-1).values   # [n_eval, G, T]
+    else:
+        dist_to_edge = signed_flat.reshape(n_eval, G, T)
+
+    # Mask invalid steps — treat as inside road (negative signed distance)
+    eval_valid = valid[eval_idx]
+    dist_to_edge = dist_to_edge.masked_fill(
+        ~eval_valid.unsqueeze(1).expand(n_eval, G, T),
+        -1.0,
+    )
+
+    offroad = dist_to_edge > 0.0
+    # DEBUG: print summary of signed distances
+    import os
+    if os.environ.get("GPU_RMM_DEBUG"):
+        fut = dist_to_edge[:, :, 11:]   # future portion
+        n_off = (fut > 0).sum().item()
+        n_tot = fut.numel()
+        print(f"  [DBG] n_re={re_tokens.shape[0]} n_flip={flip.sum().item() if isinstance(flip, torch.Tensor) else 0} "
+              f"n_gt_ref={gt_ref_xy.shape[0] if gt_ref_xy is not None else 0} "
+              f"fut_offroad={n_off}/{n_tot} corners={use_corners}")
+        print(f"  [DBG] signed_flat min={signed_flat.min().item():.3f} max={signed_flat.max().item():.3f} mean={signed_flat.mean().item():.3f}")
+    return dist_to_edge, offroad
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -859,6 +1075,7 @@ def compute_gpu_rmm(
     map_token_pos: Tensor,   # [n_map, 3, 2]  (3 pts per token, from map_save.traj_pos)
     dt: float = 0.1,
     *,
+    map_token_type: Optional[Tensor] = None,  # [n_map] uint8, type per token
     rmm_config: Optional[RMMConfig] = None,
     return_subscores: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Dict[str, Tensor]]]:
@@ -979,14 +1196,22 @@ def compute_gpu_rmm(
     else:
         gt_dist_ref = torch.zeros(0, T - t_met, device=device, dtype=dtype)
 
+    # GT validity for future window (plain agent valid, not speed_valid)
+    valid_fut = (
+        gt_val[eval_idx][:, t_met:]
+        if n_eval > 0
+        else torch.zeros(0, T_met, dtype=torch.bool, device=device)
+    )  # [n_eval, T_met] — used for Bernoulli validity masking
+
     h_min, h_max, n_bins, smooth = cfg.hist["distance_to_nearest_object"]
     if n_eval == 0:
         dno_scores = torch.ones(G, device=device, dtype=dtype)
     else:
+        # Fix: use plain GT valid (not speed_valid) for distance_to_nearest scoring
         dno_scores = _histogram_likelihood_scores_per_rollout(
             dist_to_obj[:, :, t_met:].clamp(-100.0, 200.0),
             gt_dist_ref,
-            eval_valid_fut,
+            valid_fut,
             h_min,
             h_max,
             n_bins,
@@ -994,9 +1219,10 @@ def compute_gpu_rmm(
         )
 
     if n_eval > 0:
-        col_any_sim = collision_step[:, :, t_met:].any(dim=-1).float()
-        gt_col_any = (gt_dist_nearest[:, 0, t_met:] < 0).any(dim=-1).float()
-        agent_valid = eval_valid_fut.any(dim=-1)
+        # Fix: apply GT validity mask when computing any-collision
+        col_any_sim = (collision_step[:, :, t_met:] & valid_fut.unsqueeze(1)).any(dim=-1).float()
+        gt_col_any = ((gt_dist_nearest[:, 0, t_met:] < 0) & valid_fut).any(dim=-1).float()
+        agent_valid = valid_fut.any(dim=-1)
         col_ind_scores = _bernoulli_likelihood_scores_per_rollout(
             col_any_sim,
             gt_col_any,
@@ -1030,8 +1256,9 @@ def compute_gpu_rmm(
             dtype=dtype,
         )
     )
-    veh_eval = agent_type[eval_idx].unsqueeze(-1) == 0
-    ttc_valid_fut = eval_valid_fut & veh_eval
+    # Fix: TTC validity = plain GT valid AND is_vehicle (only vehicles)
+    is_vehicle = (agent_type[eval_idx] == 0).unsqueeze(-1)   # [n_eval, 1]
+    ttc_valid_fut = valid_fut & is_vehicle   # [n_eval, T_met]
 
     h_min, h_max, n_bins, smooth = cfg.hist["time_to_collision"]
     if n_eval == 0:
@@ -1050,13 +1277,29 @@ def compute_gpu_rmm(
     # -----------------------------------------------------------------------
     # 7. Distance to road edge and offroad
     # -----------------------------------------------------------------------
+    # GT positions for road-edge orientation: eval agents across all timesteps.
+    # GT agents are always on-road, so their positions reliably determine which
+    # side of each road-edge segment is the road surface.
+    gt_ref_xy = (
+        gt_xy[eval_idx].reshape(-1, 2)        # [n_eval*T, 2]
+        if n_eval > 0 else None
+    )
+
     dist_edge, offroad_step = _compute_distance_to_road_edge(
-        sim_xy, map_token_pos, gt_val, eval_mask
+        sim_xy, map_token_pos, gt_val, eval_mask,
+        map_token_type=map_token_type,
+        agent_shape=agent_shape,
+        sim_head=sim_head,
+        gt_ref_xy=gt_ref_xy,
     )   # [n_eval, G, T], [n_eval, G, T]
 
     gt_dist_edge, _ = _compute_distance_to_road_edge(
         gt_xy.unsqueeze(1).expand(-1, 1, -1, -1),
-        map_token_pos, gt_val, eval_mask
+        map_token_pos, gt_val, eval_mask,
+        map_token_type=map_token_type,
+        agent_shape=agent_shape,
+        sim_head=gt_h.unsqueeze(1).expand(-1, 1, -1),
+        gt_ref_xy=gt_ref_xy,
     ) if n_eval > 0 else (
         torch.zeros(0, 1, T, device=device, dtype=dtype), None
     )
@@ -1069,15 +1312,16 @@ def compute_gpu_rmm(
         edge_scores = _histogram_likelihood_scores_per_rollout(
             dist_edge[:, :, t_met:].clamp(-100.0, 200.0),
             gt_dist_edge[:, 0, t_met:].clamp(-100.0, 200.0),
-            eval_valid_fut,
+            valid_fut,
             h_min,
             h_max,
             n_bins,
             smooth,
         )
-        offroad_flag_sim = offroad_step[:, :, t_met:].any(dim=-1).float()
-        gt_offroad = (gt_dist_edge[:, 0, t_met:] > 0).any(dim=-1).float()
-        agent_valid_or = eval_valid_fut.any(dim=-1)
+        # Fix: apply GT validity mask when computing any-offroad
+        offroad_flag_sim = (offroad_step[:, :, t_met:] & valid_fut.unsqueeze(1)).any(dim=-1).float()
+        gt_offroad = ((gt_dist_edge[:, 0, t_met:] > 0) & valid_fut).any(dim=-1).float()
+        agent_valid_or = valid_fut.any(dim=-1)
         offroad_scores = _bernoulli_likelihood_scores_per_rollout(
             offroad_flag_sim,
             gt_offroad,

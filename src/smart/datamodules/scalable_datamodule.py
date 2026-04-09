@@ -38,6 +38,8 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        train_tfrecords_splitted: Optional[str] = None,
+        train_use_val_transform: bool = False,
     ) -> None:
         super(MultiDataModule, self).__init__()
         self.train_batch_size = train_batch_size
@@ -52,14 +54,19 @@ class MultiDataModule(LightningDataModule):
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
+        self.train_tfrecords_splitted = train_tfrecords_splitted
 
-        self.train_transform = WaymoTargetBuilderTrain(train_max_num)
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
+        self.train_transform = self.val_transform if train_use_val_transform else WaymoTargetBuilderTrain(train_max_num)
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:
-            self.train_dataset = MultiDataset(self.train_raw_dir, self.train_transform)
+            self.train_dataset = MultiDataset(
+                self.train_raw_dir,
+                self.train_transform,
+                tfrecord_dir=self.train_tfrecords_splitted,
+            )
             self.val_dataset = MultiDataset(
                 self.val_raw_dir,
                 self.val_transform,

@@ -12,6 +12,7 @@ import torch.nn as nn
 from lightning import LightningModule
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
+import torch.nn.functional as F
 
 from src.smart.metrics import SimAgentsMetrics, SimAgentsSubmission, minADE
 from src.smart.metrics.flow_metrics import (

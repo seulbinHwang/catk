@@ -47,6 +47,8 @@ model:
       rollout_noise_scale: 1.0
       # ── EPG ───────────────────────────────────────────────────────────────
       epg_n_rollouts: 4          # G: rollouts per scenario (more → better advantage signal)
+      # G==1 전용: RMM에서 뺄 스칼라 baseline (null이면 mean(R); rollout 1개면 advantage≈0)
+      epg_single_rollout_baseline: 0.7
       epg_beta: 0.1              # KL regularisation weight β
       epg_n_samples: 8           # MC samples for ELBO log-prob
       epg_use_ref_model: true    # frozen pretrained reference (prevents collapse)
@@ -72,6 +74,12 @@ callbacks:
     monitor: val_kinematic/kin_ADE2s
     mode: min
     save_top_k: -1
+  epg_rmm_probe:
+    _target_: src.smart.callbacks.epg_rmm_probe.EPGRMMProbeCallback
+    every_n_train_steps: 5
+    n_probe_scenarios: 4
+    rollout_idx: 0
+    prefix: probe
 
 data:
   train_batch_size: 8

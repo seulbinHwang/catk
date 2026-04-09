@@ -29,7 +29,7 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
 # 이 프로세스에서 보이는 GPU 번호 (물리 GPU와 매핑). 단일 GPU면 "0" 등
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
 # -----------------------------------------------------------------------------
 # 실험 식별 / Conda
@@ -62,7 +62,7 @@ CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_l
 # Trainer / DataLoader (Lightning Trainer & Hydra data.*)
 # -----------------------------------------------------------------------------
 # DDP: 프로세스당 1 GPU 권장 → 보통 GPU 개수와 동일
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 # 한 epoch당 학습 step 상한 비율. 1.0 = 전체, 0.05 = 5%만 (스모크 테스트용)
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
 # 검증: epoch 대비 비율(소수) 또는 step 수. 0.01 = val 데이터의 1% 배치만
@@ -72,6 +72,8 @@ MAX_EPOCHS="${MAX_EPOCHS:-10}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-500}"
 # 매 N epoch마다만 val 하려면 숫자. 매 step val 느낌이면 null + VAL_CHECK_INTERVAL 사용
 CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-null}"
+# train metric 로그 주기 (1이면 매 step 로깅)
+LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 # Lightning precision: 32-true, bf16-mixed 등
 PRECISION="${PRECISION:-32-true}"
 # 그래디언트 클리핑 (0이면 비활성화인지는 Lightning 설정 따름; 여기선 1.0)
@@ -96,7 +98,8 @@ PIN_MEMORY="${PIN_MEMORY:-true}"
 # -----------------------------------------------------------------------------
 # 옵티마이저 / 스케줄 (model.model_config.* → SMARTFlow)
 # -----------------------------------------------------------------------------
-LR="${LR:-5e-5}"
+LR="${LR:-1e-4}"
+# LR="${LR:-5e-5}"
 # Step scheduler: 초기 linear warmup step 수
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-200}"
 # Cosine 등 전체 step (-1이면 trainer/모델이 다른 방식으로 결정)
@@ -121,7 +124,7 @@ DELETE_LOCAL_VIDEOS_AFTER_UPLOAD="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD:-false}"
 # -----------------------------------------------------------------------------
 # epg_n_rollouts (G): 시나리오당 같은 초기 상태에서 몇 개 rollout을 뽑을지.
 #   많을수록 RMM ranking 신호는 좋아질 수 있으나 메모리·시간·RMM 서브프로세스 비용 증가
-EPG_N_ROLLOUTS="${EPG_N_ROLLOUTS:-4}"
+EPG_N_ROLLOUTS="${EPG_N_ROLLOUTS:-1}"
 # epg_beta: KL(π_θ || π_ref) 가중치. 클수록 참조 모델에 가깝게
 EPG_BETA="${EPG_BETA:-0.1}"
 # epg_n_samples: ELBO/log p 근사용 MC 샘플 수 K (shared_t/shared_x0 공유)
@@ -131,9 +134,11 @@ EPG_USE_REF_MODEL="${EPG_USE_REF_MODEL:-true}"
 # >0 이면 GT flow-matching BC 보조 손실
 EPG_BC_LAMBDA="${EPG_BC_LAMBDA:-0.0}"
 # K gradient steps per RMM evaluation (PPO-style reuse; >1 → automatic_optimization=False)
-EPG_PPO_EPOCHS="${EPG_PPO_EPOCHS:-1}"
+EPG_PPO_EPOCHS="${EPG_PPO_EPOCHS:-4}"
 # true면 residual_velocity_head만 학습 (trunk 동결, zero-initialized)
-EPG_HEAD_ONLY="${EPG_HEAD_ONLY:-false}"
+EPG_HEAD_ONLY="${EPG_HEAD_ONLY:-true}"
+
+EPG_SINGLE_ROLLOUT_BASELINE="${EPG_SINGLE_ROLLOUT_BASELINE:-0.7}"
 
 # -----------------------------------------------------------------------------
 # W&B
@@ -171,13 +176,27 @@ echo "CACHE_ROOT=${CACHE_ROOT}"
 echo "CKPT_PATH=${CKPT_PATH}"
 echo "TRAIN_B=${TRAIN_B} VAL_B=${VAL_B} NUM_WORKERS=${NUM_WORKERS}"
 echo "LIMIT_TRAIN_BATCHES=${LIMIT_TRAIN_BATCHES} LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} MAX_EPOCHS=${MAX_EPOCHS}"
+echo "LOG_EVERY_N_STEPS=${LOG_EVERY_N_STEPS}"
 echo "EPG_N_ROLLOUTS=${EPG_N_ROLLOUTS} EPG_BETA=${EPG_BETA} EPG_N_SAMPLES=${EPG_N_SAMPLES}"
+echo "EPG_SINGLE_ROLLOUT_BASELINE=${EPG_SINGLE_ROLLOUT_BASELINE}"
 echo "EPG_USE_REF_MODEL=${EPG_USE_REF_MODEL} EPG_BC_LAMBDA=${EPG_BC_LAMBDA} EPG_PPO_EPOCHS=${EPG_PPO_EPOCHS} EPG_HEAD_ONLY=${EPG_HEAD_ONLY}"
 echo "N_VIS_BATCH=${N_VIS_BATCH} N_VIS_SCENARIO=${N_VIS_SCENARIO} N_VIS_ROLLOUT=${N_VIS_ROLLOUT}"
 echo "WANDB_MODE=${WANDB_MODE} WANDB_ENTITY=${WANDB_ENTITY}"
 
+
 PORT="$(get_free_port)"
 echo "==== Start training (flow_epg_ft): train_batch_size=${TRAIN_B}, val_batch_size=${VAL_B} ===="
+
+# Lightning 제약:
+# manual optimization(예: EPG_PPO_EPOCHS>1)에서는 Trainer.gradient_clip_val 사용 불가
+GRAD_CLIP_ARG=""
+if [ "${EPG_PPO_EPOCHS}" -le 1 ]; then
+  GRAD_CLIP_ARG="trainer.gradient_clip_val=${GRAD_CLIP_VAL}"
+else
+  # experiment 기본값(예: flow_epg_ft.yaml의 1.0)을 명시적으로 무효화해야 함
+  GRAD_CLIP_ARG="trainer.gradient_clip_val=null"
+  echo "[INFO] EPG_PPO_EPOCHS=${EPG_PPO_EPOCHS} -> manual optimization mode, set trainer.gradient_clip_val=null"
+fi
 
 # torchrun: 각 rank가 python -m src.run … 동일 인자 수신
 # --master_port / rdzv_endpoint: 단일 노드 DDP용 rendezvous
@@ -199,8 +218,9 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   trainer.max_epochs="${MAX_EPOCHS}" \
   trainer.val_check_interval="${VAL_CHECK_INTERVAL}" \
   trainer.check_val_every_n_epoch="${CHECK_VAL_EVERY_N_EPOCH}" \
+  trainer.log_every_n_steps="${LOG_EVERY_N_STEPS}" \
   trainer.precision="${PRECISION}" \
-  trainer.gradient_clip_val="${GRAD_CLIP_VAL}" \
+  ${GRAD_CLIP_ARG} \
   logger.wandb.entity="${WANDB_ENTITY}" \
   model.model_config.lr="${LR}" \
   model.model_config.lr_warmup_steps="${LR_WARMUP_STEPS}" \
@@ -220,4 +240,5 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.epg_bc_lambda="${EPG_BC_LAMBDA}" \
   model.model_config.finetune.epg_ppo_epochs="${EPG_PPO_EPOCHS}" \
   model.model_config.finetune.epg_head_only="${EPG_HEAD_ONLY}" \
+  model.model_config.finetune.epg_single_rollout_baseline="${EPG_SINGLE_ROLLOUT_BASELINE}" \
   ${EXTRA_ARGS}
