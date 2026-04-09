@@ -34,10 +34,8 @@ class DynamicsAwareFeasibleCommitBridge:
             즉 2초입니다.
         commit_steps: 실제로 실행해 context에 반영할 길이입니다. 기본값은
             ``5`` step, 즉 0.5초입니다.
-        speed_smoothing_alpha: 기준 속도 시퀀스를 한 번 부드럽게 만들 때 쓰는
-            계수입니다.
-        yaw_rate_smoothing_alpha: 기준 yaw-rate 시퀀스를 한 번 부드럽게 만들 때
-            쓰는 계수입니다.
+        smoothing_alpha: 기준 속도 시퀀스와 yaw-rate 시퀀스를 한 번 부드럽게
+            만들 때 공통으로 쓰는 계수입니다.
         q_terminal_speed: 종방향 종단 속도 오차 가중치입니다.
         r_accel: 종방향 가속도 크기 가중치입니다.
         q_terminal_lateral: 횡방향 종단 위치 오차 가중치입니다.
@@ -67,8 +65,7 @@ class DynamicsAwareFeasibleCommitBridge:
         pos_scale_m: float = 20.0,
         preview_steps: int = 10,
         commit_steps: int = 5,
-        speed_smoothing_alpha: float = 0.65,
-        yaw_rate_smoothing_alpha: float = 0.65,
+        smoothing_alpha: float = 0.65,
         q_terminal_speed: float = 10.0,
         r_accel: float = 1.0,
         q_terminal_lateral: float = 1.0,
@@ -95,8 +92,7 @@ class DynamicsAwareFeasibleCommitBridge:
         self.pos_scale_m = float(pos_scale_m)
         self.preview_steps = int(preview_steps)
         self.commit_steps = int(commit_steps)
-        self.speed_smoothing_alpha = float(speed_smoothing_alpha)
-        self.yaw_rate_smoothing_alpha = float(yaw_rate_smoothing_alpha)
+        self.smoothing_alpha = float(smoothing_alpha)
         self.q_terminal_speed = float(q_terminal_speed)
         self.r_accel = float(r_accel)
         self.q_terminal_lateral = float(q_terminal_lateral)
@@ -387,8 +383,8 @@ class DynamicsAwareFeasibleCommitBridge:
         ref_speed = (delta_pos[..., 0] * cos_head + delta_pos[..., 1] * sin_head) / self.dt
         ref_yaw_rate = delta_head / self.dt
 
-        ref_speed = self._smooth_sequence(ref_speed, alpha=self.speed_smoothing_alpha)
-        ref_yaw_rate = self._smooth_sequence(ref_yaw_rate, alpha=self.yaw_rate_smoothing_alpha)
+        ref_speed = self._smooth_sequence(ref_speed, alpha=self.smoothing_alpha)
+        ref_yaw_rate = self._smooth_sequence(ref_yaw_rate, alpha=self.smoothing_alpha)
         return ref_speed, ref_yaw_rate
 
     def _build_commit_window_motion(
