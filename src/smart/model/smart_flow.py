@@ -591,7 +591,7 @@ class SMARTFlow(LightningModule):
             for layer_idx, layer_value in feat_a_t_dict.items()
         }
 
-        return {
+        expanded_cache = {
             "n_agent": int(rollout_cache["n_agent"]) * repeat_count,
             "n_step_future_10hz": int(rollout_cache["n_step_future_10hz"]),
             "n_step_future_2hz": int(rollout_cache["n_step_future_2hz"]),
@@ -623,6 +623,18 @@ class SMARTFlow(LightningModule):
             ),
             "feat_a_t_dict": expanded_feat_a_t_dict,
         }
+        for key in [
+            "exec_pos_pair_10hz",
+            "exec_head_pair_10hz",
+            "exec_valid_pair_10hz",
+            "stationary_hold_state",
+        ]:
+            if key in rollout_cache:
+                expanded_cache[key] = self._repeat_tensor_on_first_dim(
+                    rollout_cache[key],
+                    repeat_count,
+                )
+        return expanded_cache
 
     def _reshape_parallel_rollout_prediction(
         self,
