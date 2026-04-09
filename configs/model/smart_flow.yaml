@@ -76,6 +76,7 @@ model_config:
     flow_solver_eps: 1.0e-3
     closed_loop_rollout_mode: raw_fm # raw_fm
     use_dynamics_feasible_commit_bridge: false
+    use_stationary_refinement_in_dynamics_bridge: false
   sim_agents_submission:
     is_active: false
     method_name: "SMART-flow-7M"

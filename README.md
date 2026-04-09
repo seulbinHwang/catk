@@ -20,17 +20,19 @@
 - `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true`를 켜면 vehicle / bicycle에만
   dynamics-aware feasible commit bridge를 적용합니다. 이 모드에서는 2초 FM 미래를 preview로 보되,
   실제 반영은 항상 다음 0.5초 / 5점만 실행합니다.
+- `model.model_config.decoder.use_stationary_refinement_in_dynamics_bridge=true`를 함께 켜면
+  `eab8dd38`에서 추가된 stationary hold, commit-window intent 기반 저속 보정,
+  propagation 물리 제한 강화까지 같이 적용합니다. 기본값 `false`면 이 추가 로직은 꺼집니다.
 - 이 bridge는 최근 실제 10Hz 두 점으로 현재 speed / yaw-rate를 잡고, `draft_physics.py`의
   차종별 속도, 가감속, yaw-rate, yaw-accel, 횡가속, 최소 선회 반경 제한을 같이 씁니다.
-- bridge는 제어로 바꾸기 전에 **현재 executed 상태 + 다음 0.5초 preview 5점만** 보고
-  stationary-equilibrium gate를 먼저 검사합니다. 현재가 거의 정지이고 preview도 작은
-  위치/heading tube 안에 머물면, 이번 0.5초 chunk는 정확한 hold로 commit합니다.
-- 저속에서 forward / reverse 방향은 2초 평균 signed speed로 정하지 않습니다. 대신 현재
-  0.5초 commit window의 누적 종방향 변위가 dead-zone을 넘을 때만 방향성을 인정하므로,
-  정지 근처의 작은 signed wobble이 곧바로 backward drift로 해석되지 않습니다.
+- `use_stationary_refinement_in_dynamics_bridge=true`일 때만 bridge는 제어로 바꾸기 전에
+  **현재 executed 상태 + 다음 0.5초 preview 5점만** 보고 stationary hold를 먼저 검사합니다.
+- `use_stationary_refinement_in_dynamics_bridge=true`일 때만 저속에서 현재 0.5초 commit window의
+  누적 종방향 변위를 써서 방향성을 보정합니다.
 - wheelbase가 없는 WOMD multi-agent 특성을 고려해 steering angle 대신 yaw-rate 형태의
   kinematic bicycle 계열 적분을 쓰며, 실제 에이전트 footprint 크기로 최소 선회 반경 하한을
-  한 번 더 보정합니다. 최종 0.5초 propagation에도 이 물리 제한을 그대로 적용합니다.
+  한 번 더 보정합니다. `use_stationary_refinement_in_dynamics_bridge=true`이면 최종 0.5초
+  propagation에도 이 물리 제한을 적용합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
@@ -292,12 +294,14 @@ torchrun ... -m src.run \
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
 - `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true/false`로
   vehicle / bicycle용 dynamics-aware feasible commit bridge를 켜거나 끕니다.
+- `model.model_config.decoder.use_stationary_refinement_in_dynamics_bridge=true/false`로
+  `eab8dd38`에서 들어간 stationary hold / low-speed refinement / limit-aware propagation을
+  별도로 켜거나 끕니다. 기본값은 `false`입니다.
 - 켜면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
-- 이때 현재 executed 상태와 다음 preview 5점이 모두 작은 stationary tube 안에 있으면
+- refinement를 켜면 현재 executed 상태와 다음 preview 5점이 모두 작은 stationary tube 안에 있으면
   이번 block은 exact hold로 commit합니다.
-- 저속 방향성은 현재 0.5초 block의 누적 종방향 변위가 dead-zone을 넘을 때만 forward / reverse로
-  해석하므로, 정지 근처 미세 wobble을 backward intent로 바로 증폭하지 않습니다.
-- 0.5초 propagation에는 속도, 가감속, yaw-rate, yaw-accel, 횡가속, 최소 선회 반경 제한을 적용합니다.
+- refinement를 켜면 저속 방향성은 현재 0.5초 block의 누적 종방향 변위를 기준으로 보정합니다.
+- refinement를 켜면 0.5초 propagation에 물리 제한을 적용합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
@@ -327,6 +331,10 @@ torchrun ... -m src.run \
 
 # vehicle / bicycle에 dynamics-aware feasible commit bridge 적용
 ... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true
+
+# eab8dd38의 stationary refinement까지 함께 적용
+... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true \
+    model.model_config.decoder.use_stationary_refinement_in_dynamics_bridge=true
 
 # dynamics-aware feasible commit + matched token chunk를 함께 쓸 때도
 # vehicle / bicycle export는 실행된 5점 chunk를 유지하고 pedestrian만 token chunk를 씁니다.

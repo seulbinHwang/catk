@@ -45,6 +45,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_eps: float,
         closed_loop_rollout_mode: str = "raw_fm",
         use_dynamics_feasible_commit_bridge: bool = False,
+        use_stationary_refinement_in_dynamics_bridge: bool = False,
     ) -> None:
         super().__init__(
             hidden_dim=hidden_dim,
@@ -84,9 +85,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             )
         self.closed_loop_rollout_mode = closed_loop_rollout_mode
         self.use_dynamics_feasible_commit_bridge = bool(use_dynamics_feasible_commit_bridge)
+        self.use_stationary_refinement_in_dynamics_bridge = bool(
+            use_stationary_refinement_in_dynamics_bridge
+        )
         self.commit_bridge = ContinuousCommitBridge()
         self.dynamics_commit_bridge = (
-            DynamicsAwareFeasibleCommitBridge()
+            DynamicsAwareFeasibleCommitBridge(
+                use_stationary_refinement=self.use_stationary_refinement_in_dynamics_bridge
+            )
             if self.use_dynamics_feasible_commit_bridge
             else None
         )
