@@ -112,10 +112,12 @@ def compute_distance_to_road_edge(
 
     if road_edge_polylines_tensor is None:
         polylines_tensor, _ = tensorize_polylines(road_edge_polylines)
+        polylines_tensor = polylines_tensor.to(center_x.device)
     else:
-        polylines_tensor = road_edge_polylines_tensor
+        polylines_tensor = road_edge_polylines_tensor.to(center_x.device)
     if is_polyline_cyclic is None:
         is_polyline_cyclic = check_polyline_cycles(road_edge_polylines)
+    is_polyline_cyclic = is_polyline_cyclic.to(center_x.device)
 
     corner_dist = _compute_signed_distance_to_polylines(
         xyzs=flat_eval_corners,

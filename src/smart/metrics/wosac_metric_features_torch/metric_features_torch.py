@@ -105,7 +105,11 @@ class ObjectTrajectoriesTorch:
     def gather_objects_by_id(self, ids: Tensor) -> "ObjectTrajectoriesTorch":
         # ids: (n_objects,) int
         id_to_idx = {int(oid): i for i, oid in enumerate(self.object_id.tolist())}
-        idx = torch.tensor([id_to_idx[int(oid)] for oid in ids.tolist()], dtype=torch.long)
+        idx = torch.tensor(
+            [id_to_idx[int(oid)] for oid in ids.tolist()],
+            dtype=torch.long,
+            device=self.x.device,
+        )
         return ObjectTrajectoriesTorch(
             x=self.x.index_select(0, idx),
             y=self.y.index_select(0, idx),

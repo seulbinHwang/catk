@@ -184,9 +184,12 @@ def compute_time_to_collision_with_object_in_front(
     box_ahead_speed = torch.gather(speed_b, dim=-1, index=idx).squeeze(-1)  # (T,E)
 
     rel_speed = ego_speed[..., 0] - box_ahead_speed
+    # Avoid NaN/Inf gradients: don't form distance/rel_speed when rel_speed <= 0.
+    rel_speed_safe = torch.where(rel_speed > 0.0, rel_speed, torch.ones_like(rel_speed))
+    ttc_raw = distance_to_ahead / rel_speed_safe
     ttc = torch.where(
         rel_speed > 0.0,
-        torch.minimum(distance_to_ahead / rel_speed, torch.full_like(distance_to_ahead, MAXIMUM_TIME_TO_COLLISION)),
+        torch.minimum(ttc_raw, torch.full_like(distance_to_ahead, MAXIMUM_TIME_TO_COLLISION)),
         torch.full_like(distance_to_ahead, MAXIMUM_TIME_TO_COLLISION),
     )
     return ttc.permute(1, 0)

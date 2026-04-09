@@ -123,6 +123,8 @@ def compute_red_light_violation(
 
     if lane_tensor is None or lane_ids_tensor is None:
         lane_tensor, lane_ids_tensor = map_feat.tensorize_polylines(lane_polylines, lane_ids)
+    lane_tensor = lane_tensor.to(center_x.device)
+    lane_ids_tensor = lane_ids_tensor.to(center_x.device)
     # xy_flat: (num_objects*num_steps, 2)
     xy_flat = xy.reshape(-1, 2)
 
@@ -136,6 +138,9 @@ def compute_red_light_violation(
 
     if ts_lane_id is None or ts_state is None or ts_stop_point is None:
         ts_lane_id, ts_state, ts_stop_point = _tensorize_traffic_signals(traffic_signals)
+    ts_lane_id = ts_lane_id.to(center_x.device)
+    ts_state = ts_state.to(center_x.device)
+    ts_stop_point = ts_stop_point.to(center_x.device)
     num_traffic_signals = ts_lane_id.shape[1]
 
     ts_match = current_lane_id[:, :, None].eq(ts_lane_id[None, :, :])  # (O,T,TL)
@@ -231,6 +236,8 @@ def compute_red_light_violation_soft(
 
     if lane_tensor is None or lane_ids_tensor is None:
         lane_tensor, lane_ids_tensor = map_feat.tensorize_polylines(lane_polylines, lane_ids)
+    lane_tensor = lane_tensor.to(center_x.device)
+    lane_ids_tensor = lane_ids_tensor.to(center_x.device)
     xy_flat = xy.reshape(-1, 2)
     lane_xyz_valid = lane_tensor.unsqueeze(0).expand(xy_flat.shape[0], -1, -1, -1)
     nearest_lane_segment_index = _get_nearest_lane_segment_index(xy=xy_flat, lane_xyz_valid=lane_xyz_valid)
@@ -240,6 +247,9 @@ def compute_red_light_violation_soft(
 
     if ts_lane_id is None or ts_state is None or ts_stop_point is None:
         ts_lane_id, ts_state, ts_stop_point = _tensorize_traffic_signals(traffic_signals)
+    ts_lane_id = ts_lane_id.to(center_x.device)
+    ts_state = ts_state.to(center_x.device)
+    ts_stop_point = ts_stop_point.to(center_x.device)
     num_traffic_signals = ts_lane_id.shape[1]
     ts_match = current_lane_id[:, :, None].eq(ts_lane_id[None, :, :]).to(torch.float32)
 
