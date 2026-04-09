@@ -19,6 +19,75 @@ from .surrogate import SurrogateConfig
 _ChallengeType = submission_specs.ChallengeType
 _LaneType = map_pb2.LaneCenter.LaneType
 
+_STATIC_SCENARIO_CACHE: dict[str, dict] = {}
+_STATIC_SCENARIO_CACHE_MAX = 128
+
+_COMPILED_FNS: dict[str, object] = {}
+
+
+def _maybe_compile(name: str, fn):
+    if name in _COMPILED_FNS:
+        return _COMPILED_FNS[name]
+    # torch.compile is optional and can regress depending on shapes/calls.
+    # Keep it best-effort and cached (never compile per-call).
+    try:
+        compiled = torch.compile(fn, dynamic=False)  # type: ignore[attr-defined]
+    except Exception:
+        compiled = fn
+    _COMPILED_FNS[name] = compiled
+    return compiled
+
+
+def _get_scenario_id(scenario: scenario_pb2.Scenario) -> str:
+    sid = getattr(scenario, "scenario_id", "")
+    return str(sid) if sid is not None else ""
+
+
+def _cache_get_or_build(scenario: scenario_pb2.Scenario) -> dict:
+    sid = _get_scenario_id(scenario)
+    if not sid:
+        return {}
+    hit = _STATIC_SCENARIO_CACHE.get(sid)
+    if hit is not None:
+        return hit
+
+    road_edges = [list(mf.road_edge.polyline) for mf in scenario.map_features if mf.HasField("road_edge")]
+    road_edge_polylines_tensor, _ = map_feat.tensorize_polylines(road_edges) if road_edges else (None, None)
+    road_edge_is_cyclic = map_feat.check_polyline_cycles(road_edges) if road_edges else None
+
+    lane_ids: List[int] = []
+    lane_polys: List[List[map_pb2.MapPoint]] = []
+    for mf in scenario.map_features:
+        if mf.HasField("lane") and mf.lane.type == _LaneType.TYPE_SURFACE_STREET:
+            lane_ids.append(int(mf.id))
+            lane_polys.append(list(mf.lane.polyline))
+    lane_tensor, lane_ids_tensor = map_feat.tensorize_polylines(lane_polys, lane_ids) if lane_polys else (None, None)
+
+    traffic_signals = [list(dms.lane_states) for dms in scenario.dynamic_map_states]
+    if traffic_signals:
+        ts_lane_id, ts_state, ts_stop_point = tl_feat._tensorize_traffic_signals(traffic_signals)
+    else:
+        ts_lane_id = ts_state = ts_stop_point = None
+
+    built = {
+        "road_edges": road_edges,
+        "road_edge_polylines_tensor": road_edge_polylines_tensor,
+        "road_edge_is_cyclic": road_edge_is_cyclic,
+        "lane_ids": lane_ids,
+        "lane_polys": lane_polys,
+        "lane_tensor": lane_tensor,
+        "lane_ids_tensor": lane_ids_tensor,
+        "traffic_signals": traffic_signals,
+        "ts_lane_id": ts_lane_id,
+        "ts_state": ts_state,
+        "ts_stop_point": ts_stop_point,
+    }
+    _STATIC_SCENARIO_CACHE[sid] = built
+    if len(_STATIC_SCENARIO_CACHE) > _STATIC_SCENARIO_CACHE_MAX:
+        # drop oldest inserted item (py3.7+ dict keeps insertion order)
+        _STATIC_SCENARIO_CACHE.pop(next(iter(_STATIC_SCENARIO_CACHE)))
+    return built
+
 
 @dataclass(frozen=True)
 class ObjectTrajectoriesTorch:
@@ -235,13 +304,25 @@ def compute_metric_features(
     cfg = submission_specs.get_submission_config(challenge_type)
     ct_idx = cfg.current_time_index
 
+    # Match TF: compute kinematics on (history+future) so first simulated step
+    # has a valid central difference, then slice out history.
     linear_speed, linear_accel, angular_speed, angular_accel = traj.compute_kinematic_features(
         evaluated.x, evaluated.y, evaluated.z, evaluated.heading, seconds_per_step=cfg.step_duration_seconds
     )
 
     eval_object_mask = torch.any(evaluated_ids[:, None].eq(simulated.object_id[None, :]), dim=0)
 
-    dno = inter.compute_distance_to_nearest_object(
+    dno_fn = inter.compute_distance_to_nearest_object
+    ttc_fn = inter.compute_time_to_collision_with_object_in_front
+    d_road_fn = map_feat.compute_distance_to_road_edge
+
+    # Keep compile behind an env flag so we can A/B easily without changing call sites.
+    if bool(int(__import__("os").environ.get("WOSAC_TORCH_COMPILE", "0"))):
+        dno_fn = _maybe_compile("dno", dno_fn)
+        ttc_fn = _maybe_compile("ttc", ttc_fn)
+        d_road_fn = _maybe_compile("d_road", d_road_fn)
+
+    dno = dno_fn(
         center_x=simulated.x,
         center_y=simulated.y,
         center_z=simulated.z,
@@ -252,7 +333,7 @@ def compute_metric_features(
         valid=simulated.valid,
         evaluated_object_mask=eval_object_mask,
     )
-    ttc = inter.compute_time_to_collision_with_object_in_front(
+    ttc = ttc_fn(
         center_x=simulated.x,
         center_y=simulated.y,
         length=simulated.length,
@@ -263,8 +344,9 @@ def compute_metric_features(
         seconds_per_step=cfg.step_duration_seconds,
     )
 
-    road_edges = [list(mf.road_edge.polyline) for mf in scenario.map_features if mf.HasField("road_edge")]
-    d_road = map_feat.compute_distance_to_road_edge(
+    cached = _cache_get_or_build(scenario)
+    road_edges = cached.get("road_edges") or [list(mf.road_edge.polyline) for mf in scenario.map_features if mf.HasField("road_edge")]
+    d_road = d_road_fn(
         center_x=simulated.x,
         center_y=simulated.y,
         center_z=simulated.z,
@@ -275,15 +357,13 @@ def compute_metric_features(
         valid=simulated.valid,
         evaluated_object_mask=eval_object_mask,
         road_edge_polylines=road_edges,
+        road_edge_polylines_tensor=cached.get("road_edge_polylines_tensor"),
+        is_polyline_cyclic=cached.get("road_edge_is_cyclic"),
     )
 
-    lane_ids = []
-    lane_polys = []
-    for mf in scenario.map_features:
-        if mf.HasField("lane") and mf.lane.type == _LaneType.TYPE_SURFACE_STREET:
-            lane_ids.append(int(mf.id))
-            lane_polys.append(list(mf.lane.polyline))
-    traffic_signals = [list(dms.lane_states) for dms in scenario.dynamic_map_states]
+    lane_ids = cached.get("lane_ids") or []
+    lane_polys = cached.get("lane_polys") or []
+    traffic_signals = cached.get("traffic_signals") or [list(dms.lane_states) for dms in scenario.dynamic_map_states]
 
     if lane_polys and traffic_signals:
         if surrogate is None:
@@ -295,6 +375,11 @@ def compute_metric_features(
                 lane_polylines=lane_polys,
                 lane_ids=lane_ids,
                 traffic_signals=traffic_signals,
+                lane_tensor=cached.get("lane_tensor"),
+                lane_ids_tensor=cached.get("lane_ids_tensor"),
+                ts_lane_id=cached.get("ts_lane_id"),
+                ts_state=cached.get("ts_state"),
+                ts_stop_point=cached.get("ts_stop_point"),
             )
         else:
             red_light = tl_feat.compute_red_light_violation_soft(
@@ -306,6 +391,11 @@ def compute_metric_features(
                 lane_ids=lane_ids,
                 traffic_signals=traffic_signals,
                 crossing_temperature=surrogate.red_light_crossing_temperature,
+                lane_tensor=cached.get("lane_tensor"),
+                lane_ids_tensor=cached.get("lane_ids_tensor"),
+                ts_lane_id=cached.get("ts_lane_id"),
+                ts_state=cached.get("ts_state"),
+                ts_stop_point=cached.get("ts_stop_point"),
             )
     else:
         red_light = torch.zeros(

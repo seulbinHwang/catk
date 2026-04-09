@@ -75,12 +75,13 @@ def _tensorize_traffic_signals(
         all_lane_ids = [-1]
         num_tl_lanes = 1
 
+    lane_id_to_idx = {lid: i for i, lid in enumerate(all_lane_ids)}
     lane_ids = torch.tensor(all_lane_ids, dtype=torch.int32).unsqueeze(0).repeat(num_steps, 1)
     states = torch.zeros((num_steps, num_tl_lanes), dtype=torch.int64)
     stop_points = torch.zeros((num_steps, num_tl_lanes, 2), dtype=torch.float32)
     for t, signals_at_t in enumerate(traffic_signals):
         for st in signals_at_t:
-            idx = all_lane_ids.index(int(st.lane))
+            idx = lane_id_to_idx[int(st.lane)]
             states[t, idx] = int(st.state)
             stop_points[t, idx, 0] = float(st.stop_point.x)
             stop_points[t, idx, 1] = float(st.stop_point.y)
@@ -96,6 +97,11 @@ def compute_red_light_violation(
     lane_polylines: List[_Polyline],
     lane_ids: List[int],
     traffic_signals: List[List[map_pb2.TrafficSignalLaneState]],
+    lane_tensor: Tensor | None = None,
+    lane_ids_tensor: Tensor | None = None,
+    ts_lane_id: Tensor | None = None,
+    ts_state: Tensor | None = None,
+    ts_stop_point: Tensor | None = None,
 ) -> Tensor:
     """Torch port of TF `compute_red_light_violation`.
 
@@ -115,7 +121,8 @@ def compute_red_light_violation(
     valid = valid.index_select(0, evaluated_object_indices)
     num_objects, num_steps = valid.shape
 
-    lane_tensor, lane_ids_tensor = map_feat.tensorize_polylines(lane_polylines, lane_ids)
+    if lane_tensor is None or lane_ids_tensor is None:
+        lane_tensor, lane_ids_tensor = map_feat.tensorize_polylines(lane_polylines, lane_ids)
     # xy_flat: (num_objects*num_steps, 2)
     xy_flat = xy.reshape(-1, 2)
 
@@ -127,7 +134,8 @@ def compute_red_light_violation(
     current_lane_id_flat = lane_ids_tensor.to(nearest_lane_index.device).index_select(0, nearest_lane_index)
     current_lane_id = current_lane_id_flat.reshape(num_objects, num_steps)
 
-    ts_lane_id, ts_state, ts_stop_point = _tensorize_traffic_signals(traffic_signals)
+    if ts_lane_id is None or ts_state is None or ts_stop_point is None:
+        ts_lane_id, ts_state, ts_stop_point = _tensorize_traffic_signals(traffic_signals)
     num_traffic_signals = ts_lane_id.shape[1]
 
     ts_match = current_lane_id[:, :, None].eq(ts_lane_id[None, :, :])  # (O,T,TL)
@@ -201,6 +209,11 @@ def compute_red_light_violation_soft(
     lane_ids: List[int],
     traffic_signals: List[List[map_pb2.TrafficSignalLaneState]],
     crossing_temperature: float = 0.05,
+    lane_tensor: Tensor | None = None,
+    lane_ids_tensor: Tensor | None = None,
+    ts_lane_id: Tensor | None = None,
+    ts_state: Tensor | None = None,
+    ts_stop_point: Tensor | None = None,
 ) -> Tensor:
     """Differentiable surrogate of `compute_red_light_violation`.
 
@@ -216,7 +229,8 @@ def compute_red_light_violation_soft(
     valid = valid.index_select(0, evaluated_object_indices)
     num_objects, num_steps = valid.shape
 
-    lane_tensor, lane_ids_tensor = map_feat.tensorize_polylines(lane_polylines, lane_ids)
+    if lane_tensor is None or lane_ids_tensor is None:
+        lane_tensor, lane_ids_tensor = map_feat.tensorize_polylines(lane_polylines, lane_ids)
     xy_flat = xy.reshape(-1, 2)
     lane_xyz_valid = lane_tensor.unsqueeze(0).expand(xy_flat.shape[0], -1, -1, -1)
     nearest_lane_segment_index = _get_nearest_lane_segment_index(xy=xy_flat, lane_xyz_valid=lane_xyz_valid)
@@ -224,7 +238,8 @@ def compute_red_light_violation_soft(
     current_lane_id_flat = lane_ids_tensor.to(nearest_lane_index.device).index_select(0, nearest_lane_index)
     current_lane_id = current_lane_id_flat.reshape(num_objects, num_steps)
 
-    ts_lane_id, ts_state, ts_stop_point = _tensorize_traffic_signals(traffic_signals)
+    if ts_lane_id is None or ts_state is None or ts_stop_point is None:
+        ts_lane_id, ts_state, ts_stop_point = _tensorize_traffic_signals(traffic_signals)
     num_traffic_signals = ts_lane_id.shape[1]
     ts_match = current_lane_id[:, :, None].eq(ts_lane_id[None, :, :]).to(torch.float32)
 

@@ -89,6 +89,8 @@ def compute_distance_to_road_edge(
     evaluated_object_mask: Tensor,
     road_edge_polylines: List[_Polyline],
     z_stretch: float = 3.0,
+    road_edge_polylines_tensor: Tensor | None = None,
+    is_polyline_cyclic: Tensor | None = None,
 ) -> Tensor:
     """Torch port of `map_metric_features.compute_distance_to_road_edge`.
 
@@ -108,8 +110,12 @@ def compute_distance_to_road_edge(
     num_eval_objects = eval_corners.shape[0]
     flat_eval_corners = eval_corners.reshape(-1, 3)
 
-    polylines_tensor, _ = tensorize_polylines(road_edge_polylines)
-    is_polyline_cyclic = check_polyline_cycles(road_edge_polylines)
+    if road_edge_polylines_tensor is None:
+        polylines_tensor, _ = tensorize_polylines(road_edge_polylines)
+    else:
+        polylines_tensor = road_edge_polylines_tensor
+    if is_polyline_cyclic is None:
+        is_polyline_cyclic = check_polyline_cycles(road_edge_polylines)
 
     corner_dist = _compute_signed_distance_to_polylines(
         xyzs=flat_eval_corners,
@@ -140,109 +146,134 @@ def _compute_signed_distance_to_polylines(
     if polylines.shape[2] != 4:
         raise ValueError(f"polylines must be (L,S+1,4), got {polylines.shape}")
 
-    is_point_valid = polylines[:, :, 3].to(torch.bool)
-    is_segment_valid = is_point_valid[:, :-1] & is_point_valid[:, 1:]  # (L,S)
+    # Chunking over polylines: process L in blocks to reduce peak memory.
+    # Result is identical because we only do min/argmin-style reduction over segments.
+    polyline_chunk = 64
+    if num_polylines <= polyline_chunk:
+        polyline_chunk = num_polylines
 
-    if is_polyline_cyclic is None:
-        is_polyline_cyclic = torch.zeros((num_polylines,), dtype=torch.bool, device=polylines.device)
-    else:
-        is_polyline_cyclic = is_polyline_cyclic.to(torch.bool).to(polylines.device)
+    best_dist3 = torch.full((num_points,), EXTREMELY_LARGE_DISTANCE, dtype=xyzs.dtype, device=xyzs.device)
+    best_signed2 = torch.full((num_points,), EXTREMELY_LARGE_DISTANCE, dtype=xyzs.dtype, device=xyzs.device)
+    stretch = torch.tensor([1.0, 1.0, float(z_stretch)], dtype=xyzs.dtype, device=xyzs.device)
 
-    xyz_starts = polylines[None, :, :-1, :3]  # (1,L,S,3)
-    xyz_ends = polylines[None, :, 1:, :3]
-    start_to_point = xyzs[:, None, None, :3] - xyz_starts  # (P,L,S,3)
-    start_to_end = xyz_ends - xyz_starts  # (1,L,S,3)
+    for start in range(0, num_polylines, polyline_chunk):
+        end = min(num_polylines, start + polyline_chunk)
+        pol = polylines[start:end]  # (Lc,S+1,4)
+        Lc = pol.shape[0]
 
-    rel_t = geom.divide_no_nan(
-        geom.dot_product_2d(start_to_point[..., :2], start_to_end[..., :2]),
-        geom.dot_product_2d(start_to_end[..., :2], start_to_end[..., :2]),
-    )  # (P,L,S)
+        is_point_valid = pol[:, :, 3].to(torch.bool)
+        is_segment_valid = is_point_valid[:, :-1] & is_point_valid[:, 1:]  # (Lc,S)
 
-    n = torch.sign(geom.cross_product_2d(start_to_point[..., :2], start_to_end[..., :2]))  # (P,L,S)
+        if is_polyline_cyclic is None:
+            cyc = torch.zeros((Lc,), dtype=torch.bool, device=pol.device)
+        else:
+            cyc = is_polyline_cyclic[start:end].to(torch.bool).to(pol.device)
 
-    segment_to_point = start_to_point - (
-        start_to_end * rel_t.clamp(0.0, 1.0)[..., None]
-    )  # (P,L,S,3)
+        xyz_starts = pol[None, :, :-1, :3]  # (1,Lc,S,3)
+        xyz_ends = pol[None, :, 1:, :3]
+        start_to_point = xyzs[:, None, None, :3] - xyz_starts  # (P,Lc,S,3)
+        start_to_end = xyz_ends - xyz_starts  # (1,Lc,S,3)
 
-    stretch = torch.tensor([1.0, 1.0, float(z_stretch)], dtype=segment_to_point.dtype, device=segment_to_point.device)
-    dist_3d = torch.linalg.norm(segment_to_point * stretch[None, None, None, :], dim=-1)  # (P,L,S)
-    dist_2d = torch.linalg.norm(segment_to_point[..., :2], dim=-1)
+        rel_t = geom.divide_no_nan(
+            geom.dot_product_2d(start_to_point[..., :2], start_to_end[..., :2]),
+            geom.dot_product_2d(start_to_end[..., :2], start_to_end[..., :2]),
+        )  # (P,Lc,S)
 
-    start_to_end_padded = torch.cat(
-        [
-            start_to_end[:, :, -1:, :2],
-            start_to_end[..., :2],
-            start_to_end[:, :, :1, :2],
-        ],
-        dim=-2,
-    )  # (1,L,S+2,2)
+        n = torch.sign(geom.cross_product_2d(start_to_point[..., :2], start_to_end[..., :2]))  # (P,Lc,S)
 
-    is_locally_convex = geom.cross_product_2d(
-        start_to_end_padded[:, :, :-1, :], start_to_end_padded[:, :, 1:, :]
-    ) > 0.0  # (1,L,S+1)
+        segment_to_point = start_to_point - (
+            start_to_end * rel_t.clamp(0.0, 1.0)[..., None]
+        )  # (P,Lc,S,3)
 
-    # Shifted n (P,L,S) and validity (L,S)
-    n_prior = torch.cat(
-        [
-            torch.where(is_polyline_cyclic[None, :, None], n[:, :, -1:], n[:, :, :1]),
-            n[:, :, :-1],
-        ],
-        dim=-1,
-    )
-    n_next = torch.cat(
-        [
-            n[:, :, 1:],
-            torch.where(is_polyline_cyclic[None, :, None], n[:, :, :1], n[:, :, -1:]),
-        ],
-        dim=-1,
-    )
+        dist_3d = torch.linalg.norm(segment_to_point * stretch[None, None, None, :], dim=-1)  # (P,Lc,S)
+        dist_2d = torch.linalg.norm(segment_to_point[..., :2], dim=-1)
 
-    is_prior_valid = torch.cat(
-        [
-            torch.where(is_polyline_cyclic[:, None], is_segment_valid[:, -1:], is_segment_valid[:, :1]),
-            is_segment_valid[:, :-1],
-        ],
-        dim=-1,
-    )
-    is_next_valid = torch.cat(
-        [
-            is_segment_valid[:, 1:],
-            torch.where(is_polyline_cyclic[:, None], is_segment_valid[:, :1], is_segment_valid[:, -1:]),
-        ],
-        dim=-1,
-    )
+        start_to_end_padded = torch.cat(
+            [
+                start_to_end[:, :, -1:, :2],
+                start_to_end[..., :2],
+                start_to_end[:, :, :1, :2],
+            ],
+            dim=-2,
+        )  # (1,Lc,S+2,2)
 
-    sign_if_before = torch.where(
-        is_locally_convex[:, :, :-1].expand_as(n),
-        torch.maximum(n, n_prior),
-        torch.minimum(n, n_prior),
-    )
-    sign_if_after = torch.where(
-        is_locally_convex[:, :, 1:].expand_as(n),
-        torch.maximum(n, n_next),
-        torch.minimum(n, n_next),
-    )
+        is_locally_convex = geom.cross_product_2d(
+            start_to_end_padded[:, :, :-1, :], start_to_end_padded[:, :, 1:, :]
+        ) > 0.0  # (1,Lc,S+1)
 
-    sign_to_segment = torch.where(
-        (rel_t < 0.0) & is_prior_valid[None, :, :],
-        sign_if_before,
-        torch.where((rel_t > 1.0) & is_next_valid[None, :, :], sign_if_after, n),
-    )  # (P,L,S)
+        # Shifted n (P,Lc,S) and validity (Lc,S)
+        n_prior = torch.cat(
+            [
+                torch.where(cyc[None, :, None], n[:, :, -1:], n[:, :, :1]),
+                n[:, :, :-1],
+            ],
+            dim=-1,
+        )
+        n_next = torch.cat(
+            [
+                n[:, :, 1:],
+                torch.where(cyc[None, :, None], n[:, :, :1], n[:, :, -1:]),
+            ],
+            dim=-1,
+        )
 
-    # Flatten segments
-    dist_3d_f = dist_3d.reshape(num_points, num_polylines * num_segments)
-    dist_2d_f = dist_2d.reshape(num_points, num_polylines * num_segments)
-    sign_f = sign_to_segment.reshape(num_points, num_polylines * num_segments)
-    seg_valid_f = is_segment_valid.reshape(num_polylines * num_segments).to(dist_3d_f.device)
+        is_prior_valid = torch.cat(
+            [
+                torch.where(cyc[:, None], is_segment_valid[:, -1:], is_segment_valid[:, :1]),
+                is_segment_valid[:, :-1],
+            ],
+            dim=-1,
+        )
+        is_next_valid = torch.cat(
+            [
+                is_segment_valid[:, 1:],
+                torch.where(cyc[:, None], is_segment_valid[:, :1], is_segment_valid[:, -1:]),
+            ],
+            dim=-1,
+        )
 
-    dist_3d_f = torch.where(seg_valid_f[None, :], dist_3d_f, torch.full_like(dist_3d_f, EXTREMELY_LARGE_DISTANCE))
-    dist_2d_f = torch.where(seg_valid_f[None, :], dist_2d_f, torch.full_like(dist_2d_f, EXTREMELY_LARGE_DISTANCE))
+        sign_if_before = torch.where(
+            is_locally_convex[:, :, :-1].expand_as(n),
+            torch.maximum(n, n_prior),
+            torch.minimum(n, n_prior),
+        )
+        sign_if_after = torch.where(
+            is_locally_convex[:, :, 1:].expand_as(n),
+            torch.maximum(n, n_next),
+            torch.minimum(n, n_next),
+        )
 
-    closest = torch.argmin(dist_3d_f, dim=-1)  # (P,)
-    idx = closest[:, None]
-    dist_sign = torch.gather(sign_f, 1, idx).squeeze(1)
-    dist2 = torch.gather(dist_2d_f, 1, idx).squeeze(1)
-    return dist_sign * dist2
+        sign_to_segment = torch.where(
+            (rel_t < 0.0) & is_prior_valid[None, :, :],
+            sign_if_before,
+            torch.where((rel_t > 1.0) & is_next_valid[None, :, :], sign_if_after, n),
+        )  # (P,Lc,S)
+
+        # Flatten segments within chunk
+        dist_3d_f = dist_3d.reshape(num_points, Lc * num_segments)
+        dist_2d_f = dist_2d.reshape(num_points, Lc * num_segments)
+        sign_f = sign_to_segment.reshape(num_points, Lc * num_segments)
+        seg_valid_f = is_segment_valid.reshape(Lc * num_segments).to(dist_3d_f.device)
+
+        dist_3d_f = torch.where(
+            seg_valid_f[None, :], dist_3d_f, torch.full_like(dist_3d_f, EXTREMELY_LARGE_DISTANCE)
+        )
+        dist_2d_f = torch.where(
+            seg_valid_f[None, :], dist_2d_f, torch.full_like(dist_2d_f, EXTREMELY_LARGE_DISTANCE)
+        )
+
+        closest = torch.argmin(dist_3d_f, dim=-1)  # (P,)
+        idx = closest[:, None]
+        chunk_best3 = torch.gather(dist_3d_f, 1, idx).squeeze(1)
+        chunk_sign = torch.gather(sign_f, 1, idx).squeeze(1)
+        chunk_dist2 = torch.gather(dist_2d_f, 1, idx).squeeze(1)
+        chunk_signed2 = chunk_sign * chunk_dist2
+
+        take = chunk_best3 < best_dist3
+        best_signed2 = torch.where(take, chunk_signed2, best_signed2)
+        best_dist3 = torch.where(take, chunk_best3, best_dist3)
+
+    return best_signed2
 
 
 __all__ = [

@@ -61,35 +61,55 @@ def compute_distance_to_nearest_object(
     num_eval = eval_corners.shape[0]
     all_corners = torch.cat([eval_corners, other_corners], dim=0)
 
-    # Broadcast: (E,O,T,4,2)
-    eval_bc = eval_corners[:, None, ...].expand(num_eval, num_objects, num_steps, 4, 2)
-    all_bc = all_corners[None, ...].expand(num_eval, num_objects, num_steps, 4, 2)
-    eval_flat = eval_bc.reshape(num_eval * num_objects * num_steps, 4, 2)
-    all_flat = all_bc.reshape(num_eval * num_objects * num_steps, 4, 2)
-
-    mink = geom_box.minkowski_sum_of_box_and_box_points(eval_flat, -1.0 * all_flat)
-    signed_flat = geom_box.signed_distance_from_point_to_convex_polygon(
-        query_points=torch.zeros_like(mink[:, 0, :]), polygon_points=mink
-    )
-    signed = signed_flat.reshape(num_eval, num_objects, num_steps)
+    # Chunk over 'other objects' dimension to reduce peak memory.
+    # Result is identical because we take min over objects (with masking).
+    block = 32
+    best = torch.full((num_eval, num_steps), EXTREMELY_LARGE_DISTANCE, dtype=box_corners.dtype, device=box_corners.device)
 
     # subtract shrinking distances to recover rounded-rect distance
     eval_shrink = shrinking_distance.index_select(0, eval_idx)  # (E,T)
     other_shrink = shrinking_distance.index_select(0, other_idx)
     all_shrink = torch.cat([eval_shrink, other_shrink], dim=0)  # (O,T)
-    signed = signed - eval_shrink[:, None, :] - all_shrink[None, :, :]
 
-    # Mask self distances
-    eye = torch.eye(num_eval, num_objects, device=signed.device, dtype=signed.dtype)[:, :, None]
-    signed = signed + eye * EXTREMELY_LARGE_DISTANCE
-
-    # validity mask
-    eval_valid = valid.index_select(0, eval_idx)
+    eval_valid = valid.index_select(0, eval_idx)  # (E,T)
     other_valid = valid.index_select(0, other_idx)
-    all_valid = torch.cat([eval_valid, other_valid], dim=0)
-    valid_mask = eval_valid[:, None, :] & all_valid[None, :, :]
-    signed = torch.where(valid_mask, signed, torch.full_like(signed, EXTREMELY_LARGE_DISTANCE))
-    return signed.min(dim=1).values
+    all_valid = torch.cat([eval_valid, other_valid], dim=0)  # (O,T)
+
+    for start in range(0, num_objects, block):
+        end = min(num_objects, start + block)
+        corners_blk = all_corners[start:end]  # (B,T,4,2)
+        B = corners_blk.shape[0]
+
+        eval_bc = eval_corners[:, None, ...].expand(num_eval, B, num_steps, 4, 2)
+        blk_bc = corners_blk[None, ...].expand(num_eval, B, num_steps, 4, 2)
+        eval_flat = eval_bc.reshape(num_eval * B * num_steps, 4, 2)
+        blk_flat = blk_bc.reshape(num_eval * B * num_steps, 4, 2)
+
+        mink = geom_box.minkowski_sum_of_box_and_box_points(eval_flat, -1.0 * blk_flat)
+        signed_flat = geom_box.signed_distance_from_point_to_convex_polygon(
+            query_points=torch.zeros_like(mink[:, 0, :]), polygon_points=mink
+        )
+        signed_blk = signed_flat.reshape(num_eval, B, num_steps)
+
+        # recover rounded-rect distances for this block
+        shrink_blk = all_shrink[start:end]  # (B,T)
+        signed_blk = signed_blk - eval_shrink[:, None, :] - shrink_blk[None, :, :]
+
+        # mask self distances when block overlaps evaluated objects portion
+        if start < num_eval:
+            diag_end = min(num_eval, end)
+            ii = torch.arange(start, diag_end, device=signed_blk.device)
+            jj = ii - start
+            signed_blk[ii, jj, :] = signed_blk[ii, jj, :] + EXTREMELY_LARGE_DISTANCE
+
+        # validity masking: both ego and other must be valid
+        valid_blk = all_valid[start:end]  # (B,T)
+        valid_mask = eval_valid[:, None, :] & valid_blk[None, :, :]
+        signed_blk = torch.where(valid_mask, signed_blk, torch.full_like(signed_blk, EXTREMELY_LARGE_DISTANCE))
+
+        best = torch.minimum(best, signed_blk.min(dim=1).values)
+
+    return best
 
 
 def _get_object_following_mask(long_distance: Tensor, lat_overlap: Tensor, yaw_diff: Tensor) -> Tensor:
