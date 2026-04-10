@@ -56,6 +56,7 @@ class SMARTFlow(LightningModule):
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
         self.minADE = minADE()
+        self.minADE_predict = minADE()
         self.sim_agents_metrics = SimAgentsMetrics(
             "val_closed",
             max_workers=model_config.sim_agents_metric_workers,
@@ -921,6 +922,17 @@ class SMARTFlow(LightningModule):
                 target=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]],
                 target_valid=data["agent"]["valid_mask"][:, self.num_historical_steps :],
             )
+            predict_mask = data["agent"]["role"][:, 2]  # tracks_to_predict
+            if predict_mask.any():
+                target_valid_predict = (
+                    data["agent"]["valid_mask"][:, self.num_historical_steps :]
+                    & predict_mask.unsqueeze(1)
+                )
+                self.minADE_predict.update(
+                    pred=pred_traj,
+                    target=data["agent"]["position"][:, self.num_historical_steps :, : pred_traj.shape[-1]],
+                    target_valid=target_valid_predict,
+                )
         if batch_idx < self.n_batch_sim_agents_metric:
             self.sim_agents_metrics.update_from_prediction_tensors(
                 scenario_files=data["tfrecord_path"],
@@ -1333,6 +1345,11 @@ open_metric_dict:
                     minade_value = None
                     if self._should_compute_closed_loop_minade():
                         minade_value = self.minADE.compute()
+                        if self.minADE_predict.count > 0:
+                            minade_predict_value = self.minADE_predict.compute()
+                            epoch_sim_agents_metrics[
+                                "val_closed/sim_agents_2025/minADE_tracks_to_predict"
+                            ] = minade_predict_value
                 closed_loop_metric = epoch_sim_agents_metrics[self.closed_loop_metric_name]
                 if self.global_rank == 0 and minade_value is not None:
                     epoch_sim_agents_metrics[self.val_closed_minade_name] = minade_value
@@ -1350,6 +1367,7 @@ open_metric_dict:
                     self.logger.log_metrics(epoch_sim_agents_metrics)
                 self.sim_agents_metrics.reset()
                 self.minADE.reset()
+                self.minADE_predict.reset()
             if self.sim_agents_submission.is_active:
                 self.sim_agents_submission.save_sub_file()
 
