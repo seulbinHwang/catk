@@ -1,69 +1,77 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 
+VEHICLE_TYPE = 0
+PEDESTRIAN_TYPE = 1
+BICYCLE_TYPE = 2
+
+
 @dataclass(frozen=True)
 class DynamicLimitTable:
-    """에이전트 종류별 물리 제한값을 보관합니다.
+    """에이전트 종류별 제한값을 묶어 둡니다.
 
     Attributes:
         v_max_mps: 최고 속도 제한입니다. shape은 ``[3]`` 입니다.
-        a_max_mps2: 앞방향 가감속 제한입니다. shape은 ``[3]`` 입니다.
-        alpha_max_radps2: 회전 변화 제한입니다. shape은 ``[3]`` 입니다.
+            순서는 ``[vehicle, pedestrian, bicycle]`` 입니다.
+        a_max_mps2: 가속도 제한입니다. shape은 ``[3]`` 입니다.
+            차량과 자전거는 앞방향 가속도, 사람은 2차원 가속도 크기를 뜻합니다.
         a_lat_max_mps2: 횡가속 제한입니다. shape은 ``[3]`` 입니다.
-        r_min_m: 최소 선회 반경 제한입니다. shape은 ``[3]`` 입니다.
-        omega_max_abs_radps: 절대 회전속도 제한입니다. shape은 ``[3]`` 입니다.
-        beta_max_rad: 사이드슬립 각도 제한입니다. shape은 ``[3]`` 입니다.
+            사람에는 쓰지 않으므로 0이어도 됩니다.
     """
 
     v_max_mps: Tuple[float, float, float]
     a_max_mps2: Tuple[float, float, float]
-    alpha_max_radps2: Tuple[float, float, float]
     a_lat_max_mps2: Tuple[float, float, float]
-    r_min_m: Tuple[float, float, float]
-    omega_max_abs_radps: Tuple[float, float, float]
-    beta_max_rad: Tuple[float, float, float]
 
 
 DEFAULT_LIMITS = DynamicLimitTable(
-    # CAT-K repo의 agent type 인덱스: vehicle=0, pedestrian=1, bicycle=2
-    # 값은 Diffusion-Planner feasible.py의 제한값을 그대로 옮겼습니다.
     v_max_mps=(35.0, 5.0, 22.0),
     a_max_mps2=(8.0, 4.7, 5.5),
-    alpha_max_radps2=(1.75, 14.0, 6.0),
-    a_lat_max_mps2=(4.2, 3.2, 4.4),
-    r_min_m=(4.50, 0.00001, 0.5),
-    omega_max_abs_radps=(0.9, 3.3, 2.0),
-    beta_max_rad=(0.27, 10.0, 0.7),
+    a_lat_max_mps2=(4.2, 0.0, 4.4),
 )
 
 
 DRAFT_PHYSICS_COMPONENT_KEYS = (
-    "speed",
-    "slip",
-    "accel",
-    "yaw_accel",
-    "turn",
+    "vehicle_hard",
+    "vehicle_soft",
+    "vehicle_total",
+    "bicycle_hard",
+    "bicycle_soft",
+    "bicycle_total",
+    "pedestrian_hard",
+    "pedestrian_soft",
+    "pedestrian_head",
+    "pedestrian_total",
 )
 
 DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
     "speed_excess_mps",
-    "slip_beta_excess_deg",
     "accel_excess_mps2",
-    "yaw_accel_excess_degps2",
-    "turn_yaw_rate_excess_degps",
-    "turn_lat_accel_excess_mps2",
-    "turn_radius_shortfall_m",
+    "steer_excess_deg",
+    "steer_rate_excess_degps",
+    "lat_accel_excess_mps2",
+    "heading_error_deg",
 )
 
 
 def _build_zero_output(reference: Tensor) -> Dict[str, Tensor]:
+    """출력이 없을 때 쓸 0 스칼라 사전을 만듭니다.
+
+    Args:
+        reference: device와 dtype를 맞추기 위한 기준 텐서입니다.
+            shape은 임의입니다.
+
+    Returns:
+        Dict[str, Tensor]:
+            모든 값이 0인 스칼라 사전입니다.
+    """
     zero = reference.new_zeros(())
     output = {
         "loss": zero,
@@ -71,8 +79,6 @@ def _build_zero_output(reference: Tensor) -> Dict[str, Tensor]:
     }
     for key in DRAFT_PHYSICS_COMPONENT_KEYS:
         output[key] = zero
-        output[f"pred_{key}"] = zero
-        output[f"gt_{key}"] = zero
     for key in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
         output[key] = zero
         output[f"pred_{key}"] = zero
@@ -81,27 +87,38 @@ def _build_zero_output(reference: Tensor) -> Dict[str, Tensor]:
 
 
 class DraftPhysicsRegularizer(nn.Module):
-    """최종 샘플 기준 physics penalty를 계산합니다.
+    """inverse feasibility 기반 DRaFT penalty를 계산합니다.
 
-    이 모듈은 DRaFT의 핵심처럼, 중간 noisy state가 아니라
-    "최종으로 생성된 2초 미래"에 대해 물리 penalty를 계산합니다.
-    penalty는 GT와 같은 기준으로 같이 계산한 뒤,
-    필요하면 "GT보다 더 나쁜 만큼만" 남기도록 만들 수 있습니다.
+    이 모듈은 20개 미래 점을 다시 속도, 가속도, 조향각 같은 값으로 바꾼 뒤,
+    각 에이전트 종류가 실제로 낼 수 있는 범위를 벗어나는지 계산합니다.
+
+    차량과 자전거는 자전거 모델에 맞춘 역추론 값을 쓰고,
+    사람은 2차원 속도와 2차원 가속도로 계산합니다.
 
     Args:
         dt: 미래 점 간 시간 간격입니다. 기본값은 ``0.1`` 초입니다.
         pos_scale_m: 정규화된 ``x, y`` 를 meter로 되돌릴 때 쓸 배율입니다.
             기본값은 ``20.0`` 입니다.
-        deadzone_ratio: 작은 초과량은 바로 크게 벌주지 않기 위한 여유 폭입니다.
-        deadzone_softness: dead-zone 경계를 부드럽게 만들기 위한 값입니다.
-        gt_excess_only: ``True`` 이면 GT보다 더 나쁜 만큼만 loss에 넣습니다.
-        speed_weight: 최고 속도 항 가중치입니다.
-        slip_weight: slip angle 위반 항 가중치입니다.
-        accel_weight: step 간 앞방향 속도 변화 항 가중치입니다.
-            첫 delta는 직전 anchor 제어와의 차이로 함께 계산합니다.
-        yaw_accel_weight: step 간 회전 변화 항 가중치입니다.
-            첫 delta는 직전 anchor 제어와의 차이로 함께 계산합니다.
-        turn_weight: 선회 가능성 항 가중치입니다.
+        speed_floor_mps: 곡률 계산에서 저속 불안정을 막기 위한 최소 속도입니다.
+        vehicle_v_max_mps: 차량 최고 속도 제한입니다.
+        vehicle_a_max_mps2: 차량 앞방향 가속도 제한입니다.
+        vehicle_lat_accel_max_mps2: 차량 횡가속 제한입니다.
+        bicycle_v_max_mps: 자전거 최고 속도 제한입니다.
+        bicycle_a_max_mps2: 자전거 앞방향 가속도 제한입니다.
+        bicycle_lat_accel_max_mps2: 자전거 횡가속 제한입니다.
+        pedestrian_v_max_mps: 사람 속도 제한입니다.
+        pedestrian_a_max_mps2: 사람 2차원 가속도 제한입니다.
+        vehicle_wheelbase_scale: 차량 wheelbase 비율입니다.
+        bicycle_wheelbase_scale: 자전거 wheelbase 비율입니다.
+        vehicle_steer_max_rad: 차량 최대 조향각입니다.
+        bicycle_steer_max_rad: 자전거 최대 조향각입니다.
+        vehicle_steer_rate_max_radps: 차량 최대 조향각 변화율입니다.
+        bicycle_steer_rate_max_radps: 자전거 최대 조향각 변화율입니다.
+        vehicle_soft_weight: 차량 roughness 항 가중치입니다.
+        bicycle_soft_weight: 자전거 roughness 항 가중치입니다.
+        pedestrian_soft_weight: 사람 roughness 항 가중치입니다.
+        pedestrian_heading_weight: 사람 heading 약한 정렬 항 가중치입니다.
+        pedestrian_heading_speed_threshold_mps: 사람 heading 항을 켜는 최소 속도입니다.
         eps: 수치 안정용 작은 값입니다.
     """
 
@@ -109,27 +126,60 @@ class DraftPhysicsRegularizer(nn.Module):
         self,
         dt: float = 0.1,
         pos_scale_m: float = 20.0,
-        deadzone_ratio: float = 0.02,
-        deadzone_softness: float = 0.02,
-        gt_excess_only: bool = True,
-        speed_weight: float = 1.0,
-        slip_weight: float = 1.0,
-        accel_weight: float = 1.0,
-        yaw_accel_weight: float = 1.0,
-        turn_weight: float = 1.0,
+        speed_floor_mps: float = 0.5,
+        vehicle_v_max_mps: float = DEFAULT_LIMITS.v_max_mps[VEHICLE_TYPE],
+        vehicle_a_max_mps2: float = DEFAULT_LIMITS.a_max_mps2[VEHICLE_TYPE],
+        vehicle_lat_accel_max_mps2: float = DEFAULT_LIMITS.a_lat_max_mps2[VEHICLE_TYPE],
+        bicycle_v_max_mps: float = DEFAULT_LIMITS.v_max_mps[BICYCLE_TYPE],
+        bicycle_a_max_mps2: float = DEFAULT_LIMITS.a_max_mps2[BICYCLE_TYPE],
+        bicycle_lat_accel_max_mps2: float = DEFAULT_LIMITS.a_lat_max_mps2[BICYCLE_TYPE],
+        pedestrian_v_max_mps: float = DEFAULT_LIMITS.v_max_mps[PEDESTRIAN_TYPE],
+        pedestrian_a_max_mps2: float = DEFAULT_LIMITS.a_max_mps2[PEDESTRIAN_TYPE],
+        vehicle_wheelbase_scale: float = 0.60,
+        bicycle_wheelbase_scale: float = 0.85,
+        vehicle_steer_max_rad: float = 0.55,
+        bicycle_steer_max_rad: float = 1.00,
+        vehicle_steer_rate_max_radps: float = 0.8,
+        bicycle_steer_rate_max_radps: float = 1.5,
+        vehicle_soft_weight: float = 0.25,
+        bicycle_soft_weight: float = 0.25,
+        pedestrian_soft_weight: float = 0.25,
+        pedestrian_heading_weight: float = 0.05,
+        pedestrian_heading_speed_threshold_mps: float = 0.5,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
         self.dt = float(dt)
         self.pos_scale_m = float(pos_scale_m)
-        self.deadzone_ratio = float(deadzone_ratio)
-        self.deadzone_softness = float(deadzone_softness)
-        self.gt_excess_only = bool(gt_excess_only)
-        self.speed_weight = float(speed_weight)
-        self.slip_weight = float(slip_weight)
-        self.accel_weight = float(accel_weight)
-        self.yaw_accel_weight = float(yaw_accel_weight)
-        self.turn_weight = float(turn_weight)
+        self.speed_floor_mps = float(speed_floor_mps)
+        self.limit_table = DynamicLimitTable(
+            v_max_mps=(
+                float(vehicle_v_max_mps),
+                float(pedestrian_v_max_mps),
+                float(bicycle_v_max_mps),
+            ),
+            a_max_mps2=(
+                float(vehicle_a_max_mps2),
+                float(pedestrian_a_max_mps2),
+                float(bicycle_a_max_mps2),
+            ),
+            a_lat_max_mps2=(
+                float(vehicle_lat_accel_max_mps2),
+                0.0,
+                float(bicycle_lat_accel_max_mps2),
+            ),
+        )
+        self.vehicle_wheelbase_scale = float(vehicle_wheelbase_scale)
+        self.bicycle_wheelbase_scale = float(bicycle_wheelbase_scale)
+        self.vehicle_steer_max_rad = float(vehicle_steer_max_rad)
+        self.bicycle_steer_max_rad = float(bicycle_steer_max_rad)
+        self.vehicle_steer_rate_max_radps = float(vehicle_steer_rate_max_radps)
+        self.bicycle_steer_rate_max_radps = float(bicycle_steer_rate_max_radps)
+        self.vehicle_soft_weight = float(vehicle_soft_weight)
+        self.bicycle_soft_weight = float(bicycle_soft_weight)
+        self.pedestrian_soft_weight = float(pedestrian_soft_weight)
+        self.pedestrian_heading_weight = float(pedestrian_heading_weight)
+        self.pedestrian_heading_speed_threshold_mps = float(pedestrian_heading_speed_threshold_mps)
         self.eps = float(eps)
 
     def forward(
@@ -137,396 +187,418 @@ class DraftPhysicsRegularizer(nn.Module):
         pred_future_norm: Tensor,
         target_future_norm: Tensor,
         packed_agent_type: Tensor,
+        packed_agent_length: Tensor,
         packed_prev_control: Tensor,
         packed_prev_control_valid: Tensor,
     ) -> Dict[str, Tensor]:
-        """생성 미래와 GT 미래의 physics penalty를 계산합니다.
+        """예측 미래와 GT 미래의 inverse feasibility 값을 계산합니다.
 
         Args:
-            pred_future_norm: 모델이 실제 샘플러로 만든 정규화 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            pred_future_norm: 모델이 생성한 정규화 미래입니다.
+                shape은 ``[n_valid_anchor, T, 4]`` 입니다.
             target_future_norm: 같은 anchor의 GT 정규화 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                shape은 ``[n_valid_anchor, T, 4]`` 입니다.
             packed_agent_type: anchor 순서대로 압축한 에이전트 종류입니다.
+                shape은 ``[n_valid_anchor]`` 입니다.
+            packed_agent_length: anchor 순서대로 압축한 agent box length입니다.
                 shape은 ``[n_valid_anchor]`` 입니다.
             packed_prev_control: anchor 직전 구간의 제어입니다.
                 마지막 차원은 ``[v_x^b, v_y^b, omega]`` 이고,
                 shape은 ``[n_valid_anchor, 3]`` 입니다.
-            packed_prev_control_valid: 직전 구간 제어를 믿을 수 있는지 표시합니다.
+            packed_prev_control_valid: 직전 구간 제어 유효 마스크입니다.
                 shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
             Dict[str, Tensor]:
-                총 physics loss와 각 세부 항의 평균값을 담은 사전입니다.
+                최종 loss, raw loss, class별 세부 항, 실제 단위 평균값을 담은 사전입니다.
         """
         if pred_future_norm.numel() == 0:
             return _build_zero_output(pred_future_norm)
 
-        limits = self._gather_limits(
-            packed_agent_type=packed_agent_type,
-            device=pred_future_norm.device,
-            dtype=pred_future_norm.dtype,
-        )
-        pred_stats = self._compute_proxy_penalties(
-            future_norm=pred_future_norm,
-            limits=limits,
-            prev_control=packed_prev_control,
-            prev_control_valid=packed_prev_control_valid,
-        )
-        gt_stats = self._compute_proxy_penalties(
-            future_norm=target_future_norm.detach(),
-            limits=limits,
-            prev_control=packed_prev_control.detach(),
-            prev_control_valid=packed_prev_control_valid,
-        )
+        agent_type = packed_agent_type.to(device=pred_future_norm.device, dtype=torch.long).clamp(min=0, max=2)
+        agent_length = packed_agent_length.to(device=pred_future_norm.device, dtype=pred_future_norm.dtype)
+        prev_control = packed_prev_control.to(device=pred_future_norm.device, dtype=pred_future_norm.dtype)
+        prev_control_valid = packed_prev_control_valid.to(device=pred_future_norm.device, dtype=torch.bool)
 
-        component_to_weight = {
-            "speed": self.speed_weight,
-            "slip": self.slip_weight,
-            "accel": self.accel_weight,
-            "yaw_accel": self.yaw_accel_weight,
-            "turn": self.turn_weight,
+        output = _build_zero_output(pred_future_norm)
+        pred_class_losses: List[Tensor] = []
+        raw_pred_class_losses: List[Tensor] = []
+        pred_actual_buckets: Dict[str, List[Tensor]] = {
+            key: [] for key in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS
+        }
+        gt_actual_buckets: Dict[str, List[Tensor]] = {
+            key: [] for key in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS
         }
 
-        loss_terms: Dict[str, Tensor] = {}
-        pred_means: Dict[str, Tensor] = {}
-        gt_means: Dict[str, Tensor] = {}
-        actual_unit_terms: Dict[str, Tensor] = {}
-        pred_actual_unit_means: Dict[str, Tensor] = {}
-        gt_actual_unit_means: Dict[str, Tensor] = {}
-        raw_pred_loss = pred_future_norm.new_zeros(())
-        total_loss = pred_future_norm.new_zeros(())
+        class_specs = (
+            (VEHICLE_TYPE, "vehicle"),
+            (PEDESTRIAN_TYPE, "pedestrian"),
+            (BICYCLE_TYPE, "bicycle"),
+        )
+        for class_id, class_name in class_specs:
+            class_mask = agent_type == class_id
+            if not class_mask.any():
+                continue
 
-        for name, weight in component_to_weight.items():
-            pred_value = pred_stats[name]
-            gt_value = gt_stats[name].detach()
-            pred_mean = pred_value.mean()
-            gt_mean = gt_value.mean()
-            pred_means[f"pred_{name}"] = pred_mean
-            gt_means[f"gt_{name}"] = gt_mean
+            pred_class_future = pred_future_norm[class_mask]
+            gt_class_future = target_future_norm[class_mask].detach()
+            class_prev_control = prev_control[class_mask]
+            class_prev_valid = prev_control_valid[class_mask]
+            class_length = agent_length[class_mask]
 
-            if self.gt_excess_only:
-                effective = torch.relu(pred_value - gt_value)
+            if class_id == PEDESTRIAN_TYPE:
+                pred_stats = self._compute_pedestrian_stats(
+                    future_norm=pred_class_future,
+                    prev_control=class_prev_control,
+                    prev_control_valid=class_prev_valid,
+                )
+                gt_stats = self._compute_pedestrian_stats(
+                    future_norm=gt_class_future,
+                    prev_control=class_prev_control.detach(),
+                    prev_control_valid=class_prev_valid,
+                )
+                soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
+                effective_total = (
+                    pred_stats["hard"]
+                    + self.pedestrian_soft_weight * soft_effective
+                    + self.pedestrian_heading_weight * pred_stats["head"]
+                )
+                raw_total = (
+                    pred_stats["hard"]
+                    + self.pedestrian_soft_weight * pred_stats["soft"]
+                    + self.pedestrian_heading_weight * pred_stats["head"]
+                )
+                output["pedestrian_hard"] = pred_stats["hard"].mean()
+                output["pedestrian_soft"] = soft_effective.mean()
+                output["pedestrian_head"] = pred_stats["head"].mean()
+                output["pedestrian_total"] = effective_total.mean()
+                pred_actual_buckets["speed_excess_mps"].append(pred_stats["speed_excess_mps"].mean())
+                gt_actual_buckets["speed_excess_mps"].append(gt_stats["speed_excess_mps"].mean())
+                pred_actual_buckets["accel_excess_mps2"].append(pred_stats["accel_excess_mps2"].mean())
+                gt_actual_buckets["accel_excess_mps2"].append(gt_stats["accel_excess_mps2"].mean())
+                pred_actual_buckets["heading_error_deg"].append(pred_stats["heading_error_deg"].mean())
+                gt_actual_buckets["heading_error_deg"].append(gt_stats["heading_error_deg"].mean())
             else:
-                effective = pred_value
-            effective_mean = effective.mean()
-            loss_terms[name] = effective_mean
+                pred_stats = self._compute_vehicle_like_stats(
+                    future_norm=pred_class_future,
+                    prev_control=class_prev_control,
+                    prev_control_valid=class_prev_valid,
+                    agent_length=class_length,
+                    class_id=class_id,
+                )
+                gt_stats = self._compute_vehicle_like_stats(
+                    future_norm=gt_class_future,
+                    prev_control=class_prev_control.detach(),
+                    prev_control_valid=class_prev_valid,
+                    agent_length=class_length,
+                    class_id=class_id,
+                )
+                soft_weight = self.vehicle_soft_weight if class_id == VEHICLE_TYPE else self.bicycle_soft_weight
+                soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
+                effective_total = pred_stats["hard"] + soft_weight * soft_effective
+                raw_total = pred_stats["hard"] + soft_weight * pred_stats["soft"]
 
-            total_loss = total_loss + weight * effective_mean
-            raw_pred_loss = raw_pred_loss + weight * pred_mean
+                output[f"{class_name}_hard"] = pred_stats["hard"].mean()
+                output[f"{class_name}_soft"] = soft_effective.mean()
+                output[f"{class_name}_total"] = effective_total.mean()
+                pred_actual_buckets["speed_excess_mps"].append(pred_stats["speed_excess_mps"].mean())
+                gt_actual_buckets["speed_excess_mps"].append(gt_stats["speed_excess_mps"].mean())
+                pred_actual_buckets["accel_excess_mps2"].append(pred_stats["accel_excess_mps2"].mean())
+                gt_actual_buckets["accel_excess_mps2"].append(gt_stats["accel_excess_mps2"].mean())
+                pred_actual_buckets["steer_excess_deg"].append(pred_stats["steer_excess_deg"].mean())
+                gt_actual_buckets["steer_excess_deg"].append(gt_stats["steer_excess_deg"].mean())
+                pred_actual_buckets["steer_rate_excess_degps"].append(pred_stats["steer_rate_excess_degps"].mean())
+                gt_actual_buckets["steer_rate_excess_degps"].append(gt_stats["steer_rate_excess_degps"].mean())
+                pred_actual_buckets["lat_accel_excess_mps2"].append(pred_stats["lat_accel_excess_mps2"].mean())
+                gt_actual_buckets["lat_accel_excess_mps2"].append(gt_stats["lat_accel_excess_mps2"].mean())
 
-        for name in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
-            pred_value = pred_stats[name]
-            gt_value = gt_stats[name].detach()
-            pred_actual_unit_means[f"pred_{name}"] = pred_value.mean()
-            gt_actual_unit_means[f"gt_{name}"] = gt_value.mean()
+            pred_class_losses.append(effective_total.mean())
+            raw_pred_class_losses.append(raw_total.mean())
 
-            if self.gt_excess_only:
-                effective = torch.relu(pred_value - gt_value)
-            else:
-                effective = pred_value
-            actual_unit_terms[name] = effective.mean()
+        output["loss"] = self._mean_list_or_zero(pred_class_losses, pred_future_norm)
+        output["raw_pred_loss"] = self._mean_list_or_zero(raw_pred_class_losses, pred_future_norm)
+        for key in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
+            output[f"pred_{key}"] = self._mean_list_or_zero(pred_actual_buckets[key], pred_future_norm)
+            output[f"gt_{key}"] = self._mean_list_or_zero(gt_actual_buckets[key], pred_future_norm)
+            output[key] = output[f"pred_{key}"]
+        return output
 
-        return {
-            "loss": total_loss,
-            "raw_pred_loss": raw_pred_loss,
-            **loss_terms,
-            **pred_means,
-            **gt_means,
-            **actual_unit_terms,
-            **pred_actual_unit_means,
-            **gt_actual_unit_means,
-        }
-
-    def _compute_proxy_penalties(
+    def _compute_vehicle_like_stats(
         self,
         future_norm: Tensor,
-        limits: Dict[str, Tensor],
+        prev_control: Tensor,
+        prev_control_valid: Tensor,
+        agent_length: Tensor,
+        class_id: int,
+    ) -> Dict[str, Tensor]:
+        """차량 또는 자전거의 역추론 물리량을 계산합니다.
+
+        Args:
+            future_norm: 정규화 미래입니다. shape은 ``[n_agent, T, 4]`` 입니다.
+            prev_control: 직전 구간 제어입니다.
+                shape은 ``[n_agent, 3]`` 이고 마지막 차원은 ``[v_x^b, v_y^b, omega]`` 입니다.
+            prev_control_valid: 직전 제어 유효 여부입니다. shape은 ``[n_agent]`` 입니다.
+            agent_length: agent box length입니다. shape은 ``[n_agent]`` 입니다.
+            class_id: ``vehicle`` 또는 ``bicycle``의 종류 번호입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                hard, soft, 실제 단위 초과량을 담은 사전입니다.
+                각 값의 shape은 ``[n_agent]`` 입니다.
+        """
+        pos_local_m, heading_local = self._denormalize_future(future_norm)
+        pos_seq, heading_seq = self._prepend_virtual_start(pos_local_m, heading_local)
+        delta_pos = pos_seq[:, 1:] - pos_seq[:, :-1]
+        heading_prev = heading_seq[:, :-1]
+        delta_heading = self._wrap_angle(heading_seq[:, 1:] - heading_seq[:, :-1])
+
+        progress_dir = torch.stack([heading_prev.cos(), heading_prev.sin()], dim=-1)
+        speed = (delta_pos * progress_dir).sum(dim=-1) / self.dt
+
+        speed_floor = speed.abs().clamp_min(self.speed_floor_mps)
+        curvature = delta_heading / (speed_floor * self.dt)
+
+        wheelbase_scale = self.vehicle_wheelbase_scale if class_id == VEHICLE_TYPE else self.bicycle_wheelbase_scale
+        steer_max_rad = self.vehicle_steer_max_rad if class_id == VEHICLE_TYPE else self.bicycle_steer_max_rad
+        steer_rate_max_radps = (
+            self.vehicle_steer_rate_max_radps
+            if class_id == VEHICLE_TYPE
+            else self.bicycle_steer_rate_max_radps
+        )
+        wheelbase = wheelbase_scale * agent_length.clamp_min(0.1)
+        steer = torch.atan(wheelbase.unsqueeze(-1) * curvature)
+
+        v_pre = prev_control[:, 0]
+        omega_pre = prev_control[:, 2]
+        steer_pre = torch.atan(
+            wheelbase * omega_pre / v_pre.abs().clamp_min(self.speed_floor_mps)
+        )
+        prev_valid = prev_control_valid.to(dtype=future_norm.dtype)
+
+        accel = speed.new_zeros(speed.shape)
+        accel[:, 0] = prev_valid * (speed[:, 0] - v_pre) / self.dt
+        if speed.shape[1] > 1:
+            accel[:, 1:] = (speed[:, 1:] - speed[:, :-1]) / self.dt
+
+        steer_rate = steer.new_zeros(steer.shape)
+        steer_rate[:, 0] = prev_valid * (steer[:, 0] - steer_pre) / self.dt
+        if steer.shape[1] > 1:
+            steer_rate[:, 1:] = (steer[:, 1:] - steer[:, :-1]) / self.dt
+
+        lat_accel = speed.abs().square() * curvature.abs()
+
+        v_max = self._select_limit(self.limit_table.v_max_mps, class_id, future_norm)
+        a_max = self._select_limit(self.limit_table.a_max_mps2, class_id, future_norm)
+        a_lat_max = self._select_limit(self.limit_table.a_lat_max_mps2, class_id, future_norm)
+
+        hard = self._mean_over_time(
+            self._phi(speed.abs() / v_max - 1.0)
+            + self._phi(accel.abs() / a_max - 1.0)
+            + self._phi(steer.abs() / steer_max_rad - 1.0)
+            + self._phi(steer_rate.abs() / steer_rate_max_radps - 1.0)
+            + self._phi(lat_accel / a_lat_max - 1.0)
+        )
+
+        if accel.shape[1] > 1:
+            accel_delta = accel[:, 1:] - accel[:, :-1]
+            steer_rate_delta = steer_rate[:, 1:] - steer_rate[:, :-1]
+            soft = self._mean_over_time(
+                (accel_delta / a_max).square()
+                + (steer_rate_delta / steer_rate_max_radps).square()
+            )
+        else:
+            soft = hard.new_zeros(hard.shape)
+
+        return {
+            "hard": hard,
+            "soft": soft,
+            "speed_excess_mps": self._mean_over_time(torch.relu(speed.abs() - v_max)),
+            "accel_excess_mps2": self._mean_over_time(torch.relu(accel.abs() - a_max)),
+            "steer_excess_deg": self._mean_over_time(torch.rad2deg(torch.relu(steer.abs() - steer_max_rad))),
+            "steer_rate_excess_degps": self._mean_over_time(
+                torch.rad2deg(torch.relu(steer_rate.abs() - steer_rate_max_radps))
+            ),
+            "lat_accel_excess_mps2": self._mean_over_time(torch.relu(lat_accel - a_lat_max)),
+        }
+
+    def _compute_pedestrian_stats(
+        self,
+        future_norm: Tensor,
         prev_control: Tensor,
         prev_control_valid: Tensor,
     ) -> Dict[str, Tensor]:
-        """한 미래 궤적 묶음의 physics proxy penalty를 계산합니다.
+        """사람의 2차원 속도와 2차원 가속도를 계산합니다.
 
         Args:
-            future_norm: 정규화 미래 궤적입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
-            limits: anchor별 제한값 사전입니다.
-                각 값의 shape은 ``[n_valid_anchor]`` 입니다.
-            prev_control: anchor 직전 구간 제어입니다.
-                shape은 ``[n_valid_anchor, 3]`` 입니다.
-            prev_control_valid: 직전 구간 제어 유효 여부입니다.
-                shape은 ``[n_valid_anchor]`` 입니다.
+            future_norm: 정규화 미래입니다. shape은 ``[n_agent, T, 4]`` 입니다.
+            prev_control: 직전 구간 제어입니다.
+                shape은 ``[n_agent, 3]`` 이고 마지막 차원은 ``[v_x^b, v_y^b, omega]`` 입니다.
+            prev_control_valid: 직전 제어 유효 여부입니다. shape은 ``[n_agent]`` 입니다.
 
         Returns:
             Dict[str, Tensor]:
-                각 항목별 anchor 단위 penalty입니다.
-                각 값의 shape은 ``[n_valid_anchor]`` 입니다.
+                hard, soft, head, 실제 단위 값을 담은 사전입니다.
+                각 값의 shape은 ``[n_agent]`` 입니다.
         """
         pos_local_m, heading_local = self._denormalize_future(future_norm)
-        vx_body, vy_body, omega = self._trajectory_to_body_controls(pos_local_m, heading_local)
+        pos_seq, _ = self._prepend_virtual_start(pos_local_m, heading_local)
+        vel_vec = (pos_seq[:, 1:] - pos_seq[:, :-1]) / self.dt
+        speed = torch.linalg.norm(vel_vec, dim=-1)
 
-        speed = torch.sqrt(vx_body.square() + vy_body.square() + self.eps)
-        nonholonomic = limits["is_nonholonomic"].unsqueeze(-1)
-        accel_limit = limits["a_max_mps2"] * self.dt
-        yaw_accel_limit = limits["alpha_max_radps2"] * self.dt
+        prev_vel = prev_control[:, :2]
+        prev_valid = prev_control_valid.to(dtype=future_norm.dtype).unsqueeze(-1)
+        accel_vec = vel_vec.new_zeros(vel_vec.shape)
+        accel_vec[:, 0] = prev_valid * (vel_vec[:, 0] - prev_vel) / self.dt
+        if vel_vec.shape[1] > 1:
+            accel_vec[:, 1:] = (vel_vec[:, 1:] - vel_vec[:, :-1]) / self.dt
+        accel = torch.linalg.norm(accel_vec, dim=-1)
 
-        speed_pen = self._mean_over_time(
-            self._normalized_square_penalty(
-                value=speed,
-                limit=limits["v_max_mps"].unsqueeze(-1),
-            )
-        )
-        speed_excess_mps = self._mean_over_time(
-            torch.relu(speed - limits["v_max_mps"].unsqueeze(-1))
-        )
-
-        beta = torch.atan2(vy_body.abs(), vx_body.abs() + self.eps)
-        beta_limit = limits["beta_max_rad"].unsqueeze(-1)
-        beta_pen = self._normalized_square_penalty(
-            value=beta,
-            limit=beta_limit,
-            enabled=beta_limit > 0.0,
-        )
-        slip_pen = self._mean_over_time(torch.where(nonholonomic, beta_pen, torch.zeros_like(beta_pen)))
-        beta_excess_deg = torch.rad2deg(torch.relu(beta - beta_limit))
-        slip_beta_excess_deg = self._mean_over_time(
-            torch.where(
-                nonholonomic & (beta_limit > 0.0),
-                beta_excess_deg,
-                torch.zeros_like(beta_excess_deg),
-            )
+        v_max = self._select_limit(self.limit_table.v_max_mps, PEDESTRIAN_TYPE, future_norm)
+        a_max = self._select_limit(self.limit_table.a_max_mps2, PEDESTRIAN_TYPE, future_norm)
+        hard = self._mean_over_time(
+            self._phi(speed / v_max - 1.0)
+            + self._phi(accel / a_max - 1.0)
         )
 
-        if vx_body.shape[1] > 0:
-            speed_x = vx_body
-            # 첫 delta는 직전 anchor 제어와 이어 붙인 경계차분으로 계산합니다.
-            dv = torch.empty_like(speed_x)
-            dw = torch.empty_like(omega)
-            dv[:, 0] = (speed_x[:, 0] - prev_control[:, 0]).abs()
-            dw[:, 0] = (omega[:, 0] - prev_control[:, 2]).abs()
-            if speed_x.shape[1] > 1:
-                dv[:, 1:] = (speed_x[:, 1:] - speed_x[:, :-1]).abs()
-                dw[:, 1:] = (omega[:, 1:] - omega[:, :-1]).abs()
-            delta_enabled = nonholonomic.expand(-1, dv.shape[1]).clone()
-            delta_enabled[:, 0] = delta_enabled[:, 0] & prev_control_valid
-
-            accel_pen = self._masked_mean_over_time(
-                self._normalized_square_penalty(dv, accel_limit.unsqueeze(-1)),
-                enabled=delta_enabled,
-            )
-            yaw_accel_pen = self._masked_mean_over_time(
-                self._normalized_square_penalty(dw, yaw_accel_limit.unsqueeze(-1)),
-                enabled=delta_enabled,
-            )
-            accel_excess_mps2 = self._masked_mean_over_time(
-                torch.relu(dv / self.dt - limits["a_max_mps2"].unsqueeze(-1)),
-                enabled=delta_enabled,
-            )
-            yaw_accel_excess_degps2 = self._masked_mean_over_time(
-                torch.rad2deg(torch.relu(dw / self.dt - limits["alpha_max_radps2"].unsqueeze(-1))),
-                enabled=delta_enabled,
-            )
+        if accel_vec.shape[1] > 1:
+            accel_delta = accel_vec[:, 1:] - accel_vec[:, :-1]
+            accel_delta_norm = torch.linalg.norm(accel_delta, dim=-1)
+            soft = self._mean_over_time((accel_delta_norm / a_max).square())
         else:
-            accel_pen = speed_pen.new_zeros(speed_pen.shape)
-            yaw_accel_pen = speed_pen.new_zeros(speed_pen.shape)
-            accel_excess_mps2 = speed_pen.new_zeros(speed_pen.shape)
-            yaw_accel_excess_degps2 = speed_pen.new_zeros(speed_pen.shape)
+            soft = hard.new_zeros(hard.shape)
 
-        omega_abs_pen = self._normalized_square_penalty(
-            value=omega.abs(),
-            limit=limits["omega_max_abs_radps"].unsqueeze(-1),
+        vel_angle = torch.atan2(vel_vec[..., 1], vel_vec[..., 0])
+        heading_gap = self._wrap_angle(heading_local - vel_angle)
+        heading_mask = speed > self.pedestrian_heading_speed_threshold_mps
+        head = self._mean_over_time(
+            torch.where(heading_mask, heading_gap.square(), torch.zeros_like(heading_gap))
         )
-        turn_yaw_rate_excess_degps = self._mean_over_time(
-            torch.rad2deg(torch.relu(omega.abs() - limits["omega_max_abs_radps"].unsqueeze(-1)))
-        )
-        lat_acc_value = speed * omega.abs()
-        lat_acc_pen = self._normalized_square_penalty(
-            value=lat_acc_value,
-            limit=limits["a_lat_max_mps2"].unsqueeze(-1),
-        )
-        turn_lat_accel_excess_mps2 = self._mean_over_time(
-            torch.where(
-                nonholonomic,
-                torch.relu(lat_acc_value - limits["a_lat_max_mps2"].unsqueeze(-1)),
-                torch.zeros_like(lat_acc_value),
-            )
-        )
-        radius_value = vx_body.abs() / (omega.abs() + self.eps)
-        radius_shortfall = torch.relu(limits["r_min_m"].unsqueeze(-1) - radius_value)
-        turn_radius_shortfall_m = self._mean_over_time(
-            torch.where(nonholonomic, radius_shortfall, torch.zeros_like(radius_shortfall))
-        )
-        radius_pen = self._square_from_normalized_excess(
-            radius_shortfall / (limits["r_min_m"].unsqueeze(-1) + self.eps)
-        )
-        turn_pen = self._mean_over_time(
-            omega_abs_pen
-            + torch.where(nonholonomic, lat_acc_pen + radius_pen, torch.zeros_like(lat_acc_pen))
+        heading_error_deg = self._masked_mean_over_time(
+            torch.rad2deg(heading_gap.abs()),
+            heading_mask,
         )
 
         return {
-            "speed": speed_pen,
-            "slip": slip_pen,
-            "accel": accel_pen,
-            "yaw_accel": yaw_accel_pen,
-            "turn": turn_pen,
-            "speed_excess_mps": speed_excess_mps,
-            "slip_beta_excess_deg": slip_beta_excess_deg,
-            "accel_excess_mps2": accel_excess_mps2,
-            "yaw_accel_excess_degps2": yaw_accel_excess_degps2,
-            "turn_yaw_rate_excess_degps": turn_yaw_rate_excess_degps,
-            "turn_lat_accel_excess_mps2": turn_lat_accel_excess_mps2,
-            "turn_radius_shortfall_m": turn_radius_shortfall_m,
+            "hard": hard,
+            "soft": soft,
+            "head": head,
+            "speed_excess_mps": self._mean_over_time(torch.relu(speed - v_max)),
+            "accel_excess_mps2": self._mean_over_time(torch.relu(accel - a_max)),
+            "heading_error_deg": heading_error_deg,
         }
 
-    def _gather_limits(
+    def _select_limit(
         self,
-        packed_agent_type: Tensor,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Dict[str, Tensor]:
-        """anchor별 에이전트 종류에 맞는 제한값을 펼칩니다.
+        values: Tuple[float, float, float],
+        class_id: int,
+        reference: Tensor,
+    ) -> Tensor:
+        """클래스 하나에 대응하는 제한값 스칼라를 텐서로 만듭니다.
 
         Args:
-            packed_agent_type: anchor 순서대로 압축한 종류 인덱스입니다.
-                shape은 ``[n_valid_anchor]`` 입니다.
-            device: 제한값을 올릴 장치입니다.
-            dtype: 제한값 자료형입니다.
+            values: ``[vehicle, pedestrian, bicycle]`` 순서의 제한값입니다.
+            class_id: 읽고 싶은 종류 번호입니다.
+            reference: device와 dtype를 맞출 기준 텐서입니다.
+                shape은 임의입니다.
 
         Returns:
-            Dict[str, Tensor]:
-                anchor별 제한값 사전입니다.
-                각 값의 shape은 ``[n_valid_anchor]`` 입니다.
+            Tensor:
+                스칼라 제한값 텐서입니다. shape은 ``[]`` 입니다.
         """
-        agent_type = packed_agent_type.to(device=device, dtype=torch.long).clamp(min=0, max=2)
-
-        def _select(values: Tuple[float, float, float]) -> Tensor:
-            table = torch.tensor(values, device=device, dtype=dtype)
-            return table[agent_type]
-
-        return {
-            "v_max_mps": _select(DEFAULT_LIMITS.v_max_mps),
-            "a_max_mps2": _select(DEFAULT_LIMITS.a_max_mps2),
-            "alpha_max_radps2": _select(DEFAULT_LIMITS.alpha_max_radps2),
-            "a_lat_max_mps2": _select(DEFAULT_LIMITS.a_lat_max_mps2),
-            "r_min_m": _select(DEFAULT_LIMITS.r_min_m),
-            "omega_max_abs_radps": _select(DEFAULT_LIMITS.omega_max_abs_radps),
-            "beta_max_rad": _select(DEFAULT_LIMITS.beta_max_rad),
-            "is_nonholonomic": agent_type != 1,
-        }
+        return reference.new_tensor(float(values[class_id]))
 
     def _denormalize_future(self, future_norm: Tensor) -> Tuple[Tensor, Tensor]:
-        """정규화 미래를 meter 단위 local 궤적으로 바꿉니다.
+        """정규화 미래를 meter 단위 위치와 heading으로 바꿉니다.
 
         Args:
-            future_norm: 정규화 미래입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            future_norm: 정규화 미래입니다. shape은 ``[n_agent, T, 4]`` 입니다.
 
         Returns:
             Tuple[Tensor, Tensor]:
-                meter 단위 local 위치 ``[n_valid_anchor, 20, 2]`` 와
-                local heading ``[n_valid_anchor, 20]`` 입니다.
+                meter 단위 위치 ``[n_agent, T, 2]`` 와 heading ``[n_agent, T]`` 입니다.
         """
         pos_local_m = future_norm[..., :2] * self.pos_scale_m
         heading_local = torch.atan2(future_norm[..., 3], future_norm[..., 2])
         return pos_local_m, heading_local
 
-    def _trajectory_to_body_controls(
+    def _prepend_virtual_start(
         self,
         pos_local_m: Tensor,
         heading_local: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
-        """local 미래 궤적을 몸체 기준 제어 시퀀스로 바꿉니다.
-
-        현재 시점은 ``[0, 0, 0]`` 으로 두고,
-        각 구간마다 ``[v_x^b, v_y^b, omega]`` 를 단순 차분으로 구합니다.
+    ) -> Tuple[Tensor, Tensor]:
+        """가상 0번째 step을 앞에 붙입니다.
 
         Args:
-            pos_local_m: meter 단위 local 위치입니다.
-                shape은 ``[n_valid_anchor, 20, 2]`` 입니다.
-            heading_local: local heading입니다.
-                shape은 ``[n_valid_anchor, 20]`` 입니다.
+            pos_local_m: meter 단위 위치입니다. shape은 ``[n_agent, T, 2]`` 입니다.
+            heading_local: heading입니다. shape은 ``[n_agent, T]`` 입니다.
 
         Returns:
-            Tuple[Tensor, Tensor, Tensor]:
-                앞방향 속도, 옆방향 속도, 회전속도입니다.
-                각 shape은 ``[n_valid_anchor, 20]`` 입니다.
+            Tuple[Tensor, Tensor]:
+                0번째 step이 붙은 위치 ``[n_agent, T+1, 2]`` 와
+                heading ``[n_agent, T+1]`` 입니다.
         """
-        num_anchor = pos_local_m.shape[0]
-        pos_zero = pos_local_m.new_zeros((num_anchor, 1, 2))
-        heading_zero = heading_local.new_zeros((num_anchor, 1))
+        num_agent = pos_local_m.shape[0]
+        pos_zero = pos_local_m.new_zeros((num_agent, 1, 2))
+        heading_zero = heading_local.new_zeros((num_agent, 1))
+        return torch.cat([pos_zero, pos_local_m], dim=1), torch.cat([heading_zero, heading_local], dim=1)
 
-        pos_seq = torch.cat([pos_zero, pos_local_m], dim=1)
-        heading_seq = torch.cat([heading_zero, heading_local], dim=1)
+    def _phi(self, value: Tensor) -> Tensor:
+        """hard 위반 함수 ``[z]_+^2`` 를 계산합니다.
 
-        delta_pos = pos_seq[:, 1:] - pos_seq[:, :-1]
-        heading_start = heading_seq[:, :-1]
-        delta_heading = self._wrap_angle(heading_seq[:, 1:] - heading_seq[:, :-1])
+        Args:
+            value: 입력 텐서입니다. shape은 임의입니다.
 
-        cos_head = heading_start.cos()
-        sin_head = heading_start.sin()
-        vx_body = (delta_pos[..., 0] * cos_head + delta_pos[..., 1] * sin_head) / self.dt
-        vy_body = (-delta_pos[..., 0] * sin_head + delta_pos[..., 1] * cos_head) / self.dt
-        omega = delta_heading / self.dt
-        return vx_body, vy_body, omega
+        Returns:
+            Tensor: 같은 shape의 penalty입니다.
+        """
+        return torch.relu(value).square()
 
-    def _normalized_square_penalty(
+    def _mean_list_or_zero(
         self,
-        value: Tensor,
-        limit: Tensor,
-        enabled: Tensor | None = None,
+        values: List[Tensor],
+        reference: Tensor,
     ) -> Tensor:
-        """값이 제한을 넘은 정도를 부드럽게 제곱 penalty로 바꿉니다.
+        """스칼라 목록 평균을 구하고 비어 있으면 0을 돌려줍니다.
 
         Args:
-            value: 실제값입니다. shape은 ``[...,]`` 입니다.
-            limit: 제한값입니다. shape은 ``[...,]`` 또는 브로드캐스트 가능한 shape입니다.
-            enabled: ``True`` 인 위치만 penalty를 켭니다.
-                shape은 ``[...,]`` 또는 브로드캐스트 가능한 shape입니다.
+            values: 스칼라 텐서 목록입니다.
+            reference: 0을 만들 때 device와 dtype를 맞출 기준 텐서입니다.
+                shape은 임의입니다.
 
         Returns:
-            Tensor:
-                같은 shape의 penalty입니다.
+            Tensor: 스칼라 평균값입니다.
         """
-        normalized_excess = torch.relu(value - limit) / (limit.abs() + self.eps)
-        penalty = self._square_from_normalized_excess(normalized_excess)
-        if enabled is None:
-            return penalty
-        return torch.where(enabled, penalty, penalty.new_zeros(()))
-
-    def _square_from_normalized_excess(self, normalized_excess: Tensor) -> Tensor:
-        """정규화 초과량을 부드러운 dead-zone 제곱 penalty로 바꿉니다.
-
-        Args:
-            normalized_excess: 0 이상 정규화 초과량입니다.
-                shape은 ``[...,]`` 입니다.
-
-        Returns:
-            Tensor:
-                같은 shape의 penalty입니다.
-        """
-        shifted = (normalized_excess - self.deadzone_ratio) / max(self.deadzone_softness, self.eps)
-        smooth = torch.nn.functional.softplus(shifted) * max(self.deadzone_softness, self.eps)
-        return smooth.square()
+        if len(values) == 0:
+            return reference.new_zeros(())
+        return torch.stack(values).mean()
 
     def _mean_over_time(self, value: Tensor) -> Tensor:
         """시간축 평균을 계산합니다.
 
         Args:
-            value: 마지막 축이 시간인 텐서입니다. shape은 ``[n_valid_anchor, T]`` 입니다.
+            value: 마지막 축이 시간인 텐서입니다. shape은 ``[n_agent, T]`` 입니다.
 
         Returns:
             Tensor:
-                anchor별 평균값입니다. shape은 ``[n_valid_anchor]`` 입니다.
+                에이전트별 평균값입니다. shape은 ``[n_agent]`` 입니다.
         """
-        if value.dim() == 1:
-            return value
+        if value.shape[-1] == 0:
+            return value.new_zeros(value.shape[:-1])
         return value.mean(dim=-1)
 
     def _masked_mean_over_time(self, value: Tensor, enabled: Tensor) -> Tensor:
-        """시간축에서 활성화된 위치만 평균합니다."""
+        """시간축에서 활성화된 위치만 평균합니다.
+
+        Args:
+            value: 마지막 축이 시간인 텐서입니다. shape은 ``[n_agent, T]`` 입니다.
+            enabled: 평균에 포함할지 표시하는 마스크입니다.
+                shape은 ``[n_agent, T]`` 입니다.
+
+        Returns:
+            Tensor:
+                에이전트별 마스크 평균입니다. shape은 ``[n_agent]`` 입니다.
+        """
         masked_value = torch.where(enabled, value, torch.zeros_like(value))
-        if value.dim() == 1:
-            return masked_value
         enabled_count = enabled.to(dtype=value.dtype).sum(dim=-1).clamp_min(1.0)
         return masked_value.sum(dim=-1) / enabled_count
 

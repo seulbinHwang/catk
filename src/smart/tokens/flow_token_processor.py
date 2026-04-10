@@ -82,9 +82,11 @@ class FlowTokenProcessor(TokenProcessor):
         )
 
         if self.training:
+            agent_length = self._get_agent_box_length(tokenized_agent)
             flow_train_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
             flow_train_chunks: List[Tensor] = []
             flow_train_agent_type_chunks: List[Tensor] = []
+            flow_train_agent_length_chunks: List[Tensor] = []
             flow_train_prev_control_chunks: List[Tensor] = []
             flow_train_prev_control_valid_chunks: List[Tensor] = []
 
@@ -119,6 +121,7 @@ class FlowTokenProcessor(TokenProcessor):
                     raw_step=raw_step,
                 )
                 flow_train_agent_type_chunks.append(tokenized_agent["type"][train_anchor_mask])
+                flow_train_agent_length_chunks.append(agent_length[train_anchor_mask])
                 flow_train_prev_control_chunks.append(prev_control)
                 flow_train_prev_control_valid_chunks.append(prev_control_valid)
 
@@ -133,6 +136,11 @@ class FlowTokenProcessor(TokenProcessor):
                     "flow_train_agent_type": self._concat_vector_chunks(
                         chunks=flow_train_agent_type_chunks,
                         dtype=tokenized_agent["type"].dtype,
+                        device=device,
+                    ),
+                    "flow_train_agent_length": self._concat_vector_chunks(
+                        chunks=flow_train_agent_length_chunks,
+                        dtype=dtype,
                         device=device,
                     ),
                     "flow_train_prev_control": self._concat_matrix_chunks(
@@ -294,6 +302,31 @@ class FlowTokenProcessor(TokenProcessor):
         prev_control[:, 2] = delta_head / 0.1
         prev_control[~prev_control_valid] = 0.0
         return prev_control, prev_control_valid
+
+    def _get_agent_box_length(self, tokenized_agent: Dict[str, Tensor]) -> Tensor:
+        """DRaFT inverse feasibility에 쓸 box length를 고릅니다.
+
+        raw data의 shape 순서가 ``[length, width]`` 인지 ``[width, length]`` 인지
+        전처리 경로에 따라 달라질 수 있어서,
+        첫 두 축 가운데 더 큰 값을 length로 사용합니다.
+        raw shape가 없으면 토큰화용 고정 ``[width, length]`` 값을 대신 사용합니다.
+
+        Args:
+            tokenized_agent: 에이전트 토큰 사전입니다.
+                ``shape`` 는 보통 ``[n_agent, 2]`` 또는 ``[n_agent, 3]`` 이고,
+                ``token_agent_shape`` 는 ``[n_agent, 2]`` 입니다.
+
+        Returns:
+            Tensor:
+                anchor 전 공통으로 쓸 box length입니다. shape은 ``[n_agent]`` 입니다.
+        """
+        if "shape" in tokenized_agent:
+            shape = tokenized_agent["shape"].to(dtype=torch.float32)
+            if shape.dim() >= 2 and shape.shape[-1] >= 2:
+                return shape[..., :2].amax(dim=-1)
+
+        token_shape = tokenized_agent["token_agent_shape"].to(dtype=torch.float32)
+        return token_shape[..., 1]
 
     def _concat_flow_chunks(
         self,
