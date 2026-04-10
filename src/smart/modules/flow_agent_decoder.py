@@ -720,6 +720,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_noise: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        bptt_start_step: int | None = None,
+        max_steps: int | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -731,6 +733,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 고정 난수 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
+            bptt_start_step: Truncated BPTT의 gradient 시작 coarse step입니다.
+                None이면 모든 step에서 gradient를 계산합니다 (full BPTT).
+            max_steps: 실행할 최대 coarse step 수입니다. None이면 n_step_future_2hz 전체를 실행합니다.
+                예: max_steps=3이면 3 × 0.5s = 1.5s만 rollout합니다.
 
         Returns:
             Dict[str, torch.Tensor]:
@@ -741,6 +747,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         n_agent = int(state["n_agent"])
         n_step_future_10hz = int(state["n_step_future_10hz"])
         n_step_future_2hz = int(state["n_step_future_2hz"])
+        if max_steps is not None:
+            n_step_future_2hz = min(n_step_future_2hz, max_steps)
         max_context_steps = int(state["max_context_steps"])
         pos_window = state["pos_window"]
         head_window = state["head_window"]
@@ -814,6 +822,22 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             delta_state = None
 
         for t in range(n_step_future_2hz):
+            # Truncated BPTT: at bptt_start_step, detach all autoregressive state so that
+            # gradient only flows through the remaining (n_step_future_2hz - bptt_start_step)
+            # coarse steps.  Steps before bptt_start_step still produce trajectory chunks
+            # (needed for computing the full-sequence RMM), but those chunks carry no gradient.
+            if bptt_start_step is not None and t == bptt_start_step:
+                pos_window = pos_window.detach()
+                head_window = head_window.detach()
+                head_vector_window = head_vector_window.detach()
+                feat_a = feat_a.detach()
+                feat_a_t_dict = {k: v.detach() for k, v in feat_a_t_dict.items()}
+                agent_token_emb = agent_token_emb.detach()
+                if v_state is not None:
+                    v_state = v_state.detach()
+                if delta_state is not None:
+                    delta_state = delta_state.detach()
+
             n_step = pos_window.shape[1]
             if t == 0:
                 current_hidden = feat_a_now
