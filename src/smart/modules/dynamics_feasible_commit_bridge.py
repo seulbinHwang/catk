@@ -69,7 +69,7 @@ class DynamicsAwareFeasibleCommitBridge:
         pos_scale_m: float = 20.0,
         preview_steps: int = 20,
         commit_steps: int = 5,
-        smoothing_alpha: float = 0.85,
+        smoothing_alpha: float = 0.9,
         q_terminal_speed: float = 10.0,
         r_accel: float = 1.0,
         q_terminal_lateral: float = 1.0,
