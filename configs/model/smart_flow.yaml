@@ -46,7 +46,7 @@ model_config:
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
-    flow_solver_steps: 16
+    flow_solver_steps: 4
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
   sim_agents_submission:
@@ -65,3 +65,5 @@ model_config:
     feasible_weight: 1.0
     smooth_deadzone_epsilon: [0.01, 0.01, 0.01]
     smooth_deadzone_tau: 0.002
+    # FinetuneConfig 기본은 true(velocity_head만). 기존 실험은 전체 flow_decoder FT 유지.
+    flow_velocity_head_only: false

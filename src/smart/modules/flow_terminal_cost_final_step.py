@@ -865,7 +865,13 @@ class TerminalCostFinalStepLoss(nn.Module):
                         mask=valid_window,
                         inference_mask=inference_mask,
                     )
-                    edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
+                    edge_index_t = torch.stack(
+                        (
+                            edge_index_t[0],
+                            (edge_index_t[1] + 1) // n_step - 1,
+                        ),
+                        dim=0,
+                    )
 
                     edge_index_pl2a, r_pl2a = agent_decoder.build_map2agent_edge(
                         pos_pl=map_feature["position"],

@@ -157,6 +157,23 @@ class SMARTFlowDecoder(nn.Module):
             scenario_sampling_seeds=scenario_sampling_seeds,
         )
 
+    def rollout_from_cache_no_grad(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        sampling_noise: DictConfig,
+        sampling_seed: int | None = None,
+        scenario_sampling_seeds: Tensor | None = None,
+    ) -> Dict[str, Tensor]:
+        return self.agent_encoder.rollout_from_cache_no_grad(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_noise=sampling_noise,
+            sampling_seed=sampling_seed,
+            scenario_sampling_seeds=scenario_sampling_seeds,
+        )
 
     def sample_open_loop_future(
         self,

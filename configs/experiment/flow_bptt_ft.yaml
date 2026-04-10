@@ -1,0 +1,70 @@
+# @package _global_
+# 없으면 Hydra가 이 파일을 experiment 패키지 아래로 묶어 model 병합이 깨짐
+# (ConfigCompositionException: Could not override 'model@experiment.model').
+
+defaults:
+  - override /model: smart_flow
+
+action: finetune
+
+model:
+  model_config:
+    lr: 5e-5
+    lr_warmup_steps: 200
+    lr_total_steps: -1
+    lr_min_ratio: 1e-2
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+    n_rollout_closed_val: 16
+    # validation 시 official SimAgents RMM (CPU 풀) + 비디오: batch_idx < n_vis_batch 일 때만
+    n_batch_sim_agents_metric: 10
+    n_vis_batch: 1
+    n_vis_scenario: 2
+    n_vis_rollout: 4
+    val_open_loop: true
+    val_closed_loop: true
+    # Flow ODE 적분 스텝 (기본 smart_flow.yaml 은 16; 여기서 실험 프리셋만 덮어씀)
+    decoder:
+      flow_solver_steps: 4
+    kinematic_projection:
+      enabled: false
+    finetune:
+      enabled: true
+      mode: rmm_bptt_ft
+      rollout_steps: 4
+      rollout_noise_scale: 1.0
+      bptt_n_rollouts: 2
+      rmm_bptt_use_ref_model: false
+      # true: HierarchicalFlowDecoder.velocity_head만 학습 (FinetuneConfig 코드 기본과 동일)
+      flow_velocity_head_only: true
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.01
+  # 학습 배치(스텝) 5번마다 validation 전체 루프 → official RMM + (n_vis_*) 비디오
+  check_val_every_n_epoch: null
+  val_check_interval: 5
+  max_epochs: 10
+  log_every_n_steps: 1
+  precision: 32-true
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    # kinematic off 이면 val_kinematic/* 가 없음 → closed-loop 메타메트릭 사용
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+    save_top_k: -1
+
+data:
+  train_batch_size: 16
+  val_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1
+  # soft RMM 계산용 scenario/tfrecord 정합을 위해 validation split 사용
+  train_raw_dir: ${paths.cache_root}/validation
+  train_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
+  train_use_val_transform: true

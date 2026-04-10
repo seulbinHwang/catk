@@ -34,18 +34,18 @@ class FinetuneConfig:
     flow_reg_lambda: float = 0.0
     reward_huber_beta: float = 0.05
     # ── DICE / IQ-Learn ────────────────────────────────────────────────────
-    dice_critic_hidden: int = 256       # critic MLP hidden dim
-    dice_action_hidden: int = 128       # action encoder hidden dim
-    dice_critic_lr: float = 3e-4        # critic (sidecar) optimizer LR
-    dice_critic_updates_per_actor: int = 1  # critic steps per actor step
-    dice_reward_enabled: bool = False   # on/off switch for external reward
-    dice_reward_weight: float = 1.0     # scale of external reward term
-    dice_bc_lambda: float = 0.0         # BC (flow-matching) regularization weight
+    dice_critic_hidden: int = 256
+    dice_action_hidden: int = 128
+    dice_critic_lr: float = 3e-4
+    dice_critic_updates_per_actor: int = 1
+    dice_reward_enabled: bool = False
+    dice_reward_weight: float = 1.0
+    dice_bc_lambda: float = 0.0
     # ── Flow-DPO ──────────────────────────────────────────────────────────────
-    dpo_beta: float = 0.1              # DPO temperature β
-    dpo_n_samples: int = 8             # MC samples for FM log-prob estimation
-    dpo_use_ref_model: bool = True     # True → use frozen pretrained as reference
-    dpo_bc_lambda: float = 0.0         # optional BC regularization weight
+    dpo_beta: float = 0.1
+    dpo_n_samples: int = 8
+    dpo_use_ref_model: bool = True
+    dpo_bc_lambda: float = 0.0
     # ── Flow-EPG ──────────────────────────────────────────────────────────────
     epg_n_rollouts: int = 4            # G: number of rollouts per scenario
     epg_beta: float = 0.1             # KL regularisation weight β
@@ -63,6 +63,12 @@ class FinetuneConfig:
     rwr_n_samples: int = 8           # MC samples for FM log-prob (ELBO)
     rwr_anchor_discount: float = 1.0  # γ: temporal discount per anchor step (1=uniform)
     rwr_head_only: bool = False      # True → only residual_velocity_head trained
+    # ── RMM-BPTT ───────────────────────────────────────────────────────────────
+    bptt_n_rollouts: int = 2
+    rmm_bptt_use_ref_model: bool = False
+    #: True → ``HierarchicalFlowDecoder.velocity_head`` 만 학습 (트렁크·residual 동결).
+    #: ``flow_epg_ft``/``flow_rwr_ft`` 의 ``*_head_only``(residual 전용)보다 우선하지 않음.
+    flow_velocity_head_only: bool = True
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -146,6 +152,9 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         rwr_n_samples=int(_read_config_value(finetune, "rwr_n_samples", 8)),
         rwr_anchor_discount=float(_read_config_value(finetune, "rwr_anchor_discount", 1.0)),
         rwr_head_only=bool(_read_config_value(finetune, "rwr_head_only", False)),
+        bptt_n_rollouts=int(_read_config_value(finetune, "bptt_n_rollouts", 2)),
+        rmm_bptt_use_ref_model=bool(_read_config_value(finetune, "rmm_bptt_use_ref_model", False)),
+        flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
     )
 
 
@@ -201,10 +210,9 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         "terminal_cost_full_grad",
         "kinematic_proj_ft",    # ODE generate → KinematicProjection → FM target
         "kinematic_reward_ft",  # ODE full-grad → KinematicProjection as reward → reward grad
-        "dice_ft",              # DICE / IQ-Learn imitation learning (Chi^2 f-divergence)
-        "flow_dpo_ft",          # Flow-DPO: GT vs policy rollout pairwise DPO
         "flow_epg_ft",          # Flow-EPG: Exact Policy Gradient with ELBO + RMM reward
         "flow_rwr_ft",          # Flow-RWR: Reward-Weighted Regression with GPU RMM
+        "rmm_bptt_ft",          # RMM-BPTT: differentiable soft RMM through closed-loop rollout
     }:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 
@@ -235,6 +243,32 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             f"{mode_tag} head-only mode: flow_decoder trunk frozen, "
             "only residual_velocity_head is trainable (zero-initialized)."
         )
+        return config
+
+    # ── velocity_head만 학습 (트렁크·residual 동결) ─────────────────────────
+    if config.flow_velocity_head_only:
+        try:
+            velocity_head = flow_decoder.velocity_head
+        except AttributeError as exc:
+            raise AttributeError(
+                "flow_velocity_head_only=True requires velocity_head on flow_decoder "
+                "(HierarchicalFlowDecoder)."
+            ) from exc
+        _set_requires_grad(flow_decoder, False)
+        _set_requires_grad(velocity_head, True)
+        if residual_head is not None:
+            for p in residual_head.parameters():
+                p.data.zero_()
+            _set_requires_grad(residual_head, False)
+            log.info(
+                "Finetuning mode: only velocity_head trainable; flow_decoder trunk frozen; "
+                "residual_velocity_head zeroed+frozen."
+            )
+        else:
+            log.info(
+                "Finetuning mode: only velocity_head trainable; flow_decoder trunk frozen "
+                "(no residual_velocity_head)."
+            )
         return config
 
     # ── 기본: 전체 flow_decoder 학습 ─────────────────────────────────────────

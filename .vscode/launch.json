@@ -325,6 +325,62 @@
         "task_name=debug_flow_dpo_ft"
       ],
       "subProcess": false
+    },
+    {
+      "name": "Debug run.py (flow_bptt_ft)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/run.py",
+      "python": "/home2/pnc2/miniforge3/envs/catk/bin/python",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "HYDRA_FULL_ERROR": "1",
+        "PYTHONPATH": "${workspaceFolder}",
+        "CUDA_VISIBLE_DEVICES": "2",
+        "WANDB_MODE": "offline",
+        "WANDB_SILENT": "true"
+      },
+      "args": [
+        "action=finetune",
+        "experiment=flow_bptt_ft",
+        "ckpt_path=/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt",
+        "task_name=debug_flow_bptt_ft",
+        "trainer.max_epochs=1",
+        "trainer.limit_train_batches=1",
+        "trainer.limit_val_batches=1",
+        "trainer.val_check_interval=5",
+        "trainer.check_val_every_n_epoch=null",
+        "trainer.log_every_n_steps=1",
+        "trainer.accelerator=gpu",
+        "trainer.devices=1",
+        "trainer.precision=32-true",
+        "trainer.gradient_clip_val=1.0",
+        "paths.cache_root=/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1",
+        "data.train_batch_size=2",
+        "data.val_batch_size=2",
+        "data.train_max_num=8",
+        "data.num_workers=2",
+        "data.prefetch_factor=1",
+        "data.persistent_workers=true",
+        "data.pin_memory=true",
+        "logger.wandb.offline=true",
+        "model.model_config.lr=5e-5",
+        "model.model_config.lr_warmup_steps=200",
+        "model.model_config.lr_total_steps=-1",
+        "model.model_config.lr_min_ratio=1e-2",
+        "model.model_config.weight_decay=1e-4",
+        "model.model_config.finetune.rollout_steps=4",
+        "model.model_config.finetune.rollout_noise_scale=1.0",
+        "model.model_config.finetune.bptt_n_rollouts=2",
+        "model.model_config.finetune.rmm_bptt_use_ref_model=false",
+        "model.model_config.n_vis_batch=1",
+        "model.model_config.n_vis_scenario=2",
+        "model.model_config.n_vis_rollout=4",
+        "model.model_config.delete_local_videos_after_wandb_upload=false"
+      ],
+      "subProcess": false
     }
   ]
 }

@@ -3,8 +3,9 @@ from __future__ import annotations
 import gc
 import hashlib
 import math
+import os
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Tuple
 
 import hydra
 import torch
@@ -24,10 +25,15 @@ from src.smart.metrics.flow_metrics import (
     yaw_fde_2s,
 )
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
-from src.smart.modules.flow_dice_critic import DICECritic
-from src.smart.modules.flow_dpo import flow_dpo_loss as _flow_dpo_loss
-from src.smart.modules.flow_epg import flow_epg_loss as _flow_epg_loss
-from src.smart.modules.flow_rwr import flow_rwr_loss as _flow_rwr_loss
+# try:
+#     from src.smart.modules.flow_epg import flow_epg_loss as _flow_epg_loss
+# except Exception:
+#     _flow_epg_loss = None
+
+# try:
+#     from src.smart.modules.flow_rwr import flow_rwr_loss as _flow_rwr_loss
+# except Exception:
+#     _flow_rwr_loss = None
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.modules.flow_reward import KinematicProjectionReward
 from src.smart.utils.geometry import wrap_angle
@@ -39,6 +45,19 @@ from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
 from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+
+
+#Surrogate metrics
+from waymo_open_dataset.protos import scenario_pb2, sim_agents_metrics_pb2
+from src.smart.metrics.wosac_metric_features_torch.metric_features_torch_differentiable import (
+    PredictedSimTrajectories,
+    compute_metric_features_from_predicted_sim_trajectories,
+)
+from src.smart.metrics.wosac_metametric_pytorch_differentiable import (
+    compute_wosac_metametric_soft,
+    WosacMetametricSoftResult,
+)
+from src.smart.metrics.wosac_metric_features_torch.surrogate import SurrogateConfig
 
 
 class SMARTFlow(LightningModule):
@@ -71,9 +90,9 @@ class SMARTFlow(LightningModule):
         self.adjoint_matching_loss = None
         self.terminal_cost_final_step_loss: TerminalCostFinalStepLoss | None = None
         self.kinematic_reward_fn: KinematicProjectionReward | None = None
-        self.dice_critic: DICECritic | None = None
-        self.ref_flow_decoder: nn.Module | None = None  # frozen ref for Flow-DPO
-        self._dpo_debug_path: str | None = None         # JSONL debug log path
+        self.ref_flow_decoder: nn.Module | None = None
+        self._dpo_debug_path: str | None = None
+        self.dice_critic: nn.Module | None = None
         if self.finetune_config.enabled:
             if self.finetune_config.mode == "adjoint_matching":
                 self.adjoint_matching_loss = AdjointMatchingLoss(
@@ -95,9 +114,6 @@ class SMARTFlow(LightningModule):
                     smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
                     flow_reg_lambda=self.finetune_config.flow_reg_lambda,
                 )
-            elif self.finetune_config.mode == "kinematic_proj_ft":
-                # 별도 loss 모듈 없음 — _run_kinematic_proj_ft_step이 직접 처리
-                pass
             elif self.finetune_config.mode == "kinematic_reward_ft":
                 # KinematicProjectionReward는 plain callable — TerminalCostFinalStepLoss가
                 # BPTT ODE 인프라를 제공하고 forward_reward_grad로 reward를 연결합니다.
@@ -111,38 +127,6 @@ class SMARTFlow(LightningModule):
                     flow_reg_lambda=self.finetune_config.flow_reg_lambda,
                 )
                 # kinematic_reward_fn은 kinematic_projector가 설정된 후 (아래) 초기화됩니다.
-            elif self.finetune_config.mode == "dice_ft":
-                # DICE / IQ-Learn: TerminalCostFinalStepLoss는 BPTT ODE 인프라 제공용.
-                # DICECritic은 hidden_dim이 필요해서 여기서 초기화.
-                self.terminal_cost_final_step_loss = TerminalCostFinalStepLoss(
-                    rollout_steps=self.finetune_config.rollout_steps,
-                    rollout_noise_scale=self.finetune_config.rollout_noise_scale,
-                    feasible_weight=self.finetune_config.feasible_weight,
-                    smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
-                    smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
-                    flow_reg_lambda=0.0,  # BC는 dice_bc_lambda로 별도 제어
-                )
-                _hidden_dim = int(model_config.decoder.hidden_dim)
-                self.dice_critic = DICECritic(
-                    d_state=_hidden_dim,
-                    T=20,
-                    action_hidden=self.finetune_config.dice_action_hidden,
-                    critic_hidden=self.finetune_config.dice_critic_hidden,
-                )
-                # kinematic_reward_fn은 dice_reward_enabled=True이고
-                # kinematic_projector가 설정된 후 초기화됩니다.
-            elif self.finetune_config.mode == "flow_dpo_ft":
-                # Flow-DPO: GT vs policy rollout pairwise DPO.
-                # TerminalCostFinalStepLoss가 policy rollout (y_l) 생성 인프라를 제공합니다.
-                # ref_flow_decoder는 on_train_start()에서 checkpoint 로드 후 복사합니다.
-                self.terminal_cost_final_step_loss = TerminalCostFinalStepLoss(
-                    rollout_steps=self.finetune_config.rollout_steps,
-                    rollout_noise_scale=self.finetune_config.rollout_noise_scale,
-                    feasible_weight=self.finetune_config.feasible_weight,
-                    smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
-                    smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
-                    flow_reg_lambda=0.0,
-                )
             elif self.finetune_config.mode == "flow_epg_ft":
                 # Flow-EPG: Exact Policy Gradient with ELBO likelihood + RMM reward.
                 # ref_flow_decoder는 on_train_start()에서 checkpoint 로드 후 복사합니다.
@@ -153,6 +137,12 @@ class SMARTFlow(LightningModule):
                 # Flow-RWR: Reward-Weighted Regression with GPU RMM.
                 # Uses GPU RMM (no TFRecords required) → works on training split.
                 # No reference model or manual optimization needed.
+                pass
+            elif self.finetune_config.mode == "kinematic_proj_ft":
+                # ODE → KinematicProjection → FM target; 별도 loss 모듈 불필요.
+                pass
+            elif self.finetune_config.mode == "rmm_bptt_ft":
+                # RMM BPTT: Reward-Weighted Regression with BPTT.
                 pass
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
@@ -209,32 +199,37 @@ class SMARTFlow(LightningModule):
 
         # Final projection: ODE 완료 후 마지막 한 번만 kinematic projection 적용 (PPR final-step only 버전)
         final_proj_cfg = getattr(model_config, "final_projection", None)
+        kin_cfg = getattr(model_config, "kinematic_projection", None)
+
+        def _kin_proj_from_cfg() -> KinematicProjection:
+            """kinematic_projection 블록이 있으면 그 하이퍼파라미터를 쓰고, 없으면 기본값."""
+            def _ka(attr: str, default):
+                return getattr(kin_cfg, attr, default) if kin_cfg is not None else default
+
+            return KinematicProjection(
+                coord_scale=20.0,
+                dt=0.1,
+                wheelbase=float(_ka("wheelbase", 2.7)),
+                delta_max=float(_ka("delta_max", 0.52)),
+                a_max=float(_ka("a_max", 4.0)),
+                d_max=float(_ka("d_max", 8.0)),
+                delta_rate_max=float(_ka("delta_rate_max", 0.6)),
+                ped_a_max=float(_ka("ped_a_max", 2.0)),
+                eps=float(_ka("eps", 1e-6)),
+                use_lqr=bool(_ka("use_lqr", True)),
+                lqr_q_xy=float(_ka("lqr_q_xy", 2.0)),
+                lqr_q_yaw=float(_ka("lqr_q_yaw", 2.0)),
+                lqr_q_v=float(_ka("lqr_q_v", 0.5)),
+                lqr_q_delta=float(_ka("lqr_q_delta", 0.2)),
+                lqr_r_a=float(_ka("lqr_r_a", 0.2)),
+                lqr_r_delta_rate=float(_ka("lqr_r_delta_rate", 0.2)),
+                lqr_qf_scale=float(_ka("lqr_qf_scale", 2.0)),
+            )
+
         self._final_proj_kin_projector: KinematicProjection | None = None
         self.final_proj_generator: ProjectedFlowGenerator | None = None  # deprecated, no longer used
         if final_proj_cfg is not None and getattr(final_proj_cfg, "enabled", False):
-            # kinematic_projection 설정이 있으면 그 파라미터를 재사용, 없으면 기본값
-            kin_cfg = getattr(model_config, "kinematic_projection", None)
-            def _kp(attr: str, default):
-                return getattr(kin_cfg, attr, default) if kin_cfg is not None else default
-            self._final_proj_kin_projector = KinematicProjection(
-                coord_scale=20.0,
-                dt=0.1,
-                wheelbase=float(_kp("wheelbase", 2.7)),
-                delta_max=float(_kp("delta_max", 0.52)),
-                a_max=float(_kp("a_max", 4.0)),
-                d_max=float(_kp("d_max", 8.0)),
-                delta_rate_max=float(_kp("delta_rate_max", 0.6)),
-                ped_a_max=float(_kp("ped_a_max", 2.0)),
-                eps=float(_kp("eps", 1e-6)),
-                use_lqr=bool(_kp("use_lqr", True)),
-                lqr_q_xy=float(_kp("lqr_q_xy", 2.0)),
-                lqr_q_yaw=float(_kp("lqr_q_yaw", 2.0)),
-                lqr_q_v=float(_kp("lqr_q_v", 0.5)),
-                lqr_q_delta=float(_kp("lqr_q_delta", 0.2)),
-                lqr_r_a=float(_kp("lqr_r_a", 0.2)),
-                lqr_r_delta_rate=float(_kp("lqr_r_delta_rate", 0.2)),
-                lqr_qf_scale=float(_kp("lqr_qf_scale", 2.0)),
-            )
+            self._final_proj_kin_projector = _kin_proj_from_cfg()
             self.val_final_proj_epoch_metrics = nn.ModuleDict(
                 {
                     "final_proj_ADE2s": WeightedMeanMetric(),
@@ -253,30 +248,8 @@ class SMARTFlow(LightningModule):
             }
         )
 
-        # Kinematic projection: per-step post-processing inside FlowODE.generate
-        # Vehicle/Cyclist → non-holonomic heading projection + deadzone
-        # Pedestrian → point-mass magnitude deadzone + speed clipping
-        kin_cfg = getattr(model_config, "kinematic_projection", None)
         if kin_cfg is not None and getattr(kin_cfg, "enabled", False):
-            _kin_proj = KinematicProjection(
-                coord_scale=20.0,  # flow target에서 사용하는 스케일과 동일
-                dt=0.1,
-                wheelbase=float(getattr(kin_cfg, "wheelbase", 2.7)),
-                delta_max=float(getattr(kin_cfg, "delta_max", 0.52)),
-                a_max=float(getattr(kin_cfg, "a_max", 4.0)),
-                d_max=float(getattr(kin_cfg, "d_max", 8.0)),
-                delta_rate_max=float(getattr(kin_cfg, "delta_rate_max", 0.6)),
-                ped_a_max=float(getattr(kin_cfg, "ped_a_max", 2.0)),
-                eps=float(getattr(kin_cfg, "eps", 1e-6)),
-                use_lqr=bool(getattr(kin_cfg, "use_lqr", True)),
-                lqr_q_xy=float(getattr(kin_cfg, "lqr_q_xy", 2.0)),
-                lqr_q_yaw=float(getattr(kin_cfg, "lqr_q_yaw", 2.0)),
-                lqr_q_v=float(getattr(kin_cfg, "lqr_q_v", 0.5)),
-                lqr_q_delta=float(getattr(kin_cfg, "lqr_q_delta", 0.2)),
-                lqr_r_a=float(getattr(kin_cfg, "lqr_r_a", 0.2)),
-                lqr_r_delta_rate=float(getattr(kin_cfg, "lqr_r_delta_rate", 0.2)),
-                lqr_qf_scale=float(getattr(kin_cfg, "lqr_qf_scale", 2.0)),
-            )
+            _kin_proj = _kin_proj_from_cfg()
             # attach to the agent encoder so both open-loop and closed-loop paths use it
             self.encoder.agent_encoder.kinematic_projector = _kin_proj
             self.encoder.agent_encoder.use_predict_project_renoise = bool(
@@ -321,14 +294,6 @@ class SMARTFlow(LightningModule):
         ):
             raise ValueError(
                 "kinematic_reward_ft requires kinematic_projection.enabled=True"
-            )
-        elif (
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "dice_ft"
-            and self.finetune_config.dice_reward_enabled
-        ):
-            raise ValueError(
-                "dice_ft with dice_reward_enabled=True requires kinematic_projection.enabled=True"
             )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
@@ -846,6 +811,7 @@ class SMARTFlow(LightningModule):
         rollout_cache: Dict[str, object],
         rollout_indices: Sequence[int],
         return_anchor_hidden: bool = False,
+        full_grad: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
@@ -874,13 +840,22 @@ class SMARTFlow(LightningModule):
                 rollout_idx=int(rollout_indices[0]),
                 device=scenario_device,
             )
-            pred = self.encoder.rollout_from_cache(
-                rollout_cache=rollout_cache,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                sampling_noise=self.eval_sampling_noise,
-                scenario_sampling_seeds=scenario_sampling_seeds,
-            )
+            if full_grad:
+                pred = self.encoder.rollout_from_cache(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_noise=self.eval_sampling_noise,
+                    scenario_sampling_seeds=scenario_sampling_seeds,
+                )
+            else:
+                pred = self.encoder.rollout_from_cache_no_grad(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_noise=self.eval_sampling_noise,
+                    scenario_sampling_seeds=scenario_sampling_seeds,
+                )
             base_ret = (
                 pred["pred_traj_10hz"].unsqueeze(1),
                 pred["pred_z_10hz"].unsqueeze(1),
@@ -911,13 +886,22 @@ class SMARTFlow(LightningModule):
             rollout_cache=rollout_cache,
             repeat_count=chunk_size,
         )
-        pred = self.encoder.rollout_from_cache(
-            rollout_cache=expanded_rollout_cache,
-            tokenized_agent=expanded_tokenized_agent,
-            map_feature=expanded_map_feature,
-            sampling_noise=self.eval_sampling_noise,
-            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
-        )
+        if full_grad:
+            pred = self.encoder.rollout_from_cache(
+                rollout_cache=expanded_rollout_cache,
+                tokenized_agent=expanded_tokenized_agent,
+                map_feature=expanded_map_feature,
+                sampling_noise=self.eval_sampling_noise,
+                scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+            )
+        else:
+            pred = self.encoder.rollout_from_cache_no_grad(
+                rollout_cache=expanded_rollout_cache,
+                tokenized_agent=expanded_tokenized_agent,
+                map_feature=expanded_map_feature,
+                sampling_noise=self.eval_sampling_noise,
+                scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+            )
         base_ret = (
             self._reshape_parallel_rollout_prediction(
                 pred["pred_traj_10hz"],
@@ -1200,22 +1184,21 @@ class SMARTFlow(LightningModule):
             and self.terminal_cost_final_step_loss is not None
         )
 
-    # ──────────────────────────────────────────────────────────────────────
-    # DICE / IQ-Learn fine-tuning
-    # ──────────────────────────────────────────────────────────────────────
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Flow-DPO
-    # ──────────────────────────────────────────────────────────────────────────
+    def _is_rmm_bptt_ft_enabled(self) -> bool:
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "rmm_bptt_ft"
+            and self.compute_differentiable_rmm_batch is not None
+            and self.compute_trajectory_rmm_loss is not None
+        )
 
     def on_train_start(self) -> None:
-        """checkpoint 로드 후 frozen reference model 생성 (Flow-DPO / Flow-EPG 전용)."""
         _needs_ref = (
             self.finetune_config.enabled
             and self.ref_flow_decoder is None
             and (
-                (self.finetune_config.mode == "flow_dpo_ft" and self.finetune_config.dpo_use_ref_model)
-                or (self.finetune_config.mode == "flow_epg_ft" and self.finetune_config.epg_use_ref_model)
+                (self.finetune_config.mode == "flow_epg_ft" and self.finetune_config.epg_use_ref_model)
+                or (self.finetune_config.mode == "rmm_bptt_ft" and self.finetune_config.rmm_bptt_use_ref_model)
             )
         )
         if _needs_ref:
@@ -1225,30 +1208,6 @@ class SMARTFlow(LightningModule):
             for p in self.ref_flow_decoder.parameters():
                 p.requires_grad_(False)
             print(f"[{self.finetune_config.mode}] frozen reference model created from pretrained checkpoint.")
-
-        # debug JSONL path — use Lightning logger dir if available
-        if (
-            self.finetune_config.enabled
-            and self.finetune_config.mode in {"flow_dpo_ft", "flow_epg_ft"}
-            and self.global_rank == 0
-        ):
-            try:
-                log_dir = self.logger.experiment.dir  # wandb
-            except Exception:
-                try:
-                    log_dir = self.logger.log_dir  # csv / tensorboard
-                except Exception:
-                    log_dir = "/tmp"
-            import os
-            prefix = "dpo" if self.finetune_config.mode == "flow_dpo_ft" else "epg"
-            self._dpo_debug_path = os.path.join(str(log_dir), f"{prefix}_debug.jsonl")
-            print(f"[{self.finetune_config.mode}] debug log → {self._dpo_debug_path}")
-
-    def _is_flow_dpo_ft_enabled(self) -> bool:
-        return bool(
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "flow_dpo_ft"
-        )
 
     def _is_flow_epg_ft_enabled(self) -> bool:
         return bool(
@@ -1261,48 +1220,6 @@ class SMARTFlow(LightningModule):
             self.finetune_config.enabled
             and self.finetune_config.mode == "flow_rwr_ft"
         )
-
-    def _maybe_write_dpo_debug(
-        self,
-        batch_idx: int,
-        anchor_hidden: Tensor,
-        y_w: Tensor,
-        y_l: Tensor,
-        metrics: dict,
-    ) -> None:
-        """DPO 학습 상태를 JSONL 파일에 기록합니다 (rank-0, 10 step마다)."""
-        if self._dpo_debug_path is None or self.global_rank != 0:
-            return
-        step = int(self.global_step)
-        if step % 10 != 0:
-            return
-        import json
-        record: dict = {
-            "step": step,
-            "batch_idx": int(batch_idx),
-            "n_agents": int(anchor_hidden.shape[0]),
-            "dpo_loss": float(metrics.get("train/dpo_loss", float("nan"))),
-            "log_p_w": float(metrics.get("train/dpo_log_p_w", float("nan"))),
-            "log_p_l": float(metrics.get("train/dpo_log_p_l", float("nan"))),
-            "margin": float(metrics.get("train/dpo_margin", float("nan"))),
-            "pref_acc": float(metrics.get("train/dpo_pref_acc", float("nan"))),
-        }
-        if "train/dpo_log_ratio_w" in metrics:
-            record["log_ratio_w"] = float(metrics["train/dpo_log_ratio_w"])
-            record["log_ratio_l"] = float(metrics["train/dpo_log_ratio_l"])
-        record["rmm_winner"] = float(metrics.get("train/rmm_winner", float("nan")))
-        record["rmm_loser"] = float(metrics.get("train/rmm_loser", float("nan")))
-        record["rmm_margin"] = float(metrics.get("train/rmm_margin", float("nan")))
-        # Snapshot trajectory norms for lightweight sanity check
-        with torch.no_grad():
-            record["y_w_norm_mean"] = float(y_w.norm(dim=-1).mean())
-            record["y_l_norm_mean"] = float(y_l.norm(dim=-1).mean())
-            record["y_w_l2_mean"] = float((y_w - y_l).norm(dim=-1).mean())
-        try:
-            with open(self._dpo_debug_path, "a") as f:
-                f.write(json.dumps(record) + "\n")
-        except OSError:
-            pass
 
     def _world_traj_to_flow_norm(
         self,
@@ -1328,69 +1245,37 @@ class SMARTFlow(LightningModule):
             dim=-1,
         )
 
-    def _compute_rmm_pair(
+
+
+    def _compute_soft_rmm(
         self,
-        data: dict,
-        agent_ids: Tensor,   # [n_agents]
-        agent_batch: Tensor, # [n_agents] scenario index
-        pred_traj: Tensor,   # [n_agents, 2, 80, 2]
-        pred_z: Tensor,      # [n_agents, 2, 80]
-        pred_head: Tensor,   # [n_agents, 2, 80]
-    ):
-        """Compute RMM for rollout-0 and rollout-1 separately.
-
-        Returns:
-            Tuple of two float Tensors, each [n_scenarios].
-        """
-        import multiprocessing as mp
-        from src.smart.metrics import _sim_agents_worker, SimAgentsMetrics
-
-        scenario_files = data.get("tfrecord_path", None)
-        if scenario_files is None:
-            n_sc = len(data["scenario_id"])
-            zeros = torch.zeros(n_sc)
-            return zeros, zeros
-
-        n_scenarios = len(scenario_files)
-        agent_batch_cpu = agent_batch.cpu()
-
-        # Split tensors by scenario
-        sizes = [int((agent_batch_cpu == i).sum()) for i in range(n_scenarios)]
-        ids_list = agent_ids.cpu().split(sizes)
-        traj_list = pred_traj.cpu().split(sizes)
-        z_list = pred_z.cpu().split(sizes)
-        head_list = pred_head.cpu().split(sizes)
-
-        config_bytes = SimAgentsMetrics._load_config_bytes()
-
-        # Build args: rollout 0 and rollout 1 for all scenarios (interleaved)
-        args_all = []
-        for i in range(n_scenarios):
-            ids_np = ids_list[i].numpy()
-            t_np = traj_list[i].numpy()   # [n_i, 2, 80, 2]
-            z_np = z_list[i].numpy()
-            h_np = head_list[i].numpy()
-            args_all.append((config_bytes, scenario_files[i], ids_np,
-                             t_np[:, 0:1, :, :], z_np[:, 0:1, :], h_np[:, 0:1, :]))
-            args_all.append((config_bytes, scenario_files[i], ids_np,
-                             t_np[:, 1:2, :, :], z_np[:, 1:2, :], h_np[:, 1:2, :]))
-
-        try:
-            mp.set_start_method("forkserver", force=True)
-        except RuntimeError:
-            pass
-
-        import os
-        n_pool = min(len(args_all), max(1, (os.cpu_count() or 8) // 4))
-        with mp.Pool(processes=n_pool) as pool:
-            results = pool.starmap(_sim_agents_worker, args_all)
-            pool.close()
-            pool.join()
-
-        # Deinterleave: [r0_sc0, r1_sc0, r0_sc1, r1_sc1, ...]
-        rmm_0 = torch.tensor([results[2 * i] for i in range(n_scenarios)], dtype=torch.float32)
-        rmm_1 = torch.tensor([results[2 * i + 1] for i in range(n_scenarios)], dtype=torch.float32)
-        return rmm_0, rmm_1
+        scenario: scenario_pb2.Scenario,
+        x:    Tensor,  # [A, 80]
+        y:    Tensor,
+        z:    Tensor,
+        head: Tensor,
+        agent_ids: Tensor,
+        valid: Tensor,
+        log_feat_dict: dict,
+        config: sim_agents_metrics_pb2.SimAgentMetricsConfig,
+    ) -> WosacMetametricSoftResult:
+        pred = PredictedSimTrajectories(
+            object_id=agent_ids.cpu(),
+            center_x=x, center_y=y, center_z=z, heading=head, valid=valid,
+        )
+        SURROGATE = SurrogateConfig(
+            collision_temperature=0.15,
+            offroad_temperature=0.15,
+            red_light_crossing_temperature=0.05,
+        )
+        sim_feat = compute_metric_features_from_predicted_sim_trajectories(
+            scenario=scenario, pred=pred, surrogate=SURROGATE,
+        )
+        return compute_wosac_metametric_soft(
+            config=config,
+            log_features=log_feat_dict,
+            sim_features=sim_feat.as_dict(),
+        )
 
     def _compute_rmm_group(
         self,
@@ -1452,484 +1337,367 @@ class SMARTFlow(LightningModule):
         rmm = torch.tensor(results, dtype=torch.float32).reshape(n_scenarios, G)
         return rmm
 
-    def _run_flow_epg_ft_step(
+    # def _run_flow_epg_ft_step(
+    #     self,
+    #     tokenized_map: Dict[str, Tensor],
+    #     tokenized_agent: Dict[str, Tensor],
+    #     batch_idx: int = 0,
+    #     data: dict | None = None,
+    # ) -> dict:
+    #     """Flow-EPG fine-tuning step (Exact Policy Gradient + ELBO + RMM reward).
+
+    #     Generates G closed-loop rollouts from the same initial state, scores each
+    #     with RMM, computes group-normalised advantages, and updates the flow decoder
+    #     via the EPG objective:
+
+    #         L = -E[ A^i · log π_θ(y^i) ] + β · KL(π_θ || π_ref)
+
+    #     G>1: A^i = (R^i - mean(R)) / (std(R) + ε).  G==1: rollout은 rollout 번호마다
+    #     순차 1회씩 수집하고, baseline은 ``finetune.epg_single_rollout_baseline``로
+    #     지정 가능(None이면 mean(R)=R, std=1 → advantage 0).
+    #     """
+    #     flow_ode = self.encoder.agent_encoder.flow_ode
+    #     flow_decoder = self.encoder.agent_encoder.flow_decoder
+    #     G = self.finetune_config.epg_n_rollouts
+
+    #     # ── 1. Encode map + all 13 anchors ────────────────────────────────────
+    #     with torch.no_grad():
+    #         map_feature = self.encoder.encode_map(tokenized_map)
+    #         _, anchor_hidden_all, _ = self.encoder.encode_anchor_context_from_map_feature(
+    #             map_feature=map_feature,
+    #             tokenized_agent=tokenized_agent,
+    #             anchor_mask_key="flow_train_mask",
+    #         )
+    #         # anchor_hidden_all: [n_agents, 13, hidden_dim]
+
+    #     flow_train_mask = tokenized_agent["flow_train_mask"]   # [n_agents, 13]
+    #     first_anchor_mask = flow_train_mask[:, 0]              # [n_agents] bool
+
+    #     if not first_anchor_mask.any():
+    #         dummy = next(iter(flow_decoder.parameters()))
+    #         return {"loss": dummy.sum() * 0.0}
+
+    #     # ── 2. Generate G closed-loop rollouts ────────────────────────────────
+    #     with torch.no_grad():
+    #         rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+    #             tokenized_agent=tokenized_agent,
+    #             map_feature=map_feature,
+    #         )
+    #         if G == 1:
+    #             traj_c: list[Tensor] = []
+    #             z_c: list[Tensor] = []
+    #             head_c: list[Tensor] = []
+    #             ah_c: list[Tensor] = []
+    #             for g in range(G):
+    #                 pt, pz, ph, pah = self._run_parallel_rollout_chunk(
+    #                     data=data,
+    #                     tokenized_agent=tokenized_agent,
+    #                     map_feature=map_feature,
+    #                     rollout_cache=rollout_cache,
+    #                     rollout_indices=[g],
+    #                     return_anchor_hidden=True,
+    #                 )
+    #                 traj_c.append(pt)
+    #                 z_c.append(pz)
+    #                 head_c.append(ph)
+    #                 ah_c.append(pah)
+    #             pred_traj = torch.cat(traj_c, dim=1)
+    #             pred_z = torch.cat(z_c, dim=1)
+    #             pred_head_traj = torch.cat(head_c, dim=1)
+    #             pred_anchor_hidden_2hz = torch.cat(ah_c, dim=1)
+    #         else:
+    #             pred_traj, pred_z, pred_head_traj, pred_anchor_hidden_2hz = self._run_parallel_rollout_chunk(
+    #                 data=data,
+    #                 tokenized_agent=tokenized_agent,
+    #                 map_feature=map_feature,
+    #                 rollout_cache=rollout_cache,
+    #                 rollout_indices=list(range(G)),
+    #                 return_anchor_hidden=True,
+    #             )
+    #         # pred_traj: [n_agents, G, 80, 2]  world XY at 10Hz
+
+    #     # ── 3. Compute RMM for each rollout per scenario ──────────────────────
+    #     agent_batch = tokenized_agent["batch"]   # [n_agents]
+    #     agent_ids = data["agent"]["id"] if data is not None else agent_batch
+
+    #     rmm_scores = self._compute_rmm_group(
+    #         data=data if data is not None else {},
+    #         agent_ids=agent_ids,
+    #         agent_batch=agent_batch,
+    #         pred_traj=pred_traj,
+    #         pred_z=pred_z,
+    #         pred_head=pred_head_traj,
+    #     )  # [n_scenarios, G]
+
+    #     # ── 4. Compute advantages: A^i = (R^i - mean(R)) / (std(R) + ε) ─────────
+    #     # Std-normalise within each group so advantage scale is O(1) regardless of
+    #     # how tightly the G rollout scores cluster.  This prevents the KL term from
+    #     # dominating when RMM scores are nearly identical (β · KL >> A without norm).
+    #     # G==1: group std is degenerate → σ=1, baseline은 epg_single_rollout_baseline 또는 mean(R).
+    #     dev = anchor_hidden_all.device
+    #     rmm_scores_d = rmm_scores.to(device=dev)                      # [n_scenarios, G]
+    #     if G == 1:
+    #         bcfg = self.finetune_config.epg_single_rollout_baseline
+    #         if bcfg is not None:
+    #             adv_mean = rmm_scores_d.new_full(rmm_scores_d.shape, float(bcfg))
+    #         else:
+    #             adv_mean = rmm_scores_d.mean(dim=-1, keepdim=True)
+    #         adv_std = torch.ones_like(rmm_scores_d)
+    #         advantages_sc = (rmm_scores_d - adv_mean) / adv_std
+    #     else:
+    #         adv_mean = rmm_scores_d.mean(dim=-1, keepdim=True)
+    #         adv_std = rmm_scores_d.std(dim=-1, keepdim=True).clamp(min=1e-6)
+    #         advantages_sc = (rmm_scores_d - adv_mean) / adv_std           # [n_scenarios, G]
+
+    #     # ── 5. Determine usable anchor steps ──────────────────────────────────
+    #     # Training anchor k: reference at abs 10Hz step 10+5k, target = steps 11+5k to 30+5k.
+    #     # pred_traj_10hz[:, j] = abs step 11+j  (committed from rollout step j//5).
+    #     # Correct target for anchor k: pred_traj[:, 5k : 5k+20] = abs steps 11+5k to 30+5k.
+    #     # Correct anchor_hidden: pred_anchor_hidden_2hz[:, k]  (conditioned on state at 10+5k).
+    #     # Correct reference:
+    #     #   k=0  → ctx_sampled_pos[:, 1]          (GT initial context pos, abs step 10)
+    #     #   k≥1  → pred_traj[:, 5k-1]             (rollout pos at abs step 10+5k)
+    #     ANCHOR_STRIDE = 5       # 2Hz = 5 10Hz steps
+    #     ANCHOR_FUTURE_LEN = 20  # 2s at 10Hz
+    #     n_pred_steps = pred_traj.shape[2]  # 80
+    #     n_anchors_total = anchor_hidden_all.shape[1]  # 13
+    #     n_hidden_steps = pred_anchor_hidden_2hz.shape[2]  # n_step_future_2hz (16)
+    #     n_anchors_usable = min(
+    #         n_anchors_total,                                                    # 13
+    #         (n_pred_steps - ANCHOR_FUTURE_LEN) // ANCHOR_STRIDE + 1,           # (80-20)//5+1=13
+    #         n_hidden_steps,                                                     # 16
+    #     )  # = 13
+
+    #     pred_traj_f = pred_traj.to(dtype=torch.float32, device=dev)
+    #     pred_head_f = pred_head_traj.to(dtype=torch.float32, device=dev)
+
+    #     # ctx_sampled_pos[:, 1] = GT pos at abs step 10 = anchor-0 reference.
+    #     ctx_sampled_pos = tokenized_agent["ctx_sampled_pos"].to(dtype=torch.float32, device=dev)
+    #     ctx_sampled_heading = tokenized_agent["ctx_sampled_heading"].to(dtype=torch.float32, device=dev)
+
+    #     # ── 6. Precompute rollout data for all anchors (shared across PPO epochs) ─
+    #     # Data collected once (expensive); gradient steps reuse it K times.
+    #     from src.smart.modules.flow_dpo import compute_fm_log_prob as _compute_log_prob
+    #     from copy import deepcopy
+
+    #     _K = self.finetune_config.epg_n_samples
+    #     t0 = float(flow_ode.eps)
+    #     ref_decoder = self.ref_flow_decoder if self.finetune_config.epg_use_ref_model else None
+
+    #     # Snapshot θ_old ONCE before any gradient steps (PPO-style).
+    #     old_flow_decoder = deepcopy(flow_decoder).eval()
+    #     for p in old_flow_decoder.parameters():
+    #         p.requires_grad_(False)
+
+    #     # Per-anchor precomputed tensors: anchor_hidden, trajectories, advantages, log_p_old, MC samples
+    #     anchor_data_list = []
+    #     anchor_hidden_0 = None
+
+    #     for k in range(n_anchors_usable):
+    #         valid_idx_k = flow_train_mask[:, k].nonzero(as_tuple=False).squeeze(-1)
+    #         if valid_idx_k.numel() == 0:
+    #             continue
+
+    #         n_valid_k = valid_idx_k.shape[0]
+
+    #         # FIXED: anchor_hidden at rollout step k (not k+1) → conditioned on abs step 10+5k.
+    #         anchor_hidden_k = (
+    #             pred_anchor_hidden_2hz[valid_idx_k, :, k, :]
+    #             .detach()
+    #             .to(dtype=torch.float32)
+    #         )  # [n_valid_k, G, d_model]
+    #         if k == 0:
+    #             anchor_hidden_0 = anchor_hidden_k[:, 0, :]  # saved for BC / debug
+
+    #         advantages_k = advantages_sc[agent_batch[valid_idx_k]]  # [n_valid_k, G]
+
+    #         # FIXED: target window = pred_traj[:, 5k : 5k+20] = abs steps 11+5k to 30+5k.
+    #         future_start = k * ANCHOR_STRIDE                          # 0, 5, 10, ...
+    #         future_slice = slice(future_start, future_start + ANCHOR_FUTURE_LEN)
+
+    #         traj_norm_list_k = []
+    #         for g in range(G):
+    #             y_world = pred_traj_f[valid_idx_k, g, future_slice, :]
+    #             h_world = pred_head_f[valid_idx_k, g, future_slice]
+    #             # FIXED: reference position at abs step 10+5k.
+    #             #   k=0 → GT context position (rollout hasn't started yet, same as GT)
+    #             #   k≥1 → pred_traj[:, 5k-1] = abs step 11+5k-1 = 10+5k
+    #             if k == 0:
+    #                 ref_pos_k_g = ctx_sampled_pos[valid_idx_k, 1, :]
+    #                 ref_head_k_g = ctx_sampled_heading[valid_idx_k, 1]
+    #             else:
+    #                 ref_pos_k_g = pred_traj_f[valid_idx_k, g, future_start - 1, :]
+    #                 ref_head_k_g = pred_head_f[valid_idx_k, g, future_start - 1]
+    #             traj_norm_list_k.append(
+    #                 self._world_traj_to_flow_norm(y_world, h_world, ref_pos_k_g, ref_head_k_g)
+    #             )
+    #         trajectories_k = torch.stack(traj_norm_list_k, dim=1)  # [n_valid_k, G, 20, 4]
+
+    #         # Shared MC samples (fixed across PPO epochs → stable rho comparison)
+    #         _n_k = n_valid_k * G
+    #         shared_t_k = t0 + (1.0 - t0) * torch.rand(_K, _n_k, device=dev, dtype=torch.float32)
+    #         shared_x0_k = torch.randn(_n_k, 20, 4, device=dev, dtype=torch.float32)
+
+    #         # log π_{θ_old}: computed once with frozen snapshot, same MC as log_p_theta
+    #         with torch.no_grad():
+    #             _traj_flat_k = trajectories_k.detach().reshape(_n_k, 20, 4)
+    #             _anchor_rep_k = anchor_hidden_k.reshape(_n_k, -1)
+    #             log_p_old_flat_k = _compute_log_prob(
+    #                 old_flow_decoder, _anchor_rep_k, _traj_flat_k, flow_ode,
+    #                 n_samples=_K, shared_t=shared_t_k, shared_x0=shared_x0_k,
+    #             )
+
+    #         anchor_data_list.append({
+    #             "anchor_hidden_k":  anchor_hidden_k,                   # [n_valid_k, G, d]
+    #             "trajectories_k":   trajectories_k.detach(),           # [n_valid_k, G, 20, 4]
+    #             "advantages_k":     advantages_k,                      # [n_valid_k, G]
+    #             "log_p_old_k":      log_p_old_flat_k.reshape(n_valid_k, G),  # [n_valid_k, G]
+    #             "shared_t_k":       shared_t_k,                        # [K, n_valid_k*G]
+    #             "shared_x0_k":      shared_x0_k,                       # [n_valid_k*G, 20, 4]
+    #         })
+
+    #     if not anchor_data_list:
+    #         dummy = next(iter(flow_decoder.parameters()))
+    #         return {"loss": dummy.sum() * 0.0}
+
+    #     if anchor_hidden_0 is None:
+    #         anchor_hidden_0 = anchor_hidden_all[:, 0, :].detach().to(dtype=torch.float32)
+
+        # # ── 7. PPO K-epoch gradient loop (K=1 → same as before) ──────────────
+        # K_epochs = self.finetune_config.epg_ppo_epochs
+
+        # def _compute_epg_loss_for_epoch() -> Tuple[Tensor, Dict[str, Tensor]]:
+        #     """One forward pass over all anchor steps → aggregate loss + metrics."""
+        #     total = anchor_hidden_all.new_zeros(())
+        #     accum: Dict[str, list] = {
+        #         "pg": [], "kl": [], "log_p_theta": [], "log_p_old": [],
+        #         "rho_mean": [], "rho_max": [], "pref_acc": [], "log_p_ref": [],
+        #     }
+        #     for ad in anchor_data_list:
+        #         l_k, m_k = _flow_epg_loss(
+        #             flow_decoder=flow_decoder,
+        #             ref_flow_decoder=ref_decoder,
+        #             anchor_hidden=ad["anchor_hidden_k"],
+        #             trajectories=ad["trajectories_k"],
+        #             advantages=ad["advantages_k"],
+        #             log_p_old=ad["log_p_old_k"],
+        #             shared_t=ad["shared_t_k"],
+        #             shared_x0=ad["shared_x0_k"],
+        #             flow_ode=flow_ode,
+        #             beta=self.finetune_config.epg_beta,
+        #             n_samples=_K,
+        #         )
+        #         total = total + l_k
+        #         accum["pg"].append(m_k["train/epg_pg_loss"])
+        #         accum["kl"].append(m_k["train/epg_kl"])
+        #         accum["log_p_theta"].append(m_k["train/epg_log_p_theta"])
+        #         accum["log_p_old"].append(m_k["train/epg_log_p_old"])
+        #         accum["rho_mean"].append(m_k["train/epg_rho_mean"])
+        #         accum["rho_max"].append(m_k["train/epg_rho_max"])
+        #         accum["pref_acc"].append(m_k["train/epg_pref_acc"])
+        #         if "train/epg_log_p_ref" in m_k:
+        #             accum["log_p_ref"].append(m_k["train/epg_log_p_ref"])
+
+        #     def _mean(lst: list) -> Tensor:
+        #         return torch.stack(lst).mean()
+
+        #     n = len(anchor_data_list)
+        #     ep_loss = total / n
+        #     ep_metrics: Dict[str, Tensor] = {
+        #         "train/epg_pg_loss":    _mean(accum["pg"]),
+        #         "train/epg_kl":         _mean(accum["kl"]),
+        #         "train/epg_log_p_theta":_mean(accum["log_p_theta"]),
+        #         "train/epg_log_p_old":  _mean(accum["log_p_old"]),
+        #         "train/epg_rho_mean":   _mean(accum["rho_mean"]),
+        #         "train/epg_rho_max":    _mean(accum["rho_max"]),
+        #         "train/epg_pref_acc":   _mean(accum["pref_acc"]),
+        #         "train/epg_n_anchor_steps": torch.tensor(float(n), device=dev),
+        #     }
+        #     if accum["log_p_ref"]:
+        #         ep_metrics["train/epg_log_p_ref"] = _mean(accum["log_p_ref"])
+        #     return ep_loss, ep_metrics
+
+        # if not self.automatic_optimization:
+        #     # ── Manual PPO K-epoch loop ────────────────────────────────────────
+        #     opt = self.optimizers()
+        #     sch = self.lr_schedulers()
+        #     grad_clip = getattr(self.trainer, "gradient_clip_val", 1.0)
+
+        #     for epoch_i in range(K_epochs):
+        #         ep_loss, ep_metrics = _compute_epg_loss_for_epoch()
+        #         opt.zero_grad()
+        #         self.manual_backward(ep_loss)
+        #         if grad_clip:
+        #             self.clip_gradients(opt, gradient_clip_val=grad_clip, gradient_clip_algorithm="norm")
+        #         opt.step()
+        #         if sch is not None and epoch_i == K_epochs - 1:
+        #             sch.step()
+
+        #     loss = ep_loss
+        #     metrics_ep = ep_metrics
+        # else:
+        #     # ── Automatic optimization (K=1) ──────────────────────────────────
+        #     loss, metrics_ep = _compute_epg_loss_for_epoch()
+
+        # # ── 8. Optional BC regularisation (anchor 0 only) ─────────────────────
+        # bc_loss_val = anchor_hidden_0.new_zeros(1)
+        # if self.finetune_config.epg_bc_lambda > 0.0:
+        #     gt_clean = tokenized_agent["flow_train_clean_norm"].to(
+        #         dtype=torch.float32, device=dev
+        #     )
+        #     n_first = int(first_anchor_mask.sum().item())
+        #     gt_clean_first = gt_clean[:n_first]
+        #     bc_loss = self.terminal_cost_final_step_loss.bc_flow_loss(
+        #         flow_decoder=flow_decoder,
+        #         flow_ode=flow_ode,
+        #         anchor_hidden_valid=anchor_hidden_0,
+        #         gt_clean_norm=gt_clean_first,
+        #     )
+        #     loss = loss + self.finetune_config.epg_bc_lambda * bc_loss
+        #     bc_loss_val = bc_loss.detach()
+
+        # # ── Aggregate metrics ─────────────────────────────────────────────────
+        # metrics: Dict[str, Tensor] = {
+        #     "train/epg_loss":           loss.detach(),
+        #     "train/epg_advantage_mean": advantages_sc.mean().detach(),
+        #     "train/epg_advantage_std":  (
+        #         advantages_sc.std().detach() if advantages_sc.numel() > 1
+        #         else advantages_sc.new_zeros(1)
+        #     ),
+        #     "train/rmm_mean":    rmm_scores_d.mean().to(device=dev),
+        #     "train/rmm_max":     rmm_scores_d.max(dim=-1).values.mean().to(device=dev),
+        #     "train/rmm_min":     rmm_scores_d.min(dim=-1).values.mean().to(device=dev),
+        #     "train/rmm_margin":  (rmm_scores_d.max(dim=-1).values - rmm_scores_d.min(dim=-1).values).mean(),
+        #     "train/epg_bc_loss": bc_loss_val,
+        #     "train/epg_ppo_epochs": torch.tensor(float(K_epochs), device=dev),
+        # }
+        # metrics.update(metrics_ep)
+        # metrics["loss"] = loss
+
+
+        # return metrics
+
+
+    # -- Flow-BPTT fine-tuning step --
+    def _run_flow_bptt_ft_step(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         batch_idx: int = 0,
         data: dict | None = None,
     ) -> dict:
-        """Flow-EPG fine-tuning step (Exact Policy Gradient + ELBO + RMM reward).
-
-        Generates G closed-loop rollouts from the same initial state, scores each
-        with RMM, computes group-normalised advantages, and updates the flow decoder
-        via the EPG objective:
-
-            L = -E[ A^i · log π_θ(y^i) ] + β · KL(π_θ || π_ref)
-
-        G>1: A^i = (R^i - mean(R)) / (std(R) + ε).  G==1: rollout은 rollout 번호마다
-        순차 1회씩 수집하고, baseline은 ``finetune.epg_single_rollout_baseline``로
-        지정 가능(None이면 mean(R)=R, std=1 → advantage 0).
-        """
-        flow_ode = self.encoder.agent_encoder.flow_ode
-        flow_decoder = self.encoder.agent_encoder.flow_decoder
-        G = self.finetune_config.epg_n_rollouts
-
-        # ── 1. Encode map + all 13 anchors ────────────────────────────────────
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            _, anchor_hidden_all, _ = self.encoder.encode_anchor_context_from_map_feature(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
-            # anchor_hidden_all: [n_agents, 13, hidden_dim]
-
-        flow_train_mask = tokenized_agent["flow_train_mask"]   # [n_agents, 13]
-        first_anchor_mask = flow_train_mask[:, 0]              # [n_agents] bool
-
-        if not first_anchor_mask.any():
-            dummy = next(iter(flow_decoder.parameters()))
-            return {"loss": dummy.sum() * 0.0}
-
-        # ── 2. Generate G closed-loop rollouts ────────────────────────────────
-        with torch.no_grad():
-            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-            )
-            if G == 1:
-                traj_c: list[Tensor] = []
-                z_c: list[Tensor] = []
-                head_c: list[Tensor] = []
-                ah_c: list[Tensor] = []
-                for g in range(G):
-                    pt, pz, ph, pah = self._run_parallel_rollout_chunk(
-                        data=data,
-                        tokenized_agent=tokenized_agent,
-                        map_feature=map_feature,
-                        rollout_cache=rollout_cache,
-                        rollout_indices=[g],
-                        return_anchor_hidden=True,
-                    )
-                    traj_c.append(pt)
-                    z_c.append(pz)
-                    head_c.append(ph)
-                    ah_c.append(pah)
-                pred_traj = torch.cat(traj_c, dim=1)
-                pred_z = torch.cat(z_c, dim=1)
-                pred_head_traj = torch.cat(head_c, dim=1)
-                pred_anchor_hidden_2hz = torch.cat(ah_c, dim=1)
-            else:
-                pred_traj, pred_z, pred_head_traj, pred_anchor_hidden_2hz = self._run_parallel_rollout_chunk(
-                    data=data,
-                    tokenized_agent=tokenized_agent,
-                    map_feature=map_feature,
-                    rollout_cache=rollout_cache,
-                    rollout_indices=list(range(G)),
-                    return_anchor_hidden=True,
-                )
-            # pred_traj: [n_agents, G, 80, 2]  world XY at 10Hz
-
-        # ── 3. Compute RMM for each rollout per scenario ──────────────────────
-        agent_batch = tokenized_agent["batch"]   # [n_agents]
-        agent_ids = data["agent"]["id"] if data is not None else agent_batch
-
-        rmm_scores = self._compute_rmm_group(
-            data=data if data is not None else {},
-            agent_ids=agent_ids,
-            agent_batch=agent_batch,
-            pred_traj=pred_traj,
-            pred_z=pred_z,
-            pred_head=pred_head_traj,
-        )  # [n_scenarios, G]
-
-        # ── 4. Compute advantages: A^i = (R^i - mean(R)) / (std(R) + ε) ─────────
-        # Std-normalise within each group so advantage scale is O(1) regardless of
-        # how tightly the G rollout scores cluster.  This prevents the KL term from
-        # dominating when RMM scores are nearly identical (β · KL >> A without norm).
-        # G==1: group std is degenerate → σ=1, baseline은 epg_single_rollout_baseline 또는 mean(R).
-        dev = anchor_hidden_all.device
-        rmm_scores_d = rmm_scores.to(device=dev)                      # [n_scenarios, G]
-        if G == 1:
-            bcfg = self.finetune_config.epg_single_rollout_baseline
-            if bcfg is not None:
-                adv_mean = rmm_scores_d.new_full(rmm_scores_d.shape, float(bcfg))
-            else:
-                adv_mean = rmm_scores_d.mean(dim=-1, keepdim=True)
-            adv_std = torch.ones_like(rmm_scores_d)
-            advantages_sc = (rmm_scores_d - adv_mean) / adv_std
-        else:
-            adv_mean = rmm_scores_d.mean(dim=-1, keepdim=True)
-            adv_std = rmm_scores_d.std(dim=-1, keepdim=True).clamp(min=1e-6)
-            advantages_sc = (rmm_scores_d - adv_mean) / adv_std           # [n_scenarios, G]
-
-        # ── 5. Determine usable anchor steps ──────────────────────────────────
-        # Training anchor k: reference at abs 10Hz step 10+5k, target = steps 11+5k to 30+5k.
-        # pred_traj_10hz[:, j] = abs step 11+j  (committed from rollout step j//5).
-        # Correct target for anchor k: pred_traj[:, 5k : 5k+20] = abs steps 11+5k to 30+5k.
-        # Correct anchor_hidden: pred_anchor_hidden_2hz[:, k]  (conditioned on state at 10+5k).
-        # Correct reference:
-        #   k=0  → ctx_sampled_pos[:, 1]          (GT initial context pos, abs step 10)
-        #   k≥1  → pred_traj[:, 5k-1]             (rollout pos at abs step 10+5k)
-        ANCHOR_STRIDE = 5       # 2Hz = 5 10Hz steps
-        ANCHOR_FUTURE_LEN = 20  # 2s at 10Hz
-        n_pred_steps = pred_traj.shape[2]  # 80
-        n_anchors_total = anchor_hidden_all.shape[1]  # 13
-        n_hidden_steps = pred_anchor_hidden_2hz.shape[2]  # n_step_future_2hz (16)
-        n_anchors_usable = min(
-            n_anchors_total,                                                    # 13
-            (n_pred_steps - ANCHOR_FUTURE_LEN) // ANCHOR_STRIDE + 1,           # (80-20)//5+1=13
-            n_hidden_steps,                                                     # 16
-        )  # = 13
-
-        pred_traj_f = pred_traj.to(dtype=torch.float32, device=dev)
-        pred_head_f = pred_head_traj.to(dtype=torch.float32, device=dev)
-
-        # ctx_sampled_pos[:, 1] = GT pos at abs step 10 = anchor-0 reference.
-        ctx_sampled_pos = tokenized_agent["ctx_sampled_pos"].to(dtype=torch.float32, device=dev)
-        ctx_sampled_heading = tokenized_agent["ctx_sampled_heading"].to(dtype=torch.float32, device=dev)
-
-        # ── 6. Precompute rollout data for all anchors (shared across PPO epochs) ─
-        # Data collected once (expensive); gradient steps reuse it K times.
-        from src.smart.modules.flow_dpo import compute_fm_log_prob as _compute_log_prob
-        from copy import deepcopy
-
-        _K = self.finetune_config.epg_n_samples
-        t0 = float(flow_ode.eps)
-        ref_decoder = self.ref_flow_decoder if self.finetune_config.epg_use_ref_model else None
-
-        # Snapshot θ_old ONCE before any gradient steps (PPO-style).
-        old_flow_decoder = deepcopy(flow_decoder).eval()
-        for p in old_flow_decoder.parameters():
-            p.requires_grad_(False)
-
-        # Per-anchor precomputed tensors: anchor_hidden, trajectories, advantages, log_p_old, MC samples
-        anchor_data_list = []
-        anchor_hidden_0 = None
-
-        for k in range(n_anchors_usable):
-            valid_idx_k = flow_train_mask[:, k].nonzero(as_tuple=False).squeeze(-1)
-            if valid_idx_k.numel() == 0:
-                continue
-
-            n_valid_k = valid_idx_k.shape[0]
-
-            # FIXED: anchor_hidden at rollout step k (not k+1) → conditioned on abs step 10+5k.
-            anchor_hidden_k = (
-                pred_anchor_hidden_2hz[valid_idx_k, :, k, :]
-                .detach()
-                .to(dtype=torch.float32)
-            )  # [n_valid_k, G, d_model]
-            if k == 0:
-                anchor_hidden_0 = anchor_hidden_k[:, 0, :]  # saved for BC / debug
-
-            advantages_k = advantages_sc[agent_batch[valid_idx_k]]  # [n_valid_k, G]
-
-            # FIXED: target window = pred_traj[:, 5k : 5k+20] = abs steps 11+5k to 30+5k.
-            future_start = k * ANCHOR_STRIDE                          # 0, 5, 10, ...
-            future_slice = slice(future_start, future_start + ANCHOR_FUTURE_LEN)
-
-            traj_norm_list_k = []
-            for g in range(G):
-                y_world = pred_traj_f[valid_idx_k, g, future_slice, :]
-                h_world = pred_head_f[valid_idx_k, g, future_slice]
-                # FIXED: reference position at abs step 10+5k.
-                #   k=0 → GT context position (rollout hasn't started yet, same as GT)
-                #   k≥1 → pred_traj[:, 5k-1] = abs step 11+5k-1 = 10+5k
-                if k == 0:
-                    ref_pos_k_g = ctx_sampled_pos[valid_idx_k, 1, :]
-                    ref_head_k_g = ctx_sampled_heading[valid_idx_k, 1]
-                else:
-                    ref_pos_k_g = pred_traj_f[valid_idx_k, g, future_start - 1, :]
-                    ref_head_k_g = pred_head_f[valid_idx_k, g, future_start - 1]
-                traj_norm_list_k.append(
-                    self._world_traj_to_flow_norm(y_world, h_world, ref_pos_k_g, ref_head_k_g)
-                )
-            trajectories_k = torch.stack(traj_norm_list_k, dim=1)  # [n_valid_k, G, 20, 4]
-
-            # Shared MC samples (fixed across PPO epochs → stable rho comparison)
-            _n_k = n_valid_k * G
-            shared_t_k = t0 + (1.0 - t0) * torch.rand(_K, _n_k, device=dev, dtype=torch.float32)
-            shared_x0_k = torch.randn(_n_k, 20, 4, device=dev, dtype=torch.float32)
-
-            # log π_{θ_old}: computed once with frozen snapshot, same MC as log_p_theta
-            with torch.no_grad():
-                _traj_flat_k = trajectories_k.detach().reshape(_n_k, 20, 4)
-                _anchor_rep_k = anchor_hidden_k.reshape(_n_k, -1)
-                log_p_old_flat_k = _compute_log_prob(
-                    old_flow_decoder, _anchor_rep_k, _traj_flat_k, flow_ode,
-                    n_samples=_K, shared_t=shared_t_k, shared_x0=shared_x0_k,
-                )
-
-            anchor_data_list.append({
-                "anchor_hidden_k":  anchor_hidden_k,                   # [n_valid_k, G, d]
-                "trajectories_k":   trajectories_k.detach(),           # [n_valid_k, G, 20, 4]
-                "advantages_k":     advantages_k,                      # [n_valid_k, G]
-                "log_p_old_k":      log_p_old_flat_k.reshape(n_valid_k, G),  # [n_valid_k, G]
-                "shared_t_k":       shared_t_k,                        # [K, n_valid_k*G]
-                "shared_x0_k":      shared_x0_k,                       # [n_valid_k*G, 20, 4]
-            })
-
-        if not anchor_data_list:
-            dummy = next(iter(flow_decoder.parameters()))
-            return {"loss": dummy.sum() * 0.0}
-
-        if anchor_hidden_0 is None:
-            anchor_hidden_0 = anchor_hidden_all[:, 0, :].detach().to(dtype=torch.float32)
-
-        # ── 7. PPO K-epoch gradient loop (K=1 → same as before) ──────────────
-        K_epochs = self.finetune_config.epg_ppo_epochs
-
-        def _compute_epg_loss_for_epoch() -> Tuple[Tensor, Dict[str, Tensor]]:
-            """One forward pass over all anchor steps → aggregate loss + metrics."""
-            total = anchor_hidden_all.new_zeros(())
-            accum: Dict[str, list] = {
-                "pg": [], "kl": [], "log_p_theta": [], "log_p_old": [],
-                "rho_mean": [], "rho_max": [], "pref_acc": [], "log_p_ref": [],
-            }
-            for ad in anchor_data_list:
-                l_k, m_k = _flow_epg_loss(
-                    flow_decoder=flow_decoder,
-                    ref_flow_decoder=ref_decoder,
-                    anchor_hidden=ad["anchor_hidden_k"],
-                    trajectories=ad["trajectories_k"],
-                    advantages=ad["advantages_k"],
-                    log_p_old=ad["log_p_old_k"],
-                    shared_t=ad["shared_t_k"],
-                    shared_x0=ad["shared_x0_k"],
-                    flow_ode=flow_ode,
-                    beta=self.finetune_config.epg_beta,
-                    n_samples=_K,
-                )
-                total = total + l_k
-                accum["pg"].append(m_k["train/epg_pg_loss"])
-                accum["kl"].append(m_k["train/epg_kl"])
-                accum["log_p_theta"].append(m_k["train/epg_log_p_theta"])
-                accum["log_p_old"].append(m_k["train/epg_log_p_old"])
-                accum["rho_mean"].append(m_k["train/epg_rho_mean"])
-                accum["rho_max"].append(m_k["train/epg_rho_max"])
-                accum["pref_acc"].append(m_k["train/epg_pref_acc"])
-                if "train/epg_log_p_ref" in m_k:
-                    accum["log_p_ref"].append(m_k["train/epg_log_p_ref"])
-
-            def _mean(lst: list) -> Tensor:
-                return torch.stack(lst).mean()
-
-            n = len(anchor_data_list)
-            ep_loss = total / n
-            ep_metrics: Dict[str, Tensor] = {
-                "train/epg_pg_loss":    _mean(accum["pg"]),
-                "train/epg_kl":         _mean(accum["kl"]),
-                "train/epg_log_p_theta":_mean(accum["log_p_theta"]),
-                "train/epg_log_p_old":  _mean(accum["log_p_old"]),
-                "train/epg_rho_mean":   _mean(accum["rho_mean"]),
-                "train/epg_rho_max":    _mean(accum["rho_max"]),
-                "train/epg_pref_acc":   _mean(accum["pref_acc"]),
-                "train/epg_n_anchor_steps": torch.tensor(float(n), device=dev),
-            }
-            if accum["log_p_ref"]:
-                ep_metrics["train/epg_log_p_ref"] = _mean(accum["log_p_ref"])
-            return ep_loss, ep_metrics
-
-        if not self.automatic_optimization:
-            # ── Manual PPO K-epoch loop ────────────────────────────────────────
-            opt = self.optimizers()
-            sch = self.lr_schedulers()
-            grad_clip = getattr(self.trainer, "gradient_clip_val", 1.0)
-
-            for epoch_i in range(K_epochs):
-                ep_loss, ep_metrics = _compute_epg_loss_for_epoch()
-                opt.zero_grad()
-                self.manual_backward(ep_loss)
-                if grad_clip:
-                    self.clip_gradients(opt, gradient_clip_val=grad_clip, gradient_clip_algorithm="norm")
-                opt.step()
-                if sch is not None and epoch_i == K_epochs - 1:
-                    sch.step()
-
-            loss = ep_loss
-            metrics_ep = ep_metrics
-        else:
-            # ── Automatic optimization (K=1) ──────────────────────────────────
-            loss, metrics_ep = _compute_epg_loss_for_epoch()
-
-        # ── 8. Optional BC regularisation (anchor 0 only) ─────────────────────
-        bc_loss_val = anchor_hidden_0.new_zeros(1)
-        if self.finetune_config.epg_bc_lambda > 0.0:
-            gt_clean = tokenized_agent["flow_train_clean_norm"].to(
-                dtype=torch.float32, device=dev
-            )
-            n_first = int(first_anchor_mask.sum().item())
-            gt_clean_first = gt_clean[:n_first]
-            bc_loss = self.terminal_cost_final_step_loss.bc_flow_loss(
-                flow_decoder=flow_decoder,
-                flow_ode=flow_ode,
-                anchor_hidden_valid=anchor_hidden_0,
-                gt_clean_norm=gt_clean_first,
-            )
-            loss = loss + self.finetune_config.epg_bc_lambda * bc_loss
-            bc_loss_val = bc_loss.detach()
-
-        # ── Aggregate metrics ─────────────────────────────────────────────────
-        metrics: Dict[str, Tensor] = {
-            "train/epg_loss":           loss.detach(),
-            "train/epg_advantage_mean": advantages_sc.mean().detach(),
-            "train/epg_advantage_std":  (
-                advantages_sc.std().detach() if advantages_sc.numel() > 1
-                else advantages_sc.new_zeros(1)
-            ),
-            "train/rmm_mean":    rmm_scores_d.mean().to(device=dev),
-            "train/rmm_max":     rmm_scores_d.max(dim=-1).values.mean().to(device=dev),
-            "train/rmm_min":     rmm_scores_d.min(dim=-1).values.mean().to(device=dev),
-            "train/rmm_margin":  (rmm_scores_d.max(dim=-1).values - rmm_scores_d.min(dim=-1).values).mean(),
-            "train/epg_bc_loss": bc_loss_val,
-            "train/epg_ppo_epochs": torch.tensor(float(K_epochs), device=dev),
-        }
-        metrics.update(metrics_ep)
-        metrics["loss"] = loss
-
-        # debug JSONL
-        self._maybe_write_epg_debug(batch_idx, anchor_hidden_0, rmm_scores, advantages_sc, metrics)
-
-        return metrics
-
-    def _maybe_write_epg_debug(
-        self,
-        batch_idx: int,
-        anchor_hidden: Tensor,
-        rmm_scores: Tensor,   # [n_scenarios, G]
-        advantages: Tensor,   # [n_scenarios, G]
-        metrics: dict,
-    ) -> None:
-        if self._dpo_debug_path is None or self.global_rank != 0:
-            return
-        step = int(self.global_step)
-        if step % 10 != 0:
-            return
-        import json
-        record = {
-            "step": step,
-            "batch_idx": int(batch_idx),
-            "n_agents": int(anchor_hidden.shape[0]),
-            "epg_loss": float(metrics.get("train/epg_loss", float("nan"))),
-            "epg_pg_loss": float(metrics.get("train/epg_pg_loss", float("nan"))),
-            "epg_kl": float(metrics.get("train/epg_kl", float("nan"))),
-            "epg_log_p": float(metrics.get("train/epg_log_p", float("nan"))),
-            "epg_pref_acc": float(metrics.get("train/epg_pref_acc", float("nan"))),
-            "adv_mean": float(advantages.mean()),
-            "adv_std": float(advantages.std()) if advantages.numel() > 1 else 0.0,
-            "rmm_mean": float(rmm_scores.mean()),
-            "rmm_max": float(rmm_scores.max(dim=-1).values.mean()),
-            "rmm_min": float(rmm_scores.min(dim=-1).values.mean()),
-            "rmm_margin": float((rmm_scores.max(dim=-1).values - rmm_scores.min(dim=-1).values).mean()),
-        }
-        try:
-            with open(self._dpo_debug_path, "a") as f:
-                f.write(json.dumps(record) + "\n")
-        except OSError:
-            pass
-
-    # ── GPU RMM batch helper ──────────────────────────────────────────────────
-
-    def _compute_gpu_rmm_batch(
-        self,
-        data: dict,
-        tokenized_map: Dict[str, Tensor],
-        agent_batch: Tensor,     # [n_agents] scenario index
-        pred_traj: Tensor,       # [n_agents, G, 80, 2]
-        pred_z: Tensor,          # [n_agents, G, 80]
-        pred_head: Tensor,       # [n_agents, G, 80]
-    ) -> Tensor:                 # [n_scenarios, G]
-        """Compute GPU-based RMM per scenario per rollout.
-
-        Does NOT require TFRecord files — works on both training and validation
-        splits.  Loops over scenarios in the batch and calls ``compute_gpu_rmm``
-        for each one individually.
-
-        Returns zeros if agent raw-data fields are missing (graceful degradation).
-        """
-        from src.smart.metrics.gpu_rmm import compute_gpu_rmm
-
-        device = pred_traj.device
-        G = pred_traj.shape[1]
-        n_scenarios = int(agent_batch.max().item()) + 1 if agent_batch.numel() > 0 else 0
-
-        if n_scenarios == 0:
-            return torch.zeros(0, G, device=device)
-
-        try:
-            agent = data["agent"]
-            gt_pos   = agent["position"].to(device, dtype=torch.float32)    # [N, 91, 3]
-            gt_head  = agent["heading"].to(device, dtype=torch.float32)     # [N, 91]
-            gt_valid = agent["valid_mask"].to(device, dtype=torch.bool)     # [N, 91]
-            ag_shape = agent["shape"].to(device, dtype=torch.float32)       # [N, 3]
-            ag_type  = agent["type"].to(device)                             # [N]
-            eval_mask = agent["role"][:, 2].to(device, dtype=torch.bool)   # [N] tracks_to_predict
-            map_pos  = data["map_save"]["traj_pos"].to(device, dtype=torch.float32)  # [M, 3, 2]
-            map_batch = tokenized_map["batch"].to(device)                   # [M]
-        except (KeyError, AttributeError):
-            return torch.zeros(n_scenarios, G, device=device)
-
-        rmm_list: list[Tensor] = []
-        for sc in range(n_scenarios):
-            ag_mask  = (agent_batch == sc)
-            map_mask = (map_batch == sc)
-
-            try:
-                rmm_g = compute_gpu_rmm(
-                    pred_traj=pred_traj[ag_mask],    # [n_sc, G, 80, 2]
-                    pred_z=pred_z[ag_mask],           # [n_sc, G, 80]
-                    pred_head=pred_head[ag_mask],     # [n_sc, G, 80]
-                    gt_position=gt_pos[ag_mask],      # [n_sc, 91, 3]
-                    gt_heading=gt_head[ag_mask],      # [n_sc, 91]
-                    gt_valid=gt_valid[ag_mask],       # [n_sc, 91]
-                    agent_shape=ag_shape[ag_mask],    # [n_sc, 3]
-                    agent_type=ag_type[ag_mask],      # [n_sc]
-                    eval_mask=eval_mask[ag_mask],     # [n_sc] bool
-                    map_token_pos=map_pos[map_mask],  # [m_sc, 3, 2]
-                    dt=0.1,
-                )  # [G]
-            except Exception:
-                rmm_g = torch.zeros(G, device=device)
-
-            rmm_list.append(rmm_g)
-
-        return torch.stack(rmm_list, dim=0)  # [n_scenarios, G]
-
-    # ── Flow-RWR fine-tuning step ─────────────────────────────────────────────
-
-    def _run_flow_rwr_ft_step(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        batch_idx: int = 0,
-        data: dict | None = None,
-    ) -> dict:
-        """Flow-RWR fine-tuning step (Reward-Weighted Regression + GPU RMM).
-
+        """Flow-BPTT fine-tuning step 
         Algorithm:
             1. Encode map + all anchor contexts (no_grad).
-            2. Generate G closed-loop rollouts (no_grad).
-            3. Score each rollout with GPU RMM → R^g ∈ [0,1].
-            4. Weights: w^g = softmax(R^g / β) per scenario.
-            5. FM loss weighted by w^g (and γ^k temporal discount per anchor k):
-                 L = -Σ_k γ^k Σ_g w^g · log π_θ(y^g_k | s_k)
-               where log π_θ ≈ -E_{t,x₀}[||v_θ - (y^g-x₀)||²].
-
-        Key properties vs EPG:
-            - No IS weighting (rho), no reference model, no KL term.
-            - Works on training split (GPU RMM, no TFRecords required).
-            - Temporal discount γ^k down-weights later anchors (error accumulation).
-        """
-        flow_ode = self.encoder.agent_encoder.flow_ode
+            2. Generate G closed-loop rollouts (full_grad).
+            3. Score each rollout with differentiable RMM.
+            4. Backpropagate gradients through the BPTT ODE.
+            5. Update flow decoder parameters.
+    """
         flow_decoder = self.encoder.agent_encoder.flow_decoder
-        G   = self.finetune_config.rwr_n_rollouts
-        beta = self.finetune_config.rwr_beta
-        gamma = self.finetune_config.rwr_anchor_discount
-        K   = self.finetune_config.rwr_n_samples
+        G = int(getattr(self.finetune_config, "bptt_n_rollouts", 1))
 
-        # ── 1. Encode map + anchor context ────────────────────────────────────
+        # ── 1. Encode map + all anchor contexts ────────────────────────────────
         with torch.no_grad():
             map_feature = self.encoder.encode_map(tokenized_map)
             _, anchor_hidden_all, _ = self.encoder.encode_anchor_context_from_map_feature(
@@ -1937,8 +1705,6 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent,
                 anchor_mask_key="flow_train_mask",
             )
-            # anchor_hidden_all: [n_agents, 13, hidden_dim]
-
         flow_train_mask = tokenized_agent["flow_train_mask"]   # [n_agents, 13]
         first_anchor_mask = flow_train_mask[:, 0]
 
@@ -1948,443 +1714,342 @@ class SMARTFlow(LightningModule):
 
         dev = anchor_hidden_all.device
 
-        # ── 2. Generate G closed-loop rollouts ────────────────────────────────
-        with torch.no_grad():
-            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-            )
-            pred_traj, pred_z, pred_head_traj, pred_anchor_hidden_2hz = (
-                self._run_parallel_rollout_chunk(
-                    data=data,
-                    tokenized_agent=tokenized_agent,
-                    map_feature=map_feature,
-                    rollout_cache=rollout_cache,
-                    rollout_indices=list(range(G)),
-                    return_anchor_hidden=True,
-                )
-            )
-            # pred_traj: [n_agents, G, 80, 2]
-
-        agent_batch = tokenized_agent["batch"]   # [n_agents]
-
-        # ── 3. Score with GPU RMM ─────────────────────────────────────────────
-        rmm_scores = self._compute_gpu_rmm_batch(
-            data=data if data is not None else {},
-            tokenized_map=tokenized_map,
-            agent_batch=agent_batch,
-            pred_traj=pred_traj,
-            pred_z=pred_z,
-            pred_head=pred_head_traj,
-        )  # [n_scenarios, G]
-
-        rmm_scores_d = rmm_scores.to(device=dev)
-
-        # ── 4. Importance weights: softmax(R/β) ───────────────────────────────
-        weights_sc = F.softmax(rmm_scores_d / beta, dim=-1)  # [n_scenarios, G]
-
-        # ── 5. Determine usable anchor steps (same logic as EPG) ──────────────
-        ANCHOR_STRIDE = 5
-        ANCHOR_FUTURE_LEN = 20
-        n_pred_steps = pred_traj.shape[2]     # 80
-        n_anchors_total = anchor_hidden_all.shape[1]  # 13
-        n_hidden_steps = pred_anchor_hidden_2hz.shape[2]
-        n_anchors_usable = min(
-            n_anchors_total,
-            (n_pred_steps - ANCHOR_FUTURE_LEN) // ANCHOR_STRIDE + 1,
-            n_hidden_steps,
-        )  # = 13
-
-        pred_traj_f = pred_traj.to(dtype=torch.float32, device=dev)
-        pred_head_f = pred_head_traj.to(dtype=torch.float32, device=dev)
-
-        ctx_sampled_pos = tokenized_agent["ctx_sampled_pos"].to(dtype=torch.float32, device=dev)
-        ctx_sampled_heading = tokenized_agent["ctx_sampled_heading"].to(dtype=torch.float32, device=dev)
-
-        from src.smart.modules.flow_dpo import compute_fm_log_prob as _compute_log_prob
-
-        # ── 6. Weighted FM loss over all anchors ──────────────────────────────
-        total_loss = anchor_hidden_all.new_zeros(())
-        accum_metrics: Dict[str, list] = {
-            "rwr_loss": [], "rwr_log_p": [], "rwr_pref_acc": [], "rwr_weight_entropy": [],
-        }
-        n_valid_anchors = 0
-
-        for k in range(n_anchors_usable):
-            valid_idx_k = flow_train_mask[:, k].nonzero(as_tuple=False).squeeze(-1)
-            if valid_idx_k.numel() == 0:
-                continue
-
-            n_valid_k = valid_idx_k.shape[0]
-            anchor_discount_k = gamma ** k  # temporal discount for later anchors
-
-            # anchor hidden: [n_valid_k, G, d_model]
-            anchor_hidden_k = (
-                pred_anchor_hidden_2hz[valid_idx_k, :, k, :]
-                .detach()
-                .to(dtype=torch.float32)
-            )
-
-            # Per-agent RWR weights from scenario-level weights
-            weights_k = weights_sc[agent_batch[valid_idx_k]]  # [n_valid_k, G]
-
-            # Build normalised trajectory tensors for all G rollouts
-            future_start = k * ANCHOR_STRIDE
-            future_slice = slice(future_start, future_start + ANCHOR_FUTURE_LEN)
-            traj_norm_list_k: list[Tensor] = []
-            for g in range(G):
-                y_world = pred_traj_f[valid_idx_k, g, future_slice, :]
-                h_world = pred_head_f[valid_idx_k, g, future_slice]
-                if k == 0:
-                    ref_pos  = ctx_sampled_pos[valid_idx_k, 1, :]
-                    ref_head = ctx_sampled_heading[valid_idx_k, 1]
-                else:
-                    ref_pos  = pred_traj_f[valid_idx_k, g, future_start - 1, :]
-                    ref_head = pred_head_f[valid_idx_k, g, future_start - 1]
-                traj_norm_list_k.append(
-                    self._world_traj_to_flow_norm(y_world, h_world, ref_pos, ref_head)
-                )
-            trajectories_k = torch.stack(traj_norm_list_k, dim=1)  # [n_valid_k, G, 20, 4]
-
-            # RWR loss for this anchor
-            loss_k, metrics_k = _flow_rwr_loss(
-                flow_decoder=flow_decoder,
-                anchor_hidden=anchor_hidden_k,
-                trajectories=trajectories_k.detach(),
-                weights=weights_k.detach(),
-                flow_ode=flow_ode,
-                n_samples=K,
-            )
-            total_loss = total_loss + anchor_discount_k * loss_k
-
-            accum_metrics["rwr_loss"].append(metrics_k["train/rwr_loss"])
-            accum_metrics["rwr_log_p"].append(metrics_k["train/rwr_log_p"])
-            accum_metrics["rwr_pref_acc"].append(metrics_k["train/rwr_pref_acc"])
-            accum_metrics["rwr_weight_entropy"].append(metrics_k["train/rwr_weight_entropy"])
-            n_valid_anchors += 1
-
-        if n_valid_anchors == 0:
-            dummy = next(iter(flow_decoder.parameters()))
-            return {"loss": dummy.sum() * 0.0}
-
-        loss = total_loss / n_valid_anchors
-
-        def _mean(lst: list) -> Tensor:
-            return torch.stack(lst).mean()
-
-        metrics: Dict[str, Tensor] = {
-            "train/rwr_loss":           loss.detach(),
-            "train/rwr_pg_loss":        _mean(accum_metrics["rwr_loss"]),
-            "train/rwr_log_p":          _mean(accum_metrics["rwr_log_p"]),
-            "train/rwr_pref_acc":       _mean(accum_metrics["rwr_pref_acc"]),
-            "train/rwr_weight_entropy": _mean(accum_metrics["rwr_weight_entropy"]),
-            "train/rwr_n_anchors":      torch.tensor(float(n_valid_anchors), device=dev),
-            "train/rmm_mean":           rmm_scores_d.mean().to(device=dev),
-            "train/rmm_max":            rmm_scores_d.max(dim=-1).values.mean().to(device=dev),
-            "train/rmm_min":            rmm_scores_d.min(dim=-1).values.mean().to(device=dev),
-            "train/rmm_margin":         (
-                rmm_scores_d.max(dim=-1).values - rmm_scores_d.min(dim=-1).values
-            ).mean(),
-            "train/rwr_weight_max":     weights_sc.max(dim=-1).values.mean(),
-            "train/rwr_weight_min":     weights_sc.min(dim=-1).values.mean(),
-        }
-        metrics["loss"] = loss
-        return metrics
-
-    def _run_flow_dpo_ft_step(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        batch_idx: int = 0,
-        data: dict | None = None,
-    ) -> dict:
-        """Flow-DPO fine-tuning step (RMM-ranked pairwise DPO).
-
-        Two policy rollouts are generated from the same initial state.
-        Rollouts are ranked by RMM (realism meta-metric).  The higher-RMM
-        trajectory becomes y_w (winner) and the lower-RMM trajectory becomes
-        y_l (loser).  DPO then trains the flow model to prefer y_w.
-
-        DPO loss (with optional frozen reference model):
-            L = -log σ( β · [ (log π_θ(y_w) - log π_ref(y_w))
-                              - (log π_θ(y_l) - log π_ref(y_l)) ] )
-        """
-        flow_ode = self.encoder.agent_encoder.flow_ode
-        flow_decoder = self.encoder.agent_encoder.flow_decoder
-
-        # ── 1. Encode map & full anchor context (all 13 anchors) ──────────────
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            _, anchor_hidden_all, _ = self.encoder.encode_anchor_context_from_map_feature(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
-            # anchor_hidden_all: [n_agents, 13, hidden_dim]
-
-        flow_train_mask = tokenized_agent["flow_train_mask"]   # [n_agents, 13]
-        first_anchor_mask = flow_train_mask[:, 0]              # [n_agents] bool
-
-        if not first_anchor_mask.any():
-            dummy = next(iter(flow_decoder.parameters()))
-            return {"loss": dummy.sum() * 0.0}
-
-        # ── 2. Generate 2 closed-loop rollouts from same initial state ─────────
-        with torch.no_grad():
-            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-            )
-            pred_traj, pred_z, pred_head_traj = self._run_parallel_rollout_chunk(
+        # ── 2. Generate closed-loop rollouts ────────────────────────────────
+        # NOTE: 현재 encoder.agent_encoder.rollout_from_cache 는 @torch.no_grad 데코레이터로
+        # 감싸져 있어, 아래 rollout 텐서에서 soft RMM을 계산해도 flow 파라미터까지
+        # gradient가 연결되지 않습니다. (진짜 BPTT를 원하면 grad-enabled rollout 경로가 필요)
+        rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        pred_traj, pred_z, pred_head_traj, pred_anchor_hidden_2hz = (
+            self._run_parallel_rollout_chunk(
                 data=data,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
                 rollout_cache=rollout_cache,
-                rollout_indices=[0, 1],
+                rollout_indices=list(range(G)),
+                return_anchor_hidden=True,
+                full_grad=True,
             )
-            # pred_traj: [n_agents, 2, 80, 2]  world XY at 10Hz
-            # pred_head_traj: [n_agents, 2, 80]  world heading
-
-        # ── 3. Compute RMM per rollout per scenario ─────────────────────────────
-        agent_batch = tokenized_agent["batch"]   # [n_agents]
-        agent_ids = data["agent"]["id"] if data is not None else tokenized_agent.get("id", agent_batch)
-
-        rmm_0, rmm_1 = self._compute_rmm_pair(
-            data=data if data is not None else {},
-            agent_ids=agent_ids,
-            agent_batch=agent_batch,
-            pred_traj=pred_traj,
-            pred_z=pred_z,
-            pred_head=pred_head_traj,
         )
+        # pred_traj: [n_agents, G, 80, 2]
+        agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
 
-        # ── 4. Determine winner/loser rollout per scenario ──────────────────────
-        dev = anchor_hidden_all.device
-        winner_is_0 = (rmm_0 >= rmm_1).to(device=dev)  # [n_scenarios]
+        if data is None:
+            raise ValueError("flow_bptt_ft requires `data` dict with scenario metadata.")
+        if "tfrecord_path" not in data or "scenario_id" not in data:
+            raise KeyError("flow_bptt_ft requires data['tfrecord_path'] and data['scenario_id'].")
+        # IMPORTANT: soft RMM의 object_id는 rollout agent 순서와 정확히 일치해야 합니다.
+        # 허용 소스:
+        #   1) data["agent"]["id"]  (HeteroData 정석)
+        #   2) data["id"]           (collate된 top-level agent id)
+        # 그 외 fallback은 금지합니다.
+        agent_ids = None
+        try:
+            agent_ids = data["agent"]["id"]
+        except Exception:
+            agent_ids = None
+        if agent_ids is None:
+            try:
+                agent_ids = data["id"]
+            except Exception:
+                agent_ids = None
+        if agent_ids is None:
+            raise KeyError(
+                "flow_bptt_ft requires exact agent object ids: data['agent']['id'] (or data['id'])."
+            )
+        if int(agent_ids.shape[0]) != int(tokenized_agent["batch"].shape[0]):
+            raise ValueError(
+                "agent id count mismatch: "
+                f"ids={int(agent_ids.shape[0])} vs rollout_agents={int(tokenized_agent['batch'].shape[0])}"
+            )
 
-        # ── 5. Extract & normalize first-anchor trajectories from rollouts ──────
-        # Rollout starts from 2Hz step 1 (pos_window[-1]).
-        # Anchor 0 (raw_step=10) future = rollout 10Hz indices 5:25 (steps 11-30).
-        # Reference position for normalization = ctx_sampled_pos[:, 1] (anchor 0 time).
-        ANCHOR0_FUTURE_SLICE = slice(5, 25)   # rollout 10Hz indices for anchor-0 future
+        scenario_ids: Sequence[str] = data["scenario_id"]
+        tfrecord_paths: Sequence[str] = data["tfrecord_path"]
+        n_scenarios = len(scenario_ids)
+        if len(tfrecord_paths) != n_scenarios:
+            raise ValueError(
+                f"tfrecord_path length {len(tfrecord_paths)} != scenario_id length {n_scenarios}"
+            )
 
-        valid_idx = first_anchor_mask.nonzero(as_tuple=False).squeeze(-1)  # [n_valid]
+        # Load Waymo metric config once (textproto → pb2).
+        if not hasattr(self, "_soft_rmm_waymo_cfg") or self._soft_rmm_waymo_cfg is None:
+            from google.protobuf import text_format
+            import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as wm_metrics
+            from pathlib import Path as _Path
 
-        ctx_pos = tokenized_agent["ctx_sampled_pos"].to(dtype=torch.float32, device=dev)
-        ctx_head = tokenized_agent["ctx_sampled_heading"].to(dtype=torch.float32, device=dev)
-        ref_pos = ctx_pos[valid_idx, 1]    # [n_valid, 2]  anchor-0 reference position
-        ref_head = ctx_head[valid_idx, 1]  # [n_valid]     anchor-0 reference heading
+            config_path = _Path(wm_metrics.__file__).parent / "challenge_2025_sim_agents_config.textproto"
+            cfg = sim_agents_metrics_pb2.SimAgentMetricsConfig()
+            with open(config_path) as f:
+                text_format.Parse(f.read(), cfg)
+            self._soft_rmm_waymo_cfg = cfg
+        cfg = self._soft_rmm_waymo_cfg
 
-        pred_traj_f = pred_traj.to(dtype=torch.float32, device=dev)
-        pred_head_f = pred_head_traj.to(dtype=torch.float32, device=dev)
-
-        y0_world = pred_traj_f[valid_idx, 0, ANCHOR0_FUTURE_SLICE, :]   # [n_valid, 20, 2]
-        y1_world = pred_traj_f[valid_idx, 1, ANCHOR0_FUTURE_SLICE, :]
-        h0_world = pred_head_f[valid_idx, 0, ANCHOR0_FUTURE_SLICE]      # [n_valid, 20]
-        h1_world = pred_head_f[valid_idx, 1, ANCHOR0_FUTURE_SLICE]
-
-        y0_norm = self._world_traj_to_flow_norm(y0_world, h0_world, ref_pos, ref_head)
-        y1_norm = self._world_traj_to_flow_norm(y1_world, h1_world, ref_pos, ref_head)
-
-        # Assign winner/loser per agent based on scenario-level RMM
-        agent_winner_is_0 = winner_is_0[agent_batch[valid_idx]]  # [n_valid]
-        mask_w0 = agent_winner_is_0.view(-1, 1, 1)
-        y_w = torch.where(mask_w0, y0_norm, y1_norm)  # [n_valid, 20, 4]
-        y_l = torch.where(mask_w0, y1_norm, y0_norm)
-
-        # ── 6. anchor_hidden for first anchor ──────────────────────────────────
-        anchor_hidden = anchor_hidden_all[valid_idx, 0, :].detach().to(dtype=torch.float32)
-
-        # ── 7. FM-DPO loss ─────────────────────────────────────────────────────
-        ref_decoder = self.ref_flow_decoder if self.finetune_config.dpo_use_ref_model else None
-        loss, metrics = _flow_dpo_loss(
-            flow_decoder=flow_decoder,
-            ref_flow_decoder=ref_decoder,
-            anchor_hidden=anchor_hidden,
-            y_w=y_w.detach(),
-            y_l=y_l.detach(),
-            flow_ode=flow_ode,
-            beta=self.finetune_config.dpo_beta,
-            n_samples=self.finetune_config.dpo_n_samples,
+        # Build per-scenario log features (no grad) so that scenario/log_feat matches agent slice.
+        # We only need log_feat_dict for compute_wosac_metametric_soft.
+        from src.smart.metrics.wosac_metric_features_torch.metric_features_torch import (
+            compute_scenario_rollouts_features,
         )
+        import tensorflow as tf
 
-        # ── 8. Optional BC regularization ──────────────────────────────────────
-        bc_loss_val = anchor_hidden.new_zeros(1)
-        if self.finetune_config.dpo_bc_lambda > 0.0:
-            gt_clean = tokenized_agent["flow_train_clean_norm"].to(
-                dtype=torch.float32, device=dev
-            )
-            # Only first-anchor portion: first sum(first_anchor_mask) entries
-            n_first = int(first_anchor_mask.sum().item())
-            gt_clean_first = gt_clean[:n_first]
-            bc_loss = self.terminal_cost_final_step_loss.bc_flow_loss(
-                flow_decoder=flow_decoder,
-                flow_ode=flow_ode,
-                anchor_hidden_valid=anchor_hidden,
-                gt_clean_norm=gt_clean_first,
-            )
-            loss = loss + self.finetune_config.dpo_bc_lambda * bc_loss
-            bc_loss_val = bc_loss.detach()
+        total_rmm = pred_traj.new_zeros((), dtype=torch.float32)
+        total_count = 0
 
-        # RMM diagnostic metrics (move to GPU so DDP all_reduce works)
-        rmm_0_d = rmm_0.to(device=dev)
-        rmm_1_d = rmm_1.to(device=dev)
-        metrics["train/rmm_winner"] = torch.max(rmm_0_d, rmm_1_d).mean()
-        metrics["train/rmm_loser"] = torch.min(rmm_0_d, rmm_1_d).mean()
-        metrics["train/rmm_margin"] = (rmm_0_d - rmm_1_d).abs().mean()
-        metrics["loss"] = loss
-        metrics["train/dpo_bc_loss"] = bc_loss_val
+        for sc_idx in range(n_scenarios):
+            sc_mask = (agent_batch == sc_idx)
+            if not bool(sc_mask.any()):
+                continue
 
-        # ── 9. Debug JSONL logging (rank-0, every 10 steps) ────────────────────
-        self._maybe_write_dpo_debug(batch_idx, anchor_hidden, y_w, y_l, metrics)
+            # Parse scenario proto from TFRecord (CPU).
+            scenario = scenario_pb2.Scenario()
+            for tfdata in tf.data.TFRecordDataset([tfrecord_paths[sc_idx]], compression_type=""):
+                scenario.ParseFromString(bytes(tfdata.numpy()))
+                break
 
-        return metrics
+            sc_agent_ids = agent_ids[sc_mask]
+            sc_pred_traj = pred_traj[sc_mask]       # [A_sc, G, 80, 2]
+            sc_pred_z = pred_z[sc_mask]             # [A_sc, G, 80]
+            sc_pred_head = pred_head_traj[sc_mask]  # [A_sc, G, 80]
 
-    def _is_dice_ft_enabled(self) -> bool:
-        """dice_ft 분기인지 확인합니다."""
-        return bool(
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "dice_ft"
-            and self.dice_critic is not None
-            and self.terminal_cost_final_step_loss is not None
-        )
+            # log features: build once per scenario using any rollout (rollout 0) as carrier.
+            with torch.no_grad():
+                sr_for_log = get_scenario_rollouts(
+                    scenario_id=get_scenario_id_int_tensor([scenario_ids[sc_idx]], sc_pred_traj.device),
+                    agent_id=sc_agent_ids,
+                    agent_batch=torch.zeros(sc_agent_ids.shape[0], dtype=torch.long, device=sc_pred_traj.device),
+                    pred_traj=sc_pred_traj[:, :1],
+                    pred_z=sc_pred_z[:, :1],
+                    pred_head=sc_pred_head[:, :1],
+                )
+                log_feat, _ = compute_scenario_rollouts_features(scenario, sr_for_log[0])
+                log_feat_dict = {k: v.to(device=sc_pred_traj.device) for k, v in log_feat.as_dict().items()}
 
-    def _run_dice_ft_step(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ) -> dict:
-        """DICE (Chi^2 f-divergence / IQ-Learn) imitation learning fine-tuning.
+            valid = torch.ones(sc_pred_traj.shape[0], sc_pred_traj.shape[2], dtype=torch.bool, device=sc_pred_traj.device)
 
-        Both critic and actor are updated via a single combined loss returned to
-        Lightning, avoiding DDP / manual-backward conflicts:
+            # rollout별 soft RMM을 계산해 평균 (시나리오별로 동일 가중)
+            rmm_roll = []
+            for g in range(int(sc_pred_traj.shape[1])):
+                res_g = self._compute_soft_rmm(
+                    scenario=scenario,
+                    x=sc_pred_traj[:, g, :, 0],
+                    y=sc_pred_traj[:, g, :, 1],
+                    z=sc_pred_z[:, g, :],
+                    head=sc_pred_head[:, g, :],
+                    agent_ids=sc_agent_ids,
+                    valid=valid,
+                    log_feat_dict=log_feat_dict,
+                    config=cfg,
+                )
+                rmm_roll.append(res_g.metametric)
+            rmm_sc = torch.stack(rmm_roll).mean()  # scalar
+            total_rmm = total_rmm + rmm_sc
+            total_count += 1
 
-            loss = L_actor + L_critic
-
-        where:
-            L_critic = E_π[Q²/4 + Q] − E_E[Q]   (Chi^2 f-DICE, y_hat detached)
-            L_actor  = −E_π[Q(s, y_hat)]          (BPTT grad through ODE)
-                     + optional reward / BC terms
-
-        Gradient routing (disjoint by construction):
-          • L_critic flows only to dice_critic params  (actor BPTT graph excluded)
-          • L_actor  flows only to flow_decoder params (critic frozen during forward)
-        configure_optimizers registers both as separate param groups so each
-        group's LR can be set independently.
-
-        Steps:
-          1. encoder (no_grad) → anchor_hidden
-          2. ctx → v_init, delta_init
-          3. ODE full-BPTT rollout → y_hat
-          4. q_expert = Q(s, gt_clean.detach())   ← expert side (no y_hat)
-             q_policy = Q(s, y_hat.detach())       ← policy side (y_hat detached)
-             L_critic = Chi^2 DICE loss
-          5. critic frozen → q_actor = Q(s, y_hat)  ← grad through y_hat only
-             L_actor = −q_actor + optional reward + optional BC
-          6. return L_actor + L_critic  → Lightning backward + step
-        """
-        flow_ode = self.encoder.agent_encoder.flow_ode
-        flow_decoder = self.encoder.agent_encoder.flow_decoder
-
-        # ── 1. Encode context (frozen encoder) ────────────────────────────
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
-
-        if anchor_hidden_valid.numel() == 0:
+        if total_count == 0:
             dummy = next(iter(flow_decoder.parameters()))
             return {"loss": dummy.sum() * 0.0}
 
-        anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
-        n = anchor_hidden.shape[0]
-        dev = anchor_hidden.device
-
-        # ── 2. Kinematic init ──────────────────────────────────────────────
-        kp = self.encoder.agent_encoder.kinematic_projector
-        anchor_mask_tensor = tokenized_agent.get("flow_train_mask")
-        v_init, delta_init = self._compute_kinematic_init(tokenized_agent, anchor_mask_tensor, kp)
-        if v_init is None:
-            v_init = anchor_hidden.new_zeros(n)
-            delta_init = anchor_hidden.new_zeros(n)
-        else:
-            v_init = v_init.to(device=dev, dtype=torch.float32)
-            delta_init = delta_init.to(device=dev, dtype=torch.float32)
-
-        agent_type = tokenized_agent["flow_train_agent_type"].to(dev)
-        gt_clean = tokenized_agent["flow_train_clean_norm"].to(dtype=torch.float32, device=dev)
-
-        # ── 3. ODE rollout (full BPTT → y_hat with grad) ──────────────────
-        y_hat = self.terminal_cost_final_step_loss.generate_policy_trajectory(
-            flow_decoder=flow_decoder,
-            flow_ode=flow_ode,
-            anchor_hidden_valid=anchor_hidden,
-        )  # [n, 20, 4]
-
-        # ── 4. Critic loss  (y_hat detached → grad only to dice_critic) ───
-        # Run multiple critic updates via gradient accumulation.
-        # Each iteration recomputes Q on fresh detached samples and accumulates
-        # the loss. Combined with the actor below in a single backward pass.
-        loss_critic = anchor_hidden.new_zeros(1)
-        for _ in range(self.finetune_config.dice_critic_updates_per_actor):
-            q_expert = self.dice_critic(
-                anchor_hidden.detach(), v_init.detach(), delta_init.detach(), gt_clean.detach()
-            )
-            q_policy_c = self.dice_critic(
-                anchor_hidden.detach(), v_init.detach(), delta_init.detach(), y_hat.detach()
-            )
-            loss_critic = loss_critic + DICECritic.critic_loss(q_policy_c, q_expert)
-        loss_critic = loss_critic / max(self.finetune_config.dice_critic_updates_per_actor, 1)
-
-        # ── 5. Actor loss  (critic frozen → grad only to flow_decoder) ────
-        for p in self.dice_critic.parameters():
-            p.requires_grad_(False)
-        try:
-            q_policy_a = self.dice_critic(anchor_hidden, v_init, delta_init, y_hat)
-        finally:
-            for p in self.dice_critic.parameters():
-                p.requires_grad_(True)
-
-        loss_actor = -q_policy_a.mean()
-
-        # Optional: kinematic reward (on/off via dice_reward_enabled)
-        kin_loss_val = anchor_hidden.new_zeros(1)
-        if self.finetune_config.dice_reward_enabled and self.kinematic_reward_fn is not None:
-            kin_loss, _ = self.kinematic_reward_fn(
-                y_hat, agent_type=agent_type, v_init=v_init, delta_init=delta_init,
-            )
-            loss_actor = loss_actor + self.finetune_config.dice_reward_weight * kin_loss
-            kin_loss_val = kin_loss.detach()
-
-        # Optional: BC regularization (>0 → add GT flow-matching loss)
-        bc_loss_val = anchor_hidden.new_zeros(1)
-        if self.finetune_config.dice_bc_lambda > 0.0:
-            bc_loss = self.terminal_cost_final_step_loss.bc_flow_loss(
-                flow_decoder=flow_decoder,
-                flow_ode=flow_ode,
-                anchor_hidden_valid=anchor_hidden,
-                gt_clean_norm=gt_clean,
-            )
-            loss_actor = loss_actor + self.finetune_config.dice_bc_lambda * bc_loss
-            bc_loss_val = bc_loss.detach()
-
-        # ── 6. Combined loss: disjoint gradients → safe single backward ───
-        # L_critic → dice_critic params; L_actor → flow_decoder params.
-        loss_combined = loss_actor + loss_critic
-
+        mean_rmm = total_rmm / float(total_count)
+        loss = -mean_rmm
         return {
-            "loss": loss_combined,
-            "train/dice_critic_loss": loss_critic.detach(),
-            "train/dice_q_expert": q_expert.mean().detach(),
-            "train/dice_q_policy": q_policy_c.mean().detach(),
-            "train/dice_actor_loss": loss_actor.detach(),
-            "train/dice_kin_reward": kin_loss_val,
-            "train/dice_bc_loss": bc_loss_val,
-            "train/v_init_mean": v_init.mean().item(),
+            "loss": loss,
+            "train/rmm_soft": mean_rmm.detach(),
+            "train/rmm_loss": loss.detach(),
+            "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
         }
+
+    # ── Flow-RWR fine-tuning step ─────────────────────────────────────────────
+
+    # def _run_flow_rwr_ft_step(
+    #     self,
+    #     tokenized_map: Dict[str, Tensor],
+    #     tokenized_agent: Dict[str, Tensor],
+    #     batch_idx: int = 0,
+    #     data: dict | None = None,
+    # ) -> dict:
+    #     """Flow-RWR fine-tuning step (Reward-Weighted Regression + GPU RMM).
+
+    #     Algorithm:
+    #         1. Encode map + all anchor contexts (no_grad).
+    #         2. Generate G closed-loop rollouts (no_grad).
+    #         3. Score each rollout with GPU RMM → R^g ∈ [0,1].
+    #         4. Weights: w^g = softmax(R^g / β) per scenario.
+    #         5. FM loss weighted by w^g (and γ^k temporal discount per anchor k):
+    #              L = -Σ_k γ^k Σ_g w^g · log π_θ(y^g_k | s_k)
+    #            where log π_θ ≈ -E_{t,x₀}[||v_θ - (y^g-x₀)||²].
+
+    #     Key properties vs EPG:
+    #         - No IS weighting (rho), no reference model, no KL term.
+    #         - Works on training split (GPU RMM, no TFRecords required).
+    #         - Temporal discount γ^k down-weights later anchors (error accumulation).
+    #     """
+    #     flow_ode = self.encoder.agent_encoder.flow_ode
+    #     flow_decoder = self.encoder.agent_encoder.flow_decoder
+    #     G   = self.finetune_config.rwr_n_rollouts
+    #     beta = self.finetune_config.rwr_beta
+    #     gamma = self.finetune_config.rwr_anchor_discount
+    #     K   = self.finetune_config.rwr_n_samples
+
+    #     # ── 1. Encode map + anchor context ────────────────────────────────────
+    #     with torch.no_grad():
+    #         map_feature = self.encoder.encode_map(tokenized_map)
+    #         _, anchor_hidden_all, _ = self.encoder.encode_anchor_context_from_map_feature(
+    #             map_feature=map_feature,
+    #             tokenized_agent=tokenized_agent,
+    #             anchor_mask_key="flow_train_mask",
+    #         )
+    #         # anchor_hidden_all: [n_agents, 13, hidden_dim]
+
+    #     flow_train_mask = tokenized_agent["flow_train_mask"]   # [n_agents, 13]
+    #     first_anchor_mask = flow_train_mask[:, 0]
+
+    #     if not first_anchor_mask.any():
+    #         dummy = next(iter(flow_decoder.parameters()))
+    #         return {"loss": dummy.sum() * 0.0}
+
+    #     dev = anchor_hidden_all.device
+
+    #     # ── 2. Generate G closed-loop rollouts ────────────────────────────────
+    #     with torch.no_grad():
+    #         rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+    #             tokenized_agent=tokenized_agent,
+    #             map_feature=map_feature,
+    #         )
+    #         pred_traj, pred_z, pred_head_traj, pred_anchor_hidden_2hz = (
+    #             self._run_parallel_rollout_chunk(
+    #                 data=data,
+    #                 tokenized_agent=tokenized_agent,
+    #                 map_feature=map_feature,
+    #                 rollout_cache=rollout_cache,
+    #                 rollout_indices=list(range(G)),
+    #                 return_anchor_hidden=True,
+    #             )
+    #         )
+    #         # pred_traj: [n_agents, G, 80, 2]
+
+    #     agent_batch = tokenized_agent["batch"]   # [n_agents]
+
+    #     # ── 3. Score with GPU RMM ─────────────────────────────────────────────
+    #     rmm_scores = self._compute_gpu_rmm_batch(
+    #         data=data if data is not None else {},
+    #         tokenized_map=tokenized_map,
+    #         agent_batch=agent_batch,
+    #         pred_traj=pred_traj,
+    #         pred_z=pred_z,
+    #         pred_head=pred_head_traj,
+    #     )  # [n_scenarios, G]
+
+    #     rmm_scores_d = rmm_scores.to(device=dev)
+
+    #     # ── 4. Importance weights: softmax(R/β) ───────────────────────────────
+    #     weights_sc = F.softmax(rmm_scores_d / beta, dim=-1)  # [n_scenarios, G]
+
+    #     # ── 5. Determine usable anchor steps (same logic as EPG) ──────────────
+    #     ANCHOR_STRIDE = 5
+    #     ANCHOR_FUTURE_LEN = 20
+    #     n_pred_steps = pred_traj.shape[2]     # 80
+    #     n_anchors_total = anchor_hidden_all.shape[1]  # 13
+    #     n_hidden_steps = pred_anchor_hidden_2hz.shape[2]
+    #     n_anchors_usable = min(
+    #         n_anchors_total,
+    #         (n_pred_steps - ANCHOR_FUTURE_LEN) // ANCHOR_STRIDE + 1,
+    #         n_hidden_steps,
+    #     )  # = 13
+
+    #     pred_traj_f = pred_traj.to(dtype=torch.float32, device=dev)
+    #     pred_head_f = pred_head_traj.to(dtype=torch.float32, device=dev)
+
+    #     ctx_sampled_pos = tokenized_agent["ctx_sampled_pos"].to(dtype=torch.float32, device=dev)
+    #     ctx_sampled_heading = tokenized_agent["ctx_sampled_heading"].to(dtype=torch.float32, device=dev)
+
+    #     # ── 6. Weighted FM loss over all anchors ──────────────────────────────
+    #     total_loss = anchor_hidden_all.new_zeros(())
+    #     accum_metrics: Dict[str, list] = {
+    #         "rwr_loss": [], "rwr_log_p": [], "rwr_pref_acc": [], "rwr_weight_entropy": [],
+    #     }
+    #     n_valid_anchors = 0
+
+    #     for k in range(n_anchors_usable):
+    #         valid_idx_k = flow_train_mask[:, k].nonzero(as_tuple=False).squeeze(-1)
+    #         if valid_idx_k.numel() == 0:
+    #             continue
+
+    #         n_valid_k = valid_idx_k.shape[0]
+    #         anchor_discount_k = gamma ** k  # temporal discount for later anchors
+
+    #         # anchor hidden: [n_valid_k, G, d_model]
+    #         anchor_hidden_k = (
+    #             pred_anchor_hidden_2hz[valid_idx_k, :, k, :]
+    #             .detach()
+    #             .to(dtype=torch.float32)
+    #         )
+
+    #         # Per-agent RWR weights from scenario-level weights
+    #         weights_k = weights_sc[agent_batch[valid_idx_k]]  # [n_valid_k, G]
+
+    #         # Build normalised trajectory tensors for all G rollouts
+    #         future_start = k * ANCHOR_STRIDE
+    #         future_slice = slice(future_start, future_start + ANCHOR_FUTURE_LEN)
+    #         traj_norm_list_k: list[Tensor] = []
+    #         for g in range(G):
+    #             y_world = pred_traj_f[valid_idx_k, g, future_slice, :]
+    #             h_world = pred_head_f[valid_idx_k, g, future_slice]
+    #             if k == 0:
+    #                 ref_pos  = ctx_sampled_pos[valid_idx_k, 1, :]
+    #                 ref_head = ctx_sampled_heading[valid_idx_k, 1]
+    #             else:
+    #                 ref_pos  = pred_traj_f[valid_idx_k, g, future_start - 1, :]
+    #                 ref_head = pred_head_f[valid_idx_k, g, future_start - 1]
+    #             traj_norm_list_k.append(
+    #                 self._world_traj_to_flow_norm(y_world, h_world, ref_pos, ref_head)
+    #             )
+    #         trajectories_k = torch.stack(traj_norm_list_k, dim=1)  # [n_valid_k, G, 20, 4]
+
+    #         # RWR loss for this anchor
+    #         loss_k, metrics_k = _flow_rwr_loss(
+    #             flow_decoder=flow_decoder,
+    #             anchor_hidden=anchor_hidden_k,
+    #             trajectories=trajectories_k.detach(),
+    #             weights=weights_k.detach(),
+    #             flow_ode=flow_ode,
+    #             n_samples=K,
+    #         )
+    #         total_loss = total_loss + anchor_discount_k * loss_k
+
+    #         accum_metrics["rwr_loss"].append(metrics_k["train/rwr_loss"])
+    #         accum_metrics["rwr_log_p"].append(metrics_k["train/rwr_log_p"])
+    #         accum_metrics["rwr_pref_acc"].append(metrics_k["train/rwr_pref_acc"])
+    #         accum_metrics["rwr_weight_entropy"].append(metrics_k["train/rwr_weight_entropy"])
+    #         n_valid_anchors += 1
+
+    #     if n_valid_anchors == 0:
+    #         dummy = next(iter(flow_decoder.parameters()))
+    #         return {"loss": dummy.sum() * 0.0}
+
+    #     loss = total_loss / n_valid_anchors
+
+    #     def _mean(lst: list) -> Tensor:
+    #         return torch.stack(lst).mean()
+
+    #     metrics: Dict[str, Tensor] = {
+    #         "train/rwr_loss":           loss.detach(),
+    #         "train/rwr_pg_loss":        _mean(accum_metrics["rwr_loss"]),
+    #         "train/rwr_log_p":          _mean(accum_metrics["rwr_log_p"]),
+    #         "train/rwr_pref_acc":       _mean(accum_metrics["rwr_pref_acc"]),
+    #         "train/rwr_weight_entropy": _mean(accum_metrics["rwr_weight_entropy"]),
+    #         "train/rwr_n_anchors":      torch.tensor(float(n_valid_anchors), device=dev),
+    #         "train/rmm_mean":           rmm_scores_d.mean().to(device=dev),
+    #         "train/rmm_max":            rmm_scores_d.max(dim=-1).values.mean().to(device=dev),
+    #         "train/rmm_min":            rmm_scores_d.min(dim=-1).values.mean().to(device=dev),
+    #         "train/rmm_margin":         (
+    #             rmm_scores_d.max(dim=-1).values - rmm_scores_d.min(dim=-1).values
+    #         ).mean(),
+    #         "train/rwr_weight_max":     weights_sc.max(dim=-1).values.mean(),
+    #         "train/rwr_weight_min":     weights_sc.min(dim=-1).values.mean(),
+    #     }
+    #     metrics["loss"] = loss
+    #     return metrics
 
     def _run_kinematic_reward_ft_step(
         self,
@@ -2584,40 +2249,32 @@ class SMARTFlow(LightningModule):
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
-        if self._is_flow_rwr_ft_enabled():
-            result = self._run_flow_rwr_ft_step(tokenized_map, tokenized_agent, batch_idx, data)
+        # if self._is_flow_rwr_ft_enabled():
+        #     result = self._run_flow_rwr_ft_step(tokenized_map, tokenized_agent, batch_idx, data)
+        #     for k, v in result.items():
+        #         if k != "loss" and isinstance(v, (Tensor, float)):
+        #             self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        #     self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        #     return result["loss"]
+
+        if self._is_rmm_bptt_ft_enabled():
+            result = self._run_flow_bptt_ft_step(tokenized_map, tokenized_agent, batch_idx, data)
             for k, v in result.items():
                 if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             return result["loss"]
 
-        if self._is_flow_dpo_ft_enabled():
-            result = self._run_flow_dpo_ft_step(tokenized_map, tokenized_agent, batch_idx, data)
-            for k, v in result.items():
-                if k != "loss" and isinstance(v, (Tensor, float)):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            return result["loss"]
-
-        if self._is_flow_epg_ft_enabled():
-            result = self._run_flow_epg_ft_step(tokenized_map, tokenized_agent, batch_idx, data)
-            for k, v in result.items():
-                if k != "loss" and isinstance(v, (Tensor, float)):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            if not self.automatic_optimization:
-                # Manual opt already stepped inside _run_flow_epg_ft_step; nothing to return.
-                return result["loss"]
-            return result["loss"]
-
-        if self._is_dice_ft_enabled():
-            result = self._run_dice_ft_step(tokenized_map, tokenized_agent)
-            for k, v in result.items():
-                if k != "loss" and isinstance(v, (Tensor, float)):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            return result["loss"]
+        # if self._is_flow_epg_ft_enabled():
+        #     result = self._run_flow_epg_ft_step(tokenized_map, tokenized_agent, batch_idx, data)
+        #     for k, v in result.items():
+        #         if k != "loss" and isinstance(v, (Tensor, float)):
+        #             self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        #     self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        #     if not self.automatic_optimization:
+        #         # Manual opt already stepped inside _run_flow_epg_ft_step; nothing to return.
+        #         return result["loss"]
+        #     return result["loss"]
 
         if self._is_kinematic_proj_ft_enabled():
             result = self._run_kinematic_proj_ft_step(tokenized_map, tokenized_agent)

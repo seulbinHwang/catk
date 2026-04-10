@@ -541,7 +541,13 @@ class SMARTAgentDecoder(nn.Module):
                     mask=pred_valid[:, :n_step],
                     inference_mask=inference_mask,
                 )
-                edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
+                edge_index_t = torch.stack(
+                    (
+                        edge_index_t[0],
+                        (edge_index_t[1] + 1) // n_step - 1,
+                    ),
+                    dim=0,
+                )
 
             # In the inference stage, we only infer the current stage for recurrent
             edge_index_pl2a, r_pl2a = self.build_map2agent_edge(

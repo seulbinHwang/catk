@@ -199,10 +199,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             return recent_motion
 
         recent_motion_valid = valid_window[:, -1] & valid_window[:, -2]
-        recent_motion[recent_motion_valid] = (
-            pos_window[recent_motion_valid, -1] - pos_window[recent_motion_valid, -2]
-        )
-        return recent_motion
+        dp = pos_window[:, -1] - pos_window[:, -2]
+        return torch.where(recent_motion_valid.unsqueeze(-1), dp, recent_motion)
 
 
     def _pack_anchor_hidden(
@@ -714,7 +712,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             }
         return cloned_cache
 
-    @torch.no_grad()
     def rollout_from_cache(
         self,
         rollout_cache: Dict[str, object],
@@ -767,16 +764,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         coarse_valid_list = [valid_window[:, i].clone() for i in range(valid_window.shape[1])]
         coarse_idx_list = [pred_idx_window[:, i].clone() for i in range(pred_idx_window.shape[1])]
 
-        pred_traj_10hz = torch.zeros(
-            (n_agent, n_step_future_10hz, 2),
-            dtype=pos_window.dtype,
-            device=pos_window.device,
-        )
-        pred_head_10hz = torch.zeros(
-            (n_agent, n_step_future_10hz),
-            dtype=head_window.dtype,
-            device=head_window.device,
-        )
+        # full_grad 학습 시 같은 버퍼에 슬라이스 in-place 대입하면 역전파에서 version 충돌이 납니다.
+        # 청크를 모았다가 마지막에 cat 합니다.
+        pred_traj_10hz_chunks: list[torch.Tensor] = []
+        pred_head_10hz_chunks: list[torch.Tensor] = []
         # Hidden state used to generate each coarse 0.5s step.
         # shape: [n_agent, n_step_future_2hz, hidden_dim]
         anchor_hidden_2hz_list = []
@@ -836,7 +827,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     mask=valid_window,
                     inference_mask=inference_mask,
                 )
-                edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
+                # full_grad: edge_index_t 는 pos 등과 그래프로 연결될 수 있음. 행 in-place 수정은 역전파 시
+                # LongTensor version 충돌을 일으키므로 새 텐서로 만든다.
+                edge_index_t = torch.stack(
+                    (
+                        edge_index_t[0],
+                        (edge_index_t[1] + 1) // n_step - 1,
+                    ),
+                    dim=0,
+                )
 
                 edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
                     pos_pl=map_feature["position"],
@@ -885,8 +884,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             next_pos = pos_window[:, -1].clone()
             next_head = head_window[:, -1].clone()
             next_token_idx = pred_idx_window[:, -1].clone()
-            commit_traj_step = pred_traj_10hz.new_zeros((n_agent, 5, 2))
-            commit_head_step = pred_head_10hz.new_zeros((n_agent, 5))
+            commit_traj_step = pos_window.new_zeros((n_agent, 5, 2))
+            commit_head_step = head_window.new_zeros((n_agent, 5))
 
             if active_mask.any():
                 active_hidden = current_hidden[active_mask]
@@ -910,6 +909,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         steps=self.ppr_steps,
                     )
                 else:
+
                     y_hat_norm = self.flow_ode.generate(
                         x_init=x_init_norm, model_fn=_model_fn_cl
                     )
@@ -921,6 +921,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         v_init=_v_init_cl, delta_init=_delta_init_cl,
                         commit_steps=self.shift,
                     )
+                    # full_grad: v_state/delta_state 버퍼 in-place 갱신은 스텝 간 version 충돌 유발 가능
+                    v_state = v_state.clone()
+                    delta_state = delta_state.clone()
                     v_state[active_mask] = _v_new
                     delta_state[active_mask] = _d_new
                 commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
@@ -941,12 +944,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 )
                 commit_traj_step[active_mask] = commit_pos_act
                 commit_head_step[active_mask] = commit_head_act
+                # full_grad: pos/head/token 다음 스텝 cat에 쓰이므로 in-place 전에 clone
+                next_pos = next_pos.clone()
+                next_head = next_head.clone()
+                next_token_idx = next_token_idx.clone()
                 next_pos[active_mask] = next_pos_act
                 next_head[active_mask] = next_head_act
                 next_token_idx[active_mask] = next_token_idx_act
 
-            pred_traj_10hz[:, t * 5 : (t + 1) * 5] = commit_traj_step
-            pred_head_10hz[:, t * 5 : (t + 1) * 5] = commit_head_step
+            pred_traj_10hz_chunks.append(commit_traj_step)
+            pred_head_10hz_chunks.append(commit_head_step)
 
             next_valid = active_mask.clone()
             coarse_pos_list.append(next_pos.clone())
@@ -993,6 +1000,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 for key in feat_a_t_dict:
                     feat_a_t_dict[key] = feat_a_t_dict[key][:, -max_context_steps:]
 
+        pred_traj_10hz = torch.cat(pred_traj_10hz_chunks, dim=1)
+        pred_head_10hz = torch.cat(pred_head_10hz_chunks, dim=1)
+
         pred_pos = torch.stack(coarse_pos_list, dim=1)
         pred_head = torch.stack(coarse_head_list, dim=1)
         pred_valid = torch.stack(coarse_valid_list, dim=1)
@@ -1016,6 +1026,26 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz.shape[1])
         return out_dict
 
+    def rollout_from_cache_no_grad(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        sampling_noise: DictConfig,
+        sampling_seed: int | None = None,
+        scenario_sampling_seeds: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """평가/검증용: closed-loop rollout을 no_grad로 실행합니다."""
+        with torch.no_grad():
+            return self.rollout_from_cache(
+                rollout_cache=rollout_cache,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                sampling_noise=sampling_noise,
+                sampling_seed=sampling_seed,
+                scenario_sampling_seeds=scenario_sampling_seeds,
+            )
+
     @torch.no_grad()
     def inference(
         self,
@@ -1027,7 +1057,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        return self.rollout_from_cache(
+        return self.rollout_from_cache_no_grad(
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
