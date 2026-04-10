@@ -1176,6 +1176,26 @@ class SMARTFlow(LightningModule):
             and self.finetune_config.mode == "rmm_bptt_ft"
         )
 
+    def on_after_backward(self) -> None:
+        """velocity_head gradient norm을 로깅합니다 (BPTT fine-tuning 디버깅용)."""
+        if not self._is_rmm_bptt_ft_enabled():
+            return
+        try:
+            vh = self.encoder.agent_encoder.flow_decoder.velocity_head
+            sq_sum = 0.0
+            n_params_with_grad = 0
+            for p in vh.parameters():
+                if p.grad is not None:
+                    sq_sum += p.grad.data.norm(2).item() ** 2
+                    n_params_with_grad += 1
+            grad_norm = sq_sum ** 0.5
+            self.log("train/dbg_vh_grad_norm", grad_norm, on_step=True, on_epoch=False,
+                     sync_dist=True, batch_size=1)
+            self.log("train/dbg_vh_grad_n_params", float(n_params_with_grad),
+                     on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+        except AttributeError:
+            pass
+
     def on_train_start(self) -> None:
         _needs_ref = (
             self.finetune_config.enabled
@@ -1434,6 +1454,8 @@ class SMARTFlow(LightningModule):
 
         total_rmm = pred_traj.new_zeros((), dtype=torch.float32)
         total_count = 0
+        # per-component 누적 (debug)
+        lik_accum: dict[str, float] = {}
 
         for sc_idx in range(n_scenarios):
             sc_mask = (agent_batch == sc_idx)
@@ -1491,6 +1513,10 @@ class SMARTFlow(LightningModule):
                     config=cfg,
                 )
                 rmm_roll.append(res_g.metametric)
+                # per-component 누적 (첫 rollout만 사용)
+                if g == 0:
+                    for k, v in res_g.likelihoods.items():
+                        lik_accum[k] = lik_accum.get(k, 0.0) + float(v.mean().item())
             rmm_sc = torch.stack(rmm_roll).mean()  # scalar
             total_rmm = total_rmm + rmm_sc
             total_count += 1
@@ -1501,12 +1527,24 @@ class SMARTFlow(LightningModule):
 
         mean_rmm = total_rmm / float(total_count)
         loss = -mean_rmm
-        return {
+
+        # velocity_head param norm (grad는 on_after_backward에서 로깅)
+        vh_param_norm = sum(
+            p.data.norm(2).item() ** 2
+            for p in flow_decoder.velocity_head.parameters()
+        ) ** 0.5
+
+        metrics: dict = {
             "loss": loss,
             "train/rmm_soft": mean_rmm.detach(),
             "train/rmm_loss": loss.detach(),
             "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
+            "train/dbg_vh_param_norm": torch.tensor(vh_param_norm, device=mean_rmm.device),
+            "train/dbg_pred_traj_std": pred_traj[:, :, :T_pred, :].detach().std().cpu(),
         }
+        for k, v in lik_accum.items():
+            metrics[f"train/dbg_lik_{k}"] = torch.tensor(v / total_count, device=mean_rmm.device)
+        return metrics
 
     def _run_kinematic_reward_ft_step(
         self,
