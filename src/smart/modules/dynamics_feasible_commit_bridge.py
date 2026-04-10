@@ -339,7 +339,6 @@ class DynamicsAwareFeasibleCommitBridge:
             accel_target=accel_target,
             yaw_rate_target=yaw_rate_target,
             limits=limits,
-            use_limits=self.use_stationary_refinement,
         )
         if self.use_stationary_refinement and stationary_hold_mask.any():
             commit_pos_local[stationary_hold_mask] = 0.0
