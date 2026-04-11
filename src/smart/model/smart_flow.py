@@ -99,14 +99,44 @@ class SMARTFlow(LightningModule):
             self.draft_regularizer = DraftPhysicsRegularizer(
                 dt=float(getattr(draft_physics, "dt", 0.1)),
                 pos_scale_m=float(getattr(draft_physics, "pos_scale_m", 20.0)),
-                deadzone_ratio=float(getattr(draft_physics, "deadzone_ratio", 0.02)),
-                deadzone_softness=float(getattr(draft_physics, "deadzone_softness", 0.02)),
-                gt_excess_only=bool(getattr(draft_config, "gt_excess_only", True)),
-                speed_weight=float(getattr(draft_physics, "speed_weight", 1.0)),
-                slip_weight=float(getattr(draft_physics, "slip_weight", 1.0)),
-                accel_weight=float(getattr(draft_physics, "accel_weight", 1.0)),
-                yaw_accel_weight=float(getattr(draft_physics, "yaw_accel_weight", 1.0)),
-                turn_weight=float(getattr(draft_physics, "turn_weight", 1.0)),
+                speed_floor_mps=float(getattr(draft_physics, "speed_floor_mps", 0.5)),
+                vehicle_v_max_mps=float(getattr(draft_physics, "vehicle_v_max_mps", 35.0)),
+                vehicle_a_max_mps2=float(getattr(draft_physics, "vehicle_a_max_mps2", 8.0)),
+                vehicle_lat_accel_max_mps2=float(
+                    getattr(draft_physics, "vehicle_lat_accel_max_mps2", 4.2)
+                ),
+                bicycle_v_max_mps=float(getattr(draft_physics, "bicycle_v_max_mps", 22.0)),
+                bicycle_a_max_mps2=float(getattr(draft_physics, "bicycle_a_max_mps2", 5.5)),
+                bicycle_lat_accel_max_mps2=float(
+                    getattr(draft_physics, "bicycle_lat_accel_max_mps2", 4.4)
+                ),
+                pedestrian_v_max_mps=float(getattr(draft_physics, "pedestrian_v_max_mps", 5.0)),
+                pedestrian_a_max_mps2=float(getattr(draft_physics, "pedestrian_a_max_mps2", 4.7)),
+                vehicle_wheelbase_scale=float(
+                    getattr(draft_physics, "vehicle_wheelbase_scale", 0.60)
+                ),
+                bicycle_wheelbase_scale=float(
+                    getattr(draft_physics, "bicycle_wheelbase_scale", 0.85)
+                ),
+                vehicle_steer_max_rad=float(getattr(draft_physics, "vehicle_steer_max_rad", 0.55)),
+                bicycle_steer_max_rad=float(getattr(draft_physics, "bicycle_steer_max_rad", 1.00)),
+                vehicle_steer_rate_max_radps=float(
+                    getattr(draft_physics, "vehicle_steer_rate_max_radps", 0.8)
+                ),
+                bicycle_steer_rate_max_radps=float(
+                    getattr(draft_physics, "bicycle_steer_rate_max_radps", 1.5)
+                ),
+                vehicle_soft_weight=float(getattr(draft_physics, "vehicle_soft_weight", 0.25)),
+                bicycle_soft_weight=float(getattr(draft_physics, "bicycle_soft_weight", 0.25)),
+                pedestrian_soft_weight=float(
+                    getattr(draft_physics, "pedestrian_soft_weight", 0.25)
+                ),
+                pedestrian_heading_weight=float(
+                    getattr(draft_physics, "pedestrian_heading_weight", 0.05)
+                ),
+                pedestrian_heading_speed_threshold_mps=float(
+                    getattr(draft_physics, "pedestrian_heading_speed_threshold_mps", 0.5)
+                ),
                 eps=float(getattr(draft_physics, "eps", 1e-6)),
             )
         else:
@@ -1055,6 +1085,7 @@ class SMARTFlow(LightningModule):
                 pred_future_norm=pred_sample_norm,
                 target_future_norm=pred_dict["flow_clean_norm"],
                 packed_agent_type=tokenized_agent["flow_train_agent_type"],
+                packed_agent_length=tokenized_agent["flow_train_agent_length"],
                 packed_prev_control=tokenized_agent["flow_train_prev_control"],
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
             )
@@ -1066,6 +1097,7 @@ class SMARTFlow(LightningModule):
                 pred_future_norm=pred_sample_norm.float(),
                 target_future_norm=pred_dict["flow_clean_norm"].float(),
                 packed_agent_type=tokenized_agent["flow_train_agent_type"],
+                packed_agent_length=tokenized_agent["flow_train_agent_length"].float(),
                 packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
             )
@@ -1101,7 +1133,23 @@ class SMARTFlow(LightningModule):
             batch_size=1,
         )
         self.log(
+            "train/loss_if",
+            physics_dict["loss"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
             "train/loss_phys_raw",
+            physics_dict["raw_pred_loss"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/loss_if_raw",
             physics_dict["raw_pred_loss"],
             on_step=False,
             on_epoch=True,
@@ -1110,7 +1158,7 @@ class SMARTFlow(LightningModule):
         )
         for metric_name in DRAFT_PHYSICS_COMPONENT_KEYS:
             self.log(
-                f"raw_feaisble_gap/{metric_name}",
+                f"draft_component/{metric_name}",
                 physics_dict[metric_name],
                 on_step=False,
                 on_epoch=True,
@@ -1119,15 +1167,7 @@ class SMARTFlow(LightningModule):
             )
         for metric_name in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
             self.log(
-                f"raw_feaisble_gap/{metric_name}",
-                physics_dict[metric_name],
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            self.log(
-                f"raw_feaisble_gap/pred_{metric_name}",
+                f"draft_actual_pred/{metric_name}",
                 physics_dict[f"pred_{metric_name}"],
                 on_step=False,
                 on_epoch=True,
@@ -1135,7 +1175,7 @@ class SMARTFlow(LightningModule):
                 batch_size=1,
             )
             self.log(
-                f"gt_feasible_gap/{metric_name}",
+                f"draft_actual_gt/{metric_name}",
                 physics_dict[f"gt_{metric_name}"],
                 on_step=False,
                 on_epoch=True,
@@ -1155,6 +1195,7 @@ class SMARTFlow(LightningModule):
         """
         """ tokenized_agent
 flow_train_agent_type [n_valid_anchor]
+flow_train_agent_length [n_valid_anchor]
 flow_train_prev_control [n_valid_anchor, 3]
 flow_train_prev_control_valid [n_valid_anchor]
 
@@ -1182,16 +1223,17 @@ open_metric_dict:
         fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
 
         draft_weight = self._get_draft_loss_weight()
-        """ physics_dict : Dict[str, Tensor] #  모든 값은 scalar tensor 
-        
+        """ physics_dict : Dict[str, Tensor] # 모든 값은 scalar tensor
+
         loss, raw_pred_loss
-        
-        speed, slip, accel, yaw_accel, turn
-        
-        speed_excess_mps, slip_beta_excess_deg,
-        accel_excess_mps2, yaw_accel_excess_degps2, turn_yaw_rate_excess_degps, 
-        turn_lat_accel_excess_mps2, turn_radius_shortfall_m
-        
+
+        vehicle_hard, vehicle_soft, vehicle_total
+        bicycle_hard, bicycle_soft, bicycle_total
+        pedestrian_hard, pedestrian_soft, pedestrian_head, pedestrian_total
+
+        pred_speed_excess_mps, pred_accel_excess_mps2,
+        pred_steer_excess_deg, pred_steer_rate_excess_degps,
+        pred_lat_accel_excess_mps2, pred_heading_error_deg
         """
         physics_dict = self._build_zero_draft_metrics(fm_loss)
         total_loss = fm_loss
