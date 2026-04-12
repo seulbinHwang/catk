@@ -9,9 +9,7 @@ from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
-from src.smart.modules.dynamics_feasible_commit_bridge import (
-    DynamicsAwareFeasibleCommitBridge,
-)
+
 from src.smart.modules.flow_local_decoder import (
     ContinuousCommitBridge,
     FlowODE,
@@ -89,13 +87,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             use_stationary_refinement_in_dynamics_bridge
         )
         self.commit_bridge = ContinuousCommitBridge()
-        self.dynamics_commit_bridge = (
-            DynamicsAwareFeasibleCommitBridge(
-                use_stationary_refinement=self.use_stationary_refinement_in_dynamics_bridge
-            )
-            if self.use_dynamics_feasible_commit_bridge
-            else None
-        )
+
 
     def build_interaction_edge(
         self,
@@ -925,33 +917,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     )
                     pred_flow_2s_traj[active_mask, t] = preview_pos_global
                     pred_flow_2s_valid[active_mask, t] = True
-                if self.use_dynamics_feasible_commit_bridge and self.dynamics_commit_bridge is not None:
-                    (
-                        commit_pos_act,
-                        commit_head_act,
-                        next_pos_act,
-                        next_head_act,
-                    ) = self.dynamics_commit_bridge.commit(
-                        y_hat_norm=y_hat_norm,
-                        current_pos=current_pos_act,
-                        current_head=current_head_act,
-                        agent_type=active_agent_type,
-                        agent_shape=tokenized_agent["shape"][active_mask],
-                        exec_pos_pair=exec_pos_pair_10hz[active_mask],
-                        exec_head_pair=exec_head_pair_10hz[active_mask],
-                        exec_valid_pair=exec_valid_pair_10hz[active_mask],
-                    )
-                else:
-                    (
-                        commit_pos_act,
-                        commit_head_act,
-                        next_pos_act,
-                        next_head_act,
-                    ) = self.commit_bridge.commit(
-                        y_hat_norm=y_hat_norm,
-                        current_pos=current_pos_act,
-                        current_head=current_head_act,
-                    )
+
+                (
+                    commit_pos_act,
+                    commit_head_act,
+                    next_pos_act,
+                    next_head_act,
+                ) = self.commit_bridge.commit(
+                    y_hat_norm=y_hat_norm,
+                    current_pos=current_pos_act,
+                    current_head=current_head_act,
+                )
                 next_token_idx_act = self.commit_bridge.retokenize(
                     current_pos=current_pos_act,
                     current_head=current_head_act,
