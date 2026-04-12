@@ -1137,7 +1137,11 @@ class ContinuousCommitBridge:
                 dim=-1,
             )
             head_state = wrap_angle(head_state + dt * speed_state * kappa_applied)
-            speed_state = torch.clamp(speed_state + dt * accel_applied, min=0.0, max=limits["v_max"])
+            speed_state = torch.clamp(
+                speed_state + dt * accel_applied,
+                min=torch.zeros_like(limits["v_max"]),
+                max=limits["v_max"],
+            )
             accel_state = accel_applied
             kappa_state = kappa_applied
             commit_pos[:, step_idx] = pos_state
