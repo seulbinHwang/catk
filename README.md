@@ -53,7 +53,7 @@
   즉, 작은 떨림을 허용하지 않습니다.
 - 이 stop gate는 `use_lqr=false` 여도 동작합니다.
 - `use_lqr=true` 이면 stop gate를 통과한 vehicle / bicycle에만 제어용 참조를 만들고,
-  1초 horizon의 longitudinal / lateral LQR로 다음 0.5초 5점을 실제 실행합니다.
+  1초 horizon의 longitudinal / lateral LQR를 0.1초마다 다시 풀어 다음 0.5초 5점을 실제 실행합니다.
 - 이때 제어는 steering angle 이 아니라 **curvature-domain kinematic bicycle** 로 수행합니다.
   wheelbase 추정은 쓰지 않습니다.
 - LQR가 켜져 있어도 pedestrian은 token/raw branch를 유지합니다.

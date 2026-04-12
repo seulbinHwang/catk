@@ -1047,7 +1047,7 @@ class ContinuousCommitBridge:
         exec_valid_history: torch.Tensor,
         agent_type: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """vehicle / bicycle의 다음 0.5초를 LQR과 curvature bicycle로 실행합니다.
+        """vehicle / bicycle의 다음 0.5초를 0.1초 receding-horizon LQR로 실행합니다.
 
         Args:
             y_hat_norm: raw FM 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
@@ -1075,7 +1075,7 @@ class ContinuousCommitBridge:
             current_pos=current_pos,
             current_head=current_head,
         )
-        v0, a_prev, kappa0, v_ref_horizon, kappa_ref_horizon = self._estimate_reference_profiles(
+        v0, a_prev, kappa0, _, _ = self._estimate_reference_profiles(
             current_pos=current_pos,
             current_head=current_head,
             exec_pos_history=exec_pos_history,
@@ -1084,36 +1084,59 @@ class ContinuousCommitBridge:
             future_pos=future_pos,
             future_head=future_head,
         )
-        v_ref_target = v_ref_horizon[:, -1]
-        slow_mask = (v0 < float(self.config.stop_speed_mps)) & (v_ref_target < float(self.config.stop_speed_mps))
-        a_star = self._solve_longitudinal_lqr(v0=v0, v_ref_target=v_ref_target)
-        u_star = self._solve_lateral_lqr(
-            v_profile=v_ref_horizon,
-            kappa0=kappa0,
-            kappa_ref_profile=kappa_ref_horizon,
-        )
-        if slow_mask.any():
-            a_star = a_star.clone()
-            u_star = u_star.clone()
-            a_star[slow_mask] = -float(self.config.stop_speed_kp) * (v0[slow_mask] - v_ref_target[slow_mask])
-            u_star[slow_mask] = 0.0
 
         limits = self._gather_dynamic_limits(agent_type=agent_type, dtype=current_pos.dtype)
-        a_star = torch.clamp(a_star, -limits["a_max"], limits["a_max"])
-
         dt = float(self.config.dt)
         accel_alpha = dt / (dt + float(self.config.accel_tau_s))
         curvature_alpha = dt / (dt + float(self.config.curvature_tau_s))
+        history_steps = min(exec_pos_history.shape[1], int(self.config.history_steps))
 
         pos_state = current_pos.clone()
         head_state = current_head.clone()
         speed_state = v0.clamp_min(0.0)
         accel_state = a_prev.clamp(-limits["a_max"], limits["a_max"])
         kappa_state = kappa0.clone()
+        exec_pos_history_state = exec_pos_history[:, -history_steps:].clone()
+        exec_head_history_state = exec_head_history[:, -history_steps:].clone()
+        exec_valid_history_state = exec_valid_history[:, -history_steps:].clone()
+        exec_pos_history_state[:, -1] = current_pos
+        exec_head_history_state[:, -1] = current_head
+        exec_valid_history_state[:, -1] = True
 
         commit_pos = current_pos.new_zeros((current_pos.shape[0], 5, 2))
         commit_head = current_head.new_zeros((current_head.shape[0], 5))
         for step_idx in range(5):
+            # Keep the FM future fixed for the 0.5s block, but re-solve control on the remaining horizon every 0.1s.
+            remaining_future_pos = future_pos[:, step_idx:]
+            remaining_future_head = future_head[:, step_idx:]
+            _, _, _, v_ref_horizon, kappa_ref_horizon = self._estimate_reference_profiles(
+                current_pos=pos_state,
+                current_head=head_state,
+                exec_pos_history=exec_pos_history_state,
+                exec_head_history=exec_head_history_state,
+                exec_valid_history=exec_valid_history_state,
+                future_pos=remaining_future_pos,
+                future_head=remaining_future_head,
+            )
+            v_ref_target = v_ref_horizon[:, -1]
+            a_star = self._solve_longitudinal_lqr(v0=speed_state, v_ref_target=v_ref_target)
+            u_star = self._solve_lateral_lqr(
+                v_profile=v_ref_horizon,
+                kappa0=kappa_state,
+                kappa_ref_profile=kappa_ref_horizon,
+            )
+            slow_mask = (speed_state < float(self.config.stop_speed_mps)) & (
+                v_ref_target < float(self.config.stop_speed_mps)
+            )
+            if slow_mask.any():
+                a_star = a_star.clone()
+                u_star = u_star.clone()
+                a_star[slow_mask] = -float(self.config.stop_speed_kp) * (
+                    speed_state[slow_mask] - v_ref_target[slow_mask]
+                )
+                u_star[slow_mask] = 0.0
+            a_star = torch.clamp(a_star, -limits["a_max"], limits["a_max"])
+
             accel_applied = accel_state + accel_alpha * (a_star - accel_state)
             accel_applied = torch.clamp(accel_applied, -limits["a_max"], limits["a_max"])
             kappa_state, u_applied = self._clip_curvature_and_rate(
@@ -1146,5 +1169,25 @@ class ContinuousCommitBridge:
             kappa_state = kappa_applied
             commit_pos[:, step_idx] = pos_state
             commit_head[:, step_idx] = head_state
+            if history_steps == 1:
+                exec_pos_history_state = pos_state.unsqueeze(1)
+                exec_head_history_state = head_state.unsqueeze(1)
+                exec_valid_history_state = torch.ones_like(head_state, dtype=torch.bool).unsqueeze(1)
+            else:
+                exec_pos_history_state = torch.cat(
+                    [exec_pos_history_state[:, 1:], pos_state.unsqueeze(1)],
+                    dim=1,
+                )
+                exec_head_history_state = torch.cat(
+                    [exec_head_history_state[:, 1:], head_state.unsqueeze(1)],
+                    dim=1,
+                )
+                exec_valid_history_state = torch.cat(
+                    [
+                        exec_valid_history_state[:, 1:],
+                        torch.ones_like(head_state, dtype=torch.bool).unsqueeze(1),
+                    ],
+                    dim=1,
+                )
 
         return commit_pos, commit_head, commit_pos[:, -1], commit_head[:, -1]
