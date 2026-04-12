@@ -87,13 +87,13 @@ model_config:
       stop_speed_mps: 0.2
       stop_speed_kp: 0.5
       longitudinal_q: 10.0
-      longitudinal_r: 1.0
+      longitudinal_r: 0.
       lateral_q_lat: 1.0
       lateral_q_head: 10.0
-      lateral_q_kappa: 0.1
-      lateral_r: 1.0
-      accel_tau_s: 0.2
-      curvature_tau_s: 0.05
+      lateral_q_kappa: 0.
+      lateral_r: 0.
+      accel_tau_s: 0.
+      curvature_tau_s: 0.
       min_speed_for_curvature_clip_mps: 0.5
   sim_agents_submission:
     is_active: false
