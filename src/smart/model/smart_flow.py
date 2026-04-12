@@ -625,6 +625,9 @@ class SMARTFlow(LightningModule):
             "feat_a_t_dict": expanded_feat_a_t_dict,
         }
         for key in [
+            "exec_pos_history_10hz",
+            "exec_head_history_10hz",
+            "exec_valid_history_10hz",
             "exec_pos_pair_10hz",
             "exec_head_pair_10hz",
             "exec_valid_pair_10hz",
