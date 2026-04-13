@@ -31,7 +31,7 @@ model:
     finetune:
       enabled: true
       mode: rmm_bptt_ft
-      rollout_steps: 3
+      rollout_steps: 3  # coarse steps to rollout (0.5s each). <=0 → full WOSAC (16 steps = 8s)
       rollout_noise_scale: 1.0
       bptt_n_rollouts: 2
       rmm_bptt_use_ref_model: false

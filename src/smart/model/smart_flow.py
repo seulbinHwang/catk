@@ -1329,6 +1329,8 @@ class SMARTFlow(LightningModule):
         flow_decoder = self.encoder.agent_encoder.flow_decoder
         G = int(getattr(self.finetune_config, "bptt_n_rollouts", 1))
         rollout_steps = int(getattr(self.finetune_config, "rollout_steps", 4))
+        # rollout_steps <= 0 → full WOSAC rollout (n_step_future_2hz coarse steps, no limit)
+        max_steps_arg: int | None = None if rollout_steps <= 0 else rollout_steps
 
         # ── 1. Encode map (no_grad; encoder frozen) ─────────────────────────
         with torch.no_grad():
@@ -1342,7 +1344,9 @@ class SMARTFlow(LightningModule):
             map_feature=map_feature,
         )
 
-        # ── 3. Generate rollouts (full gradient, only rollout_steps coarse steps) ──
+        # ── 3. Generate rollouts (full gradient) ─────────────────────────────
+        # max_steps_arg=None → full 16-step (80 10Hz) WOSAC rollout
+        # max_steps_arg=N   → N coarse steps only (N*5 10Hz steps), rest padded
         pred_traj, pred_z, pred_head_traj, _ = (
             self._run_parallel_rollout_chunk(
                 data=data,
@@ -1352,10 +1356,10 @@ class SMARTFlow(LightningModule):
                 rollout_indices=list(range(G)),
                 return_anchor_hidden=True,
                 full_grad=True,
-                max_steps=rollout_steps,
+                max_steps=max_steps_arg,
             )
         )
-        # pred_traj: [n_agents, G, rollout_steps*5, 2]
+        # pred_traj: [n_agents, G, T_pred, 2]  where T_pred = rollout_steps*5 or 80
         # soft RMM 파이프라인은 80 pred steps (11 hist + 80 = 91 = scenario proto 길이)를 가정합니다.
         # rollout_steps < 16이면 나머지 steps을 detach로 패딩합니다.
         # gradient는 실제 rollout steps만 통해 흐르고 패딩 부분은 grad가 없습니다.
