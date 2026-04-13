@@ -1325,22 +1325,25 @@ class SMARTFlow(LightningModule):
     ) -> dict:
         """Flow-BPTT fine-tuning step.
 
-        GT initial state에서 rollout_steps개의 coarse step만 AR rollout하고,
-        그 짧은 trajectory에 대해 soft RMM을 계산해 gradient를 흘립니다.
-        전체 gradient가 rollout_steps AR steps × flow_solver_steps ODE steps를 통해 흐릅니다.
+        항상 full 16-step (80 10Hz) WOSAC rollout을 수행하되,
+        rollout_steps 이후의 AR step에서는 hidden state를 detach해 gradient를 차단합니다.
+        이렇게 하면 sim feature histogram에 zero-padding이 섞이지 않아
+        soft RMM gradient 방향이 올바르게 유지됩니다.
 
         Algorithm:
             1. Encode map (no_grad).
             2. Build rollout cache from GT initial state (no_grad).
-            3. Generate G rollouts for rollout_steps coarse steps with full gradient.
-            4. Score with differentiable soft RMM on the short trajectory.
-            5. loss = -mean_rmm.
+            3. Full 16-step rollout; gradient only through first rollout_steps coarse steps
+               (bptt_start_step=rollout_steps → states detached after that point).
+            4. Score with differentiable soft RMM on the complete 80-step trajectory.
+            5. loss = -(mean_rmm - ema_mean).
         """
         flow_decoder = self.encoder.agent_encoder.flow_decoder
         G = int(getattr(self.finetune_config, "bptt_n_rollouts", 1))
         rollout_steps = int(getattr(self.finetune_config, "rollout_steps", 4))
-        # rollout_steps <= 0 → full WOSAC rollout (n_step_future_2hz coarse steps, no limit)
-        max_steps_arg: int | None = None if rollout_steps <= 0 else rollout_steps
+        # rollout_steps <= 0 → full gradient through all 16 WOSAC coarse steps
+        # rollout_steps > 0  → gradient through first rollout_steps steps only (bptt truncation)
+        bptt_start_arg: int | None = None if rollout_steps <= 0 else rollout_steps
 
         # ── 1. Encode map (no_grad; encoder frozen) ─────────────────────────
         with torch.no_grad():
@@ -1354,9 +1357,10 @@ class SMARTFlow(LightningModule):
             map_feature=map_feature,
         )
 
-        # ── 3. Generate rollouts (full gradient) ─────────────────────────────
-        # max_steps_arg=None → full 16-step (80 10Hz) WOSAC rollout
-        # max_steps_arg=N   → N coarse steps only (N*5 10Hz steps), rest padded
+        # ── 3. Generate rollouts (full 80-step trajectory, limited gradient) ──
+        # Always runs all 16 coarse steps so the sim distribution is clean.
+        # bptt_start_arg=N → states detached at coarse step N, no gradient beyond that.
+        # bptt_start_arg=None → gradient flows through all 16 steps.
         pred_traj, pred_z, pred_head_traj, _ = (
             self._run_parallel_rollout_chunk(
                 data=data,
@@ -1366,26 +1370,10 @@ class SMARTFlow(LightningModule):
                 rollout_indices=list(range(G)),
                 return_anchor_hidden=True,
                 full_grad=True,
-                max_steps=max_steps_arg,
+                bptt_start_step=bptt_start_arg,
             )
         )
-        # pred_traj: [n_agents, G, T_pred, 2]  where T_pred = rollout_steps*5 or 80
-        # soft RMM 파이프라인은 80 pred steps (11 hist + 80 = 91 = scenario proto 길이)를 가정합니다.
-        # rollout_steps < 16이면 나머지 steps을 detach로 패딩합니다.
-        # gradient는 실제 rollout steps만 통해 흐르고 패딩 부분은 grad가 없습니다.
-        T_pred = pred_traj.shape[2]  # rollout_steps * 5
-        _T_full = 80
-        if T_pred < _T_full:
-            _pad = _T_full - T_pred
-            pred_traj = torch.cat(
-                [pred_traj, pred_traj[:, :, -1:].detach().expand(-1, -1, _pad, -1)], dim=2
-            )
-            pred_z = torch.cat(
-                [pred_z, pred_z[:, :, -1:].detach().expand(-1, -1, _pad)], dim=2
-            )
-            pred_head_traj = torch.cat(
-                [pred_head_traj, pred_head_traj[:, :, -1:].detach().expand(-1, -1, _pad)], dim=2
-            )
+        # pred_traj: [n_agents, G, 80, 2] — full trajectory, all 80 pred steps valid
         agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
 
         if data is None:
@@ -1485,9 +1473,8 @@ class SMARTFlow(LightningModule):
                 log_feat, _ = compute_scenario_rollouts_features(scenario, sr_for_log[0])
                 log_feat_dict = {k: v.to(device=sc_pred_traj.device) for k, v in log_feat.as_dict().items()}
 
-            # 실제 예측한 steps만 valid=True; 패딩 부분은 False로 마스킹
-            valid = torch.zeros(sc_pred_traj.shape[0], sc_pred_traj.shape[2], dtype=torch.bool, device=sc_pred_traj.device)
-            valid[:, :T_pred] = True
+            # full 80-step rollout: 모든 step이 실제 예측값이므로 all-True valid mask 사용
+            valid = sc_pred_traj.new_ones(sc_pred_traj.shape[0], sc_pred_traj.shape[2], dtype=torch.bool)
 
             # rollout별 soft RMM을 계산해 평균 (시나리오별로 동일 가중)
             rmm_roll = []
@@ -1738,6 +1725,19 @@ class SMARTFlow(LightningModule):
                 current_control_valid=tokenized_agent["flow_train_current_control_valid"],
             )
 
+
+    def on_after_backward(self) -> None:
+        """Log velocity_head gradient norm to diagnose BPTT gradient flow."""
+        if not self._is_rmm_bptt_ft_enabled():
+            return
+        try:
+            flow_decoder = self.encoder.agent_encoder.flow_decoder
+            vh_params = [p for p in flow_decoder.velocity_head.parameters() if p.grad is not None]
+            if vh_params:
+                total_norm = torch.stack([p.grad.norm() for p in vh_params]).norm()
+                self.log("train/dbg_vh_grad_norm", total_norm, on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
+        except Exception:
+            pass
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
