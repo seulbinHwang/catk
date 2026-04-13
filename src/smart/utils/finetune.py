@@ -78,9 +78,9 @@ class FinetuneConfig:
     #: ``n_step_future_2hz`` 전부 (보통 16). 양수면 그만큼만 rollout 후 **그 구간 전체** soft RMM·역전파.
     #: (truncated BPTT detach는 사용하지 않음.)
     bptt_max_coarse_steps: Optional[int] = None
-    #: pred_traj / pred_head_traj 에서 역전파되는 gradient 를 element-wise 로 클리핑.
-    #: 0 이하면 비활성. soft RMM Jacobian 이 큰 gradient 를 만드는 시나리오를 억제.
-    bptt_grad_clip_traj: float = 0.5
+    #: pred_traj / pred_head_traj 에서 역전파되는 gradient L2 norm 의 상한.
+    #: 0 이하면 비활성. element-wise clamp 가 아닌 norm clip 이므로 방향을 유지하면서 크기만 제한.
+    bptt_grad_clip_traj: float = 1.0
     #: True → _compute_soft_rmm 에서 sim_features 극값과 per-metric likelihood 를 WARNING 로 출력.
     bptt_debug: bool = False
 
@@ -173,7 +173,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
         bptt_use_adjoint=bool(_read_config_value(finetune, "bptt_use_adjoint", False)),
         bptt_max_coarse_steps=None if _bptt_max_cs_raw is None else int(_bptt_max_cs_raw),
-        bptt_grad_clip_traj=float(_read_config_value(finetune, "bptt_grad_clip_traj", 0.5)),
+        bptt_grad_clip_traj=float(_read_config_value(finetune, "bptt_grad_clip_traj", 1.0)),
         bptt_debug=bool(_read_config_value(finetune, "bptt_debug", False)),
     )
 

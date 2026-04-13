@@ -1413,18 +1413,27 @@ class SMARTFlow(LightningModule):
             flow_ode.use_adjoint_for_bptt = False  # always reset
         # pred_traj: [n_agents, G, T_10hz, 2] — ``T_10hz`` 는 coarse 수 × ``shift`` (≤ 80)
 
-        # ── Gradient hook: pred_traj 에서 역전파되는 gradient 크기를 기록하고 클리핑 ──
-        # soft RMM 의 Jacobian(특히 angular_speed 경로)이 큰 gradient 를 만들 수 있으므로,
-        # loss 쪽 -> pred_traj 로 오는 gradient 를 element-wise 로 클리핑해 BPTT 안정화.
-        # _bptt_grad_clip_val: FinetuneConfig 에 없으면 0.5 기본값 사용. 0 이면 비활성.
-        _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 0.5))
+        # ── Gradient hook: pred_traj 에서 역전파되는 gradient norm 을 제한 ──────
+        # element-wise clamp(±v) 는 norm 상한이 v×√(numel) 이라 파라미터 grad norm 이
+        # 여전히 수십~수백으로 커질 수 있음. 대신 L2 norm clip 을 사용:
+        #   g_clipped = g * min(1, max_norm / ||g||)
+        # 이렇게 하면 pred_traj 로 흘러오는 gradient L2 norm 이 max_norm 으로 bound 됨.
+        # NaN/Inf 는 nan_to_num 으로 먼저 제거.
+        _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
+
+        def _make_norm_clip_hook(max_norm: float):
+            def _hook(g: Tensor) -> Tensor:
+                g = torch.nan_to_num(g, nan=0.0, posinf=max_norm, neginf=-max_norm)
+                g_norm = g.norm()
+                if g_norm > max_norm:
+                    g = g * (max_norm / g_norm)
+                return g
+            return _hook
+
         if pred_traj.requires_grad and _grad_clip_traj > 0:
-            def _clip_traj_grad(g: Tensor) -> Tensor:
-                # nan_to_num first: clamp(NaN) = NaN, so replace NaN/Inf before clipping
-                return torch.nan_to_num(g, nan=0.0, posinf=_grad_clip_traj, neginf=-_grad_clip_traj).clamp(-_grad_clip_traj, _grad_clip_traj)
-            pred_traj.register_hook(_clip_traj_grad)
-            if pred_head_traj.requires_grad:
-                pred_head_traj.register_hook(_clip_traj_grad)
+            pred_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
+        if pred_head_traj.requires_grad and _grad_clip_traj > 0:
+            pred_head_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
 
         agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
 
