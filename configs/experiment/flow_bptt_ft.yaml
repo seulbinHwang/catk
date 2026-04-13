@@ -68,7 +68,21 @@ data:
   val_batch_size: 4
   num_workers: 4
   prefetch_factor: 1
-  # soft RMM 계산용 scenario/tfrecord 정합을 위해 validation split 사용
+  # rmm_bptt_ft 는 시나리오별 Waymo bytes(`*.tfrecords`)가 필요합니다. pickle은
+  #   {cache_root}/{split}/*.pkl
+  # 대응 tfrecord는 (전처리 ``--write_tfrecords always`` 시)
+  #   {cache_root}/{split}_tfrecords_splitted/{scenario_id}.tfrecords
+  # 기존 pickle 의 ``scenario_id`` 와 파일명이 1:1 이므로, tfrecord 경로는 유추 가능합니다.
+  # (bytes 자체는 원본 WOMD 샤드에서 다시 쓰거나 전처리 재실행으로 생성)
+  #
+  # 기본: validation 만 tfrecord를 켠 레거시 캐시와 맞춤 (train/val 동일 원천 → leakage 주의).
+  # plain training/ pickle 만 쓰는 트리와 겹치지 않게 하려면 전처리에서
+  #   --split training --output_split closed_loop_train --write_tfrecords always
+  # 로 ``closed_loop_train/`` + ``closed_loop_train_tfrecords_splitted/`` 를 만들고
+  # train_raw_dir / train_tfrecords_splitted 를 그쪽으로 맞추면 됩니다.
+  #
+  # 또는 ``training/`` + ``training_tfrecords_splitted/`` 를 직접 만들었으면 아래 두 줄을
+  # training / training_tfrecords_splitted 로 바꾸거나 커맨드라인에서 오버라이드하세요.
   train_raw_dir: ${paths.cache_root}/validation
   train_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
   train_use_val_transform: true

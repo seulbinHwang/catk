@@ -18,6 +18,17 @@
 # coarse step 수 제한 (전체 16이 아니라 앞 N coarse만; 그 구간 전체 역전파·soft RMM):
 #   BPTT_MAX_COARSE_STEPS=3 sh scripts/train_flow_bptt_ft.sh
 #   (비우면 yaml 기본: null = coarse 전부)
+#
+# training split + splitted tfrecords (train/val 분리, rmm_bptt_ft 유지):
+#   A) 기존 training/ 캐시를 그대로 쓰고 tfrecord 만 올릴 때:
+#        python -m src.data_preprocess --input_dir <womd_scenario> --output_dir "${CACHE_ROOT}" \
+#          --split training --write_tfrecords always
+#   B) closed-loop 전용 폴더(validation 과 동일 레이아웃, plain training/ 과 분리):
+#        python -m src.data_preprocess --input_dir <womd_scenario> --output_dir "${CACHE_ROOT}" \
+#          --split training --output_split closed_loop_train --write_tfrecords always
+#      → closed_loop_train/ + closed_loop_train_tfrecords_splitted/
+#   실행 예 (B):
+#        EXTRA_ARGS="data.train_raw_dir=${CACHE_ROOT}/closed_loop_train data.train_tfrecords_splitted=${CACHE_ROOT}/closed_loop_train_tfrecords_splitted" sh scripts/train_flow_bptt_ft.sh
 # =============================================================================
 
 export LOGLEVEL=INFO

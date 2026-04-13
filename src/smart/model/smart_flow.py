@@ -2359,10 +2359,11 @@ class SMARTFlow(LightningModule):
         if not strict:
             return incompatible_keys
 
+        _allowed_missing = ("residual_velocity_head", "_rmm_ema_mean")
         missing_keys = [
             key
             for key in incompatible_keys.missing_keys
-            if "residual_velocity_head" not in key
+            if not any(pat in key for pat in _allowed_missing)
         ]
         unexpected_keys = list(incompatible_keys.unexpected_keys)
         if len(missing_keys) > 0 or len(unexpected_keys) > 0:

@@ -480,6 +480,46 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
                 file_writer.write(tf_data)
 
 
+def _resolve_tfrecords_splitted_dir(
+    output_dir: Path, cache_subdir: str, write_tfrecords: str
+) -> Optional[Path]:
+    """Pick output directory for per-scenario Waymo bytes (``*.tfrecords``).
+
+    Pickle cache and splitted tfrecords live as siblings under ``output_dir``::
+
+        {output_dir}/{cache_subdir}/*.pkl
+        {output_dir}/{cache_subdir}_tfrecords_splitted/{scenario_id}.tfrecords
+
+    So for an existing ``{scenario_id}.pkl``, the matching tfrecord path is always
+    ``.../{cache_subdir}_tfrecords_splitted/{scenario_id}.tfrecords`` (same ``scenario_id`` as in
+    the pickle). Regenerating that file requires the original WOMD shard (re-run
+    preprocessing with tfrecord writing) unless you have another copy of the raw bytes.
+
+    Args:
+        output_dir: Dataset root (e.g. ``paths.cache_root`` / SMART output root).
+        cache_subdir: Subfolder name for pickles (e.g. ``validation``, ``training``, or
+            ``closed_loop_train`` when mirroring validation-style layout for rmm_bptt_ft).
+        write_tfrecords: ``auto`` — only when ``cache_subdir == "validation"`` (legacy);
+            ``always`` — for any ``cache_subdir``; ``never`` — skip.
+
+    Returns:
+        Directory to write per-scenario ``*.tfrecords``, or ``None``.
+    """
+    if write_tfrecords == "never":
+        return None
+    if write_tfrecords == "auto":
+        if cache_subdir != "validation":
+            return None
+    elif write_tfrecords != "always":
+        raise ValueError(
+            "write_tfrecords must be one of {'auto', 'always', 'never'}, "
+            f"got {write_tfrecords!r}"
+        )
+    out = output_dir / f"{cache_subdir}_tfrecords_splitted"
+    out.mkdir(exist_ok=True, parents=True)
+    return out
+
+
 def batch_process9s_transformer(
     input_dir,
     output_dir,
@@ -487,14 +527,27 @@ def batch_process9s_transformer(
     num_workers,
     num_jobs: int = 1,
     job_rank: int = 0,
+    write_tfrecords: str = "auto",
+    output_split: Optional[str] = None,
 ):
-    output_dir = Path(output_dir)
-    output_dir_tfrecords_splitted = None
-    if split == "validation":
-        output_dir_tfrecords_splitted = output_dir / "validation_tfrecords_splitted"
-        output_dir_tfrecords_splitted.mkdir(exist_ok=True, parents=True)
-    output_dir = output_dir / split
-    output_dir.mkdir(exist_ok=True, parents=True)
+    """Convert WOMD scenario shards under ``input_dir/{split}`` into SMART pickles.
+
+    If ``output_split`` is set, pickles and optional splitted tfrecords go under
+    ``{output_dir}/{output_split}/`` and ``{output_dir}/{output_split}_tfrecords_splitted/``,
+    while **reading** shards still uses ``input_dir/{split}``. Use this to emit a
+    dedicated closed-loop training cache (e.g. ``closed_loop_train``) from the official
+    ``training`` split without overwriting the plain ``training/`` pickle-only tree.
+
+    For splitted tfrecords under a non-``validation`` cache folder, pass
+    ``write_tfrecords="always"`` (``auto`` only enables tfrecords for ``validation``).
+    """
+    output_root = Path(output_dir)
+    cache_subdir = output_split if output_split is not None else split
+    output_dir_tfrecords_splitted = _resolve_tfrecords_splitted_dir(
+        output_root, cache_subdir, write_tfrecords
+    )
+    pickle_out = output_root / cache_subdir
+    pickle_out.mkdir(exist_ok=True, parents=True)
 
     input_dir = Path(input_dir) / split
     packages = sorted([p.as_posix() for p in input_dir.glob("*")])
@@ -507,12 +560,13 @@ def batch_process9s_transformer(
     if num_jobs > 1:
         packages = packages[job_rank::num_jobs]
         print(
-            f"[split={split}] job {job_rank}/{num_jobs} assigned {len(packages)} shards."
+            f"[input_split={split} output_split={cache_subdir}] "
+            f"job {job_rank}/{num_jobs} assigned {len(packages)} shards."
         )
     func = partial(
         wm2argo,
         split=split,
-        output_dir=output_dir,
+        output_dir=pickle_out,
         output_dir_tfrecords_splitted=output_dir_tfrecords_splitted,
     )
 
@@ -534,6 +588,30 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--num_jobs", type=int, default=1)
     parser.add_argument("--job_rank", type=int, default=0)
+    parser.add_argument(
+        "--write_tfrecords",
+        type=str,
+        default="auto",
+        choices=("auto", "always", "never"),
+        help=(
+            "Whether to emit per-scenario *.tfrecords next to the pickle cache. "
+            "'auto' keeps legacy behavior (only when output subdir is validation). "
+            "'always' writes {output_dir}/{cache}_tfrecords_splitted/ for the chosen "
+            "output subdir (use with --output_split closed_loop_train + rmm_bptt_ft). "
+            "'never' disables for all splits."
+        ),
+    )
+    parser.add_argument(
+        "--output_split",
+        type=str,
+        default=None,
+        help=(
+            "Subdirectory name under --output_dir for *.pkl and *_tfrecords_splitted "
+            "(default: same as --split). "
+            "Example: --split training --output_split closed_loop_train reads WOMD "
+            "training/ shards but writes .../closed_loop_train/ mirroring the validation layout."
+        ),
+    )
     args = parser.parse_args()
 
     batch_process9s_transformer(
@@ -543,4 +621,6 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         num_jobs=args.num_jobs,
         job_rank=args.job_rank,
+        write_tfrecords=args.write_tfrecords,
+        output_split=args.output_split,
     )
