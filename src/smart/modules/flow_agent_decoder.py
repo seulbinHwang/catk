@@ -919,7 +919,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     noise_start : noise_start + sample_window_steps,
                 ].contiguous()
                 _active_type = tokenized_agent["type"][active_mask]
-                _model_fn_cl = lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau)
+                # Default-arg capture: checkpoint recomputation during backward
+                # would see the *last* iteration's active_hidden (late-binding bug).
+                # Capturing via default arg binds the current value at definition time.
+                _model_fn_cl = lambda x_t, tau, _h=active_hidden: self.flow_decoder(_h, x_t, tau)
                 _v_init_cl = v_state[active_mask] if v_state is not None else None
                 _delta_init_cl = delta_state[active_mask] if delta_state is not None else None
                 if self.use_predict_project_renoise and self.kinematic_projector is not None:
