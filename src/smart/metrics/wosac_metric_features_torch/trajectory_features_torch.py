@@ -6,6 +6,10 @@ import math
 import torch
 from torch import Tensor
 
+# ||dpos||²≈0 인 구간에서 torch.sqrt 역전파가 1/(2√x) 로 발산해 NaN이 남 (TTC·kinematic·ADE 경로).
+_KINEMATIC_SPEED_EPS_SQ = 1e-12
+_DISP_ERR_EPS_SQ = 1e-12
+
 
 def central_diff(t: Tensor, pad_value: float) -> Tensor:
     """TF `trajectory_features.central_diff` port (difference along last axis)."""
@@ -32,8 +36,9 @@ def compute_displacement_error(
     dx = x - ref_x
     dy = y - ref_y
     dz = z - ref_z
-    # Match tf.linalg.norm euclidean: sqrt(sum(x^2)).
-    return torch.sqrt(dx * dx + dy * dy + dz * dz)
+    sq = dx * dx + dy * dy + dz * dz
+    sq_safe = torch.where(torch.isfinite(sq), sq.clamp(min=_DISP_ERR_EPS_SQ), sq)
+    return torch.sqrt(sq_safe)
 
 
 def _wrap_angle(angle: Tensor) -> Tensor:
@@ -51,7 +56,9 @@ def compute_kinematic_features(
     nan = float("nan")
 
     dpos = central_diff(torch.stack([x, y, z], dim=0), pad_value=nan)
-    linear_speed = torch.sqrt((dpos * dpos).sum(dim=0)) / float(seconds_per_step)
+    sq = (dpos * dpos).sum(dim=0)
+    sq_safe = torch.where(torch.isfinite(sq), sq.clamp(min=_KINEMATIC_SPEED_EPS_SQ), sq)
+    linear_speed = torch.sqrt(sq_safe) / float(seconds_per_step)
     linear_accel = central_diff(linear_speed, pad_value=nan) / float(seconds_per_step)
 
     dh_step = _wrap_angle(central_diff(heading, pad_value=nan) * 2.0) / 2.0

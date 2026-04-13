@@ -52,6 +52,11 @@ def _reduce_average_with_validity_soft(tensor: Tensor, validity: Tensor) -> Tens
     valid_sum = validity.sum().clamp(min=1e-5)
     return cond_sum / valid_sum
 
+
+def _likelihood_from_log_ll(ll: Tensor) -> Tensor:
+    """log-likelihood 합을 [0,1] 근처 likelihood로 변환. exp 오버플로·역전파 불안정 방지."""
+    return torch.exp(torch.clamp(ll, min=-80.0, max=0.0))
+
 # ===========================================================================
 # 2. 미분 가능한 핵심 수학 함수 (Soft Any & Soft Binning)
 # ===========================================================================
@@ -177,7 +182,9 @@ def compute_wosac_metametric_soft(
             mask = valid_log * (ot == int(scenario_pb2.Track.ObjectType.TYPE_VEHICLE)).to(dtype).unsqueeze(-1)
         
         ll = log_likelihood_estimate_soft(cfg, _squeeze_log_sample(log_features[name]).to(dtype), sim_features[name].to(dtype), taus[name], True)
-        lik_dict[f"{name}_likelihood"] = torch.exp(_reduce_average_with_validity_soft(ll, mask))
+        lik_dict[f"{name}_likelihood"] = _likelihood_from_log_ll(
+            _reduce_average_with_validity_soft(ll, mask)
+        )
 
     # --- 2. 시나리오 기반 항목 (Scenario-level Any) ---
     sc_fields = [
@@ -197,7 +204,7 @@ def compute_wosac_metametric_soft(
         sim_any = soft_any(sim_features[feat_key].to(dtype) * v_exp, dim=-1, beta=beta)
         
         ll = log_likelihood_estimate_soft(cfg, log_any, sim_any, taus[name], False)
-        lik_dict[f"{name}_likelihood"] = torch.exp(ll.mean())
+        lik_dict[f"{name}_likelihood"] = _likelihood_from_log_ll(ll.mean())
 
     # --- 3. 최종 Metametric 가중합 ---
     metametric = torch.tensor(0.0, dtype=dtype, device=device)

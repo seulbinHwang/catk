@@ -218,7 +218,9 @@ def compute_metric_features_from_predicted_sim_trajectories(
     displacement_error = traj.compute_displacement_error(
         evaluated.x, evaluated.y, evaluated.z, eval_logged.x, eval_logged.y, eval_logged.z
     )
-    object_valid_steps = eval_logged.valid.to(torch.float32).sum(dim=1)
+    object_valid_steps = torch.clamp(
+        eval_logged.valid.to(torch.float32).sum(dim=1), min=1.0
+    )
     ade = (
         torch.where(eval_logged.valid, displacement_error, torch.zeros_like(displacement_error)).sum(dim=1)
         / object_valid_steps
