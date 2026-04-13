@@ -69,6 +69,10 @@ class FinetuneConfig:
     #: True → ``HierarchicalFlowDecoder.velocity_head`` 만 학습 (트렁크·residual 동결).
     #: ``flow_epg_ft``/``flow_rwr_ft`` 의 ``*_head_only``(residual 전용)보다 우선하지 않음.
     flow_velocity_head_only: bool = True
+    #: True → Flow ODE generate() 안의 model_fn 호출을 torch.utils.checkpoint으로 감쌈.
+    #: Neural ODE adjoint method의 이산 버전: forward 시 내부 활성화를 저장하지 않고
+    #: backward 시 재연산. O(solver_steps × activation) 메모리를 O(activation)으로 줄임.
+    bptt_use_adjoint: bool = False
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -155,6 +159,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         bptt_n_rollouts=int(_read_config_value(finetune, "bptt_n_rollouts", 2)),
         rmm_bptt_use_ref_model=bool(_read_config_value(finetune, "rmm_bptt_use_ref_model", False)),
         flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
+        bptt_use_adjoint=bool(_read_config_value(finetune, "bptt_use_adjoint", False)),
     )
 
 

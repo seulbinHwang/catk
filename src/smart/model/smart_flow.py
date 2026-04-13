@@ -1344,6 +1344,7 @@ class SMARTFlow(LightningModule):
         # rollout_steps <= 0 → full gradient through all 16 WOSAC coarse steps
         # rollout_steps > 0  → gradient through first rollout_steps steps only (bptt truncation)
         bptt_start_arg: int | None = None if rollout_steps <= 0 else rollout_steps
+        use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
 
         # ── 1. Encode map (no_grad; encoder frozen) ─────────────────────────
         with torch.no_grad():
@@ -1361,18 +1362,25 @@ class SMARTFlow(LightningModule):
         # Always runs all 16 coarse steps so the sim distribution is clean.
         # bptt_start_arg=N → states detached at coarse step N, no gradient beyond that.
         # bptt_start_arg=None → gradient flows through all 16 steps.
-        pred_traj, pred_z, pred_head_traj, _ = (
-            self._run_parallel_rollout_chunk(
-                data=data,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                rollout_cache=rollout_cache,
-                rollout_indices=list(range(G)),
-                return_anchor_hidden=True,
-                full_grad=True,
-                bptt_start_step=bptt_start_arg,
+        # use_adjoint=True → each flow_ode.generate() call uses torch.utils.checkpoint
+        #   on model_fn, trading recomputation for memory (discrete ODE adjoint).
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_ode.use_adjoint_for_bptt = use_adjoint
+        try:
+            pred_traj, pred_z, pred_head_traj, _ = (
+                self._run_parallel_rollout_chunk(
+                    data=data,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    rollout_cache=rollout_cache,
+                    rollout_indices=list(range(G)),
+                    return_anchor_hidden=True,
+                    full_grad=True,
+                    bptt_start_step=bptt_start_arg,
+                )
             )
-        )
+        finally:
+            flow_ode.use_adjoint_for_bptt = False  # always reset
         # pred_traj: [n_agents, G, 80, 2] — full trajectory, all 80 pred steps valid
         agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
 

@@ -37,6 +37,9 @@ model:
       rmm_bptt_use_ref_model: false
       # true: HierarchicalFlowDecoder.velocity_head만 학습 (FinetuneConfig 코드 기본과 동일)
       flow_velocity_head_only: true
+      # true: flow ODE generate() 내부 model_fn 호출을 gradient checkpoint으로 감쌈
+      # (Neural ODE adjoint 이산 버전) — OOM 발생 시 활성화
+      bptt_use_adjoint: false
 
 ckpt_path: null
 

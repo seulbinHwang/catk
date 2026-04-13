@@ -35,6 +35,15 @@ class FlowODE:
           ``v = x_1 - (1 - sigma_min) * x_0``.
 
     With ``sigma_min = 0``, the OT path reduces exactly to the current linear path.
+
+    Adjoint / gradient-checkpointing mode (``use_adjoint_for_bptt``):
+        When True, each ``model_fn`` call inside ``generate()`` is wrapped with
+        ``torch.utils.checkpoint``.  This is the discrete-ODE analogue of the
+        Neural ODE adjoint method: intermediate activations inside the velocity
+        network are NOT stored during the forward pass and are recomputed on
+        demand during the backward pass.  Memory usage drops from
+        O(solver_steps × activation_size) to O(activation_size) at the cost
+        of one extra forward pass per ODE integration.
     """
 
     def __init__(
@@ -55,6 +64,10 @@ class FlowODE:
         self.solver_method = solver_method
         self.path_type = path_type
         self.sigma_min = sigma_min
+        # When True, each model_fn call in generate() is wrapped with
+        # torch.utils.checkpoint to trade memory for recomputation.
+        # Set externally by SMARTFlow._run_flow_bptt_ft_step when bptt_use_adjoint=True.
+        self.use_adjoint_for_bptt: bool = False
 
     def _beta(self) -> float:
         if self.path_type == "linear":
@@ -144,6 +157,16 @@ class FlowODE:
     ) -> torch.Tensor:
         steps = self.solver_steps if steps is None else steps
         method = self.solver_method if method is None else method
+        use_adjoint = self.use_adjoint_for_bptt
+
+        if use_adjoint:
+            from torch.utils.checkpoint import checkpoint as ckpt
+
+            def _ckpt_call(x: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+                # use_reentrant=False: safer for non-leaf inputs; avoids version counter issues.
+                return ckpt(model_fn, x, tau, use_reentrant=False)
+        else:
+            _ckpt_call = model_fn  # no-op alias
 
         x_t = x_init
         t0 = self.eps
@@ -154,13 +177,13 @@ class FlowODE:
             tau = x_t.new_full((x_t.shape[0],), t)
 
             if method == "midpoint":
-                v1 = model_fn(x_t, tau)
+                v1 = _ckpt_call(x_t, tau)
                 x_mid = x_t + 0.5 * dt * v1
                 tau_mid = x_t.new_full((x_t.shape[0],), t + 0.5 * dt)
-                v2 = model_fn(x_mid, tau_mid)
+                v2 = _ckpt_call(x_mid, tau_mid)
                 x_t = x_t + dt * v2
             elif method == "euler":
-                v = model_fn(x_t, tau)
+                v = _ckpt_call(x_t, tau)
                 x_t = x_t + dt * v
             else:
                 raise ValueError(f"Unsupported solver method: {method}")
