@@ -85,6 +85,9 @@ N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-10}"
 
 BPTT_N_ROLLOUTS="${BPTT_N_ROLLOUTS:-3}"
 RMM_BPTT_USE_REF_MODEL="${RMM_BPTT_USE_REF_MODEL:-false}"
+# OOM 발생 시 true로 설정: flow ODE model_fn 호출을 gradient checkpoint으로 감쌈
+# (Neural ODE adjoint 이산 버전) — solver_steps×activation 메모리를 activation 수준으로 절감
+BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-false}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -109,7 +112,7 @@ echo "CACHE_ROOT=${CACHE_ROOT} (flow_bptt_ft: train_* → validation split under
 echo "CKPT_PATH=${CKPT_PATH}"
 echo "LIMIT_TRAIN_BATCHES=${LIMIT_TRAIN_BATCHES} MAX_EPOCHS=${MAX_EPOCHS} WANDB_MODE=${WANDB_MODE}"
 echo "LOG_EVERY_N_STEPS=${LOG_EVERY_N_STEPS} val_check_interval=${VAL_CHECK_INTERVAL} check_val_every_n_epoch=${CHECK_VAL_EVERY_N_EPOCH}"
-echo "BPTT_N_ROLLOUTS=${BPTT_N_ROLLOUTS} RMM_BPTT_USE_REF_MODEL=${RMM_BPTT_USE_REF_MODEL}"
+echo "BPTT_N_ROLLOUTS=${BPTT_N_ROLLOUTS} RMM_BPTT_USE_REF_MODEL=${RMM_BPTT_USE_REF_MODEL} BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT}"
 echo "LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} N_VIS_BATCH=${N_VIS_BATCH} N_BATCH_SIM_AGENTS_METRIC=${N_BATCH_SIM_AGENTS_METRIC}"
 echo "NPROC_PER_NODE=${NPROC_PER_NODE} NUM_WORKERS=${NUM_WORKERS} (≈ ${NPROC_PER_NODE}×${NUM_WORKERS} dataloader worker 프로세스 + 메인)"
 
@@ -150,5 +153,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.delete_local_videos_after_wandb_upload="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD}" \
   model.model_config.finetune.bptt_n_rollouts="${BPTT_N_ROLLOUTS}" \
   model.model_config.finetune.rmm_bptt_use_ref_model="${RMM_BPTT_USE_REF_MODEL}" \
+  model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   ${EXTRA_ARGS}
 
