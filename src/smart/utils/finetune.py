@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -17,7 +17,8 @@ class FinetuneConfig:
     Attributes:
         enabled: fine-tuning 분기를 켤지 나타냅니다.
         mode: 현재 지원하는 fine-tuning 방식 이름입니다.
-        rollout_steps: 학습 rollout step 수입니다.
+        rollout_steps: adjoint_matching / terminal_cost 등 **Flow ODE 시간 이산화**에만 사용됩니다
+            (``[eps,1]`` 구간 등분). ``rmm_bptt_ft`` closed-loop 길이에는 쓰이지 않습니다.
         rollout_noise_scale: 초기 Gaussian 잡음 크기입니다.
         feasible_weight: terminal feasible cost 가중치입니다.
         smooth_deadzone_epsilon: 정규화 gap dead-zone 크기입니다.
@@ -73,6 +74,10 @@ class FinetuneConfig:
     #: Neural ODE adjoint method의 이산 버전: forward 시 내부 활성화를 저장하지 않고
     #: backward 시 재연산. O(solver_steps × activation) 메모리를 O(activation)으로 줄임.
     bptt_use_adjoint: bool = False
+    #: ``rmm_bptt_ft`` 전용: 실행할 **coarse step** 개수. ``None`` 또는 0 이하면
+    #: ``n_step_future_2hz`` 전부 (보통 16). 양수면 그만큼만 rollout 후 **그 구간 전체** soft RMM·역전파.
+    #: (truncated BPTT detach는 사용하지 않음.)
+    bptt_max_coarse_steps: Optional[int] = None
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -122,6 +127,8 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
     epg_srb_raw = _read_config_value(finetune, "epg_single_rollout_baseline", None)
     epg_single_rollout_baseline = float(epg_srb_raw) if epg_srb_raw is not None else None
 
+    _bptt_max_cs_raw = _read_config_value(finetune, "bptt_max_coarse_steps", None)
+
     return FinetuneConfig(
         enabled=bool(_read_config_value(finetune, "enabled", True)),
         mode=str(_read_config_value(finetune, "mode", "adjoint_matching")),
@@ -160,6 +167,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         rmm_bptt_use_ref_model=bool(_read_config_value(finetune, "rmm_bptt_use_ref_model", False)),
         flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
         bptt_use_adjoint=bool(_read_config_value(finetune, "bptt_use_adjoint", False)),
+        bptt_max_coarse_steps=None if _bptt_max_cs_raw is None else int(_bptt_max_cs_raw),
     )
 
 

@@ -14,6 +14,10 @@
 #   - N_VIS_BATCH=0 이면 closed-loop W&B 비디오 생성 안 함 (batch_idx < n_vis_batch 일 때만 생성)
 #   - n_batch_sim_agents_metric: official SimAgents RMM(CPU 풀)에 넣는 val 배치 수 상한
 #   - LIMIT_VAL_BATCHES: 정수면 그만큼의 val 배치만 전체 검증 루프에서 사용 (open+closed 포함)
+#
+# coarse step 수 제한 (전체 16이 아니라 앞 N coarse만; 그 구간 전체 역전파·soft RMM):
+#   BPTT_MAX_COARSE_STEPS=3 sh scripts/train_flow_bptt_ft.sh
+#   (비우면 yaml 기본: null = coarse 전부)
 # =============================================================================
 
 export LOGLEVEL=INFO
@@ -24,7 +28,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2, 3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_bptt_ft}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-a100-bpttft}"
@@ -41,7 +45,7 @@ fi
 CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
 CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-0.1}"
 # 정수(예: 10) = val 배치 최대 개수. 0~1 실수 = 데이터셋 비율. 빠른 RMM 스모크는 10 권장.
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-10}"
@@ -72,7 +76,6 @@ LR_TOTAL_STEPS="${LR_TOTAL_STEPS:--1}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-1e-2}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 
-ROLLOUT_STEPS="${ROLLOUT_STEPS:-3}"
 ROLLOUT_NOISE_SCALE="${ROLLOUT_NOISE_SCALE:-1.0}"
 # 0 이면 validation 비디오 생성 안 함 (Waymo rollout MP4 + W&B 업로드 스킵)
 N_VIS_BATCH="${N_VIS_BATCH:-0}"
@@ -88,6 +91,8 @@ RMM_BPTT_USE_REF_MODEL="${RMM_BPTT_USE_REF_MODEL:-false}"
 # OOM 발생 시 true로 설정: flow ODE model_fn 호출을 gradient checkpoint으로 감쌈
 # (Neural ODE adjoint 이산 버전) — solver_steps×activation 메모리를 activation 수준으로 절감
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
+# 비어 있으면 오버라이드 없음 → configs/experiment 의 bptt_max_coarse_steps (null = 전체)
+BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -112,7 +117,7 @@ echo "CACHE_ROOT=${CACHE_ROOT} (flow_bptt_ft: train_* → validation split under
 echo "CKPT_PATH=${CKPT_PATH}"
 echo "LIMIT_TRAIN_BATCHES=${LIMIT_TRAIN_BATCHES} MAX_EPOCHS=${MAX_EPOCHS} WANDB_MODE=${WANDB_MODE}"
 echo "LOG_EVERY_N_STEPS=${LOG_EVERY_N_STEPS} val_check_interval=${VAL_CHECK_INTERVAL} check_val_every_n_epoch=${CHECK_VAL_EVERY_N_EPOCH}"
-echo "BPTT_N_ROLLOUTS=${BPTT_N_ROLLOUTS} RMM_BPTT_USE_REF_MODEL=${RMM_BPTT_USE_REF_MODEL} BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT}"
+echo "BPTT_N_ROLLOUTS=${BPTT_N_ROLLOUTS} RMM_BPTT_USE_REF_MODEL=${RMM_BPTT_USE_REF_MODEL} BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_MAX_COARSE_STEPS=${BPTT_MAX_COARSE_STEPS:-"(yaml)"}"
 echo "LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} N_VIS_BATCH=${N_VIS_BATCH} N_BATCH_SIM_AGENTS_METRIC=${N_BATCH_SIM_AGENTS_METRIC}"
 echo "NPROC_PER_NODE=${NPROC_PER_NODE} NUM_WORKERS=${NUM_WORKERS} (≈ ${NPROC_PER_NODE}×${NUM_WORKERS} dataloader worker 프로세스 + 메인)"
 
@@ -144,7 +149,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.lr_total_steps="${LR_TOTAL_STEPS}" \
   model.model_config.lr_min_ratio="${LR_MIN_RATIO}" \
   model.model_config.weight_decay="${WEIGHT_DECAY}" \
-  model.model_config.finetune.rollout_steps="${ROLLOUT_STEPS}" \
   model.model_config.finetune.rollout_noise_scale="${ROLLOUT_NOISE_SCALE}" \
   model.model_config.n_vis_batch="${N_VIS_BATCH}" \
   model.model_config.n_vis_scenario="${N_VIS_SCENARIO}" \
@@ -154,5 +158,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.bptt_n_rollouts="${BPTT_N_ROLLOUTS}" \
   model.model_config.finetune.rmm_bptt_use_ref_model="${RMM_BPTT_USE_REF_MODEL}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
+  ${BPTT_MAX_COARSE_STEPS:+model.model_config.finetune.bptt_max_coarse_steps="${BPTT_MAX_COARSE_STEPS}"} \
   ${EXTRA_ARGS}
 

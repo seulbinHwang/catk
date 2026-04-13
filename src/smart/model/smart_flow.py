@@ -34,6 +34,7 @@ from src.smart.modules.flow_terminal_cost_final_step import TerminalCostFinalSte
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
+from src.utils.pylogger import RankedLogger
 from src.utils.vis_waymo import VisWaymo
 from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -49,6 +50,22 @@ from src.smart.metrics.wosac_metametric_pytorch_differentiable import (
     WosacMetametricSoftResult,
 )
 from src.smart.metrics.wosac_metric_features_torch.surrogate import SurrogateConfig
+
+log = RankedLogger(__name__, rank_zero_only=True)
+
+
+def _slice_log_feat_dict_to_pred_horizon(
+    log_feat_dict: dict[str, Tensor],
+    t_horizon: int,
+) -> dict[str, Tensor]:
+    """GT log metric features를 예측 궤적 길이(10Hz ``T``)에 맞게 잘라 soft RMM log/sim 정합을 맞춥니다."""
+    out: dict[str, Tensor] = {}
+    for k, v in log_feat_dict.items():
+        if isinstance(v, Tensor) and v.ndim >= 3 and v.shape[-1] > t_horizon:
+            out[k] = v[..., :t_horizon]
+        else:
+            out[k] = v
+    return out
 
 
 class SMARTFlow(LightningModule):
@@ -802,7 +819,6 @@ class SMARTFlow(LightningModule):
         rollout_indices: Sequence[int],
         return_anchor_hidden: bool = False,
         full_grad: bool = False,
-        bptt_start_step: int | None = None,
         max_steps: int | None = None,
     ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
@@ -839,7 +855,6 @@ class SMARTFlow(LightningModule):
                     map_feature=map_feature,
                     sampling_noise=self.eval_sampling_noise,
                     scenario_sampling_seeds=scenario_sampling_seeds,
-                    bptt_start_step=bptt_start_step,
                     max_steps=max_steps,
                 )
             else:
@@ -887,7 +902,6 @@ class SMARTFlow(LightningModule):
                 map_feature=expanded_map_feature,
                 sampling_noise=self.eval_sampling_noise,
                 scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
-                bptt_start_step=bptt_start_step,
                 max_steps=max_steps,
             )
         else:
@@ -1325,32 +1339,30 @@ class SMARTFlow(LightningModule):
     ) -> dict:
         """Flow-BPTT fine-tuning step.
 
-        항상 full 16-step (80 10Hz) WOSAC rollout을 수행하되,
-        rollout_steps 이후의 AR step에서는 hidden state를 detach해 gradient를 차단합니다.
-        이렇게 하면 sim feature histogram에 zero-padding이 섞이지 않아
-        soft RMM gradient 방향이 올바르게 유지됩니다.
+        Closed-loop coarse rollout 후 soft RMM으로 미분 가능한 점수를 내고 gradient ascent 합니다.
+        ``finetune.bptt_max_coarse_steps``: ``None`` 또는 0 이하면 ``n_step_future_2hz`` 전체(보통 16);
+        양수면 그 coarse step 수만큼만 rollout·역전파(해당 구간 **전체**에 대해 연쇄 역전파).
 
         Algorithm:
             1. Encode map (no_grad).
             2. Build rollout cache from GT initial state (no_grad).
-            3. Full 16-step rollout; gradient only through first rollout_steps coarse steps
-               (bptt_start_step=rollout_steps → states detached after that point).
-            4. Score with differentiable soft RMM on the complete 80-step trajectory.
+            3. Rollout ``max_steps=bptt_max_coarse_steps`` (또는 전체).
+            4. Soft RMM (예측 길이에 맞게 GT log feature 슬라이스).
             5. loss = -(mean_rmm - ema_mean).
         """
         flow_decoder = self.encoder.agent_encoder.flow_decoder
         G = int(getattr(self.finetune_config, "bptt_n_rollouts", 1))
-        rollout_steps = int(getattr(self.finetune_config, "rollout_steps", 4))
-        # rollout_steps <= 0 → full gradient through all 16 WOSAC coarse steps
-        # rollout_steps > 0  → gradient through first rollout_steps steps only (bptt truncation)
-        bptt_start_arg: int | None = None if rollout_steps <= 0 else rollout_steps
+        _bmc_raw = getattr(self.finetune_config, "bptt_max_coarse_steps", None)
+        if _bmc_raw is None:
+            bptt_max_coarse_steps: int | None = None
+        else:
+            _n = int(_bmc_raw)
+            bptt_max_coarse_steps = None if _n <= 0 else _n
         use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
 
         # ── 1. Encode map (no_grad; encoder frozen) ─────────────────────────
         with torch.no_grad():
             map_feature = self.encoder.encode_map(tokenized_map)
-
-        dev = next(iter(flow_decoder.parameters())).device
 
         # ── 2. Build rollout cache from GT initial state (no_grad) ───────────
         rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
@@ -1358,12 +1370,8 @@ class SMARTFlow(LightningModule):
             map_feature=map_feature,
         )
 
-        # ── 3. Generate rollouts (full 80-step trajectory, limited gradient) ──
-        # Always runs all 16 coarse steps so the sim distribution is clean.
-        # bptt_start_arg=N → states detached at coarse step N, no gradient beyond that.
-        # bptt_start_arg=None → gradient flows through all 16 steps.
-        # use_adjoint=True → each flow_ode.generate() call uses torch.utils.checkpoint
-        #   on model_fn, trading recomputation for memory (discrete ODE adjoint).
+        # ── 3. Rollout (10Hz 길이 = coarse 수 × shift; ``max_steps`` 로 coarse 수 상한) ──
+        # use_adjoint=True → 각 flow_ode.generate() 가 torch.utils.checkpoint (OD 이산 adjoint).
         flow_ode = self.encoder.agent_encoder.flow_ode
         flow_ode.use_adjoint_for_bptt = use_adjoint
         try:
@@ -1376,12 +1384,12 @@ class SMARTFlow(LightningModule):
                     rollout_indices=list(range(G)),
                     return_anchor_hidden=True,
                     full_grad=True,
-                    bptt_start_step=bptt_start_arg,
+                    max_steps=bptt_max_coarse_steps,
                 )
             )
         finally:
             flow_ode.use_adjoint_for_bptt = False  # always reset
-        # pred_traj: [n_agents, G, 80, 2] — full trajectory, all 80 pred steps valid
+        # pred_traj: [n_agents, G, T_10hz, 2] — ``T_10hz`` 는 coarse 수 × ``shift`` (≤ 80)
         agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
 
         if data is None:
@@ -1434,12 +1442,17 @@ class SMARTFlow(LightningModule):
             self._soft_rmm_waymo_cfg = cfg
         cfg = self._soft_rmm_waymo_cfg
 
-        # Build per-scenario log features (no grad) so that scenario/log_feat matches agent slice.
-        # We only need log_feat_dict for compute_wosac_metametric_soft.
+        # GT log 분포: 시나리오 트랙의 full 미래로만 계산한다 (짧은 rollout 예측으로 joint를 만들면
+        # compute_metric_features 단계에서 시간축 불일치로 실패할 수 있음).
+        from waymo_open_dataset.utils.sim_agents import submission_specs
+
         from src.smart.metrics.wosac_metric_features_torch.metric_features_torch import (
-            compute_scenario_rollouts_features,
+            compute_metric_features,
+            scenario_to_joint_scene,
         )
         import tensorflow as tf
+
+        _sim_agents_challenge = submission_specs.ChallengeType.SIM_AGENTS
 
         total_rmm = pred_traj.new_zeros((), dtype=torch.float32)
         total_count = 0
@@ -1464,24 +1477,24 @@ class SMARTFlow(LightningModule):
                 )
 
             sc_agent_ids = agent_ids[sc_mask]
-            sc_pred_traj = pred_traj[sc_mask]       # [A_sc, G, 80, 2]
-            sc_pred_z = pred_z[sc_mask]             # [A_sc, G, 80]
-            sc_pred_head = pred_head_traj[sc_mask]  # [A_sc, G, 80]
+            sc_pred_traj = pred_traj[sc_mask]       # [A_sc, G, T, 2]
+            sc_pred_z = pred_z[sc_mask]             # [A_sc, G, T]
+            sc_pred_head = pred_head_traj[sc_mask]  # [A_sc, G, T]
 
-            # log features: build once per scenario using any rollout (rollout 0) as carrier.
+            # log features: 시나리오 GT 기반 joint (full simulation steps) 한 번만 계산.
             with torch.no_grad():
-                sr_for_log = get_scenario_rollouts(
-                    scenario_id=get_scenario_id_int_tensor([scenario_ids[sc_idx]], sc_pred_traj.device),
-                    agent_id=sc_agent_ids,
-                    agent_batch=torch.zeros(sc_agent_ids.shape[0], dtype=torch.long, device=sc_pred_traj.device),
-                    pred_traj=sc_pred_traj[:, :1],
-                    pred_z=sc_pred_z[:, :1],
-                    pred_head=sc_pred_head[:, :1],
+                log_joint = scenario_to_joint_scene(scenario, _sim_agents_challenge)
+                log_feat = compute_metric_features(
+                    scenario,
+                    log_joint,
+                    challenge_type=_sim_agents_challenge,
+                    use_log_validity=True,
                 )
-                log_feat, _ = compute_scenario_rollouts_features(scenario, sr_for_log[0])
                 log_feat_dict = {k: v.to(device=sc_pred_traj.device) for k, v in log_feat.as_dict().items()}
+                _t_hor = int(sc_pred_traj.shape[2])
+                log_feat_dict = _slice_log_feat_dict_to_pred_horizon(log_feat_dict, _t_hor)
 
-            # full 80-step rollout: 모든 step이 실제 예측값이므로 all-True valid mask 사용
+            # 예측과 같은 ``T`` — 해당 구간 모두 유효
             valid = sc_pred_traj.new_ones(sc_pred_traj.shape[0], sc_pred_traj.shape[2], dtype=torch.bool)
 
             # rollout별 soft RMM을 계산해 평균 (시나리오별로 동일 가중)

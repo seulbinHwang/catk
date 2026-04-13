@@ -128,6 +128,15 @@ def compute_metric_features_from_predicted_sim_trajectories(
     simulated = simulated.gather_objects_by_id(reordered_ids)
 
     eval_logged = logged_full.gather_objects_by_id(evaluated_ids)
+    # 시나리오 GT는 전체 시간(예: 91 step), closed-loop pred는 짧을 수 있음 → 같은 글로벌 인덱스 0..T-1만 비교.
+    _t_sim = int(simulated.x.shape[1])
+    _t_log = int(eval_logged.x.shape[1])
+    if _t_log != _t_sim:
+        if _t_sim > _t_log:
+            raise ValueError(
+                f"Simulated horizon ({_t_sim}) exceeds scenario log length ({_t_log})."
+            )
+        eval_logged = eval_logged.slice_time(0, _t_sim)
 
     cfg = submission_specs.get_submission_config(challenge_type)
     ct_idx = cfg.current_time_index

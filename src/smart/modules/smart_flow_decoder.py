@@ -147,7 +147,6 @@ class SMARTFlowDecoder(nn.Module):
         sampling_noise: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
-        bptt_start_step: int | None = None,
         max_steps: int | None = None,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
@@ -157,7 +156,6 @@ class SMARTFlowDecoder(nn.Module):
             sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
-            bptt_start_step=bptt_start_step,
             max_steps=max_steps,
         )
 

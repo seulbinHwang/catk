@@ -31,7 +31,8 @@ model:
     finetune:
       enabled: true
       mode: rmm_bptt_ft
-      rollout_steps: 3  # gradient cutoff: steps 0..N-1 get grad, steps N..15 are detached. <=0 → full BPTT (all 16 steps = 8s)
+      # null/0 이하 = coarse 전부 (16). 양수 = 그 coarse step만 rollout·전 구간 역전파 (예: 짧은 구간 3)
+      bptt_max_coarse_steps: null
       rollout_noise_scale: 1.0
       bptt_n_rollouts: 2
       rmm_bptt_use_ref_model: false

@@ -141,6 +141,16 @@ def compute_red_light_violation(
     ts_lane_id = ts_lane_id.to(center_x.device)
     ts_state = ts_state.to(center_x.device)
     ts_stop_point = ts_stop_point.to(center_x.device)
+    # Trajectory may be shorter than full scenario (e.g. truncated closed-loop rollout): align TL time axis.
+    _t_tl = ts_lane_id.shape[0]
+    if num_steps != _t_tl:
+        if num_steps > _t_tl:
+            raise ValueError(
+                f"trajectory num_steps={num_steps} exceeds traffic_signals length={_t_tl}"
+            )
+        ts_lane_id = ts_lane_id[:num_steps]
+        ts_state = ts_state[:num_steps]
+        ts_stop_point = ts_stop_point[:num_steps]
     num_traffic_signals = ts_lane_id.shape[1]
 
     ts_match = current_lane_id[:, :, None].eq(ts_lane_id[None, :, :])  # (O,T,TL)
@@ -250,6 +260,15 @@ def compute_red_light_violation_soft(
     ts_lane_id = ts_lane_id.to(center_x.device)
     ts_state = ts_state.to(center_x.device)
     ts_stop_point = ts_stop_point.to(center_x.device)
+    _t_tl = ts_lane_id.shape[0]
+    if num_steps != _t_tl:
+        if num_steps > _t_tl:
+            raise ValueError(
+                f"trajectory num_steps={num_steps} exceeds traffic_signals length={_t_tl}"
+            )
+        ts_lane_id = ts_lane_id[:num_steps]
+        ts_state = ts_state[:num_steps]
+        ts_stop_point = ts_stop_point[:num_steps]
     num_traffic_signals = ts_lane_id.shape[1]
     ts_match = current_lane_id[:, :, None].eq(ts_lane_id[None, :, :]).to(torch.float32)
 
