@@ -776,7 +776,7 @@ torchrun \
 - `model.model_config.sim_agents_submission.method_name`
 - `model.model_config.sim_agents_submission.authors`
 - `model.model_config.sim_agents_submission.affiliation`
-- `model.model_config.sim_agents_submission.description`
+- `submission.description` 또는 `model.model_config.sim_agents_submission.description`
 - `model.model_config.sim_agents_submission.method_link`
 - `model.model_config.sim_agents_submission.account_name`
 
@@ -807,7 +807,7 @@ python -m src.run \
   model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
   model.model_config.sim_agents_submission.authors=[Anonymous] \
   model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  submission.description="YOUR_DESCRIPTION" \
   model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
   model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
 ```
@@ -836,7 +836,7 @@ torchrun \
   model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
   model.model_config.sim_agents_submission.authors=[Anonymous] \
   model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  submission.description="YOUR_DESCRIPTION" \
   model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
   model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME" \
   paths.log_dir=/workspace/exp_logs
@@ -968,7 +968,7 @@ torchrun \
   model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
   model.model_config.sim_agents_submission.authors=[Anonymous] \
   model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  submission.description="YOUR_DESCRIPTION" \
   model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
   model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME" \
   waymo_submission.enabled=true \
