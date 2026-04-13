@@ -50,9 +50,10 @@ def _get_nearest_lane_segment_index(*, xy: Tensor, lane_xyz_valid: Tensor) -> Te
         geom.dot_product_2d(start_to_end, start_to_end),
     )
     clipped_rel_t = rel_t.clamp(0.0, 1.0)
-    distance_to_segment = torch.linalg.norm(
-        start_to_point + start_to_end * clipped_rel_t[..., None], dim=-1
-    )
+    # Safe norm: torch.linalg.norm backward = x/||x|| → NaN when input=0
+    # (query point exactly on segment). Use sqrt(sum(x²).clamp(ε²)) instead.
+    _diff = start_to_point + start_to_end * clipped_rel_t[..., None]
+    distance_to_segment = torch.sqrt((_diff * _diff).sum(dim=-1).clamp(min=1e-16))
 
     distance_to_segment = torch.where(
         lane_valid[..., :-1], distance_to_segment, torch.full_like(distance_to_segment, EXTREMELY_LARGE_DISTANCE)
