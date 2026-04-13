@@ -1575,7 +1575,7 @@ class SMARTFlow(LightningModule):
             total_count += 1
 
         if total_count == 0:
-            dummy = next(iter(flow_decoder.parameters()))
+            dummy = next(p for p in self.parameters() if p.requires_grad)
             return {"loss": dummy.sum() * 0.0}
 
         mean_rmm = total_rmm / float(total_count)
@@ -1583,7 +1583,7 @@ class SMARTFlow(LightningModule):
         # NaN/Inf guard
         if not torch.isfinite(mean_rmm):
             log.warning(f"[rmm_bptt_ft] Non-finite mean_rmm={mean_rmm.item():.4f}, skipping update.")
-            dummy = next(iter(flow_decoder.parameters()))
+            dummy = next(p for p in self.parameters() if p.requires_grad)
             return {"loss": dummy.sum() * 0.0}
 
         # ── rmm_soft 파일 로그 (wandb disabled 환경에서도 확인 가능) ────────────
@@ -1605,7 +1605,7 @@ class SMARTFlow(LightningModule):
                 f"(ema={_prev_ema:.4f}, threshold=drop>{_drop_threshold} or <0.5) "
                 f"at step={_step}"
             )
-            dummy = next(iter(flow_decoder.parameters()))
+            dummy = next(p for p in self.parameters() if p.requires_grad)
             return {
                 "loss": dummy.sum() * 0.0,
                 "train/rmm_soft": mean_rmm.detach(),
@@ -1668,7 +1668,7 @@ class SMARTFlow(LightningModule):
             )
 
         if anchor_hidden_valid.numel() == 0:
-            dummy = next(iter(flow_decoder.parameters()))
+            dummy = next(p for p in self.parameters() if p.requires_grad)
             return {"loss": dummy.sum() * 0.0}
 
         anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
@@ -1732,7 +1732,7 @@ class SMARTFlow(LightningModule):
             )
 
         if anchor_hidden_valid.numel() == 0:
-            dummy = next(iter(flow_decoder.parameters()))
+            dummy = next(p for p in self.parameters() if p.requires_grad)
             return {"loss": dummy.sum() * 0.0}
 
         anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
