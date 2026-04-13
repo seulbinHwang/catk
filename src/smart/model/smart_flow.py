@@ -149,6 +149,17 @@ class SMARTFlow(LightningModule):
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
 
+        # EMA reward whitening buffers for rmm_bptt_ft.
+        # Normalise loss = -(rmm - ema_mean) / (ema_std + eps) so gradient scale
+        # stays consistent across scenarios with very different RMM baselines.
+        if (
+            getattr(model_config, "finetune", None) is not None
+            and str(getattr(model_config.finetune, "mode", "")) == "rmm_bptt_ft"
+        ):
+            self.register_buffer("_rmm_ema_mean", torch.tensor(0.5))
+            self.register_buffer("_rmm_ema_var", torch.tensor(0.01))
+            self._rmm_ema_initialized = False
+
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
@@ -1503,19 +1514,42 @@ class SMARTFlow(LightningModule):
             return {"loss": dummy.sum() * 0.0}
 
         mean_rmm = total_rmm / float(total_count)
-        loss = -mean_rmm
 
-        # NaN/Inf guard: soft RMM 파이프라인의 간헐적 NaN이 모델을 망가뜨리지 않도록
-        # loss가 유효하지 않으면 zero-grad step으로 대체합니다.
-        if not torch.isfinite(loss):
-            log.warning(f"[rmm_bptt_ft] Non-finite loss={loss.item():.4f}, skipping update.")
+        # NaN/Inf guard
+        if not torch.isfinite(mean_rmm):
+            log.warning(f"[rmm_bptt_ft] Non-finite mean_rmm={mean_rmm.item():.4f}, skipping update.")
             dummy = next(iter(flow_decoder.parameters()))
             return {"loss": dummy.sum() * 0.0}
+
+        # ── EMA reward whitening ──────────────────────────────────────────────
+        # Normalise the reward signal so gradient scale stays consistent across
+        # scenarios with different difficulty levels.
+        # loss = -(rmm - ema_mean) / (ema_std + eps)
+        # → gradient responds only to *relative* deviation from running baseline.
+        _ema_mom = 0.98  # slow EMA for stable baseline
+        rmm_val = mean_rmm.detach()
+        if hasattr(self, "_rmm_ema_mean"):
+            if not self._rmm_ema_initialized:
+                # First step: initialise EMA directly with current value
+                self._rmm_ema_mean.fill_(rmm_val.item())
+                self._rmm_ema_var.fill_(1e-4)
+                self._rmm_ema_initialized = True
+            else:
+                delta = rmm_val - self._rmm_ema_mean
+                self._rmm_ema_mean = _ema_mom * self._rmm_ema_mean + (1 - _ema_mom) * rmm_val
+                self._rmm_ema_var = _ema_mom * self._rmm_ema_var + (1 - _ema_mom) * delta ** 2
+            ema_std = torch.sqrt(self._rmm_ema_var.clamp(min=1e-6))
+            loss = -(mean_rmm - self._rmm_ema_mean.detach()) / (ema_std.detach() + 1e-6)
+        else:
+            # Fallback: no whitening (EMA buffer not registered)
+            loss = -mean_rmm
 
         return {
             "loss": loss,
             "train/rmm_soft": mean_rmm.detach(),
             "train/rmm_loss": loss.detach(),
+            "train/rmm_ema_mean": self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach(),
+            "train/rmm_ema_std": ema_std.detach() if hasattr(self, "_rmm_ema_mean") else torch.tensor(1.0),
             "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
         }
 
