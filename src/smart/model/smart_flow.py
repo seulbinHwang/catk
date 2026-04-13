@@ -1420,9 +1420,11 @@ class SMARTFlow(LightningModule):
         _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 0.5))
         if pred_traj.requires_grad and _grad_clip_traj > 0:
             def _clip_traj_grad(g: Tensor) -> Tensor:
-                return g.clamp(-_grad_clip_traj, _grad_clip_traj)
+                # nan_to_num first: clamp(NaN) = NaN, so replace NaN/Inf before clipping
+                return torch.nan_to_num(g, nan=0.0, posinf=_grad_clip_traj, neginf=-_grad_clip_traj).clamp(-_grad_clip_traj, _grad_clip_traj)
             pred_traj.register_hook(_clip_traj_grad)
-            pred_head_traj.register_hook(_clip_traj_grad)
+            if pred_head_traj.requires_grad:
+                pred_head_traj.register_hook(_clip_traj_grad)
 
         agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
 
@@ -1575,6 +1577,35 @@ class SMARTFlow(LightningModule):
             dummy = next(iter(flow_decoder.parameters()))
             return {"loss": dummy.sum() * 0.0}
 
+        # ── rmm_soft 파일 로그 (wandb disabled 환경에서도 확인 가능) ────────────
+        rmm_float = mean_rmm.item()
+        ema_float = float(self._rmm_ema_mean.item()) if hasattr(self, "_rmm_ema_mean") else float("nan")
+        _step = int(getattr(self, "global_step", 0))
+        log.info(f"[rmm] step={_step} rmm_soft={rmm_float:.4f} ema={ema_float:.4f}")
+
+        # ── 급락 탐지: rmm이 이전 EMA 보다 0.15 이상 낮으면 update skip ─────────
+        # 이런 배치는 soft RMM gradient가 폭발적으로 크거나 잘못된 시나리오일 가능성 높음.
+        # 해당 배치의 gradient를 아예 반영하지 않아 weight 손상을 방지.
+        _prev_ema = float(self._rmm_ema_mean.item()) if (
+            hasattr(self, "_rmm_ema_mean") and self._rmm_ema_initialized
+        ) else None
+        _drop_threshold = 0.15
+        if _prev_ema is not None and (rmm_float < 0.5 or rmm_float < _prev_ema - _drop_threshold):
+            log.warning(
+                f"[rmm_bptt] SKIP UPDATE: rmm_soft={rmm_float:.4f} "
+                f"(ema={_prev_ema:.4f}, threshold=drop>{_drop_threshold} or <0.5) "
+                f"at step={_step}"
+            )
+            dummy = next(iter(flow_decoder.parameters()))
+            return {
+                "loss": dummy.sum() * 0.0,
+                "train/rmm_soft": mean_rmm.detach(),
+                "train/rmm_loss": torch.tensor(0.0, device=mean_rmm.device),
+                "train/rmm_ema_mean": self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach(),
+                "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
+                "train/rmm_skip": torch.tensor(1.0, device=mean_rmm.device),
+            }
+
         # ── EMA baseline (centering only, no std division) ───────────────────
         # loss = -(rmm - ema_mean): gradient only from *deviation above baseline*.
         # Dividing by std was amplifying gradients due to small initial std.
@@ -1597,6 +1628,7 @@ class SMARTFlow(LightningModule):
             "train/rmm_loss": loss.detach(),
             "train/rmm_ema_mean": self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach(),
             "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
+            "train/rmm_skip": torch.tensor(0.0, device=mean_rmm.device),
         }
 
     def _run_kinematic_reward_ft_step(
@@ -1819,6 +1851,13 @@ class SMARTFlow(LightningModule):
                 total_norm = torch.stack([p.grad.detach().norm() for p in all_params]).norm()
                 self.log("train/grad_norm_total", total_norm,
                          on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
+                # 파일 로그에도 항상 기록 (wandb disabled 환경에서도 확인 가능)
+                vh_norm_val = vh_norm.item() if vh_params else float("nan")
+                log.info(
+                    f"[grad] step={self.global_step} "
+                    f"total={total_norm.item():.3f} "
+                    f"vh={vh_norm_val:.3f}"
+                )
                 # 1000 이상이면 경고
                 if total_norm.item() > 1000:
                     log.warning(
