@@ -69,8 +69,8 @@ LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
 GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-1.0}"
 
-TRAIN_B="${TRAIN_B:-4}"
-VAL_B="${VAL_B:-4}"
+TRAIN_B="${TRAIN_B:-2}"
+VAL_B="${VAL_B:-6}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-8}"
 # DataLoader 워커는 GPU 프로세스마다 따로 뜸: (NPROC_PER_NODE × NUM_WORKERS) + α.
 # 예: 2GPU × 63워커 ≈ 126개 워커만으로도 RAM·파일 디스크립터·스케줄링 폭주 → 몇 step 후 OOM/Killed/멈춤이 잦음.
@@ -101,9 +101,9 @@ BPTT_N_ROLLOUTS="${BPTT_N_ROLLOUTS:-3}"
 RMM_BPTT_USE_REF_MODEL="${RMM_BPTT_USE_REF_MODEL:-false}"
 # OOM 발생 시 true로 설정: flow ODE model_fn 호출을 gradient checkpoint으로 감쌈
 # (Neural ODE adjoint 이산 버전) — solver_steps×activation 메모리를 activation 수준으로 절감
-BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
+BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-false}"
 # 비어 있으면 오버라이드 없음 → configs/experiment 의 bptt_max_coarse_steps (null = 전체)
-BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-}"
+BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-16}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
