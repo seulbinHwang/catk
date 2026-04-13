@@ -48,7 +48,7 @@ LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-10}"
 MAX_EPOCHS="${MAX_EPOCHS:-10}"
 # val_check_interval: 정수면 "N training step마다" 검증, 0~1 실수면 "에폭의 해당 비율마다" 검증.
 # limit_train_batches가 작으면 정수 N은 N 이하로 맞출 것(그렇지 않으면 Lightning 설정 오류).
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-10}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-50}"
 CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-1}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
@@ -66,7 +66,7 @@ PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
 PIN_MEMORY="${PIN_MEMORY:-true}"
 
 # rmm_bptt_ft: LR를 너무 키우면 soft RMM 역전파·옵티마 스텝에서 NaN/폭주가 나기 쉬움. 문제 시 1e-6 전후로 낮춰볼 것.
-LR="${LR:-1e-6}"
+LR="${LR:-1e-5}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-200}"
 LR_TOTAL_STEPS="${LR_TOTAL_STEPS:--1}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-1e-2}"
