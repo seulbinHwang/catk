@@ -1252,6 +1252,7 @@ class SMARTFlow(LightningModule):
         valid: Tensor,
         log_feat_dict: dict,
         config: sim_agents_metrics_pb2.SimAgentMetricsConfig,
+        debug: bool = False,
     ) -> WosacMetametricSoftResult:
         pred = PredictedSimTrajectories(
             object_id=agent_ids.cpu(),
@@ -1265,10 +1266,31 @@ class SMARTFlow(LightningModule):
         sim_feat = compute_metric_features_from_predicted_sim_trajectories(
             scenario=scenario, pred=pred, surrogate=SURROGATE,
         )
+        sim_feat_dict = sim_feat.as_dict()
+
+        if debug:
+            # 극값 로깅: gradient explosion 원인 후보 탐지
+            with torch.no_grad():
+                def _stat(t: Tensor, name: str) -> str:
+                    v = t.detach().float()
+                    return f"{name}=[{v.min():.3f},{v.max():.3f}]"
+                log.warning(
+                    "[soft_rmm_feat_debug] "
+                    + " | ".join([
+                        _stat(sim_feat_dict["linear_speed"],    "lin_spd"),
+                        _stat(sim_feat_dict["angular_speed"],   "ang_spd"),
+                        _stat(sim_feat_dict["distance_to_nearest_object"], "dno"),
+                        _stat(sim_feat_dict["distance_to_road_edge"],      "d_road"),
+                        _stat(sim_feat_dict["collision_per_step"].float(),  "coll"),
+                        _stat(sim_feat_dict["offroad_per_step"].float(),    "offrd"),
+                    ])
+                )
+
         return compute_wosac_metametric_soft(
             config=config,
             log_features=log_feat_dict,
-            sim_features=sim_feat.as_dict(),
+            sim_features=sim_feat_dict,
+            debug=debug,
         )
 
     def _compute_rmm_group(
@@ -1390,6 +1412,18 @@ class SMARTFlow(LightningModule):
         finally:
             flow_ode.use_adjoint_for_bptt = False  # always reset
         # pred_traj: [n_agents, G, T_10hz, 2] — ``T_10hz`` 는 coarse 수 × ``shift`` (≤ 80)
+
+        # ── Gradient hook: pred_traj 에서 역전파되는 gradient 크기를 기록하고 클리핑 ──
+        # soft RMM 의 Jacobian(특히 angular_speed 경로)이 큰 gradient 를 만들 수 있으므로,
+        # loss 쪽 -> pred_traj 로 오는 gradient 를 element-wise 로 클리핑해 BPTT 안정화.
+        # _bptt_grad_clip_val: FinetuneConfig 에 없으면 0.5 기본값 사용. 0 이면 비활성.
+        _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 0.5))
+        if pred_traj.requires_grad and _grad_clip_traj > 0:
+            def _clip_traj_grad(g: Tensor) -> Tensor:
+                return g.clamp(-_grad_clip_traj, _grad_clip_traj)
+            pred_traj.register_hook(_clip_traj_grad)
+            pred_head_traj.register_hook(_clip_traj_grad)
+
         agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
 
         if data is None:
@@ -1498,6 +1532,11 @@ class SMARTFlow(LightningModule):
             valid = sc_pred_traj.new_ones(sc_pred_traj.shape[0], sc_pred_traj.shape[2], dtype=torch.bool)
 
             # rollout별 soft RMM을 계산해 평균 (시나리오별로 동일 가중)
+            # debug: 첫 번째 rollout g=0에서 per-metric 출력
+            _dbg_enabled = (
+                bool(getattr(self.finetune_config, "bptt_debug", False))
+                and sc_idx == 0
+            )
             rmm_roll = []
             for g in range(int(sc_pred_traj.shape[1])):
                 res_g = self._compute_soft_rmm(
@@ -1510,8 +1549,16 @@ class SMARTFlow(LightningModule):
                     valid=valid,
                     log_feat_dict=log_feat_dict,
                     config=cfg,
+                    debug=(_dbg_enabled and g == 0),
                 )
                 rmm_roll.append(res_g.metametric)
+
+                # per-metric grad norm: debug 시 retain_grad
+                if _dbg_enabled and g == 0:
+                    for fn, lik in res_g.likelihoods.items():
+                        if lik.requires_grad:
+                            lik.retain_grad()
+
             rmm_sc = torch.stack(rmm_roll).mean()  # scalar
             total_rmm = total_rmm + rmm_sc
             total_count += 1
@@ -1748,15 +1795,35 @@ class SMARTFlow(LightningModule):
 
 
     def on_after_backward(self) -> None:
-        """Log velocity_head gradient norm to diagnose BPTT gradient flow."""
+        """Log gradient norms to diagnose BPTT gradient explosion."""
         if not self._is_rmm_bptt_ft_enabled():
             return
         try:
             flow_decoder = self.encoder.agent_encoder.flow_decoder
+            # velocity_head 전체 grad norm
             vh_params = [p for p in flow_decoder.velocity_head.parameters() if p.grad is not None]
             if vh_params:
-                total_norm = torch.stack([p.grad.norm() for p in vh_params]).norm()
-                self.log("train/dbg_vh_grad_norm", total_norm, on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
+                vh_norm = torch.stack([p.grad.detach().norm() for p in vh_params]).norm()
+                self.log("train/grad_norm_velocity_head", vh_norm,
+                         on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
+
+            # velocity_head 내 최대 단일 파라미터 grad norm (폭발 탐지)
+            if vh_params:
+                max_param_norm = max(p.grad.detach().norm().item() for p in vh_params)
+                self.log("train/grad_norm_vh_max_param", float(max_param_norm),
+                         on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
+
+            # 전체 학습 파라미터 grad norm
+            all_params = [p for p in self.parameters() if p.grad is not None]
+            if all_params:
+                total_norm = torch.stack([p.grad.detach().norm() for p in all_params]).norm()
+                self.log("train/grad_norm_total", total_norm,
+                         on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
+                # 1000 이상이면 경고
+                if total_norm.item() > 1000:
+                    log.warning(
+                        f"[rmm_bptt] LARGE grad norm={total_norm.item():.1f} at step={self.global_step}"
+                    )
         except Exception:
             pass
 

@@ -41,6 +41,11 @@ model:
       # true: flow ODE generate() 내부 model_fn 호출을 gradient checkpoint으로 감쌈
       # (Neural ODE adjoint 이산 버전) — OOM 발생 시 활성화
       bptt_use_adjoint: false
+      # pred_traj / pred_head_traj 에서 soft RMM 으로 역전파되는 gradient element-wise 클리핑.
+      # 0 이하면 비활성. tau fix 이후에도 큰 gradient 발생 시 낮춰볼 것.
+      bptt_grad_clip_traj: 0.5
+      # true: sim_features 극값과 per-metric likelihood 를 WARNING 로 출력 (디버깅용)
+      bptt_debug: false
 
 ckpt_path: null
 

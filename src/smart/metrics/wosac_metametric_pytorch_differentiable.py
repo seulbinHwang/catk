@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Mapping, Tuple, Dict
+from typing import Mapping, Tuple, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,8 @@ from torch import Tensor
 
 from waymo_open_dataset.protos import scenario_pb2
 from waymo_open_dataset.protos import sim_agents_metrics_pb2
+
+_log = logging.getLogger(__name__)
 
 # `compute_wosac_metametric_soft` 가중합 순서 (proto 필드명과 동일)
 _METRIC_FIELD_NAMES = [
@@ -23,8 +26,10 @@ _METRIC_FIELD_NAMES = [
     "offroad_indication",
     "traffic_light_violation",
 ]
-# default_tau 이후에 병합되며, custom_taus 로 개별 덮어쓰기 가능
-_DEFAULT_SOFT_CUSTOM_TAUS: Dict[str, float] = {"angular_speed": 0.01}
+# angular_speed 는 과거 tau=0.01 로 설정했으나, softmax Jacobian 이 1/tau 스케일이므로
+# tau=0.01 → tau=0.1 대비 10배 그래디언트 증폭. BPTT 학습에서 grad explosion 원인.
+# → custom tau 없이 default_tau(=0.1) 를 일괄 적용.
+_DEFAULT_SOFT_CUSTOM_TAUS: Dict[str, float] = {}
 
 
 def _squeeze_log_sample(x: Tensor) -> Tensor:
@@ -149,7 +154,8 @@ def compute_wosac_metametric_soft(
     sim_features: Mapping[str, Tensor],
     beta: float = 10.0,
     default_tau: float = 0.1,
-    custom_taus: Dict[str, float] = None
+    custom_taus: Dict[str, float] = None,
+    debug: bool = False,
 ) -> WosacMetametricSoftResult:
     """
     Refined Differentiable Metametric.
@@ -216,5 +222,13 @@ def compute_wosac_metametric_soft(
     for fn in _METRIC_FIELD_NAMES:
         weight = getattr(config, fn).metametric_weight
         metametric = metametric + weight * lik_dict[f"{fn}_likelihood"]
+
+    if debug:
+        parts = {fn: float(lik_dict[f"{fn}_likelihood"].detach()) for fn in _METRIC_FIELD_NAMES}
+        _log.warning(
+            "[soft_rmm_debug] metametric=%.4f | %s",
+            float(metametric.detach()),
+            " ".join(f"{k}={v:.3f}" for k, v in parts.items()),
+        )
 
     return WosacMetametricSoftResult(metametric=metametric, likelihoods=lik_dict)
