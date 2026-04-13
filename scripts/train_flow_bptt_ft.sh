@@ -66,7 +66,7 @@ PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
 PIN_MEMORY="${PIN_MEMORY:-true}"
 
 # rmm_bptt_ft: LR를 너무 키우면 soft RMM 역전파·옵티마 스텝에서 NaN/폭주가 나기 쉬움. 문제 시 1e-6 전후로 낮춰볼 것.
-LR="${LR:-1e-5}"
+LR="${LR:-1e-6}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-200}"
 LR_TOTAL_STEPS="${LR_TOTAL_STEPS:--1}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-1e-2}"
@@ -87,7 +87,7 @@ BPTT_N_ROLLOUTS="${BPTT_N_ROLLOUTS:-3}"
 RMM_BPTT_USE_REF_MODEL="${RMM_BPTT_USE_REF_MODEL:-false}"
 # OOM 발생 시 true로 설정: flow ODE model_fn 호출을 gradient checkpoint으로 감쌈
 # (Neural ODE adjoint 이산 버전) — solver_steps×activation 메모리를 activation 수준으로 절감
-BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-false}"
+BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
