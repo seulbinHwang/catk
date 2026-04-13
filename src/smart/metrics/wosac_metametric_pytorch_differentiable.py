@@ -61,9 +61,13 @@ def _likelihood_from_log_ll(ll: Tensor) -> Tensor:
 # 2. 미분 가능한 핵심 수학 함수 (Soft Any & Soft Binning)
 # ===========================================================================
 def soft_any(x: Tensor, dim: int = -1, beta: float = 10.0) -> Tensor:
-    """Smooth Maximum (LogSumExp와 유사한 가중 합 방식)"""
-    weights = F.softmax(x * beta, dim=dim)
-    return (x * weights).sum(dim=dim)
+    """Smooth Maximum (LogSumExp와 유사한 가중 합 방식).
+
+    Non-finite 값(inf/NaN)을 0으로 치환해 softmax NaN을 방지합니다.
+    """
+    x_safe = torch.where(torch.isfinite(x), x, torch.zeros_like(x))
+    weights = F.softmax(x_safe * beta, dim=dim)
+    return (x_safe * weights).sum(dim=dim)
 
 def _soft_bin_assignment(x: Tensor, edges: Tensor, tau: float) -> Tensor:
     """
@@ -97,7 +101,8 @@ def histogram_estimate_soft_torch(
     # Sim samples로 확률 분포 생성
     sim_soft_assign = _soft_bin_assignment(sim_c, edges, tau)
     sim_counts = sim_soft_assign.sum(dim=1) + pseudo
-    probs = sim_counts / sim_counts.sum(dim=-1, keepdim=True)
+    denom = sim_counts.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+    probs = sim_counts / denom
     log_probs = torch.log(probs.clamp(min=1e-10))
 
     # Log samples의 Likelihood 산출

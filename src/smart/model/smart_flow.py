@@ -1501,6 +1501,13 @@ class SMARTFlow(LightningModule):
         mean_rmm = total_rmm / float(total_count)
         loss = -mean_rmm
 
+        # NaN/Inf guard: soft RMM 파이프라인의 간헐적 NaN이 모델을 망가뜨리지 않도록
+        # loss가 유효하지 않으면 zero-grad step으로 대체합니다.
+        if not torch.isfinite(loss):
+            log.warning(f"[rmm_bptt_ft] Non-finite loss={loss.item():.4f}, skipping update.")
+            dummy = next(iter(flow_decoder.parameters()))
+            return {"loss": dummy.sum() * 0.0}
+
         return {
             "loss": loss,
             "train/rmm_soft": mean_rmm.detach(),

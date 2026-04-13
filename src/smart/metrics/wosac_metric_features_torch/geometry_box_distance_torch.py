@@ -20,6 +20,15 @@ NUM_VERTICES_IN_BOX = 4
 _EDGE_LEN_EPS = 1e-8
 
 
+def _safe_norm_2d(x: Tensor, eps: float = _EDGE_LEN_EPS) -> Tensor:
+    """Gradient-safe L2 norm along last dim for (..., 2) tensors.
+
+    torch.linalg.norm backward computes x/||x||, which is NaN when ||x||=0.
+    Using sqrt(sum(x²).clamp(min=ε²)) gives gradient 0 at x=0 instead.
+    """
+    return torch.sqrt((x * x).sum(dim=-1).clamp(min=eps * eps))
+
+
 def rotate_2d_points(xys: Tensor, rotation_yaws: Tensor) -> Tensor:
     """2D 점들을 yaw만큼 평면 회전 (Waymo `geometry_utils.rotate_2d_points` 대응).
 
@@ -56,9 +65,11 @@ def _get_downmost_edge_in_box(box: Tensor) -> Tuple[Tensor, Tensor]:
     edge_start = torch.gather(box, 1, downmost_vertex_idx[..., None].expand(-1, -1, 2))
     edge_end_idx = torch.remainder(downmost_vertex_idx + 1, NUM_VERTICES_IN_BOX)
     edge_end = torch.gather(box, 1, edge_end_idx[..., None].expand(-1, -1, 2))
-    edge = edge_end - edge_start
-    # 길이 0이면 나눗셈에서 NaN → 학습 시 안정화를 위해 하한 클램프
-    edge_len = torch.linalg.norm(edge, dim=-1, keepdim=True).clamp(min=_EDGE_LEN_EPS)
+    edge = edge_end - edge_start  # (B, 1, 2)
+    # torch.linalg.norm backward: x/||x|| → NaN at ||x||=0.
+    # Safe: sqrt((x²).sum().clamp(ε²)) → gradient 0 at x=0, not NaN.
+    edge_sq = (edge * edge).sum(dim=-1, keepdim=True)  # (B, 1, 1)
+    edge_len = torch.sqrt(edge_sq.clamp(min=_EDGE_LEN_EPS ** 2))  # (B, 1, 1)
     edge_dir = edge / edge_len
     return downmost_vertex_idx, edge_dir
 
@@ -114,9 +125,9 @@ def _get_edge_info(polygon_points: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     """
     first = polygon_points[:, 0:1, :]
     shifted = torch.cat([polygon_points[:, 1:, :], first], dim=-2)
-    edge_vec = shifted - polygon_points
-    edge_len = torch.linalg.norm(edge_vec, dim=-1)
-    edge_len_safe = edge_len.clamp(min=_EDGE_LEN_EPS)
+    edge_vec = shifted - polygon_points  # (B, K, 2)
+    # Safe norm: avoids NaN gradient when edge_vec=0 (degenerate polygon)
+    edge_len_safe = torch.sqrt((edge_vec * edge_vec).sum(dim=-1).clamp(min=_EDGE_LEN_EPS ** 2))  # (B, K)
     tangent = edge_vec / edge_len_safe[..., None]
     # CCW 폴리곤: 접선 (tx, ty)에 대해 외향 법선은 (-ty, tx)
     normal = torch.stack([-tangent[..., 1], tangent[..., 0]], dim=-1)
@@ -139,7 +150,8 @@ def signed_distance_from_point_to_convex_polygon(query_points: Tensor, polygon_p
     tangent, normal, edge_len = _get_edge_info(polygon_points)
     qp = query_points[:, None, :]
     v_to_q = qp - polygon_points  # (B,K,2) 각 꼭짓점에서 쿼리로 가는 벡터
-    v_dist = torch.linalg.norm(v_to_q, dim=-1)
+    # Safe norm: NaN gradient when query point coincides with polygon vertex (v_to_q=0)
+    v_dist = torch.sqrt((v_to_q * v_to_q).sum(dim=-1).clamp(min=_EDGE_LEN_EPS ** 2))  # (B, K)
 
     # -n·(q-v): CCW 외향 법선이면 내부에서 <= 0 (모든 변에 대해 만족하면 내부)
     edge_signed_perp = torch.sum(-normal * v_to_q, dim=-1)  # (B,K)

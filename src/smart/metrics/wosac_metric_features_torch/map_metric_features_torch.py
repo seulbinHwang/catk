@@ -187,8 +187,13 @@ def _compute_signed_distance_to_polylines(
             start_to_end * rel_t.clamp(0.0, 1.0)[..., None]
         )  # (P,Lc,S,3)
 
-        dist_3d = torch.linalg.norm(segment_to_point * stretch[None, None, None, :], dim=-1)  # (P,Lc,S)
-        dist_2d = torch.linalg.norm(segment_to_point[..., :2], dim=-1)
+        # Safe norms: torch.linalg.norm backward gives NaN when input is zero
+        # (query point exactly on polyline segment). Use sqrt(sum(x²).clamp(ε²)).
+        _EPS2 = 1e-16  # ε² = (1e-8)²
+        s3d = segment_to_point * stretch[None, None, None, :]
+        dist_3d = torch.sqrt((s3d * s3d).sum(dim=-1).clamp(min=_EPS2))  # (P,Lc,S)
+        s2d = segment_to_point[..., :2]
+        dist_2d = torch.sqrt((s2d * s2d).sum(dim=-1).clamp(min=_EPS2))
 
         start_to_end_padded = torch.cat(
             [
