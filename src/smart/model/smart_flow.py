@@ -1215,6 +1215,21 @@ class SMARTFlow(LightningModule):
                 p.requires_grad_(False)
             print(f"[{self.finetune_config.mode}] frozen reference model created from pretrained checkpoint.")
 
+        # rmm_bptt_ft: BPTT backward through 16 ODE steps can produce NaN/Inf
+        # gradients independently of the soft RMM path (e.g. exploding Jacobian,
+        # numerical instability in ODE network activations). Register nan_to_num
+        # hooks directly on trainable parameters so any NaN/Inf gradient is
+        # zeroed out regardless of where it originates.
+        if self._is_rmm_bptt_ft_enabled():
+            n_hooked = 0
+            for p in self.parameters():
+                if p.requires_grad:
+                    p.register_hook(
+                        lambda g: torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+                    )
+                    n_hooked += 1
+            log.info(f"[rmm_bptt] registered nan_to_num grad hooks on {n_hooked} trainable params")
+
     def _world_traj_to_flow_norm(
         self,
         pred_traj: Tensor,   # [n, 20, 2]  world XY at 10Hz
