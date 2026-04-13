@@ -1592,29 +1592,6 @@ class SMARTFlow(LightningModule):
         _step = int(getattr(self, "global_step", 0))
         log.info(f"[rmm] step={_step} rmm_soft={rmm_float:.4f} ema={ema_float:.4f}")
 
-        # ── 급락 탐지: rmm이 이전 EMA 보다 0.15 이상 낮으면 update skip ─────────
-        # 이런 배치는 soft RMM gradient가 폭발적으로 크거나 잘못된 시나리오일 가능성 높음.
-        # 해당 배치의 gradient를 아예 반영하지 않아 weight 손상을 방지.
-        _prev_ema = float(self._rmm_ema_mean.item()) if (
-            hasattr(self, "_rmm_ema_mean") and self._rmm_ema_initialized
-        ) else None
-        _drop_threshold = 0.15
-        if _prev_ema is not None and (rmm_float < 0.5 or rmm_float < _prev_ema - _drop_threshold):
-            log.warning(
-                f"[rmm_bptt] SKIP UPDATE: rmm_soft={rmm_float:.4f} "
-                f"(ema={_prev_ema:.4f}, threshold=drop>{_drop_threshold} or <0.5) "
-                f"at step={_step}"
-            )
-            dummy = next(p for p in self.parameters() if p.requires_grad)
-            return {
-                "loss": dummy.sum() * 0.0,
-                "train/rmm_soft": mean_rmm.detach(),
-                "train/rmm_loss": torch.tensor(0.0, device=mean_rmm.device),
-                "train/rmm_ema_mean": self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach(),
-                "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
-                "train/rmm_skip": torch.tensor(1.0, device=mean_rmm.device),
-            }
-
         # ── EMA baseline (centering only, no std division) ───────────────────
         # loss = -(rmm - ema_mean): gradient only from *deviation above baseline*.
         # Dividing by std was amplifying gradients due to small initial std.
@@ -1637,7 +1614,6 @@ class SMARTFlow(LightningModule):
             "train/rmm_loss": loss.detach(),
             "train/rmm_ema_mean": self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach(),
             "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
-            "train/rmm_skip": torch.tensor(0.0, device=mean_rmm.device),
         }
 
     def _run_kinematic_reward_ft_step(
