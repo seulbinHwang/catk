@@ -39,6 +39,9 @@ class LQRCommitBridgeConfig:
         velocity_smooth_lambda: 속도 곡선 매끈함 가중치입니다.
         curvature_smooth_lambda: 곡률 곡선 매끈함 가중치입니다.
         curvature_init_reg: 저속에서 곡률 추정이 깨지지 않게 하는 작은 값입니다.
+        reference_profile_init_mode: 미래 속도/곡률 참조를 현재 상태와 잇는 방식입니다.
+            ``"A"`` 는 현재 속도/곡률만 고정합니다.
+            ``"B"`` 는 현재 속도/곡률과 그 직전 차분까지 고정합니다.
         stop_speed_mps: 저속 종방향 제어로 넘길 기준 속도입니다.
         stop_speed_kp: 저속 종방향 비례 제어 gain입니다.
         longitudinal_q: 1초 뒤 속도 오차 가중치입니다.
@@ -58,6 +61,7 @@ class LQRCommitBridgeConfig:
     velocity_smooth_lambda: float = 1.0e-4
     curvature_smooth_lambda: float = 1.0e-2
     curvature_init_reg: float = 1.0e-10
+    reference_profile_init_mode: str = "A"
     stop_speed_mps: float = 0.2
     stop_speed_kp: float = 0.5
     longitudinal_q: float = 10.0
@@ -809,14 +813,17 @@ class ContinuousCommitBridge:
         self,
         pos_seq: torch.Tensor,
         valid_seq: torch.Tensor,
+        fixed_prefix: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """위치 시퀀스에서 batched 선형계로 매끈한 속도 곡선을 추정합니다.
 
         Args:
-            pos_seq: 현재까지 실제 이력과 미래 참조를 붙인 중심점입니다.
+            pos_seq: 연속된 위치 시퀀스입니다.
                 shape은 ``[n_agent, n_step, 2]`` 입니다.
             valid_seq: 같은 시퀀스의 유효 여부입니다.
                 shape은 ``[n_agent, n_step]`` 입니다.
+            fixed_prefix: smoothness 시작 조건으로 고정할 과거 edge 값입니다.
+                shape은 ``[n_agent, prefix_edge]`` 이고 ``prefix_edge`` 는 0, 1, 2 중 하나입니다.
 
         Returns:
             torch.Tensor: edge 기준 속도 곡선입니다.
@@ -826,28 +833,32 @@ class ContinuousCommitBridge:
         edge_valid = valid_seq[:, :-1] & valid_seq[:, 1:]
         ds_over_dt = torch.norm(pos_seq[:, 1:] - pos_seq[:, :-1], dim=-1) / dt
         edge_weight = edge_valid.to(pos_seq.dtype)
-        num_edge = ds_over_dt.shape[1]
-        eye = torch.eye(num_edge, device=pos_seq.device, dtype=pos_seq.dtype)
-        gram = self._get_difference_gram(num_edge, pos_seq.device, pos_seq.dtype)
-        system = torch.diag_embed(edge_weight) + self.config.velocity_smooth_lambda * gram.unsqueeze(0)
         rhs = edge_weight * ds_over_dt
-        return torch.linalg.solve(system + 1.0e-6 * eye.unsqueeze(0), rhs.unsqueeze(-1)).squeeze(-1)
+        return self._solve_smoothed_edge_profile(
+            diag_weight=edge_weight,
+            rhs=rhs,
+            smooth_lambda=float(self.config.velocity_smooth_lambda),
+            fixed_prefix=fixed_prefix,
+        )
 
     def _fit_smoothed_curvature_profile(
         self,
         head_seq: torch.Tensor,
         valid_seq: torch.Tensor,
         speed_profile: torch.Tensor,
+        fixed_prefix: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """방향 시퀀스와 속도 곡선에서 batched 곡률 곡선을 추정합니다.
 
         Args:
-            head_seq: 현재까지 실제 이력과 미래 참조를 붙인 방향입니다.
+            head_seq: 연속된 방향 시퀀스입니다.
                 shape은 ``[n_agent, n_step]`` 입니다.
             valid_seq: 같은 시퀀스의 유효 여부입니다.
                 shape은 ``[n_agent, n_step]`` 입니다.
             speed_profile: edge 기준 속도 곡선입니다.
                 shape은 ``[n_agent, n_step - 1]`` 입니다.
+            fixed_prefix: smoothness 시작 조건으로 고정할 과거 edge 곡률입니다.
+                shape은 ``[n_agent, prefix_edge]`` 이고 ``prefix_edge`` 는 0, 1, 2 중 하나입니다.
 
         Returns:
             torch.Tensor: edge 기준 곡률 곡선입니다.
@@ -856,19 +867,72 @@ class ContinuousCommitBridge:
         dt = float(self.config.dt)
         edge_valid = valid_seq[:, :-1] & valid_seq[:, 1:]
         yaw_rate_obs = wrap_angle(head_seq[:, 1:] - head_seq[:, :-1]) / dt
-        num_edge = speed_profile.shape[1]
-        eye = torch.eye(num_edge, device=head_seq.device, dtype=head_seq.dtype)
-        gram = self._get_difference_gram(num_edge, head_seq.device, head_seq.dtype)
         speed_abs = speed_profile.abs()
         edge_weight = edge_valid.to(head_seq.dtype)
         diag_weight = edge_weight * speed_abs.square()
         rhs = edge_weight * speed_abs * yaw_rate_obs
-        system = (
-            torch.diag_embed(diag_weight)
-            + self.config.curvature_smooth_lambda * gram.unsqueeze(0)
-            + self.config.curvature_init_reg * eye.unsqueeze(0)
+        return self._solve_smoothed_edge_profile(
+            diag_weight=diag_weight,
+            rhs=rhs,
+            smooth_lambda=float(self.config.curvature_smooth_lambda),
+            fixed_prefix=fixed_prefix,
+            diag_reg=float(self.config.curvature_init_reg),
         )
-        return torch.linalg.solve(system + 1.0e-6 * eye.unsqueeze(0), rhs.unsqueeze(-1)).squeeze(-1)
+
+    def _solve_smoothed_edge_profile(
+        self,
+        diag_weight: torch.Tensor,
+        rhs: torch.Tensor,
+        smooth_lambda: float,
+        fixed_prefix: Optional[torch.Tensor] = None,
+        diag_reg: float = 0.0,
+    ) -> torch.Tensor:
+        """고정 prefix를 경계조건으로 둘 수 있는 1차 차분 smoothing 선형계를 풉니다."""
+        num_edge = diag_weight.shape[1]
+        if num_edge == 0:
+            return rhs.new_zeros((rhs.shape[0], 0))
+
+        device = diag_weight.device
+        dtype = diag_weight.dtype
+        eye = torch.eye(num_edge, device=device, dtype=dtype)
+
+        prefix_len = 0 if fixed_prefix is None else int(fixed_prefix.shape[1])
+        if prefix_len == 0:
+            gram = self._get_difference_gram(num_edge, device, dtype)
+            system = torch.diag_embed(diag_weight) + smooth_lambda * gram.unsqueeze(0)
+            adjusted_rhs = rhs
+        else:
+            full_gram = self._get_difference_gram(prefix_len + num_edge, device, dtype)
+            gram_xx = full_gram[prefix_len:, prefix_len:]
+            gram_xp = full_gram[prefix_len:, :prefix_len]
+            system = torch.diag_embed(diag_weight) + smooth_lambda * gram_xx.unsqueeze(0)
+            prefix_term = torch.bmm(
+                gram_xp.unsqueeze(0).expand(rhs.shape[0], -1, -1),
+                fixed_prefix.unsqueeze(-1),
+            ).squeeze(-1)
+            adjusted_rhs = rhs - smooth_lambda * prefix_term
+
+        if diag_reg > 0.0:
+            system = system + diag_reg * eye.unsqueeze(0)
+        return torch.linalg.solve(system + 1.0e-6 * eye.unsqueeze(0), adjusted_rhs.unsqueeze(-1)).squeeze(-1)
+
+    def _get_reference_profile_init_mode(self) -> str:
+        mode = self.config.reference_profile_init_mode.upper()
+        if mode not in {"A", "B"}:
+            raise ValueError(f"Unsupported reference_profile_init_mode: {self.config.reference_profile_init_mode}")
+        return mode
+
+    def _build_profile_init_prefix(
+        self,
+        current_value: torch.Tensor,
+        current_rate: torch.Tensor,
+    ) -> torch.Tensor:
+        """현재 상태를 미래 edge profile의 고정 prefix로 바꿉니다."""
+        mode = self._get_reference_profile_init_mode()
+        if mode == "A":
+            return current_value.unsqueeze(1)
+        prev_value = current_value - float(self.config.dt) * current_rate
+        return torch.stack([prev_value, current_value], dim=1)
 
     def _estimate_reference_profiles(
         self,
@@ -880,7 +944,7 @@ class ContinuousCommitBridge:
         future_pos: torch.Tensor,
         future_head: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """과거 0.5초와 2초 미래를 묶어 속도/곡률 참조를 만듭니다.
+        """과거로 현재 상태를 추정하고, 미래는 그 상태에서 시작하는 참조로 만듭니다.
 
         Args:
             current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
@@ -899,6 +963,7 @@ class ContinuousCommitBridge:
                 - v_ref_horizon: 다음 1초 속도 참조 ``[n_agent, horizon]``
                 - kappa_ref_horizon: 다음 1초 곡률 참조 ``[n_agent, horizon]``
         """
+        dt = float(self.config.dt)
         history_steps = min(exec_pos_history.shape[1], int(self.config.history_steps))
         history_pos = exec_pos_history[:, -history_steps:].clone()
         history_head = exec_head_history[:, -history_steps:].clone()
@@ -907,29 +972,55 @@ class ContinuousCommitBridge:
         history_head[:, -1] = current_head
         history_valid[:, -1] = True
 
-        pos_seq = torch.cat([history_pos, future_pos], dim=1)
-        head_seq = torch.cat([history_head, future_head], dim=1)
-        valid_seq = torch.cat(
-            [history_valid, torch.ones_like(future_head, dtype=torch.bool)],
+        past_speed_profile = self._fit_smoothed_speed_profile(
+            pos_seq=history_pos,
+            valid_seq=history_valid,
+        )
+        if past_speed_profile.shape[1] >= 1:
+            v0 = past_speed_profile[:, -1].clamp_min(0.0)
+        else:
+            v0 = current_pos.new_zeros(current_pos.shape[0])
+        if past_speed_profile.shape[1] >= 2:
+            a_prev = (past_speed_profile[:, -1] - past_speed_profile[:, -2]) / dt
+        else:
+            a_prev = current_pos.new_zeros(current_pos.shape[0])
+
+        past_curvature_profile = self._fit_smoothed_curvature_profile(
+            head_seq=history_head,
+            valid_seq=history_valid,
+            speed_profile=past_speed_profile,
+        )
+        if past_curvature_profile.shape[1] >= 1:
+            kappa0 = past_curvature_profile[:, -1]
+        else:
+            kappa0 = current_head.new_zeros(current_head.shape[0])
+        if past_curvature_profile.shape[1] >= 2:
+            kappa_rate0 = (past_curvature_profile[:, -1] - past_curvature_profile[:, -2]) / dt
+        else:
+            kappa_rate0 = current_head.new_zeros(current_head.shape[0])
+
+        future_valid = torch.ones_like(future_head, dtype=torch.bool)
+        future_pos_seq = torch.cat([current_pos.unsqueeze(1), future_pos], dim=1)
+        future_head_seq = torch.cat([current_head.unsqueeze(1), future_head], dim=1)
+        future_valid_seq = torch.cat(
+            [torch.ones_like(current_head, dtype=torch.bool).unsqueeze(1), future_valid],
             dim=1,
         )
-
-        speed_profile = self._fit_smoothed_speed_profile(pos_seq=pos_seq, valid_seq=valid_seq)
-        curvature_profile = self._fit_smoothed_curvature_profile(
-            head_seq=head_seq,
-            valid_seq=valid_seq,
-            speed_profile=speed_profile,
+        future_speed_profile = self._fit_smoothed_speed_profile(
+            pos_seq=future_pos_seq,
+            valid_seq=future_valid_seq,
+            fixed_prefix=self._build_profile_init_prefix(current_value=v0, current_rate=a_prev),
         )
-        history_edge_idx = history_steps - 1
+        future_curvature_profile = self._fit_smoothed_curvature_profile(
+            head_seq=future_head_seq,
+            valid_seq=future_valid_seq,
+            speed_profile=future_speed_profile,
+            fixed_prefix=self._build_profile_init_prefix(current_value=kappa0, current_rate=kappa_rate0),
+        )
+
         horizon_steps = int(self.config.horizon_steps)
-        v0 = speed_profile[:, history_edge_idx - 1].clamp_min(0.0)
-        if history_edge_idx >= 2:
-            a_prev = (speed_profile[:, history_edge_idx - 1] - speed_profile[:, history_edge_idx - 2]) / self.config.dt
-        else:
-            a_prev = speed_profile.new_zeros(speed_profile.shape[0])
-        kappa0 = curvature_profile[:, history_edge_idx - 1]
-        v_ref_horizon = speed_profile[:, history_edge_idx : history_edge_idx + horizon_steps]
-        kappa_ref_horizon = curvature_profile[:, history_edge_idx : history_edge_idx + horizon_steps]
+        v_ref_horizon = future_speed_profile[:, :horizon_steps]
+        kappa_ref_horizon = future_curvature_profile[:, :horizon_steps]
         return v0, a_prev, kappa0, v_ref_horizon, kappa_ref_horizon
 
     def _solve_longitudinal_lqr(
