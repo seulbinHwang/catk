@@ -1537,11 +1537,6 @@ class SMARTFlow(LightningModule):
         # 한 번에 1개 rollout 만 그래프를 가지므로 피크 메모리 ≈ G 배 절감.
         # Lightning 에 반환하는 dummy loss (=0) 에 대한 backward 는 grad=0 이므로 무해.
         if sequential and G > 1:
-            # EMA baseline 은 전체 rollout 에 동일 적용 (롤아웃 전 고정)
-            _ema_baseline: Tensor | None = (
-                self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else None
-            )
-
             total_rmm_accum = 0.0
             total_count_accum = 0
 
@@ -1595,11 +1590,7 @@ class SMARTFlow(LightningModule):
                         total_rmm_accum += rmm_g.detach().item()
                         total_count_accum += 1
                         if torch.isfinite(rmm_g):
-                            partial_loss = (
-                                -(rmm_g - _ema_baseline) / G
-                                if _ema_baseline is not None
-                                else -rmm_g / G
-                            )
+                            partial_loss = -rmm_g / G
                             partial_loss.backward()
                         else:
                             log.warning(f"[rmm_bptt_ft] non-finite rmm at g={g}, skipping backward.")
@@ -1616,27 +1607,15 @@ class SMARTFlow(LightningModule):
                 dtype=torch.float32, device=agent_batch.device,
             )
             _step = int(getattr(self, "global_step", 0))
-            _ema_float = float(self._rmm_ema_mean.item()) if hasattr(self, "_rmm_ema_mean") else float("nan")
-            log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_float:.4f}")
+            log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f}")
 
-            _ema_mom = 0.98
-            rmm_val = mean_rmm.detach()
-            if hasattr(self, "_rmm_ema_mean"):
-                if not self._rmm_ema_initialized:
-                    self._rmm_ema_mean.fill_(rmm_val.item())
-                    self._rmm_ema_initialized = True
-                else:
-                    self._rmm_ema_mean = _ema_mom * self._rmm_ema_mean + (1 - _ema_mom) * rmm_val
-
-            _ema_for_log = self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm
             # DDP: 모든 trainable param 을 dummy loss graph 에 연결해야 bucket reducer 가 정상 작동.
             # manual backward 로 grad 는 이미 누적됐으므로 backward() 추가 기여는 0.
             _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
             return {
                 "loss": _ddp_dummy,   # grads already accumulated via manual backward
                 "train/rmm_soft": mean_rmm,
-                "train/rmm_loss": -(mean_rmm - _ema_for_log),
-                "train/rmm_ema_mean": _ema_for_log,
+                "train/rmm_loss": -mean_rmm,
                 "train/rmm_n_scenarios": torch.tensor(float(total_count_accum), device=mean_rmm.device),
             }
 
@@ -1709,28 +1688,14 @@ class SMARTFlow(LightningModule):
             log.warning(f"[rmm_bptt_ft] Non-finite mean_rmm={mean_rmm.item():.4f}, skipping update.")
             return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
 
-        rmm_float = mean_rmm.item()
-        ema_float = float(self._rmm_ema_mean.item()) if hasattr(self, "_rmm_ema_mean") else float("nan")
         _step = int(getattr(self, "global_step", 0))
-        log.info(f"[rmm] step={_step} rmm_soft={rmm_float:.4f} ema={ema_float:.4f}")
+        log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f}")
 
-        _ema_mom = 0.98
-        rmm_val = mean_rmm.detach()
-        if hasattr(self, "_rmm_ema_mean"):
-            if not self._rmm_ema_initialized:
-                self._rmm_ema_mean.fill_(rmm_val.item())
-                self._rmm_ema_initialized = True
-            else:
-                self._rmm_ema_mean = _ema_mom * self._rmm_ema_mean + (1 - _ema_mom) * rmm_val
-            loss = -(mean_rmm - self._rmm_ema_mean.detach())
-        else:
-            loss = -mean_rmm
-
+        loss = -mean_rmm
         return {
             "loss": loss,
             "train/rmm_soft": mean_rmm.detach(),
             "train/rmm_loss": loss.detach(),
-            "train/rmm_ema_mean": self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach(),
             "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
         }
 
