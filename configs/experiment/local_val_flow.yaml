@@ -9,7 +9,7 @@ model:
     n_vis_scenario: 0
     n_vis_rollout: 0
     n_batch_sim_agents_metric: 100
-    val_open_loop: true
+    val_open_loop: false
     val_closed_loop: true
     n_rollout_closed_val: 32
     eval_sampling_noise:
@@ -26,9 +26,9 @@ trainer:
   gradient_clip_val: 5.0
 
 data:
-  train_batch_size: 4
-  val_batch_size: 4
-  test_batch_size: 4
+  train_batch_size: 20
+  val_batch_size: 16
+  test_batch_size: 16
   num_workers: 4
 
 action: validate
