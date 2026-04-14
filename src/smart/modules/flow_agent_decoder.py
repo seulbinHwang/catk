@@ -292,8 +292,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """closed-loop 첫 block에서 쓸 최근 fine 실행 상태 2개를 준비합니다.
 
-        우선 10Hz 실제 history 마지막 두 점을 그대로 쓰고,
-        그 정보가 없으면 현재 coarse 창의 마지막 두 상태를 fallback으로 씁니다.
+        rollout 시작 직전 fine 10Hz history의 마지막 두 점을 그대로 씁니다.
 
         Args:
             tokenized_agent: 평가용 토큰 사전입니다.
@@ -307,47 +306,23 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 - exec_valid_pair: 최근 fine 상태 유효 여부입니다.
                   shape은 ``[n_agent, 2]`` 입니다.
         """
-        if all(
-            key in tokenized_agent
-            for key in [
-                "rollout_init_fine_pos_history",
-                "rollout_init_fine_head_history",
-                "rollout_init_fine_valid_history",
-            ]
-        ):
-            return (
-                tokenized_agent["rollout_init_fine_pos_history"][:, -2:].clone(),
-                tokenized_agent["rollout_init_fine_head_history"][:, -2:].clone(),
-                tokenized_agent["rollout_init_fine_valid_history"][:, -2:].clone(),
-            )
-        if all(
-            key in tokenized_agent
-            for key in [
-                "rollout_init_fine_pos_pair",
-                "rollout_init_fine_head_pair",
-                "rollout_init_fine_valid_pair",
-            ]
-        ):
-            return (
-                tokenized_agent["rollout_init_fine_pos_pair"].clone(),
-                tokenized_agent["rollout_init_fine_head_pair"].clone(),
-                tokenized_agent["rollout_init_fine_valid_pair"].clone(),
+        required_keys = [
+            "rollout_init_fine_pos_history",
+            "rollout_init_fine_head_history",
+            "rollout_init_fine_valid_history",
+        ]
+        missing_keys = [key for key in required_keys if key not in tokenized_agent]
+        if missing_keys:
+            raise KeyError(
+                "_build_initial_exec_state_pair requires rollout_init_fine_*_history in "
+                f"tokenized_agent, missing keys: {missing_keys}"
             )
 
-        coarse_pos = tokenized_agent["gt_pos"]
-        coarse_head = tokenized_agent["gt_heading"]
-        coarse_valid = tokenized_agent["valid_mask"]
-        if coarse_pos.shape[1] >= 2:
-            return (
-                coarse_pos[:, -2:].clone(),
-                coarse_head[:, -2:].clone(),
-                coarse_valid[:, -2:].clone(),
-            )
-
-        exec_pos_pair = torch.cat([coarse_pos[:, -1:], coarse_pos[:, -1:]], dim=1)
-        exec_head_pair = torch.cat([coarse_head[:, -1:], coarse_head[:, -1:]], dim=1)
-        exec_valid_pair = torch.cat([coarse_valid[:, -1:], coarse_valid[:, -1:]], dim=1)
-        return exec_pos_pair, exec_head_pair, exec_valid_pair
+        return (
+            tokenized_agent["rollout_init_fine_pos_history"][:, -2:].clone(),
+            tokenized_agent["rollout_init_fine_head_history"][:, -2:].clone(),
+            tokenized_agent["rollout_init_fine_valid_history"][:, -2:].clone(),
+        )
 
     def _pack_anchor_hidden(
         self,

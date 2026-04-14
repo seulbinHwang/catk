@@ -973,7 +973,7 @@ class ContinuousCommitBridge:
         history_valid[:, -1] = True
 
         past_speed_profile = self._fit_smoothed_speed_profile(
-            pos_seq=history_pos,
+            pos_seq=history_pos, # shape: (
             valid_seq=history_valid,
         )
         if past_speed_profile.shape[1] >= 1:

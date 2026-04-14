@@ -270,7 +270,8 @@ class TokenProcessor(torch.nn.Module):
         현재 semi-continuous closed-loop는 raw step 10을 현재 coarse 시점으로 씁니다.
         그래서 raw step 5~10 전체를 그대로 넘기면, 현재 시점과 직전 0.5초 실제
         실행 이력을 함께 사용할 수 있습니다. 기록 길이가 부족하면 가장 앞 상태를
-        반복해 길이를 6으로 맞춥니다.
+        반복해 길이를 6으로 맞추되, 패딩된 prefix는 실제 관측이 아니므로 valid를
+        False로 둡니다.
 
         Args:
             valid: 전체 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
@@ -296,7 +297,11 @@ class TokenProcessor(torch.nn.Module):
         pad_len = history_len - pos_history.shape[1]
         pos_pad = pos_history[:, :1].expand(-1, pad_len, -1)
         head_pad = head_history[:, :1].expand(-1, pad_len)
-        valid_pad = valid_history[:, :1].expand(-1, pad_len)
+        valid_pad = torch.zeros(
+            (valid_history.shape[0], pad_len),
+            dtype=valid_history.dtype,
+            device=valid_history.device,
+        )
         return (
             torch.cat([pos_pad, pos_history], dim=1),
             torch.cat([head_pad, head_history], dim=1),

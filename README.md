@@ -59,6 +59,9 @@
 - LQR 참조 생성은 이제 `과거+미래`를 한 번에 smooth fitting 하지 않습니다.
   먼저 과거 0.5초 실제 history만으로 현재 `speed / accel / curvature / curvature-rate`를 추정하고,
   그다음 미래 FM trajectory로부터 future speed / curvature reference를 따로 만듭니다.
+- 이 초기 past history(`rollout_init_fine_*_history`)는 rollout 시작 직전의 raw 10Hz 최근 6개 상태를 씁니다.
+  과거 길이가 부족하면 `pos / head`는 맨 앞 상태를 반복해 길이를 맞추고, 부족한 prefix의 `valid`는 `False`로 둬
+  LQR 초기 상태 추정이 패딩을 실제 관측으로 오해하지 않게 합니다.
 - `model.model_config.decoder.lqr_commit.reference_profile_init_mode=A|B` 로
   미래 reference의 시작 경계조건을 바꿀 수 있습니다.
   `A`는 현재 `speed / curvature`만 anchor로 쓰고,
