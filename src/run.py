@@ -11,7 +11,9 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import logging
 import pickle
+import warnings
 from typing import List
 
 import hydra
@@ -32,6 +34,15 @@ from src.utils import (
 )
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+# PyTorch FX symbolic_shapes: "not in var_ranges ... unknown range" 는 학습에 무해한 INFO성 경고가
+# logging WARNING 으로 과다 출력됨 (rmm_bptt / torch.compile 경로).
+logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(logging.ERROR)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"torch.utils.checkpoint",
+)
 
 torch.set_float32_matmul_precision("high")
 

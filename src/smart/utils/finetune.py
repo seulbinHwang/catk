@@ -83,6 +83,13 @@ class FinetuneConfig:
     bptt_grad_clip_traj: float = 1.0
     #: True → _compute_soft_rmm 에서 sim_features 극값과 per-metric likelihood 를 WARNING 로 출력.
     bptt_debug: bool = False
+    #: True → G rollout 을 병렬 배치 expand 대신 순차로 실행한 뒤 각각 즉시 backward.
+    #: 피크 메모리를 약 G 배 줄이는 대신 G 배 더 느려짐. precision=32-true 에서만 안전.
+    bptt_sequential_rollouts: bool = True
+    #: 앞 N coarse step 을 no_grad 로 실행 후 상태를 detach 해 sliding-window BPTT 를 구현합니다.
+    #: 0 이하면 비활성 (모든 coarse step 이 gradient 를 받음).
+    #: 예: bptt_max_coarse_steps=16, bptt_warm_coarse_steps=12 → 마지막 4 step 만 gradient.
+    bptt_warm_coarse_steps: int = 0
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -175,6 +182,8 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         bptt_max_coarse_steps=None if _bptt_max_cs_raw is None else int(_bptt_max_cs_raw),
         bptt_grad_clip_traj=float(_read_config_value(finetune, "bptt_grad_clip_traj", 1.0)),
         bptt_debug=bool(_read_config_value(finetune, "bptt_debug", False)),
+        bptt_sequential_rollouts=bool(_read_config_value(finetune, "bptt_sequential_rollouts", True)),
+        bptt_warm_coarse_steps=int(_read_config_value(finetune, "bptt_warm_coarse_steps", 0)),
     )
 
 

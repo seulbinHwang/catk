@@ -148,6 +148,7 @@ class SMARTFlowDecoder(nn.Module):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
         max_steps: int | None = None,
+        warm_coarse_steps: int = 0,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
@@ -157,6 +158,7 @@ class SMARTFlowDecoder(nn.Module):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             max_steps=max_steps,
+            warm_coarse_steps=warm_coarse_steps,
         )
 
     def rollout_from_cache_no_grad(

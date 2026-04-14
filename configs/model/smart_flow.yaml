@@ -9,6 +9,10 @@ model_config:
   n_rollout_closed_val: 8
   n_batch_sim_agents_metric: 10
   sim_agents_metric_workers: 3
+  # "real": 공식 TF SimAgents RMM (subprocess, 정확), "hard": PyTorch hard RMM (인-프로세스, 빠름)
+  validation_metric: "real"
+  # true 시 dno/ttc/d_road 커널을 torch.compile 로 최적화 (WOSAC_TORCH_COMPILE=1 env 세팅)
+  wosac_torch_compile: false
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0

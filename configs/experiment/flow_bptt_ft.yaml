@@ -18,6 +18,9 @@ model:
     n_rollout_closed_val: 16
     # validation 시 official SimAgents RMM (CPU 풀) + 비디오: batch_idx < n_vis_batch 일 때만
     n_batch_sim_agents_metric: 10
+    # hard: PyTorch 인-프로세스 RMM — subprocess 없어 훨씬 빠름 (값은 real과 동등)
+    validation_metric: hard
+    wosac_torch_compile: true
     n_vis_batch: 1
     n_vis_scenario: 2
     n_vis_rollout: 4
@@ -46,6 +49,12 @@ model:
       bptt_grad_clip_traj: 1.0
       # true: sim_features 극값과 per-metric likelihood 를 WARNING 로 출력 (디버깅용)
       bptt_debug: false
+      # true: G rollout 을 순차 실행해 각각 즉시 backward → 피크 메모리 ≈ G 배 절감.
+      # precision=32-true 에서만 안전. G=1 이면 효과 없음.
+      bptt_sequential_rollouts: true
+      # 앞 N coarse step 을 no_grad + detach (sliding-window BPTT).
+      # 0 이하 = 비활성. 예: 12 → 마지막 4 step (bptt_max_coarse_steps=16 기준) 만 gradient.
+      bptt_warm_coarse_steps: 0
 
 ckpt_path: null
 

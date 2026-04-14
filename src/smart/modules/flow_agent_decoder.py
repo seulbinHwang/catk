@@ -721,6 +721,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         max_steps: int | None = None,
+        warm_coarse_steps: int = 0,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -734,6 +735,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_scenario]`` 입니다.
             max_steps: 실행할 coarse step 상한입니다. None이면 n_step_future_2hz 전체.
                 예: 3이면 3 coarse step(10Hz는 shift×3)만 예측하며 해당 구간 전체 역전파.
+            warm_coarse_steps: 앞 N coarse step 을 no_grad 로 실행한 뒤 상태를 detach 합니다.
+                0 이하면 비활성. sliding-window BPTT: 전체 궤적을 유지하면서 마지막
+                ``max_steps - warm_coarse_steps`` 개 coarse step 에만 gradient 를 흘립니다.
 
         Returns:
             Dict[str, torch.Tensor]:
@@ -818,7 +822,28 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         else:
             delta_state = None
 
+        _warm = max(0, int(warm_coarse_steps))
+        # Sliding-window BPTT: 앞 _warm coarse step 을 no_grad 로 실행 후 detach.
+        # torch.set_grad_enabled 을 이용해 루프 바디 인덴테이션을 유지합니다.
+        _grad_was_enabled = torch.is_grad_enabled()
+
         for t in range(n_step_future_2hz):
+            # Warm region 진입
+            if t == 0 and _warm > 0:
+                torch.set_grad_enabled(False)
+            # Warm/grad 경계: grad 재활성 + 상태 detach
+            elif _warm > 0 and t == _warm:
+                torch.set_grad_enabled(_grad_was_enabled)
+                pos_window = pos_window.detach()
+                head_window = head_window.detach()
+                head_vector_window = head_vector_window.detach()
+                feat_a = feat_a.detach()
+                feat_a_t_dict = {k: v.detach() for k, v in feat_a_t_dict.items()}
+                agent_token_emb = agent_token_emb.detach()
+                if v_state is not None:
+                    v_state = v_state.detach()
+                if delta_state is not None:
+                    delta_state = delta_state.detach()
             n_step = pos_window.shape[1]
             if t == 0:
                 current_hidden = feat_a_now
@@ -1007,6 +1032,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 feat_a = feat_a[:, -max_context_steps:]
                 for key in feat_a_t_dict:
                     feat_a_t_dict[key] = feat_a_t_dict[key][:, -max_context_steps:]
+
+        # warm region 이 전체 step 을 덮는 경우 (max_steps <= _warm) grad 상태 복원
+        if _warm > 0 and not torch.is_grad_enabled():
+            torch.set_grad_enabled(_grad_was_enabled)
 
         pred_traj_10hz = torch.cat(pred_traj_10hz_chunks, dim=1)
         pred_head_10hz = torch.cat(pred_head_10hz_chunks, dim=1)

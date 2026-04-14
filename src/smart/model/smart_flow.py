@@ -15,7 +15,7 @@ from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 import torch.nn.functional as F
 
-from src.smart.metrics import SimAgentsMetrics, SimAgentsSubmission, minADE
+from src.smart.metrics import HardSimAgentsMetrics, SimAgentsMetrics, SimAgentsSubmission, minADE
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_2s,
@@ -139,16 +139,22 @@ class SMARTFlow(LightningModule):
                 # ODE → KinematicProjection → FM target; 별도 loss 모듈 불필요.
                 pass
             elif self.finetune_config.mode == "rmm_bptt_ft":
-                # RMM BPTT: Reward-Weighted Regression with BPTT.
                 pass
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
 
         self.minADE = minADE()
-        self.sim_agents_metrics = SimAgentsMetrics(
-            "val_closed",
-            max_workers=model_config.sim_agents_metric_workers,
-        )
+        if bool(getattr(model_config, "wosac_torch_compile", False)):
+            os.environ["WOSAC_TORCH_COMPILE"] = "1"
+
+        _validation_metric = str(getattr(model_config, "validation_metric", "real")).lower()
+        if _validation_metric == "hard":
+            self.sim_agents_metrics = HardSimAgentsMetrics("val_closed")
+        else:
+            self.sim_agents_metrics = SimAgentsMetrics(
+                "val_closed",
+                max_workers=model_config.sim_agents_metric_workers,
+            )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
@@ -820,6 +826,7 @@ class SMARTFlow(LightningModule):
         return_anchor_hidden: bool = False,
         full_grad: bool = False,
         max_steps: int | None = None,
+        warm_coarse_steps: int = 0,
     ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
@@ -856,6 +863,7 @@ class SMARTFlow(LightningModule):
                     sampling_noise=self.eval_sampling_noise,
                     scenario_sampling_seeds=scenario_sampling_seeds,
                     max_steps=max_steps,
+                    warm_coarse_steps=warm_coarse_steps,
                 )
             else:
                 pred = self.encoder.rollout_from_cache_no_grad(
@@ -903,6 +911,7 @@ class SMARTFlow(LightningModule):
                 sampling_noise=self.eval_sampling_noise,
                 scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
                 max_steps=max_steps,
+                warm_coarse_steps=warm_coarse_steps,
             )
         else:
             pred = self.encoder.rollout_from_cache_no_grad(
@@ -1377,17 +1386,14 @@ class SMARTFlow(LightningModule):
         """Flow-BPTT fine-tuning step.
 
         Closed-loop coarse rollout 후 soft RMM으로 미분 가능한 점수를 내고 gradient ascent 합니다.
-        ``finetune.bptt_max_coarse_steps``: ``None`` 또는 0 이하면 ``n_step_future_2hz`` 전체(보통 16);
-        양수면 그 coarse step 수만큼만 rollout·역전파(해당 구간 **전체**에 대해 연쇄 역전파).
 
-        Algorithm:
-            1. Encode map (no_grad).
-            2. Build rollout cache from GT initial state (no_grad).
-            3. Rollout ``max_steps=bptt_max_coarse_steps`` (또는 전체).
-            4. Soft RMM (예측 길이에 맞게 GT log feature 슬라이스).
-            5. loss = -(mean_rmm - ema_mean).
+        메모리 절감 옵션:
+          - ``bptt_sequential_rollouts=True`` (기본): G rollout 을 1개씩 순차 실행 후 각각 즉시
+            backward 해 computation graph 를 즉시 해제. 피크 메모리 ≈ G 배 절감.
+          - ``bptt_warm_coarse_steps=N``: 앞 N coarse step 을 no_grad + detach (sliding BPTT).
+          - ``bptt_use_adjoint=True``: ODE velocity head 내부 checkpoint (activation 절감).
+          - ``bptt_max_coarse_steps=K``: coarse step 수 상한 (짧을수록 graph 작아짐).
         """
-        flow_decoder = self.encoder.agent_encoder.flow_decoder
         G = int(getattr(self.finetune_config, "bptt_n_rollouts", 1))
         _bmc_raw = getattr(self.finetune_config, "bptt_max_coarse_steps", None)
         if _bmc_raw is None:
@@ -1396,71 +1402,30 @@ class SMARTFlow(LightningModule):
             _n = int(_bmc_raw)
             bptt_max_coarse_steps = None if _n <= 0 else _n
         use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
+        sequential = bool(getattr(self.finetune_config, "bptt_sequential_rollouts", True))
+        warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
+        _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
+        _dbg_enabled = bool(getattr(self.finetune_config, "bptt_debug", False))
 
         # ── 1. Encode map (no_grad; encoder frozen) ─────────────────────────
         with torch.no_grad():
             map_feature = self.encoder.encode_map(tokenized_map)
 
-        # ── 2. Build rollout cache from GT initial state (no_grad) ───────────
-        rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-        )
-
-        # ── 3. Rollout (10Hz 길이 = coarse 수 × shift; ``max_steps`` 로 coarse 수 상한) ──
-        # use_adjoint=True → 각 flow_ode.generate() 가 torch.utils.checkpoint (OD 이산 adjoint).
-        flow_ode = self.encoder.agent_encoder.flow_ode
-        flow_ode.use_adjoint_for_bptt = use_adjoint
-        try:
-            pred_traj, pred_z, pred_head_traj, _ = (
-                self._run_parallel_rollout_chunk(
-                    data=data,
-                    tokenized_agent=tokenized_agent,
-                    map_feature=map_feature,
-                    rollout_cache=rollout_cache,
-                    rollout_indices=list(range(G)),
-                    return_anchor_hidden=True,
-                    full_grad=True,
-                    max_steps=bptt_max_coarse_steps,
-                )
+        # ── 2. Build rollout cache (no_grad; cache 초기화는 gradient 불필요) ─
+        with torch.no_grad():
+            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
             )
-        finally:
-            flow_ode.use_adjoint_for_bptt = False  # always reset
-        # pred_traj: [n_agents, G, T_10hz, 2] — ``T_10hz`` 는 coarse 수 × ``shift`` (≤ 80)
-
-        # ── Gradient hook: pred_traj 에서 역전파되는 gradient norm 을 제한 ──────
-        # element-wise clamp(±v) 는 norm 상한이 v×√(numel) 이라 파라미터 grad norm 이
-        # 여전히 수십~수백으로 커질 수 있음. 대신 L2 norm clip 을 사용:
-        #   g_clipped = g * min(1, max_norm / ||g||)
-        # 이렇게 하면 pred_traj 로 흘러오는 gradient L2 norm 이 max_norm 으로 bound 됨.
-        # NaN/Inf 는 nan_to_num 으로 먼저 제거.
-        _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
-
-        def _make_norm_clip_hook(max_norm: float):
-            def _hook(g: Tensor) -> Tensor:
-                g = torch.nan_to_num(g, nan=0.0, posinf=max_norm, neginf=-max_norm)
-                g_norm = g.norm()
-                if g_norm > max_norm:
-                    g = g * (max_norm / g_norm)
-                return g
-            return _hook
-
-        if pred_traj.requires_grad and _grad_clip_traj > 0:
-            pred_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
-        if pred_head_traj.requires_grad and _grad_clip_traj > 0:
-            pred_head_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
 
         agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
 
+        # ── 3. 데이터 검증 ──────────────────────────────────────────────────
         if data is None:
             raise ValueError("flow_bptt_ft requires `data` dict with scenario metadata.")
         if "tfrecord_path" not in data or "scenario_id" not in data:
             raise KeyError("flow_bptt_ft requires data['tfrecord_path'] and data['scenario_id'].")
-        # IMPORTANT: soft RMM의 object_id는 rollout agent 순서와 정확히 일치해야 합니다.
-        # 허용 소스:
-        #   1) data["agent"]["id"]  (HeteroData 정석)
-        #   2) data["id"]           (collate된 top-level agent id)
-        # 그 외 fallback은 금지합니다.
+        # IMPORTANT: soft RMM 의 object_id 는 rollout agent 순서와 정확히 일치해야 합니다.
         agent_ids = None
         try:
             agent_ids = data["agent"]["id"]
@@ -1489,7 +1454,7 @@ class SMARTFlow(LightningModule):
                 f"tfrecord_path length {len(tfrecord_paths)} != scenario_id length {n_scenarios}"
             )
 
-        # Load Waymo metric config once (textproto → pb2).
+        # ── Waymo metric config (once per process) ───────────────────────────
         if not hasattr(self, "_soft_rmm_waymo_cfg") or self._soft_rmm_waymo_cfg is None:
             from google.protobuf import text_format
             import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as wm_metrics
@@ -1502,10 +1467,7 @@ class SMARTFlow(LightningModule):
             self._soft_rmm_waymo_cfg = cfg
         cfg = self._soft_rmm_waymo_cfg
 
-        # GT log 분포: 시나리오 트랙의 full 미래로만 계산한다 (짧은 rollout 예측으로 joint를 만들면
-        # compute_metric_features 단계에서 시간축 불일치로 실패할 수 있음).
         from waymo_open_dataset.utils.sim_agents import submission_specs
-
         from src.smart.metrics.wosac_metric_features_torch.metric_features_torch import (
             compute_metric_features,
             scenario_to_joint_scene,
@@ -1514,15 +1476,24 @@ class SMARTFlow(LightningModule):
 
         _sim_agents_challenge = submission_specs.ChallengeType.SIM_AGENTS
 
-        total_rmm = pred_traj.new_zeros((), dtype=torch.float32)
-        total_count = 0
+        # ── 4. TFRecord & log-feature 사전 로드 (모든 rollout 에서 공유) ─────
+        # 예측 지평선 T_hor 사전 계산 (coarse_steps × shift = 10Hz steps)
+        _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
+        _n_coarse = bptt_max_coarse_steps if bptt_max_coarse_steps is not None else 16
+        _t_hor_pre = _n_coarse * _shift
 
+        _sc_scenarios: list = []
+        _sc_log_feat_dicts: list = []
+        _sc_masks: list = []
+        _sc_agent_ids: list = []
         for sc_idx in range(n_scenarios):
             sc_mask = (agent_batch == sc_idx)
+            _sc_masks.append(sc_mask)
             if not bool(sc_mask.any()):
+                _sc_scenarios.append(None)
+                _sc_log_feat_dicts.append(None)
+                _sc_agent_ids.append(None)
                 continue
-
-            # Parse scenario proto from TFRecord (CPU).
             scenario = scenario_pb2.Scenario()
             for tfdata in tf.data.TFRecordDataset([tfrecord_paths[sc_idx]], compression_type=""):
                 scenario.ParseFromString(bytes(tfdata.numpy()))
@@ -1535,82 +1506,214 @@ class SMARTFlow(LightningModule):
                     f"batch='{batch_scenario_id}' vs tfrecord='{tfrecord_scenario_id}'. "
                     f"path='{tfrecord_paths[sc_idx]}'"
                 )
-
-            sc_agent_ids = agent_ids[sc_mask]
-            sc_pred_traj = pred_traj[sc_mask]       # [A_sc, G, T, 2]
-            sc_pred_z = pred_z[sc_mask]             # [A_sc, G, T]
-            sc_pred_head = pred_head_traj[sc_mask]  # [A_sc, G, T]
-
-            # log features: 시나리오 GT 기반 joint (full simulation steps) 한 번만 계산.
             with torch.no_grad():
                 log_joint = scenario_to_joint_scene(scenario, _sim_agents_challenge)
                 log_feat = compute_metric_features(
-                    scenario,
-                    log_joint,
-                    challenge_type=_sim_agents_challenge,
-                    use_log_validity=True,
+                    scenario, log_joint,
+                    challenge_type=_sim_agents_challenge, use_log_validity=True,
                 )
-                log_feat_dict = {k: v.to(device=sc_pred_traj.device) for k, v in log_feat.as_dict().items()}
-                _t_hor = int(sc_pred_traj.shape[2])
-                log_feat_dict = _slice_log_feat_dict_to_pred_horizon(log_feat_dict, _t_hor)
+                log_feat_dict = {
+                    k: v.to(device=agent_batch.device)
+                    for k, v in log_feat.as_dict().items()
+                }
+                log_feat_dict = _slice_log_feat_dict_to_pred_horizon(log_feat_dict, _t_hor_pre)
+            _sc_scenarios.append(scenario)
+            _sc_log_feat_dicts.append(log_feat_dict)
+            _sc_agent_ids.append(agent_ids[sc_mask])
 
-            # 예측과 같은 ``T`` — 해당 구간 모두 유효
-            valid = sc_pred_traj.new_ones(sc_pred_traj.shape[0], sc_pred_traj.shape[2], dtype=torch.bool)
+        # ── norm-clip hook helper ────────────────────────────────────────────
+        def _make_norm_clip_hook(max_norm: float):
+            def _hook(g: Tensor) -> Tensor:
+                g = torch.nan_to_num(g, nan=0.0, posinf=max_norm, neginf=-max_norm)
+                g_norm = g.norm()
+                if g_norm > max_norm:
+                    g = g * (max_norm / g_norm)
+                return g
+            return _hook
 
-            # rollout별 soft RMM을 계산해 평균 (시나리오별로 동일 가중)
-            # debug: 첫 번째 rollout g=0에서 per-metric 출력
-            _dbg_enabled = (
-                bool(getattr(self.finetune_config, "bptt_debug", False))
-                and sc_idx == 0
+        flow_ode = self.encoder.agent_encoder.flow_ode
+
+        # ── 5a. 순차 rollout 모드 (G > 1 이고 sequential=True) ───────────────
+        # 한 번에 1개 rollout 만 그래프를 가지므로 피크 메모리 ≈ G 배 절감.
+        # Lightning 에 반환하는 dummy loss (=0) 에 대한 backward 는 grad=0 이므로 무해.
+        if sequential and G > 1:
+            # EMA baseline 은 전체 rollout 에 동일 적용 (롤아웃 전 고정)
+            _ema_baseline: Tensor | None = (
+                self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else None
+            )
+
+            total_rmm_accum = 0.0
+            total_count_accum = 0
+
+            flow_ode.use_adjoint_for_bptt = use_adjoint
+            try:
+                for g in range(G):
+                    pred_traj_g, pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
+                        data=data,
+                        tokenized_agent=tokenized_agent,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache,
+                        rollout_indices=[g],
+                        return_anchor_hidden=True,
+                        full_grad=True,
+                        max_steps=bptt_max_coarse_steps,
+                        warm_coarse_steps=warm_coarse,
+                    )
+                    # pred_traj_g: [n_agents, 1, T, 2]
+
+                    if pred_traj_g.requires_grad and _grad_clip_traj > 0:
+                        pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip_traj))
+                    if pred_head_g.requires_grad and _grad_clip_traj > 0:
+                        pred_head_g.register_hook(_make_norm_clip_hook(_grad_clip_traj))
+
+                    total_rmm_g = pred_traj_g.new_zeros((), dtype=torch.float32)
+                    count_g = 0
+                    for sc_idx in range(n_scenarios):
+                        if _sc_scenarios[sc_idx] is None:
+                            continue
+                        sc_pt = pred_traj_g[_sc_masks[sc_idx], 0, :, :]  # [A, T, 2]
+                        sc_pz = pred_z_g[_sc_masks[sc_idx], 0, :]
+                        sc_ph = pred_head_g[_sc_masks[sc_idx], 0, :]
+                        valid_sc = sc_pt.new_ones(sc_pt.shape[0], sc_pt.shape[1], dtype=torch.bool)
+                        res = self._compute_soft_rmm(
+                            scenario=_sc_scenarios[sc_idx],
+                            x=sc_pt[:, :, 0],
+                            y=sc_pt[:, :, 1],
+                            z=sc_pz,
+                            head=sc_ph,
+                            agent_ids=_sc_agent_ids[sc_idx],
+                            valid=valid_sc,
+                            log_feat_dict=_sc_log_feat_dicts[sc_idx],
+                            config=cfg,
+                            debug=(_dbg_enabled and g == 0 and sc_idx == 0),
+                        )
+                        total_rmm_g = total_rmm_g + res.metametric
+                        count_g += 1
+
+                    if count_g > 0:
+                        rmm_g = total_rmm_g / float(count_g)
+                        total_rmm_accum += rmm_g.detach().item()
+                        total_count_accum += 1
+                        if torch.isfinite(rmm_g):
+                            partial_loss = (
+                                -(rmm_g - _ema_baseline) / G
+                                if _ema_baseline is not None
+                                else -rmm_g / G
+                            )
+                            partial_loss.backward()
+                        else:
+                            log.warning(f"[rmm_bptt_ft] non-finite rmm at g={g}, skipping backward.")
+
+                    del pred_traj_g, pred_z_g, pred_head_g
+            finally:
+                flow_ode.use_adjoint_for_bptt = False
+
+            if total_count_accum == 0:
+                return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
+
+            mean_rmm = torch.tensor(
+                total_rmm_accum / total_count_accum,
+                dtype=torch.float32, device=agent_batch.device,
+            )
+            _step = int(getattr(self, "global_step", 0))
+            _ema_float = float(self._rmm_ema_mean.item()) if hasattr(self, "_rmm_ema_mean") else float("nan")
+            log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_float:.4f}")
+
+            _ema_mom = 0.98
+            rmm_val = mean_rmm.detach()
+            if hasattr(self, "_rmm_ema_mean"):
+                if not self._rmm_ema_initialized:
+                    self._rmm_ema_mean.fill_(rmm_val.item())
+                    self._rmm_ema_initialized = True
+                else:
+                    self._rmm_ema_mean = _ema_mom * self._rmm_ema_mean + (1 - _ema_mom) * rmm_val
+
+            _ema_for_log = self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm
+            # DDP: 모든 trainable param 을 dummy loss graph 에 연결해야 bucket reducer 가 정상 작동.
+            # manual backward 로 grad 는 이미 누적됐으므로 backward() 추가 기여는 0.
+            _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
+            return {
+                "loss": _ddp_dummy,   # grads already accumulated via manual backward
+                "train/rmm_soft": mean_rmm,
+                "train/rmm_loss": -(mean_rmm - _ema_for_log),
+                "train/rmm_ema_mean": _ema_for_log,
+                "train/rmm_n_scenarios": torch.tensor(float(total_count_accum), device=mean_rmm.device),
+            }
+
+        # ── 5b. 병렬 rollout 모드 (G=1 또는 sequential=False) ────────────────
+        flow_ode.use_adjoint_for_bptt = use_adjoint
+        try:
+            pred_traj, pred_z, pred_head_traj, _ = (
+                self._run_parallel_rollout_chunk(
+                    data=data,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    rollout_cache=rollout_cache,
+                    rollout_indices=list(range(G)),
+                    return_anchor_hidden=True,
+                    full_grad=True,
+                    max_steps=bptt_max_coarse_steps,
+                    warm_coarse_steps=warm_coarse,
+                )
+            )
+        finally:
+            flow_ode.use_adjoint_for_bptt = False
+
+        if pred_traj.requires_grad and _grad_clip_traj > 0:
+            pred_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
+        if pred_head_traj.requires_grad and _grad_clip_traj > 0:
+            pred_head_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
+
+        total_rmm = pred_traj.new_zeros((), dtype=torch.float32)
+        total_count = 0
+
+        for sc_idx in range(n_scenarios):
+            if _sc_scenarios[sc_idx] is None:
+                continue
+            sc_pred_traj = pred_traj[_sc_masks[sc_idx]]        # [A_sc, G, T, 2]
+            sc_pred_z = pred_z[_sc_masks[sc_idx]]
+            sc_pred_head = pred_head_traj[_sc_masks[sc_idx]]
+            valid = sc_pred_traj.new_ones(
+                sc_pred_traj.shape[0], sc_pred_traj.shape[2], dtype=torch.bool
             )
             rmm_roll = []
             for g in range(int(sc_pred_traj.shape[1])):
                 res_g = self._compute_soft_rmm(
-                    scenario=scenario,
+                    scenario=_sc_scenarios[sc_idx],
                     x=sc_pred_traj[:, g, :, 0],
                     y=sc_pred_traj[:, g, :, 1],
                     z=sc_pred_z[:, g, :],
                     head=sc_pred_head[:, g, :],
-                    agent_ids=sc_agent_ids,
+                    agent_ids=_sc_agent_ids[sc_idx],
                     valid=valid,
-                    log_feat_dict=log_feat_dict,
+                    log_feat_dict=_sc_log_feat_dicts[sc_idx],
                     config=cfg,
-                    debug=(_dbg_enabled and g == 0),
+                    debug=(_dbg_enabled and g == 0 and sc_idx == 0),
                 )
                 rmm_roll.append(res_g.metametric)
-
-                # per-metric grad norm: debug 시 retain_grad
-                if _dbg_enabled and g == 0:
+                if _dbg_enabled and g == 0 and sc_idx == 0:
                     for fn, lik in res_g.likelihoods.items():
                         if lik.requires_grad:
                             lik.retain_grad()
 
-            rmm_sc = torch.stack(rmm_roll).mean()  # scalar
+            rmm_sc = torch.stack(rmm_roll).mean()
             total_rmm = total_rmm + rmm_sc
             total_count += 1
 
         if total_count == 0:
-            dummy = next(p for p in self.parameters() if p.requires_grad)
-            return {"loss": dummy.sum() * 0.0}
+            return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
 
         mean_rmm = total_rmm / float(total_count)
 
-        # NaN/Inf guard
         if not torch.isfinite(mean_rmm):
             log.warning(f"[rmm_bptt_ft] Non-finite mean_rmm={mean_rmm.item():.4f}, skipping update.")
-            dummy = next(p for p in self.parameters() if p.requires_grad)
-            return {"loss": dummy.sum() * 0.0}
+            return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
 
-        # ── rmm_soft 파일 로그 (wandb disabled 환경에서도 확인 가능) ────────────
         rmm_float = mean_rmm.item()
         ema_float = float(self._rmm_ema_mean.item()) if hasattr(self, "_rmm_ema_mean") else float("nan")
         _step = int(getattr(self, "global_step", 0))
         log.info(f"[rmm] step={_step} rmm_soft={rmm_float:.4f} ema={ema_float:.4f}")
 
-        # ── EMA baseline (centering only, no std division) ───────────────────
-        # loss = -(rmm - ema_mean): gradient only from *deviation above baseline*.
-        # Dividing by std was amplifying gradients due to small initial std.
-        # Scale is bounded by |rmm - ema_mean| ≤ 1 regardless of scenario.
         _ema_mom = 0.98
         rmm_val = mean_rmm.detach()
         if hasattr(self, "_rmm_ema_mean"):

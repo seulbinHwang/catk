@@ -14,6 +14,9 @@
 #   - N_VIS_BATCH=0 이면 closed-loop W&B 비디오 생성 안 함 (batch_idx < n_vis_batch 일 때만 생성)
 #   - n_batch_sim_agents_metric: official SimAgents RMM(CPU 풀)에 넣는 val 배치 수 상한
 #   - LIMIT_VAL_BATCHES: 정수면 그만큼의 val 배치만 전체 검증 루프에서 사용 (open+closed 포함)
+#   - N_ROLLOUT_CLOSED_VAL: closed-loop val 시 시나리오당 rollout 수 (yaml 16과 동일 기본, 낮출수록 빠름)
+#
+# 전체 flow_decoder 학습(velocity_head만이 아님): FLOW_VELOCITY_HEAD_ONLY=false
 #
 # coarse step 수 제한 (전체 16이 아니라 앞 N coarse만; 그 구간 전체 역전파·soft RMM):
 #   BPTT_MAX_COARSE_STEPS=3 sh scripts/train_flow_bptt_ft.sh
@@ -39,7 +42,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_bptt_ft}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-a100-bpttft}"
@@ -56,10 +59,15 @@ fi
 CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
 CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+# 학습 데이터 경로 (pickle + splitted tfrecords)
+# 기본: train_with_tfrecords 폴더 (tfrecord가 함께 전처리된 트레이닝 스플릿)
+TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
+TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-0.1}"
 # 정수(예: 10) = val 배치 최대 개수. 0~1 실수 = 데이터셋 비율. 빠른 RMM 스모크는 10 권장.
-LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-10}"
+LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-3}"
 MAX_EPOCHS="${MAX_EPOCHS:-10}"
 # val_check_interval: 정수면 "N training step마다" 검증, 0~1 실수면 "에폭의 해당 비율마다" 검증.
 # limit_train_batches가 작으면 정수 N은 N 이하로 맞출 것(그렇지 않으면 Lightning 설정 오류).
@@ -69,14 +77,14 @@ LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
 GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-1.0}"
 
-TRAIN_B="${TRAIN_B:-2}"
-VAL_B="${VAL_B:-6}"
+TRAIN_B="${TRAIN_B:-8}"
+VAL_B="${VAL_B:-8}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-8}"
 # DataLoader 워커는 GPU 프로세스마다 따로 뜸: (NPROC_PER_NODE × NUM_WORKERS) + α.
 # 예: 2GPU × 63워커 ≈ 126개 워커만으로도 RAM·파일 디스크립터·스케줄링 폭주 → 몇 step 후 OOM/Killed/멈춤이 잦음.
 # 단일 GPU에서도 63은 과한 경우 많음. 필요 시 NUM_WORKERS=16 등으로 올려서 튜닝.
 NUM_WORKERS="${NUM_WORKERS:-8}"
-PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
 PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
 PIN_MEMORY="${PIN_MEMORY:-true}"
 
@@ -94,16 +102,30 @@ N_VIS_SCENARIO="${N_VIS_SCENARIO:-2}"
 N_VIS_ROLLOUT="${N_VIS_ROLLOUT:-4}"
 DELETE_LOCAL_VIDEOS_AFTER_UPLOAD="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD:-false}"
 
+# closed-loop validation: 시나리오당 rollout N (best-of-N minADE 등; configs/experiment/flow_bptt_ft.yaml n_rollout_closed_val)
+N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-4}"
+
 # official closed-loop SimAgents RMM 갱신에 쓰는 val 배치 수 (CPU 멀티프로세스 구간)
-N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-10}"
+N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-3}"
+# "real": 공식 TF RMM (subprocess, 느림), "hard": PyTorch 인-프로세스 RMM (빠름, 수치 동등)
+# 속도 추가 팁: WOSAC_TORCH_COMPILE=1 설정 시 dno/ttc/d_road 커널을 torch.compile 로 최적화
+VALIDATION_METRIC="${VALIDATION_METRIC:-hard}"
+WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
 BPTT_N_ROLLOUTS="${BPTT_N_ROLLOUTS:-3}"
 RMM_BPTT_USE_REF_MODEL="${RMM_BPTT_USE_REF_MODEL:-false}"
 # OOM 발생 시 true로 설정: flow ODE model_fn 호출을 gradient checkpoint으로 감쌈
 # (Neural ODE adjoint 이산 버전) — solver_steps×activation 메모리를 activation 수준으로 절감
-BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-false}"
+BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
 # 비어 있으면 오버라이드 없음 → configs/experiment 의 bptt_max_coarse_steps (null = 전체)
-BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-16}"
+BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-3}"
+# true (기본): G rollout 을 1개씩 순차 실행 후 각각 backward → 피크 메모리 ≈ G 배 절감
+BPTT_SEQUENTIAL_ROLLOUTS="${BPTT_SEQUENTIAL_ROLLOUTS:-false}"
+# 앞 N coarse step 을 no_grad/detach (sliding-window BPTT). 0 = 비활성.
+# 예: BPTT_WARM_COARSE_STEPS=12 이면 마지막 4 step (BPTT_MAX_COARSE_STEPS=16 기준)만 gradient.
+BPTT_WARM_COARSE_STEPS="${BPTT_WARM_COARSE_STEPS:-0}"
+# true: HierarchicalFlowDecoder.velocity_head만 학습 (인코더·flow 트렁크·residual 동결)
+FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -124,12 +146,14 @@ if [ ! -f "${CKPT_PATH}" ]; then
 fi
 
 echo "Experiment=${MY_EXPERIMENT}"
-echo "CACHE_ROOT=${CACHE_ROOT} (flow_bptt_ft: train_* → validation split under cache)"
+echo "CACHE_ROOT=${CACHE_ROOT}"
+echo "TRAIN_RAW_DIR=${TRAIN_RAW_DIR}"
+echo "TRAIN_TFRECORDS_SPLITTED=${TRAIN_TFRECORDS_SPLITTED}"
 echo "CKPT_PATH=${CKPT_PATH}"
 echo "LIMIT_TRAIN_BATCHES=${LIMIT_TRAIN_BATCHES} MAX_EPOCHS=${MAX_EPOCHS} WANDB_MODE=${WANDB_MODE}"
 echo "LOG_EVERY_N_STEPS=${LOG_EVERY_N_STEPS} val_check_interval=${VAL_CHECK_INTERVAL} check_val_every_n_epoch=${CHECK_VAL_EVERY_N_EPOCH}"
-echo "BPTT_N_ROLLOUTS=${BPTT_N_ROLLOUTS} RMM_BPTT_USE_REF_MODEL=${RMM_BPTT_USE_REF_MODEL} BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_MAX_COARSE_STEPS=${BPTT_MAX_COARSE_STEPS:-"(yaml)"}"
-echo "LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} N_VIS_BATCH=${N_VIS_BATCH} N_BATCH_SIM_AGENTS_METRIC=${N_BATCH_SIM_AGENTS_METRIC}"
+echo "BPTT_N_ROLLOUTS=${BPTT_N_ROLLOUTS} FLOW_VELOCITY_HEAD_ONLY=${FLOW_VELOCITY_HEAD_ONLY} RMM_BPTT_USE_REF_MODEL=${RMM_BPTT_USE_REF_MODEL} BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_MAX_COARSE_STEPS=${BPTT_MAX_COARSE_STEPS:-"(yaml)"}"
+echo "LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} N_VIS_BATCH=${N_VIS_BATCH} N_ROLLOUT_CLOSED_VAL=${N_ROLLOUT_CLOSED_VAL} N_BATCH_SIM_AGENTS_METRIC=${N_BATCH_SIM_AGENTS_METRIC} VALIDATION_METRIC=${VALIDATION_METRIC}"
 echo "NPROC_PER_NODE=${NPROC_PER_NODE} NUM_WORKERS=${NUM_WORKERS} (≈ ${NPROC_PER_NODE}×${NUM_WORKERS} dataloader worker 프로세스 + 메인)"
 
 PORT="$(get_free_port)"
@@ -139,6 +163,8 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   task_name="${MY_TASK_NAME}" \
   ckpt_path="${CKPT_PATH}" \
   paths.cache_root="${CACHE_ROOT}" \
+  data.train_raw_dir="${TRAIN_RAW_DIR}" \
+  data.train_tfrecords_splitted="${TRAIN_TFRECORDS_SPLITTED}" \
   data.train_batch_size="${TRAIN_B}" \
   data.val_batch_size="${VAL_B}" \
   data.train_max_num="${TRAIN_MAX_NUM}" \
@@ -161,14 +187,20 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.lr_min_ratio="${LR_MIN_RATIO}" \
   model.model_config.weight_decay="${WEIGHT_DECAY}" \
   model.model_config.finetune.rollout_noise_scale="${ROLLOUT_NOISE_SCALE}" \
+  model.model_config.finetune.flow_velocity_head_only="${FLOW_VELOCITY_HEAD_ONLY}" \
   model.model_config.n_vis_batch="${N_VIS_BATCH}" \
   model.model_config.n_vis_scenario="${N_VIS_SCENARIO}" \
   model.model_config.n_vis_rollout="${N_VIS_ROLLOUT}" \
+  model.model_config.n_rollout_closed_val="${N_ROLLOUT_CLOSED_VAL}" \
   model.model_config.n_batch_sim_agents_metric="${N_BATCH_SIM_AGENTS_METRIC}" \
+  model.model_config.validation_metric="${VALIDATION_METRIC}" \
+  model.model_config.wosac_torch_compile="${WOSAC_TORCH_COMPILE}" \
   model.model_config.delete_local_videos_after_wandb_upload="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD}" \
   model.model_config.finetune.bptt_n_rollouts="${BPTT_N_ROLLOUTS}" \
   model.model_config.finetune.rmm_bptt_use_ref_model="${RMM_BPTT_USE_REF_MODEL}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
+  model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
+  model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
   ${BPTT_MAX_COARSE_STEPS:+model.model_config.finetune.bptt_max_coarse_steps="${BPTT_MAX_COARSE_STEPS}"} \
   ${EXTRA_ARGS}
 
