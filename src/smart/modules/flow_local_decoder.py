@@ -20,6 +20,53 @@ from src.smart.utils import (
 from src.smart.modules.draft_physics import DEFAULT_LIMITS
 
 
+def _device_prefers_math_sdp(device: torch.device) -> bool:
+    """알려진 불안정 GPU에서는 SDPA 고속 커널 대신 math 경로를 먼저 선택합니다."""
+    if device.type != "cuda":
+        return False
+    if not torch.cuda.is_available():
+        return False
+
+    major, _minor = torch.cuda.get_device_capability(device)
+    # Blackwell(sm_120) 계열에서 validation 중 SDPA 고속 커널 크래시가 관찰됐습니다.
+    return major >= 12
+
+
+def _is_retryable_sdp_runtime_error(error: RuntimeError) -> bool:
+    """SDPA 고속 커널 실패로 판단되면 안전한 math 경로 재시도를 허용합니다."""
+    error_message = str(error).lower()
+    retryable_patterns = (
+        "invalid configuration argument",
+        "no kernel image is available",
+        "device kernel image is invalid",
+        "operation not supported",
+    )
+    return any(pattern in error_message for pattern in retryable_patterns)
+
+
+def _run_attention_with_safe_fallback(
+    attn: nn.MultiheadAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """기본은 고속 커널을 쓰고, 알려진/관측된 실패에서만 math 경로로 강등합니다."""
+    if _device_prefers_math_sdp(query.device):
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            attn_out, _ = attn(query, key, value, need_weights=False)
+        return attn_out
+
+    try:
+        attn_out, _ = attn(query, key, value, need_weights=False)
+        return attn_out
+    except RuntimeError as error:
+        if query.device.type != "cuda" or not _is_retryable_sdp_runtime_error(error):
+            raise
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            attn_out, _ = attn(query, key, value, need_weights=False)
+        return attn_out
+
+
 @dataclass
 class FlowSample:
     x_t: torch.Tensor
@@ -329,7 +376,7 @@ class HalfSecondChunkMixerBlock(nn.Module):
         tau_emb: torch.Tensor,
     ) -> torch.Tensor:
         attn_in = self.attn_norm(chunk_tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        attn_out = _run_attention_with_safe_fallback(self.attn, attn_in, attn_in, attn_in)
         chunk_tokens = chunk_tokens + attn_out
 
         cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
@@ -372,7 +419,7 @@ class ChunkStepRefiner(nn.Module):
 
         step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
         attn_in = self.attn_norm(step_tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        attn_out = _run_attention_with_safe_fallback(self.attn, attn_in, attn_in, attn_in)
         step_tokens = step_tokens + attn_out
         step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
         step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)

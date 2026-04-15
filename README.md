@@ -168,7 +168,16 @@ export WANDB_PROJECT=SMART-FLOW
 export WANDB_ENTITY=<your_entity>
 ```
 
-### 2.1 2025 scorer 관련 주의사항
+### 2.1 RTX 5090 / SDPA fallback
+
+- `HierarchicalFlowDecoder`의 local attention은 기본적으로 PyTorch SDPA 고속 커널을 그대로 사용합니다.
+- 다만 RTX 5090 같은 Blackwell(`sm_120`) 계열에서는 validation 중 `MultiheadAttention`가
+  CUDA 커널 오류로 크래시하는 경우가 있어, 이 저장소는 해당 GPU에서만 자동으로 `math` SDPA 경로로
+  내려가도록 되어 있습니다.
+- 즉, 일반 GPU에서는 기존 고속 경로를 유지하고, 문제가 알려진 GPU/오류 패턴에서만 안전 경로를 사용합니다.
+- 별도 실행 옵션 없이 자동으로 적용됩니다.
+
+### 2.2 2025 scorer 관련 주의사항
 
 이 저장소는 시작 시점에 아래를 바로 확인합니다.
 
