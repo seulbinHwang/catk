@@ -18,7 +18,7 @@ model:
       enabled: true
       start_epoch: 0
       ramp_epochs: 32
-      max_weight: 0.10 #1.0
+      max_weight: 0.07 #1.0
       sampling:
         sample_steps: 16
         sample_method: midpoint
