@@ -44,6 +44,7 @@ from waymo_open_dataset.protos import scenario_pb2, sim_agents_metrics_pb2
 from src.smart.metrics.wosac_metric_features_torch.metric_features_torch_differentiable import (
     PredictedSimTrajectories,
     compute_metric_features_from_predicted_sim_trajectories,
+    compute_metric_features_batched_scenes,
 )
 from src.smart.metrics.wosac_metametric_pytorch_differentiable import (
     compute_wosac_metametric_soft,
@@ -1418,6 +1419,38 @@ class SMARTFlow(LightningModule):
         rmm = torch.tensor(results, dtype=torch.float32).reshape(n_scenarios, G)
         return rmm
 
+    def _compute_rmm_bptt_gt_fm_loss(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> Tensor | None:
+        """GT 정규화 궤적에 대한 flow-matching MSE (velocity_head에만 gradient).
+
+        ``kinematic_proj_ft`` 의 ``flow_reg_lambda`` BC 항과 동일한 경로:
+        ``flow_train_clean_norm`` + ``flow_ode.sample(..., target_type='velocity')``.
+        """
+        gt_clean = tokenized_agent.get("flow_train_clean_norm")
+        if gt_clean is None or gt_clean.numel() == 0:
+            return None
+        with torch.no_grad():
+            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+        if anchor_hidden_valid.numel() == 0:
+            return None
+        anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        gt_sample = flow_ode.sample(gt_clean.to(dtype=torch.float32), target_type="velocity")
+        gt_pred = flow_decoder(anchor_hidden, gt_sample.x_t, gt_sample.tau)
+        fm = flow_matching_loss(gt_pred, gt_sample.target)
+        if not torch.isfinite(fm).all():
+            log.warning("[rmm_bptt_ft] non-finite GT FM loss; skipping")
+            return None
+        return fm
+
     def _run_flow_bptt_ft_step(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -1434,6 +1467,10 @@ class SMARTFlow(LightningModule):
           - ``bptt_warm_coarse_steps=N``: 앞 N coarse step 을 no_grad + detach (sliding BPTT).
           - ``bptt_use_adjoint=True``: ODE velocity head 내부 checkpoint (activation 절감).
           - ``bptt_max_coarse_steps=K``: coarse step 수 상한 (짧을수록 graph 작아짐).
+
+        GT 정규화(선택):
+          - ``flow_reg_lambda>0`` 이면 ``flow_train_clean_norm`` 기반 velocity FM MSE 를
+            RMM loss 에 더합니다 (``kinematic_proj_ft`` 와 동일 키).
         """
         G = int(getattr(self.finetune_config, "bptt_n_rollouts", 1))
         _bmc_raw = getattr(self.finetune_config, "bptt_max_coarse_steps", None)
@@ -1447,6 +1484,7 @@ class SMARTFlow(LightningModule):
         warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
         _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
         _dbg_enabled = bool(getattr(self.finetune_config, "bptt_debug", False))
+        _flow_reg_lambda = float(getattr(self.finetune_config, "flow_reg_lambda", 0.0))
 
         # ── 1. Encode map (no_grad; encoder frozen) ─────────────────────────
         with torch.no_grad():
@@ -1585,6 +1623,20 @@ class SMARTFlow(LightningModule):
             _sc_log_feat_dicts.append(log_feat_dict)
             _sc_agent_ids.append(agent_ids[sc_mask])
 
+        # ── Pre-compute valid scenario indices (shared by 5a and 5b) ────────
+        _valid_sc_idx = [i for i in range(n_scenarios) if _sc_scenarios[i] is not None]
+        _n_valid = len(_valid_sc_idx)
+        _valid_scenarios    = [_sc_scenarios[i]     for i in _valid_sc_idx]
+        _valid_agent_ids    = [_sc_agent_ids[i]     for i in _valid_sc_idx]
+        _valid_log_feat_dicts = [_sc_log_feat_dicts[i] for i in _valid_sc_idx]
+        _valid_sc_masks     = [_sc_masks[i]         for i in _valid_sc_idx]
+
+        _SURROGATE = SurrogateConfig(
+            collision_temperature=0.15,
+            offroad_temperature=0.15,
+            red_light_crossing_temperature=0.05,
+        )
+
         # ── norm-clip hook helper ────────────────────────────────────────────
         def _make_norm_clip_hook(max_norm: float):
             def _hook(g: Tensor) -> Tensor:
@@ -1625,35 +1677,45 @@ class SMARTFlow(LightningModule):
                     if pred_head_g.requires_grad and _grad_clip_traj > 0:
                         pred_head_g.register_hook(_make_norm_clip_hook(_grad_clip_traj))
 
-                    total_rmm_g = pred_traj_g.new_zeros((), dtype=torch.float32)
-                    count_g = 0
-                    for sc_idx in range(n_scenarios):
-                        if _sc_scenarios[sc_idx] is None:
-                            continue
-                        sc_pt = pred_traj_g[_sc_masks[sc_idx], 0, :, :]  # [A, T, 2]
-                        sc_pz = pred_z_g[_sc_masks[sc_idx], 0, :]
-                        sc_ph = pred_head_g[_sc_masks[sc_idx], 0, :]
-                        valid_sc = sc_pt.new_ones(sc_pt.shape[0], sc_pt.shape[1], dtype=torch.bool)
-                        res = self._compute_soft_rmm(
-                            scenario=_sc_scenarios[sc_idx],
-                            x=sc_pt[:, :, 0],
-                            y=sc_pt[:, :, 1],
-                            z=sc_pz,
-                            head=sc_ph,
-                            agent_ids=_sc_agent_ids[sc_idx],
-                            valid=valid_sc,
-                            log_feat_dict=_sc_log_feat_dicts[sc_idx],
-                            config=cfg,
-                            debug=(_dbg_enabled and g == 0 and sc_idx == 0),
+                    if _n_valid > 0:
+                        # Batched soft-RMM across all valid scenes for this rollout
+                        _preds_g = [
+                            PredictedSimTrajectories(
+                                object_id=_valid_agent_ids[j].cpu(),
+                                center_x=pred_traj_g[_valid_sc_masks[j], 0, :, 0],
+                                center_y=pred_traj_g[_valid_sc_masks[j], 0, :, 1],
+                                center_z=pred_z_g[_valid_sc_masks[j], 0, :],
+                                heading=pred_head_g[_valid_sc_masks[j], 0, :],
+                                valid=pred_traj_g.new_ones(
+                                    int(_valid_sc_masks[j].sum()), pred_traj_g.shape[2],
+                                    dtype=torch.bool,
+                                ),
+                            )
+                            for j in range(_n_valid)
+                        ]
+                        _feat_list = compute_metric_features_batched_scenes(
+                            scenarios=_valid_scenarios, preds=_preds_g, surrogate=_SURROGATE,
                         )
-                        total_rmm_g = total_rmm_g + res.metametric
-                        count_g += 1
+                        _rmm_g_vec = torch.stack([
+                            compute_wosac_metametric_soft(
+                                config=cfg,
+                                log_features=_valid_log_feat_dicts[j],
+                                sim_features=_feat_list[j].as_dict(),
+                                debug=(_dbg_enabled and g == 0 and j == 0),
+                            ).metametric
+                            for j in range(_n_valid)
+                        ])  # (_n_valid,)
+                        _finite_g = torch.isfinite(_rmm_g_vec)
+                        count_g = int(_finite_g.sum().item())
+                        if count_g > 0:
+                            _safe_g = torch.where(_finite_g, _rmm_g_vec, torch.zeros_like(_rmm_g_vec))
+                            rmm_g = _safe_g.sum() / float(count_g)
+                        else:
+                            count_g = 0
+                    else:
+                        count_g = 0
 
                     if count_g > 0:
-                        rmm_g = total_rmm_g / float(count_g)
-                        # Use the .item() sync we need anyway for logging to
-                        # also check finiteness — avoids a second CUDA sync
-                        # from torch.isfinite(rmm_g).
                         rmm_g_val = rmm_g.detach().item()
                         total_rmm_accum += rmm_g_val
                         total_count_accum += 1
@@ -1686,6 +1748,18 @@ class SMARTFlow(LightningModule):
             _ema_log = self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach()
             log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_log.item():.4f}")
 
+            fm_bc_det: Tensor | None = None
+            if _flow_reg_lambda > 0:
+                _fm = self._compute_rmm_bptt_gt_fm_loss(map_feature, tokenized_agent)
+                if _fm is not None:
+                    (_flow_reg_lambda * _fm).backward()
+                    fm_bc_det = _fm.detach()
+
+            # sequential 은 loss 가 dummy(0) 이라 train/loss 로그가 의미 없음. 모니터링용 합산 스칼라.
+            train_combined = (-mean_rmm).detach()
+            if fm_bc_det is not None:
+                train_combined = train_combined + _flow_reg_lambda * fm_bc_det
+
             # DDP: 모든 trainable param 을 dummy loss graph 에 연결해야 bucket reducer 가 정상 작동.
             # manual backward 로 grad 는 이미 누적됐으므로 backward() 추가 기여는 0.
             _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
@@ -1693,9 +1767,12 @@ class SMARTFlow(LightningModule):
                 "loss": _ddp_dummy,   # grads already accumulated via manual backward
                 "train/rmm_soft": mean_rmm,
                 "train/rmm_loss": -mean_rmm,
+                "train/combined_loss": train_combined,
                 "train/rmm_ema": _ema_log,
                 "train/rmm_n_scenarios": torch.tensor(float(total_count_accum), device=mean_rmm.device),
             }
+            if fm_bc_det is not None:
+                seq_ret["train/fm_bc_loss"] = fm_bc_det
             # sequential mode: ref soft RMM (train Δ 모니터링)
             if self._ref_train_enabled and self.ref_flow_decoder is not None:
                 _orig_fd = self.encoder.agent_encoder.flow_decoder
@@ -1715,29 +1792,34 @@ class SMARTFlow(LightningModule):
                         )
                 finally:
                     self.encoder.agent_encoder.flow_decoder = _orig_fd
-                ref_s_total, ref_s_count = 0.0, 0
-                for sc_idx in range(n_scenarios):
-                    if _sc_scenarios[sc_idx] is None:
-                        continue
-                    sc_rt = ref_traj_s[_sc_masks[sc_idx]]   # [A, G, T, 2]
-                    sc_rz = ref_z_s[_sc_masks[sc_idx]]
-                    sc_rh = ref_head_s[_sc_masks[sc_idx]]
-                    valid_sc = sc_rt.new_ones(sc_rt.shape[0], sc_rt.shape[2], dtype=torch.bool)
-                    ref_roll_s = []
-                    for g in range(G):
-                        with torch.no_grad():
-                            ref_res = self._compute_soft_rmm(
-                                scenario=_sc_scenarios[sc_idx],
-                                x=sc_rt[:, g, :, 0], y=sc_rt[:, g, :, 1],
-                                z=sc_rz[:, g, :], head=sc_rh[:, g, :],
-                                agent_ids=_sc_agent_ids[sc_idx], valid=valid_sc,
-                                log_feat_dict=_sc_log_feat_dicts[sc_idx], config=cfg, debug=False,
+                if _n_valid > 0:
+                    ref_s_total = 0.0
+                    with torch.no_grad():
+                        for g in range(G):
+                            _ref_preds_g = [
+                                PredictedSimTrajectories(
+                                    object_id=_valid_agent_ids[j].cpu(),
+                                    center_x=ref_traj_s[_valid_sc_masks[j], g, :, 0],
+                                    center_y=ref_traj_s[_valid_sc_masks[j], g, :, 1],
+                                    center_z=ref_z_s[_valid_sc_masks[j], g, :],
+                                    heading=ref_head_s[_valid_sc_masks[j], g, :],
+                                    valid=ref_traj_s.new_ones(
+                                        int(_valid_sc_masks[j].sum()), ref_traj_s.shape[2],
+                                        dtype=torch.bool,
+                                    ),
+                                )
+                                for j in range(_n_valid)
+                            ]
+                            _ref_feat_list = compute_metric_features_batched_scenes(
+                                scenarios=_valid_scenarios, preds=_ref_preds_g, surrogate=_SURROGATE,
                             )
-                        ref_roll_s.append(ref_res.metametric.item())
-                    ref_s_total += sum(ref_roll_s) / len(ref_roll_s)
-                    ref_s_count += 1
-                if ref_s_count > 0:
-                    seq_ref_rmm = torch.tensor(ref_s_total / ref_s_count, dtype=torch.float32, device=mean_rmm.device)
+                            for j in range(_n_valid):
+                                ref_s_total += compute_wosac_metametric_soft(
+                                    config=cfg,
+                                    log_features=_valid_log_feat_dicts[j],
+                                    sim_features=_ref_feat_list[j].as_dict(),
+                                ).metametric.item() / (G * _n_valid)
+                    seq_ref_rmm = torch.tensor(ref_s_total, dtype=torch.float32, device=mean_rmm.device)
                     seq_ret["train/rmm_ref"] = seq_ref_rmm
                     seq_ret["train/rmm_delta"] = mean_rmm.detach() - seq_ref_rmm
             return seq_ret
@@ -1766,50 +1848,51 @@ class SMARTFlow(LightningModule):
         if pred_head_traj.requires_grad and _grad_clip_traj > 0:
             pred_head_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
 
-        total_rmm = pred_traj.new_zeros((), dtype=torch.float32)
-        total_count = 0
+        if _n_valid == 0:
+            return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
 
-        for sc_idx in range(n_scenarios):
-            if _sc_scenarios[sc_idx] is None:
-                continue
-            sc_pred_traj = pred_traj[_sc_masks[sc_idx]]        # [A_sc, G, T, 2]
-            sc_pred_z = pred_z[_sc_masks[sc_idx]]
-            sc_pred_head = pred_head_traj[_sc_masks[sc_idx]]
-            valid = sc_pred_traj.new_ones(
-                sc_pred_traj.shape[0], sc_pred_traj.shape[2], dtype=torch.bool
-            )
-            rmm_roll = []
-            for g in range(int(sc_pred_traj.shape[1])):
-                res_g = self._compute_soft_rmm(
-                    scenario=_sc_scenarios[sc_idx],
-                    x=sc_pred_traj[:, g, :, 0],
-                    y=sc_pred_traj[:, g, :, 1],
-                    z=sc_pred_z[:, g, :],
-                    head=sc_pred_head[:, g, :],
-                    agent_ids=_sc_agent_ids[sc_idx],
-                    valid=valid,
-                    log_feat_dict=_sc_log_feat_dicts[sc_idx],
-                    config=cfg,
-                    debug=(_dbg_enabled and g == 0 and sc_idx == 0),
+        # Batched soft-RMM: compute DNO+TTC once per rollout across all valid scenes
+        _rmm_by_g = []  # [G] each (n_valid,)
+        for g in range(G):
+            _preds_g = [
+                PredictedSimTrajectories(
+                    object_id=_valid_agent_ids[j].cpu(),
+                    center_x=pred_traj[_valid_sc_masks[j], g, :, 0],
+                    center_y=pred_traj[_valid_sc_masks[j], g, :, 1],
+                    center_z=pred_z[_valid_sc_masks[j], g, :],
+                    heading=pred_head_traj[_valid_sc_masks[j], g, :],
+                    valid=pred_traj.new_ones(
+                        int(_valid_sc_masks[j].sum()), pred_traj.shape[2],
+                        dtype=torch.bool,
+                    ),
                 )
-                rmm_roll.append(res_g.metametric)
-                if _dbg_enabled and g == 0 and sc_idx == 0:
-                    for fn, lik in res_g.likelihoods.items():
-                        if lik.requires_grad:
-                            lik.retain_grad()
+                for j in range(_n_valid)
+            ]
+            _feat_list = compute_metric_features_batched_scenes(
+                scenarios=_valid_scenarios, preds=_preds_g, surrogate=_SURROGATE,
+            )
+            _rmm_g = torch.stack([
+                compute_wosac_metametric_soft(
+                    config=cfg,
+                    log_features=_valid_log_feat_dicts[j],
+                    sim_features=_feat_list[j].as_dict(),
+                    debug=(_dbg_enabled and g == 0 and j == 0),
+                ).metametric
+                for j in range(_n_valid)
+            ])  # (_n_valid,)
+            _rmm_by_g.append(_rmm_g)
 
-            rmm_sc = torch.stack(rmm_roll).mean()
-            total_rmm = total_rmm + rmm_sc
-            total_count += 1
+        rmm_matrix = torch.stack(_rmm_by_g, dim=1)  # (_n_valid, G)
+        rmm_per_scene = rmm_matrix.mean(dim=1)       # (_n_valid,) — mean over rollouts
+
+        finite_mask = torch.isfinite(rmm_per_scene)
+        total_count = int(finite_mask.sum().item())
 
         if total_count == 0:
             return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
 
-        mean_rmm = total_rmm / float(total_count)
-
-        if not torch.isfinite(mean_rmm):
-            log.warning(f"[rmm_bptt_ft] Non-finite mean_rmm={mean_rmm.item():.4f}, skipping update.")
-            return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
+        safe_rmm_per_scene = torch.where(finite_mask, rmm_per_scene, torch.zeros_like(rmm_per_scene))
+        mean_rmm = safe_rmm_per_scene.sum() / float(total_count)
 
         _step = int(getattr(self, "global_step", 0))
         # EMA for monitoring only (not used in loss)
@@ -1850,44 +1933,53 @@ class SMARTFlow(LightningModule):
             finally:
                 self.encoder.agent_encoder.flow_decoder = _orig_fd
 
-            ref_total = 0.0
-            ref_count = 0
-            for sc_idx in range(n_scenarios):
-                if _sc_scenarios[sc_idx] is None:
-                    continue
-                sc_rt = ref_traj[_sc_masks[sc_idx]]   # [A, G, T, 2]
-                sc_rz = ref_z[_sc_masks[sc_idx]]
-                sc_rh = ref_head[_sc_masks[sc_idx]]
-                valid_sc = sc_rt.new_ones(sc_rt.shape[0], sc_rt.shape[2], dtype=torch.bool)
-                ref_roll = []
-                for g in range(G):
-                    with torch.no_grad():
-                        ref_res = self._compute_soft_rmm(
-                            scenario=_sc_scenarios[sc_idx],
-                            x=sc_rt[:, g, :, 0],
-                            y=sc_rt[:, g, :, 1],
-                            z=sc_rz[:, g, :],
-                            head=sc_rh[:, g, :],
-                            agent_ids=_sc_agent_ids[sc_idx],
-                            valid=valid_sc,
-                            log_feat_dict=_sc_log_feat_dicts[sc_idx],
-                            config=cfg,
-                            debug=False,
+            if _n_valid > 0:
+                ref_total = 0.0
+                with torch.no_grad():
+                    for g in range(G):
+                        _ref_preds_g = [
+                            PredictedSimTrajectories(
+                                object_id=_valid_agent_ids[j].cpu(),
+                                center_x=ref_traj[_valid_sc_masks[j], g, :, 0],
+                                center_y=ref_traj[_valid_sc_masks[j], g, :, 1],
+                                center_z=ref_z[_valid_sc_masks[j], g, :],
+                                heading=ref_head[_valid_sc_masks[j], g, :],
+                                valid=ref_traj.new_ones(
+                                    int(_valid_sc_masks[j].sum()), ref_traj.shape[2],
+                                    dtype=torch.bool,
+                                ),
+                            )
+                            for j in range(_n_valid)
+                        ]
+                        _ref_feat_list = compute_metric_features_batched_scenes(
+                            scenarios=_valid_scenarios, preds=_ref_preds_g, surrogate=_SURROGATE,
                         )
-                    ref_roll.append(ref_res.metametric.item())
-                ref_total += sum(ref_roll) / len(ref_roll)
-                ref_count += 1
-            if ref_count > 0:
-                ref_rmm_log = torch.tensor(ref_total / ref_count, dtype=torch.float32, device=mean_rmm.device)
+                        for j in range(_n_valid):
+                            ref_total += compute_wosac_metametric_soft(
+                                config=cfg,
+                                log_features=_valid_log_feat_dicts[j],
+                                sim_features=_ref_feat_list[j].as_dict(),
+                            ).metametric.item() / (G * _n_valid)
+                ref_rmm_log = torch.tensor(ref_total, dtype=torch.float32, device=mean_rmm.device)
 
         loss = -mean_rmm
+        fm_bc_det: Tensor | None = None
+        if _flow_reg_lambda > 0:
+            _fm = self._compute_rmm_bptt_gt_fm_loss(map_feature, tokenized_agent)
+            if _fm is not None:
+                loss = loss + _flow_reg_lambda * _fm
+                fm_bc_det = _fm.detach()
+
         ret = {
             "loss": loss,
             "train/rmm_soft": mean_rmm.detach(),
-            "train/rmm_loss": loss.detach(),
+            "train/rmm_loss": (-mean_rmm).detach(),
+            "train/combined_loss": loss.detach(),
             "train/rmm_ema": _ema_log,
             "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
         }
+        if fm_bc_det is not None:
+            ret["train/fm_bc_loss"] = fm_bc_det
         if ref_rmm_log is not None:
             ret["train/rmm_ref"] = ref_rmm_log
             ret["train/rmm_delta"] = mean_rmm.detach() - ref_rmm_log

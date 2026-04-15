@@ -37,6 +37,9 @@ model:
       # null/0 이하 = coarse 전부 (16). 양수 = 그 coarse step만 rollout·전 구간 역전파 (예: 짧은 구간 3)
       bptt_max_coarse_steps: null
       rollout_noise_scale: 1.0
+      # GT flow-matching 정규화 (rmm_bptt_ft): flow_train_clean_norm velocity FM MSE 가중치.
+      # 0 이면 비활성. kinematic_proj_ft 의 flow_reg_lambda 와 동일 의미.
+      flow_reg_lambda: 0.0
       bptt_n_rollouts: 2
       rmm_bptt_use_ref_model: false
       # true: HierarchicalFlowDecoder.velocity_head만 학습 (FinetuneConfig 코드 기본과 동일)

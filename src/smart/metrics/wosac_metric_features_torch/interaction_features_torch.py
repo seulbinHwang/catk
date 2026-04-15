@@ -34,6 +34,7 @@ def compute_distance_to_nearest_object(
     valid: Tensor,
     evaluated_object_mask: Tensor,
     corner_rounding_factor: float = CORNER_ROUNDING_FACTOR,
+    scene_batch: "Tensor | None" = None,
 ) -> Tensor:
     """Torch port of TF `interaction_features.compute_distance_to_nearest_object`."""
     boxes = torch.stack([center_x, center_y, center_z, length, width, height, heading], dim=-1)
@@ -75,6 +76,13 @@ def compute_distance_to_nearest_object(
     other_valid = valid.index_select(0, other_idx)
     all_valid = torch.cat([eval_valid, other_valid], dim=0)  # (O,T)
 
+    # scene-batch cross-scene masking: reorder scene labels to match [eval, other]
+    eval_scene: "Tensor | None" = None
+    all_scene: "Tensor | None" = None
+    if scene_batch is not None:
+        eval_scene = scene_batch.index_select(0, eval_idx)  # (E,)
+        all_scene = torch.cat([eval_scene, scene_batch.index_select(0, other_idx)], dim=0)  # (O,)
+
     for start in range(0, num_objects, block):
         end = min(num_objects, start + block)
         corners_blk = all_corners[start:end]  # (B,T,4,2)
@@ -101,6 +109,16 @@ def compute_distance_to_nearest_object(
             ii = torch.arange(start, diag_end, device=signed_blk.device)
             jj = ii - start
             signed_blk[ii, jj, :] = signed_blk[ii, jj, :] + EXTREMELY_LARGE_DISTANCE
+
+        # cross-scene masking: agents from different scenes never interact
+        if scene_batch is not None:
+            blk_scene = all_scene[start:end]  # (B,)
+            diff_scene = eval_scene[:, None] != blk_scene[None, :]  # (E, B)
+            signed_blk = torch.where(
+                diff_scene[:, :, None].expand(-1, -1, num_steps),
+                torch.full_like(signed_blk, EXTREMELY_LARGE_DISTANCE),
+                signed_blk,
+            )
 
         # validity masking: both ego and other must be valid
         valid_blk = all_valid[start:end]  # (B,T)
@@ -131,6 +149,7 @@ def compute_time_to_collision_with_object_in_front(
     valid: Tensor,
     evaluated_object_mask: Tensor,
     seconds_per_step: float,
+    scene_batch: "Tensor | None" = None,
 ) -> Tensor:
     """Torch port of TF `interaction_features.compute_time_to_collision_with_object_in_front`."""
     speed = traj.compute_kinematic_features(
@@ -172,6 +191,13 @@ def compute_time_to_collision_with_object_in_front(
     lat_overlap = torch.abs(other_rel_xy[..., 1]) - ego_sizes[:, :, None, 1] / 2.0 - other_lat_offset
 
     following_mask = _get_object_following_mask(long_distance, lat_overlap, yaw_diff[..., 0])
+
+    # cross-scene masking: an eval agent cannot follow an agent from a different scene
+    if scene_batch is not None:
+        eval_scene = scene_batch.index_select(0, eval_idx)  # (E,)
+        same_scene = eval_scene[None, :, None] == scene_batch[None, None, :]  # (1, E, O)
+        following_mask = following_mask & same_scene.expand(valid_t.shape[0], -1, -1)
+
     valid_mask = valid_t[:, None, :] & following_mask
     masked_long = long_distance + (~valid_mask).to(long_distance.dtype) * EXTREMELY_LARGE_DISTANCE
 
