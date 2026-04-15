@@ -65,25 +65,25 @@ TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
-LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-0.1}"
+LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
 # 정수(예: 10) = val 배치 최대 개수. 0~1 실수 = 데이터셋 비율. 빠른 RMM 스모크는 10 권장.
-LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-3}"
+LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-2}"
 MAX_EPOCHS="${MAX_EPOCHS:-10}"
 # val_check_interval: 정수면 "N training step마다" 검증, 0~1 실수면 "에폭의 해당 비율마다" 검증.
 # limit_train_batches가 작으면 정수 N은 N 이하로 맞출 것(그렇지 않으면 Lightning 설정 오류).
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-50}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-500}"
 CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-1}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
 GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-1.0}"
-
-TRAIN_B="${TRAIN_B:-8}"
-VAL_B="${VAL_B:-8}"
+5
+TRAIN_B="${TRAIN_B:-2}"
+VAL_B="${VAL_B:-2}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-8}"
 # DataLoader 워커는 GPU 프로세스마다 따로 뜸: (NPROC_PER_NODE × NUM_WORKERS) + α.
 # 예: 2GPU × 63워커 ≈ 126개 워커만으로도 RAM·파일 디스크립터·스케줄링 폭주 → 몇 step 후 OOM/Killed/멈춤이 잦음.
 # 단일 GPU에서도 63은 과한 경우 많음. 필요 시 NUM_WORKERS=16 등으로 올려서 튜닝.
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
 PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
 PIN_MEMORY="${PIN_MEMORY:-true}"
@@ -97,28 +97,30 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 
 ROLLOUT_NOISE_SCALE="${ROLLOUT_NOISE_SCALE:-1.0}"
 # 0 이면 validation 비디오 생성 안 함 (Waymo rollout MP4 + W&B 업로드 스킵)
-N_VIS_BATCH="${N_VIS_BATCH:-0}"
+N_VIS_BATCH="${N_VIS_BATCH:-1}"
 N_VIS_SCENARIO="${N_VIS_SCENARIO:-2}"
-N_VIS_ROLLOUT="${N_VIS_ROLLOUT:-4}"
+N_VIS_ROLLOUT="${N_VIS_ROLLOUT:-1}"
 DELETE_LOCAL_VIDEOS_AFTER_UPLOAD="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD:-false}"
 
 # closed-loop validation: 시나리오당 rollout N (best-of-N minADE 등; configs/experiment/flow_bptt_ft.yaml n_rollout_closed_val)
 N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-4}"
 
 # official closed-loop SimAgents RMM 갱신에 쓰는 val 배치 수 (CPU 멀티프로세스 구간)
-N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-3}"
+N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-2}"
 # "real": 공식 TF RMM (subprocess, 느림), "hard": PyTorch 인-프로세스 RMM (빠름, 수치 동등)
 # 속도 추가 팁: WOSAC_TORCH_COMPILE=1 설정 시 dno/ttc/d_road 커널을 torch.compile 로 최적화
 VALIDATION_METRIC="${VALIDATION_METRIC:-hard}"
 WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
-BPTT_N_ROLLOUTS="${BPTT_N_ROLLOUTS:-3}"
+BPTT_N_ROLLOUTS="${BPTT_N_ROLLOUTS:-4}"
 RMM_BPTT_USE_REF_MODEL="${RMM_BPTT_USE_REF_MODEL:-false}"
+# true: validation 시 pretrained ref model 도 rollout → val_ref/rmm + val_delta/rmm (val 시간 ≈ 2배)
+RMM_BPTT_REF_VAL="${RMM_BPTT_REF_VAL:-false}"
 # OOM 발생 시 true로 설정: flow ODE model_fn 호출을 gradient checkpoint으로 감쌈
 # (Neural ODE adjoint 이산 버전) — solver_steps×activation 메모리를 activation 수준으로 절감
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
 # 비어 있으면 오버라이드 없음 → configs/experiment 의 bptt_max_coarse_steps (null = 전체)
-BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-3}"
+BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-8}"
 # true (기본): G rollout 을 1개씩 순차 실행 후 각각 backward → 피크 메모리 ≈ G 배 절감
 BPTT_SEQUENTIAL_ROLLOUTS="${BPTT_SEQUENTIAL_ROLLOUTS:-false}"
 # 앞 N coarse step 을 no_grad/detach (sliding-window BPTT). 0 = 비활성.
@@ -198,6 +200,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.delete_local_videos_after_wandb_upload="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD}" \
   model.model_config.finetune.bptt_n_rollouts="${BPTT_N_ROLLOUTS}" \
   model.model_config.finetune.rmm_bptt_use_ref_model="${RMM_BPTT_USE_REF_MODEL}" \
+  model.model_config.finetune.rmm_bptt_ref_val="${RMM_BPTT_REF_VAL}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \

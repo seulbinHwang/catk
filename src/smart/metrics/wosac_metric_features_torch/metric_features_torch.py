@@ -20,7 +20,7 @@ _ChallengeType = submission_specs.ChallengeType
 _LaneType = map_pb2.LaneCenter.LaneType
 
 _STATIC_SCENARIO_CACHE: dict[str, dict] = {}
-_STATIC_SCENARIO_CACHE_MAX = 128
+_STATIC_SCENARIO_CACHE_MAX = 2048
 
 _COMPILED_FNS: dict[str, object] = {}
 
@@ -69,6 +69,14 @@ def _cache_get_or_build(scenario: scenario_pb2.Scenario) -> dict:
     else:
         ts_lane_id = ts_state = ts_stop_point = None
 
+    # Pre-build logged trajectory tensor (proto → torch) and evaluated agent IDs.
+    # These are reused across all G rollouts in BPTT training, eliminating G-fold
+    # redundant proto parsing.
+    logged_full_cpu = object_trajectories_from_scenario(scenario)
+    eval_ids_list = list(submission_specs.get_evaluation_sim_agent_ids(
+        scenario, _ChallengeType.SIM_AGENTS
+    ))
+
     built = {
         "road_edges": road_edges,
         "road_edge_polylines_tensor": road_edge_polylines_tensor,
@@ -81,6 +89,8 @@ def _cache_get_or_build(scenario: scenario_pb2.Scenario) -> dict:
         "ts_lane_id": ts_lane_id,
         "ts_state": ts_state,
         "ts_stop_point": ts_stop_point,
+        "logged_full_cpu": logged_full_cpu,
+        "eval_ids_list": eval_ids_list,
     }
     _STATIC_SCENARIO_CACHE[sid] = built
     if len(_STATIC_SCENARIO_CACHE) > _STATIC_SCENARIO_CACHE_MAX:

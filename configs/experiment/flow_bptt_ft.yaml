@@ -50,11 +50,16 @@ model:
       # true: sim_features 극값과 per-metric likelihood 를 WARNING 로 출력 (디버깅용)
       bptt_debug: false
       # true: G rollout 을 순차 실행해 각각 즉시 backward → 피크 메모리 ≈ G 배 절감.
-      # precision=32-true 에서만 안전. G=1 이면 효과 없음.
-      bptt_sequential_rollouts: true
+      # !! DDP 멀티-GPU 에서 사용 금지: G+1 backward 호출로 bucket reducer 오동작 → gradient=0.
+      # precision=32-true 단일 GPU 환경에서만 안전. G=1 이면 효과 없음.
+      bptt_sequential_rollouts: false
       # 앞 N coarse step 을 no_grad + detach (sliding-window BPTT).
       # 0 이하 = 비활성. 예: 12 → 마지막 4 step (bptt_max_coarse_steps=16 기준) 만 gradient.
       bptt_warm_coarse_steps: 0
+      # true: validation 시 pretrained ref model 도 동일 조건으로 rollout →
+      # val_ref/rmm 과 val_delta/rmm (= finetuned - pretrained) 로깅.
+      # validation 시간 ≈ 2배. noise 는 자동으로 정합.
+      rmm_bptt_ref_val: false
 
 ckpt_path: null
 

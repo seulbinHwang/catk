@@ -24,7 +24,11 @@ from . import trajectory_features_torch as traj
 from . import interaction_features_torch as inter
 from . import map_metric_features_torch as map_feat
 from . import traffic_light_features_torch as tl_feat
-from .metric_features_torch import ObjectTrajectoriesTorch, object_trajectories_from_scenario
+from .metric_features_torch import (
+    ObjectTrajectoriesTorch,
+    object_trajectories_from_scenario,
+    _cache_get_or_build,
+)
 
 _ChallengeType = submission_specs.ChallengeType
 _LaneType = map_pb2.LaneCenter.LaneType
@@ -65,11 +69,12 @@ def _build_simulated_trajectories_from_prediction(
     scenario: scenario_pb2.Scenario,
     pred: PredictedSimTrajectories,
     challenge_type: _ChallengeType = _ChallengeType.SIM_AGENTS,
+    logged_full_cpu: ObjectTrajectoriesTorch | None = None,
 ) -> ObjectTrajectoriesTorch:
     device = pred.center_x.device
     cfg = submission_specs.get_submission_config(challenge_type)
-    logged_full = object_trajectories_from_scenario(scenario).gather_objects_by_id(pred.object_id.cpu())
-    logged_full = _trajectories_to_device(logged_full, device)
+    _lf_cpu = logged_full_cpu if logged_full_cpu is not None else object_trajectories_from_scenario(scenario)
+    logged_full = _trajectories_to_device(_lf_cpu.gather_objects_by_id(pred.object_id.cpu()), device)
     logged_hist = logged_full.slice_time(0, cfg.current_time_index + 1)
 
     # sizes: repeat from last history step
@@ -106,28 +111,38 @@ def compute_metric_features_from_predicted_sim_trajectories(
         raise NotImplementedError("Only SIM_AGENTS supported")
 
     device = pred.center_x.device
+
+    # Use per-process scenario cache to avoid G-fold redundant proto→tensor conversion.
+    _sc = _cache_get_or_build(scenario)
+    logged_full_cpu: ObjectTrajectoriesTorch = (
+        _sc["logged_full_cpu"]
+        if "logged_full_cpu" in _sc
+        else object_trajectories_from_scenario(scenario)
+    )
+
     simulated = _build_simulated_trajectories_from_prediction(
-        scenario=scenario, pred=pred, challenge_type=challenge_type
+        scenario=scenario, pred=pred, challenge_type=challenge_type,
+        logged_full_cpu=logged_full_cpu,
     )
 
-    logged_full = object_trajectories_from_scenario(scenario).gather_objects_by_id(simulated.object_id.cpu())
-    logged_full = _trajectories_to_device(logged_full, device)
+    # Reorder simulated so evaluated agents come first.
+    if "eval_ids_list" in _sc:
+        _eval_ids_list = _sc["eval_ids_list"]
+    else:
+        _eval_ids_list = list(submission_specs.get_evaluation_sim_agent_ids(scenario, challenge_type))
+    evaluated_ids = torch.tensor(_eval_ids_list, dtype=torch.int64, device=device)
 
-    evaluated_ids = torch.tensor(
-        submission_specs.get_evaluation_sim_agent_ids(scenario, challenge_type),
-        dtype=torch.int64,
-        device=simulated.x.device,
-    )
     evaluated = simulated.gather_objects_by_id(evaluated_ids)
-
-    # reorder simulated so evaluated first (then non-evaluated)
-    non_eval = [oid for oid in simulated.object_id.tolist() if oid not in set(evaluated_ids.tolist())]
+    non_eval = [oid for oid in simulated.object_id.tolist() if oid not in set(_eval_ids_list)]
     reordered_ids = torch.tensor(
-        list(evaluated_ids.tolist()) + non_eval, dtype=torch.int64, device=simulated.x.device
+        _eval_ids_list + non_eval, dtype=torch.int64, device=device
     )
     simulated = simulated.gather_objects_by_id(reordered_ids)
 
-    eval_logged = logged_full.gather_objects_by_id(evaluated_ids)
+    # Gather eval-agent logged trajectories using cached logged_full (no re-parse).
+    eval_logged = _trajectories_to_device(
+        logged_full_cpu.gather_objects_by_id(evaluated_ids.cpu()), device
+    )
     # 시나리오 GT는 전체 시간(예: 91 step), closed-loop pred는 짧을 수 있음 → 같은 글로벌 인덱스 0..T-1만 비교.
     _t_sim = int(simulated.x.shape[1])
     _t_log = int(eval_logged.x.shape[1])
@@ -170,7 +185,7 @@ def compute_metric_features_from_predicted_sim_trajectories(
         seconds_per_step=cfg.step_duration_seconds,
     )
 
-    road_edges = [list(mf.road_edge.polyline) for mf in scenario.map_features if mf.HasField("road_edge")]
+    road_edges = _sc.get("road_edges") or [list(mf.road_edge.polyline) for mf in scenario.map_features if mf.HasField("road_edge")]
     d_road = map_feat.compute_distance_to_road_edge(
         center_x=simulated.x,
         center_y=simulated.y,
@@ -182,15 +197,20 @@ def compute_metric_features_from_predicted_sim_trajectories(
         valid=simulated.valid,
         evaluated_object_mask=eval_object_mask,
         road_edge_polylines=road_edges,
+        road_edge_polylines_tensor=_sc.get("road_edge_polylines_tensor"),
+        is_polyline_cyclic=_sc.get("road_edge_is_cyclic"),
     )
 
-    lane_ids: List[int] = []
-    lane_polys: List[List[map_pb2.MapPoint]] = []
-    for mf in scenario.map_features:
-        if mf.HasField("lane") and mf.lane.type == _LaneType.TYPE_SURFACE_STREET:
-            lane_ids.append(int(mf.id))
-            lane_polys.append(list(mf.lane.polyline))
-    traffic_signals = [list(dms.lane_states) for dms in scenario.dynamic_map_states]
+    lane_ids: List[int] = _sc.get("lane_ids") or []
+    lane_polys: List[List[map_pb2.MapPoint]] = _sc.get("lane_polys") or []
+    traffic_signals = _sc.get("traffic_signals") or []
+    if not lane_ids:
+        for mf in scenario.map_features:
+            if mf.HasField("lane") and mf.lane.type == _LaneType.TYPE_SURFACE_STREET:
+                lane_ids.append(int(mf.id))
+                lane_polys.append(list(mf.lane.polyline))
+    if not traffic_signals:
+        traffic_signals = [list(dms.lane_states) for dms in scenario.dynamic_map_states]
 
     if lane_polys and traffic_signals:
         if surrogate is None:
@@ -213,6 +233,11 @@ def compute_metric_features_from_predicted_sim_trajectories(
                 lane_ids=lane_ids,
                 traffic_signals=traffic_signals,
                 crossing_temperature=surrogate.red_light_crossing_temperature,
+                lane_tensor=_sc.get("lane_tensor"),
+                lane_ids_tensor=_sc.get("lane_ids_tensor"),
+                ts_lane_id=_sc.get("ts_lane_id"),
+                ts_state=_sc.get("ts_state"),
+                ts_stop_point=_sc.get("ts_stop_point"),
             )
     else:
         red_light = torch.zeros(

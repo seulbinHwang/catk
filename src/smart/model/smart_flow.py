@@ -53,6 +53,17 @@ from src.smart.metrics.wosac_metric_features_torch.surrogate import SurrogateCon
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
+# ── Per-process caches (survive across Lightning training steps) ──────────────
+# Scenario protos: eliminates TFRecord disk I/O + proto parse on repeat steps.
+# 256 scenarios × ~2 MB/proto ≈ 512 MB peak RAM — acceptable for a training machine.
+_SCENARIO_PROTO_CACHE: dict = {}
+_SCENARIO_PROTO_CACHE_MAX: int = 256
+
+# log_feat_dict: eliminates compute_metric_features (TF-based) on repeat steps.
+# Stored as CPU tensors. ~100 KB/scenario × 2048 ≈ 200 MB peak.
+_LOG_FEAT_DICT_CACHE: dict = {}
+_LOG_FEAT_DICT_CACHE_MAX: int = 2048
+
 
 def _slice_log_feat_dict_to_pred_horizon(
     log_feat_dict: dict[str, Tensor],
@@ -156,6 +167,25 @@ class SMARTFlow(LightningModule):
                 max_workers=model_config.sim_agents_metric_workers,
             )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
+
+        # pretrained ref model validation (Δ RMM = finetuned − ref)
+        _ref_val_on = (
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "rmm_bptt_ft"
+            and bool(getattr(self.finetune_config, "rmm_bptt_ref_val", False))
+            and bool(getattr(model_config, "val_closed_loop", True))
+        )
+        self._ref_val_enabled: bool = _ref_val_on
+        if _ref_val_on:
+            if _validation_metric == "hard":
+                self.ref_sim_agents_metrics: HardSimAgentsMetrics | SimAgentsMetrics | None = HardSimAgentsMetrics("val_ref")
+            else:
+                self.ref_sim_agents_metrics = SimAgentsMetrics(
+                    "val_ref",
+                    max_workers=model_config.sim_agents_metric_workers,
+                )
+        else:
+            self.ref_sim_agents_metrics = None
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
         self.closed_loop_metric_name = "val_closed/sim_agents_2025/realism_meta_metric"
@@ -1214,7 +1244,10 @@ class SMARTFlow(LightningModule):
             self.finetune_config.enabled
             and self.ref_flow_decoder is None
             and self.finetune_config.mode == "rmm_bptt_ft"
-            and self.finetune_config.rmm_bptt_use_ref_model
+            and (
+                self.finetune_config.rmm_bptt_use_ref_model
+                or bool(getattr(self.finetune_config, "rmm_bptt_ref_val", False))
+            )
         )
         if _needs_ref:
             from copy import deepcopy
@@ -1230,11 +1263,15 @@ class SMARTFlow(LightningModule):
         # hooks directly on trainable parameters so any NaN/Inf gradient is
         # zeroed out regardless of where it originates.
         if self._is_rmm_bptt_ft_enabled():
+            # NaN → 0, Inf → finite large value (not 0) so the optimizer still
+            # sees the direction even under mild overflow.  posinf/neginf are
+            # set to 1e4 as a last-resort cap; the per-trajectory norm-clip hook
+            # (bptt_grad_clip_traj) handles the main clipping before this fires.
             n_hooked = 0
             for p in self.parameters():
                 if p.requires_grad:
                     p.register_hook(
-                        lambda g: torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0)
+                        lambda g: torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
                     )
                     n_hooked += 1
             log.info(f"[rmm_bptt] registered nan_to_num grad hooks on {n_hooked} trainable params")
@@ -1471,6 +1508,7 @@ class SMARTFlow(LightningModule):
         from src.smart.metrics.wosac_metric_features_torch.metric_features_torch import (
             compute_metric_features,
             scenario_to_joint_scene,
+            _cache_get_or_build,
         )
         import tensorflow as tf
 
@@ -1494,29 +1532,51 @@ class SMARTFlow(LightningModule):
                 _sc_log_feat_dicts.append(None)
                 _sc_agent_ids.append(None)
                 continue
-            scenario = scenario_pb2.Scenario()
-            for tfdata in tf.data.TFRecordDataset([tfrecord_paths[sc_idx]], compression_type=""):
-                scenario.ParseFromString(bytes(tfdata.numpy()))
-                break
-            tfrecord_scenario_id = str(getattr(scenario, "scenario_id", ""))
+
             batch_scenario_id = str(scenario_ids[sc_idx])
-            if tfrecord_scenario_id != batch_scenario_id:
-                raise ValueError(
-                    "scenario_id mismatch between dataloader metadata and TFRecord content: "
-                    f"batch='{batch_scenario_id}' vs tfrecord='{tfrecord_scenario_id}'. "
-                    f"path='{tfrecord_paths[sc_idx]}'"
-                )
-            with torch.no_grad():
-                log_joint = scenario_to_joint_scene(scenario, _sim_agents_challenge)
-                log_feat = compute_metric_features(
-                    scenario, log_joint,
-                    challenge_type=_sim_agents_challenge, use_log_validity=True,
-                )
-                log_feat_dict = {
-                    k: v.to(device=agent_batch.device)
-                    for k, v in log_feat.as_dict().items()
-                }
-                log_feat_dict = _slice_log_feat_dict_to_pred_horizon(log_feat_dict, _t_hor_pre)
+
+            # ── scenario proto cache ──────────────────────────────────────────
+            scenario = _SCENARIO_PROTO_CACHE.get(batch_scenario_id)
+            if scenario is None:
+                scenario = scenario_pb2.Scenario()
+                for tfdata in tf.data.TFRecordDataset([tfrecord_paths[sc_idx]], compression_type=""):
+                    scenario.ParseFromString(bytes(tfdata.numpy()))
+                    break
+                tfrecord_scenario_id = str(getattr(scenario, "scenario_id", ""))
+                if tfrecord_scenario_id != batch_scenario_id:
+                    raise ValueError(
+                        "scenario_id mismatch between dataloader metadata and TFRecord content: "
+                        f"batch='{batch_scenario_id}' vs tfrecord='{tfrecord_scenario_id}'. "
+                        f"path='{tfrecord_paths[sc_idx]}'"
+                    )
+                _SCENARIO_PROTO_CACHE[batch_scenario_id] = scenario
+                if len(_SCENARIO_PROTO_CACHE) > _SCENARIO_PROTO_CACHE_MAX:
+                    _SCENARIO_PROTO_CACHE.pop(next(iter(_SCENARIO_PROTO_CACHE)))
+
+            # ── log_feat_dict cache ───────────────────────────────────────────
+            _lf_key = f"{batch_scenario_id}_{_t_hor_pre}"
+            _lf_cpu = _LOG_FEAT_DICT_CACHE.get(_lf_key)
+            if _lf_cpu is None:
+                with torch.no_grad():
+                    log_joint = scenario_to_joint_scene(scenario, _sim_agents_challenge)
+                    log_feat = compute_metric_features(
+                        scenario, log_joint,
+                        challenge_type=_sim_agents_challenge, use_log_validity=True,
+                    )
+                    log_feat_dict = {
+                        k: v.to(device=agent_batch.device)
+                        for k, v in log_feat.as_dict().items()
+                    }
+                    log_feat_dict = _slice_log_feat_dict_to_pred_horizon(log_feat_dict, _t_hor_pre)
+                _lf_cpu = {k: v.cpu() for k, v in log_feat_dict.items()}
+                _LOG_FEAT_DICT_CACHE[_lf_key] = _lf_cpu
+                if len(_LOG_FEAT_DICT_CACHE) > _LOG_FEAT_DICT_CACHE_MAX:
+                    _LOG_FEAT_DICT_CACHE.pop(next(iter(_LOG_FEAT_DICT_CACHE)))
+            else:
+                log_feat_dict = {k: v.to(device=agent_batch.device) for k, v in _lf_cpu.items()}
+
+            # ── static scenario cache (road edges, lanes, logged traj) ────────
+            _cache_get_or_build(scenario)
             _sc_scenarios.append(scenario)
             _sc_log_feat_dicts.append(log_feat_dict)
             _sc_agent_ids.append(agent_ids[sc_mask])
@@ -1587,9 +1647,13 @@ class SMARTFlow(LightningModule):
 
                     if count_g > 0:
                         rmm_g = total_rmm_g / float(count_g)
-                        total_rmm_accum += rmm_g.detach().item()
+                        # Use the .item() sync we need anyway for logging to
+                        # also check finiteness — avoids a second CUDA sync
+                        # from torch.isfinite(rmm_g).
+                        rmm_g_val = rmm_g.detach().item()
+                        total_rmm_accum += rmm_g_val
                         total_count_accum += 1
-                        if torch.isfinite(rmm_g):
+                        if math.isfinite(rmm_g_val):
                             partial_loss = -rmm_g / G
                             partial_loss.backward()
                         else:
@@ -1607,7 +1671,16 @@ class SMARTFlow(LightningModule):
                 dtype=torch.float32, device=agent_batch.device,
             )
             _step = int(getattr(self, "global_step", 0))
-            log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f}")
+            # EMA for monitoring only (not used in loss)
+            _ema_mom = 0.98
+            if hasattr(self, "_rmm_ema_mean"):
+                if not self._rmm_ema_initialized:
+                    self._rmm_ema_mean.fill_(mean_rmm.item())
+                    self._rmm_ema_initialized = True
+                else:
+                    self._rmm_ema_mean = _ema_mom * self._rmm_ema_mean + (1 - _ema_mom) * mean_rmm.detach()
+            _ema_log = self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach()
+            log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_log.item():.4f}")
 
             # DDP: 모든 trainable param 을 dummy loss graph 에 연결해야 bucket reducer 가 정상 작동.
             # manual backward 로 grad 는 이미 누적됐으므로 backward() 추가 기여는 0.
@@ -1616,6 +1689,7 @@ class SMARTFlow(LightningModule):
                 "loss": _ddp_dummy,   # grads already accumulated via manual backward
                 "train/rmm_soft": mean_rmm,
                 "train/rmm_loss": -mean_rmm,
+                "train/rmm_ema": _ema_log,
                 "train/rmm_n_scenarios": torch.tensor(float(total_count_accum), device=mean_rmm.device),
             }
 
@@ -1689,13 +1763,23 @@ class SMARTFlow(LightningModule):
             return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
 
         _step = int(getattr(self, "global_step", 0))
-        log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f}")
+        # EMA for monitoring only (not used in loss)
+        _ema_mom = 0.98
+        if hasattr(self, "_rmm_ema_mean"):
+            if not self._rmm_ema_initialized:
+                self._rmm_ema_mean.fill_(mean_rmm.item())
+                self._rmm_ema_initialized = True
+            else:
+                self._rmm_ema_mean = _ema_mom * self._rmm_ema_mean + (1 - _ema_mom) * mean_rmm.detach()
+        _ema_log = self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach()
+        log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_log.item():.4f}")
 
         loss = -mean_rmm
         return {
             "loss": loss,
             "train/rmm_soft": mean_rmm.detach(),
             "train/rmm_loss": loss.detach(),
+            "train/rmm_ema": _ema_log,
             "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
         }
 
@@ -2363,6 +2447,36 @@ class SMARTFlow(LightningModule):
                             if self.delete_local_videos_after_wandb_upload:
                                 self._cleanup_local_video(video_path)
 
+            # ── pretrained ref rollout (Δ RMM 기준선) ─────────────────────
+            if (
+                self._ref_val_enabled
+                and self.ref_flow_decoder is not None
+                and self.ref_sim_agents_metrics is not None
+                and not self.sim_agents_submission.is_active
+                and batch_idx < self.n_batch_sim_agents_metric
+            ):
+                # flow_decoder 를 pretrained ref 로 교체 후 동일 조건 rollout.
+                # scenario_sampling_seeds 는 scenario_id+rollout_idx 해시로 결정되므로
+                # 위 finetuned rollout 과 자동으로 같은 noise 를 사용합니다.
+                _orig_fd = self.encoder.agent_encoder.flow_decoder
+                self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
+                try:
+                    ref_pred_traj, ref_pred_z, ref_pred_head = self._run_closed_loop_rollouts(
+                        data=data,
+                        tokenized_agent=tokenized_agent,
+                        map_feature=map_feature,
+                    )
+                finally:
+                    self.encoder.agent_encoder.flow_decoder = _orig_fd
+                self.ref_sim_agents_metrics.update_from_prediction_tensors(
+                    scenario_files=data["tfrecord_path"],
+                    agent_id=data["agent"]["id"],
+                    agent_batch=data["agent"]["batch"],
+                    pred_traj=ref_pred_traj,
+                    pred_z=ref_pred_z,
+                    pred_head=ref_pred_head,
+                )
+
     def on_validation_epoch_end(self):
         if self.val_open_loop:
             epoch_open_metrics = self._compute_and_reset_validation_metrics(
@@ -2437,6 +2551,30 @@ class SMARTFlow(LightningModule):
                     self.logger.log_metrics(epoch_sim_agents_metrics)
                 self.sim_agents_metrics.reset()
                 self.minADE.reset()
+
+                # ── ref model metrics + Δ RMM ─────────────────────────────
+                if self._ref_val_enabled and self.ref_sim_agents_metrics is not None:
+                    self.ref_sim_agents_metrics._drain_completed_futures(wait=True, drain_all=True)
+                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                        ref_state = self.ref_sim_agents_metrics.get_state_tensor(device=self.device)
+                        torch.distributed.all_reduce(ref_state)
+                        ref_epoch_metrics = self.ref_sim_agents_metrics.compute_from_state_tensor(ref_state)
+                    else:
+                        ref_epoch_metrics = self.ref_sim_agents_metrics.compute()
+                    ref_rmm_key = "val_ref/sim_agents_2025/realism_meta_metric"
+                    delta_rmm_key = "val_delta/sim_agents_2025/realism_meta_metric"
+                    ref_rmm = ref_epoch_metrics[ref_rmm_key]
+                    delta_rmm = closed_loop_metric - ref_rmm
+                    self.log(ref_rmm_key, ref_rmm, on_step=False, on_epoch=True, sync_dist=False)
+                    self.log(delta_rmm_key, delta_rmm, on_step=False, on_epoch=True, sync_dist=False)
+                    if self.global_rank == 0 and self.logger is not None:
+                        self.logger.log_metrics({
+                            ref_rmm_key: ref_rmm,
+                            delta_rmm_key: delta_rmm,
+                            "epoch": self.log_epoch if self.log_epoch >= 0 else self.current_epoch,
+                        })
+                    self.ref_sim_agents_metrics.reset()
+
             if self.sim_agents_submission.is_active:
                 self.sim_agents_submission.save_sub_file()
 

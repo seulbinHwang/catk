@@ -90,6 +90,11 @@ class FinetuneConfig:
     #: 0 이하면 비활성 (모든 coarse step 이 gradient 를 받음).
     #: 예: bptt_max_coarse_steps=16, bptt_warm_coarse_steps=12 → 마지막 4 step 만 gradient.
     bptt_warm_coarse_steps: int = 0
+    #: True → validation 시 pretrained ref model 도 closed-loop rollout 해 ``val_ref/rmm`` 과
+    #: ``val_delta/rmm`` (= finetuned − pretrained) 을 로깅. flow_decoder 를 ref 로 교체 후
+    #: no_grad rollout 이므로 validation 시간 ≈ 2배. noise 는 scenario_id+rollout_idx 해시로
+    #: 결정되므로 finetuned rollout 과 자동으로 동일한 noise 를 씁니다.
+    rmm_bptt_ref_val: bool = False
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
