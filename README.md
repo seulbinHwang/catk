@@ -675,7 +675,7 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 - `model.model_config.draft.penalty_type=lqr` 로 바꾸면 physics regularizer 대신
   **raw 2초 draft → exact runtime LQR 실행 → 첫 0.5초 5점** 경로를 직접 GT 첫 0.5초와 맞추는 penalty를 사용합니다.
 
-LQR penalty를 쓸 때는 아래 runtime 설정이 같이 맞아야 합니다.
+아래 runtime 설정을 같이 두면 LQR penalty가 보는 실행 경로와 closed-loop runtime 경로를 맞출 수 있습니다.
 
 - `model.model_config.decoder.use_lqr=true`
 - `model.model_config.decoder.use_stop_motion=false`
@@ -683,8 +683,7 @@ LQR penalty를 쓸 때는 아래 runtime 설정이 같이 맞아야 합니다.
 - `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=false`
 
 `configs/experiment/finetune_draft_flow.yaml`은 이미 이 값을 위처럼 덮어쓰도록 바꿔 두었습니다.
-현재 구현은 `draft.penalty_type=lqr`일 때 위 네 조건이 맞지 않으면 바로 에러를 내서,
-학습 penalty와 실제 검증 정책이 어긋나지 않게 막습니다.
+다만 필요하면 이 조건과 다르게 둬도 `draft.penalty_type=lqr` 자체는 에러 없이 사용할 수 있습니다.
 
 loss와 로그는 아래처럼 보면 됩니다.
 
@@ -713,7 +712,7 @@ loss와 로그는 아래처럼 보면 됩니다.
 # physics penalty 유지
 ... model.model_config.draft.penalty_type=physics
 
-# lqr penalty로 바꾸고 runtime 경로도 같이 맞추기
+# lqr penalty로 바꾸고 penalty/runtime 경로도 같이 맞추기
 ... model.model_config.draft.penalty_type=lqr \
     model.model_config.decoder.use_lqr=true \
     model.model_config.decoder.use_stop_motion=false \

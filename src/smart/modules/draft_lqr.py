@@ -61,23 +61,6 @@ class DraftLQRRegularizer(nn.Module):
         pos_scale_m: float = 20.0,
     ) -> None:
         super().__init__()
-        if not bool(getattr(commit_bridge, "use_lqr", False)):
-            raise ValueError("DraftLQRRegularizer requires decoder.use_lqr=true.")
-        if bool(getattr(commit_bridge, "use_stop_motion", False)):
-            raise ValueError(
-                "DraftLQRRegularizer requires decoder.use_stop_motion=false "
-                "so the training penalty matches the requested runtime path."
-            )
-        if bool(getattr(commit_bridge.config, "clip_longitudinal_command", False)):
-            raise ValueError(
-                "DraftLQRRegularizer requires "
-                "decoder.lqr_commit.clip_longitudinal_command=false."
-            )
-        if bool(getattr(commit_bridge.config, "clip_lateral_projection_and_final_curvature_state", False)):
-            raise ValueError(
-                "DraftLQRRegularizer requires "
-                "decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=false."
-            )
         self.commit_bridge = commit_bridge
         self.pos_scale_m = float(pos_scale_m)
 

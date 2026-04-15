@@ -22,7 +22,7 @@ model:
         clip_lateral_projection_and_final_curvature_state: false
     draft:
       enabled: true
-      penalty_type: physics # physics | lqr
+      penalty_type: lqr # physics | lqr
       start_epoch: 0
       ramp_epochs: 32
       max_weight: 0.35 # 0.05 가 1:1 비율임.
