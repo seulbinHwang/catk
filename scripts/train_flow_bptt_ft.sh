@@ -114,6 +114,8 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
 BPTT_N_ROLLOUTS="${BPTT_N_ROLLOUTS:-4}"
 RMM_BPTT_USE_REF_MODEL="${RMM_BPTT_USE_REF_MODEL:-false}"
+# true: training step 마다 ref G rollout (no_grad) → train/rmm_ref + train/rmm_delta 로깅
+RMM_BPTT_REF_TRAIN="${RMM_BPTT_REF_TRAIN:-true}"
 # true: validation 시 pretrained ref model 도 rollout → val_ref/rmm + val_delta/rmm (val 시간 ≈ 2배)
 RMM_BPTT_REF_VAL="${RMM_BPTT_REF_VAL:-true}"
 # OOM 발생 시 true로 설정: flow ODE model_fn 호출을 gradient checkpoint으로 감쌈
@@ -200,6 +202,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.delete_local_videos_after_wandb_upload="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD}" \
   model.model_config.finetune.bptt_n_rollouts="${BPTT_N_ROLLOUTS}" \
   model.model_config.finetune.rmm_bptt_use_ref_model="${RMM_BPTT_USE_REF_MODEL}" \
+  model.model_config.finetune.rmm_bptt_ref_train="${RMM_BPTT_REF_TRAIN}" \
   model.model_config.finetune.rmm_bptt_ref_val="${RMM_BPTT_REF_VAL}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \

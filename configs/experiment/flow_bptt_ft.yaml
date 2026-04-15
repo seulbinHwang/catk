@@ -56,6 +56,8 @@ model:
       # 앞 N coarse step 을 no_grad + detach (sliding-window BPTT).
       # 0 이하 = 비활성. 예: 12 → 마지막 4 step (bptt_max_coarse_steps=16 기준) 만 gradient.
       bptt_warm_coarse_steps: 0
+      # true: training step 마다 ref model G rollout (no_grad) → train/rmm_ref + train/rmm_delta 로깅.
+      rmm_bptt_ref_train: false
       # true: validation 시 pretrained ref model 도 동일 조건으로 rollout →
       # val_ref/rmm 과 val_delta/rmm (= finetuned - pretrained) 로깅.
       # validation 시간 ≈ 2배. noise 는 자동으로 정합.

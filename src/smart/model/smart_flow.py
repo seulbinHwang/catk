@@ -168,10 +168,13 @@ class SMARTFlow(LightningModule):
             )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
 
-        # pretrained ref model validation (Δ RMM = finetuned − ref)
+        # pretrained ref model Δ RMM 모니터링 플래그 (train / val 독립)
+        _is_bptt = self.finetune_config.enabled and self.finetune_config.mode == "rmm_bptt_ft"
+        self._ref_train_enabled: bool = (
+            _is_bptt and bool(getattr(self.finetune_config, "rmm_bptt_ref_train", False))
+        )
         _ref_val_on = (
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "rmm_bptt_ft"
+            _is_bptt
             and bool(getattr(self.finetune_config, "rmm_bptt_ref_val", False))
             and bool(getattr(model_config, "val_closed_loop", True))
         )
@@ -1246,7 +1249,8 @@ class SMARTFlow(LightningModule):
             and self.finetune_config.mode == "rmm_bptt_ft"
             and (
                 self.finetune_config.rmm_bptt_use_ref_model
-                or bool(getattr(self.finetune_config, "rmm_bptt_ref_val", False))
+                or self._ref_train_enabled
+                or self._ref_val_enabled
             )
         )
         if _needs_ref:
@@ -1692,8 +1696,8 @@ class SMARTFlow(LightningModule):
                 "train/rmm_ema": _ema_log,
                 "train/rmm_n_scenarios": torch.tensor(float(total_count_accum), device=mean_rmm.device),
             }
-            # sequential mode: ref soft RMM (same helper, rollout_indices=[0])
-            if self._ref_val_enabled and self.ref_flow_decoder is not None:
+            # sequential mode: ref soft RMM (train Δ 모니터링)
+            if self._ref_train_enabled and self.ref_flow_decoder is not None:
                 _orig_fd = self.encoder.agent_encoder.flow_decoder
                 self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
                 try:
@@ -1822,7 +1826,7 @@ class SMARTFlow(LightningModule):
         # finetuned 와 동일한 G개 rollout (no_grad → gradient graph 에 영향 없음).
         # rollout_indices=list(range(G)) → 동일 hash seed → noise 완전 정합.
         ref_rmm_log: Tensor | None = None
-        if self._ref_val_enabled and self.ref_flow_decoder is not None:
+        if self._ref_train_enabled and self.ref_flow_decoder is not None:
             _orig_fd = self.encoder.agent_encoder.flow_decoder
             self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
             try:
