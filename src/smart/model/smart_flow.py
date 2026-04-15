@@ -1711,6 +1711,7 @@ class SMARTFlow(LightningModule):
                             return_anchor_hidden=True,
                             full_grad=True,   # no_grad context 내에서 max_steps 적용
                             max_steps=bptt_max_coarse_steps,
+                            warm_coarse_steps=warm_coarse,
                         )
                 finally:
                     self.encoder.agent_encoder.flow_decoder = _orig_fd
@@ -1831,9 +1832,10 @@ class SMARTFlow(LightningModule):
             self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
             try:
                 with torch.no_grad():
-                    # full_grad=True を使う: rollout_from_cache_no_grad は max_steps を
+                    # full_grad=True: rollout_from_cache_no_grad は max_steps を
                     # 受け付けないため常に 80 step を返す → log_feat_dict の長さ不一致.
                     # torch.no_grad() 内なので gradient は生成されず安全.
+                    # warm_coarse_steps も finetuned と揃えて完全同条件にする.
                     ref_traj, ref_z, ref_head, _ = self._run_parallel_rollout_chunk(
                         data=data,
                         tokenized_agent=tokenized_agent,
@@ -1843,6 +1845,7 @@ class SMARTFlow(LightningModule):
                         return_anchor_hidden=True,
                         full_grad=True,
                         max_steps=bptt_max_coarse_steps,
+                        warm_coarse_steps=warm_coarse,
                     )
             finally:
                 self.encoder.agent_encoder.flow_decoder = _orig_fd
