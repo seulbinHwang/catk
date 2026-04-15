@@ -595,10 +595,10 @@ torchrun \
 `finetune_flow_range` 기본 설정은 아래와 같습니다.
 
 - learning rate: `2e-4`
-- max epochs: `16`
-- train batch size: `20`
+- max epochs: `32`
+- train batch size: `48`
 - val batch size: `16`
-- validation 주기: `4` epoch마다
+- validation 주기: `16` epoch마다
 - `data.train_use_eval_agent_selection=true`
 
 메모리 관련 주의:
@@ -634,8 +634,8 @@ torchrun \
 
 ### 5.7 6x H100에서 DRaFT fine-tuning
 
-`configs/experiment/finetune_draft_flow.yaml`을 써서
-**기존 flow checkpoint 위에 DRaFT physics regularizer를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
+`configs/experiment/finetune_draft_flow.yaml`을 쓰면
+**기존 flow checkpoint 위에 DRaFT penalty를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
 이 경로는 pretrain을 이어서 resume하는 용도가 아니라,
 **이미 학습된 checkpoint의 weight만 읽어서 새 fine-tuning run을 시작하는 용도**입니다.
 
@@ -644,28 +644,17 @@ torchrun \
 ```bash
 export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-torchrun \
-  --standalone \
-  --nproc_per_node=6 \
-  -m src.run \
-  experiment=finetune_draft_flow \
-  action=finetune \
-  trainer=ddp \
-  trainer.devices=6 \
-  paths.cache_root="$CACHE_ROOT" \
-  ckpt_path="$PRETRAIN_CKPT" \
-  task_name=flow_semi_continuous_finetune_h1006
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun   --standalone   --nproc_per_node=6   -m src.run   experiment=finetune_draft_flow   action=finetune   trainer=ddp   trainer.devices=6   paths.cache_root="$CACHE_ROOT"   ckpt_path="$PRETRAIN_CKPT"   task_name=flow_semi_continuous_finetune_h1006
 ```
 
 중요한 차이:
 
 - 첫 fine-tuning 시작은 반드시 `action=finetune`를 사용합니다.
-- 현재 구현은 `torch.load(ckpt)["state_dict"]`를 `strict=False`로 읽은 뒤 `trainer.fit(...)`을 새로 시작합니다. 
+- 현재 구현은 `torch.load(ckpt)["state_dict"]`를 `strict=False`로 읽은 뒤 `trainer.fit(...)`을 새로 시작합니다.
 - 즉, optimizer / lr scheduler / epoch / global step은 이어받지 않습니다.
 - 반대로 `action=fit`에 `ckpt_path=...`를 주면 **resume training**으로 동작합니다. 이 경우 이전 run의 optimizer 상태까지 이어받습니다.
-- 따라서 pretrained checkpoint에서 fine-tuning을 처음 시작할 때만 `action=finetune`를 쓰고, 
-- 시작한 fine-tuning run이 중단됐으면 그 다음부터는 위 `5.4 중단된 학습 재개하기` 
+- 따라서 pretrained checkpoint에서 fine-tuning을 처음 시작할 때만 `action=finetune`를 쓰고,
+- 시작한 fine-tuning run이 중단됐으면 그 다음부터는 위 `5.4 중단된 학습 재개하기`
 - 방식대로 `action=fit` + fine-tuning run의 `last.ckpt` 또는 `epoch_last.ckpt`를 쓰면 됩니다.
 
 fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
@@ -678,24 +667,42 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 `finetune_draft_flow` 기본 설정은 아래와 같습니다.
 
 - learning rate: `2e-4`
-- max epochs: `16`
-- train batch size: `20`
+- max epochs: `32`
+- train batch size: `48`
 - val batch size: `16`
-- validation 주기: `4` epoch마다
+- validation 주기: `16` epoch마다
+- `model.model_config.draft.penalty_type=physics` 가 기본값입니다.
+- `model.model_config.draft.penalty_type=lqr` 로 바꾸면 physics regularizer 대신
+  **raw 2초 draft → exact runtime LQR 실행 → 첫 0.5초 5점** 경로를 직접 GT 첫 0.5초와 맞추는 penalty를 사용합니다.
 
+LQR penalty를 쓸 때는 아래 runtime 설정이 같이 맞아야 합니다.
+
+- `model.model_config.decoder.use_lqr=true`
+- `model.model_config.decoder.use_stop_motion=false`
+- `model.model_config.decoder.lqr_commit.clip_longitudinal_command=false`
+- `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=false`
+
+`configs/experiment/finetune_draft_flow.yaml`은 이미 이 값을 위처럼 덮어쓰도록 바꿔 두었습니다.
+현재 구현은 `draft.penalty_type=lqr`일 때 위 네 조건이 맞지 않으면 바로 에러를 내서,
+학습 penalty와 실제 검증 정책이 어긋나지 않게 막습니다.
 
 loss와 로그는 아래처럼 보면 됩니다.
 
 - `train/loss`는 최종 학습 loss입니다.
 - `train/loss_fm`는 원래 flow matching loss입니다.
-- `train/loss_phys`는 DRaFT physics penalty입니다.
-- 실제로는 `train/loss = train/loss_fm + train/draft_weight * train/loss_phys` 형태로 합쳐집니다.
-- 기본 구현은 trainer가 `bf16-mixed`여도 DRaFT physics regularizer 계산 구간만 fp32 subregion에서 수행합니다.
 - `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
-- `train/*`에는 요약 지표만 남습니다. 세부 physics gap은 `raw_feaisble_gap/speed`, `raw_feaisble_gap/accel` 같은 prefix로 기록됩니다.
-- 실제 단위 위반량도 함께 기록됩니다. 예를 들어 gap 기준 값은 `raw_feaisble_gap/speed_excess_mps`, `raw_feaisble_gap/accel_excess_mps2`, raw 예측값은 `raw_feaisble_gap/pred_accel_excess_mps2`, GT 기준값은 `gt_feasible_gap/accel_excess_mps2`처럼 기록됩니다.
-- 첫 delta는 `accel`, `yaw_accel`에 함께 포함됩니다. `prev_control_valid`가 `False`면 첫 delta만 마스킹되고, 별도 `start` metric은 기록하지 않습니다.
-- 합성 항은 하위 물리량으로 나뉘어 기록됩니다. 예를 들어 `slip`은 `raw_feaisble_gap/slip_beta_excess_deg`, `turn`은 `raw_feaisble_gap/turn_yaw_rate_excess_degps`, `raw_feaisble_gap/turn_lat_accel_excess_mps2`, `raw_feaisble_gap/turn_radius_shortfall_m`으로 볼 수 있습니다.
+- `draft.penalty_type=physics`이면 기존과 동일하게 `train/loss_phys`를 기록합니다.
+- physics 모드의 최종 합성은 `train/loss = train/loss_fm + train/draft_weight * 0.005 * train/loss_phys` 입니다.
+- `draft.penalty_type=lqr`이면 `train/loss_lqr_exec`를 기록합니다.
+- lqr 모드의 최종 합성은 `train/loss = train/loss_fm + train/draft_weight * train/loss_lqr_exec` 입니다.
+- lqr penalty는 실행된 첫 0.5초 5개 점을 현재 flow target과 같은 local normalized `[x, y, cos, sin]` 표현으로 바꾼 뒤,
+  **가중치 없는 MSE**로 GT 첫 0.5초와 비교합니다.
+- lqr 모드의 세부 로그는 `draft_lqr/commit_mse`, `draft_lqr/commit_pos_ade_m`, `draft_lqr/commit_pos_fde_m`,
+  `draft_lqr/commit_yaw_ade_deg`, `draft_lqr/commit_yaw_fde_deg`, `draft_lqr/active_anchor_count` 입니다.
+- physics 모드는 기존과 같이 `raw_feaisble_gap/*`, `gt_feasible_gap/*` 세부 지표를 유지합니다.
+- 기본 구현은 trainer가 `bf16-mixed`여도 physics / lqr penalty 계산 구간만 fp32 subregion에서 수행할 수 있습니다.
+  physics는 `model.model_config.draft.physics.force_fp32=true/false`,
+  lqr는 `model.model_config.draft.lqr.force_fp32=true/false` 로 조절합니다.
 
 자주 바꾸는 override 예시는 아래와 같습니다.
 
@@ -703,17 +710,30 @@ loss와 로그는 아래처럼 보면 됩니다.
 # fine-tuning에서도 validation/추론과 같은 agent 기준 사용
 ... data.train_use_eval_agent_selection=true
 
-# physics 가중치를 더 강하게
+# physics penalty 유지
+... model.model_config.draft.penalty_type=physics
+
+# lqr penalty로 바꾸고 runtime 경로도 같이 맞추기
+... model.model_config.draft.penalty_type=lqr \
+    model.model_config.decoder.use_lqr=true \
+    model.model_config.decoder.use_stop_motion=false \
+    model.model_config.decoder.lqr_commit.clip_longitudinal_command=false \
+    model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=false
+
+# penalty 가중치를 더 강하게
 ... model.model_config.draft.max_weight=0.1
 
 # ramp를 2 epoch 동안만 수행
 ... model.model_config.draft.ramp_epochs=2
 
-# GT보다 더 나쁜 만큼만 벌주지 않고 절대 penalty 자체를 사용
+# physics 모드에서 GT보다 더 나쁜 만큼만 벌주지 않고 절대 penalty 자체를 사용
 ... model.model_config.draft.gt_excess_only=false
 
 # physics penalty도 mixed precision으로 그대로 계산
 ... model.model_config.draft.physics.force_fp32=false
+
+# lqr penalty도 mixed precision으로 그대로 계산
+... model.model_config.draft.lqr.force_fp32=false
 
 # 샘플러 역전파를 마지막 2 step에만 남겨 메모리 사용량 줄이기
 ... model.model_config.draft.sampling.backprop_last_k=2

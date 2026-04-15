@@ -11,7 +11,7 @@ from src.smart.utils import transform_to_local
 
 
 class FlowTokenProcessor(TokenProcessor):
-    """Flow 학습용 목표와 DRaFT용 보조 메타데이터를 만듭니다."""
+    """Flow 학습용 목표와 추가 penalty용 보조 메타데이터를 만듭니다."""
 
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         """지도 토큰과 에이전트 토큰을 만들고 flow 목표를 붙입니다.
@@ -87,6 +87,11 @@ class FlowTokenProcessor(TokenProcessor):
             flow_train_agent_type_chunks: List[Tensor] = []
             flow_train_prev_control_chunks: List[Tensor] = []
             flow_train_prev_control_valid_chunks: List[Tensor] = []
+            flow_train_current_pos_chunks: List[Tensor] = []
+            flow_train_current_head_chunks: List[Tensor] = []
+            flow_train_exec_pos_history_chunks: List[Tensor] = []
+            flow_train_exec_head_history_chunks: List[Tensor] = []
+            flow_train_exec_valid_history_chunks: List[Tensor] = []
 
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
@@ -118,9 +123,22 @@ class FlowTokenProcessor(TokenProcessor):
                     anchor_mask=train_anchor_mask,
                     raw_step=raw_step,
                 )
+                exec_pos_history, exec_head_history, exec_valid_history = self._build_anchor_exec_history(
+                    pos=pos,
+                    heading=heading,
+                    valid=valid,
+                    anchor_mask=train_anchor_mask,
+                    raw_step=raw_step,
+                    history_steps=6,
+                )
                 flow_train_agent_type_chunks.append(tokenized_agent["type"][train_anchor_mask])
                 flow_train_prev_control_chunks.append(prev_control)
                 flow_train_prev_control_valid_chunks.append(prev_control_valid)
+                flow_train_current_pos_chunks.append(current_pos[train_anchor_mask])
+                flow_train_current_head_chunks.append(current_head[train_anchor_mask])
+                flow_train_exec_pos_history_chunks.append(exec_pos_history)
+                flow_train_exec_head_history_chunks.append(exec_head_history)
+                flow_train_exec_valid_history_chunks.append(exec_valid_history)
 
             tokenized_agent.update(
                 {
@@ -143,6 +161,36 @@ class FlowTokenProcessor(TokenProcessor):
                     ),
                     "flow_train_prev_control_valid": self._concat_vector_chunks(
                         chunks=flow_train_prev_control_valid_chunks,
+                        dtype=torch.bool,
+                        device=device,
+                    ),
+                    "flow_train_current_pos": self._concat_matrix_chunks(
+                        chunks=flow_train_current_pos_chunks,
+                        width=2,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "flow_train_current_head": self._concat_vector_chunks(
+                        chunks=flow_train_current_head_chunks,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "flow_train_exec_pos_history": self._concat_rank3_chunks(
+                        chunks=flow_train_exec_pos_history_chunks,
+                        dim1=6,
+                        dim2=2,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "flow_train_exec_head_history": self._concat_matrix_chunks(
+                        chunks=flow_train_exec_head_history_chunks,
+                        width=6,
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "flow_train_exec_valid_history": self._concat_matrix_chunks(
+                        chunks=flow_train_exec_valid_history_chunks,
+                        width=6,
                         dtype=torch.bool,
                         device=device,
                     ),
@@ -295,6 +343,56 @@ class FlowTokenProcessor(TokenProcessor):
         prev_control[~prev_control_valid] = 0.0
         return prev_control, prev_control_valid
 
+    def _build_anchor_exec_history(
+        self,
+        pos: Tensor,
+        heading: Tensor,
+        valid: Tensor,
+        anchor_mask: Tensor,
+        raw_step: int,
+        history_steps: int,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """anchor 현재 시점까지의 실제 fine history를 길이 6으로 만듭니다.
+
+        Args:
+            pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전처리된 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            valid: 각 시점 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            anchor_mask: 이번 anchor를 실제로 쓰는 에이전트입니다. shape은 ``[n_agent]`` 입니다.
+            raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
+            history_steps: 만들 history 길이입니다.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor]:
+                현재 시점을 포함한 실제 fine history 위치, 방향, valid 입니다.
+                shape은 각각 ``[n_valid_anchor, history_steps, 2]``,
+                ``[n_valid_anchor, history_steps]``, ``[n_valid_anchor, history_steps]`` 입니다.
+        """
+        num_valid_anchor = int(anchor_mask.sum().item())
+        if num_valid_anchor == 0:
+            return (
+                pos.new_zeros((0, history_steps, 2)),
+                heading.new_zeros((0, history_steps)),
+                torch.zeros((0, history_steps), device=valid.device, dtype=torch.bool),
+            )
+
+        history_start = max(0, raw_step - history_steps + 1)
+        pos_history = pos[anchor_mask, history_start : raw_step + 1].clone()
+        head_history = heading[anchor_mask, history_start : raw_step + 1].clone()
+        valid_history = valid[anchor_mask, history_start : raw_step + 1].clone()
+        if pos_history.shape[1] == history_steps:
+            return pos_history, head_history, valid_history
+
+        pad_len = history_steps - pos_history.shape[1]
+        pad_pos = pos_history[:, :1].expand(-1, pad_len, -1)
+        pad_head = head_history[:, :1].expand(-1, pad_len)
+        pad_valid = torch.zeros((num_valid_anchor, pad_len), device=valid.device, dtype=torch.bool)
+        return (
+            torch.cat([pad_pos, pos_history], dim=1),
+            torch.cat([pad_head, head_history], dim=1),
+            torch.cat([pad_valid, valid_history], dim=1),
+        )
+
     def _concat_flow_chunks(
         self,
         chunks: List[Tensor],
@@ -360,6 +458,32 @@ class FlowTokenProcessor(TokenProcessor):
         """
         if len(chunks) == 0:
             return torch.zeros((0, width), device=device, dtype=dtype)
+        return torch.cat([chunk.to(device=device, dtype=dtype) for chunk in chunks], dim=0)
+
+    def _concat_rank3_chunks(
+        self,
+        chunks: List[Tensor],
+        dim1: int,
+        dim2: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        """3차원 조각 목록을 하나의 텐서로 잇습니다.
+
+        Args:
+            chunks: 각 조각은 ``[n_valid_anchor, dim1, dim2]`` 입니다.
+            dim1: 두 번째 축 길이입니다.
+            dim2: 마지막 축 길이입니다.
+            dtype: 반환 텐서 자료형입니다.
+            device: 반환 텐서 장치입니다.
+
+        Returns:
+            Tensor:
+                이어 붙인 3차원 텐서입니다.
+                shape은 ``[n_total_valid_anchor, dim1, dim2]`` 입니다.
+        """
+        if len(chunks) == 0:
+            return torch.zeros((0, dim1, dim2), device=device, dtype=dtype)
         return torch.cat([chunk.to(device=device, dtype=dtype) for chunk in chunks], dim=0)
 
     def _wrap_angle(self, angle: Tensor) -> Tensor:

@@ -14,8 +14,15 @@ model:
     finetune:
       enabled: true
       train_full_flow_decoder_only: true
+    decoder:
+      use_lqr: true
+      use_stop_motion: false
+      lqr_commit:
+        clip_longitudinal_command: false
+        clip_lateral_projection_and_final_curvature_state: false
     draft:
       enabled: true
+      penalty_type: physics # physics | lqr
       start_epoch: 0
       ramp_epochs: 32
       max_weight: 0.35 # 0.05 가 1:1 비율임.
@@ -25,6 +32,8 @@ model:
         sample_method: midpoint
         noise_scale: 1.0
         backprop_last_k: 12
+      lqr:
+        force_fp32: true
       physics:
         force_fp32: true
         dt: 0.1

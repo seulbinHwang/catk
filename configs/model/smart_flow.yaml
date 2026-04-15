@@ -32,6 +32,7 @@ model_config:
     noise_scale: 1.0
   draft:
     enabled: false
+    penalty_type: physics # physics | lqr
     start_epoch: 0
     ramp_epochs: 4
     max_weight: 0.1
@@ -41,6 +42,8 @@ model_config:
       sample_method: midpoint
       noise_scale: 1.0
       backprop_last_k: null
+    lqr:
+      force_fp32: true
     physics:
       force_fp32: true
       dt: 0.1
