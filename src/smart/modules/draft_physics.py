@@ -14,6 +14,7 @@ class DynamicLimitTable:
 
     Attributes:
         v_max_mps: 최고 속도 제한입니다. shape은 ``[3]`` 입니다.
+        v_reverse_max_mps: 후진 속도 크기 제한입니다. shape은 ``[3]`` 입니다.
         a_max_mps2: 앞방향 가감속 제한입니다. shape은 ``[3]`` 입니다.
         alpha_max_radps2: 회전 변화 제한입니다. shape은 ``[3]`` 입니다.
         a_lat_max_mps2: 횡가속 제한입니다. shape은 ``[3]`` 입니다.
@@ -23,6 +24,7 @@ class DynamicLimitTable:
     """
 
     v_max_mps: Tuple[float, float, float]
+    v_reverse_max_mps: Tuple[float, float, float]
     a_max_mps2: Tuple[float, float, float]
     alpha_max_radps2: Tuple[float, float, float]
     a_lat_max_mps2: Tuple[float, float, float]
@@ -35,6 +37,7 @@ DEFAULT_LIMITS = DynamicLimitTable(
     # CAT-K repo의 agent type 인덱스: vehicle=0, pedestrian=1, bicycle=2
     # 값은 Diffusion-Planner feasible.py의 제한값을 그대로 옮겼습니다.
     v_max_mps=(35.0, 5.0, 22.0),
+    v_reverse_max_mps=(1.5, 0.0, 0.5),
     a_max_mps2=(8.0, 4.7, 5.5),
     alpha_max_radps2=(1.75, 14.0, 6.0),
     a_lat_max_mps2=(4.2, 3.2, 4.4),

@@ -1172,6 +1172,9 @@ class ContinuousCommitBridge:
         device = agent_type.device
         return {
             "v_max": torch.tensor(DEFAULT_LIMITS.v_max_mps, device=device, dtype=dtype)[agent_type.long()],
+            "v_reverse_max": torch.tensor(DEFAULT_LIMITS.v_reverse_max_mps, device=device, dtype=dtype)[
+                agent_type.long()
+            ],
             "a_max": torch.tensor(DEFAULT_LIMITS.a_max_mps2, device=device, dtype=dtype)[agent_type.long()],
             "alpha_max": torch.tensor(DEFAULT_LIMITS.alpha_max_radps2, device=device, dtype=dtype)[agent_type.long()],
             "a_lat_max": torch.tensor(DEFAULT_LIMITS.a_lat_max_mps2, device=device, dtype=dtype)[agent_type.long()],
@@ -1331,7 +1334,7 @@ class ContinuousCommitBridge:
             head_state = wrap_angle(head_state + dt * speed_state * kappa_applied)
             speed_state = torch.clamp(
                 speed_state + dt * accel_applied,
-                min=-limits["v_max"],
+                min=-limits["v_reverse_max"],
                 max=limits["v_max"],
             )
             accel_state = accel_applied

@@ -59,6 +59,10 @@
 - LQR 참조 생성은 이제 `과거+미래`를 한 번에 smooth fitting 하지 않습니다.
   먼저 과거 0.5초 실제 history만으로 현재 `speed / accel / curvature / curvature-rate`를 추정하고,
   그다음 미래 FM trajectory로부터 future speed / curvature reference를 따로 만듭니다.
+- 이때 speed는 edge 길이 norm이 아니라 **각 edge 이동을 현재 heading의 forward axis에 투영한 signed speed**
+  로 추정합니다. 즉, 후진 구간이면 음수 속도를 그대로 유지합니다.
+- curvature reference도 같은 signed speed를 기준으로 만들며, 매우 저속일 때만 최소 speed magnitude를 써서
+  수치적으로 안정화합니다.
 - 이 초기 past history(`rollout_init_fine_*_history`)는 rollout 시작 직전의 raw 10Hz 최근 6개 상태를 씁니다.
   과거 길이가 부족하면 `pos / head`는 맨 앞 상태를 반복해 길이를 맞추고, 부족한 prefix의 `valid`는 `False`로 둬
   LQR 초기 상태 추정이 패딩을 실제 관측으로 오해하지 않게 합니다.
@@ -68,6 +72,9 @@
   저속 예외 처리 뒤 종방향 목표 가속도 clamp를 켜거나 끌 수 있습니다.
 - `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=true/false` 로
   현재 속도/동역학 한계 기반 횡방향 projection과 조향 지연 뒤 최종 곡률 상태 재-clip을 함께 켜거나 끌 수 있습니다.
+- `use_lqr=true` 일 때 vehicle / bicycle speed state는 전진은 기존 `v_max`를 쓰되,
+  후진은 차종별 별도 제한을 씁니다. 현재 vehicle은 `-1.5m/s`, bicycle은 `-0.5m/s`까지 허용합니다.
+- 저속 예외 처리 자체는 전진/후진 모두 `abs(speed)` 기준으로 판단합니다.
 - LQR가 켜져 있어도 pedestrian은 token/raw branch를 유지합니다.
 - `matched_token_chunk` 를 써도 vehicle / bicycle이 LQR를 탄 경우 외부 10Hz 출력은
   token chunk가 아니라 **실제로 실행된 5점**을 유지합니다.
@@ -338,6 +345,10 @@ torchrun ... -m src.run \
 - `use_lqr=true`면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
 - future speed / curvature reference의 시작 경계조건은 항상
   previous+current prefix를 고정해 accel / curvature-rate 연속성까지 함께 반영합니다.
+- LQR reference의 speed는 heading forward axis projection으로 만든 signed speed라서,
+  vehicle / bicycle 후진 구간도 음수 속도로 그대로 추정/제어합니다.
+- 실제 LQR commit speed clamp의 후진 하한은 차종별로 다르며, 현재 vehicle은 `-1.5m/s`,
+  bicycle은 `-0.5m/s`까지 허용합니다.
 - `model.model_config.decoder.lqr_commit.clip_longitudinal_command=true/false`는
   저속 예외 처리 뒤 종방향 목표 가속도 clamp만 제어합니다.
 - `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=true/false`는
