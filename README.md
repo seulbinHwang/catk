@@ -62,10 +62,8 @@
 - 이 초기 past history(`rollout_init_fine_*_history`)는 rollout 시작 직전의 raw 10Hz 최근 6개 상태를 씁니다.
   과거 길이가 부족하면 `pos / head`는 맨 앞 상태를 반복해 길이를 맞추고, 부족한 prefix의 `valid`는 `False`로 둬
   LQR 초기 상태 추정이 패딩을 실제 관측으로 오해하지 않게 합니다.
-- `model.model_config.decoder.lqr_commit.reference_profile_init_mode=A|B` 로
-  미래 reference의 시작 경계조건을 바꿀 수 있습니다.
-  `A`는 현재 `speed / curvature`만 anchor로 쓰고,
-  `B`는 이전+현재 2개 edge prefix를 고정해 `accel / curvature-rate` 연속성까지 같이 반영합니다.
+- LQR future reference의 시작 경계조건은 이제 항상 previous+current 2개 edge prefix로 고정합니다.
+  즉 현재 `speed / curvature`뿐 아니라 `accel / curvature-rate` 연속성까지 함께 반영합니다.
 - `model.model_config.decoder.lqr_commit.clip_longitudinal_command=true/false` 로
   저속 예외 처리 뒤 종방향 목표 가속도 clamp를 켜거나 끌 수 있습니다.
 - `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=true/false` 로
@@ -91,17 +89,10 @@ python train.py \
   model.model_config.decoder.use_stop_motion=true \
   model.model_config.decoder.use_lqr=true
 
-# LQR future reference를 현재 speed/curvature만 anchor로 생성
+# LQR future reference는 previous+current prefix를 항상 사용
 python train.py \
   model.model_config.decoder.use_stop_motion=true \
-  model.model_config.decoder.use_lqr=true \
-  model.model_config.decoder.lqr_commit.reference_profile_init_mode=A
-
-# LQR future reference를 previous+current prefix로 생성
-python train.py \
-  model.model_config.decoder.use_stop_motion=true \
-  model.model_config.decoder.use_lqr=true \
-  model.model_config.decoder.lqr_commit.reference_profile_init_mode=B
+  model.model_config.decoder.use_lqr=true
 ```
 
 
@@ -345,10 +336,8 @@ torchrun ... -m src.run \
 - `model.model_config.decoder.use_stop_motion=true/false`로 stop-motion gate를 켜거나 끕니다.
 - `model.model_config.decoder.use_lqr=true/false`로 vehicle / bicycle용 dynamics-aware feasible commit bridge를 켜거나 끕니다.
 - `use_lqr=true`면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
-- `model.model_config.decoder.lqr_commit.reference_profile_init_mode=A|B` 로
-  future speed / curvature reference 생성 시 현재 상태를 어떻게 anchor할지 고릅니다.
-  `A`는 현재 speed / curvature만 고정하는 기본 모드이고,
-  `B`는 previous+current prefix를 고정해 accel / curvature-rate 연속성까지 함께 반영합니다.
+- future speed / curvature reference의 시작 경계조건은 항상
+  previous+current prefix를 고정해 accel / curvature-rate 연속성까지 함께 반영합니다.
 - `model.model_config.decoder.lqr_commit.clip_longitudinal_command=true/false`는
   저속 예외 처리 뒤 종방향 목표 가속도 clamp만 제어합니다.
 - `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=true/false`는
@@ -386,10 +375,6 @@ torchrun ... -m src.run \
 # stop-motion + vehicle / bicycle dynamics-aware feasible commit bridge 적용
 ... model.model_config.decoder.use_stop_motion=true \
     model.model_config.decoder.use_lqr=true
-
-# LQR future reference 시작조건: A(current anchor) / B(previous+current prefix)
-... model.model_config.decoder.use_lqr=true \
-    model.model_config.decoder.lqr_commit.reference_profile_init_mode=A
 
 # use_lqr + matched token chunk를 함께 쓸 때도
 # vehicle / bicycle export는 실행된 5점 chunk를 유지하고 pedestrian만 token chunk를 씁니다.

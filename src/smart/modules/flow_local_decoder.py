@@ -39,9 +39,6 @@ class LQRCommitBridgeConfig:
         velocity_smooth_lambda: 속도 곡선 매끈함 가중치입니다.
         curvature_smooth_lambda: 곡률 곡선 매끈함 가중치입니다.
         curvature_init_reg: 저속에서 곡률 추정이 깨지지 않게 하는 작은 값입니다.
-        reference_profile_init_mode: 미래 속도/곡률 참조를 현재 상태와 잇는 방식입니다.
-            ``"A"`` 는 현재 속도/곡률만 고정합니다.
-            ``"B"`` 는 현재 속도/곡률과 그 직전 차분까지 고정합니다.
         stop_speed_mps: 저속 종방향 제어로 넘길 기준 속도입니다.
         stop_speed_kp: 저속 종방향 비례 제어 gain입니다.
         longitudinal_q: 1초 뒤 속도 오차 가중치입니다.
@@ -64,7 +61,6 @@ class LQRCommitBridgeConfig:
     velocity_smooth_lambda: float = 1.0e-4
     curvature_smooth_lambda: float = 1.0e-2
     curvature_init_reg: float = 1.0e-10
-    reference_profile_init_mode: str = "A"
     stop_speed_mps: float = 0.2
     stop_speed_kp: float = 0.5
     longitudinal_q: float = 10.0
@@ -921,21 +917,12 @@ class ContinuousCommitBridge:
             system = system + diag_reg * eye.unsqueeze(0)
         return torch.linalg.solve(system + 1.0e-6 * eye.unsqueeze(0), adjusted_rhs.unsqueeze(-1)).squeeze(-1)
 
-    def _get_reference_profile_init_mode(self) -> str:
-        mode = self.config.reference_profile_init_mode.upper()
-        if mode not in {"A", "B"}:
-            raise ValueError(f"Unsupported reference_profile_init_mode: {self.config.reference_profile_init_mode}")
-        return mode
-
     def _build_profile_init_prefix(
         self,
         current_value: torch.Tensor,
         current_rate: torch.Tensor,
     ) -> torch.Tensor:
-        """현재 상태를 미래 edge profile의 고정 prefix로 바꿉니다."""
-        mode = self._get_reference_profile_init_mode()
-        if mode == "A":
-            return current_value.unsqueeze(1)
+        """현재/직전 상태를 미래 edge profile의 고정 prefix로 바꿉니다."""
         prev_value = current_value - float(self.config.dt) * current_rate
         return torch.stack([prev_value, current_value], dim=1)
 

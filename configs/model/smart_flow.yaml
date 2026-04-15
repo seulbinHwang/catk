@@ -84,7 +84,6 @@ model_config:
       velocity_smooth_lambda: 1.0e-4
       curvature_smooth_lambda: 1.0e-2
       curvature_init_reg: 1.0e-10
-      reference_profile_init_mode: A # A: current speed/curvature anchor, B: previous+current prefix anchor
       stop_speed_mps: 0.2
       stop_speed_kp: 0.5
       longitudinal_q: 10.0

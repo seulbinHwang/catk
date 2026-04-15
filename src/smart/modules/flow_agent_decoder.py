@@ -93,7 +93,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             velocity_smooth_lambda=float(getattr(lqr_commit, "velocity_smooth_lambda", 1.0e-4)) if lqr_commit is not None else 1.0e-4,
             curvature_smooth_lambda=float(getattr(lqr_commit, "curvature_smooth_lambda", 1.0e-2)) if lqr_commit is not None else 1.0e-2,
             curvature_init_reg=float(getattr(lqr_commit, "curvature_init_reg", 1.0e-10)) if lqr_commit is not None else 1.0e-10,
-            reference_profile_init_mode=str(getattr(lqr_commit, "reference_profile_init_mode", "A")) if lqr_commit is not None else "A",
             stop_speed_mps=float(getattr(lqr_commit, "stop_speed_mps", 0.2)) if lqr_commit is not None else 0.2,
             stop_speed_kp=float(getattr(lqr_commit, "stop_speed_kp", 0.5)) if lqr_commit is not None else 0.5,
             longitudinal_q=float(getattr(lqr_commit, "longitudinal_q", 10.0)) if lqr_commit is not None else 10.0,
