@@ -193,6 +193,8 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         bptt_debug=bool(_read_config_value(finetune, "bptt_debug", False)),
         bptt_sequential_rollouts=bool(_read_config_value(finetune, "bptt_sequential_rollouts", True)),
         bptt_warm_coarse_steps=int(_read_config_value(finetune, "bptt_warm_coarse_steps", 0)),
+        rmm_bptt_ref_train=bool(_read_config_value(finetune, "rmm_bptt_ref_train", False)),
+        rmm_bptt_ref_val=bool(_read_config_value(finetune, "rmm_bptt_ref_val", False)),
     )
 
 
