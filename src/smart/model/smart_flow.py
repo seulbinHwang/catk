@@ -1685,13 +1685,53 @@ class SMARTFlow(LightningModule):
             # DDP: 모든 trainable param 을 dummy loss graph 에 연결해야 bucket reducer 가 정상 작동.
             # manual backward 로 grad 는 이미 누적됐으므로 backward() 추가 기여는 0.
             _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
-            return {
+            seq_ret = {
                 "loss": _ddp_dummy,   # grads already accumulated via manual backward
                 "train/rmm_soft": mean_rmm,
                 "train/rmm_loss": -mean_rmm,
                 "train/rmm_ema": _ema_log,
                 "train/rmm_n_scenarios": torch.tensor(float(total_count_accum), device=mean_rmm.device),
             }
+            # sequential mode: ref soft RMM (same helper, rollout_indices=[0])
+            if self._ref_val_enabled and self.ref_flow_decoder is not None:
+                _orig_fd = self.encoder.agent_encoder.flow_decoder
+                self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
+                try:
+                    with torch.no_grad():
+                        ref_traj_s, ref_z_s, ref_head_s, _ = self._run_parallel_rollout_chunk(
+                            data=data,
+                            tokenized_agent=tokenized_agent,
+                            map_feature=map_feature,
+                            rollout_cache=rollout_cache,
+                            rollout_indices=[0],
+                            return_anchor_hidden=True,
+                            full_grad=False,
+                            max_steps=bptt_max_coarse_steps,
+                        )
+                finally:
+                    self.encoder.agent_encoder.flow_decoder = _orig_fd
+                ref_s_total, ref_s_count = 0.0, 0
+                for sc_idx in range(n_scenarios):
+                    if _sc_scenarios[sc_idx] is None:
+                        continue
+                    sc_rt = ref_traj_s[_sc_masks[sc_idx], 0, :, :]
+                    sc_rz = ref_z_s[_sc_masks[sc_idx], 0, :]
+                    sc_rh = ref_head_s[_sc_masks[sc_idx], 0, :]
+                    valid_sc = sc_rt.new_ones(sc_rt.shape[0], sc_rt.shape[1], dtype=torch.bool)
+                    with torch.no_grad():
+                        ref_res = self._compute_soft_rmm(
+                            scenario=_sc_scenarios[sc_idx],
+                            x=sc_rt[:, :, 0], y=sc_rt[:, :, 1], z=sc_rz, head=sc_rh,
+                            agent_ids=_sc_agent_ids[sc_idx], valid=valid_sc,
+                            log_feat_dict=_sc_log_feat_dicts[sc_idx], config=cfg, debug=False,
+                        )
+                    ref_s_total += ref_res.metametric.item()
+                    ref_s_count += 1
+                if ref_s_count > 0:
+                    seq_ref_rmm = torch.tensor(ref_s_total / ref_s_count, dtype=torch.float32, device=mean_rmm.device)
+                    seq_ret["train/rmm_ref"] = seq_ref_rmm
+                    seq_ret["train/rmm_delta"] = mean_rmm.detach() - seq_ref_rmm
+            return seq_ret
 
         # ── 5b. 병렬 rollout 모드 (G=1 또는 sequential=False) ────────────────
         flow_ode.use_adjoint_for_bptt = use_adjoint
@@ -1774,14 +1814,67 @@ class SMARTFlow(LightningModule):
         _ema_log = self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach()
         log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_log.item():.4f}")
 
+        # ── pretrained ref soft RMM (train 단계 Δ 모니터링) ────────────────
+        # rollout_indices=[0] → finetuned g=0 와 동일 hash seed → noise 정합.
+        # no_grad 이므로 gradient graph 에 영향 없음 (∼1/G 추가 시간).
+        ref_rmm_log: Tensor | None = None
+        if self._ref_val_enabled and self.ref_flow_decoder is not None:
+            _orig_fd = self.encoder.agent_encoder.flow_decoder
+            self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
+            try:
+                with torch.no_grad():
+                    ref_traj, ref_z, ref_head, _ = self._run_parallel_rollout_chunk(
+                        data=data,
+                        tokenized_agent=tokenized_agent,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache,
+                        rollout_indices=[0],
+                        return_anchor_hidden=True,
+                        full_grad=False,
+                        max_steps=bptt_max_coarse_steps,
+                    )
+            finally:
+                self.encoder.agent_encoder.flow_decoder = _orig_fd
+
+            ref_total = 0.0
+            ref_count = 0
+            for sc_idx in range(n_scenarios):
+                if _sc_scenarios[sc_idx] is None:
+                    continue
+                sc_rt = ref_traj[_sc_masks[sc_idx], 0, :, :]
+                sc_rz = ref_z[_sc_masks[sc_idx], 0, :]
+                sc_rh = ref_head[_sc_masks[sc_idx], 0, :]
+                valid_sc = sc_rt.new_ones(sc_rt.shape[0], sc_rt.shape[1], dtype=torch.bool)
+                with torch.no_grad():
+                    ref_res = self._compute_soft_rmm(
+                        scenario=_sc_scenarios[sc_idx],
+                        x=sc_rt[:, :, 0],
+                        y=sc_rt[:, :, 1],
+                        z=sc_rz,
+                        head=sc_rh,
+                        agent_ids=_sc_agent_ids[sc_idx],
+                        valid=valid_sc,
+                        log_feat_dict=_sc_log_feat_dicts[sc_idx],
+                        config=cfg,
+                        debug=False,
+                    )
+                ref_total += ref_res.metametric.item()
+                ref_count += 1
+            if ref_count > 0:
+                ref_rmm_log = torch.tensor(ref_total / ref_count, dtype=torch.float32, device=mean_rmm.device)
+
         loss = -mean_rmm
-        return {
+        ret = {
             "loss": loss,
             "train/rmm_soft": mean_rmm.detach(),
             "train/rmm_loss": loss.detach(),
             "train/rmm_ema": _ema_log,
             "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
         }
+        if ref_rmm_log is not None:
+            ret["train/rmm_ref"] = ref_rmm_log
+            ret["train/rmm_delta"] = mean_rmm.detach() - ref_rmm_log
+        return ret
 
     def _run_kinematic_reward_ft_step(
         self,
