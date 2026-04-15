@@ -102,6 +102,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             lateral_q_head=float(getattr(lqr_commit, "lateral_q_head", 10.0)) if lqr_commit is not None else 10.0,
             lateral_q_kappa=float(getattr(lqr_commit, "lateral_q_kappa", 0.1)) if lqr_commit is not None else 0.1,
             lateral_r=float(getattr(lqr_commit, "lateral_r", 1.0)) if lqr_commit is not None else 1.0,
+            clip_longitudinal_command=bool(getattr(lqr_commit, "clip_longitudinal_command", True)) if lqr_commit is not None else True,
+            clip_lateral_projection_and_final_curvature_state=bool(getattr(lqr_commit, "clip_lateral_projection_and_final_curvature_state", True)) if lqr_commit is not None else True,
             accel_tau_s=float(getattr(lqr_commit, "accel_tau_s", 0.2)) if lqr_commit is not None else 0.2,
             curvature_tau_s=float(getattr(lqr_commit, "curvature_tau_s", 0.05)) if lqr_commit is not None else 0.05,
             min_speed_for_curvature_clip_mps=float(getattr(lqr_commit, "min_speed_for_curvature_clip_mps", 0.5)) if lqr_commit is not None else 0.5,

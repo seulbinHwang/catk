@@ -66,6 +66,10 @@
   미래 reference의 시작 경계조건을 바꿀 수 있습니다.
   `A`는 현재 `speed / curvature`만 anchor로 쓰고,
   `B`는 이전+현재 2개 edge prefix를 고정해 `accel / curvature-rate` 연속성까지 같이 반영합니다.
+- `model.model_config.decoder.lqr_commit.clip_longitudinal_command=true/false` 로
+  저속 예외 처리 뒤 종방향 목표 가속도 clamp를 켜거나 끌 수 있습니다.
+- `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=true/false` 로
+  현재 속도/동역학 한계 기반 횡방향 projection과 조향 지연 뒤 최종 곡률 상태 재-clip을 함께 켜거나 끌 수 있습니다.
 - LQR가 켜져 있어도 pedestrian은 token/raw branch를 유지합니다.
 - `matched_token_chunk` 를 써도 vehicle / bicycle이 LQR를 탄 경우 외부 10Hz 출력은
   token chunk가 아니라 **실제로 실행된 5점**을 유지합니다.
@@ -345,6 +349,10 @@ torchrun ... -m src.run \
   future speed / curvature reference 생성 시 현재 상태를 어떻게 anchor할지 고릅니다.
   `A`는 현재 speed / curvature만 고정하는 기본 모드이고,
   `B`는 previous+current prefix를 고정해 accel / curvature-rate 연속성까지 함께 반영합니다.
+- `model.model_config.decoder.lqr_commit.clip_longitudinal_command=true/false`는
+  저속 예외 처리 뒤 종방향 목표 가속도 clamp만 제어합니다.
+- `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=true/false`는
+  횡방향 동역학 projection과 조향 지연 뒤 최종 곡률 상태 재-clip을 함께 제어합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.

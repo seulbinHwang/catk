@@ -50,6 +50,9 @@ class LQRCommitBridgeConfig:
         lateral_q_head: 진행 방향 오차 가중치입니다.
         lateral_q_kappa: 현재 곡률 상태 가중치입니다.
         lateral_r: 곡률 변화율 제어 크기 가중치입니다.
+        clip_longitudinal_command: 종방향 목표 가속도를 물리 한계로 먼저 자를지 여부입니다.
+        clip_lateral_projection_and_final_curvature_state: 현재 속도/동역학 한계 기반
+            횡방향 projection과 지연 뒤 최종 곡률 상태 재-clip을 같이 켤지 여부입니다.
         accel_tau_s: 가속 입력 1차 지연 시간입니다.
         curvature_tau_s: 곡률 입력 1차 지연 시간입니다.
         min_speed_for_curvature_clip_mps: 곡률 clip 계산에서 쓸 최소 속도입니다.
@@ -70,6 +73,8 @@ class LQRCommitBridgeConfig:
     lateral_q_head: float = 10.0
     lateral_q_kappa: float = 0.1
     lateral_r: float = 1.0
+    clip_longitudinal_command: bool = True
+    clip_lateral_projection_and_final_curvature_state: bool = True
     accel_tau_s: float = 0.2
     curvature_tau_s: float = 0.05
     min_speed_for_curvature_clip_mps: float = 0.5
@@ -1226,26 +1231,31 @@ class ContinuousCommitBridge:
                     speed_state[slow_mask] - v_ref_target[slow_mask]
                 )
                 u_star[slow_mask] = 0.0
-            a_star = torch.clamp(a_star, -limits["a_max"], limits["a_max"])
+            if self.config.clip_longitudinal_command:
+                a_star = torch.clamp(a_star, -limits["a_max"], limits["a_max"])
 
             accel_applied = accel_state + accel_alpha * (a_star - accel_state)
             accel_applied = torch.clamp(accel_applied, -limits["a_max"], limits["a_max"])
-            kappa_state, u_applied = self._clip_curvature_and_rate(
-                kappa_state=kappa_state,
-                a_value=accel_applied,
-                u_value=u_star,
-                speed_value=speed_state,
-                limits=limits,
-            )
+            if self.config.clip_lateral_projection_and_final_curvature_state:
+                kappa_state, u_applied = self._clip_curvature_and_rate(
+                    kappa_state=kappa_state,
+                    a_value=accel_applied,
+                    u_value=u_star,
+                    speed_value=speed_state,
+                    limits=limits,
+                )
+            else:
+                u_applied = u_star
             kappa_ideal = kappa_state + dt * u_applied
             kappa_applied = kappa_state + curvature_alpha * (kappa_ideal - kappa_state)
-            kappa_applied, _ = self._clip_curvature_and_rate(
-                kappa_state=kappa_applied,
-                a_value=accel_applied,
-                u_value=u_applied,
-                speed_value=speed_state,
-                limits=limits,
-            )
+            if self.config.clip_lateral_projection_and_final_curvature_state:
+                kappa_applied, _ = self._clip_curvature_and_rate(
+                    kappa_state=kappa_applied,
+                    a_value=accel_applied,
+                    u_value=u_applied,
+                    speed_value=speed_state,
+                    limits=limits,
+                )
             pos_state = pos_state + dt * speed_state.unsqueeze(-1) * torch.stack(
                 [head_state.cos(), head_state.sin()],
                 dim=-1,
