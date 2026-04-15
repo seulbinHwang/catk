@@ -75,8 +75,8 @@ model_config:
     flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
     closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
-    use_lqr: true
-    use_stop_motion: true
+    use_lqr: false
+    use_stop_motion: false
     lqr_commit:
       dt: 0.1
       history_steps: 6
