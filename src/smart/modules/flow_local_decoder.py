@@ -810,31 +810,108 @@ class ContinuousCommitBridge:
         self._difference_gram_cache[cache_key] = gram
         return gram
 
-    def _fit_smoothed_speed_profile(
+    def _build_edge_forward_axis(
+        self,
+        head_seq: torch.Tensor,
+    ) -> torch.Tensor:
+        """각 edge 시작점의 차체 앞 방향 단위벡터를 만듭니다.
+
+        Args:
+            head_seq: 각 시점의 차체 방향입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+
+        Returns:
+            torch.Tensor: 각 edge 시작점 기준 앞 방향 단위벡터입니다.
+                shape은 ``[n_agent, n_step - 1, 2]`` 입니다.
+        """
+        return torch.stack([head_seq[:, :-1].cos(), head_seq[:, :-1].sin()], dim=-1)
+
+    def _compute_signed_speed_observation(
         self,
         pos_seq: torch.Tensor,
+        head_seq: torch.Tensor,
         valid_seq: torch.Tensor,
-        fixed_prefix: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """위치 시퀀스에서 batched 선형계로 매끈한 속도 곡선을 추정합니다.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """각 edge 이동을 차체 앞 방향에 투영해 앞뒤 부호가 있는 속도를 만듭니다.
 
         Args:
             pos_seq: 연속된 위치 시퀀스입니다.
                 shape은 ``[n_agent, n_step, 2]`` 입니다.
+            head_seq: 각 시점의 차체 방향입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+            valid_seq: 같은 시퀀스의 유효 여부입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - signed_speed_obs: edge마다 계산한 signed 속도 관측치입니다.
+                    shape은 ``[n_agent, n_step - 1]`` 입니다.
+                - edge_valid: 인접한 두 점이 모두 유효한 edge 여부입니다.
+                    shape은 ``[n_agent, n_step - 1]`` 입니다.
+        """
+        dt = float(self.config.dt)
+        edge_delta = pos_seq[:, 1:] - pos_seq[:, :-1]
+        forward_axis = self._build_edge_forward_axis(head_seq=head_seq)
+        signed_speed_obs = (edge_delta * forward_axis).sum(dim=-1) / dt
+        edge_valid = valid_seq[:, :-1] & valid_seq[:, 1:]
+        return signed_speed_obs, edge_valid
+
+    def _apply_signed_speed_floor(
+        self,
+        speed_value: torch.Tensor,
+    ) -> torch.Tensor:
+        """속도 크기는 최소값 이상으로 올리되 앞뒤 부호는 그대로 유지합니다.
+
+        Args:
+            speed_value: signed 속도 값입니다.
+                shape은 임의의 텐서 shape을 가질 수 있습니다.
+
+        Returns:
+            torch.Tensor: 절댓값은 최소값 이상이고 부호는 유지된 signed 속도입니다.
+                shape은 입력과 같습니다.
+        """
+        speed_floor = float(self.config.min_speed_for_curvature_clip_mps)
+        speed_sign = torch.where(
+            speed_value < 0.0,
+            -torch.ones_like(speed_value),
+            torch.ones_like(speed_value),
+        )
+        speed_abs = torch.maximum(
+            speed_value.abs(),
+            speed_value.new_full(speed_value.shape, speed_floor),
+        )
+        return speed_sign * speed_abs
+
+    def _fit_smoothed_speed_profile(
+        self,
+        pos_seq: torch.Tensor,
+        head_seq: torch.Tensor,
+        valid_seq: torch.Tensor,
+        fixed_prefix: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """위치와 방향 시퀀스에서 앞뒤 부호가 있는 속도 곡선을 추정합니다.
+
+        Args:
+            pos_seq: 연속된 위치 시퀀스입니다.
+                shape은 ``[n_agent, n_step, 2]`` 입니다.
+            head_seq: 각 시점의 차체 방향입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
             valid_seq: 같은 시퀀스의 유효 여부입니다.
                 shape은 ``[n_agent, n_step]`` 입니다.
             fixed_prefix: smoothness 시작 조건으로 고정할 과거 edge 값입니다.
                 shape은 ``[n_agent, prefix_edge]`` 이고 ``prefix_edge`` 는 0, 1, 2 중 하나입니다.
 
         Returns:
-            torch.Tensor: edge 기준 속도 곡선입니다.
+            torch.Tensor: edge 기준 signed 속도 곡선입니다.
                 shape은 ``[n_agent, n_step - 1]`` 입니다.
         """
-        dt = float(self.config.dt)
-        edge_valid = valid_seq[:, :-1] & valid_seq[:, 1:]
-        ds_over_dt = torch.norm(pos_seq[:, 1:] - pos_seq[:, :-1], dim=-1) / dt
+        signed_speed_obs, edge_valid = self._compute_signed_speed_observation(
+            pos_seq=pos_seq,
+            head_seq=head_seq,
+            valid_seq=valid_seq,
+        )
         edge_weight = edge_valid.to(pos_seq.dtype)
-        rhs = edge_weight * ds_over_dt
+        rhs = edge_weight * signed_speed_obs
         return self._solve_smoothed_edge_profile(
             diag_weight=edge_weight,
             rhs=rhs,
@@ -849,14 +926,14 @@ class ContinuousCommitBridge:
         speed_profile: torch.Tensor,
         fixed_prefix: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """방향 시퀀스와 속도 곡선에서 batched 곡률 곡선을 추정합니다.
+        """방향 시퀀스와 signed 속도 곡선에서 곡률 곡선을 추정합니다.
 
         Args:
             head_seq: 연속된 방향 시퀀스입니다.
                 shape은 ``[n_agent, n_step]`` 입니다.
             valid_seq: 같은 시퀀스의 유효 여부입니다.
                 shape은 ``[n_agent, n_step]`` 입니다.
-            speed_profile: edge 기준 속도 곡선입니다.
+            speed_profile: edge 기준 signed 속도 곡선입니다.
                 shape은 ``[n_agent, n_step - 1]`` 입니다.
             fixed_prefix: smoothness 시작 조건으로 고정할 과거 edge 곡률입니다.
                 shape은 ``[n_agent, prefix_edge]`` 이고 ``prefix_edge`` 는 0, 1, 2 중 하나입니다.
@@ -868,10 +945,12 @@ class ContinuousCommitBridge:
         dt = float(self.config.dt)
         edge_valid = valid_seq[:, :-1] & valid_seq[:, 1:]
         yaw_rate_obs = wrap_angle(head_seq[:, 1:] - head_seq[:, :-1]) / dt
-        speed_abs = speed_profile.abs()
         edge_weight = edge_valid.to(head_seq.dtype)
+        speed_abs = speed_profile.abs()
+        safe_speed = self._apply_signed_speed_floor(speed_profile)
         diag_weight = edge_weight * speed_abs.square()
-        rhs = edge_weight * speed_abs * yaw_rate_obs
+        kappa_obs = yaw_rate_obs / safe_speed
+        rhs = diag_weight * kappa_obs
         return self._solve_smoothed_edge_profile(
             diag_weight=diag_weight,
             rhs=rhs,
@@ -965,11 +1044,12 @@ class ContinuousCommitBridge:
         history_valid[:, -1] = True
 
         past_speed_profile = self._fit_smoothed_speed_profile(
-            pos_seq=history_pos, # shape: (
+            pos_seq=history_pos,
+            head_seq=history_head,
             valid_seq=history_valid,
         )
         if past_speed_profile.shape[1] >= 1:
-            v0 = past_speed_profile[:, -1].clamp_min(0.0)
+            v0 = past_speed_profile[:, -1]
         else:
             v0 = current_pos.new_zeros(current_pos.shape[0])
         if past_speed_profile.shape[1] >= 2:
@@ -1000,6 +1080,7 @@ class ContinuousCommitBridge:
         )
         future_speed_profile = self._fit_smoothed_speed_profile(
             pos_seq=future_pos_seq,
+            head_seq=future_head_seq,
             valid_seq=future_valid_seq,
             fixed_prefix=self._build_profile_init_prefix(current_value=v0, current_rate=a_prev),
         )
@@ -1107,11 +1188,11 @@ class ContinuousCommitBridge:
         limits: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """현재 속도와 class별 envelope로 곡률과 곡률 변화율을 제한합니다."""
-        speed_floor = float(self.config.min_speed_for_curvature_clip_mps)
-        speed_safe = torch.maximum(speed_value.abs(), speed_value.new_full(speed_value.shape, speed_floor))
+        speed_safe = self._apply_signed_speed_floor(speed_value)
+        speed_safe_abs = speed_safe.abs()
         inv_radius_limit = 1.0 / limits["r_min"].clamp_min(1.0e-6)
-        yaw_rate_limit = limits["omega_max"] / speed_safe
-        lat_accel_limit = limits["a_lat_max"] / speed_safe.square().clamp_min(1.0e-6)
+        yaw_rate_limit = limits["omega_max"] / speed_safe_abs
+        lat_accel_limit = limits["a_lat_max"] / speed_safe_abs.square().clamp_min(1.0e-6)
         kappa_limit = torch.minimum(inv_radius_limit, torch.minimum(yaw_rate_limit, lat_accel_limit))
         kappa_state = torch.clamp(kappa_state, -kappa_limit, kappa_limit)
 
@@ -1176,7 +1257,7 @@ class ContinuousCommitBridge:
 
         pos_state = current_pos.clone()
         head_state = current_head.clone()
-        speed_state = v0.clamp_min(0.0)
+        speed_state = v0.clone()
         accel_state = a_prev.clamp(-limits["a_max"], limits["a_max"])
         kappa_state = kappa0.clone()
         exec_pos_history_state = exec_pos_history[:, -history_steps:].clone()
@@ -1208,8 +1289,8 @@ class ContinuousCommitBridge:
                 kappa0=kappa_state,
                 kappa_ref_profile=kappa_ref_horizon,
             )
-            slow_mask = (speed_state < float(self.config.stop_speed_mps)) & (
-                v_ref_target < float(self.config.stop_speed_mps)
+            slow_mask = (speed_state.abs() < float(self.config.stop_speed_mps)) & (
+                v_ref_target.abs() < float(self.config.stop_speed_mps)
             )
             if slow_mask.any():
                 a_star = a_star.clone()
@@ -1250,7 +1331,7 @@ class ContinuousCommitBridge:
             head_state = wrap_angle(head_state + dt * speed_state * kappa_applied)
             speed_state = torch.clamp(
                 speed_state + dt * accel_applied,
-                min=torch.zeros_like(limits["v_max"]),
+                min=-limits["v_max"],
                 max=limits["v_max"],
             )
             accel_state = accel_applied
