@@ -80,7 +80,7 @@ model_config:
     lqr_commit:
       dt: 0.1
       history_steps: 6
-      horizon_steps: 10
+      horizon_steps: 5
       velocity_smooth_lambda: 1.0e-4
       curvature_smooth_lambda: 1.0e-2
       curvature_init_reg: 1.0e-10
