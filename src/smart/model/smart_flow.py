@@ -1042,6 +1042,36 @@ class SMARTFlow(LightningModule):
             metric_dict[f"gt_{key}"] = zero
         return metric_dict
 
+    def _find_first_nonfinite_parameter(self) -> tuple[str, Tensor] | None:
+        """처음 발견한 non-finite trainable parameter를 반환합니다."""
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if not torch.isfinite(param).all():
+                return name, param
+        return None
+
+    def _find_first_nonfinite_gradient(self) -> tuple[str, Tensor] | None:
+        """처음 발견한 non-finite gradient를 반환합니다."""
+        for name, param in self.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+            if not torch.isfinite(param.grad).all():
+                return name, param.grad
+        return None
+
+    @staticmethod
+    def _summarize_nonfinite_tensor(tensor: Tensor) -> str:
+        """non-finite tensor의 요약 문자열을 만듭니다."""
+        detached = tensor.detach()
+        finite_mask = torch.isfinite(detached)
+        nonfinite_count = int((~finite_mask).sum().item())
+        finite_abs_max = float(detached[finite_mask].abs().max().item()) if finite_mask.any() else float("nan")
+        return (
+            f"shape={tuple(detached.shape)}, dtype={detached.dtype}, "
+            f"nonfinite_count={nonfinite_count}, finite_abs_max={finite_abs_max}"
+        )
+
     def _compute_draft_training_loss(
         self,
         pred_dict: Dict[str, Tensor],
@@ -1073,6 +1103,8 @@ class SMARTFlow(LightningModule):
             anchor_mask=pred_dict["anchor_mask"],
             sampling_scheme=self.draft_sampling,
         )
+        if not torch.isfinite(pred_sample_norm).all():
+            return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
 
         if pred_sample_norm.shape[0] != tokenized_agent["flow_train_agent_type"].shape[0]:
             raise ValueError(
@@ -1081,7 +1113,7 @@ class SMARTFlow(LightningModule):
             )
 
         if not self.draft_physics_force_fp32:
-            return self.draft_regularizer(
+            physics_dict = self.draft_regularizer(
                 pred_future_norm=pred_sample_norm,
                 target_future_norm=pred_dict["flow_clean_norm"],
                 packed_agent_type=tokenized_agent["flow_train_agent_type"],
@@ -1089,11 +1121,14 @@ class SMARTFlow(LightningModule):
                 packed_prev_control=tokenized_agent["flow_train_prev_control"],
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
             )
+            if not all(torch.isfinite(value).all() for value in physics_dict.values()):
+                return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
+            return physics_dict
 
         # Keep the threshold-heavy physics penalty in fp32 even when the trainer
         # runs with bf16 autocast, while preserving gradients to pred_sample_norm.
         with torch.autocast(device_type=pred_sample_norm.device.type, enabled=False):
-            return self.draft_regularizer(
+            physics_dict = self.draft_regularizer(
                 pred_future_norm=pred_sample_norm.float(),
                 target_future_norm=pred_dict["flow_clean_norm"].float(),
                 packed_agent_type=tokenized_agent["flow_train_agent_type"],
@@ -1101,6 +1136,9 @@ class SMARTFlow(LightningModule):
                 packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
             )
+        if not all(torch.isfinite(value).all() for value in physics_dict.values()):
+            return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
+        return physics_dict
 
     def _log_draft_training_metrics(
         self,
@@ -1193,6 +1231,13 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: 최종 학습 loss입니다.
         """
+        bad_param = self._find_first_nonfinite_parameter()
+        if bad_param is not None:
+            bad_name, bad_tensor = bad_param
+            raise RuntimeError(
+                "Detected non-finite trainable parameter before forward pass: "
+                f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
+            )
         """ tokenized_agent
 flow_train_agent_type [n_valid_anchor]
 flow_train_agent_length [n_valid_anchor]
@@ -1243,6 +1288,13 @@ open_metric_dict:
                 tokenized_agent=tokenized_agent,
             )
             total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
+        if not torch.isfinite(fm_loss):
+            raise RuntimeError(f"Non-finite fm_loss detected: {self._summarize_nonfinite_tensor(fm_loss)}")
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(
+                "Non-finite total_loss detected: "
+                f"{self._summarize_nonfinite_tensor(total_loss)}"
+            )
 
         self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/loss_fm", fm_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
@@ -1270,6 +1322,17 @@ open_metric_dict:
                 physics_dict=physics_dict,
             )
         return total_loss
+
+    def on_after_backward(self) -> None:
+        """역전파 직후 non-finite gradient를 fail-fast로 잡습니다."""
+        bad_grad = self._find_first_nonfinite_gradient()
+        if bad_grad is None:
+            return
+        bad_name, bad_tensor = bad_grad
+        raise RuntimeError(
+            "Detected non-finite gradient after backward: "
+            f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
+        )
 
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)

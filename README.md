@@ -33,6 +33,13 @@
   kinematic bicycle 계열 적분을 쓰며, 실제 에이전트 footprint 크기로 최소 선회 반경 하한을
   한 번 더 보정합니다. `use_stationary_refinement_in_dynamics_bridge=true`이면 최종 0.5초
   propagation에도 이 물리 제한을 적용합니다.
+- DRaFT physics 경로에는 NaN 방지 가드가 들어 있습니다.
+- heading 2-vector와 pedestrian velocity 2-vector는 raw `atan2` 대신 safe angle 복원으로 처리해
+  `(0, 0)` 또는 near-zero vector backward에서 gradient NaN이 나지 않도록 막습니다.
+- `sample_open_loop_future` 결과나 physics loss 출력이 non-finite면 해당 batch의 draft loss를 0으로
+  처리해 flow decoder 전체를 오염시키지 않게 합니다.
+- 학습 중에는 non-finite parameter, `fm_loss`, `total_loss`, gradient를 fail-fast로 감지해
+  NaN checkpoint가 조용히 저장되지 않도록 즉시 중단합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.

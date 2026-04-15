@@ -467,7 +467,7 @@ class DraftPhysicsRegularizer(nn.Module):
         else:
             soft = hard.new_zeros(hard.shape)
 
-        vel_angle = torch.atan2(vel_vec[..., 1], vel_vec[..., 0])
+        vel_angle = self._safe_angle_from_xy(vel_vec)
         heading_gap = self._wrap_angle(heading_local - vel_angle)
         heading_mask = speed > self.pedestrian_heading_speed_threshold_mps
         head = self._mean_over_time(
@@ -518,8 +518,20 @@ class DraftPhysicsRegularizer(nn.Module):
                 meter 단위 위치 ``[n_agent, T, 2]`` 와 heading ``[n_agent, T]`` 입니다.
         """
         pos_local_m = future_norm[..., :2] * self.pos_scale_m
-        heading_local = torch.atan2(future_norm[..., 3], future_norm[..., 2])
+        heading_local = self._safe_angle_from_xy(future_norm[..., 2:4])
         return pos_local_m, heading_local
+
+    def _safe_angle_from_xy(self, xy: Tensor) -> Tensor:
+        """거의 0인 2D 벡터에서도 backward가 NaN이 되지 않도록 각도를 구합니다."""
+        xy_norm = torch.linalg.norm(xy, dim=-1, keepdim=True)
+        default_xy = torch.zeros_like(xy)
+        default_xy[..., 0] = 1.0
+        safe_xy = torch.where(
+            xy_norm > self.eps,
+            xy / xy_norm.clamp_min(self.eps),
+            default_xy,
+        )
+        return torch.atan2(safe_xy[..., 1], safe_xy[..., 0])
 
     def _prepend_virtual_start(
         self,
