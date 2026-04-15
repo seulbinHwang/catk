@@ -635,7 +635,8 @@ torchrun \
 ### 5.7 6x H100에서 DRaFT fine-tuning
 
 `configs/experiment/finetune_draft_flow.yaml`을 쓰면
-**기존 flow checkpoint 위에 DRaFT penalty를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
+**기존 flow checkpoint 위에 DRaFT physics penalty를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
+LQR DRaFT를 바로 쓰고 싶다면 [`configs/experiment/finetune_lqr_draft_flow.yaml`](/Users/user/PycharmProjects/catk/configs/experiment/finetune_lqr_draft_flow.yaml)을 사용하면 됩니다.
 이 경로는 pretrain을 이어서 resume하는 용도가 아니라,
 **이미 학습된 checkpoint의 weight만 읽어서 새 fine-tuning run을 시작하는 용도**입니다.
 
@@ -645,6 +646,12 @@ torchrun \
 export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun   --standalone   --nproc_per_node=6   -m src.run   experiment=finetune_draft_flow   action=finetune   trainer=ddp   trainer.devices=6   paths.cache_root="$CACHE_ROOT"   ckpt_path="$PRETRAIN_CKPT"   task_name=flow_semi_continuous_finetune_h1006
+```
+
+LQR DRaFT를 바로 시작할 때는 experiment만 바꿔 아래처럼 실행하면 됩니다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun   --standalone   --nproc_per_node=6   -m src.run   experiment=finetune_lqr_draft_flow   action=finetune   trainer=ddp   trainer.devices=6   paths.cache_root="$CACHE_ROOT"   ckpt_path="$PRETRAIN_CKPT"   task_name=flow_semi_continuous_lqr_finetune_h1006
 ```
 
 중요한 차이:
@@ -672,17 +679,16 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 - val batch size: `16`
 - validation 주기: `16` epoch마다
 - `model.model_config.draft.penalty_type=physics` 가 기본값입니다.
-- `model.model_config.draft.penalty_type=lqr` 로 바꾸면 physics regularizer 대신
-  **raw 2초 draft → exact runtime LQR 실행 → 첫 0.5초 5점** 경로를 직접 GT 첫 0.5초와 맞추는 penalty를 사용합니다.
 
-아래 runtime 설정을 같이 두면 LQR penalty가 보는 실행 경로와 closed-loop runtime 경로를 맞출 수 있습니다.
+LQR DRaFT를 바로 시작하려면 `finetune_lqr_draft_flow`를 쓰면 됩니다. 이 설정은 위 physics 기본값에 더해 아래를 미리 켜 둡니다.
 
+- `model.model_config.draft.penalty_type=lqr`
 - `model.model_config.decoder.use_lqr=true`
 - `model.model_config.decoder.use_stop_motion=false`
 - `model.model_config.decoder.lqr_commit.clip_longitudinal_command=false`
 - `model.model_config.decoder.lqr_commit.clip_lateral_projection_and_final_curvature_state=false`
 
-`configs/experiment/finetune_draft_flow.yaml`은 이미 이 값을 위처럼 덮어쓰도록 바꿔 두었습니다.
+`configs/experiment/finetune_lqr_draft_flow.yaml`은 이 값을 위처럼 미리 덮어쓰도록 만들어 두었습니다.
 다만 필요하면 이 조건과 다르게 둬도 `draft.penalty_type=lqr` 자체는 에러 없이 사용할 수 있습니다.
 
 loss와 로그는 아래처럼 보면 됩니다.
@@ -712,7 +718,10 @@ loss와 로그는 아래처럼 보면 됩니다.
 # physics penalty 유지
 ... model.model_config.draft.penalty_type=physics
 
-# lqr penalty로 바꾸고 penalty/runtime 경로도 같이 맞추기
+# lqr penalty를 바로 쓰려면 experiment만 바꾸기
+... experiment=finetune_lqr_draft_flow
+
+# physics experiment 위에서 lqr penalty/runtime 경로를 직접 맞추기
 ... model.model_config.draft.penalty_type=lqr \
     model.model_config.decoder.use_lqr=true \
     model.model_config.decoder.use_stop_motion=false \
