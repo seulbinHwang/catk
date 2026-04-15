@@ -115,7 +115,7 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 BPTT_N_ROLLOUTS="${BPTT_N_ROLLOUTS:-4}"
 RMM_BPTT_USE_REF_MODEL="${RMM_BPTT_USE_REF_MODEL:-false}"
 # true: validation 시 pretrained ref model 도 rollout → val_ref/rmm + val_delta/rmm (val 시간 ≈ 2배)
-RMM_BPTT_REF_VAL="${RMM_BPTT_REF_VAL:-false}"
+RMM_BPTT_REF_VAL="${RMM_BPTT_REF_VAL:-true}"
 # OOM 발생 시 true로 설정: flow ODE model_fn 호출을 gradient checkpoint으로 감쌈
 # (Neural ODE adjoint 이산 버전) — solver_steps×activation 메모리를 activation 수준으로 절감
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
