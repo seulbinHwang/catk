@@ -1703,7 +1703,7 @@ class SMARTFlow(LightningModule):
                             tokenized_agent=tokenized_agent,
                             map_feature=map_feature,
                             rollout_cache=rollout_cache,
-                            rollout_indices=[0],
+                            rollout_indices=list(range(G)),
                             return_anchor_hidden=True,
                             full_grad=False,
                             max_steps=bptt_max_coarse_steps,
@@ -1714,18 +1714,22 @@ class SMARTFlow(LightningModule):
                 for sc_idx in range(n_scenarios):
                     if _sc_scenarios[sc_idx] is None:
                         continue
-                    sc_rt = ref_traj_s[_sc_masks[sc_idx], 0, :, :]
-                    sc_rz = ref_z_s[_sc_masks[sc_idx], 0, :]
-                    sc_rh = ref_head_s[_sc_masks[sc_idx], 0, :]
-                    valid_sc = sc_rt.new_ones(sc_rt.shape[0], sc_rt.shape[1], dtype=torch.bool)
-                    with torch.no_grad():
-                        ref_res = self._compute_soft_rmm(
-                            scenario=_sc_scenarios[sc_idx],
-                            x=sc_rt[:, :, 0], y=sc_rt[:, :, 1], z=sc_rz, head=sc_rh,
-                            agent_ids=_sc_agent_ids[sc_idx], valid=valid_sc,
-                            log_feat_dict=_sc_log_feat_dicts[sc_idx], config=cfg, debug=False,
-                        )
-                    ref_s_total += ref_res.metametric.item()
+                    sc_rt = ref_traj_s[_sc_masks[sc_idx]]   # [A, G, T, 2]
+                    sc_rz = ref_z_s[_sc_masks[sc_idx]]
+                    sc_rh = ref_head_s[_sc_masks[sc_idx]]
+                    valid_sc = sc_rt.new_ones(sc_rt.shape[0], sc_rt.shape[2], dtype=torch.bool)
+                    ref_roll_s = []
+                    for g in range(G):
+                        with torch.no_grad():
+                            ref_res = self._compute_soft_rmm(
+                                scenario=_sc_scenarios[sc_idx],
+                                x=sc_rt[:, g, :, 0], y=sc_rt[:, g, :, 1],
+                                z=sc_rz[:, g, :], head=sc_rh[:, g, :],
+                                agent_ids=_sc_agent_ids[sc_idx], valid=valid_sc,
+                                log_feat_dict=_sc_log_feat_dicts[sc_idx], config=cfg, debug=False,
+                            )
+                        ref_roll_s.append(ref_res.metametric.item())
+                    ref_s_total += sum(ref_roll_s) / len(ref_roll_s)
                     ref_s_count += 1
                 if ref_s_count > 0:
                     seq_ref_rmm = torch.tensor(ref_s_total / ref_s_count, dtype=torch.float32, device=mean_rmm.device)
@@ -1815,8 +1819,8 @@ class SMARTFlow(LightningModule):
         log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_log.item():.4f}")
 
         # ── pretrained ref soft RMM (train 단계 Δ 모니터링) ────────────────
-        # rollout_indices=[0] → finetuned g=0 와 동일 hash seed → noise 정합.
-        # no_grad 이므로 gradient graph 에 영향 없음 (∼1/G 추가 시간).
+        # finetuned 와 동일한 G개 rollout (no_grad → gradient graph 에 영향 없음).
+        # rollout_indices=list(range(G)) → 동일 hash seed → noise 완전 정합.
         ref_rmm_log: Tensor | None = None
         if self._ref_val_enabled and self.ref_flow_decoder is not None:
             _orig_fd = self.encoder.agent_encoder.flow_decoder
@@ -1828,7 +1832,7 @@ class SMARTFlow(LightningModule):
                         tokenized_agent=tokenized_agent,
                         map_feature=map_feature,
                         rollout_cache=rollout_cache,
-                        rollout_indices=[0],
+                        rollout_indices=list(range(G)),
                         return_anchor_hidden=True,
                         full_grad=False,
                         max_steps=bptt_max_coarse_steps,
@@ -1841,24 +1845,27 @@ class SMARTFlow(LightningModule):
             for sc_idx in range(n_scenarios):
                 if _sc_scenarios[sc_idx] is None:
                     continue
-                sc_rt = ref_traj[_sc_masks[sc_idx], 0, :, :]
-                sc_rz = ref_z[_sc_masks[sc_idx], 0, :]
-                sc_rh = ref_head[_sc_masks[sc_idx], 0, :]
-                valid_sc = sc_rt.new_ones(sc_rt.shape[0], sc_rt.shape[1], dtype=torch.bool)
-                with torch.no_grad():
-                    ref_res = self._compute_soft_rmm(
-                        scenario=_sc_scenarios[sc_idx],
-                        x=sc_rt[:, :, 0],
-                        y=sc_rt[:, :, 1],
-                        z=sc_rz,
-                        head=sc_rh,
-                        agent_ids=_sc_agent_ids[sc_idx],
-                        valid=valid_sc,
-                        log_feat_dict=_sc_log_feat_dicts[sc_idx],
-                        config=cfg,
-                        debug=False,
-                    )
-                ref_total += ref_res.metametric.item()
+                sc_rt = ref_traj[_sc_masks[sc_idx]]   # [A, G, T, 2]
+                sc_rz = ref_z[_sc_masks[sc_idx]]
+                sc_rh = ref_head[_sc_masks[sc_idx]]
+                valid_sc = sc_rt.new_ones(sc_rt.shape[0], sc_rt.shape[2], dtype=torch.bool)
+                ref_roll = []
+                for g in range(G):
+                    with torch.no_grad():
+                        ref_res = self._compute_soft_rmm(
+                            scenario=_sc_scenarios[sc_idx],
+                            x=sc_rt[:, g, :, 0],
+                            y=sc_rt[:, g, :, 1],
+                            z=sc_rz[:, g, :],
+                            head=sc_rh[:, g, :],
+                            agent_ids=_sc_agent_ids[sc_idx],
+                            valid=valid_sc,
+                            log_feat_dict=_sc_log_feat_dicts[sc_idx],
+                            config=cfg,
+                            debug=False,
+                        )
+                    ref_roll.append(ref_res.metametric.item())
+                ref_total += sum(ref_roll) / len(ref_roll)
                 ref_count += 1
             if ref_count > 0:
                 ref_rmm_log = torch.tensor(ref_total / ref_count, dtype=torch.float32, device=mean_rmm.device)
