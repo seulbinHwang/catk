@@ -114,9 +114,9 @@ class DraftPhysicsRegularizer(nn.Module):
         bicycle_steer_max_rad: 자전거 최대 조향각입니다.
         vehicle_steer_rate_max_radps: 차량 최대 조향각 변화율입니다.
         bicycle_steer_rate_max_radps: 자전거 최대 조향각 변화율입니다.
-        vehicle_soft_weight: 차량 roughness 항 가중치입니다.
-        bicycle_soft_weight: 자전거 roughness 항 가중치입니다.
-        pedestrian_soft_weight: 사람 roughness 항 가중치입니다.
+        soft_weight: 모든 class에 공통으로 쓰는 roughness 항 가중치입니다.
+        compare_softness_to_gt: ``True`` 이면 soft roughness를 GT보다 더 큰 만큼만
+            반영하고, ``False`` 이면 prediction roughness 자체를 그대로 반영합니다.
         pedestrian_heading_weight: 사람 heading 약한 정렬 항 가중치입니다.
         pedestrian_heading_speed_threshold_mps: 사람 heading 항을 켜는 최소 속도입니다.
         eps: 수치 안정용 작은 값입니다.
@@ -141,9 +141,8 @@ class DraftPhysicsRegularizer(nn.Module):
         bicycle_steer_max_rad: float = 1.00,
         vehicle_steer_rate_max_radps: float = 0.8,
         bicycle_steer_rate_max_radps: float = 1.5,
-        vehicle_soft_weight: float = 0.25,
-        bicycle_soft_weight: float = 0.25,
-        pedestrian_soft_weight: float = 0.25,
+        soft_weight: float = 0.25,
+        compare_softness_to_gt: bool = True,
         pedestrian_heading_weight: float = 0.05,
         pedestrian_heading_speed_threshold_mps: float = 0.5,
         eps: float = 1e-6,
@@ -175,9 +174,8 @@ class DraftPhysicsRegularizer(nn.Module):
         self.bicycle_steer_max_rad = float(bicycle_steer_max_rad)
         self.vehicle_steer_rate_max_radps = float(vehicle_steer_rate_max_radps)
         self.bicycle_steer_rate_max_radps = float(bicycle_steer_rate_max_radps)
-        self.vehicle_soft_weight = float(vehicle_soft_weight)
-        self.bicycle_soft_weight = float(bicycle_soft_weight)
-        self.pedestrian_soft_weight = float(pedestrian_soft_weight)
+        self.soft_weight = float(soft_weight)
+        self.compare_softness_to_gt = bool(compare_softness_to_gt)
         self.pedestrian_heading_weight = float(pedestrian_heading_weight)
         self.pedestrian_heading_speed_threshold_mps = float(pedestrian_heading_speed_threshold_mps)
         self.eps = float(eps)
@@ -257,15 +255,18 @@ class DraftPhysicsRegularizer(nn.Module):
                     prev_control=class_prev_control.detach(),
                     prev_control_valid=class_prev_valid,
                 )
-                soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
+                if self.compare_softness_to_gt:
+                    soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
+                else:
+                    soft_effective = pred_stats["soft"]
                 effective_total = (
                     pred_stats["hard"]
-                    + self.pedestrian_soft_weight * soft_effective
+                    + self.soft_weight * soft_effective
                     + self.pedestrian_heading_weight * pred_stats["head"]
                 )
                 raw_total = (
                     pred_stats["hard"]
-                    + self.pedestrian_soft_weight * pred_stats["soft"]
+                    + self.soft_weight * pred_stats["soft"]
                     + self.pedestrian_heading_weight * pred_stats["head"]
                 )
                 output["pedestrian_hard"] = pred_stats["hard"].mean()
@@ -293,10 +294,12 @@ class DraftPhysicsRegularizer(nn.Module):
                     agent_length=class_length,
                     class_id=class_id,
                 )
-                soft_weight = self.vehicle_soft_weight if class_id == VEHICLE_TYPE else self.bicycle_soft_weight
-                soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
-                effective_total = pred_stats["hard"] + soft_weight * soft_effective
-                raw_total = pred_stats["hard"] + soft_weight * pred_stats["soft"]
+                if self.compare_softness_to_gt:
+                    soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
+                else:
+                    soft_effective = pred_stats["soft"]
+                effective_total = pred_stats["hard"] + self.soft_weight * soft_effective
+                raw_total = pred_stats["hard"] + self.soft_weight * pred_stats["soft"]
 
                 output[f"{class_name}_hard"] = pred_stats["hard"].mean()
                 output[f"{class_name}_soft"] = soft_effective.mean()

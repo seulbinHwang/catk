@@ -126,11 +126,22 @@ class SMARTFlow(LightningModule):
                 bicycle_steer_rate_max_radps=float(
                     getattr(draft_physics, "bicycle_steer_rate_max_radps", 1.5)
                 ),
-                vehicle_soft_weight=float(getattr(draft_physics, "vehicle_soft_weight", 0.25)),
-                bicycle_soft_weight=float(getattr(draft_physics, "bicycle_soft_weight", 0.25)),
-                pedestrian_soft_weight=float(
-                    getattr(draft_physics, "pedestrian_soft_weight", 0.25)
+                soft_weight=float(
+                    getattr(
+                        draft_physics,
+                        "soft_weight",
+                        getattr(
+                            draft_physics,
+                            "vehicle_soft_weight",
+                            getattr(
+                                draft_physics,
+                                "bicycle_soft_weight",
+                                getattr(draft_physics, "pedestrian_soft_weight", 0.25),
+                            ),
+                        ),
+                    )
                 ),
+                compare_softness_to_gt=bool(getattr(draft_physics, "compare_softness_to_gt", True)),
                 pedestrian_heading_weight=float(
                     getattr(draft_physics, "pedestrian_heading_weight", 0.05)
                 ),

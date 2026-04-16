@@ -649,7 +649,9 @@ loss와 로그는 아래처럼 보면 됩니다.
 - 차량 / 자전거는 `v_pre`와 `delta_pre`를 복원해서 첫 가속도와 첫 steering rate를 만들고,
 - 사람은 `prev_control[..., :2]`를 그대로 첫 2차원 가속도 계산에 씁니다.
 - hard 항은 속도, 가속도, steering angle, steering rate, lateral acceleration 제한을 넘는 만큼 `relu(z)^2`로 계산합니다.
-- soft 항은 jerk에 가까운 거칠기 값이고, **GT roughness보다 큰 만큼만** loss에 반영합니다.
+- soft 항은 jerk에 가까운 거칠기 값입니다. 기본값에서는 **GT roughness보다 큰 만큼만** loss에 반영하고,
+  `model.model_config.draft.physics.compare_softness_to_gt=false` 로 두면
+  GT 비교 없이 prediction roughness 자체를 그대로 반영합니다.
 - 그래서 `train/loss_phys_raw`와 `train/loss_if_raw`는 GT 비교 전의 raw prediction 기준 값입니다.
 - 최종 `L_if`는 agent 전체 평균이 아니라, **batch 안에 실제로 존재하는 class별 평균을 먼저 구한 뒤 다시 class 평균**을 내는 방식입니다.
 - 그래서 vehicle이 많아도 pedestrian / bicycle 항이 묻히지 않습니다.
@@ -660,9 +662,10 @@ loss와 로그는 아래처럼 보면 됩니다.
 
 현재 inverse feasibility 기본 하이퍼파라미터는 아래와 같습니다.
 
-- vehicle: `v_max=35.0`, `a_max=8.0`, `a_lat_max=4.2`, `wheelbase_scale=0.60`, `steer_max=0.55 rad`, `steer_rate_max=0.8 rad/s`, `soft_weight=0.25`
-- bicycle: `v_max=22.0`, `a_max=5.5`, `a_lat_max=4.4`, `wheelbase_scale=0.85`, `steer_max=1.00 rad`, `steer_rate_max=1.5 rad/s`, `soft_weight=0.25`
-- pedestrian: `v_max=5.0`, `a_max=4.7`, `heading_speed_threshold=0.5 m/s`, `soft_weight=0.25`, `heading_weight=0.05`
+- 공통: `soft_weight=0.25`
+- vehicle: `v_max=35.0`, `a_max=8.0`, `a_lat_max=4.2`, `wheelbase_scale=0.60`, `steer_max=0.55 rad`, `steer_rate_max=0.8 rad/s`
+- bicycle: `v_max=22.0`, `a_max=5.5`, `a_lat_max=4.4`, `wheelbase_scale=0.85`, `steer_max=1.00 rad`, `steer_rate_max=1.5 rad/s`
+- pedestrian: `v_max=5.0`, `a_max=4.7`, `heading_speed_threshold=0.5 m/s`, `heading_weight=0.05`
 
 자주 바꾸는 override 예시는 아래와 같습니다.
 
@@ -675,6 +678,9 @@ loss와 로그는 아래처럼 보면 됩니다.
 
 # inverse feasibility도 mixed precision으로 그대로 계산
 ... model.model_config.draft.physics.force_fp32=false
+
+# soft roughness를 GT와 비교하지 않고 raw prediction 기준으로 사용
+... model.model_config.draft.physics.compare_softness_to_gt=false
 
 # 차량 steering rate 제한을 더 느슨하게
 ... model.model_config.draft.physics.vehicle_steer_rate_max_radps=1.0
