@@ -68,6 +68,12 @@ class FlowODE:
         # torch.utils.checkpoint to trade memory for recomputation.
         # Set externally by SMARTFlow._run_flow_bptt_ft_step when bptt_use_adjoint=True.
         self.use_adjoint_for_bptt: bool = False
+        # 마지막 N solver step 에서만 velocity output 이 model_fn 파라미터 gradient 를 받습니다.
+        # 0 이하면 비활성 (모든 solver step velocity 에 gradient 흐름).
+        # early step 의 velocity 는 detach 되지만 x_t chain 은 끊기지 않아
+        # coarse step 간 BPTT (x_t 경로) 는 온전히 유지됩니다.
+        # bptt_last_n_solver_steps=K 일 때 solver_steps-K 로 설정됩니다.
+        self.last_n_grad_solver_steps: int = 0
 
     def _beta(self) -> float:
         if self.path_type == "linear":
@@ -158,6 +164,7 @@ class FlowODE:
         steps = self.solver_steps if steps is None else steps
         method = self.solver_method if method is None else method
         use_adjoint = self.use_adjoint_for_bptt
+        _last_n_grad = max(0, int(self.last_n_grad_solver_steps))
 
         if use_adjoint:
             from torch.utils.checkpoint import checkpoint as ckpt
@@ -172,18 +179,38 @@ class FlowODE:
         t0 = self.eps
         dt = (1.0 - t0) / float(steps)
 
+        if _last_n_grad > 0 and not getattr(self, "_last_n_grad_logged", False):
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                f"[FlowODE] last_n_grad_solver_steps={_last_n_grad}/{steps}: "
+                f"solver steps 0~{steps - _last_n_grad - 1} velocity detached (x_t chain intact), "
+                f"steps {steps - _last_n_grad}~{steps - 1} → model params gradient."
+            )
+            self._last_n_grad_logged = True
+
         for i in range(steps):
+            # True 이면 이 step 의 velocity 가 model_fn 파라미터에 gradient 를 전달합니다.
+            # False 이면 velocity 를 detach 해 파라미터 업데이트를 차단하지만,
+            # x_t chain 자체는 끊기지 않아 coarse step 간 BPTT 는 유지됩니다.
+            _keep_vel_grad = (_last_n_grad == 0) or (i >= steps - _last_n_grad)
+
             t = t0 + i * dt
             tau = x_t.new_full((x_t.shape[0],), t)
 
             if method == "midpoint":
                 v1 = _ckpt_call(x_t, tau)
+                if not _keep_vel_grad:
+                    v1 = v1.detach()
                 x_mid = x_t + 0.5 * dt * v1
                 tau_mid = x_t.new_full((x_t.shape[0],), t + 0.5 * dt)
                 v2 = _ckpt_call(x_mid, tau_mid)
+                if not _keep_vel_grad:
+                    v2 = v2.detach()
                 x_t = x_t + dt * v2
             elif method == "euler":
                 v = _ckpt_call(x_t, tau)
+                if not _keep_vel_grad:
+                    v = v.detach()
                 x_t = x_t + dt * v
             else:
                 raise ValueError(f"Unsupported solver method: {method}")

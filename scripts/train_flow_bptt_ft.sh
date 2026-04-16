@@ -42,10 +42,10 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2, 3}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_bptt_ft}"
-MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-a100-bpttft}"
+MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-main_exp}"
 CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
 
 CONDA_SH="${CONDA_SH:-/home2/pnc2/miniforge3/etc/profile.d/conda.sh}"
@@ -64,10 +64,10 @@ CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_l
 TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
 # 정수(예: 10) = val 배치 최대 개수. 0~1 실수 = 데이터셋 비율. 빠른 RMM 스모크는 10 권장.
-LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-2}"
+LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-10}"
 MAX_EPOCHS="${MAX_EPOCHS:-10}"
 # val_check_interval: 정수면 "N training step마다" 검증, 0~1 실수면 "에폭의 해당 비율마다" 검증.
 # limit_train_batches가 작으면 정수 N은 N 이하로 맞출 것(그렇지 않으면 Lightning 설정 오류).
@@ -76,9 +76,9 @@ CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-1}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
 GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-0}"
-TRAIN_B="${TRAIN_B:-4}"
+TRAIN_B="${TRAIN_B:-16}"
 VAL_B="${VAL_B:-1}"
-TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-8}"
+TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
 # DataLoader 워커는 GPU 프로세스마다 따로 뜸: (NPROC_PER_NODE × NUM_WORKERS) + α.
 # 예: 2GPU × 63워커 ≈ 126개 워커만으로도 RAM·파일 디스크립터·스케줄링 폭주 → 몇 step 후 OOM/Killed/멈춤이 잦음.
 # 단일 GPU에서도 63은 과한 경우 많음. 필요 시 NUM_WORKERS=16 등으로 올려서 튜닝.
@@ -90,19 +90,36 @@ PIN_MEMORY="${PIN_MEMORY:-true}"
 # rmm_bptt_ft: LR를 너무 키우면 soft RMM 역전파·옵티마 스텝에서 NaN/폭주가 나기 쉬움.
 # multi-scenario(TRAIN_B>1)에서 gradient 방향이 시나리오마다 충돌하므로 단일 시나리오보다
 # LR을 낮춰야 함. 권장: single-scenario=1e-6, multi-scenario=1e-6~1e-5.
-LR="${LR:-1e-6}"
-LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-200}"
-LR_TOTAL_STEPS="${LR_TOTAL_STEPS:--1}"
-LR_MIN_RATIO="${LR_MIN_RATIO:-1e-2}"
+LR="${LR:-5e-6}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
+# LR_MIN_RATIO: LR 하한 = LR * LR_MIN_RATIO. 5e-6 → 5e-7 목표이면 0.1.
+LR_MIN_RATIO="${LR_MIN_RATIO:-0.1}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+# LR_TOTAL_STEPS: cosine decay 종점 step 수.
+# 명시하지 않으면 TRAIN_RAW_DIR 내 pkl 수로 자동 추정: ceil(n_files / (TRAIN_B * NPROC)) * MAX_EPOCHS.
+# 추정 실패 시 1000으로 fallback. 직접 지정하려면 환경변수로 넘기면 됨.
+if [ -z "${LR_TOTAL_STEPS}" ] || [ "${LR_TOTAL_STEPS}" = "-1" ]; then
+  LR_TOTAL_STEPS=$(python3 - <<PY
+import pathlib, math
+p = pathlib.Path("${TRAIN_RAW_DIR}")
+n = len(list(p.glob("*.pkl")))
+if n > 0:
+    steps_per_epoch = math.ceil(n / (${TRAIN_B} * ${NPROC_PER_NODE}))
+    print(steps_per_epoch * ${MAX_EPOCHS})
+else:
+    print(1000)
+PY
+  )
+  echo "[LR schedule] auto LR_TOTAL_STEPS=${LR_TOTAL_STEPS} (pkl=${TRAIN_RAW_DIR})"
+fi
 # GT FM 정규화 (rmm_bptt_ft): flow_train_clean_norm velocity FM MSE 가중치. 0 이면 비활성.
-FLOW_REG_LAMBDA="${FLOW_REG_LAMBDA:-10.0}"
+FLOW_REG_LAMBDA="${FLOW_REG_LAMBDA:-1.0}"
 
 ROLLOUT_NOISE_SCALE="${ROLLOUT_NOISE_SCALE:-1.0}"
 # 0 이면 validation 비디오 생성 안 함 (Waymo rollout MP4 + W&B 업로드 스킵)
-N_VIS_BATCH="${N_VIS_BATCH:-1}"
-N_VIS_SCENARIO="${N_VIS_SCENARIO:-2}"
-N_VIS_ROLLOUT="${N_VIS_ROLLOUT:-1}"
+N_VIS_BATCH="${N_VIS_BATCH:-4}"
+N_VIS_SCENARIO="${N_VIS_SCENARIO:-4}"
+N_VIS_ROLLOUT="${N_VIS_ROLLOUT:-4}"
 DELETE_LOCAL_VIDEOS_AFTER_UPLOAD="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD:-false}"
 
 # closed-loop validation: 시나리오당 rollout N (best-of-N minADE 등; configs/experiment/flow_bptt_ft.yaml n_rollout_closed_val)
@@ -125,12 +142,19 @@ RMM_BPTT_REF_VAL="${RMM_BPTT_REF_VAL:-true}"
 # (Neural ODE adjoint 이산 버전) — solver_steps×activation 메모리를 activation 수준으로 절감
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
 # 비어 있으면 오버라이드 없음 → configs/experiment 의 bptt_max_coarse_steps (null = 전체)
-BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-4}"
+BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-8}"
 # true (기본): G rollout 을 1개씩 순차 실행 후 각각 backward → 피크 메모리 ≈ G 배 절감
 BPTT_SEQUENTIAL_ROLLOUTS="${BPTT_SEQUENTIAL_ROLLOUTS:-false}"
 # 앞 N coarse step 을 no_grad/detach (sliding-window BPTT). 0 = 비활성.
 # 예: BPTT_WARM_COARSE_STEPS=12 이면 마지막 4 step (BPTT_MAX_COARSE_STEPS=16 기준)만 gradient.
 BPTT_WARM_COARSE_STEPS="${BPTT_WARM_COARSE_STEPS:-0}"
+# 마지막 N coarse step 에만 gradient (BPTT_WARM_COARSE_STEPS 의 역수 표현). 0 = 비활성.
+# 활성 시 warm_coarse = max(BPTT_WARM_COARSE_STEPS, BPTT_MAX_COARSE_STEPS - BPTT_LAST_N_COARSE_STEPS).
+# 예: BPTT_MAX_COARSE_STEPS=4, BPTT_LAST_N_COARSE_STEPS=2 → 마지막 2 coarse step 만 gradient.
+BPTT_LAST_N_COARSE_STEPS="${BPTT_LAST_N_COARSE_STEPS:-0}"
+# Flow ODE solver 의 마지막 N step 에만 gradient. 0 = 비활성 (모든 solver step gradient).
+# 예: FLOW_SOLVER_STEPS=4, BPTT_LAST_N_SOLVER_STEPS=2 → 앞 2 step no_grad+detach, 뒤 2 step gradient.
+BPTT_LAST_N_SOLVER_STEPS="${BPTT_LAST_N_SOLVER_STEPS:-0}"
 # true: HierarchicalFlowDecoder.velocity_head만 학습 (인코더·flow 트렁크·residual 동결)
 FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
 
@@ -187,6 +211,7 @@ echo "BPTT_N_ROLLOUTS=${BPTT_N_ROLLOUTS} FLOW_VELOCITY_HEAD_ONLY=${FLOW_VELOCITY
 echo "LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} N_VIS_BATCH=${N_VIS_BATCH} N_ROLLOUT_CLOSED_VAL=${N_ROLLOUT_CLOSED_VAL} N_BATCH_SIM_AGENTS_METRIC=${N_BATCH_SIM_AGENTS_METRIC} VALIDATION_METRIC=${VALIDATION_METRIC}"
 echo "NPROC_PER_NODE=${NPROC_PER_NODE} NUM_WORKERS=${NUM_WORKERS} (≈ ${NPROC_PER_NODE}×${NUM_WORKERS} dataloader worker 프로세스 + 메인)"
 echo "[grad] GRAD_CLIP_VAL=${GRAD_CLIP_VAL} BPTT_GRAD_CLIP_TRAJ=${BPTT_GRAD_CLIP_TRAJ} LR=${LR} FLOW_REG_LAMBDA=${FLOW_REG_LAMBDA} BPTT_DEBUG=${BPTT_DEBUG}"
+echo "BPTT_WARM_COARSE_STEPS=${BPTT_WARM_COARSE_STEPS} BPTT_LAST_N_COARSE_STEPS=${BPTT_LAST_N_COARSE_STEPS} BPTT_LAST_N_SOLVER_STEPS=${BPTT_LAST_N_SOLVER_STEPS}"
 
 PORT="$(get_free_port)"
 torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_endpoint="127.0.0.1:${PORT}" -m src.run \
@@ -236,6 +261,8 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
+  model.model_config.finetune.bptt_last_n_coarse_steps="${BPTT_LAST_N_COARSE_STEPS}" \
+  model.model_config.finetune.bptt_last_n_solver_steps="${BPTT_LAST_N_SOLVER_STEPS}" \
   model.model_config.finetune.bptt_grad_clip_traj="${BPTT_GRAD_CLIP_TRAJ}" \
   model.model_config.finetune.bptt_debug="${BPTT_DEBUG}" \
   ${BPTT_MAX_COARSE_STEPS:+model.model_config.finetune.bptt_max_coarse_steps="${BPTT_MAX_COARSE_STEPS}"} \

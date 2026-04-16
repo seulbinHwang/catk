@@ -74,6 +74,11 @@ class FinetuneConfig:
     #: Neural ODE adjoint method의 이산 버전: forward 시 내부 활성화를 저장하지 않고
     #: backward 시 재연산. O(solver_steps × activation) 메모리를 O(activation)으로 줄임.
     bptt_use_adjoint: bool = False
+    #: Flow ODE solver 의 마지막 N step 에만 gradient 를 흘립니다.
+    #: 0 이하면 비활성 (모든 solver step 이 gradient 를 받음).
+    #: 활성 시 FlowODE.last_n_grad_solver_steps = bptt_last_n_solver_steps 로 설정.
+    #: 예: solver_steps=4, bptt_last_n_solver_steps=2 → 앞 2 step no_grad+detach, 뒤 2 step gradient.
+    bptt_last_n_solver_steps: int = 0
     #: ``rmm_bptt_ft`` 전용: 실행할 **coarse step** 개수. ``None`` 또는 0 이하면
     #: ``n_step_future_2hz`` 전부 (보통 16). 양수면 그만큼만 rollout 후 **그 구간 전체** soft RMM·역전파.
     #: (truncated BPTT detach는 사용하지 않음.)
@@ -90,6 +95,11 @@ class FinetuneConfig:
     #: 0 이하면 비활성 (모든 coarse step 이 gradient 를 받음).
     #: 예: bptt_max_coarse_steps=16, bptt_warm_coarse_steps=12 → 마지막 4 step 만 gradient.
     bptt_warm_coarse_steps: int = 0
+    #: 마지막 N coarse step 에만 gradient 를 흘립니다 (``bptt_warm_coarse_steps`` 의 역수 표현).
+    #: 0 이하면 비활성. 활성화 시 ``bptt_warm_coarse_steps`` 를
+    #: ``max(bptt_warm_coarse_steps, bptt_max_coarse_steps - bptt_last_n_coarse_steps)`` 로 override.
+    #: 예: bptt_max_coarse_steps=16, bptt_last_n_coarse_steps=4 → warm_coarse=12 → 마지막 4 step gradient.
+    bptt_last_n_coarse_steps: int = 0
     #: True → training step 마다 pretrained ref 를 G rollout no_grad 로 돌려
     #: ``train/rmm_ref`` 와 ``train/rmm_delta`` (= finetuned − pretrained) 를 로깅.
     #: step 당 ∼1배 추가 시간 (no_grad 이므로 grad rollout 보다 빠름).
@@ -188,11 +198,13 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         rmm_bptt_use_ref_model=bool(_read_config_value(finetune, "rmm_bptt_use_ref_model", False)),
         flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
         bptt_use_adjoint=bool(_read_config_value(finetune, "bptt_use_adjoint", False)),
+        bptt_last_n_solver_steps=int(_read_config_value(finetune, "bptt_last_n_solver_steps", 0)),
         bptt_max_coarse_steps=None if _bptt_max_cs_raw is None else int(_bptt_max_cs_raw),
         bptt_grad_clip_traj=float(_read_config_value(finetune, "bptt_grad_clip_traj", 1.0)),
         bptt_debug=bool(_read_config_value(finetune, "bptt_debug", False)),
         bptt_sequential_rollouts=bool(_read_config_value(finetune, "bptt_sequential_rollouts", True)),
         bptt_warm_coarse_steps=int(_read_config_value(finetune, "bptt_warm_coarse_steps", 0)),
+        bptt_last_n_coarse_steps=int(_read_config_value(finetune, "bptt_last_n_coarse_steps", 0)),
         rmm_bptt_ref_train=bool(_read_config_value(finetune, "rmm_bptt_ref_train", False)),
         rmm_bptt_ref_val=bool(_read_config_value(finetune, "rmm_bptt_ref_val", False)),
     )

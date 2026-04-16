@@ -45,15 +45,18 @@ LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-200}"
 LR_TOTAL_STEPS="${LR_TOTAL_STEPS:--1}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-1e-2}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+FLOW_SOLVER_STEPS="${FLOW_SOLVER_STEPS:-4}"
+# FLOW_SOLVER_METHOD="${FLOW_SOLVER_METHOD:-euler}"
+FLOW_SOLVER_METHOD="${FLOW_SOLVER_METHOD:-midpoint}"
 PRECISION="${PRECISION:-32-true}"
 GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-0}"
 ROLLOUT_NOISE_SCALE="${ROLLOUT_NOISE_SCALE:-1.0}"
 
 # GT FM 정규화 (rmm_bptt_ft): flow_train_clean_norm velocity FM MSE 가중치. 0 이면 비활성.
-FLOW_REG_LAMBDA="${FLOW_REG_LAMBDA:-100.0}"
+FLOW_REG_LAMBDA="${FLOW_REG_LAMBDA:-0.0}"
 
 TRAIN_B="${TRAIN_B:-1}"
-TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-8}"
+TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
 PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
@@ -69,6 +72,12 @@ BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
 BPTT_MAX_COARSE_STEPS="${BPTT_MAX_COARSE_STEPS:-4}"
 BPTT_SEQUENTIAL_ROLLOUTS="${BPTT_SEQUENTIAL_ROLLOUTS:-false}"
 BPTT_WARM_COARSE_STEPS="${BPTT_WARM_COARSE_STEPS:-0}"
+# 마지막 N coarse step 에만 gradient (BPTT_WARM_COARSE_STEPS 의 역수 표현). 0 = 비활성.
+# 예: BPTT_MAX_COARSE_STEPS=4, BPTT_LAST_N_COARSE_STEPS=2 → 마지막 2 coarse step 만 gradient.
+BPTT_LAST_N_COARSE_STEPS="${BPTT_LAST_N_COARSE_STEPS:-0}"
+# Flow ODE solver 의 마지막 N step 에만 gradient. 0 = 비활성 (모든 solver step gradient).
+# 예: FLOW_SOLVER_STEPS=4, BPTT_LAST_N_SOLVER_STEPS=2 → 앞 2 step no_grad+detach, 뒤 2 step gradient.
+BPTT_LAST_N_SOLVER_STEPS="${BPTT_LAST_N_SOLVER_STEPS:-0}"
 FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
 BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-0}"
 BPTT_DEBUG="${BPTT_DEBUG:-true}"
@@ -102,8 +111,9 @@ echo "CKPT_PATH=${CKPT_PATH}"
 echo "TRAIN_RAW_DIR=${TRAIN_RAW_DIR}"
 echo "TRAIN_TFRECORDS_SPLITTED=${TRAIN_TFRECORDS_SPLITTED}"
 echo "SEED=${SEED} MAX_EPOCHS=${MAX_EPOCHS} LR=${LR}"
+echo "FLOW_SOLVER_STEPS=${FLOW_SOLVER_STEPS} FLOW_SOLVER_METHOD=${FLOW_SOLVER_METHOD}"
 echo "BPTT_N_ROLLOUTS=${BPTT_N_ROLLOUTS} BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_MAX_COARSE_STEPS=${BPTT_MAX_COARSE_STEPS:-"(yaml)"}"
-echo "BPTT_SEQUENTIAL_ROLLOUTS=${BPTT_SEQUENTIAL_ROLLOUTS} BPTT_WARM_COARSE_STEPS=${BPTT_WARM_COARSE_STEPS} FLOW_VELOCITY_HEAD_ONLY=${FLOW_VELOCITY_HEAD_ONLY}"
+echo "BPTT_SEQUENTIAL_ROLLOUTS=${BPTT_SEQUENTIAL_ROLLOUTS} BPTT_WARM_COARSE_STEPS=${BPTT_WARM_COARSE_STEPS} BPTT_LAST_N_COARSE_STEPS=${BPTT_LAST_N_COARSE_STEPS} BPTT_LAST_N_SOLVER_STEPS=${BPTT_LAST_N_SOLVER_STEPS} FLOW_VELOCITY_HEAD_ONLY=${FLOW_VELOCITY_HEAD_ONLY}"
 echo "[grad] GRAD_CLIP_VAL=${GRAD_CLIP_VAL} BPTT_GRAD_CLIP_TRAJ=${BPTT_GRAD_CLIP_TRAJ} FLOW_REG_LAMBDA=${FLOW_REG_LAMBDA} BPTT_DEBUG=${BPTT_DEBUG}"
 echo "RMM_BPTT_REF_TRAIN=${RMM_BPTT_REF_TRAIN} RMM_BPTT_REF_VAL=${RMM_BPTT_REF_VAL}"
 
@@ -138,6 +148,8 @@ python -m src.run \
   model.model_config.lr_total_steps="${LR_TOTAL_STEPS}" \
   model.model_config.lr_min_ratio="${LR_MIN_RATIO}" \
   model.model_config.weight_decay="${WEIGHT_DECAY}" \
+  model.model_config.decoder.flow_solver_steps="${FLOW_SOLVER_STEPS}" \
+  model.model_config.decoder.flow_solver_method="${FLOW_SOLVER_METHOD}" \
   model.model_config.finetune.flow_reg_lambda="${FLOW_REG_LAMBDA}" \
   model.model_config.finetune.rollout_noise_scale="${ROLLOUT_NOISE_SCALE}" \
   model.model_config.n_vis_batch="${N_VIS_BATCH}" \
@@ -155,6 +167,8 @@ python -m src.run \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
+  model.model_config.finetune.bptt_last_n_coarse_steps="${BPTT_LAST_N_COARSE_STEPS}" \
+  model.model_config.finetune.bptt_last_n_solver_steps="${BPTT_LAST_N_SOLVER_STEPS}" \
   ${BPTT_MAX_COARSE_STEPS:+model.model_config.finetune.bptt_max_coarse_steps="${BPTT_MAX_COARSE_STEPS}"} \
   model.model_config.finetune.flow_velocity_head_only="${FLOW_VELOCITY_HEAD_ONLY}" \
   model.model_config.finetune.bptt_grad_clip_traj="${BPTT_GRAD_CLIP_TRAJ}" \

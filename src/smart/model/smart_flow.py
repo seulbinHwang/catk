@@ -1485,6 +1485,8 @@ class SMARTFlow(LightningModule):
         _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
         _dbg_enabled = bool(getattr(self.finetune_config, "bptt_debug", False))
         _flow_reg_lambda = float(getattr(self.finetune_config, "flow_reg_lambda", 0.0))
+        _last_n_coarse = int(getattr(self.finetune_config, "bptt_last_n_coarse_steps", 0))
+        _last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
 
         # ── 1. Encode map (no_grad; encoder frozen) ─────────────────────────
         with torch.no_grad():
@@ -1561,6 +1563,18 @@ class SMARTFlow(LightningModule):
         _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
         _n_coarse = bptt_max_coarse_steps if bptt_max_coarse_steps is not None else 16
         _t_hor_pre = _n_coarse * _shift
+
+        # bptt_last_n_coarse_steps: "마지막 N coarse step에만 gradient" 편의 파라미터.
+        # warm_coarse 를 max(warm_coarse, n_coarse - last_n) 으로 override 해
+        # 앞 구간을 no_grad + detach 처리합니다.
+        if _last_n_coarse > 0:
+            _last_n_coarse = min(_last_n_coarse, _n_coarse)
+            warm_coarse = max(warm_coarse, _n_coarse - _last_n_coarse)
+            log.info(
+                f"[rmm_bptt] bptt_last_n_coarse_steps={_last_n_coarse}: "
+                f"effective warm_coarse_steps={warm_coarse} "
+                f"(gradient on last {_last_n_coarse}/{_n_coarse} coarse steps)"
+            )
 
         _sc_scenarios: list = []
         _sc_log_feat_dicts: list = []
@@ -1657,6 +1671,10 @@ class SMARTFlow(LightningModule):
             total_count_accum = 0
 
             flow_ode.use_adjoint_for_bptt = use_adjoint
+            flow_ode.last_n_grad_solver_steps = min(_last_n_solver, flow_ode.solver_steps) if _last_n_solver > 0 else 0
+            if _last_n_solver > 0:
+                log.info(f"[rmm_bptt] bptt_last_n_solver_steps={flow_ode.last_n_grad_solver_steps}/{flow_ode.solver_steps}: "
+                         f"velocity detach on first {flow_ode.solver_steps - flow_ode.last_n_grad_solver_steps} solver steps.")
             try:
                 for g in range(G):
                     pred_traj_g, pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
@@ -1728,6 +1746,7 @@ class SMARTFlow(LightningModule):
                     del pred_traj_g, pred_z_g, pred_head_g
             finally:
                 flow_ode.use_adjoint_for_bptt = False
+                flow_ode.last_n_grad_solver_steps = 0
 
             if total_count_accum == 0:
                 return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
@@ -1826,6 +1845,10 @@ class SMARTFlow(LightningModule):
 
         # ── 5b. 병렬 rollout 모드 (G=1 또는 sequential=False) ────────────────
         flow_ode.use_adjoint_for_bptt = use_adjoint
+        flow_ode.last_n_grad_solver_steps = min(_last_n_solver, flow_ode.solver_steps) if _last_n_solver > 0 else 0
+        if _last_n_solver > 0:
+            log.info(f"[rmm_bptt] bptt_last_n_solver_steps={flow_ode.last_n_grad_solver_steps}/{flow_ode.solver_steps}: "
+                     f"velocity detach on first {flow_ode.solver_steps - flow_ode.last_n_grad_solver_steps} solver steps.")
         try:
             pred_traj, pred_z, pred_head_traj, _ = (
                 self._run_parallel_rollout_chunk(
@@ -1842,6 +1865,7 @@ class SMARTFlow(LightningModule):
             )
         finally:
             flow_ode.use_adjoint_for_bptt = False
+            flow_ode.last_n_grad_solver_steps = 0
 
         if pred_traj.requires_grad and _grad_clip_traj > 0:
             pred_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
@@ -2874,12 +2898,17 @@ class SMARTFlow(LightningModule):
             return incompatible_keys
 
         _allowed_missing = ("residual_velocity_head", "_rmm_ema_mean")
+        _allowed_unexpected = ("ref_flow_decoder", "_rmm_ema_mean")
         missing_keys = [
             key
             for key in incompatible_keys.missing_keys
             if not any(pat in key for pat in _allowed_missing)
         ]
-        unexpected_keys = list(incompatible_keys.unexpected_keys)
+        unexpected_keys = [
+            key
+            for key in incompatible_keys.unexpected_keys
+            if not any(pat in key for pat in _allowed_unexpected)
+        ]
         if len(missing_keys) > 0 or len(unexpected_keys) > 0:
             raise RuntimeError(
                 "Error(s) in loading state_dict for SMARTFlow:\n"

@@ -59,6 +59,11 @@ model:
       # 앞 N coarse step 을 no_grad + detach (sliding-window BPTT).
       # 0 이하 = 비활성. 예: 12 → 마지막 4 step (bptt_max_coarse_steps=16 기준) 만 gradient.
       bptt_warm_coarse_steps: 0
+      # 마지막 N coarse step 에만 gradient (bptt_warm_coarse_steps 의 역수 표현). 0 = 비활성.
+      bptt_last_n_coarse_steps: 0
+      # Flow ODE solver 의 마지막 N step 에서만 velocity → model params gradient.
+      # 0 = 비활성. early step velocity 는 detach 되지만 x_t chain (coarse 간 BPTT) 은 유지.
+      bptt_last_n_solver_steps: 0
       # true: training step 마다 ref model G rollout (no_grad) → train/rmm_ref + train/rmm_delta 로깅.
       rmm_bptt_ref_train: false
       # true: validation 시 pretrained ref model 도 동일 조건으로 rollout →

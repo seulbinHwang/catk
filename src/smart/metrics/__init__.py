@@ -345,6 +345,18 @@ class HardSimAgentsMetrics:
 
 
 class SimAgentsSubmission:
+    """Waymo Sim Agents Challenge 제출 파일 생성기.
+
+    validation/test epoch 중 각 배치에서 ScenarioRollouts를 누적하고,
+    epoch 종료 시 binproto 샤드 파일들을 tar.gz로 패킹합니다.
+
+    DDP 동작:
+    - 각 rank가 자신에게 할당된 시나리오를 독립적으로 binproto 샤드로 저장
+    - save_sub_file() 에서 dist.barrier() 후 rank 0만 전체 샤드를 tar.gz로 묶음
+    """
+
+    _SHARD_SIZE = 300
+
     def __init__(
         self,
         is_active: bool,
@@ -356,12 +368,142 @@ class SimAgentsSubmission:
         account_name: str,
     ) -> None:
         self.is_active = bool(is_active)
+        if not self.is_active:
+            return
 
-    def update(self, **kwargs: Any) -> None:
-        return None
+        import hydra as _hydra
 
-    def aggregate_current_batch(self) -> List[Any]:
-        return []
+        self.method_name = method_name
+        self.authors = list(authors)
+        self.affiliation = affiliation
+        self.description = description
+        self.method_link = method_link
+        self.account_name = account_name
+
+        output_dir = _hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+        self.submission_dir = Path(output_dir) / "sim_agents_submission"
+        self.submission_dir.mkdir(parents=True, exist_ok=True)
+
+        self._buffer: List = []
+        self._seen_scenario_ids: set = set()
+        self._shard_idx: int = 0
+        self._pending_rollouts: List = []
+
+    @staticmethod
+    def _rank() -> int:
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                return dist.get_rank()
+        except Exception:
+            pass
+        return 0
+
+    def update(
+        self,
+        *,
+        scenario_id: List[str],
+        agent_id: Any,
+        agent_batch: Any,
+        pred_traj: Any,
+        pred_z: Any,
+        pred_head: Any,
+    ) -> None:
+        if not self.is_active:
+            return
+        import logging as _log
+        from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+
+        device = pred_traj.device
+        scenario_id_tensor = get_scenario_id_int_tensor(scenario_id, device)
+        self._pending_rollouts = get_scenario_rollouts(
+            scenario_id=scenario_id_tensor,
+            agent_id=agent_id,
+            agent_batch=agent_batch,
+            pred_traj=pred_traj,
+            pred_z=pred_z,
+            pred_head=pred_head,
+        )
+
+    def aggregate_current_batch(self) -> List:
+        if not self.is_active:
+            return []
+
+        rollouts = self._pending_rollouts
+        self._pending_rollouts = []
+
+        rank = self._rank()
+        for rollout in rollouts:
+            if rollout.scenario_id not in self._seen_scenario_ids:
+                self._seen_scenario_ids.add(rollout.scenario_id)
+                self._buffer.append(rollout)
+                if len(self._buffer) >= self._SHARD_SIZE:
+                    self._write_shard(rank)
+
+        return rollouts
+
+    def _write_shard(self, rank: int) -> None:
+        import logging as _logging
+        from waymo_open_dataset.protos import sim_agents_submission_pb2 as _pb2
+
+        _log = _logging.getLogger(__name__)
+
+        shard_submission = _pb2.SimAgentsChallengeSubmission(
+            scenario_rollouts=self._buffer,
+            submission_type=_pb2.SimAgentsChallengeSubmission.SIM_AGENTS_SUBMISSION,
+            account_name=self.account_name,
+            unique_method_name=self.method_name,
+            authors=self.authors,
+            affiliation=self.affiliation,
+            description=self.description,
+            method_link=self.method_link,
+            uses_lidar_data=False,
+            uses_camera_data=False,
+            uses_public_model_pretraining=False,
+            num_model_parameters="7M",
+            acknowledge_complies_with_closed_loop_requirement=True,
+        )
+        filename = self.submission_dir / f"submission_r{rank:02d}-{self._shard_idx:05d}.binproto"
+        _log.info(f"[SimAgentsSubmission] Saving shard → {filename}")
+        with open(filename, "wb") as f:
+            f.write(shard_submission.SerializeToString())
+        self._shard_idx += 1
+        self._buffer = []
 
     def save_sub_file(self) -> None:
-        return None
+        if not self.is_active:
+            return
+
+        import logging as _logging
+        import tarfile as _tarfile
+
+        _log = _logging.getLogger(__name__)
+        rank = self._rank()
+
+        if self._buffer:
+            self._write_shard(rank)
+
+        # 모든 rank의 샤드 파일 쓰기가 끝날 때까지 대기
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+        except Exception:
+            pass
+
+        # rank 0만 tar.gz 패킹
+        if rank != 0:
+            return
+
+        tar_path = self.submission_dir.parent / (self.submission_dir.name + ".tar.gz")
+        shard_files = sorted(self.submission_dir.glob("*.binproto"))
+        n_shards = len(shard_files)
+
+        _log.info(f"[SimAgentsSubmission] Packing {n_shards} shards → {tar_path}")
+        with _tarfile.open(str(tar_path), "w:gz") as tar:
+            for shard_file in shard_files:
+                tar.add(
+                    str(shard_file),
+                    arcname=shard_file.name + f"-of-{n_shards:05d}",
+                )
+        _log.info(f"[SimAgentsSubmission] DONE: {tar_path}")
