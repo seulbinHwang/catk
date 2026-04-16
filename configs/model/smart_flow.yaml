@@ -81,8 +81,8 @@ model_config:
       dt: 0.1
       history_steps: 6
       horizon_steps: 5
-      velocity_smooth_lambda: 1.0e-4
-      curvature_smooth_lambda: 1.0e-2
+      velocity_smooth_lambda: 0.
+      curvature_smooth_lambda: 0.
       curvature_init_reg: 1.0e-10
       stop_speed_mps: 0.2
       stop_speed_kp: 0.5
@@ -92,8 +92,8 @@ model_config:
       lateral_q_head: 10.0
       lateral_q_kappa: 0.
       lateral_r: 0.
-      clip_longitudinal_command: true
-      clip_lateral_projection_and_final_curvature_state: true
+      clip_longitudinal_command: false
+      clip_lateral_projection_and_final_curvature_state: false
       accel_tau_s: 0.
       curvature_tau_s: 0.
       min_speed_for_curvature_clip_mps: 0.5
