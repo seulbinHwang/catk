@@ -44,7 +44,7 @@ model:
         vehicle_steer_rate_max_radps: 0.8
         bicycle_steer_rate_max_radps: 1.5
         soft_weight: 0.25
-        compare_softness_to_gt: true
+        compare_softness_to_gt: false
         pedestrian_heading_weight: 0.05
         pedestrian_heading_speed_threshold_mps: 0.5
         eps: 1.0e-6
