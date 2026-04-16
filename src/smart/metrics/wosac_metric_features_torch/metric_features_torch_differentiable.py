@@ -9,6 +9,8 @@ python list -> torch.tensor 변환 과정에서 그래프가 끊긴다.
 proto를 거치지 않고 torch 텐서를 직접 받아 feature를 계산하는 경로가 필요하다.
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List
 
@@ -459,34 +461,23 @@ def compute_metric_features_batched_scenes(
         / flat_vsteps
     )
 
-    # ── Per-scene assembly (road edge + TL still per-scene; rest sliced) ─
-    results = []
-    for i in range(n_scenes):
+    # ── Map/TL per-scene (parallel launch: CPU threads + optional CUDA streams) ─
+    def _compute_map_tl_one(i: int):
         scenario = scenarios[i]
         simulated = simulated_list[i]
         evaluated = evaluated_list[i]
         eval_mask = eval_mask_list[i]
         _sc = _cache_get_or_build(scenario)
 
-        o0, o1 = eval_offsets[i], eval_offsets[i + 1]
-        dno_i = dno_flat[o0:o1]
-        ttc_i = ttc_flat[o0:o1]
-        linear_speed  = flat_ls[o0:o1]
-        linear_accel  = flat_la[o0:o1]
-        angular_speed = flat_as[o0:o1]
-        angular_accel = flat_aa[o0:o1]
-        ade = flat_ade[o0:o1]
-
         eval_ids_i_dev = evaluated.object_id.to(device)
         eval_object_mask_i = torch.any(eval_ids_i_dev[:, None].eq(simulated.object_id.to(device)[None, :]), dim=0)
 
-        # Road edge (per-scene polylines — different map per scenario)
         road_edges = _sc.get("road_edges") or [
             list(mf.road_edge.polyline)
             for mf in scenario.map_features
             if mf.HasField("road_edge")
         ]
-        d_road = map_feat.compute_distance_to_road_edge(
+        d_road_i = map_feat.compute_distance_to_road_edge(
             center_x=simulated.x, center_y=simulated.y, center_z=simulated.z,
             length=simulated.length, width=simulated.width, height=simulated.height,
             heading=simulated.heading, valid=simulated.valid,
@@ -496,7 +487,6 @@ def compute_metric_features_batched_scenes(
             is_polyline_cyclic=_sc.get("road_edge_is_cyclic"),
         )
 
-        # Traffic lights (per-scene lane/signal data)
         lane_ids: List[int] = _sc.get("lane_ids") or []
         lane_polys: List[List[map_pb2.MapPoint]] = _sc.get("lane_polys") or []
         traffic_signals = _sc.get("traffic_signals") or []
@@ -510,7 +500,7 @@ def compute_metric_features_batched_scenes(
 
         if lane_polys and traffic_signals:
             if surrogate is None:
-                red_light = tl_feat.compute_red_light_violation(
+                red_light_i = tl_feat.compute_red_light_violation(
                     center_x=simulated.x, center_y=simulated.y,
                     valid=simulated.valid,
                     evaluated_object_mask=eval_object_mask_i,
@@ -518,7 +508,7 @@ def compute_metric_features_batched_scenes(
                     traffic_signals=traffic_signals,
                 )
             else:
-                red_light = tl_feat.compute_red_light_violation_soft(
+                red_light_i = tl_feat.compute_red_light_violation_soft(
                     center_x=simulated.x, center_y=simulated.y,
                     valid=simulated.valid,
                     evaluated_object_mask=eval_object_mask_i,
@@ -532,11 +522,56 @@ def compute_metric_features_batched_scenes(
                     ts_stop_point=_sc.get("ts_stop_point"),
                 )
         else:
-            red_light = torch.zeros(
+            red_light_i = torch.zeros(
                 (int(eval_mask.sum().item()), simulated.valid.shape[1]),
                 dtype=torch.float32 if surrogate is not None else torch.bool,
                 device=device,
             )
+        return d_road_i, red_light_i
+
+    user_workers = int(os.getenv("WOSAC_MAP_TL_PARALLEL_WORKERS", "0"))
+    default_workers = min(n_scenes, max(1, (os.cpu_count() or 1) // 2))
+    n_workers = min(n_scenes, user_workers if user_workers > 0 else default_workers)
+
+    d_road_list: List[Tensor] = [None] * n_scenes  # type: ignore
+    red_light_list: List[Tensor] = [None] * n_scenes  # type: ignore
+    if n_workers <= 1 or n_scenes <= 1:
+        for i in range(n_scenes):
+            d_road_list[i], red_light_list[i] = _compute_map_tl_one(i)
+    else:
+        if device.type == "cuda":
+            streams = [torch.cuda.Stream(device=device) for _ in range(n_scenes)]
+
+            def _task(i: int):
+                with torch.cuda.stream(streams[i]):
+                    return _compute_map_tl_one(i)
+
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futs = [ex.submit(_task, i) for i in range(n_scenes)]
+                for i, fut in enumerate(futs):
+                    d_road_list[i], red_light_list[i] = fut.result()
+            for s in streams:
+                s.synchronize()
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                futs = [ex.submit(_compute_map_tl_one, i) for i in range(n_scenes)]
+                for i, fut in enumerate(futs):
+                    d_road_list[i], red_light_list[i] = fut.result()
+
+    # ── Per-scene assembly ────────────────────────────────────────────────
+    results = []
+    for i in range(n_scenes):
+        evaluated = evaluated_list[i]
+        o0, o1 = eval_offsets[i], eval_offsets[i + 1]
+        dno_i = dno_flat[o0:o1]
+        ttc_i = ttc_flat[o0:o1]
+        linear_speed  = flat_ls[o0:o1]
+        linear_accel  = flat_la[o0:o1]
+        angular_speed = flat_as[o0:o1]
+        angular_accel = flat_aa[o0:o1]
+        ade = flat_ade[o0:o1]
+        d_road = d_road_list[i]
+        red_light = red_light_list[i]
 
         # Slice to future horizon (remove history)
         validity_mask = evaluated.valid[:, ct_idx + 1:]
