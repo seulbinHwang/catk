@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Mapping, Tuple, Dict, Optional
+from typing import List, Mapping, Tuple, Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -232,3 +232,200 @@ def compute_wosac_metametric_soft(
         )
 
     return WosacMetametricSoftResult(metametric=metametric, likelihoods=lik_dict)
+
+
+# =========================================================================
+# 5. Batched Metametric — S scenarios in one fused GPU pass
+# =========================================================================
+
+def compute_wosac_metametric_soft_batched(
+    config: sim_agents_metrics_pb2.SimAgentMetricsConfig,
+    log_features_list: List[Mapping[str, Tensor]],
+    sim_features_list: List[Mapping[str, Tensor]],
+    beta: float = 10.0,
+    default_tau: float = 0.1,
+    custom_taus: Optional[Dict[str, float]] = None,
+    debug: bool = False,
+) -> Tensor:
+    """Batched differentiable metametric for *S* scenarios in a single pass.
+
+    Features are padded to ``A_max`` (the largest agent count across
+    scenarios) and all histogram / soft-any / likelihood computations run
+    as fused GPU kernels over the ``(S * A_max)`` flat batch.
+    Padded agents are masked out via per-scenario validity so they never
+    affect the per-scenario metametric values.
+
+    Returns
+    -------
+    Tensor, shape ``(S,)``
+        Per-scenario differentiable metametric.
+    """
+    S = len(log_features_list)
+    if S == 0:
+        return torch.tensor([], dtype=torch.float32)
+    if S == 1:
+        r = compute_wosac_metametric_soft(
+            config, log_features_list[0], sim_features_list[0],
+            beta, default_tau, custom_taus, debug,
+        )
+        return r.metametric.unsqueeze(0)
+
+    dtype = _squeeze_log_sample(log_features_list[0]["linear_speed"]).dtype
+    device = _squeeze_log_sample(log_features_list[0]["linear_speed"]).device
+
+    taus = {fn: default_tau for fn in _METRIC_FIELD_NAMES}
+    taus.update(_DEFAULT_SOFT_CUSTOM_TAUS)
+    if custom_taus:
+        taus.update(custom_taus)
+
+    n_agents = [_squeeze_log_sample(lf["valid"]).shape[0] for lf in log_features_list]
+    A = max(n_agents)
+    T = _squeeze_log_sample(log_features_list[0]["valid"]).shape[-1]
+    G = sim_features_list[0]["valid"].shape[0]
+
+    agent_mask = torch.zeros(S, A, dtype=dtype, device=device)
+    for i, na in enumerate(n_agents):
+        agent_mask[i, :na] = 1.0
+    agent_time_mask = agent_mask.unsqueeze(-1)  # (S, A, 1)
+
+    # ── pad helpers ──────────────────────────────────────────────────────────
+
+    def _pad_log(key: str) -> Tensor:
+        """(A_i, T) → (S, A, T). No grad needed (ground-truth log features)."""
+        out = torch.zeros(S, A, T, dtype=dtype, device=device)
+        for i, lf in enumerate(log_features_list):
+            t = _squeeze_log_sample(lf[key]).to(dtype).to(device)
+            out[i, :t.shape[0]] = t
+        return out
+
+    def _pad_sim_flat(key: str) -> Tensor:
+        """(G, A_i, T) → (S*A, G*T). Gradient-safe (F.pad + stack)."""
+        parts: List[Tensor] = []
+        for sf in sim_features_list:
+            t = sf[key].to(dtype).to(device)
+            flat = t.permute(1, 0, 2).reshape(t.shape[1], G * T)
+            if flat.shape[0] < A:
+                flat = F.pad(flat, (0, 0, 0, A - flat.shape[0]))
+            parts.append(flat)
+        return torch.stack(parts).reshape(S * A, G * T)
+
+    def _pad_sim_3d(key: str) -> Tensor:
+        """(G, A_i, T) → (S, G, A, T). Gradient-safe."""
+        parts: List[Tensor] = []
+        for sf in sim_features_list:
+            t = sf[key].to(dtype).to(device)
+            if t.shape[1] < A:
+                t = F.pad(t, (0, 0, 0, A - t.shape[1]))
+            parts.append(t)
+        return torch.stack(parts)
+
+    # ── histogram dispatch ───────────────────────────────────────────────────
+
+    def _hist(cfg_f, log_flat: Tensor, sim_flat: Tensor, tau: float) -> Tensor:
+        w = cfg_f.WhichOneof("estimator")
+        if w == "histogram":
+            h = cfg_f.histogram
+            return histogram_estimate_soft_torch(
+                h.min_val, h.max_val, h.num_bins,
+                h.additive_smoothing_pseudocount, log_flat, sim_flat, tau,
+            )
+        h = cfg_f.bernoulli
+        return histogram_estimate_soft_torch(
+            -0.5, 1.5, 2, h.additive_smoothing_pseudocount,
+            log_flat, sim_flat, tau,
+        )
+
+    # ── validity ─────────────────────────────────────────────────────────────
+
+    log_valid = _pad_log("valid") * agent_time_mask
+    speed_valid, accel_valid = compute_kinematic_validity_soft(log_valid)
+
+    lik_dict: Dict[str, Tensor] = {}
+
+    # ── 1. timeseries metrics ────────────────────────────────────────────────
+
+    ts_fields = [
+        ("linear_speed",               config.linear_speed,               speed_valid),
+        ("angular_speed",              config.angular_speed,              speed_valid),
+        ("linear_acceleration",        config.linear_acceleration,        accel_valid),
+        ("angular_acceleration",       config.angular_acceleration,       accel_valid),
+        ("distance_to_nearest_object", config.distance_to_nearest_object, log_valid),
+        ("distance_to_road_edge",      config.distance_to_road_edge,      log_valid),
+        ("time_to_collision",          config.time_to_collision,          None),
+    ]
+
+    _ot_padded: Optional[Tensor] = None
+
+    for name, cfg_f, mask in ts_fields:
+        if name == "time_to_collision":
+            if _ot_padded is None:
+                _ot_padded = torch.zeros(S, A, dtype=torch.long, device=device)
+                for i, lf in enumerate(log_features_list):
+                    ot = _squeeze_log_sample(lf["object_type"]).long().to(device)
+                    _ot_padded[i, :ot.shape[0]] = ot
+            mask = log_valid * (
+                _ot_padded == int(scenario_pb2.Track.ObjectType.TYPE_VEHICLE)
+            ).to(dtype).unsqueeze(-1)
+
+        log_vals = _pad_log(name).reshape(S * A, T)
+        sim_flat = _pad_sim_flat(name)
+
+        ll = _hist(cfg_f, log_vals, sim_flat, taus[name]).reshape(S, A, T)
+
+        masked_sum = (ll * mask).sum(dim=(1, 2))
+        valid_sum  = mask.sum(dim=(1, 2)).clamp(min=1e-5)
+        lik_dict[f"{name}_likelihood"] = _likelihood_from_log_ll(masked_sum / valid_sum)
+
+    # ── 2. scenario-level metrics ────────────────────────────────────────────
+
+    sc_fields = [
+        ("collision_indication",    "collision_per_step",                config.collision_indication,   log_valid),
+        ("offroad_indication",      "offroad_per_step",                  config.offroad_indication,     log_valid),
+        ("traffic_light_violation", "traffic_light_violation_per_step",  config.traffic_light_violation, None),
+    ]
+
+    for name, feat_key, cfg_f, v_log in sc_fields:
+        if name == "traffic_light_violation":
+            if _ot_padded is None:
+                _ot_padded = torch.zeros(S, A, dtype=torch.long, device=device)
+                for i, lf in enumerate(log_features_list):
+                    ot = _squeeze_log_sample(lf["object_type"]).long().to(device)
+                    _ot_padded[i, :ot.shape[0]] = ot
+            v_log = log_valid * (
+                _ot_padded == int(scenario_pb2.Track.ObjectType.TYPE_VEHICLE)
+            ).to(dtype).unsqueeze(-1)
+
+        log_feat = _pad_log(feat_key)
+        sim_feat = _pad_sim_3d(feat_key)
+
+        log_any = soft_any(log_feat * v_log, dim=-1, beta=beta)
+        v_exp   = v_log.unsqueeze(1)
+        sim_any = soft_any(sim_feat * v_exp, dim=-1, beta=beta)
+
+        log_v    = log_any.reshape(S * A, 1)
+        sim_v    = sim_any.permute(0, 2, 1).reshape(S * A, G)
+        ll_flat  = _hist(cfg_f, log_v, sim_v, taus[name])
+        ll       = ll_flat.reshape(S, A)
+
+        masked_sum  = (ll * agent_mask).sum(dim=1)
+        valid_count = agent_mask.sum(dim=1).clamp(min=1e-5)
+        lik_dict[f"{name}_likelihood"] = _likelihood_from_log_ll(masked_sum / valid_count)
+
+    # ── 3. weighted sum ──────────────────────────────────────────────────────
+
+    metametric = torch.zeros(S, dtype=dtype, device=device)
+    for fn in _METRIC_FIELD_NAMES:
+        w = getattr(config, fn).metametric_weight
+        metametric = metametric + w * lik_dict[f"{fn}_likelihood"]
+
+    if debug:
+        with torch.no_grad():
+            parts = {fn: lik_dict[f"{fn}_likelihood"].detach().cpu().tolist()
+                     for fn in _METRIC_FIELD_NAMES}
+            _log.warning(
+                "[soft_rmm_batched] metametric=%s | %s",
+                metametric.detach().cpu().tolist(),
+                " ".join(f"{k}={v}" for k, v in parts.items()),
+            )
+
+    return metametric

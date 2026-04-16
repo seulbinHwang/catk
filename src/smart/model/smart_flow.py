@@ -48,6 +48,7 @@ from src.smart.metrics.wosac_metric_features_torch.metric_features_torch_differe
 )
 from src.smart.metrics.wosac_metametric_pytorch_differentiable import (
     compute_wosac_metametric_soft,
+    compute_wosac_metametric_soft_batched,
     WosacMetametricSoftResult,
 )
 from src.smart.metrics.wosac_metric_features_torch.surrogate import SurrogateConfig
@@ -1714,15 +1715,12 @@ class SMARTFlow(LightningModule):
                         _feat_list = compute_metric_features_batched_scenes(
                             scenarios=_valid_scenarios, preds=_preds_g, surrogate=_SURROGATE,
                         )
-                        _rmm_g_vec = torch.stack([
-                            compute_wosac_metametric_soft(
-                                config=cfg,
-                                log_features=_valid_log_feat_dicts[j],
-                                sim_features=_feat_list[j].as_dict(),
-                                debug=(_dbg_enabled and g == 0 and j == 0),
-                            ).metametric
-                            for j in range(_n_valid)
-                        ])  # (_n_valid,)
+                        _rmm_g_vec = compute_wosac_metametric_soft_batched(
+                            config=cfg,
+                            log_features_list=_valid_log_feat_dicts,
+                            sim_features_list=[f.as_dict() for f in _feat_list],
+                            debug=(_dbg_enabled and g == 0),
+                        )  # (_n_valid,)
                         _finite_g = torch.isfinite(_rmm_g_vec)
                         count_g = int(_finite_g.sum().item())
                         if count_g > 0:
@@ -1832,12 +1830,12 @@ class SMARTFlow(LightningModule):
                             _ref_feat_list = compute_metric_features_batched_scenes(
                                 scenarios=_valid_scenarios, preds=_ref_preds_g, surrogate=_SURROGATE,
                             )
-                            for j in range(_n_valid):
-                                ref_s_total += compute_wosac_metametric_soft(
-                                    config=cfg,
-                                    log_features=_valid_log_feat_dicts[j],
-                                    sim_features=_ref_feat_list[j].as_dict(),
-                                ).metametric.item() / (G * _n_valid)
+                            _ref_rmm_vec = compute_wosac_metametric_soft_batched(
+                                config=cfg,
+                                log_features_list=_valid_log_feat_dicts,
+                                sim_features_list=[f.as_dict() for f in _ref_feat_list],
+                            )
+                            ref_s_total += _ref_rmm_vec.sum().item() / (G * _n_valid)
                     seq_ref_rmm = torch.tensor(ref_s_total, dtype=torch.float32, device=mean_rmm.device)
                     seq_ret["train/rmm_ref"] = seq_ref_rmm
                     seq_ret["train/rmm_delta"] = mean_rmm.detach() - seq_ref_rmm
@@ -1895,15 +1893,12 @@ class SMARTFlow(LightningModule):
             _feat_list = compute_metric_features_batched_scenes(
                 scenarios=_valid_scenarios, preds=_preds_g, surrogate=_SURROGATE,
             )
-            _rmm_g = torch.stack([
-                compute_wosac_metametric_soft(
-                    config=cfg,
-                    log_features=_valid_log_feat_dicts[j],
-                    sim_features=_feat_list[j].as_dict(),
-                    debug=(_dbg_enabled and g == 0 and j == 0),
-                ).metametric
-                for j in range(_n_valid)
-            ])  # (_n_valid,)
+            _rmm_g = compute_wosac_metametric_soft_batched(
+                config=cfg,
+                log_features_list=_valid_log_feat_dicts,
+                sim_features_list=[f.as_dict() for f in _feat_list],
+                debug=(_dbg_enabled and g == 0),
+            )  # (_n_valid,)
             _rmm_by_g.append(_rmm_g)
 
         rmm_matrix = torch.stack(_rmm_by_g, dim=1)  # (_n_valid, G)
@@ -1978,12 +1973,12 @@ class SMARTFlow(LightningModule):
                         _ref_feat_list = compute_metric_features_batched_scenes(
                             scenarios=_valid_scenarios, preds=_ref_preds_g, surrogate=_SURROGATE,
                         )
-                        for j in range(_n_valid):
-                            ref_total += compute_wosac_metametric_soft(
-                                config=cfg,
-                                log_features=_valid_log_feat_dicts[j],
-                                sim_features=_ref_feat_list[j].as_dict(),
-                            ).metametric.item() / (G * _n_valid)
+                        _ref_rmm_vec = compute_wosac_metametric_soft_batched(
+                            config=cfg,
+                            log_features_list=_valid_log_feat_dicts,
+                            sim_features_list=[f.as_dict() for f in _ref_feat_list],
+                        )
+                        ref_total += _ref_rmm_vec.sum().item() / (G * _n_valid)
                 ref_rmm_log = torch.tensor(ref_total, dtype=torch.float32, device=mean_rmm.device)
 
         loss = -mean_rmm

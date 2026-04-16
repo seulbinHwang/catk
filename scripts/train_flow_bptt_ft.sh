@@ -42,7 +42,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2, 3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0, 1, 2, 3}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_bptt_ft}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-main_exp}"
@@ -64,7 +64,7 @@ CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_l
 TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
 # 정수(예: 10) = val 배치 최대 개수. 0~1 실수 = 데이터셋 비율. 빠른 RMM 스모크는 10 권장.
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-10}"
@@ -114,6 +114,9 @@ PY
 fi
 # GT FM 정규화 (rmm_bptt_ft): flow_train_clean_norm velocity FM MSE 가중치. 0 이면 비활성.
 FLOW_REG_LAMBDA="${FLOW_REG_LAMBDA:-1.0}"
+FLOW_SOLVER_METHOD="${FLOW_SOLVER_METHOD:-euler}"
+FLOW_SOLVER_STEPS="${FLOW_SOLVER_STEPS:-8}"
+
 
 ROLLOUT_NOISE_SCALE="${ROLLOUT_NOISE_SCALE:-1.0}"
 # 0 이면 validation 비디오 생성 안 함 (Waymo rollout MP4 + W&B 업로드 스킵)
@@ -212,6 +215,8 @@ echo "LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES} N_VIS_BATCH=${N_VIS_BATCH} N_ROLLOU
 echo "NPROC_PER_NODE=${NPROC_PER_NODE} NUM_WORKERS=${NUM_WORKERS} (≈ ${NPROC_PER_NODE}×${NUM_WORKERS} dataloader worker 프로세스 + 메인)"
 echo "[grad] GRAD_CLIP_VAL=${GRAD_CLIP_VAL} BPTT_GRAD_CLIP_TRAJ=${BPTT_GRAD_CLIP_TRAJ} LR=${LR} FLOW_REG_LAMBDA=${FLOW_REG_LAMBDA} BPTT_DEBUG=${BPTT_DEBUG}"
 echo "BPTT_WARM_COARSE_STEPS=${BPTT_WARM_COARSE_STEPS} BPTT_LAST_N_COARSE_STEPS=${BPTT_LAST_N_COARSE_STEPS} BPTT_LAST_N_SOLVER_STEPS=${BPTT_LAST_N_SOLVER_STEPS}"
+echo "FLOW_SOLVER_METHOD=${FLOW_SOLVER_METHOD} FLOW_SOLVER_STEPS=${FLOW_SOLVER_STEPS}"
+
 
 PORT="$(get_free_port)"
 torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_endpoint="127.0.0.1:${PORT}" -m src.run \
@@ -263,6 +268,8 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
   model.model_config.finetune.bptt_last_n_coarse_steps="${BPTT_LAST_N_COARSE_STEPS}" \
   model.model_config.finetune.bptt_last_n_solver_steps="${BPTT_LAST_N_SOLVER_STEPS}" \
+  model.model_config.decoder.flow_solver_method="${FLOW_SOLVER_METHOD}" \
+  model.model_config.decoder.flow_solver_steps="${FLOW_SOLVER_STEPS}" \
   model.model_config.finetune.bptt_grad_clip_traj="${BPTT_GRAD_CLIP_TRAJ}" \
   model.model_config.finetune.bptt_debug="${BPTT_DEBUG}" \
   ${BPTT_MAX_COARSE_STEPS:+model.model_config.finetune.bptt_max_coarse_steps="${BPTT_MAX_COARSE_STEPS}"} \
