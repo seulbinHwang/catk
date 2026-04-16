@@ -83,6 +83,8 @@ class LQRCommitBridgeConfig:
         history_steps: 제어 참조를 만들 때 쓸 실제 fine history 길이입니다.
             shape 의미는 ``6`` 이면 최근 0.5초 + 현재까지의 6개 점입니다.
         horizon_steps: LQR가 직접 볼 미래 길이입니다.
+        replan_every_step: ``True`` 면 0.1초마다 receding-horizon LQR를 다시 풉니다.
+            ``False`` 면 chunk 시작에서 한 번만 제어 명령을 풀고 0.5초 동안 유지합니다.
         velocity_smooth_lambda: 속도 곡선 매끈함 가중치입니다.
         curvature_smooth_lambda: 곡률 곡선 매끈함 가중치입니다.
         curvature_init_reg: 저속에서 곡률 추정이 깨지지 않게 하는 작은 값입니다.
@@ -105,6 +107,7 @@ class LQRCommitBridgeConfig:
     dt: float = 0.1
     history_steps: int = 6
     horizon_steps: int = 10
+    replan_every_step: bool = True
     velocity_smooth_lambda: float = 1.0e-4
     curvature_smooth_lambda: float = 1.0e-2
     curvature_init_reg: float = 1.0e-10
@@ -1251,6 +1254,29 @@ class ContinuousCommitBridge:
         u_clipped = torch.clamp(u_value, torch.minimum(u_low, u_high), torch.maximum(u_low, u_high))
         return kappa_state, u_clipped
 
+    def _postprocess_lqr_commands(
+        self,
+        speed_state: torch.Tensor,
+        v_ref_target: torch.Tensor,
+        a_star: torch.Tensor,
+        u_star: torch.Tensor,
+        limits: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """저속 예외 처리와 종방향 명령 clamp를 공통으로 적용합니다."""
+        slow_mask = (speed_state.abs() < float(self.config.stop_speed_mps)) & (
+            v_ref_target.abs() < float(self.config.stop_speed_mps)
+        )
+        if slow_mask.any():
+            a_star = a_star.clone()
+            u_star = u_star.clone()
+            a_star[slow_mask] = -float(self.config.stop_speed_kp) * (
+                speed_state[slow_mask] - v_ref_target[slow_mask]
+            )
+            u_star[slow_mask] = 0.0
+        if self.config.clip_longitudinal_command:
+            a_star = torch.clamp(a_star, -limits["a_max"], limits["a_max"])
+        return a_star, u_star
+
     def execute_lqr_commit(
         self,
         y_hat_norm: torch.Tensor,
@@ -1261,7 +1287,7 @@ class ContinuousCommitBridge:
         exec_valid_history: torch.Tensor,
         agent_type: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """vehicle / bicycle의 다음 0.5초를 0.1초 receding-horizon LQR로 실행합니다.
+        """vehicle / bicycle의 다음 0.5초를 LQR commit bridge로 실행합니다.
 
         Args:
             y_hat_norm: raw FM 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
@@ -1310,6 +1336,7 @@ class ContinuousCommitBridge:
         speed_state = v0.clone()
         accel_state = a_prev.clamp(-limits["a_max"], limits["a_max"])
         kappa_state = kappa0.clone()
+        replan_every_step = bool(self.config.replan_every_step)
         exec_pos_history_state = exec_pos_history[:, -history_steps:].clone()
         exec_head_history_state = exec_head_history[:, -history_steps:].clone()
         exec_valid_history_state = exec_valid_history[:, -history_steps:].clone()
@@ -1319,38 +1346,60 @@ class ContinuousCommitBridge:
 
         commit_pos = current_pos.new_zeros((current_pos.shape[0], 5, 2))
         commit_head = current_head.new_zeros((current_head.shape[0], 5))
-        for step_idx in range(5):
-            # Keep the FM future fixed for the 0.5s block, but re-solve control on the remaining horizon every 0.1s.
-            remaining_future_pos = future_pos[:, step_idx:]
-            remaining_future_head = future_head[:, step_idx:]
+        if not replan_every_step:
             _, _, _, v_ref_horizon, kappa_ref_horizon = self._estimate_reference_profiles(
                 current_pos=pos_state,
                 current_head=head_state,
                 exec_pos_history=exec_pos_history_state,
                 exec_head_history=exec_head_history_state,
                 exec_valid_history=exec_valid_history_state,
-                future_pos=remaining_future_pos,
-                future_head=remaining_future_head,
+                future_pos=future_pos,
+                future_head=future_head,
             )
-            v_ref_target = v_ref_horizon[:, -1]
-            a_star = self._solve_longitudinal_lqr(v0=speed_state, v_ref_target=v_ref_target)
-            u_star = self._solve_lateral_lqr(
+            held_v_ref_target = v_ref_horizon[:, -1]
+            held_a_star = self._solve_longitudinal_lqr(v0=speed_state, v_ref_target=held_v_ref_target)
+            held_u_star = self._solve_lateral_lqr(
                 v_profile=v_ref_horizon,
                 kappa0=kappa_state,
                 kappa_ref_profile=kappa_ref_horizon,
             )
-            slow_mask = (speed_state.abs() < float(self.config.stop_speed_mps)) & (
-                v_ref_target.abs() < float(self.config.stop_speed_mps)
+            held_a_star, held_u_star = self._postprocess_lqr_commands(
+                speed_state=speed_state,
+                v_ref_target=held_v_ref_target,
+                a_star=held_a_star,
+                u_star=held_u_star,
+                limits=limits,
             )
-            if slow_mask.any():
-                a_star = a_star.clone()
-                u_star = u_star.clone()
-                a_star[slow_mask] = -float(self.config.stop_speed_kp) * (
-                    speed_state[slow_mask] - v_ref_target[slow_mask]
+        for step_idx in range(5):
+            if replan_every_step:
+                remaining_future_pos = future_pos[:, step_idx:]
+                remaining_future_head = future_head[:, step_idx:]
+                _, _, _, v_ref_horizon, kappa_ref_horizon = self._estimate_reference_profiles(
+                    current_pos=pos_state,
+                    current_head=head_state,
+                    exec_pos_history=exec_pos_history_state,
+                    exec_head_history=exec_head_history_state,
+                    exec_valid_history=exec_valid_history_state,
+                    future_pos=remaining_future_pos,
+                    future_head=remaining_future_head,
                 )
-                u_star[slow_mask] = 0.0
-            if self.config.clip_longitudinal_command:
-                a_star = torch.clamp(a_star, -limits["a_max"], limits["a_max"])
+                v_ref_target = v_ref_horizon[:, -1]
+                a_star = self._solve_longitudinal_lqr(v0=speed_state, v_ref_target=v_ref_target)
+                u_star = self._solve_lateral_lqr(
+                    v_profile=v_ref_horizon,
+                    kappa0=kappa_state,
+                    kappa_ref_profile=kappa_ref_horizon,
+                )
+                a_star, u_star = self._postprocess_lqr_commands(
+                    speed_state=speed_state,
+                    v_ref_target=v_ref_target,
+                    a_star=a_star,
+                    u_star=u_star,
+                    limits=limits,
+                )
+            else:
+                a_star = held_a_star
+                u_star = held_u_star
 
             accel_applied = accel_state + accel_alpha * (a_star - accel_state)
             accel_applied = torch.clamp(accel_applied, -limits["a_max"], limits["a_max"])

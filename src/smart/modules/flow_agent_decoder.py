@@ -90,6 +90,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dt=float(getattr(lqr_commit, "dt", 0.1)) if lqr_commit is not None else 0.1,
             history_steps=int(getattr(lqr_commit, "history_steps", 6)) if lqr_commit is not None else 6,
             horizon_steps=int(getattr(lqr_commit, "horizon_steps", 10)) if lqr_commit is not None else 10,
+            replan_every_step=bool(getattr(lqr_commit, "replan_every_step", True)) if lqr_commit is not None else True,
             velocity_smooth_lambda=float(getattr(lqr_commit, "velocity_smooth_lambda", 1.0e-4)) if lqr_commit is not None else 1.0e-4,
             curvature_smooth_lambda=float(getattr(lqr_commit, "curvature_smooth_lambda", 1.0e-2)) if lqr_commit is not None else 1.0e-2,
             curvature_init_reg=float(getattr(lqr_commit, "curvature_init_reg", 1.0e-10)) if lqr_commit is not None else 1.0e-10,

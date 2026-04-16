@@ -53,7 +53,10 @@
   즉, 작은 떨림을 허용하지 않습니다.
 - 이 stop gate는 `use_lqr=false` 여도 동작합니다.
 - `use_lqr=true` 이면 stop gate를 통과한 vehicle / bicycle에만 제어용 참조를 만들고,
-  1초 horizon의 longitudinal / lateral LQR를 0.1초마다 다시 풀어 다음 0.5초 5점을 실제 실행합니다.
+  1초 horizon의 longitudinal / lateral LQR를 사용해 다음 0.5초 5점을 실제 실행합니다.
+- `model.model_config.decoder.lqr_commit.replan_every_step=true/false` 로
+  0.1초마다 receding-horizon 제어를 다시 풀지, 아니면 chunk 시작에서 한 번만 제어 명령을 풀고
+  그 값을 0.5초 동안 유지할지 고를 수 있습니다.
 - 이때 제어는 steering angle 이 아니라 **curvature-domain kinematic bicycle** 로 수행합니다.
   wheelbase 추정은 쓰지 않습니다.
 - LQR 참조 생성은 이제 `과거+미래`를 한 번에 smooth fitting 하지 않습니다.
@@ -96,10 +99,11 @@ python train.py \
   model.model_config.decoder.use_stop_motion=true \
   model.model_config.decoder.use_lqr=true
 
-# LQR future reference는 previous+current prefix를 항상 사용
+# 0.1초마다 LQR를 다시 풀지 않고, 0.5초 동안 같은 제어 명령 유지
 python train.py \
   model.model_config.decoder.use_stop_motion=true \
-  model.model_config.decoder.use_lqr=true
+  model.model_config.decoder.use_lqr=true \
+  model.model_config.decoder.lqr_commit.replan_every_step=false
 ```
 
 
