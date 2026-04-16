@@ -433,31 +433,54 @@ def compute_metric_features_batched_scenes(
     for ec in eval_counts:
         eval_offsets.append(eval_offsets[-1] + ec)
 
-    # ── Per-scene assembly ─────────────────────────────────────────────────
+    # ── Batched kinematics + ADE (single kernel for all eval agents) ──────
+    flat_eval_x = torch.cat([e.x for e in evaluated_list], dim=0)
+    flat_eval_y = torch.cat([e.y for e in evaluated_list], dim=0)
+    flat_eval_z = torch.cat([e.z for e in evaluated_list], dim=0)
+    flat_eval_heading = torch.cat([e.heading for e in evaluated_list], dim=0)
+
+    flat_ls, flat_la, flat_as, flat_aa = traj.compute_kinematic_features(
+        flat_eval_x, flat_eval_y, flat_eval_z, flat_eval_heading,
+        seconds_per_step=cfg.step_duration_seconds,
+    )
+
+    flat_elog_x = torch.cat([el.x for el in eval_logged_list], dim=0)
+    flat_elog_y = torch.cat([el.y for el in eval_logged_list], dim=0)
+    flat_elog_z = torch.cat([el.z for el in eval_logged_list], dim=0)
+    flat_elog_valid = torch.cat([el.valid for el in eval_logged_list], dim=0)
+
+    flat_disp = traj.compute_displacement_error(
+        flat_eval_x, flat_eval_y, flat_eval_z,
+        flat_elog_x, flat_elog_y, flat_elog_z,
+    )
+    flat_vsteps = torch.clamp(flat_elog_valid.to(torch.float32).sum(dim=1), min=1.0)
+    flat_ade = (
+        torch.where(flat_elog_valid, flat_disp, torch.zeros_like(flat_disp)).sum(dim=1)
+        / flat_vsteps
+    )
+
+    # ── Per-scene assembly (road edge + TL still per-scene; rest sliced) ─
     results = []
     for i in range(n_scenes):
         scenario = scenarios[i]
         simulated = simulated_list[i]
         evaluated = evaluated_list[i]
-        eval_logged = eval_logged_list[i]
         eval_mask = eval_mask_list[i]
         _sc = _cache_get_or_build(scenario)
 
-        dno_i = dno_flat[eval_offsets[i]:eval_offsets[i + 1]]  # (E_i, T_full)
-        ttc_i = ttc_flat[eval_offsets[i]:eval_offsets[i + 1]]  # (E_i, T_full)
+        o0, o1 = eval_offsets[i], eval_offsets[i + 1]
+        dno_i = dno_flat[o0:o1]
+        ttc_i = ttc_flat[o0:o1]
+        linear_speed  = flat_ls[o0:o1]
+        linear_accel  = flat_la[o0:o1]
+        angular_speed = flat_as[o0:o1]
+        angular_accel = flat_aa[o0:o1]
+        ade = flat_ade[o0:o1]
 
-        # eval_object_mask in simulated order (for road edge and traffic lights)
-        # evaluated.object_id comes from gather_objects_by_id(cpu tensor) — ensure device match
         eval_ids_i_dev = evaluated.object_id.to(device)
         eval_object_mask_i = torch.any(eval_ids_i_dev[:, None].eq(simulated.object_id.to(device)[None, :]), dim=0)
 
-        # Kinematics on eval agents
-        linear_speed, linear_accel, angular_speed, angular_accel = traj.compute_kinematic_features(
-            evaluated.x, evaluated.y, evaluated.z, evaluated.heading,
-            seconds_per_step=cfg.step_duration_seconds,
-        )
-
-        # Road edge (per-scene polylines)
+        # Road edge (per-scene polylines — different map per scenario)
         road_edges = _sc.get("road_edges") or [
             list(mf.road_edge.polyline)
             for mf in scenario.map_features
@@ -471,7 +494,7 @@ def compute_metric_features_batched_scenes(
             road_edge_polylines=road_edges,
             road_edge_polylines_tensor=_sc.get("road_edge_polylines_tensor"),
             is_polyline_cyclic=_sc.get("road_edge_is_cyclic"),
-        )  # (E_i, T_full)
+        )
 
         # Traffic lights (per-scene lane/signal data)
         lane_ids: List[int] = _sc.get("lane_ids") or []
@@ -515,26 +538,15 @@ def compute_metric_features_batched_scenes(
                 device=device,
             )
 
-        # ADE against logged trajectories
-        displacement_error = traj.compute_displacement_error(
-            evaluated.x, evaluated.y, evaluated.z,
-            eval_logged.x, eval_logged.y, eval_logged.z,
-        )
-        object_valid_steps = torch.clamp(eval_logged.valid.to(torch.float32).sum(dim=1), min=1.0)
-        ade = (
-            torch.where(eval_logged.valid, displacement_error, torch.zeros_like(displacement_error)).sum(dim=1)
-            / object_valid_steps
-        )
-
         # Slice to future horizon (remove history)
         validity_mask = evaluated.valid[:, ct_idx + 1:]
-        linear_speed   = linear_speed[:, ct_idx + 1:]
-        linear_accel   = linear_accel[:, ct_idx + 1:]
-        angular_speed  = angular_speed[:, ct_idx + 1:]
-        angular_accel  = angular_accel[:, ct_idx + 1:]
-        dno_i   = dno_i[:, ct_idx + 1:]
-        ttc_i   = ttc_i[:, ct_idx + 1:]
-        d_road  = d_road[:, ct_idx + 1:]
+        linear_speed  = linear_speed[:, ct_idx + 1:]
+        linear_accel  = linear_accel[:, ct_idx + 1:]
+        angular_speed = angular_speed[:, ct_idx + 1:]
+        angular_accel = angular_accel[:, ct_idx + 1:]
+        dno_i     = dno_i[:, ct_idx + 1:]
+        ttc_i     = ttc_i[:, ct_idx + 1:]
+        d_road    = d_road[:, ct_idx + 1:]
         red_light = red_light[:, ct_idx + 1:]
 
         if surrogate is None:

@@ -296,21 +296,94 @@ class HardSimAgentsMetrics:
         pred_z: torch.Tensor,
         pred_head: torch.Tensor,
     ) -> None:
-        sizes = [int(s) for s in _tg_degree(agent_batch, dtype=torch.long).tolist()]
-        agent_id_list = [t.cpu().numpy() for t in agent_id.cpu().split(sizes)]
-        pred_traj_list = [t.cpu().numpy() for t in pred_traj.cpu().split(sizes)]
-        pred_z_list = [t.cpu().numpy() for t in pred_z.cpu().split(sizes)]
-        pred_head_list = [t.cpu().numpy() for t in pred_head.cpu().split(sizes)]
+        from src.smart.metrics.wosac_metric_features_torch.metric_features_torch_differentiable import (
+            PredictedSimTrajectories,
+            compute_metric_features_batched_scenes,
+        )
+        from src.smart.metrics.wosac_metric_features_torch.metric_features_torch import (
+            compute_metric_features,
+            scenario_to_joint_scene,
+        )
+        from src.smart.metrics.wosac_metametric_pytorch import (
+            compute_wosac_metametric_from_features_torch_batched,
+        )
+        from waymo_open_dataset.utils.sim_agents import submission_specs
 
-        for i, scenario_file in enumerate(scenario_files):
-            metametric = self._compute_one(
-                scenario_file,
-                agent_id_list[i],
-                pred_traj_list[i],
-                pred_z_list[i],
-                pred_head_list[i],
-            )
-            self._metametric_sum += metametric
+        n_scenarios = len(scenario_files)
+        if n_scenarios == 0:
+            return
+
+        sizes = [int(s) for s in _tg_degree(agent_batch, dtype=torch.long).tolist()]
+        device = pred_traj.device
+        G = pred_traj.shape[1]  # (n_agents, G, T, 2)
+        T_pred = pred_traj.shape[2]
+        _challenge = submission_specs.ChallengeType.SIM_AGENTS
+
+        id_splits = agent_id.split(sizes)
+        traj_splits = pred_traj.split(sizes)
+        z_splits = pred_z.split(sizes)
+        head_splits = pred_head.split(sizes)
+
+        scenarios = [self._load_scenario(sf) for sf in scenario_files]
+
+        # Log features: one per scenario (cached by scenario ID)
+        log_feat_dicts: List[dict] = []
+        for sc in scenarios:
+            log_joint = scenario_to_joint_scene(sc, _challenge)
+            lf = compute_metric_features(sc, log_joint, challenge_type=_challenge, use_log_validity=True)
+            log_feat_dicts.append(lf.as_dict())
+
+        # Sim features: for each rollout g, batch across all scenarios
+        sim_feat_per_g: List[list] = []  # G lists, each of length n_scenarios
+        with torch.no_grad():
+            for g in range(G):
+                preds_g = [
+                    PredictedSimTrajectories(
+                        object_id=id_splits[i].cpu(),
+                        center_x=traj_splits[i][:, g, :, 0],
+                        center_y=traj_splits[i][:, g, :, 1],
+                        center_z=z_splits[i][:, g, :],
+                        heading=head_splits[i][:, g, :],
+                        valid=torch.ones(sizes[i], T_pred, dtype=torch.bool, device=device),
+                    )
+                    for i in range(n_scenarios)
+                ]
+                feat_list_g = compute_metric_features_batched_scenes(
+                    scenarios=scenarios, preds=preds_g, surrogate=None,
+                )
+                sim_feat_per_g.append(feat_list_g)
+
+        # Stack G rollouts per scenario → (G, E_i, T) then batched hard RMM
+        sim_feat_dicts: List[dict] = []
+        for i in range(n_scenarios):
+            feats_i = [sim_feat_per_g[g][i] for g in range(G)]
+
+            def _cat(field: str) -> torch.Tensor:
+                return torch.cat([getattr(f, field) for f in feats_i], dim=0)
+
+            sim_feat_dicts.append({
+                "object_id": feats_i[0].object_id,
+                "object_type": _cat("object_type"),
+                "valid": _cat("valid"),
+                "average_displacement_error": _cat("average_displacement_error"),
+                "linear_speed": _cat("linear_speed"),
+                "linear_acceleration": _cat("linear_acceleration"),
+                "angular_speed": _cat("angular_speed"),
+                "angular_acceleration": _cat("angular_acceleration"),
+                "distance_to_nearest_object": _cat("distance_to_nearest_object"),
+                "collision_per_step": _cat("collision_per_step"),
+                "time_to_collision": _cat("time_to_collision"),
+                "distance_to_road_edge": _cat("distance_to_road_edge"),
+                "offroad_per_step": _cat("offroad_per_step"),
+                "traffic_light_violation_per_step": _cat("traffic_light_violation_per_step"),
+            })
+
+        metametric_vec = compute_wosac_metametric_from_features_torch_batched(
+            self._config, log_feat_dicts, sim_feat_dicts,
+        )
+
+        for val in metametric_vec.tolist():
+            self._metametric_sum += val
             self._count += 1
 
     def _drain_completed_futures(self, wait: bool = True, drain_all: bool = True) -> None:

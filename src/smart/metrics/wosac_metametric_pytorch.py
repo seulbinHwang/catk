@@ -36,7 +36,7 @@ Dependencies: ``torch``, ``waymo_open_dataset.protos`` (for ``SimAgentMetricsCon
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Tuple
+from typing import List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -422,10 +422,186 @@ def compute_wosac_metametric_from_features_torch(
     )
 
 
+def compute_wosac_metametric_from_features_torch_batched(
+    config: sim_agents_metrics_pb2.SimAgentMetricsConfig,
+    log_features_list: List[Mapping[str, Tensor]],
+    sim_features_list: List[Mapping[str, Tensor]],
+    *,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Batched hard RMM for *S* scenarios in a single pass.
+
+    Same semantics as ``compute_wosac_metametric_from_features_torch`` but
+    pads all scenarios to ``A_max`` agents and fuses histogram / reduce
+    operations into ``(S * A_max)``-batch GPU kernels.
+
+    Returns
+    -------
+    Tensor, shape ``(S,)``
+        Per-scenario hard metametric values.
+    """
+    S = len(log_features_list)
+    if S == 0:
+        return torch.tensor([], dtype=dtype)
+    if S == 1:
+        r = compute_wosac_metametric_from_features_torch(
+            config, log_features_list[0], sim_features_list[0], dtype=dtype,
+        )
+        return torch.tensor([r.metametric], dtype=dtype,
+                            device=_squeeze_log_sample(log_features_list[0]["valid"]).device)
+
+    device = _squeeze_log_sample(log_features_list[0]["valid"]).device
+    n_agents = [_squeeze_log_sample(lf["valid"]).shape[0] for lf in log_features_list]
+    A = max(n_agents)
+    T = _squeeze_log_sample(log_features_list[0]["valid"]).shape[-1]
+    G = sim_features_list[0]["valid"].shape[0]
+
+    agent_mask = torch.zeros(S, A, dtype=dtype, device=device)
+    for i, na in enumerate(n_agents):
+        agent_mask[i, :na] = 1.0
+
+    # ── pad helpers ──────────────────────────────────────────────────────
+
+    def _pad_log_bool(key: str) -> Tensor:
+        out = torch.zeros(S, A, T, dtype=torch.bool, device=device)
+        for i, lf in enumerate(log_features_list):
+            t = _squeeze_log_sample(lf[key]).bool().to(device)
+            out[i, :t.shape[0]] = t
+        return out
+
+    def _pad_log(key: str) -> Tensor:
+        out = torch.zeros(S, A, T, dtype=dtype, device=device)
+        for i, lf in enumerate(log_features_list):
+            t = _squeeze_log_sample(lf[key]).to(dtype).to(device)
+            out[i, :t.shape[0]] = t
+        return out
+
+    def _pad_sim_flat(key: str) -> Tensor:
+        parts: list = []
+        for sf in sim_features_list:
+            t = sf[key].to(dtype).to(device)
+            flat = t.permute(1, 0, 2).reshape(t.shape[1], G * T)
+            if flat.shape[0] < A:
+                flat = F.pad(flat, (0, 0, 0, A - flat.shape[0]))
+            parts.append(flat)
+        return torch.stack(parts).reshape(S * A, G * T)
+
+    def _hist(cfg_f, log_flat: Tensor, sim_flat: Tensor) -> Tensor:
+        w = cfg_f.WhichOneof("estimator")
+        if w == "histogram":
+            h = cfg_f.histogram
+            return histogram_estimate_torch(
+                h.min_val, h.max_val, h.num_bins,
+                h.additive_smoothing_pseudocount, log_flat, sim_flat,
+            )
+        h = cfg_f.bernoulli
+        return histogram_estimate_torch(
+            -0.5, 1.5, 2, h.additive_smoothing_pseudocount,
+            log_flat.float(), sim_flat.float(),
+        )
+
+    # ── validity ─────────────────────────────────────────────────────────
+
+    valid_log = _pad_log_bool("valid")
+    speed_valid, accel_valid = compute_kinematic_validity(valid_log)
+
+    lik_dict: dict = {}
+
+    # ── 1. timeseries metrics ────────────────────────────────────────────
+
+    ts_fields = [
+        ("linear_speed",               config.linear_speed,               speed_valid),
+        ("angular_speed",              config.angular_speed,              speed_valid),
+        ("linear_acceleration",        config.linear_acceleration,        accel_valid),
+        ("angular_acceleration",       config.angular_acceleration,       accel_valid),
+        ("distance_to_nearest_object", config.distance_to_nearest_object, valid_log),
+        ("distance_to_road_edge",      config.distance_to_road_edge,      valid_log),
+        ("time_to_collision",          config.time_to_collision,          None),
+    ]
+
+    _ot_padded: Optional[Tensor] = None
+
+    for name, cfg_f, mask in ts_fields:
+        if name == "time_to_collision":
+            if _ot_padded is None:
+                _ot_padded = torch.zeros(S, A, dtype=torch.long, device=device)
+                for i, lf in enumerate(log_features_list):
+                    ot = _squeeze_log_sample(lf["object_type"]).long().to(device)
+                    _ot_padded[i, :ot.shape[0]] = ot
+            mask = valid_log & (_ot_padded == int(
+                scenario_pb2.Track.ObjectType.TYPE_VEHICLE
+            )).unsqueeze(-1)
+
+        log_vals = _pad_log(name).reshape(S * A, T)
+        sim_flat = _pad_sim_flat(name)
+
+        ll = _hist(cfg_f, log_vals, sim_flat).reshape(S, A, T)
+
+        z = torch.zeros_like(ll)
+        masked = torch.where(mask, ll, z)
+        masked_sum = masked.sum(dim=(1, 2))
+        valid_sum = mask.to(dtype).sum(dim=(1, 2)).clamp(min=1.0)
+        lik_dict[f"{name}_likelihood"] = torch.exp(masked_sum / valid_sum)
+
+    # ── 2. scenario-level metrics ────────────────────────────────────────
+
+    valid_expand = valid_log.unsqueeze(1)  # (S, 1, A, T)
+
+    sc_fields = [
+        ("collision_indication",    "collision_per_step",                config.collision_indication,   valid_log,   valid_expand),
+        ("offroad_indication",      "offroad_per_step",                  config.offroad_indication,     valid_log,   valid_expand),
+        ("traffic_light_violation", "traffic_light_violation_per_step",  config.traffic_light_violation, None,        None),
+    ]
+
+    for name, feat_key, cfg_f, v_log, v_exp in sc_fields:
+        if name == "traffic_light_violation":
+            if _ot_padded is None:
+                _ot_padded = torch.zeros(S, A, dtype=torch.long, device=device)
+                for i, lf in enumerate(log_features_list):
+                    ot = _squeeze_log_sample(lf["object_type"]).long().to(device)
+                    _ot_padded[i, :ot.shape[0]] = ot
+            tl_mask = valid_log & (_ot_padded == int(
+                scenario_pb2.Track.ObjectType.TYPE_VEHICLE
+            )).unsqueeze(-1)
+            v_log, v_exp = tl_mask, tl_mask.unsqueeze(1)
+
+        # log: pad bool → any over time
+        log_bool = _pad_log_bool(feat_key)
+        log_any = (log_bool & v_log).any(dim=-1)  # (S, A)
+
+        # sim: pad bool (G, A_i, T) → (S, G, A, T) → any over time
+        sim_parts: list = []
+        for sf in sim_features_list:
+            t = sf[feat_key].bool().to(device)
+            if t.shape[1] < A:
+                t = F.pad(t, (0, 0, 0, A - t.shape[1]))
+            sim_parts.append(t)
+        sim_any = (torch.stack(sim_parts) & v_exp).any(dim=-1)  # (S, G, A)
+
+        log_v = log_any.to(dtype).reshape(S * A, 1)
+        sim_v = sim_any.to(dtype).permute(0, 2, 1).reshape(S * A, G)
+
+        ll = _hist(cfg_f, log_v, sim_v).reshape(S, A)
+
+        masked_sum = (ll * agent_mask).sum(dim=1)
+        valid_count = agent_mask.sum(dim=1).clamp(min=1.0)
+        lik_dict[f"{name}_likelihood"] = torch.exp(masked_sum / valid_count)
+
+    # ── 3. weighted sum ──────────────────────────────────────────────────
+
+    metametric = torch.zeros(S, dtype=dtype, device=device)
+    for fn in _METRIC_FIELD_NAMES:
+        w = getattr(config, fn).metametric_weight
+        metametric = metametric + w * lik_dict[f"{fn}_likelihood"]
+
+    return metametric
+
+
 __all__ = [
     "WosacMetametricTorchResult",
     "compute_kinematic_validity",
     "compute_wosac_metametric_from_features_torch",
+    "compute_wosac_metametric_from_features_torch_batched",
     "histogram_estimate_torch",
     "log_likelihood_estimate_scenario_level_torch",
     "log_likelihood_estimate_timeseries_torch",
