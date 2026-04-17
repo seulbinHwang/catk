@@ -111,6 +111,8 @@ def histogram_estimate_torch(
         raise ValueError("batch dim mismatch")
     device = log_samples.device
     dtype = log_samples.dtype
+    # log vs sim can disagree (e.g. GT log on CPU, rollout sim on GPU); edges follow log.
+    sim_samples = sim_samples.to(device=device, dtype=dtype)
 
     edges = torch.linspace(min_val, max_val, num_bins + 1, device=device, dtype=dtype)
     # Match TFP ``find_bins`` / Waymo pipeline: non-finite values fall into the upper bin

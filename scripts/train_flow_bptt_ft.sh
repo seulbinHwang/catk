@@ -42,7 +42,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0, 1, 2, 3}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2, 3}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_bptt_ft}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-main_exp}"
@@ -64,7 +64,7 @@ CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_l
 TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
 
-NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
 # 정수(예: 10) = val 배치 최대 개수. 0~1 실수 = 데이터셋 비율. 빠른 RMM 스모크는 10 권장.
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-10}"
