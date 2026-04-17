@@ -1,0 +1,219 @@
+#!/bin/sh
+# =============================================================================
+# OCSC (Open-Closed Self-Consistency) BPTT fine-tuning 실행 스크립트
+# configs/experiment/flow_consistency_bptt.yaml 기준
+# =============================================================================
+# 알고리즘:
+#   1. Open-loop target: rollout_idx=G 로 current/frozen policy 로 2초 궤적 생성 (no_grad)
+#   2. Closed-loop predictions: G rollout (with grad)
+#   3. Loss = L2(closed_xy, open_xy) — open-closed self-consistency
+#   4. HardRMM monitoring: 학습 rollout 을 detach 해 hard RMM 계산 (CONFIGURABLE)
+#
+# 예: sh scripts/train_flow_consistency_bptt.sh
+#     MAX_EPOCHS=10 WANDB_MODE=online sh scripts/train_flow_consistency_bptt.sh
+#
+# ── 주요 파라미터 ──────────────────────────────────────────────────────────
+# OCSC_N_ROLLOUTS        : G (시나리오당 closed-loop rollout 수, 기본 2)
+# OCSC_LOSS_TYPE         : "l2" | "smooth_l1" | "l1"
+# OCSC_USE_PRETRAINED_REF: true → frozen pretrained 으로 open-loop target 생성
+# OCSC_TARGET_MAX_STEPS  : open-loop target coarse step 수 (4 = 2초)
+# OCSC_PRED_MAX_STEPS    : closed-loop prediction coarse step 수 (4 = 2초)
+# OCSC_HEADING_WEIGHT    : heading 일관성 loss 가중치 (0 = position only)
+# OCSC_EVAL_HARD_RMM     : true → 매 step HardRMM 계산 (train/hard_rmm 로깅)
+# OCSC_EVAL_HARD_RMM_INTERVAL: N step 마다 HardRMM 계산 (1 = 매 step)
+#
+# ── BPTT tricks (rmm_bptt_ft 와 동일) ─────────────────────────────────────
+# BPTT_USE_ADJOINT       : ODE gradient checkpoint (OOM 시 true)
+# BPTT_GRAD_CLIP_TRAJ    : pred_traj gradient L2 norm clip (0 = 비활성)
+# BPTT_SEQUENTIAL_ROLLOUTS: true → G rollout 순차 실행 + 즉시 backward (메모리 절감)
+# BPTT_WARM_COARSE_STEPS : 앞 N coarse step no_grad (sliding-window BPTT)
+# BPTT_LAST_N_COARSE_STEPS: 마지막 N coarse step 에만 gradient (역수 표현)
+# BPTT_LAST_N_SOLVER_STEPS: ODE solver 마지막 N step 에만 velocity gradient
+# FLOW_VELOCITY_HEAD_ONLY: true → velocity_head 만 학습
+# =============================================================================
+
+export LOGLEVEL=INFO
+export HYDRA_FULL_ERROR=1
+export TF_CPP_MIN_LOG_LEVEL=2
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_SILENT="${WANDB_SILENT:-false}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2, 3}"
+
+MY_EXPERIMENT="${MY_EXPERIMENT:-flow_consistency_bptt}"
+MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-main_exp}"
+CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
+
+CONDA_SH="${CONDA_SH:-/home2/pnc2/miniforge3/etc/profile.d/conda.sh}"
+if [ -f "${CONDA_SH}" ]; then
+  . "${CONDA_SH}"
+fi
+if command -v conda >/dev/null 2>&1; then
+  conda activate "${CATK_CONDA_ENV}" || true
+fi
+
+CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
+CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt}"
+
+TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
+TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
+LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
+LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-10}"
+MAX_EPOCHS="${MAX_EPOCHS:-10}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-500}"
+CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-1}"
+LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
+PRECISION="${PRECISION:-32-true}"
+GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-0}"
+TRAIN_B="${TRAIN_B:-16}"
+VAL_B="${VAL_B:-1}"
+TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
+PIN_MEMORY="${PIN_MEMORY:-true}"
+
+LR="${LR:-5e-6}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
+LR_MIN_RATIO="${LR_MIN_RATIO:-0.1}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+if [ -z "${LR_TOTAL_STEPS}" ] || [ "${LR_TOTAL_STEPS}" = "-1" ]; then
+  LR_TOTAL_STEPS=$(python3 - <<PY
+import pathlib, math
+p = pathlib.Path("${TRAIN_RAW_DIR}")
+n = len(list(p.glob("*.pkl")))
+if n > 0:
+    steps_per_epoch = math.ceil(n / (${TRAIN_B} * ${NPROC_PER_NODE}))
+    print(steps_per_epoch * ${MAX_EPOCHS})
+else:
+    print(1000)
+PY
+  )
+  echo "[LR schedule] auto LR_TOTAL_STEPS=${LR_TOTAL_STEPS}"
+fi
+
+FLOW_SOLVER_METHOD="${FLOW_SOLVER_METHOD:-euler}"
+FLOW_SOLVER_STEPS="${FLOW_SOLVER_STEPS:-8}"
+ROLLOUT_NOISE_SCALE="${ROLLOUT_NOISE_SCALE:-1.0}"
+
+N_VIS_BATCH="${N_VIS_BATCH:-4}"
+N_VIS_SCENARIO="${N_VIS_SCENARIO:-4}"
+N_VIS_ROLLOUT="${N_VIS_ROLLOUT:-4}"
+DELETE_LOCAL_VIDEOS_AFTER_UPLOAD="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD:-false}"
+N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-4}"
+N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-2}"
+VALIDATION_METRIC="${VALIDATION_METRIC:-hard}"
+WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
+
+# ── OCSC 파라미터 ──────────────────────────────────────────────────────────
+OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-2}"
+OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
+OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-false}"
+OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-4}"
+OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-4}"
+OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-0.0}"
+# CONFIGURABLE: HardRMM 평가 여부 및 빈도
+OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-true}"
+OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-1}"
+
+# ── BPTT tricks ────────────────────────────────────────────────────────────
+BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
+BPTT_SEQUENTIAL_ROLLOUTS="${BPTT_SEQUENTIAL_ROLLOUTS:-false}"
+BPTT_WARM_COARSE_STEPS="${BPTT_WARM_COARSE_STEPS:-0}"
+BPTT_LAST_N_COARSE_STEPS="${BPTT_LAST_N_COARSE_STEPS:-0}"
+BPTT_LAST_N_SOLVER_STEPS="${BPTT_LAST_N_SOLVER_STEPS:-0}"
+BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-0}"
+FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
+FLOW_REG_LAMBDA="${FLOW_REG_LAMBDA:-0.0}"
+
+WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+get_free_port() {
+  python - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+if [ ! -f "${CKPT_PATH}" ]; then
+  echo "[ERROR] CKPT_PATH not found: ${CKPT_PATH}"
+  exit 1
+fi
+
+echo "Experiment=${MY_EXPERIMENT}"
+echo "CACHE_ROOT=${CACHE_ROOT}"
+echo "TRAIN_RAW_DIR=${TRAIN_RAW_DIR}"
+echo "CKPT_PATH=${CKPT_PATH}"
+echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_USE_PRETRAINED_REF=${OCSC_USE_PRETRAINED_REF}"
+echo "OCSC_TARGET_MAX_STEPS=${OCSC_TARGET_MAX_STEPS} OCSC_PRED_MAX_STEPS=${OCSC_PRED_MAX_STEPS} OCSC_HEADING_WEIGHT=${OCSC_HEADING_WEIGHT}"
+echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} OCSC_EVAL_HARD_RMM_INTERVAL=${OCSC_EVAL_HARD_RMM_INTERVAL}"
+echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_SEQUENTIAL_ROLLOUTS=${BPTT_SEQUENTIAL_ROLLOUTS} BPTT_GRAD_CLIP_TRAJ=${BPTT_GRAD_CLIP_TRAJ}"
+echo "FLOW_VELOCITY_HEAD_ONLY=${FLOW_VELOCITY_HEAD_ONLY} LR=${LR} FLOW_REG_LAMBDA=${FLOW_REG_LAMBDA}"
+echo "NPROC_PER_NODE=${NPROC_PER_NODE} TRAIN_B=${TRAIN_B} MAX_EPOCHS=${MAX_EPOCHS} LIMIT_TRAIN_BATCHES=${LIMIT_TRAIN_BATCHES}"
+
+PORT="$(get_free_port)"
+torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_endpoint="127.0.0.1:${PORT}" -m src.run \
+  experiment="${MY_EXPERIMENT}" \
+  action=finetune \
+  task_name="${MY_TASK_NAME}" \
+  ckpt_path="${CKPT_PATH}" \
+  paths.cache_root="${CACHE_ROOT}" \
+  data.train_raw_dir="${TRAIN_RAW_DIR}" \
+  data.train_tfrecords_splitted="${TRAIN_TFRECORDS_SPLITTED}" \
+  data.train_batch_size="${TRAIN_B}" \
+  data.val_batch_size="${VAL_B}" \
+  data.train_max_num="${TRAIN_MAX_NUM}" \
+  data.num_workers="${NUM_WORKERS}" \
+  data.prefetch_factor="${PREFETCH_FACTOR}" \
+  data.persistent_workers="${PERSISTENT_WORKERS}" \
+  data.pin_memory="${PIN_MEMORY}" \
+  trainer.limit_train_batches="${LIMIT_TRAIN_BATCHES}" \
+  trainer.limit_val_batches="${LIMIT_VAL_BATCHES}" \
+  trainer.max_epochs="${MAX_EPOCHS}" \
+  trainer.val_check_interval="${VAL_CHECK_INTERVAL}" \
+  trainer.check_val_every_n_epoch="${CHECK_VAL_EVERY_N_EPOCH}" \
+  trainer.log_every_n_steps="${LOG_EVERY_N_STEPS}" \
+  trainer.precision="${PRECISION}" \
+  trainer.gradient_clip_val="${GRAD_CLIP_VAL}" \
+  logger.wandb.entity="${WANDB_ENTITY}" \
+  model.model_config.lr="${LR}" \
+  model.model_config.lr_warmup_steps="${LR_WARMUP_STEPS}" \
+  model.model_config.lr_total_steps="${LR_TOTAL_STEPS}" \
+  model.model_config.lr_min_ratio="${LR_MIN_RATIO}" \
+  model.model_config.weight_decay="${WEIGHT_DECAY}" \
+  model.model_config.n_vis_batch="${N_VIS_BATCH}" \
+  model.model_config.n_vis_scenario="${N_VIS_SCENARIO}" \
+  model.model_config.n_vis_rollout="${N_VIS_ROLLOUT}" \
+  model.model_config.n_rollout_closed_val="${N_ROLLOUT_CLOSED_VAL}" \
+  model.model_config.n_batch_sim_agents_metric="${N_BATCH_SIM_AGENTS_METRIC}" \
+  model.model_config.validation_metric="${VALIDATION_METRIC}" \
+  model.model_config.wosac_torch_compile="${WOSAC_TORCH_COMPILE}" \
+  model.model_config.delete_local_videos_after_wandb_upload="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD}" \
+  model.model_config.decoder.flow_solver_method="${FLOW_SOLVER_METHOD}" \
+  model.model_config.decoder.flow_solver_steps="${FLOW_SOLVER_STEPS}" \
+  model.model_config.finetune.rollout_noise_scale="${ROLLOUT_NOISE_SCALE}" \
+  model.model_config.finetune.flow_velocity_head_only="${FLOW_VELOCITY_HEAD_ONLY}" \
+  model.model_config.finetune.flow_reg_lambda="${FLOW_REG_LAMBDA}" \
+  model.model_config.finetune.ocsc_n_rollouts="${OCSC_N_ROLLOUTS}" \
+  model.model_config.finetune.ocsc_loss_type="${OCSC_LOSS_TYPE}" \
+  model.model_config.finetune.ocsc_use_pretrained_ref="${OCSC_USE_PRETRAINED_REF}" \
+  model.model_config.finetune.ocsc_target_max_steps="${OCSC_TARGET_MAX_STEPS}" \
+  model.model_config.finetune.ocsc_pred_max_steps="${OCSC_PRED_MAX_STEPS}" \
+  model.model_config.finetune.ocsc_heading_weight="${OCSC_HEADING_WEIGHT}" \
+  model.model_config.finetune.ocsc_eval_hard_rmm="${OCSC_EVAL_HARD_RMM}" \
+  model.model_config.finetune.ocsc_eval_hard_rmm_interval="${OCSC_EVAL_HARD_RMM_INTERVAL}" \
+  model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
+  model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
+  model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
+  model.model_config.finetune.bptt_last_n_coarse_steps="${BPTT_LAST_N_COARSE_STEPS}" \
+  model.model_config.finetune.bptt_last_n_solver_steps="${BPTT_LAST_N_SOLVER_STEPS}" \
+  model.model_config.finetune.bptt_grad_clip_traj="${BPTT_GRAD_CLIP_TRAJ}" \
+  ${EXTRA_ARGS}

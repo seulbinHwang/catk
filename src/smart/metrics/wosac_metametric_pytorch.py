@@ -291,6 +291,14 @@ def compute_wosac_metametric_from_features_torch(
     """
     # --- 공통 마스크 ---
     valid_log = _squeeze_log_sample(log_features["valid"]).bool()
+    # log_features (GT)는 CPU, sim_features (예측)는 GPU 에 있을 수 있다.
+    # log_likelihood_estimate_timeseries_torch 는 내부에서 sim→log device 이동을 처리하지만
+    # collision/offroad 등 boolean 직접 연산 경로는 처리하지 않으므로 여기서 일괄 이동한다.
+    _log_device = valid_log.device
+    sim_features = {
+        k: (v.to(_log_device) if torch.is_tensor(v) else v)
+        for k, v in sim_features.items()
+    }
     speed_valid, accel_valid = compute_kinematic_validity(valid_log)
 
     # --- 시계열 히스토그램 항목: log p 그리드 → 유효 마스크로 평균 → exp → [0,1] likelihood ---

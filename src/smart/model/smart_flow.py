@@ -153,6 +153,8 @@ class SMARTFlow(LightningModule):
                 pass
             elif self.finetune_config.mode == "rmm_bptt_ft":
                 pass
+            elif self.finetune_config.mode == "ocsc_ft":
+                pass
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
 
@@ -169,6 +171,15 @@ class SMARTFlow(LightningModule):
                 max_workers=model_config.sim_agents_metric_workers,
             )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
+
+        # OCSC: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
+        _is_ocsc = self.finetune_config.enabled and self.finetune_config.mode == "ocsc_ft"
+        if _is_ocsc and bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True)):
+            self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc")
+            self._ocsc_train_hard_rmm_ref: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc_ref")
+        else:
+            self._ocsc_train_hard_rmm = None
+            self._ocsc_train_hard_rmm_ref = None
 
         # pretrained ref model Δ RMM 모니터링 플래그 (train / val 독립)
         _is_bptt = self.finetune_config.enabled and self.finetune_config.mode == "rmm_bptt_ft"
@@ -1244,6 +1255,12 @@ class SMARTFlow(LightningModule):
             and self.finetune_config.mode == "rmm_bptt_ft"
         )
 
+    def _is_ocsc_ft_enabled(self) -> bool:
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "ocsc_ft"
+        )
+
     def on_train_start(self) -> None:
         _needs_ref = (
             self.finetune_config.enabled
@@ -1255,7 +1272,14 @@ class SMARTFlow(LightningModule):
                 or self._ref_val_enabled
             )
         )
-        if _needs_ref:
+        # OCSC: ref_flow_decoder 를 항상 생성 (open-loop target 및 delta HardRMM 모니터링 공용)
+        # ocsc_use_pretrained_ref=False 여도 delta 계산을 위해 frozen ref 가 필요하다.
+        _needs_ref_ocsc = (
+            self.finetune_config.enabled
+            and self.ref_flow_decoder is None
+            and self.finetune_config.mode == "ocsc_ft"
+        )
+        if _needs_ref or _needs_ref_ocsc:
             from copy import deepcopy
             flow_decoder = self.encoder.agent_encoder.flow_decoder
             self.ref_flow_decoder = deepcopy(flow_decoder)
@@ -1263,16 +1287,12 @@ class SMARTFlow(LightningModule):
                 p.requires_grad_(False)
             print(f"[{self.finetune_config.mode}] frozen reference model created from pretrained checkpoint.")
 
-        # rmm_bptt_ft: BPTT backward through 16 ODE steps can produce NaN/Inf
-        # gradients independently of the soft RMM path (e.g. exploding Jacobian,
-        # numerical instability in ODE network activations). Register nan_to_num
-        # hooks directly on trainable parameters so any NaN/Inf gradient is
-        # zeroed out regardless of where it originates.
-        if self._is_rmm_bptt_ft_enabled():
+        # rmm_bptt_ft / ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
+        # gradients (exploding Jacobian, numerical instability). Register nan_to_num
+        # hooks on trainable parameters so any NaN/Inf gradient is zeroed out.
+        if self._is_rmm_bptt_ft_enabled() or self._is_ocsc_ft_enabled():
             # NaN → 0, Inf → finite large value (not 0) so the optimizer still
-            # sees the direction even under mild overflow.  posinf/neginf are
-            # set to 1e4 as a last-resort cap; the per-trajectory norm-clip hook
-            # (bptt_grad_clip_traj) handles the main clipping before this fires.
+            # sees the direction even under mild overflow.
             n_hooked = 0
             for p in self.parameters():
                 if p.requires_grad:
@@ -1280,7 +1300,7 @@ class SMARTFlow(LightningModule):
                         lambda g: torch.nan_to_num(g, nan=0.0, posinf=1e4, neginf=-1e4)
                     )
                     n_hooked += 1
-            log.info(f"[rmm_bptt] registered nan_to_num grad hooks on {n_hooked} trainable params")
+            log.info(f"[{self.finetune_config.mode}] registered nan_to_num grad hooks on {n_hooked} trainable params")
 
     def _world_traj_to_flow_norm(
         self,
@@ -1451,6 +1471,407 @@ class SMARTFlow(LightningModule):
             log.warning("[rmm_bptt_ft] non-finite GT FM loss; skipping")
             return None
         return fm
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # OCSC (Open-Closed Self-Consistency) fine-tuning
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _compute_ocsc_train_hard_rmm(
+        self,
+        scenario_files: list,
+        agent_ids: Tensor,
+        agent_batch: Tensor,
+        traj_list: list,   # G tensors of [n_agents, 80, 2]  ← 반드시 8초(80 step)
+        z_list: list,      # G tensors of [n_agents, 80]
+        head_list: list,   # G tensors of [n_agents, 80]
+        metric: "HardSimAgentsMetrics | None" = None,
+    ) -> float | None:
+        """G개의 8초 detached 궤적으로 HardRMM(WOSAC official 기준)을 계산합니다.
+
+        Args:
+            metric: 사용할 HardSimAgentsMetrics 인스턴스.
+                None 이면 self._ocsc_train_hard_rmm 을 사용합니다 (current model).
+
+        Returns:
+            float | None: 계산된 HardRMM 값. 실패 시 None.
+        """
+        _metric = metric if metric is not None else self._ocsc_train_hard_rmm
+        if _metric is None or len(traj_list) == 0:
+            return None
+        try:
+            # Stack into [n_agents, G, T, x]
+            pred_traj = torch.stack(traj_list, dim=1)    # [n_agents, G, 80, 2]
+            pred_z    = torch.stack(z_list, dim=1)       # [n_agents, G, 80]
+            pred_head = torch.stack(head_list, dim=1)    # [n_agents, G, 80]
+
+            with torch.no_grad():
+                _metric.update_from_prediction_tensors(
+                    scenario_files=list(scenario_files),
+                    agent_id=agent_ids,
+                    agent_batch=agent_batch,
+                    pred_traj=pred_traj,
+                    pred_z=pred_z,
+                    pred_head=pred_head,
+                )
+            result_dict = _metric.compute()
+            _metric.reset()
+            # _metric_key는 prefix에서 파생되므로 current/ref 모두 정확히 일치
+            key = getattr(_metric, "_metric_key", "train_ocsc/sim_agents_2025/realism_meta_metric")
+            val = result_dict.get(key)
+            if val is not None:
+                return float(val.item() if isinstance(val, Tensor) else val)
+        except Exception as exc:
+            log.warning(f"[ocsc_ft] HardRMM computation failed: {exc}")
+        return None
+
+    def _run_flow_ocsc_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        data: dict | None = None,
+    ) -> dict:
+        """Open-Closed Self-Consistency (OCSC) fine-tuning step.
+
+        알고리즘:
+          1. Open-loop target (no_grad, G번): flow ODE 직접 호출 (autoregressive 없음).
+             rollout_cache["feat_a_now"][active_mask] 을 context 로 사용.
+             → normalized local frame [n_active, 20, 4] (x/20, y/20, cos_h, sin_h)
+          2. Closed-loop predictions (with grad, G번): autoregressive rollout.
+             → world frame [n_agents, G, T, 2] → _world_traj_to_flow_norm 으로 변환
+          3. Consistency loss: mean_g(L2(closed_norm_g[active], open_g.detach()))
+          4. HardRMM 모니터링 (optional, configurable interval).
+
+        BPTT tricks:
+          - bptt_sequential_rollouts: G rollout 순차 backward (메모리 절감)
+          - bptt_use_adjoint: ODE gradient checkpoint
+          - bptt_warm_coarse_steps / bptt_last_n_coarse_steps: sliding-window BPTT
+          - bptt_last_n_solver_steps: ODE solver 마지막 N step gradient
+          - bptt_grad_clip_traj: closed-loop traj gradient L2 norm clip
+        """
+        G = int(getattr(self.finetune_config, "ocsc_n_rollouts", 2))
+        pred_max_steps_raw = int(getattr(self.finetune_config, "ocsc_pred_max_steps", 4))
+        pred_max_steps: int | None = pred_max_steps_raw if pred_max_steps_raw > 0 else None
+        loss_type = str(getattr(self.finetune_config, "ocsc_loss_type", "l2"))
+        heading_w = float(getattr(self.finetune_config, "ocsc_heading_weight", 0.0))
+        sequential = bool(getattr(self.finetune_config, "bptt_sequential_rollouts", False))
+        use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
+        warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
+        _grad_clip  = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
+        _last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
+        _last_n_coarse = int(getattr(self.finetune_config, "bptt_last_n_coarse_steps", 0))
+        eval_hard_rmm = bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
+        eval_hard_rmm_interval = max(1, int(getattr(self.finetune_config, "ocsc_eval_hard_rmm_interval", 1)))
+
+        # ── 데이터 검증 ──────────────────────────────────────────────────────
+        if data is None:
+            raise ValueError("ocsc_ft requires `data` dict with scenario metadata.")
+        if "tfrecord_path" not in data or "scenario_id" not in data:
+            raise KeyError("ocsc_ft requires data['tfrecord_path'] and data['scenario_id'].")
+        agent_ids = None
+        try:
+            agent_ids = data["agent"]["id"]
+        except Exception:
+            pass
+        if agent_ids is None:
+            try:
+                agent_ids = data["id"]
+            except Exception:
+                pass
+        if agent_ids is None:
+            raise KeyError("ocsc_ft requires agent object ids: data['agent']['id'] (or data['id']).")
+        if int(agent_ids.shape[0]) != int(tokenized_agent["batch"].shape[0]):
+            raise ValueError("agent id count mismatch")
+
+        tfrecord_paths = data["tfrecord_path"]
+        agent_batch    = tokenized_agent["batch"]
+
+        # ── 1. Encode map (no_grad; encoder frozen) ──────────────────────────
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+
+        # ── 2. Build rollout cache (no_grad) ─────────────────────────────────
+        with torch.no_grad():
+            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
+
+        # ── Current-state tensors from rollout_cache ─────────────────────────
+        # valid_window: [n_agents, n_hist_2hz]; last column = valid at current time
+        active_mask  = rollout_cache["valid_window"][:, -1]        # [n_agents] bool
+        current_pos  = rollout_cache["pos_window"][:, -1]          # [n_agents, 2]
+        current_head = rollout_cache["head_window"][:, -1]         # [n_agents]
+        # feat_a_now: [n_agents, hidden_dim] — context after all attention layers
+        active_hidden = rollout_cache["feat_a_now"][active_mask]   # [n_active, hidden_dim]
+
+        # bptt_last_n_coarse_steps → effective warm_coarse
+        _n_coarse_pred = pred_max_steps_raw if pred_max_steps_raw > 0 else 16
+        if _last_n_coarse > 0:
+            _last_n_coarse = min(_last_n_coarse, _n_coarse_pred)
+            warm_coarse = max(warm_coarse, _n_coarse_pred - _last_n_coarse)
+            log.info(
+                f"[ocsc_ft] bptt_last_n_coarse_steps={_last_n_coarse}: "
+                f"effective warm_coarse={warm_coarse} "
+                f"(gradient on last {_last_n_coarse}/{_n_coarse_pred} coarse steps)"
+            )
+
+        # ── norm-clip hook helper ─────────────────────────────────────────────
+        def _make_norm_clip_hook(max_norm: float):
+            def _hook(g: Tensor) -> Tensor:
+                g = torch.nan_to_num(g, nan=0.0, posinf=max_norm, neginf=-max_norm)
+                g_norm = g.norm()
+                if g_norm > max_norm:
+                    g = g * (max_norm / g_norm)
+                return g
+            return _hook
+
+        # ── consistency loss in normalized 4-channel space ───────────────────
+        # Both pred_norm and tgt_norm: [..., T, 4] = [x/20, y/20, cos_h, sin_h]
+        def _consistency_loss(pred_norm: Tensor, tgt_norm: Tensor) -> Tensor:
+            T = min(pred_norm.shape[-2], tgt_norm.shape[-2])
+            p = pred_norm[..., :T, :]
+            t = tgt_norm[..., :T, :].detach()
+            if loss_type == "smooth_l1":
+                pos_loss = F.smooth_l1_loss(p[..., :2], t[..., :2], reduction="mean")
+            elif loss_type == "l1":
+                pos_loss = F.l1_loss(p[..., :2], t[..., :2], reduction="mean")
+            else:  # default: l2
+                pos_loss = F.mse_loss(p[..., :2], t[..., :2], reduction="mean")
+            if heading_w > 0.0:
+                head_loss = F.mse_loss(p[..., 2:], t[..., 2:], reduction="mean")
+                return pos_loss + heading_w * head_loss
+            return pos_loss
+
+        # ── 3. Open-loop target (no_grad, G samples via direct flow ODE) ─────
+        # _sample_open_loop_future_from_hidden: single flow ODE call (no autoregressive
+        # feedback). Uses feat_a_now as context → [n_active, 20, 4] normalized local.
+        _use_ref = (
+            bool(getattr(self.finetune_config, "ocsc_use_pretrained_ref", False))
+            and self.ref_flow_decoder is not None
+        )
+        _agent_enc = self.encoder.agent_encoder
+        _orig_fd = _agent_enc.flow_decoder
+        if _use_ref:
+            _agent_enc.flow_decoder = self.ref_flow_decoder
+        try:
+            with torch.no_grad():
+                open_samples: list[Tensor] = []
+                for g in range(G):
+                    # Different seed per rollout index for variance reduction
+                    open_g = _agent_enc._sample_open_loop_future_from_hidden(
+                        anchor_hidden_valid=active_hidden,
+                        sampling_noise=self.eval_sampling_noise,
+                        sampling_seed=g,
+                    )
+                    open_samples.append(open_g)  # [n_active, 20, 4]
+        finally:
+            if _use_ref:
+                _agent_enc.flow_decoder = _orig_fd
+
+        # ── BPTT flow ODE settings ────────────────────────────────────────────
+        flow_ode = _agent_enc.flow_ode
+        flow_ode.use_adjoint_for_bptt = use_adjoint
+        flow_ode.last_n_grad_solver_steps = (
+            min(_last_n_solver, flow_ode.solver_steps) if _last_n_solver > 0 else 0
+        )
+        if _last_n_solver > 0:
+            log.info(
+                f"[ocsc_ft] bptt_last_n_solver_steps={flow_ode.last_n_grad_solver_steps}/{flow_ode.solver_steps}: "
+                f"velocity detach on first {flow_ode.solver_steps - flow_ode.last_n_grad_solver_steps} solver steps."
+            )
+
+        # ── world → normalized frame helper ──────────────────────────────────
+        # Convert closed-loop world XY+heading → normalized local frame [x/20, y/20, cos, sin]
+        # using the current position/heading as reference (same as open-loop anchor).
+        _cur_pos_active  = current_pos[active_mask]   # [n_active, 2]
+        _cur_head_active = current_head[active_mask]   # [n_active]
+
+        def _cl_to_norm(cl_xy: Tensor, cl_head: Tensor) -> Tensor:
+            """cl_xy: [n_active, T, 2], cl_head: [n_active, T] → [n_active, T, 4]"""
+            return self._world_traj_to_flow_norm(
+                pred_traj=cl_xy,
+                pred_head=cl_head,
+                current_pos=_cur_pos_active,
+                current_head=_cur_head_active,
+            )
+
+        # ── 4a. Sequential mode: backward per (open_g, closed_g) pair ────────
+        if sequential and G > 1:
+            total_loss_accum = 0.0
+            count = 0
+            try:
+                for g in range(G):
+                    pred_traj_g, pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
+                        data=data,
+                        tokenized_agent=tokenized_agent,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache,
+                        rollout_indices=[g],
+                        return_anchor_hidden=True,
+                        full_grad=True,
+                        max_steps=pred_max_steps,
+                        warm_coarse_steps=warm_coarse,
+                    )
+                    # pred_traj_g: [n_agents, 1, T_cl, 2]
+                    T_cl = pred_traj_g.shape[-2]
+                    cl_xy_g   = pred_traj_g[active_mask, 0, :T_cl, :]  # [n_active, T_cl, 2]
+                    cl_head_g = pred_head_g[active_mask, 0, :T_cl]      # [n_active, T_cl]
+
+                    if pred_traj_g.requires_grad and _grad_clip > 0:
+                        pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
+
+                    # Convert to normalized frame and compute loss vs open-loop
+                    cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g)       # [n_active, T_cl, 4]
+                    loss_g = _consistency_loss(cl_norm_g, open_samples[g])
+                    total_loss_accum += loss_g.item()
+                    count += 1
+                    (loss_g / G).backward()
+
+                    del pred_traj_g, pred_z_g, pred_head_g, cl_xy_g, cl_head_g, cl_norm_g
+            finally:
+                flow_ode.use_adjoint_for_bptt = False
+                flow_ode.last_n_grad_solver_steps = 0
+
+            if count == 0:
+                return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
+
+            mean_loss = torch.tensor(
+                total_loss_accum / count,
+                dtype=torch.float32, device=agent_batch.device,
+            )
+            log.info(f"[ocsc] step={int(getattr(self,'global_step',0))} consistency_loss={mean_loss.item():.4f}")
+            _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
+            ret = {
+                "loss": _ddp_dummy,
+                "train/consistency_loss": mean_loss,
+            }
+
+        else:
+            # ── 4b. Parallel mode: all G closed-loop rollouts at once ─────────
+            try:
+                pred_traj_all, pred_z_all, pred_head_all, _ = self._run_parallel_rollout_chunk(
+                    data=data,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    rollout_cache=rollout_cache,
+                    rollout_indices=list(range(G)),
+                    return_anchor_hidden=True,
+                    full_grad=True,
+                    max_steps=pred_max_steps,
+                    warm_coarse_steps=warm_coarse,
+                )
+                # pred_traj_all: [n_agents, G, T_cl, 2]
+            finally:
+                flow_ode.use_adjoint_for_bptt = False
+                flow_ode.last_n_grad_solver_steps = 0
+
+            if pred_traj_all.requires_grad and _grad_clip > 0:
+                pred_traj_all.register_hook(_make_norm_clip_hook(_grad_clip))
+
+            # Compute paired loss: mean_g(consistency(closed_norm_g, open_g))
+            T_cl = pred_traj_all.shape[-2]
+            loss_per_g: list[Tensor] = []
+            for g in range(G):
+                cl_xy_g   = pred_traj_all[active_mask, g, :T_cl, :]   # [n_active, T_cl, 2]
+                cl_head_g = pred_head_all[active_mask, g, :T_cl]       # [n_active, T_cl]
+                cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g)            # [n_active, T_cl, 4]
+                loss_per_g.append(_consistency_loss(cl_norm_g, open_samples[g]))
+
+            loss = torch.stack(loss_per_g).mean()
+            log.info(f"[ocsc] step={int(getattr(self,'global_step',0))} consistency_loss={loss.item():.4f}")
+
+            ret = {
+                "loss": loss,
+                "train/consistency_loss": loss.detach(),
+            }
+
+        # ── 5. Hard RMM monitoring (WOSAC official 8초, no_grad, configurable interval) ──
+        # 훈련 rollout 은 2초(max_steps=4)여서 WOSAC 기준에 맞지 않는다.
+        # 별도로 no_grad full rollout(max_steps=None → 16 coarse step = 8초)을 수행한다.
+        _global_step = int(getattr(self, "global_step", 0))
+        if (
+            eval_hard_rmm
+            and self._ocsc_train_hard_rmm is not None
+            and (_global_step % eval_hard_rmm_interval == 0)
+        ):
+            # ── 5a. Current model 8초 rollout ─────────────────────────────────
+            with torch.no_grad():
+                rmm_traj_all, rmm_z_all, rmm_head_all, _ = self._run_parallel_rollout_chunk(
+                    data=data,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    rollout_cache=rollout_cache,
+                    rollout_indices=list(range(G)),
+                    return_anchor_hidden=True,
+                    full_grad=False,
+                    max_steps=None,   # full 16 coarse step = 8초 = 80 timestep
+                )
+            # rmm_traj_all: [n_agents, G, 80, 2]
+            _rmm_traj_list = [rmm_traj_all[:, g] for g in range(G)]
+            _rmm_z_list    = [rmm_z_all[:, g]    for g in range(G)]
+            _rmm_head_list = [rmm_head_all[:, g] for g in range(G)]
+
+            hard_rmm_val = self._compute_ocsc_train_hard_rmm(
+                scenario_files=list(tfrecord_paths),
+                agent_ids=agent_ids,
+                agent_batch=agent_batch,
+                traj_list=_rmm_traj_list,
+                z_list=_rmm_z_list,
+                head_list=_rmm_head_list,
+                metric=self._ocsc_train_hard_rmm,
+            )
+            if hard_rmm_val is not None:
+                ret["train/hard_rmm"] = torch.tensor(
+                    hard_rmm_val, dtype=torch.float32, device=agent_batch.device
+                )
+                log.info(f"[ocsc] step={_global_step} hard_rmm={hard_rmm_val:.4f}")
+
+            # ── 5b. Reference model 8초 rollout (delta 계산) ──────────────────
+            if self.ref_flow_decoder is not None and self._ocsc_train_hard_rmm_ref is not None:
+                _agent_enc.flow_decoder = self.ref_flow_decoder
+                try:
+                    with torch.no_grad():
+                        rmm_ref_traj, rmm_ref_z, rmm_ref_head, _ = self._run_parallel_rollout_chunk(
+                            data=data,
+                            tokenized_agent=tokenized_agent,
+                            map_feature=map_feature,
+                            rollout_cache=rollout_cache,
+                            rollout_indices=list(range(G)),
+                            return_anchor_hidden=True,
+                            full_grad=False,
+                            max_steps=None,   # 8초
+                        )
+                finally:
+                    _agent_enc.flow_decoder = _orig_fd  # current model 복원
+
+                _rmm_ref_traj_list = [rmm_ref_traj[:, g] for g in range(G)]
+                _rmm_ref_z_list    = [rmm_ref_z[:, g]    for g in range(G)]
+                _rmm_ref_head_list = [rmm_ref_head[:, g] for g in range(G)]
+
+                hard_rmm_ref_val = self._compute_ocsc_train_hard_rmm(
+                    scenario_files=list(tfrecord_paths),
+                    agent_ids=agent_ids,
+                    agent_batch=agent_batch,
+                    traj_list=_rmm_ref_traj_list,
+                    z_list=_rmm_ref_z_list,
+                    head_list=_rmm_ref_head_list,
+                    metric=self._ocsc_train_hard_rmm_ref,
+                )
+                if hard_rmm_ref_val is not None:
+                    ret["train/hard_rmm_ref"] = torch.tensor(
+                        hard_rmm_ref_val, dtype=torch.float32, device=agent_batch.device
+                    )
+                    if hard_rmm_val is not None:
+                        delta = hard_rmm_val - hard_rmm_ref_val
+                        ret["train/hard_rmm_delta"] = torch.tensor(
+                            delta, dtype=torch.float32, device=agent_batch.device
+                        )
+                        log.info(
+                            f"[ocsc] step={_global_step} "
+                            f"hard_rmm={hard_rmm_val:.4f} ref={hard_rmm_ref_val:.4f} delta={delta:+.4f}"
+                        )
+
+        return ret
 
     def _run_flow_bptt_ft_step(
         self,
@@ -2201,7 +2622,7 @@ class SMARTFlow(LightningModule):
 
     def on_after_backward(self) -> None:
         """Log gradient norms to diagnose BPTT gradient explosion."""
-        if not self._is_rmm_bptt_ft_enabled():
+        if not self._is_rmm_bptt_ft_enabled() and not self._is_ocsc_ft_enabled():
             return
         try:
             flow_decoder = self.encoder.agent_encoder.flow_decoder
@@ -2244,6 +2665,14 @@ class SMARTFlow(LightningModule):
 
         if self._is_rmm_bptt_ft_enabled():
             result = self._run_flow_bptt_ft_step(tokenized_map, tokenized_agent, data)
+            for k, v in result.items():
+                if k != "loss" and isinstance(v, (Tensor, float)):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            return result["loss"]
+
+        if self._is_ocsc_ft_enabled():
+            result = self._run_flow_ocsc_ft_step(tokenized_map, tokenized_agent, data)
             for k, v in result.items():
                 if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)

@@ -109,6 +109,28 @@ class FinetuneConfig:
     #: no_grad rollout 이므로 validation 시간 ≈ 2배. noise 는 scenario_id+rollout_idx 해시로
     #: 결정되므로 finetuned rollout 과 자동으로 동일한 noise 를 씁니다.
     rmm_bptt_ref_val: bool = False
+    # ── OCSC (Open-Closed Self-Consistency) ───────────────────────────────────────
+    #: G: 시나리오당 closed-loop rollout 수. rmm_bptt_ft 의 bptt_n_rollouts 와 동일 개념.
+    ocsc_n_rollouts: int = 2
+    #: 일관성 loss 종류. "l2" (MSE), "smooth_l1", "l1" 중 하나.
+    ocsc_loss_type: str = "l2"
+    #: True → frozen pretrained model 로 open-loop target 생성.
+    #: False → current policy 로 생성 (학습 중 target 도 변함).
+    ocsc_use_pretrained_ref: bool = False
+    #: open-loop target rollout 에서 실행할 coarse step 수 (0 이하 = 전체 16).
+    #: 1 coarse step = 0.5s × 5 fine steps = 2.5s; 4 coarse step ≈ 2s.
+    ocsc_target_max_steps: int = 4
+    #: closed-loop prediction rollout 에서 실행할 coarse step 수 (0 이하 = 전체 16).
+    ocsc_pred_max_steps: int = 4
+    #: heading 일관성 loss 가중치. 0 이면 비활성 (position 만).
+    #: heading 은 sin/cos 표현으로 각도 wrap 문제를 회피합니다.
+    ocsc_heading_weight: float = 0.0
+    #: True → 매 training step 에서 closed-loop rollout 으로 hard RMM 을 계산해 로깅.
+    #: 공식 Wosac metric 이 아닌 PyTorch 인-프로세스 HardRMM (빠름).
+    #: CONFIGURABLE: eval_hard_rmm_interval 로 빈도 조절.
+    ocsc_eval_hard_rmm: bool = True
+    #: hard RMM 평가 빈도 (N training step 마다 1 회). 1 = 매 step.
+    ocsc_eval_hard_rmm_interval: int = 1
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -207,6 +229,14 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         bptt_last_n_coarse_steps=int(_read_config_value(finetune, "bptt_last_n_coarse_steps", 0)),
         rmm_bptt_ref_train=bool(_read_config_value(finetune, "rmm_bptt_ref_train", False)),
         rmm_bptt_ref_val=bool(_read_config_value(finetune, "rmm_bptt_ref_val", False)),
+        ocsc_n_rollouts=int(_read_config_value(finetune, "ocsc_n_rollouts", 2)),
+        ocsc_loss_type=str(_read_config_value(finetune, "ocsc_loss_type", "l2")),
+        ocsc_use_pretrained_ref=bool(_read_config_value(finetune, "ocsc_use_pretrained_ref", False)),
+        ocsc_target_max_steps=int(_read_config_value(finetune, "ocsc_target_max_steps", 4)),
+        ocsc_pred_max_steps=int(_read_config_value(finetune, "ocsc_pred_max_steps", 4)),
+        ocsc_heading_weight=float(_read_config_value(finetune, "ocsc_heading_weight", 0.0)),
+        ocsc_eval_hard_rmm=bool(_read_config_value(finetune, "ocsc_eval_hard_rmm", True)),
+        ocsc_eval_hard_rmm_interval=int(_read_config_value(finetune, "ocsc_eval_hard_rmm_interval", 1)),
     )
 
 
@@ -265,6 +295,7 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         "flow_epg_ft",          # Flow-EPG: Exact Policy Gradient with ELBO + RMM reward
         "flow_rwr_ft",          # Flow-RWR: Reward-Weighted Regression with GPU RMM
         "rmm_bptt_ft",          # RMM-BPTT: differentiable soft RMM through closed-loop rollout
+        "ocsc_ft",              # OCSC: Open-Closed Self-Consistency fine-tuning
     }:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 
