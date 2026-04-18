@@ -22,8 +22,9 @@
   완전히 고정합니다. 이 stop gate는 vehicle / pedestrian / bicycle 모두에 적용됩니다.
 - 이 stop-motion 토큰 매칭은 **실제 actor box 크기 대신 class별 고정 토큰 박스**를 사용합니다.
   vehicle은 `2.0 x 4.8`, pedestrian은 `1.0 x 1.0`, bicycle은 `1.0 x 2.0` 입니다.
-- `model.model_config.decoder.use_lqr=true` 를 켜면 stop gate를 통과한 vehicle / bicycle에만
-  curvature-domain LQR + kinematic bicycle commit bridge를 적용합니다.
+- `model.model_config.decoder.use_lqr=true` 를 켜면 stop gate를 통과한 vehicle / bicycle에는
+  기존 curvature-domain LQR + kinematic bicycle commit bridge를,
+  pedestrian에는 이동축/몸 방향 분리 commit bridge를 적용합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
@@ -41,9 +42,8 @@
 - 다만 내부 closed-loop context는 계속 실제 상태를 유지합니다.
 - `use_lqr=true` 를 켠 경우에도 `retokenize`와 내부 문맥 갱신은
   항상 실행된 5개 fine 상태를 기준으로 이뤄집니다.
-- 같은 모드에서 `matched_token_chunk`를 써도 vehicle / bicycle의 외부 10Hz 출력은
-  token chunk로 다시 덮지 않고 실제 실행 chunk를 유지합니다. pedestrian만 기존 방식대로
-  token chunk export를 유지합니다.
+- 같은 모드에서 `matched_token_chunk`를 써도 LQR bridge를 탄 agent의 외부 10Hz 출력은
+  token chunk로 다시 덮지 않고 실제 실행 chunk를 유지합니다.
 
 ### Closed-loop LQR / Stop-motion Switches
 
@@ -52,17 +52,19 @@
 - stop token 과 일치하면 다음 0.5초 5점의 `x / y / yaw` 를 현재 상태와 완전히 같게 고정합니다.
   즉, 작은 떨림을 허용하지 않습니다.
 - 이 stop gate는 `use_lqr=false` 여도 동작합니다.
-- `use_lqr=true` 이면 stop gate를 통과한 vehicle / bicycle에만 제어용 참조를 만들고,
-  1초 horizon의 longitudinal / lateral LQR를 0.1초마다 다시 풀어 다음 0.5초 5점을 실제 실행합니다.
-- 이때 제어는 steering angle 이 아니라 **curvature-domain kinematic bicycle** 로 수행합니다.
+- `use_lqr=true` 이면 stop gate를 통과한 agent에 대해 0.5초 horizon 제어 참조를 만들고,
+  이를 0.1초마다 다시 풀어 다음 0.5초 5점을 실제 실행합니다.
+- vehicle / bicycle은 기존과 같이 **curvature-domain kinematic bicycle** 로 수행합니다.
   wheelbase 추정은 쓰지 않습니다.
-- LQR 참조 생성은 이제 `과거+미래`를 한 번에 smooth fitting 하지 않습니다.
-  먼저 과거 0.5초 실제 history만으로 현재 `speed / accel / curvature / curvature-rate`를 추정하고,
-  그다음 미래 FM trajectory로부터 future speed / curvature reference를 따로 만듭니다.
-- 이때 speed는 edge 길이 norm이 아니라 **각 edge 이동을 현재 heading의 forward axis에 투영한 signed speed**
-  로 추정합니다. 즉, 후진 구간이면 음수 속도를 그대로 유지합니다.
-- curvature reference도 같은 signed speed를 기준으로 만들며, 매우 저속일 때만 최소 speed magnitude를 써서
-  수치적으로 안정화합니다.
+- pedestrian은 raw center path에서 speed magnitude와 이동축 참조를 만들고,
+  raw heading 채널은 body 방향 참조로 따로 추종합니다.
+- LQR 참조 생성은 `과거+미래`를 한 번에 smooth fitting 하지 않습니다.
+  먼저 과거 0.5초 실제 history만으로 현재 상태를 추정하고,
+  그다음 미래 FM trajectory로부터 future reference를 따로 만듭니다.
+- vehicle / bicycle speed는 **각 edge 이동을 현재 heading의 forward axis에 투영한 signed speed** 로 추정합니다.
+  즉, 후진 구간이면 음수 속도를 그대로 유지합니다.
+- pedestrian speed는 edge 길이 norm 기반 magnitude로 추정하고,
+  매우 저속일 때의 이동축 방향은 이전 실행 상태를 유지해 수치적으로 안정화합니다.
 - 이 초기 past history(`rollout_init_fine_*_history`)는 rollout 시작 직전의 raw 10Hz 최근 6개 상태를 씁니다.
   과거 길이가 부족하면 `pos / head`는 맨 앞 상태를 반복해 길이를 맞추고, 부족한 prefix의 `valid`는 `False`로 둬
   LQR 초기 상태 추정이 패딩을 실제 관측으로 오해하지 않게 합니다.
@@ -74,9 +76,13 @@
   현재 속도/동역학 한계 기반 횡방향 projection과 조향 지연 뒤 최종 곡률 상태 재-clip을 함께 켜거나 끌 수 있습니다.
 - `use_lqr=true` 일 때 vehicle / bicycle speed state는 전진은 기존 `v_max`를 쓰되,
   후진은 차종별 별도 제한을 씁니다. 현재 vehicle은 `-1.5m/s`, bicycle은 `-0.5m/s`까지 허용합니다.
-- 저속 예외 처리 자체는 전진/후진 모두 `abs(speed)` 기준으로 판단합니다.
-- LQR가 켜져 있어도 pedestrian은 token/raw branch를 유지합니다.
-- `matched_token_chunk` 를 써도 vehicle / bicycle이 LQR를 탄 경우 외부 10Hz 출력은
+- pedestrian speed state는 항상 `0` 이상으로 두고, 측면/대각 이동은 body yaw와 이동축 분리로 표현합니다.
+- 저속 예외 처리 자체는 vehicle / bicycle은 `abs(speed)` 기준으로 판단합니다.
+- pedestrian은 stop token이 아니어도 매우 느린 구간에서는 translation-stop / body-free 로직을 써서,
+  중심점은 멈추고 body 방향만 회전할 수 있습니다.
+- `use_stop_motion=true` 의 전역 freeze는 그대로 유지되며,
+  stop token으로 판단되면 pedestrian도 기존과 똑같이 `x / y / yaw` 전체를 고정합니다.
+- `matched_token_chunk` 를 써도 LQR bridge를 탄 agent의 외부 10Hz 출력은
   token chunk가 아니라 **실제로 실행된 5점**을 유지합니다.
 
 예시:
@@ -350,12 +356,14 @@ torchrun ... -m src.run \
 - `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. 현재 `pre_bc_flow` 기본값은 `32`입니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
 - `model.model_config.decoder.use_stop_motion=true/false`로 stop-motion gate를 켜거나 끕니다.
-- `model.model_config.decoder.use_lqr=true/false`로 vehicle / bicycle용 dynamics-aware feasible commit bridge를 켜거나 끕니다.
+- `model.model_config.decoder.use_lqr=true/false`로 dynamics-aware feasible commit bridge를 켜거나 끕니다.
+  vehicle / bicycle은 기존 curvature-domain bridge를 쓰고, pedestrian은 이동축/몸 방향 분리 bridge를 씁니다.
 - `use_lqr=true`면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
 - future speed / curvature reference의 시작 경계조건은 항상
   previous+current prefix를 고정해 accel / curvature-rate 연속성까지 함께 반영합니다.
-- LQR reference의 speed는 heading forward axis projection으로 만든 signed speed라서,
-  vehicle / bicycle 후진 구간도 음수 속도로 그대로 추정/제어합니다.
+- LQR reference의 speed는 agent type별로 다르게 만듭니다.
+  vehicle / bicycle은 heading forward axis projection 기반 signed speed라서 후진 구간도 음수 속도로 그대로 추정/제어합니다.
+  pedestrian은 edge 길이 norm 기반 magnitude speed를 사용합니다.
 - 실제 LQR commit speed clamp의 후진 하한은 차종별로 다르며, 현재 vehicle은 `-1.5m/s`,
   bicycle은 `-0.5m/s`까지 허용합니다.
 - `model.model_config.decoder.lqr_commit.clip_longitudinal_command=true/false`는
@@ -392,12 +400,12 @@ torchrun ... -m src.run \
 # stop-motion gate 적용
 ... model.model_config.decoder.use_stop_motion=true
 
-# stop-motion + vehicle / bicycle dynamics-aware feasible commit bridge 적용
+# stop-motion + dynamics-aware feasible commit bridge 적용
 ... model.model_config.decoder.use_stop_motion=true \
     model.model_config.decoder.use_lqr=true
 
 # use_lqr + matched token chunk를 함께 쓸 때도
-# vehicle / bicycle export는 실행된 5점 chunk를 유지하고 pedestrian만 token chunk를 씁니다.
+# LQR bridge를 탄 agent export는 실행된 5점 chunk를 유지합니다.
 ... model.model_config.decoder.use_lqr=true \
     model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
@@ -636,7 +644,7 @@ torchrun \
 
 `configs/experiment/finetune_draft_flow.yaml`을 쓰면
 **기존 flow checkpoint 위에 DRaFT physics penalty를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
-LQR DRaFT를 바로 쓰고 싶다면 [`configs/experiment/finetune_lqr_draft_flow.yaml`](/Users/user/PycharmProjects/catk/configs/experiment/finetune_lqr_draft_flow.yaml)을 사용하면 됩니다.
+LQR DRaFT를 바로 쓰고 싶다면 [`configs/experiment/finetune_lqr_draft_flow.yaml`](configs/experiment/finetune_lqr_draft_flow.yaml)을 사용하면 됩니다.
 이 경로는 pretrain을 이어서 resume하는 용도가 아니라,
 **이미 학습된 checkpoint의 weight만 읽어서 새 fine-tuning run을 시작하는 용도**입니다.
 
@@ -702,6 +710,7 @@ loss와 로그는 아래처럼 보면 됩니다.
 - lqr 모드의 최종 합성은 `train/loss = train/loss_fm + train/draft_weight * train/loss_lqr_exec` 입니다.
 - lqr penalty는 실행된 첫 0.5초 5개 점을 현재 flow target과 같은 local normalized `[x, y, cos, sin]` 표현으로 바꾼 뒤,
   **가중치 없는 MSE**로 GT 첫 0.5초와 비교합니다.
+- 이때 vehicle / bicycle은 기존 curvature-domain bridge 결과를, pedestrian은 이동축/몸 방향 분리 bridge 결과를 그대로 사용합니다.
 - lqr 모드의 세부 로그는 `draft_lqr/commit_mse`, `draft_lqr/commit_pos_ade_m`, `draft_lqr/commit_pos_fde_m`,
   `draft_lqr/commit_yaw_ade_deg`, `draft_lqr/commit_yaw_fde_deg`, `draft_lqr/active_anchor_count` 입니다.
 - physics 모드는 기존과 같이 `raw_feaisble_gap/*`, `gt_feasible_gap/*` 세부 지표를 유지합니다.

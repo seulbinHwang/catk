@@ -484,8 +484,8 @@ class ContinuousCommitBridge:
     이 클래스는 세 가지 일을 담당합니다.
     1) 6개 점 경로 기준 motion token 재매칭
     2) stop-motion 토큰이 나오면 0.5초 chunk를 완전히 정지로 고정
-    3) vehicle / bicycle에 대해서만 curvature-domain LQR과 kinematic bicycle로
-       다음 0.5초 5개 fine 상태를 실제 실행
+    3) vehicle / bicycle은 기존 curvature-domain bridge로,
+       pedestrian은 이동축/몸 방향 분리 bridge로 다음 0.5초 5개 fine 상태를 실제 실행
     """
 
     def __init__(
@@ -1251,7 +1251,461 @@ class ContinuousCommitBridge:
         u_clipped = torch.clamp(u_value, torch.minimum(u_low, u_high), torch.maximum(u_low, u_high))
         return kappa_state, u_clipped
 
-    def execute_lqr_commit(
+    def _carry_forward_angle(
+        self,
+        raw_angle: torch.Tensor,
+        reliable_mask: torch.Tensor,
+        init_angle: torch.Tensor,
+    ) -> torch.Tensor:
+        """유효한 edge에서만 새 각도를 쓰고, 아니면 직전 각도를 유지합니다.
+
+        Args:
+            raw_angle: edge마다 바로 계산한 각도입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+            reliable_mask: 해당 edge 각도를 믿어도 되는지 나타내는 마스크입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+            init_angle: 첫 edge 이전에 쓸 시작 각도입니다.
+                shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            torch.Tensor: carry-forward가 적용된 각도 시퀀스입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+        """
+        if raw_angle.shape[1] == 0:
+            return raw_angle
+
+        carried_angle = raw_angle.new_zeros(raw_angle.shape)
+        prev_angle = init_angle
+        for step_idx in range(raw_angle.shape[1]):
+            prev_angle = torch.where(reliable_mask[:, step_idx], raw_angle[:, step_idx], prev_angle)
+            carried_angle[:, step_idx] = prev_angle
+        return carried_angle
+
+    def _compute_pedestrian_motion_observation(
+        self,
+        pos_seq: torch.Tensor,
+        valid_seq: torch.Tensor,
+        init_angle: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """위치 시퀀스에서 보행자용 speed와 이동축 각도를 만듭니다.
+
+        보행자는 차처럼 body 방향에 속도를 투영하지 않습니다.
+        각 edge 길이로 speed magnitude를 만들고,
+        아주 느린 edge는 방향 관측으로 믿지 않고 이전 이동축 각도를 유지합니다.
+
+        Args:
+            pos_seq: 연속된 위치 시퀀스입니다.
+                shape은 ``[n_agent, n_step, 2]`` 입니다.
+            valid_seq: 같은 시퀀스의 유효 여부입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+            init_angle: 첫 edge 이전에 쓸 이동축 시작 각도입니다.
+                shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - speed_obs: edge 길이로 만든 speed 관측치입니다. shape은 ``[n_agent, n_step - 1]`` 입니다.
+                - motion_angle: carry-forward가 적용된 이동축 각도입니다. shape은 ``[n_agent, n_step - 1]`` 입니다.
+                - reliable_edge: speed/방향 관측을 믿어도 되는 edge 마스크입니다. shape은 ``[n_agent, n_step - 1]`` 입니다.
+        """
+        dt = float(self.config.dt)
+        edge_delta = pos_seq[:, 1:] - pos_seq[:, :-1]
+        speed_obs = torch.linalg.norm(edge_delta, dim=-1) / dt
+        edge_valid = valid_seq[:, :-1] & valid_seq[:, 1:]
+        reliable_edge = edge_valid & (speed_obs >= float(self.config.stop_speed_mps))
+        raw_angle = torch.atan2(edge_delta[..., 1], edge_delta[..., 0])
+        motion_angle = self._carry_forward_angle(
+            raw_angle=raw_angle,
+            reliable_mask=reliable_edge,
+            init_angle=init_angle,
+        )
+        return speed_obs, motion_angle, reliable_edge
+
+    def _fit_pedestrian_speed_profile(
+        self,
+        speed_obs: torch.Tensor,
+        reliable_edge: torch.Tensor,
+        fixed_prefix: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """보행자 speed magnitude 곡선을 부드럽게 맞춥니다.
+
+        Args:
+            speed_obs: edge 길이로 만든 speed 관측치입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+            reliable_edge: 각 edge 관측을 믿어도 되는지 나타내는 마스크입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+            fixed_prefix: smoothness 시작 조건으로 고정할 과거 edge 값입니다.
+                shape은 ``[n_agent, prefix_edge]`` 입니다.
+
+        Returns:
+            torch.Tensor: 음수가 나오지 않도록 자른 speed 곡선입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+        """
+        edge_weight = reliable_edge.to(speed_obs.dtype)
+        rhs = edge_weight * speed_obs
+        speed_profile = self._solve_smoothed_edge_profile(
+            diag_weight=edge_weight,
+            rhs=rhs,
+            smooth_lambda=float(self.config.velocity_smooth_lambda),
+            fixed_prefix=fixed_prefix,
+        )
+        return speed_profile.clamp_min(0.0)
+
+    def _build_pedestrian_turn_rate_observation(
+        self,
+        motion_angle: torch.Tensor,
+        reliable_edge: torch.Tensor,
+        init_angle: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """이동축 각도 시퀀스에서 보행자용 각속도 관측치를 만듭니다.
+
+        Args:
+            motion_angle: carry-forward가 적용된 이동축 각도입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+            reliable_edge: 각 edge 관측을 믿어도 되는지 나타내는 마스크입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+            init_angle: 첫 edge 이전의 이동축 각도입니다.
+                shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - omega_obs: edge마다 만든 이동축 각속도 관측치입니다. shape은 ``[n_agent, n_edge]`` 입니다.
+                - omega_weight: 각속도 관측 가중치입니다. shape은 ``[n_agent, n_edge]`` 입니다.
+        """
+        dt = float(self.config.dt)
+        omega_obs = motion_angle.new_zeros(motion_angle.shape)
+        if motion_angle.shape[1] > 0:
+            omega_obs[:, 0] = wrap_angle(motion_angle[:, 0] - init_angle) / dt
+        if motion_angle.shape[1] > 1:
+            omega_obs[:, 1:] = wrap_angle(motion_angle[:, 1:] - motion_angle[:, :-1]) / dt
+        omega_weight = reliable_edge.to(motion_angle.dtype)
+        return omega_obs, omega_weight
+
+    def _fit_pedestrian_turn_rate_profile(
+        self,
+        omega_obs: torch.Tensor,
+        omega_weight: torch.Tensor,
+        fixed_prefix: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """보행자 이동축 각속도 곡선을 부드럽게 맞춥니다.
+
+        Args:
+            omega_obs: edge마다 만든 이동축 각속도 관측치입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+            omega_weight: 각 edge 관측 가중치입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+            fixed_prefix: smoothness 시작 조건으로 고정할 과거 edge 값입니다.
+                shape은 ``[n_agent, prefix_edge]`` 입니다.
+
+        Returns:
+            torch.Tensor: 부드럽게 맞춘 이동축 각속도 곡선입니다.
+                shape은 ``[n_agent, n_edge]`` 입니다.
+        """
+        rhs = omega_weight * omega_obs
+        return self._solve_smoothed_edge_profile(
+            diag_weight=omega_weight,
+            rhs=rhs,
+            smooth_lambda=float(self.config.curvature_smooth_lambda),
+            fixed_prefix=fixed_prefix,
+            diag_reg=float(self.config.curvature_init_reg),
+        )
+
+    def _estimate_pedestrian_history_state(
+        self,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        exec_pos_history: torch.Tensor,
+        exec_head_history: torch.Tensor,
+        exec_valid_history: torch.Tensor,
+        limits: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """실제 실행 history로 현재 보행자 상태를 추정합니다.
+
+        Args:
+            current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 body 방향입니다. shape은 ``[n_agent]`` 입니다.
+            exec_pos_history: 최근 실제 fine 위치입니다. shape은 ``[n_agent, 6, 2]`` 입니다.
+            exec_head_history: 최근 실제 fine body 방향입니다. shape은 ``[n_agent, 6]`` 입니다.
+            exec_valid_history: 최근 실제 fine 유효 여부입니다. shape은 ``[n_agent, 6]`` 입니다.
+            limits: class별 물리 제한 사전입니다. 각 값 shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - speed_state: 현재 speed magnitude 입니다. shape은 ``[n_agent]`` 입니다.
+                - accel_state: 현재 forward acceleration 추정입니다. shape은 ``[n_agent]`` 입니다.
+                - walk_head_state: 현재 이동축 각도입니다. shape은 ``[n_agent]`` 입니다.
+                - walk_omega_state: 현재 이동축 각속도입니다. shape은 ``[n_agent]`` 입니다.
+                - walk_alpha_state: 현재 이동축 각가속도 추정입니다. shape은 ``[n_agent]`` 입니다.
+                - body_omega_state: 현재 body 각속도입니다. shape은 ``[n_agent]`` 입니다.
+        """
+        dt = float(self.config.dt)
+        history_steps = min(exec_pos_history.shape[1], int(self.config.history_steps))
+        history_pos = exec_pos_history[:, -history_steps:].clone()
+        history_head = exec_head_history[:, -history_steps:].clone()
+        history_valid = exec_valid_history[:, -history_steps:].clone()
+        history_pos[:, -1] = current_pos
+        history_head[:, -1] = current_head
+        history_valid[:, -1] = True
+
+        init_walk_head = history_head[:, 0]
+        speed_obs, motion_angle, reliable_edge = self._compute_pedestrian_motion_observation(
+            pos_seq=history_pos,
+            valid_seq=history_valid,
+            init_angle=init_walk_head,
+        )
+        speed_profile = self._fit_pedestrian_speed_profile(
+            speed_obs=speed_obs,
+            reliable_edge=reliable_edge,
+        )
+        if speed_profile.shape[1] >= 1:
+            speed_state = speed_profile[:, -1]
+        else:
+            speed_state = current_pos.new_zeros(current_pos.shape[0])
+        if speed_profile.shape[1] >= 2:
+            accel_state = (speed_profile[:, -1] - speed_profile[:, -2]) / dt
+        else:
+            accel_state = current_pos.new_zeros(current_pos.shape[0])
+
+        reliable_any = reliable_edge.any(dim=1)
+        if motion_angle.shape[1] >= 1:
+            walk_head_state = torch.where(reliable_any, motion_angle[:, -1], current_head)
+        else:
+            walk_head_state = current_head
+
+        omega_obs, omega_weight = self._build_pedestrian_turn_rate_observation(
+            motion_angle=motion_angle,
+            reliable_edge=reliable_edge,
+            init_angle=init_walk_head,
+        )
+        omega_profile = self._fit_pedestrian_turn_rate_profile(
+            omega_obs=omega_obs,
+            omega_weight=omega_weight,
+        )
+        if omega_profile.shape[1] >= 1:
+            walk_omega_state = omega_profile[:, -1]
+        else:
+            walk_omega_state = current_head.new_zeros(current_head.shape[0])
+        if omega_profile.shape[1] >= 2:
+            walk_alpha_state = (omega_profile[:, -1] - omega_profile[:, -2]) / dt
+        else:
+            walk_alpha_state = current_head.new_zeros(current_head.shape[0])
+
+        if history_head.shape[1] >= 2:
+            last_edge_valid = history_valid[:, -2] & history_valid[:, -1]
+            body_omega_state = wrap_angle(history_head[:, -1] - history_head[:, -2]) / dt
+            body_omega_state = torch.where(
+                last_edge_valid,
+                body_omega_state,
+                torch.zeros_like(body_omega_state),
+            )
+        else:
+            body_omega_state = current_head.new_zeros(current_head.shape[0])
+        body_omega_state = torch.clamp(body_omega_state, -limits["omega_max"], limits["omega_max"])
+
+        return (
+            speed_state,
+            accel_state,
+            walk_head_state,
+            walk_omega_state,
+            walk_alpha_state,
+            body_omega_state,
+        )
+
+    def _build_pedestrian_reference_profiles(
+        self,
+        current_pos: torch.Tensor,
+        current_walk_head: torch.Tensor,
+        current_speed: torch.Tensor,
+        current_accel: torch.Tensor,
+        current_walk_omega: torch.Tensor,
+        current_walk_alpha: torch.Tensor,
+        future_pos: torch.Tensor,
+        future_head: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """남은 raw future에서 보행자 참조 speed/이동축/body 방향을 만듭니다.
+
+        Args:
+            current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_walk_head: 현재 이동축 각도입니다. shape은 ``[n_agent]`` 입니다.
+            current_speed: 현재 speed magnitude 입니다. shape은 ``[n_agent]`` 입니다.
+            current_accel: 현재 forward acceleration 추정입니다. shape은 ``[n_agent]`` 입니다.
+            current_walk_omega: 현재 이동축 각속도입니다. shape은 ``[n_agent]`` 입니다.
+            current_walk_alpha: 현재 이동축 각가속도 추정입니다. shape은 ``[n_agent]`` 입니다.
+            future_pos: 남은 raw FM 중심점입니다. shape은 ``[n_agent, n_future, 2]`` 입니다.
+            future_head: 남은 raw FM body 방향입니다. shape은 ``[n_agent, n_future]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - speed_ref_horizon: 다음 1초 speed 참조입니다. shape은 ``[n_agent, horizon]`` 입니다.
+                - walk_head_ref_horizon: 다음 1초 이동축 각도 참조입니다. shape은 ``[n_agent, horizon]`` 입니다.
+                - walk_omega_ref_horizon: 다음 1초 이동축 각속도 참조입니다. shape은 ``[n_agent, horizon]`` 입니다.
+                - body_head_ref_horizon: 다음 1초 body 방향 참조입니다. shape은 ``[n_agent, horizon]`` 입니다.
+                - walk_head_init: start-from-stop bootstrap이 반영된 현재 이동축 각도입니다. shape은 ``[n_agent]`` 입니다.
+        """
+        horizon_steps = int(self.config.horizon_steps)
+        future_valid = torch.ones_like(future_head, dtype=torch.bool)
+        future_pos_seq = torch.cat([current_pos.unsqueeze(1), future_pos], dim=1)
+        speed_obs, motion_angle, reliable_edge = self._compute_pedestrian_motion_observation(
+            pos_seq=future_pos_seq,
+            valid_seq=torch.cat(
+                [
+                    torch.ones_like(current_walk_head, dtype=torch.bool).unsqueeze(1),
+                    future_valid,
+                ],
+                dim=1,
+            ),
+            init_angle=current_walk_head,
+        )
+        speed_ref_full = self._fit_pedestrian_speed_profile(
+            speed_obs=speed_obs,
+            reliable_edge=reliable_edge,
+            fixed_prefix=self._build_profile_init_prefix(
+                current_value=current_speed,
+                current_rate=current_accel,
+            ),
+        )
+        speed_ref_horizon = speed_ref_full[:, :horizon_steps]
+
+        walk_head_init = current_walk_head.clone()
+        start_mask = (current_speed < float(self.config.stop_speed_mps)) & (
+            speed_ref_horizon.max(dim=1).values >= float(self.config.stop_speed_mps)
+        )
+        if start_mask.any() and motion_angle.shape[1] > 0:
+            start_idx = (speed_ref_horizon >= float(self.config.stop_speed_mps)).float().argmax(dim=1)
+            gather_idx = start_idx.unsqueeze(1)
+            start_walk_head = motion_angle.gather(1, gather_idx).squeeze(1)
+            walk_head_init = torch.where(start_mask, start_walk_head, walk_head_init)
+
+        speed_obs, motion_angle, reliable_edge = self._compute_pedestrian_motion_observation(
+            pos_seq=future_pos_seq,
+            valid_seq=torch.cat(
+                [
+                    torch.ones_like(current_walk_head, dtype=torch.bool).unsqueeze(1),
+                    future_valid,
+                ],
+                dim=1,
+            ),
+            init_angle=walk_head_init,
+        )
+        speed_ref_full = self._fit_pedestrian_speed_profile(
+            speed_obs=speed_obs,
+            reliable_edge=reliable_edge,
+            fixed_prefix=self._build_profile_init_prefix(
+                current_value=current_speed,
+                current_rate=current_accel,
+            ),
+        )
+        speed_ref_horizon = speed_ref_full[:, :horizon_steps]
+
+        omega_obs, omega_weight = self._build_pedestrian_turn_rate_observation(
+            motion_angle=motion_angle,
+            reliable_edge=reliable_edge,
+            init_angle=walk_head_init,
+        )
+        walk_omega_ref_full = self._fit_pedestrian_turn_rate_profile(
+            omega_obs=omega_obs,
+            omega_weight=omega_weight,
+            fixed_prefix=self._build_profile_init_prefix(
+                current_value=current_walk_omega,
+                current_rate=current_walk_alpha,
+            ),
+        )
+        walk_omega_ref_horizon = walk_omega_ref_full[:, :horizon_steps]
+        walk_head_ref_horizon = wrap_angle(
+            walk_head_init.unsqueeze(1) + float(self.config.dt) * torch.cumsum(walk_omega_ref_horizon, dim=1)
+        )
+        body_head_ref_horizon = future_head[:, :horizon_steps]
+        return (
+            speed_ref_horizon,
+            walk_head_ref_horizon,
+            walk_omega_ref_horizon,
+            body_head_ref_horizon,
+            walk_head_init,
+        )
+
+    def _solve_pedestrian_walk_axis_lqr(
+        self,
+        v_profile: torch.Tensor,
+        walk_omega0: torch.Tensor,
+        walk_omega_ref_profile: torch.Tensor,
+    ) -> torch.Tensor:
+        """보행자 이동축용 상수 각가속도 하나를 1초 horizon에서 풉니다.
+
+        Args:
+            v_profile: 다음 1초 speed 참조입니다. shape은 ``[n_agent, horizon]`` 입니다.
+            walk_omega0: 현재 이동축 각속도입니다. shape은 ``[n_agent]`` 입니다.
+            walk_omega_ref_profile: 다음 1초 이동축 각속도 참조입니다. shape은 ``[n_agent, horizon]`` 입니다.
+
+        Returns:
+            torch.Tensor: horizon 전체에 유지할 이동축 각가속도입니다.
+                shape은 ``[n_agent]`` 입니다.
+        """
+        dt = float(self.config.dt)
+        q_diag = walk_omega_ref_profile.new_tensor(
+            [
+                float(self.config.lateral_q_lat),
+                float(self.config.lateral_q_head),
+                float(self.config.lateral_q_kappa),
+            ]
+        )
+        z_no_u = torch.stack(
+            [
+                walk_omega0.new_zeros(walk_omega0.shape[0]),
+                walk_omega0.new_zeros(walk_omega0.shape[0]),
+                walk_omega0,
+            ],
+            dim=-1,
+        )
+        gamma = torch.zeros_like(z_no_u)
+        b = walk_omega0.new_tensor([0.0, 0.0, dt]).unsqueeze(0).expand(walk_omega0.shape[0], -1)
+        numerator = walk_omega0.new_zeros(walk_omega0.shape[0])
+        denominator = walk_omega0.new_full(walk_omega0.shape, float(self.config.lateral_r))
+
+        for step_idx in range(walk_omega_ref_profile.shape[1]):
+            v_step = v_profile[:, step_idx]
+            a_mat = torch.zeros((walk_omega0.shape[0], 3, 3), device=walk_omega0.device, dtype=walk_omega0.dtype)
+            a_mat[:, 0, 0] = 1.0
+            a_mat[:, 0, 1] = dt * v_step
+            a_mat[:, 1, 1] = 1.0
+            a_mat[:, 1, 2] = dt
+            a_mat[:, 2, 2] = 1.0
+            c_vec = torch.stack(
+                [
+                    v_step.new_zeros(v_step.shape[0]),
+                    -(dt * walk_omega_ref_profile[:, step_idx]),
+                    v_step.new_zeros(v_step.shape[0]),
+                ],
+                dim=-1,
+            )
+            z_no_u = torch.bmm(a_mat, z_no_u.unsqueeze(-1)).squeeze(-1) + c_vec
+            gamma = torch.bmm(a_mat, gamma.unsqueeze(-1)).squeeze(-1) + b
+            numerator = numerator + (gamma * q_diag.unsqueeze(0) * z_no_u).sum(dim=-1)
+            denominator = denominator + (gamma * q_diag.unsqueeze(0) * gamma).sum(dim=-1)
+
+        return -numerator / denominator.clamp_min(1.0e-6)
+
+    def _build_pedestrian_walk_rate_limit(
+        self,
+        speed_value: torch.Tensor,
+        limits: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """현재 speed에서 가능한 보행자 이동축 각속도 한계를 계산합니다.
+
+        Args:
+            speed_value: 현재 speed magnitude 입니다. shape은 ``[n_agent]`` 입니다.
+            limits: class별 물리 제한 사전입니다. 각 값 shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            torch.Tensor: speed와 lateral acceleration을 함께 반영한 각속도 한계입니다.
+                shape은 ``[n_agent]`` 입니다.
+        """
+        speed_safe = torch.maximum(
+            speed_value,
+            speed_value.new_full(speed_value.shape, float(self.config.stop_speed_mps)),
+        )
+        lat_limit = limits["a_lat_max"] / speed_safe.clamp_min(1.0e-6)
+        return torch.minimum(limits["omega_max"], lat_limit)
+
+    def _execute_vehicle_like_lqr_commit(
         self,
         y_hat_norm: torch.Tensor,
         current_pos: torch.Tensor,
@@ -1261,7 +1715,7 @@ class ContinuousCommitBridge:
         exec_valid_history: torch.Tensor,
         agent_type: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """vehicle / bicycle의 다음 0.5초를 0.1초 receding-horizon LQR로 실행합니다.
+        """vehicle / bicycle의 기존 curvature-domain commit bridge를 실행합니다.
 
         Args:
             y_hat_norm: raw FM 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
@@ -1279,11 +1733,6 @@ class ContinuousCommitBridge:
                 - next_pos: 마지막 중심점 ``[n_agent, 2]``
                 - next_head: 마지막 방향 ``[n_agent]``
         """
-        if y_hat_norm.numel() == 0:
-            empty_pos = current_pos.new_zeros((0, 5, 2))
-            empty_head = current_head.new_zeros((0, 5))
-            return empty_pos, empty_head, current_pos.clone(), current_head.clone()
-
         future_pos, future_head = self._build_full_future_from_flow(
             y_hat_norm=y_hat_norm,
             current_pos=current_pos,
@@ -1320,7 +1769,6 @@ class ContinuousCommitBridge:
         commit_pos = current_pos.new_zeros((current_pos.shape[0], 5, 2))
         commit_head = current_head.new_zeros((current_head.shape[0], 5))
         for step_idx in range(5):
-            # Keep the FM future fixed for the 0.5s block, but re-solve control on the remaining horizon every 0.1s.
             remaining_future_pos = future_pos[:, step_idx:]
             remaining_future_head = future_head[:, step_idx:]
             _, _, _, v_ref_horizon, kappa_ref_horizon = self._estimate_reference_profiles(
@@ -1410,3 +1858,291 @@ class ContinuousCommitBridge:
                 )
 
         return commit_pos, commit_head, commit_pos[:, -1], commit_head[:, -1]
+
+    def _execute_pedestrian_lqr_commit(
+        self,
+        y_hat_norm: torch.Tensor,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        exec_pos_history: torch.Tensor,
+        exec_head_history: torch.Tensor,
+        exec_valid_history: torch.Tensor,
+        agent_type: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """보행자용 실행 commit bridge를 0.1초 receding-horizon으로 수행합니다.
+
+        translation은 이동축을 따르고,
+        body 방향은 raw heading을 따르는 별도 tracker로 업데이트합니다.
+        따라서 멈춘 상태에서도 body만 돌 수 있고,
+        DRaFT와 runtime이 같은 실행 경로를 공유합니다.
+
+        Args:
+            y_hat_norm: raw FM 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
+            current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 body 방향입니다. shape은 ``[n_agent]`` 입니다.
+            exec_pos_history: 최근 실제 fine history 입니다. shape은 ``[n_agent, 6, 2]`` 입니다.
+            exec_head_history: 최근 실제 fine body heading 입니다. shape은 ``[n_agent, 6]`` 입니다.
+            exec_valid_history: 최근 실제 fine valid 입니다. shape은 ``[n_agent, 6]`` 입니다.
+            agent_type: 차종 번호입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - commit_pos: 실행된 다음 0.5초 중심점 ``[n_agent, 5, 2]``
+                - commit_head: 실행된 다음 0.5초 body 방향 ``[n_agent, 5]``
+                - next_pos: 마지막 중심점 ``[n_agent, 2]``
+                - next_head: 마지막 body 방향 ``[n_agent]``
+        """
+        future_pos, future_head = self._build_full_future_from_flow(
+            y_hat_norm=y_hat_norm,
+            current_pos=current_pos,
+            current_head=current_head,
+        )
+        limits = self._gather_dynamic_limits(agent_type=agent_type, dtype=current_pos.dtype)
+        dt = float(self.config.dt)
+        accel_alpha = dt / (dt + float(self.config.accel_tau_s))
+        walk_omega_alpha = dt / (dt + float(self.config.curvature_tau_s))
+        history_steps = min(exec_pos_history.shape[1], int(self.config.history_steps))
+
+        pos_state = current_pos.clone()
+        body_head_state = current_head.clone()
+        exec_pos_history_state = exec_pos_history[:, -history_steps:].clone()
+        exec_head_history_state = exec_head_history[:, -history_steps:].clone()
+        exec_valid_history_state = exec_valid_history[:, -history_steps:].clone()
+        exec_pos_history_state[:, -1] = current_pos
+        exec_head_history_state[:, -1] = current_head
+        exec_valid_history_state[:, -1] = True
+
+        (
+            speed_state,
+            accel_state,
+            walk_head_state,
+            walk_omega_state,
+            walk_alpha_state,
+            body_omega_state,
+        ) = self._estimate_pedestrian_history_state(
+            current_pos=pos_state,
+            current_head=body_head_state,
+            exec_pos_history=exec_pos_history_state,
+            exec_head_history=exec_head_history_state,
+            exec_valid_history=exec_valid_history_state,
+            limits=limits,
+        )
+
+        commit_pos = current_pos.new_zeros((current_pos.shape[0], 5, 2))
+        commit_head = current_head.new_zeros((current_head.shape[0], 5))
+        for step_idx in range(5):
+            remaining_future_pos = future_pos[:, step_idx:]
+            remaining_future_head = future_head[:, step_idx:]
+            (
+                v_ref_horizon,
+                _walk_head_ref_horizon,
+                walk_omega_ref_horizon,
+                body_head_ref_horizon,
+                walk_head_state,
+            ) = self._build_pedestrian_reference_profiles(
+                current_pos=pos_state,
+                current_walk_head=walk_head_state,
+                current_speed=speed_state,
+                current_accel=accel_state,
+                current_walk_omega=walk_omega_state,
+                current_walk_alpha=walk_alpha_state,
+                future_pos=remaining_future_pos,
+                future_head=remaining_future_head,
+            )
+            translation_stop_mask = (speed_state < float(self.config.stop_speed_mps)) & (
+                v_ref_horizon.max(dim=1).values < float(self.config.stop_speed_mps)
+            )
+
+            next_pos = pos_state.clone()
+            next_walk_head = walk_head_state.clone()
+            next_speed = speed_state.clone()
+            next_accel = accel_state.clone()
+            next_walk_omega = walk_omega_state.clone()
+
+            moving_mask = ~translation_stop_mask
+            if moving_mask.any():
+                v_ref_target = v_ref_horizon[:, -1]
+                a_star = self._solve_longitudinal_lqr(v0=speed_state, v_ref_target=v_ref_target)
+                slow_mask = moving_mask & (speed_state < float(self.config.stop_speed_mps)) & (
+                    v_ref_target < float(self.config.stop_speed_mps)
+                )
+                if slow_mask.any():
+                    a_star = a_star.clone()
+                    a_star[slow_mask] = -float(self.config.stop_speed_kp) * (
+                        speed_state[slow_mask] - v_ref_target[slow_mask]
+                    )
+                if self.config.clip_longitudinal_command:
+                    a_star = torch.clamp(a_star, -limits["a_max"], limits["a_max"])
+                accel_applied = accel_state + accel_alpha * (a_star - accel_state)
+                accel_applied = torch.clamp(accel_applied, -limits["a_max"], limits["a_max"])
+
+                walk_alpha_cmd = self._solve_pedestrian_walk_axis_lqr(
+                    v_profile=v_ref_horizon,
+                    walk_omega0=walk_omega_state,
+                    walk_omega_ref_profile=walk_omega_ref_horizon,
+                )
+                if self.config.clip_lateral_projection_and_final_curvature_state:
+                    walk_alpha_cmd = torch.clamp(walk_alpha_cmd, -limits["alpha_max"], limits["alpha_max"])
+                walk_omega_ideal = walk_omega_state + dt * walk_alpha_cmd
+                walk_omega_applied = walk_omega_state + walk_omega_alpha * (walk_omega_ideal - walk_omega_state)
+                if self.config.clip_lateral_projection_and_final_curvature_state:
+                    walk_rate_limit = self._build_pedestrian_walk_rate_limit(
+                        speed_value=speed_state,
+                        limits=limits,
+                    )
+                    walk_omega_applied = torch.clamp(walk_omega_applied, -walk_rate_limit, walk_rate_limit)
+
+                next_speed_value = torch.clamp_min(
+                    speed_state[moving_mask] + dt * accel_applied[moving_mask],
+                    0.0,
+                )
+                next_speed_value = torch.minimum(next_speed_value, limits["v_max"][moving_mask])
+                move_axis = torch.stack([walk_head_state.cos(), walk_head_state.sin()], dim=-1)
+                move_speed = 0.5 * (speed_state[moving_mask] + next_speed_value)
+                next_pos[moving_mask] = pos_state[moving_mask] + dt * move_speed.unsqueeze(-1) * move_axis[
+                    moving_mask
+                ]
+                next_walk_head[moving_mask] = wrap_angle(
+                    walk_head_state[moving_mask] + dt * walk_omega_applied[moving_mask]
+                )
+                next_speed[moving_mask] = next_speed_value
+                next_accel[moving_mask] = accel_applied[moving_mask]
+                next_walk_omega[moving_mask] = walk_omega_applied[moving_mask]
+
+            if translation_stop_mask.any():
+                next_pos[translation_stop_mask] = pos_state[translation_stop_mask]
+                next_walk_head[translation_stop_mask] = walk_head_state[translation_stop_mask]
+                next_speed[translation_stop_mask] = 0.0
+                next_accel[translation_stop_mask] = 0.0
+                next_walk_omega[translation_stop_mask] = 0.0
+
+            body_ref_next = body_head_ref_horizon[:, 0]
+            body_rate_star = wrap_angle(body_ref_next - body_head_state) / dt
+            body_rate_low = torch.maximum(-limits["omega_max"], body_omega_state - limits["alpha_max"] * dt)
+            body_rate_high = torch.minimum(limits["omega_max"], body_omega_state + limits["alpha_max"] * dt)
+            body_omega_next = torch.clamp(body_rate_star, body_rate_low, body_rate_high)
+            body_head_next = wrap_angle(body_head_state + dt * body_omega_next)
+
+            walk_alpha_next = (next_walk_omega - walk_omega_state) / dt
+            pos_state = next_pos
+            body_head_state = body_head_next
+            speed_state = next_speed
+            accel_state = next_accel
+            walk_head_state = next_walk_head
+            walk_omega_state = next_walk_omega
+            walk_alpha_state = walk_alpha_next
+            body_omega_state = body_omega_next
+            commit_pos[:, step_idx] = pos_state
+            commit_head[:, step_idx] = body_head_state
+            if history_steps == 1:
+                exec_pos_history_state = pos_state.unsqueeze(1)
+                exec_head_history_state = body_head_state.unsqueeze(1)
+                exec_valid_history_state = torch.ones_like(body_head_state, dtype=torch.bool).unsqueeze(1)
+            else:
+                exec_pos_history_state = torch.cat(
+                    [exec_pos_history_state[:, 1:], pos_state.unsqueeze(1)],
+                    dim=1,
+                )
+                exec_head_history_state = torch.cat(
+                    [exec_head_history_state[:, 1:], body_head_state.unsqueeze(1)],
+                    dim=1,
+                )
+                exec_valid_history_state = torch.cat(
+                    [
+                        exec_valid_history_state[:, 1:],
+                        torch.ones_like(body_head_state, dtype=torch.bool).unsqueeze(1),
+                    ],
+                    dim=1,
+                )
+
+        return commit_pos, commit_head, commit_pos[:, -1], commit_head[:, -1]
+
+    def execute_lqr_commit(
+        self,
+        y_hat_norm: torch.Tensor,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        exec_pos_history: torch.Tensor,
+        exec_head_history: torch.Tensor,
+        exec_valid_history: torch.Tensor,
+        agent_type: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """agent type별 runtime commit bridge를 실행합니다.
+
+        vehicle / bicycle은 기존 curvature-domain bridge를 그대로 쓰고,
+        pedestrian은 body 방향과 이동축을 분리한 실행 경로를 사용합니다.
+        이 함수는 stop-motion 전역 freeze를 대신하지 않으며,
+        `use_stop_motion=True` 일 때의 바깥 로직은 그대로 유지됩니다.
+
+        Args:
+            y_hat_norm: raw FM 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
+            current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 방향입니다. shape은 ``[n_agent]`` 입니다.
+            exec_pos_history: 최근 실제 fine history 입니다. shape은 ``[n_agent, 6, 2]`` 입니다.
+            exec_head_history: 최근 실제 fine heading 입니다. shape은 ``[n_agent, 6]`` 입니다.
+            exec_valid_history: 최근 실제 fine valid 입니다. shape은 ``[n_agent, 6]`` 입니다.
+            agent_type: 차종 번호입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - commit_pos: 실행된 다음 0.5초 중심점 ``[n_agent, 5, 2]``
+                - commit_head: 실행된 다음 0.5초 방향 ``[n_agent, 5]``
+                - next_pos: 마지막 중심점 ``[n_agent, 2]``
+                - next_head: 마지막 방향 ``[n_agent]``
+        """
+        if y_hat_norm.numel() == 0:
+            empty_pos = current_pos.new_zeros((0, 5, 2))
+            empty_head = current_head.new_zeros((0, 5))
+            return empty_pos, empty_head, current_pos.clone(), current_head.clone()
+
+        commit_pos = current_pos.new_zeros((current_pos.shape[0], 5, 2))
+        commit_head = current_head.new_zeros((current_head.shape[0], 5))
+        next_pos = current_pos.clone()
+        next_head = current_head.clone()
+
+        veh_cyc_mask = (agent_type.long() == 0) | (agent_type.long() == 2)
+        ped_mask = agent_type.long() == 1
+        raw_mask = ~(veh_cyc_mask | ped_mask)
+
+        if veh_cyc_mask.any():
+            veh_commit_pos, veh_commit_head, veh_next_pos, veh_next_head = self._execute_vehicle_like_lqr_commit(
+                y_hat_norm=y_hat_norm[veh_cyc_mask],
+                current_pos=current_pos[veh_cyc_mask],
+                current_head=current_head[veh_cyc_mask],
+                exec_pos_history=exec_pos_history[veh_cyc_mask],
+                exec_head_history=exec_head_history[veh_cyc_mask],
+                exec_valid_history=exec_valid_history[veh_cyc_mask],
+                agent_type=agent_type[veh_cyc_mask],
+            )
+            commit_pos[veh_cyc_mask] = veh_commit_pos
+            commit_head[veh_cyc_mask] = veh_commit_head
+            next_pos[veh_cyc_mask] = veh_next_pos
+            next_head[veh_cyc_mask] = veh_next_head
+
+        if ped_mask.any():
+            ped_commit_pos, ped_commit_head, ped_next_pos, ped_next_head = self._execute_pedestrian_lqr_commit(
+                y_hat_norm=y_hat_norm[ped_mask],
+                current_pos=current_pos[ped_mask],
+                current_head=current_head[ped_mask],
+                exec_pos_history=exec_pos_history[ped_mask],
+                exec_head_history=exec_head_history[ped_mask],
+                exec_valid_history=exec_valid_history[ped_mask],
+                agent_type=agent_type[ped_mask],
+            )
+            commit_pos[ped_mask] = ped_commit_pos
+            commit_head[ped_mask] = ped_commit_head
+            next_pos[ped_mask] = ped_next_pos
+            next_head[ped_mask] = ped_next_head
+
+        if raw_mask.any():
+            raw_commit_pos, raw_commit_head, raw_next_pos, raw_next_head = self.commit(
+                y_hat_norm=y_hat_norm[raw_mask],
+                current_pos=current_pos[raw_mask],
+                current_head=current_head[raw_mask],
+            )
+            commit_pos[raw_mask] = raw_commit_pos
+            commit_head[raw_mask] = raw_commit_head
+            next_pos[raw_mask] = raw_next_pos
+            next_head[raw_mask] = raw_next_head
+
+        return commit_pos, commit_head, next_pos, next_head

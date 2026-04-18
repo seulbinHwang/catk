@@ -1045,7 +1045,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         next_pos_act[stop_mask_act] = stop_next_pos_act
                         next_head_act[stop_mask_act] = stop_next_head_act
 
-                lqr_mask_act = ((active_agent_type == 0) | (active_agent_type == 2)) & (~stop_mask_act)
+                lqr_mask_act = ((active_agent_type == 0) | (active_agent_type == 1) | (active_agent_type == 2)) & (~stop_mask_act)
                 if self.use_lqr and lqr_mask_act.any():
                     (
                         lqr_commit_pos_act,
@@ -1082,7 +1082,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 if self.closed_loop_rollout_mode == "matched_token_chunk":
                     restore_mask_act = ~stop_mask_act
                     if self.use_lqr:
-                        restore_mask_act = restore_mask_act & (~((active_agent_type == 0) | (active_agent_type == 2)))
+                        restore_mask_act = restore_mask_act & (~lqr_mask_act)
                     if restore_mask_act.any():
                         (
                             restored_commit_pos_act,

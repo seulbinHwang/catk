@@ -43,10 +43,10 @@ def _build_zero_output(reference: Tensor) -> Dict[str, Tensor]:
 
 
 class DraftLQRRegularizer(nn.Module):
-    """실행된 첫 0.5초를 그대로 GT와 맞추는 LQR penalty 입니다.
+    """실행된 첫 0.5초를 그대로 GT와 맞추는 commit penalty 입니다.
 
     이 모듈은 raw 2초 미래를 그대로 비교하지 않습니다.
-    먼저 현재 runtime과 같은 LQR 실행 경로로 다음 0.5초 5개 점을 만든 뒤,
+    먼저 현재 runtime과 같은 commit bridge 실행 경로로 다음 0.5초 5개 점을 만든 뒤,
     그 결과를 현재 flow target과 같은 local 정규화 표현으로 바꿔
     GT 첫 0.5초와 평균 제곱 오차로 비교합니다.
 
@@ -149,10 +149,10 @@ class DraftLQRRegularizer(nn.Module):
 
         Returns:
             Tensor:
-                vehicle 또는 bicycle 인지 나타내는 마스크입니다.
+                vehicle / pedestrian / bicycle 인지 나타내는 마스크입니다.
                 shape은 ``[n_valid_anchor]`` 입니다.
         """
-        return (packed_agent_type.long() == 0) | (packed_agent_type.long() == 2)
+        return (packed_agent_type.long() == 0) | (packed_agent_type.long() == 1) | (packed_agent_type.long() == 2)
 
     def _build_commit_local_norm(
         self,
