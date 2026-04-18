@@ -59,7 +59,7 @@ model_config:
       bicycle_steer_max_rad: 0.90
       vehicle_steer_rate_max_radps: 0.8
       bicycle_steer_rate_max_radps: 1.4
-      soft_weight: 0.5
+      soft_weight: 0.75
       compare_softness_to_gt: false
       pedestrian_heading_weight: 0.05
       pedestrian_heading_speed_threshold_mps: 0.5
