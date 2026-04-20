@@ -638,7 +638,7 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 
 - learning rate: `2e-4`
 - max epochs: `32`
-- train batch size: `24`
+- train batch size: `48`
 - val batch size: `16`
 - validation 주기: `16` epoch마다
 
@@ -711,6 +711,40 @@ checkpoint 선택은 보통 아래처럼 하면 됩니다.
 - pretrain run의 best 성능 checkpoint를 쓰려면 `epoch_XXX.ckpt`
 - 가장 마지막 저장 상태를 쓰려면 `last.ckpt`
 - validation 직전까지 포함한 가장 최근 train epoch 상태를 쓰려면 `epoch_last.ckpt`
+
+### 5.8 4x A100 80GB 에서 DRaFT fine-tuning
+
+6x H100 이 아닌 **4x A100 80GB (SXM4)** 박스에서 같은 DRaFT fine-tuning 을 돌리고 싶을 때 쓰는 별도 preset 입니다.
+
+- preset 파일: `configs/experiment/finetune_draft_flow_a100x4.yaml`
+- 자세한 실행 방법 / 하이퍼파라미터 선택 이유 / OOM 디버깅 순서: [`docs/A100x4_finetune_draft_flow_README.md`](docs/A100x4_finetune_draft_flow_README.md)
+
+요약만 보면 아래와 같습니다.
+
+- `train_batch_size=36` (실측 max), `accumulate_grad_batches=2`, `trainer.devices=4` -> effective global batch **`288`** (6xH100 preset `288` 과 정확히 동일, 따라서 lr 도 그대로 `2e-4`).
+- `max_epochs(=32)`, `check_val_every_n_epoch(=16)` 은 6xH100 preset 과 동일.
+- `val_batch_size=8` 로 줄이고 `n_rollout_closed_val=16` / `n_batch_sim_agents_metric=10` 은 유지해서 정기 eval 이 OOM 없이 돕니다.
+- **bs 상한의 원인은 메모리가 아닙니다**. A100 (sm_80) 의 flash / memory-efficient SDPA kernel 이 `ChunkStepRefiner` 의 self-attention 에서 큰 batch 일 때 `invalid configuration argument` 로 터지는 kernel grid-dim 한계입니다. bs=36 일 때 peak 48 GiB / 80 GiB 로 VRAM 은 남아돕니다.
+- 위 crash 를 완전히 없애기 위해 **`src/smart/modules/flow_local_decoder.py` 의 `ChunkStepRefiner` self-attention 만 math-SDPA kernel 로 강제하는 소폭 패치**를 포함했습니다. 실측 결과 bs=36 에서 500 step 이상 안정 + step time 도 오히려 약 20% 단축. 상세: [`docs/A100x4_finetune_draft_flow_README.md`](docs/A100x4_finetune_draft_flow_README.md) 5장.
+- 실행 예시:
+
+```bash
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m src.run \
+  experiment=finetune_draft_flow_a100x4 \
+  action=finetune \
+  trainer=ddp \
+  trainer.devices=4 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path="$PRETRAIN_CKPT" \
+  task_name=flow_semi_continuous_finetune_inv_best_a_100_a100x4
+```
 
 ## 6. 평가와 추론
 

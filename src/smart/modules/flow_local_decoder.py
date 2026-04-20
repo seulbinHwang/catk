@@ -6,6 +6,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch_cluster import radius_graph
 from torch_geometric.utils import subgraph
 
@@ -21,6 +22,14 @@ from src.smart.utils import (
     transform_to_local,
     wrap_angle,
 )
+
+# On sm_80 (A100) the flash / memory-efficient SDPA kernels inside
+# `nn.MultiheadAttention` can exceed their grid-dim limit on pathological
+# DRaFT batches with many agents, causing
+# `RuntimeError: CUDA error: invalid configuration argument` even when VRAM
+# is not close to full. `ChunkStepRefiner` only attends over seq_len=5, so
+# forcing the math SDPA kernel here is cheap and avoids that failure mode.
+_SDPA_SAFE_BACKENDS = [SDPBackend.MATH]
 
 
 @dataclass
@@ -587,7 +596,8 @@ class ChunkStepRefiner(nn.Module):
 
         step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
         attn_in = self.attn_norm(step_tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        with sdpa_kernel(_SDPA_SAFE_BACKENDS):
+            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
         step_tokens = step_tokens + attn_out
         step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
         step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)
