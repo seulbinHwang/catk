@@ -701,6 +701,38 @@ checkpoint 선택은 보통 아래처럼 하면 됩니다.
 - 가장 마지막 저장 상태를 쓰려면 `last.ckpt`
 - validation 직전까지 포함한 가장 최근 train epoch 상태를 쓰려면 `epoch_last.ckpt`
 
+### 5.8 4x A100 80GB 에서 DRaFT fine-tuning
+
+6x H100 이 아닌 **4x A100 80GB (SXM4)** 박스에서 같은 DRaFT fine-tuning 을 돌리고 싶을 때 쓰는 별도 preset 입니다.
+
+- preset 파일: `configs/experiment/finetune_draft_flow_a100x4.yaml`
+- 자세한 실행 방법 / 하이퍼파라미터 선택 이유 / OOM 디버깅 순서: [`docs/A100x4_finetune_draft_flow_README.md`](docs/A100x4_finetune_draft_flow_README.md)
+
+요약만 보면 아래와 같습니다.
+
+- `train_batch_size=32`, `accumulate_grad_batches=2`, `trainer.devices=4` → effective global batch `256` (6xH100 preset 의 `288` 과 비슷).
+- `lr`, `max_epochs(=32)`, `check_val_every_n_epoch(=16)` 은 6xH100 preset 과 동일.
+- `val_batch_size=8` 로 줄이고 `n_rollout_closed_val=16` / `n_batch_sim_agents_metric=10` 은 유지해서 정기 eval 이 OOM 없이 돕니다.
+- 실행 예시:
+
+```bash
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m src.run \
+  experiment=finetune_draft_flow_a100x4 \
+  action=finetune \
+  trainer=ddp \
+  trainer.devices=4 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path="$PRETRAIN_CKPT" \
+  task_name=flow_semi_continuous_finetune_inv_best_a_100_a100x4
+```
+
 ## 6. 평가와 추론
 
 ### 6.1 Validation set closed-loop 평가

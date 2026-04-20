@@ -1,0 +1,135 @@
+# @package _global_
+
+# ============================================================================
+# DRaFT fine-tuning preset for 4x A100 80GB (SXM4) boxes.
+# Derived from `finetune_draft_flow.yaml` (6x H100 80GB preset).
+# ----------------------------------------------------------------------------
+# Key differences vs. the 6x H100 preset:
+#   * fewer devices (4 vs 6)  -> smaller global batch even at the same per-GPU size
+#   * A100 bf16 kernels use slightly more activation memory than H100 (no TE),
+#     so per-GPU train batch is lowered to give a safety margin and avoid
+#     step-to-step fragmentation OOMs with `expandable_segments:True`.
+#   * gradient accumulation is used to recover a global batch close to the
+#     original 6xH100 setting, so the loss landscape and LR choice stay valid.
+#   * validation batch and closed-loop rollout settings are tuned so the
+#     periodic `check_val_every_n_epoch` eval never OOMs on A100 80GB while
+#     still using meaningful rollouts for the Sim Agents metric.
+#
+# Effective global batch size on this preset:
+#   per_gpu_batch * num_gpus * accumulate_grad_batches = 32 * 4 * 2 = 256
+#   (6xH100 preset used 48 * 6 * 1 = 288 -- very close, so lr is kept.)
+#
+# If you want to match 288 exactly, set:
+#   data.train_batch_size=36 trainer.accumulate_grad_batches=2   (36*4*2=288)
+# or
+#   data.train_batch_size=24 trainer.accumulate_grad_batches=3   (24*4*3=288)
+# (see README_A100x4.md for the LR scaling rule used here).
+# ============================================================================
+
+defaults:
+  - override /model: smart_flow
+
+model:
+  model_config:
+    # Optimizer / scheduler --------------------------------------------------
+    # Effective batch 256 vs 288 on the original preset -> we keep lr=2e-4
+    # because the difference is ~11% and DRaFT fine-tuning is not
+    # particularly batch-size sensitive (the LR scale rule suggests
+    # 2e-4 * 256/288 = 1.78e-4, which is within the noise).
+    lr: 2e-4
+    lr_warmup_steps: 2
+    lr_min_ratio: 1e-2
+
+    # Validation ------------------------------------------------------------
+    # `n_rollout_closed_val` is kept at 16 (same as 6xH100 preset) because
+    # the Sim Agents 2025 scorer expects 32 rollouts per scenario and the
+    # closed-loop rollout loop in smart_flow.py auto-chunks the rollouts
+    # when it hits OOM. 16 rollouts on A100 80GB with val_batch_size=8
+    # comfortably fits.
+    n_rollout_closed_val: 16
+    # Keep the 2025 sim-agents metric on; metric workers are capped to 2
+    # to avoid RAM pressure with 4 DDP ranks * multiprocess scoring.
+    n_batch_sim_agents_metric: 10
+    sim_agents_metric_workers: 2
+    val_open_loop: true
+    val_closed_loop: true
+
+    finetune:
+      enabled: true
+      train_full_flow_decoder_only: true
+
+    draft:
+      enabled: true
+      start_epoch: 0
+      ramp_epochs: 32
+      max_weight: 0.1
+      sampling:
+        sample_steps: 16
+        sample_method: midpoint
+        noise_scale: 1.0
+        # backprop_last_k stays at 12/16 (same as H100 preset). If OOM is
+        # ever hit during the DRaFT backprop, drop this to 8 or 6 before
+        # touching the batch size.
+        backprop_last_k: 12
+      physics:
+        force_fp32: true
+        dt: 0.1
+        pos_scale_m: 20.0
+        speed_floor_mps: 0.5
+        vehicle_v_max_mps: 35.0
+        vehicle_a_max_mps2: 8.0
+        vehicle_lat_accel_max_mps2: 4.2
+        bicycle_v_max_mps: 22.0
+        bicycle_a_max_mps2: 5.5
+        bicycle_lat_accel_max_mps2: 4.4
+        pedestrian_v_max_mps: 5.0
+        pedestrian_a_max_mps2: 4.7
+        vehicle_wheelbase_scale: 0.60
+        bicycle_wheelbase_scale: 0.85
+        vehicle_steer_max_rad: 0.55
+        bicycle_steer_max_rad: 0.90
+        vehicle_steer_rate_max_radps: 0.8
+        bicycle_steer_rate_max_radps: 1.4
+        pedestrian_heading_weight: 0.05
+        pedestrian_heading_speed_threshold_mps: 0.5
+        eps: 1.0e-6
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  # Same relative val budget as the 6xH100 preset. With 4 GPUs this covers
+  # about 44097*0.1/4/8 ~= 138 val batches per rank per eval.
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 16
+  # Epoch count is intentionally kept at 32 (user request: do not reduce).
+  max_epochs: 32
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+  # Restore a global-batch close to the 6xH100 preset (288) without blowing
+  # per-GPU memory. 32 * 4 * 2 = 256.
+  accumulate_grad_batches: 2
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  # Per-GPU train batch. Picked so that:
+  #   - train step fits in ~55-65 GiB on a single A100 80GB with bf16-mixed,
+  #     leaving headroom for CUDA graph / allocator fragmentation.
+  #   - a single DRaFT rollout with backprop_last_k=12 out of 16 steps
+  #     still fits without triggering the OOM-retry path.
+  train_batch_size: 32
+  # Per-GPU validation batch. Closed-loop rollout memory scales with
+  # val_batch_size * n_rollout_closed_val (=128 rollouts materialized per
+  # rank at once). 8 is the largest value we verified without OOM on A100.
+  val_batch_size: 8
+  test_batch_size: 8
+  # With 4 DDP ranks * 4 workers = 16 loader processes; fits in <32 GiB
+  # of page-locked CPU memory on this box.
+  num_workers: 4
+  prefetch_factor: 2
+  train_use_eval_agent_selection: true
