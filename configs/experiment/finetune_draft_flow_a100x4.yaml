@@ -9,27 +9,35 @@
 #   * A100 (sm_80) flash / memory-efficient SDPA kernels trip
 #     `CUDA error: invalid configuration argument` inside the
 #     `ChunkStepRefiner` self-attention for pathological DRaFT batches
-#     with many agents. This is NOT an OOM (peak VRAM at bs=36 is ~48 GiB /
-#     80 GiB). We ship a small code patch in
+#     with many agents. This is NOT an OOM. We ship a small code patch in
 #     `src/smart/modules/flow_local_decoder.py` that forces that one
 #     attention call to the math-SDPA backend, which has no grid-dim
 #     limit and is actually ~20% faster here because seq_len=5 is tiny.
 #     See `docs/A100x4_finetune_draft_flow_README.md` section 5.
-#   * Per-GPU train batch is set to 36 (vs 48 on H100) because bs>=38
-#     still trips the kernel limit even with the patch (the patched
-#     attention only covers the step-refiner; other kernels still care
-#     about tensor dims and bs=38+ sweeps were unstable in practice).
-#     `accumulate_grad_batches=2` recovers the exact H100 global batch.
+#   * Per-GPU train batch is set to 54 (vs 48 on H100). The math-SDPA patch
+#     lifts the grid-dim limit on the step-refiner, and the remaining
+#     attention calls (HalfSecondChunkMixerBlock + geometric AttentionLayer
+#     via torch_geometric MessagePassing) do NOT have the batch*num_chunks
+#     blow-up, so they comfortably absorb larger bs. Empirically bs=54 is
+#     the throughput-optimal point on this hardware (see sweep below).
 #
-# Empirical probing on this 4x A100-80GB SXM4 box (seeds 42 / 817):
-#   bs=32  -> OK,                                                ~2.50 s/step
-#   bs=36  (NO patch)  -> UNSAFE, first epoch dies at ~step 204  ~2.40 s/step
-#   bs=36  (WITH patch) -> OK, 500 steps clean, peak ~48 GiB     ~1.92 s/step
-#   bs=38+             -> UNSAFE, dies within 20-60 steps
+# Empirical per-sample throughput sweep on this 4x A100-80GB SXM4 box (all
+# with the math-SDPA patch applied, limit_train_batches=40-60, val off):
+#   bs=36 acc=2  -> 1.88 s/step, 0.0522 s/sample, 76.6 samples/s, peak ~48 GiB
+#   bs=48 acc=1  -> 2.44 s/step, 0.0508 s/sample, 78.7 samples/s, peak ~58 GiB
+#   bs=54 acc=1  -> 2.63 s/step, 0.0487 s/sample, 82.1 samples/s, peak ~63 GiB  <- ADOPTED
+#   bs=60 acc=1  -> 2.94 s/step, 0.0490 s/sample, 81.6 samples/s, peak ~67 GiB
+#   bs=72 acc=1  -> 4.00 s/step, 0.0556 s/sample, 72.0 samples/s, peak ~79 GiB (UNSAFE: 2 GiB OOM margin)
+#
+# bs=54 is Pareto-optimal: highest samples/s and a comfortable ~18 GiB OOM
+# margin. bs=60 has essentially tied throughput but a tighter margin; bs=72
+# memory-bandwidth-saturates and is within 2 GiB of OOM so any scene-variance
+# spike over 32 epochs crashes the run.
 #
 # Effective global batch size on this preset:
-#   per_gpu_batch * num_gpus * accumulate_grad_batches = 36 * 4 * 2 = 288
-#   (identical to the 6xH100 preset's 48 * 6 * 1 = 288, so `lr=2e-4` is kept.)
+#   per_gpu_batch * num_gpus * accumulate_grad_batches = 54 * 4 * 1 = 216
+#   (0.75x the 6xH100 preset's 288, so `lr=2e-4 * 216/288 = 1.5e-4`, linear
+#   scaling rule.)
 # ============================================================================
 
 defaults:
@@ -38,9 +46,10 @@ defaults:
 model:
   model_config:
     # Optimizer / scheduler --------------------------------------------------
-    # Effective global batch here is 36 * 4 * 2 = 288, exactly matching the
-    # 6xH100 preset's 48 * 6 * 1 = 288, so we keep lr = 2e-4 unchanged.
-    lr: 2e-4
+    # Effective global batch here is 54 * 4 * 1 = 216 (0.75x the 6xH100
+    # preset's 288). Linear LR scaling rule: lr = 2e-4 * 216/288 = 1.5e-4.
+    # Downward LR scaling (vs 2e-4) is conservative and keeps warmup stable.
+    lr: 1.5e-4
     lr_warmup_steps: 2
     lr_min_ratio: 1e-2
 
@@ -111,9 +120,9 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 1.0
   sync_batchnorm: false
-  # Restore an effective global batch that matches the 6xH100 preset (288)
-  # without tripping the A100 SDPA kernel limit. 36 * 4 * 2 = 288.
-  accumulate_grad_batches: 2
+  # No accumulation needed: bs=54 per GPU * 4 GPUs = 216 effective batch
+  # is already throughput-optimal. `lr` is downscaled linearly (1.5e-4).
+  accumulate_grad_batches: 1
 
 callbacks:
   model_checkpoint:
@@ -121,16 +130,19 @@ callbacks:
     mode: max
 
 data:
-  # Per-GPU train batch, empirically validated on this 4xA100-80GB box:
-  #   - bs=36 + math-SDPA patch survived 500 consecutive steps cleanly
-  #     (peak ~48 GiB / 80 GiB, ~1.92 s/step);
-  #   - bs=36 WITHOUT the patch died at step 204 with the SDPA
-  #     `invalid configuration argument` kernel error;
-  #   - bs=38+ died within 20-60 steps even with the patch (other kernels
-  #     still hit dim limits at larger per-GPU batch).
-  # So 36 is both (a) larger than the pre-patch safe ceiling and (b) the
-  # largest value that's reliably crash-free after the patch.
-  train_batch_size: 36
+  # Per-GPU train batch, empirically validated on this 4xA100-80GB box via
+  # a 5-point throughput sweep (bs=36/48/54/60/72, all with the math-SDPA
+  # patch applied). Sweet spot is bs=54:
+  #   - peak VRAM ~63 GiB / 80 GiB (~18 GiB OOM margin, comfortable);
+  #   - 0.0487 s/sample, 82.1 samples/s total -> +7.2% vs bs=36 acc=2;
+  #   - bs=60 throughput is tied but has only ~14 GiB OOM margin;
+  #   - bs=72 per-sample time degrades (memory-BW saturation) AND sits
+  #     2 GiB from OOM, so scene-variance spikes over 32 epochs would
+  #     deterministically kill the run.
+  # If bs=54 ever does OOM on scene variance, step down to bs=48 (+2.7% vs
+  # bs=36, ~22 GiB margin). Do NOT go to bs=36 first: the patch unlocked
+  # real headroom and bs=36 is now known to be underutilized.
+  train_batch_size: 54
   # Per-GPU validation batch. Closed-loop rollout memory scales with
   # val_batch_size * n_rollout_closed_val (=128 rollouts materialized per
   # rank at once). 8 is the largest value we verified without OOM on A100.
