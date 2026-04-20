@@ -277,6 +277,22 @@ torchrun \
 
 `flow_window_steps=80` 으로 학습할 때는 6x H100 80GB 에서 `data.train_batch_size=14` 를 쓰세요.
 
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=pre_bc_flow \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_semi_continuous_pretrain_h1006 \
+  model.model_config.decoder.flow_window_steps=80 \
+  data.train_batch_size=14
+```
+
 ### 5.1 학습 설정을 거칠게 이해하는 법
 
 - 기본 진입점은 `configs/run.yaml`이고, 여기서 `data/model/callbacks/logger/trainer/paths/hydra`를 조합합니다.
