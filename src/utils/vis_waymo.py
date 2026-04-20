@@ -62,7 +62,8 @@ class VisWaymo:
         n_step: int = 91,
         step_current: int = 10,
         vis_ghost_gt: bool = True,
-        vis_flow_2s_preview: bool = False,
+        vis_flow_preview: bool = False,
+        flow_preview_commit_steps: int = 5,
     ) -> None:
         self.px_per_m = px_per_m
         self.video_size = video_size
@@ -70,7 +71,8 @@ class VisWaymo:
         self.step_current = step_current
         self.px_agent2bottom = video_size // 2
         self.vis_ghost_gt = vis_ghost_gt
-        self.vis_flow_2s_preview = vis_flow_2s_preview
+        self.vis_flow_preview = vis_flow_preview
+        self.flow_preview_commit_steps = max(1, int(flow_preview_commit_steps))
 
         # colors
         self.lane_style = [
@@ -304,8 +306,8 @@ class VisWaymo:
                 ag_size,
                 ag_role,
             )
-            if self.vis_flow_2s_preview and flow_preview is not None:
-                self._draw_flow_2s_preview(
+            if self.vis_flow_preview and flow_preview is not None:
+                self._draw_flow_preview(
                     images=images,
                     flow_preview_traj=flow_preview["traj"][:, i_rollout],
                     flow_preview_valid=flow_preview["valid"][:, i_rollout],
@@ -315,7 +317,7 @@ class VisWaymo:
             self.video_paths.append(_video_path)
             save_images_to_mp4(images, _video_path)
 
-    def _draw_flow_2s_preview(
+    def _draw_flow_preview(
         self,
         images: List[np.ndarray],
         flow_preview_traj: np.ndarray,
@@ -331,7 +333,7 @@ class VisWaymo:
             return
 
         for future_frame_idx in range(num_future_frames):
-            block_idx = min(future_frame_idx // 5, num_blocks - 1)
+            block_idx = min(future_frame_idx // self.flow_preview_commit_steps, num_blocks - 1)
             frame = images[self.step_current + 1 + future_frame_idx]
             for agent_idx in range(flow_preview_traj.shape[0]):
                 if not bool(flow_preview_valid[agent_idx, block_idx]):

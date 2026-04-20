@@ -50,23 +50,22 @@ def flow_matching_loss(flow_pred_norm: torch.Tensor, flow_target_norm: torch.Ten
     return F.mse_loss(flow_pred_norm, flow_target_norm)
 
 
-def ade_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
+def ade_future(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
     if pred_clean_norm.numel() == 0:
         return pred_clean_norm.new_zeros(())
     diff_xy = (pred_clean_norm[..., :2] - target_clean_norm[..., :2]) * 20.0
     return torch.norm(diff_xy, dim=-1).mean()
 
 
-def fde_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
+def fde_future(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
     if pred_clean_norm.numel() == 0:
         return pred_clean_norm.new_zeros(())
     diff_xy = (pred_clean_norm[:, -1, :2] - target_clean_norm[:, -1, :2]) * 20.0
     return torch.norm(diff_xy, dim=-1).mean()
 
 
-
-def yaw_ade_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
-    """2초 전체 구간의 평균 방향 오차를 degree 단위로 계산합니다.
+def yaw_ade_future(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
+    """전체 미래 구간의 평균 방향 오차를 degree 단위로 계산합니다.
 
     Args:
         pred_clean_norm: 모델이 만든 정규화된 미래입니다.
@@ -85,8 +84,8 @@ def yaw_ade_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -
     return diff_head.mul(180.0 / torch.pi).mean()
 
 
-def yaw_fde_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
-    """2초 마지막 시점의 방향 오차를 degree 단위로 계산합니다.
+def yaw_fde_future(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
+    """마지막 시점의 방향 오차를 degree 단위로 계산합니다.
 
     Args:
         pred_clean_norm: 모델이 만든 정규화된 미래입니다.
@@ -103,3 +102,19 @@ def yaw_fde_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -
     target_head = torch.atan2(target_clean_norm[:, -1, 3], target_clean_norm[:, -1, 2])
     diff_head = wrap_angle(pred_head - target_head).abs()
     return diff_head.mul(180.0 / torch.pi).mean()
+
+
+def ade_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
+    return ade_future(pred_clean_norm, target_clean_norm)
+
+
+def fde_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
+    return fde_future(pred_clean_norm, target_clean_norm)
+
+
+def yaw_ade_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
+    return yaw_ade_future(pred_clean_norm, target_clean_norm)
+
+
+def yaw_fde_2s(pred_clean_norm: torch.Tensor, target_clean_norm: torch.Tensor) -> torch.Tensor:
+    return yaw_fde_future(pred_clean_norm, target_clean_norm)

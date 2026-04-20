@@ -11,7 +11,7 @@ model_config:
   n_vis_scenario: 0
   n_vis_rollout: 0
   vis_ghost_gt: false
-  vis_flow_2s_preview: true
+  vis_flow_preview: true
   delete_local_videos_after_wandb_upload: false
   val_open_loop: true
   val_closed_loop: true
@@ -20,6 +20,7 @@ model_config:
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
+    flow_window_steps: ${model.model_config.decoder.flow_window_steps}
     map_token_sampling:
       num_k: 1
       temp: 1.0
@@ -79,6 +80,7 @@ model_config:
     time_span: 30
     num_historical_steps: 11
     num_future_steps: 80
+    flow_window_steps: 20
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2

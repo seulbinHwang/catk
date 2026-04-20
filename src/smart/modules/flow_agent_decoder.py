@@ -17,7 +17,12 @@ from src.smart.modules.flow_local_decoder import (
     FlowODE,
     HierarchicalFlowDecoder,
 )
-from src.smart.utils import angle_between_2d_vectors, transform_to_global, wrap_angle
+from src.smart.utils import (
+    angle_between_2d_vectors,
+    transform_to_global,
+    validate_flow_window_steps,
+    wrap_angle,
+)
 
 
 class SMARTFlowAgentDecoder(SMARTAgentEncoder):
@@ -27,6 +32,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         hidden_dim: int,
         num_historical_steps: int,
         num_future_steps: int,
+        flow_window_steps: int,
         time_span: int | None,
         pl2a_radius: float,
         a2a_radius: float,
@@ -62,6 +68,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             hist_drop_prob=hist_drop_prob,
             n_token_agent=n_token_agent,
         )
+        self.flow_window_steps = validate_flow_window_steps(
+            flow_window_steps=flow_window_steps,
+            commit_steps=self.shift,
+            num_future_steps=num_future_steps,
+        )
         self.r_a2a_emb = FourierEmbedding(
             input_dim=5,
             hidden_dim=hidden_dim,
@@ -70,8 +81,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.flow_decoder = HierarchicalFlowDecoder(
             context_dim=hidden_dim,
             flow_dim=flow_dim,
+            num_future_steps=self.flow_window_steps,
             num_chunk_heads=flow_num_chunk_heads,
             num_chunk_layers=flow_num_chunk_layers,
+            chunk_size=self.shift,
         )
         self.flow_ode = FlowODE(
             eps=flow_solver_eps,
@@ -88,9 +101,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.use_stationary_refinement_in_dynamics_bridge = bool(
             use_stationary_refinement_in_dynamics_bridge
         )
-        self.commit_bridge = ContinuousCommitBridge()
+        self.commit_bridge = ContinuousCommitBridge(commit_steps=self.shift)
         self.dynamics_commit_bridge = (
             DynamicsAwareFeasibleCommitBridge(
+                preview_steps=self.flow_window_steps,
+                commit_steps=self.shift,
                 use_stationary_refinement=self.use_stationary_refinement_in_dynamics_bridge
             )
             if self.use_dynamics_feasible_commit_bridge
@@ -318,7 +333,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
         if anchor_hidden_valid.numel() == 0:
-            return anchor_hidden_valid.new_zeros((0, 20, 4))
+            return anchor_hidden_valid.new_zeros((0, self.flow_window_steps, 4))
 
         generator = None
         if sampling_seed is not None:
@@ -327,7 +342,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         x_init_norm = torch.randn(
             anchor_hidden_valid.shape[0],
-            20,
+            self.flow_window_steps,
             4,
             device=anchor_hidden_valid.device,
             dtype=anchor_hidden_valid.dtype,
@@ -536,7 +551,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
 
         if flow_clean_norm.numel() == 0:
-            empty = flow_clean_norm.new_zeros((0, 20, 4))
+            empty = flow_clean_norm.new_zeros((0, self.flow_window_steps, 4))
             return {
                 "flow_pred_norm": empty,
                 "flow_target_norm": empty,
@@ -803,7 +818,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         pred_flow_2s_valid = None
         if return_flow_2s_preview:
             pred_flow_2s_traj = torch.zeros(
-                (n_agent, n_step_future_2hz, 20, 2),
+                (n_agent, n_step_future_2hz, self.flow_window_steps, 2),
                 dtype=pos_window.dtype,
                 device=pos_window.device,
             )
@@ -812,7 +827,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 dtype=torch.bool,
                 device=pos_window.device,
             )
-        sample_window_steps = 20
+        sample_window_steps = self.flow_window_steps
         rollout_noise_tape = self._build_rollout_noise_tape(
             num_agent=n_agent,
             tape_steps=n_step_future_10hz + sample_window_steps - self.shift,
@@ -886,8 +901,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             next_pos = pos_window[:, -1].clone()
             next_head = head_window[:, -1].clone()
             next_token_idx = pred_idx_window[:, -1].clone()
-            commit_traj_step = pred_traj_10hz.new_zeros((n_agent, 5, 2))
-            commit_head_step = pred_head_10hz.new_zeros((n_agent, 5))
+            commit_traj_step = pred_traj_10hz.new_zeros((n_agent, self.shift, 2))
+            commit_head_step = pred_head_10hz.new_zeros((n_agent, self.shift))
 
             if active_mask.any():
                 active_hidden = current_hidden[active_mask]
@@ -1011,8 +1026,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 exec_head_pair_10hz[active_mask, 1] = commit_head_act[:, -1]
                 exec_valid_pair_10hz[active_mask] = True
 
-            pred_traj_10hz[:, t * 5 : (t + 1) * 5] = commit_traj_step
-            pred_head_10hz[:, t * 5 : (t + 1) * 5] = commit_head_step
+            pred_traj_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_traj_step
+            pred_head_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_head_step
 
             next_valid = active_mask.clone()
             coarse_pos_list.append(next_pos.clone())
@@ -1080,6 +1095,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)
         out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz.shape[1])
         if return_flow_2s_preview:
+            out_dict["pred_flow_preview_traj"] = pred_flow_2s_traj
+            out_dict["pred_flow_preview_valid"] = pred_flow_2s_valid
             out_dict["pred_flow_2s_traj"] = pred_flow_2s_traj
             out_dict["pred_flow_2s_valid"] = pred_flow_2s_valid
         return out_dict

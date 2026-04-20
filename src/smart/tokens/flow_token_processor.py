@@ -7,11 +7,30 @@ from torch import Tensor
 from torch_geometric.data import HeteroData
 
 from src.smart.tokens.token_processor import TokenProcessor
-from src.smart.utils import transform_to_local
+from src.smart.utils import transform_to_local, validate_flow_window_steps
 
 
 class FlowTokenProcessor(TokenProcessor):
     """Flow 학습용 목표와 DRaFT용 보조 메타데이터를 만듭니다."""
+
+    def __init__(
+        self,
+        map_token_file: str,
+        agent_token_file: str,
+        map_token_sampling,
+        agent_token_sampling,
+        flow_window_steps: int = 20,
+    ) -> None:
+        super().__init__(
+            map_token_file=map_token_file,
+            agent_token_file=agent_token_file,
+            map_token_sampling=map_token_sampling,
+            agent_token_sampling=agent_token_sampling,
+        )
+        self.flow_window_steps = validate_flow_window_steps(
+            flow_window_steps=flow_window_steps,
+            commit_steps=self.shift,
+        )
 
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         """지도 토큰과 에이전트 토큰을 만들고 flow 목표를 붙입니다.
@@ -92,7 +111,7 @@ class FlowTokenProcessor(TokenProcessor):
 
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
-                future_valid = valid[:, raw_step + 1 : raw_step + 21].all(dim=1)
+                future_valid = self._build_anchor_future_valid(valid=valid, raw_step=raw_step)
                 anchor_mask = current_valid & future_valid
                 train_anchor_mask = anchor_mask & train_mask
                 flow_train_mask[:, anchor_offset] = train_anchor_mask
@@ -172,7 +191,7 @@ class FlowTokenProcessor(TokenProcessor):
         flow_eval_chunks: List[Tensor] = []
         for anchor_offset, raw_step in enumerate(raw_current_steps):
             current_valid = valid[:, raw_step]
-            future_valid = valid[:, raw_step + 1 : raw_step + 21].all(dim=1)
+            future_valid = self._build_anchor_future_valid(valid=valid, raw_step=raw_step)
             anchor_mask = current_valid & future_valid
             flow_eval_mask[:, anchor_offset] = anchor_mask
             if not anchor_mask.any():
@@ -201,6 +220,13 @@ class FlowTokenProcessor(TokenProcessor):
         )
         return tokenized_agent
 
+    def _build_anchor_future_valid(self, valid: Tensor, raw_step: int) -> Tensor:
+        future_start = raw_step + 1
+        future_end = future_start + self.flow_window_steps
+        if future_end > valid.shape[1]:
+            return torch.zeros(valid.shape[0], device=valid.device, dtype=torch.bool)
+        return valid[:, future_start:future_end].all(dim=1)
+
     def _build_anchor_clean_norm(
         self,
         pos: Tensor,
@@ -226,8 +252,20 @@ class FlowTokenProcessor(TokenProcessor):
                 정규화된 2초 미래 목표입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
                 마지막 차원은 ``[x, y, cos, sin]`` 순서입니다.
         """
-        future_pos = pos[anchor_mask, raw_step + 1 : raw_step + 21]
-        future_head = heading[anchor_mask, raw_step + 1 : raw_step + 21]
+        if not anchor_mask.any():
+            return pos.new_zeros((0, self.flow_window_steps, 4))
+
+        future_start = raw_step + 1
+        future_end = future_start + self.flow_window_steps
+        if future_end > pos.shape[1]:
+            raise ValueError(
+                "Requested flow future window exceeds the available sequence length: "
+                f"raw_step={raw_step}, flow_window_steps={self.flow_window_steps}, "
+                f"n_step={pos.shape[1]}."
+            )
+
+        future_pos = pos[anchor_mask, future_start:future_end]
+        future_head = heading[anchor_mask, future_start:future_end]
         future_pos_local, future_head_local = transform_to_local(
             pos_global=future_pos,
             head_global=future_head,
@@ -348,7 +386,7 @@ class FlowTokenProcessor(TokenProcessor):
                 유효한 anchor가 없으면 ``[0, 20, 4]`` 빈 텐서를 돌려줍니다.
         """
         if len(chunks) == 0:
-            return torch.zeros((0, 20, 4), device=device, dtype=dtype)
+            return torch.zeros((0, self.flow_window_steps, 4), device=device, dtype=dtype)
         return torch.cat(chunks, dim=0)
 
     def _concat_vector_chunks(

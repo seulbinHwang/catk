@@ -298,6 +298,8 @@ torchrun ... -m src.run \
 - `model.model_config.val_closed_loop=true/false`로 closed-loop validation on/off를 바꿉니다.
 - validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
 - `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. 현재 `pre_bc_flow` 기본값은 `32`입니다.
+- `model.model_config.decoder.flow_window_steps`는 flow matching이 한 번에 생성하는 10Hz 미래 길이입니다. 기본값은 `20` step, 즉 `2초`입니다. 
+- `5`의 배수여야 하며 `decoder.num_future_steps`보다 클 수 없습니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
 - `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true/false`로
   vehicle / bicycle용 dynamics-aware feasible commit bridge를 켜거나 끕니다.
@@ -429,7 +431,7 @@ torchrun \
 - `model.model_config.n_vis_scenario`: 각 batch에서 저장할 scenario 수. 보통 `1~2`부터 시작하고, 현재 batch 크기 이하로 두면 됩니다.
 - `model.model_config.n_vis_rollout`: 각 scenario에서 저장할 rollout 영상 수. 보통 `1~2`부터 시작하고, `n_rollout_closed_val` 이하로 두면 됩니다.
 - `model.model_config.vis_ghost_gt=true|false`: rollout 비디오에서 미래 GT agent를 연한 ghost overlay로 같이 그릴지 정합니다. `false`면 `rollout_XX.mp4`에서는 이 연한 GT overlay를 숨기고 sampled rollout만 보입니다. `gt.mp4` 자체는 그대로 저장됩니다.
-- `model.model_config.vis_flow_2s_preview=true|false`: rollout 비디오에서 각 0.5초 closed-loop step마다 네트워크가 raw로 생성한 2초 / 20점 future를 overlay로 그릴지 정합니다. `true`면 `rollout_XX.mp4`에서 현재 decision block에 해당하는 raw 20점 궤적이 함께 보입니다.
+- `model.model_config.vis_flow_preview=true|false`: rollout 비디오에서 각 0.5초 closed-loop step마다 네트워크가 raw로 생성한 future를 overlay로 그릴지 정합니다. 길이는 `model.model_config.decoder.flow_window_steps`를 따릅니다. 기존 `vis_flow_2s_preview`도 호환됩니다.
 - `model.model_config.delete_local_videos_after_wandb_upload=true|false`: `wandb`에 비디오를 넘긴 뒤 `logs/.../videos/` 아래 원본 mp4를 지울지 결정합니다. `wandb` logger를 쓰지 않으면 지우지 않습니다.
 - 저장 위치는 `logs/<task_name>/runs/<timestamp>/videos/batch_XX-scenario_YY/` 이고, 각 폴더 아래에 `gt.mp4`, `rollout_00.mp4`, `rollout_01.mp4`, ... 형태로 생깁니다. `gt.mp4`는 GT, `rollout_XX.mp4`는 sampled closed-loop rollout입니다. 단, `delete_local_videos_after_wandb_upload=true`면 upload 직후 이 원본 mp4는 자동 삭제될 수 있습니다.
 - `logger=wandb` 상태면 생성된 mp4가 W&B에도 같이 기록됩니다. `logger.wandb.offline=True`면 먼저 로컬 `wandb/`에 저장되고, 이후 `wandb sync`로 올리면 됩니다.
@@ -451,7 +453,7 @@ torchrun \
   model.model_config.n_vis_scenario=2 \
   model.model_config.n_vis_rollout=2 \
   model.model_config.vis_ghost_gt=false \
-  model.model_config.vis_flow_2s_preview=true \
+  model.model_config.vis_flow_preview=true \
   model.model_config.delete_local_videos_after_wandb_upload=true
 ```
 
@@ -472,6 +474,9 @@ torchrun \
 ```
 
 학습 중 W&B에는 기본적으로 아래 metric이 기록됩니다.
+
+open-loop metric suffix의 `2s`는 기본 horizon 기준이며, `model.model_config.decoder.flow_window_steps`를 바꾸면
+`1s`, `1p5s`, `3s` 같은 suffix로 자동 변경됩니다.
 
 - `train/loss`
 - `train/ADE2s`
@@ -1049,7 +1054,7 @@ python -m src.run \
   model.model_config.n_vis_scenario=5 \
   model.model_config.n_vis_rollout=5 \
   model.model_config.vis_ghost_gt=false \
-  model.model_config.vis_flow_2s_preview=true \
+  model.model_config.vis_flow_preview=true \
   model.model_config.delete_local_videos_after_wandb_upload=true
 ```
 

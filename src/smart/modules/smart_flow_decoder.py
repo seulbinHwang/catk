@@ -35,7 +35,8 @@ class SMARTFlowDecoder(nn.Module):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
-        closed_loop_rollout_mode: str,
+        closed_loop_rollout_mode: str = "raw_fm",
+        flow_window_steps: int = 20,
         use_dynamics_feasible_commit_bridge: bool = False,
         use_stationary_refinement_in_dynamics_bridge: bool = False,
     ) -> None:
@@ -53,6 +54,7 @@ class SMARTFlowDecoder(nn.Module):
             hidden_dim=hidden_dim,
             num_historical_steps=num_historical_steps,
             num_future_steps=num_future_steps,
+            flow_window_steps=flow_window_steps,
             time_span=time_span,
             pl2a_radius=pl2a_radius,
             a2a_radius=a2a_radius,

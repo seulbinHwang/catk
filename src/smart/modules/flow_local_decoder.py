@@ -226,6 +226,11 @@ class NormalizedNoisyFutureEncoder(nn.Module):
         tau: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size = x_t_norm.shape[0]
+        if x_t_norm.shape[1] != self.num_steps:
+            raise ValueError(
+                "NormalizedNoisyFutureEncoder expected "
+                f"{self.num_steps} future steps, got {x_t_norm.shape[1]}."
+            )
 
         tau_emb = self.tau_mlp(tau.unsqueeze(-1))
         step_tokens = self.step_proj(x_t_norm)
@@ -347,12 +352,28 @@ class HierarchicalFlowDecoder(nn.Module):
         self,
         context_dim: int,
         flow_dim: int,
+        num_future_steps: int = 20,
         num_chunk_heads: int = 4,
         num_chunk_layers: int = 2,
+        chunk_size: int = 5,
     ) -> None:
         super().__init__()
+        if int(num_future_steps) <= 0:
+            raise ValueError(f"num_future_steps must be positive, got {num_future_steps}.")
+        if int(chunk_size) <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+        if int(num_future_steps) % int(chunk_size) != 0:
+            raise ValueError(
+                "num_future_steps must be divisible by chunk_size, "
+                f"got {num_future_steps} and {chunk_size}."
+            )
+        num_chunks = int(num_future_steps) // int(chunk_size)
         self.context_projector = AnchorContextProjector(context_dim, flow_dim)
-        self.noisy_future_encoder = NormalizedNoisyFutureEncoder(flow_dim=flow_dim)
+        self.noisy_future_encoder = NormalizedNoisyFutureEncoder(
+            flow_dim=flow_dim,
+            num_chunks=num_chunks,
+            chunk_size=int(chunk_size),
+        )
         self.chunk_mixers = nn.ModuleList(
             [
                 HalfSecondChunkMixerBlock(flow_dim=flow_dim, num_heads=num_chunk_heads)
@@ -427,6 +448,10 @@ class HierarchicalFlowDecoder(nn.Module):
 class ContinuousCommitBridge:
     """Bridge continuous flow output back to SMART coarse rollout state."""
 
+    def __init__(self, commit_steps: int = 5, pos_scale_m: float = 20.0) -> None:
+        self.commit_steps = int(commit_steps)
+        self.pos_scale_m = float(pos_scale_m)
+
     @staticmethod
     def _select_token_chunk_local(
         next_token_idx: torch.Tensor,
@@ -463,8 +488,8 @@ class ContinuousCommitBridge:
         current_pos: torch.Tensor,
         current_head: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        first_chunk = y_hat_norm[:, :5].clone()
-        first_chunk[..., :2] = first_chunk[..., :2] * 20.0
+        first_chunk = y_hat_norm[:, : self.commit_steps].clone()
+        first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m
 
         cos_sin = F.normalize(first_chunk[..., 2:4], dim=-1)
         delta_head = torch.atan2(cos_sin[..., 1], cos_sin[..., 0])

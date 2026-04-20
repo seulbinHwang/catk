@@ -16,11 +16,11 @@ from torch.optim.lr_scheduler import LambdaLR
 from src.smart.metrics import SimAgentsMetrics, SimAgentsSubmission, minADE
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
-    ade_2s,
-    fde_2s,
+    ade_future,
+    fde_future,
     flow_matching_loss,
-    yaw_ade_2s,
-    yaw_fde_2s,
+    yaw_ade_future,
+    yaw_fde_future,
 )
 from src.smart.modules.draft_physics import (
     DRAFT_PHYSICS_ACTUAL_UNIT_KEYS,
@@ -30,6 +30,7 @@ from src.smart.modules.draft_physics import (
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
+from src.smart.utils.flow_horizon import format_flow_horizon_tag
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -44,6 +45,8 @@ class SMARTFlow(LightningModule):
         self.lr_total_steps = model_config.lr_total_steps
         self.lr_min_ratio = model_config.lr_min_ratio
         self.num_historical_steps = model_config.decoder.num_historical_steps
+        self.flow_window_steps = int(getattr(model_config.decoder, "flow_window_steps", 20))
+        self.flow_horizon_tag = format_flow_horizon_tag(self.flow_window_steps)
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
@@ -53,6 +56,11 @@ class SMARTFlow(LightningModule):
             **model_config.decoder,
             n_token_agent=self.token_processor.n_token_agent,
         )
+        if self.flow_window_steps != int(self.token_processor.flow_window_steps):
+            raise ValueError(
+                "decoder.flow_window_steps and token_processor.flow_window_steps must match, "
+                f"got {self.flow_window_steps} and {int(self.token_processor.flow_window_steps)}."
+            )
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
         self.minADE = minADE()
@@ -74,11 +82,29 @@ class SMARTFlow(LightningModule):
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
         self.vis_ghost_gt = bool(getattr(model_config, "vis_ghost_gt", True))
-        self.vis_flow_2s_preview = bool(getattr(model_config, "vis_flow_2s_preview", False))
+        self.vis_flow_2s_preview = bool(
+            getattr(
+                model_config,
+                "vis_flow_preview",
+                getattr(model_config, "vis_flow_2s_preview", False),
+            )
+        )
         self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
+        self.open_metric_names = {
+            "ade": f"ADE{self.flow_horizon_tag}",
+            "fde": f"FDE{self.flow_horizon_tag}",
+            "yaw_ade": f"yaw_ADE{self.flow_horizon_tag}",
+            "yaw_fde": f"yaw_FDE{self.flow_horizon_tag}",
+        }
+        self.train_open_metric_names = {
+            "ade": self.open_metric_names["ade"],
+            "fde": self.open_metric_names["fde"],
+            "yaw_ade": f"ADEyaw{self.flow_horizon_tag}",
+            "yaw_fde": f"FDEyaw{self.flow_horizon_tag}",
+        }
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
@@ -155,10 +181,10 @@ class SMARTFlow(LightningModule):
 
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
-                "ADE2s": WeightedMeanMetric(),
-                "FDE2s": WeightedMeanMetric(),
-                "yaw_ADE2s": WeightedMeanMetric(),
-                "yaw_FDE2s": WeightedMeanMetric(),
+                self.open_metric_names["ade"]: WeightedMeanMetric(),
+                self.open_metric_names["fde"]: WeightedMeanMetric(),
+                self.open_metric_names["yaw_ade"]: WeightedMeanMetric(),
+                self.open_metric_names["yaw_fde"]: WeightedMeanMetric(),
             }
         )
 
@@ -293,19 +319,19 @@ class SMARTFlow(LightningModule):
         """
         with torch.no_grad():
             return {
-                "ADE2s": ade_2s(
+                self.open_metric_names["ade"]: ade_future(
                     pred_clean_norm.detach(),
                     target_clean_norm.detach(),
                 ),
-                "FDE2s": fde_2s(
+                self.open_metric_names["fde"]: fde_future(
                     pred_clean_norm.detach(),
                     target_clean_norm.detach(),
                 ),
-                "yaw_ADE2s": yaw_ade_2s(
+                self.open_metric_names["yaw_ade"]: yaw_ade_future(
                     pred_clean_norm.detach(),
                     target_clean_norm.detach(),
                 ),
-                "yaw_FDE2s": yaw_fde_2s(
+                self.open_metric_names["yaw_fde"]: yaw_fde_future(
                     pred_clean_norm.detach(),
                     target_clean_norm.detach(),
                 ),
@@ -749,8 +775,8 @@ class SMARTFlow(LightningModule):
             flow_preview = None
             if return_flow_2s_preview:
                 flow_preview = {
-                    "traj": pred["pred_flow_2s_traj"].unsqueeze(1),
-                    "valid": pred["pred_flow_2s_valid"].unsqueeze(1),
+                    "traj": pred["pred_flow_preview_traj"].unsqueeze(1),
+                    "valid": pred["pred_flow_preview_valid"].unsqueeze(1),
                 }
             return (
                 pred["pred_traj_10hz"].unsqueeze(1),
@@ -792,12 +818,12 @@ class SMARTFlow(LightningModule):
         if return_flow_2s_preview:
             flow_preview = {
                 "traj": self._reshape_parallel_rollout_prediction(
-                    pred["pred_flow_2s_traj"],
+                    pred["pred_flow_preview_traj"],
                     repeat_count=chunk_size,
                     num_agent=num_agent,
                 ),
                 "valid": self._reshape_parallel_rollout_prediction(
-                    pred["pred_flow_2s_valid"],
+                    pred["pred_flow_preview_valid"],
                     repeat_count=chunk_size,
                     num_agent=num_agent,
                 ),
@@ -1309,19 +1335,33 @@ open_metric_dict:
 
         self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/loss_fm", fm_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/ADE2s", open_metric_dict["ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/FDE2s", open_metric_dict["FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log(
-            "train/ADEyaw2s",
-            open_metric_dict["yaw_ADE2s"],
+            f"train/{self.train_open_metric_names['ade']}",
+            open_metric_dict[self.open_metric_names["ade"]],
             on_step=False,
             on_epoch=True,
             sync_dist=True,
             batch_size=1,
         )
         self.log(
-            "train/FDEyaw2s",
-            open_metric_dict["yaw_FDE2s"],
+            f"train/{self.train_open_metric_names['fde']}",
+            open_metric_dict[self.open_metric_names["fde"]],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['yaw_ade']}",
+            open_metric_dict[self.open_metric_names["yaw_ade"]],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['yaw_fde']}",
+            open_metric_dict[self.open_metric_names["yaw_fde"]],
             on_step=False,
             on_epoch=True,
             sync_dist=True,
@@ -1410,7 +1450,8 @@ open_metric_dict:
                         scenario_path=data["tfrecord_path"][scen_idx],
                         save_dir=self.video_dir / f"batch_{batch_idx:02d}-scenario_{scen_idx:02d}",
                         vis_ghost_gt=self.vis_ghost_gt,
-                        vis_flow_2s_preview=self.vis_flow_2s_preview,
+                        vis_flow_preview=self.vis_flow_2s_preview,
+                        flow_preview_commit_steps=self.encoder.agent_encoder.shift,
                     )
                     vis.save_video_scenario_rollout(
                         scenario_rollouts[scen_idx],
