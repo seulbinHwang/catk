@@ -268,7 +268,7 @@ torchrun \
 
 `pre_bc_flow` 기본 `data.train_batch_size=28` 는 6x H100 80GB 에서 OOM 없이 throughput 을 최대로 끌어올리도록 실측으로 맞춘 값입니다.
 
-- 측정 조건: 이 레포 `scripts/probe_batch_size.sh` (커스텀 `ProbeTimingCallback`) 로 per-step `peak_reserved` 와 `sec/step` 을 DDP 6-GPU 에서 직접 측정.
+- 측정 조건: 커스텀 Lightning callback 으로 per-step `peak_reserved` 와 `sec/step` 을 DDP 6-GPU 에서 직접 측정.
 - `train_batch_size=20` (이전 기본): 500-step 기준 step 당 0.92s, peak reserved 약 49% -> 여유는 많지만 throughput 손해.
 - `train_batch_size=28` (현재 기본): 500-step 기준 step 당 1.21s, peak reserved 최대 약 83% -> baseline 대비 epoch 당 약 6.5% 단축 (`H100x6` 기준 64 epoch 환산 약 4시간 절약).
 - `train_batch_size=30`: 500-step 기준 peak reserved 약 88% 까지 올라 OOM margin 이 얇습니다.
