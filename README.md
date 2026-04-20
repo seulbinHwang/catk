@@ -713,7 +713,8 @@ checkpoint 선택은 보통 아래처럼 하면 됩니다.
 - `train_batch_size=36` (실측 max), `accumulate_grad_batches=2`, `trainer.devices=4` → effective global batch **`288`** (6xH100 preset `288` 과 정확히 동일, 따라서 lr 도 그대로 `2e-4`).
 - `max_epochs(=32)`, `check_val_every_n_epoch(=16)` 은 6xH100 preset 과 동일.
 - `val_batch_size=8` 로 줄이고 `n_rollout_closed_val=16` / `n_batch_sim_agents_metric=10` 은 유지해서 정기 eval 이 OOM 없이 돕니다.
-- **bs 상한의 원인은 메모리가 아니라** `F.scaled_dot_product_attention` 의 A100 kernel 한계입니다 (bs≥38 에서 `invalid configuration argument`). 메모리는 bs=36 일 때 peak 48 GiB / 80 GiB 로 여유 있습니다.
+- **bs 상한의 원인은 메모리가 아닙니다**. A100 (sm_80) 의 flash / memory-efficient SDPA kernel 이 `ChunkStepRefiner` 의 self-attention 에서 큰 batch 일 때 `invalid configuration argument` 로 터지는 kernel grid-dim 한계입니다. bs=36 일 때 peak 48 GiB / 80 GiB 로 VRAM 은 남아돕니다.
+- 위 crash 를 완전히 없애기 위해 **`src/smart/modules/flow_local_decoder.py` 의 `ChunkStepRefiner` self-attention 만 math-SDPA kernel 로 강제하는 소폭 패치**를 포함했습니다. 실측 결과 bs=36 에서 500 step 이상 안정 + step time 도 오히려 약 20% 단축. 상세: [`docs/A100x4_finetune_draft_flow_README.md`](docs/A100x4_finetune_draft_flow_README.md) 5장.
 - 실행 예시:
 
 ```bash

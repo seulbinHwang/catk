@@ -7,9 +7,13 @@
 요약:
 
 - H100 6장 → A100 4장으로 옮기면서 **GPU 개수가 2장 줄었고**, 장당 VRAM 은 그대로 80GB 입니다.
-- 이 preset 의 `train_batch_size=36` 은 **실제 장비에서 직접 80 step 돌려보며 찾은 실측 최대값**입니다.
-  bs=38 / 40 / 48 은 `F.scaled_dot_product_attention` 의 CUDA kernel 이
-  `invalid configuration argument` 로 터집니다 (OOM 아님, kernel grid-dim 한계). 자세한 swap table 은 4장 참고.
+- 이 preset 의 `train_batch_size=36` 은 **실제 장비에서 돌려보며 찾은 실측 최대값**입니다.
+  bs=38 / 40 / 48 은 `F.scaled_dot_product_attention` 의 A100 (sm_80) kernel 이
+  `invalid configuration argument` 로 무작위 step 에서 터집니다 (OOM 아님, kernel grid-dim 한계).
+- 또한 **`src/smart/modules/flow_local_decoder.py` 에 소폭 패치**를 적용해
+  `ChunkStepRefiner` 의 self-attention 만 math-SDPA kernel 로 고정합니다.
+  패치 없이 bs=36 을 쓰면 ~204 step 근처에서 위와 같은 CUDA 에러로 학습이 통째로 죽습니다 (실측).
+  패치 적용 후에는 같은 bs=36 에서 500 step 이상 안정적으로 돕니다 (실측). swap table 과 패치 세부 설명은 4장 / 5장 참고.
 - Effective global batch 는 `accumulate_grad_batches=2` 로
   `36 × 4 × 2 = 288` 을 맞춰서 6xH100 preset 의 `48 × 6 × 1 = 288` 과 **정확히 동일**하게 유지합니다.
   → learning rate 는 원래 값 `2e-4` 를 그대로 씁니다 (linear-scaling 보정 불필요).
@@ -69,15 +73,16 @@ torchrun \
 
 ### 2.1 실측 batch-size sweep (4x A100 80GB)
 
-`seed=817`, `trainer.limit_train_batches=N` (N=10~80), val off, peak `nvidia-smi` 기준입니다.
+`seed=817 / 42`, `trainer.limit_train_batches=N` (짧은 건 N=10~20, 긴 건 N=80~500), val off,
+peak `nvidia-smi` 기준입니다.
 
-| per-GPU `train_batch_size` | 결과 | peak GPU memory | step time |
-|:--|:--|:--|:--|
-| 32 | OK (4 step 확인) | ~45 GiB / 80 GiB | ~2.50 s/step |
-| **36 (채택)** | **OK (80 step 확인)** | **~48 GiB / 80 GiB** | **~2.40 s/step** |
-| 38 | **UNSAFE** — 20 step 까지는 괜찮다가 60 step 안에 rank 1 SDPA kernel error |  | |
-| 40 | **UNSAFE** — 초반 2~4 step 안에 rank0/rank3 중 하나가 SDPA kernel error |  | |
-| 48 (H100 원본) | **UNSAFE** — step 1 안에 SDPA kernel error |  | |
+| per-GPU `train_batch_size` | 코드 패치 없이 | 코드 패치 적용 후 | peak GPU memory | step time |
+|:--|:--|:--|:--|:--|
+| 32 | OK (4 step 확인) | 미측정 | ~45 GiB / 80 GiB | ~2.50 s/step |
+| **36 (채택)** | **UNSAFE** — 80 step 에선 OK 지만 첫 epoch 의 204 step 근처에서 rank 1 에서 SDPA kernel error | **OK (500 step 확인, 크래시 0)** | ~48 GiB / 80 GiB | **~1.92 s/step** (패치 후) |
+| 38 | **UNSAFE** — 20~60 step 안에 rank 1 SDPA kernel error | (미사용) | | |
+| 40 | **UNSAFE** — 초반 2~4 step 안에 rank0/rank3 중 하나가 SDPA kernel error | (미사용) | | |
+| 48 (H100 원본) | **UNSAFE** — step 1 안에 SDPA kernel error | (미사용) | | |
 
 에러 메시지는 모두
 
@@ -88,9 +93,16 @@ RuntimeError: CUDA error: invalid configuration argument
 
 이고, `HierarchicalFlowDecoder.step_refiner` 의 `nn.MultiheadAttention` 호출 시점입니다.
 `torch.backends.cuda.enable_flash_sdp(False)` 로 flash kernel 을 꺼봐도 동일하게 터져서,
-이 한계는 attention backend 선택이 아니라 **A100 (sm_80) 의 SDPA kernel 이
-`batch × chunk` 단위의 grid-dim 을 못 잡는 상한**으로 보입니다.
-즉 bs 를 36 으로 맞춰두는 게 **가장 공격적이면서 안전한** 값입니다.
+이 한계는 attention backend 선택 문제가 아니라 **A100 (sm_80) 의 flash / memory-efficient SDPA
+커널들이 `batch × num_chunks` 차원이 커지면 grid-dim limit (~65535 블록) 을 못 맞추는 구조적
+한계**로 보입니다. 문제 step 의 batch 에 agent 가 특별히 많은 scene 이 섞여 들어가면 발생하므로
+**step 수만 채우면 언젠가는 반드시 맞닥뜨리는 확률적 크래시**입니다 (bs=36 기준 epoch 의
+~6% 지점에서 한 번은 나옴).
+
+그래서 이 preset 은 `ChunkStepRefiner` 의 self-attention 만
+math kernel 로 강제하는 **작은 코드 패치**를 함께 적용합니다 (5장 참고). 이 패치 이후 bs=36 에서
+500 step 을 이어 돌려도 크래시가 없고, step time 도 오히려 `~2.40 s → ~1.92 s` 로 약 20% 빨라집니다
+(seq_len 이 5 뿐이라 math kernel 의 O(N^2) 비용이 flash 의 커널 launch overhead 보다 싸서 그렇습니다).
 
 ## 3. 왜 이렇게 정했나 (Why)
 
@@ -186,7 +198,31 @@ RuntimeError: CUDA error: invalid configuration argument
 ... model.model_config.n_batch_sim_agents_metric=4
 ```
 
-## 5. throughput 을 더 올리고 싶다면
+## 5. `ChunkStepRefiner` math-SDPA 패치
+
+**파일**: `src/smart/modules/flow_local_decoder.py`
+**범위**: 딱 `ChunkStepRefiner.forward` 안의 `self.attn(...)` 호출 한 줄
+**형태**: `with sdpa_kernel([SDPBackend.MATH]): attn_out, _ = self.attn(...)`
+
+왜 필요한가:
+
+- `HierarchicalFlowDecoder.step_refiner` 의 self-attention 은
+  `(batch_size × num_chunks, chunk_size=5, dim=96)` shape 로 attention 을 부릅니다.
+- DRaFT fine-tuning 중 어떤 batch 가 agent 가 많은 scene 을 여러 개 담으면
+  `batch_size × num_chunks` 가 A100 flash/mem-efficient SDPA kernel 의 grid-dim 상한을 넘어서
+  `RuntimeError: CUDA error: invalid configuration argument` 로 학습이 통째로 죽습니다 (2.1 참고).
+- 이 attention 은 seq_len 이 **5 밖에 안 돼서** math kernel (O(N^2) naïve 구현) 로 돌려도 비용이 거의 같고
+  오히려 flash 의 커널 launch overhead 가 사라져 **약 20% 더 빠릅니다** (실측).
+- `HalfSecondChunkMixerBlock` 의 self-attention 은 seq_len=16, batch=anchor_count 로 grid-dim 한계와
+  여유가 있어서 패치를 적용하지 않았습니다 (필요하면 같은 방식으로 감쌀 수 있음).
+
+패치의 부작용:
+
+- 모델 파라미터 / 초기화 / 그래디언트 경로 변화 없음 (kernel 선택만 바뀜).
+- H100 에서 돌려도 문제 없습니다 (math kernel 은 모든 device 에서 쓸 수 있고, 이 지점은 seq_len 이 작아 H100 에서도 math 가 느리지 않습니다).
+- checkpoint 호환성도 그대로입니다 (state_dict 구조가 변하지 않음).
+
+## 6. throughput 을 더 올리고 싶다면
 
 **주의**: 이 preset 에서 `train_batch_size=36` 은 임의 고른 값이 아니라 **실측 상한**입니다.
 A100 80GB 에는 메모리가 아직 ~30 GiB 남아 있지만,
@@ -209,7 +245,7 @@ throughput 을 키우고 싶으면 오히려 아래 방향이 안전합니다.
 `val_batch_size=8` 은 closed-loop rollout 16개가 함께 올라가는 상한이라서,
 더 키우려면 먼저 `n_rollout_closed_val` 을 같이 줄여야 합니다.
 
-## 6. 이 preset 을 튜닝할 때 참고할 것
+## 7. 이 preset 을 튜닝할 때 참고할 것
 
 - 이 preset 은 코드 변경 없이 **YAML 만으로** 4xA100 환경에 맞췄습니다. 기존
   6xH100 preset (`finetune_draft_flow.yaml`) 은 그대로 남아 있습니다.

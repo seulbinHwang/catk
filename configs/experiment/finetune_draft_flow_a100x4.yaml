@@ -6,24 +6,26 @@
 # ----------------------------------------------------------------------------
 # Key differences vs. the 6x H100 preset:
 #   * fewer devices (4 vs 6)
-#   * A100 has a stricter CUDA-grid / SDPA kernel limit than H100 for the
-#     step-refiner attention inside the flow decoder: `batch * num_chunks`
-#     tensors large enough in bs >= 38 sporadically trigger
-#     `CUDA error: invalid configuration argument` on the
-#     `F.scaled_dot_product_attention` call (both flash and
-#     memory-efficient kernels). This is NOT an OOM -- activation memory
-#     at bs=36 peaks around 48 GiB / 80 GiB.
-#   * So per-GPU train batch is lowered empirically from 48 to 36 and
-#     recovered with `accumulate_grad_batches=2` to match the H100
-#     preset's effective global batch exactly.
+#   * A100 (sm_80) flash / memory-efficient SDPA kernels trip
+#     `CUDA error: invalid configuration argument` inside the
+#     `ChunkStepRefiner` self-attention for pathological DRaFT batches
+#     with many agents. This is NOT an OOM (peak VRAM at bs=36 is ~48 GiB /
+#     80 GiB). We ship a small code patch in
+#     `src/smart/modules/flow_local_decoder.py` that forces that one
+#     attention call to the math-SDPA backend, which has no grid-dim
+#     limit and is actually ~20% faster here because seq_len=5 is tiny.
+#     See `docs/A100x4_finetune_draft_flow_README.md` section 5.
+#   * Per-GPU train batch is set to 36 (vs 48 on H100) because bs>=38
+#     still trips the kernel limit even with the patch (the patched
+#     attention only covers the step-refiner; other kernels still care
+#     about tensor dims and bs=38+ sweeps were unstable in practice).
+#     `accumulate_grad_batches=2` recovers the exact H100 global batch.
 #
-# Empirical probing on this 4x A100-80GB SXM4 box (seed 817, 80 steps,
-# peak mem via nvidia-smi):
-#   bs=32  -> OK,     peak ~ 45 GiB,  ~2.50 s/step
-#   bs=36  -> OK,     peak ~ 48 GiB,  ~2.40 s/step
-#   bs=38  -> UNSAFE, fails after ~20-60 steps with SDPA kernel error
-#   bs=40  -> UNSAFE, fails within the first few steps (SDPA kernel)
-#   bs=48  -> UNSAFE, fails within the first step (SDPA kernel)
+# Empirical probing on this 4x A100-80GB SXM4 box (seeds 42 / 817):
+#   bs=32  -> OK,                                                ~2.50 s/step
+#   bs=36  (NO patch)  -> UNSAFE, first epoch dies at ~step 204  ~2.40 s/step
+#   bs=36  (WITH patch) -> OK, 500 steps clean, peak ~48 GiB     ~1.92 s/step
+#   bs=38+             -> UNSAFE, dies within 20-60 steps
 #
 # Effective global batch size on this preset:
 #   per_gpu_batch * num_gpus * accumulate_grad_batches = 36 * 4 * 2 = 288
@@ -119,14 +121,15 @@ callbacks:
     mode: max
 
 data:
-  # Per-GPU train batch. Picked empirically from 80-step probing runs on
-  # this 4xA100-80GB SXM4 box (see header comment for the sweep table).
-  #   - bs=36 is the largest value that did not trip the step-refiner
-  #     SDPA `invalid configuration argument` kernel error during 80 steps
-  #     of DRaFT fine-tuning;
-  #   - bs=38 and bs=40 both failed stochastically (20-60 steps in);
-  #   - peak GPU memory at bs=36 was ~48 GiB / 80 GiB, so there is plenty
-  #     of headroom, the ceiling is NOT OOM but the SDPA kernel config.
+  # Per-GPU train batch, empirically validated on this 4xA100-80GB box:
+  #   - bs=36 + math-SDPA patch survived 500 consecutive steps cleanly
+  #     (peak ~48 GiB / 80 GiB, ~1.92 s/step);
+  #   - bs=36 WITHOUT the patch died at step 204 with the SDPA
+  #     `invalid configuration argument` kernel error;
+  #   - bs=38+ died within 20-60 steps even with the patch (other kernels
+  #     still hit dim limits at larger per-GPU batch).
+  # So 36 is both (a) larger than the pre-patch safe ceiling and (b) the
+  # largest value that's reliably crash-free after the patch.
   train_batch_size: 36
   # Per-GPU validation batch. Closed-loop rollout memory scales with
   # val_batch_size * n_rollout_closed_val (=128 rollouts materialized per

@@ -6,6 +6,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from src.smart.tokens.agent_token_matching import (
     build_agent_type_masks,
@@ -17,6 +18,15 @@ from src.smart.utils import (
     transform_to_local,
     wrap_angle,
 )
+
+# On sm_80 (A100) the flash / memory-efficient SDPA kernels inside
+# `nn.MultiheadAttention` have a hard grid-dim limit that `ChunkStepRefiner`
+# can exceed on pathological DRaFT fine-tuning batches, tripping
+# `RuntimeError: CUDA error: invalid configuration argument` unpredictably
+# even when VRAM is nowhere near full. The math kernel has no such limit
+# (seq_len here is only 5 so the quadratic cost is fine), so we force it
+# only for the step-refiner's self-attention.
+_SDPA_SAFE_BACKENDS = [SDPBackend.MATH]
 
 
 @dataclass
@@ -322,7 +332,8 @@ class ChunkStepRefiner(nn.Module):
 
         step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
         attn_in = self.attn_norm(step_tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        with sdpa_kernel(_SDPA_SAFE_BACKENDS):
+            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
         step_tokens = step_tokens + attn_out
         step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
         step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)
