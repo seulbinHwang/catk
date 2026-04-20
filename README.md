@@ -1242,3 +1242,47 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=sim_agents_sub_flow action=validate trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/model.ckpt task_name=flow_sim_agents_val_ddp6 trainer.limit_val_batches=1.0 model.model_config.val_open_loop=false model.model_config.val_closed_loop=true
 ```
+
+## Self-Forced N-Second Path-Flow Matching fine-tuning
+
+이 브랜치에는 **Self-Forced N-Second Path-Flow Matching (SF-NPFM)** 이라는 선택적 학습 경로가 추가되어 있습니다. 해당 기능은 `model.model_config.self_forced` 로 제어하며, `configs/model/smart_flow.yaml` 기본값에서는 꺼져 있습니다.
+
+horizon 은 8초로 고정되어 있지 않고, `model.model_config.decoder.flow_window_steps` 값에 연동됩니다. 10 Hz 기준으로 fine-tuning horizon 은 다음과 같이 계산됩니다.
+
+```text
+N 초 = flow_window_steps / 10
+K commit block 수 = flow_window_steps / 5
+```
+
+기본값인 `flow_window_steps: 20` 에서는 SF-NPFM 이 2초짜리 self-rollout 을 0.5초 commit/update block 4 개로 구성해 실행합니다. WOSAC 제출용 rollout 은 여전히 8초 inference loop 를 그대로 쓰지만, fine-tuning objective 자체는 pretrain 에서 사용한 flow window 안쪽에만 머뭅니다.
+
+### 추가되는 구성 요소
+
+- `F_rho`: fit 시작 시점에 pretrained `SMARTFlowDecoder` 를 복사해 만드는 frozen target path-flow teacher 입니다.
+- `F_psi`: `F_rho` 와 같은 pretrained decoder weight 로 초기화한 generated path-flow estimator 이며, detached committed self-rollout 위에서 online 으로 업데이트됩니다.
+- inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로.
+- `F_rho - F_psi` clean-path 방향으로 committed self-rollout 을 밀어주는 target-shift loss.
+- committed self-rollout 에 대해서만 걸리는 control-space physics regularization (선택 사항). `model.model_config.self_forced.use_control_space_physics_regularization` 로 제어합니다.
+- 약한 open-loop flow-matching anchor. `model.model_config.self_forced.anchor_weight` 로 제어합니다.
+
+최종 inference 모델은 여전히 fine-tuning 된 Generator 하나뿐입니다. `F_rho` 와 `F_psi` 는 학습 시점 보조 모델이며 submission export 에는 사용하지 않습니다.
+
+### Fine-tuning 설정 예시
+
+바로 쓰거나 수정해서 쓸 수 있는 설정 파일이 아래 경로에 있습니다.
+
+```text
+configs/experiment/self_forced_npfm.yaml
+```
+
+현재 설정의 `decoder.flow_window_steps` 와 같은 값으로 학습된 pretrained checkpoint 를 함께 넘겨 실행합니다.
+
+```bash
+python -m src.run experiment=self_forced_npfm ckpt_path=/path/to/pretrained.ckpt
+```
+
+이 구현은 WOSAC RMM 을 reward 나 optimization objective 로 사용하지 않습니다. 기존 closed-loop 평가 경로와 동일하게, RMM 은 validation / 리포팅 용도로만 쓸 수 있습니다.
+
+### 중요한 일관성 규칙
+
+fine-tuning 에 쓰는 rollout 과 inference 에 쓰는 rollout 은 반드시 같은 commit/update 규칙을 사용해야 합니다. fine-tuning 에서 `closed_loop_rollout_mode` 나 dynamics-aware feasible commit bridge 를 켰다면, validation / test / submission export 에서도 같은 설정을 유지해야 합니다.

@@ -761,8 +761,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "flow_anchor_step_id": flow_decoder_context["anchor_step_id"],
         }
 
-    @torch.no_grad()
-    def prepare_inference_cache(
+    def _prepare_rollout_cache_impl(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
@@ -892,6 +891,45 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "feat_a_t_dict": feat_a_t_dict,
         }
 
+    @torch.no_grad()
+    def prepare_inference_cache(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+    ) -> Dict[str, object]:
+        """평가와 제출에서 쓸 no-gradient rollout cache를 만듭니다.
+
+        Args:
+            tokenized_agent: 평가용 토큰 사전입니다. agent 축 shape은 ``[n_agent, ...]`` 입니다.
+            map_feature: 지도 인코더 출력입니다.
+
+        Returns:
+            Dict[str, object]: closed-loop rollout의 초기 상태 cache입니다.
+        """
+        return self._prepare_rollout_cache_impl(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+
+    def prepare_training_rollout_cache(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+    ) -> Dict[str, object]:
+        """self-forced 학습에서 gradient를 유지한 rollout cache를 만듭니다.
+
+        Args:
+            tokenized_agent: 평가 모드 기준 토큰 사전입니다. agent 축 shape은 ``[n_agent, ...]`` 입니다.
+            map_feature: 현재 Generator의 지도 인코더 출력입니다.
+
+        Returns:
+            Dict[str, object]: N초 self-rollout에 쓸 초기 cache입니다.
+        """
+        return self._prepare_rollout_cache_impl(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+
     def _clone_rollout_cache(self, rollout_cache: Dict[str, object]) -> Dict[str, object]:
         """rollout마다 달라지는 상태만 안전하게 복사합니다.
 
@@ -927,8 +965,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             }
         return cloned_cache
 
-    @torch.no_grad()
-    def rollout_from_cache(
+    def _rollout_from_cache_impl(
         self,
         rollout_cache: Dict[str, object],
         tokenized_agent: Dict[str, torch.Tensor],
@@ -937,6 +974,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         return_flow_2s_preview: bool = False,
+        rollout_steps_2hz: int | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -958,8 +996,19 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         state = self._clone_rollout_cache(rollout_cache)
 
         n_agent = int(state["n_agent"])
-        n_step_future_10hz = int(state["n_step_future_10hz"])
-        n_step_future_2hz = int(state["n_step_future_2hz"])
+        total_step_future_2hz = int(state["n_step_future_2hz"])
+        if rollout_steps_2hz is None:
+            n_step_future_2hz = total_step_future_2hz
+        else:
+            n_step_future_2hz = int(rollout_steps_2hz)
+            if n_step_future_2hz <= 0:
+                raise ValueError("rollout_steps_2hz must be positive.")
+            if n_step_future_2hz > total_step_future_2hz:
+                raise ValueError(
+                    "rollout_steps_2hz cannot exceed the full rollout length: "
+                    f"got {n_step_future_2hz} and {total_step_future_2hz}."
+                )
+        n_step_future_10hz = n_step_future_2hz * self.shift
         max_context_steps = int(state["max_context_steps"])
         pos_window = state["pos_window"]
         head_window = state["head_window"]
@@ -1290,6 +1339,148 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             out_dict["pred_flow_2s_traj"] = pred_flow_2s_traj
             out_dict["pred_flow_2s_valid"] = pred_flow_2s_valid
         return out_dict
+
+    @torch.no_grad()
+    def rollout_from_cache(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        sampling_scheme: DictConfig,
+        sampling_seed: int | None = None,
+        scenario_sampling_seeds: torch.Tensor | None = None,
+        return_flow_2s_preview: bool = False,
+        rollout_steps_2hz: int | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """평가와 제출에서 no-gradient closed-loop rollout을 실행합니다.
+
+        Args:
+            rollout_cache: ``prepare_inference_cache`` 가 만든 초기 상태입니다.
+            tokenized_agent: 평가용 토큰 사전입니다.
+            map_feature: 지도 인코더 출력입니다.
+            sampling_scheme: flow sampling 설정입니다.
+            sampling_seed: batch 공통 seed입니다.
+            scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            return_flow_2s_preview: preview 저장 여부입니다.
+            rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 8초를 실행합니다.
+
+        Returns:
+            Dict[str, torch.Tensor]: closed-loop rollout 결과입니다.
+        """
+        return self._rollout_from_cache_impl(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_scheme=sampling_scheme,
+            sampling_seed=sampling_seed,
+            scenario_sampling_seeds=scenario_sampling_seeds,
+            return_flow_2s_preview=return_flow_2s_preview,
+            rollout_steps_2hz=rollout_steps_2hz,
+        )
+
+    def training_rollout_from_cache(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        sampling_scheme: DictConfig,
+        sampling_seed: int | None = None,
+        scenario_sampling_seeds: torch.Tensor | None = None,
+        rollout_steps_2hz: int | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
+
+        Args:
+            rollout_cache: ``prepare_training_rollout_cache`` 가 만든 초기 상태입니다.
+            tokenized_agent: 평가 모드 기준 토큰 사전입니다.
+            map_feature: 현재 Generator의 지도 인코더 출력입니다.
+            sampling_scheme: flow sampling 설정입니다.
+            sampling_seed: batch 공통 seed입니다.
+            scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            rollout_steps_2hz: 실행할 0.5초 block 수입니다. 기본 self-forced 학습은
+                ``flow_window_steps / 5`` 를 넘깁니다.
+
+        Returns:
+            Dict[str, torch.Tensor]: N초 committed self-rollout 결과입니다.
+        """
+        return self._rollout_from_cache_impl(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_scheme=sampling_scheme,
+            sampling_seed=sampling_seed,
+            scenario_sampling_seeds=scenario_sampling_seeds,
+            return_flow_2s_preview=False,
+            rollout_steps_2hz=rollout_steps_2hz,
+        )
+
+    def path_flow_velocity_for_anchor0(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        path_noisy_norm: torch.Tensor,
+        tau: torch.Tensor,
+        anchor_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """첫 flow anchor의 noisy path에 대한 flow velocity를 예측합니다.
+
+        Args:
+            tokenized_agent: 평가 모드 기준 토큰 사전입니다.
+            map_feature: 이 decoder가 직접 만든 지도 특징입니다.
+            path_noisy_norm: noisy N초 path입니다. shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent 마스크입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            Dict[str, torch.Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다. 두 텐서 shape은
+            ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+        """
+        if path_noisy_norm.numel() == 0:
+            empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, 4))
+            return {"velocity": empty, "clean": empty}
+        if path_noisy_norm.shape[1:] != (self.flow_window_steps, 4):
+            raise ValueError(
+                "path_noisy_norm must have shape [n_valid_agent, flow_window_steps, 4], "
+                f"got {tuple(path_noisy_norm.shape)}."
+            )
+        if int(anchor_mask.sum().item()) != int(path_noisy_norm.shape[0]):
+            raise ValueError(
+                "anchor_mask true count must match path_noisy_norm first dim, "
+                f"got {int(anchor_mask.sum().item())} and {path_noisy_norm.shape[0]}."
+            )
+
+        single_anchor_mask = torch.zeros(
+            anchor_mask.shape[0],
+            13,
+            device=anchor_mask.device,
+            dtype=torch.bool,
+        )
+        single_anchor_mask[:, 0] = anchor_mask.bool()
+        ctx_hidden_pack = self._encode_context(
+            agent_token_index=tokenized_agent["ctx_sampled_idx"],
+            pos_a=tokenized_agent["ctx_sampled_pos"],
+            head_a=tokenized_agent["ctx_sampled_heading"],
+            mask=tokenized_agent["ctx_valid"],
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
+        flow_decoder_context = self._pack_flow_decoder_context(
+            tokenized_agent=tokenized_agent,
+            anchor_mask=single_anchor_mask,
+        )
+        velocity = self.flow_decoder(
+            anchor_hidden_valid,
+            path_noisy_norm,
+            tau,
+            current_pos=flow_decoder_context["current_pos"],
+            current_head=flow_decoder_context["current_head"],
+            agent_batch=flow_decoder_context["agent_batch"],
+            anchor_step_id=flow_decoder_context["anchor_step_id"],
+        )
+        clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
+        return {"velocity": velocity, "clean": clean}
 
     @torch.no_grad()
     def inference(

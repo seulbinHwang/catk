@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
 import math
@@ -26,6 +27,12 @@ from src.smart.modules.draft_physics import (
     DRAFT_PHYSICS_ACTUAL_UNIT_KEYS,
     DRAFT_PHYSICS_COMPONENT_KEYS,
     DraftPhysicsRegularizer,
+)
+from src.smart.modules.self_forced_path_flow import (
+    build_anchor0_normalized_committed_path,
+    build_anchor0_physics_inputs,
+    get_anchor0_valid_mask,
+    masked_mean_square_loss,
 )
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
@@ -178,6 +185,130 @@ class SMARTFlow(LightningModule):
             )
         else:
             self.draft_regularizer = None
+
+        self.self_forced_config = getattr(model_config, "self_forced", None)
+        self.self_forced_enabled = bool(
+            self.self_forced_config is not None
+            and getattr(self.self_forced_config, "enabled", False)
+        )
+        self.self_forced_start_epoch = (
+            int(getattr(self.self_forced_config, "start_epoch", 0))
+            if self.self_forced_config is not None
+            else 0
+        )
+        self.self_forced_weight = (
+            float(getattr(self.self_forced_config, "weight", 1.0))
+            if self.self_forced_config is not None
+            else 0.0
+        )
+        self.self_forced_path_step_size = (
+            float(getattr(self.self_forced_config, "path_step_size", 0.05))
+            if self.self_forced_config is not None
+            else 0.05
+        )
+        self.self_forced_anchor_weight = (
+            float(getattr(self.self_forced_config, "anchor_weight", 0.05))
+            if self.self_forced_config is not None
+            else 0.0
+        )
+        self.self_forced_generated_estimator_lr = (
+            float(getattr(self.self_forced_config, "generated_estimator_lr", self.lr))
+            if self.self_forced_config is not None
+            else self.lr
+        )
+        self.self_forced_estimator_updates_per_step = (
+            max(1, int(getattr(self.self_forced_config, "estimator_updates_per_step", 1)))
+            if self.self_forced_config is not None
+            else 1
+        )
+        self.self_forced_initialize_aux_on_fit_start = (
+            bool(getattr(self.self_forced_config, "initialize_aux_from_generator_on_fit_start", True))
+            if self.self_forced_config is not None
+            else True
+        )
+        self.self_forced_sampling = (
+            getattr(self.self_forced_config, "sampling", self.validation_rollout_sampling)
+            if self.self_forced_config is not None
+            else self.validation_rollout_sampling
+        )
+        self.self_forced_use_physics = (
+            bool(getattr(self.self_forced_config, "use_control_space_physics_regularization", False))
+            if self.self_forced_config is not None
+            else False
+        )
+        self.self_forced_physics_weight = (
+            float(getattr(self.self_forced_config, "physics_weight", 0.0))
+            if self.self_forced_config is not None
+            else 0.0
+        )
+        self.self_forced_physics_force_fp32 = False
+        self.self_forced_target_teacher = None
+        self.self_forced_generated_estimator = None
+        if self.self_forced_enabled:
+            self.automatic_optimization = False
+            self.strict_loading = False
+            self.self_forced_target_teacher = copy.deepcopy(self.encoder)
+            self.self_forced_target_teacher.requires_grad_(False)
+            self.self_forced_generated_estimator = copy.deepcopy(self.encoder)
+            physics_config = getattr(
+                self.self_forced_config,
+                "physics",
+                getattr(draft_config, "physics", None),
+            )
+            if self.self_forced_use_physics and physics_config is not None:
+                self.self_forced_physics_force_fp32 = bool(getattr(physics_config, "force_fp32", True))
+                self.self_forced_regularizer = DraftPhysicsRegularizer(
+                    dt=float(getattr(physics_config, "dt", 0.1)),
+                    pos_scale_m=float(getattr(physics_config, "pos_scale_m", 20.0)),
+                    speed_floor_mps=float(getattr(physics_config, "speed_floor_mps", 0.5)),
+                    vehicle_v_max_mps=float(getattr(physics_config, "vehicle_v_max_mps", 35.0)),
+                    vehicle_a_max_mps2=float(getattr(physics_config, "vehicle_a_max_mps2", 8.0)),
+                    vehicle_lat_accel_max_mps2=float(
+                        getattr(physics_config, "vehicle_lat_accel_max_mps2", 4.2)
+                    ),
+                    bicycle_v_max_mps=float(getattr(physics_config, "bicycle_v_max_mps", 22.0)),
+                    bicycle_a_max_mps2=float(getattr(physics_config, "bicycle_a_max_mps2", 5.5)),
+                    bicycle_lat_accel_max_mps2=float(
+                        getattr(physics_config, "bicycle_lat_accel_max_mps2", 4.4)
+                    ),
+                    pedestrian_v_max_mps=float(getattr(physics_config, "pedestrian_v_max_mps", 5.0)),
+                    pedestrian_a_max_mps2=float(getattr(physics_config, "pedestrian_a_max_mps2", 4.7)),
+                    vehicle_wheelbase_scale=float(getattr(physics_config, "vehicle_wheelbase_scale", 0.60)),
+                    bicycle_wheelbase_scale=float(getattr(physics_config, "bicycle_wheelbase_scale", 0.85)),
+                    vehicle_steer_max_rad=float(getattr(physics_config, "vehicle_steer_max_rad", 0.55)),
+                    bicycle_steer_max_rad=float(getattr(physics_config, "bicycle_steer_max_rad", 1.00)),
+                    vehicle_steer_rate_max_radps=float(
+                        getattr(physics_config, "vehicle_steer_rate_max_radps", 0.8)
+                    ),
+                    bicycle_steer_rate_max_radps=float(
+                        getattr(physics_config, "bicycle_steer_rate_max_radps", 1.5)
+                    ),
+                    soft_weight=float(
+                        getattr(
+                            physics_config,
+                            "soft_weight",
+                            getattr(
+                                physics_config,
+                                "vehicle_soft_weight",
+                                getattr(
+                                    physics_config,
+                                    "bicycle_soft_weight",
+                                    getattr(physics_config, "pedestrian_soft_weight", 0.25),
+                                ),
+                            ),
+                        )
+                    ),
+                    compare_softness_to_gt=bool(getattr(physics_config, "compare_softness_to_gt", False)),
+                    pedestrian_heading_weight=float(getattr(physics_config, "pedestrian_heading_weight", 0.05)),
+                    pedestrian_heading_speed_threshold_mps=float(
+                        getattr(physics_config, "pedestrian_heading_speed_threshold_mps", 0.5)
+                    ),
+                    eps=float(getattr(physics_config, "eps", 1e-6)),
+                )
+            else:
+                self.self_forced_regularizer = None
+        else:
+            self.self_forced_regularizer = None
 
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
@@ -1021,6 +1152,352 @@ class SMARTFlow(LightningModule):
             )
         return scenario_rollouts
 
+    def _is_self_forced_active(self) -> bool:
+        """현재 epoch에서 self-forced NPFM을 사용할지 판단합니다.
+
+        Returns:
+            bool: 설정이 켜져 있고 시작 epoch에 도달했으면 ``True`` 입니다.
+        """
+        return bool(
+            self.self_forced_enabled
+            and int(self.current_epoch) >= int(self.self_forced_start_epoch)
+            and self.self_forced_target_teacher is not None
+            and self.self_forced_generated_estimator is not None
+        )
+
+    def _sync_self_forced_auxiliary_models(self) -> None:
+        """Generator weight를 frozen teacher와 generated estimator의 시작점으로 복사합니다.
+
+        설명:
+            PDF의 Step 2와 Step 4.1을 코드로 옮긴 함수입니다. 학습 시작 시점에는
+            checkpoint가 이미 ``self.encoder`` 로 로드된 뒤이므로, 그 weight를 그대로
+            ``F_rho`` 와 ``F_psi`` 의 초기 weight로 씁니다. ``F_rho`` 는 이후 고정하고,
+            ``F_psi`` 는 generated self-rollout으로만 online 업데이트합니다.
+
+        Returns:
+            None
+        """
+        if not self.self_forced_enabled:
+            return
+        if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
+            return
+        if not self.self_forced_initialize_aux_on_fit_start:
+            return
+
+        encoder_state = self.encoder.state_dict()
+        self.self_forced_target_teacher.load_state_dict(encoder_state)
+        self.self_forced_generated_estimator.load_state_dict(encoder_state)
+        self.self_forced_target_teacher.requires_grad_(False)
+        self.self_forced_target_teacher.eval()
+        self.self_forced_generated_estimator.requires_grad_(True)
+        self.self_forced_generated_estimator.train()
+
+    def _set_token_processor_training_mode(self, is_training: bool) -> None:
+        """token processor의 train/eval 상태를 안전하게 바꿉니다.
+
+        Args:
+            is_training: ``True`` 면 train mode, ``False`` 면 eval mode로 둡니다.
+
+        Returns:
+            None
+        """
+        if is_training:
+            self.token_processor.train()
+        else:
+            self.token_processor.eval()
+
+    def _build_eval_tokenized_inputs(self, data) -> tuple[Dict[str, Tensor], Dict[str, Tensor]]:
+        """self-rollout 학습에 사용할 평가 모드 token을 만듭니다.
+
+        설명:
+            self-forced rollout은 실제 inference와 같은 agent selection과 0.5초 commit/update
+            규칙을 써야 합니다. 그래서 open-loop anchor 학습과 별도로 token processor를
+            잠깐 eval mode로 바꿔 평가용 token을 만든 뒤, 원래 mode로 되돌립니다.
+
+        Args:
+            data: 학습 batch입니다.
+
+        Returns:
+            tuple[Dict[str, Tensor], Dict[str, Tensor]]: map token과 agent token입니다.
+        """
+        was_training = self.token_processor.training
+        self._set_token_processor_training_mode(False)
+        tokenized_map, tokenized_agent = self.token_processor(data)
+        self._set_token_processor_training_mode(was_training)
+        return tokenized_map, tokenized_agent
+
+    def _get_self_forced_rollout_steps_2hz(self) -> int:
+        """flow_window_steps에 맞춘 0.5초 commit block 수를 계산합니다.
+
+        Returns:
+            int: ``flow_window_steps / 5`` 로 얻은 N초 self-rollout block 수입니다.
+        """
+        if self.flow_window_steps % 5 != 0:
+            raise ValueError(
+                "self-forced NPFM assumes flow_window_steps is divisible by 5, "
+                f"got {self.flow_window_steps}."
+            )
+        return max(1, int(self.flow_window_steps // 5))
+
+    def _sample_flow_state_from_clean(self, clean_path_norm: Tensor):
+        """현재 Generator의 flow path 규칙으로 noisy path와 target velocity를 만듭니다.
+
+        Args:
+            clean_path_norm: clean path입니다. shape은 ``[n_agent_valid, F_win, 4]`` 입니다.
+
+        Returns:
+            FlowSample: ``x_t``, ``target``, ``tau`` 를 담은 flow sample입니다.
+        """
+        return self.encoder.agent_encoder.flow_ode.sample(clean_path_norm, target_type="velocity")
+
+    def _predict_path_flow_clean_estimate(
+        self,
+        decoder: SMARTFlowDecoder,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        noisy_path_norm: Tensor,
+        tau: Tensor,
+        anchor_mask: Tensor,
+    ) -> Dict[str, Tensor]:
+        """주어진 decoder가 noisy N초 path를 어떻게 clean path로 보는지 계산합니다.
+
+        Args:
+            decoder: ``F_rho`` 또는 ``F_psi`` 역할의 decoder입니다.
+            tokenized_map: 평가 모드 map token 사전입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+            noisy_path_norm: noisy path입니다. shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
+        """
+        map_feature = decoder.encode_map(tokenized_map)
+        return decoder.path_flow_velocity_for_anchor0(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            path_noisy_norm=noisy_path_norm,
+            tau=tau,
+            anchor_mask=anchor_mask,
+        )
+
+    def _build_self_forced_zero_metrics(self, reference: Tensor) -> Dict[str, Tensor]:
+        """self-forced logging에 필요한 0 metric 사전을 만듭니다.
+
+        Args:
+            reference: device와 dtype을 맞출 기준 텐서입니다.
+
+        Returns:
+            Dict[str, Tensor]: self-forced loss 관련 0 scalar 사전입니다.
+        """
+        zero = reference.new_zeros(())
+        metric_dict = {
+            "sf_loss": zero,
+            "gen_estimator_loss": zero,
+            "physics_loss": zero,
+            "anchor_loss": zero,
+            "total_loss": zero,
+        }
+        metric_dict.update(self._build_zero_draft_metrics(reference))
+        return metric_dict
+
+    def _run_self_forced_rollout(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        """실제 inference와 같은 규칙으로 N초 committed self-rollout을 만듭니다.
+
+        Args:
+            tokenized_map: 평가 모드 map token 사전입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+
+        Returns:
+            Dict[str, Tensor]: closed-loop rollout 결과입니다. ``pred_traj_10hz`` 와
+            ``pred_head_10hz`` 는 실제로 commit된 N초 rollout입니다.
+        """
+        map_feature = self.encoder.encode_map(tokenized_map)
+        rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
+        return self.encoder.training_rollout_from_cache(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_scheme=self.self_forced_sampling,
+            rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
+        )
+
+    def _pack_self_forced_committed_rollout(
+        self,
+        rollout: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        """committed rollout을 첫 anchor 기준 packed N초 path로 변환합니다.
+
+        Args:
+            rollout: ``_run_self_forced_rollout`` 의 출력입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+
+        Returns:
+            tuple[Tensor, Tensor]: packed path와 agent mask입니다. packed path shape은
+            ``[n_valid_agent, F_win, 4]`` 이고 mask shape은 ``[n_agent]`` 입니다.
+        """
+        anchor_mask = get_anchor0_valid_mask(tokenized_agent)
+        committed_path_norm = build_anchor0_normalized_committed_path(
+            pred_traj_10hz=rollout["pred_traj_10hz"],
+            pred_head_10hz=rollout["pred_head_10hz"],
+            tokenized_agent=tokenized_agent,
+            flow_window_steps=self.flow_window_steps,
+        )
+        return committed_path_norm[anchor_mask], anchor_mask
+
+    def _update_generated_path_flow_estimator(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        committed_path_norm: Tensor,
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """detached self-rollout으로 generated estimator F_psi를 online 업데이트합니다.
+
+        Args:
+            tokenized_map: 평가 모드 map token 사전입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+            committed_path_norm: Generator가 실제로 실행한 N초 path입니다.
+                shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            Tensor: 마지막 estimator update의 flow matching loss입니다.
+        """
+        if self.self_forced_generated_estimator is None:
+            raise RuntimeError("self_forced_generated_estimator is not initialized.")
+
+        optimizer = self.optimizers()[1]
+        last_loss = committed_path_norm.new_zeros(())
+        self.toggle_optimizer(optimizer)
+        for _ in range(self.self_forced_estimator_updates_per_step):
+            optimizer.zero_grad(set_to_none=True)
+            clean_path = committed_path_norm.detach()
+            flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
+                clean_path,
+                target_type="velocity",
+            )
+            pred_dict = self._predict_path_flow_clean_estimate(
+                decoder=self.self_forced_generated_estimator,
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                noisy_path_norm=flow_sample.x_t,
+                tau=flow_sample.tau,
+                anchor_mask=anchor_mask,
+            )
+            last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target)
+            self.manual_backward(last_loss)
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0),
+                gradient_clip_algorithm="norm",
+            )
+            optimizer.step()
+        self.untoggle_optimizer(optimizer)
+        return last_loss.detach()
+
+    def _compute_self_forced_direction(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        committed_path_norm: Tensor,
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """F_rho와 F_psi의 clean path estimate 차이인 Delta_tau를 계산합니다.
+
+        Args:
+            tokenized_map: 평가 모드 map token 사전입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+            committed_path_norm: Generator가 실제로 실행한 N초 path입니다.
+                shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            Tensor: path-space update 방향입니다. shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+        """
+        if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
+            raise RuntimeError("self-forced auxiliary models are not initialized.")
+
+        with torch.no_grad():
+            clean_for_guidance = committed_path_norm.detach()
+            flow_sample = self._sample_flow_state_from_clean(clean_for_guidance)
+            target_pred = self._predict_path_flow_clean_estimate(
+                decoder=self.self_forced_target_teacher,
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                noisy_path_norm=flow_sample.x_t,
+                tau=flow_sample.tau,
+                anchor_mask=anchor_mask,
+            )
+            generated_pred = self._predict_path_flow_clean_estimate(
+                decoder=self.self_forced_generated_estimator,
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                noisy_path_norm=flow_sample.x_t,
+                tau=flow_sample.tau,
+                anchor_mask=anchor_mask,
+            )
+            return (target_pred["clean"] - generated_pred["clean"]).detach()
+
+    def _compute_self_forced_physics_loss(
+        self,
+        committed_path_norm: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+    ) -> Dict[str, Tensor]:
+        """실제로 실행된 committed N초 self-rollout에만 physics loss를 겁니다.
+
+        Args:
+            committed_path_norm: packed committed rollout입니다. shape은
+                ``[n_valid_agent, F_win, 4]`` 입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            Dict[str, Tensor]: physics loss와 세부 항입니다.
+        """
+        if (
+            not self.self_forced_use_physics
+            or self.self_forced_regularizer is None
+            or committed_path_norm.numel() == 0
+        ):
+            return self._build_zero_draft_metrics(committed_path_norm)
+
+        physics_inputs = build_anchor0_physics_inputs(
+            tokenized_agent=tokenized_agent,
+            anchor_mask=anchor_mask,
+        )
+        if not self.self_forced_physics_force_fp32:
+            physics_dict = self.self_forced_regularizer(
+                pred_future_norm=committed_path_norm,
+                target_future_norm=committed_path_norm.detach(),
+                packed_agent_type=physics_inputs["agent_type"],
+                packed_agent_length=physics_inputs["agent_length"],
+                packed_prev_control=physics_inputs["prev_control"],
+                packed_prev_control_valid=physics_inputs["prev_control_valid"],
+            )
+            if not all(torch.isfinite(value).all() for value in physics_dict.values()):
+                return self._build_zero_draft_metrics(committed_path_norm)
+            return physics_dict
+
+        with torch.autocast(device_type=committed_path_norm.device.type, enabled=False):
+            physics_dict = self.self_forced_regularizer(
+                pred_future_norm=committed_path_norm.float(),
+                target_future_norm=committed_path_norm.detach().float(),
+                packed_agent_type=physics_inputs["agent_type"],
+                packed_agent_length=physics_inputs["agent_length"].float(),
+                packed_prev_control=physics_inputs["prev_control"].float(),
+                packed_prev_control_valid=physics_inputs["prev_control_valid"],
+            )
+        if not all(torch.isfinite(value).all() for value in physics_dict.values()):
+            return self._build_zero_draft_metrics(committed_path_norm)
+        return physics_dict
+
     def on_fit_start(self) -> None:
         """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.
 
@@ -1032,6 +1509,7 @@ class SMARTFlow(LightningModule):
             None
         """
         self._apply_fit_time_validation_batch_limit()
+        self._sync_self_forced_auxiliary_models()
 
     def on_fit_end(self) -> None:
         """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.
@@ -1262,6 +1740,209 @@ class SMARTFlow(LightningModule):
                 batch_size=1,
             )
 
+    def _training_step_manual_open_loop(self, data, batch_idx):
+        """self-forced 시작 전 epoch에서 기존 open-loop loss를 manual optimizer로 학습합니다.
+
+        Args:
+            data: 학습용 장면 batch입니다.
+            batch_idx: 현재 batch 번호입니다.
+
+        Returns:
+            Tensor: logging용 detached 총 loss입니다.
+        """
+        tokenized_map, tokenized_agent = self.token_processor(data)
+        pred = self.encoder(
+            tokenized_map,
+            tokenized_agent,
+            anchor_mask_key="flow_train_mask",
+        )
+        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+        draft_weight = self._get_draft_loss_weight()
+        physics_dict = self._build_zero_draft_metrics(fm_loss)
+        total_loss = fm_loss
+        if draft_weight > 0.0:
+            physics_dict = self._compute_draft_training_loss(
+                pred_dict=pred,
+                tokenized_agent=tokenized_agent,
+            )
+            total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
+
+        generator_optimizer = self.optimizers()[0]
+        self.toggle_optimizer(generator_optimizer)
+        generator_optimizer.zero_grad(set_to_none=True)
+        self.manual_backward(total_loss)
+        self.clip_gradients(
+            generator_optimizer,
+            gradient_clip_val=float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0),
+            gradient_clip_algorithm="norm",
+        )
+        generator_optimizer.step()
+        self.untoggle_optimizer(generator_optimizer)
+
+        self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log(
+            f"train/{self.train_open_metric_names['ade']}",
+            open_metric_dict[self.open_metric_names["ade"]].detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['fde']}",
+            open_metric_dict[self.open_metric_names["fde"]].detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['yaw_ade']}",
+            open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['yaw_fde']}",
+            open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        if self.draft_enabled:
+            self._log_draft_training_metrics(
+                draft_weight=draft_weight,
+                physics_dict=physics_dict,
+            )
+        return total_loss.detach()
+
+    def _training_step_self_forced(self, data, batch_idx):
+        """PDF Step 3~10에 해당하는 self-forced NPFM 학습 step입니다.
+
+        Args:
+            data: 학습용 장면 batch입니다.
+            batch_idx: 현재 batch 번호입니다.
+
+        Returns:
+            Tensor: logging용 detached 총 loss입니다.
+        """
+        tokenized_map_train, tokenized_agent_train = self.token_processor(data)
+        pred = self.encoder(
+            tokenized_map_train,
+            tokenized_agent_train,
+            anchor_mask_key="flow_train_mask",
+        )
+        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+
+        tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
+        rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+        committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
+            rollout=rollout,
+            tokenized_agent=tokenized_agent_eval,
+        )
+        if committed_path_norm.numel() == 0:
+            generator_optimizer = self.optimizers()[0]
+            self.toggle_optimizer(generator_optimizer)
+            generator_optimizer.zero_grad(set_to_none=True)
+            self.manual_backward(fm_loss)
+            generator_optimizer.step()
+            self.untoggle_optimizer(generator_optimizer)
+            self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            return fm_loss.detach()
+
+        gen_estimator_loss = self._update_generated_path_flow_estimator(
+            tokenized_map=tokenized_map_eval,
+            tokenized_agent=tokenized_agent_eval,
+            committed_path_norm=committed_path_norm,
+            anchor_mask=anchor_mask,
+        )
+        delta_tau = self._compute_self_forced_direction(
+            tokenized_map=tokenized_map_eval,
+            tokenized_agent=tokenized_agent_eval,
+            committed_path_norm=committed_path_norm,
+            anchor_mask=anchor_mask,
+        )
+        target_path_norm = (committed_path_norm + self.self_forced_path_step_size * delta_tau).detach()
+        sf_loss = masked_mean_square_loss(committed_path_norm, target_path_norm)
+        physics_dict = self._compute_self_forced_physics_loss(
+            committed_path_norm=committed_path_norm,
+            tokenized_agent=tokenized_agent_eval,
+            anchor_mask=anchor_mask,
+        )
+        total_loss = (
+            self.self_forced_weight * sf_loss
+            + self.self_forced_anchor_weight * fm_loss
+            + self.self_forced_physics_weight * physics_dict["loss"]
+        )
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(
+                "Non-finite self-forced total_loss detected: "
+                f"{self._summarize_nonfinite_tensor(total_loss)}"
+            )
+
+        generator_optimizer = self.optimizers()[0]
+        self.toggle_optimizer(generator_optimizer)
+        generator_optimizer.zero_grad(set_to_none=True)
+        self.manual_backward(total_loss)
+        self.clip_gradients(
+            generator_optimizer,
+            gradient_clip_val=float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0),
+            gradient_clip_algorithm="norm",
+        )
+        generator_optimizer.step()
+        self.untoggle_optimizer(generator_optimizer)
+
+        self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_physics_loss", physics_dict["loss"].detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_physics_weight", float(self.self_forced_physics_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log(
+            f"train/{self.train_open_metric_names['ade']}",
+            open_metric_dict[self.open_metric_names["ade"]].detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['fde']}",
+            open_metric_dict[self.open_metric_names["fde"]].detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['yaw_ade']}",
+            open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['yaw_fde']}",
+            open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        if self.self_forced_use_physics:
+            self._log_draft_training_metrics(
+                draft_weight=float(self.self_forced_physics_weight),
+                physics_dict=physics_dict,
+            )
+        return total_loss.detach()
+
     def training_step(self, data, batch_idx):
         """한 batch의 FM loss와 DRaFT physics loss를 함께 계산합니다.
 
@@ -1279,6 +1960,10 @@ class SMARTFlow(LightningModule):
                 "Detected non-finite trainable parameter before forward pass: "
                 f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
             )
+        if self.self_forced_enabled:
+            if self._is_self_forced_active():
+                return self._training_step_self_forced(data=data, batch_idx=batch_idx)
+            return self._training_step_manual_open_loop(data=data, batch_idx=batch_idx)
         """ tokenized_agent
 flow_train_agent_type [n_valid_anchor]
 flow_train_agent_length [n_valid_anchor]
@@ -1537,8 +2222,6 @@ open_metric_dict:
                 self.sim_agents_submission.save_sub_file()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
-
         def lr_lambda(_current_step):
             current_step = self.current_epoch + 1
             if current_step < self.lr_warmup_steps:
@@ -1553,8 +2236,47 @@ open_metric_dict:
                 )
             )
 
+        if self.self_forced_enabled:
+            generator_params = [param for param in self.encoder.parameters() if param.requires_grad]
+            if not generator_params:
+                raise RuntimeError("No trainable generator parameters found for self-forced optimization.")
+            generator_optimizer = torch.optim.AdamW(generator_params, lr=self.lr)
+            if self.self_forced_generated_estimator is None:
+                raise RuntimeError("self_forced_generated_estimator is not initialized.")
+            estimator_params = [
+                param for param in self.self_forced_generated_estimator.parameters() if param.requires_grad
+            ]
+            if not estimator_params:
+                raise RuntimeError("No trainable generated-estimator parameters found.")
+            generated_estimator_optimizer = torch.optim.AdamW(
+                estimator_params,
+                lr=self.self_forced_generated_estimator_lr,
+            )
+            lr_scheduler = LambdaLR(generator_optimizer, lr_lambda=lr_lambda)
+            return [generator_optimizer, generated_estimator_optimizer], [lr_scheduler]
+
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return [optimizer], [lr_scheduler]
+
+    def on_train_epoch_end(self) -> None:
+        """manual optimization에서 Generator scheduler를 epoch마다 한 번 진행합니다.
+
+        Returns:
+            None
+        """
+        if not self.self_forced_enabled:
+            return
+        schedulers = self.lr_schedulers()
+        if schedulers is None:
+            return
+        if isinstance(schedulers, (list, tuple)):
+            if len(schedulers) == 0:
+                return
+            scheduler = schedulers[0]
+        else:
+            scheduler = schedulers
+        scheduler.step()
 
     def test_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
