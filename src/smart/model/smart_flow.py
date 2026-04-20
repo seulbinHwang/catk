@@ -1139,6 +1139,10 @@ class SMARTFlow(LightningModule):
             anchor_hidden=pred_dict["anchor_hidden"],
             anchor_mask=pred_dict["anchor_mask"],
             sampling_scheme=self.draft_sampling,
+            current_pos=pred_dict["flow_current_pos"],
+            current_head=pred_dict["flow_current_head"],
+            agent_batch=pred_dict["flow_agent_batch"],
+            anchor_step_id=pred_dict["flow_anchor_step_id"],
         )
         if not torch.isfinite(pred_sample_norm).all():
             return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
@@ -1403,6 +1407,10 @@ open_metric_dict:
                 anchor_mask=denoise_pred["anchor_mask"],
                 sampling_scheme=self.validation_rollout_sampling,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
+                current_pos=denoise_pred["flow_current_pos"],
+                current_head=denoise_pred["flow_current_head"],
+                agent_batch=denoise_pred["flow_agent_batch"],
+                anchor_step_id=denoise_pred["flow_anchor_step_id"],
             )
             open_metric_dict = self._build_open_loop_metric_dict(
                 pred_clean_norm=open_pred_clean_norm,
