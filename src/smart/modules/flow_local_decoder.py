@@ -16,7 +16,6 @@ from src.smart.tokens.agent_token_matching import (
     match_token_idx_from_local_contour,
 )
 from src.smart.utils import (
-    angle_between_2d_vectors,
     cal_polygon_contour,
     transform_to_global,
     transform_to_local,
@@ -338,6 +337,34 @@ class ChunkAgentInteractionMixer(nn.Module):
             has_pos_emb=True,
         )
 
+    @staticmethod
+    def _safe_angle_between_2d_vectors(
+        ctr_vector: torch.Tensor,
+        nbr_vector: torch.Tensor,
+        eps: float = 1.0e-6,
+    ) -> torch.Tensor:
+        """두 방향 사이의 각도를 안전하게 계산합니다.
+
+        Args:
+            ctr_vector: 기준 방향 벡터입니다. shape은 ``[..., 2]`` 입니다.
+            nbr_vector: 비교할 방향 벡터입니다. shape은 ``[..., 2]`` 입니다.
+            eps: 길이가 이 값보다 작은 비교 벡터를 0도 방향으로 처리합니다.
+
+        Returns:
+            torch.Tensor: 두 방향 사이의 각도입니다. shape은 ``[...]`` 입니다.
+
+        Notes:
+            두 agent의 예측 chunk 중심이 같은 위치에 있으면 비교 벡터 길이가 0이 됩니다.
+            이때 바로 ``atan2(0, 0)`` 를 쓰면 backward에서 NaN이 생길 수 있어,
+            같은 위치인 edge의 방향 차이는 0도로 둡니다.
+        """
+        cross = ctr_vector[..., 0] * nbr_vector[..., 1] - ctr_vector[..., 1] * nbr_vector[..., 0]
+        dot = (ctr_vector[..., :2] * nbr_vector[..., :2]).sum(dim=-1)
+        valid = nbr_vector[..., :2].square().sum(dim=-1) > float(eps) ** 2
+        safe_cross = torch.where(valid, cross, torch.zeros_like(cross))
+        safe_dot = torch.where(valid, dot, torch.ones_like(dot))
+        return torch.atan2(safe_cross, safe_dot)
+
     def _build_chunk_batch(
         self,
         agent_batch: torch.Tensor,
@@ -358,19 +385,25 @@ class ChunkAgentInteractionMixer(nn.Module):
         """
         # agent_batch: [n_candidate]
         if agent_batch.numel() == 0:
-            return agent_batch.new_zeros((0,))
+            return agent_batch.new_zeros((0,), dtype=torch.long)
 
+        agent_batch = agent_batch.to(dtype=torch.long)
         num_scene_graphs = int(agent_batch.max().item()) + 1
         if anchor_step_id is None:
-            anchor_step_id = agent_batch.new_zeros(agent_batch.shape)
+            anchor_step_id = agent_batch.new_zeros(agent_batch.shape, dtype=torch.long)
         else:
-            anchor_step_id = anchor_step_id.to(device=agent_batch.device, dtype=agent_batch.dtype)
+            if anchor_step_id.shape != agent_batch.shape:
+                raise ValueError(
+                    "anchor_step_id shape must match agent_batch, "
+                    f"got {tuple(anchor_step_id.shape)} and {tuple(agent_batch.shape)}."
+                )
+            anchor_step_id = anchor_step_id.to(device=agent_batch.device, dtype=torch.long)
 
         num_anchor_steps = int(anchor_step_id.max().item()) + 1 if anchor_step_id.numel() > 0 else 1
         base_batch = agent_batch + anchor_step_id * num_scene_graphs
         num_base_batches = max(1, num_scene_graphs * num_anchor_steps)
         chunk_offsets = (
-            torch.arange(num_chunks, device=agent_batch.device, dtype=agent_batch.dtype)
+            torch.arange(num_chunks, device=agent_batch.device, dtype=torch.long)
             .repeat_interleave(agent_batch.shape[0])
             * num_base_batches
         )
@@ -409,7 +442,7 @@ class ChunkAgentInteractionMixer(nn.Module):
         relation_inputs = torch.stack(
             [
                 torch.norm(rel_pos[:, :2], p=2, dim=-1),
-                angle_between_2d_vectors(
+                self._safe_angle_between_2d_vectors(
                     ctr_vector=recv_head_vector,
                     nbr_vector=rel_pos[:, :2],
                 ),
@@ -494,7 +527,7 @@ class ChunkAgentInteractionMixer(nn.Module):
         motion_flat = chunk_motion.transpose(0, 1).reshape(num_chunks * n_candidate, 2)
         valid_flat = chunk_valid.transpose(0, 1).reshape(num_chunks * n_candidate)
         chunk_batch = self._build_chunk_batch(
-            agent_batch=agent_batch.to(device=chunk_tokens.device),
+            agent_batch=agent_batch.to(device=chunk_tokens.device, dtype=torch.long),
             num_chunks=num_chunks,
             anchor_step_id=anchor_step_id,
         )
@@ -628,6 +661,39 @@ class HierarchicalFlowDecoder(nn.Module):
         )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
 
+    @staticmethod
+    def _safe_angle_from_vector(
+        vector: torch.Tensor,
+        fallback_angle: torch.Tensor | None = None,
+        eps: float = 1.0e-6,
+    ) -> torch.Tensor:
+        """2차원 벡터를 각도로 안전하게 바꿉니다.
+
+        Args:
+            vector: 각도로 바꿀 2차원 벡터입니다. shape은 ``[..., 2]`` 입니다.
+            fallback_angle: 벡터 길이가 너무 짧을 때 쓸 각도입니다.
+                shape은 ``[...]`` 입니다. ``None``이면 0도를 씁니다.
+            eps: 길이가 이 값보다 작은 벡터를 fallback으로 처리합니다.
+
+        Returns:
+            torch.Tensor: 안전하게 계산된 각도입니다. shape은 ``[...]`` 입니다.
+
+        Notes:
+            chunk 안의 heading 벡터가 서로 상쇄되면 평균 벡터가 0에 가까워질 수 있습니다.
+            이 상태에서 ``atan2(0, 0)`` 를 바로 호출하면 gradient가 NaN이 될 수 있어
+            마지막 heading 또는 0도를 대체값으로 사용합니다.
+        """
+        valid = vector[..., :2].square().sum(dim=-1) > float(eps) ** 2
+        if fallback_angle is None:
+            fallback_x = torch.ones_like(vector[..., 0])
+            fallback_y = torch.zeros_like(vector[..., 1])
+        else:
+            fallback_x = fallback_angle.cos()
+            fallback_y = fallback_angle.sin()
+        safe_x = torch.where(valid, vector[..., 0], fallback_x)
+        safe_y = torch.where(valid, vector[..., 1], fallback_y)
+        return torch.atan2(safe_y, safe_x)
+
     def _build_chunk_global_kinematics(
         self,
         x_t_norm: torch.Tensor,
@@ -665,8 +731,12 @@ class HierarchicalFlowDecoder(nn.Module):
         chunk_pos_local = x_t_chunks[..., :2].mean(dim=2) * self.pos_scale_m
 
         step_head_vec = F.normalize(x_t_chunks[..., 2:4], dim=-1, eps=1.0e-6)
-        chunk_head_vec = F.normalize(step_head_vec.mean(dim=2), dim=-1, eps=1.0e-6)
-        chunk_head_local = torch.atan2(chunk_head_vec[..., 1], chunk_head_vec[..., 0])
+        chunk_head_vec = step_head_vec.mean(dim=2)
+        last_head_local = self._safe_angle_from_vector(step_head_vec[:, :, -1])
+        chunk_head_local = self._safe_angle_from_vector(
+            vector=chunk_head_vec,
+            fallback_angle=last_head_local,
+        )
 
         chunk_pos, chunk_head = transform_to_global(
             pos_local=chunk_pos_local,
