@@ -275,6 +275,18 @@ torchrun \
 - `train_batch_size=32`: 실측에서 71 step 만에 OOM 으로 학습이 죽었습니다.
 - 따라서 6x H100 80GB 에서는 `28` 이상으로 올리지 않는 것을 권장합니다. 더 작은 GPU 에서는 아래 예시처럼 override 로 낮춰 쓰면 됩니다.
 
+위 `train_batch_size=28` 상한은 기본 `flow_window_steps=20` (2초) 기준입니다. `flow_window_steps=80` (8초) 으로 학습할 때는 FM 디코더의 chunk/attention 메모리가 약 4배로 늘어나므로 batch 를 훨씬 더 낮춰야 합니다. 6x H100 80GB + `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 조건에서 실측한 결과는 아래와 같습니다.
+
+- `train_batch_size=20`: 유저 실측에서 학습 중 CUDA OOM.
+- `train_batch_size=19`: probe 에서 약 20 step 만에 OOM (rank 0).
+- `train_batch_size=18`: probe 에서 약 55 step 만에 OOM (rank 0).
+- `train_batch_size=17`: probe 에서 약 2 step 만에 OOM (rank 1).
+- `train_batch_size=16`: probe 에서 약 86 step 만에 OOM (rank 1).
+- `train_batch_size=15`: probe 에서 약 153 step 만에 OOM (rank 2).
+- `train_batch_size=14` (권장): 500-step probe 안정, rank 0 peak reserved 약 87%, step 당 1.08s.
+- `train_batch_size=13`: 500-step probe 안정, rank 0 peak reserved 약 89%, step 당 1.06s (throughput 은 `14` 보다 약 5% 낮음).
+- 따라서 `flow_window_steps=80` 학습에서는 `data.train_batch_size=14` 를 쓰는 것을 권장합니다. rank 마다 보는 데이터가 달라 무거운 batch 가 rank 0 이 아닌 다른 rank 에 먼저 떨어질 수 있어, probe 의 rank 0 peak 만 보고 더 올리면 실제 학습 도중 특정 rank 에서 OOM 이 날 수 있습니다.
+
 ### 5.1 학습 설정을 거칠게 이해하는 법
 
 - 기본 진입점은 `configs/run.yaml`이고, 여기서 `data/model/callbacks/logger/trainer/paths/hydra`를 조합합니다.
