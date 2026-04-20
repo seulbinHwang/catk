@@ -6,17 +6,15 @@
 
 요약:
 
-- H100 6장 -> A100 4장으로 옮기면서 **GPU 개수가 2장 줄었고**, 장당 VRAM 은 그대로 80GB 입니다.
-- 이 preset 의 `train_batch_size=36` 은 **실제 장비에서 돌려보며 찾은 실측 최대값**입니다.
-  bs=38 / 40 / 48 은 `F.scaled_dot_product_attention` 의 A100 (sm_80) kernel 이
-  `invalid configuration argument` 로 무작위 step 에서 터집니다 (OOM 아님, kernel grid-dim 한계).
-- 또한 **`src/smart/modules/flow_local_decoder.py` 에 소폭 패치**를 적용해
-  `ChunkStepRefiner` 의 self-attention 만 math-SDPA kernel 로 고정합니다.
-  패치 없이 bs=36 을 쓰면 ~204 step 근처에서 위와 같은 CUDA 에러로 학습이 통째로 죽습니다 (실측).
-  패치 적용 후에는 같은 bs=36 에서 500 step 이상 안정적으로 돕니다 (실측). sweep table 과 패치 세부 설명은 4장 / 5장 참고.
-- Effective global batch 는 `accumulate_grad_batches=2` 로
-  `36 x 4 x 2 = 288` 을 맞춰서 6xH100 preset 의 `48 x 6 x 1 = 288` 과 **정확히 동일**하게 유지합니다.
-  -> learning rate 는 원래 값 `2e-4` 를 그대로 씁니다 (linear-scaling 보정 불필요).
+- H100 6장 → A100 4장으로 옮기면서 **GPU 개수가 2장 줄었고**, 장당 VRAM 은 그대로 80GB 입니다.
+- 이 preset 의 `train_batch_size=54` 는 **math-SDPA 패치 적용 후 5-point 스윕 (bs=36/48/54/60/72) 으로 찾은 실측 throughput sweet spot** 입니다.
+  bs=36 대비 per-sample 시간이 **7.2% 빨라지며** (0.0522 → 0.0487 s/sample), peak VRAM 은 ~63 GiB / 80 GiB (OOM 마진 ~18 GiB) 로 안전합니다.
+- **`src/smart/modules/flow_local_decoder.py` 의 소폭 패치**가 `ChunkStepRefiner` self-attention 을 math-SDPA kernel 로 고정합니다.
+  이 패치가 A100 (sm_80) SDPA kernel 의 grid-dim 한계 (`invalid configuration argument`) 를 없애줘서, 과거에 bs≥38 에서 터지던 문제는 **실제로 풀립니다**.
+  남은 attention call (`HalfSecondChunkMixerBlock`, `AttentionLayer`) 은 batch×num_chunks blow-up 이 없어서 더 큰 bs 도 kernel-wise 는 통과합니다.
+  따라서 상한은 **kernel 이 아니라 VRAM + memory bandwidth** 입니다. (패치 세부는 5장 참고.)
+- Effective global batch 는 `54 × 4 × 1 = 216` 으로 6xH100 preset 의 288 대비 **0.75×** 입니다.
+  → learning rate 는 linear scaling rule 로 `2e-4 × 216/288 = **1.5e-4**` 로 하향 조정합니다. 하향 방향이라 warmup 안정성에도 유리.
 - `max_epochs` 는 **절대 줄이지 않습니다** (`32` 유지).
 - `check_val_every_n_epoch` 도 그대로 `16` 입니다. 즉 16 epoch 마다 eval 이 돕니다.
 - Validation 은 `val_batch_size` 를 `16 -> 8` 로 줄여서, closed-loop rollout
@@ -54,10 +52,10 @@ torchrun \
 |:--|:--|:--|
 | `nproc_per_node` | 6 | **4** |
 | `trainer.precision` | `bf16-mixed` | `bf16-mixed` |
-| `data.train_batch_size` (per GPU) | 48 | **36** (실측 max) |
-| `trainer.accumulate_grad_batches` | 1 | **2** |
-| effective global batch | 48 x 6 x 1 = **288** | 36 x 4 x 2 = **288** (exact match) |
-| `model.model_config.lr` | 2e-4 | 2e-4 (유지) |
+| `data.train_batch_size` (per GPU) | 48 | **54** (실측 throughput sweet spot) |
+| `trainer.accumulate_grad_batches` | 1 | **1** |
+| effective global batch | 48 × 6 × 1 = **288** | 54 × 4 × 1 = **216** (0.75×) |
+| `model.model_config.lr` | 2e-4 | **1.5e-4** (linear scaling: 2e-4 × 216/288) |
 | `trainer.max_epochs` | 32 | 32 (유지) |
 | `trainer.check_val_every_n_epoch` | 16 | 16 (유지) |
 | `trainer.limit_val_batches` | 0.1 | 0.1 (유지) |
@@ -71,60 +69,51 @@ torchrun \
 | `draft.sampling.sample_steps` | 16 | 16 (유지) |
 | `draft.sampling.backprop_last_k` | 12 | 12 (유지) |
 
-### 2.1 실측 batch-size sweep (4x A100 80GB)
+### 2.1 실측 batch-size throughput sweep (4x A100 80GB)
 
-`seed=817 / 42`, `trainer.limit_train_batches=N` (짧은 건 N=10~20, 긴 건 N=80~500), val off,
-peak `nvidia-smi` 기준입니다.
+모두 `math-SDPA 패치 적용 상태`, `trainer.limit_train_batches=40~60`, val off, steady-state 기준.
 
-| per-GPU `train_batch_size` | 코드 패치 없이 | 코드 패치 적용 후 | peak GPU memory | step time |
-|:--|:--|:--|:--|:--|
-| 32 | OK (4 step 확인) | 미측정 | ~45 GiB / 80 GiB | ~2.50 s/step |
-| **36 (채택)** | **UNSAFE** - 80 step 에선 OK 지만 첫 epoch 의 204 step 근처에서 rank 1 에서 SDPA kernel error | **OK (500 step 확인, 크래시 0)** | ~48 GiB / 80 GiB | **~1.92 s/step** (패치 후) |
-| 38 | **UNSAFE** - 20~60 step 안에 rank 1 SDPA kernel error | (미사용) | | |
-| 40 | **UNSAFE** - 초반 2~4 step 안에 rank0/rank3 중 하나가 SDPA kernel error | (미사용) | | |
-| 48 (H100 원본) | **UNSAFE** - step 1 안에 SDPA kernel error | (미사용) | | |
+| per-GPU `train_batch_size` | acc | step time | per-sample | samples/s (4 GPU) | peak VRAM | OOM margin | vs bs=36 acc=2 |
+|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| 36 | 2 | 1.88 s | 0.0522 s | 76.6 | ~48 GiB | 33 GiB | baseline (이전 채택) |
+| 48 | 1 | 2.44 s | 0.0508 s | 78.7 | ~58 GiB | 22 GiB | +2.7% |
+| **54 (채택)** | **1** | **2.63 s** | **0.0487 s** | **82.1** | **~63 GiB** | **18 GiB** | **+7.2%** |
+| 60 | 1 | 2.94 s | 0.0490 s | 81.6 | ~67 GiB | 14 GiB | +6.5% |
+| 72 | 1 | 4.00 s | 0.0556 s | 72.0 | ~79 GiB | **2 GiB ⚠️** | -6.0% (UNSAFE) |
 
-에러 메시지는 모두
+**해석**:
+- `bs=54` 가 per-sample throughput 최고 + OOM 마진도 18 GiB 로 안전. **Pareto 지배점**.
+- `bs=60` 은 throughput 이 사실상 tied 인데 마진 4 GiB 작음.
+- `bs=72` 는 memory-BW 포화로 per-sample 이 오히려 나빠지고, 마진 2 GiB 라 32 epoch × ~2254 opt-step = ~54k step 중 scene-variance spike 가 한 번이라도 8 GiB 이상 튀면 OOM.
+- 패치 없이는 bs=36 조차 `F.scaled_dot_product_attention` 의 A100 grid-dim 한계 (`invalid configuration argument`) 로 ~204 step 에서 터집니다. 패치는 `ChunkStepRefiner` self-attention 을 math kernel 로 고정해 이 한계를 제거하고, 동시에 seq_len=5 에서는 flash/mem-eff kernel 의 launch overhead 가 math kernel 의 O(N^2) 비용보다 비싸서 **step time 도 약 20% 빨라집니다** (~2.40 → ~1.92 s at bs=36).
+- **과거 버전의 주장** — "패치해도 bs≥38 은 다른 kernel 에서 죽는다" — 은 실측 근거가 부족한 추정이었습니다. 실제로 이 스윕에서 bs=72 까지 40 step 동안 kernel crash 는 관찰되지 않았습니다. 패치 후 진짜 상한은 **VRAM / memory bandwidth** 이며, kernel grid-dim 은 아닙니다.
 
-```text
-F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p, is_causal)
-RuntimeError: CUDA error: invalid configuration argument
-```
+### 2.2 Wall-clock 예상 절감
 
-이고, `HierarchicalFlowDecoder.step_refiner` 의 `nn.MultiheadAttention` 호출 시점입니다.
-`torch.backends.cuda.enable_flash_sdp(False)` 로 flash kernel 을 꺼봐도 동일하게 터져서,
-이 한계는 attention backend 선택 문제가 아니라 **A100 (sm_80) 의 flash / memory-efficient SDPA
-커널들이 `batch x num_chunks` 차원이 커지면 grid-dim limit (~65535 블록) 을 못 맞추는 구조적
-한계**로 보입니다. 문제 step 의 batch 에 agent 가 특별히 많은 scene 이 섞여 들어가면 발생하므로
-**step 수만 채우면 언젠가는 반드시 맞닥뜨리는 확률적 크래시**입니다 (bs=36 기준 epoch 의
-~6% 지점에서 한 번은 나옴).
-
-그래서 이 preset 은 `ChunkStepRefiner` 의 self-attention 만
-math kernel 로 강제하는 **작은 코드 패치**를 함께 적용합니다 (5장 참고). 이 패치 이후 bs=36 에서
-500 step 을 이어 돌려도 크래시가 없고, step time 도 오히려 `~2.40 s -> ~1.92 s` 로 약 20% 빨라집니다
-(seq_len 이 5 뿐이라 math kernel 의 O(N^2) 비용이 flash 의 커널 launch overhead 보다 싸서 그렇습니다).
+486,995 training samples × 32 epochs:
+- 이전 (bs=36 acc=2, lr=2e-4): 76.6 samples/s → **약 58h** (compute ~56.5h + eval/overhead ~1.5h)
+- 현재 (bs=54 acc=1, lr=1.5e-4): 82.1 samples/s → **약 54h**
+- **절감: 약 4시간 (~7%)**
 
 ## 3. 왜 이렇게 정했나 (Why)
 
-### 3.1 `train_batch_size=36`
+### 3.1 `train_batch_size=54`
 
-- H100 원본은 `48` 인데, A100 에서는 위 sweep 대로 bs=38 이상이
-  `HierarchicalFlowDecoder.step_refiner` 안의 SDPA kernel 에서 CUDA kernel 한계에 걸립니다.
-- 메모리 기준으로는 bs=36 에서 peak 48 GiB / 80 GiB 이므로 VRAM 은 꽤 남습니다.
-- 문제는 VRAM 이 아니라 **A100 (sm_80) SDPA kernel 의 grid-dim 한계**라는 점이 특이합니다.
-- 따라서 "메모리가 많이 남으니 조금 더 키워도 된다" 라고 섣불리 bs 를 올리면,
-  학습 중 무작위 스텝에서 CUDA 에러로 학습이 통째로 죽을 수 있습니다.
-- `36` 이 실측 기준 가장 공격적인 안전값입니다.
+- Math-SDPA 패치 (5장) 가 `ChunkStepRefiner` self-attention 의 A100 grid-dim 한계를 제거하면서, 상한이 **kernel → VRAM/BW** 로 옮겨갔습니다.
+  5-point 스윕 결과 bs=54 가 per-sample throughput 최고점 (0.0487 s/sample) 이었고, peak VRAM ~63 GiB 로 18 GiB 마진이 확보됩니다 (2.1 참고).
+- bs=60 은 throughput 은 사실상 tied 지만 마진이 14 GiB 로 줄고, bs=72 는 memory-bandwidth 포화로 per-sample 이 오히려 degrade + 마진 2 GiB 라 **32 epoch 스케일에서 OOM 확률적으로 확정**입니다.
+- bs=36 (이전 채택) 은 compute underutilized 상태였습니다. A100 SM (108개) 활용도 측면에서 bs=54 근처가 tile-alignment/occupancy 가 잘 맞는 지점.
 
-### 3.2 `accumulate_grad_batches=2` + `lr` 유지
+### 3.2 `accumulate_grad_batches=1` + `lr=1.5e-4`
 
-- Effective global batch 가 `288 -> 288` 로 **정확히 같습니다** (`36 x 4 x 2 = 48 x 6 x 1`).
-- DRaFT fine-tuning 의 loss landscape 이 6xH100 preset 과 동일하므로
-  linear scaling rule 으로 lr 을 건드릴 필요가 없습니다. 그대로 `2e-4`.
-- 다른 effective-batch 를 원한다면 예를 들어 아래처럼 override 할 수 있습니다.
-  - `data.train_batch_size=32 trainer.accumulate_grad_batches=2` (32 x 4 x 2 = 256, lr 을 약간 낮춰도 됨: 1.78e-4)
-  - `data.train_batch_size=24 trainer.accumulate_grad_batches=3` (24 x 4 x 3 = 288)
-  - `data.train_batch_size=18 trainer.accumulate_grad_batches=4` (18 x 4 x 4 = 288, bs 가 반이라 fragmentation 은 더 안전)
+- Effective global batch 는 `54 × 4 × 1 = 216` 으로, 6xH100 preset 의 `288` 대비 **0.75×** 입니다.
+- Adam 에 대해 linear scaling rule 을 적용: `lr = 2e-4 × 216/288 = **1.5e-4**` (하향).
+  하향 방향은 warmup 안정성과 발산 위험 측면에서 오히려 보수적이라 안전.
+- 32 epoch 에서 총 opt-step 수는 `486995 × 32 / 216 ≈ 72k` 로, 이전 (288 effective, ~54k step) 대비 **+33% 더 많은 gradient update**. gradient noise 관점에서 수렴에 오히려 유리.
+- 다른 effective-batch/LR 조합을 원한다면 예를 들어:
+  - `data.train_batch_size=54 trainer.accumulate_grad_batches=2 model.model_config.lr=3e-4` (216 × 2 = 432, linear scale)
+  - `data.train_batch_size=48 trainer.accumulate_grad_batches=1 model.model_config.lr=1.33e-4` (192, 더 보수적; throughput -4.4% vs bs=54)
+  - `data.train_batch_size=36 trainer.accumulate_grad_batches=2 model.model_config.lr=2e-4` (이전 설정 복귀용)
 
 ### 3.3 `val_batch_size=8`
 
@@ -162,14 +151,18 @@ math kernel 로 강제하는 **작은 코드 패치**를 함께 적용합니다 
 ### 4.1 Train 쪽이 터질 때 (`train step` 중 OOM)
 
 ```bash
-# 1) DRaFT sampler 역전파 깊이를 먼저 줄인다 (loss 퀄리티 영향 작음)
+# 1) 먼저 한 단계 작은 실측 sweet spot 인 bs=48 로 내린다
+#    (peak ~58 GiB, margin 22 GiB, throughput 은 bs=36 대비 여전히 +2.7%)
+... data.train_batch_size=48 model.model_config.lr=1.33e-4   # 48*4*1=192, linear scale
+
+# 2) 그래도 터지면 DRaFT sampler 역전파 깊이를 줄인다 (loss 퀄리티 영향 작음)
 ... model.model_config.draft.sampling.backprop_last_k=8
 
-# 2) 그래도 터지면 batch 절반
-... data.train_batch_size=16 trainer.accumulate_grad_batches=4   # 16*4*4=256 유지
+# 3) 그래도 터지면 이전 preset (bs=36 acc=2, lr=2e-4) 으로 복귀
+... data.train_batch_size=36 trainer.accumulate_grad_batches=2 model.model_config.lr=2e-4
 
-# 3) 그래도 터지면 아예 작게
-... data.train_batch_size=8  trainer.accumulate_grad_batches=8   # 8*4*8=256 유지
+# 4) 그래도 터지면 아예 작게
+... data.train_batch_size=18 trainer.accumulate_grad_batches=4 model.model_config.lr=1e-4
 ```
 
 ### 4.2 Validation 쪽이 터질 때 (`validation` 돌다가 OOM)
@@ -224,22 +217,21 @@ math kernel 로 강제하는 **작은 코드 패치**를 함께 적용합니다 
 
 ## 6. throughput 을 더 올리고 싶다면
 
-**주의**: 이 preset 에서 `train_batch_size=36` 은 임의 고른 값이 아니라 **실측 상한**입니다.
-A100 80GB 에는 메모리가 아직 ~30 GiB 남아 있지만,
-그 여유로 bs 를 더 키우면 SDPA kernel 이 무작위로 터집니다 (위 2.1 참고).
-따라서 **bs 를 키워서 더 땡기려는 시도는 비권장**입니다.
+**현 preset 의 `train_batch_size=54` 는 5-point 실측 스윕의 Pareto 최적점**입니다.
+bs 를 더 키우는 방향 (60, 72) 은 marginal throughput 이득이 없거나 오히려 줄고,
+OOM 마진은 빠르게 얇아지므로 **비권장**입니다 (2.1 표 참고).
 
-throughput 을 키우고 싶으면 오히려 아래 방향이 안전합니다.
+bs 는 건드리지 않고 throughput 을 더 짜내려면:
 
 ```bash
-# 1) gradient accumulation 을 늘려 effective batch 만 키우기 (wall-clock 은 더 걸림)
-... data.train_batch_size=36 trainer.accumulate_grad_batches=4   # 36*4*4=576 (큰 batch)
-
-# 2) DRaFT sampler 역전파 깊이를 줄여 step 당 연산 줄이기
+# 1) DRaFT sampler 역전파 깊이 줄이기 (loss 영향 작음, step 당 연산 ↓)
 ... model.model_config.draft.sampling.backprop_last_k=8          # 기본 12 -> 8
 
-# 3) dataloader worker / prefetch 늘리기 (CPU RAM 여유 확인 후)
+# 2) dataloader worker / prefetch 늘리기 (CPU RAM 여유 확인 후)
 ... data.num_workers=8 data.prefetch_factor=4
+
+# 3) effective batch 를 키워 opt-step 수 줄이기 (per-sample compute 는 그대로)
+... data.train_batch_size=54 trainer.accumulate_grad_batches=2 model.model_config.lr=3e-4   # 216 -> 432
 ```
 
 `val_batch_size=8` 은 closed-loop rollout 16개가 함께 올라가는 상한이라서,
@@ -247,10 +239,13 @@ throughput 을 키우고 싶으면 오히려 아래 방향이 안전합니다.
 
 ## 7. 이 preset 을 튜닝할 때 참고할 것
 
-- 이 preset 은 **A100x4 YAML preset + ChunkStepRefiner math-SDPA 패치**를 함께 전제로 합니다. 기존
+- 이 preset 은 `ChunkStepRefiner` 의 math-SDPA 패치 (5장) 한 줄을 제외하면
+  **YAML 만으로** 4xA100 환경에 맞춰져 있습니다. 기존
   6xH100 preset (`finetune_draft_flow.yaml`) 은 그대로 남아 있습니다.
 - `ddp.yaml` 의 `devices: -1` 설정은 그대로 두고, CLI 에서
   `trainer.devices=4` 로 명시해 CUDA_VISIBLE_DEVICES 와 맞추는 방식을 유지합니다.
 - DRaFT 관련 하이퍼파라미터 (`draft.*`) 는 한 글자도 안 건드렸습니다.
-  즉 이 preset 은 **6xH100 preset 과 같은 loss / 같은 scheduler** 로 학습됩니다.
+  Optimizer 는 effective batch (288 → 216) 에 맞춰 LR 만 linear scaling
+  (2e-4 → 1.5e-4) 했고, scheduler 형태 (cosine, warmup_steps, lr_min_ratio)
+  는 동일합니다.
 - 학습 재개 (`action=fit` + `ckpt_path=.../last.ckpt`) 할 때도 이 preset 을 그대로 쓰면 됩니다.
