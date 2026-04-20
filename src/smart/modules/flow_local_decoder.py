@@ -371,13 +371,56 @@ class HierarchicalFlowDecoder(nn.Module):
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        anchor_hidden : (A, 13, H) -> (N=A*13, H) -> context : (N, D)
+        """
         context = self.context_projector(anchor_hidden)
+        """
+        x_t_norm : [B, 20, 4]
+        tau : [B]
+        
+        중간
+            tau_emb : (B, D) # MLP
+            step_tokens : (B, 20, 4) -> (B, 20, D)
+                - step_ids : "각 토큰에 “이게 미래 몇 번째 step인지” 정보를 step_tokens 에 더함
+            step_tokens = step_tokens + tau_emb.unsqueeze(1) : (B, 20, D)
+            step_tokens = step_tokens.view(B, 4, 5, D) [B, 20, D] -> [B, 4, 5, D]
+            chunk_tokens : [B, 4, D]
+        """
         step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
-
+        """
+        4개 half-second chunk ( chunk_tokens ) 끼리 서로 정보 교환
+        
+        anchor 문맥 + 현재 diffusion 시간(tau)을 조건으로 주입
+            input: context : (N, D) / tau_emb : (B, D)
+            둘이 합침 : (B, 2D) # "과거~현재 + 지도 + agent끼리 상호작용한 정보" + "미래 noising 정도"
+            (B, 2D) -> (B, 3D) -> scale, bias, gate = cond.chunk(3, dim=-1): 각각 [B, D]
+            
+            chunk_tokens 에 scale, bias, gate 적용 (각각 chunk에 균일 적용)
+            chunk_tokens : (B, 4, D)
+            
+            
+        """
         for block in self.chunk_mixers:
             chunk_tokens = block(chunk_tokens, context, tau_emb)
-
+        """
+        input
+            step_tokens : (B, 20, D)
+            chunk_tokens : (B, 4, D)
+            context : (B, D)
+        로직
+            chunk_tokens 을 step_tokens 에 더함
+            context 을 step_tokens 에 더함
+            
+            chunk별 로컬 self-attention (각 구간에서 5개 step끼리만 보여 attention)
+        
+        output
+            step_tokens : (b, 20, D)
+        """
         step_tokens = self.step_refiner(step_tokens, chunk_tokens, context)
+        """
+        output : (B, 20, 4)
+        """
         return self.velocity_head(step_tokens)
 
 
