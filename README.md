@@ -710,9 +710,10 @@ checkpoint 선택은 보통 아래처럼 하면 됩니다.
 
 요약만 보면 아래와 같습니다.
 
-- `train_batch_size=32`, `accumulate_grad_batches=2`, `trainer.devices=4` → effective global batch `256` (6xH100 preset 의 `288` 과 비슷).
-- `lr`, `max_epochs(=32)`, `check_val_every_n_epoch(=16)` 은 6xH100 preset 과 동일.
+- `train_batch_size=36` (실측 max), `accumulate_grad_batches=2`, `trainer.devices=4` → effective global batch **`288`** (6xH100 preset `288` 과 정확히 동일, 따라서 lr 도 그대로 `2e-4`).
+- `max_epochs(=32)`, `check_val_every_n_epoch(=16)` 은 6xH100 preset 과 동일.
 - `val_batch_size=8` 로 줄이고 `n_rollout_closed_val=16` / `n_batch_sim_agents_metric=10` 은 유지해서 정기 eval 이 OOM 없이 돕니다.
+- **bs 상한의 원인은 메모리가 아니라** `F.scaled_dot_product_attention` 의 A100 kernel 한계입니다 (bs≥38 에서 `invalid configuration argument`). 메모리는 bs=36 일 때 peak 48 GiB / 80 GiB 로 여유 있습니다.
 - 실행 예시:
 
 ```bash

@@ -5,25 +5,29 @@
 # Derived from `finetune_draft_flow.yaml` (6x H100 80GB preset).
 # ----------------------------------------------------------------------------
 # Key differences vs. the 6x H100 preset:
-#   * fewer devices (4 vs 6)  -> smaller global batch even at the same per-GPU size
-#   * A100 bf16 kernels use slightly more activation memory than H100 (no TE),
-#     so per-GPU train batch is lowered to give a safety margin and avoid
-#     step-to-step fragmentation OOMs with `expandable_segments:True`.
-#   * gradient accumulation is used to recover a global batch close to the
-#     original 6xH100 setting, so the loss landscape and LR choice stay valid.
-#   * validation batch and closed-loop rollout settings are tuned so the
-#     periodic `check_val_every_n_epoch` eval never OOMs on A100 80GB while
-#     still using meaningful rollouts for the Sim Agents metric.
+#   * fewer devices (4 vs 6)
+#   * A100 has a stricter CUDA-grid / SDPA kernel limit than H100 for the
+#     step-refiner attention inside the flow decoder: `batch * num_chunks`
+#     tensors large enough in bs >= 38 sporadically trigger
+#     `CUDA error: invalid configuration argument` on the
+#     `F.scaled_dot_product_attention` call (both flash and
+#     memory-efficient kernels). This is NOT an OOM -- activation memory
+#     at bs=36 peaks around 48 GiB / 80 GiB.
+#   * So per-GPU train batch is lowered empirically from 48 to 36 and
+#     recovered with `accumulate_grad_batches=2` to match the H100
+#     preset's effective global batch exactly.
+#
+# Empirical probing on this 4x A100-80GB SXM4 box (seed 817, 80 steps,
+# peak mem via nvidia-smi):
+#   bs=32  -> OK,     peak ~ 45 GiB,  ~2.50 s/step
+#   bs=36  -> OK,     peak ~ 48 GiB,  ~2.40 s/step
+#   bs=38  -> UNSAFE, fails after ~20-60 steps with SDPA kernel error
+#   bs=40  -> UNSAFE, fails within the first few steps (SDPA kernel)
+#   bs=48  -> UNSAFE, fails within the first step (SDPA kernel)
 #
 # Effective global batch size on this preset:
-#   per_gpu_batch * num_gpus * accumulate_grad_batches = 32 * 4 * 2 = 256
-#   (6xH100 preset used 48 * 6 * 1 = 288 -- very close, so lr is kept.)
-#
-# If you want to match 288 exactly, set:
-#   data.train_batch_size=36 trainer.accumulate_grad_batches=2   (36*4*2=288)
-# or
-#   data.train_batch_size=24 trainer.accumulate_grad_batches=3   (24*4*3=288)
-# (see README_A100x4.md for the LR scaling rule used here).
+#   per_gpu_batch * num_gpus * accumulate_grad_batches = 36 * 4 * 2 = 288
+#   (identical to the 6xH100 preset's 48 * 6 * 1 = 288, so `lr=2e-4` is kept.)
 # ============================================================================
 
 defaults:
@@ -32,10 +36,8 @@ defaults:
 model:
   model_config:
     # Optimizer / scheduler --------------------------------------------------
-    # Effective batch 256 vs 288 on the original preset -> we keep lr=2e-4
-    # because the difference is ~11% and DRaFT fine-tuning is not
-    # particularly batch-size sensitive (the LR scale rule suggests
-    # 2e-4 * 256/288 = 1.78e-4, which is within the noise).
+    # Effective global batch here is 36 * 4 * 2 = 288, exactly matching the
+    # 6xH100 preset's 48 * 6 * 1 = 288, so we keep lr = 2e-4 unchanged.
     lr: 2e-4
     lr_warmup_steps: 2
     lr_min_ratio: 1e-2
@@ -107,8 +109,8 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 1.0
   sync_batchnorm: false
-  # Restore a global-batch close to the 6xH100 preset (288) without blowing
-  # per-GPU memory. 32 * 4 * 2 = 256.
+  # Restore an effective global batch that matches the 6xH100 preset (288)
+  # without tripping the A100 SDPA kernel limit. 36 * 4 * 2 = 288.
   accumulate_grad_batches: 2
 
 callbacks:
@@ -117,12 +119,15 @@ callbacks:
     mode: max
 
 data:
-  # Per-GPU train batch. Picked so that:
-  #   - train step fits in ~55-65 GiB on a single A100 80GB with bf16-mixed,
-  #     leaving headroom for CUDA graph / allocator fragmentation.
-  #   - a single DRaFT rollout with backprop_last_k=12 out of 16 steps
-  #     still fits without triggering the OOM-retry path.
-  train_batch_size: 32
+  # Per-GPU train batch. Picked empirically from 80-step probing runs on
+  # this 4xA100-80GB SXM4 box (see header comment for the sweep table).
+  #   - bs=36 is the largest value that did not trip the step-refiner
+  #     SDPA `invalid configuration argument` kernel error during 80 steps
+  #     of DRaFT fine-tuning;
+  #   - bs=38 and bs=40 both failed stochastically (20-60 steps in);
+  #   - peak GPU memory at bs=36 was ~48 GiB / 80 GiB, so there is plenty
+  #     of headroom, the ceiling is NOT OOM but the SDPA kernel config.
+  train_batch_size: 36
   # Per-GPU validation batch. Closed-loop rollout memory scales with
   # val_batch_size * n_rollout_closed_val (=128 rollouts materialized per
   # rank at once). 8 is the largest value we verified without OOM on A100.

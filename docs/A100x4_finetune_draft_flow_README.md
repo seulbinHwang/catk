@@ -7,15 +7,16 @@
 요약:
 
 - H100 6장 → A100 4장으로 옮기면서 **GPU 개수가 2장 줄었고**, 장당 VRAM 은 그대로 80GB 입니다.
-- A100 의 bf16 kernel 은 H100 Transformer Engine 대비 activation 메모리를
-  약 10-15% 더 씁니다. 그래서 per-GPU batch 는 여유를 두고 낮췄습니다.
-- 줄어든 global batch 를 `accumulate_grad_batches` 로 다시 채워서
-  **원래 H100 preset 의 global batch (`288`)** 과 비슷한 `256` 을 유지합니다.
-- 그래서 learning rate 는 원래 값 `2e-4` 를 그대로 씁니다.
+- 이 preset 의 `train_batch_size=36` 은 **실제 장비에서 직접 80 step 돌려보며 찾은 실측 최대값**입니다.
+  bs=38 / 40 / 48 은 `F.scaled_dot_product_attention` 의 CUDA kernel 이
+  `invalid configuration argument` 로 터집니다 (OOM 아님, kernel grid-dim 한계). 자세한 swap table 은 4장 참고.
+- Effective global batch 는 `accumulate_grad_batches=2` 로
+  `36 × 4 × 2 = 288` 을 맞춰서 6xH100 preset 의 `48 × 6 × 1 = 288` 과 **정확히 동일**하게 유지합니다.
+  → learning rate 는 원래 값 `2e-4` 를 그대로 씁니다 (linear-scaling 보정 불필요).
 - `max_epochs` 는 **절대 줄이지 않습니다** (`32` 유지).
 - `check_val_every_n_epoch` 도 그대로 `16` 입니다. 즉 16 epoch 마다 eval 이 돕니다.
 - Validation 은 `val_batch_size` 를 `16 → 8` 로 줄여서, closed-loop rollout
-  16개가 한 번에 GPU 에 올라와도 A100 80GB 안에서 안전하게 돌게 했습니다.
+  16개가 한 번에 GPU 에 올라와도 A100 80GB 안에서 안전하게 돌게 했습니다 (실측 peak ~ 42 GiB).
 
 ## 1. 실행 커맨드
 
@@ -49,9 +50,9 @@ torchrun \
 |:--|:--|:--|
 | `nproc_per_node` | 6 | **4** |
 | `trainer.precision` | `bf16-mixed` | `bf16-mixed` |
-| `data.train_batch_size` (per GPU) | 48 | **32** |
+| `data.train_batch_size` (per GPU) | 48 | **36** (실측 max) |
 | `trainer.accumulate_grad_batches` | 1 | **2** |
-| effective global batch | 48 × 6 × 1 = **288** | 32 × 4 × 2 = **256** |
+| effective global batch | 48 × 6 × 1 = **288** | 36 × 4 × 2 = **288** (exact match) |
 | `model.model_config.lr` | 2e-4 | 2e-4 (유지) |
 | `trainer.max_epochs` | 32 | 32 (유지) |
 | `trainer.check_val_every_n_epoch` | 16 | 16 (유지) |
@@ -66,30 +67,52 @@ torchrun \
 | `draft.sampling.sample_steps` | 16 | 16 (유지) |
 | `draft.sampling.backprop_last_k` | 12 | 12 (유지) |
 
+### 2.1 실측 batch-size sweep (4x A100 80GB)
+
+`seed=817`, `trainer.limit_train_batches=N` (N=10~80), val off, peak `nvidia-smi` 기준입니다.
+
+| per-GPU `train_batch_size` | 결과 | peak GPU memory | step time |
+|:--|:--|:--|:--|
+| 32 | OK (4 step 확인) | ~45 GiB / 80 GiB | ~2.50 s/step |
+| **36 (채택)** | **OK (80 step 확인)** | **~48 GiB / 80 GiB** | **~2.40 s/step** |
+| 38 | **UNSAFE** — 20 step 까지는 괜찮다가 60 step 안에 rank 1 SDPA kernel error |  | |
+| 40 | **UNSAFE** — 초반 2~4 step 안에 rank0/rank3 중 하나가 SDPA kernel error |  | |
+| 48 (H100 원본) | **UNSAFE** — step 1 안에 SDPA kernel error |  | |
+
+에러 메시지는 모두
+
+```
+F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p, is_causal)
+RuntimeError: CUDA error: invalid configuration argument
+```
+
+이고, `HierarchicalFlowDecoder.step_refiner` 의 `nn.MultiheadAttention` 호출 시점입니다.
+`torch.backends.cuda.enable_flash_sdp(False)` 로 flash kernel 을 꺼봐도 동일하게 터져서,
+이 한계는 attention backend 선택이 아니라 **A100 (sm_80) 의 SDPA kernel 이
+`batch × chunk` 단위의 grid-dim 을 못 잡는 상한**으로 보입니다.
+즉 bs 를 36 으로 맞춰두는 게 **가장 공격적이면서 안전한** 값입니다.
+
 ## 3. 왜 이렇게 정했나 (Why)
 
-### 3.1 `train_batch_size=32`
+### 3.1 `train_batch_size=36`
 
-- H100 80GB 에서 `48` 이 돌아가므로, A100 80GB 도 **메모리 용량 자체는 같습니다**.
-- 다만 A100 은 Transformer Engine 이 없어서 bf16 activation 이 몇 % 더 크고,
-  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 를 쓰더라도
-  DRaFT rollout (`backprop_last_k=12`) 이 step 마다 올렸다 내렸다 하는 메모리 패턴 때문에
-  fragmentation 이 H100 보다 불리하게 작용할 가능성이 있습니다.
-- 그래서 장당 batch 는 `48 → 32` 로 **33% 여유**를 뒀습니다.
-- 여유가 커 보이는 이유는, periodic validation 이 같은 프로세스 안에서 돌 때
-  rollout 16개 × val_batch_size 만큼의 활성 메모리가 동시에 얹히기 때문입니다.
+- H100 원본은 `48` 인데, A100 에서는 위 sweep 대로 bs=38 이상이
+  `HierarchicalFlowDecoder.step_refiner` 안의 SDPA kernel 에서 CUDA kernel 한계에 걸립니다.
+- 메모리 기준으로는 bs=36 에서 peak 48 GiB / 80 GiB 이므로 VRAM 은 꽤 남습니다.
+  문제는 VRAM 이 아니라 **A100 (sm_80) SDPA kernel 의 grid-dim 한계**라는 점이 특이합니다.
+- 따라서 "메모리가 많이 남으니 조금 더 키워도 된다" 라고 섣불리 bs 를 올리면,
+  학습 중 무작위 스텝에서 CUDA 에러로 학습이 통째로 죽을 수 있습니다.
+- `36` 이 실측 기준 가장 공격적인 안전값입니다.
 
 ### 3.2 `accumulate_grad_batches=2` + `lr` 유지
 
-- Effective global batch 가 `288 → 256` 으로 줄어드는 게 문제입니다.
-- DRaFT fine-tuning 은 batch-size 에 아주 민감하지는 않지만,
-  **loss landscape 을 최대한 6xH100 preset 과 맞추려고** gradient accumulation 으로 복구했습니다.
-- 엄밀한 linear scaling rule 이면 `lr = 2e-4 * (256 / 288) ≈ 1.78e-4` 이지만,
-  이 정도 차이는 loss scale / AdamW warmup 노이즈 안이므로 **그대로 `2e-4`** 를 쓰는 게 실전에 더 안전합니다.
-- "정확히 288 에 맞추고 싶다"면 다음 두 override 중 하나를 쓰면 됩니다.
-  - `data.train_batch_size=36 trainer.accumulate_grad_batches=2` (36 × 4 × 2 = 288)
+- Effective global batch 가 `288 → 288` 로 **정확히 같습니다** (`36 × 4 × 2 = 48 × 6 × 1`).
+- DRaFT fine-tuning 의 loss landscape 이 6xH100 preset 과 동일하므로
+  linear scaling rule 으로 lr 을 건드릴 필요가 없습니다. 그대로 `2e-4`.
+- 다른 effective-batch 를 원한다면 예를 들어 아래처럼 override 할 수 있습니다.
+  - `data.train_batch_size=32 trainer.accumulate_grad_batches=2` (32 × 4 × 2 = 256, lr 을 약간 낮춰도 됨: 1.78e-4)
   - `data.train_batch_size=24 trainer.accumulate_grad_batches=3` (24 × 4 × 3 = 288)
-  두 override 모두 step 당 forward/backward 가 조금 더 걸려서 wall-clock 이 살짝 느려집니다.
+  - `data.train_batch_size=18 trainer.accumulate_grad_batches=4` (18 × 4 × 4 = 288, bs 가 반이라 fragmentation 은 더 안전)
 
 ### 3.3 `val_batch_size=8`
 
@@ -163,22 +186,28 @@ torchrun \
 ... model.model_config.n_batch_sim_agents_metric=4
 ```
 
-## 5. 조금 더 "세게" 쓰고 싶을 때
+## 5. throughput 을 더 올리고 싶다면
 
-A100 80GB × 4 여도 실제로는 **메모리가 꽤 남는 편**입니다 (H100 80GB 와 동일 메모리).
-테스트 결과에 여유가 보이면 다음 override 로 **throughput 을 더 땡길** 수 있습니다.
+**주의**: 이 preset 에서 `train_batch_size=36` 은 임의 고른 값이 아니라 **실측 상한**입니다.
+A100 80GB 에는 메모리가 아직 ~30 GiB 남아 있지만,
+그 여유로 bs 를 더 키우면 SDPA kernel 이 무작위로 터집니다 (위 2.1 참고).
+따라서 **bs 를 키워서 더 땡기려는 시도는 비권장**입니다.
+
+throughput 을 키우고 싶으면 오히려 아래 방향이 안전합니다.
 
 ```bash
-# per-GPU train batch 를 더 키우기 (6xH100 preset 의 48 에 근접)
-... data.train_batch_size=40 trainer.accumulate_grad_batches=2   # 40*4*2=320, lr 그대로 OK
-... data.train_batch_size=48 trainer.accumulate_grad_batches=2   # 48*4*2=384, lr 그대로 OK
+# 1) gradient accumulation 을 늘려 effective batch 만 키우기 (wall-clock 은 더 걸림)
+... data.train_batch_size=36 trainer.accumulate_grad_batches=4   # 36*4*4=576 (큰 batch)
 
-# val batch 도 같이 키우기
-... data.val_batch_size=16
+# 2) DRaFT sampler 역전파 깊이를 줄여 step 당 연산 줄이기
+... model.model_config.draft.sampling.backprop_last_k=8          # 기본 12 -> 8
+
+# 3) dataloader worker / prefetch 늘리기 (CPU RAM 여유 확인 후)
+... data.num_workers=8 data.prefetch_factor=4
 ```
 
-이때 반드시 **첫 epoch 의 첫 val 까지 (epoch 16 근처) wandb 의 GPU 메모리 그래프를 확인**하고,
-`~70 GiB` 을 꾸준히 넘기는 rank 가 있으면 한 단계 낮추는 걸 권장합니다.
+`val_batch_size=8` 은 closed-loop rollout 16개가 함께 올라가는 상한이라서,
+더 키우려면 먼저 `n_rollout_closed_val` 을 같이 줄여야 합니다.
 
 ## 6. 이 preset 을 튜닝할 때 참고할 것
 
