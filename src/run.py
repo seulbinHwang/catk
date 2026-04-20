@@ -75,6 +75,48 @@ def _configure_wandb_checkpoint_upload(cfg: DictConfig) -> None:
     )
 
 
+def _configure_checkpoint_monitor(cfg: DictConfig, model: LightningModule) -> None:
+    callbacks_cfg = cfg.get("callbacks")
+    if not callbacks_cfg:
+        return
+
+    checkpoint_cfg = callbacks_cfg.get("model_checkpoint")
+    if not checkpoint_cfg:
+        return
+
+    closed_loop_metric = getattr(model, "closed_loop_metric_name", None)
+    open_metric_names = getattr(model, "open_metric_names", {})
+    open_ade_metric = open_metric_names.get("ade")
+
+    if getattr(model, "val_closed_loop", False) and closed_loop_metric:
+        desired_monitor = closed_loop_metric
+        desired_mode = "max"
+    elif getattr(model, "val_open_loop", False) and open_ade_metric:
+        desired_monitor = f"val_open/{open_ade_metric}"
+        desired_mode = "min"
+    else:
+        desired_monitor = "train/loss"
+        desired_mode = "min"
+
+    configured_monitor = checkpoint_cfg.get("monitor")
+    should_override_monitor = (
+        configured_monitor is None
+        or configured_monitor == closed_loop_metric
+        or str(configured_monitor).startswith("val_open/ADE")
+        or configured_monitor == "train/loss"
+    )
+
+    with open_dict(checkpoint_cfg):
+        if should_override_monitor:
+            checkpoint_cfg.monitor = desired_monitor
+        checkpoint_cfg.mode = desired_mode
+
+    log.info(
+        "Configured checkpoint monitor: "
+        f"monitor={checkpoint_cfg.monitor}, mode={checkpoint_cfg.mode}"
+    )
+
+
 def run(cfg: DictConfig) -> None:
     if cfg.get("seed"):
         L.seed_everything(cfg.seed, workers=True)
@@ -96,6 +138,8 @@ def run(cfg: DictConfig) -> None:
 
     log.info(f"Instantiating model <{cfg.model._target_}>")
     model: LightningModule = hydra.utils.instantiate(cfg.model, _recursive_=False)
+
+    _configure_checkpoint_monitor(cfg, model)
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
