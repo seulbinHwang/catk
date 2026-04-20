@@ -11,6 +11,7 @@
 - `trajectory_token_veh/ped/cyc` 임베딩은 마지막 contour 1개 대신 
 - **`agent_token_all_*` 전체 chunk(6 x 4 x 2)** 를 그대로 펼쳐 사용합니다.
 - `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
+- `SMARTFlowAgentDecoder`의 map-to-agent context 반경은 `flow_window_steps`에 맞춰 선형으로 커집니다. `pl2a_radius`는 2초 기준 반경으로 해석하며, 기본 30m 설정에서는 2초 30m / 4초 60m / 6초 90m / 8초 120m를 봅니다. 이 규칙은 학습 `_encode_context`, inference cache, closed-loop rollout의 map-to-agent edge 생성에 동일하게 적용됩니다.
 - `HierarchicalFlowDecoder`는 `chunk_mixers` 이후, `step_refiner` 이전에 `chunk_a2a_mixers`를 실행합니다.
 - `chunk_a2a_mixers`는 같은 scene, 같은 anchor 시간, 같은 0.5초 상대 chunk에 속한 후보끼리 `decoder.a2a_radius` 안에서 agent-to-agent attention을 수행합니다.
 - chunk별 전역 위치/방향은 flow target과 같은 현재 anchor 좌표계를 기준으로 복원합니다. heading 벡터나 agent 간 상대 위치가 0에 가까운 경우에도 안전한 각도 계산을 사용해 NaN gradient가 생기지 않도록 했습니다.

@@ -113,6 +113,25 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             else None
         )
 
+    def _get_map2agent_radius(self) -> float:
+        """flow 생성 길이에 맞춰 지도 검색 반경을 계산합니다.
+
+        ``pl2a_radius``는 2초 flow window의 기준 반경으로 둡니다.
+        현재 모델은 10Hz 미래를 만들기 때문에 2초는 20 step입니다.
+        따라서 ``flow_window_steps``가 20, 40, 60, 80이면 각각
+        config 반경의 1, 2, 3, 4배를 씁니다. 기본 config가 30m일 때
+        2초 30m, 4초 60m, 6초 90m, 8초 120m가 됩니다.
+
+        Returns:
+            float: 현재 flow window에 맞춘 map-to-agent 검색 반경입니다.
+        """
+        base_window_steps = 20
+        return (
+            float(self.pl2a_radius)
+            * float(self.flow_window_steps)
+            / float(base_window_steps)
+        )
+
     def build_interaction_edge(
         self,
         pos_a: torch.Tensor,

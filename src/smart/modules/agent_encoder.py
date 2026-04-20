@@ -136,6 +136,19 @@ class SMARTAgentEncoder(nn.Module):
         )
         self.apply(weight_init)
 
+    def _get_map2agent_radius(self) -> float:
+        """지도와 agent를 연결할 검색 반경을 반환합니다.
+
+        기본 encoder에서는 config의 ``pl2a_radius`` 값을 그대로 씁니다.
+        Flow decoder처럼 미래 생성 길이에 따라 더 넓은 지도를 봐야 하는
+        하위 클래스는 이 함수만 바꾸면 학습과 추론의 모든 map-to-agent
+        edge 생성 경로에 같은 규칙을 적용할 수 있습니다.
+
+        Returns:
+            float: 지도 polyline과 agent 사이의 검색 반경입니다. 단위는 meter입니다.
+        """
+        return float(self.pl2a_radius)
+
     def agent_token_embedding(
         self,
         agent_token_index,
@@ -316,7 +329,7 @@ class SMARTAgentEncoder(nn.Module):
         edge_index_pl2a = radius(
             x=pos_s[:, :2],
             y=pos_pl[:, :2],
-            r=self.pl2a_radius,
+            r=self._get_map2agent_radius(),
             batch_x=batch_s,
             batch_y=batch_pl,
             max_num_neighbors=300,
