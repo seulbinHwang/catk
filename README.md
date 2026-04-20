@@ -756,6 +756,42 @@ torchrun \
   task_name=flow_semi_continuous_finetune_inv_best_a_100_a100x4
 ```
 
+### 5.9 4x H100 80GB 에서 Flow Matching pretrain
+
+6x H100 이 아닌 **4x H100 80GB** 박스에서 `pre_bc_flow` 와 동일한 pretrain 을 돌리고 싶을 때 쓰는 별도 preset 입니다.
+
+- preset 파일: `configs/experiment/pre_bc_flow_4_h100.yaml`
+- 베이스: `configs/experiment/pre_bc_flow.yaml` (6x H100 preset)
+
+요약만 보면 아래와 같습니다.
+
+- `train_batch_size=20` (6xH100 preset 과 동일), `trainer.devices=4`, `accumulate_grad_batches=1` -> effective global batch **`80`** (6xH100 preset `120` 의 0.667x).
+- 선형 LR scaling rule 에 따라 `lr=2.667e-4` (= `4e-4 * 80/120`). 나머지 optimizer / scheduler 설정은 `pre_bc_flow` 와 동일.
+- `max_epochs(=64)`, `check_val_every_n_epoch(=8)`, `limit_val_batches(=0.1)`, `val_batch_size(=16)`, `n_rollout_closed_val(=16)` 은 6xH100 preset 과 동일.
+- H100 80GB 하드웨어는 6xH100 preset 과 동일하므로 메모리 측면에서 bs 를 낮출 이유는 없습니다. 필요하면 `data.train_batch_size=28` 까지 올려도 됩니다 (6xH100 preset 과 동일한 실측 상한).
+- Wall-clock 은 DDP rank 가 6 -> 4 로 줄어든 만큼 epoch 당 약 1.5x 길어집니다. 학습 신호 기준 "dataset 위 epoch 수" 는 보존됩니다.
+
+실행 예시:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m src.run \
+  experiment=pre_bc_flow_4_h100 \
+  trainer=ddp \
+  trainer.devices=4 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_semi_continuous_pretrain_h1004
+```
+
+effective global batch 을 `120` 으로 정확히 맞추고 싶으면 CLI 에서 아래처럼 override 하면 됩니다 (grad accumulation 2 회, 원래 LR 복구).
+
+```bash
+... trainer.accumulate_grad_batches=2 model.model_config.lr=4e-4
+```
+
 ## 6. 평가와 추론
 
 ### 6.1 Validation set closed-loop 평가
@@ -1163,6 +1199,12 @@ python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT"
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=pre_bc_flow trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" task_name=flow_semi_continuous_pretrain_h1006
+```
+
+### 4x H100 학습
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 -m src.run experiment=pre_bc_flow_4_h100 trainer=ddp trainer.devices=4 paths.cache_root="$CACHE_ROOT" task_name=flow_semi_continuous_pretrain_h1004
 ```
 
 ### validation 평가

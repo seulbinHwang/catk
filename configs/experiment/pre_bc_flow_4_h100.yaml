@@ -1,0 +1,70 @@
+# @package _global_
+
+# ============================================================================
+# Pretrain preset for 4x H100 80GB boxes.
+# Derived from `pre_bc_flow.yaml` (the 6x H100 80GB default pretrain preset).
+# ----------------------------------------------------------------------------
+# Key differences vs. the 6x H100 preset:
+#   * fewer devices (4 vs 6)
+#   * per-GPU settings are kept identical (train_batch_size=20, num_workers=4,
+#     prefetch_factor=1, val_batch_size=16). bs=20 is known-safe on H100 80GB
+#     from the 6xH100 preset, and hardware-wise the cards are identical, so
+#     there is no memory-side reason to change it.
+#   * effective global batch drops from 20*6=120 to 20*4=80 (0.667x). We apply
+#     the linear LR scaling rule: lr = 4e-4 * 80/120 = 2.667e-4.
+#   * max_epochs / check_val_every_n_epoch / limit_val_batches unchanged, so
+#     the training budget in "epochs over the dataset" matches the 6xH100
+#     preset; wall-clock per epoch is ~1.5x longer since there are 4 instead
+#     of 6 DDP ranks.
+#
+# If you need to preserve the exact global batch of 120 instead of running at
+# 80, set `trainer.accumulate_grad_batches=2` (global batch becomes 160; still
+# close, and you can revert `model.model_config.lr=4e-4`). We do not default
+# to accumulation here because the linear-LR path is simpler and the 4xH100
+# pretrain run was validated at effective batch 80 with the scaled LR.
+# ============================================================================
+
+defaults:
+  - override /model: smart_flow
+
+model:
+  model_config:
+    # Effective global batch here is 20 * 4 * 1 = 80 (0.667x the 6xH100
+    # preset's 120). Linear LR scaling rule: lr = 4e-4 * 80/120 ~= 2.667e-4.
+    lr: 2.667e-4
+    lr_warmup_steps: 4
+    lr_min_ratio: 1e-2
+    n_rollout_closed_val: 16
+    sim_agents_context_cache_size: 64
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 8
+  max_epochs: 64
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+  accumulate_grad_batches: 1
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  # Per-GPU train batch kept at 20 (same as the 6xH100 preset). H100 80GB
+  # comfortably fits bs=20 (the 6xH100 preset reports peak reserved ~49% at
+  # bs=20). bs=28 was validated OK on H100 80GB; if you want to push
+  # throughput you can override `data.train_batch_size=28` from the CLI.
+  train_batch_size: 20
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
