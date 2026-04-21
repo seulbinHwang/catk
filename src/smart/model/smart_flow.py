@@ -1680,22 +1680,12 @@ class SMARTFlow(LightningModule):
                 f"velocity detach on first {flow_ode.solver_steps - flow_ode.last_n_grad_solver_steps} solver steps."
             )
 
-        total_loss_accum = 0.0
+        anchor_losses: list[Tensor] = []
         n_valid_anchors = 0
         _diag_pred_traj = None   # 마지막 anchor CL traj (variance 진단용)
         _diag_ol_norms: list[Tensor] = []
         _diag_active_mask: Tensor | None = None
         _seq_keys = {"gt_pos", "gt_heading", "valid_mask", "gt_idx"}
-
-        # 총 backward 호출 횟수를 미리 추정할 수 없으므로, 두 단계로 처리:
-        # 1) 각 anchor의 loss를 immediate-backward 방식으로 누적
-        # 2) 마지막에 DDP dummy loss 반환 (gradients already accumulated)
-        # n_valid_anchors가 0이면 dummy loss만 반환.
-
-        # immediate backward를 위해 총 단위 수를 가정해 스케일을 정해야 한다.
-        # 단순히 len(all_anchor_indices)로 나누면 빈 anchor(active agent 없음)는
-        # gradient를 작게 만들 수 있지만, 실제 학습에서 빈 anchor는 드물고 허용 가능.
-        n_anchors_total = max(1, len(all_anchor_indices))
 
         try:
             for anchor_idx in all_anchor_indices:
@@ -1763,8 +1753,7 @@ class SMARTFlow(LightningModule):
                             pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
                         cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
                         loss_g = _consistency_loss(cl_norm_g, ol_norms[g])
-                        total_loss_accum += loss_g.item()
-                        (loss_g / (n_anchors_total * G)).backward()
+                        anchor_losses.append(loss_g)
                         del pred_traj_g, pred_z_g, pred_head_g, cl_xy_g, cl_head_g, cl_norm_g
                 else:
                     # G rollout 병렬 (MMD 사용 가능)
@@ -1798,15 +1787,14 @@ class SMARTFlow(LightningModule):
                         anchor_loss = torch.stack([
                             _consistency_loss(cl_norms[g], ol_norms[g]) for g in range(G)
                         ]).mean()
-                    total_loss_accum += anchor_loss.item()
-                    (anchor_loss / n_anchors_total).backward()
+                    anchor_losses.append(anchor_loss)
 
                     # 진단용: 마지막 anchor의 CL/OL 보존 (variance logging)
                     _diag_pred_traj = pred_traj_all.detach()
                     _diag_ol_norms = [o.detach() for o in ol_norms]
                     _diag_active_mask = active_mask
 
-                    del pred_traj_all, pred_z_all, pred_head_all, cl_norms, anchor_loss
+                    del pred_traj_all, pred_z_all, pred_head_all, cl_norms
 
                 n_valid_anchors += 1
                 del rollout_cache_anchor, active_hidden, current_pos_active, current_head_active, ol_norms
@@ -1818,20 +1806,16 @@ class SMARTFlow(LightningModule):
                 _agent_enc.flow_decoder = _orig_fd
 
         if n_valid_anchors == 0:
-            return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
+            return {"loss": next(iter(self.parameters())).new_zeros(())}
 
-        mean_loss = torch.tensor(
-            total_loss_accum / n_valid_anchors,
-            dtype=torch.float32, device=agent_batch.device,
-        )
+        mean_loss = torch.stack(anchor_losses).mean()
         log.info(
             f"[ocsc] step={int(getattr(self,'global_step',0))} "
             f"consistency_loss={mean_loss.item():.4f} n_anchors={n_valid_anchors}"
         )
-        _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
         ret = {
-            "loss": _ddp_dummy,
-            "train/consistency_loss": mean_loss,
+            "loss": mean_loss,
+            "train/consistency_loss": mean_loss.detach(),
         }
 
         # Mode collapse 진단 (마지막 anchor, no extra compute)
@@ -2679,10 +2663,8 @@ class SMARTFlow(LightningModule):
             )
 
 
-    def on_after_backward(self) -> None:
-        """Log gradient norms to diagnose BPTT gradient explosion."""
-        if not self._is_rmm_bptt_ft_enabled() and not self._is_ocsc_ft_enabled():
-            return
+    def _log_current_grad_norms(self, tag: str = "grad") -> None:
+        """Log gradient norms from the currently accumulated grads."""
         try:
             flow_decoder = self.encoder.agent_encoder.flow_decoder
             # velocity_head 전체 grad norm
@@ -2707,9 +2689,9 @@ class SMARTFlow(LightningModule):
                 # 파일 로그에도 항상 기록 (wandb disabled 환경에서도 확인 가능)
                 vh_norm_val = vh_norm.item() if vh_params else float("nan")
                 log.info(
-                    f"[grad] step={self.global_step} "
-                    f"total={total_norm.item():.3f} "
-                    f"vh={vh_norm_val:.3f}"
+                    f"[{tag}] step={self.global_step} "
+                    f"total={total_norm.item():.3e} "
+                    f"vh={vh_norm_val:.3e}"
                 )
                 # 1000 이상이면 경고
                 if total_norm.item() > 1000:
@@ -2719,11 +2701,51 @@ class SMARTFlow(LightningModule):
         except Exception:
             pass
 
+    def on_after_backward(self) -> None:
+        """Log gradient norms to diagnose BPTT gradient explosion."""
+        if not self._is_rmm_bptt_ft_enabled() and not self._is_ocsc_ft_enabled():
+            return
+        self._log_current_grad_norms(tag="grad_post_backward")
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """Log actual velocity_head parameter update magnitude per optimizer step."""
+        if not self._is_rmm_bptt_ft_enabled() and not self._is_ocsc_ft_enabled():
+            return
+        try:
+            flow_decoder = self.encoder.agent_encoder.flow_decoder
+            vh_params = [p for p in flow_decoder.velocity_head.parameters() if p.requires_grad]
+            if not vh_params:
+                return
+
+            flat_now = torch.cat([p.detach().view(-1) for p in vh_params])
+            prev_flat = getattr(self, "_prev_vh_params_flat", None)
+            if prev_flat is None or prev_flat.shape != flat_now.shape:
+                self._prev_vh_params_flat = flat_now.clone()
+                return
+
+            delta = (flat_now - prev_flat).norm()
+            self.log(
+                "train/vh_param_delta",
+                delta,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=False,
+                batch_size=1,
+            )
+            log.info(
+                f"[param_delta] step={self.global_step} vh={delta.item():.3e}"
+            )
+            self._prev_vh_params_flat = flat_now.clone()
+        except Exception:
+            pass
+
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
         if self._is_rmm_bptt_ft_enabled():
             result = self._run_flow_bptt_ft_step(tokenized_map, tokenized_agent, data)
+            # Manual-backward 경로의 실제 누적 grad를 dummy backward 이전 시점에서 기록.
+            self._log_current_grad_norms(tag="grad_manual")
             for k, v in result.items():
                 if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
@@ -2732,6 +2754,8 @@ class SMARTFlow(LightningModule):
 
         if self._is_ocsc_ft_enabled():
             result = self._run_flow_ocsc_ft_step(tokenized_map, tokenized_agent, data)
+            # Manual-backward 경로의 실제 누적 grad를 dummy backward 이전 시점에서 기록.
+            self._log_current_grad_norms(tag="grad_manual")
             for k, v in result.items():
                 if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)

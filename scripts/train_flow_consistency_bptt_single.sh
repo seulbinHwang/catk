@@ -107,7 +107,7 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-4}"
 OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
 OCSC_USE_MMD="${OCSC_USE_MMD:-true}"
-OCSC_MAX_ANCHORS="${OCSC_MAX_ANCHORS:-0}"
+OCSC_ANCHOR_STRIDE="${OCSC_ANCHOR_STRIDE:-1}"
 OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-4}"
 OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-4}"
@@ -265,7 +265,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_n_rollouts="${OCSC_N_ROLLOUTS}" \
   model.model_config.finetune.ocsc_loss_type="${OCSC_LOSS_TYPE}" \
   model.model_config.finetune.ocsc_use_mmd="${OCSC_USE_MMD}" \
-  model.model_config.finetune.ocsc_max_anchors="${OCSC_MAX_ANCHORS}" \
+  model.model_config.finetune.ocsc_anchor_stride="${OCSC_ANCHOR_STRIDE}" \
   model.model_config.finetune.ocsc_use_pretrained_ref="${OCSC_USE_PRETRAINED_REF}" \
   model.model_config.finetune.ocsc_target_max_steps="${OCSC_TARGET_MAX_STEPS}" \
   model.model_config.finetune.ocsc_pred_max_steps="${OCSC_PRED_MAX_STEPS}" \
