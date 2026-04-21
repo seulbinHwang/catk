@@ -5,23 +5,30 @@
 # Derived from `pre_bc_flow.yaml` (the 6x H100 80GB default pretrain preset).
 # ----------------------------------------------------------------------------
 # Key differences vs. the 6x H100 preset:
-#   * fewer devices (4 vs 6)
-#   * per-GPU settings are kept identical (train_batch_size=20, num_workers=4,
-#     prefetch_factor=1, val_batch_size=16). bs=20 is known-safe on H100 80GB
-#     from the 6xH100 preset, and hardware-wise the cards are identical, so
-#     there is no memory-side reason to change it.
-#   * effective global batch drops from 20*6=120 to 20*4=80 (0.667x). We apply
-#     the linear LR scaling rule: lr = 4e-4 * 80/120 = 2.667e-4.
+#   * fewer devices (4 vs 6).
+#   * `flow_window_steps=20` is pinned explicitly so the per-GPU memory
+#     profile this preset was tuned against stays fixed regardless of any
+#     future change to the `smart_flow` default.
+#   * `train_batch_size=52` is the measured per-GPU ceiling on H100 80GB after
+#     commit b12e653's `AttentionLayer` activation recomputation kicks in:
+#     peak reserved ~90% at 2s horizon (flow_window_steps=20) with ~10%
+#     head-room for worst-case scenes. bs=56 also survived 200 steps at 94%
+#     peak but bs=60 OOMed at 96.8%, so 52 is the recommended default and 56
+#     is a "push-throughput" CLI override.
+#   * effective global batch becomes 52*4 = 208 (1.73x the 6xH100 preset's
+#     120). The current `lr=2.667e-4` below was scaled for the previous
+#     per-GPU bs=20 (global 80). If you want to preserve the linear-LR
+#     scaling rule at the new global batch 208, override with
+#     `model.model_config.lr=6.933e-4` (= 4e-4 * 208/120). We keep the old lr
+#     as the default to avoid silently changing optimizer behaviour.
 #   * max_epochs / check_val_every_n_epoch / limit_val_batches unchanged, so
 #     the training budget in "epochs over the dataset" matches the 6xH100
-#     preset; wall-clock per epoch is ~1.5x longer since there are 4 instead
-#     of 6 DDP ranks.
+#     preset; wall-clock per epoch at bs=52 is ~87 min on 4xH100.
 #
-# If you need to preserve the exact global batch of 120 instead of running at
-# 80, set `trainer.accumulate_grad_batches=2` (global batch becomes 160; still
-# close, and you can revert `model.model_config.lr=4e-4`). We do not default
-# to accumulation here because the linear-LR path is simpler and the 4xH100
-# pretrain run was validated at effective batch 80 with the scaled LR.
+# If you need to preserve the original global batch of 120 instead of running
+# at 208, drop `data.train_batch_size=30` from the CLI (4*30=120 aligns with
+# the 6xH100 preset). Note bs=30 sits at ~95% peak without activation
+# recomputation, so the activation-recomputation path (b12e653) is required.
 # ============================================================================
 
 defaults:
@@ -29,8 +36,9 @@ defaults:
 
 model:
   model_config:
-    # Effective global batch here is 20 * 4 * 1 = 80 (0.667x the 6xH100
-    # preset's 120). Linear LR scaling rule: lr = 4e-4 * 80/120 ~= 2.667e-4.
+    # Tuned for the previous per-GPU bs=20 (effective global 80). At the new
+    # default bs=52 (global 208) the linear-LR rule would suggest
+    # lr = 4e-4 * 208/120 = 6.933e-4; override from the CLI if desired.
     lr: 2.667e-4
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
@@ -60,10 +68,16 @@ callbacks:
     mode: max
 
 data:
-  # Per-GPU train batch kept at 20 (same as the 6xH100 preset). H100 80GB
-  # comfortably fits bs=20 (the 6xH100 preset reports peak reserved ~49% at
-  # bs=20). bs=28 was validated OK on H100 80GB; if you want to push
-  # throughput you can override `data.train_batch_size=28` from the CLI.
+  # Per-GPU train batch = 52, measured on 4x H100 80GB with
+  # flow_window_steps=20 and the `AttentionLayer` activation recomputation
+  # from commit b12e653 turned on (default). Benchmark on this hardware:
+  #   bs=40  -> peak reserved 80.2%
+  #   bs=48  -> peak reserved 85.3%
+  #   bs=52  -> peak reserved 90.1%  (current default, ~10% head-room)
+  #   bs=56  -> peak reserved 94.0%  (push-throughput CLI override)
+  #   bs=60  -> OOM at 96.8%
+  # Without activation recomputation (pre-b12e653) the ceiling drops to
+  # roughly bs=28 (~82.7% peak).
   train_batch_size: 52
   val_batch_size: 16
   test_batch_size: 16

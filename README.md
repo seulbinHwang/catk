@@ -823,11 +823,18 @@ torchrun \
 
 요약만 보면 아래와 같습니다.
 
-- `train_batch_size=20` (6xH100 preset 과 동일), `trainer.devices=4`, `accumulate_grad_batches=1` -> effective global batch **`80`** (6xH100 preset `120` 의 0.667x).
-- 선형 LR scaling rule 에 따라 `lr=2.667e-4` (= `4e-4 * 80/120`). 나머지 optimizer / scheduler 설정은 `pre_bc_flow` 와 동일.
-- `max_epochs(=64)`, `check_val_every_n_epoch(=8)`, `limit_val_batches(=0.1)`, `val_batch_size(=16)`, `n_rollout_closed_val(=16)` 은 6xH100 preset 과 동일.
-- H100 80GB 하드웨어는 6xH100 preset 과 동일하므로 메모리 측면에서 bs 를 낮출 이유는 없습니다. 필요하면 `data.train_batch_size=28` 까지 올려도 됩니다 (6xH100 preset 과 동일한 실측 상한).
-- Wall-clock 은 DDP rank 가 6 -> 4 로 줄어든 만큼 epoch 당 약 1.5x 길어집니다. 학습 신호 기준 "dataset 위 epoch 수" 는 보존됩니다.
+- `flow_window_steps=20` 을 preset 자체에서 고정합니다. 이 horizon 에 맞춰 아래 batch size 상한을 실측했기 때문에 모델 default 가 바뀌더라도 4x H100 메모리 프로파일이 유지됩니다.
+- `train_batch_size=52` 가 기본값입니다. 커밋 `b12e653` 에서 추가된 `AttentionLayer` activation recomputation 이 기본으로 켜진 상태에서 4x H100 80GB 로 실측한 상한입니다. `trainer.devices=4`, `accumulate_grad_batches=1` -> effective global batch **`208`**.
+- `lr=2.667e-4` 는 이전 per-GPU bs=20 (global 80) 기준으로 맞춰둔 값입니다. 새 global batch 208 에 선형 LR scaling rule 을 적용하려면 `model.model_config.lr=6.933e-4` (= `4e-4 * 208/120`) 로 CLI override 하세요. optimizer 동작을 무언 중에 바꾸지 않기 위해 default 는 기존 값을 유지합니다.
+- `max_epochs(=64)`, `check_val_every_n_epoch(=8)`, `limit_val_batches(=0.1)`, `val_batch_size(=16)`, `n_rollout_closed_val(=16)` 은 6xH100 preset 과 동일합니다.
+- `flow_window_steps=20`, 4x H100 80GB 에서 `AttentionLayer` activation recomputation 이 켜진 상태로 실측한 per-GPU 메모리 수치입니다.
+  - `bs=40`: peak reserved 약 80.2%
+  - `bs=48`: peak reserved 약 85.3%
+  - **`bs=52` (현재 기본값): peak reserved 약 90.1%, 여유 약 10%**
+  - `bs=56`: peak reserved 약 94.0% (200 step 안정) - throughput 을 더 짜내고 싶을 때 override 용.
+  - `bs=60`: 96.8% 에서 OOM.
+- activation recomputation 이 꺼진 이전 코드 (b12e653 이전) 에서는 같은 설정 상한이 약 `bs=28` 이었습니다. 두 경우 모두 동일하게 4x H100 전부를 사용하는 DDP 기준입니다.
+- 1 epoch wall-clock 은 steady-state step time 기준 약 `87 min` (bs=52, 0.44 it/s, 약 2342 steps/epoch). 이전 `bs=20` 설정의 약 `95 min` 대비 epoch 당 약 8% 단축되며, recomputation 으로 인해 step time 이 늘지만 batch 가 커지면서 throughput 이 개선됩니다.
 
 실행 예시:
 
@@ -844,10 +851,10 @@ torchrun \
   task_name=flow_semi_continuous_pretrain_h1004
 ```
 
-effective global batch 을 `120` 으로 정확히 맞추고 싶으면 CLI 에서 아래처럼 override 하면 됩니다 (grad accumulation 2 회, 원래 LR 복구).
+이전 global batch `120` 을 정확히 유지하고 싶으면 `data.train_batch_size=30` 으로 override 하세요 (4*30=120). 단 bs=30 은 activation recomputation 이 꺼진 상태에서는 peak ~95% 로 위험하므로, b12e653 이후 코드에서만 권장합니다.
 
 ```bash
-... trainer.accumulate_grad_batches=2 model.model_config.lr=4e-4
+... data.train_batch_size=30
 ```
 
 ## 6. 평가와 추론
