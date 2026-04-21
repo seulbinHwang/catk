@@ -848,7 +848,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=4 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_semi_continuous_pretrain_h1004
+  task_name=flow_semi_continuous_pretrain_h1004_fw20
 ```
 
 이전 global batch `120` 을 정확히 유지하고 싶으면 `data.train_batch_size=30` 으로 override 하세요 (4*30=120). 단 bs=30 은 activation recomputation 이 꺼진 상태에서는 peak ~95% 로 위험하므로, b12e653 이후 코드에서만 권장합니다.
