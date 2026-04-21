@@ -39,7 +39,7 @@ model:
     # Tuned for the previous per-GPU bs=20 (effective global 80). At the new
     # default bs=52 (global 208) the linear-LR rule would suggest
     # lr = 4e-4 * 208/120 = 6.933e-4; override from the CLI if desired.
-    lr: 2.667e-4
+    lr: 4e-4
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
     n_rollout_closed_val: 16
