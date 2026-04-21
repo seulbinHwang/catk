@@ -188,6 +188,7 @@ class DraftPhysicsRegularizer(nn.Module):
         packed_agent_length: Tensor,
         packed_prev_control: Tensor,
         packed_prev_control_valid: Tensor,
+        future_valid_mask: Tensor | None = None,
     ) -> Dict[str, Tensor]:
         """예측 미래와 GT 미래의 inverse feasibility 값을 계산합니다.
 
@@ -205,6 +206,8 @@ class DraftPhysicsRegularizer(nn.Module):
                 shape은 ``[n_valid_anchor, 3]`` 입니다.
             packed_prev_control_valid: 직전 구간 제어 유효 마스크입니다.
                 shape은 ``[n_valid_anchor]`` 입니다.
+            future_valid_mask: physics loss에 포함할 미래 step입니다.
+                shape은 ``[n_valid_anchor, T]`` 입니다. 값이 없으면 전체 step을 사용합니다.
 
         Returns:
             Dict[str, Tensor]:
@@ -212,6 +215,11 @@ class DraftPhysicsRegularizer(nn.Module):
         """
         if pred_future_norm.numel() == 0:
             return _build_zero_output(pred_future_norm)
+
+        future_valid_mask = self._validate_future_mask(
+            future_norm=pred_future_norm,
+            future_valid_mask=future_valid_mask,
+        )
 
         agent_type = packed_agent_type.to(device=pred_future_norm.device, dtype=torch.long).clamp(min=0, max=2)
         agent_length = packed_agent_length.to(device=pred_future_norm.device, dtype=pred_future_norm.dtype)
@@ -240,6 +248,7 @@ class DraftPhysicsRegularizer(nn.Module):
 
             pred_class_future = pred_future_norm[class_mask]
             gt_class_future = target_future_norm[class_mask].detach()
+            class_future_mask = future_valid_mask[class_mask] if future_valid_mask is not None else None
             class_prev_control = prev_control[class_mask]
             class_prev_valid = prev_control_valid[class_mask]
             class_length = agent_length[class_mask]
@@ -249,11 +258,13 @@ class DraftPhysicsRegularizer(nn.Module):
                     future_norm=pred_class_future,
                     prev_control=class_prev_control,
                     prev_control_valid=class_prev_valid,
+                    future_valid_mask=class_future_mask,
                 )
                 gt_stats = self._compute_pedestrian_stats(
                     future_norm=gt_class_future,
                     prev_control=class_prev_control.detach(),
                     prev_control_valid=class_prev_valid,
+                    future_valid_mask=class_future_mask,
                 )
                 if self.compare_softness_to_gt:
                     soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
@@ -286,6 +297,7 @@ class DraftPhysicsRegularizer(nn.Module):
                     prev_control_valid=class_prev_valid,
                     agent_length=class_length,
                     class_id=class_id,
+                    future_valid_mask=class_future_mask,
                 )
                 gt_stats = self._compute_vehicle_like_stats(
                     future_norm=gt_class_future,
@@ -293,6 +305,7 @@ class DraftPhysicsRegularizer(nn.Module):
                     prev_control_valid=class_prev_valid,
                     agent_length=class_length,
                     class_id=class_id,
+                    future_valid_mask=class_future_mask,
                 )
                 if self.compare_softness_to_gt:
                     soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
@@ -333,6 +346,7 @@ class DraftPhysicsRegularizer(nn.Module):
         prev_control_valid: Tensor,
         agent_length: Tensor,
         class_id: int,
+        future_valid_mask: Tensor | None = None,
     ) -> Dict[str, Tensor]:
         """차량 또는 자전거의 역추론 물리량을 계산합니다.
 
@@ -343,6 +357,7 @@ class DraftPhysicsRegularizer(nn.Module):
             prev_control_valid: 직전 제어 유효 여부입니다. shape은 ``[n_agent]`` 입니다.
             agent_length: agent box length입니다. shape은 ``[n_agent]`` 입니다.
             class_id: ``vehicle`` 또는 ``bicycle``의 종류 번호입니다.
+            future_valid_mask: physics loss에 포함할 미래 step입니다. shape은 ``[n_agent, T]`` 입니다.
 
         Returns:
             Dict[str, Tensor]:
@@ -399,15 +414,18 @@ class DraftPhysicsRegularizer(nn.Module):
             + self._phi(accel.abs() / a_max - 1.0)
             + self._phi(steer.abs() / steer_max_rad - 1.0)
             + self._phi(steer_rate.abs() / steer_rate_max_radps - 1.0)
-            + self._phi(lat_accel / a_lat_max - 1.0)
+            + self._phi(lat_accel / a_lat_max - 1.0),
+            valid_mask=future_valid_mask,
         )
 
         if accel.shape[1] > 1:
             accel_delta = accel[:, 1:] - accel[:, :-1]
             steer_rate_delta = steer_rate[:, 1:] - steer_rate[:, :-1]
+            soft_mask = future_valid_mask[:, 1:] if future_valid_mask is not None else None
             soft = self._mean_over_time(
                 (accel_delta / a_max).square()
-                + (steer_rate_delta / steer_rate_max_radps).square()
+                + (steer_rate_delta / steer_rate_max_radps).square(),
+                valid_mask=soft_mask,
             )
         else:
             soft = hard.new_zeros(hard.shape)
@@ -415,13 +433,17 @@ class DraftPhysicsRegularizer(nn.Module):
         return {
             "hard": hard,
             "soft": soft,
-            "speed_excess_mps": self._mean_over_time(torch.relu(speed.abs() - v_max)),
-            "accel_excess_mps2": self._mean_over_time(torch.relu(accel.abs() - a_max)),
-            "steer_excess_deg": self._mean_over_time(torch.rad2deg(torch.relu(steer.abs() - steer_max_rad))),
-            "steer_rate_excess_degps": self._mean_over_time(
-                torch.rad2deg(torch.relu(steer_rate.abs() - steer_rate_max_radps))
+            "speed_excess_mps": self._mean_over_time(torch.relu(speed.abs() - v_max), valid_mask=future_valid_mask),
+            "accel_excess_mps2": self._mean_over_time(torch.relu(accel.abs() - a_max), valid_mask=future_valid_mask),
+            "steer_excess_deg": self._mean_over_time(
+                torch.rad2deg(torch.relu(steer.abs() - steer_max_rad)),
+                valid_mask=future_valid_mask,
             ),
-            "lat_accel_excess_mps2": self._mean_over_time(torch.relu(lat_accel - a_lat_max)),
+            "steer_rate_excess_degps": self._mean_over_time(
+                torch.rad2deg(torch.relu(steer_rate.abs() - steer_rate_max_radps)),
+                valid_mask=future_valid_mask,
+            ),
+            "lat_accel_excess_mps2": self._mean_over_time(torch.relu(lat_accel - a_lat_max), valid_mask=future_valid_mask),
         }
 
     def _compute_pedestrian_stats(
@@ -429,6 +451,7 @@ class DraftPhysicsRegularizer(nn.Module):
         future_norm: Tensor,
         prev_control: Tensor,
         prev_control_valid: Tensor,
+        future_valid_mask: Tensor | None = None,
     ) -> Dict[str, Tensor]:
         """사람의 2차원 속도와 2차원 가속도를 계산합니다.
 
@@ -437,6 +460,7 @@ class DraftPhysicsRegularizer(nn.Module):
             prev_control: 직전 구간 제어입니다.
                 shape은 ``[n_agent, 3]`` 이고 마지막 차원은 ``[v_x^b, v_y^b, omega]`` 입니다.
             prev_control_valid: 직전 제어 유효 여부입니다. shape은 ``[n_agent]`` 입니다.
+            future_valid_mask: physics loss에 포함할 미래 step입니다. shape은 ``[n_agent, T]`` 입니다.
 
         Returns:
             Dict[str, Tensor]:
@@ -460,13 +484,15 @@ class DraftPhysicsRegularizer(nn.Module):
         a_max = self._select_limit(self.limit_table.a_max_mps2, PEDESTRIAN_TYPE, future_norm)
         hard = self._mean_over_time(
             self._phi(speed / v_max - 1.0)
-            + self._phi(accel / a_max - 1.0)
+            + self._phi(accel / a_max - 1.0),
+            valid_mask=future_valid_mask,
         )
 
         if accel_vec.shape[1] > 1:
             accel_delta = accel_vec[:, 1:] - accel_vec[:, :-1]
             accel_delta_norm = torch.linalg.norm(accel_delta, dim=-1)
-            soft = self._mean_over_time((accel_delta_norm / a_max).square())
+            soft_mask = future_valid_mask[:, 1:] if future_valid_mask is not None else None
+            soft = self._mean_over_time((accel_delta_norm / a_max).square(), valid_mask=soft_mask)
         else:
             soft = hard.new_zeros(hard.shape)
 
@@ -474,19 +500,25 @@ class DraftPhysicsRegularizer(nn.Module):
         heading_gap = self._wrap_angle(heading_local - vel_angle)
         heading_mask = speed > self.pedestrian_heading_speed_threshold_mps
         head = self._mean_over_time(
-            torch.where(heading_mask, heading_gap.square(), torch.zeros_like(heading_gap))
+            torch.where(heading_mask, heading_gap.square(), torch.zeros_like(heading_gap)),
+            valid_mask=future_valid_mask,
+        )
+        heading_error_mask = (
+            heading_mask & future_valid_mask
+            if future_valid_mask is not None
+            else heading_mask
         )
         heading_error_deg = self._masked_mean_over_time(
             torch.rad2deg(heading_gap.abs()),
-            heading_mask,
+            heading_error_mask,
         )
 
         return {
             "hard": hard,
             "soft": soft,
             "head": head,
-            "speed_excess_mps": self._mean_over_time(torch.relu(speed - v_max)),
-            "accel_excess_mps2": self._mean_over_time(torch.relu(accel - a_max)),
+            "speed_excess_mps": self._mean_over_time(torch.relu(speed - v_max), valid_mask=future_valid_mask),
+            "accel_excess_mps2": self._mean_over_time(torch.relu(accel - a_max), valid_mask=future_valid_mask),
             "heading_error_deg": heading_error_deg,
         }
 
@@ -587,11 +619,38 @@ class DraftPhysicsRegularizer(nn.Module):
             return reference.new_zeros(())
         return torch.stack(values).mean()
 
-    def _mean_over_time(self, value: Tensor) -> Tensor:
+    def _validate_future_mask(
+        self,
+        future_norm: Tensor,
+        future_valid_mask: Tensor | None,
+    ) -> Tensor | None:
+        """미래 step별 유효 mask를 확인합니다.
+
+        Args:
+            future_norm: 정규화 미래입니다. shape은 ``[n_agent, T, 4]`` 입니다.
+            future_valid_mask: loss에 포함할 미래 step입니다. shape은 ``[n_agent, T]`` 입니다.
+
+        Returns:
+            Tensor | None:
+                ``future_norm`` 과 같은 장치의 bool mask입니다. 값이 없으면 ``None`` 입니다.
+        """
+        if future_valid_mask is None:
+            return None
+        expected_shape = tuple(future_norm.shape[:2])
+        if tuple(future_valid_mask.shape) != expected_shape:
+            raise ValueError(
+                "future_valid_mask shape must match future_norm first two dimensions: "
+                f"expected={expected_shape}, actual={tuple(future_valid_mask.shape)}."
+            )
+        return future_valid_mask.to(device=future_norm.device, dtype=torch.bool)
+
+    def _mean_over_time(self, value: Tensor, valid_mask: Tensor | None = None) -> Tensor:
         """시간축 평균을 계산합니다.
 
         Args:
             value: 마지막 축이 시간인 텐서입니다. shape은 ``[n_agent, T]`` 입니다.
+            valid_mask: 평균에 포함할 시간 위치입니다. shape은 ``[n_agent, T]`` 입니다.
+                값이 없으면 전체 시간을 평균냅니다.
 
         Returns:
             Tensor:
@@ -599,7 +658,17 @@ class DraftPhysicsRegularizer(nn.Module):
         """
         if value.shape[-1] == 0:
             return value.new_zeros(value.shape[:-1])
-        return value.mean(dim=-1)
+        if valid_mask is None:
+            return value.mean(dim=-1)
+        if tuple(valid_mask.shape) != tuple(value.shape):
+            raise ValueError(
+                "valid_mask shape must match value shape: "
+                f"expected={tuple(value.shape)}, actual={tuple(valid_mask.shape)}."
+            )
+        valid_mask = valid_mask.to(device=value.device, dtype=torch.bool)
+        masked_value = torch.where(valid_mask, value, torch.zeros_like(value))
+        valid_count = valid_mask.to(dtype=value.dtype).sum(dim=-1)
+        return masked_value.sum(dim=-1) / valid_count.clamp_min(1.0)
 
     def _masked_mean_over_time(self, value: Tensor, enabled: Tensor) -> Tensor:
         """시간축에서 활성화된 위치만 평균합니다.

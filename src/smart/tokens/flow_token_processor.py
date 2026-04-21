@@ -104,6 +104,7 @@ class FlowTokenProcessor(TokenProcessor):
             agent_length = self._get_agent_box_length(tokenized_agent)
             flow_train_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
             flow_train_chunks: List[Tensor] = []
+            flow_train_loss_mask_chunks: List[Tensor] = []
             flow_train_agent_type_chunks: List[Tensor] = []
             flow_train_agent_length_chunks: List[Tensor] = []
             flow_train_prev_control_chunks: List[Tensor] = []
@@ -111,8 +112,8 @@ class FlowTokenProcessor(TokenProcessor):
 
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
-                future_valid = self._build_anchor_future_valid(valid=valid, raw_step=raw_step)
-                anchor_mask = current_valid & future_valid
+                future_loss_mask = self._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
+                anchor_mask = current_valid & future_loss_mask.any(dim=1)
                 train_anchor_mask = anchor_mask & train_mask
                 flow_train_mask[:, anchor_offset] = train_anchor_mask
                 if not train_anchor_mask.any():
@@ -128,8 +129,10 @@ class FlowTokenProcessor(TokenProcessor):
                         current_head=current_head,
                         anchor_mask=train_anchor_mask,
                         raw_step=raw_step,
+                        future_loss_mask=future_loss_mask[train_anchor_mask],
                     )
                 )
+                flow_train_loss_mask_chunks.append(future_loss_mask[train_anchor_mask])
                 prev_control, prev_control_valid = self._build_anchor_prev_control(
                     pos=pos,
                     heading=heading,
@@ -150,6 +153,10 @@ class FlowTokenProcessor(TokenProcessor):
                     "flow_train_clean_norm": self._concat_flow_chunks(
                         chunks=flow_train_chunks,
                         dtype=dtype,
+                        device=device,
+                    ),
+                    "flow_train_loss_mask": self._concat_mask_chunks(
+                        chunks=flow_train_loss_mask_chunks,
                         device=device,
                     ),
                     "flow_train_agent_type": self._concat_vector_chunks(
@@ -221,11 +228,40 @@ class FlowTokenProcessor(TokenProcessor):
         return tokenized_agent
 
     def _build_anchor_future_valid(self, valid: Tensor, raw_step: int) -> Tensor:
+        future_loss_mask = self._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
+        return future_loss_mask.all(dim=1)
+
+    def _build_anchor_future_loss_mask(self, valid: Tensor, raw_step: int) -> Tensor:
+        """현재 anchor 직후부터 처음 끊기기 전까지의 미래 mask를 만듭니다.
+
+        Args:
+            valid: 각 agent와 시점의 유효 여부입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+            raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
+
+        Returns:
+            Tensor:
+                미래 step별 loss 사용 여부입니다.
+                shape은 ``[n_agent, flow_window_steps]`` 입니다.
+                현재 다음 시점부터 연속으로 유효한 구간만 ``True`` 입니다.
+        """
         future_start = raw_step + 1
-        future_end = future_start + self.flow_window_steps
-        if future_end > valid.shape[1]:
-            return torch.zeros(valid.shape[0], device=valid.device, dtype=torch.bool)
-        return valid[:, future_start:future_end].all(dim=1)
+        # future_mask: [n_agent, flow_window_steps]
+        future_mask = torch.zeros(
+            (valid.shape[0], self.flow_window_steps),
+            device=valid.device,
+            dtype=torch.bool,
+        )
+        available_len = min(self.flow_window_steps, max(0, valid.shape[1] - future_start))
+        if available_len <= 0:
+            return future_mask
+
+        # available_future_valid: [n_agent, available_len]
+        available_future_valid = valid[:, future_start : future_start + available_len].bool()
+        # continuous_future_valid: [n_agent, available_len]
+        continuous_future_valid = available_future_valid.long().cumprod(dim=1).bool()
+        future_mask[:, :available_len] = continuous_future_valid
+        return future_mask
 
     def _build_anchor_clean_norm(
         self,
@@ -235,8 +271,9 @@ class FlowTokenProcessor(TokenProcessor):
         current_head: Tensor,
         anchor_mask: Tensor,
         raw_step: int,
+        future_loss_mask: Tensor | None = None,
     ) -> Tensor:
-        """한 anchor에서 실제로 쓰는 에이전트만 골라 목표를 만듭니다.
+        """한 anchor에서 실제로 쓰는 agent만 골라 미래 목표를 만듭니다.
 
         Args:
             pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
@@ -246,31 +283,86 @@ class FlowTokenProcessor(TokenProcessor):
             anchor_mask: 이번 anchor를 실제로 학습 또는 평가에 쓰는지 나타냅니다.
                 shape은 ``[n_agent]`` 입니다.
             raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
+            future_loss_mask: loss에 포함할 미래 step입니다.
+                shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
+                값이 없으면 전체 window를 모두 사용합니다.
 
         Returns:
             Tensor:
-                정규화된 2초 미래 목표입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                정규화된 미래 목표입니다.
+                shape은 ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
                 마지막 차원은 ``[x, y, cos, sin]`` 순서입니다.
         """
-        if not anchor_mask.any():
+        num_valid_anchor = int(anchor_mask.sum().item())
+        if num_valid_anchor == 0:
             return pos.new_zeros((0, self.flow_window_steps, 4))
 
+        selected_current_pos = current_pos[anchor_mask]
+        selected_current_head = current_head[anchor_mask]
         future_start = raw_step + 1
         future_end = future_start + self.flow_window_steps
-        if future_end > pos.shape[1]:
-            raise ValueError(
-                "Requested flow future window exceeds the available sequence length: "
-                f"raw_step={raw_step}, flow_window_steps={self.flow_window_steps}, "
-                f"n_step={pos.shape[1]}."
+
+        if future_loss_mask is None:
+            if future_end > pos.shape[1]:
+                raise ValueError(
+                    "Requested flow future window exceeds the available sequence length: "
+                    f"raw_step={raw_step}, flow_window_steps={self.flow_window_steps}, "
+                    f"n_step={pos.shape[1]}."
+                )
+            # future_pos: [n_valid_anchor, flow_window_steps, 2]
+            future_pos = pos[anchor_mask, future_start:future_end]
+            # future_head: [n_valid_anchor, flow_window_steps]
+            future_head = heading[anchor_mask, future_start:future_end]
+        else:
+            expected_shape = (num_valid_anchor, self.flow_window_steps)
+            if tuple(future_loss_mask.shape) != expected_shape:
+                raise ValueError(
+                    "future_loss_mask shape must match selected anchors and flow_window_steps: "
+                    f"expected={expected_shape}, actual={tuple(future_loss_mask.shape)}."
+                )
+            future_loss_mask = future_loss_mask.to(device=pos.device, dtype=torch.bool)
+            valid_step_count = future_loss_mask.long().sum(dim=1)
+            if bool((valid_step_count <= 0).any().item()):
+                raise ValueError("future_loss_mask must contain at least one valid future step per anchor.")
+
+            # future_pos: [n_valid_anchor, flow_window_steps, 2]
+            future_pos = selected_current_pos.unsqueeze(1).expand(-1, self.flow_window_steps, -1).clone()
+            # future_head: [n_valid_anchor, flow_window_steps]
+            future_head = selected_current_head.unsqueeze(1).expand(-1, self.flow_window_steps).clone()
+
+            available_len = min(self.flow_window_steps, max(0, pos.shape[1] - future_start))
+            if available_len > 0:
+                future_pos[:, :available_len] = pos[anchor_mask, future_start : future_start + available_len]
+                future_head[:, :available_len] = heading[anchor_mask, future_start : future_start + available_len]
+
+            last_valid_index = valid_step_count - 1
+            # last_valid_pos: [n_valid_anchor, 2]
+            last_valid_pos = future_pos.gather(
+                dim=1,
+                index=last_valid_index.view(-1, 1, 1).expand(-1, 1, future_pos.shape[-1]),
+            ).squeeze(1)
+            # last_valid_head: [n_valid_anchor]
+            last_valid_head = future_head.gather(
+                dim=1,
+                index=last_valid_index.view(-1, 1),
+            ).squeeze(1)
+            invalid_future_mask = ~future_loss_mask
+            future_pos = torch.where(
+                invalid_future_mask.unsqueeze(-1),
+                last_valid_pos.unsqueeze(1),
+                future_pos,
+            )
+            future_head = torch.where(
+                invalid_future_mask,
+                last_valid_head.unsqueeze(1),
+                future_head,
             )
 
-        future_pos = pos[anchor_mask, future_start:future_end]
-        future_head = heading[anchor_mask, future_start:future_end]
         future_pos_local, future_head_local = transform_to_local(
             pos_global=future_pos,
             head_global=future_head,
-            pos_now=current_pos[anchor_mask],
-            head_now=current_head[anchor_mask],
+            pos_now=selected_current_pos,
+            head_now=selected_current_head,
         )
         return torch.stack(
             [
@@ -388,6 +480,27 @@ class FlowTokenProcessor(TokenProcessor):
         if len(chunks) == 0:
             return torch.zeros((0, self.flow_window_steps, 4), device=device, dtype=dtype)
         return torch.cat(chunks, dim=0)
+
+    def _concat_mask_chunks(
+        self,
+        chunks: List[Tensor],
+        device: torch.device,
+    ) -> Tensor:
+        """미래 step별 loss mask 조각을 하나로 잇습니다.
+
+        Args:
+            chunks: 각 anchor에서 고른 mask 조각 목록입니다.
+                각 원소 shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
+            device: 반환 텐서 장치입니다.
+
+        Returns:
+            Tensor:
+                이어 붙인 mask입니다.
+                shape은 ``[n_total_valid_anchor, flow_window_steps]`` 입니다.
+        """
+        if len(chunks) == 0:
+            return torch.zeros((0, self.flow_window_steps), device=device, dtype=torch.bool)
+        return torch.cat([chunk.to(device=device, dtype=torch.bool) for chunk in chunks], dim=0)
 
     def _concat_vector_chunks(
         self,

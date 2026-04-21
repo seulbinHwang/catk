@@ -90,11 +90,17 @@ class SMARTFlowDecoder(nn.Module):
             "flow_train_mask": "flow_train_clean_norm",
             "flow_eval_mask": "flow_eval_clean_norm",
         }[anchor_mask_key]
+        flow_loss_mask = (
+            tokenized_agent["flow_train_loss_mask"]
+            if anchor_mask_key == "flow_train_mask"
+            else None
+        )
         return self.agent_encoder(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             anchor_mask=tokenized_agent[anchor_mask_key],
             flow_clean_norm=tokenized_agent[flow_clean_norm_key],
+            flow_loss_mask=flow_loss_mask,
         )
 
     def forward(

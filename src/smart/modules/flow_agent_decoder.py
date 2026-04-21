@@ -700,7 +700,24 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         map_feature: Dict[str, torch.Tensor],
         anchor_mask: torch.Tensor,
         flow_clean_norm: torch.Tensor,
+        flow_loss_mask: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
+        """학습 또는 평가용 anchor를 골라 flow decoder 출력을 만듭니다.
+
+        Args:
+            tokenized_agent: agent 토큰 사전입니다.
+            map_feature: map encoder가 만든 지도 특징 사전입니다.
+            anchor_mask: 사용할 anchor 표시입니다. shape은 ``[n_agent, n_anchor]`` 입니다.
+            flow_clean_norm: 정답 미래입니다.
+                shape은 ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
+            flow_loss_mask: loss에 포함할 미래 step입니다.
+                shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
+                값이 없으면 전체 step을 사용합니다.
+
+        Returns:
+            Dict[str, torch.Tensor]:
+                flow prediction, target, anchor 문맥, 현재 위치/방향, batch 정보를 담은 사전입니다.
+        """
         ctx_hidden_pack = self._encode_context(
             agent_token_index=tokenized_agent["ctx_sampled_idx"],
             pos_a=tokenized_agent["ctx_sampled_pos"],
@@ -716,9 +733,18 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             anchor_mask=anchor_mask,
         )
 
+        if flow_loss_mask is not None:
+            expected_shape = tuple(flow_clean_norm.shape[:2])
+            if tuple(flow_loss_mask.shape) != expected_shape:
+                raise ValueError(
+                    "flow_loss_mask shape must match flow_clean_norm first two dimensions: "
+                    f"expected={expected_shape}, actual={tuple(flow_loss_mask.shape)}."
+                )
+            flow_loss_mask = flow_loss_mask.to(device=flow_clean_norm.device, dtype=torch.bool)
+
         if flow_clean_norm.numel() == 0:
             empty = flow_clean_norm.new_zeros((0, self.flow_window_steps, 4))
-            return {
+            output = {
                 "flow_pred_norm": empty,
                 "flow_target_norm": empty,
                 "flow_pred_clean_norm": empty,
@@ -731,6 +757,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 "flow_agent_batch": flow_decoder_context["agent_batch"],
                 "flow_anchor_step_id": flow_decoder_context["anchor_step_id"],
             }
+            if flow_loss_mask is not None:
+                output["flow_loss_mask"] = flow_loss_mask
+            return output
 
         flow_sample = self.flow_ode.sample(flow_clean_norm, target_type="velocity")
         flow_pred_norm = self.flow_decoder(
@@ -747,7 +776,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_pred_norm,
             flow_sample.tau,
         )
-        return {
+        output = {
             "flow_pred_norm": flow_pred_norm,
             "flow_target_norm": flow_sample.target,
             "flow_pred_clean_norm": flow_pred_clean_norm,
@@ -760,6 +789,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "flow_agent_batch": flow_decoder_context["agent_batch"],
             "flow_anchor_step_id": flow_decoder_context["anchor_step_id"],
         }
+        if flow_loss_mask is not None:
+            output["flow_loss_mask"] = flow_loss_mask
+        return output
 
     def _prepare_rollout_cache_impl(
         self,

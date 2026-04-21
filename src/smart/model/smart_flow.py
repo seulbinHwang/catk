@@ -435,36 +435,45 @@ class SMARTFlow(LightningModule):
         self,
         pred_clean_norm: Tensor,
         target_clean_norm: Tensor,
+        valid_mask: Tensor | None = None,
     ) -> Dict[str, Tensor]:
-        """2초 open-loop 위치와 방향 오차를 계산합니다.
+        """open-loop 위치와 방향 오차를 유효한 미래 step 기준으로 계산합니다.
 
         Args:
             pred_clean_norm: 모델이 만든 정규화된 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                shape은 ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
             target_clean_norm: 정답 정규화 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                shape은 ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
+            valid_mask: 지표 계산에 포함할 미래 step입니다.
+                shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
+                값이 없으면 전체 step을 사용합니다.
 
         Returns:
             Dict[str, Tensor]:
                 meter 단위 위치 오차와 degree 단위 방향 오차를 담은 사전입니다.
         """
+        metric_mask = valid_mask.detach() if valid_mask is not None else None
         with torch.no_grad():
             return {
                 self.open_metric_names["ade"]: ade_future(
                     pred_clean_norm.detach(),
                     target_clean_norm.detach(),
+                    valid_mask=metric_mask,
                 ),
                 self.open_metric_names["fde"]: fde_future(
                     pred_clean_norm.detach(),
                     target_clean_norm.detach(),
+                    valid_mask=metric_mask,
                 ),
                 self.open_metric_names["yaw_ade"]: yaw_ade_future(
                     pred_clean_norm.detach(),
                     target_clean_norm.detach(),
+                    valid_mask=metric_mask,
                 ),
                 self.open_metric_names["yaw_fde"]: yaw_fde_future(
                     pred_clean_norm.detach(),
                     target_clean_norm.detach(),
+                    valid_mask=metric_mask,
                 ),
             }
 
@@ -477,17 +486,25 @@ class SMARTFlow(LightningModule):
         Args:
             pred_dict: flow decoder가 낸 출력 사전입니다.
                 ``flow_pred_norm`` 과 ``flow_target_norm`` 의 shape은
-                ``[n_valid_anchor, 20, 4]`` 입니다.
+                ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
+                ``flow_loss_mask`` 가 있으면 shape은
+                ``[n_valid_anchor, flow_window_steps]`` 입니다.
 
         Returns:
             tuple[Tensor, Dict[str, Tensor], int]:
                 flow matching loss, meter/degree 단위 지표 사전,
                 그리고 유효 anchor 개수입니다.
         """
-        loss = flow_matching_loss(pred_dict["flow_pred_norm"], pred_dict["flow_target_norm"])
+        loss_mask = pred_dict.get("flow_loss_mask")
+        loss = flow_matching_loss(
+            pred_dict["flow_pred_norm"],
+            pred_dict["flow_target_norm"],
+            valid_mask=loss_mask,
+        )
         metric_dict = self._build_open_loop_metric_dict(
             pred_clean_norm=pred_dict["flow_pred_clean_norm"],
             target_clean_norm=pred_dict["flow_clean_norm"],
+            valid_mask=loss_mask,
         )
         sample_count = int(pred_dict["flow_clean_norm"].shape[0])
         return loss, metric_dict, sample_count
@@ -1639,6 +1656,7 @@ class SMARTFlow(LightningModule):
                 packed_agent_length=tokenized_agent["flow_train_agent_length"],
                 packed_prev_control=tokenized_agent["flow_train_prev_control"],
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+                future_valid_mask=pred_dict.get("flow_loss_mask"),
             )
             if not all(torch.isfinite(value).all() for value in physics_dict.values()):
                 return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
@@ -1654,6 +1672,7 @@ class SMARTFlow(LightningModule):
                 packed_agent_length=tokenized_agent["flow_train_agent_length"].float(),
                 packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
+                future_valid_mask=pred_dict.get("flow_loss_mask"),
             )
         if not all(torch.isfinite(value).all() for value in physics_dict.values()):
             return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
