@@ -64,7 +64,7 @@ data:
   # comfortably fits bs=20 (the 6xH100 preset reports peak reserved ~49% at
   # bs=20). bs=28 was validated OK on H100 80GB; if you want to push
   # throughput you can override `data.train_batch_size=28` from the CLI.
-  train_batch_size: 20
+  train_batch_size: 52
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
