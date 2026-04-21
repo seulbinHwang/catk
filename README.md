@@ -307,6 +307,22 @@ torchrun \
   data.train_batch_size=14
 ```
 
+`flow_window_steps=80` + 6x H100 80GB 조합은 `configs/experiment/pre_bc_flow_6_h100.yaml` preset으로 묶어 두었습니다. 이 preset은 `flow_window_steps=80`, `data.train_batch_size=18` 고정값을 쓰며, activation checkpointing이 켜져 있는 상태에서 500-step probe로 OOM 없이 안정 (rank 0 peak 약 87%) 인 것을 실측한 값입니다. bs=19/20은 각각 step 121 / step 430에서 OOM 났습니다. 1 epoch 예상 시간은 약 2.2시간 (global batch 108, step당 약 1.76s, epoch 당 ~4509 step).
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=pre_bc_flow_6_h100 \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_semi_continuous_pretrain_h1006_fw80
+```
+
 ### 5.1 학습 설정을 거칠게 이해하는 법
 
 - 기본 진입점은 `configs/run.yaml`이고, 여기서 `data/model/callbacks/logger/trainer/paths/hydra`를 조합합니다.
