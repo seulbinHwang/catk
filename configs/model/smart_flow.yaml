@@ -120,7 +120,7 @@ model_config:
     time_span: 30
     num_historical_steps: 11
     num_future_steps: 80
-    flow_window_steps: 20
+    flow_window_steps: 80
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
