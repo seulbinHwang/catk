@@ -39,8 +39,14 @@ model:
       # ── OCSC 핵심 파라미터 ─────────────────────────────────────────────
       # G: 시나리오당 closed-loop rollout 수 (bptt_n_rollouts 와 동일 개념)
       ocsc_n_rollouts: 2
+      # anchor stride: 매 N번째 2Hz step만 anchor로 사용
+      # stride=4 → [0,4,8,12] 4개, stride=1 → 전체 14개
+      ocsc_anchor_stride: 4
       # 일관성 loss: "l2" (MSE), "smooth_l1", "l1"
       ocsc_loss_type: l2
+      # true (권장): proper MMD² with self-terms (mode collapse 방지)
+      # false: 기존 paired L2 mean (ablation 비교용)
+      ocsc_use_mmd: true
       # False: current policy 로 open-loop target 생성 (학습 중 target 도 변함)
       # True: frozen pretrained policy 로 open-loop target 생성
       ocsc_use_pretrained_ref: false

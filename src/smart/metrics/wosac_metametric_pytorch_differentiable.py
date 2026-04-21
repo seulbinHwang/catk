@@ -26,10 +26,21 @@ _METRIC_FIELD_NAMES = [
     "offroad_indication",
     "traffic_light_violation",
 ]
-# angular_speed 는 과거 tau=0.01 로 설정했으나, softmax Jacobian 이 1/tau 스케일이므로
-# tau=0.01 → tau=0.1 대비 10배 그래디언트 증폭. BPTT 학습에서 grad explosion 원인.
-# → custom tau 없이 default_tau(=0.1) 를 일괄 적용.
-_DEFAULT_SOFT_CUSTOM_TAUS: Dict[str, float] = {}
+# tau 는 bin_width 에 비례하게 설정해야 gradient 가 흐른다.
+# tau / bin_width ≈ 0.04 (linear_speed) 이면 softmax 가 완전히 포화 → gradient ≈ 0.
+# 권장: tau ≈ bin_width / 2.
+#   linear_speed:      bin_width=2.50  → tau=1.25
+#   linear_accel:      bin_width=2.18  → tau=1.00
+#   angular_speed:     bin_width=0.114 → tau=0.05  (과거 0.01은 grad explosion, 0.1은 양호했으나 조금 더 날카롭게)
+#   angular_accel:     bin_width=0.571 → tau=0.25
+# 주의: tau 를 키우면 gradient 가 살아나는 대신 metric 추정 자체가 softer 해짐.
+#        bptt_grad_clip_traj 로 전체 clip 을 조절하는 것을 권장.
+_DEFAULT_SOFT_CUSTOM_TAUS: Dict[str, float] = {
+    "linear_speed": 1.25,        # bin_width=2.50 m/s
+    "linear_acceleration": 1.00, # bin_width=2.18 m/s²
+    "angular_speed": 0.05,       # bin_width=0.114 rad/s  (0.1에서 축소 — grad 크기 2x, explosion 주의)
+    "angular_acceleration": 0.25, # bin_width=0.571 rad/s²
+}
 
 
 def _squeeze_log_sample(x: Tensor) -> Tensor:
@@ -246,7 +257,18 @@ def compute_wosac_metametric_soft_batched(
     default_tau: float = 0.1,
     custom_taus: Optional[Dict[str, float]] = None,
     debug: bool = False,
+    train_weight_overrides: Optional[Dict[str, float]] = None,
 ) -> Tensor:
+    """``train_weight_overrides``: 학습 loss 전용 weight 재정의 (로깅에는 영향 없음).
+    예) 이미 포화된 safety 항 축소, 낮은 kinematic 항 증폭:
+        {
+            "linear_speed": 0.15, "linear_acceleration": 0.15, "angular_speed": 0.15,
+            "angular_acceleration": 0.10,
+            "collision_indication": 0.10, "offroad_indication": 0.10,
+            "distance_to_nearest_object": 0.10, "distance_to_road_edge": 0.10,
+            "time_to_collision": 0.10, "traffic_light_violation": 0.0,
+        }
+    """
     """Batched differentiable metametric for *S* scenarios in a single pass.
 
     Features are padded to ``A_max`` (the largest agent count across
@@ -412,10 +434,15 @@ def compute_wosac_metametric_soft_batched(
         lik_dict[f"{name}_likelihood"] = _likelihood_from_log_ll(masked_sum / valid_count)
 
     # ── 3. weighted sum ──────────────────────────────────────────────────────
+    # train_weight_overrides 가 있으면 학습 loss 전용으로 재정의한 weight 사용.
+    # 로깅(debug) 은 항상 원본 config 가중치 기준.
 
     metametric = torch.zeros(S, dtype=dtype, device=device)
     for fn in _METRIC_FIELD_NAMES:
-        w = getattr(config, fn).metametric_weight
+        if train_weight_overrides is not None and fn in train_weight_overrides:
+            w = train_weight_overrides[fn]
+        else:
+            w = getattr(config, fn).metametric_weight
         metametric = metametric + w * lik_dict[f"{fn}_likelihood"]
 
     if debug:

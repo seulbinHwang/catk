@@ -44,6 +44,10 @@ CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_l
 
 TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
+FIXED_SCENARIO_MODE="${FIXED_SCENARIO_MODE:-true}"
+FIXED_SCENARIO_INDEX="${FIXED_SCENARIO_INDEX:-0}"
+FIXED_SCENARIO_COUNT="${FIXED_SCENARIO_COUNT:-4}"
+FIXED_SCENARIO_PKL="${FIXED_SCENARIO_PKL:-}"
 
 # ── Single-scenario 특화 기본값 ─────────────────────────────────────────────
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
@@ -58,10 +62,13 @@ CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-0}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
 GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-0}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
-PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
-PIN_MEMORY="${PIN_MEMORY:-true}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-false}"
+PIN_MEMORY="${PIN_MEMORY:-false}"
+SEED="${SEED:-817}"
+DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
+TRAINER_DETERMINISTIC="${TRAINER_DETERMINISTIC:-true}"
 
 # single scenario: LR 조금 높여도 안정적
 LR="${LR:-1e-6}"
@@ -97,8 +104,10 @@ VALIDATION_METRIC="${VALIDATION_METRIC:-hard}"
 WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
 # ── OCSC 파라미터 ──────────────────────────────────────────────────────────
-OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-8}"
+OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-4}"
 OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
+OCSC_USE_MMD="${OCSC_USE_MMD:-true}"
+OCSC_MAX_ANCHORS="${OCSC_MAX_ANCHORS:-0}"
 OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-4}"
 OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-4}"
@@ -135,14 +144,78 @@ if [ ! -f "${CKPT_PATH}" ]; then
   exit 1
 fi
 
+# 고정 시나리오 모드:
+# - FIXED_SCENARIO_PKL 이 주어지면 해당 파일 1개만 사용
+# - 아니면 TRAIN_RAW_DIR 의 정렬된 pkl 목록에서
+#   [FIXED_SCENARIO_INDEX, FIXED_SCENARIO_INDEX + FIXED_SCENARIO_COUNT) 구간 사용
+TRAIN_RAW_DIR_EFFECTIVE="${TRAIN_RAW_DIR}"
+FIXED_SCENARIO_TMP_DIR=""
+if [ "${FIXED_SCENARIO_MODE}" = "true" ]; then
+  FIXED_SCENARIO_TMP_DIR="$(mktemp -d "/tmp/ocsc_single_scenario.XXXXXX")"
+  trap 'if [ -n "${FIXED_SCENARIO_TMP_DIR}" ] && [ -d "${FIXED_SCENARIO_TMP_DIR}" ]; then rm -rf "${FIXED_SCENARIO_TMP_DIR}"; fi' EXIT
+
+  if [ -n "${FIXED_SCENARIO_PKL}" ]; then
+    if [ ! -f "${FIXED_SCENARIO_PKL}" ]; then
+      echo "[ERROR] FIXED_SCENARIO_PKL not found: ${FIXED_SCENARIO_PKL}"
+      exit 1
+    fi
+    ln -s "${FIXED_SCENARIO_PKL}" "${FIXED_SCENARIO_TMP_DIR}/scenario.pkl"
+  else
+    SELECTED_PKL_PATHS="$(python3 - <<PY
+import pathlib, sys
+raw_dir = pathlib.Path("${TRAIN_RAW_DIR}")
+paths = sorted([p for p in raw_dir.glob("*.pkl") if p.is_file()])
+if not paths:
+    print("")
+    sys.exit(0)
+start = int("${FIXED_SCENARIO_INDEX}")
+count = int("${FIXED_SCENARIO_COUNT}")
+if start < 0 or start >= len(paths) or count <= 0:
+    print("")
+    sys.exit(0)
+end = min(len(paths), start + count)
+selected = paths[start:end]
+if not selected:
+    print("")
+    sys.exit(0)
+print("\\n".join(p.as_posix() for p in selected))
+PY
+)"
+    if [ -z "${SELECTED_PKL_PATHS}" ]; then
+      echo "[ERROR] Could not select FIXED_SCENARIO_INDEX=${FIXED_SCENARIO_INDEX}, FIXED_SCENARIO_COUNT=${FIXED_SCENARIO_COUNT} under ${TRAIN_RAW_DIR}"
+      exit 1
+    fi
+    i=0
+    printf "%s\n" "${SELECTED_PKL_PATHS}" | while IFS= read -r p; do
+      [ -n "${p}" ] || continue
+      ln -s "${p}" "${FIXED_SCENARIO_TMP_DIR}/scenario_${i}.pkl"
+      i=$((i + 1))
+    done
+  fi
+
+  TRAIN_RAW_DIR_EFFECTIVE="${FIXED_SCENARIO_TMP_DIR}"
+fi
+
 echo "[single-scenario] Experiment=${MY_EXPERIMENT}"
 echo "CACHE_ROOT=${CACHE_ROOT}"
 echo "TRAIN_RAW_DIR=${TRAIN_RAW_DIR}"
+echo "TRAIN_RAW_DIR_EFFECTIVE=${TRAIN_RAW_DIR_EFFECTIVE}"
+echo "FIXED_SCENARIO_MODE=${FIXED_SCENARIO_MODE} FIXED_SCENARIO_INDEX=${FIXED_SCENARIO_INDEX} FIXED_SCENARIO_COUNT=${FIXED_SCENARIO_COUNT}"
+if [ -n "${FIXED_SCENARIO_PKL}" ]; then
+  echo "FIXED_SCENARIO_PKL=${FIXED_SCENARIO_PKL}"
+fi
 echo "CKPT_PATH=${CKPT_PATH}"
 echo "NPROC=${NPROC_PER_NODE} TRAIN_B=${TRAIN_B} MAX_EPOCHS=${MAX_EPOCHS} LIMIT_TRAIN=${LIMIT_TRAIN_BATCHES}"
+echo "SEED=${SEED} DATA_SHUFFLE=${DATA_SHUFFLE} DETERMINISTIC=${TRAINER_DETERMINISTIC}"
 echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_TARGET=${OCSC_TARGET_MAX_STEPS}cs OCSC_PRED=${OCSC_PRED_MAX_STEPS}cs"
 echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_GRAD_CLIP=${BPTT_GRAD_CLIP_TRAJ} LR=${LR}"
+
+# num_workers=0 인 경우 torch DataLoader 제약상 prefetch_factor를 넘기면 안 됩니다.
+PREFETCH_ARG=""
+if [ "${NUM_WORKERS}" -gt 0 ]; then
+  PREFETCH_ARG="data.prefetch_factor=${PREFETCH_FACTOR}"
+fi
 
 PORT="$(get_free_port)"
 torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_endpoint="127.0.0.1:${PORT}" -m src.run \
@@ -151,13 +224,14 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   task_name="${MY_TASK_NAME}" \
   ckpt_path="${CKPT_PATH}" \
   paths.cache_root="${CACHE_ROOT}" \
-  data.train_raw_dir="${TRAIN_RAW_DIR}" \
+  seed="${SEED}" \
+  data.shuffle="${DATA_SHUFFLE}" \
+  data.train_raw_dir="${TRAIN_RAW_DIR_EFFECTIVE}" \
   data.train_tfrecords_splitted="${TRAIN_TFRECORDS_SPLITTED}" \
   data.train_batch_size="${TRAIN_B}" \
   data.val_batch_size="${VAL_B}" \
   data.train_max_num="${TRAIN_MAX_NUM}" \
   data.num_workers="${NUM_WORKERS}" \
-  data.prefetch_factor="${PREFETCH_FACTOR}" \
   data.persistent_workers="${PERSISTENT_WORKERS}" \
   data.pin_memory="${PIN_MEMORY}" \
   trainer.limit_train_batches="${LIMIT_TRAIN_BATCHES}" \
@@ -167,10 +241,9 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   trainer.check_val_every_n_epoch="${CHECK_VAL_EVERY_N_EPOCH}" \
   trainer.log_every_n_steps="${LOG_EVERY_N_STEPS}" \
   trainer.precision="${PRECISION}" \
+  trainer.deterministic="${TRAINER_DETERMINISTIC}" \
   trainer.gradient_clip_val="${GRAD_CLIP_VAL}" \
   logger.wandb.entity="${WANDB_ENTITY}" \
-  trainer.limit_train_batches=1 \
-  trainer.limit_val_batches=0.0 \
   model.model_config.lr="${LR}" \
   model.model_config.lr_warmup_steps="${LR_WARMUP_STEPS}" \
   model.model_config.lr_total_steps="${LR_TOTAL_STEPS}" \
@@ -191,6 +264,8 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.flow_reg_lambda="${FLOW_REG_LAMBDA}" \
   model.model_config.finetune.ocsc_n_rollouts="${OCSC_N_ROLLOUTS}" \
   model.model_config.finetune.ocsc_loss_type="${OCSC_LOSS_TYPE}" \
+  model.model_config.finetune.ocsc_use_mmd="${OCSC_USE_MMD}" \
+  model.model_config.finetune.ocsc_max_anchors="${OCSC_MAX_ANCHORS}" \
   model.model_config.finetune.ocsc_use_pretrained_ref="${OCSC_USE_PRETRAINED_REF}" \
   model.model_config.finetune.ocsc_target_max_steps="${OCSC_TARGET_MAX_STEPS}" \
   model.model_config.finetune.ocsc_pred_max_steps="${OCSC_PRED_MAX_STEPS}" \
@@ -203,4 +278,5 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.bptt_last_n_coarse_steps="${BPTT_LAST_N_COARSE_STEPS}" \
   model.model_config.finetune.bptt_last_n_solver_steps="${BPTT_LAST_N_SOLVER_STEPS}" \
   model.model_config.finetune.bptt_grad_clip_traj="${BPTT_GRAD_CLIP_TRAJ}" \
+  ${PREFETCH_ARG} \
   ${EXTRA_ARGS}

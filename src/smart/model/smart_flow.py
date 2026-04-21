@@ -24,6 +24,7 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_2s,
     yaw_fde_2s,
 )
+from src.smart.metrics.mmd_consistency_loss import mmd_from_stacked
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.modules.flow_reward import KinematicProjectionReward
@@ -1552,6 +1553,9 @@ class SMARTFlow(LightningModule):
         pred_max_steps_raw = int(getattr(self.finetune_config, "ocsc_pred_max_steps", 4))
         pred_max_steps: int | None = pred_max_steps_raw if pred_max_steps_raw > 0 else None
         loss_type = str(getattr(self.finetune_config, "ocsc_loss_type", "l2"))
+        # ocsc_use_mmd=True: proper MMD² (self-term 포함, mode collapse 방지)
+        # ocsc_use_mmd=False: 기존 paired L2 mean (비교/ablation 용)
+        use_mmd = bool(getattr(self.finetune_config, "ocsc_use_mmd", True))
         heading_w = float(getattr(self.finetune_config, "ocsc_heading_weight", 0.0))
         sequential = bool(getattr(self.finetune_config, "bptt_sequential_rollouts", False))
         use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
@@ -1596,13 +1600,17 @@ class SMARTFlow(LightningModule):
                 map_feature=map_feature,
             )
 
-        # ── Current-state tensors from rollout_cache ─────────────────────────
-        # valid_window: [n_agents, n_hist_2hz]; last column = valid at current time
-        active_mask  = rollout_cache["valid_window"][:, -1]        # [n_agents] bool
-        current_pos  = rollout_cache["pos_window"][:, -1]          # [n_agents, 2]
-        current_head = rollout_cache["head_window"][:, -1]         # [n_agents]
-        # feat_a_now: [n_agents, hidden_dim] — context after all attention layers
-        active_hidden = rollout_cache["feat_a_now"][active_mask]   # [n_active, hidden_dim]
+        # ── Anchor index selection (strided, uniform coverage) ───────────────
+        # anchor_idx=k: GT step k를 "현재 시점"으로 하고, 이후 pred_steps 예측.
+        # stride=N → 매 N번째 step만 anchor로 사용 (메모리/품질 트레이드오프).
+        # stride=1 이면 가능한 모든 위치, stride=4 이면 0,4,8,12 (14→4개).
+        step_current_2hz = int(rollout_cache["valid_window"].shape[1])
+        total_2hz_steps = int(tokenized_agent["gt_pos"].shape[1])
+        pred_steps = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+        anchor_stride = max(1, int(getattr(self.finetune_config, "ocsc_anchor_stride", 4)))
+
+        valid_anchor_end = max(1, total_2hz_steps - pred_steps)
+        all_anchor_indices = list(range(0, valid_anchor_end, anchor_stride))
 
         # bptt_last_n_coarse_steps → effective warm_coarse
         _n_coarse_pred = pred_max_steps_raw if pred_max_steps_raw > 0 else 16
@@ -1642,33 +1650,25 @@ class SMARTFlow(LightningModule):
                 return pos_loss + heading_w * head_loss
             return pos_loss
 
-        # ── 3. Open-loop target (no_grad, G samples via direct flow ODE) ─────
-        # _sample_open_loop_future_from_hidden: single flow ODE call (no autoregressive
-        # feedback). Uses feat_a_now as context → [n_active, 20, 4] normalized local.
+        # ── world → normalized frame helper ──────────────────────────────────
+        def _cl_to_norm(cl_xy: Tensor, cl_head: Tensor, current_pos_active: Tensor, current_head_active: Tensor) -> Tensor:
+            return self._world_traj_to_flow_norm(
+                pred_traj=cl_xy,
+                pred_head=cl_head,
+                current_pos=current_pos_active,
+                current_head=current_head_active,
+            )
+
+        # ── 3+4. Anchor-sequential loop: OL → CL → loss → backward → free ────
+        # 한 anchor씩 처리 후 즉시 backward하여 모든 anchor의 캐시/OL/CL을 동시에
+        # 메모리에 올리지 않는다. 피크 메모리 = O(G), anchor 수에 무관.
         _use_ref = (
             bool(getattr(self.finetune_config, "ocsc_use_pretrained_ref", False))
             and self.ref_flow_decoder is not None
         )
         _agent_enc = self.encoder.agent_encoder
         _orig_fd = _agent_enc.flow_decoder
-        if _use_ref:
-            _agent_enc.flow_decoder = self.ref_flow_decoder
-        try:
-            with torch.no_grad():
-                open_samples: list[Tensor] = []
-                for g in range(G):
-                    # Different seed per rollout index for variance reduction
-                    open_g = _agent_enc._sample_open_loop_future_from_hidden(
-                        anchor_hidden_valid=active_hidden,
-                        sampling_noise=self.eval_sampling_noise,
-                        sampling_seed=g,
-                    )
-                    open_samples.append(open_g)  # [n_active, 20, 4]
-        finally:
-            if _use_ref:
-                _agent_enc.flow_decoder = _orig_fd
 
-        # ── BPTT flow ODE settings ────────────────────────────────────────────
         flow_ode = _agent_enc.flow_ode
         flow_ode.use_adjoint_for_bptt = use_adjoint
         flow_ode.last_n_grad_solver_steps = (
@@ -1680,110 +1680,169 @@ class SMARTFlow(LightningModule):
                 f"velocity detach on first {flow_ode.solver_steps - flow_ode.last_n_grad_solver_steps} solver steps."
             )
 
-        # ── world → normalized frame helper ──────────────────────────────────
-        # Convert closed-loop world XY+heading → normalized local frame [x/20, y/20, cos, sin]
-        # using the current position/heading as reference (same as open-loop anchor).
-        _cur_pos_active  = current_pos[active_mask]   # [n_active, 2]
-        _cur_head_active = current_head[active_mask]   # [n_active]
+        total_loss_accum = 0.0
+        n_valid_anchors = 0
+        _diag_pred_traj = None   # 마지막 anchor CL traj (variance 진단용)
+        _diag_ol_norms: list[Tensor] = []
+        _diag_active_mask: Tensor | None = None
+        _seq_keys = {"gt_pos", "gt_heading", "valid_mask", "gt_idx"}
 
-        def _cl_to_norm(cl_xy: Tensor, cl_head: Tensor) -> Tensor:
-            """cl_xy: [n_active, T, 2], cl_head: [n_active, T] → [n_active, T, 4]"""
-            return self._world_traj_to_flow_norm(
-                pred_traj=cl_xy,
-                pred_head=cl_head,
-                current_pos=_cur_pos_active,
-                current_head=_cur_head_active,
-            )
+        # 총 backward 호출 횟수를 미리 추정할 수 없으므로, 두 단계로 처리:
+        # 1) 각 anchor의 loss를 immediate-backward 방식으로 누적
+        # 2) 마지막에 DDP dummy loss 반환 (gradients already accumulated)
+        # n_valid_anchors가 0이면 dummy loss만 반환.
 
-        # ── 4a. Sequential mode: backward per (open_g, closed_g) pair ────────
-        if sequential and G > 1:
-            total_loss_accum = 0.0
-            count = 0
-            try:
-                for g in range(G):
-                    pred_traj_g, pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
-                        data=data,
-                        tokenized_agent=tokenized_agent,
+        # immediate backward를 위해 총 단위 수를 가정해 스케일을 정해야 한다.
+        # 단순히 len(all_anchor_indices)로 나누면 빈 anchor(active agent 없음)는
+        # gradient를 작게 만들 수 있지만, 실제 학습에서 빈 anchor는 드물고 허용 가능.
+        n_anchors_total = max(1, len(all_anchor_indices))
+
+        try:
+            for anchor_idx in all_anchor_indices:
+                # ── 3a. Build anchor tokenized_agent (slice views, no copy) ──
+                hist_start = max(0, anchor_idx + 1 - step_current_2hz)
+                tokenized_agent_anchor: dict[str, Tensor] = {}
+                for key, value in tokenized_agent.items():
+                    if (
+                        key in _seq_keys
+                        and torch.is_tensor(value)
+                        and value.dim() >= 2
+                    ):
+                        tokenized_agent_anchor[key] = value[:, hist_start : anchor_idx + 1]
+                    else:
+                        tokenized_agent_anchor[key] = value
+
+                # ── 3b. Build anchor rollout cache ────────────────────────────
+                with torch.no_grad():
+                    rollout_cache_anchor = _agent_enc.prepare_inference_cache(
+                        tokenized_agent=tokenized_agent_anchor,
                         map_feature=map_feature,
-                        rollout_cache=rollout_cache,
-                        rollout_indices=[g],
+                    )
+                active_mask = rollout_cache_anchor["valid_window"][:, -1]
+                if not bool(active_mask.any()):
+                    del rollout_cache_anchor
+                    continue
+
+                current_pos_active = rollout_cache_anchor["pos_window"][:, -1][active_mask]
+                current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
+                active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
+
+                # ── 3c. Open-loop samples (G, no_grad) ───────────────────────
+                if _use_ref:
+                    _agent_enc.flow_decoder = self.ref_flow_decoder
+                with torch.no_grad():
+                    ol_norms: list[Tensor] = []
+                    for g in range(G):
+                        ol_norms.append(_agent_enc._sample_open_loop_future_from_hidden(
+                            anchor_hidden_valid=active_hidden,
+                            sampling_noise=self.eval_sampling_noise,
+                            sampling_seed=g,
+                        ))
+                if _use_ref:
+                    _agent_enc.flow_decoder = _orig_fd
+
+                # ── 4. Closed-loop rollout + loss ─────────────────────────────
+                if sequential and G > 1:
+                    # G rollout 순차 backward (메모리 최소)
+                    for g in range(G):
+                        pred_traj_g, pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
+                            data=data,
+                            tokenized_agent=tokenized_agent_anchor,
+                            map_feature=map_feature,
+                            rollout_cache=rollout_cache_anchor,
+                            rollout_indices=[g],
+                            return_anchor_hidden=True,
+                            full_grad=True,
+                            max_steps=pred_max_steps,
+                            warm_coarse_steps=warm_coarse,
+                        )
+                        T_cl = pred_traj_g.shape[-2]
+                        cl_xy_g = pred_traj_g[active_mask, 0, :T_cl, :]
+                        cl_head_g = pred_head_g[active_mask, 0, :T_cl]
+                        if pred_traj_g.requires_grad and _grad_clip > 0:
+                            pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
+                        cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
+                        loss_g = _consistency_loss(cl_norm_g, ol_norms[g])
+                        total_loss_accum += loss_g.item()
+                        (loss_g / (n_anchors_total * G)).backward()
+                        del pred_traj_g, pred_z_g, pred_head_g, cl_xy_g, cl_head_g, cl_norm_g
+                else:
+                    # G rollout 병렬 (MMD 사용 가능)
+                    pred_traj_all, pred_z_all, pred_head_all, _ = self._run_parallel_rollout_chunk(
+                        data=data,
+                        tokenized_agent=tokenized_agent_anchor,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache_anchor,
+                        rollout_indices=list(range(G)),
                         return_anchor_hidden=True,
                         full_grad=True,
                         max_steps=pred_max_steps,
                         warm_coarse_steps=warm_coarse,
                     )
-                    # pred_traj_g: [n_agents, 1, T_cl, 2]
-                    T_cl = pred_traj_g.shape[-2]
-                    cl_xy_g   = pred_traj_g[active_mask, 0, :T_cl, :]  # [n_active, T_cl, 2]
-                    cl_head_g = pred_head_g[active_mask, 0, :T_cl]      # [n_active, T_cl]
+                    if pred_traj_all.requires_grad and _grad_clip > 0:
+                        pred_traj_all.register_hook(_make_norm_clip_hook(_grad_clip))
+                    T_cl = pred_traj_all.shape[-2]
+                    cl_norms: list[Tensor] = []
+                    for g in range(G):
+                        cl_norms.append(_cl_to_norm(
+                            pred_traj_all[active_mask, g, :T_cl, :],
+                            pred_head_all[active_mask, g, :T_cl],
+                            current_pos_active, current_head_active,
+                        ))
+                    if use_mmd and G >= 2:
+                        T_min = min(T_cl, ol_norms[0].shape[-2])
+                        cl_stack = torch.stack(cl_norms, dim=0)[:, :, :T_min, :]
+                        ol_stack = torch.stack(ol_norms, dim=0)[:, :, :T_min, :].detach()
+                        anchor_loss = mmd_from_stacked(cl_stack, ol_stack)
+                    else:
+                        anchor_loss = torch.stack([
+                            _consistency_loss(cl_norms[g], ol_norms[g]) for g in range(G)
+                        ]).mean()
+                    total_loss_accum += anchor_loss.item()
+                    (anchor_loss / n_anchors_total).backward()
 
-                    if pred_traj_g.requires_grad and _grad_clip > 0:
-                        pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
+                    # 진단용: 마지막 anchor의 CL/OL 보존 (variance logging)
+                    _diag_pred_traj = pred_traj_all.detach()
+                    _diag_ol_norms = [o.detach() for o in ol_norms]
+                    _diag_active_mask = active_mask
 
-                    # Convert to normalized frame and compute loss vs open-loop
-                    cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g)       # [n_active, T_cl, 4]
-                    loss_g = _consistency_loss(cl_norm_g, open_samples[g])
-                    total_loss_accum += loss_g.item()
-                    count += 1
-                    (loss_g / G).backward()
+                    del pred_traj_all, pred_z_all, pred_head_all, cl_norms, anchor_loss
 
-                    del pred_traj_g, pred_z_g, pred_head_g, cl_xy_g, cl_head_g, cl_norm_g
-            finally:
-                flow_ode.use_adjoint_for_bptt = False
-                flow_ode.last_n_grad_solver_steps = 0
+                n_valid_anchors += 1
+                del rollout_cache_anchor, active_hidden, current_pos_active, current_head_active, ol_norms
 
-            if count == 0:
-                return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
+        finally:
+            flow_ode.use_adjoint_for_bptt = False
+            flow_ode.last_n_grad_solver_steps = 0
+            if _use_ref:
+                _agent_enc.flow_decoder = _orig_fd
 
-            mean_loss = torch.tensor(
-                total_loss_accum / count,
-                dtype=torch.float32, device=agent_batch.device,
-            )
-            log.info(f"[ocsc] step={int(getattr(self,'global_step',0))} consistency_loss={mean_loss.item():.4f}")
-            _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
-            ret = {
-                "loss": _ddp_dummy,
-                "train/consistency_loss": mean_loss,
-            }
+        if n_valid_anchors == 0:
+            return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
 
-        else:
-            # ── 4b. Parallel mode: all G closed-loop rollouts at once ─────────
-            try:
-                pred_traj_all, pred_z_all, pred_head_all, _ = self._run_parallel_rollout_chunk(
-                    data=data,
-                    tokenized_agent=tokenized_agent,
-                    map_feature=map_feature,
-                    rollout_cache=rollout_cache,
-                    rollout_indices=list(range(G)),
-                    return_anchor_hidden=True,
-                    full_grad=True,
-                    max_steps=pred_max_steps,
-                    warm_coarse_steps=warm_coarse,
-                )
-                # pred_traj_all: [n_agents, G, T_cl, 2]
-            finally:
-                flow_ode.use_adjoint_for_bptt = False
-                flow_ode.last_n_grad_solver_steps = 0
+        mean_loss = torch.tensor(
+            total_loss_accum / n_valid_anchors,
+            dtype=torch.float32, device=agent_batch.device,
+        )
+        log.info(
+            f"[ocsc] step={int(getattr(self,'global_step',0))} "
+            f"consistency_loss={mean_loss.item():.4f} n_anchors={n_valid_anchors}"
+        )
+        _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
+        ret = {
+            "loss": _ddp_dummy,
+            "train/consistency_loss": mean_loss,
+        }
 
-            if pred_traj_all.requires_grad and _grad_clip > 0:
-                pred_traj_all.register_hook(_make_norm_clip_hook(_grad_clip))
-
-            # Compute paired loss: mean_g(consistency(closed_norm_g, open_g))
-            T_cl = pred_traj_all.shape[-2]
-            loss_per_g: list[Tensor] = []
-            for g in range(G):
-                cl_xy_g   = pred_traj_all[active_mask, g, :T_cl, :]   # [n_active, T_cl, 2]
-                cl_head_g = pred_head_all[active_mask, g, :T_cl]       # [n_active, T_cl]
-                cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g)            # [n_active, T_cl, 4]
-                loss_per_g.append(_consistency_loss(cl_norm_g, open_samples[g]))
-
-            loss = torch.stack(loss_per_g).mean()
-            log.info(f"[ocsc] step={int(getattr(self,'global_step',0))} consistency_loss={loss.item():.4f}")
-
-            ret = {
-                "loss": loss,
-                "train/consistency_loss": loss.detach(),
-            }
+        # Mode collapse 진단 (마지막 anchor, no extra compute)
+        if _diag_pred_traj is not None and _diag_pred_traj.shape[1] >= 2 and _diag_active_mask is not None:
+            with torch.no_grad():
+                _cl_var = _diag_pred_traj[_diag_active_mask].var(dim=1).mean()
+                ret["train/traj_var_cl"] = _cl_var
+            if len(_diag_ol_norms) >= 2:
+                with torch.no_grad():
+                    _ol_var = torch.stack(_diag_ol_norms, dim=0).var(dim=0).mean()
+                    ret["train/traj_var_ol"] = _ol_var
 
         # ── 5. Hard RMM monitoring (WOSAC official 8초, no_grad, configurable interval) ──
         # 훈련 rollout 은 2초(max_steps=4)여서 WOSAC 기준에 맞지 않는다.

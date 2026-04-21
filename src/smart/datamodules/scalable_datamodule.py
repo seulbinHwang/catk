@@ -84,37 +84,40 @@ class MultiDataModule(LightningDataModule):
             raise ValueError(f"{stage} should be one of [fit, validate, test]")
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.train_batch_size,
-            shuffle=self.shuffle,
-            num_workers=self.num_workers,
-            prefetch_factor=self.prefetch_factor,
-            pin_memory=self.pin_memory,
-            persistent_workers=self.persistent_workers,
-            drop_last=False,
-        )
+        loader_kwargs = {
+            "batch_size": self.train_batch_size,
+            "shuffle": self.shuffle,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
+            "drop_last": False,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(self.train_dataset, **loader_kwargs)
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.val_batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            prefetch_factor=self.prefetch_factor,
-            pin_memory=self.pin_memory,  # False
-            persistent_workers=self.persistent_workers,
-            drop_last=False,
-        )
+        loader_kwargs = {
+            "batch_size": self.val_batch_size,
+            "shuffle": False,
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,  # False
+            "persistent_workers": self.persistent_workers,
+            "drop_last": False,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(self.val_dataset, **loader_kwargs)
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(
-            self.test_dataset,
-            batch_size=self.test_batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,  # 0
-            prefetch_factor=self.prefetch_factor,
-            pin_memory=self.pin_memory,  # False
-            persistent_workers=self.persistent_workers,
-            drop_last=False,
-        )
+        loader_kwargs = {
+            "batch_size": self.test_batch_size,
+            "shuffle": False,
+            "num_workers": self.num_workers,  # 0
+            "pin_memory": self.pin_memory,  # False
+            "persistent_workers": self.persistent_workers,
+            "drop_last": False,
+        }
+        if self.num_workers > 0:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        return DataLoader(self.test_dataset, **loader_kwargs)
