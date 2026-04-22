@@ -25,7 +25,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_consistency_bptt}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-single}"
@@ -44,24 +44,32 @@ CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_l
 
 TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
-FIXED_SCENARIO_MODE="${FIXED_SCENARIO_MODE:-true}"
+FIXED_SCENARIO_MODE="${FIXED_SCENARIO_MODE:-false}"
 FIXED_SCENARIO_INDEX="${FIXED_SCENARIO_INDEX:-0}"
 FIXED_SCENARIO_COUNT="${FIXED_SCENARIO_COUNT:-4}"
 FIXED_SCENARIO_PKL="${FIXED_SCENARIO_PKL:-}"
 
 # ── Single-scenario 특화 기본값 ─────────────────────────────────────────────
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-TRAIN_B="${TRAIN_B:-1}"
-VAL_B="${VAL_B:-1}"
+# TRAIN_B / VAL_B: 각 train/val dataloader의 batch size (배치 "크기")
+TRAIN_B="${TRAIN_B:-24}"
+VAL_B="${VAL_B:-8}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
-LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1}"
-LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-0}"
+# LIMIT_*_BATCHES: "배치 개수 제한" (batch size와 다른 개념)
+# - float(0~1]: 전체 dataloader 중 비율
+# - int(>=1): 실제 배치 개수
+# - val을 끄려면 LIMIT_VAL_BATCHES=0
+LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
+LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-1}"
 MAX_EPOCHS="${MAX_EPOCHS:-5000}"
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-0}"
-CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-0}"
+# VAL_CHECK_INTERVAL: step(배치) 단위 validation 주기. 0 금지.
+# CHECK_VAL_EVERY_N_EPOCH: epoch 단위 validation 주기. 0 금지.
+# 실제 validation 실행 조건은 둘 다 만족해야 하며, val을 끄려면 LIMIT_VAL_BATCHES=0 사용.
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-20}"
+CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-1}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
-GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-0}"
+GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-1.0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-false}"
@@ -98,8 +106,14 @@ N_VIS_BATCH="${N_VIS_BATCH:-0}"
 N_VIS_SCENARIO="${N_VIS_SCENARIO:-0}"
 N_VIS_ROLLOUT="${N_VIS_ROLLOUT:-0}"
 DELETE_LOCAL_VIDEOS_AFTER_UPLOAD="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD:-false}"
-N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-0}"
-N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-0}"
+# N_ROLLOUT_CLOSED_VAL: validation에서 시나리오당 closed-loop rollout 샘플 개수.
+#   - 0이면 closed-loop 결과 텐서가 비어 validation 단계에서 오류가 날 수 있음.
+#   - validation을 켠다면 보통 1 이상 권장.
+N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-1}"
+# N_BATCH_SIM_AGENTS_METRIC: val에서 sim-agents metric(WOSAC 계열)을 계산할 배치 수 제한.
+#   - 0: metric 계산 스킵
+#   - 1 이상: 앞에서 N개 val batch만 metric 계산 (속도/안정성 트레이드오프)
+N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-1}"
 VALIDATION_METRIC="${VALIDATION_METRIC:-hard}"
 WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
@@ -113,7 +127,7 @@ OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-4}"
 OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-4}"
 OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-1.0}"
 # single B: HardRMM 계산이 빠르므로 5 step 마다 (multi B 에서는 1 또는 더 높게)
-OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-true}"
+OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-false}"
 OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-10}"
 
 # ── BPTT tricks ────────────────────────────────────────────────────────────
@@ -122,7 +136,7 @@ BPTT_SEQUENTIAL_ROLLOUTS="${BPTT_SEQUENTIAL_ROLLOUTS:-false}"
 BPTT_WARM_COARSE_STEPS="${BPTT_WARM_COARSE_STEPS:-0}"
 BPTT_LAST_N_COARSE_STEPS="${BPTT_LAST_N_COARSE_STEPS:-0}"
 BPTT_LAST_N_SOLVER_STEPS="${BPTT_LAST_N_SOLVER_STEPS:-0}"
-BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-0}"
+BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-0.0}"
 FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
 FLOW_REG_LAMBDA="${FLOW_REG_LAMBDA:-0.0}"
 
@@ -242,7 +256,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   trainer.log_every_n_steps="${LOG_EVERY_N_STEPS}" \
   trainer.precision="${PRECISION}" \
   trainer.deterministic="${TRAINER_DETERMINISTIC}" \
-  trainer.gradient_clip_val="${GRAD_CLIP_VAL}" \
   logger.wandb.entity="${WANDB_ENTITY}" \
   model.model_config.lr="${LR}" \
   model.model_config.lr_warmup_steps="${LR_WARMUP_STEPS}" \

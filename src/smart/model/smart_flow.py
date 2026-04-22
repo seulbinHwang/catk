@@ -84,6 +84,8 @@ def _slice_log_feat_dict_to_pred_horizon(
 
 class SMARTFlow(LightningModule):
 
+    automatic_optimization = False
+
     def __init__(self, model_config) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -1680,8 +1682,9 @@ class SMARTFlow(LightningModule):
                 f"velocity detach on first {flow_ode.solver_steps - flow_ode.last_n_grad_solver_steps} solver steps."
             )
 
-        anchor_losses: list[Tensor] = []
+        total_loss_accum = 0.0
         n_valid_anchors = 0
+        n_anchors_total = max(1, len(all_anchor_indices))
         _diag_pred_traj = None   # 마지막 anchor CL traj (variance 진단용)
         _diag_ol_norms: list[Tensor] = []
         _diag_active_mask: Tensor | None = None
@@ -1753,8 +1756,9 @@ class SMARTFlow(LightningModule):
                             pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
                         cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
                         loss_g = _consistency_loss(cl_norm_g, ol_norms[g])
-                        anchor_losses.append(loss_g)
-                        del pred_traj_g, pred_z_g, pred_head_g, cl_xy_g, cl_head_g, cl_norm_g
+                        total_loss_accum += loss_g.item()
+                        self.manual_backward(loss_g / (n_anchors_total * G))
+                        del pred_traj_g, pred_z_g, pred_head_g, cl_xy_g, cl_head_g, cl_norm_g, loss_g
                 else:
                     # G rollout 병렬 (MMD 사용 가능)
                     pred_traj_all, pred_z_all, pred_head_all, _ = self._run_parallel_rollout_chunk(
@@ -1787,14 +1791,15 @@ class SMARTFlow(LightningModule):
                         anchor_loss = torch.stack([
                             _consistency_loss(cl_norms[g], ol_norms[g]) for g in range(G)
                         ]).mean()
-                    anchor_losses.append(anchor_loss)
+                    total_loss_accum += anchor_loss.item()
+                    self.manual_backward(anchor_loss / n_anchors_total)
 
                     # 진단용: 마지막 anchor의 CL/OL 보존 (variance logging)
                     _diag_pred_traj = pred_traj_all.detach()
                     _diag_ol_norms = [o.detach() for o in ol_norms]
                     _diag_active_mask = active_mask
 
-                    del pred_traj_all, pred_z_all, pred_head_all, cl_norms
+                    del pred_traj_all, pred_z_all, pred_head_all, cl_norms, anchor_loss
 
                 n_valid_anchors += 1
                 del rollout_cache_anchor, active_hidden, current_pos_active, current_head_active, ol_norms
@@ -1806,16 +1811,18 @@ class SMARTFlow(LightningModule):
                 _agent_enc.flow_decoder = _orig_fd
 
         if n_valid_anchors == 0:
-            return {"loss": next(iter(self.parameters())).new_zeros(())}
+            return {}
 
-        mean_loss = torch.stack(anchor_losses).mean()
+        mean_loss = torch.tensor(
+            total_loss_accum / n_valid_anchors,
+            dtype=torch.float32, device=agent_batch.device,
+        )
         log.info(
             f"[ocsc] step={int(getattr(self,'global_step',0))} "
             f"consistency_loss={mean_loss.item():.4f} n_anchors={n_valid_anchors}"
         )
         ret = {
-            "loss": mean_loss,
-            "train/consistency_loss": mean_loss.detach(),
+            "train/consistency_loss": mean_loss,
         }
 
         # Mode collapse 진단 (마지막 anchor, no extra compute)
@@ -2663,126 +2670,45 @@ class SMARTFlow(LightningModule):
             )
 
 
-    def _log_current_grad_norms(self, tag: str = "grad") -> None:
-        """Log gradient norms from the currently accumulated grads."""
-        try:
-            flow_decoder = self.encoder.agent_encoder.flow_decoder
-            # velocity_head 전체 grad norm
-            vh_params = [p for p in flow_decoder.velocity_head.parameters() if p.grad is not None]
-            if vh_params:
-                vh_norm = torch.stack([p.grad.detach().norm() for p in vh_params]).norm()
-                self.log("train/grad_norm_velocity_head", vh_norm,
-                         on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
-
-            # velocity_head 내 최대 단일 파라미터 grad norm (폭발 탐지)
-            if vh_params:
-                max_param_norm = max(p.grad.detach().norm().item() for p in vh_params)
-                self.log("train/grad_norm_vh_max_param", float(max_param_norm),
-                         on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
-
-            # 전체 학습 파라미터 grad norm
-            all_params = [p for p in self.parameters() if p.grad is not None]
-            if all_params:
-                total_norm = torch.stack([p.grad.detach().norm() for p in all_params]).norm()
-                self.log("train/grad_norm_total", total_norm,
-                         on_step=True, on_epoch=False, sync_dist=False, batch_size=1)
-                # 파일 로그에도 항상 기록 (wandb disabled 환경에서도 확인 가능)
-                vh_norm_val = vh_norm.item() if vh_params else float("nan")
-                log.info(
-                    f"[{tag}] step={self.global_step} "
-                    f"total={total_norm.item():.3e} "
-                    f"vh={vh_norm_val:.3e}"
-                )
-                # 1000 이상이면 경고
-                if total_norm.item() > 1000:
-                    log.warning(
-                        f"[rmm_bptt] LARGE grad norm={total_norm.item():.1f} at step={self.global_step}"
-                    )
-        except Exception:
-            pass
-
-    def on_after_backward(self) -> None:
-        """Log gradient norms to diagnose BPTT gradient explosion."""
-        if not self._is_rmm_bptt_ft_enabled() and not self._is_ocsc_ft_enabled():
-            return
-        self._log_current_grad_norms(tag="grad_post_backward")
-
-    def on_before_optimizer_step(self, optimizer) -> None:
-        """Log actual velocity_head parameter update magnitude per optimizer step."""
-        if not self._is_rmm_bptt_ft_enabled() and not self._is_ocsc_ft_enabled():
-            return
-        try:
-            flow_decoder = self.encoder.agent_encoder.flow_decoder
-            vh_params = [p for p in flow_decoder.velocity_head.parameters() if p.requires_grad]
-            if not vh_params:
-                return
-
-            flat_now = torch.cat([p.detach().view(-1) for p in vh_params])
-            prev_flat = getattr(self, "_prev_vh_params_flat", None)
-            if prev_flat is None or prev_flat.shape != flat_now.shape:
-                self._prev_vh_params_flat = flat_now.clone()
-                return
-
-            delta = (flat_now - prev_flat).norm()
-            self.log(
-                "train/vh_param_delta",
-                delta,
-                on_step=True,
-                on_epoch=False,
-                sync_dist=False,
-                batch_size=1,
-            )
-            log.info(
-                f"[param_delta] step={self.global_step} vh={delta.item():.3e}"
-            )
-            self._prev_vh_params_flat = flat_now.clone()
-        except Exception:
-            pass
-
     def training_step(self, data, batch_idx):
+        opt = self.optimizers()
+        sch = self.lr_schedulers()
+        opt.zero_grad()
+
         tokenized_map, tokenized_agent = self.token_processor(data)
 
         if self._is_rmm_bptt_ft_enabled():
             result = self._run_flow_bptt_ft_step(tokenized_map, tokenized_agent, data)
-            # Manual-backward 경로의 실제 누적 grad를 dummy backward 이전 시점에서 기록.
-            self._log_current_grad_norms(tag="grad_manual")
             for k, v in result.items():
                 if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            return result["loss"]
 
-        if self._is_ocsc_ft_enabled():
-            result = self._run_flow_ocsc_ft_step(tokenized_map, tokenized_agent, data)
-            # Manual-backward 경로의 실제 누적 grad를 dummy backward 이전 시점에서 기록.
-            self._log_current_grad_norms(tag="grad_manual")
-            for k, v in result.items():
-                if k != "loss" and isinstance(v, (Tensor, float)):
+        elif self._is_ocsc_ft_enabled():
+            diag = self._run_flow_ocsc_ft_step(tokenized_map, tokenized_agent, data)
+            for k, v in diag.items():
+                if isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            return result["loss"]
+            if "train/consistency_loss" in diag:
+                self.log("train/loss", diag["train/consistency_loss"], on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
-        if self._is_kinematic_proj_ft_enabled():
+        elif self._is_kinematic_proj_ft_enabled():
             result = self._run_kinematic_proj_ft_step(tokenized_map, tokenized_agent)
+            self.manual_backward(result["loss"])
             for k, v in result.items():
-                if k != "loss" and isinstance(v, Tensor):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                elif k != "loss" and isinstance(v, float):
+                if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            return result["loss"]
 
-        if self._is_kinematic_reward_ft_enabled():
+        elif self._is_kinematic_reward_ft_enabled():
             result = self._run_kinematic_reward_ft_step(tokenized_map, tokenized_agent)
+            self.manual_backward(result["loss"])
             for k, v in result.items():
-                if k != "loss" and isinstance(v, Tensor):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                elif k != "loss" and isinstance(v, float):
+                if k != "loss" and isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            return result["loss"]
 
-        if self._is_terminal_cost_final_step_enabled():
+        elif self._is_terminal_cost_final_step_enabled():
             with torch.no_grad():
                 map_feature = self.encoder.encode_map(tokenized_map)
                 _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
@@ -2817,66 +2743,38 @@ class SMARTFlow(LightningModule):
                 )
                 self.log("train/loss", result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("train/l2_loss", result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            return result.loss
+            self.manual_backward(result.loss)
 
-        if self._is_adjoint_matching_enabled():
+        elif self._is_adjoint_matching_enabled():
             am_result = self._run_adjoint_matching_training_step(
                 tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,
             )
             self.log("train/loss", am_result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log(
-                "train/terminal_cost",
-                am_result.terminal_cost, # (마지막 궤적과 projector 간의 gap) 의 평균값
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            self.log(
-                "train/projection_gap",
-                am_result.projection_gap, # (마지막 궤적과 projector 간의 gap) 의 평균값
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            self.log(
-                "train/residual_norm",
-                am_result.residual_norm, # residual_velocity 의 출력 값
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            return am_result.loss
+            self.log("train/terminal_cost", am_result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/projection_gap", am_result.projection_gap, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/residual_norm", am_result.residual_norm, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.manual_backward(am_result.loss)
 
-        pred = self.encoder(
-            tokenized_map,
-            tokenized_agent,
-            anchor_mask_key="flow_train_mask",
-        )
-        loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
-        self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/ADE2s", open_metric_dict["ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/FDE2s", open_metric_dict["FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log(
-            "train/ADEyaw2s",
-            open_metric_dict["yaw_ADE2s"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/FDEyaw2s",
-            open_metric_dict["yaw_FDE2s"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        return loss
+        else:
+            pred = self.encoder(
+                tokenized_map,
+                tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+            loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+            self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/ADE2s", open_metric_dict["ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/FDE2s", open_metric_dict["FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/ADEyaw2s", open_metric_dict["yaw_ADE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/FDEyaw2s", open_metric_dict["yaw_FDE2s"], on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.manual_backward(loss)
+
+        _clip_val = float(getattr(self.finetune_config, "gradient_clip_val", 0.0) or 0.0)
+        if _clip_val > 0:
+            self.clip_gradients(opt, gradient_clip_val=_clip_val)
+
+        opt.step()
 
     def _projected_generation_val_step(
         self,
@@ -3176,7 +3074,7 @@ class SMARTFlow(LightningModule):
                     vis.save_video_scenario_rollout(scenario_rollouts[scen_idx], self.n_vis_rollout)
                     for video_path in vis.video_paths:
                         if video_logger is not None:
-                            video_logger.log_video("/".join(video_path.split("/")[-3:]), [video_path])
+                            video_logger.log_video("/".join(video_path.split("/")[-3:]), [video_path], format="gif")
                             if self.delete_local_videos_after_wandb_upload:
                                 self._cleanup_local_video(video_path)
 
@@ -3275,7 +3173,7 @@ class SMARTFlow(LightningModule):
                     closed_loop_metric,
                     on_step=False,
                     on_epoch=True,
-                    sync_dist=False,
+                    sync_dist=True,
                 )
                 if self.global_rank == 0 and self.logger is not None:
                     epoch_sim_agents_metrics["epoch"] = (
@@ -3320,6 +3218,14 @@ class SMARTFlow(LightningModule):
         if self.lr_total_steps > 0:
             return self.lr_total_steps
         if self.lr_scheduler_unit == "step" and self.trainer is not None:
+            # automatic_optimization=False에서는 estimated_stepping_batches가
+            # 0을 반환할 수 있으므로 num_batches * max_epochs로 직접 추정
+            try:
+                n_batches = len(self.trainer.train_dataloader)
+            except Exception:
+                n_batches = 0
+            if n_batches > 0:
+                return max(1, n_batches * max(1, int(self.trainer.max_epochs)))
             estimated_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0))
             if estimated_steps > 0:
                 return estimated_steps
@@ -3328,9 +3234,10 @@ class SMARTFlow(LightningModule):
         return 1
 
     def configure_optimizers(self):
-        total_steps = self._resolve_lr_total_steps()
-
         def lr_lambda(current_index: int) -> float:
+            if not hasattr(self, "_cached_lr_total_steps"):
+                self._cached_lr_total_steps = self._resolve_lr_total_steps()
+            total_steps = self._cached_lr_total_steps
             current_step = current_index + 1
             if current_step < self.lr_warmup_steps:
                 return self.lr_min_ratio + (1.0 - self.lr_min_ratio) * current_step / max(self.lr_warmup_steps, 1)
