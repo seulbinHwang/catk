@@ -82,8 +82,8 @@ model_config:
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
-    flow_solver_steps: 16
-    flow_solver_method: midpoint
+    flow_solver_steps: 32
+    flow_solver_method: euler
     flow_solver_eps: 1.0e-3
     closed_loop_rollout_mode: raw_fm # raw_fm
     use_dynamics_feasible_commit_bridge: false
