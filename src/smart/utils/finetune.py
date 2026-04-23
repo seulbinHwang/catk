@@ -131,6 +131,8 @@ class FinetuneConfig:
     ocsc_eval_hard_rmm: bool = True
     #: hard RMM 평가 빈도 (N training step 마다 1 회). 1 = 매 step.
     ocsc_eval_hard_rmm_interval: int = 1
+    #: GT FM regularization 가중치. 0 이면 비활성 (MMD only).
+    ocsc_fm_reg_lambda: float = 0.0
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -237,6 +239,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_heading_weight=float(_read_config_value(finetune, "ocsc_heading_weight", 0.0)),
         ocsc_eval_hard_rmm=bool(_read_config_value(finetune, "ocsc_eval_hard_rmm", True)),
         ocsc_eval_hard_rmm_interval=int(_read_config_value(finetune, "ocsc_eval_hard_rmm_interval", 1)),
+        ocsc_fm_reg_lambda=float(_read_config_value(finetune, "ocsc_fm_reg_lambda", 0.0)),
     )
 
 

@@ -25,7 +25,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_consistency_bptt}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-single}"
@@ -52,7 +52,7 @@ FIXED_SCENARIO_PKL="${FIXED_SCENARIO_PKL:-}"
 # ── Single-scenario 특화 기본값 ─────────────────────────────────────────────
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 # TRAIN_B / VAL_B: 각 train/val dataloader의 batch size (배치 "크기")
-TRAIN_B="${TRAIN_B:-24}"
+TRAIN_B="${TRAIN_B:-20}"
 VAL_B="${VAL_B:-8}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
 # LIMIT_*_BATCHES: "배치 개수 제한" (batch size와 다른 개념)
@@ -109,7 +109,7 @@ DELETE_LOCAL_VIDEOS_AFTER_UPLOAD="${DELETE_LOCAL_VIDEOS_AFTER_UPLOAD:-false}"
 # N_ROLLOUT_CLOSED_VAL: validation에서 시나리오당 closed-loop rollout 샘플 개수.
 #   - 0이면 closed-loop 결과 텐서가 비어 validation 단계에서 오류가 날 수 있음.
 #   - validation을 켠다면 보통 1 이상 권장.
-N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-1}"
+N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-32}"
 # N_BATCH_SIM_AGENTS_METRIC: val에서 sim-agents metric(WOSAC 계열)을 계산할 배치 수 제한.
 #   - 0: metric 계산 스킵
 #   - 1 이상: 앞에서 N개 val batch만 metric 계산 (속도/안정성 트레이드오프)
@@ -118,7 +118,7 @@ VALIDATION_METRIC="${VALIDATION_METRIC:-hard}"
 WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
 # ── OCSC 파라미터 ──────────────────────────────────────────────────────────
-OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-4}"
+OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-5}"
 OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
 OCSC_USE_MMD="${OCSC_USE_MMD:-true}"
 OCSC_ANCHOR_STRIDE="${OCSC_ANCHOR_STRIDE:-1}"
@@ -126,6 +126,9 @@ OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-4}"
 OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-4}"
 OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-1.0}"
+# GT FM regularization: velocity_head가 GT에서 drift하지 않도록 per-anchor FM loss를 MMD와 함께 backward.
+# 0.0이면 기존 동작(MMD only). 권장 시작값: 0.1~1.0
+OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA:-1.0}"
 # single B: HardRMM 계산이 빠르므로 5 step 마다 (multi B 에서는 1 또는 더 높게)
 OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-false}"
 OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-10}"
@@ -222,6 +225,7 @@ echo "CKPT_PATH=${CKPT_PATH}"
 echo "NPROC=${NPROC_PER_NODE} TRAIN_B=${TRAIN_B} MAX_EPOCHS=${MAX_EPOCHS} LIMIT_TRAIN=${LIMIT_TRAIN_BATCHES}"
 echo "SEED=${SEED} DATA_SHUFFLE=${DATA_SHUFFLE} DETERMINISTIC=${TRAINER_DETERMINISTIC}"
 echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_TARGET=${OCSC_TARGET_MAX_STEPS}cs OCSC_PRED=${OCSC_PRED_MAX_STEPS}cs"
+echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA}"
 echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_GRAD_CLIP=${BPTT_GRAD_CLIP_TRAJ} LR=${LR}"
 
@@ -283,6 +287,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_target_max_steps="${OCSC_TARGET_MAX_STEPS}" \
   model.model_config.finetune.ocsc_pred_max_steps="${OCSC_PRED_MAX_STEPS}" \
   model.model_config.finetune.ocsc_heading_weight="${OCSC_HEADING_WEIGHT}" \
+  model.model_config.finetune.ocsc_fm_reg_lambda="${OCSC_FM_REG_LAMBDA}" \
   model.model_config.finetune.ocsc_eval_hard_rmm="${OCSC_EVAL_HARD_RMM}" \
   model.model_config.finetune.ocsc_eval_hard_rmm_interval="${OCSC_EVAL_HARD_RMM_INTERVAL}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \

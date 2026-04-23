@@ -202,6 +202,19 @@ class HardSimAgentsMetrics:
 
     _SCENARIO_CACHE_MAX: int = 256
 
+    _LIKELIHOOD_NAMES = [
+        "linear_speed_likelihood",
+        "linear_acceleration_likelihood",
+        "angular_speed_likelihood",
+        "angular_acceleration_likelihood",
+        "distance_to_nearest_object_likelihood",
+        "collision_indication_likelihood",
+        "time_to_collision_likelihood",
+        "distance_to_road_edge_likelihood",
+        "offroad_indication_likelihood",
+        "traffic_light_violation_likelihood",
+    ]
+
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
         self._metric_key = f"{prefix}/sim_agents_2025/realism_meta_metric"
@@ -209,6 +222,7 @@ class HardSimAgentsMetrics:
         self._metametric_sum: float = 0.0
         self._count: int = 0
         self._scenario_cache: Dict[str, Any] = {}
+        self._per_metric_sums: Dict[str, float] = {n: 0.0 for n in self._LIKELIHOOD_NAMES}
 
     @staticmethod
     def _load_config():
@@ -304,9 +318,6 @@ class HardSimAgentsMetrics:
             compute_metric_features,
             scenario_to_joint_scene,
         )
-        from src.smart.metrics.wosac_metametric_pytorch import (
-            compute_wosac_metametric_from_features_torch_batched,
-        )
         from waymo_open_dataset.utils.sim_agents import submission_specs
 
         n_scenarios = len(scenario_files)
@@ -378,43 +389,54 @@ class HardSimAgentsMetrics:
                 "traffic_light_violation_per_step": _cat("traffic_light_violation_per_step"),
             })
 
-        metametric_vec = compute_wosac_metametric_from_features_torch_batched(
-            self._config, log_feat_dicts, sim_feat_dicts,
+        from src.smart.metrics.wosac_metametric_pytorch import (
+            compute_wosac_metametric_from_features_torch,
         )
 
-        for val in metametric_vec.tolist():
-            self._metametric_sum += val
+        for i in range(n_scenarios):
+            result = compute_wosac_metametric_from_features_torch(
+                self._config, log_feat_dicts[i], sim_feat_dicts[i]
+            )
+            self._metametric_sum += float(result.metametric)
+            for name in self._LIKELIHOOD_NAMES:
+                self._per_metric_sums[name] += float(getattr(result, name))
             self._count += 1
 
     def _drain_completed_futures(self, wait: bool = True, drain_all: bool = True) -> None:
         return None
 
     def get_state_tensor(self, device: torch.device) -> torch.Tensor:
-        """DDP all_reduce 용으로 [metametric_sum, count] 2-element tensor 반환."""
-        return torch.tensor(
-            [self._metametric_sum, float(self._count)],
-            device=device,
-            dtype=torch.float64,
-        )
+        """DDP all_reduce 용으로 [metametric_sum, count, *per_metric_sums] tensor 반환."""
+        vals = [self._metametric_sum, float(self._count)]
+        for name in self._LIKELIHOOD_NAMES:
+            vals.append(self._per_metric_sums[name])
+        return torch.tensor(vals, device=device, dtype=torch.float64)
 
     def compute_from_state_tensor(self, reduced_metric_state: torch.Tensor) -> Dict[str, Any]:
-        """all_reduce 이후 [total_sum, total_count]로부터 평균 메트릭 계산."""
+        """all_reduce 이후 tensor로부터 metametric + per-metric 평균 계산."""
         total_count = reduced_metric_state[1].clamp_min(1.0)
-        value = (reduced_metric_state[0] / total_count).to(torch.float32)
-        return {self._metric_key: value}
+        result = {
+            self._metric_key: (reduced_metric_state[0] / total_count).to(torch.float32)
+        }
+        for j, name in enumerate(self._LIKELIHOOD_NAMES):
+            key = f"{self.prefix}/sim_agents_2025/{name}"
+            result[key] = (reduced_metric_state[2 + j] / total_count).to(torch.float32)
+        return result
 
     def compute(self) -> Dict[str, Any]:
-        if self._count == 0:
-            return {self._metric_key: torch.tensor(0.0)}
-        return {
-            self._metric_key: torch.tensor(
-                self._metametric_sum / self._count, dtype=torch.float32
-            )
+        count = max(self._count, 1)
+        result = {
+            self._metric_key: torch.tensor(self._metametric_sum / count, dtype=torch.float32)
         }
+        for name in self._LIKELIHOOD_NAMES:
+            key = f"{self.prefix}/sim_agents_2025/{name}"
+            result[key] = torch.tensor(self._per_metric_sums[name] / count, dtype=torch.float32)
+        return result
 
     def reset(self) -> None:
         self._metametric_sum = 0.0
         self._count = 0
+        self._per_metric_sums = {n: 0.0 for n in self._LIKELIHOOD_NAMES}
 
 
 class SimAgentsSubmission:

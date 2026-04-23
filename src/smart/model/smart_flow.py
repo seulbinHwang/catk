@@ -1559,6 +1559,9 @@ class SMARTFlow(LightningModule):
         # ocsc_use_mmd=False: 기존 paired L2 mean (비교/ablation 용)
         use_mmd = bool(getattr(self.finetune_config, "ocsc_use_mmd", True))
         heading_w = float(getattr(self.finetune_config, "ocsc_heading_weight", 0.0))
+        # GT FM regularization: MMD만 줄일 때 velocity_head가 GT에서 drift하는 것을 방지.
+        # 각 anchor에서 active_hidden으로 GT 궤적에 대한 FM loss를 계산해 함께 backward.
+        fm_reg_lambda = float(self.finetune_config.ocsc_fm_reg_lambda)
         sequential = bool(getattr(self.finetune_config, "bptt_sequential_rollouts", False))
         use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
         warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
@@ -1683,6 +1686,7 @@ class SMARTFlow(LightningModule):
             )
 
         total_loss_accum = 0.0
+        fm_reg_accum = 0.0
         n_valid_anchors = 0
         n_anchors_total = max(1, len(all_anchor_indices))
         _diag_pred_traj = None   # 마지막 anchor CL traj (variance 진단용)
@@ -1810,6 +1814,15 @@ class SMARTFlow(LightningModule):
             if _use_ref:
                 _agent_enc.flow_decoder = _orig_fd
 
+        # ── GT FM regularization (batch-level, anchor loop 이후) ─────────────
+        # flow_decoder는 T=20을 기대하므로 flow_train_clean_norm(T=20)을 사용.
+        # velocity_head가 GT에서 drift하지 않도록 consistency loss와 독립적으로 backward.
+        if fm_reg_lambda > 0.0 and n_valid_anchors > 0:
+            fm_val = self._compute_rmm_bptt_gt_fm_loss(map_feature, tokenized_agent)
+            if fm_val is not None and torch.isfinite(fm_val):
+                self.manual_backward(fm_reg_lambda * fm_val)
+                fm_reg_accum = fm_val.item()
+
         if n_valid_anchors == 0:
             return {}
 
@@ -1820,10 +1833,15 @@ class SMARTFlow(LightningModule):
         log.info(
             f"[ocsc] step={int(getattr(self,'global_step',0))} "
             f"consistency_loss={mean_loss.item():.4f} n_anchors={n_valid_anchors}"
+            + (f" fm_reg={fm_reg_accum:.4f}" if fm_reg_lambda > 0.0 else "")
         )
         ret = {
             "train/consistency_loss": mean_loss,
         }
+        if fm_reg_lambda > 0.0:
+            ret["train/fm_reg_loss"] = torch.tensor(
+                fm_reg_accum, dtype=torch.float32, device=agent_batch.device,
+            )
 
         # Mode collapse 진단 (마지막 anchor, no extra compute)
         if _diag_pred_traj is not None and _diag_pred_traj.shape[1] >= 2 and _diag_active_mask is not None:
@@ -2690,7 +2708,12 @@ class SMARTFlow(LightningModule):
                 if isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             if "train/consistency_loss" in diag:
-                self.log("train/loss", diag["train/consistency_loss"], on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                _fm_reg = diag.get("train/fm_reg_loss", 0.0)
+                _fm_reg_lambda = float(self.finetune_config.ocsc_fm_reg_lambda)
+                _total = diag["train/consistency_loss"] + _fm_reg_lambda * (
+                    _fm_reg if isinstance(_fm_reg, Tensor) else torch.tensor(_fm_reg, device=diag["train/consistency_loss"].device)
+                )
+                self.log("train/loss", _total, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
         elif self._is_kinematic_proj_ft_enabled():
             result = self._run_kinematic_proj_ft_step(tokenized_map, tokenized_agent)

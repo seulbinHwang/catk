@@ -56,6 +56,9 @@ model:
       ocsc_pred_max_steps: 4
       # heading 일관성 loss 가중치 (0 = position only)
       ocsc_heading_weight: 0.0
+      # GT FM regularization: velocity_head가 GT에서 drift하지 않도록 per-anchor FM loss 추가.
+      # 0.0이면 기존 동작(MMD only). 권장 시작값: 0.1~1.0
+      ocsc_fm_reg_lambda: 0.0
       # HardRMM 모니터링 (매 training step): CONFIGURABLE
       ocsc_eval_hard_rmm: true
       ocsc_eval_hard_rmm_interval: 1
