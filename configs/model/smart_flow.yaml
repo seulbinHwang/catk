@@ -85,9 +85,27 @@ model_config:
     flow_solver_steps: 32
     flow_solver_method: euler
     flow_solver_eps: 1.0e-3
-    closed_loop_rollout_mode: raw_fm # raw_fm
-    use_dynamics_feasible_commit_bridge: false
-    use_stationary_refinement_in_dynamics_bridge: true
+    closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
+    use_lqr: false
+    use_stop_motion: true
+    lqr_commit:
+      dt: 0.1
+      history_steps: 6
+      horizon_steps: 10
+      velocity_smooth_lambda: 1.0e-4
+      curvature_smooth_lambda: 1.0e-2
+      curvature_init_reg: 1.0e-10
+      stop_speed_mps: 0.2
+      stop_speed_kp: 0.5
+      longitudinal_q: 10.0
+      longitudinal_r: 0.
+      lateral_q_lat: 1.0
+      lateral_q_head: 10.0
+      lateral_q_kappa: 0.
+      lateral_r: 0.
+      accel_tau_s: 0.
+      curvature_tau_s: 0.
+      min_speed_for_curvature_clip_mps: 0.5
   sim_agents_submission:
     is_active: false
     method_name: "SMART-flow-7M"

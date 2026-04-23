@@ -24,6 +24,8 @@ task_name: "debug_open_source"
 # simply provide checkpoint path to resume training
 ckpt_path: null
 train_log_dir: null
+submission:
+  description: null
 
 # seed for random number generators in pytorch, numpy and python.random
 seed: 817
