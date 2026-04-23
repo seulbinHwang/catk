@@ -1,0 +1,6 @@
+# Minimal callback set for validation-loop batch-size throughput sweeps.
+# Drops wandb-related callbacks so the run only pays for actual validation.
+
+val_benchmark:
+  _target_: src.utils.validation_benchmark_callback.ValidationBenchmarkCallback
+  warmup_batches: 1

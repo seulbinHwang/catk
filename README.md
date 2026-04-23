@@ -901,6 +901,100 @@ torchrun \
 - `model.model_config.val_closed_loop=true`: 제출 파일 생성에 필요한 closed-loop rollout은 유지합니다.
 - `paths.log_dir=/workspace/exp_logs`: 로그를 저장할 위치입니다.
 
+### 7.2.1 validation split 전체를 8 GPU (V100-SXM2 32GB × 8) 로 제출 파일 만들기
+
+7.2 의 H100 80GB × 6 preset 을 Tesla V100-SXM2 **32GB × 8** 박스에 이식한 버전입니다.
+
+핵심 차이:
+
+- **V100 은 bfloat16 하드웨어가 없습니다** (sm_70, Volta). `trainer.precision=bf16-mixed` 대신 **`trainer.precision=16-mixed`** (FP16 mixed precision) 를 씁니다.
+- **GPU 8 장**: `nproc_per_node=8`, `trainer.devices=8`.
+- **`data.val_batch_size=8`**: V100 × 8 에서 steady-state throughput sweep 으로 확인한 최적값입니다 (실측 표는 아래).
+
+실행 커맨드는 아래와 같습니다.
+
+```bash
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache   # 각자의 캐시 경로로 교체
+export CKPT=/path/to/epoch_last.ckpt                 # 예: wandb artifact 로컬 저장 경로
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
+torchrun \
+  --standalone \
+  --nproc_per_node=8 \
+  -m src.run \
+  experiment=sim_agents_sub_flow \
+  action=validate \
+  trainer=ddp \
+  trainer.devices=8 \
+  trainer.precision=16-mixed \
+  trainer.limit_val_batches=1.0 \
+  data.val_batch_size=8 \
+  model.model_config.val_open_loop=false \
+  model.model_config.val_closed_loop=true \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path="$CKPT" \
+  task_name=flow_sim_agents_val_v100x8 \
+  model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
+  model.model_config.sim_agents_submission.authors=[Anonymous] \
+  model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
+  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
+  model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME" \
+  paths.log_dir=/workspace/exp_logs
+```
+
+#### val_batch_size 선택 근거 (V100 × 8, 실측)
+
+`scripts/bench/v100x8_sim_agents_sub_val_sweep.sh` 로 측정한 결과. 조건: 8× V100-SXM2 32GB, `precision: 16-mixed`, `n_rollout_closed_val=32`, `num_workers=4`, validation 은 `torch.no_grad()` 라 backward activation 이 없어 peak VRAM 이 매우 작습니다.
+
+| `val_batch_size` | batch ms | total samples/s (8 GPU) | peak VRAM | 32 GiB 마진 | 상태 |
+|:--:|:--:|:--:|:--:|:--:|:--:|
+| 1  | 2,286  | 3.50 | 2.5 GiB  | 29.5 GiB | ✅ |
+| 4  | 6,847  | 4.67 | 5.9 GiB  | 26.1 GiB | ✅ |
+| **8**  | **12,583** | **5.09** | **11.6 GiB** | **20.4 GiB** | ✅ **채택 (peak throughput)** |
+| 16 | 26,995 | 4.74 | 21.2 GiB | 10.8 GiB | 오히려 느려짐 (−7%) |
+| 32 | 58,584 | 4.37 | 30.4 GiB | 1.6 GiB (risky) | 더 느려지고 OOM 마진 위험 |
+| 64 | — | — | OOM | — | ❌ |
+
+관찰:
+
+- **Throughput 은 `val_bs=8` 에서 peak**. 이후 bs 를 더 키우면 samples/s 가 오히려 감소합니다 (bs=8 → 16 에서 −7%).
+- 이유: closed-loop rollout 은 80-step 순차 시뮬레이션이라 GPU kernel 이 bs=8 에서 이미 compute-bound. 더 키우면 scene variance (큰 agent 수의 worst-case step) 가 batch 전체 step 시간을 끌어내립니다.
+- 메모리 측면에서는 bs=32 까지도 넣을 수 있지만 throughput 관점에서 의미가 없고, bs=32 는 dense scene 에서 32 GiB 를 넘길 수 있어 **bs=8 이 wall-clock 최소 + 안전 마진 최대** 의 sweet spot 입니다.
+- bs=1 은 GPU 가 놀아서 throughput 이 크게 떨어집니다 (3.50 vs 5.09 samples/s, **−31%**).
+
+#### 44,097 샘플 전체 export 예상 시간
+
+| `val_batch_size` | 전체 소요 | 비고 |
+|:--:|:--:|:--|
+| **8 (채택)** | **~ 2.40 h** | 44,097 / 5.09 samples/s |
+| 16 | 2.58 h | +8% |
+| 4  | 2.62 h | +9% |
+| 32 | 2.80 h | +17%, OOM 마진 위험 |
+| 1  | 3.50 h | +46% |
+
+참고로 H100 × 6 preset 은 같은 validation split 에서 BF16 + bs=4 로 약 1.5–2 시간 수준입니다. V100 × 8 은 하드웨어 상 compute / 메모리 대역폭이 H100 보다 좁아 1.3~1.6 배 느린 것이 정상입니다.
+
+#### OOM 이나 다른 문제가 날 때
+
+- 만약 다른 ckpt 로 peak VRAM 이 여기 표 대비 크게 오르면 (예: chunk_mixer hidden 이 넓은 구버전 artifact), `data.val_batch_size: 8 → 4` 로 먼저 낮춰 보세요.
+- CPU RAM 이 부족하면 `data.num_workers: 4 → 3`, `data.prefetch_factor: 1` 유지 (기본값).
+- `trainer.precision=bf16-mixed` 는 V100 에서 에러가 나거나 FP32 보다 느린 software emulation 으로 돌 수 있으므로 **반드시 `16-mixed`** 를 쓰세요.
+
+#### 재현
+
+스윕 스크립트: `scripts/bench/v100x8_sim_agents_sub_val_sweep.sh`. 사용법:
+
+```bash
+CACHE_ROOT=/workspace/womd_v1_3/SMART_cache \
+CKPT=/path/to/epoch_last.ckpt \
+CANDIDATES="1 4 8 16 32" LIMIT=6 \
+bash scripts/bench/v100x8_sim_agents_sub_val_sweep.sh
+```
+
+각 후보마다 `[VALBENCH] val_bs=.. batch_ms=.. total_samples_s=.. peak_vram_mib=..` 한 줄이 `scripts/bench/v100x8_sim_agents_sub_results.log` 에 남습니다.
+
 ### 7.3 test split으로 최종 제출 파일 만들기
 
 실제로 Waymo/WOSAC에 올릴 test split 결과를 만들 때는 `action=test`를 사용합니다.
@@ -1160,4 +1254,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src.run experiment=sim_agents_sub_flow action=validate trainer=ddp trainer.devices=6 paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/model.ckpt task_name=flow_sim_agents_val_ddp6 trainer.limit_val_batches=1.0 model.model_config.val_open_loop=false model.model_config.val_closed_loop=true
+```
+
+### validation submission export (V100 × 8)
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" torchrun --standalone --nproc_per_node=8 -m src.run experiment=sim_agents_sub_flow action=validate trainer=ddp trainer.devices=8 trainer.precision=16-mixed trainer.limit_val_batches=1.0 data.val_batch_size=8 model.model_config.val_open_loop=false model.model_config.val_closed_loop=true paths.cache_root="$CACHE_ROOT" ckpt_path=/path/to/model.ckpt task_name=flow_sim_agents_val_v100x8
 ```
