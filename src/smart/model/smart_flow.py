@@ -1583,6 +1583,14 @@ class SMARTFlow(LightningModule):
         _last_n_coarse = int(getattr(self.finetune_config, "bptt_last_n_coarse_steps", 0))
         eval_hard_rmm = bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
         eval_hard_rmm_interval = max(1, int(getattr(self.finetune_config, "ocsc_eval_hard_rmm_interval", 1)))
+        # consistency 구간을 실제 grad가 살아있는 10Hz suffix로 제한할지 여부.
+        # bptt_last_coarse_only=true면 warm_coarse=pred_max_steps-1 이므로 마지막 coarse step만 남긴다.
+        _consistency_tail_10hz_steps: int | None = None
+        if _last_coarse_only and pred_max_steps is not None and pred_max_steps > 0:
+            _shift_10hz = int(getattr(self.encoder.agent_encoder, "shift", 5))
+            _grad_coarse = max(0, int(pred_max_steps) - int(warm_coarse))
+            _grad_coarse = max(1, _grad_coarse)
+            _consistency_tail_10hz_steps = _grad_coarse * _shift_10hz
 
         # ── 데이터 검증 ──────────────────────────────────────────────────────
         if data is None:
@@ -1667,6 +1675,12 @@ class SMARTFlow(LightningModule):
                 head_loss = F.mse_loss(p[..., 2:], t[..., 2:], reduction="mean")
                 return pos_loss + heading_w * head_loss
             return pos_loss
+
+        def _slice_consistency_suffix(x: Tensor) -> Tensor:
+            if _consistency_tail_10hz_steps is None:
+                return x
+            _tail = max(1, min(int(_consistency_tail_10hz_steps), int(x.shape[-2])))
+            return x[..., -_tail:, :]
 
         # ── world → normalized frame helper ──────────────────────────────────
         def _cl_to_norm(cl_xy: Tensor, cl_head: Tensor, current_pos_active: Tensor, current_head_active: Tensor) -> Tensor:
@@ -1812,14 +1826,15 @@ class SMARTFlow(LightningModule):
                                     noise_tape_override=shared_tapes[g],
                                 )
                                 _T_d = _traj_d.shape[-2]
-                                cl_norms_det.append(_cl_to_norm(
+                                _cl_norm_det = _cl_to_norm(
                                     _traj_d[active_mask, 0, :_T_d, :],
                                     _head_d[active_mask, 0, :_T_d],
                                     current_pos_active, current_head_active,
-                                ))
+                                )
+                                cl_norms_det.append(_slice_consistency_suffix(_cl_norm_det))
                                 del _traj_d, _head_d
 
-                        _ol_det = [o.detach() for o in ol_norms]
+                        _ol_det = [_slice_consistency_suffix(o.detach()) for o in ol_norms]
                         sigma_sq_seq = mmd_precompute_sigma_sq(_ol_det, cl_norms_det)
 
                         # Log MMD value from detached pass-1 samples (consistent with parallel mode)
@@ -1852,19 +1867,23 @@ class SMARTFlow(LightningModule):
                         if pred_traj_g.requires_grad and _grad_clip > 0:
                             pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
                         cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
+                        cl_norm_g = _slice_consistency_suffix(cl_norm_g)
 
                         if _do_seq_mmd:
                             # (proxy_g / n_anchors).backward() summed over g = ∂(mean_anchor MMD²)/∂θ
                             proxy_g = mmd_per_rollout_proxy(
                                 cl_norm_g=cl_norm_g,
                                 cl_norms_ref=cl_norms_det,
-                                ol_norms_ref=[o.detach() for o in ol_norms],
+                                ol_norms_ref=[_slice_consistency_suffix(o.detach()) for o in ol_norms],
                                 sigma_sq=sigma_sq_seq,
                             )
                             (proxy_g / n_anchors_total).backward()
                             del proxy_g
                         else:
-                            loss_g = _consistency_loss(cl_norm_g, ol_norms[g])
+                            loss_g = _consistency_loss(
+                                _slice_consistency_suffix(cl_norm_g),
+                                _slice_consistency_suffix(ol_norms[g]),
+                            )
                             total_loss_accum += loss_g.item()
                             (loss_g / (n_anchors_total * G)).backward()
                             del loss_g
@@ -1897,10 +1916,16 @@ class SMARTFlow(LightningModule):
                         T_min = min(T_cl, ol_norms[0].shape[-2])
                         cl_stack = torch.stack(cl_norms, dim=0)[:, :, :T_min, :]
                         ol_stack = torch.stack(ol_norms, dim=0)[:, :, :T_min, :].detach()
+                        cl_stack = _slice_consistency_suffix(cl_stack)
+                        ol_stack = _slice_consistency_suffix(ol_stack)
                         anchor_loss = mmd_from_stacked(cl_stack, ol_stack)
                     else:
                         anchor_loss = torch.stack([
-                            _consistency_loss(cl_norms[g], ol_norms[g]) for g in range(G)
+                            _consistency_loss(
+                                _slice_consistency_suffix(cl_norms[g]),
+                                _slice_consistency_suffix(ol_norms[g]),
+                            )
+                            for g in range(G)
                         ]).mean()
                     total_loss_accum += anchor_loss.item()
                     (anchor_loss / n_anchors_total).backward()
