@@ -150,7 +150,7 @@ class SMARTFlowDecoder(nn.Module):
         max_steps: int | None = None,
         warm_coarse_steps: int = 0,
         share_noise_across_time: bool = False,
-        z_noise_override: Tensor | None = None,
+        noise_tape_override: Tensor | None = None,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
@@ -162,7 +162,7 @@ class SMARTFlowDecoder(nn.Module):
             max_steps=max_steps,
             warm_coarse_steps=warm_coarse_steps,
             share_noise_across_time=share_noise_across_time,
-            z_noise_override=z_noise_override,
+            noise_tape_override=noise_tape_override,
         )
 
     def rollout_from_cache_no_grad(

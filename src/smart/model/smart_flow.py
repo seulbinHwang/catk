@@ -882,7 +882,7 @@ class SMARTFlow(LightningModule):
         max_steps: int | None = None,
         warm_coarse_steps: int = 0,
         share_noise_across_time: bool = False,
-        z_noise_override: Tensor | None = None,
+        noise_tape_override: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
@@ -921,7 +921,7 @@ class SMARTFlow(LightningModule):
                     max_steps=max_steps,
                     warm_coarse_steps=warm_coarse_steps,
                     share_noise_across_time=share_noise_across_time,
-                    z_noise_override=z_noise_override,
+                    noise_tape_override=noise_tape_override,
                 )
             else:
                 pred = self.encoder.rollout_from_cache_no_grad(
@@ -1575,6 +1575,9 @@ class SMARTFlow(LightningModule):
         sequential = bool(getattr(self.finetune_config, "bptt_sequential_rollouts", False))
         use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
         warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
+        _last_coarse_only = bool(getattr(self.finetune_config, "bptt_last_coarse_only", False))
+        if _last_coarse_only and pred_max_steps is not None and pred_max_steps > 1:
+            warm_coarse = pred_max_steps - 1
         _grad_clip  = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
         _last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
         _last_n_coarse = int(getattr(self.finetune_config, "bptt_last_n_coarse_steps", 0))
@@ -1734,13 +1737,16 @@ class SMARTFlow(LightningModule):
                 current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
                 active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
 
-                # ── 3c. Open-loop samples + shared z_g (G, no_grad) ──────────
-                # z_g[g]: per-scenario seeds (same as CL rollout g) → [n_agent, 4]
-                # OL-g: z_g[active_mask] → [n_active, 20, 4]  (same z for all 20 steps)
-                # CL-g: z_g → noise_tape 전체를 z_g로 채움  (pairwise noise match)
+                # ── 3c. Open-loop samples + pairwise noise tapes (G, no_grad) ─
+                # g별 per-scenario seed로 전체 noise tape 생성 → OL과 CL이 같은 tape 공유.
+                # OL-g: tape_g[active_mask, :20, :]  (fine-step 별 independent, CL step-0과 동일)
+                # CL-g: tape_g 전체 (coarse step t에서 tape[t*shift : t*shift+20] 사용)
+                # → OL 2초 horizon 내 위치는 pairwise 매칭, 그 밖은 독립 random.
                 _n_agent_full = int(tokenized_agent_anchor["batch"].shape[0])
-                _noise_scale = float(getattr(self.eval_sampling_noise, "noise_scale", 1.0))
-                shared_z_list: list[Tensor] = []  # z_g per rollout, [n_agent, 4]
+                _n_step_10hz = int(rollout_cache_anchor["n_step_future_10hz"])
+                _sample_win = 20
+                _tape_steps = _n_step_10hz + _sample_win - _agent_enc.shift
+                shared_tapes: list[Tensor] = []  # noise_tape_g per rollout [n_agent, tape_steps, 4]
                 if _use_ref:
                     _agent_enc.flow_decoder = self.ref_flow_decoder
                 with torch.no_grad():
@@ -1751,20 +1757,20 @@ class SMARTFlow(LightningModule):
                             rollout_idx=g,
                             device=active_hidden.device,
                         )
-                        # CL과 동일한 per-scenario seed로 z_g 생성 (tape_steps=1 trick)
-                        _z_g_tape = _agent_enc._build_rollout_noise_tape(
+                        # per-scenario seed로 전체 tape 생성 (fine-step마다 independent)
+                        tape_g = _agent_enc._build_rollout_noise_tape(
                             num_agent=_n_agent_full,
-                            tape_steps=1,
+                            tape_steps=_tape_steps,
                             device=active_hidden.device,
                             dtype=active_hidden.dtype,
                             sampling_noise=self.eval_sampling_noise,
                             scenario_sampling_seeds=_seeds_g,
                             agent_batch=tokenized_agent_anchor["batch"],
-                        )
-                        z_g = _z_g_tape[:, 0, :]  # [n_agent, 4], noise_scale already applied
-                        shared_z_list.append(z_g)
-
-                        x_init_ol = z_g[active_mask].unsqueeze(1).expand(-1, 20, -1).clone()
+                            share_noise_across_time=False,
+                        )  # [n_agent, tape_steps, 4]
+                        shared_tapes.append(tape_g)
+                        # OL: tape의 첫 20 fine-step (= CL coarse step 0과 동일 noise)
+                        x_init_ol = tape_g[active_mask, :_sample_win, :].clone()  # [n_active, 20, 4]
                         ol_norms.append(_agent_enc._sample_open_loop_future_from_hidden(
                             anchor_hidden_valid=active_hidden,
                             sampling_noise=self.eval_sampling_noise,
@@ -1803,7 +1809,7 @@ class SMARTFlow(LightningModule):
                                     full_grad=True,   # no_grad 컨텍스트 안이라 gradient 없음; max_steps 인수 전달에 필요
                                     max_steps=pred_max_steps,
                                     warm_coarse_steps=warm_coarse,
-                                    z_noise_override=shared_z_list[g],
+                                    noise_tape_override=shared_tapes[g],
                                 )
                                 _T_d = _traj_d.shape[-2]
                                 cl_norms_det.append(_cl_to_norm(
@@ -1838,7 +1844,7 @@ class SMARTFlow(LightningModule):
                             full_grad=True,
                             max_steps=pred_max_steps,
                             warm_coarse_steps=warm_coarse,
-                            z_noise_override=shared_z_list[g],
+                            noise_tape_override=shared_tapes[g],
                         )
                         T_cl = pred_traj_g.shape[-2]
                         cl_xy_g = pred_traj_g[active_mask, 0, :T_cl, :]
@@ -1876,7 +1882,6 @@ class SMARTFlow(LightningModule):
                         full_grad=True,
                         max_steps=pred_max_steps,
                         warm_coarse_steps=warm_coarse,
-                        share_noise_across_time=True,
                     )
                     if pred_traj_all.requires_grad and _grad_clip > 0:
                         pred_traj_all.register_hook(_make_norm_clip_hook(_grad_clip))

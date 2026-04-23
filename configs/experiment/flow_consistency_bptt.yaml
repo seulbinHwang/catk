@@ -70,6 +70,7 @@ model:
       bptt_warm_coarse_steps: 0
       bptt_last_n_coarse_steps: 0
       bptt_last_n_solver_steps: 0
+      bptt_last_coarse_only: false
       # GT flow-matching 정규화 (optional): 0 이면 비활성
       flow_reg_lambda: 0.0
       rollout_noise_scale: 1.0

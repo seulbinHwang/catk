@@ -404,7 +404,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         scenario_sampling_seeds: torch.Tensor | None = None,
         agent_batch: torch.Tensor | None = None,
         share_noise_across_time: bool = False,
-        z_pregenerated: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
 
@@ -421,9 +420,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_agent]`` 입니다.
             share_noise_across_time: True이면 agent당 z[4]를 한 번 샘플링해 모든
                 tape 시간 위치에 반복합니다. rollout 간 variance를 줄입니다.
-            z_pregenerated: 외부에서 미리 생성한 z입니다. shape은 ``[n_agent, 4]``.
-                제공되면 seeding 로직을 건너뛰고 이 z를 tape_steps만큼 반복합니다.
-                OL과 CL pairwise noise 공유에 사용합니다.
 
         Returns:
             torch.Tensor:
@@ -433,9 +429,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         noise_scale = float(getattr(sampling_noise, "noise_scale", 1.0))
         if num_agent == 0:
             return torch.zeros((0, tape_steps, 4), device=device, dtype=dtype)
-
-        if z_pregenerated is not None:
-            return z_pregenerated.unsqueeze(1).expand(-1, tape_steps, -1).contiguous()
 
         if scenario_sampling_seeds is not None:
             if agent_batch is None:
@@ -746,7 +739,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         max_steps: int | None = None,
         warm_coarse_steps: int = 0,
         share_noise_across_time: bool = False,
-        z_noise_override: torch.Tensor | None = None,
+        noise_tape_override: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -816,8 +809,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds=scenario_sampling_seeds,
             agent_batch=tokenized_agent["batch"],
             share_noise_across_time=share_noise_across_time,
-            z_pregenerated=z_noise_override,
         )
+        if noise_tape_override is not None:
+            rollout_noise_tape = noise_tape_override
 
         # Bicycle model velocity/steering state: chunk 간 연속성을 위한 per-agent 버퍼.
         # kinematic_projector가 설정되어 있으면 항상 활성화.
