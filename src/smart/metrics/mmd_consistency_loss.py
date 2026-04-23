@@ -69,3 +69,51 @@ def mmd_from_stacked(
     ).clamp(min=0)  # biased estimator → ≥ 0, clamp for numerical safety
 
     return per_agent_mmd.mean()
+
+
+def mmd_precompute_sigma_sq(
+    ol_norms: list,   # G × Tensor[n, T, C], all detached
+    cl_norms: list,   # G × Tensor[n, T, C], all detached
+) -> Tensor:
+    """Median-heuristic bandwidth from detached CL and OL samples (sequential MMD helper)."""
+    G = len(ol_norms)
+    n, T, C = ol_norms[0].shape
+    d = T * C
+    with torch.no_grad():
+        ol_flat = torch.stack(ol_norms, dim=0).reshape(G * n, d)
+        cl_flat = torch.stack(cl_norms, dim=0).reshape(G * n, d)
+    return _global_sigma_sq(ol_flat, cl_flat)
+
+
+def mmd_per_rollout_proxy(
+    cl_norm_g: Tensor,    # [n, T, C] with gradient
+    cl_norms_ref: list,   # G × Tensor[n, T, C], all detached (from no-grad pass 1)
+    ol_norms_ref: list,   # G × Tensor[n, T, C], all detached
+    sigma_sq: Tensor,
+) -> Tensor:
+    """Per-rollout proxy loss for sequential MMD backward.
+
+    Gradient identity:
+        ∂proxy_g/∂cl_g == ∂mmd_from_stacked(cl_stack, ol_stack)/∂cl_g
+
+    because detaching cl_j (j≠g) does NOT affect the gradient w.r.t. cl_g:
+        ∂k(cl_g, detach(cl_j))/∂cl_g  ==  ∂k(cl_g, cl_j)/∂cl_g
+
+    Usage: call (proxy_g / n_anchors).backward() for each rollout g.
+    Summing over all g gives ∂(mean_anchor MMD²)/∂θ exactly.
+    """
+    G = len(cl_norms_ref)
+    n, T, C = cl_norm_g.shape
+    d = T * C
+
+    # [n, G, d] — detached reference points (no grad flows through them)
+    cl_ref_flat = torch.stack(cl_norms_ref, dim=0).reshape(G, n, d).permute(1, 0, 2)
+    ol_ref_flat = torch.stack(ol_norms_ref, dim=0).reshape(G, n, d).permute(1, 0, 2)
+    cl_g_flat = cl_norm_g.reshape(n, 1, d)  # [n, 1, d]
+
+    kcc = _rbf_batch(cl_g_flat, cl_ref_flat, sigma_sq)  # [n, 1, G]
+    kco = _rbf_batch(cl_g_flat, ol_ref_flat, sigma_sq)  # [n, 1, G]
+
+    # (2/G) * mean_agents [mean_j k(cl_g, cl_j) - mean_j k(cl_g, ol_j)]
+    per_agent = kcc.mean(-1).squeeze(1) - kco.mean(-1).squeeze(1)  # [n]
+    return (2.0 / G) * per_agent.mean()

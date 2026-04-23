@@ -274,6 +274,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         delta_init: torch.Tensor | None = None,
         current_control: torch.Tensor | None = None,
         current_control_valid: torch.Tensor | None = None,
+        share_noise_across_time: bool = False,
+        x_init_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -297,14 +299,22 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             generator = torch.Generator(device=anchor_hidden_valid.device)
             generator.manual_seed(int(sampling_seed))
 
-        x_init_norm = torch.randn(
-            anchor_hidden_valid.shape[0],
-            20,
-            4,
-            device=anchor_hidden_valid.device,
-            dtype=anchor_hidden_valid.dtype,
-            generator=generator,
-        ) * getattr(sampling_noise, "noise_scale", 1.0)
+        if x_init_override is not None:
+            x_init_norm = x_init_override
+        else:
+            noise_scale = getattr(sampling_noise, "noise_scale", 1.0)
+            n = anchor_hidden_valid.shape[0]
+            if share_noise_across_time:
+                z = torch.randn(n, 4, device=anchor_hidden_valid.device,
+                                dtype=anchor_hidden_valid.dtype, generator=generator)
+                x_init_norm = z.unsqueeze(1).expand(n, 20, 4).clone() * noise_scale
+            else:
+                x_init_norm = torch.randn(
+                    n, 20, 4,
+                    device=anchor_hidden_valid.device,
+                    dtype=anchor_hidden_valid.dtype,
+                    generator=generator,
+                ) * noise_scale
 
 
         _model_fn = lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau)
@@ -393,6 +403,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         agent_batch: torch.Tensor | None = None,
+        share_noise_across_time: bool = False,
+        z_pregenerated: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
 
@@ -407,6 +419,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_scenario]`` 입니다.
             agent_batch: 각 agent가 어느 시나리오에 속하는지 나타냅니다.
                 shape은 ``[n_agent]`` 입니다.
+            share_noise_across_time: True이면 agent당 z[4]를 한 번 샘플링해 모든
+                tape 시간 위치에 반복합니다. rollout 간 variance를 줄입니다.
+            z_pregenerated: 외부에서 미리 생성한 z입니다. shape은 ``[n_agent, 4]``.
+                제공되면 seeding 로직을 건너뛰고 이 z를 tape_steps만큼 반복합니다.
+                OL과 CL pairwise noise 공유에 사용합니다.
 
         Returns:
             torch.Tensor:
@@ -416,6 +433,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         noise_scale = float(getattr(sampling_noise, "noise_scale", 1.0))
         if num_agent == 0:
             return torch.zeros((0, tape_steps, 4), device=device, dtype=dtype)
+
+        if z_pregenerated is not None:
+            return z_pregenerated.unsqueeze(1).expand(-1, tape_steps, -1).contiguous()
 
         if scenario_sampling_seeds is not None:
             if agent_batch is None:
@@ -428,20 +448,23 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     continue
                 generator = torch.Generator(device=device)
                 generator.manual_seed(int(scenario_seed))
-                noise_tape[scenario_mask] = torch.randn(
-                    int(scenario_mask.sum().item()),
-                    tape_steps,
-                    4,
-                    device=device,
-                    dtype=dtype,
-                    generator=generator,
-                )
+                n_sc = int(scenario_mask.sum().item())
+                if share_noise_across_time:
+                    z = torch.randn(n_sc, 4, device=device, dtype=dtype, generator=generator)
+                    noise_tape[scenario_mask] = z.unsqueeze(1).expand(-1, tape_steps, -1)
+                else:
+                    noise_tape[scenario_mask] = torch.randn(
+                        n_sc, tape_steps, 4, device=device, dtype=dtype, generator=generator,
+                    )
             return noise_tape * noise_scale
 
         generator = None
         if sampling_seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(sampling_seed))
+        if share_noise_across_time:
+            z = torch.randn(num_agent, 4, device=device, dtype=dtype, generator=generator)
+            return z.unsqueeze(1).expand(-1, tape_steps, -1).contiguous() * noise_scale
         return torch.randn(
             num_agent,
             tape_steps,
@@ -722,6 +745,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         scenario_sampling_seeds: torch.Tensor | None = None,
         max_steps: int | None = None,
         warm_coarse_steps: int = 0,
+        share_noise_across_time: bool = False,
+        z_noise_override: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -790,6 +815,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             agent_batch=tokenized_agent["batch"],
+            share_noise_across_time=share_noise_across_time,
+            z_pregenerated=z_noise_override,
         )
 
         # Bicycle model velocity/steering state: chunk 간 연속성을 위한 per-agent 버퍼.

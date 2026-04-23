@@ -25,7 +25,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_consistency_bptt}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-single}"
@@ -52,7 +52,7 @@ FIXED_SCENARIO_PKL="${FIXED_SCENARIO_PKL:-}"
 # ── Single-scenario 특화 기본값 ─────────────────────────────────────────────
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 # TRAIN_B / VAL_B: 각 train/val dataloader의 batch size (배치 "크기")
-TRAIN_B="${TRAIN_B:-20}"
+TRAIN_B="${TRAIN_B:-24}"
 VAL_B="${VAL_B:-8}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
 # LIMIT_*_BATCHES: "배치 개수 제한" (batch size와 다른 개념)
@@ -118,7 +118,7 @@ VALIDATION_METRIC="${VALIDATION_METRIC:-hard}"
 WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
 # ── OCSC 파라미터 ──────────────────────────────────────────────────────────
-OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-5}"
+OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-4}"
 OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
 OCSC_USE_MMD="${OCSC_USE_MMD:-true}"
 OCSC_ANCHOR_STRIDE="${OCSC_ANCHOR_STRIDE:-1}"
@@ -128,7 +128,7 @@ OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-4}"
 OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-1.0}"
 # GT FM regularization: velocity_head가 GT에서 drift하지 않도록 per-anchor FM loss를 MMD와 함께 backward.
 # 0.0이면 기존 동작(MMD only). 권장 시작값: 0.1~1.0
-OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA:-1.0}"
+OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA:-10.0}"
 # single B: HardRMM 계산이 빠르므로 5 step 마다 (multi B 에서는 1 또는 더 높게)
 OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-false}"
 OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-10}"

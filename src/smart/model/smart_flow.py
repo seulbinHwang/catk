@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import gc
 import hashlib
 import math
@@ -24,7 +25,11 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_2s,
     yaw_fde_2s,
 )
-from src.smart.metrics.mmd_consistency_loss import mmd_from_stacked
+from src.smart.metrics.mmd_consistency_loss import (
+    mmd_from_stacked,
+    mmd_precompute_sigma_sq,
+    mmd_per_rollout_proxy,
+)
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.modules.flow_reward import KinematicProjectionReward
@@ -876,6 +881,8 @@ class SMARTFlow(LightningModule):
         full_grad: bool = False,
         max_steps: int | None = None,
         warm_coarse_steps: int = 0,
+        share_noise_across_time: bool = False,
+        z_noise_override: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
@@ -913,6 +920,8 @@ class SMARTFlow(LightningModule):
                     scenario_sampling_seeds=scenario_sampling_seeds,
                     max_steps=max_steps,
                     warm_coarse_steps=warm_coarse_steps,
+                    share_noise_across_time=share_noise_across_time,
+                    z_noise_override=z_noise_override,
                 )
             else:
                 pred = self.encoder.rollout_from_cache_no_grad(
@@ -961,6 +970,7 @@ class SMARTFlow(LightningModule):
                 scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
                 max_steps=max_steps,
                 warm_coarse_steps=warm_coarse_steps,
+                share_noise_across_time=share_noise_across_time,
             )
         else:
             pred = self.encoder.rollout_from_cache_no_grad(
@@ -1724,23 +1734,99 @@ class SMARTFlow(LightningModule):
                 current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
                 active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
 
-                # ── 3c. Open-loop samples (G, no_grad) ───────────────────────
+                # ── 3c. Open-loop samples + shared z_g (G, no_grad) ──────────
+                # z_g[g]: per-scenario seeds (same as CL rollout g) → [n_agent, 4]
+                # OL-g: z_g[active_mask] → [n_active, 20, 4]  (same z for all 20 steps)
+                # CL-g: z_g → noise_tape 전체를 z_g로 채움  (pairwise noise match)
+                _n_agent_full = int(tokenized_agent_anchor["batch"].shape[0])
+                _noise_scale = float(getattr(self.eval_sampling_noise, "noise_scale", 1.0))
+                shared_z_list: list[Tensor] = []  # z_g per rollout, [n_agent, 4]
                 if _use_ref:
                     _agent_enc.flow_decoder = self.ref_flow_decoder
                 with torch.no_grad():
                     ol_norms: list[Tensor] = []
                     for g in range(G):
+                        _seeds_g = self._get_closed_loop_scenario_seeds(
+                            scenario_ids=data["scenario_id"],
+                            rollout_idx=g,
+                            device=active_hidden.device,
+                        )
+                        # CL과 동일한 per-scenario seed로 z_g 생성 (tape_steps=1 trick)
+                        _z_g_tape = _agent_enc._build_rollout_noise_tape(
+                            num_agent=_n_agent_full,
+                            tape_steps=1,
+                            device=active_hidden.device,
+                            dtype=active_hidden.dtype,
+                            sampling_noise=self.eval_sampling_noise,
+                            scenario_sampling_seeds=_seeds_g,
+                            agent_batch=tokenized_agent_anchor["batch"],
+                        )
+                        z_g = _z_g_tape[:, 0, :]  # [n_agent, 4], noise_scale already applied
+                        shared_z_list.append(z_g)
+
+                        x_init_ol = z_g[active_mask].unsqueeze(1).expand(-1, 20, -1).clone()
                         ol_norms.append(_agent_enc._sample_open_loop_future_from_hidden(
                             anchor_hidden_valid=active_hidden,
                             sampling_noise=self.eval_sampling_noise,
-                            sampling_seed=g,
+                            x_init_override=x_init_ol,
                         ))
                 if _use_ref:
                     _agent_enc.flow_decoder = _orig_fd
 
                 # ── 4. Closed-loop rollout + loss ─────────────────────────────
                 if sequential and G > 1:
-                    # G rollout 순차 backward (메모리 최소)
+                    # 2-pass sequential: peak memory O(1 graph), MMD gradient = exact.
+                    #
+                    # Pass 1 (no_grad): G CL rollouts → detached cl_norms for kernel reference.
+                    # Pass 2 (with_grad): re-run each rollout g, compute per-rollout MMD proxy,
+                    #   call .backward() immediately, free graph. Memory stays O(1 graph).
+                    #
+                    # Gradient identity (why detaching cl_j≠g is safe):
+                    #   ∂k(cl_g, detach(cl_j))/∂cl_g == ∂k(cl_g, cl_j)/∂cl_g
+                    # so ∂proxy_g/∂θ == ∂MMD²/∂cl_g · ∂cl_g/∂θ  (exact contribution of rollout g).
+                    # Summing over g: exact ∂MMD²/∂θ.
+                    _do_seq_mmd = use_mmd and G >= 2
+                    cl_norms_det: list[Tensor] = []
+                    sigma_sq_seq: Tensor | None = None
+
+                    if _do_seq_mmd:
+                        # Pass 1 ─────────────────────────────────────────────
+                        with torch.no_grad():
+                            for g in range(G):
+                                _traj_d, _, _head_d, _ = self._run_parallel_rollout_chunk(
+                                    data=data,
+                                    tokenized_agent=tokenized_agent_anchor,
+                                    map_feature=map_feature,
+                                    rollout_cache=rollout_cache_anchor,
+                                    rollout_indices=[g],
+                                    return_anchor_hidden=True,
+                                    full_grad=True,   # no_grad 컨텍스트 안이라 gradient 없음; max_steps 인수 전달에 필요
+                                    max_steps=pred_max_steps,
+                                    warm_coarse_steps=warm_coarse,
+                                    z_noise_override=shared_z_list[g],
+                                )
+                                _T_d = _traj_d.shape[-2]
+                                cl_norms_det.append(_cl_to_norm(
+                                    _traj_d[active_mask, 0, :_T_d, :],
+                                    _head_d[active_mask, 0, :_T_d],
+                                    current_pos_active, current_head_active,
+                                ))
+                                del _traj_d, _head_d
+
+                        _ol_det = [o.detach() for o in ol_norms]
+                        sigma_sq_seq = mmd_precompute_sigma_sq(_ol_det, cl_norms_det)
+
+                        # Log MMD value from detached pass-1 samples (consistent with parallel mode)
+                        _T_log = min(cl_norms_det[0].shape[-2], _ol_det[0].shape[-2])
+                        with torch.no_grad():
+                            _mmd_log = mmd_from_stacked(
+                                torch.stack(cl_norms_det, dim=0)[:, :, :_T_log, :],
+                                torch.stack(_ol_det,      dim=0)[:, :, :_T_log, :],
+                            )
+                        total_loss_accum += _mmd_log.item()
+                        del _mmd_log
+
+                    # Pass 2 ─────────────────────────────────────────────────
                     for g in range(G):
                         pred_traj_g, pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
                             data=data,
@@ -1752,6 +1838,7 @@ class SMARTFlow(LightningModule):
                             full_grad=True,
                             max_steps=pred_max_steps,
                             warm_coarse_steps=warm_coarse,
+                            z_noise_override=shared_z_list[g],
                         )
                         T_cl = pred_traj_g.shape[-2]
                         cl_xy_g = pred_traj_g[active_mask, 0, :T_cl, :]
@@ -1759,10 +1846,24 @@ class SMARTFlow(LightningModule):
                         if pred_traj_g.requires_grad and _grad_clip > 0:
                             pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
                         cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
-                        loss_g = _consistency_loss(cl_norm_g, ol_norms[g])
-                        total_loss_accum += loss_g.item()
-                        self.manual_backward(loss_g / (n_anchors_total * G))
-                        del pred_traj_g, pred_z_g, pred_head_g, cl_xy_g, cl_head_g, cl_norm_g, loss_g
+
+                        if _do_seq_mmd:
+                            # (proxy_g / n_anchors).backward() summed over g = ∂(mean_anchor MMD²)/∂θ
+                            proxy_g = mmd_per_rollout_proxy(
+                                cl_norm_g=cl_norm_g,
+                                cl_norms_ref=cl_norms_det,
+                                ol_norms_ref=[o.detach() for o in ol_norms],
+                                sigma_sq=sigma_sq_seq,
+                            )
+                            (proxy_g / n_anchors_total).backward()
+                            del proxy_g
+                        else:
+                            loss_g = _consistency_loss(cl_norm_g, ol_norms[g])
+                            total_loss_accum += loss_g.item()
+                            (loss_g / (n_anchors_total * G)).backward()
+                            del loss_g
+
+                        del pred_traj_g, pred_z_g, pred_head_g, cl_xy_g, cl_head_g, cl_norm_g
                 else:
                     # G rollout 병렬 (MMD 사용 가능)
                     pred_traj_all, pred_z_all, pred_head_all, _ = self._run_parallel_rollout_chunk(
@@ -1775,6 +1876,7 @@ class SMARTFlow(LightningModule):
                         full_grad=True,
                         max_steps=pred_max_steps,
                         warm_coarse_steps=warm_coarse,
+                        share_noise_across_time=True,
                     )
                     if pred_traj_all.requires_grad and _grad_clip > 0:
                         pred_traj_all.register_hook(_make_norm_clip_hook(_grad_clip))
@@ -1796,7 +1898,7 @@ class SMARTFlow(LightningModule):
                             _consistency_loss(cl_norms[g], ol_norms[g]) for g in range(G)
                         ]).mean()
                     total_loss_accum += anchor_loss.item()
-                    self.manual_backward(anchor_loss / n_anchors_total)
+                    (anchor_loss / n_anchors_total).backward()
 
                     # 진단용: 마지막 anchor의 CL/OL 보존 (variance logging)
                     _diag_pred_traj = pred_traj_all.detach()
@@ -1820,11 +1922,12 @@ class SMARTFlow(LightningModule):
         if fm_reg_lambda > 0.0 and n_valid_anchors > 0:
             fm_val = self._compute_rmm_bptt_gt_fm_loss(map_feature, tokenized_agent)
             if fm_val is not None and torch.isfinite(fm_val):
-                self.manual_backward(fm_reg_lambda * fm_val)
+                (fm_reg_lambda * fm_val).backward()
                 fm_reg_accum = fm_val.item()
 
         if n_valid_anchors == 0:
-            return {}
+            _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
+            return {"loss": _ddp_dummy}
 
         mean_loss = torch.tensor(
             total_loss_accum / n_valid_anchors,
@@ -1939,6 +2042,11 @@ class SMARTFlow(LightningModule):
                             f"hard_rmm={hard_rmm_val:.4f} ref={hard_rmm_ref_val:.4f} delta={delta:+.4f}"
                         )
 
+        # DDP: 모든 trainable param을 dummy graph에 연결해 bucket reducer가 정상 작동하도록 함.
+        # no_sync 컨텍스트 내에서 .backward()로 누적한 grad를 training_step에서
+        # manual_backward(_ddp_dummy)로 최종 all-reduce 한 번에 동기화.
+        _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
+        ret["loss"] = _ddp_dummy
         return ret
 
     def _run_flow_bptt_ft_step(
@@ -2703,8 +2811,25 @@ class SMARTFlow(LightningModule):
             self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
         elif self._is_ocsc_ft_enabled():
-            diag = self._run_flow_ocsc_ft_step(tokenized_map, tokenized_agent, data)
+            # DDP multi-GPU: 모든 .backward() 호출을 no_sync 컨텍스트 안에서 실행해
+            # per-backward all-reduce를 막고, 루프 종료 후 manual_backward(_ddp_dummy)로
+            # all-reduce를 딱 1회만 트리거. anchor 수가 GPU마다 달라도 deadlock 없음.
+            _ddp_model = getattr(getattr(self, "trainer", None) and self.trainer.strategy, "model", None)
+            _no_sync_ctx = (
+                _ddp_model.no_sync()
+                if _ddp_model is not None and hasattr(_ddp_model, "no_sync")
+                else contextlib.nullcontext()
+            )
+            with _no_sync_ctx:
+                diag = self._run_flow_ocsc_ft_step(tokenized_map, tokenized_agent, data)
+
+            # 최종 DDP gradient all-reduce (grad는 이미 누적됨, dummy기여=0)
+            if "loss" in diag:
+                self.manual_backward(diag["loss"])
+
             for k, v in diag.items():
+                if k == "loss":
+                    continue  # dummy tensor — metric 아님
                 if isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             if "train/consistency_loss" in diag:
