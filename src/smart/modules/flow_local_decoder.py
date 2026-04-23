@@ -22,6 +22,52 @@ from src.smart.utils import (
     transform_to_local,
     wrap_angle,
 )
+from src.smart.modules.draft_physics import DEFAULT_LIMITS
+
+
+@dataclass(frozen=True)
+class LQRCommitBridgeConfig:
+    """Closed-loop LQR bridge 설정을 담습니다.
+
+    Attributes:
+        dt: 10Hz fine step 길이입니다.
+        history_steps: 제어 참조를 만들 때 쓸 실제 fine history 길이입니다.
+            shape 의미는 ``6`` 이면 최근 0.5초 + 현재까지의 6개 점입니다.
+        horizon_steps: LQR가 직접 볼 미래 길이입니다.
+        velocity_smooth_lambda: 속도 곡선 매끈함 가중치입니다.
+        curvature_smooth_lambda: 곡률 곡선 매끈함 가중치입니다.
+        curvature_init_reg: 저속에서 곡률 추정이 깨지지 않게 하는 작은 값입니다.
+        stop_speed_mps: 저속 종방향 제어로 넘길 기준 속도입니다.
+        stop_speed_kp: 저속 종방향 비례 제어 gain입니다.
+        longitudinal_q: 1초 뒤 속도 오차 가중치입니다.
+        longitudinal_r: 종방향 제어 크기 가중치입니다.
+        lateral_q_lat: 횡방향 위치 오차 가중치입니다.
+        lateral_q_head: 진행 방향 오차 가중치입니다.
+        lateral_q_kappa: 현재 곡률 상태 가중치입니다.
+        lateral_r: 곡률 변화율 제어 크기 가중치입니다.
+        accel_tau_s: 가속 입력 1차 지연 시간입니다.
+        curvature_tau_s: 곡률 입력 1차 지연 시간입니다.
+        min_speed_for_curvature_clip_mps: 곡률 clip 계산에서 쓸 최소 속도입니다.
+    """
+
+    dt: float = 0.1
+    history_steps: int = 6
+    horizon_steps: int = 10
+    velocity_smooth_lambda: float = 1.0e-4
+    curvature_smooth_lambda: float = 1.0e-2
+    curvature_init_reg: float = 1.0e-10
+    stop_speed_mps: float = 0.2
+    stop_speed_kp: float = 0.5
+    longitudinal_q: float = 10.0
+    longitudinal_r: float = 1.0
+    lateral_q_lat: float = 1.0
+    lateral_q_head: float = 10.0
+    lateral_q_kappa: float = 0.1
+    lateral_r: float = 1.0
+    accel_tau_s: float = 0.2
+    curvature_tau_s: float = 0.05
+    min_speed_for_curvature_clip_mps: float = 0.5
+
 
 # On sm_80 (A100) the flash / memory-efficient SDPA kernels inside
 # `nn.MultiheadAttention` can exceed their grid-dim limit on pathological
@@ -848,11 +894,29 @@ class HierarchicalFlowDecoder(nn.Module):
 
 
 class ContinuousCommitBridge:
-    """Bridge continuous flow output back to SMART coarse rollout state."""
+    """Continuous FM 출력을 closed-loop 실행 상태로 바꾸는 다리입니다.
 
-    def __init__(self, commit_steps: int = 5, pos_scale_m: float = 20.0) -> None:
+    이 클래스는 세 가지 일을 담당합니다.
+    1) 6개 점 경로 기준 motion token 재매칭
+    2) stop-motion 토큰이 나오면 0.5초 chunk를 완전히 정지로 고정
+    3) vehicle / bicycle에 대해서만 curvature-domain LQR과 kinematic bicycle로
+       다음 0.5초 5개 fine 상태를 실제 실행
+    """
+
+    def __init__(
+        self,
+        commit_steps: int = 5,
+        pos_scale_m: float = 20.0,
+        use_lqr: bool = False,
+        use_stop_motion: bool = False,
+        config: LQRCommitBridgeConfig | None = None,
+    ) -> None:
         self.commit_steps = int(commit_steps)
         self.pos_scale_m = float(pos_scale_m)
+        self.use_lqr = bool(use_lqr)
+        self.use_stop_motion = bool(use_stop_motion)
+        self.config = config if config is not None else LQRCommitBridgeConfig()
+        self._difference_gram_cache: dict[tuple[int, str, str], torch.Tensor] = {}
 
     @staticmethod
     def _select_token_chunk_local(
@@ -907,6 +971,37 @@ class ContinuousCommitBridge:
         next_pos = commit_pos[:, -1]
         next_head = commit_head[:, -1]
         return commit_pos, commit_head, next_pos, next_head
+
+    def _build_full_future_from_flow(
+        self,
+        y_hat_norm: torch.Tensor,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """정규화 2초 미래 전체를 전역 중심점과 방향으로 바꿉니다.
+
+        Args:
+            y_hat_norm: 정규화 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
+            current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 방향입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - future_pos: 전역 2초 미래 중심점 ``[n_agent, 20, 2]``
+                - future_head: 전역 2초 미래 방향 ``[n_agent, 20]``
+        """
+        future_local_xy = y_hat_norm[..., :2] * 20.0
+        future_pos, _ = transform_to_global(
+            pos_local=future_local_xy,
+            head_local=None,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        future_dir = F.normalize(y_hat_norm[..., 2:4], dim=-1, eps=1.0e-6)
+        future_head = wrap_angle(
+            current_head.unsqueeze(1) + torch.atan2(future_dir[..., 1], future_dir[..., 0])
+        )
+        return future_pos, future_head
 
 
     def _build_local_commit_contour_chunk(
@@ -1075,3 +1170,503 @@ class ContinuousCommitBridge:
         next_pos = commit_pos[:, -1]
         next_head = commit_head[:, -1]
         return commit_pos, commit_head, next_pos, next_head
+    def _build_stationary_token_contour(
+        self,
+        token_agent_shape: torch.Tensor,
+    ) -> torch.Tensor:
+        """각 차종의 고정 토큰 박스로 정지 6점 contour를 만듭니다.
+
+        Args:
+            token_agent_shape: 토큰 매칭에 쓸 고정 가로, 세로 크기입니다.
+                shape은 ``[n_agent, 2]`` 입니다.
+
+        Returns:
+            torch.Tensor: 정지 6점 local contour 입니다.
+                shape은 ``[n_agent, 6, 4, 2]`` 입니다.
+        """
+        stationary_pos = token_agent_shape.new_zeros((token_agent_shape.shape[0], 6, 2))
+        stationary_head = token_agent_shape.new_zeros((token_agent_shape.shape[0], 6))
+        return cal_polygon_contour(
+            pos=stationary_pos,
+            head=stationary_head,
+            width_length=token_agent_shape.unsqueeze(1),
+        )
+
+    def build_stop_motion_mask(
+        self,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        commit_pos: torch.Tensor,
+        commit_head: torch.Tensor,
+        agent_type: torch.Tensor,
+        token_agent_shape: torch.Tensor,
+        token_bank_all_veh: torch.Tensor,
+        token_bank_all_ped: torch.Tensor,
+        token_bank_all_cyc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """raw FM 0.5초 chunk가 정지 토큰과 맞는지 판별합니다.
+
+        Args:
+            current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 방향입니다. shape은 ``[n_agent]`` 입니다.
+            commit_pos: raw FM가 낸 다음 0.5초 중심점입니다. shape은 ``[n_agent, 5, 2]`` 입니다.
+            commit_head: raw FM가 낸 다음 0.5초 방향입니다. shape은 ``[n_agent, 5]`` 입니다.
+            agent_type: 차종 번호입니다. shape은 ``[n_agent]`` 입니다.
+            token_agent_shape: 고정 토큰 박스 크기입니다. shape은 ``[n_agent, 2]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - raw_token_idx: raw FM chunk의 토큰 번호 ``[n_agent]``
+                - stop_mask: 정지 토큰과 일치하는지 여부 ``[n_agent]``
+        """
+        raw_token_idx = self.retokenize(
+            current_pos=current_pos,
+            current_head=current_head,
+            commit_pos=commit_pos,
+            commit_head=commit_head,
+            agent_type=agent_type,
+            token_agent_shape=token_agent_shape,
+            token_bank_all_veh=token_bank_all_veh,
+            token_bank_all_ped=token_bank_all_ped,
+            token_bank_all_cyc=token_bank_all_cyc,
+        )
+        stationary_contour = self._build_stationary_token_contour(token_agent_shape=token_agent_shape)
+        stop_token_idx = match_token_idx_from_local_contour(
+            agent_type=agent_type,
+            contour_local=stationary_contour,
+            token_bank_all_veh=token_bank_all_veh,
+            token_bank_all_ped=token_bank_all_ped,
+            token_bank_all_cyc=token_bank_all_cyc,
+            reduction="sum",
+            num_k=1,
+            sample_topk=False,
+        )
+        return raw_token_idx, raw_token_idx == stop_token_idx
+
+    def freeze_commit_chunk(
+        self,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """다음 0.5초 5개 상태를 현재 상태로 완전히 고정합니다."""
+        commit_pos = current_pos.unsqueeze(1).expand(-1, 5, -1).clone()
+        commit_head = current_head.unsqueeze(1).expand(-1, 5).clone()
+        return commit_pos, commit_head, current_pos.clone(), current_head.clone()
+
+    def _get_difference_gram(
+        self,
+        num_edge: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """1차 차분 제곱합에 쓰는 Gram 행렬을 돌려줍니다.
+
+        Args:
+            num_edge: 속도 또는 곡률 edge 개수입니다.
+            device: 행렬을 만들 장치입니다.
+            dtype: 행렬 자료형입니다.
+
+        Returns:
+            torch.Tensor: ``D^T D`` 행렬입니다. shape은 ``[num_edge, num_edge]`` 입니다.
+        """
+        cache_key = (num_edge, str(device), str(dtype))
+        if cache_key in self._difference_gram_cache:
+            return self._difference_gram_cache[cache_key]
+
+        if num_edge <= 1:
+            gram = torch.zeros((num_edge, num_edge), device=device, dtype=dtype)
+        else:
+            diff = torch.zeros((num_edge - 1, num_edge), device=device, dtype=dtype)
+            diag_idx = torch.arange(num_edge - 1, device=device)
+            diff[diag_idx, diag_idx] = -1.0
+            diff[diag_idx, diag_idx + 1] = 1.0
+            gram = diff.transpose(0, 1) @ diff
+        self._difference_gram_cache[cache_key] = gram
+        return gram
+
+    def _fit_smoothed_speed_profile(
+        self,
+        pos_seq: torch.Tensor,
+        valid_seq: torch.Tensor,
+    ) -> torch.Tensor:
+        """위치 시퀀스에서 batched 선형계로 매끈한 속도 곡선을 추정합니다.
+
+        Args:
+            pos_seq: 현재까지 실제 이력과 미래 참조를 붙인 중심점입니다.
+                shape은 ``[n_agent, n_step, 2]`` 입니다.
+            valid_seq: 같은 시퀀스의 유효 여부입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+
+        Returns:
+            torch.Tensor: edge 기준 속도 곡선입니다.
+                shape은 ``[n_agent, n_step - 1]`` 입니다.
+        """
+        dt = float(self.config.dt)
+        edge_valid = valid_seq[:, :-1] & valid_seq[:, 1:]
+        ds_over_dt = torch.norm(pos_seq[:, 1:] - pos_seq[:, :-1], dim=-1) / dt
+        edge_weight = edge_valid.to(pos_seq.dtype)
+        num_edge = ds_over_dt.shape[1]
+        eye = torch.eye(num_edge, device=pos_seq.device, dtype=pos_seq.dtype)
+        gram = self._get_difference_gram(num_edge, pos_seq.device, pos_seq.dtype)
+        system = torch.diag_embed(edge_weight) + self.config.velocity_smooth_lambda * gram.unsqueeze(0)
+        rhs = edge_weight * ds_over_dt
+        return torch.linalg.solve(system + 1.0e-6 * eye.unsqueeze(0), rhs.unsqueeze(-1)).squeeze(-1)
+
+    def _fit_smoothed_curvature_profile(
+        self,
+        head_seq: torch.Tensor,
+        valid_seq: torch.Tensor,
+        speed_profile: torch.Tensor,
+    ) -> torch.Tensor:
+        """방향 시퀀스와 속도 곡선에서 batched 곡률 곡선을 추정합니다.
+
+        Args:
+            head_seq: 현재까지 실제 이력과 미래 참조를 붙인 방향입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+            valid_seq: 같은 시퀀스의 유효 여부입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+            speed_profile: edge 기준 속도 곡선입니다.
+                shape은 ``[n_agent, n_step - 1]`` 입니다.
+
+        Returns:
+            torch.Tensor: edge 기준 곡률 곡선입니다.
+                shape은 ``[n_agent, n_step - 1]`` 입니다.
+        """
+        dt = float(self.config.dt)
+        edge_valid = valid_seq[:, :-1] & valid_seq[:, 1:]
+        yaw_rate_obs = wrap_angle(head_seq[:, 1:] - head_seq[:, :-1]) / dt
+        num_edge = speed_profile.shape[1]
+        eye = torch.eye(num_edge, device=head_seq.device, dtype=head_seq.dtype)
+        gram = self._get_difference_gram(num_edge, head_seq.device, head_seq.dtype)
+        speed_abs = speed_profile.abs()
+        edge_weight = edge_valid.to(head_seq.dtype)
+        diag_weight = edge_weight * speed_abs.square()
+        rhs = edge_weight * speed_abs * yaw_rate_obs
+        system = (
+            torch.diag_embed(diag_weight)
+            + self.config.curvature_smooth_lambda * gram.unsqueeze(0)
+            + self.config.curvature_init_reg * eye.unsqueeze(0)
+        )
+        return torch.linalg.solve(system + 1.0e-6 * eye.unsqueeze(0), rhs.unsqueeze(-1)).squeeze(-1)
+
+    def _estimate_reference_profiles(
+        self,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        exec_pos_history: torch.Tensor,
+        exec_head_history: torch.Tensor,
+        exec_valid_history: torch.Tensor,
+        future_pos: torch.Tensor,
+        future_head: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """과거 0.5초와 2초 미래를 묶어 속도/곡률 참조를 만듭니다.
+
+        Args:
+            current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 방향입니다. shape은 ``[n_agent]`` 입니다.
+            exec_pos_history: 최근 실제 fine history 입니다. shape은 ``[n_agent, 6, 2]`` 입니다.
+            exec_head_history: 최근 실제 fine heading 입니다. shape은 ``[n_agent, 6]`` 입니다.
+            exec_valid_history: 최근 실제 fine valid 입니다. shape은 ``[n_agent, 6]`` 입니다.
+            future_pos: raw FM 2초 미래 중심점입니다. shape은 ``[n_agent, 20, 2]`` 입니다.
+            future_head: raw FM 2초 미래 방향입니다. shape은 ``[n_agent, 20]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - v0: 현재 속도 추정 ``[n_agent]``
+                - a_prev: 직전 가속도 추정 ``[n_agent]``
+                - kappa0: 현재 곡률 추정 ``[n_agent]``
+                - v_ref_horizon: 다음 1초 속도 참조 ``[n_agent, horizon]``
+                - kappa_ref_horizon: 다음 1초 곡률 참조 ``[n_agent, horizon]``
+        """
+        history_steps = min(exec_pos_history.shape[1], int(self.config.history_steps))
+        history_pos = exec_pos_history[:, -history_steps:].clone()
+        history_head = exec_head_history[:, -history_steps:].clone()
+        history_valid = exec_valid_history[:, -history_steps:].clone()
+        history_pos[:, -1] = current_pos
+        history_head[:, -1] = current_head
+        history_valid[:, -1] = True
+
+        pos_seq = torch.cat([history_pos, future_pos], dim=1)
+        head_seq = torch.cat([history_head, future_head], dim=1)
+        valid_seq = torch.cat(
+            [history_valid, torch.ones_like(future_head, dtype=torch.bool)],
+            dim=1,
+        )
+
+        speed_profile = self._fit_smoothed_speed_profile(pos_seq=pos_seq, valid_seq=valid_seq)
+        curvature_profile = self._fit_smoothed_curvature_profile(
+            head_seq=head_seq,
+            valid_seq=valid_seq,
+            speed_profile=speed_profile,
+        )
+        history_edge_idx = history_steps - 1
+        horizon_steps = int(self.config.horizon_steps)
+        v0 = speed_profile[:, history_edge_idx - 1].clamp_min(0.0)
+        if history_edge_idx >= 2:
+            a_prev = (speed_profile[:, history_edge_idx - 1] - speed_profile[:, history_edge_idx - 2]) / self.config.dt
+        else:
+            a_prev = speed_profile.new_zeros(speed_profile.shape[0])
+        kappa0 = curvature_profile[:, history_edge_idx - 1]
+        v_ref_horizon = speed_profile[:, history_edge_idx : history_edge_idx + horizon_steps]
+        kappa_ref_horizon = curvature_profile[:, history_edge_idx : history_edge_idx + horizon_steps]
+        return v0, a_prev, kappa0, v_ref_horizon, kappa_ref_horizon
+
+    def _solve_longitudinal_lqr(
+        self,
+        v0: torch.Tensor,
+        v_ref_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """1초 뒤 속도를 맞추는 상수 가속도 하나를 닫힌형으로 풉니다."""
+        horizon_time = float(self.config.horizon_steps) * float(self.config.dt)
+        q = float(self.config.longitudinal_q)
+        r = float(self.config.longitudinal_r)
+        numerator = -q * horizon_time * (v0 - v_ref_target)
+        denominator = q * (horizon_time**2) + r
+        return numerator / max(denominator, 1.0e-6)
+
+    def _solve_lateral_lqr(
+        self,
+        v_profile: torch.Tensor,
+        kappa0: torch.Tensor,
+        kappa_ref_profile: torch.Tensor,
+    ) -> torch.Tensor:
+        """1초 회전 계획을 따르는 상수 곡률 변화율 하나를 닫힌형으로 풉니다.
+
+        Args:
+            v_profile: 다음 1초 속도 참조입니다. shape은 ``[n_agent, horizon]`` 입니다.
+            kappa0: 현재 곡률입니다. shape은 ``[n_agent]`` 입니다.
+            kappa_ref_profile: 다음 1초 곡률 참조입니다. shape은 ``[n_agent, horizon]`` 입니다.
+
+        Returns:
+            torch.Tensor: horizon 전체에 유지할 곡률 변화율입니다. shape은 ``[n_agent]`` 입니다.
+        """
+        dt = float(self.config.dt)
+        q_diag = kappa_ref_profile.new_tensor(
+            [
+                float(self.config.lateral_q_lat),
+                float(self.config.lateral_q_head),
+                float(self.config.lateral_q_kappa),
+            ]
+        )
+        z_no_u = torch.stack(
+            [kappa0.new_zeros(kappa0.shape[0]), kappa0.new_zeros(kappa0.shape[0]), kappa0],
+            dim=-1,
+        )
+        gamma = torch.zeros_like(z_no_u)
+        b = kappa0.new_tensor([0.0, 0.0, dt]).unsqueeze(0).expand(kappa0.shape[0], -1)
+
+        for step_idx in range(kappa_ref_profile.shape[1]):
+            v_step = v_profile[:, step_idx]
+            a_mat = torch.zeros((kappa0.shape[0], 3, 3), device=kappa0.device, dtype=kappa0.dtype)
+            a_mat[:, 0, 0] = 1.0
+            a_mat[:, 0, 1] = v_step * dt
+            a_mat[:, 1, 1] = 1.0
+            a_mat[:, 1, 2] = v_step * dt
+            a_mat[:, 2, 2] = 1.0
+            c_vec = torch.stack(
+                [
+                    v_step.new_zeros(v_step.shape[0]),
+                    -(v_step * dt * kappa_ref_profile[:, step_idx]),
+                    v_step.new_zeros(v_step.shape[0]),
+                ],
+                dim=-1,
+            )
+            z_no_u = torch.bmm(a_mat, z_no_u.unsqueeze(-1)).squeeze(-1) + c_vec
+            gamma = torch.bmm(a_mat, gamma.unsqueeze(-1)).squeeze(-1) + b
+
+        numerator = (gamma * q_diag.unsqueeze(0) * z_no_u).sum(dim=-1)
+        denominator = (gamma * q_diag.unsqueeze(0) * gamma).sum(dim=-1) + float(self.config.lateral_r)
+        return -numerator / denominator.clamp_min(1.0e-6)
+
+    def _gather_dynamic_limits(
+        self,
+        agent_type: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        """차종별 WOMD 통계 기반 물리 제한을 꺼냅니다."""
+        device = agent_type.device
+        return {
+            "v_max": torch.tensor(DEFAULT_LIMITS.v_max_mps, device=device, dtype=dtype)[agent_type.long()],
+            "a_max": torch.tensor(DEFAULT_LIMITS.a_max_mps2, device=device, dtype=dtype)[agent_type.long()],
+            "alpha_max": torch.tensor(DEFAULT_LIMITS.alpha_max_radps2, device=device, dtype=dtype)[agent_type.long()],
+            "a_lat_max": torch.tensor(DEFAULT_LIMITS.a_lat_max_mps2, device=device, dtype=dtype)[agent_type.long()],
+            "r_min": torch.tensor(DEFAULT_LIMITS.r_min_m, device=device, dtype=dtype)[agent_type.long()],
+            "omega_max": torch.tensor(DEFAULT_LIMITS.omega_max_abs_radps, device=device, dtype=dtype)[agent_type.long()],
+        }
+
+    def _clip_curvature_and_rate(
+        self,
+        kappa_state: torch.Tensor,
+        a_value: torch.Tensor,
+        u_value: torch.Tensor,
+        speed_value: torch.Tensor,
+        limits: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """현재 속도와 class별 envelope로 곡률과 곡률 변화율을 제한합니다."""
+        speed_floor = float(self.config.min_speed_for_curvature_clip_mps)
+        speed_safe = torch.maximum(speed_value.abs(), speed_value.new_full(speed_value.shape, speed_floor))
+        inv_radius_limit = 1.0 / limits["r_min"].clamp_min(1.0e-6)
+        yaw_rate_limit = limits["omega_max"] / speed_safe
+        lat_accel_limit = limits["a_lat_max"] / speed_safe.square().clamp_min(1.0e-6)
+        kappa_limit = torch.minimum(inv_radius_limit, torch.minimum(yaw_rate_limit, lat_accel_limit))
+        kappa_state = torch.clamp(kappa_state, -kappa_limit, kappa_limit)
+
+        u_low = (-limits["alpha_max"] - a_value * kappa_state) / speed_safe
+        u_high = (limits["alpha_max"] - a_value * kappa_state) / speed_safe
+        u_clipped = torch.clamp(u_value, torch.minimum(u_low, u_high), torch.maximum(u_low, u_high))
+        return kappa_state, u_clipped
+
+    def execute_lqr_commit(
+        self,
+        y_hat_norm: torch.Tensor,
+        current_pos: torch.Tensor,
+        current_head: torch.Tensor,
+        exec_pos_history: torch.Tensor,
+        exec_head_history: torch.Tensor,
+        exec_valid_history: torch.Tensor,
+        agent_type: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """vehicle / bicycle의 다음 0.5초를 0.1초 receding-horizon LQR로 실행합니다.
+
+        Args:
+            y_hat_norm: raw FM 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
+            current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
+            current_head: 현재 방향입니다. shape은 ``[n_agent]`` 입니다.
+            exec_pos_history: 최근 실제 fine history 입니다. shape은 ``[n_agent, 6, 2]`` 입니다.
+            exec_head_history: 최근 실제 fine heading 입니다. shape은 ``[n_agent, 6]`` 입니다.
+            exec_valid_history: 최근 실제 fine valid 입니다. shape은 ``[n_agent, 6]`` 입니다.
+            agent_type: 차종 번호입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                - commit_pos: 실행된 다음 0.5초 중심점 ``[n_agent, 5, 2]``
+                - commit_head: 실행된 다음 0.5초 방향 ``[n_agent, 5]``
+                - next_pos: 마지막 중심점 ``[n_agent, 2]``
+                - next_head: 마지막 방향 ``[n_agent]``
+        """
+        if y_hat_norm.numel() == 0:
+            empty_pos = current_pos.new_zeros((0, 5, 2))
+            empty_head = current_head.new_zeros((0, 5))
+            return empty_pos, empty_head, current_pos.clone(), current_head.clone()
+
+        future_pos, future_head = self._build_full_future_from_flow(
+            y_hat_norm=y_hat_norm,
+            current_pos=current_pos,
+            current_head=current_head,
+        )
+        v0, a_prev, kappa0, _, _ = self._estimate_reference_profiles(
+            current_pos=current_pos,
+            current_head=current_head,
+            exec_pos_history=exec_pos_history,
+            exec_head_history=exec_head_history,
+            exec_valid_history=exec_valid_history,
+            future_pos=future_pos,
+            future_head=future_head,
+        )
+
+        limits = self._gather_dynamic_limits(agent_type=agent_type, dtype=current_pos.dtype)
+        dt = float(self.config.dt)
+        accel_alpha = dt / (dt + float(self.config.accel_tau_s))
+        curvature_alpha = dt / (dt + float(self.config.curvature_tau_s))
+        history_steps = min(exec_pos_history.shape[1], int(self.config.history_steps))
+
+        pos_state = current_pos.clone()
+        head_state = current_head.clone()
+        speed_state = v0.clamp_min(0.0)
+        accel_state = a_prev.clamp(-limits["a_max"], limits["a_max"])
+        kappa_state = kappa0.clone()
+        exec_pos_history_state = exec_pos_history[:, -history_steps:].clone()
+        exec_head_history_state = exec_head_history[:, -history_steps:].clone()
+        exec_valid_history_state = exec_valid_history[:, -history_steps:].clone()
+        exec_pos_history_state[:, -1] = current_pos
+        exec_head_history_state[:, -1] = current_head
+        exec_valid_history_state[:, -1] = True
+
+        commit_pos = current_pos.new_zeros((current_pos.shape[0], 5, 2))
+        commit_head = current_head.new_zeros((current_head.shape[0], 5))
+        for step_idx in range(5):
+            # Keep the FM future fixed for the 0.5s block, but re-solve control on the remaining horizon every 0.1s.
+            remaining_future_pos = future_pos[:, step_idx:]
+            remaining_future_head = future_head[:, step_idx:]
+            _, _, _, v_ref_horizon, kappa_ref_horizon = self._estimate_reference_profiles(
+                current_pos=pos_state,
+                current_head=head_state,
+                exec_pos_history=exec_pos_history_state,
+                exec_head_history=exec_head_history_state,
+                exec_valid_history=exec_valid_history_state,
+                future_pos=remaining_future_pos,
+                future_head=remaining_future_head,
+            )
+            v_ref_target = v_ref_horizon[:, -1]
+            a_star = self._solve_longitudinal_lqr(v0=speed_state, v_ref_target=v_ref_target)
+            u_star = self._solve_lateral_lqr(
+                v_profile=v_ref_horizon,
+                kappa0=kappa_state,
+                kappa_ref_profile=kappa_ref_horizon,
+            )
+            slow_mask = (speed_state < float(self.config.stop_speed_mps)) & (
+                v_ref_target < float(self.config.stop_speed_mps)
+            )
+            if slow_mask.any():
+                a_star = a_star.clone()
+                u_star = u_star.clone()
+                a_star[slow_mask] = -float(self.config.stop_speed_kp) * (
+                    speed_state[slow_mask] - v_ref_target[slow_mask]
+                )
+                u_star[slow_mask] = 0.0
+            a_star = torch.clamp(a_star, -limits["a_max"], limits["a_max"])
+
+            accel_applied = accel_state + accel_alpha * (a_star - accel_state)
+            accel_applied = torch.clamp(accel_applied, -limits["a_max"], limits["a_max"])
+            kappa_state, u_applied = self._clip_curvature_and_rate(
+                kappa_state=kappa_state,
+                a_value=accel_applied,
+                u_value=u_star,
+                speed_value=speed_state,
+                limits=limits,
+            )
+            kappa_ideal = kappa_state + dt * u_applied
+            kappa_applied = kappa_state + curvature_alpha * (kappa_ideal - kappa_state)
+            kappa_applied, _ = self._clip_curvature_and_rate(
+                kappa_state=kappa_applied,
+                a_value=accel_applied,
+                u_value=u_applied,
+                speed_value=speed_state,
+                limits=limits,
+            )
+            pos_state = pos_state + dt * speed_state.unsqueeze(-1) * torch.stack(
+                [head_state.cos(), head_state.sin()],
+                dim=-1,
+            )
+            head_state = wrap_angle(head_state + dt * speed_state * kappa_applied)
+            speed_state = torch.clamp(
+                speed_state + dt * accel_applied,
+                min=torch.zeros_like(limits["v_max"]),
+                max=limits["v_max"],
+            )
+            accel_state = accel_applied
+            kappa_state = kappa_applied
+            commit_pos[:, step_idx] = pos_state
+            commit_head[:, step_idx] = head_state
+            if history_steps == 1:
+                exec_pos_history_state = pos_state.unsqueeze(1)
+                exec_head_history_state = head_state.unsqueeze(1)
+                exec_valid_history_state = torch.ones_like(head_state, dtype=torch.bool).unsqueeze(1)
+            else:
+                exec_pos_history_state = torch.cat(
+                    [exec_pos_history_state[:, 1:], pos_state.unsqueeze(1)],
+                    dim=1,
+                )
+                exec_head_history_state = torch.cat(
+                    [exec_head_history_state[:, 1:], head_state.unsqueeze(1)],
+                    dim=1,
+                )
+                exec_valid_history_state = torch.cat(
+                    [
+                        exec_valid_history_state[:, 1:],
+                        torch.ones_like(head_state, dtype=torch.bool).unsqueeze(1),
+                    ],
+                    dim=1,
+                )
+
+        return commit_pos, commit_head, commit_pos[:, -1], commit_head[:, -1]

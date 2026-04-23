@@ -182,6 +182,15 @@ class TokenProcessor(torch.nn.Module):
                 pos=pos,
                 heading=heading,
             )
+            (
+                rollout_init_fine_pos_history,
+                rollout_init_fine_head_history,
+                rollout_init_fine_valid_history,
+            ) = self._build_rollout_init_fine_history(
+                valid=valid,
+                pos=pos,
+                heading=heading,
+            )
             tokenized_agent.update(
                 {
                     "gt_pos_raw": pos[:, self.shift :: self.shift],
@@ -191,6 +200,9 @@ class TokenProcessor(torch.nn.Module):
                     "rollout_init_fine_pos_pair": rollout_init_fine_pos_pair,
                     "rollout_init_fine_head_pair": rollout_init_fine_head_pair,
                     "rollout_init_fine_valid_pair": rollout_init_fine_valid_pair,
+                    "rollout_init_fine_pos_history": rollout_init_fine_pos_history,
+                    "rollout_init_fine_head_history": rollout_init_fine_head_history,
+                    "rollout_init_fine_valid_history": rollout_init_fine_valid_history,
                 }
             )
 
@@ -246,6 +258,50 @@ class TokenProcessor(torch.nn.Module):
         head_pair = torch.cat([head_pair, head_pair], dim=1)
         valid_pair = torch.cat([valid_pair, valid_pair], dim=1)
         return pos_pair, head_pair, valid_pair
+
+    def _build_rollout_init_fine_history(
+        self,
+        valid: Tensor,
+        pos: Tensor,
+        heading: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """closed-loop LQR bridge가 쓸 최근 0.5초 실제 10Hz 상태 6개를 만듭니다.
+
+        현재 semi-continuous closed-loop는 raw step 10을 현재 coarse 시점으로 씁니다.
+        그래서 raw step 5~10 전체를 그대로 넘기면, 현재 시점과 직전 0.5초 실제
+        실행 이력을 함께 사용할 수 있습니다. 기록 길이가 부족하면 가장 앞 상태를
+        반복해 길이를 6으로 맞춥니다.
+
+        Args:
+            valid: 전체 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            pos: 전체 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전체 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor]:
+                - 최근 fine 중심점 6개 ``[n_agent, 6, 2]``
+                - 최근 fine 방향 6개 ``[n_agent, 6]``
+                - 최근 fine 유효 여부 6개 ``[n_agent, 6]``
+        """
+        current_raw_step = min(self.shift * 2, pos.shape[1] - 1)
+        start_step = max(current_raw_step - self.shift, 0)
+        pos_history = pos[:, start_step : current_raw_step + 1].contiguous()
+        head_history = heading[:, start_step : current_raw_step + 1].contiguous()
+        valid_history = valid[:, start_step : current_raw_step + 1].contiguous()
+
+        history_len = self.shift + 1
+        if pos_history.shape[1] >= history_len:
+            return pos_history[:, -history_len:], head_history[:, -history_len:], valid_history[:, -history_len:]
+
+        pad_len = history_len - pos_history.shape[1]
+        pos_pad = pos_history[:, :1].expand(-1, pad_len, -1)
+        head_pad = head_history[:, :1].expand(-1, pad_len)
+        valid_pad = valid_history[:, :1].expand(-1, pad_len)
+        return (
+            torch.cat([pos_pad, pos_history], dim=1),
+            torch.cat([head_pad, head_history], dim=1),
+            torch.cat([valid_pad, valid_history], dim=1),
+        )
 
     def _match_agent_token(
         self,

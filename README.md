@@ -30,22 +30,19 @@
 - `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면 
 - `retokenize`로 고른 token의 0.5초 chunk를 **외부 rollout 10Hz 출력에만** 반영합니다.
 - 내부 closed-loop context는 계속 실제 FM commit 상태를 유지합니다.
-- `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true`를 켜면 vehicle / bicycle에만
-  dynamics-aware feasible commit bridge를 적용합니다. 이 모드에서는 2초 FM 미래를 preview로 보되,
-  실제 반영은 항상 다음 0.5초 / 5점만 실행합니다.
-- `model.model_config.decoder.use_stationary_refinement_in_dynamics_bridge=true`를 함께 켜면
-  `eab8dd38`에서 추가된 stationary hold, commit-window intent 기반 저속 보정,
-  propagation 물리 제한 강화까지 같이 적용합니다. 기본값 `false`면 이 추가 로직은 꺼집니다.
-- 이 bridge는 최근 실제 10Hz 두 점으로 현재 speed / yaw-rate를 잡고, `draft_physics.py`의
-  차종별 속도, 가감속, yaw-rate, yaw-accel, 횡가속, 최소 선회 반경 제한을 같이 씁니다.
-- `use_stationary_refinement_in_dynamics_bridge=true`일 때만 bridge는 제어로 바꾸기 전에
-  **현재 executed 상태 + 다음 0.5초 preview 5점만** 보고 stationary hold를 먼저 검사합니다.
-- `use_stationary_refinement_in_dynamics_bridge=true`일 때만 저속에서 현재 0.5초 commit window의
-  누적 종방향 변위를 써서 방향성을 보정합니다.
-- wheelbase가 없는 WOMD multi-agent 특성을 고려해 steering angle 대신 yaw-rate 형태의
-  kinematic bicycle 계열 적분을 쓰며, 실제 에이전트 footprint 크기로 최소 선회 반경 하한을
-  한 번 더 보정합니다. `use_stationary_refinement_in_dynamics_bridge=true`이면 최종 0.5초
-  propagation에도 이 물리 제한을 적용합니다.
+- `model.model_config.decoder.use_stop_motion=true` 를 켜면 current + 0.1/0.2/0.3/0.4/0.5초
+  6점 경로를 motion token으로 다시 보고, **stop token** 과 일치하는 agent의 다음 0.5초 chunk를
+  완전히 고정합니다. 이 stop gate는 vehicle / pedestrian / bicycle 모두에 적용됩니다.
+- 이 stop-motion 토큰 매칭은 **실제 actor box 크기 대신 class별 고정 토큰 박스**를 사용합니다.
+  vehicle은 `2.0 x 4.8`, pedestrian은 `1.0 x 1.0`, bicycle은 `1.0 x 2.0` 입니다.
+- `model.model_config.decoder.use_lqr=true` 를 켜면 stop gate를 통과한 vehicle / bicycle에만
+  curvature-domain LQR + kinematic bicycle commit bridge를 적용합니다. 이 모드에서는 2초 FM
+  미래를 preview로 보되, 실제 반영은 항상 다음 0.5초 / 5점만 실행합니다.
+- LQR bridge는 최근 실제 10Hz 6점 history로 현재 speed / yaw-rate / curvature를 잡고,
+  `draft_physics.py`의 차종별 속도, 가감속, yaw-rate, 횡가속, 최소 선회 반경 제한을 같이 씁니다.
+- wheelbase가 없는 WOMD multi-agent 특성을 고려해 steering angle 대신 **curvature를 제어 입력**
+  으로 쓰는 kinematic bicycle 계열 적분을 쓰며, class별 envelope로 곡률과 곡률 변화율을 한 번 더
+  clip 합니다.
 - DRaFT physics 경로에는 NaN 방지 가드가 들어 있습니다.
 - heading 2-vector와 pedestrian velocity 2-vector는 raw `atan2` 대신 safe angle 복원으로 처리해
   `(0, 0)` 또는 near-zero vector backward에서 gradient NaN이 나지 않도록 막습니다.
@@ -68,7 +65,7 @@
 - post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
 - `matched_token_chunk` 에서는 같은 6점 경로 매칭으로 고른 token chunk가 외부 rollout에도 반영됩니다. 
 - 다만 내부 closed-loop context는 계속 실제 상태를 유지합니다.
-- dynamics-aware feasible commit bridge를 켠 경우에도 `retokenize`와 내부 문맥 갱신은
+- `use_lqr=true` 를 켠 경우에도 `retokenize`와 내부 문맥 갱신은
   항상 실행된 5개 fine 상태를 기준으로 이뤄집니다.
 - 같은 모드에서 `matched_token_chunk`를 써도 vehicle / bicycle의 외부 10Hz 출력은
   token chunk로 다시 덮지 않고 실제 실행 chunk를 유지합니다. pedestrian만 기존 방식대로
@@ -375,16 +372,13 @@ torchrun ... -m src.run \
 - `model.model_config.decoder.flow_window_steps`는 flow matching이 한 번에 생성하는 10Hz 미래 길이입니다. 기본값은 `20` step, 즉 `2초`입니다. 
 - `5`의 배수여야 하며 `decoder.num_future_steps`보다 클 수 없습니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
-- `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true/false`로
-  vehicle / bicycle용 dynamics-aware feasible commit bridge를 켜거나 끕니다.
-- `model.model_config.decoder.use_stationary_refinement_in_dynamics_bridge=true/false`로
-  `eab8dd38`에서 들어간 stationary hold / low-speed refinement / limit-aware propagation을
-  별도로 켜거나 끕니다. 기본값은 `false`입니다.
-- 켜면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
-- refinement를 켜면 현재 executed 상태와 다음 preview 5점이 모두 작은 stationary tube 안에 있으면
-  이번 block은 exact hold로 commit합니다.
-- refinement를 켜면 저속 방향성은 현재 0.5초 block의 누적 종방향 변위를 기준으로 보정합니다.
-- refinement를 켜면 0.5초 propagation에 물리 제한을 적용합니다.
+- `model.model_config.decoder.use_stop_motion=true/false`로 stop-motion gate를 켜거나 끕니다.
+- `model.model_config.decoder.use_lqr=true/false`로 vehicle / bicycle용 curvature-LQR commit
+  bridge를 켜거나 끕니다. 기본값은 `false` 입니다.
+- `use_lqr=true`면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
+- `use_stop_motion=true`면 stop token 과 일치하는 agent 의 다음 0.5초 5점을 현재 상태로 완전 고정합니다.
+- `use_lqr=true`는 stop gate를 통과한 vehicle / bicycle 에만 적용됩니다. pedestrian 은 항상
+  token / raw branch 를 유지합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
@@ -412,16 +406,16 @@ torchrun ... -m src.run \
 # matched token chunk를 실제 closed-loop rollout/video/score 출력에만 사용
 ... model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
-# vehicle / bicycle에 dynamics-aware feasible commit bridge 적용
-... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true
+# stop-motion gate 적용
+... model.model_config.decoder.use_stop_motion=true
 
-# eab8dd38의 stationary refinement까지 함께 적용
-... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true \
-    model.model_config.decoder.use_stationary_refinement_in_dynamics_bridge=true
+# stop-motion + vehicle / bicycle curvature-LQR commit bridge 적용
+... model.model_config.decoder.use_stop_motion=true \
+    model.model_config.decoder.use_lqr=true
 
-# dynamics-aware feasible commit + matched token chunk를 함께 쓸 때도
+# use_lqr + matched token chunk를 함께 쓸 때도
 # vehicle / bicycle export는 실행된 5점 chunk를 유지하고 pedestrian만 token chunk를 씁니다.
-... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true \
+... model.model_config.decoder.use_lqr=true \
     model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
 # training validation에서 공식 2025 scorer를 앞 20 batch에만 적용
@@ -948,7 +942,7 @@ torchrun \
 - `model.model_config.sim_agents_submission.method_name`
 - `model.model_config.sim_agents_submission.authors`
 - `model.model_config.sim_agents_submission.affiliation`
-- `model.model_config.sim_agents_submission.description`
+- `submission.description` 또는 `model.model_config.sim_agents_submission.description`
 - `model.model_config.sim_agents_submission.method_link`
 - `model.model_config.sim_agents_submission.account_name`
 
@@ -1332,4 +1326,4 @@ python -m src.run experiment=self_forced_npfm ckpt_path=/path/to/pretrained.ckpt
 
 ### 중요한 일관성 규칙
 
-fine-tuning 에 쓰는 rollout 과 inference 에 쓰는 rollout 은 반드시 같은 commit/update 규칙을 사용해야 합니다. fine-tuning 에서 `closed_loop_rollout_mode` 나 dynamics-aware feasible commit bridge 를 켰다면, validation / test / submission export 에서도 같은 설정을 유지해야 합니다.
+fine-tuning 에 쓰는 rollout 과 inference 에 쓰는 rollout 은 반드시 같은 commit/update 규칙을 사용해야 합니다. fine-tuning 에서 `closed_loop_rollout_mode` 나 `use_stop_motion` / `use_lqr` 을 켰다면, validation / test / submission export 에서도 같은 설정을 유지해야 합니다.

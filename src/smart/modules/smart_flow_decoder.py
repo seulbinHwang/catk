@@ -37,8 +37,9 @@ class SMARTFlowDecoder(nn.Module):
         flow_solver_eps: float,
         closed_loop_rollout_mode: str = "raw_fm",
         flow_window_steps: int = 20,
-        use_dynamics_feasible_commit_bridge: bool = False,
-        use_stationary_refinement_in_dynamics_bridge: bool = False,
+        use_lqr: bool = False,
+        use_stop_motion: bool = False,
+        lqr_commit: DictConfig | None = None,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -72,9 +73,9 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_method=flow_solver_method,
             flow_solver_eps=flow_solver_eps,
             closed_loop_rollout_mode=closed_loop_rollout_mode,
-            use_dynamics_feasible_commit_bridge=use_dynamics_feasible_commit_bridge,
-            use_stationary_refinement_in_dynamics_bridge=
-            use_stationary_refinement_in_dynamics_bridge,
+            use_lqr=use_lqr,
+            use_stop_motion=use_stop_motion,
+            lqr_commit=lqr_commit,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
