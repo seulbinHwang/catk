@@ -27,8 +27,8 @@ model_config:
       num_k: 1
       temp: 1.0
   validation_rollout_sampling:
-    sample_steps: 16
-    sample_method: midpoint
+    sample_steps: 32
+    sample_method: euler
     noise_scale: 1.0
   draft:
     enabled: false
@@ -36,8 +36,8 @@ model_config:
     ramp_epochs: 4
     max_weight: 1.0
     sampling:
-      sample_steps: 16
-      sample_method: midpoint
+      sample_steps: 32
+      sample_method: euler
       noise_scale: 1.0
       backprop_last_k: null
     physics:
@@ -87,7 +87,7 @@ model_config:
     flow_solver_eps: 1.0e-3
     closed_loop_rollout_mode: raw_fm # raw_fm
     use_dynamics_feasible_commit_bridge: false
-    use_stationary_refinement_in_dynamics_bridge: false
+    use_stationary_refinement_in_dynamics_bridge: true
   sim_agents_submission:
     is_active: false
     method_name: "SMART-flow-7M"
