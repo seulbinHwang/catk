@@ -47,6 +47,28 @@ log = RankedLogger(__name__, rank_zero_only=True)
 torch.set_float32_matmul_precision("high")
 
 
+def _apply_submission_overrides(cfg: DictConfig) -> None:
+    submission_override_cfg = cfg.get("submission")
+    if not submission_override_cfg:
+        return
+
+    description = submission_override_cfg.get("description")
+    if description in (None, ""):
+        return
+
+    model_cfg = cfg.get("model")
+    model_config = model_cfg.get("model_config") if model_cfg else None
+    sim_agents_submission = model_config.get("sim_agents_submission") if model_config else None
+    if not sim_agents_submission:
+        raise ValueError(
+            "submission.description was provided, but model.model_config.sim_agents_submission "
+            "is not configured."
+        )
+
+    with open_dict(sim_agents_submission):
+        sim_agents_submission.description = str(description)
+
+
 def _configure_wandb_checkpoint_upload(cfg: DictConfig) -> None:
     logger_cfg = cfg.get("logger")
     if not logger_cfg:
@@ -146,6 +168,7 @@ def main(cfg: DictConfig) -> None:
     prepared_waymo_storage_state = None
 
     try:
+        _apply_submission_overrides(cfg)
         prepared_waymo_storage_state = maybe_prepare_waymo_storage_state(cfg)
 
         log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")

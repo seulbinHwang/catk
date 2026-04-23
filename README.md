@@ -17,9 +17,13 @@
 - `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면 
 - `retokenize`로 고른 token의 0.5초 chunk를 **외부 rollout 10Hz 출력에만** 반영합니다.
 - 내부 closed-loop context는 계속 실제 FM commit 상태를 유지합니다.
-- `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true`를 켜면 vehicle / bicycle에만
-  dynamics-aware feasible commit bridge를 적용합니다. 이 모드에서는 2초 FM 미래를 preview로 보되,
-  실제 반영은 항상 다음 0.5초 / 5점만 실행합니다.
+- `model.model_config.decoder.use_stop_motion=true` 를 켜면 current + 0.1/0.2/0.3/0.4/0.5초
+  6점 경로를 motion token으로 다시 보고, **stop token** 과 일치하는 agent의 다음 0.5초 chunk를
+  완전히 고정합니다. 이 stop gate는 vehicle / pedestrian / bicycle 모두에 적용됩니다.
+- 이 stop-motion 토큰 매칭은 **실제 actor box 크기 대신 class별 고정 토큰 박스**를 사용합니다.
+  vehicle은 `2.0 x 4.8`, pedestrian은 `1.0 x 1.0`, bicycle은 `1.0 x 2.0` 입니다.
+- `model.model_config.decoder.use_lqr=true` 를 켜면 stop gate를 통과한 vehicle / bicycle에만
+  curvature-domain LQR + kinematic bicycle commit bridge를 적용합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
@@ -35,11 +39,44 @@
 - post-process된 token endpoint가 아니라 네트워크가 직접 낸 10Hz trajectory를 봅니다.
 - `matched_token_chunk` 에서는 같은 6점 경로 매칭으로 고른 token chunk가 외부 rollout에도 반영됩니다. 
 - 다만 내부 closed-loop context는 계속 실제 상태를 유지합니다.
-- dynamics-aware feasible commit bridge를 켠 경우에도 `retokenize`와 내부 문맥 갱신은
+- `use_lqr=true` 를 켠 경우에도 `retokenize`와 내부 문맥 갱신은
   항상 실행된 5개 fine 상태를 기준으로 이뤄집니다.
 - 같은 모드에서 `matched_token_chunk`를 써도 vehicle / bicycle의 외부 10Hz 출력은
   token chunk로 다시 덮지 않고 실제 실행 chunk를 유지합니다. pedestrian만 기존 방식대로
   token chunk export를 유지합니다.
+
+### Closed-loop LQR / Stop-motion Switches
+
+- `use_stop_motion=true` 이면 **raw FM 2초 미래 중 앞 5점**만 사용해 stop 여부를 먼저 판단합니다.
+- 입력은 현재 pose + 0.1/0.2/0.3/0.4/0.5초 pose의 6점 경로이고, 토큰 매칭은 항상 **고정 class box**로 합니다.
+- stop token 과 일치하면 다음 0.5초 5점의 `x / y / yaw` 를 현재 상태와 완전히 같게 고정합니다.
+  즉, 작은 떨림을 허용하지 않습니다.
+- 이 stop gate는 `use_lqr=false` 여도 동작합니다.
+- `use_lqr=true` 이면 stop gate를 통과한 vehicle / bicycle에만 제어용 참조를 만들고,
+  1초 horizon의 longitudinal / lateral LQR를 0.1초마다 다시 풀어 다음 0.5초 5점을 실제 실행합니다.
+- 이때 제어는 steering angle 이 아니라 **curvature-domain kinematic bicycle** 로 수행합니다.
+  wheelbase 추정은 쓰지 않습니다.
+- LQR가 켜져 있어도 pedestrian은 token/raw branch를 유지합니다.
+- `matched_token_chunk` 를 써도 vehicle / bicycle이 LQR를 탄 경우 외부 10Hz 출력은
+  token chunk가 아니라 **실제로 실행된 5점**을 유지합니다.
+
+예시:
+
+```bash
+# 기존 raw FM closed-loop
+python train.py \
+  model.model_config.decoder.closed_loop_rollout_mode=raw_fm
+
+# stop-motion gate만 사용
+python train.py \
+  model.model_config.decoder.use_stop_motion=true \
+  model.model_config.decoder.use_lqr=false
+
+# stop-motion + vehicle/bicycle LQR bridge 사용
+python train.py \
+  model.model_config.decoder.use_stop_motion=true \
+  model.model_config.decoder.use_lqr=true
+```
 
 
 ## 2. 환경 설치
@@ -279,9 +316,9 @@ torchrun ... -m src.run \
 - validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
 - `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. 현재 `pre_bc_flow` 기본값은 `32`입니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
-- `model.model_config.decoder.use_dynamics_feasible_commit_bridge=true/false`로
-  vehicle / bicycle용 dynamics-aware feasible commit bridge를 켜거나 끕니다.
-- 켜면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
+- `model.model_config.decoder.use_stop_motion=true/false`로 stop-motion gate를 켜거나 끕니다.
+- `model.model_config.decoder.use_lqr=true/false`로 vehicle / bicycle용 dynamics-aware feasible commit bridge를 켜거나 끕니다.
+- `use_lqr=true`면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
@@ -309,12 +346,16 @@ torchrun ... -m src.run \
 # matched token chunk를 실제 closed-loop rollout/video/score 출력에만 사용
 ... model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
-# vehicle / bicycle에 dynamics-aware feasible commit bridge 적용
-... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true
+# stop-motion gate 적용
+... model.model_config.decoder.use_stop_motion=true
 
-# dynamics-aware feasible commit + matched token chunk를 함께 쓸 때도
+# stop-motion + vehicle / bicycle dynamics-aware feasible commit bridge 적용
+... model.model_config.decoder.use_stop_motion=true \
+    model.model_config.decoder.use_lqr=true
+
+# use_lqr + matched token chunk를 함께 쓸 때도
 # vehicle / bicycle export는 실행된 5점 chunk를 유지하고 pedestrian만 token chunk를 씁니다.
-... model.model_config.decoder.use_dynamics_feasible_commit_bridge=true \
+... model.model_config.decoder.use_lqr=true \
     model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
 # training validation에서 공식 2025 scorer를 앞 20 batch에만 적용
@@ -735,7 +776,7 @@ torchrun \
 - `model.model_config.sim_agents_submission.method_name`
 - `model.model_config.sim_agents_submission.authors`
 - `model.model_config.sim_agents_submission.affiliation`
-- `model.model_config.sim_agents_submission.description`
+- `submission.description` 또는 `model.model_config.sim_agents_submission.description`
 - `model.model_config.sim_agents_submission.method_link`
 - `model.model_config.sim_agents_submission.account_name`
 
@@ -766,7 +807,7 @@ python -m src.run \
   model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
   model.model_config.sim_agents_submission.authors=[Anonymous] \
   model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  submission.description="YOUR_DESCRIPTION" \
   model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
   model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME"
 ```
@@ -795,7 +836,7 @@ torchrun \
   model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
   model.model_config.sim_agents_submission.authors=[Anonymous] \
   model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  submission.description="YOUR_DESCRIPTION" \
   model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
   model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME" \
   paths.log_dir=/workspace/exp_logs
@@ -927,7 +968,7 @@ torchrun \
   model.model_config.sim_agents_submission.method_name="SMART-flow-7M" \
   model.model_config.sim_agents_submission.authors=[Anonymous] \
   model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  submission.description="YOUR_DESCRIPTION" \
   model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
   model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME" \
   waymo_submission.enabled=true \
