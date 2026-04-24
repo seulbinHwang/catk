@@ -1428,7 +1428,7 @@ class SMARTFlow(LightningModule):
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
     ) -> Tensor:
-        """F_rho와 F_psi의 perturbed self-rollout score 차이인 Delta_tau를 계산합니다.
+        """F_rho와 F_psi의 score 차이를 clean path-space 방향으로 바꿉니다.
 
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
@@ -1439,14 +1439,14 @@ class SMARTFlow(LightningModule):
                 shape은 ``[n_agent]`` 입니다.
 
         Returns:
-            Tensor: DMD식 score-difference update 방향입니다.
+            Tensor: clean closed-loop trajectory에 MSE target으로 걸 path-space 방향입니다.
                 shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
 
         Notes:
-            기존 구현은 teacher와 generated estimator의 clean path estimate 차이를
-            그대로 반환했습니다. 이 버전은 같은 noisy state에서의 velocity 예측을
-            사용해 ``s_rho - s_psi = tau * (U_rho - U_psi) / sigma_tau`` 형태의
-            score difference를 직접 계산합니다.
+            먼저 같은 noisy state에서 ``s_rho - s_psi`` 를 계산합니다.
+            이 값은 noisy path 위의 방향이므로, ``X_tau = tau * Y + sigma_tau * eps``
+            관계를 반영해 tau를 한 번 더 곱합니다.
+            따라서 반환값은 ``d_Y = tau * (s_rho - s_psi)`` 입니다.
         """
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
@@ -1480,7 +1480,13 @@ class SMARTFlow(LightningModule):
                 target_pred["velocity"].float() - generated_pred["velocity"].float()
             ) / sigma_t
 
-        return score_delta.to(dtype=committed_path_norm.dtype).detach()
+            # score_delta는 noisy path 위의 방향입니다.
+            # clean closed-loop path에 MSE target을 걸 때는
+            # X_tau = tau * Y + sigma_tau * eps의 연결 관계를 반영해
+            # tau를 한 번 더 곱한 path-space 방향을 사용합니다.
+            path_delta = view_tau * score_delta
+
+        return path_delta.to(dtype=committed_path_norm.dtype).detach()
 
     def _compute_self_forced_physics_loss(
         self,
@@ -1901,13 +1907,13 @@ class SMARTFlow(LightningModule):
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
-        delta_tau = self._compute_self_forced_direction(
+        path_delta = self._compute_self_forced_direction(
             tokenized_map=tokenized_map_eval,
             tokenized_agent=tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
-        target_path_norm = (committed_path_norm + self.self_forced_path_step_size * delta_tau).detach()
+        target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
         sf_loss = masked_mean_square_loss(committed_path_norm, target_path_norm)
         physics_dict = self._compute_self_forced_physics_loss(
             committed_path_norm=committed_path_norm,
