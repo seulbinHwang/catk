@@ -92,7 +92,7 @@ model:
         # backprop_last_k stays at 12/16 (same as H100 preset). If OOM is
         # ever hit during the DRaFT backprop, drop this to 8 or 6 before
         # touching the batch size.
-        backprop_last_k: 12
+        backprop_last_k: 24
       physics:
         force_fp32: true
         dt: 0.1
