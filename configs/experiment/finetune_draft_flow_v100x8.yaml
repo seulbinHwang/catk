@@ -1,0 +1,168 @@
+# @package _global_
+
+# ============================================================================
+# DRaFT fine-tuning preset for 8x V100-SXM2 32GB (sm_70, Volta) boxes.
+# Derived from `finetune_draft_flow_a100x4.yaml` (4x A100 80GB) which itself
+# derives from `finetune_draft_flow.yaml` (6x H100 80GB).
+# ----------------------------------------------------------------------------
+# Key differences vs. the A100x4 preset:
+#
+#   * Precision: `bf16-mixed` -> `16-mixed`.
+#     V100 (sm_70, Volta) has FP16 tensor cores but NO native BF16. Lightning's
+#     `bf16-mixed` on V100 either falls back to software BF16 (very slow) or
+#     fails on some kernels. `16-mixed` uses FP16 with automatic loss scaling
+#     and runs on the FP16 tensor cores at full speed.
+#
+#   * VRAM: 80 GiB -> 32 GiB per GPU (~2.5x less). We must drop the per-GPU
+#     batch accordingly. Effective global batch is kept at 288 (= 6xH100
+#     preset = A100x4 preset) so the pretrained `lr=2e-4` regime carries
+#     over unchanged:
+#         per_gpu_batch * num_gpus * accumulate_grad_batches = 12 * 8 * 3 = 288
+#     This is a conservative starting point for the first V100x8 run. If
+#     it OOMs during DRaFT backprop (seq-len blow-up on scene-variance
+#     spikes), step DOWN in this order BEFORE touching `train_batch_size`:
+#         1) `model.model_config.draft.sampling.backprop_last_k` 24 -> 12 -> 8
+#         2) `data.train_batch_size` 12 -> 9 (with accumulate_grad_batches=4)
+#         3) `data.train_batch_size` 9  -> 6 (with accumulate_grad_batches=6)
+#     Always rescale `accumulate_grad_batches` so that
+#     `train_batch_size * 8 * accumulate_grad_batches = 288`, so `lr=2e-4`
+#     stays valid. If you must deviate from effective 288, apply linear
+#     lr scaling (lr_new = 2e-4 * eff_new / 288).
+#
+#   * Attention kernel: A100x4 ships a math-SDPA patch in
+#     `src/smart/modules/flow_local_decoder.py` for the ChunkStepRefiner
+#     self-attention because A100 flash / mem-efficient kernels trip
+#     `CUDA error: invalid configuration argument` on pathological batches.
+#     V100 has no flash-attention (requires sm_80+) and PyTorch SDPA
+#     auto-falls-back to math / mem-efficient on sm_70. The A100-specific
+#     patch is a no-op on V100, so no extra action is needed here.
+#
+#   * closed-loop val VRAM: `val_batch_size * n_rollout_closed_val` rollouts
+#     are materialized per rank at once. A100 fit 8 * 16 = 128 at 80 GiB.
+#     At 32 GiB we drop `val_batch_size` to 4 and keep `n_rollout_closed_val`
+#     at 16 (the 2025 sim_agents scorer auto-chunks to 32 rollouts internally).
+#
+#   * CPU-side: 8 DDP ranks * 4 workers = 32 dataloader procs easily
+#     overwhelms page-locked memory / file-handle limits on shared boxes.
+#     We default to `num_workers: 2` (= 16 procs total) and `prefetch_factor: 2`.
+#     Bump back to 4 only if you verify the box has enough RAM headroom.
+#
+# Effective global batch size on this preset:
+#   per_gpu_batch * num_gpus * accumulate_grad_batches = 12 * 8 * 3 = 288
+#   (identical to the 6xH100 preset, so `lr=2e-4` carries over directly.)
+# ============================================================================
+
+defaults:
+  - override /model: smart_flow
+
+model:
+  model_config:
+    # Optimizer / scheduler --------------------------------------------------
+    # Effective global batch here is 12 * 8 * 3 = 288 (identical to the
+    # 6xH100 and A100x4 presets), so the same lr=2e-4 applies unchanged.
+    lr: 2e-4
+    lr_warmup_steps: 2
+    lr_min_ratio: 1e-2
+
+    # Commit bridge ---------------------------------------------------------
+    # Keep stop-motion gating OFF during this fine-tune. The pretrained flow
+    # checkpoint was trained without stop_motion logic; see the note in
+    # `finetune_draft_flow_a100x4.yaml` for the full rationale.
+    use_stop_motion: false
+
+    # Validation ------------------------------------------------------------
+    # `n_rollout_closed_val=16` is the same as the A100x4 / 6xH100 preset.
+    # The closed-loop rollout loop in smart_flow.py auto-chunks rollouts on
+    # OOM, and the 2025 sim-agents scorer internally up-samples to 32 per
+    # scenario. If val OOMs on V100 32GB, drop `data.val_batch_size` first
+    # (8 -> 4 -> 2) before reducing this.
+    n_rollout_closed_val: 16
+    # Keep the 2025 sim-agents metric on. With 8 DDP ranks * multiprocess
+    # scoring, 2 workers is still the right cap to avoid RAM pressure.
+    n_batch_sim_agents_metric: 10
+    sim_agents_metric_workers: 2
+    val_open_loop: true
+    val_closed_loop: true
+
+    finetune:
+      enabled: true
+      train_full_flow_decoder_only: true
+
+    draft:
+      enabled: true
+      start_epoch: 0
+      ramp_epochs: 32
+      max_weight: 0.1
+      sampling:
+        sample_steps: 32
+        sample_method: euler
+        noise_scale: 1.0
+        # V100 32GB is tight during the DRaFT backward pass. Start at 24
+        # and drop to 12 / 8 / 6 BEFORE reducing train_batch_size if you
+        # hit OOM during .backward() (not during forward).
+        backprop_last_k: 24
+      physics:
+        force_fp32: true
+        dt: 0.1
+        pos_scale_m: 20.0
+        speed_floor_mps: 0.5
+        vehicle_v_max_mps: 35.0
+        vehicle_a_max_mps2: 8.0
+        vehicle_lat_accel_max_mps2: 4.2
+        bicycle_v_max_mps: 22.0
+        bicycle_a_max_mps2: 5.5
+        bicycle_lat_accel_max_mps2: 4.4
+        pedestrian_v_max_mps: 5.0
+        pedestrian_a_max_mps2: 4.7
+        vehicle_wheelbase_scale: 0.60
+        bicycle_wheelbase_scale: 0.85
+        vehicle_steer_max_rad: 0.55
+        bicycle_steer_max_rad: 0.90
+        vehicle_steer_rate_max_radps: 0.8
+        bicycle_steer_rate_max_radps: 1.4
+        pedestrian_heading_weight: 0.05
+        pedestrian_heading_speed_threshold_mps: 0.5
+        eps: 1.0e-6
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  # Same relative val budget as the H100 / A100x4 presets. With 8 GPUs and
+  # val_batch_size=4 this covers about 44097*0.1/8/4 ~= 138 val batches per
+  # rank per eval, matching the prior presets.
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 16
+  # Epoch count matches the H100 / A100x4 presets (user policy: do not reduce).
+  max_epochs: 32
+  # V100 (sm_70) has no native BF16. Use FP16 with Lightning's automatic
+  # loss scaler. If you ever see GradScaler "no-op" spam or NaN loss from
+  # FP16 underflow, try `precision: 32-true` at ~2x VRAM / ~2x wall time.
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+  # bs=12 per GPU * 8 GPUs * acc=3 = 288 effective batch, matching the
+  # 6xH100 and A100x4 presets. lr=2e-4 carries over directly.
+  accumulate_grad_batches: 3
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  # Per-GPU train batch. Conservative starting point for V100 32GB + FP16.
+  # Has NOT been empirically swept on this box yet; run a short
+  # limit_train_batches=40 sweep (bs=12/9/6) on the first launch to confirm
+  # peak VRAM < ~28 GiB with scene-variance headroom, then settle.
+  train_batch_size: 12
+  # Per-GPU validation batch. Closed-loop rollout memory scales with
+  # val_batch_size * n_rollout_closed_val (= 4 * 16 = 64 rollouts per rank).
+  # A100 ran 8 * 16 = 128 at 80 GiB; we halve to fit 32 GiB.
+  val_batch_size: 4
+  test_batch_size: 4
+  # 8 DDP ranks * 2 workers = 16 loader procs. Bump to 4 only if the host
+  # has enough RAM / file-handle headroom for 32 procs.
+  num_workers: 2
+  prefetch_factor: 2
+  train_use_eval_agent_selection: true
