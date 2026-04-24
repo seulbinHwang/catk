@@ -1302,7 +1302,9 @@ K commit block 수 = flow_window_steps / 5
 - `F_rho`: fit 시작 시점에 pretrained `SMARTFlowDecoder` 를 복사해 만드는 frozen target path-flow teacher 입니다.
 - `F_psi`: `F_rho` 와 같은 pretrained decoder weight 로 초기화한 generated path-flow estimator 이며, detached committed self-rollout 위에서 online 으로 업데이트됩니다.
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로.
-- `F_rho - F_psi` clean-path 방향으로 committed self-rollout 을 밀어주는 target-shift loss.
+- 같은 perturbed self-rollout state 에서 계산한 DMD식 score difference
+  `s_\rho - s_\psi = \tau (\hat U_\rho - \hat U_\psi) / \sigma_\tau`
+  방향으로 committed self-rollout 을 밀어주는 target-shift loss.
 - committed self-rollout 에 대해서만 걸리는 control-space physics regularization (선택 사항). `model.model_config.self_forced.use_control_space_physics_regularization` 로 제어합니다.
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.anchor_weight` 로 제어합니다.
 

@@ -1420,6 +1420,7 @@ class SMARTFlow(LightningModule):
         self.untoggle_optimizer(optimizer)
         return last_loss.detach()
 
+
     def _compute_self_forced_direction(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -1427,17 +1428,25 @@ class SMARTFlow(LightningModule):
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
     ) -> Tensor:
-        """F_rho와 F_psi의 clean path estimate 차이인 Delta_tau를 계산합니다.
+        """F_rho와 F_psi의 perturbed self-rollout score 차이인 Delta_tau를 계산합니다.
 
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 N초 path입니다.
                 shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
+                shape은 ``[n_agent]`` 입니다.
 
         Returns:
-            Tensor: path-space update 방향입니다. shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+            Tensor: DMD식 score-difference update 방향입니다.
+                shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+
+        Notes:
+            기존 구현은 teacher와 generated estimator의 clean path estimate 차이를
+            그대로 반환했습니다. 이 버전은 같은 noisy state에서의 velocity 예측을
+            사용해 ``s_rho - s_psi = tau * (U_rho - U_psi) / sigma_tau`` 형태의
+            score difference를 직접 계산합니다.
         """
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
@@ -1461,7 +1470,17 @@ class SMARTFlow(LightningModule):
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
             )
-            return (target_pred["clean"] - generated_pred["clean"]).detach()
+
+            tau = flow_sample.tau.float()
+            view_tau = tau.view(-1, 1, 1)
+            sigma_t = self.encoder.agent_encoder.flow_ode._sigma_t(tau).view(-1, 1, 1)
+            sigma_t = sigma_t.clamp_min(1.0e-6)
+
+            score_delta = view_tau * (
+                target_pred["velocity"].float() - generated_pred["velocity"].float()
+            ) / sigma_t
+
+        return score_delta.to(dtype=committed_path_norm.dtype).detach()
 
     def _compute_self_forced_physics_loss(
         self,
