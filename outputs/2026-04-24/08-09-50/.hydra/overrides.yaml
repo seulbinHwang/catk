@@ -1,0 +1,6 @@
+- checkpoint=/path/to/pretrained.ckpt
+- output_dir=data/godfm_pairs
+- n_rollout_collect=4
+- inpaint_steps=10
+- goal_weight=5.0
+- chunk_size=5000

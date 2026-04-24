@@ -24,9 +24,12 @@ from src.smart.metrics.flow_metrics import (
     yaw_fde_2s,
 )
 from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss
+from src.smart.modules.flow_godfm_inpainting import GoalGuidedODESampler
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
+from src.smart.utils.godfm_config import GodFMConfig, parse_godfm_config
+from src.smart.utils.valuetrain import ValueTrainConfig, set_model_for_valuetraining
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -109,6 +112,12 @@ class SMARTFlow(LightningModule):
             self.encoder,
             model_config.finetune,
         )
+
+        self.valuetrain_config: ValueTrainConfig = set_model_for_valuetraining(
+            self.encoder,
+            getattr(model_config, "valuetrain", None),
+        )
+
         self.adjoint_matching_loss = None
         if self.finetune_config.enabled:
             self.adjoint_matching_loss = AdjointMatchingLoss(
@@ -119,6 +128,29 @@ class SMARTFlow(LightningModule):
                 smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
                 rollout_time_grid=self.finetune_config.rollout_time_grid,
             )
+        
+        if self.valuetrain_config.enabled:
+            self.valuetrain_loss = ValueTrainLoss(
+                rollout_steps=self.valuetrain_config.rollout_steps,
+                rollout_noise_scale=self.valuetrain_config.rollout_noise_scale,
+                feasible_weight=self.valuetrain_config.feasible_weight,
+                smooth_deadzone_epsilon=self.valuetrain_config.smooth_deadzone_epsilon,
+                smooth_deadzone_tau=self.valuetrain_config.smooth_deadzone_tau,
+                rollout_time_grid=self.valuetrain_config.rollout_time_grid,
+            )
+
+        self.godfm_config: GodFMConfig = parse_godfm_config(
+            getattr(model_config, "godfm", None)
+        )
+        self._godfm_sampler: GoalGuidedODESampler | None = None
+        self._godfm_buffer_hidden: Tensor | None = None
+        self._godfm_buffer_target: Tensor | None = None
+        self._godfm_buffer_idx: int = 0
+        if self.godfm_config.enabled:
+            self._godfm_sampler = GoalGuidedODESampler(
+                inpaint_steps=self.godfm_config.inpaint_steps,
+                goal_weight=self.godfm_config.goal_weight,
+            )
 
         self.minADE = minADE()
         self.sim_agents_metrics = SimAgentsMetrics(
@@ -127,25 +159,31 @@ class SMARTFlow(LightningModule):
         )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
 
-        self.n_rollout_closed_val = model_config.n_rollout_closed_val
+        self.n_rollout_closed_val = int(getattr(model_config, "n_rollout_closed_val", 8))
         self.closed_loop_metric_name = "val_closed/sim_agents_2025/realism_meta_metric"
         self.val_closed_minade_name = (
             f"val_closed/sim_agents_2025/minADE_best_of_n_rollout_closed_val"
         )
-        self.validation_open_seed = int(model_config.validation_open_seed)
-        self.validation_closed_seed = int(model_config.validation_closed_seed)
-        self.n_vis_batch = model_config.n_vis_batch
-        self.n_vis_scenario = model_config.n_vis_scenario
-        self.n_vis_rollout = model_config.n_vis_rollout
-        self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
-        self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
+        self.validation_open_seed = int(getattr(model_config, "validation_open_seed", 0))
+        self.validation_closed_seed = int(getattr(model_config, "validation_closed_seed", 0))
+        self.n_vis_batch = int(getattr(model_config, "n_vis_batch", 0))
+        self.n_vis_scenario = int(getattr(model_config, "n_vis_scenario", 0))
+        self.n_vis_rollout = int(getattr(model_config, "n_vis_rollout", 0))
+        self.delete_local_videos_after_wandb_upload = bool(
+            getattr(model_config, "delete_local_videos_after_wandb_upload", False)
+        )
+        self.n_batch_sim_agents_metric = int(getattr(model_config, "n_batch_sim_agents_metric", 0))
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
-        self.eval_sampling_noise = model_config.eval_sampling_noise
+        self.eval_sampling_noise = getattr(
+            model_config,
+            "eval_sampling_noise",
+            {"noise_scale": 1.0},
+        )
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
                 "ADE2s": WeightedMeanMetric(),
@@ -903,6 +941,91 @@ class SMARTFlow(LightningModule):
                 )
         return scenario_rollouts
 
+    def _is_godfm_enabled(self) -> bool:
+        return bool(self.godfm_config.enabled and self._godfm_sampler is not None)
+
+    def _load_godfm_buffer(self) -> None:
+        """Load pre-computed GOD-FM pairs into CPU memory once at fit start."""
+        from src.smart.datasets.godfm_pair_dataset import GodFMPairDataset
+        dataset = GodFMPairDataset(self.godfm_config.pair_dir)
+        # Shuffle indices once so every epoch sees a different order.
+        perm = torch.randperm(len(dataset))
+        self._godfm_buffer_hidden = dataset.anchor_hidden[perm]  # [N, hidden_dim]
+        self._godfm_buffer_target = dataset.tau_target[perm]     # [N, 20, 4]
+        self._godfm_buffer_idx = 0
+
+    def _sample_godfm_pair(self, n: int) -> tuple[Tensor, Tensor]:
+        """Draw n pairs from the in-memory buffer (wraps around)."""
+        assert self._godfm_buffer_hidden is not None
+        total = self._godfm_buffer_hidden.shape[0]
+        idx = torch.arange(self._godfm_buffer_idx, self._godfm_buffer_idx + n) % total
+        self._godfm_buffer_idx = int((self._godfm_buffer_idx + n) % total)
+        dev = self.device
+        return (
+            self._godfm_buffer_hidden[idx].to(dev),
+            self._godfm_buffer_target[idx].to(dev),
+        )
+
+    def _run_godfm_finetune_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> Tensor:
+        """GOD-FM training step: 50% c_shift pairs, 50% GT.
+
+        For the c_shift branch:
+          - anchor_hidden comes from the pre-computed buffer (teacher-encoded).
+          - tau_target is the teacher recovery trajectory (no goal seen here).
+          - Loss = FM loss(flow_decoder(anchor_hidden, x_t), tau_target velocity).
+
+        For the GT branch:
+          - anchor_hidden is encoded from GT context (encoder frozen).
+          - tau_target = GT future clean norm.
+          - Loss = standard FM loss.
+
+        The encoder is always frozen (no_grad). Only flow_decoder trains.
+        """
+        use_godfm = torch.rand(1).item() < self.godfm_config.p_aug
+
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        flow_ode = self.encoder.agent_encoder.flow_ode
+
+        if use_godfm and self._godfm_buffer_hidden is not None:
+            # ── c_shift branch ────────────────────────────────────────────
+            # Batch size: match roughly what the GT branch would use.
+            # We sample a fixed small batch from the buffer.
+            n_sample = int(
+                tokenized_agent.get("flow_train_clean_norm",
+                                    tokenized_agent.get("flow_eval_clean_norm",
+                                                        torch.empty(0))).shape[0]
+            )
+            if n_sample == 0:
+                n_sample = 64
+            anchor_hidden, tau_target = self._sample_godfm_pair(n_sample)
+            if anchor_hidden.numel() == 0:
+                return anchor_hidden.sum() * 0.0
+        else:
+            # ── GT branch ─────────────────────────────────────────────────
+            with torch.no_grad():
+                map_feature = self.encoder.encode_map(tokenized_map)
+                _, _, anchor_hidden = self.encoder.encode_anchor_context_from_map_feature(
+                    map_feature=map_feature,
+                    tokenized_agent=tokenized_agent,
+                    anchor_mask_key="flow_train_mask",
+                )
+            tau_target = tokenized_agent["flow_train_clean_norm"]
+            if tau_target.numel() == 0:
+                return tau_target.sum() * 0.0
+
+        # ── Flow Matching loss (same formula for both branches) ───────────
+        flow_sample = flow_ode.sample(tau_target.detach(), target_type="velocity")
+        pred_velocity = flow_decoder(
+            anchor_hidden.detach(),
+            flow_sample.x_t,
+            flow_sample.tau,
+        )
+        return flow_matching_loss(pred_velocity, flow_sample.target)
+
     def on_fit_start(self) -> None:
         """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.
 
@@ -914,6 +1037,8 @@ class SMARTFlow(LightningModule):
             None
         """
         self._apply_fit_time_validation_batch_limit()
+        if self._is_godfm_enabled():
+            self._load_godfm_buffer()
 
     def on_fit_end(self) -> None:
         """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.
@@ -1029,6 +1154,15 @@ class SMARTFlow(LightningModule):
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
+
+        if self._is_godfm_enabled():
+            loss = self._run_godfm_finetune_step(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+            )
+            self.log("train/loss", loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            return loss
+
         if self._is_adjoint_matching_enabled():
             am_result = self._run_adjoint_matching_training_step(
                 tokenized_map=tokenized_map,

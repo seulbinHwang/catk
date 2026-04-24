@@ -1,0 +1,2 @@
+[2026-04-24 08:14:44,140][src.smart.utils.finetune][INFO] - [rank: 0] Pretraining mode: residual_velocity_head is frozen.
+[2026-04-24 08:14:44,142][src.smart.utils.valuetrain][INFO] - [rank: 0] Value training mode: all parameters are trainable.

@@ -914,3 +914,204 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             map_feature=map_feature,
             sampling_noise=sampling_noise,
         )
+
+    @torch.no_grad()
+    def collect_godfm_c_shift_states(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        n_rollout_collect: int,
+    ) -> list[dict]:
+        """Runs N rollout steps and returns per-step c_shift states for GOD-FM.
+
+        At each rollout step the model's own prediction advances the context
+        window, accumulating drift. We capture the resulting agent hidden and
+        the c_shift coarse position/heading so the caller can compute the goal
+        in the local frame and run Teacher inpainting.
+
+        Args:
+            rollout_cache: Output of prepare_inference_cache.
+            tokenized_agent: Eval-mode token dict (must contain gt_pos_raw,
+                gt_head_raw, gt_valid_raw).
+            map_feature: Encoded map features.
+            n_rollout_collect: Number of 2 Hz rollout steps to run (= K).
+
+        Returns:
+            List of dicts, one per rollout step t in [0, n_rollout_collect):
+                - anchor_hidden: [n_active, hidden_dim]  c_shift context hidden
+                - c_shift_pos:   [n_active, 2]           predicted coarse position
+                - c_shift_head:  [n_active]              predicted coarse heading
+                - active_mask:   [n_agent]               which agents are active
+                - rollout_step:  int                     t index
+        """
+        state = self._clone_rollout_cache(rollout_cache)
+
+        n_agent = int(state["n_agent"])
+        max_context_steps = int(state["max_context_steps"])
+        pos_window = state["pos_window"]
+        head_window = state["head_window"]
+        head_vector_window = state["head_vector_window"]
+        valid_window = state["valid_window"]
+        pred_idx_window = state["pred_idx_window"]
+        feat_a = state["feat_a"]
+        agent_token_emb = state["agent_token_emb"]
+        agent_token_emb_veh = state["agent_token_emb_veh"]
+        agent_token_emb_ped = state["agent_token_emb_ped"]
+        agent_token_emb_cyc = state["agent_token_emb_cyc"]
+        veh_mask = state["veh_mask"]
+        ped_mask = state["ped_mask"]
+        cyc_mask = state["cyc_mask"]
+        categorical_embs = state["categorical_embs"]
+        feat_a_now = state["feat_a_now"]
+        feat_a_t_dict = state["feat_a_t_dict"]
+
+        collected: list[dict] = []
+
+        for t in range(n_rollout_collect):
+            n_step = pos_window.shape[1]
+
+            if t == 0:
+                current_hidden = feat_a_now
+            else:
+                inference_mask = valid_window.clone()
+                inference_mask[:, :-1] = False
+                edge_index_t, r_t = self.build_temporal_edge(
+                    pos_a=pos_window,
+                    head_a=head_window,
+                    head_vector_a=head_vector_window,
+                    mask=valid_window,
+                    inference_mask=inference_mask,
+                )
+                edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
+                edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+                    pos_pl=map_feature["position"],
+                    orient_pl=map_feature["orientation"],
+                    pos_a=pos_window[:, -1:],
+                    head_a=head_window[:, -1:],
+                    head_vector_a=head_vector_window[:, -1:],
+                    mask=inference_mask[:, -1:],
+                    batch_s=tokenized_agent["batch"],
+                    batch_pl=map_feature["batch"],
+                )
+                recent_motion = self._build_recent_coarse_motion(
+                    pos_window=pos_window,
+                    valid_window=valid_window,
+                )
+                edge_index_a2a, r_a2a = self.build_interaction_edge(
+                    pos_a=pos_window[:, -1:],
+                    head_a=head_window[:, -1:],
+                    head_vector_a=head_vector_window[:, -1:],
+                    batch_s=tokenized_agent["batch"],
+                    mask=inference_mask[:, -1:],
+                    motion_a=recent_motion.unsqueeze(1),
+                )
+                for i in range(self.num_layers):
+                    temporal_feat = feat_a if i == 0 else feat_a_t_dict[i]
+                    current_hidden = self.t_attn_layers[i](
+                        (temporal_feat.flatten(0, 1), temporal_feat[:, -1]),
+                        r_t,
+                        edge_index_t,
+                    )
+                    current_hidden = self.pt2a_attn_layers[i](
+                        (map_feature["pt_token"], current_hidden),
+                        r_pl2a,
+                        edge_index_pl2a,
+                    )
+                    current_hidden = self.a2a_attn_layers[i](current_hidden, r_a2a, edge_index_a2a)
+                    if i + 1 < self.num_layers:
+                        feat_a_t_dict[i + 1] = torch.cat(
+                            [feat_a_t_dict[i + 1], current_hidden.unsqueeze(1)], dim=1
+                        )
+
+            active_mask = valid_window[:, -1]
+            next_pos = pos_window[:, -1].clone()
+            next_head = head_window[:, -1].clone()
+            next_token_idx = pred_idx_window[:, -1].clone()
+
+            if active_mask.any():
+                active_hidden = current_hidden[active_mask]
+
+                # ── Capture c_shift state ──────────────────────────────────
+                collected.append({
+                    "anchor_hidden": active_hidden.cpu(),
+                    "c_shift_pos": next_pos[active_mask].cpu(),
+                    "c_shift_head": next_head[active_mask].cpu(),
+                    "active_mask": active_mask.cpu(),
+                    "rollout_step": t,
+                })
+
+                # ── Advance rollout (commit + retokenize) ─────────────────
+                x_init_norm = torch.randn(
+                    int(active_mask.sum()), 20, 4,
+                    device=feat_a_now.device, dtype=feat_a_now.dtype,
+                )
+                y_hat_norm = self.flow_ode.generate(
+                    x_init=x_init_norm,
+                    model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
+                )
+                commit_pos_act, commit_head_act, next_pos_act, next_head_act = (
+                    self.commit_bridge.commit(
+                        y_hat_norm=y_hat_norm,
+                        current_pos=pos_window[active_mask, -1],
+                        current_head=head_window[active_mask, -1],
+                    )
+                )
+                next_token_idx_act = self.commit_bridge.retokenize(
+                    current_pos=pos_window[active_mask, -1],
+                    current_head=head_window[active_mask, -1],
+                    commit_pos=commit_pos_act,
+                    commit_head=commit_head_act,
+                    agent_type=tokenized_agent["type"][active_mask],
+                    token_agent_shape=tokenized_agent["token_agent_shape"][active_mask],
+                    token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                    token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                    token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
+                )
+                next_pos[active_mask] = next_pos_act
+                next_head[active_mask] = next_head_act
+                next_token_idx[active_mask] = next_token_idx_act
+
+            next_valid = active_mask.clone()
+            pred_idx_window = torch.cat([pred_idx_window, next_token_idx.unsqueeze(1)], dim=1)
+            valid_window = torch.cat([valid_window, next_valid.unsqueeze(1)], dim=1)
+            pos_window = torch.cat([pos_window, next_pos.unsqueeze(1)], dim=1)
+            head_window = torch.cat([head_window, next_head.unsqueeze(1)], dim=1)
+            head_vector_next = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+            head_vector_window = torch.cat([head_vector_window, head_vector_next.unsqueeze(1)], dim=1)
+
+            agent_token_emb_next = torch.zeros_like(agent_token_emb[:, 0])
+            agent_token_emb_next[veh_mask] = agent_token_emb_veh[next_token_idx[veh_mask]]
+            agent_token_emb_next[ped_mask] = agent_token_emb_ped[next_token_idx[ped_mask]]
+            agent_token_emb_next[cyc_mask] = agent_token_emb_cyc[next_token_idx[cyc_mask]]
+            agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next.unsqueeze(1)], dim=1)
+
+            motion_vector_a = pos_window[:, -1] - pos_window[:, -2]
+            x_a = torch.stack(
+                [
+                    torch.norm(motion_vector_a, p=2, dim=-1),
+                    angle_between_2d_vectors(
+                        ctr_vector=head_vector_window[:, -1],
+                        nbr_vector=motion_vector_a,
+                    ),
+                ],
+                dim=-1,
+            )
+            x_a = self.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)
+            feat_a_next = self.fusion_emb(
+                torch.cat([agent_token_emb_next, x_a], dim=-1).unsqueeze(1)
+            )
+            feat_a = torch.cat([feat_a, feat_a_next], dim=1)
+
+            if pos_window.shape[1] > max_context_steps:
+                pos_window = pos_window[:, -max_context_steps:]
+                head_window = head_window[:, -max_context_steps:]
+                head_vector_window = head_vector_window[:, -max_context_steps:]
+                valid_window = valid_window[:, -max_context_steps:]
+                pred_idx_window = pred_idx_window[:, -max_context_steps:]
+                agent_token_emb = agent_token_emb[:, -max_context_steps:]
+                feat_a = feat_a[:, -max_context_steps:]
+                for key in feat_a_t_dict:
+                    feat_a_t_dict[key] = feat_a_t_dict[key][:, -max_context_steps:]
+
+        return collected

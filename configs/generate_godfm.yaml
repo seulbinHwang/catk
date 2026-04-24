@@ -1,0 +1,38 @@
+# @package _global_
+#
+# Hydra config for scripts/generate_godfm_dataset.py
+# Collects (anchor_hidden_c_shift, tau_target) pairs via closed-loop rollout
+# + Teacher goal-guided ODE inpainting. Runs single-GPU, no DDP.
+
+defaults:
+  - _self_
+  - data: waymo
+  - paths: default
+
+# ── Required: set these before running ───────────────────────────────────────
+# Path to the pretrained SMARTFlow checkpoint (.ckpt)
+checkpoint: ???
+
+# Directory where pairs_*.pt chunk files will be written
+output_dir: ???
+
+# ── Rollout & inpainting knobs ────────────────────────────────────────────────
+# Number of 2Hz rollout steps per scenario  (1 step = 0.5s, 4 steps = 2s drift)
+n_rollout_collect: 4
+
+# ODE steps for Teacher inpainting  (more → better quality, slower)
+inpaint_steps: 10
+
+# Endpoint guidance strength  (higher → tighter goal pull)
+goal_weight: 5.0
+
+# Pairs per .pt chunk file on disk
+chunk_size: 5000
+
+# ── Data loading ──────────────────────────────────────────────────────────────
+data:
+  train_batch_size: 8
+  val_batch_size: 8
+  num_workers: 4
+  prefetch_factor: 2
+  shuffle: false        # deterministic order → reproducible dataset

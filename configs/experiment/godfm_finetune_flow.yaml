@@ -1,0 +1,71 @@
+# @package _global_
+#
+# GOD-FM self-distillation fine-tuning experiment.
+#
+# Requires pre-generated pair dataset (run collect_godfm.sh first).
+#
+# Training split:
+#   50 % → (anchor_hidden_c_shift, tau_target) from buffer  [GOD-FM branch]
+#   50 % → (anchor_hidden_gt,      gt_future)  on-the-fly   [GT branch]
+#
+# Only flow_decoder receives non-zero gradients in both branches.
+# The encoder is executed under torch.no_grad() for the GT branch and
+# not executed at all for the c_shift branch (pre-computed hiddens).
+
+defaults:
+  - override /model: smart_flow
+
+action: finetune   # loads ckpt via state_dict before trainer.fit
+
+model:
+  model_config:
+    lr: 2e-4
+    lr_warmup_steps: 500
+    lr_total_steps: -1
+    lr_min_ratio: 1e-2
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+
+    n_rollout_closed_val: 16
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+
+    # finetune must stay disabled so the standard grad/freeze logic is skipped
+    finetune:
+      enabled: false
+
+    # ── GOD-FM config ─────────────────────────────────────────────────────
+    godfm:
+      enabled: true
+      # Directory written by collect_godfm.sh (contains pairs_*.pt files)
+      pair_dir: ???
+      # Probability of drawing from the c_shift buffer each training step
+      p_aug: 0.5
+      # Teacher inpainting knobs (used only during collect, kept here for reference)
+      goal_weight: 5.0
+      inpaint_steps: 10
+      n_rollout_collect: 4
+
+# ckpt_path: path to the pretrained SMARTFlow checkpoint
+ckpt_path: ???
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 1
+  max_epochs: 8
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  train_batch_size: 26
+  val_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1

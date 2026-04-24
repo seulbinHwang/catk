@@ -5,10 +5,11 @@ wandb:
   offline: False
   id: null
   anonymous: null
-  project: SMART-FLOW
-  log_model: all
+  project: TEST_PROJECT
+  log_model: false
   prefix: ""
-  entity: jksg01019-naver-labs
+  # Use currently logged-in account's default entity to avoid permission mismatch.
+  entity: se99an
   group: ""
   tags: []
   job_type: ""
