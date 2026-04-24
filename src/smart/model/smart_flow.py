@@ -1569,6 +1569,8 @@ class SMARTFlow(LightningModule):
         # ocsc_use_mmd=False: 기존 paired L2 mean (비교/ablation 용)
         use_mmd = bool(getattr(self.finetune_config, "ocsc_use_mmd", True))
         heading_w = float(getattr(self.finetune_config, "ocsc_heading_weight", 0.0))
+        pos_w = float(getattr(self.finetune_config, "ocsc_position_weight", 1.0))
+        rel_disp_w = float(getattr(self.finetune_config, "ocsc_rel_disp_weight", 0.0))
         # GT FM regularization: MMD만 줄일 때 velocity_head가 GT에서 drift하는 것을 방지.
         # 각 anchor에서 active_hidden으로 GT 궤적에 대한 FM loss를 계산해 함께 backward.
         fm_reg_lambda = float(self.finetune_config.ocsc_fm_reg_lambda)
@@ -1671,10 +1673,22 @@ class SMARTFlow(LightningModule):
                 pos_loss = F.l1_loss(p[..., :2], t[..., :2], reduction="mean")
             else:  # default: l2
                 pos_loss = F.mse_loss(p[..., :2], t[..., :2], reduction="mean")
+            total = pos_w * pos_loss
+            if rel_disp_w > 0.0 and T >= 2:
+                # 상대변위(delta x/y) 정렬: 절대 위치 복귀보다 이동 패턴 일치에 직접적인 신호.
+                disp_p = p[..., 1:, :2] - p[..., :-1, :2]
+                disp_t = t[..., 1:, :2] - t[..., :-1, :2]
+                if loss_type == "smooth_l1":
+                    rel_disp_loss = F.smooth_l1_loss(disp_p, disp_t, reduction="mean")
+                elif loss_type == "l1":
+                    rel_disp_loss = F.l1_loss(disp_p, disp_t, reduction="mean")
+                else:
+                    rel_disp_loss = F.mse_loss(disp_p, disp_t, reduction="mean")
+                total = total + rel_disp_w * rel_disp_loss
             if heading_w > 0.0:
                 head_loss = F.mse_loss(p[..., 2:], t[..., 2:], reduction="mean")
-                return pos_loss + heading_w * head_loss
-            return pos_loss
+                total = total + heading_w * head_loss
+            return total
 
         def _slice_consistency_suffix(x: Tensor) -> Tensor:
             if _consistency_tail_10hz_steps is None:

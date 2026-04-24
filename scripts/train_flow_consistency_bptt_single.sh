@@ -119,16 +119,20 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
 # ── OCSC 파라미터 ──────────────────────────────────────────────────────────
 OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-4}"
-OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
+OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-smooth_l1}"
 OCSC_USE_MMD="${OCSC_USE_MMD:-false}"
 OCSC_ANCHOR_STRIDE="${OCSC_ANCHOR_STRIDE:-1}"
 OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-4}"
 OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-4}"
-OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-1.0}"
+OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-0.0}"
+OCSC_POSITION_WEIGHT="${OCSC_POSITION_WEIGHT:-0.0}"
+OCSC_REL_DISP_WEIGHT="${OCSC_REL_DISP_WEIGHT:-1.0}"
 # GT FM regularization: velocity_head가 GT에서 drift하지 않도록 per-anchor FM loss를 MMD와 함께 backward.
 # 0.0이면 기존 동작(MMD only). 권장 시작값: 0.1~1.0
-OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA:-10.0}"
+OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA:-0.1}"
+# 사용자가 실수로 "=0.1" 형태로 넘긴 경우(Hydra override 파싱 오류) 보정.
+OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA#=}"
 # single B: HardRMM 계산이 빠르므로 5 step 마다 (multi B 에서는 1 또는 더 높게)
 OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-false}"
 OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-10}"
@@ -226,6 +230,7 @@ echo "CKPT_PATH=${CKPT_PATH}"
 echo "NPROC=${NPROC_PER_NODE} TRAIN_B=${TRAIN_B} MAX_EPOCHS=${MAX_EPOCHS} LIMIT_TRAIN=${LIMIT_TRAIN_BATCHES}"
 echo "SEED=${SEED} DATA_SHUFFLE=${DATA_SHUFFLE} DETERMINISTIC=${TRAINER_DETERMINISTIC}"
 echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_TARGET=${OCSC_TARGET_MAX_STEPS}cs OCSC_PRED=${OCSC_PRED_MAX_STEPS}cs"
+echo "OCSC_HEADING_WEIGHT=${OCSC_HEADING_WEIGHT} OCSC_POSITION_WEIGHT=${OCSC_POSITION_WEIGHT} OCSC_REL_DISP_WEIGHT=${OCSC_REL_DISP_WEIGHT}"
 echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA}"
 echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_GRAD_CLIP=${BPTT_GRAD_CLIP_TRAJ} LR=${LR}"
@@ -288,6 +293,8 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_target_max_steps="${OCSC_TARGET_MAX_STEPS}" \
   model.model_config.finetune.ocsc_pred_max_steps="${OCSC_PRED_MAX_STEPS}" \
   model.model_config.finetune.ocsc_heading_weight="${OCSC_HEADING_WEIGHT}" \
+  model.model_config.finetune.ocsc_position_weight="${OCSC_POSITION_WEIGHT}" \
+  model.model_config.finetune.ocsc_rel_disp_weight="${OCSC_REL_DISP_WEIGHT}" \
   model.model_config.finetune.ocsc_fm_reg_lambda="${OCSC_FM_REG_LAMBDA}" \
   model.model_config.finetune.ocsc_eval_hard_rmm="${OCSC_EVAL_HARD_RMM}" \
   model.model_config.finetune.ocsc_eval_hard_rmm_interval="${OCSC_EVAL_HARD_RMM_INTERVAL}" \

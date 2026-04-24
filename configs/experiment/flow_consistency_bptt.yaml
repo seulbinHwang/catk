@@ -56,6 +56,11 @@ model:
       ocsc_pred_max_steps: 4
       # heading 일관성 loss 가중치 (0 = position only)
       ocsc_heading_weight: 0.0
+      # position(x/y) 일관성 loss 가중치 (0 = position matching 비활성)
+      ocsc_position_weight: 1.0
+      # 상대변위(delta x/y) 일관성 loss 가중치 (0 = 비활성)
+      # 값이 클수록 절대 위치보다 이동 패턴 정렬을 더 강하게 학습.
+      ocsc_rel_disp_weight: 0.0
       # GT FM regularization: velocity_head가 GT에서 drift하지 않도록 per-anchor FM loss 추가.
       # 0.0이면 기존 동작(MMD only). 권장 시작값: 0.1~1.0
       ocsc_fm_reg_lambda: 0.0

@@ -114,6 +114,8 @@ class FinetuneConfig:
     ocsc_n_rollouts: int = 2
     #: 일관성 loss 종류. "l2" (MSE), "smooth_l1", "l1" 중 하나.
     ocsc_loss_type: str = "l2"
+    #: True → OCSC consistency를 proper MMD^2로 계산. False → rollout별 pairwise loss.
+    ocsc_use_mmd: bool = True
     #: True → frozen pretrained model 로 open-loop target 생성.
     #: False → current policy 로 생성 (학습 중 target 도 변함).
     ocsc_use_pretrained_ref: bool = False
@@ -125,6 +127,11 @@ class FinetuneConfig:
     #: heading 일관성 loss 가중치. 0 이면 비활성 (position 만).
     #: heading 은 sin/cos 표현으로 각도 wrap 문제를 회피합니다.
     ocsc_heading_weight: float = 0.0
+    #: 위치(position x/y) 일관성 loss 가중치. 0 이면 position matching 비활성.
+    ocsc_position_weight: float = 1.0
+    #: 상대변위(연속 10Hz step 간 delta position) 일관성 loss 가중치.
+    #: 0 이면 비활성. 값이 클수록 절대 위치보다 이동 패턴 정렬을 더 강하게 학습합니다.
+    ocsc_rel_disp_weight: float = 0.0
     #: True → 매 training step 에서 closed-loop rollout 으로 hard RMM 을 계산해 로깅.
     #: 공식 Wosac metric 이 아닌 PyTorch 인-프로세스 HardRMM (빠름).
     #: CONFIGURABLE: eval_hard_rmm_interval 로 빈도 조절.
@@ -233,10 +240,13 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         rmm_bptt_ref_val=bool(_read_config_value(finetune, "rmm_bptt_ref_val", False)),
         ocsc_n_rollouts=int(_read_config_value(finetune, "ocsc_n_rollouts", 2)),
         ocsc_loss_type=str(_read_config_value(finetune, "ocsc_loss_type", "l2")),
+        ocsc_use_mmd=bool(_read_config_value(finetune, "ocsc_use_mmd", True)),
         ocsc_use_pretrained_ref=bool(_read_config_value(finetune, "ocsc_use_pretrained_ref", False)),
         ocsc_target_max_steps=int(_read_config_value(finetune, "ocsc_target_max_steps", 4)),
         ocsc_pred_max_steps=int(_read_config_value(finetune, "ocsc_pred_max_steps", 4)),
         ocsc_heading_weight=float(_read_config_value(finetune, "ocsc_heading_weight", 0.0)),
+        ocsc_position_weight=float(_read_config_value(finetune, "ocsc_position_weight", 1.0)),
+        ocsc_rel_disp_weight=float(_read_config_value(finetune, "ocsc_rel_disp_weight", 0.0)),
         ocsc_eval_hard_rmm=bool(_read_config_value(finetune, "ocsc_eval_hard_rmm", True)),
         ocsc_eval_hard_rmm_interval=int(_read_config_value(finetune, "ocsc_eval_hard_rmm_interval", 1)),
         ocsc_fm_reg_lambda=float(_read_config_value(finetune, "ocsc_fm_reg_lambda", 0.0)),
