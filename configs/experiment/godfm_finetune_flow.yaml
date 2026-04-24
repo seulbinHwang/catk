@@ -46,6 +46,12 @@ model:
       goal_weight: 5.0
       inpaint_steps: 10
       n_rollout_collect: 4
+      # Online recollect inside training loop (single-run on-policy refresh)
+      online_enabled: true
+      online_collect_every_n_steps: 1000
+      online_warmup_steps: 500
+      online_max_buffer_pairs: 200000
+      online_max_pairs_per_collect: 4096
 
 # ckpt_path: path to the pretrained SMARTFlow checkpoint
 ckpt_path: ???
@@ -55,7 +61,7 @@ trainer:
   limit_val_batches: 0.1
   check_val_every_n_epoch: 1
   max_epochs: 8
-  precision: bf16-mixed
+  precision: 32-true
   gradient_clip_val: 1.0
   sync_batchnorm: false
 

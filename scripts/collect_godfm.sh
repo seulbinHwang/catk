@@ -14,7 +14,7 @@ export TF_CPP_MIN_LOG_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # ── User settings (edit these) ────────────────────────────────────────────────
-CUDA_VISIBLE_DEVICES=0
+CUDA_VISIBLE_DEVICES=3
 
 # Pretrained SMARTFlow checkpoint produced by train_flow.sh
 PRETRAINED_CKPT="/home2/pnc2/repos_python/project_2/logs/pretrained/epoch_last.ckpt"
@@ -27,6 +27,9 @@ N_ROLLOUT_COLLECT=4   # 2Hz steps of drift to simulate   (4 = 2 s)
 INPAINT_STEPS=10      # Teacher ODE integration steps
 GOAL_WEIGHT=5.0       # Endpoint guidance strength
 CHUNK_SIZE=5000       # Pairs per .pt file
+
+# --- Parallel run knobs ───────────────────────────────────────────────────────
+BATCH_SIZE=96
 
 # ── Conda env ─────────────────────────────────────────────────────────────────
 CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
@@ -48,6 +51,7 @@ python -m scripts.generate_godfm_dataset \
   n_rollout_collect=$N_ROLLOUT_COLLECT \
   inpaint_steps=$INPAINT_STEPS \
   goal_weight=$GOAL_WEIGHT \
-  chunk_size=$CHUNK_SIZE
+  chunk_size=$CHUNK_SIZE \
+  data.train_batch_size=$BATCH_SIZE 
 
 echo "collect_godfm.sh done  →  pairs written to $GODFM_PAIR_DIR"

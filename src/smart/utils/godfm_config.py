@@ -12,6 +12,11 @@ class GodFMConfig:
     goal_weight: float = 5.0
     inpaint_steps: int = 10
     n_rollout_collect: int = 4
+    online_enabled: bool = False
+    online_collect_every_n_steps: int = 0
+    online_warmup_steps: int = 0
+    online_max_buffer_pairs: int = 200000
+    online_max_pairs_per_collect: int = 0
 
 
 def _r(config: Any, key: str, default: Any) -> Any:
@@ -34,4 +39,9 @@ def parse_godfm_config(godfm: Any) -> GodFMConfig:
         goal_weight=float(_r(godfm, "goal_weight", 5.0)),
         inpaint_steps=int(_r(godfm, "inpaint_steps", 10)),
         n_rollout_collect=int(_r(godfm, "n_rollout_collect", 4)),
+        online_enabled=bool(_r(godfm, "online_enabled", False)),
+        online_collect_every_n_steps=int(_r(godfm, "online_collect_every_n_steps", 0)),
+        online_warmup_steps=int(_r(godfm, "online_warmup_steps", 0)),
+        online_max_buffer_pairs=int(_r(godfm, "online_max_buffer_pairs", 200000)),
+        online_max_pairs_per_collect=int(_r(godfm, "online_max_pairs_per_collect", 0)),
     )

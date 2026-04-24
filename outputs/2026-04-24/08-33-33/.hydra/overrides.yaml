@@ -1,0 +1,7 @@
+- checkpoint=/home2/pnc2/repos_python/project_2/logs/pretrained/epoch_last.ckpt
+- output_dir=data/godfm_pairs
+- n_rollout_collect=4
+- inpaint_steps=10
+- goal_weight=5.0
+- chunk_size=5000
+- data.train_batch_size=96

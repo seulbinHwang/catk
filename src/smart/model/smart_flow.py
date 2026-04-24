@@ -27,6 +27,7 @@ from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss
 from src.smart.modules.flow_godfm_inpainting import GoalGuidedODESampler
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
+from src.smart.utils import transform_to_local, wrap_angle
 from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
 from src.smart.utils.godfm_config import GodFMConfig, parse_godfm_config
 from src.smart.utils.valuetrain import ValueTrainConfig, set_model_for_valuetraining
@@ -146,6 +147,8 @@ class SMARTFlow(LightningModule):
         self._godfm_buffer_hidden: Tensor | None = None
         self._godfm_buffer_target: Tensor | None = None
         self._godfm_buffer_idx: int = 0
+        self._godfm_online_last_collect_step: int = -1
+        self._godfm_online_skip_warned: bool = False
         if self.godfm_config.enabled:
             self._godfm_sampler = GoalGuidedODESampler(
                 inpaint_steps=self.godfm_config.inpaint_steps,
@@ -947,17 +950,38 @@ class SMARTFlow(LightningModule):
     def _load_godfm_buffer(self) -> None:
         """Load pre-computed GOD-FM pairs into CPU memory once at fit start."""
         from src.smart.datasets.godfm_pair_dataset import GodFMPairDataset
-        dataset = GodFMPairDataset(self.godfm_config.pair_dir)
-        # Shuffle indices once so every epoch sees a different order.
-        perm = torch.randperm(len(dataset))
-        self._godfm_buffer_hidden = dataset.anchor_hidden[perm]  # [N, hidden_dim]
-        self._godfm_buffer_target = dataset.tau_target[perm]     # [N, 20, 4]
+        pair_dir = str(self.godfm_config.pair_dir).strip()
+        if pair_dir:
+            try:
+                dataset = GodFMPairDataset(pair_dir)
+                # Shuffle indices once so every epoch sees a different order.
+                perm = torch.randperm(len(dataset))
+                self._godfm_buffer_hidden = dataset.anchor_hidden[perm]  # [N, hidden_dim]
+                self._godfm_buffer_target = dataset.tau_target[perm]     # [N, 20, 4]
+            except FileNotFoundError:
+                if self.godfm_config.online_enabled:
+                    print(
+                        f"[GOD-FM online] no seed pairs found in '{pair_dir}'. "
+                        "Starting with empty buffer and collecting online."
+                    )
+                    self._godfm_buffer_hidden = None
+                    self._godfm_buffer_target = None
+                else:
+                    raise
+        else:
+            self._godfm_buffer_hidden = None
+            self._godfm_buffer_target = None
         self._godfm_buffer_idx = 0
 
     def _sample_godfm_pair(self, n: int) -> tuple[Tensor, Tensor]:
         """Draw n pairs from the in-memory buffer (wraps around)."""
         assert self._godfm_buffer_hidden is not None
+        assert self._godfm_buffer_target is not None
         total = self._godfm_buffer_hidden.shape[0]
+        if total <= 0:
+            empty_hidden = self._godfm_buffer_hidden.new_zeros((0, self._godfm_buffer_hidden.shape[-1]))
+            empty_target = self._godfm_buffer_target.new_zeros((0, *self._godfm_buffer_target.shape[1:]))
+            return empty_hidden, empty_target
         idx = torch.arange(self._godfm_buffer_idx, self._godfm_buffer_idx + n) % total
         self._godfm_buffer_idx = int((self._godfm_buffer_idx + n) % total)
         dev = self.device
@@ -965,6 +989,194 @@ class SMARTFlow(LightningModule):
             self._godfm_buffer_hidden[idx].to(dev),
             self._godfm_buffer_target[idx].to(dev),
         )
+
+    def _compute_goal_in_local_frame_for_online_collect(
+        self,
+        gt_pos: Tensor,
+        gt_head: Tensor,
+        gt_valid: Tensor,
+        active_mask: Tensor,
+        c_shift_pos: Tensor,
+        c_shift_head: Tensor,
+        goal_step: int,
+    ) -> tuple[Tensor, Tensor]:
+        n_2hz = int(gt_pos.shape[1])
+        goal_step = min(max(int(goal_step), 0), n_2hz - 1)
+
+        gt_pos_g = gt_pos[active_mask, goal_step]
+        gt_head_g = gt_head[active_mask, goal_step]
+        goal_valid = gt_valid[active_mask, goal_step]
+
+        goal_pos_local, _ = transform_to_local(
+            pos_global=gt_pos_g.unsqueeze(1),
+            head_global=None,
+            pos_now=c_shift_pos,
+            head_now=c_shift_head,
+        )
+        goal_pos_local = goal_pos_local.squeeze(1)
+        dhead = wrap_angle(gt_head_g - c_shift_head)
+        goal = torch.cat(
+            [
+                goal_pos_local / 20.0,
+                dhead.cos().unsqueeze(-1),
+                dhead.sin().unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        return goal, goal_valid
+
+    @torch.no_grad()
+    def _collect_godfm_pairs_from_current_batch(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        if self._godfm_sampler is None:
+            return (
+                torch.empty((0, 0), dtype=torch.float32),
+                torch.empty((0, 20, 4), dtype=torch.float32),
+            )
+        required_keys = {"gt_pos", "gt_heading", "valid_mask", "batch", "type", "token_agent_shape"}
+        if not required_keys.issubset(set(tokenized_agent.keys())):
+            return (
+                torch.empty((0, 0), dtype=torch.float32),
+                torch.empty((0, 20, 4), dtype=torch.float32),
+            )
+
+        map_feature = self.encoder.encode_map(tokenized_map)
+        rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        c_shift_states = self.encoder.agent_encoder.collect_godfm_c_shift_states(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            n_rollout_collect=self.godfm_config.n_rollout_collect,
+        )
+
+        gt_pos = tokenized_agent["gt_pos"].detach()
+        gt_head = tokenized_agent["gt_heading"].detach()
+        gt_valid = tokenized_agent["valid_mask"].detach()
+        step_current_2hz = (self.num_historical_steps - 1) // 5
+
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        hidden_list: list[Tensor] = []
+        target_list: list[Tensor] = []
+
+        for state in c_shift_states:
+            t = int(state["rollout_step"])
+            active_mask = state["active_mask"].to(gt_pos.device)
+            c_shift_pos = state["c_shift_pos"].to(gt_pos.device)
+            c_shift_head = state["c_shift_head"].to(gt_head.device)
+            goal_step = step_current_2hz + t + 4
+            goal, goal_valid = self._compute_goal_in_local_frame_for_online_collect(
+                gt_pos=gt_pos,
+                gt_head=gt_head,
+                gt_valid=gt_valid,
+                active_mask=active_mask,
+                c_shift_pos=c_shift_pos,
+                c_shift_head=c_shift_head,
+                goal_step=goal_step,
+            )
+            if not bool(goal_valid.any()):
+                continue
+            anchor_hidden = state["anchor_hidden"][goal_valid.cpu()].to(self.device)
+            goal_dev = goal[goal_valid].to(self.device)
+            tau_target = self._godfm_sampler.sample(
+                flow_decoder=flow_decoder,
+                flow_ode=flow_ode,
+                anchor_hidden=anchor_hidden,
+                goal=goal_dev,
+            )
+            hidden_list.append(anchor_hidden.detach().cpu())
+            target_list.append(tau_target.detach().cpu())
+
+        if len(hidden_list) == 0:
+            return (
+                torch.empty((0, 0), dtype=torch.float32),
+                torch.empty((0, 20, 4), dtype=torch.float32),
+            )
+        hidden_cat = torch.cat(hidden_list, dim=0)
+        target_cat = torch.cat(target_list, dim=0)
+
+        max_pairs_per_collect = int(self.godfm_config.online_max_pairs_per_collect)
+        if max_pairs_per_collect > 0 and hidden_cat.shape[0] > max_pairs_per_collect:
+            keep_idx = torch.randperm(hidden_cat.shape[0])[:max_pairs_per_collect]
+            hidden_cat = hidden_cat[keep_idx]
+            target_cat = target_cat[keep_idx]
+        return hidden_cat, target_cat
+
+    def _append_godfm_pairs_to_buffer(self, anchor_hidden: Tensor, tau_target: Tensor) -> None:
+        if anchor_hidden.numel() == 0 or tau_target.numel() == 0:
+            return
+        if self._godfm_buffer_hidden is None or self._godfm_buffer_target is None:
+            self._godfm_buffer_hidden = anchor_hidden
+            self._godfm_buffer_target = tau_target
+        else:
+            self._godfm_buffer_hidden = torch.cat([self._godfm_buffer_hidden, anchor_hidden], dim=0)
+            self._godfm_buffer_target = torch.cat([self._godfm_buffer_target, tau_target], dim=0)
+
+        max_pairs = max(1, int(self.godfm_config.online_max_buffer_pairs))
+        total = int(self._godfm_buffer_hidden.shape[0])
+        if total > max_pairs:
+            keep_start = total - max_pairs
+            self._godfm_buffer_hidden = self._godfm_buffer_hidden[keep_start:]
+            self._godfm_buffer_target = self._godfm_buffer_target[keep_start:]
+        if self._godfm_buffer_idx >= int(self._godfm_buffer_hidden.shape[0]):
+            self._godfm_buffer_idx = 0
+
+    def _maybe_refresh_godfm_buffer_online(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> None:
+        if not self.godfm_config.online_enabled:
+            return
+        every = int(self.godfm_config.online_collect_every_n_steps)
+        if every <= 0:
+            return
+        step = int(self.global_step)
+        if step < int(self.godfm_config.online_warmup_steps):
+            return
+        if step == self._godfm_online_last_collect_step:
+            return
+        if (step % every) != 0:
+            return
+
+        try:
+            hidden, target = self._collect_godfm_pairs_from_current_batch(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+            )
+            if hidden.numel() > 0 and target.numel() > 0:
+                self._append_godfm_pairs_to_buffer(hidden, target)
+                self.log(
+                    "train/godfm_online_pairs_added",
+                    float(hidden.shape[0]),
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=False,
+                    batch_size=1,
+                )
+                self.log(
+                    "train/godfm_buffer_size",
+                    float(self._godfm_buffer_hidden.shape[0]),
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=False,
+                    batch_size=1,
+                )
+            elif not self._godfm_online_skip_warned:
+                print("[GOD-FM online] skipped recollect: no valid pairs from current batch.")
+                self._godfm_online_skip_warned = True
+        except Exception as error:
+            if not self._godfm_online_skip_warned:
+                print(f"[GOD-FM online] recollect failed: {error}")
+                self._godfm_online_skip_warned = True
+        finally:
+            self._godfm_online_last_collect_step = step
 
     def _run_godfm_finetune_step(
         self,
@@ -990,7 +1202,12 @@ class SMARTFlow(LightningModule):
         flow_decoder = self.encoder.agent_encoder.flow_decoder
         flow_ode = self.encoder.agent_encoder.flow_ode
 
-        if use_godfm and self._godfm_buffer_hidden is not None:
+        if (
+            use_godfm
+            and self._godfm_buffer_hidden is not None
+            and self._godfm_buffer_target is not None
+            and self._godfm_buffer_hidden.shape[0] > 0
+        ):
             # ── c_shift branch ────────────────────────────────────────────
             # Batch size: match roughly what the GT branch would use.
             # We sample a fixed small batch from the buffer.
@@ -1156,6 +1373,10 @@ class SMARTFlow(LightningModule):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
         if self._is_godfm_enabled():
+            self._maybe_refresh_godfm_buffer_online(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+            )
             loss = self._run_godfm_finetune_step(
                 tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,

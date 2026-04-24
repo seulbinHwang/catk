@@ -1,0 +1,4 @@
+[2026-04-24 08:33:49,873][src.smart.utils.finetune][INFO] - [rank: 0] Pretraining mode: residual_velocity_head is frozen.
+[2026-04-24 08:33:49,875][src.smart.utils.valuetrain][INFO] - [rank: 0] Value training mode: all parameters are trainable.
+[2026-04-24 08:33:57,178][src.smart.datasets.scalable_dataset][INFO] - [rank: 0] Length of /home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1/training dataset is 486995
+[2026-04-24 08:33:57,472][src.smart.datasets.scalable_dataset][INFO] - [rank: 0] Length of /home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1/validation dataset is 44097
