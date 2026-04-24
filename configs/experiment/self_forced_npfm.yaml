@@ -28,8 +28,8 @@ model:
       use_control_space_physics_regularization: true
       physics_weight: 0.005
       sampling:
-        sample_steps: 16
-        sample_method: midpoint
+        sample_steps: 32
+        sample_method: euler
         noise_scale: 1.0
         backprop_last_k: null
 

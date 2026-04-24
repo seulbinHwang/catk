@@ -28,8 +28,8 @@ model_config:
       num_k: 1
       temp: 1.0
   validation_rollout_sampling:
-    sample_steps: 16
-    sample_method: midpoint
+    sample_steps: 32
+    sample_method: euler
     noise_scale: 1.0
   draft:
     enabled: false
@@ -37,8 +37,8 @@ model_config:
     ramp_epochs: 4
     max_weight: 1.0
     sampling:
-      sample_steps: 16
-      sample_method: midpoint
+      sample_steps: 32
+      sample_method: euler
       noise_scale: 1.0
       backprop_last_k: null
     physics:
@@ -75,8 +75,8 @@ model_config:
     estimator_updates_per_step: 1
     initialize_aux_from_generator_on_fit_start: true
     sampling:
-      sample_steps: 16
-      sample_method: midpoint
+      sample_steps: 32
+      sample_method: euler
       noise_scale: 1.0
       backprop_last_k: null
     use_control_space_physics_regularization: false
@@ -124,8 +124,8 @@ model_config:
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
-    flow_solver_steps: 16
-    flow_solver_method: midpoint
+    flow_solver_steps: 32
+    flow_solver_method: euler
     flow_solver_eps: 1.0e-3
     closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
     use_lqr: false
