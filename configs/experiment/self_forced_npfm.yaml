@@ -25,7 +25,7 @@ model:
       generated_estimator_lr: 4e-5
       estimator_updates_per_step: 5
       initialize_aux_from_generator_on_fit_start: true
-      use_control_space_physics_regularization: true
+      use_control_space_physics_regularization: false
       physics_weight: 0.005
       sampling:
         sample_steps: 32
