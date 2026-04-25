@@ -72,7 +72,7 @@ model_config:
     path_step_size: 0.05
     anchor_weight: 0.05
     generated_estimator_lr: ${model.model_config.lr}
-    estimator_updates_per_step: 1
+    estimator_updates_per_step: 5
     initialize_aux_from_generator_on_fit_start: true
     sampling:
       sample_steps: 32

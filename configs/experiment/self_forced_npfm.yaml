@@ -22,8 +22,8 @@ model:
       weight: 1.0
       path_step_size: 0.05
       anchor_weight: 0.05
-      generated_estimator_lr: 2e-4
-      estimator_updates_per_step: 1
+      generated_estimator_lr: 4e-5
+      estimator_updates_per_step: 5
       initialize_aux_from_generator_on_fit_start: true
       use_control_space_physics_regularization: true
       physics_weight: 0.005
