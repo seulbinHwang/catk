@@ -48,7 +48,7 @@ model:
     n_vis_scenario: 0
     n_vis_rollout: 0
     decoder:
-      flow_window_steps: 20
+      flow_window_steps: 40
 
 ckpt_path: null
 
@@ -78,7 +78,7 @@ data:
   #   bs=60  -> OOM at 96.8%
   # Without activation recomputation (pre-b12e653) the ceiling drops to
   # roughly bs=28 (~82.7% peak).
-  train_batch_size: 52
+  train_batch_size: 46
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
