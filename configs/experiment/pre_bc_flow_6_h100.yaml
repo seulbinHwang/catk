@@ -28,7 +28,7 @@ model:
     n_vis_scenario: 0
     n_vis_rollout: 0
     decoder:
-      flow_window_steps: 80
+      flow_window_steps: 20
 
 ckpt_path: null
 

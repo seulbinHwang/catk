@@ -21,7 +21,7 @@ model:
       start_epoch: 0
       weight: 1.0
       path_step_size: 0.05
-      anchor_weight: 0.05
+      anchor_weight: 0.1
       generated_estimator_lr: 4e-5
       estimator_updates_per_step: 5
       initialize_aux_from_generator_on_fit_start: true
