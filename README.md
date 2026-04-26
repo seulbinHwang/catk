@@ -331,15 +331,14 @@ torchrun ... -m src.run \
 ... data.train_use_eval_agent_selection=true
 ```
 
-### 5.1.2 부분 유효 미래 step 학습 방식
+### 5.1.2 전체 유효 미래 window 학습 방식
 
-`model.model_config.decoder.flow_window_steps`를 길게 잡아도, 학습에서는 더 이상 전체 미래 step이 모두 유효한 agent만 남기지 않습니다.
+학습 target은 `model.model_config.decoder.flow_window_steps` 전체 미래 궤적이 모두 유효한 agent-anchor만 사용합니다.
 
-- 현재 anchor가 유효하고 현재 다음 시점부터 하나 이상 연속으로 유효하면 학습 후보에 포함합니다.
-- `flow_train_loss_mask`는 각 agent/anchor의 첫 연속 유효 미래 구간만 `True`로 표시합니다.
-- Flow Matching loss, DRaFT physics loss, 학습 open-loop metric은 `flow_train_loss_mask=True`인 step만 평균냅니다.
-- mask가 꺼진 뒤쪽 target은 마지막 유효 상태로 채워 shape을 유지하지만, loss에는 들어가지 않습니다.
-- validation open-loop는 비교 기준을 유지하기 위해 기존처럼 전체 `flow_window_steps`가 유효한 anchor만 평가합니다.
+- 현재 anchor가 유효하더라도 미래 `flow_window_steps` 중 하나라도 끊기면 학습 후보에서 제외합니다.
+- `flow_train_loss_mask`는 남은 학습 target에 대해 전체 미래 step이 `True`인 mask로 유지됩니다.
+- Flow Matching loss, DRaFT physics loss, self-forced anchor FM loss, 학습 open-loop metric은 모두 전체 유효 미래 window만 봅니다.
+- validation open-loop도 같은 기준으로 전체 `flow_window_steps`가 유효한 anchor만 평가합니다.
 
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
 
