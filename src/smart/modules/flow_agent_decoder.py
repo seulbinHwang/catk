@@ -84,7 +84,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_chunk_heads=flow_num_chunk_heads,
             num_chunk_layers=flow_num_chunk_layers,
             chunk_size=self.shift,
-            a2a_radius=a2a_radius,
         )
         self.flow_ode = FlowODE(
             eps=flow_solver_eps,
@@ -388,131 +387,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         return torch.cat(packed_hidden, dim=0)
 
 
-    def _pack_anchor_sequence_tensor(
-        self,
-        anchor_tensor: torch.Tensor,
-        anchor_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """anchor별 tensor를 flow target 순서와 같은 순서로 압축합니다.
-
-        Args:
-            anchor_tensor: anchor 축이 있는 tensor입니다.
-                shape은 ``[n_agent, n_anchor, ...]`` 입니다.
-            anchor_mask: 사용할 anchor 여부입니다. shape은 ``[n_agent, n_anchor]`` 입니다.
-
-        Returns:
-            torch.Tensor: 유효 anchor만 모은 tensor입니다.
-                shape은 ``[n_valid_anchor, ...]`` 입니다.
-        """
-        if anchor_tensor.shape[:2] != anchor_mask.shape:
-            raise ValueError(
-                "anchor_tensor first two dims must match anchor_mask, "
-                f"got {tuple(anchor_tensor.shape[:2])} and {tuple(anchor_mask.shape)}."
-            )
-        packed = [
-            anchor_tensor[:, anchor_idx][anchor_mask[:, anchor_idx]]
-            for anchor_idx in range(anchor_mask.shape[1])
-            if anchor_mask[:, anchor_idx].any()
-        ]
-        if len(packed) == 0:
-            return anchor_tensor.new_zeros((0, *anchor_tensor.shape[2:]))
-        return torch.cat(packed, dim=0)
-
-    def _pack_agent_tensor_by_anchor_mask(
-        self,
-        agent_tensor: torch.Tensor,
-        anchor_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """agent별 tensor를 anchor mask 순서에 맞춰 반복 압축합니다.
-
-        Args:
-            agent_tensor: agent별 tensor입니다. shape은 ``[n_agent, ...]`` 입니다.
-            anchor_mask: 사용할 anchor 여부입니다. shape은 ``[n_agent, n_anchor]`` 입니다.
-
-        Returns:
-            torch.Tensor: 유효 anchor 순서에 맞춘 tensor입니다.
-                shape은 ``[n_valid_anchor, ...]`` 입니다.
-        """
-        if agent_tensor.shape[0] != anchor_mask.shape[0]:
-            raise ValueError(
-                "agent_tensor first dim must match anchor_mask agents, "
-                f"got {agent_tensor.shape[0]} and {anchor_mask.shape[0]}."
-            )
-        packed = [
-            agent_tensor[anchor_mask[:, anchor_idx]]
-            for anchor_idx in range(anchor_mask.shape[1])
-            if anchor_mask[:, anchor_idx].any()
-        ]
-        if len(packed) == 0:
-            return agent_tensor.new_zeros((0, *agent_tensor.shape[1:]))
-        return torch.cat(packed, dim=0)
-
-    def _pack_anchor_step_id(self, anchor_mask: torch.Tensor) -> torch.Tensor:
-        """각 packed 후보가 어느 anchor 시점에서 나왔는지 번호를 만듭니다.
-
-        Args:
-            anchor_mask: 사용할 anchor 여부입니다. shape은 ``[n_agent, n_anchor]`` 입니다.
-
-        Returns:
-            torch.Tensor: packed 후보별 anchor 시점 번호입니다.
-                shape은 ``[n_valid_anchor]`` 입니다.
-        """
-        packed_step_ids = [
-            torch.full(
-                (int(anchor_mask[:, anchor_idx].sum().item()),),
-                anchor_idx,
-                device=anchor_mask.device,
-                dtype=torch.long,
-            )
-            for anchor_idx in range(anchor_mask.shape[1])
-            if anchor_mask[:, anchor_idx].any()
-        ]
-        if len(packed_step_ids) == 0:
-            return torch.zeros((0,), device=anchor_mask.device, dtype=torch.long)
-        return torch.cat(packed_step_ids, dim=0)
-
-    def _pack_flow_decoder_context(
-        self,
-        tokenized_agent: Dict[str, torch.Tensor],
-        anchor_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """flow decoder의 agent-to-agent chunk attention에 필요한 정보를 압축합니다.
-
-        Args:
-            tokenized_agent: 에이전트 토큰 사전입니다.
-            anchor_mask: 사용할 anchor 여부입니다. shape은 ``[n_agent, n_anchor]`` 입니다.
-
-        Returns:
-            Dict[str, torch.Tensor]: 현재 위치, 방향, 장면 번호, anchor 시점 번호입니다.
-                각 tensor의 첫 차원은 ``n_valid_anchor`` 입니다.
-        """
-        n_anchor = anchor_mask.shape[1]
-        anchor_pos = tokenized_agent["ctx_sampled_pos"][:, 1 : 1 + n_anchor]
-        anchor_head = tokenized_agent["ctx_sampled_heading"][:, 1 : 1 + n_anchor]
-        if anchor_pos.shape[1] != n_anchor or anchor_head.shape[1] != n_anchor:
-            raise ValueError(
-                "ctx_sampled_pos/heading must contain one context slot plus all flow anchors."
-            )
-        return {
-            "current_pos": self._pack_anchor_sequence_tensor(anchor_pos, anchor_mask),
-            "current_head": self._pack_anchor_sequence_tensor(anchor_head, anchor_mask),
-            "agent_batch": self._pack_agent_tensor_by_anchor_mask(
-                tokenized_agent["batch"],
-                anchor_mask,
-            ).long(),
-            "anchor_step_id": self._pack_anchor_step_id(anchor_mask),
-        }
-
     def _sample_open_loop_future_from_hidden(
         self,
         anchor_hidden_valid: torch.Tensor,
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
-        current_pos: torch.Tensor | None = None,
-        current_head: torch.Tensor | None = None,
-        agent_batch: torch.Tensor | None = None,
-        anchor_step_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -523,10 +403,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
             backprop_last_k: 마지막 몇 step만 역전파할지 정합니다.
                 ``None`` 이면 전체 step을 역전파합니다.
-            current_pos: 유효 anchor별 현재 중심 위치입니다. shape은 ``[n_valid_anchor, 2]`` 입니다.
-            current_head: 유효 anchor별 현재 방향입니다. shape은 ``[n_valid_anchor]`` 입니다.
-            agent_batch: 유효 anchor별 장면 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
-            anchor_step_id: 유효 anchor별 anchor 시점 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
             torch.Tensor: 생성된 정규화 2초 미래입니다.
@@ -563,15 +439,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         return self.flow_ode.generate(
             x_init=x_init_norm,
-            model_fn=lambda x_t, tau: self.flow_decoder(
-                anchor_hidden_valid,
-                x_t,
-                tau,
-                current_pos=current_pos,
-                current_head=current_head,
-                agent_batch=agent_batch,
-                anchor_step_id=anchor_step_id,
-            ),
+            model_fn=lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau),
             steps=flow_sample_steps,
             method=flow_sample_method,
             backprop_last_k=backprop_last_k,
@@ -584,10 +452,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
-        current_pos: torch.Tensor | None = None,
-        current_head: torch.Tensor | None = None,
-        agent_batch: torch.Tensor | None = None,
-        anchor_step_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
@@ -600,10 +464,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
             backprop_last_k: 마지막 몇 step만 역전파할지 정합니다.
                 ``None`` 이면 전체 step을 역전파합니다.
-            current_pos: 유효 anchor별 현재 중심 위치입니다. shape은 ``[n_valid_anchor, 2]`` 입니다.
-            current_head: 유효 anchor별 현재 방향입니다. shape은 ``[n_valid_anchor]`` 입니다.
-            agent_batch: 유효 anchor별 장면 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
-            anchor_step_id: 유효 anchor별 anchor 시점 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
             torch.Tensor: 생성된 정규화 2초 미래입니다.
@@ -615,11 +475,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
-            current_pos=current_pos,
-            current_head=current_head,
-            agent_batch=agent_batch,
-            anchor_step_id=anchor_step_id,
         )
+
 
     def _build_rollout_noise_tape(
         self,
@@ -785,10 +642,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         anchor_hidden = ctx_hidden_pack[:, 1:, :]
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
-        flow_decoder_context = self._pack_flow_decoder_context(
-            tokenized_agent=tokenized_agent,
-            anchor_mask=anchor_mask,
-        )
 
         if flow_loss_mask is not None:
             expected_shape = tuple(flow_clean_norm.shape[:2])
@@ -809,25 +662,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 "ctx_hidden_pack": ctx_hidden_pack,
                 "anchor_hidden": anchor_hidden,
                 "anchor_mask": anchor_mask,
-                "flow_current_pos": flow_decoder_context["current_pos"],
-                "flow_current_head": flow_decoder_context["current_head"],
-                "flow_agent_batch": flow_decoder_context["agent_batch"],
-                "flow_anchor_step_id": flow_decoder_context["anchor_step_id"],
             }
             if flow_loss_mask is not None:
                 output["flow_loss_mask"] = flow_loss_mask
             return output
 
         flow_sample = self.flow_ode.sample(flow_clean_norm, target_type="velocity")
-        flow_pred_norm = self.flow_decoder(
-            anchor_hidden_valid,
-            flow_sample.x_t,
-            flow_sample.tau,
-            current_pos=flow_decoder_context["current_pos"],
-            current_head=flow_decoder_context["current_head"],
-            agent_batch=flow_decoder_context["agent_batch"],
-            anchor_step_id=flow_decoder_context["anchor_step_id"],
-        )
+        flow_pred_norm = self.flow_decoder(anchor_hidden_valid, flow_sample.x_t, flow_sample.tau)
         flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
             flow_sample.x_t,
             flow_pred_norm,
@@ -841,10 +682,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "ctx_hidden_pack": ctx_hidden_pack,
             "anchor_hidden": anchor_hidden,
             "anchor_mask": anchor_mask,
-            "flow_current_pos": flow_decoder_context["current_pos"],
-            "flow_current_head": flow_decoder_context["current_head"],
-            "flow_agent_batch": flow_decoder_context["agent_batch"],
-            "flow_anchor_step_id": flow_decoder_context["anchor_step_id"],
         }
         if flow_loss_mask is not None:
             output["flow_loss_mask"] = flow_loss_mask
@@ -1253,22 +1090,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     "sample_method",
                     self.flow_ode.solver_method,
                 )
-                current_pos_act = pos_window[active_mask, -1]
-                current_head_act = head_window[active_mask, -1]
-                active_agent_batch = tokenized_agent["batch"][active_mask]
                 y_hat_norm = self.flow_ode.generate(
                     x_init=x_init_norm,
-                    model_fn=lambda x_t, tau: self.flow_decoder(
-                        active_hidden,
-                        x_t,
-                        tau,
-                        current_pos=current_pos_act,
-                        current_head=current_head_act,
-                        agent_batch=active_agent_batch,
-                    ),
+                    model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
                     steps=flow_sample_steps,
                     method=flow_sample_method,
                 )
+                current_pos_act = pos_window[active_mask, -1]
+                current_head_act = head_window[active_mask, -1]
                 active_agent_type = tokenized_agent["type"][active_mask]
                 if return_flow_2s_preview:
                     preview_pos_local = y_hat_norm[..., :2] * 20.0
@@ -1602,19 +1431,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         anchor_hidden = ctx_hidden_pack[:, 1:, :]
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
-        flow_decoder_context = self._pack_flow_decoder_context(
-            tokenized_agent=tokenized_agent,
-            anchor_mask=single_anchor_mask,
-        )
-        velocity = self.flow_decoder(
-            anchor_hidden_valid,
-            path_noisy_norm,
-            tau,
-            current_pos=flow_decoder_context["current_pos"],
-            current_head=flow_decoder_context["current_head"],
-            agent_batch=flow_decoder_context["agent_batch"],
-            anchor_step_id=flow_decoder_context["anchor_step_id"],
-        )
+        velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
         clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
         return {"velocity": velocity, "clean": clean}
 

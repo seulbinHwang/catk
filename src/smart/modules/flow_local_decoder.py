@@ -7,10 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch_cluster import radius_graph
-from torch_geometric.utils import subgraph
-
-from src.smart.layers.attention_layer import AttentionLayer
 
 from src.smart.tokens.agent_token_matching import (
     build_agent_type_masks,
@@ -317,19 +313,17 @@ class HalfSecondChunkMixerBlock(nn.Module):
             batch_first=True,
         )
 
-        # chunk_a2a_mixers가 agent 간 미래 정렬을 담당하므로, 기존 chunk 내부
-        # 조건 주입부는 같은 기능을 유지하되 hidden 폭만 줄여 파라미터 예산을 맞춥니다.
         self.cond_mlp = nn.Sequential(
-            nn.Linear(flow_dim * 2, flow_dim),
+            nn.Linear(flow_dim * 2, flow_dim * 2),
             nn.SiLU(),
-            nn.Linear(flow_dim, flow_dim * 3),
+            nn.Linear(flow_dim * 2, flow_dim * 3),
         )
 
         self.mlp_norm = nn.LayerNorm(flow_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(flow_dim, flow_dim),
+            nn.Linear(flow_dim, flow_dim * 2),
             nn.SiLU(),
-            nn.Linear(flow_dim, flow_dim),
+            nn.Linear(flow_dim * 2, flow_dim),
         )
 
     def _modulate(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
@@ -352,260 +346,6 @@ class HalfSecondChunkMixerBlock(nn.Module):
         mlp_in = self._modulate(self.mlp_norm(chunk_tokens), cond)
         chunk_tokens = chunk_tokens + self.mlp(mlp_in)
         return chunk_tokens
-
-
-class ChunkAgentInteractionMixer(nn.Module):
-    def __init__(
-        self,
-        flow_dim: int,
-        num_heads: int,
-        a2a_radius: float,
-        dropout: float = 0.0,
-        max_num_neighbors: int = 300,
-    ) -> None:
-        """같은 미래 chunk 위치에 있는 agent 후보끼리 정보를 교환합니다.
-
-        Args:
-            flow_dim: chunk token의 폭입니다.
-            num_heads: attention head 개수입니다.
-            a2a_radius: 서로 영향을 줄 수 있는 최대 거리입니다.
-            dropout: attention 내부 dropout 확률입니다.
-            max_num_neighbors: 한 노드가 볼 수 있는 최대 이웃 수입니다.
-        """
-        super().__init__()
-        if int(num_heads) <= 0:
-            raise ValueError(f"num_heads must be positive, got {num_heads}.")
-        self.a2a_radius = float(a2a_radius)
-        self.max_num_neighbors = int(max_num_neighbors)
-        self.relation_mlp = nn.Sequential(
-            nn.Linear(5, flow_dim),
-            nn.LayerNorm(flow_dim),
-            nn.SiLU(),
-            nn.Linear(flow_dim, flow_dim),
-        )
-        self.attn = AttentionLayer(
-            hidden_dim=flow_dim,
-            num_heads=int(num_heads),
-            head_dim=max(1, int(flow_dim) // int(num_heads)),
-            dropout=dropout,
-            bipartite=False,
-            has_pos_emb=True,
-        )
-
-    @staticmethod
-    def _safe_angle_between_2d_vectors(
-        ctr_vector: torch.Tensor,
-        nbr_vector: torch.Tensor,
-        eps: float = 1.0e-6,
-    ) -> torch.Tensor:
-        """두 방향 사이의 각도를 안전하게 계산합니다.
-
-        Args:
-            ctr_vector: 기준 방향 벡터입니다. shape은 ``[..., 2]`` 입니다.
-            nbr_vector: 비교할 방향 벡터입니다. shape은 ``[..., 2]`` 입니다.
-            eps: 길이가 이 값보다 작은 비교 벡터를 0도 방향으로 처리합니다.
-
-        Returns:
-            torch.Tensor: 두 방향 사이의 각도입니다. shape은 ``[...]`` 입니다.
-
-        Notes:
-            두 agent의 예측 chunk 중심이 같은 위치에 있으면 비교 벡터 길이가 0이 됩니다.
-            이때 바로 ``atan2(0, 0)`` 를 쓰면 backward에서 NaN이 생길 수 있어,
-            같은 위치인 edge의 방향 차이는 0도로 둡니다.
-        """
-        cross = ctr_vector[..., 0] * nbr_vector[..., 1] - ctr_vector[..., 1] * nbr_vector[..., 0]
-        dot = (ctr_vector[..., :2] * nbr_vector[..., :2]).sum(dim=-1)
-        valid = nbr_vector[..., :2].square().sum(dim=-1) > float(eps) ** 2
-        safe_cross = torch.where(valid, cross, torch.zeros_like(cross))
-        safe_dot = torch.where(valid, dot, torch.ones_like(dot))
-        return torch.atan2(safe_cross, safe_dot)
-
-    def _build_chunk_batch(
-        self,
-        agent_batch: torch.Tensor,
-        num_chunks: int,
-        anchor_step_id: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """chunk, 장면, anchor 시점을 하나의 graph 번호로 묶습니다.
-
-        Args:
-            agent_batch: 각 후보가 속한 장면 번호입니다. shape은 ``[n_candidate]`` 입니다.
-            num_chunks: 미래를 나눈 chunk 개수입니다.
-            anchor_step_id: 학습용 anchor 시점 번호입니다. shape은 ``[n_candidate]`` 입니다.
-                ``None``이면 모든 후보가 같은 anchor 시점에 있다고 봅니다.
-
-        Returns:
-            torch.Tensor: 펼친 chunk별 graph 번호입니다.
-                shape은 ``[num_chunks * n_candidate]`` 입니다.
-        """
-        # agent_batch: [n_candidate]
-        if agent_batch.numel() == 0:
-            return agent_batch.new_zeros((0,), dtype=torch.long)
-
-        agent_batch = agent_batch.to(dtype=torch.long)
-        num_scene_graphs = int(agent_batch.max().item()) + 1
-        if anchor_step_id is None:
-            anchor_step_id = agent_batch.new_zeros(agent_batch.shape, dtype=torch.long)
-        else:
-            if anchor_step_id.shape != agent_batch.shape:
-                raise ValueError(
-                    "anchor_step_id shape must match agent_batch, "
-                    f"got {tuple(anchor_step_id.shape)} and {tuple(agent_batch.shape)}."
-                )
-            anchor_step_id = anchor_step_id.to(device=agent_batch.device, dtype=torch.long)
-
-        num_anchor_steps = int(anchor_step_id.max().item()) + 1 if anchor_step_id.numel() > 0 else 1
-        base_batch = agent_batch + anchor_step_id * num_scene_graphs
-        num_base_batches = max(1, num_scene_graphs * num_anchor_steps)
-        chunk_offsets = (
-            torch.arange(num_chunks, device=agent_batch.device, dtype=torch.long)
-            .repeat_interleave(agent_batch.shape[0])
-            * num_base_batches
-        )
-        return base_batch.repeat(num_chunks) + chunk_offsets
-
-    def _build_relation_embedding(
-        self,
-        pos_flat: torch.Tensor,
-        head_flat: torch.Tensor,
-        motion_flat: torch.Tensor,
-        edge_index: torch.Tensor,
-    ) -> torch.Tensor:
-        """edge마다 상대 위치, 방향, 이동 차이를 embedding으로 바꿉니다.
-
-        Args:
-            pos_flat: 펼친 chunk 중심 위치입니다. shape은 ``[num_chunks * n_candidate, 2]`` 입니다.
-            head_flat: 펼친 chunk 방향입니다. shape은 ``[num_chunks * n_candidate]`` 입니다.
-            motion_flat: 펼친 chunk 이동량입니다. shape은 ``[num_chunks * n_candidate, 2]`` 입니다.
-            edge_index: source와 target 노드 번호입니다. shape은 ``[2, n_edge]`` 입니다.
-
-        Returns:
-            torch.Tensor: attention에 더할 edge 특징입니다. shape은 ``[n_edge, flow_dim]`` 입니다.
-        """
-        # edge_index[0]: source chunk, edge_index[1]: receiver chunk
-        rel_pos = pos_flat[edge_index[0]] - pos_flat[edge_index[1]]
-        rel_head = wrap_angle(head_flat[edge_index[0]] - head_flat[edge_index[1]])
-        rel_motion = motion_flat[edge_index[0]] - motion_flat[edge_index[1]]
-
-        recv_head = head_flat[edge_index[1]]
-        recv_cos = recv_head.cos()
-        recv_sin = recv_head.sin()
-        rel_motion_long = rel_motion[:, 0] * recv_cos + rel_motion[:, 1] * recv_sin
-        rel_motion_lat = -rel_motion[:, 0] * recv_sin + rel_motion[:, 1] * recv_cos
-        recv_head_vector = torch.stack([recv_cos, recv_sin], dim=-1)
-
-        relation_inputs = torch.stack(
-            [
-                torch.norm(rel_pos[:, :2], p=2, dim=-1),
-                self._safe_angle_between_2d_vectors(
-                    ctr_vector=recv_head_vector,
-                    nbr_vector=rel_pos[:, :2],
-                ),
-                rel_head,
-                rel_motion_long,
-                rel_motion_lat,
-            ],
-            dim=-1,
-        )
-        return self.relation_mlp(relation_inputs)
-
-    def forward(
-        self,
-        chunk_tokens: torch.Tensor,
-        chunk_pos: torch.Tensor,
-        chunk_head: torch.Tensor,
-        chunk_motion: torch.Tensor,
-        agent_batch: torch.Tensor,
-        anchor_step_id: torch.Tensor | None = None,
-        chunk_valid: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """같은 상대 미래 chunk끼리만 agent-to-agent attention을 수행합니다.
-
-        Args:
-            chunk_tokens: chunk별 feature입니다. shape은 ``[n_candidate, num_chunks, flow_dim]`` 입니다.
-            chunk_pos: chunk별 전역 중심 위치입니다. shape은 ``[n_candidate, num_chunks, 2]`` 입니다.
-            chunk_head: chunk별 전역 방향입니다. shape은 ``[n_candidate, num_chunks]`` 입니다.
-            chunk_motion: 이전 chunk 중심에서 현재 chunk 중심까지의 이동량입니다.
-                shape은 ``[n_candidate, num_chunks, 2]`` 입니다.
-            agent_batch: 각 후보가 속한 장면 번호입니다. shape은 ``[n_candidate]`` 입니다.
-            anchor_step_id: 학습용 anchor 시점 번호입니다. shape은 ``[n_candidate]`` 입니다.
-            chunk_valid: chunk 유효 여부입니다. shape은 ``[n_candidate, num_chunks]`` 입니다.
-                ``None``이면 모든 chunk를 유효하다고 봅니다.
-
-        Returns:
-            torch.Tensor: agent 간 정렬 정보가 반영된 chunk feature입니다.
-                shape은 ``[n_candidate, num_chunks, flow_dim]`` 입니다.
-        """
-        # chunk_tokens: [n_candidate, num_chunks, flow_dim]
-        n_candidate, num_chunks, flow_dim = chunk_tokens.shape
-        if n_candidate <= 1 or num_chunks == 0 or self.a2a_radius <= 0.0:
-            return chunk_tokens
-        if agent_batch.shape[0] != n_candidate:
-            raise ValueError(
-                "agent_batch must have one item per candidate, "
-                f"got {agent_batch.shape[0]} and {n_candidate}."
-            )
-        if chunk_pos.shape != (n_candidate, num_chunks, 2):
-            raise ValueError(
-                "chunk_pos shape must be [n_candidate, num_chunks, 2], "
-                f"got {tuple(chunk_pos.shape)}."
-            )
-        if chunk_head.shape != (n_candidate, num_chunks):
-            raise ValueError(
-                "chunk_head shape must be [n_candidate, num_chunks], "
-                f"got {tuple(chunk_head.shape)}."
-            )
-        if chunk_motion.shape != (n_candidate, num_chunks, 2):
-            raise ValueError(
-                "chunk_motion shape must be [n_candidate, num_chunks, 2], "
-                f"got {tuple(chunk_motion.shape)}."
-            )
-
-        if chunk_valid is None:
-            chunk_valid = torch.ones(
-                (n_candidate, num_chunks),
-                device=chunk_tokens.device,
-                dtype=torch.bool,
-            )
-        else:
-            if chunk_valid.shape != (n_candidate, num_chunks):
-                raise ValueError(
-                    "chunk_valid shape must be [n_candidate, num_chunks], "
-                    f"got {tuple(chunk_valid.shape)}."
-                )
-            chunk_valid = chunk_valid.to(device=chunk_tokens.device, dtype=torch.bool)
-
-        # 아래 flatten 순서는 [chunk0의 모든 후보, chunk1의 모든 후보, ...] 입니다.
-        token_flat = chunk_tokens.transpose(0, 1).reshape(num_chunks * n_candidate, flow_dim)
-        pos_flat = chunk_pos.transpose(0, 1).reshape(num_chunks * n_candidate, 2)
-        head_flat = chunk_head.transpose(0, 1).reshape(num_chunks * n_candidate)
-        motion_flat = chunk_motion.transpose(0, 1).reshape(num_chunks * n_candidate, 2)
-        valid_flat = chunk_valid.transpose(0, 1).reshape(num_chunks * n_candidate)
-        chunk_batch = self._build_chunk_batch(
-            agent_batch=agent_batch.to(device=chunk_tokens.device, dtype=torch.long),
-            num_chunks=num_chunks,
-            anchor_step_id=anchor_step_id,
-        )
-
-        edge_index = radius_graph(
-            x=pos_flat[:, :2],
-            r=self.a2a_radius,
-            batch=chunk_batch,
-            loop=False,
-            max_num_neighbors=self.max_num_neighbors,
-        )
-        edge_index = subgraph(subset=valid_flat, edge_index=edge_index)[0]
-        if edge_index.numel() == 0:
-            return chunk_tokens
-
-        relation = self._build_relation_embedding(
-            pos_flat=pos_flat,
-            head_flat=head_flat,
-            motion_flat=motion_flat,
-            edge_index=edge_index,
-        )
-        mixed_flat = self.attn(token_flat, relation, edge_index)
-        return mixed_flat.view(num_chunks, n_candidate, flow_dim).transpose(0, 1)
 
 
 class ChunkStepRefiner(nn.Module):
@@ -672,8 +412,6 @@ class HierarchicalFlowDecoder(nn.Module):
         num_chunk_heads: int = 4,
         num_chunk_layers: int = 2,
         chunk_size: int = 5,
-        a2a_radius: float = 60.0,
-        num_chunk_a2a_layers: int = 1,
     ) -> None:
         super().__init__()
         if int(num_future_steps) <= 0:
@@ -686,9 +424,6 @@ class HierarchicalFlowDecoder(nn.Module):
                 f"got {num_future_steps} and {chunk_size}."
             )
         num_chunks = int(num_future_steps) // int(chunk_size)
-        self.num_chunks = num_chunks
-        self.chunk_size = int(chunk_size)
-        self.pos_scale_m = 20.0
         self.context_projector = AnchorContextProjector(context_dim, flow_dim)
         self.noisy_future_encoder = NormalizedNoisyFutureEncoder(
             flow_dim=flow_dim,
@@ -701,123 +436,17 @@ class HierarchicalFlowDecoder(nn.Module):
                 for _ in range(num_chunk_layers)
             ]
         )
-        self.chunk_a2a_mixers = nn.ModuleList(
-            [
-                ChunkAgentInteractionMixer(
-                    flow_dim=flow_dim,
-                    num_heads=num_chunk_heads,
-                    a2a_radius=a2a_radius,
-                )
-                for _ in range(int(num_chunk_a2a_layers))
-            ]
-        )
         self.step_refiner = ChunkStepRefiner(
             flow_dim=flow_dim,
             num_heads=num_chunk_heads,
         )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
 
-    @staticmethod
-    def _safe_angle_from_vector(
-        vector: torch.Tensor,
-        fallback_angle: torch.Tensor | None = None,
-        eps: float = 1.0e-6,
-    ) -> torch.Tensor:
-        """2차원 벡터를 각도로 안전하게 바꿉니다.
-
-        Args:
-            vector: 각도로 바꿀 2차원 벡터입니다. shape은 ``[..., 2]`` 입니다.
-            fallback_angle: 벡터 길이가 너무 짧을 때 쓸 각도입니다.
-                shape은 ``[...]`` 입니다. ``None``이면 0도를 씁니다.
-            eps: 길이가 이 값보다 작은 벡터를 fallback으로 처리합니다.
-
-        Returns:
-            torch.Tensor: 안전하게 계산된 각도입니다. shape은 ``[...]`` 입니다.
-
-        Notes:
-            chunk 안의 heading 벡터가 서로 상쇄되면 평균 벡터가 0에 가까워질 수 있습니다.
-            이 상태에서 ``atan2(0, 0)`` 를 바로 호출하면 gradient가 NaN이 될 수 있어
-            마지막 heading 또는 0도를 대체값으로 사용합니다.
-        """
-        valid = vector[..., :2].square().sum(dim=-1) > float(eps) ** 2
-        if fallback_angle is None:
-            fallback_x = torch.ones_like(vector[..., 0])
-            fallback_y = torch.zeros_like(vector[..., 1])
-        else:
-            fallback_x = fallback_angle.cos()
-            fallback_y = fallback_angle.sin()
-        safe_x = torch.where(valid, vector[..., 0], fallback_x)
-        safe_y = torch.where(valid, vector[..., 1], fallback_y)
-        return torch.atan2(safe_y, safe_x)
-
-    def _build_chunk_global_kinematics(
-        self,
-        x_t_norm: torch.Tensor,
-        current_pos: torch.Tensor,
-        current_head: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """정규화된 미래 상태에서 chunk별 전역 위치와 이동량을 만듭니다.
-
-        Args:
-            x_t_norm: 현재 flow 상태입니다. shape은 ``[n_candidate, num_future_steps, 4]`` 입니다.
-            current_pos: 각 후보의 현재 중심 위치입니다. shape은 ``[n_candidate, 2]`` 입니다.
-            current_head: 각 후보의 현재 방향입니다. shape은 ``[n_candidate]`` 입니다.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - chunk_pos: chunk별 전역 중심 위치입니다. shape은 ``[n_candidate, num_chunks, 2]`` 입니다.
-                - chunk_head: chunk별 전역 방향입니다. shape은 ``[n_candidate, num_chunks]`` 입니다.
-                - chunk_motion: 이전 중심에서 현재 chunk 중심까지의 이동량입니다.
-                  shape은 ``[n_candidate, num_chunks, 2]`` 입니다.
-        """
-        # x_t_chunks: [n_candidate, num_chunks, chunk_size, 4]
-        n_candidate = x_t_norm.shape[0]
-        if current_pos.shape != (n_candidate, 2):
-            raise ValueError(
-                "current_pos shape must be [n_candidate, 2], "
-                f"got {tuple(current_pos.shape)}."
-            )
-        if current_head.shape != (n_candidate,):
-            raise ValueError(
-                "current_head shape must be [n_candidate], "
-                f"got {tuple(current_head.shape)}."
-            )
-
-        x_t_chunks = x_t_norm.reshape(n_candidate, self.num_chunks, self.chunk_size, 4)
-        chunk_pos_local = x_t_chunks[..., :2].mean(dim=2) * self.pos_scale_m
-
-        step_head_vec = F.normalize(x_t_chunks[..., 2:4], dim=-1, eps=1.0e-6)
-        chunk_head_vec = step_head_vec.mean(dim=2)
-        last_head_local = self._safe_angle_from_vector(step_head_vec[:, :, -1])
-        chunk_head_local = self._safe_angle_from_vector(
-            vector=chunk_head_vec,
-            fallback_angle=last_head_local,
-        )
-
-        chunk_pos, chunk_head = transform_to_global(
-            pos_local=chunk_pos_local,
-            head_local=chunk_head_local,
-            pos_now=current_pos.to(device=x_t_norm.device, dtype=x_t_norm.dtype),
-            head_now=current_head.to(device=x_t_norm.device, dtype=x_t_norm.dtype),
-        )
-        chunk_head = wrap_angle(chunk_head)
-
-        previous_pos = torch.cat(
-            [current_pos.to(device=x_t_norm.device, dtype=x_t_norm.dtype).unsqueeze(1), chunk_pos[:, :-1]],
-            dim=1,
-        )
-        chunk_motion = chunk_pos - previous_pos
-        return chunk_pos, chunk_head, chunk_motion
-
     def forward(
         self,
         anchor_hidden: torch.Tensor,
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
-        current_pos: torch.Tensor | None = None,
-        current_head: torch.Tensor | None = None,
-        agent_batch: torch.Tensor | None = None,
-        anchor_step_id: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         anchor_hidden : (A, 13, H) -> (N=A*13, H) -> context : (N, D)
@@ -851,27 +480,6 @@ class HierarchicalFlowDecoder(nn.Module):
         """
         for block in self.chunk_mixers:
             chunk_tokens = block(chunk_tokens, context, tau_emb)
-
-        if (
-            current_pos is not None
-            and current_head is not None
-            and agent_batch is not None
-            and len(self.chunk_a2a_mixers) > 0
-        ):
-            chunk_pos, chunk_head, chunk_motion = self._build_chunk_global_kinematics(
-                x_t_norm=x_t_norm,
-                current_pos=current_pos,
-                current_head=current_head,
-            )
-            for block in self.chunk_a2a_mixers:
-                chunk_tokens = block(
-                    chunk_tokens=chunk_tokens,
-                    chunk_pos=chunk_pos,
-                    chunk_head=chunk_head,
-                    chunk_motion=chunk_motion,
-                    agent_batch=agent_batch,
-                    anchor_step_id=anchor_step_id,
-                )
         """
         input
             step_tokens : (B, 20, D)

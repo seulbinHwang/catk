@@ -238,10 +238,6 @@ class SMARTFlowDecoder(nn.Module):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
-        current_pos: Tensor | None = None,
-        current_head: Tensor | None = None,
-        agent_batch: Tensor | None = None,
-        anchor_step_id: Tensor | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -252,11 +248,6 @@ class SMARTFlowDecoder(nn.Module):
                 shape은 ``[n_agent, 13]`` 입니다.
             sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
             sampling_seed: validation마다 같은 샘플을 만들기 위한 고정 seed입니다.
-            backprop_last_k: 마지막 몇 step에만 gradient를 남길지 정합니다.
-            current_pos: 유효 anchor별 현재 중심 위치입니다. shape은 ``[n_valid_anchor, 2]`` 입니다.
-            current_head: 유효 anchor별 현재 방향입니다. shape은 ``[n_valid_anchor]`` 입니다.
-            agent_batch: 유효 anchor별 장면 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
-            anchor_step_id: 유효 anchor별 anchor 시점 번호입니다. shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
             Tensor: 생성된 정규화 2초 미래입니다.
@@ -268,10 +259,6 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
-            current_pos=current_pos,
-            current_head=current_head,
-            agent_batch=agent_batch,
-            anchor_step_id=anchor_step_id,
         )
 
     def inference(
