@@ -12,7 +12,7 @@
 # its affiliates is strictly prohibited.
 
 import os
-from typing import List
+from typing import List, Sequence
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -45,6 +45,57 @@ from src.utils.waymo_submission import (
 log = RankedLogger(__name__, rank_zero_only=True)
 
 torch.set_float32_matmul_precision("high")
+
+
+def _format_key_list(keys: Sequence[str], max_items: int = 20) -> str:
+    shown = list(keys[:max_items])
+    suffix = "" if len(keys) <= max_items else f", ... (+{len(keys) - max_items} more)"
+    return ", ".join(shown) + suffix
+
+
+def _load_checkpoint_state_dict(ckpt_path: str) -> dict:
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        raise ValueError(
+            "action=finetune expects a Lightning checkpoint dictionary containing "
+            f"a 'state_dict' entry, got {ckpt_path!r}."
+        )
+    state_dict = checkpoint["state_dict"]
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            "action=finetune expects checkpoint['state_dict'] to be a mapping, "
+            f"got {type(state_dict).__name__} from {ckpt_path!r}."
+        )
+    return state_dict
+
+
+def _validate_finetune_loaded_trainable_params(
+    model: LightningModule,
+    missing_keys: Sequence[str],
+    unexpected_keys: Sequence[str],
+) -> None:
+    trainable_param_names = {
+        name for name, param in model.named_parameters() if param.requires_grad
+    }
+    missing_trainable = sorted(set(missing_keys) & trainable_param_names)
+    if missing_trainable:
+        raise RuntimeError(
+            "action=finetune loaded the checkpoint with strict=False, but the checkpoint "
+            "is missing parameter(s) that are trainable in this fine-tuning run. "
+            "Starting would leave those trainable weights randomly initialized. "
+            f"Missing trainable key(s): {_format_key_list(missing_trainable)}"
+        )
+
+    if missing_keys:
+        log.warning(
+            "Ignoring non-trainable missing checkpoint key(s) during finetune load: "
+            f"{_format_key_list(list(missing_keys))}"
+        )
+    if unexpected_keys:
+        log.warning(
+            "Ignoring unexpected checkpoint key(s) during finetune load: "
+            f"{_format_key_list(list(unexpected_keys))}"
+        )
 
 
 def _apply_submission_overrides(cfg: DictConfig) -> None:
@@ -150,7 +201,13 @@ def run(cfg: DictConfig) -> None:
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
     elif cfg.action == "finetune":
         log.info("Starting finetuning!")
-        model.load_state_dict(torch.load(cfg.ckpt_path)["state_dict"], strict=False)
+        state_dict = _load_checkpoint_state_dict(str(cfg.ckpt_path))
+        load_result = model.load_state_dict(state_dict, strict=False)
+        _validate_finetune_loaded_trainable_params(
+            model=model,
+            missing_keys=load_result.missing_keys,
+            unexpected_keys=load_result.unexpected_keys,
+        )
         trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")

@@ -603,7 +603,7 @@ torchrun \
 중요한 차이:
 
 - 첫 fine-tuning 시작은 반드시 `action=finetune`를 사용합니다.
-- 현재 구현은 `torch.load(ckpt)["state_dict"]`를 `strict=False`로 읽은 뒤 `trainer.fit(...)`을 새로 시작합니다.
+- 현재 구현은 `torch.load(ckpt)["state_dict"]`를 `strict=False`로 읽은 뒤 `trainer.fit(...)`을 새로 시작합니다. 단, 현재 fine-tuning에서 `requires_grad=True` 인 파라미터가 checkpoint에 없으면 실행을 중단합니다.
 - 즉, optimizer / lr scheduler / epoch / global step은 이어받지 않습니다.
 - 반대로 `action=fit`에 `ckpt_path=...`를 주면 **resume training**으로 동작합니다. 이 경우 이전 run의 optimizer 상태까지 이어받습니다.
 - 따라서 pretrained checkpoint에서 fine-tuning을 처음 시작할 때만 `action=finetune`를 쓰고,
