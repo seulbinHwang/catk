@@ -1239,6 +1239,18 @@ class SMARTFlow(LightningModule):
         self.self_forced_generated_estimator.train()
         self._apply_self_forced_map_encoder_freeze()
 
+    def _manual_backward_without_autocast(self, loss: Tensor) -> None:
+        """manual optimization의 backward만 autocast 밖에서 실행합니다.
+
+        Args:
+            loss: backward를 수행할 scalar loss입니다.
+
+        Returns:
+            None
+        """
+        with torch.autocast(device_type=loss.device.type, enabled=False):
+            self.manual_backward(loss.float())
+
     def _set_token_processor_training_mode(self, is_training: bool) -> None:
         """token processor의 train/eval 상태를 안전하게 바꿉니다.
 
@@ -1438,7 +1450,7 @@ class SMARTFlow(LightningModule):
                 anchor_mask=anchor_mask,
             )
             last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target)
-            self.manual_backward(last_loss)
+            self._manual_backward_without_autocast(last_loss)
             self.clip_gradients(
                 optimizer,
                 gradient_clip_val=self.self_forced_gradient_clip_val,
@@ -1840,7 +1852,7 @@ class SMARTFlow(LightningModule):
         generator_optimizer = self.optimizers()[0]
         self.toggle_optimizer(generator_optimizer)
         generator_optimizer.zero_grad(set_to_none=True)
-        self.manual_backward(total_loss)
+        self._manual_backward_without_autocast(total_loss)
         self.clip_gradients(
             generator_optimizer,
             gradient_clip_val=self.self_forced_gradient_clip_val,
@@ -1918,7 +1930,7 @@ class SMARTFlow(LightningModule):
             generator_optimizer = self.optimizers()[0]
             self.toggle_optimizer(generator_optimizer)
             generator_optimizer.zero_grad(set_to_none=True)
-            self.manual_backward(fm_loss)
+            self._manual_backward_without_autocast(fm_loss)
             generator_optimizer.step()
             self.untoggle_optimizer(generator_optimizer)
             self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
@@ -1958,7 +1970,7 @@ class SMARTFlow(LightningModule):
         generator_optimizer = self.optimizers()[0]
         self.toggle_optimizer(generator_optimizer)
         generator_optimizer.zero_grad(set_to_none=True)
-        self.manual_backward(total_loss)
+        self._manual_backward_without_autocast(total_loss)
         self.clip_gradients(
             generator_optimizer,
             gradient_clip_val=self.self_forced_gradient_clip_val,
