@@ -70,6 +70,15 @@ trainer:
   # (default 1.0 from configs/model/smart_flow.yaml). Override there if needed.
   gradient_clip_val: null
   sync_batchnorm: false
+  strategy:
+    # `target_teacher` (frozen copy of the generator's encoder) and the
+    # auxiliary `generated_estimator` parameters are registered on the
+    # LightningModule but receive no gradient in any single backward pass on
+    # the generator (the estimator has its own backward). DDP's reducer
+    # otherwise raises:
+    #   "parameters that were not used in producing the loss returned by
+    #    training_step ... enable find_unused_parameters=True".
+    find_unused_parameters: true
 
 callbacks:
   model_checkpoint:
