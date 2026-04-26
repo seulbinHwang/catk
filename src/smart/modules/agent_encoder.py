@@ -21,7 +21,7 @@ from torch_geometric.utils import dense_to_sparse, subgraph
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
+from src.smart.utils import angle_between_2d_vectors, safe_norm_2d, weight_init, wrap_angle
 
 
 class SMARTAgentEncoder(nn.Module):
@@ -176,7 +176,7 @@ class SMARTAgentEncoder(nn.Module):
         )
         feature_a = torch.stack(
             [
-                torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
+                safe_norm_2d(motion_vector_a[:, :, :2]),
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_a,
                     nbr_vector=motion_vector_a[:, :, :2],
@@ -249,7 +249,7 @@ class SMARTAgentEncoder(nn.Module):
         rel_head_t = wrap_angle(head_t[edge_index_t[0]] - head_t[edge_index_t[1]])
         r_t = torch.stack(
             [
-                torch.norm(rel_pos_t, p=2, dim=-1),
+                safe_norm_2d(rel_pos_t),
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_t[edge_index_t[1]],
                     nbr_vector=rel_pos_t,
@@ -286,7 +286,7 @@ class SMARTAgentEncoder(nn.Module):
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
         r_a2a = torch.stack(
             [
-                torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
+                safe_norm_2d(rel_pos_a2a[:, :2]),
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_s[edge_index_a2a[1]],
                     nbr_vector=rel_pos_a2a[:, :2],
@@ -328,7 +328,7 @@ class SMARTAgentEncoder(nn.Module):
         )
         r_pl2a = torch.stack(
             [
-                torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
+                safe_norm_2d(rel_pos_pl2a[:, :2]),
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_s[edge_index_pl2a[1]],
                     nbr_vector=rel_pos_pl2a[:, :2],

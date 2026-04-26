@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Dict
 
 import torch
@@ -17,6 +18,7 @@ from src.smart.modules.flow_local_decoder import (
 )
 from src.smart.utils import (
     angle_between_2d_vectors,
+    safe_norm_2d,
     transform_to_global,
     validate_flow_window_steps,
     wrap_angle,
@@ -177,7 +179,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         r_a2a = torch.stack(
             [
-                torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
+                safe_norm_2d(rel_pos_a2a[:, :2]),
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_s[edge_index_a2a[1]],
                     nbr_vector=rel_pos_a2a[:, :2],
@@ -1296,7 +1298,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             motion_vector_a = pos_window[:, -1] - pos_window[:, -2]
             x_a = torch.stack(
                 [
-                    torch.norm(motion_vector_a, p=2, dim=-1),
+                    safe_norm_2d(motion_vector_a),
                     angle_between_2d_vectors(
                         ctr_vector=head_vector_window[:, -1],
                         nbr_vector=motion_vector_a,
