@@ -40,7 +40,7 @@ model_config:
       sample_steps: 32
       sample_method: euler
       noise_scale: 1.0
-      backprop_last_k: null
+      backprop_last_k: 24
     physics:
       force_fp32: true
       dt: 0.1
@@ -79,7 +79,7 @@ model_config:
       sample_steps: 32
       sample_method: euler
       noise_scale: 1.0
-      backprop_last_k: null
+      backprop_last_k: 24
     use_control_space_physics_regularization: false
     physics_weight: 0.005
     physics:
