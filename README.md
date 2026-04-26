@@ -1324,6 +1324,7 @@ K commit block 수 = flow_window_steps / 5
 - `F_rho`: fresh fine-tuning 시작 시점에 pretrained `SMARTFlowDecoder` 를 복사해 만드는 frozen target path-flow teacher 입니다.
 - `F_psi`: `F_rho` 와 같은 pretrained decoder weight 로 초기화한 generated path-flow estimator 이며, detached committed self-rollout 위에서 online 으로 업데이트됩니다.
 - self-forced checkpoint resume 에서는 checkpoint에 저장된 `F_rho` / `F_psi` state를 그대로 보존합니다. 즉, resume 직후 fit 시작 hook이 두 보조 모델을 현재 Generator weight로 다시 덮어쓰지 않습니다.
+- guidance 방향을 계산할 때는 `F_rho` 와 비교용 `F_psi` 를 항상 eval mode로 둡니다. 그래서 dropout/history drop 같은 train-mode 랜덤성이 기준 방향에 섞이지 않습니다. `F_psi` 는 detached generated path에 fit되는 online update 구간에서만 train mode로 전환됩니다.
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 각 flow ODE sample 은 `model.model_config.self_forced.sampling.backprop_last_k` 를 존중해 마지막 K step에만 gradient를 남길 수 있습니다.
 - 같은 perturbed self-rollout state 에서 계산한 DMD식 score difference
   `s_\rho - s_\psi = \tau (\hat U_\rho - \hat U_\psi) / \sigma_\tau` 를 그대로 쓰지 않고,

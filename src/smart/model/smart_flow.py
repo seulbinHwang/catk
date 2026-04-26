@@ -1213,7 +1213,7 @@ class SMARTFlow(LightningModule):
             map_encoder.requires_grad_(False)
 
     def _set_self_forced_auxiliary_modes(self) -> None:
-        """self-forced 보조 모델의 train/frozen 상태를 정돈합니다.
+        """self-forced 보조 모델의 기본 eval/frozen 상태를 정돈합니다.
 
         Returns:
             None
@@ -1223,7 +1223,7 @@ class SMARTFlow(LightningModule):
         self.self_forced_target_teacher.requires_grad_(False)
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.requires_grad_(True)
-        self.self_forced_generated_estimator.train()
+        self.self_forced_generated_estimator.eval()
         self._apply_self_forced_map_encoder_freeze()
 
     def _sync_self_forced_auxiliary_models(self) -> None:
@@ -1470,30 +1470,35 @@ class SMARTFlow(LightningModule):
         optimizer = self.optimizers()[1]
         last_loss = committed_path_norm.new_zeros(())
         self.toggle_optimizer(optimizer)
-        for _ in range(self.self_forced_estimator_updates_per_step):
-            optimizer.zero_grad(set_to_none=True)
-            clean_path = committed_path_norm.detach()
-            flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
-                clean_path,
-                target_type="velocity",
-            )
-            pred_dict = self._predict_path_flow_clean_estimate(
-                decoder=self.self_forced_generated_estimator,
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-                noisy_path_norm=flow_sample.x_t,
-                tau=flow_sample.tau,
-                anchor_mask=anchor_mask,
-            )
-            last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target)
-            self._manual_backward_without_autocast(last_loss)
-            self.clip_gradients(
-                optimizer,
-                gradient_clip_val=self.self_forced_gradient_clip_val,
-                gradient_clip_algorithm="norm",
-            )
-            optimizer.step()
-        self.untoggle_optimizer(optimizer)
+        self.self_forced_target_teacher.eval()
+        self.self_forced_generated_estimator.train()
+        try:
+            for _ in range(self.self_forced_estimator_updates_per_step):
+                optimizer.zero_grad(set_to_none=True)
+                clean_path = committed_path_norm.detach()
+                flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
+                    clean_path,
+                    target_type="velocity",
+                )
+                pred_dict = self._predict_path_flow_clean_estimate(
+                    decoder=self.self_forced_generated_estimator,
+                    tokenized_map=tokenized_map,
+                    tokenized_agent=tokenized_agent,
+                    noisy_path_norm=flow_sample.x_t,
+                    tau=flow_sample.tau,
+                    anchor_mask=anchor_mask,
+                )
+                last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target)
+                self._manual_backward_without_autocast(last_loss)
+                self.clip_gradients(
+                    optimizer,
+                    gradient_clip_val=self.self_forced_gradient_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+                optimizer.step()
+        finally:
+            self.untoggle_optimizer(optimizer)
+            self._set_self_forced_auxiliary_modes()
         return last_loss.detach()
 
 
@@ -1527,6 +1532,8 @@ class SMARTFlow(LightningModule):
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
 
+        self.self_forced_target_teacher.eval()
+        self.self_forced_generated_estimator.eval()
         with torch.no_grad():
             clean_for_guidance = committed_path_norm.detach()
             flow_sample = self._sample_flow_state_from_clean(clean_for_guidance)
