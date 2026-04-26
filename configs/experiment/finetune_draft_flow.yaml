@@ -3,6 +3,7 @@
 defaults:
   - override /model: smart_flow
 
+# model.model_config.finetune.train_full_flow_decoder_only
 model:
   model_config:
     lr: 2e-4
