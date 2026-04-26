@@ -833,8 +833,9 @@ torchrun \
 ### 5.10 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
-- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `estimator_updates_per_step=5`, `freeze_map_encoder=false`, sampling = Euler 32-step / `noise_scale=1.0` / `backprop_last_k=null`, `train_batch_size=8`)
+- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `estimator_updates_per_step=5`, `freeze_map_encoder=true`, sampling = Euler 32-step / `noise_scale=1.0` / `backprop_last_k=24`, `train_batch_size=8`)
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
+- 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/scheduler/epoch 를 resume하지 않고 pretrained weight만 로드합니다.
 - 전제: `ckpt_path` 에는 같은 `flow_window_steps` 로 pretrain 된 Generator checkpoint 를 넣습니다. 모델 default 는 `flow_window_steps=20` (2초) 이고, ckpt 가 2초 horizon 으로 pretrain 된 경우 override 하지 않는 편이 안전합니다.
 
 실행 예시:
@@ -847,10 +848,13 @@ torchrun \
   --nproc_per_node=6 \
   -m src.run \
   experiment=self_forced_npfm_h100_6 \
+  action=finetune \
   paths.cache_root="$CACHE_ROOT" \
   task_name=flow_semi_continuous_self_forced_h1006 \
   ckpt_path=/path/to/2s_pretrain_epoch_last.ckpt
 ```
+
+중단된 self-forced run을 이어서 학습할 때만 `action=fit ckpt_path=/path/to/self_forced_run/last.ckpt` 를 사용하세요. 이 경우에는 Lightning이 optimizer, lr scheduler, epoch, global step까지 함께 복원합니다.
 
 `train_batch_size=8` 은 self-rollout (32-step Euler, 전체 step backprop) 부담을 고려한 보수적 시작점입니다. 실측해서 여유가 있으면 올리되, `model.model_config.self_forced.sampling.backprop_last_k` 를 줄이면 메모리를 더 절약할 수 있습니다.
 
@@ -1326,7 +1330,7 @@ K commit block 수 = flow_window_steps / 5
   path-space 방향 `d_Y = \tau (s_\rho - s_\psi)` 으로 committed self-rollout 을 밀어주는 target-shift loss.
 - committed self-rollout 에 대해서만 걸리는 control-space physics regularization (선택 사항). `model.model_config.self_forced.use_control_space_physics_regularization` 로 제어합니다.
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.anchor_weight` 로 제어합니다.
-- 선택적 map encoder freeze. `model.model_config.self_forced.freeze_map_encoder=true` 로 두면 Generator optimizer와 generated estimator `F_psi` optimizer 모두에서 `map_encoder` 파라미터를 제외합니다. 기본값 `false` 는 기존처럼 전체 모델을 fine-tuning 합니다.
+- 선택적 map encoder freeze. `model.model_config.self_forced.freeze_map_encoder=true` 로 두면 Generator optimizer와 generated estimator `F_psi` optimizer 모두에서 `map_encoder` 파라미터를 제외합니다. 현재 self-forced preset 기본값은 `true` 이며, 기존처럼 전체 모델을 fine-tuning 하려면 `model.model_config.self_forced.freeze_map_encoder=false` 로 override 합니다.
 - bf16-mixed 안전 backward boundary. self-forced 경로의 forward 와 loss 계산은 mixed precision 으로 유지하되, `manual_backward` 호출 순간만 autocast 를 끄고 scalar loss 를 fp32 로 넘깁니다. 이는 manual optimization 에서 반복 backward 를 수행할 때 PyTorch autocast promote 규칙이 backward graph 의 dtype 을 다시 분류하다가 실패하는 문제를 피하기 위한 경계입니다.
 - autograd-safe temporal edge remap. training rollout 에서는 temporal relation embedding 계산에 쓴 원본 `edge_index_t` 를 in-place 수정하지 않고, current-agent attention 용 remapped edge index 를 새 tensor 로 만들어 사용합니다.
 
@@ -1343,7 +1347,7 @@ configs/experiment/self_forced_npfm.yaml
 현재 설정의 `decoder.flow_window_steps` 와 같은 값으로 학습된 pretrained checkpoint 를 함께 넘겨 실행합니다.
 
 ```bash
-python -m src.run experiment=self_forced_npfm ckpt_path=/path/to/pretrained.ckpt
+python -m src.run experiment=self_forced_npfm action=finetune ckpt_path=/path/to/pretrained.ckpt
 ```
 
 이 구현은 WOSAC RMM 을 reward 나 optimization objective 로 사용하지 않습니다. 기존 closed-loop 평가 경로와 동일하게, RMM 은 validation / 리포팅 용도로만 쓸 수 있습니다.

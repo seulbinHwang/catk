@@ -6,6 +6,10 @@
 defaults:
   - override /model: smart_flow
 
+# Start self-forced fine-tuning from pretrained weights only.
+# Use `action=fit` explicitly only when resuming a self-forced run checkpoint.
+action: finetune
+
 model:
   model_config:
     lr: 2e-4

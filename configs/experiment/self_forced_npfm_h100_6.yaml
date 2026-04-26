@@ -11,14 +11,17 @@
 #     preset; tune `data.train_batch_size` only after a probe if you push it.
 #
 # Loads a 2s-horizon pretrained Generator checkpoint via `ckpt_path=...` from
-# the CLI. The model default `flow_window_steps=20` (2s) is kept; do not
-# override it unless the ckpt was pretrained at a different horizon.
+# the CLI with `action=finetune`, so only model weights are loaded and
+# optimizer/scheduler/epoch state is not resumed. The model default
+# `flow_window_steps=20` (2s) is kept; do not override it unless the ckpt was
+# pretrained at a different horizon.
 #
 # Run with:
 #   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 #   torchrun --standalone --nproc_per_node=6 -m src.run \
 #     experiment=self_forced_npfm_h100_6 \
+#     action=finetune \
 #     paths.cache_root="$CACHE_ROOT" \
 #     task_name=<your-task> \
 #     ckpt_path=<path-to-2s-pretrain.ckpt>
@@ -27,6 +30,8 @@
 defaults:
   - override /model: smart_flow
   - override /trainer: ddp
+
+action: finetune
 
 model:
   model_config:
