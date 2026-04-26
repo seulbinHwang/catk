@@ -872,6 +872,37 @@ torchrun \
 ... data.train_batch_size=24 model.model_config.self_forced.sampling.backprop_last_k=4
 ```
 
+#### CUDA OOM 자동 fallback 으로 무중단 재개
+
+긴 self-forced fine-tuning 도중 어쩌다 OOM 이 한 번 떨어지면 (heavy batch + cross-rank 변동성), 학습이 죽고 그동안 진행한 epoch 들이 의미 없어질 수 있습니다. `scripts/self_forced_h100_6_with_oom_retry.sh` 는 이 시나리오를 자동 처리합니다:
+
+- 첫 시도는 `PRETRAIN_CKPT` 에 지정한 2초 horizon pretrained Generator ckpt 로 `action=finetune`
+- 학습 도중 OOM 으로 죽으면 attempt log 에서 `OutOfMemoryError` / `CUDA out of memory` 마커를 감지해 `data.train_batch_size` 를 `OOM_STEP` (기본 2) 만큼 낮춤
+- 다음 시도부터는 `logs/<TASK_NAME>/runs/*/checkpoints/epoch_last.ckpt` 중 최신 self-forced ckpt 를 골라 `action=fit` 으로 **마지막 완료 epoch 끝부터 재개** (optimizer / lr scheduler / epoch / global step / `F_rho` / `F_psi` 모두 복원)
+- `bs` 가 `MIN_BS` (기본 2) 아래로 내려가거나 OOM 이외의 실패가 나면 즉시 중단
+
+실행 예시:
+
+```bash
+PRETRAIN_CKPT=/mnt/nuplan/projects/catk/downloads/wandb_ckpts/flow_semi_continuous_finetune_inv_euler_32_a100x4/run_sjan8kmh/v32/epoch_last.ckpt \
+bash scripts/self_forced_h100_6_with_oom_retry.sh
+```
+
+기본 동작을 바꿀 수 있는 환경변수 (모두 optional):
+
+| 변수 | 기본값 | 설명 |
+|---|---|---|
+| `INITIAL_BS` | `20` | 첫 시도 `data.train_batch_size` (preset ceiling) |
+| `OOM_STEP` | `2` | OOM 한 번당 줄일 batch 크기 |
+| `MIN_BS` | `2` | 이 값 미만으로 내려가면 중단 |
+| `TASK_NAME` | `flow_semi_continuous_self_forced_h1006` | checkpoint / log 위치 결정 |
+| `CACHE_ROOT` | `/mnt/nuplan/womd_v1_3/SMART_cache` | WOMD SMART cache 경로 |
+| `CUDA_VISIBLE_DEVICES` | `0,1,2,3,4,5` | 사용할 GPU |
+| `NPROC_PER_NODE` | `6` | DDP rank 수 |
+| `EXPERIMENT` | `self_forced_npfm_h100_6` | hydra experiment 이름 |
+
+각 시도의 로그는 `logs/_self_forced_oom_retry/<TASK_NAME>/attempt_NNN_bsBB.log` 로 분리 저장되어, 어느 시도에서 OOM 이 났는지 / 어디서 다음 시도가 이어 받았는지 사후 추적 가능합니다.
+
 map encoder를 self-forced fine-tuning 동안 고정하려면 아래처럼 켭니다. `true`이면 Generator의 `sf_loss`/anchor loss 업데이트와 generated estimator `F_psi`의 online 업데이트 모두에서 `map_encoder` 파라미터를 frozen 상태로 두고, `false`이면 기존처럼 전체 `SMARTFlowDecoder` 파라미터를 학습 대상으로 둡니다.
 
 ```bash
