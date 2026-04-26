@@ -61,7 +61,7 @@ model:
         sample_steps: 32
         sample_method: euler
         noise_scale: 1.0
-        backprop_last_k: 24
+        backprop_last_k: 4
 
 ckpt_path: null
 
