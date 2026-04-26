@@ -19,21 +19,33 @@ import torch
 def angle_between_2d_vectors(
     ctr_vector: torch.Tensor, nbr_vector: torch.Tensor
 ) -> torch.Tensor:
-    # If `nbr_vector` is exactly the zero vector (e.g. a stationary agent
-    # produces zero displacement, two agents are at the same position, or
-    # an agent overlaps a map node), both `cross` and `dot` are zero and
-    # `atan2(0, 0)` has an undefined backward (`1/(y^2+x^2) -> 1/0 -> NaN`).
-    # That NaN silently flows back into encoder weight gradients during
-    # the self-forced rollout. Add a tiny x-axis bias to the neighbor
-    # vector so the atan2 inputs are never simultaneously zero. The bias
-    # (~1e-6) shifts the computed angle by at most ~1e-6 rad relative to a
-    # well-separated input and is negligible for training.
-    nbr_safe = nbr_vector + nbr_vector.new_tensor([1.0e-6, 0.0])
+    # If the neighbor vector is exactly zero, its relative angle is undefined
+    # and atan2(0, 0) has an undefined backward. Replacing that vector with the
+    # center heading preserves the intended "no relative direction" feature as
+    # angle 0 while keeping the backward denominator non-zero.
+    ctr_xy = ctr_vector[..., :2]
+    nbr_xy = nbr_vector[..., :2]
+    fallback_ctr = torch.zeros_like(ctr_xy)
+    fallback_ctr[..., 0] = 1.0
+    ctr_norm_sq = ctr_xy.pow(2).sum(dim=-1, keepdim=True)
+    ctr_safe = torch.where(ctr_norm_sq > 1.0e-12, ctr_xy, fallback_ctr)
+    nbr_norm_sq = nbr_xy.pow(2).sum(dim=-1, keepdim=True)
+    nbr_safe = torch.where(nbr_norm_sq > 1.0e-12, nbr_xy, ctr_safe)
     return torch.atan2(
-        ctr_vector[..., 0] * nbr_safe[..., 1]
-        - ctr_vector[..., 1] * nbr_safe[..., 0],
-        (ctr_vector[..., :2] * nbr_safe[..., :2]).sum(dim=-1),
+        ctr_safe[..., 0] * nbr_safe[..., 1]
+        - ctr_safe[..., 1] * nbr_safe[..., 0],
+        (ctr_safe * nbr_safe).sum(dim=-1),
     )
+
+
+def safe_angle_from_2d_vector(vec: torch.Tensor, eps: float = 1.0e-12) -> torch.Tensor:
+    """Angle of a 2D vector with zero-vector fallback to 0 radians."""
+    xy = vec[..., :2]
+    fallback = torch.zeros_like(xy)
+    fallback[..., 0] = 1.0
+    norm_sq = xy.pow(2).sum(dim=-1, keepdim=True)
+    safe_xy = torch.where(norm_sq > eps, xy, fallback)
+    return torch.atan2(safe_xy[..., 1], safe_xy[..., 0])
 
 
 def safe_norm_2d(vec: torch.Tensor, eps: float = 1.0e-12) -> torch.Tensor:

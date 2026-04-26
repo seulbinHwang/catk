@@ -255,6 +255,7 @@ class SMARTFlow(LightningModule):
         self.self_forced_target_teacher = None
         self.self_forced_generated_estimator = None
         self._self_forced_aux_loaded_from_checkpoint = False
+        self._self_forced_backward_context: Dict[str, Tensor] | None = None
         if self.self_forced_enabled:
             self.automatic_optimization = False
             self.strict_loading = False
@@ -1745,6 +1746,24 @@ class SMARTFlow(LightningModule):
             f"nonfinite_count={nonfinite_count}, finite_abs_max={finite_abs_max}"
         )
 
+    def _set_self_forced_backward_context(self, **tensors: Tensor) -> None:
+        """Store SF tensors for error-only diagnostics without scanning them."""
+        self._self_forced_backward_context = {
+            name: tensor.detach() for name, tensor in tensors.items()
+        }
+
+    def _clear_self_forced_backward_context(self) -> None:
+        self._self_forced_backward_context = None
+
+    def _format_self_forced_backward_context(self) -> str:
+        if not self._self_forced_backward_context:
+            return ""
+        summaries = [
+            f"{name}=({self._summarize_nonfinite_tensor(tensor)})"
+            for name, tensor in self._self_forced_backward_context.items()
+        ]
+        return " Self-forced backward context: " + "; ".join(summaries)
+
     def _sample_draft_eval_future(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -2050,6 +2069,11 @@ class SMARTFlow(LightningModule):
             anchor_mask=anchor_mask,
         )
         target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
+        self._set_self_forced_backward_context(
+            committed_path_norm=committed_path_norm,
+            path_delta=path_delta,
+            target_path_norm=target_path_norm,
+        )
         sf_loss = masked_mean_square_loss(committed_path_norm, target_path_norm)
         physics_dict = self._compute_self_forced_physics_loss(
             committed_path_norm=committed_path_norm,
@@ -2062,22 +2086,30 @@ class SMARTFlow(LightningModule):
             + self.self_forced_physics_weight * physics_dict["loss"]
         )
         if not torch.isfinite(total_loss):
+            context = self._format_self_forced_backward_context()
+            self._clear_self_forced_backward_context()
             raise RuntimeError(
                 "Non-finite self-forced total_loss detected: "
                 f"{self._summarize_nonfinite_tensor(total_loss)}"
+                f"{context}"
             )
 
         generator_optimizer = self.optimizers()[0]
-        self.toggle_optimizer(generator_optimizer)
-        generator_optimizer.zero_grad(set_to_none=True)
-        self._manual_backward_without_autocast(total_loss)
-        self.clip_gradients(
-            generator_optimizer,
-            gradient_clip_val=self.self_forced_gradient_clip_val,
-            gradient_clip_algorithm="norm",
-        )
-        generator_optimizer.step()
-        self.untoggle_optimizer(generator_optimizer)
+        try:
+            self.toggle_optimizer(generator_optimizer)
+            try:
+                generator_optimizer.zero_grad(set_to_none=True)
+                self._manual_backward_without_autocast(total_loss)
+                self.clip_gradients(
+                    generator_optimizer,
+                    gradient_clip_val=self.self_forced_gradient_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+                generator_optimizer.step()
+            finally:
+                self.untoggle_optimizer(generator_optimizer)
+        finally:
+            self._clear_self_forced_backward_context()
 
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
@@ -2255,6 +2287,7 @@ open_metric_dict:
         raise RuntimeError(
             "Detected non-finite gradient after backward: "
             f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
+            f"{self._format_self_forced_backward_context()}"
         )
 
     def validation_step(self, data, batch_idx):

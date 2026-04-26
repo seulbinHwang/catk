@@ -15,6 +15,7 @@ from src.smart.tokens.agent_token_matching import (
 )
 from src.smart.utils import (
     cal_polygon_contour,
+    safe_angle_from_2d_vector,
     transform_to_global,
     transform_to_local,
     wrap_angle,
@@ -571,8 +572,7 @@ class ContinuousCommitBridge:
         first_chunk = y_hat_norm[:, : self.commit_steps].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m
 
-        cos_sin = F.normalize(first_chunk[..., 2:4], dim=-1)
-        delta_head = torch.atan2(cos_sin[..., 1], cos_sin[..., 0])
+        delta_head = safe_angle_from_2d_vector(first_chunk[..., 2:4])
 
         commit_pos, _ = transform_to_global(
             pos_local=first_chunk[..., :2],
@@ -611,9 +611,8 @@ class ContinuousCommitBridge:
             pos_now=current_pos,
             head_now=current_head,
         )
-        future_dir = F.normalize(y_hat_norm[..., 2:4], dim=-1, eps=1.0e-6)
         future_head = wrap_angle(
-            current_head.unsqueeze(1) + torch.atan2(future_dir[..., 1], future_dir[..., 0])
+            current_head.unsqueeze(1) + safe_angle_from_2d_vector(y_hat_norm[..., 2:4])
         )
         return future_pos, future_head
 
