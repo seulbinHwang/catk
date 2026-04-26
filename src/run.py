@@ -12,7 +12,7 @@
 # its affiliates is strictly prohibited.
 
 import os
-from typing import Any, List
+from typing import Any, List, Sequence
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -47,6 +47,12 @@ log = RankedLogger(__name__, rank_zero_only=True)
 torch.set_float32_matmul_precision("high")
 
 
+def _format_key_list(keys: Sequence[str], max_items: int = 20) -> str:
+    shown = list(keys[:max_items])
+    suffix = "" if len(keys) <= max_items else f", ... (+{len(keys) - max_items} more)"
+    return ", ".join(shown) + suffix
+
+
 def _is_self_forced_enabled(cfg: DictConfig) -> bool:
     model_cfg = cfg.get("model")
     model_config = model_cfg.get("model_config") if model_cfg else None
@@ -61,7 +67,61 @@ def _load_lightning_checkpoint(ckpt_path: str) -> dict[str, Any]:
             "ckpt_path must point to a Lightning checkpoint dictionary containing "
             f"a 'state_dict' entry, got {ckpt_path!r}."
         )
+    if not isinstance(checkpoint["state_dict"], dict):
+        raise ValueError(
+            "ckpt_path must point to a Lightning checkpoint whose 'state_dict' is a mapping, "
+            f"got {type(checkpoint['state_dict']).__name__} from {ckpt_path!r}."
+        )
     return checkpoint
+
+
+def _is_self_forced_auxiliary_key(key: str) -> bool:
+    return (
+        key.startswith("self_forced_target_teacher.")
+        or key.startswith("self_forced_generated_estimator.")
+        or ".self_forced_target_teacher." in key
+        or ".self_forced_generated_estimator." in key
+    )
+
+
+def _validate_finetune_loaded_trainable_params(
+    model: LightningModule,
+    missing_keys: Sequence[str],
+    unexpected_keys: Sequence[str],
+    *,
+    allow_missing_self_forced_auxiliary: bool = False,
+) -> None:
+    trainable_param_names = {
+        name for name, param in model.named_parameters() if param.requires_grad
+    }
+    missing_trainable = sorted(set(missing_keys) & trainable_param_names)
+    if allow_missing_self_forced_auxiliary:
+        missing_trainable = [
+            key for key in missing_trainable if not _is_self_forced_auxiliary_key(key)
+        ]
+    if missing_trainable:
+        raise RuntimeError(
+            "action=finetune loaded the checkpoint with strict=False, but the checkpoint "
+            "is missing parameter(s) that are trainable in this fine-tuning run. "
+            "Starting would leave those trainable weights randomly initialized. "
+            f"Missing trainable key(s): {_format_key_list(missing_trainable)}"
+        )
+
+    non_aux_missing = (
+        [key for key in missing_keys if not _is_self_forced_auxiliary_key(str(key))]
+        if allow_missing_self_forced_auxiliary
+        else list(missing_keys)
+    )
+    if non_aux_missing:
+        log.warning(
+            "Ignoring non-trainable missing checkpoint key(s) during finetune load: "
+            f"{_format_key_list(non_aux_missing)}"
+        )
+    if unexpected_keys:
+        log.warning(
+            "Ignoring unexpected checkpoint key(s) during finetune load: "
+            f"{_format_key_list(list(unexpected_keys))}"
+        )
 
 
 def _checkpoint_has_self_forced_auxiliary_state(checkpoint: dict[str, Any]) -> bool:
@@ -264,7 +324,13 @@ def run(cfg: DictConfig) -> None:
         checkpoint = _load_lightning_checkpoint(str(cfg.ckpt_path))
         _validate_self_forced_checkpoint_action(cfg, checkpoint)
         log.info("Starting finetuning!")
-        model.load_state_dict(checkpoint["state_dict"], strict=False)
+        load_result = model.load_state_dict(checkpoint["state_dict"], strict=False)
+        _validate_finetune_loaded_trainable_params(
+            model=model,
+            missing_keys=load_result.missing_keys,
+            unexpected_keys=load_result.unexpected_keys,
+            allow_missing_self_forced_auxiliary=_is_self_forced_enabled(cfg),
+        )
         trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")
