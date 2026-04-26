@@ -5,7 +5,7 @@ import gc
 import hashlib
 import math
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Any, Dict, Sequence
 
 import hydra
 import torch
@@ -254,6 +254,7 @@ class SMARTFlow(LightningModule):
         self.self_forced_physics_force_fp32 = False
         self.self_forced_target_teacher = None
         self.self_forced_generated_estimator = None
+        self._self_forced_aux_loaded_from_checkpoint = False
         if self.self_forced_enabled:
             self.automatic_optimization = False
             self.strict_loading = False
@@ -1211,6 +1212,20 @@ class SMARTFlow(LightningModule):
                 continue
             map_encoder.requires_grad_(False)
 
+    def _set_self_forced_auxiliary_modes(self) -> None:
+        """self-forced 보조 모델의 train/frozen 상태를 정돈합니다.
+
+        Returns:
+            None
+        """
+        if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
+            return
+        self.self_forced_target_teacher.requires_grad_(False)
+        self.self_forced_target_teacher.eval()
+        self.self_forced_generated_estimator.requires_grad_(True)
+        self.self_forced_generated_estimator.train()
+        self._apply_self_forced_map_encoder_freeze()
+
     def _sync_self_forced_auxiliary_models(self) -> None:
         """Generator weight를 frozen teacher와 generated estimator의 시작점으로 복사합니다.
 
@@ -1219,6 +1234,8 @@ class SMARTFlow(LightningModule):
             checkpoint가 이미 ``self.encoder`` 로 로드된 뒤이므로, 그 weight를 그대로
             ``F_rho`` 와 ``F_psi`` 의 초기 weight로 씁니다. ``F_rho`` 는 이후 고정하고,
             ``F_psi`` 는 generated self-rollout으로만 online 업데이트합니다.
+            단, self-forced checkpoint에서 resume하는 경우에는 checkpoint 안의
+            ``F_rho`` / ``F_psi`` state를 보존해야 하므로 재복사하지 않습니다.
 
         Returns:
             None
@@ -1227,17 +1244,36 @@ class SMARTFlow(LightningModule):
             return
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             return
+        if self._self_forced_aux_loaded_from_checkpoint:
+            self._set_self_forced_auxiliary_modes()
+            return
         if not self.self_forced_initialize_aux_on_fit_start:
             return
 
         encoder_state = self.encoder.state_dict()
         self.self_forced_target_teacher.load_state_dict(encoder_state)
         self.self_forced_generated_estimator.load_state_dict(encoder_state)
-        self.self_forced_target_teacher.requires_grad_(False)
-        self.self_forced_target_teacher.eval()
-        self.self_forced_generated_estimator.requires_grad_(True)
-        self.self_forced_generated_estimator.train()
-        self._apply_self_forced_map_encoder_freeze()
+        self._set_self_forced_auxiliary_modes()
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """self-forced resume 여부를 기록합니다.
+
+        Args:
+            checkpoint: Lightning checkpoint dictionary입니다.
+
+        Returns:
+            None
+        """
+        state_dict = checkpoint.get("state_dict", {})
+        has_target_teacher = any(
+            key.startswith("self_forced_target_teacher.") for key in state_dict
+        )
+        has_generated_estimator = any(
+            key.startswith("self_forced_generated_estimator.") for key in state_dict
+        )
+        self._self_forced_aux_loaded_from_checkpoint = bool(
+            self.self_forced_enabled and has_target_teacher and has_generated_estimator
+        )
 
     def _manual_backward_without_autocast(self, loss: Tensor) -> None:
         """manual optimization의 backward만 autocast 밖에서 실행합니다.
