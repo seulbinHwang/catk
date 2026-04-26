@@ -634,6 +634,8 @@ loss와 로그는 아래처럼 보면 됩니다.
 - `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
 - 현재 설정은 `max_weight=1.0`이라서 바깥 가중치 `gamma_draft` 역할만 맡고, 실제 scale `0.005`는 코드에 고정으로 들어갑니다.
 - 기본 구현은 trainer가 `bf16-mixed`여도 inverse feasibility 계산 구간만 fp32 subregion에서 수행합니다.
+- DRaFT physics sample은 FM anchor loss용 train-mode forward를 재사용하지 않고, 생성 모델을 eval mode로 잠깐 바꾼 상태에서 gradient를 유지한 채 다시 만듭니다.
+- 따라서 dropout과 history drop이 섞인 학습용 trajectory가 아니라 validation/test와 같은 deterministic inference trajectory를 physics loss로 보정합니다.
 - 차량 / 자전거는 예측 20개 점을 다시
 - `forward speed`, `curvature`, `steering angle`, `steering rate`, `forward acceleration`으로 바꿔 penalty를 계산합니다.
 - wheelbase는 agent box length에 각각 `0.60`, `0.85`를 곱해서 만듭니다.

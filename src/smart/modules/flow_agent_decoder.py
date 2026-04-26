@@ -374,6 +374,30 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             return anchor_hidden.new_zeros((0, anchor_hidden.shape[-1]))
         return torch.cat(packed_hidden, dim=0)
 
+    def build_anchor_context(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        anchor_mask: torch.Tensor,
+        flow_clean_norm: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Open-loop anchor sampling에 필요한 context hidden만 계산합니다."""
+        ctx_hidden_pack = self._encode_context(
+            agent_token_index=tokenized_agent["ctx_sampled_idx"],
+            pos_a=tokenized_agent["ctx_sampled_pos"],
+            head_a=tokenized_agent["ctx_sampled_heading"],
+            mask=tokenized_agent["ctx_valid"],
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        return {
+            "flow_clean_norm": flow_clean_norm,
+            "ctx_hidden_pack": ctx_hidden_pack,
+            "anchor_hidden": anchor_hidden,
+            "anchor_mask": anchor_mask,
+        }
+
 
     def _sample_open_loop_future_from_hidden(
         self,
@@ -603,15 +627,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_mask: torch.Tensor,
         flow_clean_norm: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        ctx_hidden_pack = self._encode_context(
-            agent_token_index=tokenized_agent["ctx_sampled_idx"],
-            pos_a=tokenized_agent["ctx_sampled_pos"],
-            head_a=tokenized_agent["ctx_sampled_heading"],
-            mask=tokenized_agent["ctx_valid"],
+        anchor_context = self.build_anchor_context(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            anchor_mask=anchor_mask,
+            flow_clean_norm=flow_clean_norm,
         )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        ctx_hidden_pack = anchor_context["ctx_hidden_pack"]
+        anchor_hidden = anchor_context["anchor_hidden"]
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
 
         if flow_clean_norm.numel() == 0:
