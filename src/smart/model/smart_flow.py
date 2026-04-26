@@ -231,6 +231,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
+        self.self_forced_gradient_clip_val = (
+            float(getattr(self.self_forced_config, "gradient_clip_val", 1.0))
+            if self.self_forced_config is not None
+            else 1.0
+        )
         self.self_forced_sampling = (
             getattr(self.self_forced_config, "sampling", self.validation_rollout_sampling)
             if self.self_forced_config is not None
@@ -1436,7 +1441,7 @@ class SMARTFlow(LightningModule):
             self.manual_backward(last_loss)
             self.clip_gradients(
                 optimizer,
-                gradient_clip_val=float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0),
+                gradient_clip_val=self.self_forced_gradient_clip_val,
                 gradient_clip_algorithm="norm",
             )
             optimizer.step()
@@ -1838,7 +1843,7 @@ class SMARTFlow(LightningModule):
         self.manual_backward(total_loss)
         self.clip_gradients(
             generator_optimizer,
-            gradient_clip_val=float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0),
+            gradient_clip_val=self.self_forced_gradient_clip_val,
             gradient_clip_algorithm="norm",
         )
         generator_optimizer.step()
@@ -1956,7 +1961,7 @@ class SMARTFlow(LightningModule):
         self.manual_backward(total_loss)
         self.clip_gradients(
             generator_optimizer,
-            gradient_clip_val=float(getattr(self.trainer, "gradient_clip_val", 0.0) or 0.0),
+            gradient_clip_val=self.self_forced_gradient_clip_val,
             gradient_clip_algorithm="norm",
         )
         generator_optimizer.step()

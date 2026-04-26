@@ -75,6 +75,11 @@ model_config:
     estimator_updates_per_step: 5
     initialize_aux_from_generator_on_fit_start: true
     freeze_map_encoder: true
+    # Manual gradient clip used inside self-forced training_step / estimator
+    # update. Lightning's `Trainer(gradient_clip_val=...)` cannot be used
+    # because manual optimization is on; the model reads this value and
+    # applies clip_gradients() itself.
+    gradient_clip_val: 1.0
     sampling:
       sample_steps: 32
       sample_method: euler
