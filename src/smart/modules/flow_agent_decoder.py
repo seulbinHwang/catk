@@ -1097,11 +1097,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     "sample_method",
                     self.flow_ode.solver_method,
                 )
+                flow_sample_backprop_last_k = getattr(
+                    sampling_scheme,
+                    "backprop_last_k",
+                    None,
+                )
                 y_hat_norm = self.flow_ode.generate(
                     x_init=x_init_norm,
                     model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
                     steps=flow_sample_steps,
                     method=flow_sample_method,
+                    backprop_last_k=flow_sample_backprop_last_k,
                 )
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]

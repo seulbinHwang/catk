@@ -856,7 +856,7 @@ torchrun \
 
 중단된 self-forced run을 이어서 학습할 때만 `action=fit ckpt_path=/path/to/self_forced_run/last.ckpt` 를 사용하세요. 이 경우에는 Lightning이 optimizer, lr scheduler, epoch, global step까지 함께 복원합니다. checkpoint 안에 `self_forced_target_teacher` 와 `self_forced_generated_estimator` state가 있으면, fit 시작 hook은 두 보조 모델을 현재 Generator weight로 다시 덮어쓰지 않고 checkpoint의 `F_rho` / `F_psi` 상태를 보존합니다.
 
-`train_batch_size=8` 은 self-rollout (32-step Euler, 전체 step backprop) 부담을 고려한 보수적 시작점입니다. 실측해서 여유가 있으면 올리되, `model.model_config.self_forced.sampling.backprop_last_k` 를 줄이면 메모리를 더 절약할 수 있습니다.
+`train_batch_size=8` 은 self-rollout (32-step Euler, 기본 마지막 24 step backprop) 부담을 고려한 보수적 시작점입니다. closed-loop self-forced rollout 도 `model.model_config.self_forced.sampling.backprop_last_k` 를 실제 flow ODE sampling 에 전달하므로, 이 값을 줄이면 메모리를 더 절약할 수 있습니다.
 
 ```bash
 # self-rollout backprop 을 마지막 4 step 에만 남기고 batch 키우기
@@ -1324,7 +1324,7 @@ K commit block 수 = flow_window_steps / 5
 - `F_rho`: fresh fine-tuning 시작 시점에 pretrained `SMARTFlowDecoder` 를 복사해 만드는 frozen target path-flow teacher 입니다.
 - `F_psi`: `F_rho` 와 같은 pretrained decoder weight 로 초기화한 generated path-flow estimator 이며, detached committed self-rollout 위에서 online 으로 업데이트됩니다.
 - self-forced checkpoint resume 에서는 checkpoint에 저장된 `F_rho` / `F_psi` state를 그대로 보존합니다. 즉, resume 직후 fit 시작 hook이 두 보조 모델을 현재 Generator weight로 다시 덮어쓰지 않습니다.
-- inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로.
+- inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 각 flow ODE sample 은 `model.model_config.self_forced.sampling.backprop_last_k` 를 존중해 마지막 K step에만 gradient를 남길 수 있습니다.
 - 같은 perturbed self-rollout state 에서 계산한 DMD식 score difference
   `s_\rho - s_\psi = \tau (\hat U_\rho - \hat U_\psi) / \sigma_\tau` 를 그대로 쓰지 않고,
   `X_\tau = \tau Y_\theta + \sigma_\tau \epsilon` 의 연결 관계를 반영해
