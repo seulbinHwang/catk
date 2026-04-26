@@ -660,7 +660,7 @@ torchrun \
 중요한 차이:
 
 - 첫 fine-tuning 시작은 반드시 `action=finetune`를 사용합니다.
-- 현재 구현은 `torch.load(ckpt)["state_dict"]`를 `strict=False`로 읽은 뒤 `trainer.fit(...)`을 새로 시작합니다.
+- 현재 구현은 `torch.load(ckpt)["state_dict"]`를 `strict=False`로 읽은 뒤 `trainer.fit(...)`을 새로 시작합니다. 단, 현재 fine-tuning에서 `requires_grad=True` 인 파라미터가 checkpoint에 없으면 실행을 중단합니다.
 - 즉, optimizer / lr scheduler / epoch / global step은 이어받지 않습니다.
 - 반대로 `action=fit`에 `ckpt_path=...`를 주면 **resume training**으로 동작합니다. 이 경우 이전 run의 optimizer 상태까지 이어받습니다.
 - 따라서 pretrained checkpoint에서 fine-tuning을 처음 시작할 때만 `action=finetune`를 쓰고,
@@ -670,15 +670,17 @@ torchrun \
 fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 
 - 기본적으로 encoder 전체를 먼저 freeze합니다.
-- 그 다음 `agent_encoder.flow_decoder.step_refiner`만 unfreeze합니다.
-- 추가로 `agent_encoder.flow_decoder.velocity_head`만 unfreeze합니다.
-- 즉 fine-tuning에서는 map encoder, agent embedding, attention layers는 그대로 frozen 상태를 유지합니다.
+- `finetune_draft_flow` preset은 `train_full_flow_decoder_only=true`라서
+- `agent_encoder.flow_decoder` 전체를 다시 unfreeze합니다.
+- 즉 fine-tuning에서는 map encoder, agent embedding, attention layers는 그대로 frozen 상태를 유지하고,
+- flow decoder 전체만 trainable 상태로 둡니다.
 
 `finetune_draft_flow` 기본 설정은 아래와 같습니다.
 
 - learning rate: `2e-4`
 - max epochs: `32`
-- train batch size: `48`
+- train batch size: `48` per GPU
+- effective global train batch size: `288` with 6 GPUs
 - val batch size: `16`
 - validation 주기: `16` epoch마다
 
@@ -689,8 +691,13 @@ loss와 로그는 아래처럼 보면 됩니다.
 - `train/loss_phys`와 `train/loss_if`는 같은 값이고, 새 inverse feasibility penalty `L_if`를 뜻합니다.
 - 실제 학습식은 `train/loss = train/loss_fm + train/draft_weight * 0.005 * train/loss_if` 입니다.
 - `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
-- 현재 설정은 `max_weight=1.0`이라서 바깥 가중치 `gamma_draft` 역할만 맡고, 실제 scale `0.005`는 코드에 고정으로 들어갑니다.
+- 현재 설정은 `max_weight=0.1`이고, 실제 scale `0.005`는 코드에 고정으로 들어갑니다.
+- 따라서 기본 설정의 physics loss 최대 가중치는 `0.1 * 0.005 = 0.0005`입니다.
 - 기본 구현은 trainer가 `bf16-mixed`여도 inverse feasibility 계산 구간만 fp32 subregion에서 수행합니다.
+- DRaFT physics sample은 FM anchor loss용 train-mode forward를 재사용하지 않고, 
+- 생성 모델을 eval mode로 잠깐 바꾼 상태에서 gradient를 유지한 채 다시 만듭니다.
+- 따라서 dropout과 history drop이 섞인 학습용 trajectory가 아니라 
+- validation/test와 같은 deterministic inference trajectory를 physics loss로 보정합니다.
 - 차량 / 자전거는 예측 20개 점을 다시
 - `forward speed`, `curvature`, `steering angle`, `steering rate`, `forward acceleration`으로 바꿔 penalty를 계산합니다.
 - wheelbase는 agent box length에 각각 `0.60`, `0.85`를 곱해서 만듭니다.
@@ -698,7 +705,7 @@ loss와 로그는 아래처럼 보면 됩니다.
 - heading은 속도가 `0.5 m/s`보다 클 때만 약하게 봅니다.
 - 첫 제어량은 모두 `prev_control`을 사용합니다.
 - 차량 / 자전거는 `v_pre`와 `delta_pre`를 복원해서 첫 가속도와 첫 steering rate를 만들고,
-- 사람은 `prev_control[..., :2]`를 그대로 첫 2차원 가속도 계산에 씁니다.
+- 사람은 `prev_control[..., :2]`를 `prev_control[..., 2]`의 yaw-rate로 현재 anchor-local 좌표계에 회전한 뒤 첫 2차원 가속도 계산에 씁니다.
 - hard 항은 속도, 가속도, steering angle, steering rate, lateral acceleration 제한을 넘는 만큼 `relu(z)^2`로 계산합니다.
 - soft 항은 jerk에 가까운 거칠기 값입니다. 기본값에서는 **GT roughness보다 큰 만큼만** loss에 반영하고,
   `model.model_config.draft.physics.compare_softness_to_gt=false` 로 두면
@@ -715,7 +722,7 @@ loss와 로그는 아래처럼 보면 됩니다.
 
 - 공통: `soft_weight=0.25`
 - vehicle: `v_max=35.0`, `a_max=8.0`, `a_lat_max=4.2`, `wheelbase_scale=0.60`, `steer_max=0.55 rad`, `steer_rate_max=0.8 rad/s`
-- bicycle: `v_max=22.0`, `a_max=5.5`, `a_lat_max=4.4`, `wheelbase_scale=0.85`, `steer_max=1.00 rad`, `steer_rate_max=1.5 rad/s`
+- bicycle: `v_max=22.0`, `a_max=5.5`, `a_lat_max=4.4`, `wheelbase_scale=0.85`, `steer_max=0.90 rad`, `steer_rate_max=1.4 rad/s`
 - pedestrian: `v_max=5.0`, `a_max=4.7`, `heading_speed_threshold=0.5 m/s`, `heading_weight=0.05`
 
 자주 바꾸는 override 예시는 아래와 같습니다.
