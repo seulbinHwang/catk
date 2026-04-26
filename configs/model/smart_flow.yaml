@@ -74,6 +74,7 @@ model_config:
     generated_estimator_lr: ${model.model_config.lr}
     estimator_updates_per_step: 5
     initialize_aux_from_generator_on_fit_start: true
+    freeze_map_encoder: false
     sampling:
       sample_steps: 32
       sample_method: euler

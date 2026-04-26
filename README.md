@@ -833,7 +833,7 @@ torchrun \
 ### 5.10 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
-- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `estimator_updates_per_step=5`, sampling = Euler 32-step / `noise_scale=1.0` / `backprop_last_k=null`, `train_batch_size=8`)
+- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `estimator_updates_per_step=5`, `freeze_map_encoder=false`, sampling = Euler 32-step / `noise_scale=1.0` / `backprop_last_k=null`, `train_batch_size=8`)
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
 - 전제: `ckpt_path` 에는 같은 `flow_window_steps` 로 pretrain 된 Generator checkpoint 를 넣습니다. 모델 default 는 `flow_window_steps=20` (2초) 이고, ckpt 가 2초 horizon 으로 pretrain 된 경우 override 하지 않는 편이 안전합니다.
 
@@ -857,6 +857,12 @@ torchrun \
 ```bash
 # self-rollout backprop 을 마지막 4 step 에만 남기고 batch 키우기
 ... data.train_batch_size=12 model.model_config.self_forced.sampling.backprop_last_k=4
+```
+
+map encoder를 self-forced fine-tuning 동안 고정하려면 아래처럼 켭니다. `true`이면 Generator의 `sf_loss`/anchor loss 업데이트와 generated estimator `F_psi`의 online 업데이트 모두에서 `map_encoder` 파라미터를 frozen 상태로 두고, `false`이면 기존처럼 전체 `SMARTFlowDecoder` 파라미터를 학습 대상으로 둡니다.
+
+```bash
+... model.model_config.self_forced.freeze_map_encoder=true
 ```
 
 ## 6. 평가와 추론
@@ -1316,6 +1322,7 @@ K commit block 수 = flow_window_steps / 5
   path-space 방향 `d_Y = \tau (s_\rho - s_\psi)` 으로 committed self-rollout 을 밀어주는 target-shift loss.
 - committed self-rollout 에 대해서만 걸리는 control-space physics regularization (선택 사항). `model.model_config.self_forced.use_control_space_physics_regularization` 로 제어합니다.
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.anchor_weight` 로 제어합니다.
+- 선택적 map encoder freeze. `model.model_config.self_forced.freeze_map_encoder=true` 로 두면 Generator optimizer와 generated estimator `F_psi` optimizer 모두에서 `map_encoder` 파라미터를 제외합니다. 기본값 `false` 는 기존처럼 전체 모델을 fine-tuning 합니다.
 
 최종 inference 모델은 여전히 fine-tuning 된 Generator 하나뿐입니다. `F_rho` 와 `F_psi` 는 학습 시점 보조 모델이며 submission export 에는 사용하지 않습니다.
 

@@ -226,6 +226,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else True
         )
+        self.self_forced_freeze_map_encoder = (
+            bool(getattr(self.self_forced_config, "freeze_map_encoder", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_sampling = (
             getattr(self.self_forced_config, "sampling", self.validation_rollout_sampling)
             if self.self_forced_config is not None
@@ -309,6 +314,7 @@ class SMARTFlow(LightningModule):
                 self.self_forced_regularizer = None
         else:
             self.self_forced_regularizer = None
+        self._apply_self_forced_map_encoder_freeze()
 
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
@@ -1184,6 +1190,22 @@ class SMARTFlow(LightningModule):
             and self.self_forced_generated_estimator is not None
         )
 
+    def _apply_self_forced_map_encoder_freeze(self) -> None:
+        """self-forced 설정에 따라 Generator와 F_psi의 map encoder를 고정합니다.
+
+        Returns:
+            None
+        """
+        if not self.self_forced_enabled or not self.self_forced_freeze_map_encoder:
+            return
+        for decoder in (self.encoder, self.self_forced_generated_estimator):
+            if decoder is None:
+                continue
+            map_encoder = getattr(decoder, "map_encoder", None)
+            if map_encoder is None:
+                continue
+            map_encoder.requires_grad_(False)
+
     def _sync_self_forced_auxiliary_models(self) -> None:
         """Generator weight를 frozen teacher와 generated estimator의 시작점으로 복사합니다.
 
@@ -1210,6 +1232,7 @@ class SMARTFlow(LightningModule):
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.requires_grad_(True)
         self.self_forced_generated_estimator.train()
+        self._apply_self_forced_map_encoder_freeze()
 
     def _set_token_processor_training_mode(self, is_training: bool) -> None:
         """token processor의 train/eval 상태를 안전하게 바꿉니다.
@@ -2275,6 +2298,7 @@ open_metric_dict:
             )
 
         if self.self_forced_enabled:
+            self._apply_self_forced_map_encoder_freeze()
             generator_params = [param for param in self.encoder.parameters() if param.requires_grad]
             if not generator_params:
                 raise RuntimeError("No trainable generator parameters found for self-forced optimization.")
