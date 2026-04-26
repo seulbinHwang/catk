@@ -1022,7 +1022,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     mask=valid_window,
                     inference_mask=inference_mask,
                 )
-                edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
+                # r_t was built from the original edge_index_t, so keep it immutable for autograd.
+                edge_index_t_current = torch.stack(
+                    [
+                        edge_index_t[0],
+                        (edge_index_t[1] + 1) // n_step - 1,
+                    ],
+                    dim=0,
+                )
 
                 edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
                     pos_pl=map_feature["position"],
@@ -1052,7 +1059,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     current_hidden = self.t_attn_layers[i](
                         (temporal_feat.flatten(0, 1), temporal_feat[:, -1]),
                         r_t,
-                        edge_index_t,
+                        edge_index_t_current,
                     )
                     current_hidden = self.pt2a_attn_layers[i](
                         (map_feature["pt_token"], current_hidden),
