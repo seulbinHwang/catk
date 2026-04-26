@@ -93,7 +93,14 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 8
+  # Measured ceiling on 6x H100 80GB with bf16-mixed and the preset's
+  # rollout setup (32-step Euler, backprop_last_k=24, 5 estimator updates):
+  #   bs=20 -> rank 0 peak 74.85% (~59 GB), 4.35 s/step (safe; recommended)
+  #   bs=22 -> rank 0 peak 80.50% (~64 GB), 4.71 s/step (≤2% faster, tight)
+  #   bs=24 -> rank 1 OOM at step 2 (cross-rank variance pushes >79 GB)
+  # bs=20 leaves ~10 GB headroom against typical 5-10 GB per-rank batch
+  # variance, and gives the lowest 1-epoch wall time without OOM risk.
+  train_batch_size: 20
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4

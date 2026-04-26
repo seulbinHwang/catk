@@ -840,7 +840,7 @@ torchrun \
 ### 5.10 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
-- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `estimator_updates_per_step=5`, `freeze_map_encoder=true`, sampling = Euler 32-step / `noise_scale=1.0` / `backprop_last_k=24`, `train_batch_size=8`)
+- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `estimator_updates_per_step=5`, `freeze_map_encoder=true`, sampling = Euler 32-step / `noise_scale=1.0` / `backprop_last_k=24`). 6x H100 80GB 한정으로 `train_batch_size=20` 을 preset 기본으로 박아 두었습니다 — 30-step probe 실측에서 rank 0 peak 74.85% (~59 GB), 4.35 s/step. bs=22 는 80.5% 까지 올라가 cross-rank 변동성 (5–10 GB) 대비 margin 이 부족하고 throughput 이득은 ~1.5% 에 불과하며, bs=24 는 step 2 에서 rank 1 OOM 으로 죽습니다.
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
 - 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/scheduler/epoch 를 resume하지 않고 pretrained weight만 로드합니다.
 - 전제: `ckpt_path` 에는 같은 `flow_window_steps` 로 pretrain 된 Generator checkpoint 를 넣습니다. 모델 default 는 `flow_window_steps=20` (2초) 이고, ckpt 가 2초 horizon 으로 pretrain 된 경우 override 하지 않는 편이 안전합니다.
@@ -865,11 +865,11 @@ torchrun \
 
 보호 장치도 있습니다. self-forced가 켜진 상태에서 `action=finetune` 에 self-forced checkpoint를 넣으면 실행이 중단됩니다. 반대로 `action=fit` 에 self-forced 보조 state가 없는 pretrained checkpoint를 넣어도 중단됩니다. 즉, pretrained Generator에서 처음 시작할 때는 `action=finetune`, self-forced run을 이어갈 때는 `action=fit` 으로 분리해야 합니다.
 
-`train_batch_size=8` 은 self-rollout (32-step Euler, 기본 마지막 24 step backprop) 부담을 고려한 보수적 시작점입니다. closed-loop self-forced rollout 도 `model.model_config.self_forced.sampling.backprop_last_k` 를 실제 flow ODE sampling 에 전달하므로, 이 값을 줄이면 메모리를 더 절약할 수 있습니다.
+`train_batch_size=20` 은 6x H100 80GB 에서 self-rollout (32-step Euler, 기본 마지막 24 step backprop) + 5x estimator 업데이트 부담을 고려한 측정 ceiling 입니다. WOMD train set 486,995 scenarios 기준 1 epoch 약 4,058 step ≈ 4.9 시간 (mean 4.35 s/step). closed-loop self-forced rollout 이 `model.model_config.self_forced.sampling.backprop_last_k` 를 실제 flow ODE sampling 에 전달하므로, 이 값을 줄이면 메모리를 더 절약하고 더 큰 batch 도 가능합니다.
 
 ```bash
-# self-rollout backprop 을 마지막 4 step 에만 남기고 batch 키우기
-... data.train_batch_size=12 model.model_config.self_forced.sampling.backprop_last_k=4
+# self-rollout backprop 을 마지막 4 step 에만 남기고 batch 더 키우기 (실측 후 사용)
+... data.train_batch_size=24 model.model_config.self_forced.sampling.backprop_last_k=4
 ```
 
 map encoder를 self-forced fine-tuning 동안 고정하려면 아래처럼 켭니다. `true`이면 Generator의 `sf_loss`/anchor loss 업데이트와 generated estimator `F_psi`의 online 업데이트 모두에서 `map_encoder` 파라미터를 frozen 상태로 두고, `false`이면 기존처럼 전체 `SMARTFlowDecoder` 파라미터를 학습 대상으로 둡니다.
