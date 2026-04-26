@@ -1226,6 +1226,33 @@ class SMARTFlow(LightningModule):
         self.self_forced_generated_estimator.eval()
         self._apply_self_forced_map_encoder_freeze()
 
+    @staticmethod
+    def _switch_module_to_eval_preserving_modes(module: nn.Module) -> Dict[nn.Module, bool]:
+        """autograd는 유지한 채 module을 eval mode로 바꾸고 기존 mode를 기록합니다.
+
+        Args:
+            module: eval mode로 잠깐 전환할 모듈입니다.
+
+        Returns:
+            Dict[nn.Module, bool]: 각 하위 모듈의 기존 ``training`` 플래그입니다.
+        """
+        training_modes = {submodule: submodule.training for submodule in module.modules()}
+        module.eval()
+        return training_modes
+
+    @staticmethod
+    def _restore_module_training_modes(training_modes: Dict[nn.Module, bool]) -> None:
+        """저장해둔 train/eval mode를 하위 모듈별로 복원합니다.
+
+        Args:
+            training_modes: ``_switch_module_to_eval_preserving_modes`` 의 반환값입니다.
+
+        Returns:
+            None
+        """
+        for module, was_training in training_modes.items():
+            module.train(was_training)
+
     def _sync_self_forced_auxiliary_models(self) -> None:
         """Generator weight를 frozen teacher와 generated estimator의 시작점으로 복사합니다.
 
@@ -1411,15 +1438,19 @@ class SMARTFlow(LightningModule):
             Dict[str, Tensor]: closed-loop rollout 결과입니다. ``pred_traj_10hz`` 와
             ``pred_head_10hz`` 는 실제로 commit된 N초 rollout입니다.
         """
-        map_feature = self.encoder.encode_map(tokenized_map)
-        rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
-        return self.encoder.training_rollout_from_cache(
-            rollout_cache=rollout_cache,
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            sampling_scheme=self.self_forced_sampling,
-            rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
-        )
+        encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
+        try:
+            map_feature = self.encoder.encode_map(tokenized_map)
+            rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
+            return self.encoder.training_rollout_from_cache(
+                rollout_cache=rollout_cache,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                sampling_scheme=self.self_forced_sampling,
+                rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
+            )
+        finally:
+            self._restore_module_training_modes(encoder_modes)
 
     def _pack_self_forced_committed_rollout(
         self,
