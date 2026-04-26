@@ -460,7 +460,7 @@ class DraftPhysicsRegularizer(nn.Module):
         vel_vec = (pos_seq[:, 1:] - pos_seq[:, :-1]) / self.dt
         speed = torch.linalg.norm(vel_vec, dim=-1)
 
-        prev_vel = prev_control[:, :2]
+        prev_vel = self._prev_body_velocity_to_anchor_local(prev_control)
         prev_valid = prev_control_valid.to(dtype=future_norm.dtype).unsqueeze(-1)
         accel_vec = vel_vec.new_zeros(vel_vec.shape)
         accel_vec[:, 0] = prev_valid * (vel_vec[:, 0] - prev_vel) / self.dt
@@ -501,6 +501,27 @@ class DraftPhysicsRegularizer(nn.Module):
             "accel_excess_mps2": self._mean_over_time(torch.relu(accel - a_max)),
             "heading_error_deg": heading_error_deg,
         }
+
+    def _prev_body_velocity_to_anchor_local(self, prev_control: Tensor) -> Tensor:
+        """직전 body-frame 속도를 현재 anchor-local 2D 속도로 회전합니다.
+
+        ``prev_control[..., :2]`` 는 anchor 직전 구간의 previous-heading body
+        frame 속도입니다. pedestrian physics 의 ``vel_vec`` 는 현재 anchor 기준
+        local frame 이므로 첫 acceleration 을 계산하기 전에 같은 좌표계로 맞춥니다.
+        ``prev_control[..., 2]`` 는 직전 heading 에서 현재 heading 으로 온 yaw rate라서
+        previous heading 의 current-anchor local 각도는 ``-omega * dt`` 입니다.
+        """
+        prev_body_vel = prev_control[:, :2]
+        prev_head_local = -prev_control[:, 2] * self.dt
+        cos_prev = prev_head_local.cos()
+        sin_prev = prev_head_local.sin()
+        return torch.stack(
+            [
+                prev_body_vel[:, 0] * cos_prev - prev_body_vel[:, 1] * sin_prev,
+                prev_body_vel[:, 0] * sin_prev + prev_body_vel[:, 1] * cos_prev,
+            ],
+            dim=-1,
+        )
 
     def _select_limit(
         self,

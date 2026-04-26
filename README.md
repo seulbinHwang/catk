@@ -641,7 +641,7 @@ loss와 로그는 아래처럼 보면 됩니다.
 - heading은 속도가 `0.5 m/s`보다 클 때만 약하게 봅니다.
 - 첫 제어량은 모두 `prev_control`을 사용합니다.
 - 차량 / 자전거는 `v_pre`와 `delta_pre`를 복원해서 첫 가속도와 첫 steering rate를 만들고,
-- 사람은 `prev_control[..., :2]`를 그대로 첫 2차원 가속도 계산에 씁니다.
+- 사람은 `prev_control[..., :2]`를 `prev_control[..., 2]`의 yaw-rate로 현재 anchor-local 좌표계에 회전한 뒤 첫 2차원 가속도 계산에 씁니다.
 - hard 항은 속도, 가속도, steering angle, steering rate, lateral acceleration 제한을 넘는 만큼 `relu(z)^2`로 계산합니다.
 - soft 항은 jerk에 가까운 거칠기 값입니다. 기본값에서는 **GT roughness보다 큰 만큼만** loss에 반영하고,
   `model.model_config.draft.physics.compare_softness_to_gt=false` 로 두면
