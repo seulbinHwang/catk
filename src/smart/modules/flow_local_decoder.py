@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -339,7 +340,12 @@ class HalfSecondChunkMixerBlock(nn.Module):
         tau_emb: torch.Tensor,
     ) -> torch.Tensor:
         attn_in = self.attn_norm(chunk_tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        # Force math SDPA kernel: H100's flash/mem-efficient kernels save
+        # uninitialized memory as placeholders, which backward later reads as
+        # NaN and propagates into encoder weight gradients (silently corrupting
+        # training). ChunkStepRefiner uses the same guard for the same reason.
+        with sdpa_kernel(_SDPA_SAFE_BACKENDS):
+            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
         chunk_tokens = chunk_tokens + attn_out
 
         cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))

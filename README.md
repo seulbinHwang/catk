@@ -773,6 +773,7 @@ checkpoint 선택은 보통 아래처럼 하면 됩니다.
 - `val_batch_size=8` 로 줄이고 `n_rollout_closed_val=16` / `n_batch_sim_agents_metric=10` 은 유지해서 정기 eval 이 OOM 없이 돕니다.
 - **bs 상한의 원인은 메모리가 아닙니다**. A100 (sm_80) 의 flash / memory-efficient SDPA kernel 이 `ChunkStepRefiner` 의 self-attention 에서 큰 batch 일 때 `invalid configuration argument` 로 터지는 kernel grid-dim 한계입니다. bs=36 일 때 peak 48 GiB / 80 GiB 로 VRAM 은 남아돕니다.
 - 위 crash 를 완전히 없애기 위해 **`src/smart/modules/flow_local_decoder.py` 의 `ChunkStepRefiner` self-attention 만 math-SDPA kernel 로 강제하는 소폭 패치**를 포함했습니다. 실측 결과 bs=36 에서 500 step 이상 안정 + step time 도 오히려 약 20% 단축. 상세: [`docs/A100x4_finetune_draft_flow_README.md`](docs/A100x4_finetune_draft_flow_README.md) 5장.
+- 같은 이유로 **`HalfSecondChunkMixerBlock` 의 self-attention** 에도 동일한 math-SDPA wrapper 를 적용했습니다. self-forced fine-tuning 처럼 chunk_mixers 의 backward graph 가 살아있는 학습 경로에서, H100 의 fast/mem-efficient SDPA kernel 이 backward 용 placeholder 메모리를 uninitialized 로 두면 saved tensor 가 NaN bit pattern 으로 박혀 grad 를 오염시킬 수 있어 미리 차단합니다.
 - 실행 예시:
 
 ```bash
