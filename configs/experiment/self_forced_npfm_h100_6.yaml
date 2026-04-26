@@ -1,0 +1,81 @@
+# @package _global_
+
+# ============================================================================
+# Self-Forced NPFM fine-tuning preset for 6x H100 80GB.
+# Derived from `self_forced_npfm.yaml`.
+# ----------------------------------------------------------------------------
+# Differences vs. the base self_forced_npfm preset:
+#   * `trainer` is overridden to `ddp` so 6 GPU DDP is actually engaged.
+#   * `trainer.devices=6` is pinned so the preset encodes the H100x6 intent.
+#   * Other knobs (lr, batch, sampling, anchor/physics weights) match the base
+#     preset; tune `data.train_batch_size` only after a probe if you push it.
+#
+# Loads a 2s-horizon pretrained Generator checkpoint via `ckpt_path=...` from
+# the CLI. The model default `flow_window_steps=20` (2s) is kept; do not
+# override it unless the ckpt was pretrained at a different horizon.
+#
+# Run with:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   torchrun --standalone --nproc_per_node=6 -m src.run \
+#     experiment=self_forced_npfm_h100_6 \
+#     paths.cache_root="$CACHE_ROOT" \
+#     task_name=<your-task> \
+#     ckpt_path=<path-to-2s-pretrain.ckpt>
+# ============================================================================
+
+defaults:
+  - override /model: smart_flow
+  - override /trainer: ddp
+
+model:
+  model_config:
+    lr: 2e-4
+    lr_warmup_steps: 2
+    lr_min_ratio: 1e-2
+    n_rollout_closed_val: 16
+    sim_agents_context_cache_size: 64
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    self_forced:
+      enabled: true
+      start_epoch: 0
+      weight: 1.0
+      path_step_size: 0.05
+      anchor_weight: 0.1
+      generated_estimator_lr: 4e-5
+      estimator_updates_per_step: 5
+      initialize_aux_from_generator_on_fit_start: true
+      use_control_space_physics_regularization: false
+      physics_weight: 0.005
+      sampling:
+        sample_steps: 32
+        sample_method: euler
+        noise_scale: 1.0
+        backprop_last_k: null
+
+ckpt_path: null
+
+trainer:
+  devices: 6
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 8
+  max_epochs: 16
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  train_batch_size: 8
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true

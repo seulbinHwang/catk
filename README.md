@@ -830,6 +830,35 @@ torchrun \
 ... data.train_batch_size=30
 ```
 
+### 5.10 6x H100에서 Self-Forced NPFM fine-tuning
+
+- preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
+- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `estimator_updates_per_step=5`, sampling = Euler 32-step / `noise_scale=1.0` / `backprop_last_k=null`, `train_batch_size=8`)
+- H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
+- 전제: `ckpt_path` 에는 같은 `flow_window_steps` 로 pretrain 된 Generator checkpoint 를 넣습니다. 모델 default 는 `flow_window_steps=20` (2초) 이고, ckpt 가 2초 horizon 으로 pretrain 된 경우 override 하지 않는 편이 안전합니다.
+
+실행 예시:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=self_forced_npfm_h100_6 \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=flow_semi_continuous_self_forced_h1006 \
+  ckpt_path=/path/to/2s_pretrain_epoch_last.ckpt
+```
+
+`train_batch_size=8` 은 self-rollout (32-step Euler, 전체 step backprop) 부담을 고려한 보수적 시작점입니다. 실측해서 여유가 있으면 올리되, `model.model_config.self_forced.sampling.backprop_last_k` 를 줄이면 메모리를 더 절약할 수 있습니다.
+
+```bash
+# self-rollout backprop 을 마지막 4 step 에만 남기고 batch 키우기
+... data.train_batch_size=12 model.model_config.self_forced.sampling.backprop_last_k=4
+```
+
 ## 6. 평가와 추론
 
 ### 6.1 Validation set closed-loop 평가
