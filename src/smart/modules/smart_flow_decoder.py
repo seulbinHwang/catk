@@ -104,6 +104,42 @@ class SMARTFlowDecoder(nn.Module):
             flow_loss_mask=flow_loss_mask,
         )
 
+    def build_anchor_context_from_map_feature(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask_key: str = "flow_eval_mask",
+    ) -> Dict[str, Tensor]:
+        flow_clean_norm_key = {
+            "flow_train_mask": "flow_train_clean_norm",
+            "flow_eval_mask": "flow_eval_clean_norm",
+        }[anchor_mask_key]
+        flow_loss_mask = (
+            tokenized_agent["flow_train_loss_mask"]
+            if anchor_mask_key == "flow_train_mask"
+            else None
+        )
+        return self.agent_encoder.build_anchor_context(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            anchor_mask=tokenized_agent[anchor_mask_key],
+            flow_clean_norm=tokenized_agent[flow_clean_norm_key],
+            flow_loss_mask=flow_loss_mask,
+        )
+
+    def build_anchor_context(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask_key: str = "flow_eval_mask",
+    ) -> Dict[str, Tensor]:
+        map_feature = self.encode_map(tokenized_map)
+        return self.build_anchor_context_from_map_feature(
+            map_feature=map_feature,
+            tokenized_agent=tokenized_agent,
+            anchor_mask_key=anchor_mask_key,
+        )
+
     def forward(
         self,
         tokenized_map: Dict[str, Tensor],

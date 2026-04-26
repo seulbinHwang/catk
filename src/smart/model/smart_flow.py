@@ -1745,9 +1745,32 @@ class SMARTFlow(LightningModule):
             f"nonfinite_count={nonfinite_count}, finite_abs_max={finite_abs_max}"
         )
 
+    def _sample_draft_eval_future(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> tuple[Tensor, Dict[str, Tensor]]:
+        """DRaFT physics target trajectory를 inference와 같은 eval mode에서 생성합니다."""
+        encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
+        try:
+            draft_context = self.encoder.build_anchor_context(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                anchor_mask_key="flow_train_mask",
+            )
+            pred_sample_norm = self.encoder.sample_open_loop_future(
+                anchor_hidden=draft_context["anchor_hidden"],
+                anchor_mask=draft_context["anchor_mask"],
+                sampling_scheme=self.draft_sampling,
+            )
+        finally:
+            self._restore_module_training_modes(encoder_modes)
+        return pred_sample_norm, draft_context
+
     def _compute_draft_training_loss(
         self,
         pred_dict: Dict[str, Tensor],
+        tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
     ) -> Dict[str, Tensor]:
         """실제 샘플러를 돌린 최종 미래에 physics loss를 계산합니다.
@@ -1756,6 +1779,7 @@ class SMARTFlow(LightningModule):
             pred_dict: flow decoder 출력 사전입니다.
                 ``anchor_hidden`` 은 ``[n_agent, 13, hidden_dim]`` 이고,
                 ``flow_clean_norm`` 은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            tokenized_map: 학습용 맵 토큰 사전입니다.
             tokenized_agent: 학습용 에이전트 토큰 사전입니다.
                 DRaFT용 packed 메타데이터가 들어 있어야 합니다.
 
@@ -1771,13 +1795,14 @@ class SMARTFlow(LightningModule):
             return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
 
         # pred_sample_norm : [n_valid_anchor, 20, 4]
-        pred_sample_norm = self.encoder.sample_open_loop_future(
-            anchor_hidden=pred_dict["anchor_hidden"],
-            anchor_mask=pred_dict["anchor_mask"],
-            sampling_scheme=self.draft_sampling,
+        pred_sample_norm, draft_pred = self._sample_draft_eval_future(
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
         )
+        draft_target_norm = draft_pred["flow_clean_norm"]
+        draft_loss_mask = draft_pred.get("flow_loss_mask")
         if not torch.isfinite(pred_sample_norm).all():
-            return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
+            return self._build_zero_draft_metrics(draft_target_norm)
 
         if pred_sample_norm.shape[0] != tokenized_agent["flow_train_agent_type"].shape[0]:
             raise ValueError(
@@ -1788,15 +1813,15 @@ class SMARTFlow(LightningModule):
         if not self.draft_physics_force_fp32:
             physics_dict = self.draft_regularizer(
                 pred_future_norm=pred_sample_norm,
-                target_future_norm=pred_dict["flow_clean_norm"],
+                target_future_norm=draft_target_norm,
                 packed_agent_type=tokenized_agent["flow_train_agent_type"],
                 packed_agent_length=tokenized_agent["flow_train_agent_length"],
                 packed_prev_control=tokenized_agent["flow_train_prev_control"],
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-                future_valid_mask=pred_dict.get("flow_loss_mask"),
+                future_valid_mask=draft_loss_mask,
             )
             if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-                return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
+                return self._build_zero_draft_metrics(draft_target_norm)
             return physics_dict
 
         # Keep the threshold-heavy physics penalty in fp32 even when the trainer
@@ -1804,15 +1829,15 @@ class SMARTFlow(LightningModule):
         with torch.autocast(device_type=pred_sample_norm.device.type, enabled=False):
             physics_dict = self.draft_regularizer(
                 pred_future_norm=pred_sample_norm.float(),
-                target_future_norm=pred_dict["flow_clean_norm"].float(),
+                target_future_norm=draft_target_norm.float(),
                 packed_agent_type=tokenized_agent["flow_train_agent_type"],
                 packed_agent_length=tokenized_agent["flow_train_agent_length"].float(),
                 packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
                 packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-                future_valid_mask=pred_dict.get("flow_loss_mask"),
+                future_valid_mask=draft_loss_mask,
             )
         if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-            return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
+            return self._build_zero_draft_metrics(draft_target_norm)
         return physics_dict
 
     def _log_draft_training_metrics(
@@ -1919,6 +1944,7 @@ class SMARTFlow(LightningModule):
         if draft_weight > 0.0:
             physics_dict = self._compute_draft_training_loss(
                 pred_dict=pred,
+                tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,
             )
             total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
@@ -2167,6 +2193,7 @@ open_metric_dict:
         if draft_weight > 0.0:
             physics_dict = self._compute_draft_training_loss(
                 pred_dict=pred,
+                tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,
             )
             total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]

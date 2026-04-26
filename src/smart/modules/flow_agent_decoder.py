@@ -386,6 +386,34 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             return anchor_hidden.new_zeros((0, anchor_hidden.shape[-1]))
         return torch.cat(packed_hidden, dim=0)
 
+    def build_anchor_context(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        anchor_mask: torch.Tensor,
+        flow_clean_norm: torch.Tensor,
+        flow_loss_mask: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Open-loop anchor sampling에 필요한 context hidden만 계산합니다."""
+        ctx_hidden_pack = self._encode_context(
+            agent_token_index=tokenized_agent["ctx_sampled_idx"],
+            pos_a=tokenized_agent["ctx_sampled_pos"],
+            head_a=tokenized_agent["ctx_sampled_heading"],
+            mask=tokenized_agent["ctx_valid"],
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        output = {
+            "flow_clean_norm": flow_clean_norm,
+            "ctx_hidden_pack": ctx_hidden_pack,
+            "anchor_hidden": anchor_hidden,
+            "anchor_mask": anchor_mask,
+        }
+        if flow_loss_mask is not None:
+            output["flow_loss_mask"] = flow_loss_mask
+        return output
+
 
     def _sample_open_loop_future_from_hidden(
         self,
@@ -632,17 +660,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             Dict[str, torch.Tensor]:
                 flow prediction, target, anchor 문맥, 현재 위치/방향, batch 정보를 담은 사전입니다.
         """
-        ctx_hidden_pack = self._encode_context(
-            agent_token_index=tokenized_agent["ctx_sampled_idx"],
-            pos_a=tokenized_agent["ctx_sampled_pos"],
-            head_a=tokenized_agent["ctx_sampled_heading"],
-            mask=tokenized_agent["ctx_valid"],
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-        )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
-        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
-
         if flow_loss_mask is not None:
             expected_shape = tuple(flow_clean_norm.shape[:2])
             if tuple(flow_loss_mask.shape) != expected_shape:
@@ -651,6 +668,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     f"expected={expected_shape}, actual={tuple(flow_loss_mask.shape)}."
                 )
             flow_loss_mask = flow_loss_mask.to(device=flow_clean_norm.device, dtype=torch.bool)
+
+        anchor_context = self.build_anchor_context(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            anchor_mask=anchor_mask,
+            flow_clean_norm=flow_clean_norm,
+            flow_loss_mask=flow_loss_mask,
+        )
+        ctx_hidden_pack = anchor_context["ctx_hidden_pack"]
+        anchor_hidden = anchor_context["anchor_hidden"]
+        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
 
         if flow_clean_norm.numel() == 0:
             empty = flow_clean_norm.new_zeros((0, self.flow_window_steps, 4))
