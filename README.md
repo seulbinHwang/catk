@@ -13,12 +13,6 @@
 - `HierarchicalFlowDecoder`와 `FlowODE`가 local normalized future를 직접 복원해 discrete token id보다 trajectory geometry를 더 부드럽게 모델링합니다.
 - `HierarchicalFlowDecoder`는 `chunk_mixers` 이후, `step_refiner` 이전에 `chunk_a2a_mixers`를 실행합니다.
 - `chunk_a2a_mixers`는 같은 scene, 같은 anchor 시간, 같은 0.5초 상대 chunk에 속한 후보끼리 `decoder.a2a_radius` 안에서 agent-to-agent attention을 수행합니다.
-- PyG `AttentionLayer`는 학습 중 
-- 기본적으로 edge attention 내부 activation recomputation을 사용합니다. 
-- 따라서 q/k/v, edge attention score, edge message 같은 큰 중간값은 
-- backward 때 다시 계산해 GPU 메모리 사용량을 줄입니다. 
-- 학습 중 attention weight 저장은 기본으로 끄고, 
-- 평가/시각화 모드에서는 기존처럼 확인할 수 있습니다.
 - chunk별 전역 위치/방향은 flow target과 같은 현재 anchor 좌표계를 기준으로 복원합니다. heading 벡터나 agent 간 상대 위치가 0에 가까운 경우에도 안전한 각도 계산을 사용해 NaN gradient가 생기지 않도록 했습니다.
 - 이번 검토 수정은 좌표계 기준은 유지하고, 안전 각도 계산과 batch id 검증만 보강했으므로 모델 파라미터 수는 변하지 않습니다.
 - 학습 forward, validation open-loop sampling, DRaFT sampling, closed-loop rollout 모두 현재 위치/방향과 batch 정보를 flow decoder에 넘겨 이 agent-to-agent 정렬 경로를 동일하게 사용합니다.
@@ -277,15 +271,7 @@ torchrun \
 - `train_batch_size=32`: 실측에서 71 step 만에 OOM 으로 학습이 죽었습니다.
 - 따라서 6x H100 80GB 에서는 `28` 이상으로 올리지 않는 것을 권장합니다. 더 작은 GPU 에서는 아래 예시처럼 override 로 낮춰 쓰면 됩니다.
 
-`flow_window_steps=80` 같이 긴 horizon으로 학습할 때도 모델이 보는 미래 길이와 loss 목표는 그대로 유지합니다. 대신 PyG `AttentionLayer` 내부에서 학습 중 activation recomputation이 기본 적용됩니다.
-
-- 적용 범위: temporal agent attention, map-to-agent attention, agent-to-agent attention, flow decoder의 chunk-level agent-to-agent attention처럼 `AttentionLayer`를 쓰는 PyG message passing 경로입니다.
-- 유지되는 것: `model.model_config.decoder.flow_window_steps`, attention 반경, head 수, layer 수, flow loss, open-loop/closed-loop 평가 기준입니다.
-- 줄어드는 것: forward 때 GPU에 오래 남는 q/k/v, edge score, edge softmax, edge message 중간값입니다.
-- 속도 영향: backward에서 attention 내부를 한 번 더 계산하므로 step 시간이 조금 늘 수 있습니다. 대신 batch size를 더 줄여 epoch step 수가 증가하는 상황을 피하는 것이 목적입니다.
-- attention weight 저장: 학습 중에는 기본적으로 저장하지 않습니다. 이 값은 loss에 쓰이지 않는 시각화/디버깅용 값이라 메모리 절약을 위해 꺼져 있습니다.
-
-긴 horizon에서 여전히 메모리가 부족한 경우에만 아래처럼 batch size를 낮춰 실행하세요.
+`flow_window_steps=80` 으로 학습할 때는 6x H100 80GB 에서 `data.train_batch_size=14` 를 쓰세요.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
@@ -524,7 +510,7 @@ torchrun \
   model.model_config.delete_local_videos_after_wandb_upload=true
 ```
 
-메모리가 부족할 때는 먼저 PyG attention activation recomputation이 켜진 기본 코드를 사용하세요. 이 방식은 예측 길이와 loss를 줄이지 않고 attention 내부 중간값 저장량을 줄입니다. 그래도 장비 메모리가 부족한 경우에만 아래처럼 train batch를 낮춥니다.
+메모리가 부족하면 아래처럼 train batch를 줄이면 됩니다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
