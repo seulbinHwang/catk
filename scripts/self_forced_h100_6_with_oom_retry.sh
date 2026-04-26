@@ -83,8 +83,15 @@ while (( bs >= MIN_BS )); do
   log "Attempt #${attempt}: bs=${bs} action=${action} ckpt=${ckpt_path}"
   log "  per-attempt log -> ${attempt_log}"
 
+  # `tee` so the user can watch tqdm + Lightning logs live in this pane while
+  # we still keep a per-attempt log file for OOM detection / post-hoc analysis.
+  # `PYTHONUNBUFFERED=1` keeps Python's stdout/stderr line-flushed so tee
+  # sees output immediately rather than after a 4 KiB buffer fills.
+  # `${PIPESTATUS[0]}` recovers torchrun's real exit code (tee's own exit
+  # would otherwise mask it as 0).
   CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  PYTHONUNBUFFERED=1 \
   torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m src.run \
     experiment="$EXPERIMENT" \
     action="$action" \
@@ -92,8 +99,8 @@ while (( bs >= MIN_BS )); do
     task_name="$TASK_NAME" \
     ckpt_path="$ckpt_path" \
     data.train_batch_size="$bs" \
-    >"$attempt_log" 2>&1
-  exit_code=$?
+    2>&1 | tee "$attempt_log"
+  exit_code=${PIPESTATUS[0]}
 
   if (( exit_code == 0 )); then
     log "Training completed successfully (attempt #${attempt}, bs=${bs})."
