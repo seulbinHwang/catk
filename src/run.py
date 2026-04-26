@@ -12,7 +12,7 @@
 # its affiliates is strictly prohibited.
 
 import os
-from typing import List
+from typing import Any, List
 
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -45,6 +45,67 @@ from src.utils.waymo_submission import (
 log = RankedLogger(__name__, rank_zero_only=True)
 
 torch.set_float32_matmul_precision("high")
+
+
+def _is_self_forced_enabled(cfg: DictConfig) -> bool:
+    model_cfg = cfg.get("model")
+    model_config = model_cfg.get("model_config") if model_cfg else None
+    self_forced_cfg = model_config.get("self_forced") if model_config else None
+    return bool(self_forced_cfg and self_forced_cfg.get("enabled", False))
+
+
+def _load_lightning_checkpoint(ckpt_path: str) -> dict[str, Any]:
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        raise ValueError(
+            "ckpt_path must point to a Lightning checkpoint dictionary containing "
+            f"a 'state_dict' entry, got {ckpt_path!r}."
+        )
+    return checkpoint
+
+
+def _checkpoint_has_self_forced_auxiliary_state(checkpoint: dict[str, Any]) -> bool:
+    state_dict = checkpoint.get("state_dict", {})
+    if not isinstance(state_dict, dict):
+        return False
+    prefixes = (
+        "self_forced_target_teacher.",
+        "self_forced_generated_estimator.",
+    )
+    infixes = (
+        ".self_forced_target_teacher.",
+        ".self_forced_generated_estimator.",
+    )
+    return any(
+        str(key).startswith(prefixes) or any(infix in str(key) for infix in infixes)
+        for key in state_dict
+    )
+
+
+def _validate_self_forced_checkpoint_action(
+    cfg: DictConfig,
+    checkpoint: dict[str, Any],
+) -> None:
+    if not _is_self_forced_enabled(cfg):
+        return
+
+    has_aux_state = _checkpoint_has_self_forced_auxiliary_state(checkpoint)
+    if cfg.action == "finetune" and has_aux_state:
+        raise ValueError(
+            "ckpt_path looks like a self-forced training checkpoint because it contains "
+            "'self_forced_target_teacher' or 'self_forced_generated_estimator' state. "
+            "Do not load it with action=finetune, which starts a new weight-only run and "
+            "can discard the resume semantics of F_rho/F_psi. Use action=fit with the "
+            "self-forced checkpoint to perform a full Lightning resume."
+        )
+    if cfg.action == "fit" and cfg.get("ckpt_path") and not has_aux_state:
+        raise ValueError(
+            "self-forced action=fit expects a self-forced checkpoint containing "
+            "'self_forced_target_teacher' and 'self_forced_generated_estimator' state. "
+            "The provided ckpt_path does not look like a self-forced resume checkpoint. "
+            "Use action=finetune for the first self-forced run from a pretrained "
+            "Generator checkpoint."
+        )
 
 
 def _apply_submission_overrides(cfg: DictConfig) -> None:
@@ -190,11 +251,20 @@ def run(cfg: DictConfig) -> None:
 
     log.info(f"Resuming from ckpt: cfg.ckpt_path={cfg.ckpt_path}")
     if cfg.action == "fit":
+        checkpoint = None
+        if cfg.get("ckpt_path") and _is_self_forced_enabled(cfg):
+            checkpoint = _load_lightning_checkpoint(str(cfg.ckpt_path))
+            _validate_self_forced_checkpoint_action(cfg, checkpoint)
+        del checkpoint
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
     elif cfg.action == "finetune":
+        if not cfg.get("ckpt_path"):
+            raise ValueError("action=finetune requires ckpt_path for weight-only initialization.")
+        checkpoint = _load_lightning_checkpoint(str(cfg.ckpt_path))
+        _validate_self_forced_checkpoint_action(cfg, checkpoint)
         log.info("Starting finetuning!")
-        model.load_state_dict(torch.load(cfg.ckpt_path)["state_dict"], strict=False)
+        model.load_state_dict(checkpoint["state_dict"], strict=False)
         trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")

@@ -856,6 +856,8 @@ torchrun \
 
 중단된 self-forced run을 이어서 학습할 때만 `action=fit ckpt_path=/path/to/self_forced_run/last.ckpt` 를 사용하세요. 이 경우에는 Lightning이 optimizer, lr scheduler, epoch, global step까지 함께 복원합니다. checkpoint 안에 `self_forced_target_teacher` 와 `self_forced_generated_estimator` state가 있으면, fit 시작 hook은 두 보조 모델을 현재 Generator weight로 다시 덮어쓰지 않고 checkpoint의 `F_rho` / `F_psi` 상태를 보존합니다.
 
+보호 장치도 있습니다. self-forced가 켜진 상태에서 `action=finetune` 에 self-forced checkpoint를 넣으면 실행이 중단됩니다. 반대로 `action=fit` 에 self-forced 보조 state가 없는 pretrained checkpoint를 넣어도 중단됩니다. 즉, pretrained Generator에서 처음 시작할 때는 `action=finetune`, self-forced run을 이어갈 때는 `action=fit` 으로 분리해야 합니다.
+
 `train_batch_size=8` 은 self-rollout (32-step Euler, 기본 마지막 24 step backprop) 부담을 고려한 보수적 시작점입니다. closed-loop self-forced rollout 도 `model.model_config.self_forced.sampling.backprop_last_k` 를 실제 flow ODE sampling 에 전달하므로, 이 값을 줄이면 메모리를 더 절약할 수 있습니다.
 
 ```bash
@@ -1352,6 +1354,8 @@ configs/experiment/self_forced_npfm.yaml
 ```bash
 python -m src.run experiment=self_forced_npfm action=finetune ckpt_path=/path/to/pretrained.ckpt
 ```
+
+이미 self-forced로 학습 중이던 checkpoint를 이어서 학습할 때는 `action=finetune` 이 아니라 `action=fit ckpt_path=/path/to/self_forced_run/last.ckpt` 를 사용합니다. 실행 코드는 checkpoint 안의 `F_rho` / `F_psi` 보조 state 유무를 보고 두 경로가 섞이면 조기에 에러를 냅니다.
 
 이 구현은 WOSAC RMM 을 reward 나 optimization objective 로 사용하지 않습니다. 기존 closed-loop 평가 경로와 동일하게, RMM 은 validation / 리포팅 용도로만 쓸 수 있습니다.
 
