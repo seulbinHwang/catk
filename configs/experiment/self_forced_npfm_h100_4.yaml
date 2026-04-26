@@ -1,0 +1,118 @@
+# @package _global_
+
+# ============================================================================
+# Self-Forced NPFM fine-tuning preset for 4x H100 80GB.
+# Derived from `self_forced_npfm_h100_6.yaml` (the 6xH100 preset).
+# ----------------------------------------------------------------------------
+# Differences vs. the 6xH100 preset:
+#   * `trainer.devices=4` is pinned so the preset encodes the H100x4 intent.
+#   * Per-GPU knobs (lr, batch, sampling, anchor/physics weights, val_batch,
+#     num_workers) are kept identical. H100 80GB cards are the same hardware,
+#     so the per-GPU memory ceiling is unchanged; only the effective global
+#     batch shrinks from 6*20=120 to 4*20=80 (0.667x).
+#   * The base preset's `lr=2e-4` is kept as-is. If you want to apply the
+#     linear-LR scaling rule for the smaller global batch, override via the
+#     CLI: `model.model_config.lr=1.333e-4` (= 2e-4 * 80/120). We do not
+#     default to that to keep optimizer behaviour identical to the 6xH100
+#     preset and to match the base `self_forced_npfm.yaml` defaults.
+#   * `max_epochs / check_val_every_n_epoch / limit_val_batches` unchanged,
+#     so the training budget in "epochs over the dataset" matches the 6xH100
+#     preset; wall-clock per epoch is ~1.5x longer with 4 ranks vs 6.
+#
+# Loads a 2s-horizon pretrained Generator checkpoint via `ckpt_path=...` from
+# the CLI with `action=finetune`, so only model weights are loaded and
+# optimizer/scheduler/epoch state is not resumed. The model default
+# `flow_window_steps=20` (2s) is kept; do not override it unless the ckpt was
+# pretrained at a different horizon.
+#
+# Run with:
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 \
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   torchrun --standalone --nproc_per_node=4 -m src.run \
+#     experiment=self_forced_npfm_h100_4 \
+#     action=finetune \
+#     paths.cache_root="$CACHE_ROOT" \
+#     task_name=<your-task> \
+#     ckpt_path=<path-to-2s-pretrain.ckpt>
+# ============================================================================
+
+defaults:
+  - override /model: smart_flow
+  - override /trainer: ddp
+
+action: finetune
+
+model:
+  model_config:
+    lr: 2e-4
+    lr_warmup_steps: 2
+    lr_min_ratio: 1e-2
+    n_rollout_closed_val: 16
+    sim_agents_context_cache_size: 64
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    self_forced:
+      enabled: true
+      start_epoch: 0
+      weight: 1.0
+      path_step_size: 0.05
+      anchor_weight: 0.1
+      generated_estimator_lr: 4e-5
+      estimator_updates_per_step: 5
+      # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
+      # Resume from a self-forced checkpoint preserves restored aux states.
+      initialize_aux_from_generator_on_fit_start: true
+      freeze_map_encoder: true
+      use_control_space_physics_regularization: false
+      physics_weight: 0.005
+      sampling:
+        sample_steps: 32
+        sample_method: euler
+        noise_scale: 1.0
+        backprop_last_k: 24
+
+ckpt_path: null
+
+trainer:
+  devices: 4
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 8
+  max_epochs: 16
+  precision: bf16-mixed
+  # Lightning rejects auto gradient clipping under manual optimization.
+  # Manual clip is configured at model.model_config.self_forced.gradient_clip_val
+  # (default 1.0 from configs/model/smart_flow.yaml). Override there if needed.
+  gradient_clip_val: null
+  sync_batchnorm: false
+  strategy:
+    # `target_teacher` (frozen copy of the generator's encoder) and the
+    # auxiliary `generated_estimator` parameters are registered on the
+    # LightningModule but receive no gradient in any single backward pass on
+    # the generator (the estimator has its own backward). DDP's reducer
+    # otherwise raises:
+    #   "parameters that were not used in producing the loss returned by
+    #    training_step ... enable find_unused_parameters=True".
+    find_unused_parameters: true
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  # Per-GPU train batch is kept at the 6xH100 preset's measured ceiling
+  # because H100 80GB is the same hardware and per-rank memory does not
+  # depend on the world size. From the 6xH100 preset's measurements:
+  #   bs=20 -> rank 0 peak 74.85% (~59 GB), 4.35 s/step  (safe; recommended)
+  #   bs=22 -> rank 0 peak 80.50% (~64 GB), 4.71 s/step  (≤2% faster, tight)
+  #   bs=24 -> rank 1 OOM at step 2 (cross-rank variance pushes >79 GB)
+  # bs=20 leaves ~10 GB headroom against typical 5-10 GB per-rank batch
+  # variance, and gives the lowest 1-epoch wall time without OOM risk.
+  train_batch_size: 20
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
