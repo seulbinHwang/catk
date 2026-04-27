@@ -44,7 +44,7 @@ action: finetune
 
 model:
   model_config:
-    lr: 2e-4
+    lr: 2e-5
     lr_warmup_steps: 2
     lr_min_ratio: 1e-2
     n_rollout_closed_val: 16
@@ -76,7 +76,7 @@ model:
           scope: global_batch
           # paper_uniform: 논문에 가장 충실하게 s를 1..sample_steps에서 바로 균등 샘플링합니다.
           # stability_warmup: 초반 warmup_epochs 동안 K>=warmup_min_executed_steps만 허용한 뒤 전체 균등으로 바꿉니다.
-          policy: stability_warmup
+          policy: paper_uniform
           warmup_epochs: 2
           warmup_min_executed_steps: 16
 
