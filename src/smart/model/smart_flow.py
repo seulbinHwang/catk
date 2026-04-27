@@ -1452,7 +1452,7 @@ class SMARTFlow(LightningModule):
         Returns:
             Dict[str, Tensor]: closed-loop rollout 결과입니다. ``pred_traj_10hz`` 와
             ``pred_head_10hz`` 는 실제로 commit된 N초 rollout입니다. random-s 학습이 켜져
-            있으면 scenario별 ``s`` 와 tau 구간도 함께 들어갑니다.
+            있으면 rank mini-batch가 공유한 ``s`` 와 tau 구간도 함께 들어갑니다.
         """
         encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
         try:

@@ -21,6 +21,7 @@
 #   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
 #   NPROC_PER_NODE=6
 #   EXPERIMENT=self_forced_npfm_h100_6
+#   RANDOM_TERMINAL_SCOPE=         Optional override: batch.
 #   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform or stability_warmup.
 #   RANDOM_TERMINAL_WARMUP_EPOCHS= Optional warmup epoch override.
 #   RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS=
@@ -51,6 +52,9 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:?must set PRETRAIN_CKPT to the 2s-horizon pretrained Generator ckpt}"
 
 EXTRA_OVERRIDES=()
+if [[ -n "${RANDOM_TERMINAL_SCOPE:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.scope=${RANDOM_TERMINAL_SCOPE}")
+fi
 if [[ -n "${RANDOM_TERMINAL_POLICY:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.policy=${RANDOM_TERMINAL_POLICY}")
 fi

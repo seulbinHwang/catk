@@ -930,7 +930,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             }
         return cloned_cache
 
-    def _sample_training_terminal_steps_by_scenario(
+    def _sample_training_terminal_step_for_batch(
         self,
         sampling_scheme: DictConfig,
         num_scenario: int,
@@ -938,7 +938,21 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         dtype: torch.dtype,
         self_forced_epoch: int | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-        """scenario sequence마다 random terminal step을 하나씩 샘플링합니다."""
+        """rank mini-batch 전체가 공유할 random terminal step 하나를 샘플링합니다.
+
+        Args:
+            sampling_scheme: self-forced rollout sampling 설정입니다.
+            num_scenario: 현재 rank mini-batch 안의 scenario 개수입니다.
+            device: 반환 tensor를 둘 장치입니다.
+            dtype: tau 구간 tensor의 자료형입니다.
+            self_forced_epoch: 현재 self-forced epoch입니다. ``None``이면 random terminal step을 끕니다.
+
+        Returns:
+            tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+            terminal step, 논문 표기 s, tau 하한, tau 상한입니다.
+            각 tensor의 shape은 기존 downstream 호환을 위해 ``[num_scenario]`` 로 맞춥니다.
+            실제 값은 rank mini-batch 전체에서 하나만 샘플링한 뒤 모든 scenario에 복제합니다.
+        """
         random_cfg = getattr(sampling_scheme, "random_terminal_step", None)
         if self_forced_epoch is None or random_cfg is None:
             return None, None, None, None
@@ -950,6 +964,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             raise ValueError(f"sample_steps must be positive, got {sample_steps}.")
         if num_scenario < 0:
             raise ValueError(f"num_scenario must be non-negative, got {num_scenario}.")
+
+        scope = str(getattr(random_cfg, "scope", "batch"))
+        if scope not in {"batch", "rank_batch", "per_rank_batch"}:
+            raise ValueError(
+                "random_terminal_step.scope must be 'batch' for the fast per-rank path, "
+                f"got {scope!r}."
+            )
 
         policy = str(getattr(random_cfg, "policy", "paper_uniform"))
         max_terminal_s = sample_steps
@@ -970,14 +991,21 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             )
 
         max_terminal_s = min(max(1, int(max_terminal_s)), sample_steps)
-        terminal_s = torch.randint(
+        if int(num_scenario) == 0:
+            empty_long = torch.empty((0,), device=device, dtype=torch.long)
+            empty_tau = torch.empty((0,), device=device, dtype=dtype)
+            return empty_long, empty_long, empty_tau, empty_tau
+
+        terminal_s_one = torch.randint(
             low=1,
             high=max_terminal_s + 1,
-            size=(int(num_scenario),),
+            size=(1,),
             device=device,
             dtype=torch.long,
         )
+        terminal_s = terminal_s_one.expand(int(num_scenario)).clone()
         terminal_steps = sample_steps + 1 - terminal_s
+
         terminal_steps_float = terminal_steps.to(dtype=dtype)
         dt = (1.0 - float(self.flow_ode.eps)) / float(sample_steps)
         tau_low = (float(self.flow_ode.eps) + (terminal_steps_float - 1.0) * dt).clamp(
@@ -989,41 +1017,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             max=1.0,
         )
         return terminal_steps, terminal_s, tau_low, tau_high
-
-    def _sample_random_s_rollout_for_active_agents(
-        self,
-        active_hidden: torch.Tensor,
-        x_init_norm: torch.Tensor,
-        active_terminal_steps: torch.Tensor,
-        flow_sample_steps: int,
-        flow_sample_method: str,
-    ) -> torch.Tensor:
-        """active agent를 terminal step별로 묶어 terminal clean estimate를 만듭니다."""
-        if active_hidden.numel() == 0:
-            return x_init_norm.new_zeros((0, self.flow_window_steps, 4))
-        if tuple(active_terminal_steps.shape) != (active_hidden.shape[0],):
-            raise ValueError(
-                "active_terminal_steps must have shape [n_active], "
-                f"got {tuple(active_terminal_steps.shape)} for n_active={active_hidden.shape[0]}."
-            )
-
-        y_hat_norm = x_init_norm.new_empty(
-            (active_hidden.shape[0], self.flow_window_steps, 4)
-        )
-        for terminal_step in torch.unique(active_terminal_steps, sorted=True):
-            group_mask = active_terminal_steps == terminal_step
-            hidden_group = active_hidden[group_mask]
-            x_init_group = x_init_norm[group_mask]
-            terminal_step_int = int(terminal_step.item())
-            y_hat_norm[group_mask] = self.flow_ode.generate(
-                x_init=x_init_group,
-                model_fn=lambda x_t, tau, hidden=hidden_group: self.flow_decoder(hidden, x_t, tau),
-                steps=flow_sample_steps,
-                method=flow_sample_method,
-                terminal_step=terminal_step_int,
-                return_terminal_clean=True,
-            )
-        return y_hat_norm
 
     def _rollout_from_cache_impl(
         self,
@@ -1140,7 +1133,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             terminal_s_by_scenario,
             terminal_tau_low_by_scenario,
             terminal_tau_high_by_scenario,
-        ) = self._sample_training_terminal_steps_by_scenario(
+        ) = self._sample_training_terminal_step_for_batch(
             sampling_scheme=sampling_scheme,
             num_scenario=int(tokenized_agent["num_graphs"]),
             device=feat_a_now.device,
@@ -1150,6 +1143,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         terminal_step_by_agent = (
             terminal_steps_by_scenario[tokenized_agent["batch"]]
             if terminal_steps_by_scenario is not None
+            else None
+        )
+        terminal_step_for_rollout = (
+            int(terminal_steps_by_scenario[0].item())
+            if terminal_steps_by_scenario is not None and terminal_steps_by_scenario.numel() > 0
             else None
         )
 
@@ -1261,12 +1259,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         backprop_last_k=flow_sample_backprop_last_k,
                     )
                 else:
-                    y_hat_norm = self._sample_random_s_rollout_for_active_agents(
-                        active_hidden=active_hidden,
-                        x_init_norm=x_init_norm,
-                        active_terminal_steps=terminal_step_by_agent[active_mask],
-                        flow_sample_steps=flow_sample_steps,
-                        flow_sample_method=flow_sample_method,
+                    y_hat_norm = self.flow_ode.generate(
+                        x_init=x_init_norm,
+                        model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
+                        steps=flow_sample_steps,
+                        method=flow_sample_method,
+                        terminal_step=terminal_step_for_rollout,
+                        return_terminal_clean=True,
                     )
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
