@@ -78,8 +78,8 @@ model_config:
     weight: 1.0
     path_step_size: 0.05
     anchor_weight: 0.05
-    generated_estimator_lr: ${model.model_config.lr}
-    estimator_updates_per_step: 5
+    generated_estimator_lr: 2e-4
+    estimator_updates_per_step: 1
     initialize_aux_from_generator_on_fit_start: true
     freeze_map_encoder: true
     # Manual gradient clip used inside self-forced training_step / estimator
