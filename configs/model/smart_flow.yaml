@@ -79,8 +79,8 @@ model_config:
     path_step_size: 0.05
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: true
-    generated_estimator_lr: 2e-4
-    estimator_updates_per_step: 1
+    generated_estimator_lr: 4e-5
+    estimator_updates_per_step: 5
     initialize_aux_from_generator_on_fit_start: true
     freeze_map_encoder: true
     # Manual gradient clip used inside self-forced training_step / estimator
