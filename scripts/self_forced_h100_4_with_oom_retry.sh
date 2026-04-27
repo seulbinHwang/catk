@@ -17,7 +17,7 @@
 #                  ckpt you would have passed to the bare `ckpt_path=` argument).
 #
 # Optional knobs (env vars; sensible defaults shown):
-#   INITIAL_BS=12        Initial `data.train_batch_size`. Defaults to the
+#   INITIAL_BS=14        Initial `data.train_batch_size`. Defaults to the
 #                        preset's conservative random-terminal setting.
 #   OOM_STEP=2           Decrement applied to `data.train_batch_size` per OOM.
 #   MIN_BS=2             Stop trying when `bs` would fall below this value.
