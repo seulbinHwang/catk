@@ -1211,6 +1211,22 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds=scenario_sampling_seeds,
             agent_batch=tokenized_agent["batch"],
         )
+        # Derive scenario count from the always-present `batch` index instead of
+        # `tokenized_agent["num_graphs"]`. The latter is only populated on the
+        # training-side `tokenized_agent` (built by `_build_eval_tokenized_inputs`)
+        # but is dropped by the validation/inference helper
+        # `_build_parallel_rollout_tokenized_agent`, so any read of "num_graphs"
+        # here would KeyError on the very first closed-loop validation step
+        # even though `_sample_training_terminal_step_for_batch` is a no-op for
+        # the eval path (`self_forced_epoch is None`). `batch` is required by
+        # downstream PyG ops in this same function and is therefore guaranteed
+        # to exist on every code path that reaches this point.
+        agent_batch_index = tokenized_agent["batch"]
+        num_scenario_for_random_s = (
+            int(agent_batch_index.max().item()) + 1
+            if agent_batch_index.numel() > 0
+            else 0
+        )
         (
             terminal_steps_by_scenario,
             terminal_s_by_scenario,
@@ -1218,7 +1234,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             terminal_tau_high_by_scenario,
         ) = self._sample_training_terminal_step_for_batch(
             sampling_scheme=sampling_scheme,
-            num_scenario=int(tokenized_agent["num_graphs"]),
+            num_scenario=num_scenario_for_random_s,
             device=feat_a_now.device,
             dtype=feat_a_now.dtype,
             self_forced_epoch=self_forced_epoch,
