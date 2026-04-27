@@ -211,6 +211,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 0.0
         )
+        self.self_forced_use_anchor_fm_loss = (
+            bool(getattr(self.self_forced_config, "use_anchor_flow_matching_loss", True))
+            if self.self_forced_config is not None
+            else True
+        )
         self.self_forced_generated_estimator_lr = (
             float(getattr(self.self_forced_config, "generated_estimator_lr", self.lr))
             if self.self_forced_config is not None
@@ -2074,13 +2079,16 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: logging용 detached 총 loss입니다.
         """
-        tokenized_map_train, tokenized_agent_train = self.token_processor(data)
-        pred = self.encoder(
-            tokenized_map_train,
-            tokenized_agent_train,
-            anchor_mask_key="flow_train_mask",
-        )
-        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+        fm_loss = None
+        open_metric_dict = None
+        if self.self_forced_use_anchor_fm_loss:
+            tokenized_map_train, tokenized_agent_train = self.token_processor(data)
+            pred = self.encoder(
+                tokenized_map_train,
+                tokenized_agent_train,
+                anchor_mask_key="flow_train_mask",
+            )
+            fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
         rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
@@ -2094,6 +2102,12 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent_eval,
         )
         if committed_path_norm.numel() == 0:
+            if fm_loss is None:
+                zero_loss = rollout["pred_traj_10hz"].new_zeros(())
+                self.log("train/loss", zero_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("train/sf_anchor_fm_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+                return zero_loss.detach()
             generator_optimizer = self.optimizers()[0]
             self.toggle_optimizer(generator_optimizer)
             generator_optimizer.zero_grad(set_to_none=True)
@@ -2132,9 +2146,14 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent_eval,
             anchor_mask=anchor_mask,
         )
+        anchor_loss = (
+            fm_loss
+            if fm_loss is not None
+            else committed_path_norm.new_zeros(())
+        )
         total_loss = (
             self.self_forced_weight * sf_loss
-            + self.self_forced_anchor_weight * fm_loss
+            + self.self_forced_anchor_weight * anchor_loss
             + self.self_forced_physics_weight * physics_dict["loss"]
         )
         if not torch.isfinite(total_loss):
@@ -2164,10 +2183,13 @@ class SMARTFlow(LightningModule):
             self._clear_self_forced_backward_context()
 
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        if fm_loss is not None:
+            self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_physics_loss", physics_dict["loss"].detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_physics_weight", float(self.self_forced_physics_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         if "sf_terminal_s_by_scenario" in rollout:
@@ -2187,38 +2209,39 @@ class SMARTFlow(LightningModule):
                 sync_dist=True,
                 batch_size=1,
             )
-        self.log(
-            f"train/{self.train_open_metric_names['ade']}",
-            open_metric_dict[self.open_metric_names["ade"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['fde']}",
-            open_metric_dict[self.open_metric_names["fde"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_ade']}",
-            open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_fde']}",
-            open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
+        if open_metric_dict is not None:
+            self.log(
+                f"train/{self.train_open_metric_names['ade']}",
+                open_metric_dict[self.open_metric_names["ade"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['fde']}",
+                open_metric_dict[self.open_metric_names["fde"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['yaw_ade']}",
+                open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['yaw_fde']}",
+                open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
         if self.self_forced_use_physics:
             self._log_draft_training_metrics(
                 draft_weight=float(self.self_forced_physics_weight),
