@@ -26,7 +26,7 @@
 #   CUDA_VISIBLE_DEVICES=0,1,2,3
 #   NPROC_PER_NODE=4
 #   EXPERIMENT=self_forced_npfm_h100_4
-#   RANDOM_TERMINAL_SCOPE=         Optional override: batch.
+#   RANDOM_TERMINAL_SCOPE=         Optional override: global_batch.
 #   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform or stability_warmup.
 #   RANDOM_TERMINAL_WARMUP_EPOCHS= Optional warmup epoch override.
 #   RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS=

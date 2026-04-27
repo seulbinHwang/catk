@@ -865,9 +865,9 @@ torchrun \
 
 보호 장치도 있습니다. self-forced가 켜진 상태에서 `action=finetune` 에 self-forced checkpoint를 넣으면 실행이 중단됩니다. 반대로 `action=fit` 에 self-forced 보조 state가 없는 pretrained checkpoint를 넣어도 중단됩니다. 즉, pretrained Generator에서 처음 시작할 때는 `action=finetune`, self-forced run을 이어갈 때는 `action=fit` 으로 분리해야 합니다.
 
-Self-forced H100 preset은 self-forced rollout에서 `sample_steps=32`를 유지하되, 학습 중에는 rank별 mini-batch 전체가 random terminal denoising step `s` 하나를 공유합니다. 같은 rank의 모든 scenario/agent와 0.5초 commit block은 같은 `s`를 쓰며, 실제 실행 step 수는 `K = sample_steps + 1 - s` 입니다. 따라서 이전처럼 scenario마다 다른 `s`를 뽑고 `torch.unique(K)` 그룹마다 sampler를 다시 호출하지 않습니다. 0.5초 block마다 `FlowODE.generate(..., terminal_step=K, return_terminal_clean=True)`를 한 번만 호출해 terminal clean estimate를 commit합니다.
+Self-forced H100 preset은 self-forced rollout에서 `sample_steps=32`를 유지하되, 학습 중에는 DDP 전체 rank가 같은 random terminal denoising step `s` 하나를 공유합니다. rank0에서 뽑은 `s`를 모든 rank로 broadcast하므로, 모든 rank의 scenario/agent와 0.5초 commit block은 같은 `s`를 쓰며, 실제 실행 step 수는 `K = sample_steps + 1 - s` 입니다. 따라서 이전처럼 scenario마다 다른 `s`를 뽑고 `torch.unique(K)` 그룹마다 sampler를 다시 호출하지 않습니다. 0.5초 block마다 `FlowODE.generate(..., terminal_step=K, return_terminal_clean=True)`를 한 번만 호출해 terminal clean estimate를 commit합니다.
 
-- `model.model_config.self_forced.sampling.random_terminal_step.scope=batch` 가 기본값입니다. 이 값은 per-rank mini-batch 공유 `s` fast path를 뜻합니다.
+- `model.model_config.self_forced.sampling.random_terminal_step.scope=global_batch` 가 기본값입니다. 이 값은 DDP 전체 rank 공유 `s` fast path를 뜻합니다.
 - `policy=paper_uniform` 은 `s in [1, sample_steps]` 를 바로 균등 샘플링합니다.
 - `policy=stability_warmup` 은 초반 `warmup_epochs` 동안 `K>=warmup_min_executed_steps` 만 허용한 뒤 전체 균등 샘플링으로 바꿉니다.
 - terminal step 이전 denoising은 gradient 없이 계산하고, terminal clean estimate를 만드는 마지막 호출 하나만 gradient를 유지합니다.
@@ -877,7 +877,7 @@ Self-forced H100 preset은 self-forced rollout에서 `sample_steps=32`를 유지
 
 ```bash
 python -m src.run experiment=self_forced_npfm_h100_6 \
-    model.model_config.self_forced.sampling.random_terminal_step.scope=batch \
+    model.model_config.self_forced.sampling.random_terminal_step.scope=global_batch \
     model.model_config.self_forced.sampling.random_terminal_step.policy=paper_uniform
 ```
 
@@ -909,7 +909,7 @@ bash scripts/self_forced_h100_6_with_oom_retry.sh
 | `CUDA_VISIBLE_DEVICES` | `0,1,2,3,4,5` | 사용할 GPU |
 | `NPROC_PER_NODE` | `6` | DDP rank 수 |
 | `EXPERIMENT` | `self_forced_npfm_h100_6` | hydra experiment 이름 |
-| `RANDOM_TERMINAL_SCOPE` | unset | random terminal scope override, normally `batch` |
+| `RANDOM_TERMINAL_SCOPE` | unset | random terminal scope override, normally `global_batch` |
 | `RANDOM_TERMINAL_POLICY` | unset | `paper_uniform` / `stability_warmup` override |
 | `RANDOM_TERMINAL_WARMUP_EPOCHS` | unset | random terminal warmup epoch override |
 | `RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS` | unset | warmup 중 허용할 최소 실행 step `K` override |
@@ -1379,7 +1379,7 @@ K commit block 수 = flow_window_steps / 5
 - self-forced checkpoint resume 에서는 checkpoint에 저장된 `F_rho` / `F_psi` state를 그대로 보존합니다. 즉, resume 직후 fit 시작 hook이 두 보조 모델을 현재 Generator weight로 다시 덮어쓰지 않습니다.
 - guidance 방향을 계산할 때는 `F_rho` 와 비교용 `F_psi` 를 항상 eval mode로 둡니다. 그래서 dropout/history drop 같은 train-mode 랜덤성이 기준 방향에 섞이지 않습니다. `F_psi` 는 detached generated path에 fit되는 online update 구간에서만 train mode로 전환됩니다.
 - committed self-rollout 을 만들 때는 현재 Generator를 eval mode로 잠깐 전환하되 autograd는 유지합니다. 따라서 dropout/history drop 없이 실제 inference 조건의 trajectory를 만들고, 그 trajectory를 통해 `sf_loss` gradient는 그대로 Generator로 흐릅니다.
-- inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 rank mini-batch 전체가 random terminal step `s` 를 하나 공유하고, 같은 self-rollout 안의 모든 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
+- inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 DDP 전체 rank가 random terminal step `s` 를 하나 공유하고, 모든 rank의 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
 - 같은 perturbed self-rollout state 에서 계산한 DMD식 score difference
   `s_\rho - s_\psi = \tau (\hat U_\rho - \hat U_\psi) / \sigma_\tau` 를 그대로 쓰지 않고,
   `X_\tau = \tau Y_\theta + \sigma_\tau \epsilon` 의 연결 관계를 반영해
@@ -1393,11 +1393,13 @@ K commit block 수 = flow_window_steps / 5
 
 ### Self-Forced random terminal denoising
 
-Self-forced fine-tuning은 학습 중 `self_forced.sampling.sample_steps` 값을 줄이지 않고도 평균 sampler 호출 수를 줄일 수 있습니다. `sample_steps=32`는 전체 denoising grid로 유지하고, 학습 rollout마다 각 DDP rank의 mini-batch 전체가 terminal denoising step `s` 하나를 공유합니다. 같은 rank 안의 scenario/agent와 0.5초 commit block들은 같은 `s`를 사용합니다.
+Self-forced fine-tuning은 학습 중 `self_forced.sampling.sample_steps` 값을 줄이지 않고도 평균 sampler 호출 수를 줄일 수 있습니다. `sample_steps=32`는 전체 denoising grid로 유지하고, 학습 rollout마다 DDP 전체 rank가 terminal denoising step `s` 하나를 공유합니다. rank0에서 뽑은 `s`를 모든 rank로 broadcast하므로, 모든 rank 안의 scenario/agent와 0.5초 commit block들은 같은 `s`를 사용합니다.
 
-학습 rollout에서는 `K = sample_steps + 1 - s` step까지만 진행한 뒤, 중간 noisy state를 commit하지 않고 terminal step에서 예측한 clean estimate를 2초 preview로 사용합니다. 그 preview 중 앞 0.5초만 기존 commit bridge로 반영합니다. terminal 이전 step은 gradient 없이 계산하고, terminal clean estimate를 만든 step 하나에만 gradient를 남깁니다. 이전 구현처럼 `torch.unique(K)` 로 terminal step별 agent group을 나눠 sampler를 여러 번 호출하지 않고, 0.5초 block마다 rank mini-batch 공유 `K` 로 `FlowODE.generate(..., terminal_step=K, return_terminal_clean=True)`를 한 번만 호출합니다. 다음 block의 context/cache로 들어가는 상태는 detach하여 미래 block loss가 이전 block 내부로 역전파되지 않게 합니다.
+학습 rollout에서는 `K = sample_steps + 1 - s` step까지만 진행한 뒤, 중간 noisy state를 commit하지 않고 terminal step에서 예측한 clean estimate를 2초 preview로 사용합니다. 그 preview 중 앞 0.5초만 기존 commit bridge로 반영합니다. terminal 이전 step은 gradient 없이 계산하고, terminal clean estimate를 만든 step 하나에만 gradient를 남깁니다. 이전 구현처럼 `torch.unique(K)` 로 terminal step별 agent group을 나눠 sampler를 여러 번 호출하지 않고, 0.5초 block마다 DDP 전체 rank가 공유한 `K` 로 `FlowODE.generate(..., terminal_step=K, return_terminal_clean=True)`를 한 번만 호출합니다. 다음 block의 context/cache로 들어가는 상태는 detach하여 미래 block loss가 이전 block 내부로 역전파되지 않게 합니다.
 
 Generated Path-Flow Estimator와 generator direction 계산도 같은 random-s 정보를 사용합니다. rollout에서 선택된 `s`는 tau 구간 `[tau_low, tau_high]`로 변환되고, `F_psi` 학습과 `F_rho - F_psi` 계산은 이 구간에서 샘플링한 tau를 사용합니다. `F_rho`와 `F_psi`는 항상 같은 noisy path와 같은 tau를 봅니다.
+
+DDP에서는 step 시간이 가장 늦게 끝난 rank에 맞춰지므로, rank마다 서로 다른 `s`를 뽑으면 짧은 `K`를 뽑은 rank가 긴 `K`를 뽑은 rank를 기다리게 됩니다. `scope=global_batch`는 이 대기 손실을 줄이기 위해 모든 rank가 같은 `K`를 쓰게 합니다. 단일 GPU 또는 torch.distributed가 초기화되지 않은 실행에서는 같은 설정이 자동으로 일반 batch 공유 방식처럼 동작합니다.
 
 ```yaml
 model:
@@ -1409,7 +1411,7 @@ model:
         noise_scale: 1.0
         random_terminal_step:
           enabled: true
-          scope: batch
+          scope: global_batch
           policy: paper_uniform
           warmup_epochs: 1
           warmup_min_executed_steps: 16

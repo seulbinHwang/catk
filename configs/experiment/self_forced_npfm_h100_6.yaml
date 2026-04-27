@@ -63,7 +63,7 @@ model:
         noise_scale: 1.0
         random_terminal_step:
           enabled: true
-          scope: batch
+          scope: global_batch
           # paper_uniform: 논문에 가장 충실하게 s를 1..sample_steps에서 바로 균등 샘플링합니다.
           # stability_warmup: 초반 warmup_epochs 동안 K>=warmup_min_executed_steps만 허용한 뒤 전체 균등으로 바꿉니다.
           policy: paper_uniform
