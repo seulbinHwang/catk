@@ -2103,8 +2103,22 @@ class SMARTFlow(LightningModule):
         )
         if committed_path_norm.numel() == 0:
             if fm_loss is None:
-                zero_loss = rollout["pred_traj_10hz"].new_zeros(())
-                self.log("train/loss", zero_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                # DDP requires backward on every rank to participate in the
+                # gradient all-reduce. Walk Generator parameters with a
+                # zero-coefficient sum so autograd traverses the param graph
+                # and DDP completes its all-reduce; skip optimizer.step()
+                # because the gradients are deterministically zero.
+                zero_loss = sum(
+                    p.sum() for p in self.encoder.parameters() if p.requires_grad
+                ) * 0.0
+                generator_optimizer = self.optimizers()[0]
+                self.toggle_optimizer(generator_optimizer)
+                try:
+                    generator_optimizer.zero_grad(set_to_none=True)
+                    self._manual_backward_without_autocast(zero_loss)
+                finally:
+                    self.untoggle_optimizer(generator_optimizer)
+                self.log("train/loss", zero_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("train/sf_anchor_fm_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
                 return zero_loss.detach()
