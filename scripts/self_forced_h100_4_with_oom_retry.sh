@@ -10,15 +10,15 @@
 # This is the 4xH100 sibling of `self_forced_h100_6_with_oom_retry.sh`; only
 # the GPU count, default `EXPERIMENT`, default `TASK_NAME` and CUDA device
 # list differ. Per-GPU memory ceiling is unchanged (same H100 80GB hardware),
-# so `INITIAL_BS` defaults to the same 20.
+# so `INITIAL_BS` defaults to the same conservative value.
 #
 # Required:
 #   PRETRAIN_CKPT  Path to the 2s-horizon pretrained Generator ckpt (the same
 #                  ckpt you would have passed to the bare `ckpt_path=` argument).
 #
 # Optional knobs (env vars; sensible defaults shown):
-#   INITIAL_BS=20        Initial `data.train_batch_size`. Defaults to the
-#                        preset's measured ceiling on H100 80GB.
+#   INITIAL_BS=12        Initial `data.train_batch_size`. Defaults to the
+#                        preset's conservative random-terminal setting.
 #   OOM_STEP=2           Decrement applied to `data.train_batch_size` per OOM.
 #   MIN_BS=2             Stop trying when `bs` would fall below this value.
 #   TASK_NAME=flow_semi_continuous_self_forced_h1004
@@ -26,6 +26,10 @@
 #   CUDA_VISIBLE_DEVICES=0,1,2,3
 #   NPROC_PER_NODE=4
 #   EXPERIMENT=self_forced_npfm_h100_4
+#   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform or stability_warmup.
+#   RANDOM_TERMINAL_WARMUP_EPOCHS= Optional warmup epoch override.
+#   RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS=
+#                                  Optional minimum K during warmup.
 #
 # Usage example:
 #   PRETRAIN_CKPT=/mnt/nuplan/projects/catk/downloads/wandb_ckpts/.../epoch_last.ckpt \
@@ -50,6 +54,17 @@ MIN_BS="${MIN_BS:-2}"
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:?must set PRETRAIN_CKPT to the 2s-horizon pretrained Generator ckpt}"
+
+EXTRA_OVERRIDES=()
+if [[ -n "${RANDOM_TERMINAL_POLICY:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.policy=${RANDOM_TERMINAL_POLICY}")
+fi
+if [[ -n "${RANDOM_TERMINAL_WARMUP_EPOCHS:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.warmup_epochs=${RANDOM_TERMINAL_WARMUP_EPOCHS}")
+fi
+if [[ -n "${RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.warmup_min_executed_steps=${RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS}")
+fi
 
 if [[ ! -f "$PRETRAIN_CKPT" ]]; then
   echo "ERROR: PRETRAIN_CKPT does not exist: $PRETRAIN_CKPT" >&2
@@ -87,6 +102,9 @@ while (( bs >= MIN_BS )); do
 
   log "Attempt #${attempt}: bs=${bs} action=${action} ckpt=${ckpt_path}"
   log "  per-attempt log -> ${attempt_log}"
+  if (( ${#EXTRA_OVERRIDES[@]} > 0 )); then
+    log "  extra overrides -> ${EXTRA_OVERRIDES[*]}"
+  fi
 
   # `tee` so the user can watch tqdm + Lightning logs live in this pane while
   # we still keep a per-attempt log file for OOM detection / post-hoc analysis.
@@ -104,6 +122,7 @@ while (( bs >= MIN_BS )); do
     task_name="$TASK_NAME" \
     ckpt_path="$ckpt_path" \
     data.train_batch_size="$bs" \
+    "${EXTRA_OVERRIDES[@]}" \
     2>&1 | tee "$attempt_log"
   exit_code=${PIPESTATUS[0]}
 

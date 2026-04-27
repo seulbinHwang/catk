@@ -930,6 +930,101 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             }
         return cloned_cache
 
+    def _sample_training_terminal_steps_by_scenario(
+        self,
+        sampling_scheme: DictConfig,
+        num_scenario: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        self_forced_epoch: int | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """scenario sequence마다 random terminal step을 하나씩 샘플링합니다."""
+        random_cfg = getattr(sampling_scheme, "random_terminal_step", None)
+        if self_forced_epoch is None or random_cfg is None:
+            return None, None, None, None
+        if not bool(getattr(random_cfg, "enabled", False)):
+            return None, None, None, None
+
+        sample_steps = int(getattr(sampling_scheme, "sample_steps", self.flow_ode.solver_steps))
+        if sample_steps <= 0:
+            raise ValueError(f"sample_steps must be positive, got {sample_steps}.")
+        if num_scenario < 0:
+            raise ValueError(f"num_scenario must be non-negative, got {num_scenario}.")
+
+        policy = str(getattr(random_cfg, "policy", "paper_uniform"))
+        max_terminal_s = sample_steps
+        if policy == "paper_uniform":
+            pass
+        elif policy in {"stability_warmup", "warmup_to_uniform"}:
+            warmup_epochs = max(0, int(getattr(random_cfg, "warmup_epochs", 1)))
+            warmup_min_executed_steps = int(
+                getattr(random_cfg, "warmup_min_executed_steps", min(16, sample_steps))
+            )
+            warmup_min_executed_steps = min(max(1, warmup_min_executed_steps), sample_steps)
+            if int(self_forced_epoch) < warmup_epochs:
+                max_terminal_s = sample_steps - warmup_min_executed_steps + 1
+        else:
+            raise ValueError(
+                "random_terminal_step.policy must be 'paper_uniform' or 'stability_warmup', "
+                f"got {policy!r}."
+            )
+
+        max_terminal_s = min(max(1, int(max_terminal_s)), sample_steps)
+        terminal_s = torch.randint(
+            low=1,
+            high=max_terminal_s + 1,
+            size=(int(num_scenario),),
+            device=device,
+            dtype=torch.long,
+        )
+        terminal_steps = sample_steps + 1 - terminal_s
+        terminal_steps_float = terminal_steps.to(dtype=dtype)
+        dt = (1.0 - float(self.flow_ode.eps)) / float(sample_steps)
+        tau_low = (float(self.flow_ode.eps) + (terminal_steps_float - 1.0) * dt).clamp(
+            min=float(self.flow_ode.eps),
+            max=1.0,
+        )
+        tau_high = (float(self.flow_ode.eps) + terminal_steps_float * dt).clamp(
+            min=float(self.flow_ode.eps),
+            max=1.0,
+        )
+        return terminal_steps, terminal_s, tau_low, tau_high
+
+    def _sample_random_s_rollout_for_active_agents(
+        self,
+        active_hidden: torch.Tensor,
+        x_init_norm: torch.Tensor,
+        active_terminal_steps: torch.Tensor,
+        flow_sample_steps: int,
+        flow_sample_method: str,
+    ) -> torch.Tensor:
+        """active agent를 terminal step별로 묶어 terminal clean estimate를 만듭니다."""
+        if active_hidden.numel() == 0:
+            return x_init_norm.new_zeros((0, self.flow_window_steps, 4))
+        if tuple(active_terminal_steps.shape) != (active_hidden.shape[0],):
+            raise ValueError(
+                "active_terminal_steps must have shape [n_active], "
+                f"got {tuple(active_terminal_steps.shape)} for n_active={active_hidden.shape[0]}."
+            )
+
+        y_hat_norm = x_init_norm.new_empty(
+            (active_hidden.shape[0], self.flow_window_steps, 4)
+        )
+        for terminal_step in torch.unique(active_terminal_steps, sorted=True):
+            group_mask = active_terminal_steps == terminal_step
+            hidden_group = active_hidden[group_mask]
+            x_init_group = x_init_norm[group_mask]
+            terminal_step_int = int(terminal_step.item())
+            y_hat_norm[group_mask] = self.flow_ode.generate(
+                x_init=x_init_group,
+                model_fn=lambda x_t, tau, hidden=hidden_group: self.flow_decoder(hidden, x_t, tau),
+                steps=flow_sample_steps,
+                method=flow_sample_method,
+                terminal_step=terminal_step_int,
+                return_terminal_clean=True,
+            )
+        return y_hat_norm
+
     def _rollout_from_cache_impl(
         self,
         rollout_cache: Dict[str, object],
@@ -940,6 +1035,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         scenario_sampling_seeds: torch.Tensor | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
+        self_forced_epoch: int | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -951,6 +1047,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 고정 난수 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
+            self_forced_epoch: self-forced 학습 epoch입니다. ``None`` 이면 random terminal
+                denoising step을 쓰지 않는 평가/추론 경로로 봅니다.
 
         Returns:
             Dict[str, torch.Tensor]:
@@ -1037,6 +1135,23 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds=scenario_sampling_seeds,
             agent_batch=tokenized_agent["batch"],
         )
+        (
+            terminal_steps_by_scenario,
+            terminal_s_by_scenario,
+            terminal_tau_low_by_scenario,
+            terminal_tau_high_by_scenario,
+        ) = self._sample_training_terminal_steps_by_scenario(
+            sampling_scheme=sampling_scheme,
+            num_scenario=int(tokenized_agent["num_graphs"]),
+            device=feat_a_now.device,
+            dtype=feat_a_now.dtype,
+            self_forced_epoch=self_forced_epoch,
+        )
+        terminal_step_by_agent = (
+            terminal_steps_by_scenario[tokenized_agent["batch"]]
+            if terminal_steps_by_scenario is not None
+            else None
+        )
 
         for t in range(n_step_future_2hz):
             n_step = pos_window.shape[1]
@@ -1098,8 +1213,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     )
                     current_hidden = self.a2a_attn_layers[i](current_hidden, r_a2a, edge_index_a2a)
                     if i + 1 < self.num_layers:
+                        current_hidden_for_cache = (
+                            current_hidden.detach()
+                            if terminal_step_by_agent is not None
+                            else current_hidden
+                        )
                         feat_a_t_dict[i + 1] = torch.cat(
-                            [feat_a_t_dict[i + 1], current_hidden.unsqueeze(1)],
+                            [feat_a_t_dict[i + 1], current_hidden_for_cache.unsqueeze(1)],
                             dim=1,
                         )
 
@@ -1117,28 +1237,37 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     active_mask,
                     noise_start : noise_start + sample_window_steps,
                 ].contiguous()
-                flow_sample_steps = getattr(
+                flow_sample_steps = int(getattr(
                     sampling_scheme,
                     "sample_steps",
                     self.flow_ode.solver_steps,
-                )
+                ))
                 flow_sample_method = getattr(
                     sampling_scheme,
                     "sample_method",
                     self.flow_ode.solver_method,
                 )
-                flow_sample_backprop_last_k = getattr(
-                    sampling_scheme,
-                    "backprop_last_k",
-                    None,
-                )
-                y_hat_norm = self.flow_ode.generate(
-                    x_init=x_init_norm,
-                    model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
-                    steps=flow_sample_steps,
-                    method=flow_sample_method,
-                    backprop_last_k=flow_sample_backprop_last_k,
-                )
+                if terminal_step_by_agent is None:
+                    flow_sample_backprop_last_k = getattr(
+                        sampling_scheme,
+                        "backprop_last_k",
+                        None,
+                    )
+                    y_hat_norm = self.flow_ode.generate(
+                        x_init=x_init_norm,
+                        model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
+                        steps=flow_sample_steps,
+                        method=flow_sample_method,
+                        backprop_last_k=flow_sample_backprop_last_k,
+                    )
+                else:
+                    y_hat_norm = self._sample_random_s_rollout_for_active_agents(
+                        active_hidden=active_hidden,
+                        x_init_norm=x_init_norm,
+                        active_terminal_steps=terminal_step_by_agent[active_mask],
+                        flow_sample_steps=flow_sample_steps,
+                        flow_sample_method=flow_sample_method,
+                    )
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
                 active_agent_type = tokenized_agent["type"][active_mask]
@@ -1266,6 +1395,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 exec_pos_history_act = torch.cat([current_pos_act.unsqueeze(1), commit_pos_act], dim=1)
                 exec_head_history_act = torch.cat([current_head_act.unsqueeze(1), commit_head_act], dim=1)
                 exec_valid_history_act = torch.ones_like(exec_head_history_act, dtype=torch.bool)
+                if terminal_step_by_agent is not None:
+                    exec_pos_history_act = exec_pos_history_act.detach()
+                    exec_head_history_act = exec_head_history_act.detach()
+                    exec_valid_history_act = exec_valid_history_act.detach()
                 exec_pos_history_10hz[active_mask] = exec_pos_history_act
                 exec_head_history_10hz[active_mask] = exec_head_history_act
                 exec_valid_history_10hz[active_mask] = exec_valid_history_act
@@ -1276,24 +1409,39 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             pred_traj_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_traj_step
             pred_head_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_head_step
 
+            next_pos_for_context = (
+                next_pos.detach() if terminal_step_by_agent is not None else next_pos
+            )
+            next_head_for_context = (
+                next_head.detach() if terminal_step_by_agent is not None else next_head
+            )
             next_valid = active_mask.clone()
-            coarse_pos_list.append(next_pos.clone())
-            coarse_head_list.append(next_head.clone())
+            coarse_pos_list.append(next_pos_for_context.clone())
+            coarse_head_list.append(next_head_for_context.clone())
             coarse_valid_list.append(next_valid.clone())
             coarse_idx_list.append(next_token_idx.clone())
 
             pred_idx_window = torch.cat([pred_idx_window, next_token_idx.unsqueeze(1)], dim=1)
             valid_window = torch.cat([valid_window, next_valid.unsqueeze(1)], dim=1)
-            pos_window = torch.cat([pos_window, next_pos.unsqueeze(1)], dim=1)
-            head_window = torch.cat([head_window, next_head.unsqueeze(1)], dim=1)
-            head_vector_next = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+            pos_window = torch.cat([pos_window, next_pos_for_context.unsqueeze(1)], dim=1)
+            head_window = torch.cat([head_window, next_head_for_context.unsqueeze(1)], dim=1)
+            head_vector_next = torch.stack(
+                [next_head_for_context.cos(), next_head_for_context.sin()], dim=-1
+            )
             head_vector_window = torch.cat([head_vector_window, head_vector_next.unsqueeze(1)], dim=1)
 
             agent_token_emb_next = torch.zeros_like(agent_token_emb[:, 0])
             agent_token_emb_next[veh_mask] = agent_token_emb_veh[next_token_idx[veh_mask]]
             agent_token_emb_next[ped_mask] = agent_token_emb_ped[next_token_idx[ped_mask]]
             agent_token_emb_next[cyc_mask] = agent_token_emb_cyc[next_token_idx[cyc_mask]]
-            agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next.unsqueeze(1)], dim=1)
+            agent_token_emb_next_for_context = (
+                agent_token_emb_next.detach()
+                if terminal_step_by_agent is not None
+                else agent_token_emb_next
+            )
+            agent_token_emb = torch.cat(
+                [agent_token_emb, agent_token_emb_next_for_context.unsqueeze(1)], dim=1
+            )
 
             motion_vector_a = pos_window[:, -1] - pos_window[:, -2]
             x_a = torch.stack(
@@ -1307,8 +1455,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 dim=-1,
             )
             x_a = self.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)
-            feat_a_next = self.fusion_emb(torch.cat([agent_token_emb_next, x_a], dim=-1).unsqueeze(1))
-            feat_a = torch.cat([feat_a, feat_a_next], dim=1)
+            feat_a_next = self.fusion_emb(
+                torch.cat([agent_token_emb_next_for_context, x_a], dim=-1).unsqueeze(1)
+            )
+            feat_a_next_for_context = (
+                feat_a_next.detach() if terminal_step_by_agent is not None else feat_a_next
+            )
+            feat_a = torch.cat([feat_a, feat_a_next_for_context], dim=1)
 
             if pos_window.shape[1] > max_context_steps:
                 pos_window = pos_window[:, -max_context_steps:]
@@ -1346,6 +1499,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             out_dict["pred_flow_preview_valid"] = pred_flow_2s_valid
             out_dict["pred_flow_2s_traj"] = pred_flow_2s_traj
             out_dict["pred_flow_2s_valid"] = pred_flow_2s_valid
+        if terminal_steps_by_scenario is not None:
+            out_dict["sf_terminal_step_by_scenario"] = terminal_steps_by_scenario
+            out_dict["sf_terminal_s_by_scenario"] = terminal_s_by_scenario
+            out_dict["sf_terminal_tau_low_by_scenario"] = terminal_tau_low_by_scenario
+            out_dict["sf_terminal_tau_high_by_scenario"] = terminal_tau_high_by_scenario
         return out_dict
 
     @torch.no_grad()
@@ -1395,6 +1553,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         rollout_steps_2hz: int | None = None,
+        self_forced_epoch: int | None = None,
     ) -> Dict[str, torch.Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -1407,6 +1566,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. 기본 self-forced 학습은
                 ``flow_window_steps / 5`` 를 넘깁니다.
+            self_forced_epoch: 현재 self-forced epoch입니다. random terminal denoising step
+                정책의 warmup 판정에 사용합니다.
 
         Returns:
             Dict[str, torch.Tensor]: N초 committed self-rollout 결과입니다.
@@ -1420,6 +1581,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=False,
             rollout_steps_2hz=rollout_steps_2hz,
+            self_forced_epoch=self_forced_epoch,
         )
 
     def path_flow_velocity_for_anchor0(

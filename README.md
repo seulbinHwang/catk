@@ -840,7 +840,7 @@ torchrun \
 ### 5.10 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
-- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `estimator_updates_per_step=5`, `freeze_map_encoder=true`, sampling = Euler 32-step / `noise_scale=1.0` / `backprop_last_k=24`). 6x H100 80GB 한정으로 `train_batch_size=20` 을 preset 기본으로 박아 두었습니다 — 30-step probe 실측에서 rank 0 peak 74.85% (~59 GB), 4.35 s/step. bs=22 는 80.5% 까지 올라가 cross-rank 변동성 (5–10 GB) 대비 margin 이 부족하고 throughput 이득은 ~1.5% 에 불과하며, bs=24 는 step 2 에서 rank 1 OOM 으로 죽습니다.
+- 베이스: `self_forced_npfm.yaml` 과 동일 (lr `2e-4`, `weight=1.0`, `anchor_weight=0.1`, `path_step_size=0.05`, `freeze_map_encoder=true`, sampling = Euler 32-step / `noise_scale=1.0` / random terminal denoising step). 6x H100 preset은 실제 장비 OOM 여유를 위해 `train_batch_size` 를 보수적으로 둡니다.
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
 - 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/scheduler/epoch 를 resume하지 않고 pretrained weight만 로드합니다.
 - 전제: `ckpt_path` 에는 같은 `flow_window_steps` 로 pretrain 된 Generator checkpoint 를 넣습니다. 모델 default 는 `flow_window_steps=20` (2초) 이고, ckpt 가 2초 horizon 으로 pretrain 된 경우 override 하지 않는 편이 안전합니다.
@@ -865,11 +865,11 @@ torchrun \
 
 보호 장치도 있습니다. self-forced가 켜진 상태에서 `action=finetune` 에 self-forced checkpoint를 넣으면 실행이 중단됩니다. 반대로 `action=fit` 에 self-forced 보조 state가 없는 pretrained checkpoint를 넣어도 중단됩니다. 즉, pretrained Generator에서 처음 시작할 때는 `action=finetune`, self-forced run을 이어갈 때는 `action=fit` 으로 분리해야 합니다.
 
-`train_batch_size=20` 은 6x H100 80GB 에서 self-rollout (32-step Euler, 기본 마지막 24 step backprop) + 5x estimator 업데이트 부담을 고려한 측정 ceiling 입니다. WOMD train set 486,995 scenarios 기준 1 epoch 약 4,058 step ≈ 4.9 시간 (mean 4.35 s/step). closed-loop self-forced rollout 이 `model.model_config.self_forced.sampling.backprop_last_k` 를 실제 flow ODE sampling 에 전달하므로, 이 값을 줄이면 메모리를 더 절약하고 더 큰 batch 도 가능합니다.
+Self-forced 학습 rollout은 `sample_steps=32` grid를 유지하되, 학습 중에는 scenario별 random terminal step `s` 를 뽑아 `K = sample_steps + 1 - s` step까지만 실행하고 terminal clean estimate를 commit합니다. validation/inference는 기존처럼 full 32-step sampling을 유지합니다.
 
 ```bash
-# self-rollout backprop 을 마지막 4 step 에만 남기고 batch 더 키우기 (실측 후 사용)
-... data.train_batch_size=24 model.model_config.self_forced.sampling.backprop_last_k=4
+# 초반 안정성 warmup: warmup 동안 K가 너무 짧은 terminal step을 피합니다.
+... model.model_config.self_forced.sampling.random_terminal_step.policy=stability_warmup
 ```
 
 #### CUDA OOM 자동 fallback 으로 무중단 재개
@@ -892,7 +892,7 @@ bash scripts/self_forced_h100_6_with_oom_retry.sh
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `INITIAL_BS` | `20` | 첫 시도 `data.train_batch_size` (preset ceiling) |
+| `INITIAL_BS` | `12` | 첫 시도 `data.train_batch_size` (preset 기본값) |
 | `OOM_STEP` | `2` | OOM 한 번당 줄일 batch 크기 |
 | `MIN_BS` | `2` | 이 값 미만으로 내려가면 중단 |
 | `TASK_NAME` | `flow_semi_continuous_self_forced_h1006` | checkpoint / log 위치 결정 |
@@ -900,6 +900,9 @@ bash scripts/self_forced_h100_6_with_oom_retry.sh
 | `CUDA_VISIBLE_DEVICES` | `0,1,2,3,4,5` | 사용할 GPU |
 | `NPROC_PER_NODE` | `6` | DDP rank 수 |
 | `EXPERIMENT` | `self_forced_npfm_h100_6` | hydra experiment 이름 |
+| `RANDOM_TERMINAL_POLICY` | unset | `paper_uniform` / `stability_warmup` override |
+| `RANDOM_TERMINAL_WARMUP_EPOCHS` | unset | random terminal warmup epoch override |
+| `RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS` | unset | warmup 중 허용할 최소 실행 step `K` override |
 
 각 시도의 로그는 `logs/_self_forced_oom_retry/<TASK_NAME>/attempt_NNN_bsBB.log` 로 분리 저장되어, 어느 시도에서 OOM 이 났는지 / 어디서 다음 시도가 이어 받았는지 사후 추적 가능합니다.
 
@@ -1366,7 +1369,7 @@ K commit block 수 = flow_window_steps / 5
 - self-forced checkpoint resume 에서는 checkpoint에 저장된 `F_rho` / `F_psi` state를 그대로 보존합니다. 즉, resume 직후 fit 시작 hook이 두 보조 모델을 현재 Generator weight로 다시 덮어쓰지 않습니다.
 - guidance 방향을 계산할 때는 `F_rho` 와 비교용 `F_psi` 를 항상 eval mode로 둡니다. 그래서 dropout/history drop 같은 train-mode 랜덤성이 기준 방향에 섞이지 않습니다. `F_psi` 는 detached generated path에 fit되는 online update 구간에서만 train mode로 전환됩니다.
 - committed self-rollout 을 만들 때는 현재 Generator를 eval mode로 잠깐 전환하되 autograd는 유지합니다. 따라서 dropout/history drop 없이 실제 inference 조건의 trajectory를 만들고, 그 trajectory를 통해 `sf_loss` gradient는 그대로 Generator로 흐릅니다.
-- inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 각 flow ODE sample 은 `model.model_config.self_forced.sampling.backprop_last_k` 를 존중해 마지막 K step에만 gradient를 남길 수 있습니다.
+- inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 scenario별 random terminal step `s` 를 하나 뽑고, 같은 self-rollout 안의 모든 0.5초 commit block이 같은 `s` 를 공유합니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
 - 같은 perturbed self-rollout state 에서 계산한 DMD식 score difference
   `s_\rho - s_\psi = \tau (\hat U_\rho - \hat U_\psi) / \sigma_\tau` 를 그대로 쓰지 않고,
   `X_\tau = \tau Y_\theta + \sigma_\tau \epsilon` 의 연결 관계를 반영해
@@ -1377,6 +1380,37 @@ K commit block 수 = flow_window_steps / 5
 - bf16-mixed 안전 backward boundary. self-forced 경로의 forward 와 loss 계산은 mixed precision 으로 유지하되, `manual_backward` 호출 순간만 autocast 를 끄고 scalar loss 를 fp32 로 넘깁니다. 이는 manual optimization 에서 반복 backward 를 수행할 때 PyTorch autocast promote 규칙이 backward graph 의 dtype 을 다시 분류하다가 실패하는 문제를 피하기 위한 경계입니다.
 - autograd-safe temporal edge remap. training rollout 에서는 temporal relation embedding 계산에 쓴 원본 `edge_index_t` 를 in-place 수정하지 않고, current-agent attention 용 remapped edge index 를 새 tensor 로 만들어 사용합니다.
 - autograd-safe geometry helpers. agent encoder / flow agent decoder 의 edge feature (relative position norm, relative angle) 는 정지 또는 중첩된 agent 가 만드는 영벡터에 대해 backward 가 정의되지 않습니다 (`torch.norm` 의 `x/||x||` 가 `0/0`, `atan2(0, 0)` 의 `1/(y²+x²)` 가 `1/0`). self-forced rollout 처럼 이 feature 들이 살아있는 backward graph 의 일부가 되는 경로에서 한 번이라도 영벡터가 들어오면 NaN gradient 가 encoder weight 까지 흘러 학습이 첫 step 에서 죽습니다. 이를 막기 위해 `safe_norm_2d` helper 가 `(sum(x²) + eps).sqrt()` 형태로 norm 의 backward 분모를 strictly positive 로 유지하고, `angle_between_2d_vectors` 는 상대 벡터가 0일 때 기준 heading 방향을 대체값으로 써서 상대각 0 의미를 보존합니다. flow heading 복원도 `safe_angle_from_2d_vector` 로 통일해 heading vector 가 `[0, 0]` 일 때 `atan2(0, 0)` backward 가 생기지 않게 했습니다. self-forced generator backward 에서 non-finite 가 재발하면 `committed_path_norm`, `path_delta`, `target_path_norm` 요약과 첫 non-finite gradient 이름을 함께 출력하되, 정상 step 에서는 큰 텐서를 스캔하지 않습니다.
+
+### Self-Forced random terminal denoising
+
+Self-forced fine-tuning은 학습 중 `self_forced.sampling.sample_steps` 값을 줄이지 않고도 평균 sampler 호출 수를 줄일 수 있습니다. `sample_steps=32`는 전체 denoising grid로 유지하고, 학습 rollout마다 scenario sequence별 terminal denoising step `s`를 하나 샘플링합니다. 같은 scenario의 0.5초 commit block들은 같은 `s`를 공유합니다.
+
+학습 rollout에서는 `K = sample_steps + 1 - s` step까지만 진행한 뒤, 중간 noisy state를 commit하지 않고 terminal step에서 예측한 clean estimate를 2초 preview로 사용합니다. 그 preview 중 앞 0.5초만 기존 commit bridge로 반영합니다. terminal 이전 step은 gradient 없이 계산하고, terminal clean estimate를 만든 step 하나에만 gradient를 남깁니다. 다음 block의 context/cache로 들어가는 상태는 detach하여 미래 block loss가 이전 block 내부로 역전파되지 않게 합니다.
+
+Generated Path-Flow Estimator와 generator direction 계산도 같은 random-s 정보를 사용합니다. rollout에서 선택된 `s`는 tau 구간 `[tau_low, tau_high]`로 변환되고, `F_psi` 학습과 `F_rho - F_psi` 계산은 이 구간에서 샘플링한 tau를 사용합니다. `F_rho`와 `F_psi`는 항상 같은 noisy path와 같은 tau를 봅니다.
+
+```yaml
+model:
+  model_config:
+    self_forced:
+      sampling:
+        sample_steps: 32
+        sample_method: euler
+        noise_scale: 1.0
+        random_terminal_step:
+          enabled: true
+          policy: paper_uniform
+          warmup_epochs: 1
+          warmup_min_executed_steps: 16
+```
+
+더 안정적인 초반 학습을 원하면 CLI에서 아래처럼 바꿀 수 있습니다.
+
+```bash
+model.model_config.self_forced.sampling.random_terminal_step.policy=stability_warmup
+```
+
+`stability_warmup`은 초반 `warmup_epochs` 동안 `K >= warmup_min_executed_steps`만 허용합니다. 예를 들어 `sample_steps=32`, `warmup_min_executed_steps=16`이면 warmup 중에는 `s<=17`만 샘플링하고, 그 뒤에는 `s∈[1,32]` 전체 균등 샘플링으로 바뀝니다. validation과 inference는 기존처럼 full 32-step sampling을 유지합니다.
 
 최종 inference 모델은 여전히 fine-tuning 된 Generator 하나뿐입니다. `F_rho` 와 `F_psi` 는 학습 시점 보조 모델이며 submission export 에는 사용하지 않습니다.
 

@@ -61,7 +61,13 @@ model:
         sample_steps: 32
         sample_method: euler
         noise_scale: 1.0
-        backprop_last_k: 4
+        random_terminal_step:
+          enabled: true
+          # paper_uniform: 논문에 가장 충실하게 s를 1..sample_steps에서 바로 균등 샘플링합니다.
+          # stability_warmup: 초반 warmup_epochs 동안 K>=warmup_min_executed_steps만 허용한 뒤 전체 균등으로 바꿉니다.
+          policy: paper_uniform
+          warmup_epochs: 1
+          warmup_min_executed_steps: 16
 
 ckpt_path: null
 
@@ -93,13 +99,8 @@ callbacks:
     mode: max
 
 data:
-  # Measured ceiling on 6x H100 80GB with bf16-mixed and the preset's
-  # rollout setup (32-step Euler, backprop_last_k=24, 5 estimator updates):
-  #   bs=20 -> rank 0 peak 74.85% (~59 GB), 4.35 s/step (safe; recommended)
-  #   bs=22 -> rank 0 peak 80.50% (~64 GB), 4.71 s/step (≤2% faster, tight)
-  #   bs=24 -> rank 1 OOM at step 2 (cross-rank variance pushes >79 GB)
-  # bs=20 leaves ~10 GB headroom against typical 5-10 GB per-rank batch
-  # variance, and gives the lowest 1-epoch wall time without OOM risk.
+  # Conservative per-GPU batch for self-forced random terminal denoising.
+  # Increase only after a fresh memory probe on the target H100 box.
   train_batch_size: 12
   val_batch_size: 16
   test_batch_size: 16

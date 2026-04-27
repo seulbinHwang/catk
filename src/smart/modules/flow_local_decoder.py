@@ -125,18 +125,138 @@ class FlowODE:
         beta = self._beta()
         return 1.0 - beta * tau
 
-    def sample(self, clean: torch.Tensor, target_type: str = "velocity") -> FlowSample:
+    def tau_interval_for_terminal_step(
+        self,
+        steps: int,
+        terminal_step: int,
+    ) -> tuple[float, float]:
+        """terminal denoising step에 대응되는 tau 구간을 계산합니다.
+
+        Args:
+            steps: 전체 denoising grid 개수입니다. 예를 들어 shape과 무관한 scalar 값
+                ``32`` 입니다.
+            terminal_step: 실제로 실행할 마지막 step 번호입니다. ``1``이면 noise에
+                가장 가까운 첫 step이고, ``steps``이면 clean에 가장 가까운 마지막
+                step입니다.
+
+        Returns:
+            tuple[float, float]: tau 하한과 상한입니다. 각 값은 scalar입니다.
+        """
+        steps = int(steps)
+        terminal_step = int(terminal_step)
+        if steps <= 0:
+            raise ValueError(f"steps must be positive, got {steps}.")
+        if terminal_step < 1 or terminal_step > steps:
+            raise ValueError(
+                "terminal_step must be in [1, steps], "
+                f"got terminal_step={terminal_step}, steps={steps}."
+            )
+        dt = (1.0 - float(self.eps)) / float(steps)
+        tau_low = float(self.eps) + float(terminal_step - 1) * dt
+        tau_high = float(self.eps) + float(terminal_step) * dt
+        return tau_low, min(tau_high, 1.0)
+
+    def _expand_tau_bound(
+        self,
+        bound: float | torch.Tensor | None,
+        clean: torch.Tensor,
+        default_value: float,
+        name: str,
+    ) -> torch.Tensor:
+        """tau 하한이나 상한을 batch 길이에 맞춥니다.
+
+        Args:
+            bound: scalar 값 또는 path별 값입니다. tensor인 경우 shape은 ``[]`` 또는
+                ``[n_path]`` 입니다.
+            clean: clean path입니다. shape은 ``[n_path, n_step, 4]`` 입니다.
+            default_value: ``bound`` 가 없을 때 쓸 scalar 값입니다.
+            name: 오류 메시지에 사용할 이름입니다.
+
+        Returns:
+            torch.Tensor: path별 tau 경계입니다. shape은 ``[n_path]`` 입니다.
+        """
+        batch_size = int(clean.shape[0])
+        if bound is None:
+            return clean.new_full((batch_size,), float(default_value))
+        if torch.is_tensor(bound):
+            bound_tensor = bound.to(device=clean.device, dtype=clean.dtype)
+            if bound_tensor.ndim == 0:
+                return bound_tensor.expand(batch_size)
+            if tuple(bound_tensor.shape) != (batch_size,):
+                raise ValueError(
+                    f"{name} must have shape [] or [n_path], "
+                    f"got {tuple(bound_tensor.shape)} for n_path={batch_size}."
+                )
+            return bound_tensor
+        return clean.new_full((batch_size,), float(bound))
+
+    def _sample_tau(
+        self,
+        clean: torch.Tensor,
+        tau_low: float | torch.Tensor | None = None,
+        tau_high: float | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """clean path별 tau를 지정 구간에서 샘플링합니다.
+
+        Args:
+            clean: clean path입니다. shape은 ``[n_path, n_step, 4]`` 입니다.
+            tau_low: tau 하한입니다. ``None`` 이면 ``eps`` 를 사용합니다. tensor인 경우
+                shape은 ``[]`` 또는 ``[n_path]`` 입니다.
+            tau_high: tau 상한입니다. ``None`` 이면 ``1`` 을 사용합니다. tensor인 경우
+                shape은 ``[]`` 또는 ``[n_path]`` 입니다.
+
+        Returns:
+            torch.Tensor: path별 tau입니다. shape은 ``[n_path]`` 입니다.
+        """
+        low = self._expand_tau_bound(
+            bound=tau_low,
+            clean=clean,
+            default_value=float(self.eps),
+            name="tau_low",
+        )
+        high = self._expand_tau_bound(
+            bound=tau_high,
+            clean=clean,
+            default_value=1.0,
+            name="tau_high",
+        )
+        low = low.clamp(min=float(self.eps), max=1.0)
+        high = high.clamp(min=float(self.eps), max=1.0)
+        if torch.any(high <= low):
+            raise ValueError("tau_high must be larger than tau_low for every path.")
+        unit = torch.rand(clean.shape[0], device=clean.device, dtype=clean.dtype)
+        return low + unit * (high - low)
+
+    def sample(
+        self,
+        clean: torch.Tensor,
+        target_type: str = "velocity",
+        tau_low: float | torch.Tensor | None = None,
+        tau_high: float | torch.Tensor | None = None,
+    ) -> FlowSample:
+        """clean path에 noise를 섞어 flow matching 학습 샘플을 만듭니다.
+
+        Args:
+            clean: clean path입니다. shape은 ``[n_path, n_step, 4]`` 입니다.
+            target_type: 현재는 ``"velocity"`` 만 지원합니다.
+            tau_low: tau 하한입니다. ``None`` 이면 전체 구간의 하한 ``eps`` 를 씁니다.
+                tensor인 경우 shape은 ``[]`` 또는 ``[n_path]`` 입니다.
+            tau_high: tau 상한입니다. ``None`` 이면 전체 구간의 상한 ``1`` 을 씁니다.
+                tensor인 경우 shape은 ``[]`` 또는 ``[n_path]`` 입니다.
+
+        Returns:
+            FlowSample: noisy path, target velocity, tau를 담습니다. ``x_t`` 와
+            ``target`` shape은 ``[n_path, n_step, 4]`` 이고, ``tau`` shape은
+            ``[n_path]`` 입니다.
+        """
         if target_type != "velocity":
             raise ValueError(f"Unsupported target_type: {target_type}")
 
-        tau = torch.rand(clean.shape[0], device=clean.device, dtype=clean.dtype)
-        tau = tau * (1.0 - self.eps) + self.eps
-
+        tau = self._sample_tau(clean=clean, tau_low=tau_low, tau_high=tau_high)
         noise = torch.randn_like(clean)
         view_tau = tau.view(-1, 1, 1)
         view_sigma = self._sigma_t(tau).view(-1, 1, 1)
         beta = self._beta()
-
         x_t = view_sigma * noise + view_tau * clean
         target = clean - beta * noise
         return FlowSample(x_t=x_t, target=target, tau=tau)
@@ -158,37 +278,69 @@ class FlowODE:
         steps: Optional[int] = None,
         method: Optional[str] = None,
         backprop_last_k: Optional[int] = None,
+        terminal_step: Optional[int] = None,
+        return_terminal_clean: bool = False,
     ) -> torch.Tensor:
-        """ODE 샘플링으로 최종 clean future를 만듭니다.
+        """ODE 샘플링으로 정규화 미래를 만듭니다.
 
         Args:
             x_init: 시작 잡음 상태입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
             model_fn: 현재 상태와 시간 ``tau`` 를 받아 속도를 돌려주는 함수입니다.
-            steps: 샘플링 step 수입니다. ``None`` 이면 기본 solver step을 씁니다.
+                입력 shape은 ``x_t=[n_valid_anchor, 20, 4]``, ``tau=[n_valid_anchor]`` 입니다.
+            steps: 전체 denoising grid 개수입니다. ``None`` 이면 기본 solver step을 씁니다.
             method: 적분 방식입니다. ``None`` 이면 기본 solver 방식을 씁니다.
             backprop_last_k: 마지막 몇 step에만 gradient를 남길지 정합니다.
-                ``None`` 이면 전체 step을 역전파합니다.
+                ``None`` 이면 전체 step을 역전파합니다. ``return_terminal_clean=True`` 일 때는
+                terminal step 하나만 gradient를 남깁니다.
+            terminal_step: 전체 grid 중 실제로 실행할 마지막 step 번호입니다. ``None`` 이면
+                ``steps`` 를 끝까지 실행합니다.
+            return_terminal_clean: ``True`` 면 마지막 noisy 상태를 그대로 반환하지 않고,
+                terminal step에서 예측한 clean estimate를 반환합니다.
 
         Returns:
-            torch.Tensor: 최종 정규화 미래입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+            torch.Tensor: 정규화 미래입니다. shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
         """
-        steps = self.solver_steps if steps is None else steps
+        steps = self.solver_steps if steps is None else int(steps)
         method = self.solver_method if method is None else method
+        max_step = steps if terminal_step is None else int(terminal_step)
+        if steps <= 0:
+            raise ValueError(f"steps must be positive, got {steps}.")
+        if max_step < 1 or max_step > steps:
+            raise ValueError(
+                "terminal_step must be in [1, steps], "
+                f"got terminal_step={max_step}, steps={steps}."
+            )
 
         x_t = x_init
         t0 = self.eps
         dt = (1.0 - t0) / float(steps)
 
-        if backprop_last_k is None or int(backprop_last_k) >= int(steps):
+        if return_terminal_clean:
+            for i in range(max_step - 1):
+                t = t0 + i * dt
+                tau = x_t.new_full((x_t.shape[0],), t)
+                with torch.no_grad():
+                    x_t = self._integrate_one_step(
+                        x_t=x_t,
+                        tau=tau,
+                        dt=dt,
+                        method=method,
+                        model_fn=model_fn,
+                    )
+                x_t = x_t.detach()
+            terminal_tau = x_t.new_full((x_t.shape[0],), t0 + (max_step - 1) * dt)
+            velocity = model_fn(x_t, terminal_tau)
+            return self.predict_clean_from_velocity(x_t, velocity, terminal_tau)
+
+        if backprop_last_k is None or int(backprop_last_k) >= int(max_step):
             grad_start_step = 0
         else:
-            grad_start_step = max(0, int(steps) - max(0, int(backprop_last_k)))
+            grad_start_step = max(0, int(max_step) - max(0, int(backprop_last_k)))
 
-        for i in range(steps):
+        for i in range(max_step):
             t = t0 + i * dt
             tau = x_t.new_full((x_t.shape[0],), t)
             use_grad = i >= grad_start_step
-
             if use_grad:
                 x_t = self._integrate_one_step(
                     x_t=x_t,
@@ -207,7 +359,6 @@ class FlowODE:
                         model_fn=model_fn,
                     )
                 x_t = x_t.detach()
-
         return x_t
 
     def _integrate_one_step(
