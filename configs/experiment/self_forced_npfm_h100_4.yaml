@@ -57,7 +57,7 @@ model:
       start_epoch: 0
       weight: 1.0
       path_step_size: 0.05
-      anchor_weight: 0.1
+      anchor_weight: 0.5
       use_anchor_flow_matching_loss: true
       generated_estimator_lr: 2e-4
       estimator_updates_per_step: 1
