@@ -9,6 +9,7 @@ model_config:
   n_rollout_closed_val: 8
   n_batch_sim_agents_metric: 10
   sim_agents_metric_workers: 3
+  sim_agents_metric_backend: "official"
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0

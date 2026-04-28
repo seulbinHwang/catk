@@ -13,4 +13,5 @@
 
 from src.smart.metrics.min_ade import minADE
 from src.smart.metrics.sim_agents_metrics import SimAgentsMetrics
+from src.smart.metrics.sim_agents_metrics_torch import SimAgentsTorchMetrics
 from src.smart.metrics.sim_agents_submission import SimAgentsSubmission

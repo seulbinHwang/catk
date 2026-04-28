@@ -14,7 +14,7 @@ from lightning import LightningModule
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
-from src.smart.metrics import SimAgentsMetrics, SimAgentsSubmission, minADE
+from src.smart.metrics import SimAgentsMetrics, SimAgentsTorchMetrics, SimAgentsSubmission, minADE
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_2s,
@@ -30,7 +30,6 @@ from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils import transform_to_local, wrap_angle
 from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
 from src.smart.utils.godfm_config import GodFMConfig, parse_godfm_config
-from src.smart.utils.valuetrain import ValueTrainConfig, set_model_for_valuetraining
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -114,11 +113,6 @@ class SMARTFlow(LightningModule):
             model_config.finetune,
         )
 
-        self.valuetrain_config: ValueTrainConfig = set_model_for_valuetraining(
-            self.encoder,
-            getattr(model_config, "valuetrain", None),
-        )
-
         self.adjoint_matching_loss = None
         if self.finetune_config.enabled:
             self.adjoint_matching_loss = AdjointMatchingLoss(
@@ -128,16 +122,6 @@ class SMARTFlow(LightningModule):
                 smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
                 smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
                 rollout_time_grid=self.finetune_config.rollout_time_grid,
-            )
-        
-        if self.valuetrain_config.enabled:
-            self.valuetrain_loss = ValueTrainLoss(
-                rollout_steps=self.valuetrain_config.rollout_steps,
-                rollout_noise_scale=self.valuetrain_config.rollout_noise_scale,
-                feasible_weight=self.valuetrain_config.feasible_weight,
-                smooth_deadzone_epsilon=self.valuetrain_config.smooth_deadzone_epsilon,
-                smooth_deadzone_tau=self.valuetrain_config.smooth_deadzone_tau,
-                rollout_time_grid=self.valuetrain_config.rollout_time_grid,
             )
 
         self.godfm_config: GodFMConfig = parse_godfm_config(
@@ -156,10 +140,17 @@ class SMARTFlow(LightningModule):
             )
 
         self.minADE = minADE()
-        self.sim_agents_metrics = SimAgentsMetrics(
-            "val_closed",
-            max_workers=model_config.sim_agents_metric_workers,
-        )
+        _sim_agents_backend = str(getattr(model_config, "sim_agents_metric_backend", "official"))
+        if _sim_agents_backend == "torch":
+            self.sim_agents_metrics = SimAgentsTorchMetrics(
+                "val_closed",
+                ego_only=False,
+            )
+        else:
+            self.sim_agents_metrics = SimAgentsMetrics(
+                "val_closed",
+                max_workers=model_config.sim_agents_metric_workers,
+            )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
 
         self.n_rollout_closed_val = int(getattr(model_config, "n_rollout_closed_val", 8))
@@ -1025,6 +1016,21 @@ class SMARTFlow(LightningModule):
         )
         return goal, goal_valid
 
+    @staticmethod
+    def _build_rollout_tokenized_agent(tokenized_agent: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        """Reconstruct gt_pos/heading/idx/valid_mask from ctx_sampled_* for rollout.
+
+        In training mode FlowTokenProcessor pops gt_pos, gt_heading, gt_idx, valid_mask.
+        ctx_sampled_* carry the same historical 2-Hz positions and are never popped,
+        so we alias them back under the names prepare_inference_cache expects.
+        """
+        rollout_ta = dict(tokenized_agent)
+        rollout_ta["gt_pos"] = tokenized_agent["ctx_sampled_pos"]
+        rollout_ta["gt_heading"] = tokenized_agent["ctx_sampled_heading"]
+        rollout_ta["gt_idx"] = tokenized_agent["ctx_sampled_idx"]
+        rollout_ta["valid_mask"] = tokenized_agent["ctx_valid"]
+        return rollout_ta
+
     @torch.no_grad()
     def _collect_godfm_pairs_from_current_batch(
         self,
@@ -1036,28 +1042,39 @@ class SMARTFlow(LightningModule):
                 torch.empty((0, 0), dtype=torch.float32),
                 torch.empty((0, 20, 4), dtype=torch.float32),
             )
-        required_keys = {"gt_pos", "gt_heading", "valid_mask", "batch", "type", "token_agent_shape"}
+        # ctx_sampled_* are kept in both training and eval modes; gt_pos/valid_mask
+        # are popped in training mode, so we must not check for them here.
+        required_keys = {
+            "ctx_sampled_pos", "ctx_sampled_heading", "ctx_sampled_idx", "ctx_valid",
+            "batch", "type", "token_agent_shape",
+        }
         if not required_keys.issubset(set(tokenized_agent.keys())):
             return (
                 torch.empty((0, 0), dtype=torch.float32),
                 torch.empty((0, 20, 4), dtype=torch.float32),
             )
 
+        # Restore the keys that prepare_inference_cache / collect_godfm_c_shift_states
+        # need but are popped in training mode.
+        rollout_ta = self._build_rollout_tokenized_agent(tokenized_agent)
+
         map_feature = self.encoder.encode_map(tokenized_map)
         rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
-            tokenized_agent=tokenized_agent,
+            tokenized_agent=rollout_ta,
             map_feature=map_feature,
         )
         c_shift_states = self.encoder.agent_encoder.collect_godfm_c_shift_states(
             rollout_cache=rollout_cache,
-            tokenized_agent=tokenized_agent,
+            tokenized_agent=rollout_ta,
             map_feature=map_feature,
             n_rollout_collect=self.godfm_config.n_rollout_collect,
         )
 
-        gt_pos = tokenized_agent["gt_pos"].detach()
-        gt_head = tokenized_agent["gt_heading"].detach()
-        gt_valid = tokenized_agent["valid_mask"].detach()
+        # ctx_sampled_pos/heading/valid hold 14 coarse 2-Hz steps and are
+        # available in both training and eval modes (never popped).
+        gt_pos = tokenized_agent["ctx_sampled_pos"].detach()     # [n_agent, 14, 2]
+        gt_head = tokenized_agent["ctx_sampled_heading"].detach() # [n_agent, 14]
+        gt_valid = tokenized_agent["ctx_valid"].detach()          # [n_agent, 14]
         step_current_2hz = (self.num_historical_steps - 1) // 5
 
         flow_decoder = self.encoder.agent_encoder.flow_decoder

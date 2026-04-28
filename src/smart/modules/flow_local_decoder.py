@@ -261,7 +261,12 @@ class HalfSecondChunkMixerBlock(nn.Module):
         tau_emb: torch.Tensor,
     ) -> torch.Tensor:
         attn_in = self.attn_norm(chunk_tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False,
+            enable_mem_efficient=False,
+            enable_math=True,
+        ):
+            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
         chunk_tokens = chunk_tokens + attn_out
 
         cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
@@ -304,7 +309,12 @@ class ChunkStepRefiner(nn.Module):
 
         step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
         attn_in = self.attn_norm(step_tokens)
-        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False,
+            enable_mem_efficient=False,
+            enable_math=True,
+        ):
+            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
         step_tokens = step_tokens + attn_out
         step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
         step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)
