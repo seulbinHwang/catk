@@ -20,7 +20,7 @@ export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=3
 
 # ── User settings (edit these) ────────────────────────────────────────────────
 # Pretrained SMARTFlow checkpoint to start fine-tuning from
@@ -43,12 +43,12 @@ LR_WARMUP_STEPS=1000
 LR_TOTAL_STEPS=-1
 LR_MIN_RATIO=0.1
 LR_SCHEDULER_UNIT="epoch"
-MAX_EPOCHS=10
+MAX_EPOCHS=100
 CHECK_VAL_EVERY_N_EPOCH=1
-VAL_CHECK_INTERVAL_STEPS=100
+VAL_CHECK_INTERVAL_STEPS=1000
 LIMIT_TRAIN_BATCHES=1.0
-LIMIT_VAL_BATCHES=0.01
-N_ROLLOUT_CLOSED_VAL=8
+LIMIT_VAL_BATCHES=1
+N_ROLLOUT_CLOSED_VAL=32
 N_BATCH_SIM_AGENTS_METRIC=1
 VAL_OPEN_LOOP=true
 VAL_CLOSED_LOOP=true
@@ -61,12 +61,21 @@ CKPT_MONITOR_MODE="max"
 # "official" = TF + multiprocessing (slow, full metrics); "torch" = pure-GPU (fast, metametric only)
 SIM_AGENTS_METRIC_BACKEND="torch"
 
-# Online recollect knobs (effective only when godfm.enabled=true)
+# GOD-FM collecting knobs
+# - GODFM_P_AUG is probability of sampling GOD-FM branch.
+#   Set 0.0 for GT-only, 1.0 for GOD-FM-only.
+# - N_ROLLOUT_COLLECT controls rollout drift horizon during collect.
+# - The rollout is 2Hz: 1 step = 0.5s drift, 4 steps = 2.0s drift.
+GODFM_P_AUG=1.0
+INPAINT_STEPS=10
+N_ROLLOUT_COLLECT=2
+
+# Online recollect knobs (effective only when godfm.online_enabled=true)
 ONLINE_ENABLED=true
-ONLINE_COLLECT_EVERY_N_STEPS=200
-ONLINE_WARMUP_STEPS=500
+ONLINE_COLLECT_EVERY_N_STEPS=100
+ONLINE_WARMUP_STEPS=0
 ONLINE_MAX_BUFFER_PAIRS=200000
-ONLINE_MAX_PAIRS_PER_COLLECT=1024
+ONLINE_MAX_PAIRS_PER_COLLECT=2000
 
 # ── Conda env ─────────────────────────────────────────────────────────────────
 CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
@@ -112,6 +121,9 @@ python -m src.run \
   model.model_config.delete_local_videos_after_wandb_upload=$DELETE_LOCAL_VIDEOS_AFTER_WANDB_UPLOAD \
   model.model_config.sim_agents_metric_backend=$SIM_AGENTS_METRIC_BACKEND \
   model.model_config.godfm.pair_dir="$GODFM_PAIR_DIR" \
+  model.model_config.godfm.p_aug=$GODFM_P_AUG \
+  model.model_config.godfm.inpaint_steps=$INPAINT_STEPS \
+  model.model_config.godfm.n_rollout_collect=$N_ROLLOUT_COLLECT \
   model.model_config.godfm.online_enabled=$ONLINE_ENABLED \
   model.model_config.godfm.online_collect_every_n_steps=$ONLINE_COLLECT_EVERY_N_STEPS \
   model.model_config.godfm.online_warmup_steps=$ONLINE_WARMUP_STEPS \
