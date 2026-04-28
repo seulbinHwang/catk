@@ -842,6 +842,7 @@ torchrun \
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
 - H100 preset은 Generator lr `8e-6`, generated estimator lr `1.6e-6`, `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `path_step_size=0.05`, `freeze_map_encoder=true`, sampling = Euler 32-step / `noise_scale=1.0` / random terminal denoising step을 기본으로 둡니다.
 - Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=1.0e-3`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다.
+- 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
 - self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 LR scheduler를 쓰지 않습니다. 따라서 `model.model_config.lr` 와 `model.model_config.self_forced.generated_estimator_lr` 는 학습 내내 고정되고, self-forced preset에는 `lr_warmup_steps` / `lr_min_ratio` override를 두지 않습니다.
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
 - 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/epoch 를 resume하지 않고 pretrained weight만 로드합니다.
@@ -886,7 +887,7 @@ python -m src.run experiment=self_forced_npfm_h100_6 \
 
 #### CUDA OOM 자동 fallback 으로 무중단 재개
 
-긴 self-forced fine-tuning 도중 어쩌다 OOM 이 한 번 떨어지면 (heavy batch + self-rollout 메모리 스파이크), 학습이 죽고 그동안 진행한 epoch 들이 의미 없어질 수 있습니다. `scripts/self_forced_h100_6_with_oom_retry.sh` 는 이 시나리오를 자동 처리합니다:
+긴 self-forced fine-tuning 도중 어쩌다 OOM 이 한 번 떨어지면 (heavy batch + self-rollout 메모리 스파이크), 학습이 죽고 그동안 진행한 epoch 들이 의미 없어질 수 있습니다. `scripts/self_forced_h100_4_with_oom_retry.sh` 와 `scripts/self_forced_h100_6_with_oom_retry.sh` 는 이 시나리오를 자동 처리합니다:
 
 - 첫 시도는 `PRETRAIN_CKPT` 에 지정한 2초 horizon pretrained Generator ckpt 로 `action=finetune`
 - 학습 도중 OOM 으로 죽으면 attempt log 에서 `OutOfMemoryError` / `CUDA out of memory` 마커를 감지해 `data.train_batch_size` 를 `OOM_STEP` (기본 2) 만큼 낮춤
@@ -904,7 +905,7 @@ bash scripts/self_forced_h100_6_with_oom_retry.sh
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `INITIAL_BS` | `14` | 첫 시도 `data.train_batch_size` (preset 기본값) |
+| `INITIAL_BS` | `36` | 첫 시도 `data.train_batch_size` (preset 기본값) |
 | `OOM_STEP` | `2` | OOM 한 번당 줄일 batch 크기 |
 | `MIN_BS` | `2` | 이 값 미만으로 내려가면 중단 |
 | `TASK_NAME` | `flow_semi_continuous_self_forced_h1006` | checkpoint / log 위치 결정 |
