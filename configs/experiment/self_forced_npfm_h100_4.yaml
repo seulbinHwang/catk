@@ -59,7 +59,7 @@ model:
       path_step_size: 0.05
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
-      generated_estimator_lr: 4e-5
+      generated_estimator_lr: 4e-6
       estimator_updates_per_step: 5
       # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
       # Resume from a self-forced checkpoint preserves restored aux states.
