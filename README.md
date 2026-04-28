@@ -871,7 +871,9 @@ Self-forced H100 preset은 self-forced rollout에서 `sample_steps=32`를 유지
 - `policy=paper_uniform` 은 `s in [1, sample_steps]` 를 바로 균등 샘플링합니다.
 - `policy=stability_warmup` 은 초반 `warmup_epochs` 동안 `K>=warmup_min_executed_steps` 만 허용한 뒤 전체 균등 샘플링으로 바꿉니다.
 - terminal step 이전 denoising은 gradient 없이 계산하고, terminal clean estimate를 만드는 마지막 호출 하나만 gradient를 유지합니다.
-- `F_psi` 업데이트와 `F_rho - F_psi` 방향 계산은 선택된 `s`에 대응되는 tau band를 사용합니다.
+- 선택된 `s`는 self-rollout 을 어디서 끊고 commit할지만 정합니다. 
+- `F_psi` 업데이트와 `F_rho - F_psi` 방향 계산의 noising `tau` 는 , 
+- flow ODE의 전체 tau 구간에서 독립적으로 다시 샘플링합니다.
 
 속도 실험용 기본 실행은 아래처럼 두면 됩니다.
 
@@ -1380,6 +1382,7 @@ K commit block 수 = flow_window_steps / 5
 - guidance 방향을 계산할 때는 `F_rho` 와 비교용 `F_psi` 를 항상 eval mode로 둡니다. 그래서 dropout/history drop 같은 train-mode 랜덤성이 기준 방향에 섞이지 않습니다. `F_psi` 는 detached generated path에 fit되는 online update 구간에서만 train mode로 전환됩니다.
 - committed self-rollout 을 만들 때는 현재 Generator를 eval mode로 잠깐 전환하되 autograd는 유지합니다. 따라서 dropout/history drop 없이 실제 inference 조건의 trajectory를 만들고, 그 trajectory를 통해 `sf_loss` gradient는 그대로 Generator로 흐릅니다.
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 DDP 전체 rank가 random terminal step `s` 를 하나 공유하고, 모든 rank의 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
+- random terminal step `s` 는 self-rollout 의 실행 길이와 commit 지점만 정합니다. Generated estimator `F_psi` 학습과 generator direction 계산에서 쓰는 flow noising `tau` 는 rollout 의 `s` 와 독립적으로 전체 tau 구간에서 새로 샘플링합니다.
 - 같은 perturbed self-rollout state 에서 계산한 DMD식 score difference
   `s_\rho - s_\psi = \tau (\hat U_\rho - \hat U_\psi) / \sigma_\tau` 를 그대로 쓰지 않고,
   `X_\tau = \tau Y_\theta + \sigma_\tau \epsilon` 의 연결 관계를 반영해
@@ -1397,7 +1400,7 @@ Self-forced fine-tuning은 학습 중 `self_forced.sampling.sample_steps` 값을
 
 학습 rollout에서는 `K = sample_steps + 1 - s` step까지만 진행한 뒤, 중간 noisy state를 commit하지 않고 terminal step에서 예측한 clean estimate를 2초 preview로 사용합니다. 그 preview 중 앞 0.5초만 기존 commit bridge로 반영합니다. terminal 이전 step은 gradient 없이 계산하고, terminal clean estimate를 만든 step 하나에만 gradient를 남깁니다. 이전 구현처럼 `torch.unique(K)` 로 terminal step별 agent group을 나눠 sampler를 여러 번 호출하지 않고, 0.5초 block마다 DDP 전체 rank가 공유한 `K` 로 `FlowODE.generate(..., terminal_step=K, return_terminal_clean=True)`를 한 번만 호출합니다. 다음 block의 context/cache로 들어가는 상태는 detach하여 미래 block loss가 이전 block 내부로 역전파되지 않게 합니다.
 
-Generated Path-Flow Estimator와 generator direction 계산도 같은 random-s 정보를 사용합니다. rollout에서 선택된 `s`는 tau 구간 `[tau_low, tau_high]`로 변환되고, `F_psi` 학습과 `F_rho - F_psi` 계산은 이 구간에서 샘플링한 tau를 사용합니다. `F_rho`와 `F_psi`는 항상 같은 noisy path와 같은 tau를 봅니다.
+Generated Path-Flow Estimator와 generator direction 계산은 random-s 정보를 noising 구간으로 재사용하지 않습니다. rollout에서 선택된 `s`는 terminal clean estimate를 만들 실행 step 수 `K`와 commit 지점만 정하며, packed committed path를 만든 뒤에는 `s`별 `[tau_low, tau_high]` 를 전달하지 않습니다. `F_psi` 학습과 `F_rho - F_psi` 계산은 flow ODE의 기본 전체 tau 구간에서 새 tau를 샘플링합니다. 다만 direction 계산 안에서는 `F_rho`와 `F_psi`가 항상 같은 noisy path와 같은 tau를 봅니다.
 
 DDP에서는 step 시간이 가장 늦게 끝난 rank에 맞춰지므로, rank마다 서로 다른 `s`를 뽑으면 짧은 `K`를 뽑은 rank가 긴 `K`를 뽑은 rank를 기다리게 됩니다. `scope=global_batch`는 이 대기 손실을 줄이기 위해 모든 rank가 같은 `K`를 쓰게 합니다. 단일 GPU 또는 torch.distributed가 초기화되지 않은 실행에서는 같은 설정이 자동으로 일반 batch 공유 방식처럼 동작합니다.
 

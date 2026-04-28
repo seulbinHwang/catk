@@ -1367,29 +1367,20 @@ class SMARTFlow(LightningModule):
             )
         return max(1, int(self.flow_window_steps // 5))
 
-    def _sample_flow_state_from_clean(
-        self,
-        clean_path_norm: Tensor,
-        tau_low: Tensor | None = None,
-        tau_high: Tensor | None = None,
-    ):
-        """현재 Generator의 flow path 규칙으로 noisy path와 target velocity를 만듭니다.
+    def _sample_flow_state_from_clean(self, clean_path_norm: Tensor):
+        """현재 Generator의 flow path 규칙으로 전체 tau 구간의 noisy path를 만듭니다.
 
         Args:
             clean_path_norm: clean path입니다. shape은 ``[n_agent_valid, F_win, 4]`` 입니다.
-            tau_low: path별 tau 하한입니다. shape은 ``[n_agent_valid]`` 입니다. ``None`` 이면
-                전체 tau 구간을 사용합니다.
-            tau_high: path별 tau 상한입니다. shape은 ``[n_agent_valid]`` 입니다. ``None`` 이면
-                전체 tau 구간을 사용합니다.
 
         Returns:
             FlowSample: ``x_t``, ``target``, ``tau`` 를 담은 flow sample입니다.
+                tau는 rollout을 만들 때 사용한 random terminal step과 무관하게
+                flow ODE의 기본 전체 구간에서 새로 뽑힙니다.
         """
         return self.encoder.agent_encoder.flow_ode.sample(
             clean_path_norm,
             target_type="velocity",
-            tau_low=tau_low,
-            tau_high=tau_high,
         )
 
     def _predict_path_flow_clean_estimate(
@@ -1478,7 +1469,7 @@ class SMARTFlow(LightningModule):
         self,
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+    ) -> tuple[Tensor, Tensor]:
         """committed rollout을 첫 anchor 기준 packed N초 path로 변환합니다.
 
         Args:
@@ -1486,10 +1477,14 @@ class SMARTFlow(LightningModule):
             tokenized_agent: 평가 모드 agent token 사전입니다.
 
         Returns:
-            tuple[Tensor, Tensor, Tensor | None, Tensor | None]: packed path, agent mask,
-            path별 tau 하한, path별 tau 상한입니다. packed path shape은
-            ``[n_valid_agent, F_win, 4]`` 이고 mask shape은 ``[n_agent]`` 입니다. tau tensor가
-            있으면 shape은 ``[n_valid_agent]`` 입니다.
+            tuple[Tensor, Tensor]: packed path와 agent mask입니다.
+                packed path shape은 ``[n_valid_agent, F_win, 4]`` 이고,
+                mask shape은 ``[n_agent]`` 입니다.
+
+        Notes:
+            random terminal N은 self-rollout을 어디에서 끊을지만 정합니다.
+            이후 generated estimator 학습과 generator update의 noising tau는
+            여기서 전달하지 않습니다.
         """
         anchor_mask = get_anchor0_valid_mask(tokenized_agent)
         committed_path_norm = build_anchor0_normalized_committed_path(
@@ -1498,14 +1493,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             flow_window_steps=self.flow_window_steps,
         )
-        tau_low = None
-        tau_high = None
-        if "sf_terminal_tau_low_by_scenario" in rollout:
-            tau_low_by_agent = rollout["sf_terminal_tau_low_by_scenario"][tokenized_agent["batch"]]
-            tau_high_by_agent = rollout["sf_terminal_tau_high_by_scenario"][tokenized_agent["batch"]]
-            tau_low = tau_low_by_agent[anchor_mask]
-            tau_high = tau_high_by_agent[anchor_mask]
-        return committed_path_norm[anchor_mask], anchor_mask, tau_low, tau_high
+        return committed_path_norm[anchor_mask], anchor_mask
 
     def _update_generated_path_flow_estimator(
         self,
@@ -1513,8 +1501,6 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
-        tau_low: Tensor | None = None,
-        tau_high: Tensor | None = None,
     ) -> Tensor:
         """detached self-rollout으로 generated estimator F_psi를 online 업데이트합니다.
 
@@ -1523,20 +1509,21 @@ class SMARTFlow(LightningModule):
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 N초 path입니다.
                 shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
-            tau_low: path별 tau 하한입니다. shape은 ``[n_valid_agent]`` 입니다. ``None`` 이면
-                전체 tau 구간을 사용합니다.
-            tau_high: path별 tau 상한입니다. shape은 ``[n_valid_agent]`` 입니다. ``None`` 이면
-                전체 tau 구간을 사용합니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
+                shape은 ``[n_agent]`` 입니다.
 
         Returns:
             Tensor: 마지막 estimator update의 flow matching loss입니다.
+
+        Notes:
+            noising tau는 random terminal N과 독립적으로 전체 tau 구간에서 샘플링합니다.
         """
         if self.self_forced_generated_estimator is None:
             raise RuntimeError("self_forced_generated_estimator is not initialized.")
 
         optimizer = self.optimizers()[1]
         last_loss = committed_path_norm.new_zeros(())
+
         self.toggle_optimizer(optimizer)
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.train()
@@ -1547,8 +1534,6 @@ class SMARTFlow(LightningModule):
                 flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
                     clean_path,
                     target_type="velocity",
-                    tau_low=tau_low,
-                    tau_high=tau_high,
                 )
                 pred_dict = self._predict_path_flow_clean_estimate(
                     decoder=self.self_forced_generated_estimator,
@@ -1571,15 +1556,12 @@ class SMARTFlow(LightningModule):
             self._set_self_forced_auxiliary_modes()
         return last_loss.detach()
 
-
     def _compute_self_forced_direction(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
-        tau_low: Tensor | None = None,
-        tau_high: Tensor | None = None,
     ) -> Tensor:
         """F_rho와 F_psi의 score 차이를 clean path-space 방향으로 바꿉니다.
 
@@ -1590,10 +1572,6 @@ class SMARTFlow(LightningModule):
                 shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
-            tau_low: path별 tau 하한입니다. shape은 ``[n_valid_agent]`` 입니다. ``None`` 이면
-                전체 tau 구간을 사용합니다.
-            tau_high: path별 tau 상한입니다. shape은 ``[n_valid_agent]`` 입니다. ``None`` 이면
-                전체 tau 구간을 사용합니다.
 
         Returns:
             Tensor: clean closed-loop trajectory에 MSE target으로 걸 path-space 방향입니다.
@@ -1601,9 +1579,9 @@ class SMARTFlow(LightningModule):
 
         Notes:
             먼저 같은 noisy state에서 ``s_rho - s_psi`` 를 계산합니다.
-            이 값은 noisy path 위의 방향이므로, ``X_tau = tau * Y + sigma_tau * eps``
-            관계를 반영해 tau를 한 번 더 곱합니다.
-            따라서 반환값은 ``d_Y = tau * (s_rho - s_psi)`` 입니다.
+            이때 noisy state의 tau는 random terminal N과 독립적으로 전체 tau 구간에서
+            새로 샘플링합니다. 이후 ``X_tau = tau * Y + sigma_tau * eps`` 관계를
+            반영해 clean path-space 방향으로 변환합니다.
         """
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
@@ -1612,11 +1590,7 @@ class SMARTFlow(LightningModule):
         self.self_forced_generated_estimator.eval()
         with torch.no_grad():
             clean_for_guidance = committed_path_norm.detach()
-            flow_sample = self._sample_flow_state_from_clean(
-                clean_for_guidance,
-                tau_low=tau_low,
-                tau_high=tau_high,
-            )
+            flow_sample = self._sample_flow_state_from_clean(clean_for_guidance)
             target_pred = self._predict_path_flow_clean_estimate(
                 decoder=self.self_forced_target_teacher,
                 tokenized_map=tokenized_map,
@@ -1633,22 +1607,14 @@ class SMARTFlow(LightningModule):
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
             )
-
             tau = flow_sample.tau.float()
             view_tau = tau.view(-1, 1, 1)
             sigma_t = self.encoder.agent_encoder.flow_ode._sigma_t(tau).view(-1, 1, 1)
             sigma_t = sigma_t.clamp_min(1.0e-6)
-
             score_delta = view_tau * (
                 target_pred["velocity"].float() - generated_pred["velocity"].float()
             ) / sigma_t
-
-            # score_delta는 noisy path 위의 방향입니다.
-            # clean closed-loop path에 MSE target을 걸 때는
-            # X_tau = tau * Y + sigma_tau * eps의 연결 관계를 반영해
-            # tau를 한 번 더 곱한 path-space 방향을 사용합니다.
             path_delta = view_tau * score_delta
-
         return path_delta.to(dtype=committed_path_norm.dtype).detach()
 
     def _compute_self_forced_physics_loss(
@@ -2092,12 +2058,7 @@ class SMARTFlow(LightningModule):
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
         rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
-        (
-            committed_path_norm,
-            anchor_mask,
-            sf_tau_low,
-            sf_tau_high,
-        ) = self._pack_self_forced_committed_rollout(
+        committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
             rollout=rollout,
             tokenized_agent=tokenized_agent_eval,
         )
@@ -2137,16 +2098,12 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
-            tau_low=sf_tau_low,
-            tau_high=sf_tau_high,
         )
         path_delta = self._compute_self_forced_direction(
             tokenized_map=tokenized_map_eval,
             tokenized_agent=tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
-            tau_low=sf_tau_low,
-            tau_high=sf_tau_high,
         )
         target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
         self._set_self_forced_backward_context(
