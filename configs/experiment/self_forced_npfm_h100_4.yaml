@@ -110,7 +110,7 @@ callbacks:
 data:
   # Conservative per-GPU batch for self-forced random terminal denoising.
   # Increase only after a fresh memory probe on the target H100 box.
-  train_batch_size: 20
+  train_batch_size: 28
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
