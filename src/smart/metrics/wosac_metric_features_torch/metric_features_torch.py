@@ -232,7 +232,8 @@ def joint_scene_to_trajectories(
     use_log_validity: bool = False,
 ) -> ObjectTrajectoriesTorch:
     """Torch equivalent of `converters.joint_scene_to_trajectories` (SIM_AGENTS only)."""
-    logged_full = object_trajectories_from_scenario(scenario)
+    cached = _cache_get_or_build(scenario)
+    logged_full = cached.get("logged_full_cpu") or object_trajectories_from_scenario(scenario)
     cfg = submission_specs.get_submission_config(_ChallengeType.SIM_AGENTS)
     logged_hist = logged_full.slice_time(0, cfg.current_time_index + 1)
 
@@ -298,7 +299,8 @@ def compute_metric_features(
 
     simulated = joint_scene_to_trajectories(joint_scene, scenario, use_log_validity=use_log_validity)
 
-    logged_full = object_trajectories_from_scenario(scenario)
+    cached = _cache_get_or_build(scenario)
+    logged_full = (cached.get("logged_full_cpu") or object_trajectories_from_scenario(scenario))
     logged_full = logged_full.gather_objects_by_id(simulated.object_id)
 
     evaluated_ids = torch.tensor(
