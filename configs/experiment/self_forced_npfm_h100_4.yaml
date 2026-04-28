@@ -21,7 +21,7 @@
 #
 # Loads a 2s-horizon pretrained Generator checkpoint via `ckpt_path=...` from
 # the CLI with `action=finetune`, so only model weights are loaded and
-# optimizer/scheduler/epoch state is not resumed. The model default
+# optimizer/epoch state is not resumed. The model default
 # `flow_window_steps=20` (2s) is kept; do not override it unless the ckpt was
 # pretrained at a different horizon.
 #
@@ -45,8 +45,6 @@ action: finetune
 model:
   model_config:
     lr: 2e-5
-    lr_warmup_steps: 2
-    lr_min_ratio: 1e-2
     n_rollout_closed_val: 16
     sim_agents_context_cache_size: 64
     n_vis_batch: 0

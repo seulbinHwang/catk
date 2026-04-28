@@ -2528,15 +2528,14 @@ open_metric_dict:
                 estimator_params,
                 lr=self.self_forced_generated_estimator_lr,
             )
-            lr_scheduler = LambdaLR(generator_optimizer, lr_lambda=lr_lambda)
-            return [generator_optimizer, generated_estimator_optimizer], [lr_scheduler]
+            return [generator_optimizer, generated_estimator_optimizer]
 
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return [optimizer], [lr_scheduler]
 
     def on_train_epoch_end(self) -> None:
-        """manual optimization에서 Generator scheduler를 epoch마다 한 번 진행합니다.
+        """self-forced manual optimization에서 scheduler가 있으면 epoch마다 한 번 진행합니다.
 
         Returns:
             None
