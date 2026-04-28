@@ -981,75 +981,56 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sample_steps: int,
         num_scenario: int,
         device: torch.device,
-        dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """공유된 terminal s 하나를 scenario별 tensor와 tau 구간으로 바꿉니다.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """공유된 terminal s 하나를 scenario별 tensor로 바꿉니다.
 
         Args:
             terminal_s_one: 모든 rank가 공유하는 terminal s입니다. shape은 ``[1]`` 입니다.
             sample_steps: 전체 denoising step 수입니다.
             num_scenario: 현재 rank mini-batch 안 scenario 수입니다.
             device: 반환 tensor를 올릴 장치입니다.
-            dtype: tau 구간 tensor의 자료형입니다.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-                terminal step 수, 논문 표기 s, tau 하한, tau 상한입니다.
-                네 tensor 모두 scenario 축 shape은 ``[num_scenario]`` 입니다.
+            tuple[torch.Tensor, torch.Tensor]: terminal step 수와 논문 표기 s입니다.
+                두 tensor 모두 scenario 축 shape은 ``[num_scenario]`` 입니다.
         """
         if int(num_scenario) < 0:
             raise ValueError(f"num_scenario must be non-negative, got {num_scenario}.")
         if int(num_scenario) == 0:
             empty_long = torch.empty((0,), device=device, dtype=torch.long)
-            empty_tau = torch.empty((0,), device=device, dtype=dtype)
-            return empty_long, empty_long, empty_tau, empty_tau
+            return empty_long, empty_long
 
         terminal_s = terminal_s_one.to(device=device, dtype=torch.long).expand(
             int(num_scenario)
         ).clone()
         terminal_steps = int(sample_steps) + 1 - terminal_s
-        terminal_steps_float = terminal_steps.to(dtype=dtype)
-        dt = (1.0 - float(self.flow_ode.eps)) / float(sample_steps)
-        tau_low = (
-            float(self.flow_ode.eps) + (terminal_steps_float - 1.0) * dt
-        ).clamp(
-            min=float(self.flow_ode.eps),
-            max=1.0,
-        )
-        tau_high = (float(self.flow_ode.eps) + terminal_steps_float * dt).clamp(
-            min=float(self.flow_ode.eps),
-            max=1.0,
-        )
-        return terminal_steps, terminal_s, tau_low, tau_high
+        return terminal_steps, terminal_s
 
     def _sample_training_terminal_step_for_batch(
         self,
         sampling_scheme: DictConfig,
         num_scenario: int,
         device: torch.device,
-        dtype: torch.dtype,
         self_forced_epoch: int | None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """DDP 전체 rank가 공유할 random terminal step 하나를 샘플링합니다.
 
         Args:
             sampling_scheme: self-forced rollout sampling 설정입니다.
             num_scenario: 현재 rank mini-batch 안 scenario 개수입니다.
             device: 반환 tensor를 둘 장치입니다.
-            dtype: tau 구간 tensor의 자료형입니다.
             self_forced_epoch: 현재 self-forced epoch입니다. ``None``이면 random terminal step을 끕니다.
 
         Returns:
-            tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-                terminal step, 논문 표기 s, tau 하한, tau 상한입니다.
-                random terminal이 꺼져 있으면 네 값 모두 ``None`` 입니다.
+            tuple[torch.Tensor | None, torch.Tensor | None]: terminal step과 논문 표기 s입니다.
+                random terminal이 꺼져 있으면 두 값 모두 ``None`` 입니다.
                 켜져 있으면 각 tensor의 scenario 축 shape은 ``[num_scenario]`` 입니다.
         """
         random_cfg = getattr(sampling_scheme, "random_terminal_step", None)
         if self_forced_epoch is None or random_cfg is None:
-            return None, None, None, None
+            return None, None
         if not bool(getattr(random_cfg, "enabled", False)):
-            return None, None, None, None
+            return None, None
 
         sample_steps = int(getattr(sampling_scheme, "sample_steps", self.flow_ode.solver_steps))
         if sample_steps <= 0:
@@ -1098,7 +1079,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sample_steps=sample_steps,
             num_scenario=num_scenario,
             device=device,
-            dtype=dtype,
         )
 
     def _rollout_from_cache_impl(
@@ -1230,13 +1210,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         (
             terminal_steps_by_scenario,
             terminal_s_by_scenario,
-            terminal_tau_low_by_scenario,
-            terminal_tau_high_by_scenario,
         ) = self._sample_training_terminal_step_for_batch(
             sampling_scheme=sampling_scheme,
             num_scenario=num_scenario_for_random_s,
             device=feat_a_now.device,
-            dtype=feat_a_now.dtype,
             self_forced_epoch=self_forced_epoch,
         )
         terminal_step_by_agent = (
@@ -1600,8 +1577,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         if terminal_steps_by_scenario is not None:
             out_dict["sf_terminal_step_by_scenario"] = terminal_steps_by_scenario
             out_dict["sf_terminal_s_by_scenario"] = terminal_s_by_scenario
-            out_dict["sf_terminal_tau_low_by_scenario"] = terminal_tau_low_by_scenario
-            out_dict["sf_terminal_tau_high_by_scenario"] = terminal_tau_high_by_scenario
         return out_dict
 
     @torch.no_grad()
