@@ -46,6 +46,9 @@ model:
       start_epoch: 0
       weight: 1.0
       path_step_size: 0.05
+      clean_dmd_normalizer_eps: 1.0e-3
+      clean_dmd_tau_low: 0.02
+      clean_dmd_tau_high: 0.98
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
       generated_estimator_lr: 1.6e-6

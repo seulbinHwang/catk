@@ -6,15 +6,12 @@
 # ----------------------------------------------------------------------------
 # Differences vs. the 6xH100 preset:
 #   * `trainer.devices=4` is pinned so the preset encodes the H100x4 intent.
-#   * Per-GPU knobs (lr, batch, sampling, anchor/physics weights, val_batch,
-#     num_workers) are kept identical. H100 80GB cards are the same hardware,
-#     so the per-GPU memory ceiling is unchanged; only the effective global
-#     batch shrinks from 6*20=120 to 4*20=80 (0.667x).
-#   * The base preset's `lr=2e-4` is kept as-is. If you want to apply the
-#     linear-LR scaling rule for the smaller global batch, override via the
-#     CLI: `model.model_config.lr=1.333e-4` (= 2e-4 * 80/120). We do not
-#     default to that to keep optimizer behaviour identical to the 6xH100
-#     preset and to match the base `self_forced_npfm.yaml` defaults.
+#   * The core self-forced LR/sampling/loss knobs match the 6xH100 preset:
+#     generator lr 8e-6, generated-estimator lr 1.6e-6, anchor FM off,
+#     physics regularization off, and random terminal denoising enabled.
+#   * Clean-DMD guidance defaults are pinned here for the 4xH100 experiment:
+#     clean_dmd_normalizer_eps=1e-3, clean_dmd_tau_low=0.02,
+#     clean_dmd_tau_high=0.98.
 #   * `max_epochs / check_val_every_n_epoch / limit_val_batches` unchanged,
 #     so the training budget in "epochs over the dataset" matches the 6xH100
 #     preset; wall-clock per epoch is ~1.5x longer with 4 ranks vs 6.
@@ -55,6 +52,9 @@ model:
       start_epoch: 0
       weight: 1.0
       path_step_size: 0.05
+      clean_dmd_normalizer_eps: 1.0e-3
+      clean_dmd_tau_low: 0.02
+      clean_dmd_tau_high: 0.98
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
       generated_estimator_lr: 1.6e-6

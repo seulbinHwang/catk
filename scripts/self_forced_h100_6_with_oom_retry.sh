@@ -26,6 +26,9 @@
 #   RANDOM_TERMINAL_WARMUP_EPOCHS= Optional warmup epoch override.
 #   RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS=
 #                                  Optional minimum K during warmup.
+#   CLEAN_DMD_NORMALIZER_EPS=      Optional Clean-DMD normalizer epsilon override.
+#   CLEAN_DMD_TAU_LOW=             Optional Clean-DMD guidance tau lower bound.
+#   CLEAN_DMD_TAU_HIGH=            Optional Clean-DMD guidance tau upper bound.
 #
 # Usage example:
 #   PRETRAIN_CKPT=/mnt/nuplan/projects/catk/downloads/wandb_ckpts/.../epoch_last.ckpt \
@@ -63,6 +66,15 @@ if [[ -n "${RANDOM_TERMINAL_WARMUP_EPOCHS:-}" ]]; then
 fi
 if [[ -n "${RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.warmup_min_executed_steps=${RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS}")
+fi
+if [[ -n "${CLEAN_DMD_NORMALIZER_EPS:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.clean_dmd_normalizer_eps=${CLEAN_DMD_NORMALIZER_EPS}")
+fi
+if [[ -n "${CLEAN_DMD_TAU_LOW:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.clean_dmd_tau_low=${CLEAN_DMD_TAU_LOW}")
+fi
+if [[ -n "${CLEAN_DMD_TAU_HIGH:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.clean_dmd_tau_high=${CLEAN_DMD_TAU_HIGH}")
 fi
 
 if [[ ! -f "$PRETRAIN_CKPT" ]]; then

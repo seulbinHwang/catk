@@ -34,6 +34,7 @@ from src.smart.modules.self_forced_path_flow import (
     get_anchor0_valid_mask,
     masked_mean_square_loss,
 )
+from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -205,6 +206,21 @@ class SMARTFlow(LightningModule):
             float(getattr(self.self_forced_config, "path_step_size", 0.05))
             if self.self_forced_config is not None
             else 0.05
+        )
+        self.self_forced_direction_normalizer_eps = (
+            float(getattr(self.self_forced_config, "clean_dmd_normalizer_eps", 1.0e-3))
+            if self.self_forced_config is not None
+            else 1.0e-3
+        )
+        self.self_forced_guidance_tau_low = (
+            float(getattr(self.self_forced_config, "clean_dmd_tau_low", 0.02))
+            if self.self_forced_config is not None
+            else 0.02
+        )
+        self.self_forced_guidance_tau_high = (
+            float(getattr(self.self_forced_config, "clean_dmd_tau_high", 0.98))
+            if self.self_forced_config is not None
+            else 0.98
         )
         self.self_forced_anchor_weight = (
             float(getattr(self.self_forced_config, "anchor_weight", 0.05))
@@ -1563,25 +1579,24 @@ class SMARTFlow(LightningModule):
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
     ) -> Tensor:
-        """F_rho와 F_psi의 score 차이를 clean path-space 방향으로 바꿉니다.
+        """clean path 추정 차이로 안정화된 self-forcing DMD 방향을 만듭니다.
 
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 N초 path입니다.
+            committed_path_norm: Generator가 closed-loop로 실제 실행한 path입니다.
                 shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
         Returns:
-            Tensor: clean closed-loop trajectory에 MSE target으로 걸 path-space 방향입니다.
+            Tensor: 현재 committed path에 더할 정규화된 방향입니다.
                 shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
 
         Notes:
-            먼저 같은 noisy state에서 ``s_rho - s_psi`` 를 계산합니다.
-            이때 noisy state의 tau는 random terminal N과 독립적으로 전체 tau 구간에서
-            새로 샘플링합니다. 이후 ``X_tau = tau * Y + sigma_tau * eps`` 관계를
-            반영해 clean path-space 방향으로 변환합니다.
+            같은 noisy path에서 얻은 teacher clean path와 generated clean path의
+            차이를 agent별 teacher 기준 거리로 나누어 target path가 과하게 튀는
+            문제를 줄입니다.
         """
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
@@ -1590,7 +1605,12 @@ class SMARTFlow(LightningModule):
         self.self_forced_generated_estimator.eval()
         with torch.no_grad():
             clean_for_guidance = committed_path_norm.detach()
-            flow_sample = self._sample_flow_state_from_clean(clean_for_guidance)
+            flow_sample = self.encoder.agent_encoder.flow_ode.sample(
+                clean_for_guidance,
+                target_type="velocity",
+                tau_low=self.self_forced_guidance_tau_low,
+                tau_high=self.self_forced_guidance_tau_high,
+            )
             target_pred = self._predict_path_flow_clean_estimate(
                 decoder=self.self_forced_target_teacher,
                 tokenized_map=tokenized_map,
@@ -1607,14 +1627,12 @@ class SMARTFlow(LightningModule):
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
             )
-            tau = flow_sample.tau.float()
-            view_tau = tau.view(-1, 1, 1)
-            sigma_t = self.encoder.agent_encoder.flow_ode._sigma_t(tau).view(-1, 1, 1)
-            sigma_t = sigma_t.clamp_min(1.0e-6)
-            score_delta = view_tau * (
-                target_pred["velocity"].float() - generated_pred["velocity"].float()
-            ) / sigma_t
-            path_delta = view_tau * score_delta
+            path_delta = build_clean_dmd_direction(
+                committed_path_norm=clean_for_guidance,
+                target_clean_norm=target_pred["clean"],
+                generated_clean_norm=generated_pred["clean"],
+                normalizer_eps=self.self_forced_direction_normalizer_eps,
+            )
         return path_delta.to(dtype=committed_path_norm.dtype).detach()
 
     def _compute_self_forced_physics_loss(
