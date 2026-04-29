@@ -140,6 +140,24 @@ class FinetuneConfig:
     ocsc_eval_hard_rmm_interval: int = 1
     #: GT FM regularization 가중치. 0 이면 비활성 (MMD only).
     ocsc_fm_reg_lambda: float = 0.0
+    #: True → open-loop sample 대신 GT 궤적을 target으로 사용.
+    #: CL 예측은 2Hz로 다운샘플 후 GT(2Hz)와 비교.
+    #: ocsc_use_mmd=True면 MMD²(P_CL, delta_GT), False면 masked L2.
+    ocsc_gt_target: bool = False
+    # ── Ref-NLL fine-tuning ────────────────────────────────────────────────────
+    #: G: 시나리오당 closed-loop rollout 수.
+    ref_nll_n_rollouts: int = 2
+    #: 실행할 coarse step 수 (1 step = 0.5s; 4 steps = 2s).
+    ref_nll_pred_max_steps: int = 4
+    #: Hutchinson 발산 추정 횟수 (1 = 빠름·편향 없음, >1 = 더 낮은 분산).
+    ref_nll_n_hutch_samples: int = 1
+    #: True → Hutchinson VJP 에 create_graph 를 사용해 발산 항의 gradient 도 흘림.
+    #: False (기본) → 발산 항은 detach 된 상수로 처리 (선형 근사; 훨씬 빠름).
+    ref_nll_use_full_div_grad: bool = False
+    #: GT flow-matching regularization 가중치. 0 이면 비활성.
+    ref_nll_fm_reg_lambda: float = 0.0
+    #: 전체 loss 에 곱하는 스케일 인수.
+    ref_nll_loss_scale: float = 1.0
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -250,6 +268,13 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_eval_hard_rmm=bool(_read_config_value(finetune, "ocsc_eval_hard_rmm", True)),
         ocsc_eval_hard_rmm_interval=int(_read_config_value(finetune, "ocsc_eval_hard_rmm_interval", 1)),
         ocsc_fm_reg_lambda=float(_read_config_value(finetune, "ocsc_fm_reg_lambda", 0.0)),
+        ocsc_gt_target=bool(_read_config_value(finetune, "ocsc_gt_target", False)),
+        ref_nll_n_rollouts=int(_read_config_value(finetune, "ref_nll_n_rollouts", 2)),
+        ref_nll_pred_max_steps=int(_read_config_value(finetune, "ref_nll_pred_max_steps", 4)),
+        ref_nll_n_hutch_samples=int(_read_config_value(finetune, "ref_nll_n_hutch_samples", 1)),
+        ref_nll_use_full_div_grad=bool(_read_config_value(finetune, "ref_nll_use_full_div_grad", False)),
+        ref_nll_fm_reg_lambda=float(_read_config_value(finetune, "ref_nll_fm_reg_lambda", 0.0)),
+        ref_nll_loss_scale=float(_read_config_value(finetune, "ref_nll_loss_scale", 1.0)),
     )
 
 
@@ -309,6 +334,7 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         "flow_rwr_ft",          # Flow-RWR: Reward-Weighted Regression with GPU RMM
         "rmm_bptt_ft",          # RMM-BPTT: differentiable soft RMM through closed-loop rollout
         "ocsc_ft",              # OCSC: Open-Closed Self-Consistency fine-tuning
+        "ref_nll_ft",           # Ref-NLL: CL generation maximises log p under frozen ref model
     }:
         raise ValueError(f"Unsupported finetune mode: {config.mode}")
 

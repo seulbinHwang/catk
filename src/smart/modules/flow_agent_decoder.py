@@ -740,6 +740,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         warm_coarse_steps: int = 0,
         share_noise_across_time: bool = False,
         noise_tape_override: torch.Tensor | None = None,
+        return_per_step_x1: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -798,6 +799,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         # Hidden state used to generate each coarse 0.5s step.
         # shape: [n_agent, n_step_future_2hz, hidden_dim]
         anchor_hidden_2hz_list = []
+        # Per-step x₁ for ref_nll_ft: y_hat_norm [n_active, 20, 4] and active_mask [n_agent]
+        per_step_x1_list: list[torch.Tensor | None] = []
+        per_step_active_mask_list: list[torch.Tensor] = []
         sample_window_steps = 20
         rollout_noise_tape = self._build_rollout_noise_tape(
             num_agent=n_agent,
@@ -980,6 +984,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     delta_state = delta_state.clone()
                     v_state[active_mask] = _v_new
                     delta_state[active_mask] = _d_new
+                if return_per_step_x1:
+                    per_step_x1_list.append(y_hat_norm)
+                    per_step_active_mask_list.append(active_mask)
+
                 commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
                     y_hat_norm=y_hat_norm,
                     current_pos=pos_window[active_mask, -1],
@@ -1005,6 +1013,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 next_pos[active_mask] = next_pos_act
                 next_head[active_mask] = next_head_act
                 next_token_idx[active_mask] = next_token_idx_act
+
+            if return_per_step_x1 and not active_mask.any():
+                per_step_x1_list.append(None)
+                per_step_active_mask_list.append(active_mask)
 
             pred_traj_10hz_chunks.append(commit_traj_step)
             pred_head_10hz_chunks.append(commit_head_step)
@@ -1082,6 +1094,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         }
         pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)
         out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz.shape[1])
+        if return_per_step_x1:
+            out_dict["per_step_x1"] = per_step_x1_list
+            out_dict["per_step_active_mask"] = per_step_active_mask_list
         return out_dict
 
     def rollout_from_cache_no_grad(

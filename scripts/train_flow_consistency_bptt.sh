@@ -146,6 +146,8 @@ OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA#=}"
 # CONFIGURABLE: HardRMM 평가 여부 및 빈도
 OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-false}"
 OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-500}"
+# GT target: true → open-loop sample 대신 GT 궤적을 consistency target으로 사용.
+OCSC_GT_TARGET="${OCSC_GT_TARGET:-true}"
 
 # ── BPTT tricks ────────────────────────────────────────────────────────────
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
@@ -181,7 +183,7 @@ echo "TRAIN_RAW_DIR=${TRAIN_RAW_DIR}"
 echo "CKPT_PATH=${CKPT_PATH}"
 echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_USE_PRETRAINED_REF=${OCSC_USE_PRETRAINED_REF}"
 echo "OCSC_TARGET_MAX_STEPS=${OCSC_TARGET_MAX_STEPS} OCSC_PRED_MAX_STEPS=${OCSC_PRED_MAX_STEPS} OCSC_HEADING_WEIGHT=${OCSC_HEADING_WEIGHT} OCSC_POSITION_WEIGHT=${OCSC_POSITION_WEIGHT} OCSC_REL_DISP_WEIGHT=${OCSC_REL_DISP_WEIGHT}"
-echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA}"
+echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA} OCSC_GT_TARGET=${OCSC_GT_TARGET}"
 echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} OCSC_EVAL_HARD_RMM_INTERVAL=${OCSC_EVAL_HARD_RMM_INTERVAL}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_SEQUENTIAL_ROLLOUTS=${BPTT_SEQUENTIAL_ROLLOUTS} BPTT_GRAD_CLIP_TRAJ=${BPTT_GRAD_CLIP_TRAJ}"
 echo "FLOW_VELOCITY_HEAD_ONLY=${FLOW_VELOCITY_HEAD_ONLY} LR=${LR} FLOW_REG_LAMBDA=${FLOW_REG_LAMBDA}"
@@ -242,6 +244,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_fm_reg_lambda="${OCSC_FM_REG_LAMBDA}" \
   model.model_config.finetune.ocsc_eval_hard_rmm="${OCSC_EVAL_HARD_RMM}" \
   model.model_config.finetune.ocsc_eval_hard_rmm_interval="${OCSC_EVAL_HARD_RMM_INTERVAL}" \
+  model.model_config.finetune.ocsc_gt_target="${OCSC_GT_TARGET}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \

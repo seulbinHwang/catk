@@ -151,6 +151,7 @@ class SMARTFlowDecoder(nn.Module):
         warm_coarse_steps: int = 0,
         share_noise_across_time: bool = False,
         noise_tape_override: Tensor | None = None,
+        return_per_step_x1: bool = False,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
@@ -163,6 +164,7 @@ class SMARTFlowDecoder(nn.Module):
             warm_coarse_steps=warm_coarse_steps,
             share_noise_across_time=share_noise_across_time,
             noise_tape_override=noise_tape_override,
+            return_per_step_x1=return_per_step_x1,
         )
 
     def rollout_from_cache_no_grad(

@@ -20,12 +20,40 @@ from src.smart.metrics.wosac_metrics import WOSACMetrics
 from src.smart.metrics.wosac_submission import WOSACSubmission
 
 import multiprocessing as mp
+import os
 from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
 from torch_geometric.utils import degree as _tg_degree
+
+
+def _hard_load_and_log_feat_worker(scenario_file: str, challenge):
+    """Worker for HardSimAgentsMetrics: load TFRecord scenario + compute log features.
+
+    challenge: ChallengeType enum (pickled from main).
+    Returns (scenario_serialized_bytes, log_feat_dict). All tensors CPU.
+    """
+    import tensorflow as tf
+    from waymo_open_dataset.protos import scenario_pb2
+    from src.smart.metrics.wosac_metric_features_torch.metric_features_torch import (
+        compute_metric_features,
+        scenario_to_joint_scene,
+    )
+
+    tf.config.set_visible_devices([], "GPU")
+
+    scenario = scenario_pb2.Scenario()
+    for tfdata in tf.data.TFRecordDataset([scenario_file], compression_type=""):
+        scenario.ParseFromString(bytes(tfdata.numpy()))
+        break
+
+    log_joint = scenario_to_joint_scene(scenario, challenge)
+    lf = compute_metric_features(
+        scenario, log_joint, challenge_type=challenge, use_log_validity=True
+    )
+    return scenario.SerializeToString(), lf.as_dict()
 
 
 def _sim_agents_worker(
@@ -223,6 +251,39 @@ class HardSimAgentsMetrics:
         self._count: int = 0
         self._scenario_cache: Dict[str, Any] = {}
         self._per_metric_sums: Dict[str, float] = {n: 0.0 for n in self._LIKELIHOOD_NAMES}
+        # Persistent forkserver pool for parallel scenario load + log feature compute.
+        # WOSAC_HARD_POOL_WORKERS env var (default = min(16, ncpu//2)). 0 disables pool.
+        self._pool: Any = None
+        _pw = int(os.environ.get("WOSAC_HARD_POOL_WORKERS", "-1"))
+        self._pool_workers = (
+            _pw if _pw >= 0 else max(1, min(16, (os.cpu_count() or 4) // 2))
+        )
+
+    def _get_pool(self):
+        if self._pool_workers <= 0:
+            return None
+        if self._pool is None:
+            try:
+                ctx = mp.get_context("forkserver")
+            except ValueError:
+                ctx = mp.get_context("spawn")
+            self._pool = ctx.Pool(processes=self._pool_workers)
+        return self._pool
+
+    def __getstate__(self):
+        # Pool 객체는 pickle 불가 — DDP/checkpoint 호환성 위해 제외.
+        state = self.__dict__.copy()
+        state["_pool"] = None
+        return state
+
+    def close_pool(self) -> None:
+        if self._pool is not None:
+            try:
+                self._pool.close()
+                self._pool.join()
+            except Exception:
+                pass
+            self._pool = None
 
     @staticmethod
     def _load_config():
@@ -335,14 +396,33 @@ class HardSimAgentsMetrics:
         z_splits = pred_z.split(sizes)
         head_splits = pred_head.split(sizes)
 
-        scenarios = [self._load_scenario(sf) for sf in scenario_files]
+        # Parallel: load scenario protobuf + log feature compute.
+        # mp.Pool worker 가 TFRecord 파싱 + log feat (TF/CPU) 를 시나리오별 동시 처리.
+        # cache 활용은 포기하지만 (worker 격리), val 데이터셋은 시나리오 unique 라 cache hit 율 낮아 net 이득.
+        pool = self._get_pool()
+        from waymo_open_dataset.protos import scenario_pb2 as _scenario_pb2
 
-        # Log features: one per scenario (cached by scenario ID)
-        log_feat_dicts: List[dict] = []
-        for sc in scenarios:
-            log_joint = scenario_to_joint_scene(sc, _challenge)
-            lf = compute_metric_features(sc, log_joint, challenge_type=_challenge, use_log_validity=True)
-            log_feat_dicts.append(lf.as_dict())
+        if pool is not None and n_scenarios > 1:
+            # value 가 protobuf enum → 정수로 직렬화해서 worker 에 전달
+            results = pool.starmap(
+                _hard_load_and_log_feat_worker,
+                [(sf, _challenge) for sf in scenario_files],
+            )
+            scenarios = []
+            log_feat_dicts: List[dict] = []
+            for sc_bytes, lf_dict in results:
+                sc = _scenario_pb2.Scenario()
+                sc.ParseFromString(sc_bytes)
+                scenarios.append(sc)
+                log_feat_dicts.append(lf_dict)
+        else:
+            # Fallback: 기존 serial 경로 (n_scenarios=1 또는 pool disabled).
+            scenarios = [self._load_scenario(sf) for sf in scenario_files]
+            log_feat_dicts = []
+            for sc in scenarios:
+                log_joint = scenario_to_joint_scene(sc, _challenge)
+                lf = compute_metric_features(sc, log_joint, challenge_type=_challenge, use_log_validity=True)
+                log_feat_dicts.append(lf.as_dict())
 
         # Sim features: for each rollout g, batch across all scenarios
         sim_feat_per_g: List[list] = []  # G lists, each of length n_scenarios

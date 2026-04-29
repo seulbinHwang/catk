@@ -163,6 +163,8 @@ class SMARTFlow(LightningModule):
                 pass
             elif self.finetune_config.mode == "ocsc_ft":
                 pass
+            elif self.finetune_config.mode == "ref_nll_ft":
+                pass
             else:
                 raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
 
@@ -1274,6 +1276,12 @@ class SMARTFlow(LightningModule):
             and self.finetune_config.mode == "ocsc_ft"
         )
 
+    def _is_ref_nll_ft_enabled(self) -> bool:
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "ref_nll_ft"
+        )
+
     def on_train_start(self) -> None:
         _needs_ref = (
             self.finetune_config.enabled
@@ -1292,7 +1300,13 @@ class SMARTFlow(LightningModule):
             and self.ref_flow_decoder is None
             and self.finetune_config.mode == "ocsc_ft"
         )
-        if _needs_ref or _needs_ref_ocsc:
+        # ref_nll_ft: frozen reference flow decoder for likelihood reward
+        _needs_ref_nll = (
+            self.finetune_config.enabled
+            and self.ref_flow_decoder is None
+            and self.finetune_config.mode == "ref_nll_ft"
+        )
+        if _needs_ref or _needs_ref_ocsc or _needs_ref_nll:
             from copy import deepcopy
             flow_decoder = self.encoder.agent_encoder.flow_decoder
             self.ref_flow_decoder = deepcopy(flow_decoder)
@@ -1303,7 +1317,7 @@ class SMARTFlow(LightningModule):
         # rmm_bptt_ft / ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
         # gradients (exploding Jacobian, numerical instability). Register nan_to_num
         # hooks on trainable parameters so any NaN/Inf gradient is zeroed out.
-        if self._is_rmm_bptt_ft_enabled() or self._is_ocsc_ft_enabled():
+        if self._is_rmm_bptt_ft_enabled() or self._is_ocsc_ft_enabled() or self._is_ref_nll_ft_enabled():
             # NaN → 0, Inf → finite large value (not 0) so the optimizer still
             # sees the direction even under mild overflow.
             n_hooked = 0
@@ -1486,6 +1500,219 @@ class SMARTFlow(LightningModule):
         return fm
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Ref-NLL fine-tuning
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _run_ref_nll_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        data: dict | None = None,
+    ) -> dict:
+        """Reference-NLL fine-tuning step (closed-loop → open-loop likelihood).
+
+        알고리즘:
+          1. Closed-loop rollout (BPTT): G 번 AR rollout. coarse step 마다 0.5s 만 commit
+             하면서 ``pred_max_steps`` 만큼 (= ``pred_max_steps × shift`` fine step) 굴려
+             world-frame 의 2s 궤적 ``pred_traj_10hz`` 을 모은다.
+          2. 모은 closed-loop 2s 궤적을 **초기 pose** (rollout 시작 시점의 pos/head) 의
+             local frame 으로 변환해 ``x₁`` (= [n_active, 20, 4]) 을 만든다.
+          3. Frozen ref_flow_decoder (open-loop pretrained) 의 backward ODE + Hutchinson 으로
+             ``log p_ref(τ_2s | initial_anchor)`` 와 ``∂ log p_ref / ∂ x₁`` 계산.
+          4. Straight-through loss: ``L = -mean(∂ log p_ref / ∂ x₁ · x₁)``
+             → gradient = -(∂ log p_ref / ∂ x₁) 가 x₁ → pred_traj_10hz → flow_ode → θ
+             로 BPTT 역전파. 즉, **closed-loop AR joint likelihood 를 open-loop
+             p(τ|initial) 로 끌어올리는 covariate-shift 보정 fine-tuning** 이다.
+          5. (선택) GT FM regularization.
+
+        주의: open-loop ref 는 horizon 20 fine step (= 2s, 10Hz) 에 학습돼 있으므로
+        ``pred_max_steps × shift == 20`` 이어야 한다. 다르면 경고 후 가능한 prefix 만 사용.
+        """
+        from src.smart.modules.flow_likelihood import backward_ode_log_prob_and_grad
+
+        G = int(getattr(self.finetune_config, "ref_nll_n_rollouts", 2))
+        pred_max_steps_raw = int(getattr(self.finetune_config, "ref_nll_pred_max_steps", 4))
+        pred_max_steps: int | None = pred_max_steps_raw if pred_max_steps_raw > 0 else None
+        n_hutch = int(getattr(self.finetune_config, "ref_nll_n_hutch_samples", 1))
+        use_full_div_grad = bool(getattr(self.finetune_config, "ref_nll_use_full_div_grad", False))
+        fm_reg_lambda = float(getattr(self.finetune_config, "ref_nll_fm_reg_lambda", 0.0))
+        loss_scale = float(getattr(self.finetune_config, "ref_nll_loss_scale", 1.0))
+        use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
+        warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
+        _last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
+        _grad_clip = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
+
+        if data is None:
+            raise ValueError("ref_nll_ft requires `data` dict with scenario metadata.")
+        if "scenario_id" not in data:
+            raise KeyError("ref_nll_ft requires data['scenario_id'].")
+
+        # ── 1. Encode map (no_grad) ──────────────────────────────────────────
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+
+        # ── 2. Build rollout cache (no_grad) ─────────────────────────────────
+        with torch.no_grad():
+            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
+
+        _agent_enc = self.encoder.agent_encoder
+        flow_ode = _agent_enc.flow_ode
+        # fresh sample 생성 시 ODE backward 방식 설정
+        flow_ode.use_adjoint_for_bptt = use_adjoint
+        flow_ode.last_n_grad_solver_steps = (
+            min(_last_n_solver, flow_ode.solver_steps) if _last_n_solver > 0 else 0
+        )
+
+        # Open-loop ref decoder 는 step_embed(20) + view(num_chunks, chunk_size) 로
+        # x_t_norm shape [batch, 20, 4] 가 강제된다. 그러므로 closed-loop fine step 길이
+        # 도 정확히 20 이어야 한다 (= pred_max_steps × shift).
+        _shift = int(_agent_enc.shift)
+        _open_loop_horizon = 20
+        pred_max_steps_eff = (
+            _open_loop_horizon // _shift if pred_max_steps is None else int(pred_max_steps)
+        )
+        n_fine = pred_max_steps_eff * _shift
+        if n_fine != _open_loop_horizon:
+            raise ValueError(
+                f"[ref_nll_ft] pred_max_steps×shift={n_fine} but open-loop ref requires "
+                f"exactly {_open_loop_horizon} fine steps. Set ref_nll_pred_max_steps="
+                f"{_open_loop_horizon // _shift} (= {_open_loop_horizon // _shift * 0.5}s)."
+            )
+
+        # 초기 pose (rollout 시작 시점) — closed-loop 2s 궤적을 이 frame 으로 normalize 한다.
+        initial_pos = rollout_cache["pos_window"][:, -1].detach().clone()    # [n_agent, 2]
+        initial_head = rollout_cache["head_window"][:, -1].detach().clone()  # [n_agent]
+        initial_active_mask = rollout_cache["valid_window"][:, -1].clone()   # [n_agent]
+
+        def _make_grad_clip_hook(max_norm: float):
+            def _hook(g: Tensor) -> Tensor:
+                n = g.norm()
+                return g if n <= max_norm else g * (max_norm / (n + 1e-6))
+            return _hook
+
+        total_loss_accum: Tensor | float = 0.0
+        total_log_p_accum: float = 0.0
+        n_valid_terms: int = 0
+
+        # ── 3. G rollout (WITH grad, BPTT) ───────────────────────────────────
+        for g in range(G):
+            seeds_g = self._get_closed_loop_scenario_seeds(
+                scenario_ids=data["scenario_id"],
+                rollout_idx=g,
+                device=tokenized_agent["batch"].device,
+            )
+
+            # Closed-loop rollout WITH gradient.
+            # 0.5s 씩 commit 하며 pred_max_steps × 0.5s 만큼 world-frame 으로 굴린다.
+            pred = self.encoder.rollout_from_cache(
+                rollout_cache=rollout_cache,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                sampling_noise=self.eval_sampling_noise,
+                scenario_sampling_seeds=seeds_g,
+                max_steps=pred_max_steps,
+                warm_coarse_steps=warm_coarse,
+                return_per_step_x1=False,
+            )
+
+            # Closed-loop 2s 궤적 (world frame, 10Hz) — gradient 가 흐른다.
+            pred_traj_10hz: Tensor = pred["pred_traj_10hz"]   # [n_agent, n_fine_total, 2]
+            pred_head_10hz: Tensor = pred["pred_head_10hz"]   # [n_agent, n_fine_total]
+            pred_valid: Tensor = pred["pred_valid"]           # history + coarse steps
+
+            # rollout 끝까지 활성이었던 agent 만 사용. rollout 은 한 번 inactive 가 되면
+            # 이후 next_valid 도 False 로 전파하므로 마지막 step 만 검사하면 충분하다.
+            all_active = initial_active_mask & pred_valid[:, -1]
+            if not bool(all_active.any()):
+                continue
+
+            traj_active = pred_traj_10hz[:, :n_fine][all_active]    # [n_active, n_fine, 2]
+            head_active = pred_head_10hz[:, :n_fine][all_active]    # [n_active, n_fine]
+            ipos_active = initial_pos[all_active]
+            ihead_active = initial_head[all_active]
+
+            # World-frame 2s 궤적 → 초기 frame 의 normalized [x/20, y/20, cosΔh, sinΔh].
+            x1 = self._world_traj_to_flow_norm(
+                pred_traj=traj_active,
+                pred_head=head_active,
+                current_pos=ipos_active,
+                current_head=ihead_active,
+            ).float()
+
+            if x1.requires_grad and _grad_clip > 0:
+                x1.register_hook(_make_grad_clip_hook(_grad_clip))
+
+            # 초기 anchor (rollout t=0) 만 condition 으로 사용 — open-loop 와 동일.
+            anchor_hidden_t0: Tensor = pred["anchor_hidden_2hz"][:, 0][all_active].detach().float()
+
+            def _v_ref_fn(x: Tensor, tau: Tensor, _ah: Tensor = anchor_hidden_t0) -> Tensor:
+                return self.ref_flow_decoder(_ah, x.float(), tau.float())
+
+            log_p_g, grad_x1_g = backward_ode_log_prob_and_grad(
+                x1=x1,
+                v_fn=_v_ref_fn,
+                steps=flow_ode.solver_steps,
+                eps_t=flow_ode.eps,
+                n_hutch=n_hutch,
+                use_full_div_grad=use_full_div_grad,
+            )
+
+            if not torch.isfinite(log_p_g).all():
+                log.warning(f"[ref_nll_ft] non-finite log_p at rollout {g}; skipping")
+                continue
+
+            total_log_p_accum += float(log_p_g.mean().item())
+            n_valid_terms += 1
+
+            # warm_coarse 가 전체 rollout 을 덮으면 x1 에 grad 가 없어 backward 불가 →
+            # log_p 모니터링만 하고 loss accumulation 은 건너뛴다.
+            if not x1.requires_grad:
+                continue
+
+            # Straight-through loss: L_g = -(grad_log_p · x₁)
+            # gradient: x₁ → pred_traj_10hz → flow_ode[t] → θ  (BPTT through closed-loop)
+            loss_g = -(
+                (grad_x1_g.detach() * x1).flatten(1).sum(1).mean()
+            ) * loss_scale / G
+
+            total_loss_accum = total_loss_accum + loss_g
+
+        # ── 5. GT FM regularization (선택) ────────────────────────────────────
+        if fm_reg_lambda > 0.0:
+            fm_loss = self._compute_rmm_bptt_gt_fm_loss(map_feature, tokenized_agent)
+            if fm_loss is not None:
+                total_loss_accum = total_loss_accum + fm_reg_lambda * fm_loss
+
+        mean_log_p = total_log_p_accum / max(1, n_valid_terms)
+
+        if isinstance(total_loss_accum, Tensor):
+            if not torch.isfinite(total_loss_accum):
+                log.warning("[ref_nll_ft] non-finite total loss; skipping backward")
+                return {
+                    "loss": total_loss_accum.detach(),
+                    "train/ref_nll_log_p": mean_log_p,
+                    "train/ref_nll_n_terms": float(n_valid_terms),
+                }
+            self.manual_backward(total_loss_accum)
+            return {
+                "loss": total_loss_accum.detach(),
+                "train/ref_nll_log_p": mean_log_p,
+                "train/ref_nll_n_terms": float(n_valid_terms),
+            }
+        else:
+            # no valid terms — return zero loss
+            dummy = torch.zeros(1, device=tokenized_agent["batch"].device, requires_grad=True)
+            self.manual_backward(dummy * 0.0)
+            return {
+                "loss": torch.zeros(1),
+                "train/ref_nll_log_p": 0.0,
+                "train/ref_nll_n_terms": 0.0,
+            }
+
+    # ─────────────────────────────────────────────────────────────────────────
     # OCSC (Open-Closed Self-Consistency) fine-tuning
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -1568,6 +1795,9 @@ class SMARTFlow(LightningModule):
         # ocsc_use_mmd=True: proper MMD² (self-term 포함, mode collapse 방지)
         # ocsc_use_mmd=False: 기존 paired L2 mean (비교/ablation 용)
         use_mmd = bool(getattr(self.finetune_config, "ocsc_use_mmd", True))
+        # ocsc_gt_target=True: open-loop sample 대신 GT 궤적을 target으로 사용.
+        # CL 예측을 2Hz로 다운샘플 후 GT(2Hz)와 비교.
+        use_gt_target = bool(getattr(self.finetune_config, "ocsc_gt_target", False))
         heading_w = float(getattr(self.finetune_config, "ocsc_heading_weight", 0.0))
         pos_w = float(getattr(self.finetune_config, "ocsc_position_weight", 1.0))
         rel_disp_w = float(getattr(self.finetune_config, "ocsc_rel_disp_weight", 0.0))
@@ -1585,14 +1815,16 @@ class SMARTFlow(LightningModule):
         _last_n_coarse = int(getattr(self.finetune_config, "bptt_last_n_coarse_steps", 0))
         eval_hard_rmm = bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
         eval_hard_rmm_interval = max(1, int(getattr(self.finetune_config, "ocsc_eval_hard_rmm_interval", 1)))
+        _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
         # consistency 구간을 실제 grad가 살아있는 10Hz suffix로 제한할지 여부.
         # bptt_last_coarse_only=true면 warm_coarse=pred_max_steps-1 이므로 마지막 coarse step만 남긴다.
         _consistency_tail_10hz_steps: int | None = None
+        _consistency_tail_2hz_steps: int | None = None
         if _last_coarse_only and pred_max_steps is not None and pred_max_steps > 0:
-            _shift_10hz = int(getattr(self.encoder.agent_encoder, "shift", 5))
             _grad_coarse = max(0, int(pred_max_steps) - int(warm_coarse))
             _grad_coarse = max(1, _grad_coarse)
-            _consistency_tail_10hz_steps = _grad_coarse * _shift_10hz
+            _consistency_tail_10hz_steps = _grad_coarse * _shift
+            _consistency_tail_2hz_steps = _grad_coarse
 
         # ── 데이터 검증 ──────────────────────────────────────────────────────
         if data is None:
@@ -1696,6 +1928,58 @@ class SMARTFlow(LightningModule):
             _tail = max(1, min(int(_consistency_tail_10hz_steps), int(x.shape[-2])))
             return x[..., -_tail:, :]
 
+        def _slice_consistency_suffix_2hz(x: Tensor) -> Tensor:
+            """GT target mode 전용: 2Hz 텐서 [..., T, C]의 tail 슬라이스."""
+            if _consistency_tail_2hz_steps is None:
+                return x
+            _tail = max(1, min(int(_consistency_tail_2hz_steps), int(x.shape[-2])))
+            return x[..., -_tail:, :]
+
+        def _slice_valid_suffix_2hz(x: Tensor) -> Tensor:
+            """GT valid mask [n, T] (2D)의 tail 슬라이스."""
+            if _consistency_tail_2hz_steps is None:
+                return x
+            _tail = max(1, min(int(_consistency_tail_2hz_steps), int(x.shape[-1])))
+            return x[..., -_tail:]
+
+        def _consistency_loss_gt(
+            pred_norm: Tensor,  # [n, T, 4]  (2Hz CL, gradient 있음)
+            tgt_norm: Tensor,   # [n, T, 4]  (2Hz GT, detached)
+            tgt_valid: Tensor,  # [n, T]     (GT 유효 마스크)
+        ) -> Tensor:
+            """GT target 전용: 유효한 GT step만 사용하는 masked consistency loss."""
+            T = min(pred_norm.shape[-2], tgt_norm.shape[-2])
+            p = pred_norm[..., :T, :]
+            t = tgt_norm[..., :T, :].detach()
+            valid = tgt_valid[..., :T]            # [n, T]
+            if not valid.any():
+                return p.sum() * 0.0
+            mask = valid.unsqueeze(-1).float()    # [n, T, 1]
+            n_valid = mask.sum().clamp(min=1.0)
+            if loss_type == "smooth_l1":
+                pos_loss = (F.smooth_l1_loss(p[..., :2], t[..., :2], reduction="none") * mask).sum() / n_valid
+            elif loss_type == "l1":
+                pos_loss = (F.l1_loss(p[..., :2], t[..., :2], reduction="none") * mask).sum() / n_valid
+            else:
+                pos_loss = (F.mse_loss(p[..., :2], t[..., :2], reduction="none") * mask).sum() / n_valid
+            total = pos_w * pos_loss
+            if rel_disp_w > 0.0 and T >= 2:
+                pair_valid = (valid[..., 1:] & valid[..., :-1]).unsqueeze(-1).float()  # [n, T-1, 1]
+                n_pair = pair_valid.sum().clamp(min=1.0)
+                disp_p = p[..., 1:, :2] - p[..., :-1, :2]
+                disp_t = t[..., 1:, :2] - t[..., :-1, :2]
+                if loss_type == "smooth_l1":
+                    rd_loss = (F.smooth_l1_loss(disp_p, disp_t, reduction="none") * pair_valid).sum() / n_pair
+                elif loss_type == "l1":
+                    rd_loss = (F.l1_loss(disp_p, disp_t, reduction="none") * pair_valid).sum() / n_pair
+                else:
+                    rd_loss = (F.mse_loss(disp_p, disp_t, reduction="none") * pair_valid).sum() / n_pair
+                total = total + rel_disp_w * rd_loss
+            if heading_w > 0.0:
+                head_loss = (F.mse_loss(p[..., 2:], t[..., 2:], reduction="none") * mask).sum() / n_valid
+                total = total + heading_w * head_loss
+            return total
+
         # ── world → normalized frame helper ──────────────────────────────────
         def _cl_to_norm(cl_xy: Tensor, cl_head: Tensor, current_pos_active: Tensor, current_head_active: Tensor) -> Tensor:
             return self._world_traj_to_flow_norm(
@@ -1704,6 +1988,12 @@ class SMARTFlow(LightningModule):
                 current_pos=current_pos_active,
                 current_head=current_head_active,
             )
+
+        def _cl_downsample_to_2hz(cl_xy: Tensor, cl_head: Tensor, T_target: int) -> tuple[Tensor, Tensor]:
+            """10Hz CL 예측을 2Hz로 다운샘플: 각 coarse step의 마지막 fine-step 위치를 사용."""
+            cl_xy_2hz = cl_xy[:, _shift - 1 :: _shift, :][:, :T_target]     # [n, T_2hz, 2]
+            cl_head_2hz = cl_head[:, _shift - 1 :: _shift][:, :T_target]    # [n, T_2hz]
+            return cl_xy_2hz, cl_head_2hz
 
         # ── 3+4. Anchor-sequential loop: OL → CL → loss → backward → free ────
         # 한 anchor씩 처리 후 즉시 backward하여 모든 anchor의 캐시/OL/CL을 동시에
@@ -1765,27 +2055,41 @@ class SMARTFlow(LightningModule):
                 current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
                 active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
 
-                # ── 3c. Open-loop samples + pairwise noise tapes (G, no_grad) ─
-                # g별 per-scenario seed로 전체 noise tape 생성 → OL과 CL이 같은 tape 공유.
-                # OL-g: tape_g[active_mask, :20, :]  (fine-step 별 independent, CL step-0과 동일)
-                # CL-g: tape_g 전체 (coarse step t에서 tape[t*shift : t*shift+20] 사용)
-                # → OL 2초 horizon 내 위치는 pairwise 매칭, 그 밖은 독립 random.
+                # ── 3c. Target samples: GT or Open-loop ───────────────────────
                 _n_agent_full = int(tokenized_agent_anchor["batch"].shape[0])
                 _n_step_10hz = int(rollout_cache_anchor["n_step_future_10hz"])
                 _sample_win = 20
                 _tape_steps = _n_step_10hz + _sample_win - _agent_enc.shift
                 shared_tapes: list[Tensor] = []  # noise_tape_g per rollout [n_agent, tape_steps, 4]
-                if _use_ref:
-                    _agent_enc.flow_decoder = self.ref_flow_decoder
-                with torch.no_grad():
+
+                # GT target 모드: GT 궤적을 target으로 사용.
+                # pred_max_steps_raw 만큼의 2Hz GT 위치를 anchor frame으로 정규화한다.
+                gt_norm_anchor: Tensor | None = None
+                gt_valid_anchor: Tensor | None = None
+                if use_gt_target:
+                    _T_gt = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+                    _gt_start = anchor_idx + 1
+                    _gt_end = _gt_start + _T_gt
+                    _gt_pos  = tokenized_agent["gt_pos"][active_mask, _gt_start:_gt_end, :]     # [n_active, T_gt, 2]
+                    _gt_head = tokenized_agent["gt_heading"][active_mask, _gt_start:_gt_end]     # [n_active, T_gt]
+                    _gt_valid = tokenized_agent["valid_mask"][active_mask, _gt_start:_gt_end]    # [n_active, T_gt]
+                    # 실제 사용 가능한 GT step 수 (시퀀스 끝에서 잘릴 수 있음)
+                    _T_gt_actual = _gt_pos.shape[1]
+                    if _T_gt_actual == 0 or not _gt_valid.any():
+                        del rollout_cache_anchor
+                        continue
+                    gt_norm_anchor = _cl_to_norm(
+                        _gt_pos, _gt_head, current_pos_active, current_head_active,
+                    ).detach()   # [n_active, T_gt_actual, 4]
+                    gt_valid_anchor = _gt_valid                                                   # [n_active, T_gt_actual]
                     ol_norms: list[Tensor] = []
+                    # noise tape은 CL rollout을 위해 여전히 필요 (G개)
                     for g in range(G):
                         _seeds_g = self._get_closed_loop_scenario_seeds(
                             scenario_ids=data["scenario_id"],
                             rollout_idx=g,
                             device=active_hidden.device,
                         )
-                        # per-scenario seed로 전체 tape 생성 (fine-step마다 independent)
                         tape_g = _agent_enc._build_rollout_noise_tape(
                             num_agent=_n_agent_full,
                             tape_steps=_tape_steps,
@@ -1795,19 +2099,47 @@ class SMARTFlow(LightningModule):
                             scenario_sampling_seeds=_seeds_g,
                             agent_batch=tokenized_agent_anchor["batch"],
                             share_noise_across_time=False,
-                        )  # [n_agent, tape_steps, 4]
+                        )
                         shared_tapes.append(tape_g)
-                        # OL: tape의 첫 20 fine-step (= CL coarse step 0과 동일 noise)
-                        x_init_ol = tape_g[active_mask, :_sample_win, :].clone()  # [n_active, 20, 4]
-                        ol_norms.append(_agent_enc._sample_open_loop_future_from_hidden(
-                            anchor_hidden_valid=active_hidden,
-                            sampling_noise=self.eval_sampling_noise,
-                            x_init_override=x_init_ol,
-                        ))
-                if _use_ref:
-                    _agent_enc.flow_decoder = _orig_fd
+                else:
+                    # 기존 open-loop sample 생성
+                    # g별 per-scenario seed로 전체 noise tape 생성 → OL과 CL이 같은 tape 공유.
+                    # OL-g: tape_g[active_mask, :20, :]  (fine-step 별 independent, CL step-0과 동일)
+                    # CL-g: tape_g 전체 (coarse step t에서 tape[t*shift : t*shift+20] 사용)
+                    # → OL 2초 horizon 내 위치는 pairwise 매칭, 그 밖은 독립 random.
+                    if _use_ref:
+                        _agent_enc.flow_decoder = self.ref_flow_decoder
+                    with torch.no_grad():
+                        ol_norms: list[Tensor] = []
+                        for g in range(G):
+                            _seeds_g = self._get_closed_loop_scenario_seeds(
+                                scenario_ids=data["scenario_id"],
+                                rollout_idx=g,
+                                device=active_hidden.device,
+                            )
+                            tape_g = _agent_enc._build_rollout_noise_tape(
+                                num_agent=_n_agent_full,
+                                tape_steps=_tape_steps,
+                                device=active_hidden.device,
+                                dtype=active_hidden.dtype,
+                                sampling_noise=self.eval_sampling_noise,
+                                scenario_sampling_seeds=_seeds_g,
+                                agent_batch=tokenized_agent_anchor["batch"],
+                                share_noise_across_time=False,
+                            )  # [n_agent, tape_steps, 4]
+                            shared_tapes.append(tape_g)
+                            x_init_ol = tape_g[active_mask, :_sample_win, :].clone()  # [n_active, 20, 4]
+                            ol_norms.append(_agent_enc._sample_open_loop_future_from_hidden(
+                                anchor_hidden_valid=active_hidden,
+                                sampling_noise=self.eval_sampling_noise,
+                                x_init_override=x_init_ol,
+                            ))
+                    if _use_ref:
+                        _agent_enc.flow_decoder = _orig_fd
 
                 # ── 4. Closed-loop rollout + loss ─────────────────────────────
+                _T_gt = int(gt_norm_anchor.shape[1]) if use_gt_target else 0
+
                 if sequential and G > 1:
                     # 2-pass sequential: peak memory O(1 graph), MMD gradient = exact.
                     #
@@ -1840,26 +2172,51 @@ class SMARTFlow(LightningModule):
                                     noise_tape_override=shared_tapes[g],
                                 )
                                 _T_d = _traj_d.shape[-2]
-                                _cl_norm_det = _cl_to_norm(
-                                    _traj_d[active_mask, 0, :_T_d, :],
-                                    _head_d[active_mask, 0, :_T_d],
-                                    current_pos_active, current_head_active,
-                                )
-                                cl_norms_det.append(_slice_consistency_suffix(_cl_norm_det))
+                                if use_gt_target:
+                                    _xy_d, _hd_d = _cl_downsample_to_2hz(
+                                        _traj_d[active_mask, 0, :_T_d, :],
+                                        _head_d[active_mask, 0, :_T_d],
+                                        _T_gt,
+                                    )
+                                    _cl_norm_det = _cl_to_norm(_xy_d, _hd_d, current_pos_active, current_head_active)
+                                    _cl_norm_det = _slice_consistency_suffix_2hz(_cl_norm_det)
+                                else:
+                                    _cl_norm_det = _cl_to_norm(
+                                        _traj_d[active_mask, 0, :_T_d, :],
+                                        _head_d[active_mask, 0, :_T_d],
+                                        current_pos_active, current_head_active,
+                                    )
+                                    _cl_norm_det = _slice_consistency_suffix(_cl_norm_det)
+                                cl_norms_det.append(_cl_norm_det)
                                 del _traj_d, _head_d
 
-                        _ol_det = [_slice_consistency_suffix(o.detach()) for o in ol_norms]
-                        sigma_sq_seq = mmd_precompute_sigma_sq(_ol_det, cl_norms_det)
-
-                        # Log MMD value from detached pass-1 samples (consistent with parallel mode)
-                        _T_log = min(cl_norms_det[0].shape[-2], _ol_det[0].shape[-2])
-                        with torch.no_grad():
-                            _mmd_log = mmd_from_stacked(
-                                torch.stack(cl_norms_det, dim=0)[:, :, :_T_log, :],
-                                torch.stack(_ol_det,      dim=0)[:, :, :_T_log, :],
-                            )
-                        total_loss_accum += _mmd_log.item()
-                        del _mmd_log
+                        if use_gt_target:
+                            _gt_slice = _slice_consistency_suffix_2hz(gt_norm_anchor)
+                            _ol_ref_list = [_gt_slice] * G
+                            sigma_sq_seq = mmd_precompute_sigma_sq(_ol_ref_list, cl_norms_det)
+                            # Log detached MMD from pass-1 vs GT
+                            _T_log = min(cl_norms_det[0].shape[-2], _gt_slice.shape[-2])
+                            with torch.no_grad():
+                                _gt_stack = _gt_slice.unsqueeze(0).expand(G, -1, -1, -1)[:, :, :_T_log, :]
+                                _mmd_log = mmd_from_stacked(
+                                    torch.stack(cl_norms_det, dim=0)[:, :, :_T_log, :],
+                                    _gt_stack,
+                                )
+                            total_loss_accum += _mmd_log.item()
+                            del _mmd_log, _gt_stack
+                        else:
+                            _ol_det = [_slice_consistency_suffix(o.detach()) for o in ol_norms]
+                            _ol_ref_list = _ol_det
+                            sigma_sq_seq = mmd_precompute_sigma_sq(_ol_det, cl_norms_det)
+                            # Log MMD value from detached pass-1 samples (consistent with parallel mode)
+                            _T_log = min(cl_norms_det[0].shape[-2], _ol_det[0].shape[-2])
+                            with torch.no_grad():
+                                _mmd_log = mmd_from_stacked(
+                                    torch.stack(cl_norms_det, dim=0)[:, :, :_T_log, :],
+                                    torch.stack(_ol_det,      dim=0)[:, :, :_T_log, :],
+                                )
+                            total_loss_accum += _mmd_log.item()
+                            del _mmd_log
 
                     # Pass 2 ─────────────────────────────────────────────────
                     for g in range(G):
@@ -1875,27 +2232,41 @@ class SMARTFlow(LightningModule):
                             warm_coarse_steps=warm_coarse,
                             noise_tape_override=shared_tapes[g],
                         )
+                        if pred_traj_g.requires_grad and _grad_clip > 0:
+                            pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
                         T_cl = pred_traj_g.shape[-2]
                         cl_xy_g = pred_traj_g[active_mask, 0, :T_cl, :]
                         cl_head_g = pred_head_g[active_mask, 0, :T_cl]
-                        if pred_traj_g.requires_grad and _grad_clip > 0:
-                            pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip))
-                        cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
-                        cl_norm_g = _slice_consistency_suffix(cl_norm_g)
+
+                        if use_gt_target:
+                            _xy_2hz, _hd_2hz = _cl_downsample_to_2hz(cl_xy_g, cl_head_g, _T_gt)
+                            cl_norm_g = _cl_to_norm(_xy_2hz, _hd_2hz, current_pos_active, current_head_active)
+                            cl_norm_g = _slice_consistency_suffix_2hz(cl_norm_g)
+                            _gt_slice_pass2 = _slice_consistency_suffix_2hz(gt_norm_anchor)
+                            _gt_valid_slice = _slice_valid_suffix_2hz(gt_valid_anchor)
+                        else:
+                            cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
+                            cl_norm_g = _slice_consistency_suffix(cl_norm_g)
 
                         if _do_seq_mmd:
                             # (proxy_g / n_anchors).backward() summed over g = ∂(mean_anchor MMD²)/∂θ
+                            # GT target: ol_norms_ref = [gt_slice] * G → kco = k(cl_g, GT) exactly.
                             proxy_g = mmd_per_rollout_proxy(
                                 cl_norm_g=cl_norm_g,
                                 cl_norms_ref=cl_norms_det,
-                                ol_norms_ref=[_slice_consistency_suffix(o.detach()) for o in ol_norms],
+                                ol_norms_ref=_ol_ref_list,
                                 sigma_sq=sigma_sq_seq,
                             )
                             (proxy_g / n_anchors_total).backward()
                             del proxy_g
+                        elif use_gt_target:
+                            loss_g = _consistency_loss_gt(cl_norm_g, _gt_slice_pass2, _gt_valid_slice)
+                            total_loss_accum += loss_g.item()
+                            (loss_g / (n_anchors_total * G)).backward()
+                            del loss_g
                         else:
                             loss_g = _consistency_loss(
-                                _slice_consistency_suffix(cl_norm_g),
+                                cl_norm_g,
                                 _slice_consistency_suffix(ol_norms[g]),
                             )
                             total_loss_accum += loss_g.item()
@@ -1921,12 +2292,41 @@ class SMARTFlow(LightningModule):
                     T_cl = pred_traj_all.shape[-2]
                     cl_norms: list[Tensor] = []
                     for g in range(G):
-                        cl_norms.append(_cl_to_norm(
-                            pred_traj_all[active_mask, g, :T_cl, :],
-                            pred_head_all[active_mask, g, :T_cl],
-                            current_pos_active, current_head_active,
-                        ))
-                    if use_mmd and G >= 2:
+                        if use_gt_target:
+                            _xy_2hz, _hd_2hz = _cl_downsample_to_2hz(
+                                pred_traj_all[active_mask, g, :T_cl, :],
+                                pred_head_all[active_mask, g, :T_cl],
+                                _T_gt,
+                            )
+                            cl_norms.append(_cl_to_norm(_xy_2hz, _hd_2hz, current_pos_active, current_head_active))
+                        else:
+                            cl_norms.append(_cl_to_norm(
+                                pred_traj_all[active_mask, g, :T_cl, :],
+                                pred_head_all[active_mask, g, :T_cl],
+                                current_pos_active, current_head_active,
+                            ))
+
+                    if use_gt_target:
+                        _gt_slice = _slice_consistency_suffix_2hz(gt_norm_anchor)
+                        _gt_valid_slice = _slice_valid_suffix_2hz(gt_valid_anchor)
+                        if use_mmd and G >= 2:
+                            T_min = min(cl_norms[0].shape[-2], _gt_slice.shape[-2])
+                            cl_stack = torch.stack(
+                                [_slice_consistency_suffix_2hz(c) for c in cl_norms], dim=0
+                            )[:, :, :T_min, :]
+                            # GT를 G번 반복해 ol_stack으로 사용: koo=1 (constant, no grad)
+                            gt_stack = _gt_slice.unsqueeze(0).expand(G, -1, -1, -1)[:, :, :T_min, :].detach()
+                            anchor_loss = mmd_from_stacked(cl_stack, gt_stack)
+                        else:
+                            anchor_loss = torch.stack([
+                                _consistency_loss_gt(
+                                    _slice_consistency_suffix_2hz(cl_norms[g]),
+                                    _gt_slice,
+                                    _gt_valid_slice,
+                                )
+                                for g in range(G)
+                            ]).mean()
+                    elif use_mmd and G >= 2:
                         T_min = min(T_cl, ol_norms[0].shape[-2])
                         cl_stack = torch.stack(cl_norms, dim=0)[:, :, :T_min, :]
                         ol_stack = torch.stack(ol_norms, dim=0)[:, :, :T_min, :].detach()
@@ -1944,15 +2344,18 @@ class SMARTFlow(LightningModule):
                     total_loss_accum += anchor_loss.item()
                     (anchor_loss / n_anchors_total).backward()
 
-                    # 진단용: 마지막 anchor의 CL/OL 보존 (variance logging)
+                    # 진단용: 마지막 anchor의 CL/OL 보존 (variance logging; GT mode에서는 OL skip)
                     _diag_pred_traj = pred_traj_all.detach()
-                    _diag_ol_norms = [o.detach() for o in ol_norms]
+                    if not use_gt_target:
+                        _diag_ol_norms = [o.detach() for o in ol_norms]
                     _diag_active_mask = active_mask
 
                     del pred_traj_all, pred_z_all, pred_head_all, cl_norms, anchor_loss
 
                 n_valid_anchors += 1
-                del rollout_cache_anchor, active_hidden, current_pos_active, current_head_active, ol_norms
+                del rollout_cache_anchor, active_hidden, current_pos_active, current_head_active
+                if not use_gt_target:
+                    del ol_norms
 
         finally:
             flow_ode.use_adjoint_for_bptt = False
@@ -2883,6 +3286,13 @@ class SMARTFlow(LightningModule):
                     _fm_reg if isinstance(_fm_reg, Tensor) else torch.tensor(_fm_reg, device=diag["train/consistency_loss"].device)
                 )
                 self.log("train/loss", _total, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+
+        elif self._is_ref_nll_ft_enabled():
+            result = self._run_ref_nll_ft_step(tokenized_map, tokenized_agent, data)
+            for k, v in result.items():
+                if k != "loss" and isinstance(v, (Tensor, float)):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
         elif self._is_kinematic_proj_ft_enabled():
             result = self._run_kinematic_proj_ft_step(tokenized_map, tokenized_agent)
