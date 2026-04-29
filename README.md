@@ -59,6 +59,22 @@
   token chunk export를 유지합니다.
 
 
+### Self-forced Sampling Policy
+
+- `model.model_config.self_forced.sampling.random_terminal_step.policy=paper_uniform` 은 기존 동작과 같습니다.
+  실행할 denoising step 수를 `min_executed_steps..sample_steps` 범위에서 균등하게 고릅니다.
+- `model.model_config.self_forced.sampling.random_terminal_step.policy=all` 은 closed-loop rollout에서
+  항상 `model.model_config.self_forced.sampling.sample_steps` 전체 denoising을 실행합니다.
+- `policy=all` 일 때 gradient는 마지막 `model.model_config.self_forced.sampling.backprop_last_k` 개
+  denoising step에만 남깁니다. 이 값을 생략하면 기본값은 `8` 입니다.
+
+예시:
+
+```bash
+... model.model_config.self_forced.sampling.random_terminal_step.policy=all \
+    model.model_config.self_forced.sampling.backprop_last_k=8
+```
+
 ## 2. 환경 설치
 
 권장 환경:
@@ -874,6 +890,7 @@ Self-forced H100 preset은 self-forced rollout에서 `sample_steps=32`를 유지
 
 - `model.model_config.self_forced.sampling.random_terminal_step.scope=global_batch` 가 기본값입니다. 이 값은 DDP 전체 rank 공유 `s` fast path를 뜻합니다.
 - `policy=paper_uniform` 은 실제 실행 denoising step `K` 를 `[min_executed_steps, sample_steps]` 범위에서 균등 샘플링합니다. 기본 `min_executed_steps=24` 이므로 `sample_steps=32` 에서는 `K=24..32` 만 사용합니다.
+- `policy=all` 은 random terminal step을 샘플링하지 않고 항상 `sample_steps` 전체 denoising을 실행합니다. 이때 `sampling.backprop_last_k` 개 마지막 step에만 gradient를 남기며, 값을 생략하면 기본값은 `8` 입니다.
 - terminal step 이전 denoising은 gradient 없이 계산하고, terminal clean estimate를 만드는 마지막 호출 하나만 gradient를 유지합니다.
 - 선택된 `s`는 self-rollout을 어디서 끊고 commit할지만 정합니다.
 - `F_psi` 업데이트와 clean-DMD guidance 계산의 noising `tau` 는 flow ODE의 전체 tau 구간에서 독립적으로 다시 샘플링합니다.
@@ -1429,6 +1446,7 @@ model:
         sample_steps: 32
         sample_method: euler
         noise_scale: 1.0
+        backprop_last_k: 8
         random_terminal_step:
           enabled: true
           scope: global_batch

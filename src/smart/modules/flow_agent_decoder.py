@@ -1006,6 +1006,41 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         terminal_steps = int(sample_steps) + 1 - terminal_s
         return terminal_steps, terminal_s
 
+    def _resolve_training_backprop_last_k(
+        self,
+        sampling_scheme: DictConfig,
+    ) -> int | None:
+        """self-forced 생성 중 gradient를 남길 마지막 denoising step 수를 정합니다.
+
+        Args:
+            sampling_scheme: self-forced rollout sampling 설정입니다.
+
+        Returns:
+            int | None:
+                마지막 몇 denoising step에 gradient를 남길지 나타냅니다.
+                값이 ``None`` 이면 전체 denoising step이 gradient 대상입니다.
+                ``random_terminal_step.policy=all`` 이고 사용자가 값을 주지 않으면
+                기본값 ``8`` 을 돌려줍니다.
+        """
+        configured_last_k = getattr(sampling_scheme, "backprop_last_k", None)
+        if configured_last_k is not None:
+            backprop_last_k = int(configured_last_k)
+            if backprop_last_k < 1:
+                raise ValueError(
+                    "sampling.backprop_last_k must be positive when set, "
+                    f"got {backprop_last_k}."
+                )
+            return backprop_last_k
+
+        random_cfg = getattr(sampling_scheme, "random_terminal_step", None)
+        if random_cfg is None or not bool(getattr(random_cfg, "enabled", False)):
+            return None
+
+        policy = str(getattr(random_cfg, "policy", "paper_uniform"))
+        if policy == "all":
+            return 8
+        return None
+
     def _sample_training_terminal_step_for_batch(
         self,
         sampling_scheme: DictConfig,
@@ -1027,9 +1062,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 켜져 있으면 각 tensor의 scenario 축 shape은 ``[num_scenario]`` 입니다.
 
         Notes:
-            ``policy=paper_uniform`` 만 지원합니다. 실제 실행 step 수 ``K`` 를
-            ``[min_executed_steps, sample_steps]`` 에서 균등하게 뽑은 뒤,
-            기존 코드가 쓰는 논문 표기 ``s = sample_steps + 1 - K`` 로 변환합니다.
+            ``policy=paper_uniform`` 은 기존처럼 실행할 denoising step 수를 균등 샘플링합니다.
+            ``policy=all`` 은 random terminal step을 만들지 않고 전체 denoising을 실행합니다.
+            이때 gradient는 ``sampling.backprop_last_k`` 로 지정한 마지막 step에만 남깁니다.
+            ``sampling.backprop_last_k`` 를 생략하면 기본값은 ``8`` 입니다.
         """
         random_cfg = getattr(sampling_scheme, "random_terminal_step", None)
         if self_forced_epoch is None or random_cfg is None:
@@ -1044,10 +1080,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             raise ValueError(f"num_scenario must be non-negative, got {num_scenario}.")
 
         policy = str(getattr(random_cfg, "policy", "paper_uniform"))
+        if policy == "all":
+            return None, None
         if policy != "paper_uniform":
             raise ValueError(
-                "random_terminal_step.policy only supports 'paper_uniform'. "
-                "use min_executed_steps to control the lower bound of executed denoising steps."
+                "random_terminal_step.policy only supports 'paper_uniform' or 'all'. "
+                "Use 'all' to execute every denoising step with last-k backprop, "
+                "or use 'paper_uniform' with min_executed_steps."
             )
 
         scope = str(getattr(random_cfg, "scope", "global_batch"))
@@ -1326,10 +1365,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     self.flow_ode.solver_method,
                 )
                 if terminal_step_by_agent is None:
-                    flow_sample_backprop_last_k = getattr(
-                        sampling_scheme,
-                        "backprop_last_k",
-                        None,
+                    flow_sample_backprop_last_k = self._resolve_training_backprop_last_k(
+                        sampling_scheme=sampling_scheme,
                     )
                     y_hat_norm = self.flow_ode.generate(
                         x_init=x_init_norm,
