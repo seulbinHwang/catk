@@ -87,13 +87,14 @@ class SMARTFlow(LightningModule):
 
         draft_config = getattr(model_config, "draft", None)
         self.draft_enabled = bool(draft_config is not None and getattr(draft_config, "enabled", False))
+        self.draft_loss_enabled = self.draft_enabled and bool(getattr(draft_config, "loss_enabled", True))
         self.draft_sampling = getattr(draft_config, "sampling", None)
         self.draft_start_epoch = int(getattr(draft_config, "start_epoch", 0)) if draft_config is not None else 0
         self.draft_ramp_epochs = int(getattr(draft_config, "ramp_epochs", 1)) if draft_config is not None else 1
         self.draft_max_weight = float(getattr(draft_config, "max_weight", 0.0)) if draft_config is not None else 0.0
         self.draft_physics_force_fp32 = False
 
-        if self.draft_enabled:
+        if self.draft_loss_enabled:
             draft_physics = getattr(draft_config, "physics")
             self.draft_physics_force_fp32 = bool(getattr(draft_physics, "force_fp32", True))
             self.draft_regularizer = DraftPhysicsRegularizer(
@@ -1023,10 +1024,10 @@ class SMARTFlow(LightningModule):
 
         Returns:
             float:
-                warm-up 이전이면 ``0.0`` 이고,
+                DRaFT loss가 꺼져 있거나 warm-up 이전이면 ``0.0`` 이고,
                 그 뒤에는 설정한 최대값까지 선형으로 올라갑니다.
         """
-        if not self.draft_enabled or self.draft_max_weight <= 0.0:
+        if not self.draft_loss_enabled or self.draft_max_weight <= 0.0:
             return 0.0
 
         current_epoch = int(self.current_epoch)
@@ -1142,6 +1143,7 @@ class SMARTFlow(LightningModule):
         """
         if (
             not self.draft_enabled
+            or not self.draft_loss_enabled
             or self.draft_regularizer is None
             or pred_dict["flow_clean_norm"].numel() == 0
         ):
@@ -1272,7 +1274,7 @@ class SMARTFlow(LightningModule):
             )
 
     def training_step(self, data, batch_idx):
-        """한 batch의 FM loss와 DRaFT physics loss를 함께 계산합니다.
+        """한 batch의 FM loss와 선택적 DRaFT physics loss를 계산합니다.
 
         Args:
             data: 학습용 장면 배치입니다.

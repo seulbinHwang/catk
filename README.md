@@ -626,14 +626,17 @@ fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
 - effective global train batch size: `288` with 6 GPUs
 - val batch size: `16`
 - validation 주기: `16` epoch마다
+- DRaFT inverse feasibility loss 계산: `model.model_config.draft.loss_enabled=true`
 
 loss와 로그는 아래처럼 보면 됩니다.
 
 - `train/loss`는 최종 학습 loss입니다.
 - `train/loss_fm`는 원래 flow matching loss입니다.
 - `train/loss_phys`와 `train/loss_if`는 같은 값이고, 새 inverse feasibility penalty `L_if`를 뜻합니다.
-- 실제 학습식은 `train/loss = train/loss_fm + train/draft_weight * 0.005 * train/loss_if` 입니다.
-- `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
+- `model.model_config.draft.loss_enabled=true`일 때 실제 학습식은 `train/loss = train/loss_fm + train/draft_weight * 0.005 * train/loss_if` 입니다.
+- `model.model_config.draft.loss_enabled=false`로 두면 `draft.max_weight` 값과 무관하게 DRaFT 샘플링과 inverse feasibility loss 계산을 하지 않습니다.
+- 이 경우 fine-tuning은 pure Flow Matching으로만 진행되고, `train/loss = train/loss_fm`이 됩니다.
+- `loss_enabled=true`인 경우 `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
 - 현재 설정은 `max_weight=0.1`이고, 실제 scale `0.005`는 코드에 고정으로 들어갑니다.
 - 따라서 기본 설정의 physics loss 최대 가중치는 `0.1 * 0.005 = 0.0005`입니다.
 - 기본 구현은 trainer가 `bf16-mixed`여도 inverse feasibility 계산 구간만 fp32 subregion에서 수행합니다.
@@ -674,6 +677,9 @@ loss와 로그는 아래처럼 보면 됩니다.
 
 # gamma_draft를 더 빨리/강하게 올리기
 ... model.model_config.draft.max_weight=1.0     model.model_config.draft.ramp_epochs=2
+
+# DRaFT preset의 trainable module / schedule은 쓰되 inverse feasibility loss만 완전히 끄기
+... model.model_config.draft.loss_enabled=false
 
 # inverse feasibility도 mixed precision으로 그대로 계산
 ... model.model_config.draft.physics.force_fp32=false

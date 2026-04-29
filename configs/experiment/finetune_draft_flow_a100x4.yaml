@@ -82,6 +82,7 @@ model:
 
     draft:
       enabled: true
+      loss_enabled: true
       start_epoch: 0
       ramp_epochs: 32
       max_weight: 0.1
