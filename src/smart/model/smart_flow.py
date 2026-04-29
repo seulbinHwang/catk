@@ -236,15 +236,13 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else True
         )
-        self.self_forced_generated_estimator_lr = (
-            float(getattr(self.self_forced_config, "generated_estimator_lr", self.lr))
-            if self.self_forced_config is not None
-            else self.lr
-        )
         self.self_forced_estimator_updates_per_step = (
             max(1, int(getattr(self.self_forced_config, "estimator_updates_per_step", 1)))
             if self.self_forced_config is not None
             else 1
+        )
+        self.self_forced_estimator_lr = self.lr / float(
+            self.self_forced_estimator_updates_per_step
         )
         self.self_forced_initialize_aux_on_fit_start = (
             bool(getattr(self.self_forced_config, "initialize_aux_from_generator_on_fit_start", True))
@@ -2790,7 +2788,7 @@ open_metric_dict:
                 raise RuntimeError("No trainable generated-estimator parameters found.")
             generated_estimator_optimizer = torch.optim.AdamW(
                 estimator_params,
-                lr=self.self_forced_generated_estimator_lr,
+                lr=self.self_forced_estimator_lr,
             )
             return [generator_optimizer, generated_estimator_optimizer]
 
