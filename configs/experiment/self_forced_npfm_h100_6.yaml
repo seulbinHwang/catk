@@ -57,6 +57,8 @@ model:
       # Resume from a self-forced checkpoint preserves restored aux states.
       initialize_aux_from_generator_on_fit_start: true
       freeze_map_encoder: true
+      ema_weight: 0.99
+      ema_start_step: 50
       use_control_space_physics_regularization: false
       physics_weight: 0.005
       sampling:

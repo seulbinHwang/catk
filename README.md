@@ -842,6 +842,7 @@ torchrun \
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
 - H100 preset은 Generator lr `4e-6`, generated estimator lr `8e-7`, `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `path_step_size=0.05`, `freeze_map_encoder=true`, sampling = Euler 32-step / `noise_scale=1.0` / random terminal denoising step을 기본으로 둡니다.
 - Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=1.0e-3`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다.
+- Generator EMA 기본값은 `ema_weight=0.99`, `ema_start_step=50` 입니다. EMA는 online Generator update 직후에만 갱신되고, generated estimator에는 적용하지 않습니다.
 - 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
 - self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 LR scheduler를 쓰지 않습니다. 따라서 `model.model_config.lr` 와 `model.model_config.self_forced.generated_estimator_lr` 는 학습 내내 고정되고, self-forced preset에는 `lr_warmup_steps` / `lr_min_ratio` override를 두지 않습니다.
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
@@ -864,7 +865,7 @@ torchrun \
   ckpt_path=/path/to/2s_pretrain_epoch_last.ckpt
 ```
 
-중단된 self-forced run을 이어서 학습할 때만 `action=fit ckpt_path=/path/to/self_forced_run/last.ckpt` 를 사용하세요. 이 경우에는 Lightning이 optimizer, epoch, global step까지 함께 복원합니다. checkpoint 안에 `self_forced_target_teacher` 와 `self_forced_generated_estimator` state가 있으면, fit 시작 hook은 두 보조 모델을 현재 Generator weight로 다시 덮어쓰지 않고 checkpoint의 `F_rho` / `F_psi` 상태를 보존합니다.
+중단된 self-forced run을 이어서 학습할 때만 `action=fit ckpt_path=/path/to/self_forced_run/last.ckpt` 를 사용하세요. 이 경우에는 Lightning이 optimizer, epoch, global step까지 함께 복원합니다. checkpoint 안에 `self_forced_target_teacher`, `self_forced_generated_estimator`, `self_forced_generator_ema` state가 있으면, fit 시작 hook은 보조 모델과 EMA를 현재 Generator weight로 다시 덮어쓰지 않고 checkpoint의 `F_rho` / `F_psi` / EMA 상태를 보존합니다.
 
 보호 장치도 있습니다. self-forced가 켜진 상태에서 `action=finetune` 에 self-forced checkpoint를 넣으면 실행이 중단됩니다. 반대로 `action=fit` 에 self-forced 보조 state가 없는 pretrained checkpoint를 넣어도 중단됩니다. 즉, pretrained Generator에서 처음 시작할 때는 `action=finetune`, self-forced run을 이어갈 때는 `action=fit` 으로 분리해야 합니다.
 
@@ -890,7 +891,7 @@ python -m src.run experiment=self_forced_npfm_h100_6 \
 
 - 첫 시도는 `PRETRAIN_CKPT` 에 지정한 2초 horizon pretrained Generator ckpt 로 `action=finetune`
 - 학습 도중 OOM 으로 죽으면 attempt log 에서 `OutOfMemoryError` / `CUDA out of memory` 마커를 감지해 `data.train_batch_size` 를 `OOM_STEP` (기본 2) 만큼 낮춤
-- 다음 시도부터는 `logs/<TASK_NAME>/runs/*/checkpoints/epoch_last.ckpt` 중 최신 self-forced ckpt 를 골라 `action=fit` 으로 **마지막 완료 epoch 끝부터 재개** (optimizer / epoch / global step / `F_rho` / `F_psi` 모두 복원)
+- 다음 시도부터는 `logs/<TASK_NAME>/runs/*/checkpoints/epoch_last.ckpt` 중 최신 self-forced ckpt 를 골라 `action=fit` 으로 **마지막 완료 epoch 끝부터 재개** (optimizer / epoch / global step / `F_rho` / `F_psi` / Generator EMA 모두 복원)
 - `bs` 가 `MIN_BS` (기본 2) 아래로 내려가거나 OOM 이외의 실패가 나면 즉시 중단
 
 실행 예시:
@@ -913,6 +914,8 @@ bash scripts/self_forced_h100_6_with_oom_retry.sh
 | `NPROC_PER_NODE` | `6` | DDP rank 수 |
 | `EXPERIMENT` | `self_forced_npfm_h100_6` | hydra experiment 이름 |
 | `RANDOM_TERMINAL_SCOPE` | unset | random terminal scope override, normally `global_batch` |
+| `EMA_WEIGHT` | unset | Generator EMA decay override |
+| `EMA_START_STEP` | unset | Generator EMA 시작 generator update 수 override |
 | `CLEAN_DMD_NORMALIZER_EPS` | unset | Clean-DMD direction 정규화 분모 최소값 override |
 | `CLEAN_DMD_TAU_LOW` | unset | Clean-DMD guidance noising tau 하한 override |
 | `CLEAN_DMD_TAU_HIGH` | unset | Clean-DMD guidance noising tau 상한 override |
@@ -1379,7 +1382,8 @@ K commit block 수 = flow_window_steps / 5
 
 - `F_rho`: fresh fine-tuning 시작 시점에 pretrained `SMARTFlowDecoder` 를 복사해 만드는 frozen target path-flow teacher 입니다.
 - `F_psi`: `F_rho` 와 같은 pretrained decoder weight 로 초기화한 generated path-flow estimator 이며, detached committed self-rollout 위에서 online 으로 업데이트됩니다.
-- self-forced checkpoint resume 에서는 checkpoint에 저장된 `F_rho` / `F_psi` state를 그대로 보존합니다. 즉, resume 직후 fit 시작 hook이 두 보조 모델을 현재 Generator weight로 다시 덮어쓰지 않습니다.
+- Generator EMA: online Generator의 update를 평균낸 frozen copy입니다. `ema_start_step=50` 번째 generator update에서 현재 online Generator를 복사해 시작하고, 그 뒤 update마다 `ema_weight=0.99` 비율로 이전 EMA를 유지합니다. 학습 rollout과 gradient update는 항상 online Generator로 하고, validation / checkpoint 선택 / test submission은 EMA가 준비된 뒤 EMA Generator를 사용합니다.
+- self-forced checkpoint resume 에서는 checkpoint에 저장된 `F_rho` / `F_psi` / Generator EMA state를 그대로 보존합니다. 즉, resume 직후 fit 시작 hook이 두 보조 모델이나 EMA를 현재 Generator weight로 다시 덮어쓰지 않습니다.
 - guidance 방향을 계산할 때는 `F_rho` 와 비교용 `F_psi` 를 항상 eval mode로 둡니다. 그래서 dropout/history drop 같은 train-mode 랜덤성이 기준 방향에 섞이지 않습니다. `F_psi` 는 detached generated path에 fit되는 online update 구간에서만 train mode로 전환됩니다.
 - committed self-rollout 을 만들 때는 현재 Generator를 eval mode로 잠깐 전환하되 autograd는 유지합니다. 따라서 dropout/history drop 없이 실제 inference 조건의 trajectory를 만들고, 그 trajectory를 통해 `sf_loss` gradient는 그대로 Generator로 흐릅니다.
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 DDP 전체 rank가 random terminal step `s` 를 하나 공유하고, 모든 rank의 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
@@ -1394,6 +1398,7 @@ K commit block 수 = flow_window_steps / 5
 - committed self-rollout 에 대해서만 걸리는 control-space physics regularization (선택 사항). `model.model_config.self_forced.use_control_space_physics_regularization` 로 제어합니다.
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.use_anchor_flow_matching_loss=false` 로 두면 `anchor_weight` 값과 무관하게 self-forced active step에서 training-mode open-loop forward와 FM loss 계산 자체를 생략합니다. `true` 일 때만 `model.model_config.self_forced.anchor_weight` 로 total loss 반영 강도를 제어합니다. anchor FM 을 끈 상태에서 어떤 rank 의 committed self-rollout 까지 비어있는 (모든 agent 가 invalid anchor0) 드문 경우에는, encoder 파라미터 합에 0 을 곱한 zero-loss 로 backward 만 한 번 돌려 DDP all-reduce 참여를 보장하고 optimizer step 은 건너뜁니다. 이 가드가 없으면 그 rank 만 backward 를 호출하지 않아 다른 rank 의 NCCL all-reduce 가 NCCL_TIMEOUT 까지 hang 합니다.
 - 선택적 map encoder freeze. `model.model_config.self_forced.freeze_map_encoder=true` 로 두면 Generator optimizer와 generated estimator `F_psi` optimizer 모두에서 `map_encoder` 파라미터를 제외합니다. 현재 self-forced preset 기본값은 `true` 이며, 기존처럼 전체 모델을 fine-tuning 하려면 `model.model_config.self_forced.freeze_map_encoder=false` 로 override 합니다.
+- Generator EMA는 Generator에만 적용합니다. `F_psi` 는 현재 online Generator가 만든 분포를 따라가야 하므로 EMA를 두지 않고, `F_rho` 는 pretrained 기준점이라 계속 frozen 상태로 둡니다.
 - bf16-mixed 안전 backward boundary. self-forced 경로의 forward 와 loss 계산은 mixed precision 으로 유지하되, `manual_backward` 호출 순간만 autocast 를 끄고 scalar loss 를 fp32 로 넘깁니다. 이는 manual optimization 에서 반복 backward 를 수행할 때 PyTorch autocast promote 규칙이 backward graph 의 dtype 을 다시 분류하다가 실패하는 문제를 피하기 위한 경계입니다.
 - autograd-safe temporal edge remap. training rollout 에서는 temporal relation embedding 계산에 쓴 원본 `edge_index_t` 를 in-place 수정하지 않고, current-agent attention 용 remapped edge index 를 새 tensor 로 만들어 사용합니다.
 - autograd-safe geometry helpers. agent encoder / flow agent decoder 의 edge feature (relative position norm, relative angle) 는 정지 또는 중첩된 agent 가 만드는 영벡터에 대해 backward 가 정의되지 않습니다 (`torch.norm` 의 `x/||x||` 가 `0/0`, `atan2(0, 0)` 의 `1/(y²+x²)` 가 `1/0`). self-forced rollout 처럼 이 feature 들이 살아있는 backward graph 의 일부가 되는 경로에서 한 번이라도 영벡터가 들어오면 NaN gradient 가 encoder weight 까지 흘러 학습이 첫 step 에서 죽습니다. 이를 막기 위해 `safe_norm_2d` helper 가 `(sum(x²) + eps).sqrt()` 형태로 norm 의 backward 분모를 strictly positive 로 유지하고, `angle_between_2d_vectors` 는 상대 벡터가 0일 때 기준 heading 방향을 대체값으로 써서 상대각 0 의미를 보존합니다. flow heading 복원도 `safe_angle_from_2d_vector` 로 통일해 heading vector 가 `[0, 0]` 일 때 `atan2(0, 0)` backward 가 생기지 않게 했습니다. self-forced generator backward 에서 non-finite 가 재발하면 `committed_path_norm`, `path_delta`, `target_path_norm` 요약과 첫 non-finite gradient 이름을 함께 출력하되, 정상 step 에서는 큰 텐서를 스캔하지 않습니다.
@@ -1427,9 +1432,11 @@ model:
           scope: global_batch
           policy: paper_uniform
           min_executed_steps: 24
+      ema_weight: 0.99
+      ema_start_step: 50
 ```
 
-최종 inference 모델은 여전히 fine-tuning 된 Generator 하나뿐입니다. `F_rho` 와 `F_psi` 는 학습 시점 보조 모델이며 submission export 에는 사용하지 않습니다.
+최종 inference 모델은 fine-tuning 된 Generator의 EMA copy입니다. EMA가 아직 준비되지 않은 early checkpoint나 old checkpoint에서는 online Generator로 fallback합니다. `F_rho` 와 `F_psi` 는 학습 시점 보조 모델이며 submission export 에는 사용하지 않습니다.
 
 ### Fine-tuning 설정 예시
 

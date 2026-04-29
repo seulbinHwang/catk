@@ -23,6 +23,8 @@
 #   EXPERIMENT=self_forced_npfm_h100_6
 #   RANDOM_TERMINAL_SCOPE=         Optional override: global_batch.
 #   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform.
+#   EMA_WEIGHT=                    Optional Generator EMA decay override.
+#   EMA_START_STEP=                Optional Generator EMA start update override.
 #   CLEAN_DMD_NORMALIZER_EPS=      Optional Clean-DMD normalizer epsilon override.
 #   CLEAN_DMD_TAU_LOW=             Optional Clean-DMD guidance tau lower bound.
 #   CLEAN_DMD_TAU_HIGH=            Optional Clean-DMD guidance tau upper bound.
@@ -57,6 +59,12 @@ if [[ -n "${RANDOM_TERMINAL_SCOPE:-}" ]]; then
 fi
 if [[ -n "${RANDOM_TERMINAL_POLICY:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.policy=${RANDOM_TERMINAL_POLICY}")
+fi
+if [[ -n "${EMA_WEIGHT:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.ema_weight=${EMA_WEIGHT}")
+fi
+if [[ -n "${EMA_START_STEP:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.ema_start_step=${EMA_START_STEP}")
 fi
 if [[ -n "${CLEAN_DMD_NORMALIZER_EPS:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.clean_dmd_normalizer_eps=${CLEAN_DMD_NORMALIZER_EPS}")

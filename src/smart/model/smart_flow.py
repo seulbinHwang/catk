@@ -257,6 +257,16 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1.0
         )
+        self.self_forced_ema_weight = (
+            float(getattr(self.self_forced_config, "ema_weight", 0.99))
+            if self.self_forced_config is not None
+            else 0.99
+        )
+        self.self_forced_ema_start_step = (
+            max(0, int(getattr(self.self_forced_config, "ema_start_step", 50)))
+            if self.self_forced_config is not None
+            else 50
+        )
         self.self_forced_sampling = (
             getattr(self.self_forced_config, "sampling", self.validation_rollout_sampling)
             if self.self_forced_config is not None
@@ -275,14 +285,34 @@ class SMARTFlow(LightningModule):
         self.self_forced_physics_force_fp32 = False
         self.self_forced_target_teacher = None
         self.self_forced_generated_estimator = None
+        self.self_forced_generator_ema = None
         self._self_forced_aux_loaded_from_checkpoint = False
+        self._self_forced_generator_ema_loaded_from_checkpoint = False
         self._self_forced_backward_context: Dict[str, Tensor] | None = None
         if self.self_forced_enabled:
+            if not (0.0 <= self.self_forced_ema_weight < 1.0):
+                raise ValueError(
+                    "self_forced.ema_weight must be in [0, 1), "
+                    f"got {self.self_forced_ema_weight}."
+                )
             self.automatic_optimization = False
             self.strict_loading = False
             self.self_forced_target_teacher = copy.deepcopy(self.encoder)
             self.self_forced_target_teacher.requires_grad_(False)
             self.self_forced_generated_estimator = copy.deepcopy(self.encoder)
+            self.self_forced_generator_ema = copy.deepcopy(self.encoder)
+            self.self_forced_generator_ema.requires_grad_(False)
+            self.self_forced_generator_ema.eval()
+            self.register_buffer(
+                "self_forced_generator_update_count",
+                torch.zeros((), dtype=torch.long),
+                persistent=True,
+            )
+            self.register_buffer(
+                "self_forced_generator_ema_ready",
+                torch.zeros((), dtype=torch.bool),
+                persistent=True,
+            )
             physics_config = getattr(
                 self.self_forced_config,
                 "physics",
@@ -913,6 +943,7 @@ class SMARTFlow(LightningModule):
 
     def _run_parallel_rollout_chunk(
         self,
+        rollout_encoder: SMARTFlowDecoder,
         data,
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
@@ -923,6 +954,7 @@ class SMARTFlow(LightningModule):
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
         Args:
+            rollout_encoder: rollout을 실행할 Generator입니다.
             data: dataloader가 준 원본 batch입니다.
             tokenized_agent: 평가용 agent 토큰 사전입니다.
                 agent 축 텐서는 ``[n_agent, ...]`` 입니다.
@@ -948,7 +980,7 @@ class SMARTFlow(LightningModule):
                 rollout_idx=int(rollout_indices[0]),
                 device=scenario_device,
             )
-            pred = self.encoder.rollout_from_cache(
+            pred = rollout_encoder.rollout_from_cache(
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
@@ -990,7 +1022,7 @@ class SMARTFlow(LightningModule):
             rollout_cache=rollout_cache,
             repeat_count=chunk_size,
         )
-        pred = self.encoder.rollout_from_cache(
+        pred = rollout_encoder.rollout_from_cache(
             rollout_cache=expanded_rollout_cache,
             tokenized_agent=expanded_tokenized_agent,
             map_feature=expanded_map_feature,
@@ -1079,6 +1111,7 @@ class SMARTFlow(LightningModule):
 
     def _run_closed_loop_rollouts(
         self,
+        rollout_encoder: SMARTFlowDecoder,
         data,
         tokenized_agent,
         map_feature: Dict[str, Tensor],
@@ -1091,6 +1124,8 @@ class SMARTFlow(LightningModule):
         같은 결과 shape을 유지한 채 다시 시도합니다.
 
         Args:
+            rollout_encoder: rollout을 실행할 Generator입니다. EMA가 준비된 validation/test에서는
+                EMA Generator가 들어오고, 그 전에는 online Generator가 들어옵니다.
             data: dataloader가 준 원본 batch입니다.
             tokenized_agent: 평가용 agent 토큰 사전입니다.
             map_feature: 한 번 인코딩한 지도 특징입니다.
@@ -1103,7 +1138,7 @@ class SMARTFlow(LightningModule):
                 ``[n_agent, n_rollout, 80]`` 입니다.
                 마지막 값은 선택적 2초 preview 사전입니다.
         """
-        rollout_cache = self.encoder.prepare_inference_cache(
+        rollout_cache = rollout_encoder.prepare_inference_cache(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
@@ -1120,6 +1155,7 @@ class SMARTFlow(LightningModule):
                 for chunk_start in range(0, len(rollout_indices), chunk_size):
                     chunk_rollout_indices = rollout_indices[chunk_start : chunk_start + chunk_size]
                     chunk_pred_traj, chunk_pred_z, chunk_pred_head, chunk_flow_preview = self._run_parallel_rollout_chunk(
+                        rollout_encoder=rollout_encoder,
                         data=data,
                         tokenized_agent=tokenized_agent,
                         map_feature=map_feature,
@@ -1246,7 +1282,72 @@ class SMARTFlow(LightningModule):
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.requires_grad_(True)
         self.self_forced_generated_estimator.eval()
+        if self.self_forced_generator_ema is not None:
+            self.self_forced_generator_ema.requires_grad_(False)
+            self.self_forced_generator_ema.eval()
         self._apply_self_forced_map_encoder_freeze()
+
+    def _copy_online_generator_to_ema(self) -> None:
+        """현재 online Generator weight를 EMA Generator에 그대로 복사합니다."""
+        if self.self_forced_generator_ema is None:
+            return
+        self.self_forced_generator_ema.load_state_dict(self.encoder.state_dict())
+        self.self_forced_generator_ema.requires_grad_(False)
+        self.self_forced_generator_ema.eval()
+
+    def _prepare_self_forced_generator_ema(self) -> None:
+        """fit 시작 시 EMA Generator 상태를 checkpoint 상황에 맞게 정돈합니다."""
+        if not self.self_forced_enabled or self.self_forced_generator_ema is None:
+            return
+        if not self._self_forced_generator_ema_loaded_from_checkpoint:
+            self._copy_online_generator_to_ema()
+            self.self_forced_generator_update_count.zero_()
+            self.self_forced_generator_ema_ready.fill_(False)
+            return
+        self.self_forced_generator_ema.requires_grad_(False)
+        self.self_forced_generator_ema.eval()
+
+    def _is_self_forced_generator_ema_ready(self) -> bool:
+        """EMA Generator를 eval/test에 사용할 수 있는지 확인합니다."""
+        return bool(
+            self.self_forced_enabled
+            and self.self_forced_generator_ema is not None
+            and hasattr(self, "self_forced_generator_ema_ready")
+            and bool(self.self_forced_generator_ema_ready.item())
+        )
+
+    def _get_eval_generator(self) -> SMARTFlowDecoder:
+        """validation/test에서 사용할 Generator를 반환합니다."""
+        if self._is_self_forced_generator_ema_ready():
+            return self.self_forced_generator_ema
+        return self.encoder
+
+    @torch.no_grad()
+    def _update_self_forced_generator_ema_after_step(self) -> None:
+        """Generator optimizer step 직후 EMA Generator를 갱신합니다."""
+        if not self.self_forced_enabled or self.self_forced_generator_ema is None:
+            return
+        self.self_forced_generator_update_count.add_(1)
+        if int(self.self_forced_generator_update_count.item()) < int(self.self_forced_ema_start_step):
+            return
+        if not bool(self.self_forced_generator_ema_ready.item()):
+            self._copy_online_generator_to_ema()
+            self.self_forced_generator_ema_ready.fill_(True)
+            return
+
+        ema_weight = float(self.self_forced_ema_weight)
+        online_state = self.encoder.state_dict()
+        ema_state = self.self_forced_generator_ema.state_dict()
+        for name, ema_value in ema_state.items():
+            online_value = online_state[name].detach().to(device=ema_value.device)
+            if torch.is_floating_point(ema_value):
+                ema_value.mul_(ema_weight).add_(
+                    online_value.to(dtype=ema_value.dtype),
+                    alpha=1.0 - ema_weight,
+                )
+            else:
+                ema_value.copy_(online_value.to(dtype=ema_value.dtype))
+        self.self_forced_generator_ema.eval()
 
     @staticmethod
     def _switch_module_to_eval_preserving_modes(module: nn.Module) -> Dict[nn.Module, bool]:
@@ -1320,8 +1421,14 @@ class SMARTFlow(LightningModule):
         has_generated_estimator = any(
             key.startswith("self_forced_generated_estimator.") for key in state_dict
         )
+        has_generator_ema = any(
+            key.startswith("self_forced_generator_ema.") for key in state_dict
+        )
         self._self_forced_aux_loaded_from_checkpoint = bool(
             self.self_forced_enabled and has_target_teacher and has_generated_estimator
+        )
+        self._self_forced_generator_ema_loaded_from_checkpoint = bool(
+            self.self_forced_enabled and has_generator_ema
         )
 
     def _manual_backward_without_autocast(self, loss: Tensor) -> None:
@@ -1701,6 +1808,7 @@ class SMARTFlow(LightningModule):
         """
         self._apply_fit_time_validation_batch_limit()
         self._sync_self_forced_auxiliary_models()
+        self._prepare_self_forced_generator_ema()
 
     def on_fit_end(self) -> None:
         """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.
@@ -2010,6 +2118,7 @@ class SMARTFlow(LightningModule):
             gradient_clip_algorithm="norm",
         )
         generator_optimizer.step()
+        self._update_self_forced_generator_ema_after_step()
         self.untoggle_optimizer(generator_optimizer)
 
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
@@ -2106,6 +2215,7 @@ class SMARTFlow(LightningModule):
             generator_optimizer.zero_grad(set_to_none=True)
             self._manual_backward_without_autocast(fm_loss)
             generator_optimizer.step()
+            self._update_self_forced_generator_ema_after_step()
             self.untoggle_optimizer(generator_optimizer)
             self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
@@ -2166,6 +2276,7 @@ class SMARTFlow(LightningModule):
                     gradient_clip_algorithm="norm",
                 )
                 generator_optimizer.step()
+                self._update_self_forced_generator_ema_after_step()
             finally:
                 self.untoggle_optimizer(generator_optimizer)
         finally:
@@ -2372,19 +2483,20 @@ open_metric_dict:
         )
 
     def validation_step(self, data, batch_idx):
+        eval_generator = self._get_eval_generator()
         tokenized_map, tokenized_agent = self.token_processor(data)
         map_feature = None
         if self.val_open_loop or self.val_closed_loop:
-            map_feature = self.encoder.encode_map(tokenized_map)
+            map_feature = eval_generator.encode_map(tokenized_map)
 
         if self.val_open_loop:
-            denoise_pred = self.encoder.forward_from_map_feature(
+            denoise_pred = eval_generator.forward_from_map_feature(
                 map_feature=map_feature,
                 tokenized_agent=tokenized_agent,
                 anchor_mask_key="flow_eval_mask",
             )
             open_sample_count = int(denoise_pred["flow_clean_norm"].shape[0])
-            open_pred_clean_norm = self.encoder.sample_open_loop_future(
+            open_pred_clean_norm = eval_generator.sample_open_loop_future(
                 anchor_hidden=denoise_pred["anchor_hidden"],
                 anchor_mask=denoise_pred["anchor_mask"],
                 sampling_scheme=self.validation_rollout_sampling,
@@ -2403,6 +2515,7 @@ open_metric_dict:
         if self.val_closed_loop:
             return_flow_2s_preview = self.vis_flow_2s_preview and batch_idx < self.n_vis_batch
             pred_traj, pred_z, pred_head, flow_preview = self._run_closed_loop_rollouts(
+                rollout_encoder=eval_generator,
                 data=data,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
@@ -2572,9 +2685,11 @@ open_metric_dict:
         scheduler.step()
 
     def test_step(self, data, batch_idx):
+        eval_generator = self._get_eval_generator()
         tokenized_map, tokenized_agent = self.token_processor(data)
-        map_feature = self.encoder.encode_map(tokenized_map)
+        map_feature = eval_generator.encode_map(tokenized_map)
         pred_traj, pred_z, pred_head, _ = self._run_closed_loop_rollouts(
+            rollout_encoder=eval_generator,
             data=data,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
