@@ -54,7 +54,7 @@ model:
       method_name: "Flow Agents 7M"
       authors: [Seulbin Hwang, Kiyoung Om]
       affiliation: NaverLabs
-      description: Flow-based generative model for simulating realistic agents.
+      description: inv_draft_finetune_backprop_last_k24_euler32_stopmotion_a100x4_32ep
       method_link: "not available yet"
       account_name: "h.sb@naverlabs.com"
 

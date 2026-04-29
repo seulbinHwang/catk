@@ -740,6 +740,27 @@ torchrun \
   task_name=flow_semi_continuous_finetune_inv_best_a_100_a100x4
 ```
 
+#### 5.8.1 No-DRaFT ablation + adaptive train_batch_size sweep
+
+같은 4x A100 박스에서 **DRaFT 를 통째로 끄고** (`model.model_config.draft.enabled=false`, sampling/loss 모두 비활성), `train_batch_size` 를 64 부터 시작해 OOM 이 나면 4 씩 줄여 재시도하는 스크립트입니다. ablation 비교군 (DRaFT 적용 vs 미적용) 을 자동화하기 위한 러너입니다.
+
+- 스크립트: `scripts/finetune_a100x4_no_draft_bs_sweep.sh`
+- 첫 시도: `action=finetune` (pretrained weight 로 epoch 0 시작)
+- OOM 발생 시: `action=fit ckpt_path=<직전 attempt 의 epoch_last.ckpt>` 로 Lightning full-resume — **마지막으로 완료된 epoch 부터 이어서** 학습 (epoch counter / optimizer / scheduler 모두 복원). 한 epoch 도 끝나기 전에 OOM 이 나면 더 작은 bs 로 pretrain 부터 다시 시작.
+- OOM 이 아닌 에러 (모델 버그 / I/O 등) 면 즉시 abort — bs 줄여도 안 풀리는 문제이므로.
+- bs sweep: 64 → 60 → 56 → ... → 4
+- `accumulate_grad_batches=1` 로 고정. 따라서 effective global batch = `bs × 4`.
+- **Linear LR scaling** 자동 적용: `lr = 2e-4 × (bs × 4) / 288` (기준점은 원본 preset 의 `bs=36, accum=2` 글로벌 288 / lr 2e-4). 단 `action=fit` 으로 resume 할 때는 Lightning 이 ckpt 의 optimizer state 를 복원하므로 lr override 가 무시됩니다 (의도된 보수 동작).
+
+실행:
+
+```bash
+cd /mnt/nuplan/projects/catk
+bash scripts/finetune_a100x4_no_draft_bs_sweep.sh
+```
+
+각 attempt 의 raw torchrun 출력은 `/tmp/${TASK_NAME}_attempt<N>_bs<bs>.log` 에 저장돼서 OOM 판정 / 디버깅에 쓰입니다.
+
 ## 6. 평가와 추론
 
 ### 6.1 Validation set closed-loop 평가
