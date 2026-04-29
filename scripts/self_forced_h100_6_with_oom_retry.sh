@@ -12,7 +12,7 @@
 #                  ckpt you would have passed to the bare `ckpt_path=` argument).
 #
 # Optional knobs (env vars; sensible defaults shown):
-#   INITIAL_BS=14        Initial `data.train_batch_size`. Defaults to the
+#   INITIAL_BS=36        Initial `data.train_batch_size`. Defaults to the
 #                        preset's conservative random-terminal setting.
 #   OOM_STEP=2           Decrement applied to `data.train_batch_size` per OOM.
 #   MIN_BS=2             Stop trying when `bs` would fall below this value.
@@ -22,10 +22,7 @@
 #   NPROC_PER_NODE=6
 #   EXPERIMENT=self_forced_npfm_h100_6
 #   RANDOM_TERMINAL_SCOPE=         Optional override: global_batch.
-#   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform or stability_warmup.
-#   RANDOM_TERMINAL_WARMUP_EPOCHS= Optional warmup epoch override.
-#   RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS=
-#                                  Optional minimum K during warmup.
+#   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform.
 #   CLEAN_DMD_NORMALIZER_EPS=      Optional Clean-DMD normalizer epsilon override.
 #   CLEAN_DMD_TAU_LOW=             Optional Clean-DMD guidance tau lower bound.
 #   CLEAN_DMD_TAU_HIGH=            Optional Clean-DMD guidance tau upper bound.
@@ -60,12 +57,6 @@ if [[ -n "${RANDOM_TERMINAL_SCOPE:-}" ]]; then
 fi
 if [[ -n "${RANDOM_TERMINAL_POLICY:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.policy=${RANDOM_TERMINAL_POLICY}")
-fi
-if [[ -n "${RANDOM_TERMINAL_WARMUP_EPOCHS:-}" ]]; then
-  EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.warmup_epochs=${RANDOM_TERMINAL_WARMUP_EPOCHS}")
-fi
-if [[ -n "${RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS:-}" ]]; then
-  EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.warmup_min_executed_steps=${RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS}")
 fi
 if [[ -n "${CLEAN_DMD_NORMALIZER_EPS:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.clean_dmd_normalizer_eps=${CLEAN_DMD_NORMALIZER_EPS}")

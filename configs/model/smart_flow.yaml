@@ -43,11 +43,9 @@ model_config:
       random_terminal_step:
         enabled: true
         scope: global_batch
-        # paper_uniform: 논문에 가장 충실하게 s를 1..sample_steps에서 바로 균등 샘플링합니다.
-        # stability_warmup: 초반 warmup_epochs 동안 K>=warmup_min_executed_steps만 허용한 뒤 전체 균등으로 바꿉니다.
+        # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
         policy: paper_uniform
-        warmup_epochs: 1
-        warmup_min_executed_steps: 16
+        min_executed_steps: 24
     physics:
       force_fp32: true
       dt: 0.1
@@ -95,11 +93,9 @@ model_config:
       random_terminal_step:
         enabled: true
         scope: global_batch
-        # paper_uniform: 논문에 가장 충실하게 s를 1..sample_steps에서 바로 균등 샘플링합니다.
-        # stability_warmup: 초반 warmup_epochs 동안 K>=warmup_min_executed_steps만 허용한 뒤 전체 균등으로 바꿉니다.
+        # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
         policy: paper_uniform
-        warmup_epochs: 1
-        warmup_min_executed_steps: 16
+        min_executed_steps: 24
     use_control_space_physics_regularization: false
     physics_weight: 0.005
     physics:

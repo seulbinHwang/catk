@@ -871,8 +871,7 @@ torchrun \
 Self-forced H100 preset은 self-forced rollout에서 `sample_steps=32`를 유지하되, 학습 중에는 DDP 전체 rank가 같은 random terminal denoising step `s` 하나를 공유합니다. rank0에서 뽑은 `s`를 모든 rank로 broadcast하므로, 모든 rank의 scenario/agent와 0.5초 commit block은 같은 `s`를 쓰며, 실제 실행 step 수는 `K = sample_steps + 1 - s` 입니다. 따라서 이전처럼 scenario마다 다른 `s`를 뽑고 `torch.unique(K)` 그룹마다 sampler를 다시 호출하지 않습니다. 0.5초 block마다 `FlowODE.generate(..., terminal_step=K, return_terminal_clean=True)`를 한 번만 호출해 terminal clean estimate를 commit합니다.
 
 - `model.model_config.self_forced.sampling.random_terminal_step.scope=global_batch` 가 기본값입니다. 이 값은 DDP 전체 rank 공유 `s` fast path를 뜻합니다.
-- `policy=paper_uniform` 은 `s in [1, sample_steps]` 를 바로 균등 샘플링합니다.
-- `policy=stability_warmup` 은 초반 `warmup_epochs` 동안 `K>=warmup_min_executed_steps` 만 허용한 뒤 전체 균등 샘플링으로 바꿉니다.
+- `policy=paper_uniform` 은 실제 실행 denoising step `K` 를 `[min_executed_steps, sample_steps]` 범위에서 균등 샘플링합니다. 기본 `min_executed_steps=24` 이므로 `sample_steps=32` 에서는 `K=24..32` 만 사용합니다.
 - terminal step 이전 denoising은 gradient 없이 계산하고, terminal clean estimate를 만드는 마지막 호출 하나만 gradient를 유지합니다.
 - 선택된 `s`는 self-rollout을 어디서 끊고 commit할지만 정합니다.
 - `F_psi` 업데이트와 clean-DMD guidance 계산의 noising `tau` 는 flow ODE의 전체 tau 구간에서 독립적으로 다시 샘플링합니다.
@@ -914,9 +913,6 @@ bash scripts/self_forced_h100_6_with_oom_retry.sh
 | `NPROC_PER_NODE` | `6` | DDP rank 수 |
 | `EXPERIMENT` | `self_forced_npfm_h100_6` | hydra experiment 이름 |
 | `RANDOM_TERMINAL_SCOPE` | unset | random terminal scope override, normally `global_batch` |
-| `RANDOM_TERMINAL_POLICY` | unset | `paper_uniform` / `stability_warmup` override |
-| `RANDOM_TERMINAL_WARMUP_EPOCHS` | unset | random terminal warmup epoch override |
-| `RANDOM_TERMINAL_WARMUP_MIN_EXECUTED_STEPS` | unset | warmup 중 허용할 최소 실행 step `K` override |
 | `CLEAN_DMD_NORMALIZER_EPS` | unset | Clean-DMD direction 정규화 분모 최소값 override |
 | `CLEAN_DMD_TAU_LOW` | unset | Clean-DMD guidance noising tau 하한 override |
 | `CLEAN_DMD_TAU_HIGH` | unset | Clean-DMD guidance noising tau 상한 override |
@@ -1430,17 +1426,8 @@ model:
           enabled: true
           scope: global_batch
           policy: paper_uniform
-          warmup_epochs: 1
-          warmup_min_executed_steps: 16
+          min_executed_steps: 24
 ```
-
-더 안정적인 초반 학습을 원하면 CLI에서 아래처럼 바꿀 수 있습니다.
-
-```bash
-model.model_config.self_forced.sampling.random_terminal_step.policy=stability_warmup
-```
-
-`stability_warmup`은 초반 `warmup_epochs` 동안 `K >= warmup_min_executed_steps`만 허용합니다. 예를 들어 `sample_steps=32`, `warmup_min_executed_steps=16`이면 warmup 중에는 `s<=17`만 샘플링하고, 그 뒤에는 `s∈[1,32]` 전체 균등 샘플링으로 바뀝니다. validation과 inference는 기존처럼 full 32-step sampling을 유지합니다.
 
 최종 inference 모델은 여전히 fine-tuning 된 Generator 하나뿐입니다. `F_rho` 와 `F_psi` 는 학습 시점 보조 모델이며 submission export 에는 사용하지 않습니다.
 

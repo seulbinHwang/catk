@@ -1013,7 +1013,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         device: torch.device,
         self_forced_epoch: int | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """DDP 전체 rank가 공유할 random terminal step 하나를 샘플링합니다.
+        """DDP 전체 rank가 공유할 high-K random terminal step 하나를 샘플링합니다.
 
         Args:
             sampling_scheme: self-forced rollout sampling 설정입니다.
@@ -1022,9 +1022,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             self_forced_epoch: 현재 self-forced epoch입니다. ``None``이면 random terminal step을 끕니다.
 
         Returns:
-            tuple[torch.Tensor | None, torch.Tensor | None]: terminal step과 논문 표기 s입니다.
+            tuple[torch.Tensor | None, torch.Tensor | None]: terminal step 수 ``K``와 논문 표기 ``s``입니다.
                 random terminal이 꺼져 있으면 두 값 모두 ``None`` 입니다.
                 켜져 있으면 각 tensor의 scenario 축 shape은 ``[num_scenario]`` 입니다.
+
+        Notes:
+            ``policy=paper_uniform`` 만 지원합니다. 실제 실행 step 수 ``K`` 를
+            ``[min_executed_steps, sample_steps]`` 에서 균등하게 뽑은 뒤,
+            기존 코드가 쓰는 논문 표기 ``s = sample_steps + 1 - K`` 로 변환합니다.
         """
         random_cfg = getattr(sampling_scheme, "random_terminal_step", None)
         if self_forced_epoch is None or random_cfg is None:
@@ -1038,42 +1043,41 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         if int(num_scenario) < 0:
             raise ValueError(f"num_scenario must be non-negative, got {num_scenario}.")
 
+        policy = str(getattr(random_cfg, "policy", "paper_uniform"))
+        if policy != "paper_uniform":
+            raise ValueError(
+                "random_terminal_step.policy only supports 'paper_uniform'. "
+                "use min_executed_steps to control the lower bound of executed denoising steps."
+            )
+
         scope = str(getattr(random_cfg, "scope", "global_batch"))
         if scope != "global_batch":
             raise ValueError(
-                "random_terminal_step.scope must be 'global_batch'. "
-                "The old per-rank scope was removed because it makes fast ranks "
-                "wait for ranks that sampled a larger K. "
+                "random_terminal_step.scope only supports 'global_batch' for self-forced training, "
                 f"got {scope!r}."
             )
 
-        policy = str(getattr(random_cfg, "policy", "paper_uniform"))
-        max_terminal_s = sample_steps
-        if policy == "paper_uniform":
-            pass
-        elif policy == "stability_warmup":
-            warmup_epochs = max(0, int(getattr(random_cfg, "warmup_epochs", 1)))
-            warmup_min_executed_steps = int(
-                getattr(random_cfg, "warmup_min_executed_steps", min(16, sample_steps))
-            )
-            warmup_min_executed_steps = min(max(1, warmup_min_executed_steps), sample_steps)
-            if int(self_forced_epoch) < warmup_epochs:
-                max_terminal_s = sample_steps - warmup_min_executed_steps + 1
-        else:
+        min_executed_steps = int(getattr(random_cfg, "min_executed_steps", 24))
+        if min_executed_steps < 1 or min_executed_steps > sample_steps:
             raise ValueError(
-                "random_terminal_step.policy must be 'paper_uniform' or 'stability_warmup', "
-                f"got {policy!r}."
+                "random_terminal_step.min_executed_steps must be in [1, sample_steps], "
+                f"got min_executed_steps={min_executed_steps}, sample_steps={sample_steps}."
             )
 
-        max_terminal_s = min(max(1, int(max_terminal_s)), sample_steps)
-        terminal_s_one = torch.randint(
-            low=1,
-            high=max_terminal_s + 1,
-            size=(1,),
-            device=device,
-            dtype=torch.long,
-        )
+        max_terminal_s = sample_steps + 1 - min_executed_steps
+        distributed_enabled = self._get_random_terminal_world_size() > 1
+        if distributed_enabled and torch.distributed.get_rank() != 0:
+            terminal_s_one = torch.empty((1,), device=device, dtype=torch.long)
+        else:
+            terminal_s_one = torch.randint(
+                low=1,
+                high=max_terminal_s + 1,
+                size=(1,),
+                device=device,
+                dtype=torch.long,
+            )
         terminal_s_one = self._sync_random_terminal_s_one(terminal_s_one)
+
         return self._build_terminal_step_tensors_from_s_one(
             terminal_s_one=terminal_s_one,
             sample_steps=sample_steps,
@@ -1639,8 +1643,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. 기본 self-forced 학습은
                 ``flow_window_steps / 5`` 를 넘깁니다.
-            self_forced_epoch: 현재 self-forced epoch입니다. random terminal denoising step
-                정책의 warmup 판정에 사용합니다.
+            self_forced_epoch: 현재 self-forced epoch입니다. ``None`` 이면 training
+                random terminal denoising step을 끕니다.
 
         Returns:
             Dict[str, torch.Tensor]: N초 committed self-rollout 결과입니다.
