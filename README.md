@@ -1459,3 +1459,12 @@ python -m src.run experiment=self_forced_npfm action=finetune ckpt_path=/path/to
 ### 중요한 일관성 규칙
 
 fine-tuning 에 쓰는 rollout 과 inference 에 쓰는 rollout 은 반드시 같은 commit/update 규칙을 사용해야 합니다. fine-tuning 에서 `closed_loop_rollout_mode` 나 `use_stop_motion` / `use_lqr` 을 켰다면, validation / test / submission export 에서도 같은 설정을 유지해야 합니다.
+
+### Self-forced Strict DMD Update Separation
+
+- self-forcing DMD에서 Generator update와 generated estimator update를 더 강하게 분리합니다.
+- Generator update에서는 target teacher와 generated estimator를 평가자로만 사용하고, 두 보조 모델에 gradient가 생기면 즉시 오류를 냅니다.
+- generated estimator update에서는 현재 Generator가 만든 detached closed-loop path만 학습 대상으로 사용해야 하며, Generator에 gradient가 생기면 즉시 오류를 냅니다.
+- update 경계마다 이전 단계의 gradient를 명확히 비워서, DMD 방향이 optimizer 간에 섞이지 않게 했습니다.
+- Clean-DMD guidance는 기존처럼 teacher/generated clean path 추정 차이를 agent별 teacher 기준 거리로 정규화합니다.
+- `use_anchor_flow_matching_loss=false`, `use_control_space_physics_regularization=false` 설정은 그대로 유지됩니다.

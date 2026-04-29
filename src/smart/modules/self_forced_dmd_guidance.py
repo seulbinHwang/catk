@@ -10,7 +10,28 @@ def build_clean_dmd_direction(
     generated_clean_norm: Tensor,
     normalizer_eps: float = 1.0e-3,
 ) -> Tensor:
-    """Build a normalized DMD direction from clean path estimates."""
+    """teacher와 generated estimator의 clean path 차이로 DMD 방향을 만듭니다.
+
+    Args:
+        committed_path_norm: Generator가 closed-loop로 실제 실행한 path입니다.
+            shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+        target_clean_norm: frozen teacher가 같은 noisy path에서 추정한 clean path입니다.
+            shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+        generated_clean_norm: generated estimator가 같은 noisy path에서 추정한 clean path입니다.
+            shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+        normalizer_eps: agent별 정규화 분모의 최소값입니다.
+
+    Returns:
+        Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
+        shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+
+    설명:
+        이 함수는 raw velocity 차이나 시간/노이즈 계수가 섞인 값을 그대로 쓰지 않습니다.
+        먼저 ``target_clean_norm - generated_clean_norm`` 방향을 만들고, 각 agent의 전체
+        미래 path 기준으로 ``committed_path_norm``과 ``target_clean_norm`` 사이의 평균
+        거리로 나눕니다. 이렇게 하면 teacher가 보는 방향은 유지하면서도 특정 tau 구간에서
+        target path가 과하게 커지는 문제를 줄일 수 있습니다.
+    """
     expected_shape = tuple(committed_path_norm.shape)
     if tuple(target_clean_norm.shape) != expected_shape:
         raise ValueError(

@@ -35,6 +35,10 @@ from src.smart.modules.self_forced_path_flow import (
     masked_mean_square_loss,
 )
 from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
+from src.smart.modules.self_forced_update_separation import (
+    assert_no_module_gradients,
+    clear_module_gradients,
+)
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -1443,6 +1447,116 @@ class SMARTFlow(LightningModule):
         with torch.autocast(device_type=loss.device.type, enabled=False):
             self.manual_backward(loss.float())
 
+    def _clear_self_forced_auxiliary_gradients(self) -> None:
+        """self-forcing 보조 모델의 gradient를 비웁니다.
+
+        Args:
+            없음.
+
+        Returns:
+            None.
+
+        설명:
+            target teacher와 generated estimator는 Generator update에서 평가자 역할만 해야
+            합니다. update 경계마다 두 보조 모델의 gradient를 지워서 이전 단계의 값이 다음
+            검사에 섞이지 않게 합니다.
+        """
+        if not self.self_forced_enabled:
+            return
+        clear_module_gradients(self.self_forced_target_teacher)
+        clear_module_gradients(self.self_forced_generated_estimator)
+
+    def _clear_self_forced_generator_gradients(self) -> None:
+        """online Generator의 gradient를 비웁니다.
+
+        Args:
+            없음.
+
+        Returns:
+            None.
+
+        설명:
+            generated estimator update는 detached rollout만 학습해야 하므로 Generator에
+            gradient가 남아 있으면 안 됩니다. update가 끝난 뒤와 estimator backward 직전에
+            Generator gradient를 비웁니다.
+        """
+        if not self.self_forced_enabled:
+            return
+        clear_module_gradients(self.encoder)
+
+    def _prepare_self_forced_generator_backward_boundary(self) -> None:
+        """Generator backward 직전에 보조 모델 gradient를 초기화합니다.
+
+        Args:
+            없음.
+
+        Returns:
+            None.
+
+        설명:
+            Generator loss backward 뒤에 생긴 gradient만 검사하기 위해, backward 직전에
+            target teacher와 generated estimator의 이전 gradient를 모두 지웁니다.
+        """
+        self._clear_self_forced_auxiliary_gradients()
+
+    def _prepare_self_forced_estimator_backward_boundary(self) -> None:
+        """generated estimator backward 직전에 Generator gradient를 초기화합니다.
+
+        Args:
+            없음.
+
+        Returns:
+            None.
+
+        설명:
+            estimator loss backward 뒤에 Generator gradient가 새로 생겼는지만 확인하기 위해,
+            backward 직전에 online Generator와 target teacher의 gradient를 지웁니다.
+        """
+        self._clear_self_forced_generator_gradients()
+        clear_module_gradients(self.self_forced_target_teacher)
+
+    def _assert_self_forced_generator_update_isolated(self) -> None:
+        """Generator update가 보조 모델을 학습하지 않았는지 검사합니다.
+
+        Args:
+            없음.
+
+        Returns:
+            None.
+
+        Raises:
+            RuntimeError: target teacher나 generated estimator에 gradient가 생기면 발생합니다.
+
+        설명:
+            clean-DMD 방향은 Generator를 움직이는 고정 목표여야 합니다. 이 검사에 실패하면
+            Generator loss graph 안에서 보조 모델이 함께 학습되고 있다는 뜻입니다.
+        """
+        if not self.self_forced_enabled:
+            return
+        assert_no_module_gradients(self.self_forced_target_teacher, "self_forced_target_teacher", "generator update")
+        assert_no_module_gradients(self.self_forced_generated_estimator, "self_forced_generated_estimator", "generator update")
+
+    def _assert_self_forced_estimator_update_isolated(self) -> None:
+        """generated estimator update가 Generator를 학습하지 않았는지 검사합니다.
+
+        Args:
+            없음.
+
+        Returns:
+            None.
+
+        Raises:
+            RuntimeError: online Generator나 target teacher에 gradient가 생기면 발생합니다.
+
+        설명:
+            generated estimator는 현재 Generator가 만든 detached closed-loop path를 설명하는
+            모델입니다. 이 update에서 Generator에 gradient가 생기면 DMD의 분리 원칙이 깨집니다.
+        """
+        if not self.self_forced_enabled:
+            return
+        assert_no_module_gradients(self.encoder, "online Generator", "generated-estimator update")
+        assert_no_module_gradients(self.self_forced_target_teacher, "self_forced_target_teacher", "generated-estimator update")
+
     def _set_token_processor_training_mode(self, is_training: bool) -> None:
         """token processor의 train/eval 상태를 안전하게 바꿉니다.
 
@@ -1653,6 +1767,7 @@ class SMARTFlow(LightningModule):
         try:
             for _ in range(self.self_forced_estimator_updates_per_step):
                 optimizer.zero_grad(set_to_none=True)
+                self._prepare_self_forced_estimator_backward_boundary()
                 clean_path = committed_path_norm.detach()
                 flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
                     clean_path,
@@ -1668,12 +1783,15 @@ class SMARTFlow(LightningModule):
                 )
                 last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target)
                 self._manual_backward_without_autocast(last_loss)
+                self._assert_self_forced_estimator_update_isolated()
                 self.clip_gradients(
                     optimizer,
                     gradient_clip_val=self.self_forced_gradient_clip_val,
                     gradient_clip_algorithm="norm",
                 )
                 optimizer.step()
+                self._clear_self_forced_auxiliary_gradients()
+                self._clear_self_forced_generator_gradients()
         finally:
             self.untoggle_optimizer(optimizer)
             self._set_self_forced_auxiliary_modes()
@@ -1686,30 +1804,31 @@ class SMARTFlow(LightningModule):
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
     ) -> Tensor:
-        """clean path 추정 차이로 안정화된 self-forcing DMD 방향을 만듭니다.
+        """clean-DMD 방향을 고정된 평가자 출력으로 계산합니다.
 
         Args:
-            tokenized_map: 평가 모드 map token 사전입니다.
-            tokenized_agent: 평가 모드 agent token 사전입니다.
+            tokenized_map: map token 사전입니다.
+            tokenized_agent: agent token 사전입니다.
             committed_path_norm: Generator가 closed-loop로 실제 실행한 path입니다.
-                shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
+                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            anchor_mask: 첫 anchor 기준으로 유효한 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
         Returns:
-            Tensor: 현재 committed path에 더할 정규화된 방향입니다.
-                shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+            Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
+            shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
 
-        Notes:
-            같은 noisy path에서 얻은 teacher clean path와 generated clean path의
-            차이를 agent별 teacher 기준 거리로 나누어 target path가 과하게 튀는
-            문제를 줄입니다.
+        설명:
+            Generator update에서 target teacher와 generated estimator는 학습 대상이 아닙니다.
+            두 모델은 같은 noisy path를 보고 clean path 추정을 내는 평가자로만 쓰입니다.
+            그래서 모든 보조 모델 호출은 ``no_grad``로 감싸고, 최종 방향도 detach합니다.
         """
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
 
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.eval()
+        self._clear_self_forced_auxiliary_gradients()
         with torch.no_grad():
             clean_for_guidance = committed_path_norm.detach()
             flow_sample = self.encoder.agent_encoder.flow_ode.sample(
@@ -1740,6 +1859,8 @@ class SMARTFlow(LightningModule):
                 generated_clean_norm=generated_pred["clean"],
                 normalizer_eps=self.self_forced_direction_normalizer_eps,
             )
+
+        self._assert_self_forced_generator_update_isolated()
         return path_delta.to(dtype=committed_path_norm.dtype).detach()
 
     def _compute_self_forced_physics_loss(
@@ -2111,7 +2232,9 @@ class SMARTFlow(LightningModule):
         generator_optimizer = self.optimizers()[0]
         self.toggle_optimizer(generator_optimizer)
         generator_optimizer.zero_grad(set_to_none=True)
+        self._prepare_self_forced_generator_backward_boundary()
         self._manual_backward_without_autocast(total_loss)
+        self._assert_self_forced_generator_update_isolated()
         self.clip_gradients(
             generator_optimizer,
             gradient_clip_val=self.self_forced_gradient_clip_val,
@@ -2119,6 +2242,7 @@ class SMARTFlow(LightningModule):
         )
         generator_optimizer.step()
         self._update_self_forced_generator_ema_after_step()
+        self._clear_self_forced_generator_gradients()
         self.untoggle_optimizer(generator_optimizer)
 
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
@@ -2203,8 +2327,11 @@ class SMARTFlow(LightningModule):
                 self.toggle_optimizer(generator_optimizer)
                 try:
                     generator_optimizer.zero_grad(set_to_none=True)
+                    self._prepare_self_forced_generator_backward_boundary()
                     self._manual_backward_without_autocast(zero_loss)
+                    self._assert_self_forced_generator_update_isolated()
                 finally:
+                    self._clear_self_forced_generator_gradients()
                     self.untoggle_optimizer(generator_optimizer)
                 self.log("train/loss", zero_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("train/sf_anchor_fm_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
@@ -2213,9 +2340,12 @@ class SMARTFlow(LightningModule):
             generator_optimizer = self.optimizers()[0]
             self.toggle_optimizer(generator_optimizer)
             generator_optimizer.zero_grad(set_to_none=True)
+            self._prepare_self_forced_generator_backward_boundary()
             self._manual_backward_without_autocast(fm_loss)
+            self._assert_self_forced_generator_update_isolated()
             generator_optimizer.step()
             self._update_self_forced_generator_ema_after_step()
+            self._clear_self_forced_generator_gradients()
             self.untoggle_optimizer(generator_optimizer)
             self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
@@ -2269,7 +2399,9 @@ class SMARTFlow(LightningModule):
             self.toggle_optimizer(generator_optimizer)
             try:
                 generator_optimizer.zero_grad(set_to_none=True)
+                self._prepare_self_forced_generator_backward_boundary()
                 self._manual_backward_without_autocast(total_loss)
+                self._assert_self_forced_generator_update_isolated()
                 self.clip_gradients(
                     generator_optimizer,
                     gradient_clip_val=self.self_forced_gradient_clip_val,
@@ -2277,6 +2409,7 @@ class SMARTFlow(LightningModule):
                 )
                 generator_optimizer.step()
                 self._update_self_forced_generator_ema_after_step()
+                self._clear_self_forced_generator_gradients()
             finally:
                 self.untoggle_optimizer(generator_optimizer)
         finally:
