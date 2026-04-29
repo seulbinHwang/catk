@@ -71,3 +71,4 @@ data:
   num_workers: 4
   prefetch_factor: 1
   train_use_eval_agent_selection: true
+  train_epoch_sample_fraction: 0.5

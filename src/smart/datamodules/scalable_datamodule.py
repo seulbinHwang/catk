@@ -21,6 +21,7 @@ from torch_geometric.transforms import BaseTransform
 from src.smart.datasets import MultiDataset
 
 from .exact_distributed_sampler import ExactDistributedSampler
+from .random_fraction_distributed_sampler import RandomFractionDistributedSampler
 from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
 
 
@@ -62,11 +63,18 @@ class MultiDataModule(LightningDataModule):
         persistent_workers: bool,
         train_max_num: int,
         train_use_eval_agent_selection: bool = False,
+        train_epoch_sample_fraction: float = 1.0,
     ) -> None:
         super(MultiDataModule, self).__init__()
+        if not 0.0 < float(train_epoch_sample_fraction) <= 1.0:
+            raise ValueError(
+                "train_epoch_sample_fraction must be in (0, 1], "
+                f"got {train_epoch_sample_fraction}."
+            )
         self.train_batch_size = train_batch_size
         self.val_batch_size = val_batch_size
         self.test_batch_size = test_batch_size
+        self.train_epoch_sample_fraction = float(train_epoch_sample_fraction)
         self.shuffle = shuffle
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor if num_workers > 0 else None
@@ -103,6 +111,25 @@ class MultiDataModule(LightningDataModule):
         else:
             raise ValueError(f"{stage} should be one of [fit, validate, test]")
 
+    def _get_trainer_world_info(self) -> tuple[int, int]:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return 1, 0
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        global_rank = int(getattr(trainer, "global_rank", 0) or 0)
+        return max(1, world_size), global_rank
+
+    def _build_train_fraction_sampler(self):
+        if self.train_epoch_sample_fraction >= 1.0:
+            return None
+        world_size, global_rank = self._get_trainer_world_info()
+        return RandomFractionDistributedSampler(
+            dataset=self.train_dataset,
+            fraction=self.train_epoch_sample_fraction,
+            num_replicas=world_size,
+            rank=global_rank,
+        )
+
     def train_dataloader(self) -> TRAIN_DATALOADERS:
         loader_kwargs = {
             "num_workers": self.num_workers,
@@ -113,26 +140,24 @@ class MultiDataModule(LightningDataModule):
         if self.prefetch_factor is not None:
             loader_kwargs["prefetch_factor"] = self.prefetch_factor
 
+        sampler = self._build_train_fraction_sampler()
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
-            shuffle=self.shuffle,
+            shuffle=self.shuffle if sampler is None else False,
+            sampler=sampler,
             **loader_kwargs,
         )
 
     def _build_eval_sampler(self, dataset):
-        trainer = getattr(self, "trainer", None)
-        if trainer is None:
-            return None
-
-        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        world_size, global_rank = self._get_trainer_world_info()
         if world_size <= 1:
             return None
 
         return ExactDistributedSampler(
             dataset=dataset,
             num_replicas=world_size,
-            rank=int(getattr(trainer, "global_rank", 0) or 0),
+            rank=global_rank,
             shuffle=False,
         )
 
