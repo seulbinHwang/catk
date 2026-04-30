@@ -4,6 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project conventions
 
+### GPU usage
+
+**This machine is shared.** Only use GPUs **2 and 3** for any background job, training, or evaluation. Always set `CUDA_VISIBLE_DEVICES=2,3` (or `=2` / `=3` for single-GPU runs) when launching commands. Do not touch GPU 0 or 1 — they belong to other users / jobs.
+
+When using `torchrun --nproc_per_node=2` for DDP, set `CUDA_VISIBLE_DEVICES=2,3`. For single-process scripts, either device works once the env var is set; the first visible device becomes `cuda:0` inside the process.
+
 ### Time display
 
 Always convert times to **KST (UTC+9)** when reporting to the user. The server runs in UTC; tools like `date` return UTC. Convert before displaying:
@@ -101,6 +107,8 @@ The flow training scripts read most knobs from environment variables (LR, batch 
 ```sh
 LR=1e-6 TRAIN_B=8 BPTT_MAX_COARSE_STEPS=4 sh scripts/train_flow_bptt_ft.sh
 ```
+
+The table lists canonical entrypoints; `scripts/` also contains close variants (`train_flow_consistency_bptt*.sh`, `train_kinematic_*_ft.sh`, `val_*.sh`, single-scenario / no-val variants, `monitor_exp.sh`). Skim `scripts/` before duplicating one — there is usually already a wrapper for the case you want.
 
 ## Things that bite
 

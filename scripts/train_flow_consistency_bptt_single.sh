@@ -6,6 +6,9 @@
 # 사용법:
 #   sh scripts/train_flow_consistency_bptt_single.sh
 #   OCSC_N_ROLLOUTS=4 MAX_EPOCHS=5 sh scripts/train_flow_consistency_bptt_single.sh
+#   # validation worker / thread 조정 예:
+#   WOSAC_HARD_POOL_WORKERS=2 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 NUM_WORKERS=2 \
+#     sh scripts/train_flow_consistency_bptt_single.sh
 #
 # single scenario 특징:
 #   - TRAIN_B=1: 시나리오 1개씩 학습 (gradient 방향 충돌 없음 → LR 좀 더 올릴 수 있음)
@@ -21,11 +24,23 @@ export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# CPU thread 노브 (학습 main + forkserver 워커 모두 상속)
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-${OMP_NUM_THREADS}}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-${OMP_NUM_THREADS}}"
+# Validation 시 sim-agents metric forkserver pool 크기 (코드 default 16).
+# - 학습 자체 self-val 은 보통 N_BATCH_SIM_AGENTS_METRIC=1 batch 만 본다.
+# - 16 워커는 GPU 메모리 attach 만 ~6.7GB 차지하므로 학습 중에는 4 권장:
+#     WOSAC_HARD_POOL_WORKERS=4 sh scripts/train_flow_consistency_bptt_single.sh
+# - hard: HardSimAgentsMetrics, real: official TF SimAgentsMetrics.
+export WOSAC_HARD_POOL_WORKERS="${WOSAC_HARD_POOL_WORKERS:-16}"
+export WOSAC_REAL_POOL_WORKERS="${WOSAC_REAL_POOL_WORKERS:-16}"
+# 1로 두면 hard vs real 결과 cross-check (느려짐, 디버깅용).
+export WOSAC_VERIFY="${WOSAC_VERIFY:-0}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_consistency_bptt}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-single}"
@@ -52,8 +67,8 @@ FIXED_SCENARIO_PKL="${FIXED_SCENARIO_PKL:-}"
 # ── Single-scenario 특화 기본값 ─────────────────────────────────────────────
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 # TRAIN_B / VAL_B: 각 train/val dataloader의 batch size (배치 "크기")
-TRAIN_B="${TRAIN_B:-24}"
-VAL_B="${VAL_B:-8}"
+TRAIN_B="${TRAIN_B:-8}"
+VAL_B="${VAL_B:-16}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
 # LIMIT_*_BATCHES: "배치 개수 제한" (batch size와 다른 개념)
 # - float(0~1]: 전체 dataloader 중 비율
@@ -65,7 +80,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-5000}"
 # VAL_CHECK_INTERVAL: step(배치) 단위 validation 주기. 0 금지.
 # CHECK_VAL_EVERY_N_EPOCH: epoch 단위 validation 주기. 0 금지.
 # 실제 validation 실행 조건은 둘 다 만족해야 하며, val을 끄려면 LIMIT_VAL_BATCHES=0 사용.
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-20}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-50}"
 CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-1}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
@@ -99,7 +114,7 @@ PY
 fi
 
 FLOW_SOLVER_METHOD="${FLOW_SOLVER_METHOD:-euler}"
-FLOW_SOLVER_STEPS="${FLOW_SOLVER_STEPS:-8}"
+FLOW_SOLVER_STEPS="${FLOW_SOLVER_STEPS:-16}"
 ROLLOUT_NOISE_SCALE="${ROLLOUT_NOISE_SCALE:-1.0}"
 
 N_VIS_BATCH="${N_VIS_BATCH:-0}"
@@ -119,12 +134,13 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-1}"
 
 # ── OCSC 파라미터 ──────────────────────────────────────────────────────────
 OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-4}"
-OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-smooth_l1}"
+# OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-smooth_l1}"
+OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
 OCSC_USE_MMD="${OCSC_USE_MMD:-false}"
 OCSC_ANCHOR_STRIDE="${OCSC_ANCHOR_STRIDE:-1}"
 OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
-OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-4}"
-OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-4}"
+OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-8}"
+OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-8}"
 OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-0.0}"
 OCSC_POSITION_WEIGHT="${OCSC_POSITION_WEIGHT:-0.0}"
 OCSC_REL_DISP_WEIGHT="${OCSC_REL_DISP_WEIGHT:-1.0}"
@@ -237,6 +253,7 @@ echo "OCSC_HEADING_WEIGHT=${OCSC_HEADING_WEIGHT} OCSC_POSITION_WEIGHT=${OCSC_POS
 echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA} OCSC_GT_TARGET=${OCSC_GT_TARGET}"
 echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_GRAD_CLIP=${BPTT_GRAD_CLIP_TRAJ} LR=${LR}"
+echo "OMP=${OMP_NUM_THREADS} MKL=${MKL_NUM_THREADS} NUM_WORKERS=${NUM_WORKERS} WOSAC_HARD_POOL=${WOSAC_HARD_POOL_WORKERS} WOSAC_REAL_POOL=${WOSAC_REAL_POOL_WORKERS} WOSAC_VERIFY=${WOSAC_VERIFY}"
 
 # num_workers=0 인 경우 torch DataLoader 제약상 prefetch_factor를 넘기면 안 됩니다.
 PREFETCH_ARG=""
