@@ -21,6 +21,7 @@ from src.smart.metrics.wosac_submission import WOSACSubmission
 
 import multiprocessing as mp
 import os
+import pickle
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -302,6 +303,10 @@ class HardSimAgentsMetrics:
     """
 
     _SCENARIO_CACHE_MAX: int = 256
+    # Module-level (process-local) cache: scenario_file_path -> (sc_bytes, lf_dict).
+    _log_feat_cache: Dict[str, Any] = {}
+    # Disk cache root (persistent across processes). Override with WOSAC_HARD_LOG_CACHE_DIR.
+    _disk_cache_dir: str = os.environ.get("WOSAC_HARD_LOG_CACHE_DIR", "/tmp/wosac_hard_log_feat_cache")
 
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
@@ -466,13 +471,66 @@ class HardSimAgentsMetrics:
             if bool(int(os.environ.get("WOSAC_PROFILE", "0"))):
                 import time as _time
                 _pool_t0 = _time.perf_counter()
-            # value 가 protobuf enum → 정수로 직렬화해서 worker 에 전달
-            results = pool.starmap(
-                _hard_load_and_log_feat_worker,
-                [(sf, _challenge) for sf in scenario_files],
-            )
+            # Two-level cache: in-memory (process-local) + disk (persistent across processes).
+            # Disk hits skip TF compute_metric_features entirely; Run 1 → Run 2 free path.
+            mem_cache = HardSimAgentsMetrics._log_feat_cache
+            disk_dir = HardSimAgentsMetrics._disk_cache_dir
+            os.makedirs(disk_dir, exist_ok=True)
+
+            def _disk_path(sf: str) -> str:
+                # basename only — assumes scenario_id unique. Safer than path-hashed.
+                bn = os.path.basename(sf).replace(os.sep, "_")
+                return os.path.join(disk_dir, f"{bn}.pkl")
+
+            miss_idx: list = []
+            miss_files: list = []
+            slot: list = [None] * n_scenarios
+            n_mem_hits = 0
+            n_disk_hits = 0
+            for j, sf in enumerate(scenario_files):
+                cached = mem_cache.get(sf)
+                if cached is not None:
+                    slot[j] = cached
+                    n_mem_hits += 1
+                    continue
+                dp = _disk_path(sf)
+                if os.path.exists(dp):
+                    try:
+                        with open(dp, "rb") as _f:
+                            res = pickle.load(_f)
+                        mem_cache[sf] = res
+                        slot[j] = res
+                        n_disk_hits += 1
+                        continue
+                    except Exception:
+                        pass  # fallthrough to recompute
+                miss_idx.append(j)
+                miss_files.append(sf)
+            if miss_files:
+                miss_results = pool.starmap(
+                    _hard_load_and_log_feat_worker,
+                    [(sf, _challenge) for sf in miss_files],
+                )
+                for j, sf, res in zip(miss_idx, miss_files, miss_results):
+                    mem_cache[sf] = res
+                    slot[j] = res
+                    # Atomic write: tmp file + rename to prevent partial reads.
+                    dp = _disk_path(sf)
+                    try:
+                        tmp = dp + ".tmp"
+                        with open(tmp, "wb") as _f:
+                            pickle.dump(res, _f, protocol=pickle.HIGHEST_PROTOCOL)
+                        os.replace(tmp, dp)
+                    except Exception:
+                        pass  # cache write failures are non-fatal
+            results = slot
             if bool(int(os.environ.get("WOSAC_PROFILE", "0"))):
-                print(f"[hard-rmm-profile] pool_starmap={_time.perf_counter()-_pool_t0:.2f}s n_scenes={n_scenarios}", flush=True)
+                print(
+                    f"[hard-rmm-profile] pool_starmap={_time.perf_counter()-_pool_t0:.2f}s "
+                    f"n_scenes={n_scenarios} mem_hits={n_mem_hits} disk_hits={n_disk_hits} "
+                    f"misses={len(miss_files)}",
+                    flush=True,
+                )
             scenarios = []
             log_feat_dicts: List[dict] = []
             for sc_bytes, lf_dict in results:
