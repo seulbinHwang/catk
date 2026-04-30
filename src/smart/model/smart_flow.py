@@ -35,6 +35,7 @@ from src.smart.modules.self_forced_path_flow import (
     masked_mean_square_loss,
 )
 from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
+from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
 from src.smart.modules.self_forced_update_separation import (
     assert_no_module_gradients,
     clear_module_gradients,
@@ -215,6 +216,32 @@ class SMARTFlow(LightningModule):
             float(getattr(self.self_forced_config, "clean_dmd_normalizer_eps", 1.0e-3))
             if self.self_forced_config is not None
             else 1.0e-3
+        )
+        self.self_forced_distribution_matching_objective = (
+            str(getattr(self.self_forced_config, "distribution_matching_objective", "dmd")).lower()
+            if self.self_forced_config is not None
+            else "dmd"
+        )
+        if self.self_forced_distribution_matching_objective not in {"dmd", "sid"}:
+            raise ValueError(
+                "self_forced.distribution_matching_objective must be 'dmd' or 'sid', "
+                f"got {self.self_forced_distribution_matching_objective}."
+            )
+        self.self_forced_sid_alpha = (
+            float(getattr(self.self_forced_config, "sid_alpha", 1.0))
+            if self.self_forced_config is not None
+            else 1.0
+        )
+        self.self_forced_sid_normalizer_eps = (
+            float(
+                getattr(
+                    self.self_forced_config,
+                    "sid_normalizer_eps",
+                    self.self_forced_direction_normalizer_eps,
+                )
+            )
+            if self.self_forced_config is not None
+            else self.self_forced_direction_normalizer_eps
         )
         self.self_forced_guidance_tau_low = (
             float(getattr(self.self_forced_config, "clean_dmd_tau_low", 0.02))
@@ -1861,6 +1888,164 @@ class SMARTFlow(LightningModule):
         self._assert_self_forced_generator_update_isolated()
         return path_delta.to(dtype=committed_path_norm.dtype).detach()
 
+
+    def _sample_self_forced_guidance_flow_state(self, clean_path_norm: Tensor):
+        """SiD/DMD teacher query에 쓸 noisy path를 샘플링합니다.
+
+        Args:
+            clean_path_norm: Generator가 만든 clean path입니다.
+                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+
+        Returns:
+            object: ``x_t`` 와 ``tau`` 를 가진 flow sample입니다.
+        """
+        try:
+            return self.encoder.agent_encoder.flow_ode.sample(
+                clean_path_norm,
+                target_type="velocity",
+                tau_low=self.self_forced_guidance_tau_low,
+                tau_high=self.self_forced_guidance_tau_high,
+            )
+        except TypeError:
+            return self.encoder.agent_encoder.flow_ode.sample(
+                clean_path_norm,
+                target_type="velocity",
+            )
+
+    def _predict_self_forced_teacher_estimator_clean_paths(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        committed_path_norm: Tensor,
+        anchor_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """같은 noisy path에서 teacher와 generated estimator의 clean 예측을 구합니다.
+
+        Args:
+            tokenized_map: 평가 모드 map token 사전입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+            committed_path_norm: Generator가 실제로 실행한 path입니다.
+                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
+                shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            tuple[Tensor, Tensor]: ``target_clean_norm`` 과 ``generated_clean_norm`` 입니다.
+                각 shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+        """
+        if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
+            raise RuntimeError("self-forced auxiliary models are not initialized.")
+
+        self.self_forced_target_teacher.eval()
+        self.self_forced_generated_estimator.eval()
+        if hasattr(self, "_clear_self_forced_auxiliary_gradients"):
+            self._clear_self_forced_auxiliary_gradients()
+
+        with torch.no_grad():
+            clean_for_guidance = committed_path_norm.detach()
+            flow_sample = self._sample_self_forced_guidance_flow_state(clean_for_guidance)
+            target_pred = self._predict_path_flow_clean_estimate(
+                decoder=self.self_forced_target_teacher,
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                noisy_path_norm=flow_sample.x_t,
+                tau=flow_sample.tau,
+                anchor_mask=anchor_mask,
+            )
+            generated_pred = self._predict_path_flow_clean_estimate(
+                decoder=self.self_forced_generated_estimator,
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                noisy_path_norm=flow_sample.x_t,
+                tau=flow_sample.tau,
+                anchor_mask=anchor_mask,
+            )
+
+        if hasattr(self, "_assert_self_forced_generator_update_isolated"):
+            self._assert_self_forced_generator_update_isolated()
+        return target_pred["clean"].detach(), generated_pred["clean"].detach()
+
+    def _compute_self_forced_sid_loss(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        committed_path_norm: Tensor,
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """Self-forced rollout path에 SiD-lite loss를 계산합니다.
+
+        Args:
+            tokenized_map: 평가 모드 map token 사전입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+            committed_path_norm: Generator가 실제로 실행한 path ``X`` 입니다.
+                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
+                shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            Tensor: scalar SiD-lite loss입니다. shape은 ``[]`` 입니다.
+        """
+        target_clean_norm, generated_clean_norm = self._predict_self_forced_teacher_estimator_clean_paths(
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
+            committed_path_norm=committed_path_norm,
+            anchor_mask=anchor_mask,
+        )
+        self._set_self_forced_backward_context(
+            committed_path_norm=committed_path_norm,
+            target_clean_norm=target_clean_norm,
+            generated_clean_norm=generated_clean_norm,
+        )
+        return compute_clean_sid_loss(
+            committed_path_norm=committed_path_norm,
+            target_clean_norm=target_clean_norm,
+            generated_clean_norm=generated_clean_norm,
+            sid_alpha=self.self_forced_sid_alpha,
+            normalizer_eps=self.self_forced_sid_normalizer_eps,
+        )
+
+    def _compute_self_forced_distribution_matching_loss(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        committed_path_norm: Tensor,
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """설정에 따라 DMD-style 또는 SiD-style generator loss를 계산합니다.
+
+        Args:
+            tokenized_map: 평가 모드 map token 사전입니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+            committed_path_norm: Generator가 실제로 실행한 path입니다.
+                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
+                shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            Tensor: scalar 분포 맞춤 loss입니다. shape은 ``[]`` 입니다.
+        """
+        if self.self_forced_distribution_matching_objective == "sid":
+            return self._compute_self_forced_sid_loss(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                committed_path_norm=committed_path_norm,
+                anchor_mask=anchor_mask,
+            )
+
+        path_delta = self._compute_self_forced_direction(
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
+            committed_path_norm=committed_path_norm,
+            anchor_mask=anchor_mask,
+        )
+        target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
+        self._set_self_forced_backward_context(
+            committed_path_norm=committed_path_norm,
+            path_delta=path_delta,
+            target_path_norm=target_path_norm,
+        )
+        return masked_mean_square_loss(committed_path_norm, target_path_norm)
+
     def _compute_self_forced_physics_loss(
         self,
         committed_path_norm: Tensor,
@@ -2355,19 +2540,12 @@ class SMARTFlow(LightningModule):
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
-        path_delta = self._compute_self_forced_direction(
+        sf_loss = self._compute_self_forced_distribution_matching_loss(
             tokenized_map=tokenized_map_eval,
             tokenized_agent=tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
-        target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
-        self._set_self_forced_backward_context(
-            committed_path_norm=committed_path_norm,
-            path_delta=path_delta,
-            target_path_norm=target_path_norm,
-        )
-        sf_loss = masked_mean_square_loss(committed_path_norm, target_path_norm)
         physics_dict = self._compute_self_forced_physics_loss(
             committed_path_norm=committed_path_norm,
             tokenized_agent=tokenized_agent_eval,
