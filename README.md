@@ -859,6 +859,7 @@ torchrun \
 - H100 preset은 Generator lr `4e-6`, generated estimator optimizer lr `8e-7` (`4e-6 / 5`), `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `path_step_size=0.05`, `unfrozen_range=except_map_encoder`, sampling = Euler 32-step / `noise_scale=1.0` / random terminal denoising step을 기본으로 둡니다.
 - Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=1.0e-3`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다.
 - Generator EMA 기본값은 `ema_weight=0.99`, `ema_start_step=50` 입니다. EMA는 online Generator update 직후에만 갱신되고, generated estimator에는 적용하지 않습니다.
+- Generated estimator warmup 기본값은 `estimator_warmup_epochs=1` 입니다. self-forcing 시작 후 첫 1 epoch 동안은 현재 Generator의 self-rollout으로 generated estimator만 먼저 학습하고, Generator update와 EMA update는 건너뜁니다.
 - 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
 - self-forced preset은 각 epoch마다 train dataset의 50%만 새로 랜덤 샘플링해 학습합니다. 비율은 `data.train_epoch_sample_fraction` 으로 바꾸며, `1.0` 으로 두면 전체 train dataset을 사용합니다.
 - self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 LR scheduler를 쓰지 않습니다. Generator lr은 `model.model_config.lr` 로 설정하고, generated estimator optimizer lr은 별도 config 없이 `model.model_config.lr / model.model_config.self_forced.estimator_updates_per_step` 으로 계산합니다. 따라서 self-forced preset에는 `lr_warmup_steps` / `lr_min_ratio` override를 두지 않습니다.
@@ -944,6 +945,20 @@ self-forced fine-tuning에서 학습할 파라미터 범위는 `unfrozen_range` 
 
 ```bash
 ... model.model_config.self_forced.unfrozen_range=full_flow_decoder
+```
+
+### Self-forced Generated Estimator Warmup
+
+- `model.model_config.self_forced.estimator_warmup_epochs=1` 이 기본값입니다.
+- 이 기간에는 online Generator를 업데이트하지 않고, 현재 Generator가 만든 self-rollout으로 generated estimator만 먼저 학습합니다.
+- warmup 중 self-rollout은 `torch.no_grad()`로 생성하고, Generator optimizer step과 EMA update는 실행하지 않습니다.
+- warmup이 끝나면 기존 self-forcing 경로를 그대로 사용합니다. DMD/SiD 선택, block detach, `unfrozen_range` 설정은 그대로 유지됩니다.
+- 끄고 싶으면 `estimator_warmup_epochs=0` 으로 설정합니다.
+
+예시:
+
+```bash
+... model.model_config.self_forced.estimator_warmup_epochs=0
 ```
 
 `precision=bf16-mixed` 에서도 self-forced forward / rollout / loss 계산은 그대로 mixed precision 으로 실행합니다. 다만 manual optimization 경로의 backward 진입점만 autocast-disabled boundary 밖에서 실행해, `F_psi` 업데이트와 Generator 업데이트 중 PyTorch autocast dtype promote 경로가 backward graph 를 다시 분류하다가 `Unexpected floating ScalarType in at::autocast::prioritize` 로 멈추는 상황을 피합니다. 현재 self-forced preset 기본값은 `estimator_updates_per_step=5` 이며, 이 값을 늘리면 그 횟수만큼 `F_psi` manual backward가 반복됩니다. 무거운 forward 계산은 bf16-mixed 를 유지하므로 전체 학습을 fp32 로 낮추는 방식보다 속도 손실이 작습니다.

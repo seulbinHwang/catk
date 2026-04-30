@@ -40,6 +40,10 @@ from src.smart.modules.self_forced_update_separation import (
     assert_no_module_gradients,
     clear_module_gradients,
 )
+from src.smart.modules.self_forced_estimator_warmup import (
+    is_self_forced_estimator_warmup_epoch,
+    resolve_self_forced_estimator_warmup_epochs,
+)
 from src.smart.modules.self_forced_trainable_range import (
     apply_self_forced_unfrozen_range,
     resolve_self_forced_unfrozen_range,
@@ -279,6 +283,9 @@ class SMARTFlow(LightningModule):
         )
         self.self_forced_estimator_lr = self.lr / float(
             self.self_forced_estimator_updates_per_step
+        )
+        self.self_forced_estimator_warmup_epochs = (
+            resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
         )
         self.self_forced_initialize_aux_on_fit_start = (
             bool(getattr(self.self_forced_config, "initialize_aux_from_generator_on_fit_start", True))
@@ -1276,6 +1283,52 @@ class SMARTFlow(LightningModule):
                 pred_head=pred_head,
             )
         return scenario_rollouts
+
+    def _is_self_forced_estimator_warmup_active(self) -> bool:
+        """현재 epoch에서 generated estimator만 먼저 적응시킬지 판단합니다."""
+        return is_self_forced_estimator_warmup_epoch(
+            current_epoch=int(self.current_epoch),
+            self_forced_start_epoch=int(self.self_forced_start_epoch),
+            estimator_warmup_epochs=int(self.self_forced_estimator_warmup_epochs),
+        )
+
+    def _finish_self_forced_estimator_warmup_step(
+        self,
+        estimator_loss: Tensor | None,
+    ) -> Tensor:
+        """warmup step을 마무리하고 generator update 없이 반환합니다."""
+        self._clear_self_forced_generator_gradients()
+        self._clear_self_forced_backward_context()
+        if estimator_loss is None:
+            detached_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+        else:
+            detached_loss = estimator_loss.detach().float()
+
+        self.log(
+            "train/loss",
+            detached_loss,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/self_forced_estimator_warmup/active",
+            torch.ones((), device=self.device, dtype=torch.float32),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/self_forced_estimator_warmup/estimator_loss",
+            detached_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        return detached_loss
 
     def _is_self_forced_active(self) -> bool:
         """현재 epoch에서 self-forced NPFM을 사용할지 판단합니다.
@@ -2513,12 +2566,18 @@ class SMARTFlow(LightningModule):
             fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
-        rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+        if self._is_self_forced_estimator_warmup_active():
+            with torch.no_grad():
+                rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+        else:
+            rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
         committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
             rollout=rollout,
             tokenized_agent=tokenized_agent_eval,
         )
         if committed_path_norm.numel() == 0:
+            if self._is_self_forced_estimator_warmup_active():
+                return self._finish_self_forced_estimator_warmup_step(None)
             if fm_loss is None:
                 # DDP requires backward on every rank to participate in the
                 # gradient all-reduce. Walk Generator parameters with a
@@ -2562,6 +2621,8 @@ class SMARTFlow(LightningModule):
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
+        if self._is_self_forced_estimator_warmup_active():
+            return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
         sf_loss = self._compute_self_forced_distribution_matching_loss(
             tokenized_map=tokenized_map_eval,
             tokenized_agent=tokenized_agent_eval,
