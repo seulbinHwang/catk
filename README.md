@@ -761,6 +761,41 @@ bash scripts/finetune_a100x4_no_draft_bs_sweep.sh
 
 각 attempt 의 raw torchrun 출력은 `/tmp/${TASK_NAME}_attempt<N>_bs<bs>.log` 에 저장돼서 OOM 판정 / 디버깅에 쓰입니다.
 
+### 5.8.2 Feasible DRaFT slip-angle penalty
+
+이 변경은 DRaFT fine-tuning의 물리 feasibility 항에 vehicle / bicycle 전용 slip-angle penalty를 추가합니다. 목적은 도로 정합성, 주변 agent 상호작용, RMM metric 직접 최적화가 아니라, heading 방향과 실제 이동 방향이 크게 어긋나는 비물리적인 옆방향 미끄러짐을 줄이는 것입니다.
+
+각 0.1초 구간에서 현재 anchor 상태를 `(0, 0, 0)`으로 두고, 미래 위치 변화량을 직전 heading 기준 body 좌표계로 회전합니다.
+
+```text
+vx_body = (dx * cos(theta_prev) + dy * sin(theta_prev)) / dt
+vy_body = (-dx * sin(theta_prev) + dy * cos(theta_prev)) / dt
+beta = atan2(abs(vy_body), abs(vx_body) + eps)
+```
+
+vehicle / bicycle에만 아래 제한값을 적용합니다.
+
+```text
+vehicle beta_max = 0.27 rad
+bicycle beta_max = 0.70 rad
+```
+
+초과량은 `semi_continuous_lqr`의 proxy penalty와 같은 dead-zone 제곱 형태를 사용합니다.
+
+```text
+r = relu(beta - beta_max) / (abs(beta_max) + eps)
+z = (r - 0.02) / 0.02
+slip_penalty = (0.02 * softplus(z))^2
+```
+
+최종 vehicle / bicycle feasibility 손실은 기존 hard 항과 기존 soft 처리 방식 사이에 slip 항을 1.0 배율로 직접 더합니다.
+
+```text
+vehicle_or_bicycle_total = hard + slip + soft_weight * soft_effective
+```
+
+기존 sampling 설정, draft 전체 가중치, train batch size, learning rate는 바꾸지 않습니다. 학습 로그에는 `vehicle_slip`, `bicycle_slip`, `slip_beta_excess_deg`가 추가됩니다.
+
 ## 6. 평가와 추론
 
 ### 6.1 Validation set closed-loop 평가

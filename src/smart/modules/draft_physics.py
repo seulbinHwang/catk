@@ -24,6 +24,8 @@ class DynamicLimitTable:
             차량과 자전거는 앞방향 가속도, 사람은 2차원 가속도 크기를 뜻합니다.
         a_lat_max_mps2: 횡가속 제한입니다. shape은 ``[3]`` 입니다.
             사람에는 쓰지 않으므로 0이어도 됩니다.
+        beta_max_rad: body-frame slip angle 제한입니다. shape은 ``[3]`` 입니다.
+            차량과 자전거의 옆방향 미끄러짐을 제한할 때 씁니다.
         alpha_max_radps2: 회전 변화 제한입니다. shape은 ``[3]`` 입니다.
             LQR commit bridge 의 곡률 변화율 clip 에 쓰입니다.
         r_min_m: 최소 선회 반경 제한입니다. shape은 ``[3]`` 입니다.
@@ -35,6 +37,7 @@ class DynamicLimitTable:
     v_max_mps: Tuple[float, float, float]
     a_max_mps2: Tuple[float, float, float]
     a_lat_max_mps2: Tuple[float, float, float]
+    beta_max_rad: Tuple[float, float, float] = (0.27, 10.0, 0.70)
     alpha_max_radps2: Tuple[float, float, float] = (1.75, 14.0, 6.0)
     r_min_m: Tuple[float, float, float] = (4.50, 1.0e-5, 0.5)
     omega_max_abs_radps: Tuple[float, float, float] = (0.9, 3.3, 2.0)
@@ -44,6 +47,7 @@ DEFAULT_LIMITS = DynamicLimitTable(
     v_max_mps=(35.0, 5.0, 22.0),
     a_max_mps2=(8.0, 4.7, 5.5),
     a_lat_max_mps2=(4.2, 0.0, 4.4),
+    beta_max_rad=(0.27, 10.0, 0.70),
     alpha_max_radps2=(1.75, 14.0, 6.0),
     r_min_m=(4.50, 1.0e-5, 0.5),
     omega_max_abs_radps=(0.9, 3.3, 2.0),
@@ -52,9 +56,11 @@ DEFAULT_LIMITS = DynamicLimitTable(
 
 DRAFT_PHYSICS_COMPONENT_KEYS = (
     "vehicle_hard",
+    "vehicle_slip",
     "vehicle_soft",
     "vehicle_total",
     "bicycle_hard",
+    "bicycle_slip",
     "bicycle_soft",
     "bicycle_total",
     "pedestrian_hard",
@@ -65,6 +71,7 @@ DRAFT_PHYSICS_COMPONENT_KEYS = (
 
 DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
     "speed_excess_mps",
+    "slip_beta_excess_deg",
     "accel_excess_mps2",
     "steer_excess_deg",
     "steer_rate_excess_degps",
@@ -106,6 +113,8 @@ class DraftPhysicsRegularizer(nn.Module):
 
     차량과 자전거는 자전거 모델에 맞춘 역추론 값을 쓰고,
     사람은 2차원 속도와 2차원 가속도로 계산합니다.
+    차량과 자전거에는 body-frame slip angle 벌점을 추가해 heading 방향과
+    실제 이동 방향이 크게 어긋나는 옆방향 미끄러짐을 줄입니다.
 
     Args:
         dt: 미래 점 간 시간 간격입니다. 기본값은 ``0.1`` 초입니다.
@@ -115,9 +124,11 @@ class DraftPhysicsRegularizer(nn.Module):
         vehicle_v_max_mps: 차량 최고 속도 제한입니다.
         vehicle_a_max_mps2: 차량 앞방향 가속도 제한입니다.
         vehicle_lat_accel_max_mps2: 차량 횡가속 제한입니다.
+        vehicle_beta_max_rad: 차량 slip angle 제한입니다.
         bicycle_v_max_mps: 자전거 최고 속도 제한입니다.
         bicycle_a_max_mps2: 자전거 앞방향 가속도 제한입니다.
         bicycle_lat_accel_max_mps2: 자전거 횡가속 제한입니다.
+        bicycle_beta_max_rad: 자전거 slip angle 제한입니다.
         pedestrian_v_max_mps: 사람 속도 제한입니다.
         pedestrian_a_max_mps2: 사람 2차원 가속도 제한입니다.
         vehicle_wheelbase_scale: 차량 wheelbase 비율입니다.
@@ -129,6 +140,10 @@ class DraftPhysicsRegularizer(nn.Module):
         soft_weight: 모든 class에 공통으로 쓰는 roughness 항 가중치입니다.
         compare_softness_to_gt: ``True`` 이면 soft roughness를 GT보다 더 큰 만큼만
             반영하고, ``False`` 이면 prediction roughness 자체를 그대로 반영합니다.
+        slip_deadzone_ratio: slip angle 초과량 중 무시할 정규화 여유 폭입니다.
+            ``semi_continuous_lqr`` 의 기본값 ``0.02`` 를 그대로 사용합니다.
+        slip_deadzone_softness: slip dead-zone 경계를 부드럽게 만드는 값입니다.
+            ``semi_continuous_lqr`` 의 기본값 ``0.02`` 를 그대로 사용합니다.
         pedestrian_heading_weight: 사람 heading 약한 정렬 항 가중치입니다.
         pedestrian_heading_speed_threshold_mps: 사람 heading 항을 켜는 최소 속도입니다.
         eps: 수치 안정용 작은 값입니다.
@@ -142,9 +157,11 @@ class DraftPhysicsRegularizer(nn.Module):
         vehicle_v_max_mps: float = DEFAULT_LIMITS.v_max_mps[VEHICLE_TYPE],
         vehicle_a_max_mps2: float = DEFAULT_LIMITS.a_max_mps2[VEHICLE_TYPE],
         vehicle_lat_accel_max_mps2: float = DEFAULT_LIMITS.a_lat_max_mps2[VEHICLE_TYPE],
+        vehicle_beta_max_rad: float = DEFAULT_LIMITS.beta_max_rad[VEHICLE_TYPE],
         bicycle_v_max_mps: float = DEFAULT_LIMITS.v_max_mps[BICYCLE_TYPE],
         bicycle_a_max_mps2: float = DEFAULT_LIMITS.a_max_mps2[BICYCLE_TYPE],
         bicycle_lat_accel_max_mps2: float = DEFAULT_LIMITS.a_lat_max_mps2[BICYCLE_TYPE],
+        bicycle_beta_max_rad: float = DEFAULT_LIMITS.beta_max_rad[BICYCLE_TYPE],
         pedestrian_v_max_mps: float = DEFAULT_LIMITS.v_max_mps[PEDESTRIAN_TYPE],
         pedestrian_a_max_mps2: float = DEFAULT_LIMITS.a_max_mps2[PEDESTRIAN_TYPE],
         vehicle_wheelbase_scale: float = 0.60,
@@ -155,6 +172,8 @@ class DraftPhysicsRegularizer(nn.Module):
         bicycle_steer_rate_max_radps: float = 1.5,
         soft_weight: float = 0.25,
         compare_softness_to_gt: bool = True,
+        slip_deadzone_ratio: float = 0.02,
+        slip_deadzone_softness: float = 0.02,
         pedestrian_heading_weight: float = 0.05,
         pedestrian_heading_speed_threshold_mps: float = 0.5,
         eps: float = 1e-6,
@@ -179,6 +198,11 @@ class DraftPhysicsRegularizer(nn.Module):
                 0.0,
                 float(bicycle_lat_accel_max_mps2),
             ),
+            beta_max_rad=(
+                float(vehicle_beta_max_rad),
+                10.0,
+                float(bicycle_beta_max_rad),
+            ),
         )
         self.vehicle_wheelbase_scale = float(vehicle_wheelbase_scale)
         self.bicycle_wheelbase_scale = float(bicycle_wheelbase_scale)
@@ -188,6 +212,8 @@ class DraftPhysicsRegularizer(nn.Module):
         self.bicycle_steer_rate_max_radps = float(bicycle_steer_rate_max_radps)
         self.soft_weight = float(soft_weight)
         self.compare_softness_to_gt = bool(compare_softness_to_gt)
+        self.slip_deadzone_ratio = float(slip_deadzone_ratio)
+        self.slip_deadzone_softness = float(slip_deadzone_softness)
         self.pedestrian_heading_weight = float(pedestrian_heading_weight)
         self.pedestrian_heading_speed_threshold_mps = float(pedestrian_heading_speed_threshold_mps)
         self.eps = float(eps)
@@ -310,14 +336,28 @@ class DraftPhysicsRegularizer(nn.Module):
                     soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
                 else:
                     soft_effective = pred_stats["soft"]
-                effective_total = pred_stats["hard"] + self.soft_weight * soft_effective
-                raw_total = pred_stats["hard"] + self.soft_weight * pred_stats["soft"]
+                # slip은 semi_continuous_lqr의 proxy penalty처럼 예측 궤적의
+                # 비홀로노믹 위반 자체를 직접 더합니다. 전체 draft.max_weight는
+                # 기존 학습 파이프라인이 그대로 적용합니다.
+                effective_total = (
+                    pred_stats["hard"]
+                    + pred_stats["slip"]
+                    + self.soft_weight * soft_effective
+                )
+                raw_total = (
+                    pred_stats["hard"]
+                    + pred_stats["slip"]
+                    + self.soft_weight * pred_stats["soft"]
+                )
 
                 output[f"{class_name}_hard"] = pred_stats["hard"].mean()
+                output[f"{class_name}_slip"] = pred_stats["slip"].mean()
                 output[f"{class_name}_soft"] = soft_effective.mean()
                 output[f"{class_name}_total"] = effective_total.mean()
                 pred_actual_buckets["speed_excess_mps"].append(pred_stats["speed_excess_mps"].mean())
                 gt_actual_buckets["speed_excess_mps"].append(gt_stats["speed_excess_mps"].mean())
+                pred_actual_buckets["slip_beta_excess_deg"].append(pred_stats["slip_beta_excess_deg"].mean())
+                gt_actual_buckets["slip_beta_excess_deg"].append(gt_stats["slip_beta_excess_deg"].mean())
                 pred_actual_buckets["accel_excess_mps2"].append(pred_stats["accel_excess_mps2"].mean())
                 gt_actual_buckets["accel_excess_mps2"].append(gt_stats["accel_excess_mps2"].mean())
                 pred_actual_buckets["steer_excess_deg"].append(pred_stats["steer_excess_deg"].mean())
@@ -358,7 +398,7 @@ class DraftPhysicsRegularizer(nn.Module):
 
         Returns:
             Dict[str, Tensor]:
-                hard, soft, 실제 단위 초과량을 담은 사전입니다.
+                hard, slip, soft, 실제 단위 초과량을 담은 사전입니다.
                 각 값의 shape은 ``[n_agent]`` 입니다.
         """
         pos_local_m, heading_local = self._denormalize_future(future_norm)
@@ -367,8 +407,11 @@ class DraftPhysicsRegularizer(nn.Module):
         heading_prev = heading_seq[:, :-1]
         delta_heading = self._wrap_angle(heading_seq[:, 1:] - heading_seq[:, :-1])
 
-        progress_dir = torch.stack([heading_prev.cos(), heading_prev.sin()], dim=-1)
-        speed = (delta_pos * progress_dir).sum(dim=-1) / self.dt
+        cos_head = heading_prev.cos()
+        sin_head = heading_prev.sin()
+        vx_body = (delta_pos[..., 0] * cos_head + delta_pos[..., 1] * sin_head) / self.dt
+        vy_body = (-delta_pos[..., 0] * sin_head + delta_pos[..., 1] * cos_head) / self.dt
+        speed = vx_body
 
         speed_floor = speed.abs().clamp_min(self.speed_floor_mps)
         curvature = delta_heading / (speed_floor * self.dt)
@@ -405,6 +448,18 @@ class DraftPhysicsRegularizer(nn.Module):
         v_max = self._select_limit(self.limit_table.v_max_mps, class_id, future_norm)
         a_max = self._select_limit(self.limit_table.a_max_mps2, class_id, future_norm)
         a_lat_max = self._select_limit(self.limit_table.a_lat_max_mps2, class_id, future_norm)
+        beta_max = self._select_limit(self.limit_table.beta_max_rad, class_id, future_norm)
+
+        beta = torch.atan2(vy_body.abs(), vx_body.abs() + self.eps)
+        beta_pen = self._normalized_slip_square_penalty(
+            value=beta,
+            limit=beta_max,
+            enabled=beta_max > 0.0,
+        )
+        slip = self._mean_over_time(beta_pen)
+        slip_beta_excess_deg = self._mean_over_time(
+            torch.rad2deg(torch.relu(beta - beta_max))
+        )
 
         hard = self._mean_over_time(
             self._phi(speed.abs() / v_max - 1.0)
@@ -426,8 +481,10 @@ class DraftPhysicsRegularizer(nn.Module):
 
         return {
             "hard": hard,
+            "slip": slip,
             "soft": soft,
             "speed_excess_mps": self._mean_over_time(torch.relu(speed.abs() - v_max)),
+            "slip_beta_excess_deg": slip_beta_excess_deg,
             "accel_excess_mps2": self._mean_over_time(torch.relu(accel.abs() - a_max)),
             "steer_excess_deg": self._mean_over_time(torch.rad2deg(torch.relu(steer.abs() - steer_max_rad))),
             "steer_rate_excess_degps": self._mean_over_time(
@@ -505,11 +562,14 @@ class DraftPhysicsRegularizer(nn.Module):
     def _prev_body_velocity_to_anchor_local(self, prev_control: Tensor) -> Tensor:
         """직전 body-frame 속도를 현재 anchor-local 2D 속도로 회전합니다.
 
-        ``prev_control[..., :2]`` 는 anchor 직전 구간의 previous-heading body
-        frame 속도입니다. pedestrian physics 의 ``vel_vec`` 는 현재 anchor 기준
-        local frame 이므로 첫 acceleration 을 계산하기 전에 같은 좌표계로 맞춥니다.
-        ``prev_control[..., 2]`` 는 직전 heading 에서 현재 heading 으로 온 yaw rate라서
-        previous heading 의 current-anchor local 각도는 ``-omega * dt`` 입니다.
+        Args:
+            prev_control: anchor 직전 구간의 제어입니다.
+                마지막 차원은 ``[v_x^b, v_y^b, omega]`` 이고,
+                shape은 ``[n_agent, 3]`` 입니다.
+
+        Returns:
+            Tensor:
+                현재 anchor-local 기준 2D 속도입니다. shape은 ``[n_agent, 2]`` 입니다.
         """
         prev_body_vel = prev_control[:, :2]
         prev_head_local = -prev_control[:, 2] * self.dt
@@ -558,7 +618,15 @@ class DraftPhysicsRegularizer(nn.Module):
         return pos_local_m, heading_local
 
     def _safe_angle_from_xy(self, xy: Tensor) -> Tensor:
-        """거의 0인 2D 벡터에서도 backward가 NaN이 되지 않도록 각도를 구합니다."""
+        """거의 0인 2D 벡터에서도 backward가 NaN이 되지 않도록 각도를 구합니다.
+
+        Args:
+            xy: heading 2D 벡터입니다. shape은 ``[..., 2]`` 입니다.
+
+        Returns:
+            Tensor:
+                안전하게 복원한 각도입니다. shape은 ``[...]`` 입니다.
+        """
         xy_norm = torch.linalg.norm(xy, dim=-1, keepdim=True)
         default_xy = torch.zeros_like(xy)
         default_xy[..., 0] = 1.0
@@ -590,65 +658,97 @@ class DraftPhysicsRegularizer(nn.Module):
         heading_zero = heading_local.new_zeros((num_agent, 1))
         return torch.cat([pos_zero, pos_local_m], dim=1), torch.cat([heading_zero, heading_local], dim=1)
 
-    def _phi(self, value: Tensor) -> Tensor:
-        """hard 위반 함수 ``[z]_+^2`` 를 계산합니다.
+    def _normalized_slip_square_penalty(
+        self,
+        value: Tensor,
+        limit: Tensor,
+        enabled: Tensor | None = None,
+    ) -> Tensor:
+        """LQR 브랜치와 같은 slip 초과량 제곱 penalty를 계산합니다.
 
         Args:
-            value: 입력 텐서입니다. shape은 임의입니다.
+            value: slip angle입니다. shape은 ``[n_agent, T]`` 입니다.
+            limit: slip angle 제한값입니다. shape은 ``[]`` 이며 broadcast됩니다.
+            enabled: ``True``인 위치만 penalty를 켭니다.
+                shape은 ``[]`` 또는 ``[n_agent, T]`` 로 broadcast 가능합니다.
 
         Returns:
-            Tensor: 같은 shape의 penalty입니다.
+            Tensor:
+                slip penalty입니다. shape은 ``[n_agent, T]`` 입니다.
+        """
+        normalized_excess = torch.relu(value - limit) / (limit.abs() + self.eps)
+        shifted = (normalized_excess - self.slip_deadzone_ratio) / max(
+            self.slip_deadzone_softness,
+            self.eps,
+        )
+        smooth = torch.nn.functional.softplus(shifted) * max(
+            self.slip_deadzone_softness,
+            self.eps,
+        )
+        penalty = smooth.square()
+        if enabled is None:
+            return penalty
+        return torch.where(enabled, penalty, penalty.new_zeros(()))
+
+    def _phi(self, value: Tensor) -> Tensor:
+        """hard 위반 함수입니다.
+
+        Args:
+            value: 제한값 대비 초과 비율입니다. shape은 임의입니다.
+
+        Returns:
+            Tensor:
+                양수 초과량만 부드럽게 반영한 penalty입니다. shape은 입력과 같습니다.
         """
         return torch.relu(value).square()
-
-    def _mean_list_or_zero(
-        self,
-        values: List[Tensor],
-        reference: Tensor,
-    ) -> Tensor:
-        """스칼라 목록 평균을 구하고 비어 있으면 0을 돌려줍니다.
-
-        Args:
-            values: 스칼라 텐서 목록입니다.
-            reference: 0을 만들 때 device와 dtype를 맞출 기준 텐서입니다.
-                shape은 임의입니다.
-
-        Returns:
-            Tensor: 스칼라 평균값입니다.
-        """
-        if len(values) == 0:
-            return reference.new_zeros(())
-        return torch.stack(values).mean()
 
     def _mean_over_time(self, value: Tensor) -> Tensor:
         """시간축 평균을 계산합니다.
 
         Args:
             value: 마지막 축이 시간인 텐서입니다. shape은 ``[n_agent, T]`` 입니다.
+                이미 anchor별 값이면 shape은 ``[n_agent]`` 입니다.
 
         Returns:
             Tensor:
-                에이전트별 평균값입니다. shape은 ``[n_agent]`` 입니다.
+                anchor별 평균값입니다. shape은 ``[n_agent]`` 입니다.
         """
-        if value.shape[-1] == 0:
-            return value.new_zeros(value.shape[:-1])
+        if value.dim() == 1:
+            return value
         return value.mean(dim=-1)
 
-    def _masked_mean_over_time(self, value: Tensor, enabled: Tensor) -> Tensor:
-        """시간축에서 활성화된 위치만 평균합니다.
+    def _masked_mean_over_time(self, value: Tensor, mask: Tensor) -> Tensor:
+        """시간축에서 유효한 위치만 평균합니다.
 
         Args:
-            value: 마지막 축이 시간인 텐서입니다. shape은 ``[n_agent, T]`` 입니다.
-            enabled: 평균에 포함할지 표시하는 마스크입니다.
-                shape은 ``[n_agent, T]`` 입니다.
+            value: 평균할 값입니다. shape은 ``[n_agent, T]`` 입니다.
+            mask: 유효 위치입니다. shape은 ``[n_agent, T]`` 입니다.
 
         Returns:
             Tensor:
-                에이전트별 마스크 평균입니다. shape은 ``[n_agent]`` 입니다.
+                anchor별 masked 평균입니다. shape은 ``[n_agent]`` 입니다.
         """
-        masked_value = torch.where(enabled, value, torch.zeros_like(value))
-        enabled_count = enabled.to(dtype=value.dtype).sum(dim=-1).clamp_min(1.0)
-        return masked_value.sum(dim=-1) / enabled_count
+        if value.dim() == 1:
+            return torch.where(mask, value, torch.zeros_like(value))
+        mask_f = mask.to(dtype=value.dtype)
+        denom = mask_f.sum(dim=-1).clamp_min(1.0)
+        return (value * mask_f).sum(dim=-1) / denom
+
+    def _mean_list_or_zero(self, values: List[Tensor], reference: Tensor) -> Tensor:
+        """스칼라 목록의 평균을 계산하고, 비어 있으면 0을 돌려줍니다.
+
+        Args:
+            values: 평균할 스칼라 텐서 목록입니다.
+            reference: 빈 목록일 때 device와 dtype를 맞출 기준 텐서입니다.
+                shape은 임의입니다.
+
+        Returns:
+            Tensor:
+                스칼라 평균값입니다. shape은 ``[]`` 입니다.
+        """
+        if len(values) == 0:
+            return reference.new_zeros(())
+        return torch.stack(values).mean()
 
     def _wrap_angle(self, angle: Tensor) -> Tensor:
         """각도를 ``[-pi, pi]`` 범위로 접습니다.
@@ -657,6 +757,7 @@ class DraftPhysicsRegularizer(nn.Module):
             angle: 각도 텐서입니다. shape은 임의입니다.
 
         Returns:
-            Tensor: 같은 shape의 접힌 각도입니다.
+            Tensor:
+                같은 shape의 접힌 각도입니다.
         """
         return torch.atan2(angle.sin(), angle.cos())
