@@ -12,4 +12,5 @@ model:
       sid_alpha: 1.0
       sid_normalizer_eps: 1.0e-3
       use_anchor_flow_matching_loss: false
+      detach_block_transition: false
       use_control_space_physics_regularization: false

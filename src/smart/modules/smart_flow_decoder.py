@@ -214,6 +214,7 @@ class SMARTFlowDecoder(nn.Module):
         scenario_sampling_seeds: Tensor | None = None,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
+        detach_block_transition: bool = False,
     ) -> Dict[str, Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -238,6 +239,7 @@ class SMARTFlowDecoder(nn.Module):
             scenario_sampling_seeds=scenario_sampling_seeds,
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
+            detach_block_transition=detach_block_transition,
         )
 
     def path_flow_velocity_for_anchor0(

@@ -243,6 +243,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else self.self_forced_direction_normalizer_eps
         )
+        self.self_forced_detach_block_transition = (
+            bool(getattr(self.self_forced_config, "detach_block_transition", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_guidance_tau_low = (
             float(getattr(self.self_forced_config, "clean_dmd_tau_low", 0.02))
             if self.self_forced_config is not None
@@ -1723,6 +1728,7 @@ class SMARTFlow(LightningModule):
                 sampling_scheme=self.self_forced_sampling,
                 rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
                 self_forced_epoch=int(self.current_epoch),
+                detach_block_transition=self.self_forced_detach_block_transition,
             )
         finally:
             self._restore_module_training_modes(encoder_modes)

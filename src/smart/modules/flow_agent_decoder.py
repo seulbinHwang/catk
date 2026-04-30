@@ -16,6 +16,9 @@ from src.smart.modules.flow_local_decoder import (
     HierarchicalFlowDecoder,
     LQRCommitBridgeConfig,
 )
+from src.smart.modules.self_forced_rollout_detach import (
+    detach_training_rollout_state,
+)
 from src.smart.utils import (
     angle_between_2d_vectors,
     safe_norm_2d,
@@ -1135,6 +1138,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
+        detach_block_transition: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -1271,6 +1275,39 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
 
         for t in range(n_step_future_2hz):
+            if detach_block_transition and t > 0:
+                detached_state = detach_training_rollout_state(
+                    {
+                        "pos_window": pos_window,
+                        "head_window": head_window,
+                        "head_vector_window": head_vector_window,
+                        "valid_window": valid_window,
+                        "pred_idx_window": pred_idx_window,
+                        "exec_pos_history_10hz": exec_pos_history_10hz,
+                        "exec_head_history_10hz": exec_head_history_10hz,
+                        "exec_valid_history_10hz": exec_valid_history_10hz,
+                        "exec_pos_pair_10hz": exec_pos_pair_10hz,
+                        "exec_head_pair_10hz": exec_head_pair_10hz,
+                        "exec_valid_pair_10hz": exec_valid_pair_10hz,
+                        "feat_a": feat_a,
+                        "agent_token_emb": agent_token_emb,
+                        "feat_a_t_dict": feat_a_t_dict,
+                    }
+                )
+                pos_window = detached_state["pos_window"]
+                head_window = detached_state["head_window"]
+                head_vector_window = detached_state["head_vector_window"]
+                valid_window = detached_state["valid_window"]
+                pred_idx_window = detached_state["pred_idx_window"]
+                exec_pos_history_10hz = detached_state["exec_pos_history_10hz"]
+                exec_head_history_10hz = detached_state["exec_head_history_10hz"]
+                exec_valid_history_10hz = detached_state["exec_valid_history_10hz"]
+                exec_pos_pair_10hz = detached_state["exec_pos_pair_10hz"]
+                exec_head_pair_10hz = detached_state["exec_head_pair_10hz"]
+                exec_valid_pair_10hz = detached_state["exec_valid_pair_10hz"]
+                feat_a = detached_state["feat_a"]
+                agent_token_emb = detached_state["agent_token_emb"]
+                feat_a_t_dict = detached_state["feat_a_t_dict"]
             n_step = pos_window.shape[1]
             if t == 0:
                 current_hidden = feat_a_now
@@ -1668,6 +1705,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         scenario_sampling_seeds: torch.Tensor | None = None,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
+        detach_block_transition: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -1696,6 +1734,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             return_flow_2s_preview=False,
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
+            detach_block_transition=detach_block_transition,
         )
 
     def path_flow_velocity_for_anchor0(

@@ -51,6 +51,7 @@ model:
       clean_dmd_tau_high: 0.98
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
+      detach_block_transition: false
       estimator_updates_per_step: 5
       # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
       # Resume from a self-forced checkpoint preserves restored aux states.

@@ -80,6 +80,7 @@ model_config:
     distribution_matching_objective: dmd
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
+    detach_block_transition: false
     estimator_updates_per_step: 5
     initialize_aux_from_generator_on_fit_start: true
     freeze_map_encoder: true
