@@ -40,6 +40,10 @@ from src.smart.modules.self_forced_update_separation import (
     assert_no_module_gradients,
     clear_module_gradients,
 )
+from src.smart.modules.self_forced_trainable_range import (
+    apply_self_forced_unfrozen_range,
+    resolve_self_forced_unfrozen_range,
+)
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -281,10 +285,8 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else True
         )
-        self.self_forced_freeze_map_encoder = (
-            bool(getattr(self.self_forced_config, "freeze_map_encoder", False))
-            if self.self_forced_config is not None
-            else False
+        self.self_forced_unfrozen_range = resolve_self_forced_unfrozen_range(
+            self.self_forced_config,
         )
         self.self_forced_gradient_clip_val = (
             float(getattr(self.self_forced_config, "gradient_clip_val", 1.0))
@@ -406,7 +408,7 @@ class SMARTFlow(LightningModule):
                 self.self_forced_regularizer = None
         else:
             self.self_forced_regularizer = None
-        self._apply_self_forced_map_encoder_freeze()
+        self._apply_self_forced_unfrozen_range()
 
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
@@ -1288,21 +1290,35 @@ class SMARTFlow(LightningModule):
             and self.self_forced_generated_estimator is not None
         )
 
-    def _apply_self_forced_map_encoder_freeze(self) -> None:
-        """self-forced 설정에 따라 Generator와 F_psi의 map encoder를 고정합니다.
+
+    def _apply_self_forced_unfrozen_range(self) -> None:
+        """self-forcing에서 학습할 generator / estimator 범위를 적용합니다.
 
         Returns:
             None
+
+        설명:
+            ``except_map_encoder`` 는 기존 ``freeze_map_encoder=true`` 와 같은 의도입니다.
+            ``middle`` 은 마지막 flow decoder와 생성부 바로 앞의 마지막 agent 문맥 블록만 엽니다.
+            ``full_flow_decoder`` 는 draft fine-tuning의 ``train_full_flow_decoder_only=true`` 처럼
+            마지막 궤적 생성부만 엽니다.
         """
-        if not self.self_forced_enabled or not self.self_forced_freeze_map_encoder:
+        if not self.self_forced_enabled:
             return
-        for decoder in (self.encoder, self.self_forced_generated_estimator):
-            if decoder is None:
-                continue
-            map_encoder = getattr(decoder, "map_encoder", None)
-            if map_encoder is None:
-                continue
-            map_encoder.requires_grad_(False)
+
+        apply_self_forced_unfrozen_range(
+            self.encoder,
+            self.self_forced_unfrozen_range,
+        )
+        if self.self_forced_generated_estimator is not None:
+            apply_self_forced_unfrozen_range(
+                self.self_forced_generated_estimator,
+                self.self_forced_unfrozen_range,
+            )
+        if self.self_forced_target_teacher is not None:
+            self.self_forced_target_teacher.requires_grad_(False)
+        if self.self_forced_generator_ema is not None:
+            self.self_forced_generator_ema.requires_grad_(False)
 
     def _set_self_forced_auxiliary_modes(self) -> None:
         """self-forced 보조 모델의 기본 eval/frozen 상태를 정돈합니다.
@@ -1319,7 +1335,7 @@ class SMARTFlow(LightningModule):
         if self.self_forced_generator_ema is not None:
             self.self_forced_generator_ema.requires_grad_(False)
             self.self_forced_generator_ema.eval()
-        self._apply_self_forced_map_encoder_freeze()
+        self._apply_self_forced_unfrozen_range()
 
     def _copy_online_generator_to_ema(self) -> None:
         """현재 online Generator weight를 EMA Generator에 그대로 복사합니다."""
@@ -2958,7 +2974,7 @@ open_metric_dict:
             )
 
         if self.self_forced_enabled:
-            self._apply_self_forced_map_encoder_freeze()
+            self._apply_self_forced_unfrozen_range()
             generator_params = [param for param in self.encoder.parameters() if param.requires_grad]
             if not generator_params:
                 raise RuntimeError("No trainable generator parameters found for self-forced optimization.")

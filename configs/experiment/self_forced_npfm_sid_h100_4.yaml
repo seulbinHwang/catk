@@ -13,4 +13,5 @@ model:
       sid_normalizer_eps: 1.0e-3
       use_anchor_flow_matching_loss: false
       detach_block_transition: false
+      unfrozen_range: except_map_encoder
       use_control_space_physics_regularization: false

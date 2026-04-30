@@ -83,7 +83,7 @@ model_config:
     detach_block_transition: false
     estimator_updates_per_step: 5
     initialize_aux_from_generator_on_fit_start: true
-    freeze_map_encoder: true
+    unfrozen_range: except_map_encoder
     ema_weight: 0.99
     ema_start_step: 50
     # Manual gradient clip used inside self-forced training_step / estimator
