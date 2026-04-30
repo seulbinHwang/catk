@@ -365,11 +365,16 @@ def compute_metric_features_batched_scenes(
         # eval mask in simulated order (used for DNO/TTC and road/TL features) — keep on device
         eval_mask = torch.any(evaluated_ids[:, None].eq(sim_oid_dev[None, :]), dim=0)  # (A_i,) device
 
-        # local positions on CPU for indexing the CPU object_id tensor
-        local_eval_pos_cpu = eval_mask.cpu().nonzero(as_tuple=True)[0]  # (E_i,) CPU
-        eval_ids_in_order_cpu = sim_oid_cpu[local_eval_pos_cpu]  # (E_i,) CPU
+        # CRITICAL: evaluated must be ordered by `_eval_ids_list` (the official
+        # `submission_specs.get_evaluation_sim_agent_ids` order) so that downstream
+        # histogram likelihood comparisons align log_features and sim_features by
+        # the SAME agent at the same index. Previously this used sim_oid order,
+        # which silently mismatched the log-side `compute_metric_features` ordering
+        # for scenarios where the two orderings differ → meaningless histograms
+        # and meta_RMM underestimation.
+        eval_ids_in_order_cpu = torch.tensor(_eval_ids_list, dtype=torch.int64)
 
-        # Build evaluated in simulated order (must match DNO/TTC output order)
+        # Build evaluated in `_eval_ids_list` order (must match log-side ordering)
         evaluated = simulated.gather_objects_by_id(eval_ids_in_order_cpu)
 
         eval_logged = _trajectories_to_device(
@@ -385,6 +390,26 @@ def compute_metric_features_batched_scenes(
                     f"Scene {i}: simulated horizon ({_t_sim}) exceeds scenario log length ({_t_log})."
                 )
             eval_logged = eval_logged.slice_time(0, _t_sim)
+
+        # CRITICAL: also reorder `simulated` so eval agents come FIRST in `_eval_ids_list`
+        # order, matching single-scene `compute_metric_features`. This makes dno/ttc/d_road
+        # outputs (computed on simulated with eval_object_mask) come back in the same order
+        # as kinematic features (computed on `evaluated`). Without this, dno is in original
+        # simulated order while linear_speed is in _eval_ids_list order → histograms misalign.
+        non_eval_ids_cpu = torch.tensor(
+            [oid for oid in sim_oid_cpu.tolist() if oid not in set(_eval_ids_list)],
+            dtype=torch.int64,
+        )
+        if non_eval_ids_cpu.numel() > 0:
+            reordered_ids_cpu = torch.cat([eval_ids_in_order_cpu, non_eval_ids_cpu])
+        else:
+            reordered_ids_cpu = eval_ids_in_order_cpu
+        simulated = simulated.gather_objects_by_id(reordered_ids_cpu)
+
+        # eval_mask is now [True]*n_eval + [False]*n_non_eval
+        n_eval_i = int(eval_ids_in_order_cpu.numel())
+        eval_mask = torch.zeros(simulated.x.shape[0], dtype=torch.bool, device=device)
+        eval_mask[:n_eval_i] = True
 
         simulated_list.append(simulated)
         evaluated_list.append(evaluated)

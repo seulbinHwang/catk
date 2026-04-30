@@ -1464,7 +1464,8 @@ class SMARTFlow(LightningModule):
             pool.join()
 
         # Reshape: results are [sc0_r0, sc0_r1, ..., sc1_r0, ...] → [n_scenarios, G]
-        rmm = torch.tensor(results, dtype=torch.float32).reshape(n_scenarios, G)
+        meta_vals = [r["metametric"] for r in results]
+        rmm = torch.tensor(meta_vals, dtype=torch.float32).reshape(n_scenarios, G)
         return rmm
 
     def _compute_rmm_bptt_gt_fm_loss(
@@ -3801,11 +3802,12 @@ class SMARTFlow(LightningModule):
                     self.log(ref_rmm_key, ref_rmm, on_step=False, on_epoch=True, sync_dist=False)
                     self.log(delta_rmm_key, delta_rmm, on_step=False, on_epoch=True, sync_dist=False)
                     if self.global_rank == 0 and self.logger is not None:
-                        self.logger.log_metrics({
-                            ref_rmm_key: ref_rmm,
-                            delta_rmm_key: delta_rmm,
-                            "epoch": self.log_epoch if self.log_epoch >= 0 else self.current_epoch,
-                        })
+                        wandb_payload = dict(ref_epoch_metrics)
+                        wandb_payload[delta_rmm_key] = delta_rmm
+                        wandb_payload["epoch"] = (
+                            self.log_epoch if self.log_epoch >= 0 else self.current_epoch
+                        )
+                        self.logger.log_metrics(wandb_payload)
                     self.ref_sim_agents_metrics.reset()
 
             if self.sim_agents_submission.is_active:

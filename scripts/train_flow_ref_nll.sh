@@ -120,7 +120,7 @@ PY
 fi
 
 FLOW_SOLVER_METHOD="${FLOW_SOLVER_METHOD:-euler}"
-FLOW_SOLVER_STEPS="${FLOW_SOLVER_STEPS:-8}"
+FLOW_SOLVER_STEPS="${FLOW_SOLVER_STEPS:-16}"
 ROLLOUT_NOISE_SCALE="${ROLLOUT_NOISE_SCALE:-1.0}"
 
 # ── Ref-NLL 파라미터 ────────────────────────────────────────────────────────

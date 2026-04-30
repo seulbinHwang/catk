@@ -29,6 +29,20 @@ import torch
 from torch_geometric.utils import degree as _tg_degree
 
 
+_LIKELIHOOD_NAMES: List[str] = [
+    "linear_speed_likelihood",
+    "linear_acceleration_likelihood",
+    "angular_speed_likelihood",
+    "angular_acceleration_likelihood",
+    "distance_to_nearest_object_likelihood",
+    "collision_indication_likelihood",
+    "time_to_collision_likelihood",
+    "distance_to_road_edge_likelihood",
+    "offroad_indication_likelihood",
+    "traffic_light_violation_likelihood",
+]
+
+
 def _hard_load_and_log_feat_worker(scenario_file: str, challenge):
     """Worker for HardSimAgentsMetrics: load TFRecord scenario + compute log features.
 
@@ -63,8 +77,12 @@ def _sim_agents_worker(
     pred_traj_np: np.ndarray,
     pred_z_np: np.ndarray,
     pred_head_np: np.ndarray,
-) -> float:
-    """Subprocess worker: 모든 TF/proto 연산을 격리된 프로세스에서 실행합니다."""
+) -> Dict[str, Any]:
+    """Subprocess worker: 모든 TF/proto 연산을 격리된 프로세스에서 실행합니다.
+
+    Returns dict with keys: ``scenario_id``, ``metametric``, and every entry
+    of :data:`_LIKELIHOOD_NAMES`.
+    """
     import tensorflow as tf
     import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as wm
     from waymo_open_dataset.protos import (
@@ -106,7 +124,13 @@ def _sim_agents_worker(
         scenario_id=scenario.scenario_id,
     )
     result = wm.compute_scenario_metrics_for_bundle(config, scenario, scenario_rollout)
-    return float(result.metametric)
+    out: Dict[str, Any] = {
+        "scenario_id": scenario.scenario_id,
+        "metametric": float(result.metametric),
+    }
+    for name in _LIKELIHOOD_NAMES:
+        out[name] = float(getattr(result, name))
+    return out
 
 
 class SimAgentsMetrics:
@@ -122,7 +146,41 @@ class SimAgentsMetrics:
         self._config_bytes = self._load_config_bytes()
         self._metametric_sum: float = 0.0
         self._count: int = 0
+        self._per_metric_sums: Dict[str, float] = {n: 0.0 for n in _LIKELIHOOD_NAMES}
         self._is_mp_init: bool = False
+        # Persistent pool: WOSAC_REAL_POOL_WORKERS env (default = min(16, ncpu//2)).
+        # 0 disables pool (fall back to per-call pool).
+        self._pool: Any = None
+        _pw = int(os.environ.get("WOSAC_REAL_POOL_WORKERS", "-1"))
+        self._pool_workers = (
+            _pw if _pw >= 0 else max(1, min(16, (os.cpu_count() or 4) // 2))
+        )
+
+    def _get_pool(self):
+        if self._pool_workers <= 0:
+            return None
+        if self._pool is None:
+            self._ensure_mp_init()
+            try:
+                ctx = mp.get_context("forkserver")
+            except ValueError:
+                ctx = mp.get_context("spawn")
+            self._pool = ctx.Pool(processes=self._pool_workers)
+        return self._pool
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_pool"] = None
+        return state
+
+    def close_pool(self) -> None:
+        if self._pool is not None:
+            try:
+                self._pool.close()
+                self._pool.join()
+            except Exception:
+                pass
+            self._pool = None
 
     @staticmethod
     def _load_config_bytes() -> bytes:
@@ -173,45 +231,60 @@ class SimAgentsMetrics:
             for i in range(n_scenarios)
         ]
 
-        self._ensure_mp_init()
-        with mp.Pool(processes=max(1, n_scenarios)) as pool:
+        # 우선 persistent pool 사용. 없으면 fallback 으로 per-call pool.
+        pool = self._get_pool()
+        if pool is not None:
             results = pool.starmap(_sim_agents_worker, args)
-            pool.close()
-            pool.join()
+        else:
+            self._ensure_mp_init()
+            with mp.Pool(processes=max(1, n_scenarios)) as _local_pool:
+                results = _local_pool.starmap(_sim_agents_worker, args)
+                _local_pool.close()
+                _local_pool.join()
 
-        for metametric in results:
-            self._metametric_sum += metametric
+        for r in results:
+            self._metametric_sum += r["metametric"]
+            for name in _LIKELIHOOD_NAMES:
+                self._per_metric_sums[name] += r[name]
             self._count += 1
 
     def _drain_completed_futures(self, wait: bool = True, drain_all: bool = True) -> None:
         return None
 
     def get_state_tensor(self, device: torch.device) -> torch.Tensor:
-        """DDP all_reduce 용으로 [metametric_sum, count] 2-element tensor 반환."""
-        return torch.tensor(
-            [self._metametric_sum, float(self._count)],
-            device=device,
-            dtype=torch.float64,
-        )
+        """DDP all_reduce 용으로 [metametric_sum, count, *per_metric_sums] tensor 반환."""
+        vals = [self._metametric_sum, float(self._count)]
+        for name in _LIKELIHOOD_NAMES:
+            vals.append(self._per_metric_sums[name])
+        return torch.tensor(vals, device=device, dtype=torch.float64)
 
     def compute_from_state_tensor(self, reduced_metric_state: torch.Tensor) -> Dict[str, Any]:
-        """all_reduce 이후 [total_sum, total_count]로부터 평균 메트릭 계산."""
+        """all_reduce 이후 tensor로부터 metametric + per-likelihood 평균 계산."""
         total_count = reduced_metric_state[1].clamp_min(1.0)
-        value = (reduced_metric_state[0] / total_count).to(torch.float32)
-        return {self._metric_key: value}
+        result = {
+            self._metric_key: (reduced_metric_state[0] / total_count).to(torch.float32)
+        }
+        for j, name in enumerate(_LIKELIHOOD_NAMES):
+            key = f"{self.prefix}/sim_agents_2025/{name}"
+            result[key] = (reduced_metric_state[2 + j] / total_count).to(torch.float32)
+        return result
 
     def compute(self) -> Dict[str, Any]:
-        if self._count == 0:
-            return {self._metric_key: torch.tensor(0.0)}
-        return {
+        count = max(self._count, 1)
+        result = {
             self._metric_key: torch.tensor(
-                self._metametric_sum / self._count, dtype=torch.float32
+                self._metametric_sum / count, dtype=torch.float32
             )
         }
+        for name in _LIKELIHOOD_NAMES:
+            key = f"{self.prefix}/sim_agents_2025/{name}"
+            result[key] = torch.tensor(self._per_metric_sums[name] / count, dtype=torch.float32)
+        return result
 
     def reset(self) -> None:
         self._metametric_sum = 0.0
         self._count = 0
+        self._per_metric_sums = {n: 0.0 for n in _LIKELIHOOD_NAMES}
 
 
 class HardSimAgentsMetrics:
@@ -230,19 +303,6 @@ class HardSimAgentsMetrics:
 
     _SCENARIO_CACHE_MAX: int = 256
 
-    _LIKELIHOOD_NAMES = [
-        "linear_speed_likelihood",
-        "linear_acceleration_likelihood",
-        "angular_speed_likelihood",
-        "angular_acceleration_likelihood",
-        "distance_to_nearest_object_likelihood",
-        "collision_indication_likelihood",
-        "time_to_collision_likelihood",
-        "distance_to_road_edge_likelihood",
-        "offroad_indication_likelihood",
-        "traffic_light_violation_likelihood",
-    ]
-
     def __init__(self, prefix: str) -> None:
         self.prefix = prefix
         self._metric_key = f"{prefix}/sim_agents_2025/realism_meta_metric"
@@ -250,7 +310,7 @@ class HardSimAgentsMetrics:
         self._metametric_sum: float = 0.0
         self._count: int = 0
         self._scenario_cache: Dict[str, Any] = {}
-        self._per_metric_sums: Dict[str, float] = {n: 0.0 for n in self._LIKELIHOOD_NAMES}
+        self._per_metric_sums: Dict[str, float] = {n: 0.0 for n in _LIKELIHOOD_NAMES}
         # Persistent forkserver pool for parallel scenario load + log feature compute.
         # WOSAC_HARD_POOL_WORKERS env var (default = min(16, ncpu//2)). 0 disables pool.
         self._pool: Any = None
@@ -473,14 +533,67 @@ class HardSimAgentsMetrics:
             compute_wosac_metametric_from_features_torch,
         )
 
+        # Per-scenario meta-metric (Hard) and optional verification against official Real.
+        hard_per_scenario: List[float] = []
         for i in range(n_scenarios):
             result = compute_wosac_metametric_from_features_torch(
                 self._config, log_feat_dicts[i], sim_feat_dicts[i]
             )
-            self._metametric_sum += float(result.metametric)
-            for name in self._LIKELIHOOD_NAMES:
+            hm = float(result.metametric)
+            hard_per_scenario.append(hm)
+            self._metametric_sum += hm
+            for name in _LIKELIHOOD_NAMES:
                 self._per_metric_sums[name] += float(getattr(result, name))
             self._count += 1
+
+        # Verify mode: per-sub-metric Hard vs Real comparison via subprocess pool.
+        if os.environ.get("WOSAC_VERIFY") == "1":
+            # Lazy persistent pool reuse from SimAgentsMetrics (cheaper than a new pool).
+            if not hasattr(self, "_verify_pool"):
+                try:
+                    _ctx = mp.get_context("forkserver")
+                except ValueError:
+                    _ctx = mp.get_context("spawn")
+                self._verify_pool = _ctx.Pool(
+                    processes=int(os.environ.get("WOSAC_VERIFY_POOL", "4"))
+                )
+                self._verify_config_bytes = SimAgentsMetrics._load_config_bytes()
+
+            # Build Real call args per scenario.
+            real_args = []
+            for i in range(n_scenarios):
+                real_args.append((
+                    self._verify_config_bytes,
+                    scenario_files[i],
+                    id_splits[i].cpu().numpy(),
+                    pred_traj.split(sizes)[i].cpu().numpy(),
+                    pred_z.split(sizes)[i].cpu().numpy(),
+                    pred_head.split(sizes)[i].cpu().numpy(),
+                ))
+            from src.smart.metrics._verify_workers import real_full_metrics_worker as _vw
+            real_results = self._verify_pool.starmap(_vw, real_args)
+
+            _SHORT_NAMES = [
+                "linear_speed", "linear_acceleration", "angular_speed", "angular_acceleration",
+                "distance_to_nearest_object", "collision_indication", "time_to_collision",
+                "distance_to_road_edge", "offroad_indication", "traffic_light_violation",
+            ]
+            for i in range(n_scenarios):
+                hard_result = compute_wosac_metametric_from_features_torch(
+                    self._config, log_feat_dicts[i], sim_feat_dicts[i]
+                )
+                rr = real_results[i]
+                line_parts = [
+                    f"[VERIFY i={i} sc={rr['scenario_id'][:10]}]",
+                    f"meta H={hard_result.metametric:.4f} R={rr['metametric']:.4f} d={abs(hard_result.metametric-rr['metametric']):.4f}",
+                ]
+                for short in _SHORT_NAMES:
+                    h = float(getattr(hard_result, short + "_likelihood"))
+                    r = rr[short]
+                    d = abs(h - r)
+                    mark = "**" if d > 0.05 else ("*" if d > 0.01 else "")
+                    line_parts.append(f"{short[:8]}:H={h:.3f}/R={r:.3f}{mark}")
+                print(" | ".join(line_parts), flush=True)
 
     def _drain_completed_futures(self, wait: bool = True, drain_all: bool = True) -> None:
         return None
@@ -488,7 +601,7 @@ class HardSimAgentsMetrics:
     def get_state_tensor(self, device: torch.device) -> torch.Tensor:
         """DDP all_reduce 용으로 [metametric_sum, count, *per_metric_sums] tensor 반환."""
         vals = [self._metametric_sum, float(self._count)]
-        for name in self._LIKELIHOOD_NAMES:
+        for name in _LIKELIHOOD_NAMES:
             vals.append(self._per_metric_sums[name])
         return torch.tensor(vals, device=device, dtype=torch.float64)
 
@@ -498,7 +611,7 @@ class HardSimAgentsMetrics:
         result = {
             self._metric_key: (reduced_metric_state[0] / total_count).to(torch.float32)
         }
-        for j, name in enumerate(self._LIKELIHOOD_NAMES):
+        for j, name in enumerate(_LIKELIHOOD_NAMES):
             key = f"{self.prefix}/sim_agents_2025/{name}"
             result[key] = (reduced_metric_state[2 + j] / total_count).to(torch.float32)
         return result
@@ -508,7 +621,7 @@ class HardSimAgentsMetrics:
         result = {
             self._metric_key: torch.tensor(self._metametric_sum / count, dtype=torch.float32)
         }
-        for name in self._LIKELIHOOD_NAMES:
+        for name in _LIKELIHOOD_NAMES:
             key = f"{self.prefix}/sim_agents_2025/{name}"
             result[key] = torch.tensor(self._per_metric_sums[name] / count, dtype=torch.float32)
         return result
@@ -516,7 +629,7 @@ class HardSimAgentsMetrics:
     def reset(self) -> None:
         self._metametric_sum = 0.0
         self._count = 0
-        self._per_metric_sums = {n: 0.0 for n in self._LIKELIHOOD_NAMES}
+        self._per_metric_sums = {n: 0.0 for n in _LIKELIHOOD_NAMES}
 
 
 class SimAgentsSubmission:
