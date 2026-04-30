@@ -43,7 +43,7 @@ action: finetune
 
 model:
   model_config:
-    lr: 1e-6
+    lr: 5e-6
     n_rollout_closed_val: 16
     sim_agents_context_cache_size: 64
     n_vis_batch: 0
