@@ -433,6 +433,11 @@ def compute_metric_features_batched_scenes(
         dim=0,
     )  # (N_total,)
 
+    import os as _os, time as _time
+    _PROFILE = bool(int(_os.environ.get("WOSAC_PROFILE", "0")))
+    if _PROFILE and device.type == "cuda":
+        torch.cuda.synchronize()
+    _t_setup_done = _time.perf_counter() if _PROFILE else 0.0
     # ── Batched DNO ────────────────────────────────────────────────────────
     dno_flat = inter.compute_distance_to_nearest_object(
         center_x=flat_x, center_y=flat_y, center_z=flat_z,
@@ -484,6 +489,9 @@ def compute_metric_features_batched_scenes(
         / flat_vsteps
     )
 
+    if _PROFILE and device.type == "cuda":
+        torch.cuda.synchronize()
+    _t_dno_ttc_kin_done = _time.perf_counter() if _PROFILE else 0.0
     # ── Per-scene assembly (road edge + TL still per-scene; rest sliced) ─
     results = []
     for i in range(n_scenes):
@@ -601,6 +609,17 @@ def compute_metric_features_batched_scenes(
             offroad_per_step=is_offroad.unsqueeze(0),
             traffic_light_violation_per_step=tl_out.unsqueeze(0),
         ))
+
+    if _PROFILE:
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        _t_assembly_done = _time.perf_counter()
+        print(
+            f"[bs-profile] n_scenes={n_scenes} "
+            f"dno_ttc_kin={_t_dno_ttc_kin_done-_t_setup_done:.3f}s "
+            f"assembly_per_scene_loop(d_road+TL)={_t_assembly_done-_t_dno_ttc_kin_done:.3f}s",
+            flush=True,
+        )
 
     return results
 

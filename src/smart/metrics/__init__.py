@@ -463,11 +463,16 @@ class HardSimAgentsMetrics:
         from waymo_open_dataset.protos import scenario_pb2 as _scenario_pb2
 
         if pool is not None and n_scenarios > 1:
+            if bool(int(os.environ.get("WOSAC_PROFILE", "0"))):
+                import time as _time
+                _pool_t0 = _time.perf_counter()
             # value 가 protobuf enum → 정수로 직렬화해서 worker 에 전달
             results = pool.starmap(
                 _hard_load_and_log_feat_worker,
                 [(sf, _challenge) for sf in scenario_files],
             )
+            if bool(int(os.environ.get("WOSAC_PROFILE", "0"))):
+                print(f"[hard-rmm-profile] pool_starmap={_time.perf_counter()-_pool_t0:.2f}s n_scenes={n_scenarios}", flush=True)
             scenarios = []
             log_feat_dicts: List[dict] = []
             for sc_bytes, lf_dict in results:
@@ -486,8 +491,17 @@ class HardSimAgentsMetrics:
 
         # Sim features: for each rollout g, batch across all scenarios
         sim_feat_per_g: List[list] = []  # G lists, each of length n_scenarios
+        _PROFILE = bool(int(os.environ.get("WOSAC_PROFILE", "0")))
+        if _PROFILE:
+            import time as _time
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            _t0 = _time.perf_counter()
+            _per_g_times: list = []
         with torch.no_grad():
             for g in range(G):
+                if _PROFILE:
+                    torch.cuda.synchronize() if torch.cuda.is_available() else None
+                    _g_start = _time.perf_counter()
                 preds_g = [
                     PredictedSimTrajectories(
                         object_id=id_splits[i].cpu(),
@@ -503,6 +517,13 @@ class HardSimAgentsMetrics:
                     scenarios=scenarios, preds=preds_g, surrogate=None,
                 )
                 sim_feat_per_g.append(feat_list_g)
+                if _PROFILE:
+                    torch.cuda.synchronize() if torch.cuda.is_available() else None
+                    _per_g_times.append(_time.perf_counter() - _g_start)
+        if _PROFILE:
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
+            _t1 = _time.perf_counter()
+            print(f"[hard-rmm-profile] G_loop_total={_t1-_t0:.2f}s mean_per_g={sum(_per_g_times)/len(_per_g_times):.3f}s n_scenes={n_scenarios} G={G}", flush=True)
 
         # Stack G rollouts per scenario → (G, E_i, T) then batched hard RMM
         sim_feat_dicts: List[dict] = []
