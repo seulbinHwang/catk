@@ -68,10 +68,12 @@ def render_env_file(
         export_line("MASTER_PORT", args.master_port),
         export_line("TASK_NAME", task_name),
         export_line("CATK_EXPERIMENT", args.experiment),
+        export_line("CATK_ACTION", args.action),
         export_line("CATK_LR", args.learning_rate),
         export_line("LOG_DIR", args.log_dir),
     ]
     optional_env = {
+        "CATK_CKPT_PATH": args.ckpt_path,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
         "SOFT_LIMIT_RATIO": args.soft_limit_ratio,
@@ -260,6 +262,8 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(pull=True)
     parser.add_argument("--cache-root", default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--pretrain-ckpt", default="")
+    parser.add_argument("--action", choices=["finetune", "fit"], default="finetune")
+    parser.add_argument("--ckpt-path", default="")
     parser.add_argument("--experiment", default="finetune_draft_flow_v100x8")
     parser.add_argument("--task-name", default="")
     parser.add_argument("--session", default="catk-draft-multinode")
@@ -285,8 +289,10 @@ def parse_args() -> argparse.Namespace:
 
     if len(args.pods) < 2 and not args.stop:
         parser.error("--pods must contain at least two pods for multi-node training")
-    if not args.pretrain_ckpt and not args.stop:
-        parser.error("--pretrain-ckpt is required unless --stop is set")
+    if not args.pretrain_ckpt and not args.ckpt_path and not args.stop:
+        parser.error("--pretrain-ckpt or --ckpt-path is required unless --stop is set")
+    if args.action == "fit" and not args.ckpt_path and not args.stop:
+        parser.error("--ckpt-path is required when --action=fit")
     if args.nproc_per_node < 1:
         parser.error("--nproc-per-node must be >= 1")
     if args.monitor_interval < 1:

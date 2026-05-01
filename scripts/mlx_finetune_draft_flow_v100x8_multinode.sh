@@ -79,7 +79,6 @@ main() {
     activate_conda_if_available
 
     require_env CACHE_ROOT
-    require_env PRETRAIN_CKPT
 
     local nnodes="${PET_NNODES:-${NNODES:-1}}"
     local nproc_per_node="${PET_NPROC_PER_NODE:-${NPROC_PER_NODE:-8}}"
@@ -91,6 +90,8 @@ main() {
     local master_port="${MASTER_PORT:-29500}"
     local task_name="${TASK_NAME:-flow_semi_continuous_finetune_v100x8x${nnodes}}"
     local experiment="${CATK_EXPERIMENT:-finetune_draft_flow_v100x8}"
+    local action="${CATK_ACTION:-finetune}"
+    local ckpt_path="${CATK_CKPT_PATH:-${PRETRAIN_CKPT:-}}"
     local lr="${CATK_LR:-auto}"
 
     if [[ "$nnodes" -gt 1 && -z "$node_rank" && -z "$rdzv_endpoint" ]]; then
@@ -106,8 +107,16 @@ main() {
         log "ERROR: CACHE_ROOT does not exist in this pod: $CACHE_ROOT"
         exit 2
     fi
-    if [[ ! -f "$PRETRAIN_CKPT" ]]; then
-        log "ERROR: PRETRAIN_CKPT does not exist in this pod: $PRETRAIN_CKPT"
+    if [[ "$action" != "finetune" && "$action" != "fit" ]]; then
+        log "ERROR: CATK_ACTION must be finetune or fit, got: $action"
+        exit 2
+    fi
+    if [[ -z "$ckpt_path" ]]; then
+        log "ERROR: PRETRAIN_CKPT or CATK_CKPT_PATH must be set."
+        exit 2
+    fi
+    if [[ ! -f "$ckpt_path" ]]; then
+        log "ERROR: checkpoint does not exist in this pod: $ckpt_path"
         exit 2
     fi
 
@@ -123,6 +132,7 @@ main() {
 
     log "starting CAT-K multi-node fine-tune"
     log "  experiment:       $experiment"
+    log "  action:           $action"
     log "  task_name:        $task_name"
     log "  nnodes:           $nnodes"
     log "  nproc_per_node:   $nproc_per_node"
@@ -137,7 +147,7 @@ main() {
         log "  rdzv_endpoint:    ${rdzv_endpoint:-<empty>}"
     fi
     log "  cache_root:       $CACHE_ROOT"
-    log "  pretrain_ckpt:    $PRETRAIN_CKPT"
+    log "  ckpt_path:        $ckpt_path"
     log "  lr:               $lr"
 
     local torchrun_args=(
@@ -165,12 +175,12 @@ main() {
     torchrun_args+=(
         -m src.run
         experiment="$experiment"
-        action=finetune
+        action="$action"
         trainer=ddp
         trainer.devices="$nproc_per_node"
         trainer.num_nodes="$nnodes"
         paths.cache_root="$CACHE_ROOT"
-        ckpt_path="$PRETRAIN_CKPT"
+        ckpt_path="$ckpt_path"
         task_name="$task_name"
         model.model_config.lr="$lr"
     )

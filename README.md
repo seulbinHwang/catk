@@ -118,6 +118,7 @@ V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 수 
 관련 스크립트:
 
 - `scripts/launch_mlx_static_pods_tmux.py`: 이미 떠 있는 고정 Pod에 tmux 세션을 만들고 static `torchrun`을 시작합니다.
+- `scripts/launch_mlx_static_pods_bs_sweep.py`: 고정 Pod에서 `train_batch_size`를 키워 시도하고, CUDA OOM이면 batch size를 낮춰 재시작/재개합니다.
 - `scripts/render_mlx_finetune_pytorchjob.py`: 새 worker Pod를 만드는 Kubeflow `PyTorchJob` YAML을 생성합니다.
 - `scripts/mlx_finetune_draft_flow_v100x8_multinode.sh`: 각 worker 안에서 실제 `torchrun`을 실행하는 공통 wrapper입니다.
 
@@ -178,6 +179,55 @@ python scripts/launch_mlx_static_pods_tmux.py \
 ```
 
 기본적으로 런처는 각 Pod에서 `origin/<branch>`를 fetch/pull 합니다. Pod 안 repo에 실험용 로컬 수정이 있어서 pull하면 안 되는 경우에만 `--no-pull`을 붙이세요.
+
+#### Case 1-A. `testv`, `testvv`에서 train_batch_size OOM sweep
+
+V100 32GB 메모리 여유를 더 쓰고 싶으면 `train_batch_size=36`부터 시작해 CUDA OOM이 날 때마다 `8`씩 낮추는 자동 sweep을 쓸 수 있습니다. 이 스크립트는 기존 static tmux launcher를 반복 호출합니다.
+
+기본 동작:
+
+- 첫 시도: `train_batch_size=36`, `accumulate_grad_batches=1`, `action=finetune`
+- OOM 감지: `train_batch_size -= 8`
+- 재개 checkpoint가 있으면: `action=fit`, `ckpt_path=<latest epoch_last.ckpt>`
+- 재개 checkpoint가 아직 없으면: 더 작은 batch size로 pretrained checkpoint에서 epoch 0 재시도
+- non-OOM 에러: batch size를 낮춰도 해결되지 않는 문제로 보고 중단
+
+주의: `epoch_last.ckpt`는 train epoch이 끝난 뒤 저장됩니다. 따라서 mid-epoch OOM은 정확히 그 batch에서 재개하는 것이 아니라, **마지막으로 완료된 epoch checkpoint**에서 재개합니다. 0 epoch 중 OOM이 나서 checkpoint가 없으면 더 작은 batch size로 처음부터 다시 시작합니다.
+
+현재 2-node 기본 run은 `12 * 16 GPUs * accumulate 3 = 576` effective batch입니다. sweep의 첫 시도는 `36 * 16 GPUs * accumulate 1 = 576`이라 effective batch를 유지하면서 per-GPU batch를 키우는 설정입니다.
+
+실행 예시:
+
+```bash
+cd /path/to/catk
+
+nohup python -u scripts/launch_mlx_static_pods_bs_sweep.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --soft-limit-ratio 0.8 \
+  --learning-rate 2e-4 \
+  --start-batch-size 36 \
+  --batch-step 8 \
+  --min-batch-size 4 \
+  --accumulate-grad-batches 1 \
+  --task-name catk_draft_v100x8x2_soft_limit_ratio_0.8_bs_sweep \
+  --session catk-draft-bs-sweep \
+  > /tmp/catk_draft_v100x8x2_bs_sweep.log 2>&1 &
+
+tail -f /tmp/catk_draft_v100x8x2_bs_sweep.log
+```
+
+현재 attempt의 training stdout/tqdm은 master Pod인 `testv`의 tmux에서 봅니다.
+
+```bash
+kubectl exec -it -n p-pnc testv -c main -- tmux attach -t catk-draft-bs-sweep
+```
+
+worker Pod인 `testvv`는 global rank 8-15만 갖기 때문에 Lightning progress bar가 기본적으로 출력되지 않습니다. 그래도 학습에는 참여 중이며 GPU heartbeat pane이나 `nvidia-smi`로 사용률을 확인할 수 있습니다.
 
 #### Case 2. 아직 worker Pod가 없는 경우
 
