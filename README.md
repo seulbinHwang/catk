@@ -104,6 +104,61 @@
 ... model.model_config.draft.physics.soft_limit_ratio=0.75
 ```
 
+### MLX PyTorchJob Multi-Node V100x8 Fine-Tuning
+
+V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 때는 기존 `testv`, `testvv`에 각각 접속해서 수동 실행하지 말고, Kubeflow `PyTorchJob` 하나를 생성하세요. PyTorchJob이 worker Pod를 N개 만들고 rendezvous 주소를 자동으로 주입하므로 각 노드 IP를 몰라도 됩니다.
+
+추가된 파일:
+
+- `scripts/render_mlx_finetune_pytorchjob.py`: MLX용 PyTorchJob YAML 생성기입니다.
+- `scripts/mlx_finetune_draft_flow_v100x8_multinode.sh`: 각 worker Pod 안에서 실행되는 `torchrun` wrapper입니다.
+
+먼저 짧은 연결 테스트를 권장합니다. 아래 예시는 V100x8 worker 2개, 전체 16 GPU입니다.
+
+```bash
+cd /mnt/nuplan/projects/catk
+
+python scripts/render_mlx_finetune_pytorchjob.py \
+  --workers 2 \
+  --job-name catk-draft-v100x8x2-smoke \
+  --namespace p-pnc \
+  --zone private-v100-naverlabs-0 \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /path/to/pretrained_flow.ckpt \
+  --limit-train-batches 40 \
+  --limit-val-batches 0 \
+  --output /tmp/catk-draft-v100x8x2-smoke.yaml
+
+kubectl apply -f /tmp/catk-draft-v100x8x2-smoke.yaml
+```
+
+상태와 로그 확인:
+
+```bash
+kubectl get pytorchjob catk-draft-v100x8x2-smoke -n p-pnc
+kubectl get pods -n p-pnc | grep catk-draft-v100x8x2-smoke
+kubectl logs -f catk-draft-v100x8x2-smoke-worker-0 -c pytorch -n p-pnc
+```
+
+smoke test가 붙으면 full run은 batch 제한만 빼고 실행합니다.
+
+```bash
+python scripts/render_mlx_finetune_pytorchjob.py \
+  --workers N \
+  --job-name catk-draft-v100x8xN \
+  --namespace p-pnc \
+  --zone private-v100-naverlabs-0 \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /path/to/pretrained_flow.ckpt \
+  --output /tmp/catk-draft-v100x8xN.yaml
+
+kubectl apply -f /tmp/catk-draft-v100x8xN.yaml
+```
+
+기본 실행은 `experiment=finetune_draft_flow_v100x8`, `trainer=ddp`, `trainer.devices=8`, `trainer.num_nodes=N`으로 고정됩니다. `--learning-rate auto`가 기본이며, V100x8 단일 노드 기준 `2e-4`에서 node 수만큼 linear scaling합니다. 즉 N=2면 `4e-4`, N=3이면 `6e-4`입니다. 보수적으로 가고 싶으면 `--learning-rate 2e-4`처럼 직접 고정하세요.
+
+기존 `testv`, `testvv` Pod가 GPU를 점유 중이면 새 PyTorchJob이 Pending일 수 있습니다. GPU를 비우려면 삭제해야 하지만, 데이터가 그 Pod의 `emptyDir` 안에만 있으면 함께 사라집니다. PyTorchJob worker가 새로 뜬 뒤에도 `--cache-root`와 `--pretrain-ckpt` 경로가 모든 worker Pod 안에서 똑같이 보여야 합니다.
+
 ## 2. 환경 설치
 
 권장 환경:
