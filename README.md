@@ -159,6 +159,32 @@ kubectl apply -f /tmp/catk-draft-v100x8xN.yaml
 
 기존 `testv`, `testvv` Pod가 GPU를 점유 중이면 새 PyTorchJob이 Pending일 수 있습니다. GPU를 비우려면 삭제해야 하지만, 데이터가 그 Pod의 `emptyDir` 안에만 있으면 함께 사라집니다. PyTorchJob worker가 새로 뜬 뒤에도 `--cache-root`와 `--pretrain-ckpt` 경로가 모든 worker Pod 안에서 똑같이 보여야 합니다.
 
+이미 떠 있는 고정 Pod 두 개를 그대로 써야 하고 두 Pod 안에 cache/checkpoint가 모두 있다면, DNS 이슈를 피하기 위해 static torchrun 모드를 쓸 수 있습니다. `testv`를 rank 0, `testvv`를 rank 1로 두고 둘 다 같은 `MASTER_ADDR`/`MASTER_PORT`를 씁니다.
+
+```bash
+# testv 안에서
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
+export NNODES=2
+export NPROC_PER_NODE=8
+export NODE_RANK=0
+export MASTER_ADDR=<testv-pod-ip>
+export MASTER_PORT=29503
+export TASK_NAME=catk_draft_v100x8x2
+bash scripts/mlx_finetune_draft_flow_v100x8_multinode.sh
+
+# testvv 안에서
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
+export NNODES=2
+export NPROC_PER_NODE=8
+export NODE_RANK=1
+export MASTER_ADDR=<testv-pod-ip>
+export MASTER_PORT=29503
+export TASK_NAME=catk_draft_v100x8x2
+bash scripts/mlx_finetune_draft_flow_v100x8_multinode.sh
+```
+
 ## 2. 환경 설치
 
 권장 환경:

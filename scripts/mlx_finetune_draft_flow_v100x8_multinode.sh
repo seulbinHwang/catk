@@ -86,12 +86,20 @@ main() {
     local rdzv_id="${PET_RDZV_ID:-${RDZV_ID:-catk-draft-flow}}"
     local rdzv_backend="${PET_RDZV_BACKEND:-${RDZV_BACKEND:-c10d}}"
     local rdzv_endpoint="${PET_RDZV_ENDPOINT:-${RDZV_ENDPOINT:-}}"
+    local node_rank="${NODE_RANK:-}"
+    local master_addr="${MASTER_ADDR:-}"
+    local master_port="${MASTER_PORT:-29500}"
     local task_name="${TASK_NAME:-flow_semi_continuous_finetune_v100x8x${nnodes}}"
     local experiment="${CATK_EXPERIMENT:-finetune_draft_flow_v100x8}"
     local lr="${CATK_LR:-auto}"
 
-    if [[ "$nnodes" -gt 1 && -z "$rdzv_endpoint" ]]; then
-        log "ERROR: PET_RDZV_ENDPOINT/RDZV_ENDPOINT is required for multi-node torchrun."
+    if [[ "$nnodes" -gt 1 && -z "$node_rank" && -z "$rdzv_endpoint" ]]; then
+        log "ERROR: multi-node elastic mode requires PET_RDZV_ENDPOINT/RDZV_ENDPOINT."
+        log "       For existing fixed pods, set NODE_RANK, MASTER_ADDR, and MASTER_PORT instead."
+        exit 2
+    fi
+    if [[ -n "$node_rank" && -z "$master_addr" ]]; then
+        log "ERROR: static multi-node mode requires MASTER_ADDR when NODE_RANK is set."
         exit 2
     fi
     if [[ ! -d "$CACHE_ROOT" ]]; then
@@ -118,8 +126,16 @@ main() {
     log "  task_name:        $task_name"
     log "  nnodes:           $nnodes"
     log "  nproc_per_node:   $nproc_per_node"
-    log "  rdzv_backend:     $rdzv_backend"
-    log "  rdzv_endpoint:    ${rdzv_endpoint:-<empty>}"
+    if [[ -n "$node_rank" ]]; then
+        log "  launch_mode:      static"
+        log "  node_rank:        $node_rank"
+        log "  master_addr:      $master_addr"
+        log "  master_port:      $master_port"
+    else
+        log "  launch_mode:      elastic"
+        log "  rdzv_backend:     $rdzv_backend"
+        log "  rdzv_endpoint:    ${rdzv_endpoint:-<empty>}"
+    fi
     log "  cache_root:       $CACHE_ROOT"
     log "  pretrain_ckpt:    $PRETRAIN_CKPT"
     log "  lr:               $lr"
@@ -127,11 +143,19 @@ main() {
     local torchrun_args=(
         --nnodes "$nnodes"
         --nproc_per_node "$nproc_per_node"
-        --rdzv_id "$rdzv_id"
-        --rdzv_backend "$rdzv_backend"
     )
 
-    if [[ -n "$rdzv_endpoint" ]]; then
+    if [[ -n "$node_rank" ]]; then
+        torchrun_args+=(
+            --node_rank "$node_rank"
+            --master_addr "$master_addr"
+            --master_port "$master_port"
+        )
+    else
+        torchrun_args+=(
+            --rdzv_id "$rdzv_id"
+            --rdzv_backend "$rdzv_backend"
+        )
         torchrun_args+=(--rdzv_endpoint "$rdzv_endpoint")
     fi
     if [[ -n "${LOCAL_ADDR:-}" ]]; then
