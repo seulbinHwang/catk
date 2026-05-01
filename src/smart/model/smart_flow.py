@@ -86,23 +86,6 @@ class SMARTFlow(LightningModule):
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
-        self.nonfinite_fm_loss_policy = str(
-            getattr(model_config, "nonfinite_fm_loss_policy", "raise")
-        ).lower()
-        if self.nonfinite_fm_loss_policy not in {"raise", "skip"}:
-            raise ValueError(
-                "model_config.nonfinite_fm_loss_policy must be 'raise' or 'skip', "
-                f"got {self.nonfinite_fm_loss_policy!r}."
-            )
-        self.nonfinite_gradient_policy = str(
-            getattr(model_config, "nonfinite_gradient_policy", "raise")
-        ).lower()
-        if self.nonfinite_gradient_policy not in {"raise", "zero"}:
-            raise ValueError(
-                "model_config.nonfinite_gradient_policy must be 'raise' or 'zero', "
-                f"got {self.nonfinite_gradient_policy!r}."
-            )
-
         draft_config = getattr(model_config, "draft", None)
         self.draft_enabled = bool(draft_config is not None and getattr(draft_config, "enabled", False))
         self.draft_loss_enabled = self.draft_enabled and bool(getattr(draft_config, "loss_enabled", True))
@@ -355,26 +338,6 @@ class SMARTFlow(LightningModule):
         )
         sample_count = int(pred_dict["flow_clean_norm"].shape[0])
         return loss, metric_dict, sample_count
-
-    @staticmethod
-    def _zero_loss_connected_to_pred(pred_dict: Dict[str, Tensor]) -> Tensor:
-        """Return a finite zero loss that keeps the training graph connected."""
-        pred = pred_dict["flow_pred_norm"]
-        if pred.numel() == 0:
-            return pred.sum() * 0.0
-        return torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
-
-    @staticmethod
-    def _sanitize_scalar_metric_dict(metric_dict: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        return {
-            name: torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
-            for name, value in metric_dict.items()
-        }
-
-    def _zero_nonfinite_gradients(self) -> None:
-        for param in self.parameters():
-            if param.grad is not None and not torch.isfinite(param.grad).all():
-                param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _update_weighted_validation_metrics(
         self,
@@ -1358,15 +1321,8 @@ open_metric_dict:
     Dict[str, Tensor]
         """
         fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
-        skipped_nonfinite_fm_loss = fm_loss.detach().new_zeros(())
-        skipped_nonfinite_fm_loss_bool = False
         if not torch.isfinite(fm_loss):
-            if self.nonfinite_fm_loss_policy == "raise":
-                raise RuntimeError(f"Non-finite fm_loss detected: {self._summarize_nonfinite_tensor(fm_loss)}")
-            skipped_nonfinite_fm_loss = fm_loss.detach().new_ones(())
-            skipped_nonfinite_fm_loss_bool = True
-            fm_loss = self._zero_loss_connected_to_pred(pred)
-            open_metric_dict = self._sanitize_scalar_metric_dict(open_metric_dict)
+            raise RuntimeError(f"Non-finite fm_loss detected: {self._summarize_nonfinite_tensor(fm_loss)}")
 
         draft_weight = self._get_draft_loss_weight()
         """ physics_dict : Dict[str, Tensor] # 모든 값은 scalar tensor
@@ -1383,7 +1339,7 @@ open_metric_dict:
         """
         physics_dict = self._build_zero_draft_metrics(fm_loss)
         total_loss = fm_loss
-        if draft_weight > 0.0 and not skipped_nonfinite_fm_loss_bool:
+        if draft_weight > 0.0:
             physics_dict = self._compute_draft_training_loss(
                 pred_dict=pred,
                 tokenized_map=tokenized_map,
@@ -1416,14 +1372,6 @@ open_metric_dict:
             sync_dist=True,
             batch_size=1,
         )
-        self.log(
-            "train/nonfinite_fm_loss_skipped",
-            skipped_nonfinite_fm_loss,
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
         if self.draft_enabled:
             self._log_draft_training_metrics(
                 draft_weight=draft_weight,
@@ -1432,14 +1380,11 @@ open_metric_dict:
         return total_loss
 
     def on_after_backward(self) -> None:
-        """역전파 직후 non-finite gradient를 설정에 따라 처리합니다."""
+        """역전파 직후 non-finite gradient를 fail-fast로 감지합니다."""
         bad_grad = self._find_first_nonfinite_gradient()
         if bad_grad is None:
             return
         bad_name, bad_tensor = bad_grad
-        if self.nonfinite_gradient_policy == "zero":
-            self._zero_nonfinite_gradients()
-            return
         raise RuntimeError(
             "Detected non-finite gradient after backward: "
             f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
