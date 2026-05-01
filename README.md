@@ -59,6 +59,22 @@
   token chunk export를 유지합니다.
 
 
+
+### DRaFT Top-K Feasibility Loss
+
+- DRaFT physics loss는 기본적으로 2초 미래 20개 시점의 물리 위반을 평균합니다.
+- `model.model_config.draft.physics.topk_violation_k` 를 줄이면 각 agent 안에서 물리 위반이 큰 상위 K개 시점도 함께 봅니다.
+- 최종 physics loss는 `0.5 * (기존 시간 평균 loss + 상위-K 위반 loss)` 입니다.
+- 기본값은 `topk_violation_k=20` 입니다. 20개 시점을 모두 보므로 기존 로직과 같은 값으로 동작합니다.
+- 한두 프레임의 급가속, 급회전, 순간 점프가 평균에 묻히는 문제를 줄이고 싶으면 `topk_violation_k=4`부터 비교하는 것을 권장합니다.
+- 이 설정은 `draft.max_weight`, sampling step, sampling method, backprop_last_k, batch size, learning rate를 바꾸지 않습니다.
+
+예시:
+
+```bash
+... model.model_config.draft.physics.topk_violation_k=4
+```
+
 ## 2. 환경 설치
 
 권장 환경:
