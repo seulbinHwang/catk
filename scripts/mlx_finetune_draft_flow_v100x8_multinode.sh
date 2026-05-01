@@ -92,6 +92,7 @@ main() {
     local task_name="${TASK_NAME:-flow_semi_continuous_finetune_v100x8x${nnodes}}"
     local experiment="${CATK_EXPERIMENT:-finetune_draft_flow_v100x8}"
     local lr="${CATK_LR:-auto}"
+    local nonfinite_fm_loss_policy="${NONFINITE_FM_LOSS_POLICY:-skip}"
 
     if [[ "$nnodes" -gt 1 && -z "$node_rank" && -z "$rdzv_endpoint" ]]; then
         log "ERROR: multi-node elastic mode requires PET_RDZV_ENDPOINT/RDZV_ENDPOINT."
@@ -139,6 +140,7 @@ main() {
     log "  cache_root:       $CACHE_ROOT"
     log "  pretrain_ckpt:    $PRETRAIN_CKPT"
     log "  lr:               $lr"
+    log "  nonfinite_fm:     $nonfinite_fm_loss_policy"
 
     local torchrun_args=(
         --nnodes "$nnodes"
@@ -173,6 +175,7 @@ main() {
         ckpt_path="$PRETRAIN_CKPT"
         task_name="$task_name"
         model.model_config.lr="$lr"
+        model.model_config.nonfinite_fm_loss_policy="$nonfinite_fm_loss_policy"
     )
 
     if [[ -n "${LOG_DIR:-}" ]]; then
