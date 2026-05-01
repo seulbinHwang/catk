@@ -53,7 +53,7 @@ model:
       enabled: true
       start_epoch: 0
       weight: 1.0
-      path_step_size: 0.01
+      path_step_size: 0.25
       clean_dmd_normalizer_eps: 1.0e-3
       clean_dmd_tau_low: 0.02
       clean_dmd_tau_high: 0.98
