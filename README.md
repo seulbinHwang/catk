@@ -45,6 +45,12 @@
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
+### TODO: Motion Missingness Feature
+
+- 현재 flow encoder는 invalid context step과 valid context step 사이의 motion을 `0`으로 두어 `(0, 0)` padding에서 global 좌표로 튀는 가짜 초대형 motion을 막습니다.
+- 장기적으로는 `motion value = 0`에 더해 `motion_valid = false` 같은 별도 feature를 추가해, 실제 정지 agent와 이전 motion을 알 수 없는 agent를 구분하는 편이 더 완전합니다.
+- 다만 이 방식은 motion embedding input dimension을 바꾸므로 기존 pretrained checkpoint와 바로 호환되지 않습니다. 새 pretraining을 처음부터 설계할 때 검토할 TODO로 둡니다.
+
 ### Closed-loop Retokenize Rule
 
 - `retokenize` 자체는 **현재 실제 coarse 상태 + 이번 0.5초 raw FM commit 5점**을 합친 6개 점 경로를 기준으로 

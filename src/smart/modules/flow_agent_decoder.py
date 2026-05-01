@@ -127,13 +127,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
 
         if motion_a is None:
-            motion_a = torch.cat(
-                [
-                    pos_a.new_zeros(pos_a.shape[0], 1, pos_a.shape[-1]),
-                    pos_a[:, 1:] - pos_a[:, :-1],
-                ],
-                dim=1,
-            )
+            motion_a = self._build_motion_vector(pos_a, mask)
         else:
             if motion_a.shape != pos_a.shape:
                 raise ValueError(
@@ -578,6 +572,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_vector_a=head_vector_a, # ctx_sampled_heading
             agent_type=tokenized_agent["type"],
             agent_shape=tokenized_agent["shape"],
+            valid_mask=mask,
         )
 
         edge_index_t, r_t = self.build_temporal_edge(
@@ -598,6 +593,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_vector_a=head_vector_a, # ctx_sampled_heading
             batch_s=batch_s_a2a,
             mask=mask,
+            motion_a=self._build_motion_vector(pos_a, mask),
         )
         edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
             pos_pl=map_feature["position"],
@@ -722,6 +718,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_vector_a=head_vector_window,
             agent_type=tokenized_agent["type"],
             agent_shape=tokenized_agent["shape"],
+            valid_mask=valid_window,
             inference=True,
         )
 
@@ -754,6 +751,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_vector_a=head_vector_window,
             batch_s=batch_s_a2a,
             mask=valid_window,
+            motion_a=self._build_motion_vector(pos_window, valid_window),
         )
 
         feat_map = map_feature["pt_token"]
@@ -1184,6 +1182,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next.unsqueeze(1)], dim=1)
 
             motion_vector_a = pos_window[:, -1] - pos_window[:, -2]
+            motion_valid_a = valid_window[:, -1] & valid_window[:, -2]
+            motion_vector_a = motion_vector_a.masked_fill(
+                ~motion_valid_a.unsqueeze(-1),
+                0.0,
+            )
             x_a = torch.stack(
                 [
                     torch.norm(motion_vector_a, p=2, dim=-1),
