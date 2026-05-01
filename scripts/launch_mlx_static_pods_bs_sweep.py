@@ -105,6 +105,28 @@ def latest_progress(text: str) -> str:
     return matches[-1] if matches else ""
 
 
+def session_exists(args: argparse.Namespace, pod: str) -> bool:
+    result = subprocess.run(
+        [
+            "kubectl",
+            "exec",
+            "-n",
+            args.namespace,
+            pod,
+            "-c",
+            args.container,
+            "--",
+            "tmux",
+            "has-session",
+            "-t",
+            args.session,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
 def classify_logs(logs: dict[str, str]) -> tuple[str, str]:
     all_text = "\n".join(logs.values())
     oom = bool(OOM_RE.search(all_text))
@@ -232,6 +254,11 @@ def monitor_attempt(args: argparse.Namespace, *, attempt: int, batch_size: int) 
     while True:
         logs = {pod: read_remote_log(args, pod) for pod in args.pods}
         state, detail = classify_logs(logs)
+        if state in {"running", "running_oom_seen"} and not any(
+            session_exists(args, pod) for pod in args.pods
+        ):
+            state = "failed"
+            detail = "tmux sessions disappeared before runner exit status was logged"
         if state in {"success", "oom", "failed"}:
             if state == "failed" and args.failure_grace_seconds > 0:
                 time.sleep(args.failure_grace_seconds)
