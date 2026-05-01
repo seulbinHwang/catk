@@ -48,7 +48,7 @@ model:
     # Optimizer / scheduler --------------------------------------------------
     # Effective global batch here is 36 * 4 * 2 = 288 (identical to the
     # 6xH100 preset), so the same lr=2e-4 applies unchanged.
-    lr: 2e-4
+    lr: 2.7e-4
     lr_warmup_steps: 2
     lr_min_ratio: 1e-2
 
@@ -85,7 +85,7 @@ model:
       loss_enabled: true
       start_epoch: 0
       ramp_epochs: 32
-      max_weight: 0.5
+      max_weight: 0.2
       sampling:
         sample_steps: 32
         sample_method: euler
@@ -155,7 +155,7 @@ data:
   #     the known-good prior fine-tune checkpoint.
   # If training proves stable and you want speed back, swap to bs=54 acc=1
   # lr=1.5e-4 (all three together so the linear scaling rule stays intact).
-  train_batch_size: 36
+  train_batch_size: 72
   # Per-GPU validation batch. Closed-loop rollout memory scales with
   # val_batch_size * n_rollout_closed_val (=128 rollouts materialized per
   # rank at once). 8 is the largest value we verified without OOM on A100.
