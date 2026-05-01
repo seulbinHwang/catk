@@ -26,8 +26,8 @@ from src.smart.modules.draft_physics import (
     DRAFT_PHYSICS_ACTUAL_UNIT_KEYS,
     DRAFT_PHYSICS_COMPONENT_KEYS,
 )
-from src.smart.modules.draft_physics_topk import (
-    TopKDraftPhysicsRegularizer as DraftPhysicsRegularizer,
+from src.smart.modules.draft_physics_soft_limit import (
+    SoftLimitTopKDraftPhysicsRegularizer as DraftPhysicsRegularizer,
 )
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
@@ -151,6 +151,7 @@ class SMARTFlow(LightningModule):
                 pedestrian_heading_speed_threshold_mps=float(
                     getattr(draft_physics, "pedestrian_heading_speed_threshold_mps", 0.5)
                 ),
+                soft_limit_ratio=float(getattr(draft_physics, "soft_limit_ratio", 1.0)),
                 topk_violation_k=int(getattr(draft_physics, "topk_violation_k", 20)),
                 eps=float(getattr(draft_physics, "eps", 1e-6)),
             )

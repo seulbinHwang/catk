@@ -75,6 +75,30 @@
 ... model.model_config.draft.physics.topk_violation_k=4
 ```
 
+### DRaFT Soft-Limit Ratio
+
+- DRaFT physics hard loss는 물리량을 한계값으로 나눈 뒤 `1.0`을 넘은 초과분에 벌점을 줍니다.
+- `model.model_config.draft.physics.soft_limit_ratio` 는 이 벌점 시작점을 낮추는 값입니다.
+- 물리량 `z_t`, hard limit `z_max`, soft-limit 비율 `rho` 에 대해 손실은 `max(0, z_t / z_max - rho)^2` 입니다.
+- 기본값은 `soft_limit_ratio=1.0` 입니다. 이 값이면 기존 hard-only 방식과 동일하게 동작합니다.
+- `soft_limit_ratio=0.85` 이면 hard limit의 85%를 넘는 순간부터 벌점이 생깁니다.
+- 보수적인 시작점은 `0.85`, 더 강한 시작점은 `0.75`를 권장합니다.
+- 너무 낮추면 실제로 가능한 빠른 움직임까지 억제할 수 있습니다.
+- 이 설정은 `draft.max_weight`, sampling step, sampling method, backprop_last_k, batch size, learning rate를 바꾸지 않습니다.
+
+예시:
+
+```bash
+# 기존 hard-only와 동일
+... model.model_config.draft.physics.soft_limit_ratio=1.0
+
+# 보수적 soft-limit
+... model.model_config.draft.physics.soft_limit_ratio=0.85
+
+# 더 강한 soft-limit
+... model.model_config.draft.physics.soft_limit_ratio=0.75
+```
+
 ## 2. 환경 설치
 
 권장 환경:
