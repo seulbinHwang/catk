@@ -110,27 +110,92 @@
 ... model.model_config.draft.physics.soft_limit_ratio=0.75
 ```
 
-### MLX PyTorchJob Multi-Node V100x8 Fine-Tuning
+### MLX Multi-Node V100x8 DRaFT Fine-Tuning
 
-V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 때는 기존 `testv`, `testvv`에 각각 접속해서 수동 실행하지 말고, Kubeflow `PyTorchJob` 하나를 생성하세요. PyTorchJob이 worker Pod를 N개 만들고 rendezvous 주소를 자동으로 주입하므로 각 노드 IP를 몰라도 됩니다.
+V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 수 있습니다. 전체 GPU 수는 `8 x worker 수`이고, 모든 worker Pod에서 같은 repo branch, 같은 cache root, 같은 pretrain checkpoint 경로가 보여야 합니다.
 
-추가된 파일:
+관련 스크립트:
 
-- `scripts/render_mlx_finetune_pytorchjob.py`: MLX용 PyTorchJob YAML 생성기입니다.
-- `scripts/mlx_finetune_draft_flow_v100x8_multinode.sh`: 각 worker Pod 안에서 실행되는 `torchrun` wrapper입니다.
+- `scripts/launch_mlx_static_pods_tmux.py`: 이미 떠 있는 고정 Pod에 tmux 세션을 만들고 static `torchrun`을 시작합니다.
+- `scripts/render_mlx_finetune_pytorchjob.py`: 새 worker Pod를 만드는 Kubeflow `PyTorchJob` YAML을 생성합니다.
+- `scripts/mlx_finetune_draft_flow_v100x8_multinode.sh`: 각 worker 안에서 실제 `torchrun`을 실행하는 공통 wrapper입니다.
 
-먼저 짧은 연결 테스트를 권장합니다. 아래 예시는 V100x8 worker 2개, 전체 16 GPU입니다.
+#### Case 1. `testv`, `testvv` Pod가 이미 떠 있는 경우
+
+이 경우가 가장 빠릅니다. kubectl이 되는 터미널에서 이 repo checkout으로 이동해 아래 명령을 한 번 실행하면, `testv`와 `testvv` 안에 같은 이름의 tmux session이 만들어지고 각각 rank 0/1로 학습이 시작됩니다. `MASTER_ADDR`는 `testv`의 Pod IP로 자동 설정됩니다. Pod 안 repo 위치는 기본값이 `/mnt/nuplan/projects/catk`이고, 다르면 `--project-root`로 바꾸면 됩니다.
+
+먼저 짧은 smoke run을 권장합니다.
 
 ```bash
-cd /mnt/nuplan/projects/catk
+cd /path/to/catk
+
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --learning-rate 2e-4 \
+  --limit-train-batches 40 \
+  --limit-val-batches 0 \
+  --session catk-draft-ft \
+  --replace
+```
+
+각 Pod의 tmux에 들어가면 위 pane에는 training stdout/tqdm이, 아래 pane에는 GPU 사용률 heartbeat가 보입니다.
+
+```bash
+kubectl exec -it -n p-pnc testv -c main -- tmux attach -t catk-draft-ft
+kubectl exec -it -n p-pnc testvv -c main -- tmux attach -t catk-draft-ft
+```
+
+tmux에서 빠져나올 때는 `Ctrl-b d`를 누릅니다. 학습을 중단하려면:
+
+```bash
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --container main \
+  --session catk-draft-ft \
+  --stop
+```
+
+smoke run이 정상 연결되면 full run은 batch 제한만 빼고 다시 시작합니다.
+
+```bash
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --learning-rate 2e-4 \
+  --session catk-draft-ft \
+  --replace
+```
+
+기본적으로 런처는 각 Pod에서 `origin/<branch>`를 fetch/pull 합니다. Pod 안 repo에 실험용 로컬 수정이 있어서 pull하면 안 되는 경우에만 `--no-pull`을 붙이세요.
+
+#### Case 2. 아직 worker Pod가 없는 경우
+
+새 Pod를 만들어야 하면 Kubeflow `PyTorchJob`이 가장 깔끔합니다. PyTorchJob은 worker Pod 수, rendezvous endpoint, rank 관련 환경을 자동으로 맞춥니다. 이 방식은 Kubernetes Job lifecycle을 따르므로 tmux 대신 `kubectl logs`로 보는 것이 기본입니다. 꼭 tmux가 필요하면 먼저 장기 실행 Pod를 만든 뒤 Case 1의 static tmux launcher를 쓰세요.
+
+먼저 짧은 PyTorchJob smoke run:
+
+```bash
+cd /path/to/catk
 
 python scripts/render_mlx_finetune_pytorchjob.py \
   --workers 2 \
   --job-name catk-draft-v100x8x2-smoke \
   --namespace p-pnc \
   --zone private-v100-naverlabs-0 \
+  --branch semi_continuous_track_loss \
   --cache-root /workspace/womd_v1_3/SMART_cache \
-  --pretrain-ckpt /path/to/pretrained_flow.ckpt \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --learning-rate 2e-4 \
   --limit-train-batches 40 \
   --limit-val-batches 0 \
   --output /tmp/catk-draft-v100x8x2-smoke.yaml
@@ -146,7 +211,7 @@ kubectl get pods -n p-pnc | grep catk-draft-v100x8x2-smoke
 kubectl logs -f catk-draft-v100x8x2-smoke-worker-0 -c pytorch -n p-pnc
 ```
 
-smoke test가 붙으면 full run은 batch 제한만 빼고 실행합니다.
+full run:
 
 ```bash
 python scripts/render_mlx_finetune_pytorchjob.py \
@@ -154,44 +219,16 @@ python scripts/render_mlx_finetune_pytorchjob.py \
   --job-name catk-draft-v100x8xN \
   --namespace p-pnc \
   --zone private-v100-naverlabs-0 \
+  --branch semi_continuous_track_loss \
   --cache-root /workspace/womd_v1_3/SMART_cache \
-  --pretrain-ckpt /path/to/pretrained_flow.ckpt \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --learning-rate 2e-4 \
   --output /tmp/catk-draft-v100x8xN.yaml
 
 kubectl apply -f /tmp/catk-draft-v100x8xN.yaml
 ```
 
-기본 실행은 `experiment=finetune_draft_flow_v100x8`, `trainer=ddp`, `trainer.devices=8`, `trainer.num_nodes=N`으로 고정됩니다. `--learning-rate auto`가 기본이며, V100x8 단일 노드 기준 `2e-4`에서 node 수만큼 linear scaling합니다. 즉 N=2면 `4e-4`, N=3이면 `6e-4`입니다. 보수적으로 가고 싶으면 `--learning-rate 2e-4`처럼 직접 고정하세요.
-
-MLX wrapper는 non-finite loss/gradient policy override를 넘기지 않습니다. FP16 FM loss나 gradient가 non-finite가 되면 학습은 fail-fast로 즉시 중단됩니다.
-
-기존 `testv`, `testvv` Pod가 GPU를 점유 중이면 새 PyTorchJob이 Pending일 수 있습니다. GPU를 비우려면 삭제해야 하지만, 데이터가 그 Pod의 `emptyDir` 안에만 있으면 함께 사라집니다. PyTorchJob worker가 새로 뜬 뒤에도 `--cache-root`와 `--pretrain-ckpt` 경로가 모든 worker Pod 안에서 똑같이 보여야 합니다.
-
-이미 떠 있는 고정 Pod 두 개를 그대로 써야 하고 두 Pod 안에 cache/checkpoint가 모두 있다면, DNS 이슈를 피하기 위해 static torchrun 모드를 쓸 수 있습니다. `testv`를 rank 0, `testvv`를 rank 1로 두고 둘 다 같은 `MASTER_ADDR`/`MASTER_PORT`를 씁니다.
-
-```bash
-# testv 안에서
-export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
-export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
-export NNODES=2
-export NPROC_PER_NODE=8
-export NODE_RANK=0
-export MASTER_ADDR=<testv-pod-ip>
-export MASTER_PORT=29503
-export TASK_NAME=catk_draft_v100x8x2
-bash scripts/mlx_finetune_draft_flow_v100x8_multinode.sh
-
-# testvv 안에서
-export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
-export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
-export NNODES=2
-export NPROC_PER_NODE=8
-export NODE_RANK=1
-export MASTER_ADDR=<testv-pod-ip>
-export MASTER_PORT=29503
-export TASK_NAME=catk_draft_v100x8x2
-bash scripts/mlx_finetune_draft_flow_v100x8_multinode.sh
-```
+`--learning-rate auto`를 쓰면 V100x8 단일 노드 기준 `2e-4`에서 worker 수만큼 linear scaling합니다. 보수적으로 시작하려면 위 예시처럼 `--learning-rate 2e-4`로 고정하세요.
 
 ## 2. 환경 설치
 

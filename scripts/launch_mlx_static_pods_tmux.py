@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Launch static multi-node CAT-K fine-tuning in tmux on existing MLX pods."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import shlex
+import subprocess
+import sys
+
+
+DEFAULT_NAMESPACE = "p-pnc"
+DEFAULT_PODS = ["testv", "testvv"]
+DEFAULT_BRANCH = "semi_continuous_track_loss"
+DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
+DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
+DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
+
+
+def shq(value: object) -> str:
+    return shlex.quote(str(value))
+
+
+def run_kubectl(args: list[str], *, capture: bool = False) -> str:
+    result = subprocess.run(
+        ["kubectl", *args],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+    )
+    return result.stdout.strip() if capture else ""
+
+
+def pod_ip(namespace: str, pod: str) -> str:
+    return run_kubectl(
+        [
+            "get",
+            "pod",
+            pod,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.status.podIP}",
+        ],
+        capture=True,
+    )
+
+
+def export_line(name: str, value: object) -> str:
+    return f"export {name}={shq(value)}"
+
+
+def render_env_file(
+    *,
+    args: argparse.Namespace,
+    rank: int,
+    master_addr: str,
+    task_name: str,
+) -> str:
+    lines = [
+        export_line("CACHE_ROOT", args.cache_root),
+        export_line("PRETRAIN_CKPT", args.pretrain_ckpt),
+        export_line("NNODES", len(args.pods)),
+        export_line("NPROC_PER_NODE", args.nproc_per_node),
+        export_line("NODE_RANK", rank),
+        export_line("MASTER_ADDR", master_addr),
+        export_line("MASTER_PORT", args.master_port),
+        export_line("TASK_NAME", task_name),
+        export_line("CATK_EXPERIMENT", args.experiment),
+        export_line("CATK_LR", args.learning_rate),
+        export_line("LOG_DIR", args.log_dir),
+    ]
+    optional_env = {
+        "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
+        "LIMIT_VAL_BATCHES": args.limit_val_batches,
+        "SOFT_LIMIT_RATIO": args.soft_limit_ratio,
+        "TOPK_VIOLATION_K": args.topk_violation_k,
+        "BACKPROP_LAST_K": args.backprop_last_k,
+        "TRAIN_BATCH_SIZE": args.train_batch_size,
+        "ACCUMULATE_GRAD_BATCHES": args.accumulate_grad_batches,
+        "CATK_HYDRA_OVERRIDES": args.extra_hydra_overrides,
+    }
+    for name, value in optional_env.items():
+        if value not in (None, ""):
+            lines.append(export_line(name, value))
+    return "\n".join(lines) + "\n"
+
+
+def render_run_script(project_root: str, env_file: str) -> str:
+    return f"""#!/usr/bin/env bash
+set +e
+export TERM="${{TERM:-xterm-256color}}"
+export PYTHONUNBUFFERED=1
+
+if [ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]; then
+  source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
+  conda activate catk 2>/dev/null || conda activate base 2>/dev/null || true
+fi
+
+cd {shq(project_root)}
+set -a
+source {shq(env_file)}
+set +a
+
+echo "[tmux-run] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
+echo "[tmux-run] started at $(date '+%F %T')"
+echo "[tmux-run] attach survives after exit; press Ctrl-b d to detach"
+echo
+
+bash scripts/mlx_finetune_draft_flow_v100x8_multinode.sh
+status=$?
+
+echo
+echo "[tmux-run] exited with status $status at $(date '+%F %T')"
+echo "[tmux-run] leaving shell open for inspection"
+exec bash
+"""
+
+
+def render_monitor_script(interval: int, task_name: str) -> str:
+    return f"""#!/usr/bin/env bash
+set +e
+while true; do
+  echo
+  echo "[monitor] $(date '+%F %T') task={task_name} pod=$(hostname)"
+  nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null || true
+  sleep {int(interval)}
+done
+"""
+
+
+def render_start_command(
+    *,
+    args: argparse.Namespace,
+    pod: str,
+    rank: int,
+    master_addr: str,
+    task_name: str,
+) -> str:
+    safe_task = task_name.replace("/", "_")
+    run_root = f"{args.log_dir.rstrip('/')}/tmux_static_multinode/{safe_task}"
+    env_file = f"{run_root}/{pod}.env"
+    run_file = f"{run_root}/{pod}_run.sh"
+    monitor_file = f"{run_root}/{pod}_monitor.sh"
+    log_file = f"{run_root}/{pod}.tmux.log"
+    pipe_command = f"cat >> {shq(log_file)}"
+    env_text = render_env_file(args=args, rank=rank, master_addr=master_addr, task_name=task_name)
+    run_text = render_run_script(args.project_root, env_file)
+    monitor_text = render_monitor_script(args.monitor_interval, task_name)
+
+    replace_block = ""
+    if args.replace:
+        replace_block = f"""
+if tmux has-session -t {shq(args.session)} 2>/dev/null; then
+  tmux kill-session -t {shq(args.session)}
+fi
+"""
+    else:
+        replace_block = f"""
+if tmux has-session -t {shq(args.session)} 2>/dev/null; then
+  echo "[launcher] tmux session already exists: {args.session}" >&2
+  echo "[launcher] attach with: tmux attach -t {args.session}" >&2
+  exit 3
+fi
+"""
+
+    pull_block = ""
+    if args.pull:
+        branch_ref = f"refs/heads/{args.branch}"
+        origin_ref = f"origin/{args.branch}"
+        fetch_refspec = f"{args.branch}:refs/remotes/origin/{args.branch}"
+        pull_block = f"""
+git config --global --add safe.directory {shq(args.project_root)} || true
+git fetch origin {shq(fetch_refspec)}
+if git show-ref --verify --quiet {shq(branch_ref)}; then
+  git checkout {shq(args.branch)}
+else
+  git checkout -b {shq(args.branch)} {shq(origin_ref)}
+fi
+git pull --ff-only origin {shq(args.branch)}
+"""
+
+    monitor_block = ""
+    if not args.no_monitor_pane:
+        monitor_block = f"""
+cat > {shq(monitor_file)} <<'CATK_MONITOR'
+{monitor_text.rstrip()}
+CATK_MONITOR
+chmod +x {shq(monitor_file)}
+tmux split-window -v -l 12 -t {shq(args.session)} {shq(monitor_file)}
+tmux select-pane -t {shq(args.session)}:0.0
+"""
+
+    return f"""set -Eeuo pipefail
+if [ ! -d {shq(args.project_root)}/.git ]; then
+  echo "[launcher] PROJECT_ROOT is not a git checkout: {args.project_root}" >&2
+  exit 2
+fi
+cd {shq(args.project_root)}
+{pull_block}
+{replace_block}
+mkdir -p {shq(run_root)}
+cat > {shq(env_file)} <<'CATK_ENV'
+{env_text.rstrip()}
+CATK_ENV
+cat > {shq(run_file)} <<'CATK_RUN'
+{run_text.rstrip()}
+CATK_RUN
+chmod +x {shq(run_file)}
+: > {shq(log_file)}
+tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_file)}
+tmux pipe-pane -t {shq(args.session)}:0.0 -o {shq(pipe_command)}
+{monitor_block}
+echo "[launcher] started tmux session {args.session} on pod {pod}"
+echo "[launcher] tmux log: {log_file}"
+"""
+
+
+def render_stop_command(session: str) -> str:
+    return f"""set -Eeuo pipefail
+if tmux has-session -t {shq(session)} 2>/dev/null; then
+  tmux kill-session -t {shq(session)}
+  echo "[launcher] stopped tmux session {session}"
+else
+  echo "[launcher] tmux session not found: {session}"
+fi
+"""
+
+
+def exec_in_pod(namespace: str, container: str, pod: str, script: str, *, dry_run: bool) -> None:
+    cmd = [
+        "exec",
+        "-n",
+        namespace,
+        pod,
+        "-c",
+        container,
+        "--",
+        "bash",
+        "-lc",
+        script,
+    ]
+    if dry_run:
+        print("kubectl " + " ".join(shq(part) for part in cmd))
+        return
+    run_kubectl(cmd)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Start CAT-K static multi-node fine-tuning in tmux on existing pods.",
+    )
+    parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
+    parser.add_argument("--pods", nargs="+", default=DEFAULT_PODS)
+    parser.add_argument("--container", default="main")
+    parser.add_argument("--project-root", default=DEFAULT_PROJECT_ROOT)
+    parser.add_argument("--branch", default=DEFAULT_BRANCH)
+    parser.add_argument("--no-pull", dest="pull", action="store_false")
+    parser.set_defaults(pull=True)
+    parser.add_argument("--cache-root", default=DEFAULT_CACHE_ROOT)
+    parser.add_argument("--pretrain-ckpt", default="")
+    parser.add_argument("--experiment", default="finetune_draft_flow_v100x8")
+    parser.add_argument("--task-name", default="")
+    parser.add_argument("--session", default="catk-draft-multinode")
+    parser.add_argument("--master-addr", default="")
+    parser.add_argument("--master-port", default="29507")
+    parser.add_argument("--nproc-per-node", type=int, default=8)
+    parser.add_argument("--learning-rate", default="auto")
+    parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
+    parser.add_argument("--limit-train-batches", default="")
+    parser.add_argument("--limit-val-batches", default="")
+    parser.add_argument("--soft-limit-ratio", default="")
+    parser.add_argument("--topk-violation-k", default="")
+    parser.add_argument("--backprop-last-k", default="")
+    parser.add_argument("--train-batch-size", default="")
+    parser.add_argument("--accumulate-grad-batches", default="")
+    parser.add_argument("--extra-hydra-overrides", default="")
+    parser.add_argument("--monitor-interval", type=int, default=30)
+    parser.add_argument("--no-monitor-pane", action="store_true")
+    parser.add_argument("--replace", action="store_true")
+    parser.add_argument("--stop", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    if len(args.pods) < 2 and not args.stop:
+        parser.error("--pods must contain at least two pods for multi-node training")
+    if not args.pretrain_ckpt and not args.stop:
+        parser.error("--pretrain-ckpt is required unless --stop is set")
+    if args.nproc_per_node < 1:
+        parser.error("--nproc-per-node must be >= 1")
+    if args.monitor_interval < 1:
+        parser.error("--monitor-interval must be >= 1")
+    if not args.task_name:
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.task_name = f"catk_draft_v100x8x{len(args.pods)}_{stamp}"
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    if args.stop:
+        for pod in args.pods:
+            exec_in_pod(
+                args.namespace,
+                args.container,
+                pod,
+                render_stop_command(args.session),
+                dry_run=args.dry_run,
+            )
+        return
+
+    master_addr = args.master_addr or pod_ip(args.namespace, args.pods[0])
+    print(f"[launcher] master pod: {args.pods[0]} ({master_addr}:{args.master_port})")
+    print(f"[launcher] task_name: {args.task_name}")
+    print(f"[launcher] session:   {args.session}")
+
+    for rank, pod in enumerate(args.pods):
+        script = render_start_command(
+            args=args,
+            pod=pod,
+            rank=rank,
+            master_addr=master_addr,
+            task_name=args.task_name,
+        )
+        exec_in_pod(args.namespace, args.container, pod, script, dry_run=args.dry_run)
+
+    print("\nAttach commands:")
+    for pod in args.pods:
+        print(
+            "  kubectl exec -it "
+            f"-n {args.namespace} {pod} -c {args.container} -- "
+            f"tmux attach -t {args.session}"
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as exc:
+        sys.exit(exc.returncode)
