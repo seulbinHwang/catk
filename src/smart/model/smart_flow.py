@@ -97,9 +97,9 @@ class SMARTFlow(LightningModule):
         self.nonfinite_gradient_policy = str(
             getattr(model_config, "nonfinite_gradient_policy", "raise")
         ).lower()
-        if self.nonfinite_gradient_policy not in {"raise", "allow", "zero"}:
+        if self.nonfinite_gradient_policy not in {"raise", "zero"}:
             raise ValueError(
-                "model_config.nonfinite_gradient_policy must be 'raise', 'allow', or 'zero', "
+                "model_config.nonfinite_gradient_policy must be 'raise' or 'zero', "
                 f"got {self.nonfinite_gradient_policy!r}."
             )
 
@@ -1437,8 +1437,6 @@ open_metric_dict:
         if bad_grad is None:
             return
         bad_name, bad_tensor = bad_grad
-        if self.nonfinite_gradient_policy == "allow":
-            return
         if self.nonfinite_gradient_policy == "zero":
             self._zero_nonfinite_gradients()
             return

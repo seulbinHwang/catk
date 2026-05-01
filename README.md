@@ -38,9 +38,8 @@
 - 학습 중에는 non-finite parameter, `total_loss`, gradient를 fail-fast로 감지해
   NaN checkpoint가 조용히 저장되지 않도록 즉시 중단합니다. `fm_loss`는 기본적으로 fail-fast지만,
   MLX 멀티노드 wrapper에서는 한 rank의 bad batch가 전체 run을 죽이지 않도록 해당 batch만
-  zero-gradient로 건너뛰는 `model.model_config.nonfinite_fm_loss_policy=skip`을 사용합니다. 같은 wrapper는
-  `16-mixed` AMP에서 GradScaler가 non-finite gradient step을 처리할 수 있도록
-  `model.model_config.nonfinite_gradient_policy=allow`도 함께 사용합니다.
+  zero-gradient로 건너뛰는 `model.model_config.nonfinite_fm_loss_policy=skip`을 사용합니다. gradient는
+  `model.model_config.nonfinite_gradient_policy=raise`가 기본이며 non-finite gradient를 허용하지 않습니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
@@ -167,7 +166,7 @@ kubectl apply -f /tmp/catk-draft-v100x8xN.yaml
 
 기본 실행은 `experiment=finetune_draft_flow_v100x8`, `trainer=ddp`, `trainer.devices=8`, `trainer.num_nodes=N`으로 고정됩니다. `--learning-rate auto`가 기본이며, V100x8 단일 노드 기준 `2e-4`에서 node 수만큼 linear scaling합니다. 즉 N=2면 `4e-4`, N=3이면 `6e-4`입니다. 보수적으로 가고 싶으면 `--learning-rate 2e-4`처럼 직접 고정하세요.
 
-MLX wrapper는 기본적으로 `model.model_config.nonfinite_fm_loss_policy=skip`과 `model.model_config.nonfinite_gradient_policy=allow`를 함께 넘깁니다. 특정 rank의 특정 batch에서 FP16 FM loss가 non-finite가 되면 그 rank의 해당 batch만 zero-gradient로 지나가고 `train/nonfinite_fm_loss_skipped`에 기록합니다. backward 직후 non-finite gradient가 보이면 `16-mixed` GradScaler가 optimizer step을 건너뛸 수 있게 즉시 중단하지 않습니다. 예전처럼 즉시 중단시키고 싶으면 생성기에서 `--nonfinite-fm-loss-policy raise --nonfinite-gradient-policy raise`를 쓰거나 wrapper 실행 전 `NONFINITE_FM_LOSS_POLICY=raise`, `NONFINITE_GRADIENT_POLICY=raise`를 지정하세요.
+MLX wrapper는 기본적으로 `model.model_config.nonfinite_fm_loss_policy=skip`과 `model.model_config.nonfinite_gradient_policy=raise`를 함께 넘깁니다. 특정 rank의 특정 batch에서 FP16 FM loss가 non-finite가 되면 그 rank의 해당 batch만 zero-gradient로 지나가고 `train/nonfinite_fm_loss_skipped`에 기록합니다. backward 직후 non-finite gradient가 보이면 즉시 중단합니다. gradient 쪽은 `allow` 정책을 지원하지 않으며, 실험적으로 non-finite gradient를 0으로 지우고 싶을 때만 `--nonfinite-gradient-policy zero` 또는 `NONFINITE_GRADIENT_POLICY=zero`를 명시하세요.
 
 기존 `testv`, `testvv` Pod가 GPU를 점유 중이면 새 PyTorchJob이 Pending일 수 있습니다. GPU를 비우려면 삭제해야 하지만, 데이터가 그 Pod의 `emptyDir` 안에만 있으면 함께 사라집니다. PyTorchJob worker가 새로 뜬 뒤에도 `--cache-root`와 `--pretrain-ckpt` 경로가 모든 worker Pod 안에서 똑같이 보여야 합니다.
 
@@ -184,7 +183,7 @@ export MASTER_ADDR=<testv-pod-ip>
 export MASTER_PORT=29503
 export TASK_NAME=catk_draft_v100x8x2
 export NONFINITE_FM_LOSS_POLICY=skip
-export NONFINITE_GRADIENT_POLICY=allow
+export NONFINITE_GRADIENT_POLICY=raise
 bash scripts/mlx_finetune_draft_flow_v100x8_multinode.sh
 
 # testvv 안에서
@@ -197,7 +196,7 @@ export MASTER_ADDR=<testv-pod-ip>
 export MASTER_PORT=29503
 export TASK_NAME=catk_draft_v100x8x2
 export NONFINITE_FM_LOSS_POLICY=skip
-export NONFINITE_GRADIENT_POLICY=allow
+export NONFINITE_GRADIENT_POLICY=raise
 bash scripts/mlx_finetune_draft_flow_v100x8_multinode.sh
 ```
 

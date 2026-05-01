@@ -284,9 +284,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--nonfinite-gradient-policy",
-        default="allow",
-        choices=("raise", "allow", "zero"),
-        help="Use 'allow' with 16-mixed so Lightning GradScaler can skip non-finite AMP steps.",
+        default="raise",
+        choices=("raise", "zero"),
+        help="Use 'raise' to fail fast on non-finite gradients, or 'zero' to clear them.",
     )
     parser.add_argument("--install-requirements", default="auto", choices=("auto", "0", "1"))
     parser.add_argument("--limit-train-batches", default="")

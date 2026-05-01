@@ -93,7 +93,7 @@ main() {
     local experiment="${CATK_EXPERIMENT:-finetune_draft_flow_v100x8}"
     local lr="${CATK_LR:-auto}"
     local nonfinite_fm_loss_policy="${NONFINITE_FM_LOSS_POLICY:-skip}"
-    local nonfinite_gradient_policy="${NONFINITE_GRADIENT_POLICY:-allow}"
+    local nonfinite_gradient_policy="${NONFINITE_GRADIENT_POLICY:-raise}"
 
     if [[ "$nnodes" -gt 1 && -z "$node_rank" && -z "$rdzv_endpoint" ]]; then
         log "ERROR: multi-node elastic mode requires PET_RDZV_ENDPOINT/RDZV_ENDPOINT."
