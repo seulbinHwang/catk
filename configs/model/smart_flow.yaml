@@ -65,7 +65,7 @@ model_config:
       pedestrian_heading_weight: 0.05
       pedestrian_heading_speed_threshold_mps: 0.5
       soft_limit_ratio: 1.0
-      topk_violation_k: 4
+      topk_violation_k: 20
       eps: 1.0e-6
   decoder:
     hidden_dim: 128
