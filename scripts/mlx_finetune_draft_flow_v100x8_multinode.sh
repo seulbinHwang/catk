@@ -134,6 +134,9 @@ main() {
     if [[ -n "$rdzv_endpoint" ]]; then
         torchrun_args+=(--rdzv_endpoint "$rdzv_endpoint")
     fi
+    if [[ -n "${LOCAL_ADDR:-}" ]]; then
+        torchrun_args+=(--local_addr "$LOCAL_ADDR")
+    fi
 
     torchrun_args+=(
         -m src.run
