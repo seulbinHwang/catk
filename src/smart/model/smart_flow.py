@@ -152,7 +152,7 @@ class SMARTFlow(LightningModule):
                     getattr(draft_physics, "pedestrian_heading_speed_threshold_mps", 0.5)
                 ),
                 soft_limit_ratio=float(getattr(draft_physics, "soft_limit_ratio", 1.0)),
-                topk_violation_k=int(getattr(draft_physics, "topk_violation_k", 20)),
+                topk_violation_k=int(getattr(draft_physics, "topk_violation_k", 4)),
                 eps=float(getattr(draft_physics, "eps", 1e-6)),
             )
         else:

@@ -62,17 +62,22 @@
 
 ### DRaFT Top-K Feasibility Loss
 
-- DRaFT physics loss는 기본적으로 2초 미래 20개 시점의 물리 위반을 평균합니다.
-- `model.model_config.draft.physics.topk_violation_k` 를 줄이면 각 agent 안에서 물리 위반이 큰 상위 K개 시점도 함께 봅니다.
-- 최종 physics loss는 `0.5 * (기존 시간 평균 loss + 상위-K 위반 loss)` 입니다.
-- 기본값은 `topk_violation_k=20` 입니다. 20개 시점을 모두 보므로 기존 로직과 같은 값으로 동작합니다.
-- 한두 프레임의 급가속, 급회전, 순간 점프가 평균에 묻히는 문제를 줄이고 싶으면 `topk_violation_k=4`부터 비교하는 것을 권장합니다.
+- DRaFT physics loss는 기본적으로 2초 미래 20개 시점의 물리 위반을 한 번 계산해서 시간 평균과 시간축 상위-K 평균을 동시에 얻고, 둘을 절반씩 섞어 최종 손실로 씁니다.
+- `model.model_config.draft.physics.topk_violation_k` 가 K 입니다. K 가 T (=20) 이상이면 상위-K 가 시간 평균과 같아져 단일 mean 경로로만 동작합니다.
+- 최종 physics loss는 `0.5 * (시간 평균 loss + 상위-K 위반 loss)` 입니다.
+- **기본값은 `topk_violation_k=4`** 입니다. 한두 프레임의 급가속, 급회전, 순간 점프가 평균에 묻히지 않도록 곧바로 강조되도록 켠 default 입니다 (이전에는 `K=20` no-op 이 기본이라 사용자가 명시적으로 줄여야 활성화됐습니다).
+- 더 부드럽게 평균 위주로 학습하고 싶으면 `topk_violation_k=8` 이나 `topk_violation_k=20` (mean-only) 으로 늘리세요. 더 강한 worst-step 집중을 원하면 `topk_violation_k=2`/`1` 도 가능합니다.
+- 시점별 위반은 클래스 당 한 번만 계산되어 mean 과 상위-K 집계에 동시에 사용됩니다. 이전 구현이 가졌던 mean 경로 + topk 경로의 이중 forward 비용이 없습니다.
 - 이 설정은 `draft.max_weight`, sampling step, sampling method, backprop_last_k, batch size, learning rate를 바꾸지 않습니다.
 
 예시:
 
 ```bash
+# 기본값 (K=4) - mean + 상위-4 worst-step blend
 ... model.model_config.draft.physics.topk_violation_k=4
+
+# Mean-only (이전 default 와 동일)
+... model.model_config.draft.physics.topk_violation_k=20
 ```
 
 ### DRaFT Soft-Limit Ratio

@@ -378,7 +378,7 @@ class DraftPhysicsRegularizer(nn.Module):
             output[key] = output[f"pred_{key}"]
         return output
 
-    def _compute_vehicle_like_stats(
+    def _compute_vehicle_like_per_step_penalties(
         self,
         future_norm: Tensor,
         prev_control: Tensor,
@@ -386,7 +386,7 @@ class DraftPhysicsRegularizer(nn.Module):
         agent_length: Tensor,
         class_id: int,
     ) -> Dict[str, Tensor]:
-        """차량 또는 자전거의 역추론 물리량을 계산합니다.
+        """차량/자전거의 시점별 (시간축 평균 전) 물리 위반량을 계산합니다.
 
         Args:
             future_norm: 정규화 미래입니다. shape은 ``[n_agent, T, 4]`` 입니다.
@@ -398,8 +398,9 @@ class DraftPhysicsRegularizer(nn.Module):
 
         Returns:
             Dict[str, Tensor]:
-                hard, slip, soft, 실제 단위 초과량을 담은 사전입니다.
-                각 값의 shape은 ``[n_agent]`` 입니다.
+                시점별 위반량을 담은 사전입니다. ``hard``/``slip`` shape은
+                ``[n_agent, T]``, ``soft`` shape은 ``[n_agent, T-1]`` (T<2이면 ``[n_agent, 0]``),
+                실제 단위 초과량 키들의 shape은 ``[n_agent, T]`` 입니다.
         """
         pos_local_m, heading_local = self._denormalize_future(future_norm)
         pos_seq, heading_seq = self._prepend_virtual_start(pos_local_m, heading_local)
@@ -451,46 +452,135 @@ class DraftPhysicsRegularizer(nn.Module):
         beta_max = self._select_limit(self.limit_table.beta_max_rad, class_id, future_norm)
 
         beta = torch.atan2(vy_body.abs(), vx_body.abs() + self.eps)
-        beta_pen = self._normalized_slip_square_penalty(
+        slip_per_step = self._normalized_slip_square_penalty(
             value=beta,
             limit=beta_max,
             enabled=beta_max > 0.0,
         )
-        slip = self._mean_over_time(beta_pen)
-        slip_beta_excess_deg = self._mean_over_time(
-            torch.rad2deg(torch.relu(beta - beta_max))
-        )
-
-        hard = self._mean_over_time(
+        hard_per_step = (
             self._phi(speed.abs() / v_max - 1.0)
             + self._phi(accel.abs() / a_max - 1.0)
             + self._phi(steer.abs() / steer_max_rad - 1.0)
             + self._phi(steer_rate.abs() / steer_rate_max_radps - 1.0)
             + self._phi(lat_accel / a_lat_max - 1.0)
         )
-
         if accel.shape[1] > 1:
             accel_delta = accel[:, 1:] - accel[:, :-1]
             steer_rate_delta = steer_rate[:, 1:] - steer_rate[:, :-1]
-            soft = self._mean_over_time(
+            soft_per_step = (
                 (accel_delta / a_max).square()
                 + (steer_rate_delta / steer_rate_max_radps).square()
             )
         else:
-            soft = hard.new_zeros(hard.shape)
+            soft_per_step = hard_per_step.new_zeros((hard_per_step.shape[0], 0))
 
         return {
-            "hard": hard,
-            "slip": slip,
-            "soft": soft,
-            "speed_excess_mps": self._mean_over_time(torch.relu(speed.abs() - v_max)),
-            "slip_beta_excess_deg": slip_beta_excess_deg,
-            "accel_excess_mps2": self._mean_over_time(torch.relu(accel.abs() - a_max)),
-            "steer_excess_deg": self._mean_over_time(torch.rad2deg(torch.relu(steer.abs() - steer_max_rad))),
-            "steer_rate_excess_degps": self._mean_over_time(
-                torch.rad2deg(torch.relu(steer_rate.abs() - steer_rate_max_radps))
-            ),
-            "lat_accel_excess_mps2": self._mean_over_time(torch.relu(lat_accel - a_lat_max)),
+            "hard": hard_per_step,
+            "slip": slip_per_step,
+            "soft": soft_per_step,
+            "speed_excess_mps": torch.relu(speed.abs() - v_max),
+            "slip_beta_excess_deg": torch.rad2deg(torch.relu(beta - beta_max)),
+            "accel_excess_mps2": torch.relu(accel.abs() - a_max),
+            "steer_excess_deg": torch.rad2deg(torch.relu(steer.abs() - steer_max_rad)),
+            "steer_rate_excess_degps": torch.rad2deg(torch.relu(steer_rate.abs() - steer_rate_max_radps)),
+            "lat_accel_excess_mps2": torch.relu(lat_accel - a_lat_max),
+        }
+
+    def _compute_vehicle_like_stats(
+        self,
+        future_norm: Tensor,
+        prev_control: Tensor,
+        prev_control_valid: Tensor,
+        agent_length: Tensor,
+        class_id: int,
+    ) -> Dict[str, Tensor]:
+        """차량 또는 자전거의 역추론 물리량을 계산합니다.
+
+        Args:
+            future_norm: 정규화 미래입니다. shape은 ``[n_agent, T, 4]`` 입니다.
+            prev_control: 직전 구간 제어입니다.
+                shape은 ``[n_agent, 3]`` 이고 마지막 차원은 ``[v_x^b, v_y^b, omega]`` 입니다.
+            prev_control_valid: 직전 제어 유효 여부입니다. shape은 ``[n_agent]`` 입니다.
+            agent_length: agent box length입니다. shape은 ``[n_agent]`` 입니다.
+            class_id: ``vehicle`` 또는 ``bicycle``의 종류 번호입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                hard, slip, soft, 실제 단위 초과량을 담은 사전입니다.
+                각 값의 shape은 ``[n_agent]`` 입니다.
+        """
+        per_step = self._compute_vehicle_like_per_step_penalties(
+            future_norm=future_norm,
+            prev_control=prev_control,
+            prev_control_valid=prev_control_valid,
+            agent_length=agent_length,
+            class_id=class_id,
+        )
+        return {key: self._mean_over_time(value) for key, value in per_step.items()}
+
+    def _compute_pedestrian_per_step_penalties(
+        self,
+        future_norm: Tensor,
+        prev_control: Tensor,
+        prev_control_valid: Tensor,
+    ) -> Dict[str, Tensor]:
+        """사람의 시점별 (시간축 평균 전) 물리 위반량을 계산합니다.
+
+        Args:
+            future_norm: 정규화 미래입니다. shape은 ``[n_agent, T, 4]`` 입니다.
+            prev_control: 직전 구간 제어입니다.
+                shape은 ``[n_agent, 3]`` 이고 마지막 차원은 ``[v_x^b, v_y^b, omega]`` 입니다.
+            prev_control_valid: 직전 제어 유효 여부입니다. shape은 ``[n_agent]`` 입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                시점별 위반량을 담은 사전입니다. ``hard``/``head`` shape은
+                ``[n_agent, T]``, ``soft`` shape은 ``[n_agent, T-1]`` (T<2이면 ``[n_agent, 0]``).
+                ``heading_error_deg_unmasked`` 와 ``heading_mask`` 는 masked-mean 집계용
+                보조 텐서입니다.
+        """
+        pos_local_m, heading_local = self._denormalize_future(future_norm)
+        pos_seq, _ = self._prepend_virtual_start(pos_local_m, heading_local)
+        vel_vec = (pos_seq[:, 1:] - pos_seq[:, :-1]) / self.dt
+        speed = torch.linalg.norm(vel_vec, dim=-1)
+
+        prev_vel = self._prev_body_velocity_to_anchor_local(prev_control)
+        prev_valid = prev_control_valid.to(dtype=future_norm.dtype).unsqueeze(-1)
+        accel_vec = vel_vec.new_zeros(vel_vec.shape)
+        accel_vec[:, 0] = prev_valid * (vel_vec[:, 0] - prev_vel) / self.dt
+        if vel_vec.shape[1] > 1:
+            accel_vec[:, 1:] = (vel_vec[:, 1:] - vel_vec[:, :-1]) / self.dt
+        accel = torch.linalg.norm(accel_vec, dim=-1)
+
+        v_max = self._select_limit(self.limit_table.v_max_mps, PEDESTRIAN_TYPE, future_norm)
+        a_max = self._select_limit(self.limit_table.a_max_mps2, PEDESTRIAN_TYPE, future_norm)
+        hard_per_step = (
+            self._phi(speed / v_max - 1.0) + self._phi(accel / a_max - 1.0)
+        )
+
+        if accel_vec.shape[1] > 1:
+            accel_delta = accel_vec[:, 1:] - accel_vec[:, :-1]
+            accel_delta_norm = torch.linalg.norm(accel_delta, dim=-1)
+            soft_per_step = (accel_delta_norm / a_max).square()
+        else:
+            soft_per_step = hard_per_step.new_zeros((hard_per_step.shape[0], 0))
+
+        vel_angle = self._safe_angle_from_xy(vel_vec)
+        heading_gap = self._wrap_angle(heading_local - vel_angle)
+        heading_mask = speed > self.pedestrian_heading_speed_threshold_mps
+        head_per_step = torch.where(
+            heading_mask, heading_gap.square(), torch.zeros_like(heading_gap)
+        )
+        heading_error_deg_unmasked = torch.rad2deg(heading_gap.abs())
+
+        return {
+            "hard": hard_per_step,
+            "soft": soft_per_step,
+            "head": head_per_step,
+            "speed_excess_mps": torch.relu(speed - v_max),
+            "accel_excess_mps2": torch.relu(accel - a_max),
+            "heading_error_deg_unmasked": heading_error_deg_unmasked,
+            "heading_mask": heading_mask,
         }
 
     def _compute_pedestrian_stats(
@@ -512,51 +602,20 @@ class DraftPhysicsRegularizer(nn.Module):
                 hard, soft, head, 실제 단위 값을 담은 사전입니다.
                 각 값의 shape은 ``[n_agent]`` 입니다.
         """
-        pos_local_m, heading_local = self._denormalize_future(future_norm)
-        pos_seq, _ = self._prepend_virtual_start(pos_local_m, heading_local)
-        vel_vec = (pos_seq[:, 1:] - pos_seq[:, :-1]) / self.dt
-        speed = torch.linalg.norm(vel_vec, dim=-1)
-
-        prev_vel = self._prev_body_velocity_to_anchor_local(prev_control)
-        prev_valid = prev_control_valid.to(dtype=future_norm.dtype).unsqueeze(-1)
-        accel_vec = vel_vec.new_zeros(vel_vec.shape)
-        accel_vec[:, 0] = prev_valid * (vel_vec[:, 0] - prev_vel) / self.dt
-        if vel_vec.shape[1] > 1:
-            accel_vec[:, 1:] = (vel_vec[:, 1:] - vel_vec[:, :-1]) / self.dt
-        accel = torch.linalg.norm(accel_vec, dim=-1)
-
-        v_max = self._select_limit(self.limit_table.v_max_mps, PEDESTRIAN_TYPE, future_norm)
-        a_max = self._select_limit(self.limit_table.a_max_mps2, PEDESTRIAN_TYPE, future_norm)
-        hard = self._mean_over_time(
-            self._phi(speed / v_max - 1.0)
-            + self._phi(accel / a_max - 1.0)
+        per_step = self._compute_pedestrian_per_step_penalties(
+            future_norm=future_norm,
+            prev_control=prev_control,
+            prev_control_valid=prev_control_valid,
         )
-
-        if accel_vec.shape[1] > 1:
-            accel_delta = accel_vec[:, 1:] - accel_vec[:, :-1]
-            accel_delta_norm = torch.linalg.norm(accel_delta, dim=-1)
-            soft = self._mean_over_time((accel_delta_norm / a_max).square())
-        else:
-            soft = hard.new_zeros(hard.shape)
-
-        vel_angle = self._safe_angle_from_xy(vel_vec)
-        heading_gap = self._wrap_angle(heading_local - vel_angle)
-        heading_mask = speed > self.pedestrian_heading_speed_threshold_mps
-        head = self._mean_over_time(
-            torch.where(heading_mask, heading_gap.square(), torch.zeros_like(heading_gap))
-        )
-        heading_error_deg = self._masked_mean_over_time(
-            torch.rad2deg(heading_gap.abs()),
-            heading_mask,
-        )
-
         return {
-            "hard": hard,
-            "soft": soft,
-            "head": head,
-            "speed_excess_mps": self._mean_over_time(torch.relu(speed - v_max)),
-            "accel_excess_mps2": self._mean_over_time(torch.relu(accel - a_max)),
-            "heading_error_deg": heading_error_deg,
+            "hard": self._mean_over_time(per_step["hard"]),
+            "soft": self._mean_over_time(per_step["soft"]),
+            "head": self._mean_over_time(per_step["head"]),
+            "speed_excess_mps": self._mean_over_time(per_step["speed_excess_mps"]),
+            "accel_excess_mps2": self._mean_over_time(per_step["accel_excess_mps2"]),
+            "heading_error_deg": self._masked_mean_over_time(
+                per_step["heading_error_deg_unmasked"], per_step["heading_mask"]
+            ),
         }
 
     def _prev_body_velocity_to_anchor_local(self, prev_control: Tensor) -> Tensor:
