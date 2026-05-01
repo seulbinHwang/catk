@@ -26,7 +26,7 @@ model:
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
       estimator_updates_per_step: 5
-      estimator_warmup_epochs: 1
+      estimator_warmup_epochs: 0
       # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
       # Resume from a self-forced checkpoint preserves restored aux states.
       initialize_aux_from_generator_on_fit_start: true
