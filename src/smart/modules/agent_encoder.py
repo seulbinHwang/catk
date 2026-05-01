@@ -146,6 +146,7 @@ class SMARTAgentEncoder(nn.Module):
         head_vector_a,
         agent_type,
         agent_shape,
+        valid_mask: Optional[torch.Tensor] = None,
         inference=False,
     ):
         n_agent, n_step, traj_dim = pos_a.shape
@@ -167,13 +168,7 @@ class SMARTAgentEncoder(nn.Module):
         agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]
         agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]]
 
-        motion_vector_a = torch.cat(
-            [
-                pos_a.new_zeros(agent_token_index.shape[0], 1, traj_dim),
-                pos_a[:, 1:] - pos_a[:, :-1],
-            ],
-            dim=1,
-        )
+        motion_vector_a = self._build_motion_vector(pos_a, valid_mask)
         feature_a = torch.stack(
             [
                 safe_norm_2d(motion_vector_a[:, :, :2]),
@@ -214,6 +209,24 @@ class SMARTAgentEncoder(nn.Module):
                 categorical_embs,
             )
         return feat_a
+
+    @staticmethod
+    def _build_motion_vector(
+        pos_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        n_agent, n_step, traj_dim = pos_a.shape
+        motion_vector_a = pos_a.new_zeros(n_agent, n_step, traj_dim)
+        if n_step <= 1:
+            return motion_vector_a
+
+        step_delta = pos_a[:, 1:] - pos_a[:, :-1]
+        if valid_mask is not None:
+            # Invalid samples are stored at the origin; mask origin-to-global jumps.
+            step_valid = valid_mask[:, 1:].bool() & valid_mask[:, :-1].bool()
+            step_delta = step_delta.masked_fill(~step_valid.unsqueeze(-1), 0.0)
+        motion_vector_a[:, 1:] = step_delta
+        return motion_vector_a
 
     def build_temporal_edge(
         self,
