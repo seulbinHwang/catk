@@ -26,7 +26,7 @@ activate_conda_if_available() {
         conda activate "${CATK_CONDA_ENV:-catk}" 2>/dev/null \
             || conda activate base 2>/dev/null \
             || true
-        log "conda env: $(conda info --envs | awk '/\\*/ {print $1\" \"$NF}')"
+        log "conda env: ${CONDA_DEFAULT_ENV:-unknown}"
     else
         log "conda root not found at $conda_root; using image Python."
     fi
@@ -129,6 +129,13 @@ main() {
         --nproc_per_node "$nproc_per_node"
         --rdzv_id "$rdzv_id"
         --rdzv_backend "$rdzv_backend"
+    )
+
+    if [[ -n "$rdzv_endpoint" ]]; then
+        torchrun_args+=(--rdzv_endpoint "$rdzv_endpoint")
+    fi
+
+    torchrun_args+=(
         -m src.run
         experiment="$experiment"
         action=finetune
@@ -141,9 +148,6 @@ main() {
         model.model_config.lr="$lr"
     )
 
-    if [[ -n "$rdzv_endpoint" ]]; then
-        torchrun_args+=(--rdzv_endpoint "$rdzv_endpoint")
-    fi
     if [[ -n "${LOG_DIR:-}" ]]; then
         torchrun_args+=(paths.log_dir="$LOG_DIR")
     fi
