@@ -49,7 +49,7 @@ model:
     # Effective global batch here is 36 * 4 * 2 = 288 (identical to the
     # 6xH100 preset), so the same lr=2e-4 applies unchanged.
     lr: 2.7e-4
-    lr_warmup_steps: 2
+    lr_warmup_steps: 4
     lr_min_ratio: 1e-2
 
     # Commit bridge ---------------------------------------------------------
