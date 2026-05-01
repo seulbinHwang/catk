@@ -35,8 +35,9 @@
   `(0, 0)` 또는 near-zero vector backward에서 gradient NaN이 나지 않도록 막습니다.
 - `sample_open_loop_future` 결과나 physics loss 출력이 non-finite면 해당 batch의 draft loss를 0으로
   처리해 flow decoder 전체를 오염시키지 않게 합니다.
-- 학습 중에는 non-finite parameter, `fm_loss`, `total_loss`, gradient를 fail-fast로 감지해
-  NaN checkpoint가 조용히 저장되지 않도록 즉시 중단합니다.
+- 학습 중에는 non-finite parameter, `fm_loss`, `total_loss`, 비-AMP gradient를 fail-fast로 감지해
+  NaN checkpoint가 조용히 저장되지 않도록 즉시 중단합니다. 단, `16-mixed` AMP의 scaled gradient
+  overflow는 PyTorch `GradScaler`가 optimizer step을 skip하고 scale을 낮추도록 맡깁니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
@@ -229,6 +230,24 @@ kubectl apply -f /tmp/catk-draft-v100x8xN.yaml
 ```
 
 `--learning-rate auto`를 쓰면 V100x8 단일 노드 기준 `2e-4`에서 worker 수만큼 linear scaling합니다. 보수적으로 시작하려면 위 예시처럼 `--learning-rate 2e-4`로 고정하세요.
+
+#### V100 `16-mixed`와 non-finite gradient 처리
+
+V100은 BF16을 네이티브로 쓰기 어려우므로 fine-tuning preset은 기본적으로 `trainer.precision=16-mixed`를 씁니다. `16-mixed`에서는 Lightning/PyTorch가 `GradScaler`로 loss를 크게 키운 뒤 backward를 수행합니다. 이때 일부 gradient가 FP16 범위를 넘어 `inf`가 될 수 있지만, 이는 AMP가 예상하는 recoverable overflow입니다.
+
+중요한 순서는 아래와 같습니다.
+
+```text
+scale(loss) -> backward -> on_after_backward hook -> unscale gradients -> optimizer step or skip -> scale update
+```
+
+따라서 `on_after_backward`에서 scaled gradient를 즉시 fail-fast하면, `GradScaler`가 원래 하려던 "이번 step skip + scale 낮추기"가 실행되기 전에 학습이 종료됩니다. 이 저장소는 `16-mixed`일 때 backward 직후 gradient fail-fast를 건너뛰고, AMP overflow 처리는 `GradScaler`에 맡깁니다. `fm_loss`, `total_loss`, trainable parameter non-finite 검사는 그대로 유지됩니다.
+
+숫자 안정성을 최우선으로 보고 gradient까지 즉시 fail-fast하고 싶으면 아래처럼 FP32로 실행하세요. 대신 V100에서는 더 느리고 메모리를 더 씁니다.
+
+```bash
+... --extra-hydra-overrides 'trainer.precision=32-true'
+```
 
 ## 2. 환경 설치
 

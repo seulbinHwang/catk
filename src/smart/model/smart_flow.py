@@ -1077,6 +1077,15 @@ class SMARTFlow(LightningModule):
                 return name, param.grad
         return None
 
+    def _uses_loss_scaled_amp(self) -> bool:
+        """현재 backward gradient가 GradScaler로 scale된 AMP gradient인지 판단합니다."""
+        precision_plugin = getattr(self.trainer, "precision_plugin", None)
+        scaler = getattr(precision_plugin, "scaler", None)
+        if scaler is None:
+            return False
+        is_enabled = getattr(scaler, "is_enabled", None)
+        return bool(is_enabled()) if callable(is_enabled) else True
+
     @staticmethod
     def _summarize_nonfinite_tensor(tensor: Tensor) -> str:
         """non-finite tensor의 요약 문자열을 만듭니다."""
@@ -1381,6 +1390,11 @@ open_metric_dict:
 
     def on_after_backward(self) -> None:
         """역전파 직후 non-finite gradient를 fail-fast로 감지합니다."""
+        if self._uses_loss_scaled_amp():
+            # Lightning calls this hook before GradScaler unscales gradients.
+            # In 16-mixed, an inf here can be a recoverable scaled-gradient
+            # overflow; GradScaler should skip the step and lower the scale.
+            return
         bad_grad = self._find_first_nonfinite_gradient()
         if bad_grad is None:
             return
