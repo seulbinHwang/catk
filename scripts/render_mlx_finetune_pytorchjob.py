@@ -79,6 +79,7 @@ def render_manifest(args: argparse.Namespace) -> str:
         render_env_value("TASK_NAME", args.task_name),
         render_env_value("CATK_LR", args.learning_rate),
         render_env_value("NONFINITE_FM_LOSS_POLICY", args.nonfinite_fm_loss_policy),
+        render_env_value("NONFINITE_GRADIENT_POLICY", args.nonfinite_gradient_policy),
         render_env_value("CATK_INSTALL_REQUIREMENTS", args.install_requirements),
         render_env_value("NUBES_GATEWAY_ADDRESS", args.nubes_gateway),
         render_env_value("WANDB_ENTITY", args.wandb_entity),
@@ -280,6 +281,12 @@ def parse_args() -> argparse.Namespace:
         default="skip",
         choices=("raise", "skip"),
         help="Use 'skip' to zero-gradient only the rank/batch whose FM loss becomes non-finite.",
+    )
+    parser.add_argument(
+        "--nonfinite-gradient-policy",
+        default="allow",
+        choices=("raise", "allow", "zero"),
+        help="Use 'allow' with 16-mixed so Lightning GradScaler can skip non-finite AMP steps.",
     )
     parser.add_argument("--install-requirements", default="auto", choices=("auto", "0", "1"))
     parser.add_argument("--limit-train-batches", default="")

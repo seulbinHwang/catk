@@ -18,6 +18,7 @@ model_config:
   validation_open_seed: 0
   validation_closed_seed: 0
   nonfinite_fm_loss_policy: raise
+  nonfinite_gradient_policy: raise
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"

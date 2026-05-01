@@ -94,6 +94,14 @@ class SMARTFlow(LightningModule):
                 "model_config.nonfinite_fm_loss_policy must be 'raise' or 'skip', "
                 f"got {self.nonfinite_fm_loss_policy!r}."
             )
+        self.nonfinite_gradient_policy = str(
+            getattr(model_config, "nonfinite_gradient_policy", "raise")
+        ).lower()
+        if self.nonfinite_gradient_policy not in {"raise", "allow", "zero"}:
+            raise ValueError(
+                "model_config.nonfinite_gradient_policy must be 'raise', 'allow', or 'zero', "
+                f"got {self.nonfinite_gradient_policy!r}."
+            )
 
         draft_config = getattr(model_config, "draft", None)
         self.draft_enabled = bool(draft_config is not None and getattr(draft_config, "enabled", False))
@@ -362,6 +370,11 @@ class SMARTFlow(LightningModule):
             name: torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
             for name, value in metric_dict.items()
         }
+
+    def _zero_nonfinite_gradients(self) -> None:
+        for param in self.parameters():
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _update_weighted_validation_metrics(
         self,
@@ -1419,11 +1432,16 @@ open_metric_dict:
         return total_loss
 
     def on_after_backward(self) -> None:
-        """역전파 직후 non-finite gradient를 fail-fast로 잡습니다."""
+        """역전파 직후 non-finite gradient를 설정에 따라 처리합니다."""
         bad_grad = self._find_first_nonfinite_gradient()
         if bad_grad is None:
             return
         bad_name, bad_tensor = bad_grad
+        if self.nonfinite_gradient_policy == "allow":
+            return
+        if self.nonfinite_gradient_policy == "zero":
+            self._zero_nonfinite_gradients()
+            return
         raise RuntimeError(
             "Detected non-finite gradient after backward: "
             f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
