@@ -5,6 +5,12 @@ strategy:
   _target_: lightning.pytorch.strategies.DDPStrategy
   find_unused_parameters: false
   gradient_as_bucket_view: true
+  # Fit-time closed-loop validation can spend a long time in CPU-side official
+  # scorers before the next DDP collective. Keep this above the scorer worst
+  # case so healthy ranks do not trip the default 30-minute NCCL timeout.
+  timeout:
+    _target_: datetime.timedelta
+    seconds: 14400
 
 accelerator: gpu
 devices: -1
