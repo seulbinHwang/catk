@@ -130,6 +130,8 @@ V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 수 
 
 `finetune_draft_flow_v100x8`의 기본 batch 설정은 실측 안정값인 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다. `testv` + `testvv` 2-node run에서는 effective batch가 `36 * 16 GPUs * 1 = 576`입니다.
 
+V100x8 fit-time validation은 보수적으로 잡습니다. 이전 2-node run에서 Epoch 15 train은 정상 종료됐지만, `check_val_every_n_epoch=16`으로 시작된 closed-loop validation 중 한 worker가 메모리 압박으로 먼저 죽고 다음 NCCL collective에서 전체 run이 abort된 적이 있습니다. 그래서 `finetune_draft_flow_v100x8`은 현재 기본값을 `data.val_batch_size=2`, `model.model_config.n_rollout_closed_val=8`, `trainer.limit_val_batches=0.05`, `model.model_config.sim_agents_metric_workers=1`로 둡니다. train 속도는 유지하면서 validation의 per-rank rollout 메모리를 기존 `4 * 16 = 64`에서 `2 * 8 = 16`으로 줄이는 설정입니다.
+
 먼저 짧은 smoke run을 권장합니다.
 
 ```bash
@@ -233,6 +235,26 @@ kubectl exec -it -n p-pnc testv -c main -- tmux attach -t catk-draft-bs-sweep
 ```
 
 worker Pod인 `testvv`는 global rank 8-15만 갖기 때문에 Lightning progress bar가 기본적으로 출력되지 않습니다. 그래도 학습에는 참여 중이며 GPU heartbeat pane이나 `nvidia-smi`로 사용률을 확인할 수 있습니다.
+
+validation 도중 worker가 죽어서 중단된 경우에는 master pod에 남아 있는 `logs/<task_name>/runs/<timestamp>/checkpoints/epoch_last.ckpt`를 양쪽 pod의 같은 경로로 복사한 뒤 `action=fit`으로 재개합니다. `epoch_last.ckpt`는 validation 시작 직전의 loop 상태를 담고 있어서, 이미 끝난 train epoch을 다시 돌지 않고 완료하지 못한 fit-time validation부터 이어갈 수 있습니다.
+
+```bash
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --action fit \
+  --ckpt-path /mnt/nuplan/projects/catk/checkpoints/<copied_epoch_last>.ckpt \
+  --learning-rate 2e-4 \
+  --soft-limit-ratio 0.8 \
+  --train-batch-size 36 \
+  --accumulate-grad-batches 1 \
+  --task-name catk_draft_v100x8x2_soft_limit_ratio_0.8_valfix_resume \
+  --session catk-draft-bs-sweep \
+  --replace
+```
 
 #### Case 1-B. `testsv`, `testsvv`, `testsvvv`, `testsvvvv` V100x4 Pod 4개를 새로 만들어 쓰는 경우
 

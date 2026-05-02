@@ -75,6 +75,11 @@ main() {
     export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
     export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
     export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+    # Fit-time closed-loop validation can legitimately have long CPU scorer
+    # sections. Give NCCL enough watchdog headroom so transient stalls do not
+    # abort healthy ranks; real worker death will still fail the job.
+    export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
+    export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
 
     activate_conda_if_available
 
