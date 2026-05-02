@@ -130,7 +130,7 @@ V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 수 
 
 `finetune_draft_flow_v100x8`의 기본 batch 설정은 실측 안정값인 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다. `testv` + `testvv` 2-node run에서는 effective batch가 `36 * 16 GPUs * 1 = 576`입니다.
 
-V100x8 fit-time validation은 비교 공정성을 유지합니다. 이전 2-node run에서 Epoch 15 train은 정상 종료됐지만, `check_val_every_n_epoch=16`으로 시작된 closed-loop validation 중 공식 `sim_agents_2025` TensorFlow scorer가 오래 CPU를 점유했고, 한 worker가 먼저 죽은 뒤 다음 NCCL collective에서 전체 run이 abort된 적이 있습니다. 그래서 `finetune_draft_flow_v100x8`은 평가량을 줄이지 않고 `data.val_batch_size=4`, `model.model_config.n_rollout_closed_val=16`, `model.model_config.n_batch_sim_agents_metric=10`, `trainer.limit_val_batches=0.1`을 유지합니다. 안정성 조치는 `model.model_config.sim_agents_metric_workers=1`로 scorer를 rank마다 순차 실행하고, NCCL heartbeat timeout을 길게 두는 것입니다. 이 설정은 느릴 수 있지만, 평가하는 batch/rollout/scorer 수를 줄이지 않습니다.
+V100x8 fit-time validation은 비교 공정성을 유지합니다. 이전 2-node run에서 Epoch 15 train은 정상 종료됐지만, `check_val_every_n_epoch=16`으로 시작된 closed-loop validation 중 한 worker가 먼저 죽은 뒤 다음 NCCL collective에서 전체 run이 abort된 적이 있습니다. 이 문제는 scorer를 순차 실행하도록 바꾸지 않고, `data.val_batch_size=2`로 peak memory만 낮춰 대응합니다. 대신 공식 scorer scene 수가 줄지 않도록 `model.model_config.n_batch_sim_agents_metric=20`으로 맞춥니다. 즉 `20 batch * 2 scene/rank`가 예전 `10 batch * 4 scene/rank`와 같고, `model.model_config.n_rollout_closed_val=16`, `trainer.limit_val_batches=0.1`, scorer worker 병렬성은 유지합니다.
 
 먼저 짧은 smoke run을 권장합니다.
 
@@ -258,7 +258,7 @@ python scripts/launch_mlx_static_pods_tmux.py \
 
 8-GPU pod 하나와 7-GPU pod 하나처럼 GPU 수가 서로 다르면 일반 `torchrun --nproc_per_node 8 --nnodes 2`는 사용할 수 없습니다. 이때는 hetero static launcher를 사용합니다. 이 launcher는 각 GPU를 1-GPU logical node로 보고, `testv`의 8개 GPU와 `testvv`의 7개 GPU를 합쳐 `world_size=15`로 실행합니다.
 
-validation 도중 죽은 run을 16 GPU에서 15 GPU로 바꿔 복구할 때는 먼저 같은 checkpoint로 validation-only를 통과시키는 편이 안전합니다. 15 GPU에서 16 GPU run과 같은 공식 scorer scene 수를 맞추려면 `n_batch_sim_agents_metric=11`, `n_scenario_sim_agents_metric=640`을 같이 줍니다. 이렇게 하면 16 GPU run의 `10 batch * 4 scene * 16 rank = 640 scene`과 같은 수만 공식 scorer에 들어갑니다.
+validation 도중 죽은 run을 16 GPU에서 15 GPU로 바꿔 복구할 때는 먼저 같은 checkpoint로 validation-only를 통과시키는 편이 안전합니다. 15 GPU에서 16 GPU run과 같은 공식 scorer scene 수를 맞추려면 `n_batch_sim_agents_metric=22`, `n_scenario_sim_agents_metric=640`을 같이 줍니다. 이렇게 하면 16 GPU run의 `20 batch * 2 scene * 16 rank = 640 scene`과 같은 수만 공식 scorer에 들어갑니다.
 
 ```bash
 python scripts/launch_mlx_hetero_static_pods_tmux.py \
@@ -275,7 +275,7 @@ python scripts/launch_mlx_hetero_static_pods_tmux.py \
   --soft-limit-ratio 0.8 \
   --train-batch-size 36 \
   --accumulate-grad-batches 1 \
-  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=11 model.model_config.n_scenario_sim_agents_metric=640" \
+  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=22 model.model_config.n_scenario_sim_agents_metric=640" \
   --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_valfix_validate \
   --session catk-draft-hetero15-validate \
   --master-port 29541 \
@@ -299,7 +299,7 @@ python scripts/launch_mlx_hetero_static_pods_tmux.py \
   --soft-limit-ratio 0.8 \
   --train-batch-size 36 \
   --accumulate-grad-batches 1 \
-  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=11 model.model_config.n_scenario_sim_agents_metric=640" \
+  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=22 model.model_config.n_scenario_sim_agents_metric=640" \
   --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_valfix_resume \
   --session catk-draft-hetero15-valfix \
   --replace
