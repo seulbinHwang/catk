@@ -79,6 +79,11 @@ class SMARTFlow(LightningModule):
         self.vis_flow_2s_preview = bool(getattr(model_config, "vis_flow_2s_preview", False))
         self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
+        self.n_scenario_sim_agents_metric = getattr(
+            model_config,
+            "n_scenario_sim_agents_metric",
+            None,
+        )
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
 
@@ -981,10 +986,25 @@ class SMARTFlow(LightningModule):
                     target_valid=target_valid_predict,
                 )
         if batch_idx < self.n_batch_sim_agents_metric:
+            scenario_files = data["tfrecord_path"]
+            agent_id = data["agent"]["id"]
+            agent_batch = data["agent"]["batch"]
+            if self.n_scenario_sim_agents_metric is not None:
+                scenario_files, agent_id, agent_batch, pred_traj, pred_z, pred_head = (
+                    self._filter_sim_agents_metric_scenarios(
+                        batch_idx=batch_idx,
+                        scenario_files=scenario_files,
+                        agent_id=agent_id,
+                        agent_batch=agent_batch,
+                        pred_traj=pred_traj,
+                        pred_z=pred_z,
+                        pred_head=pred_head,
+                    )
+                )
             self.sim_agents_metrics.update_from_prediction_tensors(
-                scenario_files=data["tfrecord_path"],
-                agent_id=data["agent"]["id"],
-                agent_batch=data["agent"]["batch"],
+                scenario_files=scenario_files,
+                agent_id=agent_id,
+                agent_batch=agent_batch,
                 pred_traj=pred_traj,
                 pred_z=pred_z,
                 pred_head=pred_head,
@@ -1000,6 +1020,72 @@ class SMARTFlow(LightningModule):
                 pred_head=pred_head,
             )
         return scenario_rollouts
+
+    def _filter_sim_agents_metric_scenarios(
+        self,
+        batch_idx: int,
+        scenario_files: list[str],
+        agent_id: Tensor,
+        agent_batch: Tensor,
+        pred_traj: Tensor,
+        pred_z: Tensor,
+        pred_head: Tensor,
+    ) -> tuple[list[str], Tensor, Tensor, Tensor, Tensor, Tensor]:
+        max_scenarios = int(self.n_scenario_sim_agents_metric)
+        if max_scenarios <= 0 or not scenario_files:
+            return (
+                [],
+                agent_id[:0],
+                agent_batch[:0],
+                pred_traj[:0],
+                pred_z[:0],
+                pred_head[:0],
+            )
+
+        world_size = max(1, int(getattr(self.trainer, "world_size", 1) or 1))
+        global_rank = int(getattr(self.trainer, "global_rank", self.global_rank) or 0)
+        batch_size = len(scenario_files)
+        selected_indices = [
+            scenario_idx
+            for scenario_idx in range(batch_size)
+            if global_rank + world_size * (batch_idx * batch_size + scenario_idx)
+            < max_scenarios
+        ]
+        if len(selected_indices) == batch_size:
+            return scenario_files, agent_id, agent_batch, pred_traj, pred_z, pred_head
+        if not selected_indices:
+            return (
+                [],
+                agent_id[:0],
+                agent_batch[:0],
+                pred_traj[:0],
+                pred_z[:0],
+                pred_head[:0],
+            )
+
+        device = agent_batch.device
+        selected_tensor = torch.as_tensor(selected_indices, dtype=torch.long, device=device)
+        scenario_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        scenario_mask[selected_tensor] = True
+        agent_batch_long = agent_batch.to(dtype=torch.long)
+        agent_mask = scenario_mask[agent_batch_long]
+
+        remap = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+        remap[selected_tensor] = torch.arange(
+            len(selected_indices),
+            dtype=torch.long,
+            device=device,
+        )
+        filtered_agent_batch = remap[agent_batch_long[agent_mask]]
+        filtered_scenario_files = [scenario_files[idx] for idx in selected_indices]
+        return (
+            filtered_scenario_files,
+            agent_id[agent_mask],
+            filtered_agent_batch,
+            pred_traj[agent_mask],
+            pred_z[agent_mask],
+            pred_head[agent_mask],
+        )
 
     def on_fit_start(self) -> None:
         """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.

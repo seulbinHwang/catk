@@ -6,6 +6,9 @@ model_config:
   lr_min_ratio: 0.01
   n_rollout_closed_val: 8
   n_batch_sim_agents_metric: 10
+  # Optional absolute cap for official sim_agents scorer scenes. Leave null
+  # for the legacy per-rank `n_batch_sim_agents_metric` behavior.
+  n_scenario_sim_agents_metric: null
   sim_agents_metric_workers: 3
   n_vis_batch: 0
   n_vis_scenario: 0
