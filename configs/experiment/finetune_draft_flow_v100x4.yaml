@@ -38,7 +38,7 @@ model:
     # Validation ------------------------------------------------------------
     n_rollout_closed_val: 16
     n_batch_sim_agents_metric: 10
-    sim_agents_metric_workers: 2
+    sim_agents_metric_workers: 1
     val_open_loop: true
     val_closed_loop: true
 
