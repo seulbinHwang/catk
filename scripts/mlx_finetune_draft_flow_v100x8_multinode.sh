@@ -78,7 +78,7 @@ main() {
     # Fit-time closed-loop validation can legitimately have long CPU scorer
     # sections. Give NCCL enough watchdog headroom so transient stalls do not
     # abort healthy ranks; real worker death will still fail the job.
-    export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
+    export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-14400}"
     export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
 
     activate_conda_if_available
