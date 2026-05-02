@@ -38,7 +38,7 @@ model_config:
     loss_enabled: true
     start_epoch: 0
     ramp_epochs: 4
-    max_weight: 1.0
+    max_weight: 0.2
     sampling:
       sample_steps: 32
       sample_method: euler
