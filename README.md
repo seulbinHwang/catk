@@ -130,7 +130,7 @@ V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 수 
 
 `finetune_draft_flow_v100x8`의 기본 batch 설정은 실측 안정값인 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다. `testv` + `testvv` 2-node run에서는 effective batch가 `36 * 16 GPUs * 1 = 576`입니다.
 
-V100x8 fit-time validation은 보수적으로 잡습니다. 이전 2-node run에서 Epoch 15 train은 정상 종료됐지만, `check_val_every_n_epoch=16`으로 시작된 closed-loop validation 중 한 worker가 메모리 압박으로 먼저 죽고 다음 NCCL collective에서 전체 run이 abort된 적이 있습니다. 그래서 `finetune_draft_flow_v100x8`은 현재 기본값을 `data.val_batch_size=2`, `model.model_config.n_rollout_closed_val=8`, `trainer.limit_val_batches=0.05`, `model.model_config.sim_agents_metric_workers=1`로 둡니다. train 속도는 유지하면서 validation의 per-rank rollout 메모리를 기존 `4 * 16 = 64`에서 `2 * 8 = 16`으로 줄이는 설정입니다.
+V100x8 fit-time validation은 보수적으로 잡습니다. 이전 2-node run에서 Epoch 15 train은 정상 종료됐지만, `check_val_every_n_epoch=16`으로 시작된 closed-loop validation 중 공식 `sim_agents_2025` TensorFlow scorer가 오래 CPU를 점유했고, 한 worker가 먼저 죽은 뒤 다음 NCCL collective에서 전체 run이 abort된 적이 있습니다. 그래서 `finetune_draft_flow_v100x8`은 현재 기본값을 `data.val_batch_size=2`, `model.model_config.n_rollout_closed_val=8`, `model.model_config.n_batch_sim_agents_metric=1`, `trainer.limit_val_batches=4`, `model.model_config.sim_agents_metric_workers=1`로 둡니다. train 속도는 유지하면서 validation의 per-rank rollout 메모리를 기존 `4 * 16 = 64`에서 `2 * 8 = 16`으로 줄이고, 무거운 공식 scorer는 첫 batch에서만 실행합니다.
 
 먼저 짧은 smoke run을 권장합니다.
 

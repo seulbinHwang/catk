@@ -38,7 +38,8 @@
 #     validation and lost a worker before the next NCCL collective. Keep the
 #     train default aggressive, but make fit-time validation conservative:
 #     `2 * 8 = 16` rollouts per rank instead of the old `4 * 16 = 64`.
-#     The 2025 sim_agents scorer can still up-sample internally for scoring.
+#     The official 2025 sim_agents scorer is TensorFlow CPU-heavy, so score
+#     only the first validation batch during scheduled fit-time validation.
 #
 #   * CPU-side: 8 DDP ranks * 4 workers = 32 dataloader procs easily
 #     overwhelms page-locked memory / file-handle limits on shared boxes.
@@ -73,9 +74,9 @@ model:
     # CUDA OOM is auto-chunked in smart_flow.py, but CPU-side scorer worker
     # OOM can kill a rank and surface later as an NCCL remote error.
     n_rollout_closed_val: 8
-    # Keep the 2025 sim-agents metric on, but use one scorer process per rank
-    # to avoid CPU RAM spikes during validation.
-    n_batch_sim_agents_metric: 10
+    # Keep the 2025 sim-agents metric on, but score only the first batch and
+    # use one scorer process per rank to avoid CPU RAM spikes / long stalls.
+    n_batch_sim_agents_metric: 1
     sim_agents_metric_workers: 1
     val_open_loop: true
     val_closed_loop: true
@@ -127,10 +128,11 @@ ckpt_path: null
 
 trainer:
   limit_train_batches: 1.0
-  # With 16 ranks and val_batch_size=2, 0.05 still evaluates about 69 batches
-  # per rank, while the per-batch closed-loop memory drops 4x vs. the old
-  # val_batch_size=4, n_rollout_closed_val=16 setting.
-  limit_val_batches: 0.05
+  # Keep scheduled validation short on V100 multi-node runs. The first batch
+  # computes the official TensorFlow sim_agents metric; the remaining batches
+  # keep a small closed-loop / open-loop smoke signal without the old hour-long
+  # scorer stall.
+  limit_val_batches: 4
   check_val_every_n_epoch: 16
   # Epoch count matches the H100 / A100x4 presets (user policy: do not reduce).
   max_epochs: 32
