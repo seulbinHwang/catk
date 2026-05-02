@@ -379,10 +379,11 @@ torchrun ... -m src.run \
 - `use_stop_motion=true`면 stop token 과 일치하는 agent 의 다음 0.5초 5점을 현재 상태로 완전 고정합니다.
 - `use_lqr=true`는 stop gate를 통과한 vehicle / bicycle 에만 적용됩니다. pedestrian 은 항상
   token / raw branch 를 유지합니다.
-- `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다.
+- `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다. 단, `model.model_config.scorer_scene_num`이 양의 정수이면 이 값은 validation 시작 시 자동으로 덮어써집니다.
+- `model.model_config.scorer_scene_num`는 GPU 개수와 validation batch size가 달라도 공식 scorer에 들어가는 scene 규모를 비슷하게 맞추기 위한 기준값입니다. 기본값은 `960` 입니다. 실제 적용식은 `n_batch_sim_agents_metric = max(1, ceil(ceil(scorer_scene_num / world_size) / val_batch_size))` 입니다. `null` 또는 `0` 으로 두면 자동 덮어쓰기를 끄고 명시한 `n_batch_sim_agents_metric` 값을 그대로 씁니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
-- `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다.
-- 공식 2025 scorer 기준 총 채점 scene 수는 대략 `min(실행한 val batch 수, n_batch_sim_agents_metric) x val_batch_size` 입니다.
+- `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다. `scorer_scene_num` 자동 덮어쓰기가 켜져 있으면 이 값이 `n_batch_sim_agents_metric` 계산식의 분모가 됩니다.
+- 공식 2025 scorer 기준 총 채점 scene 수는 `scorer_scene_num`이 켜져 있으면 대략 `n_batch_sim_agents_metric x val_batch_size x world_size` 입니다. batch 단위로만 자르므로 요청값보다 조금 커질 수 있습니다. 끈 경우에는 대략 `min(실행한 val batch 수, n_batch_sim_agents_metric) x val_batch_size x world_size` 입니다.
 - closed-loop rollout 총 수는 대략 `(실행한 val batch 수) x val_batch_size x n_rollout_closed_val` 입니다.
 
 예시:
@@ -419,7 +420,15 @@ torchrun ... -m src.run \
     model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
 # training validation에서 공식 2025 scorer를 앞 20 batch에만 적용
-... model.model_config.n_batch_sim_agents_metric=20
+# scorer_scene_num 자동 덮어쓰기를 끈 경우에만 의미가 있습니다.
+... model.model_config.scorer_scene_num=null \
+    model.model_config.n_batch_sim_agents_metric=20
+
+# 공식 2025 scorer 채점 규모를 GPU 수와 무관하게 대략 1920 scene으로 맞추기
+... model.model_config.scorer_scene_num=1920
+
+# scorer_scene_num 자동 덮어쓰기 끄기
+... model.model_config.scorer_scene_num=null
 
 # validation을 전체 val set에 대해 수행
 ... trainer.limit_val_batches=1.0

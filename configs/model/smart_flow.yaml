@@ -9,6 +9,10 @@ model_config:
   # CPD/CES are always evaluated regardless of this value.
   wosac_cpd_reference: null
   n_batch_sim_agents_metric: 10
+  # Positive values auto-set n_batch_sim_agents_metric from world_size and
+  # val_batch_size so scorer work is comparable across GPU counts. Set null or
+  # 0 to keep the explicit n_batch_sim_agents_metric value.
+  scorer_scene_num: 960
   sim_agents_metric_workers: 3
   n_vis_batch: 0
   n_vis_scenario: 0

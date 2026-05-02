@@ -128,6 +128,8 @@ class SMARTFlow(LightningModule):
         )
         self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
+        self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
+        self._scorer_scene_num_last_key: tuple[int, int, int] | None = None
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
         self.open_metric_names = {
@@ -459,6 +461,65 @@ class SMARTFlow(LightningModule):
             and not self.sim_agents_submission.is_active
             and int(self.n_batch_sim_agents_metric) > 0
         )
+
+    def _resolve_val_batch_size(self) -> int | None:
+        """현재 trainer datamodule의 validation batch size를 안전하게 읽습니다."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return None
+        val_batch_size = getattr(datamodule, "val_batch_size", None)
+        if not isinstance(val_batch_size, int) or val_batch_size <= 0:
+            return None
+        return int(val_batch_size)
+
+    def _apply_scorer_scene_num_overrides(self) -> None:
+        """GPU 수와 validation batch size에 맞춰 scorer batch 수를 자동 조정합니다.
+
+        ``scorer_scene_num`` 이 양의 정수이면 전역 기준으로 그 정도의 scene을
+        official scorer에 넣을 수 있도록 ``n_batch_sim_agents_metric`` 을 per-rank
+        batch 수로 덮어씁니다. 별도의 scenario-level cap은 두지 않습니다.
+        """
+        scorer_scene_num = self.scorer_scene_num
+        if scorer_scene_num is None:
+            return
+        try:
+            scorer_scene_num = int(scorer_scene_num)
+        except (TypeError, ValueError):
+            return
+        if scorer_scene_num <= 0:
+            return
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        if world_size <= 0:
+            world_size = 1
+
+        val_batch_size = self._resolve_val_batch_size()
+        if val_batch_size is None:
+            return
+
+        per_rank_scenes = math.ceil(scorer_scene_num / world_size)
+        n_batch_override = max(1, math.ceil(per_rank_scenes / val_batch_size))
+        self.n_batch_sim_agents_metric = int(n_batch_override)
+
+        current_key = (int(scorer_scene_num), int(world_size), int(val_batch_size))
+        if self._scorer_scene_num_last_key == current_key:
+            return
+        self._scorer_scene_num_last_key = current_key
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[scorer_scene_num] 공식 sim_agents_2025 scorer batch 수를 "
+                f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric} 으로 설정합니다 "
+                f"(requested_scenes={scorer_scene_num}, world_size={world_size}, "
+                f"val_batch_size={val_batch_size}).",
+                flush=True,
+            )
 
     def _apply_fit_time_validation_batch_limit(self) -> None:
         """학습 중 validation에서 앞쪽 일부 batch만 돌도록 trainer 값을 바꿉니다.
@@ -2201,9 +2262,14 @@ class SMARTFlow(LightningModule):
         Returns:
             None
         """
+        self._apply_scorer_scene_num_overrides()
         self._apply_fit_time_validation_batch_limit()
         self._sync_self_forced_auxiliary_models()
         self._prepare_self_forced_generator_ema()
+
+    def on_validation_start(self) -> None:
+        """validation 시작 직전에 scorer batch 수 자동 조정을 다시 시도합니다."""
+        self._apply_scorer_scene_num_overrides()
 
     def on_fit_end(self) -> None:
         """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.
