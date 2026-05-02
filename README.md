@@ -236,13 +236,13 @@ worker Pod인 `testvv`는 global rank 8-15만 갖기 때문에 Lightning progres
 
 #### Case 1-B. `testsv`, `testsvv`, `testvvv` V100x4 Pod 3개를 새로 만들어 쓰는 경우
 
-V100 4장짜리 Pod 3개로 하나의 run을 돌릴 때는 전체 GPU가 `4 * 3 = 12`장입니다. 이전 V100x8 Pod 2개 run의 effective batch `576`을 유지하려면 아래처럼 둡니다.
+V100 4장짜리 Pod 3개로 하나의 run을 돌릴 때는 전체 GPU가 `4 * 3 = 12`장입니다. 이 경우 `--nproc-per-node 4`를 주면 런처가 기본 experiment를 `finetune_draft_flow_v100x4`로 자동 선택합니다. 이 preset의 기본 batch 설정은 V100x8과 동일하게 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다.
 
 ```text
-train_batch_size 16 * total_gpus 12 * accumulate_grad_batches 3 = 576
+train_batch_size 36 * total_gpus 12 * accumulate_grad_batches 1 = 432
 ```
 
-이 설정은 per-GPU batch가 16이라 V100 32GB에서 `train_batch_size=48, accumulate=1`보다 훨씬 안전합니다. `soft_limit_ratio=0.8`은 명령줄에서 명시해 실험 이름과 설정이 같이 남도록 합니다.
+`soft_limit_ratio=0.8`은 `finetune_draft_flow_v100x4` 안의 기본값이지만, 명령줄에 명시해도 됩니다. 이전처럼 exact effective batch `576`을 재현하고 싶을 때만 `--train-batch-size 16 --accumulate-grad-batches 3`을 따로 붙이세요.
 
 1. Pod 생성
 
@@ -299,13 +299,10 @@ python scripts/launch_mlx_static_pods_tmux.py \
   --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
   --nproc-per-node 4 \
   --learning-rate 2e-4 \
-  --soft-limit-ratio 0.8 \
-  --train-batch-size 16 \
-  --accumulate-grad-batches 3 \
   --limit-train-batches 40 \
   --limit-val-batches 0 \
   --max-epochs 1 \
-  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.8_bs16_acc3_smoke \
+  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.8_bs36_acc1_smoke \
   --session catk-draft-v100x4x3 \
   --replace
 ```
@@ -330,10 +327,7 @@ python scripts/launch_mlx_static_pods_tmux.py \
   --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
   --nproc-per-node 4 \
   --learning-rate 2e-4 \
-  --soft-limit-ratio 0.8 \
-  --train-batch-size 16 \
-  --accumulate-grad-batches 3 \
-  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.8_bs16_acc3 \
+  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.8_bs36_acc1 \
   --session catk-draft-v100x4x3 \
   --replace
 ```

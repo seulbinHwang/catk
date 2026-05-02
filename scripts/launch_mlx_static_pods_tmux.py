@@ -18,6 +18,12 @@ DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 
 
+def default_experiment(nproc_per_node: int) -> str:
+    if nproc_per_node == 4:
+        return "finetune_draft_flow_v100x4"
+    return "finetune_draft_flow_v100x8"
+
+
 def shq(value: object) -> str:
     return shlex.quote(str(value))
 
@@ -265,7 +271,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrain-ckpt", default="")
     parser.add_argument("--action", choices=["finetune", "fit"], default="finetune")
     parser.add_argument("--ckpt-path", default="")
-    parser.add_argument("--experiment", default="finetune_draft_flow_v100x8")
+    parser.add_argument(
+        "--experiment",
+        default="auto",
+        help="Hydra experiment preset. 'auto' selects v100x4 for nproc=4, otherwise v100x8.",
+    )
     parser.add_argument("--task-name", default="")
     parser.add_argument("--session", default="catk-draft-multinode")
     parser.add_argument("--master-addr", default="")
@@ -299,6 +309,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--nproc-per-node must be >= 1")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
+    if args.experiment == "auto":
+        args.experiment = default_experiment(args.nproc_per_node)
     if not args.task_name:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         args.task_name = f"catk_draft_v100x{args.nproc_per_node}x{len(args.pods)}_{stamp}"
