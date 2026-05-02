@@ -119,6 +119,8 @@ V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 수 
 
 - `scripts/launch_mlx_static_pods_tmux.py`: 이미 떠 있는 고정 Pod에 tmux 세션을 만들고 static `torchrun`을 시작합니다.
 - `scripts/launch_mlx_static_pods_bs_sweep.py`: 고정 Pod에서 `train_batch_size`를 키워 시도하고, CUDA OOM이면 batch size를 낮춰 재시작/재개합니다.
+- `scripts/create_mlx_static_v100_pods.py`: `testsv` 같은 장기 실행 V100 Pod를 만들고, 스케줄링이 안 되면 CPU/memory request를 낮춰 재시도합니다.
+- `scripts/prepare_mlx_static_pods_assets.py`: 각 static Pod 안에서 repo, conda env, SMART cache, W&B checkpoint를 준비하고 검증합니다.
 - `scripts/render_mlx_finetune_pytorchjob.py`: 새 worker Pod를 만드는 Kubeflow `PyTorchJob` YAML을 생성합니다.
 - `scripts/mlx_finetune_draft_flow_v100x8_multinode.sh`: 각 worker 안에서 실제 `torchrun`을 실행하는 공통 wrapper입니다.
 
@@ -141,6 +143,7 @@ python scripts/launch_mlx_static_pods_tmux.py \
   --learning-rate 2e-4 \
   --limit-train-batches 40 \
   --limit-val-batches 0 \
+  --max-epochs 1 \
   --session catk-draft-ft \
   --replace
 ```
@@ -229,6 +232,121 @@ kubectl exec -it -n p-pnc testv -c main -- tmux attach -t catk-draft-bs-sweep
 
 worker Pod인 `testvv`는 global rank 8-15만 갖기 때문에 Lightning progress bar가 기본적으로 출력되지 않습니다. 그래도 학습에는 참여 중이며 GPU heartbeat pane이나 `nvidia-smi`로 사용률을 확인할 수 있습니다.
 
+#### Case 1-B. `testsv`, `testsvv`, `testvvv` V100x4 Pod 3개를 새로 만들어 쓰는 경우
+
+V100 4장짜리 Pod 3개로 하나의 run을 돌릴 때는 전체 GPU가 `4 * 3 = 12`장입니다. 이전 V100x8 Pod 2개 run의 effective batch `576`을 유지하려면 아래처럼 둡니다.
+
+```text
+train_batch_size 16 * total_gpus 12 * accumulate_grad_batches 3 = 576
+```
+
+이 설정은 per-GPU batch가 16이라 V100 32GB에서 `train_batch_size=48, accumulate=1`보다 훨씬 안전합니다. `soft_limit_ratio=0.8`은 명령줄에서 명시해 실험 이름과 설정이 같이 남도록 합니다.
+
+1. Pod 생성
+
+```bash
+cd /path/to/catk
+
+python scripts/create_mlx_static_v100_pods.py \
+  --namespace p-pnc \
+  --pods testsv testsvv testvvv \
+  --gpu-count 4 \
+  --zone private-v100-naverlabs-0
+```
+
+첫 profile은 `requests.cpu=32`, `requests.memory=128Gi`, `limits.memory=480Gi`, `nvidia.com/gpu=4`입니다. 스케줄링이 안 되면 같은 Pod 이름을 지웠다가 `96Gi/384Gi`, `64Gi/256Gi` 순서로 낮춰 재시도합니다. 이미 같은 이름의 Pod가 있으면 건드리지 않습니다. 처음부터 다시 만들려면 `--replace`를 붙입니다.
+
+2. repo / conda env / cache / checkpoint 준비
+
+```bash
+python scripts/prepare_mlx_static_pods_assets.py \
+  --namespace p-pnc \
+  --pods testsv testsvv testvvv \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --cache-source labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
+  --artifact jksg01019-naver-labs/SMART-FLOW/epoch-last-4pxhrpv8:v70 \
+  --ckpt-path /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --replace
+```
+
+이 스크립트는 각 Pod 안에 `catk-pod-prepare` tmux session을 만들고 병렬로 준비합니다. SMART cache 다운로드는 보통 오래 걸립니다. 중간 상태만 보려면:
+
+```bash
+python scripts/prepare_mlx_static_pods_assets.py \
+  --namespace p-pnc \
+  --pods testsv testsvv testvvv \
+  --status-only
+```
+
+개별 로그를 보고 싶으면:
+
+```bash
+kubectl exec -it -n p-pnc testsv -c main -- tmux attach -t catk-pod-prepare
+```
+
+3. 짧은 multi-node smoke run
+
+```bash
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testsv testsvv testvvv \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --nproc-per-node 4 \
+  --learning-rate 2e-4 \
+  --soft-limit-ratio 0.8 \
+  --train-batch-size 16 \
+  --accumulate-grad-batches 3 \
+  --limit-train-batches 40 \
+  --limit-val-batches 0 \
+  --max-epochs 1 \
+  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.8_bs16_acc3_smoke \
+  --session catk-draft-v100x4x3 \
+  --replace
+```
+
+progress bar는 master Pod인 `testsv`에서 봅니다.
+
+```bash
+kubectl exec -it -n p-pnc testsv -c main -- tmux attach -t catk-draft-v100x4x3
+```
+
+4. full run
+
+smoke run 연결이 정상임을 확인한 뒤 같은 session 이름으로 full run을 다시 시작합니다.
+
+```bash
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testsv testsvv testvvv \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --nproc-per-node 4 \
+  --learning-rate 2e-4 \
+  --soft-limit-ratio 0.8 \
+  --train-batch-size 16 \
+  --accumulate-grad-batches 3 \
+  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.8_bs16_acc3 \
+  --session catk-draft-v100x4x3 \
+  --replace
+```
+
+중단:
+
+```bash
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testsv testsvv testvvv \
+  --container main \
+  --session catk-draft-v100x4x3 \
+  --stop
+```
+
 #### Case 2. 아직 worker Pod가 없는 경우
 
 새 Pod를 만들어야 하면 Kubeflow `PyTorchJob`이 가장 깔끔합니다. PyTorchJob은 worker Pod 수, rendezvous endpoint, rank 관련 환경을 자동으로 맞춥니다. 이 방식은 Kubernetes Job lifecycle을 따르므로 tmux 대신 `kubectl logs`로 보는 것이 기본입니다. 꼭 tmux가 필요하면 먼저 장기 실행 Pod를 만든 뒤 Case 1의 static tmux launcher를 쓰세요.
@@ -249,6 +367,7 @@ python scripts/render_mlx_finetune_pytorchjob.py \
   --learning-rate 2e-4 \
   --limit-train-batches 40 \
   --limit-val-batches 0 \
+  --extra-hydra-overrides trainer.max_epochs=1 \
   --output /tmp/catk-draft-v100x8x2-smoke.yaml
 
 kubectl apply -f /tmp/catk-draft-v100x8x2-smoke.yaml

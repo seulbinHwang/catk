@@ -76,6 +76,7 @@ def render_env_file(
         "CATK_CKPT_PATH": args.ckpt_path,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
+        "MAX_EPOCHS": args.max_epochs,
         "SOFT_LIMIT_RATIO": args.soft_limit_ratio,
         "TOPK_VIOLATION_K": args.topk_violation_k,
         "BACKPROP_LAST_K": args.backprop_last_k,
@@ -274,6 +275,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
+    parser.add_argument("--max-epochs", default="")
     parser.add_argument("--soft-limit-ratio", default="")
     parser.add_argument("--topk-violation-k", default="")
     parser.add_argument("--backprop-last-k", default="")
@@ -299,7 +301,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--monitor-interval must be >= 1")
     if not args.task_name:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.task_name = f"catk_draft_v100x8x{len(args.pods)}_{stamp}"
+        args.task_name = f"catk_draft_v100x{args.nproc_per_node}x{len(args.pods)}_{stamp}"
     return args
 
 

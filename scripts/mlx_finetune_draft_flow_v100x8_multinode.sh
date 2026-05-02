@@ -194,6 +194,9 @@ main() {
     if [[ -n "${LIMIT_VAL_BATCHES:-}" ]]; then
         torchrun_args+=(trainer.limit_val_batches="$LIMIT_VAL_BATCHES")
     fi
+    if [[ -n "${MAX_EPOCHS:-}" ]]; then
+        torchrun_args+=(trainer.max_epochs="$MAX_EPOCHS")
+    fi
     if [[ -n "${SOFT_LIMIT_RATIO:-}" ]]; then
         torchrun_args+=(model.model_config.draft.physics.soft_limit_ratio="$SOFT_LIMIT_RATIO")
     fi
