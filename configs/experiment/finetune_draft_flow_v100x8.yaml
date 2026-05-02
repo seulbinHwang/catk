@@ -13,21 +13,16 @@
 #     fails on some kernels. `16-mixed` uses FP16 with automatic loss scaling
 #     and runs on the FP16 tensor cores at full speed.
 #
-#   * VRAM: 80 GiB -> 32 GiB per GPU (~2.5x less). We must drop the per-GPU
-#     batch accordingly. Effective global batch is kept at 288 (= 6xH100
-#     preset = A100x4 preset) so the pretrained `lr=2e-4` regime carries
-#     over unchanged:
-#         per_gpu_batch * num_gpus * accumulate_grad_batches = 12 * 8 * 3 = 288
-#     This is a conservative starting point for the first V100x8 run. If
-#     it OOMs during DRaFT backprop (seq-len blow-up on scene-variance
-#     spikes), step DOWN in this order BEFORE touching `train_batch_size`:
-#         1) `model.model_config.draft.sampling.backprop_last_k` 24 -> 12 -> 8
-#         2) `data.train_batch_size` 12 -> 9 (with accumulate_grad_batches=4)
-#         3) `data.train_batch_size` 9  -> 6 (with accumulate_grad_batches=6)
-#     Always rescale `accumulate_grad_batches` so that
-#     `train_batch_size * 8 * accumulate_grad_batches = 288`, so `lr=2e-4`
-#     stays valid. If you must deviate from effective 288, apply linear
-#     lr scaling (lr_new = 2e-4 * eff_new / 288).
+#   * VRAM: 80 GiB -> 32 GiB per GPU (~2.5x less). Empirical multi-node
+#     runs on two V100x8 pods (`testv`, `testvv`) are stable with
+#     `train_batch_size=36` and `accumulate_grad_batches=1`, so that is now
+#     the default. On one V100x8 pod the effective global batch is kept at
+#     288 (= 36 * 8 * 1), matching the 6xH100 / A100x4 training regime and
+#     preserving `lr=2e-4`. On N V100x8 pods the effective batch scales to
+#     288 * N; keep `lr=2e-4` unless you intentionally re-tune it.
+#     If a new V100 box OOMs, first use the adaptive batch sweep or step
+#     `data.train_batch_size` down in this order:
+#         36 -> 28 -> 20 -> 12
 #
 #   * Attention kernel: A100x4 ships a math-SDPA patch in
 #     `src/smart/modules/flow_local_decoder.py` for the ChunkStepRefiner
@@ -48,7 +43,7 @@
 #     Bump back to 4 only if you verify the box has enough RAM headroom.
 #
 # Effective global batch size on this preset:
-#   per_gpu_batch * num_gpus * accumulate_grad_batches = 12 * 8 * 3 = 288
+#   per_gpu_batch * num_gpus * accumulate_grad_batches = 36 * 8 * 1 = 288
 #   (identical to the 6xH100 preset, so `lr=2e-4` carries over directly.)
 # ============================================================================
 
@@ -58,7 +53,7 @@ defaults:
 model:
   model_config:
     # Optimizer / scheduler --------------------------------------------------
-    # Effective global batch here is 12 * 8 * 3 = 288 (identical to the
+    # Effective global batch here is 36 * 8 * 1 = 288 (identical to the
     # 6xH100 and A100x4 presets), so the same lr=2e-4 applies unchanged.
     lr: 2e-4
     lr_warmup_steps: 2
@@ -98,9 +93,9 @@ model:
         sample_steps: 32
         sample_method: euler
         noise_scale: 1.0
-        # V100 32GB is tight during the DRaFT backward pass. Start at 24
-        # and drop to 12 / 8 / 6 BEFORE reducing train_batch_size if you
-        # hit OOM during .backward() (not during forward).
+        # V100x8 multi-node runs are stable at bs=36 / acc=1 with this value.
+        # If a new box OOMs on scene-variance spikes, prefer the adaptive
+        # train_batch_size sweep before changing sampling semantics.
         backprop_last_k: 12
       physics:
         force_fp32: true
@@ -144,9 +139,9 @@ trainer:
   precision: 16-mixed
   gradient_clip_val: 1.0
   sync_batchnorm: false
-  # bs=12 per GPU * 8 GPUs * acc=3 = 288 effective batch, matching the
+  # bs=36 per GPU * 8 GPUs * acc=1 = 288 effective batch, matching the
   # 6xH100 and A100x4 presets. lr=2e-4 carries over directly.
-  accumulate_grad_batches: 3
+  accumulate_grad_batches: 1
 
 callbacks:
   model_checkpoint:
@@ -154,11 +149,9 @@ callbacks:
     mode: max
 
 data:
-  # Per-GPU train batch. Conservative starting point for V100 32GB + FP16.
-  # Has NOT been empirically swept on this box yet; run a short
-  # limit_train_batches=40 sweep (bs=12/9/6) on the first launch to confirm
-  # peak VRAM < ~28 GiB with scene-variance headroom, then settle.
-  train_batch_size: 12
+  # Per-GPU train batch. Empirically stable on the testv/testvv V100x8
+  # multi-node run with `accumulate_grad_batches=1`.
+  train_batch_size: 36
   # Per-GPU validation batch. Closed-loop rollout memory scales with
   # val_batch_size * n_rollout_closed_val (= 4 * 16 = 64 rollouts per rank).
   # A100 ran 8 * 16 = 128 at 80 GiB; we halve to fit 32 GiB.
