@@ -19,6 +19,8 @@ DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 
 
 def default_experiment(nproc_per_node: int) -> str:
+    if nproc_per_node == 3:
+        return "finetune_draft_flow_v100x3"
     if nproc_per_node == 4:
         return "finetune_draft_flow_v100x4"
     return "finetune_draft_flow_v100x8"

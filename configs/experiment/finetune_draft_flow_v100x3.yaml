@@ -1,0 +1,118 @@
+# @package _global_
+
+# ============================================================================
+# DRaFT fine-tuning preset for 3x V100-SXM2 32GB (sm_70, Volta) pods.
+# This is the V100x3 sibling of `finetune_draft_flow_v100x8.yaml`.
+# ----------------------------------------------------------------------------
+# Intended static multi-node setup:
+#   - one worker pod has 3 V100 GPUs
+#   - `torchrun --nproc_per_node 3`
+#   - e.g. `fv`, `fvv`, `fvvv`, `fvvvv`, `fvvvvv` => 15 total GPUs
+#
+# Empirical policy:
+#   `train_batch_size=36` and `accumulate_grad_batches=1` match the stable
+#   V100x8 and V100x4 multi-node settings. For five V100x3 pods the effective
+#   global batch is:
+#       36 * 15 GPUs * 1 = 540
+#   Keep lr=2e-4 unless you intentionally run a separate LR sweep.
+#   Use soft_limit_ratio=0.7 for the V100x3 5-node DRaFT run.
+#
+# V100 has FP16 tensor cores but no native BF16, so this preset uses
+# `16-mixed` and lets Lightning/PyTorch GradScaler handle recoverable AMP
+# overflow steps.
+# ============================================================================
+
+defaults:
+  - override /model: smart_flow
+
+model:
+  model_config:
+    # Optimizer / scheduler --------------------------------------------------
+    lr: 2e-4
+    lr_warmup_steps: 4
+    lr_min_ratio: 1e-2
+
+    # Commit bridge ---------------------------------------------------------
+    use_stop_motion: false
+
+    # Validation ------------------------------------------------------------
+    n_rollout_closed_val: 16
+    n_batch_sim_agents_metric: 10
+    sim_agents_metric_workers: 2
+    val_open_loop: true
+    val_closed_loop: true
+
+    finetune:
+      enabled: true
+      train_full_flow_decoder_only: true
+
+    draft:
+      enabled: true
+      loss_enabled: true
+      start_epoch: 0
+      ramp_epochs: 32
+      max_weight: 0.5
+      sampling:
+        sample_steps: 32
+        sample_method: euler
+        noise_scale: 1.0
+        # Stable with bs=36 / acc=1 on V100 multi-node runs. If a new box OOMs
+        # on scene-variance spikes, prefer sweeping train_batch_size downward
+        # before changing sampling semantics.
+        backprop_last_k: 12
+      physics:
+        force_fp32: true
+        dt: 0.1
+        pos_scale_m: 20.0
+        speed_floor_mps: 0.5
+        vehicle_v_max_mps: 35.0
+        vehicle_a_max_mps2: 8.0
+        vehicle_lat_accel_max_mps2: 4.2
+        bicycle_v_max_mps: 22.0
+        bicycle_a_max_mps2: 5.5
+        bicycle_lat_accel_max_mps2: 4.4
+        pedestrian_v_max_mps: 5.0
+        pedestrian_a_max_mps2: 4.7
+        vehicle_wheelbase_scale: 0.60
+        bicycle_wheelbase_scale: 0.85
+        vehicle_steer_max_rad: 0.55
+        bicycle_steer_max_rad: 0.90
+        vehicle_steer_rate_max_radps: 0.8
+        bicycle_steer_rate_max_radps: 1.4
+        pedestrian_heading_weight: 0.05
+        pedestrian_heading_speed_threshold_mps: 0.5
+        soft_limit_ratio: 0.7
+        topk_violation_k: 20
+        eps: 1.0e-6
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  # Same relative val budget as the V100x8 preset. With one V100x3 pod this is
+  # more val batches per rank than V100x8, but still uses the same per-GPU val
+  # batch and rollout settings.
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 16
+  max_epochs: 32
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+  # Default requested for V100x3 static multi-node runs.
+  accumulate_grad_batches: 1
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  # Per-GPU train batch. This intentionally matches the V100x8/V100x4 defaults.
+  train_batch_size: 36
+  # Keep per-GPU validation footprint identical to V100x8/V100x4.
+  val_batch_size: 4
+  test_batch_size: 4
+  # 3 DDP ranks * 2 workers = 6 loader processes per V100x3 pod.
+  num_workers: 2
+  prefetch_factor: 2
+  train_use_eval_agent_selection: true

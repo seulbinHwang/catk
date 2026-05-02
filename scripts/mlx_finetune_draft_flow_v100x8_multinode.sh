@@ -90,7 +90,9 @@ main() {
     local master_port="${MASTER_PORT:-29500}"
     local task_name="${TASK_NAME:-flow_semi_continuous_finetune_v100x${nproc_per_node}x${nnodes}}"
     local default_experiment="finetune_draft_flow_v100x8"
-    if [[ "$nproc_per_node" == "4" ]]; then
+    if [[ "$nproc_per_node" == "3" ]]; then
+        default_experiment="finetune_draft_flow_v100x3"
+    elif [[ "$nproc_per_node" == "4" ]]; then
         default_experiment="finetune_draft_flow_v100x4"
     fi
     local experiment="${CATK_EXPERIMENT:-$default_experiment}"
