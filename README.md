@@ -242,7 +242,7 @@ V100 4장짜리 Pod 3개로 하나의 run을 돌릴 때는 전체 GPU가 `4 * 3 
 train_batch_size 36 * total_gpus 12 * accumulate_grad_batches 1 = 432
 ```
 
-`soft_limit_ratio=0.8`은 `finetune_draft_flow_v100x4` 안의 기본값이지만, 명령줄에 명시해도 됩니다. 이전처럼 exact effective batch `576`을 재현하고 싶을 때만 `--train-batch-size 16 --accumulate-grad-batches 3`을 따로 붙이세요.
+`soft_limit_ratio=0.9`는 `finetune_draft_flow_v100x4` 안의 기본값이지만, 명령줄에 명시해도 됩니다. 이전처럼 exact effective batch `576`을 재현하고 싶을 때만 `--train-batch-size 16 --accumulate-grad-batches 3`을 따로 붙이세요.
 
 1. Pod 생성
 
@@ -302,7 +302,7 @@ python scripts/launch_mlx_static_pods_tmux.py \
   --limit-train-batches 40 \
   --limit-val-batches 0 \
   --max-epochs 1 \
-  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.8_bs36_acc1_smoke \
+  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.9_bs36_acc1_smoke \
   --session catk-draft-v100x4x3 \
   --replace
 ```
@@ -327,7 +327,7 @@ python scripts/launch_mlx_static_pods_tmux.py \
   --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
   --nproc-per-node 4 \
   --learning-rate 2e-4 \
-  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.8_bs36_acc1 \
+  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.9_bs36_acc1 \
   --session catk-draft-v100x4x3 \
   --replace
 ```
