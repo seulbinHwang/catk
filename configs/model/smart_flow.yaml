@@ -6,13 +6,10 @@ model_config:
   lr_min_ratio: 0.01
   n_rollout_closed_val: 8
   n_batch_sim_agents_metric: 10
-  # Optional absolute cap for official sim_agents scorer scenes. Leave null
-  # for the legacy per-rank `n_batch_sim_agents_metric` behavior.
-  n_scenario_sim_agents_metric: null
   # 학습 / validation 중 closed-loop 공식 sim_agents_2025 scorer 가 실제 채점할
   # 총 scene 개수입니다. GPU / node 수에 무관하게 항상 이 값을 보장하도록
-  # `n_batch_sim_agents_metric` 와 `n_scenario_sim_agents_metric` 를 fit/validation
-  # 시작 시에 자동으로 덮어씁니다. ``null`` 이거나 0 이하면 자동 덮어쓰기를 끕니다.
+  # `n_batch_sim_agents_metric` 를 fit/validation 시작 시에 자동으로 덮어씁니다.
+  # ``null`` 이거나 0 이하면 자동 덮어쓰기를 끕니다.
   scorer_scene_num: 840
   sim_agents_metric_workers: 3
   n_vis_batch: 0

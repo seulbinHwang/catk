@@ -79,14 +79,10 @@ class SMARTFlow(LightningModule):
         self.vis_flow_2s_preview = bool(getattr(model_config, "vis_flow_2s_preview", False))
         self.delete_local_videos_after_wandb_upload = model_config.delete_local_videos_after_wandb_upload
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
-        self.n_scenario_sim_agents_metric = getattr(
-            model_config,
-            "n_scenario_sim_agents_metric",
-            None,
-        )
         # 공식 sim_agents_2025 scorer 가 학습/validation 중 채점할 절대 scene 수입니다.
         # 0 / None 이면 자동 덮어쓰기를 끄고 기존 값을 그대로 사용합니다.
         self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
+        self._scorer_scene_limit: int | None = None
         # `_apply_scorer_scene_num_overrides` 가 갱신한 마지막 결정값을 보관해
         # ``on_validation_start`` 가 매번 같은 결과를 다시 계산해도 일관되게 동작합니다.
         self._scorer_scene_num_applied: bool = False
@@ -995,7 +991,7 @@ class SMARTFlow(LightningModule):
             scenario_files = data["tfrecord_path"]
             agent_id = data["agent"]["id"]
             agent_batch = data["agent"]["batch"]
-            if self.n_scenario_sim_agents_metric is not None:
+            if self._scorer_scene_limit is not None:
                 scenario_files, agent_id, agent_batch, pred_traj, pred_z, pred_head = (
                     self._filter_sim_agents_metric_scenarios(
                         batch_idx=batch_idx,
@@ -1037,7 +1033,7 @@ class SMARTFlow(LightningModule):
         pred_z: Tensor,
         pred_head: Tensor,
     ) -> tuple[list[str], Tensor, Tensor, Tensor, Tensor, Tensor]:
-        max_scenarios = int(self.n_scenario_sim_agents_metric)
+        max_scenarios = int(self._scorer_scene_limit or 0)
         if max_scenarios <= 0 or not scenario_files:
             return (
                 [],
@@ -1119,9 +1115,9 @@ class SMARTFlow(LightningModule):
 
         - ``n_batch_sim_agents_metric = ceil(scorer_scene_num / world_size / val_batch_size)``
           로 per-rank 앞쪽 batch 개수를 늘려 잡고,
-        - ``n_scenario_sim_agents_metric = scorer_scene_num`` 로 절대 scene cap 을 함께
-          설정해, ceil 로 인해 약간 더 잡힌 scene 들을 ``_filter_sim_agents_metric_scenarios``
-          가 정확히 ``scorer_scene_num`` 으로 잘라줍니다.
+        - 내부 scene cap 으로 ceil 때문에 약간 더 잡힌 scene 들을
+          ``_filter_sim_agents_metric_scenarios`` 가 정확히 ``scorer_scene_num`` 으로
+          잘라줍니다.
 
         ``scorer_scene_num`` 이 ``None`` 이거나 0 이하이면 자동 덮어쓰기를 끕니다.
 
@@ -1129,6 +1125,7 @@ class SMARTFlow(LightningModule):
             None
         """
         self._scorer_scene_num_applied = False
+        self._scorer_scene_limit = None
         scorer_scene_num = self.scorer_scene_num
         if scorer_scene_num is None:
             return
@@ -1156,7 +1153,7 @@ class SMARTFlow(LightningModule):
         n_batch_override = max(1, math.ceil(per_rank_scenes / val_batch_size))
 
         self.n_batch_sim_agents_metric = int(n_batch_override)
-        self.n_scenario_sim_agents_metric = int(scorer_scene_num)
+        self._scorer_scene_limit = int(scorer_scene_num)
         self._scorer_scene_num_applied = True
 
         if getattr(trainer, "is_global_zero", True):
@@ -1165,7 +1162,7 @@ class SMARTFlow(LightningModule):
                 f"{scorer_scene_num} 개로 고정합니다 "
                 f"(world_size={world_size}, val_batch_size={val_batch_size}, "
                 f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric}, "
-                f"n_scenario_sim_agents_metric={self.n_scenario_sim_agents_metric}).",
+                f"scene_limit={self._scorer_scene_limit}).",
                 flush=True,
             )
 

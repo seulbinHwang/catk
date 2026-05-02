@@ -256,56 +256,7 @@ python scripts/launch_mlx_static_pods_tmux.py \
   --replace
 ```
 
-8-GPU pod 하나와 7-GPU pod 하나처럼 GPU 수가 서로 다르면 일반 `torchrun --nproc_per_node 8 --nnodes 2`는 사용할 수 없습니다. 이때는 hetero static launcher를 사용합니다. 이 launcher는 각 GPU를 1-GPU logical node로 보고, `testv`의 8개 GPU와 `testvv`의 7개 GPU를 합쳐 `world_size=15`로 실행합니다.
-
-validation 도중 죽은 run을 16 GPU에서 15 GPU로 바꿔 복구할 때는 먼저 같은 checkpoint로 validation-only를 통과시키는 편이 안전합니다. 지금 비교 기준은 A100x4 preset의 공식 scorer budget인 `10 batch * 8 scene * 4 rank = 320 scene`입니다. 15 GPU hetero run에서는 `n_batch_sim_agents_metric=6`, `n_scenario_sim_agents_metric=320`을 같이 줘서 공식 scorer에 들어가는 scene 수를 320개로 고정합니다.
-
-```bash
-python scripts/launch_mlx_hetero_static_pods_tmux.py \
-  --namespace p-pnc \
-  --pods testv testvv \
-  --nproc-per-pod 8 7 \
-  --container main \
-  --branch semi_continuous_track_loss \
-  --cache-root /workspace/womd_v1_3/SMART_cache \
-  --action validate \
-  --ckpt-path /mnt/nuplan/projects/catk/checkpoints/catk_draft_v100x8x2_soft_limit_ratio_0.8_bs_sweep_20260502_0055/epoch15_valfix_resume.ckpt \
-  --experiment finetune_draft_flow_v100x8 \
-  --learning-rate 2e-4 \
-  --soft-limit-ratio 0.8 \
-  --train-batch-size 36 \
-  --accumulate-grad-batches 1 \
-  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=6 model.model_config.n_scenario_sim_agents_metric=320" \
-  --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_scorer320_validate \
-  --session catk-draft-hetero15-validate \
-  --master-port 29541 \
-  --replace
-```
-
-validation이 성공하면 학습은 `action=fit`으로 다시 띄웁니다. world size가 16에서 15로 바뀌면 epoch 안의 batch 개수가 달라지므로, 이미 끝난 epoch 15 training을 다시 돌지 않도록 loop progress를 epoch-complete 상태로 맞춘 checkpoint를 쓰는 것이 안전합니다.
-
-```bash
-python scripts/launch_mlx_hetero_static_pods_tmux.py \
-  --namespace p-pnc \
-  --pods testv testvv \
-  --nproc-per-pod 8 7 \
-  --container main \
-  --branch semi_continuous_track_loss \
-  --cache-root /workspace/womd_v1_3/SMART_cache \
-  --action fit \
-  --ckpt-path /mnt/nuplan/projects/catk/checkpoints/catk_draft_v100x8x2_soft_limit_ratio_0.8_bs_sweep_20260502_0055/epoch15_valfix_resume_epoch_complete_for_15gpu.ckpt \
-  --experiment finetune_draft_flow_v100x8 \
-  --learning-rate 2e-4 \
-  --soft-limit-ratio 0.8 \
-  --train-batch-size 36 \
-  --accumulate-grad-batches 1 \
-  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=6 model.model_config.n_scenario_sim_agents_metric=320" \
-  --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_scorer320_resume \
-  --session catk-draft-hetero15-valfix \
-  --replace
-```
-
-이 구성의 effective batch는 `36 * 15 * 1 = 540`입니다. 기존 16-GPU run의 `576`보다 약 6.25% 작지만, checkpoint의 optimizer/scheduler 상태는 그대로 복원되므로 validation 복구용으로는 이 차이가 가장 작은 현실적인 선택입니다.
+현재 static Pod launcher는 모든 worker Pod가 같은 GPU 개수를 가진다고 가정합니다. 예를 들어 V100x8 Pod 2개면 `--nproc-per-node 8`, V100x4 Pod 4개면 `--nproc-per-node 4`처럼 한 run 안에서는 동일한 값을 사용합니다. Pod별 GPU 개수가 다른 임시 복구 구성은 지원하지 않습니다.
 
 #### Case 1-B. `testsv`, `testsvv`, `testsvvv`, `testsvvvv` V100x4 Pod 4개를 새로 만들어 쓰는 경우
 
@@ -813,10 +764,10 @@ torchrun ... -m src.run \
 - `use_lqr=true`는 stop gate를 통과한 vehicle / bicycle 에만 적용됩니다. pedestrian 은 항상
   token / raw branch 를 유지합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다. **단, 아래 `scorer_scene_num`이 양의 정수면 `on_fit_start` / `on_validation_start` 시점에 `ceil(scorer_scene_num / world_size / val_batch_size)` 로 자동 덮어써져 위 기본값은 무시됩니다.**
-- `model.model_config.scorer_scene_num`는 closed-loop 공식 `sim_agents_2025` scorer 가 학습/validation 중 실제 채점할 **절대 scene 수** 입니다. `smart_flow` 기본값은 `960` 입니다. V100 / A100 / H100 어떤 GPU 든, 단일 노드 든 멀티 노드 든, GPU 개수에 무관하게 항상 정확히 이 개수만큼 채점됩니다. 끄고 싶으면 `null` 또는 `0` 으로 두면 기존 `n_batch_sim_agents_metric` 값을 그대로 사용합니다.
-  - 실제로 적용되는 식: `n_batch_sim_agents_metric = max(1, ceil(ceil(scorer_scene_num / world_size) / val_batch_size))`, 그리고 `n_scenario_sim_agents_metric = scorer_scene_num` 가 함께 설정됩니다. 후자가 절대 cap 역할을 하므로 ceil 때문에 raw global scene 수가 약간 더 잡혀도 `_filter_sim_agents_metric_scenarios` 가 정확히 `scorer_scene_num` 으로 잘라줍니다.
+- `model.model_config.scorer_scene_num`는 closed-loop 공식 `sim_agents_2025` scorer 가 학습/validation 중 실제 채점할 **절대 scene 수** 입니다. `smart_flow` 기본값은 `840` 입니다. V100 / A100 / H100 어떤 GPU 든, 단일 노드 든 멀티 노드 든, GPU 개수에 무관하게 항상 정확히 이 개수만큼 채점됩니다. 끄고 싶으면 `null` 또는 `0` 으로 두면 기존 `n_batch_sim_agents_metric` 값을 그대로 사용합니다.
+  - 실제로 적용되는 식: `n_batch_sim_agents_metric = max(1, ceil(ceil(scorer_scene_num / world_size) / val_batch_size))` 입니다. 내부 scene cap 이 함께 적용되므로 ceil 때문에 raw global scene 수가 약간 더 잡혀도 `_filter_sim_agents_metric_scenarios` 가 정확히 `scorer_scene_num` 으로 잘라줍니다.
   - 예시: `scorer_scene_num=960`, `data.val_batch_size=4`, `trainer.devices=8` → `n_batch_sim_agents_metric=30` 으로 자동 덮어쓰기. `world_size=4`, `val_batch_size=8` → `30`. `world_size=16`, `val_batch_size=4` → `15`. 어떤 조합에서도 총 채점 scene 은 `960` 으로 고정됩니다.
-  - rank-0 stdout 에 `[scorer_scene_num] 공식 sim_agents_2025 scorer 채점 scene 수를 N 개로 고정합니다 (...)` 한 줄이 찍혀 실제 적용된 값과 그 근거(world_size / val_batch_size / 결정된 `n_batch_sim_agents_metric` / scene cap) 를 확인할 수 있습니다.
+  - rank-0 stdout 에 `[scorer_scene_num] 공식 sim_agents_2025 scorer 채점 scene 수를 N 개로 고정합니다 (...)` 한 줄이 찍혀 실제 적용된 값과 그 근거(world_size / val_batch_size / 결정된 `n_batch_sim_agents_metric` / 내부 scene cap) 를 확인할 수 있습니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다. `scorer_scene_num` 자동 덮어쓰기가 켜진 상태에서는 per-rank 가 적어도 `n_batch_sim_agents_metric` batch 이상 돌도록 `limit_val_batches` 를 충분히 크게 두어야 합니다(체크포인트 전용 모드에서는 자동으로 정확히 그만큼만 돌도록 trainer.limit_val_batches 가 임시 조정됩니다).
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다. `scorer_scene_num` 식의 분모로 들어가므로 이 값을 바꾸면 `n_batch_sim_agents_metric` 자동 덮어쓰기 결과도 같이 바뀝니다.
 - 공식 2025 scorer 기준 총 채점 scene 수는 `scorer_scene_num` 가 켜져 있으면 항상 `scorer_scene_num` 입니다. 끈 경우에는 대략 `min(실행한 val batch 수, n_batch_sim_agents_metric) x val_batch_size x world_size` 입니다.
