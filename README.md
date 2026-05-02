@@ -187,6 +187,69 @@ python scripts/launch_mlx_static_pods_tmux.py \
 
 기본적으로 런처는 각 Pod에서 `origin/<branch>`를 fetch/pull 합니다. Pod 안 repo에 실험용 로컬 수정이 있어서 pull하면 안 되는 경우에만 `--no-pull`을 붙이세요.
 
+#### Case 1-7. `testv`, `testvv`에서 V100 7장씩 총 14장으로 돌리는 경우
+
+`testv`와 `testvv`는 그대로 두고, 각 Pod에서 `torchrun --nproc_per_node 7`만 사용하면 GPU 0..6만 학습에 참여합니다. 전체 GPU 수는 `7 * 2 = 14`이고, 런처의 `--experiment auto`는 자동으로 `finetune_draft_flow_v100x7` preset을 선택합니다.
+
+이 실험의 핵심 설정은 `model.model_config.draft.physics.soft_limit_ratio=0.9`입니다. 실험 이름에도 반드시 이 값이 보이도록 `task_name`에 `soft_limit_ratio_0.9`를 넣습니다.
+
+```text
+train_batch_size 36 * total_gpus 14 * accumulate_grad_batches 1 = 504
+```
+
+짧은 smoke run:
+
+```bash
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --nproc-per-node 7 \
+  --learning-rate 2e-4 \
+  --soft-limit-ratio 0.9 \
+  --limit-train-batches 40 \
+  --limit-val-batches 0 \
+  --max-epochs 1 \
+  --task-name catk_draft_v100x7x2_soft_limit_ratio_0.9_bs36_acc1_smoke \
+  --session catk-draft-v100x7x2-soft09 \
+  --replace
+```
+
+smoke run이 정상적으로 batch를 진행하면 같은 session 이름으로 full run을 다시 시작합니다.
+
+```bash
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
+  --nproc-per-node 7 \
+  --learning-rate 2e-4 \
+  --soft-limit-ratio 0.9 \
+  --task-name catk_draft_v100x7x2_soft_limit_ratio_0.9_bs36_acc1 \
+  --session catk-draft-v100x7x2-soft09 \
+  --replace
+```
+
+확인 / 중단:
+
+```bash
+kubectl exec -it -n p-pnc testv -c main -- tmux attach -t catk-draft-v100x7x2-soft09
+kubectl exec -it -n p-pnc testvv -c main -- tmux attach -t catk-draft-v100x7x2-soft09
+
+python scripts/launch_mlx_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --container main \
+  --session catk-draft-v100x7x2-soft09 \
+  --stop
+```
+
 #### Case 1-A. `testv`, `testvv`에서 train_batch_size OOM sweep
 
 `train_batch_size=36`, `accumulate_grad_batches=1`은 이제 V100x8 기본값입니다. 새 V100 박스나 다른 데이터 상태에서 OOM이 걱정되면, 같은 값에서 시작해 CUDA OOM이 날 때마다 `8`씩 낮추는 자동 sweep을 쓸 수 있습니다. 이 스크립트는 기존 static tmux launcher를 반복 호출합니다.

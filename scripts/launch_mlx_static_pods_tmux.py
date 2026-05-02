@@ -23,6 +23,8 @@ def default_experiment(nproc_per_node: int) -> str:
         return "finetune_draft_flow_v100x3"
     if nproc_per_node == 4:
         return "finetune_draft_flow_v100x4"
+    if nproc_per_node == 7:
+        return "finetune_draft_flow_v100x7"
     return "finetune_draft_flow_v100x8"
 
 
@@ -280,7 +282,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--experiment",
         default="auto",
-        help="Hydra experiment preset. 'auto' selects v100x4 for nproc=4, otherwise v100x8.",
+        help=(
+            "Hydra experiment preset. 'auto' selects v100x3/v100x4/v100x7 "
+            "for nproc=3/4/7, otherwise v100x8."
+        ),
     )
     parser.add_argument("--task-name", default="")
     parser.add_argument("--session", default="catk-draft-multinode")
@@ -323,7 +328,15 @@ def parse_args() -> argparse.Namespace:
         args.experiment = default_experiment(args.nproc_per_node)
     if not args.task_name:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.task_name = f"catk_draft_v100x{args.nproc_per_node}x{len(args.pods)}_{stamp}"
+        soft_limit = (
+            f"_soft_limit_ratio_{args.soft_limit_ratio}"
+            if args.soft_limit_ratio
+            else ""
+        )
+        args.task_name = (
+            f"catk_draft_v100x{args.nproc_per_node}x{len(args.pods)}"
+            f"{soft_limit}_{stamp}"
+        )
     return args
 
 

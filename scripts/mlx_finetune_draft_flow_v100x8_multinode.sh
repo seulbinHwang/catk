@@ -99,6 +99,8 @@ main() {
         default_experiment="finetune_draft_flow_v100x3"
     elif [[ "$nproc_per_node" == "4" ]]; then
         default_experiment="finetune_draft_flow_v100x4"
+    elif [[ "$nproc_per_node" == "7" ]]; then
+        default_experiment="finetune_draft_flow_v100x7"
     fi
     local experiment="${CATK_EXPERIMENT:-$default_experiment}"
     local action="${CATK_ACTION:-finetune}"
