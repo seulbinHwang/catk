@@ -84,6 +84,12 @@ class SMARTFlow(LightningModule):
             "n_scenario_sim_agents_metric",
             None,
         )
+        # 공식 sim_agents_2025 scorer 가 학습/validation 중 채점할 절대 scene 수입니다.
+        # 0 / None 이면 자동 덮어쓰기를 끄고 기존 값을 그대로 사용합니다.
+        self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
+        # `_apply_scorer_scene_num_overrides` 가 갱신한 마지막 결정값을 보관해
+        # ``on_validation_start`` 가 매번 같은 결과를 다시 계산해도 일관되게 동작합니다.
+        self._scorer_scene_num_applied: bool = False
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
 
@@ -1087,6 +1093,82 @@ class SMARTFlow(LightningModule):
             pred_head[agent_mask],
         )
 
+    def _resolve_val_batch_size(self) -> int | None:
+        """현재 trainer에 연결된 datamodule 의 ``val_batch_size`` 를 안전하게 읽어옵니다.
+
+        Returns:
+            int | None: 양의 정수 ``val_batch_size`` 가 확인되면 그 값을, 그렇지
+                않으면 ``None`` 을 돌려줍니다.
+        """
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return None
+        val_batch_size = getattr(datamodule, "val_batch_size", None)
+        if not isinstance(val_batch_size, int) or val_batch_size <= 0:
+            return None
+        return int(val_batch_size)
+
+    def _apply_scorer_scene_num_overrides(self) -> None:
+        """``scorer_scene_num`` 을 기준으로 GPU/노드 수에 무관한 scorer 채점량을 보장합니다.
+
+        멀티 GPU / 멀티 노드 학습이라도 closed-loop 공식 ``sim_agents_2025`` scorer 가
+        실제 채점하는 scene 수가 항상 ``scorer_scene_num`` 이 되도록,
+
+        - ``n_batch_sim_agents_metric = ceil(scorer_scene_num / world_size / val_batch_size)``
+          로 per-rank 앞쪽 batch 개수를 늘려 잡고,
+        - ``n_scenario_sim_agents_metric = scorer_scene_num`` 로 절대 scene cap 을 함께
+          설정해, ceil 로 인해 약간 더 잡힌 scene 들을 ``_filter_sim_agents_metric_scenarios``
+          가 정확히 ``scorer_scene_num`` 으로 잘라줍니다.
+
+        ``scorer_scene_num`` 이 ``None`` 이거나 0 이하이면 자동 덮어쓰기를 끕니다.
+
+        Returns:
+            None
+        """
+        self._scorer_scene_num_applied = False
+        scorer_scene_num = self.scorer_scene_num
+        if scorer_scene_num is None:
+            return
+        try:
+            scorer_scene_num = int(scorer_scene_num)
+        except (TypeError, ValueError):
+            return
+        if scorer_scene_num <= 0:
+            return
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        if world_size <= 0:
+            world_size = 1
+
+        val_batch_size = self._resolve_val_batch_size()
+        if val_batch_size is None:
+            # validation dataloader 가 아직 준비되지 않은 시점이면 다음 hook 에서 다시 시도합니다.
+            return
+
+        per_rank_scenes = math.ceil(scorer_scene_num / world_size)
+        n_batch_override = max(1, math.ceil(per_rank_scenes / val_batch_size))
+
+        self.n_batch_sim_agents_metric = int(n_batch_override)
+        self.n_scenario_sim_agents_metric = int(scorer_scene_num)
+        self._scorer_scene_num_applied = True
+
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[scorer_scene_num] 공식 sim_agents_2025 scorer 채점 scene 수를 "
+                f"{scorer_scene_num} 개로 고정합니다 "
+                f"(world_size={world_size}, val_batch_size={val_batch_size}, "
+                f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric}, "
+                f"n_scenario_sim_agents_metric={self.n_scenario_sim_agents_metric}).",
+                flush=True,
+            )
+
     def on_fit_start(self) -> None:
         """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.
 
@@ -1097,7 +1179,22 @@ class SMARTFlow(LightningModule):
         Returns:
             None
         """
+        self._apply_scorer_scene_num_overrides()
         self._apply_fit_time_validation_batch_limit()
+
+    def on_validation_start(self) -> None:
+        """validation 시작 직전에 ``scorer_scene_num`` 기반 덮어쓰기를 다시 적용합니다.
+
+        ``trainer.validate()`` 처럼 ``on_fit_start`` 를 거치지 않는 경로에서도
+        scorer 채점 scene 수가 ``scorer_scene_num`` 으로 보장되도록 hook 시점에서
+        한 번 더 계산해 둡니다. 이미 ``on_fit_start`` 에서 적용된 fit-time
+        validation batch 제한은 그대로 둡니다.
+
+        Returns:
+            None
+        """
+        if not self._scorer_scene_num_applied:
+            self._apply_scorer_scene_num_overrides()
 
     def on_fit_end(self) -> None:
         """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.
