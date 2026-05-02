@@ -953,6 +953,17 @@ self-forced fine-tuning에서 학습할 파라미터 범위는 `unfrozen_range` 
 ... model.model_config.self_forced.unfrozen_range=full_flow_decoder
 ```
 
+### WOSAC-CPD / WOSAC-CES Distribution Metrics
+
+closed-loop validation과 Sim Agents submission export에서는 모델이 실제로 만든 10Hz rollout으로 아래 metric을 계산합니다.
+
+- `val_closed/WOSAC-CPD/value`: 같은 scenario 안 rollout끼리의 조건부 다양성입니다. 높을수록 rollout들이 서로 다릅니다.
+- `val_closed/WOSAC-CES/value`: validation GT가 있을 때만 계산되는 Energy Score 계열 metric입니다. 낮을수록 좋습니다.
+- `test/WOSAC-CPD/value`: test submission export에서 계산되는 CPD입니다. test set은 GT 미래를 제공하지 않으므로 CES는 기록하지 않습니다.
+- `*/WOSAC-CPD/DPR`: `model.model_config.wosac_cpd_reference`에 flow-pretrain CPD를 넣었을 때만 기록됩니다. 값은 `현재 CPD / 기준 CPD` 입니다.
+
+이 metric들은 학습 step에서는 계산하지 않고, validation/test closed-loop rollout이 만들어진 뒤에만 계산합니다. `n_rollout_closed_val`이 16이면 이미 생성된 16개 rollout만 사용하고 별도 rollout을 추가 생성하지 않습니다.
+
 ### Self-forced Generated Estimator Warmup
 
 - `model.model_config.self_forced.estimator_warmup_epochs=1` 이 기본값입니다.

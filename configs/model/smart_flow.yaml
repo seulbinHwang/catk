@@ -5,6 +5,9 @@ model_config:
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.01
   n_rollout_closed_val: 8
+  # Optional: set this to the flow-pretrain CPD value only when you want DPR.
+  # CPD/CES are always evaluated regardless of this value.
+  wosac_cpd_reference: null
   n_batch_sim_agents_metric: 10
   sim_agents_metric_workers: 3
   n_vis_batch: 0
