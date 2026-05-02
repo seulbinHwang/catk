@@ -258,6 +258,31 @@ python scripts/launch_mlx_static_pods_tmux.py \
 
 8-GPU pod 하나와 7-GPU pod 하나처럼 GPU 수가 서로 다르면 일반 `torchrun --nproc_per_node 8 --nnodes 2`는 사용할 수 없습니다. 이때는 hetero static launcher를 사용합니다. 이 launcher는 각 GPU를 1-GPU logical node로 보고, `testv`의 8개 GPU와 `testvv`의 7개 GPU를 합쳐 `world_size=15`로 실행합니다.
 
+validation 도중 죽은 run을 16 GPU에서 15 GPU로 바꿔 복구할 때는 먼저 같은 checkpoint로 validation-only를 통과시키는 편이 안전합니다.
+
+```bash
+python scripts/launch_mlx_hetero_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --nproc-per-pod 8 7 \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --action validate \
+  --ckpt-path /mnt/nuplan/projects/catk/checkpoints/catk_draft_v100x8x2_soft_limit_ratio_0.8_bs_sweep_20260502_0055/epoch15_valfix_resume.ckpt \
+  --experiment finetune_draft_flow_v100x8 \
+  --learning-rate 2e-4 \
+  --soft-limit-ratio 0.8 \
+  --train-batch-size 36 \
+  --accumulate-grad-batches 1 \
+  --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_valfix_validate \
+  --session catk-draft-hetero15-validate \
+  --master-port 29541 \
+  --replace
+```
+
+validation이 성공하면 학습은 `action=fit`으로 다시 띄웁니다. world size가 16에서 15로 바뀌면 epoch 안의 batch 개수가 달라지므로, 이미 끝난 epoch 15 training을 다시 돌지 않도록 loop progress를 epoch-complete 상태로 맞춘 checkpoint를 쓰는 것이 안전합니다.
+
 ```bash
 python scripts/launch_mlx_hetero_static_pods_tmux.py \
   --namespace p-pnc \
@@ -267,7 +292,7 @@ python scripts/launch_mlx_hetero_static_pods_tmux.py \
   --branch semi_continuous_track_loss \
   --cache-root /workspace/womd_v1_3/SMART_cache \
   --action fit \
-  --ckpt-path /mnt/nuplan/projects/catk/checkpoints/catk_draft_v100x8x2_soft_limit_ratio_0.8_bs_sweep_20260502_0055/epoch15_valfix_resume.ckpt \
+  --ckpt-path /mnt/nuplan/projects/catk/checkpoints/catk_draft_v100x8x2_soft_limit_ratio_0.8_bs_sweep_20260502_0055/epoch15_valfix_resume_epoch_complete_for_15gpu.ckpt \
   --experiment finetune_draft_flow_v100x8 \
   --learning-rate 2e-4 \
   --soft-limit-ratio 0.8 \

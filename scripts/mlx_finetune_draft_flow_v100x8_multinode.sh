@@ -118,8 +118,11 @@ main() {
         log "ERROR: CACHE_ROOT does not exist in this pod: $CACHE_ROOT"
         exit 2
     fi
-    if [[ "$action" != "finetune" && "$action" != "fit" ]]; then
-        log "ERROR: CATK_ACTION must be finetune or fit, got: $action"
+    if [[ "$action" != "finetune" \
+        && "$action" != "fit" \
+        && "$action" != "validate" \
+        && "$action" != "test" ]]; then
+        log "ERROR: CATK_ACTION must be finetune, fit, validate, or test; got: $action"
         exit 2
     fi
     if [[ -z "$ckpt_path" ]]; then

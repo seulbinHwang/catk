@@ -271,7 +271,11 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(pull=True)
     parser.add_argument("--cache-root", default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--pretrain-ckpt", default="")
-    parser.add_argument("--action", choices=["finetune", "fit"], default="finetune")
+    parser.add_argument(
+        "--action",
+        choices=["finetune", "fit", "validate", "test"],
+        default="finetune",
+    )
     parser.add_argument("--ckpt-path", default="")
     parser.add_argument(
         "--experiment",
@@ -305,8 +309,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--pods must contain at least two pods for multi-node training")
     if not args.pretrain_ckpt and not args.ckpt_path and not args.stop:
         parser.error("--pretrain-ckpt or --ckpt-path is required unless --stop is set")
-    if args.action == "fit" and not args.ckpt_path and not args.stop:
-        parser.error("--ckpt-path is required when --action=fit")
+    if (
+        args.action in {"fit", "validate", "test"}
+        and not args.ckpt_path
+        and not args.stop
+    ):
+        parser.error(f"--ckpt-path is required when --action={args.action}")
     if args.nproc_per_node < 1:
         parser.error("--nproc-per-node must be >= 1")
     if args.monitor_interval < 1:
