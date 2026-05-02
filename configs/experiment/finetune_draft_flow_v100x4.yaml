@@ -7,15 +7,15 @@
 # Intended static multi-node setup:
 #   - one worker pod has 4 V100 GPUs
 #   - `torchrun --nproc_per_node 4`
-#   - e.g. `testsv`, `testsvv`, `testvvv` => 12 total GPUs
+#   - e.g. `testsv`, `testsvv`, `testsvvv`, `testsvvvv` => 16 total GPUs
 #
 # Empirical policy:
 #   `train_batch_size=36` and `accumulate_grad_batches=1` are the default,
-#   matching the stable V100x8 multi-node setting. For three V100x4 pods the
+#   matching the stable V100x8 multi-node setting. For four V100x4 pods the
 #   effective global batch is:
-#       36 * 12 GPUs * 1 = 432
+#       36 * 16 GPUs * 1 = 576
 #   Keep lr=2e-4 unless you intentionally run a separate LR sweep.
-#   Use soft_limit_ratio=0.9 for the V100x4 3-node DRaFT runs.
+#   Use soft_limit_ratio=0.9 for the V100x4 4-node DRaFT runs.
 #
 # V100 has FP16 tensor cores but no native BF16, so this preset uses
 # `16-mixed` and lets Lightning/PyTorch GradScaler handle recoverable AMP

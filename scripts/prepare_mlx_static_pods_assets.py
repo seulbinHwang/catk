@@ -12,7 +12,7 @@ import time
 
 
 DEFAULT_NAMESPACE = "p-pnc"
-DEFAULT_PODS = ["testsv", "testsvv", "testvvv"]
+DEFAULT_PODS = ["testsv", "testsvv", "testsvvv", "testsvvvv"]
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_BRANCH = "semi_continuous_track_loss"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"

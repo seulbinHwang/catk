@@ -13,7 +13,7 @@ import time
 
 
 DEFAULT_NAMESPACE = "p-pnc"
-DEFAULT_PODS = ["testsv", "testsvv", "testvvv"]
+DEFAULT_PODS = ["testsv", "testsvv", "testsvvv", "testsvvvv"]
 DEFAULT_ZONE = "private-v100-naverlabs-0"
 DEFAULT_IMAGE = "labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121"
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"

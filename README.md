@@ -234,15 +234,15 @@ kubectl exec -it -n p-pnc testv -c main -- tmux attach -t catk-draft-bs-sweep
 
 worker Pod인 `testvv`는 global rank 8-15만 갖기 때문에 Lightning progress bar가 기본적으로 출력되지 않습니다. 그래도 학습에는 참여 중이며 GPU heartbeat pane이나 `nvidia-smi`로 사용률을 확인할 수 있습니다.
 
-#### Case 1-B. `testsv`, `testsvv`, `testvvv` V100x4 Pod 3개를 새로 만들어 쓰는 경우
+#### Case 1-B. `testsv`, `testsvv`, `testsvvv`, `testsvvvv` V100x4 Pod 4개를 새로 만들어 쓰는 경우
 
-V100 4장짜리 Pod 3개로 하나의 run을 돌릴 때는 전체 GPU가 `4 * 3 = 12`장입니다. 이 경우 `--nproc-per-node 4`를 주면 런처가 기본 experiment를 `finetune_draft_flow_v100x4`로 자동 선택합니다. 이 preset의 기본 batch 설정은 V100x8과 동일하게 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다.
+V100 4장짜리 Pod 4개로 하나의 run을 돌릴 때는 전체 GPU가 `4 * 4 = 16`장입니다. 이 경우 `--nproc-per-node 4`를 주면 런처가 기본 experiment를 `finetune_draft_flow_v100x4`로 자동 선택합니다. 이 preset의 기본 batch 설정은 V100x8과 동일하게 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다.
 
 ```text
-train_batch_size 36 * total_gpus 12 * accumulate_grad_batches 1 = 432
+train_batch_size 36 * total_gpus 16 * accumulate_grad_batches 1 = 576
 ```
 
-`soft_limit_ratio=0.9`는 `finetune_draft_flow_v100x4` 안의 기본값이지만, 명령줄에 명시해도 됩니다. 이전처럼 exact effective batch `576`을 재현하고 싶을 때만 `--train-batch-size 16 --accumulate-grad-batches 3`을 따로 붙이세요.
+`soft_limit_ratio=0.9`는 `finetune_draft_flow_v100x4` 안의 기본값이지만, 명령줄에 명시해도 됩니다. 이 구성은 V100x8 Pod 2개 구성과 같은 effective batch `576`을 사용합니다.
 
 1. Pod 생성
 
@@ -251,7 +251,7 @@ cd /path/to/catk
 
 python scripts/create_mlx_static_v100_pods.py \
   --namespace p-pnc \
-  --pods testsv testsvv testvvv \
+  --pods testsv testsvv testsvvv testsvvvv \
   --gpu-count 4 \
   --zone private-v100-naverlabs-0
 ```
@@ -263,7 +263,7 @@ python scripts/create_mlx_static_v100_pods.py \
 ```bash
 python scripts/prepare_mlx_static_pods_assets.py \
   --namespace p-pnc \
-  --pods testsv testsvv testvvv \
+  --pods testsv testsvv testsvvv testsvvvv \
   --branch semi_continuous_track_loss \
   --cache-root /workspace/womd_v1_3/SMART_cache \
   --cache-source labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
@@ -277,7 +277,7 @@ python scripts/prepare_mlx_static_pods_assets.py \
 ```bash
 python scripts/prepare_mlx_static_pods_assets.py \
   --namespace p-pnc \
-  --pods testsv testsvv testvvv \
+  --pods testsv testsvv testsvvv testsvvvv \
   --status-only
 ```
 
@@ -292,7 +292,7 @@ kubectl exec -it -n p-pnc testsv -c main -- tmux attach -t catk-pod-prepare
 ```bash
 python scripts/launch_mlx_static_pods_tmux.py \
   --namespace p-pnc \
-  --pods testsv testsvv testvvv \
+  --pods testsv testsvv testsvvv testsvvvv \
   --container main \
   --branch semi_continuous_track_loss \
   --cache-root /workspace/womd_v1_3/SMART_cache \
@@ -302,15 +302,15 @@ python scripts/launch_mlx_static_pods_tmux.py \
   --limit-train-batches 40 \
   --limit-val-batches 0 \
   --max-epochs 1 \
-  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.9_bs36_acc1_smoke \
-  --session catk-draft-v100x4x3 \
+  --task-name catk_draft_v100x4x4_soft_limit_ratio_0.9_bs36_acc1_smoke \
+  --session catk-draft-v100x4x4 \
   --replace
 ```
 
 progress bar는 master Pod인 `testsv`에서 봅니다.
 
 ```bash
-kubectl exec -it -n p-pnc testsv -c main -- tmux attach -t catk-draft-v100x4x3
+kubectl exec -it -n p-pnc testsv -c main -- tmux attach -t catk-draft-v100x4x4
 ```
 
 4. full run
@@ -320,15 +320,15 @@ smoke run 연결이 정상임을 확인한 뒤 같은 session 이름으로 full 
 ```bash
 python scripts/launch_mlx_static_pods_tmux.py \
   --namespace p-pnc \
-  --pods testsv testsvv testvvv \
+  --pods testsv testsvv testsvvv testsvvvv \
   --container main \
   --branch semi_continuous_track_loss \
   --cache-root /workspace/womd_v1_3/SMART_cache \
   --pretrain-ckpt /mnt/nuplan/projects/catk/checkpoints/flow_semi_continuous_pretrain_all_target_h1006/4pxhrpv8_v70_e64_step259776/epoch_last.ckpt \
   --nproc-per-node 4 \
   --learning-rate 2e-4 \
-  --task-name catk_draft_v100x4x3_soft_limit_ratio_0.9_bs36_acc1 \
-  --session catk-draft-v100x4x3 \
+  --task-name catk_draft_v100x4x4_soft_limit_ratio_0.9_bs36_acc1 \
+  --session catk-draft-v100x4x4 \
   --replace
 ```
 
@@ -337,9 +337,9 @@ python scripts/launch_mlx_static_pods_tmux.py \
 ```bash
 python scripts/launch_mlx_static_pods_tmux.py \
   --namespace p-pnc \
-  --pods testsv testsvv testvvv \
+  --pods testsv testsvv testsvvv testsvvvv \
   --container main \
-  --session catk-draft-v100x4x3 \
+  --session catk-draft-v100x4x4 \
   --stop
 ```
 
