@@ -128,7 +128,7 @@ V100 8장짜리 Pod 여러 개로 **하나의 DRaFT fine-tuning**을 돌릴 수 
 
 이 경우가 가장 빠릅니다. kubectl이 되는 터미널에서 이 repo checkout으로 이동해 아래 명령을 한 번 실행하면, `testv`와 `testvv` 안에 같은 이름의 tmux session이 만들어지고 각각 rank 0/1로 학습이 시작됩니다. `MASTER_ADDR`는 `testv`의 Pod IP로 자동 설정됩니다. Pod 안 repo 위치는 기본값이 `/mnt/nuplan/projects/catk`이고, 다르면 `--project-root`로 바꾸면 됩니다.
 
-`finetune_draft_flow_v100x8`의 기본 batch 설정은 실측 안정값인 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다. `testv` + `testvv` 2-node run에서는 effective batch가 `36 * 16 GPUs * 1 = 576`입니다.
+`finetune_draft_flow_v100x8`의 기본 batch 설정은 실측 안정값인 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다. DRaFT loss 가중치는 A100x4 preset과 같은 `draft.max_weight=0.2`를 사용합니다. `testv` + `testvv` 2-node run에서는 effective batch가 `36 * 16 GPUs * 1 = 576`입니다.
 
 V100x8 fit-time validation은 비교 공정성을 유지합니다. 이전 2-node run에서 Epoch 15 train은 정상 종료됐지만, `check_val_every_n_epoch=16`으로 시작된 closed-loop validation 중 한 worker가 먼저 죽은 뒤 다음 NCCL collective에서 전체 run이 abort된 적이 있습니다. 이 문제는 GPU rollout OOM보다 공식 `sim_agents_2025` scorer의 CPU/RAM 압박 쪽이 더 유력했으므로, `data.val_batch_size=4`, `model.model_config.n_rollout_closed_val=16`, `model.model_config.n_batch_sim_agents_metric=10`, `trainer.limit_val_batches=0.1`은 유지하고 `model.model_config.sim_agents_metric_workers=1`만 적용합니다. 이 설정은 느릴 수 있지만, 평가하는 batch/rollout/scorer scene 수를 줄이지 않습니다. 공식 scorer가 오래 걸리는 동안 일부 rank가 다음 DDP collective에서 기다릴 수 있으므로, `trainer=ddp`의 process group timeout은 기본 30분보다 긴 4시간으로 둡니다.
 
@@ -258,7 +258,7 @@ python scripts/launch_mlx_static_pods_tmux.py \
 
 8-GPU pod 하나와 7-GPU pod 하나처럼 GPU 수가 서로 다르면 일반 `torchrun --nproc_per_node 8 --nnodes 2`는 사용할 수 없습니다. 이때는 hetero static launcher를 사용합니다. 이 launcher는 각 GPU를 1-GPU logical node로 보고, `testv`의 8개 GPU와 `testvv`의 7개 GPU를 합쳐 `world_size=15`로 실행합니다.
 
-validation 도중 죽은 run을 16 GPU에서 15 GPU로 바꿔 복구할 때는 먼저 같은 checkpoint로 validation-only를 통과시키는 편이 안전합니다. 15 GPU에서 16 GPU run과 같은 공식 scorer scene 수를 맞추려면 `n_batch_sim_agents_metric=11`, `n_scenario_sim_agents_metric=640`을 같이 줍니다. 이렇게 하면 16 GPU run의 `10 batch * 4 scene * 16 rank = 640 scene`과 같은 수만 공식 scorer에 들어갑니다.
+validation 도중 죽은 run을 16 GPU에서 15 GPU로 바꿔 복구할 때는 먼저 같은 checkpoint로 validation-only를 통과시키는 편이 안전합니다. 지금 비교 기준은 A100x4 preset의 공식 scorer budget인 `10 batch * 8 scene * 4 rank = 320 scene`입니다. 15 GPU hetero run에서는 `n_batch_sim_agents_metric=6`, `n_scenario_sim_agents_metric=320`을 같이 줘서 공식 scorer에 들어가는 scene 수를 320개로 고정합니다.
 
 ```bash
 python scripts/launch_mlx_hetero_static_pods_tmux.py \
@@ -275,8 +275,8 @@ python scripts/launch_mlx_hetero_static_pods_tmux.py \
   --soft-limit-ratio 0.8 \
   --train-batch-size 36 \
   --accumulate-grad-batches 1 \
-  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=11 model.model_config.n_scenario_sim_agents_metric=640" \
-  --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_valfix_validate \
+  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=6 model.model_config.n_scenario_sim_agents_metric=320" \
+  --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_scorer320_validate \
   --session catk-draft-hetero15-validate \
   --master-port 29541 \
   --replace
@@ -299,8 +299,8 @@ python scripts/launch_mlx_hetero_static_pods_tmux.py \
   --soft-limit-ratio 0.8 \
   --train-batch-size 36 \
   --accumulate-grad-batches 1 \
-  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=11 model.model_config.n_scenario_sim_agents_metric=640" \
-  --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_valfix_resume \
+  --extra-hydra-overrides "model.model_config.n_batch_sim_agents_metric=6 model.model_config.n_scenario_sim_agents_metric=320" \
+  --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_scorer320_resume \
   --session catk-draft-hetero15-valfix \
   --replace
 ```
