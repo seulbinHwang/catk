@@ -13,7 +13,7 @@ model_config:
   # 총 scene 개수입니다. GPU / node 수에 무관하게 항상 이 값을 보장하도록
   # `n_batch_sim_agents_metric` 와 `n_scenario_sim_agents_metric` 를 fit/validation
   # 시작 시에 자동으로 덮어씁니다. ``null`` 이거나 0 이하면 자동 덮어쓰기를 끕니다.
-  scorer_scene_num: 960
+  scorer_scene_num: 840
   sim_agents_metric_workers: 3
   n_vis_batch: 0
   n_vis_scenario: 0
