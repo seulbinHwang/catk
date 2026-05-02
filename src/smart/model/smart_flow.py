@@ -13,7 +13,14 @@ from lightning import LightningModule
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
-from src.smart.metrics import SimAgentsMetrics, SimAgentsSubmission, minADE
+from src.smart.metrics import (
+    SimAgentsMetrics,
+    SimAgentsSubmission,
+    WOSACDistributionMetrics,
+    log_and_reset_wosac_distribution_metric,
+    minADE,
+    update_wosac_distribution_metric_from_model,
+)
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_2s,
@@ -64,6 +71,15 @@ class SMARTFlow(LightningModule):
             max_workers=model_config.sim_agents_metric_workers,
         )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
+        wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
+        self.wosac_distribution_metrics = WOSACDistributionMetrics(
+            prefix="val_closed",
+            cpd_reference=wosac_cpd_reference,
+        )
+        self.test_wosac_distribution_metrics = WOSACDistributionMetrics(
+            prefix="test",
+            cpd_reference=wosac_cpd_reference,
+        )
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
         self.closed_loop_metric_name = "val_closed/sim_agents_2025/realism_meta_metric"
@@ -1621,6 +1637,11 @@ open_metric_dict:
                 map_feature=map_feature,
                 return_flow_2s_preview=return_flow_2s_preview,
             )
+            update_wosac_distribution_metric_from_model(
+                model=self,
+                data=data,
+                pred_traj=pred_traj,
+            )
 
             scenario_rollouts = None
             if self.sim_agents_submission.is_active:
@@ -1668,6 +1689,10 @@ open_metric_dict:
                                 self._cleanup_local_video(video_path)
 
     def on_validation_epoch_end(self):
+        log_and_reset_wosac_distribution_metric(
+            model=self,
+            metric=self.wosac_distribution_metrics,
+        )
         if self.val_open_loop:
             epoch_open_metrics = self._compute_and_reset_validation_metrics(
                 prefix="val_open",
@@ -1754,6 +1779,11 @@ open_metric_dict:
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
+        update_wosac_distribution_metric_from_model(
+            model=self,
+            data=data,
+            pred_traj=pred_traj,
+        )
 
         self.sim_agents_submission.update(
             scenario_id=data["scenario_id"],
@@ -1766,4 +1796,8 @@ open_metric_dict:
         self.sim_agents_submission.aggregate_current_batch()
 
     def on_test_epoch_end(self):
+        log_and_reset_wosac_distribution_metric(
+            model=self,
+            metric=self.test_wosac_distribution_metrics,
+        )
         self.sim_agents_submission.save_sub_file()

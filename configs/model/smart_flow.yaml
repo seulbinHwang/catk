@@ -5,6 +5,9 @@ model_config:
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.01
   n_rollout_closed_val: 8
+  # Optional: set this to the flow-pretrain CPD value only when you want DPR.
+  # CPD/CES are always evaluated regardless of this value.
+  wosac_cpd_reference: null
   n_batch_sim_agents_metric: 10
   # 학습 / validation 중 closed-loop 공식 sim_agents_2025 scorer 가 실제 채점할
   # 총 scene 개수입니다. GPU / node 수에 무관하게 항상 이 값을 보장하도록
