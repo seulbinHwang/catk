@@ -36,12 +36,12 @@
 #     are materialized per rank before metric scoring. A prior 2-node V100x8
 #     run completed epoch 15 training, then stalled for ~1h in closed-loop
 #     validation and lost a worker before the next NCCL collective. Keep the
-#     evaluation budget comparable with the prior presets while reducing peak
-#     memory: `val_batch_size=2`, `n_rollout_closed_val=16`,
-#     `limit_val_batches=0.1`, and `n_batch_sim_agents_metric=20`.
-#     The scorer worker count stays parallel; if memory is still tight, lower
-#     `val_batch_size` first and increase `n_batch_sim_agents_metric`
-#     proportionally to keep the official scorer scene count comparable.
+#     evaluation budget comparable with the prior presets:
+#     `val_batch_size=4`, `n_rollout_closed_val=16`,
+#     `limit_val_batches=0.1`, and `n_batch_sim_agents_metric=10`.
+#     Because the prior failure looked CPU-scorer/RAM related rather than GPU
+#     rollout OOM, keep the validation batch unchanged and reduce only the
+#     official scorer worker count on this V100x8 preset.
 #
 #   * CPU-side: 8 DDP ranks * 4 workers = 32 dataloader procs easily
 #     overwhelms page-locked memory / file-handle limits on shared boxes.
@@ -77,10 +77,11 @@ model:
     # OOM, and the official 2025 sim-agents scorer internally up-samples to 32
     # rollouts per scenario for scoring.
     n_rollout_closed_val: 16
-    # Keep the 2025 sim-agents metric scene budget unchanged after lowering
-    # validation batch size: 20 * 2 scenes/rank == 10 * 4 scenes/rank.
-    n_batch_sim_agents_metric: 20
-    sim_agents_metric_workers: 2
+    # Keep the 2025 sim-agents metric budget unchanged. Use one scorer worker
+    # per rank to reduce CPU RAM spikes; this is slower but evaluates the same
+    # scenario payloads.
+    n_batch_sim_agents_metric: 10
+    sim_agents_metric_workers: 1
     val_open_loop: true
     val_closed_loop: true
 
@@ -132,9 +133,8 @@ ckpt_path: null
 trainer:
   limit_train_batches: 1.0
   # Same relative val budget as the H100 / A100x4 presets. With 8 GPUs and
-  # val_batch_size=2 this covers about 44097*0.1/8/2 ~= 276 val batches per
-  # rank per eval. The smaller batch lowers peak validation memory while the
-  # 0.1 relative budget keeps the scenario count comparable.
+  # val_batch_size=4 this covers about 44097*0.1/8/4 ~= 138 val batches per
+  # rank per eval, matching the prior presets.
   limit_val_batches: 0.1
   check_val_every_n_epoch: 16
   # Epoch count matches the H100 / A100x4 presets (user policy: do not reduce).
@@ -158,9 +158,9 @@ data:
   # Per-GPU train batch. Empirically stable on the testv/testvv V100x8
   # multi-node run with `accumulate_grad_batches=1`.
   train_batch_size: 36
-  # Per-GPU validation batch. Lower this before changing scorer parallelism;
-  # keep n_batch_sim_agents_metric proportional for fair comparison.
-  val_batch_size: 2
+  # Per-GPU validation batch. Keep the previous validation budget for fair
+  # comparison; CUDA rollout OOMs are handled by auto-chunking in smart_flow.py.
+  val_batch_size: 4
   test_batch_size: 4
   # 8 DDP ranks * 2 workers = 16 loader procs. Bump to 4 only if the host
   # has enough RAM / file-handle headroom for 32 procs.
