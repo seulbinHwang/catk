@@ -256,6 +256,30 @@ python scripts/launch_mlx_static_pods_tmux.py \
   --replace
 ```
 
+8-GPU pod 하나와 7-GPU pod 하나처럼 GPU 수가 서로 다르면 일반 `torchrun --nproc_per_node 8 --nnodes 2`는 사용할 수 없습니다. 이때는 hetero static launcher를 사용합니다. 이 launcher는 각 GPU를 1-GPU logical node로 보고, `testv`의 8개 GPU와 `testvv`의 7개 GPU를 합쳐 `world_size=15`로 실행합니다.
+
+```bash
+python scripts/launch_mlx_hetero_static_pods_tmux.py \
+  --namespace p-pnc \
+  --pods testv testvv \
+  --nproc-per-pod 8 7 \
+  --container main \
+  --branch semi_continuous_track_loss \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --action fit \
+  --ckpt-path /mnt/nuplan/projects/catk/checkpoints/catk_draft_v100x8x2_soft_limit_ratio_0.8_bs_sweep_20260502_0055/epoch15_valfix_resume.ckpt \
+  --experiment finetune_draft_flow_v100x8 \
+  --learning-rate 2e-4 \
+  --soft-limit-ratio 0.8 \
+  --train-batch-size 36 \
+  --accumulate-grad-batches 1 \
+  --task-name catk_draft_v100x8x7_hetero15_soft_limit_ratio_0.8_valfix_resume \
+  --session catk-draft-hetero15-valfix \
+  --replace
+```
+
+이 구성의 effective batch는 `36 * 15 * 1 = 540`입니다. 기존 16-GPU run의 `576`보다 약 6.25% 작지만, checkpoint의 optimizer/scheduler 상태는 그대로 복원되므로 validation 복구용으로는 이 차이가 가장 작은 현실적인 선택입니다.
+
 #### Case 1-B. `testsv`, `testsvv`, `testsvvv`, `testsvvvv` V100x4 Pod 4개를 새로 만들어 쓰는 경우
 
 V100 4장짜리 Pod 4개로 하나의 run을 돌릴 때는 전체 GPU가 `4 * 4 = 16`장입니다. 이 경우 `--nproc-per-node 4`를 주면 런처가 기본 experiment를 `finetune_draft_flow_v100x4`로 자동 선택합니다. 이 preset의 기본 batch 설정은 V100x8과 동일하게 `data.train_batch_size=36`, `trainer.accumulate_grad_batches=1`입니다.
