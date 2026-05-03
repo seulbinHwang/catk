@@ -147,6 +147,10 @@ class FlowTokenProcessor(TokenProcessor):
                 flow_train_prev_control_chunks.append(prev_control)
                 flow_train_prev_control_valid_chunks.append(prev_control_valid)
 
+            self._assert_flow_train_anchor_context_valid(
+                flow_train_mask=flow_train_mask,
+                ctx_valid=ctx_valid,
+            )
             tokenized_agent.update(
                 {
                     "flow_train_mask": flow_train_mask,
@@ -226,6 +230,33 @@ class FlowTokenProcessor(TokenProcessor):
             }
         )
         return tokenized_agent
+
+    def _assert_flow_train_anchor_context_valid(
+        self,
+        flow_train_mask: Tensor,
+        ctx_valid: Tensor,
+    ) -> None:
+        """선택된 flow 학습 anchor의 현재 0.5초 context token 유효성을 확인합니다."""
+        if flow_train_mask.numel() == 0:
+            return
+
+        required_ctx_steps = flow_train_mask.shape[1] + 1
+        if ctx_valid.shape[1] < required_ctx_steps:
+            raise ValueError(
+                "Flow train context validity check requires one leading context token "
+                f"plus all anchors: required={required_ctx_steps}, actual={ctx_valid.shape[1]}."
+            )
+
+        anchor_ctx_valid = ctx_valid[:, 1:required_ctx_steps]
+        invalid_anchor_mask = flow_train_mask & ~anchor_ctx_valid
+        if invalid_anchor_mask.any():
+            invalid_count = int(invalid_anchor_mask.sum().item())
+            selected_count = int(flow_train_mask.sum().item())
+            raise ValueError(
+                "Flow train invariant violated: selected training anchors include invalid "
+                "current 0.5s context tokens. "
+                f"invalid_count={invalid_count}, selected_count={selected_count}."
+            )
 
     def _build_anchor_future_valid(self, valid: Tensor, raw_step: int) -> Tensor:
         future_loss_mask = self._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
