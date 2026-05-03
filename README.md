@@ -41,11 +41,13 @@
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
-### TODO: Motion Missingness Feature
+### Motion Missingness Feature
 
-- 현재 flow encoder는 invalid context step과 valid context step 사이의 motion을 `0`으로 두어 `(0, 0)` padding에서 global 좌표로 튀는 가짜 초대형 motion을 막습니다.
-- 장기적으로는 `motion value = 0`에 더해 `motion_valid = false` 같은 별도 feature를 추가해, 실제 정지 agent와 이전 motion을 알 수 없는 agent를 구분하는 편이 더 완전합니다.
-- 다만 이 방식은 motion embedding input dimension을 바꾸므로 기존 pretrained checkpoint와 바로 호환되지 않습니다. 새 pretraining을 처음부터 설계할 때 검토할 TODO로 둡니다.
+- flow encoder의 motion feature는 이제 `motion value = 0` 과 별도 `motion_valid` 입력을 함께 씁니다.
+- 첫 context step 또는 invalid/valid 경계처럼 이전 coarse motion을 정의할 수 없는 경우에는 motion 값을 `0`으로 두고 `motion_valid=0`으로 표시합니다.
+- 실제로 유효한 연속 coarse step에서 정지한 agent는 motion 값이 `0`이어도 `motion_valid=1`이므로 missing motion과 구분됩니다.
+- flow 전용 agent-agent relation의 relative motion에도 `rel_motion_valid`를 추가해, 관계 feature 안에서도 알 수 없는 상대 motion과 실제 0 상대 motion을 분리합니다.
+- 이 설계는 `x_a_emb`와 flow `r_a2a_emb` 입력 차원을 바꾸므로, 예전 pretrained checkpoint와의 호환 경로는 제공하지 않습니다. 새 pretrain을 기준으로 사용합니다.
 
 ### Closed-loop Retokenize Rule
 

@@ -55,7 +55,7 @@ class SMARTAgentEncoder(nn.Module):
         self.hist_drop_prob = hist_drop_prob
         self.n_token_agent = n_token_agent
 
-        input_dim_x_a = 2
+        input_dim_x_a = 3
         input_dim_r_t = 4
         input_dim_r_pt2a = 3
         input_dim_r_a2a = 3
@@ -168,16 +168,10 @@ class SMARTAgentEncoder(nn.Module):
         agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]
         agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]]
 
-        motion_vector_a = self._build_motion_vector(pos_a, valid_mask)
-        feature_a = torch.stack(
-            [
-                safe_norm_2d(motion_vector_a[:, :, :2]),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_a,
-                    nbr_vector=motion_vector_a[:, :, :2],
-                ),
-            ],
-            dim=-1,
+        feature_a = self._build_motion_feature(
+            pos_a=pos_a,
+            head_vector_a=head_vector_a,
+            valid_mask=valid_mask,
         )
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
@@ -211,6 +205,33 @@ class SMARTAgentEncoder(nn.Module):
         return feat_a
 
     @staticmethod
+    def _build_motion_valid_mask(
+        pos_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        n_agent, n_step, _ = pos_a.shape
+        motion_valid_a = torch.zeros(
+            n_agent,
+            n_step,
+            device=pos_a.device,
+            dtype=torch.bool,
+        )
+        if n_step <= 1:
+            return motion_valid_a
+
+        if valid_mask is None:
+            motion_valid_a[:, 1:] = True
+            return motion_valid_a
+
+        if tuple(valid_mask.shape) != (n_agent, n_step):
+            raise ValueError(
+                "valid_mask shape must match the first two dimensions of pos_a, "
+                f"got {tuple(valid_mask.shape)} and {(n_agent, n_step)}."
+            )
+        motion_valid_a[:, 1:] = valid_mask[:, 1:].bool() & valid_mask[:, :-1].bool()
+        return motion_valid_a
+
+    @staticmethod
     def _build_motion_vector(
         pos_a: torch.Tensor,
         valid_mask: Optional[torch.Tensor] = None,
@@ -221,12 +242,44 @@ class SMARTAgentEncoder(nn.Module):
             return motion_vector_a
 
         step_delta = pos_a[:, 1:] - pos_a[:, :-1]
-        if valid_mask is not None:
-            # Invalid samples are stored at the origin; mask origin-to-global jumps.
-            step_valid = valid_mask[:, 1:].bool() & valid_mask[:, :-1].bool()
-            step_delta = step_delta.masked_fill(~step_valid.unsqueeze(-1), 0.0)
+        motion_valid_a = SMARTAgentEncoder._build_motion_valid_mask(pos_a, valid_mask)
+        # Invalid samples are stored at the origin; keep the value at zero and
+        # expose missingness through the separate motion_valid feature.
+        step_delta = step_delta.masked_fill(~motion_valid_a[:, 1:].unsqueeze(-1), 0.0)
         motion_vector_a[:, 1:] = step_delta
         return motion_vector_a
+
+    @staticmethod
+    def _build_motion_feature_from_vector(
+        motion_vector_a: torch.Tensor,
+        head_vector_a: torch.Tensor,
+        motion_valid_a: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.stack(
+            [
+                safe_norm_2d(motion_vector_a[..., :2]),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vector_a,
+                    nbr_vector=motion_vector_a[..., :2],
+                ),
+                motion_valid_a.to(dtype=motion_vector_a.dtype),
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
+    def _build_motion_feature(
+        pos_a: torch.Tensor,
+        head_vector_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        motion_vector_a = SMARTAgentEncoder._build_motion_vector(pos_a, valid_mask)
+        motion_valid_a = SMARTAgentEncoder._build_motion_valid_mask(pos_a, valid_mask)
+        return SMARTAgentEncoder._build_motion_feature_from_vector(
+            motion_vector_a=motion_vector_a,
+            head_vector_a=head_vector_a,
+            motion_valid_a=motion_valid_a,
+        )
 
     def build_temporal_edge(
         self,
