@@ -52,16 +52,6 @@ model:
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
 
-    # Commit bridge ---------------------------------------------------------
-    # Keep stop-motion gating OFF during this fine-tune. The pretrained flow
-    # checkpoint was trained without stop_motion logic, and enabling it at
-    # fine-tune time changes the DRaFT commit target for stopped agents
-    # (see `flow_agent_decoder.py` where `use_stop_motion` gates
-    # `commit_bridge.freeze_commit_chunk`). Turn this back on only if you
-    # want the fine-tune to bake in stop-motion freezing semantics (and are
-    # ready to compare against an ablation).
-    use_stop_motion: false
-
     # Validation ------------------------------------------------------------
     # `n_rollout_closed_val` is kept at 16 (same as 6xH100 preset) because
     # the Sim Agents 2025 scorer expects 32 rollouts per scenario and the

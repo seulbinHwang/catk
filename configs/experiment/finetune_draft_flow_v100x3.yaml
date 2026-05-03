@@ -32,9 +32,6 @@ model:
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
 
-    # Commit bridge ---------------------------------------------------------
-    use_stop_motion: false
-
     # Validation ------------------------------------------------------------
     n_rollout_closed_val: 16
     n_batch_sim_agents_metric: 10

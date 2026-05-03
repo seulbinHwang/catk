@@ -65,12 +65,6 @@ model:
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
 
-    # Commit bridge ---------------------------------------------------------
-    # Keep stop-motion gating OFF during this fine-tune. The pretrained flow
-    # checkpoint was trained without stop_motion logic; see the note in
-    # `finetune_draft_flow_a100x4.yaml` for the full rationale.
-    use_stop_motion: false
-
     # Validation ------------------------------------------------------------
     # Same validation semantics as the A100x4 / 6xH100 presets. The
     # closed-loop rollout loop in smart_flow.py auto-chunks rollouts on CUDA
