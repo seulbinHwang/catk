@@ -870,7 +870,105 @@ torchrun \
 ... data.train_batch_size=30
 ```
 
-### 5.10 6x H100에서 Self-Forced NPFM fine-tuning
+### 5.10 H100 4장짜리 pod 2개로 multi-node Flow Matching pretrain
+
+이미 떠 있는 `hsb-npc-training`, `hsb-npc-training2` pod를 그대로 살려 두고, 각 pod의 H100 4장씩 총 8 GPU로 하나의 pretrain run을 돌릴 때 쓰는 경로입니다. **이 경로는 pod를 새로 만들거나 지우거나 재시작하지 않습니다.** launcher는 `kubectl exec`로 기존 running pod 안에 들어가 tmux 세션과 `torchrun`만 시작합니다.
+
+- preset 파일: `configs/experiment/pre_bc_flow_2x4_h100.yaml`
+- pod launcher: `scripts/launch_h100x4_multinode_pretrain_tmux.py`
+- pod 내부 실행 wrapper: `scripts/h100x4_multinode_pretrain.sh`
+- 기본 구성: `NNODES=2`, `NPROC_PER_NODE=4`, `trainer.num_nodes=2`, `trainer.devices=4`
+- 기본 effective global batch: `data.train_batch_size=26 * 8 GPUs = 208`
+- 기본 lr: `6.933e-4` (`4e-4 * 208 / 120` 선형 scaling)
+- 기본 horizon: `flow_window_steps=20`
+- validation 중 공식 scorer가 오래 걸려도 DDP가 조기 timeout 나지 않도록 `trainer=ddp`의 process group timeout은 4시간입니다.
+
+로컬에서 kubectl이 되는 터미널에서 이 repo checkout으로 이동해 아래를 실행하면, master 주소는 `hsb-npc-training`의 Pod IP로 자동 설정되고 두 pod에 같은 tmux session이 만들어집니다.
+
+```bash
+python scripts/launch_h100x4_multinode_pretrain_tmux.py \
+  --namespace p-pnc \
+  --pods hsb-npc-training hsb-npc-training2 \
+  --container main \
+  --project-root /mnt/nuplan/projects/catk \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --branch self_forcing_bugfix \
+  --task-name flow_semi_continuous_pretrain_h100x4x2 \
+  --replace
+```
+
+실행 후 접속:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-h100x4-pretrain
+kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-h100x4-pretrain
+```
+
+중단도 pod가 아니라 tmux session만 종료합니다.
+
+```bash
+python scripts/launch_h100x4_multinode_pretrain_tmux.py \
+  --namespace p-pnc \
+  --pods hsb-npc-training hsb-npc-training2 \
+  --stop
+```
+
+중단된 multi-node pretrain을 이어서 학습할 때는 양쪽 pod에서 접근 가능한 같은 checkpoint 경로를 넘기고 `action=fit`을 유지합니다.
+
+```bash
+python scripts/launch_h100x4_multinode_pretrain_tmux.py \
+  --namespace p-pnc \
+  --pods hsb-npc-training hsb-npc-training2 \
+  --ckpt-path /mnt/nuplan/projects/catk/logs/flow_semi_continuous_pretrain_h100x4x2/runs/<timestamp>/checkpoints/epoch_last.ckpt \
+  --task-name flow_semi_continuous_pretrain_h100x4x2_resume \
+  --replace
+```
+
+짧은 smoke run은 아래처럼 전체 batch/epoch를 제한해서 rendezvous와 dataloader만 먼저 확인합니다.
+
+```bash
+python scripts/launch_h100x4_multinode_pretrain_tmux.py \
+  --namespace p-pnc \
+  --pods hsb-npc-training hsb-npc-training2 \
+  --task-name flow_pretrain_h100x4x2_smoke \
+  --limit-train-batches 20 \
+  --limit-val-batches 0 \
+  --max-epochs 1 \
+  --replace
+```
+
+manual launch가 필요하면 각 pod 안에서 같은 repo로 이동해 아래 환경변수를 다르게 주고 같은 wrapper를 실행합니다. rank 0은 `hsb-npc-training`, rank 1은 `hsb-npc-training2`입니다.
+
+```bash
+# hsb-npc-training
+export NNODES=2 NPROC_PER_NODE=4 NODE_RANK=0
+export MASTER_ADDR=<hsb-npc-training Pod IP>
+export MASTER_PORT=29511
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export TASK_NAME=flow_semi_continuous_pretrain_h100x4x2
+bash scripts/h100x4_multinode_pretrain.sh
+
+# hsb-npc-training2
+export NNODES=2 NPROC_PER_NODE=4 NODE_RANK=1
+export MASTER_ADDR=<hsb-npc-training Pod IP>
+export MASTER_PORT=29511
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export TASK_NAME=flow_semi_continuous_pretrain_h100x4x2
+bash scripts/h100x4_multinode_pretrain.sh
+```
+
+batch/LR를 바꾸고 싶으면 launcher 인자로 override 합니다.
+
+```bash
+python scripts/launch_h100x4_multinode_pretrain_tmux.py \
+  --pods hsb-npc-training hsb-npc-training2 \
+  --train-batch-size 23 \
+  --learning-rate 6.133e-4 \
+  --task-name flow_pretrain_h100x4x2_bs23 \
+  --replace
+```
+
+### 5.11 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
 - H100 preset은 Generator lr `4e-6`, generated estimator optimizer lr `8e-7` (`4e-6 / 5`), `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `path_step_size=0.05`, `unfrozen_range=except_map_encoder`, sampling = Euler 32-step / `noise_scale=1.0` / random terminal denoising step을 기본으로 둡니다.
@@ -1406,6 +1504,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 torchrun --standalone --nproc_per_node=6 -m src
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 -m src.run experiment=pre_bc_flow_4_h100 trainer=ddp trainer.devices=4 paths.cache_root="$CACHE_ROOT" task_name=flow_semi_continuous_pretrain_h1004
+```
+
+### 2-node 4x H100 학습
+
+```bash
+python scripts/launch_h100x4_multinode_pretrain_tmux.py --pods hsb-npc-training hsb-npc-training2 --task-name flow_semi_continuous_pretrain_h100x4x2 --replace
 ```
 
 ### validation 평가
