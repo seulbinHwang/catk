@@ -10,6 +10,7 @@ from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
+from src.smart.modules.dynamic_light_time import build_constant_light_time_delta_norm
 from src.smart.modules.flow_local_decoder import (
     ContinuousCommitBridge,
     FlowODE,
@@ -234,6 +235,35 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             * num_graphs
         )
         return batch.repeat(num_steps) + step_offsets
+
+    def _build_rollout_light_time_delta_norm(
+        self,
+        *,
+        num_agent: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        rollout_step_index: int,
+    ) -> torch.Tensor:
+        """closed-loop rollout에서 현재 신호가 얼마나 오래된 정보인지 만듭니다.
+
+        Args:
+            num_agent: 현재 batch 안 agent 수입니다.
+            device: 반환 tensor를 둘 장치입니다.
+            dtype: 반환 tensor 자료형입니다.
+            rollout_step_index: 0.5초 rollout block 번호입니다. 첫 block은 0입니다.
+
+        Returns:
+            torch.Tensor: 모든 agent에 대한 정규화된 신호 시간 차입니다.
+                shape은 ``[num_agent, 1]`` 입니다.
+        """
+        delta_seconds = float(rollout_step_index) * float(self.shift) * 0.1
+        return build_constant_light_time_delta_norm(
+            num_agents=num_agent,
+            num_steps=1,
+            delta_seconds=delta_seconds,
+            device=device,
+            dtype=dtype,
+        )
 
     @staticmethod
     def _build_recent_coarse_motion(
@@ -649,6 +679,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             mask=mask,
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
+            light_type=map_feature.get("light_type"),
         )
 
         feat_map = map_feature["pt_token"]
@@ -821,6 +852,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             mask=valid_window,
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
+            light_type=map_feature.get("light_type"),
         )
         edge_index_a2a, r_a2a = self.build_interaction_edge(
             pos_a=pos_window,
@@ -1360,6 +1392,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     mask=inference_mask[:, -1:],
                     batch_s=tokenized_agent["batch"],
                     batch_pl=map_feature["batch"],
+                    light_type=map_feature.get("light_type"),
+                    light_time_delta_norm=self._build_rollout_light_time_delta_norm(
+                        num_agent=pos_window.shape[0],
+                        device=pos_window.device,
+                        dtype=pos_window.dtype,
+                        rollout_step_index=t,
+                    ),
                 )
                 recent_motion, recent_motion_valid = self._build_recent_coarse_motion(
                     pos_window=pos_window,

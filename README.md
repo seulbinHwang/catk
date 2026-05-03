@@ -41,6 +41,17 @@
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
+
+### Dynamic Traffic-Light Staleness Feature
+
+- 교통 신호는 더 이상 정적 map token feature로 섞지 않습니다.
+- 현재 관측된 신호 상태는 agent가 주변 lane을 읽는 단계에서만 사용합니다.
+- 이때 신호 상태와 함께 `예측 기준 시점 - 신호 관측 시점` 시간 차를 넣습니다.
+- 시간 차는 `[-1초, +6초]` 범위로 clip 한 뒤 `6초` 로 나눠 정규화합니다.
+- 따라서 모델 입력 의미는 `이 lane은 빨간불이다` 가 아니라 `이 lane은 Δt초 전에 빨간불로 관측됐다` 입니다.
+- pretrain과 closed-loop 추론 모두 실제 미래 신호를 입력하지 않고, 현재 관측 신호와 경과 시간만 사용합니다.
+- 이 변경은 map encoder의 정적 traffic-light embedding을 제거하고, agent-lane relation 쪽에 동적 traffic-light embedding과 시간 차 scalar를 추가하므로 기존 pretrained checkpoint와 호환되지 않습니다. 새 pretrain을 기준으로 사용합니다.
+
 ### Motion Missingness Feature
 
 - flow encoder의 motion feature는 이제 `motion value = 0` 과 별도 `motion_valid` 입력을 함께 씁니다.
