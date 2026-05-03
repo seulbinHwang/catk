@@ -37,8 +37,11 @@ default_cache_root() {
 
 activate_conda_if_available() {
   if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then
-    log "conda env already active: ${CONDA_DEFAULT_ENV}"
-    return 0
+    if command -v python >/dev/null 2>&1 && command -v torchrun >/dev/null 2>&1; then
+      log "conda env already active: ${CONDA_DEFAULT_ENV}"
+      return 0
+    fi
+    log "conda env marker is set (${CONDA_DEFAULT_ENV}), but PATH is incomplete; reactivating."
   fi
 
   local conda_root="${CONDA_ROOT:-/mnt/nuplan/miniforge}"
