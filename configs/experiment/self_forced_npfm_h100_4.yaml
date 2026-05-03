@@ -53,19 +53,19 @@ model:
       enabled: true
       start_epoch: 0
       weight: 1.0
-      path_step_size: 0.01
+      path_step_size: 0.05
       clean_dmd_normalizer_eps: 1.0e-3
       clean_dmd_tau_low: 0.02
       clean_dmd_tau_high: 0.98
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
-      detach_block_transition: true
+      detach_block_transition: false
       estimator_updates_per_step: 5
       estimator_warmup_epochs: 0
       # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
       # Resume from a self-forced checkpoint preserves restored aux states.
       initialize_aux_from_generator_on_fit_start: true
-      unfrozen_range: except_map_encoder
+      unfrozen_range: full_flow_decoder #except_map_encoder
       ema_weight: 0.99
       ema_start_step: 50
       use_control_space_physics_regularization: false
