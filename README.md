@@ -889,15 +889,17 @@ torchrun \
 - pod launcher: `scripts/launch_h100x4_multinode_pretrain_tmux.py`
 - pod 내부 실행 wrapper: `scripts/h100x4_multinode_pretrain.sh`
 - 기본 구성: `NNODES=2`, `NPROC_PER_NODE=4`, `trainer.num_nodes=2`, `trainer.devices=4`
+- 기본 pod별 `CACHE_ROOT`: `hsb-npc-training=/mnt/nuplan/womd_v1_3/SMART_cache`, `hsb-npc-training2=/workspace/womd_v1_3/SMART_cache`
 - 기본 per-GPU batch: `data.train_batch_size=20` (기존 6xH100 pretrain의 per-GPU workload 유지)
 - 기본 effective global batch: `20 * 8 GPUs = 160`
 - 기본 lr: `5.333e-4` (`4e-4 * 160 / 120` 선형 scaling)
 - 기본 horizon: `flow_window_steps=20`
 - validation 중 공식 scorer가 오래 걸려도 DDP가 조기 timeout 나지 않도록 `trainer=ddp`의 process group timeout은 4시간입니다.
 - `pre_bc_flow_2x4_h100` preset은 `TQDMProgressBar(refresh_rate=1)`와 `trainer.enable_progress_bar=true`를 명시합니다. launcher 기본 pod 순서에서는 `hsb-npc-training`이 node rank 0/global rank 0이므로, `check_val_every_n_epoch=32`로 fit-time validation이 시작될 때 validation tqdm 진행률은 `hsb-npc-training`의 `catk-h100x4-pretrain` tmux 주 pane에 표시됩니다. `hsb-npc-training2`는 non-zero rank라 같은 progress bar를 중복 출력하지 않는 것이 정상입니다.
+- launcher는 각 pod 안에 쓰는 env 파일에 pod별 `CACHE_ROOT`를 따로 기록합니다. 두 pod가 같은 mount path를 공유하는 경우에만 `--cache-root <PATH>`로 전체 override를 쓰고, pod별 경로를 바꿔야 하면 `--pod-cache-root POD=PATH`를 반복해서 넘깁니다.
 - 이 기본값은 H100 한 장당 메모리/연산량은 기존 6xH100 설정과 맞추고, GPU 수 증가분만 global batch와 throughput 증가로 쓰는 보수적 선택입니다. 기존 6xH100과 global batch까지 맞춰야 하는 ablation이면 `--train-batch-size 15 --learning-rate 4e-4`를 쓰세요.
 
-로컬에서 kubectl이 되는 터미널에서 이 repo checkout으로 이동해 아래를 실행하면, master 주소는 `hsb-npc-training`의 Pod IP로 자동 설정되고 두 pod에 같은 tmux session이 만들어집니다.
+로컬에서 kubectl이 되는 터미널에서 이 repo checkout으로 이동해 아래를 실행하면, master 주소는 `hsb-npc-training`의 Pod IP로 자동 설정되고 두 pod에 같은 tmux session이 만들어집니다. 새 pretrain을 처음부터 시작하는 경로이므로 `--ckpt-path`는 넘기지 않습니다.
 
 ```bash
 python scripts/launch_h100x4_multinode_pretrain_tmux.py \
@@ -905,7 +907,6 @@ python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --pods hsb-npc-training hsb-npc-training2 \
   --container main \
   --project-root /mnt/nuplan/projects/catk \
-  --cache-root /workspace/womd_v1_3/SMART_cache \
   --branch self_forcing_bugfix \
   --task-name flow_semi_continuous_pretrain_h100x4x2 \
   --replace
@@ -925,17 +926,6 @@ python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --namespace p-pnc \
   --pods hsb-npc-training hsb-npc-training2 \
   --stop
-```
-
-중단된 multi-node pretrain을 이어서 학습할 때는 양쪽 pod에서 접근 가능한 같은 checkpoint 경로를 넘기고 `action=fit`을 유지합니다.
-
-```bash
-python scripts/launch_h100x4_multinode_pretrain_tmux.py \
-  --namespace p-pnc \
-  --pods hsb-npc-training hsb-npc-training2 \
-  --ckpt-path /mnt/nuplan/projects/catk/logs/flow_semi_continuous_pretrain_h100x4x2/runs/<timestamp>/checkpoints/epoch_last.ckpt \
-  --task-name flow_semi_continuous_pretrain_h100x4x2_resume \
-  --replace
 ```
 
 짧은 smoke run은 아래처럼 전체 batch/epoch를 제한해서 rendezvous와 dataloader만 먼저 확인합니다.
@@ -958,7 +948,7 @@ manual launch가 필요하면 각 pod 안에서 같은 repo로 이동해 아래 
 export NNODES=2 NPROC_PER_NODE=4 NODE_RANK=0
 export MASTER_ADDR=<hsb-npc-training Pod IP>
 export MASTER_PORT=29511
-export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export CACHE_ROOT=/mnt/nuplan/womd_v1_3/SMART_cache
 export TASK_NAME=flow_semi_continuous_pretrain_h100x4x2
 bash scripts/h100x4_multinode_pretrain.sh
 

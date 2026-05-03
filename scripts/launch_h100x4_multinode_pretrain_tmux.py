@@ -21,6 +21,10 @@ DEFAULT_PODS = ["hsb-npc-training", "hsb-npc-training2"]
 DEFAULT_BRANCH = os.environ.get("CATK_BRANCH", "self_forcing_bugfix")
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
+DEFAULT_CACHE_ROOT_BY_POD = {
+    "hsb-npc-training": "/mnt/nuplan/womd_v1_3/SMART_cache",
+    "hsb-npc-training2": "/workspace/womd_v1_3/SMART_cache",
+}
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 
 
@@ -57,15 +61,44 @@ def export_line(name: str, value: object) -> str:
     return f"export {name}={shq(value)}"
 
 
+def parse_pod_cache_roots(values: list[str]) -> dict[str, str]:
+    roots: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(
+                "--pod-cache-root entries must use POD=PATH, "
+                f"but got: {value!r}"
+            )
+        pod, path = value.split("=", 1)
+        pod = pod.strip()
+        path = path.strip()
+        if not pod or not path:
+            raise ValueError(
+                "--pod-cache-root entries must include both POD and PATH, "
+                f"but got: {value!r}"
+            )
+        roots[pod] = path
+    return roots
+
+
+def cache_root_for_pod(args: argparse.Namespace, pod: str) -> str:
+    if pod in args.pod_cache_root_map:
+        return args.pod_cache_root_map[pod]
+    if args.cache_root:
+        return args.cache_root
+    return DEFAULT_CACHE_ROOT_BY_POD.get(pod, DEFAULT_CACHE_ROOT)
+
+
 def render_env_file(
     *,
     args: argparse.Namespace,
+    cache_root: str,
     rank: int,
     master_addr: str,
     task_name: str,
 ) -> str:
     lines = [
-        export_line("CACHE_ROOT", args.cache_root),
+        export_line("CACHE_ROOT", cache_root),
         export_line("NNODES", len(args.pods)),
         export_line("NPROC_PER_NODE", args.nproc_per_node),
         export_line("NODE_RANK", rank),
@@ -146,8 +179,10 @@ def render_start_command(
     monitor_file = f"{run_root}/{pod}_monitor.sh"
     log_file = f"{run_root}/{pod}.tmux.log"
     pipe_command = f"cat >> {shq(log_file)}"
+    cache_root = cache_root_for_pod(args, pod)
     env_text = render_env_file(
         args=args,
+        cache_root=cache_root,
         rank=rank,
         master_addr=master_addr,
         task_name=task_name,
@@ -219,6 +254,7 @@ tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_
 tmux pipe-pane -t {shq(args.session)}:0.0 -o {shq(pipe_command)}
 {monitor_block}
 echo "[launcher] started tmux session {args.session} on pod {pod}"
+echo "[launcher] cache root: {cache_root}"
 echo "[launcher] tmux log: {log_file}"
 """
 
@@ -271,7 +307,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branch", default=DEFAULT_BRANCH)
     parser.add_argument("--no-pull", dest="pull", action="store_false")
     parser.set_defaults(pull=True)
-    parser.add_argument("--cache-root", default=DEFAULT_CACHE_ROOT)
+    parser.add_argument(
+        "--cache-root",
+        default="",
+        help=(
+            "Use one CACHE_ROOT for every pod. If omitted, known pod-specific "
+            "defaults are used."
+        ),
+    )
+    parser.add_argument(
+        "--pod-cache-root",
+        action="append",
+        default=[],
+        metavar="POD=PATH",
+        help=(
+            "Override CACHE_ROOT for one pod. Can be repeated; takes priority "
+            "over --cache-root."
+        ),
+    )
     parser.add_argument(
         "--action",
         choices=["fit", "validate", "test"],
@@ -299,6 +352,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    try:
+        args.pod_cache_root_map = parse_pod_cache_roots(args.pod_cache_root)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if len(args.pods) < 2 and not args.stop:
         parser.error("--pods must contain at least two pods for multi-node training")
@@ -333,6 +391,9 @@ def main() -> None:
     print(f"[launcher] master pod: {args.pods[0]} ({master_addr}:{args.master_port})")
     print(f"[launcher] task_name: {args.task_name}")
     print(f"[launcher] session:   {args.session}")
+    print("[launcher] cache roots:")
+    for pod in args.pods:
+        print(f"  {pod}: {cache_root_for_pod(args, pod)}")
 
     for rank, pod in enumerate(args.pods):
         script = render_start_command(
