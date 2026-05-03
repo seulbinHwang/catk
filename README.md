@@ -888,16 +888,17 @@ torchrun \
 - preset 파일: `configs/experiment/pre_bc_flow_2x4_h100.yaml`
 - pod launcher: `scripts/launch_h100x4_multinode_pretrain_tmux.py`
 - pod 내부 실행 wrapper: `scripts/h100x4_multinode_pretrain.sh`
+- OOM fallback launcher: `scripts/h100x4_multinode_pretrain_with_oom_retry.sh`
 - 기본 구성: `NNODES=2`, `NPROC_PER_NODE=4`, `trainer.num_nodes=2`, `trainer.devices=4`
 - 기본 pod별 `CACHE_ROOT`: `hsb-npc-training=/mnt/nuplan/womd_v1_3/SMART_cache`, `hsb-npc-training2=/workspace/womd_v1_3/SMART_cache`
-- 기본 per-GPU batch: `data.train_batch_size=20` (기존 6xH100 pretrain의 per-GPU workload 유지)
-- 기본 effective global batch: `20 * 8 GPUs = 160`
-- 기본 lr: `5.333e-4` (`4e-4 * 160 / 120` 선형 scaling)
+- 기본 per-GPU batch: `data.train_batch_size=26`
+- 기본 effective global batch: `26 * 8 GPUs = 208`
+- 기본 lr: `5e-4` (이전 H100x4x2 `train_batch_size=20` 설정의 lr을 그대로 유지; batch 증가에 대해 추가 선형 scaling 하지 않음)
 - 기본 horizon: `flow_window_steps=20`
 - validation 중 공식 scorer가 오래 걸려도 DDP가 조기 timeout 나지 않도록 `trainer=ddp`의 process group timeout은 4시간입니다.
 - `pre_bc_flow_2x4_h100` preset은 `TQDMProgressBar(refresh_rate=1)`와 `trainer.enable_progress_bar=true`를 명시합니다. launcher 기본 pod 순서에서는 `hsb-npc-training`이 node rank 0/global rank 0이므로, `check_val_every_n_epoch=32`로 fit-time validation이 시작될 때 validation tqdm 진행률은 `hsb-npc-training`의 `catk-h100x4-pretrain` tmux 주 pane에 표시됩니다. `hsb-npc-training2`는 non-zero rank라 같은 progress bar를 중복 출력하지 않는 것이 정상입니다.
 - launcher는 각 pod 안에 쓰는 env 파일에 pod별 `CACHE_ROOT`를 따로 기록합니다. 두 pod가 같은 mount path를 공유하는 경우에만 `--cache-root <PATH>`로 전체 override를 쓰고, pod별 경로를 바꿔야 하면 `--pod-cache-root POD=PATH`를 반복해서 넘깁니다.
-- 이 기본값은 H100 한 장당 메모리/연산량은 기존 6xH100 설정과 맞추고, GPU 수 증가분만 global batch와 throughput 증가로 쓰는 보수적 선택입니다. 기존 6xH100과 global batch까지 맞춰야 하는 ablation이면 `--train-batch-size 15 --learning-rate 4e-4`를 쓰세요.
+- 이 기본값은 H100x4x2의 추가 GPU 수와 H100 메모리 여유를 throughput으로 쓰되, optimizer lr은 이전 H100x4x2 설정과 동일하게 유지하는 선택입니다. 이전 보수적 설정과 같은 per-GPU batch를 유지해야 하는 ablation이면 `--train-batch-size 20`을 쓰고, 기존 6xH100과 global batch까지 맞춰야 하는 ablation이면 `--train-batch-size 15 --learning-rate 4e-4`를 쓰세요.
 
 로컬에서 kubectl이 되는 터미널에서 이 repo checkout으로 이동해 아래를 실행하면, master 주소는 `hsb-npc-training`의 Pod IP로 자동 설정되고 두 pod에 같은 tmux session이 만들어집니다. 새 pretrain을 처음부터 시작하는 경로이므로 `--ckpt-path`는 넘기지 않습니다.
 
@@ -911,6 +912,26 @@ python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --task-name flow_semi_continuous_pretrain_h100x4x2 \
   --replace
 ```
+
+긴 pretrain을 OOM fallback과 함께 돌릴 때는 아래 shell wrapper를 권장합니다. 첫 시도는 `data.train_batch_size=26`으로 시작하고, attempt 로그에서 `CUDA out of memory` / `OutOfMemoryError` 계열 마커가 잡히면 batch를 `2`씩 낮춘 뒤 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`를 찾아 `ckpt_path`로 넘겨 resume합니다. 기본 `MIN_BS=20`은 이전에 안정적으로 돌린 per-GPU batch 20을 안전 하한으로 둔 값이며, 더 낮게 내려가야 하면 환경변수로 바꿀 수 있습니다. 이 wrapper도 pod를 새로 만들거나 재시작하지 않고, attempt마다 기존 tmux session만 `--replace`로 교체합니다.
+
+```bash
+TASK_NAME=flow_semi_continuous_pretrain_h100x4x2_bs26 \
+bash scripts/h100x4_multinode_pretrain_with_oom_retry.sh
+```
+
+주요 override:
+
+```bash
+INITIAL_BS=26 \
+OOM_STEP=2 \
+MIN_BS=20 \
+TASK_NAME=flow_semi_continuous_pretrain_h100x4x2_bs26 \
+BRANCH=self_forcing_bugfix \
+bash scripts/h100x4_multinode_pretrain_with_oom_retry.sh
+```
+
+retry wrapper의 로컬 attempt 로그는 `logs/_h100x4_multinode_pretrain_oom_retry/<TASK_NAME>/attempt_XXX_bsYY.log`에 저장됩니다. resume 기준 checkpoint는 pod 안의 `logs/<TASK_NAME>/runs/*/checkpoints/epoch_last.ckpt` 중 최신 파일입니다. 학습 epoch 중간에 OOM이 나면 마지막으로 저장된 `epoch_last.ckpt`, 즉 보통 마지막 완료 epoch부터 이어가고, validation 직전/중간 OOM이면 validation 직전에 저장된 pending checkpoint부터 이어갑니다.
 
 실행 후 접속:
 
@@ -928,7 +949,7 @@ python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --stop
 ```
 
-짧은 smoke run은 아래처럼 전체 batch/epoch를 제한해서 rendezvous와 dataloader만 먼저 확인합니다.
+짧은 smoke run은 아래처럼 전체 batch/epoch를 제한해서 rendezvous와 dataloader만 먼저 확인합니다. preset 기본값이 이미 `data.train_batch_size=26`이므로 별도 batch override는 필요 없습니다.
 
 ```bash
 python scripts/launch_h100x4_multinode_pretrain_tmux.py \
@@ -961,14 +982,13 @@ export TASK_NAME=flow_semi_continuous_pretrain_h100x4x2
 bash scripts/h100x4_multinode_pretrain.sh
 ```
 
-batch/LR를 더 공격적으로 키우고 싶으면 launcher 인자로 override 합니다. 예를 들어 per-GPU batch 23은 global batch `184`이고, 6xH100 baseline global batch `120` 기준 선형 scaling LR은 `6.133e-4` 입니다.
+batch를 더 공격적으로 키우고 싶으면 launcher 인자로 override 합니다. 기본 정책은 batch를 바꿔도 lr을 자동 선형 scaling하지 않는 것입니다. lr까지 바꿔야 하는 별도 ablation에서만 `--learning-rate`를 명시하세요.
 
 ```bash
 python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --pods hsb-npc-training hsb-npc-training2 \
-  --train-batch-size 23 \
-  --learning-rate 6.133e-4 \
-  --task-name flow_pretrain_h100x4x2_bs23 \
+  --train-batch-size 28 \
+  --task-name flow_pretrain_h100x4x2_bs28 \
   --replace
 ```
 

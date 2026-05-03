@@ -8,11 +8,11 @@
 #   * 4 H100 80GB GPUs per node
 #   * 8 total DDP ranks
 #
-# The per-GPU batch keeps the existing 6xH100 pretrain workload per GPU while
-# using two extra GPUs for throughput:
-#   train_batch_size 20 * 8 GPUs = effective global batch 160.
-# The lr follows the README's linear scaling rule from the 6xH100 global batch
-# 120 baseline: 4e-4 * 160 / 120 = 5.333e-4.
+# The per-GPU batch uses the extra H100 memory headroom while preserving the
+# same 2s flow window and one optimizer step per global batch:
+#   train_batch_size 26 * 8 GPUs = effective global batch 208.
+# The lr intentionally stays at the previous H100x4x2 value instead of applying
+# another linear scaling step when the batch is raised from 20 to 26.
 # ============================================================================
 
 defaults:
@@ -20,7 +20,7 @@ defaults:
 
 model:
   model_config:
-    lr: 5.333e-4
+    lr: 5e-4
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
     n_rollout_closed_val: 16
@@ -58,7 +58,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 20
+  train_batch_size: 26
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
