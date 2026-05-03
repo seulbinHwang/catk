@@ -71,14 +71,14 @@ class TopKDraftPhysicsRegularizer(DraftPhysicsRegularizer):
     ) -> Dict[str, Tensor]:
         """클래스별 시점 위반을 mean 또는 topk 로 집계합니다.
 
-        손실 항(hard/slip/soft/head)만 ``topk`` 인자에 따라 집계 방식이
+        손실 항(hard/soft/head)만 ``topk`` 인자에 따라 집계 방식이
         달라지며, 로깅용 excess 키들은 항상 시간 평균을 씁니다 (학습 신호와
         분리).
 
         Args:
             per_step: ``_compute_*_per_step_penalties`` 의 출력입니다.
             class_id: ``VEHICLE``/``BICYCLE``/``PEDESTRIAN`` 클래스입니다.
-            topk: ``True`` 면 hard/slip/soft/head 에 상위-K 평균을 적용합니다.
+            topk: ``True`` 면 hard/soft/head 에 상위-K 평균을 적용합니다.
 
         Returns:
             Dict[str, Tensor]: 집계된 스칼라 사전입니다 (각 값 shape은 ``[n_agent]``).
@@ -97,7 +97,6 @@ class TopKDraftPhysicsRegularizer(DraftPhysicsRegularizer):
             }
         return {
             "hard": agg(per_step["hard"]),
-            "slip": agg(per_step["slip"]),
             "soft": agg(per_step["soft"]),
             "speed_excess_mps": self._mean_over_time(per_step["speed_excess_mps"]),
             "slip_beta_excess_deg": self._mean_over_time(per_step["slip_beta_excess_deg"]),
@@ -143,8 +142,8 @@ class TopKDraftPhysicsRegularizer(DraftPhysicsRegularizer):
             soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
         else:
             soft_effective = pred_stats["soft"]
-        effective_total = pred_stats["hard"] + pred_stats["slip"] + self.soft_weight * soft_effective
-        raw_total = pred_stats["hard"] + pred_stats["slip"] + self.soft_weight * pred_stats["soft"]
+        effective_total = pred_stats["hard"] + self.soft_weight * soft_effective
+        raw_total = pred_stats["hard"] + self.soft_weight * pred_stats["soft"]
         return effective_total, raw_total, soft_effective
 
     def forward(
@@ -174,7 +173,7 @@ class TopKDraftPhysicsRegularizer(DraftPhysicsRegularizer):
 
         Returns:
             Dict[str, Tensor]: 부모 클래스와 같은 키 구조의 사전입니다. ``loss``,
-                ``raw_pred_loss``, class별 component (``hard``/``slip``/``soft``/
+                ``raw_pred_loss``, class별 component (``hard``/``soft``/
                 ``head``/``total``) 는 ``K < T`` 일 때 ``0.5 * (mean + topk)`` 로
                 블렌드되며, 로깅용 excess 키들은 항상 시간 평균입니다.
         """
@@ -288,14 +287,12 @@ class TopKDraftPhysicsRegularizer(DraftPhysicsRegularizer):
                     effective_total = 0.5 * (eff_mean + eff_topk)
                     raw_total = 0.5 * (raw_mean + raw_topk)
                     output[f"{class_name}_hard"] = (0.5 * (pred_mean["hard"] + pred_topk["hard"])).mean()
-                    output[f"{class_name}_slip"] = (0.5 * (pred_mean["slip"] + pred_topk["slip"])).mean()
                     output[f"{class_name}_soft"] = (0.5 * (soft_eff_mean + soft_eff_topk)).mean()
                     output[f"{class_name}_total"] = effective_total.mean()
                 else:
                     effective_total = eff_mean
                     raw_total = raw_mean
                     output[f"{class_name}_hard"] = pred_mean["hard"].mean()
-                    output[f"{class_name}_slip"] = pred_mean["slip"].mean()
                     output[f"{class_name}_soft"] = soft_eff_mean.mean()
                     output[f"{class_name}_total"] = effective_total.mean()
                 for key in (

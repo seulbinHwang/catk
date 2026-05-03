@@ -56,11 +56,9 @@ DEFAULT_LIMITS = DynamicLimitTable(
 
 DRAFT_PHYSICS_COMPONENT_KEYS = (
     "vehicle_hard",
-    "vehicle_slip",
     "vehicle_soft",
     "vehicle_total",
     "bicycle_hard",
-    "bicycle_slip",
     "bicycle_soft",
     "bicycle_total",
     "pedestrian_hard",
@@ -140,10 +138,6 @@ class DraftPhysicsRegularizer(nn.Module):
         soft_weight: 모든 class에 공통으로 쓰는 roughness 항 가중치입니다.
         compare_softness_to_gt: ``True`` 이면 soft roughness를 GT보다 더 큰 만큼만
             반영하고, ``False`` 이면 prediction roughness 자체를 그대로 반영합니다.
-        slip_deadzone_ratio: slip angle 초과량 중 무시할 정규화 여유 폭입니다.
-            ``semi_continuous_lqr`` 의 기본값 ``0.02`` 를 그대로 사용합니다.
-        slip_deadzone_softness: slip dead-zone 경계를 부드럽게 만드는 값입니다.
-            ``semi_continuous_lqr`` 의 기본값 ``0.02`` 를 그대로 사용합니다.
         pedestrian_heading_weight: 사람 heading 약한 정렬 항 가중치입니다.
         pedestrian_heading_speed_threshold_mps: 사람 heading 항을 켜는 최소 속도입니다.
         eps: 수치 안정용 작은 값입니다.
@@ -172,8 +166,6 @@ class DraftPhysicsRegularizer(nn.Module):
         bicycle_steer_rate_max_radps: float = 1.5,
         soft_weight: float = 0.25,
         compare_softness_to_gt: bool = True,
-        slip_deadzone_ratio: float = 0.02,
-        slip_deadzone_softness: float = 0.02,
         pedestrian_heading_weight: float = 0.05,
         pedestrian_heading_speed_threshold_mps: float = 0.5,
         eps: float = 1e-6,
@@ -212,8 +204,6 @@ class DraftPhysicsRegularizer(nn.Module):
         self.bicycle_steer_rate_max_radps = float(bicycle_steer_rate_max_radps)
         self.soft_weight = float(soft_weight)
         self.compare_softness_to_gt = bool(compare_softness_to_gt)
-        self.slip_deadzone_ratio = float(slip_deadzone_ratio)
-        self.slip_deadzone_softness = float(slip_deadzone_softness)
         self.pedestrian_heading_weight = float(pedestrian_heading_weight)
         self.pedestrian_heading_speed_threshold_mps = float(pedestrian_heading_speed_threshold_mps)
         self.eps = float(eps)
@@ -336,22 +326,16 @@ class DraftPhysicsRegularizer(nn.Module):
                     soft_effective = torch.relu(pred_stats["soft"] - gt_stats["soft"])
                 else:
                     soft_effective = pred_stats["soft"]
-                # slip은 semi_continuous_lqr의 proxy penalty처럼 예측 궤적의
-                # 비홀로노믹 위반 자체를 직접 더합니다. 전체 draft.max_weight는
-                # 기존 학습 파이프라인이 그대로 적용합니다.
                 effective_total = (
                     pred_stats["hard"]
-                    + pred_stats["slip"]
                     + self.soft_weight * soft_effective
                 )
                 raw_total = (
                     pred_stats["hard"]
-                    + pred_stats["slip"]
                     + self.soft_weight * pred_stats["soft"]
                 )
 
                 output[f"{class_name}_hard"] = pred_stats["hard"].mean()
-                output[f"{class_name}_slip"] = pred_stats["slip"].mean()
                 output[f"{class_name}_soft"] = soft_effective.mean()
                 output[f"{class_name}_total"] = effective_total.mean()
                 pred_actual_buckets["speed_excess_mps"].append(pred_stats["speed_excess_mps"].mean())
@@ -398,8 +382,9 @@ class DraftPhysicsRegularizer(nn.Module):
 
         Returns:
             Dict[str, Tensor]:
-                시점별 위반량을 담은 사전입니다. ``hard``/``slip`` shape은
-                ``[n_agent, T]``, ``soft`` shape은 ``[n_agent, T-1]`` (T<2이면 ``[n_agent, 0]``),
+                시점별 위반량을 담은 사전입니다. ``hard`` shape은 ``[n_agent, T]`` 이며
+                속도, 가속도, 조향, 조향 변화, 횡가속, slip-angle 위반을 모두 포함합니다.
+                ``soft`` shape은 ``[n_agent, T-1]`` (T<2이면 ``[n_agent, 0]``),
                 실제 단위 초과량 키들의 shape은 ``[n_agent, T]`` 입니다.
         """
         pos_local_m, heading_local = self._denormalize_future(future_norm)
@@ -463,6 +448,7 @@ class DraftPhysicsRegularizer(nn.Module):
             + self._phi(steer.abs() / steer_max_rad - 1.0)
             + self._phi(steer_rate.abs() / steer_rate_max_radps - 1.0)
             + self._phi(lat_accel / a_lat_max - 1.0)
+            + slip_per_step
         )
         if accel.shape[1] > 1:
             accel_delta = accel[:, 1:] - accel[:, :-1]
@@ -476,7 +462,6 @@ class DraftPhysicsRegularizer(nn.Module):
 
         return {
             "hard": hard_per_step,
-            "slip": slip_per_step,
             "soft": soft_per_step,
             "speed_excess_mps": torch.relu(speed.abs() - v_max),
             "slip_beta_excess_deg": torch.rad2deg(torch.relu(beta - beta_max)),
@@ -506,7 +491,8 @@ class DraftPhysicsRegularizer(nn.Module):
 
         Returns:
             Dict[str, Tensor]:
-                hard, slip, soft, 실제 단위 초과량을 담은 사전입니다.
+                hard, soft, 실제 단위 초과량을 담은 사전입니다.
+                차량/자전거 hard에는 slip-angle penalty가 포함됩니다.
                 각 값의 shape은 ``[n_agent]`` 입니다.
         """
         per_step = self._compute_vehicle_like_per_step_penalties(
@@ -723,7 +709,7 @@ class DraftPhysicsRegularizer(nn.Module):
         limit: Tensor,
         enabled: Tensor | None = None,
     ) -> Tensor:
-        """LQR 브랜치와 같은 slip 초과량 제곱 penalty를 계산합니다.
+        """다른 hard-limit 항과 같은 slip angle 초과 penalty를 계산합니다.
 
         Args:
             value: slip angle입니다. shape은 ``[n_agent, T]`` 입니다.
@@ -735,16 +721,7 @@ class DraftPhysicsRegularizer(nn.Module):
             Tensor:
                 slip penalty입니다. shape은 ``[n_agent, T]`` 입니다.
         """
-        normalized_excess = torch.relu(value - limit) / (limit.abs() + self.eps)
-        shifted = (normalized_excess - self.slip_deadzone_ratio) / max(
-            self.slip_deadzone_softness,
-            self.eps,
-        )
-        smooth = torch.nn.functional.softplus(shifted) * max(
-            self.slip_deadzone_softness,
-            self.eps,
-        )
-        penalty = smooth.square()
+        penalty = self._phi(value / (limit.abs() + self.eps) - 1.0)
         if enabled is None:
             return penalty
         return torch.where(enabled, penalty, penalty.new_zeros(()))

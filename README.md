@@ -1326,21 +1326,20 @@ vehicle beta_max = 0.27 rad
 bicycle beta_max = 0.70 rad
 ```
 
-초과량은 `semi_continuous_lqr`의 proxy penalty와 같은 dead-zone 제곱 형태를 사용합니다.
+초과량은 다른 hard-limit 항과 같은 정규화 제곱 형태를 사용합니다. `soft_limit_ratio`가 켜져 있으면 slip angle도 같은 비율만큼 벌점 시작점이 앞당겨집니다.
 
 ```text
-r = relu(beta - beta_max) / (abs(beta_max) + eps)
-z = (r - 0.02) / 0.02
-slip_penalty = (0.02 * softplus(z))^2
+slip_penalty = max(0, beta / beta_max - soft_limit_ratio)^2
 ```
 
-최종 vehicle / bicycle feasibility 손실은 기존 hard 항과 기존 soft 처리 방식 사이에 slip 항을 1.0 배율로 직접 더합니다.
+최종 vehicle / bicycle feasibility 손실에서는 slip penalty를 별도 loss component로 두지 않고 hard 항 내부에 포함합니다.
 
 ```text
-vehicle_or_bicycle_total = hard + slip + soft_weight * soft_effective
+hard = speed/accel/steer/steer_rate/lat_accel hard penalty + slip_penalty
+vehicle_or_bicycle_total = hard + soft_weight * soft_effective
 ```
 
-기존 sampling 설정, draft 전체 가중치, train batch size, learning rate는 바꾸지 않습니다. 학습 로그에는 `vehicle_slip`, `bicycle_slip`, `slip_beta_excess_deg`가 추가됩니다.
+기존 sampling 설정, draft 전체 가중치, train batch size, learning rate는 바꾸지 않습니다. 학습 로그에서 slip penalty 자체는 `vehicle_hard` / `bicycle_hard`에 포함되고, 실제 slip 초과 각도는 `slip_beta_excess_deg`로 확인합니다.
 
 ## 6. 평가와 추론
 
