@@ -889,10 +889,12 @@ torchrun \
 - pod launcher: `scripts/launch_h100x4_multinode_pretrain_tmux.py`
 - pod 내부 실행 wrapper: `scripts/h100x4_multinode_pretrain.sh`
 - 기본 구성: `NNODES=2`, `NPROC_PER_NODE=4`, `trainer.num_nodes=2`, `trainer.devices=4`
-- 기본 effective global batch: `data.train_batch_size=26 * 8 GPUs = 208`
-- 기본 lr: `6.933e-4` (`4e-4 * 208 / 120` 선형 scaling)
+- 기본 per-GPU batch: `data.train_batch_size=20` (기존 6xH100 pretrain의 per-GPU workload 유지)
+- 기본 effective global batch: `20 * 8 GPUs = 160`
+- 기본 lr: `5.333e-4` (`4e-4 * 160 / 120` 선형 scaling)
 - 기본 horizon: `flow_window_steps=20`
 - validation 중 공식 scorer가 오래 걸려도 DDP가 조기 timeout 나지 않도록 `trainer=ddp`의 process group timeout은 4시간입니다.
+- 이 기본값은 H100 한 장당 메모리/연산량은 기존 6xH100 설정과 맞추고, GPU 수 증가분만 global batch와 throughput 증가로 쓰는 보수적 선택입니다. 기존 6xH100과 global batch까지 맞춰야 하는 ablation이면 `--train-batch-size 15 --learning-rate 4e-4`를 쓰세요.
 
 로컬에서 kubectl이 되는 터미널에서 이 repo checkout으로 이동해 아래를 실행하면, master 주소는 `hsb-npc-training`의 Pod IP로 자동 설정되고 두 pod에 같은 tmux session이 만들어집니다.
 
@@ -968,7 +970,7 @@ export TASK_NAME=flow_semi_continuous_pretrain_h100x4x2
 bash scripts/h100x4_multinode_pretrain.sh
 ```
 
-batch/LR를 바꾸고 싶으면 launcher 인자로 override 합니다.
+batch/LR를 더 공격적으로 키우고 싶으면 launcher 인자로 override 합니다. 예를 들어 per-GPU batch 23은 global batch `184`이고, 6xH100 baseline global batch `120` 기준 선형 scaling LR은 `6.133e-4` 입니다.
 
 ```bash
 python scripts/launch_h100x4_multinode_pretrain_tmux.py \
