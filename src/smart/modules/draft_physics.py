@@ -111,8 +111,8 @@ class DraftPhysicsRegularizer(nn.Module):
 
     차량과 자전거는 자전거 모델에 맞춘 역추론 값을 쓰고,
     사람은 2차원 속도와 2차원 가속도로 계산합니다.
-    차량과 자전거에는 body-frame slip angle 벌점을 추가해 heading 방향과
-    실제 이동 방향이 크게 어긋나는 옆방향 미끄러짐을 줄입니다.
+    ``use_slip_penalty`` 가 켜지면 차량과 자전거에는 body-frame slip angle 벌점을
+    추가해 heading 방향과 실제 이동 방향이 크게 어긋나는 옆방향 미끄러짐을 줄입니다.
 
     Args:
         dt: 미래 점 간 시간 간격입니다. 기본값은 ``0.1`` 초입니다.
@@ -138,6 +138,7 @@ class DraftPhysicsRegularizer(nn.Module):
         soft_weight: 모든 class에 공통으로 쓰는 roughness 항 가중치입니다.
         compare_softness_to_gt: ``True`` 이면 soft roughness를 GT보다 더 큰 만큼만
             반영하고, ``False`` 이면 prediction roughness 자체를 그대로 반영합니다.
+        use_slip_penalty: ``True`` 이면 차량/자전거 hard 항에 slip angle penalty를 포함합니다.
         pedestrian_heading_weight: 사람 heading 약한 정렬 항 가중치입니다.
         pedestrian_heading_speed_threshold_mps: 사람 heading 항을 켜는 최소 속도입니다.
         eps: 수치 안정용 작은 값입니다.
@@ -166,6 +167,7 @@ class DraftPhysicsRegularizer(nn.Module):
         bicycle_steer_rate_max_radps: float = 1.5,
         soft_weight: float = 0.25,
         compare_softness_to_gt: bool = True,
+        use_slip_penalty: bool = False,
         pedestrian_heading_weight: float = 0.05,
         pedestrian_heading_speed_threshold_mps: float = 0.5,
         eps: float = 1e-6,
@@ -204,6 +206,7 @@ class DraftPhysicsRegularizer(nn.Module):
         self.bicycle_steer_rate_max_radps = float(bicycle_steer_rate_max_radps)
         self.soft_weight = float(soft_weight)
         self.compare_softness_to_gt = bool(compare_softness_to_gt)
+        self.use_slip_penalty = bool(use_slip_penalty)
         self.pedestrian_heading_weight = float(pedestrian_heading_weight)
         self.pedestrian_heading_speed_threshold_mps = float(pedestrian_heading_speed_threshold_mps)
         self.eps = float(eps)
@@ -437,11 +440,14 @@ class DraftPhysicsRegularizer(nn.Module):
         beta_max = self._select_limit(self.limit_table.beta_max_rad, class_id, future_norm)
 
         beta = torch.atan2(vy_body.abs(), vx_body.abs() + self.eps)
-        slip_per_step = self._normalized_slip_square_penalty(
-            value=beta,
-            limit=beta_max,
-            enabled=beta_max > 0.0,
-        )
+        if self.use_slip_penalty:
+            slip_per_step = self._normalized_slip_square_penalty(
+                value=beta,
+                limit=beta_max,
+                enabled=beta_max > 0.0,
+            )
+        else:
+            slip_per_step = beta.new_zeros(beta.shape)
         hard_per_step = (
             self._phi(speed.abs() / v_max - 1.0)
             + self._phi(accel.abs() / a_max - 1.0)

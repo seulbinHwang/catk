@@ -1309,7 +1309,7 @@ bash scripts/finetune_a100x4_no_draft_bs_sweep.sh
 
 ### 5.8.2 Feasible DRaFT slip-angle penalty
 
-이 변경은 DRaFT fine-tuning의 물리 feasibility 항에 vehicle / bicycle 전용 slip-angle penalty를 추가합니다. 목적은 도로 정합성, 주변 agent 상호작용, RMM metric 직접 최적화가 아니라, heading 방향과 실제 이동 방향이 크게 어긋나는 비물리적인 옆방향 미끄러짐을 줄이는 것입니다.
+이 옵션은 DRaFT fine-tuning의 물리 feasibility 항에 vehicle / bicycle 전용 slip-angle penalty를 추가합니다. 목적은 도로 정합성, 주변 agent 상호작용, RMM metric 직접 최적화가 아니라, heading 방향과 실제 이동 방향이 크게 어긋나는 비물리적인 옆방향 미끄러짐을 줄이는 것입니다. 기본값은 `model.model_config.draft.physics.use_slip_penalty=false` 이므로 slip penalty는 계산/반영되지 않습니다.
 
 각 0.1초 구간에서 현재 anchor 상태를 `(0, 0, 0)`으로 두고, 미래 위치 변화량을 직전 heading 기준 body 좌표계로 회전합니다.
 
@@ -1332,6 +1332,12 @@ bicycle beta_max = 0.70 rad
 slip_penalty = max(0, beta / beta_max - soft_limit_ratio)^2
 ```
 
+활성화 예시:
+
+```bash
+... model.model_config.draft.physics.use_slip_penalty=true
+```
+
 최종 vehicle / bicycle feasibility 손실에서는 slip penalty를 별도 loss component로 두지 않고 hard 항 내부에 포함합니다.
 
 ```text
@@ -1339,7 +1345,7 @@ hard = speed/accel/steer/steer_rate/lat_accel hard penalty + slip_penalty
 vehicle_or_bicycle_total = hard + soft_weight * soft_effective
 ```
 
-기존 sampling 설정, draft 전체 가중치, train batch size, learning rate는 바꾸지 않습니다. 학습 로그에서 slip penalty 자체는 `vehicle_hard` / `bicycle_hard`에 포함되고, 실제 slip 초과 각도는 `slip_beta_excess_deg`로 확인합니다.
+기존 sampling 설정, draft 전체 가중치, train batch size, learning rate는 바꾸지 않습니다. `use_slip_penalty=true`일 때 slip penalty 자체는 `vehicle_hard` / `bicycle_hard`에 포함되고, 실제 slip 초과 각도는 `slip_beta_excess_deg`로 확인합니다.
 
 ## 6. 평가와 추론
 

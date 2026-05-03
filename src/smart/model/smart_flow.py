@@ -167,6 +167,7 @@ class SMARTFlow(LightningModule):
                     )
                 ),
                 compare_softness_to_gt=bool(getattr(draft_physics, "compare_softness_to_gt", True)),
+                use_slip_penalty=bool(getattr(draft_physics, "use_slip_penalty", False)),
                 pedestrian_heading_weight=float(
                     getattr(draft_physics, "pedestrian_heading_weight", 0.05)
                 ),
