@@ -77,6 +77,28 @@ To reproduce our final results, you should follow the following steps
 3. Use [scripts/wosac_sub.sh](scripts/wosac_sub.sh) to pack the submission fille for `validate` or `test` split. Upload the `wosac_submission.tar.gz` file located in `logs` folder to the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) such that you can evaluate the model fine-tuned in step 2 on the WOSAC leaderboard.
 4. Alternatively, you can do local validation with [scripts/local_val.sh](scripts/local_val.sh).
 
+### WOSAC-CPD / WOSAC-CES distribution metrics
+
+Closed-loop validation and WOSAC submission export now also compute distribution metrics from the 10Hz rollouts that the model already generated. No extra rollout is created only for these metrics.
+
+- `val_closed/WOSAC-CPD/value`: conditional pairwise diversity among rollouts from the same scenario. Higher means the rollouts are more diverse.
+- `val_closed/WOSAC-CES/value`: conditional Energy Score-style distribution metric. It is computed only when validation GT future is available. Lower is better.
+- `test/WOSAC-CPD/value`: CPD measured during test submission export. Test split has no GT future, so CES is not reported.
+- `*/WOSAC-CPD/DPR`: diversity preservation ratio. It is logged only when `model.model_config.wosac_cpd_reference` is set to a positive pretrain CPD value.
+
+The two metrics use the same WOSAC joint rollout distance. Validation CPD/CES normalize each agent type by an automatically computed future-motion scale from validation GT. The scale is computed inside the metric and is not a user-chosen threshold.
+
+Example for reporting CAT-K fine-tuning diversity preservation:
+
+```bash
+python -m src.run \
+  experiment=clsft \
+  ckpt_path=/path/to/catk.ckpt \
+  model.model_config.wosac_cpd_reference=<SMART_PRETRAIN_CPD>
+```
+
+If `n_rollout_closed_val=32`, the metrics use those 32 rollouts. If it is changed to 16, the metrics use the already generated 16 rollouts.
+
 For Gaussian Mixture Model (GMM) based ego policy, the procedure is similar, just use the following configs
 - [BC pre-training config for GMM-based ego policy](configs/experiment/ego_gmm_pre_bc.yaml)
 - [CLSFT with CAT-K config for GMM-based ego policy](configs/experiment/ego_gmm_clsft.yaml)

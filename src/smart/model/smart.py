@@ -22,9 +22,12 @@ from torch.optim.lr_scheduler import LambdaLR
 from src.smart.metrics import (
     CrossEntropy,
     TokenCls,
+    WOSACDistributionMetrics,
     WOSACMetrics,
     WOSACSubmission,
+    log_and_reset_wosac_distribution_metric,
     minADE,
+    update_wosac_distribution_metric_from_model,
 )
 from src.smart.modules.smart_decoder import SMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
@@ -57,6 +60,15 @@ class SMART(LightningModule):
         self.TokenCls = TokenCls(max_guesses=5)
         self.wosac_metrics = WOSACMetrics("val_closed")
         self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
+        wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
+        self.wosac_distribution_metrics = WOSACDistributionMetrics(
+            "val_closed",
+            cpd_reference=wosac_cpd_reference,
+        )
+        self.test_wosac_distribution_metrics = WOSACDistributionMetrics(
+            "test",
+            cpd_reference=wosac_cpd_reference,
+        )
         self.training_loss = CrossEntropy(**model_config.training_loss)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
@@ -136,6 +148,14 @@ class SMART(LightningModule):
             pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
             pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
 
+            update_wosac_distribution_metric_from_model(
+                metric=self.wosac_distribution_metrics,
+                model=self,
+                data=data,
+                pred_traj=pred_traj,
+                include_gt=True,
+            )
+
             # ! WOSAC
             scenario_rollouts = None
             if self.wosac_submission.is_active:  # ! save WOSAC submission
@@ -202,9 +222,13 @@ class SMART(LightningModule):
 
     def on_validation_epoch_end(self):
         if self.val_closed_loop:
+            epoch_distribution_metrics = log_and_reset_wosac_distribution_metric(
+                self.wosac_distribution_metrics
+            )
             if not self.wosac_submission.is_active:
                 epoch_wosac_metrics = self.wosac_metrics.compute()
                 epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
+                epoch_wosac_metrics.update(epoch_distribution_metrics)
                 if self.global_rank == 0:
                     epoch_wosac_metrics["epoch"] = (
                         self.log_epoch if self.log_epoch >= 0 else self.current_epoch
@@ -216,6 +240,11 @@ class SMART(LightningModule):
 
             if self.global_rank == 0:
                 if self.wosac_submission.is_active:
+                    if epoch_distribution_metrics:
+                        epoch_distribution_metrics["epoch"] = (
+                            self.log_epoch if self.log_epoch >= 0 else self.current_epoch
+                        )
+                        self.logger.log_metrics(epoch_distribution_metrics)
                     self.wosac_submission.save_sub_file()
 
     def configure_optimizers(self):
@@ -260,6 +289,14 @@ class SMART(LightningModule):
         pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
         pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
 
+        update_wosac_distribution_metric_from_model(
+            metric=self.test_wosac_distribution_metrics,
+            model=self,
+            data=data,
+            pred_traj=pred_traj,
+            include_gt=False,
+        )
+
         # ! WOSAC submission save
         self.wosac_submission.update(
             scenario_id=data["scenario_id"],
@@ -280,5 +317,10 @@ class SMART(LightningModule):
         self.wosac_submission.reset()
 
     def on_test_epoch_end(self):
+        epoch_distribution_metrics = log_and_reset_wosac_distribution_metric(
+            self.test_wosac_distribution_metrics
+        )
         if self.global_rank == 0:
+            if epoch_distribution_metrics:
+                self.logger.log_metrics(epoch_distribution_metrics)
             self.wosac_submission.save_sub_file()
