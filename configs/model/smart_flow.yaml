@@ -7,6 +7,9 @@ model_config:
   weight_decay: 0.01
   lr_scheduler_unit: epoch
   n_rollout_closed_val: 8
+  # Optional: set to flow-pretrain CPD value to log DPR (CPD/CPD_ref).
+  # CPD/CES are always evaluated regardless of this value.
+  wosac_cpd_reference: null
   n_batch_sim_agents_metric: 10
   sim_agents_metric_workers: 3
   # "real": 공식 TF SimAgents RMM (subprocess, 정확), "hard": PyTorch hard RMM (인-프로세스, 빠름)

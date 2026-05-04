@@ -16,7 +16,15 @@ from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 import torch.nn.functional as F
 
-from src.smart.metrics import HardSimAgentsMetrics, SimAgentsMetrics, SimAgentsSubmission, minADE
+from src.smart.metrics import (
+    HardSimAgentsMetrics,
+    SimAgentsMetrics,
+    SimAgentsSubmission,
+    WOSACDistributionMetrics,
+    log_and_reset_wosac_distribution_metric,
+    minADE,
+    update_wosac_distribution_metric_from_model,
+)
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_2s,
@@ -181,6 +189,16 @@ class SMARTFlow(LightningModule):
                 max_workers=model_config.sim_agents_metric_workers,
             )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
+
+        wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
+        self.wosac_distribution_metrics = WOSACDistributionMetrics(
+            prefix="val_closed",
+            cpd_reference=wosac_cpd_reference,
+        )
+        self.test_wosac_distribution_metrics = WOSACDistributionMetrics(
+            prefix="test",
+            cpd_reference=wosac_cpd_reference,
+        )
 
         # OCSC: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
         _is_ocsc = self.finetune_config.enabled and self.finetune_config.mode == "ocsc_ft"
@@ -3641,6 +3659,11 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
             )
+            update_wosac_distribution_metric_from_model(
+                model=self,
+                data=data,
+                pred_traj=pred_traj,
+            )
 
             scenario_rollouts = None
             if self.sim_agents_submission.is_active:
@@ -3712,6 +3735,10 @@ class SMARTFlow(LightningModule):
                 )
 
     def on_validation_epoch_end(self):
+        log_and_reset_wosac_distribution_metric(
+            model=self,
+            metric=self.wosac_distribution_metrics,
+        )
         if self.val_open_loop:
             epoch_open_metrics = self._compute_and_reset_validation_metrics(
                 prefix="val_open",
@@ -3943,6 +3970,11 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
+        update_wosac_distribution_metric_from_model(
+            model=self,
+            data=data,
+            pred_traj=pred_traj,
+        )
 
         self.sim_agents_submission.update(
             scenario_id=data["scenario_id"],
@@ -3955,4 +3987,8 @@ class SMARTFlow(LightningModule):
         self.sim_agents_submission.aggregate_current_batch()
 
     def on_test_epoch_end(self):
+        log_and_reset_wosac_distribution_metric(
+            model=self,
+            metric=self.test_wosac_distribution_metrics,
+        )
         self.sim_agents_submission.save_sub_file()
