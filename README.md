@@ -87,6 +87,24 @@
 ... model.model_config.draft.physics.topk_violation_k=20
 ```
 
+### DRaFT Commit-Horizon Loss Weight
+
+- DRaFT fine-tuning은 2초 미래 20개 점을 생성하지만, closed-loop에서는 그중 앞 0.5초, 즉 5개 점만 실제 다음 상태로 commit합니다.
+- `model.model_config.draft.physics.commit_loss_weight` 는 이 앞 5개 점의 시점별 physics loss를 더 크게 보는 가중치입니다.
+- 나머지 15개 점의 weight는 항상 `1.0`이고, 전체 시간축 평균 weight가 `1.0`이 되도록 내부에서 정규화합니다.
+- 기본값은 `commit_loss_weight=3.0`입니다. 2초 전체 물리 일관성은 유지하면서 실제로 바로 실행되는 구간의 위반을 더 강하게 줄이는 설정입니다.
+- 이 설정은 commit 구간 길이, sampling step, sampling method, backprop_last_k, batch size, learning rate를 바꾸지 않습니다.
+
+예시:
+
+```bash
+# 기본값
+... model.model_config.draft.physics.commit_loss_weight=3.0
+
+# 앞 0.5초 commit 구간을 더 강하게 강조
+... model.model_config.draft.physics.commit_loss_weight=4.0
+```
+
 ### DRaFT Soft-Limit Ratio
 
 - DRaFT physics hard loss는 물리량을 한계값으로 나눈 뒤 `1.0`을 넘은 초과분에 벌점을 줍니다.
@@ -1211,6 +1229,7 @@ loss와 로그는 아래처럼 보면 됩니다.
 현재 inverse feasibility 기본 하이퍼파라미터는 아래와 같습니다.
 
 - 공통: `soft_weight=0.25`
+- commit 구간: `commit_loss_weight=3.0`
 - vehicle: `v_max=35.0`, `a_max=8.0`, `a_lat_max=4.2`, `wheelbase_scale=0.60`, `steer_max=0.55 rad`, `steer_rate_max=0.8 rad/s`
 - bicycle: `v_max=22.0`, `a_max=5.5`, `a_lat_max=4.4`, `wheelbase_scale=0.85`, `steer_max=0.90 rad`, `steer_rate_max=1.4 rad/s`
 - pedestrian: `v_max=5.0`, `a_max=4.7`, `heading_speed_threshold=0.5 m/s`, `heading_weight=0.05`

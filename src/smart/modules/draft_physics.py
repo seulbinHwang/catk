@@ -141,8 +141,13 @@ class DraftPhysicsRegularizer(nn.Module):
         use_slip_penalty: ``True`` 이면 차량/자전거 hard 항에 slip angle penalty를 포함합니다.
         pedestrian_heading_weight: 사람 heading 약한 정렬 항 가중치입니다.
         pedestrian_heading_speed_threshold_mps: 사람 heading 항을 켜는 최소 속도입니다.
+        commit_loss_weight: 실제 closed-loop에서 다음 step으로 commit되는 앞 5개 점의
+            시점별 DRaFT 손실 가중치입니다. 나머지 점은 1.0을 쓰며, 시간축 평균
+            weight가 1.0이 되도록 내부에서 정규화합니다.
         eps: 수치 안정용 작은 값입니다.
     """
+
+    _COMMIT_LOSS_STEPS = 5
 
     def __init__(
         self,
@@ -170,9 +175,12 @@ class DraftPhysicsRegularizer(nn.Module):
         use_slip_penalty: bool = False,
         pedestrian_heading_weight: float = 0.05,
         pedestrian_heading_speed_threshold_mps: float = 0.5,
+        commit_loss_weight: float = 3.0,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
+        if float(commit_loss_weight) < 1.0:
+            raise ValueError("commit_loss_weight must be >= 1.0.")
         self.dt = float(dt)
         self.pos_scale_m = float(pos_scale_m)
         self.speed_floor_mps = float(speed_floor_mps)
@@ -209,6 +217,7 @@ class DraftPhysicsRegularizer(nn.Module):
         self.use_slip_penalty = bool(use_slip_penalty)
         self.pedestrian_heading_weight = float(pedestrian_heading_weight)
         self.pedestrian_heading_speed_threshold_mps = float(pedestrian_heading_speed_threshold_mps)
+        self.commit_loss_weight = float(commit_loss_weight)
         self.eps = float(eps)
 
     def forward(
@@ -508,7 +517,10 @@ class DraftPhysicsRegularizer(nn.Module):
             agent_length=agent_length,
             class_id=class_id,
         )
-        return {key: self._mean_over_time(value) for key, value in per_step.items()}
+        stats = {key: self._mean_over_time(value) for key, value in per_step.items()}
+        stats["hard"] = self._loss_mean_over_time(per_step["hard"])
+        stats["soft"] = self._loss_mean_over_time(per_step["soft"])
+        return stats
 
     def _compute_pedestrian_per_step_penalties(
         self,
@@ -600,9 +612,9 @@ class DraftPhysicsRegularizer(nn.Module):
             prev_control_valid=prev_control_valid,
         )
         return {
-            "hard": self._mean_over_time(per_step["hard"]),
-            "soft": self._mean_over_time(per_step["soft"]),
-            "head": self._mean_over_time(per_step["head"]),
+            "hard": self._loss_mean_over_time(per_step["hard"]),
+            "soft": self._loss_mean_over_time(per_step["soft"]),
+            "head": self._loss_mean_over_time(per_step["head"]),
             "speed_excess_mps": self._mean_over_time(per_step["speed_excess_mps"]),
             "accel_excess_mps2": self._mean_over_time(per_step["accel_excess_mps2"]),
             "heading_error_deg": self._masked_mean_over_time(
@@ -759,6 +771,13 @@ class DraftPhysicsRegularizer(nn.Module):
             return value
         return value.mean(dim=-1)
 
+    def _loss_mean_over_time(self, value: Tensor) -> Tensor:
+        """commit 구간 우선순위를 반영해 학습용 시간축 평균을 계산합니다."""
+        if value.dim() == 1:
+            return value
+        weights = self._commit_temporal_weights(value)
+        return (value * weights).mean(dim=-1)
+
     def _masked_mean_over_time(self, value: Tensor, mask: Tensor) -> Tensor:
         """시간축에서 유효한 위치만 평균합니다.
 
@@ -775,6 +794,15 @@ class DraftPhysicsRegularizer(nn.Module):
         mask_f = mask.to(dtype=value.dtype)
         denom = mask_f.sum(dim=-1).clamp_min(1.0)
         return (value * mask_f).sum(dim=-1) / denom
+
+    def _commit_temporal_weights(self, value: Tensor) -> Tensor:
+        """앞 0.5초 commit 구간을 강조하는 정규화된 시간축 weight를 만듭니다."""
+        T = int(value.shape[-1])
+        weights = value.new_ones((T,))
+        weights[: min(self._COMMIT_LOSS_STEPS, T)] = self.commit_loss_weight
+        weights = weights / weights.mean().clamp_min(self.eps)
+        view_shape = (1,) * (value.dim() - 1) + (T,)
+        return weights.view(view_shape)
 
     def _mean_list_or_zero(self, values: List[Tensor], reference: Tensor) -> Tensor:
         """스칼라 목록의 평균을 계산하고, 비어 있으면 0을 돌려줍니다.

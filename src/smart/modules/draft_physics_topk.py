@@ -60,8 +60,14 @@ class TopKDraftPhysicsRegularizer(DraftPhysicsRegularizer):
             return value.new_zeros((value.shape[0],))
         topk = min(self.topk_violation_k, int(value.shape[-1]))
         if topk >= int(value.shape[-1]):
-            return self._mean_over_time(value)
-        return value.topk(topk, dim=-1, largest=True, sorted=False).values.mean(dim=-1)
+            return self._loss_mean_over_time(value)
+        weights = self._commit_temporal_weights(value).expand_as(value)
+        topk_idx = (value * weights).topk(topk, dim=-1, largest=True, sorted=False).indices
+        topk_value = value.gather(dim=-1, index=topk_idx)
+        topk_weight = weights.gather(dim=-1, index=topk_idx)
+        return (topk_value * topk_weight).sum(dim=-1) / topk_weight.sum(dim=-1).clamp_min(
+            self.eps
+        )
 
     def _aggregate_class_per_step(
         self,
@@ -83,7 +89,7 @@ class TopKDraftPhysicsRegularizer(DraftPhysicsRegularizer):
         Returns:
             Dict[str, Tensor]: 집계된 스칼라 사전입니다 (각 값 shape은 ``[n_agent]``).
         """
-        agg = self._topk_mean_over_time if topk else self._mean_over_time
+        agg = self._topk_mean_over_time if topk else self._loss_mean_over_time
         if class_id == PEDESTRIAN_TYPE:
             return {
                 "hard": agg(per_step["hard"]),
