@@ -969,10 +969,10 @@ scripts/launch_self_forced_v100x4x4_static_pods.py
 
 - 핵심 실험 조건: `unfrozen_range=except_map_encoder`, `estimator_warmup_epochs=1`
 - precision: V100은 bf16을 지원하지 않으므로 `trainer.precision=16-mixed`
-- per-GPU train batch: `8`
-- global train batch: `8 x 16 = 128`, H100x4 preset의 `28 x 4 = 112`와 비슷한 update scale
+- per-GPU train batch: `6`
+- global train batch: `6 x 16 = 96`
 - validation batch: `4`, 그래서 한 validation batch의 scene 수가 `4 x 16 = 64`로 H100x4의 `16 x 4 = 64`와 같습니다.
-- OOM이 나면 launcher가 `8 -> 6 -> 4 -> 2` 순서로 per-GPU batch를 낮추고, 최신 `epoch_last.ckpt`로 `action=fit` 재개합니다.
+- OOM이 나면 launcher가 `6 -> 4 -> 2` 순서로 per-GPU batch를 낮추고, 최신 `epoch_last.ckpt`로 `action=fit` 재개합니다.
 
 pretrained checkpoint는 기본적으로 아래 W&B artifact에서 받습니다.
 
@@ -1000,7 +1000,7 @@ python scripts/launch_self_forced_v100x4x4_static_pods.py \
   --limit-train-batches 20 \
   --limit-val-batches 0 \
   --max-epochs 1 \
-  --task-name flow_self_forced_v100x4x4_unfrozen_except_map_encoder_estimator_warmup_1_bs8_smoke
+  --task-name flow_self_forced_v100x4x4_unfrozen_except_map_encoder_estimator_warmup_1_bs6_smoke
 ```
 
 attach:
