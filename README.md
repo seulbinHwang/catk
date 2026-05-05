@@ -973,6 +973,7 @@ scripts/launch_self_forced_v100x4x4_static_pods.py
 - global train batch: `6 x 16 = 96`
 - validation batch: `4`, 그래서 한 validation batch의 scene 수가 `4 x 16 = 64`로 H100x4의 `16 x 4 = 64`와 같습니다.
 - OOM이 나면 launcher가 `6 -> 4 -> 2` 순서로 per-GPU batch를 낮추고, 최신 `epoch_last.ckpt`로 `action=fit` 재개합니다.
+- OOM retry 동기화는 rank0 pod의 `RETRY_SYNC_PORT` HTTP status server로 모읍니다. 각 pod의 `/mnt/nuplan/.../retry_state` 가 pod-local이어도 모든 pod가 같은 attempt 결과를 보고 함께 다음 batch size로 내려갑니다.
 
 pretrained checkpoint는 기본적으로 아래 W&B artifact에서 받습니다.
 
@@ -1093,6 +1094,7 @@ scripts/launch_self_forced_v100x3x5_static_pods.py
 - validation batch: `4`, 그래서 한 validation batch의 scene 수가 `4 x 15 = 60`으로 H100x4의 `16 x 4 = 64`와 가깝습니다.
 - scorer scene 수: `300`, world size 15와 val batch 4에서 official scorer 5 batch가 됩니다.
 - OOM이 나면 launcher가 `6 -> 4 -> 2` 순서로 per-GPU batch를 낮추고, 최신 `epoch_last.ckpt`로 `action=fit` 재개합니다.
+- OOM retry 동기화는 rank0 pod의 `RETRY_SYNC_PORT` HTTP status server로 모읍니다. 각 pod의 `/mnt/nuplan/.../retry_state` 가 pod-local이어도 모든 pod가 같은 attempt 결과를 보고 함께 다음 batch size로 내려갑니다.
 
 pretrained checkpoint는 기본적으로 아래 W&B artifact에서 받습니다.
 

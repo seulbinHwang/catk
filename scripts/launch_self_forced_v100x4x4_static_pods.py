@@ -75,6 +75,8 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
         export_line("NODE_RANK", rank),
         export_line("MASTER_ADDR", master_addr),
         export_line("MASTER_PORT", args.master_port),
+        export_line("RETRY_SYNC_HOST", master_addr),
+        export_line("RETRY_SYNC_PORT", args.retry_sync_port),
         export_line("INITIAL_BS", args.initial_bs),
         export_line("OOM_STEP", args.oom_step),
         export_line("MIN_BS", args.min_bs),
@@ -143,6 +145,175 @@ echo "[self-forced-v100x4x4] attach survives after exit; press Ctrl-b d to detac
 echo
 
 OOM_REGEX='OutOfMemoryError|CUDA out of memory|c10::OutOfMemoryError|torch\\.OutOfMemoryError|CUDA_ERROR_OUT_OF_MEMORY'
+RETRY_SYNC_PID=""
+
+start_retry_sync_server() {{
+  if (( NODE_RANK != 0 )); then
+    return 0
+  fi
+
+  python - <<'PY' &
+import http.server
+import os
+import pathlib
+import re
+import urllib.parse
+
+root = pathlib.Path(os.environ["RETRY_STATE_DIR"])
+root.mkdir(parents=True, exist_ok=True)
+port = int(os.environ["RETRY_SYNC_PORT"])
+name_re = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def read_statuses(attempt):
+    files = sorted(root.glob(attempt + ".*.status"))
+    status_values = []
+    oom_values = []
+    for path in files:
+        data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        values = dict(line.split("=", 1) for line in data if "=" in line)
+        status_values.append(values.get("status", "1"))
+        oom_values.append(values.get("oom", "0"))
+    failure = any(value != "0" for value in status_values)
+    oom = any(value == "1" for value in oom_values)
+    return len(files), failure, oom
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def send_text(self, code, text):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.strip("/")
+        if path == "health":
+            self.send_text(200, "ok\\n")
+            return
+        parts = path.split("/", 1)
+        if len(parts) != 2 or parts[0] not in ("count", "aggregate"):
+            self.send_text(404, "not found\\n")
+            return
+        attempt = parts[1]
+        if not name_re.match(attempt):
+            self.send_text(400, "bad attempt\\n")
+            return
+        count, failure, oom = read_statuses(attempt)
+        if parts[0] == "count":
+            self.send_text(200, str(count) + "\\n")
+        else:
+            self.send_text(
+                200,
+                "count=" + str(count) + "\\n"
+                + "failure=" + ("1" if failure else "0") + "\\n"
+                + "oom=" + ("1" if oom else "0") + "\\n",
+            )
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/status":
+            self.send_text(404, "not found\\n")
+            return
+        query = urllib.parse.parse_qs(parsed.query)
+        attempt = query.get("attempt", [""])[0]
+        host = query.get("host", [""])[0]
+        if not name_re.match(attempt) or not name_re.match(host):
+            self.send_text(400, "bad name\\n")
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        target = root / (attempt + "." + host + ".status")
+        tmp = root / (target.name + ".tmp." + str(os.getpid()))
+        tmp.write_text(body, encoding="utf-8")
+        tmp.replace(target)
+        self.send_text(200, "ok\\n")
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+Server(("", port), Handler).serve_forever()
+PY
+  RETRY_SYNC_PID=$!
+  echo "$RETRY_SYNC_PID" > "$RETRY_STATE_DIR/sync_server.pid"
+  echo "[self-forced-v100x4x4] retry sync server started on $MASTER_ADDR:$RETRY_SYNC_PORT pid=$RETRY_SYNC_PID"
+}}
+
+stop_retry_sync_server() {{
+  if [[ -n "$RETRY_SYNC_PID" ]]; then
+    kill "$RETRY_SYNC_PID" 2>/dev/null || true
+  fi
+}}
+
+retry_sync_get() {{
+  local endpoint="$1"
+  python - "$endpoint" <<'PY'
+import os
+import sys
+import urllib.request
+
+endpoint = sys.argv[1].lstrip("/")
+url = "http://" + os.environ["RETRY_SYNC_HOST"] + ":" + os.environ["RETRY_SYNC_PORT"] + "/" + endpoint
+with urllib.request.urlopen(url, timeout=5) as response:
+    sys.stdout.write(response.read().decode("utf-8"))
+PY
+}}
+
+wait_for_retry_sync_server() {{
+  local waited=0
+  local timeout_sec="${{RETRY_SYNC_START_TIMEOUT_SEC:-120}}"
+  while true; do
+    if retry_sync_get "health" >/dev/null 2>&1; then
+      return 0
+    fi
+    if (( waited >= timeout_sec )); then
+      echo "[self-forced-v100x4x4] retry sync server did not become ready at $RETRY_SYNC_HOST:$RETRY_SYNC_PORT" >&2
+      return 1
+    fi
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
+}}
+
+post_attempt_status() {{
+  local attempt_name="$1"
+  local status_file="$2"
+  local try
+  for try in $(seq 1 12); do
+    if python - "$attempt_name" "$status_file" <<'PY'
+import os
+import socket
+import sys
+import urllib.parse
+import urllib.request
+
+attempt = sys.argv[1]
+status_file = sys.argv[2]
+host = socket.gethostname()
+query = urllib.parse.urlencode((("attempt", attempt), ("host", host)))
+url = "http://" + os.environ["RETRY_SYNC_HOST"] + ":" + os.environ["RETRY_SYNC_PORT"] + "/status?" + query
+with open(status_file, "rb") as handle:
+    body = handle.read()
+request = urllib.request.Request(url, data=body, method="POST")
+with urllib.request.urlopen(request, timeout=10) as response:
+    response.read()
+PY
+    then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "[self-forced-v100x4x4] failed to post retry status for $attempt_name after retries" >&2
+  return 1
+}}
 
 ensure_pretrain_checkpoint() {{
   if [[ -f "$PRETRAIN_CKPT" ]]; then
@@ -238,6 +409,7 @@ write_attempt_status() {{
     echo "time=$(date '+%F %T')"
   }} > "$tmp_file"
   mv "$tmp_file" "$status_file"
+  post_attempt_status "$attempt_tag" "$status_file"
 }}
 
 wait_for_attempt_statuses() {{
@@ -245,7 +417,8 @@ wait_for_attempt_statuses() {{
   local timeout_sec="${{RETRY_BARRIER_TIMEOUT_SEC:-1200}}"
   local count=0
   while true; do
-    count="$(find "$RETRY_STATE_DIR" -maxdepth 1 -type f -name "$attempt_tag.*.status" | wc -l | tr -d ' ')"
+    count="$(retry_sync_get "count/$attempt_tag" 2>/dev/null | tr -d '[:space:]')"
+    count="${{count:-0}}"
     if (( count >= NNODES )); then
       return 0
     fi
@@ -259,27 +432,16 @@ wait_for_attempt_statuses() {{
 }}
 
 global_attempt_has_oom() {{
-  local status_path
-  for status_path in "$RETRY_STATE_DIR"/$attempt_tag.*.status; do
-    if grep -q '^oom=1$' "$status_path" 2>/dev/null; then
-      return 0
-    fi
-  done
-  grep -Eq "$OOM_REGEX" "$RUN_ROOT"/*."$attempt_tag".log 2>/dev/null
+  retry_sync_get "aggregate/$attempt_tag" 2>/dev/null | grep -q '^oom=1$'
 }}
 
 global_attempt_has_failure() {{
-  local status_path
-  local status_value
-  for status_path in "$RETRY_STATE_DIR"/$attempt_tag.*.status; do
-    status_value="$(awk -F= '$1 == "status" {{print $2; exit}}' "$status_path" 2>/dev/null)"
-    if [[ "$status_value" != "0" ]]; then
-      return 0
-    fi
-  done
-  return 1
+  retry_sync_get "aggregate/$attempt_tag" 2>/dev/null | grep -q '^failure=1$'
 }}
 
+start_retry_sync_server
+trap stop_retry_sync_server EXIT
+wait_for_retry_sync_server || exit 1
 ensure_pretrain_checkpoint || exit $?
 
 bs="$INITIAL_BS"
@@ -542,6 +704,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--master-addr", default="")
     parser.add_argument("--master-port", default="29543")
+    parser.add_argument(
+        "--retry-sync-port",
+        default="29544",
+        help="Rank-0 pod HTTP port used to collect retry status from all pods.",
+    )
     parser.add_argument("--nproc-per-node", type=int, default=4)
     parser.add_argument("--initial-bs", type=int, default=6)
     parser.add_argument("--oom-step", type=int, default=2)
@@ -596,6 +763,7 @@ def main() -> None:
 
     master_addr = args.master_addr or pod_ip(args.namespace, args.pods[0])
     print(f"[launcher] master pod: {args.pods[0]} ({master_addr}:{args.master_port})")
+    print(f"[launcher] retry sync: {master_addr}:{args.retry_sync_port}")
     print(f"[launcher] task_name: {args.task_name}")
     print(f"[launcher] session:   {args.session}")
     print(f"[launcher] bs fallback: {args.initial_bs}->{args.min_bs} step {args.oom_step}")
