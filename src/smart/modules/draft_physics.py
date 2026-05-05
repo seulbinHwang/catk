@@ -30,6 +30,8 @@ class DynamicLimitTable:
             LQR commit bridge 의 곡률 크기 clip 에 쓰입니다.
         omega_max_abs_radps: 절대 회전속도 제한입니다. shape은 ``[3]`` 입니다.
             LQR commit bridge 의 속도-기반 곡률 clip 에 쓰입니다.
+        beta_max_rad: heading 방향과 실제 이동 방향 사이의 허용 slip angle 입니다.
+            사람에는 쓰지 않으므로 0이어도 됩니다.
     """
 
     v_max_mps: Tuple[float, float, float]
@@ -38,6 +40,7 @@ class DynamicLimitTable:
     alpha_max_radps2: Tuple[float, float, float] = (1.75, 14.0, 6.0)
     r_min_m: Tuple[float, float, float] = (4.50, 1.0e-5, 0.5)
     omega_max_abs_radps: Tuple[float, float, float] = (0.9, 3.3, 2.0)
+    beta_max_rad: Tuple[float, float, float] = (0.27, 0.0, 0.70)
 
 
 DEFAULT_LIMITS = DynamicLimitTable(
@@ -47,6 +50,7 @@ DEFAULT_LIMITS = DynamicLimitTable(
     alpha_max_radps2=(1.75, 14.0, 6.0),
     r_min_m=(4.50, 1.0e-5, 0.5),
     omega_max_abs_radps=(0.9, 3.3, 2.0),
+    beta_max_rad=(0.27, 0.0, 0.70),
 )
 
 
@@ -69,6 +73,7 @@ DRAFT_PHYSICS_ACTUAL_UNIT_KEYS = (
     "steer_excess_deg",
     "steer_rate_excess_degps",
     "lat_accel_excess_mps2",
+    "slip_beta_excess_deg",
     "heading_error_deg",
 )
 
@@ -101,7 +106,7 @@ def _build_zero_output(reference: Tensor) -> Dict[str, Tensor]:
 class DraftPhysicsRegularizer(nn.Module):
     """inverse feasibility 기반 DRaFT penalty를 계산합니다.
 
-    이 모듈은 20개 미래 점을 다시 속도, 가속도, 조향각 같은 값으로 바꾼 뒤,
+    이 모듈은 유효한 미래 점을 다시 속도, 가속도, 조향각 같은 값으로 바꾼 뒤,
     각 에이전트 종류가 실제로 낼 수 있는 범위를 벗어나는지 계산합니다.
 
     차량과 자전거는 자전거 모델에 맞춘 역추론 값을 쓰고,
@@ -129,6 +134,10 @@ class DraftPhysicsRegularizer(nn.Module):
         soft_weight: 모든 class에 공통으로 쓰는 roughness 항 가중치입니다.
         compare_softness_to_gt: ``True`` 이면 soft roughness를 GT보다 더 큰 만큼만
             반영하고, ``False`` 이면 prediction roughness 자체를 그대로 반영합니다.
+        use_slip_penalty: 차량/자전거의 heading 방향과 실제 이동 방향 차이를 hard 항에 넣을지 정합니다.
+        commit_loss_weight: closed-loop에서 실제 commit되는 앞 5개 미래 점의 상대 가중치입니다.
+        soft_limit_ratio: 1보다 작으면 hard limit에 닿기 전부터 penalty를 시작합니다.
+        topk_violation_k: 시간 평균 loss에 섞을 agent별 큰 위반 시점 개수입니다.
         pedestrian_heading_weight: 사람 heading 약한 정렬 항 가중치입니다.
         pedestrian_heading_speed_threshold_mps: 사람 heading 항을 켜는 최소 속도입니다.
         eps: 수치 안정용 작은 값입니다.
@@ -153,8 +162,14 @@ class DraftPhysicsRegularizer(nn.Module):
         bicycle_steer_max_rad: float = 1.00,
         vehicle_steer_rate_max_radps: float = 0.8,
         bicycle_steer_rate_max_radps: float = 1.5,
+        vehicle_beta_max_rad: float = DEFAULT_LIMITS.beta_max_rad[VEHICLE_TYPE],
+        bicycle_beta_max_rad: float = DEFAULT_LIMITS.beta_max_rad[BICYCLE_TYPE],
         soft_weight: float = 0.25,
         compare_softness_to_gt: bool = True,
+        use_slip_penalty: bool = False,
+        commit_loss_weight: float = 1.0,
+        soft_limit_ratio: float = 1.0,
+        topk_violation_k: int = 1_000_000,
         pedestrian_heading_weight: float = 0.05,
         pedestrian_heading_speed_threshold_mps: float = 0.5,
         eps: float = 1e-6,
@@ -179,6 +194,11 @@ class DraftPhysicsRegularizer(nn.Module):
                 0.0,
                 float(bicycle_lat_accel_max_mps2),
             ),
+            beta_max_rad=(
+                float(vehicle_beta_max_rad),
+                0.0,
+                float(bicycle_beta_max_rad),
+            ),
         )
         self.vehicle_wheelbase_scale = float(vehicle_wheelbase_scale)
         self.bicycle_wheelbase_scale = float(bicycle_wheelbase_scale)
@@ -188,6 +208,16 @@ class DraftPhysicsRegularizer(nn.Module):
         self.bicycle_steer_rate_max_radps = float(bicycle_steer_rate_max_radps)
         self.soft_weight = float(soft_weight)
         self.compare_softness_to_gt = bool(compare_softness_to_gt)
+        self.use_slip_penalty = bool(use_slip_penalty)
+        self.commit_loss_weight = float(commit_loss_weight)
+        self.soft_limit_ratio = float(soft_limit_ratio)
+        self.topk_violation_k = int(topk_violation_k)
+        if self.commit_loss_weight < 1.0:
+            raise ValueError(f"commit_loss_weight must be >= 1.0, got {self.commit_loss_weight}.")
+        if not 0.0 < self.soft_limit_ratio <= 1.0:
+            raise ValueError(f"soft_limit_ratio must be in (0, 1], got {self.soft_limit_ratio}.")
+        if self.topk_violation_k < 1:
+            raise ValueError(f"topk_violation_k must be >= 1, got {self.topk_violation_k}.")
         self.pedestrian_heading_weight = float(pedestrian_heading_weight)
         self.pedestrian_heading_speed_threshold_mps = float(pedestrian_heading_speed_threshold_mps)
         self.eps = float(eps)
@@ -339,6 +369,8 @@ class DraftPhysicsRegularizer(nn.Module):
                 gt_actual_buckets["steer_rate_excess_degps"].append(gt_stats["steer_rate_excess_degps"].mean())
                 pred_actual_buckets["lat_accel_excess_mps2"].append(pred_stats["lat_accel_excess_mps2"].mean())
                 gt_actual_buckets["lat_accel_excess_mps2"].append(gt_stats["lat_accel_excess_mps2"].mean())
+                pred_actual_buckets["slip_beta_excess_deg"].append(pred_stats["slip_beta_excess_deg"].mean())
+                gt_actual_buckets["slip_beta_excess_deg"].append(gt_stats["slip_beta_excess_deg"].mean())
 
             pred_class_losses.append(effective_total.mean())
             raw_pred_class_losses.append(raw_total.mean())
@@ -421,20 +453,28 @@ class DraftPhysicsRegularizer(nn.Module):
         a_max = self._select_limit(self.limit_table.a_max_mps2, class_id, future_norm)
         a_lat_max = self._select_limit(self.limit_table.a_lat_max_mps2, class_id, future_norm)
 
-        hard = self._mean_over_time(
+        lateral_dir = torch.stack([-heading_prev.sin(), heading_prev.cos()], dim=-1)
+        lateral_speed = (delta_pos * lateral_dir).sum(dim=-1) / self.dt
+        beta = torch.atan2(lateral_speed.abs(), speed.abs() + self.eps)
+        beta_max = self._select_limit(self.limit_table.beta_max_rad, class_id, future_norm)
+        slip_penalty = self._phi(beta.abs() / beta_max - 1.0)
+
+        hard_step = (
             self._phi(speed.abs() / v_max - 1.0)
             + self._phi(accel.abs() / a_max - 1.0)
             + self._phi(steer.abs() / steer_max_rad - 1.0)
             + self._phi(steer_rate.abs() / steer_rate_max_radps - 1.0)
-            + self._phi(lat_accel / a_lat_max - 1.0),
-            valid_mask=future_valid_mask,
+            + self._phi(lat_accel / a_lat_max - 1.0)
         )
+        if self.use_slip_penalty:
+            hard_step = hard_step + slip_penalty
+        hard = self._aggregate_loss_over_time(hard_step, valid_mask=future_valid_mask)
 
         if accel.shape[1] > 1:
             accel_delta = accel[:, 1:] - accel[:, :-1]
             steer_rate_delta = steer_rate[:, 1:] - steer_rate[:, :-1]
-            soft_mask = future_valid_mask[:, 1:] if future_valid_mask is not None else None
-            soft = self._mean_over_time(
+            soft_mask = self._transition_valid_mask(future_valid_mask)
+            soft = self._aggregate_loss_over_time(
                 (accel_delta / a_max).square()
                 + (steer_rate_delta / steer_rate_max_radps).square(),
                 valid_mask=soft_mask,
@@ -456,6 +496,10 @@ class DraftPhysicsRegularizer(nn.Module):
                 valid_mask=future_valid_mask,
             ),
             "lat_accel_excess_mps2": self._mean_over_time(torch.relu(lat_accel - a_lat_max), valid_mask=future_valid_mask),
+            "slip_beta_excess_deg": self._mean_over_time(
+                torch.rad2deg(torch.relu(beta.abs() - beta_max)),
+                valid_mask=future_valid_mask,
+            ),
         }
 
     def _compute_pedestrian_stats(
@@ -494,7 +538,7 @@ class DraftPhysicsRegularizer(nn.Module):
 
         v_max = self._select_limit(self.limit_table.v_max_mps, PEDESTRIAN_TYPE, future_norm)
         a_max = self._select_limit(self.limit_table.a_max_mps2, PEDESTRIAN_TYPE, future_norm)
-        hard = self._mean_over_time(
+        hard = self._aggregate_loss_over_time(
             self._phi(speed / v_max - 1.0)
             + self._phi(accel / a_max - 1.0),
             valid_mask=future_valid_mask,
@@ -503,15 +547,15 @@ class DraftPhysicsRegularizer(nn.Module):
         if accel_vec.shape[1] > 1:
             accel_delta = accel_vec[:, 1:] - accel_vec[:, :-1]
             accel_delta_norm = torch.linalg.norm(accel_delta, dim=-1)
-            soft_mask = future_valid_mask[:, 1:] if future_valid_mask is not None else None
-            soft = self._mean_over_time((accel_delta_norm / a_max).square(), valid_mask=soft_mask)
+            soft_mask = self._transition_valid_mask(future_valid_mask)
+            soft = self._aggregate_loss_over_time((accel_delta_norm / a_max).square(), valid_mask=soft_mask)
         else:
             soft = hard.new_zeros(hard.shape)
 
         vel_angle = self._safe_angle_from_xy(vel_vec)
         heading_gap = self._wrap_angle(heading_local - vel_angle)
         heading_mask = speed > self.pedestrian_heading_speed_threshold_mps
-        head = self._mean_over_time(
+        head = self._aggregate_loss_over_time(
             torch.where(heading_mask, heading_gap.square(), torch.zeros_like(heading_gap)),
             valid_mask=future_valid_mask,
         )
@@ -631,7 +675,7 @@ class DraftPhysicsRegularizer(nn.Module):
         Returns:
             Tensor: 같은 shape의 penalty입니다.
         """
-        return torch.relu(value).square()
+        return torch.relu(value + (1.0 - self.soft_limit_ratio)).square()
 
     def _mean_list_or_zero(
         self,
@@ -702,6 +746,78 @@ class DraftPhysicsRegularizer(nn.Module):
         masked_value = torch.where(valid_mask, value, torch.zeros_like(value))
         valid_count = valid_mask.to(dtype=value.dtype).sum(dim=-1)
         return masked_value.sum(dim=-1) / valid_count.clamp_min(1.0)
+
+    def _aggregate_loss_over_time(self, value: Tensor, valid_mask: Tensor | None = None) -> Tensor:
+        """평균 위반과 큰 순간 위반을 함께 보도록 시간축 loss를 집계합니다."""
+        mean_loss = self._loss_mean_over_time(value, valid_mask=valid_mask)
+        if value.shape[-1] == 0 or self.topk_violation_k >= value.shape[-1]:
+            return mean_loss
+        topk_loss = self._topk_loss_mean_over_time(value, valid_mask=valid_mask)
+        return 0.5 * (mean_loss + topk_loss)
+
+    def _loss_mean_over_time(self, value: Tensor, valid_mask: Tensor | None = None) -> Tensor:
+        """commit 구간 가중치와 유효 mask를 반영한 시간축 평균 loss입니다."""
+        if value.shape[-1] == 0:
+            return value.new_zeros(value.shape[:-1])
+        weights = self._commit_temporal_weights(value)
+        if valid_mask is None:
+            numerator = (value * weights).sum(dim=-1)
+            denominator = weights.sum(dim=-1)
+            return numerator / denominator.clamp_min(self.eps)
+
+        if tuple(valid_mask.shape) != tuple(value.shape):
+            raise ValueError(
+                "valid_mask shape must match value shape: "
+                f"expected={tuple(value.shape)}, actual={tuple(valid_mask.shape)}."
+            )
+        valid = valid_mask.to(device=value.device, dtype=value.dtype)
+        weighted_valid = weights * valid
+        numerator = (value * weighted_valid).sum(dim=-1)
+        denominator = weighted_valid.sum(dim=-1)
+        return numerator / denominator.clamp_min(self.eps)
+
+    def _topk_loss_mean_over_time(self, value: Tensor, valid_mask: Tensor | None = None) -> Tensor:
+        """agent별로 큰 위반 시점 K개를 골라 평균합니다."""
+        if value.shape[-1] == 0:
+            return value.new_zeros(value.shape[:-1])
+        k = min(self.topk_violation_k, value.shape[-1])
+        weights = self._commit_temporal_weights(value)
+        score = value * weights
+
+        if valid_mask is None:
+            topk_index = score.topk(k, dim=-1).indices
+            topk_value = torch.gather(value, dim=-1, index=topk_index)
+            topk_weight = torch.gather(weights, dim=-1, index=topk_index)
+            return (topk_value * topk_weight).sum(dim=-1) / topk_weight.sum(dim=-1).clamp_min(self.eps)
+
+        if tuple(valid_mask.shape) != tuple(value.shape):
+            raise ValueError(
+                "valid_mask shape must match value shape: "
+                f"expected={tuple(value.shape)}, actual={tuple(valid_mask.shape)}."
+            )
+        valid = valid_mask.to(device=value.device, dtype=torch.bool)
+        masked_score = torch.where(valid, score, torch.full_like(score, -torch.finfo(score.dtype).max))
+        topk_index = masked_score.topk(k, dim=-1).indices
+        topk_value = torch.gather(value, dim=-1, index=topk_index)
+        topk_weight = torch.gather(weights, dim=-1, index=topk_index)
+        topk_valid = torch.gather(valid.to(dtype=value.dtype), dim=-1, index=topk_index)
+        weighted_valid = topk_weight * topk_valid
+        return (topk_value * weighted_valid).sum(dim=-1) / weighted_valid.sum(dim=-1).clamp_min(self.eps)
+
+    def _commit_temporal_weights(self, value: Tensor) -> Tensor:
+        """앞 0.5초 commit 구간을 더 크게 보되 전체 loss scale은 평균 분모로 보존합니다."""
+        weights = torch.ones_like(value)
+        if self.commit_loss_weight > 1.0 and value.shape[-1] > 0:
+            weights[..., : min(5, value.shape[-1])] = self.commit_loss_weight
+        return weights
+
+    def _transition_valid_mask(self, valid_mask: Tensor | None) -> Tensor | None:
+        """두 인접 미래 step이 모두 유효한 transition만 roughness loss에 포함합니다."""
+        if valid_mask is None:
+            return None
+        if valid_mask.shape[-1] <= 1:
+            return valid_mask[..., :0]
+        return valid_mask[..., 1:] & valid_mask[..., :-1]
 
     def _masked_mean_over_time(self, value: Tensor, enabled: Tensor) -> Tensor:
         """시간축에서 활성화된 위치만 평균합니다.

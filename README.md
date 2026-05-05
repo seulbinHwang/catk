@@ -742,15 +742,20 @@ loss와 로그는 아래처럼 보면 됩니다.
 - 생성 모델을 eval mode로 잠깐 바꾼 상태에서 gradient를 유지한 채 다시 만듭니다.
 - 따라서 dropout과 history drop이 섞인 학습용 trajectory가 아니라
 - validation/test와 같은 deterministic inference trajectory를 physics loss로 보정합니다.
-- 차량 / 자전거는 예측 20개 점을 다시
+- 차량 / 자전거는 유효한 미래 예측 구간을 다시
 - `forward speed`, `curvature`, `steering angle`, `steering rate`, `forward acceleration`으로 바꿔 penalty를 계산합니다.
 - wheelbase는 agent box length에 각각 `0.60`, `0.85`를 곱해서 만듭니다.
 - 사람은 steering state를 두지 않고, 2차원 속도와 2차원 가속도만으로 hard / soft 항을 계산합니다.
 - heading은 속도가 `0.5 m/s`보다 클 때만 약하게 봅니다.
+- `flow_window_steps`가 20이든 30이든 같은 regularizer를 쓰며, 실제 GT 미래가 유효한 step만 loss 평균에 들어갑니다.
 - 첫 제어량은 모두 `prev_control`을 사용합니다.
 - 차량 / 자전거는 `v_pre`와 `delta_pre`를 복원해서 첫 가속도와 첫 steering rate를 만들고,
 - 사람은 `prev_control[..., :2]`를 `prev_control[..., 2]`의 yaw-rate로 현재 anchor-local 좌표계에 회전한 뒤 첫 2차원 가속도 계산에 씁니다.
 - hard 항은 속도, 가속도, steering angle, steering rate, lateral acceleration 제한을 넘는 만큼 `relu(z)^2`로 계산합니다.
+- `soft_limit_ratio < 1.0`이면 실제 한계를 넘기 전부터 완충 penalty가 시작됩니다.
+- `topk_violation_k`는 agent별로 큰 위반 시점도 함께 보게 해서, 짧은 순간의 큰 물리 위반이 전체 평균에 묻히는 것을 줄입니다.
+- `commit_loss_weight`는 closed-loop에서 다음 상태로 직접 반영되는 앞 0.5초, 즉 앞 5개 미래 점의 상대 가중치를 높입니다. 전체 scale은 시간축 평균 분모로 다시 정규화합니다.
+- `use_slip_penalty=true`이면 차량 / 자전거의 heading 방향과 실제 이동 방향 차이도 hard 항에 포함해 옆미끄러짐을 직접 줄입니다.
 - soft 항은 jerk에 가까운 거칠기 값입니다. 기본값에서는 **GT roughness보다 큰 만큼만** loss에 반영하고,
   `model.model_config.draft.physics.compare_softness_to_gt=false` 로 두면
   GT 비교 없이 prediction roughness 자체를 그대로 반영합니다.
@@ -760,11 +765,14 @@ loss와 로그는 아래처럼 보면 됩니다.
 - class별 세부 loss는 `draft_component/*`에 기록됩니다.
 - 현재는 `vehicle_hard`, `vehicle_soft`, `vehicle_total`, `bicycle_*`, `pedestrian_hard`, `pedestrian_soft`, `pedestrian_head`, `pedestrian_total`을 봐두면 됩니다.
 - 실제 단위 평균값은 `draft_actual_pred/*`, GT 기준값은 `draft_actual_gt/*`에 기록됩니다.
-- 현재는 `speed_excess_mps`, `accel_excess_mps2`, `steer_excess_deg`, `steer_rate_excess_degps`, `lat_accel_excess_mps2`, `heading_error_deg`를 남깁니다.
+- 현재는 `speed_excess_mps`, `accel_excess_mps2`, `steer_excess_deg`, `steer_rate_excess_degps`, `lat_accel_excess_mps2`, `slip_beta_excess_deg`, `heading_error_deg`를 남깁니다.
 
 현재 inverse feasibility 기본 하이퍼파라미터는 아래와 같습니다.
 
 - 공통: `soft_weight=0.25`
+- aggregation: `soft_limit_ratio=0.8`, `topk_violation_k=20`, `commit_loss_weight=2.0`
+- no-slip: 기본은 `use_slip_penalty=false`이고, 차량 `beta_max=0.27 rad`, 자전거 `beta_max=0.70 rad`입니다.
+- DRaFT loss ablation: `model.model_config.draft.loss_enabled=false`로 같은 fine-tuning preset에서 inverse feasibility loss만 끌 수 있습니다.
 - vehicle: `v_max=35.0`, `a_max=8.0`, `a_lat_max=4.2`, `wheelbase_scale=0.60`, `steer_max=0.55 rad`, `steer_rate_max=0.8 rad/s`
 - bicycle: `v_max=22.0`, `a_max=5.5`, `a_lat_max=4.4`, `wheelbase_scale=0.85`, `steer_max=0.90 rad`, `steer_rate_max=1.4 rad/s`
 - pedestrian: `v_max=5.0`, `a_max=4.7`, `heading_speed_threshold=0.5 m/s`, `heading_weight=0.05`
@@ -783,6 +791,18 @@ loss와 로그는 아래처럼 보면 됩니다.
 
 # soft roughness를 GT와 비교하지 않고 raw prediction 기준으로 사용
 ... model.model_config.draft.physics.compare_softness_to_gt=false
+
+# inverse feasibility loss만 꺼서 같은 DRaFT fine-tuning 파이프라인에서 ablation
+... model.model_config.draft.loss_enabled=false
+
+# 차량/자전거 옆미끄러짐 penalty 켜기
+... model.model_config.draft.physics.use_slip_penalty=true
+
+# hard limit 주변 완충 구간과 큰 위반 시점 강조 조정
+... model.model_config.draft.physics.soft_limit_ratio=0.9     model.model_config.draft.physics.topk_violation_k=10
+
+# 실제 commit되는 앞 0.5초 구간을 더 강하게 보기
+... model.model_config.draft.physics.commit_loss_weight=3.0
 
 # 차량 steering rate 제한을 더 느슨하게
 ... model.model_config.draft.physics.vehicle_steer_rate_max_radps=1.0
