@@ -149,7 +149,7 @@ data:
   # If bs=54 ever does OOM on scene variance, step down to bs=48 (+2.7% vs
   # bs=36, ~22 GiB margin). Do NOT go to bs=36 first: the patch unlocked
   # real headroom and bs=36 is now known to be underutilized.
-  train_batch_size: 54
+  train_batch_size: 64
   # Per-GPU validation batch. Closed-loop rollout memory scales with
   # val_batch_size * n_rollout_closed_val (=128 rollouts materialized per
   # rank at once). 8 is the largest value we verified without OOM on A100.
