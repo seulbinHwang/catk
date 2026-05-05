@@ -31,7 +31,7 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 DEFAULT_TASK_NAME = (
     "flow_self_forced_v100x3x5_"
-    "unfrozen_except_map_encoder_estimator_warmup_4_bs8"
+    "unfrozen_except_map_encoder_estimator_warmup_4_bs6"
 )
 DEFAULT_SESSION = "catk-sf-v100x3x5-exceptmap-warmup4"
 
@@ -543,7 +543,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-addr", default="")
     parser.add_argument("--master-port", default="29545")
     parser.add_argument("--nproc-per-node", type=int, default=3)
-    parser.add_argument("--initial-bs", type=int, default=8)
+    parser.add_argument("--initial-bs", type=int, default=6)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--val-batch-size", type=int, default=4)
