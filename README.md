@@ -1015,6 +1015,66 @@ kubectl exec -it -n p-pnc testsv -c main -- tmux attach -t catk-sf-v100x4x4-exce
 python scripts/launch_self_forced_v100x4x4_static_pods.py --stop
 ```
 
+#### 5-node x 3 V100 static pod 실행
+
+이미 떠 있는 `fv`, `fvv`, `fvvv`, `fvvvv`, `fvvvvv` pod를 그대로 사용해서 V100 3장 x 5노드 self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다.
+
+```text
+configs/experiment/self_forced_npfm_v100x3x5.yaml
+scripts/launch_self_forced_v100x3x5_static_pods.py
+```
+
+이 preset은 `self_forced_npfm_h100_4.yaml`의 self-forcing 실험 조건을 유지하되 V100 32GB x 15 ranks에 맞게 하드웨어 관련 값만 바꿉니다.
+
+- 핵심 실험 조건: `unfrozen_range=except_map_encoder`, `estimator_warmup_epochs=4`
+- precision: V100은 bf16을 지원하지 않으므로 `trainer.precision=16-mixed`
+- per-GPU train batch: `8`
+- global train batch: `8 x 15 = 120`, H100x4 preset의 `28 x 4 = 112`와 비슷한 update scale
+- validation batch: `4`, 그래서 한 validation batch의 scene 수가 `4 x 15 = 60`으로 H100x4의 `16 x 4 = 64`와 가깝습니다.
+- scorer scene 수: `300`, world size 15와 val batch 4에서 official scorer 5 batch가 됩니다.
+- OOM이 나면 launcher가 `8 -> 6 -> 4 -> 2` 순서로 per-GPU batch를 낮추고, 최신 `epoch_last.ckpt`로 `action=fit` 재개합니다.
+
+pretrained checkpoint는 기본적으로 아래 W&B artifact에서 받습니다.
+
+```text
+jksg01019-naver-labs/SMART-FLOW/epoch-last-sjan8kmh:v32
+```
+
+다운로드된 checkpoint는 실험 출처가 보이도록 아래 경로에 저장됩니다.
+
+```text
+/mnt/nuplan/projects/catk/downloads/wandb_ckpts/flow_semi_continuous_finetune_inv_euler_32_a100x4/epoch-last-sjan8kmh_v32/epoch_last.ckpt
+```
+
+실행:
+
+```bash
+python scripts/launch_self_forced_v100x3x5_static_pods.py --replace
+```
+
+smoke test:
+
+```bash
+python scripts/launch_self_forced_v100x3x5_static_pods.py \
+  --replace \
+  --limit-train-batches 20 \
+  --limit-val-batches 0 \
+  --max-epochs 1 \
+  --task-name flow_self_forced_v100x3x5_unfrozen_except_map_encoder_estimator_warmup_4_bs8_smoke
+```
+
+attach:
+
+```bash
+kubectl exec -it -n p-pnc fv -c main -- tmux attach -t catk-sf-v100x3x5-exceptmap-warmup4
+```
+
+중지:
+
+```bash
+python scripts/launch_self_forced_v100x3x5_static_pods.py --stop
+```
+
 self-forced fine-tuning에서 학습할 파라미터 범위는 `unfrozen_range` 로 정합니다. 기본값 `except_map_encoder` 는 map encoder만 고정하고 나머지 Generator / generated estimator 파라미터를 학습 대상으로 둡니다. 더 보수적으로 보려면 마지막 궤적 생성부만 여는 `full_flow_decoder` 를 먼저 시도하세요.
 
 ```bash
