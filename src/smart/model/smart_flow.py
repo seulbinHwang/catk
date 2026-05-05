@@ -1673,8 +1673,9 @@ class SMARTFlow(LightningModule):
             동일한 의미를 유지합니다.
         """
         scaler = self._get_amp_grad_scaler()
+        raw_optimizer = getattr(optimizer, "optimizer", optimizer)
         if scaler is not None:
-            scaler.unscale_(optimizer)
+            scaler.unscale_(raw_optimizer)
         if gradient_clip_val is not None:
             self.clip_gradients(
                 optimizer,
@@ -1682,7 +1683,7 @@ class SMARTFlow(LightningModule):
                 gradient_clip_algorithm=gradient_clip_algorithm,
             )
         if scaler is not None:
-            scaler.step(optimizer)
+            scaler.step(raw_optimizer)
             scaler.update()
         else:
             optimizer.step()
