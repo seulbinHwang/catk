@@ -1,0 +1,43 @@
+# @package _global_
+
+# ============================================================================
+# Self-Forced NPFM fine-tuning preset for 4 nodes x 4 V100 32GB.
+#
+# This preset is derived from `self_forced_npfm_h100_4.yaml` and keeps the
+# self-forcing objective knobs aligned with that H100x4 experiment. The
+# hardware-facing changes are:
+#   * `trainer.num_nodes=4`, `trainer.devices=4` for 16 total ranks.
+#   * `trainer.precision=16-mixed` because V100 does not support bf16.
+#   * `data.train_batch_size=8`. With 16 ranks the global batch is 128,
+#     close to the H100x4 global batch 112 (28 x 4), while leaving memory
+#     margin on 32GB V100 cards.
+#   * `data.val_batch_size=4`, so validation scorer scenes stay comparable:
+#     4 x 16 ranks = 64 scenes per validation batch, matching H100x4
+#     val_batch_size=16 x 4 ranks.
+#
+# Main experiment points:
+#   * unfrozen_range=except_map_encoder
+#   * estimator_warmup_epochs=1
+# ============================================================================
+
+defaults:
+  - self_forced_npfm_h100_4
+  - _self_
+
+trainer:
+  num_nodes: 4
+  devices: 4
+  precision: 16-mixed
+
+data:
+  train_batch_size: 8
+  val_batch_size: 4
+  test_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1
+
+model:
+  model_config:
+    self_forced:
+      unfrozen_range: except_map_encoder
+      estimator_warmup_epochs: 1
