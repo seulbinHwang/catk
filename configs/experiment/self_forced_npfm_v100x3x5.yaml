@@ -43,4 +43,4 @@ model:
     scorer_scene_num: 300
     self_forced:
       unfrozen_range: except_map_encoder
-      estimator_warmup_epochs: 4
+      estimator_warmup_epochs: 1
