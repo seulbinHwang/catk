@@ -89,7 +89,7 @@ model_config:
     sid_normalizer_eps: 1.0e-3
     detach_block_transition: false
     estimator_updates_per_step: 5
-    estimator_warmup_epochs: 1
+    estimator_warmup_epochs: 4
     initialize_aux_from_generator_on_fit_start: true
     unfrozen_range: except_map_encoder
     ema_weight: 0.99

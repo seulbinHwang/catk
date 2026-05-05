@@ -40,4 +40,4 @@ model:
   model_config:
     self_forced:
       unfrozen_range: except_map_encoder
-      estimator_warmup_epochs: 1
+      estimator_warmup_epochs: 4
