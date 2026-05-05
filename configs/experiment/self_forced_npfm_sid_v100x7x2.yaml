@@ -1,0 +1,49 @@
+# @package _global_
+
+# ============================================================================
+# SiD-lite Self-Forced NPFM fine-tuning preset for 2 nodes x 7 V100 32GB.
+#
+# This preset is derived from `self_forced_npfm_sid_h100_4.yaml`, so the
+# objective is the H100x4 self-forcing setup with only
+# `distribution_matching_objective=sid` changed from DMD to SiD-lite.
+#
+# Hardware-facing changes for the existing `testv` / `testvv` pods:
+#   * `trainer.num_nodes=2`, `trainer.devices=7` for 14 total ranks.
+#   * `trainer.precision=16-mixed` because V100 does not support bf16.
+#   * `data.train_batch_size=8`. With 14 ranks the global batch is 112,
+#     exactly matching the H100x4 preset's 28 x 4 global batch.
+#   * `data.val_batch_size=4`, so each validation batch has 56 scenes.
+#   * `model.model_config.scorer_scene_num=280`, giving 5 official scorer
+#     batches at world_size=14 and val_batch_size=4.
+#
+# Main experiment points:
+#   * distribution_matching_objective=sid
+#   * unfrozen_range=except_map_encoder
+#   * estimator_warmup_epochs=1
+# ============================================================================
+
+defaults:
+  - self_forced_npfm_sid_h100_4
+  - _self_
+
+trainer:
+  num_nodes: 2
+  devices: 7
+  precision: 16-mixed
+
+data:
+  train_batch_size: 8
+  val_batch_size: 4
+  test_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1
+
+model:
+  model_config:
+    scorer_scene_num: 280
+    self_forced:
+      distribution_matching_objective: sid
+      sid_alpha: 1.0
+      sid_normalizer_eps: 1.0e-3
+      unfrozen_range: except_map_encoder
+      estimator_warmup_epochs: 1
