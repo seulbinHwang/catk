@@ -92,9 +92,23 @@ class MultiDataModule(LightningDataModule):
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
 
+    def refresh_train_dataset(self, train_raw_dir: Optional[str] = None) -> None:
+        """학습용 cache 폴더를 바꾼 뒤 train dataset을 다시 만듭니다.
+
+        Args:
+            train_raw_dir: 새로 읽을 학습 cache 폴더입니다. 값이 없으면 현재
+                ``self.train_raw_dir`` 값을 그대로 사용합니다.
+
+        Returns:
+            None
+        """
+        if train_raw_dir is not None:
+            self.train_raw_dir = str(train_raw_dir)
+        self.train_dataset = MultiDataset(self.train_raw_dir, self.train_transform)
+
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:
-            self.train_dataset = MultiDataset(self.train_raw_dir, self.train_transform)
+            self.refresh_train_dataset()
             self.val_dataset = MultiDataset(
                 self.val_raw_dir,
                 self.val_transform,
@@ -131,6 +145,9 @@ class MultiDataModule(LightningDataModule):
         )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
+        if not hasattr(self, "train_dataset"):
+            self.refresh_train_dataset()
+
         loader_kwargs = {
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,

@@ -1718,3 +1718,96 @@ H100 preset은 `experiment=self_forced_npfm_sid_h100_4` 또는
 ```bash
 ... model.model_config.self_forced.unfrozen_range=full_flow_decoder
 ```
+
+<!-- CATK_ROAD_FINE_TUNING_SECTION -->
+## RoaD closed-loop fine-tuning
+
+이 학습법은 self-forcing과 무관한 독립 fine-tuning 경로입니다. 시작점은 Flow Matching pretrained checkpoint이며, 매 epoch마다 현재 모델로 closed-loop RoaD cache를 새로 만들고 그 epoch 학습에만 사용한 뒤 삭제합니다.
+
+### 핵심 설정
+
+| 항목 | 값 |
+|---|---:|
+| action | `road_finetune` |
+| 시작 checkpoint | Flow Matching pretrained checkpoint |
+| fine-tuning epoch | 32 |
+| max learning rate | `5e-5` |
+| 원본 WOMD training scenario 수 | 486,995 |
+| scenario당 RoaD rollout 수 | 3 |
+| epoch마다 생성되는 RoaD cache 수 | 1,460,985 |
+| RoaD 1 epoch에서 실제 학습 sample 수 | 486,995 |
+| candidate 수 | 64 |
+| sampling temperature | 0.8 |
+| closed-loop commit 단위 | 0.5초, 즉 5 step |
+| 후보 선택 기준 | 첫 20 step의 사각형 4개 꼭지점 평균 거리 |
+| data update frequency | always |
+| 사용 완료 cache | epoch 종료 직후 삭제 |
+
+### 실행 방법
+
+먼저 기존 방식대로 WOMD training set을 `.pkl` cache로 만들어둡니다. 기본 원본 cache 경로는 `${paths.cache_root}/training`입니다.
+
+```bash
+bash scripts/road_flow_finetune.sh /path/to/flow_pretrained.ckpt
+```
+
+Hydra override를 직접 쓰는 경우는 다음과 같습니다.
+
+```bash
+python src/run.py \
+  experiment=road_flow \
+  ckpt_path=/path/to/flow_pretrained.ckpt
+```
+
+분산 학습 예시는 다음과 같습니다.
+
+```bash
+python src/run.py \
+  experiment=road_flow \
+  ckpt_path=/path/to/flow_pretrained.ckpt \
+  trainer.devices=4 \
+  trainer.num_nodes=1
+```
+
+원본 cache 경로를 바꾸려면 다음처럼 지정합니다.
+
+```bash
+python src/run.py \
+  experiment=road_flow \
+  ckpt_path=/path/to/flow_pretrained.ckpt \
+  road.source_train_raw_dir=/data/womd_cache/training
+```
+
+### 동작 순서
+
+1. epoch 0 시작 전, 현재 모델로 원본 WOMD training cache를 순회합니다.
+2. 각 scenario마다 RoaD rollout 3개를 생성합니다.
+3. 각 0.5초 block마다 현재 closed-loop scene에서 후보 64개를 temperature 0.8로 새로 만들고, GT future와 사각형 4개 꼭지점 평균 거리가 가장 작은 후보를 agent별로 고릅니다.
+4. 선택된 후보의 앞 0.5초만 scene에 반영하고, 이 과정을 16번 반복해 8초 future를 만듭니다.
+5. 선택된 future를 기존 WOMD `.pkl` schema와 같은 RoaD `.pkl` cache로 저장합니다.
+6. 생성된 3N개 cache 중 scenario마다 하나만 균등하게 골라 selected cache 폴더를 만듭니다.
+7. selected cache N개만 사용해 1 epoch 학습합니다. 따라서 optimizer update 수는 기존 CAT-K fine-tuning 1 epoch와 같습니다.
+8. epoch 종료 후 다음 epoch용 RoaD cache를 최신 모델로 다시 만들고, 이미 사용한 이전 epoch cache는 삭제합니다.
+9. 이 과정을 32 epoch 반복합니다.
+
+### 저장 구조
+
+기본 저장 위치는 `${paths.output_dir}/road_cache`입니다.
+
+```text
+road_cache/
+  epoch_000/
+    all/
+      variant_00/  # N개
+      variant_01/  # N개
+      variant_02/  # N개
+    selected/      # 실제 학습에 쓰는 N개
+```
+
+`selected/`는 hardlink를 먼저 시도하고, 파일 시스템이 지원하지 않으면 복사합니다. 한 epoch 학습이 끝나면 해당 epoch 폴더는 삭제됩니다.
+
+### 주의사항
+
+`trainer.reload_dataloaders_every_n_epochs=1`이 필요합니다. 새 epoch마다 selected cache 폴더가 바뀌기 때문입니다. `road_flow` 실험 설정에는 이 값이 이미 들어 있습니다.
+
+`road.candidate_micro_batch_size`는 기본 4입니다. K=64 후보를 한 번에 모두 만들지 않고 작은 묶음으로 나누어 생성하므로, GPU 메모리가 부족하면 1 또는 2로 낮추면 됩니다.
