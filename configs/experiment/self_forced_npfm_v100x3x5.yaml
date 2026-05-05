@@ -8,8 +8,8 @@
 # hardware-facing changes are:
 #   * `trainer.num_nodes=5`, `trainer.devices=3` for 15 total ranks.
 #   * `trainer.precision=16-mixed` because V100 does not support bf16.
-#   * `data.train_batch_size=6`. The V100x4x4 self-forced run OOMed at bs=8
-#     after epoch 0, so this preset starts from the same safer per-GPU batch.
+#   * `data.train_batch_size=4`. The V100 self-forced runs OOMed at larger
+#     per-GPU batches after epoch 0, so this preset starts from a safer value.
 #   * `data.val_batch_size=4`, so validation scorer scenes stay comparable:
 #     4 x 15 ranks = 60 scenes per validation batch, close to H100x4
 #     val_batch_size=16 x 4 ranks = 64.
@@ -31,7 +31,7 @@ trainer:
   precision: 16-mixed
 
 data:
-  train_batch_size: 6
+  train_batch_size: 4
   val_batch_size: 4
   test_batch_size: 4
   num_workers: 4
