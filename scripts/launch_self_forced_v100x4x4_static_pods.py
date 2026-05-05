@@ -86,6 +86,7 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
         export_line("ESTIMATOR_WARMUP_EPOCHS", args.estimator_warmup_epochs),
         export_line("LOG_DIR", args.log_dir),
         export_line("RUN_ROOT", run_root(args)),
+        export_line("RETRY_STATE_DIR", f"{run_root(args)}/retry_state"),
     ]
     optional = {
         "CATK_LR": args.learning_rate,
@@ -131,7 +132,7 @@ source {shq(env_file)}
 set +a
 
 cd "$PROJECT_ROOT"
-mkdir -p "$RUN_ROOT"
+mkdir -p "$RUN_ROOT" "$RETRY_STATE_DIR"
 
 echo "[self-forced-v100x4x4] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
 echo "[self-forced-v100x4x4] started at $(date '+%F %T')"
@@ -221,6 +222,64 @@ find_latest_self_forced_ckpt() {{
   ls -t "$PROJECT_ROOT/logs/$TASK_NAME/runs"/*/checkpoints/epoch_last.ckpt 2>/dev/null | head -1
 }}
 
+write_attempt_status() {{
+  local status="$1"
+  local oom="$2"
+  local status_file="$RETRY_STATE_DIR/$attempt_tag.$(hostname).status"
+  local tmp_file="$status_file.$$"
+  {{
+    echo "host=$(hostname)"
+    echo "node_rank=$NODE_RANK"
+    echo "attempt=$attempt"
+    echo "batch_size=$bs"
+    echo "status=$status"
+    echo "oom=$oom"
+    echo "log=$attempt_log"
+    echo "time=$(date '+%F %T')"
+  }} > "$tmp_file"
+  mv "$tmp_file" "$status_file"
+}}
+
+wait_for_attempt_statuses() {{
+  local waited=0
+  local timeout_sec="${{RETRY_BARRIER_TIMEOUT_SEC:-1200}}"
+  local count=0
+  while true; do
+    count="$(find "$RETRY_STATE_DIR" -maxdepth 1 -type f -name "$attempt_tag.*.status" | wc -l | tr -d ' ')"
+    if (( count >= NNODES )); then
+      return 0
+    fi
+    if (( waited >= timeout_sec )); then
+      echo "[self-forced-v100x4x4] timed out waiting for attempt $attempt status files: got $count/$NNODES" >&2
+      return 1
+    fi
+    sleep 5
+    waited=$(( waited + 5 ))
+  done
+}}
+
+global_attempt_has_oom() {{
+  local status_path
+  for status_path in "$RETRY_STATE_DIR"/$attempt_tag.*.status; do
+    if grep -q '^oom=1$' "$status_path" 2>/dev/null; then
+      return 0
+    fi
+  done
+  grep -Eq "$OOM_REGEX" "$RUN_ROOT"/*."$attempt_tag".log 2>/dev/null
+}}
+
+global_attempt_has_failure() {{
+  local status_path
+  local status_value
+  for status_path in "$RETRY_STATE_DIR"/$attempt_tag.*.status; do
+    status_value="$(awk -F= '$1 == "status" {{print $2; exit}}' "$status_path" 2>/dev/null)"
+    if [[ "$status_value" != "0" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}}
+
 ensure_pretrain_checkpoint || exit $?
 
 bs="$INITIAL_BS"
@@ -293,21 +352,30 @@ while (( bs >= MIN_BS )); do
 
   torchrun "${{torchrun_args[@]}}" 2>&1 | tee "$attempt_log"
   status=${{PIPESTATUS[0]}}
+  local_oom=0
+  if grep -Eq "$OOM_REGEX" "$attempt_log" 2>/dev/null; then
+    local_oom=1
+  fi
+  write_attempt_status "$status" "$local_oom"
 
-  if (( status == 0 )); then
+  if ! wait_for_attempt_statuses; then
+    echo "[self-forced-v100x4x4] retry barrier failed for $attempt_tag; see $RETRY_STATE_DIR" >&2
+    exit 1
+  fi
+
+  if ! global_attempt_has_failure; then
     echo "[self-forced-v100x4x4] training completed successfully at bs=$bs"
     exit 0
   fi
 
-  sleep 15
-  if grep -Eq "$OOM_REGEX" "$RUN_ROOT"/*.${{attempt_tag}}.log 2>/dev/null; then
+  if global_attempt_has_oom; then
     next_bs=$(( bs - OOM_STEP ))
-    echo "[self-forced-v100x4x4] OOM detected in attempt $attempt; lowering bs $bs -> $next_bs"
+    echo "[self-forced-v100x4x4] OOM detected on at least one node in attempt $attempt; all nodes lowering bs $bs -> $next_bs"
     bs="$next_bs"
     continue
   fi
 
-  echo "[self-forced-v100x4x4] non-OOM failure status=$status; see $attempt_log"
+  echo "[self-forced-v100x4x4] non-OOM failure status=$status; see $attempt_log and $RETRY_STATE_DIR/$attempt_tag.*.status"
   exit "$status"
 done
 
@@ -340,6 +408,16 @@ def render_start_command(
     worker_file = f"{root}/{pod}_worker.sh"
     monitor_file = f"{root}/{pod}_monitor.sh"
     tmux_log = f"{root}/{pod}.tmux.log"
+
+    if rank == 0:
+        state_reset_block = f"""
+rm -rf {shq(root + '/retry_state')}
+mkdir -p {shq(root + '/retry_state')}
+"""
+    else:
+        state_reset_block = f"""
+mkdir -p {shq(root + '/retry_state')}
+"""
 
     pull_block = ""
     if args.pull:
@@ -389,6 +467,7 @@ cd {shq(args.project_root)}
 {pull_block}
 {replace_block}
 mkdir -p {shq(root)}
+{state_reset_block}
 cat > {shq(env_file)} <<'CATK_ENV'
 {render_env(args, rank=rank, master_addr=master_addr).rstrip()}
 CATK_ENV
