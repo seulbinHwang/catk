@@ -17,7 +17,7 @@ model:
       train_full_flow_decoder_only: true
     draft:
       enabled: true
-      loss_enabled: true
+      loss_enabled: false
       start_epoch: 0
       ramp_epochs: 32
       max_weight: 0.1
