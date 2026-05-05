@@ -84,6 +84,7 @@ trainer:
   limit_val_batches: 0.1
   check_val_every_n_epoch: 2
   precision: bf16-mixed
+  max_epochs: 8
   # Lightning rejects auto gradient clipping under manual optimization.
   # Manual clip is configured at model.model_config.self_forced.gradient_clip_val
   # (default 1.0 from configs/model/smart_flow.yaml). Override there if needed.
