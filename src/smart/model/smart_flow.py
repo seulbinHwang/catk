@@ -46,6 +46,7 @@ from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
 from src.smart.modules.self_forced_update_separation import (
     assert_no_module_gradients,
     clear_module_gradients,
+    module_gradients_disabled,
 )
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
@@ -2014,41 +2015,46 @@ class SMARTFlow(LightningModule):
         """
         if self.self_forced_generated_estimator is None:
             raise RuntimeError("self_forced_generated_estimator is not initialized.")
+        if self.self_forced_target_teacher is None:
+            raise RuntimeError("self_forced_target_teacher is not initialized.")
 
         optimizer = self.optimizers()[1]
         last_loss = committed_path_norm.new_zeros(())
+        clean_path = committed_path_norm.detach().clone()
 
         self.toggle_optimizer(optimizer)
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.train()
         try:
-            for _ in range(self.self_forced_estimator_updates_per_step):
-                optimizer.zero_grad(set_to_none=True)
-                self._prepare_self_forced_estimator_backward_boundary()
-                clean_path = committed_path_norm.detach()
-                flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
-                    clean_path,
-                    target_type="velocity",
-                )
-                pred_dict = self._predict_path_flow_clean_estimate(
-                    decoder=self.self_forced_generated_estimator,
-                    tokenized_map=tokenized_map,
-                    tokenized_agent=tokenized_agent,
-                    noisy_path_norm=flow_sample.x_t,
-                    tau=flow_sample.tau,
-                    anchor_mask=anchor_mask,
-                )
-                last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target)
-                self._manual_backward_without_autocast(last_loss)
-                self._assert_self_forced_estimator_update_isolated()
-                self._clip_and_step_with_optional_scaler(
-                    optimizer,
-                    gradient_clip_val=self.self_forced_gradient_clip_val,
-                    gradient_clip_algorithm="norm",
-                )
-                self._clear_self_forced_auxiliary_gradients()
-                self._clear_self_forced_generator_gradients()
+            with module_gradients_disabled(self.encoder, self.self_forced_target_teacher):
+                for _ in range(self.self_forced_estimator_updates_per_step):
+                    optimizer.zero_grad(set_to_none=True)
+                    self._prepare_self_forced_estimator_backward_boundary()
+                    flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
+                        clean_path,
+                        target_type="velocity",
+                    )
+                    pred_dict = self._predict_path_flow_clean_estimate(
+                        decoder=self.self_forced_generated_estimator,
+                        tokenized_map=tokenized_map,
+                        tokenized_agent=tokenized_agent,
+                        noisy_path_norm=flow_sample.x_t.detach(),
+                        tau=flow_sample.tau.detach(),
+                        anchor_mask=anchor_mask,
+                    )
+                    last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target.detach())
+                    self._manual_backward_without_autocast(last_loss)
+                    self._assert_self_forced_estimator_update_isolated()
+                    self._clip_and_step_with_optional_scaler(
+                        optimizer,
+                        gradient_clip_val=self.self_forced_gradient_clip_val,
+                        gradient_clip_algorithm="norm",
+                    )
+                    self._clear_self_forced_auxiliary_gradients()
+                    self._clear_self_forced_generator_gradients()
         finally:
+            self._clear_self_forced_auxiliary_gradients()
+            self._clear_self_forced_generator_gradients()
             self.untoggle_optimizer(optimizer)
             self._set_self_forced_auxiliary_modes()
         return last_loss.detach()
