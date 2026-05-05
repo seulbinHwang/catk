@@ -1,10 +1,38 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Any, Iterator
 
+from torch import Tensor
 import torch.nn as nn
 from torch.nn import Parameter
+
+
+def detach_tensor_tree(value: Any) -> Any:
+    """nested container 안의 tensor들을 autograd graph에서 분리합니다.
+
+    Args:
+        value: tensor, dict, list, tuple 또는 그 밖의 값을 담은 객체입니다.
+
+    Returns:
+        Any: 원래 container 구조는 유지하되 tensor leaf만 ``detach()`` 한 값입니다.
+
+    설명:
+        generated estimator update는 현재 Generator가 만든 값들을 학습 target/context로만
+        봐야 합니다. tensor container 전체를 boundary에서 detach해 두면 estimator backward가
+        online Generator rollout graph로 되돌아가는 것을 구조적으로 막을 수 있습니다.
+    """
+    if isinstance(value, Tensor):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: detach_tensor_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [detach_tensor_tree(item) for item in value]
+    if isinstance(value, tuple):
+        if hasattr(value, "_fields"):
+            return type(value)(*(detach_tensor_tree(item) for item in value))
+        return tuple(detach_tensor_tree(item) for item in value)
+    return value
 
 
 def clear_module_gradients(module: nn.Module | None) -> None:
