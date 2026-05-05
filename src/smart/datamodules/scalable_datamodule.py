@@ -37,6 +37,7 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        road_num_rollouts_per_scenario: int = 1,
     ) -> None:
         super(MultiDataModule, self).__init__()
         self.train_batch_size = train_batch_size
@@ -50,14 +51,47 @@ class MultiDataModule(LightningDataModule):
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
+        self.road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
+        self._train_dataset_raw_dir: Optional[str] = None
+        self._train_dataset_road_group_size: Optional[int] = None
 
         self.train_transform = WaymoTargetBuilderTrain(train_max_num)
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
 
+    def set_train_raw_dir(
+        self, train_raw_dir: str, road_num_rollouts_per_scenario: int = 1
+    ) -> None:
+        """다음 train dataloader가 읽을 cache 위치를 바꾼다.
+
+        Args:
+            train_raw_dir: 다음 epoch에서 사용할 pickle cache 디렉터리이다.
+            road_num_rollouts_per_scenario: scenario 하나당 저장된 RoaD rollout 개수이다.
+                1이면 기존 WOMD cache처럼 파일 하나를 sample 하나로 본다.
+        """
+        self.train_raw_dir = train_raw_dir
+        self.road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
+        self.train_dataset = None
+        self._train_dataset_raw_dir = None
+        self._train_dataset_road_group_size = None
+
+    def _build_train_dataset(self) -> None:
+        """현재 설정된 train cache에서 학습 dataset을 만든다.
+
+        RoaD fine-tuning에서는 epoch마다 cache 디렉터리가 바뀐다. 이 함수는
+        dataloader가 새로 만들어질 때 현재 cache 위치를 기준으로 dataset을 다시 만든다.
+        """
+        self.train_dataset = MultiDataset(
+            self.train_raw_dir,
+            self.train_transform,
+            road_num_rollouts_per_scenario=self.road_num_rollouts_per_scenario,
+        )
+        self._train_dataset_raw_dir = self.train_raw_dir
+        self._train_dataset_road_group_size = self.road_num_rollouts_per_scenario
+
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:
-            self.train_dataset = MultiDataset(self.train_raw_dir, self.train_transform)
+            self._build_train_dataset()
             self.val_dataset = MultiDataset(
                 self.val_raw_dir,
                 self.val_transform,
@@ -75,6 +109,15 @@ class MultiDataModule(LightningDataModule):
             raise ValueError(f"{stage} should be one of [fit, validate, test]")
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
+        needs_rebuild = (
+            not hasattr(self, "train_dataset")
+            or self.train_dataset is None
+            or self._train_dataset_raw_dir != self.train_raw_dir
+            or self._train_dataset_road_group_size != self.road_num_rollouts_per_scenario
+        )
+        if needs_rebuild:
+            self._build_train_dataset()
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
@@ -91,7 +134,7 @@ class MultiDataModule(LightningDataModule):
             batch_size=self.val_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=self.pin_memory,  # False
+            pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             drop_last=False,
         )
@@ -101,8 +144,8 @@ class MultiDataModule(LightningDataModule):
             self.test_dataset,
             batch_size=self.test_batch_size,
             shuffle=False,
-            num_workers=self.num_workers,  # 0
-            pin_memory=self.pin_memory,  # False
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             drop_last=False,
         )

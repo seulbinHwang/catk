@@ -22,6 +22,7 @@ from lightning.pytorch.loggers import Logger
 from lightning.pytorch.loggers.wandb import WandbLogger
 from omegaconf import DictConfig
 
+from src.smart.road import RoadCacheRefreshCallback
 from src.utils import (
     RankedLogger,
     instantiate_callbacks,
@@ -33,6 +34,28 @@ from src.utils import (
 log = RankedLogger(__name__, rank_zero_only=True)
 
 torch.set_float32_matmul_precision("high")
+
+
+def build_road_cache_callback(cfg: DictConfig) -> RoadCacheRefreshCallback:
+    """RoaD fine-tuning용 cache refresh callback을 만든다.
+
+    Args:
+        cfg: Hydra 전체 설정이다. ``data``에는 원본 WOMD cache 위치가 있고,
+            ``road``에는 RoaD rollout 생성 설정이 있다.
+
+    Returns:
+        epoch마다 RoaD cache를 만들고 dataloader가 그 cache를 읽게 하는 callback이다.
+    """
+    return RoadCacheRefreshCallback(
+        original_train_raw_dir=cfg.data.train_raw_dir,
+        cache_root_dir=cfg.road.cache_root_dir,
+        sampling_scheme=cfg.road.rollout_sampling,
+        num_rollouts_per_scenario=cfg.road.num_rollouts_per_scenario,
+        generation_batch_size=cfg.road.generation_batch_size,
+        num_workers=cfg.road.num_workers,
+        pin_memory=cfg.road.pin_memory,
+        delete_after_use=cfg.road.delete_after_use,
+    )
 
 
 def run(cfg: DictConfig) -> None:
@@ -47,10 +70,11 @@ def run(cfg: DictConfig) -> None:
 
     log.info("Instantiating callbacks...")
     callbacks: List[Callback] = instantiate_callbacks(cfg.get("callbacks"))
+    if cfg.action == "road_finetune":
+        callbacks.append(build_road_cache_callback(cfg))
 
     log.info(f"Instantiating loggers...")
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
-    # setup model watching
     for _logger in logger:
         if isinstance(_logger, WandbLogger):
             _logger.watch(model, log="all")
@@ -80,6 +104,10 @@ def run(cfg: DictConfig) -> None:
         log.info("Starting finetuning!")
         model.load_state_dict(torch.load(cfg.ckpt_path)["state_dict"], strict=False)
         trainer.fit(model=model, datamodule=datamodule)
+    elif cfg.action == "road_finetune":
+        log.info("Starting RoaD finetuning!")
+        model.load_state_dict(torch.load(cfg.ckpt_path)["state_dict"], strict=False)
+        trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")
         trainer.validate(
@@ -97,7 +125,7 @@ def main(cfg: DictConfig) -> None:
     log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
     print_config_tree(cfg, resolve=True, save_to_file=True)
 
-    run(cfg)  # train/val/test the model
+    run(cfg)
 
     log.info("Closing wandb!")
     wandb.finish()

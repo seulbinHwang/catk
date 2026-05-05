@@ -99,6 +99,54 @@ python -m src.run \
 
 If `n_rollout_closed_val=32`, the metrics use those 32 rollouts. If it is changed to 16, the metrics use the already generated 16 rollouts.
 
+### RoaD fine-tuning
+
+This repository also supports RoaD-style closed-loop fine-tuning through:
+
+```text
+configs/experiment/road_clsft.yaml
+```
+
+RoaD fine-tuning is implemented as an epoch-local generated dataset pipeline:
+
+- The original WOMD training pickle cache is never overwritten.
+- At the beginning of each fine-tuning epoch, the latest SMART model generates a temporary RoaD cache from the original training cache.
+- Each scenario generates 3 independent RoaD rollouts by default.
+- The training dataset keeps the same effective length as the original scenario count by uniformly sampling one of the 3 generated rollouts for each scenario.
+- The temporary cache is regenerated every epoch and deleted after use by default.
+
+Default RoaD settings:
+
+| Item | Value |
+| --- | ---: |
+| config | `road_clsft` |
+| action | `road_finetune` |
+| learning rate | `5e-5` |
+| label smoothing | `0.0` |
+| rollouts per scenario | `3` |
+| candidate policy | Sample-K |
+| candidate count | `64` |
+| sampling temperature | `0.8` |
+| candidate selection | closest sampled token to the expert next state |
+| in-step CAT-K rollout during RoaD training | off |
+
+Run RoaD fine-tuning with an explicit SMART BC checkpoint:
+
+```bash
+torchrun -m src.run \
+  experiment=road_clsft \
+  ckpt_path=/path/to/SMART_BC_PRETRAINED.ckpt \
+  task_name=road_clsft
+```
+
+or use:
+
+```bash
+bash scripts/road_train.sh
+```
+
+For DDP training, use the DDP block in `scripts/road_train.sh`. Rank 0 generates the epoch-local RoaD cache under `${paths.output_dir}/road_cache/epoch_XXX`, then all ranks synchronize and read that cache. Set `road.delete_after_use=false` only when debugging generated data.
+
 For Gaussian Mixture Model (GMM) based ego policy, the procedure is similar, just use the following configs
 - [BC pre-training config for GMM-based ego policy](configs/experiment/ego_gmm_pre_bc.yaml)
 - [CLSFT with CAT-K config for GMM-based ego policy](configs/experiment/ego_gmm_clsft.yaml)
