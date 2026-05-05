@@ -1619,9 +1619,73 @@ class SMARTFlow(LightningModule):
 
         Returns:
             None
+
+        설명:
+            ``loss.float()`` 으로 fp32 캐스팅을 유지합니다. ``precision='16-mixed'`` 인
+            경우 Lightning의 precision plugin이 ``manual_backward`` 안에서
+            ``GradScaler.scale`` 을 적용하므로, 이후 step은
+            ``_clip_and_step_with_optional_scaler`` 를 통해 unscale → clip → step → update
+            순서를 지킵니다.
         """
         with torch.autocast(device_type=loss.device.type, enabled=False):
             self.manual_backward(loss.float())
+
+    def _get_amp_grad_scaler(self) -> Any | None:
+        """fp16 mixed precision에서 Lightning이 만든 GradScaler를 가져옵니다.
+
+        Returns:
+            Any | None: ``precision='16-mixed'`` 일 때 ``torch.amp.GradScaler``,
+            그 외(``bf16-mixed`` / ``32-true``)에는 ``None``.
+
+        설명:
+            manual optimization은 Lightning의 ``optimizer_step`` 경로를 사용하지 않으므로
+            scaler의 unscale/step/update를 우리가 직접 호출해야 합니다.
+        """
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        plugin = getattr(trainer, "precision_plugin", None)
+        if plugin is None:
+            return None
+        return getattr(plugin, "scaler", None)
+
+    def _clip_and_step_with_optional_scaler(
+        self,
+        optimizer,
+        *,
+        gradient_clip_val: float | None = None,
+        gradient_clip_algorithm: str = "norm",
+    ) -> None:
+        """unscale → clip → step → update 순서로 fp16-safe하게 step을 수행합니다.
+
+        Args:
+            optimizer: step 대상 optimizer.
+            gradient_clip_val: gradient clip threshold. ``None`` 이면 clipping 생략합니다.
+            gradient_clip_algorithm: clip 알고리즘 ("norm" 또는 "value").
+
+        Returns:
+            None.
+
+        설명:
+            ``GradScaler`` 가 활성이면 ``scaler.unscale_`` 으로 gradient를 정상 스케일로
+            돌린 뒤 clip을 적용하고, ``scaler.step`` 으로 inf/NaN을 자동 감지·skip하며
+            ``scaler.update`` 로 scale factor를 갱신합니다. scaler가 없으면 평문 경로로
+            동일한 의미를 유지합니다.
+        """
+        scaler = self._get_amp_grad_scaler()
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+        if gradient_clip_val is not None:
+            self.clip_gradients(
+                optimizer,
+                gradient_clip_val=gradient_clip_val,
+                gradient_clip_algorithm=gradient_clip_algorithm,
+            )
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
     def _clear_self_forced_auxiliary_gradients(self) -> None:
         """self-forcing 보조 모델의 gradient를 비웁니다.
@@ -1961,12 +2025,11 @@ class SMARTFlow(LightningModule):
                 last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target)
                 self._manual_backward_without_autocast(last_loss)
                 self._assert_self_forced_estimator_update_isolated()
-                self.clip_gradients(
+                self._clip_and_step_with_optional_scaler(
                     optimizer,
                     gradient_clip_val=self.self_forced_gradient_clip_val,
                     gradient_clip_algorithm="norm",
                 )
-                optimizer.step()
                 self._clear_self_forced_auxiliary_gradients()
                 self._clear_self_forced_generator_gradients()
         finally:
@@ -2575,12 +2638,11 @@ class SMARTFlow(LightningModule):
         self._prepare_self_forced_generator_backward_boundary()
         self._manual_backward_without_autocast(total_loss)
         self._assert_self_forced_generator_update_isolated()
-        self.clip_gradients(
+        self._clip_and_step_with_optional_scaler(
             generator_optimizer,
             gradient_clip_val=self.self_forced_gradient_clip_val,
             gradient_clip_algorithm="norm",
         )
-        generator_optimizer.step()
         self._update_self_forced_generator_ema_after_step()
         self._clear_self_forced_generator_gradients()
         self.untoggle_optimizer(generator_optimizer)
@@ -2689,7 +2751,7 @@ class SMARTFlow(LightningModule):
             self._prepare_self_forced_generator_backward_boundary()
             self._manual_backward_without_autocast(fm_loss)
             self._assert_self_forced_generator_update_isolated()
-            generator_optimizer.step()
+            self._clip_and_step_with_optional_scaler(generator_optimizer)
             self._update_self_forced_generator_ema_after_step()
             self._clear_self_forced_generator_gradients()
             self.untoggle_optimizer(generator_optimizer)
@@ -2743,12 +2805,11 @@ class SMARTFlow(LightningModule):
                 self._prepare_self_forced_generator_backward_boundary()
                 self._manual_backward_without_autocast(total_loss)
                 self._assert_self_forced_generator_update_isolated()
-                self.clip_gradients(
+                self._clip_and_step_with_optional_scaler(
                     generator_optimizer,
                     gradient_clip_val=self.self_forced_gradient_clip_val,
                     gradient_clip_algorithm="norm",
                 )
-                generator_optimizer.step()
                 self._update_self_forced_generator_ema_after_step()
                 self._clear_self_forced_generator_gradients()
             finally:
@@ -2945,7 +3006,18 @@ open_metric_dict:
         return total_loss
 
     def on_after_backward(self) -> None:
-        """역전파 직후 non-finite gradient를 fail-fast로 잡습니다."""
+        """역전파 직후 non-finite gradient를 fail-fast로 잡습니다.
+
+        설명:
+            ``precision='16-mixed'`` 에서는 Lightning이 ``GradScaler`` 로 loss를 스케일해
+            backward를 수행하므로, 이 시점의 gradient는 정상적으로 scaled 상태이고
+            fp16 overflow로 인한 inf/NaN도 흔하게 발생합니다. ``GradScaler.step`` 이
+            optimizer step을 자동으로 건너뛰고 scale factor를 낮춰 회복하므로, scaler가
+            활성인 경로에서는 여기서 ``raise`` 하지 않습니다. scaler가 없는 경로
+            (bf16 / 32-true) 에서는 기존대로 fail-fast를 유지합니다.
+        """
+        if self._get_amp_grad_scaler() is not None:
+            return
         bad_grad = self._find_first_nonfinite_gradient()
         if bad_grad is None:
             return
