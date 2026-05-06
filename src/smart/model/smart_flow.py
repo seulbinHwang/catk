@@ -800,6 +800,17 @@ class SMARTFlow(LightningModule):
         last_n_coarse = int(getattr(cfg, "bptt_last_n_coarse_steps", 0))
         if last_n_coarse > 0:
             warm_coarse = max(warm_coarse, max(0, pred_steps - last_n_coarse))
+        # Consistency tail suffix slicing — bptt_last_coarse_only / warm_coarse 가
+        # 활성이면 처음 N coarse step 은 detach 라 grad 가 안 흐른다.  loss
+        # magnitude 가 부풀지 않게 grad-active suffix 만 비교한다 (fix-hard-rmm
+        # `_consistency_tail_*hz_steps` 와 동일 패턴).
+        _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
+        _consistency_tail_2hz: int | None = None
+        _consistency_tail_10hz: int | None = None
+        if last_coarse_only and pred_steps > 0:
+            _grad_coarse = max(1, pred_steps - warm_coarse)
+            _consistency_tail_2hz = _grad_coarse
+            _consistency_tail_10hz = _grad_coarse * _shift
         use_adjoint = bool(getattr(cfg, "bptt_use_adjoint", False))
         last_n_solver = int(getattr(cfg, "bptt_last_n_solver_steps", 0))
         grad_clip_traj = float(getattr(cfg, "bptt_grad_clip_traj", 0.0))
@@ -807,6 +818,11 @@ class SMARTFlow(LightningModule):
 
         agent_enc = self.encoder.agent_encoder
         shift = int(getattr(agent_enc, "shift", 5))
+        # prepare_inference_cache 의 ``[:, :step_current_2hz]`` 슬라이싱과 정합한
+        # sliding-window 길이.  anchor_idx 마다 마지막 ``step_current_2hz`` step 만
+        # cache 의 input 으로 들어가므로, sequence 도 동일 윈도우로 잘라야 anchor
+        # 별로 다른 hidden state 가 나옵니다 (fix-hard-rmm 와 동일 패턴).
+        step_current_2hz = max(1, (int(getattr(agent_enc, "num_historical_steps", 11)) - 1) // shift)
         device = tokenized_agent["batch"].device
 
         # FlowODE BPTT 속성 일시 활성화 (finally 에서 원복).
@@ -864,6 +880,11 @@ class SMARTFlow(LightningModule):
 
         try:
             for anchor_idx in all_anchor_indices:
+                # Sliding window: anchor_idx 시점에서 마지막 ``step_current_2hz`` step
+                # 만 cache 입력으로 사용 (fix-hard-rmm 패턴).  hist_start 가 0 으로
+                # 고정되면 anchor_idx >= step_current_2hz 부터 cache 가 동일해지는
+                # 정합성 버그 발생.
+                hist_start = max(0, anchor_idx + 1 - step_current_2hz)
                 tokenized_agent_anchor: Dict[str, Tensor] = {}
                 for key, value in tokenized_agent.items():
                     if (
@@ -872,7 +893,7 @@ class SMARTFlow(LightningModule):
                         and value.dim() >= 2
                         and value.shape[1] >= anchor_idx + 1
                     ):
-                        tokenized_agent_anchor[key] = value[:, : anchor_idx + 1]
+                        tokenized_agent_anchor[key] = value[:, hist_start : anchor_idx + 1]
                     else:
                         tokenized_agent_anchor[key] = value
 
@@ -1015,6 +1036,21 @@ class SMARTFlow(LightningModule):
                         xy, hd, current_pos_active, current_head_active,
                     )
 
+                def _slice_consistency_suffix(x: Tensor) -> Tensor:
+                    """grad-active suffix slice (10Hz CL or 2Hz norm tensor)."""
+                    tail = _consistency_tail_2hz if use_gt_target else _consistency_tail_10hz
+                    if tail is None:
+                        return x
+                    n = max(1, min(int(tail), int(x.shape[-2])))
+                    return x[..., -n:, :]
+
+                def _slice_consistency_suffix_valid(x: Tensor) -> Tensor:
+                    """GT valid mask [n, T] suffix slice (use_gt_target 전용)."""
+                    if _consistency_tail_2hz is None:
+                        return x
+                    n = max(1, min(int(_consistency_tail_2hz), int(x.shape[-1])))
+                    return x[..., -n:]
+
                 # G rollout 의 noise tape 을 chunk batch 차원으로 묶는다.
                 # _build_parallel_rollout_cache 의 expand 패턴 (G blocks, 각 block
                 # 안에 n_agent 순서) 과 동일하도록 ``cat(..., dim=0)`` 사용.
@@ -1057,6 +1093,14 @@ class SMARTFlow(LightningModule):
 
                 anchor_loss: Tensor | None = None
 
+                # tgt_norms / tgt_valid 도 grad-active suffix 로 통일 (정합성).
+                tgt_norms_sliced = [_slice_consistency_suffix(t) for t in tgt_norms]
+                tgt_valid_sliced = (
+                    _slice_consistency_suffix_valid(tgt_valid)
+                    if (tgt_valid is not None and use_gt_target)
+                    else tgt_valid
+                )
+
                 if sequential and use_mmd and not use_gt_target and G >= 2:
                     # 2-pass sequential MMD: peak memory O(1 graph), exact gradient.
                     # 각 g 를 단일-chunk 호출 (chunk_size==1 path) 로 직렬 실행.
@@ -1066,18 +1110,22 @@ class SMARTFlow(LightningModule):
                         for g in range(G):
                             ptraj_d, phead_d = _run_cl_chunk([g])
                             cl_norms_det.append(
-                                _cl_norm_from_traj_head(ptraj_d[:, 0], phead_d[:, 0]).detach()
+                                _slice_consistency_suffix(
+                                    _cl_norm_from_traj_head(ptraj_d[:, 0], phead_d[:, 0])
+                                ).detach()
                             )
                     sigma_sq_seq = mmd_precompute_sigma_sq(
-                        ol_norms=tgt_norms, cl_norms=cl_norms_det,
+                        ol_norms=tgt_norms_sliced, cl_norms=cl_norms_det,
                     )
                     for g in range(G):
                         ptraj_g, phead_g = _run_cl_chunk([g])
-                        cl_norm_g = _cl_norm_from_traj_head(ptraj_g[:, 0], phead_g[:, 0])
+                        cl_norm_g = _slice_consistency_suffix(
+                            _cl_norm_from_traj_head(ptraj_g[:, 0], phead_g[:, 0])
+                        )
                         proxy_g = pos_w * mmd_per_rollout_proxy(
                             cl_norm_g=cl_norm_g,
                             cl_norms_ref=cl_norms_det,
-                            ol_norms_ref=tgt_norms,
+                            ol_norms_ref=tgt_norms_sliced,
                             sigma_sq=sigma_sq_seq,
                         )
                         # backward 즉시 후 그래프 free.
@@ -1090,12 +1138,14 @@ class SMARTFlow(LightningModule):
                     cl_norms_grad: list[Tensor] = []
                     for g in range(G):
                         cl_norms_grad.append(
-                            _cl_norm_from_traj_head(pred_traj_all[:, g], pred_head_all[:, g])
+                            _slice_consistency_suffix(
+                                _cl_norm_from_traj_head(pred_traj_all[:, g], pred_head_all[:, g])
+                            )
                         )
                     anchor_loss = self._ocsc_consistency_loss(
                         cl_norms=cl_norms_grad,
-                        tgt_norms=tgt_norms,
-                        tgt_valid=tgt_valid,
+                        tgt_norms=tgt_norms_sliced,
+                        tgt_valid=tgt_valid_sliced,
                         use_mmd=use_mmd,
                         use_gt_target=use_gt_target,
                         loss_type=loss_type,
