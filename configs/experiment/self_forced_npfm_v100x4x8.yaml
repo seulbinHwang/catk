@@ -27,6 +27,8 @@ trainer:
   num_nodes: 8
   devices: 4
   precision: 16-mixed
+  max_epochs: 12
+  check_val_every_n_epoch: 2
 
 model:
   model_config:
@@ -41,7 +43,7 @@ model:
 data:
   # V100 32GB self-forced runs have a much tighter memory envelope than H100.
   # Start conservatively; the launcher can step down on OOM.
-  train_batch_size: 3
+  train_batch_size: 2
   val_batch_size: 2
   test_batch_size: 2
   num_workers: 4
