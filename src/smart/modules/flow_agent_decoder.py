@@ -1013,199 +1013,26 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             }
         return cloned_cache
 
-    @staticmethod
-    def _get_random_terminal_world_size() -> int:
-        """random terminal 값을 맞춰야 하는 rank 수를 확인합니다.
-
-        torch.distributed가 준비되지 않은 단일 실행에서는 1을 돌려줍니다.
-        DDP 실행에서는 실제 rank 수를 돌려줍니다. 반환값이 2 이상일 때만
-        rank0에서 뽑은 값을 다른 rank로 복사합니다.
-
-        Returns:
-            int: 현재 실행에서 값을 맞춰야 하는 rank 수입니다.
-        """
-        distributed = getattr(torch, "distributed", None)
-        if distributed is None:
-            return 1
-        try:
-            if not distributed.is_available():
-                return 1
-            if not distributed.is_initialized():
-                return 1
-            return int(distributed.get_world_size())
-        except RuntimeError:
-            return 1
-
-    def _sync_random_terminal_s_one(self, terminal_s_one: torch.Tensor) -> torch.Tensor:
-        """rank0에서 뽑은 random terminal s 하나를 모든 rank에 복사합니다.
-
-        Args:
-            terminal_s_one: 각 rank가 가진 terminal s 후보입니다.
-                shape은 ``[1]`` 이고 dtype은 ``torch.long`` 입니다.
-
-        Returns:
-            torch.Tensor: 모든 rank가 같은 값을 갖는 terminal s입니다.
-                shape은 ``[1]`` 입니다.
-        """
-        if tuple(terminal_s_one.shape) != (1,):
-            raise ValueError(
-                "terminal_s_one must have shape [1], "
-                f"got {tuple(terminal_s_one.shape)}."
-            )
-        if self._get_random_terminal_world_size() <= 1:
-            return terminal_s_one
-        synced_terminal_s_one = terminal_s_one.clone()
-        torch.distributed.broadcast(synced_terminal_s_one, src=0)
-        return synced_terminal_s_one
-
-    def _build_terminal_step_tensors_from_s_one(
-        self,
-        terminal_s_one: torch.Tensor,
-        sample_steps: int,
-        num_scenario: int,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """공유된 terminal s 하나를 scenario별 tensor로 바꿉니다.
-
-        Args:
-            terminal_s_one: 모든 rank가 공유하는 terminal s입니다. shape은 ``[1]`` 입니다.
-            sample_steps: 전체 denoising step 수입니다.
-            num_scenario: 현재 rank mini-batch 안 scenario 수입니다.
-            device: 반환 tensor를 올릴 장치입니다.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: terminal step 수와 논문 표기 s입니다.
-                두 tensor 모두 scenario 축 shape은 ``[num_scenario]`` 입니다.
-        """
-        if int(num_scenario) < 0:
-            raise ValueError(f"num_scenario must be non-negative, got {num_scenario}.")
-        if int(num_scenario) == 0:
-            empty_long = torch.empty((0,), device=device, dtype=torch.long)
-            return empty_long, empty_long
-
-        terminal_s = terminal_s_one.to(device=device, dtype=torch.long).expand(
-            int(num_scenario)
-        ).clone()
-        terminal_steps = int(sample_steps) + 1 - terminal_s
-        return terminal_steps, terminal_s
-
     def _resolve_training_backprop_last_k(
         self,
         sampling_scheme: DictConfig,
     ) -> int | None:
-        """self-forced 생성 중 gradient를 남길 마지막 denoising step 수를 정합니다.
-
-        Args:
-            sampling_scheme: self-forced rollout sampling 설정입니다.
+        """flow_ode.generate 의 마지막 K denoising step 에만 gradient 를 남길 K 를 결정합니다.
 
         Returns:
-            int | None:
-                마지막 몇 denoising step에 gradient를 남길지 나타냅니다.
-                값이 ``None`` 이면 전체 denoising step이 gradient 대상입니다.
-                ``random_terminal_step.policy=all`` 이고 사용자가 값을 주지 않으면
-                기본값 ``8`` 을 돌려줍니다.
+            int | None: ``sampling.backprop_last_k`` 값.  ``None`` 이면 전체 step 에 grad 가 흐릅니다.
         """
         configured_last_k = getattr(sampling_scheme, "backprop_last_k", None)
-        if configured_last_k is not None:
-            backprop_last_k = int(configured_last_k)
-            if backprop_last_k < 1:
-                raise ValueError(
-                    "sampling.backprop_last_k must be positive when set, "
-                    f"got {backprop_last_k}."
-                )
-            return backprop_last_k
-
-        random_cfg = getattr(sampling_scheme, "random_terminal_step", None)
-        if random_cfg is None or not bool(getattr(random_cfg, "enabled", False)):
+        if configured_last_k is None:
             return None
-
-        policy = str(getattr(random_cfg, "policy", "paper_uniform"))
-        if policy == "all":
-            return 8
-        return None
-
-    def _sample_training_terminal_step_for_batch(
-        self,
-        sampling_scheme: DictConfig,
-        num_scenario: int,
-        device: torch.device,
-        self_forced_epoch: int | None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """DDP 전체 rank가 공유할 high-K random terminal step 하나를 샘플링합니다.
-
-        Args:
-            sampling_scheme: self-forced rollout sampling 설정입니다.
-            num_scenario: 현재 rank mini-batch 안 scenario 개수입니다.
-            device: 반환 tensor를 둘 장치입니다.
-            self_forced_epoch: 현재 self-forced epoch입니다. ``None``이면 random terminal step을 끕니다.
-
-        Returns:
-            tuple[torch.Tensor | None, torch.Tensor | None]: terminal step 수 ``K``와 논문 표기 ``s``입니다.
-                random terminal이 꺼져 있으면 두 값 모두 ``None`` 입니다.
-                켜져 있으면 각 tensor의 scenario 축 shape은 ``[num_scenario]`` 입니다.
-
-        Notes:
-            ``policy=paper_uniform`` 은 기존처럼 실행할 denoising step 수를 균등 샘플링합니다.
-            ``policy=all`` 은 random terminal step을 만들지 않고 전체 denoising을 실행합니다.
-            이때 gradient는 ``sampling.backprop_last_k`` 로 지정한 마지막 step에만 남깁니다.
-            ``sampling.backprop_last_k`` 를 생략하면 기본값은 ``8`` 입니다.
-        """
-        random_cfg = getattr(sampling_scheme, "random_terminal_step", None)
-        if self_forced_epoch is None or random_cfg is None:
-            return None, None
-        if not bool(getattr(random_cfg, "enabled", False)):
-            return None, None
-
-        sample_steps = int(getattr(sampling_scheme, "sample_steps", self.flow_ode.solver_steps))
-        if sample_steps <= 0:
-            raise ValueError(f"sample_steps must be positive, got {sample_steps}.")
-        if int(num_scenario) < 0:
-            raise ValueError(f"num_scenario must be non-negative, got {num_scenario}.")
-
-        policy = str(getattr(random_cfg, "policy", "paper_uniform"))
-        if policy == "all":
-            return None, None
-        if policy != "paper_uniform":
+        backprop_last_k = int(configured_last_k)
+        if backprop_last_k < 1:
             raise ValueError(
-                "random_terminal_step.policy only supports 'paper_uniform' or 'all'. "
-                "Use 'all' to execute every denoising step with last-k backprop, "
-                "or use 'paper_uniform' with min_executed_steps."
+                "sampling.backprop_last_k must be positive when set, "
+                f"got {backprop_last_k}."
             )
+        return backprop_last_k
 
-        scope = str(getattr(random_cfg, "scope", "global_batch"))
-        if scope != "global_batch":
-            raise ValueError(
-                "random_terminal_step.scope only supports 'global_batch' for self-forced training, "
-                f"got {scope!r}."
-            )
-
-        min_executed_steps = int(getattr(random_cfg, "min_executed_steps", 24))
-        if min_executed_steps < 1 or min_executed_steps > sample_steps:
-            raise ValueError(
-                "random_terminal_step.min_executed_steps must be in [1, sample_steps], "
-                f"got min_executed_steps={min_executed_steps}, sample_steps={sample_steps}."
-            )
-
-        max_terminal_s = sample_steps + 1 - min_executed_steps
-        distributed_enabled = self._get_random_terminal_world_size() > 1
-        if distributed_enabled and torch.distributed.get_rank() != 0:
-            terminal_s_one = torch.empty((1,), device=device, dtype=torch.long)
-        else:
-            terminal_s_one = torch.randint(
-                low=1,
-                high=max_terminal_s + 1,
-                size=(1,),
-                device=device,
-                dtype=torch.long,
-            )
-        terminal_s_one = self._sync_random_terminal_s_one(terminal_s_one)
-
-        return self._build_terminal_step_tensors_from_s_one(
-            terminal_s_one=terminal_s_one,
-            sample_steps=sample_steps,
-            num_scenario=num_scenario,
-            device=device,
-        )
 
     def _rollout_from_cache_impl(
         self,
