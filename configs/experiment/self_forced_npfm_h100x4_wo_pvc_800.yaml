@@ -1,0 +1,40 @@
+# @package _global_
+
+# ============================================================================
+# Self-Forced NPFM fine-tuning preset for one 4x H100 pod: wo-pvc-800.
+#
+# The matching launcher downloads the W&B artifact
+# `jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v64` to:
+#   /workspace/flow_semi_continuous_pretrain_h100x4x2_bs26/v64/epoch_last.ckpt
+#
+# Main experiment points:
+#   * Single-node DDP: trainer.num_nodes=1, trainer.devices=4
+#   * H100 precision: bf16-mixed
+#   * Generator lr: 1e-6
+#   * self_forced.estimator_warmup_epochs=1
+#   * self_forced.use_stop_motion=false for the training self-rollout
+#   * data.train_batch_size=22
+# ============================================================================
+
+defaults:
+  - self_forced_npfm_h100_4
+  - _self_
+
+trainer:
+  num_nodes: 1
+  devices: 4
+  precision: bf16-mixed
+
+model:
+  model_config:
+    lr: 1.0e-6
+    self_forced:
+      use_stop_motion: false
+      estimator_warmup_epochs: 1
+
+data:
+  train_batch_size: 22
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
