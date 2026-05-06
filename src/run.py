@@ -86,6 +86,12 @@ def _is_self_forced_auxiliary_key(key: str) -> bool:
     )
 
 
+def _is_lora_parameter_key(key: str) -> bool:
+    # LoRA A/B 는 random init (B=0, A=kaiming) 이 의도된 시작점이므로
+    # ckpt 부재가 정상.  validator 가 fail 시키지 않도록 whitelist.
+    return key.endswith(".lora_A") or key.endswith(".lora_B")
+
+
 def _validate_finetune_loaded_trainable_params(
     model: LightningModule,
     missing_keys: Sequence[str],
@@ -101,6 +107,9 @@ def _validate_finetune_loaded_trainable_params(
         missing_trainable = [
             key for key in missing_trainable if not _is_self_forced_auxiliary_key(key)
         ]
+    missing_trainable = [
+        key for key in missing_trainable if not _is_lora_parameter_key(key)
+    ]
     if missing_trainable:
         raise RuntimeError(
             "action=finetune loaded the checkpoint with strict=False, but the checkpoint "
@@ -114,6 +123,9 @@ def _validate_finetune_loaded_trainable_params(
         if allow_missing_self_forced_auxiliary
         else list(missing_keys)
     )
+    non_aux_missing = [
+        key for key in non_aux_missing if not _is_lora_parameter_key(str(key))
+    ]
     if non_aux_missing:
         log.warning(
             "Ignoring non-trainable missing checkpoint key(s) during finetune load: "
