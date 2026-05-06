@@ -172,7 +172,10 @@ class TokenProcessor(torch.nn.Module):
             ).flatten(1, 3)
             tokenized_agent[f"token_bank_all_{k}"] = getattr(self, f"agent_token_all_{k}")
 
-        if not self.training:
+        # OCSC 학습 step 은 ``gt_*_raw`` 와 ``rollout_init_fine_*`` 를 closed-loop
+        # rollout/anchor 처리에 사용하므로 학습 모드에서도 항상 set 합니다.
+        # 다른 학습 경로는 이 키들을 무시하므로 영향 없음.
+        if True:
             (
                 rollout_init_fine_pos_pair,
                 rollout_init_fine_head_pair,
