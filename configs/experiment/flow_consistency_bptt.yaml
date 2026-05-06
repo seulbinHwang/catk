@@ -105,3 +105,7 @@ data:
   persistent_workers: true
   pin_memory: true
   shuffle: false
+  # OCSC step needs validation-style tokenized_agent (gt_pos / gt_heading /
+  # valid_mask / gt_idx keys).  Without this flag the train transform produces
+  # flow_train_* keys and OCSC step KeyErrors.
+  train_use_eval_agent_selection: true
