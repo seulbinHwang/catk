@@ -213,6 +213,10 @@ class SMARTFlowDecoder(nn.Module):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
         rollout_steps_2hz: int | None = None,
+        warm_coarse_steps: int = 0,
+        noise_tape_override: Tensor | None = None,
+        share_noise_across_time: bool = False,
+        bptt_grad_clip_traj: float = 0.0,
     ) -> Dict[str, Tensor]:
         """OCSC/BPTT 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -224,6 +228,10 @@ class SMARTFlowDecoder(nn.Module):
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 평가 길이를 실행합니다.
+            warm_coarse_steps: BPTT warm-up 으로 처음 N coarse step 을 no_grad 로 실행합니다.
+            noise_tape_override: 외부에서 만든 noise tape 입니다 (OCSC OL/CL pairing).
+            share_noise_across_time: rollout noise tape 의 시간 축 공유 여부입니다.
+            bptt_grad_clip_traj: closed-loop trajectory L2 norm clip 값입니다.
 
         Returns:
             Dict[str, Tensor]: committed rollout 결과입니다.
@@ -236,6 +244,10 @@ class SMARTFlowDecoder(nn.Module):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             rollout_steps_2hz=rollout_steps_2hz,
+            warm_coarse_steps=warm_coarse_steps,
+            noise_tape_override=noise_tape_override,
+            share_noise_across_time=share_noise_across_time,
+            bptt_grad_clip_traj=bptt_grad_clip_traj,
         )
 
     def path_flow_velocity_for_anchor0(
