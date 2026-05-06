@@ -1003,9 +1003,8 @@ class SMARTFlow(LightningModule):
                     T_compare = 0
                 T_target = T_compare
 
-                def _cl_norm_from_out(cl_out: dict) -> Tensor:
-                    cl_traj_10hz = cl_out["pred_traj_10hz"]
-                    cl_head_10hz = cl_out["pred_head_10hz"]
+                def _cl_norm_from_traj_head(cl_traj_10hz: Tensor, cl_head_10hz: Tensor) -> Tensor:
+                    """closed-loop 10Hz 출력을 anchor-local 4ch normalized 로 변환."""
                     if use_gt_target:
                         xy = cl_traj_10hz[active_mask][:, shift - 1 :: shift, :][:, :T_target]
                         hd = cl_head_10hz[active_mask][:, shift - 1 :: shift][:, :T_target]
@@ -1016,44 +1015,65 @@ class SMARTFlow(LightningModule):
                         xy, hd, current_pos_active, current_head_active,
                     )
 
-                def _run_cl(g: int) -> dict:
-                    seeds_g = (
-                        self._get_closed_loop_scenario_seeds(
-                            scenario_ids=scenario_ids,
-                            rollout_idx=g,
-                            device=device,
-                        ) if scenario_ids is not None else None
-                    )
-                    return agent_enc.training_rollout_from_cache(
-                        rollout_cache=rollout_cache_anchor,
+                # G rollout 의 noise tape 을 chunk batch 차원으로 묶는다.
+                # _build_parallel_rollout_cache 의 expand 패턴 (G blocks, 각 block
+                # 안에 n_agent 순서) 과 동일하도록 ``cat(..., dim=0)`` 사용.
+                expanded_tape = (
+                    torch.cat(shared_tapes, dim=0).contiguous()
+                    if share_noise_tape and len(shared_tapes) == G
+                    else None
+                )
+
+                def _run_cl_chunk(rollout_indices_g) -> tuple[Tensor, Tensor]:
+                    """주어진 rollout index 묶음 (size 1 또는 G) 을 한 번에 실행."""
+                    g_count = len(rollout_indices_g)
+                    if g_count == 1:
+                        tape_arg = (
+                            shared_tapes[int(rollout_indices_g[0])]
+                            if share_noise_tape
+                            else None
+                        )
+                    else:
+                        tape_arg = expanded_tape  # [G * n_agent, tape_steps, 4]
+                    pred_traj_chunk, _, pred_head_chunk, _ = self._run_parallel_rollout_chunk(
+                        rollout_encoder=self.encoder,
+                        data=data,
                         tokenized_agent=tokenized_agent_anchor,
                         map_feature=map_feature,
-                        sampling_scheme=sampling_scheme,
-                        sampling_seed=int(self.global_step) * G + g,
-                        scenario_sampling_seeds=seeds_g,
+                        rollout_cache=rollout_cache_anchor,
+                        rollout_indices=rollout_indices_g,
+                        full_grad=True,
                         rollout_steps_2hz=pred_steps,
                         warm_coarse_steps=warm_coarse,
-                        noise_tape_override=shared_tapes[g] if share_noise_tape else None,
                         share_noise_across_time=share_noise_across_time,
+                        noise_tape_override=tape_arg,
                         bptt_grad_clip_traj=grad_clip_traj,
+                        sampling_scheme=sampling_scheme,
+                        sampling_seed_base=int(self.global_step) * G,
                     )
+                    # pred_traj_chunk: [n_agent, g_count, T_fine, 2]
+                    # pred_head_chunk: [n_agent, g_count, T_fine]
+                    return pred_traj_chunk, pred_head_chunk
 
                 anchor_loss: Tensor | None = None
 
                 if sequential and use_mmd and not use_gt_target and G >= 2:
                     # 2-pass sequential MMD: peak memory O(1 graph), exact gradient.
+                    # 각 g 를 단일-chunk 호출 (chunk_size==1 path) 로 직렬 실행.
                     cl_norms_det: list[Tensor] = []
                     sigma_sq_seq: Tensor | None = None
                     with torch.no_grad():
                         for g in range(G):
-                            cl_out_d = _run_cl(g)
-                            cl_norms_det.append(_cl_norm_from_out(cl_out_d).detach())
+                            ptraj_d, phead_d = _run_cl_chunk([g])
+                            cl_norms_det.append(
+                                _cl_norm_from_traj_head(ptraj_d[:, 0], phead_d[:, 0]).detach()
+                            )
                     sigma_sq_seq = mmd_precompute_sigma_sq(
                         ol_norms=tgt_norms, cl_norms=cl_norms_det,
                     )
                     for g in range(G):
-                        cl_out_g = _run_cl(g)
-                        cl_norm_g = _cl_norm_from_out(cl_out_g)
+                        ptraj_g, phead_g = _run_cl_chunk([g])
+                        cl_norm_g = _cl_norm_from_traj_head(ptraj_g[:, 0], phead_g[:, 0])
                         proxy_g = pos_w * mmd_per_rollout_proxy(
                             cl_norm_g=cl_norm_g,
                             cl_norms_ref=cl_norms_det,
@@ -1065,10 +1085,13 @@ class SMARTFlow(LightningModule):
                         total_loss_value += float(proxy_g.detach().item())
                     anchor_loss = None  # 이미 backward 됨
                 else:
+                    # G rollout 을 한 번의 batched forward 로 실행 (chunk_size==G).
+                    pred_traj_all, pred_head_all = _run_cl_chunk(list(range(G)))
                     cl_norms_grad: list[Tensor] = []
                     for g in range(G):
-                        cl_out_g = _run_cl(g)
-                        cl_norms_grad.append(_cl_norm_from_out(cl_out_g))
+                        cl_norms_grad.append(
+                            _cl_norm_from_traj_head(pred_traj_all[:, g], pred_head_all[:, g])
+                        )
                     anchor_loss = self._ocsc_consistency_loss(
                         cl_norms=cl_norms_grad,
                         tgt_norms=tgt_norms,
