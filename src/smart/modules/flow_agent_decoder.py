@@ -570,6 +570,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         agent_batch: torch.Tensor | None = None,
+        share_noise_across_time: bool = False,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
 
@@ -605,20 +606,28 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     continue
                 generator = torch.Generator(device=device)
                 generator.manual_seed(int(scenario_seed))
-                noise_tape[scenario_mask] = torch.randn(
-                    int(scenario_mask.sum().item()),
-                    tape_steps,
-                    4,
-                    device=device,
-                    dtype=dtype,
-                    generator=generator,
-                )
+                n_sc = int(scenario_mask.sum().item())
+                if share_noise_across_time:
+                    z = torch.randn(
+                        n_sc, 4, device=device, dtype=dtype, generator=generator,
+                    )
+                    noise_tape[scenario_mask] = z.unsqueeze(1).expand(-1, tape_steps, -1)
+                else:
+                    noise_tape[scenario_mask] = torch.randn(
+                        n_sc, tape_steps, 4,
+                        device=device, dtype=dtype, generator=generator,
+                    )
             return noise_tape * noise_scale
 
         generator = None
         if sampling_seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(sampling_seed))
+        if share_noise_across_time:
+            z = torch.randn(
+                num_agent, 4, device=device, dtype=dtype, generator=generator,
+            )
+            return z.unsqueeze(1).expand(-1, tape_steps, -1).contiguous() * noise_scale
         return torch.randn(
             num_agent,
             tape_steps,
@@ -1192,6 +1201,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
+        warm_coarse_steps: int = 0,
+        noise_tape_override: torch.Tensor | None = None,
+        share_noise_across_time: bool = False,
+        bptt_grad_clip_traj: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -1281,16 +1294,21 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 device=pos_window.device,
             )
         sample_window_steps = self.flow_window_steps
-        rollout_noise_tape = self._build_rollout_noise_tape(
-            num_agent=n_agent,
-            tape_steps=n_step_future_10hz + sample_window_steps - self.shift,
-            device=feat_a_now.device,
-            dtype=feat_a_now.dtype,
-            sampling_scheme=sampling_scheme,
-            sampling_seed=sampling_seed,
-            scenario_sampling_seeds=scenario_sampling_seeds,
-            agent_batch=tokenized_agent["batch"],
-        )
+        if noise_tape_override is not None:
+            # OCSC: 외부에서 미리 만든 tape 을 그대로 사용해 OL/CL noise pairing 보장.
+            rollout_noise_tape = noise_tape_override
+        else:
+            rollout_noise_tape = self._build_rollout_noise_tape(
+                num_agent=n_agent,
+                tape_steps=n_step_future_10hz + sample_window_steps - self.shift,
+                device=feat_a_now.device,
+                dtype=feat_a_now.dtype,
+                sampling_scheme=sampling_scheme,
+                sampling_seed=sampling_seed,
+                scenario_sampling_seeds=scenario_sampling_seeds,
+                agent_batch=tokenized_agent["batch"],
+                share_noise_across_time=share_noise_across_time,
+            )
         # Derive scenario count from the always-present `batch` index instead of
         # `tokenized_agent["num_graphs"]`. The latter is only populated on the
         # training-side `tokenized_agent` (built by `_build_eval_tokenized_inputs`)
@@ -1327,7 +1345,50 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             else None
         )
 
+        _ocsc_prev_grad: bool | None = None
         for t in range(n_step_future_2hz):
+            # ── OCSC warm_coarse_steps boundary: detach state once before grad mode ──
+            if warm_coarse_steps > 0 and t == warm_coarse_steps:
+                detached_state = detach_training_rollout_state(
+                    {
+                        "pos_window": pos_window,
+                        "head_window": head_window,
+                        "head_vector_window": head_vector_window,
+                        "valid_window": valid_window,
+                        "pred_idx_window": pred_idx_window,
+                        "exec_pos_history_10hz": exec_pos_history_10hz,
+                        "exec_head_history_10hz": exec_head_history_10hz,
+                        "exec_valid_history_10hz": exec_valid_history_10hz,
+                        "exec_pos_pair_10hz": exec_pos_pair_10hz,
+                        "exec_head_pair_10hz": exec_head_pair_10hz,
+                        "exec_valid_pair_10hz": exec_valid_pair_10hz,
+                        "feat_a": feat_a,
+                        "agent_token_emb": agent_token_emb,
+                        "feat_a_t_dict": feat_a_t_dict,
+                    }
+                )
+                pos_window = detached_state["pos_window"]
+                head_window = detached_state["head_window"]
+                head_vector_window = detached_state["head_vector_window"]
+                valid_window = detached_state["valid_window"]
+                pred_idx_window = detached_state["pred_idx_window"]
+                exec_pos_history_10hz = detached_state["exec_pos_history_10hz"]
+                exec_head_history_10hz = detached_state["exec_head_history_10hz"]
+                exec_valid_history_10hz = detached_state["exec_valid_history_10hz"]
+                exec_pos_pair_10hz = detached_state["exec_pos_pair_10hz"]
+                exec_head_pair_10hz = detached_state["exec_head_pair_10hz"]
+                exec_valid_pair_10hz = detached_state["exec_valid_pair_10hz"]
+                feat_a = detached_state["feat_a"]
+                agent_token_emb = detached_state["agent_token_emb"]
+                feat_a_t_dict = detached_state["feat_a_t_dict"]
+            # ── OCSC warm-up: 본 iteration 동안 gradient 끄기 ──
+            if warm_coarse_steps > 0 and t < warm_coarse_steps and _ocsc_prev_grad is None:
+                _ocsc_prev_grad = torch.is_grad_enabled()
+                torch.set_grad_enabled(False)
+            elif warm_coarse_steps > 0 and t == warm_coarse_steps and _ocsc_prev_grad is not None:
+                torch.set_grad_enabled(_ocsc_prev_grad)
+                _ocsc_prev_grad = None
+
             if detach_block_transition and t > 0:
                 detached_state = detach_training_rollout_state(
                     {
@@ -1688,6 +1749,27 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 for key in feat_a_t_dict:
                     feat_a_t_dict[key] = feat_a_t_dict[key][:, -max_context_steps:]
 
+        # ── OCSC warm-up: loop 이 grad-restore 없이 끝난 경우(warm > pred) safety ──
+        if _ocsc_prev_grad is not None:
+            torch.set_grad_enabled(_ocsc_prev_grad)
+            _ocsc_prev_grad = None
+
+        # ── OCSC bptt_grad_clip_traj: closed-loop traj gradient L2 norm clip ──
+        # Detached buffer 에서는 hook 이 호출되지 않으므로 requires_grad 분기.
+        if bptt_grad_clip_traj > 0.0 and pred_traj_10hz.requires_grad:
+            _max_norm = float(bptt_grad_clip_traj)
+
+            def _norm_clip_hook(g: torch.Tensor) -> torch.Tensor:
+                g = torch.nan_to_num(g, nan=0.0, posinf=_max_norm, neginf=-_max_norm)
+                g_norm = g.norm()
+                if g_norm > _max_norm:
+                    g = g * (_max_norm / g_norm)
+                return g
+
+            pred_traj_10hz.register_hook(_norm_clip_hook)
+            if pred_head_10hz.requires_grad:
+                pred_head_10hz.register_hook(_norm_clip_hook)
+
         pred_pos = torch.stack(coarse_pos_list, dim=1)
         pred_head = torch.stack(coarse_head_list, dim=1)
         pred_valid = torch.stack(coarse_valid_list, dim=1)
@@ -1767,6 +1849,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
+        warm_coarse_steps: int = 0,
+        noise_tape_override: torch.Tensor | None = None,
+        share_noise_across_time: bool = False,
+        bptt_grad_clip_traj: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -1796,6 +1882,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
+            warm_coarse_steps=warm_coarse_steps,
+            noise_tape_override=noise_tape_override,
+            share_noise_across_time=share_noise_across_time,
+            bptt_grad_clip_traj=bptt_grad_clip_traj,
         )
 
     def path_flow_velocity_for_anchor0(
