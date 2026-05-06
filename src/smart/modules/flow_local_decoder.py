@@ -115,6 +115,15 @@ class FlowODE:
         self.solver_method = solver_method
         self.path_type = path_type
         self.sigma_min = sigma_min
+        # OCSC / BPTT memory tricks (default off → 기존 동작과 동일).
+        # ``use_adjoint_for_bptt=True`` 면 generate() 의 각 model_fn 호출을
+        # torch.utils.checkpoint 로 감싸 메모리 ↓, 재계산 ↑ 트레이드오프.
+        # ``last_n_grad_solver_steps=K (>0)`` 면 마지막 K solver step 의 velocity 에만
+        # gradient 를 흘립니다.  앞쪽 step 의 velocity 는 detach 되지만 x_t chain
+        # 자체는 끊기지 않아 coarse step 간 BPTT 는 유지됩니다.  이 값이 0 일 때
+        # 기존 ``backprop_last_k`` 의 (x_t 까지 detach) semantic 과는 별개로 동작합니다.
+        self.use_adjoint_for_bptt: bool = False
+        self.last_n_grad_solver_steps: int = 0
 
     def _beta(self) -> float:
         if self.path_type == "linear":
@@ -337,11 +346,48 @@ class FlowODE:
         else:
             grad_start_step = max(0, int(max_step) - max(0, int(backprop_last_k)))
 
+        # OCSC BPTT 모드 (fix-hard-rmm 호환):
+        #   use_adjoint_for_bptt=True → model_fn 을 torch.utils.checkpoint 로 감쌈.
+        #   last_n_grad_solver_steps=K (>0) → 앞쪽 (max_step - K) step 의 velocity 만
+        #     detach (x_t chain 은 유지).  ``backprop_last_k`` 와 다른 의미입니다.
+        use_adjoint = bool(getattr(self, "use_adjoint_for_bptt", False))
+        last_n_vel_grad = max(0, int(getattr(self, "last_n_grad_solver_steps", 0)))
+        if use_adjoint:
+            from torch.utils.checkpoint import checkpoint as _ckpt
+
+            def _call(x: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+                return _ckpt(model_fn, x, tau, use_reentrant=False)
+        else:
+            _call = model_fn
+
         for i in range(max_step):
             t = t0 + i * dt
             tau = x_t.new_full((x_t.shape[0],), t)
             use_grad = i >= grad_start_step
-            if use_grad:
+
+            if use_grad and (use_adjoint or last_n_vel_grad > 0):
+                # fix-hard-rmm 호환 경로: velocity-detach + ckpt.
+                keep_vel_grad = (last_n_vel_grad == 0) or (
+                    i >= max_step - last_n_vel_grad
+                )
+                if method == "midpoint":
+                    v1 = _call(x_t, tau)
+                    if not keep_vel_grad:
+                        v1 = v1.detach()
+                    x_mid = x_t + 0.5 * dt * v1
+                    tau_mid = tau + 0.5 * dt
+                    v2 = _call(x_mid, tau_mid)
+                    if not keep_vel_grad:
+                        v2 = v2.detach()
+                    x_t = x_t + dt * v2
+                elif method == "euler":
+                    v = _call(x_t, tau)
+                    if not keep_vel_grad:
+                        v = v.detach()
+                    x_t = x_t + dt * v
+                else:
+                    raise ValueError(f"Unsupported solver method: {method}")
+            elif use_grad:
                 x_t = self._integrate_one_step(
                     x_t=x_t,
                     tau=tau,
