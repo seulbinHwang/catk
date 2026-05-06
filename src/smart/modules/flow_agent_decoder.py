@@ -1313,38 +1313,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         # Derive scenario count from the always-present `batch` index instead of
         # `tokenized_agent["num_graphs"]`. The latter is only populated on the
         # training-side `tokenized_agent` (built by `_build_eval_tokenized_inputs`)
-        # but is dropped by the validation/inference helper
-        # `_build_parallel_rollout_tokenized_agent`, so any read of "num_graphs"
-        # here would KeyError on the very first closed-loop validation step
-        # even though `_sample_training_terminal_step_for_batch` is a no-op for
-        # the eval path (`self_forced_epoch is None`). `batch` is required by
-        # downstream PyG ops in this same function and is therefore guaranteed
-        # to exist on every code path that reaches this point.
-        agent_batch_index = tokenized_agent["batch"]
-        num_scenario_for_random_s = (
-            int(agent_batch_index.max().item()) + 1
-            if agent_batch_index.numel() > 0
-            else 0
-        )
-        (
-            terminal_steps_by_scenario,
-            terminal_s_by_scenario,
-        ) = self._sample_training_terminal_step_for_batch(
-            sampling_scheme=sampling_scheme,
-            num_scenario=num_scenario_for_random_s,
-            device=feat_a_now.device,
-            self_forced_epoch=self_forced_epoch,
-        )
-        terminal_step_by_agent = (
-            terminal_steps_by_scenario[tokenized_agent["batch"]]
-            if terminal_steps_by_scenario is not None
-            else None
-        )
-        terminal_step_for_rollout = (
-            int(terminal_steps_by_scenario[0].item())
-            if terminal_steps_by_scenario is not None and terminal_steps_by_scenario.numel() > 0
-            else None
-        )
+        # self-forced learning 의 random terminal-step 기능은 OCSC / inference 에서
+        # 사용하지 않습니다.  관련 변수를 None 으로 고정해 dead path 를 모두 제거합니다.
+        terminal_steps_by_scenario = None
+        terminal_s_by_scenario = None
+        terminal_step_by_agent = None
+        terminal_step_for_rollout = None
 
         _ocsc_prev_grad: bool | None = None
         for t in range(n_step_future_2hz):
