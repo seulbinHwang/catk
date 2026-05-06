@@ -35,11 +35,6 @@ class SMARTFlowDecoder(nn.Module):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
-        closed_loop_rollout_mode: str = "raw_fm",
-        flow_window_steps: int = 20,
-        use_lqr: bool = False,
-        use_stop_motion: bool = False,
-        lqr_commit: DictConfig | None = None,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -55,7 +50,6 @@ class SMARTFlowDecoder(nn.Module):
             hidden_dim=hidden_dim,
             num_historical_steps=num_historical_steps,
             num_future_steps=num_future_steps,
-            flow_window_steps=flow_window_steps,
             time_span=time_span,
             pl2a_radius=pl2a_radius,
             a2a_radius=a2a_radius,
@@ -72,14 +66,38 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_steps=flow_solver_steps,
             flow_solver_method=flow_solver_method,
             flow_solver_eps=flow_solver_eps,
-            closed_loop_rollout_mode=closed_loop_rollout_mode,
-            use_lqr=use_lqr,
-            use_stop_motion=use_stop_motion,
-            lqr_commit=lqr_commit,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
         return self.map_encoder(tokenized_map)
+
+    def encode_anchor_context_from_map_feature(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask_key: str = "flow_eval_mask",
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """한 번 인코딩한 지도 특징에서 anchor 문맥만 뽑습니다.
+
+        Args:
+            map_feature: 지도 인코더 출력입니다.
+            tokenized_agent: agent 토큰 사전입니다.
+            anchor_mask_key: 어떤 anchor 마스크를 쓸지 나타내는 키입니다.
+
+        Returns:
+            tuple[Tensor, Tensor, Tensor]:
+                - ``ctx_hidden_pack``: context encoder 전체 출력입니다.
+                  shape은 ``[n_agent, 14, hidden_dim]`` 입니다.
+                - ``anchor_hidden``: 13개 anchor 문맥입니다.
+                  shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+                - ``anchor_hidden_valid``: 유효 anchor만 모은 문맥입니다.
+                  shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
+        """
+        return self.agent_encoder.encode_anchor_context(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            anchor_mask=tokenized_agent[anchor_mask_key],
+        )
 
     def forward_from_map_feature(
         self,
@@ -91,53 +109,11 @@ class SMARTFlowDecoder(nn.Module):
             "flow_train_mask": "flow_train_clean_norm",
             "flow_eval_mask": "flow_eval_clean_norm",
         }[anchor_mask_key]
-        flow_loss_mask = (
-            tokenized_agent["flow_train_loss_mask"]
-            if anchor_mask_key == "flow_train_mask"
-            else None
-        )
         return self.agent_encoder(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             anchor_mask=tokenized_agent[anchor_mask_key],
             flow_clean_norm=tokenized_agent[flow_clean_norm_key],
-            flow_loss_mask=flow_loss_mask,
-        )
-
-    def build_anchor_context_from_map_feature(
-        self,
-        map_feature: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        anchor_mask_key: str = "flow_eval_mask",
-    ) -> Dict[str, Tensor]:
-        flow_clean_norm_key = {
-            "flow_train_mask": "flow_train_clean_norm",
-            "flow_eval_mask": "flow_eval_clean_norm",
-        }[anchor_mask_key]
-        flow_loss_mask = (
-            tokenized_agent["flow_train_loss_mask"]
-            if anchor_mask_key == "flow_train_mask"
-            else None
-        )
-        return self.agent_encoder.build_anchor_context(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            anchor_mask=tokenized_agent[anchor_mask_key],
-            flow_clean_norm=tokenized_agent[flow_clean_norm_key],
-            flow_loss_mask=flow_loss_mask,
-        )
-
-    def build_anchor_context(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        anchor_mask_key: str = "flow_eval_mask",
-    ) -> Dict[str, Tensor]:
-        map_feature = self.encode_map(tokenized_map)
-        return self.build_anchor_context_from_map_feature(
-            map_feature=map_feature,
-            tokenized_agent=tokenized_agent,
-            anchor_mask_key=anchor_mask_key,
         )
 
     def forward(
@@ -163,124 +139,63 @@ class SMARTFlowDecoder(nn.Module):
             map_feature=map_feature,
         )
 
-    def prepare_training_rollout_cache(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-    ) -> Dict[str, object]:
-        """self-forced 학습에서 gradient를 유지한 rollout cache를 만듭니다.
-
-        Args:
-            tokenized_agent: 평가 모드 기준 agent token 사전입니다.
-            map_feature: 현재 decoder가 만든 map feature입니다.
-
-        Returns:
-            Dict[str, object]: N초 self-rollout에 사용할 초기 cache입니다.
-        """
-        return self.agent_encoder.prepare_training_rollout_cache(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-        )
-
     def rollout_from_cache(
         self,
         rollout_cache: Dict[str, object],
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
-        return_flow_2s_preview: bool = False,
-        rollout_steps_2hz: int | None = None,
+        max_steps: int | None = None,
+        warm_coarse_steps: int = 0,
+        share_noise_across_time: bool = False,
+        noise_tape_override: Tensor | None = None,
+        return_per_step_x1: bool = False,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
-            return_flow_2s_preview=return_flow_2s_preview,
-            rollout_steps_2hz=rollout_steps_2hz,
+            max_steps=max_steps,
+            warm_coarse_steps=warm_coarse_steps,
+            share_noise_across_time=share_noise_across_time,
+            noise_tape_override=noise_tape_override,
+            return_per_step_x1=return_per_step_x1,
         )
 
-    def training_rollout_from_cache(
+    def rollout_from_cache_no_grad(
         self,
         rollout_cache: Dict[str, object],
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
-        rollout_steps_2hz: int | None = None,
-        self_forced_epoch: int | None = None,
-        detach_block_transition: bool = False,
-        use_stop_motion: bool | None = None,
     ) -> Dict[str, Tensor]:
-        """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
-
-        Args:
-            rollout_cache: ``prepare_training_rollout_cache`` 가 만든 초기 상태입니다.
-            tokenized_agent: 평가 모드 기준 agent token 사전입니다.
-            map_feature: 현재 decoder가 만든 map feature입니다.
-            sampling_scheme: flow sampling 설정입니다.
-            sampling_seed: batch 공통 seed입니다.
-            scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
-            rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 평가 길이를 실행합니다.
-            use_stop_motion: self-forced 학습 rollout 전용 stop-motion 사용 여부입니다.
-
-        Returns:
-            Dict[str, Tensor]: committed self-rollout 결과입니다.
-        """
-        return self.agent_encoder.training_rollout_from_cache(
+        return self.agent_encoder.rollout_from_cache_no_grad(
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
-            rollout_steps_2hz=rollout_steps_2hz,
-            self_forced_epoch=self_forced_epoch,
-            detach_block_transition=detach_block_transition,
-            use_stop_motion=use_stop_motion,
         )
-
-    def path_flow_velocity_for_anchor0(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        path_noisy_norm: Tensor,
-        tau: Tensor,
-        anchor_mask: Tensor,
-    ) -> Dict[str, Tensor]:
-        """첫 flow anchor의 noisy N초 path에 대한 velocity와 clean estimate를 계산합니다.
-
-        Args:
-            tokenized_agent: 평가 모드 기준 agent token 사전입니다.
-            map_feature: 이 decoder가 직접 만든 map feature입니다.
-            path_noisy_norm: noisy path입니다. shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
-            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
-
-        Returns:
-            Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
-        """
-        return self.agent_encoder.path_flow_velocity_for_anchor0(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            path_noisy_norm=path_noisy_norm,
-            tau=tau,
-            anchor_mask=anchor_mask,
-        )
-
 
     def sample_open_loop_future(
         self,
         anchor_hidden: Tensor,
         anchor_mask: Tensor,
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig,
         sampling_seed: int | None = None,
-        backprop_last_k: int | None = None,
+        agent_type: Tensor | None = None,
+        v_init: Tensor | None = None,
+        delta_init: Tensor | None = None,
+        current_control: Tensor | None = None,
+        current_control_valid: Tensor | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -289,8 +204,13 @@ class SMARTFlowDecoder(nn.Module):
                 shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
             anchor_mask: 실제로 평가할 anchor 여부입니다.
                 shape은 ``[n_agent, 13]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
-            sampling_seed: validation마다 같은 샘플을 만들기 위한 고정 seed입니다.
+            sampling_noise: 평가 시 샘플링 초기 잡음 설정입니다.
+            sampling_seed: 평가마다 같은 샘플을 만들기 위한 고정 seed입니다.
+            agent_type: 유효 anchor의 agent type입니다. shape ``[n_valid_anchor]``.
+            current_control: 유효 anchor의 직전 body-frame control입니다.
+                shape은 ``[n_valid_anchor, 3]`` 입니다.
+            current_control_valid: 위 control의 신뢰도 마스크입니다.
+                shape은 ``[n_valid_anchor]`` 입니다.
 
         Returns:
             Tensor: 생성된 정규화 2초 미래입니다.
@@ -299,16 +219,20 @@ class SMARTFlowDecoder(nn.Module):
         return self.agent_encoder.sample_open_loop_future(
             anchor_hidden=anchor_hidden,
             anchor_mask=anchor_mask,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
-            backprop_last_k=backprop_last_k,
+            agent_type=agent_type,
+            v_init=v_init,
+            delta_init=delta_init,
+            current_control=current_control,
+            current_control_valid=current_control_valid,
         )
 
     def inference(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-        sampling_scheme: DictConfig,
+        sampling_noise: DictConfig,
     ) -> Dict[str, Tensor]:
         map_feature = self.encode_map(tokenized_map)
         rollout_cache = self.prepare_inference_cache(tokenized_agent, map_feature)
@@ -316,5 +240,5 @@ class SMARTFlowDecoder(nn.Module):
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
         )
