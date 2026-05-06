@@ -1314,44 +1314,58 @@ class SMARTFlow(LightningModule):
                     )
 
                 # ── 2e. Optional GT FM regularization ────────────────────────
-                # ``flow_decoder`` 는 정확히 ``flow_window_steps`` 길이의 future
-                # tensor 를 요구한다.  anchor 슬라이스 GT 가 이보다 짧으면
-                # ``data["agent"]["position"]`` 의 raw 10Hz 에서 anchor 다음
-                # ``flow_window_steps`` 만큼 잘라 정규화한다.
+                # velocity_head 가 GT 분포에서 drift 하지 않도록 anchor 별로 reverse FM
+                # loss 를 함께 흘립니다.  Consistency target 종류 (OL/GT) 와 무관하게
+                # 항상 GT 궤적을 기준으로 동작합니다.
+                #   - ``flow_decoder`` 는 ``flow_window_steps`` 길이를 강제하므로 anchor
+                #     이후 raw 10Hz GT 를 그만큼 잘라 anchor-local 4ch 로 정규화합니다.
+                #   - ``data["agent"]["valid_mask"]`` 로 학습창 전체가 유효한 agent 만
+                #     사용해 invalid timestep 노이즈를 제거합니다.
+                #   - sequence 끝(91 step) 근처 anchor 는 raw GT 가 부족해 자동 skip.
                 fm_reg_anchor: Tensor | None = None
-                if fm_reg_lambda > 0.0 and use_gt_target and tgt_valid is not None:
+                if fm_reg_lambda > 0.0:
                     flow_win = int(getattr(agent_enc, "flow_window_steps", 20))
                     fine_start = anchor_idx * shift + 1
                     fine_end = fine_start + flow_win
-                    # data 는 HeteroData/Batch 또는 dict — 둘 다 ``data["agent"][...]``
-                    # 인덱싱은 동작하므로 try/except 로 안전하게 추출.
                     try:
                         raw_pos = data["agent"]["position"]
                         raw_head = data["agent"]["heading"]
+                        raw_valid = data["agent"]["valid_mask"]
                     except (KeyError, TypeError, AttributeError):
-                        raw_pos = None
-                        raw_head = None
+                        raw_pos = raw_head = raw_valid = None
+
                     if (
                         raw_pos is not None
                         and raw_head is not None
+                        and raw_valid is not None
                         and raw_pos.shape[1] >= fine_end
                     ):
-                        fm_pos = raw_pos[active_mask, fine_start:fine_end, :2]
-                        fm_head = raw_head[active_mask, fine_start:fine_end]
-                        gt_norm_fm = self._world_traj_to_flow_norm(
-                            fm_pos, fm_head, current_pos_active, current_head_active,
-                        ).detach()
-                        fm_sample = flow_ode.sample(gt_norm_fm, target_type="velocity") if hasattr(flow_ode, "sample") else None
-                        if fm_sample is not None:
-                            v_pred = agent_enc.flow_decoder(
-                                active_hidden, fm_sample.x_t, fm_sample.tau,
+                        # active_mask: 현재 anchor 시점에 유효한 agent.
+                        # 그 중에서 ``[fine_start:fine_end]`` 가 모두 valid 한 agent 만 사용.
+                        win_valid = raw_valid[active_mask, fine_start:fine_end]
+                        fm_active = win_valid.all(dim=1)
+                        if bool(fm_active.any()):
+                            sub = active_mask.nonzero(as_tuple=True)[0][fm_active]
+                            fm_pos = raw_pos[sub, fine_start:fine_end, :2]
+                            fm_head = raw_head[sub, fine_start:fine_end]
+                            gt_norm_fm = self._world_traj_to_flow_norm(
+                                fm_pos, fm_head,
+                                current_pos_active[fm_active],
+                                current_head_active[fm_active],
+                            ).detach()
+                            fm_sample = (
+                                flow_ode.sample(gt_norm_fm, target_type="velocity")
+                                if hasattr(flow_ode, "sample") else None
                             )
-                            fm_reg_anchor = fm_reg_lambda * F.mse_loss(v_pred, fm_sample.target)
-                    else:
-                        log.warning(
-                            f"[ocsc_ft] FM reg skipped at anchor {anchor_idx}: "
-                            f"raw GT shorter than flow_window_steps={flow_win}"
-                        )
+                            if fm_sample is not None:
+                                v_pred = agent_enc.flow_decoder(
+                                    active_hidden[fm_active],
+                                    fm_sample.x_t,
+                                    fm_sample.tau,
+                                )
+                                fm_reg_anchor = fm_reg_lambda * F.mse_loss(
+                                    v_pred, fm_sample.target,
+                                )
 
                 if anchor_loss is not None:
                     if fm_reg_anchor is not None:
