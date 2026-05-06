@@ -1216,7 +1216,24 @@ class SMARTFlow(LightningModule):
                             agent_enc.flow_decoder = _orig_flow_decoder
 
                 # ── 2d. Closed-loop rollout(s) ───────────────────────────────
-                T_target = int(tgt_norms[0].shape[1]) if tgt_norms else 0
+                # T_compare: OL/CL 비교에 쓸 fine-step (or 2Hz step) 길이.
+                #   GT-target: 양쪽 모두 2Hz, T = min(T_GT, pred_steps).
+                #   OL-target: 양쪽 모두 10Hz, T = min(T_OL, pred_steps * shift).
+                # OL 은 ``flow_window_steps`` (e.g. 20) fine-step, CL 은 actual
+                # ``pred_steps * shift`` fine-step (e.g. 10) — 짧은 쪽으로 자른다.
+                if tgt_norms:
+                    T_tgt_raw = int(tgt_norms[0].shape[1])
+                    if use_gt_target:
+                        T_compare = min(T_tgt_raw, pred_steps)
+                    else:
+                        T_compare = min(T_tgt_raw, pred_steps * shift)
+                    if T_compare < T_tgt_raw:
+                        tgt_norms = [t[..., :T_compare, :] for t in tgt_norms]
+                        if tgt_valid is not None and tgt_valid.dim() >= 2:
+                            tgt_valid = tgt_valid[..., :T_compare]
+                else:
+                    T_compare = 0
+                T_target = T_compare
 
                 def _cl_norm_from_out(cl_out: dict) -> Tensor:
                     cl_traj_10hz = cl_out["pred_traj_10hz"]
@@ -1297,17 +1314,38 @@ class SMARTFlow(LightningModule):
                     )
 
                 # ── 2e. Optional GT FM regularization ────────────────────────
+                # ``flow_decoder`` 는 정확히 ``flow_window_steps`` 길이의 future
+                # tensor 를 요구한다.  anchor 슬라이스 GT 가 이보다 짧으면
+                # ``data["agent"]["position"]`` 의 raw 10Hz 에서 anchor 다음
+                # ``flow_window_steps`` 만큼 잘라 정규화한다.
                 fm_reg_anchor: Tensor | None = None
                 if fm_reg_lambda > 0.0 and use_gt_target and tgt_valid is not None:
-                    # GT 궤적 자체에 FM loss 를 걸어 velocity_head 가 GT 에서 drift 하지
-                    # 않도록 anchor 함께 정규화한다.  detach 된 tgt 에 대한 reverse FM.
-                    gt_norm = tgt_norms[0]
-                    fm_sample = flow_ode.sample(gt_norm, target_type="velocity") if hasattr(flow_ode, "sample") else None
-                    if fm_sample is not None:
-                        v_pred = agent_enc.flow_decoder(
-                            active_hidden, fm_sample.x_t, fm_sample.tau,
+                    flow_win = int(getattr(agent_enc, "flow_window_steps", 20))
+                    fine_start = anchor_idx * shift + 1
+                    fine_end = fine_start + flow_win
+                    raw_pos = data.get("agent", {}).get("position") if isinstance(data, dict) else None
+                    raw_head = data.get("agent", {}).get("heading") if isinstance(data, dict) else None
+                    if (
+                        raw_pos is not None
+                        and raw_head is not None
+                        and raw_pos.shape[1] >= fine_end
+                    ):
+                        fm_pos = raw_pos[active_mask, fine_start:fine_end, :2]
+                        fm_head = raw_head[active_mask, fine_start:fine_end]
+                        gt_norm_fm = self._world_traj_to_flow_norm(
+                            fm_pos, fm_head, current_pos_active, current_head_active,
+                        ).detach()
+                        fm_sample = flow_ode.sample(gt_norm_fm, target_type="velocity") if hasattr(flow_ode, "sample") else None
+                        if fm_sample is not None:
+                            v_pred = agent_enc.flow_decoder(
+                                active_hidden, fm_sample.x_t, fm_sample.tau,
+                            )
+                            fm_reg_anchor = fm_reg_lambda * F.mse_loss(v_pred, fm_sample.target)
+                    else:
+                        log.warning(
+                            f"[ocsc_ft] FM reg skipped at anchor {anchor_idx}: "
+                            f"raw GT shorter than flow_window_steps={flow_win}"
                         )
-                        fm_reg_anchor = fm_reg_lambda * F.mse_loss(v_pred, fm_sample.target)
 
                 if anchor_loss is not None:
                     if fm_reg_anchor is not None:
