@@ -36,28 +36,6 @@ from src.smart.modules.draft_physics import (
     DRAFT_PHYSICS_COMPONENT_KEYS,
     DraftPhysicsRegularizer,
 )
-from src.smart.modules.self_forced_path_flow import (
-    build_anchor0_normalized_committed_path,
-    build_anchor0_physics_inputs,
-    get_anchor0_valid_mask,
-    masked_mean_square_loss,
-)
-from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
-from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
-from src.smart.modules.self_forced_update_separation import (
-    assert_no_module_gradients,
-    clear_module_gradients,
-    detach_tensor_tree,
-    module_gradients_disabled,
-)
-from src.smart.modules.self_forced_estimator_warmup import (
-    is_self_forced_estimator_warmup_epoch,
-    resolve_self_forced_estimator_warmup_epochs,
-)
-from src.smart.modules.self_forced_trainable_range import (
-    apply_self_forced_unfrozen_range,
-    resolve_self_forced_unfrozen_range,
-)
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -1843,20 +1821,11 @@ class SMARTFlow(LightningModule):
 
 
 
-    def _copy_online_generator_to_ema(self) -> None:
-        """현재 online Generator weight를 EMA Generator에 그대로 복사합니다."""
-        if self.self_forced_generator_ema is None:
-            return
-        self.self_forced_generator_ema.load_state_dict(self.encoder.state_dict())
-        self.self_forced_generator_ema.requires_grad_(False)
-        self.self_forced_generator_ema.eval()
 
 
 
     def _get_eval_generator(self) -> SMARTFlowDecoder:
         """validation/test에서 사용할 Generator를 반환합니다."""
-        if self._is_self_forced_generator_ema_ready():
-            return self.self_forced_generator_ema
         return self.encoder
 
 
@@ -2006,131 +1975,11 @@ class SMARTFlow(LightningModule):
         return tokenized_map, tokenized_agent
 
 
-    def _sample_flow_state_from_clean(self, clean_path_norm: Tensor):
-        """현재 Generator의 flow path 규칙으로 전체 tau 구간의 noisy path를 만듭니다.
-
-        Args:
-            clean_path_norm: clean path입니다. shape은 ``[n_agent_valid, F_win, 4]`` 입니다.
-
-        Returns:
-            FlowSample: ``x_t``, ``target``, ``tau`` 를 담은 flow sample입니다.
-                tau는 rollout을 만들 때 사용한 random terminal step과 무관하게
-                flow ODE의 기본 전체 구간에서 새로 뽑힙니다.
-        """
-        return self.encoder.agent_encoder.flow_ode.sample(
-            clean_path_norm,
-            target_type="velocity",
-        )
-
-    def _predict_path_flow_clean_estimate(
-        self,
-        decoder: SMARTFlowDecoder,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        noisy_path_norm: Tensor,
-        tau: Tensor,
-        anchor_mask: Tensor,
-    ) -> Dict[str, Tensor]:
-        """주어진 decoder가 noisy N초 path를 어떻게 clean path로 보는지 계산합니다.
-
-        Args:
-            decoder: ``F_rho`` 또는 ``F_psi`` 역할의 decoder입니다.
-            tokenized_map: 평가 모드 map token 사전입니다.
-            tokenized_agent: 평가 모드 agent token 사전입니다.
-            noisy_path_norm: noisy path입니다. shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
-            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
-
-        Returns:
-            Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
-        """
-        map_feature = decoder.encode_map(tokenized_map)
-        return decoder.path_flow_velocity_for_anchor0(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            path_noisy_norm=noisy_path_norm,
-            tau=tau,
-            anchor_mask=anchor_mask,
-        )
 
 
 
 
-    def _update_generated_path_flow_estimator(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        committed_path_norm: Tensor,
-        anchor_mask: Tensor,
-    ) -> Tensor:
-        """detached self-rollout으로 generated estimator F_psi를 online 업데이트합니다.
 
-        Args:
-            tokenized_map: 평가 모드 map token 사전입니다.
-            tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 N초 path입니다.
-                shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
-                shape은 ``[n_agent]`` 입니다.
-
-        Returns:
-            Tensor: 마지막 estimator update의 flow matching loss입니다.
-
-        Notes:
-            noising tau는 random terminal N과 독립적으로 전체 tau 구간에서 샘플링합니다.
-        """
-        if self.self_forced_generated_estimator is None:
-            raise RuntimeError("self_forced_generated_estimator is not initialized.")
-        if self.self_forced_target_teacher is None:
-            raise RuntimeError("self_forced_target_teacher is not initialized.")
-
-        optimizer = self.optimizers()[1]
-        last_loss = committed_path_norm.new_zeros(())
-        clean_path = committed_path_norm.detach().clone()
-        estimator_tokenized_map = detach_tensor_tree(tokenized_map)
-        estimator_tokenized_agent = detach_tensor_tree(tokenized_agent)
-        estimator_anchor_mask = anchor_mask.detach()
-
-        self.toggle_optimizer(optimizer)
-        self.self_forced_target_teacher.eval()
-        self.self_forced_generated_estimator.train()
-        try:
-            with module_gradients_disabled(self.encoder, self.self_forced_target_teacher):
-                for _ in range(self.self_forced_estimator_updates_per_step):
-                    optimizer.zero_grad(set_to_none=True)
-                    self._prepare_self_forced_estimator_backward_boundary()
-                    with torch.no_grad():
-                        flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
-                            clean_path,
-                            target_type="velocity",
-                        )
-                    noisy_path_norm = flow_sample.x_t.detach()
-                    tau = flow_sample.tau.detach()
-                    flow_target = flow_sample.target.detach()
-                    pred_dict = self._predict_path_flow_clean_estimate(
-                        decoder=self.self_forced_generated_estimator,
-                        tokenized_map=estimator_tokenized_map,
-                        tokenized_agent=estimator_tokenized_agent,
-                        noisy_path_norm=noisy_path_norm,
-                        tau=tau,
-                        anchor_mask=estimator_anchor_mask,
-                    )
-                    last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
-                    self._manual_backward_without_autocast(last_loss)
-                    self._assert_self_forced_estimator_update_isolated()
-                    self._clip_and_step_with_optional_scaler(
-                        optimizer,
-                        gradient_clip_val=self.self_forced_gradient_clip_val,
-                        gradient_clip_algorithm="norm",
-                    )
-                    self._clear_self_forced_auxiliary_gradients()
-                    self._clear_self_forced_generator_gradients()
-        finally:
-            self._clear_self_forced_auxiliary_gradients()
-            self._clear_self_forced_generator_gradients()
-            self.untoggle_optimizer(optimizer)
-            self._set_self_forced_auxiliary_modes()
-        return last_loss.detach()
 
 
 
@@ -2615,7 +2464,6 @@ open_metric_dict:
         raise RuntimeError(
             "Detected non-finite gradient after backward: "
             f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
-            f"{self._format_self_forced_backward_context()}"
         )
 
     def validation_step(self, data, batch_idx):
