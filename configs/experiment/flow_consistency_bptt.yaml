@@ -8,11 +8,13 @@
 #      - 4-channel anchor-local normalized space 에서 consistency loss 계산.
 #   2. ``finetune.enabled=true`` + ``finetune.mode=ocsc_ft`` 가 OCSC 진입점.
 #
-# 기본 freeze 정책 (set_model_for_finetuning):
-#   - 모든 파라미터 freeze.
-#   - flow_decoder.step_refiner, flow_decoder.velocity_head 만 학습.
-#   - ``finetune.flow_velocity_head_only=true``  → velocity_head 만 학습 (다른 head 도 freeze).
-#   - ``finetune.train_full_flow_decoder_only=true`` → 전체 flow_decoder 학습.
+# 기본 설정 = fix-hard-rmm production 프리셋:
+#   - GT-target consistency, relative-displacement weight=1.
+#   - Frozen pretrained reference decoder 로 OL 생성.
+#   - velocity_head 만 학습 (다른 head 모두 freeze).
+#   - BPTT use_adjoint + last_coarse_only (메모리 ↓).
+#   - GT FM regularization λ=0.1 (velocity_head drift 방지).
+#   - validation 은 hard RMM (PyTorch in-process).
 
 defaults:
   - override /model: smart_flow
@@ -26,53 +28,54 @@ model:
     lr_total_steps: -1
     lr_min_ratio: 0.1
     weight_decay: 1e-4
-    n_rollout_closed_val: 4
-    n_batch_sim_agents_metric: 2
-    n_vis_batch: 1
-    n_vis_scenario: 2
-    n_vis_rollout: 4
+    n_rollout_closed_val: 16
+    n_batch_sim_agents_metric: 10000
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
     val_open_loop: true
     val_closed_loop: true
     # validation 시 RMM backend.  "real"=공식 TF (정확), "hard"=PyTorch (빠름).
     validation_metric: hard
+    decoder:
+      flow_solver_method: euler
+      flow_solver_steps: 16
     finetune:
       enabled: true
       # OCSC fine-tuning 모드.  smart_flow.py 의 ``_is_ocsc_ft_enabled()`` 가
       # 이 값을 검사해 ``_training_step_ocsc_ft`` 로 라우팅한다.
       mode: ocsc_ft
 
-      # ── Freeze 정책 ────────────────────────────────────────────────────
-      # set_model_for_finetuning 의 기본: step_refiner + velocity_head 학습.
-      # 아래 둘 중 하나만 동시에 사용 (둘 다 false 면 default).
+      # ── Freeze 정책 (둘 중 하나만 동시에 사용; 둘 다 false 면 default) ─────
       train_full_flow_decoder_only: false
-      flow_velocity_head_only: false
+      flow_velocity_head_only: true
 
       # ── OCSC 핵심 파라미터 ─────────────────────────────────────────────
-      ocsc_n_rollouts: 2                  # 시나리오당 closed-loop rollout 수 (>=2: MMD 사용 가능).
-      ocsc_anchor_stride: 4               # 매 N번째 2Hz step 만 anchor 로 사용.
-      ocsc_pred_max_steps: 4              # closed-loop coarse step 수 (×0.5s).
-      ocsc_loss_type: l2                  # "l2" / "smooth_l1" / "l1"
-      ocsc_use_mmd: true                  # true=proper MMD², false=paired L2.
-      ocsc_gt_target: false               # true=GT consistency, false=open-loop sample.
-      ocsc_position_weight: 1.0
-      ocsc_rel_disp_weight: 0.0
+      ocsc_n_rollouts: 4                   # 시나리오당 closed-loop rollout 수.
+      ocsc_anchor_stride: 1                # 매 N번째 2Hz step 만 anchor 로 사용.
+      ocsc_pred_max_steps: 2               # closed-loop coarse step 수 (×0.5s).
+      ocsc_loss_type: l2                   # "l2" / "smooth_l1" / "l1"
+      ocsc_use_mmd: false                  # true=proper MMD², false=paired L2.
+      ocsc_gt_target: true                 # true=GT consistency, false=open-loop sample.
+      ocsc_position_weight: 0.0
+      ocsc_rel_disp_weight: 1.0
       ocsc_heading_weight: 0.0
       # OL/CL noise 공유 옵션
-      ocsc_share_noise_tape: true         # OL/CL 이 같은 noise tape 공유 (deterministic pairing).
-      ocsc_share_noise_across_time: false # 동일 z[4] 를 시간축으로 expand (variance ↓).
-      # frozen reference policy 로 OL 생성 (train 중 OL 가 달라지지 않도록).
-      ocsc_use_pretrained_ref: false
+      ocsc_share_noise_tape: true          # OL/CL 이 같은 noise tape 공유.
+      ocsc_share_noise_across_time: false  # 동일 z[4] 를 시간축으로 expand.
+      # frozen reference policy 로 OL 생성 (학습 중 OL drift 방지).
+      ocsc_use_pretrained_ref: true
       # GT FM regularization (ocsc_gt_target=true 일 때만 의미 있음).
-      ocsc_fm_reg_lambda: 0.0
+      ocsc_fm_reg_lambda: 0.1
 
       # ── BPTT 메모리 / 속도 토글 ────────────────────────────────────────
-      bptt_use_adjoint: false             # flow_ode model_fn 에 ckpt 적용.
-      bptt_last_n_solver_steps: 0         # 마지막 N solver step 만 velocity grad (0=비활성).
-      bptt_warm_coarse_steps: 0           # 앞 N coarse step 을 no_grad 로.
-      bptt_last_coarse_only: false        # true → warm = pred_max_steps - 1.
-      bptt_last_n_coarse_steps: 0         # 마지막 N coarse step 만 grad (0=비활성).
-      bptt_grad_clip_traj: 1.0            # closed-loop traj L2 norm clip (0=비활성).
-      bptt_sequential_rollouts: false     # G rollout 을 순차 backward (manual opt).
+      bptt_use_adjoint: true               # flow_ode model_fn 에 ckpt 적용.
+      bptt_last_n_solver_steps: 0          # 마지막 N solver step 만 velocity grad (0=비활성).
+      bptt_warm_coarse_steps: 0            # 앞 N coarse step 을 no_grad 로.
+      bptt_last_coarse_only: true          # true → warm = pred_max_steps - 1.
+      bptt_last_n_coarse_steps: 0          # 마지막 N coarse step 만 grad (0=비활성).
+      bptt_grad_clip_traj: 0.0             # closed-loop traj L2 norm clip (0=비활성).
+      bptt_sequential_rollouts: false      # G rollout 을 순차 backward (manual opt).
 
       # ── HardRMM 모니터링 (선택) ───────────────────────────────────────
       # true 면 detached CL 궤적으로 매 N step 마다 RMM 계산해 wandb 로깅.
@@ -84,13 +87,14 @@ ckpt_path: null
 trainer:
   limit_train_batches: 1.0
   limit_val_batches: 0.01
-  check_val_every_n_epoch: null
-  val_check_interval: 500
-  max_epochs: 10
+  check_val_every_n_epoch: 1
+  val_check_interval: 200
+  max_epochs: 20
   log_every_n_steps: 1
   precision: 32-true
-  gradient_clip_val: 0
+  gradient_clip_val: 1.0
   sync_batchnorm: false
+  deterministic: true
 
 callbacks:
   model_checkpoint:
@@ -99,8 +103,11 @@ callbacks:
     save_top_k: -1
 
 data:
-  train_batch_size: 16
-  val_batch_size: 4
-  num_workers: 4
-  prefetch_factor: 1
+  train_batch_size: 8
+  val_batch_size: 16
+  num_workers: 12
+  prefetch_factor: 8
+  persistent_workers: true
+  pin_memory: true
+  shuffle: false
   train_use_val_transform: true
