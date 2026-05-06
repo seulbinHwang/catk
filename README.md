@@ -870,6 +870,7 @@ DRaFT inverse feasibility fine-tuning을 돌릴 때 쓰는 preset과 launcher입
 - launcher 파일: `scripts/launch_finetune_draft_v100x3x5_static_pods.py`
 - 총 DDP rank: `5 nodes * 3 GPUs = 15`
 - physics 설정: `soft_limit_ratio=1.0`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=false`
+- DRaFT weight: `draft.max_weight=0.15`
 - 기본 per-GPU `train_batch_size=24`, `val_batch_size=2`
 
 이 launcher는 pod를 만들거나 지우지 않습니다. 이미 떠 있는 pod 안에 `kubectl exec`로 들어가 tmux 세션만 시작하거나 종료합니다.

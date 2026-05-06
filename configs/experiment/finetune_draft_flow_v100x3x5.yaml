@@ -36,6 +36,7 @@ model:
     draft:
       enabled: true
       loss_enabled: true
+      max_weight: 0.15
       physics:
         use_slip_penalty: false
         commit_loss_weight: 1.0
