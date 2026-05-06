@@ -1088,7 +1088,7 @@ testsv testsvv testsvvv testsvvvv sv svv svvv svvvv
 - `model.model_config.lr=1.0e-6`
 - `model.model_config.self_forced.estimator_warmup_epochs=0`
 - `model.model_config.self_forced.use_stop_motion=false`
-- `data.train_batch_size=4`, OOM 시 launcher가 모든 pod의 attempt status를 모아 `4 -> 3 -> 2` 순서로 함께 낮춤
+- `data.train_batch_size=3`, OOM 시 launcher가 OOM status를 즉시 공유해 멈춘 local `torchrun`을 정리하고 `3 -> 2` 순서로 함께 낮춤
 - `data.val_batch_size=2`, `model.model_config.scorer_scene_num=320`
 
 pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
@@ -1120,7 +1120,7 @@ python scripts/launch_self_forced_v100x4x8_static_pods.py \
   --limit-train-batches 20 \
   --limit-val-batches 0 \
   --max-epochs 1 \
-  --task-name flow_self_forced_v100x4x8_stopfalse_warmup0_lr1e-6_bs4_smoke
+  --task-name flow_self_forced_v100x4x8_stopfalse_warmup0_lr1e-6_bs3_smoke
 ```
 
 attach:

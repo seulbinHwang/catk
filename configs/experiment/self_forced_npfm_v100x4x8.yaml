@@ -36,12 +36,12 @@ model:
     scorer_scene_num: 320
     self_forced:
       use_stop_motion: false
-      estimator_warmup_epochs: 1
+      estimator_warmup_epochs: 0
 
 data:
   # V100 32GB self-forced runs have a much tighter memory envelope than H100.
   # Start conservatively; the launcher can step down on OOM.
-  train_batch_size: 4
+  train_batch_size: 3
   val_batch_size: 2
   test_batch_size: 2
   num_workers: 4

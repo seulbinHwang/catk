@@ -42,7 +42,7 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 DEFAULT_TASK_NAME = (
     "flow_self_forced_v100x4x8_"
-    "use_stop_motion_false_estimator_warmup_0_lr1e-6_bs4"
+    "use_stop_motion_false_estimator_warmup_0_lr1e-6_bs3"
 )
 DEFAULT_SESSION = "catk-sf-v100x4x8-stopfalse-warmup0"
 
@@ -431,6 +431,10 @@ wait_for_attempt_statuses() {{
   local timeout_sec="${{RETRY_BARRIER_TIMEOUT_SEC:-1200}}"
   local count=0
   while true; do
+    if global_attempt_has_oom; then
+      echo "[self-forced-v100x4x8] OOM status observed for attempt $attempt; skipping full status barrier"
+      return 0
+    fi
     count="$(retry_sync_get "count/$attempt_tag" 2>/dev/null | tr -d '[:space:]')"
     count="${{count:-0}}"
     if (( count >= NNODES )); then
@@ -451,6 +455,65 @@ global_attempt_has_oom() {{
 
 global_attempt_has_failure() {{
   retry_sync_get "aggregate/$attempt_tag" 2>/dev/null | grep -q '^failure=1$'
+}}
+
+terminate_process_group() {{
+  local pgid="$1"
+  if [[ -z "$pgid" || "$pgid" == "0" ]]; then
+    return 0
+  fi
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  sleep "${{OOM_WATCH_KILL_GRACE_SEC:-20}}"
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+}}
+
+run_torchrun_attempt() {{
+  local torch_status_file="$RUN_ROOT/$(hostname).${{attempt_tag}}.torchrun_status"
+  local torch_pgid_file="$RUN_ROOT/$(hostname).${{attempt_tag}}.torchrun_pgid"
+  local oom_watch_file="$RUN_ROOT/$(hostname).${{attempt_tag}}.remote_oom_watch"
+  local tee_pid=""
+  local watch_pid=""
+  local pgid=""
+  local status="1"
+
+  rm -f "$torch_status_file" "$torch_pgid_file" "$oom_watch_file"
+
+  (
+    set +e
+    setsid bash -c 'pgid_file="$1"; shift; echo "$$" > "$pgid_file"; exec "$@"' \
+      bash "$torch_pgid_file" torchrun "${{torchrun_args[@]}}"
+    echo "$?" > "$torch_status_file"
+  ) 2>&1 | tee "$attempt_log" &
+  tee_pid=$!
+
+  (
+    set +e
+    while kill -0 "$tee_pid" 2>/dev/null; do
+      if global_attempt_has_oom; then
+        echo "[self-forced-v100x4x8] remote OOM observed for $attempt_tag; terminating local torchrun group"
+        pgid="$(cat "$torch_pgid_file" 2>/dev/null || true)"
+        terminate_process_group "$pgid"
+        touch "$oom_watch_file"
+        exit 0
+      fi
+      sleep "${{OOM_WATCH_INTERVAL_SEC:-5}}"
+    done
+  ) &
+  watch_pid=$!
+
+  wait "$tee_pid"
+  if [[ -n "$watch_pid" ]]; then
+    kill "$watch_pid" 2>/dev/null || true
+    wait "$watch_pid" 2>/dev/null || true
+  fi
+
+  if [[ -f "$torch_status_file" ]]; then
+    status="$(cat "$torch_status_file" 2>/dev/null || echo 1)"
+  fi
+  if [[ -f "$oom_watch_file" && "$status" == "0" ]]; then
+    status="1"
+  fi
+  return "$status"
 }}
 
 start_retry_sync_server
@@ -530,10 +593,13 @@ while (( bs >= MIN_BS )); do
   printf ' %q' "${{torchrun_args[@]}}"
   printf '\\n'
 
-  torchrun "${{torchrun_args[@]}}" 2>&1 | tee "$attempt_log"
-  status=${{PIPESTATUS[0]}}
+  run_torchrun_attempt
+  status=$?
   local_oom=0
   if grep -Eq "$OOM_REGEX" "$attempt_log" 2>/dev/null; then
+    local_oom=1
+  fi
+  if [[ -f "$RUN_ROOT/$(hostname).${{attempt_tag}}.remote_oom_watch" ]]; then
     local_oom=1
   fi
   write_attempt_status "$status" "$local_oom"
@@ -551,6 +617,7 @@ while (( bs >= MIN_BS )); do
   if global_attempt_has_oom; then
     next_bs=$(( bs - OOM_STEP ))
     echo "[self-forced-v100x4x8] OOM detected on at least one node in attempt $attempt; all nodes lowering bs $bs -> $next_bs"
+    sleep "${{OOM_RETRY_RESTART_GRACE_SEC:-10}}"
     bs="$next_bs"
     continue
   fi
@@ -636,7 +703,7 @@ cat > {shq(monitor_file)} <<'CATK_MONITOR'
 CATK_MONITOR
 chmod +x {shq(monitor_file)}
 tmux split-window -v -l 12 -t {shq(args.session)} {shq(monitor_file)}
-tmux select-pane -t {shq(args.session)}:0.0
+tmux select-pane -t {shq(args.session)}
 """
 
     return f"""set -Eeuo pipefail
@@ -658,7 +725,7 @@ CATK_WORKER
 chmod +x {shq(worker_file)}
 : > {shq(tmux_log)}
 tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(worker_file)}
-tmux pipe-pane -t {shq(args.session)}:0.0 -o {shq('cat >> ' + shq(tmux_log))}
+tmux pipe-pane -t {shq(args.session)} -o {shq('cat >> ' + shq(tmux_log))}
 {monitor_block}
 echo "[launcher] started {args.session} on {pod}"
 echo "[launcher] tmux log: {tmux_log}"
@@ -729,7 +796,7 @@ def parse_args() -> argparse.Namespace:
         help="Rank-0 pod HTTP port used to collect retry status from all pods.",
     )
     parser.add_argument("--nproc-per-node", type=int, default=4)
-    parser.add_argument("--initial-bs", type=int, default=4)
+    parser.add_argument("--initial-bs", type=int, default=3)
     parser.add_argument("--oom-step", type=int, default=1)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--val-batch-size", type=int, default=2)
