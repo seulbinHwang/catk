@@ -939,8 +939,23 @@ class SMARTFlow(LightningModule):
         _orig_flow_decoder = agent_enc.flow_decoder
         ref_decoder = getattr(self, "ref_flow_decoder", None) if use_pretrained_ref else None
 
+        # ── Optional: anchor-batched cache build (encoder forward N_anchor → 1) ──
+        batched_cache_build = bool(getattr(cfg, "bptt_batched_cache_build", False))
+        precomputed_anchor_caches: list[Dict[str, object]] | None = None
+        if batched_cache_build and len(all_anchor_indices) > 1:
+            with torch.no_grad():
+                precomputed_anchor_caches = (
+                    agent_enc.prepare_inference_cache_anchor_batched(
+                        tokenized_agent=tokenized_agent,
+                        map_feature=map_feature,
+                        anchor_indices=list(all_anchor_indices),
+                        step_current_2hz=step_current_2hz,
+                        seq_keys=tuple(seq_keys),
+                    )
+                )
+
         try:
-            for anchor_idx in all_anchor_indices:
+            for anchor_loop_idx, anchor_idx in enumerate(all_anchor_indices):
                 # Sliding window: anchor_idx 시점에서 마지막 ``step_current_2hz`` step
                 # 만 cache 입력으로 사용 (fix-hard-rmm 패턴).  hist_start 가 0 으로
                 # 고정되면 anchor_idx >= step_current_2hz 부터 cache 가 동일해지는
@@ -959,11 +974,14 @@ class SMARTFlow(LightningModule):
                         tokenized_agent_anchor[key] = value
 
                 # ── 2a. Build anchor-local rollout cache ─────────────────────
-                with torch.no_grad():
-                    rollout_cache_anchor = agent_enc.prepare_inference_cache(
-                        tokenized_agent=tokenized_agent_anchor,
-                        map_feature=map_feature,
-                    )
+                if precomputed_anchor_caches is not None:
+                    rollout_cache_anchor = precomputed_anchor_caches[anchor_loop_idx]
+                else:
+                    with torch.no_grad():
+                        rollout_cache_anchor = agent_enc.prepare_inference_cache(
+                            tokenized_agent=tokenized_agent_anchor,
+                            map_feature=map_feature,
+                        )
                 valid_window = rollout_cache_anchor.get("valid_window", None)
                 if valid_window is None:
                     continue

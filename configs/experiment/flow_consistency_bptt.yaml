@@ -82,6 +82,7 @@ model:
 
       # ── BPTT 메모리 / 속도 토글 ────────────────────────────────────────
       bptt_use_adjoint: true               # flow_ode model_fn 에 ckpt 적용.
+      bptt_batched_cache_build: false      # true → anchor 별 prepare_inference_cache 를 한 번의 batched forward 로 압축.
       bptt_last_n_solver_steps: 0          # 마지막 N solver step 만 velocity grad (0=비활성).
       bptt_warm_coarse_steps: 0            # 앞 N coarse step 을 no_grad 로.
       bptt_last_coarse_only: true          # true → warm = pred_max_steps - 1.
