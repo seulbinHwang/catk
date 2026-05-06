@@ -3330,7 +3330,13 @@ class SMARTFlow(LightningModule):
                 if sch is not None:
                     sch.step()
 
-        log_kwargs = dict(on_step=True, on_epoch=True, sync_dist=True)
+        # Lightning auto-extract batch_size 가 PyG HeteroData iterate 에서
+        # NotImplementedError 를 던지므로 batch_size 를 명시적으로 넘긴다.
+        try:
+            _bs = int(data.num_graphs) if hasattr(data, "num_graphs") else 1
+        except Exception:
+            _bs = 1
+        log_kwargs = dict(on_step=True, on_epoch=True, sync_dist=True, batch_size=_bs)
         self.log("train_ocsc/loss", loss.detach(), prog_bar=True, **log_kwargs)
         self.log(
             "train_ocsc/n_valid_anchors",
