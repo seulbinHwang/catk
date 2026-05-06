@@ -101,10 +101,15 @@ class SMARTFlow(LightningModule):
         # OCSC fine-tuning: ``finetune_config`` 는 mode 분기/디스패치 용도이며
         # ``set_model_for_finetuning`` 의 freeze 처리와 별도 책임을 갖습니다.
         self.finetune_config = getattr(model_config, "finetune", None)
+        self.ref_flow_decoder: nn.Module | None = None
+        self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = None
         if self._is_ocsc_ft_enabled():
-            self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc")
-        else:
-            self._ocsc_train_hard_rmm = None
+            self._ocsc_train_hard_rmm = HardSimAgentsMetrics("train_ocsc")
+            # ── ocsc_use_pretrained_ref / flow_velocity_head_only 정합 ──
+            self._configure_ocsc_finetune(model_config.finetune)
+            # ── sequential 모드는 manual optimization 필요 ──
+            if bool(getattr(model_config.finetune, "bptt_sequential_rollouts", False)):
+                self.automatic_optimization = False
 
         self.minADE = minADE()
         self.minADE_predict = minADE()
@@ -971,6 +976,41 @@ class SMARTFlow(LightningModule):
         if cfg is None or not bool(getattr(cfg, "enabled", False)):
             return False
         return str(getattr(cfg, "mode", "")) == "ocsc_ft"
+
+    def _configure_ocsc_finetune(self, finetune_cfg) -> None:
+        """OCSC 특화 freeze / ref decoder 초기화.
+
+        - ``flow_velocity_head_only=True``: ``set_model_for_finetuning`` 이 풀어준 다른
+          파라미터를 다시 freeze 하고 ``flow_decoder.velocity_head`` 만 학습 대상으로 둠.
+        - ``ocsc_use_pretrained_ref=True``: 현재 ``flow_decoder`` 를 deepcopy 해
+          ``self.ref_flow_decoder`` 로 보관 (OL target 생성용 frozen reference).
+
+        Args:
+            finetune_cfg: ``model_config.finetune`` (omegaconf node 또는 dict).
+        """
+        if bool(getattr(finetune_cfg, "flow_velocity_head_only", False)):
+            try:
+                fd = self.encoder.agent_encoder.flow_decoder
+                for p in fd.parameters():
+                    p.requires_grad = False
+                if hasattr(fd, "velocity_head"):
+                    for p in fd.velocity_head.parameters():
+                        p.requires_grad = True
+                    log.info("[ocsc_ft] flow_velocity_head_only: only velocity_head trainable.")
+            except AttributeError:
+                log.warning("[ocsc_ft] flow_velocity_head_only requested but flow_decoder/velocity_head not found.")
+
+        if bool(getattr(finetune_cfg, "ocsc_use_pretrained_ref", False)):
+            try:
+                fd = self.encoder.agent_encoder.flow_decoder
+                ref = copy.deepcopy(fd)
+                for p in ref.parameters():
+                    p.requires_grad = False
+                ref.eval()
+                self.ref_flow_decoder = ref
+                log.info("[ocsc_ft] ocsc_use_pretrained_ref: ref_flow_decoder snapshot taken.")
+            except AttributeError:
+                log.warning("[ocsc_ft] ocsc_use_pretrained_ref requested but flow_decoder not found.")
 
     def _run_flow_ocsc_ft_step(
         self,
@@ -3302,8 +3342,13 @@ class SMARTFlow(LightningModule):
     def _training_step_ocsc_ft(self, data, batch_idx):
         """OCSC (Open-Closed Self-Consistency) 파인튜닝 step.
 
-        토큰화 → ``_run_flow_ocsc_ft_step`` 호출 → 로깅의 단순 wrapper 입니다.
-        실제 알고리즘 로직은 ``_run_flow_ocsc_ft_step`` 내부에 있습니다.
+        Lightning automatic vs. manual optimization 두 모드를 모두 지원합니다.
+
+        - automatic (default, ``bptt_sequential_rollouts=False``): 누적된 단일
+          loss tensor 를 반환하면 Lightning 이 backward + optimizer.step 처리.
+        - manual (``bptt_sequential_rollouts=True``): ``_run_flow_ocsc_ft_step``
+          이 anchor 별 / rollout 별 backward 를 직접 호출.  여기서 optimizer.step
+          + zero_grad + scheduler.step 까지 수행.  반환 값은 logging 전용 placeholder.
 
         Args:
             data: 학습용 장면 batch 입니다.  ``scenario_id`` 와 (optional)
@@ -3312,15 +3357,34 @@ class SMARTFlow(LightningModule):
             batch_idx: 현재 batch 번호 입니다.
 
         Returns:
-            Tensor: logging 용 backward-가능 consistency loss.
+            Tensor: logging 용 loss (manual 모드에서는 detached scalar).
         """
         tokenized_map, tokenized_agent = self.token_processor(data)
+        manual_mode = not getattr(self, "automatic_optimization", True)
+        if manual_mode:
+            opt = self.optimizers()
+            if isinstance(opt, list):
+                opt = opt[0]
+            opt.zero_grad(set_to_none=True)
+
         result = self._run_flow_ocsc_ft_step(
             tokenized_map=tokenized_map,
             tokenized_agent=tokenized_agent,
             data=data,
         )
         loss = result["loss"]
+
+        if manual_mode:
+            # sequential 모드면 _run_flow_ocsc_ft_step 이 이미 backward 한 상태.
+            if not result.get("sequential_backward_done", False):
+                self.manual_backward(loss)
+            opt.step()
+            sch = self.lr_schedulers()
+            if sch is not None:
+                if isinstance(sch, list):
+                    sch = sch[0]
+                if sch is not None:
+                    sch.step()
 
         log_kwargs = dict(on_step=True, on_epoch=True, sync_dist=True)
         self.log("train_ocsc/loss", loss.detach(), prog_bar=True, **log_kwargs)
@@ -3330,8 +3394,12 @@ class SMARTFlow(LightningModule):
             **log_kwargs,
         )
         if result.get("hard_rmm") is not None:
-            self.log("train_ocsc/sim_agents_2025/realism_meta_metric",
-                     float(result["hard_rmm"]), prog_bar=True, **log_kwargs)
+            self.log(
+                "train_ocsc/sim_agents_2025/realism_meta_metric",
+                float(result["hard_rmm"]), prog_bar=True, **log_kwargs,
+            )
+        if result.get("fm_reg_loss") is not None:
+            self.log("train_ocsc/fm_reg_loss", float(result["fm_reg_loss"]), **log_kwargs)
         return loss
 
     def _training_step_manual_open_loop(self, data, batch_idx):
