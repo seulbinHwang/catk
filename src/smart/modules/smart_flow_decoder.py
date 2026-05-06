@@ -163,23 +163,6 @@ class SMARTFlowDecoder(nn.Module):
             map_feature=map_feature,
         )
 
-    def prepare_inference_cache_anchor_batched(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        anchor_indices,
-        step_current_2hz: int,
-        seq_keys: tuple = ("gt_pos", "gt_heading", "valid_mask", "gt_idx"),
-    ):
-        """OCSC 학습용 anchor-batched cache 빌드 (forward 1 회 → anchor 별 split)."""
-        return self.agent_encoder.prepare_inference_cache_anchor_batched(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            anchor_indices=anchor_indices,
-            step_current_2hz=step_current_2hz,
-            seq_keys=seq_keys,
-        )
-
     def prepare_training_rollout_cache(
         self,
         tokenized_agent: Dict[str, Tensor],

@@ -153,7 +153,6 @@ BPTT_LAST_N_COARSE_STEPS="${BPTT_LAST_N_COARSE_STEPS:-0}"
 BPTT_LAST_N_SOLVER_STEPS="${BPTT_LAST_N_SOLVER_STEPS:-0}"
 BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-0.0}"
 BPTT_LAST_COARSE_ONLY="${BPTT_LAST_COARSE_ONLY:-true}"
-BPTT_BATCHED_CACHE_BUILD="${BPTT_BATCHED_CACHE_BUILD:-false}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 WANDB_PROJECT="${WANDB_PROJECT:-SMART-FLOW}"
@@ -240,7 +239,7 @@ echo "        weights pos=${OCSC_POSITION_WEIGHT} disp=${OCSC_REL_DISP_WEIGHT} h
 echo "  BPTT: adjoint=${BPTT_USE_ADJOINT} last_solver=${BPTT_LAST_N_SOLVER_STEPS}"
 echo "        warm=${BPTT_WARM_COARSE_STEPS} last_only=${BPTT_LAST_COARSE_ONLY}"
 echo "        last_n=${BPTT_LAST_N_COARSE_STEPS} grad_clip=${BPTT_GRAD_CLIP_TRAJ}"
-echo "        sequential=${BPTT_SEQUENTIAL_ROLLOUTS} batched_cache=${BPTT_BATCHED_CACHE_BUILD}"
+echo "        sequential=${BPTT_SEQUENTIAL_ROLLOUTS}"
 echo "  freeze: full_decoder=${TRAIN_FULL_FLOW_DECODER_ONLY} velocity_only=${FLOW_VELOCITY_HEAD_ONLY}"
 echo "  LoRA: enabled=${OCSC_LORA_ENABLED} r=${OCSC_LORA_R} alpha=${OCSC_LORA_ALPHA} dropout=${OCSC_LORA_DROPOUT} filter=${OCSC_LORA_LAYER_FILTER}"
 echo "  validation: ${VALIDATION_METRIC} (n_batch=${N_BATCH_SIM_AGENTS_METRIC} n_rollout=${N_ROLLOUT_CLOSED_VAL})"
@@ -320,7 +319,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.bptt_last_n_solver_steps="${BPTT_LAST_N_SOLVER_STEPS}" \
   model.model_config.finetune.bptt_grad_clip_traj="${BPTT_GRAD_CLIP_TRAJ}" \
   model.model_config.finetune.bptt_last_coarse_only="${BPTT_LAST_COARSE_ONLY}" \
-  model.model_config.finetune.bptt_batched_cache_build="${BPTT_BATCHED_CACHE_BUILD}" \
   ${PREFETCH_ARG} \
   ${EXTRA_ARGS}
 
