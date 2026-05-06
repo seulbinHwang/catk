@@ -1318,6 +1318,20 @@ class SMARTFlow(LightningModule):
                 return cl_norms[0].sum() * 0.0 if cl_norms else torch.zeros(())
             tgt = tgt_norms[0]
             T = min(int(cl_norms[0].shape[-2]), int(tgt.shape[-2]))
+            # GT-target + MMD: G CL 분포가 single GT point 로 mode collapse 되지
+            # 않도록 G-expanded GT 와 mmd_from_stacked.  fix-hard-rmm 의 GT-target
+            # MMD path 와 동일.  (tgt_valid 마스킹은 MMD 안에서 지원되지 않으므로
+            # paired path 에서만 사용.)
+            if use_mmd and len(cl_norms) >= 2:
+                cl_stack = torch.stack([c[..., :T, :] for c in cl_norms], dim=0)
+                gt_stack = (
+                    tgt[..., :T, :]
+                    .unsqueeze(0)
+                    .expand(len(cl_norms), -1, -1, -1)
+                    .detach()
+                )
+                return pos_w * mmd_from_stacked(cl_stack, gt_stack)
+
             valid = tgt_valid[..., :T] if tgt_valid is not None else None
             mask = valid.unsqueeze(-1).float() if valid is not None else None
             total = cl_norms[0].sum() * 0.0
@@ -1327,10 +1341,16 @@ class SMARTFlow(LightningModule):
                 term = pos_w * _pos_loss(p, t, mask=mask)
                 if heading_w > 0.0:
                     term = term + heading_w * _pos_loss(
-                        torch.cat([p[..., 2:], p[..., 2:]], dim=-1),
-                        torch.cat([t[..., 2:], t[..., 2:]], dim=-1),
-                        mask=mask,
+                        p[..., 2:], t[..., 2:], mask=mask,
                     )
+                if rel_disp_w > 0.0 and T >= 2:
+                    if mask is not None:
+                        pair_valid = (valid[..., 1:] & valid[..., :-1]).unsqueeze(-1).float()
+                    else:
+                        pair_valid = None
+                    disp_p = p[..., 1:, :2] - p[..., :-1, :2]
+                    disp_t = t[..., 1:, :2] - t[..., :-1, :2]
+                    term = term + rel_disp_w * _pos_loss(disp_p, disp_t, mask=pair_valid)
                 total = total + term
             return total / float(len(cl_norms))
 
