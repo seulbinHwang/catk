@@ -4,21 +4,21 @@ model_config:
   lr_warmup_steps: 2
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.01
+  weight_decay: 0.01
+  lr_scheduler_unit: epoch
   n_rollout_closed_val: 8
-  # Optional: set this to the flow-pretrain CPD value only when you want DPR.
+  # Optional: set to flow-pretrain CPD value to log DPR (CPD/CPD_ref).
   # CPD/CES are always evaluated regardless of this value.
   wosac_cpd_reference: null
   n_batch_sim_agents_metric: 10
-  # Positive values auto-set n_batch_sim_agents_metric from world_size and
-  # val_batch_size so scorer work is comparable across GPU counts. Set null or
-  # 0 to keep the explicit n_batch_sim_agents_metric value.
-  scorer_scene_num: 840
   sim_agents_metric_workers: 3
+  # "real": 공식 TF SimAgents RMM (subprocess, 정확), "hard": PyTorch hard RMM (인-프로세스, 빠름)
+  validation_metric: "real"
+  # true 시 dno/ttc/d_road 커널을 torch.compile 로 최적화 (WOSAC_TORCH_COMPILE=1 env 세팅)
+  wosac_torch_compile: false
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0
-  vis_ghost_gt: false
-  vis_flow_preview: true
   delete_local_videos_after_wandb_upload: false
   val_open_loop: true
   val_closed_loop: true
@@ -27,63 +27,14 @@ model_config:
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
-    flow_window_steps: ${model.model_config.decoder.flow_window_steps}
     map_token_sampling:
       num_k: 1
       temp: 1.0
     agent_token_sampling:
       num_k: 1
       temp: 1.0
-  validation_rollout_sampling:
-    sample_steps: 32
-    sample_method: euler
+  eval_sampling_noise:
     noise_scale: 1.0
-  draft:
-    enabled: false
-    loss_enabled: false
-    start_epoch: 0
-    ramp_epochs: 4
-    max_weight: 1.0
-    sampling:
-      sample_steps: 32
-      sample_method: euler
-      noise_scale: 1.0
-      random_terminal_step:
-        enabled: true
-        scope: global_batch
-        # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
-        policy: paper_uniform
-        min_executed_steps: 24
-    physics:
-      force_fp32: true
-      dt: 0.1
-      pos_scale_m: 20.0
-      speed_floor_mps: 0.5
-      vehicle_v_max_mps: 35.0
-      vehicle_a_max_mps2: 8.0
-      vehicle_lat_accel_max_mps2: 4.2
-      bicycle_v_max_mps: 22.0
-      bicycle_a_max_mps2: 5.5
-      bicycle_lat_accel_max_mps2: 4.4
-      vehicle_beta_max_rad: 0.27
-      bicycle_beta_max_rad: 0.70
-      pedestrian_v_max_mps: 5.0
-      pedestrian_a_max_mps2: 4.7
-      vehicle_wheelbase_scale: 0.60
-      bicycle_wheelbase_scale: 0.85
-      vehicle_steer_max_rad: 0.55
-      bicycle_steer_max_rad: 0.90
-      vehicle_steer_rate_max_radps: 0.8
-      bicycle_steer_rate_max_radps: 1.4
-      soft_weight: 0.25
-      compare_softness_to_gt: false
-      use_slip_penalty: false
-      commit_loss_weight: 2.0
-      soft_limit_ratio: 0.8
-      topk_violation_k: 20
-      pedestrian_heading_weight: 0.05
-      pedestrian_heading_speed_threshold_mps: 0.5
-      eps: 1.0e-6
   decoder:
     hidden_dim: 128
     num_freq_bands: 64
@@ -99,34 +50,12 @@ model_config:
     time_span: 30
     num_historical_steps: 11
     num_future_steps: 80
-    flow_window_steps: 20
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
-    flow_solver_steps: 32
-    flow_solver_method: euler
+    flow_solver_steps: 4
+    flow_solver_method: midpoint
     flow_solver_eps: 1.0e-3
-    closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
-    use_lqr: false
-    use_stop_motion: true
-    lqr_commit:
-      dt: 0.1
-      history_steps: 6
-      horizon_steps: 10
-      velocity_smooth_lambda: 1.0e-4
-      curvature_smooth_lambda: 1.0e-2
-      curvature_init_reg: 1.0e-10
-      stop_speed_mps: 0.2
-      stop_speed_kp: 0.5
-      longitudinal_q: 10.0
-      longitudinal_r: 0.
-      lateral_q_lat: 1.0
-      lateral_q_head: 10.0
-      lateral_q_kappa: 0.
-      lateral_r: 0.
-      accel_tau_s: 0.
-      curvature_tau_s: 0.
-      min_speed_for_curvature_clip_mps: 0.5
   sim_agents_submission:
     is_active: false
     method_name: "SMART-flow-7M"
@@ -137,4 +66,14 @@ model_config:
     account_name: "h.sb@naverlabs.com"
   finetune:
     enabled: false
-    train_full_flow_decoder_only: false
+    mode: adjoint_matching
+    # adjoint_matching·terminal_cost 등 ODE 이산화용 (rmm_bptt_ft closed-loop 길이와 무관)
+    rollout_steps: 16
+    bptt_max_coarse_steps: null
+    rollout_noise_scale: 1.0
+    feasible_weight: 1.0
+    smooth_deadzone_epsilon: [0.01, 0.01, 0.01]
+    smooth_deadzone_tau: 0.002
+    # FinetuneConfig 기본은 true(velocity_head만). 기존 실험은 전체 flow_decoder FT 유지.
+    flow_velocity_head_only: false
+    gradient_clip_val: 0.0

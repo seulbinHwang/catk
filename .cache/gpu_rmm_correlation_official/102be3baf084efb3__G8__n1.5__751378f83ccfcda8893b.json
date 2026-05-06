@@ -1,0 +1,1 @@
+{"stem": "102be3baf084efb3", "G": 8, "noise_std": 1.5, "config_tag": "challenge_2025_sim_agents_config.textproto_dd58cd9321b865af", "rollout_scheme_id": "deterministic_seed_v1", "official_scores": [0.2997499108314514, 0.2967466115951538, 0.3377346694469452, 0.2996193766593933, 0.34239110350608826, 0.34353819489479065, 0.29405850172042847, 0.3393496572971344]}

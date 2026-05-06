@@ -1,0 +1,63 @@
+# @package _global_
+# Fine-tuning: ODE generate → KinematicProjection → projected trajectory as FM target.
+#
+# 학습 루프:
+#   1. encoder (no_grad) → anchor_hidden
+#   2. ctx_sampled_pos/heading → v_init, delta_init  (closed-loop chunk init 동일 공식)
+#   3. ODE generate (no_grad, current policy) → y_hat
+#   4. KinematicProjection(y_hat, v_init, delta_init) → y_proj
+#   5. flow_matching_loss(flow_decoder(x_t), target) with y_proj as clean target
+#
+# flow_reg_lambda > 0 이면 GT 기반 BC 정규화항도 추가.
+
+defaults:
+  - override /model: smart_flow
+
+action: finetune
+
+model:
+  model_config:
+    lr: 5e-5
+    lr_warmup_steps: 500
+    lr_total_steps: -1
+    lr_min_ratio: 1e-2
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+    n_rollout_closed_val: 16
+    n_vis_batch: 1
+    n_vis_scenario: 2
+    n_vis_rollout: 4
+    val_open_loop: true
+    val_closed_loop: true
+    kinematic_projection:
+      enabled: true
+    finetune:
+      enabled: true
+      mode: kinematic_proj_ft
+      rollout_noise_scale: 1.0
+      flow_reg_lambda: 0.0   # >0 이면 GT BC 정규화 추가
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.01
+  check_val_every_n_epoch: null
+  val_check_interval: 500
+  max_epochs: 10
+  log_every_n_steps: 5
+  precision: 32-true
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_kinematic/kin_ADE2s
+    mode: min
+    save_top_k: -1
+
+data:
+  train_batch_size: 8
+  val_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1

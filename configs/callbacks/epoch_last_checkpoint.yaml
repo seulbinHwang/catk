@@ -1,7 +1,0 @@
-epoch_last_checkpoint:
-  _target_: src.utils.epoch_last_checkpoint.EpochLastCheckpointCallback
-  dirpath: ${paths.output_dir}/checkpoints
-  filename: epoch_last.ckpt
-  save_weights_only: false
-  upload_to_wandb: true
-  artifact_name: null

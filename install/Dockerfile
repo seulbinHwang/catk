@@ -42,6 +42,7 @@ ADD ./requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 RUN pip install torch_geometric
 RUN pip install torch_scatter torch_cluster -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
-RUN pip install --no-cache-dir --no-deps waymo-open-dataset-tf-2-12-0==1.6.7
+RUN pip install --no-cache-dir --no-deps waymo-open-dataset-tf-2-12-0==1.6.4
 
 CMD ["/bin/bash"]
+

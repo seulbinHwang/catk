@@ -43,8 +43,8 @@ from waymo_open_dataset.utils.sim_agents import submission_specs
 from waymo_open_dataset.wdl_limited.sim_agents_metrics import metric_features
 from waymo_open_dataset.wdl_limited.sim_agents_metrics import metrics as wm
 
-from src.smart.metrics.hard_sim_agents_metrics import HardSimAgentsMetrics
 from src.smart.metrics.wosac_metametric_pytorch import compute_wosac_metametric_from_features_torch
+from src.smart.metrics.wosac_metrics import WOSACMetrics
 
 _LIKELIHOOD_ATTRS = [
     "linear_speed_likelihood",
@@ -187,7 +187,7 @@ def main() -> None:
         print("Set WOSAC_PARITY_TFRECORD_DIR", file=sys.stderr)
         sys.exit(2)
 
-    config = HardSimAgentsMetrics._load_config()
+    config = WOSACMetrics.load_metrics_config()
     worst: Dict[str, float] = {}
     n_fail = 0
     first_fail: Tuple[str, str, float] | None = None  # path, metric, delta
