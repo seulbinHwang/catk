@@ -46,7 +46,7 @@ export WOSAC_REAL_POOL_WORKERS="${WOSAC_REAL_POOL_WORKERS:-16}"
 export WOSAC_VERIFY="${WOSAC_VERIFY:-0}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2}"
 
 MY_EXPERIMENT="${MY_EXPERIMENT:-flow_consistency_bptt}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-single}"
@@ -68,7 +68,6 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CKPT_PATH="${CKPT_PATH:-${PROJECT_ROOT}/logs/pretrained/epoch_last.ckpt}"
 
 TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
-TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
 FIXED_SCENARIO_MODE="${FIXED_SCENARIO_MODE:-false}"
 FIXED_SCENARIO_INDEX="${FIXED_SCENARIO_INDEX:-0}"
 FIXED_SCENARIO_COUNT="${FIXED_SCENARIO_COUNT:-4}"
@@ -121,7 +120,7 @@ VALIDATION_METRIC="${VALIDATION_METRIC:-hard}"
 # ── OCSC 핵심 (fix-hard-rmm production defaults) ────────────────────────────
 OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-4}"
 OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
-OCSC_USE_MMD="${OCSC_USE_MMD:-false}"
+OCSC_USE_MMD="${OCSC_USE_MMD:-true}"
 OCSC_ANCHOR_STRIDE="${OCSC_ANCHOR_STRIDE:-1}"
 OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-2}"
@@ -129,9 +128,7 @@ OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-0.0}"
 OCSC_POSITION_WEIGHT="${OCSC_POSITION_WEIGHT:-1.0}"
 OCSC_REL_DISP_WEIGHT="${OCSC_REL_DISP_WEIGHT:-0.0}"
 OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA:-0.1}"
-# 사용자가 실수로 "=0.1" 형태로 넘긴 경우 보정.
-OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA#=}"
-OCSC_GT_TARGET="${OCSC_GT_TARGET:-true}"
+OCSC_GT_TARGET="${OCSC_GT_TARGET:-false}"
 OCSC_SHARE_NOISE_TAPE="${OCSC_SHARE_NOISE_TAPE:-true}"
 OCSC_SHARE_NOISE_ACROSS_TIME="${OCSC_SHARE_NOISE_ACROSS_TIME:-false}"
 
@@ -253,7 +250,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   seed="${SEED}" \
   data.shuffle="${DATA_SHUFFLE}" \
   data.train_raw_dir="${TRAIN_RAW_DIR_EFFECTIVE}" \
-  data.train_tfrecords_splitted="${TRAIN_TFRECORDS_SPLITTED}" \
   data.train_batch_size="${TRAIN_B}" \
   data.val_batch_size="${VAL_B}" \
   data.train_max_num="${TRAIN_MAX_NUM}" \
