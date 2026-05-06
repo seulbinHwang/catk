@@ -17,9 +17,6 @@ from src.smart.modules.flow_local_decoder import (
     HierarchicalFlowDecoder,
     LQRCommitBridgeConfig,
 )
-from src.smart.modules.self_forced_rollout_detach import (
-    detach_training_rollout_state,
-)
 from src.smart.utils import (
     angle_between_2d_vectors,
     safe_norm_2d,
@@ -27,6 +24,27 @@ from src.smart.utils import (
     validate_flow_window_steps,
     wrap_angle,
 )
+
+
+def _detach_tensor_tree(value: object) -> object:
+    """값 안에 들어 있는 tensor의 gradient 연결을 모두 끊습니다."""
+    if torch.is_tensor(value):
+        return value.detach()
+    if isinstance(value, dict):
+        return {key: _detach_tensor_tree(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_detach_tensor_tree(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_detach_tensor_tree(child) for child in value)
+    return value
+
+
+def detach_training_rollout_state(rollout_state: Dict[str, object]) -> Dict[str, object]:
+    """closed-loop rollout 의 0.5초 block 경계에서 입력 상태의 gradient 를 끊습니다.
+
+    OCSC warm_coarse_steps 토글이 활성일 때 warm-up 영역에서 grad 그래프를 끊는 데 쓰입니다.
+    """
+    return {key: _detach_tensor_tree(value) for key, value in rollout_state.items()}
 
 
 class SMARTFlowAgentDecoder(SMARTAgentEncoder):
