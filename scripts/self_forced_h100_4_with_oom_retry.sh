@@ -17,22 +17,33 @@
 #                  ckpt you would have passed to the bare `ckpt_path=` argument).
 #
 # Optional knobs (env vars; sensible defaults shown):
-#   INITIAL_BS=36        Initial `data.train_batch_size`. Defaults to the
+#   INITIAL_BS=28        Initial `data.train_batch_size`. Defaults to the
 #                        preset's conservative random-terminal setting.
-#   OOM_STEP=2           Decrement applied to `data.train_batch_size` per OOM.
+#   OOM_STEP=4           Decrement applied to `data.train_batch_size` per OOM.
 #   MIN_BS=2             Stop trying when `bs` would fall below this value.
 #   TASK_NAME=flow_semi_continuous_self_forced_h1004
 #   CACHE_ROOT=/mnt/nuplan/womd_v1_3/SMART_cache
+#   CATK_LOG_DIR=<repo>/logs
 #   CUDA_VISIBLE_DEVICES=0,1,2,3
 #   NPROC_PER_NODE=4
 #   EXPERIMENT=self_forced_npfm_h100_4
+#   CATK_LR=                     Optional Generator learning-rate override.
+#   ESTIMATOR_WARMUP_EPOCHS=     Optional self-forced warmup override.
+#   SELF_FORCED_USE_STOP_MOTION= Optional training rollout stop-motion gate.
+#   DECODER_USE_STOP_MOTION=     Optional validation/test inference gate.
+#   LIMIT_TRAIN_BATCHES=         Optional Trainer limit_train_batches override.
+#   LIMIT_VAL_BATCHES=           Optional Trainer limit_val_batches override.
+#   MAX_EPOCHS=                  Optional Trainer max_epochs override.
 #   RANDOM_TERMINAL_SCOPE=         Optional override: global_batch.
 #   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform.
+#   BACKPROP_LAST_K=              Optional policy=all gradient-step override.
+#   UNFROZEN_RANGE=               Optional trainable Generator range override.
 #   EMA_WEIGHT=                    Optional Generator EMA decay override.
 #   EMA_START_STEP=                Optional Generator EMA start update override.
 #   CLEAN_DMD_NORMALIZER_EPS=      Optional Clean-DMD normalizer epsilon override.
 #   CLEAN_DMD_TAU_LOW=             Optional Clean-DMD guidance tau lower bound.
 #   CLEAN_DMD_TAU_HIGH=            Optional Clean-DMD guidance tau upper bound.
+#   CATK_EXTRA_OVERRIDES=          Optional whitespace-separated Hydra overrides.
 #
 # Usage example:
 #   PRETRAIN_CKPT=/mnt/nuplan/projects/catk/downloads/wandb_ckpts/.../epoch_last.ckpt \
@@ -51,6 +62,7 @@ cd "$REPO_ROOT"
 EXPERIMENT="${EXPERIMENT:-self_forced_npfm_h100_4}"
 TASK_NAME="${TASK_NAME:-flow_semi_continuous_self_forced_h1004}"
 CACHE_ROOT="${CACHE_ROOT:-/mnt/nuplan/womd_v1_3/SMART_cache}"
+CATK_LOG_DIR="${CATK_LOG_DIR:-${REPO_ROOT}/logs}"
 INITIAL_BS="${INITIAL_BS:-28}"
 OOM_STEP="${OOM_STEP:-4}"
 MIN_BS="${MIN_BS:-2}"
@@ -59,11 +71,44 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:?must set PRETRAIN_CKPT to the 2s-horizon pretrained Generator ckpt}"
 
 EXTRA_OVERRIDES=()
+if [[ -n "${VAL_BATCH_SIZE:-}" ]]; then
+  EXTRA_OVERRIDES+=("data.val_batch_size=${VAL_BATCH_SIZE}")
+fi
+if [[ -n "${TEST_BATCH_SIZE:-}" ]]; then
+  EXTRA_OVERRIDES+=("data.test_batch_size=${TEST_BATCH_SIZE}")
+fi
+if [[ -n "${LIMIT_TRAIN_BATCHES:-}" ]]; then
+  EXTRA_OVERRIDES+=("trainer.limit_train_batches=${LIMIT_TRAIN_BATCHES}")
+fi
+if [[ -n "${LIMIT_VAL_BATCHES:-}" ]]; then
+  EXTRA_OVERRIDES+=("trainer.limit_val_batches=${LIMIT_VAL_BATCHES}")
+fi
+if [[ -n "${MAX_EPOCHS:-}" ]]; then
+  EXTRA_OVERRIDES+=("trainer.max_epochs=${MAX_EPOCHS}")
+fi
+if [[ -n "${CATK_LR:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.lr=${CATK_LR}")
+fi
+if [[ -n "${ESTIMATOR_WARMUP_EPOCHS:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}")
+fi
+if [[ -n "${SELF_FORCED_USE_STOP_MOTION:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.use_stop_motion=${SELF_FORCED_USE_STOP_MOTION}")
+fi
+if [[ -n "${DECODER_USE_STOP_MOTION:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.decoder.use_stop_motion=${DECODER_USE_STOP_MOTION}")
+fi
+if [[ -n "${UNFROZEN_RANGE:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.unfrozen_range=${UNFROZEN_RANGE}")
+fi
 if [[ -n "${RANDOM_TERMINAL_SCOPE:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.scope=${RANDOM_TERMINAL_SCOPE}")
 fi
 if [[ -n "${RANDOM_TERMINAL_POLICY:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.policy=${RANDOM_TERMINAL_POLICY}")
+fi
+if [[ -n "${BACKPROP_LAST_K:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.backprop_last_k=${BACKPROP_LAST_K}")
 fi
 if [[ -n "${EMA_WEIGHT:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.ema_weight=${EMA_WEIGHT}")
@@ -80,13 +125,17 @@ fi
 if [[ -n "${CLEAN_DMD_TAU_HIGH:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.clean_dmd_tau_high=${CLEAN_DMD_TAU_HIGH}")
 fi
+if [[ -n "${CATK_EXTRA_OVERRIDES:-}" ]]; then
+  read -r -a EXTRA_FROM_ENV <<< "$CATK_EXTRA_OVERRIDES"
+  EXTRA_OVERRIDES+=("${EXTRA_FROM_ENV[@]}")
+fi
 
 if [[ ! -f "$PRETRAIN_CKPT" ]]; then
   echo "ERROR: PRETRAIN_CKPT does not exist: $PRETRAIN_CKPT" >&2
   exit 1
 fi
 
-LOG_DIR="${REPO_ROOT}/logs/_self_forced_oom_retry/${TASK_NAME}"
+LOG_DIR="${CATK_LOG_DIR}/_self_forced_oom_retry/${TASK_NAME}"
 mkdir -p "$LOG_DIR"
 
 OOM_REGEX='OutOfMemoryError|CUDA out of memory|c10::OutOfMemoryError|cuda runtime error.*out of memory|torch\.OutOfMemoryError|CUDA_ERROR_OUT_OF_MEMORY'
@@ -97,7 +146,7 @@ log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
 find_latest_self_forced_ckpt() {
   # Latest `epoch_last.ckpt` under any run directory for this task.
   # Returns empty string when none exists yet.
-  ls -t "${REPO_ROOT}/logs/${TASK_NAME}/runs"/*/checkpoints/epoch_last.ckpt 2>/dev/null | head -1
+  ls -t "${CATK_LOG_DIR}/${TASK_NAME}/runs"/*/checkpoints/epoch_last.ckpt 2>/dev/null | head -1
 }
 
 bs="$INITIAL_BS"
@@ -134,6 +183,7 @@ while (( bs >= MIN_BS )); do
     experiment="$EXPERIMENT" \
     action="$action" \
     paths.cache_root="$CACHE_ROOT" \
+    paths.log_dir="$CATK_LOG_DIR" \
     task_name="$TASK_NAME" \
     ckpt_path="$ckpt_path" \
     data.train_batch_size="$bs" \

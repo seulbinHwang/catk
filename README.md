@@ -1046,6 +1046,153 @@ python -m src.run experiment=self_forced_npfm_h100_6 \
     model.model_config.self_forced.sampling.random_terminal_step.policy=paper_uniform
 ```
 
+#### 8-node x 4 V100 static pod self-forced 실행
+
+이미 떠 있는 V100 4장짜리 pod 8개를 묶어 32-rank self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다. launcher는 pod를 새로 만들거나 지우거나 재시작하지 않고, `kubectl exec`로 각 pod 안에 tmux 세션과 `torchrun`만 시작합니다.
+
+```text
+configs/experiment/self_forced_npfm_v100x4x8.yaml
+scripts/launch_self_forced_v100x4x8_static_pods.py
+```
+
+대상 pod 순서는 기본값으로 고정되어 있습니다.
+
+```text
+testsv testsvv testsvvv testsvvvv sv svv svvv svvvv
+```
+
+기본 실험 설정:
+
+- `trainer.num_nodes=8`, `trainer.devices=4` → 총 32 DDP ranks
+- V100용 `trainer.precision=16-mixed`
+- `model.model_config.lr=1.0e-6`
+- `model.model_config.self_forced.estimator_warmup_epochs=0`
+- `model.model_config.self_forced.use_stop_motion=false`
+- `data.train_batch_size=4`, OOM 시 launcher가 모든 pod의 attempt status를 모아 `4 -> 3 -> 2` 순서로 함께 낮춤
+- `data.val_batch_size=2`, `model.model_config.scorer_scene_num=320`
+
+pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
+
+```text
+artifact: jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v64
+target:   /workspace/flow_semi_continuous_pretrain_h100x4x2_bs26/v64/epoch_last.ckpt
+```
+
+실제 실행 전에 로컬에서 렌더링만 확인하려면 `--dry-run`을 사용합니다. 이 모드는 pod 안에 아무 것도 만들지 않습니다.
+
+```bash
+python scripts/launch_self_forced_v100x4x8_static_pods.py \
+  --dry-run \
+  --master-addr <testsv-pod-ip>
+```
+
+실행:
+
+```bash
+python scripts/launch_self_forced_v100x4x8_static_pods.py --replace
+```
+
+smoke test를 돌릴 때는 task 이름을 따로 주는 편이 안전합니다.
+
+```bash
+python scripts/launch_self_forced_v100x4x8_static_pods.py \
+  --replace \
+  --limit-train-batches 20 \
+  --limit-val-batches 0 \
+  --max-epochs 1 \
+  --task-name flow_self_forced_v100x4x8_stopfalse_warmup0_lr1e-6_bs4_smoke
+```
+
+attach:
+
+```bash
+kubectl exec -it -n p-pnc testsv -c main -- tmux attach -t catk-sf-v100x4x8-stopfalse-warmup0
+```
+
+중지:
+
+```bash
+python scripts/launch_self_forced_v100x4x8_static_pods.py --stop
+```
+
+Validation/test/submission inference의 stop-motion까지 끄고 싶을 때만 아래 override를 추가합니다. 기본 launcher 설정은 self-forced 학습 rollout의 stop-motion만 끕니다.
+
+```bash
+python scripts/launch_self_forced_v100x4x8_static_pods.py \
+  --replace \
+  --decoder-use-stop-motion false
+```
+
+#### 1-node x 4 H100 wo-pvc-800 self-forced 실행
+
+H100 4장짜리 `wo-pvc-800` pod 하나에서 self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다. launcher는 pod를 새로 만들거나 지우거나 재시작하지 않고, `kubectl exec`로 해당 pod 안에 tmux 세션과 `torchrun --standalone --nproc_per_node=4`만 시작합니다.
+
+```text
+configs/experiment/self_forced_npfm_h100x4_wo_pvc_800.yaml
+scripts/launch_self_forced_h100x4_wo_pvc_800.py
+```
+
+기본 실험 설정:
+
+- 대상 pod: `wo-pvc-800`
+- `trainer.num_nodes=1`, `trainer.devices=4` → 총 4 DDP ranks
+- H100용 `trainer.precision=bf16-mixed`
+- `model.model_config.lr=1.0e-6`
+- `model.model_config.self_forced.estimator_warmup_epochs=1`
+- `model.model_config.self_forced.use_stop_motion=false`
+- `data.train_batch_size=22`
+- OOM 시 launcher가 호출하는 retry wrapper가 `22 -> 20 -> 18 -> ...` 순서로 batch size를 낮춰 재시도
+
+pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
+
+```text
+artifact: jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v64
+target:   /workspace/flow_semi_continuous_pretrain_h100x4x2_bs26/v64/epoch_last.ckpt
+```
+
+실제 실행 전에 로컬에서 렌더링만 확인하려면 `--dry-run`을 사용합니다. 이 모드는 pod 안에 아무 것도 만들지 않습니다.
+
+```bash
+python scripts/launch_self_forced_h100x4_wo_pvc_800.py --dry-run
+```
+
+실행:
+
+```bash
+python scripts/launch_self_forced_h100x4_wo_pvc_800.py --replace
+```
+
+smoke test를 돌릴 때는 task 이름을 따로 주는 편이 안전합니다.
+
+```bash
+python scripts/launch_self_forced_h100x4_wo_pvc_800.py \
+  --replace \
+  --limit-train-batches 20 \
+  --limit-val-batches 0 \
+  --max-epochs 1 \
+  --task-name flow_self_forced_h100x4_wo_pvc_800_stopfalse_warmup1_lr1e-6_bs22_smoke
+```
+
+attach:
+
+```bash
+kubectl exec -it -n p-pnc wo-pvc-800 -c main -- tmux attach -t catk-sf-h100x4-wo-pvc-800
+```
+
+중지:
+
+```bash
+python scripts/launch_self_forced_h100x4_wo_pvc_800.py --stop
+```
+
+Validation/test/submission inference의 stop-motion까지 끄고 싶을 때만 아래 override를 추가합니다. 기본 launcher 설정은 self-forced 학습 rollout의 stop-motion만 끕니다.
+
+```bash
+python scripts/launch_self_forced_h100x4_wo_pvc_800.py \
+  --replace \
+  --decoder-use-stop-motion false
+```
+
 #### CUDA OOM 자동 fallback 으로 무중단 재개
 
 긴 self-forced fine-tuning 도중 어쩌다 OOM 이 한 번 떨어지면 (heavy batch + self-rollout 메모리 스파이크), 학습이 죽고 그동안 진행한 epoch 들이 의미 없어질 수 있습니다. `scripts/self_forced_h100_4_with_oom_retry.sh` 와 `scripts/self_forced_h100_6_with_oom_retry.sh` 는 이 시나리오를 자동 처리합니다:
