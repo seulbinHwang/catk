@@ -113,10 +113,25 @@ class SMARTFlow(LightningModule):
 
         self.minADE = minADE()
         self.minADE_predict = minADE()
-        self.sim_agents_metrics = SimAgentsMetrics(
-            "val_closed",
-            max_workers=model_config.sim_agents_metric_workers,
-        )
+        # Validation metric backend toggle:
+        #   "real" / 기본 → 공식 Waymo TF SimAgentsMetrics (정확하지만 느림).
+        #   "hard"        → HardSimAgentsMetrics (PyTorch in-process, 빠름).
+        # 두 클래스는 ``update_from_prediction_tensors / get_state_tensor /
+        # compute_from_state_tensor / compute / reset / _drain_completed_futures
+        # / _metric_key`` 인터페이스를 공유하므로 드롭인 교체가 가능합니다.
+        self.validation_metric_backend = str(
+            getattr(model_config, "validation_metric", "real")
+        ).lower()
+        if self.validation_metric_backend == "hard":
+            self.sim_agents_metrics: SimAgentsMetrics | HardSimAgentsMetrics = (
+                HardSimAgentsMetrics("val_closed")
+            )
+            log.info("[validation] using HardSimAgentsMetrics (PyTorch in-process RMM).")
+        else:
+            self.sim_agents_metrics = SimAgentsMetrics(
+                "val_closed",
+                max_workers=model_config.sim_agents_metric_workers,
+            )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
         wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
         self.wosac_distribution_metrics = WOSACDistributionMetrics(
