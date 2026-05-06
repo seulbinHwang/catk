@@ -978,18 +978,32 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         data: dict | None,
     ) -> dict:
-        """Open-Closed Self-Consistency 학습 step.
+        """Open-Closed Self-Consistency 학습 step (full-feature 버전).
 
         알고리즘:
           1. Map encode (no_grad).
           2. 각 anchor index ``a`` 에 대해 (anchor_stride 간격):
              a. ``tokenized_agent`` 의 시퀀스 키를 ``[..., :a+1]`` 로 슬라이스.
              b. ``prepare_inference_cache`` 로 anchor frame 캐시 구성.
-             c. G 개의 closed-loop rollout 을 ``training_rollout_from_cache``
-                (gradient 유지) 로 실행.
+             c. G 개의 noise tape 생성 (``ocsc_share_noise_tape=True`` 면 OL/CL 공유).
              d. Target (open-loop sample 또는 GT) 을 anchor-local 4ch 로 투영.
-             e. Consistency loss 누적.
+             e. CL rollout — sequential (2-pass MMD) 또는 parallel.
+             f. consistency loss (+ optional GT FM regularization) 누적.
           3. 평균 loss 반환.  optional 로 detached CL 궤적으로 HardRMM 모니터링.
+
+        BPTT 메모리 / 속도 토글 (모두 ``finetune_config`` 키로 노출):
+          - ``bptt_warm_coarse_steps``: 앞 N coarse step no_grad + state detach.
+          - ``bptt_last_coarse_only``: True 면 ``warm = pred_steps - 1``.
+          - ``bptt_last_n_coarse_steps``: 마지막 N coarse step 만 grad.
+          - ``bptt_use_adjoint``: flow_ode 의 model_fn 호출을 ckpt 로 감쌈.
+          - ``bptt_last_n_solver_steps``: 마지막 N solver step 만 velocity grad.
+          - ``bptt_grad_clip_traj``: closed-loop traj backward L2 norm clip.
+          - ``bptt_sequential_rollouts``: G rollout 을 순차 backward (메모리 ↓).
+          - ``ocsc_share_noise_tape``: True 면 OL/CL 이 같은 noise tape 공유.
+          - ``ocsc_share_noise_across_time``: ``_build_rollout_noise_tape`` 의
+            동일 z[4] 시간축 expand 토글.
+          - ``ocsc_use_pretrained_ref``: True 면 frozen ref decoder 로 OL 생성.
+          - ``ocsc_fm_reg_lambda``: per-anchor GT FM regularization weight.
 
         Args:
             tokenized_map: 토큰화된 지도 입력입니다.
@@ -1000,11 +1014,20 @@ class SMARTFlow(LightningModule):
 
         Returns:
             dict: ``{"loss": Tensor[], "n_anchors": int,
-                "n_valid_anchors": int, "hard_rmm": float | None}``.
+                "n_valid_anchors": int, "hard_rmm": float | None,
+                "fm_reg_loss": float | None}``.
         """
+        import torch.nn.functional as F
+        from src.smart.metrics.mmd_consistency_loss import (
+            mmd_from_stacked,
+            mmd_per_rollout_proxy,
+            mmd_precompute_sigma_sq,
+        )
+
         cfg = self.finetune_config
         G = int(getattr(cfg, "ocsc_n_rollouts", 2))
         pred_max_steps_raw = int(getattr(cfg, "ocsc_pred_max_steps", 4))
+        pred_steps = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
         loss_type = str(getattr(cfg, "ocsc_loss_type", "l2"))
         use_mmd = bool(getattr(cfg, "ocsc_use_mmd", True))
         use_gt_target = bool(getattr(cfg, "ocsc_gt_target", False))
@@ -1012,14 +1035,45 @@ class SMARTFlow(LightningModule):
         heading_w = float(getattr(cfg, "ocsc_heading_weight", 0.0))
         pos_w = float(getattr(cfg, "ocsc_position_weight", 1.0))
         rel_disp_w = float(getattr(cfg, "ocsc_rel_disp_weight", 0.0))
+        share_noise_tape = bool(getattr(cfg, "ocsc_share_noise_tape", True))
+        share_noise_across_time = bool(getattr(cfg, "ocsc_share_noise_across_time", False))
+        use_pretrained_ref = bool(getattr(cfg, "ocsc_use_pretrained_ref", False))
+        fm_reg_lambda = float(getattr(cfg, "ocsc_fm_reg_lambda", 0.0))
+
         eval_hard_rmm = bool(getattr(cfg, "ocsc_eval_hard_rmm", False))
         eval_hard_rmm_interval = max(
             1, int(getattr(cfg, "ocsc_eval_hard_rmm_interval", 1))
         )
 
+        # BPTT 토글
+        warm_coarse = max(0, int(getattr(cfg, "bptt_warm_coarse_steps", 0)))
+        last_coarse_only = bool(getattr(cfg, "bptt_last_coarse_only", False))
+        if last_coarse_only and pred_steps > 1:
+            warm_coarse = max(warm_coarse, pred_steps - 1)
+        last_n_coarse = int(getattr(cfg, "bptt_last_n_coarse_steps", 0))
+        if last_n_coarse > 0:
+            warm_coarse = max(warm_coarse, max(0, pred_steps - last_n_coarse))
+        use_adjoint = bool(getattr(cfg, "bptt_use_adjoint", False))
+        last_n_solver = int(getattr(cfg, "bptt_last_n_solver_steps", 0))
+        grad_clip_traj = float(getattr(cfg, "bptt_grad_clip_traj", 0.0))
+        sequential = bool(getattr(cfg, "bptt_sequential_rollouts", False))
+
         agent_enc = self.encoder.agent_encoder
         shift = int(getattr(agent_enc, "shift", 5))
         device = tokenized_agent["batch"].device
+
+        # FlowODE BPTT 속성 일시 활성화 (finally 에서 원복).
+        flow_ode = agent_enc.flow_ode
+        prev_use_adjoint = bool(getattr(flow_ode, "use_adjoint_for_bptt", False))
+        prev_last_n_grad = int(getattr(flow_ode, "last_n_grad_solver_steps", 0))
+        flow_ode.use_adjoint_for_bptt = use_adjoint
+        flow_ode.last_n_grad_solver_steps = (
+            min(last_n_solver, int(getattr(flow_ode, "solver_steps", 0)))
+            if last_n_solver > 0
+            else 0
+        )
+
+        sampling_scheme = self.validation_rollout_sampling
 
         # ── 1. Map encode (no_grad) ──────────────────────────────────────────
         with torch.no_grad():
@@ -1032,7 +1086,6 @@ class SMARTFlow(LightningModule):
                 f"{list(tokenized_agent.keys())}"
             )
         total_2hz_steps = int(tokenized_agent["gt_pos"].shape[1])
-        pred_steps = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
         valid_anchor_end = max(1, total_2hz_steps - pred_steps)
         all_anchor_indices = list(range(0, valid_anchor_end, anchor_stride))
         if len(all_anchor_indices) == 0:
@@ -1040,173 +1093,323 @@ class SMARTFlow(LightningModule):
 
         seq_keys = {"gt_pos", "gt_heading", "valid_mask", "gt_idx"}
 
-        total_loss = torch.zeros((), device=device)
+        # Sequential 모드면 직접 backward 후 loss 누적, 아니면 graph 누적 후 외부 backward.
+        total_loss_value: float = 0.0
+        accumulated_loss: Tensor | None = None
+        fm_reg_total: Tensor | None = None
         n_valid = 0
 
-        # OCSC 8s detached trajectories for optional HardRMM monitoring.
         hard_rmm_traj_list: list[Tensor] = []
         hard_rmm_z_list: list[Tensor] = []
         hard_rmm_head_list: list[Tensor] = []
 
-        sampling_scheme = self.validation_rollout_sampling
+        # ref_flow_decoder swap helper
+        _orig_flow_decoder = agent_enc.flow_decoder
+        ref_decoder = getattr(self, "ref_flow_decoder", None) if use_pretrained_ref else None
 
-        for anchor_idx in all_anchor_indices:
-            tokenized_agent_anchor: Dict[str, Tensor] = {}
-            for key, value in tokenized_agent.items():
-                if (
-                    key in seq_keys
-                    and isinstance(value, torch.Tensor)
-                    and value.dim() >= 2
-                    and value.shape[1] >= anchor_idx + 1
-                ):
-                    tokenized_agent_anchor[key] = value[:, : anchor_idx + 1]
-                else:
-                    tokenized_agent_anchor[key] = value
+        try:
+            for anchor_idx in all_anchor_indices:
+                tokenized_agent_anchor: Dict[str, Tensor] = {}
+                for key, value in tokenized_agent.items():
+                    if (
+                        key in seq_keys
+                        and isinstance(value, torch.Tensor)
+                        and value.dim() >= 2
+                        and value.shape[1] >= anchor_idx + 1
+                    ):
+                        tokenized_agent_anchor[key] = value[:, : anchor_idx + 1]
+                    else:
+                        tokenized_agent_anchor[key] = value
 
-            # ── 2a. Build anchor-local rollout cache ─────────────────────────
-            with torch.no_grad():
-                rollout_cache_anchor = agent_enc.prepare_inference_cache(
-                    tokenized_agent=tokenized_agent_anchor,
-                    map_feature=map_feature,
-                )
-            valid_window = rollout_cache_anchor.get("valid_window", None)
-            if valid_window is None:
-                continue
-            active_mask = valid_window[:, -1]
-            if not bool(active_mask.any()):
-                continue
-            current_pos_active = rollout_cache_anchor["pos_window"][:, -1][active_mask]
-            current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
-            active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
-
-            # ── 2b. Build target (GT or open-loop sample) ────────────────────
-            tgt_norms: list[Tensor] = []
-            tgt_valid: Tensor | None = None
-            if use_gt_target:
-                gt_start = anchor_idx + 1
-                gt_end = gt_start + pred_steps
-                gt_pos_a = tokenized_agent["gt_pos"][active_mask, gt_start:gt_end, :]
-                gt_head_a = tokenized_agent["gt_heading"][active_mask, gt_start:gt_end]
-                gt_valid_a = tokenized_agent["valid_mask"][active_mask, gt_start:gt_end]
-                if gt_pos_a.shape[1] == 0 or not gt_valid_a.any():
-                    continue
-                gt_norm = self._world_traj_to_flow_norm(
-                    gt_pos_a, gt_head_a, current_pos_active, current_head_active,
-                ).detach()
-                tgt_norms = [gt_norm]
-                tgt_valid = gt_valid_a
-            else:
+                # ── 2a. Build anchor-local rollout cache ─────────────────────
                 with torch.no_grad():
-                    for g in range(G):
-                        ol_norm = agent_enc._sample_open_loop_future_from_hidden(
-                            anchor_hidden_valid=active_hidden,
-                            sampling_scheme=sampling_scheme,
-                            sampling_seed=int(self.global_step) * G + g,
+                    rollout_cache_anchor = agent_enc.prepare_inference_cache(
+                        tokenized_agent=tokenized_agent_anchor,
+                        map_feature=map_feature,
+                    )
+                valid_window = rollout_cache_anchor.get("valid_window", None)
+                if valid_window is None:
+                    continue
+                active_mask = valid_window[:, -1]
+                if not bool(active_mask.any()):
+                    continue
+                current_pos_active = rollout_cache_anchor["pos_window"][:, -1][active_mask]
+                current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
+                active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
+                n_agent_full = int(tokenized_agent_anchor["batch"].shape[0])
+                n_step_future_10hz = int(rollout_cache_anchor.get("n_step_future_10hz", pred_steps * shift))
+                tape_steps = n_step_future_10hz + agent_enc.flow_window_steps - shift
+
+                # ── 2b. Build per-rollout noise tapes (shared between OL/CL if toggled) ──
+                shared_tapes: list[Tensor] = []
+                scenario_ids = data.get("scenario_id") if isinstance(data, dict) else None
+                for g in range(G):
+                    if scenario_ids is not None:
+                        seeds_g = self._get_closed_loop_scenario_seeds(
+                            scenario_ids=scenario_ids,
+                            rollout_idx=g,
+                            device=device,
                         )
-                        tgt_norms.append(ol_norm.detach())
-
-            # ── 2c. Closed-loop rollouts (gradient enabled) ──────────────────
-            cl_norms_grad: list[Tensor] = []
-            scenario_ids = data.get("scenario_id") if isinstance(data, dict) else None
-            for g in range(G):
-                if scenario_ids is not None:
-                    seeds_g = self._get_closed_loop_scenario_seeds(
-                        scenario_ids=scenario_ids,
-                        rollout_idx=g,
+                    else:
+                        seeds_g = None
+                    tape_g = agent_enc._build_rollout_noise_tape(
+                        num_agent=n_agent_full,
+                        tape_steps=tape_steps,
                         device=device,
+                        dtype=active_hidden.dtype,
+                        sampling_scheme=sampling_scheme,
+                        sampling_seed=int(self.global_step) * G + g,
+                        scenario_sampling_seeds=seeds_g,
+                        agent_batch=tokenized_agent_anchor["batch"],
+                        share_noise_across_time=share_noise_across_time,
                     )
-                else:
-                    seeds_g = None
-                cl_out = agent_enc.training_rollout_from_cache(
-                    rollout_cache=rollout_cache_anchor,
-                    tokenized_agent=tokenized_agent_anchor,
-                    map_feature=map_feature,
-                    sampling_scheme=sampling_scheme,
-                    sampling_seed=int(self.global_step) * G + g,
-                    scenario_sampling_seeds=seeds_g,
-                    rollout_steps_2hz=pred_steps,
-                )
-                cl_traj_10hz = cl_out["pred_traj_10hz"]
-                cl_head_10hz = cl_out["pred_head_10hz"]
+                    shared_tapes.append(tape_g)
+
+                # ── 2c. Build target (GT or open-loop sample) ────────────────
+                tgt_norms: list[Tensor] = []
+                tgt_valid: Tensor | None = None
                 if use_gt_target:
-                    T_gt = int(tgt_norms[0].shape[1])
-                    xy_2hz = cl_traj_10hz[active_mask][:, shift - 1 :: shift, :][:, :T_gt]
-                    head_2hz = cl_head_10hz[active_mask][:, shift - 1 :: shift][:, :T_gt]
-                    cl_norm = self._world_traj_to_flow_norm(
-                        xy_2hz, head_2hz, current_pos_active, current_head_active,
+                    gt_start = anchor_idx + 1
+                    gt_end = gt_start + pred_steps
+                    gt_pos_a = tokenized_agent["gt_pos"][active_mask, gt_start:gt_end, :]
+                    gt_head_a = tokenized_agent["gt_heading"][active_mask, gt_start:gt_end]
+                    gt_valid_a = tokenized_agent["valid_mask"][active_mask, gt_start:gt_end]
+                    if gt_pos_a.shape[1] == 0 or not gt_valid_a.any():
+                        continue
+                    gt_norm = self._world_traj_to_flow_norm(
+                        gt_pos_a, gt_head_a, current_pos_active, current_head_active,
+                    ).detach()
+                    tgt_norms = [gt_norm]
+                    tgt_valid = gt_valid_a
+                else:
+                    if ref_decoder is not None:
+                        agent_enc.flow_decoder = ref_decoder
+                    try:
+                        with torch.no_grad():
+                            sample_win = agent_enc.flow_window_steps
+                            for g in range(G):
+                                x_init_g = (
+                                    shared_tapes[g][active_mask, :sample_win, :].clone()
+                                    if share_noise_tape
+                                    else None
+                                )
+                                if x_init_g is not None and x_init_g.shape[1] != sample_win:
+                                    x_init_g = None
+                                if x_init_g is not None:
+                                    # _sample_open_loop_future_from_hidden 은 내부에서
+                                    # x_init 을 randn 으로 만든다.  공유를 강제하려면
+                                    # tape 의 첫 sample_win step 을 그대로 noise 로 사용해
+                                    # flow_ode.generate 를 직접 호출한다.
+                                    flow_method = getattr(
+                                        sampling_scheme, "sample_method",
+                                        flow_ode.solver_method,
+                                    )
+                                    flow_steps = getattr(
+                                        sampling_scheme, "sample_steps",
+                                        flow_ode.solver_steps,
+                                    )
+                                    noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
+                                    ol_norm = flow_ode.generate(
+                                        x_init=x_init_g * noise_scale if noise_scale != 1.0 else x_init_g,
+                                        model_fn=lambda x_t, tau: agent_enc.flow_decoder(
+                                            active_hidden, x_t, tau
+                                        ),
+                                        steps=flow_steps,
+                                        method=flow_method,
+                                    )
+                                else:
+                                    ol_norm = agent_enc._sample_open_loop_future_from_hidden(
+                                        anchor_hidden_valid=active_hidden,
+                                        sampling_scheme=sampling_scheme,
+                                        sampling_seed=int(self.global_step) * G + g,
+                                    )
+                                tgt_norms.append(ol_norm.detach())
+                    finally:
+                        if ref_decoder is not None:
+                            agent_enc.flow_decoder = _orig_flow_decoder
+
+                # ── 2d. Closed-loop rollout(s) ───────────────────────────────
+                T_target = int(tgt_norms[0].shape[1]) if tgt_norms else 0
+
+                def _cl_norm_from_out(cl_out: dict) -> Tensor:
+                    cl_traj_10hz = cl_out["pred_traj_10hz"]
+                    cl_head_10hz = cl_out["pred_head_10hz"]
+                    if use_gt_target:
+                        xy = cl_traj_10hz[active_mask][:, shift - 1 :: shift, :][:, :T_target]
+                        hd = cl_head_10hz[active_mask][:, shift - 1 :: shift][:, :T_target]
+                    else:
+                        xy = cl_traj_10hz[active_mask][:, :T_target, :]
+                        hd = cl_head_10hz[active_mask][:, :T_target]
+                    return self._world_traj_to_flow_norm(
+                        xy, hd, current_pos_active, current_head_active,
+                    )
+
+                def _maybe_record_hard_rmm(cl_out: dict) -> None:
+                    if not eval_hard_rmm:
+                        return
+                    if int(self.global_step) % eval_hard_rmm_interval != 0:
+                        return
+                    cl_traj = cl_out["pred_traj_10hz"].detach()
+                    hard_rmm_traj_list.append(cl_traj)
+                    hard_rmm_head_list.append(cl_out["pred_head_10hz"].detach())
+                    if "gt_z_raw" in tokenized_agent:
+                        z_full = tokenized_agent["gt_z_raw"].unsqueeze(1).expand(
+                            -1, cl_traj.shape[1]
+                        )
+                        hard_rmm_z_list.append(z_full.detach())
+
+                def _run_cl(g: int) -> dict:
+                    seeds_g = (
+                        self._get_closed_loop_scenario_seeds(
+                            scenario_ids=scenario_ids,
+                            rollout_idx=g,
+                            device=device,
+                        ) if scenario_ids is not None else None
+                    )
+                    return agent_enc.training_rollout_from_cache(
+                        rollout_cache=rollout_cache_anchor,
+                        tokenized_agent=tokenized_agent_anchor,
+                        map_feature=map_feature,
+                        sampling_scheme=sampling_scheme,
+                        sampling_seed=int(self.global_step) * G + g,
+                        scenario_sampling_seeds=seeds_g,
+                        rollout_steps_2hz=pred_steps,
+                        warm_coarse_steps=warm_coarse,
+                        noise_tape_override=shared_tapes[g] if share_noise_tape else None,
+                        share_noise_across_time=share_noise_across_time,
+                        bptt_grad_clip_traj=grad_clip_traj,
+                    )
+
+                anchor_loss: Tensor | None = None
+
+                if sequential and use_mmd and not use_gt_target and G >= 2:
+                    # 2-pass sequential MMD: peak memory O(1 graph), exact gradient.
+                    cl_norms_det: list[Tensor] = []
+                    sigma_sq_seq: Tensor | None = None
+                    with torch.no_grad():
+                        for g in range(G):
+                            cl_out_d = _run_cl(g)
+                            cl_norms_det.append(_cl_norm_from_out(cl_out_d).detach())
+                            _maybe_record_hard_rmm(cl_out_d)
+                    sigma_sq_seq = mmd_precompute_sigma_sq(
+                        ol_norms=tgt_norms, cl_norms=cl_norms_det,
+                    )
+                    for g in range(G):
+                        cl_out_g = _run_cl(g)
+                        cl_norm_g = _cl_norm_from_out(cl_out_g)
+                        proxy_g = pos_w * mmd_per_rollout_proxy(
+                            cl_norm_g=cl_norm_g,
+                            cl_norms_ref=cl_norms_det,
+                            ol_norms_ref=tgt_norms,
+                            sigma_sq=sigma_sq_seq,
+                        )
+                        # backward 즉시 후 그래프 free.
+                        self.manual_backward(proxy_g) if hasattr(self, "manual_backward") else proxy_g.backward(retain_graph=False)
+                        total_loss_value += float(proxy_g.detach().item())
+                    anchor_loss = None  # 이미 backward 됨
+                else:
+                    cl_norms_grad: list[Tensor] = []
+                    for g in range(G):
+                        cl_out_g = _run_cl(g)
+                        cl_norms_grad.append(_cl_norm_from_out(cl_out_g))
+                        _maybe_record_hard_rmm(cl_out_g)
+                    anchor_loss = self._ocsc_consistency_loss(
+                        cl_norms=cl_norms_grad,
+                        tgt_norms=tgt_norms,
+                        tgt_valid=tgt_valid,
+                        use_mmd=use_mmd,
+                        use_gt_target=use_gt_target,
+                        loss_type=loss_type,
+                        pos_w=pos_w,
+                        rel_disp_w=rel_disp_w,
+                        heading_w=heading_w,
+                    )
+
+                # ── 2e. Optional GT FM regularization ────────────────────────
+                fm_reg_anchor: Tensor | None = None
+                if fm_reg_lambda > 0.0 and use_gt_target and tgt_valid is not None:
+                    # GT 궤적 자체에 FM loss 를 걸어 velocity_head 가 GT 에서 drift 하지
+                    # 않도록 anchor 함께 정규화한다.  detach 된 tgt 에 대한 reverse FM.
+                    gt_norm = tgt_norms[0]
+                    fm_sample = flow_ode.sample(gt_norm, target_type="velocity") if hasattr(flow_ode, "sample") else None
+                    if fm_sample is not None:
+                        v_pred = agent_enc.flow_decoder(
+                            active_hidden, fm_sample.x_t, fm_sample.tau,
+                        )
+                        fm_reg_anchor = fm_reg_lambda * F.mse_loss(v_pred, fm_sample.target)
+
+                if anchor_loss is not None:
+                    if fm_reg_anchor is not None:
+                        anchor_loss = anchor_loss + fm_reg_anchor
+                        fm_reg_total = (fm_reg_total or torch.zeros_like(fm_reg_anchor)) + fm_reg_anchor.detach()
+                    accumulated_loss = (
+                        anchor_loss if accumulated_loss is None else accumulated_loss + anchor_loss
                     )
                 else:
-                    T_ol = int(tgt_norms[0].shape[1])
-                    xy_10hz = cl_traj_10hz[active_mask][:, :T_ol, :]
-                    head_10hz = cl_head_10hz[active_mask][:, :T_ol]
-                    cl_norm = self._world_traj_to_flow_norm(
-                        xy_10hz, head_10hz, current_pos_active, current_head_active,
+                    if fm_reg_anchor is not None:
+                        # sequential 경로에서도 FM reg 는 별도로 backward.
+                        if hasattr(self, "manual_backward"):
+                            self.manual_backward(fm_reg_anchor)
+                        else:
+                            fm_reg_anchor.backward()
+                        total_loss_value += float(fm_reg_anchor.detach().item())
+                        fm_reg_total = (
+                            fm_reg_total
+                            if fm_reg_total is not None
+                            else torch.zeros((), device=device)
+                        ) + fm_reg_anchor.detach()
+                n_valid += 1
+
+            # ── 3. Aggregate / monitoring ────────────────────────────────────
+            if n_valid == 0:
+                final_loss = torch.zeros((), device=device, requires_grad=True)
+            elif accumulated_loss is not None:
+                final_loss = accumulated_loss / float(n_valid)
+            else:
+                # sequential: backward 가 이미 anchor 별로 끝났음.  로깅용 placeholder.
+                final_loss = torch.tensor(
+                    total_loss_value / float(max(n_valid, 1)), device=device,
+                )
+
+            hard_rmm_val: float | None = None
+            if (
+                eval_hard_rmm
+                and len(hard_rmm_traj_list) > 0
+                and isinstance(data, dict)
+                and "tfrecord_path" in data
+            ):
+                try:
+                    agent_ids = (
+                        data["agent"]["id"] if "agent" in data else data.get("id")
                     )
-                cl_norms_grad.append(cl_norm)
+                    if agent_ids is not None:
+                        hard_rmm_val = self._compute_ocsc_train_hard_rmm(
+                            scenario_files=list(data["tfrecord_path"]),
+                            agent_ids=agent_ids,
+                            agent_batch=tokenized_agent["batch"],
+                            traj_list=hard_rmm_traj_list,
+                            z_list=hard_rmm_z_list,
+                            head_list=hard_rmm_head_list,
+                        )
+                except Exception as exc:
+                    log.warning(f"[ocsc_ft] HardRMM monitoring failed: {exc}")
 
-                if eval_hard_rmm and (
-                    int(self.global_step) % eval_hard_rmm_interval == 0
-                ):
-                    hard_rmm_traj_list.append(cl_traj_10hz.detach())
-                    hard_rmm_head_list.append(cl_head_10hz.detach())
-                    z_full = tokenized_agent["gt_z_raw"].unsqueeze(1).expand(
-                        -1, cl_traj_10hz.shape[1]
-                    )
-                    hard_rmm_z_list.append(z_full.detach())
-
-            # ── 2d. Consistency loss ─────────────────────────────────────────
-            anchor_loss = self._ocsc_consistency_loss(
-                cl_norms=cl_norms_grad,
-                tgt_norms=tgt_norms,
-                tgt_valid=tgt_valid,
-                use_mmd=use_mmd,
-                use_gt_target=use_gt_target,
-                loss_type=loss_type,
-                pos_w=pos_w,
-                rel_disp_w=rel_disp_w,
-                heading_w=heading_w,
-            )
-            total_loss = total_loss + anchor_loss
-            n_valid += 1
-
-        if n_valid == 0:
             return {
-                "loss": torch.zeros((), device=device, requires_grad=True),
+                "loss": final_loss,
                 "n_anchors": len(all_anchor_indices),
-                "n_valid_anchors": 0,
-                "hard_rmm": None,
+                "n_valid_anchors": n_valid,
+                "hard_rmm": hard_rmm_val,
+                "fm_reg_loss": (
+                    float(fm_reg_total.item()) if fm_reg_total is not None else None
+                ),
+                "sequential_backward_done": sequential and use_mmd and not use_gt_target and G >= 2,
             }
-
-        avg_loss = total_loss / float(n_valid)
-
-        # ── 3. Optional HardRMM monitoring ───────────────────────────────────
-        hard_rmm_val: float | None = None
-        if (
-            eval_hard_rmm
-            and len(hard_rmm_traj_list) > 0
-            and isinstance(data, dict)
-            and "tfrecord_path" in data
-        ):
-            try:
-                agent_ids = data["agent"]["id"] if "agent" in data else data.get("id")
-                if agent_ids is not None:
-                    hard_rmm_val = self._compute_ocsc_train_hard_rmm(
-                        scenario_files=list(data["tfrecord_path"]),
-                        agent_ids=agent_ids,
-                        agent_batch=tokenized_agent["batch"],
-                        traj_list=hard_rmm_traj_list,
-                        z_list=hard_rmm_z_list,
-                        head_list=hard_rmm_head_list,
-                    )
-            except Exception as exc:
-                log.warning(f"[ocsc_ft] HardRMM monitoring failed: {exc}")
-
-        return {
-            "loss": avg_loss,
-            "n_anchors": len(all_anchor_indices),
-            "n_valid_anchors": n_valid,
-            "hard_rmm": hard_rmm_val,
-        }
+        finally:
+            # FlowODE BPTT 속성 원복.
+            flow_ode.use_adjoint_for_bptt = prev_use_adjoint
+            flow_ode.last_n_grad_solver_steps = prev_last_n_grad
+            if ref_decoder is not None:
+                agent_enc.flow_decoder = _orig_flow_decoder
 
     def _ocsc_consistency_loss(
         self,
