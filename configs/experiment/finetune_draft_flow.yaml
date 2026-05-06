@@ -17,10 +17,10 @@ model:
       train_full_flow_decoder_only: true
     draft:
       enabled: true
-      loss_enabled: false
+      loss_enabled: true
       start_epoch: 0
       ramp_epochs: 32
-      max_weight: 0.1
+      max_weight: 0.15
       sampling:
         sample_steps: 32
         sample_method: euler
@@ -48,8 +48,8 @@ model:
         vehicle_steer_rate_max_radps: 0.8
         bicycle_steer_rate_max_radps: 1.4
         use_slip_penalty: false
-        commit_loss_weight: 2.0
-        soft_limit_ratio: 0.8
+        commit_loss_weight: 1.0
+        soft_limit_ratio: 1.0
         topk_violation_k: 20
         pedestrian_heading_weight: 0.05
         pedestrian_heading_speed_threshold_mps: 0.5

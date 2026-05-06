@@ -40,7 +40,7 @@ model_config:
     noise_scale: 1.0
   draft:
     enabled: false
-    loss_enabled: false
+    loss_enabled: true
     start_epoch: 0
     ramp_epochs: 4
     max_weight: 1.0
@@ -78,8 +78,8 @@ model_config:
       soft_weight: 0.25
       compare_softness_to_gt: false
       use_slip_penalty: false
-      commit_loss_weight: 2.0
-      soft_limit_ratio: 0.8
+      commit_loss_weight: 1.0
+      soft_limit_ratio: 1.0
       topk_violation_k: 20
       pedestrian_heading_weight: 0.05
       pedestrian_heading_speed_threshold_mps: 0.5
