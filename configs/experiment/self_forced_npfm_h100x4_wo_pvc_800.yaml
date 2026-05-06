@@ -30,7 +30,7 @@ model:
     lr: 1.0e-6
     self_forced:
       use_stop_motion: false
-      estimator_warmup_epochs: 1
+      estimator_warmup_epochs: 4
 
 data:
   train_batch_size: 22
