@@ -767,7 +767,12 @@ class SMARTFlow(LightningModule):
 
         Returns:
             dict: ``{"loss": Tensor[], "n_anchors": int,
-                "n_valid_anchors": int, "fm_reg_loss": float | None}``.
+                "n_valid_anchors": int, "fm_reg_loss": float | None,
+                "consistency_loss": float, "fm_reg_loss_avg": float | None,
+                "sequential_backward_done": bool}``.
+                ``consistency_loss`` 는 anchor 평균 consistency 항이고,
+                ``fm_reg_loss_avg`` 는 anchor 평균 FM regularization 항이다
+                (둘 다 wandb 분리 로깅에 사용).
         """
         import torch.nn.functional as F
         from src.smart.metrics.mmd_consistency_loss import (
@@ -872,6 +877,8 @@ class SMARTFlow(LightningModule):
         total_loss_value: float = 0.0
         accumulated_loss: Tensor | None = None
         fm_reg_total: Tensor | None = None
+        # consistency component (FM reg 분리) 로깅용 누적기 — detached scalar sum.
+        consistency_total_value: float = 0.0
         n_valid = 0
 
         # ref_flow_decoder swap helper
@@ -1130,7 +1137,9 @@ class SMARTFlow(LightningModule):
                         )
                         # backward 즉시 후 그래프 free.
                         self.manual_backward(proxy_g) if hasattr(self, "manual_backward") else proxy_g.backward(retain_graph=False)
-                        total_loss_value += float(proxy_g.detach().item())
+                        proxy_g_value = float(proxy_g.detach().item())
+                        total_loss_value += proxy_g_value
+                        consistency_total_value += proxy_g_value
                     anchor_loss = None  # 이미 backward 됨
                 else:
                     # G rollout 을 한 번의 batched forward 로 실행 (chunk_size==G).
@@ -1209,6 +1218,8 @@ class SMARTFlow(LightningModule):
                                 )
 
                 if anchor_loss is not None:
+                    # FM reg 와 합치기 전 pure consistency 값을 따로 기록.
+                    consistency_total_value += float(anchor_loss.detach().item())
                     if fm_reg_anchor is not None:
                         anchor_loss = anchor_loss + fm_reg_anchor
                         fm_reg_total = (fm_reg_total or torch.zeros_like(fm_reg_anchor)) + fm_reg_anchor.detach()
@@ -1241,6 +1252,11 @@ class SMARTFlow(LightningModule):
                     total_loss_value / float(max(n_valid, 1)), device=device,
                 )
 
+            denom = float(max(n_valid, 1))
+            consistency_loss_avg = consistency_total_value / denom
+            fm_reg_loss_avg = (
+                float(fm_reg_total.item()) / denom if fm_reg_total is not None else None
+            )
             return {
                 "loss": final_loss,
                 "n_anchors": len(all_anchor_indices),
@@ -1248,6 +1264,8 @@ class SMARTFlow(LightningModule):
                 "fm_reg_loss": (
                     float(fm_reg_total.item()) if fm_reg_total is not None else None
                 ),
+                "consistency_loss": consistency_loss_avg,
+                "fm_reg_loss_avg": fm_reg_loss_avg,
                 "sequential_backward_done": sequential and use_mmd and not use_gt_target and G >= 2,
             }
         finally:
@@ -2480,6 +2498,18 @@ class SMARTFlow(LightningModule):
             float(result["n_valid_anchors"]),
             **log_kwargs,
         )
+        # Consistency / flow-matching 분리 로깅 (둘 다 per-anchor 평균).
+        self.log(
+            "train_ocsc/loss_consistency",
+            float(result.get("consistency_loss", 0.0) or 0.0),
+            **log_kwargs,
+        )
+        if result.get("fm_reg_loss_avg") is not None:
+            self.log(
+                "train_ocsc/loss_fm",
+                float(result["fm_reg_loss_avg"]),
+                **log_kwargs,
+            )
         if result.get("fm_reg_loss") is not None:
             self.log("train_ocsc/fm_reg_loss", float(result["fm_reg_loss"]), **log_kwargs)
         return loss
