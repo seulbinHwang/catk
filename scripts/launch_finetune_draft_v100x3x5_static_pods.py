@@ -277,6 +277,18 @@ git pull --ff-only origin {shq(args.branch)}
 if tmux has-session -t {shq(args.session)} 2>/dev/null; then
   tmux kill-session -t {shq(args.session)}
 fi
+TASK_NAME_TO_STOP={shq(args.task_name)}
+mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+if (( ${{#pids[@]}} > 0 )); then
+  echo "[launcher] terminating stale task processes for $TASK_NAME_TO_STOP: ${{pids[*]}}"
+  kill -TERM "${{pids[@]}}" 2>/dev/null || true
+  sleep 10
+  mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+  if (( ${{#pids[@]}} > 0 )); then
+    echo "[launcher] force killing stale task processes for $TASK_NAME_TO_STOP: ${{pids[*]}}"
+    kill -KILL "${{pids[@]}}" 2>/dev/null || true
+  fi
+fi
 """
     else:
         replace_block = f"""
@@ -323,13 +335,25 @@ echo "[launcher] tmux log: {tmux_log}"
 """
 
 
-def render_stop_command(session: str) -> str:
+def render_stop_command(session: str, task_name: str) -> str:
     return f"""set -Eeuo pipefail
 if tmux has-session -t {shq(session)} 2>/dev/null; then
   tmux kill-session -t {shq(session)}
   echo "[launcher] stopped tmux session {session}"
 else
   echo "[launcher] tmux session not found: {session}"
+fi
+TASK_NAME_TO_STOP={shq(task_name)}
+mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+if (( ${{#pids[@]}} > 0 )); then
+  echo "[launcher] terminating task processes for $TASK_NAME_TO_STOP: ${{pids[*]}}"
+  kill -TERM "${{pids[@]}}" 2>/dev/null || true
+  sleep 10
+  mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+  if (( ${{#pids[@]}} > 0 )); then
+    echo "[launcher] force killing task processes for $TASK_NAME_TO_STOP: ${{pids[*]}}"
+    kill -KILL "${{pids[@]}}" 2>/dev/null || true
+  fi
 fi
 """
 
@@ -418,7 +442,7 @@ def main() -> None:
 
     if args.stop:
         for pod in args.pods:
-            exec_in_pod(args, pod, render_stop_command(args.session))
+            exec_in_pod(args, pod, render_stop_command(args.session, args.task_name))
         return
 
     master_addr = args.master_addr or (

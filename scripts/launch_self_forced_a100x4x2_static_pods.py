@@ -398,7 +398,10 @@ PY
 }}
 
 find_latest_self_forced_ckpt() {{
-  ls -t "$LOG_DIR/$TASK_NAME/runs"/*/checkpoints/epoch_last.ckpt 2>/dev/null | head -1
+  {{
+    ls -t "$LOG_DIR/$TASK_NAME/runs"/*/checkpoints/epoch_last.ckpt 2>/dev/null
+    ls -t "$LOG_DIR/$TASK_NAME/runs"/*/checkpoints/last.ckpt 2>/dev/null
+  }} | head -1
 }}
 
 write_attempt_status() {{
@@ -461,6 +464,50 @@ terminate_process_group() {{
   kill -KILL -- "-$pgid" 2>/dev/null || true
 }}
 
+task_process_pids() {{
+  pgrep -f "task_name=${{TASK_NAME}}" 2>/dev/null | while read -r pid; do
+    if [[ -n "$pid" && "$pid" != "$$" && "$pid" != "${{BASHPID:-}}" ]]; then
+      echo "$pid"
+    fi
+  done
+}}
+
+terminate_task_processes() {{
+  local reason="${{1:-cleanup}}"
+  local grace_sec="${{TASK_PROCESS_KILL_GRACE_SEC:-15}}"
+  local waited=0
+  local pids=()
+
+  mapfile -t pids < <(task_process_pids || true)
+  if (( ${{#pids[@]}} == 0 )); then
+    return 0
+  fi
+
+  echo "[self-forced-a100x4x2] terminating task processes for $reason: ${{pids[*]}}"
+  kill -TERM "${{pids[@]}}" 2>/dev/null || true
+  while (( waited < grace_sec )); do
+    sleep 1
+    waited=$(( waited + 1 ))
+    mapfile -t pids < <(task_process_pids || true)
+    if (( ${{#pids[@]}} == 0 )); then
+      return 0
+    fi
+  done
+
+  echo "[self-forced-a100x4x2] force killing task processes for $reason: ${{pids[*]}}"
+  kill -KILL "${{pids[@]}}" 2>/dev/null || true
+}}
+
+terminate_attempt_processes() {{
+  local pgid_file="$1"
+  local reason="$2"
+  local pgid=""
+
+  pgid="$(cat "$pgid_file" 2>/dev/null || true)"
+  terminate_process_group "$pgid"
+  terminate_task_processes "$reason"
+}}
+
 run_torchrun_attempt() {{
   local torch_status_file="$RUN_ROOT/$(hostname).${{attempt_tag}}.torchrun_status"
   local torch_pgid_file="$RUN_ROOT/$(hostname).${{attempt_tag}}.torchrun_pgid"
@@ -471,6 +518,7 @@ run_torchrun_attempt() {{
   local status="1"
 
   rm -f "$torch_status_file" "$torch_pgid_file" "$oom_watch_file"
+  terminate_task_processes "pre-attempt stale cleanup for $attempt_tag"
 
   (
     set +e
@@ -485,8 +533,7 @@ run_torchrun_attempt() {{
     while kill -0 "$tee_pid" 2>/dev/null; do
       if global_attempt_has_oom; then
         echo "[self-forced-a100x4x2] remote OOM observed for $attempt_tag; terminating local torchrun group"
-        pgid="$(cat "$torch_pgid_file" 2>/dev/null || true)"
-        terminate_process_group "$pgid"
+        terminate_attempt_processes "$torch_pgid_file" "remote OOM on $attempt_tag"
         touch "$oom_watch_file"
         exit 0
       fi
@@ -506,6 +553,9 @@ run_torchrun_attempt() {{
   fi
   if [[ -f "$oom_watch_file" && "$status" == "0" ]]; then
     status="1"
+  fi
+  if [[ "$status" != "0" || -f "$oom_watch_file" ]]; then
+    terminate_attempt_processes "$torch_pgid_file" "post-attempt cleanup for $attempt_tag status=$status"
   fi
   return "$status"
 }}
@@ -611,6 +661,7 @@ while (( bs >= MIN_BS )); do
   if global_attempt_has_oom; then
     next_bs=$(( bs - OOM_STEP ))
     echo "[self-forced-a100x4x2] OOM detected on at least one node in attempt $attempt; all nodes lowering bs $bs -> $next_bs"
+    terminate_task_processes "OOM retry cleanup before next attempt"
     sleep "${{OOM_RETRY_RESTART_GRACE_SEC:-10}}"
     bs="$next_bs"
     continue
@@ -726,13 +777,25 @@ echo "[launcher] tmux log: {tmux_log}"
 """
 
 
-def render_stop_command(session: str) -> str:
+def render_stop_command(session: str, task_name: str) -> str:
     return f"""set -Eeuo pipefail
 if tmux has-session -t {shq(session)} 2>/dev/null; then
   tmux kill-session -t {shq(session)}
   echo "[launcher] stopped tmux session {session}"
 else
   echo "[launcher] tmux session not found: {session}"
+fi
+TASK_NAME_TO_STOP={shq(task_name)}
+mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+if (( ${{#pids[@]}} > 0 )); then
+  echo "[launcher] terminating task processes for $TASK_NAME_TO_STOP: ${{pids[*]}}"
+  kill -TERM "${{pids[@]}}" 2>/dev/null || true
+  sleep 10
+  mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+  if (( ${{#pids[@]}} > 0 )); then
+    echo "[launcher] force killing task processes for $TASK_NAME_TO_STOP: ${{pids[*]}}"
+    kill -KILL "${{pids[@]}}" 2>/dev/null || true
+  fi
 fi
 """
 
@@ -844,7 +907,7 @@ def main() -> None:
 
     if args.stop:
         for pod in args.pods:
-            exec_in_pod(args, pod, render_stop_command(args.session))
+            exec_in_pod(args, pod, render_stop_command(args.session, args.task_name))
         return
 
     master_addr = args.master_addr or (

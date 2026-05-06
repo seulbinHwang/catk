@@ -149,6 +149,59 @@ torch_status_file="$RUN_ROOT/$(hostname).torchrun_status"
 torch_pgid_file="$RUN_ROOT/$(hostname).torchrun_pgid"
 rm -f "$torch_status_file" "$torch_pgid_file"
 
+terminate_process_group() {{
+  local pgid="$1"
+  if [[ -z "$pgid" || "$pgid" == "0" ]]; then
+    return 0
+  fi
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  sleep "${{REMOTE_KILL_GRACE_SEC:-20}}"
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+}}
+
+task_process_pids() {{
+  pgrep -f "task_name=${{TASK_NAME}}" 2>/dev/null | while read -r pid; do
+    if [[ -n "$pid" && "$pid" != "$$" && "$pid" != "${{BASHPID:-}}" ]]; then
+      echo "$pid"
+    fi
+  done
+}}
+
+terminate_task_processes() {{
+  local reason="${{1:-cleanup}}"
+  local grace_sec="${{TASK_PROCESS_KILL_GRACE_SEC:-15}}"
+  local waited=0
+  local pids=()
+
+  mapfile -t pids < <(task_process_pids || true)
+  if (( ${{#pids[@]}} == 0 )); then
+    return 0
+  fi
+
+  echo "[tmux-run] terminating task processes for $reason: ${{pids[*]}}"
+  kill -TERM "${{pids[@]}}" 2>/dev/null || true
+  while (( waited < grace_sec )); do
+    sleep 1
+    waited=$(( waited + 1 ))
+    mapfile -t pids < <(task_process_pids || true)
+    if (( ${{#pids[@]}} == 0 )); then
+      return 0
+    fi
+  done
+
+  echo "[tmux-run] force killing task processes for $reason: ${{pids[*]}}"
+  kill -KILL "${{pids[@]}}" 2>/dev/null || true
+}}
+
+terminate_attempt_processes() {{
+  local pgid=""
+  pgid="$(cat "$torch_pgid_file" 2>/dev/null || true)"
+  terminate_process_group "$pgid"
+  terminate_task_processes "$1"
+}}
+
+terminate_task_processes "pre-run stale cleanup"
+
 (
   set +e
   setsid bash -c 'pgid_file="$1"; shift; echo "$$" > "$pgid_file"; exec "$@"' \
@@ -159,6 +212,9 @@ runner_pid=$!
 
 wait "$runner_pid"
 status="$(cat "$torch_status_file" 2>/dev/null || echo 1)"
+if [[ "$status" != "0" ]]; then
+  terminate_attempt_processes "post-run cleanup status=$status"
+fi
 
 echo
 echo "[tmux-run] exited with status $status at $(date '+%F %T')"
@@ -275,13 +331,25 @@ echo "[launcher] tmux log: {log_file}"
 """
 
 
-def render_stop_command(session: str) -> str:
+def render_stop_command(session: str, task_name: str) -> str:
     return f"""set -Eeuo pipefail
 if tmux has-session -t {shq(session)} 2>/dev/null; then
   tmux kill-session -t {shq(session)}
   echo "[launcher] stopped tmux session {session}"
 else
   echo "[launcher] tmux session not found: {session}"
+fi
+TASK_NAME_TO_STOP={shq(task_name)}
+mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+if (( ${{#pids[@]}} > 0 )); then
+  echo "[launcher] terminating task processes for $TASK_NAME_TO_STOP: ${{pids[*]}}"
+  kill -TERM "${{pids[@]}}" 2>/dev/null || true
+  sleep 10
+  mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+  if (( ${{#pids[@]}} > 0 )); then
+    echo "[launcher] force killing task processes for $TASK_NAME_TO_STOP: ${{pids[*]}}"
+    kill -KILL "${{pids[@]}}" 2>/dev/null || true
+  fi
 fi
 """
 
@@ -396,7 +464,7 @@ def main() -> None:
                 args.namespace,
                 args.container,
                 pod,
-                render_stop_command(args.session),
+                render_stop_command(args.session, args.task_name),
                 dry_run=args.dry_run,
             )
         return

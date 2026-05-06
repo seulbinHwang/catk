@@ -74,7 +74,7 @@ find_latest_epoch_last_ckpt() {
   local runs_dir runs_dir_q cmd
   runs_dir="${REMOTE_LOG_DIR%/}/${TASK_NAME}/runs"
   runs_dir_q="$(remote_quote "$runs_dir")"
-  cmd="ls -t ${runs_dir_q}/*/checkpoints/epoch_last.ckpt 2>/dev/null | head -1"
+  cmd="{ ls -t ${runs_dir_q}/*/checkpoints/epoch_last.ckpt 2>/dev/null; ls -t ${runs_dir_q}/*/checkpoints/last.ckpt 2>/dev/null; } | head -1"
   kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "$cmd" 2>/dev/null | tr -d '\r'
 }
 
@@ -169,15 +169,38 @@ find_remote_oom_pod() {
 }
 
 stop_attempt_sessions() {
-  local pod run_root run_root_q session_q pod_q grace
+  local pod run_root run_root_q session_q pod_q task_q grace
   run_root="$(remote_run_root)"
   run_root_q="$(remote_quote "$run_root")"
   session_q="$(remote_quote "$SESSION")"
+  task_q="$(remote_quote "$TASK_NAME")"
   grace="${REMOTE_KILL_GRACE_SEC:-20}"
   for pod in "${POD_ARRAY[@]}"; do
     pod_q="$(remote_quote "$pod")"
     kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
 set +e
+TASK_NAME_TO_STOP=${task_q}
+task_process_pids() {
+  pgrep -f \"task_name=\${TASK_NAME_TO_STOP}\" 2>/dev/null | while read -r pid; do
+    if [[ -n \"\$pid\" && \"\$pid\" != \"\$\$\" && \"\$pid\" != \"\${BASHPID:-}\" ]]; then
+      echo \"\$pid\"
+    fi
+  done
+}
+terminate_task_processes() {
+  local pids=()
+  mapfile -t pids < <(task_process_pids || true)
+  if (( \${#pids[@]} > 0 )); then
+    echo \"terminating task processes for \${TASK_NAME_TO_STOP}: \${pids[*]}\"
+    kill -TERM \"\${pids[@]}\" 2>/dev/null || true
+    sleep ${grace}
+    mapfile -t pids < <(task_process_pids || true)
+    if (( \${#pids[@]} > 0 )); then
+      echo \"force killing task processes for \${TASK_NAME_TO_STOP}: \${pids[*]}\"
+      kill -KILL \"\${pids[@]}\" 2>/dev/null || true
+    fi
+  fi
+}
 pgid_file=${run_root_q}/${pod_q}.torchrun_pgid
 if [[ -f \"\$pgid_file\" ]]; then
   pgid=\"\$(cat \"\$pgid_file\" 2>/dev/null || true)\"
@@ -187,6 +210,7 @@ if [[ -f \"\$pgid_file\" ]]; then
     kill -KILL -- \"-\$pgid\" 2>/dev/null || true
   fi
 fi
+terminate_task_processes
 tmux kill-session -t ${session_q} 2>/dev/null || true
 " >/dev/null 2>&1 || true
   done
@@ -223,6 +247,7 @@ while (( bs >= MIN_BS )); do
   fi
   log "  local attempt log -> ${attempt_log}"
 
+  stop_attempt_sessions
   if ! start_attempt "$bs" "$latest_ckpt"; then
     log "launcher failed before torchrun completed."
     exit 1
