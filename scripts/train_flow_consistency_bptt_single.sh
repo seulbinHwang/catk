@@ -139,7 +139,7 @@ FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
 # ── LoRA fine-tuning (옵션) ─────────────────────────────────────────────────
 # OCSC_LORA_ENABLED=true 이면 t_attn_layers.{to_q,to_v} 12 개에 LoRA wrap
 # 하고 encoder 의 다른 파라미터는 모두 freeze (LoRA-only).
-OCSC_LORA_ENABLED="${OCSC_LORA_ENABLED:-false}"
+OCSC_LORA_ENABLED="${OCSC_LORA_ENABLED:-true}"
 OCSC_LORA_R="${OCSC_LORA_R:-8}"
 OCSC_LORA_ALPHA="${OCSC_LORA_ALPHA:-16}"
 OCSC_LORA_DROPOUT="${OCSC_LORA_DROPOUT:-0.0}"
