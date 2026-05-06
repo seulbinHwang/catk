@@ -15,6 +15,7 @@ from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import (
+    HardSimAgentsMetrics,
     SimAgentsMetrics,
     SimAgentsSubmission,
     WOSACDistributionMetrics,
@@ -61,6 +62,7 @@ from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.smart.utils.flow_horizon import format_flow_horizon_tag
+from src.smart.utils.rollout import transform_to_local
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -846,6 +848,45 @@ class SMARTFlow(LightningModule):
             return tensor
         repeat_pattern = (repeat_count,) + (1,) * tensor.dim()
         return tensor.unsqueeze(0).repeat(repeat_pattern).flatten(0, 1).contiguous()
+
+    def _world_traj_to_flow_norm(
+        self,
+        pred_traj: Tensor,
+        pred_head: Tensor,
+        current_pos: Tensor,
+        current_head: Tensor,
+    ) -> Tensor:
+        """World-coordinate trajectory를 anchor frame normalized flow space로 변환합니다.
+
+        OCSC consistency loss는 동일한 4채널 정규화 표현(``[x/20, y/20, cos h, sin h]``)
+        에서 비교해야 의미가 있습니다.  이 헬퍼는 closed-loop rollout 산출물(world frame)을
+        open-loop sample / GT (anchor-local 4ch) 와 같은 표현으로 옮깁니다.
+
+        Args:
+            pred_traj: ``[n, T, 2]`` world XY 궤적입니다 (10Hz 또는 2Hz).
+            pred_head: ``[n, T]`` world heading 입니다.
+            current_pos: ``[n, 2]`` anchor 시점의 reference 위치입니다.
+            current_head: ``[n]`` anchor 시점의 reference heading 입니다.
+
+        Returns:
+            Tensor:
+                ``[n, T, 4]`` normalized 텐서입니다.  채널 순서는 ``x/20, y/20, cos, sin``.
+        """
+        pos_local, head_local = transform_to_local(
+            pos_global=pred_traj,
+            head_global=pred_head,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        return torch.stack(
+            [
+                pos_local[..., 0] / 20.0,
+                pos_local[..., 1] / 20.0,
+                head_local.cos(),
+                head_local.sin(),
+            ],
+            dim=-1,
+        )
 
     def _expand_batch_index_for_rollouts(
         self,
