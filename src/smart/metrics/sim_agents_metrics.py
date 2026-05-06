@@ -949,6 +949,13 @@ def _resolve_sim_agents_metric_workers(configured_workers: int) -> int:
             f"sim_agents_metric_workers must be an integer, got {configured_workers!r}."
         ) from exc
 
+    # Env override takes precedence so users can size the validation pool
+    # per-launch without editing yaml.  Mirrors HardSimAgentsMetrics'
+    # WOSAC_HARD_POOL_WORKERS convention.  Negative values fall through.
+    env_override = _read_nonnegative_int_env("WOSAC_REAL_POOL_WORKERS", -1)
+    if env_override > 0:
+        return env_override
+
     if configured_workers > 0:
         return configured_workers
 
