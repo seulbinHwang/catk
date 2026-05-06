@@ -11,9 +11,10 @@
 #   * Single-node DDP: trainer.num_nodes=1, trainer.devices=4
 #   * H100 precision: bf16-mixed
 #   * Generator lr: 1e-6
-#   * self_forced.estimator_warmup_epochs=1
+#   * trainer.max_epochs=10, trainer.check_val_every_n_epoch=2
+#   * self_forced.estimator_warmup_epochs=4
 #   * self_forced.use_stop_motion=false for the training self-rollout
-#   * data.train_batch_size=22
+#   * data.train_batch_size=28
 # ============================================================================
 
 defaults:
@@ -24,6 +25,8 @@ trainer:
   num_nodes: 1
   devices: 4
   precision: bf16-mixed
+  max_epochs: 10
+  check_val_every_n_epoch: 2
 
 model:
   model_config:
@@ -33,7 +36,7 @@ model:
       estimator_warmup_epochs: 4
 
 data:
-  train_batch_size: 22
+  train_batch_size: 28
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4

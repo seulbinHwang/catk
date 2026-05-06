@@ -19,7 +19,7 @@
 # Optional knobs (env vars; sensible defaults shown):
 #   INITIAL_BS=28        Initial `data.train_batch_size`. Defaults to the
 #                        preset's conservative random-terminal setting.
-#   OOM_STEP=4           Decrement applied to `data.train_batch_size` per OOM.
+#   OOM_STEP=2           Decrement applied to `data.train_batch_size` per OOM.
 #   MIN_BS=2             Stop trying when `bs` would fall below this value.
 #   TASK_NAME=flow_semi_continuous_self_forced_h1004
 #   CACHE_ROOT=/mnt/nuplan/womd_v1_3/SMART_cache
@@ -34,6 +34,7 @@
 #   LIMIT_TRAIN_BATCHES=         Optional Trainer limit_train_batches override.
 #   LIMIT_VAL_BATCHES=           Optional Trainer limit_val_batches override.
 #   MAX_EPOCHS=                  Optional Trainer max_epochs override.
+#   CHECK_VAL_EVERY_N_EPOCH=     Optional Trainer check_val_every_n_epoch override.
 #   RANDOM_TERMINAL_SCOPE=         Optional override: global_batch.
 #   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform.
 #   BACKPROP_LAST_K=              Optional policy=all gradient-step override.
@@ -64,7 +65,7 @@ TASK_NAME="${TASK_NAME:-flow_semi_continuous_self_forced_h1004}"
 CACHE_ROOT="${CACHE_ROOT:-/mnt/nuplan/womd_v1_3/SMART_cache}"
 CATK_LOG_DIR="${CATK_LOG_DIR:-${REPO_ROOT}/logs}"
 INITIAL_BS="${INITIAL_BS:-28}"
-OOM_STEP="${OOM_STEP:-4}"
+OOM_STEP="${OOM_STEP:-2}"
 MIN_BS="${MIN_BS:-2}"
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -85,6 +86,9 @@ if [[ -n "${LIMIT_VAL_BATCHES:-}" ]]; then
 fi
 if [[ -n "${MAX_EPOCHS:-}" ]]; then
   EXTRA_OVERRIDES+=("trainer.max_epochs=${MAX_EPOCHS}")
+fi
+if [[ -n "${CHECK_VAL_EVERY_N_EPOCH:-}" ]]; then
+  EXTRA_OVERRIDES+=("trainer.check_val_every_n_epoch=${CHECK_VAL_EVERY_N_EPOCH}")
 fi
 if [[ -n "${CATK_LR:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.lr=${CATK_LR}")

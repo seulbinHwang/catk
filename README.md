@@ -1210,11 +1210,12 @@ scripts/launch_self_forced_h100x4_wo_pvc_800.py
 - 대상 pod: `wo-pvc-800`
 - `trainer.num_nodes=1`, `trainer.devices=4` -> 총 4 DDP ranks
 - H100용 `trainer.precision=bf16-mixed`
+- `trainer.max_epochs=10`, `trainer.check_val_every_n_epoch=2`
 - `model.model_config.lr=1.0e-6`
-- `model.model_config.self_forced.estimator_warmup_epochs=1`
+- `model.model_config.self_forced.estimator_warmup_epochs=4`
 - `model.model_config.self_forced.use_stop_motion=false`
-- `data.train_batch_size=22`
-- OOM 시 launcher가 호출하는 retry wrapper가 `22 -> 20 -> 18 -> ...` 순서로 batch size를 낮춰 재시도
+- `data.train_batch_size=28`
+- OOM 시 launcher가 호출하는 retry wrapper가 `28 -> 26 -> 24 -> ...` 순서로 batch size를 낮춰 재시도
 
 pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
 
@@ -1243,7 +1244,7 @@ python scripts/launch_self_forced_h100x4_wo_pvc_800.py \
   --limit-train-batches 20 \
   --limit-val-batches 0 \
   --max-epochs 1 \
-  --task-name flow_self_forced_h100x4_wo_pvc_800_stopfalse_warmup1_lr1e-6_bs22_smoke
+  --task-name flow_self_forced_h100x4_wo_pvc_800_stopfalse_warmup4_lr1e-6_bs28_smoke
 ```
 
 attach:

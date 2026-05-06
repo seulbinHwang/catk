@@ -34,7 +34,7 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 DEFAULT_TASK_NAME = (
     "flow_self_forced_h100x4_wo_pvc_800_"
-    "use_stop_motion_false_estimator_warmup_1_lr1e-6_bs22"
+    "use_stop_motion_false_estimator_warmup_4_lr1e-6_bs28"
 )
 DEFAULT_SESSION = "catk-sf-h100x4-wo-pvc-800"
 
@@ -86,6 +86,7 @@ def render_env(args: argparse.Namespace) -> str:
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
         "MAX_EPOCHS": args.max_epochs,
+        "CHECK_VAL_EVERY_N_EPOCH": args.check_val_every_n_epoch,
         "UNFROZEN_RANGE": args.unfrozen_range,
         "DECODER_USE_STOP_MOTION": args.decoder_use_stop_motion,
         "RANDOM_TERMINAL_SCOPE": args.random_terminal_scope,
@@ -281,7 +282,7 @@ cat > {shq(monitor_file)} <<'CATK_MONITOR'
 CATK_MONITOR
 chmod +x {shq(monitor_file)}
 tmux split-window -v -l 12 -t {shq(args.session)} {shq(monitor_file)}
-tmux select-pane -t {shq(args.session)}:0.0
+tmux select-pane -t {shq(args.session)}
 """
 
     return f"""set -Eeuo pipefail
@@ -302,7 +303,7 @@ CATK_WORKER
 chmod +x {shq(worker_file)}
 : > {shq(tmux_log)}
 tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(worker_file)}
-tmux pipe-pane -t {shq(args.session)}:0.0 -o {shq('cat >> ' + shq(tmux_log))}
+tmux pipe-pane -t {shq(args.session)} -o {shq('cat >> ' + shq(tmux_log))}
 {monitor_block}
 echo "[launcher] started {args.session} on {args.pod}"
 echo "[launcher] tmux log: {tmux_log}"
@@ -360,16 +361,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3")
     parser.add_argument("--nproc-per-node", type=int, default=4)
-    parser.add_argument("--initial-bs", type=int, default=22)
+    parser.add_argument("--initial-bs", type=int, default=28)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--val-batch-size", default="")
     parser.add_argument("--test-batch-size", default="")
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
-    parser.add_argument("--max-epochs", default="")
+    parser.add_argument("--max-epochs", default="10")
+    parser.add_argument("--check-val-every-n-epoch", default="2")
     parser.add_argument("--learning-rate", default="1.0e-6")
-    parser.add_argument("--estimator-warmup-epochs", default="1")
+    parser.add_argument("--estimator-warmup-epochs", default="4")
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="")
     parser.add_argument("--unfrozen-range", default="")
