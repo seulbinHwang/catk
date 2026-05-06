@@ -1143,6 +1143,59 @@ python scripts/launch_self_forced_v100x4x8_static_pods.py \
   --decoder-use-stop-motion false
 ```
 
+#### 2-node x 4 A100 static pod self-forced 실행
+
+A100 80GB 4장짜리 pod 2개(`testa`, `testaa`)를 묶어 8-rank self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다. launcher는 pod를 새로 만들거나 지우거나 재시작하지 않고, `kubectl exec`로 각 pod 안에 tmux 세션과 `torchrun`만 시작합니다.
+
+```text
+configs/experiment/self_forced_npfm_a100x4x2.yaml
+scripts/launch_self_forced_a100x4x2_static_pods.py
+```
+
+기본 실험 설정:
+
+- 대상 pod: `testa testaa`
+- `trainer.num_nodes=2`, `trainer.devices=4` -> 총 8 DDP ranks
+- A100용 `trainer.precision=bf16-mixed`
+- `model.model_config.lr=1.0e-6`
+- `model.model_config.self_forced.estimator_warmup_epochs=1`
+- `model.model_config.self_forced.use_stop_motion=false`
+- `data.train_batch_size=22`, OOM 시 launcher가 모든 pod의 attempt status를 모아 `22 -> 20 -> 18 -> ...` 순서로 함께 낮춤
+- `data.val_batch_size=8`, `model.model_config.scorer_scene_num=320`
+
+pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
+
+```text
+artifact: jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v64
+target:   /workspace/flow_semi_continuous_pretrain_h100x4x2_bs26/v64/epoch_last.ckpt
+```
+
+실제 실행 전에 로컬에서 렌더링만 확인하려면 `--dry-run`을 사용합니다. 이 모드는 pod 안에 아무 것도 만들지 않습니다.
+
+```bash
+python scripts/launch_self_forced_a100x4x2_static_pods.py \
+  --dry-run \
+  --master-addr <testa-pod-ip>
+```
+
+실행:
+
+```bash
+python scripts/launch_self_forced_a100x4x2_static_pods.py --replace
+```
+
+attach:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-sf-a100x4x2-stopfalse-warmup1
+```
+
+중지:
+
+```bash
+python scripts/launch_self_forced_a100x4x2_static_pods.py --stop
+```
+
 #### 1-node x 4 H100 wo-pvc-800 self-forced 실행
 
 H100 4장짜리 `wo-pvc-800` pod 하나에서 self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다. launcher는 pod를 새로 만들거나 지우거나 재시작하지 않고, `kubectl exec`로 해당 pod 안에 tmux 세션과 `torchrun --standalone --nproc_per_node=4`만 시작합니다.
