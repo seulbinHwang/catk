@@ -3678,10 +3678,6 @@ class SMARTFlow(LightningModule):
             )
         if self._is_ocsc_ft_enabled():
             return self._training_step_ocsc_ft(data=data, batch_idx=batch_idx)
-        if self.self_forced_enabled:
-            if self._is_self_forced_active():
-                return self._training_step_self_forced(data=data, batch_idx=batch_idx)
-            return self._training_step_manual_open_loop(data=data, batch_idx=batch_idx)
         """ tokenized_agent
 flow_train_agent_type [n_valid_anchor]
 flow_train_agent_length [n_valid_anchor]
