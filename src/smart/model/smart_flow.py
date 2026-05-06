@@ -11,6 +11,7 @@ import hydra
 import torch
 import torch.nn as nn
 from lightning import LightningModule
+from omegaconf import DictConfig
 from torch import Tensor
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -1524,6 +1525,14 @@ class SMARTFlow(LightningModule):
         rollout_cache: Dict[str, object],
         rollout_indices: Sequence[int],
         return_flow_2s_preview: bool = False,
+        full_grad: bool = False,
+        rollout_steps_2hz: int | None = None,
+        warm_coarse_steps: int = 0,
+        share_noise_across_time: bool = False,
+        noise_tape_override: Tensor | None = None,
+        bptt_grad_clip_traj: float = 0.0,
+        sampling_scheme: DictConfig | None = None,
+        sampling_seed_base: int | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Dict[str, Tensor] | None]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
@@ -1537,6 +1546,22 @@ class SMARTFlow(LightningModule):
             rollout_cache: 원본 closed-loop cache 입니다.
             rollout_indices: 이번에 한꺼번에 돌릴 rollout 번호 목록입니다.
                 길이는 ``[n_rollout_chunk]`` 입니다.
+            full_grad: ``True`` 이면 ``training_rollout_from_cache`` 로 dispatch
+                해 backward 가능한 그래프를 반환합니다 (OCSC).  ``False`` (default)
+                는 inference 용 ``rollout_from_cache`` 입니다.
+            rollout_steps_2hz: closed-loop coarse step 수 제한입니다.
+            warm_coarse_steps: BPTT warm-up 으로 처음 N coarse step 을 no_grad 로
+                실행합니다.
+            share_noise_across_time: rollout noise tape 의 시간 축 공유 여부입니다.
+            noise_tape_override: 외부에서 만든 noise tape 입니다.  shape 은
+                chunk_size==1 이면 ``[n_agent, tape_steps, 4]``, chunk_size>1
+                이면 ``[chunk_size * n_agent, tape_steps, 4]`` 이어야 합니다 (G별
+                tape 들을 ``torch.cat(.., dim=0)`` 으로 묶어서 전달).
+            bptt_grad_clip_traj: closed-loop trajectory L2 norm clip 값.
+            sampling_scheme: closed-loop sampling 설정입니다.  ``None`` 이면
+                ``self.validation_rollout_sampling`` 을 씁니다.
+            sampling_seed_base: 학습 step 기반 batch-wide seed 시작값입니다.
+                rollout g 의 sampling_seed = ``base + g``.
 
         Returns:
             tuple[Tensor, Tensor, Tensor, Dict[str, Tensor] | None]:
@@ -1548,22 +1573,44 @@ class SMARTFlow(LightningModule):
         """
         chunk_size = int(len(rollout_indices))
         scenario_device = tokenized_agent["batch"].device
+        scheme = sampling_scheme if sampling_scheme is not None else self.validation_rollout_sampling
+
+        def _seed_for(g: int) -> int | None:
+            if sampling_seed_base is None:
+                return None
+            return int(sampling_seed_base) + int(g)
+
         if chunk_size == 1:
             scenario_sampling_seeds = self._get_closed_loop_scenario_seeds(
                 scenario_ids=data["scenario_id"],
                 rollout_idx=int(rollout_indices[0]),
                 device=scenario_device,
             )
-            pred = rollout_encoder.rollout_from_cache(
-                rollout_cache=rollout_cache,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                sampling_scheme=self.validation_rollout_sampling,
-                scenario_sampling_seeds=scenario_sampling_seeds,
-                return_flow_2s_preview=return_flow_2s_preview,
-            )
+            if full_grad:
+                pred = rollout_encoder.training_rollout_from_cache(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_scheme=scheme,
+                    sampling_seed=_seed_for(int(rollout_indices[0])),
+                    scenario_sampling_seeds=scenario_sampling_seeds,
+                    rollout_steps_2hz=rollout_steps_2hz,
+                    warm_coarse_steps=warm_coarse_steps,
+                    noise_tape_override=noise_tape_override,
+                    share_noise_across_time=share_noise_across_time,
+                    bptt_grad_clip_traj=bptt_grad_clip_traj,
+                )
+            else:
+                pred = rollout_encoder.rollout_from_cache(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_scheme=scheme,
+                    scenario_sampling_seeds=scenario_sampling_seeds,
+                    return_flow_2s_preview=return_flow_2s_preview,
+                )
             flow_preview = None
-            if return_flow_2s_preview:
+            if return_flow_2s_preview and not full_grad:
                 flow_preview = {
                     "traj": pred["pred_flow_preview_traj"].unsqueeze(1),
                     "valid": pred["pred_flow_preview_valid"].unsqueeze(1),
@@ -1596,16 +1643,37 @@ class SMARTFlow(LightningModule):
             rollout_cache=rollout_cache,
             repeat_count=chunk_size,
         )
-        pred = rollout_encoder.rollout_from_cache(
-            rollout_cache=expanded_rollout_cache,
-            tokenized_agent=expanded_tokenized_agent,
-            map_feature=expanded_map_feature,
-            sampling_scheme=self.validation_rollout_sampling,
-            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
-            return_flow_2s_preview=return_flow_2s_preview,
-        )
+        if full_grad:
+            # G rollout 의 sampling_seed 는 batch-wide 한 단일 int 라 chunk 전체를
+            # 하나의 seed 로 묶는다.  rollout 별 다양성은 expanded
+            # ``scenario_sampling_seeds`` 로 보장된다.
+            chunk_sampling_seed = (
+                _seed_for(int(rollout_indices[0])) if sampling_seed_base is not None else None
+            )
+            pred = rollout_encoder.training_rollout_from_cache(
+                rollout_cache=expanded_rollout_cache,
+                tokenized_agent=expanded_tokenized_agent,
+                map_feature=expanded_map_feature,
+                sampling_scheme=scheme,
+                sampling_seed=chunk_sampling_seed,
+                scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+                rollout_steps_2hz=rollout_steps_2hz,
+                warm_coarse_steps=warm_coarse_steps,
+                noise_tape_override=noise_tape_override,
+                share_noise_across_time=share_noise_across_time,
+                bptt_grad_clip_traj=bptt_grad_clip_traj,
+            )
+        else:
+            pred = rollout_encoder.rollout_from_cache(
+                rollout_cache=expanded_rollout_cache,
+                tokenized_agent=expanded_tokenized_agent,
+                map_feature=expanded_map_feature,
+                sampling_scheme=scheme,
+                scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+                return_flow_2s_preview=return_flow_2s_preview,
+            )
         flow_preview = None
-        if return_flow_2s_preview:
+        if return_flow_2s_preview and not full_grad:
             flow_preview = {
                 "traj": self._reshape_parallel_rollout_prediction(
                     pred["pred_flow_preview_traj"],
