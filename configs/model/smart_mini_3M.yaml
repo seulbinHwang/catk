@@ -1,5 +1,5 @@
 defaults:
-  - smart
+  - smart_flow
 
 model_config:
   decoder:
@@ -8,4 +8,4 @@ model_config:
     num_map_layers: 2
     num_agent_layers: 4
 
-# 3M parameters.
+# 3M parameters for the flow-matching variant.

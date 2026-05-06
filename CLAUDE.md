@@ -1,119 +1,121 @@
-# CLAUDE.md
+# Repo notes
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+CATK / SMART-Flow 기반 motion forecasting 코드베이스. 현재 브랜치는 OCSC
+(Open-Closed Self-Consistency) 파인튜닝을 self-forcing + track-loss 라인 위에
+얹은 상태입니다.
 
-## Project conventions
+## 작업 규칙 (반드시 준수)
 
-### GPU usage
+1. **코드 변경 = commit + push 페어**.  변경 전 상태 commit 하고, 변경 후
+   commit 해서 push 한 뒤 다음 단계로 넘어갈 것.  중간 상태로 멈추지 말 것.
+2. **GPU 할당**: GPU `0`, `1` 은 사용자 할당이 아니므로 절대 사용 금지.  학습 /
+   추론 / parity check 모두 `CUDA_VISIBLE_DEVICES=2` 또는 `3` 에서만 진행할 것
+   (멀티 GPU 가 필요하면 `2,3`).  런처 스크립트 default 는 이 정책을 따라야 함.
+3. **시간 표기는 KST (Asia/Seoul)**.  로그 파일명, commit 메시지, 사용자 보고
+   문, 스케줄링 모두 KST 기준.
+4. **사용자 응답은 한국어**로 설명할 것.  코드 symbol / 변수명 / log message /
+   commit 메시지는 영어, docstring 은 한국어 (기존 코드베이스 컨벤션 유지).
 
-**This machine is shared.** Only use GPUs **2 and 3** for any background job, training, or evaluation. Always set `CUDA_VISIBLE_DEVICES=2,3` (or `=2` / `=3` for single-GPU runs) when launching commands. Do not touch GPU 0 or 1 — they belong to other users / jobs.
+## Branches
 
-When using `torchrun --nproc_per_node=2` for DDP, set `CUDA_VISIBLE_DEVICES=2,3`. For single-process scripts, either device works once the env var is set; the first visible device becomes `cuda:0` inside the process.
+- `main` — baseline.
+- `self_forcing` 계열 (`self_forcing`, `self_forcing_bugfix`, `self_forcing_7m`,
+  `self_forcing_w_road`, `self_forcing_w_track_loss`) — self-forced + track-loss
+  학습 라인. 현재 작업 브랜치 `OL_consistency_training` 의 부모는
+  `self_forcing_w_track_loss`.
+- `OL_consistency_training` — **현재 브랜치**. self-forcing 코드를 보존한 채로
+  OCSC 인프라를 *additive* 방식으로 얹었음. 절대 self-forcing 경로를 부수지 말 것.
+- `origin/fix-hard-rmm` — OCSC 의 reference 구현. 디코더 API 가 더 발전된
+  대신 self-forcing 코드는 없음. 가져올 때 verbatim copy 가 아니라 **현재
+  브랜치 primitives 위에 어댑터로 통합**한 형태가 정답.
 
-### Time display
+## Key modules
 
-Always convert times to **KST (UTC+9)** when reporting to the user. The server runs in UTC; tools like `date` return UTC. Convert before displaying:
-
-- Internal/log timestamps may stay UTC.
-- All user-facing time references (current time, ETAs, deadlines, schedules, "X minutes ago", etc.) must be KST.
-- When showing both, label explicitly: `01:30 UTC (10:30 KST)`.
-
-## Environment
-
-- Conda env name: `catk` (Python 3.11.9, torch 2.4.1, lightning 2.4.0, hydra 1.3.2, waymo-open-dataset-tf-2-12-0).
-- Conda activation differs by host: scripts probe `${CONDA_SH:-$HOME/miniconda3/etc/profile.d/conda.sh}` and fall back to `/home2/pnc2/miniforge3/etc/profile.d/conda.sh` (the active path on this machine). Override `CONDA_SH` if neither exists.
-- WandB is the default logger (`logger=wandb`); set `WANDB_MODE=offline` to disable network upload.
-- Cached dataset root is configured in `configs/paths/default.yaml` (`paths.cache_root`); override with `paths.cache_root=...` rather than editing the YAML.
-
-## Entry point
-
-All training/validation/test runs go through Hydra:
-
-```sh
-python -m src.run experiment=<NAME> action=<fit|finetune|validate|test> task_name=<TAG>
+```
+src/smart/model/smart_flow.py          # SMARTFlow LightningModule
+                                       # OCSC 진입점: _is_ocsc_ft_enabled,
+                                       # _training_step_ocsc_ft, _run_flow_ocsc_ft_step
+src/smart/modules/flow_agent_decoder.py
+   - rollout_from_cache (no-grad, validation/inference)
+   - training_rollout_from_cache (gradient 유지, OCSC + self-forcing 공용)
+   - _rollout_from_cache_impl (둘의 공용 backbone, 539 lines)
+   - _build_rollout_noise_tape (share_noise_across_time 토글)
+src/smart/modules/flow_local_decoder.py
+   - FlowODE.generate (use_adjoint_for_bptt, last_n_grad_solver_steps,
+     기존 backprop_last_k 와 별도 동작)
+src/smart/modules/self_forced_*.py     # 기존 self-forcing 학습 경로 (보존)
+src/smart/metrics/
+   - sim_agents_metrics.py  # 공식 TF (subprocess + forkserver)
+   - hard_sim_agents_metrics.py  # PyTorch in-process. SimAgentsMetrics 와 동일 인터페이스
+   - wosac_metametric_pytorch{,_differentiable}.py  # 본 RMM 계산기 (TF 없이)
+   - wosac_metric_features_torch/  # PyTorch feature 계산
+   - mmd_consistency_loss.py  # OCSC consistency MMD²
+   - wosac_distribution_metrics.py  # CPD / CES / DPR
+configs/experiment/flow_consistency_bptt.yaml  # OCSC 실험 config
+scripts/train_flow_consistency_bptt_single.sh  # OCSC single-GPU 런처
 ```
 
-`configs/run.yaml` composes `data` + `model` + `callbacks` + `logger` + `trainer` + `paths` + `hydra` + `experiment`. Experiment files in `configs/experiment/` use `# @package _global_` and are the canonical place to override model/trainer/data settings — prefer adding/editing an experiment YAML over per-flag CLI overrides.
+## OCSC 통합 원칙
 
-Hydra output dirs land under `logs/<task_name>/runs/<timestamp>/`. `cfg.paths.output_dir` is `${hydra:runtime.output_dir}`; `VisWaymo` videos and submission tarballs are written there.
+1. **기존 self-forcing/track-loss 코드 절대 수정 금지**. OCSC 는 추가-only.
+2. 디코더 신규 파라미터는 default no-op 로 추가 (`warm_coarse_steps=0`,
+   `noise_tape_override=None`, `share_noise_across_time=False`,
+   `bptt_grad_clip_traj=0.0`).
+3. FlowODE BPTT 속성 (`use_adjoint_for_bptt`, `last_n_grad_solver_steps`)
+   은 OCSC step 진입 시 활성, finally 절에서 원복.
+4. `automatic_optimization=False` 는 `bptt_sequential_rollouts=true` 일 때만.
+5. `_run_flow_ocsc_ft_step` 은 단일 함수 (~400 lines) 로 유지. 분리 금지.
 
-DDP runs use `torchrun --nproc_per_node=N -m src.run ...` (see `scripts/train_flow_bptt_ft.sh` for the canonical multi-GPU pattern with `get_free_port` and `--rdzv_endpoint`).
+## Validation backend
 
-## Two model families
+`model.model_config.validation_metric: "real" | "hard"`:
+- `real` (default): 공식 TF SimAgentsMetrics. 정확하지만 subprocess + TF 비용.
+- `hard`: HardSimAgentsMetrics (PyTorch in-process). 동일 인터페이스 (drop-in
+  replace). Parity 검증됨 (max delta ≈ 6e-8 vs official, see Phase 1-3).
 
-This repo contains two parallel model stacks driven by separate Lightning modules. They share the encoder/map/agent token plumbing but diverge at the decoder and finetuning loop. Picking the wrong family for a script is the most common point of confusion.
+## Diversity metrics
 
-**1. CAT-K / token AR (`SMART`, `EgoGMMSMART`)** — the published CVPR'25 work.
-- `src/smart/model/smart.py`, `src/smart/model/ego_gmm_smart.py`.
-- Tokenized AR over discrete agent + map vocabularies (`src/smart/tokens/*.pkl`, `TokenProcessor`).
-- Closed-loop fine-tuning is **CAT-K rollout sampling** (`training_rollout_sampling.criterium=topk_prob_sampled_with_dist, temp=1e-5`) on top of `CrossEntropy` loss.
-- Validation/submission metric: WOSAC 2024 (`WOSACMetrics`, `WOSACSubmission`).
-- Experiments: `pre_bc.yaml`, `clsft.yaml`, `local_val.yaml`, `wosac_sub.yaml`, plus the `ego_gmm_*` variants.
-- Scripts: `scripts/train.sh`, `scripts/local_val.sh`, `scripts/wosac_sub.sh`.
+`WOSACDistributionMetrics` 가 `__init__` 에서 자동 wiring. CPD / CES 는 항상
+계산, DPR 은 `model_config.wosac_cpd_reference: <float>` 설정 시에만.
+RMM backend 와 무관하게 closed-loop rollout 끝나면 `pred_traj` 만으로 갱신.
 
-**2. SMART-Flow (`SMARTFlow`)** — a continuous flow-based extension layered onto SMART.
-- `src/smart/model/smart_flow.py`, `src/smart/modules/smart_flow_decoder.py`, `src/smart/modules/flow_*`, `src/smart/tokens/flow_token_processor.py`.
-- Flow ODE generates continuous trajectories; coarse rollouts feed Sim Agents 2025 (`SimAgentsMetrics`, `SimAgentsSubmission`, `HardSimAgentsMetrics`).
-- `automatic_optimization = False` — the LightningModule drives the optimizer manually inside `_run_*_step` helpers (one per finetune mode). Do NOT add `optimizer.step()` calls expecting Lightning to handle them.
-- Finetune mode dispatch lives on `model.model_config.finetune.mode` and is read by `set_model_for_finetuning` in `src/smart/utils/finetune.py`. Modes wired today: `adjoint_matching`, `rmm_bptt_ft`, `ref_nll_ft`, `kinematic_proj_ft`, `kinematic_reward_ft`, `flow_epg_ft`, `flow_rwr_ft`, `flow_dpo_ft`, `dice_ft`, plain `flow_bptt_ft` plus `terminal_cost_final_step`. Each has a matching `configs/experiment/*.yaml` and `scripts/train_flow_*.sh` wrapper.
-- Experiments: `pre_bc_flow.yaml`, `flow_bptt_ft.yaml`, `flow_ref_nll.yaml`, `am_finetune_flow*.yaml`, `kinematic_*_ft.yaml`, `local_val_flow*.yaml`, `sim_agents_sub_flow.yaml`, etc.
+## Run
 
-When asked to add a feature, first identify which family the request targets — flow scripts/configs almost always have `flow` in the name; CAT-K scripts do not.
+```bash
+# OCSC fine-tuning (single GPU, fix-hard-rmm production defaults)
+sh scripts/train_flow_consistency_bptt_single.sh
 
-## Sim Agents metric variants (flow stack)
+# 자주 쓰는 토글:
+OCSC_GT_TARGET=false sh ...           # GT 대신 open-loop sample target
+OCSC_USE_MMD=true sh ...              # MMD² loss
+BPTT_SEQUENTIAL_ROLLOUTS=true sh ...  # G rollout 순차 backward + manual opt
+VALIDATION_METRIC=real sh ...         # 공식 TF 검증
+WANDB_PROJECT=My-Run sh ...
 
-`model.model_config.validation_metric` selects the validation-side scorer for `SMARTFlow`:
-
-- `real` → `SimAgentsMetrics` (official Waymo TF metrics, runs in a forkserver `mp.Pool`; pool size from `WOSAC_REAL_POOL_WORKERS`). Slow but authoritative.
-- `hard` → `HardSimAgentsMetrics` (pure-PyTorch in-process; numerically equivalent within tolerance, much faster). Pool size from `WOSAC_HARD_POOL_WORKERS`. Set `WOSAC_TORCH_COMPILE=1` to compile the dno/ttc/d_road kernels.
-- Set `WOSAC_VERIFY=1` to cross-check Hard vs Real per submetric (logs absolute deltas to stdout).
-
-The **soft RMM** in `wosac_metametric_pytorch_differentiable.py` is the *training* objective for `rmm_bptt_ft` (differentiable surrogate). Validation never uses soft. See `docs/flow_bptt_finetuning_guide.md` for the full math (Korean).
-
-The training loop caches scenario protos and GT log feature dicts in module-level dicts (`_SCENARIO_PROTO_CACHE`, `_LOG_FEAT_DICT_CACHE`) at the top of `smart_flow.py` — `rmm_bptt_ft` requires the per-scenario TFRecord at `${cache_root}/<split>_tfrecords_splitted/<scenario_id>.tfrecords`.
-
-## Data preprocessing
-
-`src/data_preprocess.py` converts raw WOMD `scenario` shards into per-scenario pickles (and optionally per-scenario `tfrecords_splitted/`). The flow BPTT path requires the splitted tfrecords to be present.
-
-```sh
-# Single split, single process:
-sh scripts/cache_womd.sh                     # vars: DATA_SPLIT, INPUT_DIR, OUTPUT_DIR, NUM_WORKERS
-
-# Parallelised (multi-job, multi-worker) with tfrecord shards — needed for rmm_bptt_ft training data:
-NJ=8 NW=4 sh scripts/run_preprocess_train_with_tfrecords_parallel.sh
+# Hard-RMM parity check (vs 공식 TF)
+WOSAC_PARITY_TFRECORD_DIR=<dir> python scripts/verify_wosac_metametric_pytorch_parity.py --n 50
 ```
 
-Use `--output_split closed_loop_train` (with `--write_tfrecords always`) when you need tfrecords for the *training* split without colliding with the plain `training/` cache.
+## Pretrained checkpoint
 
-## Common script entrypoints
+`logs/pretrained/epoch_last.ckpt` (about 87 MB). 런처가
+`SCRIPT_DIR + ../logs/pretrained/epoch_last.ckpt` 로 자동 해결.
 
-| Task | Script | Notes |
-|------|--------|-------|
-| BC pre-train (CAT-K family) | `scripts/train.sh` | Edit `MY_EXPERIMENT` to switch experiment. |
-| CAT-K fine-tune | `scripts/train.sh` with `MY_EXPERIMENT=clsft` | Loads BC ckpt via `ckpt_path` in YAML. |
-| Local validation (CAT-K) | `scripts/local_val.sh` | Single GPU; `VAL_K` controls rollout `num_k`. |
-| WOSAC submission packing | `scripts/wosac_sub.sh` | Writes `wosac_submission.tar.gz` under the run's output dir. |
-| BC pre-train (Flow) | `scripts/train_flow.sh` |  |
-| Flow BPTT fine-tune (RMM) | `scripts/train_flow_bptt_ft.sh` | Heavily parameterised by env vars; read header comment before changing. |
-| Flow Ref-NLL fine-tune | `scripts/train_flow_ref_nll.sh` | Closed-loop BPTT + open-loop ref likelihood. |
-| Adjoint-matching finetune | `scripts/train_flow_feasibility_full_grad.sh` |  |
-| Local validation (Flow) | `scripts/local_val_flow.sh` |  |
-| Sim Agents 2025 submission | `scripts/sim_agents_sub_flow.sh` | Set `ACTION=test` for the test split. |
-| Parity / verification | `scripts/verify_wosac_*.py`, `scripts/parity_check_hard_rmm.py` | One-off checks for torch-vs-TF metric parity. |
+## Env vars (런처가 export)
 
-The flow training scripts read most knobs from environment variables (LR, batch size, BPTT options, …). Override at the call site rather than editing the script:
+| var | 소비처 |
+|---|---|
+| `OMP_NUM_THREADS` 등 BLAS thread | numpy/torch/MKL/OpenBLAS auto |
+| `WOSAC_HARD_POOL_WORKERS` | `hard_sim_agents_metrics.py` |
+| `WOSAC_REAL_POOL_WORKERS` | `sim_agents_metrics.py:_resolve_sim_agents_metric_workers` (env > yaml) |
+| `WOSAC_VERIFY` | hard vs real cross-check (디버그) |
+| `WOSAC_HARD_LOG_CACHE_DIR` | hard-RMM log feature 디스크 캐시 |
 
-```sh
-LR=1e-6 TRAIN_B=8 BPTT_MAX_COARSE_STEPS=4 sh scripts/train_flow_bptt_ft.sh
-```
+## Conventions
 
-The table lists canonical entrypoints; `scripts/` also contains close variants (`train_flow_consistency_bptt*.sh`, `train_kinematic_*_ft.sh`, `val_*.sh`, single-scenario / no-val variants, `monitor_exp.sh`). Skim `scripts/` before duplicating one — there is usually already a wrapper for the case you want.
-
-## Things that bite
-
-- `SMARTFlow.automatic_optimization = False` — when adding a new finetune mode, you own the `optimizer.zero_grad/backward/step` calls. Mirror an existing `_run_*_step` helper.
-- `bptt_sequential_rollouts=true` is incompatible with DDP (multiple `backward()` calls confuse the bucket reducer → silent zero-grad). Single-GPU only.
-- Hard vs Real RMM are equivalent in expectation but each maintains its own forkserver pool; both must be `close_pool()`-ed at trainer teardown to avoid orphaned TF processes.
-- `data.train_raw_dir` defaults to the `validation/` split for `flow_bptt_ft` (because rmm_bptt_ft needs tfrecords and the legacy cache only had them on val). For real training runs, point at a `training/` cache that was preprocessed with `--write_tfrecords always`, otherwise you will leak val into train.
-- WandB watches the model with `log="all"` in `src/run.py` — large grad/param histograms can dominate run time on big models; comment it out for profiling.
+- 한 클래스 한 파일 (e.g. `HardSimAgentsMetrics` 는 `__init__.py` 가 아니라
+  `hard_sim_agents_metrics.py`).
+- Korean docstring, English code 주석/symbol.
+- Hydra 진입점은 `src/run.py`, primary config `configs/run.yaml`.
+- 새 finetune 모드 추가 시: `finetune_config.mode == "<name>"` 분기 패턴 따라가기
+  (`_is_ocsc_ft_enabled` 처럼).

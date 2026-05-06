@@ -5,7 +5,7 @@
 defaults:
   - _self_
   - data: waymo
-  - model: smart
+  - model: smart_flow
   - callbacks: default
   - logger: wandb
   - trainer: default
@@ -14,9 +14,9 @@ defaults:
 
   # experiment configs allow for version control of specific hyperparameters
   # e.g. best hyperparameters for given model and datamodule
-  - experiment: pre_bc
+  - experiment: pre_bc_flow
 
-action: fit # fit, finetune, validate, test
+action: fit # fit, finetune, road_finetune, validate, test
 
 # task name, determines output directory path
 task_name: "debug_open_source"
@@ -24,6 +24,30 @@ task_name: "debug_open_source"
 # simply provide checkpoint path to resume training
 ckpt_path: null
 train_log_dir: null
+submission:
+  description: null
 
 # seed for random number generators in pytorch, numpy and python.random
 seed: 817
+
+waymo_submission:
+  enabled: false
+  submit_validate: true
+  submit_test: false
+  evaluation_set: null
+  challenge_url: https://waymo.com/open/challenges/2025/sim-agents/
+  submissions_url: https://waymo.com/open/challenges/submissions/
+  storage_state_path: ${paths.root_dir}/secrets/waymo/waymo_storage_state.json
+  archive_path: null
+  browser_name: chromium
+  browser_channel: null
+  browser_executable_path: null
+  headless: true
+  chromium_sandbox: false
+  navigation_timeout_ms: 120000
+  upload_timeout_ms: 120000
+  post_submit_wait_ms: 5000
+  poll_submission_status: false
+  poll_timeout_seconds: 0
+  poll_interval_seconds: 60
+  save_debug_artifacts: true

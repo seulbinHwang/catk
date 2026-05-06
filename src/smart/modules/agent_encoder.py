@@ -21,7 +21,8 @@ from torch_geometric.utils import dense_to_sparse, subgraph
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
+from src.smart.modules.dynamic_light_time import resolve_light_time_delta_norm
+from src.smart.utils import angle_between_2d_vectors, safe_norm_2d, weight_init, wrap_angle
 
 
 class SMARTAgentEncoder(nn.Module):
@@ -55,14 +56,18 @@ class SMARTAgentEncoder(nn.Module):
         self.hist_drop_prob = hist_drop_prob
         self.n_token_agent = n_token_agent
 
-        input_dim_x_a = 2
+        input_dim_x_a = 3
         input_dim_r_t = 4
-        input_dim_r_pt2a = 3
+        input_dim_r_pt2a = 4
         input_dim_r_a2a = 3
-        input_dim_token = 8
+        token_num_steps = 6
+        token_num_vertices = 4
+        token_xy_dim = 2
+        input_dim_token = token_num_steps * token_num_vertices * token_xy_dim
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
+        self.light_pl2a_emb = nn.Embedding(5, hidden_dim)
 
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
@@ -143,6 +148,7 @@ class SMARTAgentEncoder(nn.Module):
         head_vector_a,
         agent_type,
         agent_shape,
+        valid_mask: Optional[torch.Tensor] = None,
         inference=False,
     ):
         n_agent, n_step, traj_dim = pos_a.shape
@@ -164,22 +170,10 @@ class SMARTAgentEncoder(nn.Module):
         agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]
         agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]]
 
-        motion_vector_a = torch.cat(
-            [
-                pos_a.new_zeros(agent_token_index.shape[0], 1, traj_dim),
-                pos_a[:, 1:] - pos_a[:, :-1],
-            ],
-            dim=1,
-        )
-        feature_a = torch.stack(
-            [
-                torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_a,
-                    nbr_vector=motion_vector_a[:, :, :2],
-                ),
-            ],
-            dim=-1,
+        feature_a = self._build_motion_feature(
+            pos_a=pos_a,
+            head_vector_a=head_vector_a,
+            valid_mask=valid_mask,
         )
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
@@ -211,6 +205,83 @@ class SMARTAgentEncoder(nn.Module):
                 categorical_embs,
             )
         return feat_a
+
+    @staticmethod
+    def _build_motion_valid_mask(
+        pos_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        n_agent, n_step, _ = pos_a.shape
+        motion_valid_a = torch.zeros(
+            n_agent,
+            n_step,
+            device=pos_a.device,
+            dtype=torch.bool,
+        )
+        if n_step <= 1:
+            return motion_valid_a
+
+        if valid_mask is None:
+            motion_valid_a[:, 1:] = True
+            return motion_valid_a
+
+        if tuple(valid_mask.shape) != (n_agent, n_step):
+            raise ValueError(
+                "valid_mask shape must match the first two dimensions of pos_a, "
+                f"got {tuple(valid_mask.shape)} and {(n_agent, n_step)}."
+            )
+        motion_valid_a[:, 1:] = valid_mask[:, 1:].bool() & valid_mask[:, :-1].bool()
+        return motion_valid_a
+
+    @staticmethod
+    def _build_motion_vector(
+        pos_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        n_agent, n_step, traj_dim = pos_a.shape
+        motion_vector_a = pos_a.new_zeros(n_agent, n_step, traj_dim)
+        if n_step <= 1:
+            return motion_vector_a
+
+        step_delta = pos_a[:, 1:] - pos_a[:, :-1]
+        motion_valid_a = SMARTAgentEncoder._build_motion_valid_mask(pos_a, valid_mask)
+        # Invalid samples are stored at the origin; keep the value at zero and
+        # expose missingness through the separate motion_valid feature.
+        step_delta = step_delta.masked_fill(~motion_valid_a[:, 1:].unsqueeze(-1), 0.0)
+        motion_vector_a[:, 1:] = step_delta
+        return motion_vector_a
+
+    @staticmethod
+    def _build_motion_feature_from_vector(
+        motion_vector_a: torch.Tensor,
+        head_vector_a: torch.Tensor,
+        motion_valid_a: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.stack(
+            [
+                safe_norm_2d(motion_vector_a[..., :2]),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vector_a,
+                    nbr_vector=motion_vector_a[..., :2],
+                ),
+                motion_valid_a.to(dtype=motion_vector_a.dtype),
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
+    def _build_motion_feature(
+        pos_a: torch.Tensor,
+        head_vector_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        motion_vector_a = SMARTAgentEncoder._build_motion_vector(pos_a, valid_mask)
+        motion_valid_a = SMARTAgentEncoder._build_motion_valid_mask(pos_a, valid_mask)
+        return SMARTAgentEncoder._build_motion_feature_from_vector(
+            motion_vector_a=motion_vector_a,
+            head_vector_a=head_vector_a,
+            motion_valid_a=motion_valid_a,
+        )
 
     def build_temporal_edge(
         self,
@@ -246,7 +317,7 @@ class SMARTAgentEncoder(nn.Module):
         rel_head_t = wrap_angle(head_t[edge_index_t[0]] - head_t[edge_index_t[1]])
         r_t = torch.stack(
             [
-                torch.norm(rel_pos_t, p=2, dim=-1),
+                safe_norm_2d(rel_pos_t),
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_t[edge_index_t[1]],
                     nbr_vector=rel_pos_t,
@@ -283,7 +354,7 @@ class SMARTAgentEncoder(nn.Module):
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
         r_a2a = torch.stack(
             [
-                torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
+                safe_norm_2d(rel_pos_a2a[:, :2]),
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_s[edge_index_a2a[1]],
                     nbr_vector=rel_pos_a2a[:, :2],
@@ -305,6 +376,8 @@ class SMARTAgentEncoder(nn.Module):
         mask,
         batch_s,
         batch_pl,
+        light_type: Optional[torch.Tensor] = None,
+        light_time_delta_norm: Optional[torch.Tensor] = None,
     ):
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
@@ -319,20 +392,42 @@ class SMARTAgentEncoder(nn.Module):
             max_num_neighbors=300,
         )
         edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
+        if light_type is None:
+            light_type = torch.zeros(
+                pos_pl.shape[0],
+                device=pos_pl.device,
+                dtype=torch.long,
+            )
+        else:
+            light_type = light_type.to(device=pos_pl.device, dtype=torch.long)
+        light_time_delta_norm = resolve_light_time_delta_norm(
+            light_time_delta_norm=light_time_delta_norm,
+            num_agents=pos_a.shape[0],
+            num_steps=pos_a.shape[1],
+            device=pos_pl.device,
+            dtype=pos_pl.dtype,
+            shift_steps=self.shift,
+        )
+        light_time_delta_flat = light_time_delta_norm.transpose(0, 1).reshape(-1)
+        edge_light_time_delta_norm = light_time_delta_flat[edge_index_pl2a[1]]
         rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
         rel_orient_pl2a = wrap_angle(
             orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]]
         )
         r_pl2a = torch.stack(
             [
-                torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
+                safe_norm_2d(rel_pos_pl2a[:, :2]),
                 angle_between_2d_vectors(
                     ctr_vector=head_vector_s[edge_index_pl2a[1]],
                     nbr_vector=rel_pos_pl2a[:, :2],
                 ),
                 rel_orient_pl2a,
+                edge_light_time_delta_norm,
             ],
             dim=-1,
         )
-        r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
+        r_pl2a = self.r_pt2a_emb(
+            continuous_inputs=r_pl2a,
+            categorical_embs=[self.light_pl2a_emb(light_type[edge_index_pl2a[0]])],
+        )
         return edge_index_pl2a, r_pl2a

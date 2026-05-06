@@ -1,0 +1,1280 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CAT-K SMART-Flow 특수 Polygon 개정안</title>
+  <style>
+    :root {
+      --bg: #f4efe5;
+      --bg-2: #efe6d6;
+      --paper: rgba(255, 251, 244, 0.88);
+      --paper-strong: #fffdf8;
+      --ink: #203033;
+      --muted: #617172;
+      --line: rgba(32, 48, 51, 0.12);
+      --shadow: 0 24px 80px rgba(43, 37, 27, 0.12);
+      --olive: #4c6d5e;
+      --teal: #287894;
+      --orange: #c65e3a;
+      --gold: #c79531;
+      --rose: #b84f64;
+      --soft-olive: #deebe4;
+      --soft-teal: #d9edf4;
+      --soft-orange: #f9e0d6;
+      --soft-gold: #f6ecd0;
+      --soft-rose: #f8dde4;
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 14px;
+      --maxw: 1480px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 10%, rgba(199, 149, 49, 0.18), transparent 22%),
+        radial-gradient(circle at 88% 12%, rgba(40, 120, 148, 0.14), transparent 22%),
+        linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+      font-family: "Pretendard", "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+      line-height: 1.6;
+      letter-spacing: -0.01em;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(32, 48, 51, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(32, 48, 51, 0.03) 1px, transparent 1px);
+      background-size: 26px 26px;
+      mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.45), transparent 84%);
+      pointer-events: none;
+    }
+
+    a { color: inherit; }
+    code {
+      font-family: "JetBrains Mono", "SFMono-Regular", "Consolas", monospace;
+      background: rgba(32, 48, 51, 0.08);
+      border-radius: 8px;
+      padding: 0.14em 0.42em;
+      font-size: 0.92em;
+      word-break: break-word;
+    }
+
+    .page {
+      width: min(var(--maxw), calc(100% - 28px));
+      margin: 18px auto 72px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .hero,
+    .section,
+    .sources {
+      background: var(--paper);
+      border: 1px solid rgba(255, 255, 255, 0.68);
+      border-radius: var(--radius-xl);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+
+    .hero {
+      padding: 34px;
+      display: grid;
+      gap: 24px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      top: -120px;
+      right: -140px;
+      width: 340px;
+      height: 340px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(184, 79, 100, 0.14), transparent 70%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      font-size: 0.78rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 22px;
+      align-items: stretch;
+    }
+
+    h1, h2, h3, h4 { margin: 0; line-height: 1.08; }
+    h1 {
+      font-family: "Iowan Old Style", "Nanum Myeongjo", serif;
+      font-size: clamp(2.5rem, 5.1vw, 5rem);
+      letter-spacing: -0.06em;
+      max-width: 12ch;
+    }
+    h2 {
+      font-family: "Iowan Old Style", "Nanum Myeongjo", serif;
+      font-size: clamp(1.9rem, 2.8vw, 2.7rem);
+      letter-spacing: -0.04em;
+    }
+    h3 {
+      font-size: 1.18rem;
+      letter-spacing: -0.03em;
+    }
+    h4 {
+      font-size: 1.02rem;
+      letter-spacing: -0.02em;
+    }
+
+    .lead {
+      margin: 16px 0 0;
+      font-size: 1.07rem;
+      color: #314244;
+      max-width: 78ch;
+    }
+
+    .summary, .top-pills {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+
+    .pill {
+      border-radius: 999px;
+      padding: 8px 12px;
+      background: rgba(255, 255, 255, 0.78);
+      border: 1px solid var(--line);
+      color: #314244;
+      font-size: 0.9rem;
+    }
+
+    .pill.new { background: rgba(198, 94, 58, 0.14); border-color: rgba(198, 94, 58, 0.28); }
+    .pill.keep { background: rgba(40, 120, 148, 0.12); border-color: rgba(40, 120, 148, 0.24); }
+    .pill.gold { background: rgba(199, 149, 49, 0.13); border-color: rgba(199, 149, 49, 0.26); }
+
+    .hero-side {
+      display: grid;
+      gap: 14px;
+    }
+
+    .hero-board {
+      border-radius: 24px;
+      min-height: 260px;
+      position: relative;
+      overflow: hidden;
+      background:
+        linear-gradient(145deg, rgba(40, 120, 148, 0.12), rgba(198, 94, 58, 0.12)),
+        #eadfce;
+      border: 1px solid var(--line);
+      padding: 20px;
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+
+    .hero-board::before {
+      content: "ORIGINAL new_2 VS REVISED PROPOSAL";
+      display: inline-block;
+      width: fit-content;
+      padding: 7px 11px;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      background: rgba(32, 48, 51, 0.76);
+      color: white;
+    }
+
+    .hero-board .big-line {
+      font-size: 1.34rem;
+      font-weight: 700;
+      max-width: 20ch;
+    }
+
+    .mini-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .mini-card {
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+    }
+
+    .mini-card .k {
+      font-size: 0.78rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .mini-card .v {
+      font-size: 1.45rem;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .topnav {
+      position: sticky;
+      top: 14px;
+      z-index: 5;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin: 18px 0 24px;
+      padding: 12px;
+      border-radius: 18px;
+      background: rgba(255, 251, 244, 0.74);
+      border: 1px solid rgba(255, 255, 255, 0.7);
+      box-shadow: 0 12px 30px rgba(43, 37, 27, 0.08);
+      backdrop-filter: blur(18px);
+    }
+
+    .topnav a {
+      padding: 10px 14px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.78);
+      border: 1px solid var(--line);
+      color: #314244;
+      text-decoration: none;
+      font-size: 0.92rem;
+    }
+
+    .stack { display: grid; gap: 24px; }
+    .section { padding: 28px; }
+
+    .section-head {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+
+    .section-head p {
+      margin: 0;
+      color: var(--muted);
+      max-width: 92ch;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .legend-card, .note-card, .compare-card, .spec-card, .module-card, .step-card, .source-card {
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: var(--paper-strong);
+    }
+
+    .legend-card {
+      padding: 16px;
+    }
+
+    .legend-card strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 1rem;
+    }
+
+    .legend-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.86rem;
+      color: #3b4b4e;
+      margin-top: 8px;
+    }
+
+    .dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    .dot.new { background: var(--orange); }
+    .dot.keep { background: var(--teal); }
+    .dot.old { background: var(--gold); }
+    .dot.warn { background: var(--rose); }
+
+    .grid-2, .grid-3, .grid-4 {
+      display: grid;
+      gap: 16px;
+    }
+
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .compare-card {
+      padding: 18px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .compare-card::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 7px;
+    }
+
+    .compare-card.old::before { background: var(--gold); }
+    .compare-card.new::before { background: var(--orange); }
+    .compare-card.keep::before { background: var(--teal); }
+    .compare-card.warn::before { background: var(--rose); }
+
+    .badge {
+      display: inline-block;
+      width: fit-content;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+      background: rgba(32, 48, 51, 0.08);
+      color: var(--muted);
+    }
+
+    .badge.new { background: rgba(198, 94, 58, 0.14); color: #914023; }
+    .badge.keep { background: rgba(40, 120, 148, 0.14); color: #20586c; }
+    .badge.old { background: rgba(199, 149, 49, 0.14); color: #856117; }
+    .badge.warn { background: rgba(184, 79, 100, 0.14); color: #88364a; }
+
+    .compare-card p,
+    .spec-card p,
+    .module-card p,
+    .step-card p,
+    .source-card p,
+    .note-card p {
+      margin: 0;
+      color: #324346;
+      font-size: 0.95rem;
+    }
+
+    .compare-card ul,
+    .module-card ul,
+    .step-card ul,
+    .source-card ul {
+      margin: 10px 0 0;
+      padding-left: 18px;
+      color: #344447;
+    }
+
+    .compare-card li + li,
+    .module-card li + li,
+    .step-card li + li,
+    .source-card li + li { margin-top: 6px; }
+
+    .highlight {
+      border-radius: 16px;
+      padding: 16px 18px;
+      border: 1px solid rgba(198, 94, 58, 0.18);
+      background: linear-gradient(135deg, rgba(198, 94, 58, 0.12), rgba(255, 255, 255, 0.92));
+      color: #2d3d40;
+    }
+
+    .diagram {
+      display: grid;
+      gap: 16px;
+    }
+
+    .band {
+      padding: 18px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .band-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+
+    .band-title {
+      font-size: 1.2rem;
+      font-weight: 700;
+    }
+
+    .band-sub {
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .flow-row {
+      display: grid;
+      gap: 12px;
+      align-items: stretch;
+    }
+
+    .flow-row.cols-5 { grid-template-columns: 1.2fr 44px 1.35fr 44px 1.45fr; }
+    .flow-row.cols-6 { grid-template-columns: 1.15fr 44px 1.2fr 44px 1.25fr 44px 1.3fr; }
+    .flow-row.cols-4 { grid-template-columns: 1.2fr 44px 1.35fr 44px 1.35fr; }
+    .flow-row.cols-7 { grid-template-columns: 1.1fr 38px 1.1fr 38px 1.1fr 38px 1.2fr; }
+
+    .arrow {
+      display: grid;
+      place-items: center;
+      color: rgba(32, 48, 51, 0.42);
+      font-size: 1.7rem;
+      min-height: 36px;
+    }
+
+    .block {
+      border-radius: 20px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      background: var(--paper-strong);
+      position: relative;
+      overflow: hidden;
+      min-height: 168px;
+    }
+
+    .block::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 7px;
+    }
+
+    .block.map::before { background: var(--olive); }
+    .block.agent::before { background: var(--teal); }
+    .block.new::before { background: var(--orange); }
+    .block.keep::before { background: var(--teal); }
+    .block.old::before { background: var(--gold); }
+    .block.warn::before { background: var(--rose); }
+
+    .block .type {
+      display: inline-block;
+      font-size: 0.75rem;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .block h3 { margin-bottom: 10px; }
+
+    .io {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .io-line {
+      font-size: 0.9rem;
+      color: #425255;
+    }
+
+    .module-card {
+      padding: 22px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .module-card.new {
+      background: linear-gradient(180deg, var(--soft-orange), rgba(255, 255, 255, 0.9));
+    }
+
+    .module-card.keep {
+      background: linear-gradient(180deg, var(--soft-teal), rgba(255, 255, 255, 0.9));
+    }
+
+    .module-card.old {
+      background: linear-gradient(180deg, var(--soft-gold), rgba(255, 255, 255, 0.9));
+    }
+
+    .module-card header {
+      display: grid;
+      gap: 8px;
+    }
+
+    .path {
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .spec-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .spec-card {
+      padding: 16px;
+    }
+
+    .spec-card strong {
+      display: block;
+      margin-bottom: 8px;
+    }
+
+    .stage-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .step-card {
+      padding: 16px;
+      border: 1px solid rgba(32, 48, 51, 0.08);
+      background: rgba(255, 255, 255, 0.8);
+      border-radius: 18px;
+    }
+
+    .step-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+
+    .step-tag {
+      display: inline-block;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      background: rgba(32, 48, 51, 0.07);
+      color: var(--muted);
+    }
+
+    .shape-table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.76);
+    }
+
+    .shape-table th,
+    .shape-table td {
+      border: 1px solid rgba(32, 48, 51, 0.08);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 0.92rem;
+    }
+
+    .shape-table th {
+      background: rgba(255, 255, 255, 0.76);
+      font-weight: 700;
+    }
+
+    .source-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .source-card {
+      padding: 18px;
+    }
+
+    .callout {
+      border-radius: 18px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, rgba(40, 120, 148, 0.12), rgba(255, 255, 255, 0.88));
+    }
+
+    .callout strong {
+      display: block;
+      margin-bottom: 8px;
+    }
+
+    .sources {
+      padding: 28px;
+    }
+
+    .fade {
+      opacity: 0;
+      transform: translateY(18px);
+      animation: rise 650ms ease forwards;
+    }
+
+    .fade:nth-child(2) { animation-delay: 70ms; }
+    .fade:nth-child(3) { animation-delay: 140ms; }
+    .fade:nth-child(4) { animation-delay: 210ms; }
+
+    @keyframes rise {
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 1280px) {
+      .hero-grid,
+      .grid-4,
+      .grid-3,
+      .grid-2,
+      .spec-grid,
+      .source-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .legend { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+      .flow-row.cols-5,
+      .flow-row.cols-6,
+      .flow-row.cols-4,
+      .flow-row.cols-7 { grid-template-columns: 1fr; }
+
+      .arrow { transform: rotate(90deg); min-height: 24px; }
+    }
+
+    @media (max-width: 760px) {
+      .page {
+        width: min(var(--maxw), calc(100% - 14px));
+        margin-top: 8px;
+      }
+      .hero, .section, .sources {
+        padding: 20px;
+        border-radius: 22px;
+      }
+      .topnav { top: 8px; }
+      h1 { font-size: clamp(2rem, 10vw, 3.3rem); }
+      .mini-grid, .legend { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero fade">
+      <div class="hero-grid">
+        <div>
+          <div class="eyebrow">CAT-K / SMART-Flow 특수 Polygon 개정안</div>
+          <h1>stop sign은 원본 유지, polygon만 별도 의미 branch로 강화</h1>
+          <p class="lead">
+            이 문서는 <code>new_2</code> 기준 구조를 최대한 덜 건드리면서,
+            <code>crosswalk</code>, <code>speed bump</code>, <code>driveway entrance</code>를 더 잘 인코딩하기 위한
+            단일 아키텍처 제안을 정리합니다. 핵심은 <strong>도로 branch는 유지</strong>하고,
+            <strong>polygon semantic encoder만 추가</strong>하며,
+            <strong>stop sign은 기존처럼 lane type 2 처리</strong>를 그대로 두는 것입니다.
+          </p>
+          <div class="summary">
+            <span class="pill keep">유지: 기존 road token bank / map trunk / agent trunk / flow decoder</span>
+            <span class="pill new">추가: polygon semantic encoder + polygon→road 1층 cross-attention</span>
+            <span class="pill keep">유지: stop sign은 lane type 2 override</span>
+            <span class="pill gold">목표: 7M 근처 유지 + WOSAC 점수 향상</span>
+          </div>
+        </div>
+        <div class="hero-side">
+          <div class="hero-board">
+            <div class="big-line">원본의 문제는 polygon을 road-like polyline으로 뭉개는 것이고, 개정안의 핵심은 polygon만 독립 의미 token으로 살리는 것입니다.</div>
+            <div class="top-pills">
+              <span class="pill old">원본: 4점 선택 → 두 변 선분화 → type 9 병합</span>
+              <span class="pill new">개정: 원래 polygon 경계 유지 → 고정 길이 boundary token화</span>
+              <span class="pill keep">stop sign: lane type 2 유지</span>
+            </div>
+          </div>
+          <div class="mini-grid">
+            <div class="mini-card fade">
+              <div class="k">Hidden</div>
+              <div class="v">128</div>
+              <div>공통 문맥 채널 유지</div>
+            </div>
+            <div class="mini-card fade">
+              <div class="k">Map Layer</div>
+              <div class="v">3</div>
+              <div>기존 map trunk 유지</div>
+            </div>
+            <div class="mini-card fade">
+              <div class="k">Agent Layer</div>
+              <div class="v">6</div>
+              <div>기존 agent trunk 유지</div>
+            </div>
+            <div class="mini-card fade">
+              <div class="k">Flow Dim</div>
+              <div class="v">96</div>
+              <div>기존 flow decoder 유지</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <nav class="topnav">
+      <a href="#diff">원본과 차이</a>
+      <a href="#proposal">최종 1안</a>
+      <a href="#polygon">Polygon Semantic Encoder 상세</a>
+      <a href="#fusion">융합과 다운스트림</a>
+      <a href="#budget">파라미터 / 정규화</a>
+      <a href="#sources">비교 기준 파일</a>
+    </nav>
+
+    <div class="stack">
+      <section class="section fade" id="diff">
+        <div class="section-head">
+          <div class="eyebrow">Diff Legend</div>
+          <h2>이번 개정안에서 무엇을 바꾸고, 무엇을 그대로 두는가</h2>
+          <p>
+            아래 표시는 문서 전체에서 같은 뜻으로 쓰입니다. 특히 이번 문서에서 가장 중요한 점은
+            <strong>stop sign 관련 구조는 일부러 안 바꾼다</strong>는 것입니다.
+          </p>
+        </div>
+        <div class="legend">
+          <div class="legend-card">
+            <strong>새로 추가</strong>
+            polygon semantic encoder, polygon→road cross-attention, polygon token fusion
+            <div class="legend-chip"><span class="dot new"></span>주황</div>
+          </div>
+          <div class="legend-card">
+            <strong>그대로 유지</strong>
+            road token bank, road map encoder, stop sign lane type 2 처리, agent encoder, flow decoder
+            <div class="legend-chip"><span class="dot keep"></span>청록</div>
+          </div>
+          <div class="legend-card">
+            <strong>원본 방식</strong>
+            polygon을 4점과 두 변 선분으로 바꿔 road bank에 맞추는 현재 방식
+            <div class="legend-chip"><span class="dot old"></span>금색</div>
+          </div>
+          <div class="legend-card">
+            <strong>핵심 경고</strong>
+            stop sign은 이번 안에서 별도 객체 token으로 만들지 않음
+            <div class="legend-chip"><span class="dot warn"></span>분홍</div>
+          </div>
+        </div>
+
+        <div class="grid-4" style="margin-top:18px;">
+          <article class="compare-card old">
+            <div class="badge old">Original new_2</div>
+            <h3>polygon 3종이 한 덩어리</h3>
+            <p>
+              crosswalk, speed bump, driveway entrance는 모두 4개 점만 고른 뒤 두 쌍의 변을 펴서
+              선분으로 만들고, <code>type = 9</code>로 묶인 뒤 <code>crosswalk</code> 그룹에 저장됩니다.
+            </p>
+          </article>
+          <article class="compare-card old">
+            <div class="badge old">Original new_2</div>
+            <h3>road token bank로 최근접 matching</h3>
+            <p>
+              위 선분은 다시 <code>[num_nodes, 3, 2]</code> 조각으로 잘린 뒤, road map token bank와 같은 방식으로
+              matching 됩니다. 그래서 polygon 의미가 road-like 모양으로 약해질 수 있습니다.
+            </p>
+          </article>
+          <article class="compare-card keep">
+            <div class="badge keep">Keep As-Is</div>
+            <h3>stop sign은 lane type 2 유지</h3>
+            <p>
+              stop sign은 독립 객체가 아니라, 연결된 lane 타입을 2로 바꾸는 현재 처리 그대로 유지합니다.
+              이번 개정안은 여기를 손대지 않습니다.
+            </p>
+          </article>
+          <article class="compare-card new">
+            <div class="badge new">Revised Proposal</div>
+            <h3>polygon만 별도 의미 branch</h3>
+            <p>
+              road는 road대로 두고, crosswalk / speed bump / driveway entrance만 road bank를 거치지 않는
+              별도 polygon semantic encoder로 보낸 뒤, 기존 map→agent attention 앞에서 합칩니다.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section fade" id="proposal">
+        <div class="section-head">
+          <div class="eyebrow">One Final Design</div>
+          <h2>최종 1안: road는 그대로, polygon만 따로 살리고, stop sign은 원본 유지</h2>
+          <p>
+            한 문장으로 줄이면 이렇습니다. <strong>기존 road token branch는 그대로 둔다.</strong>
+            <strong>crosswalk / speed bump / driveway entrance만 별도 polygon semantic encoder로 인코딩한다.</strong>
+            <strong>stop sign은 현재처럼 lane type 2 처리만 유지한다.</strong>
+            그다음 polygon token을 road token과 합쳐 기존 agent 문맥 인코더가 그대로 보게 한다.
+          </p>
+        </div>
+
+        <div class="highlight">
+          <strong>핵심 판단</strong><br>
+          이번 안은 <strong>stop-control encoder를 아예 넣지 않습니다.</strong>
+          stop sign은 현재 코드가 이미 lane type 2로 lane semantics 안에 녹여 두고 있으므로,
+          추가 분기 없이 유지하는 편이 더 깔끔합니다. 대신 모델의 약점이 큰 polygon 3종만 정확히 분리해 강화합니다.
+        </div>
+
+        <div class="diagram" style="margin-top:18px;">
+          <div class="band">
+            <div class="band-head">
+              <div class="band-title">전체 처리 흐름</div>
+              <div class="band-sub">Road branch unchanged + Polygon branch added + Stop sign unchanged</div>
+            </div>
+            <div class="flow-row cols-7">
+              <article class="block keep">
+                <div class="type">Keep</div>
+                <h3>도로 geometry encoder</h3>
+                <p>기존 road micro-polyline을 기존 token bank와 기존 map trunk로 처리합니다.</p>
+                <div class="io">
+                  <div class="io-line"><strong>입력</strong>: <code>[N_road, 3, 2]</code></div>
+                  <div class="io-line"><strong>출력</strong>: <code>road token [N_road, 128]</code></div>
+                </div>
+              </article>
+              <div class="arrow">＋</div>
+              <article class="block new">
+                <div class="type">New</div>
+                <h3>polygon semantic encoder</h3>
+                <p>crosswalk / speed bump / driveway entrance만 원래 polygon 경계를 유지한 채 별도 token으로 만듭니다.</p>
+                <div class="io">
+                  <div class="io-line"><strong>입력</strong>: <code>raw polygon [N_poly, V_i, 2]</code></div>
+                  <div class="io-line"><strong>출력</strong>: <code>poly token [N_poly, 128]</code></div>
+                </div>
+              </article>
+              <div class="arrow">→</div>
+              <article class="block new">
+                <div class="type">New</div>
+                <h3>polygon→road refinement</h3>
+                <p>polygon token이 주변 road token을 1층만 읽어, 어느 도로 흐름에 붙는지 반영합니다.</p>
+                <div class="io">
+                  <div class="io-line"><strong>출력</strong>: <code>refined poly token [N_poly, 128]</code></div>
+                </div>
+              </article>
+              <div class="arrow">→</div>
+              <article class="block keep">
+                <div class="type">Keep</div>
+                <h3>기존 agent / flow trunk</h3>
+                <p>합쳐진 map token 집합을 기존 time→map→agent→flow 경로에 그대로 넣습니다.</p>
+                <div class="io">
+                  <div class="io-line"><strong>최종 map set</strong>: <code>[N_road + N_poly, 128]</code></div>
+                  <div class="io-line"><strong>출력</strong>: <code>[N_valid_anchor, 20, 4]</code></div>
+                </div>
+              </article>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section fade" id="polygon">
+        <div class="section-head">
+          <div class="eyebrow">Detailed Polygon Semantic Encoder</div>
+          <h2>Polygon Semantic Encoder를 더 디테일하게 풀어 쓴 구조</h2>
+          <p>
+            이번 개정안의 핵심은 여기입니다. 아래 구조는 polygon을 단순히 선분 조각으로 바꾸지 않고,
+            <strong>원래의 경계 모양</strong>, <strong>객체 종류</strong>, <strong>주변 도로와의 연결 관계</strong>를
+            작은 파라미터로 함께 담도록 만든 설계입니다.
+          </p>
+        </div>
+
+        <div class="module-card new">
+          <header>
+            <div class="path">새로 추가되는 branch · 대상: <code>crosswalk</code> / <code>speed bump</code> / <code>driveway entrance</code></div>
+            <h3>입력과 출력</h3>
+            <p>이 branch는 road token bank를 전혀 거치지 않습니다. 처음부터 polygon 전용 표현으로 들어가고, 마지막에만 road token과 합칩니다.</p>
+          </header>
+          <table class="shape-table">
+            <thead>
+              <tr>
+                <th>항목</th>
+                <th>shape</th>
+                <th>의미</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>raw polygon</td>
+                <td><code>[N_poly, V_i, 2]</code></td>
+                <td>객체마다 점 개수가 다른 원래 경계점</td>
+              </tr>
+              <tr>
+                <td>resampled boundary</td>
+                <td><code>[N_poly, K, 2]</code></td>
+                <td>고정 개수로 다시 샘플링한 경계점, 권장 <code>K = 8</code></td>
+              </tr>
+              <tr>
+                <td>boundary edge vector</td>
+                <td><code>[N_poly, K, 2]</code></td>
+                <td>각 점에서 다음 점으로 가는 경계 방향과 길이</td>
+              </tr>
+              <tr>
+                <td>boundary token input</td>
+                <td><code>[N_poly, K, 4]</code></td>
+                <td><code>[x, y, dx, dy]</code>, 모두 polygon 중심 기준 local meter</td>
+              </tr>
+              <tr>
+                <td>point hidden</td>
+                <td><code>[N_poly, K, 64]</code></td>
+                <td>shared point MLP + 경계 순서 self-attention 이후의 점 표현</td>
+              </tr>
+              <tr>
+                <td>pooled shape summary</td>
+                <td><code>[N_poly, 128]</code></td>
+                <td>mean pool 64 + max pool 64를 이어 붙인 전체 모양 요약</td>
+              </tr>
+              <tr>
+                <td>size feature</td>
+                <td><code>[N_poly, 2]</code> → <code>[N_poly, 32]</code></td>
+                <td>짧은 축 길이, 긴 축 길이</td>
+              </tr>
+              <tr>
+                <td>type embedding</td>
+                <td><code>[N_poly]</code> → <code>[N_poly, 32]</code></td>
+                <td>0 crosswalk / 1 speed bump / 2 driveway entrance</td>
+              </tr>
+              <tr>
+                <td>initial polygon token</td>
+                <td><code>[N_poly, 128]</code></td>
+                <td>shape summary + size feature + type embedding을 합친 결과</td>
+              </tr>
+              <tr>
+                <td>refined polygon token</td>
+                <td><code>[N_poly, 128]</code></td>
+                <td>주변 road context를 1층만 읽은 최종 polygon token</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="stage-list" style="margin-top:18px;">
+          <article class="step-card">
+            <div class="step-head">
+              <h3>1) polygon canonicalizer</h3>
+              <span class="step-tag">New / Geometry Setup</span>
+            </div>
+            <p>
+              먼저 원래 polygon 경계를 그대로 읽고, 객체 중심을 기준으로 local frame을 만듭니다.
+              여기서 가장 중요한 선택은 <strong>local x축을 긴 축이 아니라 짧은 축 방향</strong>으로 두는 것입니다.
+              이유는 세 객체 모두 차량이 실제로 반응하는 방향이 짧은 축과 더 잘 맞기 때문입니다.
+            </p>
+            <ul>
+              <li><strong>중심점</strong>: polygon 중심 <code>[N_poly, 2]</code></li>
+              <li><strong>대표 방향</strong>: 짧은 축 방향 각도 <code>[N_poly]</code></li>
+              <li><strong>로컬 좌표</strong>: 중심 기준 meter 값 그대로 사용</li>
+              <li><strong>크기값</strong>: 짧은 축 길이, 긴 축 길이만 사용</li>
+            </ul>
+            <p style="margin-top:10px;">
+              이렇게 두면 crosswalk는 차량 접근 방향, speed bump는 넘는 방향, driveway entrance는 진입 방향이
+              하나의 공통 축 의미로 정리됩니다.
+            </p>
+          </article>
+
+          <article class="step-card">
+            <div class="step-head">
+              <h3>2) boundary resampling</h3>
+              <span class="step-tag">New / Fixed-Length Input</span>
+            </div>
+            <p>
+              객체마다 점 개수가 달라도 encoder 입력은 고정 길이여야 하므로, 닫힌 경계를 둘레 기준으로 균일하게 다시 샘플링합니다.
+              권장값은 <code>K = 8</code>입니다. 이 정도면 직사각형 중심인 crosswalk / speed bump는 충분히 표현되고,
+              driveway entrance의 비대칭도 어느 정도 유지됩니다.
+            </p>
+            <ul>
+              <li>입력: <code>raw polygon [N_poly, V_i, 2]</code></li>
+              <li>출력: <code>boundary points [N_poly, 8, 2]</code></li>
+              <li>추가 계산: 연속 점 차이로 <code>edge vector [N_poly, 8, 2]</code></li>
+            </ul>
+            <p style="margin-top:10px;">
+              이 단계 덕분에 원본처럼 4개 점만 뽑아 의미를 잃지 않고, 모든 polygon이 같은 크기의 입력으로 정렬됩니다.
+            </p>
+          </article>
+
+          <article class="step-card">
+            <div class="step-head">
+              <h3>3) boundary point encoder</h3>
+              <span class="step-tag">MLP + 1-Layer Self-Attention</span>
+            </div>
+            <p>
+              각 boundary point는 자기 위치만 보면 부족하므로, 다음 점으로 가는 경계 방향까지 함께 넣습니다.
+              그래서 한 점의 입력은 <code>[x, y, dx, dy]</code>입니다. 이 입력을 작은 MLP로 올린 다음,
+              경계 순서를 1층 self-attention으로 한 번만 섞어 줍니다.
+            </p>
+            <ul>
+              <li><strong>입력</strong>: <code>[N_poly, 8, 4]</code></li>
+              <li><strong>점별 MLP</strong>: 각 점을 <code>64</code>차원으로 변환</li>
+              <li><strong>경계 순서 attention</strong>: <code>[N_poly, 8, 64]</code> 유지</li>
+            </ul>
+            <p style="margin-top:10px;">
+              여기서 self-attention을 1층만 넣는 이유는, 단순 pooling만 쓰면 경계 순서 정보가 약해지기 때문입니다.
+              하지만 층을 많이 쌓을 필요는 없습니다. 점 개수 자체가 작고, 파라미터도 아껴야 하기 때문입니다.
+            </p>
+          </article>
+
+          <article class="step-card">
+            <div class="step-head">
+              <h3>4) shape summary pooling</h3>
+              <span class="step-tag">Mean Pool + Max Pool</span>
+            </div>
+            <p>
+              점 수준 표현을 전체 객체 표현으로 바꾸는 단계입니다. mean pool은 전체 평균 모양을 담고,
+              max pool은 가장 강한 경계 특징을 잡습니다. 두 벡터를 이어 붙이면 전체 shape summary가 됩니다.
+            </p>
+            <ul>
+              <li><strong>입력</strong>: <code>[N_poly, 8, 64]</code></li>
+              <li><strong>mean pool</strong>: <code>[N_poly, 64]</code></li>
+              <li><strong>max pool</strong>: <code>[N_poly, 64]</code></li>
+              <li><strong>출력</strong>: <code>[N_poly, 128]</code></li>
+            </ul>
+          </article>
+
+          <article class="step-card">
+            <div class="step-head">
+              <h3>5) size head + type head</h3>
+              <span class="step-tag">Small MLP + Embedding</span>
+            </div>
+            <p>
+              boundary 모양만으로는 crosswalk와 speed bump를 완전히 나누기 어렵기 때문에,
+              객체 고유 종류와 크기 요약을 별도 채널로 같이 넣습니다. 다만 입력 스케일 철학을 맞추기 위해,
+              큰 값이 될 수 있는 area는 직접 넣지 않고 <strong>짧은 축 길이, 긴 축 길이</strong>만 사용합니다.
+            </p>
+            <ul>
+              <li><strong>size input</strong>: <code>[N_poly, 2]</code> = 짧은 축, 긴 축</li>
+              <li><strong>size MLP 출력</strong>: <code>[N_poly, 32]</code></li>
+              <li><strong>type embedding 출력</strong>: <code>[N_poly, 32]</code></li>
+            </ul>
+            <p style="margin-top:10px;">
+              이 정보는 shape summary와 합쳐져, 같은 직사각형처럼 보여도 crosswalk / speed bump / driveway를
+              다르게 해석하도록 도와줍니다.
+            </p>
+          </article>
+
+          <article class="step-card">
+            <div class="step-head">
+              <h3>6) fusion MLP</h3>
+              <span class="step-tag">MLP</span>
+            </div>
+            <p>
+              shape summary, size feature, type embedding을 이어 붙여 최종 초기 polygon token을 만듭니다.
+              이 단계까지의 출력은 아직 <strong>자기 모양만 아는 token</strong>입니다.
+            </p>
+            <ul>
+              <li><strong>입력</strong>: <code>[N_poly, 128 + 32 + 32]</code></li>
+              <li><strong>출력</strong>: <code>initial polygon token [N_poly, 128]</code></li>
+            </ul>
+          </article>
+
+          <article class="step-card">
+            <div class="step-head">
+              <h3>7) lane-conditioned refinement</h3>
+              <span class="step-tag">1-Layer Cross-Attention</span>
+            </div>
+            <p>
+              polygon은 자기 모양만 알면 부족합니다. 실제 주행에서는 <strong>어느 도로 흐름에 붙어 있는지</strong>가 중요합니다.
+              그래서 초기 polygon token이 주변 road token을 1층만 읽게 합니다. 이때 road token은 이미 기존 road branch가 잘 만든 표현을 그대로 씁니다.
+            </p>
+            <ul>
+              <li><strong>query</strong>: <code>initial polygon token [N_poly, 128]</code></li>
+              <li><strong>key / value</strong>: <code>road token [N_road, 128]</code></li>
+              <li><strong>관계 feature</strong>: <code>[E, 3]</code> = 거리, 상대 방향, heading 차이</li>
+              <li><strong>출력</strong>: <code>refined polygon token [N_poly, 128]</code></li>
+            </ul>
+            <p style="margin-top:10px;">
+              이 1층 때문에 crosswalk는 어떤 주행 흐름 위에 놓였는지, speed bump는 어느 lane을 가로지르는지,
+              driveway entrance는 어느 road edge / lane과 연결되는지가 token 안에 들어갑니다.
+            </p>
+          </article>
+        </div>
+
+        <div class="callout" style="margin-top:18px;">
+          <strong>정리</strong>
+          polygon semantic encoder는 <strong>모양 자체</strong>는 boundary point encoder가, <strong>객체 종류</strong>는 type embedding이,
+          <strong>크기 차이</strong>는 size head가, <strong>도로와의 연결 의미</strong>는 lane-conditioned refinement가 담당합니다.
+          이 네 조합이면 지금 구조를 크게 어지럽히지 않으면서도 polygon 3종을 가장 분리해서 살릴 수 있습니다.
+        </div>
+      </section>
+
+      <section class="section fade" id="fusion">
+        <div class="section-head">
+          <div class="eyebrow">Fusion & Downstream</div>
+          <h2>road / polygon / stop sign이 최종적으로 어떻게 합쳐지는가</h2>
+          <p>
+            여기서 중요한 점은 <strong>stop sign만 별도 token이 없다</strong>는 것입니다.
+            stop sign은 lane type 2로 lane branch 안에 남고, polygon 3종만 따로 token이 생깁니다.
+          </p>
+        </div>
+
+        <div class="grid-3">
+          <article class="module-card keep">
+            <header>
+              <div class="path">유지</div>
+              <h3>1. road branch</h3>
+              <p>기존 road token bank matching, type embedding, light embedding, map trunk를 그대로 씁니다.</p>
+            </header>
+            <ul>
+              <li><strong>입력</strong>: <code>[N_road, 3, 2]</code>, point type, polygon group, light type</li>
+              <li><strong>출력</strong>: <code>road token [N_road, 128]</code></li>
+              <li><strong>stop sign</strong>: lane type 2가 여기에 포함됨</li>
+            </ul>
+          </article>
+
+          <article class="module-card new">
+            <header>
+              <div class="path">추가</div>
+              <h3>2. polygon branch</h3>
+              <p>crosswalk / speed bump / driveway entrance만 별도로 <code>[N_poly, 128]</code> token을 만듭니다.</p>
+            </header>
+            <ul>
+              <li><strong>출력 위치</strong>: <code>poly center [N_poly, 2]</code></li>
+              <li><strong>출력 방향</strong>: <code>poly heading [N_poly]</code> = 짧은 축 방향</li>
+              <li><strong>출력 token</strong>: <code>poly token [N_poly, 128]</code></li>
+            </ul>
+          </article>
+
+          <article class="module-card keep">
+            <header>
+              <div class="path">유지 + 소폭 추가</div>
+              <h3>3. 최종 map set</h3>
+              <p>road token과 polygon token을 같은 map 집합으로 합쳐 기존 agent encoder가 그대로 보게 합니다.</p>
+            </header>
+            <ul>
+              <li><strong>token</strong>: <code>[N_road + N_poly, 128]</code></li>
+              <li><strong>position</strong>: <code>[N_road + N_poly, 2]</code></li>
+              <li><strong>orientation</strong>: <code>[N_road + N_poly]</code></li>
+              <li><strong>선택 추가</strong>: road / polygon 구분용 2-way source embedding</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="diagram" style="margin-top:18px;">
+          <div class="band">
+            <div class="band-head">
+              <div class="band-title">downstream은 그대로 유지</div>
+              <div class="band-sub">기존 trunk를 깨지 않는 것이 이번 설계의 핵심</div>
+            </div>
+            <div class="flow-row cols-5">
+              <article class="block keep">
+                <div class="type">Keep</div>
+                <h3>Temporal attention</h3>
+                <p>에이전트 자신의 과거 coarse 문맥을 읽습니다.</p>
+              </article>
+              <div class="arrow">→</div>
+              <article class="block keep">
+                <div class="type">Keep</div>
+                <h3>Map→Agent attention</h3>
+                <p>여기서 road token과 polygon token이 함께 agent에 주입됩니다.</p>
+              </article>
+              <div class="arrow">→</div>
+              <article class="block keep">
+                <div class="type">Keep</div>
+                <h3>Agent↔Agent attention</h3>
+                <p>주변 차와의 상호작용을 기존 방식대로 읽습니다.</p>
+              </article>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-2" style="margin-top:18px;">
+          <article class="compare-card keep">
+            <div class="badge keep">왜 stop sign을 안 건드리는가</div>
+            <p>
+              stop sign은 지금 코드가 이미 lane semantics 안으로 넣고 있습니다. 이번 개정안에서 굳이 stop-sign 전용 token을 새로 만들면,
+              구조는 복잡해지고 파라미터도 늘어나는데, 핵심 약점인 polygon 3종과는 별개 분기가 또 하나 생깁니다.
+              이번 안은 그 유혹을 버리고, <strong>stop sign은 원본 유지</strong>로 고정합니다.
+            </p>
+          </article>
+          <article class="compare-card new">
+            <div class="badge new">이번 안의 진짜 변경 포인트</div>
+            <p>
+              결국 바뀌는 것은 딱 하나입니다. <strong>crosswalk / speed bump / driveway entrance가 road-like 선분이 아니라,
+              자기 의미를 가진 polygon token으로 살아난다</strong>는 점입니다. 나머지 문맥 trunk는 거의 그대로 유지됩니다.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section fade" id="budget">
+        <div class="section-head">
+          <div class="eyebrow">Budget & Scaling</div>
+          <h2>왜 이 안이 7M 수준과 현재 정규화 철학에 맞는가</h2>
+          <p>
+            이 프로젝트는 입력을 크게 표준화해서 넣는 스타일이 아니고, 상대값과 local 값 중심입니다.
+            그래서 polygon branch도 같은 철학으로 맞추는 것이 중요합니다.
+          </p>
+        </div>
+
+        <div class="spec-grid">
+          <article class="spec-card">
+            <strong>정규화 원칙</strong>
+            <p>
+              polygon branch에서도 <strong>global normalization을 새로 만들지 않습니다.</strong>
+              boundary point, edge vector, 짧은 축 길이, 긴 축 길이는 모두 local meter 값 그대로 넣습니다.
+              heading은 기존 관계 feature와 맞게 angle 차이 또는 방향 벡터로 다룹니다.
+            </p>
+          </article>
+          <article class="spec-card">
+            <strong>왜 area를 직접 안 넣는가</strong>
+            <p>
+              면적은 숫자 스케일이 커질 수 있고, 현재 trunk와 감각이 다를 수 있습니다.
+              대신 boundary shape와 축 길이 두 개만 있어도 면 정보 대부분이 이미 들어갑니다.
+            </p>
+          </article>
+          <article class="spec-card">
+            <strong>파라미터 예산</strong>
+            <p>
+              새로 늘어나는 것은 작은 point MLP, 1층 boundary self-attention, 작은 size MLP,
+              type embedding, 1층 polygon→road cross-attention 정도입니다. 그래서 증가분은 비교적 작고,
+              전체를 7M 근처에 유지하는 설계가 가능합니다.
+            </p>
+          </article>
+          <article class="spec-card">
+            <strong>왜 이게 가장 깔끔한가</strong>
+            <p>
+              road trunk, stop sign 처리, agent trunk, flow decoder는 그대로 두고,
+              약점이 큰 polygon 3종만 정교하게 살리기 때문입니다. 바꾸는 범위가 작고, 의미 분리는 커집니다.
+            </p>
+          </article>
+        </div>
+
+        <div class="callout" style="margin-top:18px;">
+          <strong>최종 요약</strong>
+          road는 기존 road token bank를 계속 쓴다. stop sign은 기존 lane type 2 처리 그대로 둔다.
+          crosswalk / speed bump / driveway entrance만 road bank를 우회하는 polygon semantic encoder로 만들고,
+          1층 polygon→road refinement 뒤에 기존 map→agent attention에 합친다.
+          이게 이번 조건에서 가장 단순하면서도 가장 합리적인 1안이다.
+        </div>
+      </section>
+
+      <section class="sources fade" id="sources">
+        <div class="section-head">
+          <div class="eyebrow">Compared Files</div>
+          <h2>이 문서가 비교 기준으로 삼은 원본 파일</h2>
+          <p>
+            아래 파일들을 기준으로 원본 <code>new_2</code> 동작을 읽고, 그 위에 변경 지점을 표시했습니다.
+          </p>
+        </div>
+        <div class="source-grid">
+          <article class="source-card">
+            <h3>원본 동작을 보는 핵심 파일</h3>
+            <ul>
+              <li><a href="https://github.com/seulbinHwang/catk/blob/new_2/src/data_preprocess.py">src/data_preprocess.py</a></li>
+              <li><a href="https://github.com/seulbinHwang/catk/blob/new_2/src/smart/utils/preprocess.py">src/smart/utils/preprocess.py</a></li>
+              <li><a href="https://github.com/seulbinHwang/catk/blob/new_2/src/smart/tokens/token_processor.py">src/smart/tokens/token_processor.py</a></li>
+            </ul>
+          </article>
+          <article class="source-card">
+            <h3>기존 trunk와 shape를 보는 파일</h3>
+            <ul>
+              <li><a href="https://github.com/seulbinHwang/catk/blob/new_2/configs/model/smart_flow.yaml">configs/model/smart_flow.yaml</a></li>
+              <li><a href="https://github.com/seulbinHwang/catk/blob/new_2/src/smart/modules/flow_agent_decoder.py">src/smart/modules/flow_agent_decoder.py</a></li>
+              <li><a href="https://github.com/seulbinHwang/catk/blob/new_2/src/smart/tokens/flow_token_processor.py">src/smart/tokens/flow_token_processor.py</a></li>
+            </ul>
+          </article>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

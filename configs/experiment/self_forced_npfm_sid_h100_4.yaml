@@ -1,0 +1,18 @@
+# @package _global_
+
+# H100x4 SiD-lite self-forcing fine-tuning preset.
+defaults:
+  - self_forced_npfm_h100_4
+  - _self_
+
+model:
+  model_config:
+    self_forced:
+      distribution_matching_objective: sid
+      sid_alpha: 1.0
+      sid_normalizer_eps: 1.0e-3
+      use_anchor_flow_matching_loss: false
+      detach_block_transition: false
+      unfrozen_range: except_map_encoder
+      estimator_warmup_epochs: 0
+      use_control_space_physics_regularization: false

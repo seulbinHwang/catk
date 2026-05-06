@@ -1,5 +1,5 @@
 defaults:
-  - smart
+  - smart_flow
 
 model_config:
   decoder:
@@ -13,4 +13,4 @@ model_config:
     a2a_radius: 20
     time_span: 20
 
-# 1.2M parameters. Train on single A100 80GB, with batch size 64.
+# 1.2M parameters for the flow-matching variant.

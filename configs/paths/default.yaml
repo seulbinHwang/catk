@@ -13,4 +13,4 @@ log_dir: ${paths.root_dir}/logs/
 output_dir: ${hydra:runtime.output_dir}
 
 # path to data directory
-cache_root: /home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1
+cache_root: /scratch/cache/SMART

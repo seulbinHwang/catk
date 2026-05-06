@@ -5,6 +5,12 @@ strategy:
   _target_: lightning.pytorch.strategies.DDPStrategy
   find_unused_parameters: false
   gradient_as_bucket_view: true
+  # Closed-loop validation can spend a long time inside the CPU-side official
+  # Sim Agents scorer before the next DDP collective. Keep the process group
+  # timeout comfortably above that path for multi-node runs.
+  timeout:
+    _target_: datetime.timedelta
+    seconds: 14400
 
 accelerator: gpu
 devices: -1

@@ -25,7 +25,7 @@ model:
       method_link: "not available yet"
       account_name: "h.sb@naverlabs.com"
 
-ckpt_path: /home2/pnc2/repos_python/project/logs/exp-b2-steps8-lam1/runs/2026-04-15_07-40-01/checkpoints/last.ckpt
+ckpt_path: YOUR_MODEL.ckpt
 
 trainer:
   limit_train_batches: 1.0
