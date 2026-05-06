@@ -29,7 +29,7 @@ model:
       # model_config.decoder.use_stop_motion으로 별도 제어합니다.
       use_stop_motion: false
       estimator_updates_per_step: 5
-      estimator_warmup_epochs: 0
+      estimator_warmup_epochs: 1
       # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
       # Resume from a self-forced checkpoint preserves restored aux states.
       initialize_aux_from_generator_on_fit_start: true

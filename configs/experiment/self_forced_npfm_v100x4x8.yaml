@@ -36,7 +36,7 @@ model:
     scorer_scene_num: 320
     self_forced:
       use_stop_motion: false
-      estimator_warmup_epochs: 0
+      estimator_warmup_epochs: 1
 
 data:
   # V100 32GB self-forced runs have a much tighter memory envelope than H100.

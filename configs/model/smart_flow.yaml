@@ -99,7 +99,7 @@ model_config:
     # test / submission inference는 decoder.use_stop_motion을 따릅니다.
     use_stop_motion: false
     estimator_updates_per_step: 5
-    estimator_warmup_epochs: 0
+    estimator_warmup_epochs: 1
     initialize_aux_from_generator_on_fit_start: true
     unfrozen_range: except_map_encoder
     ema_weight: 0.99
