@@ -1270,16 +1270,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         coarse_valid_list = [valid_window[:, i].clone() for i in range(valid_window.shape[1])]
         coarse_idx_list = [pred_idx_window[:, i].clone() for i in range(pred_idx_window.shape[1])]
 
-        pred_traj_10hz = torch.zeros(
-            (n_agent, n_step_future_10hz, 2),
-            dtype=pos_window.dtype,
-            device=pos_window.device,
-        )
-        pred_head_10hz = torch.zeros(
-            (n_agent, n_step_future_10hz),
-            dtype=head_window.dtype,
-            device=head_window.device,
-        )
+        # full-grad 학습(OCSC, BPTT) 시 같은 텐서에 슬라이스 in-place 대입을 하면
+        # autograd version counter 가 증가해 backward 에서 chain 이 끊기거나 silent
+        # 하게 grad 가 흐르지 않을 수 있다.  안전하게 청크 리스트에 모았다가 마지막에
+        # cat 한다 (fix-hard-rmm 의 패턴).
+        pred_traj_10hz_chunks: list[torch.Tensor] = []
+        pred_head_10hz_chunks: list[torch.Tensor] = []
+        # commit chunk 의 dtype/device 결정용으로 빈 zeros 한 번 보관 (실제 출력엔 안 씀).
+        _pred_traj_10hz_dtype = pos_window.dtype
+        _pred_traj_10hz_device = pos_window.device
+        _pred_head_10hz_dtype = head_window.dtype
+        _pred_head_10hz_device = head_window.device
         pred_flow_2s_traj = None
         pred_flow_2s_valid = None
         if return_flow_2s_preview:
@@ -1503,8 +1504,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             next_pos = pos_window[:, -1].clone()
             next_head = head_window[:, -1].clone()
             next_token_idx = pred_idx_window[:, -1].clone()
-            commit_traj_step = pred_traj_10hz.new_zeros((n_agent, self.shift, 2))
-            commit_head_step = pred_head_10hz.new_zeros((n_agent, self.shift))
+            commit_traj_step = torch.zeros(
+                (n_agent, self.shift, 2),
+                dtype=_pred_traj_10hz_dtype,
+                device=_pred_traj_10hz_device,
+            )
+            commit_head_step = torch.zeros(
+                (n_agent, self.shift),
+                dtype=_pred_head_10hz_dtype,
+                device=_pred_head_10hz_device,
+            )
 
             if active_mask.any():
                 active_hidden = current_hidden[active_mask]
@@ -1681,8 +1690,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 exec_head_pair_10hz[active_mask] = exec_head_history_act[:, -2:]
                 exec_valid_pair_10hz[active_mask] = exec_valid_history_act[:, -2:]
 
-            pred_traj_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_traj_step
-            pred_head_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_head_step
+            pred_traj_10hz_chunks.append(commit_traj_step)
+            pred_head_10hz_chunks.append(commit_head_step)
 
             next_pos_for_context = (
                 next_pos.detach() if terminal_step_by_agent is not None else next_pos
@@ -1753,6 +1762,20 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         if _ocsc_prev_grad is not None:
             torch.set_grad_enabled(_ocsc_prev_grad)
             _ocsc_prev_grad = None
+
+        # 청크 → 단일 텐서로 결합.  in-place 대입 회피로 autograd version 충돌 방지.
+        if pred_traj_10hz_chunks:
+            pred_traj_10hz = torch.cat(pred_traj_10hz_chunks, dim=1)
+            pred_head_10hz = torch.cat(pred_head_10hz_chunks, dim=1)
+        else:
+            pred_traj_10hz = torch.zeros(
+                (n_agent, 0, 2),
+                dtype=_pred_traj_10hz_dtype, device=_pred_traj_10hz_device,
+            )
+            pred_head_10hz = torch.zeros(
+                (n_agent, 0),
+                dtype=_pred_head_10hz_dtype, device=_pred_head_10hz_device,
+            )
 
         # ── OCSC bptt_grad_clip_traj: closed-loop traj gradient L2 norm clip ──
         # Detached buffer 에서는 hook 이 호출되지 않으므로 requires_grad 분기.
