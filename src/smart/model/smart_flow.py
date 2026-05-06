@@ -63,8 +63,11 @@ from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.smart.utils.flow_horizon import format_flow_horizon_tag
 from src.smart.utils.rollout import transform_to_local
+from src.utils import RankedLogger
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+
+log = RankedLogger(__name__, rank_zero_only=True)
 
 
 class SMARTFlow(LightningModule):
@@ -887,6 +890,62 @@ class SMARTFlow(LightningModule):
             ],
             dim=-1,
         )
+
+    def _compute_ocsc_train_hard_rmm(
+        self,
+        scenario_files: list,
+        agent_ids: Tensor,
+        agent_batch: Tensor,
+        traj_list: list,
+        z_list: list,
+        head_list: list,
+        metric: "HardSimAgentsMetrics | None" = None,
+    ) -> float | None:
+        """G개의 8초 detached 궤적으로 HardRMM(WOSAC official 기준)을 계산합니다.
+
+        검증/테스트가 아니라 **학습 step 내부에서** 호출하기 위한 헬퍼입니다.
+        OCSC 파인튜닝 중 매 step (또는 N step 마다) closed-loop rollout 의 RMM 을
+        모니터링해 학습 추세를 빠르게 확인할 수 있습니다.
+
+        Args:
+            scenario_files: 시나리오별 TFRecord 경로 (length B).
+            agent_ids: ``[n_agents]`` 글로벌 agent id 텐서.
+            agent_batch: ``[n_agents]`` 시나리오 인덱스 텐서.
+            traj_list: G 개의 ``[n_agents, 80, 2]`` 궤적 (10Hz × 8초).
+            z_list: G 개의 ``[n_agents, 80]`` z 좌표.
+            head_list: G 개의 ``[n_agents, 80]`` heading.
+            metric: 사용할 HardSimAgentsMetrics 인스턴스. None 이면
+                ``self._ocsc_train_hard_rmm`` 을 사용 (현재 정책).
+
+        Returns:
+            float | None: 계산된 HardRMM 값. 실패하거나 metric 이 없으면 None.
+        """
+        _metric = metric if metric is not None else getattr(self, "_ocsc_train_hard_rmm", None)
+        if _metric is None or len(traj_list) == 0:
+            return None
+        try:
+            pred_traj = torch.stack(traj_list, dim=1)
+            pred_z = torch.stack(z_list, dim=1)
+            pred_head = torch.stack(head_list, dim=1)
+
+            with torch.no_grad():
+                _metric.update_from_prediction_tensors(
+                    scenario_files=list(scenario_files),
+                    agent_id=agent_ids,
+                    agent_batch=agent_batch,
+                    pred_traj=pred_traj,
+                    pred_z=pred_z,
+                    pred_head=pred_head,
+                )
+            result_dict = _metric.compute()
+            _metric.reset()
+            key = getattr(_metric, "_metric_key", "train_ocsc/sim_agents_2025/realism_meta_metric")
+            val = result_dict.get(key)
+            if val is not None:
+                return float(val.item() if isinstance(val, Tensor) else val)
+        except Exception as exc:
+            log.warning(f"[ocsc_ft] HardRMM computation failed: {exc}")
+        return None
 
     def _expand_batch_index_for_rollouts(
         self,
