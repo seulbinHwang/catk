@@ -947,6 +947,360 @@ class SMARTFlow(LightningModule):
             log.warning(f"[ocsc_ft] HardRMM computation failed: {exc}")
         return None
 
+    # ────────────────────────────────────────────────────────────────────────
+    # OCSC (Open-Closed Self-Consistency) fine-tuning
+    # ────────────────────────────────────────────────────────────────────────
+    # OCSC 는 covariate-shift 를 줄이기 위해 closed-loop rollout 을 self-supervised
+    # signal 에 정렬합니다.  Target 은 둘 중 하나를 선택합니다:
+    #   - Open-loop sample (현재 또는 frozen 정책의 noise→2초 prediction).
+    #   - GT 궤적 (ocsc_gt_target=True).
+    # Loss 는 4-channel normalized space 에서 L2 또는 MMD² 로 계산합니다.
+    # ----------------------------------------------------------------------
+
+    def _is_ocsc_ft_enabled(self) -> bool:
+        """``model_config.finetune.mode == 'ocsc_ft'`` 활성 여부."""
+        cfg = getattr(self, "finetune_config", None)
+        if cfg is None or not bool(getattr(cfg, "enabled", False)):
+            return False
+        return str(getattr(cfg, "mode", "")) == "ocsc_ft"
+
+    def _run_flow_ocsc_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        data: dict | None,
+    ) -> dict:
+        """Open-Closed Self-Consistency 학습 step.
+
+        알고리즘:
+          1. Map encode (no_grad).
+          2. 각 anchor index ``a`` 에 대해 (anchor_stride 간격):
+             a. ``tokenized_agent`` 의 시퀀스 키를 ``[..., :a+1]`` 로 슬라이스.
+             b. ``prepare_inference_cache`` 로 anchor frame 캐시 구성.
+             c. G 개의 closed-loop rollout 을 ``training_rollout_from_cache``
+                (gradient 유지) 로 실행.
+             d. Target (open-loop sample 또는 GT) 을 anchor-local 4ch 로 투영.
+             e. Consistency loss 누적.
+          3. 평균 loss 반환.  optional 로 detached CL 궤적으로 HardRMM 모니터링.
+
+        Args:
+            tokenized_map: 토큰화된 지도 입력입니다.
+            tokenized_agent: 토큰화된 agent 입력입니다.
+                ``gt_pos / gt_heading / valid_mask / gt_idx`` 키가 시퀀스 길이 T 를
+                갖는 텐서로 존재해야 합니다 (anchor 슬라이싱 대상).
+            data: 학습 batch dict (``scenario_id`` 등 메타데이터 포함).
+
+        Returns:
+            dict: ``{"loss": Tensor[], "n_anchors": int,
+                "n_valid_anchors": int, "hard_rmm": float | None}``.
+        """
+        cfg = self.finetune_config
+        G = int(getattr(cfg, "ocsc_n_rollouts", 2))
+        pred_max_steps_raw = int(getattr(cfg, "ocsc_pred_max_steps", 4))
+        loss_type = str(getattr(cfg, "ocsc_loss_type", "l2"))
+        use_mmd = bool(getattr(cfg, "ocsc_use_mmd", True))
+        use_gt_target = bool(getattr(cfg, "ocsc_gt_target", False))
+        anchor_stride = max(1, int(getattr(cfg, "ocsc_anchor_stride", 4)))
+        heading_w = float(getattr(cfg, "ocsc_heading_weight", 0.0))
+        pos_w = float(getattr(cfg, "ocsc_position_weight", 1.0))
+        rel_disp_w = float(getattr(cfg, "ocsc_rel_disp_weight", 0.0))
+        eval_hard_rmm = bool(getattr(cfg, "ocsc_eval_hard_rmm", False))
+        eval_hard_rmm_interval = max(
+            1, int(getattr(cfg, "ocsc_eval_hard_rmm_interval", 1))
+        )
+
+        agent_enc = self.encoder.agent_encoder
+        shift = int(getattr(agent_enc, "shift", 5))
+        device = tokenized_agent["batch"].device
+
+        # ── 1. Map encode (no_grad) ──────────────────────────────────────────
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+
+        # ── 2. Resolve anchor schedule ───────────────────────────────────────
+        if "gt_pos" not in tokenized_agent:
+            raise KeyError(
+                "ocsc_ft requires tokenized_agent['gt_pos']; got keys: "
+                f"{list(tokenized_agent.keys())}"
+            )
+        total_2hz_steps = int(tokenized_agent["gt_pos"].shape[1])
+        pred_steps = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+        valid_anchor_end = max(1, total_2hz_steps - pred_steps)
+        all_anchor_indices = list(range(0, valid_anchor_end, anchor_stride))
+        if len(all_anchor_indices) == 0:
+            all_anchor_indices = [0]
+
+        seq_keys = {"gt_pos", "gt_heading", "valid_mask", "gt_idx"}
+
+        total_loss = torch.zeros((), device=device)
+        n_valid = 0
+
+        # OCSC 8s detached trajectories for optional HardRMM monitoring.
+        hard_rmm_traj_list: list[Tensor] = []
+        hard_rmm_z_list: list[Tensor] = []
+        hard_rmm_head_list: list[Tensor] = []
+
+        sampling_scheme = self.validation_rollout_sampling
+
+        for anchor_idx in all_anchor_indices:
+            tokenized_agent_anchor: Dict[str, Tensor] = {}
+            for key, value in tokenized_agent.items():
+                if (
+                    key in seq_keys
+                    and isinstance(value, torch.Tensor)
+                    and value.dim() >= 2
+                    and value.shape[1] >= anchor_idx + 1
+                ):
+                    tokenized_agent_anchor[key] = value[:, : anchor_idx + 1]
+                else:
+                    tokenized_agent_anchor[key] = value
+
+            # ── 2a. Build anchor-local rollout cache ─────────────────────────
+            with torch.no_grad():
+                rollout_cache_anchor = agent_enc.prepare_inference_cache(
+                    tokenized_agent=tokenized_agent_anchor,
+                    map_feature=map_feature,
+                )
+            valid_window = rollout_cache_anchor.get("valid_window", None)
+            if valid_window is None:
+                continue
+            active_mask = valid_window[:, -1]
+            if not bool(active_mask.any()):
+                continue
+            current_pos_active = rollout_cache_anchor["pos_window"][:, -1][active_mask]
+            current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
+            active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
+
+            # ── 2b. Build target (GT or open-loop sample) ────────────────────
+            tgt_norms: list[Tensor] = []
+            tgt_valid: Tensor | None = None
+            if use_gt_target:
+                gt_start = anchor_idx + 1
+                gt_end = gt_start + pred_steps
+                gt_pos_a = tokenized_agent["gt_pos"][active_mask, gt_start:gt_end, :]
+                gt_head_a = tokenized_agent["gt_heading"][active_mask, gt_start:gt_end]
+                gt_valid_a = tokenized_agent["valid_mask"][active_mask, gt_start:gt_end]
+                if gt_pos_a.shape[1] == 0 or not gt_valid_a.any():
+                    continue
+                gt_norm = self._world_traj_to_flow_norm(
+                    gt_pos_a, gt_head_a, current_pos_active, current_head_active,
+                ).detach()
+                tgt_norms = [gt_norm]
+                tgt_valid = gt_valid_a
+            else:
+                with torch.no_grad():
+                    for g in range(G):
+                        ol_norm = agent_enc._sample_open_loop_future_from_hidden(
+                            anchor_hidden_valid=active_hidden,
+                            sampling_scheme=sampling_scheme,
+                            sampling_seed=int(self.global_step) * G + g,
+                        )
+                        tgt_norms.append(ol_norm.detach())
+
+            # ── 2c. Closed-loop rollouts (gradient enabled) ──────────────────
+            cl_norms_grad: list[Tensor] = []
+            scenario_ids = data.get("scenario_id") if isinstance(data, dict) else None
+            for g in range(G):
+                if scenario_ids is not None:
+                    seeds_g = self._get_closed_loop_scenario_seeds(
+                        scenario_ids=scenario_ids,
+                        rollout_idx=g,
+                        device=device,
+                    )
+                else:
+                    seeds_g = None
+                cl_out = agent_enc.training_rollout_from_cache(
+                    rollout_cache=rollout_cache_anchor,
+                    tokenized_agent=tokenized_agent_anchor,
+                    map_feature=map_feature,
+                    sampling_scheme=sampling_scheme,
+                    sampling_seed=int(self.global_step) * G + g,
+                    scenario_sampling_seeds=seeds_g,
+                    rollout_steps_2hz=pred_steps,
+                )
+                cl_traj_10hz = cl_out["pred_traj_10hz"]
+                cl_head_10hz = cl_out["pred_head_10hz"]
+                if use_gt_target:
+                    T_gt = int(tgt_norms[0].shape[1])
+                    xy_2hz = cl_traj_10hz[active_mask][:, shift - 1 :: shift, :][:, :T_gt]
+                    head_2hz = cl_head_10hz[active_mask][:, shift - 1 :: shift][:, :T_gt]
+                    cl_norm = self._world_traj_to_flow_norm(
+                        xy_2hz, head_2hz, current_pos_active, current_head_active,
+                    )
+                else:
+                    T_ol = int(tgt_norms[0].shape[1])
+                    xy_10hz = cl_traj_10hz[active_mask][:, :T_ol, :]
+                    head_10hz = cl_head_10hz[active_mask][:, :T_ol]
+                    cl_norm = self._world_traj_to_flow_norm(
+                        xy_10hz, head_10hz, current_pos_active, current_head_active,
+                    )
+                cl_norms_grad.append(cl_norm)
+
+                if eval_hard_rmm and (
+                    int(self.global_step) % eval_hard_rmm_interval == 0
+                ):
+                    hard_rmm_traj_list.append(cl_traj_10hz.detach())
+                    hard_rmm_head_list.append(cl_head_10hz.detach())
+                    z_full = tokenized_agent["gt_z_raw"].unsqueeze(1).expand(
+                        -1, cl_traj_10hz.shape[1]
+                    )
+                    hard_rmm_z_list.append(z_full.detach())
+
+            # ── 2d. Consistency loss ─────────────────────────────────────────
+            anchor_loss = self._ocsc_consistency_loss(
+                cl_norms=cl_norms_grad,
+                tgt_norms=tgt_norms,
+                tgt_valid=tgt_valid,
+                use_mmd=use_mmd,
+                use_gt_target=use_gt_target,
+                loss_type=loss_type,
+                pos_w=pos_w,
+                rel_disp_w=rel_disp_w,
+                heading_w=heading_w,
+            )
+            total_loss = total_loss + anchor_loss
+            n_valid += 1
+
+        if n_valid == 0:
+            return {
+                "loss": torch.zeros((), device=device, requires_grad=True),
+                "n_anchors": len(all_anchor_indices),
+                "n_valid_anchors": 0,
+                "hard_rmm": None,
+            }
+
+        avg_loss = total_loss / float(n_valid)
+
+        # ── 3. Optional HardRMM monitoring ───────────────────────────────────
+        hard_rmm_val: float | None = None
+        if (
+            eval_hard_rmm
+            and len(hard_rmm_traj_list) > 0
+            and isinstance(data, dict)
+            and "tfrecord_path" in data
+        ):
+            try:
+                agent_ids = data["agent"]["id"] if "agent" in data else data.get("id")
+                if agent_ids is not None:
+                    hard_rmm_val = self._compute_ocsc_train_hard_rmm(
+                        scenario_files=list(data["tfrecord_path"]),
+                        agent_ids=agent_ids,
+                        agent_batch=tokenized_agent["batch"],
+                        traj_list=hard_rmm_traj_list,
+                        z_list=hard_rmm_z_list,
+                        head_list=hard_rmm_head_list,
+                    )
+            except Exception as exc:
+                log.warning(f"[ocsc_ft] HardRMM monitoring failed: {exc}")
+
+        return {
+            "loss": avg_loss,
+            "n_anchors": len(all_anchor_indices),
+            "n_valid_anchors": n_valid,
+            "hard_rmm": hard_rmm_val,
+        }
+
+    def _ocsc_consistency_loss(
+        self,
+        cl_norms: list,
+        tgt_norms: list,
+        tgt_valid: Tensor | None,
+        use_mmd: bool,
+        use_gt_target: bool,
+        loss_type: str,
+        pos_w: float,
+        rel_disp_w: float,
+        heading_w: float,
+    ) -> Tensor:
+        """OCSC consistency loss 계산기.
+
+        Open-loop target 모드 (default):
+          - ``use_mmd=True``: MMD² between G CL rollouts and G OL rollouts.
+          - ``use_mmd=False``: paired L2 between matching CL/OL rollouts.
+
+        GT target 모드 (``ocsc_gt_target=True``):
+          - 단일 GT 궤적과 G CL rollouts 의 평균 거리, ``tgt_valid`` 마스킹 적용.
+
+        Args:
+            cl_norms: G 개의 ``[n_active, T, 4]`` closed-loop normalized 텐서
+                (gradient 활성).
+            tgt_norms: target normalized 텐서 리스트.  open-loop 이면 G 개,
+                GT 이면 1 개.
+            tgt_valid: GT 모드에서 ``[n_active, T]`` 유효 마스크.  open-loop 이면
+                ``None``.
+            use_mmd: open-loop 모드에서 MMD² 사용 여부.
+            use_gt_target: GT 모드 여부.
+            loss_type: ``"l2"``, ``"smooth_l1"``, ``"l1"``.
+            pos_w: position 항 가중치.
+            rel_disp_w: relative displacement 항 가중치.
+            heading_w: heading (cos/sin) 항 가중치.
+
+        Returns:
+            Tensor: scalar consistency loss.
+        """
+        import torch.nn.functional as F
+        from src.smart.metrics.mmd_consistency_loss import (
+            mmd_from_stacked,
+            mmd_precompute_sigma_sq,
+        )
+
+        def _pos_loss(p: Tensor, t: Tensor, mask: Tensor | None = None) -> Tensor:
+            if loss_type == "smooth_l1":
+                fn = F.smooth_l1_loss
+            elif loss_type == "l1":
+                fn = F.l1_loss
+            else:
+                fn = F.mse_loss
+            if mask is None:
+                return fn(p[..., :2], t[..., :2], reduction="mean")
+            err = fn(p[..., :2], t[..., :2], reduction="none") * mask
+            return err.sum() / mask.sum().clamp(min=1.0)
+
+        if use_gt_target:
+            if not cl_norms or len(tgt_norms) == 0:
+                return cl_norms[0].sum() * 0.0 if cl_norms else torch.zeros(())
+            tgt = tgt_norms[0]
+            T = min(int(cl_norms[0].shape[-2]), int(tgt.shape[-2]))
+            valid = tgt_valid[..., :T] if tgt_valid is not None else None
+            mask = valid.unsqueeze(-1).float() if valid is not None else None
+            total = cl_norms[0].sum() * 0.0
+            for cl in cl_norms:
+                p = cl[..., :T, :]
+                t = tgt[..., :T, :].detach()
+                term = pos_w * _pos_loss(p, t, mask=mask)
+                if heading_w > 0.0:
+                    term = term + heading_w * _pos_loss(
+                        torch.cat([p[..., 2:], p[..., 2:]], dim=-1),
+                        torch.cat([t[..., 2:], t[..., 2:]], dim=-1),
+                        mask=mask,
+                    )
+                total = total + term
+            return total / float(len(cl_norms))
+
+        if use_mmd and len(cl_norms) >= 2 and len(tgt_norms) >= 2:
+            sigma_sq = mmd_precompute_sigma_sq(
+                ol_norms=[t.detach() for t in tgt_norms],
+                cl_norms=[c.detach() for c in cl_norms],
+            )
+            cl_stack = torch.stack(cl_norms, dim=0)
+            tgt_stack = torch.stack(
+                [t.detach() for t in tgt_norms], dim=0
+            )
+            return pos_w * mmd_from_stacked(cl_stack, tgt_stack)
+
+        # paired L2 fallback
+        total = cl_norms[0].sum() * 0.0
+        n = min(len(cl_norms), len(tgt_norms))
+        for g in range(n):
+            T = min(int(cl_norms[g].shape[-2]), int(tgt_norms[g].shape[-2]))
+            p = cl_norms[g][..., :T, :]
+            t = tgt_norms[g][..., :T, :].detach()
+            term = pos_w * _pos_loss(p, t)
+            if heading_w > 0.0:
+                term = term + heading_w * _pos_loss(p[..., 2:], t[..., 2:])
+            total = total + term
+        return total / float(max(n, 1))
+
     def _expand_batch_index_for_rollouts(
         self,
         batch_index: Tensor,
