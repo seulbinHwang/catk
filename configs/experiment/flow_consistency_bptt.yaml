@@ -68,6 +68,18 @@ model:
       # GT FM regularization (ocsc_gt_target=true 일 때만 의미 있음).
       ocsc_fm_reg_lambda: 0.1
 
+      # ── LoRA fine-tuning (옵션) ────────────────────────────────────────
+      # enabled=true 이면 지정된 nn.Linear (default: t_attn_layers.{to_q,to_v})
+      # 만 LoRA wrap 하고 encoder 의 다른 파라미터는 모두 freeze.  flow_velocity
+      # _head_only 토글은 무시된다 (LoRA-only 학습).
+      lora:
+        enabled: false
+        r: 8                              # LoRA rank.
+        alpha: 16                         # scaling = alpha / r.
+        dropout: 0.0
+        layer_filter: t_attn_layers       # dotted-name 안에 이 substring 이 있어야 매칭.
+        projection_names: [to_q, to_v]    # leaf attribute 가 이 중 하나여야 매칭.
+
       # ── BPTT 메모리 / 속도 토글 ────────────────────────────────────────
       bptt_use_adjoint: true               # flow_ode model_fn 에 ckpt 적용.
       bptt_last_n_solver_steps: 0          # 마지막 N solver step 만 velocity grad (0=비활성).

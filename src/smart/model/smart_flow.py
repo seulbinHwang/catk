@@ -691,17 +691,26 @@ class SMARTFlow(LightningModule):
         return str(getattr(cfg, "mode", "")) == "ocsc_ft"
 
     def _configure_ocsc_finetune(self, finetune_cfg) -> None:
-        """OCSC 특화 freeze / ref decoder 초기화.
+        """OCSC 특화 freeze / ref decoder / LoRA 초기화.
 
         - ``flow_velocity_head_only=True``: ``set_model_for_finetuning`` 이 풀어준 다른
           파라미터를 다시 freeze 하고 ``flow_decoder.velocity_head`` 만 학습 대상으로 둠.
+          ``lora.enabled=True`` 일 때는 무시 (LoRA-only 모드).
         - ``ocsc_use_pretrained_ref=True``: 현재 ``flow_decoder`` 를 deepcopy 해
           ``self.ref_flow_decoder`` 로 보관 (OL target 생성용 frozen reference).
+          deepcopy 는 LoRA 주입 *이전* 에 일어나므로 ref 는 LoRA 없는 base 유지.
+        - ``lora.enabled=True``: 지정된 dotted-name 의 ``nn.Linear`` 들을
+          ``LoraLinear`` 로 wrap 하고, encoder 의 모든 파라미터를 freeze 한 뒤 LoRA
+          A/B 만 trainable 로 둠 (LoRA-only 학습).  default target 은
+          ``agent_encoder.t_attn_layers[i].{to_q,to_v}`` 12 개.
 
         Args:
             finetune_cfg: ``model_config.finetune`` (omegaconf node 또는 dict).
         """
-        if bool(getattr(finetune_cfg, "flow_velocity_head_only", False)):
+        lora_cfg = getattr(finetune_cfg, "lora", None)
+        lora_enabled = bool(getattr(lora_cfg, "enabled", False)) if lora_cfg is not None else False
+
+        if not lora_enabled and bool(getattr(finetune_cfg, "flow_velocity_head_only", False)):
             try:
                 fd = self.encoder.agent_encoder.flow_decoder
                 for p in fd.parameters():
@@ -712,6 +721,8 @@ class SMARTFlow(LightningModule):
                     log.info("[ocsc_ft] flow_velocity_head_only: only velocity_head trainable.")
             except AttributeError:
                 log.warning("[ocsc_ft] flow_velocity_head_only requested but flow_decoder/velocity_head not found.")
+        elif lora_enabled and bool(getattr(finetune_cfg, "flow_velocity_head_only", False)):
+            log.info("[ocsc_ft] LoRA enabled: ignoring flow_velocity_head_only (LoRA-only mode).")
 
         if bool(getattr(finetune_cfg, "ocsc_use_pretrained_ref", False)):
             try:
@@ -724,6 +735,49 @@ class SMARTFlow(LightningModule):
                 log.info("[ocsc_ft] ocsc_use_pretrained_ref: ref_flow_decoder snapshot taken.")
             except AttributeError:
                 log.warning("[ocsc_ft] ocsc_use_pretrained_ref requested but flow_decoder not found.")
+
+        # ref deepcopy 이후 LoRA 주입 — ref 는 깨끗한 base 유지.
+        if lora_enabled:
+            from src.smart.utils.lora_utils import (
+                collect_lora_target_names,
+                freeze_all_then_unfreeze_lora,
+                inject_lora_into_linear_modules,
+            )
+
+            r = int(getattr(lora_cfg, "r", 8))
+            alpha = int(getattr(lora_cfg, "alpha", 16))
+            dropout = float(getattr(lora_cfg, "dropout", 0.0))
+            layer_filter = str(getattr(lora_cfg, "layer_filter", "t_attn_layers"))
+            projection_names = list(
+                getattr(lora_cfg, "projection_names", ["to_q", "to_v"])
+            )
+            targets = collect_lora_target_names(
+                self.encoder,
+                layer_filter=layer_filter,
+                projection_names=projection_names,
+            )
+            if not targets:
+                log.warning(
+                    "[ocsc_ft] LoRA enabled but no target modules matched "
+                    "layer_filter=%s projections=%s",
+                    layer_filter,
+                    projection_names,
+                )
+            else:
+                n_wrapped = inject_lora_into_linear_modules(
+                    self.encoder,
+                    target_names=targets,
+                    r=r,
+                    alpha=alpha,
+                    dropout=dropout,
+                )
+                n_train, n_total = freeze_all_then_unfreeze_lora(self.encoder)
+                log.info(
+                    "[ocsc_ft] LoRA injected: r=%d alpha=%d dropout=%.3f "
+                    "wrapped=%d trainable=%d/%d (%.4f%%)",
+                    r, alpha, dropout, n_wrapped, n_train, n_total,
+                    100.0 * n_train / max(n_total, 1),
+                )
 
     def _run_flow_ocsc_ft_step(
         self,

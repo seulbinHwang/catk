@@ -136,6 +136,15 @@ OCSC_SHARE_NOISE_ACROSS_TIME="${OCSC_SHARE_NOISE_ACROSS_TIME:-false}"
 TRAIN_FULL_FLOW_DECODER_ONLY="${TRAIN_FULL_FLOW_DECODER_ONLY:-false}"
 FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
 
+# ── LoRA fine-tuning (옵션) ─────────────────────────────────────────────────
+# OCSC_LORA_ENABLED=true 이면 t_attn_layers.{to_q,to_v} 12 개에 LoRA wrap
+# 하고 encoder 의 다른 파라미터는 모두 freeze (LoRA-only).
+OCSC_LORA_ENABLED="${OCSC_LORA_ENABLED:-false}"
+OCSC_LORA_R="${OCSC_LORA_R:-8}"
+OCSC_LORA_ALPHA="${OCSC_LORA_ALPHA:-16}"
+OCSC_LORA_DROPOUT="${OCSC_LORA_DROPOUT:-0.0}"
+OCSC_LORA_LAYER_FILTER="${OCSC_LORA_LAYER_FILTER:-t_attn_layers}"
+
 # ── BPTT 메모리 / 속도 토글 ────────────────────────────────────────────────
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
 BPTT_SEQUENTIAL_ROLLOUTS="${BPTT_SEQUENTIAL_ROLLOUTS:-false}"
@@ -232,6 +241,7 @@ echo "        warm=${BPTT_WARM_COARSE_STEPS} last_only=${BPTT_LAST_COARSE_ONLY}"
 echo "        last_n=${BPTT_LAST_N_COARSE_STEPS} grad_clip=${BPTT_GRAD_CLIP_TRAJ}"
 echo "        sequential=${BPTT_SEQUENTIAL_ROLLOUTS}"
 echo "  freeze: full_decoder=${TRAIN_FULL_FLOW_DECODER_ONLY} velocity_only=${FLOW_VELOCITY_HEAD_ONLY}"
+echo "  LoRA: enabled=${OCSC_LORA_ENABLED} r=${OCSC_LORA_R} alpha=${OCSC_LORA_ALPHA} dropout=${OCSC_LORA_DROPOUT} filter=${OCSC_LORA_LAYER_FILTER}"
 echo "  validation: ${VALIDATION_METRIC} (n_batch=${N_BATCH_SIM_AGENTS_METRIC} n_rollout=${N_ROLLOUT_CLOSED_VAL})"
 echo "  LR=${LR} solver=${FLOW_SOLVER_METHOD}/${FLOW_SOLVER_STEPS}"
 echo "  wandb: entity=${WANDB_ENTITY} project=${WANDB_PROJECT} mode=${WANDB_MODE}"
@@ -284,6 +294,11 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.validation_rollout_sampling.noise_scale="${ROLLOUT_NOISE_SCALE}" \
   model.model_config.finetune.train_full_flow_decoder_only="${TRAIN_FULL_FLOW_DECODER_ONLY}" \
   model.model_config.finetune.flow_velocity_head_only="${FLOW_VELOCITY_HEAD_ONLY}" \
+  model.model_config.finetune.lora.enabled="${OCSC_LORA_ENABLED}" \
+  model.model_config.finetune.lora.r="${OCSC_LORA_R}" \
+  model.model_config.finetune.lora.alpha="${OCSC_LORA_ALPHA}" \
+  model.model_config.finetune.lora.dropout="${OCSC_LORA_DROPOUT}" \
+  model.model_config.finetune.lora.layer_filter="${OCSC_LORA_LAYER_FILTER}" \
   model.model_config.finetune.ocsc_n_rollouts="${OCSC_N_ROLLOUTS}" \
   model.model_config.finetune.ocsc_loss_type="${OCSC_LOSS_TYPE}" \
   model.model_config.finetune.ocsc_use_mmd="${OCSC_USE_MMD}" \
