@@ -126,18 +126,14 @@ OCSC_ANCHOR_STRIDE="${OCSC_ANCHOR_STRIDE:-1}"
 OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 OCSC_PRED_MAX_STEPS="${OCSC_PRED_MAX_STEPS:-2}"
 OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-0.0}"
-OCSC_POSITION_WEIGHT="${OCSC_POSITION_WEIGHT:-0.0}"
-OCSC_REL_DISP_WEIGHT="${OCSC_REL_DISP_WEIGHT:-1.0}"
+OCSC_POSITION_WEIGHT="${OCSC_POSITION_WEIGHT:-1.0}"
+OCSC_REL_DISP_WEIGHT="${OCSC_REL_DISP_WEIGHT:-0.0}"
 OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA:-0.1}"
 # 사용자가 실수로 "=0.1" 형태로 넘긴 경우 보정.
 OCSC_FM_REG_LAMBDA="${OCSC_FM_REG_LAMBDA#=}"
 OCSC_GT_TARGET="${OCSC_GT_TARGET:-true}"
 OCSC_SHARE_NOISE_TAPE="${OCSC_SHARE_NOISE_TAPE:-true}"
 OCSC_SHARE_NOISE_ACROSS_TIME="${OCSC_SHARE_NOISE_ACROSS_TIME:-false}"
-
-# ── HardRMM 모니터링 ────────────────────────────────────────────────────────
-OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-false}"
-OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-10}"
 
 # ── Freeze 정책 ─────────────────────────────────────────────────────────────
 TRAIN_FULL_FLOW_DECODER_ONLY="${TRAIN_FULL_FLOW_DECODER_ONLY:-false}"
@@ -240,7 +236,6 @@ echo "        last_n=${BPTT_LAST_N_COARSE_STEPS} grad_clip=${BPTT_GRAD_CLIP_TRAJ
 echo "        sequential=${BPTT_SEQUENTIAL_ROLLOUTS}"
 echo "  freeze: full_decoder=${TRAIN_FULL_FLOW_DECODER_ONLY} velocity_only=${FLOW_VELOCITY_HEAD_ONLY}"
 echo "  validation: ${VALIDATION_METRIC} (n_batch=${N_BATCH_SIM_AGENTS_METRIC} n_rollout=${N_ROLLOUT_CLOSED_VAL})"
-echo "  hard_rmm monitor: ${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
 echo "  LR=${LR} solver=${FLOW_SOLVER_METHOD}/${FLOW_SOLVER_STEPS}"
 echo "  wandb: entity=${WANDB_ENTITY} project=${WANDB_PROJECT} mode=${WANDB_MODE}"
 
@@ -303,8 +298,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_position_weight="${OCSC_POSITION_WEIGHT}" \
   model.model_config.finetune.ocsc_rel_disp_weight="${OCSC_REL_DISP_WEIGHT}" \
   model.model_config.finetune.ocsc_fm_reg_lambda="${OCSC_FM_REG_LAMBDA}" \
-  model.model_config.finetune.ocsc_eval_hard_rmm="${OCSC_EVAL_HARD_RMM}" \
-  model.model_config.finetune.ocsc_eval_hard_rmm_interval="${OCSC_EVAL_HARD_RMM_INTERVAL}" \
   model.model_config.finetune.ocsc_gt_target="${OCSC_GT_TARGET}" \
   model.model_config.finetune.ocsc_share_noise_tape="${OCSC_SHARE_NOISE_TAPE}" \
   model.model_config.finetune.ocsc_share_noise_across_time="${OCSC_SHARE_NOISE_ACROSS_TIME}" \

@@ -102,9 +102,7 @@ class SMARTFlow(LightningModule):
         # ``set_model_for_finetuning`` 의 freeze 처리와 별도 책임을 갖습니다.
         self.finetune_config = getattr(model_config, "finetune", None)
         self.ref_flow_decoder: nn.Module | None = None
-        self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = None
         if self._is_ocsc_ft_enabled():
-            self._ocsc_train_hard_rmm = HardSimAgentsMetrics("train_ocsc")
             # ── ocsc_use_pretrained_ref / flow_velocity_head_only 정합 ──
             self._configure_ocsc_finetune(model_config.finetune)
             # ── sequential 모드는 manual optimization 필요 ──
@@ -919,62 +917,6 @@ class SMARTFlow(LightningModule):
             dim=-1,
         )
 
-    def _compute_ocsc_train_hard_rmm(
-        self,
-        scenario_files: list,
-        agent_ids: Tensor,
-        agent_batch: Tensor,
-        traj_list: list,
-        z_list: list,
-        head_list: list,
-        metric: "HardSimAgentsMetrics | None" = None,
-    ) -> float | None:
-        """G개의 8초 detached 궤적으로 HardRMM(WOSAC official 기준)을 계산합니다.
-
-        검증/테스트가 아니라 **학습 step 내부에서** 호출하기 위한 헬퍼입니다.
-        OCSC 파인튜닝 중 매 step (또는 N step 마다) closed-loop rollout 의 RMM 을
-        모니터링해 학습 추세를 빠르게 확인할 수 있습니다.
-
-        Args:
-            scenario_files: 시나리오별 TFRecord 경로 (length B).
-            agent_ids: ``[n_agents]`` 글로벌 agent id 텐서.
-            agent_batch: ``[n_agents]`` 시나리오 인덱스 텐서.
-            traj_list: G 개의 ``[n_agents, 80, 2]`` 궤적 (10Hz × 8초).
-            z_list: G 개의 ``[n_agents, 80]`` z 좌표.
-            head_list: G 개의 ``[n_agents, 80]`` heading.
-            metric: 사용할 HardSimAgentsMetrics 인스턴스. None 이면
-                ``self._ocsc_train_hard_rmm`` 을 사용 (현재 정책).
-
-        Returns:
-            float | None: 계산된 HardRMM 값. 실패하거나 metric 이 없으면 None.
-        """
-        _metric = metric if metric is not None else getattr(self, "_ocsc_train_hard_rmm", None)
-        if _metric is None or len(traj_list) == 0:
-            return None
-        try:
-            pred_traj = torch.stack(traj_list, dim=1)
-            pred_z = torch.stack(z_list, dim=1)
-            pred_head = torch.stack(head_list, dim=1)
-
-            with torch.no_grad():
-                _metric.update_from_prediction_tensors(
-                    scenario_files=list(scenario_files),
-                    agent_id=agent_ids,
-                    agent_batch=agent_batch,
-                    pred_traj=pred_traj,
-                    pred_z=pred_z,
-                    pred_head=pred_head,
-                )
-            result_dict = _metric.compute()
-            _metric.reset()
-            key = getattr(_metric, "_metric_key", "train_ocsc/sim_agents_2025/realism_meta_metric")
-            val = result_dict.get(key)
-            if val is not None:
-                return float(val.item() if isinstance(val, Tensor) else val)
-        except Exception as exc:
-            log.warning(f"[ocsc_ft] HardRMM computation failed: {exc}")
-        return None
-
     # ────────────────────────────────────────────────────────────────────────
     # OCSC (Open-Closed Self-Consistency) fine-tuning
     # ────────────────────────────────────────────────────────────────────────
@@ -1044,7 +986,7 @@ class SMARTFlow(LightningModule):
              d. Target (open-loop sample 또는 GT) 을 anchor-local 4ch 로 투영.
              e. CL rollout — sequential (2-pass MMD) 또는 parallel.
              f. consistency loss (+ optional GT FM regularization) 누적.
-          3. 평균 loss 반환.  optional 로 detached CL 궤적으로 HardRMM 모니터링.
+          3. 평균 loss 반환.
 
         BPTT 메모리 / 속도 토글 (모두 ``finetune_config`` 키로 노출):
           - ``bptt_warm_coarse_steps``: 앞 N coarse step no_grad + state detach.
@@ -1069,8 +1011,7 @@ class SMARTFlow(LightningModule):
 
         Returns:
             dict: ``{"loss": Tensor[], "n_anchors": int,
-                "n_valid_anchors": int, "hard_rmm": float | None,
-                "fm_reg_loss": float | None}``.
+                "n_valid_anchors": int, "fm_reg_loss": float | None}``.
         """
         import torch.nn.functional as F
         from src.smart.metrics.mmd_consistency_loss import (
@@ -1094,11 +1035,6 @@ class SMARTFlow(LightningModule):
         share_noise_across_time = bool(getattr(cfg, "ocsc_share_noise_across_time", False))
         use_pretrained_ref = bool(getattr(cfg, "ocsc_use_pretrained_ref", False))
         fm_reg_lambda = float(getattr(cfg, "ocsc_fm_reg_lambda", 0.0))
-
-        eval_hard_rmm = bool(getattr(cfg, "ocsc_eval_hard_rmm", False))
-        eval_hard_rmm_interval = max(
-            1, int(getattr(cfg, "ocsc_eval_hard_rmm_interval", 1))
-        )
 
         # BPTT 토글
         warm_coarse = max(0, int(getattr(cfg, "bptt_warm_coarse_steps", 0)))
@@ -1153,10 +1089,6 @@ class SMARTFlow(LightningModule):
         accumulated_loss: Tensor | None = None
         fm_reg_total: Tensor | None = None
         n_valid = 0
-
-        hard_rmm_traj_list: list[Tensor] = []
-        hard_rmm_z_list: list[Tensor] = []
-        hard_rmm_head_list: list[Tensor] = []
 
         # ref_flow_decoder swap helper
         _orig_flow_decoder = agent_enc.flow_decoder
@@ -1299,20 +1231,6 @@ class SMARTFlow(LightningModule):
                         xy, hd, current_pos_active, current_head_active,
                     )
 
-                def _maybe_record_hard_rmm(cl_out: dict) -> None:
-                    if not eval_hard_rmm:
-                        return
-                    if int(self.global_step) % eval_hard_rmm_interval != 0:
-                        return
-                    cl_traj = cl_out["pred_traj_10hz"].detach()
-                    hard_rmm_traj_list.append(cl_traj)
-                    hard_rmm_head_list.append(cl_out["pred_head_10hz"].detach())
-                    if "gt_z_raw" in tokenized_agent:
-                        z_full = tokenized_agent["gt_z_raw"].unsqueeze(1).expand(
-                            -1, cl_traj.shape[1]
-                        )
-                        hard_rmm_z_list.append(z_full.detach())
-
                 def _run_cl(g: int) -> dict:
                     seeds_g = (
                         self._get_closed_loop_scenario_seeds(
@@ -1345,7 +1263,6 @@ class SMARTFlow(LightningModule):
                         for g in range(G):
                             cl_out_d = _run_cl(g)
                             cl_norms_det.append(_cl_norm_from_out(cl_out_d).detach())
-                            _maybe_record_hard_rmm(cl_out_d)
                     sigma_sq_seq = mmd_precompute_sigma_sq(
                         ol_norms=tgt_norms, cl_norms=cl_norms_det,
                     )
@@ -1367,7 +1284,6 @@ class SMARTFlow(LightningModule):
                     for g in range(G):
                         cl_out_g = _run_cl(g)
                         cl_norms_grad.append(_cl_norm_from_out(cl_out_g))
-                        _maybe_record_hard_rmm(cl_out_g)
                     anchor_loss = self._ocsc_consistency_loss(
                         cl_norms=cl_norms_grad,
                         tgt_norms=tgt_norms,
@@ -1426,34 +1342,10 @@ class SMARTFlow(LightningModule):
                     total_loss_value / float(max(n_valid, 1)), device=device,
                 )
 
-            hard_rmm_val: float | None = None
-            if (
-                eval_hard_rmm
-                and len(hard_rmm_traj_list) > 0
-                and isinstance(data, dict)
-                and "tfrecord_path" in data
-            ):
-                try:
-                    agent_ids = (
-                        data["agent"]["id"] if "agent" in data else data.get("id")
-                    )
-                    if agent_ids is not None:
-                        hard_rmm_val = self._compute_ocsc_train_hard_rmm(
-                            scenario_files=list(data["tfrecord_path"]),
-                            agent_ids=agent_ids,
-                            agent_batch=tokenized_agent["batch"],
-                            traj_list=hard_rmm_traj_list,
-                            z_list=hard_rmm_z_list,
-                            head_list=hard_rmm_head_list,
-                        )
-                except Exception as exc:
-                    log.warning(f"[ocsc_ft] HardRMM monitoring failed: {exc}")
-
             return {
                 "loss": final_loss,
                 "n_anchors": len(all_anchor_indices),
                 "n_valid_anchors": n_valid,
-                "hard_rmm": hard_rmm_val,
                 "fm_reg_loss": (
                     float(fm_reg_total.item()) if fm_reg_total is not None else None
                 ),
@@ -3366,9 +3258,8 @@ class SMARTFlow(LightningModule):
           + zero_grad + scheduler.step 까지 수행.  반환 값은 logging 전용 placeholder.
 
         Args:
-            data: 학습용 장면 batch 입니다.  ``scenario_id`` 와 (optional)
-                ``tfrecord_path`` / ``agent['id']`` 키가 있으면 HardRMM 모니터링을
-                활성화할 수 있습니다.
+            data: 학습용 장면 batch 입니다.  ``scenario_id`` 키가 OCSC noise tape
+                seed 에 사용됩니다.
             batch_idx: 현재 batch 번호 입니다.
 
         Returns:
@@ -3408,11 +3299,6 @@ class SMARTFlow(LightningModule):
             float(result["n_valid_anchors"]),
             **log_kwargs,
         )
-        if result.get("hard_rmm") is not None:
-            self.log(
-                "train_ocsc/sim_agents_2025/realism_meta_metric",
-                float(result["hard_rmm"]), prog_bar=True, **log_kwargs,
-            )
         if result.get("fm_reg_loss") is not None:
             self.log("train_ocsc/fm_reg_loss", float(result["fm_reg_loss"]), **log_kwargs)
         return loss

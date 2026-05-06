@@ -77,11 +77,6 @@ model:
       bptt_grad_clip_traj: 0.0             # closed-loop traj L2 norm clip (0=비활성).
       bptt_sequential_rollouts: false      # G rollout 을 순차 backward (manual opt).
 
-      # ── HardRMM 모니터링 (선택) ───────────────────────────────────────
-      # true 면 detached CL 궤적으로 매 N step 마다 RMM 계산해 wandb 로깅.
-      ocsc_eval_hard_rmm: false
-      ocsc_eval_hard_rmm_interval: 10
-
 ckpt_path: null
 
 trainer:
