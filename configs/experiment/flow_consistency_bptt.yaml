@@ -105,4 +105,5 @@ data:
   persistent_workers: true
   pin_memory: true
   shuffle: false
-  train_use_val_transform: true
+  # Validation 과 동일한 agent selection 으로 학습 (OCSC 가 평가-경로 토큰을 그대로 씀).
+  train_use_eval_agent_selection: true
