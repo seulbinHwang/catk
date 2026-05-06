@@ -11,6 +11,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+from src.smart.metrics.hard_sim_agents_metrics import HardSimAgentsMetrics
 from src.smart.metrics.min_ade import minADE
 from src.smart.metrics.sim_agents_metrics import SimAgentsMetrics
 from src.smart.metrics.sim_agents_submission import SimAgentsSubmission
