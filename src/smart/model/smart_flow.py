@@ -1323,8 +1323,14 @@ class SMARTFlow(LightningModule):
                     flow_win = int(getattr(agent_enc, "flow_window_steps", 20))
                     fine_start = anchor_idx * shift + 1
                     fine_end = fine_start + flow_win
-                    raw_pos = data.get("agent", {}).get("position") if isinstance(data, dict) else None
-                    raw_head = data.get("agent", {}).get("heading") if isinstance(data, dict) else None
+                    # data 는 HeteroData/Batch 또는 dict — 둘 다 ``data["agent"][...]``
+                    # 인덱싱은 동작하므로 try/except 로 안전하게 추출.
+                    try:
+                        raw_pos = data["agent"]["position"]
+                        raw_head = data["agent"]["heading"]
+                    except (KeyError, TypeError, AttributeError):
+                        raw_pos = None
+                        raw_head = None
                     if (
                         raw_pos is not None
                         and raw_head is not None
