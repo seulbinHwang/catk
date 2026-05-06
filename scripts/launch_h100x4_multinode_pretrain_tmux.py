@@ -96,6 +96,7 @@ def render_env_file(
     rank: int,
     master_addr: str,
     task_name: str,
+    run_root: str,
 ) -> str:
     lines = [
         export_line("CACHE_ROOT", cache_root),
@@ -108,6 +109,7 @@ def render_env_file(
         export_line("CATK_EXPERIMENT", args.experiment),
         export_line("CATK_ACTION", args.action),
         export_line("LOG_DIR", args.log_dir),
+        export_line("RUN_ROOT", run_root),
     ]
     optional_env = {
         "CATK_CKPT_PATH": args.ckpt_path,
@@ -142,8 +144,21 @@ echo "[tmux-run] started at $(date '+%F %T')"
 echo "[tmux-run] attach survives after exit; press Ctrl-b d to detach"
 echo
 
-bash scripts/h100x4_multinode_pretrain.sh
-status=$?
+mkdir -p "$RUN_ROOT"
+torch_status_file="$RUN_ROOT/$(hostname).torchrun_status"
+torch_pgid_file="$RUN_ROOT/$(hostname).torchrun_pgid"
+rm -f "$torch_status_file" "$torch_pgid_file"
+
+(
+  set +e
+  setsid bash -c 'pgid_file="$1"; shift; echo "$$" > "$pgid_file"; exec "$@"' \
+    bash "$torch_pgid_file" bash scripts/h100x4_multinode_pretrain.sh
+  echo "$?" > "$torch_status_file"
+) &
+runner_pid=$!
+
+wait "$runner_pid"
+status="$(cat "$torch_status_file" 2>/dev/null || echo 1)"
 
 echo
 echo "[tmux-run] exited with status $status at $(date '+%F %T')"
@@ -186,6 +201,7 @@ def render_start_command(
         rank=rank,
         master_addr=master_addr,
         task_name=task_name,
+        run_root=run_root,
     )
     run_text = render_run_script(args.project_root, env_file)
     monitor_text = render_monitor_script(args.monitor_interval, task_name)
@@ -230,7 +246,7 @@ cat > {shq(monitor_file)} <<'CATK_MONITOR'
 CATK_MONITOR
 chmod +x {shq(monitor_file)}
 tmux split-window -v -l 12 -t {shq(args.session)} {shq(monitor_file)}
-tmux select-pane -t {shq(args.session)}:0.0
+tmux select-pane -t {shq(args.session)}
 """
 
     return f"""set -Eeuo pipefail
@@ -251,7 +267,7 @@ CATK_RUN
 chmod +x {shq(run_file)}
 : > {shq(log_file)}
 tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_file)}
-tmux pipe-pane -t {shq(args.session)}:0.0 -o {shq(pipe_command)}
+tmux pipe-pane -t {shq(args.session)} -o {shq(pipe_command)}
 {monitor_block}
 echo "[launcher] started tmux session {args.session} on pod {pod}"
 echo "[launcher] cache root: {cache_root}"

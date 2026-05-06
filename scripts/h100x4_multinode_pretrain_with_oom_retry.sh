@@ -61,8 +61,13 @@ remote_run_root() {
   printf '%s/tmux_h100x4_multinode_pretrain/%s' "${REMOTE_LOG_DIR%/}" "$safe_task"
 }
 
+remote_tmux_log_for_pod() {
+  local pod="$1"
+  printf '%s/%s.tmux.log' "$(remote_run_root)" "$pod"
+}
+
 remote_master_tmux_log() {
-  printf '%s/%s.tmux.log' "$(remote_run_root)" "$MASTER_POD"
+  remote_tmux_log_for_pod "$MASTER_POD"
 }
 
 find_latest_epoch_last_ckpt() {
@@ -121,18 +126,26 @@ start_attempt() {
 }
 
 wait_for_attempt_exit() {
-  local remote_log remote_log_q grep_cmd status_line
+  local remote_log remote_log_q grep_cmd status_line oom_pod
   remote_log="$(remote_master_tmux_log)"
   remote_log_q="$(remote_quote "$remote_log")"
   grep_cmd="grep -E '\\[tmux-run\\] exited with status [0-9]+' ${remote_log_q} 2>/dev/null | tail -1"
 
   while true; do
+    if oom_pod="$(find_remote_oom_pod)"; then
+      log "OOM marker observed on ${oom_pod}; stopping all node sessions before retry."
+      ATTEMPT_EXIT_CODE="1"
+      ATTEMPT_EXIT_REASON="oom"
+      stop_attempt_sessions
+      return 0
+    fi
     status_line="$(
       kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "$grep_cmd" 2>/dev/null || true
     )"
     status_line="${status_line//$'\r'/}"
     if [[ "$status_line" =~ exited\ with\ status\ ([0-9]+) ]]; then
       ATTEMPT_EXIT_CODE="${BASH_REMATCH[1]}"
+      ATTEMPT_EXIT_REASON="exit"
       return 0
     fi
     log "waiting for attempt to finish; attach: kubectl exec -it -n ${NAMESPACE} ${MASTER_POD} -c ${CONTAINER} -- tmux attach -t ${SESSION}"
@@ -140,15 +153,60 @@ wait_for_attempt_exit() {
   done
 }
 
+find_remote_oom_pod() {
+  local pod remote_log remote_log_q oom_regex_q cmd
+  oom_regex_q="$(remote_quote "$OOM_REGEX")"
+  for pod in "${POD_ARRAY[@]}"; do
+    remote_log="$(remote_tmux_log_for_pod "$pod")"
+    remote_log_q="$(remote_quote "$remote_log")"
+    cmd="grep -Eq ${oom_regex_q} ${remote_log_q} 2>/dev/null"
+    if kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "$cmd" >/dev/null 2>&1; then
+      printf '%s\n' "$pod"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stop_attempt_sessions() {
+  local pod run_root run_root_q session_q pod_q grace
+  run_root="$(remote_run_root)"
+  run_root_q="$(remote_quote "$run_root")"
+  session_q="$(remote_quote "$SESSION")"
+  grace="${REMOTE_KILL_GRACE_SEC:-20}"
+  for pod in "${POD_ARRAY[@]}"; do
+    pod_q="$(remote_quote "$pod")"
+    kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
+set +e
+pgid_file=${run_root_q}/${pod_q}.torchrun_pgid
+if [[ -f \"\$pgid_file\" ]]; then
+  pgid=\"\$(cat \"\$pgid_file\" 2>/dev/null || true)\"
+  if [[ -n \"\$pgid\" && \"\$pgid\" != \"0\" ]]; then
+    kill -TERM -- \"-\$pgid\" 2>/dev/null || true
+    sleep ${grace}
+    kill -KILL -- \"-\$pgid\" 2>/dev/null || true
+  fi
+fi
+tmux kill-session -t ${session_q} 2>/dev/null || true
+" >/dev/null 2>&1 || true
+  done
+}
+
 copy_attempt_log() {
   local destination="$1"
-  local remote_log remote_log_q
-  remote_log="$(remote_master_tmux_log)"
-  remote_log_q="$(remote_quote "$remote_log")"
-  if ! kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "cat ${remote_log_q}" > "$destination" 2>/dev/null; then
-    log "warning: failed to copy tmux log from ${MASTER_POD}:${remote_log}"
-    : > "$destination"
-  fi
+  local pod remote_log remote_log_q
+  : > "$destination"
+  for pod in "${POD_ARRAY[@]}"; do
+    remote_log="$(remote_tmux_log_for_pod "$pod")"
+    remote_log_q="$(remote_quote "$remote_log")"
+    {
+      printf '===== %s:%s =====\n' "$pod" "$remote_log"
+      if ! kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "cat ${remote_log_q}" 2>/dev/null; then
+        printf 'warning: failed to copy tmux log from %s:%s\n' "$pod" "$remote_log"
+      fi
+      printf '\n'
+    } >> "$destination"
+  done
 }
 
 bs="$INITIAL_BS"
@@ -171,6 +229,7 @@ while (( bs >= MIN_BS )); do
   fi
 
   ATTEMPT_EXIT_CODE=""
+  ATTEMPT_EXIT_REASON=""
   wait_for_attempt_exit
   copy_attempt_log "$attempt_log"
 
@@ -179,7 +238,7 @@ while (( bs >= MIN_BS )); do
     exit 0
   fi
 
-  if grep -Eq "$OOM_REGEX" "$attempt_log"; then
+  if [[ "$ATTEMPT_EXIT_REASON" == "oom" ]] || grep -Eq "$OOM_REGEX" "$attempt_log"; then
     new_bs=$(( bs - OOM_STEP ))
     log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Lowering to bs=${new_bs}."
     if (( new_bs < MIN_BS )); then
