@@ -186,11 +186,10 @@ class FlowTokenProcessor(TokenProcessor):
                     ),
                 }
             )
+            # OCSC 학습 step 은 ``gt_pos / gt_heading / valid_mask / gt_idx`` 를
+            # anchor 슬라이싱에 사용하므로 학습 모드에서도 보존합니다.
+            # 다른 학습 경로(self-forced, 표준 FM)는 이들 키를 무시하므로 영향 없음.
             for key in [
-                "valid_mask",
-                "gt_idx",
-                "gt_pos",
-                "gt_heading",
                 "sampled_idx",
                 "sampled_pos",
                 "sampled_heading",
