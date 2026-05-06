@@ -31,6 +31,11 @@ trainer:
 model:
   model_config:
     lr: 1.0e-6
+    decoder:
+      # The W&B artifact used by this launcher was pretrained with a 2s
+      # horizon. Pin the model shape so checkpoint loading stays compatible
+      # even if the branch default decoder horizon changes.
+      flow_window_steps: 20
     # Keep the validation scorer workload stable across the 32-rank run:
     # ceil(ceil(320 / 32) / val_batch_size=2) = 5 official scorer batches.
     scorer_scene_num: 320

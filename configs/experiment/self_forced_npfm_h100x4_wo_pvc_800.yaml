@@ -28,6 +28,11 @@ trainer:
 model:
   model_config:
     lr: 1.0e-6
+    decoder:
+      # The W&B artifact used by this launcher was pretrained with a 2s
+      # horizon. Pin the model shape so checkpoint loading stays compatible
+      # even if the branch default decoder horizon changes.
+      flow_window_steps: 20
     self_forced:
       use_stop_motion: false
       estimator_warmup_epochs: 1
