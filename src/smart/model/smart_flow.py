@@ -46,6 +46,7 @@ from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
 from src.smart.modules.self_forced_update_separation import (
     assert_no_module_gradients,
     clear_module_gradients,
+    detach_tensor_tree,
     module_gradients_disabled,
 )
 from src.smart.modules.self_forced_estimator_warmup import (
@@ -2021,6 +2022,9 @@ class SMARTFlow(LightningModule):
         optimizer = self.optimizers()[1]
         last_loss = committed_path_norm.new_zeros(())
         clean_path = committed_path_norm.detach().clone()
+        estimator_tokenized_map = detach_tensor_tree(tokenized_map)
+        estimator_tokenized_agent = detach_tensor_tree(tokenized_agent)
+        estimator_anchor_mask = anchor_mask.detach()
 
         self.toggle_optimizer(optimizer)
         self.self_forced_target_teacher.eval()
@@ -2030,19 +2034,23 @@ class SMARTFlow(LightningModule):
                 for _ in range(self.self_forced_estimator_updates_per_step):
                     optimizer.zero_grad(set_to_none=True)
                     self._prepare_self_forced_estimator_backward_boundary()
-                    flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
-                        clean_path,
-                        target_type="velocity",
-                    )
+                    with torch.no_grad():
+                        flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
+                            clean_path,
+                            target_type="velocity",
+                        )
+                    noisy_path_norm = flow_sample.x_t.detach()
+                    tau = flow_sample.tau.detach()
+                    flow_target = flow_sample.target.detach()
                     pred_dict = self._predict_path_flow_clean_estimate(
                         decoder=self.self_forced_generated_estimator,
-                        tokenized_map=tokenized_map,
-                        tokenized_agent=tokenized_agent,
-                        noisy_path_norm=flow_sample.x_t.detach(),
-                        tau=flow_sample.tau.detach(),
-                        anchor_mask=anchor_mask,
+                        tokenized_map=estimator_tokenized_map,
+                        tokenized_agent=estimator_tokenized_agent,
+                        noisy_path_norm=noisy_path_norm,
+                        tau=tau,
+                        anchor_mask=estimator_anchor_mask,
                     )
-                    last_loss = flow_matching_loss(pred_dict["velocity"], flow_sample.target.detach())
+                    last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
                     self._manual_backward_without_autocast(last_loss)
                     self._assert_self_forced_estimator_update_isolated()
                     self._clip_and_step_with_optional_scaler(
