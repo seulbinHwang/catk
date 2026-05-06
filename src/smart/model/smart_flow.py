@@ -1064,7 +1064,19 @@ class SMARTFlow(LightningModule):
             else 0
         )
 
-        sampling_scheme = self.validation_rollout_sampling
+        # validation_rollout_sampling.sample_steps (default 32) 가 flow_ode.solver_steps
+        # (e.g. 16) 보다 크면 OCSC rollout 이 불필요한 2× solver iteration 을 돈다.
+        # fix-hard-rmm 의 eval_sampling_noise 처럼 solver_steps 와 일치시키기 위해
+        # OCSC 내부에서만 sample_steps 를 override 한 사본을 사용한다.
+        from omegaconf import OmegaConf
+        _ode_steps = int(getattr(flow_ode, "solver_steps", 16))
+        try:
+            sampling_scheme = OmegaConf.create(
+                OmegaConf.to_container(self.validation_rollout_sampling, resolve=True)
+            )
+            sampling_scheme.sample_steps = _ode_steps
+        except Exception:
+            sampling_scheme = self.validation_rollout_sampling
 
         # ── 1. Map encode (no_grad) ──────────────────────────────────────────
         with torch.no_grad():
