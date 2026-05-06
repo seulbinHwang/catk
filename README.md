@@ -861,6 +861,59 @@ torchrun \
   task_name=flow_semi_continuous_finetune_inv_best_a_100_a100x4
 ```
 
+### 5.8.1 5x V100 32GB x3 static pods에서 DRaFT fine-tuning
+
+`fv`, `fvv`, `fvvv`, `fvvvv`, `fvvvvv` 처럼 **V100 32GB 3장짜리 pod 5개**를 묶어
+DRaFT inverse feasibility fine-tuning을 돌릴 때 쓰는 preset과 launcher입니다.
+
+- preset 파일: `configs/experiment/finetune_draft_flow_v100x3x5.yaml`
+- launcher 파일: `scripts/launch_finetune_draft_v100x3x5_static_pods.py`
+- 총 DDP rank: `5 nodes * 3 GPUs = 15`
+- physics 설정: `soft_limit_ratio=1.0`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=false`
+- 기본 per-GPU `train_batch_size=24`, `val_batch_size=2`
+
+이 launcher는 pod를 만들거나 지우지 않습니다. 이미 떠 있는 pod 안에 `kubectl exec`로 들어가 tmux 세션만 시작하거나 종료합니다.
+지금 다른 실험이 돌고 있으면 `--replace`나 `--stop`을 쓰지 마세요.
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
+  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
+  --dry-run
+```
+
+실제 시작:
+
+```bash
+python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
+  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
+  --task-name flow_finetune_draft_v100x3x5_newckpt_bs24
+```
+
+checkpoint가 아직 pod 안에 없고 W&B artifact에서 받아야 한다면 아래처럼 full name을 넘기면 됩니다.
+
+```bash
+python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
+  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
+  --wandb-artifact entity/project/artifact-name:v1 \
+  --artifact-download-dir /workspace/path/to/new_checkpoint/artifact \
+  --task-name flow_finetune_draft_v100x3x5_newckpt_bs24
+```
+
+이미 떠 있는 이 launcher의 tmux 세션만 종료:
+
+```bash
+python scripts/launch_finetune_draft_v100x3x5_static_pods.py --stop
+```
+
+batch size 판단:
+
+- `64 / 80 * 32 = 25.6`은 **A100 80GB에서 per-GPU batch 64가 안정적이었다면, per-GPU 메모리 대부분이 batch에 선형으로 비례한다**고 가정한 1차 추정입니다.
+- 이 가정은 DRaFT fine-tuning처럼 activation이 큰 학습에서는 꽤 유용하지만, 완전한 보장은 아닙니다. V100은 A100과 kernel/workspace, fp16/bf16 특성, fragmentation, batch별 agent 수 분산이 다릅니다.
+- 그래서 `25.6`을 그대로 쓰는 대신 `24`로 시작하는 판단은 합리적인 보수값입니다. 다만 실측 전에는 “안전한 시작점”이지 “항상 성공 보장값”은 아닙니다.
+- OOM이 나면 같은 launcher에 `--train-batch-size 22` 또는 `20`을 넘겨 다시 시작하세요.
+
 ### 5.9 4x H100 80GB 에서 Flow Matching pretrain
 
 6x H100 이 아닌 **4x H100 80GB** 박스에서 `pre_bc_flow` 와 동일한 pretrain 을 돌리고 싶을 때 쓰는 별도 preset 입니다.
