@@ -153,6 +153,7 @@ BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-0.0}"
 BPTT_LAST_COARSE_ONLY="${BPTT_LAST_COARSE_ONLY:-true}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
+WANDB_PROJECT="${WANDB_PROJECT:-SMART-FLOW}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 get_free_port() {
@@ -241,6 +242,7 @@ echo "  freeze: full_decoder=${TRAIN_FULL_FLOW_DECODER_ONLY} velocity_only=${FLO
 echo "  validation: ${VALIDATION_METRIC} (n_batch=${N_BATCH_SIM_AGENTS_METRIC} n_rollout=${N_ROLLOUT_CLOSED_VAL})"
 echo "  hard_rmm monitor: ${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
 echo "  LR=${LR} solver=${FLOW_SOLVER_METHOD}/${FLOW_SOLVER_STEPS}"
+echo "  wandb: entity=${WANDB_ENTITY} project=${WANDB_PROJECT} mode=${WANDB_MODE}"
 
 PREFETCH_ARG=""
 if [ "${NUM_WORKERS}" -gt 0 ]; then
@@ -273,6 +275,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   trainer.gradient_clip_val="${GRAD_CLIP_VAL}" \
   trainer.deterministic="${TRAINER_DETERMINISTIC}" \
   logger.wandb.entity="${WANDB_ENTITY}" \
+  logger.wandb.project="${WANDB_PROJECT}" \
   model.model_config.lr="${LR}" \
   model.model_config.lr_warmup_steps="${LR_WARMUP_STEPS}" \
   model.model_config.lr_total_steps="${LR_TOTAL_STEPS}" \
