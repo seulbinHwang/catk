@@ -15,7 +15,6 @@ import distutils.spawn
 import distutils.version
 import os
 import os.path
-import pkgutil
 import subprocess
 
 import numpy as np
@@ -43,14 +42,15 @@ class ImageEncoder(object):
             self.backend = "avconv"
         elif distutils.spawn.find_executable("ffmpeg") is not None:
             self.backend = "ffmpeg"
-        elif pkgutil.find_loader("imageio_ffmpeg"):
-            raise RuntimeError
-            # import imageio_ffmpeg
-            # self.backend = imageio_ffmpeg.get_ffmpeg_exe()
         else:
-            raise RuntimeError(
-                """Found neither the ffmpeg nor avconv executables. On OS X, you can install ffmpeg via `brew install ffmpeg`. On most Ubuntu variants, `sudo apt-get install ffmpeg` should do it. On Ubuntu 14.04, however, you'll need to install avconv with `sudo apt-get install libav-tools`. Alternatively, please install imageio-ffmpeg with `pip install imageio-ffmpeg`"""
-            )
+            try:
+                import imageio_ffmpeg
+
+                self.backend = imageio_ffmpeg.get_ffmpeg_exe()
+            except ImportError:
+                raise RuntimeError(
+                    """Found neither the ffmpeg nor avconv executables. On OS X, you can install ffmpeg via `brew install ffmpeg`. On most Ubuntu variants, `sudo apt-get install ffmpeg` should do it. On Ubuntu 14.04, however, you'll need to install avconv with `sudo apt-get install libav-tools`. Alternatively, please install imageio-ffmpeg with `pip install imageio-ffmpeg`"""
+                ) from None
 
         self.start()
 

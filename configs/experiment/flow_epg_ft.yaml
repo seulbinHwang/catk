@@ -1,0 +1,93 @@
+# @package _global_
+# Flow-EPG fine-tuning: Exact Policy Gradient with ELBO likelihood + RMM reward.
+#
+# Based on: "Rethinking the Design Space of RL for Diffusion Models" (Choi et al., 2026)
+#
+# Training loop:
+#   1. encoder (no_grad) → anchor_hidden
+#   2. Generate G closed-loop rollouts from same initial state
+#   3. Score each rollout with RMM → R^i [n_scenarios, G]
+#   4. Advantages: A^i = (R^i - mean(R)) / (std(R) + ε)  (std-norm for β balance)
+#   5. ELBO log-prob: log π_θ(y^i) ≈ -E_{t,x0}[ ||v_θ(x_t,t,s) - (y^i-x0)||² ]
+#   6. EPG loss: L = -mean(A^i · log π_θ(y^i)) + β · KL(π_θ || π_ref)
+#
+# Key metrics:
+#   train/epg_pref_acc   → fraction where highest-RMM rollout also gets highest log-prob
+#   train/epg_pg_loss    → policy gradient term (should decrease)
+#   train/epg_kl         → KL from reference (should stay bounded)
+#   train/rmm_mean       → mean RMM of rollouts (should increase over training)
+#   train/rmm_margin     → max−min RMM within group (higher = better ranking signal)
+#   val_kinematic/kin_ADE2s  → trajectory quality
+
+defaults:
+  - override /model: smart_flow
+
+action: finetune
+
+model:
+  model_config:
+    lr: 5e-5
+    lr_warmup_steps: 200
+    lr_total_steps: -1
+    lr_min_ratio: 1e-2
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+    n_rollout_closed_val: 16
+    n_vis_batch: 1
+    n_vis_scenario: 2
+    n_vis_rollout: 4
+    val_open_loop: true
+    val_closed_loop: true
+    kinematic_projection:
+      enabled: true
+    finetune:
+      enabled: true
+      mode: flow_epg_ft
+      rollout_steps: 4
+      rollout_noise_scale: 1.0
+      # ── EPG ───────────────────────────────────────────────────────────────
+      epg_n_rollouts: 4          # G: rollouts per scenario (more → better advantage signal)
+      # G==1 전용: RMM에서 뺄 스칼라 baseline (null이면 mean(R); rollout 1개면 advantage≈0)
+      epg_single_rollout_baseline: 0.7
+      epg_beta: 0.1              # KL regularisation weight β
+      epg_n_samples: 8           # MC samples for ELBO log-prob
+      epg_use_ref_model: true    # frozen pretrained reference (prevents collapse)
+      epg_bc_lambda: 0.0         # >0 → add GT flow-matching BC loss
+      epg_ppo_epochs: 1          # K gradient steps per RMM evaluation (>1 → manual opt)
+      epg_head_only: false       # true → only residual_velocity_head trained (frozen trunk)
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.01
+  check_val_every_n_epoch: null
+  val_check_interval: 500
+  max_epochs: 10
+  log_every_n_steps: 5
+  precision: 32-true
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_kinematic/kin_ADE2s
+    mode: min
+    save_top_k: -1
+  epg_rmm_probe:
+    _target_: src.smart.callbacks.epg_rmm_probe.EPGRMMProbeCallback
+    every_n_train_steps: 5
+    n_probe_scenarios: 4
+    rollout_idx: 0
+    prefix: probe
+
+data:
+  train_batch_size: 8
+  val_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1
+  # EPG: val split as training data (has tfrecords for RMM scoring)
+  # val transform required so all tracks_to_predict agents are included
+  train_raw_dir: ${paths.cache_root}/validation
+  train_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
+  train_use_val_transform: true

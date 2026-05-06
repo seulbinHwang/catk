@@ -1,0 +1,82 @@
+# @package _global_
+# Fine-tuning: DICE / IQ-Learn imitation learning (Chi^2 f-divergence).
+#
+# 학습 루프:
+#   1. encoder (no_grad) → anchor_hidden
+#   2. ctx_sampled_pos/heading → v_init, delta_init
+#   3. ODE full-BPTT rollout → y_hat
+#
+#   [Critic update — sidecar optimizer, not tracked by Lightning]
+#   4. q_expert = Q(s, gt_clean)
+#      q_policy = Q(s, y_hat.detach())
+#      L_Q = E_π[Q²/4 + Q] − E_E[Q]   ← Chi^2 f-DICE objective
+#
+#   [Actor update — returned to Lightning for automatic backward+step]
+#   5. L_actor = −E_π[Q(s, y_hat)]             (BPTT grad through ODE)
+#              + dice_reward_weight * kin_reward  (if dice_reward_enabled)
+#              + dice_bc_lambda * FM_BC_loss      (if > 0)
+#
+# dice_reward_enabled: false  → 순수 imitation learning
+# dice_reward_enabled: true   → imitation + kinematic reward (requires kinematic_projection.enabled=true)
+
+defaults:
+  - override /model: smart_flow
+
+action: finetune
+
+model:
+  model_config:
+    lr: 5e-5
+    lr_warmup_steps: 500
+    lr_total_steps: -1
+    lr_min_ratio: 1e-2
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+    n_rollout_closed_val: 16
+    n_vis_batch: 1
+    n_vis_scenario: 2
+    n_vis_rollout: 4
+    val_open_loop: true
+    val_closed_loop: true
+    kinematic_projection:
+      enabled: true
+    finetune:
+      enabled: true
+      mode: dice_ft
+      rollout_steps: 4
+      rollout_noise_scale: 1.0
+      # ── Critic ────────────────────────────────────────────────────────
+      dice_critic_hidden: 256
+      dice_action_hidden: 128
+      dice_critic_lr: 3.0e-4
+      dice_critic_updates_per_actor: 1
+      # ── Reward on/off ─────────────────────────────────────────────────
+      dice_reward_enabled: false     # true → add kinematic projection reward
+      dice_reward_weight: 1.0
+      # ── BC regularization ─────────────────────────────────────────────
+      dice_bc_lambda: 0.0            # >0 → add GT flow-matching BC loss
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.01
+  check_val_every_n_epoch: null
+  val_check_interval: 500
+  max_epochs: 10
+  log_every_n_steps: 5
+  precision: 32-true
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_kinematic/kin_ADE2s
+    mode: min
+    save_top_k: -1
+
+data:
+  train_batch_size: 8
+  val_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1

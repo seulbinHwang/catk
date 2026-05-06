@@ -1,0 +1,113 @@
+# @package _global_
+# Open-Closed Self-Consistency (OCSC) fine-tuning experiment config.
+# 알고리즘:
+#   1. Open-loop target (no_grad, rollout_idx=G): current/frozen policy 로 2초 궤적 생성.
+#   2. Closed-loop predictions (grad, rollout_idx=0..G-1): G 번 closed-loop rollout.
+#   3. Consistency loss = L2(closed_xy, target_xy) — covariate shift 를 self-supervised 방식으로 감소.
+#   4. HardRMM monitoring: 학습 rollout 을 detach 해 매 step (or N step 마다) hard RMM 계산.
+
+defaults:
+  - override /model: smart_flow
+
+action: finetune
+
+model:
+  model_config:
+    lr: 5e-6
+    lr_warmup_steps: 0
+    lr_total_steps: -1
+    lr_min_ratio: 0.1
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+    n_rollout_closed_val: 4
+    n_batch_sim_agents_metric: 2
+    # hard: PyTorch 인-프로세스 RMM (빠름, 값은 real 과 동등)
+    validation_metric: hard
+    wosac_torch_compile: true
+    n_vis_batch: 1
+    n_vis_scenario: 2
+    n_vis_rollout: 4
+    val_open_loop: true
+    val_closed_loop: true
+    decoder:
+      flow_solver_steps: 4
+    kinematic_projection:
+      enabled: false
+    finetune:
+      enabled: true
+      mode: ocsc_ft
+      # ── OCSC 핵심 파라미터 ─────────────────────────────────────────────
+      # G: 시나리오당 closed-loop rollout 수 (bptt_n_rollouts 와 동일 개념)
+      ocsc_n_rollouts: 2
+      # anchor stride: 매 N번째 2Hz step만 anchor로 사용
+      # stride=4 → [0,4,8,12] 4개, stride=1 → 전체 14개
+      ocsc_anchor_stride: 4
+      # 일관성 loss: "l2" (MSE), "smooth_l1", "l1"
+      ocsc_loss_type: l2
+      # true (권장): proper MMD² with self-terms (mode collapse 방지)
+      # false: 기존 paired L2 mean (ablation 비교용)
+      ocsc_use_mmd: true
+      # False: current policy 로 open-loop target 생성 (학습 중 target 도 변함)
+      # True: frozen pretrained policy 로 open-loop target 생성
+      ocsc_use_pretrained_ref: false
+      # open-loop target rollout coarse step 수 (4 × 0.5s = 2초)
+      ocsc_target_max_steps: 4
+      # closed-loop prediction rollout coarse step 수 (4 × 0.5s = 2초)
+      ocsc_pred_max_steps: 4
+      # heading 일관성 loss 가중치 (0 = position only)
+      ocsc_heading_weight: 0.0
+      # position(x/y) 일관성 loss 가중치 (0 = position matching 비활성)
+      ocsc_position_weight: 1.0
+      # 상대변위(delta x/y) 일관성 loss 가중치 (0 = 비활성)
+      # 값이 클수록 절대 위치보다 이동 패턴 정렬을 더 강하게 학습.
+      ocsc_rel_disp_weight: 0.0
+      # GT FM regularization: velocity_head가 GT에서 drift하지 않도록 per-anchor FM loss 추가.
+      # 0.0이면 기존 동작(MMD only). 권장 시작값: 0.1~1.0
+      ocsc_fm_reg_lambda: 0.0
+      # HardRMM 모니터링 (매 training step): CONFIGURABLE
+      ocsc_eval_hard_rmm: true
+      ocsc_eval_hard_rmm_interval: 1
+      # GT target: true → open-loop sample 대신 GT 궤적을 consistency target으로 사용
+      ocsc_gt_target: false
+      # ── BPTT tricks (rmm_bptt_ft 와 동일 설정) ───────────────────────
+      flow_velocity_head_only: true
+      bptt_use_adjoint: false
+      bptt_grad_clip_traj: 1.0
+      bptt_sequential_rollouts: false
+      bptt_warm_coarse_steps: 0
+      bptt_last_n_coarse_steps: 0
+      bptt_last_n_solver_steps: 0
+      bptt_last_coarse_only: false
+      # GT flow-matching 정규화 (optional): 0 이면 비활성
+      flow_reg_lambda: 0.0
+      rollout_noise_scale: 1.0
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.01
+  check_val_every_n_epoch: null
+  val_check_interval: 500
+  max_epochs: 10
+  log_every_n_steps: 1
+  precision: 32-true
+  gradient_clip_val: 0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+    save_top_k: -1
+
+data:
+  train_batch_size: 16
+  val_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1
+  # ocsc_ft 는 tfrecord 가 필요합니다 (hard RMM monitoring 용).
+  # 없으면 ocsc_eval_hard_rmm=false 로 끄면 됩니다.
+  train_raw_dir: ${paths.cache_root}/validation
+  train_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
+  train_use_val_transform: true

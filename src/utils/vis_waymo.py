@@ -13,12 +13,14 @@
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import cv2
 import numpy as np
 import tensorflow as tf
 from waymo_open_dataset.protos import scenario_pb2, sim_agents_submission_pb2
+
+from .video_recorder import ImageEncoder
 
 COLOR_BLACK = (0, 0, 0)
 COLOR_WHITE = (255, 255, 255)
@@ -41,17 +43,6 @@ COLOR_ALUMINIUM_1 = (211, 215, 207)
 COLOR_ALUMINIUM_2 = (66, 62, 64)
 
 
-def _read_single_record_tfrecord(record_path: str) -> bytes:
-    dataset = tf.data.TFRecordDataset(record_path, compression_type="")
-    options = tf.data.Options()
-    options.threading.private_threadpool_size = 1
-    options.threading.max_intra_op_parallelism = 1
-    dataset = dataset.with_options(options)
-    for data in dataset.take(1):
-        return bytes(data.numpy())
-    raise RuntimeError(f"TFRecord file is empty: {record_path}")
-
-
 class VisWaymo:
     def __init__(
         self,
@@ -62,8 +53,6 @@ class VisWaymo:
         n_step: int = 91,
         step_current: int = 10,
         vis_ghost_gt: bool = True,
-        vis_flow_preview: bool = False,
-        flow_preview_commit_steps: int = 5,
     ) -> None:
         self.px_per_m = px_per_m
         self.video_size = video_size
@@ -71,8 +60,6 @@ class VisWaymo:
         self.step_current = step_current
         self.px_agent2bottom = video_size // 2
         self.vis_ghost_gt = vis_ghost_gt
-        self.vis_flow_preview = vis_flow_preview
-        self.flow_preview_commit_steps = max(1, int(flow_preview_commit_steps))
 
         # colors
         self.lane_style = [
@@ -85,9 +72,8 @@ class VisWaymo:
             (COLOR_BUTTER, 2),  # BROKEN = 6
             (COLOR_MAGENTA, 2),  # SOLID_SINGLE = 7
             (COLOR_SCARLET_RED, 2),  # DOUBLE = 8
-            (COLOR_SKY_BLUE_0, 4),  # CROSSWALK = 9
-            (COLOR_CHAMELEON, 4),  # SPEED_BUMP = 10
-            (COLOR_VIOLET, 4),  # DRIVEWAY = 11
+            (COLOR_CHAMELEON, 4),  # SPEED_BUMP = 9
+            (COLOR_SKY_BLUE_0, 4),  # CROSSWALK = 10
         ]
 
         self.tl_style = [
@@ -113,7 +99,9 @@ class VisWaymo:
 
         # load tfrecord scenario
         scenario = scenario_pb2.Scenario()
-        scenario.ParseFromString(_read_single_record_tfrecord(scenario_path))
+        for data in tf.data.TFRecordDataset([scenario_path], compression_type=""):
+            scenario.ParseFromString(bytes(data.numpy()))
+            break
 
         # make output dir
         self.save_dir = save_dir
@@ -291,7 +279,6 @@ class VisWaymo:
         self,
         scenario_rollout: sim_agents_submission_pb2.ScenarioRollouts,
         n_vis_rollout: int,
-        flow_preview: Dict[str, np.ndarray] | None = None,
     ):
         for i_rollout in range(n_vis_rollout):
             images = deepcopy(self.im_gt_blended)
@@ -306,61 +293,9 @@ class VisWaymo:
                 ag_size,
                 ag_role,
             )
-            if self.vis_flow_preview and flow_preview is not None:
-                self._draw_flow_preview(
-                    images=images,
-                    flow_preview_traj=flow_preview["traj"][:, i_rollout],
-                    flow_preview_valid=flow_preview["valid"][:, i_rollout],
-                    object_id=flow_preview["object_id"],
-                )
             _video_path = (self.save_dir / f"rollout_{i_rollout:02d}.mp4").as_posix()
             self.video_paths.append(_video_path)
             save_images_to_mp4(images, _video_path)
-
-    def _draw_flow_preview(
-        self,
-        images: List[np.ndarray],
-        flow_preview_traj: np.ndarray,
-        flow_preview_valid: np.ndarray,
-        object_id: np.ndarray,
-    ) -> None:
-        if flow_preview_traj.size == 0 or flow_preview_valid.size == 0:
-            return
-
-        num_future_frames = len(images) - (self.step_current + 1)
-        num_blocks = int(flow_preview_traj.shape[1])
-        if num_blocks == 0 or num_future_frames <= 0:
-            return
-
-        for future_frame_idx in range(num_future_frames):
-            block_idx = min(future_frame_idx // self.flow_preview_commit_steps, num_blocks - 1)
-            frame = images[self.step_current + 1 + future_frame_idx]
-            for agent_idx in range(flow_preview_traj.shape[0]):
-                if not bool(flow_preview_valid[agent_idx, block_idx]):
-                    continue
-
-                preview_points = flow_preview_traj[agent_idx, block_idx]
-                preview_px = self._to_pixel(preview_points)
-                color = COLOR_WHITE
-
-                cv2.polylines(
-                    frame,
-                    [preview_px],
-                    isClosed=False,
-                    color=color,
-                    thickness=2,
-                    lineType=cv2.LINE_AA,
-                )
-                for point_idx, point in enumerate(preview_px):
-                    radius = 4 if point_idx == 0 else 2
-                    cv2.circle(
-                        frame,
-                        tuple(point),
-                        radius=radius,
-                        color=color,
-                        thickness=-1,
-                        lineType=cv2.LINE_AA,
-                    )
 
     def _get_features_from_trajs(
         self, trajs: List[sim_agents_submission_pb2.SimulatedTrajectory]
@@ -426,53 +361,11 @@ class VisWaymo:
 
 
 def save_images_to_mp4(images: List[np.ndarray], out_path: str, fps=20) -> None:
-    if not images:
-        raise ValueError("save_images_to_mp4 received an empty image list.")
-
-    reference_shape = images[0].shape
-    if len(reference_shape) != 3 or reference_shape[2] != 3:
-        raise RuntimeError(
-            f"Expected RGB frames with shape [H, W, 3], got {reference_shape}."
-        )
-
-    frame_h, frame_w = reference_shape[:2]
-    pad_bottom = frame_h % 2
-    pad_right = frame_w % 2
-    output_size = (frame_w + pad_right, frame_h + pad_bottom)
-
-    writer = cv2.VideoWriter(
-        out_path,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        output_size,
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"Failed to open video writer for {out_path}.")
-
-    try:
-        for im in images:
-            if im.shape != reference_shape:
-                raise RuntimeError(
-                    f"Inconsistent frame shape {im.shape}; expected {reference_shape}."
-                )
-            if im.dtype != np.uint8:
-                raise RuntimeError(
-                    f"Expected uint8 frames for video export, got {im.dtype}."
-                )
-
-            if pad_bottom or pad_right:
-                im = cv2.copyMakeBorder(
-                    im,
-                    0,
-                    pad_bottom,
-                    0,
-                    pad_right,
-                    cv2.BORDER_CONSTANT,
-                    value=(0, 0, 0),
-                )
-            writer.write(cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
-    finally:
-        writer.release()
+    encoder = ImageEncoder(out_path, images[0].shape, fps, fps)
+    for im in images:
+        encoder.capture_frame(im)
+    encoder.close()
+    encoder = None
 
 
 def get_agent_features(
@@ -616,17 +509,13 @@ def get_map_features(
             mp_id.append(mf.id)
             mp_type.append(feature_type_new)
             mp_xyz.append([[p.x, p.y, p.z] for p in feature.polyline][::2])
-        elif feature_data_type in ["crosswalk", "speed_bump", "driveway"]:
+        elif feature_data_type in ["speed_bump", "driveway", "crosswalk"]:
             xyz = np.array([[p.x, p.y, p.z] for p in feature.polygon])
             polygon_idx = np.linspace(0, xyz.shape[0], 4, endpoint=False, dtype=int)
             pl_polygon = _get_polylines_from_polygon(xyz[polygon_idx])
             mp_xyz.extend(pl_polygon)
             mp_id.extend([mf.id] * len(pl_polygon))
-            pl_type = {
-                "crosswalk": 9,
-                "speed_bump": 10,
-                "driveway": 11,
-            }[feature_data_type]
+            pl_type = 9 if feature_data_type in ["speed_bump", "driveway"] else 10
             mp_type.extend([pl_type] * len(pl_polygon))
         else:
             raise ValueError
