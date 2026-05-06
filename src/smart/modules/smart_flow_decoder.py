@@ -213,10 +213,8 @@ class SMARTFlowDecoder(nn.Module):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
         rollout_steps_2hz: int | None = None,
-        self_forced_epoch: int | None = None,
-        detach_block_transition: bool = False,
     ) -> Dict[str, Tensor]:
-        """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
+        """OCSC/BPTT 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
         Args:
             rollout_cache: ``prepare_training_rollout_cache`` 가 만든 초기 상태입니다.
@@ -228,7 +226,7 @@ class SMARTFlowDecoder(nn.Module):
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 평가 길이를 실행합니다.
 
         Returns:
-            Dict[str, Tensor]: committed self-rollout 결과입니다.
+            Dict[str, Tensor]: committed rollout 결과입니다.
         """
         return self.agent_encoder.training_rollout_from_cache(
             rollout_cache=rollout_cache,
@@ -238,8 +236,6 @@ class SMARTFlowDecoder(nn.Module):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             rollout_steps_2hz=rollout_steps_2hz,
-            self_forced_epoch=self_forced_epoch,
-            detach_block_transition=detach_block_transition,
         )
 
     def path_flow_velocity_for_anchor0(
