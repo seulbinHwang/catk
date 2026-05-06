@@ -35,7 +35,7 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 DEFAULT_TASK_NAME = (
     "flow_self_forced_sid_v100x7x2_"
-    "unfrozen_except_map_encoder_estimator_warmup_1_bs8"
+    "unfrozen_except_map_encoder_estimator_warmup_1_bs4"
 )
 DEFAULT_SESSION = "catk-sf-sid-v100x7x2-exceptmap-warmup1"
 
@@ -78,8 +78,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--master-addr", default="")
     parser.add_argument("--master-port", default="29547")
+    parser.add_argument(
+        "--retry-sync-port",
+        default="29548",
+        help="Rank-0 pod HTTP port used to collect retry status from all pods.",
+    )
     parser.add_argument("--nproc-per-node", type=int, default=7)
-    parser.add_argument("--initial-bs", type=int, default=8)
+    parser.add_argument("--initial-bs", type=int, default=4)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--val-batch-size", type=int, default=4)

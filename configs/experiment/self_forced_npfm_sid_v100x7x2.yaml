@@ -10,8 +10,9 @@
 # Hardware-facing changes for the existing `testv` / `testvv` pods:
 #   * `trainer.num_nodes=2`, `trainer.devices=7` for 14 total ranks.
 #   * `trainer.precision=16-mixed` because V100 does not support bf16.
-#   * `data.train_batch_size=8`. With 14 ranks the global batch is 112,
-#     exactly matching the H100x4 preset's 28 x 4 global batch.
+#   * `data.train_batch_size=4`. bs=8 OOMed on V100 32GB during the
+#     generated-estimator update after epoch 0, so this preset starts from a
+#     safer per-GPU batch.
 #   * `data.val_batch_size=4`, so each validation batch has 56 scenes.
 #   * `model.model_config.scorer_scene_num=280`, giving 5 official scorer
 #     batches at world_size=14 and val_batch_size=4.
@@ -32,7 +33,7 @@ trainer:
   precision: 16-mixed
 
 data:
-  train_batch_size: 8
+  train_batch_size: 4
   val_batch_size: 4
   test_batch_size: 4
   num_workers: 4
