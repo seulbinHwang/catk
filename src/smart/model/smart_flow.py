@@ -98,6 +98,14 @@ class SMARTFlow(LightningModule):
             )
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
+        # OCSC fine-tuning: ``finetune_config`` 는 mode 분기/디스패치 용도이며
+        # ``set_model_for_finetuning`` 의 freeze 처리와 별도 책임을 갖습니다.
+        self.finetune_config = getattr(model_config, "finetune", None)
+        if self._is_ocsc_ft_enabled():
+            self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc")
+        else:
+            self._ocsc_train_hard_rmm = None
+
         self.minADE = minADE()
         self.minADE_predict = minADE()
         self.sim_agents_metrics = SimAgentsMetrics(
@@ -3088,6 +3096,41 @@ class SMARTFlow(LightningModule):
                 batch_size=1,
             )
 
+    def _training_step_ocsc_ft(self, data, batch_idx):
+        """OCSC (Open-Closed Self-Consistency) 파인튜닝 step.
+
+        토큰화 → ``_run_flow_ocsc_ft_step`` 호출 → 로깅의 단순 wrapper 입니다.
+        실제 알고리즘 로직은 ``_run_flow_ocsc_ft_step`` 내부에 있습니다.
+
+        Args:
+            data: 학습용 장면 batch 입니다.  ``scenario_id`` 와 (optional)
+                ``tfrecord_path`` / ``agent['id']`` 키가 있으면 HardRMM 모니터링을
+                활성화할 수 있습니다.
+            batch_idx: 현재 batch 번호 입니다.
+
+        Returns:
+            Tensor: logging 용 backward-가능 consistency loss.
+        """
+        tokenized_map, tokenized_agent = self.token_processor(data)
+        result = self._run_flow_ocsc_ft_step(
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
+            data=data,
+        )
+        loss = result["loss"]
+
+        log_kwargs = dict(on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train_ocsc/loss", loss.detach(), prog_bar=True, **log_kwargs)
+        self.log(
+            "train_ocsc/n_valid_anchors",
+            float(result["n_valid_anchors"]),
+            **log_kwargs,
+        )
+        if result.get("hard_rmm") is not None:
+            self.log("train_ocsc/sim_agents_2025/realism_meta_metric",
+                     float(result["hard_rmm"]), prog_bar=True, **log_kwargs)
+        return loss
+
     def _training_step_manual_open_loop(self, data, batch_idx):
         """self-forced 시작 전 epoch에서 기존 open-loop loss를 manual optimizer로 학습합니다.
 
@@ -3385,6 +3428,8 @@ class SMARTFlow(LightningModule):
                 "Detected non-finite trainable parameter before forward pass: "
                 f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
             )
+        if self._is_ocsc_ft_enabled():
+            return self._training_step_ocsc_ft(data=data, batch_idx=batch_idx)
         if self.self_forced_enabled:
             if self._is_self_forced_active():
                 return self._training_step_self_forced(data=data, batch_idx=batch_idx)
