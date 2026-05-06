@@ -630,7 +630,7 @@ cat > {shq(monitor_file)} <<'CATK_MONITOR'
 CATK_MONITOR
 chmod +x {shq(monitor_file)}
 tmux split-window -v -l 12 -t {shq(args.session)} {shq(monitor_file)}
-tmux select-pane -t {shq(args.session)}:0.0
+tmux select-pane -t {shq(args.session)}
 """
 
     return f"""set -Eeuo pipefail
@@ -652,7 +652,7 @@ CATK_WORKER
 chmod +x {shq(worker_file)}
 : > {shq(tmux_log)}
 tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(worker_file)}
-tmux pipe-pane -t {shq(args.session)}:0.0 -o {shq('cat >> ' + shq(tmux_log))}
+tmux pipe-pane -t {shq(args.session)} -o {shq('cat >> ' + shq(tmux_log))}
 {monitor_block}
 echo "[launcher] started {args.session} on {pod}"
 echo "[launcher] tmux log: {tmux_log}"
