@@ -274,6 +274,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
+        self.self_forced_use_stop_motion = (
+            bool(getattr(self.self_forced_config, "use_stop_motion", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_guidance_tau_low = (
             float(getattr(self.self_forced_config, "clean_dmd_tau_low", 0.02))
             if self.self_forced_config is not None
@@ -1940,6 +1945,7 @@ class SMARTFlow(LightningModule):
                 rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
                 self_forced_epoch=int(self.current_epoch),
                 detach_block_transition=self.self_forced_detach_block_transition,
+                use_stop_motion=self.self_forced_use_stop_motion,
             )
         finally:
             self._restore_module_training_modes(encoder_modes)

@@ -17,7 +17,7 @@
 - `model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk` 를 쓰면
 - `retokenize`로 고른 token의 0.5초 chunk를 **외부 rollout 10Hz 출력에만** 반영합니다.
 - 내부 closed-loop context는 계속 실제 FM commit 상태를 유지합니다.
-- `model.model_config.decoder.use_stop_motion=true` 를 켜면 current + 0.1/0.2/0.3/0.4/0.5초
+- closed-loop inference에서 `model.model_config.decoder.use_stop_motion=true` 를 켜면 current + 0.1/0.2/0.3/0.4/0.5초
   6점 경로를 motion token으로 다시 보고, **stop token** 과 일치하는 agent의 다음 0.5초 chunk를
   완전히 고정합니다. 이 stop gate는 vehicle / pedestrian / bicycle 모두에 적용됩니다.
 - 이 stop-motion 토큰 매칭은 **실제 actor box 크기 대신 class별 고정 토큰 박스**를 사용합니다.
@@ -385,7 +385,7 @@ torchrun ... -m src.run \
 - `model.model_config.decoder.flow_window_steps`는 flow matching이 한 번에 생성하는 10Hz 미래 길이입니다. 기본값은 `20` step, 즉 `2초`입니다.
 - `5`의 배수여야 하며 `decoder.num_future_steps`보다 클 수 없습니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
-- `model.model_config.decoder.use_stop_motion=true/false`로 stop-motion gate를 켜거나 끕니다.
+- `model.model_config.decoder.use_stop_motion=true/false`로 validation / test / submission inference의 stop-motion gate를 켜거나 끕니다. Self-forced 학습 rollout의 stop-motion 여부는 `model.model_config.self_forced.use_stop_motion`으로 별도 제어합니다.
 - `model.model_config.decoder.use_lqr=true/false`로 vehicle / bicycle용 curvature-LQR commit
   bridge를 켜거나 끕니다. 기본값은 `false` 입니다.
 - `use_lqr=true`면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
@@ -422,6 +422,9 @@ torchrun ... -m src.run \
 
 # stop-motion gate 적용
 ... model.model_config.decoder.use_stop_motion=true
+
+# self-forced 학습 rollout에서만 stop-motion gate 적용
+... model.model_config.self_forced.use_stop_motion=true
 
 # stop-motion + vehicle / bicycle curvature-LQR commit bridge 적용
 ... model.model_config.decoder.use_stop_motion=true \
@@ -1576,6 +1579,7 @@ K commit block 수 = flow_window_steps / 5
 - guidance 방향을 계산할 때는 `F_rho` 와 비교용 `F_psi` 를 항상 eval mode로 둡니다. 그래서 dropout/history drop 같은 train-mode 랜덤성이 기준 방향에 섞이지 않습니다. `F_psi` 는 detached generated path에 fit되는 online update 구간에서만 train mode로 전환됩니다.
 - committed self-rollout 을 만들 때는 현재 Generator를 eval mode로 잠깐 전환하되 autograd는 유지합니다. 따라서 dropout/history drop 없이 실제 inference 조건의 trajectory를 만들고, 그 trajectory를 통해 `sf_loss` gradient는 그대로 Generator로 흐릅니다.
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 DDP 전체 rank가 random terminal step `s` 를 하나 공유하고, 모든 rank의 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
+- self-forced 학습 rollout의 stop-motion gate는 `model.model_config.self_forced.use_stop_motion` 으로 제어합니다. Validation / test / submission inference의 `model.model_config.decoder.use_stop_motion` 과 분리되어 있으므로, inference ablation을 위해 decoder 설정을 바꿔도 학습 rollout 규칙은 자동으로 바뀌지 않습니다.
 - random terminal step `s` 는 self-rollout 의 실행 길이와 commit 지점만 정합니다. Generated estimator `F_psi` 학습과 generator direction 계산에서 쓰는 flow noising `tau` 는 rollout 의 `s` 와 독립적으로 전체 tau 구간에서 새로 샘플링합니다.
 - generator direction은 raw score/path 이동량을 그대로 쓰지 않고,
 - 같은 noisy path에서 `F_rho` 와 `F_psi` 가 각각 추정한 clean path 차이를 사용합니다.
@@ -1613,6 +1617,7 @@ model:
   model_config:
     self_forced:
       use_anchor_flow_matching_loss: false
+      use_stop_motion: false
       sampling:
         sample_steps: 32
         sample_method: euler
@@ -1651,7 +1656,12 @@ python -m src.run experiment=self_forced_npfm action=finetune ckpt_path=/path/to
 
 ### 중요한 일관성 규칙
 
-fine-tuning 에 쓰는 rollout 과 inference 에 쓰는 rollout 은 반드시 같은 commit/update 규칙을 사용해야 합니다. fine-tuning 에서 `closed_loop_rollout_mode` 나 `use_stop_motion` / `use_lqr` 을 켰다면, validation / test / submission export 에서도 같은 설정을 유지해야 합니다.
+fine-tuning 에 쓰는 rollout 과 inference 에 쓰는 rollout 은 기본 commit/update 의미가 어긋나지 않아야 합니다. 다만 stop-motion gate는 목적이 다른 두 config로 분리합니다.
+
+- `model.model_config.decoder.use_stop_motion`: validation / test / submission inference 전용입니다.
+- `model.model_config.self_forced.use_stop_motion`: self-forced closed-loop training rollout 전용입니다.
+
+따라서 inference ablation을 위해 `decoder.use_stop_motion` 을 바꿔도 self-forced 학습 rollout은 바뀌지 않습니다. 학습 rollout에서도 같은 stop-motion gate를 쓰고 싶을 때만 `self_forced.use_stop_motion=true` 를 명시하세요.
 
 ### Self-forced Strict DMD Update Separation
 

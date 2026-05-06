@@ -88,6 +88,9 @@ model_config:
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
     detach_block_transition: false
+    # Self-forced training rollout 전용 stop-motion gate입니다. Validation /
+    # test / submission inference는 decoder.use_stop_motion을 따릅니다.
+    use_stop_motion: false
     estimator_updates_per_step: 5
     estimator_warmup_epochs: 0
     initialize_aux_from_generator_on_fit_start: true
