@@ -176,6 +176,11 @@ def pad_pred_to_80(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """앞 ``T_pred`` step 은 model 예측, 뒤는 ``pad_mode`` 에 따라 채운다.
 
+    NOTE: ``pad_mode="none"`` 인 경우 caller 는 이 함수를 호출하지 않고 짧은
+    예측 그대로 hard-RMM 에 흘려보낸다.  ``compute_metric_features_batched_scenes``
+    가 sim 쪽 GT alignment 를 자동 처리하고, ``per_scenario_hard_rmm`` 에서
+    log_feat 의 시간 축도 ``T_pred`` 로 잘라주므로 8초 padding 은 불필요.
+
     Args:
         pred_*_short: 모델이 만든 짧은 (예: 2 초 = 20 step) 예측들.
         gt_*_future: GT 8 초 미래 (10Hz, 80 step). 비활성 (active_mask False)
@@ -249,17 +254,19 @@ def run_ol_cl_2s_for_batch(
     data: dict,
     G: int,
     pred_max_steps: int,
-    pad_mode: str,
     logger: logging.Logger,
 ) -> Dict[str, torch.Tensor]:
-    """한 batch 에 대해 OL/CL 의 8 초 (80 step) world prediction 텐서 6 개 반환.
+    """한 batch 에 대해 OL/CL 의 ``T_pred = pred_max_steps * shift`` step
+    (default 20 = 2 초) world prediction 텐서를 반환한다.
 
     OL: ``_sample_open_loop_future_from_hidden`` 으로 active anchor t=0 에서
     2 초 단발 ODE 호출.  CL: ``_run_parallel_rollout_chunk(max_steps=
     pred_max_steps, full_grad=True)`` 로 4 × 0.5 초 autoregressive rollout.
     같은 ``scenario_sampling_seeds`` + ``noise_tape_override`` 로 noise 공유.
-    OL/CL 모두 앞 ``T_pred=pred_max_steps*shift`` (= 20) 까지가 model pred,
-    뒤는 ``pad_mode`` 로 채워 80 step 으로 만든다.
+    원본 hard RMM (8 초) 과 정합성을 깨지 않으면서 short horizon 으로 측정하기
+    위해 padding 없이 짧은 텐서 그대로 반환 — caller (per_scenario_hard_rmm)
+    가 ``compute_scenario_rollouts_features_2s(n_steps_override=T_pred)`` 로
+    GT 도 같은 길이로 잘라 feature 추출을 한다.
     """
     encoder = model.encoder            # SMARTFlowDecoder wrapper
     agent_enc = encoder.agent_encoder  # SMARTFlowAgentDecoder
@@ -360,19 +367,19 @@ def run_ol_cl_2s_for_batch(
         ol_traj_short[active_mask, 0] = ol_pos_world
         ol_head_short[active_mask, 0] = ol_head_world
 
-        ol_full_traj, ol_full_z, ol_full_head = pad_pred_to_80(
-            pred_traj_short=ol_traj_short,
-            pred_z_short=ol_z_short,
-            pred_head_short=ol_head_short,
-            gt_pos_future=gt_pos_future,
-            gt_z_future=gt_z_future,
-            gt_head_future=gt_head_future,
-            pad_mode=pad_mode,
-            valid_active_2hz=active_mask,
-        )
-        ol_traj_list.append(ol_full_traj.squeeze(1))    # [n_agent, 80, 2]
-        ol_z_list.append(ol_full_z.squeeze(1))
-        ol_head_list.append(ol_full_head.squeeze(1))
+        # 비활성 agent 는 OL prediction 이 없으므로 GT 의 첫 T_pred step 으로
+        # 채운다 (CL 도 동일 처리 → 두 path 모두 비활성 agent 기여는 동일 = 0).
+        if not bool(active_mask.all()):
+            inactive = ~active_mask
+            ol_traj_short[inactive, 0] = gt_pos_future[inactive, :T_pred_fine].to(dtype)
+            ol_head_short[inactive, 0] = gt_head_future[inactive, :T_pred_fine].to(dtype)
+
+        # native 2 초 (T_pred_fine = 20 step) RMM 을 직접 흘려보낸다 — 짧은
+        # horizon 에 맞게 hard RMM 코드를 복사/수정한 ``hard_rmm_2s/`` 본체가
+        # GT future 도 T_pred 로 자르므로 padding 불필요.
+        ol_traj_list.append(ol_traj_short.squeeze(1))    # [n_agent, T_pred, 2]
+        ol_z_list.append(ol_z_short.squeeze(1))
+        ol_head_list.append(ol_head_short.squeeze(1))
         t_ol += time.perf_counter() - _t0
 
         # 4d) CL 2 초: rollout_from_cache(max_steps=pred_max_steps,
@@ -401,19 +408,17 @@ def run_ol_cl_2s_for_batch(
         cl_z_short = cl_z_g.to(dtype)                    # [n_agent, 1, T]
         cl_head_short = cl_head_g.to(dtype)              # [n_agent, 1, T]
 
-        cl_full_traj, cl_full_z, cl_full_head = pad_pred_to_80(
-            pred_traj_short=cl_traj_short,
-            pred_z_short=cl_z_short,
-            pred_head_short=cl_head_short,
-            gt_pos_future=gt_pos_future,
-            gt_z_future=gt_z_future,
-            gt_head_future=gt_head_future,
-            pad_mode=pad_mode,
-            valid_active_2hz=active_mask,
-        )
-        cl_traj_list.append(cl_full_traj.squeeze(1))
-        cl_z_list.append(cl_full_z.squeeze(1))
-        cl_head_list.append(cl_full_head.squeeze(1))
+        # CL native 2 초: rollout_from_cache(max_steps=4) 가 이미 [n_agent, 1,
+        # T_pred_fine, 2/h/z] 로 출력하므로 padding 없이 그대로 흘려보낸다.
+        # 비활성 agent 는 OL 과 동일하게 GT 의 앞 T_pred 로 채워 비교 isolated.
+        if not bool(active_mask.all()):
+            inactive = ~active_mask
+            cl_traj_short[inactive, 0] = gt_pos_future[inactive, :T_pred_fine].to(dtype)
+            cl_head_short[inactive, 0] = gt_head_future[inactive, :T_pred_fine].to(dtype)
+            cl_z_short[inactive, 0] = gt_z_future[inactive, :T_pred_fine].to(dtype)
+        cl_traj_list.append(cl_traj_short.squeeze(1))
+        cl_z_list.append(cl_z_short.squeeze(1))
+        cl_head_list.append(cl_head_short.squeeze(1))
         t_cl += time.perf_counter() - _t0
 
     # 5) Stack G rollouts → [n_agent, G, 80, 2/1/1]
@@ -479,7 +484,6 @@ def main(cfg: DictConfig) -> None:
     G = int(os.environ.get("OLCL_G_ROLLOUTS", "16"))
     pred_max_steps = int(os.environ.get("OLCL_PRED_2S_COARSE", "4"))
     limit_val_batches = float(os.environ.get("OLCL_LIMIT_VAL_BATCHES", "0.01"))
-    pad_mode = os.environ.get("OLCL_PAD_MODE", "gt")
     wandb_project = os.environ.get("OLCL_WANDB_PROJECT", "project_3-ol-vs-cl-rmm")
     wandb_run_name = os.environ.get(
         "OLCL_WANDB_RUN_NAME", f"ol-vs-cl-{_kst_compact()}"
@@ -493,8 +497,9 @@ def main(cfg: DictConfig) -> None:
     logger = _setup_logger(out_dir / "logs")
     logger.info(f"=== OL vs CL Hard-RMM 비교 시작 @ {_kst_now()} ===")
     logger.info(
-        f"config: G={G} pred_max_steps={pred_max_steps} (2초={pred_max_steps*0.5}초) "
-        f"limit_val={limit_val_batches} pad_mode={pad_mode}"
+        f"config: G={G} pred_max_steps={pred_max_steps} "
+        f"(={pred_max_steps*0.5}초 horizon, native short-T hard RMM) "
+        f"limit_val={limit_val_batches}"
     )
 
     # ── Hydra cfg 강제 셋팅 (validate-only, 표준 OL/CL 메트릭 비활성) ─────
@@ -575,7 +580,7 @@ def main(cfg: DictConfig) -> None:
             "G_rollouts": G,
             "pred_max_steps_coarse": pred_max_steps,
             "pred_horizon_seconds": pred_max_steps * 0.5,
-            "pad_mode": pad_mode,
+            "rmm_path": "non_diff_2s_native",
             "limit_val_batches": limit_val_batches,
             "n_use_batches": n_use_batches,
             "n_total_batches": n_total_batches,
@@ -639,7 +644,6 @@ def main(cfg: DictConfig) -> None:
             data=data,
             G=G,
             pred_max_steps=pred_max_steps,
-            pad_mode=pad_mode,
             logger=logger,
         )
         if not out:

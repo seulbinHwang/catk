@@ -56,7 +56,7 @@ export WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 export OLCL_G_ROLLOUTS="${OLCL_G_ROLLOUTS:-16}"             # WOSAC G
 export OLCL_PRED_2S_COARSE="${OLCL_PRED_2S_COARSE:-4}"      # 4 × 0.5초 = 2초
 export OLCL_LIMIT_VAL_BATCHES="${OLCL_LIMIT_VAL_BATCHES:-0.01}"
-export OLCL_PAD_MODE="${OLCL_PAD_MODE:-gt}"                  # gt | last | zero
+# RMM path 는 non-differentiable 2s native 고정 (hard_rmm_2s/ 본체 사용).
 
 # ── ckpt (fix-hard-rmm 호환) ────────────────────────────────────────────────
 CKPT_PATH="${OLCL_CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt}"
@@ -94,7 +94,7 @@ PRED_SEC="$(python3 -c "print(${OLCL_PRED_2S_COARSE} * 0.5)" 2>/dev/null || echo
 echo "============================================================"
 echo "[ol-vs-cl-rmm launch] KST=${KST_NOW}  GPU=${CUDA_VISIBLE_DEVICES}"
 echo "  G=${OLCL_G_ROLLOUTS}  pred_max_steps=${OLCL_PRED_2S_COARSE} (= ${PRED_SEC} 초)"
-echo "  limit_val_batches=${OLCL_LIMIT_VAL_BATCHES}  pad=${OLCL_PAD_MODE}"
+echo "  limit_val_batches=${OLCL_LIMIT_VAL_BATCHES}  rmm_path=non_diff_2s_native"
 echo "  CKPT=${CKPT_PATH}"
 echo "  wandb: project=${OLCL_WANDB_PROJECT}  run=${OLCL_WANDB_RUN_NAME}  mode=${WANDB_MODE}"
 echo "  WOSAC_HARD_POOL_WORKERS=${WOSAC_HARD_POOL_WORKERS}"

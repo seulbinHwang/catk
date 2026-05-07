@@ -1,28 +1,39 @@
-# Hard-RMM per-scenario 헬퍼.
+# Hard-RMM 2초 horizon per-scenario 헬퍼.
 #
-# `HardSimAgentsMetrics.update_from_prediction_tensors` 는 batch-aggregated
-# scalar 만 누적/반환하므로, per-scenario 단위로 metametric + 10 개 likelihood
-# 를 분리해서 wandb 로깅에 쓰려면 같은 내부 logic 을 그대로 재사용하면서
-# `hard_per_scenario` 누적 단계만 분기시켜야 한다.
+# 의도: ``HardSimAgentsMetrics.update_from_prediction_tensors`` 와 동일한
+# **non-differentiable** hard RMM 경로 (`compute_metric_features` 가
+# JointScene proto 를 받아 feature 추출 → ``compute_wosac_metametric_from_features_torch``)
+# 를 사용하되, GT future 와 sim trajectory 모두 ``T_pred`` (2초 = 20 step) 로
+# 잘라서 정합성을 깨지 않으면서 short-horizon RMM 을 측정한다.
 #
-# 본 모듈은 그 inner-loop 만 떼어내 `compute_hard_rmm_per_scenario` 로 노출한다.
-# 코드 흐름은 src/smart/metrics/__init__.py 의 update_from_prediction_tensors
-# (line 434~) 와 1:1 매칭이다 — log feature load 는 `_log_feat_cache` 와
-# `_disk_cache_dir` 를 그대로 재활용해 동일 epoch 의 두 metric 인스턴스 (OL/CL)
-# 가 캐시 hit 으로 빠르게 동작한다.
-
+# 정합성 (vs 8초 hard RMM):
+#   - feature extractor / metametric 호출 코드는 동일 — 단지 시간축 길이만 달라짐.
+#   - histogram bin 범위는 8초 분포 기준 (config.linear_speed.histogram 등) 이므로
+#     절대값 likelihood 는 8초와 직접 비교 불가, OL/CL 간 상대 비교 (Δ) 만 의미.
+#   - cache (`_log_feat_cache` / `_disk_cache_dir`) 는 8초 log_feat 만 저장하므로
+#     2초 변형은 매 시나리오 새로 계산 (caching 은 future work).
 from __future__ import annotations
 
 import os
-import pickle
-from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
 from torch_geometric.utils import degree as _tg_degree
 
-# Hard RMM 본 클래스 (cache, config, pool 활용을 위해 import)
+# 2초 변형 hard RMM 본체 (temp/ol_vs_cl_rmm/hard_rmm_2s/) 호출
+import sys as _sys
+from pathlib import Path as _Path
+_REPO_ROOT = _Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
+from temp.ol_vs_cl_rmm.hard_rmm_2s.metric_features_torch_2s import (
+    compute_scenario_rollouts_features as _compute_scenario_rollouts_features_2s,
+)
+from temp.ol_vs_cl_rmm.hard_rmm_2s.wosac_metametric_pytorch_2s import (
+    compute_wosac_metametric_from_features_torch as _compute_metametric_2s,
+)
 from src.smart.metrics import HardSimAgentsMetrics, _LIKELIHOOD_NAMES
 
 
@@ -32,176 +43,84 @@ def compute_hard_rmm_per_scenario(
     scenario_files: List[str],
     agent_id: torch.Tensor,
     agent_batch: torch.Tensor,
-    pred_traj: torch.Tensor,    # [n_agents, G, 80, 2]
-    pred_z: torch.Tensor,       # [n_agents, G, 80]
-    pred_head: torch.Tensor,    # [n_agents, G, 80]
+    pred_traj: torch.Tensor,    # [n_agents, G, T_pred, 2]
+    pred_z: torch.Tensor,       # [n_agents, G, T_pred]
+    pred_head: torch.Tensor,    # [n_agents, G, T_pred]
     update_running: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Hard RMM 을 시나리오별로 분리해서 metametric + 10 likelihoods 반환.
+    """2초 horizon hard-RMM 을 시나리오별로 분리해서 metametric + 10 likelihoods 반환.
+
+    이 함수는 **2초 변형** ``compute_scenario_rollouts_features_2s`` 를 사용해
+    sim 길이 (T_pred) 로 GT future 를 잘라 log/sim feature 시간축을 맞춘다.
+    원본 hard RMM (8초) 파이프라인 (``HardSimAgentsMetrics.update_from_prediction_tensors``)
+    와 코드 흐름은 동일하지만, ``T_pred`` 가 짧을 때만 (예: 20=2초) 의미 있는
+    경로다.  ``metric._scenario_cache`` 만 재활용 (TFRecord proto 파싱 캐시).
 
     Args:
-        metric: 기존 ``HardSimAgentsMetrics`` 인스턴스. cache + pool 재활용.
-        scenario_files: TFRecord 파일 경로 리스트, 길이 ``n_scenarios``.
-        agent_id: ``[n_agents]`` 객체 ID. ``data["agent"]["id"]`` 그대로 가능.
-        agent_batch: ``[n_agents]`` graph 배정 (PyG style).
-        pred_traj/pred_z/pred_head: WOSAC 8 초 (80 step, 10Hz) world-frame 예측.
-        update_running: ``True`` 면 ``metric._metametric_sum`` / ``_per_metric_sums``
-            / ``_count`` 누적도 함께 수행 (epoch 끝에서 ``metric.compute()``
-            가 정상 동작하도록).
+        metric: 기존 ``HardSimAgentsMetrics`` 인스턴스.  scenario proto cache
+            (``_load_scenario``) 와 누적 ``_metametric_sum`` / ``_count`` 만 사용.
+        pred_traj/pred_z/pred_head: world-frame 짧은 (``T_pred``) prediction.
 
     Returns:
-        ``len == n_scenarios`` 의 dict 리스트. 각 dict 의 키는
-        ``scenario_file`` (str), ``metametric`` (float), ``_LIKELIHOOD_NAMES`` 의
-        10 개 항목 (각 float). 시나리오 순서는 입력 ``scenario_files`` 와 동일.
+        ``len == n_scenarios`` 의 dict 리스트.  키: ``scenario_file``,
+        ``metametric``, ``_LIKELIHOOD_NAMES`` 의 10 항목.
     """
-    # 아래 import 는 metric 본체가 사용하는 inner module 들. circular 위험 없음.
-    from src.smart.metrics.wosac_metric_features_torch.metric_features_torch_differentiable import (
-        PredictedSimTrajectories,
-        compute_metric_features_batched_scenes,
-    )
-    from src.smart.metrics.wosac_metric_features_torch.metric_features_torch import (
-        compute_metric_features,
-        scenario_to_joint_scene,
-    )
-    from src.smart.metrics.wosac_metametric_pytorch import (
-        compute_wosac_metametric_from_features_torch,
-    )
-    from waymo_open_dataset.protos import scenario_pb2 as _scenario_pb2
-    from waymo_open_dataset.utils.sim_agents import submission_specs
+    from waymo_open_dataset.protos import sim_agents_submission_pb2
 
     n_scenarios = len(scenario_files)
     if n_scenarios == 0:
         return []
 
     sizes = [int(s) for s in _tg_degree(agent_batch, dtype=torch.long).tolist()]
-    device = pred_traj.device
     G = int(pred_traj.shape[1])
     T_pred = int(pred_traj.shape[2])
-    _challenge = submission_specs.ChallengeType.SIM_AGENTS
 
-    id_splits = agent_id.split(sizes)
-    traj_splits = pred_traj.split(sizes)
-    z_splits = pred_z.split(sizes)
-    head_splits = pred_head.split(sizes)
+    id_splits = [t.cpu().numpy() for t in agent_id.cpu().split(sizes)]
+    traj_splits = [t.cpu().numpy() for t in pred_traj.cpu().split(sizes)]
+    z_splits = [t.cpu().numpy() for t in pred_z.cpu().split(sizes)]
+    head_splits = [t.cpu().numpy() for t in pred_head.cpu().split(sizes)]
 
-    # ── log_feat 로드 (HardSimAgentsMetrics 의 mem/disk 캐시 재사용) ──────────
-    pool = metric._get_pool()
-    _mem_cache = HardSimAgentsMetrics._log_feat_cache
-    _disk_dir = HardSimAgentsMetrics._disk_cache_dir
-    os.makedirs(_disk_dir, exist_ok=True)
-
-    def _disk_path(sf: str) -> str:
-        bn = os.path.basename(sf).replace(os.sep, "_")
-        return os.path.join(_disk_dir, f"{bn}.pkl")
-
-    slot: list = [None] * n_scenarios
-    miss_idx: list = []
-    miss_files: list = []
-    for j, sf in enumerate(scenario_files):
-        cached = _mem_cache.get(sf)
-        if cached is not None:
-            slot[j] = cached
-            continue
-        dp = _disk_path(sf)
-        if os.path.exists(dp):
-            try:
-                with open(dp, "rb") as _f:
-                    res = pickle.load(_f)
-                _mem_cache[sf] = res
-                slot[j] = res
-                continue
-            except Exception:
-                pass
-        miss_idx.append(j)
-        miss_files.append(sf)
-
-    if miss_files:
-        if pool is not None and len(miss_files) > 1:
-            from src.smart.metrics import _hard_load_and_log_feat_worker
-            miss_results = pool.starmap(
-                _hard_load_and_log_feat_worker,
-                [(sf, _challenge) for sf in miss_files],
-            )
-        else:
-            # serial fallback
-            from src.smart.metrics import _hard_load_and_log_feat_worker
-            miss_results = [
-                _hard_load_and_log_feat_worker(sf, _challenge) for sf in miss_files
-            ]
-        for j, sf, res in zip(miss_idx, miss_files, miss_results):
-            _mem_cache[sf] = res
-            slot[j] = res
-            try:
-                dp = _disk_path(sf)
-                tmp = dp + ".tmp"
-                with open(tmp, "wb") as _f:
-                    pickle.dump(res, _f, protocol=pickle.HIGHEST_PROTOCOL)
-                os.replace(tmp, dp)
-            except Exception:
-                pass
-
-    # 시나리오 protobuf 와 log_feat dict 분리
-    scenarios = []
-    log_feat_dicts: List[dict] = []
-    for sc_bytes, lf_dict in slot:
-        sc = _scenario_pb2.Scenario()
-        sc.ParseFromString(sc_bytes)
-        scenarios.append(sc)
-        log_feat_dicts.append(lf_dict)
-
-    # ── Sim feature 계산 (rollout 별로 모든 시나리오 batched) ────────────────
-    sim_feat_per_g: List[list] = []
-    with torch.no_grad():
-        for g in range(G):
-            preds_g = [
-                PredictedSimTrajectories(
-                    object_id=id_splits[i].cpu(),
-                    center_x=traj_splits[i][:, g, :, 0],
-                    center_y=traj_splits[i][:, g, :, 1],
-                    center_z=z_splits[i][:, g, :],
-                    heading=head_splits[i][:, g, :],
-                    valid=torch.ones(sizes[i], T_pred, dtype=torch.bool, device=device),
-                )
-                for i in range(n_scenarios)
-            ]
-            feat_list_g = compute_metric_features_batched_scenes(
-                scenarios=scenarios, preds=preds_g, surrogate=None,
-            )
-            sim_feat_per_g.append(feat_list_g)
-
-    # G rollout 을 시나리오별로 stack 해서 (G, E_i, T) 형태로 만듦
-    sim_feat_dicts: List[dict] = []
-    for i in range(n_scenarios):
-        feats_i = [sim_feat_per_g[g][i] for g in range(G)]
-
-        def _cat(field: str) -> torch.Tensor:
-            return torch.cat([getattr(f, field) for f in feats_i], dim=0)
-
-        sim_feat_dicts.append({
-            "object_id": feats_i[0].object_id,
-            "object_type": _cat("object_type"),
-            "valid": _cat("valid"),
-            "average_displacement_error": _cat("average_displacement_error"),
-            "linear_speed": _cat("linear_speed"),
-            "linear_acceleration": _cat("linear_acceleration"),
-            "angular_speed": _cat("angular_speed"),
-            "angular_acceleration": _cat("angular_acceleration"),
-            "distance_to_nearest_object": _cat("distance_to_nearest_object"),
-            "collision_per_step": _cat("collision_per_step"),
-            "time_to_collision": _cat("time_to_collision"),
-            "distance_to_road_edge": _cat("distance_to_road_edge"),
-            "offroad_per_step": _cat("offroad_per_step"),
-            "traffic_light_violation_per_step": _cat("traffic_light_violation_per_step"),
-        })
-
-    # ── 시나리오별 metametric + likelihood 계산 ──────────────────────────────
     out: List[Dict[str, Any]] = []
     for i in range(n_scenarios):
-        result = compute_wosac_metametric_from_features_torch(
-            metric._config, log_feat_dicts[i], sim_feat_dicts[i]
+        sf = scenario_files[i]
+        scenario = metric._load_scenario(sf)   # proto cache hit (HardSimAgentsMetrics 의 LRU)
+
+        # ── 시나리오별 ScenarioRollouts proto 빌드 (G rollouts) ───────────────
+        n_agents = int(traj_splits[i].shape[0])
+        joint_scenes = []
+        for g in range(G):
+            sim_trajs = []
+            for a in range(n_agents):
+                sim_trajs.append(
+                    sim_agents_submission_pb2.SimulatedTrajectory(
+                        center_x=traj_splits[i][a, g, :, 0],
+                        center_y=traj_splits[i][a, g, :, 1],
+                        center_z=z_splits[i][a, g],
+                        heading=head_splits[i][a, g],
+                        object_id=int(id_splits[i][a]),
+                    )
+                )
+            joint_scenes.append(
+                sim_agents_submission_pb2.JointScene(simulated_trajectories=sim_trajs)
+            )
+        scenario_rollouts = sim_agents_submission_pb2.ScenarioRollouts(
+            joint_scenes=joint_scenes,
+            scenario_id=scenario.scenario_id,
         )
+
+        # ── 2초 변형 hard RMM feature extraction ─────────────────────────────
+        log_feat, sim_feat = _compute_scenario_rollouts_features_2s(
+            scenario,
+            scenario_rollouts,
+            n_steps_override=T_pred,    # 핵심: GT future 도 T_pred 로 잘라 log T 매치
+        )
+        # ── metametric (dim-dynamic) ─────────────────────────────────────────
+        result = _compute_metametric_2s(
+            metric._config, log_feat.as_dict(), sim_feat.as_dict(),
+        )
+
         d: Dict[str, Any] = {
-            "scenario_file": scenario_files[i],
+            "scenario_file": sf,
             "metametric": float(result.metametric),
         }
         for name in _LIKELIHOOD_NAMES:
