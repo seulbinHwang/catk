@@ -105,6 +105,8 @@ def render_env_file(
         export_line("NODE_RANK", rank),
         export_line("MASTER_ADDR", master_addr),
         export_line("MASTER_PORT", args.master_port),
+        export_line("CHECKPOINT_SYNC_HOST", master_addr),
+        export_line("CHECKPOINT_SYNC_PORT", args.checkpoint_sync_port),
         export_line("TASK_NAME", task_name),
         export_line("CATK_EXPERIMENT", args.experiment),
         export_line("CATK_ACTION", args.action),
@@ -147,7 +149,203 @@ echo
 mkdir -p "$RUN_ROOT"
 torch_status_file="$RUN_ROOT/$(hostname).torchrun_status"
 torch_pgid_file="$RUN_ROOT/$(hostname).torchrun_pgid"
+CHECKPOINT_SYNC_PID=""
 rm -f "$torch_status_file" "$torch_pgid_file"
+
+start_checkpoint_sync_server() {{
+  if (( NODE_RANK != 0 )); then
+    return 0
+  fi
+  if [[ -z "${{CATK_CKPT_PATH:-}}" ]]; then
+    return 0
+  fi
+  python - <<'PY' &
+import hashlib
+import http.server
+import os
+import pathlib
+
+ckpt_path = pathlib.Path(os.environ["CATK_CKPT_PATH"])
+port = int(os.environ["CHECKPOINT_SYNC_PORT"])
+
+
+def checkpoint_metadata():
+    stat = ckpt_path.stat()
+    digest = hashlib.sha256()
+    with ckpt_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return stat.st_size, digest.hexdigest()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def send_text(self, code, text):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/health":
+            self.send_text(200, "ok\\n")
+            return
+        if not ckpt_path.is_file():
+            self.send_text(404, "missing checkpoint\\n")
+            return
+        if path == "/metadata":
+            size, sha = checkpoint_metadata()
+            self.send_text(200, f"size={{size}}\\nsha256={{sha}}\\npath={{ckpt_path}}\\n")
+            return
+        if path == "/checkpoint":
+            size = ckpt_path.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with ckpt_path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    self.wfile.write(chunk)
+            return
+        self.send_text(404, "not found\\n")
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+Server(("", port), Handler).serve_forever()
+PY
+  CHECKPOINT_SYNC_PID=$!
+  echo "[tmux-run] checkpoint sync server started on $CHECKPOINT_SYNC_HOST:$CHECKPOINT_SYNC_PORT pid=$CHECKPOINT_SYNC_PID"
+}}
+
+stop_checkpoint_sync_server() {{
+  if [[ -n "$CHECKPOINT_SYNC_PID" ]]; then
+    kill "$CHECKPOINT_SYNC_PID" 2>/dev/null || true
+  fi
+}}
+
+wait_for_checkpoint_sync_server() {{
+  local waited=0
+  local timeout_sec="${{CHECKPOINT_SYNC_START_TIMEOUT_SEC:-600}}"
+  while true; do
+    if python - <<'PY' >/dev/null 2>&1
+import os
+import urllib.request
+
+url = "http://" + os.environ["CHECKPOINT_SYNC_HOST"] + ":" + os.environ["CHECKPOINT_SYNC_PORT"] + "/health"
+with urllib.request.urlopen(url, timeout=5) as response:
+    response.read()
+PY
+    then
+      return 0
+    fi
+    if (( waited >= timeout_sec )); then
+      echo "[tmux-run] timed out waiting for checkpoint sync server at $CHECKPOINT_SYNC_HOST:$CHECKPOINT_SYNC_PORT" >&2
+      return 1
+    fi
+    sleep 5
+    waited=$(( waited + 5 ))
+  done
+}}
+
+fetch_checkpoint_metadata() {{
+  python - <<'PY'
+import os
+import sys
+import urllib.request
+
+url = "http://" + os.environ["CHECKPOINT_SYNC_HOST"] + ":" + os.environ["CHECKPOINT_SYNC_PORT"] + "/metadata"
+with urllib.request.urlopen(url, timeout=30) as response:
+    sys.stdout.write(response.read().decode("utf-8"))
+PY
+}}
+
+metadata_value() {{
+  local metadata="$1"
+  local key="$2"
+  awk -F= -v key="$key" '$1 == key {{ print substr($0, index($0, "=") + 1); exit }}' <<< "$metadata"
+}}
+
+checkpoint_matches() {{
+  local path="$1"
+  local expected_size="$2"
+  local expected_sha="$3"
+  local actual_size=""
+  local actual_sha=""
+
+  [[ -f "$path" ]] || return 1
+  actual_size="$(stat -c %s "$path" 2>/dev/null || true)"
+  [[ "$actual_size" == "$expected_size" ]] || return 1
+  actual_sha="$(sha256sum "$path" 2>/dev/null | awk '{{ print $1 }}')"
+  [[ "$actual_sha" == "$expected_sha" ]]
+}}
+
+sync_checkpoint_if_needed() {{
+  local metadata=""
+  local expected_size=""
+  local expected_sha=""
+  local tmp_file=""
+
+  if [[ -z "${{CATK_CKPT_PATH:-}}" ]]; then
+    return 0
+  fi
+  if (( NODE_RANK == 0 )); then
+    if [[ ! -f "$CATK_CKPT_PATH" ]]; then
+      echo "[tmux-run] ERROR: rank0 checkpoint does not exist: $CATK_CKPT_PATH" >&2
+      return 1
+    fi
+    start_checkpoint_sync_server
+    return $?
+  fi
+
+  wait_for_checkpoint_sync_server || return $?
+  metadata="$(fetch_checkpoint_metadata)" || return $?
+  expected_size="$(metadata_value "$metadata" size)"
+  expected_sha="$(metadata_value "$metadata" sha256)"
+  if [[ -z "$expected_size" || -z "$expected_sha" ]]; then
+    echo "[tmux-run] invalid checkpoint metadata from rank0" >&2
+    return 1
+  fi
+  if checkpoint_matches "$CATK_CKPT_PATH" "$expected_size" "$expected_sha"; then
+    echo "[tmux-run] checkpoint already synced: $CATK_CKPT_PATH"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$CATK_CKPT_PATH")"
+  tmp_file="${{CATK_CKPT_PATH}}.download.$$"
+  rm -f "$tmp_file"
+  echo "[tmux-run] downloading rank0 checkpoint to $CATK_CKPT_PATH"
+  if ! python - "$tmp_file" <<'PY'
+import os
+import shutil
+import sys
+import urllib.request
+
+target = sys.argv[1]
+url = "http://" + os.environ["CHECKPOINT_SYNC_HOST"] + ":" + os.environ["CHECKPOINT_SYNC_PORT"] + "/checkpoint"
+with urllib.request.urlopen(url, timeout=120) as response:
+    with open(target, "wb") as handle:
+        shutil.copyfileobj(response, handle, length=1024 * 1024)
+PY
+  then
+    rm -f "$tmp_file"
+    return 1
+  fi
+  if ! checkpoint_matches "$tmp_file" "$expected_size" "$expected_sha"; then
+    echo "[tmux-run] downloaded checkpoint failed verification: $tmp_file" >&2
+    rm -f "$tmp_file"
+    return 1
+  fi
+  mv -f "$tmp_file" "$CATK_CKPT_PATH"
+  checkpoint_matches "$CATK_CKPT_PATH" "$expected_size" "$expected_sha"
+}}
 
 terminate_process_group() {{
   local pgid="$1"
@@ -200,6 +398,8 @@ terminate_attempt_processes() {{
   terminate_task_processes "$1"
 }}
 
+trap stop_checkpoint_sync_server EXIT
+sync_checkpoint_if_needed || exit $?
 terminate_task_processes "pre-run stale cleanup"
 
 (
@@ -420,6 +620,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", default="catk-h100x4-pretrain")
     parser.add_argument("--master-addr", default="")
     parser.add_argument("--master-port", default="29511")
+    parser.add_argument(
+        "--checkpoint-sync-port",
+        default="29512",
+        help="Rank-0 pod HTTP port used to serve --ckpt-path to worker pods.",
+    )
     parser.add_argument("--nproc-per-node", type=int, default=4)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--train-batch-size", default="")
@@ -473,6 +678,7 @@ def main() -> None:
         "<MASTER_POD_IP>" if args.dry_run else pod_ip(args.namespace, args.pods[0])
     )
     print(f"[launcher] master pod: {args.pods[0]} ({master_addr}:{args.master_port})")
+    print(f"[launcher] checkpoint sync: {master_addr}:{args.checkpoint_sync_port}")
     print(f"[launcher] task_name: {args.task_name}")
     print(f"[launcher] session:   {args.session}")
     print("[launcher] cache roots:")
