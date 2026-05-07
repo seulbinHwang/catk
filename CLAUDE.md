@@ -62,6 +62,8 @@ src/smart/modules/smart_flow_decoder.py
    - SMARTFlowDecoder wrapper
 src/smart/metrics/mmd_consistency_loss.py
    - mmd_from_stacked, mmd_per_rollout_proxy, mmd_precompute_sigma_sq
+   - per-channel-group split: pos (ch[0:2]) 와 heading (ch[2:4]) 각각
+     별도 sigma + RBF, pos_weight/heading_weight 로 가중합
 src/smart/metrics/wosac_metametric_pytorch.py
    - PyTorch hard RMM 본 계산기 (validation_metric=hard 일 때)
 src/smart/metrics/wosac_metric_features_torch/
@@ -100,20 +102,24 @@ WOSAC_PARITY_TFRECORD_DIR=<dir> python scripts/verify_wosac_metametric_pytorch_p
 | `OCSC_N_ROLLOUTS` (G) | 4 | scenario 당 closed-loop rollout 수 |
 | `OCSC_ANCHOR_STRIDE` | 1 | 매 N번째 2Hz step 만 anchor |
 | `OCSC_PRED_MAX_STEPS` | 2 | closed-loop coarse step (×0.5s) |
-| `OCSC_USE_MMD` | false | true=proper MMD², false=paired L2 |
+| `OCSC_USE_MMD` | false | true=split MMD² (pos/heading group 별 sigma), false=paired L2 |
 | `OCSC_USE_PRETRAINED_REF` | true | frozen ref decoder 로 OL 생성 |
-| `OCSC_POSITION_WEIGHT` | 0.0 | paired L2 분기에서만 효과 |
-| `OCSC_REL_DISP_WEIGHT` | 1.0 | 동일 |
-| `OCSC_HEADING_WEIGHT` | 0.0 | 동일 |
+| `OCSC_POSITION_WEIGHT` | 0.0 | pos channel ([x/20,y/20]) — paired L2 / split-MMD 모두 active |
+| `OCSC_REL_DISP_WEIGHT` | 1.0 | paired L2 분기 전용 (MMD 분기에선 무시) |
+| `OCSC_HEADING_WEIGHT` | 0.0 | heading channel ([cos_h,sin_h]) — paired L2 / split-MMD 모두 active |
 | `OCSC_FM_REG_LAMBDA` | 0.1 | GT FM regularization (batch-level 1회) |
 | `BPTT_USE_ADJOINT` | true | flow_ode model_fn ckpt |
 | `BPTT_LAST_COARSE_ONLY` | true | 마지막 1 coarse step 만 grad (warm = pred_steps - 1) |
 | `BPTT_SEQUENTIAL_ROLLOUTS` | false | true 면 G rollout 순차 backward + 2-pass MMD |
 | `FLOW_VELOCITY_HEAD_ONLY` | true | velocity_head 만 학습 (residual_velocity_head zero+frozen) |
 
-**중요**: `OCSC_USE_MMD=true` 분기는 `pos/rel_disp/heading_weight` 토글을
-**무시**하고 4ch norm tensor 전체를 RBF 거리에 넣음.  채널 가중치 효과를 보려면
-`OCSC_USE_MMD=false` 로 paired L2 분기를 써야 한다.
+**중요 (split MMD)**: `OCSC_USE_MMD=true` 분기는 이제 channel group 별
+(pos = `[x/20, y/20]`, heading = `[cos_h, sin_h]`) MMD² 를 따로 계산해
+`OCSC_POSITION_WEIGHT`, `OCSC_HEADING_WEIGHT` 로 가중합한다.  group 별로
+median-heuristic sigma 가 따로 잡혀서 position scale 이 heading channel 을
+saturate 시키는 문제가 사라짐.  단 두 weight 가 모두 0 이면 loss=0 (no-op)
+이므로 launcher 에서 적어도 하나는 명시적으로 양수로 set 해야 한다.
+`OCSC_REL_DISP_WEIGHT` 는 여전히 paired L2 분기 전용 (MMD 에선 무시).
 
 ## Validation backend
 
