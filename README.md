@@ -1377,6 +1377,59 @@ python scripts/launch_self_forced_h100x4_wo_pvc_800.py \
   --decoder-use-stop-motion false
 ```
 
+#### 1-node x 4 H100 hsb-npc-training self-forced 실행
+
+H100 4장짜리 `hsb-npc-training` pod 하나에서 self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다. `wo-pvc-800` launcher와 같은 단일 pod OOM fallback 구조를 쓰지만, 기본 pod/cache/task/session을 `hsb-npc-training` 전용으로 분리했습니다.
+
+```text
+configs/experiment/self_forced_npfm_h100x4_hsb_npc_training.yaml
+scripts/launch_self_forced_h100x4_hsb_npc_training.py
+```
+
+기본 실험 설정:
+
+- 대상 pod: `hsb-npc-training`
+- `trainer.num_nodes=1`, `trainer.devices=4` -> 총 4 DDP ranks
+- H100용 `trainer.precision=bf16-mixed`
+- `trainer.max_epochs=10`, `trainer.check_val_every_n_epoch=2`
+- `model.model_config.lr=1.0e-6`
+- `model.model_config.self_forced.estimator_warmup_epochs=0`
+- `model.model_config.self_forced.use_stop_motion=false`
+- 기본 cache root: `/mnt/nuplan/womd_v1_3/SMART_cache`
+- `data.train_batch_size=28`
+- OOM 시 retry wrapper가 `28 -> 26 -> 24 -> ...` 순서로 batch size를 낮추고 local `epoch_last.ckpt`로 재개
+
+pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
+
+```text
+artifact: jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v64
+target:   /workspace/flow_semi_continuous_pretrain_h100x4x2_bs26/v64/epoch_last.ckpt
+```
+
+지금 pod에 다른 실험이 돌고 있으면 실제 실행 명령을 쓰지 말고, 먼저 dry-run만 확인하세요. `--dry-run`은 pod 안에 아무 것도 만들지 않습니다.
+
+```bash
+python scripts/launch_self_forced_h100x4_hsb_npc_training.py --dry-run
+```
+
+실행:
+
+```bash
+python scripts/launch_self_forced_h100x4_hsb_npc_training.py --replace
+```
+
+attach:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-sf-h100x4-hsb-npc-training
+```
+
+중지:
+
+```bash
+python scripts/launch_self_forced_h100x4_hsb_npc_training.py --stop
+```
+
 #### CUDA OOM 자동 fallback 으로 무중단 재개
 
 긴 self-forced fine-tuning 도중 어쩌다 OOM 이 한 번 떨어지면 (heavy batch + self-rollout 메모리 스파이크), 학습이 죽고 그동안 진행한 epoch 들이 의미 없어질 수 있습니다. `scripts/self_forced_h100_4_with_oom_retry.sh` 와 `scripts/self_forced_h100_6_with_oom_retry.sh` 는 이 시나리오를 자동 처리합니다:
