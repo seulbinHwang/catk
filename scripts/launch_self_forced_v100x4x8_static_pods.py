@@ -193,6 +193,26 @@ def read_statuses(attempt):
     return len(files), failure, oom
 
 
+def read_plan_ready(attempt):
+    files = sorted(root.glob(attempt + ".*.plan_ready"))
+    status_values = []
+    for path in files:
+        data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        values = dict(line.split("=", 1) for line in data if "=" in line)
+        status_values.append(values.get("status", "1"))
+    failure = any(value != "0" for value in status_values)
+    return len(files), failure
+
+
+def read_plan(attempt):
+    path = root / (attempt + ".plan")
+    if not path.is_file():
+        return None, None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    values = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    return text, values
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
@@ -205,6 +225,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_file(self, code, path):
+        size = path.stat().st_size
+        self.send_response(code)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.strip("/")
@@ -212,12 +245,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_text(200, "ok\\n")
             return
         parts = path.split("/", 1)
-        if len(parts) != 2 or parts[0] not in ("count", "aggregate"):
+        if len(parts) != 2 or parts[0] not in (
+            "count",
+            "aggregate",
+            "plan",
+            "checkpoint",
+            "plan-ready-count",
+            "plan-ready-aggregate",
+        ):
             self.send_text(404, "not found\\n")
             return
         attempt = parts[1]
         if not name_re.match(attempt):
             self.send_text(400, "bad attempt\\n")
+            return
+        if parts[0] == "plan":
+            text, _ = read_plan(attempt)
+            if text is None:
+                self.send_text(404, "missing plan\\n")
+            else:
+                self.send_text(200, text)
+            return
+        if parts[0] == "checkpoint":
+            _, values = read_plan(attempt)
+            if not values:
+                self.send_text(404, "missing plan\\n")
+                return
+            if values.get("action") != "fit":
+                self.send_text(409, "plan does not require checkpoint sync\\n")
+                return
+            ckpt_path = pathlib.Path(values.get("ckpt_path", ""))
+            if not ckpt_path.is_file():
+                self.send_text(404, "missing checkpoint\\n")
+                return
+            self.send_file(200, ckpt_path)
+            return
+        if parts[0] in ("plan-ready-count", "plan-ready-aggregate"):
+            count, failure = read_plan_ready(attempt)
+            if parts[0] == "plan-ready-count":
+                self.send_text(200, str(count) + "\\n")
+            else:
+                self.send_text(
+                    200,
+                    "count=" + str(count) + "\\n"
+                    + "failure=" + ("1" if failure else "0") + "\\n",
+                )
             return
         count, failure, oom = read_statuses(attempt)
         if parts[0] == "count":
@@ -232,18 +304,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/status":
+        if parsed.path not in ("/status", "/plan", "/plan-ready"):
             self.send_text(404, "not found\\n")
             return
         query = urllib.parse.parse_qs(parsed.query)
         attempt = query.get("attempt", [""])[0]
         host = query.get("host", [""])[0]
-        if not name_re.match(attempt) or not name_re.match(host):
+        if not name_re.match(attempt):
             self.send_text(400, "bad name\\n")
             return
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace")
-        target = root / (attempt + "." + host + ".status")
+        if parsed.path == "/plan":
+            target = root / (attempt + ".plan")
+        else:
+            if not name_re.match(host):
+                self.send_text(400, "bad name\\n")
+                return
+            suffix = ".status" if parsed.path == "/status" else ".plan_ready"
+            target = root / (attempt + "." + host + suffix)
         tmp = root / (target.name + ".tmp." + str(os.getpid()))
         tmp.write_text(body, encoding="utf-8")
         tmp.replace(target)
@@ -327,6 +406,279 @@ PY
   done
   echo "[self-forced-v100x4x8] failed to post retry status for $attempt_name after retries" >&2
   return 1
+}}
+
+post_attempt_plan() {{
+  local plan_file="$1"
+  local try
+  for try in $(seq 1 12); do
+    if python - "$attempt_tag" "$plan_file" <<'PY'
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+attempt = sys.argv[1]
+plan_file = sys.argv[2]
+query = urllib.parse.urlencode((("attempt", attempt),))
+url = "http://" + os.environ["RETRY_SYNC_HOST"] + ":" + os.environ["RETRY_SYNC_PORT"] + "/plan?" + query
+with open(plan_file, "rb") as handle:
+    body = handle.read()
+request = urllib.request.Request(url, data=body, method="POST")
+with urllib.request.urlopen(request, timeout=10) as response:
+    response.read()
+PY
+    then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "[self-forced-v100x4x8] failed to post retry plan for $attempt_tag after retries" >&2
+  return 1
+}}
+
+fetch_attempt_plan() {{
+  local plan_file="$1"
+  local tmp_file="${{plan_file}}.$$"
+  local waited=0
+  local timeout_sec="${{PLAN_SYNC_TIMEOUT_SEC:-600}}"
+  while true; do
+    if retry_sync_get "plan/$attempt_tag" > "$tmp_file" 2>/dev/null && grep -q '^action=' "$tmp_file"; then
+      mv "$tmp_file" "$plan_file"
+      return 0
+    fi
+    rm -f "$tmp_file"
+    if (( waited >= timeout_sec )); then
+      echo "[self-forced-v100x4x8] timed out waiting for checkpoint plan for $attempt_tag" >&2
+      return 1
+    fi
+    sleep 5
+    waited=$(( waited + 5 ))
+  done
+}}
+
+plan_value() {{
+  local plan_file="$1"
+  local key="$2"
+  awk -F= -v key="$key" '$1 == key {{ print substr($0, index($0, "=") + 1); exit }}' "$plan_file"
+}}
+
+checkpoint_matches_plan() {{
+  local path="$1"
+  local expected_size="$2"
+  local expected_sha="$3"
+  local actual_size=""
+  local actual_sha=""
+
+  [[ -f "$path" ]] || return 1
+  if [[ -n "$expected_size" ]]; then
+    actual_size="$(stat -c %s "$path" 2>/dev/null || true)"
+    [[ "$actual_size" == "$expected_size" ]] || return 1
+  fi
+  if [[ -n "$expected_sha" ]]; then
+    actual_sha="$(sha256sum "$path" 2>/dev/null | awk '{{ print $1 }}')"
+    [[ "$actual_sha" == "$expected_sha" ]] || return 1
+  fi
+  return 0
+}}
+
+download_plan_checkpoint() {{
+  local path="$1"
+  local expected_size="$2"
+  local expected_sha="$3"
+  local tmp_file=""
+
+  if checkpoint_matches_plan "$path" "$expected_size" "$expected_sha"; then
+    echo "[self-forced-v100x4x8] checkpoint already synced for $attempt_tag: $path"
+    return 0
+  fi
+  if (( NODE_RANK == 0 )); then
+    echo "[self-forced-v100x4x8] master checkpoint is missing or does not match plan: $path" >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$path")"
+  tmp_file="${{path}}.download.${{attempt_tag}}.$$"
+  rm -f "$tmp_file"
+  echo "[self-forced-v100x4x8] downloading resume checkpoint for $attempt_tag from rank0 to $path"
+  if ! python - "$attempt_tag" "$tmp_file" <<'PY'
+import os
+import shutil
+import sys
+import urllib.parse
+import urllib.request
+
+attempt = sys.argv[1]
+target = sys.argv[2]
+url = (
+    "http://"
+    + os.environ["RETRY_SYNC_HOST"]
+    + ":"
+    + os.environ["RETRY_SYNC_PORT"]
+    + "/checkpoint/"
+    + urllib.parse.quote(attempt)
+)
+with urllib.request.urlopen(url, timeout=120) as response:
+    with open(target, "wb") as handle:
+        shutil.copyfileobj(response, handle, length=1024 * 1024)
+PY
+  then
+    rm -f "$tmp_file"
+    return 1
+  fi
+  if ! checkpoint_matches_plan "$tmp_file" "$expected_size" "$expected_sha"; then
+    echo "[self-forced-v100x4x8] downloaded checkpoint failed verification: $tmp_file" >&2
+    rm -f "$tmp_file"
+    return 1
+  fi
+  mv -f "$tmp_file" "$path"
+  checkpoint_matches_plan "$path" "$expected_size" "$expected_sha"
+}}
+
+post_plan_ready() {{
+  local status="$1"
+  local message="${{2:-ok}}"
+  local ready_file="$RETRY_STATE_DIR/$attempt_tag.$(hostname).plan_ready"
+  local tmp_file="${{ready_file}}.$$"
+  {{
+    echo "host=$(hostname)"
+    echo "node_rank=$NODE_RANK"
+    echo "attempt=$attempt"
+    echo "batch_size=$bs"
+    echo "status=$status"
+    echo "action=${{action:-}}"
+    echo "ckpt_path=${{ckpt_path:-}}"
+    echo "message=$message"
+    echo "time=$(date '+%F %T')"
+  }} > "$tmp_file"
+  mv "$tmp_file" "$ready_file"
+  python - "$attempt_tag" "$ready_file" <<'PY'
+import os
+import socket
+import sys
+import urllib.parse
+import urllib.request
+
+attempt = sys.argv[1]
+ready_file = sys.argv[2]
+host = socket.gethostname()
+query = urllib.parse.urlencode((("attempt", attempt), ("host", host)))
+url = "http://" + os.environ["RETRY_SYNC_HOST"] + ":" + os.environ["RETRY_SYNC_PORT"] + "/plan-ready?" + query
+with open(ready_file, "rb") as handle:
+    body = handle.read()
+request = urllib.request.Request(url, data=body, method="POST")
+with urllib.request.urlopen(request, timeout=10) as response:
+    response.read()
+PY
+}}
+
+plan_ready_has_failure() {{
+  retry_sync_get "plan-ready-aggregate/$attempt_tag" 2>/dev/null | grep -q '^failure=1$'
+}}
+
+wait_for_plan_ready() {{
+  local waited=0
+  local timeout_sec="${{PLAN_READY_TIMEOUT_SEC:-600}}"
+  local count=0
+  while true; do
+    if plan_ready_has_failure; then
+      echo "[self-forced-v100x4x8] checkpoint plan sync failed for $attempt_tag" >&2
+      return 1
+    fi
+    count="$(retry_sync_get "plan-ready-count/$attempt_tag" 2>/dev/null | tr -d '[:space:]')"
+    count="${{count:-0}}"
+    if (( count >= NNODES )); then
+      return 0
+    fi
+    if (( waited >= timeout_sec )); then
+      echo "[self-forced-v100x4x8] timed out waiting for checkpoint plan readiness: got $count/$NNODES" >&2
+      return 1
+    fi
+    sleep 5
+    waited=$(( waited + 5 ))
+  done
+}}
+
+resolve_attempt_plan() {{
+  local plan_file="$RETRY_STATE_DIR/$attempt_tag.plan"
+  local latest_ckpt=""
+  local ckpt_size=""
+  local ckpt_sha256=""
+  local plan_status=0
+  local plan_message="ok"
+
+  action=""
+  ckpt_path=""
+
+  if (( NODE_RANK == 0 )); then
+    latest_ckpt="$(find_latest_self_forced_ckpt)"
+    if [[ -n "$latest_ckpt" ]]; then
+      action="fit"
+      ckpt_path="$latest_ckpt"
+      ckpt_size="$(stat -c %s "$ckpt_path" 2>/dev/null || true)"
+      ckpt_sha256="$(sha256sum "$ckpt_path" 2>/dev/null | awk '{{ print $1 }}')"
+      if [[ -z "$ckpt_size" || -z "$ckpt_sha256" ]]; then
+        plan_status=1
+        plan_message="failed_to_hash_resume_checkpoint"
+      fi
+    else
+      action="finetune"
+      ckpt_path="$PRETRAIN_CKPT"
+    fi
+    {{
+      echo "action=$action"
+      echo "ckpt_path=$ckpt_path"
+      echo "ckpt_size=$ckpt_size"
+      echo "ckpt_sha256=$ckpt_sha256"
+      echo "master_host=$(hostname)"
+      echo "time=$(date '+%F %T')"
+    }} > "$plan_file"
+    if ! post_attempt_plan "$plan_file"; then
+      plan_status=1
+      plan_message="failed_to_publish_plan"
+    fi
+  else
+    if ! fetch_attempt_plan "$plan_file"; then
+      plan_status=1
+      plan_message="failed_to_fetch_plan"
+    fi
+  fi
+
+  if (( plan_status == 0 )); then
+    action="$(plan_value "$plan_file" action)"
+    ckpt_path="$(plan_value "$plan_file" ckpt_path)"
+    ckpt_size="$(plan_value "$plan_file" ckpt_size)"
+    ckpt_sha256="$(plan_value "$plan_file" ckpt_sha256)"
+
+    if [[ "$action" == "fit" ]]; then
+      if ! download_plan_checkpoint "$ckpt_path" "$ckpt_size" "$ckpt_sha256"; then
+        plan_status=1
+        plan_message="failed_to_sync_resume_checkpoint"
+      fi
+    elif [[ "$action" == "finetune" ]]; then
+      if [[ ! -f "$ckpt_path" ]]; then
+        plan_status=1
+        plan_message="missing_pretrain_checkpoint"
+      fi
+    else
+      plan_status=1
+      plan_message="invalid_plan_action"
+    fi
+  fi
+
+  if ! post_plan_ready "$plan_status" "$plan_message"; then
+    echo "[self-forced-v100x4x8] failed to post checkpoint plan readiness for $attempt_tag" >&2
+    return 1
+  fi
+  if ! wait_for_plan_ready; then
+    return 1
+  fi
+  if (( plan_status != 0 )); then
+    echo "[self-forced-v100x4x8] local checkpoint plan sync failed for $attempt_tag: $plan_message" >&2
+    return 1
+  fi
+  echo "[self-forced-v100x4x8] checkpoint plan ready for $attempt_tag: action=$action ckpt=$ckpt_path"
+  return 0
 }}
 
 ensure_pretrain_checkpoint() {{
@@ -578,13 +930,9 @@ while (( bs >= MIN_BS )); do
   attempt_tag="attempt_$(printf '%03d' "$attempt")_bs${{bs}}"
   attempt_log="$RUN_ROOT/$(hostname).${{attempt_tag}}.log"
 
-  latest_ckpt="$(find_latest_self_forced_ckpt)"
-  if [[ -n "$latest_ckpt" ]]; then
-    action="fit"
-    ckpt_path="$latest_ckpt"
-  else
-    action="finetune"
-    ckpt_path="$PRETRAIN_CKPT"
+  if ! resolve_attempt_plan; then
+    echo "[self-forced-v100x4x8] refusing to start $attempt_tag because checkpoint/action plan is not synchronized" >&2
+    exit 1
   fi
 
   extra_overrides=()
@@ -856,7 +1204,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--retry-sync-port",
         default="29564",
-        help="Rank-0 pod HTTP port used to collect retry status from all pods.",
+        help=(
+            "Rank-0 pod HTTP port used to collect retry status, publish the "
+            "shared checkpoint/action plan, and serve resume checkpoints."
+        ),
     )
     parser.add_argument("--nproc-per-node", type=int, default=4)
     parser.add_argument("--initial-bs", type=int, default=2)
