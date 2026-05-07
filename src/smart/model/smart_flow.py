@@ -1808,12 +1808,23 @@ class SMARTFlow(LightningModule):
           - bptt_grad_clip_traj: closed-loop traj gradient L2 norm clip
         """
         G = int(getattr(self.finetune_config, "ocsc_n_rollouts", 2))
+        # ocsc_n_ol_rollouts=-1 (default): G_ol = G (paired L2/MMD).
+        # ocsc_n_ol_rollouts=1: single OL sample broadcast → 모든 CL rollout 이 동일 OL 과 비교.
+        _g_ol_raw = int(getattr(self.finetune_config, "ocsc_n_ol_rollouts", -1))
+        G_ol = G if _g_ol_raw <= 0 else max(1, min(_g_ol_raw, G))
+        _shared_ol = (G_ol < G)
         pred_max_steps_raw = int(getattr(self.finetune_config, "ocsc_pred_max_steps", 4))
         pred_max_steps: int | None = pred_max_steps_raw if pred_max_steps_raw > 0 else None
         loss_type = str(getattr(self.finetune_config, "ocsc_loss_type", "l2"))
         # ocsc_use_mmd=True: proper MMD² (self-term 포함, mode collapse 방지)
         # ocsc_use_mmd=False: 기존 paired L2 mean (비교/ablation 용)
         use_mmd = bool(getattr(self.finetune_config, "ocsc_use_mmd", True))
+        if _shared_ol and use_mmd:
+            log.warning(
+                f"[ocsc_ft] G_ol={G_ol} < G={G}: forcing use_mmd=False "
+                f"(single OL sample → no distribution to match)"
+            )
+            use_mmd = False
         # ocsc_gt_target=True: open-loop sample 대신 GT 궤적을 target으로 사용.
         # CL 예측을 2Hz로 다운샘플 후 GT(2Hz)와 비교.
         use_gt_target = bool(getattr(self.finetune_config, "ocsc_gt_target", False))
@@ -2130,6 +2141,8 @@ class SMARTFlow(LightningModule):
                         _agent_enc.flow_decoder = self.ref_flow_decoder
                     with torch.no_grad():
                         ol_norms: list[Tensor] = []
+                        # shared_tapes 는 CL rollout 용으로 항상 G 개. ol_norms 는 G_ol 개만 sample.
+                        # _shared_ol=True 면 G_ol=1: 모든 CL 은 ol_norms[0] 과 비교 (broadcast).
                         for g in range(G):
                             _seeds_g = self._get_closed_loop_scenario_seeds(
                                 scenario_ids=data["scenario_id"],
@@ -2147,12 +2160,13 @@ class SMARTFlow(LightningModule):
                                 share_noise_across_time=False,
                             )  # [n_agent, tape_steps, 4]
                             shared_tapes.append(tape_g)
-                            x_init_ol = tape_g[active_mask, :_sample_win, :].clone()  # [n_active, 20, 4]
-                            ol_norms.append(_agent_enc._sample_open_loop_future_from_hidden(
-                                anchor_hidden_valid=active_hidden,
-                                sampling_noise=self.eval_sampling_noise,
-                                x_init_override=x_init_ol,
-                            ))
+                            if g < G_ol:
+                                x_init_ol = tape_g[active_mask, :_sample_win, :].clone()  # [n_active, 20, 4]
+                                ol_norms.append(_agent_enc._sample_open_loop_future_from_hidden(
+                                    anchor_hidden_valid=active_hidden,
+                                    sampling_noise=self.eval_sampling_noise,
+                                    x_init_override=x_init_ol,
+                                ))
                     if _use_ref:
                         _agent_enc.flow_decoder = _orig_fd
 
@@ -2294,9 +2308,10 @@ class SMARTFlow(LightningModule):
                             (loss_g / (n_anchors_total * G)).backward()
                             del loss_g
                         else:
+                            _ol_idx = 0 if _shared_ol else g
                             loss_g = _consistency_loss(
                                 cl_norm_g,
-                                _slice_consistency_suffix(ol_norms[g]),
+                                _slice_consistency_suffix(ol_norms[_ol_idx]),
                             )
                             total_loss_accum += loss_g.item()
                             (loss_g / (n_anchors_total * G)).backward()
@@ -2372,7 +2387,7 @@ class SMARTFlow(LightningModule):
                         anchor_loss = torch.stack([
                             _consistency_loss(
                                 _slice_consistency_suffix(cl_norms[g]),
-                                _slice_consistency_suffix(ol_norms[g]),
+                                _slice_consistency_suffix(ol_norms[0 if _shared_ol else g]),
                             )
                             for g in range(G)
                         ]).mean()

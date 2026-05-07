@@ -112,6 +112,10 @@ class FinetuneConfig:
     # ── OCSC (Open-Closed Self-Consistency) ───────────────────────────────────────
     #: G: 시나리오당 closed-loop rollout 수. rmm_bptt_ft 의 bptt_n_rollouts 와 동일 개념.
     ocsc_n_rollouts: int = 2
+    #: G_ol: open-loop sample 개수. ``-1`` (기본) 이면 ``ocsc_n_rollouts`` 와 동일 (paired).
+    #: 1 이면 모든 CL rollout 이 단일 OL sample 과 paired L2 비교 (single-OL broadcast).
+    #: ``ocsc_use_mmd=True`` 와 함께 쓸 수 없음 (단일 OL 은 distribution 정의 불가) — 자동으로 False 강제.
+    ocsc_n_ol_rollouts: int = -1
     #: 일관성 loss 종류. "l2" (MSE), "smooth_l1", "l1" 중 하나.
     ocsc_loss_type: str = "l2"
     #: True → OCSC consistency를 proper MMD^2로 계산. False → rollout별 pairwise loss.
@@ -257,6 +261,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         rmm_bptt_ref_train=bool(_read_config_value(finetune, "rmm_bptt_ref_train", False)),
         rmm_bptt_ref_val=bool(_read_config_value(finetune, "rmm_bptt_ref_val", False)),
         ocsc_n_rollouts=int(_read_config_value(finetune, "ocsc_n_rollouts", 2)),
+        ocsc_n_ol_rollouts=int(_read_config_value(finetune, "ocsc_n_ol_rollouts", -1)),
         ocsc_loss_type=str(_read_config_value(finetune, "ocsc_loss_type", "l2")),
         ocsc_use_mmd=bool(_read_config_value(finetune, "ocsc_use_mmd", True)),
         ocsc_use_pretrained_ref=bool(_read_config_value(finetune, "ocsc_use_pretrained_ref", False)),
