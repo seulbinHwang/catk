@@ -82,17 +82,31 @@ CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_pro
 # ── batch size 조정 가능 ────────────────────────────────────────────────────
 VAL_B="${VAL_B:-4}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
+PIN_MEMORY="${PIN_MEMORY:-true}"
 
 cd "$(dirname "$0")/../.."   # repo root
 
+# pred horizon (초) — bc 없는 환경에서도 동작하도록 python 으로 계산
+PRED_SEC="$(python3 -c "print(${OLCL_PRED_2S_COARSE} * 0.5)" 2>/dev/null || echo '?')"
+
 echo "============================================================"
 echo "[ol-vs-cl-rmm launch] KST=${KST_NOW}  GPU=${CUDA_VISIBLE_DEVICES}"
-echo "  G=${OLCL_G_ROLLOUTS}  pred_max_steps=${OLCL_PRED_2S_COARSE} (= $(echo "${OLCL_PRED_2S_COARSE} * 0.5" | bc) 초)"
+echo "  G=${OLCL_G_ROLLOUTS}  pred_max_steps=${OLCL_PRED_2S_COARSE} (= ${PRED_SEC} 초)"
 echo "  limit_val_batches=${OLCL_LIMIT_VAL_BATCHES}  pad=${OLCL_PAD_MODE}"
 echo "  CKPT=${CKPT_PATH}"
 echo "  wandb: project=${OLCL_WANDB_PROJECT}  run=${OLCL_WANDB_RUN_NAME}  mode=${WANDB_MODE}"
 echo "  WOSAC_HARD_POOL_WORKERS=${WOSAC_HARD_POOL_WORKERS}"
+echo "  VAL_B=${VAL_B}  NUM_WORKERS=${NUM_WORKERS}  PREFETCH_FACTOR=${PREFETCH_FACTOR}"
 echo "============================================================"
+
+# num_workers=0 일 땐 prefetch_factor 옵션을 주면 PyTorch DataLoader 가 에러를 낸다.
+PREFETCH_ARG=""
+if [ "${NUM_WORKERS}" -gt 0 ]; then
+  # local_val_flow data config 에 prefetch_factor 가 없어서 +데이터필드 추가 형식 사용.
+  PREFETCH_ARG="+data.prefetch_factor=${PREFETCH_FACTOR}"
+fi
 
 # Hydra config: experiment=local_val_flow (validate 모드용 base)
 exec python temp/ol_vs_cl_rmm/compare_ol_vs_cl_rmm.py \
@@ -101,6 +115,9 @@ exec python temp/ol_vs_cl_rmm/compare_ol_vs_cl_rmm.py \
   paths.cache_root="${CACHE_ROOT}" \
   data.val_batch_size="${VAL_B}" \
   data.num_workers="${NUM_WORKERS}" \
+  data.persistent_workers="${PERSISTENT_WORKERS}" \
+  data.pin_memory="${PIN_MEMORY}" \
+  ${PREFETCH_ARG} \
   trainer.limit_val_batches="${OLCL_LIMIT_VAL_BATCHES}" \
   task_name="ol-vs-cl-${KST_NOW}" \
   "$@"

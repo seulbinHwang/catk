@@ -549,7 +549,8 @@ def main(cfg: DictConfig) -> None:
     datamodule.setup("validate")
     val_loader = datamodule.val_dataloader()
     n_total_batches = len(val_loader)
-    if 0 < limit_val_batches <= 1.0:
+    # 0 < x < 1 → 비율 (e.g. 0.01 = 1%).  >=1 → 절대 batch 개수.  1.0 == 1 batch.
+    if 0 < limit_val_batches < 1.0:
         n_use_batches = max(1, int(round(n_total_batches * limit_val_batches)))
     else:
         n_use_batches = max(1, min(int(limit_val_batches), n_total_batches))
@@ -692,11 +693,13 @@ def main(cfg: DictConfig) -> None:
         # ── Batch-level wandb log ─────────────────────────────────────────
         ol_flat = _per_scenario_to_flat("ol", ol_per)
         cl_flat = _per_scenario_to_flat("cl", cl_per)
-        delta_flat = {
-            f"delta/{k.split('/', 1)[1]}": cl_flat[k] - ol_flat[k]
-            for k in cl_flat
-            if k in ol_flat
-        }
+        # ol/<name> 와 cl/<name> 짝 맞춰 delta/<name> 산출
+        delta_flat: Dict[str, float] = {}
+        for k_cl, v_cl in cl_flat.items():
+            _name = k_cl.split("/", 1)[1]
+            _k_ol = f"ol/{_name}"
+            if _k_ol in ol_flat:
+                delta_flat[f"delta/{_name}"] = v_cl - ol_flat[_k_ol]
         # running mean
         for d in (ol_flat, cl_flat, delta_flat):
             for k, v in d.items():
