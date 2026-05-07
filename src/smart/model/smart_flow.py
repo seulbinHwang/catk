@@ -2212,7 +2212,10 @@ class SMARTFlow(LightningModule):
                         if use_gt_target:
                             _gt_slice = _slice_consistency_suffix_2hz(gt_norm_anchor)
                             _ol_ref_list = [_gt_slice] * G
-                            sigma_sq_seq = mmd_precompute_sigma_sq(_ol_ref_list, cl_norms_det)
+                            sigma_sq_seq = mmd_precompute_sigma_sq(
+                                _ol_ref_list, cl_norms_det,
+                                pos_weight=pos_w, heading_weight=heading_w,
+                            )
                             # Log detached MMD from pass-1 vs GT
                             _T_log = min(cl_norms_det[0].shape[-2], _gt_slice.shape[-2])
                             with torch.no_grad():
@@ -2220,19 +2223,24 @@ class SMARTFlow(LightningModule):
                                 _mmd_log = mmd_from_stacked(
                                     torch.stack(cl_norms_det, dim=0)[:, :, :_T_log, :],
                                     _gt_stack,
+                                    pos_weight=pos_w, heading_weight=heading_w,
                                 )
                             total_loss_accum += _mmd_log.item()
                             del _mmd_log, _gt_stack
                         else:
                             _ol_det = [_slice_consistency_suffix(o.detach()) for o in ol_norms]
                             _ol_ref_list = _ol_det
-                            sigma_sq_seq = mmd_precompute_sigma_sq(_ol_det, cl_norms_det)
+                            sigma_sq_seq = mmd_precompute_sigma_sq(
+                                _ol_det, cl_norms_det,
+                                pos_weight=pos_w, heading_weight=heading_w,
+                            )
                             # Log MMD value from detached pass-1 samples (consistent with parallel mode)
                             _T_log = min(cl_norms_det[0].shape[-2], _ol_det[0].shape[-2])
                             with torch.no_grad():
                                 _mmd_log = mmd_from_stacked(
                                     torch.stack(cl_norms_det, dim=0)[:, :, :_T_log, :],
                                     torch.stack(_ol_det,      dim=0)[:, :, :_T_log, :],
+                                    pos_weight=pos_w, heading_weight=heading_w,
                                 )
                             total_loss_accum += _mmd_log.item()
                             del _mmd_log
@@ -2274,7 +2282,9 @@ class SMARTFlow(LightningModule):
                                 cl_norm_g=cl_norm_g,
                                 cl_norms_ref=cl_norms_det,
                                 ol_norms_ref=_ol_ref_list,
-                                sigma_sq=sigma_sq_seq,
+                                sigma_sqs=sigma_sq_seq,
+                                pos_weight=pos_w,
+                                heading_weight=heading_w,
                             )
                             (proxy_g / n_anchors_total).backward()
                             del proxy_g
@@ -2335,7 +2345,10 @@ class SMARTFlow(LightningModule):
                             )[:, :, :T_min, :]
                             # GT를 G번 반복해 ol_stack으로 사용: koo=1 (constant, no grad)
                             gt_stack = _gt_slice.unsqueeze(0).expand(G, -1, -1, -1)[:, :, :T_min, :].detach()
-                            anchor_loss = mmd_from_stacked(cl_stack, gt_stack)
+                            anchor_loss = mmd_from_stacked(
+                                cl_stack, gt_stack,
+                                pos_weight=pos_w, heading_weight=heading_w,
+                            )
                         else:
                             anchor_loss = torch.stack([
                                 _consistency_loss_gt(
@@ -2351,7 +2364,10 @@ class SMARTFlow(LightningModule):
                         ol_stack = torch.stack(ol_norms, dim=0)[:, :, :T_min, :].detach()
                         cl_stack = _slice_consistency_suffix(cl_stack)
                         ol_stack = _slice_consistency_suffix(ol_stack)
-                        anchor_loss = mmd_from_stacked(cl_stack, ol_stack)
+                        anchor_loss = mmd_from_stacked(
+                            cl_stack, ol_stack,
+                            pos_weight=pos_w, heading_weight=heading_w,
+                        )
                     else:
                         anchor_loss = torch.stack([
                             _consistency_loss(
