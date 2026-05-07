@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch DRaFT fine-tuning on existing V100x3x5 static pods.
+"""Launch DRaFT fine-tuning on existing V100x4x8 static pods.
 
 This launcher never creates, deletes, or restarts pods. It only uses
 ``kubectl exec`` to start or stop a tmux session inside already-running pods.
@@ -13,15 +13,24 @@ import subprocess
 
 
 DEFAULT_NAMESPACE = "p-pnc"
-DEFAULT_PODS = ["fv", "fvv", "fvvv", "fvvvv", "fvvvvv"]
+DEFAULT_PODS = [
+    "testsv",
+    "testsvv",
+    "testsvvv",
+    "testsvvvv",
+    "sv",
+    "svv",
+    "svvv",
+    "svvvv",
+]
 DEFAULT_CONTAINER = "main"
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_BRANCH = "self_forcing_w_track_loss"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
-DEFAULT_EXPERIMENT = "finetune_draft_flow_v100x3x5"
-DEFAULT_TASK_NAME = "flow_finetune_draft_v100x3x5_bs24_soft08_topk20_commit1_noslip"
-DEFAULT_SESSION = "catk-draft-v100x3x5-bs24-soft08"
+DEFAULT_EXPERIMENT = "finetune_draft_flow_v100x4x8"
+DEFAULT_TASK_NAME = "flow_finetune_draft_v100x4x8_bs24_soft08_topk20_commit1_noslip"
+DEFAULT_SESSION = "catk-draft-v100x4x8-bs24-soft08"
 
 
 def shq(value: object) -> str:
@@ -109,11 +118,11 @@ set +a
 cd "$PROJECT_ROOT"
 mkdir -p "$RUN_ROOT"
 
-echo "[draft-v100x3x5] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
-echo "[draft-v100x3x5] started at $(date '+%F %T')"
-echo "[draft-v100x3x5] experiment=${{EXPERIMENT}} bs=${{TRAIN_BATCH_SIZE}} precision=${{PRECISION}}"
-echo "[draft-v100x3x5] ckpt_path=${{CKPT_PATH}}"
-echo "[draft-v100x3x5] attach survives after exit; press Ctrl-b d to detach"
+echo "[draft-v100x4x8] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
+echo "[draft-v100x4x8] started at $(date '+%F %T')"
+echo "[draft-v100x4x8] experiment=${{EXPERIMENT}} bs=${{TRAIN_BATCH_SIZE}} precision=${{PRECISION}}"
+echo "[draft-v100x4x8] ckpt_path=${{CKPT_PATH}}"
+echo "[draft-v100x4x8] attach survives after exit; press Ctrl-b d to detach"
 echo
 
 CHECKPOINT_SYNC_PID=""
@@ -185,7 +194,7 @@ class Server(http.server.ThreadingHTTPServer):
 Server(("", port), Handler).serve_forever()
 PY
   CHECKPOINT_SYNC_PID=$!
-  echo "[draft-v100x3x5] checkpoint sync server started on $CHECKPOINT_SYNC_HOST:$CHECKPOINT_SYNC_PORT pid=$CHECKPOINT_SYNC_PID"
+  echo "[draft-v100x4x8] checkpoint sync server started on $CHECKPOINT_SYNC_HOST:$CHECKPOINT_SYNC_PORT pid=$CHECKPOINT_SYNC_PID"
 }}
 
 stop_checkpoint_sync_server() {{
@@ -210,7 +219,7 @@ PY
       return 0
     fi
     if (( waited >= timeout_sec )); then
-      echo "[draft-v100x3x5] timed out waiting for checkpoint sync server at $CHECKPOINT_SYNC_HOST:$CHECKPOINT_SYNC_PORT" >&2
+      echo "[draft-v100x4x8] timed out waiting for checkpoint sync server at $CHECKPOINT_SYNC_HOST:$CHECKPOINT_SYNC_PORT" >&2
       return 1
     fi
     sleep 5
@@ -259,18 +268,18 @@ download_synced_checkpoint() {{
   expected_size="$(metadata_value "$metadata" size)"
   expected_sha="$(metadata_value "$metadata" sha256)"
   if [[ -z "$expected_size" || -z "$expected_sha" ]]; then
-    echo "[draft-v100x3x5] invalid checkpoint metadata from rank0" >&2
+    echo "[draft-v100x4x8] invalid checkpoint metadata from rank0" >&2
     return 1
   fi
   if checkpoint_matches "$CKPT_PATH" "$expected_size" "$expected_sha"; then
-    echo "[draft-v100x3x5] checkpoint already synced: $CKPT_PATH"
+    echo "[draft-v100x4x8] checkpoint already synced: $CKPT_PATH"
     return 0
   fi
 
   mkdir -p "$(dirname "$CKPT_PATH")"
   tmp_file="${{CKPT_PATH}}.download.$$"
   rm -f "$tmp_file"
-  echo "[draft-v100x3x5] downloading rank0 checkpoint to $CKPT_PATH"
+  echo "[draft-v100x4x8] downloading rank0 checkpoint to $CKPT_PATH"
   if ! python - "$tmp_file" <<'PY'
 import os
 import shutil
@@ -288,7 +297,7 @@ PY
     return 1
   fi
   if ! checkpoint_matches "$tmp_file" "$expected_size" "$expected_sha"; then
-    echo "[draft-v100x3x5] downloaded checkpoint failed verification: $tmp_file" >&2
+    echo "[draft-v100x4x8] downloaded checkpoint failed verification: $tmp_file" >&2
     rm -f "$tmp_file"
     return 1
   fi
@@ -298,11 +307,11 @@ PY
 
 ensure_checkpoint_local() {{
   if [[ -f "$CKPT_PATH" ]]; then
-    echo "[draft-v100x3x5] using checkpoint: $CKPT_PATH"
+    echo "[draft-v100x4x8] using checkpoint: $CKPT_PATH"
     return 0
   fi
   if [[ -z "$WANDB_ARTIFACT" ]]; then
-    echo "[draft-v100x3x5] ERROR: checkpoint not found and WANDB_ARTIFACT is empty: $CKPT_PATH" >&2
+    echo "[draft-v100x4x8] ERROR: checkpoint not found and WANDB_ARTIFACT is empty: $CKPT_PATH" >&2
     return 2
   fi
 
@@ -311,7 +320,7 @@ ensure_checkpoint_local() {{
   local lock_dir="${{CKPT_PATH}}.download.lock"
 
   if mkdir "$lock_dir" 2>/dev/null; then
-    echo "[draft-v100x3x5] downloading W&B artifact: $WANDB_ARTIFACT"
+    echo "[draft-v100x4x8] downloading W&B artifact: $WANDB_ARTIFACT"
     python - <<'PY'
 import glob
 import os
@@ -358,15 +367,15 @@ PY
     return "$status"
   fi
 
-  echo "[draft-v100x3x5] waiting for checkpoint download lock: $lock_dir"
+  echo "[draft-v100x4x8] waiting for checkpoint download lock: $lock_dir"
   for _ in $(seq 1 180); do
     if [[ -f "$CKPT_PATH" ]]; then
-      echo "[draft-v100x3x5] checkpoint appeared: $CKPT_PATH"
+      echo "[draft-v100x4x8] checkpoint appeared: $CKPT_PATH"
       return 0
     fi
     sleep 10
   done
-  echo "[draft-v100x3x5] timed out waiting for $CKPT_PATH" >&2
+  echo "[draft-v100x4x8] timed out waiting for $CKPT_PATH" >&2
   return 4
 }}
 
@@ -420,7 +429,7 @@ torchrun_args=(
 )
 torchrun_args+=("${{extra_overrides[@]}}")
 
-printf '[draft-v100x3x5] torchrun'
+printf '[draft-v100x4x8] torchrun'
 printf ' %q' "${{torchrun_args[@]}}"
 printf '\\n'
 
@@ -576,7 +585,7 @@ def exec_in_pod(args: argparse.Namespace, pod: str, script: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch DRaFT fine-tuning on existing V100x3x5 static pods.",
+        description="Launch DRaFT fine-tuning on existing V100x4x8 static pods.",
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--pods", nargs="+", default=DEFAULT_PODS)
@@ -602,13 +611,13 @@ def parse_args() -> argparse.Namespace:
         help="Optional artifact download directory. Defaults to dirname(--ckpt-path)/artifact.",
     )
     parser.add_argument("--master-addr", default="")
-    parser.add_argument("--master-port", default="29573")
+    parser.add_argument("--master-port", default="29593")
     parser.add_argument(
         "--checkpoint-sync-port",
-        default="29574",
+        default="29594",
         help="Rank-0 pod HTTP port used to serve the resolved checkpoint to worker pods.",
     )
-    parser.add_argument("--nproc-per-node", type=int, default=3)
+    parser.add_argument("--nproc-per-node", type=int, default=4)
     parser.add_argument("--train-batch-size", type=int, default=24)
     parser.add_argument("--val-batch-size", type=int, default=2)
     parser.add_argument("--test-batch-size", type=int, default=2)
@@ -624,10 +633,10 @@ def parse_args() -> argparse.Namespace:
 
     if args.stop:
         return args
-    if len(args.pods) != 5:
-        parser.error("--pods must contain exactly five pods for the V100x3x5 preset")
-    if args.nproc_per_node != 3:
-        parser.error("--nproc-per-node must be 3 for the V100x3x5 preset")
+    if len(args.pods) != 8:
+        parser.error("--pods must contain exactly eight pods for the V100x4x8 preset")
+    if args.nproc_per_node != 4:
+        parser.error("--nproc-per-node must be 4 for the V100x4x8 preset")
     if args.train_batch_size < 1:
         parser.error("--train-batch-size must be >= 1")
     if args.val_batch_size < 1:

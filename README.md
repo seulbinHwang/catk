@@ -869,7 +869,7 @@ DRaFT inverse feasibility fine-tuning을 돌릴 때 쓰는 preset과 launcher입
 - preset 파일: `configs/experiment/finetune_draft_flow_v100x3x5.yaml`
 - launcher 파일: `scripts/launch_finetune_draft_v100x3x5_static_pods.py`
 - 총 DDP rank: `5 nodes * 3 GPUs = 15`
-- physics 설정: `soft_limit_ratio=1.0`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=false`
+- physics 설정: `soft_limit_ratio=0.8`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=false`
 - DRaFT weight: `draft.max_weight=0.15`
 - 기본 per-GPU `train_batch_size=24`, `val_batch_size=2`
 
@@ -914,6 +914,61 @@ batch size 판단:
 - 이 가정은 DRaFT fine-tuning처럼 activation이 큰 학습에서는 꽤 유용하지만, 완전한 보장은 아닙니다. V100은 A100과 kernel/workspace, fp16/bf16 특성, fragmentation, batch별 agent 수 분산이 다릅니다.
 - 그래서 `25.6`을 그대로 쓰는 대신 `24`로 시작하는 판단은 합리적인 보수값입니다. 다만 실측 전에는 “안전한 시작점”이지 “항상 성공 보장값”은 아닙니다.
 - OOM이 나면 같은 launcher에 `--train-batch-size 22` 또는 `20`을 넘겨 다시 시작하세요.
+
+### 5.8.2 8x V100 32GB x4 static pods에서 DRaFT fine-tuning
+
+`testsv`, `testsvv`, `testsvvv`, `testsvvvv`, `sv`, `svv`, `svvv`, `svvvv` 처럼
+**V100 32GB 4장짜리 pod 8개**를 묶어 새 checkpoint에서 DRaFT inverse feasibility fine-tuning을
+시작할 때 쓰는 preset과 launcher입니다.
+
+- preset 파일: `configs/experiment/finetune_draft_flow_v100x4x8.yaml`
+- launcher 파일: `scripts/launch_finetune_draft_v100x4x8_static_pods.py`
+- 총 DDP rank: `8 nodes * 4 GPUs = 32`
+- physics 설정: `soft_limit_ratio=0.8`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=false`
+- DRaFT weight: `draft.max_weight=0.15`
+- 기본 per-GPU `train_batch_size=24`, `val_batch_size=2`
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
+  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
+  --dry-run
+```
+
+실제 시작:
+
+```bash
+python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
+  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
+  --task-name flow_finetune_draft_v100x4x8_bs24_soft08_topk20_commit1_noslip
+```
+
+checkpoint가 아직 pod 안에 없고 W&B artifact에서 받아야 한다면 full name을 같이 넘기면 됩니다.
+rank 0 pod가 checkpoint를 받은 뒤 나머지 pod들이 같은 파일을 검증하며 동기화합니다.
+
+```bash
+python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
+  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
+  --wandb-artifact entity/project/artifact-name:v1 \
+  --artifact-download-dir /workspace/path/to/new_checkpoint/artifact \
+  --task-name flow_finetune_draft_v100x4x8_bs24_soft08_topk20_commit1_noslip
+```
+
+이미 떠 있는 이 launcher의 tmux 세션만 종료:
+
+```bash
+python scripts/launch_finetune_draft_v100x4x8_static_pods.py --stop
+```
+
+batch size 판단:
+
+- `64 / 320 * 128 = 25.6`은 A100x4 pod의 총 320 GiB에서 per-GPU batch 64가 완주했고,
+  V100x4 pod의 총 128 GiB로 같은 모델/데이터/precision을 옮긴다는 가정의 1차 추정입니다.
+- 실제 학습은 GPU별 activation, attention workspace, batch별 agent 수 분산, V100/A100 kernel 차이에 영향을 받으므로
+  완전한 보장은 아닙니다.
+- 그래도 `25.6`을 그대로 쓰지 않고 `24`로 내리는 판단은 합리적인 보수 시작점입니다.
+  OOM이 나면 같은 launcher에 `--train-batch-size 22` 또는 `20`을 넘겨 다시 시작하세요.
 
 ### 5.9 4x H100 80GB 에서 Flow Matching pretrain
 
