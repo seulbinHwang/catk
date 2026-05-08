@@ -87,10 +87,19 @@ class SMARTFlow(LightningModule):
 
         self.minADE = minADE()
         self.minADE_predict = minADE()
-        self.sim_agents_metrics = SimAgentsMetrics(
-            "val_closed",
-            max_workers=model_config.sim_agents_metric_workers,
-        )
+        # validation_metric: "real" (공식 TF SimAgentsMetrics, 정확하지만 느림)
+        # "hard" (PyTorch in-process HardSimAgentsMetrics, 빠름, parity 검증됨).
+        # OCSC default 는 hard.
+        _validation_metric = str(
+            getattr(model_config, "validation_metric", "real")
+        ).lower()
+        if _validation_metric == "hard":
+            self.sim_agents_metrics = HardSimAgentsMetrics("val_closed")
+        else:
+            self.sim_agents_metrics = SimAgentsMetrics(
+                "val_closed",
+                max_workers=model_config.sim_agents_metric_workers,
+            )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
         wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
         self.wosac_distribution_metrics = WOSACDistributionMetrics(
