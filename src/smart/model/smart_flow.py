@@ -2277,7 +2277,17 @@ class SMARTFlow(LightningModule):
             opt = self.optimizers()
             opt.zero_grad()
 
-            tokenized_map, tokenized_agent = self.token_processor(data)
+            # OCSC step 본체는 prepare_inference_cache 를 호출하므로
+            # tokenized_agent 가 inference 형태 (valid_mask / gt_pos / gt_heading
+            # / gt_idx / rollout_init_* / gt_pos_raw 등) 를 갖춰야 한다. project_3
+            # 측 TokenProcessor 는 train mode 에서 그 키들을 일부 누락시키므로
+            # OCSC step 직전에 강제로 eval mode 로 전환한다.
+            _was_training = self.token_processor.training
+            self.token_processor.eval()
+            try:
+                tokenized_map, tokenized_agent = self.token_processor(data)
+            finally:
+                self.token_processor.train(_was_training)
 
             # DDP multi-GPU: 모든 .backward() 호출을 no_sync 컨텍스트 안에서
             # 실행해 per-backward all-reduce 를 막고, 끝나서 manual_backward 로
