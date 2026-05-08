@@ -64,6 +64,7 @@ class MultiDataModule(LightningDataModule):
         train_max_num: int,
         train_use_eval_agent_selection: bool = False,
         train_epoch_sample_fraction: float = 1.0,
+        train_tfrecords_splitted: Optional[str] = None,
     ) -> None:
         super(MultiDataModule, self).__init__()
         if not 0.0 < float(train_epoch_sample_fraction) <= 1.0:
@@ -84,6 +85,10 @@ class MultiDataModule(LightningDataModule):
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
+        # project_3 train pipeline 은 pickle cache 기반이라 TFRecord 입력은
+        # 사용하지 않습니다. OCSC launcher 는 호환성을 위해 이 인자를 inject
+        # 하므로 받기만 하고 별도 사용은 안 합니다.
+        self.train_tfrecords_splitted = train_tfrecords_splitted
 
         self.train_transform = build_train_agent_target_builder(
             train_max_num=train_max_num,
