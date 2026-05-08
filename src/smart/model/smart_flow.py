@@ -840,16 +840,26 @@ class SMARTFlow(LightningModule):
                 rollout_idx=int(rollout_indices[0]),
                 device=scenario_device,
             )
-            pred = rollout_encoder.rollout_from_cache(
-                rollout_cache=rollout_cache,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                sampling_scheme=self.validation_rollout_sampling,
-                scenario_sampling_seeds=scenario_sampling_seeds,
-                return_flow_2s_preview=return_flow_2s_preview,
-            )
+            if full_grad:
+                pred = rollout_encoder.training_rollout_from_cache(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_scheme=self.validation_rollout_sampling,
+                    scenario_sampling_seeds=scenario_sampling_seeds,
+                    rollout_steps_2hz=max_steps,
+                )
+            else:
+                pred = rollout_encoder.rollout_from_cache(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_scheme=self.validation_rollout_sampling,
+                    scenario_sampling_seeds=scenario_sampling_seeds,
+                    return_flow_2s_preview=return_flow_2s_preview,
+                )
             flow_preview = None
-            if return_flow_2s_preview:
+            if (not full_grad) and return_flow_2s_preview:
                 flow_preview = {
                     "traj": pred["pred_flow_preview_traj"].unsqueeze(1),
                     "valid": pred["pred_flow_preview_valid"].unsqueeze(1),
@@ -882,16 +892,26 @@ class SMARTFlow(LightningModule):
             rollout_cache=rollout_cache,
             repeat_count=chunk_size,
         )
-        pred = rollout_encoder.rollout_from_cache(
-            rollout_cache=expanded_rollout_cache,
-            tokenized_agent=expanded_tokenized_agent,
-            map_feature=expanded_map_feature,
-            sampling_scheme=self.validation_rollout_sampling,
-            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
-            return_flow_2s_preview=return_flow_2s_preview,
-        )
+        if full_grad:
+            pred = rollout_encoder.training_rollout_from_cache(
+                rollout_cache=expanded_rollout_cache,
+                tokenized_agent=expanded_tokenized_agent,
+                map_feature=expanded_map_feature,
+                sampling_scheme=self.validation_rollout_sampling,
+                scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+                rollout_steps_2hz=max_steps,
+            )
+        else:
+            pred = rollout_encoder.rollout_from_cache(
+                rollout_cache=expanded_rollout_cache,
+                tokenized_agent=expanded_tokenized_agent,
+                map_feature=expanded_map_feature,
+                sampling_scheme=self.validation_rollout_sampling,
+                scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+                return_flow_2s_preview=return_flow_2s_preview,
+            )
         flow_preview = None
-        if return_flow_2s_preview:
+        if (not full_grad) and return_flow_2s_preview:
             flow_preview = {
                 "traj": self._reshape_parallel_rollout_prediction(
                     pred["pred_flow_preview_traj"],
