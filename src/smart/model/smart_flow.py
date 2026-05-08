@@ -32,7 +32,7 @@ from src.smart.metrics.flow_metrics import (
 )
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
-from src.smart.utils.finetune import set_model_for_finetuning
+from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
 from src.smart.utils.flow_horizon import format_flow_horizon_tag
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
@@ -64,7 +64,9 @@ class SMARTFlow(LightningModule):
                 "decoder.flow_window_steps and token_processor.flow_window_steps must match, "
                 f"got {self.flow_window_steps} and {int(self.token_processor.flow_window_steps)}."
             )
-        set_model_for_finetuning(self.encoder, model_config.finetune)
+        self.finetune_config: FinetuneConfig = set_model_for_finetuning(
+            self.encoder, model_config.finetune
+        )
 
         self.minADE = minADE()
         self.minADE_predict = minADE()
