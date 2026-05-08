@@ -76,6 +76,33 @@ def _hard_load_and_log_feat_worker(scenario_file: str, challenge):
     return scenario.SerializeToString(), lf.as_dict()
 
 
+def _hard_meta_metric_worker(
+    config_bytes: bytes,
+    log_feat_dict,
+    sim_feat_dict,
+) -> Dict[str, float]:
+    """Worker for per-scenario hard meta-metric.
+
+    Inputs (log_feat_dict / sim_feat_dict) must already be CPU tensors —
+    main process is responsible for .cpu() copy before dispatch.
+
+    Returns dict with ``metametric`` plus every entry of ``_LIKELIHOOD_NAMES``
+    so the main process can update per-metric running sums.
+    """
+    from waymo_open_dataset.protos import sim_agents_metrics_pb2
+    from src.smart.metrics.wosac_metametric_pytorch import (
+        compute_wosac_metametric_from_features_torch,
+    )
+
+    cfg = sim_agents_metrics_pb2.SimAgentMetricsConfig()
+    cfg.ParseFromString(config_bytes)
+    r = compute_wosac_metametric_from_features_torch(cfg, log_feat_dict, sim_feat_dict)
+    out: Dict[str, float] = {"metametric": float(r.metametric)}
+    for name in _LIKELIHOOD_NAMES:
+        out[name] = float(getattr(r, name))
+    return out
+
+
 def _sim_agents_worker(
     config_bytes: bytes,
     scenario_file: str,
@@ -618,17 +645,49 @@ class HardSimAgentsMetrics:
         )
 
         # Per-scenario meta-metric (Hard) and optional verification against official Real.
+        # ── 분산 경로: forkserver pool 16 worker 가 n_scenarios 개 meta-metric 을
+        # 병렬 계산. main thread 는 GPU forward 와 overlap 가능.
+        # log_feat_dicts 는 worker 가 만든 CPU tensor; sim_feat_dicts 는 GPU tensor 라
+        # dispatch 전 .cpu() copy 필요 (size 작음, PCIe overhead 무시 가능).
         hard_per_scenario: List[float] = []
-        for i in range(n_scenarios):
-            result = compute_wosac_metametric_from_features_torch(
-                self._config, log_feat_dicts[i], sim_feat_dicts[i]
+        _PROFILE_META = bool(int(os.environ.get("WOSAC_PROFILE", "0")))
+        if _PROFILE_META:
+            import time as _time
+            _meta_t0 = _time.perf_counter()
+        if pool is not None and n_scenarios > 1:
+            _sim_feat_cpu = [
+                {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in sf.items()}
+                for sf in sim_feat_dicts
+            ]
+            _cfg_bytes = self._config.SerializeToString()
+            _meta_args = [
+                (_cfg_bytes, log_feat_dicts[i], _sim_feat_cpu[i]) for i in range(n_scenarios)
+            ]
+            _meta_results = pool.starmap(_hard_meta_metric_worker, _meta_args)
+            for r in _meta_results:
+                hm = float(r["metametric"])
+                hard_per_scenario.append(hm)
+                self._metametric_sum += hm
+                for name in _LIKELIHOOD_NAMES:
+                    self._per_metric_sums[name] += float(r[name])
+                self._count += 1
+        else:
+            for i in range(n_scenarios):
+                result = compute_wosac_metametric_from_features_torch(
+                    self._config, log_feat_dicts[i], sim_feat_dicts[i]
+                )
+                hm = float(result.metametric)
+                hard_per_scenario.append(hm)
+                self._metametric_sum += hm
+                for name in _LIKELIHOOD_NAMES:
+                    self._per_metric_sums[name] += float(getattr(result, name))
+                self._count += 1
+        if _PROFILE_META:
+            print(
+                f"[hard-rmm-profile] meta_metric_loop={_time.perf_counter()-_meta_t0:.2f}s "
+                f"n_scenes={n_scenarios} pool={'on' if pool is not None and n_scenarios > 1 else 'off'}",
+                flush=True,
             )
-            hm = float(result.metametric)
-            hard_per_scenario.append(hm)
-            self._metametric_sum += hm
-            for name in _LIKELIHOOD_NAMES:
-                self._per_metric_sums[name] += float(getattr(result, name))
-            self._count += 1
 
         # Verify mode: per-sub-metric Hard vs Real comparison via subprocess pool.
         if os.environ.get("WOSAC_VERIFY") == "1":
