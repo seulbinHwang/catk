@@ -42,8 +42,6 @@ from src.utils.waymo_submission import (
     maybe_submit_waymo_submission,
 )
 
-from src.smart.road import run_road_finetune
-
 log = RankedLogger(__name__, rank_zero_only=True)
 
 torch.set_float32_matmul_precision("high")
@@ -53,13 +51,6 @@ def _format_key_list(keys: Sequence[str], max_items: int = 20) -> str:
     shown = list(keys[:max_items])
     suffix = "" if len(keys) <= max_items else f", ... (+{len(keys) - max_items} more)"
     return ", ".join(shown) + suffix
-
-
-def _is_self_forced_enabled(cfg: DictConfig) -> bool:
-    model_cfg = cfg.get("model")
-    model_config = model_cfg.get("model_config") if model_cfg else None
-    self_forced_cfg = model_config.get("self_forced") if model_config else None
-    return bool(self_forced_cfg and self_forced_cfg.get("enabled", False))
 
 
 def _load_lightning_checkpoint(ckpt_path: str) -> dict[str, Any]:
@@ -77,30 +68,15 @@ def _load_lightning_checkpoint(ckpt_path: str) -> dict[str, Any]:
     return checkpoint
 
 
-def _is_self_forced_auxiliary_key(key: str) -> bool:
-    return (
-        key.startswith("self_forced_target_teacher.")
-        or key.startswith("self_forced_generated_estimator.")
-        or ".self_forced_target_teacher." in key
-        or ".self_forced_generated_estimator." in key
-    )
-
-
 def _validate_finetune_loaded_trainable_params(
     model: LightningModule,
     missing_keys: Sequence[str],
     unexpected_keys: Sequence[str],
-    *,
-    allow_missing_self_forced_auxiliary: bool = False,
 ) -> None:
     trainable_param_names = {
         name for name, param in model.named_parameters() if param.requires_grad
     }
     missing_trainable = sorted(set(missing_keys) & trainable_param_names)
-    if allow_missing_self_forced_auxiliary:
-        missing_trainable = [
-            key for key in missing_trainable if not _is_self_forced_auxiliary_key(key)
-        ]
     if missing_trainable:
         raise RuntimeError(
             "action=finetune loaded the checkpoint with strict=False, but the checkpoint "
@@ -109,64 +85,15 @@ def _validate_finetune_loaded_trainable_params(
             f"Missing trainable key(s): {_format_key_list(missing_trainable)}"
         )
 
-    non_aux_missing = (
-        [key for key in missing_keys if not _is_self_forced_auxiliary_key(str(key))]
-        if allow_missing_self_forced_auxiliary
-        else list(missing_keys)
-    )
-    if non_aux_missing:
+    if missing_keys:
         log.warning(
             "Ignoring non-trainable missing checkpoint key(s) during finetune load: "
-            f"{_format_key_list(non_aux_missing)}"
+            f"{_format_key_list(list(missing_keys))}"
         )
     if unexpected_keys:
         log.warning(
             "Ignoring unexpected checkpoint key(s) during finetune load: "
             f"{_format_key_list(list(unexpected_keys))}"
-        )
-
-
-def _checkpoint_has_self_forced_auxiliary_state(checkpoint: dict[str, Any]) -> bool:
-    state_dict = checkpoint.get("state_dict", {})
-    if not isinstance(state_dict, dict):
-        return False
-    prefixes = (
-        "self_forced_target_teacher.",
-        "self_forced_generated_estimator.",
-    )
-    infixes = (
-        ".self_forced_target_teacher.",
-        ".self_forced_generated_estimator.",
-    )
-    return any(
-        str(key).startswith(prefixes) or any(infix in str(key) for infix in infixes)
-        for key in state_dict
-    )
-
-
-def _validate_self_forced_checkpoint_action(
-    cfg: DictConfig,
-    checkpoint: dict[str, Any],
-) -> None:
-    if not _is_self_forced_enabled(cfg):
-        return
-
-    has_aux_state = _checkpoint_has_self_forced_auxiliary_state(checkpoint)
-    if cfg.action == "finetune" and has_aux_state:
-        raise ValueError(
-            "ckpt_path looks like a self-forced training checkpoint because it contains "
-            "'self_forced_target_teacher' or 'self_forced_generated_estimator' state. "
-            "Do not load it with action=finetune, which starts a new weight-only run and "
-            "can discard the resume semantics of F_rho/F_psi. Use action=fit with the "
-            "self-forced checkpoint to perform a full Lightning resume."
-        )
-    if cfg.action == "fit" and cfg.get("ckpt_path") and not has_aux_state:
-        raise ValueError(
-            "self-forced action=fit expects a self-forced checkpoint containing "
-            "'self_forced_target_teacher' and 'self_forced_generated_estimator' state. "
-            "The provided ckpt_path does not look like a self-forced resume checkpoint. "
-            "Use action=finetune for the first self-forced run from a pretrained "
-            "Generator checkpoint."
         )
 
 
@@ -313,46 +240,20 @@ def run(cfg: DictConfig) -> None:
 
     log.info(f"Resuming from ckpt: cfg.ckpt_path={cfg.ckpt_path}")
     if cfg.action == "fit":
-        checkpoint = None
-        if cfg.get("ckpt_path") and _is_self_forced_enabled(cfg):
-            checkpoint = _load_lightning_checkpoint(str(cfg.ckpt_path))
-            _validate_self_forced_checkpoint_action(cfg, checkpoint)
-        del checkpoint
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
     elif cfg.action == "finetune":
         if not cfg.get("ckpt_path"):
             raise ValueError("action=finetune requires ckpt_path for weight-only initialization.")
         checkpoint = _load_lightning_checkpoint(str(cfg.ckpt_path))
-        _validate_self_forced_checkpoint_action(cfg, checkpoint)
         log.info("Starting finetuning!")
         load_result = model.load_state_dict(checkpoint["state_dict"], strict=False)
         _validate_finetune_loaded_trainable_params(
             model=model,
             missing_keys=load_result.missing_keys,
             unexpected_keys=load_result.unexpected_keys,
-            allow_missing_self_forced_auxiliary=_is_self_forced_enabled(cfg),
         )
         trainer.fit(model=model, datamodule=datamodule)
-    elif cfg.action == "road_finetune":
-        if not cfg.get("ckpt_path"):
-            raise ValueError("action=road_finetune requires ckpt_path for weight-only initialization.")
-        checkpoint = _load_lightning_checkpoint(str(cfg.ckpt_path))
-        _validate_self_forced_checkpoint_action(cfg, checkpoint)
-        log.info("Starting RoaD fine-tuning!")
-        load_result = model.load_state_dict(checkpoint["state_dict"], strict=False)
-        _validate_finetune_loaded_trainable_params(
-            model=model,
-            missing_keys=load_result.missing_keys,
-            unexpected_keys=load_result.unexpected_keys,
-            allow_missing_self_forced_auxiliary=_is_self_forced_enabled(cfg),
-        )
-        run_road_finetune(
-            cfg=cfg,
-            datamodule=datamodule,
-            model=model,
-            trainer=trainer,
-        )
     elif cfg.action == "validate":
         log.info("Starting validating!")
         trainer.validate(
