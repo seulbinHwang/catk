@@ -1808,11 +1808,23 @@ class SMARTFlow(LightningModule):
           - bptt_grad_clip_traj: closed-loop traj gradient L2 norm clip
         """
         G = int(getattr(self.finetune_config, "ocsc_n_rollouts", 2))
-        # ocsc_n_ol_rollouts=-1 (default): G_ol = G (paired L2/MMD).
+        # ocsc_n_ol_rollouts=-1 (default): M = G (paired L2/MMD).
         # ocsc_n_ol_rollouts=1: single OL sample broadcast → 모든 CL rollout 이 동일 OL 과 비교.
+        # ocsc_n_ol_rollouts=M (>G) + ocsc_ol_nearest_match=True: 각 CL g 에 대해 M 개 OL 중
+        #   per-anchor flat L2 거리 최소를 골라 paired L2 target 으로 사용.
         _g_ol_raw = int(getattr(self.finetune_config, "ocsc_n_ol_rollouts", -1))
-        G_ol = G if _g_ol_raw <= 0 else max(1, min(_g_ol_raw, G))
-        _shared_ol = (G_ol < G)
+        M_ol = G if _g_ol_raw <= 0 else max(1, _g_ol_raw)
+        _nearest_match = bool(getattr(self.finetune_config, "ocsc_ol_nearest_match", False))
+        if _nearest_match and M_ol < G:
+            log.warning(
+                f"[ocsc_ft] ocsc_ol_nearest_match=True 인데 M={M_ol} < G={G}: nearest_match 비활성."
+            )
+            _nearest_match = False
+        # _shared_ol: M < G 일 때 모든 CL 이 ol_norms[0] 과 비교 (broadcast).
+        # nearest_match 일 때는 M >= G 강제이므로 _shared_ol 은 항상 False.
+        _shared_ol = (M_ol < G) and (not _nearest_match)
+        # G_ol: backward-compatible alias for M_ol when M_ol <= G (legacy code paths).
+        G_ol = min(M_ol, G)
         pred_max_steps_raw = int(getattr(self.finetune_config, "ocsc_pred_max_steps", 4))
         pred_max_steps: int | None = pred_max_steps_raw if pred_max_steps_raw > 0 else None
         loss_type = str(getattr(self.finetune_config, "ocsc_loss_type", "l2"))
@@ -1821,8 +1833,13 @@ class SMARTFlow(LightningModule):
         use_mmd = bool(getattr(self.finetune_config, "ocsc_use_mmd", True))
         if _shared_ol and use_mmd:
             log.warning(
-                f"[ocsc_ft] G_ol={G_ol} < G={G}: forcing use_mmd=False "
+                f"[ocsc_ft] M={M_ol} < G={G}: forcing use_mmd=False "
                 f"(single OL sample → no distribution to match)"
+            )
+            use_mmd = False
+        if _nearest_match and use_mmd:
+            log.warning(
+                f"[ocsc_ft] ocsc_ol_nearest_match=True: forcing use_mmd=False (paired L2 with argmin target)"
             )
             use_mmd = False
         # ocsc_gt_target=True: open-loop sample 대신 GT 궤적을 target으로 사용.
@@ -1835,6 +1852,11 @@ class SMARTFlow(LightningModule):
         # 각 anchor에서 active_hidden으로 GT 궤적에 대한 FM loss를 계산해 함께 backward.
         fm_reg_lambda = float(self.finetune_config.ocsc_fm_reg_lambda)
         sequential = bool(getattr(self.finetune_config, "bptt_sequential_rollouts", False))
+        if _nearest_match and sequential:
+            log.warning(
+                "[ocsc_ft] nearest_match + sequential 조합은 미구현 — sequential=False 강제."
+            )
+            sequential = False
         use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
         warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
         _last_coarse_only = bool(getattr(self.finetune_config, "bptt_last_coarse_only", False))
@@ -2141,8 +2163,10 @@ class SMARTFlow(LightningModule):
                         _agent_enc.flow_decoder = self.ref_flow_decoder
                     with torch.no_grad():
                         ol_norms: list[Tensor] = []
-                        # shared_tapes 는 CL rollout 용으로 항상 G 개. ol_norms 는 G_ol 개만 sample.
-                        # _shared_ol=True 면 G_ol=1: 모든 CL 은 ol_norms[0] 과 비교 (broadcast).
+                        # shared_tapes 는 CL rollout 용으로 항상 G 개. ol_norms 는 M_ol 개 sample.
+                        # M_ol < G (_shared_ol): G_ol=1 broadcast.
+                        # M_ol = G: 기존 paired.
+                        # M_ol > G + nearest_match: 추가 (M_ol - G) 개 OL-only sample 생성 (CL 과 noise 공유 안 함).
                         for g in range(G):
                             _seeds_g = self._get_closed_loop_scenario_seeds(
                                 scenario_ids=data["scenario_id"],
@@ -2167,6 +2191,30 @@ class SMARTFlow(LightningModule):
                                     sampling_noise=self.eval_sampling_noise,
                                     x_init_override=x_init_ol,
                                 ))
+                        # OL-only extra samples (M_ol > G): CL 과 noise 공유 안 하고 별도 seed.
+                        for m in range(G, M_ol):
+                            _seeds_m = self._get_closed_loop_scenario_seeds(
+                                scenario_ids=data["scenario_id"],
+                                rollout_idx=m,
+                                device=active_hidden.device,
+                            )
+                            tape_m = _agent_enc._build_rollout_noise_tape(
+                                num_agent=_n_agent_full,
+                                tape_steps=_tape_steps,
+                                device=active_hidden.device,
+                                dtype=active_hidden.dtype,
+                                sampling_noise=self.eval_sampling_noise,
+                                scenario_sampling_seeds=_seeds_m,
+                                agent_batch=tokenized_agent_anchor["batch"],
+                                share_noise_across_time=False,
+                            )
+                            x_init_ol = tape_m[active_mask, :_sample_win, :].clone()
+                            ol_norms.append(_agent_enc._sample_open_loop_future_from_hidden(
+                                anchor_hidden_valid=active_hidden,
+                                sampling_noise=self.eval_sampling_noise,
+                                x_init_override=x_init_ol,
+                            ))
+                            del tape_m
                     if _use_ref:
                         _agent_enc.flow_decoder = _orig_fd
 
@@ -2384,13 +2432,34 @@ class SMARTFlow(LightningModule):
                             pos_weight=pos_w, heading_weight=heading_w,
                         )
                     else:
-                        anchor_loss = torch.stack([
-                            _consistency_loss(
-                                _slice_consistency_suffix(cl_norms[g]),
-                                _slice_consistency_suffix(ol_norms[0 if _shared_ol else g]),
-                            )
-                            for g in range(G)
-                        ]).mean()
+                        cl_sliced_pl = [_slice_consistency_suffix(cl_norms[g]) for g in range(G)]
+                        if _nearest_match:
+                            # 각 CL g 에 대해 M_ol 개 OL 중 per-anchor flat L2 거리 최소를 선택.
+                            ol_sliced_pl = [_slice_consistency_suffix(ol_norms[m]) for m in range(M_ol)]
+                            T_min_nm = min(cl_sliced_pl[0].shape[-2], ol_sliced_pl[0].shape[-2])
+                            with torch.no_grad():
+                                cl_stk_nm = torch.stack(
+                                    [c[:, :T_min_nm, :] for c in cl_sliced_pl], dim=0
+                                ).detach()  # [G, N_active, T, F]
+                                ol_stk_nm = torch.stack(
+                                    [o[:, :T_min_nm, :] for o in ol_sliced_pl], dim=0
+                                )  # [M, N_active, T, F]
+                                # [G, M] flat L2² distance
+                                _d2_nm = ((cl_stk_nm.unsqueeze(1) - ol_stk_nm.unsqueeze(0)) ** 2).flatten(2).sum(-1)
+                                m_star_nm = _d2_nm.argmin(dim=1).tolist()
+                            del cl_stk_nm, ol_stk_nm, _d2_nm
+                            anchor_loss = torch.stack([
+                                _consistency_loss(cl_sliced_pl[g], ol_sliced_pl[int(m_star_nm[g])])
+                                for g in range(G)
+                            ]).mean()
+                        else:
+                            anchor_loss = torch.stack([
+                                _consistency_loss(
+                                    cl_sliced_pl[g],
+                                    _slice_consistency_suffix(ol_norms[0 if _shared_ol else g]),
+                                )
+                                for g in range(G)
+                            ]).mean()
                     total_loss_accum += anchor_loss.item()
                     (anchor_loss / n_anchors_total).backward()
 

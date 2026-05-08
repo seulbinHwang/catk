@@ -134,10 +134,14 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-0}"
 
 # ── OCSC 파라미터 ──────────────────────────────────────────────────────────
 OCSC_N_ROLLOUTS="${OCSC_N_ROLLOUTS:-4}"
-# OCSC_N_OL_ROLLOUTS: open-loop sample 개수.
-#   -1 (default): G_ol = OCSC_N_ROLLOUTS (paired).
+# OCSC_N_OL_ROLLOUTS: open-loop sample 개수 (M).
+#   -1 (default): M = OCSC_N_ROLLOUTS (= G, paired).
 #    1          : single-OL broadcast (모든 CL 이 동일 OL 과 paired L2; use_mmd 자동 false).
+#    M (>G) + OCSC_OL_NEAREST_MATCH=true: 각 CL g 마다 M 개 OL 중 L2 최소를 target.
 OCSC_N_OL_ROLLOUTS="${OCSC_N_OL_ROLLOUTS:--1}"
+# OCSC_OL_NEAREST_MATCH: true → 각 CL g 별로 M 개 OL 중 per-anchor flat L2 최소를 paired L2 target.
+#   use_mmd 자동 false 강제. M>=G 필요 (그 외는 비활성).
+OCSC_OL_NEAREST_MATCH="${OCSC_OL_NEAREST_MATCH:-false}"
 # OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-smooth_l1}"
 OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
 OCSC_USE_MMD="${OCSC_USE_MMD:-false}"
@@ -312,6 +316,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.flow_reg_lambda="${FLOW_REG_LAMBDA}" \
   model.model_config.finetune.ocsc_n_rollouts="${OCSC_N_ROLLOUTS}" \
   model.model_config.finetune.ocsc_n_ol_rollouts="${OCSC_N_OL_ROLLOUTS}" \
+  model.model_config.finetune.ocsc_ol_nearest_match="${OCSC_OL_NEAREST_MATCH}" \
   model.model_config.finetune.ocsc_loss_type="${OCSC_LOSS_TYPE}" \
   model.model_config.finetune.ocsc_use_mmd="${OCSC_USE_MMD}" \
   model.model_config.finetune.ocsc_anchor_stride="${OCSC_ANCHOR_STRIDE}" \

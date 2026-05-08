@@ -39,9 +39,13 @@ model:
       # ── OCSC 핵심 파라미터 ─────────────────────────────────────────────
       # G: 시나리오당 closed-loop rollout 수 (bptt_n_rollouts 와 동일 개념)
       ocsc_n_rollouts: 2
-      # G_ol: open-loop sample 개수. -1 (기본) = G; 1 = single-OL broadcast (모든 CL 이 동일 OL 과 paired L2).
-      # ocsc_use_mmd 와 함께 G_ol<G 면 use_mmd 자동으로 false 강제.
+      # M (open-loop sample 개수): -1 (기본) = G; 1 = single-OL broadcast.
+      # M > G + ocsc_ol_nearest_match=true → 각 CL g 마다 M 개 OL 중 L2 최소를 paired L2 target.
+      # ocsc_use_mmd 와 함께 M<G 또는 nearest_match=true 면 use_mmd 자동으로 false 강제.
       ocsc_n_ol_rollouts: -1
+      # True → CL g 별로 M 개 OL 중 per-anchor flat L2 거리 최소 (argmin) 를 paired L2 target.
+      # use_mmd 자동 false 강제. M>=G 필요 (M<G 면 자동 비활성).
+      ocsc_ol_nearest_match: false
       # anchor stride: 매 N번째 2Hz step만 anchor로 사용
       # stride=4 → [0,4,8,12] 4개, stride=1 → 전체 14개
       ocsc_anchor_stride: 4
