@@ -437,9 +437,18 @@ class TokenProcessor(torch.nn.Module):
             dtype=torch.float32,
         )
         agent_type_masks = self._build_agent_type_masks(agent_type)
-        agent_shape[agent_type_masks["veh"]] = agent_shape.new_tensor([2.0, 4.8])
-        agent_shape[agent_type_masks["ped"]] = agent_shape.new_tensor([1.0, 1.0])
-        agent_shape[agent_type_masks["cyc"]] = agent_shape.new_tensor([1.0, 2.0])
+        # Per-column scalar assignment to dodge a CUDA Indexing.cu internal
+        # assert that fired on `agent_shape[mask] = scalar_broadcast_tensor`
+        # in the OCSC training pipeline. Functionally identical to the
+        # broadcast assignment.
+        for key, (width, length) in (
+            ("veh", (2.0, 4.8)),
+            ("ped", (1.0, 1.0)),
+            ("cyc", (1.0, 2.0)),
+        ):
+            mask = agent_type_masks[key].bool()
+            agent_shape[mask, 0] = width
+            agent_shape[mask, 1] = length
         return agent_shape
 
 
