@@ -213,7 +213,6 @@ class SMARTFlowDecoder(nn.Module):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
         rollout_steps_2hz: int | None = None,
-        detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
     ) -> Dict[str, Tensor]:
         """gradient를 유지한 closed-loop rollout을 실행합니다.
@@ -239,7 +238,6 @@ class SMARTFlowDecoder(nn.Module):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             rollout_steps_2hz=rollout_steps_2hz,
-            detach_block_transition=detach_block_transition,
             use_stop_motion=use_stop_motion,
         )
 
