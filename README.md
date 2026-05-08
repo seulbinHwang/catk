@@ -869,7 +869,7 @@ DRaFT inverse feasibility fine-tuning을 돌릴 때 쓰는 preset과 launcher입
 - preset 파일: `configs/experiment/finetune_draft_flow_v100x3x5.yaml`
 - launcher 파일: `scripts/launch_finetune_draft_v100x3x5_static_pods.py`
 - 총 DDP rank: `5 nodes * 3 GPUs = 15`
-- physics 설정: `soft_limit_ratio=0.8`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=false`
+- physics 설정: `soft_limit_ratio=0.9`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=true`
 - DRaFT weight: `draft.max_weight=0.15`
 - 기본 per-GPU `train_batch_size=24`, `val_batch_size=2`
 
@@ -889,7 +889,7 @@ python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
 ```bash
 python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
   --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
-  --task-name flow_finetune_draft_v100x3x5_newckpt_bs24
+  --task-name flow_finetune_draft_v100x3x5_bs24_soft09_topk20_commit1_slip
 ```
 
 checkpoint가 아직 pod 안에 없고 W&B artifact에서 받아야 한다면 아래처럼 full name을 넘기면 됩니다.
@@ -899,7 +899,7 @@ python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
   --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
   --wandb-artifact entity/project/artifact-name:v1 \
   --artifact-download-dir /workspace/path/to/new_checkpoint/artifact \
-  --task-name flow_finetune_draft_v100x3x5_newckpt_bs24
+  --task-name flow_finetune_draft_v100x3x5_bs24_soft09_topk20_commit1_slip
 ```
 
 이미 떠 있는 이 launcher의 tmux 세션만 종료:
