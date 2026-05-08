@@ -116,15 +116,7 @@ class MultiDataModule(LightningDataModule):
         """
         if train_raw_dir is not None:
             self.train_raw_dir = str(train_raw_dir)
-        # OCSC fine-tuning 은 dataset[i] 에 tfrecord_path / scenario_id 가 필요해
-        # train_tfrecords_splitted 가 set 된 경우 train dataset 에도 tfrecord_dir
-        # 를 넘긴다. 일반 pretraining 은 train_tfrecords_splitted=None 이라
-        # 기존 동작과 동일하다.
-        self.train_dataset = MultiDataset(
-            self.train_raw_dir,
-            self.train_transform,
-            tfrecord_dir=self.train_tfrecords_splitted,
-        )
+        self.train_dataset = MultiDataset(self.train_raw_dir, self.train_transform)
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:

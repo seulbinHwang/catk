@@ -163,12 +163,6 @@ class SMARTFlow(LightningModule):
             # OCSC step 본체가 manual_backward 를 사용하므로 manual optimization
             # 모드로 전환한다. 일반 pretraining/inference 는 그대로 automatic.
             self.automatic_optimization = False
-        if _is_ocsc and bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True)):
-            self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc")
-            self._ocsc_train_hard_rmm_ref: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc_ref")
-        else:
-            self._ocsc_train_hard_rmm = None
-            self._ocsc_train_hard_rmm_ref = None
 
         self.val_open_epoch_metrics = nn.ModuleDict(
             {
@@ -1373,54 +1367,6 @@ class SMARTFlow(LightningModule):
     # ─────────────────────────────────────────────────────────────────────────
 
 
-    def _compute_ocsc_train_hard_rmm(
-        self,
-        scenario_files: list,
-        agent_ids: Tensor,
-        agent_batch: Tensor,
-        traj_list: list,   # G tensors of [n_agents, 80, 2]  ← 반드시 8초(80 step)
-        z_list: list,      # G tensors of [n_agents, 80]
-        head_list: list,   # G tensors of [n_agents, 80]
-        metric: "HardSimAgentsMetrics | None" = None,
-    ) -> float | None:
-        """G개의 8초 detached 궤적으로 HardRMM(WOSAC official 기준)을 계산합니다.
-
-        Args:
-            metric: 사용할 HardSimAgentsMetrics 인스턴스.
-                None 이면 self._ocsc_train_hard_rmm 을 사용합니다 (current model).
-
-        Returns:
-            float | None: 계산된 HardRMM 값. 실패 시 None.
-        """
-        _metric = metric if metric is not None else self._ocsc_train_hard_rmm
-        if _metric is None or len(traj_list) == 0:
-            return None
-        try:
-            # Stack into [n_agents, G, T, x]
-            pred_traj = torch.stack(traj_list, dim=1)    # [n_agents, G, 80, 2]
-            pred_z    = torch.stack(z_list, dim=1)       # [n_agents, G, 80]
-            pred_head = torch.stack(head_list, dim=1)    # [n_agents, G, 80]
-
-            with torch.no_grad():
-                _metric.update_from_prediction_tensors(
-                    scenario_files=list(scenario_files),
-                    agent_id=agent_ids,
-                    agent_batch=agent_batch,
-                    pred_traj=pred_traj,
-                    pred_z=pred_z,
-                    pred_head=pred_head,
-                )
-            result_dict = _metric.compute()
-            _metric.reset()
-            # _metric_key는 prefix에서 파생되므로 current/ref 모두 정확히 일치
-            key = getattr(_metric, "_metric_key", "train_ocsc/sim_agents_2025/realism_meta_metric")
-            val = result_dict.get(key)
-            if val is not None:
-                return float(val.item() if isinstance(val, Tensor) else val)
-        except Exception as exc:
-            log.warning(f"[ocsc_ft] HardRMM computation failed: {exc}")
-        return None
-
     def _run_flow_ocsc_ft_step(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -1503,8 +1449,6 @@ class SMARTFlow(LightningModule):
         _grad_clip  = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
         _last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
         _last_n_coarse = int(getattr(self.finetune_config, "bptt_last_n_coarse_steps", 0))
-        eval_hard_rmm = bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
-        eval_hard_rmm_interval = max(1, int(getattr(self.finetune_config, "ocsc_eval_hard_rmm_interval", 1)))
         _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
         # consistency 구간을 실제 grad가 살아있는 10Hz suffix로 제한할지 여부.
         # bptt_last_coarse_only=true면 warm_coarse=pred_max_steps-1 이므로 마지막 coarse step만 남긴다.
@@ -1516,40 +1460,11 @@ class SMARTFlow(LightningModule):
             _consistency_tail_10hz_steps = _grad_coarse * _shift
             _consistency_tail_2hz_steps = _grad_coarse
 
-        # ── 데이터 검증 ──────────────────────────────────────────────────────
-        # tfrecord_path / scenario_id / agent ids 는 _compute_ocsc_train_hard_rmm
-        # (= train 시 HardRMM 모니터링) 에서만 쓰인다. ocsc_eval_hard_rmm=false 면
-        # 모니터링 자체가 꺼져 있어 이 키들이 없어도 학습엔 영향이 없다. 따라서
-        # 모니터링이 켜져 있을 때만 검증을 강제한다.
+        # train 시 HardRMM 모니터링 path 는 OCSC_clean_v2 에서 제거됨
+        # (사용자 지시: tfrecord_path / scenario_id / eval_hard_rmm 모두 미사용).
         if data is None:
             raise ValueError("ocsc_ft requires `data` dict.")
-        _need_scenario_meta = bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
-        if _need_scenario_meta:
-            if "tfrecord_path" not in data or "scenario_id" not in data:
-                raise KeyError(
-                    "ocsc_ft with ocsc_eval_hard_rmm=true requires "
-                    "data['tfrecord_path'] and data['scenario_id']."
-                )
-        agent_ids = None
-        try:
-            agent_ids = data["agent"]["id"]
-        except Exception:
-            pass
-        if agent_ids is None:
-            try:
-                agent_ids = data["id"]
-            except Exception:
-                pass
-        if _need_scenario_meta and agent_ids is None:
-            raise KeyError(
-                "ocsc_ft with ocsc_eval_hard_rmm=true requires agent object ids: "
-                "data['agent']['id'] (or data['id'])."
-            )
-        if agent_ids is not None and int(agent_ids.shape[0]) != int(tokenized_agent["batch"].shape[0]):
-            raise ValueError("agent id count mismatch")
-
-        tfrecord_paths = data["tfrecord_path"]
-        agent_batch    = tokenized_agent["batch"]
+        agent_batch = tokenized_agent["batch"]
 
         # ── 1. Encode map (no_grad; encoder frozen) ──────────────────────────
         with torch.no_grad():
@@ -2175,89 +2090,6 @@ class SMARTFlow(LightningModule):
         # ── 5. Hard RMM monitoring (WOSAC official 8초, no_grad, configurable interval) ──
         # 훈련 rollout 은 2초(max_steps=4)여서 WOSAC 기준에 맞지 않는다.
         # 별도로 no_grad full rollout(max_steps=None → 16 coarse step = 8초)을 수행한다.
-        _global_step = int(getattr(self, "global_step", 0))
-        if (
-            eval_hard_rmm
-            and self._ocsc_train_hard_rmm is not None
-            and (_global_step % eval_hard_rmm_interval == 0)
-        ):
-            # ── 5a. Current model 8초 rollout ─────────────────────────────────
-            with torch.no_grad():
-                rmm_traj_all, rmm_z_all, rmm_head_all, _ = self._run_parallel_rollout_chunk(
-                    data=data,
-                    tokenized_agent=tokenized_agent,
-                    map_feature=map_feature,
-                    rollout_cache=rollout_cache,
-                    rollout_indices=list(range(G)),
-                    return_anchor_hidden=True,
-                    full_grad=False,
-                    max_steps=None,   # full 16 coarse step = 8초 = 80 timestep
-                )
-            # rmm_traj_all: [n_agents, G, 80, 2]
-            _rmm_traj_list = [rmm_traj_all[:, g] for g in range(G)]
-            _rmm_z_list    = [rmm_z_all[:, g]    for g in range(G)]
-            _rmm_head_list = [rmm_head_all[:, g] for g in range(G)]
-
-            hard_rmm_val = self._compute_ocsc_train_hard_rmm(
-                scenario_files=list(tfrecord_paths),
-                agent_ids=agent_ids,
-                agent_batch=agent_batch,
-                traj_list=_rmm_traj_list,
-                z_list=_rmm_z_list,
-                head_list=_rmm_head_list,
-                metric=self._ocsc_train_hard_rmm,
-            )
-            if hard_rmm_val is not None:
-                ret["train/hard_rmm"] = torch.tensor(
-                    hard_rmm_val, dtype=torch.float32, device=agent_batch.device
-                )
-                log.info(f"[ocsc] step={_global_step} hard_rmm={hard_rmm_val:.4f}")
-
-            # ── 5b. Reference model 8초 rollout (delta 계산) ──────────────────
-            if self.ref_flow_decoder is not None and self._ocsc_train_hard_rmm_ref is not None:
-                _agent_enc.flow_decoder = self.ref_flow_decoder
-                try:
-                    with torch.no_grad():
-                        rmm_ref_traj, rmm_ref_z, rmm_ref_head, _ = self._run_parallel_rollout_chunk(
-                            data=data,
-                            tokenized_agent=tokenized_agent,
-                            map_feature=map_feature,
-                            rollout_cache=rollout_cache,
-                            rollout_indices=list(range(G)),
-                            return_anchor_hidden=True,
-                            full_grad=False,
-                            max_steps=None,   # 8초
-                        )
-                finally:
-                    _agent_enc.flow_decoder = _orig_fd  # current model 복원
-
-                _rmm_ref_traj_list = [rmm_ref_traj[:, g] for g in range(G)]
-                _rmm_ref_z_list    = [rmm_ref_z[:, g]    for g in range(G)]
-                _rmm_ref_head_list = [rmm_ref_head[:, g] for g in range(G)]
-
-                hard_rmm_ref_val = self._compute_ocsc_train_hard_rmm(
-                    scenario_files=list(tfrecord_paths),
-                    agent_ids=agent_ids,
-                    agent_batch=agent_batch,
-                    traj_list=_rmm_ref_traj_list,
-                    z_list=_rmm_ref_z_list,
-                    head_list=_rmm_ref_head_list,
-                    metric=self._ocsc_train_hard_rmm_ref,
-                )
-                if hard_rmm_ref_val is not None:
-                    ret["train/hard_rmm_ref"] = torch.tensor(
-                        hard_rmm_ref_val, dtype=torch.float32, device=agent_batch.device
-                    )
-                    if hard_rmm_val is not None:
-                        delta = hard_rmm_val - hard_rmm_ref_val
-                        ret["train/hard_rmm_delta"] = torch.tensor(
-                            delta, dtype=torch.float32, device=agent_batch.device
-                        )
-                        log.info(
-                            f"[ocsc] step={_global_step} "
-                            f"hard_rmm={hard_rmm_val:.4f} ref={hard_rmm_ref_val:.4f} delta={delta:+.4f}"
-                        )
-
         # DDP: 모든 trainable param을 dummy graph에 연결해 bucket reducer가 정상 작동하도록 함.
         # no_sync 컨텍스트 내에서 .backward()로 누적한 grad를 training_step에서
         # manual_backward(_ddp_dummy)로 최종 all-reduce 한 번에 동기화.
