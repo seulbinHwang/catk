@@ -17,11 +17,17 @@ def build_agent_type_masks(agent_type: Tensor) -> Dict[str, Tensor]:
         Dict[str, Tensor]:
             ``veh``, ``ped``, ``cyc`` 키를 가지는 bool 마스크 사전입니다.
             각 마스크 shape은 ``[n_agent]`` 입니다.
+
+    Notes:
+        Waymo cache 에서 ``agent_type`` 은 종종 ``uint8`` 로 저장되어 있어
+        ``agent_type == 0`` 결과도 ``uint8`` 이 됩니다. 최신 PyTorch 는 uint8
+        tensor 를 indexing mask 로 쓰는 것을 deprecate 했고 CUDA 에서 internal
+        assertion 으로 깨질 수 있어, 명시적으로 ``.bool()`` 로 캐스트합니다.
     """
     return {
-        "veh": agent_type == 0,
-        "ped": agent_type == 1,
-        "cyc": agent_type == 2,
+        "veh": (agent_type == 0).bool(),
+        "ped": (agent_type == 1).bool(),
+        "cyc": (agent_type == 2).bool(),
     }
 
 
