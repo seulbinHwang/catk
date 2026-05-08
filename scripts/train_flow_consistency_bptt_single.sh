@@ -266,9 +266,10 @@ if [ "${NUM_WORKERS}" -gt 0 ]; then
 fi
 
 PORT="$(get_free_port)"
+ACTION="${ACTION:-finetune}"
 torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_endpoint="127.0.0.1:${PORT}" -m src.run \
   experiment="${MY_EXPERIMENT}" \
-  action=finetune \
+  action="${ACTION}" \
   task_name="${MY_TASK_NAME}" \
   ckpt_path="${CKPT_PATH}" \
   paths.cache_root="${CACHE_ROOT}" \
