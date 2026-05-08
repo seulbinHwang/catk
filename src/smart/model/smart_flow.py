@@ -792,13 +792,21 @@ class SMARTFlow(LightningModule):
 
     def _run_parallel_rollout_chunk(
         self,
-        rollout_encoder: SMARTFlowDecoder,
-        data,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        rollout_cache: Dict[str, object],
-        rollout_indices: Sequence[int],
+        rollout_encoder: SMARTFlowDecoder | None = None,
+        data=None,
+        tokenized_agent: Dict[str, Tensor] | None = None,
+        map_feature: Dict[str, Tensor] | None = None,
+        rollout_cache: Dict[str, object] | None = None,
+        rollout_indices: Sequence[int] = (),
         return_flow_2s_preview: bool = False,
+        # OCSC step 이 OCSC_clean 시그니처로 호출하므로 호환을 위해 받는 인자들.
+        # 현재 OCSC_clean_v2 에서는 wire 되지 않고 단순 받기만 한다 (받기 무시).
+        return_anchor_hidden: bool = False,
+        full_grad: bool = False,
+        max_steps: int | None = None,
+        warm_coarse_steps: int = 0,
+        share_noise_across_time: bool = False,
+        noise_tape_override: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Dict[str, Tensor] | None]:
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
@@ -821,6 +829,9 @@ class SMARTFlow(LightningModule):
                 ``[n_agent, n_rollout_chunk, 80]`` 입니다.
                 마지막 값은 선택적 2초 preview 사전입니다.
         """
+        # OCSC step 이 rollout_encoder 를 안 넘기는 경우 self.encoder 로 fallback.
+        if rollout_encoder is None:
+            rollout_encoder = self.encoder
         chunk_size = int(len(rollout_indices))
         scenario_device = tokenized_agent["batch"].device
         if chunk_size == 1:
