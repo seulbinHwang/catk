@@ -38,7 +38,7 @@ model:
       loss_enabled: true
       max_weight: 0.15
       physics:
-        use_slip_penalty: false
+        use_slip_penalty: true
         commit_loss_weight: 1.0
         soft_limit_ratio: 1.0
         topk_violation_k: 20
