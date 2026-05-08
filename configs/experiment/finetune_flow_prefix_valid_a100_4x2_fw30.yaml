@@ -1,0 +1,15 @@
+# @package _global_
+
+# Prefix-valid flow fine-tuning preset for 2 nodes x 4 A100 80GB when the
+# starting checkpoint was trained with decoder.flow_window_steps=30.
+
+defaults:
+  - finetune_flow_prefix_valid_a100_4x2
+  - _self_
+
+model:
+  model_config:
+    decoder:
+      flow_window_steps: 30
+    token_processor:
+      use_prefix_valid_future_loss_mask: true

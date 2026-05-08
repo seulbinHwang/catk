@@ -436,6 +436,25 @@ torchrun \
 
 두 preset 모두 `max_epochs=16`, `lr=1e-4`, `lr_warmup_steps=1`, `gradient_clip_val=1.0`, `val_open_loop=true`, `val_closed_loop=true`를 사용합니다. `decoder.flow_window_steps`는 checkpoint와 같은 값을 써야 합니다. 2초 pretrained checkpoint면 기본값 `20`을 그대로 둡니다.
 
+#### testa/testaa A100x4x2 FW30 prefix-valid fine tuning
+
+`flow_semi_continuous_pretrain_fw30_3s_h100x4x2_bs26_self_forcing_w_road_20260505_222745` 계열처럼 `decoder.flow_window_steps=30`으로 학습된 checkpoint는 fine tuning도 같은 horizon으로 실행해야 합니다. `testa`, `testaa` 2개 A100 4GPU pod에서는 아래 launcher를 씁니다.
+
+```bash
+python scripts/launch_finetune_flow_prefix_valid_a100x4x2_fw30_static_pods.py --replace
+```
+
+이 launcher는 W&B artifact `jksg01019-naver-labs/SMART-FLOW/epoch-last-swkp98ig:v64`에서 `epoch_last.ckpt`를 받아 각 pod의 `/workspace/fw_30_pretrain/epoch_last.ckpt`에 저장한 뒤 시작합니다. `decoder.flow_window_steps=30`, `token_processor.use_prefix_valid_future_loss_mask=true`, `lr=1e-4`, `train_batch_size=26`이 기본값입니다.
+
+CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 최신 `epoch_last.ckpt`를 rank 0에서 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-prefix-valid-a100x4x2-fw30
+kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-prefix-valid-a100x4x2-fw30
+```
+
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
 
 - 학습 중 validation은 `trainer.check_val_every_n_epoch` 마다 실행됩니다.
