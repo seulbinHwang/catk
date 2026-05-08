@@ -59,6 +59,11 @@ class SMARTFlow(LightningModule):
         self.lr_warmup_steps = model_config.lr_warmup_steps
         self.lr_total_steps = model_config.lr_total_steps
         self.lr_min_ratio = model_config.lr_min_ratio
+        self.weight_decay = float(getattr(model_config, "weight_decay", 0.0))
+        # OCSC 는 step 단위 cosine schedule 을 가정 (manual_optimization 모드).
+        self.lr_scheduler_unit = str(getattr(model_config, "lr_scheduler_unit", "epoch"))
+        if self.lr_scheduler_unit not in {"epoch", "step"}:
+            raise ValueError(f"Unsupported lr_scheduler_unit: {self.lr_scheduler_unit}")
         self.num_historical_steps = model_config.decoder.num_historical_steps
         self.flow_window_steps = int(getattr(model_config.decoder, "flow_window_steps", 20))
         self.flow_horizon_tag = format_flow_horizon_tag(self.flow_window_steps)
@@ -2433,9 +2438,30 @@ class SMARTFlow(LightningModule):
             if self.sim_agents_submission.is_active:
                 self.sim_agents_submission.save_sub_file()
 
+    def _resolve_lr_total_steps(self) -> int:
+        """현재 스케줄 단위에 맞는 전체 step 수를 정합니다."""
+        if self.lr_total_steps > 0:
+            return int(self.lr_total_steps)
+        if self.lr_scheduler_unit == "step" and self.trainer is not None:
+            try:
+                n_batches = len(self.trainer.train_dataloader)
+            except Exception:
+                n_batches = 0
+            if n_batches > 0:
+                return max(1, n_batches * max(1, int(self.trainer.max_epochs)))
+            estimated_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0))
+            if estimated_steps > 0:
+                return estimated_steps
+        if self.trainer is not None:
+            return max(int(self.trainer.max_epochs), 1)
+        return 1
+
     def configure_optimizers(self):
-        def lr_lambda(_current_step):
-            current_step = self.current_epoch + 1
+        def lr_lambda(current_index: int) -> float:
+            if not hasattr(self, "_cached_lr_total_steps"):
+                self._cached_lr_total_steps = self._resolve_lr_total_steps()
+            total_steps = self._cached_lr_total_steps
+            current_step = current_index + 1
             if current_step < self.lr_warmup_steps:
                 return self.lr_min_ratio + (1.0 - self.lr_min_ratio) * current_step / max(self.lr_warmup_steps, 1)
             return self.lr_min_ratio + 0.5 * (1.0 - self.lr_min_ratio) * (
@@ -2443,14 +2469,28 @@ class SMARTFlow(LightningModule):
                 + math.cos(
                     math.pi * min(
                         1.0,
-                        (current_step - self.lr_warmup_steps) / max(self.lr_total_steps - self.lr_warmup_steps, 1),
+                        (current_step - self.lr_warmup_steps) / max(total_steps - self.lr_warmup_steps, 1),
                     )
                 )
             )
 
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable parameters were found.")
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
-        return [optimizer], [lr_scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": lr_scheduler,
+                "interval": self.lr_scheduler_unit,
+                "frequency": 1,
+            },
+        }
 
     def test_step(self, data, batch_idx):
         eval_generator = self.encoder
