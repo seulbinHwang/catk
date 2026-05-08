@@ -103,6 +103,74 @@ def _hard_meta_metric_worker(
     return out
 
 
+def _hard_g_features_worker(
+    g_idx: int,
+    scenario_files: List[str],
+    preds_g_cpu: List[Dict[str, Any]],
+    disk_dir: str,
+    challenge,
+):
+    """Worker for HardSimAgentsMetrics G-loop.
+
+    한 g (rollout index) 에 대해:
+      1. scenario protobuf 들을 disk cache 에서 load (없으면 tfrecord 재파싱).
+      2. ``preds_g_cpu`` (CPU dict list) 로부터 ``PredictedSimTrajectories`` 복원.
+      3. ``compute_metric_features_batched_scenes`` 호출해 sim feature 계산.
+
+    Returns
+    -------
+    list of ``MetricFeaturesTorch``, length n_scenarios, all-CPU tensors.
+    """
+    import os as _os
+    import pickle as _pickle
+    import tensorflow as tf
+    import torch as _torch
+    from waymo_open_dataset.protos import scenario_pb2
+    from src.smart.metrics.wosac_metric_features_torch.metric_features_torch_differentiable import (
+        PredictedSimTrajectories,
+        compute_metric_features_batched_scenes,
+    )
+
+    tf.config.set_visible_devices([], "GPU")
+
+    scenarios = []
+    for sf in scenario_files:
+        bn = _os.path.basename(sf).replace(_os.sep, "_")
+        dp = _os.path.join(disk_dir, f"{bn}.pkl")
+        sc = None
+        if _os.path.exists(dp):
+            try:
+                with open(dp, "rb") as _f:
+                    sc_bytes, _ = _pickle.load(_f)
+                sc = scenario_pb2.Scenario()
+                sc.ParseFromString(sc_bytes)
+            except Exception:
+                sc = None
+        if sc is None:
+            sc = scenario_pb2.Scenario()
+            for tfdata in tf.data.TFRecordDataset([sf], compression_type=""):
+                sc.ParseFromString(bytes(tfdata.numpy()))
+                break
+        scenarios.append(sc)
+
+    preds_g = [
+        PredictedSimTrajectories(
+            object_id=p["object_id"],
+            center_x=p["center_x"],
+            center_y=p["center_y"],
+            center_z=p["center_z"],
+            heading=p["heading"],
+            valid=p["valid"],
+        )
+        for p in preds_g_cpu
+    ]
+
+    feat_list_g = compute_metric_features_batched_scenes(
+        scenarios=scenarios, preds=preds_g, surrogate=None,
+    )
+    return feat_list_g
+
+
 def _sim_agents_worker(
     config_bytes: bytes,
     scenario_file: str,
@@ -579,7 +647,11 @@ class HardSimAgentsMetrics:
                 lf = compute_metric_features(sc, log_joint, challenge_type=_challenge, use_log_validity=True)
                 log_feat_dicts.append(lf.as_dict())
 
-        # Sim features: for each rollout g, batch across all scenarios
+        # Sim features: for each rollout g, batch across all scenarios.
+        # ── 분산 경로: pool 활용 시 G 개 task 를 forkserver worker 에 분배.
+        # 각 worker 가 자체적으로 (cache 에서) scenario load + CPU 에서
+        # compute_metric_features_batched_scenes 실행. main thread 는 GPU
+        # forward 와 overlap 가능. preds_g 는 작은 텐서 .cpu() copy 로 ipc.
         sim_feat_per_g: List[list] = []  # G lists, each of length n_scenarios
         _PROFILE = bool(int(os.environ.get("WOSAC_PROFILE", "0")))
         if _PROFILE:
@@ -587,33 +659,64 @@ class HardSimAgentsMetrics:
             torch.cuda.synchronize() if torch.cuda.is_available() else None
             _t0 = _time.perf_counter()
             _per_g_times: list = []
-        with torch.no_grad():
+        _g_use_pool = (
+            pool is not None
+            and G > 1
+            and bool(int(os.environ.get("WOSAC_HARD_G_POOL", "1")))
+        )
+        if _g_use_pool:
+            # Pre-build per-g CPU dict args (small tensors).
+            preds_per_g_cpu: list = []
             for g in range(G):
-                if _PROFILE:
-                    torch.cuda.synchronize() if torch.cuda.is_available() else None
-                    _g_start = _time.perf_counter()
-                preds_g = [
-                    PredictedSimTrajectories(
-                        object_id=id_splits[i].cpu(),
-                        center_x=traj_splits[i][:, g, :, 0],
-                        center_y=traj_splits[i][:, g, :, 1],
-                        center_z=z_splits[i][:, g, :],
-                        heading=head_splits[i][:, g, :],
-                        valid=torch.ones(sizes[i], T_pred, dtype=torch.bool, device=device),
+                preds_g_list: list = []
+                for i in range(n_scenarios):
+                    preds_g_list.append({
+                        "object_id": id_splits[i].detach().cpu().clone(),
+                        "center_x": traj_splits[i][:, g, :, 0].detach().cpu().clone(),
+                        "center_y": traj_splits[i][:, g, :, 1].detach().cpu().clone(),
+                        "center_z": z_splits[i][:, g, :].detach().cpu().clone(),
+                        "heading": head_splits[i][:, g, :].detach().cpu().clone(),
+                        "valid": torch.ones(sizes[i], T_pred, dtype=torch.bool),
+                    })
+                preds_per_g_cpu.append(preds_g_list)
+            _disk_dir_g = HardSimAgentsMetrics._disk_cache_dir
+            os.makedirs(_disk_dir_g, exist_ok=True)
+            _g_args = [
+                (g, scenario_files, preds_per_g_cpu[g], _disk_dir_g, _challenge)
+                for g in range(G)
+            ]
+            _g_results = pool.starmap(_hard_g_features_worker, _g_args)
+            sim_feat_per_g = list(_g_results)  # list (G,) of list (n_scenarios,)
+        else:
+            with torch.no_grad():
+                for g in range(G):
+                    if _PROFILE:
+                        torch.cuda.synchronize() if torch.cuda.is_available() else None
+                        _g_start = _time.perf_counter()
+                    preds_g = [
+                        PredictedSimTrajectories(
+                            object_id=id_splits[i].cpu(),
+                            center_x=traj_splits[i][:, g, :, 0],
+                            center_y=traj_splits[i][:, g, :, 1],
+                            center_z=z_splits[i][:, g, :],
+                            heading=head_splits[i][:, g, :],
+                            valid=torch.ones(sizes[i], T_pred, dtype=torch.bool, device=device),
+                        )
+                        for i in range(n_scenarios)
+                    ]
+                    feat_list_g = compute_metric_features_batched_scenes(
+                        scenarios=scenarios, preds=preds_g, surrogate=None,
                     )
-                    for i in range(n_scenarios)
-                ]
-                feat_list_g = compute_metric_features_batched_scenes(
-                    scenarios=scenarios, preds=preds_g, surrogate=None,
-                )
-                sim_feat_per_g.append(feat_list_g)
-                if _PROFILE:
-                    torch.cuda.synchronize() if torch.cuda.is_available() else None
-                    _per_g_times.append(_time.perf_counter() - _g_start)
+                    sim_feat_per_g.append(feat_list_g)
+                    if _PROFILE:
+                        torch.cuda.synchronize() if torch.cuda.is_available() else None
+                        _per_g_times.append(_time.perf_counter() - _g_start)
         if _PROFILE:
             torch.cuda.synchronize() if torch.cuda.is_available() else None
             _t1 = _time.perf_counter()
-            print(f"[hard-rmm-profile] G_loop_total={_t1-_t0:.2f}s mean_per_g={sum(_per_g_times)/len(_per_g_times):.3f}s n_scenes={n_scenarios} G={G}", flush=True)
+            _branch = "pool" if _g_use_pool else "serial"
+            _mean_per_g = (sum(_per_g_times) / len(_per_g_times)) if (not _g_use_pool and _per_g_times) else float("nan")
+            print(f"[hard-rmm-profile] G_loop_total={_t1-_t0:.2f}s branch={_branch} mean_per_g={_mean_per_g:.3f}s n_scenes={n_scenarios} G={G}", flush=True)
 
         # Stack G rollouts per scenario → (G, E_i, T) then batched hard RMM
         sim_feat_dicts: List[dict] = []
