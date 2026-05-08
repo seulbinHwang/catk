@@ -568,6 +568,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         scenario_sampling_seeds: torch.Tensor | None = None,
         agent_batch: torch.Tensor | None = None,
         sampling_noise: object = None,
+        share_noise_across_time: bool = False,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
 
@@ -600,10 +601,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         if num_agent == 0:
             return torch.zeros((0, tape_steps, 4), device=device, dtype=dtype)
 
+        # share_noise_across_time=True 면 시간 축으로 같은 noise 를 broadcast 한다
+        # (OCSC consistency 메커니즘: 동일 시나리오/agent 가 시간에 따라 같은
+        # noise pattern 을 보게 해 closed-loop rollout 비교의 분산을 줄인다).
+        sample_steps = 1 if share_noise_across_time else tape_steps
+
         if scenario_sampling_seeds is not None:
             if agent_batch is None:
                 raise ValueError("scenario별 잡음 테이프를 만들려면 agent_batch가 필요합니다.")
-            noise_tape = torch.empty((num_agent, tape_steps, 4), device=device, dtype=dtype)
+            noise_tape = torch.empty((num_agent, sample_steps, 4), device=device, dtype=dtype)
             scenario_seed_list = scenario_sampling_seeds.detach().cpu().tolist()
             for scenario_idx, scenario_seed in enumerate(scenario_seed_list):
                 scenario_mask = agent_batch == scenario_idx
@@ -613,26 +619,31 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 generator.manual_seed(int(scenario_seed))
                 noise_tape[scenario_mask] = torch.randn(
                     int(scenario_mask.sum().item()),
-                    tape_steps,
+                    sample_steps,
                     4,
                     device=device,
                     dtype=dtype,
                     generator=generator,
                 )
+            if share_noise_across_time and sample_steps != tape_steps:
+                noise_tape = noise_tape.expand(-1, tape_steps, -1).contiguous()
             return noise_tape * noise_scale
 
         generator = None
         if sampling_seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(sampling_seed))
-        return torch.randn(
+        noise_tape = torch.randn(
             num_agent,
-            tape_steps,
+            sample_steps,
             4,
             device=device,
             dtype=dtype,
             generator=generator,
-        ) * noise_scale
+        )
+        if share_noise_across_time and sample_steps != tape_steps:
+            noise_tape = noise_tape.expand(-1, tape_steps, -1).contiguous()
+        return noise_tape * noise_scale
 
     def _encode_context(
         self,
