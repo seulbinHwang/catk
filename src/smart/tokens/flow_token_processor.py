@@ -20,6 +20,7 @@ class FlowTokenProcessor(TokenProcessor):
         map_token_sampling,
         agent_token_sampling,
         flow_window_steps: int = 20,
+        use_prefix_valid_future_loss_mask: bool = False,
     ) -> None:
         super().__init__(
             map_token_file=map_token_file,
@@ -31,6 +32,7 @@ class FlowTokenProcessor(TokenProcessor):
             flow_window_steps=flow_window_steps,
             commit_steps=self.shift,
         )
+        self.use_prefix_valid_future_loss_mask = bool(use_prefix_valid_future_loss_mask)
 
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         """지도 토큰과 에이전트 토큰을 만들고 flow 목표를 붙입니다.
@@ -263,7 +265,7 @@ class FlowTokenProcessor(TokenProcessor):
         return future_loss_mask.all(dim=1)
 
     def _build_anchor_future_loss_mask(self, valid: Tensor, raw_step: int) -> Tensor:
-        """현재 anchor 뒤 전체 flow window가 유효한 경우에만 미래 mask를 만듭니다.
+        """현재 설정에 맞는 미래 loss mask를 만듭니다.
 
         Args:
             valid: 각 agent와 시점의 유효 여부입니다.
@@ -274,27 +276,74 @@ class FlowTokenProcessor(TokenProcessor):
             Tensor:
                 미래 step별 loss 사용 여부입니다.
                 shape은 ``[n_agent, flow_window_steps]`` 입니다.
-                전체 미래 window가 유효한 agent만 모든 step이 ``True`` 입니다.
+        """
+        if self.use_prefix_valid_future_loss_mask:
+            return self._build_prefix_valid_future_loss_mask(valid=valid, raw_step=raw_step)
+        return self._build_full_window_future_loss_mask(valid=valid, raw_step=raw_step)
+
+    def _build_full_window_future_loss_mask(self, valid: Tensor, raw_step: int) -> Tensor:
+        """기존 방식처럼 전체 미래 window가 유효한 경우에만 loss mask를 만듭니다.
+
+        Args:
+            valid: 각 agent와 시점의 유효 여부입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+            raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
+
+        Returns:
+            Tensor:
+                미래 step별 loss 사용 여부입니다.
+                shape은 ``[n_agent, flow_window_steps]`` 입니다.
+                미래 전체가 유효한 agent만 모든 step이 ``True`` 입니다.
         """
         future_start = raw_step + 1
-        # future_mask: [n_agent, flow_window_steps]
-        future_mask = torch.zeros(
+        # future_loss_mask: [n_agent, flow_window_steps]
+        future_loss_mask = torch.zeros(
+            (valid.shape[0], self.flow_window_steps),
+            device=valid.device,
+            dtype=torch.bool,
+        )
+        available_len = min(self.flow_window_steps, max(0, valid.shape[1] - future_start))
+        if available_len != self.flow_window_steps:
+            return future_loss_mask
+
+        # available_future_valid: [n_agent, flow_window_steps]
+        available_future_valid = valid[:, future_start : future_start + available_len].bool()
+        full_future_valid = available_future_valid.all(dim=1)
+        future_loss_mask[full_future_valid] = True
+        return future_loss_mask
+
+    def _build_prefix_valid_future_loss_mask(self, valid: Tensor, raw_step: int) -> Tensor:
+        """가까운 미래부터 연속으로 유효한 구간만 loss mask로 만듭니다.
+
+        Args:
+            valid: 각 agent와 시점의 유효 여부입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+            raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
+
+        Returns:
+            Tensor:
+                미래 step별 loss 사용 여부입니다.
+                shape은 ``[n_agent, flow_window_steps]`` 입니다.
+                ``raw_step + 1``부터 처음 유효하지 않은 step 직전까지만
+                ``True`` 입니다. 첫 미래 step이 유효하지 않으면 전부 ``False`` 입니다.
+        """
+        future_start = raw_step + 1
+        # future_loss_mask: [n_agent, flow_window_steps]
+        future_loss_mask = torch.zeros(
             (valid.shape[0], self.flow_window_steps),
             device=valid.device,
             dtype=torch.bool,
         )
         available_len = min(self.flow_window_steps, max(0, valid.shape[1] - future_start))
         if available_len <= 0:
-            return future_mask
+            return future_loss_mask
 
         # available_future_valid: [n_agent, available_len]
         available_future_valid = valid[:, future_start : future_start + available_len].bool()
-        if available_len != self.flow_window_steps:
-            return future_mask
-
-        full_future_valid = available_future_valid.all(dim=1)
-        future_mask[full_future_valid] = True
-        return future_mask
+        # prefix_valid: [n_agent, available_len]
+        prefix_valid = available_future_valid.to(dtype=torch.long).cumprod(dim=1).bool()
+        future_loss_mask[:, :available_len] = prefix_valid
+        return future_loss_mask
 
     def _build_anchor_clean_norm(
         self,

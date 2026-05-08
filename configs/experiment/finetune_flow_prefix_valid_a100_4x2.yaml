@@ -1,0 +1,28 @@
+# @package _global_
+
+# ============================================================================
+# Prefix-valid flow fine-tuning preset for 2 nodes x 4 A100 80GB.
+#
+# This preset inherits the H100x4 prefix-valid fine-tuning recipe and only pins
+# the distributed layout plus conservative validation batch sizes for 8 ranks.
+# ============================================================================
+
+defaults:
+  - finetune_flow_prefix_valid_h100_4
+  - _self_
+
+trainer:
+  num_nodes: 2
+  devices: 4
+  precision: bf16-mixed
+
+model:
+  model_config:
+    scorer_scene_num: 840
+
+data:
+  train_batch_size: 20
+  val_batch_size: 8
+  test_batch_size: 8
+  num_workers: 4
+  prefetch_factor: 1

@@ -366,14 +366,75 @@ torchrun ... -m src.run \
 ... data.train_use_eval_agent_selection=true
 ```
 
-### 5.1.2 전체 유효 미래 window 학습 방식
+### 5.1.2 미래 GT 유효 길이 기반 학습 target 선택
 
-학습 target은 `model.model_config.decoder.flow_window_steps` 전체 미래 궤적이 모두 유효한 agent-anchor만 사용합니다.
+학습 target 선택은 아래 단일 옵션으로 고릅니다.
 
-- 현재 anchor가 유효하더라도 미래 `flow_window_steps` 중 하나라도 끊기면 학습 후보에서 제외합니다.
-- `flow_train_loss_mask`는 남은 학습 target에 대해 전체 미래 step이 `True`인 mask로 유지됩니다.
-- Flow Matching loss, DRaFT physics loss, self-forced anchor FM loss, 학습 open-loop metric은 모두 전체 유효 미래 window만 봅니다.
-- validation open-loop도 같은 기준으로 전체 `flow_window_steps`가 유효한 anchor만 평가합니다.
+```bash
+model.model_config.token_processor.use_prefix_valid_future_loss_mask=false  # 기존 방식
+model.model_config.token_processor.use_prefix_valid_future_loss_mask=true   # prefix-valid 방식
+```
+
+- `false`이면 기존과 같습니다. 현재 anchor 뒤 `decoder.flow_window_steps` 전체 미래가 모두 유효한 agent-anchor만 학습합니다.
+- `true`이면 현재 anchor 뒤 가장 가까운 미래부터 시작해서, 처음 끊기기 전까지 연속으로 유효한 구간만 학습합니다. 이 구간에만 loss가 들어갑니다.
+- full-valid sample은 `true`에서도 그대로 전체 미래 loss를 받습니다. 새로 추가되는 것은 partial-valid sample뿐입니다.
+- 이 옵션은 `FlowTokenProcessor`에서 학습 target을 만들 때 적용되므로 pretrain, 일반 fine tuning, DRaFT fine tuning, self-forced fine tuning에서 같은 방식으로 동작합니다.
+- README 기준 cache를 그대로 만들었다면 cache 재생성은 필요 없습니다. pkl cache 자체에서 partial-valid agent/anchor를 직접 삭제한 경우에만 cache를 다시 만들어야 합니다.
+
+기존 pretrained checkpoint를 prefix-valid 목표로 이어서 학습할 때는 `action=finetune`을 씁니다. 이 방식은 모델 weight만 불러오고 optimizer / scheduler는 새로 시작합니다. 모델 전체를 학습하려면 `model.model_config.finetune.enabled=false`를 유지합니다.
+
+#### H100 4GPU 단일 pod prefix-valid fine tuning
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun \
+  --standalone \
+  --nproc_per_node=4 \
+  -m src.run \
+  experiment=finetune_flow_prefix_valid_h100_4 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path="/path/to/pretrained.ckpt" \
+  task_name=flow_prefix_valid_finetune_h100_4
+```
+
+#### A100 4GPU x 2node prefix-valid fine tuning
+
+각 node에서 같은 command를 실행하되 `--node_rank`만 다르게 둡니다.
+
+```bash
+# node 0
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun \
+  --nnodes=2 \
+  --nproc_per_node=4 \
+  --node_rank=0 \
+  --master_addr=<node0-address> \
+  --master_port=29500 \
+  -m src.run \
+  experiment=finetune_flow_prefix_valid_a100_4x2 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path="/path/to/pretrained.ckpt" \
+  task_name=flow_prefix_valid_finetune_a100_4x2
+
+# node 1
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun \
+  --nnodes=2 \
+  --nproc_per_node=4 \
+  --node_rank=1 \
+  --master_addr=<node0-address> \
+  --master_port=29500 \
+  -m src.run \
+  experiment=finetune_flow_prefix_valid_a100_4x2 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path="/path/to/pretrained.ckpt" \
+  task_name=flow_prefix_valid_finetune_a100_4x2
+```
+
+두 preset 모두 `max_epochs=16`, `lr=1e-4`, `lr_warmup_steps=1`, `gradient_clip_val=1.0`, `val_open_loop=true`, `val_closed_loop=true`를 사용합니다. `decoder.flow_window_steps`는 checkpoint와 같은 값을 써야 합니다. 2초 pretrained checkpoint면 기본값 `20`을 그대로 둡니다.
 
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
 

@@ -1,0 +1,65 @@
+# @package _global_
+
+# ============================================================================
+# Prefix-valid flow fine-tuning preset for 1 node x 4 H100 80GB.
+#
+# Purpose:
+#   Start from a completed flow pretrain checkpoint and continue training with
+#   partial future GT anchors included. For each anchor, only the continuous
+#   valid future prefix from raw_step + 1 receives loss.
+#
+# Important:
+#   * Use action=finetune so only weights are loaded from ckpt_path.
+#   * Keep decoder.flow_window_steps equal to the checkpoint horizon.
+#   * No cache regeneration is needed when the original README cache was used.
+# ============================================================================
+
+defaults:
+  - override /model: smart_flow
+  - override /trainer: ddp
+
+action: finetune
+
+model:
+  model_config:
+    lr: 1e-4
+    lr_warmup_steps: 1
+    lr_min_ratio: 1e-2
+    n_rollout_closed_val: 16
+    sim_agents_context_cache_size: 64
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    val_open_loop: true
+    val_closed_loop: true
+    token_processor:
+      use_prefix_valid_future_loss_mask: true
+    finetune:
+      enabled: false
+      train_full_flow_decoder_only: false
+
+ckpt_path: null
+
+trainer:
+  num_nodes: 1
+  devices: 4
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 2
+  max_epochs: 16
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  train_batch_size: 20
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
