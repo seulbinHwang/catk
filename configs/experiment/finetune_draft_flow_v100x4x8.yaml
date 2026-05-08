@@ -41,7 +41,7 @@ model:
       physics:
         use_slip_penalty: false
         commit_loss_weight: 1.0
-        soft_limit_ratio: 0.8
+        soft_limit_ratio: 1.0
         topk_violation_k: 20
 
 data:
