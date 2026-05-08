@@ -15,5 +15,5 @@ model:
       use_anchor_flow_matching_loss: false
       detach_block_transition: false
       unfrozen_range: except_map_encoder
-      estimator_warmup_epochs: 0
+      estimator_warmup_epochs: 1
       use_control_space_physics_regularization: false

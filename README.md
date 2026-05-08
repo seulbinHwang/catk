@@ -2060,7 +2060,7 @@ model:
         sample_steps: 32
         sample_method: euler
         noise_scale: 1.0
-        backprop_last_k: 8
+        backprop_last_k: 16
         random_terminal_step:
           enabled: true
           scope: global_batch
