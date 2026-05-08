@@ -6,10 +6,11 @@
 # Target static pods:
 #   testsv, testsvv, testsvvv, testsvvvv, sv, svv, svvv, svvvv
 #
-# This preset intentionally keeps the DRaFT physics objective conservative:
-#   * soft pre-limit buffer: soft_limit_ratio=0.8
+# This preset uses the slip-penalty DRaFT physics objective requested for the
+# 8x V100x4 run:
+#   * exact physics limit onset: soft_limit_ratio=1.0
 #   * no commit-window reweighting: commit_loss_weight=1.0
-#   * no slip penalty: use_slip_penalty=false
+#   * slip penalty enabled: use_slip_penalty=true
 #   * topk_violation_k=20, which is equivalent to full-horizon mean when
 #     decoder.flow_window_steps=20 and becomes active if the horizon is longer.
 # ============================================================================

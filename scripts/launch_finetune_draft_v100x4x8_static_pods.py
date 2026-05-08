@@ -29,8 +29,8 @@ DEFAULT_BRANCH = "self_forcing_w_track_loss"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "finetune_draft_flow_v100x4x8"
-DEFAULT_TASK_NAME = "flow_finetune_draft_v100x4x8_bs24_soft08_topk20_commit1_noslip"
-DEFAULT_SESSION = "catk-draft-v100x4x8-bs24-soft08"
+DEFAULT_TASK_NAME = "flow_finetune_draft_v100x4x8_bs24_soft10_topk20_commit1_slip"
+DEFAULT_SESSION = "catk-draft-v100x4x8-bs24-soft10-slip"
 
 
 def shq(value: object) -> str:
@@ -422,10 +422,10 @@ torchrun_args=(
   model.model_config.lr="$CATK_LR"
   model.model_config.draft.enabled=true
   model.model_config.draft.loss_enabled=true
-  model.model_config.draft.physics.soft_limit_ratio=0.8
+  model.model_config.draft.physics.soft_limit_ratio=1.0
   model.model_config.draft.physics.topk_violation_k=20
   model.model_config.draft.physics.commit_loss_weight=1.0
-  model.model_config.draft.physics.use_slip_penalty=false
+  model.model_config.draft.physics.use_slip_penalty=true
 )
 torchrun_args+=("${{extra_overrides[@]}}")
 

@@ -924,7 +924,7 @@ batch size 판단:
 - preset 파일: `configs/experiment/finetune_draft_flow_v100x4x8.yaml`
 - launcher 파일: `scripts/launch_finetune_draft_v100x4x8_static_pods.py`
 - 총 DDP rank: `8 nodes * 4 GPUs = 32`
-- physics 설정: `soft_limit_ratio=0.8`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=false`
+- physics 설정: `soft_limit_ratio=1.0`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=true`
 - DRaFT weight: `draft.max_weight=0.15`
 - 기본 per-GPU `train_batch_size=24`, `val_batch_size=2`
 
@@ -941,7 +941,7 @@ python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
 ```bash
 python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
   --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
-  --task-name flow_finetune_draft_v100x4x8_bs24_soft08_topk20_commit1_noslip
+  --task-name flow_finetune_draft_v100x4x8_bs24_soft10_topk20_commit1_slip
 ```
 
 checkpoint가 아직 pod 안에 없고 W&B artifact에서 받아야 한다면 full name을 같이 넘기면 됩니다.
@@ -952,7 +952,7 @@ python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
   --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
   --wandb-artifact entity/project/artifact-name:v1 \
   --artifact-download-dir /workspace/path/to/new_checkpoint/artifact \
-  --task-name flow_finetune_draft_v100x4x8_bs24_soft08_topk20_commit1_noslip
+  --task-name flow_finetune_draft_v100x4x8_bs24_soft10_topk20_commit1_slip
 ```
 
 이미 떠 있는 이 launcher의 tmux 세션만 종료:
