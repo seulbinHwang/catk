@@ -65,6 +65,7 @@ class MultiDataModule(LightningDataModule):
         train_use_eval_agent_selection: bool = False,
         train_epoch_sample_fraction: float = 1.0,
         train_tfrecords_splitted: Optional[str] = None,
+        train_use_val_transform: bool = False,
     ) -> None:
         super(MultiDataModule, self).__init__()
         if not 0.0 < float(train_epoch_sample_fraction) <= 1.0:
@@ -90,12 +91,18 @@ class MultiDataModule(LightningDataModule):
         # 하므로 받기만 하고 별도 사용은 안 합니다.
         self.train_tfrecords_splitted = train_tfrecords_splitted
 
-        self.train_transform = build_train_agent_target_builder(
-            train_max_num=train_max_num,
-            train_use_eval_agent_selection=train_use_eval_agent_selection,
-        )
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
+        if train_use_val_transform:
+            # OCSC 학습은 train/val transform 을 동일하게 두어 covariate shift
+            # 비교를 안정시킨다. 이 분기에선 val transform 을 train transform
+            # 으로 그대로 쓴다.
+            self.train_transform = self.val_transform
+        else:
+            self.train_transform = build_train_agent_target_builder(
+                train_max_num=train_max_num,
+                train_use_eval_agent_selection=train_use_eval_agent_selection,
+            )
 
     def refresh_train_dataset(self, train_raw_dir: Optional[str] = None) -> None:
         """학습용 cache 폴더를 바꾼 뒤 train dataset을 다시 만듭니다.
