@@ -159,6 +159,10 @@ class SMARTFlow(LightningModule):
             self.finetune_config.enabled
             and self.finetune_config.mode == "ocsc_ft"
         )
+        if _is_ocsc:
+            # OCSC step 본체가 manual_backward 를 사용하므로 manual optimization
+            # 모드로 전환한다. 일반 pretraining/inference 는 그대로 automatic.
+            self.automatic_optimization = False
         if _is_ocsc and bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True)):
             self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc")
             self._ocsc_train_hard_rmm_ref: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc_ref")
@@ -2268,7 +2272,57 @@ class SMARTFlow(LightningModule):
             )
 
         if self._is_ocsc_ft_enabled():
-            return self._run_flow_ocsc_ft_step(data, batch_idx)
+            import contextlib
+
+            opt = self.optimizers()
+            opt.zero_grad()
+
+            tokenized_map, tokenized_agent = self.token_processor(data)
+
+            # DDP multi-GPU: 모든 .backward() 호출을 no_sync 컨텍스트 안에서
+            # 실행해 per-backward all-reduce 를 막고, 끝나서 manual_backward 로
+            # all-reduce 1회만 트리거. anchor 수가 GPU 마다 달라도 deadlock 없음.
+            _trainer = getattr(self, "trainer", None)
+            _ddp_model = (
+                getattr(_trainer.strategy, "model", None) if _trainer is not None else None
+            )
+            _no_sync_ctx = (
+                _ddp_model.no_sync()
+                if _ddp_model is not None and hasattr(_ddp_model, "no_sync")
+                else contextlib.nullcontext()
+            )
+            with _no_sync_ctx:
+                diag = self._run_flow_ocsc_ft_step(tokenized_map, tokenized_agent, data)
+
+            if "loss" in diag:
+                self.manual_backward(diag["loss"])
+
+            opt.step()
+
+            for k, v in diag.items():
+                if k == "loss":
+                    continue
+                if isinstance(v, (Tensor, float)):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            if "train/consistency_loss" in diag:
+                _fm_reg = diag.get("train/fm_reg_loss", 0.0)
+                _fm_reg_lambda = float(self.finetune_config.ocsc_fm_reg_lambda)
+                _consistency = diag["train/consistency_loss"]
+                _fm_reg_t = (
+                    _fm_reg
+                    if isinstance(_fm_reg, Tensor)
+                    else torch.tensor(_fm_reg, device=_consistency.device)
+                )
+                _total = _consistency + _fm_reg_lambda * _fm_reg_t
+                self.log(
+                    "train/loss",
+                    _total,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
+            return None
 
         tokenized_map, tokenized_agent = self.token_processor(data)
         pred = self.encoder(
