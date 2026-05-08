@@ -173,6 +173,19 @@ saturate 시키는 문제가 사라짐.  단 두 weight 가 모두 0 이면 loss
 | `last_n_grad_solver_steps` semantic | velocity 만 detach (x_t chain 유지) | x_t no_grad+detach (project_3 측 backprop_last_k 와 동일) |
 | 다른 fine-tuning mode (adjoint_matching, kinematic_*, rmm_bptt_ft, ref_nll_ft, dice_ft, flow_epg_ft, flow_rwr_ft) | 활성 | dormant (FinetuneConfig field 만 존재, 분기 없음) |
 | `wosac_metametric_api.py` | 존재 (dead code) | 미이식 (이름 mismatch dead code) |
+| Train HardRMM monitoring (`_compute_ocsc_train_hard_rmm`) | 활성 (config 분기) | 통째 제거 (사용자 요청) |
+| `data["tfrecord_path"]` / `data["scenario_id"]` 검증 | 강제 raise | 제거 (HardRMM 미사용) |
+
+## Phase D smoke test 알려진 limitation
+
+- **`BPTT_USE_ADJOINT=true` 가 `torch.utils.checkpoint` shape recompute
+  mismatch 로 깨짐**. project_3 측 forward path 가 BPTT backward 시점의
+  재연산과 텐서 shape 이 다른 corner-case 가 있음 (e.g. `forward_components`
+  의 base+residual 결합 path). 회피: launcher 에 `BPTT_USE_ADJOINT=false`
+  로 override 후 OCSC 학습 가능. 메모리 사용량은 약간 증가하지만 OCSC
+  consistency loss 는 그대로 산출됨 (Phase D smoke test 5-step 검증:
+  `train/consistency_loss=0.00014`).
+- 추후 model_fn 의 deterministic recompute 보장 디버깅 필요.
 
 ## Validation backend
 
