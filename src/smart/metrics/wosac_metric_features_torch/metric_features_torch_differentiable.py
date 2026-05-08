@@ -492,6 +492,8 @@ def compute_metric_features_batched_scenes(
     if _PROFILE and device.type == "cuda":
         torch.cuda.synchronize()
     _t_dno_ttc_kin_done = _time.perf_counter() if _PROFILE else 0.0
+    _t_d_road_total: float = 0.0
+    _t_tl_total: float = 0.0
     # ── Per-scene assembly (road edge + TL still per-scene; rest sliced) ─
     results = []
     for i in range(n_scenes):
@@ -514,6 +516,9 @@ def compute_metric_features_batched_scenes(
         eval_object_mask_i = torch.any(eval_ids_i_dev[:, None].eq(simulated.object_id.to(device)[None, :]), dim=0)
 
         # Road edge (per-scene polylines — different map per scenario)
+        if _PROFILE and device.type == "cuda":
+            torch.cuda.synchronize()
+        _t_dr0 = _time.perf_counter() if _PROFILE else 0.0
         road_edges = _sc.get("road_edges") or [
             list(mf.road_edge.polyline)
             for mf in scenario.map_features
@@ -528,8 +533,15 @@ def compute_metric_features_batched_scenes(
             road_edge_polylines_tensor=_sc.get("road_edge_polylines_tensor"),
             is_polyline_cyclic=_sc.get("road_edge_is_cyclic"),
         )
+        if _PROFILE:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            _t_d_road_total += _time.perf_counter() - _t_dr0
 
         # Traffic lights (per-scene lane/signal data)
+        if _PROFILE and device.type == "cuda":
+            torch.cuda.synchronize()
+        _t_tl0 = _time.perf_counter() if _PROFILE else 0.0
         lane_ids: List[int] = _sc.get("lane_ids") or []
         lane_polys: List[List[map_pb2.MapPoint]] = _sc.get("lane_polys") or []
         traffic_signals = _sc.get("traffic_signals") or []
@@ -570,6 +582,10 @@ def compute_metric_features_batched_scenes(
                 dtype=torch.float32 if surrogate is not None else torch.bool,
                 device=device,
             )
+        if _PROFILE:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            _t_tl_total += _time.perf_counter() - _t_tl0
 
         # Slice to future horizon (remove history)
         validity_mask = evaluated.valid[:, ct_idx + 1:]
@@ -614,10 +630,15 @@ def compute_metric_features_batched_scenes(
         if device.type == "cuda":
             torch.cuda.synchronize()
         _t_assembly_done = _time.perf_counter()
+        _t_assembly = _t_assembly_done - _t_dno_ttc_kin_done
+        _t_other = max(0.0, _t_assembly - _t_d_road_total - _t_tl_total)
         print(
-            f"[bs-profile] n_scenes={n_scenes} "
+            f"[bs-profile] device={device.type} n_scenes={n_scenes} "
             f"dno_ttc_kin={_t_dno_ttc_kin_done-_t_setup_done:.3f}s "
-            f"assembly_per_scene_loop(d_road+TL)={_t_assembly_done-_t_dno_ttc_kin_done:.3f}s",
+            f"assembly={_t_assembly:.3f}s "
+            f"(d_road={_t_d_road_total:.3f}s "
+            f"tl={_t_tl_total:.3f}s "
+            f"other={_t_other:.3f}s)",
             flush=True,
         )
 
