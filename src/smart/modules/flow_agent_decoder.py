@@ -563,7 +563,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         tape_steps: int,
         device: torch.device,
         dtype: torch.dtype,
-        sampling_scheme: DictConfig,
+        sampling_scheme: DictConfig | None = None,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         agent_batch: torch.Tensor | None = None,
