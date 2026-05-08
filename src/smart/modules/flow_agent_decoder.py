@@ -567,6 +567,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         agent_batch: torch.Tensor | None = None,
+        sampling_noise: object = None,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
 
@@ -587,7 +588,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 각 agent가 rollout 전체에서 공유할 긴 Gaussian 잡음입니다.
                 shape은 ``[n_agent, tape_steps, 4]`` 입니다.
         """
-        noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
+        # OCSC step 은 sampling_noise (DictConfig 또는 float) 를 별도 인자로
+        # 넘긴다. 명시되면 그 값을 noise_scale 로 우선 사용한다.
+        if sampling_noise is not None:
+            if hasattr(sampling_noise, "noise_scale"):
+                noise_scale = float(getattr(sampling_noise, "noise_scale", 1.0))
+            else:
+                noise_scale = float(sampling_noise)
+        else:
+            noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
         if num_agent == 0:
             return torch.zeros((0, tape_steps, 4), device=device, dtype=dtype)
 

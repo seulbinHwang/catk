@@ -139,15 +139,15 @@ class SMARTFlow(LightningModule):
 
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
 
-        # OCSC 가 closed-loop rollout 시 별도 noise scale 을 사용할 수 있도록 한
-        # 별도 attribute. project_3 model config 에는 별도 키가 없으므로
-        # validation_rollout_sampling.noise_scale 을 fallback 으로 사용한다.
-        self.eval_sampling_noise = float(
-            getattr(
-                model_config,
-                "eval_sampling_noise",
-                getattr(self.validation_rollout_sampling, "noise_scale", 1.0),
-            )
+        # OCSC step 본체는 self.eval_sampling_noise 를 DictConfig 형태로 가정
+        # (`getattr(sampling_noise, "noise_scale", 1.0)` 로 접근). project_3
+        # model config 에는 eval_sampling_noise 키가 없어
+        # validation_rollout_sampling 자체를 fallback 으로 둔다 — 그 안에 이미
+        # noise_scale 항목이 있다.
+        self.eval_sampling_noise = getattr(
+            model_config,
+            "eval_sampling_noise",
+            self.validation_rollout_sampling,
         )
 
         # OCSC fine-tuning 시점에만 채워지는 frozen pretrained reference decoder.
@@ -1517,10 +1517,19 @@ class SMARTFlow(LightningModule):
             _consistency_tail_2hz_steps = _grad_coarse
 
         # ── 데이터 검증 ──────────────────────────────────────────────────────
+        # tfrecord_path / scenario_id / agent ids 는 _compute_ocsc_train_hard_rmm
+        # (= train 시 HardRMM 모니터링) 에서만 쓰인다. ocsc_eval_hard_rmm=false 면
+        # 모니터링 자체가 꺼져 있어 이 키들이 없어도 학습엔 영향이 없다. 따라서
+        # 모니터링이 켜져 있을 때만 검증을 강제한다.
         if data is None:
-            raise ValueError("ocsc_ft requires `data` dict with scenario metadata.")
-        if "tfrecord_path" not in data or "scenario_id" not in data:
-            raise KeyError("ocsc_ft requires data['tfrecord_path'] and data['scenario_id'].")
+            raise ValueError("ocsc_ft requires `data` dict.")
+        _need_scenario_meta = bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
+        if _need_scenario_meta:
+            if "tfrecord_path" not in data or "scenario_id" not in data:
+                raise KeyError(
+                    "ocsc_ft with ocsc_eval_hard_rmm=true requires "
+                    "data['tfrecord_path'] and data['scenario_id']."
+                )
         agent_ids = None
         try:
             agent_ids = data["agent"]["id"]
@@ -1531,9 +1540,12 @@ class SMARTFlow(LightningModule):
                 agent_ids = data["id"]
             except Exception:
                 pass
-        if agent_ids is None:
-            raise KeyError("ocsc_ft requires agent object ids: data['agent']['id'] (or data['id']).")
-        if int(agent_ids.shape[0]) != int(tokenized_agent["batch"].shape[0]):
+        if _need_scenario_meta and agent_ids is None:
+            raise KeyError(
+                "ocsc_ft with ocsc_eval_hard_rmm=true requires agent object ids: "
+                "data['agent']['id'] (or data['id'])."
+            )
+        if agent_ids is not None and int(agent_ids.shape[0]) != int(tokenized_agent["batch"].shape[0]):
             raise ValueError("agent id count mismatch")
 
         tfrecord_paths = data["tfrecord_path"]
