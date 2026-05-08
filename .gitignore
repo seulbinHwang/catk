@@ -3,3 +3,4 @@
 **/logs
 secrets/waymo/waymo_storage_state.json
 secrets/waymo/playwright_profile/
+.claude/
