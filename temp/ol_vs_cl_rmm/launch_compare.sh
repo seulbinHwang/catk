@@ -39,14 +39,20 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-${OMP_NUM_THREADS}}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-${OMP_NUM_THREADS}}"
 
-# WOSAC hard-RMM forkserver pool (사이즈 자동조정 = min(16, ncpu/2))
+# WOSAC pool workers — hard 는 PyTorch port, real 은 official TF metric.
 export WOSAC_HARD_POOL_WORKERS="${WOSAC_HARD_POOL_WORKERS:-8}"
-export WOSAC_REAL_POOL_WORKERS="${WOSAC_REAL_POOL_WORKERS:-0}"   # real metric 안 씀
+export WOSAC_REAL_POOL_WORKERS="${WOSAC_REAL_POOL_WORKERS:-8}"
 export WOSAC_HARD_LOG_CACHE_DIR="${WOSAC_HARD_LOG_CACHE_DIR:-/tmp/wosac_hard_log_feat_cache}"
 
 # ── KST timestamp ───────────────────────────────────────────────────────────
 KST_NOW="$(TZ=Asia/Seoul date +%Y%m%d-%H%M%S)"
-export OLCL_WANDB_RUN_NAME="${OLCL_WANDB_RUN_NAME:-ol-vs-cl-2s-${KST_NOW}-gpu${CUDA_VISIBLE_DEVICES}}"
+# OL slot 을 GT future 로 바꾸는 sanity/ceiling 모드 토글
+export OLCL_OL_USE_GT="${OLCL_OL_USE_GT:-false}"
+case "${OLCL_OL_USE_GT}" in
+  true|1|yes) _OLCL_TAG="gt-vs-cl" ;;
+  *)          _OLCL_TAG="ol-vs-cl" ;;
+esac
+export OLCL_WANDB_RUN_NAME="${OLCL_WANDB_RUN_NAME:-${_OLCL_TAG}-2s-${KST_NOW}-gpu${CUDA_VISIBLE_DEVICES}}"
 export OLCL_WANDB_PROJECT="${OLCL_WANDB_PROJECT:-project_3-ol-vs-cl-rmm}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
@@ -92,9 +98,11 @@ cd "$(dirname "$0")/../.."   # repo root
 PRED_SEC="$(python3 -c "print(${OLCL_PRED_2S_COARSE} * 0.5)" 2>/dev/null || echo '?')"
 
 echo "============================================================"
-echo "[ol-vs-cl-rmm launch] KST=${KST_NOW}  GPU=${CUDA_VISIBLE_DEVICES}"
+echo "[${_OLCL_TAG}-rmm launch] KST=${KST_NOW}  GPU=${CUDA_VISIBLE_DEVICES}"
 echo "  G=${OLCL_G_ROLLOUTS}  pred_max_steps=${OLCL_PRED_2S_COARSE} (= ${PRED_SEC} 초)"
 echo "  limit_val_batches=${OLCL_LIMIT_VAL_BATCHES}  rmm_path=non_diff_2s_native"
+echo "  OLCL_OL_USE_GT=${OLCL_OL_USE_GT}  (mode=${_OLCL_TAG})"
+echo "  OLCL_USE_OFFICIAL_RMM=${OLCL_USE_OFFICIAL_RMM:-false}"
 echo "  CKPT=${CKPT_PATH}"
 echo "  wandb: project=${OLCL_WANDB_PROJECT}  run=${OLCL_WANDB_RUN_NAME}  mode=${WANDB_MODE}"
 echo "  WOSAC_HARD_POOL_WORKERS=${WOSAC_HARD_POOL_WORKERS}"

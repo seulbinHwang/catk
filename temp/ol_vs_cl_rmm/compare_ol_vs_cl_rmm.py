@@ -70,7 +70,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.smart.metrics import HardSimAgentsMetrics, _LIKELIHOOD_NAMES  # noqa: E402
+from src.smart.metrics import HardSimAgentsMetrics, SimAgentsMetrics, _LIKELIHOOD_NAMES  # noqa: E402
 from src.smart.utils.rollout import transform_to_global  # noqa: E402
 
 # 로컬 헬퍼
@@ -255,6 +255,7 @@ def run_ol_cl_2s_for_batch(
     G: int,
     pred_max_steps: int,
     logger: logging.Logger,
+    ol_use_gt: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """한 batch 에 대해 OL/CL 의 ``T_pred = pred_max_steps * shift`` step
     (default 20 = 2 초) world prediction 텐서를 반환한다.
@@ -342,30 +343,38 @@ def run_ol_cl_2s_for_batch(
             share_noise_across_time=False,
         )
 
-        # 4c) OL 2 초: x_init_override 로 같은 noise 의 앞 20 step 사용
+        # 4c) "OL" slot:
+        #   ol_use_gt=False (default): 기존 OL = `_sample_open_loop_future_from_hidden`
+        #     를 같은 noise 의 앞 20 step 으로 호출 → world frame 변환
+        #   ol_use_gt=True : OL 자리에 GT future trajectory (next T_pred_fine step
+        #     in world frame) 를 직접 사용.  Sanity / ceiling 비교용 (sim≡log
+        #     이라 metametric ≈ 1.0 가 나와야 metric pipeline 정상.  CL 의 metametric
+        #     과 비교하면 "GT 대비 CL 이 얼마나 떨어지는가" 가 보임).
         _t0 = time.perf_counter()
-        x_init_ol = tape_g[active_mask, :sample_win, :].clone()
-        ol_norm = agent_enc._sample_open_loop_future_from_hidden(
-            anchor_hidden_valid=active_hidden,
-            sampling_noise=model.eval_sampling_noise,
-            x_init_override=x_init_ol,
-        )   # [n_active, 20, 4]
-        ol_pos_world, ol_head_world = ol_norm_to_world(
-            ol_norm=ol_norm,
-            current_pos=current_pos_active,
-            current_head=current_head_active,
-        )
-        # active 만 채운 [n_agent, 20, 2/1/1] short prediction → pad to 80
-        ol_traj_short = torch.zeros(n_agent_full, 1, T_pred_fine, 2,
-                                    device=device, dtype=dtype)
-        ol_head_short = torch.zeros(n_agent_full, 1, T_pred_fine,
-                                    device=device, dtype=dtype)
-        # OL 은 z 를 예측하지 않으므로 GT z 의 앞 T_pred_fine step 을 그대로 사용
-        # (OL/CL 이 같은 z 를 쓰면 z 차이는 0 이므로 RMM 비교가 OL/CL pos+heading
-        #  차이로 isolated 됨)
-        ol_z_short = gt_z_future[:, :T_pred_fine].unsqueeze(1).to(dtype)
-        ol_traj_short[active_mask, 0] = ol_pos_world
-        ol_head_short[active_mask, 0] = ol_head_world
+        if ol_use_gt:
+            # GT 직접 사용 — active mask 무관하게 모든 agent 의 GT slice
+            ol_traj_short = gt_pos_future[:, :T_pred_fine].unsqueeze(1).to(dtype)
+            ol_head_short = gt_head_future[:, :T_pred_fine].unsqueeze(1).to(dtype)
+            ol_z_short = gt_z_future[:, :T_pred_fine].unsqueeze(1).to(dtype)
+        else:
+            x_init_ol = tape_g[active_mask, :sample_win, :].clone()
+            ol_norm = agent_enc._sample_open_loop_future_from_hidden(
+                anchor_hidden_valid=active_hidden,
+                sampling_noise=model.eval_sampling_noise,
+                x_init_override=x_init_ol,
+            )   # [n_active, 20, 4]
+            ol_pos_world, ol_head_world = ol_norm_to_world(
+                ol_norm=ol_norm,
+                current_pos=current_pos_active,
+                current_head=current_head_active,
+            )
+            ol_traj_short = torch.zeros(n_agent_full, 1, T_pred_fine, 2,
+                                        device=device, dtype=dtype)
+            ol_head_short = torch.zeros(n_agent_full, 1, T_pred_fine,
+                                        device=device, dtype=dtype)
+            ol_z_short = gt_z_future[:, :T_pred_fine].unsqueeze(1).to(dtype)
+            ol_traj_short[active_mask, 0] = ol_pos_world
+            ol_head_short[active_mask, 0] = ol_head_world
 
         # 비활성 agent 는 OL prediction 이 없으므로 GT 의 첫 T_pred step 으로
         # 채운다 (CL 도 동일 처리 → 두 path 모두 비활성 agent 기여는 동일 = 0).
@@ -484,6 +493,11 @@ def main(cfg: DictConfig) -> None:
     G = int(os.environ.get("OLCL_G_ROLLOUTS", "16"))
     pred_max_steps = int(os.environ.get("OLCL_PRED_2S_COARSE", "4"))
     limit_val_batches = float(os.environ.get("OLCL_LIMIT_VAL_BATCHES", "0.01"))
+    # OL slot 을 model OL prediction 대신 GT future 로 교체할지 (sanity / ceiling 비교)
+    ol_use_gt = os.environ.get("OLCL_OL_USE_GT", "false").strip().lower() in ("1", "true", "yes")
+    # WOSAC official metric (TF subprocess + 공식 metrics 라이브러리) 사용 여부.
+    # True 면 HardSimAgentsMetrics 대신 SimAgentsMetrics, 항상 8초 (80 step) 가정.
+    use_official = os.environ.get("OLCL_USE_OFFICIAL_RMM", "false").strip().lower() in ("1", "true", "yes")
     wandb_project = os.environ.get("OLCL_WANDB_PROJECT", "project_3-ol-vs-cl-rmm")
     wandb_run_name = os.environ.get(
         "OLCL_WANDB_RUN_NAME", f"ol-vs-cl-{_kst_compact()}"
@@ -498,9 +512,25 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"=== OL vs CL Hard-RMM 비교 시작 @ {_kst_now()} ===")
     logger.info(
         f"config: G={G} pred_max_steps={pred_max_steps} "
-        f"(={pred_max_steps*0.5}초 horizon, native short-T hard RMM) "
-        f"limit_val={limit_val_batches}"
+        f"(={pred_max_steps*0.5}초 horizon) "
+        f"limit_val={limit_val_batches}  ol_use_gt={ol_use_gt}  use_official={use_official}"
     )
+    if ol_use_gt:
+        logger.info(
+            "★ ol_use_gt=True — 'OL' slot 은 model OL 이 아니라 GT future trajectory."
+            " 'OL' 컬럼은 실은 'GT' (sanity/ceiling), Δ = CL − GT (음수가 정상)."
+        )
+    if use_official:
+        logger.info(
+            "★ use_official=True — WOSAC official TF metric (SimAgentsMetrics) 사용. "
+            "per-scenario 분리 없음, batch-level metametric 만 보고."
+        )
+        if pred_max_steps != 16:
+            logger.warning(
+                f"WOSAC official 은 8초 (80 step) 기준 — pred_max_steps={pred_max_steps} "
+                f"권장값 16 으로 강제 override."
+            )
+            pred_max_steps = 16
 
     # ── Hydra cfg 강제 셋팅 (validate-only, 표준 OL/CL 메트릭 비활성) ─────
     with open_dict(cfg):
@@ -581,6 +611,8 @@ def main(cfg: DictConfig) -> None:
             "pred_max_steps_coarse": pred_max_steps,
             "pred_horizon_seconds": pred_max_steps * 0.5,
             "rmm_path": "non_diff_2s_native",
+            "ol_use_gt": ol_use_gt,
+            "comparison_mode": "gt-vs-cl" if ol_use_gt else "ol-vs-cl",
             "limit_val_batches": limit_val_batches,
             "n_use_batches": n_use_batches,
             "n_total_batches": n_total_batches,
@@ -593,9 +625,19 @@ def main(cfg: DictConfig) -> None:
     wandb_run.tags = wandb_run.tags + ("ol-vs-cl-2s",) if wandb_run.tags else ("ol-vs-cl-2s",)
     logger.info(f"wandb run 시작: project={wandb_project} name={wandb_run_name} mode={wandb_mode}")
 
-    # ── Hard RMM metric 인스턴스 (OL/CL 별도) ──────────────────────────────
-    ol_metric = HardSimAgentsMetrics("ol_2s")
-    cl_metric = HardSimAgentsMetrics("cl_2s")
+    # ── Metric 인스턴스 (OL/CL 별도) ───────────────────────────────────────
+    if use_official:
+        # WOSAC official: TF subprocess + 공식 metrics 라이브러리. 8초 standard.
+        _ol_label = "gt_official_8s" if ol_use_gt else "ol_official_8s"
+        _cl_label = "cl_official_8s"
+        ol_metric = SimAgentsMetrics(_ol_label, max_workers=0)
+        cl_metric = SimAgentsMetrics(_cl_label, max_workers=0)
+    else:
+        # PyTorch hard RMM (2s native, custom-modified)
+        _ol_label = "gt_2s" if ol_use_gt else "ol_2s"
+        _cl_label = "cl_2s"
+        ol_metric = HardSimAgentsMetrics(_ol_label)
+        cl_metric = HardSimAgentsMetrics(_cl_label)
 
     # ── Per-scenario CSV / 누적 buffer ─────────────────────────────────────
     csv_path = out_dir / "per_scenario.csv"
@@ -645,40 +687,88 @@ def main(cfg: DictConfig) -> None:
             G=G,
             pred_max_steps=pred_max_steps,
             logger=logger,
+            ol_use_gt=ol_use_gt,
         )
         if not out:
             logger.warning(f"batch {batch_idx} 건너뜀 (active 0).")
             continue
 
-        # ── Hard RMM (per scenario, OL & CL) ──────────────────────────────
-        t0 = time.perf_counter()
-        ol_per = compute_hard_rmm_per_scenario(
-            metric=ol_metric,
-            scenario_files=list(data["tfrecord_path"]),
-            agent_id=data["agent"]["id"],
-            agent_batch=data["agent"]["batch"],
-            pred_traj=out["ol_traj"],
-            pred_z=out["ol_z"],
-            pred_head=out["ol_head"],
-            update_running=True,
-        )
-        t_ol_rmm = time.perf_counter() - t0
-        t0 = time.perf_counter()
-        cl_per = compute_hard_rmm_per_scenario(
-            metric=cl_metric,
-            scenario_files=list(data["tfrecord_path"]),
-            agent_id=data["agent"]["id"],
-            agent_batch=data["agent"]["batch"],
-            pred_traj=out["cl_traj"],
-            pred_z=out["cl_z"],
-            pred_head=out["cl_head"],
-            update_running=True,
-        )
-        t_cl_rmm = time.perf_counter() - t0
-        logger.info(
-            f"  ↳ hard-RMM compute: OL={t_ol_rmm:.2f}s  CL={t_cl_rmm:.2f}s "
-            f"per_scenario_count={len(ol_per)}"
-        )
+        # ── RMM (per-scenario or official) ────────────────────────────────
+        if use_official:
+            # 공식 metric 은 per-scenario 분리 미제공.  단순 batch-level update
+            # 후 epoch 끝에서 compute() 한번에 평균값.  이번 batch 의 metametric
+            # 만 보고 싶으면 reset → update → compute → reset 패턴.
+            t0 = time.perf_counter()
+            ol_metric.reset()
+            ol_metric.update_from_prediction_tensors(
+                scenario_files=list(data["tfrecord_path"]),
+                agent_id=data["agent"]["id"],
+                agent_batch=data["agent"]["batch"],
+                pred_traj=out["ol_traj"],
+                pred_z=out["ol_z"],
+                pred_head=out["ol_head"],
+            )
+            ol_compute = ol_metric.compute()
+            t_ol_rmm = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            cl_metric.reset()
+            cl_metric.update_from_prediction_tensors(
+                scenario_files=list(data["tfrecord_path"]),
+                agent_id=data["agent"]["id"],
+                agent_batch=data["agent"]["batch"],
+                pred_traj=out["cl_traj"],
+                pred_z=out["cl_z"],
+                pred_head=out["cl_head"],
+            )
+            cl_compute = cl_metric.compute()
+            t_cl_rmm = time.perf_counter() - t0
+            # 가짜 per-scenario 리스트 만들어서 기존 로깅 흐름 재사용
+            def _flatten(compute_dict, prefix):
+                out = {}
+                for k, v in compute_dict.items():
+                    short = k.split("/", 2)[-1]   # "realism_meta_metric" or "<name>"
+                    out[short] = float(v.item() if torch.is_tensor(v) else v)
+                # convert to list-of-1-scenario format used downstream
+                d = {"scenario_file": "<batch_aggregated>",
+                     "metametric": out.get("realism_meta_metric", float("nan"))}
+                for name in _LIKELIHOOD_NAMES:
+                    d[name] = out.get(name, float("nan"))
+                return [d]
+            ol_per = _flatten(ol_compute, _ol_label)
+            cl_per = _flatten(cl_compute, _cl_label)
+            logger.info(
+                f"  ↳ official-RMM compute: OL={t_ol_rmm:.1f}s  CL={t_cl_rmm:.1f}s "
+                f"(batch-aggregated)"
+            )
+        else:
+            t0 = time.perf_counter()
+            ol_per = compute_hard_rmm_per_scenario(
+                metric=ol_metric,
+                scenario_files=list(data["tfrecord_path"]),
+                agent_id=data["agent"]["id"],
+                agent_batch=data["agent"]["batch"],
+                pred_traj=out["ol_traj"],
+                pred_z=out["ol_z"],
+                pred_head=out["ol_head"],
+                update_running=True,
+            )
+            t_ol_rmm = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            cl_per = compute_hard_rmm_per_scenario(
+                metric=cl_metric,
+                scenario_files=list(data["tfrecord_path"]),
+                agent_id=data["agent"]["id"],
+                agent_batch=data["agent"]["batch"],
+                pred_traj=out["cl_traj"],
+                pred_z=out["cl_z"],
+                pred_head=out["cl_head"],
+                update_running=True,
+            )
+            t_cl_rmm = time.perf_counter() - t0
+            logger.info(
+                f"  ↳ hard-RMM compute: OL={t_ol_rmm:.2f}s  CL={t_cl_rmm:.2f}s "
+                f"per_scenario_count={len(ol_per)}"
+            )
 
         # ── Per-scenario logging ──────────────────────────────────────────
         for s_i, (ol_d, cl_d) in enumerate(zip(ol_per, cl_per)):
