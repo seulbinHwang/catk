@@ -115,6 +115,15 @@ class FlowODE:
         self.solver_method = solver_method
         self.path_type = path_type
         self.sigma_min = sigma_min
+        # OCSC fine-tuning 토글. SMARTFlow.on_train_start / _run_flow_ocsc_ft_step 에서
+        # 외부 set 한다. pretraining inference 에는 영향 없음.
+        # True 이면 generate() 안 model_fn 호출이 torch.utils.checkpoint 로 감싸져
+        # forward 활성화 저장 대신 backward 시 재연산 → BPTT 메모리 ↓.
+        self.use_adjoint_for_bptt: bool = False
+        # 마지막 N solver step 의 velocity 만 model_fn 파라미터 gradient 를 받습니다.
+        # 0 이하면 비활성 (전체 step 이 gradient).  early step 의 velocity 는 detach
+        # 되지만 x_t chain 은 유지되어 coarse step 간 BPTT 는 살아 있습니다.
+        self.last_n_grad_solver_steps: int = 0
 
     def _beta(self) -> float:
         if self.path_type == "linear":
@@ -310,6 +319,17 @@ class FlowODE:
                 "terminal_step must be in [1, steps], "
                 f"got terminal_step={max_step}, steps={steps}."
             )
+
+        # OCSC fine-tuning 토글. SMARTFlow._run_flow_ocsc_ft_step 에서 매 step
+        # 직전 set 하고 끝나면 0 / False 로 되돌린다.
+        if getattr(self, "use_adjoint_for_bptt", False):
+            from torch.utils.checkpoint import checkpoint as _ckpt
+
+            _orig_model_fn = model_fn
+            model_fn = lambda _x, _tau: _ckpt(_orig_model_fn, _x, _tau, use_reentrant=False)
+        _last_n_grad = max(0, int(getattr(self, "last_n_grad_solver_steps", 0)))
+        if backprop_last_k is None and _last_n_grad > 0:
+            backprop_last_k = _last_n_grad
 
         x_t = x_init
         t0 = self.eps
@@ -561,6 +581,30 @@ class FlowVelocityHead(nn.Module):
         return self.net(step_tokens)
 
 
+class ResidualFlowVelocityHead(nn.Module):
+    """OCSC fine-tuning 때만 움직이는 작은 residual velocity head 입니다.
+
+    pretraining 단계에는 zero-init + frozen 으로 두어 base velocity_head 의 출력
+    을 그대로 패스하고, OCSC 단계에서만 unfreeze 해 base 위에 residual 보정을
+    학습합니다.
+    """
+
+    def __init__(self, flow_dim: int, bottleneck_dim: int | None = None) -> None:
+        super().__init__()
+        hidden_dim = flow_dim // 2 if bottleneck_dim is None else bottleneck_dim
+        self.net = nn.Sequential(
+            nn.LayerNorm(flow_dim),
+            nn.Linear(flow_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 4),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, step_tokens: torch.Tensor) -> torch.Tensor:
+        return self.net(step_tokens)
+
+
 class HierarchicalFlowDecoder(nn.Module):
     def __init__(
         self,
@@ -599,6 +643,50 @@ class HierarchicalFlowDecoder(nn.Module):
             num_heads=num_chunk_heads,
         )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
+        # OCSC fine-tuning 전용. Pretraining 시에는 zero-init+frozen 이라 inference
+        # 결과에 영향 없음.
+        self.residual_velocity_head = ResidualFlowVelocityHead(flow_dim=flow_dim)
+
+    def _build_step_tokens(
+        self,
+        anchor_hidden: torch.Tensor,
+        x_t_norm: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> torch.Tensor:
+        """velocity head 직전의 step feature 를 만듭니다.
+
+        forward / forward_components 양쪽이 공유하는 헬퍼입니다.
+        """
+        context = self.context_projector(anchor_hidden)
+        step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
+        for block in self.chunk_mixers:
+            chunk_tokens = block(chunk_tokens, context, tau_emb)
+        return self.step_refiner(step_tokens, chunk_tokens, context)
+
+    def forward_components(
+        self,
+        anchor_hidden: torch.Tensor,
+        x_t_norm: torch.Tensor,
+        tau: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Base velocity 와 residual velocity 를 함께 계산합니다.
+
+        Returns:
+            dict[str, torch.Tensor]:
+                - ``velocity``: base + residual 합산. shape ``[B, 20, 4]``.
+                - ``base_velocity``: base velocity. shape ``[B, 20, 4]``.
+                - ``residual_velocity``: OCSC residual. shape ``[B, 20, 4]``.
+                - ``step_tokens``: 마지막 step feature. shape ``[B, 20, flow_dim]``.
+        """
+        step_tokens = self._build_step_tokens(anchor_hidden, x_t_norm, tau)
+        base_velocity = self.velocity_head(step_tokens)
+        residual_velocity = self.residual_velocity_head(step_tokens)
+        return {
+            "velocity": base_velocity + residual_velocity,
+            "base_velocity": base_velocity,
+            "residual_velocity": residual_velocity,
+            "step_tokens": step_tokens,
+        }
 
     def forward(
         self,
@@ -606,57 +694,21 @@ class HierarchicalFlowDecoder(nn.Module):
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
     ) -> torch.Tensor:
+        """anchor 문맥과 현재 noisy trajectory 로부터 velocity 를 예측합니다.
+
+        OCSC fine-tuning 도입 후 base velocity_head 출력에 residual_velocity_head
+        보정을 더한 값을 돌려줍니다. residual head 는 zero-init + (default
+        finetune off) 동결이므로 pretraining inference 결과는 변하지 않습니다.
+
+        Args:
+            anchor_hidden: anchor 문맥. shape ``[B, hidden_dim]``.
+            x_t_norm: 현재 noisy trajectory. shape ``[B, 20, 4]``.
+            tau: 생성 진행률 [0, 1]. shape ``[B]``.
+
+        Returns:
+            torch.Tensor: 최종 velocity. shape ``[B, 20, 4]``.
         """
-        anchor_hidden : (A, 13, H) -> (N=A*13, H) -> context : (N, D)
-        """
-        context = self.context_projector(anchor_hidden)
-        """
-        x_t_norm : [B, 20, 4]
-        tau : [B]
-        
-        중간
-            tau_emb : (B, D) # MLP
-            step_tokens : (B, 20, 4) -> (B, 20, D)
-                - step_ids : "각 토큰에 “이게 미래 몇 번째 step인지” 정보를 step_tokens 에 더함
-            step_tokens = step_tokens + tau_emb.unsqueeze(1) : (B, 20, D)
-            step_tokens = step_tokens.view(B, 4, 5, D) [B, 20, D] -> [B, 4, 5, D]
-            chunk_tokens : [B, 4, D]
-        """
-        step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
-        """
-        4개 half-second chunk ( chunk_tokens ) 끼리 서로 정보 교환
-        
-        anchor 문맥 + 현재 diffusion 시간(tau)을 조건으로 주입
-            input: context : (N, D) / tau_emb : (B, D)
-            둘이 합침 : (B, 2D) # "과거~현재 + 지도 + agent끼리 상호작용한 정보" + "미래 noising 정도"
-            (B, 2D) -> (B, 3D) -> scale, bias, gate = cond.chunk(3, dim=-1): 각각 [B, D]
-            
-            chunk_tokens 에 scale, bias, gate 적용 (각각 chunk에 균일 적용)
-            chunk_tokens : (B, 4, D)
-            
-            
-        """
-        for block in self.chunk_mixers:
-            chunk_tokens = block(chunk_tokens, context, tau_emb)
-        """
-        input
-            step_tokens : (B, 20, D)
-            chunk_tokens : (B, 4, D)
-            context : (B, D)
-        로직
-            chunk_tokens 을 step_tokens 에 더함
-            context 을 step_tokens 에 더함
-            
-            chunk별 로컬 self-attention (각 구간에서 5개 step끼리만 보여 attention)
-        
-        output
-            step_tokens : (b, 20, D)
-        """
-        step_tokens = self.step_refiner(step_tokens, chunk_tokens, context)
-        """
-        output : (B, 20, 4)
-        """
-        return self.velocity_head(step_tokens)
+        return self.forward_components(anchor_hidden, x_t_norm, tau)["velocity"]
 
 
 class ContinuousCommitBridge:
