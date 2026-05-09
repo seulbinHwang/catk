@@ -36,10 +36,8 @@ model_config:
     # Flow Matching은 [delta_s, delta_n, delta_yaw] 제어공간에서 학습합니다.
     use_kinematic_control_flow: false
     control_pos_scale_m: 1.0
-    control_yaw_scale_rad: 0.2
-    # control-space yaw normalization is agent type-aware when agent_type is available:
+    # control-space yaw normalization is always agent type-aware:
     # vehicle=0.025rad, pedestrian=0.20rad, cyclist=0.06rad.
-    # This scalar remains a fallback for calls without agent_type.
     # control-space 학습에서 GT -> control -> pose 복원 위치 오차가 이 값보다 큰 anchor는 학습에서 제외합니다.
     control_round_trip_max_position_error_m: 5.0
     map_token_sampling:
@@ -183,7 +181,6 @@ model_config:
     flow_solver_eps: 1.0e-3
     use_kinematic_control_flow: ${model.model_config.token_processor.use_kinematic_control_flow}
     control_pos_scale_m: ${model.model_config.token_processor.control_pos_scale_m}
-    control_yaw_scale_rad: ${model.model_config.token_processor.control_yaw_scale_rad}
     closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
     use_lqr: false
     use_stop_motion: true

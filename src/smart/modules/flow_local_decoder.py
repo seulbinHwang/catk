@@ -806,7 +806,6 @@ class ContinuousCommitBridge:
         config: LQRCommitBridgeConfig | None = None,
         use_kinematic_control_flow: bool = False,
         control_pos_scale_m: float = 1.0,
-        control_yaw_scale_rad: float = 0.2,
     ) -> None:
         self.commit_steps = int(commit_steps)
         self.pos_scale_m = float(pos_scale_m)
@@ -814,7 +813,6 @@ class ContinuousCommitBridge:
         self.use_stop_motion = bool(use_stop_motion)
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.control_pos_scale_m = float(control_pos_scale_m)
-        self.control_yaw_scale_rad = float(control_yaw_scale_rad)
         self.config = config if config is not None else LQRCommitBridgeConfig()
         self._difference_gram_cache: dict[tuple[int, str, str], torch.Tensor] = {}
 
@@ -862,7 +860,6 @@ class ContinuousCommitBridge:
                 control_norm=y_hat_norm,
                 agent_type=agent_type,
                 pos_scale_m=self.control_pos_scale_m,
-                yaw_scale_rad=self.control_yaw_scale_rad,
             )
         first_chunk = y_hat_norm[:, : self.commit_steps].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m

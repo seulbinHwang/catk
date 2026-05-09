@@ -7,7 +7,6 @@ from torch import Tensor
 POSE_FLOW_DIM = 4
 CONTROL_FLOW_DIM = 3
 DEFAULT_CONTROL_POS_SCALE_M = 1.0
-DEFAULT_CONTROL_YAW_SCALE_RAD = 0.2
 DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M = 5.0
 DEFAULT_CONTROL_VEHICLE_YAW_SCALE_RAD = 0.025
 DEFAULT_CONTROL_PEDESTRIAN_YAW_SCALE_RAD = 0.20
@@ -128,9 +127,8 @@ def safe_sinc(x: Tensor, eps: float = 1.0e-6) -> Tensor:
 
 def normalize_control(
     control: Tensor,
+    agent_type: Tensor,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
-    yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
-    agent_type: Tensor | None = None,
 ) -> Tensor:
     """제어값을 Flow Matching 학습 스케일로 바꿉니다.
 
@@ -138,11 +136,8 @@ def normalize_control(
         control: 실제 단위 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
             마지막 차원은 ``[앞뒤 이동량, 좌우 이동량, 방향 변화량]`` 입니다.
         pos_scale_m: 이동량을 나눌 meter 단위 값입니다. 모든 agent에 공통 적용합니다.
-        yaw_scale_rad: ``agent_type`` 이 없을 때 쓸 yaw scalar scale입니다.
-            기존 호출과의 호환용 fallback입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
-            값이 있으면 yaw는 vehicle ``0.025rad``, pedestrian ``0.20rad``,
-            cyclist ``0.06rad`` 로 나눕니다.
+            yaw는 vehicle ``0.025rad``, pedestrian ``0.20rad``, cyclist ``0.06rad`` 로 나눕니다.
 
     Returns:
         Tensor: 정규화된 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
@@ -152,10 +147,6 @@ def normalize_control(
 
     control_norm = control.clone()
     control_norm[..., :2] = control[..., :2] / float(pos_scale_m)
-    if agent_type is None:
-        control_norm[..., 2] = control[..., 2] / float(yaw_scale_rad)
-        return control_norm
-
     _validate_control_agent_type(control=control, agent_type=agent_type)
     yaw_scale = resolve_control_yaw_scale(
         agent_type=agent_type,
@@ -169,20 +160,16 @@ def normalize_control(
 
 def denormalize_control(
     control_norm: Tensor,
+    agent_type: Tensor,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
-    yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
-    agent_type: Tensor | None = None,
 ) -> Tensor:
     """정규화된 제어값을 실제 단위로 되돌립니다.
 
     Args:
         control_norm: 정규화된 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
         pos_scale_m: 이동량 정규화에 쓴 meter 단위 값입니다.
-        yaw_scale_rad: ``agent_type`` 이 없을 때 쓸 yaw scalar scale입니다.
-            기존 호출과의 호환용 fallback입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
-            값이 있으면 yaw는 vehicle ``0.025rad``, pedestrian ``0.20rad``,
-            cyclist ``0.06rad`` 로 곱합니다.
+            yaw는 vehicle ``0.025rad``, pedestrian ``0.20rad``, cyclist ``0.06rad`` 로 곱합니다.
 
     Returns:
         Tensor: 실제 단위 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
@@ -192,10 +179,6 @@ def denormalize_control(
 
     control = control_norm.clone()
     control[..., :2] = control_norm[..., :2] * float(pos_scale_m)
-    if agent_type is None:
-        control[..., 2] = control_norm[..., 2] * float(yaw_scale_rad)
-        return control
-
     _validate_control_agent_type(control=control_norm, agent_type=agent_type)
     yaw_scale = resolve_control_yaw_scale(
         agent_type=agent_type,
@@ -296,7 +279,6 @@ def control_norm_to_pose_norm(
     control_norm: Tensor,
     agent_type: Tensor,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
-    yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
     pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
 ) -> Tensor:
     """정규화된 제어 시퀀스를 기존 pose-space 표현으로 바꿉니다.
@@ -306,8 +288,6 @@ def control_norm_to_pose_norm(
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
             yaw 역정규화는 agent type별 scale을 사용합니다.
         pos_scale_m: 이동량 정규화에 쓴 meter 단위 값입니다.
-        yaw_scale_rad: ``agent_type`` 없는 호출의 scalar fallback입니다.
-            이 함수는 항상 ``agent_type`` 을 받으므로 일반적으로 직접 쓰지 않습니다.
         pose_pos_scale_m: 기존 pose-space Flow 표현의 위치 정규화 meter 값입니다.
 
     Returns:
@@ -318,7 +298,6 @@ def control_norm_to_pose_norm(
     control = denormalize_control(
         control_norm=control_norm,
         pos_scale_m=pos_scale_m,
-        yaw_scale_rad=yaw_scale_rad,
         agent_type=agent_type,
     )
     pos, head = decode_control_sequence(control=control, agent_type=agent_type)
@@ -340,7 +319,6 @@ def build_rolling_control_target(
     current_head: Tensor,
     agent_type: Tensor,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
-    yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
 ) -> Tensor:
     """GT pose를 decoder-consistent rolling control label로 바꿉니다.
 
@@ -351,7 +329,6 @@ def build_rolling_control_target(
         current_head: anchor 현재 방향입니다. shape은 ``[N]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
-        yaw_scale_rad: 방향 변화량 정규화에 쓸 radian 단위 값입니다.
 
     Returns:
         Tensor: 정규화된 rolling control label입니다. shape은 ``[N, T, 3]`` 입니다.
@@ -412,7 +389,6 @@ def build_rolling_control_target(
     return normalize_control(
         control=control,
         pos_scale_m=pos_scale_m,
-        yaw_scale_rad=yaw_scale_rad,
         agent_type=agent_type,
     )
 
@@ -424,7 +400,6 @@ def build_rolling_control_target_with_round_trip_error(
     current_head: Tensor,
     agent_type: Tensor,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
-    yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
 ) -> tuple[Tensor, Tensor]:
     """GT pose를 control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
 
@@ -435,7 +410,6 @@ def build_rolling_control_target_with_round_trip_error(
         current_head: anchor 현재 방향입니다. shape은 ``[N]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
-        yaw_scale_rad: 방향 변화량 정규화에 쓸 radian 단위 값입니다.
 
     Returns:
         tuple[Tensor, Tensor]:
@@ -449,12 +423,10 @@ def build_rolling_control_target_with_round_trip_error(
         current_head=current_head,
         agent_type=agent_type,
         pos_scale_m=pos_scale_m,
-        yaw_scale_rad=yaw_scale_rad,
     )
     control = denormalize_control(
         control_norm=control_norm,
         pos_scale_m=pos_scale_m,
-        yaw_scale_rad=yaw_scale_rad,
         agent_type=agent_type,
     )
     decoded_pos, _ = decode_control_sequence(

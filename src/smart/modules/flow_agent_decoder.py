@@ -60,7 +60,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_eps: float,
         use_kinematic_control_flow: bool = False,
         control_pos_scale_m: float = 1.0,
-        control_yaw_scale_rad: float = 0.2,
         closed_loop_rollout_mode: str = "raw_fm",
         use_lqr: bool = False,
         use_stop_motion: bool = False,
@@ -88,7 +87,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.control_pos_scale_m = float(control_pos_scale_m)
-        self.control_yaw_scale_rad = float(control_yaw_scale_rad)
         self.flow_state_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
         self.r_a2a_emb = FourierEmbedding(
             input_dim=6,
@@ -143,7 +141,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             config=lqr_commit_cfg,
             use_kinematic_control_flow=self.use_kinematic_control_flow,
             control_pos_scale_m=self.control_pos_scale_m,
-            control_yaw_scale_rad=self.control_yaw_scale_rad,
         )
 
     def build_interaction_edge(
@@ -502,7 +499,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             control_norm=value,
             agent_type=agent_type.to(device=value.device),
             pos_scale_m=self.control_pos_scale_m,
-            yaw_scale_rad=self.control_yaw_scale_rad,
         )
 
     def flow_norm_to_pose_metric_norm(
