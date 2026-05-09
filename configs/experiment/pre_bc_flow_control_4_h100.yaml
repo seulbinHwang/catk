@@ -16,3 +16,5 @@ model:
   model_config:
     token_processor:
       use_kinematic_control_flow: true
+      control_pos_scale_m: 1.0
+      control_yaw_scale_rad: 0.2

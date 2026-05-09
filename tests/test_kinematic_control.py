@@ -56,7 +56,7 @@ def test_vehicle_rolling_control_uses_no_lateral_channel() -> None:
 
 def test_control_norm_to_pose_norm_returns_pose_space_shape() -> None:
     control_norm = torch.zeros((2, 5, 3))
-    control_norm[..., 0] = 0.05
+    control_norm[..., 0] = 1.0
     agent_type = torch.tensor([0, 1])
 
     pose_norm = control_norm_to_pose_norm(control_norm=control_norm, agent_type=agent_type)
@@ -64,7 +64,7 @@ def test_control_norm_to_pose_norm_returns_pose_space_shape() -> None:
     assert tuple(pose_norm.shape) == (2, 5, 4)
     torch.testing.assert_close(
         pose_norm[0, :, 0],
-        torch.arange(1, 6, dtype=pose_norm.dtype) * 0.05 / 20.0,
+        torch.arange(1, 6, dtype=pose_norm.dtype) / 20.0,
     )
     torch.testing.assert_close(pose_norm[..., 2], torch.ones_like(pose_norm[..., 2]))
     torch.testing.assert_close(pose_norm[..., 3], torch.zeros_like(pose_norm[..., 3]))
