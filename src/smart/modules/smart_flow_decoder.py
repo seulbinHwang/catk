@@ -274,23 +274,22 @@ class SMARTFlowDecoder(nn.Module):
         self,
         anchor_hidden: Tensor,
         anchor_mask: Tensor,
-        sampling_scheme: DictConfig,
+        sampling_scheme: DictConfig | None = None,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        sampling_noise: object | None = None,
+        agent_type: Tensor | None = None,
+        v_init: Tensor | None = None,
+        delta_init: Tensor | None = None,
+        current_control: Tensor | None = None,
+        current_control_valid: Tensor | None = None,
+        share_noise_across_time: bool = False,
+        x_init_override: Tensor | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
-        Args:
-            anchor_hidden: 모든 anchor 문맥입니다.
-                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
-            anchor_mask: 실제로 평가할 anchor 여부입니다.
-                shape은 ``[n_agent, 13]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
-            sampling_seed: validation마다 같은 샘플을 만들기 위한 고정 seed입니다.
-
-        Returns:
-            Tensor: 생성된 정규화 2초 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        OCSC step 호환 인자 (sampling_noise / agent_type / v_init / ...) 도
+        받아서 inner agent_encoder.sample_open_loop_future 로 forward 합니다.
         """
         return self.agent_encoder.sample_open_loop_future(
             anchor_hidden=anchor_hidden,
@@ -298,6 +297,14 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            sampling_noise=sampling_noise,
+            agent_type=agent_type,
+            v_init=v_init,
+            delta_init=delta_init,
+            current_control=current_control,
+            current_control_valid=current_control_valid,
+            share_noise_across_time=share_noise_across_time,
+            x_init_override=x_init_override,
         )
 
     def inference(

@@ -469,52 +469,65 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
     def _sample_open_loop_future_from_hidden(
         self,
         anchor_hidden_valid: torch.Tensor,
-        sampling_scheme: DictConfig,
+        sampling_scheme: DictConfig | None = None,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        # OCSC step 은 sampling_noise (DictConfig) 를 별도 인자로 넘긴다.
+        # 명시되면 sampling_scheme 자리에 그대로 사용한다.
+        sampling_noise: object | None = None,
+        # OCSC_clean 시그니처 호환 (project_3 본체에선 미사용 — 받기 무시).
+        agent_type: torch.Tensor | None = None,
+        v_init: torch.Tensor | None = None,
+        delta_init: torch.Tensor | None = None,
+        current_control: torch.Tensor | None = None,
+        current_control_valid: torch.Tensor | None = None,
+        share_noise_across_time: bool = False,
+        x_init_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
-
-        Args:
-            anchor_hidden_valid: 유효 anchor만 모은 문맥입니다.
-                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
-            sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
-            backprop_last_k: 마지막 몇 step만 역전파할지 정합니다.
-                ``None`` 이면 전체 step을 역전파합니다.
-
-        Returns:
-            torch.Tensor: 생성된 정규화 2초 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
-        """
+        """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다."""
         if anchor_hidden_valid.numel() == 0:
             return anchor_hidden_valid.new_zeros((0, self.flow_window_steps, 4))
+
+        scheme = sampling_noise if sampling_noise is not None else sampling_scheme
 
         generator = None
         if sampling_seed is not None:
             generator = torch.Generator(device=anchor_hidden_valid.device)
             generator.manual_seed(int(sampling_seed))
 
-        x_init_norm = torch.randn(
-            anchor_hidden_valid.shape[0],
-            self.flow_window_steps,
-            4,
-            device=anchor_hidden_valid.device,
-            dtype=anchor_hidden_valid.dtype,
-            generator=generator,
-        ) * getattr(sampling_scheme, "noise_scale", 1.0)
-        flow_sample_steps = getattr(
-            sampling_scheme,
+        if x_init_override is not None:
+            x_init_norm = x_init_override
+        elif share_noise_across_time:
+            x_init_one = torch.randn(
+                anchor_hidden_valid.shape[0],
+                1,
+                4,
+                device=anchor_hidden_valid.device,
+                dtype=anchor_hidden_valid.dtype,
+                generator=generator,
+            ) * float(getattr(scheme, "noise_scale", 1.0))
+            x_init_norm = x_init_one.expand(-1, self.flow_window_steps, -1).contiguous()
+        else:
+            x_init_norm = torch.randn(
+                anchor_hidden_valid.shape[0],
+                self.flow_window_steps,
+                4,
+                device=anchor_hidden_valid.device,
+                dtype=anchor_hidden_valid.dtype,
+                generator=generator,
+            ) * float(getattr(scheme, "noise_scale", 1.0))
+        flow_sample_steps = int(getattr(
+            scheme,
             "sample_steps",
             self.flow_ode.solver_steps,
-        )
+        ))
         flow_sample_method = getattr(
-            sampling_scheme,
+            scheme,
             "sample_method",
             self.flow_ode.solver_method,
         )
         if backprop_last_k is None:
-            backprop_last_k = getattr(sampling_scheme, "backprop_last_k", None)
+            backprop_last_k = getattr(scheme, "backprop_last_k", None)
 
         return self.flow_ode.generate(
             x_init=x_init_norm,
@@ -528,25 +541,22 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self,
         anchor_hidden: torch.Tensor,
         anchor_mask: torch.Tensor,
-        sampling_scheme: DictConfig,
+        sampling_scheme: DictConfig | None = None,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        sampling_noise: object | None = None,
+        agent_type: torch.Tensor | None = None,
+        v_init: torch.Tensor | None = None,
+        delta_init: torch.Tensor | None = None,
+        current_control: torch.Tensor | None = None,
+        current_control_valid: torch.Tensor | None = None,
+        share_noise_across_time: bool = False,
+        x_init_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
-        Args:
-            anchor_hidden: 모든 anchor 문맥입니다.
-                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
-            anchor_mask: 실제로 평가할 anchor 여부입니다.
-                shape은 ``[n_agent, 13]`` 입니다.
-            sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
-            sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
-            backprop_last_k: 마지막 몇 step만 역전파할지 정합니다.
-                ``None`` 이면 전체 step을 역전파합니다.
-
-        Returns:
-            torch.Tensor: 생성된 정규화 2초 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+        OCSC step 호환 인자 (sampling_noise / agent_type / v_init / ...) 도
+        받아서 `_sample_open_loop_future_from_hidden` 으로 forward 합니다.
         """
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
         return self._sample_open_loop_future_from_hidden(
@@ -554,6 +564,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            sampling_noise=sampling_noise,
+            agent_type=agent_type,
+            v_init=v_init,
+            delta_init=delta_init,
+            current_control=current_control,
+            current_control_valid=current_control_valid,
+            share_noise_across_time=share_noise_across_time,
+            x_init_override=x_init_override,
         )
 
 
