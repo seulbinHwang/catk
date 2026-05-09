@@ -13,6 +13,7 @@ from src.smart.modules.kinematic_control import (
     POSE_FLOW_DIM,
     build_rolling_control_target,
     build_rolling_control_target_with_round_trip_error,
+    validate_control_yaw_scale_config,
 )
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils import transform_to_local, validate_flow_window_steps
@@ -31,6 +32,9 @@ class FlowTokenProcessor(TokenProcessor):
         use_prefix_valid_future_loss_mask: bool = False,
         use_kinematic_control_flow: bool = False,
         control_pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+        control_vehicle_yaw_scale_rad: float | None = None,
+        control_pedestrian_yaw_scale_rad: float | None = None,
+        control_cyclist_yaw_scale_rad: float | None = None,
         control_round_trip_max_position_error_m: float = DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
     ) -> None:
         super().__init__(
@@ -46,6 +50,19 @@ class FlowTokenProcessor(TokenProcessor):
         self.use_prefix_valid_future_loss_mask = bool(use_prefix_valid_future_loss_mask)
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.control_pos_scale_m = float(control_pos_scale_m)
+        self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
+        self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
+        self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
+        if self.use_kinematic_control_flow:
+            (
+                self.control_vehicle_yaw_scale_rad,
+                self.control_pedestrian_yaw_scale_rad,
+                self.control_cyclist_yaw_scale_rad,
+            ) = validate_control_yaw_scale_config(
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            )
         self.control_round_trip_max_position_error_m = float(
             control_round_trip_max_position_error_m
         )
@@ -539,6 +556,9 @@ class FlowTokenProcessor(TokenProcessor):
                     current_head=selected_current_head,
                     agent_type=selected_agent_type,
                     pos_scale_m=self.control_pos_scale_m,
+                    vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                    pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                    cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
                 )
             return build_rolling_control_target(
                 future_pos=future_pos,
@@ -547,6 +567,9 @@ class FlowTokenProcessor(TokenProcessor):
                 current_head=selected_current_head,
                 agent_type=selected_agent_type,
                 pos_scale_m=self.control_pos_scale_m,
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
             )
 
         if return_round_trip_error:

@@ -17,6 +17,12 @@ from src.smart.modules.kinematic_control import (
     safe_sinc,
 )
 
+CONTROL_YAW_SCALE_KWARGS = {
+    "vehicle_yaw_scale_rad": 0.025,
+    "pedestrian_yaw_scale_rad": 0.20,
+    "cyclist_yaw_scale_rad": 0.06,
+}
+
 
 def test_pedestrian_rolling_control_reconstructs_target_position() -> None:
     current_pos = torch.tensor([[0.0, 0.0]])
@@ -31,9 +37,14 @@ def test_pedestrian_rolling_control_reconstructs_target_position() -> None:
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
     )
     decoded_pos, decoded_head = decode_control_sequence(
-        control=denormalize_control(control_norm, agent_type=agent_type),
+        control=denormalize_control(
+            control_norm,
+            agent_type=agent_type,
+            **CONTROL_YAW_SCALE_KWARGS,
+        ),
         agent_type=agent_type,
         current_pos=current_pos,
         current_head=current_head,
@@ -56,8 +67,9 @@ def test_vehicle_rolling_control_uses_no_lateral_channel() -> None:
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
     )
-    control = denormalize_control(control_norm, agent_type=agent_type)
+    control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
 
     assert torch.allclose(control[..., 1], torch.zeros_like(control[..., 1]))
 
@@ -75,8 +87,9 @@ def test_cyclist_rolling_control_uses_no_lateral_channel_and_round_trips() -> No
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
     )
-    control = denormalize_control(control_norm, agent_type=agent_type)
+    control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
     decoded_pos, decoded_head = decode_control_sequence(
         control=control,
         agent_type=agent_type,
@@ -105,6 +118,7 @@ def test_invalid_agent_type_id_is_rejected() -> None:
             current_pos=current_pos,
             current_head=current_head,
             agent_type=bad_agent_type,
+            **CONTROL_YAW_SCALE_KWARGS,
         )
 
 
@@ -139,8 +153,9 @@ def test_rolling_projection_round_trip_for_vehicle_uses_decoder_consistent_pose(
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
     )
-    control = denormalize_control(control_norm, agent_type=agent_type)
+    control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
     decoded_pos, decoded_head = decode_control_sequence(
         control=control,
         agent_type=agent_type,
@@ -172,6 +187,7 @@ def test_round_trip_error_reports_vehicle_lateral_teleport() -> None:
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
     )
 
     assert tuple(control_norm.shape) == (1, 1, 3)
@@ -191,6 +207,7 @@ def test_round_trip_error_is_zero_for_pedestrian() -> None:
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
     )
 
     torch.testing.assert_close(round_trip_error_m, torch.zeros_like(round_trip_error_m))
@@ -207,7 +224,11 @@ def test_control_norm_to_pose_norm_returns_pose_space_shape() -> None:
     control_norm[..., 0] = 1.0
     agent_type = torch.tensor([0, 1])
 
-    pose_norm = control_norm_to_pose_norm(control_norm=control_norm, agent_type=agent_type)
+    pose_norm = control_norm_to_pose_norm(
+        control_norm=control_norm,
+        agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
 
     assert tuple(pose_norm.shape) == (2, 5, 4)
     torch.testing.assert_close(

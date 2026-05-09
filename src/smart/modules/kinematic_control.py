@@ -8,9 +8,6 @@ POSE_FLOW_DIM = 4
 CONTROL_FLOW_DIM = 3
 DEFAULT_CONTROL_POS_SCALE_M = 1.0
 DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M = 5.0
-DEFAULT_CONTROL_VEHICLE_YAW_SCALE_RAD = 0.025
-DEFAULT_CONTROL_PEDESTRIAN_YAW_SCALE_RAD = 0.20
-DEFAULT_CONTROL_CYCLIST_YAW_SCALE_RAD = 0.06
 POSE_NORM_POS_SCALE_M = 20.0
 
 # repo의 다른 모듈(draft_physics, agent_encoder, dataset 전처리)이 공유하는 정수 매핑입니다.
@@ -59,8 +56,34 @@ def _validate_control_agent_type(control: Tensor, agent_type: Tensor) -> None:
     _validate_agent_type(agent_type)
 
 
+def validate_control_yaw_scale_config(
+    *,
+    vehicle_yaw_scale_rad: float | None,
+    pedestrian_yaw_scale_rad: float | None,
+    cyclist_yaw_scale_rad: float | None,
+) -> tuple[float, float, float]:
+    """config에서 받은 agent별 yaw 정규화 scale을 검증합니다."""
+    scales = {
+        "control_vehicle_yaw_scale_rad": vehicle_yaw_scale_rad,
+        "control_pedestrian_yaw_scale_rad": pedestrian_yaw_scale_rad,
+        "control_cyclist_yaw_scale_rad": cyclist_yaw_scale_rad,
+    }
+    validated = []
+    for name, value in scales.items():
+        if value is None:
+            raise ValueError(f"{name} must be configured for control-space flow.")
+        scale = float(value)
+        if scale <= 0.0:
+            raise ValueError(f"{name} must be positive, got {scale}.")
+        validated.append(scale)
+    return validated[0], validated[1], validated[2]
+
+
 def resolve_control_yaw_scale(
     agent_type: Tensor,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
     dtype: torch.dtype | None = None,
     device: torch.device | None = None,
 ) -> Tensor:
@@ -69,12 +92,14 @@ def resolve_control_yaw_scale(
     Args:
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
             vehicle은 ``0``, pedestrian은 ``1``, cyclist는 ``2`` 입니다.
+        vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
+        pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
+        cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
         dtype: 반환 tensor 자료형입니다. 값이 없으면 ``torch.float32`` 를 씁니다.
         device: 반환 tensor 장치입니다. 값이 없으면 ``agent_type`` 장치를 씁니다.
 
     Returns:
         Tensor: agent별 yaw scale입니다. shape은 ``[N]`` 입니다.
-            vehicle은 ``0.025rad``, pedestrian은 ``0.20rad``, cyclist는 ``0.06rad`` 입니다.
     """
     if agent_type.ndim != 1:
         raise ValueError(f"agent_type must have shape [N], got {tuple(agent_type.shape)}.")
@@ -85,11 +110,16 @@ def resolve_control_yaw_scale(
 
     agent_type_device = agent_type.to(device=device)
     _validate_agent_type(agent_type_device)
+    vehicle_scale, pedestrian_scale, cyclist_scale = validate_control_yaw_scale_config(
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
+    )
 
     yaw_scale = torch.empty(agent_type_device.shape, device=device, dtype=dtype)
-    yaw_scale[agent_type_device == VEHICLE_TYPE_ID] = DEFAULT_CONTROL_VEHICLE_YAW_SCALE_RAD
-    yaw_scale[agent_type_device == PEDESTRIAN_TYPE_ID] = DEFAULT_CONTROL_PEDESTRIAN_YAW_SCALE_RAD
-    yaw_scale[agent_type_device == CYCLIST_TYPE_ID] = DEFAULT_CONTROL_CYCLIST_YAW_SCALE_RAD
+    yaw_scale[agent_type_device == VEHICLE_TYPE_ID] = vehicle_scale
+    yaw_scale[agent_type_device == PEDESTRIAN_TYPE_ID] = pedestrian_scale
+    yaw_scale[agent_type_device == CYCLIST_TYPE_ID] = cyclist_scale
     return yaw_scale
 
 
@@ -128,7 +158,11 @@ def safe_sinc(x: Tensor, eps: float = 1.0e-6) -> Tensor:
 def normalize_control(
     control: Tensor,
     agent_type: Tensor,
+    *,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
 ) -> Tensor:
     """제어값을 Flow Matching 학습 스케일로 바꿉니다.
 
@@ -137,7 +171,9 @@ def normalize_control(
             마지막 차원은 ``[앞뒤 이동량, 좌우 이동량, 방향 변화량]`` 입니다.
         pos_scale_m: 이동량을 나눌 meter 단위 값입니다. 모든 agent에 공통 적용합니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
-            yaw는 vehicle ``0.025rad``, pedestrian ``0.20rad``, cyclist ``0.06rad`` 로 나눕니다.
+        vehicle_yaw_scale_rad: vehicle yaw를 나눌 radian 단위 값입니다.
+        pedestrian_yaw_scale_rad: pedestrian yaw를 나눌 radian 단위 값입니다.
+        cyclist_yaw_scale_rad: cyclist yaw를 나눌 radian 단위 값입니다.
 
     Returns:
         Tensor: 정규화된 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
@@ -150,6 +186,9 @@ def normalize_control(
     _validate_control_agent_type(control=control, agent_type=agent_type)
     yaw_scale = resolve_control_yaw_scale(
         agent_type=agent_type,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
         dtype=control.dtype,
         device=control.device,
     )
@@ -161,7 +200,11 @@ def normalize_control(
 def denormalize_control(
     control_norm: Tensor,
     agent_type: Tensor,
+    *,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
 ) -> Tensor:
     """정규화된 제어값을 실제 단위로 되돌립니다.
 
@@ -169,7 +212,9 @@ def denormalize_control(
         control_norm: 정규화된 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
         pos_scale_m: 이동량 정규화에 쓴 meter 단위 값입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
-            yaw는 vehicle ``0.025rad``, pedestrian ``0.20rad``, cyclist ``0.06rad`` 로 곱합니다.
+        vehicle_yaw_scale_rad: vehicle yaw를 복원할 radian 단위 값입니다.
+        pedestrian_yaw_scale_rad: pedestrian yaw를 복원할 radian 단위 값입니다.
+        cyclist_yaw_scale_rad: cyclist yaw를 복원할 radian 단위 값입니다.
 
     Returns:
         Tensor: 실제 단위 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
@@ -182,6 +227,9 @@ def denormalize_control(
     _validate_control_agent_type(control=control_norm, agent_type=agent_type)
     yaw_scale = resolve_control_yaw_scale(
         agent_type=agent_type,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
         dtype=control_norm.dtype,
         device=control_norm.device,
     )
@@ -278,7 +326,11 @@ def decode_control_sequence(
 def control_norm_to_pose_norm(
     control_norm: Tensor,
     agent_type: Tensor,
+    *,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
     pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
 ) -> Tensor:
     """정규화된 제어 시퀀스를 기존 pose-space 표현으로 바꿉니다.
@@ -288,6 +340,9 @@ def control_norm_to_pose_norm(
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
             yaw 역정규화는 agent type별 scale을 사용합니다.
         pos_scale_m: 이동량 정규화에 쓴 meter 단위 값입니다.
+        vehicle_yaw_scale_rad: vehicle yaw를 복원할 radian 단위 값입니다.
+        pedestrian_yaw_scale_rad: pedestrian yaw를 복원할 radian 단위 값입니다.
+        cyclist_yaw_scale_rad: cyclist yaw를 복원할 radian 단위 값입니다.
         pose_pos_scale_m: 기존 pose-space Flow 표현의 위치 정규화 meter 값입니다.
 
     Returns:
@@ -299,6 +354,9 @@ def control_norm_to_pose_norm(
         control_norm=control_norm,
         pos_scale_m=pos_scale_m,
         agent_type=agent_type,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
     pos, head = decode_control_sequence(control=control, agent_type=agent_type)
     return torch.stack(
@@ -318,7 +376,11 @@ def build_rolling_control_target(
     current_pos: Tensor,
     current_head: Tensor,
     agent_type: Tensor,
+    *,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
 ) -> Tensor:
     """GT pose를 decoder-consistent rolling control label로 바꿉니다.
 
@@ -329,6 +391,9 @@ def build_rolling_control_target(
         current_head: anchor 현재 방향입니다. shape은 ``[N]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
+        vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
+        pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
+        cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
 
     Returns:
         Tensor: 정규화된 rolling control label입니다. shape은 ``[N, T, 3]`` 입니다.
@@ -390,6 +455,9 @@ def build_rolling_control_target(
         control=control,
         pos_scale_m=pos_scale_m,
         agent_type=agent_type,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
 
 
@@ -399,7 +467,11 @@ def build_rolling_control_target_with_round_trip_error(
     current_pos: Tensor,
     current_head: Tensor,
     agent_type: Tensor,
+    *,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
 ) -> tuple[Tensor, Tensor]:
     """GT pose를 control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
 
@@ -410,6 +482,9 @@ def build_rolling_control_target_with_round_trip_error(
         current_head: anchor 현재 방향입니다. shape은 ``[N]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
+        vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
+        pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
+        cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
 
     Returns:
         tuple[Tensor, Tensor]:
@@ -423,11 +498,17 @@ def build_rolling_control_target_with_round_trip_error(
         current_head=current_head,
         agent_type=agent_type,
         pos_scale_m=pos_scale_m,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
     control = denormalize_control(
         control_norm=control_norm,
         pos_scale_m=pos_scale_m,
         agent_type=agent_type,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
     decoded_pos, _ = decode_control_sequence(
         control=control,

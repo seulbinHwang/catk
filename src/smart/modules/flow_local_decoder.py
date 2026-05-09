@@ -21,7 +21,10 @@ from src.smart.utils import (
     wrap_angle,
 )
 from src.smart.modules.draft_physics import DEFAULT_LIMITS
-from src.smart.modules.kinematic_control import control_norm_to_pose_norm
+from src.smart.modules.kinematic_control import (
+    control_norm_to_pose_norm,
+    validate_control_yaw_scale_config,
+)
 
 
 @dataclass(frozen=True)
@@ -806,6 +809,9 @@ class ContinuousCommitBridge:
         config: LQRCommitBridgeConfig | None = None,
         use_kinematic_control_flow: bool = False,
         control_pos_scale_m: float = 1.0,
+        control_vehicle_yaw_scale_rad: float | None = None,
+        control_pedestrian_yaw_scale_rad: float | None = None,
+        control_cyclist_yaw_scale_rad: float | None = None,
     ) -> None:
         self.commit_steps = int(commit_steps)
         self.pos_scale_m = float(pos_scale_m)
@@ -813,6 +819,19 @@ class ContinuousCommitBridge:
         self.use_stop_motion = bool(use_stop_motion)
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.control_pos_scale_m = float(control_pos_scale_m)
+        self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
+        self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
+        self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
+        if self.use_kinematic_control_flow:
+            (
+                self.control_vehicle_yaw_scale_rad,
+                self.control_pedestrian_yaw_scale_rad,
+                self.control_cyclist_yaw_scale_rad,
+            ) = validate_control_yaw_scale_config(
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            )
         self.config = config if config is not None else LQRCommitBridgeConfig()
         self._difference_gram_cache: dict[tuple[int, str, str], torch.Tensor] = {}
 
@@ -860,6 +879,9 @@ class ContinuousCommitBridge:
                 control_norm=y_hat_norm,
                 agent_type=agent_type,
                 pos_scale_m=self.control_pos_scale_m,
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
             )
         first_chunk = y_hat_norm[:, : self.commit_steps].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m

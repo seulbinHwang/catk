@@ -21,6 +21,7 @@ from src.smart.modules.kinematic_control import (
     CONTROL_FLOW_DIM,
     POSE_FLOW_DIM,
     control_norm_to_pose_norm,
+    validate_control_yaw_scale_config,
 )
 from src.smart.modules.self_forced_rollout_detach import (
     detach_training_rollout_state,
@@ -60,6 +61,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_eps: float,
         use_kinematic_control_flow: bool = False,
         control_pos_scale_m: float = 1.0,
+        control_vehicle_yaw_scale_rad: float | None = None,
+        control_pedestrian_yaw_scale_rad: float | None = None,
+        control_cyclist_yaw_scale_rad: float | None = None,
         closed_loop_rollout_mode: str = "raw_fm",
         use_lqr: bool = False,
         use_stop_motion: bool = False,
@@ -87,6 +91,19 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.control_pos_scale_m = float(control_pos_scale_m)
+        self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
+        self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
+        self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
+        if self.use_kinematic_control_flow:
+            (
+                self.control_vehicle_yaw_scale_rad,
+                self.control_pedestrian_yaw_scale_rad,
+                self.control_cyclist_yaw_scale_rad,
+            ) = validate_control_yaw_scale_config(
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            )
         self.flow_state_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
         self.r_a2a_emb = FourierEmbedding(
             input_dim=6,
@@ -141,6 +158,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             config=lqr_commit_cfg,
             use_kinematic_control_flow=self.use_kinematic_control_flow,
             control_pos_scale_m=self.control_pos_scale_m,
+            control_vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+            control_pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+            control_cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
         )
 
     def build_interaction_edge(
@@ -499,6 +519,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             control_norm=value,
             agent_type=agent_type.to(device=value.device),
             pos_scale_m=self.control_pos_scale_m,
+            vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
         )
 
     def flow_norm_to_pose_metric_norm(
