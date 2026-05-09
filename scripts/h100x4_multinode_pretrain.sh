@@ -121,6 +121,8 @@ main() {
   local action="${CATK_ACTION:-fit}"
   local task_name="${TASK_NAME:-flow_semi_continuous_pretrain_h1004x2}"
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
+  local manual_rank_offset="${MANUAL_RANK_OFFSET:-}"
+  local manual_world_size="${MANUAL_WORLD_SIZE:-}"
 
   if [[ "$action" != "fit" && "$action" != "validate" && "$action" != "test" ]]; then
     log "ERROR: CATK_ACTION must be fit, validate, or test for this pretrain wrapper; got: $action"
@@ -176,6 +178,110 @@ main() {
     log "  ckpt_path:        $ckpt_path"
   fi
 
+  local app_args=(
+    -m src.run
+    experiment="$experiment"
+    action="$action"
+    trainer=ddp
+    trainer.devices="$trainer_devices"
+    trainer.num_nodes="$nnodes"
+    trainer.enable_progress_bar=true
+    paths.cache_root="$cache_root"
+    task_name="$task_name"
+  )
+
+  if [[ -n "$ckpt_path" ]]; then
+    app_args+=(ckpt_path="$ckpt_path")
+  fi
+  if [[ -n "${LOG_DIR:-}" ]]; then
+    app_args+=(paths.log_dir="$LOG_DIR")
+  fi
+  if [[ -n "${TRAIN_BATCH_SIZE:-}" ]]; then
+    app_args+=(data.train_batch_size="$TRAIN_BATCH_SIZE")
+  fi
+  if [[ -n "${VAL_BATCH_SIZE:-}" ]]; then
+    app_args+=(data.val_batch_size="$VAL_BATCH_SIZE")
+  fi
+  if [[ -n "${ACCUMULATE_GRAD_BATCHES:-}" ]]; then
+    app_args+=(trainer.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES")
+  fi
+  if [[ -n "${LIMIT_TRAIN_BATCHES:-}" ]]; then
+    app_args+=(trainer.limit_train_batches="$LIMIT_TRAIN_BATCHES")
+  fi
+  if [[ -n "${LIMIT_VAL_BATCHES:-}" ]]; then
+    app_args+=(trainer.limit_val_batches="$LIMIT_VAL_BATCHES")
+  fi
+  if [[ -n "${MAX_EPOCHS:-}" ]]; then
+    app_args+=(trainer.max_epochs="$MAX_EPOCHS")
+  fi
+  if [[ -n "${CATK_LR:-}" ]]; then
+    app_args+=(model.model_config.lr="$CATK_LR")
+  fi
+  if [[ -n "${CATK_HYDRA_OVERRIDES:-}" ]]; then
+    read -r -a extra_overrides <<< "$CATK_HYDRA_OVERRIDES"
+    app_args+=("${extra_overrides[@]}")
+  fi
+  app_args+=("$@")
+
+  if [[ -n "$manual_rank_offset" || -n "$manual_world_size" ]]; then
+    if ! [[ "$manual_rank_offset" =~ ^[0-9]+$ && "$manual_world_size" =~ ^[0-9]+$ ]]; then
+      log "ERROR: MANUAL_RANK_OFFSET and MANUAL_WORLD_SIZE must be non-negative integers."
+      exit 2
+    fi
+    if ! [[ "$nproc_per_node" =~ ^[0-9]+$ ]] || (( nproc_per_node < 1 )); then
+      log "ERROR: manual launch requires integer NPROC_PER_NODE; got: $nproc_per_node"
+      exit 2
+    fi
+    if [[ -z "$master_addr" ]]; then
+      log "ERROR: manual launch requires MASTER_ADDR."
+      exit 2
+    fi
+
+    log "manual heterogeneous launch:"
+    log "  rank_offset:      $manual_rank_offset"
+    log "  world_size:       $manual_world_size"
+    local -a pids=()
+    local local_rank global_rank pid remaining status
+    for (( local_rank = 0; local_rank < nproc_per_node; local_rank++ )); do
+      global_rank=$(( manual_rank_offset + local_rank ))
+      (
+        export MASTER_ADDR="$master_addr"
+        export MASTER_PORT="$master_port"
+        export WORLD_SIZE="$manual_world_size"
+        export LOCAL_WORLD_SIZE="$nproc_per_node"
+        export RANK="$global_rank"
+        export LOCAL_RANK="$local_rank"
+        export GROUP_RANK="${node_rank:-0}"
+        export ROLE_RANK="$global_rank"
+        export ROLE_WORLD_SIZE="$manual_world_size"
+        export TORCHELASTIC_RUN_ID="${TORCHELASTIC_RUN_ID:-$task_name}"
+        export TORCHELASTIC_RESTART_COUNT="${TORCHELASTIC_RESTART_COUNT:-0}"
+        export TORCHELASTIC_MAX_RESTARTS="${TORCHELASTIC_MAX_RESTARTS:-0}"
+        log "manual worker local_rank=$LOCAL_RANK rank=$RANK/$WORLD_SIZE"
+        exec python "${app_args[@]}"
+      ) &
+      pid=$!
+      pids+=("$pid")
+    done
+
+    status=0
+    remaining="${#pids[@]}"
+    while (( remaining > 0 )); do
+      wait -n
+      status=$?
+      if (( status != 0 )); then
+        log "manual worker failed with status $status; terminating peer workers"
+        kill -TERM "${pids[@]}" 2>/dev/null || true
+        sleep "${LOCAL_KILL_GRACE_SEC:-10}"
+        kill -KILL "${pids[@]}" 2>/dev/null || true
+        wait "${pids[@]}" 2>/dev/null || true
+        exit "$status"
+      fi
+      remaining=$(( remaining - 1 ))
+    done
+    exit 0
+  fi
+
   local torchrun_args=(
     --nnodes "$nnodes"
     --nproc_per_node "$nproc_per_node"
@@ -197,51 +303,7 @@ main() {
   if [[ -n "${LOCAL_ADDR:-}" ]]; then
     torchrun_args+=(--local_addr "$LOCAL_ADDR")
   fi
-
-  torchrun_args+=(
-    -m src.run
-    experiment="$experiment"
-    action="$action"
-    trainer=ddp
-    trainer.devices="$trainer_devices"
-    trainer.num_nodes="$nnodes"
-    trainer.enable_progress_bar=true
-    paths.cache_root="$cache_root"
-    task_name="$task_name"
-  )
-
-  if [[ -n "$ckpt_path" ]]; then
-    torchrun_args+=(ckpt_path="$ckpt_path")
-  fi
-  if [[ -n "${LOG_DIR:-}" ]]; then
-    torchrun_args+=(paths.log_dir="$LOG_DIR")
-  fi
-  if [[ -n "${TRAIN_BATCH_SIZE:-}" ]]; then
-    torchrun_args+=(data.train_batch_size="$TRAIN_BATCH_SIZE")
-  fi
-  if [[ -n "${VAL_BATCH_SIZE:-}" ]]; then
-    torchrun_args+=(data.val_batch_size="$VAL_BATCH_SIZE")
-  fi
-  if [[ -n "${ACCUMULATE_GRAD_BATCHES:-}" ]]; then
-    torchrun_args+=(trainer.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES")
-  fi
-  if [[ -n "${LIMIT_TRAIN_BATCHES:-}" ]]; then
-    torchrun_args+=(trainer.limit_train_batches="$LIMIT_TRAIN_BATCHES")
-  fi
-  if [[ -n "${LIMIT_VAL_BATCHES:-}" ]]; then
-    torchrun_args+=(trainer.limit_val_batches="$LIMIT_VAL_BATCHES")
-  fi
-  if [[ -n "${MAX_EPOCHS:-}" ]]; then
-    torchrun_args+=(trainer.max_epochs="$MAX_EPOCHS")
-  fi
-  if [[ -n "${CATK_LR:-}" ]]; then
-    torchrun_args+=(model.model_config.lr="$CATK_LR")
-  fi
-  if [[ -n "${CATK_HYDRA_OVERRIDES:-}" ]]; then
-    read -r -a extra_overrides <<< "$CATK_HYDRA_OVERRIDES"
-    torchrun_args+=("${extra_overrides[@]}")
-  fi
-  torchrun_args+=("$@")
+  torchrun_args+=("${app_args[@]}")
 
   log "torchrun command:"
   printf '  %q' torchrun "${torchrun_args[@]}"

@@ -57,6 +57,28 @@ def pod_ip(namespace: str, pod: str) -> str:
     )
 
 
+def pod_gpu_count(namespace: str, container: str, pod: str) -> int:
+    output = run_kubectl(
+        [
+            "exec",
+            "-n",
+            namespace,
+            pod,
+            "-c",
+            container,
+            "--",
+            "bash",
+            "-lc",
+            "nvidia-smi -L 2>/dev/null | wc -l",
+        ],
+        capture=True,
+    )
+    count = int(output.strip())
+    if count < 1:
+        raise RuntimeError(f"no GPUs found in pod {pod}")
+    return count
+
+
 def export_line(name: str, value: object) -> str:
     return f"export {name}={shq(value)}"
 
@@ -111,11 +133,15 @@ def render_env_file(
     master_addr: str,
     task_name: str,
     run_root: str,
+    local_world_size: int | None = None,
+    manual_rank_offset: int | None = None,
+    manual_world_size: int | None = None,
 ) -> str:
+    nproc_per_node = local_world_size if local_world_size is not None else args.nproc_per_node
     lines = [
         export_line("CACHE_ROOT", cache_root),
         export_line("NNODES", len(args.pods)),
-        export_line("NPROC_PER_NODE", args.nproc_per_node),
+        export_line("NPROC_PER_NODE", nproc_per_node),
         export_line("NODE_RANK", rank),
         export_line("MASTER_ADDR", master_addr),
         export_line("MASTER_PORT", args.master_port),
@@ -127,6 +153,14 @@ def render_env_file(
         export_line("LOG_DIR", args.log_dir),
         export_line("RUN_ROOT", run_root),
     ]
+    if manual_rank_offset is not None and manual_world_size is not None:
+        lines.extend(
+            [
+                export_line("MANUAL_RANK_OFFSET", manual_rank_offset),
+                export_line("MANUAL_WORLD_SIZE", manual_world_size),
+                export_line("TRAINER_DEVICES", nproc_per_node),
+            ]
+        )
     optional_env = {
         "CATK_CKPT_PATH": args.ckpt_path,
         "TRAIN_BATCH_SIZE": args.train_batch_size,
@@ -457,6 +491,9 @@ def render_start_command(
     rank: int,
     master_addr: str,
     task_name: str,
+    local_world_size: int | None = None,
+    manual_rank_offset: int | None = None,
+    manual_world_size: int | None = None,
 ) -> str:
     safe_task = task_name.replace("/", "_")
     run_root = f"{args.log_dir.rstrip('/')}/tmux_h100x4_multinode_pretrain/{safe_task}"
@@ -473,6 +510,9 @@ def render_start_command(
         master_addr=master_addr,
         task_name=task_name,
         run_root=run_root,
+        local_world_size=local_world_size,
+        manual_rank_offset=manual_rank_offset,
+        manual_world_size=manual_world_size,
     )
     run_text = render_run_script(args.project_root, env_file)
     monitor_text = render_monitor_script(args.monitor_interval, task_name)
@@ -641,6 +681,14 @@ def parse_args() -> argparse.Namespace:
         help="Rank-0 pod HTTP port used to serve --ckpt-path to worker pods.",
     )
     parser.add_argument("--nproc-per-node", type=validate_nproc_per_node, default="4")
+    parser.add_argument(
+        "--manual-rank-offsets",
+        action="store_true",
+        help=(
+            "Launch one process per local GPU with explicit RANK/WORLD_SIZE "
+            "env vars instead of torchrun. Use for heterogeneous pod GPU counts."
+        ),
+    )
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--train-batch-size", default="")
     parser.add_argument("--val-batch-size", default="")
@@ -664,6 +712,8 @@ def parse_args() -> argparse.Namespace:
 
     if len(args.pods) < 2 and not args.stop:
         parser.error("--pods must contain at least two pods for multi-node training")
+    if args.manual_rank_offsets and args.action != "fit" and not args.stop:
+        parser.error("--manual-rank-offsets is only wired for action=fit")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
     if args.action in {"validate", "test"} and not args.ckpt_path and not args.stop:
@@ -698,6 +748,30 @@ def main() -> None:
     for pod in args.pods:
         print(f"  {pod}: {cache_root_for_pod(args, pod)}")
 
+    local_world_sizes: dict[str, int] = {}
+    rank_offsets: dict[str, int] = {}
+    manual_world_size: int | None = None
+    if args.manual_rank_offsets:
+        offset = 0
+        for pod in args.pods:
+            if args.dry_run and args.nproc_per_node in {"auto", "gpu"}:
+                local_size = 1
+            elif args.nproc_per_node in {"auto", "gpu"}:
+                local_size = pod_gpu_count(args.namespace, args.container, pod)
+            else:
+                local_size = int(args.nproc_per_node)
+            local_world_sizes[pod] = local_size
+            rank_offsets[pod] = offset
+            offset += local_size
+        manual_world_size = offset
+        print("[launcher] manual rank layout:")
+        for pod in args.pods:
+            print(
+                f"  {pod}: local_world_size={local_world_sizes[pod]} "
+                f"rank_offset={rank_offsets[pod]}"
+            )
+        print(f"[launcher] manual world_size: {manual_world_size}")
+
     for rank, pod in enumerate(args.pods):
         script = render_start_command(
             args=args,
@@ -705,6 +779,9 @@ def main() -> None:
             rank=rank,
             master_addr=master_addr,
             task_name=args.task_name,
+            local_world_size=local_world_sizes.get(pod),
+            manual_rank_offset=rank_offsets.get(pod),
+            manual_world_size=manual_world_size,
         )
         exec_in_pod(args.namespace, args.container, pod, script, dry_run=args.dry_run)
 

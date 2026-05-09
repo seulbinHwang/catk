@@ -30,6 +30,7 @@ POD_CACHE_ROOTS="${POD_CACHE_ROOTS:-}"
 MASTER_PORT="${MASTER_PORT:-29511}"
 CHECKPOINT_SYNC_PORT="${CHECKPOINT_SYNC_PORT:-29512}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
+MANUAL_RANK_OFFSETS="${MANUAL_RANK_OFFSETS:-0}"
 INITIAL_BS="${INITIAL_BS:-26}"
 OOM_STEP="${OOM_STEP:-2}"
 MIN_BS="${MIN_BS:-20}"
@@ -105,6 +106,9 @@ start_attempt() {
 
   if [[ -n "$CACHE_ROOT" ]]; then
     cmd+=(--cache-root "$CACHE_ROOT")
+  fi
+  if [[ "$MANUAL_RANK_OFFSETS" == "1" ]]; then
+    cmd+=(--manual-rank-offsets)
   fi
   if [[ -n "$POD_CACHE_ROOTS" ]]; then
     read -r -a pod_cache_root_array <<< "$POD_CACHE_ROOTS"
