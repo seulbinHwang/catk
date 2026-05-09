@@ -100,6 +100,10 @@ class FinetuneConfig:
     #: ``max(bptt_warm_coarse_steps, bptt_max_coarse_steps - bptt_last_n_coarse_steps)`` 로 override.
     #: 예: bptt_max_coarse_steps=16, bptt_last_n_coarse_steps=4 → warm_coarse=12 → 마지막 4 step gradient.
     bptt_last_n_coarse_steps: int = 0
+    #: True → ``ocsc_pred_max_steps - 1`` coarse step 을 no_grad warm-up 으로 처리하고
+    #: 마지막 1 coarse step 만 gradient 흘림.  ``warm_coarse = pred_max_steps - 1`` 로 override.
+    #: 이전엔 schema 누락으로 silently False 였음 (origin/OCSC_clean 도 동일 버그).
+    bptt_last_coarse_only: bool = False
     #: True → training step 마다 pretrained ref 를 G rollout no_grad 로 돌려
     #: ``train/rmm_ref`` 와 ``train/rmm_delta`` (= finetuned − pretrained) 를 로깅.
     #: step 당 ∼1배 추가 시간 (no_grad 이므로 grad rollout 보다 빠름).
@@ -264,6 +268,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         bptt_sequential_rollouts=bool(_read_config_value(finetune, "bptt_sequential_rollouts", True)),
         bptt_warm_coarse_steps=int(_read_config_value(finetune, "bptt_warm_coarse_steps", 0)),
         bptt_last_n_coarse_steps=int(_read_config_value(finetune, "bptt_last_n_coarse_steps", 0)),
+        bptt_last_coarse_only=bool(_read_config_value(finetune, "bptt_last_coarse_only", False)),
         rmm_bptt_ref_train=bool(_read_config_value(finetune, "rmm_bptt_ref_train", False)),
         rmm_bptt_ref_val=bool(_read_config_value(finetune, "rmm_bptt_ref_val", False)),
         ocsc_n_rollouts=int(_read_config_value(finetune, "ocsc_n_rollouts", 2)),
