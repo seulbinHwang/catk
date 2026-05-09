@@ -49,6 +49,10 @@ from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
+# OCSC pipeline verbose tracing.  set OCSC_VERBOSE=1 to dump per-call args / grad / loss state.
+import os as _os
+_OCSC_VERBOSE = _os.environ.get("OCSC_VERBOSE", "0") not in ("0", "", "false", "False")
+
 
 class SMARTFlow(LightningModule):
 
@@ -822,6 +826,15 @@ class SMARTFlow(LightningModule):
         share_noise_across_time: bool = False,
         noise_tape_override: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Dict[str, Tensor] | None]:
+        if _OCSC_VERBOSE:
+            _nto = (None if noise_tape_override is None
+                    else f"shape={tuple(noise_tape_override.shape)} req_grad={noise_tape_override.requires_grad}")
+            log.info(
+                f"[ocsc_dbg] _run_parallel_rollout_chunk entry: "
+                f"rollouts={list(rollout_indices)} full_grad={full_grad} max_steps={max_steps} "
+                f"warm_coarse_steps={warm_coarse_steps} share_noise_across_time={share_noise_across_time} "
+                f"noise_tape_override={_nto} return_anchor_hidden={return_anchor_hidden}"
+            )
         """주어진 rollout 번호 묶음을 한 번의 큰 batch로 실행합니다.
 
         Args:
@@ -878,6 +891,13 @@ class SMARTFlow(LightningModule):
                     "traj": pred["pred_flow_preview_traj"].unsqueeze(1),
                     "valid": pred["pred_flow_preview_valid"].unsqueeze(1),
                 }
+            if _OCSC_VERBOSE:
+                _pt = pred["pred_traj_10hz"]
+                log.info(
+                    f"[ocsc_dbg] _run_parallel_rollout_chunk exit (single chunk): "
+                    f"pred_traj_10hz shape={tuple(_pt.shape)} req_grad={_pt.requires_grad} "
+                    f"grad_fn={type(_pt.grad_fn).__name__ if _pt.grad_fn is not None else None}"
+                )
             return (
                 pred["pred_traj_10hz"].unsqueeze(1),
                 pred["pred_z_10hz"].unsqueeze(1),
@@ -938,6 +958,13 @@ class SMARTFlow(LightningModule):
                     num_agent=num_agent,
                 ),
             }
+        if _OCSC_VERBOSE:
+            _pt = pred["pred_traj_10hz"]
+            log.info(
+                f"[ocsc_dbg] _run_parallel_rollout_chunk exit (multi chunk={chunk_size}): "
+                f"pred_traj_10hz shape={tuple(_pt.shape)} req_grad={_pt.requires_grad} "
+                f"grad_fn={type(_pt.grad_fn).__name__ if _pt.grad_fn is not None else None}"
+            )
         return (
             self._reshape_parallel_rollout_prediction(
                 pred["pred_traj_10hz"],
@@ -1495,6 +1522,21 @@ class SMARTFlow(LightningModule):
         _last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
         _last_n_coarse = int(getattr(self.finetune_config, "bptt_last_n_coarse_steps", 0))
         _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
+        if _OCSC_VERBOSE:
+            _trainable = [(n, p.numel()) for n, p in self.named_parameters() if p.requires_grad]
+            _trainable_total = sum(c for _, c in _trainable)
+            log.info(
+                f"[ocsc_dbg] _run_flow_ocsc_ft_step entry: G={G} M_ol={M_ol} "
+                f"nearest_match={_nearest_match} use_mmd={use_mmd} use_gt_target={use_gt_target} "
+                f"pred_max_steps={pred_max_steps} warm_coarse={warm_coarse} "
+                f"last_coarse_only={_last_coarse_only} use_adjoint={use_adjoint} "
+                f"sequential={sequential} pos_w={pos_w} heading_w={heading_w} rel_disp_w={rel_disp_w} "
+                f"fm_reg_lambda={fm_reg_lambda} grad_clip_traj={_grad_clip}"
+            )
+            log.info(
+                f"[ocsc_dbg] trainable_params: {len(_trainable)} groups, total={_trainable_total} elems. "
+                f"top5: {[(n, c) for n, c in _trainable[:5]]}"
+            )
         # consistency 구간을 실제 grad가 살아있는 10Hz suffix로 제한할지 여부.
         # bptt_last_coarse_only=true면 warm_coarse=pred_max_steps-1 이므로 마지막 coarse step만 남긴다.
         _consistency_tail_10hz_steps: int | None = None
@@ -2070,8 +2112,38 @@ class SMARTFlow(LightningModule):
                                 )
                                 for g in range(G)
                             ]).mean()
+                    if _OCSC_VERBOSE:
+                        try:
+                            _vh_params = [p for n, p in self.named_parameters() if "velocity_head" in n and "residual" not in n and p.requires_grad]
+                            _vh_grad_pre = sum(
+                                (p.grad.norm() ** 2 if p.grad is not None else torch.tensor(0.0, device=p.device))
+                                for p in _vh_params
+                            ).sqrt().item() if _vh_params else float("nan")
+                        except Exception:
+                            _vh_grad_pre = float("nan")
+                        log.info(
+                            f"[ocsc_dbg] anchor pre-backward: anchor_idx={anchor_idx} "
+                            f"anchor_loss={float(anchor_loss):.6e} "
+                            f"req_grad={anchor_loss.requires_grad} "
+                            f"grad_fn={type(anchor_loss.grad_fn).__name__ if anchor_loss.grad_fn is not None else None} "
+                            f"n_anchors_total={n_anchors_total} "
+                            f"velocity_head_grad_norm_pre={_vh_grad_pre:.6e}"
+                        )
                     total_loss_accum += anchor_loss.item()
                     (anchor_loss / n_anchors_total).backward()
+                    if _OCSC_VERBOSE:
+                        try:
+                            _vh_grad_post = sum(
+                                (p.grad.norm() ** 2 if p.grad is not None else torch.tensor(0.0, device=p.device))
+                                for p in _vh_params
+                            ).sqrt().item() if _vh_params else float("nan")
+                        except Exception:
+                            _vh_grad_post = float("nan")
+                        log.info(
+                            f"[ocsc_dbg] anchor post-backward: anchor_idx={anchor_idx} "
+                            f"velocity_head_grad_norm_post={_vh_grad_post:.6e} "
+                            f"delta={(_vh_grad_post - _vh_grad_pre):.6e}"
+                        )
 
                     # 진단용: 마지막 anchor의 CL/OL 보존 (variance logging; GT mode에서는 OL skip)
                     _diag_pred_traj = pred_traj_all.detach()
@@ -2196,7 +2268,33 @@ class SMARTFlow(LightningModule):
             if "loss" in diag:
                 self.manual_backward(diag["loss"])
 
+            if _OCSC_VERBOSE:
+                try:
+                    _vh_params = [p for n, p in self.named_parameters() if "velocity_head" in n and "residual" not in n and p.requires_grad]
+                    _vh_w_pre = sum(p.detach().norm() ** 2 for p in _vh_params).sqrt().item() if _vh_params else float("nan")
+                    _vh_g_pre = sum(
+                        (p.grad.detach().norm() ** 2 if p.grad is not None else torch.tensor(0.0, device=p.device))
+                        for p in _vh_params
+                    ).sqrt().item() if _vh_params else float("nan")
+                except Exception:
+                    _vh_w_pre = float("nan")
+                    _vh_g_pre = float("nan")
+
             opt.step()
+
+            if _OCSC_VERBOSE:
+                try:
+                    _vh_w_post = sum(p.detach().norm() ** 2 for p in _vh_params).sqrt().item() if _vh_params else float("nan")
+                    _delta_w = abs(_vh_w_post - _vh_w_pre)
+                except Exception:
+                    _vh_w_post = float("nan")
+                    _delta_w = float("nan")
+                log.info(
+                    f"[ocsc_dbg] step={int(getattr(self,'global_step',0))} "
+                    f"velocity_head_grad_norm_total={_vh_g_pre:.6e} "
+                    f"velocity_head_weight_norm pre={_vh_w_pre:.6e} post={_vh_w_post:.6e} "
+                    f"|delta_w|={_delta_w:.6e}"
+                )
 
             for k, v in diag.items():
                 if k == "loss":
