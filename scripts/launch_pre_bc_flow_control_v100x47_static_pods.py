@@ -35,6 +35,8 @@ DEFAULT_PODS = (
     "fvvvvv",
 )
 DEFAULT_EXTRA_HYDRA_OVERRIDES = (
+    "trainer.strategy._target_="
+    "src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy "
     "trainer.strategy.cluster_environment._target_="
     "src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment"
 )

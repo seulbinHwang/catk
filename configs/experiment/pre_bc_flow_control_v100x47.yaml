@@ -56,6 +56,7 @@ trainer:
   sync_batchnorm: false
   accumulate_grad_batches: 1
   strategy:
+    _target_: src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy
     cluster_environment:
       _target_: src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment
 

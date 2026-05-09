@@ -252,6 +252,7 @@ main() {
         export RANK="$global_rank"
         export LOCAL_RANK="$local_rank"
         export GROUP_RANK="${node_rank:-0}"
+        export GROUP_WORLD_SIZE="$nnodes"
         export ROLE_RANK="$global_rank"
         export ROLE_WORLD_SIZE="$manual_world_size"
         export TORCHELASTIC_RUN_ID="${TORCHELASTIC_RUN_ID:-$task_name}"
