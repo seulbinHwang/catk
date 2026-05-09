@@ -1,0 +1,18 @@
+# @package _global_
+
+# Control-space Flow Matching pretrain preset for one 4x H100 80GB pod.
+#
+# This intentionally inherits the full 4x H100 pretrain recipe and changes only
+# the Flow Matching target space. With the flag below:
+#   * token processor builds GT labels on the fly as [delta_s, delta_n, delta_yaw].
+#   * decoder flow state dimension switches from pose-space 4D to control-space 3D.
+#   * metric/rollout paths restore predictions back to pose-space internally.
+
+defaults:
+  - pre_bc_flow_4_h100
+  - _self_
+
+model:
+  model_config:
+    token_processor:
+      use_kinematic_control_flow: true

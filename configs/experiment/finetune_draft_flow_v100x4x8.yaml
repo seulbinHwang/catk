@@ -36,7 +36,7 @@ model:
     n_batch_sim_agents_metric: 10
     sim_agents_metric_workers: 1
     draft:
-      enabled: true
+      enabled: false
       loss_enabled: true
       max_weight: 0.15
       physics:

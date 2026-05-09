@@ -72,7 +72,7 @@ model:
       train_full_flow_decoder_only: true
 
     draft:
-      enabled: true
+      enabled: false
       loss_enabled: true
       start_epoch: 0
       ramp_epochs: 32
