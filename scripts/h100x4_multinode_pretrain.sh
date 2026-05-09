@@ -177,7 +177,7 @@ main() {
     trainer=ddp
     trainer.devices="$nproc_per_node"
     trainer.num_nodes="$nnodes"
-    +trainer.enable_progress_bar=true
+    trainer.enable_progress_bar=true
     paths.cache_root="$cache_root"
     task_name="$task_name"
   )
