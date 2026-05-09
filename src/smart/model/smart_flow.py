@@ -2053,6 +2053,60 @@ class SMARTFlow(LightningModule):
                     if use_gt_target:
                         _gt_slice = _slice_consistency_suffix_2hz(gt_norm_anchor)
                         _gt_valid_slice = _slice_valid_suffix_2hz(gt_valid_anchor)
+                        if _OCSC_VERBOSE and int(getattr(self, "global_step", 0)) <= 1:
+                            with torch.no_grad():
+                                _cl0 = _slice_consistency_suffix_2hz(cl_norms[0]).detach()
+                                _gt0 = _gt_slice.detach()
+                                _t_min = min(_cl0.shape[-2], _gt0.shape[-2])
+                                _cl_v = _cl0[:, :_t_min, :]
+                                _gt_v = _gt0[:, :_t_min, :]
+                                _diff = (_cl_v - _gt_v)
+                                _n_active = _cl_v.shape[0]
+                                # raw value samples (first agent, first timestep)
+                                _cl_a0 = _cl_v[0, 0].cpu().tolist() if _n_active > 0 else []
+                                _gt_a0 = _gt_v[0, 0].cpu().tolist() if _n_active > 0 else []
+                                _diff_norm_pos = _diff[..., :2].norm().item()
+                                _diff_norm_head = _diff[..., 2:].norm().item()
+                                _cl_norm_pos = _cl_v[..., :2].norm().item()
+                                _cl_norm_head = _cl_v[..., 2:].norm().item()
+                                _gt_norm_pos = _gt_v[..., :2].norm().item()
+                                _gt_norm_head = _gt_v[..., 2:].norm().item()
+                                # raw pred_traj sample (world-frame xy)
+                                _pt0 = pred_traj_all[active_mask, 0, :, :].detach()
+                                _pt_a0 = _pt0[0, 0].cpu().tolist() if _n_active > 0 else []
+                                _pt_a0_last = _pt0[0, -1].cpu().tolist() if _n_active > 0 else []
+                                _cur_pos = current_pos_active[0].cpu().tolist() if _n_active > 0 else []
+                                _cur_head = float(current_head_active[0].item()) if _n_active > 0 else None
+                            log.info(
+                                f"[ocsc_dbg_frame] anchor={anchor_idx} n_active={_n_active} T_min={_t_min} "
+                                f"pred_traj[0,0]={_pt_a0} pred_traj[0,-1]={_pt_a0_last} "
+                                f"current_pos[0]={_cur_pos} current_head[0]={_cur_head}"
+                            )
+                            log.info(
+                                f"[ocsc_dbg_frame] anchor={anchor_idx} cl_norm[0,0]={_cl_a0} gt_norm[0,0]={_gt_a0}"
+                            )
+                            log.info(
+                                f"[ocsc_dbg_frame] anchor={anchor_idx} "
+                                f"|cl-gt|_pos={_diff_norm_pos:.6e} |cl-gt|_head={_diff_norm_head:.6e} "
+                                f"|cl|_pos={_cl_norm_pos:.6e} |cl|_head={_cl_norm_head:.6e} "
+                                f"|gt|_pos={_gt_norm_pos:.6e} |gt|_head={_gt_norm_head:.6e}"
+                            )
+                            # per-channel loss decomposition (pos vs heading vs rel_disp)
+                            _p = _cl_v
+                            _t = _gt_v.detach()
+                            _pos_mse = F.mse_loss(_p[..., :2], _t[..., :2]).item()
+                            _head_mse = F.mse_loss(_p[..., 2:], _t[..., 2:]).item()
+                            _rel_disp_mse = (
+                                F.mse_loss(_p[..., 1:, :2] - _p[..., :-1, :2],
+                                           _t[..., 1:, :2] - _t[..., :-1, :2]).item()
+                                if _t_min >= 2 else float("nan")
+                            )
+                            log.info(
+                                f"[ocsc_dbg_loss_decomp] anchor={anchor_idx} "
+                                f"pos_mse={_pos_mse:.6e} (w={pos_w}) "
+                                f"head_mse={_head_mse:.6e} (w={heading_w}) "
+                                f"rel_disp_mse={_rel_disp_mse:.6e} (w={rel_disp_w})"
+                            )
                         if use_mmd and G >= 2:
                             T_min = min(cl_norms[0].shape[-2], _gt_slice.shape[-2])
                             cl_stack = torch.stack(
