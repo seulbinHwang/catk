@@ -543,14 +543,14 @@ scripts/launch_pre_bc_flow_control_v100x47_static_pods.py
 - `model.model_config.token_processor.use_kinematic_control_flow=true`
 - `model.model_config.token_processor.use_prefix_valid_future_loss_mask=true`
 - `model.model_config.token_processor.control_round_trip_max_position_error_m=2.0`
-- `data.train_batch_size=8`, effective global batch `8 * 47 = 376`
+- `data.train_batch_size=6`, effective global batch `6 * 47 = 282`
 - `model.model_config.lr=6e-4`
 
 4GPU pod와 3GPU pod를 섞으면 `torchrun --nproc_per_node`의 homogeneous local world size 가정과 Lightning 기본 TorchElastic 검증의 `devices * num_nodes == WORLD_SIZE` 가정이 맞지 않습니다. 그래서 이 launcher는 `--manual-rank-offsets` 경로로 각 pod의 GPU 수를 읽어 `RANK/WORLD_SIZE/LOCAL_RANK`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment`로 homogeneous 검증만 완화합니다.
 
-batch size는 가장 작은 V100 32GB GPU에 맞춰 정합니다. H100 80GB에서 per-GPU `26`이 맞았던 기록을 단순 메모리 비율로 옮기면 `26 * 32 / 80 = 10.4`가 1차 추정치입니다. V100은 bf16 대신 fp16(`16-mixed`)이고 kernel/workspace/fragmentation 차이가 있으므로 첫 시도는 `8`로 낮춰 잡았습니다. OOM fallback은 `8 -> 6 -> 4 -> 2`입니다.
+batch size는 가장 작은 V100 32GB GPU에 맞춰 정합니다. H100 80GB에서 per-GPU `26`이 맞았던 기록을 단순 메모리 비율로 옮기면 `26 * 32 / 80 = 10.4`가 1차 추정치입니다. V100은 bf16 대신 fp16(`16-mixed`)이고 kernel/workspace/fragmentation 차이가 있어 `8`은 실측 OOM이 났으므로 기본 첫 시도는 `6`으로 둡니다. OOM fallback은 `6 -> 4 -> 2`입니다.
 
-lr은 선형 scaling을 쓰지 않고 더 보수적으로 잡습니다. H100x4x2 기준 global batch는 `26 * 8 = 208`이고 이 V100 47GPU 설정은 `8 * 47 = 376`입니다. 선형 scaling이면 `~9e-4`가 되지만, 첫 run에서는 sqrt scaling에 가깝게 낮춘 `6e-4`를 기본값으로 둡니다.
+lr은 선형 scaling을 쓰지 않고 더 보수적으로 잡습니다. H100x4x2 기준 global batch는 `26 * 8 = 208`이고 이 V100 47GPU 설정은 `6 * 47 = 282`입니다. 선형 scaling이면 `~6.8e-4`가 되지만, 첫 run에서는 sqrt scaling에 가깝게 낮춘 `6e-4`를 기본값으로 둡니다.
 
 실행:
 

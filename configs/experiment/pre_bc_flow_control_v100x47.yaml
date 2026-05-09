@@ -18,8 +18,8 @@ defaults:
 model:
   model_config:
     # H100x4x2 control-space pretrain used global batch 26*8=208 at lr=5e-4.
-    # This V100 fleet starts at global batch 8*47=376. Linear scaling would be
-    # ~9e-4; we use a milder sqrt-style scale and round down for a first run.
+    # This V100 fleet uses global batch 6*47=282. Linear scaling would be
+    # ~6.8e-4; we use a milder sqrt-style scale and round to 6e-4.
     lr: 6e-4
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
@@ -70,7 +70,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 8
+  train_batch_size: 6
   val_batch_size: 4
   test_batch_size: 4
   num_workers: 2
