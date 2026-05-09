@@ -2144,7 +2144,7 @@ N 초 = flow_window_steps / 10
 K commit block 수 = flow_window_steps / 5
 ```
 
-기본값인 `flow_window_steps: 30` 에서는 SF-NPFM 이 2초짜리 self-rollout 을 0.5초 commit/update block 4 개로 구성해 실행합니다. WOSAC 제출용 rollout 은 여전히 8초 inference loop 를 그대로 쓰지만, fine-tuning objective 자체는 pretrain 에서 사용한 flow window 안쪽에만 머뭅니다.
+기본값인 `flow_window_steps: 20` 에서는 SF-NPFM 이 2초짜리 self-rollout 을 0.5초 commit/update block 4 개로 구성해 실행합니다. WOSAC 제출용 rollout 은 여전히 8초 inference loop 를 그대로 쓰지만, fine-tuning objective 자체는 pretrain 에서 사용한 flow window 안쪽에만 머뭅니다.
 
 ### 추가되는 구성 요소
 
