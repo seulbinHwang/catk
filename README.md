@@ -1208,6 +1208,7 @@ python scripts/launch_h100x4_multinode_pretrain_tmux.py \
 
 `wo-pvc-800`의 H100 4장과 `testa`, `testaa`의 A100 각 4장, 
 총 3개 pod / 12 GPU를 하나의 DDP pretrain으로 묶을 때는 아래 preset과 wrapper를 사용합니다. 
+`c917c80e` 이후 기본 task 이름은 prefix-valid loss mask를 decoder attention에도 전달하는 mask-aware 경로를 명확히 구분하도록 `maskaware`를 포함합니다.
 이 경로도 pod를 새로 만들거나 지우지 않고, 기존 pod 안의 tmux session과 학습 process만 관리합니다.
 
 ```text
@@ -1222,6 +1223,7 @@ scripts/launch_mixed_h100x4_a100x4x2_prefix_valid_pretrain_with_oom_retry.sh
 - `trainer.num_nodes=3`, `trainer.devices=4` -> 총 12 DDP ranks
 - `decoder.flow_window_steps=30`
 - `model.model_config.token_processor.use_prefix_valid_future_loss_mask=true`
+- prefix-valid decoder mask-aware path 사용
 - `data.train_batch_size=26`, effective global batch `26 * 12 = 312`
 - `model.model_config.lr=5e-4`
 
@@ -1250,7 +1252,7 @@ INITIAL_BS=26 \
 OOM_STEP=2 \
 MIN_BS=20 \
 LEARNING_RATE=5.0e-4 \
-TASK_NAME=flow_pretrain_prefix_valid_fw30_mixed_h100x4_a100x4x2_bs26 \
+TASK_NAME=flow_pretrain_prefix_valid_fw30_maskaware_mixed_h100x4_a100x4x2_bs26 \
 bash scripts/launch_mixed_h100x4_a100x4x2_prefix_valid_pretrain_with_oom_retry.sh
 ```
 

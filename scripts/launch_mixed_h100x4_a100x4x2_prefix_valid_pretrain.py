@@ -16,7 +16,7 @@ from pathlib import Path
 BASE_LAUNCHER = Path(__file__).with_name("launch_h100x4_multinode_pretrain_tmux.py")
 
 DEFAULT_PODS = ("wo-pvc-800", "testa", "testaa")
-DEFAULT_TASK_NAME = "flow_pretrain_prefix_valid_fw30_mixed_h100x4_a100x4x2_bs26"
+DEFAULT_TASK_NAME = "flow_pretrain_prefix_valid_fw30_maskaware_mixed_h100x4_a100x4x2_bs26"
 DEFAULT_SESSION = "catk-pretrain-mixed-h100-a100-prefix-fw30"
 DEFAULT_EXPERIMENT = "pre_bc_flow_mixed_h100x4_a100x4x2_prefix_valid"
 DEFAULT_BRANCH = "self_forcing_anchor_new"

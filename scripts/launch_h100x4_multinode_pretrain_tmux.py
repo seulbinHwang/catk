@@ -480,18 +480,16 @@ fi
 
     pull_block = ""
     if args.pull:
-        branch_ref = f"refs/heads/{args.branch}"
         origin_ref = f"origin/{args.branch}"
-        fetch_refspec = f"{args.branch}:refs/remotes/origin/{args.branch}"
+        fetch_refspec = f"+{args.branch}:refs/remotes/origin/{args.branch}"
+        stash_message = f"codex launcher auto-stash before syncing {args.branch}"
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
 git fetch origin {shq(fetch_refspec)}
-if git show-ref --verify --quiet {shq(branch_ref)}; then
-  git checkout {shq(args.branch)}
-else
-  git checkout -b {shq(args.branch)} {shq(origin_ref)}
+if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+  git stash push -m {shq(stash_message)} || true
 fi
-git pull --ff-only origin {shq(args.branch)}
+git checkout -B {shq(args.branch)} {shq(origin_ref)}
 """
 
     monitor_block = ""
