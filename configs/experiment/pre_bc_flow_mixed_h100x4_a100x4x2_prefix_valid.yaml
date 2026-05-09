@@ -1,0 +1,42 @@
+# @package _global_
+
+# Flow Matching pretrain preset for one H100x4 node plus two A100x4 nodes.
+#
+# Intended launch shape:
+#   * wo-pvc-800: 4x H100 80GB
+#   * testa/testaa: 4x A100 80GB each
+#   * 3 nodes, 12 total DDP ranks
+#
+# This keeps the FW30 H100x4x2 pretrain recipe conservative:
+#   * per-GPU train batch starts at 26, the measured safe H100 FW30 value.
+#   * A100 and H100 are both 80GB here, so DDP uses one common per-rank batch.
+#   * lr stays at the proven H100x4x2 value instead of linearly scaling again
+#     from global batch 208 to 312 for the mixed-hardware first run.
+
+defaults:
+  - pre_bc_flow_4_h100
+  - _self_
+
+model:
+  model_config:
+    lr: 5e-4
+    decoder:
+      flow_window_steps: 30
+    token_processor:
+      use_prefix_valid_future_loss_mask: true
+
+trainer:
+  devices: 4
+  num_nodes: 3
+
+callbacks:
+  # Keep tqdm visible in the rank-0 tmux pane during long fit-time validation.
+  tqdm_progress_bar:
+    _target_: lightning.pytorch.callbacks.TQDMProgressBar
+    refresh_rate: 1
+    process_position: 0
+
+data:
+  train_batch_size: 26
+  val_batch_size: 16
+  test_batch_size: 16

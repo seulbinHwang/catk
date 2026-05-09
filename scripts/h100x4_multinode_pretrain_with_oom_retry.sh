@@ -23,7 +23,10 @@ PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk}"
 BRANCH="${BRANCH:-self_forcing_bugfix}"
 TASK_NAME="${TASK_NAME:-flow_semi_continuous_pretrain_h100x4x2_bs26}"
 SESSION="${SESSION:-catk-h100x4-pretrain}"
+EXPERIMENT="${EXPERIMENT:-pre_bc_flow_2x4_h100}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
+CACHE_ROOT="${CACHE_ROOT:-}"
+POD_CACHE_ROOTS="${POD_CACHE_ROOTS:-}"
 MASTER_PORT="${MASTER_PORT:-29511}"
 CHECKPOINT_SYNC_PORT="${CHECKPOINT_SYNC_PORT:-29512}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -89,6 +92,7 @@ start_attempt() {
     --container "$CONTAINER"
     --project-root "$PROJECT_ROOT"
     --branch "$BRANCH"
+    --experiment "$EXPERIMENT"
     --task-name "$TASK_NAME"
     --session "$SESSION"
     --master-port "$MASTER_PORT"
@@ -99,6 +103,16 @@ start_attempt() {
     --replace
   )
 
+  if [[ -n "$CACHE_ROOT" ]]; then
+    cmd+=(--cache-root "$CACHE_ROOT")
+  fi
+  if [[ -n "$POD_CACHE_ROOTS" ]]; then
+    read -r -a pod_cache_root_array <<< "$POD_CACHE_ROOTS"
+    local mapping
+    for mapping in "${pod_cache_root_array[@]}"; do
+      cmd+=(--pod-cache-root "$mapping")
+    done
+  fi
   if [[ -n "$ckpt_path" ]]; then
     cmd+=(--ckpt-path "$ckpt_path")
   fi

@@ -1204,6 +1204,64 @@ python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --replace
 ```
 
+#### H100x4 1대 + A100x4 2대 mixed prefix-valid FW30 pretrain
+
+`wo-pvc-800`의 H100 4장과 `testa`, `testaa`의 A100 각 4장, 
+총 3개 pod / 12 GPU를 하나의 DDP pretrain으로 묶을 때는 아래 preset과 wrapper를 사용합니다. 
+이 경로도 pod를 새로 만들거나 지우지 않고, 기존 pod 안의 tmux session과 학습 process만 관리합니다.
+
+```text
+configs/experiment/pre_bc_flow_mixed_h100x4_a100x4x2_prefix_valid.yaml
+scripts/launch_mixed_h100x4_a100x4x2_prefix_valid_pretrain.py
+scripts/launch_mixed_h100x4_a100x4x2_prefix_valid_pretrain_with_oom_retry.sh
+```
+
+기본 설정:
+
+- pod 순서: `wo-pvc-800 testa testaa`
+- `trainer.num_nodes=3`, `trainer.devices=4` -> 총 12 DDP ranks
+- `decoder.flow_window_steps=30`
+- `model.model_config.token_processor.use_prefix_valid_future_loss_mask=true`
+- `data.train_batch_size=26`, effective global batch `26 * 12 = 312`
+- `model.model_config.lr=5e-4`
+
+batch size 판단은 가장 작은 GPU 메모리에 맞춥니다. 여기서는 `wo-pvc-800` H100과 `testa/testaa` A100이 모두 80GB급이므로, H100 FW30에서 실측 최적이었던 per-GPU `26`을 그대로 시작점으로 둡니다. A100이 H100보다 느려 전체 step time은 A100 쪽에 맞춰질 수 있지만, DDP는 rank별 batch를 하나로 맞춰야 하므로 메모리 기준 batch는 80GB 공통 상한을 따르는 것이 맞습니다.
+
+lr은 더 보수적으로 잡았습니다. global batch는 기존 H100x4x2 `208`에서 mixed 12GPU `312`로 커지므로 단순 선형 scaling이면 `5e-4 * 312/208 = 7.5e-4`가 됩니다. 하지만 mixed hardware 첫 run이고 prefix-valid target 선택도 달라지므로, 기본값은 검증된 `5e-4`를 유지합니다. 선형 scaling ablation을 따로 보고 싶을 때만 `--learning-rate 7.5e-4`로 override하세요.
+
+일회 실행:
+
+```bash
+python scripts/launch_mixed_h100x4_a100x4x2_prefix_valid_pretrain.py --replace
+```
+
+CUDA OOM fallback까지 켜고 실행하려면 아래 wrapper를 권장합니다. 첫 시도는 `train_batch_size=26`이고, OOM marker가 어느 pod 로그에서든 관측되면 전체 tmux/torchrun group을 정리한 뒤 최신 `epoch_last.ckpt`를 기준으로 `26 -> 24 -> 22 -> ... -> 2` 순서로 batch를 2씩 낮춰 재개합니다. 너무 낮은 batch까지 자동으로 내려가는 것을 막고 싶으면 `MIN_BS=20`처럼 하한을 올려 실행하세요.
+
+H100과 A100을 섞는 이 경로에서는 NCCL이 H100 전용 NVLS/CUMEM 경로를 고르지 않도록 `NCCL_NVLS_ENABLE=0`, `NCCL_CUMEM_ENABLE=0`을 기본으로 둡니다. 세 pod의 통신 인터페이스는 `eth0`으로 고정됩니다.
+
+```bash
+bash scripts/launch_mixed_h100x4_a100x4x2_prefix_valid_pretrain_with_oom_retry.sh
+```
+
+주요 override:
+
+```bash
+INITIAL_BS=26 \
+OOM_STEP=2 \
+MIN_BS=20 \
+LEARNING_RATE=5.0e-4 \
+TASK_NAME=flow_pretrain_prefix_valid_fw30_mixed_h100x4_a100x4x2_bs26 \
+bash scripts/launch_mixed_h100x4_a100x4x2_prefix_valid_pretrain_with_oom_retry.sh
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc wo-pvc-800 -c main -- tmux attach -t catk-pretrain-mixed-h100-a100-prefix-fw30
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-pretrain-mixed-h100-a100-prefix-fw30
+kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h100-a100-prefix-fw30
+```
+
 ### 5.11 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`

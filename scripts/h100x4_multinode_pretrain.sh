@@ -77,6 +77,12 @@ main() {
   export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
   export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
   export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+  export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+  export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-eth0}"
+  export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-AF_INET}"
+  export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+  export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+  export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
   export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-14400}"
   export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
 
@@ -171,7 +177,7 @@ main() {
     trainer=ddp
     trainer.devices="$nproc_per_node"
     trainer.num_nodes="$nnodes"
-    trainer.enable_progress_bar=true
+    +trainer.enable_progress_bar=true
     paths.cache_root="$cache_root"
     task_name="$task_name"
   )
