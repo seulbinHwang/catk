@@ -1782,6 +1782,23 @@ class SMARTFlow(LightningModule):
                     if _T_gt_actual == 0 or not _gt_valid.any():
                         del rollout_cache_anchor
                         continue
+                    # tokenizer 는 invalid agent/timestep 의 gt_pos 를 raw 0.0 으로 padding
+                    # (token_processor.py:370).  transform_to_local 에서 (0,0) - current_pos
+                    # = -current_pos (수천 m) → /20 으로 normalize 해도 50+ 의 huge 값이 되어
+                    # mask 가 없는 downstream path (MMD, variance logging, debug dump) 를
+                    # 오염시킨다.  invalid 위치를 anchor frame 시작점으로 채우면
+                    # transform 결과가 (0, 0, 1, 0) 이라 mask 적용 분기엔 영향 없으면서
+                    # 모든 unmasked path 가 안전해진다.
+                    _gt_pos = torch.where(
+                        _gt_valid.unsqueeze(-1),
+                        _gt_pos,
+                        current_pos_active.unsqueeze(1).expand_as(_gt_pos),
+                    )
+                    _gt_head = torch.where(
+                        _gt_valid,
+                        _gt_head,
+                        current_head_active.unsqueeze(1).expand_as(_gt_head),
+                    )
                     gt_norm_anchor = _cl_to_norm(
                         _gt_pos, _gt_head, current_pos_active, current_head_active,
                     ).detach()   # [n_active, T_gt_actual, 4]
