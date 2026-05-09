@@ -135,6 +135,7 @@ def render_run_script(project_root: str, env_file: str) -> str:
 set +e
 export TERM="${{TERM:-xterm-256color}}"
 export PYTHONUNBUFFERED=1
+export CATK_REMOTE_PYTHON="${{CATK_REMOTE_PYTHON:-/mnt/nuplan/miniforge/envs/catk/bin/python}}"
 
 cd {shq(project_root)}
 set -a
@@ -159,7 +160,7 @@ start_checkpoint_sync_server() {{
   if [[ -z "${{CATK_CKPT_PATH:-}}" ]]; then
     return 0
   fi
-  python - <<'PY' &
+  "$CATK_REMOTE_PYTHON" - <<'PY' &
 import hashlib
 import http.server
 import os
@@ -235,7 +236,7 @@ wait_for_checkpoint_sync_server() {{
   local waited=0
   local timeout_sec="${{CHECKPOINT_SYNC_START_TIMEOUT_SEC:-600}}"
   while true; do
-    if python - <<'PY' >/dev/null 2>&1
+    if "$CATK_REMOTE_PYTHON" - <<'PY' >/dev/null 2>&1
 import os
 import urllib.request
 
@@ -256,7 +257,7 @@ PY
 }}
 
 fetch_checkpoint_metadata() {{
-  python - <<'PY'
+  "$CATK_REMOTE_PYTHON" - <<'PY'
 import os
 import sys
 import urllib.request
@@ -322,7 +323,7 @@ sync_checkpoint_if_needed() {{
   tmp_file="${{CATK_CKPT_PATH}}.download.$$"
   rm -f "$tmp_file"
   echo "[tmux-run] downloading rank0 checkpoint to $CATK_CKPT_PATH"
-  if ! python - "$tmp_file" <<'PY'
+  if ! "$CATK_REMOTE_PYTHON" - "$tmp_file" <<'PY'
 import os
 import shutil
 import sys
