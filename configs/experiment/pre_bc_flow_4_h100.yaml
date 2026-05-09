@@ -78,7 +78,7 @@ data:
   #   bs=60  -> OOM at 96.8%
   # Without activation recomputation (pre-b12e653) the ceiling drops to
   # roughly bs=28 (~82.7% peak).
-  train_batch_size: 46
+  train_batch_size: 26
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
