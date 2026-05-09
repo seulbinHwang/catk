@@ -6,6 +6,13 @@ import torch
 from torch import Tensor
 from torch_geometric.data import HeteroData
 
+from src.smart.modules.kinematic_control import (
+    CONTROL_FLOW_DIM,
+    DEFAULT_CONTROL_POS_SCALE_M,
+    DEFAULT_CONTROL_YAW_SCALE_RAD,
+    POSE_FLOW_DIM,
+    build_rolling_control_target,
+)
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils import transform_to_local, validate_flow_window_steps
 
@@ -21,6 +28,9 @@ class FlowTokenProcessor(TokenProcessor):
         agent_token_sampling,
         flow_window_steps: int = 20,
         use_prefix_valid_future_loss_mask: bool = False,
+        use_kinematic_control_flow: bool = False,
+        control_pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+        control_yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
     ) -> None:
         super().__init__(
             map_token_file=map_token_file,
@@ -33,6 +43,10 @@ class FlowTokenProcessor(TokenProcessor):
             commit_steps=self.shift,
         )
         self.use_prefix_valid_future_loss_mask = bool(use_prefix_valid_future_loss_mask)
+        self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
+        self.control_pos_scale_m = float(control_pos_scale_m)
+        self.control_yaw_scale_rad = float(control_yaw_scale_rad)
+        self.flow_target_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
 
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         """지도 토큰과 에이전트 토큰을 만들고 flow 목표를 붙입니다.
@@ -129,6 +143,7 @@ class FlowTokenProcessor(TokenProcessor):
                         heading=heading,
                         current_pos=current_pos,
                         current_head=current_head,
+                        agent_type=tokenized_agent["type"],
                         anchor_mask=train_anchor_mask,
                         raw_step=raw_step,
                         future_loss_mask=future_loss_mask[train_anchor_mask],
@@ -202,6 +217,7 @@ class FlowTokenProcessor(TokenProcessor):
 
         flow_eval_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
         flow_eval_chunks: List[Tensor] = []
+        flow_eval_agent_type_chunks: List[Tensor] = []
         for anchor_offset, raw_step in enumerate(raw_current_steps):
             current_valid = valid[:, raw_step]
             future_valid = self._build_anchor_future_valid(valid=valid, raw_step=raw_step)
@@ -210,12 +226,14 @@ class FlowTokenProcessor(TokenProcessor):
             if not anchor_mask.any():
                 continue
 
+            flow_eval_agent_type_chunks.append(tokenized_agent["type"][anchor_mask])
             flow_eval_chunks.append(
                 self._build_anchor_clean_norm(
                     pos=pos,
                     heading=heading,
                     current_pos=pos[:, raw_step],
                     current_head=heading[:, raw_step],
+                    agent_type=tokenized_agent["type"],
                     anchor_mask=anchor_mask,
                     raw_step=raw_step,
                 )
@@ -227,6 +245,11 @@ class FlowTokenProcessor(TokenProcessor):
                 "flow_eval_clean_norm": self._concat_flow_chunks(
                     chunks=flow_eval_chunks,
                     dtype=dtype,
+                    device=device,
+                ),
+                "flow_eval_agent_type": self._concat_vector_chunks(
+                    chunks=flow_eval_agent_type_chunks,
+                    dtype=tokenized_agent["type"].dtype,
                     device=device,
                 ),
             }
@@ -351,6 +374,7 @@ class FlowTokenProcessor(TokenProcessor):
         heading: Tensor,
         current_pos: Tensor,
         current_head: Tensor,
+        agent_type: Tensor,
         anchor_mask: Tensor,
         raw_step: int,
         future_loss_mask: Tensor | None = None,
@@ -362,6 +386,7 @@ class FlowTokenProcessor(TokenProcessor):
             heading: 전처리된 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
             current_pos: 현재 coarse anchor 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 coarse anchor 방향입니다. shape은 ``[n_agent]`` 입니다.
+            agent_type: agent 종류입니다. shape은 ``[n_agent]`` 입니다.
             anchor_mask: 이번 anchor를 실제로 학습 또는 평가에 쓰는지 나타냅니다.
                 shape은 ``[n_agent]`` 입니다.
             raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
@@ -372,15 +397,16 @@ class FlowTokenProcessor(TokenProcessor):
         Returns:
             Tensor:
                 정규화된 미래 목표입니다.
-                shape은 ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
-                마지막 차원은 ``[x, y, cos, sin]`` 순서입니다.
+                pose-space에서는 ``[n_valid_anchor, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_anchor, flow_window_steps, 3]`` 입니다.
         """
         num_valid_anchor = int(anchor_mask.sum().item())
         if num_valid_anchor == 0:
-            return pos.new_zeros((0, self.flow_window_steps, 4))
+            return pos.new_zeros((0, self.flow_window_steps, self.flow_target_dim))
 
         selected_current_pos = current_pos[anchor_mask]
         selected_current_head = current_head[anchor_mask]
+        selected_agent_type = agent_type[anchor_mask]
         future_start = raw_step + 1
         future_end = future_start + self.flow_window_steps
 
@@ -438,6 +464,17 @@ class FlowTokenProcessor(TokenProcessor):
                 invalid_future_mask,
                 last_valid_head.unsqueeze(1),
                 future_head,
+            )
+
+        if self.use_kinematic_control_flow:
+            return build_rolling_control_target(
+                future_pos=future_pos,
+                future_head=future_head,
+                current_pos=selected_current_pos,
+                current_head=selected_current_head,
+                agent_type=selected_agent_type,
+                pos_scale_m=self.control_pos_scale_m,
+                yaw_scale_rad=self.control_yaw_scale_rad,
             )
 
         future_pos_local, future_head_local = transform_to_local(
@@ -560,7 +597,7 @@ class FlowTokenProcessor(TokenProcessor):
                 유효한 anchor가 없으면 ``[0, 20, 4]`` 빈 텐서를 돌려줍니다.
         """
         if len(chunks) == 0:
-            return torch.zeros((0, self.flow_window_steps, 4), device=device, dtype=dtype)
+            return torch.zeros((0, self.flow_window_steps, self.flow_target_dim), device=device, dtype=dtype)
         return torch.cat(chunks, dim=0)
 
     def _concat_mask_chunks(

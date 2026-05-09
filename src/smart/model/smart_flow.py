@@ -707,9 +707,17 @@ class SMARTFlow(LightningModule):
             pred_dict["flow_target_norm"],
             valid_mask=loss_mask,
         )
+        metric_pred_clean_norm = pred_dict.get(
+            "flow_pred_clean_metric_norm",
+            pred_dict["flow_pred_clean_norm"],
+        )
+        metric_target_clean_norm = pred_dict.get(
+            "flow_clean_metric_norm",
+            pred_dict["flow_clean_norm"],
+        )
         metric_dict = self._build_open_loop_metric_dict(
-            pred_clean_norm=pred_dict["flow_pred_clean_norm"],
-            target_clean_norm=pred_dict["flow_clean_norm"],
+            pred_clean_norm=metric_pred_clean_norm,
+            target_clean_norm=metric_target_clean_norm,
             valid_mask=loss_mask,
         )
         sample_count = int(pred_dict["flow_clean_norm"].shape[0])
@@ -2518,7 +2526,11 @@ class SMARTFlow(LightningModule):
             tokenized_map=tokenized_map,
             tokenized_agent=tokenized_agent,
         )
-        draft_target_norm = draft_pred["flow_clean_norm"]
+        pred_sample_norm = self.encoder.flow_norm_to_pose_metric_norm(
+            value=pred_sample_norm,
+            agent_type=draft_pred.get("flow_metric_agent_type"),
+        )
+        draft_target_norm = draft_pred.get("flow_clean_metric_norm", draft_pred["flow_clean_norm"])
         draft_loss_mask = draft_pred.get("flow_loss_mask")
         if not torch.isfinite(pred_sample_norm).all():
             return self._build_zero_draft_metrics(draft_target_norm)
@@ -3084,9 +3096,17 @@ open_metric_dict:
                 sampling_scheme=self.validation_rollout_sampling,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
             )
+            open_pred_metric_norm = eval_generator.flow_norm_to_pose_metric_norm(
+                value=open_pred_clean_norm,
+                agent_type=denoise_pred.get("flow_metric_agent_type"),
+            )
+            open_target_metric_norm = denoise_pred.get(
+                "flow_clean_metric_norm",
+                denoise_pred["flow_clean_norm"],
+            )
             open_metric_dict = self._build_open_loop_metric_dict(
-                pred_clean_norm=open_pred_clean_norm,
-                target_clean_norm=denoise_pred["flow_clean_norm"],
+                pred_clean_norm=open_pred_metric_norm,
+                target_clean_norm=open_target_metric_norm,
             )
             self._update_weighted_validation_metrics(
                 metric_store=self.val_open_epoch_metrics,

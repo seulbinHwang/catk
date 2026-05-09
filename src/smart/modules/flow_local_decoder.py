@@ -21,6 +21,7 @@ from src.smart.utils import (
     wrap_angle,
 )
 from src.smart.modules.draft_physics import DEFAULT_LIMITS
+from src.smart.modules.kinematic_control import control_norm_to_pose_norm
 
 
 @dataclass(frozen=True)
@@ -408,14 +409,21 @@ class AnchorContextProjector(nn.Module):
 
 
 class NormalizedNoisyFutureEncoder(nn.Module):
-    def __init__(self, flow_dim: int, num_chunks: int = 4, chunk_size: int = 5) -> None:
+    def __init__(
+        self,
+        flow_dim: int,
+        num_chunks: int = 4,
+        chunk_size: int = 5,
+        flow_state_dim: int = 4,
+    ) -> None:
         super().__init__()
         self.flow_dim = flow_dim
         self.num_chunks = num_chunks
         self.chunk_size = chunk_size
         self.num_steps = num_chunks * chunk_size
+        self.flow_state_dim = int(flow_state_dim)
 
-        self.step_proj = nn.Linear(4, flow_dim)
+        self.step_proj = nn.Linear(self.flow_state_dim, flow_dim)
         self.step_embed = nn.Embedding(self.num_steps, flow_dim)
         self.tau_mlp = nn.Sequential(
             nn.Linear(1, flow_dim),
@@ -438,6 +446,11 @@ class NormalizedNoisyFutureEncoder(nn.Module):
             raise ValueError(
                 "NormalizedNoisyFutureEncoder expected "
                 f"{self.num_steps} future steps, got {x_t_norm.shape[1]}."
+            )
+        if x_t_norm.shape[-1] != self.flow_state_dim:
+            raise ValueError(
+                "NormalizedNoisyFutureEncoder expected last dim "
+                f"{self.flow_state_dim}, got {x_t_norm.shape[-1]}."
             )
 
         tau_emb = self.tau_mlp(tau.unsqueeze(-1))
@@ -549,12 +562,13 @@ class ChunkStepRefiner(nn.Module):
 
 
 class FlowVelocityHead(nn.Module):
-    def __init__(self, flow_dim: int) -> None:
+    def __init__(self, flow_dim: int, flow_state_dim: int = 4) -> None:
         super().__init__()
+        self.flow_state_dim = int(flow_state_dim)
         self.net = nn.Sequential(
             nn.Linear(flow_dim, flow_dim),
             nn.SiLU(),
-            nn.Linear(flow_dim, 4),
+            nn.Linear(flow_dim, self.flow_state_dim),
         )
 
     def forward(self, step_tokens: torch.Tensor) -> torch.Tensor:
@@ -570,6 +584,7 @@ class HierarchicalFlowDecoder(nn.Module):
         num_chunk_heads: int = 4,
         num_chunk_layers: int = 2,
         chunk_size: int = 5,
+        flow_state_dim: int = 4,
     ) -> None:
         super().__init__()
         if int(num_future_steps) <= 0:
@@ -583,10 +598,12 @@ class HierarchicalFlowDecoder(nn.Module):
             )
         num_chunks = int(num_future_steps) // int(chunk_size)
         self.context_projector = AnchorContextProjector(context_dim, flow_dim)
+        self.flow_state_dim = int(flow_state_dim)
         self.noisy_future_encoder = NormalizedNoisyFutureEncoder(
             flow_dim=flow_dim,
             num_chunks=num_chunks,
             chunk_size=int(chunk_size),
+            flow_state_dim=self.flow_state_dim,
         )
         self.chunk_mixers = nn.ModuleList(
             [
@@ -598,7 +615,7 @@ class HierarchicalFlowDecoder(nn.Module):
             flow_dim=flow_dim,
             num_heads=num_chunk_heads,
         )
-        self.velocity_head = FlowVelocityHead(flow_dim=flow_dim)
+        self.velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
 
     def forward(
         self,
@@ -676,11 +693,17 @@ class ContinuousCommitBridge:
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         config: LQRCommitBridgeConfig | None = None,
+        use_kinematic_control_flow: bool = False,
+        control_pos_scale_m: float = 20.0,
+        control_yaw_scale_rad: float = 1.0,
     ) -> None:
         self.commit_steps = int(commit_steps)
         self.pos_scale_m = float(pos_scale_m)
         self.use_lqr = bool(use_lqr)
         self.use_stop_motion = bool(use_stop_motion)
+        self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
+        self.control_pos_scale_m = float(control_pos_scale_m)
+        self.control_yaw_scale_rad = float(control_yaw_scale_rad)
         self.config = config if config is not None else LQRCommitBridgeConfig()
         self._difference_gram_cache: dict[tuple[int, str, str], torch.Tensor] = {}
 
@@ -719,7 +742,17 @@ class ContinuousCommitBridge:
         y_hat_norm: torch.Tensor,
         current_pos: torch.Tensor,
         current_head: torch.Tensor,
+        agent_type: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_kinematic_control_flow:
+            if agent_type is None:
+                raise ValueError("agent_type is required when use_kinematic_control_flow=True.")
+            y_hat_norm = control_norm_to_pose_norm(
+                control_norm=y_hat_norm,
+                agent_type=agent_type,
+                pos_scale_m=self.control_pos_scale_m,
+                yaw_scale_rad=self.control_yaw_scale_rad,
+            )
         first_chunk = y_hat_norm[:, : self.commit_steps].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m
 

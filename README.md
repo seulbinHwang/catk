@@ -455,6 +455,31 @@ kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-prefix-valid-a100
 kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-prefix-valid-a100x4x2-fw30
 ```
 
+### 5.1.3 Kinematic control-space Flow Matching
+
+기본값은 기존 pose-space Flow Matching입니다.
+
+```bash
+model.model_config.token_processor.use_kinematic_control_flow=false
+```
+
+`true`로 바꾸면 Flow Matching clean target이 기존 `(x, y, cos(yaw), sin(yaw))` pose 표현에서 `[delta_s, delta_n, delta_yaw]` 제어값 표현으로 바뀝니다.
+
+```bash
+torchrun ... -m src.run \
+  experiment=pre_bc_flow \
+  model.model_config.token_processor.use_kinematic_control_flow=true \
+  task_name=flow_control_space_pretrain
+```
+
+- GT control label은 기존 cache 안의 GT pose에서 batch 생성 시점에 on-the-fly로 만듭니다. 별도 target cache는 필요 없습니다.
+- vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
+- label 생성은 decoder-consistent rolling projection 방식입니다. 매 step마다 raw GT 현재 pose가 아니라 직전 control을 kinematic decoder에 통과시킨 pose를 다음 inverse의 현재 pose로 씁니다.
+- 추가 trajectory loss, x0 loss, open-loop draft loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
+- validation / rollout / metric 경로에서는 control 예측을 기존 pose-space 표현으로 복원해 기존 open-loop metric과 closed-loop rollout을 그대로 계산합니다.
+
+pose-space checkpoint와 control-space checkpoint는 Flow decoder 입출력 차원이 다르므로 서로 섞어 resume하지 않는 것을 권장합니다. 기존 pose-space pretrain weight를 control-space 실험의 초기값으로 재사용하려면 Flow decoder head/encoder 차원 차이를 어떻게 처리할지 별도 migration 정책이 필요합니다.
+
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
 
 - 학습 중 validation은 `trainer.check_val_every_n_epoch` 마다 실행됩니다.
