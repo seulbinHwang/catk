@@ -10,6 +10,6 @@ defaults:
 model:
   model_config:
     decoder:
-      flow_window_steps: 20
+      flow_window_steps: 30
     token_processor:
       use_prefix_valid_future_loss_mask: true
