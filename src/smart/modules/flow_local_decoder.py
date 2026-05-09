@@ -407,6 +407,7 @@ class AnchorContextProjector(nn.Module):
         return self.net(anchor_hidden)
 
 
+
 class NormalizedNoisyFutureEncoder(nn.Module):
     def __init__(self, flow_dim: int, num_chunks: int = 4, chunk_size: int = 5) -> None:
         super().__init__()
@@ -428,11 +429,101 @@ class NormalizedNoisyFutureEncoder(nn.Module):
             nn.Linear(flow_dim, flow_dim),
         )
 
+    def _normalize_future_valid_mask(
+        self,
+        future_valid_mask: torch.Tensor | None,
+        x_t_norm: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """미래 step 유효 mask를 현재 입력에 맞게 정리합니다.
+
+        Args:
+            future_valid_mask: loss에 포함되는 미래 step 여부입니다.
+                shape은 ``[batch_size, num_steps]`` 입니다. 값이 없으면 모든 step을
+                정상 step으로 봅니다.
+            x_t_norm: noisy future 입력입니다. shape은 ``[batch_size, num_steps, 4]`` 입니다.
+
+        Returns:
+            torch.Tensor | None: bool mask입니다. 모든 step이 유효하면 기존 연산과
+            완전히 같은 경로를 쓰기 위해 ``None`` 을 돌려줍니다.
+        """
+        if future_valid_mask is None:
+            return None
+        if tuple(future_valid_mask.shape) != tuple(x_t_norm.shape[:2]):
+            raise ValueError(
+                "future_valid_mask shape must match x_t_norm first two dimensions: "
+                f"expected={tuple(x_t_norm.shape[:2])}, actual={tuple(future_valid_mask.shape)}."
+            )
+        future_valid_mask = future_valid_mask.to(device=x_t_norm.device, dtype=torch.bool)
+        if bool(future_valid_mask.all().item()):
+            return None
+        return future_valid_mask
+
+    def _build_masked_chunk_tokens(
+        self,
+        step_tokens: torch.Tensor,
+        future_valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """valid step만 사용해서 chunk 표현을 만듭니다.
+
+        Args:
+            step_tokens: step별 noisy future 표현입니다.
+                shape은 ``[batch_size, num_steps, flow_dim]`` 입니다.
+            future_valid_mask: step별 유효 여부입니다.
+                shape은 ``[batch_size, num_steps]`` 입니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                ``step_tokens`` 는 invalid step이 0으로 지워진 step 표현이고,
+                ``chunk_tokens`` 는 valid step만 평균낸 chunk 표현입니다.
+                ``chunk_valid_mask`` 는 chunk 안에 valid step이 하나 이상 있는지입니다.
+                각 shape은 ``[batch_size, num_chunks, chunk_size, flow_dim]``,
+                ``[batch_size, num_chunks, flow_dim]``,
+                ``[batch_size, num_chunks]`` 입니다.
+        """
+        batch_size = step_tokens.shape[0]
+        step_valid = future_valid_mask.view(batch_size, self.num_chunks, self.chunk_size)
+        step_valid_float = step_valid.to(dtype=step_tokens.dtype).unsqueeze(-1)
+
+        step_tokens = step_tokens.view(
+            batch_size,
+            self.num_chunks,
+            self.chunk_size,
+            self.flow_dim,
+        )
+        step_tokens = step_tokens * step_valid_float
+
+        valid_count = step_valid_float.sum(dim=2).clamp_min(1.0)
+        chunk_mean = step_tokens.sum(dim=2) / valid_count
+        chunk_valid_mask = step_valid.any(dim=2)
+        chunk_tokens = self.chunk_pool(chunk_mean)
+        chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
+        return step_tokens, chunk_tokens, chunk_valid_mask
+
     def forward(
         self,
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        future_valid_mask: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """noisy future를 step 표현과 chunk 표현으로 바꿉니다.
+
+        Args:
+            x_t_norm: noisy future입니다. shape은 ``[batch_size, num_steps, 4]`` 입니다.
+            tau: flow 시간입니다. shape은 ``[batch_size]`` 입니다.
+            future_valid_mask: prefix-valid 학습에서 loss에 포함되는 미래 step입니다.
+                shape은 ``[batch_size, num_steps]`` 입니다. 값이 없으면 기존 동작과 같습니다.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+                step 표현, chunk 표현, tau 표현, step mask, chunk mask입니다.
+                mask가 없거나 모든 step이 유효하면 뒤의 두 mask는 ``None`` 입니다.
+        """
         batch_size = x_t_norm.shape[0]
         if x_t_norm.shape[1] != self.num_steps:
             raise ValueError(
@@ -446,14 +537,25 @@ class NormalizedNoisyFutureEncoder(nn.Module):
         step_tokens = step_tokens + self.step_embed(step_ids).unsqueeze(0)
         step_tokens = step_tokens + tau_emb.unsqueeze(1)
 
-        step_tokens = step_tokens.view(
-            batch_size,
-            self.num_chunks,
-            self.chunk_size,
-            self.flow_dim,
+        future_valid_mask = self._normalize_future_valid_mask(
+            future_valid_mask=future_valid_mask,
+            x_t_norm=x_t_norm,
         )
-        chunk_tokens = self.chunk_pool(step_tokens.mean(dim=2))
-        return step_tokens, chunk_tokens, tau_emb
+        if future_valid_mask is None:
+            step_tokens = step_tokens.view(
+                batch_size,
+                self.num_chunks,
+                self.chunk_size,
+                self.flow_dim,
+            )
+            chunk_tokens = self.chunk_pool(step_tokens.mean(dim=2))
+            return step_tokens, chunk_tokens, tau_emb, None, None
+
+        step_tokens, chunk_tokens, chunk_valid_mask = self._build_masked_chunk_tokens(
+            step_tokens=step_tokens,
+            future_valid_mask=future_valid_mask,
+        )
+        return step_tokens, chunk_tokens, tau_emb, future_valid_mask, chunk_valid_mask
 
 
 class HalfSecondChunkMixerBlock(nn.Module):
@@ -485,24 +587,67 @@ class HalfSecondChunkMixerBlock(nn.Module):
             x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1)
         )
 
+    def _build_safe_key_padding_mask(
+        self,
+        chunk_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """attention에서 invalid chunk를 보지 못하게 하는 mask를 만듭니다.
+
+        Args:
+            chunk_valid_mask: chunk별 유효 여부입니다. shape은 ``[batch_size, num_chunks]`` 입니다.
+
+        Returns:
+            torch.Tensor: ``MultiheadAttention`` 에 넣을 key padding mask입니다.
+            shape은 ``[batch_size, num_chunks]`` 입니다. 값이 ``True`` 인 위치는
+            attention 대상에서 제외됩니다.
+        """
+        key_padding_mask = ~chunk_valid_mask.bool()
+        all_masked = key_padding_mask.all(dim=1)
+        if bool(all_masked.any().item()):
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[all_masked] = False
+        return key_padding_mask
+
     def forward(
         self,
         chunk_tokens: torch.Tensor,
         context: torch.Tensor,
         tau_emb: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """0.5초 chunk끼리 정보를 섞습니다.
+
+        Args:
+            chunk_tokens: chunk 표현입니다. shape은 ``[batch_size, num_chunks, flow_dim]`` 입니다.
+            context: anchor 문맥입니다. shape은 ``[batch_size, flow_dim]`` 입니다.
+            tau_emb: flow 시간 표현입니다. shape은 ``[batch_size, flow_dim]`` 입니다.
+            chunk_valid_mask: chunk별 유효 여부입니다. shape은 ``[batch_size, num_chunks]`` 입니다.
+                값이 없으면 기존과 같은 full attention을 사용합니다.
+
+        Returns:
+            torch.Tensor: 갱신된 chunk 표현입니다. shape은 입력과 같습니다.
+        """
         attn_in = self.attn_norm(chunk_tokens)
-        # Force math SDPA kernel: H100's flash/mem-efficient kernels save
-        # uninitialized memory as placeholders, which backward later reads as
-        # NaN and propagates into encoder weight gradients (silently corrupting
-        # training). ChunkStepRefiner uses the same guard for the same reason.
         with sdpa_kernel(_SDPA_SAFE_BACKENDS):
-            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+            if chunk_valid_mask is None:
+                attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+            else:
+                attn_out, _ = self.attn(
+                    attn_in,
+                    attn_in,
+                    attn_in,
+                    key_padding_mask=self._build_safe_key_padding_mask(chunk_valid_mask),
+                    need_weights=False,
+                )
         chunk_tokens = chunk_tokens + attn_out
+        if chunk_valid_mask is not None:
+            chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
 
         cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
         mlp_in = self._modulate(self.mlp_norm(chunk_tokens), cond)
         chunk_tokens = chunk_tokens + self.mlp(mlp_in)
+        if chunk_valid_mask is not None:
+            chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
         return chunk_tokens
 
 
@@ -526,12 +671,65 @@ class ChunkStepRefiner(nn.Module):
             nn.Linear(flow_dim * 2, flow_dim),
         )
 
+    def _build_safe_step_key_padding_mask(
+        self,
+        step_valid_mask: torch.Tensor,
+        batch_size: int,
+        num_chunks: int,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        """chunk 내부 step attention용 mask를 만듭니다.
+
+        Args:
+            step_valid_mask: 미래 step별 유효 여부입니다.
+                shape은 ``[batch_size, num_chunks * chunk_size]`` 입니다.
+            batch_size: batch 크기입니다.
+            num_chunks: chunk 개수입니다.
+            chunk_size: chunk 안의 step 개수입니다.
+
+        Returns:
+            torch.Tensor: ``MultiheadAttention`` 에 넣을 key padding mask입니다.
+            shape은 ``[batch_size * num_chunks, chunk_size]`` 입니다. 값이 ``True`` 인
+            step은 attention 대상에서 제외됩니다.
+        """
+        expected_shape = (batch_size, num_chunks * chunk_size)
+        if tuple(step_valid_mask.shape) != expected_shape:
+            raise ValueError(
+                "step_valid_mask shape must match flattened future steps: "
+                f"expected={expected_shape}, actual={tuple(step_valid_mask.shape)}."
+            )
+        key_padding_mask = ~step_valid_mask.view(batch_size, num_chunks, chunk_size).reshape(
+            batch_size * num_chunks,
+            chunk_size,
+        ).bool()
+        all_masked = key_padding_mask.all(dim=1)
+        if bool(all_masked.any().item()):
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[all_masked] = False
+        return key_padding_mask
+
     def forward(
         self,
         step_tokens: torch.Tensor,
         chunk_tokens: torch.Tensor,
         context: torch.Tensor,
+        step_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """chunk 안의 10Hz step 표현을 다듬습니다.
+
+        Args:
+            step_tokens: step 표현입니다.
+                shape은 ``[batch_size, num_chunks, chunk_size, flow_dim]`` 입니다.
+            chunk_tokens: chunk 표현입니다. shape은 ``[batch_size, num_chunks, flow_dim]`` 입니다.
+            context: anchor 문맥입니다. shape은 ``[batch_size, flow_dim]`` 입니다.
+            step_valid_mask: 미래 step별 유효 여부입니다.
+                shape은 ``[batch_size, num_chunks * chunk_size]`` 입니다.
+                값이 없으면 기존과 같은 chunk 내부 full attention을 사용합니다.
+
+        Returns:
+            torch.Tensor: step별 출력 표현입니다.
+            shape은 ``[batch_size, num_chunks * chunk_size, flow_dim]`` 입니다.
+        """
         batch_size, num_chunks, chunk_size, dim = step_tokens.shape
 
         step_tokens = step_tokens + chunk_tokens.unsqueeze(2)
@@ -541,12 +739,27 @@ class ChunkStepRefiner(nn.Module):
         step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
         attn_in = self.attn_norm(step_tokens)
         with sdpa_kernel(_SDPA_SAFE_BACKENDS):
-            attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+            if step_valid_mask is None:
+                attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+            else:
+                attn_out, _ = self.attn(
+                    attn_in,
+                    attn_in,
+                    attn_in,
+                    key_padding_mask=self._build_safe_step_key_padding_mask(
+                        step_valid_mask=step_valid_mask,
+                        batch_size=batch_size,
+                        num_chunks=num_chunks,
+                        chunk_size=chunk_size,
+                    ),
+                    need_weights=False,
+                )
         step_tokens = step_tokens + attn_out
         step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
         step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)
+        if step_valid_mask is not None:
+            step_tokens = step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
         return step_tokens
-
 
 class FlowVelocityHead(nn.Module):
     def __init__(self, flow_dim: int) -> None:
@@ -559,6 +772,7 @@ class FlowVelocityHead(nn.Module):
 
     def forward(self, step_tokens: torch.Tensor) -> torch.Tensor:
         return self.net(step_tokens)
+
 
 
 class HierarchicalFlowDecoder(nn.Module):
@@ -605,59 +819,48 @@ class HierarchicalFlowDecoder(nn.Module):
         anchor_hidden: torch.Tensor,
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
+        future_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        anchor_hidden : (A, 13, H) -> (N=A*13, H) -> context : (N, D)
+        """noisy future에서 flow velocity를 예측합니다.
+
+        Args:
+            anchor_hidden: anchor 문맥입니다. shape은 ``[batch_size, context_dim]`` 입니다.
+            x_t_norm: noisy future입니다. shape은 ``[batch_size, num_future_steps, 4]`` 입니다.
+            tau: flow 시간입니다. shape은 ``[batch_size]`` 입니다.
+            future_valid_mask: prefix-valid 학습에서 실제로 관측된 미래 step입니다.
+                shape은 ``[batch_size, num_future_steps]`` 입니다. 값이 없거나 모든 step이
+                유효하면 기존과 같은 full attention 경로를 사용합니다.
+
+        Returns:
+            torch.Tensor: step별 flow velocity입니다.
+            shape은 ``[batch_size, num_future_steps, 4]`` 입니다.
         """
         context = self.context_projector(anchor_hidden)
-        """
-        x_t_norm : [B, 20, 4]
-        tau : [B]
-        
-        중간
-            tau_emb : (B, D) # MLP
-            step_tokens : (B, 20, 4) -> (B, 20, D)
-                - step_ids : "각 토큰에 “이게 미래 몇 번째 step인지” 정보를 step_tokens 에 더함
-            step_tokens = step_tokens + tau_emb.unsqueeze(1) : (B, 20, D)
-            step_tokens = step_tokens.view(B, 4, 5, D) [B, 20, D] -> [B, 4, 5, D]
-            chunk_tokens : [B, 4, D]
-        """
-        step_tokens, chunk_tokens, tau_emb = self.noisy_future_encoder(x_t_norm, tau)
-        """
-        4개 half-second chunk ( chunk_tokens ) 끼리 서로 정보 교환
-        
-        anchor 문맥 + 현재 diffusion 시간(tau)을 조건으로 주입
-            input: context : (N, D) / tau_emb : (B, D)
-            둘이 합침 : (B, 2D) # "과거~현재 + 지도 + agent끼리 상호작용한 정보" + "미래 noising 정도"
-            (B, 2D) -> (B, 3D) -> scale, bias, gate = cond.chunk(3, dim=-1): 각각 [B, D]
-            
-            chunk_tokens 에 scale, bias, gate 적용 (각각 chunk에 균일 적용)
-            chunk_tokens : (B, 4, D)
-            
-            
-        """
+        (
+            step_tokens,
+            chunk_tokens,
+            tau_emb,
+            step_valid_mask,
+            chunk_valid_mask,
+        ) = self.noisy_future_encoder(
+            x_t_norm=x_t_norm,
+            tau=tau,
+            future_valid_mask=future_valid_mask,
+        )
         for block in self.chunk_mixers:
-            chunk_tokens = block(chunk_tokens, context, tau_emb)
-        """
-        input
-            step_tokens : (B, 20, D)
-            chunk_tokens : (B, 4, D)
-            context : (B, D)
-        로직
-            chunk_tokens 을 step_tokens 에 더함
-            context 을 step_tokens 에 더함
-            
-            chunk별 로컬 self-attention (각 구간에서 5개 step끼리만 보여 attention)
-        
-        output
-            step_tokens : (b, 20, D)
-        """
-        step_tokens = self.step_refiner(step_tokens, chunk_tokens, context)
-        """
-        output : (B, 20, 4)
-        """
+            chunk_tokens = block(
+                chunk_tokens=chunk_tokens,
+                context=context,
+                tau_emb=tau_emb,
+                chunk_valid_mask=chunk_valid_mask,
+            )
+        step_tokens = self.step_refiner(
+            step_tokens=step_tokens,
+            chunk_tokens=chunk_tokens,
+            context=context,
+            step_valid_mask=step_valid_mask,
+        )
         return self.velocity_head(step_tokens)
-
 
 class ContinuousCommitBridge:
     """Continuous FM 출력을 closed-loop 실행 상태로 바꾸는 다리입니다.
