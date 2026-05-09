@@ -8,6 +8,7 @@ POSE_FLOW_DIM = 4
 CONTROL_FLOW_DIM = 3
 DEFAULT_CONTROL_POS_SCALE_M = 1.0
 DEFAULT_CONTROL_YAW_SCALE_RAD = 0.2
+DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M = 5.0
 POSE_NORM_POS_SCALE_M = 20.0
 
 # repo의 다른 모듈(draft_physics, agent_encoder, dataset 전처리)이 공유하는 정수 매핑입니다.
@@ -317,3 +318,52 @@ def build_rolling_control_target(
         pos_scale_m=pos_scale_m,
         yaw_scale_rad=yaw_scale_rad,
     )
+
+
+def build_rolling_control_target_with_round_trip_error(
+    future_pos: Tensor,
+    future_head: Tensor,
+    current_pos: Tensor,
+    current_head: Tensor,
+    agent_type: Tensor,
+    pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+    yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
+) -> tuple[Tensor, Tensor]:
+    """GT pose를 control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
+
+    Args:
+        future_pos: GT 미래 위치입니다. shape은 ``[N, T, 2]`` 입니다.
+        future_head: GT 미래 방향입니다. shape은 ``[N, T]`` 입니다.
+        current_pos: anchor 현재 위치입니다. shape은 ``[N, 2]`` 입니다.
+        current_head: anchor 현재 방향입니다. shape은 ``[N]`` 입니다.
+        agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
+        pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
+        yaw_scale_rad: 방향 변화량 정규화에 쓸 radian 단위 값입니다.
+
+    Returns:
+        tuple[Tensor, Tensor]:
+            정규화된 control label과 step별 위치 복원 오차입니다.
+            shape은 각각 ``[N, T, 3]`` 과 ``[N, T]`` 입니다.
+    """
+    control_norm = build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        pos_scale_m=pos_scale_m,
+        yaw_scale_rad=yaw_scale_rad,
+    )
+    control = denormalize_control(
+        control_norm=control_norm,
+        pos_scale_m=pos_scale_m,
+        yaw_scale_rad=yaw_scale_rad,
+    )
+    decoded_pos, _ = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        current_pos=current_pos,
+        current_head=current_head,
+    )
+    round_trip_error_m = torch.linalg.vector_norm(decoded_pos - future_pos, dim=-1)
+    return control_norm, round_trip_error_m

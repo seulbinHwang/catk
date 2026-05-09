@@ -10,6 +10,7 @@ from src.smart.modules.kinematic_control import (
     PEDESTRIAN_TYPE_ID,
     VEHICLE_TYPE_ID,
     build_rolling_control_target,
+    build_rolling_control_target_with_round_trip_error,
     control_norm_to_pose_norm,
     decode_control_sequence,
     denormalize_control,
@@ -156,6 +157,43 @@ def test_rolling_projection_round_trip_for_vehicle_uses_decoder_consistent_pose(
     delta_vec = future_pos[:, 0] - current_pos
     expected_pos = current_pos + (delta_vec * h_mid).sum(dim=-1, keepdim=True) * h_mid
     torch.testing.assert_close(decoded_pos[:, 0], expected_pos, atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_round_trip_error_reports_vehicle_lateral_teleport() -> None:
+    current_pos = torch.tensor([[0.0, 0.0]])
+    current_head = torch.tensor([0.0])
+    future_pos = torch.tensor([[[0.0, 6.0]]])
+    future_head = torch.tensor([[0.0]])
+    agent_type = torch.tensor([VEHICLE_TYPE_ID])
+
+    control_norm, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+    )
+
+    assert tuple(control_norm.shape) == (1, 1, 3)
+    torch.testing.assert_close(round_trip_error_m, torch.tensor([[6.0]]), atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_round_trip_error_is_zero_for_pedestrian() -> None:
+    current_pos = torch.tensor([[0.0, 0.0]])
+    current_head = torch.tensor([0.0])
+    future_pos = torch.tensor([[[0.0, 6.0]]])
+    future_head = torch.tensor([[0.0]])
+    agent_type = torch.tensor([PEDESTRIAN_TYPE_ID])
+
+    _, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+    )
+
+    torch.testing.assert_close(round_trip_error_m, torch.zeros_like(round_trip_error_m))
 
 
 def test_pedestrian_uses_pedestrian_type_id_constant() -> None:

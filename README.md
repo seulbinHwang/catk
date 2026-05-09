@@ -476,6 +476,7 @@ torchrun ... -m src.run \
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
 - label 생성은 decoder-consistent rolling projection 방식입니다. 매 step마다 raw GT 현재 pose가 아니라 직전 control을 kinematic decoder에 통과시킨 pose를 다음 inverse의 현재 pose로 씁니다.
 - control-space 정규화 기본값은 `control_pos_scale_m=1.0`, `control_yaw_scale_rad=0.2`입니다. 이 값은 control label에만 적용되고, metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
+- control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `5.0m`이며, 평가 경로에는 적용하지 않습니다.
 - 추가 trajectory loss, x0 loss, open-loop draft loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
 - validation / rollout / metric 경로에서는 control 예측을 기존 pose-space 표현으로 복원해 기존 open-loop metric과 closed-loop rollout을 그대로 계산합니다.
 
@@ -498,6 +499,7 @@ model:
       use_kinematic_control_flow: true
       control_pos_scale_m: 1.0
       control_yaw_scale_rad: 0.2
+      control_round_trip_max_position_error_m: 5.0
 ```
 
 기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
