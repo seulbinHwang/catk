@@ -33,7 +33,7 @@ def test_pedestrian_rolling_control_reconstructs_target_position() -> None:
         agent_type=agent_type,
     )
     decoded_pos, decoded_head = decode_control_sequence(
-        control=denormalize_control(control_norm),
+        control=denormalize_control(control_norm, agent_type=agent_type),
         agent_type=agent_type,
         current_pos=current_pos,
         current_head=current_head,
@@ -57,7 +57,7 @@ def test_vehicle_rolling_control_uses_no_lateral_channel() -> None:
         current_head=current_head,
         agent_type=agent_type,
     )
-    control = denormalize_control(control_norm)
+    control = denormalize_control(control_norm, agent_type=agent_type)
 
     assert torch.allclose(control[..., 1], torch.zeros_like(control[..., 1]))
 
@@ -76,7 +76,7 @@ def test_cyclist_rolling_control_uses_no_lateral_channel_and_round_trips() -> No
         current_head=current_head,
         agent_type=agent_type,
     )
-    control = denormalize_control(control_norm)
+    control = denormalize_control(control_norm, agent_type=agent_type)
     decoded_pos, decoded_head = decode_control_sequence(
         control=control,
         agent_type=agent_type,
@@ -140,7 +140,7 @@ def test_rolling_projection_round_trip_for_vehicle_uses_decoder_consistent_pose(
         current_head=current_head,
         agent_type=agent_type,
     )
-    control = denormalize_control(control_norm)
+    control = denormalize_control(control_norm, agent_type=agent_type)
     decoded_pos, decoded_head = decode_control_sequence(
         control=control,
         agent_type=agent_type,

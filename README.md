@@ -475,7 +475,7 @@ torchrun ... -m src.run \
 - GT control label은 기존 cache 안의 GT pose에서 batch 생성 시점에 on-the-fly로 만듭니다. 별도 target cache는 필요 없습니다.
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
 - label 생성은 decoder-consistent rolling projection 방식입니다. 매 step마다 raw GT 현재 pose가 아니라 직전 control을 kinematic decoder에 통과시킨 pose를 다음 inverse의 현재 pose로 씁니다.
-- control-space 정규화 기본값은 `control_pos_scale_m=1.0`, `control_yaw_scale_rad=0.2`입니다. 이 값은 control label에만 적용되고, metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
+- control-space 정규화는 위치 이동량에는 공통 `control_pos_scale_m=1.0`을 쓰고, yaw에는 agent type별 scale을 씁니다. vehicle은 `0.025rad`, cyclist는 `0.06rad`, pedestrian은 `0.20rad`입니다. `control_yaw_scale_rad=0.2`는 agent type이 없는 기존 호출의 fallback 값입니다. metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
 - control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `5.0m`이며, 평가 경로에는 적용하지 않습니다.
 - 추가 trajectory loss, x0 loss, open-loop draft loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
 - validation / rollout / metric 경로에서는 control 예측을 기존 pose-space 표현으로 복원해 기존 open-loop metric과 closed-loop rollout을 그대로 계산합니다.
@@ -2467,3 +2467,10 @@ road_cache/
 `trainer.reload_dataloaders_every_n_epochs=1`이 필요합니다. 새 epoch마다 selected cache 폴더가 바뀌기 때문입니다. `road_flow` 실험 설정에는 이 값이 이미 들어 있습니다.
 
 `road.candidate_micro_batch_size`는 기본 4입니다. K=64 후보를 한 번에 모두 만들지 않고 작은 묶음으로 나누어 생성하므로, GPU 메모리가 부족하면 1 또는 2로 낮추면 됩니다.
+
+### Type-aware Control Yaw Normalization
+
+- control-space Flow Matching에서 position scale은 계속 `1.0m` 공통값을 씁니다.
+- yaw scale은 agent type별로 적용합니다: vehicle `0.025rad`, cyclist `0.06rad`, pedestrian `0.20rad`.
+- 이 변경은 정규화/역정규화 좌표계만 바꾸며, decoder 구조와 loss 구성은 바꾸지 않습니다.
+- 학습 target 생성, metric용 pose 복원, round-trip error 계산 모두 같은 type-aware yaw scale을 씁니다.

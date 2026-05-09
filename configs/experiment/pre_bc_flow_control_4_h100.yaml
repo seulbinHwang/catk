@@ -19,4 +19,7 @@ model:
       use_kinematic_control_flow: true
       control_pos_scale_m: 1.0
       control_yaw_scale_rad: 0.2
+      # control-space yaw normalization is agent type-aware when agent_type is available:
+      # vehicle=0.025rad, pedestrian=0.20rad, cyclist=0.06rad.
+      # This scalar remains a fallback for calls without agent_type.
       control_round_trip_max_position_error_m: 5.0

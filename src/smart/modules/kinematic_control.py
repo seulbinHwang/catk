@@ -9,6 +9,9 @@ CONTROL_FLOW_DIM = 3
 DEFAULT_CONTROL_POS_SCALE_M = 1.0
 DEFAULT_CONTROL_YAW_SCALE_RAD = 0.2
 DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M = 5.0
+DEFAULT_CONTROL_VEHICLE_YAW_SCALE_RAD = 0.025
+DEFAULT_CONTROL_PEDESTRIAN_YAW_SCALE_RAD = 0.20
+DEFAULT_CONTROL_CYCLIST_YAW_SCALE_RAD = 0.06
 POSE_NORM_POS_SCALE_M = 20.0
 
 # repo의 다른 모듈(draft_physics, agent_encoder, dataset 전처리)이 공유하는 정수 매핑입니다.
@@ -37,6 +40,58 @@ def _validate_agent_type(agent_type: Tensor) -> None:
             f"{{VEHICLE={VEHICLE_TYPE_ID}, PEDESTRIAN={PEDESTRIAN_TYPE_ID}, "
             f"CYCLIST={CYCLIST_TYPE_ID}}}; got values in [{type_min}, {type_max}]."
         )
+
+
+def _validate_control_agent_type(control: Tensor, agent_type: Tensor) -> None:
+    """control batch와 agent type batch가 서로 맞는지 확인합니다.
+
+    Args:
+        control: 정규화하거나 역정규화할 control입니다. shape은 ``[N, ..., 3]`` 입니다.
+        agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
+
+    Raises:
+        ValueError: batch 크기 또는 agent type 값이 올바르지 않은 경우 발생합니다.
+    """
+    if agent_type.ndim != 1 or agent_type.shape[0] != control.shape[0]:
+        raise ValueError(
+            "agent_type must have shape [N] and match control batch, "
+            f"got {tuple(agent_type.shape)} and {tuple(control.shape)}."
+        )
+    _validate_agent_type(agent_type)
+
+
+def resolve_control_yaw_scale(
+    agent_type: Tensor,
+    dtype: torch.dtype | None = None,
+    device: torch.device | None = None,
+) -> Tensor:
+    """agent 종류별 yaw 정규화 scale을 고릅니다.
+
+    Args:
+        agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
+            vehicle은 ``0``, pedestrian은 ``1``, cyclist는 ``2`` 입니다.
+        dtype: 반환 tensor 자료형입니다. 값이 없으면 ``torch.float32`` 를 씁니다.
+        device: 반환 tensor 장치입니다. 값이 없으면 ``agent_type`` 장치를 씁니다.
+
+    Returns:
+        Tensor: agent별 yaw scale입니다. shape은 ``[N]`` 입니다.
+            vehicle은 ``0.025rad``, pedestrian은 ``0.20rad``, cyclist는 ``0.06rad`` 입니다.
+    """
+    if agent_type.ndim != 1:
+        raise ValueError(f"agent_type must have shape [N], got {tuple(agent_type.shape)}.")
+    if device is None:
+        device = agent_type.device
+    if dtype is None:
+        dtype = torch.float32
+
+    agent_type_device = agent_type.to(device=device)
+    _validate_agent_type(agent_type_device)
+
+    yaw_scale = torch.empty(agent_type_device.shape, device=device, dtype=dtype)
+    yaw_scale[agent_type_device == VEHICLE_TYPE_ID] = DEFAULT_CONTROL_VEHICLE_YAW_SCALE_RAD
+    yaw_scale[agent_type_device == PEDESTRIAN_TYPE_ID] = DEFAULT_CONTROL_PEDESTRIAN_YAW_SCALE_RAD
+    yaw_scale[agent_type_device == CYCLIST_TYPE_ID] = DEFAULT_CONTROL_CYCLIST_YAW_SCALE_RAD
+    return yaw_scale
 
 
 def wrap_angle(angle: Tensor) -> Tensor:
@@ -75,43 +130,81 @@ def normalize_control(
     control: Tensor,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
     yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
+    agent_type: Tensor | None = None,
 ) -> Tensor:
     """제어값을 Flow Matching 학습 스케일로 바꿉니다.
 
     Args:
-        control: 실제 단위 제어값입니다. shape은 ``[..., 3]`` 입니다.
+        control: 실제 단위 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
             마지막 차원은 ``[앞뒤 이동량, 좌우 이동량, 방향 변화량]`` 입니다.
-        pos_scale_m: 이동량을 나눌 meter 단위 값입니다.
-        yaw_scale_rad: 방향 변화량을 나눌 radian 단위 값입니다.
+        pos_scale_m: 이동량을 나눌 meter 단위 값입니다. 모든 agent에 공통 적용합니다.
+        yaw_scale_rad: ``agent_type`` 이 없을 때 쓸 yaw scalar scale입니다.
+            기존 호출과의 호환용 fallback입니다.
+        agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
+            값이 있으면 yaw는 vehicle ``0.025rad``, pedestrian ``0.20rad``,
+            cyclist ``0.06rad`` 로 나눕니다.
 
     Returns:
-        Tensor: 정규화된 제어값입니다. shape은 ``[..., 3]`` 입니다.
+        Tensor: 정규화된 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
     """
     if control.shape[-1] != CONTROL_FLOW_DIM:
         raise ValueError(f"control last dim must be 3, got {control.shape[-1]}.")
-    scale = control.new_tensor([float(pos_scale_m), float(pos_scale_m), float(yaw_scale_rad)])
-    return control / scale
+
+    control_norm = control.clone()
+    control_norm[..., :2] = control[..., :2] / float(pos_scale_m)
+    if agent_type is None:
+        control_norm[..., 2] = control[..., 2] / float(yaw_scale_rad)
+        return control_norm
+
+    _validate_control_agent_type(control=control, agent_type=agent_type)
+    yaw_scale = resolve_control_yaw_scale(
+        agent_type=agent_type,
+        dtype=control.dtype,
+        device=control.device,
+    )
+    view_shape = (yaw_scale.shape[0],) + (1,) * (control.ndim - 2)
+    control_norm[..., 2] = control[..., 2] / yaw_scale.view(view_shape)
+    return control_norm
 
 
 def denormalize_control(
     control_norm: Tensor,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
     yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
+    agent_type: Tensor | None = None,
 ) -> Tensor:
     """정규화된 제어값을 실제 단위로 되돌립니다.
 
     Args:
-        control_norm: 정규화된 제어값입니다. shape은 ``[..., 3]`` 입니다.
+        control_norm: 정규화된 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
         pos_scale_m: 이동량 정규화에 쓴 meter 단위 값입니다.
-        yaw_scale_rad: 방향 변화량 정규화에 쓴 radian 단위 값입니다.
+        yaw_scale_rad: ``agent_type`` 이 없을 때 쓸 yaw scalar scale입니다.
+            기존 호출과의 호환용 fallback입니다.
+        agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
+            값이 있으면 yaw는 vehicle ``0.025rad``, pedestrian ``0.20rad``,
+            cyclist ``0.06rad`` 로 곱합니다.
 
     Returns:
-        Tensor: 실제 단위 제어값입니다. shape은 ``[..., 3]`` 입니다.
+        Tensor: 실제 단위 제어값입니다. shape은 ``[N, ..., 3]`` 입니다.
     """
     if control_norm.shape[-1] != CONTROL_FLOW_DIM:
         raise ValueError(f"control_norm last dim must be 3, got {control_norm.shape[-1]}.")
-    scale = control_norm.new_tensor([float(pos_scale_m), float(pos_scale_m), float(yaw_scale_rad)])
-    return control_norm * scale
+
+    control = control_norm.clone()
+    control[..., :2] = control_norm[..., :2] * float(pos_scale_m)
+    if agent_type is None:
+        control[..., 2] = control_norm[..., 2] * float(yaw_scale_rad)
+        return control
+
+    _validate_control_agent_type(control=control_norm, agent_type=agent_type)
+    yaw_scale = resolve_control_yaw_scale(
+        agent_type=agent_type,
+        dtype=control_norm.dtype,
+        device=control_norm.device,
+    )
+    view_shape = (yaw_scale.shape[0],) + (1,) * (control_norm.ndim - 2)
+    control[..., 2] = control_norm[..., 2] * yaw_scale.view(view_shape)
+    return control
 
 
 def decode_control_sequence(
@@ -211,8 +304,10 @@ def control_norm_to_pose_norm(
     Args:
         control_norm: 정규화된 제어 시퀀스입니다. shape은 ``[N, T, 3]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
+            yaw 역정규화는 agent type별 scale을 사용합니다.
         pos_scale_m: 이동량 정규화에 쓴 meter 단위 값입니다.
-        yaw_scale_rad: 방향 변화량 정규화에 쓴 radian 단위 값입니다.
+        yaw_scale_rad: ``agent_type`` 없는 호출의 scalar fallback입니다.
+            이 함수는 항상 ``agent_type`` 을 받으므로 일반적으로 직접 쓰지 않습니다.
         pose_pos_scale_m: 기존 pose-space Flow 표현의 위치 정규화 meter 값입니다.
 
     Returns:
@@ -224,6 +319,7 @@ def control_norm_to_pose_norm(
         control_norm=control_norm,
         pos_scale_m=pos_scale_m,
         yaw_scale_rad=yaw_scale_rad,
+        agent_type=agent_type,
     )
     pos, head = decode_control_sequence(control=control, agent_type=agent_type)
     return torch.stack(
@@ -317,6 +413,7 @@ def build_rolling_control_target(
         control=control,
         pos_scale_m=pos_scale_m,
         yaw_scale_rad=yaw_scale_rad,
+        agent_type=agent_type,
     )
 
 
@@ -358,6 +455,7 @@ def build_rolling_control_target_with_round_trip_error(
         control_norm=control_norm,
         pos_scale_m=pos_scale_m,
         yaw_scale_rad=yaw_scale_rad,
+        agent_type=agent_type,
     )
     decoded_pos, _ = decode_control_sequence(
         control=control,

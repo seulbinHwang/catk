@@ -37,6 +37,9 @@ model_config:
     use_kinematic_control_flow: false
     control_pos_scale_m: 1.0
     control_yaw_scale_rad: 0.2
+    # control-space yaw normalization is agent type-aware when agent_type is available:
+    # vehicle=0.025rad, pedestrian=0.20rad, cyclist=0.06rad.
+    # This scalar remains a fallback for calls without agent_type.
     # control-space 학습에서 GT -> control -> pose 복원 위치 오차가 이 값보다 큰 anchor는 학습에서 제외합니다.
     control_round_trip_max_position_error_m: 5.0
     map_token_sampling:
