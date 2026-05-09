@@ -6,8 +6,9 @@ from torch import Tensor
 
 POSE_FLOW_DIM = 4
 CONTROL_FLOW_DIM = 3
-DEFAULT_CONTROL_POS_SCALE_M = 20.0
-DEFAULT_CONTROL_YAW_SCALE_RAD = 1.0
+DEFAULT_CONTROL_POS_SCALE_M = 1.0
+DEFAULT_CONTROL_YAW_SCALE_RAD = 0.2
+POSE_NORM_POS_SCALE_M = 20.0
 
 
 def wrap_angle(angle: Tensor) -> Tensor:
@@ -171,6 +172,7 @@ def control_norm_to_pose_norm(
     agent_type: Tensor,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
     yaw_scale_rad: float = DEFAULT_CONTROL_YAW_SCALE_RAD,
+    pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
 ) -> Tensor:
     """정규화된 제어 시퀀스를 기존 pose-space 표현으로 바꿉니다.
 
@@ -179,11 +181,12 @@ def control_norm_to_pose_norm(
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
         pos_scale_m: 이동량 정규화에 쓴 meter 단위 값입니다.
         yaw_scale_rad: 방향 변화량 정규화에 쓴 radian 단위 값입니다.
+        pose_pos_scale_m: 기존 pose-space Flow 표현의 위치 정규화 meter 값입니다.
 
     Returns:
         Tensor: 기존 Flow Matching 평가/추론 경로가 쓰는 pose 표현입니다.
             shape은 ``[N, T, 4]`` 이고, 마지막 차원은
-            ``[x / 20, y / 20, cos(yaw), sin(yaw)]`` 입니다.
+            ``[x / pose_pos_scale_m, y / pose_pos_scale_m, cos(yaw), sin(yaw)]`` 입니다.
     """
     control = denormalize_control(
         control_norm=control_norm,
@@ -193,8 +196,8 @@ def control_norm_to_pose_norm(
     pos, head = decode_control_sequence(control=control, agent_type=agent_type)
     return torch.stack(
         [
-            pos[..., 0] / float(pos_scale_m),
-            pos[..., 1] / float(pos_scale_m),
+            pos[..., 0] / float(pose_pos_scale_m),
+            pos[..., 1] / float(pose_pos_scale_m),
             head.cos(),
             head.sin(),
         ],

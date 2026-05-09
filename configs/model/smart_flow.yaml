@@ -35,8 +35,8 @@ model_config:
     # true이면 GT pose에서 decoder-consistent rolling control label을 on-the-fly로 만들고,
     # Flow Matching은 [delta_s, delta_n, delta_yaw] 제어공간에서 학습합니다.
     use_kinematic_control_flow: false
-    control_pos_scale_m: 20.0
-    control_yaw_scale_rad: 1.0
+    control_pos_scale_m: 1.0
+    control_yaw_scale_rad: 0.2
     map_token_sampling:
       num_k: 1
       temp: 1.0

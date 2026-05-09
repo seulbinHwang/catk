@@ -473,6 +473,7 @@ torchrun ... -m src.run \
 ```
 
 - GT control label은 기존 cache 안의 GT pose에서 batch 생성 시점에 on-the-fly로 만듭니다. 별도 target cache는 필요 없습니다.
+- control 정규화 기본값은 `control_pos_scale_m=1.0`, `control_yaw_scale_rad=0.2` 입니다. metric/rollout용 pose-space 복원은 기존 pose normalization인 20m 기준을 유지합니다.
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
 - label 생성은 decoder-consistent rolling projection 방식입니다. 매 step마다 raw GT 현재 pose가 아니라 직전 control을 kinematic decoder에 통과시킨 pose를 다음 inverse의 현재 pose로 씁니다.
 - 추가 trajectory loss, x0 loss, open-loop draft loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.

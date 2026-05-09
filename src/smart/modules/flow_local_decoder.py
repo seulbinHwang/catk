@@ -694,8 +694,8 @@ class ContinuousCommitBridge:
         use_stop_motion: bool = False,
         config: LQRCommitBridgeConfig | None = None,
         use_kinematic_control_flow: bool = False,
-        control_pos_scale_m: float = 20.0,
-        control_yaw_scale_rad: float = 1.0,
+        control_pos_scale_m: float = 1.0,
+        control_yaw_scale_rad: float = 0.2,
     ) -> None:
         self.commit_steps = int(commit_steps)
         self.pos_scale_m = float(pos_scale_m)
