@@ -34,6 +34,10 @@ DEFAULT_PODS = (
     "fvvvv",
     "fvvvvv",
 )
+DEFAULT_EXTRA_HYDRA_OVERRIDES = (
+    "trainer.strategy.cluster_environment._target_="
+    "src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment"
+)
 
 
 def current_branch() -> str:
@@ -206,11 +210,14 @@ def main() -> int:
             "VAL_BATCH_SIZE": str(args.val_batch_size),
         }
     )
+    extra_hydra_overrides = " ".join(
+        part for part in (DEFAULT_EXTRA_HYDRA_OVERRIDES, args.extra_hydra_overrides) if part
+    )
     optional_env = {
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
         "MAX_EPOCHS": args.max_epochs,
-        "EXTRA_HYDRA_OVERRIDES": args.extra_hydra_overrides,
+        "EXTRA_HYDRA_OVERRIDES": extra_hydra_overrides,
     }
     env.update({name: value for name, value in optional_env.items() if value})
     if args.pod_cache_root:

@@ -548,6 +548,8 @@ scripts/launch_pre_bc_flow_control_v100x47_static_pods.py
 
 현재 런처는 `torchrun --nproc_per_node=gpu` 경로를 사용하므로, 실행 환경의 PyTorch가 이 모드를 지원해야 47-rank heterogeneous launch가 됩니다. 만약 해당 torchrun 버전이 이를 거부하면, 임시 안전 fallback은 `--nproc-per-node 3`으로 모든 pod에서 3장씩만 써서 39-rank로 돌리는 것입니다.
 
+4GPU pod와 3GPU pod를 섞으면 Lightning 기본 TorchElastic 검증의 `devices * num_nodes == WORLD_SIZE` 가정이 맞지 않습니다. 이 preset은 `HeterogeneousTorchElasticEnvironment`를 써서 그 homogeneous 검증만 완화하고, 실제 rank/world size는 torchrun이 제공하는 `WORLD_SIZE=47` 값을 그대로 사용합니다.
+
 batch size는 가장 작은 V100 32GB GPU에 맞춰 정합니다. H100 80GB에서 per-GPU `26`이 맞았던 기록을 단순 메모리 비율로 옮기면 `26 * 32 / 80 = 10.4`가 1차 추정치입니다. V100은 bf16 대신 fp16(`16-mixed`)이고 kernel/workspace/fragmentation 차이가 있으므로 첫 시도는 `8`로 낮춰 잡았습니다. OOM fallback은 `8 -> 6 -> 4 -> 2`입니다.
 
 lr은 선형 scaling을 쓰지 않고 더 보수적으로 잡습니다. H100x4x2 기준 global batch는 `26 * 8 = 208`이고 이 V100 47GPU 설정은 `8 * 47 = 376`입니다. 선형 scaling이면 `~9e-4`가 되지만, 첫 run에서는 sqrt scaling에 가깝게 낮춘 `6e-4`를 기본값으로 둡니다.

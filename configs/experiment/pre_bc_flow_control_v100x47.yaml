@@ -55,6 +55,9 @@ trainer:
   gradient_clip_val: 1.0
   sync_batchnorm: false
   accumulate_grad_batches: 1
+  strategy:
+    cluster_environment:
+      _target_: src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment
 
 callbacks:
   tqdm_progress_bar:
