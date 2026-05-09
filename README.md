@@ -481,6 +481,46 @@ torchrun ... -m src.run \
 
 pose-space checkpoint와 control-space checkpoint는 Flow decoder 입출력 차원이 다르므로 서로 섞어 resume하지 않는 것을 권장합니다. 기존 pose-space pretrain weight를 control-space 실험의 초기값으로 재사용하려면 Flow decoder head/encoder 차원 차이를 어떻게 처리할지 별도 migration 정책이 필요합니다.
 
+#### hsb-npc-training/hsb-npc-training2 H100x4x2 control-space pretrain
+
+`hsb-npc-training`, `hsb-npc-training2` 두 H100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --replace
+```
+
+이 launcher는 `configs/experiment/pre_bc_flow_control_2x4_h100.yaml`을 사용합니다. 해당 preset은 `pre_bc_flow_2x4_h100`의 2-node H100 학습 설정을 유지하면서 `pre_bc_flow_control_4_h100.yaml`과 같은 control-space 설정을 켭니다.
+
+```yaml
+model:
+  model_config:
+    token_processor:
+      use_kinematic_control_flow: true
+      control_pos_scale_m: 1.0
+      control_yaw_scale_rad: 0.2
+```
+
+기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-control-pretrain-h100x4x2
+kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-control-pretrain-h100x4x2
+```
+
+실행 전에 실제 kubectl 명령을 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --dry-run
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --stop
+```
+
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
 
 - 학습 중 validation은 `trainer.check_val_every_n_epoch` 마다 실행됩니다.

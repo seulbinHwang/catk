@@ -1,0 +1,18 @@
+# @package _global_
+
+# Control-space Flow Matching pretrain preset for two H100x4 nodes.
+#
+# This keeps the distributed/batch/lr recipe from `pre_bc_flow_2x4_h100` and
+# applies the same kinematic-control target switch as
+# `pre_bc_flow_control_4_h100`.
+
+defaults:
+  - pre_bc_flow_2x4_h100
+  - _self_
+
+model:
+  model_config:
+    token_processor:
+      use_kinematic_control_flow: true
+      control_pos_scale_m: 1.0
+      control_yaw_scale_rad: 0.2
