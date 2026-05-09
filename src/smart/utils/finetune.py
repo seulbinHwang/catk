@@ -122,6 +122,11 @@ class FinetuneConfig:
     #: (argmin) 를 골라 paired L2 target 으로 사용. ``ocsc_use_mmd`` 자동 False 강제.
     #: M < G 면 의미 없음 (자동으로 비활성).
     ocsc_ol_nearest_match: bool = False
+    #: True → consistency loss 의 L2 만 global world frame 에서 측정 (per-agent rotate
+    #: + /20 normalize 안 함).  rollout 자체는 그대로; 단지 cl_norm/gt_norm 텐서를
+    #: 만들 때 transform_to_local 우회하고 [x, y, cos(head), sin(head)] 로 stack.
+    #: pos channel scale 이 400x 커지므로 Adam 의 weight_decay vs grad 비율이 바뀜.
+    ocsc_loss_global_frame: bool = False
     #: 일관성 loss 종류. "l2" (MSE), "smooth_l1", "l1" 중 하나.
     ocsc_loss_type: str = "l2"
     #: True → OCSC consistency를 proper MMD^2로 계산. False → rollout별 pairwise loss.
@@ -269,6 +274,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_n_rollouts=int(_read_config_value(finetune, "ocsc_n_rollouts", 2)),
         ocsc_n_ol_rollouts=int(_read_config_value(finetune, "ocsc_n_ol_rollouts", -1)),
         ocsc_ol_nearest_match=bool(_read_config_value(finetune, "ocsc_ol_nearest_match", False)),
+        ocsc_loss_global_frame=bool(_read_config_value(finetune, "ocsc_loss_global_frame", False)),
         ocsc_loss_type=str(_read_config_value(finetune, "ocsc_loss_type", "l2")),
         ocsc_use_mmd=bool(_read_config_value(finetune, "ocsc_use_mmd", True)),
         ocsc_use_pretrained_ref=bool(_read_config_value(finetune, "ocsc_use_pretrained_ref", False)),

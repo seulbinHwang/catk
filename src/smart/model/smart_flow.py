@@ -1685,7 +1685,18 @@ class SMARTFlow(LightningModule):
             return total
 
         # ── world → normalized frame helper ──────────────────────────────────
+        # ocsc_loss_global_frame=True 면 transform_to_local + /20 우회하고 raw world xy
+        # 와 cos/sin(world heading) 으로만 stack — L2 가 global frame meter 단위로 측정됨.
+        # rollout 자체는 영향 없음 (이 closure 는 loss 입력 텐서 만들 때만 호출).
+        _loss_global_frame = bool(getattr(self.finetune_config, "ocsc_loss_global_frame", False))
+        if _loss_global_frame:
+            log.info(f"[ocsc_ft] ocsc_loss_global_frame=True: L2 in world frame (no transform, no /20).")
         def _cl_to_norm(cl_xy: Tensor, cl_head: Tensor, current_pos_active: Tensor, current_head_active: Tensor) -> Tensor:
+            if _loss_global_frame:
+                return torch.stack(
+                    [cl_xy[..., 0], cl_xy[..., 1], cl_head.cos(), cl_head.sin()],
+                    dim=-1,
+                )
             return self._world_traj_to_flow_norm(
                 pred_traj=cl_xy,
                 pred_head=cl_head,

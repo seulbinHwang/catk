@@ -142,6 +142,9 @@ OCSC_N_OL_ROLLOUTS="${OCSC_N_OL_ROLLOUTS:--1}"
 # OCSC_OL_NEAREST_MATCH: true → 각 CL g 별로 M 개 OL 중 per-anchor flat L2 최소를 paired L2 target.
 #   use_mmd 자동 false 강제. M>=G 필요 (그 외는 비활성).
 OCSC_OL_NEAREST_MATCH="${OCSC_OL_NEAREST_MATCH:-false}"
+# OCSC_LOSS_GLOBAL_FRAME: true → consistency L2 를 global world frame 에서 측정 (transform 우회).
+#   rollout 자체는 그대로; loss 입력 텐서만 raw world xy + cos/sin(world heading) 으로 stack.
+OCSC_LOSS_GLOBAL_FRAME="${OCSC_LOSS_GLOBAL_FRAME:-false}"
 # OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-smooth_l1}"
 OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
 OCSC_USE_MMD="${OCSC_USE_MMD:-false}"
@@ -317,6 +320,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_n_rollouts="${OCSC_N_ROLLOUTS}" \
   model.model_config.finetune.ocsc_n_ol_rollouts="${OCSC_N_OL_ROLLOUTS}" \
   model.model_config.finetune.ocsc_ol_nearest_match="${OCSC_OL_NEAREST_MATCH}" \
+  model.model_config.finetune.ocsc_loss_global_frame="${OCSC_LOSS_GLOBAL_FRAME}" \
   model.model_config.finetune.ocsc_loss_type="${OCSC_LOSS_TYPE}" \
   model.model_config.finetune.ocsc_use_mmd="${OCSC_USE_MMD}" \
   model.model_config.finetune.ocsc_anchor_stride="${OCSC_ANCHOR_STRIDE}" \
