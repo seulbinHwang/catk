@@ -81,6 +81,7 @@ class SMARTFlow(LightningModule):
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
         self.token_processor = FlowTokenProcessor(**model_config.token_processor)
+        self.use_kinematic_control_flow = bool(self.token_processor.use_kinematic_control_flow)
 
         self.encoder = SMARTFlowDecoder(
             **model_config.decoder,
@@ -157,6 +158,13 @@ class SMARTFlow(LightningModule):
         self.draft_loss_enabled = bool(
             self.draft_enabled and getattr(draft_config, "loss_enabled", True)
         )
+        if self.use_kinematic_control_flow and self.draft_loss_enabled:
+            raise ValueError(
+                "control-space Flow Matching requires a single loss in control space; "
+                "draft physics regularizer pulls decoded trajectories toward pose-space targets "
+                "and must not run with token_processor.use_kinematic_control_flow=true. "
+                "Set draft.enabled=false or draft.loss_enabled=false."
+            )
         self.draft_sampling = getattr(draft_config, "sampling", None)
         self.draft_start_epoch = int(getattr(draft_config, "start_epoch", 0)) if draft_config is not None else 0
         self.draft_ramp_epochs = int(getattr(draft_config, "ramp_epochs", 1)) if draft_config is not None else 1
@@ -354,6 +362,13 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
+        if self.use_kinematic_control_flow and self.self_forced_use_physics:
+            raise ValueError(
+                "control-space Flow Matching requires a single loss in control space; "
+                "self_forced physics regularizer compares decoded trajectories to pose-space "
+                "targets and must not run with token_processor.use_kinematic_control_flow=true. "
+                "Set self_forced.use_control_space_physics_regularization=false."
+            )
         self.self_forced_physics_weight = (
             float(getattr(self.self_forced_config, "physics_weight", 0.0))
             if self.self_forced_config is not None

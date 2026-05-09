@@ -10,6 +10,33 @@ DEFAULT_CONTROL_POS_SCALE_M = 1.0
 DEFAULT_CONTROL_YAW_SCALE_RAD = 0.2
 POSE_NORM_POS_SCALE_M = 20.0
 
+# repo의 다른 모듈(draft_physics, agent_encoder, dataset 전처리)이 공유하는 정수 매핑입니다.
+# 이 모듈은 "pedestrian만 holonomic, 나머지는 non-holonomic" 분기를 이 약속 위에서 직접 코딩하므로,
+# 호출자가 다른 인덱싱을 넘기면 잘못된 디코더가 적용되어도 학습이 silent하게 진행됩니다.
+# 매핑이 흔들리면 이 상수와 _validate_agent_type() 한 곳을 같이 고치도록 의도적으로 노출합니다.
+VEHICLE_TYPE_ID = 0
+PEDESTRIAN_TYPE_ID = 1
+CYCLIST_TYPE_ID = 2
+_VALID_AGENT_TYPE_IDS = (VEHICLE_TYPE_ID, PEDESTRIAN_TYPE_ID, CYCLIST_TYPE_ID)
+
+
+def _validate_agent_type(agent_type: Tensor) -> None:
+    """agent_type 값이 이 모듈이 가정한 정수 매핑 안에 있는지 확인합니다.
+
+    Args:
+        agent_type: 검사할 agent 종류 텐서입니다. shape은 임의입니다.
+    """
+    if agent_type.numel() == 0:
+        return
+    type_min = int(agent_type.min().item())
+    type_max = int(agent_type.max().item())
+    if type_min < 0 or type_max > CYCLIST_TYPE_ID:
+        raise ValueError(
+            "agent_type must follow the repo convention "
+            f"{{VEHICLE={VEHICLE_TYPE_ID}, PEDESTRIAN={PEDESTRIAN_TYPE_ID}, "
+            f"CYCLIST={CYCLIST_TYPE_ID}}}; got values in [{type_min}, {type_max}]."
+        )
+
 
 def wrap_angle(angle: Tensor) -> Tensor:
     """각도를 안정적인 범위로 접습니다.
@@ -28,16 +55,19 @@ def safe_sinc(x: Tensor, eps: float = 1.0e-6) -> Tensor:
 
     Args:
         x: sinc 값을 계산할 입력입니다. shape은 임의입니다.
-        eps: 0에 가까운지 판단할 기준값입니다.
+        eps: Taylor 분기로 바꿀 0 근처 판단 기준값입니다.
 
     Returns:
         Tensor: 입력과 같은 shape의 sinc 값입니다.
     """
+    near_zero = x.abs() < eps
+    safe_x = torch.where(near_zero, torch.ones_like(x), x)
     x2 = x * x
-    approx = 1.0 - x2 / 6.0 + x2 * x2 / 120.0
-    exact = x.sin() / x.clamp_min(eps)
-    exact = torch.where(x < 0.0, x.sin() / x.clamp_max(-eps), exact)
-    return torch.where(x.abs() < eps, approx, exact)
+    return torch.where(
+        near_zero,
+        1.0 - x2 / 6.0 + x2 * x2 / 120.0,
+        x.sin() / safe_x,
+    )
 
 
 def normalize_control(
@@ -95,7 +125,7 @@ def decode_control_sequence(
         control: 실제 단위 제어값입니다. shape은 ``[N, T, 3]`` 입니다.
             마지막 차원은 ``[앞뒤 이동량, 좌우 이동량, 방향 변화량]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
-            repo의 기존 규칙대로 ``0=vehicle, 1=pedestrian, 2=cyclist`` 를 사용합니다.
+            ``VEHICLE_TYPE_ID``, ``PEDESTRIAN_TYPE_ID``, ``CYCLIST_TYPE_ID`` 안에 있어야 합니다.
         current_pos: 시작 위치입니다. shape은 ``[N, 2]`` 입니다.
             값이 없으면 원점에서 시작합니다.
         current_head: 시작 방향입니다. shape은 ``[N]`` 입니다.
@@ -113,6 +143,7 @@ def decode_control_sequence(
             "agent_type must have shape [N] and match control batch, "
             f"got {tuple(agent_type.shape)} and {tuple(control.shape)}."
         )
+    _validate_agent_type(agent_type)
 
     num_agent = control.shape[0]
     device = control.device
@@ -126,7 +157,7 @@ def decode_control_sequence(
     else:
         roll_head = current_head.to(device=device, dtype=dtype)
 
-    ped_mask = agent_type.to(device=device) == 1
+    ped_mask = agent_type.to(device=device) == PEDESTRIAN_TYPE_ID
     pos_steps: list[Tensor] = []
     head_steps: list[Tensor] = []
 
@@ -242,10 +273,11 @@ def build_rolling_control_target(
         raise ValueError(f"current_head must have shape [N], got {tuple(current_head.shape)}.")
     if tuple(agent_type.shape) != (future_pos.shape[0],):
         raise ValueError(f"agent_type must have shape [N], got {tuple(agent_type.shape)}.")
+    _validate_agent_type(agent_type)
 
     roll_pos = current_pos.clone()
     roll_head = current_head.clone()
-    ped_mask = agent_type.to(device=future_pos.device) == 1
+    ped_mask = agent_type.to(device=future_pos.device) == PEDESTRIAN_TYPE_ID
     control_steps: list[Tensor] = []
 
     for step_idx in range(future_pos.shape[1]):
@@ -254,29 +286,28 @@ def build_rolling_control_target(
         delta_head = wrap_angle(target_head - roll_head)
         delta_vec = target_pos - roll_pos
 
+        # pedestrian: holonomic — control은 현재 heading body frame의 GT 변위를 그대로 담는다.
         cos_head = roll_head.cos()
         sin_head = roll_head.sin()
         ped_delta_s = delta_vec[:, 0] * cos_head + delta_vec[:, 1] * sin_head
         ped_delta_n = -delta_vec[:, 0] * sin_head + delta_vec[:, 1] * cos_head
 
+        # vehicle/cyclist: non-holonomic — h_mid 방향 투영분만 살리고 lateral 성분은 버린다.
+        # 이 inverse 결정이 곧 다음 가상 pose를 정의하므로(decoder를 따로 호출하지 않는다),
+        # nonhol_proj 는 같은 한 번의 계산이 control과 다음 roll_pos 양쪽에 쓰인다.
         mid_head = roll_head + 0.5 * delta_head
         h_mid = torch.stack([mid_head.cos(), mid_head.sin()], dim=-1)
-        nonhol_delta_s = (delta_vec * h_mid).sum(dim=-1) / safe_sinc(0.5 * delta_head)
-        nonhol_delta_n = torch.zeros_like(nonhol_delta_s)
+        nonhol_proj = (delta_vec * h_mid).sum(dim=-1)
+        nonhol_delta_s = nonhol_proj / safe_sinc(0.5 * delta_head)
 
         delta_s = torch.where(ped_mask, ped_delta_s, nonhol_delta_s)
-        delta_n = torch.where(ped_mask, ped_delta_n, nonhol_delta_n)
+        delta_n = torch.where(ped_mask, ped_delta_n, torch.zeros_like(ped_delta_n))
         step_control = torch.stack([delta_s, delta_n, delta_head], dim=-1)
         control_steps.append(step_control)
 
-        decoded_pos, decoded_head = decode_control_sequence(
-            control=step_control.unsqueeze(1),
-            agent_type=agent_type,
-            current_pos=roll_pos,
-            current_head=roll_head,
-        )
-        roll_pos = decoded_pos[:, -1]
-        roll_head = decoded_head[:, -1]
+        nonhol_next_pos = roll_pos + nonhol_proj.unsqueeze(-1) * h_mid
+        roll_pos = torch.where(ped_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
+        roll_head = wrap_angle(roll_head + delta_head)
 
     if len(control_steps) == 0:
         return future_pos.new_zeros((future_pos.shape[0], 0, CONTROL_FLOW_DIM))
