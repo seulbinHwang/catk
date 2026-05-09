@@ -68,6 +68,25 @@ activate_conda_if_available() {
   log "conda not found; using current Python."
 }
 
+resolve_trainer_devices() {
+  local requested="$1"
+  case "$requested" in
+    gpu|auto)
+      python - <<'PY'
+import torch
+
+count = torch.cuda.device_count()
+if count < 1:
+    raise SystemExit("no CUDA devices are visible")
+print(count)
+PY
+      ;;
+    *)
+      printf '%s\n' "$requested"
+      ;;
+  esac
+}
+
 main() {
   export LOGLEVEL="${LOGLEVEL:-INFO}"
   export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
@@ -91,6 +110,7 @@ main() {
   local cache_root="${CACHE_ROOT:-$(default_cache_root)}"
   local nnodes="${PET_NNODES:-${NNODES:-2}}"
   local nproc_per_node="${PET_NPROC_PER_NODE:-${NPROC_PER_NODE:-4}}"
+  local trainer_devices="${TRAINER_DEVICES:-}"
   local node_rank="${NODE_RANK:-}"
   local master_addr="${MASTER_ADDR:-}"
   local master_port="${MASTER_PORT:-29511}"
@@ -126,6 +146,13 @@ main() {
     log "ERROR: CACHE_ROOT does not exist in this node: $cache_root"
     exit 2
   fi
+  if [[ -z "$trainer_devices" ]]; then
+    trainer_devices="$(resolve_trainer_devices "$nproc_per_node")"
+  fi
+  if ! [[ "$trainer_devices" =~ ^[0-9]+$ ]] || (( trainer_devices < 1 )); then
+    log "ERROR: resolved trainer.devices must be a positive integer; got: $trainer_devices"
+    exit 2
+  fi
 
   log "starting CAT-K H100x4 multi-node pretrain"
   log "  experiment:       $experiment"
@@ -133,6 +160,7 @@ main() {
   log "  task_name:        $task_name"
   log "  nnodes:           $nnodes"
   log "  nproc_per_node:   $nproc_per_node"
+  log "  trainer.devices:  $trainer_devices"
   log "  cache_root:       $cache_root"
   if [[ -n "$node_rank" ]]; then
     log "  launch_mode:      static"
@@ -175,7 +203,7 @@ main() {
     experiment="$experiment"
     action="$action"
     trainer=ddp
-    trainer.devices="$nproc_per_node"
+    trainer.devices="$trainer_devices"
     trainer.num_nodes="$nnodes"
     trainer.enable_progress_bar=true
     paths.cache_root="$cache_root"

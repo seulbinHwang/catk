@@ -1,0 +1,74 @@
+# @package _global_
+
+# Kinematic-control Flow Matching pretrain preset for the static V100 fleet.
+#
+# Intended launcher shape:
+#   * testsv/testsvv/testsvvv/testsvvvv/sv/svv/svvv/svvvv: 8 pods x 4 V100
+#   * fv/fvv/fvvv/fvvvv/fvvvvv: 5 pods x 3 V100
+#   * 47 total DDP ranks when launched with NPROC_PER_NODE=gpu.
+#
+# The launcher overrides trainer.devices on each pod to the number of visible
+# GPUs on that pod. This config keeps the model/data/training hyperparameters
+# in one place; it cannot represent the heterogeneous local GPU counts by
+# itself.
+
+defaults:
+  - override /model: smart_flow
+
+model:
+  model_config:
+    # H100x4x2 control-space pretrain used global batch 26*8=208 at lr=5e-4.
+    # This V100 fleet starts at global batch 8*47=376. Linear scaling would be
+    # ~9e-4; we use a milder sqrt-style scale and round down for a first run.
+    lr: 6e-4
+    lr_warmup_steps: 4
+    lr_min_ratio: 1e-2
+    n_rollout_closed_val: 16
+    sim_agents_context_cache_size: 64
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    decoder:
+      flow_window_steps: 20
+    token_processor:
+      use_prefix_valid_future_loss_mask: true
+      use_kinematic_control_flow: true
+      control_pos_scale_m: 1.0
+      control_vehicle_yaw_scale_rad: 0.025
+      control_pedestrian_yaw_scale_rad: 0.20
+      control_cyclist_yaw_scale_rad: 0.06
+      control_round_trip_max_position_error_m: 2.0
+
+ckpt_path: null
+
+trainer:
+  # The static-pod launcher passes the actual local GPU count per pod. Keep -1
+  # here so manual single-pod sanity checks still use all visible GPUs.
+  devices: -1
+  num_nodes: 13
+  enable_progress_bar: true
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 32
+  max_epochs: 64
+  precision: 16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+  accumulate_grad_batches: 1
+
+callbacks:
+  tqdm_progress_bar:
+    _target_: lightning.pytorch.callbacks.TQDMProgressBar
+    refresh_rate: 1
+    process_position: 0
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  train_batch_size: 8
+  val_batch_size: 4
+  test_batch_size: 4
+  num_workers: 2
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true

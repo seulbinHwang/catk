@@ -81,6 +81,20 @@ def parse_pod_cache_roots(values: list[str]) -> dict[str, str]:
     return roots
 
 
+def validate_nproc_per_node(value: str) -> str:
+    if value in {"auto", "gpu"}:
+        return value
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--nproc-per-node must be a positive integer or one of: auto, gpu"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("--nproc-per-node must be >= 1")
+    return value
+
+
 def cache_root_for_pod(args: argparse.Namespace, pod: str) -> str:
     if pod in args.pod_cache_root_map:
         return args.pod_cache_root_map[pod]
@@ -626,7 +640,7 @@ def parse_args() -> argparse.Namespace:
         default="29512",
         help="Rank-0 pod HTTP port used to serve --ckpt-path to worker pods.",
     )
-    parser.add_argument("--nproc-per-node", type=int, default=4)
+    parser.add_argument("--nproc-per-node", type=validate_nproc_per_node, default="4")
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--train-batch-size", default="")
     parser.add_argument("--val-batch-size", default="")
@@ -650,8 +664,6 @@ def parse_args() -> argparse.Namespace:
 
     if len(args.pods) < 2 and not args.stop:
         parser.error("--pods must contain at least two pods for multi-node training")
-    if args.nproc_per_node < 1:
-        parser.error("--nproc-per-node must be >= 1")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
     if args.action in {"validate", "test"} and not args.ckpt_path and not args.stop:
