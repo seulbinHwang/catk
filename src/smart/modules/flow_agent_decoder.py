@@ -803,7 +803,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             return output
 
         flow_sample = self.flow_ode.sample(flow_clean_norm, target_type="velocity")
-        flow_pred_norm = self.flow_decoder(anchor_hidden_valid, flow_sample.x_t, flow_sample.tau)
+        flow_pred_norm = self.flow_decoder(
+            anchor_hidden_valid,
+            flow_sample.x_t,
+            flow_sample.tau,
+            future_valid_mask=flow_loss_mask,
+        )
         flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
             flow_sample.x_t,
             flow_pred_norm,
