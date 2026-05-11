@@ -501,7 +501,7 @@ model:
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20
       control_cyclist_yaw_scale_rad: 0.06
-      control_round_trip_max_position_error_m: 5.0
+      control_round_trip_max_position_error_m: 2.0
 ```
 
 기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
