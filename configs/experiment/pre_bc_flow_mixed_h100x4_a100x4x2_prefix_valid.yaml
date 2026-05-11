@@ -10,8 +10,9 @@
 # This keeps the FW30 H100x4x2 pretrain recipe conservative:
 #   * per-GPU train batch starts at 26, the measured safe H100 FW30 value.
 #   * A100 and H100 are both 80GB here, so DDP uses one common per-rank batch.
-#   * lr stays at the proven H100x4x2 value instead of linearly scaling again
-#     from global batch 208 to 312 for the mixed-hardware first run.
+#   * lr stays at a separate conservative 5e-4 for the mixed-hardware first
+#     run instead of following the H100x4x2 6e-4 baseline or linearly scaling
+#     again from global batch 208 to 312.
 
 defaults:
   - pre_bc_flow_4_h100

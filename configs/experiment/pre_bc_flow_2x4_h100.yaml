@@ -11,8 +11,7 @@
 # The per-GPU batch uses the extra H100 memory headroom while preserving the
 # same 2s flow window and one optimizer step per global batch:
 #   train_batch_size 26 * 8 GPUs = effective global batch 208.
-# The lr intentionally stays at the previous H100x4x2 value instead of applying
-# another linear scaling step when the batch is raised from 20 to 26.
+# The lr is set to 6e-4 for this 208 global-batch H100x4x2 recipe.
 # ============================================================================
 
 defaults:
@@ -20,7 +19,7 @@ defaults:
 
 model:
   model_config:
-    lr: 5e-4
+    lr: 6e-4
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
     n_rollout_closed_val: 16
