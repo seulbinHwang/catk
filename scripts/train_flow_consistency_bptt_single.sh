@@ -57,6 +57,21 @@ fi
 CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
 CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt}"
 
+# ── Backbone variant 자동 선택 ──────────────────────────────────────────────
+# CKPT_PATH 가 project_3 의 87MB ckpt (8b2f9b7d-base, OCSC_v3 V2 backbone) 면
+# model=smart_flow_v2 로 override.  사용자가 MODEL_CONFIG 를 직접 export 하면
+# 그 값을 우선 사용한다.
+if [ -z "${MODEL_CONFIG:-}" ]; then
+  case "${CKPT_PATH}" in
+    *project_3/logs/pretrained/*)
+      MODEL_CONFIG="smart_flow_v2"
+      ;;
+    *)
+      MODEL_CONFIG="smart_flow"
+      ;;
+  esac
+fi
+
 TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
 FIXED_SCENARIO_MODE="${FIXED_SCENARIO_MODE:-false}"
@@ -262,6 +277,7 @@ if [ -n "${FIXED_SCENARIO_PKL}" ]; then
   echo "FIXED_SCENARIO_PKL=${FIXED_SCENARIO_PKL}"
 fi
 echo "CKPT_PATH=${CKPT_PATH}"
+echo "MODEL_CONFIG=${MODEL_CONFIG}"
 echo "NPROC=${NPROC_PER_NODE} TRAIN_B=${TRAIN_B} MAX_EPOCHS=${MAX_EPOCHS} LIMIT_TRAIN=${LIMIT_TRAIN_BATCHES}"
 echo "SEED=${SEED} DATA_SHUFFLE=${DATA_SHUFFLE} DETERMINISTIC=${TRAINER_DETERMINISTIC}"
 echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_TARGET=${OCSC_TARGET_MAX_STEPS}cs OCSC_PRED=${OCSC_PRED_MAX_STEPS}cs"
@@ -281,6 +297,7 @@ PORT="$(get_free_port)"
 ACTION="${ACTION:-finetune}"
 torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_endpoint="127.0.0.1:${PORT}" -m src.run \
   experiment="${MY_EXPERIMENT}" \
+  model="${MODEL_CONFIG}" \
   action="${ACTION}" \
   task_name="${MY_TASK_NAME}" \
   ckpt_path="${CKPT_PATH}" \
