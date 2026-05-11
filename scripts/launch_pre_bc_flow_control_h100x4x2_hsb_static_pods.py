@@ -58,7 +58,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or current_branch())
     parser.add_argument("--remote-log-dir", default=os.environ.get("REMOTE_LOG_DIR", "/mnt/nuplan/projects/catk/logs"))
     parser.add_argument("--experiment", default="pre_bc_flow_control_2x4_h100")
-    parser.add_argument("--task-name", default="flow_control_space_pretrain_h100x4x2_bs26")
+    parser.add_argument(
+        "--task-name",
+        default="flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26",
+    )
     parser.add_argument("--session", default="catk-control-pretrain-h100x4x2")
     parser.add_argument("--initial-bs", type=int, default=26)
     parser.add_argument("--oom-step", type=int, default=2)

@@ -497,6 +497,7 @@ model:
   model_config:
     token_processor:
       use_kinematic_control_flow: true
+      use_prefix_valid_future_loss_mask: false
       control_pos_scale_m: 1.0
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20
@@ -504,7 +505,7 @@ model:
       control_round_trip_max_position_error_m: 2.0
 ```
 
-기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
+기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`이라 effective global batch는 `208`이며, 기본 lr은 `6e-4`입니다. `use_prefix_valid_future_loss_mask=false`라 전체 2초 미래가 유효한 anchor만 학습하고, `control_round_trip_max_position_error_m=2.0`으로 round-trip 이상치 anchor를 거릅니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
 
 tmux 확인:
 
