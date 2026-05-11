@@ -42,7 +42,13 @@ from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.utils.geometry import wrap_angle
 from src.smart.utils.rollout import transform_to_local
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
+from src.smart.modules.smart_flow_decoder_v2 import (
+    SMARTFlowDecoder as SMARTFlowDecoderV2,
+)
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
+from src.smart.tokens.flow_token_processor_v2 import (
+    FlowTokenProcessor as FlowTokenProcessorV2,
+)
 from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
 from src.utils.pylogger import RankedLogger
 from src.utils.vis_waymo import VisWaymo
@@ -96,9 +102,28 @@ class SMARTFlow(LightningModule):
         self.log_epoch = -1
         self.val_open_loop = model_config.val_open_loop
         self.val_closed_loop = model_config.val_closed_loop
-        self.token_processor = FlowTokenProcessor(**model_config.token_processor)
 
-        self.encoder = SMARTFlowDecoder(
+        # Backbone variant selector. "v1" preserves the OCSC_clean 85MB-ckpt
+        # path verbatim; "v2" swaps in the self-forcing-line backbone (87MB
+        # ckpt) modules. All V2 code lives in *_v2 files so V1 is unchanged.
+        self._backbone_variant = str(
+            getattr(model_config, "backbone_variant", "v1")
+        ).lower()
+        if self._backbone_variant not in {"v1", "v2"}:
+            raise ValueError(
+                f"Unsupported backbone_variant: {self._backbone_variant!r}. "
+                "Expected 'v1' or 'v2'."
+            )
+        if self._backbone_variant == "v2":
+            _flow_token_proc_cls = FlowTokenProcessorV2
+            _flow_decoder_cls = SMARTFlowDecoderV2
+        else:
+            _flow_token_proc_cls = FlowTokenProcessor
+            _flow_decoder_cls = SMARTFlowDecoder
+
+        self.token_processor = _flow_token_proc_cls(**model_config.token_processor)
+
+        self.encoder = _flow_decoder_cls(
             **model_config.decoder,
             n_token_agent=self.token_processor.n_token_agent,
         )
