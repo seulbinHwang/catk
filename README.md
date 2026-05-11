@@ -376,7 +376,7 @@ model.model_config.token_processor.use_prefix_valid_future_loss_mask=true   # pr
 ```
 
 - `false`이면 기존과 같습니다. 현재 anchor 뒤 `decoder.flow_window_steps` 전체 미래가 모두 유효한 agent-anchor만 학습합니다.
-- `true`이면 현재 anchor 뒤 가장 가까운 미래부터 시작해서, 처음 끊기기 전까지 연속으로 유효한 구간만 학습합니다. 이 구간에만 loss가 들어갑니다.
+- `true`이면 현재 anchor 뒤 가장 가까운 미래부터 시작해서, 처음 끊기기 전까지 연속으로 유효한 구간을 5-step(0.5초) chunk 단위로 내림해서 학습합니다. 1~4 step은 버리고, 5~9 step은 첫 0.5초만, 10~14 step은 첫 1.0초만, 15~19 step은 첫 1.5초만 loss가 들어갑니다.
 - full-valid sample은 `true`에서도 그대로 전체 미래 loss를 받습니다. 새로 추가되는 것은 partial-valid sample뿐입니다.
 - 이 옵션은 `FlowTokenProcessor`에서 학습 target을 만들 때 적용되므로 pretrain, 일반 fine tuning, DRaFT fine tuning, self-forced fine tuning에서 같은 방식으로 동작합니다.
 - README 기준 cache를 그대로 만들었다면 cache 재생성은 필요 없습니다. pkl cache 자체에서 partial-valid agent/anchor를 직접 삭제한 경우에만 cache를 다시 만들어야 합니다.
