@@ -169,6 +169,9 @@ OCSC_GT_RESOLUTION="${OCSC_GT_RESOLUTION:-2hz}"
 # 각 CL g 가 [M_ol OL + 1 GT] 중 argmin paired L2 target 선택.
 # ocsc_ol_nearest_match=true 와 함께 써야 함 (단독 활성 시 자동 비활성).
 OCSC_NEAREST_INCLUDE_GT="${OCSC_NEAREST_INCLUDE_GT:-false}"
+# Strict active_mask: future fine step 모두 valid 인 agent 만 OCSC 학습 (main training 과 일관성).
+# 부분 invalid agent 의 hallucination self-consistency 학습 방지.
+OCSC_STRICT_ACTIVE_MASK="${OCSC_STRICT_ACTIVE_MASK:-false}"
 
 # ── BPTT tricks ────────────────────────────────────────────────────────────
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
@@ -335,6 +338,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_gt_target="${OCSC_GT_TARGET}" \
   model.model_config.finetune.ocsc_gt_resolution="${OCSC_GT_RESOLUTION}" \
   model.model_config.finetune.ocsc_nearest_include_gt="${OCSC_NEAREST_INCLUDE_GT}" \
+  model.model_config.finetune.ocsc_strict_active_mask="${OCSC_STRICT_ACTIVE_MASK}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \

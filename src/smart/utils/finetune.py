@@ -83,6 +83,11 @@ class FinetuneConfig:
     ocsc_gt_target: bool = False
     ocsc_gt_resolution: str = "2hz"
     ocsc_nearest_include_gt: bool = False
+    #: True → OCSC active_mask 를 main training 과 동일하게 강화 (current_valid AND
+    #: future pred_max_steps_raw*shift fine step 모두 valid). 부분 invalid agent
+    #: (anchor 시점 valid 인데 future 일부 invalid) 는 OCSC anchor 에서 제외 →
+    #: model 이 학습 안 한 영역의 hallucination self-consistency 학습 방지.
+    ocsc_strict_active_mask: bool = False
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -153,6 +158,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_gt_target=bool(_read_config_value(finetune, "ocsc_gt_target", False)),
         ocsc_gt_resolution=str(_read_config_value(finetune, "ocsc_gt_resolution", "2hz")),
         ocsc_nearest_include_gt=bool(_read_config_value(finetune, "ocsc_nearest_include_gt", False)),
+        ocsc_strict_active_mask=bool(_read_config_value(finetune, "ocsc_strict_active_mask", False)),
     )
 
 

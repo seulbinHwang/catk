@@ -1337,6 +1337,8 @@ class SMARTFlow(LightningModule):
                 "use_gt_target 만 활성 (include_gt 무시)."
             )
             _nearest_include_gt = False
+        # strict active_mask: future fine step 모두 valid 인 agent 만 OCSC anchor 로 사용.
+        _strict_active_mask = bool(getattr(self.finetune_config, "ocsc_strict_active_mask", False))
         heading_w = float(getattr(self.finetune_config, "ocsc_heading_weight", 0.0))
         pos_w = float(getattr(self.finetune_config, "ocsc_position_weight", 1.0))
         rel_disp_w = float(getattr(self.finetune_config, "ocsc_rel_disp_weight", 0.0))
@@ -1591,6 +1593,24 @@ class SMARTFlow(LightningModule):
                         map_feature=map_feature,
                     )
                 active_mask = rollout_cache_anchor["valid_window"][:, -1]
+                if _strict_active_mask:
+                    # main training 과 일관성: future fine step 모두 valid 인 agent 만 사용.
+                    # 부분 invalid agent (anchor valid 인데 future 일부 invalid) 는 OCSC 학습에서 제외 →
+                    # model 이 학습 안 한 영역의 hallucination self-consistency 방지.
+                    _T_future_raw = pred_max_steps_raw * _shift
+                    _anchor_now_10hz_str = (anchor_idx + 1) * _shift
+                    _future_start_str = _anchor_now_10hz_str + 1
+                    _future_end_str = _future_start_str + _T_future_raw
+                    _raw_valid_full = data["agent"]["valid_mask"]
+                    _seq_len = _raw_valid_full.shape[1]
+                    if _future_end_str <= _seq_len and _T_future_raw > 0:
+                        _future_valid_str = _raw_valid_full[:, _future_start_str:_future_end_str].all(dim=1)
+                    else:
+                        # sequence 끝 부근: future 부족하면 모두 invalid 처리 (안전)
+                        _future_valid_str = torch.zeros(
+                            _raw_valid_full.shape[0], dtype=torch.bool, device=_raw_valid_full.device,
+                        )
+                    active_mask = active_mask & _future_valid_str
                 if not bool(active_mask.any()):
                     del rollout_cache_anchor
                     continue
