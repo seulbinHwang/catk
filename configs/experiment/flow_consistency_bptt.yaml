@@ -80,7 +80,7 @@ model:
       ocsc_gt_resolution: "2hz"
       # nearest_match candidate pool 에 raw 10Hz GT 1 개 포함 (ocsc_ol_nearest_match=true 와 함께)
       ocsc_nearest_include_gt: false
-      # ── BPTT tricks (rmm_bptt_ft 와 동일 설정) ───────────────────────
+      # ── BPTT tricks ─────────────────────────────────────────────────
       flow_velocity_head_only: true
       bptt_use_adjoint: false
       bptt_grad_clip_traj: 1.0
@@ -89,9 +89,6 @@ model:
       bptt_last_n_coarse_steps: 0
       bptt_last_n_solver_steps: 0
       bptt_last_coarse_only: false
-      # GT flow-matching 정규화 (optional): 0 이면 비활성
-      flow_reg_lambda: 0.0
-      rollout_noise_scale: 1.0
 
 ckpt_path: null
 

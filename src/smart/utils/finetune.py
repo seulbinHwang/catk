@@ -68,6 +68,7 @@ class FinetuneConfig:
     ocsc_n_rollouts: int = 2
     ocsc_n_ol_rollouts: int = -1
     ocsc_ol_nearest_match: bool = False
+    ocsc_anchor_stride: int = 1
     ocsc_loss_type: str = "l2"
     ocsc_use_mmd: bool = True
     ocsc_use_pretrained_ref: bool = False
@@ -137,6 +138,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_n_rollouts=int(_read_config_value(finetune, "ocsc_n_rollouts", 2)),
         ocsc_n_ol_rollouts=int(_read_config_value(finetune, "ocsc_n_ol_rollouts", -1)),
         ocsc_ol_nearest_match=bool(_read_config_value(finetune, "ocsc_ol_nearest_match", False)),
+        ocsc_anchor_stride=int(_read_config_value(finetune, "ocsc_anchor_stride", 1)),
         ocsc_loss_type=str(_read_config_value(finetune, "ocsc_loss_type", "l2")),
         ocsc_use_mmd=bool(_read_config_value(finetune, "ocsc_use_mmd", True)),
         ocsc_use_pretrained_ref=bool(_read_config_value(finetune, "ocsc_use_pretrained_ref", False)),

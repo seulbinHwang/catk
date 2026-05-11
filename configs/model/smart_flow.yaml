@@ -66,14 +66,7 @@ model_config:
     account_name: "h.sb@naverlabs.com"
   finetune:
     enabled: false
-    mode: adjoint_matching
-    # adjoint_matching·terminal_cost 등 ODE 이산화용 (rmm_bptt_ft closed-loop 길이와 무관)
-    rollout_steps: 16
-    bptt_max_coarse_steps: null
-    rollout_noise_scale: 1.0
-    feasible_weight: 1.0
-    smooth_deadzone_epsilon: [0.01, 0.01, 0.01]
-    smooth_deadzone_tau: 0.002
+    mode: ocsc_ft
     # FinetuneConfig 기본은 true(velocity_head만). 기존 실험은 전체 flow_decoder FT 유지.
     flow_velocity_head_only: false
     gradient_clip_val: 0.0
