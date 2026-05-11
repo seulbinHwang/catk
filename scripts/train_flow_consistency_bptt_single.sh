@@ -161,7 +161,7 @@ OCSC_EVAL_HARD_RMM="${OCSC_EVAL_HARD_RMM:-false}"
 OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-10}"
 # GT target: true → open-loop sample 대신 GT 궤적을 consistency target으로 사용.
 # CL 예측을 2Hz로 다운샘플 후 GT와 비교 (ocsc_use_mmd에 따라 MMD 또는 masked L2).
-OCSC_GT_TARGET="${OCSC_GT_TARGET:-true}"
+OCSC_GT_TARGET="${OCSC_GT_TARGET:-false}"
 # GT target resolution: "2hz" (기존 동작, tokenized_agent["gt_pos"] 의 2Hz slice + CL 도 2Hz 다운샘플)
 # 또는 "10hz" (raw data["agent"]["position"] 의 fine 10Hz + CL/OL native fine 그대로).
 OCSC_GT_RESOLUTION="${OCSC_GT_RESOLUTION:-2hz}"
@@ -171,7 +171,7 @@ OCSC_GT_RESOLUTION="${OCSC_GT_RESOLUTION:-2hz}"
 OCSC_NEAREST_INCLUDE_GT="${OCSC_NEAREST_INCLUDE_GT:-false}"
 # Strict active_mask: future fine step 모두 valid 인 agent 만 OCSC 학습 (main training 과 일관성).
 # 부분 invalid agent 의 hallucination self-consistency 학습 방지.
-OCSC_STRICT_ACTIVE_MASK="${OCSC_STRICT_ACTIVE_MASK:-false}"
+OCSC_STRICT_ACTIVE_MASK="${OCSC_STRICT_ACTIVE_MASK:-true}"
 
 # ── BPTT tricks ────────────────────────────────────────────────────────────
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"

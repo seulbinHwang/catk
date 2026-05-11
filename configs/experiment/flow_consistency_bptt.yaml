@@ -82,7 +82,7 @@ model:
       ocsc_nearest_include_gt: false
       # Strict active_mask: future fine step 모두 valid 인 agent 만 OCSC anchor 사용
       # (main training 과 일관). 부분 invalid agent 의 hallucination self-consistency 방지.
-      ocsc_strict_active_mask: false
+      ocsc_strict_active_mask: true
       # ── BPTT tricks ─────────────────────────────────────────────────
       flow_velocity_head_only: true
       bptt_use_adjoint: false

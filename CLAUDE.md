@@ -91,10 +91,13 @@ scripts/train_flow_consistency_bptt_single.sh   # OCSC single-GPU 런처
 
 | key | default | 의미 |
 |---|---|---|
-| `OCSC_GT_TARGET` | true | GT 궤적 vs (false) OL sample |
+| `OCSC_GT_TARGET` | **false** | true=GT 궤적 / false=OL sample (default 5/11: OL setting) |
+| `OCSC_GT_RESOLUTION` | 2hz | GT target 의 시간 해상도 ("2hz" 또는 "10hz" raw fine) |
 | `OCSC_N_ROLLOUTS` (G) | 4 | 시나리오당 closed-loop rollout 수 |
 | `OCSC_N_OL_ROLLOUTS` (M) | -1 (=G) | OL sample 수.  M>G 면 nearest match |
 | `OCSC_OL_NEAREST_MATCH` | false | true=각 CL g 가 M 개 OL 중 argmin 으로 paired L2 |
+| `OCSC_NEAREST_INCLUDE_GT` | false | nearest_match pool 에 raw 10Hz GT 1 개 추가 |
+| `OCSC_STRICT_ACTIVE_MASK` | **true** | future fine step 모두 valid 인 agent 만 OCSC 학습 (main training 과 일관) |
 | `OCSC_ANCHOR_STRIDE` | 1 | 매 N번째 2Hz step 만 anchor |
 | `OCSC_PRED_MAX_STEPS` | 2 | CL coarse step (×0.5s) |
 | `OCSC_USE_MMD` | false | true=split MMD² (pos/heading 따로 sigma) |
