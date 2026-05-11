@@ -929,25 +929,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             map_feature=map_feature,
         )
 
-    def prepare_training_rollout_cache(
-        self,
-        tokenized_agent: Dict[str, torch.Tensor],
-        map_feature: Dict[str, torch.Tensor],
-    ) -> Dict[str, object]:
-        """self-forced 학습에서 gradient를 유지한 rollout cache를 만듭니다.
-
-        Args:
-            tokenized_agent: 평가 모드 기준 토큰 사전입니다. agent 축 shape은 ``[n_agent, ...]`` 입니다.
-            map_feature: 현재 Generator의 지도 인코더 출력입니다.
-
-        Returns:
-            Dict[str, object]: N초 self-rollout에 쓸 초기 cache입니다.
-        """
-        return self._prepare_rollout_cache_impl(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-        )
-
     def _clone_rollout_cache(self, rollout_cache: Dict[str, object]) -> Dict[str, object]:
         """rollout마다 달라지는 상태만 안전하게 복사합니다.
 
@@ -1760,52 +1741,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
-        )
-
-    def training_rollout_from_cache(
-        self,
-        rollout_cache: Dict[str, object],
-        tokenized_agent: Dict[str, torch.Tensor],
-        map_feature: Dict[str, torch.Tensor],
-        sampling_scheme: DictConfig,
-        sampling_seed: int | None = None,
-        scenario_sampling_seeds: torch.Tensor | None = None,
-        rollout_steps_2hz: int | None = None,
-        self_forced_epoch: int | None = None,
-        detach_block_transition: bool = False,
-        use_stop_motion: bool | None = None,
-    ) -> Dict[str, torch.Tensor]:
-        """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
-
-        Args:
-            rollout_cache: ``prepare_training_rollout_cache`` 가 만든 초기 상태입니다.
-            tokenized_agent: 평가 모드 기준 토큰 사전입니다.
-            map_feature: 현재 Generator의 지도 인코더 출력입니다.
-            sampling_scheme: flow sampling 설정입니다.
-            sampling_seed: batch 공통 seed입니다.
-            scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
-            rollout_steps_2hz: 실행할 0.5초 block 수입니다. 기본 self-forced 학습은
-                ``flow_window_steps / 5`` 를 넘깁니다.
-            self_forced_epoch: 현재 self-forced epoch입니다. ``None`` 이면 training
-                random terminal denoising step을 끕니다.
-            use_stop_motion: ``None``이면 decoder 기본 inference 설정을 사용합니다.
-                self-forced 학습에서는 별도 config 값을 넘겨 inference 설정과 분리합니다.
-
-        Returns:
-            Dict[str, torch.Tensor]: N초 committed self-rollout 결과입니다.
-        """
-        return self._rollout_from_cache_impl(
-            rollout_cache=rollout_cache,
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            sampling_scheme=sampling_scheme,
-            sampling_seed=sampling_seed,
-            scenario_sampling_seeds=scenario_sampling_seeds,
-            return_flow_2s_preview=False,
-            rollout_steps_2hz=rollout_steps_2hz,
-            self_forced_epoch=self_forced_epoch,
-            detach_block_transition=detach_block_transition,
-            use_stop_motion=use_stop_motion,
         )
 
     def path_flow_velocity_for_anchor0(

@@ -163,25 +163,6 @@ class SMARTFlowDecoder(nn.Module):
             map_feature=map_feature,
         )
 
-    def prepare_training_rollout_cache(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-    ) -> Dict[str, object]:
-        """self-forced 학습에서 gradient를 유지한 rollout cache를 만듭니다.
-
-        Args:
-            tokenized_agent: 평가 모드 기준 agent token 사전입니다.
-            map_feature: 현재 decoder가 만든 map feature입니다.
-
-        Returns:
-            Dict[str, object]: N초 self-rollout에 사용할 초기 cache입니다.
-        """
-        return self.agent_encoder.prepare_training_rollout_cache(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-        )
-
     def rollout_from_cache(
         self,
         rollout_cache: Dict[str, object],
@@ -202,47 +183,6 @@ class SMARTFlowDecoder(nn.Module):
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
-        )
-
-    def training_rollout_from_cache(
-        self,
-        rollout_cache: Dict[str, object],
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        sampling_scheme: DictConfig,
-        sampling_seed: int | None = None,
-        scenario_sampling_seeds: Tensor | None = None,
-        rollout_steps_2hz: int | None = None,
-        self_forced_epoch: int | None = None,
-        detach_block_transition: bool = False,
-        use_stop_motion: bool | None = None,
-    ) -> Dict[str, Tensor]:
-        """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
-
-        Args:
-            rollout_cache: ``prepare_training_rollout_cache`` 가 만든 초기 상태입니다.
-            tokenized_agent: 평가 모드 기준 agent token 사전입니다.
-            map_feature: 현재 decoder가 만든 map feature입니다.
-            sampling_scheme: flow sampling 설정입니다.
-            sampling_seed: batch 공통 seed입니다.
-            scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
-            rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 평가 길이를 실행합니다.
-            use_stop_motion: self-forced 학습 rollout 전용 stop-motion 사용 여부입니다.
-
-        Returns:
-            Dict[str, Tensor]: committed self-rollout 결과입니다.
-        """
-        return self.agent_encoder.training_rollout_from_cache(
-            rollout_cache=rollout_cache,
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            sampling_scheme=sampling_scheme,
-            sampling_seed=sampling_seed,
-            scenario_sampling_seeds=scenario_sampling_seeds,
-            rollout_steps_2hz=rollout_steps_2hz,
-            self_forced_epoch=self_forced_epoch,
-            detach_block_transition=detach_block_transition,
-            use_stop_motion=use_stop_motion,
         )
 
     def path_flow_velocity_for_anchor0(
