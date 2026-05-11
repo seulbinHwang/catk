@@ -77,6 +77,7 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("CUDA_VISIBLE_DEVICES", args.cuda_visible_devices),
         export_line("NPROC_PER_NODE", args.nproc_per_node),
         export_line("CATK_LR", args.learning_rate),
+        export_line("FLOW_WINDOW_STEPS", args.flow_window_steps),
         export_line("SCORER_SCENE_NUM", args.scorer_scene_num),
         export_line("DISTRIBUTION_MATCHING_OBJECTIVE", args.distribution_matching_objective),
         export_line("DETACH_BLOCK_TRANSITION", args.detach_block_transition),
@@ -131,7 +132,7 @@ set +a
 echo "[self-forced-h100x4-wo-pvc-800] pod=$(hostname) task=${{TASK_NAME}}"
 echo "[self-forced-h100x4-wo-pvc-800] started at $(date '+%F %T')"
 echo "[self-forced-h100x4-wo-pvc-800] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}}"
-echo "[self-forced-h100x4-wo-pvc-800] lr=${{CATK_LR}} scorer_scene_num=${{SCORER_SCENE_NUM}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
+echo "[self-forced-h100x4-wo-pvc-800] lr=${{CATK_LR}} flow_window_steps=${{FLOW_WINDOW_STEPS}} scorer_scene_num=${{SCORER_SCENE_NUM}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
 echo "[self-forced-h100x4-wo-pvc-800] objective=${{DISTRIBUTION_MATCHING_OBJECTIVE}} backprop_last_k=${{BACKPROP_LAST_K}} detach_block_transition=${{DETACH_BLOCK_TRANSITION}} anchor_fm=${{USE_ANCHOR_FLOW_MATCHING_LOSS}} anchor_weight=${{ANCHOR_WEIGHT}}"
 echo "[self-forced-h100x4-wo-pvc-800] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
 echo "[self-forced-h100x4-wo-pvc-800] pretrain_ckpt=${{PRETRAIN_CKPT}}"
@@ -377,6 +378,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", default="4")
     parser.add_argument("--check-val-every-n-epoch", default="2")
     parser.add_argument("--learning-rate", default="5.0e-6")
+    parser.add_argument("--flow-window-steps", default="20")
     parser.add_argument("--scorer-scene-num", default="640")
     parser.add_argument("--distribution-matching-objective", default="dmd", choices=("dmd", "sid"))
     parser.add_argument("--detach-block-transition", default="false")

@@ -19,6 +19,7 @@
 #   * self_forced.use_anchor_flow_matching_loss=true
 #   * self_forced.anchor_weight=0.02 by default; use the sweep launcher to try several weights.
 #   * self_forced.use_stop_motion=false for the training self-rollout
+#   * decoder.flow_window_steps=20 to match the pretrained checkpoint.
 #   * scorer_scene_num=640 for fit-time closed-loop RMM
 #   * data.train_batch_size=22
 # ============================================================================
@@ -38,6 +39,8 @@ model:
   model_config:
     lr: 5.0e-6
     scorer_scene_num: 640
+    decoder:
+      flow_window_steps: 20
     self_forced:
       distribution_matching_objective: dmd
       detach_block_transition: false

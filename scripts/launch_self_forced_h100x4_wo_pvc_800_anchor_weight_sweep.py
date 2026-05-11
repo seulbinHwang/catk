@@ -106,6 +106,7 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("CUDA_VISIBLE_DEVICES", args.cuda_visible_devices),
         export_line("NPROC_PER_NODE", args.nproc_per_node),
         export_line("CATK_LR", args.learning_rate),
+        export_line("FLOW_WINDOW_STEPS", args.flow_window_steps),
         export_line("SCORER_SCENE_NUM", args.scorer_scene_num),
         export_line("DISTRIBUTION_MATCHING_OBJECTIVE", args.distribution_matching_objective),
         export_line("DETACH_BLOCK_TRANSITION", args.detach_block_transition),
@@ -160,7 +161,7 @@ fi
 
 echo "[anchor-sweep] pod=$(hostname) sweep_id=${{SWEEP_ID}}"
 echo "[anchor-sweep] weights=${{ANCHOR_WEIGHTS}}"
-echo "[anchor-sweep] lr=${{CATK_LR}} max_epochs=${{MAX_EPOCHS}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}}"
+echo "[anchor-sweep] lr=${{CATK_LR}} flow_window_steps=${{FLOW_WINDOW_STEPS}} max_epochs=${{MAX_EPOCHS}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}}"
 echo "[anchor-sweep] objective=${{DISTRIBUTION_MATCHING_OBJECTIVE}} backprop_last_k=${{BACKPROP_LAST_K}} detach_block_transition=${{DETACH_BLOCK_TRANSITION}}"
 echo "[anchor-sweep] scorer_scene_num=${{SCORER_SCENE_NUM}} pretrain_ckpt=${{PRETRAIN_CKPT}}"
 echo
@@ -440,6 +441,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", default="4")
     parser.add_argument("--check-val-every-n-epoch", default="2")
     parser.add_argument("--learning-rate", default="5.0e-6")
+    parser.add_argument("--flow-window-steps", default="20")
     parser.add_argument("--scorer-scene-num", default="640")
     parser.add_argument("--distribution-matching-objective", default="dmd", choices=("dmd", "sid"))
     parser.add_argument("--detach-block-transition", default="false")

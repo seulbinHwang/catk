@@ -1462,6 +1462,7 @@ scripts/launch_self_forced_h100x4_wo_pvc_800.py
 - H100용 `trainer.precision=bf16-mixed`
 - `trainer.max_epochs=4`, `trainer.check_val_every_n_epoch=2`
 - `model.model_config.lr=5.0e-6`
+- `model.model_config.decoder.flow_window_steps=20`
 - `model.model_config.scorer_scene_num=640`
 - `model.model_config.self_forced.distribution_matching_objective=dmd`
 - `model.model_config.self_forced.detach_block_transition=false`

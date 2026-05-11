@@ -28,6 +28,7 @@
 #   NPROC_PER_NODE=4
 #   EXPERIMENT=self_forced_npfm_h100_4
 #   CATK_LR=                     Optional Generator learning-rate override.
+#   FLOW_WINDOW_STEPS=           Optional decoder horizon override.
 #   SCORER_SCENE_NUM=            Optional fit-time closed-loop scorer scene target.
 #   DISTRIBUTION_MATCHING_OBJECTIVE=
 #                                  Optional self-forced objective override: dmd or sid.
@@ -99,6 +100,9 @@ if [[ -n "${CHECK_VAL_EVERY_N_EPOCH:-}" ]]; then
 fi
 if [[ -n "${CATK_LR:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.lr=${CATK_LR}")
+fi
+if [[ -n "${FLOW_WINDOW_STEPS:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.decoder.flow_window_steps=${FLOW_WINDOW_STEPS}")
 fi
 if [[ -n "${SCORER_SCENE_NUM:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.scorer_scene_num=${SCORER_SCENE_NUM}")
