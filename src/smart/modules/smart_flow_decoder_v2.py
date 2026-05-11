@@ -171,8 +171,6 @@ class SMARTFlowDecoder(nn.Module):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
-        return_flow_2s_preview: bool = False,
-        rollout_steps_2hz: int | None = None,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
@@ -181,38 +179,7 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
-            return_flow_2s_preview=return_flow_2s_preview,
-            rollout_steps_2hz=rollout_steps_2hz,
         )
-
-    def path_flow_velocity_for_anchor0(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        path_noisy_norm: Tensor,
-        tau: Tensor,
-        anchor_mask: Tensor,
-    ) -> Dict[str, Tensor]:
-        """첫 flow anchor의 noisy N초 path에 대한 velocity와 clean estimate를 계산합니다.
-
-        Args:
-            tokenized_agent: 평가 모드 기준 agent token 사전입니다.
-            map_feature: 이 decoder가 직접 만든 map feature입니다.
-            path_noisy_norm: noisy path입니다. shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
-            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
-
-        Returns:
-            Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
-        """
-        return self.agent_encoder.path_flow_velocity_for_anchor0(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            path_noisy_norm=path_noisy_norm,
-            tau=tau,
-            anchor_mask=anchor_mask,
-        )
-
 
     def sample_open_loop_future(
         self,

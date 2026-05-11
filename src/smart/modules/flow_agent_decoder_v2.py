@@ -1714,8 +1714,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
-        return_flow_2s_preview: bool = False,
-        rollout_steps_2hz: int | None = None,
     ) -> Dict[str, torch.Tensor]:
         """평가와 제출에서 no-gradient closed-loop rollout을 실행합니다.
 
@@ -1726,8 +1724,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme: flow sampling 설정입니다.
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
-            return_flow_2s_preview: preview 저장 여부입니다.
-            rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 8초를 실행합니다.
 
         Returns:
             Dict[str, torch.Tensor]: closed-loop rollout 결과입니다.
@@ -1739,65 +1735,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
-            return_flow_2s_preview=return_flow_2s_preview,
-            rollout_steps_2hz=rollout_steps_2hz,
         )
-
-    def path_flow_velocity_for_anchor0(
-        self,
-        tokenized_agent: Dict[str, torch.Tensor],
-        map_feature: Dict[str, torch.Tensor],
-        path_noisy_norm: torch.Tensor,
-        tau: torch.Tensor,
-        anchor_mask: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """첫 flow anchor의 noisy path에 대한 flow velocity를 예측합니다.
-
-        Args:
-            tokenized_agent: 평가 모드 기준 토큰 사전입니다.
-            map_feature: 이 decoder가 직접 만든 지도 특징입니다.
-            path_noisy_norm: noisy N초 path입니다. shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
-            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent 마스크입니다. shape은 ``[n_agent]`` 입니다.
-
-        Returns:
-            Dict[str, torch.Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다. 두 텐서 shape은
-            ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
-        """
-        if path_noisy_norm.numel() == 0:
-            empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, 4))
-            return {"velocity": empty, "clean": empty}
-        if path_noisy_norm.shape[1:] != (self.flow_window_steps, 4):
-            raise ValueError(
-                "path_noisy_norm must have shape [n_valid_agent, flow_window_steps, 4], "
-                f"got {tuple(path_noisy_norm.shape)}."
-            )
-        if int(anchor_mask.sum().item()) != int(path_noisy_norm.shape[0]):
-            raise ValueError(
-                "anchor_mask true count must match path_noisy_norm first dim, "
-                f"got {int(anchor_mask.sum().item())} and {path_noisy_norm.shape[0]}."
-            )
-
-        single_anchor_mask = torch.zeros(
-            anchor_mask.shape[0],
-            13,
-            device=anchor_mask.device,
-            dtype=torch.bool,
-        )
-        single_anchor_mask[:, 0] = anchor_mask.bool()
-        ctx_hidden_pack = self._encode_context(
-            agent_token_index=tokenized_agent["ctx_sampled_idx"],
-            pos_a=tokenized_agent["ctx_sampled_pos"],
-            head_a=tokenized_agent["ctx_sampled_heading"],
-            mask=tokenized_agent["ctx_valid"],
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-        )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
-        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
-        velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
-        clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
-        return {"velocity": velocity, "clean": clean}
 
     @torch.no_grad()
     def inference(
