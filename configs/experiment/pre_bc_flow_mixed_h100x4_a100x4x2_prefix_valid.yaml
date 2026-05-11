@@ -23,7 +23,7 @@ model:
     decoder:
       flow_window_steps: 30
     token_processor:
-      use_prefix_valid_future_loss_mask: true
+      use_prefix_valid_future_loss_mask: false
 
 trainer:
   devices: 4
