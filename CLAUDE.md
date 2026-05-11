@@ -1,148 +1,160 @@
 # Repo notes
 
-CATK / SMART-Flow 기반 motion forecasting 코드베이스. **현재 브랜치
-`OCSC_clean` 는 `origin/fix-hard-rmm` 의 src/configs/scripts 트리를
-verbatim 복사**한 상태이며, OCSC (Open-Closed Self-Consistency)
-fine-tuning 을 fix-hard-rmm reference 그대로 검증/실험하는 라인입니다.
+CATK / SMART-Flow 기반 motion forecasting 코드베이스.  **현재 브랜치
+`OCSC_clean`** 은 `origin/fix-hard-rmm` 의 src/configs/scripts 를 verbatim 복사한
+뒤 두 개의 patch 가 추가된 상태:
+
+1. **`d945af2` (5/8)**: OCSC nearest-match (M>G OL samples + per-anchor argmin paired L2)
+2. **`642d91d` (5/10)**: `bptt_last_coarse_only` field 를 `FinetuneConfig` schema 에 추가
+   — 이전엔 schema 누락으로 launcher 의 `BPTT_LAST_COARSE_ONLY=true` 가 silently False
+   였음 (fix-hard-rmm 도 동일 버그).  fix 후 토글이 진짜 동작 → 마지막 1 coarse step
+   만 grad 흘림.  ⚠ LR 민감 (lr=5e-6 + last_coarse_only=true 가 RMM 폭락 사례 있음).
 
 ## 작업 규칙 (반드시 준수)
 
-1. **코드 변경 = commit + push 페어**.  변경 전 상태 commit 하고, 변경 후
-   commit 해서 push 한 뒤 다음 단계로 넘어갈 것.  중간 상태로 멈추지 말 것.
-2. **GPU 할당**: GPU `0`, `1` 은 사용자 할당이 아니므로 절대 사용 금지.  학습 /
-   추론 / parity check 모두 `CUDA_VISIBLE_DEVICES=2` 또는 `3` 에서만 진행할 것
-   (멀티 GPU 가 필요하면 `2,3`).  런처 스크립트 default 는 이 정책을 따라야 함.
-3. **시간 표기는 KST (Asia/Seoul)**.  로그 파일명, commit 메시지, 사용자 보고
-   문, 스케줄링 모두 KST 기준.
-4. **사용자 응답은 한국어**로 설명할 것.  코드 symbol / 변수명 / log message /
-   commit 메시지는 영어, docstring 은 한국어 (기존 코드베이스 컨벤션 유지).
+1. **코드 변경 = commit + push 페어**.  변경 전 상태 commit, 변경 후 commit + push.
+   중간 상태로 멈추지 말 것.
+2. **GPU 할당** (5/10 갱신): GPU 2/3 우선.  GPU 0/1 은 사용자가 명시 허용한 경우만
+   사용; 동료 사용 통보 받으면 즉시 종료.
+3. **시간 표기는 KST (Asia/Seoul)**.  로그 파일명, commit 메시지, 보고문, 스케줄링 모두 KST.
+4. **사용자 응답은 한국어**.  코드 symbol / 변수명 / log message / commit 메시지는 영어.
+   docstring 은 한국어 (기존 컨벤션).
 
 ## Branches
 
 - `main` — baseline.
-- `origin/fix-hard-rmm` — OCSC reference (검증된 production 라인).
-- **`OCSC_clean` — 현재 브랜치**.  `self_forcing_w_track_loss` 에서 분기했지만
-  src/configs/scripts 가 fix-hard-rmm 와 byte-identical 하게 동기화됐고
-  self-forcing 잔재는 모두 제거됨.  ckpt 호환성도 fix-hard-rmm 와 매칭.
-- `OL_consistency_training` (별도 라인) — 이전 additive 통합 시도.  RMM
-  regression 이 명확해서 사용자가 "fix-hard-rmm 복붙 재구현" 을 지시,
-  현재는 사용 안 함.  reset 하지 말 것 (이전 commit history 보존).
+- `origin/fix-hard-rmm` — OCSC reference (검증된 production 라인).  85MB ckpt 호환.
+- **`OCSC_clean` — 현재 브랜치**.  fix-hard-rmm + 위 두 patch.  85MB ckpt 호환.
+- `OCSC_clean_v2` (sister) — `8b2f9b7d` (self-forcing 라인) 위에 OCSC 알고리즘 surgical
+  이식.  87MB ckpt 호환 (`/project_3/logs/pretrained/`).  추가 patch (verbose tracing,
+  GT padding fix, `ocsc_loss_global_frame` toggle).  실험 결과 RMM 회귀 — 87MB 모델 +
+  OCSC 가 잘 안 맞는 듯.  코드 구현이 잘못 되었을 수 있음.
+- `OL_consistency_training` — 폐기 보존, reset 금지.
 
 ## 호환 ckpt
 
 ```
-/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt   # 85MB, fix-hard-rmm 호환 (launcher default)
+/home2/pnc2/repos_python/project/logs/pretrained/epoch_last.ckpt   # 85MB, fix-hard-rmm/OCSC_clean 호환 (launcher default)
+/home2/pnc2/repos_python/project_3/logs/pretrained/epoch_last.ckpt # 87MB, OCSC_clean_v2 전용 (다른 모델 arch)
 ```
 
-`logs/pretrained/epoch_last.ckpt` (87MB, project_3 안) 은 OL_consistency_training
-시점에 학습된 다른 모델로, fix-hard-rmm 의 agent_encoder shape 와 호환 안 됨
-(token_emb / freqs.weight 차원 차이).  OCSC_clean 학습 / 평가에는 반드시
-`/project/logs/pretrained/epoch_last.ckpt` 를 사용 (launcher default).
+OCSC_clean 은 반드시 85MB (default).  OCSC_clean_v2 는 87MB 로 override.
 
-## Key modules
+## 좌표계 / L2 semantics (사용자 자주 묻는 부분)
+
+CL / GT / OL **세 trajectory 모두 같은 anchor-local normalized frame** 에서 L2:
+
+- **CL**: rollout → world XY (commit_bridge 통해) → `_cl_to_norm` → anchor-local normalized
+- **GT**: `tokenized_agent["gt_pos"]` 는 **raw continuous** (token vocab snap 없음),
+  단 시간 spacing 만 2Hz (= every shift=5 of 10Hz).  → `_cl_to_norm` → anchor-local normalized
+- **OL**: `flow_decoder.generate(x_init, _model_fn=lambda x_t,tau: flow_decoder(anchor_hidden, ...))`
+  의 출력 자체가 anchor-frame normalized [x/20, y/20, cos, sin] (native).  변환 불필요.
+
+`_cl_to_norm = _world_traj_to_flow_norm` = `transform_to_local(world_xy, world_head, current_pos, current_head)` + `pos/20` + `cos/sin(head_local)`.  per-agent rotation, 모든 timestep 이 같은 anchor reference.
+
+**Time alignment**:
+- CL `pred_traj_10hz[..., 4::5][:T_target]` = 2Hz at +0.5s, +1.0s (with pred_max_steps=2)
+- GT `gt_pos[..., anchor+1:anchor+3]` = 2Hz at +0.5s, +1.0s
+- 직접 매칭 (downsample 필요한 건 model 의 의사결정이 2Hz coarse step 이라서)
+
+## 핵심 모듈
 
 ```
 src/smart/model/smart_flow.py
-   - _is_ocsc_ft_enabled, _run_flow_ocsc_ft_step (1786~)
-     · OCSC training step 본체
-     · anchor sequential 루프 + per-anchor 즉시 backward (peak mem O(1 graph))
+   - _is_ocsc_ft_enabled, _run_flow_ocsc_ft_step (1815~)
+     · anchor sequential 루프 + per-anchor 즉시 backward
      · MMD² (use_mmd=true) / paired L2 (use_mmd=false) 분기
      · GT vs OL target 분기 (ocsc_gt_target)
-     · BPTT 토글: bptt_use_adjoint, bptt_last_coarse_only, bptt_warm_coarse_steps,
-       bptt_last_n_solver_steps, bptt_last_n_coarse_steps, bptt_grad_clip_traj
-   - GT FM regularization 은 anchor 루프 이후 batch-level 1회
-     (_compute_rmm_bptt_gt_fm_loss)
+     · M_ol > G + nearest_match: argmin paired L2 target
+     · _cl_to_norm closure: anchor-frame normalize
+   - _world_traj_to_flow_norm (1266): transform_to_local + /20 + cos/sin
+   - GT FM regularization 은 anchor 루프 후 batch-level 1회 (_compute_rmm_bptt_gt_fm_loss)
 src/smart/modules/flow_local_decoder.py
-   - FlowODE (use_adjoint_for_bptt, last_n_grad_solver_steps 토글),
-     ResidualFlowVelocityHead, HierarchicalFlowDecoder.forward_components
+   - FlowODE (use_adjoint_for_bptt, last_n_grad_solver_steps),
+     ContinuousCommitBridge.commit (normalized → world XY)
 src/smart/modules/flow_agent_decoder.py
-   - SMARTFlowAgentDecoder: rollout_from_cache, training_rollout_from_cache,
-     prepare_inference_cache, _build_rollout_noise_tape, sliding-window history
-src/smart/modules/smart_flow_decoder.py
-   - SMARTFlowDecoder wrapper
-src/smart/metrics/mmd_consistency_loss.py
-   - mmd_from_stacked, mmd_per_rollout_proxy, mmd_precompute_sigma_sq
-   - per-channel-group split: pos (ch[0:2]) 와 heading (ch[2:4]) 각각
-     별도 sigma + RBF, pos_weight/heading_weight 로 가중합
-src/smart/metrics/wosac_metametric_pytorch.py
-   - PyTorch hard RMM 본 계산기 (validation_metric=hard 일 때)
-src/smart/metrics/wosac_metric_features_torch/
-   - PyTorch feature 계산 (interaction / map / traffic light / trajectory)
+   - SMARTFlowAgentDecoder: rollout_from_cache, _sample_open_loop_future_from_hidden,
+     _build_rollout_noise_tape
+src/smart/utils/finetune.py
+   - FinetuneConfig dataclass + parse_finetune_config
+   - 5/10 추가 field: bptt_last_coarse_only, ocsc_ol_nearest_match (둘 다 OCSC_clean 만)
+src/smart/utils/rollout.py
+   - transform_to_local (per-agent SE(2) inverse + rotation)
+src/smart/tokens/token_processor.py / flow_token_processor.py
+   - tokenize_agent: tokenized_agent["gt_pos"] = pos[:, ::shift] (raw continuous, 2Hz)
+src/smart/metrics/mmd_consistency_loss.py / wosac_metametric_pytorch.py / wosac_metric_features_torch/
 configs/experiment/flow_consistency_bptt.yaml   # OCSC 실험 config
 scripts/train_flow_consistency_bptt_single.sh   # OCSC single-GPU 런처
-scripts/launch_ocsc_clean_current.sh            # 현재 도는 GT-target 셋팅 핀
-```
-
-## Run
-
-```bash
-# OCSC fine-tuning (single GPU, fix-hard-rmm production defaults)
-sh scripts/train_flow_consistency_bptt_single.sh
-
-# 자주 쓰는 toggle (env override):
-CUDA_VISIBLE_DEVICES=2 OCSC_GT_TARGET=false sh scripts/train_flow_consistency_bptt_single.sh
-OCSC_USE_MMD=true sh ...                  # MMD² (rel_disp/pos/heading_weight 무시)
-OCSC_USE_MMD=false OCSC_POSITION_WEIGHT=1.0 sh ...   # paired L2 with channel weights
-BPTT_LAST_COARSE_ONLY=false sh ...        # 모든 coarse step grad
-BPTT_SEQUENTIAL_ROLLOUTS=true sh ...      # G rollout 순차 backward (메모리 ↓)
-VAL_CHECK_INTERVAL=200 sh ...
-TRAIN_B=8 VAL_B=8 sh ...                  # OOM 회피
-MY_TASK_NAME=ocsc-... sh ...              # wandb run name
-WANDB_PROJECT=My-Run sh ...
-
-# Hard-RMM parity check (vs 공식 TF)
-WOSAC_PARITY_TFRECORD_DIR=<dir> python scripts/verify_wosac_metametric_pytorch_parity.py --n 50
 ```
 
 ## OCSC 핵심 토글 (launcher default)
 
 | key | default | 의미 |
 |---|---|---|
-| `OCSC_GT_TARGET` | true | GT 궤적 vs (false) ref decoder 의 OL sample |
-| `OCSC_N_ROLLOUTS` (G) | 4 | scenario 당 closed-loop rollout 수 |
+| `OCSC_GT_TARGET` | true | GT 궤적 vs (false) OL sample |
+| `OCSC_N_ROLLOUTS` (G) | 4 | 시나리오당 closed-loop rollout 수 |
+| `OCSC_N_OL_ROLLOUTS` (M) | -1 (=G) | OL sample 수.  M>G 면 nearest match |
+| `OCSC_OL_NEAREST_MATCH` | false | true=각 CL g 가 M 개 OL 중 argmin 으로 paired L2 |
 | `OCSC_ANCHOR_STRIDE` | 1 | 매 N번째 2Hz step 만 anchor |
-| `OCSC_PRED_MAX_STEPS` | 2 | closed-loop coarse step (×0.5s) |
-| `OCSC_USE_MMD` | false | true=split MMD² (pos/heading group 별 sigma), false=paired L2 |
+| `OCSC_PRED_MAX_STEPS` | 2 | CL coarse step (×0.5s) |
+| `OCSC_USE_MMD` | false | true=split MMD² (pos/heading 따로 sigma) |
 | `OCSC_USE_PRETRAINED_REF` | true | frozen ref decoder 로 OL 생성 |
-| `OCSC_POSITION_WEIGHT` | 0.0 | pos channel ([x/20,y/20]) — paired L2 / split-MMD 모두 active |
-| `OCSC_REL_DISP_WEIGHT` | 1.0 | paired L2 분기 전용 (MMD 분기에선 무시) |
-| `OCSC_HEADING_WEIGHT` | 0.0 | heading channel ([cos_h,sin_h]) — paired L2 / split-MMD 모두 active |
-| `OCSC_FM_REG_LAMBDA` | 0.1 | GT FM regularization (batch-level 1회) |
-| `BPTT_USE_ADJOINT` | true | flow_ode model_fn ckpt |
-| `BPTT_LAST_COARSE_ONLY` | true | 마지막 1 coarse step 만 grad (warm = pred_steps - 1) |
-| `BPTT_SEQUENTIAL_ROLLOUTS` | false | true 면 G rollout 순차 backward + 2-pass MMD |
-| `FLOW_VELOCITY_HEAD_ONLY` | true | velocity_head 만 학습 (residual_velocity_head zero+frozen) |
+| `OCSC_POSITION_WEIGHT` | 1.0 | pos channel L2 가중치 |
+| `OCSC_HEADING_WEIGHT` | 0.1 | heading channel L2 가중치 |
+| `OCSC_REL_DISP_WEIGHT` | 0.0 | rel_disp (delta-pos) L2; paired L2 분기 전용 |
+| `OCSC_FM_REG_LAMBDA` | 0.1 | GT FM regularization |
+| `BPTT_USE_ADJOINT` | true | flow_ode model_fn checkpoint |
+| `BPTT_LAST_COARSE_ONLY` | false | 마지막 1 coarse step 만 grad — ⚠ schema fix 후 진짜 동작 |
+| `FLOW_VELOCITY_HEAD_ONLY` | true | velocity_head 만 학습 |
 
-**중요 (split MMD)**: `OCSC_USE_MMD=true` 분기는 이제 channel group 별
-(pos = `[x/20, y/20]`, heading = `[cos_h, sin_h]`) MMD² 를 따로 계산해
-`OCSC_POSITION_WEIGHT`, `OCSC_HEADING_WEIGHT` 로 가중합한다.  group 별로
-median-heuristic sigma 가 따로 잡혀서 position scale 이 heading channel 을
-saturate 시키는 문제가 사라짐.  단 두 weight 가 모두 0 이면 loss=0 (no-op)
-이므로 launcher 에서 적어도 하나는 명시적으로 양수로 set 해야 한다.
-`OCSC_REL_DISP_WEIGHT` 는 여전히 paired L2 분기 전용 (MMD 에선 무시).
+## 5/10 검증된 best 셋팅 (85MB OCSC_clean, M=24 OL, b32)
+
+| task | LR | GT? | best RMM | step |
+|---|---|---|---|---|
+| `GT-lastF-lr5e6` | 5e-6 | true | **0.77340** ★ | 599 |
+| `GT-lastF-lr1e6` | 1e-6 | true | 0.77287 (slow but stable) | 2599 |
+| `M24-lastF-lr1e6` | 1e-6 | false | 0.77025 | 2399 |
+| `M24-lastF-lr5e6` | 5e-6 | false | 0.77064 | 1199 |
+
+baseline (pretrained 85MB) ≈ **0.7669**.  공통: TRAIN_B=32, VAL_B=16, last_coarse_only=false,
+pos=1.0/h=0.01/rd=0, M=24/-1, fm_reg=0, anchor_stride=1, pred_max=2.
+
+**불안정 사례** (실패): `lastT-lr5e6` (last_coarse_only=true + LR=5e-6) → RMM 0.7669→0.27 폭락
+(schema fix 후 last_coarse 가 진짜 작동, gradient 발산).  `GT-lastF-lr5e5` (LR=5e-5) → RMM
+초기 dip 후 0.762 정체.
+
+## 알려진 fix / 패치 (OCSC_clean_v2, 비교 참고)
+
+- GT padding fix: tokenizer 가 invalid GT 를 raw 0.0 으로 채움 → `_cl_to_norm` 후 50+ huge value
+  → mask 적용 path (paired L2) 는 영향 없음, 하지만 MMD/aux logging 오염.  v2 commit `5db83d2`
+  에서 `torch.where(_gt_valid, _gt_pos, current_pos_active.unsqueeze(1))` 로 수정.
+  OCSC_clean 에는 미적용 (필요시 cherry-pick).
+- `ocsc_loss_global_frame` toggle (v2 commit `bed4b64`): L2 만 world-frame 에서 측정.
+  실험에서 결정적 효과 X (Adam 이 grad scale 불변), 폐기.
 
 ## Validation backend
 
 `model.model_config.validation_metric: "real" | "hard"`:
-- `real`: 공식 TF SimAgentsMetrics (subprocess + TF, 정확하지만 비용 큼).
-- `hard` (launcher default): PyTorch in-process RMM (`HardSimAgentsMetrics`).
-  Parity 검증됨.
+- `real`: 공식 TF SimAgentsMetrics (느림, 정확)
+- `hard` (launcher default): PyTorch in-process HardSimAgentsMetrics.  Parity 검증됨.
 
-## Env vars (런처가 export)
+## Env vars (런처 export)
 
 | var | 소비처 |
 |---|---|
-| `OMP_NUM_THREADS` 등 BLAS thread | numpy/torch/MKL/OpenBLAS auto |
-| `WOSAC_HARD_POOL_WORKERS` | hard RMM forkserver pool |
-| `WOSAC_REAL_POOL_WORKERS` | official TF metric forkserver pool |
+| `OMP_NUM_THREADS` 등 BLAS thread | numpy/torch/MKL/OpenBLAS |
+| `WOSAC_HARD_POOL_WORKERS` | hard RMM forkserver pool (default 16, 학습 중엔 4 권장) |
+| `WOSAC_REAL_POOL_WORKERS` | official TF metric forkserver |
 | `WOSAC_VERIFY` | hard vs real cross-check (디버그) |
+| `OCSC_VERBOSE` | (v2 only) 좌표 frame raw dump + per-channel loss decomp |
+| `WANDB_RUN_ID` + `WANDB_RESUME=allow` | wandb 같은 run id 로 이어붙이기 |
 
 ## Conventions
 
 - 한 클래스 한 파일.
 - Korean docstring, English code 주석/symbol.
-- Hydra 진입점은 `src/run.py`, primary config `configs/run.yaml`.
+- Hydra 진입점 `src/run.py`, primary config `configs/run.yaml`.
 - 새 finetune 모드 추가 시: `finetune_config.mode == "<name>"` 분기 패턴
   (`_is_ocsc_ft_enabled` 처럼).
-- ckpt 가 OCSC_clean 와 호환 안 되는 경우 (shape mismatch) 가 가장 흔한
-  init 실패.  먼저 `CKPT_PATH` 가 fix-hard-rmm 호환인지 확인.
+- ckpt 가 OCSC_clean 와 호환 안 되는 경우 (shape mismatch) 가 가장 흔한 init 실패.
+  OCSC_clean → 85MB, OCSC_clean_v2 → 87MB 확인.
