@@ -36,10 +36,15 @@ from src.smart.modules.draft_physics import (
     DraftPhysicsRegularizer,
 )
 from src.smart.modules.self_forced_path_flow import (
-    build_anchor0_normalized_committed_path,
     build_anchor0_physics_inputs,
     get_anchor0_valid_mask,
     masked_mean_square_loss,
+)
+from src.smart.modules.self_forced_delayed_window import (
+    SelfForcedDelayedWindow,
+    build_delayed_anchor0_tokenized_agent,
+    build_delayed_normalized_committed_path,
+    resolve_self_forced_delayed_window,
 )
 from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
 from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
@@ -238,6 +243,20 @@ class SMARTFlow(LightningModule):
             int(getattr(self.self_forced_config, "start_epoch", 0))
             if self.self_forced_config is not None
             else 0
+        )
+        self.self_forced_delayed_window_config = (
+            getattr(self.self_forced_config, "delayed_window", None)
+            if self.self_forced_config is not None
+            else None
+        )
+        self.self_forced_delayed_window_enabled = bool(
+            self.self_forced_delayed_window_config is not None
+            and getattr(self.self_forced_delayed_window_config, "enabled", False)
+        )
+        self.self_forced_delayed_window_stage_epochs = (
+            max(1, int(getattr(self.self_forced_delayed_window_config, "stage_epochs", 4)))
+            if self.self_forced_delayed_window_config is not None
+            else 4
         )
         self.self_forced_weight = (
             float(getattr(self.self_forced_config, "weight", 1.0))
@@ -464,6 +483,21 @@ class SMARTFlow(LightningModule):
                 self.open_metric_names["yaw_ade"]: WeightedMeanMetric(),
                 self.open_metric_names["yaw_fde"]: WeightedMeanMetric(),
             }
+        )
+
+    def _resolve_self_forced_delayed_window(self) -> SelfForcedDelayedWindow:
+        """현재 epoch에서 self-forcing이 학습할 2초 구간을 정합니다.
+
+        Returns:
+            SelfForcedDelayedWindow: 전체 rollout 길이와 실제 학습 시작 시점을 담은 값입니다.
+        """
+        return resolve_self_forced_delayed_window(
+            current_epoch=int(self.current_epoch),
+            start_epoch=int(self.self_forced_start_epoch),
+            flow_window_steps=int(self.flow_window_steps),
+            commit_steps=int(self.encoder.agent_encoder.shift),
+            stage_epochs=int(self.self_forced_delayed_window_stage_epochs),
+            enabled=bool(self.self_forced_delayed_window_enabled),
         )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
@@ -1950,6 +1984,7 @@ class SMARTFlow(LightningModule):
             ``pred_head_10hz`` 는 실제로 commit된 N초 rollout입니다. random-s 학습이 켜져
             있으면 DDP 전체 rank가 공유한 ``s`` 와 tau 구간도 함께 들어갑니다.
         """
+        delayed_window = self._resolve_self_forced_delayed_window()
         encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
         try:
             map_feature = self.encoder.encode_map(tokenized_map)
@@ -1959,7 +1994,8 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
                 sampling_scheme=self.self_forced_sampling,
-                rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
+                rollout_steps_2hz=delayed_window.rollout_steps_2hz,
+                learning_start_step_2hz=delayed_window.skipped_blocks_2hz,
                 self_forced_epoch=int(self.current_epoch),
                 detach_block_transition=self.self_forced_detach_block_transition,
                 use_stop_motion=self.self_forced_use_stop_motion,
@@ -1971,7 +2007,7 @@ class SMARTFlow(LightningModule):
         self,
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Dict[str, Tensor]]:
         """committed rollout을 첫 anchor 기준 packed N초 path로 변환합니다.
 
         Args:
@@ -1979,7 +2015,8 @@ class SMARTFlow(LightningModule):
             tokenized_agent: 평가 모드 agent token 사전입니다.
 
         Returns:
-            tuple[Tensor, Tensor]: packed path와 agent mask입니다.
+            tuple[Tensor, Tensor, Dict[str, Tensor]]: packed path, agent mask, 그리고
+                해당 path의 기준 시점에 맞춘 agent token 사전입니다.
                 packed path shape은 ``[n_valid_agent, F_win, 4]`` 이고,
                 mask shape은 ``[n_agent]`` 입니다.
 
@@ -1988,14 +2025,27 @@ class SMARTFlow(LightningModule):
             이후 generated estimator 학습과 generator update의 noising tau는
             여기서 전달하지 않습니다.
         """
-        anchor_mask = get_anchor0_valid_mask(tokenized_agent)
-        committed_path_norm = build_anchor0_normalized_committed_path(
+        delayed_window = self._resolve_self_forced_delayed_window()
+        if self.self_forced_delayed_window_enabled:
+            anchor_mask = tokenized_agent["flow_eval_mask"][:, delayed_window.anchor_offset].bool()
+        else:
+            anchor_mask = get_anchor0_valid_mask(tokenized_agent)
+        path_tokenized_agent = tokenized_agent
+        if self.self_forced_delayed_window_enabled:
+            path_tokenized_agent = build_delayed_anchor0_tokenized_agent(
+                tokenized_agent=tokenized_agent,
+                pred_traj_10hz=rollout["pred_traj_10hz"],
+                pred_head_10hz=rollout["pred_head_10hz"],
+                window=delayed_window,
+                commit_steps=int(self.encoder.agent_encoder.shift),
+            )
+        committed_path_norm = build_delayed_normalized_committed_path(
             pred_traj_10hz=rollout["pred_traj_10hz"],
             pred_head_10hz=rollout["pred_head_10hz"],
-            tokenized_agent=tokenized_agent,
+            tokenized_agent=path_tokenized_agent,
             flow_window_steps=self.flow_window_steps,
         )
-        return committed_path_norm[anchor_mask], anchor_mask
+        return committed_path_norm[anchor_mask], anchor_mask, path_tokenized_agent
 
     def _update_generated_path_flow_estimator(
         self,
@@ -2751,7 +2801,11 @@ class SMARTFlow(LightningModule):
                 rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
         else:
             rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
-        committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
+        (
+            committed_path_norm,
+            anchor_mask,
+            path_tokenized_agent_eval,
+        ) = self._pack_self_forced_committed_rollout(
             rollout=rollout,
             tokenized_agent=tokenized_agent_eval,
         )
@@ -2797,7 +2851,7 @@ class SMARTFlow(LightningModule):
 
         gen_estimator_loss = self._update_generated_path_flow_estimator(
             tokenized_map=tokenized_map_eval,
-            tokenized_agent=tokenized_agent_eval,
+            tokenized_agent=path_tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
@@ -2805,13 +2859,13 @@ class SMARTFlow(LightningModule):
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
         sf_loss = self._compute_self_forced_distribution_matching_loss(
             tokenized_map=tokenized_map_eval,
-            tokenized_agent=tokenized_agent_eval,
+            tokenized_agent=path_tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
         physics_dict = self._compute_self_forced_physics_loss(
             committed_path_norm=committed_path_norm,
-            tokenized_agent=tokenized_agent_eval,
+            tokenized_agent=path_tokenized_agent_eval,
             anchor_mask=anchor_mask,
         )
         anchor_loss = (

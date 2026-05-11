@@ -1195,6 +1195,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         scenario_sampling_seeds: torch.Tensor | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
+        learning_start_step_2hz: int = 0,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
@@ -1209,6 +1210,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 고정 난수 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
+            learning_start_step_2hz: loss가 걸리는 첫 0.5초 block index입니다.
+                앞쪽 block은 실행만 하고, 이 경계에서 gradient 연결을 끊습니다.
             self_forced_epoch: self-forced 학습 epoch입니다. ``None`` 이면 random terminal
                 denoising step을 쓰지 않는 평가/추론 경로로 봅니다.
 
@@ -1337,9 +1340,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             if terminal_steps_by_scenario is not None and terminal_steps_by_scenario.numel() > 0
             else None
         )
+        learning_start_step_2hz = max(0, int(learning_start_step_2hz))
 
         for t in range(n_step_future_2hz):
-            if detach_block_transition and t > 0:
+            if (detach_block_transition and t > 0) or (
+                t == learning_start_step_2hz and t > 0
+            ):
                 detached_state = detach_training_rollout_state(
                     {
                         "pos_window": pos_window,
@@ -1776,6 +1782,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         rollout_steps_2hz: int | None = None,
+        learning_start_step_2hz: int = 0,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
@@ -1791,6 +1798,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. 기본 self-forced 학습은
                 ``flow_window_steps / 5`` 를 넘깁니다.
+            learning_start_step_2hz: loss를 적용할 2초 window가 시작되는 0.5초 block
+                index입니다. 지연 self-forcing에서는 이 지점에서 앞구간 graph를 끊습니다.
             self_forced_epoch: 현재 self-forced epoch입니다. ``None`` 이면 training
                 random terminal denoising step을 끕니다.
             use_stop_motion: ``None``이면 decoder 기본 inference 설정을 사용합니다.
@@ -1808,6 +1817,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=False,
             rollout_steps_2hz=rollout_steps_2hz,
+            learning_start_step_2hz=learning_start_step_2hz,
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
             use_stop_motion=use_stop_motion,

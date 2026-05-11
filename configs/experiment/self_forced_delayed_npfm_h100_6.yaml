@@ -1,0 +1,35 @@
+# @package _global_
+
+# 지연 시작 self-forcing fine-tuning preset for 6x H100 80GB.
+# 핵심 변경은 하나입니다.
+#   epoch 0~3   : 0~2초만 학습
+#   epoch 4~7   : 0~2초는 굴리기만 하고 2~4초만 학습
+#   epoch 8~11  : 0~4초는 굴리기만 하고 4~6초만 학습
+#   epoch 12~15 : 0~6초는 굴리기만 하고 6~8초만 학습
+
+# 기존 self_forced_npfm_h100_6 preset을 기반으로 하며,
+# 별도 RMM loss, 혼합 window, random window를 추가하지 않습니다.
+defaults:
+  - self_forced_npfm_h100_6
+
+trainer:
+  max_epochs: 16
+
+model:
+  model_config:
+    decoder:
+      # 지연 시작 schedule은 2초 target을 전제로 합니다.
+      flow_window_steps: 20
+    self_forced:
+      detach_block_transition: false
+      estimator_warmup_epochs: 1
+      delayed_window:
+        enabled: true
+        # 4 epoch마다 학습 시작 시점을 2초씩 늦춥니다.
+        stage_epochs: 4
+      sampling:
+        # 항상 전체 32 step을 실행하고 마지막 8 step만 역전파합니다.
+        backprop_last_k: 8
+        random_terminal_step:
+          enabled: true
+          policy: all

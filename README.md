@@ -2428,3 +2428,51 @@ road_cache/
 `trainer.reload_dataloaders_every_n_epochs=1`이 필요합니다. 새 epoch마다 selected cache 폴더가 바뀌기 때문입니다. `road_flow` 실험 설정에는 이 값이 이미 들어 있습니다.
 
 `road.candidate_micro_batch_size`는 기본 4입니다. K=64 후보를 한 번에 모두 만들지 않고 작은 묶음으로 나누어 생성하므로, GPU 메모리가 부족하면 1 또는 2로 낮추면 됩니다.
+
+### Delayed-Window Self-Forcing
+
+이 모드는 self-forcing fine-tuning에서 학습 시작 시점만 epoch에 따라 뒤로 미룹니다.
+RMM을 직접 loss로 쓰지 않고, 기존 self-forcing loss를 그대로 사용합니다.
+
+| epoch | 전체 rollout | 학습 제외 구간 | 실제 학습 구간 | 기준 시점 |
+|---:|---:|---:|---:|---:|
+| 0~3 | 2초 | 없음 | 0~2초 | 0초 |
+| 4~7 | 4초 | 0~2초 | 2~4초 | 2초 |
+| 8~11 | 6초 | 0~4초 | 4~6초 | 4초 |
+| 12~15 | 8초 | 0~6초 | 6~8초 | 6초 |
+
+핵심 규칙은 아래와 같습니다.
+
+- 앞구간은 현재 모델이 스스로 굴러가게만 하고 loss에는 쓰지 않습니다.
+- 앞구간과 실제 학습 구간 사이의 gradient 연결은 끊습니다.
+- 실제 학습 2초 구간 안의 0.5초 block 연결은 유지합니다.
+- target horizon은 항상 2초입니다. 그래서 `decoder.flow_window_steps=20`을 사용합니다.
+- 새 RMM loss, 혼합 window, random window는 추가하지 않습니다.
+
+6x H100 실행 예시:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --standalone --nproc_per_node=6 -m src.run \
+  experiment=self_forced_delayed_npfm_h100_6 \
+  action=finetune \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=self_forced_delayed_window_h100_6 \
+  ckpt_path="/path/to/pretrained.ckpt"
+```
+
+4x H100 실행 예시:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --standalone --nproc_per_node=4 -m src.run \
+  experiment=self_forced_delayed_npfm_h100_4 \
+  action=finetune \
+  paths.cache_root="$CACHE_ROOT" \
+  task_name=self_forced_delayed_window_h100_4 \
+  ckpt_path="/path/to/pretrained.ckpt"
+```
+
+상세 설명은 `docs/DELAYED_SELF_FORCING_USAGE.md`에 있습니다.

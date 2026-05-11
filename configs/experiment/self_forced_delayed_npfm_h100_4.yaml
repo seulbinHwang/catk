@@ -1,0 +1,25 @@
+# @package _global_
+
+# 지연 시작 self-forcing fine-tuning preset for 4x H100 80GB.
+# 6GPU preset과 같은 학습법이며 trainer.devices와 batch는 기존 4GPU preset을 따릅니다.
+defaults:
+  - self_forced_npfm_h100_4
+
+trainer:
+  max_epochs: 16
+
+model:
+  model_config:
+    decoder:
+      flow_window_steps: 20
+    self_forced:
+      detach_block_transition: false
+      estimator_warmup_epochs: 1
+      delayed_window:
+        enabled: true
+        stage_epochs: 4
+      sampling:
+        backprop_last_k: 8
+        random_terminal_step:
+          enabled: true
+          policy: all
