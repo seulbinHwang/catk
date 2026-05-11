@@ -52,12 +52,17 @@ class FinetuneConfig:
 
     enabled: bool = False
     mode: str = "ocsc_ft"
-    # ── 공통 BPTT 토글 (OCSC 에서 ODE solver / closed-loop rollout 제어) ───────
+    # ── 공통 학습 토글 ─────────────────────────────────────────────────────────
+    gradient_clip_val: float = 0.0
+    # ── BPTT 토글 (OCSC 에서 ODE solver / closed-loop rollout 제어) ────────────
     flow_velocity_head_only: bool = True
     bptt_use_adjoint: bool = False
     bptt_last_n_solver_steps: int = 0
     bptt_grad_clip_traj: float = 1.0
     bptt_debug: bool = False
+    bptt_sequential_rollouts: bool = True
+    bptt_warm_coarse_steps: int = 0
+    bptt_last_n_coarse_steps: int = 0
     bptt_last_coarse_only: bool = False
     # ── OCSC (Open-Closed Self-Consistency) ───────────────────────────────────
     ocsc_n_rollouts: int = 2
@@ -119,11 +124,15 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
     return FinetuneConfig(
         enabled=bool(_read_config_value(finetune, "enabled", True)),
         mode=str(_read_config_value(finetune, "mode", "ocsc_ft")),
+        gradient_clip_val=float(_read_config_value(finetune, "gradient_clip_val", 0.0)),
         flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
         bptt_use_adjoint=bool(_read_config_value(finetune, "bptt_use_adjoint", False)),
         bptt_last_n_solver_steps=int(_read_config_value(finetune, "bptt_last_n_solver_steps", 0)),
         bptt_grad_clip_traj=float(_read_config_value(finetune, "bptt_grad_clip_traj", 1.0)),
         bptt_debug=bool(_read_config_value(finetune, "bptt_debug", False)),
+        bptt_sequential_rollouts=bool(_read_config_value(finetune, "bptt_sequential_rollouts", True)),
+        bptt_warm_coarse_steps=int(_read_config_value(finetune, "bptt_warm_coarse_steps", 0)),
+        bptt_last_n_coarse_steps=int(_read_config_value(finetune, "bptt_last_n_coarse_steps", 0)),
         bptt_last_coarse_only=bool(_read_config_value(finetune, "bptt_last_coarse_only", False)),
         ocsc_n_rollouts=int(_read_config_value(finetune, "ocsc_n_rollouts", 2)),
         ocsc_n_ol_rollouts=int(_read_config_value(finetune, "ocsc_n_ol_rollouts", -1)),

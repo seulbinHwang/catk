@@ -38,13 +38,9 @@ from src.smart.metrics.mmd_consistency_loss import (
     mmd_precompute_sigma_sq,
     mmd_per_rollout_proxy,
 )
-from src.smart.modules.flow_adjoint_matching import AdjointMatchingLoss, SmoothControlProjector
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
-from src.smart.modules.flow_reward import KinematicProjectionReward
 from src.smart.utils.geometry import wrap_angle
 from src.smart.utils.rollout import transform_to_local
-from src.smart.modules.flow_projected_generation import ProjectedFlowGenerator
-from src.smart.modules.flow_terminal_cost_final_step import TerminalCostFinalStepLoss
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import FinetuneConfig, set_model_for_finetuning
@@ -52,20 +48,6 @@ from src.utils.pylogger import RankedLogger
 from src.utils.vis_waymo import VisWaymo
 from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
-
-#Surrogate metrics
-from waymo_open_dataset.protos import scenario_pb2, sim_agents_metrics_pb2
-from src.smart.metrics.wosac_metric_features_torch.metric_features_torch_differentiable import (
-    PredictedSimTrajectories,
-    compute_metric_features_from_predicted_sim_trajectories,
-    compute_metric_features_batched_scenes,
-)
-from src.smart.metrics.wosac_metametric_pytorch_differentiable import (
-    compute_wosac_metametric_soft,
-    compute_wosac_metametric_soft_batched,
-    WosacMetametricSoftResult,
-)
-from src.smart.metrics.wosac_metric_features_torch.surrogate import SurrogateConfig
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -124,57 +106,12 @@ class SMARTFlow(LightningModule):
             self.encoder,
             model_config.finetune,
         )
-        self.adjoint_matching_loss = None
-        self.terminal_cost_final_step_loss: TerminalCostFinalStepLoss | None = None
-        self.kinematic_reward_fn: KinematicProjectionReward | None = None
         self.ref_flow_decoder: nn.Module | None = None
-        self._dpo_debug_path: str | None = None
-        self.dice_critic: nn.Module | None = None
-        if self.finetune_config.enabled:
-            if self.finetune_config.mode == "adjoint_matching":
-                self.adjoint_matching_loss = AdjointMatchingLoss(
-                    rollout_steps=self.finetune_config.rollout_steps,
-                    rollout_noise_scale=self.finetune_config.rollout_noise_scale,
-                    feasible_weight=self.finetune_config.feasible_weight,
-                    smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
-                    smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
-                )
-            elif self.finetune_config.mode in {
-                "terminal_cost_final_step",
-                "terminal_cost_full_grad",
-            }:
-                self.terminal_cost_final_step_loss = TerminalCostFinalStepLoss(
-                    rollout_steps=self.finetune_config.rollout_steps,
-                    rollout_noise_scale=self.finetune_config.rollout_noise_scale,
-                    feasible_weight=self.finetune_config.feasible_weight,
-                    smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
-                    smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
-                    flow_reg_lambda=self.finetune_config.flow_reg_lambda,
-                )
-            elif self.finetune_config.mode == "kinematic_reward_ft":
-                # KinematicProjectionReward는 plain callable — TerminalCostFinalStepLoss가
-                # BPTT ODE 인프라를 제공하고 forward_reward_grad로 reward를 연결합니다.
-                # SmoothControlProjector를 만들지만 forward_feasibility_with_bc는 호출 안 합니다.
-                self.terminal_cost_final_step_loss = TerminalCostFinalStepLoss(
-                    rollout_steps=self.finetune_config.rollout_steps,
-                    rollout_noise_scale=self.finetune_config.rollout_noise_scale,
-                    feasible_weight=self.finetune_config.feasible_weight,
-                    smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
-                    smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
-                    flow_reg_lambda=self.finetune_config.flow_reg_lambda,
-                )
-                # kinematic_reward_fn은 kinematic_projector가 설정된 후 (아래) 초기화됩니다.
-            elif self.finetune_config.mode == "kinematic_proj_ft":
-                # ODE → KinematicProjection → FM target; 별도 loss 모듈 불필요.
-                pass
-            elif self.finetune_config.mode == "rmm_bptt_ft":
-                pass
-            elif self.finetune_config.mode == "ocsc_ft":
-                pass
-            elif self.finetune_config.mode == "ref_nll_ft":
-                pass
-            else:
-                raise ValueError(f"Unsupported finetune mode: {self.finetune_config.mode}")
+        if self.finetune_config.enabled and self.finetune_config.mode != "ocsc_ft":
+            raise ValueError(
+                f"Unsupported finetune mode: {self.finetune_config.mode}. "
+                "Only 'ocsc_ft' is supported."
+            )
 
         self.minADE = minADE()
         if bool(getattr(model_config, "wosac_torch_compile", False)):
@@ -209,28 +146,6 @@ class SMARTFlow(LightningModule):
             self._ocsc_train_hard_rmm = None
             self._ocsc_train_hard_rmm_ref = None
 
-        # pretrained ref model Δ RMM 모니터링 플래그 (train / val 독립)
-        _is_bptt = self.finetune_config.enabled and self.finetune_config.mode == "rmm_bptt_ft"
-        self._ref_train_enabled: bool = (
-            _is_bptt and bool(getattr(self.finetune_config, "rmm_bptt_ref_train", False))
-        )
-        _ref_val_on = (
-            _is_bptt
-            and bool(getattr(self.finetune_config, "rmm_bptt_ref_val", False))
-            and bool(getattr(model_config, "val_closed_loop", True))
-        )
-        self._ref_val_enabled: bool = _ref_val_on
-        if _ref_val_on:
-            if _validation_metric == "hard":
-                self.ref_sim_agents_metrics: HardSimAgentsMetrics | SimAgentsMetrics | None = HardSimAgentsMetrics("val_ref")
-            else:
-                self.ref_sim_agents_metrics = SimAgentsMetrics(
-                    "val_ref",
-                    max_workers=model_config.sim_agents_metric_workers,
-                )
-        else:
-            self.ref_sim_agents_metrics = None
-
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
         self.closed_loop_metric_name = "val_closed/sim_agents_2025/realism_meta_metric"
         self.val_closed_minade_name = (
@@ -246,43 +161,10 @@ class SMARTFlow(LightningModule):
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
 
-        # EMA reward whitening buffers for rmm_bptt_ft.
-        # Normalise loss = -(rmm - ema_mean) / (ema_std + eps) so gradient scale
-        # stays consistent across scenarios with very different RMM baselines.
-        if (
-            getattr(model_config, "finetune", None) is not None
-            and str(getattr(model_config.finetune, "mode", "")) == "rmm_bptt_ft"
-        ):
-            self.register_buffer("_rmm_ema_mean", torch.tensor(0.5))
-            self._rmm_ema_initialized = False
-
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.eval_sampling_noise = model_config.eval_sampling_noise
-
-        # Projected Diffusion generation (inference-time feasibility projection)
-        proj_cfg = getattr(model_config, "projected_generation", None)
-        self.projected_generator: ProjectedFlowGenerator | None = None
-        if proj_cfg is not None and getattr(proj_cfg, "enabled", False):
-            _projector = SmoothControlProjector(
-                feasible_weight=self.finetune_config.feasible_weight,
-                smooth_deadzone_epsilon=self.finetune_config.smooth_deadzone_epsilon,
-                smooth_deadzone_tau=self.finetune_config.smooth_deadzone_tau,
-            )
-            self.projected_generator = ProjectedFlowGenerator(
-                projector=_projector,
-                n_proj_steps=int(getattr(proj_cfg, "n_proj_steps", 3)),
-                proj_lr=float(getattr(proj_cfg, "proj_lr", 0.01)),
-            )
-            self.val_projected_epoch_metrics = nn.ModuleDict(
-                {
-                    "proj_ADE2s": WeightedMeanMetric(),
-                    "proj_FDE2s": WeightedMeanMetric(),
-                    "proj_yaw_ADE2s": WeightedMeanMetric(),
-                    "proj_yaw_FDE2s": WeightedMeanMetric(),
-                }
-            )
 
         # Final projection: ODE 완료 후 마지막 한 번만 kinematic projection 적용 (PPR final-step only 버전)
         final_proj_cfg = getattr(model_config, "final_projection", None)
@@ -314,7 +196,6 @@ class SMARTFlow(LightningModule):
             )
 
         self._final_proj_kin_projector: KinematicProjection | None = None
-        self.final_proj_generator: ProjectedFlowGenerator | None = None  # deprecated, no longer used
         if final_proj_cfg is not None and getattr(final_proj_cfg, "enabled", False):
             self._final_proj_kin_projector = _kin_proj_from_cfg()
             self.val_final_proj_epoch_metrics = nn.ModuleDict(
@@ -356,31 +237,6 @@ class SMARTFlow(LightningModule):
                     "kin_yaw_ADE2s": WeightedMeanMetric(),
                     "kin_yaw_FDE2s": WeightedMeanMetric(),
                 }
-            )
-            # kinematic_reward_ft / dice_ft(reward_enabled): kinematic_projector가
-            # 이제 설정됐으므로 reward fn 초기화
-            _needs_kin_reward = (
-                self.finetune_config.enabled
-                and self.kinematic_reward_fn is None
-                and (
-                    self.finetune_config.mode == "kinematic_reward_ft"
-                    or (
-                        self.finetune_config.mode == "dice_ft"
-                        and self.finetune_config.dice_reward_enabled
-                    )
-                )
-            )
-            if _needs_kin_reward:
-                self.kinematic_reward_fn = KinematicProjectionReward(
-                    kinematic_projector=self.encoder.agent_encoder.kinematic_projector,
-                    huber_beta=self.finetune_config.reward_huber_beta,
-                )
-        elif (
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "kinematic_reward_ft"
-        ):
-            raise ValueError(
-                "kinematic_reward_ft requires kinematic_projection.enabled=True"
             )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
@@ -1251,66 +1107,13 @@ class SMARTFlow(LightningModule):
     # Fine-tuning mode checks
     # ──────────────────────────────────────────────────────────────────────
 
-    def _is_adjoint_matching_enabled(self) -> bool:
-        """현재 학습이 Adjoint Matching 분기인지 확인합니다.
-
-        Returns:
-            bool: residual head만 학습하는 fine-tuning 단계면 ``True`` 입니다.
-        """
-        return bool(self.finetune_config.enabled and self.adjoint_matching_loss is not None)
-
-    def _is_terminal_cost_final_step_enabled(self) -> bool:
-        """현재 학습이 terminal_cost 기반 마지막 step gradient 분기인지 확인합니다."""
-        return bool(
-            self.finetune_config.enabled and self.terminal_cost_final_step_loss is not None
-        )
-
-    def _is_kinematic_proj_ft_enabled(self) -> bool:
-        """kinematic_proj_ft 분기인지 확인합니다."""
-        return bool(
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "kinematic_proj_ft"
-            and self.encoder.agent_encoder.kinematic_projector is not None
-        )
-
-    def _is_kinematic_reward_ft_enabled(self) -> bool:
-        """kinematic_reward_ft 분기인지 확인합니다."""
-        return bool(
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "kinematic_reward_ft"
-            and self.kinematic_reward_fn is not None
-            and self.terminal_cost_final_step_loss is not None
-        )
-
-    def _is_rmm_bptt_ft_enabled(self) -> bool:
-        return bool(
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "rmm_bptt_ft"
-        )
-
     def _is_ocsc_ft_enabled(self) -> bool:
         return bool(
             self.finetune_config.enabled
             and self.finetune_config.mode == "ocsc_ft"
         )
 
-    def _is_ref_nll_ft_enabled(self) -> bool:
-        return bool(
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "ref_nll_ft"
-        )
-
     def on_train_start(self) -> None:
-        _needs_ref = (
-            self.finetune_config.enabled
-            and self.ref_flow_decoder is None
-            and self.finetune_config.mode == "rmm_bptt_ft"
-            and (
-                self.finetune_config.rmm_bptt_use_ref_model
-                or self._ref_train_enabled
-                or self._ref_val_enabled
-            )
-        )
         # OCSC: ref_flow_decoder 를 항상 생성 (open-loop target 및 delta HardRMM 모니터링 공용)
         # ocsc_use_pretrained_ref=False 여도 delta 계산을 위해 frozen ref 가 필요하다.
         _needs_ref_ocsc = (
@@ -1318,13 +1121,7 @@ class SMARTFlow(LightningModule):
             and self.ref_flow_decoder is None
             and self.finetune_config.mode == "ocsc_ft"
         )
-        # ref_nll_ft: frozen reference flow decoder for likelihood reward
-        _needs_ref_nll = (
-            self.finetune_config.enabled
-            and self.ref_flow_decoder is None
-            and self.finetune_config.mode == "ref_nll_ft"
-        )
-        if _needs_ref or _needs_ref_ocsc or _needs_ref_nll:
+        if _needs_ref_ocsc:
             from copy import deepcopy
             flow_decoder = self.encoder.agent_encoder.flow_decoder
             self.ref_flow_decoder = deepcopy(flow_decoder)
@@ -1332,10 +1129,10 @@ class SMARTFlow(LightningModule):
                 p.requires_grad_(False)
             print(f"[{self.finetune_config.mode}] frozen reference model created from pretrained checkpoint.")
 
-        # rmm_bptt_ft / ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
+        # ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
         # gradients (exploding Jacobian, numerical instability). Register nan_to_num
         # hooks on trainable parameters so any NaN/Inf gradient is zeroed out.
-        if self._is_rmm_bptt_ft_enabled() or self._is_ocsc_ft_enabled() or self._is_ref_nll_ft_enabled():
+        if self._is_ocsc_ft_enabled():
             # NaN → 0, Inf → finite large value (not 0) so the optimizer still
             # sees the direction even under mild overflow.
             n_hooked = 0
@@ -1373,119 +1170,6 @@ class SMARTFlow(LightningModule):
 
 
 
-    def _compute_soft_rmm(
-        self,
-        scenario: scenario_pb2.Scenario,
-        x:    Tensor,  # [A, 80]
-        y:    Tensor,
-        z:    Tensor,
-        head: Tensor,
-        agent_ids: Tensor,
-        valid: Tensor,
-        log_feat_dict: dict,
-        config: sim_agents_metrics_pb2.SimAgentMetricsConfig,
-        debug: bool = False,
-    ) -> WosacMetametricSoftResult:
-        pred = PredictedSimTrajectories(
-            object_id=agent_ids.cpu(),
-            center_x=x, center_y=y, center_z=z, heading=head, valid=valid,
-        )
-        SURROGATE = SurrogateConfig(
-            collision_temperature=0.15,
-            offroad_temperature=0.15,
-            red_light_crossing_temperature=0.05,
-        )
-        sim_feat = compute_metric_features_from_predicted_sim_trajectories(
-            scenario=scenario, pred=pred, surrogate=SURROGATE,
-        )
-        sim_feat_dict = sim_feat.as_dict()
-
-        if debug:
-            # 극값 로깅: gradient explosion 원인 후보 탐지
-            with torch.no_grad():
-                def _stat(t: Tensor, name: str) -> str:
-                    v = t.detach().float()
-                    return f"{name}=[{v.min():.3f},{v.max():.3f}]"
-                log.warning(
-                    "[soft_rmm_feat_debug] "
-                    + " | ".join([
-                        _stat(sim_feat_dict["linear_speed"],    "lin_spd"),
-                        _stat(sim_feat_dict["angular_speed"],   "ang_spd"),
-                        _stat(sim_feat_dict["distance_to_nearest_object"], "dno"),
-                        _stat(sim_feat_dict["distance_to_road_edge"],      "d_road"),
-                        _stat(sim_feat_dict["collision_per_step"].float(),  "coll"),
-                        _stat(sim_feat_dict["offroad_per_step"].float(),    "offrd"),
-                    ])
-                )
-
-        return compute_wosac_metametric_soft(
-            config=config,
-            log_features=log_feat_dict,
-            sim_features=sim_feat_dict,
-            debug=debug,
-        )
-
-    def _compute_rmm_group(
-        self,
-        data: dict,
-        agent_ids: Tensor,    # [n_agents]
-        agent_batch: Tensor,  # [n_agents]
-        pred_traj: Tensor,    # [n_agents, G, 80, 2]
-        pred_z: Tensor,       # [n_agents, G, 80]
-        pred_head: Tensor,    # [n_agents, G, 80]
-    ) -> Tensor:              # [n_scenarios, G]
-        """Compute RMM for each of G rollouts, for each scenario.
-
-        Returns:
-            Float Tensor ``[n_scenarios, G]``. Returns zeros if tfrecord_path unavailable.
-        """
-        import multiprocessing as mp
-        from src.smart.metrics import _sim_agents_worker, SimAgentsMetrics
-
-        scenario_files = data.get("tfrecord_path", None)
-        G = pred_traj.shape[1]
-        n_scenarios = int(agent_batch.max().item()) + 1 if agent_batch.numel() > 0 else 0
-
-        if scenario_files is None or n_scenarios == 0:
-            return torch.zeros(n_scenarios, G)
-
-        agent_batch_cpu = agent_batch.cpu()
-        sizes = [int((agent_batch_cpu == i).sum()) for i in range(n_scenarios)]
-        ids_list = agent_ids.cpu().split(sizes)
-        traj_list = pred_traj.cpu().split(sizes)
-        z_list = pred_z.cpu().split(sizes)
-        head_list = pred_head.cpu().split(sizes)
-
-        config_bytes = SimAgentsMetrics._load_config_bytes()
-
-        # Build args: scenario × rollout (interleaved as sc0_r0, sc0_r1, ..., sc1_r0, ...)
-        args_all = []
-        for i in range(n_scenarios):
-            ids_np = ids_list[i].numpy()
-            t_np = traj_list[i].numpy()   # [n_i, G, 80, 2]
-            z_np = z_list[i].numpy()
-            h_np = head_list[i].numpy()
-            for g in range(G):
-                args_all.append((config_bytes, scenario_files[i], ids_np,
-                                 t_np[:, g:g+1, :, :], z_np[:, g:g+1, :], h_np[:, g:g+1, :]))
-
-        try:
-            mp.set_start_method("forkserver", force=True)
-        except RuntimeError:
-            pass
-
-        import os
-        n_pool = min(len(args_all), max(1, (os.cpu_count() or 8) // 4))
-        with mp.Pool(processes=n_pool) as pool:
-            results = pool.starmap(_sim_agents_worker, args_all)
-            pool.close()
-            pool.join()
-
-        # Reshape: results are [sc0_r0, sc0_r1, ..., sc1_r0, ...] → [n_scenarios, G]
-        meta_vals = [r["metametric"] for r in results]
-        rmm = torch.tensor(meta_vals, dtype=torch.float32).reshape(n_scenarios, G)
-        return rmm
-
     def _compute_rmm_bptt_gt_fm_loss(
         self,
         map_feature: Dict[str, Tensor],
@@ -1517,219 +1201,6 @@ class SMARTFlow(LightningModule):
             log.warning("[rmm_bptt_ft] non-finite GT FM loss; skipping")
             return None
         return fm
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Ref-NLL fine-tuning
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def _run_ref_nll_ft_step(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        data: dict | None = None,
-    ) -> dict:
-        """Reference-NLL fine-tuning step (closed-loop → open-loop likelihood).
-
-        알고리즘:
-          1. Closed-loop rollout (BPTT): G 번 AR rollout. coarse step 마다 0.5s 만 commit
-             하면서 ``pred_max_steps`` 만큼 (= ``pred_max_steps × shift`` fine step) 굴려
-             world-frame 의 2s 궤적 ``pred_traj_10hz`` 을 모은다.
-          2. 모은 closed-loop 2s 궤적을 **초기 pose** (rollout 시작 시점의 pos/head) 의
-             local frame 으로 변환해 ``x₁`` (= [n_active, 20, 4]) 을 만든다.
-          3. Frozen ref_flow_decoder (open-loop pretrained) 의 backward ODE + Hutchinson 으로
-             ``log p_ref(τ_2s | initial_anchor)`` 와 ``∂ log p_ref / ∂ x₁`` 계산.
-          4. Straight-through loss: ``L = -mean(∂ log p_ref / ∂ x₁ · x₁)``
-             → gradient = -(∂ log p_ref / ∂ x₁) 가 x₁ → pred_traj_10hz → flow_ode → θ
-             로 BPTT 역전파. 즉, **closed-loop AR joint likelihood 를 open-loop
-             p(τ|initial) 로 끌어올리는 covariate-shift 보정 fine-tuning** 이다.
-          5. (선택) GT FM regularization.
-
-        주의: open-loop ref 는 horizon 20 fine step (= 2s, 10Hz) 에 학습돼 있으므로
-        ``pred_max_steps × shift == 20`` 이어야 한다. 다르면 경고 후 가능한 prefix 만 사용.
-        """
-        from src.smart.modules.flow_likelihood import backward_ode_log_prob_and_grad
-
-        G = int(getattr(self.finetune_config, "ref_nll_n_rollouts", 2))
-        pred_max_steps_raw = int(getattr(self.finetune_config, "ref_nll_pred_max_steps", 4))
-        pred_max_steps: int | None = pred_max_steps_raw if pred_max_steps_raw > 0 else None
-        n_hutch = int(getattr(self.finetune_config, "ref_nll_n_hutch_samples", 1))
-        use_full_div_grad = bool(getattr(self.finetune_config, "ref_nll_use_full_div_grad", False))
-        fm_reg_lambda = float(getattr(self.finetune_config, "ref_nll_fm_reg_lambda", 0.0))
-        loss_scale = float(getattr(self.finetune_config, "ref_nll_loss_scale", 1.0))
-        use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
-        warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
-        _last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
-        _grad_clip = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
-
-        if data is None:
-            raise ValueError("ref_nll_ft requires `data` dict with scenario metadata.")
-        if "scenario_id" not in data:
-            raise KeyError("ref_nll_ft requires data['scenario_id'].")
-
-        # ── 1. Encode map (no_grad) ──────────────────────────────────────────
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-
-        # ── 2. Build rollout cache (no_grad) ─────────────────────────────────
-        with torch.no_grad():
-            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-            )
-
-        _agent_enc = self.encoder.agent_encoder
-        flow_ode = _agent_enc.flow_ode
-        # fresh sample 생성 시 ODE backward 방식 설정
-        flow_ode.use_adjoint_for_bptt = use_adjoint
-        flow_ode.last_n_grad_solver_steps = (
-            min(_last_n_solver, flow_ode.solver_steps) if _last_n_solver > 0 else 0
-        )
-
-        # Open-loop ref decoder 는 step_embed(20) + view(num_chunks, chunk_size) 로
-        # x_t_norm shape [batch, 20, 4] 가 강제된다. 그러므로 closed-loop fine step 길이
-        # 도 정확히 20 이어야 한다 (= pred_max_steps × shift).
-        _shift = int(_agent_enc.shift)
-        _open_loop_horizon = 20
-        pred_max_steps_eff = (
-            _open_loop_horizon // _shift if pred_max_steps is None else int(pred_max_steps)
-        )
-        n_fine = pred_max_steps_eff * _shift
-        if n_fine != _open_loop_horizon:
-            raise ValueError(
-                f"[ref_nll_ft] pred_max_steps×shift={n_fine} but open-loop ref requires "
-                f"exactly {_open_loop_horizon} fine steps. Set ref_nll_pred_max_steps="
-                f"{_open_loop_horizon // _shift} (= {_open_loop_horizon // _shift * 0.5}s)."
-            )
-
-        # 초기 pose (rollout 시작 시점) — closed-loop 2s 궤적을 이 frame 으로 normalize 한다.
-        initial_pos = rollout_cache["pos_window"][:, -1].detach().clone()    # [n_agent, 2]
-        initial_head = rollout_cache["head_window"][:, -1].detach().clone()  # [n_agent]
-        initial_active_mask = rollout_cache["valid_window"][:, -1].clone()   # [n_agent]
-
-        def _make_grad_clip_hook(max_norm: float):
-            def _hook(g: Tensor) -> Tensor:
-                n = g.norm()
-                return g if n <= max_norm else g * (max_norm / (n + 1e-6))
-            return _hook
-
-        total_loss_accum: Tensor | float = 0.0
-        total_log_p_accum: float = 0.0
-        n_valid_terms: int = 0
-
-        # ── 3. G rollout (WITH grad, BPTT) ───────────────────────────────────
-        for g in range(G):
-            seeds_g = self._get_closed_loop_scenario_seeds(
-                scenario_ids=data["scenario_id"],
-                rollout_idx=g,
-                device=tokenized_agent["batch"].device,
-            )
-
-            # Closed-loop rollout WITH gradient.
-            # 0.5s 씩 commit 하며 pred_max_steps × 0.5s 만큼 world-frame 으로 굴린다.
-            pred = self.encoder.rollout_from_cache(
-                rollout_cache=rollout_cache,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                sampling_noise=self.eval_sampling_noise,
-                scenario_sampling_seeds=seeds_g,
-                max_steps=pred_max_steps,
-                warm_coarse_steps=warm_coarse,
-                return_per_step_x1=False,
-            )
-
-            # Closed-loop 2s 궤적 (world frame, 10Hz) — gradient 가 흐른다.
-            pred_traj_10hz: Tensor = pred["pred_traj_10hz"]   # [n_agent, n_fine_total, 2]
-            pred_head_10hz: Tensor = pred["pred_head_10hz"]   # [n_agent, n_fine_total]
-            pred_valid: Tensor = pred["pred_valid"]           # history + coarse steps
-
-            # rollout 끝까지 활성이었던 agent 만 사용. rollout 은 한 번 inactive 가 되면
-            # 이후 next_valid 도 False 로 전파하므로 마지막 step 만 검사하면 충분하다.
-            all_active = initial_active_mask & pred_valid[:, -1]
-            if not bool(all_active.any()):
-                continue
-
-            traj_active = pred_traj_10hz[:, :n_fine][all_active]    # [n_active, n_fine, 2]
-            head_active = pred_head_10hz[:, :n_fine][all_active]    # [n_active, n_fine]
-            ipos_active = initial_pos[all_active]
-            ihead_active = initial_head[all_active]
-
-            # World-frame 2s 궤적 → 초기 frame 의 normalized [x/20, y/20, cosΔh, sinΔh].
-            x1 = self._world_traj_to_flow_norm(
-                pred_traj=traj_active,
-                pred_head=head_active,
-                current_pos=ipos_active,
-                current_head=ihead_active,
-            ).float()
-
-            if x1.requires_grad and _grad_clip > 0:
-                x1.register_hook(_make_grad_clip_hook(_grad_clip))
-
-            # 초기 anchor (rollout t=0) 만 condition 으로 사용 — open-loop 와 동일.
-            anchor_hidden_t0: Tensor = pred["anchor_hidden_2hz"][:, 0][all_active].detach().float()
-
-            def _v_ref_fn(x: Tensor, tau: Tensor, _ah: Tensor = anchor_hidden_t0) -> Tensor:
-                return self.ref_flow_decoder(_ah, x.float(), tau.float())
-
-            log_p_g, grad_x1_g = backward_ode_log_prob_and_grad(
-                x1=x1,
-                v_fn=_v_ref_fn,
-                steps=flow_ode.solver_steps,
-                eps_t=flow_ode.eps,
-                n_hutch=n_hutch,
-                use_full_div_grad=use_full_div_grad,
-            )
-
-            if not torch.isfinite(log_p_g).all():
-                log.warning(f"[ref_nll_ft] non-finite log_p at rollout {g}; skipping")
-                continue
-
-            total_log_p_accum += float(log_p_g.mean().item())
-            n_valid_terms += 1
-
-            # warm_coarse 가 전체 rollout 을 덮으면 x1 에 grad 가 없어 backward 불가 →
-            # log_p 모니터링만 하고 loss accumulation 은 건너뛴다.
-            if not x1.requires_grad:
-                continue
-
-            # Straight-through loss: L_g = -(grad_log_p · x₁)
-            # gradient: x₁ → pred_traj_10hz → flow_ode[t] → θ  (BPTT through closed-loop)
-            loss_g = -(
-                (grad_x1_g.detach() * x1).flatten(1).sum(1).mean()
-            ) * loss_scale / G
-
-            total_loss_accum = total_loss_accum + loss_g
-
-        # ── 5. GT FM regularization (선택) ────────────────────────────────────
-        if fm_reg_lambda > 0.0:
-            fm_loss = self._compute_rmm_bptt_gt_fm_loss(map_feature, tokenized_agent)
-            if fm_loss is not None:
-                total_loss_accum = total_loss_accum + fm_reg_lambda * fm_loss
-
-        mean_log_p = total_log_p_accum / max(1, n_valid_terms)
-
-        if isinstance(total_loss_accum, Tensor):
-            if not torch.isfinite(total_loss_accum):
-                log.warning("[ref_nll_ft] non-finite total loss; skipping backward")
-                return {
-                    "loss": total_loss_accum.detach(),
-                    "train/ref_nll_log_p": mean_log_p,
-                    "train/ref_nll_n_terms": float(n_valid_terms),
-                }
-            self.manual_backward(total_loss_accum)
-            return {
-                "loss": total_loss_accum.detach(),
-                "train/ref_nll_log_p": mean_log_p,
-                "train/ref_nll_n_terms": float(n_valid_terms),
-            }
-        else:
-            # no valid terms — return zero loss
-            dummy = torch.zeros(1, device=tokenized_agent["batch"].device, requires_grad=True)
-            self.manual_backward(dummy * 0.0)
-            return {
-                "loss": torch.zeros(1),
-                "train/ref_nll_log_p": 0.0,
-                "train/ref_nll_n_terms": 0.0,
-            }
 
     # ─────────────────────────────────────────────────────────────────────────
     # OCSC (Open-Closed Self-Consistency) fine-tuning
@@ -2711,752 +2182,6 @@ class SMARTFlow(LightningModule):
         ret["loss"] = _ddp_dummy
         return ret
 
-    def _run_flow_bptt_ft_step(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-        data: dict | None = None,
-    ) -> dict:
-        """Flow-BPTT fine-tuning step.
-
-        Closed-loop coarse rollout 후 soft RMM으로 미분 가능한 점수를 내고 gradient ascent 합니다.
-
-        메모리 절감 옵션:
-          - ``bptt_sequential_rollouts=True`` (기본): G rollout 을 1개씩 순차 실행 후 각각 즉시
-            backward 해 computation graph 를 즉시 해제. 피크 메모리 ≈ G 배 절감.
-          - ``bptt_warm_coarse_steps=N``: 앞 N coarse step 을 no_grad + detach (sliding BPTT).
-          - ``bptt_use_adjoint=True``: ODE velocity head 내부 checkpoint (activation 절감).
-          - ``bptt_max_coarse_steps=K``: coarse step 수 상한 (짧을수록 graph 작아짐).
-
-        GT 정규화(선택):
-          - ``flow_reg_lambda>0`` 이면 ``flow_train_clean_norm`` 기반 velocity FM MSE 를
-            RMM loss 에 더합니다 (``kinematic_proj_ft`` 와 동일 키).
-        """
-        G = int(getattr(self.finetune_config, "bptt_n_rollouts", 1))
-        _bmc_raw = getattr(self.finetune_config, "bptt_max_coarse_steps", None)
-        if _bmc_raw is None:
-            bptt_max_coarse_steps: int | None = None
-        else:
-            _n = int(_bmc_raw)
-            bptt_max_coarse_steps = None if _n <= 0 else _n
-        use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
-        sequential = bool(getattr(self.finetune_config, "bptt_sequential_rollouts", True))
-        warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
-        _grad_clip_traj = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
-        _dbg_enabled = bool(getattr(self.finetune_config, "bptt_debug", False))
-        _flow_reg_lambda = float(getattr(self.finetune_config, "flow_reg_lambda", 0.0))
-        _last_n_coarse = int(getattr(self.finetune_config, "bptt_last_n_coarse_steps", 0))
-        _last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
-
-        # ── 1. Encode map (no_grad; encoder frozen) ─────────────────────────
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-
-        # ── 2. Build rollout cache (no_grad; cache 초기화는 gradient 불필요) ─
-        with torch.no_grad():
-            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-            )
-
-        agent_batch = tokenized_agent["batch"]   # [n_agents] scenario index
-
-        # ── 3. 데이터 검증 ──────────────────────────────────────────────────
-        if data is None:
-            raise ValueError("flow_bptt_ft requires `data` dict with scenario metadata.")
-        if "tfrecord_path" not in data or "scenario_id" not in data:
-            raise KeyError("flow_bptt_ft requires data['tfrecord_path'] and data['scenario_id'].")
-        # IMPORTANT: soft RMM 의 object_id 는 rollout agent 순서와 정확히 일치해야 합니다.
-        agent_ids = None
-        try:
-            agent_ids = data["agent"]["id"]
-        except Exception:
-            agent_ids = None
-        if agent_ids is None:
-            try:
-                agent_ids = data["id"]
-            except Exception:
-                agent_ids = None
-        if agent_ids is None:
-            raise KeyError(
-                "flow_bptt_ft requires exact agent object ids: data['agent']['id'] (or data['id'])."
-            )
-        if int(agent_ids.shape[0]) != int(tokenized_agent["batch"].shape[0]):
-            raise ValueError(
-                "agent id count mismatch: "
-                f"ids={int(agent_ids.shape[0])} vs rollout_agents={int(tokenized_agent['batch'].shape[0])}"
-            )
-
-        scenario_ids: Sequence[str] = data["scenario_id"]
-        tfrecord_paths: Sequence[str] = data["tfrecord_path"]
-        n_scenarios = len(scenario_ids)
-        if len(tfrecord_paths) != n_scenarios:
-            raise ValueError(
-                f"tfrecord_path length {len(tfrecord_paths)} != scenario_id length {n_scenarios}"
-            )
-
-        # ── Waymo metric config (once per process) ───────────────────────────
-        if not hasattr(self, "_soft_rmm_waymo_cfg") or self._soft_rmm_waymo_cfg is None:
-            from google.protobuf import text_format
-            import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as wm_metrics
-            from pathlib import Path as _Path
-
-            config_path = _Path(wm_metrics.__file__).parent / "challenge_2025_sim_agents_config.textproto"
-            cfg = sim_agents_metrics_pb2.SimAgentMetricsConfig()
-            with open(config_path) as f:
-                text_format.Parse(f.read(), cfg)
-            self._soft_rmm_waymo_cfg = cfg
-        cfg = self._soft_rmm_waymo_cfg
-
-        from waymo_open_dataset.utils.sim_agents import submission_specs
-        from src.smart.metrics.wosac_metric_features_torch.metric_features_torch import (
-            compute_metric_features,
-            scenario_to_joint_scene,
-            _cache_get_or_build,
-        )
-        import tensorflow as tf
-
-        _sim_agents_challenge = submission_specs.ChallengeType.SIM_AGENTS
-
-        # ── 4. TFRecord & log-feature 사전 로드 (모든 rollout 에서 공유) ─────
-        # 예측 지평선 T_hor 사전 계산 (coarse_steps × shift = 10Hz steps)
-        _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
-        _n_coarse = bptt_max_coarse_steps if bptt_max_coarse_steps is not None else 16
-        _t_hor_pre = _n_coarse * _shift
-
-        # bptt_last_n_coarse_steps: "마지막 N coarse step에만 gradient" 편의 파라미터.
-        # warm_coarse 를 max(warm_coarse, n_coarse - last_n) 으로 override 해
-        # 앞 구간을 no_grad + detach 처리합니다.
-        if _last_n_coarse > 0:
-            _last_n_coarse = min(_last_n_coarse, _n_coarse)
-            warm_coarse = max(warm_coarse, _n_coarse - _last_n_coarse)
-            log.info(
-                f"[rmm_bptt] bptt_last_n_coarse_steps={_last_n_coarse}: "
-                f"effective warm_coarse_steps={warm_coarse} "
-                f"(gradient on last {_last_n_coarse}/{_n_coarse} coarse steps)"
-            )
-
-        _sc_scenarios: list = []
-        _sc_log_feat_dicts: list = []
-        _sc_masks: list = []
-        _sc_agent_ids: list = []
-        for sc_idx in range(n_scenarios):
-            sc_mask = (agent_batch == sc_idx)
-            _sc_masks.append(sc_mask)
-            if not bool(sc_mask.any()):
-                _sc_scenarios.append(None)
-                _sc_log_feat_dicts.append(None)
-                _sc_agent_ids.append(None)
-                continue
-
-            batch_scenario_id = str(scenario_ids[sc_idx])
-
-            # ── scenario proto cache ──────────────────────────────────────────
-            scenario = _SCENARIO_PROTO_CACHE.get(batch_scenario_id)
-            if scenario is None:
-                scenario = scenario_pb2.Scenario()
-                for tfdata in tf.data.TFRecordDataset([tfrecord_paths[sc_idx]], compression_type=""):
-                    scenario.ParseFromString(bytes(tfdata.numpy()))
-                    break
-                tfrecord_scenario_id = str(getattr(scenario, "scenario_id", ""))
-                if tfrecord_scenario_id != batch_scenario_id:
-                    raise ValueError(
-                        "scenario_id mismatch between dataloader metadata and TFRecord content: "
-                        f"batch='{batch_scenario_id}' vs tfrecord='{tfrecord_scenario_id}'. "
-                        f"path='{tfrecord_paths[sc_idx]}'"
-                    )
-                _SCENARIO_PROTO_CACHE[batch_scenario_id] = scenario
-                if len(_SCENARIO_PROTO_CACHE) > _SCENARIO_PROTO_CACHE_MAX:
-                    _SCENARIO_PROTO_CACHE.pop(next(iter(_SCENARIO_PROTO_CACHE)))
-
-            # ── log_feat_dict cache ───────────────────────────────────────────
-            _lf_key = f"{batch_scenario_id}_{_t_hor_pre}"
-            _lf_cpu = _LOG_FEAT_DICT_CACHE.get(_lf_key)
-            if _lf_cpu is None:
-                with torch.no_grad():
-                    log_joint = scenario_to_joint_scene(scenario, _sim_agents_challenge)
-                    log_feat = compute_metric_features(
-                        scenario, log_joint,
-                        challenge_type=_sim_agents_challenge, use_log_validity=True,
-                    )
-                    log_feat_dict = {
-                        k: v.to(device=agent_batch.device)
-                        for k, v in log_feat.as_dict().items()
-                    }
-                    log_feat_dict = _slice_log_feat_dict_to_pred_horizon(log_feat_dict, _t_hor_pre)
-                _lf_cpu = {k: v.cpu() for k, v in log_feat_dict.items()}
-                _LOG_FEAT_DICT_CACHE[_lf_key] = _lf_cpu
-                if len(_LOG_FEAT_DICT_CACHE) > _LOG_FEAT_DICT_CACHE_MAX:
-                    _LOG_FEAT_DICT_CACHE.pop(next(iter(_LOG_FEAT_DICT_CACHE)))
-            else:
-                log_feat_dict = {k: v.to(device=agent_batch.device) for k, v in _lf_cpu.items()}
-
-            # ── static scenario cache (road edges, lanes, logged traj) ────────
-            _cache_get_or_build(scenario)
-            _sc_scenarios.append(scenario)
-            _sc_log_feat_dicts.append(log_feat_dict)
-            _sc_agent_ids.append(agent_ids[sc_mask])
-
-        # ── Pre-compute valid scenario indices (shared by 5a and 5b) ────────
-        _valid_sc_idx = [i for i in range(n_scenarios) if _sc_scenarios[i] is not None]
-        _n_valid = len(_valid_sc_idx)
-        _valid_scenarios    = [_sc_scenarios[i]     for i in _valid_sc_idx]
-        _valid_agent_ids    = [_sc_agent_ids[i]     for i in _valid_sc_idx]
-        _valid_log_feat_dicts = [_sc_log_feat_dicts[i] for i in _valid_sc_idx]
-        _valid_sc_masks     = [_sc_masks[i]         for i in _valid_sc_idx]
-
-        _SURROGATE = SurrogateConfig(
-            collision_temperature=0.15,
-            offroad_temperature=0.15,
-            red_light_crossing_temperature=0.05,
-        )
-
-        # ── norm-clip hook helper ────────────────────────────────────────────
-        def _make_norm_clip_hook(max_norm: float):
-            def _hook(g: Tensor) -> Tensor:
-                g = torch.nan_to_num(g, nan=0.0, posinf=max_norm, neginf=-max_norm)
-                g_norm = g.norm()
-                if g_norm > max_norm:
-                    g = g * (max_norm / g_norm)
-                return g
-            return _hook
-
-        flow_ode = self.encoder.agent_encoder.flow_ode
-
-        # ── 5a. 순차 rollout 모드 (G > 1 이고 sequential=True) ───────────────
-        # 한 번에 1개 rollout 만 그래프를 가지므로 피크 메모리 ≈ G 배 절감.
-        # Lightning 에 반환하는 dummy loss (=0) 에 대한 backward 는 grad=0 이므로 무해.
-        if sequential and G > 1:
-            total_rmm_accum = 0.0
-            total_count_accum = 0
-
-            flow_ode.use_adjoint_for_bptt = use_adjoint
-            flow_ode.last_n_grad_solver_steps = min(_last_n_solver, flow_ode.solver_steps) if _last_n_solver > 0 else 0
-            if _last_n_solver > 0:
-                log.info(f"[rmm_bptt] bptt_last_n_solver_steps={flow_ode.last_n_grad_solver_steps}/{flow_ode.solver_steps}: "
-                         f"velocity detach on first {flow_ode.solver_steps - flow_ode.last_n_grad_solver_steps} solver steps.")
-            try:
-                for g in range(G):
-                    pred_traj_g, pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
-                        data=data,
-                        tokenized_agent=tokenized_agent,
-                        map_feature=map_feature,
-                        rollout_cache=rollout_cache,
-                        rollout_indices=[g],
-                        return_anchor_hidden=True,
-                        full_grad=True,
-                        max_steps=bptt_max_coarse_steps,
-                        warm_coarse_steps=warm_coarse,
-                    )
-                    # pred_traj_g: [n_agents, 1, T, 2]
-
-                    if pred_traj_g.requires_grad and _grad_clip_traj > 0:
-                        pred_traj_g.register_hook(_make_norm_clip_hook(_grad_clip_traj))
-                    if pred_head_g.requires_grad and _grad_clip_traj > 0:
-                        pred_head_g.register_hook(_make_norm_clip_hook(_grad_clip_traj))
-
-                    if _n_valid > 0:
-                        # Batched soft-RMM across all valid scenes for this rollout
-                        _preds_g = [
-                            PredictedSimTrajectories(
-                                object_id=_valid_agent_ids[j].cpu(),
-                                center_x=pred_traj_g[_valid_sc_masks[j], 0, :, 0],
-                                center_y=pred_traj_g[_valid_sc_masks[j], 0, :, 1],
-                                center_z=pred_z_g[_valid_sc_masks[j], 0, :],
-                                heading=pred_head_g[_valid_sc_masks[j], 0, :],
-                                valid=pred_traj_g.new_ones(
-                                    int(_valid_sc_masks[j].sum()), pred_traj_g.shape[2],
-                                    dtype=torch.bool,
-                                ),
-                            )
-                            for j in range(_n_valid)
-                        ]
-                        _feat_list = compute_metric_features_batched_scenes(
-                            scenarios=_valid_scenarios, preds=_preds_g, surrogate=_SURROGATE,
-                        )
-                        _rmm_g_vec = compute_wosac_metametric_soft_batched(
-                            config=cfg,
-                            log_features_list=_valid_log_feat_dicts,
-                            sim_features_list=[f.as_dict() for f in _feat_list],
-                            debug=(_dbg_enabled and g == 0),
-                        )  # (_n_valid,)
-                        _finite_g = torch.isfinite(_rmm_g_vec)
-                        count_g = int(_finite_g.sum().item())
-                        if count_g > 0:
-                            _safe_g = torch.where(_finite_g, _rmm_g_vec, torch.zeros_like(_rmm_g_vec))
-                            rmm_g = _safe_g.sum() / float(count_g)
-                        else:
-                            count_g = 0
-                    else:
-                        count_g = 0
-
-                    if count_g > 0:
-                        rmm_g_val = rmm_g.detach().item()
-                        total_rmm_accum += rmm_g_val
-                        total_count_accum += 1
-                        if math.isfinite(rmm_g_val):
-                            partial_loss = -rmm_g / G
-                            partial_loss.backward()
-                        else:
-                            log.warning(f"[rmm_bptt_ft] non-finite rmm at g={g}, skipping backward.")
-
-                    del pred_traj_g, pred_z_g, pred_head_g
-            finally:
-                flow_ode.use_adjoint_for_bptt = False
-                flow_ode.last_n_grad_solver_steps = 0
-
-            if total_count_accum == 0:
-                return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
-
-            mean_rmm = torch.tensor(
-                total_rmm_accum / total_count_accum,
-                dtype=torch.float32, device=agent_batch.device,
-            )
-            _step = int(getattr(self, "global_step", 0))
-            # EMA for monitoring only (not used in loss)
-            _ema_mom = 0.98
-            if hasattr(self, "_rmm_ema_mean"):
-                if not self._rmm_ema_initialized:
-                    self._rmm_ema_mean.fill_(mean_rmm.item())
-                    self._rmm_ema_initialized = True
-                else:
-                    self._rmm_ema_mean = _ema_mom * self._rmm_ema_mean + (1 - _ema_mom) * mean_rmm.detach()
-            _ema_log = self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach()
-            log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_log.item():.4f}")
-
-            fm_bc_det: Tensor | None = None
-            if _flow_reg_lambda > 0:
-                _fm = self._compute_rmm_bptt_gt_fm_loss(map_feature, tokenized_agent)
-                if _fm is not None:
-                    (_flow_reg_lambda * _fm).backward()
-                    fm_bc_det = _fm.detach()
-
-            # sequential 은 loss 가 dummy(0) 이라 train/loss 로그가 의미 없음. 모니터링용 합산 스칼라.
-            train_combined = (-mean_rmm).detach()
-            if fm_bc_det is not None:
-                train_combined = train_combined + _flow_reg_lambda * fm_bc_det
-
-            # DDP: 모든 trainable param 을 dummy loss graph 에 연결해야 bucket reducer 가 정상 작동.
-            # manual backward 로 grad 는 이미 누적됐으므로 backward() 추가 기여는 0.
-            _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
-            seq_ret = {
-                "loss": _ddp_dummy,   # grads already accumulated via manual backward
-                "train/rmm_soft": mean_rmm,
-                "train/rmm_loss": -mean_rmm,
-                "train/combined_loss": train_combined,
-                "train/rmm_ema": _ema_log,
-                "train/rmm_n_scenarios": torch.tensor(float(total_count_accum), device=mean_rmm.device),
-            }
-            if fm_bc_det is not None:
-                seq_ret["train/fm_bc_loss"] = fm_bc_det
-            # sequential mode: ref soft RMM (train Δ 모니터링)
-            if self._ref_train_enabled and self.ref_flow_decoder is not None:
-                _orig_fd = self.encoder.agent_encoder.flow_decoder
-                self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
-                try:
-                    with torch.no_grad():
-                        ref_traj_s, ref_z_s, ref_head_s, _ = self._run_parallel_rollout_chunk(
-                            data=data,
-                            tokenized_agent=tokenized_agent,
-                            map_feature=map_feature,
-                            rollout_cache=rollout_cache,
-                            rollout_indices=list(range(G)),
-                            return_anchor_hidden=True,
-                            full_grad=True,   # no_grad context 내에서 max_steps 적용
-                            max_steps=bptt_max_coarse_steps,
-                            warm_coarse_steps=warm_coarse,
-                        )
-                finally:
-                    self.encoder.agent_encoder.flow_decoder = _orig_fd
-                if _n_valid > 0:
-                    ref_s_total = 0.0
-                    with torch.no_grad():
-                        for g in range(G):
-                            _ref_preds_g = [
-                                PredictedSimTrajectories(
-                                    object_id=_valid_agent_ids[j].cpu(),
-                                    center_x=ref_traj_s[_valid_sc_masks[j], g, :, 0],
-                                    center_y=ref_traj_s[_valid_sc_masks[j], g, :, 1],
-                                    center_z=ref_z_s[_valid_sc_masks[j], g, :],
-                                    heading=ref_head_s[_valid_sc_masks[j], g, :],
-                                    valid=ref_traj_s.new_ones(
-                                        int(_valid_sc_masks[j].sum()), ref_traj_s.shape[2],
-                                        dtype=torch.bool,
-                                    ),
-                                )
-                                for j in range(_n_valid)
-                            ]
-                            _ref_feat_list = compute_metric_features_batched_scenes(
-                                scenarios=_valid_scenarios, preds=_ref_preds_g, surrogate=_SURROGATE,
-                            )
-                            _ref_rmm_vec = compute_wosac_metametric_soft_batched(
-                                config=cfg,
-                                log_features_list=_valid_log_feat_dicts,
-                                sim_features_list=[f.as_dict() for f in _ref_feat_list],
-                            )
-                            ref_s_total += _ref_rmm_vec.sum().item() / (G * _n_valid)
-                    seq_ref_rmm = torch.tensor(ref_s_total, dtype=torch.float32, device=mean_rmm.device)
-                    seq_ret["train/rmm_ref"] = seq_ref_rmm
-                    seq_ret["train/rmm_delta"] = mean_rmm.detach() - seq_ref_rmm
-            return seq_ret
-
-        # ── 5b. 병렬 rollout 모드 (G=1 또는 sequential=False) ────────────────
-        flow_ode.use_adjoint_for_bptt = use_adjoint
-        flow_ode.last_n_grad_solver_steps = min(_last_n_solver, flow_ode.solver_steps) if _last_n_solver > 0 else 0
-        if _last_n_solver > 0:
-            log.info(f"[rmm_bptt] bptt_last_n_solver_steps={flow_ode.last_n_grad_solver_steps}/{flow_ode.solver_steps}: "
-                     f"velocity detach on first {flow_ode.solver_steps - flow_ode.last_n_grad_solver_steps} solver steps.")
-        try:
-            pred_traj, pred_z, pred_head_traj, _ = (
-                self._run_parallel_rollout_chunk(
-                    data=data,
-                    tokenized_agent=tokenized_agent,
-                    map_feature=map_feature,
-                    rollout_cache=rollout_cache,
-                    rollout_indices=list(range(G)),
-                    return_anchor_hidden=True,
-                    full_grad=True,
-                    max_steps=bptt_max_coarse_steps,
-                    warm_coarse_steps=warm_coarse,
-                )
-            )
-        finally:
-            flow_ode.use_adjoint_for_bptt = False
-            flow_ode.last_n_grad_solver_steps = 0
-
-        if pred_traj.requires_grad and _grad_clip_traj > 0:
-            pred_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
-        if pred_head_traj.requires_grad and _grad_clip_traj > 0:
-            pred_head_traj.register_hook(_make_norm_clip_hook(_grad_clip_traj))
-
-        if _n_valid == 0:
-            return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
-
-        # Batched soft-RMM: compute DNO+TTC once per rollout across all valid scenes
-        _rmm_by_g = []  # [G] each (n_valid,)
-        for g in range(G):
-            _preds_g = [
-                PredictedSimTrajectories(
-                    object_id=_valid_agent_ids[j].cpu(),
-                    center_x=pred_traj[_valid_sc_masks[j], g, :, 0],
-                    center_y=pred_traj[_valid_sc_masks[j], g, :, 1],
-                    center_z=pred_z[_valid_sc_masks[j], g, :],
-                    heading=pred_head_traj[_valid_sc_masks[j], g, :],
-                    valid=pred_traj.new_ones(
-                        int(_valid_sc_masks[j].sum()), pred_traj.shape[2],
-                        dtype=torch.bool,
-                    ),
-                )
-                for j in range(_n_valid)
-            ]
-            _feat_list = compute_metric_features_batched_scenes(
-                scenarios=_valid_scenarios, preds=_preds_g, surrogate=_SURROGATE,
-            )
-            _rmm_g = compute_wosac_metametric_soft_batched(
-                config=cfg,
-                log_features_list=_valid_log_feat_dicts,
-                sim_features_list=[f.as_dict() for f in _feat_list],
-                debug=(_dbg_enabled and g == 0),
-            )  # (_n_valid,)
-            _rmm_by_g.append(_rmm_g)
-
-        rmm_matrix = torch.stack(_rmm_by_g, dim=1)  # (_n_valid, G)
-        rmm_per_scene = rmm_matrix.mean(dim=1)       # (_n_valid,) — mean over rollouts
-
-        finite_mask = torch.isfinite(rmm_per_scene)
-        total_count = int(finite_mask.sum().item())
-
-        if total_count == 0:
-            return {"loss": sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)}
-
-        safe_rmm_per_scene = torch.where(finite_mask, rmm_per_scene, torch.zeros_like(rmm_per_scene))
-        mean_rmm = safe_rmm_per_scene.sum() / float(total_count)
-
-        _step = int(getattr(self, "global_step", 0))
-        # EMA for monitoring only (not used in loss)
-        _ema_mom = 0.98
-        if hasattr(self, "_rmm_ema_mean"):
-            if not self._rmm_ema_initialized:
-                self._rmm_ema_mean.fill_(mean_rmm.item())
-                self._rmm_ema_initialized = True
-            else:
-                self._rmm_ema_mean = _ema_mom * self._rmm_ema_mean + (1 - _ema_mom) * mean_rmm.detach()
-        _ema_log = self._rmm_ema_mean.detach() if hasattr(self, "_rmm_ema_mean") else mean_rmm.detach()
-        log.info(f"[rmm] step={_step} rmm_soft={mean_rmm.item():.4f} ema={_ema_log.item():.4f}")
-
-        # ── pretrained ref soft RMM (train 단계 Δ 모니터링) ────────────────
-        # finetuned 와 동일한 G개 rollout (no_grad → gradient graph 에 영향 없음).
-        # rollout_indices=list(range(G)) → 동일 hash seed → noise 완전 정합.
-        ref_rmm_log: Tensor | None = None
-        if self._ref_train_enabled and self.ref_flow_decoder is not None:
-            _orig_fd = self.encoder.agent_encoder.flow_decoder
-            self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
-            try:
-                with torch.no_grad():
-                    # full_grad=True: rollout_from_cache_no_grad は max_steps を
-                    # 受け付けないため常に 80 step を返す → log_feat_dict の長さ不一致.
-                    # torch.no_grad() 内なので gradient は生成されず安全.
-                    # warm_coarse_steps も finetuned と揃えて完全同条件にする.
-                    ref_traj, ref_z, ref_head, _ = self._run_parallel_rollout_chunk(
-                        data=data,
-                        tokenized_agent=tokenized_agent,
-                        map_feature=map_feature,
-                        rollout_cache=rollout_cache,
-                        rollout_indices=list(range(G)),
-                        return_anchor_hidden=True,
-                        full_grad=True,
-                        max_steps=bptt_max_coarse_steps,
-                        warm_coarse_steps=warm_coarse,
-                    )
-            finally:
-                self.encoder.agent_encoder.flow_decoder = _orig_fd
-
-            if _n_valid > 0:
-                ref_total = 0.0
-                with torch.no_grad():
-                    for g in range(G):
-                        _ref_preds_g = [
-                            PredictedSimTrajectories(
-                                object_id=_valid_agent_ids[j].cpu(),
-                                center_x=ref_traj[_valid_sc_masks[j], g, :, 0],
-                                center_y=ref_traj[_valid_sc_masks[j], g, :, 1],
-                                center_z=ref_z[_valid_sc_masks[j], g, :],
-                                heading=ref_head[_valid_sc_masks[j], g, :],
-                                valid=ref_traj.new_ones(
-                                    int(_valid_sc_masks[j].sum()), ref_traj.shape[2],
-                                    dtype=torch.bool,
-                                ),
-                            )
-                            for j in range(_n_valid)
-                        ]
-                        _ref_feat_list = compute_metric_features_batched_scenes(
-                            scenarios=_valid_scenarios, preds=_ref_preds_g, surrogate=_SURROGATE,
-                        )
-                        _ref_rmm_vec = compute_wosac_metametric_soft_batched(
-                            config=cfg,
-                            log_features_list=_valid_log_feat_dicts,
-                            sim_features_list=[f.as_dict() for f in _ref_feat_list],
-                        )
-                        ref_total += _ref_rmm_vec.sum().item() / (G * _n_valid)
-                ref_rmm_log = torch.tensor(ref_total, dtype=torch.float32, device=mean_rmm.device)
-
-        loss = -mean_rmm
-        fm_bc_det: Tensor | None = None
-        if _flow_reg_lambda > 0:
-            _fm = self._compute_rmm_bptt_gt_fm_loss(map_feature, tokenized_agent)
-            if _fm is not None:
-                loss = loss + _flow_reg_lambda * _fm
-                fm_bc_det = _fm.detach()
-
-        ret = {
-            "loss": loss,
-            "train/rmm_soft": mean_rmm.detach(),
-            "train/rmm_loss": (-mean_rmm).detach(),
-            "train/combined_loss": loss.detach(),
-            "train/rmm_ema": _ema_log,
-            "train/rmm_n_scenarios": torch.tensor(float(total_count), device=mean_rmm.device),
-        }
-        if fm_bc_det is not None:
-            ret["train/fm_bc_loss"] = fm_bc_det
-        if ref_rmm_log is not None:
-            ret["train/rmm_ref"] = ref_rmm_log
-            ret["train/rmm_delta"] = mean_rmm.detach() - ref_rmm_log
-        return ret
-
-    def _run_kinematic_reward_ft_step(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ) -> dict:
-        """ODE full-grad rollout → KinematicProjection reward → reward gradient.
-
-        Steps:
-          1. encoder (no_grad) → anchor_hidden_valid
-          2. ctx_sampled_pos/heading → v_init, delta_init
-          3. ODE full-BPTT rollout → y_hat  (gradient flows through all steps)
-          4. KinematicProjectionReward(y_hat) → Huber(y_hat, y_proj.detach())
-          5. (optional) BC regularisation on GT via flow_reg_lambda
-        """
-        kp = self.encoder.agent_encoder.kinematic_projector
-        flow_ode = self.encoder.agent_encoder.flow_ode
-        flow_decoder = self.encoder.agent_encoder.flow_decoder
-
-        # 1. Encode context (no_grad; encoder is frozen)
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
-
-        if anchor_hidden_valid.numel() == 0:
-            dummy = next(p for p in self.parameters() if p.requires_grad)
-            return {"loss": dummy.sum() * 0.0}
-
-        anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
-
-        # 2. v_init / delta_init (closed-loop chunk 초기화와 동일 공식)
-        anchor_mask_tensor = tokenized_agent.get("flow_train_mask")
-        v_init, delta_init = self._compute_kinematic_init(tokenized_agent, anchor_mask_tensor, kp)
-        agent_type = tokenized_agent["flow_train_agent_type"]
-
-        # 3–4. Full-BPTT ODE + KinematicProjection reward (soft Huber loss)
-        gt_clean_norm = tokenized_agent.get("flow_train_clean_norm")
-        _dev = anchor_hidden.device
-        result = self.terminal_cost_final_step_loss.forward_reward_grad(
-            flow_decoder=flow_decoder,
-            flow_ode=flow_ode,
-            anchor_hidden_valid=anchor_hidden,
-            reward_fn=self.kinematic_reward_fn,
-            gt_clean_norm=gt_clean_norm.to(dtype=torch.float32, device=_dev) if gt_clean_norm is not None else None,
-            # reward_fn kwargs:
-            agent_type=agent_type.to(_dev),
-            v_init=v_init.to(_dev) if v_init is not None else None,
-            delta_init=delta_init.to(_dev) if delta_init is not None else None,
-        )
-
-        log_dict = {
-            "train/reward_loss": result.terminal_cost,
-            "train/projection_gap": result.projection_gap,
-            "train/v_init_mean": v_init.mean().item() if v_init is not None else 0.0,
-        }
-        if result.flow_reg_loss is not None:
-            log_dict["train/bc_loss"] = result.flow_reg_loss
-        log_dict["train/loss"] = result.loss.detach()
-        return {"loss": result.loss, **log_dict}
-
-    def _run_kinematic_proj_ft_step(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ) -> dict:
-        """ODE 생성 → KinematicProjection → projected trajectory를 FM target으로 fine-tuning.
-
-        Steps:
-          1. encoder (no_grad) → anchor_hidden_valid
-          2. ctx_sampled_pos/heading → v_init, delta_init  (closed-loop init과 동일)
-          3. ODE generate (no_grad, current policy) → y_hat
-          4. KinematicProjection(y_hat, v_init, delta_init) → y_proj  (no_grad)
-          5. flow_matching_loss(flow_decoder(x_t), target)  with y_proj as clean target
-          6. (optional) BC regularization on GT with flow_reg_lambda
-        """
-        kp = self.encoder.agent_encoder.kinematic_projector
-        flow_ode = self.encoder.agent_encoder.flow_ode
-        flow_decoder = self.encoder.agent_encoder.flow_decoder
-
-        # 1. Encode context (no_grad; encoder is frozen in finetune mode)
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
-
-        if anchor_hidden_valid.numel() == 0:
-            dummy = next(p for p in self.parameters() if p.requires_grad)
-            return {"loss": dummy.sum() * 0.0}
-
-        anchor_hidden = anchor_hidden_valid.detach().to(dtype=torch.float32)
-
-        # 2. v_init / delta_init (closed-loop chunk 초기화와 동일 공식)
-        anchor_mask_tensor = tokenized_agent.get("flow_train_mask")
-        v_init, delta_init = self._compute_kinematic_init(tokenized_agent, anchor_mask_tensor, kp)
-
-        # 3. ODE generate with current (frozen) policy
-        n_anchor = anchor_hidden.shape[0]
-        noise_scale = float(getattr(self.finetune_config, "rollout_noise_scale", 1.0))
-        x_init = torch.randn(n_anchor, 20, 4, device=anchor_hidden.device, dtype=torch.float32)
-        x_init = x_init * noise_scale
-
-        def _model_fn(x_t: Tensor, tau: Tensor) -> Tensor:
-            with torch.no_grad():
-                return flow_decoder(anchor_hidden, x_t, tau)
-
-        with torch.no_grad():
-            y_hat = flow_ode.generate(x_init=x_init, model_fn=_model_fn)
-
-            # 4. KinematicProjection → projected target
-            agent_type = tokenized_agent["flow_train_agent_type"]
-            _dev = y_hat.device
-            y_proj = kp(
-                y_hat,
-                agent_type.to(_dev),
-                v_init=v_init.to(_dev) if v_init is not None else None,
-                delta_init=delta_init.to(_dev) if delta_init is not None else None,
-            )
-
-        # 5. Flow matching loss on projected target (gradient through flow_decoder only)
-        y_proj_fp32 = y_proj.to(dtype=torch.float32)
-        proj_sample = flow_ode.sample(y_proj_fp32, target_type="velocity")
-        proj_pred = flow_decoder(anchor_hidden, proj_sample.x_t, proj_sample.tau)
-        loss = flow_matching_loss(proj_pred, proj_sample.target)
-        log_dict = {
-            "train/proj_ft_loss": loss.detach(),
-            "train/v_init_mean": v_init.mean().item() if v_init is not None else 0.0,
-        }
-
-        # 6. (optional) BC regularization on GT
-        if self.finetune_config.flow_reg_lambda > 0:
-            gt_clean = tokenized_agent.get("flow_train_clean_norm")
-            if gt_clean is not None:
-                gt_sample = flow_ode.sample(gt_clean.to(dtype=torch.float32), target_type="velocity")
-                gt_pred = flow_decoder(anchor_hidden, gt_sample.x_t, gt_sample.tau)
-                bc_loss = flow_matching_loss(gt_pred, gt_sample.target)
-                loss = loss + self.finetune_config.flow_reg_lambda * bc_loss
-                log_dict["train/bc_loss"] = bc_loss.detach()
-
-        log_dict["train/loss"] = loss.detach()
-        return {"loss": loss, **log_dict}
-
-    def _run_adjoint_matching_training_step(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ):
-        """Frozen base 문맥으로 Adjoint Matching loss를 계산합니다.
-
-        Args:
-            tokenized_map: 지도 토큰 사전입니다.
-            tokenized_agent: agent 토큰 사전입니다.
-
-        Returns:
-            AdjointMatchingResult: loss와 logging용 스칼라 묶음입니다.
-        """
-        device_type = self.device.type if self.device.type else "cpu"
-        # Adjoint loss는 작은 tau 분모와 autograd.grad를 같이 써서 mixed precision에 민감합니다.
-        with torch.autocast(device_type=device_type, enabled=False):
-            with torch.no_grad():
-                map_feature = self.encoder.encode_map(tokenized_map)
-
-                _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
-                    map_feature=map_feature,
-                    tokenized_agent=tokenized_agent,
-                    anchor_mask_key="flow_train_mask",
-                )
-            """
-            - ``anchor_hidden_valid``: 유효 anchor만 모은 문맥입니다.
-                shape은 ``[n_valid_anchor, hidden_dim]`` 입니다.
-            - flow_train_agent_type :  [n_valid_anchor] 
-                vehicle / pedestrian / cyclist를 구분하는 용도
-            - flow_train_current_control : [n_valid_anchor, 3]
-                - “anchor 직전 0.1초 동안의 현재 운동 상태를 body frame으로 표현한 값”
-                - 정규화된 값도 아니다.
-            - flow_train_current_control_valid : [n_valid_anchor]
-                - “방금 만든 current_control을 실제로 믿을 수 있는가”를 나타내는 bool 마스크
-                - raw_step-1과 raw_step이 둘 다 valid일 때만 True
-                - “현재 운동과의 연속성 제약을 적용할지 여부”
-            """
-            return self.adjoint_matching_loss(
-                flow_decoder=self.encoder.agent_encoder.flow_decoder,
-                flow_ode=self.encoder.agent_encoder.flow_ode,
-                anchor_hidden_valid=anchor_hidden_valid.detach().to(dtype=torch.float32),
-                agent_type=tokenized_agent["flow_train_agent_type"],
-                current_control=tokenized_agent["flow_train_current_control"].to(dtype=torch.float32),
-                current_control_valid=tokenized_agent["flow_train_current_control_valid"],
-            )
-
 
     def training_step(self, data, batch_idx):
         opt = self.optimizers()
@@ -3465,14 +2190,7 @@ class SMARTFlow(LightningModule):
 
         tokenized_map, tokenized_agent = self.token_processor(data)
 
-        if self._is_rmm_bptt_ft_enabled():
-            result = self._run_flow_bptt_ft_step(tokenized_map, tokenized_agent, data)
-            for k, v in result.items():
-                if k != "loss" and isinstance(v, (Tensor, float)):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-
-        elif self._is_ocsc_ft_enabled():
+        if self._is_ocsc_ft_enabled():
             # DDP multi-GPU: 모든 .backward() 호출을 no_sync 컨텍스트 안에서 실행해
             # per-backward all-reduce를 막고, 루프 종료 후 manual_backward(_ddp_dummy)로
             # all-reduce를 딱 1회만 트리거. anchor 수가 GPU마다 달라도 deadlock 없음.
@@ -3502,77 +2220,6 @@ class SMARTFlow(LightningModule):
                 )
                 self.log("train/loss", _total, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
-        elif self._is_ref_nll_ft_enabled():
-            result = self._run_ref_nll_ft_step(tokenized_map, tokenized_agent, data)
-            for k, v in result.items():
-                if k != "loss" and isinstance(v, (Tensor, float)):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-
-        elif self._is_kinematic_proj_ft_enabled():
-            result = self._run_kinematic_proj_ft_step(tokenized_map, tokenized_agent)
-            self.manual_backward(result["loss"])
-            for k, v in result.items():
-                if k != "loss" and isinstance(v, (Tensor, float)):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-
-        elif self._is_kinematic_reward_ft_enabled():
-            result = self._run_kinematic_reward_ft_step(tokenized_map, tokenized_agent)
-            self.manual_backward(result["loss"])
-            for k, v in result.items():
-                if k != "loss" and isinstance(v, (Tensor, float)):
-                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss", result["loss"].detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-
-        elif self._is_terminal_cost_final_step_enabled():
-            with torch.no_grad():
-                map_feature = self.encoder.encode_map(tokenized_map)
-                _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
-                    map_feature=map_feature,
-                    tokenized_agent=tokenized_agent,
-                    anchor_mask_key="flow_train_mask",
-                )
-            anchor_hidden_fp32 = anchor_hidden_valid.detach().to(dtype=torch.float32)
-            gt_clean_norm = tokenized_agent["flow_train_clean_norm"].to(dtype=torch.float32)
-
-            if self.finetune_config.mode == "terminal_cost_full_grad":
-                result = self.terminal_cost_final_step_loss.forward_feasibility_with_bc(
-                    flow_decoder=self.encoder.agent_encoder.flow_decoder,
-                    flow_ode=self.encoder.agent_encoder.flow_ode,
-                    anchor_hidden_valid=anchor_hidden_fp32,
-                    gt_clean_norm=gt_clean_norm,
-                    agent_type=tokenized_agent["flow_train_agent_type"],
-                    current_control=tokenized_agent["flow_train_current_control"].to(dtype=torch.float32),
-                    current_control_valid=tokenized_agent["flow_train_current_control_valid"],
-                )
-                self.log("train/loss", result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                self.log("train/feasibility_cost", result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                self.log("train/projection_gap", result.projection_gap, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                if result.flow_reg_loss is not None:
-                    self.log("train/bc_loss", result.flow_reg_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            else:
-                result = self.terminal_cost_final_step_loss.forward_l2(
-                    flow_decoder=self.encoder.agent_encoder.flow_decoder,
-                    flow_ode=self.encoder.agent_encoder.flow_ode,
-                    anchor_hidden_valid=anchor_hidden_fp32,
-                    gt_clean_norm=gt_clean_norm,
-                )
-                self.log("train/loss", result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                self.log("train/l2_loss", result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.manual_backward(result.loss)
-
-        elif self._is_adjoint_matching_enabled():
-            am_result = self._run_adjoint_matching_training_step(
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-            )
-            self.log("train/loss", am_result.loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/terminal_cost", am_result.terminal_cost, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/projection_gap", am_result.projection_gap, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/residual_norm", am_result.residual_norm, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.manual_backward(am_result.loss)
-
         else:
             pred = self.encoder(
                 tokenized_map,
@@ -3592,82 +2239,6 @@ class SMARTFlow(LightningModule):
             self.clip_gradients(opt, gradient_clip_val=_clip_val)
 
         opt.step()
-
-    def _projected_generation_val_step(
-        self,
-        tokenized_map: Dict,
-        tokenized_agent: Dict,
-        batch_idx: int,
-    ) -> None:
-        """Projected Diffusion ODE로 open-loop trajectory를 생성하고 ADE/FDE를 기록합니다.
-
-        매 ODE step 후 kinematic feasibility gap에 대해 gradient descent를 수행합니다.
-        """
-        # train/val에 따라 mask key 결정 (train: flow_train_*, val: flow_eval_*)
-        if "flow_eval_mask" in tokenized_agent:
-            anchor_mask_key = "flow_eval_mask"
-            clean_norm_key = "flow_eval_clean_norm"
-            agent_type_key = "flow_eval_agent_type"
-            ctrl_key = "flow_eval_current_control"
-            ctrl_valid_key = "flow_eval_current_control_valid"
-        elif "flow_train_mask" in tokenized_agent:
-            anchor_mask_key = "flow_train_mask"
-            clean_norm_key = "flow_train_clean_norm"
-            agent_type_key = "flow_train_agent_type"
-            ctrl_key = "flow_train_current_control"
-            ctrl_valid_key = "flow_train_current_control_valid"
-        else:
-            return
-
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            _, _, anchor_hidden_valid = self.encoder.encode_anchor_context_from_map_feature(
-                map_feature=map_feature,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key=anchor_mask_key,
-            )
-
-        if anchor_hidden_valid.numel() == 0:
-            return
-
-        anchor_hidden_valid = anchor_hidden_valid.to(dtype=torch.float32)
-        flow_decoder = self.encoder.agent_encoder.flow_decoder
-        flow_ode = self.encoder.agent_encoder.flow_ode
-
-        x_init = torch.randn(
-            anchor_hidden_valid.shape[0], 20, 4,
-            device=anchor_hidden_valid.device,
-            dtype=torch.float32,
-        )
-
-        def model_fn(x_t: Tensor, tau: Tensor) -> Tensor:
-            with torch.no_grad():
-                return flow_decoder(anchor_hidden_valid, x_t, tau)
-
-        pred_clean_norm = self.projected_generator.generate(
-            flow_ode=flow_ode,
-            model_fn=model_fn,
-            x_init=x_init,
-            agent_type=tokenized_agent[agent_type_key],
-            current_control=tokenized_agent.get(ctrl_key),
-            current_control_valid=tokenized_agent.get(ctrl_valid_key),
-            steps=16,
-        )
-
-        target_clean_norm = tokenized_agent[clean_norm_key].to(
-            device=pred_clean_norm.device, dtype=pred_clean_norm.dtype
-        )
-        proj_metric_dict = self._build_open_loop_metric_dict(
-            pred_clean_norm=pred_clean_norm,
-            target_clean_norm=target_clean_norm,
-        )
-        # key 앞에 proj_ prefix 붙여 저장
-        proj_metric_dict = {f"proj_{k}": v for k, v in proj_metric_dict.items()}
-        self._update_weighted_validation_metrics(
-            metric_store=self.val_projected_epoch_metrics,
-            metric_dict=proj_metric_dict,
-            sample_count=int(target_clean_norm.shape[0]),
-        )
 
     def _final_projection_val_step(
         self,
@@ -3834,14 +2405,6 @@ class SMARTFlow(LightningModule):
                     sample_count=open_sample_count,
                 )
 
-        # Projected Diffusion open-loop generation (feasibility projection at each ODE step)
-        if self.projected_generator is not None:
-            self._projected_generation_val_step(
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-                batch_idx=batch_idx,
-            )
-
         # Final projection: standard ODE → post-hoc gradient descent to feasible region
         if self._final_proj_kin_projector is not None:
             self._final_projection_val_step(
@@ -3900,36 +2463,6 @@ class SMARTFlow(LightningModule):
                             if self.delete_local_videos_after_wandb_upload:
                                 self._cleanup_local_video(video_path)
 
-            # ── pretrained ref rollout (Δ RMM 기준선) ─────────────────────
-            if (
-                self._ref_val_enabled
-                and self.ref_flow_decoder is not None
-                and self.ref_sim_agents_metrics is not None
-                and not self.sim_agents_submission.is_active
-                and batch_idx < self.n_batch_sim_agents_metric
-            ):
-                # flow_decoder 를 pretrained ref 로 교체 후 동일 조건 rollout.
-                # scenario_sampling_seeds 는 scenario_id+rollout_idx 해시로 결정되므로
-                # 위 finetuned rollout 과 자동으로 같은 noise 를 사용합니다.
-                _orig_fd = self.encoder.agent_encoder.flow_decoder
-                self.encoder.agent_encoder.flow_decoder = self.ref_flow_decoder
-                try:
-                    ref_pred_traj, ref_pred_z, ref_pred_head = self._run_closed_loop_rollouts(
-                        data=data,
-                        tokenized_agent=tokenized_agent,
-                        map_feature=map_feature,
-                    )
-                finally:
-                    self.encoder.agent_encoder.flow_decoder = _orig_fd
-                self.ref_sim_agents_metrics.update_from_prediction_tensors(
-                    scenario_files=data["tfrecord_path"],
-                    agent_id=data["agent"]["id"],
-                    agent_batch=data["agent"]["batch"],
-                    pred_traj=ref_pred_traj,
-                    pred_z=ref_pred_z,
-                    pred_head=ref_pred_head,
-                )
-
     def on_validation_epoch_end(self):
         log_and_reset_wosac_distribution_metric(
             model=self,
@@ -3941,14 +2474,6 @@ class SMARTFlow(LightningModule):
                 metric_store=self.val_open_epoch_metrics,
             )
             for metric_name, metric_value in epoch_open_metrics.items():
-                self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
-
-        if self.projected_generator is not None:
-            epoch_proj_metrics = self._compute_and_reset_validation_metrics(
-                prefix="val_projected",
-                metric_store=self.val_projected_epoch_metrics,
-            )
-            for metric_name, metric_value in epoch_proj_metrics.items():
                 self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
 
         if self._final_proj_kin_projector is not None:
@@ -4009,30 +2534,6 @@ class SMARTFlow(LightningModule):
                 self.sim_agents_metrics.reset()
                 self.minADE.reset()
 
-                # ── ref model metrics + Δ RMM ─────────────────────────────
-                if self._ref_val_enabled and self.ref_sim_agents_metrics is not None:
-                    self.ref_sim_agents_metrics._drain_completed_futures(wait=True, drain_all=True)
-                    if torch.distributed.is_available() and torch.distributed.is_initialized():
-                        ref_state = self.ref_sim_agents_metrics.get_state_tensor(device=self.device)
-                        torch.distributed.all_reduce(ref_state)
-                        ref_epoch_metrics = self.ref_sim_agents_metrics.compute_from_state_tensor(ref_state)
-                    else:
-                        ref_epoch_metrics = self.ref_sim_agents_metrics.compute()
-                    ref_rmm_key = "val_ref/sim_agents_2025/realism_meta_metric"
-                    delta_rmm_key = "val_delta/sim_agents_2025/realism_meta_metric"
-                    ref_rmm = ref_epoch_metrics[ref_rmm_key]
-                    delta_rmm = closed_loop_metric - ref_rmm
-                    self.log(ref_rmm_key, ref_rmm, on_step=False, on_epoch=True, sync_dist=False)
-                    self.log(delta_rmm_key, delta_rmm, on_step=False, on_epoch=True, sync_dist=False)
-                    if self.global_rank == 0 and self.logger is not None:
-                        wandb_payload = dict(ref_epoch_metrics)
-                        wandb_payload[delta_rmm_key] = delta_rmm
-                        wandb_payload["epoch"] = (
-                            self.log_epoch if self.log_epoch >= 0 else self.current_epoch
-                        )
-                        self.logger.log_metrics(wandb_payload)
-                    self.ref_sim_agents_metrics.reset()
-
             if self.sim_agents_submission.is_active:
                 self.sim_agents_submission.save_sub_file()
 
@@ -4078,35 +2579,14 @@ class SMARTFlow(LightningModule):
                 )
             )
 
-        if (
-            self.finetune_config.enabled
-            and self.finetune_config.mode == "dice_ft"
-            and self.dice_critic is not None
-        ):
-            # DICE mode: two param groups in a single optimizer.
-            # • Group 0 (actor): flow_decoder — updated by L_actor gradient
-            # • Group 1 (critic): dice_critic — updated by L_critic gradient
-            # Gradients are disjoint by construction (see _run_dice_ft_step).
-            actor_params = [p for p in self.encoder.agent_encoder.flow_decoder.parameters() if p.requires_grad]
-            critic_params = list(self.dice_critic.parameters())
-            if not actor_params:
-                raise RuntimeError("dice_ft: no trainable actor (flow_decoder) parameters found.")
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": actor_params, "lr": self.lr},
-                    {"params": critic_params, "lr": self.finetune_config.dice_critic_lr},
-                ],
-                weight_decay=self.weight_decay,
-            )
-        else:
-            trainable_params = [p for p in self.parameters() if p.requires_grad]
-            if not trainable_params:
-                raise RuntimeError("No trainable parameters were found.")
-            optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=self.lr,
-                weight_decay=self.weight_decay,
-            )
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable parameters were found.")
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
 
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return {
@@ -4138,8 +2618,8 @@ class SMARTFlow(LightningModule):
         if not strict:
             return incompatible_keys
 
-        _allowed_missing = ("residual_velocity_head", "_rmm_ema_mean")
-        _allowed_unexpected = ("ref_flow_decoder", "_rmm_ema_mean")
+        _allowed_missing = ("residual_velocity_head",)
+        _allowed_unexpected = ("ref_flow_decoder",)
         missing_keys = [
             key
             for key in incompatible_keys.missing_keys
