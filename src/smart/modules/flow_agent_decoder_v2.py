@@ -1711,9 +1711,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         rollout_cache: Dict[str, object],
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
-        sampling_scheme: DictConfig,
+        sampling_scheme: DictConfig | None = None,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        max_steps: int | None = None,
+        # V1 SMARTFlow OCSC monitoring 이 같은 시그니처로 호출하기 때문에 받기만 하고
+        # V2 backbone 에서는 의미를 보장하지 않습니다 (silent no-op).
+        sampling_noise: DictConfig | None = None,
+        warm_coarse_steps: int = 0,
+        share_noise_across_time: bool = False,
+        noise_tape_override: torch.Tensor | None = None,
+        return_per_step_x1: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """평가와 제출에서 no-gradient closed-loop rollout을 실행합니다.
 
@@ -1721,18 +1729,60 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             rollout_cache: ``prepare_inference_cache`` 가 만든 초기 상태입니다.
             tokenized_agent: 평가용 토큰 사전입니다.
             map_feature: 지도 인코더 출력입니다.
-            sampling_scheme: flow sampling 설정입니다.
+            sampling_scheme: V2 본체 sampling 설정입니다. ``None`` 이면 ``sampling_noise``
+                를 같은 의미로 받습니다.
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            max_steps: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 평가 길이를 실행합니다.
+                V1 의 ``max_steps`` 와 같은 의미입니다.
+            sampling_noise: V1 alias 입니다. ``sampling_scheme`` 가 ``None`` 일 때 사용합니다.
+            warm_coarse_steps: V1 OCSC monitoring 호환을 위한 자리채움 입니다.
+                V2 backbone 에서는 효과가 없습니다.
+            share_noise_across_time: V1 OCSC monitoring 호환을 위한 자리채움 입니다.
+                V2 backbone 에서는 효과가 없습니다.
+            noise_tape_override: V1 OCSC monitoring 호환을 위한 자리채움 입니다.
+                V2 backbone 에서는 효과가 없습니다.
+            return_per_step_x1: V1 OCSC monitoring 호환을 위한 자리채움 입니다.
+                V2 backbone 에서는 효과가 없습니다.
 
         Returns:
             Dict[str, torch.Tensor]: closed-loop rollout 결과입니다.
         """
+        del warm_coarse_steps, share_noise_across_time, noise_tape_override, return_per_step_x1
+        if sampling_scheme is None:
+            sampling_scheme = sampling_noise
+        if sampling_scheme is None:
+            raise ValueError(
+                "V2 rollout_from_cache requires sampling_scheme or sampling_noise."
+            )
         return self._rollout_from_cache_impl(
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             sampling_scheme=sampling_scheme,
+            sampling_seed=sampling_seed,
+            scenario_sampling_seeds=scenario_sampling_seeds,
+            rollout_steps_2hz=max_steps,
+        )
+
+    @torch.no_grad()
+    def rollout_from_cache_no_grad(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        sampling_noise: DictConfig | None = None,
+        sampling_seed: int | None = None,
+        scenario_sampling_seeds: torch.Tensor | None = None,
+        sampling_scheme: DictConfig | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """V1 OCSC reference-rollout 호환 alias. ``rollout_from_cache`` 와 동일합니다."""
+        return self.rollout_from_cache(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
         )

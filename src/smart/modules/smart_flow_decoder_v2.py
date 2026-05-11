@@ -132,15 +132,48 @@ class SMARTFlowDecoder(nn.Module):
         rollout_cache: Dict[str, object],
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
-        sampling_scheme: DictConfig,
+        sampling_scheme: DictConfig | None = None,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
+        max_steps: int | None = None,
+        sampling_noise: DictConfig | None = None,
+        warm_coarse_steps: int = 0,
+        share_noise_across_time: bool = False,
+        noise_tape_override: Tensor | None = None,
+        return_per_step_x1: bool = False,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
+            sampling_seed=sampling_seed,
+            scenario_sampling_seeds=scenario_sampling_seeds,
+            max_steps=max_steps,
+            warm_coarse_steps=warm_coarse_steps,
+            share_noise_across_time=share_noise_across_time,
+            noise_tape_override=noise_tape_override,
+            return_per_step_x1=return_per_step_x1,
+        )
+
+    def rollout_from_cache_no_grad(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        sampling_noise: DictConfig | None = None,
+        sampling_seed: int | None = None,
+        scenario_sampling_seeds: Tensor | None = None,
+        sampling_scheme: DictConfig | None = None,
+    ) -> Dict[str, Tensor]:
+        """V1 OCSC reference-rollout 호환 alias. ``rollout_from_cache`` 와 동일합니다."""
+        return self.agent_encoder.rollout_from_cache_no_grad(
+            rollout_cache=rollout_cache,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            sampling_scheme=sampling_scheme,
+            sampling_noise=sampling_noise,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
         )
