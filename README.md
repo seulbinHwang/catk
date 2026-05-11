@@ -1335,7 +1335,7 @@ testsv testsvv testsvvv testsvvvv sv svv svvv svvvv
 - `trainer.num_nodes=8`, `trainer.devices=4` -> 총 32 DDP ranks
 - V100용 `trainer.precision=16-mixed`
 - `trainer.max_epochs=12`, `trainer.check_val_every_n_epoch=2`
-- `model.model_config.lr=1.0e-6`
+- `model.model_config.lr=5.0e-6`
 - `model.model_config.self_forced.estimator_warmup_epochs=0`
 - `model.model_config.self_forced.use_stop_motion=false`
 - `data.train_batch_size=2`, OOM 시 launcher가 OOM status를 즉시 공유해 모든 pod의 local `torchrun`과 남은 `task_name=...` 학습 rank를 정리하고 `2 -> 1` 순서로 함께 낮춤
@@ -1407,7 +1407,7 @@ scripts/launch_self_forced_a100x4x2_static_pods.py
 - 대상 pod: `testa testaa`
 - `trainer.num_nodes=2`, `trainer.devices=4` -> 총 8 DDP ranks
 - A100용 `trainer.precision=bf16-mixed`
-- `model.model_config.lr=1.0e-6`
+- `model.model_config.lr=5.0e-6`
 - `model.model_config.self_forced.estimator_warmup_epochs=1`
 - `model.model_config.self_forced.use_stop_motion=false`
 - `data.train_batch_size=22`, OOM 시 launcher가 모든 pod의 attempt status를 모아 `22 -> 20 -> 18 -> ...` 순서로 함께 낮춤
@@ -1460,12 +1460,18 @@ scripts/launch_self_forced_h100x4_wo_pvc_800.py
 - 대상 pod: `wo-pvc-800`
 - `trainer.num_nodes=1`, `trainer.devices=4` -> 총 4 DDP ranks
 - H100용 `trainer.precision=bf16-mixed`
-- `trainer.max_epochs=10`, `trainer.check_val_every_n_epoch=2`
-- `model.model_config.lr=1.0e-6`
-- `model.model_config.self_forced.estimator_warmup_epochs=4`
+- `trainer.max_epochs=4`, `trainer.check_val_every_n_epoch=2`
+- `model.model_config.lr=5.0e-6`
+- `model.model_config.scorer_scene_num=640`
+- `model.model_config.self_forced.distribution_matching_objective=dmd`
+- `model.model_config.self_forced.detach_block_transition=false`
+- `model.model_config.self_forced.estimator_warmup_epochs=1`
+- `model.model_config.self_forced.sampling.backprop_last_k=8`
+- `model.model_config.self_forced.use_anchor_flow_matching_loss=true`
+- `model.model_config.self_forced.anchor_weight=0.02`
 - `model.model_config.self_forced.use_stop_motion=false`
-- `data.train_batch_size=28`
-- OOM 시 launcher가 호출하는 retry wrapper가 `28 -> 26 -> 24 -> ...` 순서로 batch size를 낮춰 재시도
+- `data.train_batch_size=22`
+- OOM 시 launcher가 호출하는 retry wrapper가 `22 -> 20 -> 18 -> ...` 순서로 batch size를 낮춰 재시도
 
 pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
 
@@ -1494,7 +1500,27 @@ python scripts/launch_self_forced_h100x4_wo_pvc_800.py \
   --limit-train-batches 20 \
   --limit-val-batches 0 \
   --max-epochs 1 \
-  --task-name flow_self_forced_h100x4_wo_pvc_800_stopfalse_warmup4_lr1e-6_bs28_smoke
+  --task-name flow_self_forced_h100x4_wo_pvc_800_dmd_anchorfm_w002_backprop8_detachfalse_warmup1_lr5e-6_scorer640_bs22_smoke
+```
+
+anchor FM weight만 훑어보고 싶을 때는 sweep launcher를 사용합니다. 기본값은 `0.02 -> 0.06 -> 0.1 -> 0.2 -> 0.5` 순서이며, 각 weight는 서로 다른 task name으로 시작하므로 모두 같은 pretrained checkpoint에서 새 fine-tuning으로 출발합니다. 각 weight 내부에서 CUDA OOM이 나면 `22 -> 20 -> 18 -> ...` 순서로 batch size를 낮춰 해당 weight 실험만 resume합니다.
+
+```bash
+python scripts/launch_self_forced_h100x4_wo_pvc_800_anchor_weight_sweep.py --replace
+```
+
+기본 sweep session:
+
+```text
+catk-sf-h100x4-wo-pvc-800-anchor-sweep
+```
+
+weight 목록을 바꾸고 싶을 때:
+
+```bash
+python scripts/launch_self_forced_h100x4_wo_pvc_800_anchor_weight_sweep.py \
+  --replace \
+  --anchor-weights "0.02 0.06 0.1 0.2 0.5"
 ```
 
 attach:

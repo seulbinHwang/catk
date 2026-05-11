@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Launch self-forced H100x4 training in tmux on the existing wo-pvc-800 pod.
+"""Launch a sequential anchor-weight sweep on the existing wo-pvc-800 pod.
 
-This launcher never creates, deletes, or restarts pods. It only uses
-``kubectl exec`` to start or stop a tmux session inside the already-running
-pod. Use ``--dry-run`` to render the command without touching the pod.
+The launcher creates one tmux session inside the already-running pod and runs
+five self-forced fine-tuning jobs in order. It never creates, deletes, or
+restarts pods. Each anchor weight gets a distinct task name, so OOM retry
+resumes only within that weight and the next weight starts from the same
+pretrained checkpoint.
 """
 
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import shlex
 import subprocess
 
@@ -21,6 +24,9 @@ DEFAULT_BRANCH = "self_forcing_anchor_new"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "self_forced_npfm_h100x4_wo_pvc_800"
+DEFAULT_SESSION = "catk-sf-h100x4-wo-pvc-800-anchor-sweep"
+DEFAULT_TASK_PREFIX = "flow_self_forced_h100x4_wo_pvc_800_dmd_anchorfm"
+DEFAULT_ANCHOR_WEIGHTS = ("0.02", "0.06", "0.1", "0.2", "0.5")
 DEFAULT_WANDB_PRETRAIN_ARTIFACT = (
     "jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v64"
 )
@@ -32,34 +38,55 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
     "/workspace/flow_semi_continuous_pretrain_h100x4x2_bs26/"
     "v64/artifact"
 )
-DEFAULT_TASK_NAME = (
-    "flow_self_forced_h100x4_wo_pvc_800_"
-    "dmd_anchorfm_w002_backprop8_detachfalse_warmup1_lr5e-6_max4_scorer640_bs22"
-)
-DEFAULT_SESSION = "catk-sf-h100x4-wo-pvc-800"
 
 
 def shq(value: object) -> str:
     return shlex.quote(str(value))
 
 
-def run_kubectl(args: list[str], *, capture: bool = False) -> str:
-    result = subprocess.run(
-        ["kubectl", *args],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE if capture else None,
-    )
-    return result.stdout.strip() if capture else ""
+def run_kubectl(args: list[str]) -> None:
+    subprocess.run(["kubectl", *args], check=True, text=True)
 
 
 def export_line(name: str, value: object) -> str:
     return f"export {name}={shq(value)}"
 
 
+def parse_anchor_weights(value: str) -> list[str]:
+    raw_items = value.replace(",", " ").split()
+    if not raw_items:
+        raise argparse.ArgumentTypeError("at least one anchor weight is required")
+    weights: list[str] = []
+    for raw in raw_items:
+        try:
+            parsed = Decimal(raw)
+        except InvalidOperation as exc:
+            raise argparse.ArgumentTypeError(f"invalid anchor weight: {raw}") from exc
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("anchor weights must be positive")
+        weights.append(str(parsed.normalize()))
+    return weights
+
+
+def anchor_tag(weight: str) -> str:
+    scaled = int((Decimal(weight) * Decimal("100")).to_integral_value())
+    return f"w{scaled:03d}"
+
+
 def run_root(args: argparse.Namespace) -> str:
-    safe_task = args.task_name.replace("/", "_")
-    return f"{args.log_dir.rstrip('/')}/tmux_self_forced_h100x4_wo_pvc_800/{safe_task}"
+    return f"{args.log_dir.rstrip('/')}/tmux_self_forced_h100x4_wo_pvc_800_anchor_sweep"
+
+
+def render_monitor_script(interval: int, session: str) -> str:
+    return f"""#!/usr/bin/env bash
+set +e
+while true; do
+  echo
+  echo "[monitor] $(date '+%F %T') session={session} pod=$(hostname)"
+  nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null || true
+  sleep {int(interval)}
+done
+"""
 
 
 def render_env(args: argparse.Namespace) -> str:
@@ -68,7 +95,9 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("WANDB_PRETRAIN_ARTIFACT", args.wandb_pretrain_artifact),
         export_line("WANDB_PRETRAIN_DOWNLOAD_DIR", args.pretrain_download_dir),
         export_line("EXPERIMENT", args.experiment),
-        export_line("TASK_NAME", args.task_name),
+        export_line("TASK_PREFIX", args.task_prefix),
+        export_line("SWEEP_ID", args.sweep_id),
+        export_line("ANCHOR_WEIGHTS", " ".join(args.anchor_weights)),
         export_line("CACHE_ROOT", args.cache_root),
         export_line("CATK_LOG_DIR", args.log_dir),
         export_line("INITIAL_BS", args.initial_bs),
@@ -81,18 +110,15 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("DISTRIBUTION_MATCHING_OBJECTIVE", args.distribution_matching_objective),
         export_line("DETACH_BLOCK_TRANSITION", args.detach_block_transition),
         export_line("USE_ANCHOR_FLOW_MATCHING_LOSS", args.use_anchor_flow_matching_loss),
-        export_line("ANCHOR_WEIGHT", args.anchor_weight),
         export_line("ESTIMATOR_WARMUP_EPOCHS", args.estimator_warmup_epochs),
         export_line("SELF_FORCED_USE_STOP_MOTION", args.self_forced_use_stop_motion),
         export_line("BACKPROP_LAST_K", args.backprop_last_k),
+        export_line("MAX_EPOCHS", args.max_epochs),
+        export_line("CHECK_VAL_EVERY_N_EPOCH", args.check_val_every_n_epoch),
     ]
     optional = {
         "VAL_BATCH_SIZE": args.val_batch_size,
         "TEST_BATCH_SIZE": args.test_batch_size,
-        "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
-        "LIMIT_VAL_BATCHES": args.limit_val_batches,
-        "MAX_EPOCHS": args.max_epochs,
-        "CHECK_VAL_EVERY_N_EPOCH": args.check_val_every_n_epoch,
         "UNFROZEN_RANGE": args.unfrozen_range,
         "DECODER_USE_STOP_MOTION": args.decoder_use_stop_motion,
         "RANDOM_TERMINAL_SCOPE": args.random_terminal_scope,
@@ -105,7 +131,7 @@ def render_env(args: argparse.Namespace) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_worker_script(project_root: str, env_file: str) -> str:
+def render_worker_script(project_root: str, env_file: str, status_file: str) -> str:
     return f"""#!/usr/bin/env bash
 set +e
 export TERM="${{TERM:-xterm-256color}}"
@@ -128,19 +154,20 @@ set -a
 source {shq(env_file)}
 set +a
 
-echo "[self-forced-h100x4-wo-pvc-800] pod=$(hostname) task=${{TASK_NAME}}"
-echo "[self-forced-h100x4-wo-pvc-800] started at $(date '+%F %T')"
-echo "[self-forced-h100x4-wo-pvc-800] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}}"
-echo "[self-forced-h100x4-wo-pvc-800] lr=${{CATK_LR}} scorer_scene_num=${{SCORER_SCENE_NUM}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
-echo "[self-forced-h100x4-wo-pvc-800] objective=${{DISTRIBUTION_MATCHING_OBJECTIVE}} backprop_last_k=${{BACKPROP_LAST_K}} detach_block_transition=${{DETACH_BLOCK_TRANSITION}} anchor_fm=${{USE_ANCHOR_FLOW_MATCHING_LOSS}} anchor_weight=${{ANCHOR_WEIGHT}}"
-echo "[self-forced-h100x4-wo-pvc-800] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
-echo "[self-forced-h100x4-wo-pvc-800] pretrain_ckpt=${{PRETRAIN_CKPT}}"
-echo "[self-forced-h100x4-wo-pvc-800] attach survives after exit; press Ctrl-b d to detach"
+if [[ -z "${{SWEEP_ID:-}}" ]]; then
+  SWEEP_ID="$(date '+%Y%m%d_%H%M%S')"
+fi
+
+echo "[anchor-sweep] pod=$(hostname) sweep_id=${{SWEEP_ID}}"
+echo "[anchor-sweep] weights=${{ANCHOR_WEIGHTS}}"
+echo "[anchor-sweep] lr=${{CATK_LR}} max_epochs=${{MAX_EPOCHS}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}}"
+echo "[anchor-sweep] objective=${{DISTRIBUTION_MATCHING_OBJECTIVE}} backprop_last_k=${{BACKPROP_LAST_K}} detach_block_transition=${{DETACH_BLOCK_TRANSITION}}"
+echo "[anchor-sweep] scorer_scene_num=${{SCORER_SCENE_NUM}} pretrain_ckpt=${{PRETRAIN_CKPT}}"
 echo
 
 ensure_pretrain_checkpoint() {{
   if [[ -f "$PRETRAIN_CKPT" ]]; then
-    echo "[self-forced-h100x4-wo-pvc-800] using cached pretrain checkpoint: $PRETRAIN_CKPT"
+    echo "[anchor-sweep] using cached pretrain checkpoint: $PRETRAIN_CKPT"
     return 0
   fi
 
@@ -148,7 +175,7 @@ ensure_pretrain_checkpoint() {{
   lock_dir="${{PRETRAIN_CKPT}}.download.lock"
 
   if mkdir "$lock_dir" 2>/dev/null; then
-    echo "[self-forced-h100x4-wo-pvc-800] downloading W&B artifact: $WANDB_PRETRAIN_ARTIFACT"
+    echo "[anchor-sweep] downloading W&B artifact: $WANDB_PRETRAIN_ARTIFACT"
     python - <<'PY'
 import glob
 import os
@@ -193,61 +220,96 @@ PY
     status=$?
     rm -rf "$lock_dir"
     if (( status != 0 )); then
-      echo "[self-forced-h100x4-wo-pvc-800] W&B artifact download failed with status $status" >&2
+      echo "[anchor-sweep] W&B artifact download failed with status $status" >&2
       return "$status"
     fi
   else
-    echo "[self-forced-h100x4-wo-pvc-800] waiting for checkpoint download lock: $lock_dir"
+    echo "[anchor-sweep] waiting for checkpoint download lock: $lock_dir"
     for _ in $(seq 1 180); do
       if [[ -f "$PRETRAIN_CKPT" ]]; then
-        echo "[self-forced-h100x4-wo-pvc-800] checkpoint appeared: $PRETRAIN_CKPT"
+        echo "[anchor-sweep] checkpoint appeared: $PRETRAIN_CKPT"
         return 0
       fi
       sleep 10
     done
-    echo "[self-forced-h100x4-wo-pvc-800] timed out waiting for $PRETRAIN_CKPT" >&2
+    echo "[anchor-sweep] timed out waiting for $PRETRAIN_CKPT" >&2
     return 4
   fi
 
   test -f "$PRETRAIN_CKPT"
 }}
 
+weight_tag() {{
+  python - "$1" <<'PY'
+from decimal import Decimal
+import sys
+
+value = Decimal(sys.argv[1])
+print(f"w{{int((value * Decimal('100')).to_integral_value()):03d}}")
+PY
+}}
+
+run_one_weight() {{
+  local weight="$1"
+  local tag
+  tag="$(weight_tag "$weight")"
+  local task_name="${{TASK_PREFIX}}_${{SWEEP_ID}}_${{tag}}_backprop8_detachfalse_warmup1_lr5e-6_max4_scorer640_bs22"
+
+  echo
+  echo "================================================================"
+  echo "[anchor-sweep] starting anchor_weight=${{weight}} task=${{task_name}}"
+  echo "================================================================"
+
+  export TASK_NAME="$task_name"
+  export ANCHOR_WEIGHT="$weight"
+  bash scripts/self_forced_h100_4_with_oom_retry.sh
+  local status=$?
+
+  printf '%s\\t%s\\t%s\\t%s\\n' "$(date '+%F %T')" "$weight" "$status" "$task_name" >> {shq(status_file)}
+  if (( status != 0 )); then
+    echo "[anchor-sweep] failed at anchor_weight=${{weight}} with status $status"
+    return "$status"
+  fi
+  echo "[anchor-sweep] completed anchor_weight=${{weight}} task=${{task_name}}"
+  return 0
+}}
+
 ensure_pretrain_checkpoint
 status=$?
 if (( status != 0 )); then
-  echo "[self-forced-h100x4-wo-pvc-800] checkpoint preparation failed with status $status"
-  echo "[self-forced-h100x4-wo-pvc-800] leaving shell open for inspection"
+  echo "[anchor-sweep] checkpoint preparation failed with status $status"
+  echo "[anchor-sweep] leaving shell open for inspection"
   exec bash
 fi
 
-bash scripts/self_forced_h100_4_with_oom_retry.sh
-status=$?
+: > {shq(status_file)}
+for weight in $ANCHOR_WEIGHTS; do
+  run_one_weight "$weight"
+  status=$?
+  if (( status != 0 )); then
+    echo
+    echo "[anchor-sweep] stopped early. Status file: {status_file}"
+    echo "[anchor-sweep] leaving shell open for inspection"
+    exec bash
+  fi
+done
 
 echo
-echo "[self-forced-h100x4-wo-pvc-800] exited with status $status at $(date '+%F %T')"
-echo "[self-forced-h100x4-wo-pvc-800] leaving shell open for inspection"
+echo "[anchor-sweep] all anchor-weight experiments completed successfully."
+echo "[anchor-sweep] status file: {status_file}"
+cat {shq(status_file)}
+echo "[anchor-sweep] leaving shell open for inspection"
 exec bash
-"""
-
-
-def render_monitor_script(interval: int, task_name: str) -> str:
-    return f"""#!/usr/bin/env bash
-set +e
-while true; do
-  echo
-  echo "[monitor] $(date '+%F %T') task={task_name} pod=$(hostname)"
-  nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null || true
-  sleep {int(interval)}
-done
 """
 
 
 def render_start_command(args: argparse.Namespace) -> str:
     root = run_root(args)
-    env_file = f"{root}/{args.pod}.env"
-    worker_file = f"{root}/{args.pod}_worker.sh"
-    monitor_file = f"{root}/{args.pod}_monitor.sh"
-    tmux_log = f"{root}/{args.pod}.tmux.log"
+    env_file = f"{root}/{args.pod}.anchor_sweep.env"
+    worker_file = f"{root}/{args.pod}_anchor_sweep_worker.sh"
+    monitor_file = f"{root}/{args.pod}_anchor_sweep_monitor.sh"
+    status_file = f"{root}/{args.pod}_anchor_sweep_status.tsv"
+    tmux_log = f"{root}/{args.pod}.anchor_sweep.tmux.log"
 
     pull_block = ""
     if args.pull:
@@ -284,7 +346,7 @@ fi
     if not args.no_monitor_pane:
         monitor_block = f"""
 cat > {shq(monitor_file)} <<'CATK_MONITOR'
-{render_monitor_script(args.monitor_interval, args.task_name).rstrip()}
+{render_monitor_script(args.monitor_interval, args.session).rstrip()}
 CATK_MONITOR
 chmod +x {shq(monitor_file)}
 tmux split-window -v -l 12 -t {shq(args.session)} {shq(monitor_file)}
@@ -304,7 +366,7 @@ cat > {shq(env_file)} <<'CATK_ENV'
 {render_env(args).rstrip()}
 CATK_ENV
 cat > {shq(worker_file)} <<'CATK_WORKER'
-{render_worker_script(args.project_root, env_file).rstrip()}
+{render_worker_script(args.project_root, env_file, status_file).rstrip()}
 CATK_WORKER
 chmod +x {shq(worker_file)}
 : > {shq(tmux_log)}
@@ -313,6 +375,7 @@ tmux pipe-pane -t {shq(args.session)} -o {shq('cat >> ' + shq(tmux_log))}
 {monitor_block}
 echo "[launcher] started {args.session} on {args.pod}"
 echo "[launcher] tmux log: {tmux_log}"
+echo "[launcher] status file: {status_file}"
 """
 
 
@@ -348,7 +411,7 @@ def exec_in_pod(args: argparse.Namespace, script: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch H100x4 self-forced training on the existing wo-pvc-800 pod.",
+        description="Launch a sequential anchor-weight sweep on wo-pvc-800.",
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--pod", default=DEFAULT_POD)
@@ -359,12 +422,14 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(pull=True)
     parser.add_argument("--cache-root", default=DEFAULT_CACHE_ROOT)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
+    parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
+    parser.add_argument("--task-prefix", default=DEFAULT_TASK_PREFIX)
+    parser.add_argument("--session", default=DEFAULT_SESSION)
+    parser.add_argument("--sweep-id", default="")
+    parser.add_argument("--anchor-weights", type=parse_anchor_weights, default=list(DEFAULT_ANCHOR_WEIGHTS))
     parser.add_argument("--wandb-pretrain-artifact", default=DEFAULT_WANDB_PRETRAIN_ARTIFACT)
     parser.add_argument("--pretrain-ckpt", default=DEFAULT_PRETRAIN_CKPT)
     parser.add_argument("--pretrain-download-dir", default=DEFAULT_PRETRAIN_DOWNLOAD_DIR)
-    parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
-    parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
-    parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3")
     parser.add_argument("--nproc-per-node", type=int, default=4)
     parser.add_argument("--initial-bs", type=int, default=22)
@@ -372,8 +437,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--val-batch-size", default="")
     parser.add_argument("--test-batch-size", default="")
-    parser.add_argument("--limit-train-batches", default="")
-    parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--max-epochs", default="4")
     parser.add_argument("--check-val-every-n-epoch", default="2")
     parser.add_argument("--learning-rate", default="5.0e-6")
@@ -381,7 +444,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distribution-matching-objective", default="dmd", choices=("dmd", "sid"))
     parser.add_argument("--detach-block-transition", default="false")
     parser.add_argument("--use-anchor-flow-matching-loss", default="true")
-    parser.add_argument("--anchor-weight", default="0.02")
     parser.add_argument("--estimator-warmup-epochs", default="1")
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="")
@@ -400,7 +462,7 @@ def parse_args() -> argparse.Namespace:
     if args.stop:
         return args
     if args.nproc_per_node != 4:
-        parser.error("--nproc-per-node must be 4 for the H100x4 preset")
+        parser.error("--nproc-per-node must be 4 for the H100x4 pod")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
     if args.oom_step < 1:
@@ -417,12 +479,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--decoder-use-stop-motion must be empty, 'true', or 'false'")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
-    if not args.pretrain_ckpt:
-        parser.error("--pretrain-ckpt must not be empty unless --stop is set")
-    if not args.wandb_pretrain_artifact:
-        parser.error("--wandb-pretrain-artifact must not be empty unless --stop is set")
-    if not args.pretrain_download_dir:
-        parser.error("--pretrain-download-dir must not be empty unless --stop is set")
     return args
 
 
@@ -432,13 +488,12 @@ def main() -> None:
         exec_in_pod(args, render_stop_command(args.session))
         return
 
-    print(f"[launcher] pod:       {args.pod}")
-    print(f"[launcher] task_name: {args.task_name}")
-    print(f"[launcher] session:   {args.session}")
-    print(f"[launcher] experiment:{args.experiment}")
-    print(f"[launcher] artifact:  {args.wandb_pretrain_artifact}")
-    print(f"[launcher] ckpt path: {args.pretrain_ckpt}")
-    print(f"[launcher] bs fallback: {args.initial_bs}->{args.min_bs} step {args.oom_step}")
+    print(f"[launcher] pod:            {args.pod}")
+    print(f"[launcher] session:        {args.session}")
+    print(f"[launcher] experiment:     {args.experiment}")
+    print(f"[launcher] anchor_weights: {' '.join(args.anchor_weights)}")
+    print(f"[launcher] bs fallback:    {args.initial_bs}->{args.min_bs} step {args.oom_step}")
+    print(f"[launcher] lr/max_epochs:  {args.learning_rate} / {args.max_epochs}")
 
     exec_in_pod(args, render_start_command(args))
 

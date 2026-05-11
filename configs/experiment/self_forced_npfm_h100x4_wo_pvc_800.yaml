@@ -10,11 +10,17 @@
 # Main experiment points:
 #   * Single-node DDP: trainer.num_nodes=1, trainer.devices=4
 #   * H100 precision: bf16-mixed
-#   * Generator lr: 1e-6
-#   * trainer.max_epochs=10, trainer.check_val_every_n_epoch=2
-#   * self_forced.estimator_warmup_epochs=4
+#   * Generator lr: 5e-6
+#   * trainer.max_epochs=4, trainer.check_val_every_n_epoch=2
+#   * self_forced.distribution_matching_objective=dmd
+#   * self_forced.detach_block_transition=false
+#   * self_forced.estimator_warmup_epochs=1
+#   * self_forced.sampling.backprop_last_k=8
+#   * self_forced.use_anchor_flow_matching_loss=true
+#   * self_forced.anchor_weight=0.02 by default; use the sweep launcher to try several weights.
 #   * self_forced.use_stop_motion=false for the training self-rollout
-#   * data.train_batch_size=28
+#   * scorer_scene_num=640 for fit-time closed-loop RMM
+#   * data.train_batch_size=22
 # ============================================================================
 
 defaults:
@@ -25,15 +31,22 @@ trainer:
   num_nodes: 1
   devices: 4
   precision: bf16-mixed
-  max_epochs: 10
+  max_epochs: 4
   check_val_every_n_epoch: 2
 
 model:
   model_config:
-    lr: 1.0e-6
+    lr: 5.0e-6
+    scorer_scene_num: 640
     self_forced:
+      distribution_matching_objective: dmd
+      detach_block_transition: false
+      anchor_weight: 0.02
+      use_anchor_flow_matching_loss: true
       use_stop_motion: false
       estimator_warmup_epochs: 1
+      sampling:
+        backprop_last_k: 8
 
 data:
   train_batch_size: 22

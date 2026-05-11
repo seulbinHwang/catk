@@ -28,6 +28,13 @@
 #   NPROC_PER_NODE=4
 #   EXPERIMENT=self_forced_npfm_h100_4
 #   CATK_LR=                     Optional Generator learning-rate override.
+#   SCORER_SCENE_NUM=            Optional fit-time closed-loop scorer scene target.
+#   DISTRIBUTION_MATCHING_OBJECTIVE=
+#                                  Optional self-forced objective override: dmd or sid.
+#   DETACH_BLOCK_TRANSITION=      Optional rollout block detach override: true or false.
+#   USE_ANCHOR_FLOW_MATCHING_LOSS=
+#                                  Optional anchor FM loss gate override: true or false.
+#   ANCHOR_WEIGHT=                Optional anchor FM loss weight override.
 #   ESTIMATOR_WARMUP_EPOCHS=     Optional self-forced warmup override.
 #   SELF_FORCED_USE_STOP_MOTION= Optional training rollout stop-motion gate.
 #   DECODER_USE_STOP_MOTION=     Optional validation/test inference gate.
@@ -92,6 +99,21 @@ if [[ -n "${CHECK_VAL_EVERY_N_EPOCH:-}" ]]; then
 fi
 if [[ -n "${CATK_LR:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.lr=${CATK_LR}")
+fi
+if [[ -n "${SCORER_SCENE_NUM:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.scorer_scene_num=${SCORER_SCENE_NUM}")
+fi
+if [[ -n "${DISTRIBUTION_MATCHING_OBJECTIVE:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.distribution_matching_objective=${DISTRIBUTION_MATCHING_OBJECTIVE}")
+fi
+if [[ -n "${DETACH_BLOCK_TRANSITION:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.detach_block_transition=${DETACH_BLOCK_TRANSITION}")
+fi
+if [[ -n "${USE_ANCHOR_FLOW_MATCHING_LOSS:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.use_anchor_flow_matching_loss=${USE_ANCHOR_FLOW_MATCHING_LOSS}")
+fi
+if [[ -n "${ANCHOR_WEIGHT:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.anchor_weight=${ANCHOR_WEIGHT}")
 fi
 if [[ -n "${ESTIMATOR_WARMUP_EPOCHS:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}")
