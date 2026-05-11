@@ -47,6 +47,9 @@ class FinetuneConfig:
         ocsc_fm_reg_lambda: GT FM regularization 가중치 (0 이면 비활성).
         ocsc_gt_target: True → OL sample 대신 GT 궤적을 target 으로 사용.
         ocsc_gt_resolution: "2hz" (기본, tokenized 2Hz GT) 또는 "10hz" (raw 10Hz).
+        ocsc_ol_resolution: OL target / CL prediction 시간 해상도.
+            "10hz" (기본, native fine 20 step) 또는 "2hz" (fine→2Hz coarse 다운샘플).
+            OL 분기 (ocsc_gt_target=False) 전용. GT 분기는 ocsc_gt_resolution 사용.
         ocsc_nearest_include_gt: True → nearest-match candidate pool 에 GT 1 개 추가.
     """
 
@@ -82,6 +85,7 @@ class FinetuneConfig:
     ocsc_fm_reg_lambda: float = 0.0
     ocsc_gt_target: bool = False
     ocsc_gt_resolution: str = "2hz"
+    ocsc_ol_resolution: str = "10hz"
     ocsc_nearest_include_gt: bool = False
     #: True → OCSC active_mask 를 main training 과 동일하게 강화 (current_valid AND
     #: future pred_max_steps_raw*shift fine step 모두 valid). 부분 invalid agent
@@ -157,6 +161,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_fm_reg_lambda=float(_read_config_value(finetune, "ocsc_fm_reg_lambda", 0.0)),
         ocsc_gt_target=bool(_read_config_value(finetune, "ocsc_gt_target", False)),
         ocsc_gt_resolution=str(_read_config_value(finetune, "ocsc_gt_resolution", "2hz")),
+        ocsc_ol_resolution=str(_read_config_value(finetune, "ocsc_ol_resolution", "10hz")),
         ocsc_nearest_include_gt=bool(_read_config_value(finetune, "ocsc_nearest_include_gt", False)),
         ocsc_strict_active_mask=bool(_read_config_value(finetune, "ocsc_strict_active_mask", False)),
     )

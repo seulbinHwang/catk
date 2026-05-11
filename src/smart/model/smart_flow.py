@@ -1324,6 +1324,17 @@ class SMARTFlow(LightningModule):
             )
             gt_resolution = "2hz"
         gt_is_10hz = (gt_resolution == "10hz")
+        # OL target 분기 (use_gt_target=False) 의 시간 해상도.
+        # "10hz" (default, 기존 동작): OL native fine 20 step ↔ CL native fine 10Hz.
+        # "2hz": OL 출력을 4::5 로 2Hz coarse 다운샘플 ↔ CL 도 _cl_downsample_to_2hz 적용.
+        # GT 분기는 ocsc_gt_resolution 사용. 두 토글 독립.
+        ol_resolution = str(getattr(self.finetune_config, "ocsc_ol_resolution", "10hz")).lower()
+        if ol_resolution not in ("2hz", "10hz"):
+            log.warning(
+                f"[ocsc_ft] unknown ocsc_ol_resolution={ol_resolution!r}, falling back to '10hz'."
+            )
+            ol_resolution = "10hz"
+        ol_is_2hz = (ol_resolution == "2hz")
         # nearest_match candidate pool 에 GT 1 개 포함 (always raw 10Hz GT).
         _nearest_include_gt = bool(getattr(self.finetune_config, "ocsc_nearest_include_gt", False))
         if _nearest_include_gt and not _nearest_match:
@@ -1541,6 +1552,18 @@ class SMARTFlow(LightningModule):
             cl_head_2hz = cl_head[:, _shift - 1 :: _shift][:, :T_target]    # [n, T_2hz]
             return cl_xy_2hz, cl_head_2hz
 
+        def _ol_downsample_to_2hz(ol_norm: Tensor, T_target: int) -> Tensor:
+            """OL native 10Hz fine [n, 20, 4] → 2Hz coarse [n, T_target, 4].
+
+            OL 출력은 이미 anchor-frame normalized 라 좌표 변환 없이 시간 축만 slice.
+            CL 의 _cl_downsample_to_2hz 와 동일한 4::5 규칙으로 +0.5s, +1.0s, ... 추출.
+            """
+            return ol_norm[:, _shift - 1 :: _shift, :][:, :T_target]
+
+        # OL-path suffix slicer 선택: ol_is_2hz=True 면 2Hz tail, 아니면 fine 10Hz tail.
+        # (GT-path 는 별도로 gt_is_10hz 분기 그대로 사용.)
+        _ol_slice_fn = _slice_consistency_suffix_2hz if ol_is_2hz else _slice_consistency_suffix
+
         # ── 3+4. Anchor-sequential loop: OL → CL → loss → backward → free ────
         # 한 anchor씩 처리 후 즉시 backward하여 모든 anchor의 캐시/OL/CL을 동시에
         # 메모리에 올리지 않는다. 피크 메모리 = O(G), anchor 수에 무관.
@@ -1747,15 +1770,31 @@ class SMARTFlow(LightningModule):
                     if _use_ref:
                         _agent_enc.flow_decoder = _orig_fd
 
-                    # nearest_include_gt: candidate pool 에 raw 10Hz GT 1 개 추가.
+                    # ol_is_2hz: OL native fine 20 step → 2Hz coarse 다운샘플.
+                    # GT-2hz 분기와 동일하게 4::5 규칙. CL 도 아래에서 _cl_downsample_to_2hz 로 매칭.
+                    if ol_is_2hz:
+                        _T_ol_2hz = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+                        ol_norms = [_ol_downsample_to_2hz(o, _T_ol_2hz) for o in ol_norms]
+
+                    # nearest_include_gt: candidate pool 에 GT 1 개 추가.
+                    # OL 이 2Hz coarse 면 GT 후보도 2Hz tokenized GT 로 일관 매칭.
+                    # OL 이 10Hz fine 이면 GT 후보는 기존대로 raw 10Hz GT.
                     if _nearest_include_gt:
-                        _T_gt_inc = (pred_max_steps_raw if pred_max_steps_raw > 0 else 4) * _shift
-                        _anchor_now_10hz_inc = (anchor_idx + 1) * _shift
-                        _gt_start_inc = _anchor_now_10hz_inc + 1
-                        _gt_end_inc = _gt_start_inc + _T_gt_inc
-                        _gt_pos_inc  = data["agent"]["position"][active_mask, _gt_start_inc:_gt_end_inc, :2]
-                        _gt_head_inc = data["agent"]["heading"][active_mask, _gt_start_inc:_gt_end_inc]
-                        _gt_valid_inc = data["agent"]["valid_mask"][active_mask, _gt_start_inc:_gt_end_inc]
+                        if ol_is_2hz:
+                            _T_gt_inc = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+                            _gt_start_inc = anchor_idx + 1
+                            _gt_end_inc = _gt_start_inc + _T_gt_inc
+                            _gt_pos_inc  = tokenized_agent["gt_pos"][active_mask, _gt_start_inc:_gt_end_inc, :]
+                            _gt_head_inc = tokenized_agent["gt_heading"][active_mask, _gt_start_inc:_gt_end_inc]
+                            _gt_valid_inc = tokenized_agent["valid_mask"][active_mask, _gt_start_inc:_gt_end_inc]
+                        else:
+                            _T_gt_inc = (pred_max_steps_raw if pred_max_steps_raw > 0 else 4) * _shift
+                            _anchor_now_10hz_inc = (anchor_idx + 1) * _shift
+                            _gt_start_inc = _anchor_now_10hz_inc + 1
+                            _gt_end_inc = _gt_start_inc + _T_gt_inc
+                            _gt_pos_inc  = data["agent"]["position"][active_mask, _gt_start_inc:_gt_end_inc, :2]
+                            _gt_head_inc = data["agent"]["heading"][active_mask, _gt_start_inc:_gt_end_inc]
+                            _gt_valid_inc = data["agent"]["valid_mask"][active_mask, _gt_start_inc:_gt_end_inc]
                         if _gt_pos_inc.shape[1] > 0 and bool(_gt_valid_inc.any()):
                             gt_norm_anchor_inc = _cl_to_norm(
                                 _gt_pos_inc, _gt_head_inc, current_pos_active, current_head_active,
@@ -1806,12 +1845,21 @@ class SMARTFlow(LightningModule):
                                     _cl_norm_det = _cl_to_norm(_xy_d, _hd_d, current_pos_active, current_head_active)
                                     _cl_norm_det = _slice_consistency_suffix_2hz(_cl_norm_det)
                                 else:
-                                    _cl_norm_det = _cl_to_norm(
-                                        _traj_d[active_mask, 0, :_T_d, :],
-                                        _head_d[active_mask, 0, :_T_d],
-                                        current_pos_active, current_head_active,
-                                    )
-                                    _cl_norm_det = _slice_consistency_suffix(_cl_norm_det)
+                                    if ol_is_2hz:
+                                        _T_ol_2hz = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+                                        _xy_d, _hd_d = _cl_downsample_to_2hz(
+                                            _traj_d[active_mask, 0, :_T_d, :],
+                                            _head_d[active_mask, 0, :_T_d],
+                                            _T_ol_2hz,
+                                        )
+                                        _cl_norm_det = _cl_to_norm(_xy_d, _hd_d, current_pos_active, current_head_active)
+                                    else:
+                                        _cl_norm_det = _cl_to_norm(
+                                            _traj_d[active_mask, 0, :_T_d, :],
+                                            _head_d[active_mask, 0, :_T_d],
+                                            current_pos_active, current_head_active,
+                                        )
+                                    _cl_norm_det = _ol_slice_fn(_cl_norm_det)
                                 cl_norms_det.append(_cl_norm_det)
                                 del _traj_d, _head_d
 
@@ -1834,7 +1882,7 @@ class SMARTFlow(LightningModule):
                             total_loss_accum += _mmd_log.item()
                             del _mmd_log, _gt_stack
                         else:
-                            _ol_det = [_slice_consistency_suffix(o.detach()) for o in ol_norms]
+                            _ol_det = [_ol_slice_fn(o.detach()) for o in ol_norms]
                             _ol_ref_list = _ol_det
                             sigma_sq_seq = mmd_precompute_sigma_sq(
                                 _ol_det, cl_norms_det,
@@ -1878,8 +1926,13 @@ class SMARTFlow(LightningModule):
                             _gt_slice_pass2 = _slice_consistency_suffix_2hz(gt_norm_anchor)
                             _gt_valid_slice = _slice_valid_suffix_2hz(gt_valid_anchor)
                         else:
-                            cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
-                            cl_norm_g = _slice_consistency_suffix(cl_norm_g)
+                            if ol_is_2hz:
+                                _T_ol_2hz = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+                                _xy_2hz, _hd_2hz = _cl_downsample_to_2hz(cl_xy_g, cl_head_g, _T_ol_2hz)
+                                cl_norm_g = _cl_to_norm(_xy_2hz, _hd_2hz, current_pos_active, current_head_active)
+                            else:
+                                cl_norm_g = _cl_to_norm(cl_xy_g, cl_head_g, current_pos_active, current_head_active)
+                            cl_norm_g = _ol_slice_fn(cl_norm_g)
 
                         if _do_seq_mmd:
                             # (proxy_g / n_anchors).backward() summed over g = ∂(mean_anchor MMD²)/∂θ
@@ -1903,7 +1956,7 @@ class SMARTFlow(LightningModule):
                             _ol_idx = 0 if _shared_ol else g
                             loss_g = _consistency_loss(
                                 cl_norm_g,
-                                _slice_consistency_suffix(ol_norms[_ol_idx]),
+                                _ol_slice_fn(ol_norms[_ol_idx]),
                             )
                             total_loss_accum += loss_g.item()
                             (loss_g / (n_anchors_total * G)).backward()
@@ -1927,17 +1980,26 @@ class SMARTFlow(LightningModule):
                         pred_traj_all.register_hook(_make_norm_clip_hook(_grad_clip))
                     T_cl = pred_traj_all.shape[-2]
                     cl_norms: list[Tensor] = []
+                    # CL 다운샘플 필요 조건:
+                    #   - GT 분기 + 2Hz GT (use_gt_target=True, gt_is_10hz=False)
+                    #   - OL 분기 + 2Hz OL  (use_gt_target=False, ol_is_2hz=True)
+                    # 그 외 (GT-10Hz, OL-10Hz) 는 CL 도 native fine.
+                    _need_2hz_cl = (use_gt_target and not gt_is_10hz) or (
+                        (not use_gt_target) and ol_is_2hz
+                    )
+                    _T_cl_2hz = _T_gt if use_gt_target else (
+                        pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+                    )
                     for g in range(G):
-                        if use_gt_target and not gt_is_10hz:
-                            # 2Hz GT mode: CL 을 2Hz 로 다운샘플
+                        if _need_2hz_cl:
                             _xy_2hz, _hd_2hz = _cl_downsample_to_2hz(
                                 pred_traj_all[active_mask, g, :T_cl, :],
                                 pred_head_all[active_mask, g, :T_cl],
-                                _T_gt,
+                                _T_cl_2hz,
                             )
                             cl_norms.append(_cl_to_norm(_xy_2hz, _hd_2hz, current_pos_active, current_head_active))
                         else:
-                            # OL mode 또는 10Hz GT mode: CL 은 native fine 10Hz
+                            # OL-10Hz 또는 GT-10Hz mode: CL 은 native fine 10Hz
                             cl_norms.append(_cl_to_norm(
                                 pred_traj_all[active_mask, g, :T_cl, :],
                                 pred_head_all[active_mask, g, :T_cl],
@@ -1972,21 +2034,21 @@ class SMARTFlow(LightningModule):
                                 for g in range(G)
                             ]).mean()
                     elif use_mmd and G >= 2:
-                        T_min = min(T_cl, ol_norms[0].shape[-2])
+                        T_min = min(cl_norms[0].shape[-2], ol_norms[0].shape[-2])
                         cl_stack = torch.stack(cl_norms, dim=0)[:, :, :T_min, :]
                         ol_stack = torch.stack(ol_norms, dim=0)[:, :, :T_min, :].detach()
-                        cl_stack = _slice_consistency_suffix(cl_stack)
-                        ol_stack = _slice_consistency_suffix(ol_stack)
+                        cl_stack = _ol_slice_fn(cl_stack)
+                        ol_stack = _ol_slice_fn(ol_stack)
                         anchor_loss = mmd_from_stacked(
                             cl_stack, ol_stack,
                             pos_weight=pos_w, heading_weight=heading_w,
                         )
                     else:
-                        cl_sliced_pl = [_slice_consistency_suffix(cl_norms[g]) for g in range(G)]
+                        cl_sliced_pl = [_ol_slice_fn(cl_norms[g]) for g in range(G)]
                         if _nearest_match:
                             # 각 CL g 에 대해 M_ol 개 OL (+ optionally 1 GT) 중
                             # per-anchor flat L2 거리 최소를 선택.
-                            ol_sliced_pl = [_slice_consistency_suffix(ol_norms[m]) for m in range(M_ol)]
+                            ol_sliced_pl = [_ol_slice_fn(ol_norms[m]) for m in range(M_ol)]
                             T_min_nm = min(cl_sliced_pl[0].shape[-2], ol_sliced_pl[0].shape[-2])
                             _use_gt_cand = (
                                 _nearest_include_gt
@@ -1994,7 +2056,7 @@ class SMARTFlow(LightningModule):
                                 and gt_valid_anchor_inc is not None
                             )
                             if _use_gt_cand:
-                                gt_sliced_nm = _slice_consistency_suffix(gt_norm_anchor_inc)
+                                gt_sliced_nm = _ol_slice_fn(gt_norm_anchor_inc)
                                 T_min_nm = min(T_min_nm, gt_sliced_nm.shape[-2])
                             with torch.no_grad():
                                 cl_stk_nm = torch.stack(
@@ -2043,7 +2105,7 @@ class SMARTFlow(LightningModule):
                             anchor_loss = torch.stack([
                                 _consistency_loss(
                                     cl_sliced_pl[g],
-                                    _slice_consistency_suffix(ol_norms[0 if _shared_ol else g]),
+                                    _ol_slice_fn(ol_norms[0 if _shared_ol else g]),
                                 )
                                 for g in range(G)
                             ]).mean()

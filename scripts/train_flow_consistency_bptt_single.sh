@@ -165,6 +165,10 @@ OCSC_GT_TARGET="${OCSC_GT_TARGET:-false}"
 # GT target resolution: "2hz" (기존 동작, tokenized_agent["gt_pos"] 의 2Hz slice + CL 도 2Hz 다운샘플)
 # 또는 "10hz" (raw data["agent"]["position"] 의 fine 10Hz + CL/OL native fine 그대로).
 OCSC_GT_RESOLUTION="${OCSC_GT_RESOLUTION:-2hz}"
+# OL target resolution (ocsc_gt_target=false 일 때만 효과):
+#   "10hz" (기존, OL native fine 20 step + CL native fine)
+#   "2hz"  (OL 4::5 다운샘플 + CL 도 _cl_downsample_to_2hz). nearest_match 의 GT 후보도 2hz tokenized GT 로 일관.
+OCSC_OL_RESOLUTION="${OCSC_OL_RESOLUTION:-10hz}"
 # nearest_match candidate pool 에 raw 10Hz GT 1 개 추가.
 # 각 CL g 가 [M_ol OL + 1 GT] 중 argmin paired L2 target 선택.
 # ocsc_ol_nearest_match=true 와 함께 써야 함 (단독 활성 시 자동 비활성).
@@ -266,7 +270,7 @@ echo "NPROC=${NPROC_PER_NODE} TRAIN_B=${TRAIN_B} MAX_EPOCHS=${MAX_EPOCHS} LIMIT_
 echo "SEED=${SEED} DATA_SHUFFLE=${DATA_SHUFFLE} DETERMINISTIC=${TRAINER_DETERMINISTIC}"
 echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_TARGET=${OCSC_TARGET_MAX_STEPS}cs OCSC_PRED=${OCSC_PRED_MAX_STEPS}cs"
 echo "OCSC_HEADING_WEIGHT=${OCSC_HEADING_WEIGHT} OCSC_POSITION_WEIGHT=${OCSC_POSITION_WEIGHT} OCSC_REL_DISP_WEIGHT=${OCSC_REL_DISP_WEIGHT}"
-echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA} OCSC_GT_TARGET=${OCSC_GT_TARGET}"
+echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA} OCSC_GT_TARGET=${OCSC_GT_TARGET} OCSC_GT_RES=${OCSC_GT_RESOLUTION} OCSC_OL_RES=${OCSC_OL_RESOLUTION}"
 echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_GRAD_CLIP=${BPTT_GRAD_CLIP_TRAJ} LR=${LR}"
 echo "OMP=${OMP_NUM_THREADS} MKL=${MKL_NUM_THREADS} NUM_WORKERS=${NUM_WORKERS} WOSAC_HARD_POOL=${WOSAC_HARD_POOL_WORKERS} WOSAC_REAL_POOL=${WOSAC_REAL_POOL_WORKERS} WOSAC_VERIFY=${WOSAC_VERIFY}"
@@ -337,6 +341,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_eval_hard_rmm_interval="${OCSC_EVAL_HARD_RMM_INTERVAL}" \
   model.model_config.finetune.ocsc_gt_target="${OCSC_GT_TARGET}" \
   model.model_config.finetune.ocsc_gt_resolution="${OCSC_GT_RESOLUTION}" \
+  model.model_config.finetune.ocsc_ol_resolution="${OCSC_OL_RESOLUTION}" \
   model.model_config.finetune.ocsc_nearest_include_gt="${OCSC_NEAREST_INCLUDE_GT}" \
   model.model_config.finetune.ocsc_strict_active_mask="${OCSC_STRICT_ACTIVE_MASK}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \

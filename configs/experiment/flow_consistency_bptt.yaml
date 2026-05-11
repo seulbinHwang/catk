@@ -78,7 +78,11 @@ model:
       ocsc_gt_target: false
       # GT target resolution: "2hz" (기존, tokenized_agent["gt_pos"]) | "10hz" (raw data["agent"]["position"])
       ocsc_gt_resolution: "2hz"
-      # nearest_match candidate pool 에 raw 10Hz GT 1 개 포함 (ocsc_ol_nearest_match=true 와 함께)
+      # OL target resolution (ocsc_gt_target=false 일 때만 의미):
+      #   "10hz" (기존, OL native fine 20 step + CL native fine) | "2hz" (OL 4::5 다운샘플 + CL 도 2hz)
+      ocsc_ol_resolution: "10hz"
+      # nearest_match candidate pool 에 GT 1 개 포함 (ocsc_ol_nearest_match=true 와 함께).
+      # ol_resolution=2hz 면 GT 후보도 자동으로 2hz tokenized GT 사용.
       ocsc_nearest_include_gt: false
       # Strict active_mask: future fine step 모두 valid 인 agent 만 OCSC anchor 사용
       # (main training 과 일관). 부분 invalid agent 의 hallucination self-consistency 방지.
