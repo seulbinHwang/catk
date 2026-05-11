@@ -55,8 +55,8 @@ model_config:
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
-    # V2 default: euler solver 32 step (V1 은 midpoint 4 step)
-    flow_solver_steps: 32
+    # Launcher 가 16 euler 로 override 하므로 yaml default 도 동일하게 맞춥니다.
+    flow_solver_steps: 16
     flow_solver_method: euler
     flow_solver_eps: 1.0e-3
     # V2 신규 토글들
