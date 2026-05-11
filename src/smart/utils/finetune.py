@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -12,178 +12,71 @@ log = RankedLogger(__name__, rank_zero_only=True)
 
 @dataclass(frozen=True)
 class FinetuneConfig:
-    """Adjoint Matching fine-tuning 설정을 한곳에 모읍니다.
+    """OCSC (Open-Closed Self-Consistency) fine-tuning 설정을 한곳에 모읍니다.
 
     Attributes:
         enabled: fine-tuning 분기를 켤지 나타냅니다.
-        mode: 현재 지원하는 fine-tuning 방식 이름입니다.
-        rollout_steps: adjoint_matching / terminal_cost 등 **Flow ODE 시간 이산화**에만 사용됩니다
-            (``[eps,1]`` 구간 등분). ``rmm_bptt_ft`` closed-loop 길이에는 쓰이지 않습니다.
-        rollout_noise_scale: 초기 Gaussian 잡음 크기입니다.
-        feasible_weight: terminal feasible cost 가중치입니다.
-        smooth_deadzone_epsilon: 정규화 gap dead-zone 크기입니다.
-        smooth_deadzone_tau: smooth dead-zone의 매끈한 정도입니다.
+        mode: 현재 지원하는 fine-tuning 방식 이름입니다. ``"ocsc_ft"`` 만 허용합니다.
+        flow_velocity_head_only: True 면 ``HierarchicalFlowDecoder.velocity_head`` 만
+            학습 (트렁크·residual 동결).
+        bptt_use_adjoint: Flow ODE generate() 안의 model_fn 호출을
+            ``torch.utils.checkpoint`` 으로 감쌉니다 (BPTT adjoint method).
+        bptt_last_n_solver_steps: Flow ODE solver 의 마지막 N step 에만 gradient 를
+            흘립니다 (0 이하 = 모든 step).
+        bptt_grad_clip_traj: pred_traj / pred_head_traj 에서 역전파되는 gradient
+            L2 norm 의 상한 (0 이하 = 비활성).
+        bptt_debug: True → ``_compute_soft_rmm`` 류에서 극값/likelihood WARNING.
+        bptt_last_coarse_only: True → ``ocsc_pred_max_steps - 1`` coarse step 을
+            no_grad warm-up 으로 처리하고 마지막 1 coarse step 만 gradient 를 흘립니다.
+            ⚠ LR 민감 (lr=5e-6 + last_coarse_only=true 가 RMM 폭락 사례 있음).
+
+        ocsc_n_rollouts: G — 시나리오당 closed-loop rollout 수.
+        ocsc_n_ol_rollouts: M — open-loop sample 개수. ``-1`` 이면 G 와 동일.
+            M > G 또는 nearest_match 면 ``ocsc_use_mmd`` 자동 False.
+        ocsc_ol_nearest_match: 각 CL rollout g 에 대해 M 개 OL 중 argmin paired L2 target.
+        ocsc_loss_type: "l2" | "smooth_l1" | "l1".
+        ocsc_use_mmd: True → MMD². False → rollout 별 paired L2.
+        ocsc_use_pretrained_ref: True → frozen pretrained ref decoder 로 OL 생성.
+        ocsc_target_max_steps: open-loop target rollout 에서 실행할 coarse step 수.
+        ocsc_pred_max_steps: closed-loop prediction rollout 에서 실행할 coarse step 수.
+        ocsc_heading_weight: heading channel L2 가중치 (sin/cos).
+        ocsc_position_weight: position channel L2 가중치.
+        ocsc_rel_disp_weight: 상대변위 (delta-pos) L2 가중치 (paired L2 전용).
+        ocsc_eval_hard_rmm: 매 training step 에서 hard RMM 계산 후 로깅.
+        ocsc_eval_hard_rmm_interval: hard RMM 평가 주기 (N training step 마다 1 회).
+        ocsc_fm_reg_lambda: GT FM regularization 가중치 (0 이면 비활성).
+        ocsc_gt_target: True → OL sample 대신 GT 궤적을 target 으로 사용.
+        ocsc_gt_resolution: "2hz" (기본, tokenized 2Hz GT) 또는 "10hz" (raw 10Hz).
+        ocsc_nearest_include_gt: True → nearest-match candidate pool 에 GT 1 개 추가.
     """
 
     enabled: bool = False
-    mode: str = "adjoint_matching"
-    rollout_steps: int = 4
-    rollout_noise_scale: float = 1.0
-    feasible_weight: float = 1.0
-    smooth_deadzone_epsilon: tuple[float, float, float] = (0.01, 0.01, 0.01)
-    smooth_deadzone_tau: float = 0.002
-    flow_reg_lambda: float = 0.0
-    reward_huber_beta: float = 0.05
-    # ── DICE / IQ-Learn ────────────────────────────────────────────────────
-    dice_critic_hidden: int = 256
-    dice_action_hidden: int = 128
-    dice_critic_lr: float = 3e-4
-    dice_critic_updates_per_actor: int = 1
-    dice_reward_enabled: bool = False
-    dice_reward_weight: float = 1.0
-    dice_bc_lambda: float = 0.0
-    # ── Flow-DPO ──────────────────────────────────────────────────────────────
-    dpo_beta: float = 0.1
-    dpo_n_samples: int = 8
-    dpo_use_ref_model: bool = True
-    dpo_bc_lambda: float = 0.0
-    # ── Flow-EPG ──────────────────────────────────────────────────────────────
-    epg_n_rollouts: int = 4            # G: number of rollouts per scenario
-    epg_beta: float = 0.1             # KL regularisation weight β
-    epg_n_samples: int = 8            # MC samples for ELBO log-prob estimation
-    epg_use_ref_model: bool = True    # True → use frozen pretrained as reference
-    epg_bc_lambda: float = 0.0        # optional BC regularization weight
-    epg_ppo_epochs: int = 1           # K gradient steps per RMM evaluation (PPO-style)
-    epg_head_only: bool = False       # True → only train residual_velocity_head (frozen trunk)
-    #: G==1일 때만: RMM에서 뺄 baseline(스칼라). None이면 그룹 평균(=단일 rollout이면 R)을 쓰고
-    #: 표준편차는 1로 두어 NaN을 피함 → advantage는 0. float를 주면 (R−baseline)/1 로 정규화.
-    epg_single_rollout_baseline: float | None = None
-    # ── Flow-RWR ──────────────────────────────────────────────────────────────
-    rwr_n_rollouts: int = 4          # G: rollouts per scenario
-    rwr_beta: float = 0.1            # temperature β for exp(R/β) weighting
-    rwr_n_samples: int = 8           # MC samples for FM log-prob (ELBO)
-    rwr_anchor_discount: float = 1.0  # γ: temporal discount per anchor step (1=uniform)
-    rwr_head_only: bool = False      # True → only residual_velocity_head trained
-    # ── RMM-BPTT ───────────────────────────────────────────────────────────────
-    bptt_n_rollouts: int = 2
-    rmm_bptt_use_ref_model: bool = False
-    #: True → ``HierarchicalFlowDecoder.velocity_head`` 만 학습 (트렁크·residual 동결).
-    #: ``flow_epg_ft``/``flow_rwr_ft`` 의 ``*_head_only``(residual 전용)보다 우선하지 않음.
+    mode: str = "ocsc_ft"
+    # ── 공통 BPTT 토글 (OCSC 에서 ODE solver / closed-loop rollout 제어) ───────
     flow_velocity_head_only: bool = True
-    #: True → Flow ODE generate() 안의 model_fn 호출을 torch.utils.checkpoint으로 감쌈.
-    #: Neural ODE adjoint method의 이산 버전: forward 시 내부 활성화를 저장하지 않고
-    #: backward 시 재연산. O(solver_steps × activation) 메모리를 O(activation)으로 줄임.
     bptt_use_adjoint: bool = False
-    #: Flow ODE solver 의 마지막 N step 에만 gradient 를 흘립니다.
-    #: 0 이하면 비활성 (모든 solver step 이 gradient 를 받음).
-    #: 활성 시 FlowODE.last_n_grad_solver_steps = bptt_last_n_solver_steps 로 설정.
-    #: 예: solver_steps=4, bptt_last_n_solver_steps=2 → 앞 2 step no_grad+detach, 뒤 2 step gradient.
     bptt_last_n_solver_steps: int = 0
-    #: ``rmm_bptt_ft`` 전용: 실행할 **coarse step** 개수. ``None`` 또는 0 이하면
-    #: ``n_step_future_2hz`` 전부 (보통 16). 양수면 그만큼만 rollout 후 **그 구간 전체** soft RMM·역전파.
-    #: (truncated BPTT detach는 사용하지 않음.)
-    bptt_max_coarse_steps: Optional[int] = None
-    #: pred_traj / pred_head_traj 에서 역전파되는 gradient L2 norm 의 상한.
-    #: 0 이하면 비활성. element-wise clamp 가 아닌 norm clip 이므로 방향을 유지하면서 크기만 제한.
     bptt_grad_clip_traj: float = 1.0
-    #: True → _compute_soft_rmm 에서 sim_features 극값과 per-metric likelihood 를 WARNING 로 출력.
     bptt_debug: bool = False
-    #: True → G rollout 을 병렬 배치 expand 대신 순차로 실행한 뒤 각각 즉시 backward.
-    #: 피크 메모리를 약 G 배 줄이는 대신 G 배 더 느려짐. precision=32-true 에서만 안전.
-    bptt_sequential_rollouts: bool = True
-    #: 앞 N coarse step 을 no_grad 로 실행 후 상태를 detach 해 sliding-window BPTT 를 구현합니다.
-    #: 0 이하면 비활성 (모든 coarse step 이 gradient 를 받음).
-    #: 예: bptt_max_coarse_steps=16, bptt_warm_coarse_steps=12 → 마지막 4 step 만 gradient.
-    bptt_warm_coarse_steps: int = 0
-    #: 마지막 N coarse step 에만 gradient 를 흘립니다 (``bptt_warm_coarse_steps`` 의 역수 표현).
-    #: 0 이하면 비활성. 활성화 시 ``bptt_warm_coarse_steps`` 를
-    #: ``max(bptt_warm_coarse_steps, bptt_max_coarse_steps - bptt_last_n_coarse_steps)`` 로 override.
-    #: 예: bptt_max_coarse_steps=16, bptt_last_n_coarse_steps=4 → warm_coarse=12 → 마지막 4 step gradient.
-    bptt_last_n_coarse_steps: int = 0
-    #: True → ``ocsc_pred_max_steps - 1`` coarse step 을 no_grad warm-up 으로 처리하고
-    #: 마지막 1 coarse step 만 gradient 흘림.  ``warm_coarse = pred_max_steps - 1`` 로 override.
-    #: 이전엔 schema 누락으로 silently False 였음 (origin/OCSC_clean 도 동일 버그).
     bptt_last_coarse_only: bool = False
-    #: True → training step 마다 pretrained ref 를 G rollout no_grad 로 돌려
-    #: ``train/rmm_ref`` 와 ``train/rmm_delta`` (= finetuned − pretrained) 를 로깅.
-    #: step 당 ∼1배 추가 시간 (no_grad 이므로 grad rollout 보다 빠름).
-    rmm_bptt_ref_train: bool = False
-    #: True → validation 시 pretrained ref model 도 closed-loop rollout 해 ``val_ref/rmm`` 과
-    #: ``val_delta/rmm`` (= finetuned − pretrained) 을 로깅. flow_decoder 를 ref 로 교체 후
-    #: no_grad rollout 이므로 validation 시간 ≈ 2배. noise 는 scenario_id+rollout_idx 해시로
-    #: 결정되므로 finetuned rollout 과 자동으로 동일한 noise 를 씁니다.
-    rmm_bptt_ref_val: bool = False
-    # ── OCSC (Open-Closed Self-Consistency) ───────────────────────────────────────
-    #: G: 시나리오당 closed-loop rollout 수. rmm_bptt_ft 의 bptt_n_rollouts 와 동일 개념.
+    # ── OCSC (Open-Closed Self-Consistency) ───────────────────────────────────
     ocsc_n_rollouts: int = 2
-    #: M: open-loop sample 개수. ``-1`` (기본) 이면 ``ocsc_n_rollouts`` (= G) 와 동일 (paired).
-    #: 1 이면 모든 CL rollout 이 단일 OL sample 과 paired L2 비교 (single-OL broadcast).
-    #: M > G 도 허용; nearest-match (``ocsc_ol_nearest_match=True``) 와 함께 쓰면 각 CL g 에 대해
-    #: M 개 OL 중 L2 최소를 골라 paired L2 target 으로 삼는다.
-    #: ``ocsc_use_mmd=True`` 와 함께 ``M < G`` 면 distribution 정의 불가 — 자동으로 False 강제.
     ocsc_n_ol_rollouts: int = -1
-    #: True → 각 CL rollout g 에 대해 M 개 OL sample 중 per-anchor flat L2 거리 최소
-    #: (argmin) 를 골라 paired L2 target 으로 사용. ``ocsc_use_mmd`` 자동 False 강제.
-    #: M < G 면 의미 없음 (자동으로 비활성).
     ocsc_ol_nearest_match: bool = False
-    #: 일관성 loss 종류. "l2" (MSE), "smooth_l1", "l1" 중 하나.
     ocsc_loss_type: str = "l2"
-    #: True → OCSC consistency를 proper MMD^2로 계산. False → rollout별 pairwise loss.
     ocsc_use_mmd: bool = True
-    #: True → frozen pretrained model 로 open-loop target 생성.
-    #: False → current policy 로 생성 (학습 중 target 도 변함).
     ocsc_use_pretrained_ref: bool = False
-    #: open-loop target rollout 에서 실행할 coarse step 수 (0 이하 = 전체 16).
-    #: 1 coarse step = 0.5s × 5 fine steps = 2.5s; 4 coarse step ≈ 2s.
     ocsc_target_max_steps: int = 4
-    #: closed-loop prediction rollout 에서 실행할 coarse step 수 (0 이하 = 전체 16).
     ocsc_pred_max_steps: int = 4
-    #: heading 일관성 loss 가중치. 0 이면 비활성 (position 만).
-    #: heading 은 sin/cos 표현으로 각도 wrap 문제를 회피합니다.
     ocsc_heading_weight: float = 0.0
-    #: 위치(position x/y) 일관성 loss 가중치. 0 이면 position matching 비활성.
     ocsc_position_weight: float = 1.0
-    #: 상대변위(연속 10Hz step 간 delta position) 일관성 loss 가중치.
-    #: 0 이면 비활성. 값이 클수록 절대 위치보다 이동 패턴 정렬을 더 강하게 학습합니다.
     ocsc_rel_disp_weight: float = 0.0
-    #: True → 매 training step 에서 closed-loop rollout 으로 hard RMM 을 계산해 로깅.
-    #: 공식 Wosac metric 이 아닌 PyTorch 인-프로세스 HardRMM (빠름).
-    #: CONFIGURABLE: eval_hard_rmm_interval 로 빈도 조절.
     ocsc_eval_hard_rmm: bool = True
-    #: hard RMM 평가 빈도 (N training step 마다 1 회). 1 = 매 step.
     ocsc_eval_hard_rmm_interval: int = 1
-    #: GT FM regularization 가중치. 0 이면 비활성 (MMD only).
     ocsc_fm_reg_lambda: float = 0.0
-    #: True → open-loop sample 대신 GT 궤적을 target으로 사용.
-    #: CL 예측은 2Hz로 다운샘플 후 GT(2Hz)와 비교.
-    #: ocsc_use_mmd=True면 MMD²(P_CL, delta_GT), False면 masked L2.
     ocsc_gt_target: bool = False
-    #: OCSC GT target 의 시간 해상도. "2hz" (기본, tokenized_agent["gt_pos"] 의 2Hz slice 사용,
-    #: CL 도 2Hz 다운샘플 후 비교) 또는 "10hz" (data["agent"]["position"] 의 raw 10Hz 사용,
-    #: CL/OL 도 native fine 10Hz 그대로 비교 — downsample 없음).
-    #: ``ocsc_gt_target=True`` 분기와 ``ocsc_nearest_include_gt=True`` 분기 양쪽에서 의미.
     ocsc_gt_resolution: str = "2hz"
-    #: True → OCSC nearest-match (M_ol > G + ``ocsc_ol_nearest_match=True``) 의 candidate
-    #: pool 에 GT 1 개를 추가해, 각 CL g 가 ``[M_ol OL samples + 1 GT]`` 중 argmin paired L2
-    #: target 을 선택하게 한다. argmin 이 OL 이면 ``_consistency_loss``, GT 이면
-    #: ``_consistency_loss_gt`` (valid mask 적용) 로 backprop.
-    #: GT 거리는 mask 적용 sum (invalid step 제외). ``ocsc_nearest_include_gt=True`` 가 활성이면
-    #: ``ocsc_ol_nearest_match=True`` 이어야 한다 (아니면 자동 비활성).
     ocsc_nearest_include_gt: bool = False
-    # ── Ref-NLL fine-tuning ────────────────────────────────────────────────────
-    #: G: 시나리오당 closed-loop rollout 수.
-    ref_nll_n_rollouts: int = 2
-    #: 실행할 coarse step 수 (1 step = 0.5s; 4 steps = 2s).
-    ref_nll_pred_max_steps: int = 4
-    #: Hutchinson 발산 추정 횟수 (1 = 빠름·편향 없음, >1 = 더 낮은 분산).
-    ref_nll_n_hutch_samples: int = 1
-    #: True → Hutchinson VJP 에 create_graph 를 사용해 발산 항의 gradient 도 흘림.
-    #: False (기본) → 발산 항은 detach 된 상수로 처리 (선형 근사; 훨씬 빠름).
-    ref_nll_use_full_div_grad: bool = False
-    #: GT flow-matching regularization 가중치. 0 이면 비활성.
-    ref_nll_fm_reg_lambda: float = 0.0
-    #: 전체 loss 에 곱하는 스케일 인수.
-    ref_nll_loss_scale: float = 1.0
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -223,66 +116,15 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
     if finetune is None:
         return FinetuneConfig(enabled=False)
 
-    epsilon = _read_config_value(finetune, "smooth_deadzone_epsilon", (0.01, 0.01, 0.01))
-    epsilon_tuple = tuple(float(v) for v in epsilon)
-    if len(epsilon_tuple) != 3:
-        raise ValueError(
-            "smooth_deadzone_epsilon must contain exactly 3 values for [vx, vy, omega]."
-        )
-
-    epg_srb_raw = _read_config_value(finetune, "epg_single_rollout_baseline", None)
-    epg_single_rollout_baseline = float(epg_srb_raw) if epg_srb_raw is not None else None
-
-    _bptt_max_cs_raw = _read_config_value(finetune, "bptt_max_coarse_steps", None)
-
     return FinetuneConfig(
         enabled=bool(_read_config_value(finetune, "enabled", True)),
-        mode=str(_read_config_value(finetune, "mode", "adjoint_matching")),
-        rollout_steps=int(_read_config_value(finetune, "rollout_steps", 4)),
-        rollout_noise_scale=float(_read_config_value(finetune, "rollout_noise_scale", 1.0)),
-        feasible_weight=float(_read_config_value(finetune, "feasible_weight", 1.0)),
-        smooth_deadzone_epsilon=epsilon_tuple,
-        smooth_deadzone_tau=float(_read_config_value(finetune, "smooth_deadzone_tau", 0.002)),
-        flow_reg_lambda=float(_read_config_value(finetune, "flow_reg_lambda", 0.0)),
-        reward_huber_beta=float(_read_config_value(finetune, "reward_huber_beta", 0.05)),
-        dice_critic_hidden=int(_read_config_value(finetune, "dice_critic_hidden", 256)),
-        dice_action_hidden=int(_read_config_value(finetune, "dice_action_hidden", 128)),
-        dice_critic_lr=float(_read_config_value(finetune, "dice_critic_lr", 3e-4)),
-        dice_critic_updates_per_actor=int(_read_config_value(finetune, "dice_critic_updates_per_actor", 1)),
-        dice_reward_enabled=bool(_read_config_value(finetune, "dice_reward_enabled", False)),
-        dice_reward_weight=float(_read_config_value(finetune, "dice_reward_weight", 1.0)),
-        dice_bc_lambda=float(_read_config_value(finetune, "dice_bc_lambda", 0.0)),
-        dpo_beta=float(_read_config_value(finetune, "dpo_beta", 0.1)),
-        dpo_n_samples=int(_read_config_value(finetune, "dpo_n_samples", 8)),
-        dpo_use_ref_model=bool(_read_config_value(finetune, "dpo_use_ref_model", True)),
-        dpo_bc_lambda=float(_read_config_value(finetune, "dpo_bc_lambda", 0.0)),
-        epg_n_rollouts=int(_read_config_value(finetune, "epg_n_rollouts", 4)),
-        epg_beta=float(_read_config_value(finetune, "epg_beta", 0.1)),
-        epg_n_samples=int(_read_config_value(finetune, "epg_n_samples", 8)),
-        epg_use_ref_model=bool(_read_config_value(finetune, "epg_use_ref_model", True)),
-        epg_bc_lambda=float(_read_config_value(finetune, "epg_bc_lambda", 0.0)),
-        epg_ppo_epochs=int(_read_config_value(finetune, "epg_ppo_epochs", 1)),
-        epg_head_only=bool(_read_config_value(finetune, "epg_head_only", False)),
-        epg_single_rollout_baseline=epg_single_rollout_baseline,
-        rwr_n_rollouts=int(_read_config_value(finetune, "rwr_n_rollouts", 4)),
-        rwr_beta=float(_read_config_value(finetune, "rwr_beta", 0.1)),
-        rwr_n_samples=int(_read_config_value(finetune, "rwr_n_samples", 8)),
-        rwr_anchor_discount=float(_read_config_value(finetune, "rwr_anchor_discount", 1.0)),
-        rwr_head_only=bool(_read_config_value(finetune, "rwr_head_only", False)),
-        bptt_n_rollouts=int(_read_config_value(finetune, "bptt_n_rollouts", 2)),
-        rmm_bptt_use_ref_model=bool(_read_config_value(finetune, "rmm_bptt_use_ref_model", False)),
+        mode=str(_read_config_value(finetune, "mode", "ocsc_ft")),
         flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
         bptt_use_adjoint=bool(_read_config_value(finetune, "bptt_use_adjoint", False)),
         bptt_last_n_solver_steps=int(_read_config_value(finetune, "bptt_last_n_solver_steps", 0)),
-        bptt_max_coarse_steps=None if _bptt_max_cs_raw is None else int(_bptt_max_cs_raw),
         bptt_grad_clip_traj=float(_read_config_value(finetune, "bptt_grad_clip_traj", 1.0)),
         bptt_debug=bool(_read_config_value(finetune, "bptt_debug", False)),
-        bptt_sequential_rollouts=bool(_read_config_value(finetune, "bptt_sequential_rollouts", True)),
-        bptt_warm_coarse_steps=int(_read_config_value(finetune, "bptt_warm_coarse_steps", 0)),
-        bptt_last_n_coarse_steps=int(_read_config_value(finetune, "bptt_last_n_coarse_steps", 0)),
         bptt_last_coarse_only=bool(_read_config_value(finetune, "bptt_last_coarse_only", False)),
-        rmm_bptt_ref_train=bool(_read_config_value(finetune, "rmm_bptt_ref_train", False)),
-        rmm_bptt_ref_val=bool(_read_config_value(finetune, "rmm_bptt_ref_val", False)),
         ocsc_n_rollouts=int(_read_config_value(finetune, "ocsc_n_rollouts", 2)),
         ocsc_n_ol_rollouts=int(_read_config_value(finetune, "ocsc_n_ol_rollouts", -1)),
         ocsc_ol_nearest_match=bool(_read_config_value(finetune, "ocsc_ol_nearest_match", False)),
@@ -300,12 +142,6 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_gt_target=bool(_read_config_value(finetune, "ocsc_gt_target", False)),
         ocsc_gt_resolution=str(_read_config_value(finetune, "ocsc_gt_resolution", "2hz")),
         ocsc_nearest_include_gt=bool(_read_config_value(finetune, "ocsc_nearest_include_gt", False)),
-        ref_nll_n_rollouts=int(_read_config_value(finetune, "ref_nll_n_rollouts", 2)),
-        ref_nll_pred_max_steps=int(_read_config_value(finetune, "ref_nll_pred_max_steps", 4)),
-        ref_nll_n_hutch_samples=int(_read_config_value(finetune, "ref_nll_n_hutch_samples", 1)),
-        ref_nll_use_full_div_grad=bool(_read_config_value(finetune, "ref_nll_use_full_div_grad", False)),
-        ref_nll_fm_reg_lambda=float(_read_config_value(finetune, "ref_nll_fm_reg_lambda", 0.0)),
-        ref_nll_loss_scale=float(_read_config_value(finetune, "ref_nll_loss_scale", 1.0)),
     )
 
 
@@ -355,19 +191,10 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             )
         return config
 
-    if config.mode not in {
-        "adjoint_matching",
-        "terminal_cost_final_step",
-        "terminal_cost_full_grad",
-        "kinematic_proj_ft",    # ODE generate → KinematicProjection → FM target
-        "kinematic_reward_ft",  # ODE full-grad → KinematicProjection as reward → reward grad
-        "flow_epg_ft",          # Flow-EPG: Exact Policy Gradient with ELBO + RMM reward
-        "flow_rwr_ft",          # Flow-RWR: Reward-Weighted Regression with GPU RMM
-        "rmm_bptt_ft",          # RMM-BPTT: differentiable soft RMM through closed-loop rollout
-        "ocsc_ft",              # OCSC: Open-Closed Self-Consistency fine-tuning
-        "ref_nll_ft",           # Ref-NLL: CL generation maximises log p under frozen ref model
-    }:
-        raise ValueError(f"Unsupported finetune mode: {config.mode}")
+    if config.mode != "ocsc_ft":
+        raise ValueError(
+            f"Unsupported finetune mode: {config.mode}. Only 'ocsc_ft' is supported."
+        )
 
     # 전체 모델 freeze 후 flow_decoder만 unfreeze
     _set_requires_grad(model, False)
@@ -378,25 +205,6 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             "Finetuning enabled but flow_decoder not found. "
             "Use the flow-based model (e.g., SMARTFlow) or fix the model config."
         )
-
-    # ── head_only: residual_velocity_head만 학습 (트렁크 완전 동결) ──────────
-    is_epg_head_only = (config.mode == "flow_epg_ft" and config.epg_head_only)
-    is_rwr_head_only = (config.mode == "flow_rwr_ft" and config.rwr_head_only)
-    if is_epg_head_only or is_rwr_head_only:
-        if residual_head is None:
-            raise AttributeError(
-                "epg_head_only=True requires residual_velocity_head in flow_decoder."
-            )
-        # residual head only: zero-init + unfreeze only that head
-        for p in residual_head.parameters():
-            p.data.zero_()
-        _set_requires_grad(residual_head, True)
-        mode_tag = "EPG" if is_epg_head_only else "RWR"
-        log.info(
-            f"{mode_tag} head-only mode: flow_decoder trunk frozen, "
-            "only residual_velocity_head is trainable (zero-initialized)."
-        )
-        return config
 
     # ── velocity_head만 학습 (트렁크·residual 동결) ─────────────────────────
     if config.flow_velocity_head_only:
