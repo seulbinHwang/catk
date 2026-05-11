@@ -163,6 +163,13 @@ OCSC_EVAL_HARD_RMM_INTERVAL="${OCSC_EVAL_HARD_RMM_INTERVAL:-10}"
 # GT target: true → open-loop sample 대신 GT 궤적을 consistency target으로 사용.
 # CL 예측을 2Hz로 다운샘플 후 GT와 비교 (ocsc_use_mmd에 따라 MMD 또는 masked L2).
 OCSC_GT_TARGET="${OCSC_GT_TARGET:-true}"
+# GT target resolution: "2hz" (기존 동작, tokenized_agent["gt_pos"] 의 2Hz slice + CL 도 2Hz 다운샘플)
+# 또는 "10hz" (raw data["agent"]["position"] 의 fine 10Hz + CL/OL native fine 그대로).
+OCSC_GT_RESOLUTION="${OCSC_GT_RESOLUTION:-2hz}"
+# nearest_match candidate pool 에 raw 10Hz GT 1 개 추가.
+# 각 CL g 가 [M_ol OL + 1 GT] 중 argmin paired L2 target 선택.
+# ocsc_ol_nearest_match=true 와 함께 써야 함 (단독 활성 시 자동 비활성).
+OCSC_NEAREST_INCLUDE_GT="${OCSC_NEAREST_INCLUDE_GT:-false}"
 
 # ── BPTT tricks ────────────────────────────────────────────────────────────
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
@@ -330,6 +337,8 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_eval_hard_rmm="${OCSC_EVAL_HARD_RMM}" \
   model.model_config.finetune.ocsc_eval_hard_rmm_interval="${OCSC_EVAL_HARD_RMM_INTERVAL}" \
   model.model_config.finetune.ocsc_gt_target="${OCSC_GT_TARGET}" \
+  model.model_config.finetune.ocsc_gt_resolution="${OCSC_GT_RESOLUTION}" \
+  model.model_config.finetune.ocsc_nearest_include_gt="${OCSC_NEAREST_INCLUDE_GT}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \

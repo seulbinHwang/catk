@@ -1845,6 +1845,27 @@ class SMARTFlow(LightningModule):
         # ocsc_gt_target=True: open-loop sample 대신 GT 궤적을 target으로 사용.
         # CL 예측을 2Hz로 다운샘플 후 GT(2Hz)와 비교.
         use_gt_target = bool(getattr(self.finetune_config, "ocsc_gt_target", False))
+        # GT resolution: "2hz" (default, 기존) | "10hz" (raw fine 10Hz GT, no downsample).
+        gt_resolution = str(getattr(self.finetune_config, "ocsc_gt_resolution", "2hz")).lower()
+        if gt_resolution not in ("2hz", "10hz"):
+            log.warning(
+                f"[ocsc_ft] unknown ocsc_gt_resolution={gt_resolution!r}, falling back to '2hz'."
+            )
+            gt_resolution = "2hz"
+        gt_is_10hz = (gt_resolution == "10hz")
+        # nearest_match candidate pool 에 GT 1 개 포함 (always raw 10Hz GT).
+        _nearest_include_gt = bool(getattr(self.finetune_config, "ocsc_nearest_include_gt", False))
+        if _nearest_include_gt and not _nearest_match:
+            log.warning(
+                "[ocsc_ft] ocsc_nearest_include_gt=True 인데 nearest_match 비활성: include_gt 자동 비활성."
+            )
+            _nearest_include_gt = False
+        if _nearest_include_gt and use_gt_target:
+            log.warning(
+                "[ocsc_ft] ocsc_nearest_include_gt=True + ocsc_gt_target=True 중복: "
+                "use_gt_target 만 활성 (include_gt 무시)."
+            )
+            _nearest_include_gt = False
         heading_w = float(getattr(self.finetune_config, "ocsc_heading_weight", 0.0))
         pos_w = float(getattr(self.finetune_config, "ocsc_position_weight", 1.0))
         rel_disp_w = float(getattr(self.finetune_config, "ocsc_rel_disp_weight", 0.0))
@@ -2115,16 +2136,33 @@ class SMARTFlow(LightningModule):
                 shared_tapes: list[Tensor] = []  # noise_tape_g per rollout [n_agent, tape_steps, 4]
 
                 # GT target 모드: GT 궤적을 target으로 사용.
-                # pred_max_steps_raw 만큼의 2Hz GT 위치를 anchor frame으로 정규화한다.
+                # resolution 토글에 따라 2Hz (기존, tokenized_agent["gt_pos"]) 또는
+                # 10Hz raw (data["agent"]["position"]) GT 점을 anchor frame으로 정규화.
                 gt_norm_anchor: Tensor | None = None
                 gt_valid_anchor: Tensor | None = None
+                # nearest_include_gt 전용: candidate pool 추가 GT (항상 raw 10Hz).
+                # use_gt_target=False 분기에서 활성 시 별도 set.
+                gt_norm_anchor_inc: Tensor | None = None
+                gt_valid_anchor_inc: Tensor | None = None
                 if use_gt_target:
-                    _T_gt = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
-                    _gt_start = anchor_idx + 1
-                    _gt_end = _gt_start + _T_gt
-                    _gt_pos  = tokenized_agent["gt_pos"][active_mask, _gt_start:_gt_end, :]     # [n_active, T_gt, 2]
-                    _gt_head = tokenized_agent["gt_heading"][active_mask, _gt_start:_gt_end]     # [n_active, T_gt]
-                    _gt_valid = tokenized_agent["valid_mask"][active_mask, _gt_start:_gt_end]    # [n_active, T_gt]
+                    if gt_is_10hz:
+                        # raw 10Hz GT: anchor (2Hz idx) 의 10Hz 시점 = (anchor+1)*shift,
+                        # GT 는 그 직후 fine 점들 (anchor +0.1s 부터).
+                        _T_gt = (pred_max_steps_raw if pred_max_steps_raw > 0 else 4) * _shift
+                        _anchor_now_10hz = (anchor_idx + 1) * _shift
+                        _gt_start = _anchor_now_10hz + 1
+                        _gt_end = _gt_start + _T_gt
+                        _gt_pos  = data["agent"]["position"][active_mask, _gt_start:_gt_end, :2]
+                        _gt_head = data["agent"]["heading"][active_mask, _gt_start:_gt_end]
+                        _gt_valid = data["agent"]["valid_mask"][active_mask, _gt_start:_gt_end]
+                    else:
+                        # 2Hz GT (기존): tokenized_agent["gt_pos"] 의 2Hz slice.
+                        _T_gt = pred_max_steps_raw if pred_max_steps_raw > 0 else 4
+                        _gt_start = anchor_idx + 1
+                        _gt_end = _gt_start + _T_gt
+                        _gt_pos  = tokenized_agent["gt_pos"][active_mask, _gt_start:_gt_end, :]     # [n_active, T_gt, 2]
+                        _gt_head = tokenized_agent["gt_heading"][active_mask, _gt_start:_gt_end]     # [n_active, T_gt]
+                        _gt_valid = tokenized_agent["valid_mask"][active_mask, _gt_start:_gt_end]    # [n_active, T_gt]
                     # 실제 사용 가능한 GT step 수 (시퀀스 끝에서 잘릴 수 있음)
                     _T_gt_actual = _gt_pos.shape[1]
                     if _T_gt_actual == 0 or not _gt_valid.any():
@@ -2217,6 +2255,21 @@ class SMARTFlow(LightningModule):
                             del tape_m
                     if _use_ref:
                         _agent_enc.flow_decoder = _orig_fd
+
+                    # nearest_include_gt: candidate pool 에 raw 10Hz GT 1 개 추가.
+                    if _nearest_include_gt:
+                        _T_gt_inc = (pred_max_steps_raw if pred_max_steps_raw > 0 else 4) * _shift
+                        _anchor_now_10hz_inc = (anchor_idx + 1) * _shift
+                        _gt_start_inc = _anchor_now_10hz_inc + 1
+                        _gt_end_inc = _gt_start_inc + _T_gt_inc
+                        _gt_pos_inc  = data["agent"]["position"][active_mask, _gt_start_inc:_gt_end_inc, :2]
+                        _gt_head_inc = data["agent"]["heading"][active_mask, _gt_start_inc:_gt_end_inc]
+                        _gt_valid_inc = data["agent"]["valid_mask"][active_mask, _gt_start_inc:_gt_end_inc]
+                        if _gt_pos_inc.shape[1] > 0 and bool(_gt_valid_inc.any()):
+                            gt_norm_anchor_inc = _cl_to_norm(
+                                _gt_pos_inc, _gt_head_inc, current_pos_active, current_head_active,
+                            ).detach()
+                            gt_valid_anchor_inc = _gt_valid_inc
 
                 # ── 4. Closed-loop rollout + loss ─────────────────────────────
                 _T_gt = int(gt_norm_anchor.shape[1]) if use_gt_target else 0
@@ -2384,7 +2437,8 @@ class SMARTFlow(LightningModule):
                     T_cl = pred_traj_all.shape[-2]
                     cl_norms: list[Tensor] = []
                     for g in range(G):
-                        if use_gt_target:
+                        if use_gt_target and not gt_is_10hz:
+                            # 2Hz GT mode: CL 을 2Hz 로 다운샘플
                             _xy_2hz, _hd_2hz = _cl_downsample_to_2hz(
                                 pred_traj_all[active_mask, g, :T_cl, :],
                                 pred_head_all[active_mask, g, :T_cl],
@@ -2392,6 +2446,7 @@ class SMARTFlow(LightningModule):
                             )
                             cl_norms.append(_cl_to_norm(_xy_2hz, _hd_2hz, current_pos_active, current_head_active))
                         else:
+                            # OL mode 또는 10Hz GT mode: CL 은 native fine 10Hz
                             cl_norms.append(_cl_to_norm(
                                 pred_traj_all[active_mask, g, :T_cl, :],
                                 pred_head_all[active_mask, g, :T_cl],
@@ -2399,12 +2454,16 @@ class SMARTFlow(LightningModule):
                             ))
 
                     if use_gt_target:
-                        _gt_slice = _slice_consistency_suffix_2hz(gt_norm_anchor)
+                        # GT mode: 2Hz 면 _slice_consistency_suffix_2hz, 10Hz 면 fine suffix.
+                        _cl_slice_fn = _slice_consistency_suffix if gt_is_10hz else _slice_consistency_suffix_2hz
+                        _gt_slice = _cl_slice_fn(gt_norm_anchor)
+                        # valid mask: 10Hz mode 에선 _consistency_tail_10hz_steps 기준이 맞지만,
+                        # last_coarse_only=False 인 경우 둘 다 None → identity. 가장 흔한 경로.
                         _gt_valid_slice = _slice_valid_suffix_2hz(gt_valid_anchor)
                         if use_mmd and G >= 2:
                             T_min = min(cl_norms[0].shape[-2], _gt_slice.shape[-2])
                             cl_stack = torch.stack(
-                                [_slice_consistency_suffix_2hz(c) for c in cl_norms], dim=0
+                                [_cl_slice_fn(c) for c in cl_norms], dim=0
                             )[:, :, :T_min, :]
                             # GT를 G번 반복해 ol_stack으로 사용: koo=1 (constant, no grad)
                             gt_stack = _gt_slice.unsqueeze(0).expand(G, -1, -1, -1)[:, :, :T_min, :].detach()
@@ -2415,7 +2474,7 @@ class SMARTFlow(LightningModule):
                         else:
                             anchor_loss = torch.stack([
                                 _consistency_loss_gt(
-                                    _slice_consistency_suffix_2hz(cl_norms[g]),
+                                    _cl_slice_fn(cl_norms[g]),
                                     _gt_slice,
                                     _gt_valid_slice,
                                 )
@@ -2434,9 +2493,18 @@ class SMARTFlow(LightningModule):
                     else:
                         cl_sliced_pl = [_slice_consistency_suffix(cl_norms[g]) for g in range(G)]
                         if _nearest_match:
-                            # 각 CL g 에 대해 M_ol 개 OL 중 per-anchor flat L2 거리 최소를 선택.
+                            # 각 CL g 에 대해 M_ol 개 OL (+ optionally 1 GT) 중
+                            # per-anchor flat L2 거리 최소를 선택.
                             ol_sliced_pl = [_slice_consistency_suffix(ol_norms[m]) for m in range(M_ol)]
                             T_min_nm = min(cl_sliced_pl[0].shape[-2], ol_sliced_pl[0].shape[-2])
+                            _use_gt_cand = (
+                                _nearest_include_gt
+                                and gt_norm_anchor_inc is not None
+                                and gt_valid_anchor_inc is not None
+                            )
+                            if _use_gt_cand:
+                                gt_sliced_nm = _slice_consistency_suffix(gt_norm_anchor_inc)
+                                T_min_nm = min(T_min_nm, gt_sliced_nm.shape[-2])
                             with torch.no_grad():
                                 cl_stk_nm = torch.stack(
                                     [c[:, :T_min_nm, :] for c in cl_sliced_pl], dim=0
@@ -2445,13 +2513,41 @@ class SMARTFlow(LightningModule):
                                     [o[:, :T_min_nm, :] for o in ol_sliced_pl], dim=0
                                 )  # [M, N_active, T, F]
                                 # [G, M] flat L2² distance
-                                _d2_nm = ((cl_stk_nm.unsqueeze(1) - ol_stk_nm.unsqueeze(0)) ** 2).flatten(2).sum(-1)
+                                _d2_ol = ((cl_stk_nm.unsqueeze(1) - ol_stk_nm.unsqueeze(0)) ** 2).flatten(2).sum(-1)
+                                if _use_gt_cand:
+                                    gt_stk = gt_sliced_nm[:, :T_min_nm, :]  # [N_active, T, F]
+                                    gt_mask = gt_valid_anchor_inc[:, :T_min_nm].float().unsqueeze(-1)  # [N, T, 1]
+                                    # GT 거리: invalid step 의 squared diff 는 0 (mask), 전체 sum.
+                                    _d2_gt = (
+                                        (cl_stk_nm - gt_stk.unsqueeze(0)) ** 2
+                                        * gt_mask.unsqueeze(0)
+                                    ).flatten(1).sum(-1, keepdim=True)  # [G, 1]
+                                    _d2_nm = torch.cat([_d2_ol, _d2_gt], dim=1)  # [G, M+1]
+                                else:
+                                    _d2_nm = _d2_ol
                                 m_star_nm = _d2_nm.argmin(dim=1).tolist()
                             del cl_stk_nm, ol_stk_nm, _d2_nm
-                            anchor_loss = torch.stack([
-                                _consistency_loss(cl_sliced_pl[g], ol_sliced_pl[int(m_star_nm[g])])
-                                for g in range(G)
-                            ]).mean()
+                            if _use_gt_cand:
+                                losses_nm = []
+                                gt_valid_for_loss = gt_valid_anchor_inc[:, :T_min_nm]
+                                for g in range(G):
+                                    _m_idx = int(m_star_nm[g])
+                                    if _m_idx == M_ol:
+                                        losses_nm.append(_consistency_loss_gt(
+                                            cl_sliced_pl[g][..., :T_min_nm, :],
+                                            gt_sliced_nm[..., :T_min_nm, :],
+                                            gt_valid_for_loss,
+                                        ))
+                                    else:
+                                        losses_nm.append(_consistency_loss(
+                                            cl_sliced_pl[g], ol_sliced_pl[_m_idx],
+                                        ))
+                                anchor_loss = torch.stack(losses_nm).mean()
+                            else:
+                                anchor_loss = torch.stack([
+                                    _consistency_loss(cl_sliced_pl[g], ol_sliced_pl[int(m_star_nm[g])])
+                                    for g in range(G)
+                                ]).mean()
                         else:
                             anchor_loss = torch.stack([
                                 _consistency_loss(

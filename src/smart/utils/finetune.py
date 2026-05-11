@@ -158,6 +158,18 @@ class FinetuneConfig:
     #: CL 예측은 2Hz로 다운샘플 후 GT(2Hz)와 비교.
     #: ocsc_use_mmd=True면 MMD²(P_CL, delta_GT), False면 masked L2.
     ocsc_gt_target: bool = False
+    #: OCSC GT target 의 시간 해상도. "2hz" (기본, tokenized_agent["gt_pos"] 의 2Hz slice 사용,
+    #: CL 도 2Hz 다운샘플 후 비교) 또는 "10hz" (data["agent"]["position"] 의 raw 10Hz 사용,
+    #: CL/OL 도 native fine 10Hz 그대로 비교 — downsample 없음).
+    #: ``ocsc_gt_target=True`` 분기와 ``ocsc_nearest_include_gt=True`` 분기 양쪽에서 의미.
+    ocsc_gt_resolution: str = "2hz"
+    #: True → OCSC nearest-match (M_ol > G + ``ocsc_ol_nearest_match=True``) 의 candidate
+    #: pool 에 GT 1 개를 추가해, 각 CL g 가 ``[M_ol OL samples + 1 GT]`` 중 argmin paired L2
+    #: target 을 선택하게 한다. argmin 이 OL 이면 ``_consistency_loss``, GT 이면
+    #: ``_consistency_loss_gt`` (valid mask 적용) 로 backprop.
+    #: GT 거리는 mask 적용 sum (invalid step 제외). ``ocsc_nearest_include_gt=True`` 가 활성이면
+    #: ``ocsc_ol_nearest_match=True`` 이어야 한다 (아니면 자동 비활성).
+    ocsc_nearest_include_gt: bool = False
     # ── Ref-NLL fine-tuning ────────────────────────────────────────────────────
     #: G: 시나리오당 closed-loop rollout 수.
     ref_nll_n_rollouts: int = 2
@@ -286,6 +298,8 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_eval_hard_rmm_interval=int(_read_config_value(finetune, "ocsc_eval_hard_rmm_interval", 1)),
         ocsc_fm_reg_lambda=float(_read_config_value(finetune, "ocsc_fm_reg_lambda", 0.0)),
         ocsc_gt_target=bool(_read_config_value(finetune, "ocsc_gt_target", False)),
+        ocsc_gt_resolution=str(_read_config_value(finetune, "ocsc_gt_resolution", "2hz")),
+        ocsc_nearest_include_gt=bool(_read_config_value(finetune, "ocsc_nearest_include_gt", False)),
         ref_nll_n_rollouts=int(_read_config_value(finetune, "ref_nll_n_rollouts", 2)),
         ref_nll_pred_max_steps=int(_read_config_value(finetune, "ref_nll_pred_max_steps", 4)),
         ref_nll_n_hutch_samples=int(_read_config_value(finetune, "ref_nll_n_hutch_samples", 1)),
