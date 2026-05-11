@@ -526,6 +526,48 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --dry-run
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --stop
 ```
 
+#### testa/testaa A100x4x2 prefix-valid control-space pretrain
+
+`testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`, round-trip filter `2.0m`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_static_pods.py --replace
+```
+
+이 launcher는 `configs/experiment/pre_bc_flow_control_a100x4x2_prefix_valid.yaml`을 사용합니다. 해당 preset은 `pre_bc_flow_control_2x4_h100`을 상속하므로 `train_batch_size=26`, `trainer.num_nodes=2`, `trainer.devices=4`, `precision=bf16-mixed`, `lr=6e-4`, `control_round_trip_max_position_error_m=2.0`은 그대로 유지합니다.
+
+```yaml
+model:
+  model_config:
+    token_processor:
+      use_kinematic_control_flow: true
+      use_prefix_valid_future_loss_mask: true
+      control_round_trip_max_position_error_m: 2.0
+```
+
+현재 브랜치의 `use_prefix_valid_future_loss_mask=true`는 `812eccc` 이후 의미입니다. 즉, 가까운 미래부터 연속 valid prefix를 만들고, 그 길이를 5-step chunk 단위로 내림합니다. 1~4 step만 유효한 anchor는 버리고, 5~9 step은 첫 0.5초, 10~14 step은 첫 1.0초, 15~19 step은 첫 1.5초만 학습합니다.
+
+기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_roundtrip2_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-control-pretrain-a100x4x2-prefix
+kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-control-pretrain-a100x4x2-prefix
+```
+
+실행 전에 실제 kubectl 명령을 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_static_pods.py --dry-run
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_static_pods.py --stop
+```
+
 #### V100 47GPU static pod control-space pretrain
 
 `testsv`, `testsvv`, `testsvvv`, `testsvvvv`, `sv`, `svv`, `svvv`, `svvvv`의 V100x4 pod 8개와 `fv`, `fvv`, `fvvv`, `fvvvv`, `fvvvvv`의 V100x3 pod 5개를 묶어 control-space pretrain을 돌릴 때는 아래 preset과 launcher를 씁니다.

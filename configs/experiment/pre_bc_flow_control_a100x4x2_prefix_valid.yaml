@@ -1,0 +1,26 @@
+# @package _global_
+
+# Control-space Flow Matching pretrain preset for two A100x4 nodes.
+#
+# Intended launch shape:
+#   * testa/testaa
+#   * 4 A100 80GB GPUs per node
+#   * 8 total DDP ranks
+#
+# This mirrors the H100x4x2 control-space recipe:
+#   * data.train_batch_size=26 -> effective global batch 208
+#   * lr=6e-4
+#   * control_round_trip_max_position_error_m=2.0
+#
+# The only intentional target-selection change is prefix-valid supervision.
+# On this branch, prefix-valid masks are aligned to complete 5-step chunks:
+# 1-4 valid future steps are dropped, 5-9 use the first 0.5s, and so on.
+
+defaults:
+  - pre_bc_flow_control_2x4_h100
+  - _self_
+
+model:
+  model_config:
+    token_processor:
+      use_prefix_valid_future_loss_mask: true
