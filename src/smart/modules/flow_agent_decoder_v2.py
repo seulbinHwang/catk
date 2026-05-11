@@ -10,6 +10,7 @@ from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder_v2 import SMARTAgentEncoder
+from src.smart.modules.dynamic_light_time import build_constant_light_time_delta_norm
 from src.smart.modules.flow_local_decoder_v2 import (
     ContinuousCommitBridge,
     FlowODE,
@@ -78,7 +79,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_future_steps=num_future_steps,
         )
         self.r_a2a_emb = FourierEmbedding(
-            input_dim=5,
+            input_dim=6,
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
@@ -137,6 +138,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         batch_s: torch.Tensor,
         mask: torch.Tensor,
         motion_a: torch.Tensor | None = None,
+        motion_valid_a: torch.Tensor | None = None,
     ):
         mask_flat = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
@@ -145,13 +147,27 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         if motion_a is None:
             motion_a = self._build_motion_vector(pos_a, mask)
+            motion_valid_a = self._build_motion_valid_mask(pos_a, mask)
         else:
             if motion_a.shape != pos_a.shape:
                 raise ValueError(
                     "motion_a shape must match pos_a shape, "
                     f"got {tuple(motion_a.shape)} and {tuple(pos_a.shape)}"
                 )
+            if motion_valid_a is None:
+                motion_valid_a = torch.ones(
+                    motion_a.shape[:2],
+                    device=motion_a.device,
+                    dtype=torch.bool,
+                )
+            elif tuple(motion_valid_a.shape) != tuple(motion_a.shape[:2]):
+                raise ValueError(
+                    "motion_valid_a shape must match the first two dimensions of motion_a, "
+                    f"got {tuple(motion_valid_a.shape)} and {tuple(motion_a.shape[:2])}"
+                )
+        motion_valid_a = motion_valid_a.bool()
         motion_s = motion_a.transpose(0, 1).reshape(-1, 2)
+        motion_valid_s = motion_valid_a.transpose(0, 1).reshape(-1)
 
         edge_index_a2a = radius_graph(
             x=pos_s[:, :2],
@@ -173,6 +189,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         recv_sin = recv_head.sin()
         rel_motion_long = rel_motion[:, 0] * recv_cos + rel_motion[:, 1] * recv_sin
         rel_motion_lat = -rel_motion[:, 0] * recv_sin + rel_motion[:, 1] * recv_cos
+        rel_motion_valid = (
+            motion_valid_s[edge_index_a2a[0]]
+            & motion_valid_s[edge_index_a2a[1]]
+        )
 
         r_a2a = torch.stack(
             [
@@ -184,6 +204,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 rel_head_a2a,
                 rel_motion_long,
                 rel_motion_lat,
+                rel_motion_valid.to(dtype=rel_motion_long.dtype),
             ],
             dim=-1,
         )
@@ -215,11 +236,40 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         return batch.repeat(num_steps) + step_offsets
 
-    def _build_recent_coarse_motion(
+    def _build_rollout_light_time_delta_norm(
         self,
+        *,
+        num_agent: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        rollout_step_index: int,
+    ) -> torch.Tensor:
+        """closed-loop rollout에서 현재 신호가 얼마나 오래된 정보인지 만듭니다.
+
+        Args:
+            num_agent: 현재 batch 안 agent 수입니다.
+            device: 반환 tensor를 둘 장치입니다.
+            dtype: 반환 tensor 자료형입니다.
+            rollout_step_index: 0.5초 rollout block 번호입니다. 첫 block은 0입니다.
+
+        Returns:
+            torch.Tensor: 모든 agent에 대한 정규화된 신호 시간 차입니다.
+                shape은 ``[num_agent, 1]`` 입니다.
+        """
+        delta_seconds = float(rollout_step_index) * float(self.shift) * 0.1
+        return build_constant_light_time_delta_norm(
+            num_agents=num_agent,
+            num_steps=1,
+            delta_seconds=delta_seconds,
+            device=device,
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def _build_recent_coarse_motion(
         pos_window: torch.Tensor,
         valid_window: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """마지막 두 coarse 상태 차이로 최근 이동량을 만듭니다.
 
         Args:
@@ -229,21 +279,26 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_agent, n_step]`` 입니다.
 
         Returns:
-            torch.Tensor:
-                각 agent의 최근 coarse 이동량입니다.
-                shape은 ``[n_agent, 2]`` 입니다.
-                마지막 두 상태가 모두 유효하지 않으면 0으로 둡니다.
+            tuple[torch.Tensor, torch.Tensor]:
+                각 agent의 최근 coarse 이동량과 그 유효 여부입니다.
+                shape은 각각 ``[n_agent, 2]`` 와 ``[n_agent]`` 입니다.
+                마지막 두 상태가 모두 유효하지 않으면 이동량은 0, 유효 여부는
+                ``False`` 로 둡니다.
         """
         recent_motion = pos_window.new_zeros((pos_window.shape[0], pos_window.shape[-1]))
+        recent_motion_valid = torch.zeros(
+            pos_window.shape[0],
+            device=pos_window.device,
+            dtype=torch.bool,
+        )
         if pos_window.shape[1] < 2:
-            return recent_motion
+            return recent_motion, recent_motion_valid
 
         recent_motion_valid = valid_window[:, -1] & valid_window[:, -2]
         recent_motion[recent_motion_valid] = (
             pos_window[recent_motion_valid, -1] - pos_window[recent_motion_valid, -2]
         )
-        return recent_motion
-
+        return recent_motion, recent_motion_valid
 
     def _build_initial_exec_state_history(
         self,
@@ -614,7 +669,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_vector_a=head_vector_a, # ctx_sampled_heading
             batch_s=batch_s_a2a,
             mask=mask,
-            motion_a=self._build_motion_vector(pos_a, mask),
         )
         edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
             pos_pl=map_feature["position"],
@@ -625,6 +679,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             mask=mask,
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
+            light_type=map_feature.get("light_type"),
         )
 
         feat_map = map_feature["pt_token"]
@@ -797,6 +852,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             mask=valid_window,
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
+            light_type=map_feature.get("light_type"),
         )
         edge_index_a2a, r_a2a = self.build_interaction_edge(
             pos_a=pos_window,
@@ -804,7 +860,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             head_vector_a=head_vector_window,
             batch_s=batch_s_a2a,
             mask=valid_window,
-            motion_a=self._build_motion_vector(pos_window, valid_window),
         )
 
         feat_map = map_feature["pt_token"]
@@ -1137,6 +1192,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
+        use_stop_motion: bool | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -1158,6 +1214,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 함께 반환합니다.
         """
         state = self._clone_rollout_cache(rollout_cache)
+        rollout_use_stop_motion = (
+            self.use_stop_motion
+            if use_stop_motion is None
+            else bool(use_stop_motion)
+        )
 
         n_agent = int(state["n_agent"])
         total_step_future_2hz = int(state["n_step_future_2hz"])
@@ -1337,8 +1398,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     mask=inference_mask[:, -1:],
                     batch_s=tokenized_agent["batch"],
                     batch_pl=map_feature["batch"],
+                    light_type=map_feature.get("light_type"),
+                    light_time_delta_norm=self._build_rollout_light_time_delta_norm(
+                        num_agent=pos_window.shape[0],
+                        device=pos_window.device,
+                        dtype=pos_window.dtype,
+                        rollout_step_index=t,
+                    ),
                 )
-                recent_motion = self._build_recent_coarse_motion(
+                recent_motion, recent_motion_valid = self._build_recent_coarse_motion(
                     pos_window=pos_window,
                     valid_window=valid_window,
                 )
@@ -1349,6 +1417,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     batch_s=tokenized_agent["batch"],
                     mask=inference_mask[:, -1:],
                     motion_a=recent_motion.unsqueeze(1),
+                    motion_valid_a=recent_motion_valid.unsqueeze(1),
                 )
 
                 for i in range(self.num_layers):
@@ -1456,7 +1525,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     dtype=torch.bool,
                     device=active_agent_type.device,
                 )
-                if self.use_stop_motion:
+                if rollout_use_stop_motion:
                     _, stop_mask_act = self.commit_bridge.build_stop_motion_mask(
                         current_pos=current_pos_act,
                         current_head=current_head_act,
@@ -1600,15 +1669,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 ~motion_valid_a.unsqueeze(-1),
                 0.0,
             )
-            x_a = torch.stack(
-                [
-                    safe_norm_2d(motion_vector_a),
-                    angle_between_2d_vectors(
-                        ctr_vector=head_vector_window[:, -1],
-                        nbr_vector=motion_vector_a,
-                    ),
-                ],
-                dim=-1,
+            x_a = self._build_motion_feature_from_vector(
+                motion_vector_a=motion_vector_a,
+                head_vector_a=head_vector_window[:, -1],
+                motion_valid_a=motion_valid_a,
             )
             x_a = self.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)
             feat_a_next = self.fusion_emb(
@@ -1709,6 +1773,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
+        use_stop_motion: bool | None = None,
     ) -> Dict[str, torch.Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -1723,6 +1788,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 ``flow_window_steps / 5`` 를 넘깁니다.
             self_forced_epoch: 현재 self-forced epoch입니다. ``None`` 이면 training
                 random terminal denoising step을 끕니다.
+            use_stop_motion: ``None``이면 decoder 기본 inference 설정을 사용합니다.
+                self-forced 학습에서는 별도 config 값을 넘겨 inference 설정과 분리합니다.
 
         Returns:
             Dict[str, torch.Tensor]: N초 committed self-rollout 결과입니다.
@@ -1738,6 +1805,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
+            use_stop_motion=use_stop_motion,
         )
 
     def path_flow_velocity_for_anchor0(

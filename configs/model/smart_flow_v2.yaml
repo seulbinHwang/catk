@@ -1,0 +1,98 @@
+_target_: src.smart.model.smart_flow.SMARTFlow
+model_config:
+  # backbone_variant=v2 면 SMARTFlow 가 V2 모듈 (smart_flow_decoder_v2 + flow_token_processor_v2)
+  # 을 instantiate 합니다. V1 (OCSC_clean default) 와 ckpt 가 호환되지 않으므로 ckpt 와
+  # 함께 짝지어 사용해야 합니다.
+  backbone_variant: v2
+  lr: 0.0005
+  lr_warmup_steps: 2
+  lr_total_steps: ${trainer.max_epochs}
+  lr_min_ratio: 0.01
+  weight_decay: 0.01
+  lr_scheduler_unit: epoch
+  n_rollout_closed_val: 8
+  wosac_cpd_reference: null
+  n_batch_sim_agents_metric: 10
+  sim_agents_metric_workers: 3
+  validation_metric: "real"
+  wosac_torch_compile: false
+  n_vis_batch: 0
+  n_vis_scenario: 0
+  n_vis_rollout: 0
+  delete_local_videos_after_wandb_upload: false
+  val_open_loop: true
+  val_closed_loop: true
+  validation_open_seed: 0
+  validation_closed_seed: 0
+  token_processor:
+    map_token_file: "map_traj_token5.pkl"
+    agent_token_file: "agent_vocab_555_s2.pkl"
+    map_token_sampling:
+      num_k: 1
+      temp: 1.0
+    agent_token_sampling:
+      num_k: 1
+      temp: 1.0
+    # V2 신규. decoder.flow_window_steps 와 같아야 합니다 (validate_flow_window_steps).
+    flow_window_steps: 20
+  eval_sampling_noise:
+    noise_scale: 1.0
+  decoder:
+    hidden_dim: 128
+    num_freq_bands: 64
+    num_heads: 8
+    head_dim: 15
+    dropout: 0.1
+    hist_drop_prob: 0.1
+    num_map_layers: 3
+    num_agent_layers: 6
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    a2a_radius: 60
+    time_span: 30
+    num_historical_steps: 11
+    num_future_steps: 80
+    flow_dim: 96
+    flow_num_chunk_heads: 4
+    flow_num_chunk_layers: 2
+    # V2 default: euler solver 32 step (V1 은 midpoint 4 step)
+    flow_solver_steps: 32
+    flow_solver_method: euler
+    flow_solver_eps: 1.0e-3
+    # V2 신규 토글들
+    flow_window_steps: 20
+    closed_loop_rollout_mode: raw_fm  # raw_fm | matched_token_chunk
+    use_lqr: false
+    use_stop_motion: true
+    # LQR 사용 안 해도 LQRCommitBridgeConfig 생성에 쓰이므로 default 값을 채워 둡니다.
+    lqr_commit:
+      dt: 0.1
+      history_steps: 6
+      horizon_steps: 10
+      velocity_smooth_lambda: 1.0e-4
+      curvature_smooth_lambda: 1.0e-2
+      curvature_init_reg: 1.0e-10
+      stop_speed_mps: 0.2
+      stop_speed_kp: 0.5
+      longitudinal_q: 10.0
+      longitudinal_r: 0.
+      lateral_q_lat: 1.0
+      lateral_q_head: 10.0
+      lateral_q_kappa: 0.
+      lateral_r: 0.
+      accel_tau_s: 0.
+      curvature_tau_s: 0.
+      min_speed_for_curvature_clip_mps: 0.5
+  sim_agents_submission:
+    is_active: false
+    method_name: "SMART-flow-7M"
+    authors: [Seulbin Hwang, Kiyoung Om]
+    affiliation: NaverLabs
+    description: Flow-based generative model for simulating realistic agents.
+    method_link: "not available yet"
+    account_name: "h.sb@naverlabs.com"
+  finetune:
+    enabled: false
+    mode: ocsc_ft
+    flow_velocity_head_only: false
+    gradient_clip_val: 0.0
