@@ -76,6 +76,10 @@ model:
       ocsc_eval_hard_rmm_interval: 1
       # GT target: true → open-loop sample 대신 GT 궤적을 consistency target으로 사용
       ocsc_gt_target: false
+      # GT target resolution: "2hz" (기존, tokenized_agent["gt_pos"]) | "10hz" (raw data["agent"]["position"])
+      ocsc_gt_resolution: "2hz"
+      # nearest_match candidate pool 에 raw 10Hz GT 1 개 포함 (ocsc_ol_nearest_match=true 와 함께)
+      ocsc_nearest_include_gt: false
       # ── BPTT tricks (rmm_bptt_ft 와 동일 설정) ───────────────────────
       flow_velocity_head_only: true
       bptt_use_adjoint: false
