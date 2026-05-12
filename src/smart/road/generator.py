@@ -53,6 +53,22 @@ def build_sampling_scheme(config: RoadGenerationConfig) -> SimpleNamespace:
     )
 
 
+def road_light_time_start_seconds(
+    *,
+    block_idx: int,
+    commit_steps: int,
+    seconds_per_step: float = 0.1,
+) -> float:
+    """RoaD outer block이 시작된 전체 rollout 기준 시간을 초 단위로 계산합니다."""
+    if int(block_idx) < 0:
+        raise ValueError(f"block_idx must be non-negative, got {block_idx}.")
+    if int(commit_steps) <= 0:
+        raise ValueError(f"commit_steps must be positive, got {commit_steps}.")
+    if float(seconds_per_step) <= 0.0:
+        raise ValueError(f"seconds_per_step must be positive, got {seconds_per_step}.")
+    return float(block_idx) * float(commit_steps) * float(seconds_per_step)
+
+
 def chunked_paths(paths: Sequence[Path], chunk_size: int) -> Iterable[list[Path]]:
     """파일 경로 목록을 작은 묶음으로 나눕니다.
 
@@ -266,6 +282,7 @@ def sample_candidate_micro_batch(
     device: torch.device,
     repeat_count: int,
     seed: int,
+    light_time_start_seconds: float = 0.0,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """현재 scene에서 후보 rollout micro-batch를 생성합니다.
 
@@ -277,6 +294,7 @@ def sample_candidate_micro_batch(
         device: model과 batch가 올라갈 장치입니다.
         repeat_count: 이번 호출에서 만들 후보 개수입니다.
         seed: sampling seed입니다.
+        light_time_start_seconds: 전체 RoaD rollout 기준으로 현재 block 시작까지 지난 시간입니다.
 
     Returns:
         tuple[Tensor, Tensor, Tensor]: 후보 위치, 방향, 유효 여부입니다.
@@ -296,6 +314,7 @@ def sample_candidate_micro_batch(
         sampling_scheme=build_sampling_scheme(config),
         sampling_seed=int(seed),
         rollout_steps_2hz=math.ceil(config.selection_horizon_steps / config.commit_steps),
+        light_time_start_seconds=float(light_time_start_seconds),
     )
     xy, heading, valid = extract_rollout_prediction(prediction)
     horizon = int(config.selection_horizon_steps)
@@ -322,6 +341,7 @@ def sample_candidate_rollouts_for_block(
     config: RoadGenerationConfig,
     device: torch.device,
     seed_base: int,
+    block_idx: int = 0,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """현재 0.5초 block에서 K개 후보를 생성합니다.
 
@@ -332,6 +352,7 @@ def sample_candidate_rollouts_for_block(
         config: RoaD 생성 설정입니다.
         device: model과 batch가 올라갈 장치입니다.
         seed_base: 후보별 seed 기준값입니다.
+        block_idx: 전체 RoaD rollout 기준 0.5초 block 번호입니다.
 
     Returns:
         tuple[Tensor, Tensor, Tensor]: 후보 위치, 방향, 유효 여부입니다.
@@ -342,6 +363,10 @@ def sample_candidate_rollouts_for_block(
     valid_chunks: list[Tensor] = []
     made_count = 0
     micro_batch = max(1, int(config.candidate_micro_batch_size))
+    light_time_start_seconds = road_light_time_start_seconds(
+        block_idx=int(block_idx),
+        commit_steps=int(config.commit_steps),
+    )
     while made_count < int(config.candidates_per_agent):
         repeat_count = min(micro_batch, int(config.candidates_per_agent) - made_count)
         xy, heading, valid = sample_candidate_micro_batch(
@@ -352,6 +377,7 @@ def sample_candidate_rollouts_for_block(
             device=device,
             repeat_count=repeat_count,
             seed=int(seed_base) + made_count * 104729,
+            light_time_start_seconds=light_time_start_seconds,
         )
         xy_chunks.append(xy)
         heading_chunks.append(heading)
@@ -526,6 +552,7 @@ def generate_single_road_rollout(
             config=config,
             device=device,
             seed_base=seed_base,
+            block_idx=block_idx,
         )
         future_start = block_idx * int(config.commit_steps)
         future_end = future_start + int(config.selection_horizon_steps)

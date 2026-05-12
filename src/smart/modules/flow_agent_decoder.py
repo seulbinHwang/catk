@@ -275,6 +275,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         device: torch.device,
         dtype: torch.dtype,
         rollout_step_index: int,
+        rollout_start_seconds: float = 0.0,
     ) -> torch.Tensor:
         """closed-loop rollout에서 현재 신호가 얼마나 오래된 정보인지 만듭니다.
 
@@ -283,12 +284,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             device: 반환 tensor를 둘 장치입니다.
             dtype: 반환 tensor 자료형입니다.
             rollout_step_index: 0.5초 rollout block 번호입니다. 첫 block은 0입니다.
+            rollout_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다. RoaD처럼
+                매 block을 새 입력으로 만들 때 stale 시간이 0초로 reset되지 않도록 더합니다.
 
         Returns:
             torch.Tensor: 모든 agent에 대한 정규화된 신호 시간 차입니다.
                 shape은 ``[num_agent, 1]`` 입니다.
         """
-        delta_seconds = float(rollout_step_index) * float(self.shift) * 0.1
+        delta_seconds = float(rollout_start_seconds) + (
+            float(rollout_step_index) * float(self.shift) * 0.1
+        )
         return build_constant_light_time_delta_norm(
             num_agents=num_agent,
             num_steps=1,
@@ -1278,6 +1283,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
+        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -1291,6 +1297,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_scenario]`` 입니다.
             self_forced_epoch: self-forced 학습 epoch입니다. ``None`` 이면 random terminal
                 denoising step을 쓰지 않는 평가/추론 경로로 봅니다.
+            light_time_start_seconds: RoaD처럼 중간 block에서 새 sample을 만들 때 이미 지난
+                rollout 시간입니다. 일반 closed-loop는 0초를 씁니다.
 
         Returns:
             Dict[str, torch.Tensor]:
@@ -1489,6 +1497,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         device=pos_window.device,
                         dtype=pos_window.dtype,
                         rollout_step_index=t,
+                        rollout_start_seconds=light_time_start_seconds,
                     ),
                 )
                 recent_motion, recent_motion_valid = self._build_recent_coarse_motion(
@@ -1822,6 +1831,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         scenario_sampling_seeds: torch.Tensor | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
+        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """평가와 제출에서 no-gradient closed-loop rollout을 실행합니다.
 
@@ -1834,6 +1844,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             return_flow_2s_preview: preview 저장 여부입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 8초를 실행합니다.
+            light_time_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다.
 
         Returns:
             Dict[str, torch.Tensor]: closed-loop rollout 결과입니다.
@@ -1847,6 +1858,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
+            light_time_start_seconds=light_time_start_seconds,
         )
 
     def training_rollout_from_cache(
@@ -1861,6 +1873,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
+        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -1877,6 +1890,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 random terminal denoising step을 끕니다.
             use_stop_motion: ``None``이면 decoder 기본 inference 설정을 사용합니다.
                 self-forced 학습에서는 별도 config 값을 넘겨 inference 설정과 분리합니다.
+            light_time_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다.
 
         Returns:
             Dict[str, torch.Tensor]: N초 committed self-rollout 결과입니다.
@@ -1893,6 +1907,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
             use_stop_motion=use_stop_motion,
+            light_time_start_seconds=light_time_start_seconds,
         )
 
     def path_flow_velocity_for_anchor0(
