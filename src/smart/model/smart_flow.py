@@ -274,6 +274,8 @@ class SMARTFlow(LightningModule):
         self._self_forced_aux_loaded_from_checkpoint = False
         self._self_forced_generator_ema_loaded_from_checkpoint = False
         self._self_forced_backward_context: Dict[str, Tensor] | None = None
+        self._automatic_open_loop_has_target_since_step = False
+        self._skip_next_automatic_optimizer_step = False
         if self.self_forced_enabled:
             if not (0.0 <= self.self_forced_ema_weight < 1.0):
                 raise ValueError(
@@ -526,10 +528,36 @@ class SMARTFlow(LightningModule):
                 ),
             }
 
+    @staticmethod
+    def _has_open_loop_loss_targets(pred_dict: Dict[str, Tensor]) -> bool:
+        """open-loop FM loss에 실제로 들어갈 미래 target이 있는지 확인합니다."""
+        pred_norm = pred_dict["flow_pred_norm"]
+        target_norm = pred_dict["flow_target_norm"]
+        if pred_norm.numel() == 0 or target_norm.numel() == 0:
+            return False
+        loss_mask = pred_dict.get("flow_loss_mask")
+        if loss_mask is None:
+            return True
+        return bool(loss_mask.to(device=pred_norm.device, dtype=torch.bool).any().item())
+
+    def _build_trainable_connected_zero_loss(self, module: nn.Module | None = None) -> Tensor:
+        """trainable parameter graph에 연결된 scalar 0 loss를 만듭니다."""
+        zero_loss: Tensor | None = None
+        parameter_source = module if module is not None else self
+        for param in parameter_source.parameters():
+            if not param.requires_grad:
+                continue
+            term = param.sum() * 0.0
+            zero_loss = term if zero_loss is None else zero_loss + term
+        if zero_loss is None:
+            return torch.zeros((), device=self.device, requires_grad=True)
+        return zero_loss
+
     def _open_loop_denoise_metrics(
         self,
         pred_dict: Dict[str, Tensor],
-    ) -> tuple[Tensor, Dict[str, Tensor], int]:
+        zero_loss_module: nn.Module | None = None,
+    ) -> tuple[Tensor, Dict[str, Tensor], int, bool]:
         """잡음 제거 방식 검증 점수와 유효 표본 수를 계산합니다.
 
         Args:
@@ -538,18 +566,24 @@ class SMARTFlow(LightningModule):
                 ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
                 ``flow_loss_mask`` 가 있으면 shape은
                 ``[n_valid_anchor, flow_window_steps]`` 입니다.
+            zero_loss_module: 유효 target이 없을 때 0 loss를 연결할 trainable
+                parameter 소스입니다. 값이 없으면 flow generator에 연결합니다.
 
         Returns:
-            tuple[Tensor, Dict[str, Tensor], int]:
+            tuple[Tensor, Dict[str, Tensor], int, bool]:
                 flow matching loss, meter/degree 단위 지표 사전,
-                그리고 유효 anchor 개수입니다.
+                유효 anchor 개수, 그리고 loss에 실제 target이 있는지 여부입니다.
         """
         loss_mask = pred_dict.get("flow_loss_mask")
-        loss = flow_matching_loss(
-            pred_dict["flow_pred_norm"],
-            pred_dict["flow_target_norm"],
-            valid_mask=loss_mask,
-        )
+        has_loss_targets = self._has_open_loop_loss_targets(pred_dict)
+        if has_loss_targets:
+            loss = flow_matching_loss(
+                pred_dict["flow_pred_norm"],
+                pred_dict["flow_target_norm"],
+                valid_mask=loss_mask,
+            )
+        else:
+            loss = self._build_trainable_connected_zero_loss(zero_loss_module or self.encoder)
         metric_pred_clean_norm = pred_dict.get(
             "flow_pred_clean_metric_norm",
             pred_dict["flow_pred_clean_norm"],
@@ -564,7 +598,7 @@ class SMARTFlow(LightningModule):
             valid_mask=loss_mask,
         )
         sample_count = int(pred_dict["flow_clean_norm"].shape[0])
-        return loss, metric_dict, sample_count
+        return loss, metric_dict, sample_count, has_loss_targets
 
     def _update_weighted_validation_metrics(
         self,
@@ -2261,23 +2295,29 @@ class SMARTFlow(LightningModule):
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
-        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+        fm_loss, open_metric_dict, _, has_open_loop_targets = self._open_loop_denoise_metrics(
+            pred,
+            zero_loss_module=self.encoder,
+        )
         total_loss = fm_loss
 
         generator_optimizer = self.optimizers()[0]
         self.toggle_optimizer(generator_optimizer)
-        generator_optimizer.zero_grad(set_to_none=True)
-        self._prepare_self_forced_generator_backward_boundary()
-        self._manual_backward_without_autocast(total_loss)
-        self._assert_self_forced_generator_update_isolated()
-        self._clip_and_step_with_optional_scaler(
-            generator_optimizer,
-            gradient_clip_val=self.self_forced_gradient_clip_val,
-            gradient_clip_algorithm="norm",
-        )
-        self._update_self_forced_generator_ema_after_step()
-        self._clear_self_forced_generator_gradients()
-        self.untoggle_optimizer(generator_optimizer)
+        try:
+            generator_optimizer.zero_grad(set_to_none=True)
+            self._prepare_self_forced_generator_backward_boundary()
+            self._manual_backward_without_autocast(total_loss)
+            self._assert_self_forced_generator_update_isolated()
+            if has_open_loop_targets:
+                self._clip_and_step_with_optional_scaler(
+                    generator_optimizer,
+                    gradient_clip_val=self.self_forced_gradient_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+                self._update_self_forced_generator_ema_after_step()
+        finally:
+            self._clear_self_forced_generator_gradients()
+            self.untoggle_optimizer(generator_optimizer)
 
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
@@ -2327,6 +2367,7 @@ class SMARTFlow(LightningModule):
         """
         fm_loss = None
         open_metric_dict = None
+        has_anchor_fm_targets = False
         if self.self_forced_use_anchor_fm_loss:
             tokenized_map_train, tokenized_agent_train = self.token_processor(data)
             pred = self.encoder(
@@ -2334,7 +2375,10 @@ class SMARTFlow(LightningModule):
                 tokenized_agent_train,
                 anchor_mask_key="flow_train_mask",
             )
-            fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+            fm_loss, open_metric_dict, _, has_anchor_fm_targets = self._open_loop_denoise_metrics(
+                pred,
+                zero_loss_module=self.encoder,
+            )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
         if self._is_self_forced_estimator_warmup_active():
@@ -2355,9 +2399,7 @@ class SMARTFlow(LightningModule):
                 # zero-coefficient sum so autograd traverses the param graph
                 # and DDP completes its all-reduce; skip optimizer.step()
                 # because the gradients are deterministically zero.
-                zero_loss = sum(
-                    p.sum() for p in self.encoder.parameters() if p.requires_grad
-                ) * 0.0
+                zero_loss = self._build_trainable_connected_zero_loss(self.encoder)
                 generator_optimizer = self.optimizers()[0]
                 self.toggle_optimizer(generator_optimizer)
                 try:
@@ -2376,12 +2418,15 @@ class SMARTFlow(LightningModule):
             self.toggle_optimizer(generator_optimizer)
             generator_optimizer.zero_grad(set_to_none=True)
             self._prepare_self_forced_generator_backward_boundary()
-            self._manual_backward_without_autocast(fm_loss)
-            self._assert_self_forced_generator_update_isolated()
-            self._clip_and_step_with_optional_scaler(generator_optimizer)
-            self._update_self_forced_generator_ema_after_step()
-            self._clear_self_forced_generator_gradients()
-            self.untoggle_optimizer(generator_optimizer)
+            try:
+                self._manual_backward_without_autocast(fm_loss)
+                self._assert_self_forced_generator_update_isolated()
+                if has_anchor_fm_targets:
+                    self._clip_and_step_with_optional_scaler(generator_optimizer)
+                    self._update_self_forced_generator_ema_after_step()
+            finally:
+                self._clear_self_forced_generator_gradients()
+                self.untoggle_optimizer(generator_optimizer)
             self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
             return fm_loss.detach()
@@ -2539,7 +2584,14 @@ fm_loss:
 open_metric_dict: 
     Dict[str, Tensor]
         """
-        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+        fm_loss, open_metric_dict, _, has_open_loop_targets = self._open_loop_denoise_metrics(
+            pred,
+            zero_loss_module=self,
+        )
+        self._automatic_open_loop_has_target_since_step = (
+            self._automatic_open_loop_has_target_since_step or has_open_loop_targets
+        )
+        self._skip_next_automatic_optimizer_step = not self._automatic_open_loop_has_target_since_step
 
         total_loss = fm_loss
         if not torch.isfinite(fm_loss):
@@ -2585,6 +2637,13 @@ open_metric_dict:
             batch_size=1,
         )
         return total_loss
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """target이 없는 automatic optimization batch에서는 zero grad 업데이트를 막습니다."""
+        if self._skip_next_automatic_optimizer_step:
+            optimizer.zero_grad(set_to_none=True)
+        self._automatic_open_loop_has_target_since_step = False
+        self._skip_next_automatic_optimizer_step = False
 
     def on_after_backward(self) -> None:
         """역전파 직후 non-finite gradient를 fail-fast로 잡습니다.
