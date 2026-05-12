@@ -219,15 +219,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         # added relation channels stay on a meter-scale comparable to the existing
         # distance feature without introducing another global normalization rule.
         rel_motion = motion_s[edge_index_a2a[0]] - motion_s[edge_index_a2a[1]]
+        rel_motion_valid = (
+            motion_valid_s[edge_index_a2a[0]]
+            & motion_valid_s[edge_index_a2a[1]]
+        )
         recv_head = head_s[edge_index_a2a[1]]
         recv_cos = recv_head.cos()
         recv_sin = recv_head.sin()
         rel_motion_long = rel_motion[:, 0] * recv_cos + rel_motion[:, 1] * recv_sin
         rel_motion_lat = -rel_motion[:, 0] * recv_sin + rel_motion[:, 1] * recv_cos
-        rel_motion_valid = (
-            motion_valid_s[edge_index_a2a[0]]
-            & motion_valid_s[edge_index_a2a[1]]
-        )
+        rel_motion_long = rel_motion_long.masked_fill(~rel_motion_valid, 0.0)
+        rel_motion_lat = rel_motion_lat.masked_fill(~rel_motion_valid, 0.0)
 
         r_a2a = torch.stack(
             [

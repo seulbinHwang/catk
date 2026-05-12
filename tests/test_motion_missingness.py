@@ -238,7 +238,9 @@ def test_open_loop_train_context_preserves_motion_missingness() -> None:
 
     assert motion_features[2, -1].item() == 0.0  # invalid/valid boundary, zero value but missing.
     assert motion_features[5, -1].item() == 1.0  # stationary, zero value and valid.
-    assert motion_features[5, 0].item() == 0.0
+    torch.testing.assert_close(motion_features[5, 0], torch.tensor(0.0), atol=1.0e-5, rtol=0.0)
+    torch.testing.assert_close(relation_features[:, 3], torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(relation_features[:, 4], torch.tensor([0.0, 0.0]))
     torch.testing.assert_close(relation_features[:, -1], torch.tensor([0.0, 1.0]))
 
 
@@ -248,6 +250,8 @@ def test_open_loop_eval_context_preserves_motion_missingness() -> None:
     assert motion_features[0, -1].item() == 0.0  # first context step has no previous motion.
     assert motion_features[2, -1].item() == 0.0
     assert motion_features[8, -1].item() == 1.0
+    torch.testing.assert_close(relation_features[:, 3], torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(relation_features[:, 4], torch.tensor([0.0, 0.0]))
     torch.testing.assert_close(relation_features[:, -1], torch.tensor([0.0, 1.0]))
 
 
@@ -351,8 +355,10 @@ def test_closed_loop_initial_cache_preserves_motion_missingness() -> None:
     relation_features = decoder.r_a2a_emb.continuous_inputs
     assert motion_features[0, -1].item() == 0.0
     assert motion_features[1, -1].item() == 0.0
-    assert motion_features[3, -1].item() == 0.0
-    assert motion_features[4, -1].item() == 1.0
+    assert motion_features[3, -1].item() == 1.0
+    assert motion_features[5, -1].item() == 1.0
+    torch.testing.assert_close(relation_features[:, 3], torch.tensor([0.0, 1.0]))
+    torch.testing.assert_close(relation_features[:, 4], torch.tensor([0.0, 0.0]))
     torch.testing.assert_close(relation_features[:, -1], torch.tensor([0.0, 1.0]))
 
 
