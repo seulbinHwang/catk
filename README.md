@@ -1935,7 +1935,7 @@ python scripts/waymo_save_storage_state.py --browser-channel chrome
 자주 바꿀 수 있는 값은 환경변수로 덮어쓸 수 있습니다.
 
 ```bash
-CACHE_ROOT=/mnt/nuplan/projects/catk/womd_v1_3/SMART_cache \
+CACHE_ROOT=/media/user/E/dataset/womd_v1_3/SMART_cache \
 NPROC_PER_NODE=4 \
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 bash scripts/run_wosac_val_submit_v100x47_epoch_last_48v4vo86.sh
