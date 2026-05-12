@@ -14,7 +14,11 @@ CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints/wandb/flow_control_space_pretrain
 CKPT_PATH="${CKPT_PATH:-${CKPT_DIR}/epoch_last.ckpt}"
 WANDB_DOWNLOAD_DIR="${WANDB_DOWNLOAD_DIR:-${CKPT_DIR}/artifact_download}"
 CACHE_ROOT="${CACHE_ROOT:-/media/user/E/dataset/womd_v1_3/SMART_cache}"
-LOG_DIR="${LOG_DIR:-${REPO_ROOT}/logs}"
+DEFAULT_LOG_DIR="${REPO_ROOT}/logs"
+if [[ -d "/media/user/D" && -w "/media/user/D" ]]; then
+  DEFAULT_LOG_DIR="/media/user/D/catk_wosac_val_logs"
+fi
+LOG_DIR="${LOG_DIR:-${DEFAULT_LOG_DIR}}"
 TASK_NAME="${TASK_NAME:-flow_control_space_pretrain_v100x47_prefix_roundtrip2_bs8_wosac_val_submit}"
 CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
 PRECISION="${PRECISION:-bf16-mixed}"
