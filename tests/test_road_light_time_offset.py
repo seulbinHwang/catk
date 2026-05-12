@@ -128,11 +128,11 @@ def test_agent_lane_relation_receives_closed_loop_and_road_stale_values() -> Non
     )
     torch.testing.assert_close(
         _agent_lane_relation_light_time_values(block1),
-        torch.tensor([0.5 / 6.0, 0.5 / 6.0], dtype=torch.float32),
+        torch.tensor([0.5 / 6.0, 0.0], dtype=torch.float32),
     )
     torch.testing.assert_close(
         _agent_lane_relation_light_time_values(road_block3_context),
-        torch.tensor([1.5 / 6.0, 1.5 / 6.0], dtype=torch.float32),
+        torch.tensor([1.5 / 6.0, 0.0], dtype=torch.float32),
     )
 
 
