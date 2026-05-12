@@ -36,6 +36,7 @@ from src.smart.modules.draft_physics import (
     DraftPhysicsRegularizer,
 )
 from src.smart.modules.self_forced_path_flow import (
+    build_anchor0_normalized_committed_control,
     build_anchor0_normalized_committed_path,
     build_anchor0_physics_inputs,
     get_anchor0_valid_mask,
@@ -2001,15 +2002,16 @@ class SMARTFlow(LightningModule):
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
     ) -> tuple[Tensor, Tensor]:
-        """committed rollout을 첫 anchor 기준 packed N초 path로 변환합니다.
+        """committed rollout을 첫 anchor 기준 packed N초 flow state로 변환합니다.
 
         Args:
             rollout: ``_run_self_forced_rollout`` 의 출력입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
 
         Returns:
-            tuple[Tensor, Tensor]: packed path와 agent mask입니다.
-                packed path shape은 ``[n_valid_agent, F_win, 4]`` 이고,
+            tuple[Tensor, Tensor]: packed flow state와 agent mask입니다.
+                pose-space shape은 ``[n_valid_agent, F_win, 4]`` 이고,
+                control-space shape은 ``[n_valid_agent, F_win, 3]`` 이며,
                 mask shape은 ``[n_agent]`` 입니다.
 
         Notes:
@@ -2024,7 +2026,18 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             flow_window_steps=self.flow_window_steps,
         )
-        return committed_path_norm[anchor_mask], anchor_mask
+        packed_path_norm = committed_path_norm[anchor_mask]
+        if self.use_kinematic_control_flow:
+            packed_path_norm = build_anchor0_normalized_committed_control(
+                committed_path_norm=packed_path_norm,
+                tokenized_agent=tokenized_agent,
+                anchor_mask=anchor_mask,
+                pos_scale_m=self.encoder.agent_encoder.control_pos_scale_m,
+                vehicle_yaw_scale_rad=self.encoder.agent_encoder.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.encoder.agent_encoder.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
+            )
+        return packed_path_norm, anchor_mask
 
     def _update_generated_path_flow_estimator(
         self,
@@ -2038,8 +2051,9 @@ class SMARTFlow(LightningModule):
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 N초 path입니다.
-                shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
+            committed_path_norm: Generator가 실제로 실행한 N초 self-forced flow state입니다.
+                pose-space에서는 ``[n_valid_agent, F_win, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, F_win, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -2114,14 +2128,15 @@ class SMARTFlow(LightningModule):
         Args:
             tokenized_map: map token 사전입니다.
             tokenized_agent: agent token 사전입니다.
-            committed_path_norm: Generator가 closed-loop로 실제 실행한 path입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            committed_path_norm: Generator가 closed-loop로 실제 실행한 self-forced flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor 기준으로 유효한 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
         Returns:
             Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
-            shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            shape은 ``committed_path_norm`` 과 같습니다.
 
         설명:
             Generator update에서 target teacher와 generated estimator는 학습 대상이 아닙니다.
@@ -2173,8 +2188,9 @@ class SMARTFlow(LightningModule):
         """SiD/DMD teacher query에 쓸 noisy path를 샘플링합니다.
 
         Args:
-            clean_path_norm: Generator가 만든 clean path입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            clean_path_norm: Generator가 만든 clean flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
 
         Returns:
             object: ``x_t`` 와 ``tau`` 를 가진 flow sample입니다.
@@ -2204,14 +2220,15 @@ class SMARTFlow(LightningModule):
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 path입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            committed_path_norm: Generator가 실제로 실행한 self-forced flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
         Returns:
             tuple[Tensor, Tensor]: ``target_clean_norm`` 과 ``generated_clean_norm`` 입니다.
-                각 shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+                각 shape은 ``committed_path_norm`` 과 같습니다.
         """
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
@@ -2257,8 +2274,9 @@ class SMARTFlow(LightningModule):
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 path ``X`` 입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            committed_path_norm: Generator가 실제로 실행한 self-forced flow state ``X`` 입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -2296,8 +2314,9 @@ class SMARTFlow(LightningModule):
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            committed_path_norm: Generator가 실제로 실행한 path입니다.
-                shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            committed_path_norm: Generator가 실제로 실행한 self-forced flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 

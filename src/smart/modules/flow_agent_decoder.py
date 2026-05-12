@@ -1949,13 +1949,15 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         Args:
             tokenized_agent: 평가 모드 기준 토큰 사전입니다.
             map_feature: 이 decoder가 직접 만든 지도 특징입니다.
-            path_noisy_norm: noisy N초 path입니다. shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            path_noisy_norm: noisy N초 flow state입니다.
+                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent 마스크입니다. shape은 ``[n_agent]`` 입니다.
 
         Returns:
             Dict[str, torch.Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다. 두 텐서 shape은
-            ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
+            ``[n_valid_agent, flow_window_steps, flow_state_dim]`` 입니다.
         """
         if path_noisy_norm.numel() == 0:
             empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))

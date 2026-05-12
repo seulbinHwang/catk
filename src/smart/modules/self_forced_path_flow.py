@@ -5,6 +5,12 @@ from typing import Dict
 import torch
 from torch import Tensor
 
+from src.smart.modules.kinematic_control import (
+    CONTROL_FLOW_DIM,
+    POSE_FLOW_DIM,
+    POSE_NORM_POS_SCALE_M,
+    build_rolling_control_target,
+)
 from src.smart.utils import transform_to_local
 
 
@@ -119,6 +125,70 @@ def build_anchor0_normalized_committed_path(
             path_head_local.sin(),
         ],
         dim=-1,
+    )
+
+
+def build_anchor0_normalized_committed_control(
+    committed_path_norm: Tensor,
+    tokenized_agent: Dict[str, Tensor],
+    anchor_mask: Tensor,
+    *,
+    pos_scale_m: float,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
+    pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
+) -> Tensor:
+    """첫 anchor 기준 pose rollout을 control-space self-forced flow state로 바꿉니다.
+
+    Args:
+        committed_path_norm: ``build_anchor0_normalized_committed_path`` 가 만든
+            anchor-local pose path입니다. shape은 ``[n_valid_agent, T, 4]`` 입니다.
+        tokenized_agent: 평가 모드 토큰 사전입니다. ``type`` 이 들어 있어야 합니다.
+        anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+        pos_scale_m: control 이동량 정규화 scale입니다.
+        vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
+        pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
+        cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
+        pose_pos_scale_m: pose-space 위치 정규화 scale입니다.
+
+    Returns:
+        Tensor: 정규화된 rolling control path입니다.
+            shape은 ``[n_valid_agent, T, 3]`` 입니다.
+    """
+    if committed_path_norm.ndim != 3 or committed_path_norm.shape[-1] != POSE_FLOW_DIM:
+        raise ValueError(
+            "committed_path_norm must have shape [n_valid_agent, T, 4], "
+            f"got {tuple(committed_path_norm.shape)}."
+        )
+    if "type" not in tokenized_agent:
+        raise KeyError("tokenized_agent must contain type for control-space self-forced loss.")
+    if anchor_mask.ndim != 1:
+        raise ValueError(f"anchor_mask must have shape [n_agent], got {tuple(anchor_mask.shape)}.")
+
+    agent_type = tokenized_agent["type"][anchor_mask].to(device=committed_path_norm.device)
+    if agent_type.shape[0] != committed_path_norm.shape[0]:
+        raise ValueError(
+            "anchor_mask selected agent count must match committed_path_norm batch: "
+            f"got {agent_type.shape[0]} and {committed_path_norm.shape[0]}."
+        )
+    if committed_path_norm.shape[0] == 0:
+        return committed_path_norm.new_zeros((0, committed_path_norm.shape[1], CONTROL_FLOW_DIM))
+
+    future_pos = committed_path_norm[..., :2] * float(pose_pos_scale_m)
+    future_head = torch.atan2(committed_path_norm[..., 3], committed_path_norm[..., 2])
+    current_pos = future_pos.new_zeros((future_pos.shape[0], 2))
+    current_head = future_head.new_zeros((future_head.shape[0],))
+    return build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        pos_scale_m=pos_scale_m,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
 
 
