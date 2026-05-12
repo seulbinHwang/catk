@@ -21,7 +21,10 @@ from torch_geometric.utils import dense_to_sparse, subgraph
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from src.smart.modules.dynamic_light_time import resolve_light_time_delta_norm
+from src.smart.modules.dynamic_light_time import (
+    mask_light_time_delta_norm_by_light_type,
+    resolve_light_time_delta_norm,
+)
 from src.smart.utils import angle_between_2d_vectors, safe_norm_2d, weight_init, wrap_angle
 
 
@@ -410,6 +413,11 @@ class SMARTAgentEncoder(nn.Module):
         )
         light_time_delta_flat = light_time_delta_norm.transpose(0, 1).reshape(-1)
         edge_light_time_delta_norm = light_time_delta_flat[edge_index_pl2a[1]]
+        edge_light_type = light_type[edge_index_pl2a[0]]
+        edge_light_time_delta_norm = mask_light_time_delta_norm_by_light_type(
+            light_time_delta_norm=edge_light_time_delta_norm,
+            light_type=edge_light_type,
+        )
         rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
         rel_orient_pl2a = wrap_angle(
             orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]]
@@ -428,6 +436,6 @@ class SMARTAgentEncoder(nn.Module):
         )
         r_pl2a = self.r_pt2a_emb(
             continuous_inputs=r_pl2a,
-            categorical_embs=[self.light_pl2a_emb(light_type[edge_index_pl2a[0]])],
+            categorical_embs=[self.light_pl2a_emb(edge_light_type)],
         )
         return edge_index_pl2a, r_pl2a

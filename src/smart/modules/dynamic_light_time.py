@@ -10,6 +10,7 @@ DEFAULT_LIGHT_TIME_MAX_SECONDS = 6.0
 DEFAULT_LIGHT_TIME_NORMALIZER_SECONDS = 6.0
 DEFAULT_WAYMO_CURRENT_RAW_STEP = 10
 DEFAULT_SECONDS_PER_RAW_STEP = 0.1
+NO_LANE_STATE_LIGHT_TYPE = 0
 
 
 def normalize_light_time_delta_seconds(
@@ -38,6 +39,22 @@ def normalize_light_time_delta_seconds(
     return delta_seconds.clamp(min=float(min_seconds), max=float(max_seconds)) / float(
         normalizer_seconds
     )
+
+
+def mask_light_time_delta_norm_by_light_type(
+    light_time_delta_norm: torch.Tensor,
+    light_type: torch.Tensor,
+) -> torch.Tensor:
+    """관측된 traffic-light가 없는 지도 요소의 시간차를 제거합니다.
+
+    ``NO_LANE_STATE`` 는 신호 관측 자체가 없는 상태이고, ``UNKNOWN`` 은 관측은
+    됐지만 상태를 모르는 상태이므로 시간차를 유지합니다.
+    """
+    observed_signal = light_type.to(
+        device=light_time_delta_norm.device,
+        dtype=torch.long,
+    ) != NO_LANE_STATE_LIGHT_TYPE
+    return light_time_delta_norm.masked_fill(~observed_signal, 0.0)
 
 
 def build_context_light_time_delta_norm(
