@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import sys
+import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
@@ -483,6 +484,7 @@ def maybe_submit_waymo_submission(cfg: DictConfig) -> WaymoSubmissionResult | No
         return None
 
     runtime = _build_runtime_config(cfg)
+    _validate_complete_validation_archive_before_upload(cfg=cfg, runtime=runtime)
 
     log.info(
         "Submitting %s to Waymo %s set via %s.",
@@ -506,6 +508,96 @@ def is_waymo_submission_enabled_for_action(
     if normalized_action == "test":
         return submit_test
     return False
+
+
+def _validate_complete_validation_archive_before_upload(
+    *,
+    cfg: DictConfig,
+    runtime: _WaymoSubmissionRuntime,
+) -> None:
+    """validation 자동 제출 전 archive가 전체 validation split을 담았는지 확인합니다."""
+    if runtime.evaluation_set != "validation":
+        return
+
+    verify_env = str(os.environ.get("WAYMO_VERIFY_COMPLETE_ARCHIVE", "1")).strip().lower()
+    if verify_env in {"0", "false", "no", "off"}:
+        log.warning("Skipping complete validation archive check by WAYMO_VERIFY_COMPLETE_ARCHIVE=%s.", verify_env)
+        return
+
+    limit_val_batches = cfg.trainer.get("limit_val_batches")
+    if not (
+        isinstance(limit_val_batches, float)
+        and float(limit_val_batches) == 1.0
+    ):
+        log.warning(
+            "Skipping complete validation archive check because trainer.limit_val_batches=%r "
+            "is not float 1.0.",
+            limit_val_batches,
+        )
+        return
+
+    cache_root = Path(str(cfg.paths.cache_root)).expanduser().resolve()
+    validation_dir = cache_root / "validation"
+    if not validation_dir.is_dir():
+        raise FileNotFoundError(
+            "Validation cache directory was not found while checking Waymo archive completeness: "
+            f"{validation_dir}"
+        )
+
+    expected_scenarios = sum(1 for path in validation_dir.iterdir() if path.is_file())
+    if expected_scenarios <= 0:
+        raise RuntimeError(
+            "Validation cache directory does not contain any scenario files: "
+            f"{validation_dir}"
+        )
+
+    scenario_ids = _read_submission_archive_scenario_ids(runtime.archive_path)
+    unique_scenario_ids = set(scenario_ids)
+    duplicate_count = len(scenario_ids) - len(unique_scenario_ids)
+    if duplicate_count:
+        raise RuntimeError(
+            "Waymo validation archive contains duplicate scenario rollouts: "
+            f"total={len(scenario_ids)}, unique={len(unique_scenario_ids)}, "
+            f"duplicates={duplicate_count}, archive={runtime.archive_path}"
+        )
+    if len(unique_scenario_ids) != expected_scenarios:
+        raise RuntimeError(
+            "Waymo validation archive is incomplete; refusing to upload. "
+            f"archive_scenarios={len(unique_scenario_ids)}, "
+            f"expected_validation_scenarios={expected_scenarios}, "
+            f"archive={runtime.archive_path}"
+        )
+
+    log.info(
+        "Verified complete Waymo validation archive before upload: %s scenarios in %s.",
+        len(unique_scenario_ids),
+        runtime.archive_path,
+    )
+
+
+def _read_submission_archive_scenario_ids(archive_path: Path) -> list[str]:
+    from waymo_open_dataset.protos import sim_agents_submission_pb2
+
+    scenario_ids: list[str] = []
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = [member for member in archive.getmembers() if member.isfile()]
+        if not members:
+            raise RuntimeError(f"Waymo submission archive contains no files: {archive_path}")
+        for member in members:
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise RuntimeError(
+                    f"Failed to read Waymo submission archive member {member.name!r} "
+                    f"from {archive_path}"
+                )
+            payload = extracted.read()
+            submission = sim_agents_submission_pb2.SimAgentsChallengeSubmission()
+            submission.ParseFromString(payload)
+            scenario_ids.extend(str(rollout.scenario_id) for rollout in submission.scenario_rollouts)
+
+    if not scenario_ids:
+        raise RuntimeError(f"Waymo submission archive contains no scenario rollouts: {archive_path}")
+    return scenario_ids
 
 
 def _build_runtime_config(cfg: DictConfig) -> _WaymoSubmissionRuntime:

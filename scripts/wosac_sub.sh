@@ -9,6 +9,8 @@ MY_TASK_NAME="sim_agents_2025-$ACTION-debug"
 
 CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
 . "$(dirname "$0")/_activate_conda.sh"
+. "$(dirname "$0")/_wandb_env.sh"
+require_wandb_env
 python \
   -m src.run \
   experiment=$MY_EXPERIMENT \

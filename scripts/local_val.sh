@@ -8,6 +8,8 @@ MY_TASK_NAME=$MY_EXPERIMENT"-debug"
 
 CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
 . "$(dirname "$0")/_activate_conda.sh"
+. "$(dirname "$0")/_wandb_env.sh"
+require_wandb_env
 # local_val runs on single GPU
 python \
   -m src.run \
