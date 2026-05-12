@@ -1506,6 +1506,7 @@ class SMARTFlow(LightningModule):
         Returns:
             None
         """
+        self._assert_motion_missingness_checkpoint_compatible(checkpoint)
         state_dict = checkpoint.get("state_dict", {})
         has_target_teacher = any(
             key.startswith("self_forced_target_teacher.") for key in state_dict
@@ -1522,6 +1523,34 @@ class SMARTFlow(LightningModule):
         self._self_forced_generator_ema_loaded_from_checkpoint = bool(
             self.self_forced_enabled and has_generator_ema
         )
+
+    def _assert_motion_missingness_checkpoint_compatible(self, checkpoint: Dict[str, Any]) -> None:
+        """motion missingness 입력 차원과 맞지 않는 예전 checkpoint를 명확히 거부합니다."""
+        state_dict = checkpoint.get("state_dict", {})
+        if not isinstance(state_dict, dict):
+            return
+        current_state = self.state_dict()
+        guarded_keys = [
+            "encoder.agent_encoder.x_a_emb.freqs.weight",
+            "encoder.agent_encoder.r_a2a_emb.freqs.weight",
+        ]
+        mismatches: list[str] = []
+        for key in guarded_keys:
+            checkpoint_value = state_dict.get(key)
+            current_value = current_state.get(key)
+            if checkpoint_value is None or current_value is None:
+                continue
+            if tuple(checkpoint_value.shape) != tuple(current_value.shape):
+                mismatches.append(
+                    f"{key}: checkpoint={tuple(checkpoint_value.shape)}, "
+                    f"current={tuple(current_value.shape)}"
+                )
+        if mismatches:
+            raise RuntimeError(
+                "Motion Missingness Feature changes flow context input dimensions and "
+                "requires a fresh pretrain checkpoint. Incompatible checkpoint tensors: "
+                + "; ".join(mismatches)
+            )
 
     def _manual_backward_without_autocast(self, loss: Tensor) -> None:
         """manual optimization의 backward만 autocast 밖에서 실행합니다.

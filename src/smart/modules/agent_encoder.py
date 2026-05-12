@@ -154,6 +154,11 @@ class SMARTAgentEncoder(nn.Module):
         valid_mask: Optional[torch.Tensor] = None,
         inference=False,
     ):
+        if valid_mask is None:
+            raise ValueError(
+                "valid_mask is required for agent motion features. Missing motion must "
+                "not be treated as valid stationary motion."
+            )
         n_agent, n_step, traj_dim = pos_a.shape
         device = pos_a.device
 
@@ -225,8 +230,10 @@ class SMARTAgentEncoder(nn.Module):
             return motion_valid_a
 
         if valid_mask is None:
-            motion_valid_a[:, 1:] = True
-            return motion_valid_a
+            raise ValueError(
+                "valid_mask is required to build motion_valid. Missing motion must "
+                "not be treated as valid stationary motion."
+            )
 
         if tuple(valid_mask.shape) != (n_agent, n_step):
             raise ValueError(
