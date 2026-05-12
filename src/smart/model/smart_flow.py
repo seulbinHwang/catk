@@ -914,7 +914,7 @@ class SMARTFlow(LightningModule):
         Args:
             map_feature: 지도 인코더 출력입니다.
                 ``pt_token`` 과 ``position`` 은 ``[n_map_token, ...]`` 이고,
-                ``batch`` 는 ``[n_map_token]`` 입니다.
+                ``light_type`` 과 ``batch`` 는 ``[n_map_token]`` 입니다.
             repeat_count: 이번에 동시에 돌릴 rollout 개수입니다.
             num_graphs: 원본 batch 안 장면 개수입니다.
 
@@ -925,7 +925,7 @@ class SMARTFlow(LightningModule):
         """
         if repeat_count == 1:
             return map_feature
-        return {
+        expanded_map_feature = {
             "pt_token": self._repeat_tensor_on_first_dim(map_feature["pt_token"], repeat_count),
             "position": self._repeat_tensor_on_first_dim(map_feature["position"], repeat_count),
             "orientation": self._repeat_tensor_on_first_dim(
@@ -937,6 +937,12 @@ class SMARTFlow(LightningModule):
                 num_graphs=num_graphs,
             ),
         }
+        if "light_type" in map_feature:
+            expanded_map_feature["light_type"] = self._repeat_tensor_on_first_dim(
+                map_feature["light_type"],
+                repeat_count,
+            )
+        return expanded_map_feature
 
     def _build_parallel_rollout_tokenized_agent(
         self,

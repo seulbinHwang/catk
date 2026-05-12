@@ -51,6 +51,7 @@
 - 시간 차는 `[-1초, +6초]` 범위로 clip 한 뒤 `6초` 로 나눠 정규화합니다.
 - 따라서 모델 입력 의미는 `이 lane은 빨간불이다` 가 아니라 `이 lane은 Δt초 전에 빨간불로 관측됐다` 입니다.
 - pretrain과 closed-loop 추론 모두 실제 미래 신호를 입력하지 않고, 현재 관측 신호와 경과 시간만 사용합니다.
+- closed-loop validation/test에서 여러 rollout을 병렬 실행할 때도 traffic-light 상태를 map token과 같은 순서로 복제합니다.
 - 이 변경은 map encoder의 정적 traffic-light embedding을 제거하고, agent-lane relation 쪽에 동적 traffic-light embedding과 시간 차 scalar를 추가하므로 기존 pretrained checkpoint와 호환되지 않습니다. 새 pretrain을 기준으로 사용합니다.
 
 ### Motion Missingness Feature
