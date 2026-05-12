@@ -36,8 +36,6 @@ model:
       unfrozen_range: except_map_encoder
       ema_weight: 0.99
       ema_start_step: 50
-      use_control_space_physics_regularization: false
-      physics_weight: 0.005
       sampling:
         sample_steps: 32
         sample_method: euler

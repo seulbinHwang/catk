@@ -53,52 +53,6 @@ model_config:
     sample_steps: 32
     sample_method: euler
     noise_scale: 1.0
-  draft:
-    enabled: false
-    loss_enabled: true
-    start_epoch: 0
-    ramp_epochs: 4
-    max_weight: 1.0
-    sampling:
-      sample_steps: 32
-      sample_method: euler
-      noise_scale: 1.0
-      random_terminal_step:
-        enabled: true
-        scope: global_batch
-        # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
-        policy: paper_uniform
-        min_executed_steps: 24
-    physics:
-      force_fp32: true
-      dt: 0.1
-      pos_scale_m: 20.0
-      speed_floor_mps: 0.5
-      vehicle_v_max_mps: 35.0
-      vehicle_a_max_mps2: 8.0
-      vehicle_lat_accel_max_mps2: 4.2
-      bicycle_v_max_mps: 22.0
-      bicycle_a_max_mps2: 5.5
-      bicycle_lat_accel_max_mps2: 4.4
-      vehicle_beta_max_rad: 0.27
-      bicycle_beta_max_rad: 0.70
-      pedestrian_v_max_mps: 5.0
-      pedestrian_a_max_mps2: 4.7
-      vehicle_wheelbase_scale: 0.60
-      bicycle_wheelbase_scale: 0.85
-      vehicle_steer_max_rad: 0.55
-      bicycle_steer_max_rad: 0.90
-      vehicle_steer_rate_max_radps: 0.8
-      bicycle_steer_rate_max_radps: 1.4
-      soft_weight: 0.25
-      compare_softness_to_gt: false
-      use_slip_penalty: true
-      commit_loss_weight: 1.0
-      soft_limit_ratio: 0.9
-      topk_violation_k: 20
-      pedestrian_heading_weight: 0.05
-      pedestrian_heading_speed_threshold_mps: 0.5
-      eps: 1.0e-6
   self_forced:
     enabled: false
     start_epoch: 0
@@ -134,32 +88,6 @@ model_config:
         # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
         policy: paper_uniform
         min_executed_steps: 24
-    use_control_space_physics_regularization: false
-    physics_weight: 0.005
-    physics:
-      force_fp32: true
-      dt: 0.1
-      pos_scale_m: 20.0
-      speed_floor_mps: 0.5
-      vehicle_v_max_mps: 35.0
-      vehicle_a_max_mps2: 8.0
-      vehicle_lat_accel_max_mps2: 4.2
-      bicycle_v_max_mps: 22.0
-      bicycle_a_max_mps2: 5.5
-      bicycle_lat_accel_max_mps2: 4.4
-      pedestrian_v_max_mps: 5.0
-      pedestrian_a_max_mps2: 4.7
-      vehicle_wheelbase_scale: 0.60
-      bicycle_wheelbase_scale: 0.85
-      vehicle_steer_max_rad: 0.55
-      bicycle_steer_max_rad: 0.90
-      vehicle_steer_rate_max_radps: 0.8
-      bicycle_steer_rate_max_radps: 1.4
-      soft_weight: 0.25
-      compare_softness_to_gt: false
-      pedestrian_heading_weight: 0.05
-      pedestrian_heading_speed_threshold_mps: 0.5
-      eps: 1.0e-6
   decoder:
     hidden_dim: 128
     num_freq_bands: 64

@@ -30,15 +30,9 @@ from src.smart.metrics.flow_metrics import (
     yaw_ade_future,
     yaw_fde_future,
 )
-from src.smart.modules.draft_physics import (
-    DRAFT_PHYSICS_ACTUAL_UNIT_KEYS,
-    DRAFT_PHYSICS_COMPONENT_KEYS,
-    DraftPhysicsRegularizer,
-)
 from src.smart.modules.self_forced_path_flow import (
     build_anchor0_normalized_committed_control,
     build_anchor0_normalized_committed_path,
-    build_anchor0_physics_inputs,
     get_anchor0_valid_mask,
     masked_mean_square_loss,
 )
@@ -153,90 +147,6 @@ class SMARTFlow(LightningModule):
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
-
-        draft_config = getattr(model_config, "draft", None)
-        self.draft_enabled = bool(draft_config is not None and getattr(draft_config, "enabled", False))
-        self.draft_loss_enabled = bool(
-            self.draft_enabled and getattr(draft_config, "loss_enabled", True)
-        )
-        if self.use_kinematic_control_flow and self.draft_loss_enabled:
-            raise ValueError(
-                "control-space Flow Matching requires a single loss in control space; "
-                "draft physics regularizer pulls decoded trajectories toward pose-space targets "
-                "and must not run with token_processor.use_kinematic_control_flow=true. "
-                "Set draft.enabled=false or draft.loss_enabled=false."
-            )
-        self.draft_sampling = getattr(draft_config, "sampling", None)
-        self.draft_start_epoch = int(getattr(draft_config, "start_epoch", 0)) if draft_config is not None else 0
-        self.draft_ramp_epochs = int(getattr(draft_config, "ramp_epochs", 1)) if draft_config is not None else 1
-        self.draft_max_weight = float(getattr(draft_config, "max_weight", 0.0)) if draft_config is not None else 0.0
-        self.draft_physics_force_fp32 = False
-
-        if self.draft_loss_enabled:
-            draft_physics = getattr(draft_config, "physics")
-            self.draft_physics_force_fp32 = bool(getattr(draft_physics, "force_fp32", True))
-            self.draft_regularizer = DraftPhysicsRegularizer(
-                dt=float(getattr(draft_physics, "dt", 0.1)),
-                pos_scale_m=float(getattr(draft_physics, "pos_scale_m", 20.0)),
-                speed_floor_mps=float(getattr(draft_physics, "speed_floor_mps", 0.5)),
-                vehicle_v_max_mps=float(getattr(draft_physics, "vehicle_v_max_mps", 35.0)),
-                vehicle_a_max_mps2=float(getattr(draft_physics, "vehicle_a_max_mps2", 8.0)),
-                vehicle_lat_accel_max_mps2=float(
-                    getattr(draft_physics, "vehicle_lat_accel_max_mps2", 4.2)
-                ),
-                bicycle_v_max_mps=float(getattr(draft_physics, "bicycle_v_max_mps", 22.0)),
-                bicycle_a_max_mps2=float(getattr(draft_physics, "bicycle_a_max_mps2", 5.5)),
-                bicycle_lat_accel_max_mps2=float(
-                    getattr(draft_physics, "bicycle_lat_accel_max_mps2", 4.4)
-                ),
-                pedestrian_v_max_mps=float(getattr(draft_physics, "pedestrian_v_max_mps", 5.0)),
-                pedestrian_a_max_mps2=float(getattr(draft_physics, "pedestrian_a_max_mps2", 4.7)),
-                vehicle_wheelbase_scale=float(
-                    getattr(draft_physics, "vehicle_wheelbase_scale", 0.60)
-                ),
-                bicycle_wheelbase_scale=float(
-                    getattr(draft_physics, "bicycle_wheelbase_scale", 0.85)
-                ),
-                vehicle_steer_max_rad=float(getattr(draft_physics, "vehicle_steer_max_rad", 0.55)),
-                bicycle_steer_max_rad=float(getattr(draft_physics, "bicycle_steer_max_rad", 1.00)),
-                vehicle_steer_rate_max_radps=float(
-                    getattr(draft_physics, "vehicle_steer_rate_max_radps", 0.8)
-                ),
-                bicycle_steer_rate_max_radps=float(
-                    getattr(draft_physics, "bicycle_steer_rate_max_radps", 1.5)
-                ),
-                vehicle_beta_max_rad=float(getattr(draft_physics, "vehicle_beta_max_rad", 0.27)),
-                bicycle_beta_max_rad=float(getattr(draft_physics, "bicycle_beta_max_rad", 0.70)),
-                soft_weight=float(
-                    getattr(
-                        draft_physics,
-                        "soft_weight",
-                        getattr(
-                            draft_physics,
-                            "vehicle_soft_weight",
-                            getattr(
-                                draft_physics,
-                                "bicycle_soft_weight",
-                                getattr(draft_physics, "pedestrian_soft_weight", 0.25),
-                            ),
-                        ),
-                    )
-                ),
-                compare_softness_to_gt=bool(getattr(draft_physics, "compare_softness_to_gt", True)),
-                use_slip_penalty=bool(getattr(draft_physics, "use_slip_penalty", False)),
-                commit_loss_weight=float(getattr(draft_physics, "commit_loss_weight", 1.0)),
-                soft_limit_ratio=float(getattr(draft_physics, "soft_limit_ratio", 1.0)),
-                topk_violation_k=int(getattr(draft_physics, "topk_violation_k", 1_000_000)),
-                pedestrian_heading_weight=float(
-                    getattr(draft_physics, "pedestrian_heading_weight", 0.05)
-                ),
-                pedestrian_heading_speed_threshold_mps=float(
-                    getattr(draft_physics, "pedestrian_heading_speed_threshold_mps", 0.5)
-                ),
-                eps=float(getattr(draft_physics, "eps", 1e-6)),
-            )
-        else:
-            self.draft_regularizer = None
 
         self.self_forced_config = getattr(model_config, "self_forced", None)
         self.self_forced_enabled = bool(
@@ -358,24 +268,6 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else self.validation_rollout_sampling
         )
-        self.self_forced_use_physics = (
-            bool(getattr(self.self_forced_config, "use_control_space_physics_regularization", False))
-            if self.self_forced_config is not None
-            else False
-        )
-        if self.use_kinematic_control_flow and self.self_forced_use_physics:
-            raise ValueError(
-                "control-space Flow Matching requires a single loss in control space; "
-                "self_forced physics regularizer compares decoded trajectories to pose-space "
-                "targets and must not run with token_processor.use_kinematic_control_flow=true. "
-                "Set self_forced.use_control_space_physics_regularization=false."
-            )
-        self.self_forced_physics_weight = (
-            float(getattr(self.self_forced_config, "physics_weight", 0.0))
-            if self.self_forced_config is not None
-            else 0.0
-        )
-        self.self_forced_physics_force_fp32 = False
         self.self_forced_target_teacher = None
         self.self_forced_generated_estimator = None
         self.self_forced_generator_ema = None
@@ -406,71 +298,6 @@ class SMARTFlow(LightningModule):
                 torch.zeros((), dtype=torch.bool),
                 persistent=True,
             )
-            physics_config = getattr(
-                self.self_forced_config,
-                "physics",
-                getattr(draft_config, "physics", None),
-            )
-            if self.self_forced_use_physics and physics_config is not None:
-                self.self_forced_physics_force_fp32 = bool(getattr(physics_config, "force_fp32", True))
-                self.self_forced_regularizer = DraftPhysicsRegularizer(
-                    dt=float(getattr(physics_config, "dt", 0.1)),
-                    pos_scale_m=float(getattr(physics_config, "pos_scale_m", 20.0)),
-                    speed_floor_mps=float(getattr(physics_config, "speed_floor_mps", 0.5)),
-                    vehicle_v_max_mps=float(getattr(physics_config, "vehicle_v_max_mps", 35.0)),
-                    vehicle_a_max_mps2=float(getattr(physics_config, "vehicle_a_max_mps2", 8.0)),
-                    vehicle_lat_accel_max_mps2=float(
-                        getattr(physics_config, "vehicle_lat_accel_max_mps2", 4.2)
-                    ),
-                    bicycle_v_max_mps=float(getattr(physics_config, "bicycle_v_max_mps", 22.0)),
-                    bicycle_a_max_mps2=float(getattr(physics_config, "bicycle_a_max_mps2", 5.5)),
-                    bicycle_lat_accel_max_mps2=float(
-                        getattr(physics_config, "bicycle_lat_accel_max_mps2", 4.4)
-                    ),
-                    pedestrian_v_max_mps=float(getattr(physics_config, "pedestrian_v_max_mps", 5.0)),
-                    pedestrian_a_max_mps2=float(getattr(physics_config, "pedestrian_a_max_mps2", 4.7)),
-                    vehicle_wheelbase_scale=float(getattr(physics_config, "vehicle_wheelbase_scale", 0.60)),
-                    bicycle_wheelbase_scale=float(getattr(physics_config, "bicycle_wheelbase_scale", 0.85)),
-                    vehicle_steer_max_rad=float(getattr(physics_config, "vehicle_steer_max_rad", 0.55)),
-                    bicycle_steer_max_rad=float(getattr(physics_config, "bicycle_steer_max_rad", 1.00)),
-                    vehicle_steer_rate_max_radps=float(
-                        getattr(physics_config, "vehicle_steer_rate_max_radps", 0.8)
-                    ),
-                    bicycle_steer_rate_max_radps=float(
-                        getattr(physics_config, "bicycle_steer_rate_max_radps", 1.5)
-                    ),
-                    vehicle_beta_max_rad=float(getattr(physics_config, "vehicle_beta_max_rad", 0.27)),
-                    bicycle_beta_max_rad=float(getattr(physics_config, "bicycle_beta_max_rad", 0.70)),
-                    soft_weight=float(
-                        getattr(
-                            physics_config,
-                            "soft_weight",
-                            getattr(
-                                physics_config,
-                                "vehicle_soft_weight",
-                                getattr(
-                                    physics_config,
-                                    "bicycle_soft_weight",
-                                    getattr(physics_config, "pedestrian_soft_weight", 0.25),
-                                ),
-                            ),
-                        )
-                    ),
-                    compare_softness_to_gt=bool(getattr(physics_config, "compare_softness_to_gt", False)),
-                    use_slip_penalty=bool(getattr(physics_config, "use_slip_penalty", False)),
-                    commit_loss_weight=float(getattr(physics_config, "commit_loss_weight", 1.0)),
-                    soft_limit_ratio=float(getattr(physics_config, "soft_limit_ratio", 1.0)),
-                    topk_violation_k=int(getattr(physics_config, "topk_violation_k", 1_000_000)),
-                    pedestrian_heading_weight=float(getattr(physics_config, "pedestrian_heading_weight", 0.05)),
-                    pedestrian_heading_speed_threshold_mps=float(
-                        getattr(physics_config, "pedestrian_heading_speed_threshold_mps", 0.5)
-                    ),
-                    eps=float(getattr(physics_config, "eps", 1e-6)),
-                )
-            else:
-                self.self_forced_regularizer = None
-        else:
-            self.self_forced_regularizer = None
         self._apply_self_forced_unfrozen_range()
 
         self.val_open_epoch_metrics = nn.ModuleDict(
@@ -1482,8 +1309,7 @@ class SMARTFlow(LightningModule):
         설명:
             ``except_map_encoder`` 는 기존 ``freeze_map_encoder=true`` 와 같은 의도입니다.
             ``middle`` 은 마지막 flow decoder와 생성부 바로 앞의 마지막 agent 문맥 블록만 엽니다.
-            ``full_flow_decoder`` 는 draft fine-tuning의 ``train_full_flow_decoder_only=true`` 처럼
-            마지막 궤적 생성부만 엽니다.
+            ``full_flow_decoder`` 는 마지막 궤적 생성부만 엽니다.
         """
         if not self.self_forced_enabled:
             return
@@ -1957,11 +1783,9 @@ class SMARTFlow(LightningModule):
         metric_dict = {
             "sf_loss": zero,
             "gen_estimator_loss": zero,
-            "physics_loss": zero,
             "anchor_loss": zero,
             "total_loss": zero,
         }
-        metric_dict.update(self._build_zero_draft_metrics(reference))
         return metric_dict
 
     def _run_self_forced_rollout(
@@ -2345,60 +2169,6 @@ class SMARTFlow(LightningModule):
         )
         return masked_mean_square_loss(committed_path_norm, target_path_norm)
 
-    def _compute_self_forced_physics_loss(
-        self,
-        committed_path_norm: Tensor,
-        tokenized_agent: Dict[str, Tensor],
-        anchor_mask: Tensor,
-    ) -> Dict[str, Tensor]:
-        """실제로 실행된 committed N초 self-rollout에만 physics loss를 겁니다.
-
-        Args:
-            committed_path_norm: packed committed rollout입니다. shape은
-                ``[n_valid_agent, F_win, 4]`` 입니다.
-            tokenized_agent: 평가 모드 agent token 사전입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
-
-        Returns:
-            Dict[str, Tensor]: physics loss와 세부 항입니다.
-        """
-        if (
-            not self.self_forced_use_physics
-            or self.self_forced_regularizer is None
-            or committed_path_norm.numel() == 0
-        ):
-            return self._build_zero_draft_metrics(committed_path_norm)
-
-        physics_inputs = build_anchor0_physics_inputs(
-            tokenized_agent=tokenized_agent,
-            anchor_mask=anchor_mask,
-        )
-        if not self.self_forced_physics_force_fp32:
-            physics_dict = self.self_forced_regularizer(
-                pred_future_norm=committed_path_norm,
-                target_future_norm=committed_path_norm.detach(),
-                packed_agent_type=physics_inputs["agent_type"],
-                packed_agent_length=physics_inputs["agent_length"],
-                packed_prev_control=physics_inputs["prev_control"],
-                packed_prev_control_valid=physics_inputs["prev_control_valid"],
-            )
-            if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-                return self._build_zero_draft_metrics(committed_path_norm)
-            return physics_dict
-
-        with torch.autocast(device_type=committed_path_norm.device.type, enabled=False):
-            physics_dict = self.self_forced_regularizer(
-                pred_future_norm=committed_path_norm.float(),
-                target_future_norm=committed_path_norm.detach().float(),
-                packed_agent_type=physics_inputs["agent_type"],
-                packed_agent_length=physics_inputs["agent_length"].float(),
-                packed_prev_control=physics_inputs["prev_control"].float(),
-                packed_prev_control_valid=physics_inputs["prev_control_valid"],
-            )
-        if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-            return self._build_zero_draft_metrics(committed_path_norm)
-        return physics_dict
-
     def on_fit_start(self) -> None:
         """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.
 
@@ -2426,43 +2196,6 @@ class SMARTFlow(LightningModule):
         """
         self._restore_fit_time_validation_batch_limit()
 
-
-    def _get_draft_loss_weight(self) -> float:
-        """현재 epoch에서 사용할 DRaFT physics 가중치를 계산합니다.
-
-        Returns:
-            float:
-                warm-up 이전이면 ``0.0`` 이고,
-                그 뒤에는 설정한 최대값까지 선형으로 올라갑니다.
-        """
-        if not self.draft_loss_enabled or self.draft_max_weight <= 0.0:
-            return 0.0
-
-        current_epoch = int(self.current_epoch)
-        if current_epoch < self.draft_start_epoch:
-            return 0.0
-
-        if self.draft_ramp_epochs <= 1:
-            return self.draft_max_weight
-
-        progress = (current_epoch - self.draft_start_epoch + 1) / float(self.draft_ramp_epochs)
-        progress = min(max(progress, 0.0), 1.0)
-        return self.draft_max_weight * progress
-
-    def _build_zero_draft_metrics(self, reference: Tensor) -> Dict[str, Tensor]:
-        """DRaFT logging에 필요한 0 metric 사전을 만듭니다."""
-        zero = reference.new_zeros(())
-        metric_dict = {
-            "loss": zero,
-            "raw_pred_loss": zero,
-        }
-        for key in DRAFT_PHYSICS_COMPONENT_KEYS:
-            metric_dict[key] = zero
-        for key in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
-            metric_dict[key] = zero
-            metric_dict[f"pred_{key}"] = zero
-            metric_dict[f"gt_{key}"] = zero
-        return metric_dict
 
     def _find_first_nonfinite_parameter(self) -> tuple[str, Tensor] | None:
         """처음 발견한 non-finite trainable parameter를 반환합니다."""
@@ -2512,186 +2245,6 @@ class SMARTFlow(LightningModule):
         ]
         return " Self-forced backward context: " + "; ".join(summaries)
 
-    def _sample_draft_eval_future(
-        self,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ) -> tuple[Tensor, Dict[str, Tensor]]:
-        """DRaFT physics target trajectory를 inference와 같은 eval mode에서 생성합니다."""
-        encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
-        try:
-            draft_context = self.encoder.build_anchor_context(
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-                anchor_mask_key="flow_train_mask",
-            )
-            pred_sample_norm = self.encoder.sample_open_loop_future(
-                anchor_hidden=draft_context["anchor_hidden"],
-                anchor_mask=draft_context["anchor_mask"],
-                sampling_scheme=self.draft_sampling,
-            )
-        finally:
-            self._restore_module_training_modes(encoder_modes)
-        return pred_sample_norm, draft_context
-
-    def _compute_draft_training_loss(
-        self,
-        pred_dict: Dict[str, Tensor],
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ) -> Dict[str, Tensor]:
-        """실제 샘플러를 돌린 최종 미래에 physics loss를 계산합니다.
-
-        Args:
-            pred_dict: flow decoder 출력 사전입니다.
-                ``anchor_hidden`` 은 ``[n_agent, 13, hidden_dim]`` 이고,
-                ``flow_clean_norm`` 은 ``[n_valid_anchor, 20, 4]`` 입니다.
-            tokenized_map: 학습용 맵 토큰 사전입니다.
-            tokenized_agent: 학습용 에이전트 토큰 사전입니다.
-                DRaFT용 packed 메타데이터가 들어 있어야 합니다.
-
-        Returns:
-            Dict[str, Tensor]:
-                총 physics loss와 세부 항을 담은 사전입니다.
-        """
-        if (
-            not self.draft_loss_enabled
-            or self.draft_regularizer is None
-            or pred_dict["flow_clean_norm"].numel() == 0
-        ):
-            return self._build_zero_draft_metrics(pred_dict["flow_clean_norm"])
-
-        # pred_sample_norm : [n_valid_anchor, 20, 4]
-        pred_sample_norm, draft_pred = self._sample_draft_eval_future(
-            tokenized_map=tokenized_map,
-            tokenized_agent=tokenized_agent,
-        )
-        pred_sample_norm = self.encoder.flow_norm_to_pose_metric_norm(
-            value=pred_sample_norm,
-            agent_type=draft_pred.get("flow_metric_agent_type"),
-        )
-        draft_target_norm = draft_pred.get("flow_clean_metric_norm", draft_pred["flow_clean_norm"])
-        draft_loss_mask = draft_pred.get("flow_loss_mask")
-        if not torch.isfinite(pred_sample_norm).all():
-            return self._build_zero_draft_metrics(draft_target_norm)
-
-        if pred_sample_norm.shape[0] != tokenized_agent["flow_train_agent_type"].shape[0]:
-            raise ValueError(
-                "DRaFT 샘플 개수와 packed anchor 메타데이터 개수가 다릅니다. "
-                f"got {pred_sample_norm.shape[0]} and {tokenized_agent['flow_train_agent_type'].shape[0]}"
-            )
-
-        if not self.draft_physics_force_fp32:
-            physics_dict = self.draft_regularizer(
-                pred_future_norm=pred_sample_norm,
-                target_future_norm=draft_target_norm,
-                packed_agent_type=tokenized_agent["flow_train_agent_type"],
-                packed_agent_length=tokenized_agent["flow_train_agent_length"],
-                packed_prev_control=tokenized_agent["flow_train_prev_control"],
-                packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-                future_valid_mask=draft_loss_mask,
-            )
-            if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-                return self._build_zero_draft_metrics(draft_target_norm)
-            return physics_dict
-
-        # Keep the threshold-heavy physics penalty in fp32 even when the trainer
-        # runs with bf16 autocast, while preserving gradients to pred_sample_norm.
-        with torch.autocast(device_type=pred_sample_norm.device.type, enabled=False):
-            physics_dict = self.draft_regularizer(
-                pred_future_norm=pred_sample_norm.float(),
-                target_future_norm=draft_target_norm.float(),
-                packed_agent_type=tokenized_agent["flow_train_agent_type"],
-                packed_agent_length=tokenized_agent["flow_train_agent_length"].float(),
-                packed_prev_control=tokenized_agent["flow_train_prev_control"].float(),
-                packed_prev_control_valid=tokenized_agent["flow_train_prev_control_valid"],
-                future_valid_mask=draft_loss_mask,
-            )
-        if not all(torch.isfinite(value).all() for value in physics_dict.values()):
-            return self._build_zero_draft_metrics(draft_target_norm)
-        return physics_dict
-
-    def _log_draft_training_metrics(
-        self,
-        draft_weight: float,
-        physics_dict: Dict[str, Tensor],
-    ) -> None:
-        """DRaFT fine-tuning용 학습 로그를 기록합니다.
-
-        Args:
-            draft_weight: 현재 batch에 적용한 physics loss 가중치입니다.
-            physics_dict: physics loss 계산 결과 사전입니다.
-
-        Returns:
-            None
-        """
-        self.log(
-            "train/draft_weight",
-            float(draft_weight),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/loss_phys",
-            physics_dict["loss"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/loss_if",
-            physics_dict["loss"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/loss_phys_raw",
-            physics_dict["raw_pred_loss"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            "train/loss_if_raw",
-            physics_dict["raw_pred_loss"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        for metric_name in DRAFT_PHYSICS_COMPONENT_KEYS:
-            self.log(
-                f"draft_component/{metric_name}",
-                physics_dict[metric_name],
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-        for metric_name in DRAFT_PHYSICS_ACTUAL_UNIT_KEYS:
-            self.log(
-                f"draft_actual_pred/{metric_name}",
-                physics_dict[f"pred_{metric_name}"],
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-            self.log(
-                f"draft_actual_gt/{metric_name}",
-                physics_dict[f"gt_{metric_name}"],
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=1,
-            )
-
     def _training_step_manual_open_loop(self, data, batch_idx):
         """self-forced 시작 전 epoch에서 기존 open-loop loss를 manual optimizer로 학습합니다.
 
@@ -2709,16 +2262,7 @@ class SMARTFlow(LightningModule):
             anchor_mask_key="flow_train_mask",
         )
         fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
-        draft_weight = self._get_draft_loss_weight()
-        physics_dict = self._build_zero_draft_metrics(fm_loss)
         total_loss = fm_loss
-        if draft_weight > 0.0:
-            physics_dict = self._compute_draft_training_loss(
-                pred_dict=pred,
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-            )
-            total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
 
         generator_optimizer = self.optimizers()[0]
         self.toggle_optimizer(generator_optimizer)
@@ -2769,11 +2313,6 @@ class SMARTFlow(LightningModule):
             sync_dist=True,
             batch_size=1,
         )
-        if self.draft_enabled:
-            self._log_draft_training_metrics(
-                draft_weight=draft_weight,
-                physics_dict=physics_dict,
-            )
         return total_loss.detach()
 
     def _training_step_self_forced(self, data, batch_idx):
@@ -2861,11 +2400,6 @@ class SMARTFlow(LightningModule):
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
-        physics_dict = self._compute_self_forced_physics_loss(
-            committed_path_norm=committed_path_norm,
-            tokenized_agent=tokenized_agent_eval,
-            anchor_mask=anchor_mask,
-        )
         anchor_loss = (
             fm_loss
             if fm_loss is not None
@@ -2874,7 +2408,6 @@ class SMARTFlow(LightningModule):
         total_loss = (
             self.self_forced_weight * sf_loss
             + self.self_forced_anchor_weight * anchor_loss
-            + self.self_forced_physics_weight * physics_dict["loss"]
         )
         if not torch.isfinite(total_loss):
             context = self._format_self_forced_backward_context()
@@ -2910,11 +2443,9 @@ class SMARTFlow(LightningModule):
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_physics_loss", physics_dict["loss"].detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_physics_weight", float(self.self_forced_physics_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         if "sf_terminal_s_by_scenario" in rollout:
             self.log(
                 "train/sf_terminal_s_mean",
@@ -2965,15 +2496,10 @@ class SMARTFlow(LightningModule):
                 sync_dist=True,
                 batch_size=1,
             )
-        if self.self_forced_use_physics:
-            self._log_draft_training_metrics(
-                draft_weight=float(self.self_forced_physics_weight),
-                physics_dict=physics_dict,
-            )
         return total_loss.detach()
 
     def training_step(self, data, batch_idx):
-        """한 batch의 FM loss와 DRaFT physics loss를 함께 계산합니다.
+        """한 batch의 Flow Matching loss를 계산합니다.
 
         Args:
             data: 학습용 장면 배치입니다.
@@ -2993,13 +2519,6 @@ class SMARTFlow(LightningModule):
             if self._is_self_forced_active():
                 return self._training_step_self_forced(data=data, batch_idx=batch_idx)
             return self._training_step_manual_open_loop(data=data, batch_idx=batch_idx)
-        """ tokenized_agent
-flow_train_agent_type [n_valid_anchor]
-flow_train_agent_length [n_valid_anchor]
-flow_train_prev_control [n_valid_anchor, 3]
-flow_train_prev_control_valid [n_valid_anchor]
-
-        """
         tokenized_map, tokenized_agent = self.token_processor(data)
         """ pred
 flow_pred_norm [n_valid_anchor, 20, 4]
@@ -3022,28 +2541,7 @@ open_metric_dict:
         """
         fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
 
-        draft_weight = self._get_draft_loss_weight()
-        """ physics_dict : Dict[str, Tensor] # 모든 값은 scalar tensor
-
-        loss, raw_pred_loss
-
-        vehicle_hard, vehicle_soft, vehicle_total
-        bicycle_hard, bicycle_soft, bicycle_total
-        pedestrian_hard, pedestrian_soft, pedestrian_head, pedestrian_total
-
-        pred_speed_excess_mps, pred_accel_excess_mps2,
-        pred_steer_excess_deg, pred_steer_rate_excess_degps,
-        pred_lat_accel_excess_mps2, pred_heading_error_deg
-        """
-        physics_dict = self._build_zero_draft_metrics(fm_loss)
         total_loss = fm_loss
-        if draft_weight > 0.0:
-            physics_dict = self._compute_draft_training_loss(
-                pred_dict=pred,
-                tokenized_map=tokenized_map,
-                tokenized_agent=tokenized_agent,
-            )
-            total_loss = total_loss + draft_weight * 0.005 * physics_dict["loss"]
         if not torch.isfinite(fm_loss):
             raise RuntimeError(f"Non-finite fm_loss detected: {self._summarize_nonfinite_tensor(fm_loss)}")
         if not torch.isfinite(total_loss):
@@ -3086,11 +2584,6 @@ open_metric_dict:
             sync_dist=True,
             batch_size=1,
         )
-        if self.draft_enabled:
-            self._log_draft_training_metrics(
-                draft_weight=draft_weight,
-                physics_dict=physics_dict,
-            )
         return total_loss
 
     def on_after_backward(self) -> None:

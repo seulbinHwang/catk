@@ -20,7 +20,7 @@ from src.smart.utils import (
     transform_to_local,
     wrap_angle,
 )
-from src.smart.modules.draft_physics import DEFAULT_LIMITS
+from src.smart.modules.dynamic_limits import DEFAULT_LIMITS
 from src.smart.modules.kinematic_control import (
     control_norm_to_pose_norm,
     validate_control_yaw_scale_config,
@@ -72,8 +72,8 @@ class LQRCommitBridgeConfig:
 
 
 # On sm_80 (A100) the flash / memory-efficient SDPA kernels inside
-# `nn.MultiheadAttention` can exceed their grid-dim limit on pathological
-# DRaFT batches with many agents, causing
+# `nn.MultiheadAttention` can exceed their grid-dim limit on large
+# batches with many agents, causing
 # `RuntimeError: CUDA error: invalid configuration argument` even when VRAM
 # is not close to full. `ChunkStepRefiner` only attends over seq_len=5, so
 # forcing the math SDPA kernel here is cheap and avoids that failure mode.

@@ -181,7 +181,6 @@ def _apply_full_flow_decoder_range(model: nn.Module) -> None:
         None
 
     설명:
-        이 범위는 draft fine-tuning의 ``train_full_flow_decoder_only=true`` 와 같은 의도입니다.
         지도 처리부와 agent 문맥부는 그대로 보존하고, ``agent_encoder.flow_decoder`` 만
         자기 rollout 분포 차이를 흡수하게 합니다.
     """

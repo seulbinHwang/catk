@@ -10,7 +10,7 @@ DEFAULT_CONTROL_POS_SCALE_M = 1.0
 DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M = 5.0
 POSE_NORM_POS_SCALE_M = 20.0
 
-# repo의 다른 모듈(draft_physics, agent_encoder, dataset 전처리)이 공유하는 정수 매핑입니다.
+# repo의 agent encoder와 dataset 전처리가 공유하는 정수 매핑입니다.
 # 이 모듈은 "pedestrian만 holonomic, 나머지는 non-holonomic" 분기를 이 약속 위에서 직접 코딩하므로,
 # 호출자가 다른 인덱싱을 넘기면 잘못된 디코더가 적용되어도 학습이 silent하게 진행됩니다.
 # 매핑이 흔들리면 이 상수와 _validate_agent_type() 한 곳을 같이 고치도록 의도적으로 노출합니다.

@@ -9,8 +9,7 @@
 #   * The core self-forced LR/sampling/loss knobs match the 6xH100 preset:
 #     generator lr 4e-6, generated-estimator optimizer lr 8e-7
 #     (= lr / estimator_updates_per_step),
-#     anchor FM off,
-#     physics regularization off, and random terminal denoising enabled.
+#     anchor FM off and random terminal denoising enabled.
 #   * Clean-DMD guidance defaults are pinned here for the 4xH100 experiment:
 #     clean_dmd_normalizer_eps=1e-3, clean_dmd_tau_low=0.02,
 #     clean_dmd_tau_high=0.98.
@@ -68,8 +67,6 @@ model:
       unfrozen_range: except_map_encoder
       ema_weight: 0.99
       ema_start_step: 50
-      use_control_space_physics_regularization: false
-      physics_weight: 0.005
       sampling:
         sample_steps: 32
         sample_method: euler

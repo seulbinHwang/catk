@@ -26,15 +26,12 @@
   curvature-domain LQR + kinematic bicycle commit bridge를 적용합니다. 이 모드에서는 2초 FM
   미래를 preview로 보되, 실제 반영은 항상 다음 0.5초 / 5점만 실행합니다.
 - LQR bridge는 최근 실제 10Hz 6점 history로 현재 speed / yaw-rate / curvature를 잡고,
-  `draft_physics.py`의 차종별 속도, 가감속, yaw-rate, 횡가속, 최소 선회 반경 제한을 같이 씁니다.
+  차종별 속도, 가감속, yaw-rate, 횡가속, 최소 선회 반경 제한을 같이 씁니다.
 - wheelbase가 없는 WOMD multi-agent 특성을 고려해 steering angle 대신 **curvature를 제어 입력**
   으로 쓰는 kinematic bicycle 계열 적분을 쓰며, class별 envelope로 곡률과 곡률 변화율을 한 번 더
   clip 합니다.
-- DRaFT physics 경로에는 NaN 방지 가드가 들어 있습니다.
 - heading 2-vector와 pedestrian velocity 2-vector는 raw `atan2` 대신 safe angle 복원으로 처리해
   `(0, 0)` 또는 near-zero vector backward에서 gradient NaN이 나지 않도록 막습니다.
-- `sample_open_loop_future` 결과나 physics loss 출력이 non-finite면 해당 batch의 draft loss를 0으로
-  처리해 flow decoder 전체를 오염시키지 않게 합니다.
 - 학습 중에는 non-finite parameter, `fm_loss`, `total_loss`, gradient를 fail-fast로 감지해
   NaN checkpoint가 조용히 저장되지 않도록 즉시 중단합니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
@@ -359,7 +356,7 @@ torchrun ... -m src.run \
 
 - `false`면 기존과 같습니다. 학습 입력 agent는 ego 기준 150m 안만 남기고, 학습 대상은 ego/예측 특별 대상과 ego 기준 100m 안이면서 미래 유효 길이가 충분한 agent 중 최대 `data.train_max_num`개를 사용합니다.
 - `true`면 학습에서도 validation/추론용 transform을 그대로 사용합니다. 따라서 별도의 150m 입력 제한과 `train_mask` / `train_max_num` 제한을 추가하지 않습니다. 이 경우 학습 입력 agent와 학습 대상 anchor가 validation/추론과 같은 기준으로 정해집니다.
-- 이 설정은 pretrain, Flow Matching range fine-tuning, DRaFT fine-tuning에 동일하게 적용됩니다.
+- 이 설정은 pretrain과 Flow Matching range fine-tuning에 동일하게 적용됩니다.
 
 예시:
 
@@ -380,7 +377,7 @@ model.model_config.token_processor.use_prefix_valid_future_loss_mask=true   # pr
 - `false`이면 기존과 같습니다. 현재 anchor 뒤 `decoder.flow_window_steps` 전체 미래가 모두 유효한 agent-anchor만 학습합니다.
 - `true`이면 현재 anchor 뒤 가장 가까운 미래부터 시작해서, 처음 끊기기 전까지 연속으로 유효한 구간을 5-step(0.5초) chunk 단위로 내림해서 학습합니다. 1~4 step은 버리고, 5~9 step은 첫 0.5초만, 10~14 step은 첫 1.0초만, 15~19 step은 첫 1.5초만 loss가 들어갑니다.
 - full-valid sample은 `true`에서도 그대로 전체 미래 loss를 받습니다. 새로 추가되는 것은 partial-valid sample뿐입니다.
-- 이 옵션은 `FlowTokenProcessor`에서 학습 target을 만들 때 적용되므로 pretrain, 일반 fine tuning, DRaFT fine tuning, self-forced fine tuning에서 같은 방식으로 동작합니다.
+- 이 옵션은 `FlowTokenProcessor`에서 학습 target을 만들 때 적용되므로 pretrain, 일반 fine tuning, self-forced fine tuning에서 같은 방식으로 동작합니다.
 - README 기준 cache를 그대로 만들었다면 cache 재생성은 필요 없습니다. pkl cache 자체에서 partial-valid agent/anchor를 직접 삭제한 경우에만 cache를 다시 만들어야 합니다.
 
 기존 pretrained checkpoint를 prefix-valid 목표로 이어서 학습할 때는 `action=finetune`을 씁니다. 이 방식은 모델 weight만 불러오고 optimizer / scheduler는 새로 시작합니다. 모델 전체를 학습하려면 `model.model_config.finetune.enabled=false`를 유지합니다.
@@ -479,7 +476,7 @@ torchrun ... -m src.run \
 - label 생성은 decoder-consistent rolling projection 방식입니다. 매 step마다 raw GT 현재 pose가 아니라 직전 control을 kinematic decoder에 통과시킨 pose를 다음 inverse의 현재 pose로 씁니다.
 - control-space 정규화는 위치 이동량에는 공통 `control_pos_scale_m=1.0`을 쓰고, yaw에는 config로 관리되는 agent type별 scale을 씁니다. 기본 preset은 `control_vehicle_yaw_scale_rad=0.025`, `control_cyclist_yaw_scale_rad=0.06`, `control_pedestrian_yaw_scale_rad=0.20`입니다. control-space target 생성과 복원 경로에는 항상 `agent_type`이 필요합니다. metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
 - control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `5.0m`이며, 평가 경로에는 적용하지 않습니다.
-- 추가 trajectory loss, x0 loss, open-loop draft loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
+- 추가 trajectory loss, x0 loss, open-loop auxiliary loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
 - validation / rollout / metric 경로에서는 control 예측을 기존 pose-space 표현으로 복원해 기존 open-loop metric과 closed-loop rollout을 그대로 계산합니다.
 
 pose-space checkpoint와 control-space checkpoint는 Flow decoder 입출력 차원이 다르므로 서로 섞어 resume하지 않는 것을 권장합니다. 기존 pose-space pretrain weight를 control-space 실험의 초기값으로 재사용하려면 Flow decoder head/encoder 차원 차이를 어떻게 처리할지 별도 migration 정책이 필요합니다.
@@ -879,7 +876,6 @@ torchrun \
 중요한 차이:
 
 - 이 경로는 `experiment=pre_bc_flow` + `data.train_use_eval_agent_selection=true`를 매번 길게 적지 않도록 묶어둔 preset입니다.
-- `model.model_config.draft.enabled=false` 상태라서 DRaFT inverse feasibility regularizer는 전혀 쓰지 않습니다.
 - 즉, **pure FM fine-tuning** 입니다.
 - 첫 시작은 반드시 `action=finetune`를 사용합니다.
 - 현재 구현은 `torch.load(ckpt)["state_dict"]`만 읽고 새 optimizer / lr scheduler / epoch / global step으로 다시 시작합니다.
@@ -926,298 +922,6 @@ torchrun \
 ```
 
 다만 이 경우에도 150m 입력 제한과 ego 기준 100m 학습 대상 제한은 그대로 남습니다.
-
-### 5.7 6x H100에서 DRaFT fine-tuning
-
-`configs/experiment/finetune_draft_flow.yaml`을 써서
-**기존 flow checkpoint 위에 DRaFT inverse feasibility regularizer를 얹는 fine-tuning**을 바로 시작할 수 있습니다.
-이 경로는 pretrain을 이어서 resume하는 용도가 아니라,
-**이미 학습된 checkpoint의 weight만 읽어서 새 fine-tuning run을 시작하는 용도**입니다.
-
-가장 단순한 6 GPU 실행 예시는 아래와 같습니다.
-
-```bash
-export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
-
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
-torchrun \
-  --standalone \
-  --nproc_per_node=6 \
-  -m src.run \
-  experiment=finetune_draft_flow \
-  action=finetune \
-  trainer=ddp \
-  trainer.devices=6 \
-  paths.cache_root="$CACHE_ROOT" \
-  ckpt_path="$PRETRAIN_CKPT" \
-  task_name=flow_semi_continuous_finetune_h1006
-```
-
-중요한 차이:
-
-- 첫 fine-tuning 시작은 반드시 `action=finetune`를 사용합니다.
-- 현재 구현은 `torch.load(ckpt)["state_dict"]`를 `strict=False`로 읽은 뒤 `trainer.fit(...)`을 새로 시작합니다. 단, 현재 fine-tuning에서 `requires_grad=True` 인 파라미터가 checkpoint에 없으면 실행을 중단합니다.
-- 즉, optimizer / lr scheduler / epoch / global step은 이어받지 않습니다.
-- 반대로 `action=fit`에 `ckpt_path=...`를 주면 **resume training**으로 동작합니다. 이 경우 이전 run의 optimizer 상태까지 이어받습니다.
-- 따라서 pretrained checkpoint에서 fine-tuning을 처음 시작할 때만 `action=finetune`를 쓰고,
-- 시작한 fine-tuning run이 중단됐으면 그 다음부터는 위 `5.4 중단된 학습 재개하기`
-- 방식대로 `action=fit` + fine-tuning run의 `last.ckpt` 또는 `epoch_last.ckpt`를 쓰면 됩니다.
-
-fine-tuning에서 실제로 trainable인 모듈은 아래와 같습니다.
-
-- 기본적으로 encoder 전체를 먼저 freeze합니다.
-- `finetune_draft_flow` preset은 `train_full_flow_decoder_only=true`라서
-- `agent_encoder.flow_decoder` 전체를 다시 unfreeze합니다.
-- 즉 fine-tuning에서는 map encoder, agent embedding, attention layers는 그대로 frozen 상태를 유지하고,
-- flow decoder 전체만 trainable 상태로 둡니다.
-
-`finetune_draft_flow` 기본 설정은 아래와 같습니다.
-
-- learning rate: `2e-4`
-- max epochs: `32`
-- train batch size: `48` per GPU
-- effective global train batch size: `288` with 6 GPUs
-- val batch size: `16`
-- validation 주기: `16` epoch마다
-
-loss와 로그는 아래처럼 보면 됩니다.
-
-- `train/loss`는 최종 학습 loss입니다.
-- `train/loss_fm`는 원래 flow matching loss입니다.
-- `train/loss_phys`와 `train/loss_if`는 같은 값이고, 새 inverse feasibility penalty `L_if`를 뜻합니다.
-- 실제 학습식은 `train/loss = train/loss_fm + train/draft_weight * 0.005 * train/loss_if` 입니다.
-- `train/draft_weight`는 `start_epoch` 이후 `ramp_epochs` 동안 선형으로 증가해 `max_weight`까지 올라갑니다.
-- 현재 설정은 `max_weight=0.1`이고, 실제 scale `0.005`는 코드에 고정으로 들어갑니다.
-- 따라서 기본 설정의 physics loss 최대 가중치는 `0.1 * 0.005 = 0.0005`입니다.
-- 기본 구현은 trainer가 `bf16-mixed`여도 inverse feasibility 계산 구간만 fp32 subregion에서 수행합니다.
-- DRaFT physics sample은 FM anchor loss용 train-mode forward를 재사용하지 않고,
-- 생성 모델을 eval mode로 잠깐 바꾼 상태에서 gradient를 유지한 채 다시 만듭니다.
-- 따라서 dropout과 history drop이 섞인 학습용 trajectory가 아니라
-- validation/test와 같은 deterministic inference trajectory를 physics loss로 보정합니다.
-- 차량 / 자전거는 유효한 미래 예측 구간을 다시
-- `forward speed`, `curvature`, `steering angle`, `steering rate`, `forward acceleration`으로 바꿔 penalty를 계산합니다.
-- wheelbase는 agent box length에 각각 `0.60`, `0.85`를 곱해서 만듭니다.
-- 사람은 steering state를 두지 않고, 2차원 속도와 2차원 가속도만으로 hard / soft 항을 계산합니다.
-- heading은 속도가 `0.5 m/s`보다 클 때만 약하게 봅니다.
-- `flow_window_steps`가 20이든 30이든 같은 regularizer를 쓰며, 실제 GT 미래가 유효한 step만 loss 평균에 들어갑니다.
-- 첫 제어량은 모두 `prev_control`을 사용합니다.
-- 차량 / 자전거는 `v_pre`와 `delta_pre`를 복원해서 첫 가속도와 첫 steering rate를 만들고,
-- 사람은 `prev_control[..., :2]`를 `prev_control[..., 2]`의 yaw-rate로 현재 anchor-local 좌표계에 회전한 뒤 첫 2차원 가속도 계산에 씁니다.
-- hard 항은 속도, 가속도, steering angle, steering rate, lateral acceleration 제한을 넘는 만큼 `relu(z)^2`로 계산합니다.
-- `soft_limit_ratio < 1.0`이면 실제 한계를 넘기 전부터 완충 penalty가 시작됩니다.
-- `topk_violation_k`는 agent별로 큰 위반 시점도 함께 보게 해서, 짧은 순간의 큰 물리 위반이 전체 평균에 묻히는 것을 줄입니다.
-- `commit_loss_weight`는 closed-loop에서 다음 상태로 직접 반영되는 앞 0.5초, 즉 앞 5개 미래 점의 상대 가중치를 높입니다. 전체 scale은 시간축 평균 분모로 다시 정규화합니다.
-- `use_slip_penalty=true`이면 차량 / 자전거의 heading 방향과 실제 이동 방향 차이도 hard 항에 포함해 옆미끄러짐을 직접 줄입니다.
-- soft 항은 jerk에 가까운 거칠기 값입니다. 기본값에서는 **GT roughness보다 큰 만큼만** loss에 반영하고,
-  `model.model_config.draft.physics.compare_softness_to_gt=false` 로 두면
-  GT 비교 없이 prediction roughness 자체를 그대로 반영합니다.
-- 그래서 `train/loss_phys_raw`와 `train/loss_if_raw`는 GT 비교 전의 raw prediction 기준 값입니다.
-- 최종 `L_if`는 agent 전체 평균이 아니라, **batch 안에 실제로 존재하는 class별 평균을 먼저 구한 뒤 다시 class 평균**을 내는 방식입니다.
-- 그래서 vehicle이 많아도 pedestrian / bicycle 항이 묻히지 않습니다.
-- class별 세부 loss는 `draft_component/*`에 기록됩니다.
-- 현재는 `vehicle_hard`, `vehicle_soft`, `vehicle_total`, `bicycle_*`, `pedestrian_hard`, `pedestrian_soft`, `pedestrian_head`, `pedestrian_total`을 봐두면 됩니다.
-- 실제 단위 평균값은 `draft_actual_pred/*`, GT 기준값은 `draft_actual_gt/*`에 기록됩니다.
-- 현재는 `speed_excess_mps`, `accel_excess_mps2`, `steer_excess_deg`, `steer_rate_excess_degps`, `lat_accel_excess_mps2`, `slip_beta_excess_deg`, `heading_error_deg`를 남깁니다.
-
-현재 inverse feasibility 기본 하이퍼파라미터는 아래와 같습니다.
-
-- 공통: `soft_weight=0.25`
-- aggregation: `soft_limit_ratio=0.8`, `topk_violation_k=20`, `commit_loss_weight=2.0`
-- no-slip: 기본은 `use_slip_penalty=false`이고, 차량 `beta_max=0.27 rad`, 자전거 `beta_max=0.70 rad`입니다.
-- DRaFT loss ablation: `model.model_config.draft.loss_enabled=false`로 같은 fine-tuning preset에서 inverse feasibility loss만 끌 수 있습니다.
-- vehicle: `v_max=35.0`, `a_max=8.0`, `a_lat_max=4.2`, `wheelbase_scale=0.60`, `steer_max=0.55 rad`, `steer_rate_max=0.8 rad/s`
-- bicycle: `v_max=22.0`, `a_max=5.5`, `a_lat_max=4.4`, `wheelbase_scale=0.85`, `steer_max=0.90 rad`, `steer_rate_max=1.4 rad/s`
-- pedestrian: `v_max=5.0`, `a_max=4.7`, `heading_speed_threshold=0.5 m/s`, `heading_weight=0.05`
-
-자주 바꾸는 override 예시는 아래와 같습니다.
-
-```bash
-# fine-tuning에서도 validation/추론과 같은 agent 기준 사용
-... data.train_use_eval_agent_selection=true
-
-# gamma_draft를 더 빨리/강하게 올리기
-... model.model_config.draft.max_weight=1.0     model.model_config.draft.ramp_epochs=2
-
-# inverse feasibility도 mixed precision으로 그대로 계산
-... model.model_config.draft.physics.force_fp32=false
-
-# soft roughness를 GT와 비교하지 않고 raw prediction 기준으로 사용
-... model.model_config.draft.physics.compare_softness_to_gt=false
-
-# inverse feasibility loss만 꺼서 같은 DRaFT fine-tuning 파이프라인에서 ablation
-... model.model_config.draft.loss_enabled=false
-
-# 차량/자전거 옆미끄러짐 penalty 켜기
-... model.model_config.draft.physics.use_slip_penalty=true
-
-# hard limit 주변 완충 구간과 큰 위반 시점 강조 조정
-... model.model_config.draft.physics.soft_limit_ratio=0.9     model.model_config.draft.physics.topk_violation_k=10
-
-# 실제 commit되는 앞 0.5초 구간을 더 강하게 보기
-... model.model_config.draft.physics.commit_loss_weight=3.0
-
-# 차량 steering rate 제한을 더 느슨하게
-... model.model_config.draft.physics.vehicle_steer_rate_max_radps=1.0
-
-# 사람 heading 항을 더 약하게
-... model.model_config.draft.physics.pedestrian_heading_weight=0.02
-
-# 샘플러 역전파를 마지막 2 step에만 남겨 메모리 사용량 줄이기
-... model.model_config.draft.sampling.backprop_last_k=2
-
-# validation을 매 epoch마다 수행
-... trainer.check_val_every_n_epoch=1
-```
-
-checkpoint 선택은 보통 아래처럼 하면 됩니다.
-
-- pretrain run의 best 성능 checkpoint를 쓰려면 `epoch_XXX.ckpt`
-- 가장 마지막 저장 상태를 쓰려면 `last.ckpt`
-- validation 직전까지 포함한 가장 최근 train epoch 상태를 쓰려면 `epoch_last.ckpt`
-
-### 5.8 4x A100 80GB 에서 DRaFT fine-tuning
-
-6x H100 이 아닌 **4x A100 80GB (SXM4)** 박스에서 같은 DRaFT fine-tuning 을 돌리고 싶을 때 쓰는 별도 preset 입니다.
-
-- preset 파일: `configs/experiment/finetune_draft_flow_a100x4.yaml`
-- 자세한 실행 방법 / 하이퍼파라미터 선택 이유 / OOM 디버깅 순서: [`docs/A100x4_finetune_draft_flow_README.md`](docs/A100x4_finetune_draft_flow_README.md)
-
-요약만 보면 아래와 같습니다.
-
-- `train_batch_size=36` (실측 max), `accumulate_grad_batches=2`, `trainer.devices=4` -> effective global batch **`288`** (6xH100 preset `288` 과 정확히 동일, 따라서 lr 도 그대로 `2e-4`).
-- `max_epochs(=32)`, `check_val_every_n_epoch(=16)` 은 6xH100 preset 과 동일.
-- `val_batch_size=8` 로 줄이고 `n_rollout_closed_val=16` / `n_batch_sim_agents_metric=10` 은 유지해서 정기 eval 이 OOM 없이 돕니다.
-- **bs 상한의 원인은 메모리가 아닙니다**. A100 (sm_80) 의 flash / memory-efficient SDPA kernel 이 `ChunkStepRefiner` 의 self-attention 에서 큰 batch 일 때 `invalid configuration argument` 로 터지는 kernel grid-dim 한계입니다. bs=36 일 때 peak 48 GiB / 80 GiB 로 VRAM 은 남아돕니다.
-- 위 crash 를 완전히 없애기 위해 **`src/smart/modules/flow_local_decoder.py` 의 `ChunkStepRefiner` self-attention 만 math-SDPA kernel 로 강제하는 소폭 패치**를 포함했습니다. 실측 결과 bs=36 에서 500 step 이상 안정 + step time 도 오히려 약 20% 단축. 상세: [`docs/A100x4_finetune_draft_flow_README.md`](docs/A100x4_finetune_draft_flow_README.md) 5장.
-- 같은 이유로 **`HalfSecondChunkMixerBlock` 의 self-attention** 에도 동일한 math-SDPA wrapper 를 적용했습니다. self-forced fine-tuning 처럼 chunk_mixers 의 backward graph 가 살아있는 학습 경로에서, H100 의 fast/mem-efficient SDPA kernel 이 backward 용 placeholder 메모리를 uninitialized 로 두면 saved tensor 가 NaN bit pattern 으로 박혀 grad 를 오염시킬 수 있어 미리 차단합니다.
-- 실행 예시:
-
-```bash
-export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
-export PRETRAIN_CKPT=/path/to/pretrained_flow.ckpt
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-torchrun \
-  --standalone \
-  --nproc_per_node=4 \
-  -m src.run \
-  experiment=finetune_draft_flow_a100x4 \
-  action=finetune \
-  trainer=ddp \
-  trainer.devices=4 \
-  paths.cache_root="$CACHE_ROOT" \
-  ckpt_path="$PRETRAIN_CKPT" \
-  task_name=flow_semi_continuous_finetune_inv_best_a_100_a100x4
-```
-
-### 5.8.1 5x V100 32GB x3 static pods에서 DRaFT fine-tuning
-
-`fv`, `fvv`, `fvvv`, `fvvvv`, `fvvvvv` 처럼 **V100 32GB 3장짜리 pod 5개**를 묶어
-DRaFT inverse feasibility fine-tuning을 돌릴 때 쓰는 preset과 launcher입니다.
-
-- preset 파일: `configs/experiment/finetune_draft_flow_v100x3x5.yaml`
-- launcher 파일: `scripts/launch_finetune_draft_v100x3x5_static_pods.py`
-- 총 DDP rank: `5 nodes * 3 GPUs = 15`
-- physics 설정: `soft_limit_ratio=0.9`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=true`
-- DRaFT weight: `draft.max_weight=0.15`
-- 기본 per-GPU `train_batch_size=24`, `val_batch_size=2`
-
-이 launcher는 pod를 만들거나 지우지 않습니다. 이미 떠 있는 pod 안에 `kubectl exec`로 들어가 tmux 세션만 시작하거나 종료합니다.
-지금 다른 실험이 돌고 있으면 `--replace`나 `--stop`을 쓰지 마세요.
-
-실행 전 dry-run:
-
-```bash
-python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
-  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
-  --dry-run
-```
-
-실제 시작:
-
-```bash
-python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
-  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
-  --task-name flow_finetune_draft_v100x3x5_bs24_soft09_topk20_commit1_slip
-```
-
-checkpoint가 아직 pod 안에 없고 W&B artifact에서 받아야 한다면 아래처럼 full name을 넘기면 됩니다.
-
-```bash
-python scripts/launch_finetune_draft_v100x3x5_static_pods.py \
-  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
-  --wandb-artifact entity/project/artifact-name:v1 \
-  --artifact-download-dir /workspace/path/to/new_checkpoint/artifact \
-  --task-name flow_finetune_draft_v100x3x5_bs24_soft09_topk20_commit1_slip
-```
-
-이미 떠 있는 이 launcher의 tmux 세션만 종료:
-
-```bash
-python scripts/launch_finetune_draft_v100x3x5_static_pods.py --stop
-```
-
-batch size 판단:
-
-- `64 / 80 * 32 = 25.6`은 **A100 80GB에서 per-GPU batch 64가 안정적이었다면, per-GPU 메모리 대부분이 batch에 선형으로 비례한다**고 가정한 1차 추정입니다.
-- 이 가정은 DRaFT fine-tuning처럼 activation이 큰 학습에서는 꽤 유용하지만, 완전한 보장은 아닙니다. V100은 A100과 kernel/workspace, fp16/bf16 특성, fragmentation, batch별 agent 수 분산이 다릅니다.
-- 그래서 `25.6`을 그대로 쓰는 대신 `24`로 시작하는 판단은 합리적인 보수값입니다. 다만 실측 전에는 “안전한 시작점”이지 “항상 성공 보장값”은 아닙니다.
-- OOM이 나면 같은 launcher에 `--train-batch-size 22` 또는 `20`을 넘겨 다시 시작하세요.
-
-### 5.8.2 8x V100 32GB x4 static pods에서 DRaFT fine-tuning
-
-`testsv`, `testsvv`, `testsvvv`, `testsvvvv`, `sv`, `svv`, `svvv`, `svvvv` 처럼
-**V100 32GB 4장짜리 pod 8개**를 묶어 새 checkpoint에서 DRaFT inverse feasibility fine-tuning을
-시작할 때 쓰는 preset과 launcher입니다.
-
-- preset 파일: `configs/experiment/finetune_draft_flow_v100x4x8.yaml`
-- launcher 파일: `scripts/launch_finetune_draft_v100x4x8_static_pods.py`
-- 총 DDP rank: `8 nodes * 4 GPUs = 32`
-- physics 설정: `soft_limit_ratio=1.0`, `topk_violation_k=20`, `commit_loss_weight=1.0`, `use_slip_penalty=true`
-- DRaFT weight: `draft.max_weight=0.15`
-- 기본 per-GPU `train_batch_size=24`, `val_batch_size=2`
-
-실행 전 dry-run:
-
-```bash
-python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
-  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
-  --dry-run
-```
-
-실제 시작:
-
-```bash
-python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
-  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
-  --task-name flow_finetune_draft_v100x4x8_bs24_soft10_topk20_commit1_slip
-```
-
-checkpoint가 아직 pod 안에 없고 W&B artifact에서 받아야 한다면 full name을 같이 넘기면 됩니다.
-rank 0 pod가 checkpoint를 받은 뒤 나머지 pod들이 같은 파일을 검증하며 동기화합니다.
-
-```bash
-python scripts/launch_finetune_draft_v100x4x8_static_pods.py \
-  --ckpt-path /workspace/path/to/new_checkpoint/epoch_last.ckpt \
-  --wandb-artifact entity/project/artifact-name:v1 \
-  --artifact-download-dir /workspace/path/to/new_checkpoint/artifact \
-  --task-name flow_finetune_draft_v100x4x8_bs24_soft10_topk20_commit1_slip
-```
-
-이미 떠 있는 이 launcher의 tmux 세션만 종료:
-
-```bash
-python scripts/launch_finetune_draft_v100x4x8_static_pods.py --stop
-```
-
-batch size 판단:
-
-- `64 / 320 * 128 = 25.6`은 A100x4 pod의 총 320 GiB에서 per-GPU batch 64가 완주했고,
-  V100x4 pod의 총 128 GiB로 같은 모델/데이터/precision을 옮긴다는 가정의 1차 추정입니다.
-- 실제 학습은 GPU별 activation, attention workspace, batch별 agent 수 분산, V100/A100 kernel 차이에 영향을 받으므로
-  완전한 보장은 아닙니다.
-- 그래도 `25.6`을 그대로 쓰지 않고 `24`로 내리는 판단은 합리적인 보수 시작점입니다.
-  OOM이 나면 같은 launcher에 `--train-batch-size 22` 또는 `20`을 넘겨 다시 시작하세요.
 
 ### 5.9 4x H100 80GB 에서 Flow Matching pretrain
 
@@ -2334,7 +2038,6 @@ K commit block 수 = flow_window_steps / 5
 - `path_step_size` 를 곱해 target path를 만듭니다.
 - Clean-DMD guidance의 기본 noising 구간은 `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 입니다.
 - 정규화 분모는 `clean_dmd_normalizer_eps=1.0e-3` 으로 최소값을 둬서 target path가 과하게 튀는 상황을 줄입니다.
-- committed self-rollout 에 대해서만 걸리는 control-space physics regularization (선택 사항). `model.model_config.self_forced.use_control_space_physics_regularization` 로 제어합니다.
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.use_anchor_flow_matching_loss=false` 로 두면 `anchor_weight` 값과 무관하게 self-forced active step에서 training-mode open-loop forward와 FM loss 계산 자체를 생략합니다. `true` 일 때만 `model.model_config.self_forced.anchor_weight` 로 total loss 반영 강도를 제어합니다. anchor FM 을 끈 상태에서 어떤 rank 의 committed self-rollout 까지 비어있는 (모든 agent 가 invalid anchor0) 드문 경우에는, encoder 파라미터 합에 0 을 곱한 zero-loss 로 backward 만 한 번 돌려 DDP all-reduce 참여를 보장하고 optimizer step 은 건너뜁니다. 이 가드가 없으면 그 rank 만 backward 를 호출하지 않아 다른 rank 의 NCCL all-reduce 가 NCCL_TIMEOUT 까지 hang 합니다.
 - 선택적 trainable range. `model.model_config.self_forced.unfrozen_range=except_map_encoder` 가 기본값이며, map encoder만 고정하고 나머지 Generator / generated estimator 파라미터는 학습합니다. `middle` 은 마지막 agent 문맥 블록과 flow decoder만 열고, `full_flow_decoder` 는 마지막 궤적 생성부만 엽니다.
 - epoch별 train subset sampling. self-forced preset은 `data.train_epoch_sample_fraction=0.5` 를 기본으로 두어 매 epoch 전체 train dataset의 50%만 새로 랜덤 샘플링해 학습합니다. DDP에서는 모든 rank가 같은 전역 subset을 공유한 뒤 rank별로 나눠 받습니다. `1.0` 으로 override하면 기존처럼 전체 train dataset을 씁니다.
@@ -2418,7 +2121,7 @@ fine-tuning 에 쓰는 rollout 과 inference 에 쓰는 rollout 은 기본 commi
 - online Generator와 frozen teacher의 parameter gradient 누적도 update 동안 임시로 꺼 둡니다.
 - update 경계마다 이전 단계의 gradient를 명확히 비워서, DMD 방향이 optimizer 간에 섞이지 않게 했습니다.
 - Clean-DMD guidance는 기존처럼 teacher/generated clean path 추정 차이를 agent별 teacher 기준 거리로 정규화합니다.
-- `use_anchor_flow_matching_loss=false`, `use_control_space_physics_regularization=false` 설정은 그대로 유지됩니다.
+- `use_anchor_flow_matching_loss=false` 설정은 그대로 유지됩니다.
 
 ### Self-forced SiD-lite Update
 
@@ -2467,7 +2170,7 @@ H100 preset은 `experiment=self_forced_npfm_sid_h100_4` 또는
 - `unfrozen_range=middle` 은 map encoder와 대부분의 agent 문맥부를 고정하고,
   `agent_encoder.flow_decoder` 와 마지막 temporal / map-to-agent / agent-to-agent 문맥 블록만 엽니다.
   즉 `except_map_encoder` 보다 더 보수적이고, `full_flow_decoder` 보다는 덜 보수적인 중간 설정입니다.
-- `unfrozen_range=full_flow_decoder` 는 draft fine-tuning의 `train_full_flow_decoder_only=true` 와 같은 의도입니다.
+- `unfrozen_range=full_flow_decoder` 는 마지막 궤적 생성부만 학습 가능하게 두는 설정입니다.
   지도/장면/상호작용 해석부는 pretrained 상태로 보존하고, 자기 rollout 분포 차이는 마지막 궤적 생성부가 흡수하게 합니다.
 - self-forcing용 기존 `freeze_map_encoder` 설정은 제거했습니다. 같은 동작이 필요하면 `unfrozen_range=except_map_encoder` 를 사용합니다.
 

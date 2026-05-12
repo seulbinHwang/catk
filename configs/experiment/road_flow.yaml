@@ -35,8 +35,6 @@ model:
     val_closed_loop: true
     self_forced:
       enabled: false
-    draft:
-      enabled: false
     finetune:
       enabled: false
       train_full_flow_decoder_only: false

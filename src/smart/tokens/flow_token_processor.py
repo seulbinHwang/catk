@@ -20,7 +20,7 @@ from src.smart.utils import transform_to_local, validate_flow_window_steps
 
 
 class FlowTokenProcessor(TokenProcessor):
-    """Flow 학습용 목표와 DRaFT용 보조 메타데이터를 만듭니다."""
+    """Flow 학습용 anchor 목표와 평가용 메타데이터를 만듭니다."""
 
     def __init__(
         self,
@@ -142,15 +142,11 @@ class FlowTokenProcessor(TokenProcessor):
         )
 
         if self.training:
-            agent_length = self._get_agent_box_length(tokenized_agent)
             flow_train_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
             flow_train_chunks: List[Tensor] = []
             flow_train_metric_chunks: List[Tensor] = []
             flow_train_loss_mask_chunks: List[Tensor] = []
             flow_train_agent_type_chunks: List[Tensor] = []
-            flow_train_agent_length_chunks: List[Tensor] = []
-            flow_train_prev_control_chunks: List[Tensor] = []
-            flow_train_prev_control_valid_chunks: List[Tensor] = []
 
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
@@ -213,19 +209,7 @@ class FlowTokenProcessor(TokenProcessor):
                 flow_train_chunks.append(flow_train_clean_norm)
                 flow_train_metric_chunks.append(flow_train_metric_norm)
                 flow_train_loss_mask_chunks.append(selected_future_loss_mask)
-                prev_control, prev_control_valid = self._build_anchor_prev_control(
-                    pos=pos,
-                    heading=heading,
-                    valid=valid,
-                    current_pos=current_pos,
-                    current_head=current_head,
-                    anchor_mask=train_anchor_mask,
-                    raw_step=raw_step,
-                )
                 flow_train_agent_type_chunks.append(tokenized_agent["type"][train_anchor_mask])
-                flow_train_agent_length_chunks.append(agent_length[train_anchor_mask])
-                flow_train_prev_control_chunks.append(prev_control)
-                flow_train_prev_control_valid_chunks.append(prev_control_valid)
 
             self._assert_flow_train_anchor_context_valid(
                 flow_train_mask=flow_train_mask,
@@ -252,22 +236,6 @@ class FlowTokenProcessor(TokenProcessor):
                     "flow_train_agent_type": self._concat_vector_chunks(
                         chunks=flow_train_agent_type_chunks,
                         dtype=tokenized_agent["type"].dtype,
-                        device=device,
-                    ),
-                    "flow_train_agent_length": self._concat_vector_chunks(
-                        chunks=flow_train_agent_length_chunks,
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    "flow_train_prev_control": self._concat_matrix_chunks(
-                        chunks=flow_train_prev_control_chunks,
-                        width=3,
-                        dtype=dtype,
-                        device=device,
-                    ),
-                    "flow_train_prev_control_valid": self._concat_vector_chunks(
-                        chunks=flow_train_prev_control_valid_chunks,
-                        dtype=torch.bool,
                         device=device,
                     ),
                 }
@@ -642,90 +610,6 @@ class FlowTokenProcessor(TokenProcessor):
             ],
             dim=-1,
         )
-
-    def _build_anchor_prev_control(
-        self,
-        pos: Tensor,
-        heading: Tensor,
-        valid: Tensor,
-        current_pos: Tensor,
-        current_head: Tensor,
-        anchor_mask: Tensor,
-        raw_step: int,
-    ) -> Tuple[Tensor, Tensor]:
-        """anchor 직전 구간의 단순 제어를 local frame 기준으로 만듭니다.
-
-        Args:
-            pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
-            heading: 전처리된 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
-            valid: 각 시점 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
-            current_pos: 현재 coarse anchor 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
-            current_head: 현재 coarse anchor 방향입니다. shape은 ``[n_agent]`` 입니다.
-            anchor_mask: 이번 anchor를 실제로 쓰는 에이전트입니다. shape은 ``[n_agent]`` 입니다.
-            raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
-
-        Returns:
-            Tuple[Tensor, Tensor]:
-                직전 제어 ``[v_x^b, v_y^b, omega]`` 와 유효 마스크입니다.
-                shape은 각각 ``[n_valid_anchor, 3]`` 과 ``[n_valid_anchor]`` 입니다.
-        """
-        num_valid_anchor = int(anchor_mask.sum().item())
-        if num_valid_anchor == 0:
-            return (
-                pos.new_zeros((0, 3)),
-                torch.zeros((0,), device=pos.device, dtype=torch.bool),
-            )
-
-        prev_control_valid = valid[anchor_mask, raw_step] & valid[anchor_mask, raw_step - 1]
-        prev_control = pos.new_zeros((num_valid_anchor, 3))
-        if not prev_control_valid.any():
-            return prev_control, prev_control_valid
-
-        pos_pair = pos[anchor_mask, raw_step - 1 : raw_step + 1]
-        head_pair = heading[anchor_mask, raw_step - 1 : raw_step + 1]
-        pos_pair_local, head_pair_local = transform_to_local(
-            pos_global=pos_pair,
-            head_global=head_pair,
-            pos_now=current_pos[anchor_mask],
-            head_now=current_head[anchor_mask],
-        )
-
-        delta_pos = pos_pair_local[:, 1] - pos_pair_local[:, 0]
-        prev_head_local = head_pair_local[:, 0]
-        delta_head = self._wrap_angle(head_pair_local[:, 1] - head_pair_local[:, 0])
-
-        cos_prev = prev_head_local.cos()
-        sin_prev = prev_head_local.sin()
-        prev_control[:, 0] = (delta_pos[:, 0] * cos_prev + delta_pos[:, 1] * sin_prev) / 0.1
-        prev_control[:, 1] = (-delta_pos[:, 0] * sin_prev + delta_pos[:, 1] * cos_prev) / 0.1
-        prev_control[:, 2] = delta_head / 0.1
-        prev_control[~prev_control_valid] = 0.0
-        return prev_control, prev_control_valid
-
-    def _get_agent_box_length(self, tokenized_agent: Dict[str, Tensor]) -> Tensor:
-        """DRaFT inverse feasibility에 쓸 box length를 고릅니다.
-
-        raw data의 shape 순서가 ``[length, width]`` 인지 ``[width, length]`` 인지
-        전처리 경로에 따라 달라질 수 있어서,
-        첫 두 축 가운데 더 큰 값을 length로 사용합니다.
-        raw shape가 없으면 토큰화용 고정 ``[width, length]`` 값을 대신 사용합니다.
-
-        Args:
-            tokenized_agent: 에이전트 토큰 사전입니다.
-                ``shape`` 는 보통 ``[n_agent, 2]`` 또는 ``[n_agent, 3]`` 이고,
-                ``token_agent_shape`` 는 ``[n_agent, 2]`` 입니다.
-
-        Returns:
-            Tensor:
-                anchor 전 공통으로 쓸 box length입니다. shape은 ``[n_agent]`` 입니다.
-        """
-        if "shape" in tokenized_agent:
-            shape = tokenized_agent["shape"].to(dtype=torch.float32)
-            if shape.dim() >= 2 and shape.shape[-1] >= 2:
-                return shape[..., :2].amax(dim=-1)
-
-        token_shape = tokenized_agent["token_agent_shape"].to(dtype=torch.float32)
-        return token_shape[..., 1]
 
     def _concat_flow_chunks(
         self,
