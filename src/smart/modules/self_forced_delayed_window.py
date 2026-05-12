@@ -6,7 +6,9 @@ from typing import Dict
 import torch
 from torch import Tensor
 
-from src.smart.utils import transform_to_local
+from src.smart.modules.dynamic_light_time import normalize_light_time_delta_seconds
+from src.smart.tokens.agent_token_matching import match_token_idx_from_local_contour
+from src.smart.utils import cal_polygon_contour, transform_to_local
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,105 @@ def _clone_tensor_dict_value(value: object) -> object:
     return value
 
 
+def _has_token_matching_inputs(tokenized_agent: Dict[str, Tensor]) -> bool:
+    """self-generated chunk 기준 motion token id를 다시 고를 수 있는지 확인합니다."""
+    required_keys = {
+        "type",
+        "token_agent_shape",
+        "trajectory_token_veh",
+        "trajectory_token_ped",
+        "trajectory_token_cyc",
+    }
+    return required_keys.issubset(tokenized_agent.keys())
+
+
+def _build_local_commit_contour_chunk(
+    *,
+    current_pos: Tensor,
+    current_head: Tensor,
+    commit_pos: Tensor,
+    commit_head: Tensor,
+    token_agent_shape: Tensor,
+) -> Tensor:
+    """현재 coarse 상태 기준 0.5초 generated chunk contour를 local 좌표로 만듭니다."""
+    pos_seq = torch.cat([current_pos.unsqueeze(1), commit_pos], dim=1)
+    head_seq = torch.cat([current_head.unsqueeze(1), commit_head], dim=1)
+    contour_global = cal_polygon_contour(
+        pos=pos_seq,
+        head=head_seq,
+        width_length=token_agent_shape.unsqueeze(1),
+    )
+    contour_local_flat, _ = transform_to_local(
+        pos_global=contour_global.flatten(1, 2),
+        head_global=None,
+        pos_now=current_pos,
+        head_now=current_head,
+    )
+    return contour_local_flat.view(pos_seq.shape[0], pos_seq.shape[1], 4, 2)
+
+
+def _match_generated_chunk_token_idx(
+    *,
+    tokenized_agent: Dict[str, Tensor],
+    pred_traj_10hz: Tensor,
+    pred_head_10hz: Tensor,
+    end_index_10hz: int,
+    commit_steps: int,
+) -> Tensor | None:
+    """자기 생성 0.5초 chunk를 학습 토큰화와 같은 방식으로 다시 매칭합니다."""
+    if not _has_token_matching_inputs(tokenized_agent):
+        return None
+
+    start_index_10hz = int(end_index_10hz - commit_steps)
+    if start_index_10hz < 0:
+        return None
+    if pred_traj_10hz.shape[1] <= end_index_10hz:
+        raise ValueError(
+            "pred_traj_10hz is shorter than the generated token chunk: "
+            f"T={pred_traj_10hz.shape[1]}, required_index={end_index_10hz}."
+        )
+
+    contour_local = _build_local_commit_contour_chunk(
+        current_pos=pred_traj_10hz[:, start_index_10hz].detach(),
+        current_head=pred_head_10hz[:, start_index_10hz].detach(),
+        commit_pos=pred_traj_10hz[:, start_index_10hz + 1 : end_index_10hz + 1].detach(),
+        commit_head=pred_head_10hz[:, start_index_10hz + 1 : end_index_10hz + 1].detach(),
+        token_agent_shape=tokenized_agent["token_agent_shape"].to(
+            device=pred_traj_10hz.device,
+            dtype=pred_traj_10hz.dtype,
+        ),
+    )
+    return match_token_idx_from_local_contour(
+        agent_type=tokenized_agent["type"],
+        contour_local=contour_local,
+        token_bank_all_veh=tokenized_agent["trajectory_token_veh"],
+        token_bank_all_ped=tokenized_agent["trajectory_token_ped"],
+        token_bank_all_cyc=tokenized_agent["trajectory_token_cyc"],
+        reduction="sum",
+        num_k=1,
+        sample_topk=False,
+    )
+
+
+def _build_delayed_light_time_delta_norm(
+    *,
+    num_agents: int,
+    num_steps: int,
+    start_step_10hz: int,
+    commit_steps: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """지연 시작 시점을 새 현재로 본 context slot별 traffic-light 시간차를 만듭니다."""
+    slot_steps = (
+        float(start_step_10hz)
+        + (torch.arange(num_steps, device=device, dtype=dtype) - 1.0) * float(commit_steps)
+    )
+    delta_seconds = slot_steps * 0.1
+    delta_norm = normalize_light_time_delta_seconds(delta_seconds)
+    return delta_norm.view(1, num_steps).expand(num_agents, num_steps)
+
+
 def build_delayed_anchor0_tokenized_agent(
     tokenized_agent: Dict[str, Tensor],
     pred_traj_10hz: Tensor,
@@ -175,17 +276,15 @@ def build_delayed_anchor0_tokenized_agent(
     delayed_agent["_self_forced_delayed_start_step_10hz"] = int(window.start_step_10hz)
     delayed_agent["_self_forced_delayed_anchor_offset"] = int(window.anchor_offset)
 
-    # flow_eval_mask: [N, 13]. anchor 0이 이번 delayed window의 시작 시점을 보게 합니다.
-    delayed_agent["flow_eval_mask"][:, 0] = flow_eval_mask[:, window.anchor_offset].bool()
+    # flow_eval_mask: [N, 13]. anchor 0만 이번 delayed window의 시작 시점을 보게 합니다.
+    delayed_flow_eval_mask = flow_eval_mask.new_zeros(flow_eval_mask.shape)
+    delayed_flow_eval_mask[:, 0] = flow_eval_mask[:, window.anchor_offset].bool()
+    delayed_agent["flow_eval_mask"] = delayed_flow_eval_mask
 
     source_ctx_slot = int(window.anchor_offset + 1)
     if "ctx_valid" in delayed_agent and source_ctx_slot < delayed_agent["ctx_valid"].shape[1]:
         # ctx_valid: [N, 14]
         delayed_agent["ctx_valid"][:, 1] = delayed_agent["ctx_valid"][:, source_ctx_slot]
-    if "ctx_sampled_idx" in delayed_agent and source_ctx_slot < delayed_agent["ctx_sampled_idx"].shape[1]:
-        # ctx_sampled_idx: [N, 14]
-        delayed_agent["ctx_sampled_idx"][:, 1] = delayed_agent["ctx_sampled_idx"][:, source_ctx_slot]
-
     if window.start_step_10hz <= 0:
         return delayed_agent
 
@@ -200,6 +299,16 @@ def build_delayed_anchor0_tokenized_agent(
     # ctx_sampled_pos[:, 1]: [N, 2], ctx_sampled_heading[:, 1]: [N]
     delayed_agent["ctx_sampled_pos"][:, 1] = pred_traj_10hz[:, current_index].detach()
     delayed_agent["ctx_sampled_heading"][:, 1] = pred_head_10hz[:, current_index].detach()
+    if "ctx_sampled_idx" in delayed_agent:
+        token_idx_current = _match_generated_chunk_token_idx(
+            tokenized_agent=tokenized_agent,
+            pred_traj_10hz=pred_traj_10hz,
+            pred_head_10hz=pred_head_10hz,
+            end_index_10hz=current_index,
+            commit_steps=int(commit_steps),
+        )
+        if token_idx_current is not None:
+            delayed_agent["ctx_sampled_idx"][:, 1] = token_idx_current
 
     prev_index = current_index - int(commit_steps)
     if prev_index >= 0:
@@ -208,6 +317,25 @@ def build_delayed_anchor0_tokenized_agent(
         delayed_agent["ctx_sampled_heading"][:, 0] = pred_head_10hz[:, prev_index].detach()
         if "ctx_valid" in delayed_agent:
             delayed_agent["ctx_valid"][:, 0] = delayed_agent["ctx_valid"][:, 1]
+        if "ctx_sampled_idx" in delayed_agent:
+            token_idx_prev = _match_generated_chunk_token_idx(
+                tokenized_agent=tokenized_agent,
+                pred_traj_10hz=pred_traj_10hz,
+                pred_head_10hz=pred_head_10hz,
+                end_index_10hz=prev_index,
+                commit_steps=int(commit_steps),
+            )
+            if token_idx_prev is not None:
+                delayed_agent["ctx_sampled_idx"][:, 0] = token_idx_prev
+
+    delayed_agent["light_time_delta_norm"] = _build_delayed_light_time_delta_norm(
+        num_agents=pred_traj_10hz.shape[0],
+        num_steps=delayed_agent["ctx_sampled_pos"].shape[1],
+        start_step_10hz=int(window.start_step_10hz),
+        commit_steps=int(commit_steps),
+        device=pred_traj_10hz.device,
+        dtype=pred_traj_10hz.dtype,
+    )
 
     return delayed_agent
 

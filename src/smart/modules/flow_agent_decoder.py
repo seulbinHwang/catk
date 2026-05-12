@@ -680,6 +680,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
             light_type=map_feature.get("light_type"),
+            light_time_delta_norm=tokenized_agent.get("light_time_delta_norm"),
         )
 
         feat_map = map_feature["pt_token"]
