@@ -508,12 +508,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         value: torch.Tensor,
         agent_type: torch.Tensor | None,
     ) -> torch.Tensor:
-        if (
-            not self.use_kinematic_control_flow
-            or agent_type is None
-            or value.shape[-1] != CONTROL_FLOW_DIM
-        ):
+        if not self.use_kinematic_control_flow or value.shape[-1] != CONTROL_FLOW_DIM:
             return value
+        if agent_type is None:
+            raise ValueError(
+                "agent_type is required to convert control-space flow output "
+                "to pose-space metric representation."
+            )
         return control_norm_to_pose_norm(
             control_norm=value,
             agent_type=agent_type.to(device=value.device),
