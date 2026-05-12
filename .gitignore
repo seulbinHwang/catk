@@ -3,3 +3,17 @@
 **/logs
 secrets/waymo/waymo_storage_state.json
 secrets/waymo/playwright_profile/
+
+# Paper/Overleaf artifacts — code repo 에 절대 들어가면 안 됨
+# (학습 .log 파일과 충돌 피하려고 디렉토리 단위로 격리 + latex 전용 확장자만 명시)
+*.tex
+*.bib
+*.bbl
+*.blg
+*.aux
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+paper/
+paper_assets/
+overleaf/
