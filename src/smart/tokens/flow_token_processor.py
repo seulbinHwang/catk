@@ -145,6 +145,7 @@ class FlowTokenProcessor(TokenProcessor):
             agent_length = self._get_agent_box_length(tokenized_agent)
             flow_train_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
             flow_train_chunks: List[Tensor] = []
+            flow_train_metric_chunks: List[Tensor] = []
             flow_train_loss_mask_chunks: List[Tensor] = []
             flow_train_agent_type_chunks: List[Tensor] = []
             flow_train_agent_length_chunks: List[Tensor] = []
@@ -194,7 +195,23 @@ class FlowTokenProcessor(TokenProcessor):
                 if not train_anchor_mask.any():
                     continue
 
+                flow_train_metric_norm = (
+                    self._build_anchor_clean_norm(
+                        pos=pos,
+                        heading=heading,
+                        current_pos=current_pos,
+                        current_head=current_head,
+                        agent_type=tokenized_agent["type"],
+                        anchor_mask=train_anchor_mask,
+                        raw_step=raw_step,
+                        future_loss_mask=selected_future_loss_mask,
+                        force_pose_space=True,
+                    )
+                    if self.use_kinematic_control_flow
+                    else flow_train_clean_norm
+                )
                 flow_train_chunks.append(flow_train_clean_norm)
+                flow_train_metric_chunks.append(flow_train_metric_norm)
                 flow_train_loss_mask_chunks.append(selected_future_loss_mask)
                 prev_control, prev_control_valid = self._build_anchor_prev_control(
                     pos=pos,
@@ -221,6 +238,12 @@ class FlowTokenProcessor(TokenProcessor):
                         chunks=flow_train_chunks,
                         dtype=dtype,
                         device=device,
+                    ),
+                    "flow_train_clean_metric_norm": self._concat_flow_chunks(
+                        chunks=flow_train_metric_chunks,
+                        dtype=dtype,
+                        device=device,
+                        target_dim=POSE_FLOW_DIM,
                     ),
                     "flow_train_loss_mask": self._concat_mask_chunks(
                         chunks=flow_train_loss_mask_chunks,
@@ -263,6 +286,7 @@ class FlowTokenProcessor(TokenProcessor):
 
         flow_eval_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
         flow_eval_chunks: List[Tensor] = []
+        flow_eval_metric_chunks: List[Tensor] = []
         flow_eval_agent_type_chunks: List[Tensor] = []
         for anchor_offset, raw_step in enumerate(raw_current_steps):
             current_valid = valid[:, raw_step]
@@ -273,7 +297,17 @@ class FlowTokenProcessor(TokenProcessor):
                 continue
 
             flow_eval_agent_type_chunks.append(tokenized_agent["type"][anchor_mask])
-            flow_eval_chunks.append(
+            flow_eval_clean_norm = self._build_anchor_clean_norm(
+                pos=pos,
+                heading=heading,
+                current_pos=pos[:, raw_step],
+                current_head=heading[:, raw_step],
+                agent_type=tokenized_agent["type"],
+                anchor_mask=anchor_mask,
+                raw_step=raw_step,
+            )
+            flow_eval_chunks.append(flow_eval_clean_norm)
+            flow_eval_metric_chunks.append(
                 self._build_anchor_clean_norm(
                     pos=pos,
                     heading=heading,
@@ -282,7 +316,10 @@ class FlowTokenProcessor(TokenProcessor):
                     agent_type=tokenized_agent["type"],
                     anchor_mask=anchor_mask,
                     raw_step=raw_step,
+                    force_pose_space=True,
                 )
+                if self.use_kinematic_control_flow
+                else flow_eval_clean_norm
             )
 
         tokenized_agent.update(
@@ -292,6 +329,12 @@ class FlowTokenProcessor(TokenProcessor):
                     chunks=flow_eval_chunks,
                     dtype=dtype,
                     device=device,
+                ),
+                "flow_eval_clean_metric_norm": self._concat_flow_chunks(
+                    chunks=flow_eval_metric_chunks,
+                    dtype=dtype,
+                    device=device,
+                    target_dim=POSE_FLOW_DIM,
                 ),
                 "flow_eval_agent_type": self._concat_vector_chunks(
                     chunks=flow_eval_agent_type_chunks,
@@ -456,6 +499,7 @@ class FlowTokenProcessor(TokenProcessor):
         raw_step: int,
         future_loss_mask: Tensor | None = None,
         return_round_trip_error: bool = False,
+        force_pose_space: bool = False,
     ) -> Tensor | Tuple[Tensor, Tensor]:
         """한 anchor에서 실제로 쓰는 agent만 골라 미래 목표를 만듭니다.
 
@@ -472,6 +516,8 @@ class FlowTokenProcessor(TokenProcessor):
                 shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
                 값이 없으면 전체 window를 모두 사용합니다.
             return_round_trip_error: control-space label의 복원 위치 오차도 함께 돌려줄지 정합니다.
+            force_pose_space: control-space 학습 중에도 raw GT 기준 pose-space target을
+                만들어 open-loop metric 정답으로 쓸 때 켭니다.
 
         Returns:
             Tensor | Tuple[Tensor, Tensor]:
@@ -481,9 +527,12 @@ class FlowTokenProcessor(TokenProcessor):
                 ``return_round_trip_error=True`` 이면 두 번째 값으로 meter 단위 복원 오차
                 ``[n_valid_anchor, flow_window_steps]`` 를 함께 돌려줍니다.
         """
+        if force_pose_space and return_round_trip_error:
+            raise ValueError("force_pose_space cannot be combined with return_round_trip_error.")
         num_valid_anchor = int(anchor_mask.sum().item())
         if num_valid_anchor == 0:
-            empty_target = pos.new_zeros((0, self.flow_window_steps, self.flow_target_dim))
+            target_dim = POSE_FLOW_DIM if force_pose_space else self.flow_target_dim
+            empty_target = pos.new_zeros((0, self.flow_window_steps, target_dim))
             if return_round_trip_error:
                 return empty_target, pos.new_zeros((0, self.flow_window_steps))
             return empty_target
@@ -550,7 +599,7 @@ class FlowTokenProcessor(TokenProcessor):
                 future_head,
             )
 
-        if self.use_kinematic_control_flow:
+        if self.use_kinematic_control_flow and not force_pose_space:
             if return_round_trip_error:
                 return build_rolling_control_target_with_round_trip_error(
                     future_pos=future_pos,
@@ -683,6 +732,7 @@ class FlowTokenProcessor(TokenProcessor):
         chunks: List[Tensor],
         dtype: torch.dtype,
         device: torch.device,
+        target_dim: int | None = None,
     ) -> Tensor:
         """빈 경우까지 포함해서 flow 목표 조각을 하나로 합칩니다.
 
@@ -697,8 +747,10 @@ class FlowTokenProcessor(TokenProcessor):
                 이어 붙인 목표입니다. shape은 ``[n_total_valid_anchor, 20, 4]`` 입니다.
                 유효한 anchor가 없으면 ``[0, 20, 4]`` 빈 텐서를 돌려줍니다.
         """
+        if target_dim is None:
+            target_dim = self.flow_target_dim
         if len(chunks) == 0:
-            return torch.zeros((0, self.flow_window_steps, self.flow_target_dim), device=device, dtype=dtype)
+            return torch.zeros((0, self.flow_window_steps, target_dim), device=device, dtype=dtype)
         return torch.cat(chunks, dim=0)
 
     def _concat_mask_chunks(

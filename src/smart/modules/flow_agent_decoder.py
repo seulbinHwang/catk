@@ -769,6 +769,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_clean_norm: torch.Tensor,
         flow_agent_type: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
+        flow_clean_metric_norm: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """학습 또는 평가용 anchor를 골라 flow decoder 출력을 만듭니다.
 
@@ -781,6 +782,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_loss_mask: loss에 포함할 미래 step입니다.
                 shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
                 값이 없으면 전체 step을 사용합니다.
+            flow_clean_metric_norm: open-loop metric/시각화가 정답으로 쓸 raw GT pose-space
+                표현입니다. control-space 학습에서는 clean control target과 분리됩니다.
 
         Returns:
             Dict[str, torch.Tensor]:
@@ -794,6 +797,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     f"expected={expected_shape}, actual={tuple(flow_loss_mask.shape)}."
                 )
             flow_loss_mask = flow_loss_mask.to(device=flow_clean_norm.device, dtype=torch.bool)
+        if flow_clean_metric_norm is not None:
+            expected_metric_shape = tuple(flow_clean_norm.shape[:2]) + (POSE_FLOW_DIM,)
+            if tuple(flow_clean_metric_norm.shape) != expected_metric_shape:
+                raise ValueError(
+                    "flow_clean_metric_norm must be raw pose-space target with shape "
+                    f"{expected_metric_shape}, got {tuple(flow_clean_metric_norm.shape)}."
+                )
+            flow_clean_metric_norm = flow_clean_metric_norm.to(
+                device=flow_clean_norm.device,
+                dtype=flow_clean_norm.dtype,
+            )
 
         anchor_context = self.build_anchor_context(
             tokenized_agent=tokenized_agent,
@@ -821,7 +835,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             if flow_agent_type is not None:
                 output["flow_metric_agent_type"] = flow_agent_type
                 output["flow_pred_clean_metric_norm"] = self._to_pose_metric_norm(empty, flow_agent_type)
-                output["flow_clean_metric_norm"] = self._to_pose_metric_norm(empty, flow_agent_type)
+                output["flow_clean_metric_norm"] = (
+                    flow_clean_metric_norm
+                    if flow_clean_metric_norm is not None
+                    else self._to_pose_metric_norm(empty, flow_agent_type)
+                )
+            elif flow_clean_metric_norm is not None:
+                output["flow_clean_metric_norm"] = flow_clean_metric_norm
             if flow_loss_mask is not None:
                 output["flow_loss_mask"] = flow_loss_mask
             return output
@@ -853,10 +873,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 flow_pred_clean_norm,
                 flow_agent_type,
             )
-            output["flow_clean_metric_norm"] = self._to_pose_metric_norm(
-                flow_clean_norm,
-                flow_agent_type,
+            output["flow_clean_metric_norm"] = (
+                flow_clean_metric_norm
+                if flow_clean_metric_norm is not None
+                else self._to_pose_metric_norm(
+                    flow_clean_norm,
+                    flow_agent_type,
+                )
             )
+        elif flow_clean_metric_norm is not None:
+            output["flow_clean_metric_norm"] = flow_clean_metric_norm
         if flow_loss_mask is not None:
             output["flow_loss_mask"] = flow_loss_mask
         return output
