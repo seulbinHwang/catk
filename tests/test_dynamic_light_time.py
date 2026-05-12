@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from src.smart.modules.dynamic_light_time import (
@@ -7,6 +8,7 @@ from src.smart.modules.dynamic_light_time import (
     build_context_light_time_delta_norm,
     mask_light_time_delta_norm_by_light_type,
     normalize_light_time_delta_seconds,
+    validate_observed_current_raw_step,
 )
 
 
@@ -15,6 +17,15 @@ def test_normalize_light_time_delta_seconds_clips_and_scales() -> None:
     normalized = normalize_light_time_delta_seconds(value)
     expected = torch.tensor([-1.0 / 6.0, -1.0 / 6.0, 0.0, 0.5, 1.0, 1.0])
     assert torch.allclose(normalized, expected)
+
+
+def test_observed_current_raw_step_guard_accepts_waymo_standard_current() -> None:
+    assert validate_observed_current_raw_step(10, scenario_id="ok") == 10
+
+
+def test_observed_current_raw_step_guard_rejects_nonstandard_current() -> None:
+    with pytest.raises(ValueError, match="current_time_index=12"):
+        validate_observed_current_raw_step(12, scenario_id="bad")
 
 
 def test_context_light_time_delta_matches_waymo_context_slots() -> None:

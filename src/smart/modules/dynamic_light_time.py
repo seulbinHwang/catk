@@ -13,6 +13,26 @@ DEFAULT_SECONDS_PER_RAW_STEP = 0.1
 NO_LANE_STATE_LIGHT_TYPE = 0
 
 
+def validate_observed_current_raw_step(
+    current_time_index: int,
+    *,
+    expected_raw_step: int = DEFAULT_WAYMO_CURRENT_RAW_STEP,
+    scenario_id: str | None = None,
+) -> int:
+    """traffic-light 관측 시점이 모델의 stale-time 기준과 일치하는지 확인합니다."""
+    current = int(current_time_index)
+    expected = int(expected_raw_step)
+    if current != expected:
+        scenario_suffix = f" for scenario {scenario_id}" if scenario_id else ""
+        raise ValueError(
+            "Dynamic traffic-light staleness assumes the observed current raw step "
+            f"is {expected}, but got current_time_index={current}{scenario_suffix}. "
+            "Regenerate the cache with the standard WOMD current step or make the "
+            "observed traffic-light raw step explicit in the model input."
+        )
+    return current
+
+
 def normalize_light_time_delta_seconds(
     delta_seconds: torch.Tensor,
     *,

@@ -46,6 +46,7 @@
 - 이때 신호 상태와 함께 `예측 기준 시점 - 신호 관측 시점` 시간 차를 넣습니다.
 - 시간 차는 실제 신호가 관측된 lane(`UNKNOWN/STOP/GO/CAUTION`)에만 붙이고, 신호가 없는 lane / lane이 아닌 지도 요소 / dummy map에는 `0`을 넣습니다.
 - 시간 차는 `[-1초, +6초]` 범위로 clip 한 뒤 `6초` 로 나눠 정규화합니다.
+- WOMD cache 생성 시 `scenario.current_time_index == 10` 을 강제 검사합니다. 이 값은 stale time 계산에서 “현재 관측 신호가 raw step 10에서 관측됐다”는 기준이므로, 다른 현재 시점의 cache는 조용히 사용하지 않고 fail-fast합니다.
 - 따라서 모델 입력 의미는 `이 lane은 빨간불이다` 가 아니라 `이 lane은 Δt초 전에 빨간불로 관측됐다` 입니다.
 - pretrain과 closed-loop 추론 모두 실제 미래 신호를 입력하지 않고, 현재 관측 신호와 경과 시간만 사용합니다.
 - closed-loop validation/test에서 여러 rollout을 병렬 실행할 때도 traffic-light 상태를 map token과 같은 순서로 복제합니다.
@@ -2245,7 +2246,7 @@ python src/run.py \
 2. 각 scenario마다 RoaD rollout 3개를 생성합니다.
 3. 각 0.5초 block마다 현재 closed-loop scene에서 후보 64개를 temperature 0.8로 새로 만들고, GT future와 사각형 4개 꼭지점 평균 거리가 가장 작은 후보를 agent별로 고릅니다.
 4. 선택된 후보의 앞 0.5초만 scene에 반영하고, 이 과정을 16번 반복해 8초 future를 만듭니다.
-5. 선택된 future를 기존 WOMD `.pkl` schema와 같은 RoaD `.pkl` cache로 저장합니다.
+5. 선택된 future를 기존 WOMD `.pkl` schema와 같은 RoaD `.pkl` cache로 저장합니다. 이때 traffic-light 상태 자체는 원본 현재 관측값을 유지하고, block이 진행될수록 stale time scalar만 증가시킵니다. 즉 RoaD cache 생성 중에도 미래 traffic-light 상태를 보거나 동적으로 갱신하지 않습니다.
 6. 생성된 3N개 cache 중 scenario마다 하나만 균등하게 골라 selected cache 폴더를 만듭니다.
 7. selected cache N개만 사용해 1 epoch 학습합니다. 따라서 optimizer update 수는 기존 CAT-K fine-tuning 1 epoch와 같습니다.
 8. epoch 종료 후 다음 epoch용 RoaD cache를 최신 모델로 다시 만들고, 이미 사용한 이전 epoch cache는 삭제합니다.
