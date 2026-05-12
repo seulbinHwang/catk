@@ -188,12 +188,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     f"got {tuple(motion_a.shape)} and {tuple(pos_a.shape)}"
                 )
             if motion_valid_a is None:
-                motion_valid_a = torch.ones(
-                    motion_a.shape[:2],
-                    device=motion_a.device,
-                    dtype=torch.bool,
+                raise ValueError(
+                    "motion_valid_a is required when motion_a is provided. "
+                    "Missing motion must not be treated as valid zero motion."
                 )
-            elif tuple(motion_valid_a.shape) != tuple(motion_a.shape[:2]):
+            if tuple(motion_valid_a.shape) != tuple(motion_a.shape[:2]):
                 raise ValueError(
                     "motion_valid_a shape must match the first two dimensions of motion_a, "
                     f"got {tuple(motion_valid_a.shape)} and {tuple(motion_a.shape[:2])}"

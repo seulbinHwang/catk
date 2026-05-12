@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
@@ -64,3 +65,23 @@ def test_recent_coarse_motion_returns_value_and_validity() -> None:
     assert torch.allclose(recent_motion[0], torch.zeros(2))
     assert torch.allclose(recent_motion[1], torch.tensor([3.0, 4.0]))
     assert torch.allclose(recent_motion[2], torch.zeros(2))
+
+
+def test_external_motion_requires_validity_mask() -> None:
+    pos = torch.zeros(2, 1, 2)
+    head = torch.zeros(2, 1)
+    head_vector = torch.zeros(2, 1, 2)
+    head_vector[..., 0] = 1.0
+    mask = torch.ones(2, 1, dtype=torch.bool)
+    batch_s = torch.zeros(2, dtype=torch.long)
+
+    with pytest.raises(ValueError, match="motion_valid_a is required"):
+        SMARTFlowAgentDecoder.build_interaction_edge(
+            None,
+            pos_a=pos,
+            head_a=head,
+            head_vector_a=head_vector,
+            batch_s=batch_s,
+            mask=mask,
+            motion_a=pos,
+        )
