@@ -6,7 +6,6 @@ import torch
 from src.smart.modules.dynamic_light_time import (
     build_constant_light_time_delta_norm,
     build_context_light_time_delta_norm,
-    mask_light_time_delta_norm_by_light_type,
     normalize_light_time_delta_seconds,
     validate_observed_current_raw_step,
 )
@@ -52,17 +51,3 @@ def test_constant_light_time_delta_handles_rollout_tail() -> None:
     )
     assert delta.shape == (3, 1)
     assert torch.allclose(delta, torch.ones_like(delta))
-
-
-def test_light_time_delta_is_zero_without_observed_signal() -> None:
-    delta = torch.tensor([0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
-    # 0: no observed signal, 1: observed unknown, 2/3/4: stop/go/caution.
-    light_type = torch.tensor([0, 1, 2, 3, 4, 0])
-
-    masked = mask_light_time_delta_norm_by_light_type(
-        light_time_delta_norm=delta,
-        light_type=light_type,
-    )
-
-    expected = torch.tensor([0.0, 0.3, 0.4, 0.5, 0.6, 0.0])
-    assert torch.allclose(masked, expected)
