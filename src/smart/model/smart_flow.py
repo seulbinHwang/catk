@@ -553,6 +553,44 @@ class SMARTFlow(LightningModule):
             return torch.zeros((), device=self.device, requires_grad=True)
         return zero_loss
 
+    @staticmethod
+    def _first_parameter_device(module: nn.Module) -> torch.device:
+        """module 안 첫 parameter device를 반환합니다."""
+        for param in module.parameters():
+            return param.device
+        return torch.device("cpu")
+
+    def _optimizer_parameter_device(self, optimizer) -> torch.device:
+        """optimizer가 관리하는 첫 parameter device를 반환합니다."""
+        raw_optimizer = getattr(optimizer, "optimizer", optimizer)
+        for group in getattr(raw_optimizer, "param_groups", []):
+            for param in group.get("params", []):
+                return param.device
+        return self._first_parameter_device(self)
+
+    @staticmethod
+    def _distributed_available_and_initialized() -> bool:
+        """torch.distributed all-reduce를 사용할 수 있는지 확인합니다."""
+        distributed = getattr(torch, "distributed", None)
+        return bool(
+            distributed is not None
+            and distributed.is_available()
+            and distributed.is_initialized()
+        )
+
+    def _sync_distributed_bool_any(
+        self,
+        value: bool,
+        *,
+        device: torch.device | None = None,
+    ) -> bool:
+        """DDP 전체 rank 중 하나라도 True인지 동기화해 반환합니다."""
+        sync_device = device if device is not None else self._first_parameter_device(self)
+        flag = torch.tensor(int(bool(value)), device=sync_device, dtype=torch.long)
+        if self._distributed_available_and_initialized():
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item())
+
     def _open_loop_denoise_metrics(
         self,
         pred_dict: Dict[str, Tensor],
@@ -1932,6 +1970,8 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        *,
+        has_committed_path_global: bool | None = None,
     ) -> Tensor:
         """detached self-rollout으로 generated estimator F_psi를 online 업데이트합니다.
 
@@ -1943,6 +1983,8 @@ class SMARTFlow(LightningModule):
                 control-space에서는 ``[n_valid_agent, F_win, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
+            has_committed_path_global: DDP 전체 rank 기준으로 self-forced path가 하나라도
+                있는지입니다. 값이 없으면 이 함수 안에서 동기화합니다.
 
         Returns:
             Tensor: 마지막 estimator update의 flow matching loss입니다.
@@ -1957,6 +1999,15 @@ class SMARTFlow(LightningModule):
 
         optimizer = self.optimizers()[1]
         last_loss = committed_path_norm.new_zeros(())
+        has_committed_path_local = committed_path_norm.numel() > 0
+        if has_committed_path_global is None:
+            has_committed_path_global = self._sync_distributed_bool_any(
+                has_committed_path_local,
+                device=committed_path_norm.device,
+            )
+        if not has_committed_path_global:
+            return last_loss.detach()
+
         clean_path = committed_path_norm.detach().clone()
         estimator_tokenized_map = detach_tensor_tree(tokenized_map)
         estimator_tokenized_agent = detach_tensor_tree(tokenized_agent)
@@ -1970,23 +2021,28 @@ class SMARTFlow(LightningModule):
                 for _ in range(self.self_forced_estimator_updates_per_step):
                     optimizer.zero_grad(set_to_none=True)
                     self._prepare_self_forced_estimator_backward_boundary()
-                    with torch.no_grad():
-                        flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
-                            clean_path,
-                            target_type="velocity",
+                    if has_committed_path_local:
+                        with torch.no_grad():
+                            flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
+                                clean_path,
+                                target_type="velocity",
+                            )
+                        noisy_path_norm = flow_sample.x_t.detach()
+                        tau = flow_sample.tau.detach()
+                        flow_target = flow_sample.target.detach()
+                        pred_dict = self._predict_path_flow_clean_estimate(
+                            decoder=self.self_forced_generated_estimator,
+                            tokenized_map=estimator_tokenized_map,
+                            tokenized_agent=estimator_tokenized_agent,
+                            noisy_path_norm=noisy_path_norm,
+                            tau=tau,
+                            anchor_mask=estimator_anchor_mask,
                         )
-                    noisy_path_norm = flow_sample.x_t.detach()
-                    tau = flow_sample.tau.detach()
-                    flow_target = flow_sample.target.detach()
-                    pred_dict = self._predict_path_flow_clean_estimate(
-                        decoder=self.self_forced_generated_estimator,
-                        tokenized_map=estimator_tokenized_map,
-                        tokenized_agent=estimator_tokenized_agent,
-                        noisy_path_norm=noisy_path_norm,
-                        tau=tau,
-                        anchor_mask=estimator_anchor_mask,
-                    )
-                    last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
+                        last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
+                    else:
+                        last_loss = self._build_trainable_connected_zero_loss(
+                            self.self_forced_generated_estimator,
+                        )
                     self._manual_backward_without_autocast(last_loss)
                     self._assert_self_forced_estimator_update_isolated()
                     self._clip_and_step_with_optional_scaler(
@@ -2329,6 +2385,10 @@ class SMARTFlow(LightningModule):
             zero_loss_module=self.encoder,
         )
         total_loss = fm_loss
+        has_open_loop_targets_global = self._sync_distributed_bool_any(
+            has_open_loop_targets,
+            device=total_loss.device,
+        )
 
         generator_optimizer = self.optimizers()[0]
         self.toggle_optimizer(generator_optimizer)
@@ -2337,7 +2397,7 @@ class SMARTFlow(LightningModule):
             self._prepare_self_forced_generator_backward_boundary()
             self._manual_backward_without_autocast(total_loss)
             self._assert_self_forced_generator_update_isolated()
-            if has_open_loop_targets:
+            if has_open_loop_targets_global:
                 self._clip_and_step_with_optional_scaler(
                     generator_optimizer,
                     gradient_clip_val=self.self_forced_gradient_clip_val,
@@ -2419,16 +2479,27 @@ class SMARTFlow(LightningModule):
             rollout=rollout,
             tokenized_agent=tokenized_agent_eval,
         )
-        if committed_path_norm.numel() == 0:
+        has_committed_path_local = committed_path_norm.numel() > 0
+        has_committed_path_global = self._sync_distributed_bool_any(
+            has_committed_path_local,
+            device=committed_path_norm.device,
+        )
+        has_anchor_fm_targets_global = False
+        if fm_loss is not None:
+            has_anchor_fm_targets_global = self._sync_distributed_bool_any(
+                has_anchor_fm_targets,
+                device=fm_loss.device,
+            )
+
+        if not has_committed_path_global:
             if self._is_self_forced_estimator_warmup_active():
                 return self._finish_self_forced_estimator_warmup_step(None)
-            if fm_loss is None:
-                # DDP requires backward on every rank to participate in the
-                # gradient all-reduce. Walk Generator parameters with a
-                # zero-coefficient sum so autograd traverses the param graph
-                # and DDP completes its all-reduce; skip optimizer.step()
-                # because the gradients are deterministically zero.
-                zero_loss = self._build_trainable_connected_zero_loss(self.encoder)
+            if fm_loss is None or not has_anchor_fm_targets_global:
+                zero_loss = (
+                    fm_loss
+                    if fm_loss is not None
+                    else self._build_trainable_connected_zero_loss(self.encoder)
+                )
                 generator_optimizer = self.optimizers()[0]
                 self.toggle_optimizer(generator_optimizer)
                 try:
@@ -2440,6 +2511,15 @@ class SMARTFlow(LightningModule):
                     self._clear_self_forced_generator_gradients()
                     self.untoggle_optimizer(generator_optimizer)
                 self.log("train/loss", zero_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                if fm_loss is not None:
+                    self.log(
+                        "train/loss_fm",
+                        fm_loss.detach(),
+                        on_step=False,
+                        on_epoch=True,
+                        sync_dist=True,
+                        batch_size=1,
+                    )
                 self.log("train/sf_anchor_fm_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
                 return zero_loss.detach()
@@ -2450,7 +2530,7 @@ class SMARTFlow(LightningModule):
             try:
                 self._manual_backward_without_autocast(fm_loss)
                 self._assert_self_forced_generator_update_isolated()
-                if has_anchor_fm_targets:
+                if has_anchor_fm_targets_global:
                     self._clip_and_step_with_optional_scaler(generator_optimizer)
                     self._update_self_forced_generator_ema_after_step()
             finally:
@@ -2465,15 +2545,19 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            has_committed_path_global=has_committed_path_global,
         )
         if self._is_self_forced_estimator_warmup_active():
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
-        sf_loss = self._compute_self_forced_distribution_matching_loss(
-            tokenized_map=tokenized_map_eval,
-            tokenized_agent=tokenized_agent_eval,
-            committed_path_norm=committed_path_norm,
-            anchor_mask=anchor_mask,
-        )
+        if has_committed_path_local:
+            sf_loss = self._compute_self_forced_distribution_matching_loss(
+                tokenized_map=tokenized_map_eval,
+                tokenized_agent=tokenized_agent_eval,
+                committed_path_norm=committed_path_norm,
+                anchor_mask=anchor_mask,
+            )
+        else:
+            sf_loss = self._build_trainable_connected_zero_loss(self.encoder)
         anchor_loss = (
             fm_loss
             if fm_loss is not None
@@ -2620,7 +2704,6 @@ open_metric_dict:
         self._automatic_open_loop_has_target_since_step = (
             self._automatic_open_loop_has_target_since_step or has_open_loop_targets
         )
-        self._skip_next_automatic_optimizer_step = not self._automatic_open_loop_has_target_since_step
 
         total_loss = fm_loss
         if not torch.isfinite(fm_loss):
@@ -2668,8 +2751,13 @@ open_metric_dict:
         return total_loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
-        """target이 없는 automatic optimization batch에서는 zero grad 업데이트를 막습니다."""
-        if self._skip_next_automatic_optimizer_step:
+        """DDP 전체에 target이 없는 automatic optimization step의 업데이트를 막습니다."""
+        has_open_loop_targets_global = self._sync_distributed_bool_any(
+            self._automatic_open_loop_has_target_since_step,
+            device=self._optimizer_parameter_device(optimizer),
+        )
+        self._skip_next_automatic_optimizer_step = not has_open_loop_targets_global
+        if not has_open_loop_targets_global:
             optimizer.zero_grad(set_to_none=True)
         self._automatic_open_loop_has_target_since_step = False
         self._skip_next_automatic_optimizer_step = False

@@ -75,7 +75,8 @@ def test_empty_target_automatic_step_clears_zero_grads_before_adamw_decay() -> N
     model = _make_minimal_model()
     optimizer = torch.optim.AdamW(model.encoder.parameters(), lr=1.0, weight_decay=0.1)
     before = model.encoder.weight.detach().clone()
-    model._skip_next_automatic_optimizer_step = True
+    model._automatic_open_loop_has_target_since_step = False
+    model._skip_next_automatic_optimizer_step = False
 
     loss = model._build_trainable_connected_zero_loss(model.encoder)
     loss.backward()
@@ -85,4 +86,22 @@ def test_empty_target_automatic_step_clears_zero_grads_before_adamw_decay() -> N
     optimizer.step()
 
     torch.testing.assert_close(model.encoder.weight, before)
+    assert model._skip_next_automatic_optimizer_step is False
+
+
+def test_empty_local_target_keeps_grad_when_another_rank_has_target() -> None:
+    model = _make_minimal_model()
+    optimizer = torch.optim.AdamW(model.encoder.parameters(), lr=1.0, weight_decay=0.1)
+    model._automatic_open_loop_has_target_since_step = False
+    model._skip_next_automatic_optimizer_step = False
+    model._sync_distributed_bool_any = lambda value, *, device=None: True  # type: ignore[method-assign]
+
+    loss = model._build_trainable_connected_zero_loss(model.encoder)
+    loss.backward()
+    assert model.encoder.weight.grad is not None
+
+    model.on_before_optimizer_step(optimizer)
+
+    assert model.encoder.weight.grad is not None
+    assert model._automatic_open_loop_has_target_since_step is False
     assert model._skip_next_automatic_optimizer_step is False
