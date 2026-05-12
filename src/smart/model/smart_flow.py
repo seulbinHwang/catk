@@ -2752,6 +2752,8 @@ open_metric_dict:
 
     def on_before_optimizer_step(self, optimizer) -> None:
         """DDP 전체에 target이 없는 automatic optimization step의 업데이트를 막습니다."""
+        if not bool(getattr(self, "automatic_optimization", True)):
+            return
         has_open_loop_targets_global = self._sync_distributed_bool_any(
             self._automatic_open_loop_has_target_since_step,
             device=self._optimizer_parameter_device(optimizer),

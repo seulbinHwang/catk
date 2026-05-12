@@ -8,7 +8,9 @@ from src.smart.model.smart_flow import SMARTFlow
 
 def _make_minimal_model() -> SMARTFlow:
     model = SMARTFlow.__new__(SMARTFlow)
+    nn.Module.__init__(model)
     model.encoder = nn.Linear(2, 1, bias=False)
+    model.automatic_optimization = True
     model.open_metric_names = {
         "ade": "ADE2s",
         "fde": "FDE2s",
@@ -105,3 +107,19 @@ def test_empty_local_target_keeps_grad_when_another_rank_has_target() -> None:
     assert model.encoder.weight.grad is not None
     assert model._automatic_open_loop_has_target_since_step is False
     assert model._skip_next_automatic_optimizer_step is False
+
+
+def test_manual_optimizer_hook_does_not_clear_existing_gradients() -> None:
+    model = _make_minimal_model()
+    model.automatic_optimization = False
+    optimizer = torch.optim.AdamW(model.encoder.parameters(), lr=1.0, weight_decay=0.1)
+
+    loss = model.encoder(torch.ones((1, 2), dtype=torch.float32)).sum()
+    loss.backward()
+    assert model.encoder.weight.grad is not None
+    grad_before = model.encoder.weight.grad.detach().clone()
+
+    model.on_before_optimizer_step(optimizer)
+
+    assert model.encoder.weight.grad is not None
+    torch.testing.assert_close(model.encoder.weight.grad, grad_before)
