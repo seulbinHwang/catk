@@ -25,7 +25,7 @@ DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "self_forced_npfm_h100x4_wo_pvc_800"
 DEFAULT_SESSION = "catk-sf-h100x4-wo-pvc-800-anchor-sweep"
-DEFAULT_TASK_PREFIX = "flow_self_forced_h100x4_wo_pvc_800_dmd_anchorfm"
+DEFAULT_TASK_PREFIX = "flow_sf_anchorfm"
 DEFAULT_ANCHOR_WEIGHTS = ("0.02", "0.06", "0.1", "0.2", "0.5")
 DEFAULT_WANDB_PRETRAIN_ARTIFACT = (
     "jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v64"
@@ -69,8 +69,11 @@ def parse_anchor_weights(value: str) -> list[str]:
 
 
 def anchor_tag(weight: str) -> str:
-    scaled = int((Decimal(weight) * Decimal("100")).to_integral_value())
-    return f"w{scaled:03d}"
+    normalized = format(Decimal(weight).normalize(), "f")
+    if "." in normalized:
+        integer, fraction = normalized.split(".", 1)
+        normalized = integer + "." + fraction.ljust(2, "0")
+    return "aw" + normalized.replace("-", "m").replace(".", "p")
 
 
 def run_root(args: argparse.Namespace) -> str:
@@ -246,7 +249,11 @@ from decimal import Decimal
 import sys
 
 value = Decimal(sys.argv[1])
-print(f"w{{int((value * Decimal('100')).to_integral_value()):03d}}")
+normalized = format(value.normalize(), "f")
+if "." in normalized:
+    integer, fraction = normalized.split(".", 1)
+    normalized = integer + "." + fraction.ljust(2, "0")
+print("aw" + normalized.replace("-", "m").replace(".", "p"))
 PY
 }}
 
@@ -254,7 +261,7 @@ run_one_weight() {{
   local weight="$1"
   local tag
   tag="$(weight_tag "$weight")"
-  local task_name="${{TASK_PREFIX}}_${{SWEEP_ID}}_${{tag}}_backprop8_detachfalse_warmup1_lr5e-6_max4_scorer640_bs22"
+  local task_name="${{TASK_PREFIX}}_${{tag}}_${{SWEEP_ID}}_h100x4wo800_dmd_k${{BACKPROP_LAST_K}}_lr${{CATK_LR}}_bs${{INITIAL_BS}}"
 
   echo
   echo "================================================================"

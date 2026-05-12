@@ -1747,6 +1747,34 @@ class SMARTFlow(LightningModule):
             return
         clear_module_gradients(self.encoder)
 
+    def _snapshot_self_forced_generator_gradients(self) -> list[tuple[Tensor, Tensor | None]]:
+        """현재 online Generator gradient를 임시 보관합니다.
+
+        Returns:
+            list[tuple[Tensor, Tensor | None]]: 파라미터와 gradient clone의 쌍입니다.
+
+        설명:
+            anchor FM loss를 먼저 backward하면 activation graph는 바로 해제할 수 있습니다.
+            이후 generated-estimator update는 격리 검증을 위해 Generator gradient를 비우므로,
+            이미 계산한 anchor gradient만 작은 텐서 clone으로 보관했다가 Generator update
+            직전에 복원합니다.
+        """
+        if not self.self_forced_enabled:
+            return []
+        return [
+            (parameter, None if parameter.grad is None else parameter.grad.detach().clone())
+            for parameter in self.encoder.parameters()
+            if parameter.requires_grad
+        ]
+
+    @staticmethod
+    def _restore_gradient_snapshot(
+        gradient_snapshot: list[tuple[Tensor, Tensor | None]],
+    ) -> None:
+        """보관해둔 gradient snapshot을 원래 parameter에 복원합니다."""
+        for parameter, gradient in gradient_snapshot:
+            parameter.grad = None if gradient is None else gradient.to(device=parameter.device)
+
     def _prepare_self_forced_generator_backward_boundary(self) -> None:
         """Generator backward 직전에 보조 모델 gradient를 초기화합니다.
 
@@ -2724,6 +2752,53 @@ class SMARTFlow(LightningModule):
             )
         return total_loss.detach()
 
+    @staticmethod
+    def _detach_metric_dict(metric_dict: Dict[str, Tensor] | None) -> Dict[str, Tensor] | None:
+        """logging용 metric dict를 graph 없이 보관합니다."""
+        if metric_dict is None:
+            return None
+        return {
+            key: value.detach() if torch.is_tensor(value) else value
+            for key, value in metric_dict.items()
+        }
+
+    def _backward_self_forced_anchor_fm_loss(
+        self,
+        data,
+    ) -> tuple[Tensor, Dict[str, Tensor] | None]:
+        """anchor open-loop FM loss를 계산하고 즉시 backward합니다.
+
+        Args:
+            data: 학습용 장면 batch입니다.
+
+        Returns:
+            tuple[Tensor, Dict[str, Tensor] | None]: raw anchor FM loss와 open-loop metric입니다.
+
+        설명:
+            이 함수는 ``self.self_forced_anchor_weight`` 가 곱해진 loss를 바로 backward합니다.
+            optimizer step은 호출하지 않습니다. 따라서 이후 self-forcing DMD/SiD loss를
+            backward하면 두 gradient가 같은 Generator optimizer step에 누적됩니다.
+        """
+        tokenized_map_train, tokenized_agent_train = self.token_processor(data)
+        pred = self.encoder(
+            tokenized_map_train,
+            tokenized_agent_train,
+            anchor_mask_key="flow_train_mask",
+        )
+        fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+        if not torch.isfinite(fm_loss):
+            raise RuntimeError(
+                "Non-finite self-forced anchor FM loss detected: "
+                f"{self._summarize_nonfinite_tensor(fm_loss)}"
+            )
+
+        weighted_anchor_loss = self.self_forced_anchor_weight * fm_loss
+        self._prepare_self_forced_generator_backward_boundary()
+        self._manual_backward_without_autocast(weighted_anchor_loss)
+        self._assert_self_forced_generator_update_isolated()
+
+        return fm_loss.detach(), self._detach_metric_dict(open_metric_dict)
+
     def _training_step_self_forced(self, data, batch_idx):
         """PDF Step 3~10에 해당하는 self-forced NPFM 학습 step입니다.
 
@@ -2734,19 +2809,36 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: logging용 detached 총 loss입니다.
         """
-        fm_loss = None
+        warmup_active = self._is_self_forced_estimator_warmup_active()
+        generator_optimizer = self.optimizers()[0]
+        anchor_loss = None
         open_metric_dict = None
-        if self.self_forced_use_anchor_fm_loss:
-            tokenized_map_train, tokenized_agent_train = self.token_processor(data)
-            pred = self.encoder(
-                tokenized_map_train,
-                tokenized_agent_train,
-                anchor_mask_key="flow_train_mask",
-            )
-            fm_loss, open_metric_dict, _ = self._open_loop_denoise_metrics(pred)
+        anchor_grad_snapshot = None
+
+        # On bf16/32-bit runs there is no GradScaler state to preserve, so we
+        # can backward the optional anchor FM branch before the closed-loop
+        # self-forcing rollout. This frees the open-loop activation graph before
+        # the much larger rollout/DMD/SID branch is built. For fp16 GradScaler
+        # runs, estimator updates may update the shared scaler between backward
+        # calls, so the anchor branch is still backpropagated sequentially but
+        # after the estimator update.
+        anchor_before_rollout = (
+            self.self_forced_use_anchor_fm_loss
+            and not warmup_active
+            and self._get_amp_grad_scaler() is None
+        )
+        if anchor_before_rollout:
+            self.toggle_optimizer(generator_optimizer)
+            try:
+                generator_optimizer.zero_grad(set_to_none=True)
+                anchor_loss, open_metric_dict = self._backward_self_forced_anchor_fm_loss(data)
+                anchor_grad_snapshot = self._snapshot_self_forced_generator_gradients()
+                self._clear_self_forced_generator_gradients()
+            finally:
+                self.untoggle_optimizer(generator_optimizer)
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
-        if self._is_self_forced_estimator_warmup_active():
+        if warmup_active:
             with torch.no_grad():
                 rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
         else:
@@ -2756,9 +2848,9 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent_eval,
         )
         if committed_path_norm.numel() == 0:
-            if self._is_self_forced_estimator_warmup_active():
+            if warmup_active:
                 return self._finish_self_forced_estimator_warmup_step(None)
-            if fm_loss is None:
+            if not self.self_forced_use_anchor_fm_loss:
                 # DDP requires backward on every rank to participate in the
                 # gradient all-reduce. Walk Generator parameters with a
                 # zero-coefficient sum so autograd traverses the param graph
@@ -2781,19 +2873,30 @@ class SMARTFlow(LightningModule):
                 self.log("train/sf_anchor_fm_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
                 return zero_loss.detach()
-            generator_optimizer = self.optimizers()[0]
+
             self.toggle_optimizer(generator_optimizer)
-            generator_optimizer.zero_grad(set_to_none=True)
-            self._prepare_self_forced_generator_backward_boundary()
-            self._manual_backward_without_autocast(fm_loss)
-            self._assert_self_forced_generator_update_isolated()
-            self._clip_and_step_with_optional_scaler(generator_optimizer)
-            self._update_self_forced_generator_ema_after_step()
-            self._clear_self_forced_generator_gradients()
-            self.untoggle_optimizer(generator_optimizer)
-            self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-            return fm_loss.detach()
+            try:
+                generator_optimizer.zero_grad(set_to_none=True)
+                if anchor_grad_snapshot is not None:
+                    self._restore_gradient_snapshot(anchor_grad_snapshot)
+                    self._assert_self_forced_generator_update_isolated()
+                else:
+                    anchor_loss, open_metric_dict = self._backward_self_forced_anchor_fm_loss(data)
+                self._clip_and_step_with_optional_scaler(
+                    generator_optimizer,
+                    gradient_clip_val=self.self_forced_gradient_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+                self._update_self_forced_generator_ema_after_step()
+                self._clear_self_forced_generator_gradients()
+            finally:
+                self.untoggle_optimizer(generator_optimizer)
+            total_loss = self.self_forced_anchor_weight * anchor_loss
+            self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss_fm", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            return total_loss.detach()
 
         gen_estimator_loss = self._update_generated_path_flow_estimator(
             tokenized_map=tokenized_map_eval,
@@ -2801,45 +2904,49 @@ class SMARTFlow(LightningModule):
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
-        if self._is_self_forced_estimator_warmup_active():
+        if warmup_active:
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
-        sf_loss = self._compute_self_forced_distribution_matching_loss(
-            tokenized_map=tokenized_map_eval,
-            tokenized_agent=tokenized_agent_eval,
-            committed_path_norm=committed_path_norm,
-            anchor_mask=anchor_mask,
-        )
-        physics_dict = self._compute_self_forced_physics_loss(
-            committed_path_norm=committed_path_norm,
-            tokenized_agent=tokenized_agent_eval,
-            anchor_mask=anchor_mask,
-        )
-        anchor_loss = (
-            fm_loss
-            if fm_loss is not None
-            else committed_path_norm.new_zeros(())
-        )
-        total_loss = (
-            self.self_forced_weight * sf_loss
-            + self.self_forced_anchor_weight * anchor_loss
-            + self.self_forced_physics_weight * physics_dict["loss"]
-        )
-        if not torch.isfinite(total_loss):
-            context = self._format_self_forced_backward_context()
-            self._clear_self_forced_backward_context()
-            raise RuntimeError(
-                "Non-finite self-forced total_loss detected: "
-                f"{self._summarize_nonfinite_tensor(total_loss)}"
-                f"{context}"
-            )
 
-        generator_optimizer = self.optimizers()[0]
         try:
             self.toggle_optimizer(generator_optimizer)
             try:
                 generator_optimizer.zero_grad(set_to_none=True)
+                if anchor_grad_snapshot is not None:
+                    self._restore_gradient_snapshot(anchor_grad_snapshot)
+                elif self.self_forced_use_anchor_fm_loss:
+                    anchor_loss, open_metric_dict = self._backward_self_forced_anchor_fm_loss(data)
+
+                sf_loss = self._compute_self_forced_distribution_matching_loss(
+                    tokenized_map=tokenized_map_eval,
+                    tokenized_agent=tokenized_agent_eval,
+                    committed_path_norm=committed_path_norm,
+                    anchor_mask=anchor_mask,
+                )
+                physics_dict = self._compute_self_forced_physics_loss(
+                    committed_path_norm=committed_path_norm,
+                    tokenized_agent=tokenized_agent_eval,
+                    anchor_mask=anchor_mask,
+                )
+                anchor_loss = (
+                    anchor_loss
+                    if anchor_loss is not None
+                    else committed_path_norm.new_zeros(())
+                )
+                self_forced_loss = (
+                    self.self_forced_weight * sf_loss
+                    + self.self_forced_physics_weight * physics_dict["loss"]
+                )
+                total_loss = self_forced_loss + self.self_forced_anchor_weight * anchor_loss
+                if not torch.isfinite(total_loss):
+                    context = self._format_self_forced_backward_context()
+                    self._clear_self_forced_backward_context()
+                    raise RuntimeError(
+                        "Non-finite self-forced total_loss detected: "
+                        f"{self._summarize_nonfinite_tensor(total_loss)}"
+                        f"{context}"
+                    )
                 self._prepare_self_forced_generator_backward_boundary()
-                self._manual_backward_without_autocast(total_loss)
+                self._manual_backward_without_autocast(self_forced_loss)
                 self._assert_self_forced_generator_update_isolated()
                 self._clip_and_step_with_optional_scaler(
                     generator_optimizer,
@@ -2854,8 +2961,8 @@ class SMARTFlow(LightningModule):
             self._clear_self_forced_backward_context()
 
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        if fm_loss is not None:
-            self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        if self.self_forced_use_anchor_fm_loss:
+            self.log("train/loss_fm", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_physics_loss", physics_dict["loss"].detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
