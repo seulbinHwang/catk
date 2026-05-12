@@ -2047,7 +2047,10 @@ class SMARTFlow(LightningModule):
                         cl_sliced_pl = [_ol_slice_fn(cl_norms[g]) for g in range(G)]
                         if _nearest_match:
                             # 각 CL g 에 대해 M_ol 개 OL (+ optionally 1 GT) 중
-                            # per-anchor flat L2 거리 최소를 선택.
+                            # batch-flat weighted L2 거리 최소를 선택.
+                            # 거리 = pos_w · Σ(Δx² + Δy²) + heading_w · Σ((Δcos)² + (Δsin)²)
+                            #   — agent (N_active), timestep (T), 채널 합산.
+                            # 선택 (argmin) 기준 = 학습 (loss) 기준 (pos_w, heading_w) 일치.
                             ol_sliced_pl = [_ol_slice_fn(ol_norms[m]) for m in range(M_ol)]
                             T_min_nm = min(cl_sliced_pl[0].shape[-2], ol_sliced_pl[0].shape[-2])
                             _use_gt_cand = (
@@ -2065,16 +2068,22 @@ class SMARTFlow(LightningModule):
                                 ol_stk_nm = torch.stack(
                                     [o[:, :T_min_nm, :] for o in ol_sliced_pl], dim=0
                                 )  # [M, N_active, T, F]
-                                # [G, M] flat L2² distance
-                                _d2_ol = ((cl_stk_nm.unsqueeze(1) - ol_stk_nm.unsqueeze(0)) ** 2).flatten(2).sum(-1)
+                                # [G, M] weighted L2² distance: pos_w · Σpos² + heading_w · Σhead²
+                                _diff_sq_ol = (cl_stk_nm.unsqueeze(1) - ol_stk_nm.unsqueeze(0)) ** 2  # [G, M, N, T, F]
+                                _d2_ol_pos  = _diff_sq_ol[..., :2].sum(dim=(2, 3, 4))   # [G, M]
+                                _d2_ol_head = _diff_sq_ol[..., 2:].sum(dim=(2, 3, 4))   # [G, M]
+                                _d2_ol = pos_w * _d2_ol_pos + heading_w * _d2_ol_head
+                                del _diff_sq_ol, _d2_ol_pos, _d2_ol_head
                                 if _use_gt_cand:
                                     gt_stk = gt_sliced_nm[:, :T_min_nm, :]  # [N_active, T, F]
                                     gt_mask = gt_valid_anchor_inc[:, :T_min_nm].float().unsqueeze(-1)  # [N, T, 1]
-                                    # GT 거리: invalid step 의 squared diff 는 0 (mask), 전체 sum.
-                                    _d2_gt = (
-                                        (cl_stk_nm - gt_stk.unsqueeze(0)) ** 2
-                                        * gt_mask.unsqueeze(0)
-                                    ).flatten(1).sum(-1, keepdim=True)  # [G, 1]
+                                    # GT 거리: invalid step 의 squared diff 는 0 (mask).
+                                    # OL 과 동일하게 pos_w / heading_w 채널 분리 가중.
+                                    _diff_sq_gt = (cl_stk_nm - gt_stk.unsqueeze(0)) ** 2 * gt_mask.unsqueeze(0)  # [G, N, T, F]
+                                    _d2_gt_pos  = _diff_sq_gt[..., :2].sum(dim=(1, 2, 3))  # [G]
+                                    _d2_gt_head = _diff_sq_gt[..., 2:].sum(dim=(1, 2, 3))  # [G]
+                                    _d2_gt = (pos_w * _d2_gt_pos + heading_w * _d2_gt_head).unsqueeze(1)  # [G, 1]
+                                    del _diff_sq_gt, _d2_gt_pos, _d2_gt_head
                                     _d2_nm = torch.cat([_d2_ol, _d2_gt], dim=1)  # [G, M+1]
                                 else:
                                     _d2_nm = _d2_ol
