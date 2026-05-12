@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from src.smart.modules.flow_agent_decoder import SMARTFlowAgentDecoder
+from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.modules.kinematic_control import (
     VEHICLE_TYPE_ID,
     control_norm_to_pose_norm,
@@ -145,6 +146,59 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
         flow_clean_norm=flow_clean_norm,
         flow_agent_type=agent_type,
         flow_clean_metric_norm=raw_metric_target,
+    )
+
+    torch.testing.assert_close(out["flow_clean_metric_norm"], raw_metric_target)
+
+
+def test_agent_anchor_context_keeps_raw_metric_target() -> None:
+    decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
+    decoder._encode_context = lambda **kwargs: torch.zeros((1, 2, 1))
+
+    flow_clean_norm = torch.zeros((1, 2, 3), dtype=torch.float32)
+    raw_metric_target = torch.zeros((1, 2, 4), dtype=torch.float32)
+    raw_metric_target[0, :, 1] = torch.tensor([1.0 / 20.0, 2.0 / 20.0])
+    tokenized_agent = {
+        "ctx_sampled_idx": torch.zeros((1, 2), dtype=torch.long),
+        "ctx_sampled_pos": torch.zeros((1, 2, 2), dtype=torch.float32),
+        "ctx_sampled_heading": torch.zeros((1, 2), dtype=torch.float32),
+        "ctx_valid": torch.ones((1, 2), dtype=torch.bool),
+    }
+
+    out = decoder.build_anchor_context(
+        tokenized_agent=tokenized_agent,
+        map_feature={},
+        anchor_mask=torch.tensor([[True]]),
+        flow_clean_norm=flow_clean_norm,
+        flow_agent_type=torch.tensor([VEHICLE_TYPE_ID]),
+        flow_clean_metric_norm=raw_metric_target,
+    )
+
+    torch.testing.assert_close(out["flow_clean_metric_norm"], raw_metric_target)
+
+
+def test_smart_flow_anchor_context_passes_raw_metric_target() -> None:
+    class _DummyAgentEncoder:
+        def build_anchor_context(self, **kwargs):
+            return kwargs
+
+    decoder = SMARTFlowDecoder.__new__(SMARTFlowDecoder)
+    decoder.agent_encoder = _DummyAgentEncoder()
+
+    flow_clean_norm = torch.zeros((1, 2, 3), dtype=torch.float32)
+    raw_metric_target = torch.zeros((1, 2, 4), dtype=torch.float32)
+    raw_metric_target[0, :, 1] = torch.tensor([1.0 / 20.0, 2.0 / 20.0])
+    tokenized_agent = {
+        "flow_eval_mask": torch.tensor([[True]]),
+        "flow_eval_clean_norm": flow_clean_norm,
+        "flow_eval_clean_metric_norm": raw_metric_target,
+        "flow_eval_agent_type": torch.tensor([VEHICLE_TYPE_ID]),
+    }
+
+    out = decoder.build_anchor_context_from_map_feature(
+        map_feature={},
+        tokenized_agent=tokenized_agent,
+        anchor_mask_key="flow_eval_mask",
     )
 
     torch.testing.assert_close(out["flow_clean_metric_norm"], raw_metric_target)

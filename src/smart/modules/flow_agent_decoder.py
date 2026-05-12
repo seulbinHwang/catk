@@ -518,8 +518,21 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_clean_norm: torch.Tensor,
         flow_agent_type: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
+        flow_clean_metric_norm: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """Open-loop anchor sampling에 필요한 context hidden만 계산합니다."""
+        if flow_clean_metric_norm is not None:
+            expected_metric_shape = tuple(flow_clean_norm.shape[:2]) + (POSE_FLOW_DIM,)
+            if tuple(flow_clean_metric_norm.shape) != expected_metric_shape:
+                raise ValueError(
+                    "flow_clean_metric_norm must be raw pose-space target with shape "
+                    f"{expected_metric_shape}, got {tuple(flow_clean_metric_norm.shape)}."
+                )
+            flow_clean_metric_norm = flow_clean_metric_norm.to(
+                device=flow_clean_norm.device,
+                dtype=flow_clean_norm.dtype,
+            )
+
         ctx_hidden_pack = self._encode_context(
             agent_token_index=tokenized_agent["ctx_sampled_idx"],
             pos_a=tokenized_agent["ctx_sampled_pos"],
@@ -539,6 +552,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             output["flow_metric_agent_type"] = flow_agent_type
         if flow_loss_mask is not None:
             output["flow_loss_mask"] = flow_loss_mask
+        if flow_clean_metric_norm is not None:
+            output["flow_clean_metric_norm"] = flow_clean_metric_norm
         return output
 
     def _to_pose_metric_norm(
@@ -849,6 +864,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_clean_norm=flow_clean_norm,
             flow_agent_type=flow_agent_type,
             flow_loss_mask=flow_loss_mask,
+            flow_clean_metric_norm=flow_clean_metric_norm,
         )
         ctx_hidden_pack = anchor_context["ctx_hidden_pack"]
         anchor_hidden = anchor_context["anchor_hidden"]

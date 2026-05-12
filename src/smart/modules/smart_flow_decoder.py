@@ -134,6 +134,10 @@ class SMARTFlowDecoder(nn.Module):
             "flow_train_mask": "flow_train_clean_norm",
             "flow_eval_mask": "flow_eval_clean_norm",
         }[anchor_mask_key]
+        flow_clean_metric_norm_key = {
+            "flow_train_mask": "flow_train_clean_metric_norm",
+            "flow_eval_mask": "flow_eval_clean_metric_norm",
+        }[anchor_mask_key]
         flow_loss_mask = (
             tokenized_agent["flow_train_loss_mask"]
             if anchor_mask_key == "flow_train_mask"
@@ -150,6 +154,7 @@ class SMARTFlowDecoder(nn.Module):
             flow_clean_norm=tokenized_agent[flow_clean_norm_key],
             flow_agent_type=tokenized_agent.get(flow_agent_type_key),
             flow_loss_mask=flow_loss_mask,
+            flow_clean_metric_norm=tokenized_agent.get(flow_clean_metric_norm_key),
         )
 
     def build_anchor_context(
