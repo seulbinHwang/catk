@@ -18,8 +18,8 @@ defaults:
 model:
   model_config:
     # H100x4x2 control-space pretrain uses global batch 26*8=208 at lr=6e-4.
-    # This V100 fleet uses global batch 6*47=282. Linear scaling would be
-    # ~6.8e-4; we use a milder sqrt-style scale and round to 6e-4.
+    # This V100 fleet uses global batch 4*47=188. Keep lr=6e-4 to match the
+    # stable H100x4x2 recipe while staying close in effective batch size.
     lr: 6e-4
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
@@ -31,7 +31,9 @@ model:
     decoder:
       flow_window_steps: 20
     token_processor:
-      use_prefix_valid_future_loss_mask: false
+      # 812eccc+ semantics: prefix-valid futures are rounded down to 5-step
+      # chunks; 1~4 valid steps are dropped, 5~9 keep 0.5s, etc.
+      use_prefix_valid_future_loss_mask: true
       use_kinematic_control_flow: true
       control_pos_scale_m: 1.0
       control_vehicle_yaw_scale_rad: 0.025
@@ -70,7 +72,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 6
+  train_batch_size: 4
   val_batch_size: 4
   test_batch_size: 4
   num_workers: 2

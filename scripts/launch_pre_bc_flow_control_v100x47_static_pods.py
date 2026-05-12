@@ -90,10 +90,13 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("PODS", " ".join(DEFAULT_PODS)).split(),
     )
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", "/mnt/nuplan/projects/catk"))
-    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or current_branch())
+    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable")
     parser.add_argument("--remote-log-dir", default=os.environ.get("REMOTE_LOG_DIR", "/mnt/nuplan/projects/catk/logs"))
     parser.add_argument("--experiment", default="pre_bc_flow_control_v100x47")
-    parser.add_argument("--task-name", default="flow_control_space_pretrain_v100x47_prefix_roundtrip2_bs6")
+    parser.add_argument(
+        "--task-name",
+        default="flow_control_space_pretrain_v100x47_prefix_roundtrip2_stable_lr6e-4_bs4",
+    )
     parser.add_argument("--session", default="catk-control-pretrain-v100x47")
     parser.add_argument(
         "--nproc-per-node",
@@ -104,7 +107,7 @@ def parse_args() -> argparse.Namespace:
             "uses 4 ranks on V100x4 pods and 3 ranks on V100x3 pods."
         ),
     )
-    parser.add_argument("--initial-bs", type=int, default=6)
+    parser.add_argument("--initial-bs", type=int, default=4)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--poll-interval", type=int, default=30)
