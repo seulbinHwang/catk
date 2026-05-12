@@ -8,7 +8,7 @@
 #
 # 전제:
 #   - Code figures 는 project_3/paper_assets/figures/ 에 모아둠 (gitignored)
-#   - Overleaf repo 는 /home2/pnc2/repos_overleaf/paper_69fbf3e1/ 에 clone 되어 있음
+#   - Overleaf repo 는 /home2/pnc2/repos_overleaf/69fbf3e1697f670db6f6110c/ 에 clone 되어 있음
 #   - Overleaf 측 figure 폴더는 figures/ (없으면 자동 생성)
 #
 # 운영 규칙:
@@ -19,13 +19,13 @@
 set -euo pipefail
 
 CODE_REPO="/home2/pnc2/repos_python/project_3"
-PAPER_REPO="/home2/pnc2/repos_overleaf/paper_69fbf3e1"
+PAPER_REPO="/home2/pnc2/repos_overleaf/69fbf3e1697f670db6f6110c"
 SRC_DIR="${CODE_REPO}/paper_assets/figures"
 DST_DIR="${PAPER_REPO}/figures"
 
 if [[ ! -d "${PAPER_REPO}" ]]; then
     echo "[ERR] Overleaf repo not found at ${PAPER_REPO}" >&2
-    echo "      먼저 clone: cd /home2/pnc2/repos_overleaf && git clone https://git@git.overleaf.com/69fbf3e1697f670db6f6110c paper_69fbf3e1" >&2
+    echo "      먼저 clone: cd /home2/pnc2/repos_overleaf && git clone https://git@git.overleaf.com/69fbf3e1697f670db6f6110c 69fbf3e1697f670db6f6110c" >&2
     exit 1
 fi
 
