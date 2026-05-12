@@ -306,7 +306,11 @@ def sample_candidate_micro_batch(
     batch = _to_repeated_batch(current_sample, repeat_count, transform, device)
     tokenized_map, tokenized_agent = model.token_processor(batch)
     map_feature = model.encoder.encode_map(tokenized_map)
-    rollout_cache = model.encoder.prepare_inference_cache(tokenized_agent, map_feature)
+    rollout_cache = model.encoder.prepare_inference_cache(
+        tokenized_agent,
+        map_feature,
+        light_time_start_seconds=float(light_time_start_seconds),
+    )
     prediction = model.encoder.rollout_from_cache(
         rollout_cache=rollout_cache,
         tokenized_agent=tokenized_agent,

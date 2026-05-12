@@ -10,7 +10,10 @@ from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
-from src.smart.modules.dynamic_light_time import build_constant_light_time_delta_norm
+from src.smart.modules.dynamic_light_time import (
+    build_constant_light_time_delta_norm,
+    normalize_light_time_delta_seconds,
+)
 from src.smart.modules.flow_local_decoder import (
     ContinuousCommitBridge,
     FlowODE,
@@ -301,6 +304,36 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             device=device,
             dtype=dtype,
         )
+
+    def _build_rollout_context_light_time_delta_norm(
+        self,
+        *,
+        num_agent: int,
+        num_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        rollout_start_seconds: float = 0.0,
+    ) -> torch.Tensor:
+        """초기 rollout cache의 context slot별 신호 stale 시간을 만듭니다.
+
+        RoaD처럼 중간 block을 새 sample로 다시 만들 때, 마지막 context slot은
+        ``rollout_start_seconds`` 만큼 오래된 신호를 봐야 하고 그 이전 slot들은
+        0.5초 간격으로 더 과거 값을 봐야 합니다.
+        """
+        if num_agent < 0 or num_steps < 0:
+            raise ValueError(
+                f"num_agent and num_steps must be non-negative, got {num_agent}, {num_steps}."
+            )
+        if num_steps == 0:
+            return torch.zeros((num_agent, 0), device=device, dtype=dtype)
+
+        current_raw_step = self.num_historical_steps - 1
+        raw_steps = torch.arange(1, num_steps + 1, device=device, dtype=dtype) * float(self.shift)
+        delta_seconds = float(rollout_start_seconds) + (
+            raw_steps - float(current_raw_step)
+        ) * 0.1
+        delta_norm = normalize_light_time_delta_seconds(delta_seconds)
+        return delta_norm.view(1, num_steps).expand(num_agent, num_steps)
 
     @staticmethod
     def _build_recent_coarse_motion(
@@ -891,12 +924,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
+        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, object]:
         """여러 rollout이 공통으로 쓰는 초기 문맥을 한 번만 만듭니다.
 
         Args:
             tokenized_agent: 평가용 토큰 사전입니다.
             map_feature: 한 번 인코딩한 지도 특징 사전입니다.
+            light_time_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다.
+                RoaD처럼 중간 block을 새 입력으로 만들 때 초기 context의 신호 stale
+                시간이 0초로 reset되지 않도록 더합니다.
 
         Returns:
             Dict[str, object]:
@@ -953,6 +990,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_graphs=tokenized_agent["num_graphs"],
         )
         batch_s_pl2a = tokenized_agent["batch"].repeat(n_step)
+        context_light_time_delta_norm = self._build_rollout_context_light_time_delta_norm(
+            num_agent=n_agent,
+            num_steps=n_step,
+            device=pos_window.device,
+            dtype=pos_window.dtype,
+            rollout_start_seconds=light_time_start_seconds,
+        )
         edge_index_t, r_t = self.build_temporal_edge(
             pos_a=pos_window,
             head_a=head_window,
@@ -969,6 +1013,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
             light_type=map_feature.get("light_type"),
+            light_time_delta_norm=context_light_time_delta_norm,
         )
         edge_index_a2a, r_a2a = self.build_interaction_edge(
             pos_a=pos_window,
@@ -1030,12 +1075,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
+        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, object]:
         """평가와 제출에서 쓸 no-gradient rollout cache를 만듭니다.
 
         Args:
             tokenized_agent: 평가용 토큰 사전입니다. agent 축 shape은 ``[n_agent, ...]`` 입니다.
             map_feature: 지도 인코더 출력입니다.
+            light_time_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다.
 
         Returns:
             Dict[str, object]: closed-loop rollout의 초기 상태 cache입니다.
@@ -1043,18 +1090,21 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         return self._prepare_rollout_cache_impl(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            light_time_start_seconds=light_time_start_seconds,
         )
 
     def prepare_training_rollout_cache(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
+        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, object]:
         """self-forced 학습에서 gradient를 유지한 rollout cache를 만듭니다.
 
         Args:
             tokenized_agent: 평가 모드 기준 토큰 사전입니다. agent 축 shape은 ``[n_agent, ...]`` 입니다.
             map_feature: 현재 Generator의 지도 인코더 출력입니다.
+            light_time_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다.
 
         Returns:
             Dict[str, object]: N초 self-rollout에 쓸 초기 cache입니다.
@@ -1062,6 +1112,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         return self._prepare_rollout_cache_impl(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            light_time_start_seconds=light_time_start_seconds,
         )
 
     def _clone_rollout_cache(self, rollout_cache: Dict[str, object]) -> Dict[str, object]:

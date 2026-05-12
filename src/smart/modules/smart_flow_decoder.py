@@ -182,22 +182,26 @@ class SMARTFlowDecoder(nn.Module):
         self,
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
+        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, object]:
         return self.agent_encoder.prepare_inference_cache(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            light_time_start_seconds=light_time_start_seconds,
         )
 
     def prepare_training_rollout_cache(
         self,
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
+        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, object]:
         """self-forced 학습에서 gradient를 유지한 rollout cache를 만듭니다.
 
         Args:
             tokenized_agent: 평가 모드 기준 agent token 사전입니다.
             map_feature: 현재 decoder가 만든 map feature입니다.
+            light_time_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다.
 
         Returns:
             Dict[str, object]: N초 self-rollout에 사용할 초기 cache입니다.
@@ -205,6 +209,7 @@ class SMARTFlowDecoder(nn.Module):
         return self.agent_encoder.prepare_training_rollout_cache(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            light_time_start_seconds=light_time_start_seconds,
         )
 
     def rollout_from_cache(
