@@ -63,6 +63,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_method: str,
         flow_solver_eps: float,
         use_kinematic_control_flow: bool = False,
+        use_holonomic_model_only: bool = False,
         control_pos_scale_m: float = 1.0,
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
@@ -93,6 +94,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_future_steps=num_future_steps,
         )
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
+        self.use_holonomic_model_only = bool(use_holonomic_model_only)
         self.control_pos_scale_m = float(control_pos_scale_m)
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
@@ -160,6 +162,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             use_stop_motion=self.use_stop_motion,
             config=lqr_commit_cfg,
             use_kinematic_control_flow=self.use_kinematic_control_flow,
+            use_holonomic_model_only=self.use_holonomic_model_only,
             control_pos_scale_m=self.control_pos_scale_m,
             control_vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
             control_pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
@@ -577,6 +580,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
             pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
             cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            use_holonomic_model_only=getattr(self, "use_holonomic_model_only", False),
         )
 
     def flow_norm_to_pose_metric_norm(

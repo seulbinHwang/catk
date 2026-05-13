@@ -17,6 +17,7 @@ model:
   model_config:
     token_processor:
       use_kinematic_control_flow: true
+      use_holonomic_model_only: false
       control_pos_scale_m: 1.0
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20

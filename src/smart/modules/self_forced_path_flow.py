@@ -137,6 +137,7 @@ def build_anchor0_normalized_committed_control(
     vehicle_yaw_scale_rad: float,
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
+    use_holonomic_model_only: bool = False,
     pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
 ) -> Tensor:
     """첫 anchor 기준 pose rollout을 control-space self-forced flow state로 바꿉니다.
@@ -150,6 +151,8 @@ def build_anchor0_normalized_committed_control(
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
+        use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic control
+            projection을 씁니다.
         pose_pos_scale_m: pose-space 위치 정규화 scale입니다.
 
     Returns:
@@ -189,4 +192,5 @@ def build_anchor0_normalized_committed_control(
         vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
+        use_holonomic_model_only=use_holonomic_model_only,
     )

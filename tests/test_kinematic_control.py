@@ -74,6 +74,37 @@ def test_vehicle_rolling_control_uses_no_lateral_channel() -> None:
     assert torch.allclose(control[..., 1], torch.zeros_like(control[..., 1]))
 
 
+def test_holonomic_model_only_lets_vehicle_use_lateral_channel_and_round_trip() -> None:
+    current_pos = torch.tensor([[0.0, 0.0]])
+    current_head = torch.tensor([0.0])
+    future_pos = torch.tensor([[[1.0, 0.2], [2.0, 0.5]]])
+    future_head = torch.tensor([[0.1, 0.2]])
+    agent_type = torch.tensor([VEHICLE_TYPE_ID])
+
+    control_norm, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        use_holonomic_model_only=True,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+    control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
+    decoded_pos, decoded_head = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        current_pos=current_pos,
+        current_head=current_head,
+        use_holonomic_model_only=True,
+    )
+
+    assert torch.any(control[..., 1].abs() > 1.0e-6)
+    torch.testing.assert_close(decoded_pos, future_pos, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(decoded_head, future_head, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(round_trip_error_m, torch.zeros_like(round_trip_error_m), atol=1.0e-5, rtol=1.0e-5)
+
+
 def test_cyclist_rolling_control_uses_no_lateral_channel_and_round_trips() -> None:
     current_pos = torch.tensor([[0.0, 0.0]])
     current_head = torch.tensor([0.0])

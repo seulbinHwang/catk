@@ -11,7 +11,7 @@ DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M = 5.0
 POSE_NORM_POS_SCALE_M = 20.0
 
 # repo의 agent encoder와 dataset 전처리가 공유하는 정수 매핑입니다.
-# 이 모듈은 "pedestrian만 holonomic, 나머지는 non-holonomic" 분기를 이 약속 위에서 직접 코딩하므로,
+# 기본 control-space는 "pedestrian만 holonomic, 나머지는 non-holonomic" 분기를 이 약속 위에서 직접 코딩하므로,
 # 호출자가 다른 인덱싱을 넘기면 잘못된 디코더가 적용되어도 학습이 silent하게 진행됩니다.
 # 매핑이 흔들리면 이 상수와 _validate_agent_type() 한 곳을 같이 고치도록 의도적으로 노출합니다.
 VEHICLE_TYPE_ID = 0
@@ -243,6 +243,8 @@ def decode_control_sequence(
     agent_type: Tensor,
     current_pos: Tensor | None = None,
     current_head: Tensor | None = None,
+    *,
+    use_holonomic_model_only: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """제어 시퀀스를 pose 시퀀스로 바꿉니다.
 
@@ -255,6 +257,9 @@ def decode_control_sequence(
             값이 없으면 원점에서 시작합니다.
         current_head: 시작 방향입니다. shape은 ``[N]`` 입니다.
             값이 없으면 0 rad에서 시작합니다.
+        use_holonomic_model_only: ``True`` 이면 vehicle/cyclist도 pedestrian과 같은
+            holonomic decoder를 사용합니다. ``False`` 이면 기존처럼 vehicle/cyclist는
+            non-holonomic decoder를 사용합니다.
 
     Returns:
         tuple[Tensor, Tensor]:
@@ -282,7 +287,9 @@ def decode_control_sequence(
     else:
         roll_head = current_head.to(device=device, dtype=dtype)
 
-    ped_mask = agent_type.to(device=device) == PEDESTRIAN_TYPE_ID
+    holonomic_mask = agent_type.to(device=device) == PEDESTRIAN_TYPE_ID
+    if use_holonomic_model_only:
+        holonomic_mask = torch.ones_like(holonomic_mask)
     pos_steps: list[Tensor] = []
     head_steps: list[Tensor] = []
 
@@ -309,7 +316,7 @@ def decode_control_sequence(
             dim=-1,
         )
 
-        delta_pos = torch.where(ped_mask.unsqueeze(-1), delta_pos_ped, delta_pos_nonhol)
+        delta_pos = torch.where(holonomic_mask.unsqueeze(-1), delta_pos_ped, delta_pos_nonhol)
         roll_pos = roll_pos + delta_pos
         roll_head = wrap_angle(roll_head + delta_head)
         pos_steps.append(roll_pos)
@@ -332,6 +339,7 @@ def control_norm_to_pose_norm(
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
     pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
+    use_holonomic_model_only: bool = False,
 ) -> Tensor:
     """정규화된 제어 시퀀스를 기존 pose-space 표현으로 바꿉니다.
 
@@ -344,6 +352,7 @@ def control_norm_to_pose_norm(
         pedestrian_yaw_scale_rad: pedestrian yaw를 복원할 radian 단위 값입니다.
         cyclist_yaw_scale_rad: cyclist yaw를 복원할 radian 단위 값입니다.
         pose_pos_scale_m: 기존 pose-space Flow 표현의 위치 정규화 meter 값입니다.
+        use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic decoder를 씁니다.
 
     Returns:
         Tensor: 기존 Flow Matching 평가/추론 경로가 쓰는 pose 표현입니다.
@@ -358,7 +367,11 @@ def control_norm_to_pose_norm(
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
-    pos, head = decode_control_sequence(control=control, agent_type=agent_type)
+    pos, head = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        use_holonomic_model_only=use_holonomic_model_only,
+    )
     return torch.stack(
         [
             pos[..., 0] / float(pose_pos_scale_m),
@@ -381,6 +394,7 @@ def build_rolling_control_target(
     vehicle_yaw_scale_rad: float,
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
+    use_holonomic_model_only: bool = False,
 ) -> Tensor:
     """GT pose를 decoder-consistent rolling control label로 바꿉니다.
 
@@ -394,6 +408,8 @@ def build_rolling_control_target(
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
+        use_holonomic_model_only: ``True`` 이면 vehicle/cyclist도 pedestrian과 같은
+            holonomic inverse/decoder projection을 사용합니다.
 
     Returns:
         Tensor: 정규화된 rolling control label입니다. shape은 ``[N, T, 3]`` 입니다.
@@ -416,7 +432,9 @@ def build_rolling_control_target(
 
     roll_pos = current_pos.clone()
     roll_head = current_head.clone()
-    ped_mask = agent_type.to(device=future_pos.device) == PEDESTRIAN_TYPE_ID
+    holonomic_mask = agent_type.to(device=future_pos.device) == PEDESTRIAN_TYPE_ID
+    if use_holonomic_model_only:
+        holonomic_mask = torch.ones_like(holonomic_mask)
     control_steps: list[Tensor] = []
 
     for step_idx in range(future_pos.shape[1]):
@@ -439,13 +457,13 @@ def build_rolling_control_target(
         nonhol_proj = (delta_vec * h_mid).sum(dim=-1)
         nonhol_delta_s = nonhol_proj / safe_sinc(0.5 * delta_head)
 
-        delta_s = torch.where(ped_mask, ped_delta_s, nonhol_delta_s)
-        delta_n = torch.where(ped_mask, ped_delta_n, torch.zeros_like(ped_delta_n))
+        delta_s = torch.where(holonomic_mask, ped_delta_s, nonhol_delta_s)
+        delta_n = torch.where(holonomic_mask, ped_delta_n, torch.zeros_like(ped_delta_n))
         step_control = torch.stack([delta_s, delta_n, delta_head], dim=-1)
         control_steps.append(step_control)
 
         nonhol_next_pos = roll_pos + nonhol_proj.unsqueeze(-1) * h_mid
-        roll_pos = torch.where(ped_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
+        roll_pos = torch.where(holonomic_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
         roll_head = wrap_angle(roll_head + delta_head)
 
     if len(control_steps) == 0:
@@ -472,6 +490,7 @@ def build_rolling_control_target_with_round_trip_error(
     vehicle_yaw_scale_rad: float,
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
+    use_holonomic_model_only: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """GT pose를 control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
 
@@ -485,6 +504,7 @@ def build_rolling_control_target_with_round_trip_error(
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
+        use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic inverse/decoder를 씁니다.
 
     Returns:
         tuple[Tensor, Tensor]:
@@ -501,6 +521,7 @@ def build_rolling_control_target_with_round_trip_error(
         vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
+        use_holonomic_model_only=use_holonomic_model_only,
     )
     control = denormalize_control(
         control_norm=control_norm,
@@ -515,6 +536,7 @@ def build_rolling_control_target_with_round_trip_error(
         agent_type=agent_type,
         current_pos=current_pos,
         current_head=current_head,
+        use_holonomic_model_only=use_holonomic_model_only,
     )
     round_trip_error_m = torch.linalg.vector_norm(decoded_pos - future_pos, dim=-1)
     return control_norm, round_trip_error_m

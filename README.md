@@ -487,6 +487,7 @@ torchrun ... -m src.run \
 
 - GT control label은 기존 cache 안의 GT pose에서 batch 생성 시점에 on-the-fly로 만듭니다. 별도 target cache는 필요 없습니다.
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
+- `model.model_config.token_processor.use_holonomic_model_only=true`를 켜면 ablation용으로 vehicle / cyclist에도 pedestrian과 같은 holonomic decoder를 적용합니다. 이때 vehicle / cyclist의 `delta_n`도 학습 target과 rollout 복원에 사용됩니다. 기본값 `false`는 기존 agent-type-aware non-holonomic/holonomic 혼합 방식입니다.
 - label 생성은 decoder-consistent rolling projection 방식입니다. 매 step마다 raw GT 현재 pose가 아니라 직전 control을 kinematic decoder에 통과시킨 pose를 다음 inverse의 현재 pose로 씁니다.
 - control-space 정규화는 위치 이동량에는 공통 `control_pos_scale_m=1.0`을 쓰고, yaw에는 config로 관리되는 agent type별 scale을 씁니다. 기본 preset은 `control_vehicle_yaw_scale_rad=0.025`, `control_cyclist_yaw_scale_rad=0.06`, `control_pedestrian_yaw_scale_rad=0.20`입니다. control-space target 생성과 복원 경로에는 항상 `agent_type`이 필요합니다. metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
 - control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `5.0m`이며, 평가 경로에는 적용하지 않습니다.
@@ -510,6 +511,7 @@ model:
   model_config:
     token_processor:
       use_kinematic_control_flow: true
+      use_holonomic_model_only: false
       use_prefix_valid_future_loss_mask: false
       control_pos_scale_m: 1.0
       control_vehicle_yaw_scale_rad: 0.025

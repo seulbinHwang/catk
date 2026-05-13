@@ -31,6 +31,7 @@ class FlowTokenProcessor(TokenProcessor):
         flow_window_steps: int = 20,
         use_prefix_valid_future_loss_mask: bool = False,
         use_kinematic_control_flow: bool = False,
+        use_holonomic_model_only: bool = False,
         control_pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
@@ -49,6 +50,7 @@ class FlowTokenProcessor(TokenProcessor):
         )
         self.use_prefix_valid_future_loss_mask = bool(use_prefix_valid_future_loss_mask)
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
+        self.use_holonomic_model_only = bool(use_holonomic_model_only)
         self.control_pos_scale_m = float(control_pos_scale_m)
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
@@ -579,6 +581,7 @@ class FlowTokenProcessor(TokenProcessor):
                     vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
                     pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                     cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+                    use_holonomic_model_only=self.use_holonomic_model_only,
                 )
             return build_rolling_control_target(
                 future_pos=future_pos,
@@ -590,6 +593,7 @@ class FlowTokenProcessor(TokenProcessor):
                 vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
                 pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                 cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+                use_holonomic_model_only=self.use_holonomic_model_only,
             )
 
         if return_round_trip_error:
