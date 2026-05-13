@@ -656,7 +656,7 @@ python scripts/launch_pre_bc_flow_control_v100x47_static_pods.py --stop
 - `use_lqr=true`는 stop gate를 통과한 vehicle / bicycle 에만 적용됩니다. pedestrian 은 항상
   token / raw branch 를 유지합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 Fast WOSAC scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다. 단, `model.model_config.scorer_scene_num`이 양의 정수이면 이 값은 validation 시작 시 자동으로 덮어써집니다.
-- `model.model_config.scorer_scene_num`는 GPU 개수와 validation batch size가 달라도 Fast WOSAC scorer에 들어가는 scene 규모를 비슷하게 맞추기 위한 기준값입니다. 기본값은 `960` 입니다. 실제 적용식은 `n_batch_sim_agents_metric = max(1, ceil(ceil(scorer_scene_num / world_size) / val_batch_size))` 입니다. `null` 또는 `0` 으로 두면 자동 덮어쓰기를 끄고 명시한 `n_batch_sim_agents_metric` 값을 그대로 씁니다.
+- `model.model_config.scorer_scene_num`는 GPU 개수와 validation batch size가 달라도 Fast WOSAC scorer에 들어가는 scene 규모를 비슷하게 맞추기 위한 기준값입니다. 기본값은 `1680` 입니다. 실제 적용식은 `n_batch_sim_agents_metric = max(1, ceil(ceil(scorer_scene_num / world_size) / val_batch_size))` 입니다. `null` 또는 `0` 으로 두면 자동 덮어쓰기를 끄고 명시한 `n_batch_sim_agents_metric` 값을 그대로 씁니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다. `scorer_scene_num` 자동 덮어쓰기가 켜져 있으면 이 값이 `n_batch_sim_agents_metric` 계산식의 분모가 됩니다.
 - Fast WOSAC scorer 기준 총 채점 scene 수는 `scorer_scene_num`이 켜져 있으면 대략 `n_batch_sim_agents_metric x val_batch_size x world_size` 입니다. batch 단위로만 자르므로 요청값보다 조금 커질 수 있습니다. 끈 경우에는 대략 `min(실행한 val batch 수, n_batch_sim_agents_metric) x val_batch_size x world_size` 입니다.
@@ -1227,7 +1227,7 @@ testsv testsvv testsvvv testsvvvv sv svv svvv svvvv
 - `model.model_config.self_forced.estimator_warmup_epochs=0`
 - `model.model_config.self_forced.use_stop_motion=false`
 - `data.train_batch_size=2`, OOM 시 launcher가 OOM status를 즉시 공유해 모든 pod의 local `torchrun`과 남은 `task_name=...` 학습 rank를 정리하고 `2 -> 1` 순서로 함께 낮춤
-- `data.val_batch_size=2`, `model.model_config.scorer_scene_num=320`
+- `data.val_batch_size=2`, `model.model_config.scorer_scene_num=1680`
 
 pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
 
@@ -1299,7 +1299,7 @@ scripts/launch_self_forced_a100x4x2_static_pods.py
 - `model.model_config.self_forced.estimator_warmup_epochs=1`
 - `model.model_config.self_forced.use_stop_motion=false`
 - `data.train_batch_size=22`, OOM 시 launcher가 모든 pod의 attempt status를 모아 `22 -> 20 -> 18 -> ...` 순서로 함께 낮춤
-- `data.val_batch_size=8`, `model.model_config.scorer_scene_num=320`
+- `data.val_batch_size=8`, `model.model_config.scorer_scene_num=1680`
 
 pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
 
