@@ -2033,7 +2033,7 @@ python scripts/launch_fast_wosac_val_a100x4x2_epoch_last_ssh_5090.py --replace
 - remote checkpoint cache:
   `/media/user/E/projects/catk/checkpoints/from_pods/flow_control_space_pretrain_a100x4x2_prefix_roundtrip2_lr6e-4_bs26/epoch_last.ckpt`
 - tmux target: `hsb-rl-train:fast-wosac-a100x4x2`
-- `scorer_scene_num=1680`, `n_rollout_closed_val=32`, `data.val_batch_size=2`
+- `scorer_scene_num=1680`, `n_rollout_closed_val=32`, `data.val_batch_size=4`
 - control-space validation override:
   `use_kinematic_control_flow=true`, `use_prefix_valid_future_loss_mask=true`,
   `control_round_trip_max_position_error_m=2.0`, `flow_window_steps=20`

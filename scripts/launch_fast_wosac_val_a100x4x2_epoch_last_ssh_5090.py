@@ -460,7 +460,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--cuda-visible-devices", default="0")
     parser.add_argument("--nproc-per-node", type=int, default=1)
-    parser.add_argument("--val-batch-size", type=int, default=2)
+    parser.add_argument("--val-batch-size", type=int, default=4)
     parser.add_argument("--limit-val-batches", default="auto")
     parser.add_argument("--scorer-scene-num", type=int, default=1680)
     parser.add_argument("--n-rollout-closed-val", type=int, default=32)
