@@ -8,7 +8,7 @@ V100x47 stable experiment's control-space semantics:
 
 * use_prefix_valid_future_loss_mask=true
 * use_kinematic_control_flow=true
-* use_holonomic_model_only=false
+* use_holonomic_model_only=true
 * use_rolling_supervision=true
 * control_round_trip_max_position_error_m=2.0
 
@@ -32,7 +32,7 @@ DEFAULT_PODS = ("hsb-npc-training", "hsb-npc-training2")
 DEFAULT_EXTRA_HYDRA_OVERRIDES = (
     "model.model_config.token_processor.use_prefix_valid_future_loss_mask=true",
     "model.model_config.token_processor.use_kinematic_control_flow=true",
-    "model.model_config.token_processor.use_holonomic_model_only=false",
+    "model.model_config.token_processor.use_holonomic_model_only=true",
     "model.model_config.token_processor.use_rolling_supervision=true",
     "model.model_config.token_processor.control_round_trip_max_position_error_m=2.0",
     "model.model_config.decoder.flow_window_steps=20",
@@ -63,9 +63,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default="pre_bc_flow_control_2x4_h100")
     parser.add_argument(
         "--task-name",
-        default="flow_control_space_pretrain_h100x4x2_prefix_roundtrip2_stable_lr6e-4_bs26",
+        default="flow_control_space_pretrain_h100x4x2_holonomic_prefix_roundtrip2_stable_lr6e-4_bs26",
     )
-    parser.add_argument("--session", default="catk-control-pretrain-h100x4x2-prefix-stable")
+    parser.add_argument("--session", default="catk-control-pretrain-h100x4x2-holonomic-prefix")
     parser.add_argument("--initial-bs", type=int, default=26)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=20)
