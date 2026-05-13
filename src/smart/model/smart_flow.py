@@ -1962,6 +1962,7 @@ class SMARTFlow(LightningModule):
                 pedestrian_yaw_scale_rad=self.encoder.agent_encoder.control_pedestrian_yaw_scale_rad,
                 cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
                 use_holonomic_model_only=self.encoder.agent_encoder.use_holonomic_model_only,
+                use_rolling_supervision=self.encoder.agent_encoder.use_rolling_supervision,
             )
         return packed_path_norm, anchor_mask
 

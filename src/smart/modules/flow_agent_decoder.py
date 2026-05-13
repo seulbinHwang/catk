@@ -64,6 +64,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_eps: float,
         use_kinematic_control_flow: bool = False,
         use_holonomic_model_only: bool = False,
+        use_rolling_supervision: bool = True,
         control_pos_scale_m: float = 1.0,
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
@@ -95,6 +96,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.use_holonomic_model_only = bool(use_holonomic_model_only)
+        self.use_rolling_supervision = bool(use_rolling_supervision)
         self.control_pos_scale_m = float(control_pos_scale_m)
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad

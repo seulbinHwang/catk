@@ -105,6 +105,73 @@ def test_holonomic_model_only_lets_vehicle_use_lateral_channel_and_round_trip() 
     torch.testing.assert_close(round_trip_error_m, torch.zeros_like(round_trip_error_m), atol=1.0e-5, rtol=1.0e-5)
 
 
+def test_raw_pose_pair_supervision_differs_from_rolling_for_nonholonomic_vehicle() -> None:
+    current_pos = torch.tensor([[0.0, 0.0]])
+    current_head = torch.tensor([0.0])
+    future_pos = torch.tensor([[[1.0, 1.0], [2.0, 1.5]]])
+    future_head = torch.tensor([[0.4, 0.4]])
+    agent_type = torch.tensor([VEHICLE_TYPE_ID])
+
+    rolling_norm = build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        use_holonomic_model_only=False,
+        use_rolling_supervision=True,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+    raw_pair_norm = build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        use_holonomic_model_only=False,
+        use_rolling_supervision=False,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+
+    rolling = denormalize_control(rolling_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
+    raw_pair = denormalize_control(raw_pair_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
+
+    torch.testing.assert_close(raw_pair[:, 0], rolling[:, 0], atol=1.0e-5, rtol=1.0e-5)
+    assert not torch.allclose(raw_pair[:, 1], rolling[:, 1], atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(raw_pair[..., 1], torch.zeros_like(raw_pair[..., 1]))
+
+
+def test_holonomic_model_only_makes_rolling_supervision_flag_noop() -> None:
+    current_pos = torch.tensor([[0.0, 0.0]])
+    current_head = torch.tensor([0.0])
+    future_pos = torch.tensor([[[1.0, 1.0], [2.0, 1.5]]])
+    future_head = torch.tensor([[0.4, 0.4]])
+    agent_type = torch.tensor([VEHICLE_TYPE_ID])
+
+    rolling_norm = build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        use_holonomic_model_only=True,
+        use_rolling_supervision=True,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+    raw_pair_norm = build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        use_holonomic_model_only=True,
+        use_rolling_supervision=False,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+
+    torch.testing.assert_close(raw_pair_norm, rolling_norm, atol=1.0e-5, rtol=1.0e-5)
+
+
 def test_cyclist_rolling_control_uses_no_lateral_channel_and_round_trips() -> None:
     current_pos = torch.tensor([[0.0, 0.0]])
     current_head = torch.tensor([0.0])

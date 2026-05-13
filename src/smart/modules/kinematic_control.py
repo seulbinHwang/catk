@@ -395,8 +395,9 @@ def build_rolling_control_target(
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
     use_holonomic_model_only: bool = False,
+    use_rolling_supervision: bool = True,
 ) -> Tensor:
-    """GT pose를 decoder-consistent rolling control label로 바꿉니다.
+    """GT pose를 control label로 바꿉니다.
 
     Args:
         future_pos: GT 미래 위치입니다. shape은 ``[N, T, 2]`` 입니다.
@@ -410,6 +411,10 @@ def build_rolling_control_target(
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
         use_holonomic_model_only: ``True`` 이면 vehicle/cyclist도 pedestrian과 같은
             holonomic inverse/decoder projection을 사용합니다.
+        use_rolling_supervision: ``True`` 이면 decoder-consistent rolling supervision을
+            사용합니다. ``False`` 이면 각 step의 raw GT pose pair만으로 inverse control을
+            만듭니다. ``use_holonomic_model_only=True`` 에서는 두 방식이 같은 target을
+            만듭니다.
 
     Returns:
         Tensor: 정규화된 rolling control label입니다. shape은 ``[N, T, 3]`` 입니다.
@@ -440,19 +445,28 @@ def build_rolling_control_target(
     for step_idx in range(future_pos.shape[1]):
         target_pos = future_pos[:, step_idx]
         target_head = future_head[:, step_idx]
-        delta_head = wrap_angle(target_head - roll_head)
-        delta_vec = target_pos - roll_pos
+        if use_rolling_supervision:
+            source_pos = roll_pos
+            source_head = roll_head
+        elif step_idx == 0:
+            source_pos = current_pos
+            source_head = current_head
+        else:
+            source_pos = future_pos[:, step_idx - 1]
+            source_head = future_head[:, step_idx - 1]
+        delta_head = wrap_angle(target_head - source_head)
+        delta_vec = target_pos - source_pos
 
         # pedestrian: holonomic — control은 현재 heading body frame의 GT 변위를 그대로 담는다.
-        cos_head = roll_head.cos()
-        sin_head = roll_head.sin()
+        cos_head = source_head.cos()
+        sin_head = source_head.sin()
         ped_delta_s = delta_vec[:, 0] * cos_head + delta_vec[:, 1] * sin_head
         ped_delta_n = -delta_vec[:, 0] * sin_head + delta_vec[:, 1] * cos_head
 
         # vehicle/cyclist: non-holonomic — h_mid 방향 투영분만 살리고 lateral 성분은 버린다.
         # 이 inverse 결정이 곧 다음 가상 pose를 정의하므로(decoder를 따로 호출하지 않는다),
         # nonhol_proj 는 같은 한 번의 계산이 control과 다음 roll_pos 양쪽에 쓰인다.
-        mid_head = roll_head + 0.5 * delta_head
+        mid_head = source_head + 0.5 * delta_head
         h_mid = torch.stack([mid_head.cos(), mid_head.sin()], dim=-1)
         nonhol_proj = (delta_vec * h_mid).sum(dim=-1)
         nonhol_delta_s = nonhol_proj / safe_sinc(0.5 * delta_head)
@@ -462,9 +476,10 @@ def build_rolling_control_target(
         step_control = torch.stack([delta_s, delta_n, delta_head], dim=-1)
         control_steps.append(step_control)
 
-        nonhol_next_pos = roll_pos + nonhol_proj.unsqueeze(-1) * h_mid
-        roll_pos = torch.where(holonomic_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
-        roll_head = wrap_angle(roll_head + delta_head)
+        if use_rolling_supervision:
+            nonhol_next_pos = roll_pos + nonhol_proj.unsqueeze(-1) * h_mid
+            roll_pos = torch.where(holonomic_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
+            roll_head = wrap_angle(roll_head + delta_head)
 
     if len(control_steps) == 0:
         return future_pos.new_zeros((future_pos.shape[0], 0, CONTROL_FLOW_DIM))
@@ -491,6 +506,7 @@ def build_rolling_control_target_with_round_trip_error(
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
     use_holonomic_model_only: bool = False,
+    use_rolling_supervision: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """GT pose를 control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
 
@@ -505,6 +521,8 @@ def build_rolling_control_target_with_round_trip_error(
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
         use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic inverse/decoder를 씁니다.
+        use_rolling_supervision: ``True`` 이면 decoder-consistent rolling supervision을
+            사용하고, ``False`` 이면 raw GT pose pair inverse를 사용합니다.
 
     Returns:
         tuple[Tensor, Tensor]:
@@ -522,6 +540,7 @@ def build_rolling_control_target_with_round_trip_error(
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
         use_holonomic_model_only=use_holonomic_model_only,
+        use_rolling_supervision=use_rolling_supervision,
     )
     control = denormalize_control(
         control_norm=control_norm,
