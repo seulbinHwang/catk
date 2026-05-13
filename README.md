@@ -1402,6 +1402,61 @@ python scripts/launch_self_forced_h100x4_wo_pvc_800.py \
   --decoder-use-stop-motion false
 ```
 
+#### 1-node x 4 H100 wo-pvc-800 control-space self-forced 48v4vo86 sweep
+
+`flow_control_space_pretrain_v100x47_prefix_roundtrip2_bs8`의 W&B artifact
+`jksg01019-naver-labs/SMART-FLOW/epoch-last-48v4vo86:v61`에서 시작해,
+control-space self-forcing fine-tuning을 6개 조합으로 순차 실행하려면 아래 launcher를 사용합니다.
+
+```text
+scripts/launch_self_forced_control_48v4vo86_h100x4_wo_pvc_800_sweep.py
+```
+
+기본 sweep:
+
+- 대상 pod: `wo-pvc-800`
+- branch: `semi_control`
+- checkpoint: `/workspace/flow_control_space_pretrain_v100x47_prefix_roundtrip2_bs8/v61/epoch_last.ckpt`
+- `estimator_warmup_epochs`: `0`, `1`
+- `lr`: `1e-6`, `5e-6`, `1e-5`
+- 각 조합 `trainer.max_epochs=4`
+- `trainer.check_val_every_n_epoch=2`
+- `use_kinematic_control_flow=true`
+- `use_prefix_valid_future_loss_mask=true`
+- `control_round_trip_max_position_error_m=2.0`
+- `use_anchor_flow_matching_loss=false`
+- `sampling.random_terminal_step.policy=all`
+- `sampling.backprop_last_k=8`
+- `INITIAL_BS=26`, `OOM_STEP=2`, `MIN_BS=20`
+
+각 조합은 task name이 분리되어 서로 다른 fine-tuning checkpoint를 이어받지 않습니다.
+같은 조합 안에서만 CUDA OOM이 나면 `26 -> 24 -> 22 -> 20` 순서로 batch size를 낮추고,
+해당 조합의 최신 `epoch_last.ckpt`에서 resume합니다.
+
+실행 전 렌더링만 확인:
+
+```bash
+python scripts/launch_self_forced_control_48v4vo86_h100x4_wo_pvc_800_sweep.py --dry-run
+```
+
+실행:
+
+```bash
+python scripts/launch_self_forced_control_48v4vo86_h100x4_wo_pvc_800_sweep.py --replace
+```
+
+attach:
+
+```bash
+kubectl exec -it -n p-pnc wo-pvc-800 -c main -- tmux attach -t catk-sf-control48v4vo86-h100x4-wo800-sweep
+```
+
+중지:
+
+```bash
+python scripts/launch_self_forced_control_48v4vo86_h100x4_wo_pvc_800_sweep.py --stop
+```
+
 #### 1-node x 4 H100 hsb-npc-training self-forced 실행
 
 H100 4장짜리 `hsb-npc-training` pod 하나에서 self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다. `wo-pvc-800` launcher와 같은 단일 pod OOM fallback 구조를 쓰지만, 기본 pod/cache/task/session을 `hsb-npc-training` 전용으로 분리했습니다.
