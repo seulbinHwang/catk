@@ -2,7 +2,7 @@
 
 이 저장소는 **flow matching 학습/추론/평가 전용**으로 정리된 버전입니다.
 기본 실행 경로와 문서, 스크립트는 모두 `smart_flow` 계열만 사용하며 CrossEntropy 기반 next-token 경로는 제거했습니다.
-현재 closed-loop local 평가와 제출 export는 **WOSAC 2025 / Waymo 2025 Sim Agents 기준**만 사용합니다.
+현재 closed-loop local 평가는 **TrajTok Fast WOSAC 2025 metric**을 사용하고, 제출 export는 **Waymo 2025 Sim Agents** 형식을 사용합니다.
 
 - 기존 SMART의 map/context trunk를 그대로 재사용하고, agent 쪽만 flow decoder로 바꿔 scene-context 품질을 유지합니다.
 - `FlowTokenProcessor`는 14-slot context pack과 13개 anchor를 만들되,
@@ -34,10 +34,23 @@
   `(0, 0)` 또는 near-zero vector backward에서 gradient NaN이 나지 않도록 막습니다.
 - 학습 중에는 non-finite parameter, `fm_loss`, `total_loss`, gradient를 fail-fast로 감지해
   NaN checkpoint가 조용히 저장되지 않도록 즉시 중단합니다.
-- closed-loop local 평가는 `SimAgentsMetrics`가 Waymo 공식 2025 scorer를 그대로 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
+- closed-loop local 평가는 `SimAgentsMetrics`가 vendored TrajTok Fast WOSAC 2025 evaluator를 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
-- 설치 시점에 official 2025 scorer와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
+- 설치 시점에 2025 Sim Agents proto와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
+### Fast WOSAC Metric
+
+- TrajTok의 `wosac_fast_eval_tool.fast_sim_agents_metrics` 구현을 `src/smart/metrics/wosac_fast_eval_tool/` 아래에 vendoring했습니다.
+- production closed-loop metric 경로는 더 이상 Waymo 공식 TensorFlow scorer를 호출하지 않고, torch tensor rollout을 Fast WOSAC 입력 형태 `[n_rollout, n_agents, n_step, (x,y,z,yaw)]`로 직접 변환해 평가합니다.
+- 공식 scorer와의 수치 차이는 아래 스크립트로 검증합니다. local split validation TFRecord 3개, 32 rollout 기준 최대 절대오차는 `3.5762786865234375e-07`로 `1e-6` 기준을 통과했습니다.
+
+```bash
+conda run -n catk python tools/compare_fast_wosac_metric.py \
+  --num-scenarios 3 \
+  --threshold 1e-6 \
+  --device cpu \
+  --json-output artifacts/fast_wosac_compare_3scenarios.json
+```
 
 ### Dynamic Traffic-Light Staleness Feature
 
@@ -639,11 +652,11 @@ python scripts/launch_pre_bc_flow_control_v100x47_static_pods.py --stop
 - `use_stop_motion=true`면 stop token 과 일치하는 agent 의 다음 0.5초 5점을 현재 상태로 완전 고정합니다.
 - `use_lqr=true`는 stop gate를 통과한 vehicle / bicycle 에만 적용됩니다. pedestrian 은 항상
   token / raw branch 를 유지합니다.
-- `model.model_config.n_batch_sim_agents_metric`는 validation 중 공식 2025 scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다. 단, `model.model_config.scorer_scene_num`이 양의 정수이면 이 값은 validation 시작 시 자동으로 덮어써집니다.
-- `model.model_config.scorer_scene_num`는 GPU 개수와 validation batch size가 달라도 공식 scorer에 들어가는 scene 규모를 비슷하게 맞추기 위한 기준값입니다. 기본값은 `960` 입니다. 실제 적용식은 `n_batch_sim_agents_metric = max(1, ceil(ceil(scorer_scene_num / world_size) / val_batch_size))` 입니다. `null` 또는 `0` 으로 두면 자동 덮어쓰기를 끄고 명시한 `n_batch_sim_agents_metric` 값을 그대로 씁니다.
+- `model.model_config.n_batch_sim_agents_metric`는 validation 중 Fast WOSAC scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다. 단, `model.model_config.scorer_scene_num`이 양의 정수이면 이 값은 validation 시작 시 자동으로 덮어써집니다.
+- `model.model_config.scorer_scene_num`는 GPU 개수와 validation batch size가 달라도 Fast WOSAC scorer에 들어가는 scene 규모를 비슷하게 맞추기 위한 기준값입니다. 기본값은 `960` 입니다. 실제 적용식은 `n_batch_sim_agents_metric = max(1, ceil(ceil(scorer_scene_num / world_size) / val_batch_size))` 입니다. `null` 또는 `0` 으로 두면 자동 덮어쓰기를 끄고 명시한 `n_batch_sim_agents_metric` 값을 그대로 씁니다.
 - `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다. `scorer_scene_num` 자동 덮어쓰기가 켜져 있으면 이 값이 `n_batch_sim_agents_metric` 계산식의 분모가 됩니다.
-- 공식 2025 scorer 기준 총 채점 scene 수는 `scorer_scene_num`이 켜져 있으면 대략 `n_batch_sim_agents_metric x val_batch_size x world_size` 입니다. batch 단위로만 자르므로 요청값보다 조금 커질 수 있습니다. 끈 경우에는 대략 `min(실행한 val batch 수, n_batch_sim_agents_metric) x val_batch_size x world_size` 입니다.
+- Fast WOSAC scorer 기준 총 채점 scene 수는 `scorer_scene_num`이 켜져 있으면 대략 `n_batch_sim_agents_metric x val_batch_size x world_size` 입니다. batch 단위로만 자르므로 요청값보다 조금 커질 수 있습니다. 끈 경우에는 대략 `min(실행한 val batch 수, n_batch_sim_agents_metric) x val_batch_size x world_size` 입니다.
 - closed-loop rollout 총 수는 대략 `(실행한 val batch 수) x val_batch_size x n_rollout_closed_val` 입니다.
 
 예시:
@@ -682,12 +695,12 @@ python scripts/launch_pre_bc_flow_control_v100x47_static_pods.py --stop
 ... model.model_config.decoder.use_lqr=true \
     model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
 
-# training validation에서 공식 2025 scorer를 앞 20 batch에만 적용
+# training validation에서 Fast WOSAC scorer를 앞 20 batch에만 적용
 # scorer_scene_num 자동 덮어쓰기를 끈 경우에만 의미가 있습니다.
 ... model.model_config.scorer_scene_num=null \
     model.model_config.n_batch_sim_agents_metric=20
 
-# 공식 2025 scorer 채점 규모를 GPU 수와 무관하게 대략 1920 scene으로 맞추기
+# Fast WOSAC scorer 채점 규모를 GPU 수와 무관하게 대략 1920 scene으로 맞추기
 ... model.model_config.scorer_scene_num=1920
 
 # scorer_scene_num 자동 덮어쓰기 끄기
@@ -981,7 +994,7 @@ torchrun \
 - 기본 effective global batch: `26 * 8 GPUs = 208`
 - 기본 lr: `6e-4`
 - 기본 horizon: `flow_window_steps=20`
-- validation 중 공식 scorer가 오래 걸려도 DDP가 조기 timeout 나지 않도록 `trainer=ddp`의 process group timeout은 4시간입니다.
+- validation 중 WOSAC scoring이 오래 걸려도 DDP가 조기 timeout 나지 않도록 `trainer=ddp`의 process group timeout은 4시간입니다.
 - `pre_bc_flow_2x4_h100` preset은 `TQDMProgressBar(refresh_rate=1)`와 `trainer.enable_progress_bar=true`를 명시합니다. launcher 기본 pod 순서에서는 `hsb-npc-training`이 node rank 0/global rank 0이므로, `check_val_every_n_epoch=32`로 fit-time validation이 시작될 때 validation tqdm 진행률은 `hsb-npc-training`의 `catk-h100x4-pretrain` tmux 주 pane에 표시됩니다. `hsb-npc-training2`는 non-zero rank라 같은 progress bar를 중복 출력하지 않는 것이 정상입니다.
 - launcher는 각 pod 안에 쓰는 env 파일에 pod별 `CACHE_ROOT`를 따로 기록합니다. 두 pod가 같은 mount path를 공유하는 경우에만 `--cache-root <PATH>`로 전체 override를 쓰고, pod별 경로를 바꿔야 하면 `--pod-cache-root POD=PATH`를 반복해서 넘깁니다.
 - 이 기본값은 H100x4x2 global batch `208` 기준으로 `6e-4`를 사용합니다. 이전 보수적 설정과 같은 per-GPU batch를 유지해야 하는 ablation이면 `--train-batch-size 20`을 쓰고, 기존 6xH100과 global batch까지 맞춰야 하는 ablation이면 `--train-batch-size 15 --learning-rate 4e-4`를 쓰세요.
@@ -1600,7 +1613,7 @@ python -m src.run \
 
 - `local_val_flow` 기본값은 `trainer.limit_val_batches=60` 이라 빠른 local check용입니다.
 - 전체 validation set을 돌리고 싶으면 `trainer.limit_val_batches=1.0` 을 추가하면 됩니다.
-- 현재 `local_val_flow`는 `model.model_config.n_batch_sim_agents_metric=100` 이라 실행한 validation batch 전체에 대해 공식 scorer를 돌립니다.
+- 현재 `local_val_flow`는 `model.model_config.n_batch_sim_agents_metric=100` 이라 실행한 validation batch 전체에 대해 Fast WOSAC scorer를 돌립니다.
 
 ### 6.2 Validation set에서 open-loop만 보고 싶을 때
 

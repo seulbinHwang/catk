@@ -13,7 +13,9 @@ model_config:
   # val_batch_size so scorer work is comparable across GPU counts. Set null or
   # 0 to keep the explicit n_batch_sim_agents_metric value.
   scorer_scene_num: 840
-  sim_agents_metric_workers: 3
+  # Backward-compatible knob. Fast WOSAC runs on the current torch device and
+  # no longer launches the old official-scorer worker pool.
+  sim_agents_metric_workers: 0
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0

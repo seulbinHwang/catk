@@ -320,7 +320,7 @@ class SMARTFlow(LightningModule):
                 1) closed-loop validation을 사용함
                 2) open-loop validation을 같이 쓰지 않음
                 3) submission 저장 모드가 아님
-                4) official 점수에 사용할 batch 개수가 1 이상임
+                4) Fast WOSAC 점수에 사용할 batch 개수가 1 이상임
         """
         return (
             self.val_closed_loop
@@ -346,7 +346,7 @@ class SMARTFlow(LightningModule):
         """GPU 수와 validation batch size에 맞춰 scorer batch 수를 자동 조정합니다.
 
         ``scorer_scene_num`` 이 양의 정수이면 전역 기준으로 그 정도의 scene을
-        official scorer에 넣을 수 있도록 ``n_batch_sim_agents_metric`` 을 per-rank
+        Fast WOSAC scorer에 넣을 수 있도록 ``n_batch_sim_agents_metric`` 을 per-rank
         batch 수로 덮어씁니다. 별도의 scenario-level cap은 두지 않습니다.
         """
         scorer_scene_num = self.scorer_scene_num
@@ -381,7 +381,7 @@ class SMARTFlow(LightningModule):
         self._scorer_scene_num_last_key = current_key
         if getattr(trainer, "is_global_zero", True):
             print(
-                "[scorer_scene_num] 공식 sim_agents_2025 scorer batch 수를 "
+                "[scorer_scene_num] Fast WOSAC sim_agents_2025 scorer batch 수를 "
                 f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric} 으로 설정합니다 "
                 f"(requested_scenes={scorer_scene_num}, world_size={world_size}, "
                 f"val_batch_size={val_batch_size}).",
@@ -431,7 +431,7 @@ class SMARTFlow(LightningModule):
     def _should_compute_closed_loop_minade(self) -> bool:
         """현재 validation에서 closed-loop minADE를 계산할지 판단합니다.
 
-        학습 중 빠른 validation에서는 checkpoint 선택에 쓰는 official 점수만
+        학습 중 빠른 validation에서는 checkpoint 선택에 쓰는 Fast WOSAC 점수만
         남기고 minADE 계산은 끕니다.
 
         Returns:
