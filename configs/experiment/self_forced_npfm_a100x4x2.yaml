@@ -31,7 +31,7 @@ trainer:
 model:
   model_config:
     lr: 1.0e-6
-    scorer_scene_num: 320
+    scorer_scene_num: 1680
     self_forced:
       use_stop_motion: false
       estimator_warmup_epochs: 1

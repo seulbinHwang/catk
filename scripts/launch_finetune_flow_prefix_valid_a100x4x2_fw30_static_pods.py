@@ -69,7 +69,7 @@ def main() -> int:
         "--learning-rate",
         "1.0e-4",
         "--scorer-scene-num",
-        "840",
+        "1680",
         "--extra-hydra-overrides",
         extra_overrides,
         *passthrough_args,
