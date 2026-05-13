@@ -2050,6 +2050,38 @@ ssh -t user@10.60.188.78 'tmux attach -t hsb-rl-train'
 python scripts/launch_fast_wosac_val_a100x4x2_epoch_last_ssh_5090.py --replace --skip-ckpt-copy
 ```
 
+### 7.7 H100x4x2 full-valid epoch-31 checkpoint Fast WOSAC 1680-scene validation on RTX 5090
+
+`hsb-npc-training + hsb-npc-training2`에서 실행 중인
+`flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26`의
+0-index `epoch_031.ckpt`를 `hsb-npc-training`에서 가져와,
+`user@10.60.188.78`의 RTX 5090 한 장으로 Fast WOSAC closed-loop validation을
+1680개 scenario 규모로 돌리려면 아래 launcher를 사용합니다.
+
+```bash
+python scripts/launch_fast_wosac_val_h100x4x2_epoch031_ssh_5090.py --replace
+```
+
+기본 동작:
+
+- source checkpoint:
+  `hsb-npc-training:/mnt/nuplan/projects/catk/logs/flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26/runs/2026-05-11_14-43-27/checkpoints/epoch_031.ckpt`
+- remote repo: `/media/user/E/projects/catk`
+- remote cache: `/media/user/E/dataset/womd_v1_3/SMART_cache`
+- remote checkpoint cache:
+  `/media/user/E/projects/catk/checkpoints/from_pods/flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26/epoch_031.ckpt`
+- tmux target: `hsb-rl-train:fast-wosac-h100x4x2`
+- `scorer_scene_num=1680`, `n_rollout_closed_val=32`, `data.val_batch_size=4`
+- control-space validation override:
+  `use_kinematic_control_flow=true`, `use_prefix_valid_future_loss_mask=false`,
+  `control_round_trip_max_position_error_m=2.0`, `flow_window_steps=20`
+
+이미 원격 checkpoint가 최신이고 복사를 건너뛰고 싶으면:
+
+```bash
+python scripts/launch_fast_wosac_val_h100x4x2_epoch031_ssh_5090.py --replace --skip-ckpt-copy
+```
+
 ## 8. Visualization
 
 학습 중 `val_closed_loop` 비디오 저장 방법은 위 `5.5 val_closed_loop 비디오 저장하기`를 참고하면 됩니다.
