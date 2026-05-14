@@ -2082,7 +2082,40 @@ python scripts/launch_fast_wosac_val_h100x4x2_epoch031_ssh_5090.py --replace
 python scripts/launch_fast_wosac_val_h100x4x2_epoch031_ssh_5090.py --replace --skip-ckpt-copy
 ```
 
-### 7.8 V100x47 48v4vo86 v29 Fast WOSAC 1680-scene validation on RTX 5090
+### 7.8 H100x4x2 full-valid epoch-last Fast WOSAC 1680-scene validation on RTX 5090
+
+`hsb-npc-training + hsb-npc-training2`에서 완료된
+`flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26`의
+최신 `epoch_last.ckpt`를 `hsb-npc-training`에서 가져와,
+`user@10.60.188.78`의 RTX 5090 한 장으로 Fast WOSAC closed-loop validation을
+1680개 scenario 규모로 돌리려면 아래 launcher를 사용합니다. 기본적으로 checkpoint
+내 epoch이 0-index `63`인지 확인한 뒤 실행합니다.
+
+```bash
+python scripts/launch_fast_wosac_val_h100x4x2_epoch_last_ssh_5090.py --replace
+```
+
+기본 동작:
+
+- source checkpoint:
+  `hsb-npc-training:/mnt/nuplan/projects/catk/logs/flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26/runs/<latest>/checkpoints/epoch_last.ckpt`
+- remote repo: `/media/user/E/projects/catk`
+- remote cache: `/media/user/E/dataset/womd_v1_3/SMART_cache`
+- remote checkpoint cache:
+  `/media/user/E/projects/catk/checkpoints/from_pods/flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26/epoch_last.ckpt`
+- tmux target: `hsb-rl-train:fast-wosac-h100x4x2-last`
+- `scorer_scene_num=1680`, `n_rollout_closed_val=32`, `data.val_batch_size=4`
+- control-space validation override:
+  `use_kinematic_control_flow=true`, `use_prefix_valid_future_loss_mask=false`,
+  `control_round_trip_max_position_error_m=2.0`, `flow_window_steps=20`
+
+이미 원격 checkpoint가 최신이고 복사를 건너뛰고 싶으면:
+
+```bash
+python scripts/launch_fast_wosac_val_h100x4x2_epoch_last_ssh_5090.py --replace --skip-ckpt-copy
+```
+
+### 7.9 V100x47 48v4vo86 v29 Fast WOSAC 1680-scene validation on RTX 5090
 
 `flow_control_space_pretrain_v100x47_prefix_roundtrip2_bs8`의 W&B artifact
 `jksg01019-naver-labs/SMART-FLOW/epoch-last-48v4vo86:v29`를
@@ -2116,7 +2149,7 @@ python scripts/launch_fast_wosac_val_48v4vo86_v29_ssh_5090.py --replace
   `use_kinematic_control_flow=true`, `use_prefix_valid_future_loss_mask=true`,
   `control_round_trip_max_position_error_m=2.0`, `flow_window_steps=20`
 
-### 7.9 g3zr84tp pose-space v31 Fast WOSAC 1680-scene validation on RTX 5090
+### 7.10 g3zr84tp pose-space v31 Fast WOSAC 1680-scene validation on RTX 5090
 
 `flow_semi_continuous_pretrain_h100x4x2_bs26`의 W&B artifact
 `jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v31`를
