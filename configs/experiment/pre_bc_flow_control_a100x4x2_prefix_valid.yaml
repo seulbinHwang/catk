@@ -10,7 +10,7 @@
 # This mirrors the H100x4x2 control-space recipe:
 #   * data.train_batch_size=26 -> effective global batch 208
 #   * lr=6e-4
-#   * control_round_trip_max_position_error_m=2.0
+#   * control_round_trip_max_position_error_m=0.5
 #
 # The only intentional target-selection change is prefix-valid supervision.
 # On this branch, prefix-valid masks are aligned to complete 5-step chunks:

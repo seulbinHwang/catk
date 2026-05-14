@@ -503,7 +503,7 @@ python tools/estimate_control_no_slip_rho.py \
 
   이 도구는 vehicle / cyclist를 분리해서 0.5초 sliding segment를 만들고, agent별 bounded weighted median을 먼저 구한 뒤 type별 capped weighted median으로 `rho_vehicle`, `rho_cyclist` 후보를 출력합니다. segment filter는 `|p[t+5]-p[t]| >= 0.25m`, `|2L sin(delta_yaw/2)| >= 0.10m` 두 개만 씁니다. 전체 SMART cache에서 `training 486,995`개 파일로 fitting하고 `validation 44,097`개 파일로 residual을 확인한 기본 후보는 `rho_vehicle=0.2289518863`, `rho_cyclist=0.0495847873`입니다. 출력의 `residual` 항목은 `before = b`, `after = b - rho * c`의 validation median absolute residual과 개선율입니다. validation 개선율이 양수인지 먼저 확인한 뒤 실험 config에 반영하세요.
 - control-space 정규화는 위치 이동량에는 공통 `control_pos_scale_m=1.0`을 쓰고, yaw에는 config로 관리되는 agent type별 scale을 씁니다. 기본 preset은 `control_vehicle_yaw_scale_rad=0.025`, `control_cyclist_yaw_scale_rad=0.06`, `control_pedestrian_yaw_scale_rad=0.20`입니다. control-space target 생성과 복원 경로에는 항상 `agent_type`이 필요합니다. metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
-- control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `5.0m`이며, 평가 경로에는 적용하지 않습니다.
+- control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `0.5m`이며, 평가 경로에는 적용하지 않습니다. 기본 no-slip point ratio 기준 전체 training cache 분석에서 `0.5m`는 약 `0.21%`의 anchor만 제거하면서 vehicle round-trip tail을 크게 줄인 값입니다.
 - `control_round_trip_max_position_error_m` 값을 데이터 분포에서 고르려면 training cache에 대해 아래 분석 도구를 먼저 돌립니다. 이 값은 anchor별로 “loss에 실제 들어가는 미래 step들의 GT -> control -> pose 복원 위치 오차 중 최대값”을 기준으로 집계하므로, 학습 필터가 보는 값과 같은 의미입니다.
 
 ```bash
@@ -547,10 +547,10 @@ model:
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20
       control_cyclist_yaw_scale_rad: 0.06
-      control_round_trip_max_position_error_m: 2.0
+      control_round_trip_max_position_error_m: 0.5
 ```
 
-기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip2_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`이라 effective global batch는 `208`이며, 기본 lr은 `6e-4`입니다. `use_prefix_valid_future_loss_mask=false`라 전체 2초 미래가 유효한 anchor만 학습하고, `control_round_trip_max_position_error_m=2.0`으로 round-trip 이상치 anchor를 거릅니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
+기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip05_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`이라 effective global batch는 `208`이며, 기본 lr은 `6e-4`입니다. `use_prefix_valid_future_loss_mask=false`라 전체 2초 미래가 유효한 anchor만 학습하고, `control_round_trip_max_position_error_m=0.5`로 round-trip 이상치 anchor를 거릅니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
 
 tmux 확인:
 
@@ -573,13 +573,13 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --stop
 
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
-`testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`, round-trip filter `2.0m`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
+`testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`, round-trip filter `0.5m`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_a100x4x2_static_pods.py --replace
 ```
 
-이 launcher는 `configs/experiment/pre_bc_flow_control_a100x4x2_prefix_valid.yaml`을 사용합니다. 해당 preset은 `pre_bc_flow_control_2x4_h100`을 상속하므로 `train_batch_size=26`, `trainer.num_nodes=2`, `trainer.devices=4`, `precision=bf16-mixed`, `lr=6e-4`, `control_round_trip_max_position_error_m=2.0`은 그대로 유지합니다.
+이 launcher는 `configs/experiment/pre_bc_flow_control_a100x4x2_prefix_valid.yaml`을 사용합니다. 해당 preset은 `pre_bc_flow_control_2x4_h100`을 상속하므로 `train_batch_size=26`, `trainer.num_nodes=2`, `trainer.devices=4`, `precision=bf16-mixed`, `lr=6e-4`, `control_round_trip_max_position_error_m=0.5`는 그대로 유지합니다.
 
 ```yaml
 model:
@@ -587,12 +587,12 @@ model:
     token_processor:
       use_kinematic_control_flow: true
       use_prefix_valid_future_loss_mask: true
-      control_round_trip_max_position_error_m: 2.0
+      control_round_trip_max_position_error_m: 0.5
 ```
 
 현재 브랜치의 `use_prefix_valid_future_loss_mask=true`는 `812eccc` 이후 의미입니다. 즉, 가까운 미래부터 연속 valid prefix를 만들고, 그 길이를 5-step chunk 단위로 내림합니다. 1~4 step만 유효한 anchor는 버리고, 5~9 step은 첫 0.5초, 10~14 step은 첫 1.0초, 15~19 step은 첫 1.5초만 학습합니다.
 
-기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_roundtrip2_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
+기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_roundtrip05_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
 
 tmux 확인:
 
@@ -631,7 +631,7 @@ scripts/launch_pre_bc_flow_control_v100x47_static_pods.py
 - `model.model_config.decoder.flow_window_steps=20`
 - `model.model_config.token_processor.use_kinematic_control_flow=true`
 - `model.model_config.token_processor.use_prefix_valid_future_loss_mask=true`
-- `model.model_config.token_processor.control_round_trip_max_position_error_m=2.0`
+- `model.model_config.token_processor.control_round_trip_max_position_error_m=0.5`
 - `data.train_batch_size=4`, effective global batch `4 * 47 = 188`
 - `model.model_config.lr=6e-4`
 
