@@ -58,7 +58,7 @@ class _ZeroFlowODE:
 class _StraightCommitBridge:
     config = SimpleNamespace(history_steps=6)
 
-    def commit(self, y_hat_norm, current_pos, current_head, agent_type):
+    def commit(self, y_hat_norm, current_pos, current_head, agent_type=None, agent_length=None):
         offsets = torch.arange(1, 6, device=current_pos.device, dtype=current_pos.dtype).view(1, 5, 1)
         commit_pos = current_pos.unsqueeze(1) + torch.cat([offsets, offsets.new_zeros(offsets.shape)], dim=-1)
         commit_head = current_head.unsqueeze(1).expand(-1, 5)
