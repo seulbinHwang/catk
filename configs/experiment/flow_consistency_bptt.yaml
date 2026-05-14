@@ -89,6 +89,10 @@ model:
       ocsc_strict_active_mask: true
       # ── BPTT tricks ─────────────────────────────────────────────────
       flow_velocity_head_only: true
+      # 학습 대상 module 선택 (flow_velocity_head_only 보다 우선).
+      # "default" (기존 토글 따름) | "velocity_head" | "step_refiner_and_velocity_head"
+      # | "chunk_mixers_and_velocity_head" | "full".
+      flow_ft_target: "default"
       bptt_use_adjoint: false
       bptt_grad_clip_traj: 1.0
       bptt_sequential_rollouts: false

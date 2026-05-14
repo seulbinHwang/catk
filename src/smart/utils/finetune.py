@@ -59,6 +59,13 @@ class FinetuneConfig:
     gradient_clip_val: float = 0.0
     # ── BPTT 토글 (OCSC 에서 ODE solver / closed-loop rollout 제어) ────────────
     flow_velocity_head_only: bool = True
+    # 학습 대상 module 선택 (flow_velocity_head_only 보다 우선 적용).
+    # "default": 기존 flow_velocity_head_only 토글 따름 (backward-compat).
+    # "velocity_head": velocity_head 만 학습 (flow_velocity_head_only=true 와 동일).
+    # "step_refiner_and_velocity_head": step_refiner + velocity_head 만 학습.
+    # "chunk_mixers_and_velocity_head": chunk_mixers + velocity_head 만 학습.
+    # "full": 전체 flow_decoder 학습 (flow_velocity_head_only=false 와 동일).
+    flow_ft_target: str = "default"
     bptt_use_adjoint: bool = False
     bptt_last_n_solver_steps: int = 0
     bptt_grad_clip_traj: float = 1.0
@@ -136,6 +143,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         mode=str(_read_config_value(finetune, "mode", "ocsc_ft")),
         gradient_clip_val=float(_read_config_value(finetune, "gradient_clip_val", 0.0)),
         flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
+        flow_ft_target=str(_read_config_value(finetune, "flow_ft_target", "default")),
         bptt_use_adjoint=bool(_read_config_value(finetune, "bptt_use_adjoint", False)),
         bptt_last_n_solver_steps=int(_read_config_value(finetune, "bptt_last_n_solver_steps", 0)),
         bptt_grad_clip_traj=float(_read_config_value(finetune, "bptt_grad_clip_traj", 1.0)),
@@ -228,8 +236,65 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             "Use the flow-based model (e.g., SMARTFlow) or fix the model config."
         )
 
+    # ── flow_ft_target 우선 적용 ────────────────────────────────────────────
+    # "default" 면 기존 flow_velocity_head_only 분기로 fallback.
+    _target = str(getattr(config, "flow_ft_target", "default")).lower()
+    if _target == "step_refiner_and_velocity_head":
+        try:
+            velocity_head = flow_decoder.velocity_head
+            step_refiner = flow_decoder.step_refiner
+        except AttributeError as exc:
+            raise AttributeError(
+                "flow_ft_target=step_refiner_and_velocity_head requires both "
+                "velocity_head and step_refiner on flow_decoder."
+            ) from exc
+        _set_requires_grad(flow_decoder, False)
+        _set_requires_grad(velocity_head, True)
+        _set_requires_grad(step_refiner, True)
+        if residual_head is not None:
+            for p in residual_head.parameters():
+                p.data.zero_()
+            _set_requires_grad(residual_head, False)
+        log.info(
+            "Finetuning mode: step_refiner + velocity_head trainable; "
+            "chunk_mixers / encoders / residual frozen."
+        )
+        return config
+    if _target == "chunk_mixers_and_velocity_head":
+        try:
+            velocity_head = flow_decoder.velocity_head
+            chunk_mixers = flow_decoder.chunk_mixers
+        except AttributeError as exc:
+            raise AttributeError(
+                "flow_ft_target=chunk_mixers_and_velocity_head requires both "
+                "velocity_head and chunk_mixers on flow_decoder."
+            ) from exc
+        _set_requires_grad(flow_decoder, False)
+        _set_requires_grad(velocity_head, True)
+        _set_requires_grad(chunk_mixers, True)
+        if residual_head is not None:
+            for p in residual_head.parameters():
+                p.data.zero_()
+            _set_requires_grad(residual_head, False)
+        log.info(
+            "Finetuning mode: chunk_mixers + velocity_head trainable; "
+            "step_refiner / encoders / residual frozen."
+        )
+        return config
+    if _target == "velocity_head":
+        _velocity_head_only = True   # explicit alias
+    elif _target == "full":
+        _velocity_head_only = False  # explicit alias
+    elif _target == "default":
+        _velocity_head_only = bool(config.flow_velocity_head_only)
+    else:
+        log.warning(
+            f"[finetune] unknown flow_ft_target={_target!r}; falling back to flow_velocity_head_only={config.flow_velocity_head_only}."
+        )
+        _velocity_head_only = bool(config.flow_velocity_head_only)
+
     # ── velocity_head만 학습 (트렁크·residual 동결) ─────────────────────────
-    if config.flow_velocity_head_only:
+    if _velocity_head_only:
         try:
             velocity_head = flow_decoder.velocity_head
         except AttributeError as exc:

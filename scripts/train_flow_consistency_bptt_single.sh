@@ -186,6 +186,10 @@ BPTT_LAST_N_SOLVER_STEPS="${BPTT_LAST_N_SOLVER_STEPS:-0}"
 BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-0.0}"
 BPTT_LAST_COARSE_ONLY="${BPTT_LAST_COARSE_ONLY:-true}"
 FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
+# 학습 대상 module 선택 (flow_velocity_head_only 보다 우선).
+# "default" (위 토글 따름) | "velocity_head" | "step_refiner_and_velocity_head"
+# | "chunk_mixers_and_velocity_head" | "full"
+FLOW_FT_TARGET="${FLOW_FT_TARGET:-default}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -324,6 +328,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.decoder.flow_solver_method="${FLOW_SOLVER_METHOD}" \
   model.model_config.decoder.flow_solver_steps="${FLOW_SOLVER_STEPS}" \
   model.model_config.finetune.flow_velocity_head_only="${FLOW_VELOCITY_HEAD_ONLY}" \
+  model.model_config.finetune.flow_ft_target="${FLOW_FT_TARGET}" \
   model.model_config.finetune.ocsc_n_rollouts="${OCSC_N_ROLLOUTS}" \
   model.model_config.finetune.ocsc_n_ol_rollouts="${OCSC_N_OL_ROLLOUTS}" \
   model.model_config.finetune.ocsc_ol_nearest_match="${OCSC_OL_NEAREST_MATCH}" \
