@@ -60,6 +60,46 @@ from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
 
+_TOKEN_PROCESSOR_DECODER_SHARED_KEYS = (
+    "use_kinematic_control_flow",
+    "use_holonomic_model_only",
+    "use_rolling_supervision",
+    "control_pos_scale_m",
+    "control_no_slip_point_ratio",
+    "control_vehicle_yaw_scale_rad",
+    "control_pedestrian_yaw_scale_rad",
+    "control_cyclist_yaw_scale_rad",
+)
+
+
+def _values_match(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return bool(left) == bool(right)
+    if left is None or right is None:
+        return left is right
+    if isinstance(left, (int, float)) or isinstance(right, (int, float)):
+        return math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1.0e-12)
+    return left == right
+
+
+def _build_decoder_config_from_token_processor(decoder_config: Any, token_processor: FlowTokenProcessor) -> Dict[str, Any]:
+    """token_processor와 decoder가 공유하는 control-space 설정을 한 곳에서 고정합니다."""
+    synced_config = dict(decoder_config)
+    for key in _TOKEN_PROCESSOR_DECODER_SHARED_KEYS:
+        token_value = getattr(token_processor, key)
+        if key in synced_config:
+            decoder_value = decoder_config[key]
+            if not _values_match(decoder_value, token_value):
+                raise ValueError(
+                    f"model_config.decoder.{key} must match "
+                    f"model_config.token_processor.{key}. "
+                    "Set the token_processor value only; decoder uses it as the single source of truth. "
+                    f"got decoder={decoder_value!r}, token_processor={token_value!r}."
+                )
+        synced_config[key] = token_value
+    return synced_config
+
+
 class SMARTFlow(LightningModule):
 
     def __init__(self, model_config) -> None:
@@ -77,9 +117,13 @@ class SMARTFlow(LightningModule):
         self.val_closed_loop = model_config.val_closed_loop
         self.token_processor = FlowTokenProcessor(**model_config.token_processor)
         self.use_kinematic_control_flow = bool(self.token_processor.use_kinematic_control_flow)
+        decoder_config = _build_decoder_config_from_token_processor(
+            decoder_config=model_config.decoder,
+            token_processor=self.token_processor,
+        )
 
         self.encoder = SMARTFlowDecoder(
-            **model_config.decoder,
+            **decoder_config,
             n_token_agent=self.token_processor.n_token_agent,
         )
         if self.flow_window_steps != int(self.token_processor.flow_window_steps):

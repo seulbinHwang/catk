@@ -122,6 +122,8 @@ model_config:
     flow_solver_steps: 32
     flow_solver_method: euler
     flow_solver_eps: 1.0e-3
+    # 아래 control-space 공유 설정은 token_processor 값을 단일 기준으로 사용합니다.
+    # decoder 쪽만 다른 값으로 override하면 SMARTFlow 초기화 단계에서 에러를 냅니다.
     use_kinematic_control_flow: ${model.model_config.token_processor.use_kinematic_control_flow}
     use_holonomic_model_only: ${model.model_config.token_processor.use_holonomic_model_only}
     use_rolling_supervision: ${model.model_config.token_processor.use_rolling_supervision}
