@@ -534,7 +534,13 @@ fi
 """
 
     pull_block = ""
-    if args.pull:
+    if args.git_ref:
+        pull_block = f"""
+git config --global --add safe.directory {shq(args.project_root)} || true
+git fetch origin --prune
+git checkout --detach {shq(args.git_ref)}
+"""
+    elif args.pull:
         branch_ref = f"refs/heads/{args.branch}"
         origin_ref = f"origin/{args.branch}"
         fetch_refspec = f"{args.branch}:refs/remotes/origin/{args.branch}"
@@ -644,6 +650,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--container", default="main")
     parser.add_argument("--project-root", default=DEFAULT_PROJECT_ROOT)
     parser.add_argument("--branch", default=DEFAULT_BRANCH)
+    parser.add_argument(
+        "--git-ref",
+        default="",
+        help=(
+            "Checkout this exact git ref/SHA on every pod before launch. "
+            "When set, branch checkout and git pull are skipped so resumes can "
+            "use the same code snapshot as the original run."
+        ),
+    )
     parser.add_argument("--no-pull", dest="pull", action="store_false")
     parser.set_defaults(pull=True)
     parser.add_argument(

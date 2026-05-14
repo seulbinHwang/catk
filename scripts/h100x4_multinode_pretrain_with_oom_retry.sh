@@ -23,6 +23,7 @@ CONTAINER="${CONTAINER:-main}"
 PODS="${PODS:-hsb-npc-training hsb-npc-training2}"
 PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk}"
 BRANCH="${BRANCH:-self_forcing_bugfix}"
+GIT_REF="${GIT_REF:-}"
 TASK_NAME="${TASK_NAME:-flow_semi_continuous_pretrain_h100x4x2_bs26}"
 SESSION="${SESSION:-catk-h100x4-pretrain}"
 EXPERIMENT="${EXPERIMENT:-pre_bc_flow_2x4_h100}"
@@ -126,6 +127,10 @@ start_attempt() {
     --train-batch-size "$bs"
     --replace
   )
+
+  if [[ -n "$GIT_REF" ]]; then
+    cmd+=(--git-ref "$GIT_REF")
+  fi
 
   if [[ -n "$CACHE_ROOT" ]]; then
     cmd+=(--cache-root "$CACHE_ROOT")
