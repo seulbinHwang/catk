@@ -512,11 +512,12 @@ python tools/analyze_control_round_trip_error.py \
   --split training \
   --flow-window-steps 20 \
   --thresholds 0.5,1,1.5,2,3,5,10 \
-  --num-workers 8 \
+  --num-workers 48 \
+  --chunksize 512 \
   --output-json outputs/control_round_trip_training.json
 ```
 
-  prefix-valid 실험이면 `--use-prefix-valid-future-loss-mask`를 같이 켜고, `use_holonomic_model_only`, `use_rolling_supervision`, `control_vehicle_no_slip_point_ratio`, `control_cyclist_no_slip_point_ratio`를 바꾼 실험이면 도구에도 같은 옵션을 넘겨야 합니다. 출력은 전체/vehicle/pedestrian/cyclist별 anchor max error percentile, step error percentile, threshold별 anchor 제거율을 포함합니다. 기본 추천값은 전체 anchor max error의 p99.5를 `0.25m` 단위로 올림한 값입니다. 실전적으로는 이 추천값과 threshold table을 함께 보고, 정상적인 대다수 anchor를 유지하면서 명백한 non-holonomic projection outlier만 제거하는 값을 고릅니다.
+  prefix-valid 실험이면 `--use-prefix-valid-future-loss-mask`를 같이 켜고, `use_holonomic_model_only`, `use_rolling_supervision`, `control_vehicle_no_slip_point_ratio`, `control_cyclist_no_slip_point_ratio`를 바꾼 실험이면 도구에도 같은 옵션을 넘겨야 합니다. 이 분석 도구는 파일 내부 anchor 계산을 NumPy로 벡터화하고 worker별 file chunk 단위로 histogram을 합쳐 IPC 비용을 줄입니다. 현재 컨테이너에서는 `--num-workers 48 --chunksize 512`가 training `486,995`개 파일을 20분 안에 끝내는 기준 설정입니다. 출력은 전체/vehicle/pedestrian/cyclist별 anchor max error percentile, step error percentile, threshold별 anchor 제거율을 포함합니다. 기본 추천값은 전체 anchor max error의 p99.5를 `0.25m` 단위로 올림한 값입니다. 실전적으로는 이 추천값과 threshold table을 함께 보고, 정상적인 대다수 anchor를 유지하면서 명백한 non-holonomic projection outlier만 제거하는 값을 고릅니다.
 - 추가 trajectory loss, x0 loss, open-loop auxiliary loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
 - validation / rollout / metric 경로에서는 control 예측을 기존 pose-space 표현으로 복원해 기존 open-loop metric과 closed-loop rollout을 그대로 계산합니다.
 

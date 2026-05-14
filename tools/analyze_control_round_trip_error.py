@@ -15,12 +15,29 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from src.smart.modules.kinematic_control import (
     build_rolling_control_target_with_round_trip_error,
 )
 
 
 TYPE_IDS = {"all": None, "vehicle": 0, "pedestrian": 1, "cyclist": 2}
+
+
+def _available_cpu_count() -> int:
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def _default_num_workers() -> int:
+    return min(64, max(1, 3 * _available_cpu_count()))
 
 
 @dataclass(frozen=True)
@@ -50,6 +67,12 @@ def _as_tensor(value: Any) -> torch.Tensor:
     return torch.as_tensor(value)
 
 
+def _as_numpy(value: Any) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
 def _load_agent_record(path: Path) -> dict[str, torch.Tensor]:
     with path.open("rb") as handle:
         data = pickle.load(handle)
@@ -66,6 +89,25 @@ def _load_agent_record(path: Path) -> dict[str, torch.Tensor]:
     else:
         record["train_mask"] = torch.ones(record["valid"].shape[0], dtype=torch.bool)
     return record
+
+
+def _load_agent_record_np(path: Path) -> dict[str, np.ndarray]:
+    with path.open("rb") as handle:
+        data = pickle.load(handle)
+    agent = data["agent"]
+    valid = _as_numpy(agent["valid_mask"]).astype(bool, copy=False)
+    if "train_mask" in agent:
+        train_mask = _as_numpy(agent["train_mask"]).astype(bool, copy=False)
+    else:
+        train_mask = np.ones((valid.shape[0],), dtype=bool)
+    return {
+        "pos": _as_numpy(agent["position"])[..., :2].astype(np.float32, copy=False),
+        "heading": _as_numpy(agent["heading"]).astype(np.float32, copy=False),
+        "valid": valid,
+        "type": _as_numpy(agent["type"]).astype(np.int64, copy=False),
+        "length": _as_numpy(agent["shape"])[:, 0].astype(np.float32, copy=False),
+        "train_mask": train_mask,
+    }
 
 
 def _build_future_loss_mask(valid: torch.Tensor, raw_step: int, cfg: AnalysisConfig) -> torch.Tensor:
@@ -88,6 +130,28 @@ def _build_future_loss_mask(valid: torch.Tensor, raw_step: int, cfg: AnalysisCon
     usable_len = (prefix_len // cfg.shift) * cfg.shift
     step_index = torch.arange(cfg.flow_window_steps).unsqueeze(0)
     return step_index < usable_len.unsqueeze(1)
+
+
+def _build_future_loss_mask_np(valid: np.ndarray, raw_step: int, cfg: AnalysisConfig) -> np.ndarray:
+    future_start = raw_step + 1
+    future_loss_mask = np.zeros((valid.shape[0], cfg.flow_window_steps), dtype=bool)
+    available_len = min(cfg.flow_window_steps, max(0, valid.shape[1] - future_start))
+    if available_len <= 0:
+        return future_loss_mask
+
+    available_future_valid = valid[:, future_start : future_start + available_len].astype(bool, copy=False)
+    if not cfg.use_prefix_valid_future_loss_mask:
+        if available_len != cfg.flow_window_steps:
+            return future_loss_mask
+        full_future_valid = available_future_valid.all(axis=1)
+        future_loss_mask[full_future_valid] = True
+        return future_loss_mask
+
+    prefix_valid = np.cumprod(available_future_valid, axis=1, dtype=np.int64).astype(bool, copy=False)
+    prefix_len = prefix_valid.sum(axis=1)
+    usable_len = (prefix_len // int(cfg.shift)) * int(cfg.shift)
+    step_index = np.arange(cfg.flow_window_steps, dtype=np.int64)[None, :]
+    return step_index < usable_len[:, None]
 
 
 def _build_future_pose_with_loss_mask(
@@ -130,6 +194,156 @@ def _build_future_pose_with_loss_mask(
     future_pos = torch.where(invalid_future_mask.unsqueeze(-1), last_valid_pos.unsqueeze(1), future_pos)
     future_head = torch.where(invalid_future_mask, last_valid_head.unsqueeze(1), future_head)
     return future_pos, future_head
+
+
+def _wrap_angle_np(angle: np.ndarray) -> np.ndarray:
+    return np.arctan2(np.sin(angle), np.cos(angle)).astype(np.float32, copy=False)
+
+
+def _safe_sinc_np(x: np.ndarray, eps: float = 1.0e-6) -> np.ndarray:
+    near_zero = np.abs(x) < np.float32(eps)
+    safe_x = np.where(near_zero, np.ones_like(x, dtype=np.float32), x)
+    x2 = x * x
+    return np.where(
+        near_zero,
+        np.float32(1.0) - x2 / np.float32(6.0) + x2 * x2 / np.float32(120.0),
+        np.sin(x) / safe_x,
+    ).astype(np.float32, copy=False)
+
+
+def _round_trip_error_np(
+    *,
+    future_pos: np.ndarray,
+    future_head: np.ndarray,
+    current_pos: np.ndarray,
+    current_head: np.ndarray,
+    agent_type: np.ndarray,
+    agent_length: np.ndarray,
+    cfg: AnalysisConfig,
+) -> np.ndarray:
+    num_agent, num_step = future_head.shape
+    if num_agent == 0:
+        return np.zeros((0, num_step), dtype=np.float32)
+
+    build_roll_pos = current_pos.astype(np.float32, copy=True)
+    build_roll_head = current_head.astype(np.float32, copy=True)
+    decode_roll_pos = current_pos.astype(np.float32, copy=True)
+    decode_roll_head = current_head.astype(np.float32, copy=True)
+    error = np.zeros((num_agent, num_step), dtype=np.float32)
+
+    holonomic_mask = agent_type == 1
+    if cfg.use_holonomic_model_only:
+        holonomic_mask = np.ones_like(holonomic_mask, dtype=bool)
+    nonhol_mask = ~holonomic_mask
+
+    no_slip_offset = np.zeros((num_agent,), dtype=np.float32)
+    if not cfg.use_holonomic_model_only:
+        no_slip_offset[agent_type == 0] = (
+            np.float32(cfg.control_vehicle_no_slip_point_ratio) * agent_length[agent_type == 0]
+        )
+        no_slip_offset[agent_type == 2] = (
+            np.float32(cfg.control_cyclist_no_slip_point_ratio) * agent_length[agent_type == 2]
+        )
+    yaw_scale = np.empty((num_agent,), dtype=np.float32)
+    yaw_scale[agent_type == 0] = np.float32(cfg.control_vehicle_yaw_scale_rad)
+    yaw_scale[agent_type == 1] = np.float32(cfg.control_pedestrian_yaw_scale_rad)
+    yaw_scale[agent_type == 2] = np.float32(cfg.control_cyclist_yaw_scale_rad)
+    pos_scale = np.float32(cfg.control_pos_scale_m)
+
+    for step_idx in range(num_step):
+        target_pos = future_pos[:, step_idx]
+        target_head = future_head[:, step_idx]
+        if cfg.use_rolling_supervision:
+            source_pos = build_roll_pos
+            source_head = build_roll_head
+        elif step_idx == 0:
+            source_pos = current_pos
+            source_head = current_head
+        else:
+            source_pos = future_pos[:, step_idx - 1]
+            source_head = future_head[:, step_idx - 1]
+
+        delta_head = _wrap_angle_np(target_head - source_head)
+        mid_head = source_head + np.float32(0.5) * delta_head
+        h_mid = np.stack([np.cos(mid_head), np.sin(mid_head)], axis=-1).astype(np.float32, copy=False)
+        source_heading_vec = np.stack([np.cos(source_head), np.sin(source_head)], axis=-1).astype(
+            np.float32,
+            copy=False,
+        )
+        target_heading_vec = np.stack([np.cos(target_head), np.sin(target_head)], axis=-1).astype(
+            np.float32,
+            copy=False,
+        )
+
+        delta_vec = target_pos - source_pos
+        source_cos = np.cos(source_head).astype(np.float32, copy=False)
+        source_sin = np.sin(source_head).astype(np.float32, copy=False)
+        ped_delta_s = delta_vec[:, 0] * source_cos + delta_vec[:, 1] * source_sin
+        ped_delta_n = -delta_vec[:, 0] * source_sin + delta_vec[:, 1] * source_cos
+        nonhol_delta_vec = (
+            target_pos
+            - source_pos
+            - no_slip_offset[:, None] * target_heading_vec
+            + no_slip_offset[:, None] * source_heading_vec
+        )
+        nonhol_proj = np.sum(nonhol_delta_vec * h_mid, axis=-1, dtype=np.float32)
+        nonhol_delta_s = nonhol_proj / _safe_sinc_np(np.float32(0.5) * delta_head)
+
+        delta_s = np.where(holonomic_mask, ped_delta_s, nonhol_delta_s).astype(np.float32, copy=False)
+        delta_n = np.where(holonomic_mask, ped_delta_n, np.zeros_like(ped_delta_n)).astype(np.float32, copy=False)
+        delta_s_dec = ((delta_s / pos_scale) * pos_scale).astype(np.float32, copy=False)
+        delta_n_dec = ((delta_n / pos_scale) * pos_scale).astype(np.float32, copy=False)
+        delta_head_dec = ((delta_head / yaw_scale) * yaw_scale).astype(np.float32, copy=False)
+
+        decode_cos = np.cos(decode_roll_head).astype(np.float32, copy=False)
+        decode_sin = np.sin(decode_roll_head).astype(np.float32, copy=False)
+        decode_next_head = _wrap_angle_np(decode_roll_head + delta_head_dec)
+        delta_pos_ped = np.stack(
+            [
+                delta_s_dec * decode_cos - delta_n_dec * decode_sin,
+                delta_s_dec * decode_sin + delta_n_dec * decode_cos,
+            ],
+            axis=-1,
+        ).astype(np.float32, copy=False)
+        decode_mid_head = decode_roll_head + np.float32(0.5) * delta_head_dec
+        decode_arc_scale = delta_s_dec * _safe_sinc_np(np.float32(0.5) * delta_head_dec)
+        delta_pos_nonhol = np.stack(
+            [decode_arc_scale * np.cos(decode_mid_head), decode_arc_scale * np.sin(decode_mid_head)],
+            axis=-1,
+        ).astype(np.float32, copy=False)
+        if np.any(no_slip_offset != 0.0):
+            decode_current_heading_vec = np.stack([decode_cos, decode_sin], axis=-1)
+            decode_next_heading_vec = np.stack(
+                [np.cos(decode_next_head), np.sin(decode_next_head)],
+                axis=-1,
+            ).astype(np.float32, copy=False)
+            delta_pos_nonhol = delta_pos_nonhol + no_slip_offset[:, None] * (
+                decode_next_heading_vec - decode_current_heading_vec
+            )
+        delta_pos = delta_pos_ped
+        if np.any(nonhol_mask):
+            delta_pos = delta_pos.copy()
+            delta_pos[nonhol_mask] = delta_pos_nonhol[nonhol_mask]
+        next_decode_pos = decode_roll_pos + delta_pos
+
+        build_next_pos = (
+            build_roll_pos
+            + nonhol_proj[:, None] * h_mid
+            + no_slip_offset[:, None] * (target_heading_vec - source_heading_vec)
+        )
+        if cfg.use_rolling_supervision:
+            if np.any(holonomic_mask):
+                build_next_pos = build_next_pos.copy()
+                build_next_pos[holonomic_mask] = target_pos[holonomic_mask]
+            build_roll_pos = build_next_pos
+            build_roll_head = _wrap_angle_np(build_roll_head + delta_head)
+
+        diff = next_decode_pos - target_pos
+        error[:, step_idx] = np.sqrt(np.sum(diff * diff, axis=-1, dtype=np.float32))
+        decode_roll_pos = next_decode_pos
+        decode_roll_head = decode_next_head
+
+    return error
 
 
 def _empty_hist(cfg: AnalysisConfig) -> np.ndarray:
@@ -183,8 +397,35 @@ def _update_stats(stats: dict[str, Any], anchor_max: torch.Tensor, step_error: t
     stats["hist_clipped_step_count"] += int((step_np >= float(cfg.hist_max_error_m)).sum())
 
 
-def analyze_cache_file(path: Path, cfg: AnalysisConfig, thresholds: np.ndarray) -> dict[str, dict[str, Any]]:
-    record = _load_agent_record(path)
+def _update_stats_np(
+    stats: dict[str, Any],
+    anchor_max: np.ndarray,
+    step_error: np.ndarray,
+    thresholds: np.ndarray,
+    cfg: AnalysisConfig,
+) -> None:
+    anchor_np = np.asarray(anchor_max, dtype=np.float64)
+    step_np = np.asarray(step_error, dtype=np.float64)
+    anchor_np = anchor_np[np.isfinite(anchor_np)]
+    step_np = step_np[np.isfinite(step_np)]
+    if anchor_np.size == 0:
+        return
+
+    stats["anchor_count"] += int(anchor_np.size)
+    stats["loss_step_count"] += int(step_np.size)
+    stats["hist_anchor_max"] += _histogram(anchor_np, cfg)
+    stats["hist_step"] += _histogram(step_np, cfg)
+    stats["threshold_keep_counts"] += (anchor_np[:, None] <= thresholds[None, :]).sum(axis=0).astype(np.int64)
+    stats["sum_anchor_max_error_m"] += float(anchor_np.sum(dtype=np.float64))
+    stats["sum_step_error_m"] += float(step_np.sum(dtype=np.float64)) if step_np.size else 0.0
+    stats["max_anchor_error_m"] = max(float(stats["max_anchor_error_m"]), float(anchor_np.max(initial=0.0)))
+    stats["max_step_error_m"] = max(float(stats["max_step_error_m"]), float(step_np.max(initial=0.0)))
+    stats["hist_clipped_anchor_count"] += int((anchor_np >= float(cfg.hist_max_error_m)).sum())
+    stats["hist_clipped_step_count"] += int((step_np >= float(cfg.hist_max_error_m)).sum())
+
+
+def _collect_cache_file_errors(path: Path, cfg: AnalysisConfig) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    record = _load_agent_record_np(path)
     pos = record["pos"]
     heading = record["heading"]
     valid = record["valid"]
@@ -192,67 +433,135 @@ def analyze_cache_file(path: Path, cfg: AnalysisConfig, thresholds: np.ndarray) 
     agent_length = record["length"]
     train_mask = record["train_mask"]
 
-    result = {type_name: _new_type_stats(cfg, thresholds) for type_name in TYPE_IDS}
+    current_pos_parts: list[np.ndarray] = []
+    current_head_parts: list[np.ndarray] = []
+    future_pos_parts: list[np.ndarray] = []
+    future_head_parts: list[np.ndarray] = []
+    loss_mask_parts: list[np.ndarray] = []
+    type_parts: list[np.ndarray] = []
+    length_parts: list[np.ndarray] = []
     raw_current_steps = range(int(cfg.raw_start), int(cfg.raw_end) + 1, int(cfg.shift))
     for raw_step in raw_current_steps:
         if raw_step >= valid.shape[1]:
             continue
-        future_loss_mask_all = _build_future_loss_mask(valid=valid, raw_step=raw_step, cfg=cfg)
-        anchor_mask = valid[:, raw_step] & future_loss_mask_all.any(dim=1) & train_mask
-        if not bool(anchor_mask.any().item()):
+        future_loss_mask_all = _build_future_loss_mask_np(valid=valid, raw_step=raw_step, cfg=cfg)
+        anchor_mask = valid[:, raw_step] & future_loss_mask_all.any(axis=1) & train_mask
+        if not np.any(anchor_mask):
             continue
 
         selected_loss_mask = future_loss_mask_all[anchor_mask]
-        future_pos, future_head = _build_future_pose_with_loss_mask(
-            pos=pos,
-            heading=heading,
-            current_pos=pos[:, raw_step],
-            current_head=heading[:, raw_step],
-            anchor_mask=anchor_mask,
-            raw_step=raw_step,
-            future_loss_mask=selected_loss_mask,
-            cfg=cfg,
-        )
-        selected_type = agent_type[anchor_mask]
-        selected_length = agent_length[anchor_mask]
-        _, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
-            future_pos=future_pos,
-            future_head=future_head,
-            current_pos=pos[anchor_mask, raw_step],
-            current_head=heading[anchor_mask, raw_step],
-            agent_type=selected_type,
-            agent_length=selected_length,
-            pos_scale_m=cfg.control_pos_scale_m,
-            vehicle_yaw_scale_rad=cfg.control_vehicle_yaw_scale_rad,
-            pedestrian_yaw_scale_rad=cfg.control_pedestrian_yaw_scale_rad,
-            cyclist_yaw_scale_rad=cfg.control_cyclist_yaw_scale_rad,
-            use_holonomic_model_only=cfg.use_holonomic_model_only,
-            use_rolling_supervision=cfg.use_rolling_supervision,
-            vehicle_no_slip_point_ratio=cfg.control_vehicle_no_slip_point_ratio,
-            cyclist_no_slip_point_ratio=cfg.control_cyclist_no_slip_point_ratio,
-        )
-        masked_error = torch.where(
-            selected_loss_mask,
-            round_trip_error_m,
-            torch.zeros_like(round_trip_error_m),
-        )
-        anchor_max_error = masked_error.max(dim=1).values
-        step_error = round_trip_error_m[selected_loss_mask]
+        selected_current_pos = pos[anchor_mask, raw_step]
+        selected_current_head = heading[anchor_mask, raw_step]
+        future_start = raw_step + 1
+        future_pos = np.broadcast_to(
+            selected_current_pos[:, None, :],
+            (selected_current_pos.shape[0], cfg.flow_window_steps, 2),
+        ).copy()
+        future_head = np.broadcast_to(
+            selected_current_head[:, None],
+            (selected_current_head.shape[0], cfg.flow_window_steps),
+        ).copy()
+        available_len = min(cfg.flow_window_steps, max(0, pos.shape[1] - future_start))
+        if available_len > 0:
+            future_pos[:, :available_len] = pos[anchor_mask, future_start : future_start + available_len]
+            future_head[:, :available_len] = heading[anchor_mask, future_start : future_start + available_len]
 
-        _update_stats(result["all"], anchor_max_error, step_error, thresholds, cfg)
-        for type_name, type_id in TYPE_IDS.items():
-            if type_id is None:
-                continue
-            type_mask = selected_type == int(type_id)
-            if bool(type_mask.any().item()):
-                _update_stats(
-                    result[type_name],
-                    anchor_max_error[type_mask],
-                    round_trip_error_m[type_mask][selected_loss_mask[type_mask]],
-                    thresholds,
-                    cfg,
-                )
+        valid_step_count = selected_loss_mask.sum(axis=1)
+        if np.any(valid_step_count <= 0):
+            raise ValueError("future_loss_mask must contain at least one valid future step per selected anchor.")
+        last_valid_index = valid_step_count - 1
+        row_index = np.arange(future_pos.shape[0])
+        last_valid_pos = future_pos[row_index, last_valid_index]
+        last_valid_head = future_head[row_index, last_valid_index]
+        invalid_future_mask = ~selected_loss_mask
+        future_pos[invalid_future_mask] = np.broadcast_to(
+            last_valid_pos[:, None, :],
+            future_pos.shape,
+        )[invalid_future_mask]
+        future_head[invalid_future_mask] = np.broadcast_to(
+            last_valid_head[:, None],
+            future_head.shape,
+        )[invalid_future_mask]
+
+        current_pos_parts.append(selected_current_pos)
+        current_head_parts.append(selected_current_head)
+        future_pos_parts.append(future_pos)
+        future_head_parts.append(future_head)
+        loss_mask_parts.append(selected_loss_mask)
+        type_parts.append(agent_type[anchor_mask])
+        length_parts.append(agent_length[anchor_mask])
+
+    result: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    if not current_pos_parts:
+        empty = np.zeros((0,), dtype=np.float32)
+        return {type_name: (empty, empty) for type_name in TYPE_IDS}
+
+    current_pos_all = np.concatenate(current_pos_parts, axis=0)
+    current_head_all = np.concatenate(current_head_parts, axis=0)
+    future_pos_all = np.concatenate(future_pos_parts, axis=0)
+    future_head_all = np.concatenate(future_head_parts, axis=0)
+    loss_mask_all = np.concatenate(loss_mask_parts, axis=0)
+    type_all = np.concatenate(type_parts, axis=0)
+    length_all = np.concatenate(length_parts, axis=0)
+    round_trip_error_m = _round_trip_error_np(
+        future_pos=future_pos_all,
+        future_head=future_head_all,
+        current_pos=current_pos_all,
+        current_head=current_head_all,
+        agent_type=type_all,
+        agent_length=length_all,
+        cfg=cfg,
+    )
+    masked_error = np.where(loss_mask_all, round_trip_error_m, np.float32(0.0))
+    anchor_max_all = masked_error.max(axis=1)
+    for type_name in TYPE_IDS:
+        type_id = TYPE_IDS[type_name]
+        if type_id is None:
+            type_mask = np.ones((type_all.shape[0],), dtype=bool)
+        else:
+            type_mask = type_all == int(type_id)
+        if np.any(type_mask):
+            anchor_max = anchor_max_all[type_mask]
+            step_error = round_trip_error_m[type_mask][loss_mask_all[type_mask]]
+        else:
+            anchor_max = np.zeros((0,), dtype=np.float32)
+            step_error = np.zeros((0,), dtype=np.float32)
+        result[type_name] = (anchor_max, step_error)
     return result
+
+
+def analyze_cache_file(path: Path, cfg: AnalysisConfig, thresholds: np.ndarray) -> dict[str, dict[str, Any]]:
+    errors = _collect_cache_file_errors(path, cfg=cfg)
+    result = {type_name: _new_type_stats(cfg, thresholds) for type_name in TYPE_IDS}
+    for type_name, (anchor_max, step_error) in errors.items():
+        _update_stats_np(result[type_name], anchor_max, step_error, thresholds, cfg)
+    return result
+
+
+def analyze_cache_files(paths: list[Path], cfg: AnalysisConfig, thresholds: np.ndarray) -> dict[str, dict[str, Any]]:
+    merged = {type_name: _new_type_stats(cfg, thresholds) for type_name in TYPE_IDS}
+    anchor_parts: dict[str, list[np.ndarray]] = {type_name: [] for type_name in TYPE_IDS}
+    step_parts: dict[str, list[np.ndarray]] = {type_name: [] for type_name in TYPE_IDS}
+    for path in paths:
+        errors = _collect_cache_file_errors(path, cfg=cfg)
+        for type_name, (anchor_max, step_error) in errors.items():
+            if anchor_max.size:
+                anchor_parts[type_name].append(anchor_max)
+            if step_error.size:
+                step_parts[type_name].append(step_error)
+    for type_name in TYPE_IDS:
+        anchor_max = (
+            np.concatenate(anchor_parts[type_name])
+            if anchor_parts[type_name]
+            else np.zeros((0,), dtype=np.float32)
+        )
+        step_error = (
+            np.concatenate(step_parts[type_name])
+            if step_parts[type_name]
+            else np.zeros((0,), dtype=np.float32)
+        )
+        _update_stats_np(merged[type_name], anchor_max, step_error, thresholds, cfg)
+    return merged
 
 
 def _iter_results(
@@ -267,15 +576,20 @@ def _iter_results(
         if progress_interval > 0 and (index == len(files) or index % progress_interval == 0):
             print(f"[round-trip] processed {index}/{len(files)} files", file=sys.stderr, flush=True)
 
+    file_chunks = [files[index : index + chunksize] for index in range(0, len(files), chunksize)]
     if num_workers <= 1:
-        for index, path in enumerate(files, start=1):
-            yield worker(path)
-            maybe_report(index)
+        processed = 0
+        for chunk in file_chunks:
+            yield worker(chunk)
+            processed += len(chunk)
+            maybe_report(processed)
         return
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for index, result in enumerate(executor.map(worker, files, chunksize=chunksize), start=1):
+        processed = 0
+        for result, chunk in zip(executor.map(worker, file_chunks), file_chunks, strict=True):
             yield result
-            maybe_report(index)
+            processed += len(chunk)
+            maybe_report(processed)
 
 
 def _resolve_split_dir(cache_root: Path, split: str) -> Path:
@@ -399,7 +713,7 @@ def analyze_round_trip_distribution(
     progress_interval: int = 1000,
 ) -> dict[str, Any]:
     files = _list_cache_files(cache_root=cache_root, split=split, max_files=max_files)
-    worker = partial(analyze_cache_file, cfg=cfg, thresholds=thresholds)
+    worker = partial(analyze_cache_files, cfg=cfg, thresholds=thresholds)
     raw = _merge_raw_stats(
         _iter_results(
             worker,
@@ -489,8 +803,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split", default="training")
     parser.add_argument("--max-files", type=int, default=None, help="Debug: limit number of cache files.")
-    parser.add_argument("--num-workers", type=int, default=min(8, os.cpu_count() or 1))
-    parser.add_argument("--chunksize", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=_default_num_workers())
+    parser.add_argument("--chunksize", type=int, default=512)
     parser.add_argument("--progress-interval", type=int, default=1000)
     parser.add_argument("--flow-window-steps", type=int, default=20)
     parser.add_argument("--shift", type=int, default=5)
