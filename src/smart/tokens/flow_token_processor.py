@@ -8,12 +8,14 @@ from torch_geometric.data import HeteroData
 
 from src.smart.modules.kinematic_control import (
     CONTROL_FLOW_DIM,
-    DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
+    DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
     DEFAULT_CONTROL_POS_SCALE_M,
     DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
+    DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
     POSE_FLOW_DIM,
     build_rolling_control_target,
     build_rolling_control_target_with_round_trip_error,
+    validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
 )
 from src.smart.tokens.token_processor import TokenProcessor
@@ -38,7 +40,8 @@ class FlowTokenProcessor(TokenProcessor):
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
         control_cyclist_yaw_scale_rad: float | None = None,
-        control_no_slip_point_ratio: float = DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
+        control_vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+        control_cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
         control_round_trip_max_position_error_m: float = DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
     ) -> None:
         super().__init__(
@@ -59,12 +62,13 @@ class FlowTokenProcessor(TokenProcessor):
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
         self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
-        self.control_no_slip_point_ratio = float(control_no_slip_point_ratio)
-        if self.control_no_slip_point_ratio < 0.0:
-            raise ValueError(
-                "control_no_slip_point_ratio must be non-negative, "
-                f"got {self.control_no_slip_point_ratio}."
-            )
+        (
+            self.control_vehicle_no_slip_point_ratio,
+            self.control_cyclist_no_slip_point_ratio,
+        ) = validate_control_no_slip_ratio_config(
+            vehicle_no_slip_point_ratio=control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=control_cyclist_no_slip_point_ratio,
+        )
         if self.use_kinematic_control_flow:
             (
                 self.control_vehicle_yaw_scale_rad,
@@ -615,7 +619,8 @@ class FlowTokenProcessor(TokenProcessor):
                     cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
                     use_holonomic_model_only=self.use_holonomic_model_only,
                     use_rolling_supervision=self.use_rolling_supervision,
-                    no_slip_point_ratio=self.control_no_slip_point_ratio,
+                    vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+                    cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
                 )
             return build_rolling_control_target(
                 future_pos=future_pos,
@@ -630,7 +635,8 @@ class FlowTokenProcessor(TokenProcessor):
                 cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
                 use_holonomic_model_only=self.use_holonomic_model_only,
                 use_rolling_supervision=self.use_rolling_supervision,
-                no_slip_point_ratio=self.control_no_slip_point_ratio,
+                vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+                cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
             )
 
         if return_round_trip_error:

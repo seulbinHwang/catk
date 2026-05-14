@@ -8,7 +8,8 @@ POSE_FLOW_DIM = 4
 CONTROL_FLOW_DIM = 3
 DEFAULT_CONTROL_POS_SCALE_M = 1.0
 DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M = 5.0
-DEFAULT_CONTROL_NO_SLIP_POINT_RATIO = 0.0
+DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO = 0.0
+DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO = 0.0
 POSE_NORM_POS_SCALE_M = 20.0
 
 # repo의 agent encoder와 dataset 전처리가 공유하는 정수 매핑입니다.
@@ -78,6 +79,27 @@ def validate_control_yaw_scale_config(
             raise ValueError(f"{name} must be positive, got {scale}.")
         validated.append(scale)
     return validated[0], validated[1], validated[2]
+
+
+def validate_control_no_slip_ratio_config(
+    *,
+    vehicle_no_slip_point_ratio: float | None,
+    cyclist_no_slip_point_ratio: float | None,
+) -> tuple[float, float]:
+    """vehicle/cyclist별 no-slip point offset ratio를 검증합니다."""
+    ratios = {
+        "control_vehicle_no_slip_point_ratio": vehicle_no_slip_point_ratio,
+        "control_cyclist_no_slip_point_ratio": cyclist_no_slip_point_ratio,
+    }
+    validated = []
+    for name, value in ratios.items():
+        if value is None:
+            raise ValueError(f"{name} must be configured for control-space flow.")
+        ratio = float(value)
+        if ratio < 0.0:
+            raise ValueError(f"{name} must be non-negative, got {ratio}.")
+        validated.append(ratio)
+    return validated[0], validated[1]
 
 
 def resolve_control_yaw_scale(
@@ -160,15 +182,17 @@ def _resolve_no_slip_point_offset(
     agent_type: Tensor,
     agent_length: Tensor | None,
     *,
-    no_slip_point_ratio: float = DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
+    vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
     use_holonomic_model_only: bool = False,
     dtype: torch.dtype | None = None,
     device: torch.device | None = None,
 ) -> Tensor:
     """vehicle/cyclist box center 뒤쪽의 effective no-slip point offset을 고릅니다."""
-    ratio = float(no_slip_point_ratio)
-    if ratio < 0.0:
-        raise ValueError(f"control_no_slip_point_ratio must be non-negative, got {ratio}.")
+    vehicle_ratio, cyclist_ratio = validate_control_no_slip_ratio_config(
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+    )
     if agent_type.ndim != 1:
         raise ValueError(f"agent_type must have shape [N], got {tuple(agent_type.shape)}.")
     if device is None:
@@ -179,15 +203,18 @@ def _resolve_no_slip_point_offset(
     agent_type_device = agent_type.to(device=device)
     _validate_agent_type(agent_type_device)
     offset = torch.zeros(agent_type_device.shape, device=device, dtype=dtype)
-    if ratio == 0.0 or use_holonomic_model_only:
+    if use_holonomic_model_only:
         return offset
 
-    nonholonomic_mask = agent_type_device != PEDESTRIAN_TYPE_ID
-    if not bool(nonholonomic_mask.any().item()):
+    ratio_by_agent = torch.zeros(agent_type_device.shape, device=device, dtype=dtype)
+    ratio_by_agent[agent_type_device == VEHICLE_TYPE_ID] = vehicle_ratio
+    ratio_by_agent[agent_type_device == CYCLIST_TYPE_ID] = cyclist_ratio
+    ratio_mask = ratio_by_agent > 0.0
+    if not bool(ratio_mask.any().item()):
         return offset
     if agent_length is None:
         raise ValueError(
-            "agent_length is required when control_no_slip_point_ratio > 0 for "
+            "agent_length is required when vehicle/cyclist no-slip point ratio > 0 for "
             "vehicle/cyclist control-space decoding."
         )
     if tuple(agent_length.shape) != tuple(agent_type.shape):
@@ -196,9 +223,9 @@ def _resolve_no_slip_point_offset(
             f"got {tuple(agent_length.shape)} and {tuple(agent_type.shape)}."
         )
     length = agent_length.to(device=device, dtype=dtype)
-    if bool((length[nonholonomic_mask] < 0.0).any().item()):
+    if bool((length[ratio_mask] < 0.0).any().item()):
         raise ValueError("agent_length must be non-negative for vehicle/cyclist agents.")
-    offset[nonholonomic_mask] = ratio * length[nonholonomic_mask]
+    offset[ratio_mask] = ratio_by_agent[ratio_mask] * length[ratio_mask]
     return offset
 
 
@@ -293,7 +320,8 @@ def decode_control_sequence(
     current_head: Tensor | None = None,
     *,
     use_holonomic_model_only: bool = False,
-    no_slip_point_ratio: float = DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
+    vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
 ) -> tuple[Tensor, Tensor]:
     """제어 시퀀스를 pose 시퀀스로 바꿉니다.
 
@@ -303,7 +331,7 @@ def decode_control_sequence(
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
             ``VEHICLE_TYPE_ID``, ``PEDESTRIAN_TYPE_ID``, ``CYCLIST_TYPE_ID`` 안에 있어야 합니다.
         agent_length: WOMD box length입니다. shape은 ``[N]`` 입니다.
-            ``no_slip_point_ratio > 0`` 일 때 vehicle/cyclist no-slip point offset에 씁니다.
+            vehicle/cyclist no-slip point offset ratio가 0보다 클 때 씁니다.
         current_pos: 시작 위치입니다. shape은 ``[N, 2]`` 입니다.
             값이 없으면 원점에서 시작합니다.
         current_head: 시작 방향입니다. shape은 ``[N]`` 입니다.
@@ -311,8 +339,10 @@ def decode_control_sequence(
         use_holonomic_model_only: ``True`` 이면 vehicle/cyclist도 pedestrian과 같은
             holonomic decoder를 사용합니다. ``False`` 이면 기존처럼 vehicle/cyclist는
             non-holonomic decoder를 사용합니다.
-        no_slip_point_ratio: vehicle/cyclist box length에 곱해 no-slip point가 box center
-            뒤쪽으로 얼마나 떨어져 있는지 정합니다. 기본값 0은 기존 box-center rule입니다.
+        vehicle_no_slip_point_ratio: vehicle box length에 곱해 no-slip point가 box center
+            뒤쪽으로 얼마나 떨어져 있는지 정합니다.
+        cyclist_no_slip_point_ratio: cyclist box length에 곱해 no-slip point가 box center
+            뒤쪽으로 얼마나 떨어져 있는지 정합니다.
 
     Returns:
         tuple[Tensor, Tensor]:
@@ -346,7 +376,8 @@ def decode_control_sequence(
     no_slip_offset = _resolve_no_slip_point_offset(
         agent_type=agent_type,
         agent_length=agent_length,
-        no_slip_point_ratio=no_slip_point_ratio,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
         use_holonomic_model_only=use_holonomic_model_only,
         dtype=dtype,
         device=device,
@@ -377,7 +408,7 @@ def decode_control_sequence(
             [arc_scale * mid_head.cos(), arc_scale * mid_head.sin()],
             dim=-1,
         )
-        if no_slip_point_ratio != 0.0:
+        if bool((no_slip_offset != 0.0).any().item()):
             current_heading_vec = torch.stack([cos_head, sin_head], dim=-1)
             next_heading_vec = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
             delta_pos_nonhol = delta_pos_nonhol + no_slip_offset.unsqueeze(-1) * (
@@ -409,7 +440,8 @@ def control_norm_to_pose_norm(
     cyclist_yaw_scale_rad: float,
     pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
     use_holonomic_model_only: bool = False,
-    no_slip_point_ratio: float = DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
+    vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
 ) -> Tensor:
     """정규화된 제어 시퀀스를 기존 pose-space 표현으로 바꿉니다.
 
@@ -418,14 +450,15 @@ def control_norm_to_pose_norm(
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
             yaw 역정규화는 agent type별 scale을 사용합니다.
         agent_length: WOMD box length입니다. shape은 ``[N]`` 입니다.
-            ``no_slip_point_ratio > 0`` 일 때 vehicle/cyclist no-slip point offset에 씁니다.
+            vehicle/cyclist no-slip point offset ratio가 0보다 클 때 씁니다.
         pos_scale_m: 이동량 정규화에 쓴 meter 단위 값입니다.
         vehicle_yaw_scale_rad: vehicle yaw를 복원할 radian 단위 값입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw를 복원할 radian 단위 값입니다.
         cyclist_yaw_scale_rad: cyclist yaw를 복원할 radian 단위 값입니다.
         pose_pos_scale_m: 기존 pose-space Flow 표현의 위치 정규화 meter 값입니다.
         use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic decoder를 씁니다.
-        no_slip_point_ratio: vehicle/cyclist box length에 곱하는 no-slip point offset 비율입니다.
+        vehicle_no_slip_point_ratio: vehicle box length에 곱하는 no-slip point offset 비율입니다.
+        cyclist_no_slip_point_ratio: cyclist box length에 곱하는 no-slip point offset 비율입니다.
 
     Returns:
         Tensor: 기존 Flow Matching 평가/추론 경로가 쓰는 pose 표현입니다.
@@ -445,7 +478,8 @@ def control_norm_to_pose_norm(
         agent_type=agent_type,
         agent_length=agent_length,
         use_holonomic_model_only=use_holonomic_model_only,
-        no_slip_point_ratio=no_slip_point_ratio,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )
     return torch.stack(
         [
@@ -472,7 +506,8 @@ def build_rolling_control_target(
     cyclist_yaw_scale_rad: float,
     use_holonomic_model_only: bool = False,
     use_rolling_supervision: bool = True,
-    no_slip_point_ratio: float = DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
+    vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
 ) -> Tensor:
     """GT pose를 control label로 바꿉니다.
 
@@ -483,7 +518,7 @@ def build_rolling_control_target(
         current_head: anchor 현재 방향입니다. shape은 ``[N]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
         agent_length: WOMD box length입니다. shape은 ``[N]`` 입니다.
-            ``no_slip_point_ratio > 0`` 일 때 vehicle/cyclist no-slip point offset에 씁니다.
+            vehicle/cyclist no-slip point offset ratio가 0보다 클 때 씁니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
@@ -494,8 +529,10 @@ def build_rolling_control_target(
             사용합니다. ``False`` 이면 각 step의 raw GT pose pair만으로 inverse control을
             만듭니다. ``use_holonomic_model_only=True`` 에서는 두 방식이 같은 target을
             만듭니다.
-        no_slip_point_ratio: vehicle/cyclist box length에 곱해 no-slip point가 box center
-            뒤쪽으로 얼마나 떨어져 있는지 정합니다. 기본값 0은 기존 box-center rule입니다.
+        vehicle_no_slip_point_ratio: vehicle box length에 곱해 no-slip point가 box center
+            뒤쪽으로 얼마나 떨어져 있는지 정합니다.
+        cyclist_no_slip_point_ratio: cyclist box length에 곱해 no-slip point가 box center
+            뒤쪽으로 얼마나 떨어져 있는지 정합니다.
 
     Returns:
         Tensor: 정규화된 rolling control label입니다. shape은 ``[N, T, 3]`` 입니다.
@@ -524,7 +561,8 @@ def build_rolling_control_target(
     no_slip_offset = _resolve_no_slip_point_offset(
         agent_type=agent_type,
         agent_length=agent_length,
-        no_slip_point_ratio=no_slip_point_ratio,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
         use_holonomic_model_only=use_holonomic_model_only,
         dtype=future_pos.dtype,
         device=future_pos.device,
@@ -607,7 +645,8 @@ def build_rolling_control_target_with_round_trip_error(
     cyclist_yaw_scale_rad: float,
     use_holonomic_model_only: bool = False,
     use_rolling_supervision: bool = True,
-    no_slip_point_ratio: float = DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
+    vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
 ) -> tuple[Tensor, Tensor]:
     """GT pose를 control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
 
@@ -618,7 +657,7 @@ def build_rolling_control_target_with_round_trip_error(
         current_head: anchor 현재 방향입니다. shape은 ``[N]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
         agent_length: WOMD box length입니다. shape은 ``[N]`` 입니다.
-            ``no_slip_point_ratio > 0`` 일 때 vehicle/cyclist no-slip point offset에 씁니다.
+            vehicle/cyclist no-slip point offset ratio가 0보다 클 때 씁니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
@@ -626,7 +665,8 @@ def build_rolling_control_target_with_round_trip_error(
         use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic inverse/decoder를 씁니다.
         use_rolling_supervision: ``True`` 이면 decoder-consistent rolling supervision을
             사용하고, ``False`` 이면 raw GT pose pair inverse를 사용합니다.
-        no_slip_point_ratio: vehicle/cyclist box length에 곱하는 no-slip point offset 비율입니다.
+        vehicle_no_slip_point_ratio: vehicle box length에 곱하는 no-slip point offset 비율입니다.
+        cyclist_no_slip_point_ratio: cyclist box length에 곱하는 no-slip point offset 비율입니다.
 
     Returns:
         tuple[Tensor, Tensor]:
@@ -646,7 +686,8 @@ def build_rolling_control_target_with_round_trip_error(
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
         use_holonomic_model_only=use_holonomic_model_only,
         use_rolling_supervision=use_rolling_supervision,
-        no_slip_point_ratio=no_slip_point_ratio,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )
     control = denormalize_control(
         control_norm=control_norm,
@@ -663,7 +704,8 @@ def build_rolling_control_target_with_round_trip_error(
         current_pos=current_pos,
         current_head=current_head,
         use_holonomic_model_only=use_holonomic_model_only,
-        no_slip_point_ratio=no_slip_point_ratio,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )
     round_trip_error_m = torch.linalg.vector_norm(decoded_pos - future_pos, dim=-1)
     return control_norm, round_trip_error_m

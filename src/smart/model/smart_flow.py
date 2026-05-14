@@ -65,7 +65,8 @@ _TOKEN_PROCESSOR_DECODER_SHARED_KEYS = (
     "use_holonomic_model_only",
     "use_rolling_supervision",
     "control_pos_scale_m",
-    "control_no_slip_point_ratio",
+    "control_vehicle_no_slip_point_ratio",
+    "control_cyclist_no_slip_point_ratio",
     "control_vehicle_yaw_scale_rad",
     "control_pedestrian_yaw_scale_rad",
     "control_cyclist_yaw_scale_rad",
@@ -2007,7 +2008,8 @@ class SMARTFlow(LightningModule):
                 cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
                 use_holonomic_model_only=self.encoder.agent_encoder.use_holonomic_model_only,
                 use_rolling_supervision=self.encoder.agent_encoder.use_rolling_supervision,
-                no_slip_point_ratio=self.encoder.agent_encoder.control_no_slip_point_ratio,
+                vehicle_no_slip_point_ratio=self.encoder.agent_encoder.control_vehicle_no_slip_point_ratio,
+                cyclist_no_slip_point_ratio=self.encoder.agent_encoder.control_cyclist_no_slip_point_ratio,
             )
         return packed_path_norm, anchor_mask
 

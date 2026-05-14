@@ -489,7 +489,7 @@ torchrun ... -m src.run \
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
 - `model.model_config.token_processor.use_holonomic_model_only=true`를 켜면 ablation용으로 vehicle / cyclist에도 pedestrian과 같은 holonomic decoder를 적용합니다. 이때 vehicle / cyclist의 `delta_n`도 학습 target과 rollout 복원에 사용됩니다. 기본값 `false`는 기존 agent-type-aware non-holonomic/holonomic 혼합 방식입니다.
 - `model.model_config.token_processor.use_rolling_supervision=true`가 기본값이며, label 생성은 decoder-consistent rolling projection 방식입니다. 매 step마다 raw GT 현재 pose가 아니라 직전 control을 kinematic decoder에 통과시킨 pose를 다음 inverse의 현재 pose로 씁니다. `false`로 두면 각 step의 raw GT pose pair만으로 inverse control label을 만듭니다. `use_holonomic_model_only=true`일 때는 holonomic decoder가 raw GT를 정확히 따라가므로 `use_rolling_supervision` 값에 따른 target 차이가 없습니다.
-- `model.model_config.token_processor.control_no_slip_point_ratio`는 vehicle / cyclist의 non-holonomic 제약을 box center가 아니라 box center 뒤쪽의 effective no-slip point에 적용하는 ablation knob입니다. offset은 `ratio * WOMD box length`이고, 최종 metric/rollout pose는 여전히 box center로 복원됩니다. 기본값 `0.0`은 기존 box-center midpoint arc rule과 정확히 같은 동작입니다. pedestrian과 `use_holonomic_model_only=true` 경로에서는 이 값이 적용되지 않습니다. 학습 target 생성과 decoder rollout은 이 token processor 값을 단일 기준으로 공유하므로, decoder 쪽 동일 key만 따로 다르게 override하면 실행 초기에 에러를 냅니다.
+- `model.model_config.token_processor.control_vehicle_no_slip_point_ratio`와 `model.model_config.token_processor.control_cyclist_no_slip_point_ratio`는 vehicle / cyclist의 non-holonomic 제약을 box center가 아니라 box center 뒤쪽의 effective no-slip point에 적용합니다. offset은 각 agent type별로 `ratio * WOMD box length`이며, 최종 metric/rollout pose는 여전히 box center로 복원됩니다. 기본값은 전체 SMART cache training split에서 추정한 `vehicle=0.2289518863`, `cyclist=0.0495847873`입니다. 이 값으로 validation residual median은 vehicle `0.0958m -> 0.0203m`, cyclist `0.0222m -> 0.0213m`로 줄었습니다. 두 값을 모두 `0.0`으로 두면 기존 box-center midpoint arc rule과 같은 동작입니다. pedestrian과 `use_holonomic_model_only=true` 경로에서는 이 값이 적용되지 않습니다. 학습 target 생성과 decoder rollout은 이 token processor 값을 단일 기준으로 공유하므로, decoder 쪽 동일 key만 따로 다르게 override하면 실행 초기에 에러를 냅니다.
 - 실제 cache에서 no-slip point ratio를 추정하려면 아래 도구를 씁니다. `CACHE_ROOT`는 README의 cache 생성 절차에서 쓰는 동일한 경로이며, fitting은 training split만 사용하고 validation split은 residual 개선율 확인에만 사용합니다.
 
 ```bash
@@ -501,7 +501,7 @@ python tools/estimate_control_no_slip_rho.py \
   --output-json outputs/control_no_slip_rho.json
 ```
 
-  이 도구는 vehicle / cyclist를 분리해서 0.5초 sliding segment를 만들고, agent별 bounded weighted median을 먼저 구한 뒤 type별 capped weighted median으로 `rho_vehicle`, `rho_cyclist` 후보를 출력합니다. segment filter는 `|p[t+5]-p[t]| >= 0.25m`, `|2L sin(delta_yaw/2)| >= 0.10m` 두 개만 씁니다. 출력의 `residual` 항목은 `before = b`, `after = b - rho * c`의 validation median absolute residual과 개선율입니다. validation 개선율이 양수인지 먼저 확인한 뒤 실험 config에 반영하세요.
+  이 도구는 vehicle / cyclist를 분리해서 0.5초 sliding segment를 만들고, agent별 bounded weighted median을 먼저 구한 뒤 type별 capped weighted median으로 `rho_vehicle`, `rho_cyclist` 후보를 출력합니다. segment filter는 `|p[t+5]-p[t]| >= 0.25m`, `|2L sin(delta_yaw/2)| >= 0.10m` 두 개만 씁니다. 전체 SMART cache에서 `training 486,995`개 파일로 fitting하고 `validation 44,097`개 파일로 residual을 확인한 기본 후보는 `rho_vehicle=0.2289518863`, `rho_cyclist=0.0495847873`입니다. 출력의 `residual` 항목은 `before = b`, `after = b - rho * c`의 validation median absolute residual과 개선율입니다. validation 개선율이 양수인지 먼저 확인한 뒤 실험 config에 반영하세요.
 - control-space 정규화는 위치 이동량에는 공통 `control_pos_scale_m=1.0`을 쓰고, yaw에는 config로 관리되는 agent type별 scale을 씁니다. 기본 preset은 `control_vehicle_yaw_scale_rad=0.025`, `control_cyclist_yaw_scale_rad=0.06`, `control_pedestrian_yaw_scale_rad=0.20`입니다. control-space target 생성과 복원 경로에는 항상 `agent_type`이 필요합니다. metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
 - control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `5.0m`이며, 평가 경로에는 적용하지 않습니다.
 - `control_round_trip_max_position_error_m` 값을 데이터 분포에서 고르려면 training cache에 대해 아래 분석 도구를 먼저 돌립니다. 이 값은 anchor별로 “loss에 실제 들어가는 미래 step들의 GT -> control -> pose 복원 위치 오차 중 최대값”을 기준으로 집계하므로, 학습 필터가 보는 값과 같은 의미입니다.
@@ -516,7 +516,7 @@ python tools/analyze_control_round_trip_error.py \
   --output-json outputs/control_round_trip_training.json
 ```
 
-  prefix-valid 실험이면 `--use-prefix-valid-future-loss-mask`를 같이 켜고, `use_holonomic_model_only`, `use_rolling_supervision`, `control_no_slip_point_ratio`를 바꾼 실험이면 도구에도 같은 옵션을 넘겨야 합니다. 출력은 전체/vehicle/pedestrian/cyclist별 anchor max error percentile, step error percentile, threshold별 anchor 제거율을 포함합니다. 기본 추천값은 전체 anchor max error의 p99.5를 `0.25m` 단위로 올림한 값입니다. 실전적으로는 이 추천값과 threshold table을 함께 보고, 정상적인 대다수 anchor를 유지하면서 명백한 non-holonomic projection outlier만 제거하는 값을 고릅니다.
+  prefix-valid 실험이면 `--use-prefix-valid-future-loss-mask`를 같이 켜고, `use_holonomic_model_only`, `use_rolling_supervision`, `control_vehicle_no_slip_point_ratio`, `control_cyclist_no_slip_point_ratio`를 바꾼 실험이면 도구에도 같은 옵션을 넘겨야 합니다. 출력은 전체/vehicle/pedestrian/cyclist별 anchor max error percentile, step error percentile, threshold별 anchor 제거율을 포함합니다. 기본 추천값은 전체 anchor max error의 p99.5를 `0.25m` 단위로 올림한 값입니다. 실전적으로는 이 추천값과 threshold table을 함께 보고, 정상적인 대다수 anchor를 유지하면서 명백한 non-holonomic projection outlier만 제거하는 값을 고릅니다.
 - 추가 trajectory loss, x0 loss, open-loop auxiliary loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
 - validation / rollout / metric 경로에서는 control 예측을 기존 pose-space 표현으로 복원해 기존 open-loop metric과 closed-loop rollout을 그대로 계산합니다.
 
@@ -541,6 +541,8 @@ model:
       use_rolling_supervision: true
       use_prefix_valid_future_loss_mask: false
       control_pos_scale_m: 1.0
+      control_vehicle_no_slip_point_ratio: 0.2289518863
+      control_cyclist_no_slip_point_ratio: 0.0495847873
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20
       control_cyclist_yaw_scale_rad: 0.06

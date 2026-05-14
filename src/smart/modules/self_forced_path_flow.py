@@ -139,7 +139,8 @@ def build_anchor0_normalized_committed_control(
     cyclist_yaw_scale_rad: float,
     use_holonomic_model_only: bool = False,
     use_rolling_supervision: bool = True,
-    no_slip_point_ratio: float = 0.0,
+    vehicle_no_slip_point_ratio: float = 0.0,
+    cyclist_no_slip_point_ratio: float = 0.0,
     pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
 ) -> Tensor:
     """첫 anchor 기준 pose rollout을 control-space self-forced flow state로 바꿉니다.
@@ -157,7 +158,8 @@ def build_anchor0_normalized_committed_control(
             projection을 씁니다.
         use_rolling_supervision: ``True`` 이면 decoder-consistent rolling projection을
             사용하고, ``False`` 이면 raw pose pair inverse를 사용합니다.
-        no_slip_point_ratio: vehicle/cyclist box length에 곱하는 no-slip point offset 비율입니다.
+        vehicle_no_slip_point_ratio: vehicle box length에 곱하는 no-slip point offset 비율입니다.
+        cyclist_no_slip_point_ratio: cyclist box length에 곱하는 no-slip point offset 비율입니다.
         pose_pos_scale_m: pose-space 위치 정규화 scale입니다.
 
     Returns:
@@ -171,9 +173,12 @@ def build_anchor0_normalized_committed_control(
         )
     if "type" not in tokenized_agent:
         raise KeyError("tokenized_agent must contain type for control-space self-forced loss.")
-    if no_slip_point_ratio > 0.0 and "shape" not in tokenized_agent:
+    if (
+        (vehicle_no_slip_point_ratio > 0.0 or cyclist_no_slip_point_ratio > 0.0)
+        and "shape" not in tokenized_agent
+    ):
         raise KeyError(
-            "tokenized_agent must contain shape when no_slip_point_ratio > 0 "
+            "tokenized_agent must contain shape when vehicle/cyclist no-slip point ratio > 0 "
             "for control-space self-forced loss."
         )
     if anchor_mask.ndim != 1:
@@ -210,5 +215,6 @@ def build_anchor0_normalized_committed_control(
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
         use_holonomic_model_only=use_holonomic_model_only,
         use_rolling_supervision=use_rolling_supervision,
-        no_slip_point_ratio=no_slip_point_ratio,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )

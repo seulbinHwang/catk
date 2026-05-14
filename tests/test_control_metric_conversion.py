@@ -51,7 +51,8 @@ def _make_control_processor() -> FlowTokenProcessor:
     processor.control_vehicle_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_vehicle_yaw_scale_rad"]
     processor.control_pedestrian_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_pedestrian_yaw_scale_rad"]
     processor.control_cyclist_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_cyclist_yaw_scale_rad"]
-    processor.control_no_slip_point_ratio = 0.0
+    processor.control_vehicle_no_slip_point_ratio = 0.0
+    processor.control_cyclist_no_slip_point_ratio = 0.0
     return processor
 
 
@@ -84,7 +85,8 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
         vehicle_yaw_scale_rad=processor.control_vehicle_yaw_scale_rad,
         pedestrian_yaw_scale_rad=processor.control_pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=processor.control_cyclist_yaw_scale_rad,
-        no_slip_point_ratio=processor.control_no_slip_point_ratio,
+        vehicle_no_slip_point_ratio=processor.control_vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=processor.control_cyclist_no_slip_point_ratio,
     )
     raw_metric_target = processor._build_anchor_clean_norm(
         pos=pos,
@@ -135,7 +137,8 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
     decoder.control_vehicle_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_vehicle_yaw_scale_rad"]
     decoder.control_pedestrian_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_pedestrian_yaw_scale_rad"]
     decoder.control_cyclist_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_cyclist_yaw_scale_rad"]
-    decoder.control_no_slip_point_ratio = 0.0
+    decoder.control_vehicle_no_slip_point_ratio = 0.0
+    decoder.control_cyclist_no_slip_point_ratio = 0.0
     decoder.flow_ode = _DummyFlowODE()
     decoder.flow_decoder = lambda hidden, x_t, tau, future_valid_mask=None: x_t
     decoder.build_anchor_context = lambda **kwargs: {

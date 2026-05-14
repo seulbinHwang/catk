@@ -34,7 +34,8 @@ class AnalysisConfig:
     control_vehicle_yaw_scale_rad: float = 0.025
     control_pedestrian_yaw_scale_rad: float = 0.20
     control_cyclist_yaw_scale_rad: float = 0.06
-    control_no_slip_point_ratio: float = 0.0
+    control_vehicle_no_slip_point_ratio: float = 0.2289518863
+    control_cyclist_no_slip_point_ratio: float = 0.0495847873
     use_holonomic_model_only: bool = False
     use_rolling_supervision: bool = True
     hist_max_error_m: float = 20.0
@@ -227,7 +228,8 @@ def analyze_cache_file(path: Path, cfg: AnalysisConfig, thresholds: np.ndarray) 
             cyclist_yaw_scale_rad=cfg.control_cyclist_yaw_scale_rad,
             use_holonomic_model_only=cfg.use_holonomic_model_only,
             use_rolling_supervision=cfg.use_rolling_supervision,
-            no_slip_point_ratio=cfg.control_no_slip_point_ratio,
+            vehicle_no_slip_point_ratio=cfg.control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=cfg.control_cyclist_no_slip_point_ratio,
         )
         masked_error = torch.where(
             selected_loss_mask,
@@ -499,7 +501,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-vehicle-yaw-scale-rad", type=float, default=0.025)
     parser.add_argument("--control-pedestrian-yaw-scale-rad", type=float, default=0.20)
     parser.add_argument("--control-cyclist-yaw-scale-rad", type=float, default=0.06)
-    parser.add_argument("--control-no-slip-point-ratio", type=float, default=0.0)
+    parser.add_argument("--control-vehicle-no-slip-point-ratio", type=float, default=0.2289518863)
+    parser.add_argument("--control-cyclist-no-slip-point-ratio", type=float, default=0.0495847873)
     parser.add_argument("--use-holonomic-model-only", action="store_true")
     parser.add_argument("--no-use-rolling-supervision", dest="use_rolling_supervision", action="store_false")
     parser.set_defaults(use_rolling_supervision=True)
@@ -526,7 +529,8 @@ def main() -> None:
         control_vehicle_yaw_scale_rad=args.control_vehicle_yaw_scale_rad,
         control_pedestrian_yaw_scale_rad=args.control_pedestrian_yaw_scale_rad,
         control_cyclist_yaw_scale_rad=args.control_cyclist_yaw_scale_rad,
-        control_no_slip_point_ratio=args.control_no_slip_point_ratio,
+        control_vehicle_no_slip_point_ratio=args.control_vehicle_no_slip_point_ratio,
+        control_cyclist_no_slip_point_ratio=args.control_cyclist_no_slip_point_ratio,
         use_holonomic_model_only=bool(args.use_holonomic_model_only),
         use_rolling_supervision=bool(args.use_rolling_supervision),
         hist_max_error_m=args.hist_max_error_m,

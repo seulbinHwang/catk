@@ -41,7 +41,8 @@ def _synthetic_agent_record(
         agent_length=length,
         current_pos=current_pos,
         current_head=current_head,
-        no_slip_point_ratio=rho,
+        vehicle_no_slip_point_ratio=rho,
+        cyclist_no_slip_point_ratio=rho,
     )
 
     position = torch.zeros((num_agent, step_count + 1, 3), dtype=torch.float32)

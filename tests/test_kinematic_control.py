@@ -92,7 +92,7 @@ def test_vehicle_no_slip_point_ratio_zero_preserves_box_center_rule() -> None:
         agent_length=torch.tensor([4.5]),
         current_pos=current_pos,
         current_head=current_head,
-        no_slip_point_ratio=0.0,
+        vehicle_no_slip_point_ratio=0.0,
     )
 
     torch.testing.assert_close(ratio_zero_pos, old_pos)
@@ -113,7 +113,7 @@ def test_vehicle_no_slip_point_ratio_adds_box_center_rotation_offset() -> None:
         agent_length=agent_length,
         current_pos=current_pos,
         current_head=current_head,
-        no_slip_point_ratio=0.5,
+        vehicle_no_slip_point_ratio=0.5,
     )
 
     delta_head = control[:, 0, 2]
@@ -132,6 +132,29 @@ def test_vehicle_no_slip_point_ratio_adds_box_center_rotation_offset() -> None:
     torch.testing.assert_close(decoded_head[:, 0], torch.tensor([math.pi / 2.0]), atol=1.0e-5, rtol=1.0e-5)
 
 
+def test_vehicle_and_cyclist_no_slip_point_ratios_are_type_specific() -> None:
+    current_pos = torch.zeros((2, 2))
+    current_head = torch.zeros(2)
+    agent_type = torch.tensor([VEHICLE_TYPE_ID, CYCLIST_TYPE_ID])
+    agent_length = torch.tensor([4.0, 2.0])
+    control = torch.zeros((2, 1, 3))
+    control[:, 0, 2] = math.pi / 2.0
+
+    decoded_pos, _ = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        current_pos=current_pos,
+        current_head=current_head,
+        vehicle_no_slip_point_ratio=0.25,
+        cyclist_no_slip_point_ratio=0.10,
+    )
+
+    expected_offset = torch.tensor([1.0, 0.2])
+    expected_pos = torch.stack([-expected_offset, expected_offset], dim=-1)
+    torch.testing.assert_close(decoded_pos[:, 0], expected_pos, atol=1.0e-5, rtol=1.0e-5)
+
+
 def test_vehicle_no_slip_point_rolling_label_round_trips_with_same_transition() -> None:
     current_pos = torch.tensor([[2.0, -1.0]])
     current_head = torch.tensor([0.3])
@@ -145,7 +168,7 @@ def test_vehicle_no_slip_point_rolling_label_round_trips_with_same_transition() 
         agent_length=agent_length,
         current_pos=current_pos,
         current_head=current_head,
-        no_slip_point_ratio=0.5,
+        vehicle_no_slip_point_ratio=0.5,
     )
     control_norm = build_rolling_control_target(
         future_pos=future_pos,
@@ -154,7 +177,7 @@ def test_vehicle_no_slip_point_rolling_label_round_trips_with_same_transition() 
         current_head=current_head,
         agent_type=agent_type,
         agent_length=agent_length,
-        no_slip_point_ratio=0.5,
+        vehicle_no_slip_point_ratio=0.5,
         **CONTROL_YAW_SCALE_KWARGS,
     )
     rebuilt_control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
@@ -164,7 +187,7 @@ def test_vehicle_no_slip_point_rolling_label_round_trips_with_same_transition() 
         agent_length=agent_length,
         current_pos=current_pos,
         current_head=current_head,
-        no_slip_point_ratio=0.5,
+        vehicle_no_slip_point_ratio=0.5,
     )
 
     torch.testing.assert_close(rebuilt_control, original_control, atol=1.0e-5, rtol=1.0e-5)
@@ -177,7 +200,7 @@ def test_vehicle_no_slip_point_ratio_requires_agent_length() -> None:
         decode_control_sequence(
             control=torch.zeros((1, 1, 3)),
             agent_type=torch.tensor([VEHICLE_TYPE_ID]),
-            no_slip_point_ratio=0.5,
+            vehicle_no_slip_point_ratio=0.5,
         )
 
 

@@ -72,12 +72,15 @@ def test_analyze_cache_file_zero_for_decoder_consistent_trajectory(tmp_path) -> 
     control = torch.zeros((1, 20, 3), dtype=torch.float32)
     control[..., 0] = 0.7
     control[..., 2] = 0.04
+    cfg = AnalysisConfig(flow_window_steps=20, raw_start=10, raw_end=10)
     future_pos, future_head = decode_control_sequence(
         control=control,
         agent_type=agent_type,
         agent_length=agent_length,
         current_pos=current_pos,
         current_head=current_head,
+        vehicle_no_slip_point_ratio=cfg.control_vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cfg.control_cyclist_no_slip_point_ratio,
     )
 
     position = torch.zeros((1, 91, 3), dtype=torch.float32)
@@ -92,7 +95,6 @@ def test_analyze_cache_file_zero_for_decoder_consistent_trajectory(tmp_path) -> 
     path = tmp_path / "consistent.pkl"
     _write_cache(path, position=position, heading=heading, valid=valid)
 
-    cfg = AnalysisConfig(flow_window_steps=20, raw_start=10, raw_end=10)
     stats = analyze_cache_file(path, cfg, thresholds=np.array([0.001, 0.01]))
 
     assert stats["all"]["anchor_count"] == 1

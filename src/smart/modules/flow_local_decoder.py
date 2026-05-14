@@ -23,6 +23,7 @@ from src.smart.utils import (
 from src.smart.modules.dynamic_limits import DEFAULT_LIMITS
 from src.smart.modules.kinematic_control import (
     control_norm_to_pose_norm,
+    validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
 )
 
@@ -810,7 +811,8 @@ class ContinuousCommitBridge:
         use_kinematic_control_flow: bool = False,
         use_holonomic_model_only: bool = False,
         control_pos_scale_m: float = 1.0,
-        control_no_slip_point_ratio: float = 0.0,
+        control_vehicle_no_slip_point_ratio: float = 0.0,
+        control_cyclist_no_slip_point_ratio: float = 0.0,
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
         control_cyclist_yaw_scale_rad: float | None = None,
@@ -822,12 +824,13 @@ class ContinuousCommitBridge:
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.use_holonomic_model_only = bool(use_holonomic_model_only)
         self.control_pos_scale_m = float(control_pos_scale_m)
-        self.control_no_slip_point_ratio = float(control_no_slip_point_ratio)
-        if self.control_no_slip_point_ratio < 0.0:
-            raise ValueError(
-                "control_no_slip_point_ratio must be non-negative, "
-                f"got {self.control_no_slip_point_ratio}."
-            )
+        (
+            self.control_vehicle_no_slip_point_ratio,
+            self.control_cyclist_no_slip_point_ratio,
+        ) = validate_control_no_slip_ratio_config(
+            vehicle_no_slip_point_ratio=control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=control_cyclist_no_slip_point_ratio,
+        )
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
         self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
@@ -894,7 +897,8 @@ class ContinuousCommitBridge:
                 pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                 cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
                 use_holonomic_model_only=self.use_holonomic_model_only,
-                no_slip_point_ratio=self.control_no_slip_point_ratio,
+                vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+                cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
             )
         first_chunk = y_hat_norm[:, : self.commit_steps].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m
