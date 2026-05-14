@@ -1140,7 +1140,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         max_steps: int | None = None,
         strict_active_mask: bool = True,
         sampling_seed: int | None = None,
-        gen_batch_chunk: int = 16384,
+        gen_batch_chunk: int = 8192,
     ) -> Dict[str, object]:
         """RoaD expert-guided closed-loop rollout (데이터 수집, 항상 no_grad).
 
@@ -1308,9 +1308,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
                 # ── K 후보 i.i.d. 샘플 ───────────────────────────────────────
                 # n_active*K 를 한 번에 flow_ode.generate 하면 step_refiner 의
-                # scaled_dot_product_attention CUDA 커널이 batch grid 한계(~65535)를
-                # 넘어 "invalid configuration argument" 로 죽는다. gen_batch_chunk
-                # 행 단위로 쪼개서 생성 후 concat (전부 no_grad 라 반복 비용 작음).
+                # scaled_dot_product_attention 이 보는 batch dim = (rows × num_chunks=4)
+                # 가 CUDA grid 한계 65535 를 넘어 "invalid configuration argument" 로
+                # 죽는다 (rows=16384 → 16384×4=65536, 1 초과).  gen_batch_chunk 행
+                # 단위로 쪼개 생성 후 concat (전부 no_grad 라 반복 비용 작음).
+                # 기본 8192 → SDPA batch 32768 로 안전 마진 확보.
                 hidden_rep = active_hidden.repeat_interleave(K, dim=0)   # [n_active*K, D]
                 x_init = torch.randn(
                     n_active * K, sample_window_steps, 4,
