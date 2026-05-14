@@ -9,6 +9,8 @@
 # Default behavior:
 #   * first attempt: data.train_batch_size=26
 #   * on CUDA OOM: reduce batch by 2 and resume from the latest epoch_last.ckpt
+#   * on retryable external exits such as SIGTERM/SIGABRT: keep the batch size
+#     and resume from the latest epoch_last.ckpt
 #   * stop at MIN_BS=20 unless overridden
 
 set -uo pipefail
@@ -35,6 +37,8 @@ INITIAL_BS="${INITIAL_BS:-26}"
 OOM_STEP="${OOM_STEP:-2}"
 MIN_BS="${MIN_BS:-20}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
+RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-134,143}"
+MAX_NON_OOM_RETRIES="${MAX_NON_OOM_RETRIES:-3}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
@@ -73,6 +77,25 @@ remote_tmux_log_for_pod() {
 
 remote_master_tmux_log() {
   remote_tmux_log_for_pod "$MASTER_POD"
+}
+
+remote_status_file_for_pod() {
+  local pod="$1"
+  printf '%s/%s.torchrun_status' "$(remote_run_root)" "$pod"
+}
+
+is_retryable_non_oom_exit() {
+  local status="$1"
+  local code
+  local -a retry_codes
+  IFS=',' read -r -a retry_codes <<< "$RETRY_NON_OOM_EXIT_CODES"
+  for code in "${retry_codes[@]}"; do
+    code="${code//[[:space:]]/}"
+    if [[ -n "$code" && "$status" == "$code" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 find_latest_epoch_last_ckpt() {
@@ -146,10 +169,13 @@ start_attempt() {
 }
 
 wait_for_attempt_exit() {
-  local remote_log remote_log_q grep_cmd status_line oom_pod
+  local remote_log remote_log_q grep_cmd status_line oom_pod status_file status_file_q status_cmd
   remote_log="$(remote_master_tmux_log)"
   remote_log_q="$(remote_quote "$remote_log")"
   grep_cmd="grep -E '\\[tmux-run\\] exited with status [0-9]+' ${remote_log_q} 2>/dev/null | tail -1"
+  status_file="$(remote_status_file_for_pod "$MASTER_POD")"
+  status_file_q="$(remote_quote "$status_file")"
+  status_cmd="cat ${status_file_q} 2>/dev/null | tail -1"
 
   while true; do
     if oom_pod="$(find_remote_oom_pod)"; then
@@ -166,6 +192,15 @@ wait_for_attempt_exit() {
     if [[ "$status_line" =~ exited\ with\ status\ ([0-9]+) ]]; then
       ATTEMPT_EXIT_CODE="${BASH_REMATCH[1]}"
       ATTEMPT_EXIT_REASON="exit"
+      return 0
+    fi
+    status_line="$(
+      kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "$status_cmd" 2>/dev/null || true
+    )"
+    status_line="${status_line//$'\r'/}"
+    if [[ "$status_line" =~ ^[0-9]+$ ]]; then
+      ATTEMPT_EXIT_CODE="$status_line"
+      ATTEMPT_EXIT_REASON="status_file"
       return 0
     fi
     log "waiting for attempt to finish; attach: kubectl exec -it -n ${NAMESPACE} ${MASTER_POD} -c ${CONTAINER} -- tmux attach -t ${SESSION}"
@@ -255,6 +290,7 @@ copy_attempt_log() {
 
 bs="$INITIAL_BS"
 attempt=0
+non_oom_retry_count=0
 while (( bs >= MIN_BS )); do
   attempt=$(( attempt + 1 ))
   attempt_log="${LOCAL_RETRY_LOG_DIR}/attempt_$(printf '%03d' "$attempt")_bs${bs}.log"
@@ -285,12 +321,25 @@ while (( bs >= MIN_BS )); do
 
   if [[ "$ATTEMPT_EXIT_REASON" == "oom" ]] || grep -Eq "$OOM_REGEX" "$attempt_log"; then
     new_bs=$(( bs - OOM_STEP ))
+    non_oom_retry_count=0
     log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Lowering to bs=${new_bs}."
     if (( new_bs < MIN_BS )); then
       log "Next bs=${new_bs} is below MIN_BS=${MIN_BS}; aborting."
       exit 1
     fi
     bs="$new_bs"
+    continue
+  fi
+
+  if is_retryable_non_oom_exit "$ATTEMPT_EXIT_CODE" && (( non_oom_retry_count < MAX_NON_OOM_RETRIES )); then
+    non_oom_retry_count=$(( non_oom_retry_count + 1 ))
+    latest_ckpt="$(find_latest_epoch_last_ckpt)"
+    if [[ -n "$latest_ckpt" ]]; then
+      log "Retryable non-OOM exit=${ATTEMPT_EXIT_CODE}; retrying bs=${bs} from latest ckpt=${latest_ckpt} (${non_oom_retry_count}/${MAX_NON_OOM_RETRIES})."
+    else
+      log "Retryable non-OOM exit=${ATTEMPT_EXIT_CODE}; retrying bs=${bs} with no checkpoint found (${non_oom_retry_count}/${MAX_NON_OOM_RETRIES})."
+    fi
+    stop_attempt_sessions
     continue
   fi
 
