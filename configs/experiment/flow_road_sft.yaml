@@ -64,9 +64,10 @@ model:
       road_comparison_horizon: 20
       # True → BC term 에 horizon 전체 GT valid 인 agent 만 포함.
       road_strict_active_mask: true
-      # free-running closed-loop hard RMM 모니터링.
-      road_eval_hard_rmm: true
-      road_eval_hard_rmm_interval: 1
+      # 학습 중 free-running closed-loop hard RMM 모니터링은 끔 (속도 저하 큼).
+      # RMM/CPD/CES 는 validation (val_check_interval) 에서 측정됨.
+      road_eval_hard_rmm: false
+      road_eval_hard_rmm_interval: 10
       # ── 학습 대상 module 선택 (OCSC 와 공유) ───────────────────────────
       # RoaD 는 정책 전체 SFT 라 flow_decoder 전체 학습 ("full") 이 가장 충실.
       flow_velocity_head_only: false

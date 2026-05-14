@@ -119,8 +119,9 @@ ROAD_HEADING_WEIGHT="${ROAD_HEADING_WEIGHT:-0.1}"
 ROAD_COMPARISON_HORIZON="${ROAD_COMPARISON_HORIZON:-20}"
 # True → BC term 에 horizon 전체 GT valid 인 agent 만 포함.
 ROAD_STRICT_ACTIVE_MASK="${ROAD_STRICT_ACTIVE_MASK:-true}"
-# free-running closed-loop hard RMM 모니터링.
-ROAD_EVAL_HARD_RMM="${ROAD_EVAL_HARD_RMM:-true}"
+# 학습 중 free-running closed-loop hard RMM 모니터링 (기본 off — 속도 저하 큼).
+# RMM/CPD/CES 는 validation 에서 측정됨.
+ROAD_EVAL_HARD_RMM="${ROAD_EVAL_HARD_RMM:-false}"
 ROAD_EVAL_HARD_RMM_INTERVAL="${ROAD_EVAL_HARD_RMM_INTERVAL:-10}"
 
 # 학습 대상 module 선택. RoaD 는 정책 전체 SFT 라 "full" 이 가장 충실.
