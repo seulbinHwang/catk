@@ -504,6 +504,19 @@ python tools/estimate_control_no_slip_rho.py \
   이 도구는 vehicle / cyclist를 분리해서 0.5초 sliding segment를 만들고, agent별 bounded weighted median을 먼저 구한 뒤 type별 capped weighted median으로 `rho_vehicle`, `rho_cyclist` 후보를 출력합니다. segment filter는 `|p[t+5]-p[t]| >= 0.25m`, `|2L sin(delta_yaw/2)| >= 0.10m` 두 개만 씁니다. 출력의 `residual` 항목은 `before = b`, `after = b - rho * c`의 validation median absolute residual과 개선율입니다. validation 개선율이 양수인지 먼저 확인한 뒤 실험 config에 반영하세요.
 - control-space 정규화는 위치 이동량에는 공통 `control_pos_scale_m=1.0`을 쓰고, yaw에는 config로 관리되는 agent type별 scale을 씁니다. 기본 preset은 `control_vehicle_yaw_scale_rad=0.025`, `control_cyclist_yaw_scale_rad=0.06`, `control_pedestrian_yaw_scale_rad=0.20`입니다. control-space target 생성과 복원 경로에는 항상 `agent_type`이 필요합니다. metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
 - control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `5.0m`이며, 평가 경로에는 적용하지 않습니다.
+- `control_round_trip_max_position_error_m` 값을 데이터 분포에서 고르려면 training cache에 대해 아래 분석 도구를 먼저 돌립니다. 이 값은 anchor별로 “loss에 실제 들어가는 미래 step들의 GT -> control -> pose 복원 위치 오차 중 최대값”을 기준으로 집계하므로, 학습 필터가 보는 값과 같은 의미입니다.
+
+```bash
+export CACHE_ROOT=/path/to/womd_v1_3/SMART_cache
+python tools/analyze_control_round_trip_error.py \
+  --split training \
+  --flow-window-steps 20 \
+  --thresholds 0.5,1,1.5,2,3,5,10 \
+  --num-workers 8 \
+  --output-json outputs/control_round_trip_training.json
+```
+
+  prefix-valid 실험이면 `--use-prefix-valid-future-loss-mask`를 같이 켜고, `use_holonomic_model_only`, `use_rolling_supervision`, `control_no_slip_point_ratio`를 바꾼 실험이면 도구에도 같은 옵션을 넘겨야 합니다. 출력은 전체/vehicle/pedestrian/cyclist별 anchor max error percentile, step error percentile, threshold별 anchor 제거율을 포함합니다. 기본 추천값은 전체 anchor max error의 p99.5를 `0.25m` 단위로 올림한 값입니다. 실전적으로는 이 추천값과 threshold table을 함께 보고, 정상적인 대다수 anchor를 유지하면서 명백한 non-holonomic projection outlier만 제거하는 값을 고릅니다.
 - 추가 trajectory loss, x0 loss, open-loop auxiliary loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
 - validation / rollout / metric 경로에서는 control 예측을 기존 pose-space 표현으로 복원해 기존 open-loop metric과 closed-loop rollout을 그대로 계산합니다.
 
