@@ -107,10 +107,10 @@ class SMARTFlow(LightningModule):
             model_config.finetune,
         )
         self.ref_flow_decoder: nn.Module | None = None
-        if self.finetune_config.enabled and self.finetune_config.mode != "ocsc_ft":
+        if self.finetune_config.enabled and self.finetune_config.mode not in ("ocsc_ft", "road_ft"):
             raise ValueError(
                 f"Unsupported finetune mode: {self.finetune_config.mode}. "
-                "Only 'ocsc_ft' is supported."
+                "Supported: 'ocsc_ft', 'road_ft'."
             )
 
         self.minADE = minADE()
@@ -137,9 +137,15 @@ class SMARTFlow(LightningModule):
             cpd_reference=wosac_cpd_reference,
         )
 
-        # OCSC: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
+        # OCSC / RoaD: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
         _is_ocsc = self.finetune_config.enabled and self.finetune_config.mode == "ocsc_ft"
-        if _is_ocsc and bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True)):
+        _is_road = self.finetune_config.enabled and self.finetune_config.mode == "road_ft"
+        _want_train_rmm = (
+            _is_ocsc and bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
+        ) or (
+            _is_road and bool(getattr(self.finetune_config, "road_eval_hard_rmm", False))
+        )
+        if _want_train_rmm:
             self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc")
             self._ocsc_train_hard_rmm_ref: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc_ref")
         else:
@@ -1113,6 +1119,12 @@ class SMARTFlow(LightningModule):
             and self.finetune_config.mode == "ocsc_ft"
         )
 
+    def _is_road_ft_enabled(self) -> bool:
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "road_ft"
+        )
+
     def on_train_start(self) -> None:
         # OCSC: ref_flow_decoder 를 항상 생성 (open-loop target 및 delta HardRMM 모니터링 공용)
         # ocsc_use_pretrained_ref=False 여도 delta 계산을 위해 frozen ref 가 필요하다.
@@ -1132,7 +1144,7 @@ class SMARTFlow(LightningModule):
         # ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
         # gradients (exploding Jacobian, numerical instability). Register nan_to_num
         # hooks on trainable parameters so any NaN/Inf gradient is zeroed out.
-        if self._is_ocsc_ft_enabled():
+        if self._is_ocsc_ft_enabled() or self._is_road_ft_enabled():
             # NaN → 0, Inf → finite large value (not 0) so the optimizer still
             # sees the direction even under mild overflow.
             n_hooked = 0
@@ -2273,6 +2285,186 @@ class SMARTFlow(LightningModule):
         ret["loss"] = _ddp_dummy
         return ret
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # RoaD (Rollouts as Demonstrations) CL-SFT baseline
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _run_flow_road_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        data: dict | None = None,
+    ) -> dict:
+        """RoaD closed-loop SFT fine-tuning step (OCSC 비교용 baseline).
+
+        알고리즘 (RoaD, NVIDIA 2025, traffic-sim 세팅):
+          1. Expert-guided closed-loop rollout (no_grad): 매 coarse step 마다 정책에서
+             K 개 후보 trajectory 를 i.i.d. 샘플 → GT continuation 에 weighted
+             step-wise L2 (Eq.6) 가 최소인 후보를 선택해 commit (Sample-K, Eq.4-5).
+          2. BC loss: 선택된 후보를 clean target 으로 flow-matching loss.  RoaD loss
+             는 -log π(a_t|o_<t) 이므로 conditioning (anchor_hidden) 과 target 은
+             모두 detach — rollout 자체에는 gradient 가 흐르지 않습니다 (BPTT 없음).
+          3. HardRMM 모니터링 (optional): free-running closed-loop 8초 rollout.
+
+        OCSC 와의 차이: OCSC 는 CL/OL 분포 간 consistency loss, RoaD 는 GT-selected
+        rollout 에 대한 단순 behavior cloning.  diversity 비교용으로 ``train/road_
+        candidate_var`` (K 후보의 분산) 를 함께 로깅합니다.
+        """
+        cfg = self.finetune_config
+        K = int(getattr(cfg, "road_sample_k", 64))
+        G = max(1, int(getattr(cfg, "road_n_rollouts", 1)))
+        pred_max_steps = int(getattr(cfg, "road_pred_max_steps", 16))
+        temperature = float(getattr(cfg, "road_temperature", 0.8))
+        pos_w = float(getattr(cfg, "road_position_weight", 1.0))
+        heading_w = float(getattr(cfg, "road_heading_weight", 0.1))
+        cmp_h = int(getattr(cfg, "road_comparison_horizon", 20))
+        strict = bool(getattr(cfg, "road_strict_active_mask", True))
+        eval_hard_rmm = bool(getattr(cfg, "road_eval_hard_rmm", False))
+        eval_hard_rmm_interval = max(1, int(getattr(cfg, "road_eval_hard_rmm_interval", 10)))
+
+        if data is None:
+            raise ValueError("road_ft requires `data` dict with scenario metadata.")
+        if "scenario_id" not in data:
+            raise KeyError("road_ft requires data['scenario_id'].")
+
+        agent_batch = tokenized_agent["batch"]
+        device = agent_batch.device
+
+        # ── 1. Encode map + rollout cache (no_grad; encoder/trunk frozen) ────
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
+
+        _agent_enc = self.encoder.agent_encoder
+        flow_ode = _agent_enc.flow_ode
+        flow_decoder = _agent_enc.flow_decoder
+
+        gt_pos_10hz = data["agent"]["position"]
+        gt_head_10hz = data["agent"]["heading"]
+        gt_valid_10hz = data["agent"]["valid_mask"]
+
+        # ── 2. Expert-guided rollouts → (anchor_hidden, chosen_x1) 수집 ──────
+        bc_hidden: list[Tensor] = []
+        bc_x1: list[Tensor] = []
+        _cand_var_accum = 0.0
+        _winner_dist_accum = 0.0
+        _global_step = int(getattr(self, "global_step", 0))
+        for g in range(G):
+            eg = _agent_enc.rollout_from_cache_expert_guided(
+                rollout_cache=rollout_cache,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                gt_pos_10hz=gt_pos_10hz,
+                gt_head_10hz=gt_head_10hz,
+                gt_valid_10hz=gt_valid_10hz,
+                sample_k=K,
+                temperature=temperature,
+                pos_weight=pos_w,
+                heading_weight=heading_w,
+                comparison_horizon=cmp_h,
+                max_steps=pred_max_steps,
+                strict_active_mask=strict,
+                sampling_seed=_global_step * 1000 + g,
+            )
+            _cand_var_accum += float(eg["mean_candidate_var"])
+            _winner_dist_accum += float(eg["mean_winner_gt_dist"])
+            for h, x1, bcm in zip(
+                eg["per_step_anchor_hidden"],
+                eg["per_step_chosen_x1"],
+                eg["per_step_bc_mask"],
+            ):
+                if h is None or h.shape[0] == 0 or not bool(bcm.any()):
+                    continue
+                bc_hidden.append(h[bcm].detach())
+                bc_x1.append(x1[bcm].detach())
+
+        # ── 3. Behavior-cloning flow-matching loss ──────────────────────────
+        # conditioning(anchor_hidden) / target(chosen_x1) 모두 detach 상태.
+        # gradient 는 flow_decoder forward 에서만 발생 → flow_velocity_head_only
+        # 적용 시 velocity_head 만 학습.
+        bc_loss_accum = 0.0
+        if len(bc_hidden) > 0:
+            all_h = torch.cat(bc_hidden, dim=0).to(dtype=torch.float32)    # [N, D]
+            all_x1 = torch.cat(bc_x1, dim=0).to(dtype=torch.float32)       # [N, 20, 4]
+            N = int(all_h.shape[0])
+            _chunk = 8192
+            for start in range(0, N, _chunk):
+                h_c = all_h[start:start + _chunk]
+                x1_c = all_x1[start:start + _chunk]
+                fm_sample = flow_ode.sample(x1_c, target_type="velocity")
+                pred = flow_decoder(h_c, fm_sample.x_t, fm_sample.tau)
+                fm = flow_matching_loss(pred, fm_sample.target)
+                if not torch.isfinite(fm).all():
+                    log.warning("[road_ft] non-finite BC FM loss chunk; skipping")
+                    continue
+                _w = float(h_c.shape[0]) / float(N)
+                bc_loss_accum += fm.item() * _w
+                (fm * _w).backward()
+
+        log.info(
+            f"[road] step={_global_step} bc_loss={bc_loss_accum:.4f} "
+            f"n_terms={len(bc_hidden)} cand_var={_cand_var_accum / G:.4f} "
+            f"winner_gt_dist={_winner_dist_accum / G:.4f}"
+        )
+        ret: dict = {
+            "train/road_bc_loss": torch.tensor(bc_loss_accum, dtype=torch.float32, device=device),
+            "train/road_candidate_var": torch.tensor(
+                _cand_var_accum / G, dtype=torch.float32, device=device
+            ),
+            "train/road_winner_gt_dist": torch.tensor(
+                _winner_dist_accum / G, dtype=torch.float32, device=device
+            ),
+            "train/loss": torch.tensor(bc_loss_accum, dtype=torch.float32, device=device),
+        }
+
+        # ── 4. Hard RMM monitoring (optional, free-running closed-loop 8초) ──
+        if (
+            eval_hard_rmm
+            and self._ocsc_train_hard_rmm is not None
+            and (_global_step % eval_hard_rmm_interval == 0)
+            and "tfrecord_path" in data
+        ):
+            agent_ids = None
+            try:
+                agent_ids = data["agent"]["id"]
+            except Exception:
+                agent_ids = data.get("id") if isinstance(data, dict) else None
+            if agent_ids is not None:
+                _G_rmm = max(1, int(getattr(self, "n_rollout_closed_val", 4)))
+                with torch.no_grad():
+                    rmm_traj_all, rmm_z_all, rmm_head_all, _ = self._run_parallel_rollout_chunk(
+                        data=data,
+                        tokenized_agent=tokenized_agent,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache,
+                        rollout_indices=list(range(_G_rmm)),
+                        return_anchor_hidden=True,
+                        full_grad=False,
+                        max_steps=None,
+                    )
+                hard_rmm_val = self._compute_ocsc_train_hard_rmm(
+                    scenario_files=list(data["tfrecord_path"]),
+                    agent_ids=agent_ids,
+                    agent_batch=agent_batch,
+                    traj_list=[rmm_traj_all[:, g] for g in range(_G_rmm)],
+                    z_list=[rmm_z_all[:, g] for g in range(_G_rmm)],
+                    head_list=[rmm_head_all[:, g] for g in range(_G_rmm)],
+                    metric=self._ocsc_train_hard_rmm,
+                )
+                if hard_rmm_val is not None:
+                    ret["train/hard_rmm"] = torch.tensor(
+                        hard_rmm_val, dtype=torch.float32, device=device
+                    )
+                    log.info(f"[road] step={_global_step} hard_rmm={hard_rmm_val:.4f}")
+
+        # DDP: 모든 trainable param을 dummy graph에 연결 (OCSC 와 동일 패턴).
+        _ddp_dummy = sum(p.sum() * 0.0 for p in self.parameters() if p.requires_grad)
+        ret["loss"] = _ddp_dummy
+        return ret
+
 
     def training_step(self, data, batch_idx):
         opt = self.optimizers()
@@ -2310,6 +2502,26 @@ class SMARTFlow(LightningModule):
                     _fm_reg if isinstance(_fm_reg, Tensor) else torch.tensor(_fm_reg, device=diag["train/consistency_loss"].device)
                 )
                 self.log("train/loss", _total, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+
+        elif self._is_road_ft_enabled():
+            # RoaD: OCSC 와 동일하게 step 내부에서 .backward() 누적 후 dummy 로 all-reduce 1회.
+            _ddp_model = getattr(getattr(self, "trainer", None) and self.trainer.strategy, "model", None)
+            _no_sync_ctx = (
+                _ddp_model.no_sync()
+                if _ddp_model is not None and hasattr(_ddp_model, "no_sync")
+                else contextlib.nullcontext()
+            )
+            with _no_sync_ctx:
+                diag = self._run_flow_road_ft_step(tokenized_map, tokenized_agent, data)
+
+            if "loss" in diag:
+                self.manual_backward(diag["loss"])
+
+            for k, v in diag.items():
+                if k == "loss":
+                    continue
+                if isinstance(v, (Tensor, float)):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
         else:
             pred = self.encoder(

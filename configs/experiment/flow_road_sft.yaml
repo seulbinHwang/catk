@@ -1,0 +1,96 @@
+# @package _global_
+# RoaD (Rollouts as Demonstrations) closed-loop SFT fine-tuning experiment.
+# OCSC 비교용 baseline — RoaD 논문 (NVIDIA, 2025) 의 traffic-sim CL-SFT 방법론.
+#
+# 알고리즘:
+#   1. Expert-guided closed-loop rollout (no_grad): 매 coarse step 마다 정책에서
+#      K 개 후보 trajectory 를 i.i.d. 샘플 → GT continuation 에 weighted step-wise
+#      L2 (Eq.6) 가 최소인 후보를 선택해 commit (Sample-K, Eq.4-5).
+#   2. BC loss: 선택된 후보를 clean target 으로 flow-matching loss.  conditioning
+#      (anchor_hidden) / target 모두 detach — rollout 에는 gradient 미전파 (BPTT 없음).
+#   3. HardRMM 모니터링: free-running closed-loop 8초 rollout 의 hard RMM.
+#
+# OCSC 와의 차이: OCSC = CL/OL 분포 consistency, RoaD = GT-selected rollout BC.
+# diversity 비교용으로 train/road_candidate_var (K 후보 분산) 를 로깅.
+
+defaults:
+  - override /model: smart_flow
+
+action: finetune
+
+model:
+  model_config:
+    lr: 5e-6
+    lr_warmup_steps: 0
+    lr_total_steps: -1
+    lr_min_ratio: 0.1
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+    n_rollout_closed_val: 4
+    n_batch_sim_agents_metric: 2
+    validation_metric: hard
+    wosac_torch_compile: true
+    n_vis_batch: 1
+    n_vis_scenario: 2
+    n_vis_rollout: 4
+    val_open_loop: true
+    val_closed_loop: true
+    decoder:
+      flow_solver_steps: 4
+    kinematic_projection:
+      enabled: false
+    finetune:
+      enabled: true
+      mode: road_ft
+      # ── RoaD 핵심 파라미터 ─────────────────────────────────────────────
+      # K: Sample-K 후보 개수 (논문 기본값 64).
+      road_sample_k: 64
+      # 시나리오당 expert-guided rollout 수 (RoaD SFT dataset 의 N_roll).
+      road_n_rollouts: 1
+      # expert-guided rollout coarse step 수 (16 = 8초 full episode, WOSAC 기준).
+      road_pred_max_steps: 16
+      # 후보 샘플링 noise scale (논문의 sampling temperature 0.8).
+      road_temperature: 0.8
+      # d^g (Eq.6) position / heading 채널 가중치.
+      road_position_weight: 1.0
+      road_heading_weight: 0.1
+      # d^g 비교 horizon H_t — 후보당 비교할 fine(10Hz) step 수 (논문: first 20 = 2초).
+      road_comparison_horizon: 20
+      # True → BC term 에 horizon 전체 GT valid 인 agent 만 포함.
+      road_strict_active_mask: true
+      # free-running closed-loop hard RMM 모니터링.
+      road_eval_hard_rmm: true
+      road_eval_hard_rmm_interval: 1
+      # ── 학습 대상 module 선택 (OCSC 와 공유) ───────────────────────────
+      flow_velocity_head_only: true
+      flow_ft_target: "default"
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.01
+  check_val_every_n_epoch: null
+  val_check_interval: 500
+  max_epochs: 10
+  log_every_n_steps: 1
+  precision: 32-true
+  gradient_clip_val: 0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+    save_top_k: -1
+
+data:
+  train_batch_size: 16
+  val_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1
+  # road_ft 는 hard RMM 모니터링용 tfrecord 가 필요합니다.
+  # 없으면 road_eval_hard_rmm=false 로 끄면 됩니다.
+  train_raw_dir: ${paths.cache_root}/validation
+  train_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
+  train_use_val_transform: true

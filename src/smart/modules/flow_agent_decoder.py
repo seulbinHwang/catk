@@ -14,7 +14,11 @@ from src.smart.modules.flow_local_decoder import (
     FlowODE,
     HierarchicalFlowDecoder,
 )
-from src.smart.utils import angle_between_2d_vectors, wrap_angle
+from src.smart.utils import (
+    angle_between_2d_vectors,
+    transform_to_local,
+    wrap_angle,
+)
 
 
 class SMARTFlowAgentDecoder(SMARTAgentEncoder):
@@ -1118,6 +1122,344 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 sampling_seed=sampling_seed,
                 scenario_sampling_seeds=scenario_sampling_seeds,
             )
+
+    @torch.no_grad()
+    def rollout_from_cache_expert_guided(
+        self,
+        rollout_cache: Dict[str, object],
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        gt_pos_10hz: torch.Tensor,
+        gt_head_10hz: torch.Tensor,
+        gt_valid_10hz: torch.Tensor,
+        sample_k: int = 64,
+        temperature: float = 0.8,
+        pos_weight: float = 1.0,
+        heading_weight: float = 0.1,
+        comparison_horizon: int = 20,
+        max_steps: int | None = None,
+        strict_active_mask: bool = True,
+        sampling_seed: int | None = None,
+    ) -> Dict[str, object]:
+        """RoaD expert-guided closed-loop rollout (데이터 수집, 항상 no_grad).
+
+        매 coarse step 마다 정책에서 ``sample_k`` 개의 후보 미래(각 20-fine-step
+        anchor-local normalized trajectory)를 i.i.d. 샘플하고, GT continuation 에
+        weighted step-wise L2 (RoaD Eq.6) 가 최소인 후보를 선택해 commit 합니다
+        (Sample-K, Eq.4-5).  선택된 후보와 그 step 의 anchor hidden 을 기록해
+        이후 behavior-cloning (flow-matching) loss 의 (conditioning, target) 으로
+        사용합니다.
+
+        Args:
+            rollout_cache: ``prepare_inference_cache`` 가 만든 원본 캐시입니다.
+            tokenized_agent: 평가용 토큰 사전입니다.
+            map_feature: 한 번 인코딩한 지도 특징 사전입니다.
+            gt_pos_10hz: raw 10Hz GT 위치입니다. shape ``[n_agent, T_total, 2]``.
+            gt_head_10hz: raw 10Hz GT heading 입니다. shape ``[n_agent, T_total]``.
+            gt_valid_10hz: raw 10Hz GT valid mask 입니다. shape ``[n_agent, T_total]``.
+            sample_k: step 당 후보 개수 K 입니다.
+            temperature: 후보 초기 noise scale 입니다.
+            pos_weight: d^g 의 position 채널 가중치입니다.
+            heading_weight: d^g 의 heading(cos/sin) 채널 가중치입니다.
+            comparison_horizon: d^g 비교에 쓸 fine step 수 H_t 입니다.
+            max_steps: 실행할 coarse step 상한입니다. None 이면 전체.
+            strict_active_mask: True 면 BC term 에 horizon 전체 GT valid 인 agent 만 포함.
+            sampling_seed: 후보 난수 재현용 seed 입니다.
+
+        Returns:
+            Dict[str, object]:
+                - ``per_step_anchor_hidden``: step 별 ``[n_active, hidden_dim]`` (detached).
+                - ``per_step_chosen_x1``: step 별 ``[n_active, 20, 4]`` 선택된 후보 (detached).
+                - ``per_step_bc_mask``: step 별 ``[n_active]`` BC term 포함 여부.
+                - ``pred_traj_10hz`` / ``pred_head_10hz`` / ``pred_z_10hz``: commit 된
+                  expert-guided 궤적 (RMM 모니터링용).
+                - ``mean_candidate_var``: K 후보 normalized-traj 분산 평균 (diversity 진단).
+                - ``mean_winner_gt_dist``: 선택된 후보의 d^g 평균 (정규화).
+        """
+        state = self._clone_rollout_cache(rollout_cache)
+
+        n_agent = int(state["n_agent"])
+        n_step_future_10hz = int(state["n_step_future_10hz"])
+        n_step_future_2hz = int(state["n_step_future_2hz"])
+        if max_steps is not None:
+            n_step_future_2hz = min(n_step_future_2hz, max_steps)
+        max_context_steps = int(state["max_context_steps"])
+        pos_window = state["pos_window"]
+        head_window = state["head_window"]
+        head_vector_window = state["head_vector_window"]
+        valid_window = state["valid_window"]
+        pred_idx_window = state["pred_idx_window"]
+        feat_a = state["feat_a"]
+        agent_token_emb = state["agent_token_emb"]
+        agent_token_emb_veh = state["agent_token_emb_veh"]
+        agent_token_emb_ped = state["agent_token_emb_ped"]
+        agent_token_emb_cyc = state["agent_token_emb_cyc"]
+        veh_mask = state["veh_mask"]
+        ped_mask = state["ped_mask"]
+        cyc_mask = state["cyc_mask"]
+        categorical_embs = state["categorical_embs"]
+        feat_a_now = state["feat_a_now"]
+        feat_a_t_dict = state["feat_a_t_dict"]
+
+        device = feat_a_now.device
+        dtype = feat_a_now.dtype
+        K = max(1, int(sample_k))
+        sample_window_steps = 20
+        # 현재(=rollout 시작) 시점의 10Hz 인덱스. step t 의 anchor 10Hz idx =
+        # step_current_10hz + t * shift.  생성된 20 fine step 은 그 직후 시점들.
+        step_current_10hz = self.num_historical_steps - 1
+        seq_len_10hz = int(gt_pos_10hz.shape[1])
+
+        generator: torch.Generator | None = None
+        if sampling_seed is not None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(sampling_seed))
+
+        pred_traj_10hz_chunks: list[torch.Tensor] = []
+        pred_head_10hz_chunks: list[torch.Tensor] = []
+        per_step_anchor_hidden: list[torch.Tensor] = []
+        per_step_chosen_x1: list[torch.Tensor] = []
+        per_step_bc_mask: list[torch.Tensor] = []
+        _cand_var_accum = 0.0
+        _winner_dist_accum = 0.0
+        _diag_steps = 0
+
+        _has_proj = self.kinematic_projector is not None
+
+        for t in range(n_step_future_2hz):
+            n_step = pos_window.shape[1]
+            if t == 0:
+                current_hidden = feat_a_now
+            else:
+                inference_mask = valid_window.clone()
+                inference_mask[:, :-1] = False
+                edge_index_t, r_t = self.build_temporal_edge(
+                    pos_a=pos_window,
+                    head_a=head_window,
+                    head_vector_a=head_vector_window,
+                    mask=valid_window,
+                    inference_mask=inference_mask,
+                )
+                edge_index_t = torch.stack(
+                    (
+                        edge_index_t[0],
+                        (edge_index_t[1] + 1) // n_step - 1,
+                    ),
+                    dim=0,
+                )
+                edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
+                    pos_pl=map_feature["position"],
+                    orient_pl=map_feature["orientation"],
+                    pos_a=pos_window[:, -1:],
+                    head_a=head_window[:, -1:],
+                    head_vector_a=head_vector_window[:, -1:],
+                    mask=inference_mask[:, -1:],
+                    batch_s=tokenized_agent["batch"],
+                    batch_pl=map_feature["batch"],
+                )
+                recent_motion = self._build_recent_coarse_motion(
+                    pos_window=pos_window,
+                    valid_window=valid_window,
+                )
+                edge_index_a2a, r_a2a = self.build_interaction_edge(
+                    pos_a=pos_window[:, -1:],
+                    head_a=head_window[:, -1:],
+                    head_vector_a=head_vector_window[:, -1:],
+                    batch_s=tokenized_agent["batch"],
+                    mask=inference_mask[:, -1:],
+                    motion_a=recent_motion.unsqueeze(1),
+                )
+                for i in range(self.num_layers):
+                    temporal_feat = feat_a if i == 0 else feat_a_t_dict[i]
+                    current_hidden = self.t_attn_layers[i](
+                        (temporal_feat.flatten(0, 1), temporal_feat[:, -1]),
+                        r_t,
+                        edge_index_t,
+                    )
+                    current_hidden = self.pt2a_attn_layers[i](
+                        (map_feature["pt_token"], current_hidden),
+                        r_pl2a,
+                        edge_index_pl2a,
+                    )
+                    current_hidden = self.a2a_attn_layers[i](current_hidden, r_a2a, edge_index_a2a)
+                    if i + 1 < self.num_layers:
+                        feat_a_t_dict[i + 1] = torch.cat(
+                            [feat_a_t_dict[i + 1], current_hidden.unsqueeze(1)],
+                            dim=1,
+                        )
+
+            active_mask = valid_window[:, -1]
+            next_pos = pos_window[:, -1].clone()
+            next_head = head_window[:, -1].clone()
+            next_token_idx = pred_idx_window[:, -1].clone()
+            commit_traj_step = pos_window.new_zeros((n_agent, self.shift, 2))
+            commit_head_step = head_window.new_zeros((n_agent, self.shift))
+
+            if active_mask.any():
+                active_hidden = current_hidden[active_mask]              # [n_active, D]
+                n_active = int(active_hidden.shape[0])
+                current_pos_act = pos_window[active_mask, -1]            # [n_active, 2]
+                current_head_act = head_window[active_mask, -1]          # [n_active]
+                active_type = tokenized_agent["type"][active_mask]
+
+                # ── K 후보 i.i.d. 샘플 ───────────────────────────────────────
+                hidden_rep = active_hidden.repeat_interleave(K, dim=0)   # [n_active*K, D]
+                x_init = torch.randn(
+                    n_active * K, sample_window_steps, 4,
+                    device=device, dtype=dtype, generator=generator,
+                ) * float(temperature)
+                _model_fn = lambda x_t, tau, _h=hidden_rep: self.flow_decoder(_h, x_t, tau)
+                if self.use_predict_project_renoise and _has_proj:
+                    _at_rep = active_type.repeat_interleave(K, dim=0)
+                    cand = self.flow_ode.generate_predict_project_renoise(
+                        x_init=x_init,
+                        model_fn=_model_fn,
+                        project_fn=lambda x1, pw: self.kinematic_projector(
+                            x1, _at_rep, proj_weight=pw,
+                        ),
+                        steps=self.ppr_steps,
+                    )
+                else:
+                    cand = self.flow_ode.generate(x_init=x_init, model_fn=_model_fn)
+                    if _has_proj:
+                        _at_rep = active_type.repeat_interleave(K, dim=0)
+                        cand = self.kinematic_projector(cand, _at_rep)
+                cand = cand.view(n_active, K, sample_window_steps, 4)    # [n_active, K, 20, 4]
+
+                # ── GT continuation 을 현재(drift 된) anchor-local frame 으로 ─
+                anchor_10hz = step_current_10hz + t * self.shift
+                gt_start = anchor_10hz + 1
+                gt_end = min(seq_len_10hz, gt_start + sample_window_steps)
+                T_avail = max(0, gt_end - gt_start)
+                T = min(sample_window_steps, T_avail, max(1, int(comparison_horizon)))
+                if T > 0:
+                    gt_pos_seg = gt_pos_10hz[active_mask, gt_start:gt_start + T, :2]
+                    gt_head_seg = gt_head_10hz[active_mask, gt_start:gt_start + T]
+                    gt_valid_seg = gt_valid_10hz[active_mask, gt_start:gt_start + T]
+                    gt_pos_local, gt_head_local = transform_to_local(
+                        pos_global=gt_pos_seg,
+                        head_global=gt_head_seg,
+                        pos_now=current_pos_act,
+                        head_now=current_head_act,
+                    )
+                    gt_norm = torch.stack(
+                        [
+                            gt_pos_local[..., 0] / 20.0,
+                            gt_pos_local[..., 1] / 20.0,
+                            gt_head_local.cos(),
+                            gt_head_local.sin(),
+                        ],
+                        dim=-1,
+                    )  # [n_active, T, 4]
+                    # d^g (Eq.6): weighted step-wise L2², GT invalid step 은 mask.
+                    diff_sq = (cand[:, :, :T, :] - gt_norm[:, None, :, :]) ** 2  # [n_active,K,T,4]
+                    mask = gt_valid_seg[:, None, :, None].to(diff_sq.dtype)
+                    diff_sq = diff_sq * mask
+                    d_pos = diff_sq[..., :2].sum(dim=(-1, -2))   # [n_active, K]
+                    d_head = diff_sq[..., 2:].sum(dim=(-1, -2))  # [n_active, K]
+                    d_g = pos_weight * d_pos + heading_weight * d_head  # [n_active, K]
+                    winner = d_g.argmin(dim=1)                  # [n_active]
+                    _n_valid_gt = gt_valid_seg.sum(dim=1).clamp(min=1).to(d_g.dtype)
+                    if strict_active_mask:
+                        bc_mask = gt_valid_seg.all(dim=1)
+                    else:
+                        bc_mask = gt_valid_seg.any(dim=1)
+                    _winner_dist_accum += float(
+                        (d_g.gather(1, winner[:, None]).squeeze(1) / _n_valid_gt).mean().item()
+                    )
+                else:
+                    # GT 가 더 이상 없는 꼬리 구간: rollout 은 이어가되 BC term 제외.
+                    winner = torch.zeros(n_active, dtype=torch.long, device=device)
+                    bc_mask = torch.zeros(n_active, dtype=torch.bool, device=device)
+
+                chosen_x1 = cand[torch.arange(n_active, device=device), winner]  # [n_active,20,4]
+                _cand_var_accum += float(cand.var(dim=1).mean().item())
+                _diag_steps += 1
+
+                per_step_anchor_hidden.append(active_hidden.detach())
+                per_step_chosen_x1.append(chosen_x1.detach())
+                per_step_bc_mask.append(bc_mask)
+
+                # ── commit: 선택된 후보로 world 상태 갱신 ────────────────────
+                commit_pos_act, commit_head_act, next_pos_act, next_head_act = self.commit_bridge.commit(
+                    y_hat_norm=chosen_x1,
+                    current_pos=current_pos_act,
+                    current_head=current_head_act,
+                )
+                next_token_idx_act = self.commit_bridge.retokenize(
+                    current_pos=current_pos_act,
+                    current_head=current_head_act,
+                    commit_pos=commit_pos_act,
+                    commit_head=commit_head_act,
+                    agent_type=active_type,
+                    token_agent_shape=tokenized_agent["token_agent_shape"][active_mask],
+                    token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                    token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                    token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
+                )
+                commit_traj_step[active_mask] = commit_pos_act
+                commit_head_step[active_mask] = commit_head_act
+                next_pos[active_mask] = next_pos_act
+                next_head[active_mask] = next_head_act
+                next_token_idx[active_mask] = next_token_idx_act
+
+            pred_traj_10hz_chunks.append(commit_traj_step)
+            pred_head_10hz_chunks.append(commit_head_step)
+
+            next_valid = active_mask.clone()
+            pred_idx_window = torch.cat([pred_idx_window, next_token_idx.unsqueeze(1)], dim=1)
+            valid_window = torch.cat([valid_window, next_valid.unsqueeze(1)], dim=1)
+            pos_window = torch.cat([pos_window, next_pos.unsqueeze(1)], dim=1)
+            head_window = torch.cat([head_window, next_head.unsqueeze(1)], dim=1)
+            head_vector_next = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+            head_vector_window = torch.cat([head_vector_window, head_vector_next.unsqueeze(1)], dim=1)
+
+            agent_token_emb_next = torch.zeros_like(agent_token_emb[:, 0])
+            agent_token_emb_next[veh_mask] = agent_token_emb_veh[next_token_idx[veh_mask]]
+            agent_token_emb_next[ped_mask] = agent_token_emb_ped[next_token_idx[ped_mask]]
+            agent_token_emb_next[cyc_mask] = agent_token_emb_cyc[next_token_idx[cyc_mask]]
+            agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next.unsqueeze(1)], dim=1)
+
+            motion_vector_a = pos_window[:, -1] - pos_window[:, -2]
+            x_a = torch.stack(
+                [
+                    torch.norm(motion_vector_a, p=2, dim=-1),
+                    angle_between_2d_vectors(
+                        ctr_vector=head_vector_window[:, -1],
+                        nbr_vector=motion_vector_a,
+                    ),
+                ],
+                dim=-1,
+            )
+            x_a = self.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)
+            feat_a_next = self.fusion_emb(torch.cat([agent_token_emb_next, x_a], dim=-1).unsqueeze(1))
+            feat_a = torch.cat([feat_a, feat_a_next], dim=1)
+
+            if pos_window.shape[1] > max_context_steps:
+                pos_window = pos_window[:, -max_context_steps:]
+                head_window = head_window[:, -max_context_steps:]
+                head_vector_window = head_vector_window[:, -max_context_steps:]
+                valid_window = valid_window[:, -max_context_steps:]
+                pred_idx_window = pred_idx_window[:, -max_context_steps:]
+                agent_token_emb = agent_token_emb[:, -max_context_steps:]
+                feat_a = feat_a[:, -max_context_steps:]
+                for key in feat_a_t_dict:
+                    feat_a_t_dict[key] = feat_a_t_dict[key][:, -max_context_steps:]
+
+        pred_traj_10hz = torch.cat(pred_traj_10hz_chunks, dim=1)
+        pred_head_10hz = torch.cat(pred_head_10hz_chunks, dim=1)
+        pred_z_10hz = tokenized_agent["gt_z_raw"].unsqueeze(1).expand(-1, pred_traj_10hz.shape[1])
+        _denom = max(1, _diag_steps)
+        return {
+            "per_step_anchor_hidden": per_step_anchor_hidden,
+            "per_step_chosen_x1": per_step_chosen_x1,
+            "per_step_bc_mask": per_step_bc_mask,
+            "pred_traj_10hz": pred_traj_10hz,
+            "pred_head_10hz": pred_head_10hz,
+            "pred_z_10hz": pred_z_10hz,
+            "mean_candidate_var": _cand_var_accum / _denom,
+            "mean_winner_gt_dist": _winner_dist_accum / _denom,
+        }
 
     @torch.no_grad()
     def inference(

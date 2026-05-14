@@ -16,7 +16,8 @@ class FinetuneConfig:
 
     Attributes:
         enabled: fine-tuning 분기를 켤지 나타냅니다.
-        mode: 현재 지원하는 fine-tuning 방식 이름입니다. ``"ocsc_ft"`` 만 허용합니다.
+        mode: fine-tuning 방식 이름입니다. ``"ocsc_ft"`` (Open-Closed Self-Consistency)
+            또는 ``"road_ft"`` (RoaD CL-SFT baseline) 를 허용합니다.
         flow_velocity_head_only: True 면 ``HierarchicalFlowDecoder.velocity_head`` 만
             학습 (트렁크·residual 동결).
         bptt_use_adjoint: Flow ODE generate() 안의 model_fn 호출을
@@ -99,6 +100,33 @@ class FinetuneConfig:
     #: (anchor 시점 valid 인데 future 일부 invalid) 는 OCSC anchor 에서 제외 →
     #: model 이 학습 안 한 영역의 hallucination self-consistency 학습 방지.
     ocsc_strict_active_mask: bool = False
+    # ── RoaD (Rollouts as Demonstrations) CL-SFT baseline ─────────────────────
+    # RoaD 논문 (NVIDIA, 2025) 의 closed-loop SFT 방법론을 OCSC 비교용 baseline 으로
+    # 구현한 분기 (mode="road_ft").  알고리즘:
+    #   1. Expert-guided closed-loop rollout: 매 coarse step 마다 정책에서 K 개 후보
+    #      trajectory 를 i.i.d. 샘플 → GT continuation 에 weighted step-wise L2 (Eq.6)
+    #      가 최소인 후보를 선택해 commit (Sample-K, Eq.4-5).
+    #   2. BC loss: 선택된 후보를 clean target 으로 flow-matching loss.  RoaD loss 는
+    #      -log π(a_t|o_<t) 이므로 conditioning (anchor_hidden) 은 detach, BPTT 없음.
+    #: K — Sample-K 후보 개수 (논문 기본값 64).
+    road_sample_k: int = 64
+    #: 시나리오당 expert-guided rollout 수 (RoaD SFT dataset 의 N_roll).
+    road_n_rollouts: int = 1
+    #: expert-guided rollout 의 coarse step 수 (16 = 8초 full episode, WOSAC 기준).
+    road_pred_max_steps: int = 16
+    #: 후보 샘플링 noise scale (논문의 sampling temperature 0.8).
+    road_temperature: float = 0.8
+    #: d^g (Eq.6) position channel 가중치.
+    road_position_weight: float = 1.0
+    #: d^g (Eq.6) heading channel (cos/sin) 가중치.
+    road_heading_weight: float = 0.1
+    #: d^g 비교 horizon H_t — 후보당 비교할 fine(10Hz) step 수 (논문: first 20 = 2초).
+    road_comparison_horizon: int = 20
+    #: True → BC term 에 future GT 가 horizon 전체 valid 인 agent 만 포함.
+    road_strict_active_mask: bool = True
+    #: 매 training step free-running closed-loop hard RMM 모니터링.
+    road_eval_hard_rmm: bool = False
+    road_eval_hard_rmm_interval: int = 10
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -172,6 +200,16 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_ol_resolution=str(_read_config_value(finetune, "ocsc_ol_resolution", "10hz")),
         ocsc_nearest_include_gt=bool(_read_config_value(finetune, "ocsc_nearest_include_gt", False)),
         ocsc_strict_active_mask=bool(_read_config_value(finetune, "ocsc_strict_active_mask", False)),
+        road_sample_k=int(_read_config_value(finetune, "road_sample_k", 64)),
+        road_n_rollouts=int(_read_config_value(finetune, "road_n_rollouts", 1)),
+        road_pred_max_steps=int(_read_config_value(finetune, "road_pred_max_steps", 16)),
+        road_temperature=float(_read_config_value(finetune, "road_temperature", 0.8)),
+        road_position_weight=float(_read_config_value(finetune, "road_position_weight", 1.0)),
+        road_heading_weight=float(_read_config_value(finetune, "road_heading_weight", 0.1)),
+        road_comparison_horizon=int(_read_config_value(finetune, "road_comparison_horizon", 20)),
+        road_strict_active_mask=bool(_read_config_value(finetune, "road_strict_active_mask", True)),
+        road_eval_hard_rmm=bool(_read_config_value(finetune, "road_eval_hard_rmm", False)),
+        road_eval_hard_rmm_interval=int(_read_config_value(finetune, "road_eval_hard_rmm_interval", 10)),
     )
 
 
@@ -221,9 +259,10 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             )
         return config
 
-    if config.mode != "ocsc_ft":
+    if config.mode not in ("ocsc_ft", "road_ft"):
         raise ValueError(
-            f"Unsupported finetune mode: {config.mode}. Only 'ocsc_ft' is supported."
+            f"Unsupported finetune mode: {config.mode}. "
+            "Supported: 'ocsc_ft', 'road_ft'."
         )
 
     # 전체 모델 freeze 후 flow_decoder만 unfreeze
