@@ -69,6 +69,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
         control_cyclist_yaw_scale_rad: float | None = None,
+        control_no_slip_point_ratio: float = 0.0,
         closed_loop_rollout_mode: str = "raw_fm",
         use_lqr: bool = False,
         use_stop_motion: bool = False,
@@ -101,6 +102,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
         self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
+        self.control_no_slip_point_ratio = float(control_no_slip_point_ratio)
+        if self.control_no_slip_point_ratio < 0.0:
+            raise ValueError(
+                "control_no_slip_point_ratio must be non-negative, "
+                f"got {self.control_no_slip_point_ratio}."
+            )
         if self.use_kinematic_control_flow:
             (
                 self.control_vehicle_yaw_scale_rad,
@@ -169,6 +176,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             control_vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
             control_pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
             control_cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            control_no_slip_point_ratio=self.control_no_slip_point_ratio,
         )
 
     def build_interaction_edge(
@@ -524,6 +532,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_mask: torch.Tensor,
         flow_clean_norm: torch.Tensor,
         flow_agent_type: torch.Tensor | None = None,
+        flow_agent_length: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
         flow_clean_metric_norm: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
@@ -557,6 +566,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         }
         if flow_agent_type is not None:
             output["flow_metric_agent_type"] = flow_agent_type
+        if flow_agent_length is not None:
+            output["flow_metric_agent_length"] = flow_agent_length
         if flow_loss_mask is not None:
             output["flow_loss_mask"] = flow_loss_mask
         if flow_clean_metric_norm is not None:
@@ -567,6 +578,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self,
         value: torch.Tensor,
         agent_type: torch.Tensor | None,
+        agent_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self.use_kinematic_control_flow or value.shape[-1] != CONTROL_FLOW_DIM:
             return value
@@ -578,20 +590,31 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         return control_norm_to_pose_norm(
             control_norm=value,
             agent_type=agent_type.to(device=value.device),
+            agent_length=(
+                agent_length.to(device=value.device, dtype=value.dtype)
+                if agent_length is not None
+                else None
+            ),
             pos_scale_m=self.control_pos_scale_m,
             vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
             pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
             cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
             use_holonomic_model_only=getattr(self, "use_holonomic_model_only", False),
+            no_slip_point_ratio=getattr(self, "control_no_slip_point_ratio", 0.0),
         )
 
     def flow_norm_to_pose_metric_norm(
         self,
         value: torch.Tensor,
         agent_type: torch.Tensor | None,
+        agent_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Metric/시각화 경로가 쓰는 pose-space flow 표현으로 변환합니다."""
-        return self._to_pose_metric_norm(value=value, agent_type=agent_type)
+        return self._to_pose_metric_norm(
+            value=value,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
 
 
     def _sample_open_loop_future_from_hidden(
@@ -824,6 +847,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_mask: torch.Tensor,
         flow_clean_norm: torch.Tensor,
         flow_agent_type: torch.Tensor | None = None,
+        flow_agent_length: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
         flow_clean_metric_norm: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
@@ -871,6 +895,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             anchor_mask=anchor_mask,
             flow_clean_norm=flow_clean_norm,
             flow_agent_type=flow_agent_type,
+            flow_agent_length=flow_agent_length,
             flow_loss_mask=flow_loss_mask,
             flow_clean_metric_norm=flow_clean_metric_norm,
         )
@@ -891,11 +916,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             }
             if flow_agent_type is not None:
                 output["flow_metric_agent_type"] = flow_agent_type
-                output["flow_pred_clean_metric_norm"] = self._to_pose_metric_norm(empty, flow_agent_type)
+                if flow_agent_length is not None:
+                    output["flow_metric_agent_length"] = flow_agent_length
+                output["flow_pred_clean_metric_norm"] = self._to_pose_metric_norm(
+                    empty,
+                    flow_agent_type,
+                    flow_agent_length,
+                )
                 output["flow_clean_metric_norm"] = (
                     flow_clean_metric_norm
                     if flow_clean_metric_norm is not None
-                    else self._to_pose_metric_norm(empty, flow_agent_type)
+                    else self._to_pose_metric_norm(empty, flow_agent_type, flow_agent_length)
                 )
             elif flow_clean_metric_norm is not None:
                 output["flow_clean_metric_norm"] = flow_clean_metric_norm
@@ -926,9 +957,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         }
         if flow_agent_type is not None:
             output["flow_metric_agent_type"] = flow_agent_type
+            if flow_agent_length is not None:
+                output["flow_metric_agent_length"] = flow_agent_length
             output["flow_pred_clean_metric_norm"] = self._to_pose_metric_norm(
                 flow_pred_clean_norm,
                 flow_agent_type,
+                flow_agent_length,
             )
             output["flow_clean_metric_norm"] = (
                 flow_clean_metric_norm
@@ -936,6 +970,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 else self._to_pose_metric_norm(
                     flow_clean_norm,
                     flow_agent_type,
+                    flow_agent_length,
                 )
             )
         elif flow_clean_metric_norm is not None:
@@ -1686,8 +1721,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
                 active_agent_type = tokenized_agent["type"][active_mask]
+                active_agent_length = tokenized_agent["shape"][active_mask, 0]
                 if return_flow_2s_preview:
-                    y_hat_metric_norm = self._to_pose_metric_norm(y_hat_norm, active_agent_type)
+                    y_hat_metric_norm = self._to_pose_metric_norm(
+                        y_hat_norm,
+                        active_agent_type,
+                        active_agent_length,
+                    )
                     preview_pos_local = y_hat_metric_norm[..., :2] * 20.0
                     preview_pos_global, _ = transform_to_global(
                         pos_local=preview_pos_local,
@@ -1707,6 +1747,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     current_pos=current_pos_act,
                     current_head=current_head_act,
                     agent_type=active_agent_type,
+                    agent_length=active_agent_length,
                 )
                 exec_pos_history_act = exec_pos_history_10hz[active_mask].clone()
                 exec_head_history_act = exec_head_history_10hz[active_mask].clone()

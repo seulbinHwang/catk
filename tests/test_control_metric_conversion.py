@@ -51,6 +51,7 @@ def _make_control_processor() -> FlowTokenProcessor:
     processor.control_vehicle_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_vehicle_yaw_scale_rad"]
     processor.control_pedestrian_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_pedestrian_yaw_scale_rad"]
     processor.control_cyclist_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_cyclist_yaw_scale_rad"]
+    processor.control_no_slip_point_ratio = 0.0
     return processor
 
 
@@ -63,6 +64,7 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
     current_pos = pos[:, 0]
     current_head = heading[:, 0]
     agent_type = torch.tensor([VEHICLE_TYPE_ID])
+    agent_length = torch.tensor([4.0])
     anchor_mask = torch.tensor([True])
 
     control_target = processor._build_anchor_clean_norm(
@@ -71,6 +73,7 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
+        agent_length=agent_length,
         anchor_mask=anchor_mask,
         raw_step=0,
     )
@@ -81,6 +84,7 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
         vehicle_yaw_scale_rad=processor.control_vehicle_yaw_scale_rad,
         pedestrian_yaw_scale_rad=processor.control_pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=processor.control_cyclist_yaw_scale_rad,
+        no_slip_point_ratio=processor.control_no_slip_point_ratio,
     )
     raw_metric_target = processor._build_anchor_clean_norm(
         pos=pos,
@@ -88,6 +92,7 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
+        agent_length=agent_length,
         anchor_mask=anchor_mask,
         raw_step=0,
         force_pose_space=True,
@@ -130,6 +135,7 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
     decoder.control_vehicle_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_vehicle_yaw_scale_rad"]
     decoder.control_pedestrian_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_pedestrian_yaw_scale_rad"]
     decoder.control_cyclist_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_cyclist_yaw_scale_rad"]
+    decoder.control_no_slip_point_ratio = 0.0
     decoder.flow_ode = _DummyFlowODE()
     decoder.flow_decoder = lambda hidden, x_t, tau, future_valid_mask=None: x_t
     decoder.build_anchor_context = lambda **kwargs: {
@@ -197,6 +203,7 @@ def test_smart_flow_anchor_context_passes_raw_metric_target() -> None:
         "flow_eval_clean_norm": flow_clean_norm,
         "flow_eval_clean_metric_norm": raw_metric_target,
         "flow_eval_agent_type": torch.tensor([VEHICLE_TYPE_ID]),
+        "flow_eval_agent_length": torch.tensor([4.0]),
     }
 
     out = decoder.build_anchor_context_from_map_feature(
@@ -206,3 +213,4 @@ def test_smart_flow_anchor_context_passes_raw_metric_target() -> None:
     )
 
     torch.testing.assert_close(out["flow_clean_metric_norm"], raw_metric_target)
+    torch.testing.assert_close(out["flow_agent_length"], tokenized_agent["flow_eval_agent_length"])

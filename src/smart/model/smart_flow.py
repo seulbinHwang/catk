@@ -1963,6 +1963,7 @@ class SMARTFlow(LightningModule):
                 cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
                 use_holonomic_model_only=self.encoder.agent_encoder.use_holonomic_model_only,
                 use_rolling_supervision=self.encoder.agent_encoder.use_rolling_supervision,
+                no_slip_point_ratio=self.encoder.agent_encoder.control_no_slip_point_ratio,
             )
         return packed_path_norm, anchor_mask
 
@@ -2812,6 +2813,7 @@ open_metric_dict:
             open_pred_metric_norm = eval_generator.flow_norm_to_pose_metric_norm(
                 value=open_pred_clean_norm,
                 agent_type=denoise_pred.get("flow_metric_agent_type"),
+                agent_length=denoise_pred.get("flow_metric_agent_length"),
             )
             open_target_metric_norm = denoise_pred.get(
                 "flow_clean_metric_norm",

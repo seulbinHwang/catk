@@ -74,6 +74,113 @@ def test_vehicle_rolling_control_uses_no_lateral_channel() -> None:
     assert torch.allclose(control[..., 1], torch.zeros_like(control[..., 1]))
 
 
+def test_vehicle_no_slip_point_ratio_zero_preserves_box_center_rule() -> None:
+    current_pos = torch.tensor([[0.0, 0.0]])
+    current_head = torch.tensor([0.2])
+    agent_type = torch.tensor([VEHICLE_TYPE_ID])
+    control = torch.tensor([[[1.0, 0.0, 0.3], [0.5, 0.0, -0.2]]])
+
+    old_pos, old_head = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        current_pos=current_pos,
+        current_head=current_head,
+    )
+    ratio_zero_pos, ratio_zero_head = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        agent_length=torch.tensor([4.5]),
+        current_pos=current_pos,
+        current_head=current_head,
+        no_slip_point_ratio=0.0,
+    )
+
+    torch.testing.assert_close(ratio_zero_pos, old_pos)
+    torch.testing.assert_close(ratio_zero_head, old_head)
+
+
+def test_vehicle_no_slip_point_ratio_adds_box_center_rotation_offset() -> None:
+    current_pos = torch.tensor([[0.0, 0.0]])
+    current_head = torch.tensor([0.0])
+    agent_type = torch.tensor([VEHICLE_TYPE_ID])
+    agent_length = torch.tensor([4.0])
+    control = torch.tensor([[[1.0, 0.0, math.pi / 2.0]]])
+    offset = 0.5 * agent_length
+
+    decoded_pos, decoded_head = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        current_pos=current_pos,
+        current_head=current_head,
+        no_slip_point_ratio=0.5,
+    )
+
+    delta_head = control[:, 0, 2]
+    mid_head = current_head + 0.5 * delta_head
+    arc = control[:, 0, 0].unsqueeze(-1) * safe_sinc(0.5 * delta_head).unsqueeze(-1) * torch.stack(
+        [mid_head.cos(), mid_head.sin()],
+        dim=-1,
+    )
+    heading_offset = offset.unsqueeze(-1) * (
+        torch.stack([delta_head.cos(), delta_head.sin()], dim=-1)
+        - torch.stack([current_head.cos(), current_head.sin()], dim=-1)
+    )
+    expected_pos = current_pos + arc + heading_offset
+
+    torch.testing.assert_close(decoded_pos[:, 0], expected_pos, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(decoded_head[:, 0], torch.tensor([math.pi / 2.0]), atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_vehicle_no_slip_point_rolling_label_round_trips_with_same_transition() -> None:
+    current_pos = torch.tensor([[2.0, -1.0]])
+    current_head = torch.tensor([0.3])
+    agent_type = torch.tensor([VEHICLE_TYPE_ID])
+    agent_length = torch.tensor([4.0])
+    original_control = torch.tensor([[[1.2, 0.0, 0.35], [0.8, 0.0, -0.15]]])
+
+    future_pos, future_head = decode_control_sequence(
+        control=original_control,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        current_pos=current_pos,
+        current_head=current_head,
+        no_slip_point_ratio=0.5,
+    )
+    control_norm = build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        no_slip_point_ratio=0.5,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+    rebuilt_control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
+    rebuilt_pos, rebuilt_head = decode_control_sequence(
+        control=rebuilt_control,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        current_pos=current_pos,
+        current_head=current_head,
+        no_slip_point_ratio=0.5,
+    )
+
+    torch.testing.assert_close(rebuilt_control, original_control, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(rebuilt_pos, future_pos, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(rebuilt_head, future_head, atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_vehicle_no_slip_point_ratio_requires_agent_length() -> None:
+    with pytest.raises(ValueError, match="agent_length is required"):
+        decode_control_sequence(
+            control=torch.zeros((1, 1, 3)),
+            agent_type=torch.tensor([VEHICLE_TYPE_ID]),
+            no_slip_point_ratio=0.5,
+        )
+
+
 def test_holonomic_model_only_lets_vehicle_use_lateral_channel_and_round_trip() -> None:
     current_pos = torch.tensor([[0.0, 0.0]])
     current_head = torch.tensor([0.0])

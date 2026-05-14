@@ -41,6 +41,7 @@ class SMARTFlowDecoder(nn.Module):
         use_holonomic_model_only: bool = False,
         use_rolling_supervision: bool = True,
         control_pos_scale_m: float = 1.0,
+        control_no_slip_point_ratio: float = 0.0,
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
         control_cyclist_yaw_scale_rad: float | None = None,
@@ -65,6 +66,7 @@ class SMARTFlowDecoder(nn.Module):
             flow_window_steps=flow_window_steps,
             use_kinematic_control_flow=use_kinematic_control_flow,
             control_pos_scale_m=control_pos_scale_m,
+            control_no_slip_point_ratio=control_no_slip_point_ratio,
             control_vehicle_yaw_scale_rad=control_vehicle_yaw_scale_rad,
             control_pedestrian_yaw_scale_rad=control_pedestrian_yaw_scale_rad,
             control_cyclist_yaw_scale_rad=control_cyclist_yaw_scale_rad,
@@ -118,12 +120,17 @@ class SMARTFlowDecoder(nn.Module):
             "flow_train_mask": "flow_train_agent_type",
             "flow_eval_mask": "flow_eval_agent_type",
         }[anchor_mask_key]
+        flow_agent_length_key = {
+            "flow_train_mask": "flow_train_agent_length",
+            "flow_eval_mask": "flow_eval_agent_length",
+        }[anchor_mask_key]
         return self.agent_encoder(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             anchor_mask=tokenized_agent[anchor_mask_key],
             flow_clean_norm=tokenized_agent[flow_clean_norm_key],
             flow_agent_type=tokenized_agent.get(flow_agent_type_key),
+            flow_agent_length=tokenized_agent.get(flow_agent_length_key),
             flow_loss_mask=flow_loss_mask,
             flow_clean_metric_norm=tokenized_agent.get(flow_clean_metric_norm_key),
         )
@@ -151,12 +158,17 @@ class SMARTFlowDecoder(nn.Module):
             "flow_train_mask": "flow_train_agent_type",
             "flow_eval_mask": "flow_eval_agent_type",
         }[anchor_mask_key]
+        flow_agent_length_key = {
+            "flow_train_mask": "flow_train_agent_length",
+            "flow_eval_mask": "flow_eval_agent_length",
+        }[anchor_mask_key]
         return self.agent_encoder.build_anchor_context(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             anchor_mask=tokenized_agent[anchor_mask_key],
             flow_clean_norm=tokenized_agent[flow_clean_norm_key],
             flow_agent_type=tokenized_agent.get(flow_agent_type_key),
+            flow_agent_length=tokenized_agent.get(flow_agent_length_key),
             flow_loss_mask=flow_loss_mask,
             flow_clean_metric_norm=tokenized_agent.get(flow_clean_metric_norm_key),
         )
@@ -352,8 +364,13 @@ class SMARTFlowDecoder(nn.Module):
         self,
         value: Tensor,
         agent_type: Tensor | None,
+        agent_length: Tensor | None = None,
     ) -> Tensor:
-        return self.agent_encoder.flow_norm_to_pose_metric_norm(value=value, agent_type=agent_type)
+        return self.agent_encoder.flow_norm_to_pose_metric_norm(
+            value=value,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
 
     def inference(
         self,

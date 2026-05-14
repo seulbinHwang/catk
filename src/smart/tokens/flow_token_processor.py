@@ -8,6 +8,7 @@ from torch_geometric.data import HeteroData
 
 from src.smart.modules.kinematic_control import (
     CONTROL_FLOW_DIM,
+    DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
     DEFAULT_CONTROL_POS_SCALE_M,
     DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
     POSE_FLOW_DIM,
@@ -37,6 +38,7 @@ class FlowTokenProcessor(TokenProcessor):
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
         control_cyclist_yaw_scale_rad: float | None = None,
+        control_no_slip_point_ratio: float = DEFAULT_CONTROL_NO_SLIP_POINT_RATIO,
         control_round_trip_max_position_error_m: float = DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
     ) -> None:
         super().__init__(
@@ -57,6 +59,12 @@ class FlowTokenProcessor(TokenProcessor):
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
         self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
+        self.control_no_slip_point_ratio = float(control_no_slip_point_ratio)
+        if self.control_no_slip_point_ratio < 0.0:
+            raise ValueError(
+                "control_no_slip_point_ratio must be non-negative, "
+                f"got {self.control_no_slip_point_ratio}."
+            )
         if self.use_kinematic_control_flow:
             (
                 self.control_vehicle_yaw_scale_rad,
@@ -151,6 +159,7 @@ class FlowTokenProcessor(TokenProcessor):
             flow_train_metric_chunks: List[Tensor] = []
             flow_train_loss_mask_chunks: List[Tensor] = []
             flow_train_agent_type_chunks: List[Tensor] = []
+            flow_train_agent_length_chunks: List[Tensor] = []
 
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
@@ -169,6 +178,7 @@ class FlowTokenProcessor(TokenProcessor):
                     current_pos=current_pos,
                     current_head=current_head,
                     agent_type=tokenized_agent["type"],
+                    agent_length=tokenized_agent["shape"][:, 0],
                     anchor_mask=train_anchor_mask,
                     raw_step=raw_step,
                     future_loss_mask=selected_future_loss_mask,
@@ -202,6 +212,7 @@ class FlowTokenProcessor(TokenProcessor):
                         current_pos=current_pos,
                         current_head=current_head,
                         agent_type=tokenized_agent["type"],
+                        agent_length=tokenized_agent["shape"][:, 0],
                         anchor_mask=train_anchor_mask,
                         raw_step=raw_step,
                         future_loss_mask=selected_future_loss_mask,
@@ -214,6 +225,7 @@ class FlowTokenProcessor(TokenProcessor):
                 flow_train_metric_chunks.append(flow_train_metric_norm)
                 flow_train_loss_mask_chunks.append(selected_future_loss_mask)
                 flow_train_agent_type_chunks.append(tokenized_agent["type"][train_anchor_mask])
+                flow_train_agent_length_chunks.append(tokenized_agent["shape"][train_anchor_mask, 0])
 
             self._assert_flow_train_anchor_context_valid(
                 flow_train_mask=flow_train_mask,
@@ -242,6 +254,11 @@ class FlowTokenProcessor(TokenProcessor):
                         dtype=tokenized_agent["type"].dtype,
                         device=device,
                     ),
+                    "flow_train_agent_length": self._concat_vector_chunks(
+                        chunks=flow_train_agent_length_chunks,
+                        dtype=dtype,
+                        device=device,
+                    ),
                 }
             )
             for key in [
@@ -260,6 +277,7 @@ class FlowTokenProcessor(TokenProcessor):
         flow_eval_chunks: List[Tensor] = []
         flow_eval_metric_chunks: List[Tensor] = []
         flow_eval_agent_type_chunks: List[Tensor] = []
+        flow_eval_agent_length_chunks: List[Tensor] = []
         for anchor_offset, raw_step in enumerate(raw_current_steps):
             current_valid = valid[:, raw_step]
             future_valid = self._build_anchor_future_valid(valid=valid, raw_step=raw_step)
@@ -269,12 +287,14 @@ class FlowTokenProcessor(TokenProcessor):
                 continue
 
             flow_eval_agent_type_chunks.append(tokenized_agent["type"][anchor_mask])
+            flow_eval_agent_length_chunks.append(tokenized_agent["shape"][anchor_mask, 0])
             flow_eval_clean_norm = self._build_anchor_clean_norm(
                 pos=pos,
                 heading=heading,
                 current_pos=pos[:, raw_step],
                 current_head=heading[:, raw_step],
                 agent_type=tokenized_agent["type"],
+                agent_length=tokenized_agent["shape"][:, 0],
                 anchor_mask=anchor_mask,
                 raw_step=raw_step,
             )
@@ -286,6 +306,7 @@ class FlowTokenProcessor(TokenProcessor):
                     current_pos=pos[:, raw_step],
                     current_head=heading[:, raw_step],
                     agent_type=tokenized_agent["type"],
+                    agent_length=tokenized_agent["shape"][:, 0],
                     anchor_mask=anchor_mask,
                     raw_step=raw_step,
                     force_pose_space=True,
@@ -311,6 +332,11 @@ class FlowTokenProcessor(TokenProcessor):
                 "flow_eval_agent_type": self._concat_vector_chunks(
                     chunks=flow_eval_agent_type_chunks,
                     dtype=tokenized_agent["type"].dtype,
+                    device=device,
+                ),
+                "flow_eval_agent_length": self._concat_vector_chunks(
+                    chunks=flow_eval_agent_length_chunks,
+                    dtype=dtype,
                     device=device,
                 ),
             }
@@ -467,6 +493,7 @@ class FlowTokenProcessor(TokenProcessor):
         current_pos: Tensor,
         current_head: Tensor,
         agent_type: Tensor,
+        agent_length: Tensor | None,
         anchor_mask: Tensor,
         raw_step: int,
         future_loss_mask: Tensor | None = None,
@@ -481,6 +508,7 @@ class FlowTokenProcessor(TokenProcessor):
             current_pos: 현재 coarse anchor 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 coarse anchor 방향입니다. shape은 ``[n_agent]`` 입니다.
             agent_type: agent 종류입니다. shape은 ``[n_agent]`` 입니다.
+            agent_length: WOMD box length입니다. shape은 ``[n_agent]`` 입니다.
             anchor_mask: 이번 anchor를 실제로 학습 또는 평가에 쓰는지 나타냅니다.
                 shape은 ``[n_agent]`` 입니다.
             raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
@@ -512,6 +540,7 @@ class FlowTokenProcessor(TokenProcessor):
         selected_current_pos = current_pos[anchor_mask]
         selected_current_head = current_head[anchor_mask]
         selected_agent_type = agent_type[anchor_mask]
+        selected_agent_length = agent_length[anchor_mask] if agent_length is not None else None
         future_start = raw_step + 1
         future_end = future_start + self.flow_window_steps
 
@@ -579,12 +608,14 @@ class FlowTokenProcessor(TokenProcessor):
                     current_pos=selected_current_pos,
                     current_head=selected_current_head,
                     agent_type=selected_agent_type,
+                    agent_length=selected_agent_length,
                     pos_scale_m=self.control_pos_scale_m,
                     vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
                     pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                     cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
                     use_holonomic_model_only=self.use_holonomic_model_only,
                     use_rolling_supervision=self.use_rolling_supervision,
+                    no_slip_point_ratio=self.control_no_slip_point_ratio,
                 )
             return build_rolling_control_target(
                 future_pos=future_pos,
@@ -592,12 +623,14 @@ class FlowTokenProcessor(TokenProcessor):
                 current_pos=selected_current_pos,
                 current_head=selected_current_head,
                 agent_type=selected_agent_type,
+                agent_length=selected_agent_length,
                 pos_scale_m=self.control_pos_scale_m,
                 vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
                 pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                 cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
                 use_holonomic_model_only=self.use_holonomic_model_only,
                 use_rolling_supervision=self.use_rolling_supervision,
+                no_slip_point_ratio=self.control_no_slip_point_ratio,
             )
 
         if return_round_trip_error:
