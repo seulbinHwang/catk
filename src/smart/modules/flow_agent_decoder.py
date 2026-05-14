@@ -1140,6 +1140,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         max_steps: int | None = None,
         strict_active_mask: bool = True,
         sampling_seed: int | None = None,
+        gen_batch_chunk: int = 16384,
     ) -> Dict[str, object]:
         """RoaD expert-guided closed-loop rollout (데이터 수집, 항상 no_grad).
 
@@ -1165,6 +1166,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             max_steps: 실행할 coarse step 상한입니다. None 이면 전체.
             strict_active_mask: True 면 BC term 에 horizon 전체 GT valid 인 agent 만 포함.
             sampling_seed: 후보 난수 재현용 seed 입니다.
+            gen_batch_chunk: 한 번의 flow_ode.generate 에 넣을 최대 행 수입니다.
+                n_active*K 가 크면 attention CUDA 커널 grid 한계를 넘으므로 이 단위로
+                쪼개 생성합니다.
 
         Returns:
             Dict[str, object]:
@@ -1303,28 +1307,44 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 active_type = tokenized_agent["type"][active_mask]
 
                 # ── K 후보 i.i.d. 샘플 ───────────────────────────────────────
+                # n_active*K 를 한 번에 flow_ode.generate 하면 step_refiner 의
+                # scaled_dot_product_attention CUDA 커널이 batch grid 한계(~65535)를
+                # 넘어 "invalid configuration argument" 로 죽는다. gen_batch_chunk
+                # 행 단위로 쪼개서 생성 후 concat (전부 no_grad 라 반복 비용 작음).
                 hidden_rep = active_hidden.repeat_interleave(K, dim=0)   # [n_active*K, D]
                 x_init = torch.randn(
                     n_active * K, sample_window_steps, 4,
                     device=device, dtype=dtype, generator=generator,
                 ) * float(temperature)
-                _model_fn = lambda x_t, tau, _h=hidden_rep: self.flow_decoder(_h, x_t, tau)
-                if self.use_predict_project_renoise and _has_proj:
-                    _at_rep = active_type.repeat_interleave(K, dim=0)
-                    cand = self.flow_ode.generate_predict_project_renoise(
-                        x_init=x_init,
-                        model_fn=_model_fn,
-                        project_fn=lambda x1, pw: self.kinematic_projector(
-                            x1, _at_rep, proj_weight=pw,
-                        ),
-                        steps=self.ppr_steps,
-                    )
-                else:
-                    cand = self.flow_ode.generate(x_init=x_init, model_fn=_model_fn)
-                    if _has_proj:
-                        _at_rep = active_type.repeat_interleave(K, dim=0)
-                        cand = self.kinematic_projector(cand, _at_rep)
-                cand = cand.view(n_active, K, sample_window_steps, 4)    # [n_active, K, 20, 4]
+                _at_rep = (
+                    active_type.repeat_interleave(K, dim=0) if _has_proj else None
+                )
+                total_rows = n_active * K
+                _chunk = max(1, int(gen_batch_chunk))
+                cand_chunks: list[torch.Tensor] = []
+                for cs in range(0, total_rows, _chunk):
+                    ce = min(total_rows, cs + _chunk)
+                    _h_c = hidden_rep[cs:ce]
+                    _x_c = x_init[cs:ce]
+                    _model_fn = lambda x_t, tau, _h=_h_c: self.flow_decoder(_h, x_t, tau)
+                    if self.use_predict_project_renoise and _has_proj:
+                        _c = self.flow_ode.generate_predict_project_renoise(
+                            x_init=_x_c,
+                            model_fn=_model_fn,
+                            project_fn=lambda x1, pw, _a=_at_rep[cs:ce]: self.kinematic_projector(
+                                x1, _a, proj_weight=pw,
+                            ),
+                            steps=self.ppr_steps,
+                        )
+                    else:
+                        _c = self.flow_ode.generate(x_init=_x_c, model_fn=_model_fn)
+                        if _has_proj:
+                            _c = self.kinematic_projector(_c, _at_rep[cs:ce])
+                    cand_chunks.append(_c)
+                cand = torch.cat(cand_chunks, dim=0).view(
+                    n_active, K, sample_window_steps, 4
+                )                                                       # [n_active, K, 20, 4]
+                del cand_chunks, hidden_rep, x_init
 
                 # ── GT continuation 을 현재(drift 된) anchor-local frame 으로 ─
                 anchor_10hz = step_current_10hz + t * self.shift
