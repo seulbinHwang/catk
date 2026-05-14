@@ -87,6 +87,11 @@ model:
       # Strict active_mask: future fine step 모두 valid 인 agent 만 OCSC anchor 사용
       # (main training 과 일관). 부분 invalid agent 의 hallucination self-consistency 방지.
       ocsc_strict_active_mask: true
+      # OL target 용 ref_flow_decoder 갱신 방식:
+      #   "frozen" (기본) | "periodic" (interval step 마다 hard copy) | "ema" (mean-teacher)
+      ocsc_ref_refresh_mode: "frozen"
+      ocsc_ref_refresh_interval: 0      # periodic 모드 갱신 주기 (training step)
+      ocsc_ref_ema_decay: 0.999         # ema 모드 decay 계수
       # ── BPTT tricks ─────────────────────────────────────────────────
       flow_velocity_head_only: true
       # 학습 대상 module 선택 (flow_velocity_head_only 보다 우선).

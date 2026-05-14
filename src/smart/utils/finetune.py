@@ -100,6 +100,15 @@ class FinetuneConfig:
     #: (anchor 시점 valid 인데 future 일부 invalid) 는 OCSC anchor 에서 제외 →
     #: model 이 학습 안 한 영역의 hallucination self-consistency 학습 방지.
     ocsc_strict_active_mask: bool = False
+    #: OL target 생성에 쓰는 ref_flow_decoder 갱신 방식.
+    #: "frozen" (기본): 학습 시작 시점 pretrained 가중치로 고정.
+    #: "periodic": ocsc_ref_refresh_interval step 마다 현재 flow_decoder 로 hard copy.
+    #: "ema": 매 step ref = decay·ref + (1-decay)·current (mean-teacher 방식).
+    ocsc_ref_refresh_mode: str = "frozen"
+    #: periodic 모드의 갱신 주기 (training step). 0 이하면 갱신 안 함.
+    ocsc_ref_refresh_interval: int = 0
+    #: ema 모드의 decay 계수. 1 에 가까울수록 ref 가 느리게 따라옴.
+    ocsc_ref_ema_decay: float = 0.999
     # ── RoaD (Rollouts as Demonstrations) CL-SFT baseline ─────────────────────
     # RoaD 논문 (NVIDIA, 2025) 의 closed-loop SFT 방법론을 OCSC 비교용 baseline 으로
     # 구현한 분기 (mode="road_ft").  알고리즘:
@@ -200,6 +209,9 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_ol_resolution=str(_read_config_value(finetune, "ocsc_ol_resolution", "10hz")),
         ocsc_nearest_include_gt=bool(_read_config_value(finetune, "ocsc_nearest_include_gt", False)),
         ocsc_strict_active_mask=bool(_read_config_value(finetune, "ocsc_strict_active_mask", False)),
+        ocsc_ref_refresh_mode=str(_read_config_value(finetune, "ocsc_ref_refresh_mode", "frozen")),
+        ocsc_ref_refresh_interval=int(_read_config_value(finetune, "ocsc_ref_refresh_interval", 0)),
+        ocsc_ref_ema_decay=float(_read_config_value(finetune, "ocsc_ref_ema_decay", 0.999)),
         road_sample_k=int(_read_config_value(finetune, "road_sample_k", 64)),
         road_n_rollouts=int(_read_config_value(finetune, "road_n_rollouts", 1)),
         road_pred_max_steps=int(_read_config_value(finetune, "road_pred_max_steps", 16)),

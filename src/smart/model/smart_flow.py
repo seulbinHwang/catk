@@ -2543,6 +2543,45 @@ class SMARTFlow(LightningModule):
 
         opt.step()
 
+        # OL target 용 ref_flow_decoder 갱신 (frozen / periodic / ema).
+        self._maybe_refresh_ref_decoder()
+
+    def _maybe_refresh_ref_decoder(self) -> None:
+        """OL target 생성용 ``ref_flow_decoder`` 를 설정에 따라 갱신합니다.
+
+        ``ocsc_ref_refresh_mode``:
+          - ``"frozen"`` (기본): 갱신하지 않습니다 (학습 시작 시점 가중치 고정).
+          - ``"periodic"``: ``ocsc_ref_refresh_interval`` step 마다 현재
+            flow_decoder 의 state_dict 로 hard copy 합니다.
+          - ``"ema"``: 매 step ``ref = decay·ref + (1-decay)·current`` 로
+            지수이동평균 갱신합니다 (mean-teacher 방식).
+        """
+        if self.ref_flow_decoder is None or not self._is_ocsc_ft_enabled():
+            return
+        mode = str(getattr(self.finetune_config, "ocsc_ref_refresh_mode", "frozen")).lower()
+        if mode == "frozen":
+            return
+        cur = self.encoder.agent_encoder.flow_decoder
+        if mode == "periodic":
+            interval = int(getattr(self.finetune_config, "ocsc_ref_refresh_interval", 0))
+            if interval <= 0:
+                return
+            gstep = int(getattr(self, "global_step", 0))
+            if gstep > 0 and gstep % interval == 0:
+                self.ref_flow_decoder.load_state_dict(cur.state_dict())
+                log.info(f"[ocsc] step={gstep} ref_flow_decoder hard-refreshed (periodic).")
+        elif mode == "ema":
+            decay = float(getattr(self.finetune_config, "ocsc_ref_ema_decay", 0.999))
+            with torch.no_grad():
+                for rp, cp in zip(self.ref_flow_decoder.parameters(), cur.parameters()):
+                    rp.mul_(decay).add_(cp.detach(), alpha=1.0 - decay)
+                for rb, cb in zip(self.ref_flow_decoder.buffers(), cur.buffers()):
+                    rb.copy_(cb)
+        else:
+            log.warning(
+                f"[ocsc] unknown ocsc_ref_refresh_mode={mode!r}; treating as 'frozen'."
+            )
+
     def _final_projection_val_step(
         self,
         tokenized_map: Dict,

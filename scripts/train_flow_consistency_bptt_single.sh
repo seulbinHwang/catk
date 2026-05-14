@@ -176,6 +176,11 @@ OCSC_NEAREST_INCLUDE_GT="${OCSC_NEAREST_INCLUDE_GT:-false}"
 # Strict active_mask: future fine step 모두 valid 인 agent 만 OCSC 학습 (main training 과 일관성).
 # 부분 invalid agent 의 hallucination self-consistency 학습 방지.
 OCSC_STRICT_ACTIVE_MASK="${OCSC_STRICT_ACTIVE_MASK:-true}"
+# OL target 용 ref_flow_decoder 갱신 방식:
+#   "frozen" (기본) | "periodic" (REFRESH_INTERVAL step 마다 hard copy) | "ema" (mean-teacher)
+OCSC_REF_REFRESH_MODE="${OCSC_REF_REFRESH_MODE:-frozen}"
+OCSC_REF_REFRESH_INTERVAL="${OCSC_REF_REFRESH_INTERVAL:-0}"
+OCSC_REF_EMA_DECAY="${OCSC_REF_EMA_DECAY:-0.999}"
 
 # ── BPTT tricks ────────────────────────────────────────────────────────────
 BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
@@ -276,6 +281,7 @@ echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_T
 echo "OCSC_HEADING_WEIGHT=${OCSC_HEADING_WEIGHT} OCSC_POSITION_WEIGHT=${OCSC_POSITION_WEIGHT} OCSC_REL_DISP_WEIGHT=${OCSC_REL_DISP_WEIGHT}"
 echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA} OCSC_GT_TARGET=${OCSC_GT_TARGET} OCSC_GT_RES=${OCSC_GT_RESOLUTION} OCSC_OL_RES=${OCSC_OL_RESOLUTION}"
 echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
+echo "OCSC_REF_REFRESH_MODE=${OCSC_REF_REFRESH_MODE} interval=${OCSC_REF_REFRESH_INTERVAL} ema_decay=${OCSC_REF_EMA_DECAY}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_GRAD_CLIP=${BPTT_GRAD_CLIP_TRAJ} LR=${LR}"
 echo "OMP=${OMP_NUM_THREADS} MKL=${MKL_NUM_THREADS} NUM_WORKERS=${NUM_WORKERS} WOSAC_HARD_POOL=${WOSAC_HARD_POOL_WORKERS} WOSAC_REAL_POOL=${WOSAC_REAL_POOL_WORKERS} WOSAC_VERIFY=${WOSAC_VERIFY}"
 
@@ -349,6 +355,9 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_ol_resolution="${OCSC_OL_RESOLUTION}" \
   model.model_config.finetune.ocsc_nearest_include_gt="${OCSC_NEAREST_INCLUDE_GT}" \
   model.model_config.finetune.ocsc_strict_active_mask="${OCSC_STRICT_ACTIVE_MASK}" \
+  model.model_config.finetune.ocsc_ref_refresh_mode="${OCSC_REF_REFRESH_MODE}" \
+  model.model_config.finetune.ocsc_ref_refresh_interval="${OCSC_REF_REFRESH_INTERVAL}" \
+  model.model_config.finetune.ocsc_ref_ema_decay="${OCSC_REF_EMA_DECAY}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_sequential_rollouts="${BPTT_SEQUENTIAL_ROLLOUTS}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
