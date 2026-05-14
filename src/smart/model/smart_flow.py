@@ -2622,6 +2622,19 @@ class SMARTFlow(LightningModule):
                         self.log_epoch if self.log_epoch >= 0 else self.current_epoch
                     )
                     self.logger.log_metrics(epoch_sim_agents_metrics)
+                # stdout 에도 sub-metric 출력 (wandb 외부에서 grep/monitor 용).
+                if self.global_rank == 0:
+                    _gstep = int(getattr(self, "global_step", 0))
+                    def _fmt(_v: object) -> str:
+                        try:
+                            return f"{float(_v):.5f}"
+                        except (TypeError, ValueError):
+                            return str(_v)
+                    _summary = " ".join(
+                        f"{_k.rsplit('/', 1)[-1]}={_fmt(_v)}"
+                        for _k, _v in sorted(epoch_sim_agents_metrics.items())
+                    )
+                    log.info(f"[val_closed] step={_gstep} {_summary}")
                 self.sim_agents_metrics.reset()
                 self.minADE.reset()
 
