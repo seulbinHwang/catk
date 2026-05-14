@@ -68,10 +68,14 @@ SEED="${SEED:-817}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 TRAINER_DETERMINISTIC="${TRAINER_DETERMINISTIC:-true}"
 
-LR="${LR:-5e-6}"
-LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
-LR_MIN_RATIO="${LR_MIN_RATIO:-0.1}"
+# LR 셋팅은 flow-matching pretraining (pre_bc_flow.yaml) 참조: lr=4e-4 / min_ratio=1e-2.
+# RoaD BC loss = pretraining 과 동일 objective. fine-tuning 이라 warmup 만 약간 키움.
+LR="${LR:-4e-4}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-50}"
+LR_MIN_RATIO="${LR_MIN_RATIO:-0.01}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
+# pretraining 과 동일하게 gradient clip 1.0 (road_ft 는 manual opt → finetune.gradient_clip_val).
+GRAD_CLIP_VAL="${GRAD_CLIP_VAL:-1.0}"
 if [ -z "${LR_TOTAL_STEPS}" ] || [ "${LR_TOTAL_STEPS}" = "-1" ]; then
   LR_TOTAL_STEPS=$(python3 - <<PY
 import pathlib, math
@@ -102,8 +106,8 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-0}"
 # ── RoaD 파라미터 ──────────────────────────────────────────────────────────
 # K: Sample-K 후보 개수 (논문 기본값 64).
 ROAD_SAMPLE_K="${ROAD_SAMPLE_K:-64}"
-# 시나리오당 expert-guided rollout 수 (N_roll).
-ROAD_N_ROLLOUTS="${ROAD_N_ROLLOUTS:-1}"
+# 시나리오당 expert-guided rollout 수 (N_roll). 논문 Table 4: 많을수록 단조 개선.
+ROAD_N_ROLLOUTS="${ROAD_N_ROLLOUTS:-3}"
 # expert-guided rollout coarse step 수 (16 = 8초 full episode).
 ROAD_PRED_MAX_STEPS="${ROAD_PRED_MAX_STEPS:-16}"
 # 후보 샘플링 noise scale (논문 temperature 0.8).
@@ -119,9 +123,9 @@ ROAD_STRICT_ACTIVE_MASK="${ROAD_STRICT_ACTIVE_MASK:-true}"
 ROAD_EVAL_HARD_RMM="${ROAD_EVAL_HARD_RMM:-true}"
 ROAD_EVAL_HARD_RMM_INTERVAL="${ROAD_EVAL_HARD_RMM_INTERVAL:-10}"
 
-# 학습 대상 module 선택 (OCSC 와 공유).
-FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-true}"
-FLOW_FT_TARGET="${FLOW_FT_TARGET:-default}"
+# 학습 대상 module 선택. RoaD 는 정책 전체 SFT 라 "full" 이 가장 충실.
+FLOW_VELOCITY_HEAD_ONLY="${FLOW_VELOCITY_HEAD_ONLY:-false}"
+FLOW_FT_TARGET="${FLOW_FT_TARGET:-full}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -200,6 +204,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.decoder.flow_solver_steps="${FLOW_SOLVER_STEPS}" \
   model.model_config.finetune.flow_velocity_head_only="${FLOW_VELOCITY_HEAD_ONLY}" \
   model.model_config.finetune.flow_ft_target="${FLOW_FT_TARGET}" \
+  model.model_config.finetune.gradient_clip_val="${GRAD_CLIP_VAL}" \
   model.model_config.finetune.road_sample_k="${ROAD_SAMPLE_K}" \
   model.model_config.finetune.road_n_rollouts="${ROAD_N_ROLLOUTS}" \
   model.model_config.finetune.road_pred_max_steps="${ROAD_PRED_MAX_STEPS}" \

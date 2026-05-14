@@ -20,10 +20,14 @@ action: finetune
 
 model:
   model_config:
-    lr: 5e-6
-    lr_warmup_steps: 0
+    # LR 셋팅은 flow-matching pretraining (configs/experiment/pre_bc_flow.yaml) 참조.
+    # RoaD BC loss = pretraining 과 동일한 flow-matching objective 라 같은 스케줄 사용.
+    # pretraining: lr=4e-4 / warmup=4 / min_ratio=1e-2 / grad_clip=1.0.
+    # fine-tuning 이므로 warmup 만 약간 키움 (4 → 50).
+    lr: 4e-4
+    lr_warmup_steps: 50
     lr_total_steps: -1
-    lr_min_ratio: 0.1
+    lr_min_ratio: 1e-2
     weight_decay: 1e-4
     lr_scheduler_unit: step
     n_rollout_closed_val: 4
@@ -46,7 +50,9 @@ model:
       # K: Sample-K 후보 개수 (논문 기본값 64).
       road_sample_k: 64
       # 시나리오당 expert-guided rollout 수 (RoaD SFT dataset 의 N_roll).
-      road_n_rollouts: 1
+      # 매 training step 마다 같은 batch 를 N_roll 번 (다른 noise seed) expert-guided
+      # rollout 해 demonstration 을 N_roll 벌 모음. 논문 Table 4: 많을수록 단조 개선.
+      road_n_rollouts: 3
       # expert-guided rollout coarse step 수 (16 = 8초 full episode, WOSAC 기준).
       road_pred_max_steps: 16
       # 후보 샘플링 noise scale (논문의 sampling temperature 0.8).
@@ -62,8 +68,12 @@ model:
       road_eval_hard_rmm: true
       road_eval_hard_rmm_interval: 1
       # ── 학습 대상 module 선택 (OCSC 와 공유) ───────────────────────────
-      flow_velocity_head_only: true
-      flow_ft_target: "default"
+      # RoaD 는 정책 전체 SFT 라 flow_decoder 전체 학습 ("full") 이 가장 충실.
+      flow_velocity_head_only: false
+      flow_ft_target: "full"
+      # pretraining (pre_bc_flow) 과 동일하게 gradient clip 1.0.
+      # road_ft 는 manual optimization → trainer.gradient_clip_val 대신 이 값을 사용.
+      gradient_clip_val: 1.0
 
 ckpt_path: null
 
