@@ -16,10 +16,19 @@ from typing import Optional
 from lightning import LightningDataModule
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 from torch_geometric.loader import DataLoader
+from torch_geometric.transforms import BaseTransform
 
 from src.smart.datasets import MultiDataset
 
 from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
+
+
+def build_train_agent_target_builder(
+    train_max_num: int, train_use_eval_agent_selection: bool
+) -> BaseTransform:
+    if train_use_eval_agent_selection:
+        return WaymoTargetBuilderVal()
+    return WaymoTargetBuilderTrain(train_max_num)
 
 
 class MultiDataModule(LightningDataModule):
@@ -37,6 +46,7 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        train_use_eval_agent_selection: bool = False,
         road_num_rollouts_per_scenario: int = 1,
     ) -> None:
         super(MultiDataModule, self).__init__()
@@ -51,11 +61,14 @@ class MultiDataModule(LightningDataModule):
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
+        self.train_use_eval_agent_selection = train_use_eval_agent_selection
         self.road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
         self._train_dataset_raw_dir: Optional[str] = None
         self._train_dataset_road_group_size: Optional[int] = None
 
-        self.train_transform = WaymoTargetBuilderTrain(train_max_num)
+        self.train_transform = build_train_agent_target_builder(
+            train_max_num, train_use_eval_agent_selection
+        )
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
 

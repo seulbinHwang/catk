@@ -107,7 +107,7 @@ class CrossEntropy(Metric):
 
         # ! weighting final loss [n_agent, n_step]
         loss_weighting_mask = next_token_valid & euclidean_target_valid
-        if self.training:
+        if self.training and train_mask is not None:
             loss_weighting_mask &= train_mask.unsqueeze(1)  # [n_agent, n_step]
 
         self.loss_sum += (loss * loss_weighting_mask).sum()
