@@ -34,7 +34,7 @@ model_config:
     temp: 1.0
   decoder:
     hidden_dim: 128
-    num_freq_bands: 64
+    num_freq_bands: 66
     num_heads: 8
     head_dim: 16
     dropout: 0.1
