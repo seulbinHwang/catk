@@ -77,6 +77,25 @@ To reproduce our final results, you should follow the following steps
 3. Use [scripts/wosac_sub.sh](scripts/wosac_sub.sh) to pack the submission fille for `validate` or `test` split. Upload the `wosac_submission.tar.gz` file located in `logs` folder to the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) such that you can evaluate the model fine-tuned in step 2 on the WOSAC leaderboard.
 4. Alternatively, you can do local validation with [scripts/local_val.sh](scripts/local_val.sh).
 
+### 공정 비교용 SMART NTP 학습 agent selection
+
+KFM 계열 실험과 SMART NTP pretrain을 공정하게 비교할 때는 학습 손실을 받는
+agent 집합도 맞춰야 한다. 이를 위해 `configs/experiment/pre_bc.yaml`은
+`data.train_use_eval_agent_selection: true`를 켠다.
+
+이 설정이 켜진 SMART NTP pretrain은 학습 전용 150m 거리 clipping, 현재 100m
+조건, 미래 valid 길이 조건, 그리고 scenario당 최대 32개 target random selection을
+적용하지 않는다. 대신 validation과 같은 no-op agent transform을 사용하고,
+별도 train mask가 없으면 모든 valid target에 대해 loss를 계산한다. 즉, 방법론
+비교에서 "KFM은 넓은 agent 집합을 학습하고 SMART NTP는 near-ego 일부 agent만
+학습한다"는 차이가 생기지 않도록 맞춘다.
+
+기본 data config인 `configs/data/waymo.yaml`의 기본값은
+`train_use_eval_agent_selection: false`이므로, 별도 override가 없는 기존 학습
+동작은 유지된다. 또한 target builder는 PyG `BaseTransform`의 현재 실행 형식에
+맞게 구현되어 있어, true/false 양쪽 train selection mode 모두 datamodule 생성
+단계에서 바로 사용할 수 있다.
+
 ### Dynamic traffic-light staleness for SMART baselines
 
 The SMART token baseline now uses the same traffic-light input semantics as the
