@@ -455,7 +455,7 @@ class FlowTokenProcessor(TokenProcessor):
         return future_loss_mask
 
     def _build_prefix_valid_future_loss_mask(self, valid: Tensor, raw_step: int) -> Tensor:
-        """가까운 미래부터 연속 유효한 구간을 0.5초 단위로 잘라 loss mask로 만듭니다.
+        """가까운 미래부터 연속으로 유효한 구간만 loss mask로 만듭니다.
 
         Args:
             valid: 각 agent와 시점의 유효 여부입니다.
@@ -466,10 +466,8 @@ class FlowTokenProcessor(TokenProcessor):
             Tensor:
                 미래 step별 loss 사용 여부입니다.
                 shape은 ``[n_agent, flow_window_steps]`` 입니다.
-                ``raw_step + 1``부터 처음 유효하지 않은 step 직전까지의 prefix를
-                0.5초 chunk(``self.shift`` step) 단위로 내림한 구간만 ``True`` 입니다.
-                예를 들어 10Hz 기준 1~4 step은 버리고, 5~9 step은 첫 5 step만
-                사용합니다.
+                ``raw_step + 1``부터 처음 유효하지 않은 step 직전까지만
+                ``True`` 입니다. 첫 미래 step이 유효하지 않으면 전부 ``False`` 입니다.
         """
         future_start = raw_step + 1
         # future_loss_mask: [n_agent, flow_window_steps]
@@ -482,12 +480,11 @@ class FlowTokenProcessor(TokenProcessor):
         if available_len <= 0:
             return future_loss_mask
 
+        # available_future_valid: [n_agent, available_len]
         available_future_valid = valid[:, future_start : future_start + available_len].bool()
+        # prefix_valid: [n_agent, available_len]
         prefix_valid = available_future_valid.to(dtype=torch.long).cumprod(dim=1).bool()
-        prefix_len = prefix_valid.long().sum(dim=1)
-        usable_len = (prefix_len // self.shift) * self.shift
-        step_index = torch.arange(self.flow_window_steps, device=valid.device).unsqueeze(0)
-        future_loss_mask = step_index < usable_len.unsqueeze(1)
+        future_loss_mask[:, :available_len] = prefix_valid
         return future_loss_mask
 
     def _build_anchor_clean_norm(

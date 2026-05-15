@@ -5,10 +5,7 @@ import torch
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 
 
-def _build_processor(
-    use_prefix_valid_future_loss_mask: bool,
-    flow_window_steps: int = 5,
-) -> FlowTokenProcessor:
+def _build_processor(use_prefix_valid_future_loss_mask: bool) -> FlowTokenProcessor:
     """토큰 파일을 읽지 않고 loss mask helper만 테스트할 processor를 만듭니다.
 
     Args:
@@ -18,55 +15,35 @@ def _build_processor(
         FlowTokenProcessor: ``flow_window_steps``와 옵션만 채운 테스트용 객체입니다.
     """
     processor = FlowTokenProcessor.__new__(FlowTokenProcessor)
-    processor.flow_window_steps = flow_window_steps
-    processor.shift = 5
+    processor.flow_window_steps = 5
     processor.use_prefix_valid_future_loss_mask = use_prefix_valid_future_loss_mask
     processor.control_round_trip_max_position_error_m = 5.0
     return processor
 
 
-def _valid_row_with_future_prefix(
-    prefix_len: int,
-    flow_window_steps: int,
-    raw_step: int = 1,
-) -> torch.Tensor:
-    """raw_step 뒤 연속 future valid 길이가 prefix_len인 테스트 row를 만듭니다."""
-    total_steps = raw_step + 1 + flow_window_steps
-    row = torch.ones(total_steps, dtype=torch.bool)
-    if prefix_len < flow_window_steps:
-        row[raw_step + 1 + prefix_len] = False
-    return row
-
-
-def _loss_mask_row(usable_len: int, flow_window_steps: int) -> torch.Tensor:
-    """앞 usable_len step만 True인 loss mask row를 만듭니다."""
-    return torch.arange(flow_window_steps) < int(usable_len)
-
-
-def test_prefix_valid_future_loss_mask_uses_only_complete_chunks() -> None:
-    """연속 valid prefix를 5-step chunk 단위로 내림하는지 확인합니다."""
-    flow_window_steps = 20
-    processor = _build_processor(
-        use_prefix_valid_future_loss_mask=True,
-        flow_window_steps=flow_window_steps,
-    )
-    valid = torch.stack(
+def test_prefix_valid_future_loss_mask_keeps_only_continuous_prefix() -> None:
+    """가까운 미래부터 처음 끊기기 전까지만 True로 남는지 확인합니다."""
+    processor = _build_processor(use_prefix_valid_future_loss_mask=True)
+    # valid: [n_agent, n_step]
+    valid = torch.tensor(
         [
-            _valid_row_with_future_prefix(prefix_len, flow_window_steps=flow_window_steps)
-            for prefix_len in [3, 6, 10, 15, 20]
+            [True, True, True, True, False, True, True],
+            [True, True, False, True, True, True, True],
+            [True, True, True, True, True, True, True],
         ],
-        dim=0,
+        dtype=torch.bool,
     )
 
-    # raw_step=1이면 future는 step 2부터 최대 20개입니다.
+    # raw_step=1이면 future는 step 2부터 최대 5개입니다.
     loss_mask = processor._build_anchor_future_loss_mask(valid=valid, raw_step=1)
 
-    expected = torch.stack(
+    expected = torch.tensor(
         [
-            _loss_mask_row(usable_len, flow_window_steps=flow_window_steps)
-            for usable_len in [0, 5, 10, 15, 20]
+            [True, True, False, False, False],
+            [False, False, False, False, False],
+            [True, True, True, True, True],
         ],
-        dim=0,
+        dtype=torch.bool,
     )
     assert torch.equal(loss_mask, expected)
 

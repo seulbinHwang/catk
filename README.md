@@ -389,7 +389,7 @@ model.model_config.token_processor.use_prefix_valid_future_loss_mask=true   # pr
 ```
 
 - `false`이면 기존과 같습니다. 현재 anchor 뒤 `decoder.flow_window_steps` 전체 미래가 모두 유효한 agent-anchor만 학습합니다.
-- `true`이면 현재 anchor 뒤 가장 가까운 미래부터 시작해서, 처음 끊기기 전까지 연속으로 유효한 구간을 5-step(0.5초) chunk 단위로 내림해서 학습합니다. 1~4 step은 버리고, 5~9 step은 첫 0.5초만, 10~14 step은 첫 1.0초만, 15~19 step은 첫 1.5초만 loss가 들어갑니다.
+- `true`이면 현재 anchor 뒤 가장 가까운 미래부터 시작해서, 처음 끊기기 전까지 연속으로 유효한 구간만 학습합니다. 이 구간에만 loss가 들어갑니다.
 - full-valid sample은 `true`에서도 그대로 전체 미래 loss를 받습니다. 새로 추가되는 것은 partial-valid sample뿐입니다.
 - 이 옵션은 `FlowTokenProcessor`에서 학습 target을 만들 때 적용되므로 pretrain, 일반 fine tuning, self-forced fine tuning에서 같은 방식으로 동작합니다.
 - README 기준 cache를 그대로 만들었다면 cache 재생성은 필요 없습니다. pkl cache 자체에서 partial-valid agent/anchor를 직접 삭제한 경우에만 cache를 다시 만들어야 합니다.
@@ -590,7 +590,7 @@ model:
       control_round_trip_max_position_error_m: 0.5
 ```
 
-현재 브랜치의 `use_prefix_valid_future_loss_mask=true`는 `812eccc` 이후 의미입니다. 즉, 가까운 미래부터 연속 valid prefix를 만들고, 그 길이를 5-step chunk 단위로 내림합니다. 1~4 step만 유효한 anchor는 버리고, 5~9 step은 첫 0.5초, 10~14 step은 첫 1.0초, 15~19 step은 첫 1.5초만 학습합니다.
+현재 브랜치의 `use_prefix_valid_future_loss_mask=true`는 가까운 미래부터 처음 끊기기 전까지의 연속 valid prefix 전체를 loss에 반영합니다.
 
 기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_roundtrip05_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
 
@@ -635,7 +635,7 @@ scripts/launch_pre_bc_flow_control_v100x47_static_pods.py
 - `data.train_batch_size=4`, effective global batch `4 * 47 = 188`
 - `model.model_config.lr=6e-4`
 
-현재 `semi_control_stable`의 `use_prefix_valid_future_loss_mask=true`는 `812eccc` 이후 의미입니다. 즉, 가까운 미래부터 연속 valid prefix를 만들고, 그 길이를 5-step chunk 단위로 내림합니다.
+현재 `semi_control_stable`의 `use_prefix_valid_future_loss_mask=true`는 가까운 미래부터 처음 끊기기 전까지의 연속 valid prefix 전체를 loss에 반영합니다.
 
 4GPU pod와 3GPU pod를 섞으면 `torchrun --nproc_per_node`의 homogeneous local world size 가정과 Lightning 기본 TorchElastic 검증의 `devices * num_nodes == WORLD_SIZE` 가정이 맞지 않습니다. 그래서 이 launcher는 `--manual-rank-offsets` 경로로 각 pod의 GPU 수를 읽어 `RANK/WORLD_SIZE/LOCAL_RANK`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment`로 homogeneous 검증만 완화합니다.
 

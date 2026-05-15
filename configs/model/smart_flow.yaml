@@ -31,8 +31,7 @@ model_config:
     agent_token_file: "agent_vocab_555_s2.pkl"
     flow_window_steps: ${model.model_config.decoder.flow_window_steps}
     # false: 기존 방식. flow_window_steps 전체 미래가 유효한 anchor만 학습합니다.
-    # true: 가까운 미래부터 연속으로 유효한 prefix를 5-step(0.5초) chunk 단위로
-    # 내림해서 loss를 주고 학습합니다. 1~4 step prefix는 버립니다.
+    # true: 가장 가까운 미래부터 연속으로 유효한 prefix만 loss를 주고 학습합니다.
     use_prefix_valid_future_loss_mask: false
     # false이면 기존 pose-space Flow Matching을 그대로 사용합니다.
     # true이면 GT pose에서 control label을 on-the-fly로 만들고,
