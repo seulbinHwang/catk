@@ -108,6 +108,12 @@ metrics, WOSAC submission, and visualization code see them. This keeps the publi
 validation/test result interface unchanged while avoiding repeated inference
 calls for each rollout.
 
+Stochastic SMART validation/test sampling uses rollout/scenario-specific seeds,
+derived from `validation_closed_seed`, `scenario_id`, and rollout index. Each
+expanded scenario owns a persistent `torch.Generator` during the closed-loop
+token rollout, so `topk_prob` sampling does not depend on whether rollouts are
+executed one by one or as a larger rollout batch.
+
 ### Motion missingness features for SMART baselines
 
 The SMART next-token baseline now exposes motion missingness to the agent

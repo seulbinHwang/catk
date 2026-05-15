@@ -11,12 +11,134 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributions import Categorical, Independent, MixtureSameFamily, Normal
+
+
+def _sample_categorical_logits(
+    logits: Tensor,
+    generator: Optional[torch.Generator] = None,
+) -> Tensor:
+    if generator is None:
+        return Categorical(logits=logits).sample()
+
+    probs = torch.softmax(logits.float(), dim=-1)
+    return torch.multinomial(
+        probs,
+        num_samples=1,
+        replacement=True,
+        generator=generator,
+    ).squeeze(-1)
+
+
+def _sample_categorical_logits_k(
+    logits: Tensor,
+    num_samples: int,
+    generator: Optional[torch.Generator] = None,
+) -> Tensor:
+    if generator is None:
+        return (
+            Categorical(logits=logits)
+            .sample((num_samples,))
+            .transpose(0, 1)
+            .contiguous()
+        )
+
+    probs = torch.softmax(logits.float(), dim=-1)
+    return torch.multinomial(
+        probs,
+        num_samples=num_samples,
+        replacement=True,
+        generator=generator,
+    )
+
+
+def _sample_categorical_logits_by_batch(
+    logits: Tensor,
+    batch_index: Optional[Tensor] = None,
+    generators_by_batch: Optional[Sequence[torch.Generator]] = None,
+) -> Tensor:
+    if generators_by_batch is None:
+        return _sample_categorical_logits(logits)
+    if batch_index is None:
+        raise ValueError("batch_index is required when generators_by_batch is provided.")
+    if tuple(batch_index.shape) != (logits.shape[0],):
+        raise ValueError(
+            "batch_index must have one entry per categorical row, "
+            f"got {tuple(batch_index.shape)} for logits shape {tuple(logits.shape)}."
+        )
+
+    samples = torch.empty(logits.shape[0], dtype=torch.long, device=logits.device)
+    if batch_index.numel() == 0:
+        return samples
+    min_batch = int(batch_index.min().item())
+    if min_batch < 0:
+        raise ValueError(f"batch_index must be non-negative, got min batch {min_batch}.")
+    max_batch = int(batch_index.max().item())
+    if max_batch >= len(generators_by_batch):
+        raise ValueError(
+            "generators_by_batch must cover every batch id, "
+            f"got max batch {max_batch} and {len(generators_by_batch)} generators."
+        )
+
+    for batch_id, generator in enumerate(generators_by_batch):
+        mask = batch_index == batch_id
+        if not bool(mask.any()):
+            continue
+        samples[mask] = _sample_categorical_logits(
+            logits=logits[mask],
+            generator=generator,
+        )
+    return samples
+
+
+def _sample_categorical_logits_k_by_batch(
+    logits: Tensor,
+    num_samples: int,
+    batch_index: Optional[Tensor] = None,
+    generators_by_batch: Optional[Sequence[torch.Generator]] = None,
+) -> Tensor:
+    if generators_by_batch is None:
+        return _sample_categorical_logits_k(logits, num_samples=num_samples)
+    if batch_index is None:
+        raise ValueError("batch_index is required when generators_by_batch is provided.")
+    if tuple(batch_index.shape) != (logits.shape[0],):
+        raise ValueError(
+            "batch_index must have one entry per categorical row, "
+            f"got {tuple(batch_index.shape)} for logits shape {tuple(logits.shape)}."
+        )
+
+    samples = torch.empty(
+        (logits.shape[0], num_samples),
+        dtype=torch.long,
+        device=logits.device,
+    )
+    if batch_index.numel() == 0:
+        return samples
+    min_batch = int(batch_index.min().item())
+    if min_batch < 0:
+        raise ValueError(f"batch_index must be non-negative, got min batch {min_batch}.")
+    max_batch = int(batch_index.max().item())
+    if max_batch >= len(generators_by_batch):
+        raise ValueError(
+            "generators_by_batch must cover every batch id, "
+            f"got max batch {max_batch} and {len(generators_by_batch)} generators."
+        )
+
+    for batch_id, generator in enumerate(generators_by_batch):
+        mask = batch_index == batch_id
+        if not bool(mask.any()):
+            continue
+        samples[mask] = _sample_categorical_logits_k(
+            logits=logits[mask],
+            num_samples=num_samples,
+            generator=generator,
+        )
+    return samples
 
 
 @torch.no_grad()
@@ -88,6 +210,8 @@ def sample_policy_token_candidates(
     next_token_logits: Tensor,
     num_k: int,
     temperature: float,
+    sampling_generators_by_batch: Optional[Sequence[torch.Generator]] = None,
+    sampling_batch: Optional[Tensor] = None,
 ) -> Tensor:
     """RoaD 방식으로 모델 확률에서 후보 token을 뽑는다.
 
@@ -104,7 +228,12 @@ def sample_policy_token_candidates(
     if temperature <= 0:
         raise ValueError(f"temperature should be positive for RoaD sampling, got {temperature}")
     sampling_logits = next_token_logits.detach() / temperature
-    return Categorical(logits=sampling_logits).sample((num_k,)).transpose(0, 1).contiguous()
+    return _sample_categorical_logits_k_by_batch(
+        logits=sampling_logits,
+        num_samples=num_k,
+        batch_index=sampling_batch,
+        generators_by_batch=sampling_generators_by_batch,
+    )
 
 
 def select_road_samplek_candidate(
@@ -160,6 +289,8 @@ def sample_next_token_traj(
     head_next_gt: Tensor,
     valid_next_gt: Tensor,
     token_agent_shape: Tensor,
+    sampling_generators_by_batch: Optional[Sequence[torch.Generator]] = None,
+    sampling_batch: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """
     Returns:
@@ -175,6 +306,8 @@ def sample_next_token_traj(
             next_token_logits=next_token_logits,
             num_k=sampling_scheme.num_k,
             temperature=sampling_scheme.temp,
+            sampling_generators_by_batch=sampling_generators_by_batch,
+            sampling_batch=sampling_batch,
         )
         next_token_idx = select_road_samplek_candidate(
             token_traj=token_traj,
@@ -227,7 +360,11 @@ def sample_next_token_traj(
         raise ValueError(f"Invalid criterium: {sampling_scheme.criterium}")
 
     topk_logits = topk_logits / sampling_scheme.temp
-    samples = Categorical(logits=topk_logits).sample()
+    samples = _sample_categorical_logits_by_batch(
+        logits=topk_logits,
+        batch_index=sampling_batch,
+        generators_by_batch=sampling_generators_by_batch,
+    )
     next_token_idx = topk_indices[range_a, samples]
     return next_token_idx, token_traj_all[range_a, next_token_idx]
 

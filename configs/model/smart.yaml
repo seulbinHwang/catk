@@ -14,6 +14,7 @@ model_config:
   n_vis_rollout: 5
   val_open_loop: true
   val_closed_loop: true
+  validation_closed_seed: 0
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"

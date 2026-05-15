@@ -11,9 +11,10 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import hashlib
 import math
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Sequence
 
 import hydra
 import torch
@@ -83,6 +84,9 @@ class SMART(LightningModule):
 
         self.training_rollout_sampling = model_config.training_rollout_sampling
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
+        self.validation_closed_seed = int(
+            getattr(model_config, "validation_closed_seed", 0)
+        )
 
     @staticmethod
     def _repeat_tensor_on_first_dim(tensor: torch.Tensor, repeat_count: int) -> torch.Tensor:
@@ -106,6 +110,38 @@ class SMART(LightningModule):
         expanded_batch = batch_index.unsqueeze(0).repeat(repeat_count, 1)
         expanded_batch = expanded_batch + rollout_offsets.unsqueeze(1)
         return expanded_batch.reshape(-1).contiguous()
+
+    def _make_closed_loop_seed(self, scenario_id: str, rollout_idx: int) -> int:
+        seed_payload = (
+            f"{self.validation_closed_seed}:{scenario_id}:{int(rollout_idx)}".encode(
+                "utf-8"
+            )
+        )
+        digest = hashlib.blake2b(seed_payload, digest_size=8).digest()
+        return (
+            int.from_bytes(digest, byteorder="little", signed=False)
+            & 0x7FFF_FFFF_FFFF_FFFF
+        )
+
+    def _build_closed_loop_seed_table(
+        self,
+        scenario_ids: Sequence[str],
+        repeat_count: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        seed_rows = [
+            [
+                self._make_closed_loop_seed(
+                    scenario_id=str(scenario_id),
+                    rollout_idx=rollout_idx,
+                )
+                for scenario_id in scenario_ids
+            ]
+            for rollout_idx in range(repeat_count)
+        ]
+        if len(seed_rows) == 0:
+            return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
+        return torch.tensor(seed_rows, dtype=torch.long, device=device)
 
     def _build_parallel_rollout_map_feature(
         self,
@@ -207,6 +243,7 @@ class SMART(LightningModule):
         self,
         tokenized_map: Dict[str, torch.Tensor],
         tokenized_agent: Dict[str, torch.Tensor],
+        scenario_ids: Sequence[str],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         repeat_count = int(self.n_rollout_closed_val)
         if repeat_count <= 0:
@@ -216,6 +253,11 @@ class SMART(LightningModule):
 
         num_agent = int(tokenized_agent["batch"].shape[0])
         num_graphs = int(tokenized_agent["num_graphs"])
+        if len(scenario_ids) != num_graphs:
+            raise ValueError(
+                "scenario_ids length must match tokenized_agent['num_graphs'], "
+                f"got {len(scenario_ids)} and {num_graphs}."
+            )
         map_feature = self.encoder.map_encoder(tokenized_map)
         rollout_map_feature = self._build_parallel_rollout_map_feature(
             map_feature=map_feature,
@@ -227,10 +269,16 @@ class SMART(LightningModule):
             repeat_count=repeat_count,
             num_graphs=num_graphs,
         )
+        scenario_seed_table = self._build_closed_loop_seed_table(
+            scenario_ids=scenario_ids,
+            repeat_count=repeat_count,
+            device=tokenized_agent["batch"].device,
+        )
         pred = self.encoder.agent_encoder.inference(
             rollout_tokenized_agent,
             rollout_map_feature,
             self.validation_rollout_sampling,
+            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
         )
         return (
             self._reshape_parallel_rollout_prediction(
@@ -305,6 +353,7 @@ class SMART(LightningModule):
             pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
                 tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,
+                scenario_ids=data["scenario_id"],
             )
 
             update_wosac_distribution_metric_from_model(
@@ -438,6 +487,7 @@ class SMART(LightningModule):
         pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
             tokenized_map=tokenized_map,
             tokenized_agent=tokenized_agent,
+            scenario_ids=data["scenario_id"],
         )
 
         update_wosac_distribution_metric_from_model(

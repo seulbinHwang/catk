@@ -79,9 +79,13 @@ class SMARTDecoder(nn.Module):
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         sampling_scheme: DictConfig,
+        scenario_sampling_seeds: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         map_feature = self.map_encoder(tokenized_map)
         pred_dict = self.agent_encoder.inference(
-            tokenized_agent, map_feature, sampling_scheme
+            tokenized_agent,
+            map_feature,
+            sampling_scheme,
+            scenario_sampling_seeds=scenario_sampling_seeds,
         )
         return pred_dict

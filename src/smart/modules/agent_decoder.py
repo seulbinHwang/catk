@@ -493,6 +493,21 @@ class SMARTAgentDecoder(nn.Module):
         )
         return edge_index_pl2a, r_pl2a
 
+    @staticmethod
+    def _build_sampling_generators_by_batch(
+        sampling_seeds: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> Optional[list[torch.Generator]]:
+        if sampling_seeds is None:
+            return None
+
+        generators = []
+        for seed in sampling_seeds.detach().cpu().tolist():
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+            generators.append(generator)
+        return generators
+
     def forward(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -603,6 +618,7 @@ class SMARTAgentDecoder(nn.Module):
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
         sampling_scheme: DictConfig,
+        scenario_sampling_seeds: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         n_agent = tokenized_agent["valid_mask"].shape[0]
         n_step_future_10hz = self.num_future_steps  # 80
@@ -649,6 +665,15 @@ class SMARTAgentDecoder(nn.Module):
         next_token_logits_list = []
         next_token_action_list = []
         feat_a_t_dict = {}
+        sampling_generators_by_batch = self._build_sampling_generators_by_batch(
+            sampling_seeds=scenario_sampling_seeds,
+            device=pos_a.device,
+        )
+        sampling_batch = (
+            tokenized_agent["batch"]
+            if sampling_generators_by_batch is not None
+            else None
+        )
         for t in range(n_step_future_2hz):  # 0 -> 15
             t_now = step_current_2hz - 1 + t  # 1 -> 16
             n_step = t_now + 1  # 2 -> 17
@@ -808,6 +833,8 @@ class SMARTAgentDecoder(nn.Module):
                 head_next_gt=tokenized_agent["gt_head_raw"][:, n_step],  # [n_agent]
                 valid_next_gt=tokenized_agent["gt_valid_raw"][:, n_step],  # [n_agent]
                 token_agent_shape=tokenized_agent["token_agent_shape"],  # [n_token, 2]
+                sampling_generators_by_batch=sampling_generators_by_batch,
+                sampling_batch=sampling_batch,
             )  # next_token_idx: [n_agent], next_token_traj_all: [n_agent, 6, 4, 2]
 
             diff_xy = next_token_traj_all[:, -1, 0] - next_token_traj_all[:, -1, 3]
