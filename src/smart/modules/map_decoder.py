@@ -40,7 +40,6 @@ class SMARTMapDecoder(nn.Module):
 
         self.type_pt_emb = nn.Embedding(10, hidden_dim)
         self.polygon_type_emb = nn.Embedding(4, hidden_dim)
-        self.light_pl_emb = nn.Embedding(5, hidden_dim)
 
         input_dim_r_pt2pt = 3
         self.r_pt2pt_emb = FourierEmbedding(
@@ -76,7 +75,6 @@ class SMARTMapDecoder(nn.Module):
         x_pt_categorical_embs = [
             self.type_pt_emb(tokenized_map["type"]),
             self.polygon_type_emb(tokenized_map["pl_type"]),
-            self.light_pl_emb(tokenized_map["light_type"]),
         ]
         x_pt = x_pt + torch.stack(x_pt_categorical_embs).sum(dim=0)
         edge_index_pt2pt = radius_graph(
@@ -109,5 +107,6 @@ class SMARTMapDecoder(nn.Module):
             "pt_token": x_pt,
             "position": pos_pt,
             "orientation": orient_pt,
+            "light_type": tokenized_map["light_type"].long(),
             "batch": tokenized_map["batch"],
         }

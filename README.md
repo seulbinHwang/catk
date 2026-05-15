@@ -77,6 +77,28 @@ To reproduce our final results, you should follow the following steps
 3. Use [scripts/wosac_sub.sh](scripts/wosac_sub.sh) to pack the submission fille for `validate` or `test` split. Upload the `wosac_submission.tar.gz` file located in `logs` folder to the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) such that you can evaluate the model fine-tuned in step 2 on the WOSAC leaderboard.
 4. Alternatively, you can do local validation with [scripts/local_val.sh](scripts/local_val.sh).
 
+### Dynamic traffic-light staleness for SMART baselines
+
+The SMART token baseline now uses the same traffic-light input semantics as the
+control-space flow experiments used for method comparison. Traffic-light state is
+no longer embedded as a static map-token feature. The map encoder keeps the
+current observed light state only as metadata, and the agent-to-lane attention
+relation receives:
+
+- the current observed traffic-light state for that lane, and
+- a normalized staleness scalar, defined as `prediction_time - observed_light_time`.
+
+The scalar is clipped to `[-1s, 6s]` and divided by `6s`. Map elements without an
+observed light keep a zero staleness value, while observed `UNKNOWN` lights still
+carry the elapsed-time value. This keeps the input meaning as “this lane was
+observed with state S Δt seconds ago” rather than treating traffic lights as
+permanent map attributes.
+
+During closed-loop SMART rollout, the first predicted 0.5s block sees the current
+light at `0s` staleness, and later blocks use `0.5s`, `1.0s`, ... staleness. The
+cache builder also checks that WOMD scenarios use the standard current raw step
+`10`, so the observed-light timestamp and model staleness convention stay aligned.
+
 ### WOSAC-CPD / WOSAC-CES distribution metrics
 
 Closed-loop validation and WOSAC submission export now also compute distribution metrics from the 10Hz rollouts that the model already generated. No extra rollout is created only for these metrics.
