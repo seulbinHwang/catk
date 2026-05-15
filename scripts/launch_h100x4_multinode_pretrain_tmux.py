@@ -548,6 +548,11 @@ else
 fi
 git pull --ff-only origin {shq(args.branch)}
 """
+        if args.git_ref:
+            pull_block += f"""
+git fetch origin {shq(args.branch)} --tags || true
+git checkout --detach {shq(args.git_ref)}
+"""
 
     monitor_block = ""
     if not args.no_monitor_pane:
@@ -644,6 +649,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--container", default="main")
     parser.add_argument("--project-root", default=DEFAULT_PROJECT_ROOT)
     parser.add_argument("--branch", default=DEFAULT_BRANCH)
+    parser.add_argument(
+        "--git-ref",
+        default="",
+        help="Optional exact commit/tag to check out after updating --branch on each pod.",
+    )
     parser.add_argument("--no-pull", dest="pull", action="store_false")
     parser.set_defaults(pull=True)
     parser.add_argument(

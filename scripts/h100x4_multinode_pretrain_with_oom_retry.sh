@@ -8,7 +8,7 @@
 #
 # Default behavior:
 #   * first attempt: data.train_batch_size=26
-#   * on CUDA OOM: reduce batch by 2 and resume from the latest epoch_last.ckpt
+#   * on CUDA OOM: reduce batch and resume from the latest epoch_last.ckpt
 #   * stop at MIN_BS=20 unless overridden
 
 set -uo pipefail
@@ -35,12 +35,16 @@ INITIAL_BS="${INITIAL_BS:-26}"
 OOM_STEP="${OOM_STEP:-2}"
 MIN_BS="${MIN_BS:-20}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
+GIT_REF="${GIT_REF:-}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
+KUBECTL_EXEC_TIMEOUT_SEC="${KUBECTL_EXEC_TIMEOUT_SEC:-90}"
+RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-}"
+MAX_NON_OOM_RETRIES="${MAX_NON_OOM_RETRIES:-0}"
 
 read -r -a POD_ARRAY <<< "$PODS"
 if (( ${#POD_ARRAY[@]} < 2 )); then
@@ -110,6 +114,9 @@ start_attempt() {
   if [[ "$MANUAL_RANK_OFFSETS" == "1" ]]; then
     cmd+=(--manual-rank-offsets)
   fi
+  if [[ -n "$GIT_REF" ]]; then
+    cmd+=(--git-ref "$GIT_REF")
+  fi
   if [[ -n "$POD_CACHE_ROOTS" ]]; then
     read -r -a pod_cache_root_array <<< "$POD_CACHE_ROOTS"
     local mapping
@@ -146,19 +153,12 @@ start_attempt() {
 }
 
 wait_for_attempt_exit() {
-  local remote_log remote_log_q grep_cmd status_line oom_pod
+  local remote_log remote_log_q grep_cmd status_line any_exit
   remote_log="$(remote_master_tmux_log)"
   remote_log_q="$(remote_quote "$remote_log")"
   grep_cmd="grep -E '\\[tmux-run\\] exited with status [0-9]+' ${remote_log_q} 2>/dev/null | tail -1"
 
   while true; do
-    if oom_pod="$(find_remote_oom_pod)"; then
-      log "OOM marker observed on ${oom_pod}; stopping all node sessions before retry."
-      ATTEMPT_EXIT_CODE="1"
-      ATTEMPT_EXIT_REASON="oom"
-      stop_attempt_sessions
-      return 0
-    fi
     status_line="$(
       kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "$grep_cmd" 2>/dev/null || true
     )"
@@ -168,28 +168,64 @@ wait_for_attempt_exit() {
       ATTEMPT_EXIT_REASON="exit"
       return 0
     fi
+    if any_exit="$(find_remote_exit_status)"; then
+      local exit_pod="${any_exit%%:*}"
+      local exit_status="${any_exit##*:}"
+      log "Remote pod ${exit_pod} exited with status ${exit_status}; stopping the remaining node sessions before retry classification."
+      ATTEMPT_EXIT_CODE="${exit_status}"
+      ATTEMPT_EXIT_REASON="exit"
+      stop_attempt_sessions
+      return 0
+    fi
     log "waiting for attempt to finish; attach: kubectl exec -it -n ${NAMESPACE} ${MASTER_POD} -c ${CONTAINER} -- tmux attach -t ${SESSION}"
     sleep "$POLL_INTERVAL"
   done
 }
 
-find_remote_oom_pod() {
-  local pod remote_log remote_log_q oom_regex_q cmd
-  oom_regex_q="$(remote_quote "$OOM_REGEX")"
+find_remote_exit_status() {
+  local pod remote_log remote_log_q cmd status_line
   for pod in "${POD_ARRAY[@]}"; do
     remote_log="$(remote_tmux_log_for_pod "$pod")"
     remote_log_q="$(remote_quote "$remote_log")"
-    cmd="grep -Eq ${oom_regex_q} ${remote_log_q} 2>/dev/null"
-    if kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "$cmd" >/dev/null 2>&1; then
-      printf '%s\n' "$pod"
+    cmd="grep -E '\\[tmux-run\\] exited with status [0-9]+' ${remote_log_q} 2>/dev/null | tail -1"
+    status_line="$(
+      kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "$cmd" 2>/dev/null || true
+    )"
+    status_line="${status_line//$'\r'/}"
+    if [[ "$status_line" =~ exited\ with\ status\ ([0-9]+) ]]; then
+      printf '%s:%s\n' "$pod" "${BASH_REMATCH[1]}"
       return 0
     fi
   done
   return 1
 }
 
+kubectl_exec_with_timeout() {
+  local pod="$1"
+  local script="$2"
+  local timeout_sec="$KUBECTL_EXEC_TIMEOUT_SEC"
+  local pid waited=0
+
+  kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "$script" >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= timeout_sec )); then
+      log "cleanup command timed out on ${pod} after ${timeout_sec}s; killing local kubectl exec."
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 2
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  wait "$pid" 2>/dev/null || true
+}
+
 stop_attempt_sessions() {
-  local pod run_root run_root_q session_q pod_q task_q grace
+  local pod run_root run_root_q session_q pod_q task_q grace cleanup_script pid
+  local cleanup_pids=()
   run_root="$(remote_run_root)"
   run_root_q="$(remote_quote "$run_root")"
   session_q="$(remote_quote "$SESSION")"
@@ -197,7 +233,7 @@ stop_attempt_sessions() {
   grace="${REMOTE_KILL_GRACE_SEC:-20}"
   for pod in "${POD_ARRAY[@]}"; do
     pod_q="$(remote_quote "$pod")"
-    kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
+    cleanup_script="
 set +e
 TASK_NAME_TO_STOP=${task_q}
 task_process_pids() {
@@ -232,7 +268,13 @@ if [[ -f \"\$pgid_file\" ]]; then
 fi
 terminate_task_processes
 tmux kill-session -t ${session_q} 2>/dev/null || true
-" >/dev/null 2>&1 || true
+"
+    kubectl_exec_with_timeout "$pod" "$cleanup_script" &
+    cleanup_pids+=("$!")
+  done
+
+  for pid in "${cleanup_pids[@]}"; do
+    wait "$pid" || true
   done
 }
 
@@ -255,6 +297,7 @@ copy_attempt_log() {
 
 bs="$INITIAL_BS"
 attempt=0
+non_oom_retry_count=0
 while (( bs >= MIN_BS )); do
   attempt=$(( attempt + 1 ))
   attempt_log="${LOCAL_RETRY_LOG_DIR}/attempt_$(printf '%03d' "$attempt")_bs${bs}.log"
@@ -283,7 +326,8 @@ while (( bs >= MIN_BS )); do
     exit 0
   fi
 
-  if [[ "$ATTEMPT_EXIT_REASON" == "oom" ]] || grep -Eq "$OOM_REGEX" "$attempt_log"; then
+  if grep -Eq "$OOM_REGEX" "$attempt_log"; then
+    non_oom_retry_count=0
     new_bs=$(( bs - OOM_STEP ))
     log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Lowering to bs=${new_bs}."
     if (( new_bs < MIN_BS )); then
@@ -292,6 +336,15 @@ while (( bs >= MIN_BS )); do
     fi
     bs="$new_bs"
     continue
+  fi
+
+  if [[ -n "$RETRY_NON_OOM_EXIT_CODES" ]] && [[ ",${RETRY_NON_OOM_EXIT_CODES}," == *",${ATTEMPT_EXIT_CODE},"* ]]; then
+    if (( non_oom_retry_count < MAX_NON_OOM_RETRIES )); then
+      non_oom_retry_count=$(( non_oom_retry_count + 1 ))
+      log "Retryable non-OOM exit=${ATTEMPT_EXIT_CODE}; retry ${non_oom_retry_count}/${MAX_NON_OOM_RETRIES} at bs=${bs} from latest checkpoint."
+      continue
+    fi
+    log "Retryable non-OOM exit=${ATTEMPT_EXIT_CODE} exceeded MAX_NON_OOM_RETRIES=${MAX_NON_OOM_RETRIES}."
   fi
 
   log "Non-OOM failure (exit=${ATTEMPT_EXIT_CODE}). See ${attempt_log}. Aborting retry loop."

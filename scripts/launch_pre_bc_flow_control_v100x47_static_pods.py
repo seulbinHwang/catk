@@ -91,6 +91,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", "/mnt/nuplan/projects/catk"))
     parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or current_branch())
+    parser.add_argument(
+        "--git-ref",
+        default=os.environ.get("CATK_GIT_REF", ""),
+        help="Optional exact commit/tag to check out after updating --branch on each pod.",
+    )
     parser.add_argument("--remote-log-dir", default=os.environ.get("REMOTE_LOG_DIR", "/mnt/nuplan/projects/catk/logs"))
     parser.add_argument("--experiment", default="pre_bc_flow_control_v100x47")
     parser.add_argument("--task-name", default="flow_control_space_pretrain_v100x47_prefix_roundtrip2_bs6")
@@ -105,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--initial-bs", type=int, default=6)
-    parser.add_argument("--oom-step", type=int, default=2)
+    parser.add_argument("--oom-step", type=int, default=1)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--poll-interval", type=int, default=30)
     parser.add_argument("--master-port", default="29531")
@@ -197,6 +202,7 @@ def main() -> int:
             "PODS": " ".join(args.pods),
             "PROJECT_ROOT": args.project_root,
             "BRANCH": args.branch,
+            "GIT_REF": args.git_ref,
             "TASK_NAME": args.task_name,
             "SESSION": args.session,
             "EXPERIMENT": args.experiment,
@@ -236,6 +242,7 @@ def main() -> int:
                 "PODS",
                 "PROJECT_ROOT",
                 "BRANCH",
+                "GIT_REF",
                 "TASK_NAME",
                 "SESSION",
                 "EXPERIMENT",
