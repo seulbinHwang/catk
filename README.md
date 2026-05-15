@@ -99,6 +99,27 @@ light at `0s` staleness, and later blocks use `0.5s`, `1.0s`, ... staleness. The
 cache builder also checks that WOMD scenarios use the standard current raw step
 `10`, so the observed-light timestamp and model staleness convention stay aligned.
 
+### Motion missingness features for SMART baselines
+
+The SMART next-token baseline now exposes motion missingness to the agent
+context in the same way as the kinematic-control flow experiments. Each agent
+motion feature is `[coarse displacement norm, heading-relative displacement
+angle, motion_valid]`. Invalid coarse displacements are zeroed, and
+`motion_valid=0` tells the model that the zero displacement came from missing
+motion rather than a real stop.
+
+The agent-to-agent relation feature also includes the sender/receiver relative
+coarse motion in the receiver frame plus a relative-motion validity bit. When
+either side has missing motion, the relative motion channels are zeroed and the
+validity bit is `0`.
+
+This does not change SMART token validity or loss masking. SMART still treats a
+0.5s token as valid when the two coarse endpoint tokens are valid. The
+control-flow branch may still use stricter fine-step segment validity; this
+change only aligns the available missingness information in the shared context
+features. Because the embedding input dimensions changed, SMART checkpoints
+from before this change are not shape-compatible with fresh pretraining runs.
+
 ### WOSAC-CPD / WOSAC-CES distribution metrics
 
 Closed-loop validation and WOSAC submission export now also compute distribution metrics from the 10Hz rollouts that the model already generated. No extra rollout is created only for these metrics.

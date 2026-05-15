@@ -65,10 +65,10 @@ class SMARTAgentDecoder(nn.Module):
         self.shift = 5
         self.hist_drop_prob = hist_drop_prob
 
-        input_dim_x_a = 2
+        input_dim_x_a = 3
         input_dim_r_t = 4
         input_dim_r_pt2a = 4
-        input_dim_r_a2a = 3
+        input_dim_r_a2a = 6
         input_dim_token = 8
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
@@ -162,6 +162,7 @@ class SMARTAgentDecoder(nn.Module):
         head_vector_a,  # [n_agent, n_step, 2]
         agent_type,  # [n_agent]
         agent_shape,  # [n_agent, 3]
+        valid_mask: Optional[torch.Tensor] = None,  # [n_agent, n_step]
         inference=False,
     ):
         n_agent, n_step, traj_dim = pos_a.shape
@@ -181,22 +182,11 @@ class SMARTAgentDecoder(nn.Module):
         agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]
         agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]]
 
-        motion_vector_a = torch.cat(
-            [
-                pos_a.new_zeros(agent_token_index.shape[0], 1, traj_dim),
-                pos_a[:, 1:] - pos_a[:, :-1],
-            ],
-            dim=1,
-        )  # [n_agent, n_step, 2]
-        feature_a = torch.stack(
-            [
-                torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_a, nbr_vector=motion_vector_a[:, :, :2]
-                ),
-            ],
-            dim=-1,
-        )  # [n_agent, n_step, 2]
+        feature_a = self._build_motion_feature(
+            pos_a=pos_a,
+            head_vector_a=head_vector_a,
+            valid_mask=valid_mask,
+        )  # [n_agent, n_step, 3]
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
             self.shape_emb(agent_shape),
@@ -227,6 +217,81 @@ class SMARTAgentDecoder(nn.Module):
             )
         else:
             return feat_a  # [n_agent, n_step, hidden_dim]
+
+    @staticmethod
+    def _build_motion_valid_mask(
+        pos_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        n_agent, n_step, _ = pos_a.shape
+        if valid_mask is None:
+            raise ValueError(
+                "valid_mask is required for SMART motion features. Missing motion "
+                "must not be treated as valid stationary motion."
+            )
+        if tuple(valid_mask.shape) != (n_agent, n_step):
+            raise ValueError(
+                "valid_mask shape must match the first two dimensions of pos_a, "
+                f"got {tuple(valid_mask.shape)} and {(n_agent, n_step)}."
+            )
+
+        motion_valid_a = torch.zeros(
+            n_agent,
+            n_step,
+            device=pos_a.device,
+            dtype=torch.bool,
+        )
+        if n_step > 1:
+            motion_valid_a[:, 1:] = valid_mask[:, 1:].bool() & valid_mask[:, :-1].bool()
+        return motion_valid_a
+
+    @staticmethod
+    def _build_motion_vector(
+        pos_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        n_agent, n_step, traj_dim = pos_a.shape
+        motion_vector_a = pos_a.new_zeros(n_agent, n_step, traj_dim)
+        if n_step <= 1:
+            return motion_vector_a
+
+        motion_valid_a = SMARTAgentDecoder._build_motion_valid_mask(pos_a, valid_mask)
+        step_delta = pos_a[:, 1:] - pos_a[:, :-1]
+        step_delta = step_delta.masked_fill(~motion_valid_a[:, 1:].unsqueeze(-1), 0.0)
+        motion_vector_a[:, 1:] = step_delta
+        return motion_vector_a
+
+    @staticmethod
+    def _build_motion_feature_from_vector(
+        motion_vector_a: torch.Tensor,
+        head_vector_a: torch.Tensor,
+        motion_valid_a: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.stack(
+            [
+                torch.norm(motion_vector_a[..., :2], p=2, dim=-1),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vector_a,
+                    nbr_vector=motion_vector_a[..., :2],
+                ),
+                motion_valid_a.to(dtype=motion_vector_a.dtype),
+            ],
+            dim=-1,
+        )
+
+    @staticmethod
+    def _build_motion_feature(
+        pos_a: torch.Tensor,
+        head_vector_a: torch.Tensor,
+        valid_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        motion_vector_a = SMARTAgentDecoder._build_motion_vector(pos_a, valid_mask)
+        motion_valid_a = SMARTAgentDecoder._build_motion_valid_mask(pos_a, valid_mask)
+        return SMARTAgentDecoder._build_motion_feature_from_vector(
+            motion_vector_a=motion_vector_a,
+            head_vector_a=head_vector_a,
+            motion_valid_a=motion_valid_a,
+        )
 
     def build_temporal_edge(
         self,
@@ -280,11 +345,38 @@ class SMARTAgentDecoder(nn.Module):
         head_vector_a,  # [n_agent, n_step, 2]
         batch_s,  # [n_agent*n_step]
         mask,  # [n_agent, n_step]
+        motion_a: Optional[torch.Tensor] = None,  # [n_agent, n_step, 2]
+        motion_valid_a: Optional[torch.Tensor] = None,  # [n_agent, n_step]
     ):
-        mask = mask.transpose(0, 1).reshape(-1)
+        mask_flat = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
+
+        if motion_a is None:
+            motion_a = self._build_motion_vector(pos_a, mask)
+            motion_valid_a = self._build_motion_valid_mask(pos_a, mask)
+        else:
+            if tuple(motion_a.shape) != tuple(pos_a.shape):
+                raise ValueError(
+                    "motion_a shape must match pos_a shape, "
+                    f"got {tuple(motion_a.shape)} and {tuple(pos_a.shape)}."
+                )
+            if motion_valid_a is None:
+                raise ValueError(
+                    "motion_valid_a is required when motion_a is provided. Missing "
+                    "motion must not be treated as valid zero motion."
+                )
+            if tuple(motion_valid_a.shape) != tuple(motion_a.shape[:2]):
+                raise ValueError(
+                    "motion_valid_a shape must match the first two dimensions of "
+                    f"motion_a, got {tuple(motion_valid_a.shape)} and "
+                    f"{tuple(motion_a.shape[:2])}."
+                )
+        motion_valid_a = motion_valid_a.bool()
+        motion_s = motion_a.transpose(0, 1).reshape(-1, 2)
+        motion_valid_s = motion_valid_a.transpose(0, 1).reshape(-1)
+
         edge_index_a2a = radius_graph(
             x=pos_s[:, :2],
             r=self.a2a_radius,
@@ -292,9 +384,23 @@ class SMARTAgentDecoder(nn.Module):
             loop=False,
             max_num_neighbors=300,
         )
-        edge_index_a2a = subgraph(subset=mask, edge_index=edge_index_a2a)[0]
+        edge_index_a2a = subgraph(subset=mask_flat, edge_index=edge_index_a2a)[0]
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
+
+        rel_motion = motion_s[edge_index_a2a[0]] - motion_s[edge_index_a2a[1]]
+        rel_motion_valid = (
+            motion_valid_s[edge_index_a2a[0]]
+            & motion_valid_s[edge_index_a2a[1]]
+        )
+        recv_head = head_s[edge_index_a2a[1]]
+        recv_cos = recv_head.cos()
+        recv_sin = recv_head.sin()
+        rel_motion_long = rel_motion[:, 0] * recv_cos + rel_motion[:, 1] * recv_sin
+        rel_motion_lat = -rel_motion[:, 0] * recv_sin + rel_motion[:, 1] * recv_cos
+        rel_motion_long = rel_motion_long.masked_fill(~rel_motion_valid, 0.0)
+        rel_motion_lat = rel_motion_lat.masked_fill(~rel_motion_valid, 0.0)
+
         r_a2a = torch.stack(
             [
                 torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
@@ -303,6 +409,9 @@ class SMARTAgentDecoder(nn.Module):
                     nbr_vector=rel_pos_a2a[:, :2],
                 ),
                 rel_head_a2a,
+                rel_motion_long,
+                rel_motion_lat,
+                rel_motion_valid.to(dtype=rel_motion_long.dtype),
             ],
             dim=-1,
         )
@@ -405,6 +514,7 @@ class SMARTAgentDecoder(nn.Module):
             head_vector_a=head_vector_a,  # [n_agent, n_step, 2]
             agent_type=tokenized_agent["type"],  # [n_agent]
             agent_shape=tokenized_agent["shape"],  # [n_agent, 3]
+            valid_mask=mask,  # [n_agent, n_step]
         )  # feat_a: [n_agent, n_step, hidden_dim]
 
         # ! build temporal, interaction and map2agent edges
@@ -523,6 +633,7 @@ class SMARTAgentDecoder(nn.Module):
             head_vector_a=head_vector_a,
             agent_type=tokenized_agent["type"],
             agent_shape=tokenized_agent["shape"],
+            valid_mask=tokenized_agent["valid_mask"][:, :step_current_2hz],
             inference=True,
         )
 
@@ -603,12 +714,24 @@ class SMARTAgentDecoder(nn.Module):
                     )
                 ),
             )
+            motion_a = None
+            motion_valid_a = None
+            if hist_step == 1 and pos_a.shape[1] >= 2:
+                motion_a = pos_a[:, -1:] - pos_a[:, -2:-1]
+                motion_valid_a = (
+                    pred_valid[:, n_step - 1 : n_step]
+                    & pred_valid[:, n_step - 2 : n_step - 1]
+                )
+                motion_a = motion_a.masked_fill(~motion_valid_a.unsqueeze(-1), 0.0)
+
             edge_index_a2a, r_a2a = self.build_interaction_edge(
                 pos_a=pos_a[:, -hist_step:],  # [n_agent, hist_step, 2]
                 head_a=head_a[:, -hist_step:],  # [n_agent, hist_step]
                 head_vector_a=head_vector_a[:, -hist_step:],  # [n_agent, hist_step, 2]
                 batch_s=batch_s,  # [n_agent*hist_step]
                 mask=inference_mask[:, -hist_step:],  # [n_agent, hist_step]
+                motion_a=motion_a,
+                motion_valid_a=motion_valid_a,
             )
 
             # ! attention layers
@@ -749,14 +872,15 @@ class SMARTAgentDecoder(nn.Module):
 
             # ! get feat_a_next
             motion_vector_a = pos_a[:, -1] - pos_a[:, -2]  # [n_agent, 2]
-            x_a = torch.stack(
-                [
-                    torch.norm(motion_vector_a, p=2, dim=-1),
-                    angle_between_2d_vectors(
-                        ctr_vector=head_vector_a[:, -1], nbr_vector=motion_vector_a
-                    ),
-                ],
-                dim=-1,
+            motion_valid_a = pred_valid[:, n_step] & pred_valid[:, t_now]
+            motion_vector_a = motion_vector_a.masked_fill(
+                ~motion_valid_a.unsqueeze(-1),
+                0.0,
+            )
+            x_a = self._build_motion_feature_from_vector(
+                motion_vector_a=motion_vector_a,
+                head_vector_a=head_vector_a[:, -1],
+                motion_valid_a=motion_valid_a,
             )
             # [n_agent, hidden_dim]
             x_a = self.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)
