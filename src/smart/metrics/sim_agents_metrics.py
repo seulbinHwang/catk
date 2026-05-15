@@ -80,11 +80,6 @@ _REQUIRED_2025_BUCKET_FIELDS = {
     "simulated_traffic_light_violation_rate",
 }
 _TF_RUNTIME_CONFIGURED = False
-_GT_SCENARIO_CACHE: Dict[tuple[str, bool], dict] = {}
-
-
-def _clear_sim_agents_caches() -> None:
-    _GT_SCENARIO_CACHE.clear()
 
 
 def _read_nonnegative_int_env(var_name: str, default: int) -> int:
@@ -246,14 +241,10 @@ def _load_gt_scenario_for_device(
     ego_only: bool,
     device: torch.device,
 ) -> dict:
-    cache_key = (scenario_file, ego_only)
-    gt_scenario = _GT_SCENARIO_CACHE.get(cache_key)
-    if gt_scenario is None:
-        gt_scenario = extract_gt_scenario(
-            _load_scenario_proto(scenario_file, ego_only),
-            device="cpu",
-        )
-        _GT_SCENARIO_CACHE[cache_key] = gt_scenario
+    gt_scenario = extract_gt_scenario(
+        _load_scenario_proto(scenario_file, ego_only),
+        device="cpu",
+    )
     return _clone_to_device(gt_scenario, device)
 
 
@@ -459,7 +450,7 @@ def _compute_scenario_metrics(
 class SimAgentsMetrics(Metric):
     """TrajTok Fast WOSAC 2025 evaluator wrapped as a torchmetrics Metric."""
 
-    def __init__(self, prefix: str, ego_only: bool = False, max_workers: int = 4) -> None:
+    def __init__(self, prefix: str, ego_only: bool = False) -> None:
         super().__init__()
         self.prefix = prefix
         self.ego_only = ego_only
@@ -479,9 +470,6 @@ class SimAgentsMetrics(Metric):
         for field_name in self.scenario_metric_field_names:
             self.add_state(field_name, default=tensor(0.0), dist_reduce_fx="sum")
         self.add_state("scenario_counter", default=tensor(0.0), dist_reduce_fx="sum")
-        # Kept for config compatibility. Fast WOSAC runs directly on the caller's
-        # torch device, so the old official-scorer worker pool is no longer used.
-        self._max_workers = int(max_workers)
 
     @staticmethod
     def _compute_scenario_metrics(
@@ -496,14 +484,6 @@ class SimAgentsMetrics(Metric):
             scenario_rollout=scenario_rollout,
             ego_only=ego_only,
         )
-
-    def _drain_completed_futures(self, wait: bool, drain_all: bool = False) -> None:
-        del wait, drain_all
-        return
-
-    def reset(self) -> None:
-        super().reset()
-        _clear_sim_agents_caches()
 
     def _update_metric_states(
         self,
@@ -581,17 +561,14 @@ class SimAgentsMetrics(Metric):
         if len(scenario_rollouts) == 0:
             return
 
-        try:
-            for scenario_file, scenario_rollout in zip(scenario_files, scenario_rollouts):
-                scenario_metrics = self._compute_scenario_metrics(
-                    self.sim_agents_config,
-                    scenario_file,
-                    scenario_rollout,
-                    self.ego_only,
-                )
-                self._update_metric_states(scenario_metrics)
-        finally:
-            _clear_sim_agents_caches()
+        for scenario_file, scenario_rollout in zip(scenario_files, scenario_rollouts):
+            scenario_metrics = self._compute_scenario_metrics(
+                self.sim_agents_config,
+                scenario_file,
+                scenario_rollout,
+                self.ego_only,
+            )
+            self._update_metric_states(scenario_metrics)
 
     @staticmethod
     def build_prediction_payloads(
@@ -635,26 +612,23 @@ class SimAgentsMetrics(Metric):
         self._computed = None
         self._update_count += 1
 
-        try:
-            for (
-                scenario_file,
-                scenario_agent_id,
-                scenario_pred_traj,
-                scenario_pred_z,
-                scenario_pred_head,
-            ) in scenario_payloads:
-                scenario_metrics = _compute_scenario_metrics_from_arrays(
-                    config=self.sim_agents_config,
-                    scenario_file=scenario_file,
-                    agent_id=scenario_agent_id,
-                    pred_traj=scenario_pred_traj,
-                    pred_z=scenario_pred_z,
-                    pred_head=scenario_pred_head,
-                    ego_only=self.ego_only,
-                )
-                self._update_metric_states(scenario_metrics)
-        finally:
-            _clear_sim_agents_caches()
+        for (
+            scenario_file,
+            scenario_agent_id,
+            scenario_pred_traj,
+            scenario_pred_z,
+            scenario_pred_head,
+        ) in scenario_payloads:
+            scenario_metrics = _compute_scenario_metrics_from_arrays(
+                config=self.sim_agents_config,
+                scenario_file=scenario_file,
+                agent_id=scenario_agent_id,
+                pred_traj=scenario_pred_traj,
+                pred_z=scenario_pred_z,
+                pred_head=scenario_pred_head,
+                ego_only=self.ego_only,
+            )
+            self._update_metric_states(scenario_metrics)
 
     def update_from_prediction_tensors(
         self,
@@ -676,23 +650,20 @@ class SimAgentsMetrics(Metric):
         metric_device = pred_traj.device
 
         start = 0
-        try:
-            for scenario_file, size in zip(scenario_files, sizes):
-                end = start + int(size)
-                scenario_metrics = _compute_scenario_metrics_from_arrays(
-                    config=self.sim_agents_config,
-                    scenario_file=scenario_file,
-                    agent_id=agent_id[start:end],
-                    pred_traj=pred_traj[start:end],
-                    pred_z=pred_z[start:end],
-                    pred_head=pred_head[start:end],
-                    ego_only=self.ego_only,
-                    device=metric_device,
-                )
-                self._update_metric_states(scenario_metrics)
-                start = end
-        finally:
-            _clear_sim_agents_caches()
+        for scenario_file, size in zip(scenario_files, sizes):
+            end = start + int(size)
+            scenario_metrics = _compute_scenario_metrics_from_arrays(
+                config=self.sim_agents_config,
+                scenario_file=scenario_file,
+                agent_id=agent_id[start:end],
+                pred_traj=pred_traj[start:end],
+                pred_z=pred_z[start:end],
+                pred_head=pred_head[start:end],
+                ego_only=self.ego_only,
+                device=metric_device,
+            )
+            self._update_metric_states(scenario_metrics)
+            start = end
 
     def compute(self) -> Dict[str, Tensor]:
         return self.compute_from_state_tensor(

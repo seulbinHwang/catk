@@ -96,6 +96,18 @@ agent 집합도 맞춰야 한다. 이를 위해 `configs/experiment/pre_bc.yaml`
 맞게 구현되어 있어, true/false 양쪽 train selection mode 모두 datamodule 생성
 단계에서 바로 사용할 수 있다.
 
+### WOSAC submission 실행 시 fast metric 비활성화
+
+`configs/experiment/wosac_sub.yaml`은 제출 파일 생성 전용 설정이다. 이 모드에서는
+WOSAC submission protobuf를 저장하는 것이 목적이고, validation 중 fast Sim Agents
+metric을 따로 누적해 로깅할 필요가 없다. 따라서 해당 config는
+`n_batch_sim_agents_metric: 0`과 `scorer_scene_num: 0`을 명시해서 local fast metric
+계산을 끈다.
+
+SMART 모델도 submission 모드에서는 scorer scene 수 자동 조정을 적용하지 않는다.
+이렇게 하면 제출 파일의 내용은 유지하면서, 로깅되지 않을 metric state를 만들기
+위해 앞쪽 validation batch를 불필요하게 평가하는 일을 피할 수 있다.
+
 ### Dynamic traffic-light staleness for SMART baselines
 
 The SMART token baseline now uses the same traffic-light input semantics as the

@@ -60,10 +60,7 @@ class SMART(LightningModule):
 
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
-        self.sim_agents_metrics = SimAgentsMetrics(
-            "val_closed",
-            max_workers=getattr(model_config, "sim_agents_metric_workers", 0),
-        )
+        self.sim_agents_metrics = SimAgentsMetrics("val_closed")
         self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
         wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
         self.wosac_distribution_metrics = WOSACDistributionMetrics(
@@ -171,6 +168,9 @@ class SMART(LightningModule):
         return int(val_batch_size)
 
     def _apply_scorer_scene_num_overrides(self) -> None:
+        if self.wosac_submission.is_active:
+            return
+
         scorer_scene_num = self.scorer_scene_num
         if scorer_scene_num is None:
             return
@@ -519,10 +519,6 @@ class SMART(LightningModule):
                 self.wosac_distribution_metrics
             )
             if not self.wosac_submission.is_active:
-                self.sim_agents_metrics._drain_completed_futures(
-                    wait=True,
-                    drain_all=True,
-                )
                 if (
                     torch.distributed.is_available()
                     and torch.distributed.is_initialized()
