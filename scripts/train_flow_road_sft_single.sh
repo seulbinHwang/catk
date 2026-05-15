@@ -68,9 +68,9 @@ SEED="${SEED:-817}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 TRAINER_DETERMINISTIC="${TRAINER_DETERMINISTIC:-true}"
 
-# LR 셋팅은 flow-matching pretraining (pre_bc_flow.yaml) 참조: lr=4e-4 / min_ratio=1e-2.
-# RoaD BC loss = pretraining 과 동일 objective. fine-tuning 이라 warmup 만 약간 키움.
-LR="${LR:-4e-4}"
+# LR: 4e-4 (pre_bc_flow) 는 수렴된 모델 full FT 에 너무 공격적 (RMM 급락 확인) →
+# 1e-6 으로 낮춤 (OCSC 안정 셋팅과 동일한 보수적 LR).
+LR="${LR:-1e-6}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-50}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-0.01}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"

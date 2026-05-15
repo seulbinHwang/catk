@@ -20,11 +20,10 @@ action: finetune
 
 model:
   model_config:
-    # LR 셋팅은 flow-matching pretraining (configs/experiment/pre_bc_flow.yaml) 참조.
-    # RoaD BC loss = pretraining 과 동일한 flow-matching objective 라 같은 스케줄 사용.
-    # pretraining: lr=4e-4 / warmup=4 / min_ratio=1e-2 / grad_clip=1.0.
-    # fine-tuning 이므로 warmup 만 약간 키움 (4 → 50).
-    lr: 4e-4
+    # LR: pretraining (pre_bc_flow) 의 4e-4 는 수렴된 모델 full FT 에 너무 공격적
+    # (RMM 0.767→0.644 급락, kinematic likelihood 붕괴 확인) → 1e-6 로 낮춤.
+    # OCSC 안정 셋팅과 동일한 보수적 LR. grad_clip=1.0 유지.
+    lr: 1e-6
     lr_warmup_steps: 50
     lr_total_steps: -1
     lr_min_ratio: 1e-2
