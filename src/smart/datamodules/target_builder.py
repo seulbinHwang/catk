@@ -22,7 +22,7 @@ class WaymoTargetBuilderTrain(BaseTransform):
         self.step_current = 10
         self.max_num = max_num
 
-    def __call__(self, data) -> HeteroData:
+    def forward(self, data) -> HeteroData:
         pos = data["agent"]["position"]
         av_index = torch.where(data["agent"]["role"][:, 0])[0].item()
         distance = torch.norm(pos - pos[av_index], dim=-1)
@@ -54,5 +54,5 @@ class WaymoTargetBuilderVal(BaseTransform):
     def __init__(self) -> None:
         super(WaymoTargetBuilderVal, self).__init__()
 
-    def __call__(self, data) -> HeteroData:
+    def forward(self, data) -> HeteroData:
         return HeteroData(data)
