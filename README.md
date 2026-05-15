@@ -99,6 +99,15 @@ light at `0s` staleness, and later blocks use `0.5s`, `1.0s`, ... staleness. The
 cache builder also checks that WOMD scenarios use the standard current raw step
 `10`, so the observed-light timestamp and model staleness convention stay aligned.
 
+SMART closed-loop validation/test runs all `n_rollout_closed_val` rollouts as one
+rollout-major batch. The map encoder is evaluated once, then `pt_token`,
+`position`, `orientation`, `batch`, and `light_type` are expanded together with
+rollout-specific batch offsets. Agent tensors are expanded in the same rollout
+order, and outputs are reshaped back to `[agent, rollout, time, ...]` before
+metrics, WOSAC submission, and visualization code see them. This keeps the public
+validation/test result interface unchanged while avoiding repeated inference
+calls for each rollout.
+
 ### Motion missingness features for SMART baselines
 
 The SMART next-token baseline now exposes motion missingness to the agent

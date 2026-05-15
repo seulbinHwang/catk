@@ -13,6 +13,7 @@
 
 import math
 from pathlib import Path
+from typing import Dict
 
 import hydra
 import torch
@@ -83,6 +84,172 @@ class SMART(LightningModule):
         self.training_rollout_sampling = model_config.training_rollout_sampling
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
 
+    @staticmethod
+    def _repeat_tensor_on_first_dim(tensor: torch.Tensor, repeat_count: int) -> torch.Tensor:
+        if repeat_count == 1:
+            return tensor
+        repeat_pattern = (repeat_count,) + (1,) * tensor.dim()
+        return tensor.unsqueeze(0).repeat(repeat_pattern).flatten(0, 1).contiguous()
+
+    @staticmethod
+    def _expand_batch_index_for_rollouts(
+        batch_index: torch.Tensor,
+        repeat_count: int,
+        num_graphs: int,
+    ) -> torch.Tensor:
+        if repeat_count == 1:
+            return batch_index
+        rollout_offsets = (
+            torch.arange(repeat_count, device=batch_index.device, dtype=batch_index.dtype)
+            * int(num_graphs)
+        )
+        expanded_batch = batch_index.unsqueeze(0).repeat(repeat_count, 1)
+        expanded_batch = expanded_batch + rollout_offsets.unsqueeze(1)
+        return expanded_batch.reshape(-1).contiguous()
+
+    def _build_parallel_rollout_map_feature(
+        self,
+        map_feature: Dict[str, torch.Tensor],
+        repeat_count: int,
+        num_graphs: int,
+    ) -> Dict[str, torch.Tensor]:
+        if repeat_count == 1:
+            return map_feature
+
+        expanded_map_feature = {
+            "pt_token": self._repeat_tensor_on_first_dim(map_feature["pt_token"], repeat_count),
+            "position": self._repeat_tensor_on_first_dim(map_feature["position"], repeat_count),
+            "orientation": self._repeat_tensor_on_first_dim(
+                map_feature["orientation"],
+                repeat_count,
+            ),
+            "light_type": self._repeat_tensor_on_first_dim(map_feature["light_type"], repeat_count),
+            "batch": self._expand_batch_index_for_rollouts(
+                map_feature["batch"],
+                repeat_count=repeat_count,
+                num_graphs=num_graphs,
+            ),
+        }
+        return expanded_map_feature
+
+    def _build_parallel_rollout_tokenized_agent(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        repeat_count: int,
+        num_graphs: int,
+    ) -> Dict[str, torch.Tensor]:
+        if repeat_count == 1:
+            return tokenized_agent
+
+        return {
+            "num_graphs": int(num_graphs) * repeat_count,
+            "type": self._repeat_tensor_on_first_dim(tokenized_agent["type"], repeat_count),
+            "shape": self._repeat_tensor_on_first_dim(tokenized_agent["shape"], repeat_count),
+            "token_agent_shape": self._repeat_tensor_on_first_dim(
+                tokenized_agent["token_agent_shape"],
+                repeat_count,
+            ),
+            "batch": self._expand_batch_index_for_rollouts(
+                tokenized_agent["batch"],
+                repeat_count=repeat_count,
+                num_graphs=num_graphs,
+            ),
+            "token_traj_all": self._repeat_tensor_on_first_dim(
+                tokenized_agent["token_traj_all"],
+                repeat_count,
+            ),
+            "token_traj": self._repeat_tensor_on_first_dim(
+                tokenized_agent["token_traj"],
+                repeat_count,
+            ),
+            "trajectory_token_veh": tokenized_agent["trajectory_token_veh"],
+            "trajectory_token_ped": tokenized_agent["trajectory_token_ped"],
+            "trajectory_token_cyc": tokenized_agent["trajectory_token_cyc"],
+            "gt_pos_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_pos_raw"],
+                repeat_count,
+            ),
+            "gt_head_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_head_raw"],
+                repeat_count,
+            ),
+            "gt_valid_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_valid_raw"],
+                repeat_count,
+            ),
+            "gt_z_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_z_raw"],
+                repeat_count,
+            ),
+            "valid_mask": self._repeat_tensor_on_first_dim(
+                tokenized_agent["valid_mask"],
+                repeat_count,
+            ),
+            "gt_idx": self._repeat_tensor_on_first_dim(tokenized_agent["gt_idx"], repeat_count),
+            "gt_pos": self._repeat_tensor_on_first_dim(tokenized_agent["gt_pos"], repeat_count),
+            "gt_heading": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_heading"],
+                repeat_count,
+            ),
+        }
+
+    @staticmethod
+    def _reshape_parallel_rollout_prediction(
+        pred_tensor: torch.Tensor,
+        repeat_count: int,
+        num_agent: int,
+    ) -> torch.Tensor:
+        pred_tensor = pred_tensor.reshape(repeat_count, num_agent, *pred_tensor.shape[1:])
+        permute_order = (1, 0) + tuple(range(2, pred_tensor.dim()))
+        return pred_tensor.permute(*permute_order).contiguous()
+
+    def _run_closed_loop_rollouts(
+        self,
+        tokenized_map: Dict[str, torch.Tensor],
+        tokenized_agent: Dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        repeat_count = int(self.n_rollout_closed_val)
+        if repeat_count <= 0:
+            raise ValueError(
+                f"n_rollout_closed_val must be positive, got {self.n_rollout_closed_val}."
+            )
+
+        num_agent = int(tokenized_agent["batch"].shape[0])
+        num_graphs = int(tokenized_agent["num_graphs"])
+        map_feature = self.encoder.map_encoder(tokenized_map)
+        rollout_map_feature = self._build_parallel_rollout_map_feature(
+            map_feature=map_feature,
+            repeat_count=repeat_count,
+            num_graphs=num_graphs,
+        )
+        rollout_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
+            tokenized_agent=tokenized_agent,
+            repeat_count=repeat_count,
+            num_graphs=num_graphs,
+        )
+        pred = self.encoder.agent_encoder.inference(
+            rollout_tokenized_agent,
+            rollout_map_feature,
+            self.validation_rollout_sampling,
+        )
+        return (
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_traj_10hz"],
+                repeat_count=repeat_count,
+                num_agent=num_agent,
+            ),
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_z_10hz"],
+                repeat_count=repeat_count,
+                num_agent=num_agent,
+            ),
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_head_10hz"],
+                repeat_count=repeat_count,
+                num_agent=num_agent,
+            ),
+        )
+
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         if self.training_rollout_sampling.num_k <= 0:
@@ -135,18 +302,10 @@ class SMART(LightningModule):
 
         # ! closed-loop vlidation
         if self.val_closed_loop:
-            pred_traj, pred_z, pred_head = [], [], []
-            for _ in range(self.n_rollout_closed_val):
-                pred = self.encoder.inference(
-                    tokenized_map, tokenized_agent, self.validation_rollout_sampling
-                )
-                pred_traj.append(pred["pred_traj_10hz"])
-                pred_z.append(pred["pred_z_10hz"])
-                pred_head.append(pred["pred_head_10hz"])
-
-            pred_traj = torch.stack(pred_traj, dim=1)  # [n_ag, n_rollout, n_step, 2]
-            pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
-            pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
+            pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+            )
 
             update_wosac_distribution_metric_from_model(
                 metric=self.wosac_distribution_metrics,
@@ -276,18 +435,10 @@ class SMART(LightningModule):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
         # ! only closed-loop vlidation
-        pred_traj, pred_z, pred_head = [], [], []
-        for _ in range(self.n_rollout_closed_val):
-            pred = self.encoder.inference(
-                tokenized_map, tokenized_agent, self.validation_rollout_sampling
-            )
-            pred_traj.append(pred["pred_traj_10hz"])
-            pred_z.append(pred["pred_z_10hz"])
-            pred_head.append(pred["pred_head_10hz"])
-
-        pred_traj = torch.stack(pred_traj, dim=1)  # [n_ag, n_rollout, n_step, 2]
-        pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
-        pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
+        pred_traj, pred_z, pred_head = self._run_closed_loop_rollouts(
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
+        )
 
         update_wosac_distribution_metric_from_model(
             metric=self.test_wosac_distribution_metrics,
