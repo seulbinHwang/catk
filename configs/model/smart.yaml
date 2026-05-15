@@ -8,7 +8,14 @@ model_config:
   # Optional: set this to the SMART pretrain CPD value only when you want DPR.
   # CPD/CES are evaluated regardless of this value.
   wosac_cpd_reference: null
-  n_batch_wosac_metric: 10
+  n_batch_sim_agents_metric: 10
+  # Positive values auto-set n_batch_sim_agents_metric from world_size and
+  # val_batch_size so scorer work is comparable across GPU counts. Set null or
+  # 0 to keep the explicit n_batch_sim_agents_metric value.
+  scorer_scene_num: 840
+  # Backward-compatible knob. Fast WOSAC runs on the current torch device and
+  # no longer launches the old official-scorer worker pool.
+  sim_agents_metric_workers: 0
   n_vis_batch: 2
   n_vis_scenario: 5
   n_vis_rollout: 5

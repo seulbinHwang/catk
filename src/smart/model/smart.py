@@ -23,9 +23,9 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import (
     CrossEntropy,
+    SimAgentsMetrics,
     TokenCls,
     WOSACDistributionMetrics,
-    WOSACMetrics,
     WOSACSubmission,
     log_and_reset_wosac_distribution_metric,
     minADE,
@@ -60,7 +60,10 @@ class SMART(LightningModule):
 
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
-        self.wosac_metrics = WOSACMetrics("val_closed")
+        self.sim_agents_metrics = SimAgentsMetrics(
+            "val_closed",
+            max_workers=getattr(model_config, "sim_agents_metric_workers", 0),
+        )
         self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
         wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
         self.wosac_distribution_metrics = WOSACDistributionMetrics(
@@ -77,7 +80,19 @@ class SMART(LightningModule):
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
-        self.n_batch_wosac_metric = model_config.n_batch_wosac_metric
+        self.n_batch_sim_agents_metric = int(
+            getattr(
+                model_config,
+                "n_batch_sim_agents_metric",
+                getattr(model_config, "n_batch_wosac_metric", 10),
+            )
+        )
+        self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
+        self._scorer_scene_num_last_key: tuple[int, int, int] | None = None
+        self.closed_loop_metric_name = "val_closed/sim_agents_2025/realism_meta_metric"
+        self.val_closed_minade_name = (
+            "val_closed/sim_agents_2025/minADE_best_of_n_rollout_closed_val"
+        )
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
@@ -142,6 +157,66 @@ class SMART(LightningModule):
         if len(seed_rows) == 0:
             return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
         return torch.tensor(seed_rows, dtype=torch.long, device=device)
+
+    def _resolve_val_batch_size(self) -> int | None:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return None
+        val_batch_size = getattr(datamodule, "val_batch_size", None)
+        if not isinstance(val_batch_size, int) or val_batch_size <= 0:
+            return None
+        return int(val_batch_size)
+
+    def _apply_scorer_scene_num_overrides(self) -> None:
+        scorer_scene_num = self.scorer_scene_num
+        if scorer_scene_num is None:
+            return
+        try:
+            scorer_scene_num = int(scorer_scene_num)
+        except (TypeError, ValueError):
+            return
+        if scorer_scene_num <= 0:
+            return
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        if world_size <= 0:
+            world_size = 1
+
+        val_batch_size = self._resolve_val_batch_size()
+        if val_batch_size is None:
+            return
+
+        per_rank_scenes = math.ceil(scorer_scene_num / world_size)
+        self.n_batch_sim_agents_metric = max(
+            1,
+            math.ceil(per_rank_scenes / val_batch_size),
+        )
+
+        current_key = (int(scorer_scene_num), int(world_size), int(val_batch_size))
+        if self._scorer_scene_num_last_key == current_key:
+            return
+        self._scorer_scene_num_last_key = current_key
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[scorer_scene_num] Fast WOSAC sim_agents_2025 scorer batch count set to "
+                f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric} "
+                f"(requested_scenes={scorer_scene_num}, world_size={world_size}, "
+                f"val_batch_size={val_batch_size}).",
+                flush=True,
+            )
+
+    def on_fit_start(self) -> None:
+        self._apply_scorer_scene_num_overrides()
+
+    def on_validation_start(self) -> None:
+        self._apply_scorer_scene_num_overrides()
 
     def _build_parallel_rollout_map_feature(
         self,
@@ -364,7 +439,7 @@ class SMART(LightningModule):
                 include_gt=True,
             )
 
-            # ! WOSAC
+            # ! Sim Agents submission / metrics
             scenario_rollouts = None
             if self.wosac_submission.is_active:  # ! save WOSAC submission
                 self.wosac_submission.update(
@@ -396,8 +471,19 @@ class SMART(LightningModule):
                     ],
                 )
 
-                # WOSAC metrics
-                if batch_idx < self.n_batch_wosac_metric:
+                if batch_idx < self.n_batch_sim_agents_metric:
+                    self.sim_agents_metrics.update_from_prediction_tensors(
+                        scenario_files=data["tfrecord_path"],
+                        agent_id=data["agent"]["id"],
+                        agent_batch=data["agent"]["batch"],
+                        pred_traj=pred_traj,
+                        pred_z=pred_z,
+                        pred_head=pred_head,
+                    )
+
+            # ! visualization
+            if self.global_rank == 0 and batch_idx < self.n_vis_batch:
+                if scenario_rollouts is None:
                     device = pred_traj.device
                     scenario_rollouts = get_scenario_rollouts(
                         scenario_id=get_scenario_id_int_tensor(
@@ -409,10 +495,6 @@ class SMART(LightningModule):
                         pred_z=pred_z,
                         pred_head=pred_head,
                     )
-                    self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
-
-            # ! visualization
-            if self.global_rank == 0 and batch_idx < self.n_vis_batch:
                 if scenario_rollouts is not None:
                     for _i_sc in range(self.n_vis_scenario):
                         _vis = VisWaymo(
@@ -434,16 +516,56 @@ class SMART(LightningModule):
                 self.wosac_distribution_metrics
             )
             if not self.wosac_submission.is_active:
-                epoch_wosac_metrics = self.wosac_metrics.compute()
-                epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
-                epoch_wosac_metrics.update(epoch_distribution_metrics)
+                self.sim_agents_metrics._drain_completed_futures(
+                    wait=True,
+                    drain_all=True,
+                )
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    reduced_metric_state = self.sim_agents_metrics.get_state_tensor(
+                        device=self.device
+                    )
+                    torch.distributed.all_reduce(reduced_metric_state)
+                    epoch_sim_agents_metrics = (
+                        self.sim_agents_metrics.compute_from_state_tensor(
+                            reduced_metric_state
+                        )
+                    )
+                    reduced_minade_state = torch.stack(
+                        [
+                            self.minADE.sum.detach().to(device=self.device),
+                            self.minADE.count.detach().to(device=self.device),
+                        ]
+                    )
+                    torch.distributed.all_reduce(reduced_minade_state)
+                    minade_value = reduced_minade_state[0] / reduced_minade_state[
+                        1
+                    ].clamp_min(1e-6)
+                else:
+                    epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
+                    minade_value = self.minADE.sum / self.minADE.count.clamp_min(1e-6)
+
+                closed_loop_metric = epoch_sim_agents_metrics[
+                    self.closed_loop_metric_name
+                ]
+                epoch_sim_agents_metrics[self.val_closed_minade_name] = minade_value
+                epoch_sim_agents_metrics.update(epoch_distribution_metrics)
+                self.log(
+                    self.closed_loop_metric_name,
+                    closed_loop_metric,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=False,
+                )
                 if self.global_rank == 0:
-                    epoch_wosac_metrics["epoch"] = (
+                    epoch_sim_agents_metrics["epoch"] = (
                         self.log_epoch if self.log_epoch >= 0 else self.current_epoch
                     )
-                    self.logger.log_metrics(epoch_wosac_metrics)
+                    self.logger.log_metrics(epoch_sim_agents_metrics)
 
-                self.wosac_metrics.reset()
+                self.sim_agents_metrics.reset()
                 self.minADE.reset()
 
             if self.global_rank == 0:
