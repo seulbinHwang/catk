@@ -126,10 +126,8 @@ def _build_future_loss_mask(valid: torch.Tensor, raw_step: int, cfg: AnalysisCon
         return future_loss_mask
 
     prefix_valid = available_future_valid.to(dtype=torch.long).cumprod(dim=1).bool()
-    prefix_len = prefix_valid.long().sum(dim=1)
-    usable_len = (prefix_len // cfg.shift) * cfg.shift
-    step_index = torch.arange(cfg.flow_window_steps).unsqueeze(0)
-    return step_index < usable_len.unsqueeze(1)
+    future_loss_mask[:, :available_len] = prefix_valid
+    return future_loss_mask
 
 
 def _build_future_loss_mask_np(valid: np.ndarray, raw_step: int, cfg: AnalysisConfig) -> np.ndarray:
@@ -148,10 +146,8 @@ def _build_future_loss_mask_np(valid: np.ndarray, raw_step: int, cfg: AnalysisCo
         return future_loss_mask
 
     prefix_valid = np.cumprod(available_future_valid, axis=1, dtype=np.int64).astype(bool, copy=False)
-    prefix_len = prefix_valid.sum(axis=1)
-    usable_len = (prefix_len // int(cfg.shift)) * int(cfg.shift)
-    step_index = np.arange(cfg.flow_window_steps, dtype=np.int64)[None, :]
-    return step_index < usable_len[:, None]
+    future_loss_mask[:, :available_len] = prefix_valid
+    return future_loss_mask
 
 
 def _build_future_pose_with_loss_mask(

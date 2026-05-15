@@ -26,7 +26,7 @@ def _write_cache(path, *, position: torch.Tensor, heading: torch.Tensor, valid: 
         pickle.dump({"agent": agent}, handle)
 
 
-def test_future_loss_mask_prefix_uses_complete_chunks_only() -> None:
+def test_future_loss_mask_prefix_keeps_continuous_prefix() -> None:
     valid = torch.ones((4, 35), dtype=torch.bool)
     raw_step = 10
     valid[0, raw_step + 1 + 3] = False
@@ -39,7 +39,7 @@ def test_future_loss_mask_prefix_uses_complete_chunks_only() -> None:
         cfg=AnalysisConfig(flow_window_steps=20, use_prefix_valid_future_loss_mask=True),
     )
 
-    expected_counts = torch.tensor([0, 5, 10, 20])
+    expected_counts = torch.tensor([3, 7, 12, 20])
     torch.testing.assert_close(mask.long().sum(dim=1), expected_counts)
 
 

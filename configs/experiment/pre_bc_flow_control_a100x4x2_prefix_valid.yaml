@@ -13,8 +13,8 @@
 #   * control_round_trip_max_position_error_m=0.5
 #
 # The only intentional target-selection change is prefix-valid supervision.
-# On this branch, prefix-valid masks are aligned to complete 5-step chunks:
-# 1-4 valid future steps are dropped, 5-9 use the first 0.5s, and so on.
+# On this branch, prefix-valid masks keep the whole continuous valid prefix
+# after the current anchor without rounding down to 5-step chunks.
 
 defaults:
   - pre_bc_flow_control_2x4_h100

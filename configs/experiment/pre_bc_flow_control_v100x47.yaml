@@ -31,8 +31,8 @@ model:
     decoder:
       flow_window_steps: 20
     token_processor:
-      # 812eccc+ semantics: prefix-valid futures are rounded down to 5-step
-      # chunks; 1~4 valid steps are dropped, 5~9 keep 0.5s, etc.
+      # Prefix-valid futures keep the whole continuous valid prefix after
+      # the current anchor without rounding down to 5-step chunks.
       use_prefix_valid_future_loss_mask: true
       use_kinematic_control_flow: true
       use_holonomic_model_only: false
