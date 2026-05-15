@@ -1,0 +1,25 @@
+# @package _global_
+
+# A100x4x2 prefix-valid control-space pretrain for the default non-holonomic
+# no-slip point ratios.
+#
+# This preset is meant to isolate the effect of moving vehicle/cyclist control
+# from the old box-center ratio 0.0/0.0 to the code defaults:
+#   * vehicle: 0.2289518863
+#   * cyclist: 0.0495847873
+# while keeping prefix-valid supervision and the 0.5m round-trip filter fixed.
+
+defaults:
+  - pre_bc_flow_control_a100x4x2_prefix_valid
+  - _self_
+
+model:
+  model_config:
+    token_processor:
+      use_kinematic_control_flow: true
+      use_holonomic_model_only: false
+      use_rolling_supervision: true
+      use_prefix_valid_future_loss_mask: true
+      control_vehicle_no_slip_point_ratio: 0.2289518863
+      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_round_trip_max_position_error_m: 0.5

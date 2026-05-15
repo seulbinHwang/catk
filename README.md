@@ -613,6 +613,41 @@ python scripts/launch_pre_bc_flow_control_a100x4x2_static_pods.py --dry-run
 python scripts/launch_pre_bc_flow_control_a100x4x2_static_pods.py --stop
 ```
 
+#### testa/testaa A100x4x2 prefix-valid default no-slip ratio pretrain
+
+`testa`, `testaa`에서 기존 box-center ratio `0.0 / 0.0` 대비 default no-slip point ratio 효과를 보려면 아래 전용 launcher를 씁니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_pods.py --replace
+```
+
+이 launcher는 `configs/experiment/pre_bc_flow_control_a100x4x2_prefix_default_noslip.yaml`을 사용합니다. 학습 shape은 A100x4x2 prefix-valid control-space pretrain과 같고, 아래 값만 실험 의도가 드러나도록 명시적으로 고정합니다.
+
+```yaml
+model:
+  model_config:
+    token_processor:
+      use_kinematic_control_flow: true
+      use_holonomic_model_only: false
+      use_rolling_supervision: true
+      use_prefix_valid_future_loss_mask: true
+      control_vehicle_no_slip_point_ratio: 0.2289518863
+      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_round_trip_max_position_error_m: 0.5
+```
+
+기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_default_noslip_roundtrip05_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix-default-noslip`입니다. 실행 전에 실제 kubectl 명령을 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_pods.py --dry-run
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_pods.py --stop
+```
+
 #### V100 47GPU static pod control-space pretrain
 
 `testsv`, `testsvv`, `testsvvv`, `testsvvvv`, `sv`, `svv`, `svvv`, `svvvv`의 V100x4 pod 8개와 `fv`, `fvv`, `fvvv`, `fvvvv`, `fvvvvv`의 V100x3 pod 5개를 묶어 control-space pretrain을 돌릴 때는 아래 preset과 launcher를 씁니다.
