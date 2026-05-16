@@ -19,6 +19,7 @@ model_config:
   n_vis_batch: 2
   n_vis_scenario: 5
   n_vis_rollout: 5
+  delete_local_videos_after_wandb_upload: true
   val_open_loop: true
   val_closed_loop: true
   validation_closed_seed: 0

@@ -80,6 +80,9 @@ class SMART(LightningModule):
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
+        self.delete_local_videos_after_wandb_upload = bool(
+            getattr(model_config, "delete_local_videos_after_wandb_upload", True)
+        )
         self.n_batch_sim_agents_metric = int(
             getattr(
                 model_config,
@@ -266,6 +269,38 @@ class SMART(LightningModule):
 
     def _should_compute_closed_loop_minade(self) -> bool:
         return not self._fit_time_fast_validation_enabled
+
+    def _get_video_logger(self):
+        trainer = getattr(self, "trainer", None)
+        if trainer is not None:
+            for logger in getattr(trainer, "loggers", []) or []:
+                if hasattr(logger, "log_video"):
+                    return logger
+        logger = getattr(self, "logger", None)
+        if hasattr(logger, "log_video"):
+            return logger
+        return None
+
+    def _log_metrics_to_logger(self, metrics: Dict[str, object]) -> None:
+        logger = getattr(self, "logger", None)
+        if logger is not None and hasattr(logger, "log_metrics"):
+            logger.log_metrics(metrics)
+
+    def _cleanup_local_video(self, video_path: str) -> None:
+        video_file = Path(video_path)
+        try:
+            video_file.resolve().relative_to(self.video_dir.resolve())
+        except ValueError:
+            return
+
+        video_file.unlink(missing_ok=True)
+        current_dir = video_file.parent
+        while current_dir != self.video_dir.parent:
+            try:
+                current_dir.rmdir()
+            except OSError:
+                break
+            current_dir = current_dir.parent
 
     def on_fit_start(self) -> None:
         self._apply_scorer_scene_num_overrides()
@@ -617,6 +652,7 @@ class SMART(LightningModule):
 
             # ! visualization
             if self.global_rank == 0 and batch_idx < self.n_vis_batch:
+                video_logger = self._get_video_logger()
                 if scenario_rollouts is None:
                     device = pred_traj.device
                     scenario_rollouts = get_scenario_rollouts(
@@ -640,9 +676,12 @@ class SMART(LightningModule):
                             scenario_rollouts[_i_sc], self.n_vis_rollout
                         )
                         for _path in _vis.video_paths:
-                            self.logger.log_video(
-                                "/".join(_path.split("/")[-3:]), [_path]
-                            )
+                            if video_logger is not None:
+                                video_logger.log_video(
+                                    "/".join(_path.split("/")[-3:]), [_path]
+                                )
+                                if self.delete_local_videos_after_wandb_upload:
+                                    self._cleanup_local_video(_path)
 
     def on_validation_epoch_end(self):
         if self.val_closed_loop:
@@ -700,7 +739,7 @@ class SMART(LightningModule):
                     epoch_sim_agents_metrics["epoch"] = (
                         self.log_epoch if self.log_epoch >= 0 else self.current_epoch
                     )
-                    self.logger.log_metrics(epoch_sim_agents_metrics)
+                    self._log_metrics_to_logger(epoch_sim_agents_metrics)
 
                 self.sim_agents_metrics.reset()
                 self.minADE.reset()
@@ -710,7 +749,7 @@ class SMART(LightningModule):
                     epoch_distribution_metrics["epoch"] = (
                         self.log_epoch if self.log_epoch >= 0 else self.current_epoch
                     )
-                    self.logger.log_metrics(epoch_distribution_metrics)
+                    self._log_metrics_to_logger(epoch_distribution_metrics)
                 self.sim_agents_submission.save_sub_file()
 
     def configure_optimizers(self):
@@ -773,5 +812,5 @@ class SMART(LightningModule):
         )
         if self.global_rank == 0:
             if epoch_distribution_metrics:
-                self.logger.log_metrics(epoch_distribution_metrics)
+                self._log_metrics_to_logger(epoch_distribution_metrics)
         self.sim_agents_submission.save_sub_file()
