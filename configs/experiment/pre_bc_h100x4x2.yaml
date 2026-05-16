@@ -8,7 +8,8 @@
 #   * 2 nodes
 #   * 4 H100 80GB GPUs per node
 #   * 8 total DDP ranks
-#   * train_batch_size 26 * 8 GPUs = effective global batch 208
+#   * train_batch_size 2 * 8 GPUs * accumulate_grad_batches 13
+#     = effective global batch 208
 #   * lr=6e-4, warmup=4, lr_min_ratio=1e-2
 
 defaults:
@@ -36,7 +37,7 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 1.0
   sync_batchnorm: false
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 13
 
 callbacks:
   tqdm_progress_bar:
@@ -48,8 +49,8 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 26
-  val_batch_size: 16
-  test_batch_size: 16
+  train_batch_size: 2
+  val_batch_size: 2
+  test_batch_size: 2
   num_workers: 4
   train_use_eval_agent_selection: true
