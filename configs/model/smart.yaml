@@ -63,6 +63,9 @@ model_config:
     description: YOUR_DESCRIPTION
     method_link: YOUR_METHOD_LINK
     account_name: YOUR_ACCOUNT_NAME
+    # Waymo submission proto의 num_model_parameters 필드. 모델 크기에 맞춰 override.
+    # 작은 모델로 학습한 경우 "3M" / "1M" 등으로 바꿔야 한다.
+    num_model_parameters: "7M"
   training_loss:
     use_gt_raw: true
     gt_thresh_scale_length: -1.0  # {"veh": 4.8, "cyc": 2.0, "ped": 1.0}

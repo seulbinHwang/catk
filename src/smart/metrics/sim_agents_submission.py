@@ -28,6 +28,26 @@ from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_
 log = RankedLogger(__name__, rank_zero_only=False)
 _SIM_AGENTS_2025_SUBMISSION_DIRNAME = "sim_agents_2025_submission"
 
+# Waymo 리더보드 거절을 피하기 위해 placeholder가 그대로 들어간 submission archive를
+# 생성하기 전에 미리 차단한다. configs/model/smart.yaml 등의 default placeholder와
+# 정확히 일치하는 문자열만 거른다.
+_SUBMISSION_FIELD_PLACEHOLDERS: Dict[str, frozenset] = {
+    "affiliation": frozenset({"YOUR_AFFILIATION"}),
+    "description": frozenset({"YOUR_DESCRIPTION"}),
+    "method_link": frozenset({"YOUR_METHOD_LINK"}),
+    "account_name": frozenset({"YOUR_ACCOUNT_NAME"}),
+}
+_SUBMISSION_AUTHORS_PLACEHOLDERS: frozenset = frozenset({"Anonymous"})
+
+
+def _is_authors_placeholder(authors: ListConfig[str]) -> bool:
+    if authors is None:
+        return True
+    author_list = [str(name).strip() for name in authors if str(name).strip()]
+    if not author_list:
+        return True
+    return all(name in _SUBMISSION_AUTHORS_PLACEHOLDERS for name in author_list)
+
 
 class SimAgentsSubmission(Metric):
     """Waymo 2025 Sim Agents 제출 파일을 shard와 tar.gz로 저장합니다."""
@@ -41,24 +61,36 @@ class SimAgentsSubmission(Metric):
         description: str,
         method_link: str,
         account_name: str,
+        num_model_parameters: str = "7M",
     ) -> None:
         # Evaluation data is already sharded exactly once per rank by ExactDistributedSampler.
         # Submission export must therefore stay rank-local and only pack shards together at epoch end.
         super().__init__(sync_on_compute=False)
         self.is_active = is_active
         if self.is_active:
+            self._raise_if_metadata_is_placeholder(
+                authors=authors,
+                affiliation=affiliation,
+                description=description,
+                method_link=method_link,
+                account_name=account_name,
+            )
             self.method_name = method_name
             self.authors = authors
             self.affiliation = affiliation
             self.description = description
             self.method_link = method_link
             self.account_name = account_name
+            self.num_model_parameters = str(num_model_parameters)
             self.buffer_scenario_rollouts = []
             self.i_file = 0
             self.submission_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
             self.submission_dir = Path(self.submission_dir) / _SIM_AGENTS_2025_SUBMISSION_DIRNAME
             self.submission_dir.mkdir(parents=True, exist_ok=True)
-            self.submission_scenario_id = []
+            # scenario_id 중복 검사는 list보다 set이 빠르다. 전체 WOMD test split처럼
+            # rank당 수천 scenario가 누적되면 list 기반 ``in`` 검사가 O(n^2)이 되므로
+            # set으로 dedup해서 aggregate_rollouts가 O(n)에 끝나도록 만든다.
+            self.submission_scenario_id = set()
 
             self.data_keys = [
                 "scenario_id",
@@ -111,7 +143,7 @@ class SimAgentsSubmission(Metric):
     ) -> None:
         for rollout in scenario_rollouts:
             if rollout.scenario_id not in self.submission_scenario_id:
-                self.submission_scenario_id.append(rollout.scenario_id)
+                self.submission_scenario_id.add(rollout.scenario_id)
                 self.buffer_scenario_rollouts.append(rollout)
                 if len(self.buffer_scenario_rollouts) > 300:
                     self._save_shard()
@@ -161,7 +193,7 @@ class SimAgentsSubmission(Metric):
             uses_lidar_data=False,
             uses_camera_data=False,
             uses_public_model_pretraining=False,
-            num_model_parameters="7M",
+            num_model_parameters=self.num_model_parameters,
             acknowledge_complies_with_closed_loop_requirement=True,
         )
         output_filename = self.submission_dir / (
@@ -172,6 +204,43 @@ class SimAgentsSubmission(Metric):
             f.write(shard_submission.SerializeToString())
         self.i_file += 1
         self.buffer_scenario_rollouts = []
+
+    @staticmethod
+    def _raise_if_metadata_is_placeholder(
+        authors: ListConfig[str],
+        affiliation: str,
+        description: str,
+        method_link: str,
+        account_name: str,
+    ) -> None:
+        """``is_active=True``인 submission 모드에서 placeholder가 들어가지 않았는지 검사한다.
+
+        ``configs/model/smart.yaml``의 default 값이 그대로 남아 있으면 Waymo
+        리더보드가 archive를 거절한다. 그래서 모델 초기화 단계에서 미리 차단해
+        몇 시간짜리 rollout 끝에서야 잘못된 tar.gz가 만들어지는 일을 막는다.
+        """
+        offending_fields: List[str] = []
+        for field_name, value in (
+            ("affiliation", affiliation),
+            ("description", description),
+            ("method_link", method_link),
+            ("account_name", account_name),
+        ):
+            placeholders = _SUBMISSION_FIELD_PLACEHOLDERS.get(field_name, frozenset())
+            if str(value).strip() in placeholders:
+                offending_fields.append(field_name)
+        if _is_authors_placeholder(authors):
+            offending_fields.append("authors")
+        if offending_fields:
+            field_list = ", ".join(sorted(offending_fields))
+            raise ValueError(
+                "Sim Agents 2025 submission 메타데이터가 default placeholder인 채로 "
+                f"is_active=True로 켜졌습니다: {field_list}. "
+                "Waymo 리더보드가 placeholder가 들어간 archive를 거절하므로 실행 인자로 "
+                "model.model_config.sim_agents_submission.* 필드를 실제 값으로 "
+                "override해 주세요. 예: "
+                "model.model_config.sim_agents_submission.account_name=\"<your_account>\"."
+            )
 
     @staticmethod
     def _build_archive_member_name(shard_index: int, num_shards: int) -> str:

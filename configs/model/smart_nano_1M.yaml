@@ -12,5 +12,7 @@ model_config:
     pl2a_radius: 20
     a2a_radius: 20
     time_span: 20
+  sim_agents_submission:
+    num_model_parameters: "1M"
 
 # 1.2M parameters. Train on single A100 80GB, with batch size 64.

@@ -7,5 +7,7 @@ model_config:
     head_dim: 8
     num_map_layers: 2
     num_agent_layers: 4
+  sim_agents_submission:
+    num_model_parameters: "3M"
 
 # 3M parameters.

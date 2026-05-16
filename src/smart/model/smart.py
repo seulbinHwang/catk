@@ -258,9 +258,37 @@ class SMART(LightningModule):
                 flush=True,
             )
 
+    def _warn_if_fit_time_fast_validation_inactive(self) -> None:
+        """``fit_time_fast_validation_only=True``로 켰지만 조건이 안 맞아 활성화되지
+        못한 경우를 한 번만 알린다. README §"학습 중 checkpoint 확인" 예시는
+        ``val_open_loop=false``를 같이 끄도록 안내하지만 둘 중 한쪽만 켜면 fast
+        모드가 silently OFF가 된다. 사용자가 "왜 안 빨라지지?" 디버깅하지 않게 돕는다.
+        """
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        if not getattr(trainer, "is_global_zero", True):
+            return
+        reasons: list[str] = []
+        if not self.val_closed_loop:
+            reasons.append("val_closed_loop=false")
+        if self.val_open_loop:
+            reasons.append("val_open_loop=true (false로 끄세요)")
+        if self.sim_agents_submission.is_active:
+            reasons.append("sim_agents_submission.is_active=true (submission 모드에선 의미 없음)")
+        if int(self.n_batch_sim_agents_metric) <= 0:
+            reasons.append("n_batch_sim_agents_metric<=0")
+        print(
+            "[fit_time_fast_validation_only] 옵션이 켜져 있지만 활성 조건이 충족되지 "
+            f"않아 fast 모드가 적용되지 않았습니다. 원인: {', '.join(reasons)}.",
+            flush=True,
+        )
+
     def _apply_fit_time_validation_batch_limit(self) -> None:
         if not self._should_enable_fit_time_fast_validation():
             self._fit_time_fast_validation_enabled = False
+            if self.fit_time_fast_validation_only:
+                self._warn_if_fit_time_fast_validation_inactive()
             return
 
         trainer = getattr(self, "trainer", None)
