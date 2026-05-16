@@ -118,6 +118,81 @@ local validation, WOSAC submission 생성은 모두 KFM 계열 `semi_control_sta
 추론의 precision 조건을 맞추기 위한 기본값이며, FP32가 꼭 필요한 실험만 실행 시
 `trainer.precision=32-true`로 명시적으로 덮어쓴다.
 
+### H100x4x2 멀티 노드 SMART NTP pretrain
+
+`hsb-npc-training`과 `hsb-npc-training2`처럼 H100 4장이 붙은 pod 두 개에서 SMART NTP
+pretrain을 바로 시작하려면 아래 launcher를 사용한다.
+
+```bash
+python scripts/launch_smart_ntp_h100x4x2_hsb.py \
+  --replace \
+  --task-name smart_ntp_pretrain_h100x4x2_fair
+```
+
+이 launcher는 pod를 만들거나 지우지 않는다. 로컬에서 `kubectl exec`로 이미 떠 있는 두 pod에
+접속한 뒤, 각 pod 안에서 같은 이름의 tmux session을 시작한다. 기본 namespace는 `p-pnc`,
+pod 목록은 `hsb-npc-training hsb-npc-training2`, 원격 저장소 위치는
+`/mnt/nuplan/projects/catk`, branch는 `main`이다. 실행 전에 각 pod에서 `git pull --ff-only
+origin main`을 수행하므로, 현재 main에 push된 코드를 기준으로 학습한다.
+
+기본 experiment는 `configs/experiment/pre_bc_h100x4x2.yaml`이다. 이 config는
+`pre_bc`를 상속하므로 SMART backbone, next-token prediction loss, token sampling,
+agent selection, `num_freq_bands: 66` 같은 모델/알고리즘 설정은 바꾸지 않는다. 대신
+`semi_control_stable`의 H100x4x2 control-space pretrain recipe와 학습 실행 조건을 맞추기
+위해 아래 training/runtime 값만 명시한다.
+
+- `trainer.devices: 4`, `trainer.num_nodes: 2`
+- `data.train_batch_size: 26`, 즉 8개 rank 기준 effective global batch 208
+- `model.model_config.lr: 6e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
+- `trainer.max_epochs: 64`, `check_val_every_n_epoch: 32`
+- `trainer.precision: bf16-mixed`, `gradient_clip_val: 1.0`,
+  `accumulate_grad_batches: 1`
+- `data.val_batch_size: 16`, `data.test_batch_size: 16`, `num_workers: 4`,
+  `prefetch_factor: 1`
+
+기본 cache root는 pod별로 다르다.
+
+- `hsb-npc-training`: `/mnt/nuplan/womd_v1_3/SMART_cache`
+- `hsb-npc-training2`: `/workspace/womd_v1_3/SMART_cache`
+
+다른 위치를 쓰려면 아래처럼 pod별로 override한다.
+
+```bash
+python scripts/launch_smart_ntp_h100x4x2_hsb.py \
+  --replace \
+  --task-name smart_ntp_pretrain_h100x4x2_fair \
+  --pod-cache-root hsb-npc-training=/path/to/SMART_cache \
+  --pod-cache-root hsb-npc-training2=/path/to/SMART_cache
+```
+
+시작 후 tmux에 붙으려면 launcher가 출력하는 attach 명령을 사용한다.
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4x2
+kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-smart-ntp-h100x4x2
+```
+
+실행을 멈추려면 같은 task name으로 stop을 호출한다.
+
+```bash
+python scripts/launch_smart_ntp_h100x4x2_hsb.py \
+  --stop \
+  --task-name smart_ntp_pretrain_h100x4x2_fair
+```
+
+학습 batch, learning rate, epoch 수 같은 실험 파라미터를 바꿔야 할 때는 launcher option을
+명시한다. 단, 논문용 공정 비교에서는 어떤 값을 바꿨는지 KFM 쪽 recipe와 함께 기록해야 한다.
+
+```bash
+python scripts/launch_smart_ntp_h100x4x2_hsb.py \
+  --replace \
+  --task-name smart_ntp_pretrain_h100x4x2_bs24 \
+  --train-batch-size 24 \
+  --learning-rate 5e-4
+```
+
+실제로 pod에 명령을 보내기 전에 무엇이 실행될지만 확인하려면 `--dry-run`을 붙인다.
+
 공정 비교에서는 어느 epoch의 가중치를 비교하는지도 맞춰야 한다.
 `configs/experiment/pre_bc.yaml`은 KFM pretrain 설정과 같이
 `val_closed/sim_agents_2025/realism_meta_metric`을 checkpoint monitor로 사용하고
