@@ -156,8 +156,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"this preset expects exactly {len(DEFAULT_PODS)} V100 pods")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
-    if args.oom_step < 1:
-        parser.error("--oom-step must be >= 1")
+    if args.oom_step < 0:
+        parser.error("--oom-step must be >= 0")
     if args.min_bs < 1:
         parser.error("--min-bs must be >= 1")
     return args

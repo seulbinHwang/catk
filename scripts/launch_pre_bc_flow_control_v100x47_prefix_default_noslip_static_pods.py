@@ -6,8 +6,9 @@ This is the static V100-fleet counterpart of the A100x4x2 W&B run:
     flow_control_space_pretrain_a100x4x2_prefix_default_noslip_roundtrip05_lr6e-4_bs26
 
 It reuses the generic V100x47 launcher for heterogeneous pod GPU counts,
-manual rank offsets, checkpoint sync, and OOM retry. The wrapper only fixes the
-ablation-specific preset, task name, pod order, session, and ports.
+manual rank offsets, checkpoint sync, and OOM restart. Unlike the fallback
+launchers, this wrapper keeps train_batch_size unchanged after OOM and only
+resumes from the latest checkpoint.
 """
 
 from __future__ import annotations
@@ -95,7 +96,15 @@ def parse_args() -> argparse.Namespace:
         help="Use 'gpu' to spawn one worker per visible GPU on each pod.",
     )
     parser.add_argument("--initial-bs", type=int, default=4)
-    parser.add_argument("--oom-step", type=int, default=2)
+    parser.add_argument(
+        "--oom-step",
+        type=int,
+        default=0,
+        help=(
+            "Batch-size decrement after CUDA OOM. The default 0 keeps "
+            "train_batch_size unchanged and only resumes from the latest checkpoint."
+        ),
+    )
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--poll-interval", type=int, default=30)
     parser.add_argument("--master-port", default="29561")
@@ -126,8 +135,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"this preset expects exactly {len(DEFAULT_PODS)} V100 pods")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
-    if args.oom_step < 1:
-        parser.error("--oom-step must be >= 1")
+    if args.oom_step < 0:
+        parser.error("--oom-step must be >= 0")
     if args.min_bs < 1:
         parser.error("--min-bs must be >= 1")
     return args

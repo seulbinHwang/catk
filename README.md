@@ -698,6 +698,8 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 
 `data.train_batch_size=4`는 기존 V100x47 안정 설정을 따른 값입니다. A100x4x2 run의 effective global batch는 `26 * 8 = 208`이므로 완전히 같지는 않지만, V100 32GB fleet에서 memory-safe한 기본값을 쓰고 lr은 A100 run과 같은 `6e-4`로 고정합니다.
 
+이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=4`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, `4 -> 2`처럼 batch를 낮추지 않습니다.
+
 기본 실험 이름은 `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4`이고, tmux session 이름은 `catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix`입니다.
 
 실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:

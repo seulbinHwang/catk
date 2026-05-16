@@ -8,7 +8,8 @@
 #
 # Default behavior:
 #   * first attempt: data.train_batch_size=26
-#   * on CUDA OOM: reduce batch by 2 and resume from the latest epoch_last.ckpt
+#   * on CUDA OOM: reduce batch by OOM_STEP and resume from the latest epoch_last.ckpt
+#     If OOM_STEP=0, keep the same batch size and only resume.
 #   * on retryable external exits such as SIGTERM/SIGABRT: keep the batch size
 #     and resume from the latest epoch_last.ckpt
 #   * stop at MIN_BS=20 unless overridden
@@ -325,8 +326,12 @@ while (( bs >= MIN_BS )); do
   fi
 
   if [[ "$ATTEMPT_EXIT_REASON" == "oom" ]] || grep -Eq "$OOM_REGEX" "$attempt_log"; then
-    new_bs=$(( bs - OOM_STEP ))
     non_oom_retry_count=0
+    if (( OOM_STEP == 0 )); then
+      log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Keeping bs=${bs} and resuming from the latest checkpoint."
+      continue
+    fi
+    new_bs=$(( bs - OOM_STEP ))
     log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Lowering to bs=${new_bs}."
     if (( new_bs < MIN_BS )); then
       log "Next bs=${new_bs} is below MIN_BS=${MIN_BS}; aborting."
