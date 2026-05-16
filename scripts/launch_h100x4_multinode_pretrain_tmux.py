@@ -538,7 +538,7 @@ fi
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
 git fetch origin --prune
-git checkout --detach {shq(args.git_ref)}
+git checkout -f {shq(args.git_ref)}
 """
     elif args.pull:
         branch_ref = f"refs/heads/{args.branch}"
