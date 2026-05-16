@@ -10,7 +10,7 @@ wandb:
   project: clsft-catk
   log_model: False # upload lightning ckpts
   prefix: "" # a string to put at the beginning of metric keys
-  entity: YOUR_ENTITY
+  entity: null # null이면 wandb 기본 entity (보통 사용자 본인)를 사용. 팀 entity로 보내려면 logger.wandb.entity=<id>로 override.
   group: ""
   tags: []
   job_type: ""

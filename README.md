@@ -56,6 +56,11 @@
 
 - 다른 방법으로 [Dockerfile](install/Dockerfile)을 사용해 직접 Docker image를 만들 수 있다. 몇 가지 이유로 Docker 환경에서 코드가 더 빠르게 실행되는 것을 확인했다.
 - logging에는 [WandB](https://wandb.ai/)를 사용한다. 계정은 무료로 만들 수 있다.
+  - `configs/logger/wandb.yaml`의 `entity`는 `null`이 기본값이다. 이 경우 wandb는
+    `wandb login`으로 인증된 사용자의 기본 entity를 사용한다. 팀이나 organization
+    entity로 로그를 보내고 싶으면 실행 시 `logger.wandb.entity=<your_entity>`를
+    덧붙이면 된다. 로컬 디스크에만 기록하고 싶으면 환경변수 `WANDB_MODE=offline`을
+    켜거나 `logger.wandb.offline=true`를 추가하면 wandb 서버로의 업로드가 멈춘다.
 - **주의할 점**
   - 학습과 validation에는 *NVIDIA A100 80GB* 8장을 사용했다. 학습과 fine-tuning은 며칠이 걸리고, validation과 test도 몇 시간이 걸릴 수 있다.
   - [Waymo Open Motion Dataset 약관](https://waymo.com/open/terms)에 따라 pre-trained model은 공유할 수 없다.
@@ -125,6 +130,32 @@ side-effect를 만들지 않는다.
 `model.model_config.decoder.num_freq_bands: 66`을 명시한다. 이 값을 빠뜨리면
 `pre_bc`에서 저장한 checkpoint의 Fourier embedding weight shape이 기본 SMART 값인
 `64`와 맞지 않아 checkpoint load 단계에서 실패한다.
+
+### 학습 손실 metric 상태 정리
+
+SMART의 학습/검증 손실은 모두 같은 `CrossEntropy` torchmetrics 인스턴스
+(`self.training_loss`)를 통과한다. `training_step`과 `validation_step` 양쪽에서
+`forward`로 호출되기 때문에 metric 내부의 `loss_sum`/`count` 상태가 phase를
+넘나들며 누적되는 구조였다. 현재 코드 경로에서 `compute()`를 직접 호출하는
+지점은 없어 가시적인 잘못된 숫자는 없었지만, DDP에서 `dist_reduce_fx="sum"`로
+all-reduce가 trigger되거나 누가 epoch-mean 집계를 추가하면 즉시 train과 val의
+loss가 섞여 잘못된 평균이 잡힐 수 있다.
+
+이를 막기 위해 `on_train_epoch_start`와 `on_validation_start`에서
+`self.training_loss.reset()`을 한 번씩 호출한다. 매 phase 시작 시 metric
+buffer를 0으로 초기화하므로 train 누적과 val 누적이 서로를 오염시키지 않는다.
+`forward` 반환값은 항상 현재 batch에 대한 값이라 `self.log("train/loss", ...)`나
+`val_open/loss`로 찍히는 스칼라는 변하지 않는다.
+
+### finetune/road_finetune checkpoint 로딩 안정성
+
+`src/run.py`의 `finetune`과 `road_finetune` action은 SMART pretrain checkpoint를
+`torch.load(...)["state_dict"]`로 직접 읽는다. PyTorch 2.6부터는
+`torch.load`의 기본값이 `weights_only=True`로 바뀌면서 Lightning이 저장한
+풀 checkpoint dict (state_dict 외 hyperparameter, callback state 등 포함)는
+바로 unpickle되지 않는다. 두 action 모두 `weights_only=False`를 명시적으로
+넘겨서 향후 torch 버전 업그레이드 시 finetune 경로가 silently 깨지는 일을
+막는다.
 
 ### 2025 Sim Agents 제출 실행 시 빠른 지표 비활성화
 

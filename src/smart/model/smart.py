@@ -335,8 +335,16 @@ class SMART(LightningModule):
     def on_fit_end(self) -> None:
         self._restore_fit_time_validation_batch_limit()
 
+    def on_train_epoch_start(self) -> None:
+        # training_loss는 torchmetrics.Metric이라 forward 호출마다 loss_sum/count
+        # 내부 상태가 누적된다. train과 val 양쪽에서 같은 인스턴스를 호출하므로,
+        # phase 시작 시 한 번씩 reset해서 train/val 상태가 섞이거나 epoch 간에
+        # 무한 누적되지 않도록 한다.
+        self.training_loss.reset()
+
     def on_validation_start(self) -> None:
         self._apply_scorer_scene_num_overrides()
+        self.training_loss.reset()
 
     def _build_parallel_rollout_map_feature(
         self,

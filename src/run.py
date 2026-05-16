@@ -107,11 +107,17 @@ def run(cfg: DictConfig) -> None:
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
     elif cfg.action == "finetune":
         log.info("Starting finetuning!")
-        model.load_state_dict(torch.load(cfg.ckpt_path)["state_dict"], strict=False)
+        model.load_state_dict(
+            torch.load(cfg.ckpt_path, weights_only=False)["state_dict"],
+            strict=False,
+        )
         trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "road_finetune":
         log.info("Starting RoaD finetuning!")
-        model.load_state_dict(torch.load(cfg.ckpt_path)["state_dict"], strict=False)
+        model.load_state_dict(
+            torch.load(cfg.ckpt_path, weights_only=False)["state_dict"],
+            strict=False,
+        )
         trainer.fit(model=model, datamodule=datamodule)
     elif cfg.action == "validate":
         log.info("Starting validating!")
