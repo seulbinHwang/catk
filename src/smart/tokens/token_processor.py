@@ -140,10 +140,10 @@ class TokenProcessor(torch.nn.Module):
         )
 
         # ! get raw trajectory data
-        valid = data["agent"]["valid_mask"]  # [n_agent, n_step]
-        heading = data["agent"]["heading"]  # [n_agent, n_step]
-        pos = data["agent"]["position"][..., :2].contiguous()  # [n_agent, n_step, 2]
-        vel = data["agent"]["velocity"]  # [n_agent, n_step, 2]
+        valid = data["agent"]["valid_mask"].clone()  # [n_agent, n_step]
+        heading = data["agent"]["heading"].clone()  # [n_agent, n_step]
+        pos = data["agent"]["position"][..., :2].clone().contiguous()  # [n_agent, n_step, 2]
+        vel = data["agent"]["velocity"].clone()  # [n_agent, n_step, 2]
 
         # ! agent, specifically vehicle's heading can be 180 degree off. We fix it here.
         heading = self._clean_heading(valid, heading)
