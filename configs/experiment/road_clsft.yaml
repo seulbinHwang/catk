@@ -8,6 +8,11 @@ model:
   model_config:
     lr: 5e-5
     lr_min_ratio: 0.05
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    decoder:
+      num_freq_bands: 66
     token_processor:
       map_token_sampling:
         num_k: 1

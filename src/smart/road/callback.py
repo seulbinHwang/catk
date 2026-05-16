@@ -139,3 +139,7 @@ class RoadCacheRefreshCallback(Callback):
         if self.delete_after_use and trainer.global_rank == 0:
             delete_cache_dir(self.current_cache_dir)
         self._sync(trainer, "road_cache_final_deleted")
+        trainer.datamodule.set_train_raw_dir(
+            self.original_train_raw_dir,
+            road_num_rollouts_per_scenario=1,
+        )
