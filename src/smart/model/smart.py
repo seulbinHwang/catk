@@ -11,6 +11,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import gc
 import hashlib
 import math
 from pathlib import Path
@@ -138,7 +139,7 @@ class SMART(LightningModule):
     def _build_closed_loop_seed_table(
         self,
         scenario_ids: Sequence[str],
-        repeat_count: int,
+        rollout_indices: Sequence[int],
         device: torch.device,
     ) -> torch.Tensor:
         seed_rows = [
@@ -149,7 +150,7 @@ class SMART(LightningModule):
                 )
                 for scenario_id in scenario_ids
             ]
-            for rollout_idx in range(repeat_count)
+            for rollout_idx in rollout_indices
         ]
         if len(seed_rows) == 0:
             return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
@@ -314,6 +315,85 @@ class SMART(LightningModule):
         permute_order = (1, 0) + tuple(range(2, pred_tensor.dim()))
         return pred_tensor.permute(*permute_order).contiguous()
 
+    def _run_parallel_rollout_chunk(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        scenario_ids: Sequence[str],
+        rollout_indices: Sequence[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        chunk_size = int(len(rollout_indices))
+        if chunk_size <= 0:
+            raise ValueError("rollout_indices must contain at least one rollout index.")
+
+        num_agent = int(tokenized_agent["batch"].shape[0])
+        num_graphs = int(tokenized_agent["num_graphs"])
+        rollout_map_feature = self._build_parallel_rollout_map_feature(
+            map_feature=map_feature,
+            repeat_count=chunk_size,
+            num_graphs=num_graphs,
+        )
+        rollout_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
+            tokenized_agent=tokenized_agent,
+            repeat_count=chunk_size,
+            num_graphs=num_graphs,
+        )
+        scenario_seed_table = self._build_closed_loop_seed_table(
+            scenario_ids=scenario_ids,
+            rollout_indices=rollout_indices,
+            device=tokenized_agent["batch"].device,
+        )
+        pred = self.encoder.agent_encoder.inference(
+            rollout_tokenized_agent,
+            rollout_map_feature,
+            self.validation_rollout_sampling,
+            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+        )
+        return (
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_traj_10hz"],
+                repeat_count=chunk_size,
+                num_agent=num_agent,
+            ),
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_z_10hz"],
+                repeat_count=chunk_size,
+                num_agent=num_agent,
+            ),
+            self._reshape_parallel_rollout_prediction(
+                pred["pred_head_10hz"],
+                repeat_count=chunk_size,
+                num_agent=num_agent,
+            ),
+        )
+
+    def _build_rollout_chunk_size_candidates(self) -> list[int]:
+        chunk_sizes: list[int] = []
+        current = max(1, int(self.n_rollout_closed_val))
+        while True:
+            if current not in chunk_sizes:
+                chunk_sizes.append(current)
+            if current == 1:
+                break
+            current = max(1, math.ceil(current / 2))
+        return chunk_sizes
+
+    @staticmethod
+    def _is_cuda_out_of_memory(error: RuntimeError) -> bool:
+        error_message = str(error).lower()
+        oom_patterns = (
+            "out of memory",
+            "cuda error: out of memory",
+            "cublas_status_alloc_failed",
+        )
+        return any(pattern in error_message for pattern in oom_patterns)
+
+    @staticmethod
+    def _cleanup_after_rollout_oom() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _run_closed_loop_rollouts(
         self,
         tokenized_map: Dict[str, torch.Tensor],
@@ -326,7 +406,6 @@ class SMART(LightningModule):
                 f"n_rollout_closed_val must be positive, got {self.n_rollout_closed_val}."
             )
 
-        num_agent = int(tokenized_agent["batch"].shape[0])
         num_graphs = int(tokenized_agent["num_graphs"])
         if len(scenario_ids) != num_graphs:
             raise ValueError(
@@ -334,44 +413,45 @@ class SMART(LightningModule):
                 f"got {len(scenario_ids)} and {num_graphs}."
             )
         map_feature = self.encoder.map_encoder(tokenized_map)
-        rollout_map_feature = self._build_parallel_rollout_map_feature(
-            map_feature=map_feature,
-            repeat_count=repeat_count,
-            num_graphs=num_graphs,
-        )
-        rollout_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
-            tokenized_agent=tokenized_agent,
-            repeat_count=repeat_count,
-            num_graphs=num_graphs,
-        )
-        scenario_seed_table = self._build_closed_loop_seed_table(
-            scenario_ids=scenario_ids,
-            repeat_count=repeat_count,
-            device=tokenized_agent["batch"].device,
-        )
-        pred = self.encoder.agent_encoder.inference(
-            rollout_tokenized_agent,
-            rollout_map_feature,
-            self.validation_rollout_sampling,
-            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
-        )
-        return (
-            self._reshape_parallel_rollout_prediction(
-                pred["pred_traj_10hz"],
-                repeat_count=repeat_count,
-                num_agent=num_agent,
-            ),
-            self._reshape_parallel_rollout_prediction(
-                pred["pred_z_10hz"],
-                repeat_count=repeat_count,
-                num_agent=num_agent,
-            ),
-            self._reshape_parallel_rollout_prediction(
-                pred["pred_head_10hz"],
-                repeat_count=repeat_count,
-                num_agent=num_agent,
-            ),
-        )
+        rollout_indices = list(range(repeat_count))
+        last_oom_error: RuntimeError | None = None
+
+        for chunk_size in self._build_rollout_chunk_size_candidates():
+            pred_traj_chunks: list[torch.Tensor] = []
+            pred_z_chunks: list[torch.Tensor] = []
+            pred_head_chunks: list[torch.Tensor] = []
+            try:
+                for chunk_start in range(0, repeat_count, chunk_size):
+                    chunk_rollout_indices = rollout_indices[
+                        chunk_start : chunk_start + chunk_size
+                    ]
+                    chunk_pred_traj, chunk_pred_z, chunk_pred_head = (
+                        self._run_parallel_rollout_chunk(
+                            tokenized_agent=tokenized_agent,
+                            map_feature=map_feature,
+                            scenario_ids=scenario_ids,
+                            rollout_indices=chunk_rollout_indices,
+                        )
+                    )
+                    pred_traj_chunks.append(chunk_pred_traj)
+                    pred_z_chunks.append(chunk_pred_z)
+                    pred_head_chunks.append(chunk_pred_head)
+                return (
+                    torch.cat(pred_traj_chunks, dim=1),
+                    torch.cat(pred_z_chunks, dim=1),
+                    torch.cat(pred_head_chunks, dim=1),
+                )
+            except RuntimeError as error:
+                if (not self._is_cuda_out_of_memory(error)) or chunk_size == 1:
+                    raise
+                last_oom_error = error
+                del pred_traj_chunks, pred_z_chunks, pred_head_chunks
+                self._cleanup_after_rollout_oom()
+                continue
+
+        if last_oom_error is not None:
+            raise last_oom_error
+        raise RuntimeError("closed-loop rollout failed before producing predictions.")
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)

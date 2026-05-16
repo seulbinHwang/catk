@@ -256,11 +256,25 @@ metrics, WOSAC submission, and visualization code see them. This keeps the publi
 validation/test result interface unchanged while avoiding repeated inference
 calls for each rollout.
 
+CUDA 메모리가 부족해서 전체 rollout 묶음을 한 번에 실행하지 못하면, validation/test
+코드는 rollout chunk 크기를 자동으로 줄여 다시 시도한다. 예를 들어
+`n_rollout_closed_val=16`이면 먼저 16개를 한 번에 실행하고, CUDA OOM이 발생한
+경우에만 `8 -> 4 -> 2 -> 1` 순서로 더 작은 묶음을 시도한다. 각 rollout seed는
+`scenario_id`와 rollout index로 고정되므로 chunk 크기가 바뀌어도 같은 rollout
+index는 같은 sampling seed를 사용한다. 이 기능은 속도 향상보다는 validation이
+메모리 부족으로 중단되지 않게 하는 안정성 장치이다.
+
 Stochastic SMART validation/test sampling uses rollout/scenario-specific seeds,
 derived from `validation_closed_seed`, `scenario_id`, and rollout index. Each
 expanded scenario owns a persistent `torch.Generator` during the closed-loop
 token rollout, so `topk_prob` sampling does not depend on whether rollouts are
 executed one by one or as a larger rollout batch.
+
+DDP validation/test에서는 각 rank가 validation/test sample을 복제 없이 정확히 한
+번씩 나눠 처리한다. 일반 distributed sampler처럼 dataset 길이를 world size에 맞추기
+위해 뒤쪽 sample을 padding 복제하지 않으므로, 멀티 GPU 평가에서 같은 scenario가
+중복 채점되는 일을 막고 불필요한 validation work를 줄인다. 학습 dataloader의
+shuffle/sampling 정책은 이 변경의 영향을 받지 않는다.
 
 ### Motion missingness features for SMART baselines
 
