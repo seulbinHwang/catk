@@ -38,11 +38,6 @@ road:
   num_workers: ${data.num_workers}
   pin_memory: ${data.pin_memory}
   delete_after_use: true
-  # ego로부터 이 거리(미터)를 넘어가는 RoaD rollout step은 invalid로 마킹한다.
-  # WaymoTargetBuilderTrain의 150m clip과 같은 안전장치를 cache 단계에도 두어,
-  # train_use_eval_agent_selection=true처럼 학습 transform이 거리 clip을 안 거는
-  # 설정에서도 폭주한 RoaD rollout이 학습에 흘러 들어가지 않게 한다. 0 이하이면 끈다.
-  max_distance_from_ego: 150.0
   rollout_sampling:
     criterium: road_samplek_dist
     num_k: 64

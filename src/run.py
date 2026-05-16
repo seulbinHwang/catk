@@ -61,7 +61,6 @@ def build_road_cache_callback(cfg: DictConfig) -> RoadCacheRefreshCallback:
         num_workers=cfg.road.num_workers,
         pin_memory=cfg.road.pin_memory,
         delete_after_use=cfg.road.delete_after_use,
-        max_distance_from_ego=float(cfg.road.get("max_distance_from_ego", 0.0) or 0.0),
     )
 
 

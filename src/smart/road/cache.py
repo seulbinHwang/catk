@@ -153,44 +153,6 @@ def make_future_velocity(position_xy: Tensor, num_historical_steps: int) -> Tens
     return (future_xy - previous_xy) / 0.1
 
 
-def _apply_runaway_rollout_filter(
-    valid_mask: Tensor,
-    position: Tensor,
-    role: Tensor,
-    future_slice: slice,
-    max_distance_from_ego: float,
-) -> Tensor:
-    """ego로부터 너무 멀어진 RoaD rollout step을 invalid로 바꾼다.
-
-    Args:
-        valid_mask: 이미 ``future_valid`` broadcast가 끝난 ``[n_agent, 91]`` 마스크이다.
-        position: RoaD rollout으로 채워진 ``[n_agent, 91, 3]`` 좌표이다.
-        role: ``[n_agent, 3]`` boolean role 마스크이며 ``role[:, 0]``이 ego이다.
-        future_slice: future step 범위이다.
-        max_distance_from_ego: 이 거리(미터)를 초과하는 step은 invalid 처리한다.
-
-    Returns:
-        runaway step이 invalid로 바뀐 valid_mask이다.
-    """
-    if max_distance_from_ego <= 0:
-        return valid_mask
-
-    ego_indices = torch.where(role[:, 0])[0]
-    if ego_indices.numel() != 1:
-        # ego가 정확히 1개가 아니면 다운스트림 transform이 처리하도록 두고 여기서는 건드리지 않는다.
-        return valid_mask
-
-    av_idx = int(ego_indices.item())
-    ego_pos = position[av_idx, future_slice, :2]  # [n_future, 2]
-    agent_pos = position[:, future_slice, :2]  # [n_agent, n_future, 2]
-    distance = torch.norm(agent_pos - ego_pos.unsqueeze(0), dim=-1)  # [n_agent, n_future]
-    within_range = distance < float(max_distance_from_ego)  # [n_agent, n_future]
-    future_valid = valid_mask[:, future_slice] & within_range
-    valid_mask = valid_mask.clone()
-    valid_mask[:, future_slice] = future_valid
-    return valid_mask
-
-
 def update_raw_data_with_road_rollout(
     raw_data: Mapping[str, Any],
     scenario_id: str,
@@ -199,7 +161,6 @@ def update_raw_data_with_road_rollout(
     pred_head_10hz: Tensor,
     future_valid: Tensor,
     num_historical_steps: int,
-    max_distance_from_ego: float = 0.0,
 ) -> Dict[str, Any]:
     """원본 WOMD pickle의 future를 RoaD rollout으로 교체한다.
 
@@ -211,12 +172,14 @@ def update_raw_data_with_road_rollout(
         pred_head_10hz: RoaD가 생성한 future 방향이다. Shape은 ``[n_agent, 80]``이다.
         future_valid: future를 학습에 쓸 agent mask이다. Shape은 ``[n_agent]``이다.
         num_historical_steps: history step 수이다. WOMD 기준 11이다.
-        max_distance_from_ego: ego로부터 이 거리(미터)를 넘어가는 RoaD rollout step을
-            invalid로 마킹한다. 0 이하이면 거리 기반 필터를 끄고 기존처럼
-            ``future_valid``만 broadcast한다.
 
     Returns:
         기존 학습 cache와 같은 schema를 유지하는 RoaD pickle data이다.
+
+    Note:
+        RoaD는 모델 자기 자신의 rollout을 그대로 새 정답으로 학습시키는 방식이다.
+        ego로부터 멀어진 step이나 폭주한 궤적도 별도 후처리 없이 그대로 학습 신호가
+        되도록, 캐시 단계에서는 거리 기반 invalid 처리 같은 추가 방어 로직을 두지 않는다.
     """
     data = clone_to_cpu(raw_data)
     agent = data["agent"]
@@ -242,15 +205,6 @@ def update_raw_data_with_road_rollout(
     heading[:, future_slice] = pred_head_10hz
     velocity[:, future_slice] = make_future_velocity(position[..., :2], num_historical_steps)
     valid_mask[:, future_slice] = future_valid.unsqueeze(1).expand(-1, pred_traj_10hz.shape[1])
-
-    if max_distance_from_ego > 0:
-        valid_mask = _apply_runaway_rollout_filter(
-            valid_mask=valid_mask,
-            position=position,
-            role=agent["role"],
-            future_slice=future_slice,
-            max_distance_from_ego=float(max_distance_from_ego),
-        )
 
     agent["position"] = position
     agent["heading"] = heading
@@ -288,7 +242,6 @@ def generate_road_cache(
     num_historical_steps: int,
     device: Optional[torch.device] = None,
     autocast_dtype: Optional[torch.dtype] = None,
-    max_distance_from_ego: float = 0.0,
 ) -> None:
     """현재 모델로 RoaD rollout cache를 만든다.
 
@@ -306,10 +259,12 @@ def generate_road_cache(
         device: model 실행 장치이다. None이면 자동으로 고른다.
         autocast_dtype: ``bf16-mixed``로 학습할 때 ``torch.bfloat16``을 넘기면
             inference 분포가 학습 step의 분포와 동일해진다. ``None``이면 fp32로 돈다.
-        max_distance_from_ego: ego로부터 이 거리(미터)를 넘어간 rollout step을
-            invalid로 마킹한다. 0 이하이면 거리 기반 필터를 끈다. 학습 transform이
-            중간에 거리 clip을 안 거는 설정(예: ``train_use_eval_agent_selection``)에서도
-            폭주한 RoaD rollout이 학습에 흘러 들어가지 않도록 캐시 단계에서 막는다.
+
+    Note:
+        RoaD는 모델 자기 자신의 rollout을 그대로 새 정답으로 삼아 학습시키는 방식이다.
+        ego와의 거리, 도로 이탈 같은 휴리스틱으로 rollout step을 invalid 처리하지 않고,
+        모델이 생성한 80 step 전체를 학습 신호로 사용한다. precision 정합(autocast)만
+        남기고, 후처리 방어 로직은 일부러 두지 않는다.
     """
     output_path = Path(output_dir)
     if output_path.exists():
@@ -338,14 +293,12 @@ def generate_road_cache(
         log.info(
             f"Generating RoaD cache at {output_path.as_posix()} with "
             f"{num_rollouts_per_scenario} rollouts per scenario "
-            f"under autocast dtype={autocast_dtype}, "
-            f"max_distance_from_ego={max_distance_from_ego}."
+            f"under autocast dtype={autocast_dtype}."
         )
     else:
         log.info(
             f"Generating RoaD cache at {output_path.as_posix()} with "
-            f"{num_rollouts_per_scenario} rollouts per scenario, "
-            f"max_distance_from_ego={max_distance_from_ego}."
+            f"{num_rollouts_per_scenario} rollouts per scenario."
         )
 
     with torch.no_grad(), autocast_ctx:
@@ -376,7 +329,6 @@ def generate_road_cache(
                         pred_head_10hz=pred["pred_head_10hz"][agent_mask],
                         future_valid=current_valid[agent_mask],
                         num_historical_steps=num_historical_steps,
-                        max_distance_from_ego=max_distance_from_ego,
                     )
                     save_pickle_atomic(
                         road_data,
