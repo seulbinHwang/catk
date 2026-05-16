@@ -538,7 +538,8 @@ fi
         fetch_refspec = f"{args.branch}:refs/remotes/origin/{args.branch}"
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
-git fetch origin --prune {shq(fetch_refspec)}
+git update-ref -d {shq(f"refs/remotes/origin/{args.branch}")} || true
+git fetch origin --prune {shq(f"+{fetch_refspec}")}
 git checkout -f {shq(args.git_ref)}
 """
     elif args.pull:
