@@ -291,6 +291,20 @@ DDP validation/test에서는 각 rank가 validation/test sample을 복제 없이
 중복 채점되는 일을 막고 불필요한 validation work를 줄인다. 학습 dataloader의
 shuffle/sampling 정책은 이 변경의 영향을 받지 않는다.
 
+학습 중 checkpoint 확인만 빠르게 하고 싶으면 아래 옵션을 명시적으로 켤 수 있다.
+
+```bash
+model.model_config.fit_time_fast_validation_only=true \
+model.model_config.val_open_loop=false
+```
+
+이 모드는 `fit` 실행 중 validation batch 수를 Fast WOSAC scorer에 필요한
+`n_batch_sim_agents_metric` 값으로 제한한다. 즉, full validation과 같은 결과가
+아니라 빠른 checkpoint 선택용 근사 validation이다. 그래서 open-loop validation과
+submission 저장 모드에서는 자동으로 켜지지 않는다. 논문용 최종 RMM 비교, 전체
+validation, WOSAC submission 생성은 이 옵션 없이 `validate` 또는 `test`로 다시
+실행해야 한다.
+
 ### Motion missingness features for SMART baselines
 
 The SMART next-token baseline now exposes motion missingness to the agent

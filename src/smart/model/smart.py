@@ -89,6 +89,11 @@ class SMART(LightningModule):
         )
         self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
         self._scorer_scene_num_last_key: tuple[int, int, int] | None = None
+        self.fit_time_fast_validation_only = bool(
+            getattr(model_config, "fit_time_fast_validation_only", False)
+        )
+        self._fit_time_original_limit_val_batches: int | float | None = None
+        self._fit_time_fast_validation_enabled = False
         self.closed_loop_metric_name = "val_closed/sim_agents_2025/realism_meta_metric"
         self.val_closed_minade_name = (
             "val_closed/sim_agents_2025/minADE_best_of_n_rollout_closed_val"
@@ -170,6 +175,15 @@ class SMART(LightningModule):
             return None
         return int(val_batch_size)
 
+    def _should_enable_fit_time_fast_validation(self) -> bool:
+        return (
+            self.fit_time_fast_validation_only
+            and self.val_closed_loop
+            and not self.val_open_loop
+            and not self.sim_agents_submission.is_active
+            and int(self.n_batch_sim_agents_metric) > 0
+        )
+
     def _apply_scorer_scene_num_overrides(self) -> None:
         if self.sim_agents_submission.is_active:
             return
@@ -215,8 +229,50 @@ class SMART(LightningModule):
                 flush=True,
             )
 
+    def _apply_fit_time_validation_batch_limit(self) -> None:
+        if not self._should_enable_fit_time_fast_validation():
+            self._fit_time_fast_validation_enabled = False
+            return
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+
+        if self._fit_time_original_limit_val_batches is None:
+            self._fit_time_original_limit_val_batches = trainer.limit_val_batches
+
+        target_batches = int(self.n_batch_sim_agents_metric)
+        trainer.limit_val_batches = target_batches
+        self._fit_time_fast_validation_enabled = True
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[fit_time_fast_validation_only] Fit-time validation is limited to "
+                f"{target_batches} batch(es) per rank for fast checkpoint scoring. "
+                "Run validate/test without this option for full validation.",
+                flush=True,
+            )
+
+    def _restore_fit_time_validation_batch_limit(self) -> None:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            self._fit_time_fast_validation_enabled = False
+            return
+
+        if self._fit_time_original_limit_val_batches is not None:
+            trainer.limit_val_batches = self._fit_time_original_limit_val_batches
+
+        self._fit_time_original_limit_val_batches = None
+        self._fit_time_fast_validation_enabled = False
+
+    def _should_compute_closed_loop_minade(self) -> bool:
+        return not self._fit_time_fast_validation_enabled
+
     def on_fit_start(self) -> None:
         self._apply_scorer_scene_num_overrides()
+        self._apply_fit_time_validation_batch_limit()
+
+    def on_fit_end(self) -> None:
+        self._restore_fit_time_validation_batch_limit()
 
     def on_validation_start(self) -> None:
         self._apply_scorer_scene_num_overrides()
@@ -538,15 +594,16 @@ class SMART(LightningModule):
                 scenario_rollouts = self.sim_agents_submission.aggregate_current_batch()
 
             else:  # ! compute metrics, disable if saving Sim Agents submission
-                self.minADE.update(
-                    pred=pred_traj,
-                    target=data["agent"]["position"][
-                        :, self.num_historical_steps :, : pred_traj.shape[-1]
-                    ],
-                    target_valid=data["agent"]["valid_mask"][
-                        :, self.num_historical_steps :
-                    ],
-                )
+                if self._should_compute_closed_loop_minade():
+                    self.minADE.update(
+                        pred=pred_traj,
+                        target=data["agent"]["position"][
+                            :, self.num_historical_steps :, : pred_traj.shape[-1]
+                        ],
+                        target_valid=data["agent"]["valid_mask"][
+                            :, self.num_historical_steps :
+                        ],
+                    )
 
                 if batch_idx < self.n_batch_sim_agents_metric:
                     self.sim_agents_metrics.update_from_prediction_tensors(
@@ -606,24 +663,31 @@ class SMART(LightningModule):
                             reduced_metric_state
                         )
                     )
-                    reduced_minade_state = torch.stack(
-                        [
-                            self.minADE.sum.detach().to(device=self.device),
-                            self.minADE.count.detach().to(device=self.device),
-                        ]
-                    )
-                    torch.distributed.all_reduce(reduced_minade_state)
-                    minade_value = reduced_minade_state[0] / reduced_minade_state[
-                        1
-                    ].clamp_min(1e-6)
+                    minade_value = None
+                    if self._should_compute_closed_loop_minade():
+                        reduced_minade_state = torch.stack(
+                            [
+                                self.minADE.sum.detach().to(device=self.device),
+                                self.minADE.count.detach().to(device=self.device),
+                            ]
+                        )
+                        torch.distributed.all_reduce(reduced_minade_state)
+                        minade_value = reduced_minade_state[0] / reduced_minade_state[
+                            1
+                        ].clamp_min(1e-6)
                 else:
                     epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
-                    minade_value = self.minADE.sum / self.minADE.count.clamp_min(1e-6)
+                    minade_value = None
+                    if self._should_compute_closed_loop_minade():
+                        minade_value = (
+                            self.minADE.sum / self.minADE.count.clamp_min(1e-6)
+                        )
 
                 closed_loop_metric = epoch_sim_agents_metrics[
                     self.closed_loop_metric_name
                 ]
-                epoch_sim_agents_metrics[self.val_closed_minade_name] = minade_value
+                if minade_value is not None:
+                    epoch_sim_agents_metrics[self.val_closed_minade_name] = minade_value
                 epoch_sim_agents_metrics.update(epoch_distribution_metrics)
                 self.log(
                     self.closed_loop_metric_name,
