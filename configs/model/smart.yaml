@@ -4,7 +4,7 @@ model_config:
   lr_warmup_steps: 0
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.05
-  n_rollout_closed_val: 32
+  n_rollout_closed_val: 16
   # Optional: set this to the SMART pretrain CPD value only when you want DPR.
   # CPD/CES are evaluated regardless of this value.
   wosac_cpd_reference: null
