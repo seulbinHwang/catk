@@ -1,0 +1,41 @@
+# @package _global_
+
+# V100x47 counterpart of
+# `pre_bc_flow_control_a100x4x2_prefix_default_noslip`.
+#
+# This preset keeps the same objective-side settings as the A100x4x2 W&B run:
+#   flow_control_space_pretrain_a100x4x2_prefix_default_noslip_roundtrip05_lr6e-4_bs26
+#
+# Intended differences:
+#   * f278261 tail-prefix data expansion is active through
+#     use_prefix_valid_future_loss_mask=true on the current branch.
+#   * Hardware is the static 47-GPU V100 fleet:
+#       sv/svv/svvv/svvvv: 4 pods x 4 V100
+#       testsv/testsvv/testsvvv/testsvvvv: 4 pods x 4 V100
+#       fv/fvv/fvvv/fvvvv/fvvvvv: 5 pods x 3 V100
+#   * Per-rank train batch stays at the V100-safe value 4, so effective global
+#     batch is 188 instead of the A100x4x2 run's 208.
+
+defaults:
+  - pre_bc_flow_control_v100x47
+  - _self_
+
+model:
+  model_config:
+    lr: 6e-4
+    decoder:
+      flow_window_steps: 20
+    token_processor:
+      use_kinematic_control_flow: true
+      use_holonomic_model_only: false
+      use_rolling_supervision: true
+      use_prefix_valid_future_loss_mask: true
+      control_vehicle_no_slip_point_ratio: 0.2289518863
+      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_round_trip_max_position_error_m: 0.5
+
+data:
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 4
+  train_use_eval_agent_selection: true

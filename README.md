@@ -659,6 +659,66 @@ python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_
 python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_pods.py --stop
 ```
 
+#### V100 47GPU prefix-valid default no-slip ratio pretrain
+
+W&B의 `flow_control_space_pretrain_a100x4x2_prefix_default_noslip_roundtrip05_lr6e-4_bs26`와 objective 설정을 맞추고, hardware만 `sv~svvvv + testsv~testsvvvv + fv~fvvvvv` V100 47GPU fleet로 바꾸려면 아래 전용 launcher를 씁니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py --replace
+```
+
+이 launcher는 아래 preset을 사용합니다.
+
+```text
+configs/experiment/pre_bc_flow_control_v100x47_prefix_default_noslip.yaml
+scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
+```
+
+비교 의도:
+
+- A100 run과 같은 control-space / non-holonomic / default no-slip ratio / round-trip filter 설정을 유지합니다.
+- `f278261 Add tail-prefix flow pretraining anchors` 이후의 `18-token / 16-anchor` Tail-Prefix supervision을 사용합니다.
+- hardware만 A100x4 pod 2개에서 V100 47GPU static fleet로 바꿉니다.
+
+기본 설정:
+
+- pod 순서: `sv svv svvv svvvv testsv testsvv testsvvv testsvvvv fv fvv fvv fvvvv fvvvvv`
+- V100x4 pod는 4 rank, V100x3 pod는 3 rank를 띄워 총 47 rank를 사용합니다.
+- `model.model_config.lr=6e-4`
+- `model.model_config.decoder.flow_window_steps=20`
+- `model.model_config.token_processor.use_kinematic_control_flow=true`
+- `model.model_config.token_processor.use_holonomic_model_only=false`
+- `model.model_config.token_processor.use_rolling_supervision=true`
+- `model.model_config.token_processor.use_prefix_valid_future_loss_mask=true`
+- `model.model_config.token_processor.control_vehicle_no_slip_point_ratio=0.2289518863`
+- `model.model_config.token_processor.control_cyclist_no_slip_point_ratio=0.0495847873`
+- `model.model_config.token_processor.control_round_trip_max_position_error_m=0.5`
+- `trainer.precision=16-mixed`
+- `data.train_batch_size=4`, effective global batch `4 * 47 = 188`
+
+`data.train_batch_size=4`는 기존 V100x47 안정 설정을 따른 값입니다. A100x4x2 run의 effective global batch는 `26 * 8 = 208`이므로 완전히 같지는 않지만, V100 32GB fleet에서 memory-safe한 기본값을 쓰고 lr은 A100 run과 같은 `6e-4`로 고정합니다.
+
+기본 실험 이름은 `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4`이고, tmux session 이름은 `catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix`입니다.
+
+실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py --dry-run
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc sv -c main -- tmux attach -t catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix
+kubectl exec -it -n p-pnc fv -c main -- tmux attach -t catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py --stop
+```
+
 #### V100 47GPU static pod control-space pretrain
 
 `testsv`, `testsvv`, `testsvvv`, `testsvvvv`, `sv`, `svv`, `svvv`, `svvvv`의 V100x4 pod 8개와 `fv`, `fvv`, `fvvv`, `fvvvv`, `fvvvvv`의 V100x3 pod 5개를 묶어 control-space pretrain을 돌릴 때는 아래 preset과 launcher를 씁니다.
