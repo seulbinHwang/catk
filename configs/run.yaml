@@ -25,6 +25,14 @@ task_name: "debug_open_source"
 ckpt_path: null
 train_log_dir: null
 
+resume:
+  # If true and ckpt_path is empty, action=fit resumes from the newest
+  # logs/<task_name>/runs/*/checkpoints/<checkpoint_name>.
+  auto: false
+  task_name: null
+  checkpoint_name: epoch_last.ckpt
+  require_checkpoint: true
+
 # seed for random number generators in pytorch, numpy and python.random
 seed: 817
 

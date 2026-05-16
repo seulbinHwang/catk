@@ -20,7 +20,7 @@ import wandb
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from lightning.pytorch.loggers.wandb import WandbLogger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from src.smart.road import RoadCacheRefreshCallback
 from src.utils import (
@@ -35,6 +35,7 @@ from src.utils.waymo_submission import (
     maybe_prepare_waymo_storage_state,
     maybe_submit_waymo_submission,
 )
+from src.utils.resume_checkpoint import resolve_fit_resume_ckpt_path
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -89,6 +90,13 @@ def run(cfg: DictConfig) -> None:
         cfg.trainer, callbacks=callbacks, logger=logger
     )
 
+    fit_ckpt_path = None
+    if cfg.action == "fit":
+        fit_ckpt_path = resolve_fit_resume_ckpt_path(cfg)
+        if fit_ckpt_path:
+            with open_dict(cfg):
+                cfg.ckpt_path = fit_ckpt_path
+
     log.info("Logging hyperparameters!")
     log_hyperparameters(
         {
@@ -104,7 +112,7 @@ def run(cfg: DictConfig) -> None:
     log.info(f"Resuming from ckpt: cfg.ckpt_path={cfg.ckpt_path}")
     if cfg.action == "fit":
         log.info("Starting training!")
-        trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+        trainer.fit(model=model, datamodule=datamodule, ckpt_path=fit_ckpt_path)
     elif cfg.action == "finetune":
         log.info("Starting finetuning!")
         model.load_state_dict(

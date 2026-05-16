@@ -191,6 +191,67 @@ python scripts/launch_smart_ntp_h100x4x2_hsb.py \
   --task-name smart_ntp_pretrain_h100x4x2_fair
 ```
 
+### SMART pretrain 중단 후 resume
+
+SMART pretrain은 두 종류의 checkpoint를 저장한다. Lightning `ModelCheckpoint`는
+validation metric 기준 best checkpoint와 `last.ckpt`를 저장하고, 별도
+`EpochLastCheckpointCallback`은 매 epoch의 학습 상태를
+`checkpoints/epoch_last.ckpt` 하나로 계속 갱신한다. `epoch_last.ckpt`는 모델
+weight뿐 아니라 optimizer, scheduler, epoch, global step, callback state를 포함하므로
+중단된 pretrain을 이어갈 때 사용하는 기본 checkpoint이다.
+
+가장 명시적인 resume 방법은 중단된 run의 `epoch_last.ckpt`를 직접 넘기는 것이다.
+
+```bash
+python -m src.run \
+  experiment=pre_bc \
+  action=fit \
+  task_name=smart_ntp_pretrain_fair \
+  ckpt_path=/path/to/logs/smart_ntp_pretrain_fair/runs/2026-05-16_12-00-00/checkpoints/epoch_last.ckpt
+```
+
+`ckpt_path`를 직접 지정하면 이 값이 항상 우선한다. H100x4x2 launcher에서도 같은
+방식으로 넘길 수 있다.
+
+```bash
+python scripts/launch_smart_ntp_h100x4x2_hsb.py \
+  --replace \
+  --task-name smart_ntp_pretrain_h100x4x2_fair \
+  --ckpt-path /mnt/nuplan/projects/catk/logs/smart_ntp_pretrain_h100x4x2_fair/runs/2026-05-16_12-00-00/checkpoints/epoch_last.ckpt
+```
+
+같은 task name 아래에서 가장 최신 `epoch_last.ckpt`를 자동으로 찾아 이어가려면
+`resume.auto=true`를 켠다. 이때 코드는
+`logs/<task_name>/runs/*/checkpoints/epoch_last.ckpt` 중 수정 시간이 가장 최신인
+파일을 찾아 `trainer.fit(..., ckpt_path=...)`에 넘긴다.
+
+```bash
+python -m src.run \
+  experiment=pre_bc \
+  action=fit \
+  task_name=smart_ntp_pretrain_fair \
+  resume.auto=true
+```
+
+H100x4x2 launcher에서는 아래처럼 쓴다.
+
+```bash
+python scripts/launch_smart_ntp_h100x4x2_hsb.py \
+  --replace \
+  --task-name smart_ntp_pretrain_h100x4x2_fair \
+  --auto-resume
+```
+
+다른 task 이름의 checkpoint를 찾아 이어가려면 `resume.task_name=<old_task_name>` 또는
+launcher의 `--resume-task-name <old_task_name>`을 사용한다. 자동 resume은 기본적으로
+checkpoint가 없으면 에러를 내고 새 학습을 시작하지 않는다. checkpoint가 없을 때 새로
+시작하는 동작을 원하면 `resume.require_checkpoint=false` 또는
+`--allow-missing-resume-checkpoint`를 명시한다.
+
+중요한 제약은 resume 시 모델/config가 checkpoint와 호환되어야 한다는 점이다. 예를 들어
+SMART 공정 비교 pretrain은 `num_freq_bands: 66`을 쓰므로, resume도 같은
+`experiment=pre_bc` 또는 `pre_bc_h100x4x2` 계열 설정으로 실행해야 한다.
+
 학습 batch, learning rate, epoch 수 같은 실험 파라미터를 바꿔야 할 때는 launcher option을
 명시한다. 단, 논문용 공정 비교에서는 어떤 값을 바꿨는지 KFM 쪽 recipe와 함께 기록해야 한다.
 

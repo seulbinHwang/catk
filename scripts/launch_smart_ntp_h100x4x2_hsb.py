@@ -111,6 +111,12 @@ def render_env_file(
     ]
     optional_env = {
         "CATK_CKPT_PATH": args.ckpt_path,
+        "CATK_AUTO_RESUME": "true" if args.auto_resume else "",
+        "CATK_RESUME_TASK_NAME": args.resume_task_name,
+        "CATK_RESUME_CHECKPOINT_NAME": args.resume_checkpoint_name,
+        "CATK_RESUME_REQUIRE_CHECKPOINT": "false"
+        if args.allow_missing_resume_checkpoint
+        else "",
         "TRAIN_BATCH_SIZE": args.train_batch_size,
         "VAL_BATCH_SIZE": args.val_batch_size,
         "TEST_BATCH_SIZE": args.test_batch_size,
@@ -347,6 +353,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--action", choices=["fit", "validate", "test"], default="fit")
     parser.add_argument("--ckpt-path", default="")
+    parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help="For action=fit, resume from the newest task-local epoch_last.ckpt.",
+    )
+    parser.add_argument(
+        "--resume-task-name",
+        default="",
+        help="Task name to search when --auto-resume is set. Defaults to --task-name.",
+    )
+    parser.add_argument("--resume-checkpoint-name", default="epoch_last.ckpt")
+    parser.add_argument(
+        "--allow-missing-resume-checkpoint",
+        action="store_true",
+        help="With --auto-resume, start from scratch if no checkpoint is found.",
+    )
     parser.add_argument("--experiment", default="pre_bc_h100x4x2")
     parser.add_argument("--task-name", default="")
     parser.add_argument("--session", default="catk-smart-ntp-h100x4x2")

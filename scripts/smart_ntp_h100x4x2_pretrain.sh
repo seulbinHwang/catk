@@ -110,6 +110,10 @@ main() {
   local action="${CATK_ACTION:-fit}"
   local task_name="${TASK_NAME:-smart_ntp_pretrain_h100x4x2}"
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
+  local auto_resume="${CATK_AUTO_RESUME:-false}"
+  local resume_task_name="${CATK_RESUME_TASK_NAME:-}"
+  local resume_checkpoint_name="${CATK_RESUME_CHECKPOINT_NAME:-epoch_last.ckpt}"
+  local resume_require_checkpoint="${CATK_RESUME_REQUIRE_CHECKPOINT:-true}"
 
   if [[ "$action" != "fit" && "$action" != "validate" && "$action" != "test" ]]; then
     log "ERROR: CATK_ACTION must be fit, validate, or test; got: $action"
@@ -156,6 +160,10 @@ main() {
   log "  cache_root:       $cache_root"
   if [[ -n "$ckpt_path" ]]; then
     log "  ckpt_path:        $ckpt_path"
+  elif [[ "$auto_resume" == "true" || "$auto_resume" == "1" ]]; then
+    log "  resume.auto:      true"
+    log "  resume task:      ${resume_task_name:-$task_name}"
+    log "  resume checkpoint: $resume_checkpoint_name"
   fi
 
   local app_args=(
@@ -172,6 +180,15 @@ main() {
 
   if [[ -n "$ckpt_path" ]]; then
     app_args+=(ckpt_path="$ckpt_path")
+  elif [[ "$auto_resume" == "true" || "$auto_resume" == "1" ]]; then
+    app_args+=(
+      resume.auto=true
+      resume.checkpoint_name="$resume_checkpoint_name"
+      resume.require_checkpoint="$resume_require_checkpoint"
+    )
+    if [[ -n "$resume_task_name" ]]; then
+      app_args+=(resume.task_name="$resume_task_name")
+    fi
   fi
   if [[ -n "${LOG_DIR:-}" ]]; then
     app_args+=(paths.log_dir="$LOG_DIR")
