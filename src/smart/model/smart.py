@@ -21,6 +21,7 @@ import hydra
 import torch
 from lightning import LightningModule
 from torch.optim.lr_scheduler import LambdaLR
+from waymo_open_dataset.utils.sim_agents import submission_specs
 
 from src.smart.metrics import (
     CrossEntropy,
@@ -40,6 +41,27 @@ from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_
 
 
 class SMART(LightningModule):
+    @staticmethod
+    def _required_sim_agents_rollout_count() -> int:
+        submission_config = submission_specs.get_submission_config(
+            submission_specs.ChallengeType.SIM_AGENTS
+        )
+        return int(submission_config.n_rollouts)
+
+    @staticmethod
+    def _check_sim_agents_submission_rollout_count(
+        is_active: bool,
+        n_rollout_closed_val: int,
+    ) -> None:
+        if not is_active:
+            return
+        expected_rollouts = SMART._required_sim_agents_rollout_count()
+        if int(n_rollout_closed_val) != expected_rollouts:
+            raise ValueError(
+                "Sim Agents 2025 submission export requires "
+                f"n_rollout_closed_val={expected_rollouts}, "
+                f"got {n_rollout_closed_val}."
+            )
 
     def __init__(self, model_config) -> None:
         super(SMART, self).__init__()
@@ -77,6 +99,10 @@ class SMART(LightningModule):
         self.training_loss = CrossEntropy(**model_config.training_loss)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
+        self._check_sim_agents_submission_rollout_count(
+            is_active=bool(self.sim_agents_submission.is_active),
+            n_rollout_closed_val=int(self.n_rollout_closed_val),
+        )
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout

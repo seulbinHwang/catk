@@ -121,6 +121,11 @@ side-effect를 만들지 않는다.
 `num_freq_bands=64`일 때는 7,168,384개이므로, 이 공정 비교 설정의 증가분은
 10,280개이다.
 
+`local_val`과 `wosac_sub`도 같은 pretrain checkpoint를 그대로 읽어야 하므로
+`model.model_config.decoder.num_freq_bands: 66`을 명시한다. 이 값을 빠뜨리면
+`pre_bc`에서 저장한 checkpoint의 Fourier embedding weight shape이 기본 SMART 값인
+`64`와 맞지 않아 checkpoint load 단계에서 실패한다.
+
 ### 2025 Sim Agents 제출 실행 시 빠른 지표 비활성화
 
 `configs/experiment/wosac_sub.yaml`은 제출 파일 생성 전용 설정이다. 이 모드에서는
@@ -154,6 +159,18 @@ shard를 만들지 않는다. 이 경우 test loop는 distribution metric만 계
 `experiment=wosac_sub`처럼 `model.model_config.sim_agents_submission.is_active=true`인
 설정을 사용해야 한다. 이 guard는 실수로 기본 test 설정을 실행했을 때 inactive
 exporter가 `update()`/`save_sub_file()`에서 깨지는 일을 막기 위한 안전장치이다.
+
+Waymo Sim Agents 제출 형식은 scenario마다 32개 parallel simulation을 요구한다.
+따라서 `configs/experiment/wosac_sub.yaml`은
+`model.model_config.n_rollout_closed_val: 32`를 명시한다. 제출 exporter가 켜진 상태에서
+이 값이 Waymo 제출 규격과 다르면 모델 초기화 단계에서 바로 중단해, 16 rollout 같은
+잘못된 submission archive가 만들어지지 않도록 한다.
+
+로컬 실행 스크립트는 `scripts/setup_runtime_env.sh`를 통해 conda 환경과 cache root를
+찾는다. 기본으로 현재 머신의 `/media/user/E/dataset/womd_v1_3/SMART_cache`가 있으면
+그 경로를 사용하고, 없으면 `/scratch/cache/SMART`를 사용한다. 다른 경로를 쓰려면
+`CACHE_ROOT=/path/to/SMART_cache`를 지정하면 된다. `local_val.sh`와 `wosac_sub.sh`는
+평가할 checkpoint가 필요하므로 `CKPT_PATH=/path/to/model.ckpt`를 함께 지정해야 한다.
 
 ### SSH 서버에서 Waymo 사이트로 자동 업로드
 

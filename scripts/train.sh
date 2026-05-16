@@ -1,4 +1,5 @@
-#!/bin/sh
+#!/usr/bin/env bash
+set -euo pipefail
 export LOGLEVEL=INFO
 export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
@@ -7,11 +8,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 MY_EXPERIMENT="pre_bc"
 MY_TASK_NAME=$MY_EXPERIMENT"-debug"
 
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate catk
+source "$(dirname "$0")/setup_runtime_env.sh"
 torchrun \
   -m src.run \
   experiment=$MY_EXPERIMENT \
+  paths.cache_root="$CACHE_ROOT" \
   task_name=$MY_TASK_NAME
 
 # ! below is for training with ddp

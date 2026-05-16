@@ -6,6 +6,7 @@ defaults:
 
 model:
   model_config:
+    n_rollout_closed_val: 32
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
@@ -14,6 +15,8 @@ model:
     scorer_scene_num: 0
     val_open_loop: false
     val_closed_loop: true
+    decoder:
+      num_freq_bands: 66
     validation_rollout_sampling:
       criterium: topk_prob
       num_k: 48 # for k most likely
