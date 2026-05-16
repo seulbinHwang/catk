@@ -33,7 +33,7 @@ model:
     val_open_loop: true
     val_closed_loop: true
     token_processor:
-      use_prefix_valid_future_loss_mask: false
+      use_prefix_valid_future_loss_mask: true
     finetune:
       enabled: false
       train_full_flow_decoder_only: false

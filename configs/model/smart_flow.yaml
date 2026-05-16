@@ -30,9 +30,9 @@ model_config:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
     flow_window_steps: ${model.model_config.decoder.flow_window_steps}
-    # false: 기존 방식. flow_window_steps 전체 미래가 유효한 anchor만 학습합니다.
-    # true: 가장 가까운 미래부터 연속으로 유효한 prefix만 loss를 주고 학습합니다.
-    use_prefix_valid_future_loss_mask: false
+    # false: full-window 미래가 모두 유효한 anchor만 학습합니다.
+    # true: 18-token / 16-anchor pretrain에서 tail anchor의 유효 prefix만 loss를 줍니다.
+    use_prefix_valid_future_loss_mask: true
     # false이면 기존 pose-space Flow Matching을 그대로 사용합니다.
     # true이면 GT pose에서 control label을 on-the-fly로 만들고,
     # Flow Matching은 [delta_s, delta_n, delta_yaw] 제어공간에서 학습합니다.

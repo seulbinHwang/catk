@@ -5,7 +5,8 @@
 현재 closed-loop local 평가는 **TrajTok Fast WOSAC 2025 metric**을 사용하고, 제출 export는 **Waymo 2025 Sim Agents** 형식을 사용합니다.
 
 - 기존 SMART의 map/context trunk를 그대로 재사용하고, agent 쪽만 flow decoder로 바꿔 scene-context 품질을 유지합니다.
-- `FlowTokenProcessor`는 14-slot context pack과 13개 anchor를 만들되,
+- `FlowTokenProcessor`는 18-token context pack과 16개 NTP-aligned anchor를 만들고,
+  tail anchor는 존재하는 future prefix에만 Flow loss를 줍니다.
 - **context 위치/방향과 flow target 원점은 token-restored 상태가 아니라 실제 coarse 상태**를 사용합니다.
 - agent coarse token id는 **마지막 점 1개가 아니라 0.5초 전체 6개 점 사각형 경로**를 기준으로 매칭합니다.
 - `trajectory_token_veh/ped/cyc` 임베딩은 마지막 contour 1개 대신
@@ -379,18 +380,28 @@ torchrun ... -m src.run \
 ... data.train_use_eval_agent_selection=true
 ```
 
-### 5.1.2 미래 GT 유효 길이 기반 학습 target 선택
+### 5.1.2 NTP-Aligned Tail-Prefix Flow Supervision
 
-학습 target 선택은 아래 단일 옵션으로 고릅니다.
+Flow pretrain의 기본 target coverage는 SMART NTP와 맞춘 `18-token / 16-anchor` 구조입니다.
+
+- encoder 입력 coarse context는 raw step `5, 10, ..., 90`에 해당하는 18개 slot을 사용합니다.
+- Flow 학습 anchor는 raw step `10, 15, ..., 85`의 16개 현재 상태입니다.
+- temporal attention은 과거에서 현재 방향으로만 연결되므로, 각 anchor hidden은 자기 시점까지의 context만 봅니다. 마지막 raw step `90` context는 encoder 입력에는 들어가지만 target anchor로는 쓰지 않습니다.
+- `use_prefix_valid_future_loss_mask=true`가 기본값입니다. 이때 raw step `75/80/85` tail anchor는 각각 `15/10/5`개 fine-step prefix만 loss와 future-step decoding attention에 포함합니다.
+- loss는 anchor 평균이 아니라 실제 유효 fine-step 기준으로 평균냅니다. 따라서 0.5초짜리 tail anchor가 2초짜리 anchor와 같은 weight를 받지 않습니다.
+
+전체 agent가 끝까지 유효한 2초 horizon 기준 supervision 수는 기존 `13 x 20 = 260` fine-step에서 `13 x 20 + 15 + 10 + 5 = 290` fine-step으로 늘어납니다. 추가되는 3개 anchor는 closed-loop rollout 후반부 query state이므로, pretrain에서 직접 보는 현재 상태 coverage가 넓어집니다.
+
+학습 target 선택은 아래 옵션으로 고릅니다.
 
 ```bash
-model.model_config.token_processor.use_prefix_valid_future_loss_mask=false  # 기존 방식
-model.model_config.token_processor.use_prefix_valid_future_loss_mask=true   # prefix-valid 방식
+model.model_config.token_processor.use_prefix_valid_future_loss_mask=true   # 기본 Tail-Prefix 방식
+model.model_config.token_processor.use_prefix_valid_future_loss_mask=false  # full-window anchor만 학습
 ```
 
-- `false`이면 기존과 같습니다. 현재 anchor 뒤 `decoder.flow_window_steps` 전체 미래가 모두 유효한 agent-anchor만 학습합니다.
-- `true`이면 현재 anchor 뒤 가장 가까운 미래부터 시작해서, 처음 끊기기 전까지 연속으로 유효한 구간만 학습합니다. 이 구간에만 loss가 들어갑니다.
-- full-valid sample은 `true`에서도 그대로 전체 미래 loss를 받습니다. 새로 추가되는 것은 partial-valid sample뿐입니다.
+- `true`이면 현재 anchor 뒤 가장 가까운 미래부터 시작해서, 처음 끊기기 전까지 연속으로 유효한 prefix만 학습합니다. 없는 suffix는 target을 억지로 정지/반복으로 만들지 않고, loss와 decoder future-step attention에서 완전히 mask 처리합니다.
+- full-valid sample은 `true`에서도 그대로 전체 미래 loss를 받습니다. 새로 추가되는 것은 partial-valid tail sample뿐입니다.
+- `false`이면 `18-token / 16-anchor` slot shape은 유지하지만, 현재 anchor 뒤 `decoder.flow_window_steps` 전체 미래가 모두 유효한 agent-anchor만 학습합니다. 기본 WOMD 91-step horizon에서는 raw step `75/80/85` tail anchor가 제외되어 실질적으로 기존 13개 full-horizon anchor만 loss를 받습니다.
 - 이 옵션은 `FlowTokenProcessor`에서 학습 target을 만들 때 적용되므로 pretrain, 일반 fine tuning, self-forced fine tuning에서 같은 방식으로 동작합니다.
 - README 기준 cache를 그대로 만들었다면 cache 재생성은 필요 없습니다. pkl cache 자체에서 partial-valid agent/anchor를 직접 삭제한 경우에만 cache를 다시 만들어야 합니다.
 

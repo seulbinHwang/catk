@@ -719,7 +719,7 @@ class HierarchicalFlowDecoder(nn.Module):
         future_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        anchor_hidden : (A, 13, H) -> (N=A*13, H) -> context : (N, D)
+        anchor_hidden : (N, H) -> context : (N, D)
         """
         context = self.context_projector(anchor_hidden)
         """

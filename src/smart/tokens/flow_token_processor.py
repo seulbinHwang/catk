@@ -22,6 +22,10 @@ from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils import transform_to_local, validate_flow_window_steps
 
 
+FLOW_CONTEXT_TOKEN_COUNT = 18
+FLOW_TRAIN_ANCHOR_COUNT = 16
+
+
 class FlowTokenProcessor(TokenProcessor):
     """Flow 학습용 anchor 목표와 평가용 메타데이터를 만듭니다."""
 
@@ -132,16 +136,19 @@ class FlowTokenProcessor(TokenProcessor):
         pos = processed_agent["pos"]
         heading = processed_agent["heading"]
 
-        ctx_sampled_idx = tokenized_agent["sampled_idx"][:, :14].contiguous()
-        ctx_sampled_pos = tokenized_agent["sampled_pos"][:, :14].contiguous()
-        ctx_sampled_heading = tokenized_agent["sampled_heading"][:, :14].contiguous()
-        ctx_valid = tokenized_agent["valid_mask"][:, :14].contiguous()
+        ctx_sampled_idx = tokenized_agent["sampled_idx"][:, :FLOW_CONTEXT_TOKEN_COUNT].contiguous()
+        ctx_sampled_pos = tokenized_agent["sampled_pos"][:, :FLOW_CONTEXT_TOKEN_COUNT].contiguous()
+        ctx_sampled_heading = tokenized_agent["sampled_heading"][:, :FLOW_CONTEXT_TOKEN_COUNT].contiguous()
+        ctx_valid = tokenized_agent["valid_mask"][:, :FLOW_CONTEXT_TOKEN_COUNT].contiguous()
 
         num_agent = pos.shape[0]
         device = pos.device
         dtype = pos.dtype
-        num_anchor = 13
-        raw_current_steps = list(range(10, 71, self.shift))
+        num_anchor = FLOW_TRAIN_ANCHOR_COUNT
+        raw_current_steps = [
+            self.shift * (anchor_idx + 2)
+            for anchor_idx in range(num_anchor)
+        ]
 
         if "train_mask" in data["agent"]:
             train_mask = data["agent"]["train_mask"].bool()

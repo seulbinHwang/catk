@@ -512,8 +512,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         Args:
             anchor_hidden: context encoder 출력입니다.
-                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
-            anchor_mask: 유효 anchor 여부입니다. shape은 ``[n_agent, 13]`` 입니다.
+                shape은 ``[n_agent, n_anchor, hidden_dim]`` 입니다.
+            anchor_mask: 유효 anchor 여부입니다. shape은 ``[n_agent, n_anchor]`` 입니다.
 
         Returns:
             torch.Tensor:
@@ -561,7 +561,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        num_anchor = int(anchor_mask.shape[1])
+        required_context_steps = num_anchor + 1
+        if ctx_hidden_pack.shape[1] < required_context_steps:
+            raise ValueError(
+                "Flow anchor context requires one leading token plus all anchor tokens: "
+                f"required={required_context_steps}, actual={ctx_hidden_pack.shape[1]}."
+            )
+        anchor_hidden = ctx_hidden_pack[:, 1:required_context_steps, :]
         output = {
             "flow_clean_norm": flow_clean_norm,
             "ctx_hidden_pack": ctx_hidden_pack,
@@ -692,9 +699,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         Args:
             anchor_hidden: 모든 anchor 문맥입니다.
-                shape은 ``[n_agent, 13, hidden_dim]`` 입니다.
+                shape은 ``[n_agent, n_anchor, hidden_dim]`` 입니다.
             anchor_mask: 실제로 평가할 anchor 여부입니다.
-                shape은 ``[n_agent, 13]`` 입니다.
+                shape은 ``[n_agent, n_anchor]`` 입니다.
             sampling_scheme: 샘플링 단계 수, 방법, 잡음 크기 설정입니다.
             sampling_seed: validation마다 같은 출발 잡음을 만들기 위한 seed입니다.
             backprop_last_k: 마지막 몇 step만 역전파할지 정합니다.
@@ -2094,13 +2101,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 f"got {int(anchor_mask.sum().item())} and {path_noisy_norm.shape[0]}."
             )
 
-        single_anchor_mask = torch.zeros(
-            anchor_mask.shape[0],
-            13,
-            device=anchor_mask.device,
-            dtype=torch.bool,
-        )
-        single_anchor_mask[:, 0] = anchor_mask.bool()
         ctx_hidden_pack = self._encode_context(
             agent_token_index=tokenized_agent["ctx_sampled_idx"],
             pos_a=tokenized_agent["ctx_sampled_pos"],
@@ -2109,7 +2109,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        anchor_hidden = ctx_hidden_pack[:, 1:, :]
+        if ctx_hidden_pack.shape[1] < 2:
+            raise ValueError(
+                "path_flow_velocity_for_anchor0 requires at least one leading context "
+                "token and one anchor token."
+            )
+        anchor_hidden = ctx_hidden_pack[:, 1:2, :]
+        single_anchor_mask = anchor_mask.bool().view(-1, 1)
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
         velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
         clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
