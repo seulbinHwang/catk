@@ -96,6 +96,13 @@ agent 집합도 맞춰야 한다. 이를 위해 `configs/experiment/pre_bc.yaml`
 맞게 구현되어 있어, true/false 양쪽 train selection mode 모두 datamodule 생성
 단계에서 바로 사용할 수 있다.
 
+공정 비교에서는 어느 epoch의 가중치를 비교하는지도 맞춰야 한다.
+`configs/experiment/pre_bc.yaml`은 KFM pretrain 설정과 같이
+`val_closed/sim_agents_2025/realism_meta_metric`을 checkpoint monitor로 사용하고
+`mode: max`를 적용한다. 따라서 SMART NTP pretrain도 마지막 epoch 가중치가 아니라
+closed-loop validation realism 점수가 가장 높았던 가중치를 best checkpoint로
+저장한다.
+
 ### WOSAC submission 실행 시 fast metric 비활성화
 
 `configs/experiment/wosac_sub.yaml`은 제출 파일 생성 전용 설정이다. 이 모드에서는

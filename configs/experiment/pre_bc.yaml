@@ -25,6 +25,11 @@ trainer:
   check_val_every_n_epoch: 16
   max_epochs: 64
 
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
 data:
   train_batch_size: 10
   val_batch_size: 10
