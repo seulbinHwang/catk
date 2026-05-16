@@ -103,6 +103,18 @@ agent 집합도 맞춰야 한다. 이를 위해 `configs/experiment/pre_bc.yaml`
 closed-loop validation realism 점수가 가장 높았던 가중치를 best checkpoint로
 저장한다.
 
+공정 비교용 SMART NTP pretrain에서는 validation video 저장도 끈다.
+`configs/experiment/pre_bc.yaml`은 `n_vis_batch: 0`, `n_vis_scenario: 0`,
+`n_vis_rollout: 0`을 명시해서 validation 중 rollout video 저장이라는 불필요한
+side-effect를 만들지 않는다.
+
+같은 config는 SMART NTP의 capacity 보정을 위해
+`model.model_config.decoder.num_freq_bands: 66`도 명시한다. 최신 main 코드에서
+`experiment=pre_bc`와 `num_freq_bands=66`으로 SMART 모델을 실제 instantiate해 센
+총 파라미터 수는 7,008,734개이며, 모두 trainable parameter이다. 같은 최신 코드에서
+`num_freq_bands=64`일 때는 7,001,024개이므로, 이 공정 비교 설정의 증가분은
+7,710개이다.
+
 ### 2025 Sim Agents submission 실행 시 fast metric 비활성화
 
 `configs/experiment/wosac_sub.yaml`은 제출 파일 생성 전용 설정이다. 이 모드에서는
