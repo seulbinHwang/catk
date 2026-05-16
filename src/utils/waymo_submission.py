@@ -120,7 +120,9 @@ def is_primary_process(env: Mapping[str, str] | None = None) -> bool:
         try:
             return int(value) == 0
         except ValueError:
-            log.warning("Ignoring non-integer %s=%r while resolving primary rank.", key, value)
+            log.warning(
+                f"Ignoring non-integer {key}={value!r} while resolving primary rank."
+            )
     return True
 
 
@@ -469,13 +471,11 @@ def maybe_submit_waymo_submission(cfg: DictConfig) -> WaymoSubmissionResult | No
     ):
         if str(cfg.action) in {"validate", "test"}:
             log.info(
-                "Waymo auto submission is disabled for action=%s by config. "
-                "Set waymo_submission.submit_%s=true to arm it.",
-                cfg.action,
-                str(cfg.action),
+                f"Waymo auto submission is disabled for action={cfg.action} by config. "
+                f"Set waymo_submission.submit_{cfg.action}=true to arm it."
             )
         else:
-            log.info("Skipping Waymo auto submission for unsupported action=%s.", cfg.action)
+            log.info(f"Skipping Waymo auto submission for unsupported action={cfg.action}.")
         return None
 
     if not is_primary_process():
@@ -485,10 +485,8 @@ def maybe_submit_waymo_submission(cfg: DictConfig) -> WaymoSubmissionResult | No
     runtime = _build_runtime_config(cfg)
 
     log.info(
-        "Submitting %s to Waymo %s set via %s.",
-        runtime.archive_path,
-        runtime.evaluation_set,
-        runtime.challenge_url,
+        f"Submitting {runtime.archive_path} to Waymo {runtime.evaluation_set} set "
+        f"via {runtime.challenge_url}."
     )
     uploader = _WaymoSubmissionUploader(runtime=runtime)
     return uploader.submit()
@@ -608,9 +606,11 @@ class _WaymoSubmissionUploader:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
             from playwright.sync_api import sync_playwright
         except ImportError as exc:
+            hint = _playwright_install_hint(
+                "Playwright is required for browser-based Waymo auto submission."
+            )
             log.warning(
-                "%s Falling back to direct HTTP upload using the saved Waymo session.",
-                _playwright_install_hint("Playwright is required for browser-based Waymo auto submission."),
+                f"{hint} Falling back to direct HTTP upload using the saved Waymo session."
             )
             return self._submit_via_http()
 
@@ -619,10 +619,9 @@ class _WaymoSubmissionUploader:
                 browser = self._launch_browser(playwright)
             except Exception as exc:
                 log.warning(
-                    "Failed to launch Playwright %s browser (%s). "
-                    "Falling back to direct HTTP upload using the saved Waymo session.",
-                    self.runtime.browser_name,
-                    exc,
+                    f"Failed to launch Playwright {self.runtime.browser_name} browser "
+                    f"({exc}). Falling back to direct HTTP upload using the saved "
+                    "Waymo session."
                 )
                 return self._submit_via_http()
             context = None
@@ -667,10 +666,9 @@ class _WaymoSubmissionUploader:
                 submitted = self._submit_form(page, submit_section, file_input)
                 if not submitted:
                     log.warning(
-                        "No explicit submit trigger was found after attaching %s. "
-                        "If Waymo changed the DOM, inspect %s for the current structure.",
-                        self.runtime.archive_path.name,
-                        self.runtime.debug_dir,
+                        f"No explicit submit trigger was found after attaching "
+                        f"{self.runtime.archive_path.name}. If Waymo changed the DOM, "
+                        f"inspect {self.runtime.debug_dir} for the current structure."
                     )
 
                 page.wait_for_timeout(self.runtime.post_submit_wait_ms)
@@ -1064,7 +1062,7 @@ class _WaymoSubmissionUploader:
             matched_term = next((term for term in match_terms if term in body_text), None)
             if matched_term is not None:
                 text_window = _extract_text_window(body_text, matched_term)
-                log.info("Waymo submissions page match: %s", text_window)
+                log.info(f"Waymo submissions page match: {text_window}")
                 lowered = text_window.lower()
                 if any(
                     token in lowered
@@ -1086,8 +1084,8 @@ class _WaymoSubmissionUploader:
             )
 
         log.warning(
-            "Timed out while polling %s for the new Waymo submission status.",
-            self.runtime.submissions_url,
+            f"Timed out while polling {self.runtime.submissions_url} for the new "
+            "Waymo submission status."
         )
 
     def _poll_submissions_page_http(self, session: requests.Session) -> None:
@@ -1107,7 +1105,7 @@ class _WaymoSubmissionUploader:
             matched_term = next((term for term in match_terms if term in body_text), None)
             if matched_term is not None:
                 text_window = _extract_text_window(body_text, matched_term)
-                log.info("Waymo submissions page match: %s", text_window)
+                log.info(f"Waymo submissions page match: {text_window}")
                 lowered = text_window.lower()
                 if any(
                     token in lowered
@@ -1125,8 +1123,8 @@ class _WaymoSubmissionUploader:
             time.sleep(self.runtime.poll_interval_seconds)
 
         log.warning(
-            "Timed out while polling %s for the new Waymo submission status.",
-            self.runtime.submissions_url,
+            f"Timed out while polling {self.runtime.submissions_url} for the new "
+            "Waymo submission status."
         )
 
     def _save_debug_artifacts(self, page, prefix: str) -> None:
@@ -1141,7 +1139,7 @@ class _WaymoSubmissionUploader:
             html_path.write_text(page.content(), encoding="utf-8")
             page.screenshot(path=png_path.as_posix(), full_page=True)
         except Exception as exc:
-            log.warning("Failed to persist Waymo debug artifacts: %s", exc)
+            log.warning(f"Failed to persist Waymo debug artifacts: {exc}")
 
     def _save_http_debug_artifact(self, prefix: str, html: str) -> None:
         if not self.runtime.save_debug_artifacts:
@@ -1153,7 +1151,7 @@ class _WaymoSubmissionUploader:
             html_path = self.runtime.debug_dir / f"{prefix}-{timestamp}.html"
             html_path.write_text(html, encoding="utf-8")
         except Exception as exc:
-            log.warning("Failed to persist Waymo HTTP debug artifacts: %s", exc)
+            log.warning(f"Failed to persist Waymo HTTP debug artifacts: {exc}")
 
     def _build_http_session(self) -> requests.Session:
         state = json.loads(self.runtime.storage_state_path.read_text(encoding="utf-8"))

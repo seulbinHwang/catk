@@ -252,6 +252,15 @@ test 자동 제출은 실수 방지를 위해 기본으로 꺼져 있다. Waymo 
     waymo_submission.submit_test=true
 ```
 
+#### Waymo 자동 업로드 로그 메시지 안정화
+
+`src/utils/waymo_submission.py`의 모든 `log.info`/`log.warning` 호출은 `%`-스타일
+포맷 인자(`log.info("...%s...", value)`) 대신 f-string 으로 작성되어 있다. 이는
+`RankedLogger.log(self, level, msg, rank=None, *args, **kwargs)` 시그니처가
+첫 번째 추가 positional 인자를 `rank` 키워드로 흡수해 포맷 인자가 한 칸 밀려
+경고 메시지가 깨지는 현상을 피하기 위함이다. 이 파일에 새 로그 호출을 추가할 때도
+같은 패턴을 따라야 한다.
+
 ### Dynamic traffic-light staleness for SMART baselines
 
 The SMART token baseline now uses the same traffic-light input semantics as the
