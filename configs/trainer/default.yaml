@@ -14,7 +14,7 @@ max_epochs: 32
 accelerator: gpu
 devices: -1
 
-precision: 32-true
+precision: bf16-mixed
 check_val_every_n_epoch: 16
 
 # set True to to ensure deterministic results

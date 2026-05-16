@@ -111,6 +111,13 @@ agent 집합도 맞춰야 한다. 이를 위해 `configs/experiment/pre_bc.yaml`
 맞게 구현되어 있어, true/false 양쪽 train selection mode 모두 datamodule 생성
 단계에서 바로 사용할 수 있다.
 
+main 브랜치의 기본 trainer precision은 `configs/trainer/default.yaml`에서
+`bf16-mixed`로 설정한다. 따라서 별도 precision override가 없는 SMART NTP pretrain,
+local validation, WOSAC submission 생성은 모두 KFM 계열 `semi_control_stable` 설정과
+같은 mixed bfloat16 실행 조건을 사용한다. A100/H100 같은 bf16 지원 GPU에서 학습과
+추론의 precision 조건을 맞추기 위한 기본값이며, FP32가 꼭 필요한 실험만 실행 시
+`trainer.precision=32-true`로 명시적으로 덮어쓴다.
+
 공정 비교에서는 어느 epoch의 가중치를 비교하는지도 맞춰야 한다.
 `configs/experiment/pre_bc.yaml`은 KFM pretrain 설정과 같이
 `val_closed/sim_agents_2025/realism_meta_metric`을 checkpoint monitor로 사용하고
