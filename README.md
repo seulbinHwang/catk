@@ -64,7 +64,11 @@
     다른 project/entity를 쓰려면 실행 시 `logger.wandb.project=<project>` 또는
     `logger.wandb.entity=<entity>`를 override하면 된다. 로컬 디스크에만 기록하고
     싶으면 환경변수 `WANDB_MODE=offline`을 켜거나 `logger.wandb.offline=true`를
-    추가하면 wandb 서버로의 업로드가 멈춘다.
+    추가하면 wandb 서버로의 업로드가 멈춘다. 이때 Lightning은 offline mode에서
+    model artifact 업로드(`log_model: all`)를 허용하지 않으므로, logger 생성 직전에
+    `log_model=false`로 자동 낮춘다. 따라서 online 실행에서는 checkpoint artifact
+    업로드 기본값을 유지하고, offline smoke test나 로컬 디버깅은 별도
+    `logger.wandb.log_model=false` override 없이 실행할 수 있다.
 - **주의할 점**
   - 학습과 validation에는 *NVIDIA A100 80GB* 8장을 사용했다. 학습과 fine-tuning은 며칠이 걸리고, validation과 test도 몇 시간이 걸릴 수 있다.
   - [Waymo Open Motion Dataset 약관](https://waymo.com/open/terms)에 따라 pre-trained model은 공유할 수 없다.
@@ -117,6 +121,13 @@ local validation, WOSAC submission 생성은 모두 KFM 계열 `semi_control_sta
 같은 mixed bfloat16 실행 조건을 사용한다. A100/H100 같은 bf16 지원 GPU에서 학습과
 추론의 precision 조건을 맞추기 위한 기본값이며, FP32가 꼭 필요한 실험만 실행 시
 `trainer.precision=32-true`로 명시적으로 덮어쓴다.
+
+bf16 mixed precision에서는 module 출력이 bfloat16으로 autocast될 수 있지만, cache에서
+읽은 위치/heading tensor는 float32로 남는다. SMART agent decoder는 agent token
+embedding을 임시 buffer에 모아 넣는 과정에서 buffer dtype을 token embedding 출력
+dtype에 맞춘다. 그래서 `agent_token_embedding()`의 boolean indexing assignment가
+`Float` destination과 `BFloat16` source mismatch로 실패하지 않고, pretrain,
+local validation, WOSAC submission 경로가 기본 `bf16-mixed` 설정으로 실행된다.
 
 ### H100x4x2 멀티 노드 SMART NTP pretrain
 

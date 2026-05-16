@@ -11,16 +11,40 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import os
 from typing import List, Optional
 
 import hydra
 from lightning import Callback
 from lightning.pytorch.loggers import Logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from . import pylogger
 
 log = pylogger.RankedLogger(__name__, rank_zero_only=True)
+
+_WANDB_OFFLINE_MODES = {"offline", "dryrun", "disabled"}
+
+
+def _is_wandb_offline(lg_conf: DictConfig) -> bool:
+    wandb_mode = os.getenv("WANDB_MODE", "").strip().lower()
+    return bool(lg_conf.get("offline", False)) or wandb_mode in _WANDB_OFFLINE_MODES
+
+
+def _disable_wandb_log_model_when_offline(lg_conf: DictConfig) -> None:
+    if "wandb.WandbLogger" not in str(lg_conf.get("_target_", "")):
+        return
+    if not _is_wandb_offline(lg_conf):
+        return
+    if lg_conf.get("log_model") in (False, None):
+        return
+
+    log.warning(
+        "WandB offline mode is active; setting log_model=False because "
+        "Lightning cannot upload model artifacts while offline."
+    )
+    with open_dict(lg_conf):
+        lg_conf.log_model = False
 
 
 def instantiate_callbacks(callbacks_cfg: DictConfig) -> List[Callback]:
@@ -63,6 +87,7 @@ def instantiate_loggers(logger_cfg: DictConfig) -> List[Logger]:
 
     for _, lg_conf in logger_cfg.items():
         if isinstance(lg_conf, DictConfig) and "_target_" in lg_conf:
+            _disable_wandb_log_model_when_offline(lg_conf)
             log.info(f"Instantiating logger <{lg_conf._target_}>")
             logger.append(hydra.utils.instantiate(lg_conf))
 
