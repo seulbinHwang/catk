@@ -694,6 +694,21 @@ DDP 학습에는 `scripts/road_train.sh` 안의 DDP block을 사용한다. Rank 
 그 뒤 모든 rank가 synchronize한 다음 해당 cache를 읽는다. 생성된 데이터를 debug하려는
 경우에만 `road.delete_after_use=false`를 설정한다.
 
+#### RoaD cache 안전장치: ego 거리 클립과 precision 정합
+
+RoaD는 모델 자기 자신의 rollout을 새 정답으로 다시 학습시키는 방식이라, rollout이
+도로 밖으로 폭주하면 그 헛소리 궤적이 그대로 학습 신호가 될 수 있다. 이를 막기 위해
+`road.max_distance_from_ego` (기본 `150.0` m) 옵션이 캐시 단계에서 ego와의 거리가
+임계를 초과한 step을 `valid_mask=False`로 마킹한다. 이 가드는
+`WaymoTargetBuilderTrain`의 150m clip이 우회되는 설정 (예:
+`data.train_use_eval_agent_selection=true`)에서도 학습 데이터 품질을 지킨다.
+0 이하 값을 주면 가드를 끈다.
+
+또한 `RoadCacheRefreshCallback`은 `trainer.precision`을 읽어
+`bf16-mixed`/`16-mixed`일 때 `generate_road_cache` 안의 inference를
+`torch.autocast`로 감싼다. 학습 step과 cache 생성이 같은 precision 분포로 돌아가도록
+정합을 맞추기 위한 것이며, `32-true`로 실행할 때는 autocast가 깔리지 않는다.
+
 Gaussian Mixture Model(GMM) 기반 ego policy도 절차는 비슷하며, 아래 config를 사용하면 된다.
 
 - [GMM 기반 ego policy용 BC pre-training config](configs/experiment/ego_gmm_pre_bc.yaml)

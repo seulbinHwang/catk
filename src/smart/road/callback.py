@@ -4,7 +4,11 @@ from typing import Optional
 from lightning import Callback, LightningModule, Trainer
 from omegaconf import DictConfig
 
-from src.smart.road.cache import delete_cache_dir, generate_road_cache
+from src.smart.road.cache import (
+    delete_cache_dir,
+    generate_road_cache,
+    resolve_autocast_dtype_from_precision,
+)
 
 
 class RoadCacheRefreshCallback(Callback):
@@ -18,6 +22,7 @@ class RoadCacheRefreshCallback(Callback):
         num_workers: int,
         pin_memory: bool,
         delete_after_use: bool,
+        max_distance_from_ego: float = 0.0,
     ) -> None:
         """RoaD fine-tuning용 epoch-local cache를 관리한다.
 
@@ -30,6 +35,9 @@ class RoadCacheRefreshCallback(Callback):
             num_workers: cache 생성용 worker 수이다.
             pin_memory: cache 생성용 DataLoader pin_memory 여부이다.
             delete_after_use: 학습이 끝난 cache를 바로 삭제할지 여부이다.
+            max_distance_from_ego: ego로부터 이 거리(미터)를 초과한 RoaD rollout step을
+                invalid로 마킹한다. 학습 transform이 거리 clip을 안 거는 설정에서도
+                폭주한 rollout이 학습에 들어가지 않도록 막는 안전장치이다. 0 이하이면 끈다.
         """
         super().__init__()
         self.original_train_raw_dir = original_train_raw_dir
@@ -40,6 +48,7 @@ class RoadCacheRefreshCallback(Callback):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.delete_after_use = delete_after_use
+        self.max_distance_from_ego = float(max_distance_from_ego)
         self.current_cache_dir: Optional[str] = None
 
     def _cache_dir(self, epoch: int) -> str:
@@ -94,6 +103,9 @@ class RoadCacheRefreshCallback(Callback):
         """
         cache_dir = self._cache_dir(epoch)
         if trainer.global_rank == 0:
+            autocast_dtype = resolve_autocast_dtype_from_precision(
+                getattr(trainer, "precision", None)
+            )
             generate_road_cache(
                 model=pl_module,
                 original_train_raw_dir=self.original_train_raw_dir,
@@ -106,6 +118,8 @@ class RoadCacheRefreshCallback(Callback):
                 pin_memory=self.pin_memory,
                 num_historical_steps=pl_module.num_historical_steps,
                 device=None,
+                autocast_dtype=autocast_dtype,
+                max_distance_from_ego=self.max_distance_from_ego,
             )
         self._sync(trainer, f"road_cache_epoch_{epoch:03d}_generated")
         trainer.datamodule.set_train_raw_dir(
