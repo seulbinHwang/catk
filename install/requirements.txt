@@ -23,6 +23,8 @@ hydra-colorlog==1.2.0 # MIT License: https://github.com/facebookresearch/hydra/b
 # logging
 wandb==0.17.9 # MIT License: https://github.com/wandb/wandb/blob/main/LICENSE
 rich==13.8.0 # MIT License: https://github.com/Textualize/rich/blob/master/LICENSE
+requests==2.32.3 # Apache License 2.0: https://github.com/psf/requests/blob/main/LICENSE
+playwright==1.52.0 # Apache License 2.0: https://github.com/microsoft/playwright/blob/main/LICENSE
 
 
 # License for packages installed with command line
@@ -39,4 +41,3 @@ rich==13.8.0 # MIT License: https://github.com/Textualize/rich/blob/master/LICEN
 
 # Waymo Dataset
 # Waymo Dataset License Agreement for Non-Commercial Use: https://waymo.com/open/terms/
-

@@ -115,6 +115,116 @@ SMART 모델도 submission 모드에서는 scorer scene 수 자동 조정을 적
 이렇게 하면 제출 파일의 내용은 유지하면서, 로깅되지 않을 metric state를 만들기
 위해 앞쪽 validation batch를 불필요하게 평가하는 일을 피할 수 있다.
 
+### SSH 서버에서 Waymo 사이트로 자동 업로드
+
+SSH 서버에서도 `wosac_submission.tar.gz`를 만든 뒤 바로 Waymo 사이트에 업로드할 수
+있다. Google 로그인은 한 번 필요하므로, GUI가 있는 PC에서 로그인 상태를 저장한 뒤
+서버에서는 그 JSON 내용을 붙여넣는 방식으로 쓰는 편이 안전하다. 로그인 상태 파일의
+기본 위치는 아래와 같다.
+
+```text
+secrets/waymo/waymo_storage_state.json
+```
+
+이 파일은 로그인된 상태를 담고 있으므로 비밀번호처럼 다뤄야 한다. `.gitignore`에는
+`secrets/waymo/waymo_storage_state.json`과 `secrets/waymo/playwright_profile/`이
+포함되어 있다.
+
+준비:
+
+```bash
+python -m pip install -r install/requirements.txt
+python -m playwright install chromium
+```
+
+환경에 `python` 명령이 없으면 위 예시의 `python`을 `python3`로 바꿔서 실행하면 된다.
+
+GUI가 있는 PC에서 로그인 상태를 저장한다.
+
+```bash
+python scripts/waymo_save_storage_state.py --browser-channel chrome
+```
+
+기본 저장 위치는 `secrets/waymo/waymo_storage_state.json`이다. 로그인이 잘 안 되면
+Playwright 기본 Chromium보다 설치된 Chrome이나 Edge를 쓰는 편이 안정적이므로
+`--browser-channel chrome` 또는 `--browser-channel msedge`를 권장한다. 이 스크립트는
+저장 직전에 Sim Agents 페이지에서 `Submit to Validation Set` 또는 `Submit to Test Set`
+업로드 박스가 실제로 보이는지 확인한다. Waymo가 `Review rules`를 보여주면 약관 동의를
+마친 뒤 다시 저장해야 한다. 이때 headless 업로드에 필요한 Waymo localStorage 항목인
+`datasetChallengeTermsAgreementAccepted=true`도 storage state에 함께 기록한다.
+
+브라우저 프로필은 기본적으로 실행할 때마다 임시로 만들고 종료 시 정리한다.
+`--user-data-dir`를 직접 줄 때는 Playwright 전용의 빈 폴더를 쓰는 편이 안전하며,
+평소 쓰는 기본 Chrome 프로필 폴더를 그대로 넣는 것은 권장하지 않는다. 예전에 만든
+프로필을 재사용하다가 브라우저가 바로 꺼지면 `--user-data-dir` 없이 다시 실행하면 된다.
+
+서버에 이 파일을 꼭 복사해 둘 필요는 없다. `waymo_submission.enabled=true`로 실행했을
+때 파일이 없으면 rank 0 프로세스가 시작 직후 JSON 붙여넣기를 요청한다. pretty-printed
+JSON을 그대로 붙여넣고 마지막 `}` 뒤에서 Enter를 한 번 더 치면 된다. 입력된 JSON은
+`/tmp` 아래 임시 파일로만 저장되고 프로세스 종료 시 삭제된다. 서버에 파일을 두고 싶으면
+`waymo_submission.storage_state_path` 경로에 배치하면 되고, 이 경우 붙여넣기 프롬프트는
+뜨지 않는다.
+
+validation 자동 업로드 예시는 아래와 같다.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+torchrun \
+  --standalone \
+  --nproc_per_node=6 \
+  -m src.run \
+  experiment=wosac_sub \
+  action=validate \
+  trainer=ddp \
+  trainer.devices=6 \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path=/path/to/model.ckpt \
+  task_name=smart_ntp_waymo_val_ddp6 \
+  model.model_config.wosac_submission.method_name="SMART-NTP-7M" \
+  model.model_config.wosac_submission.authors=[Anonymous] \
+  model.model_config.wosac_submission.affiliation="YOUR_AFFILIATION" \
+  model.model_config.wosac_submission.description="YOUR_DESCRIPTION" \
+  model.model_config.wosac_submission.method_link="YOUR_METHOD_LINK" \
+  model.model_config.wosac_submission.account_name="YOUR_ACCOUNT_NAME" \
+  waymo_submission.enabled=true \
+  waymo_submission.poll_submission_status=false
+```
+
+핵심 옵션:
+
+- `waymo_submission.enabled=true`: 자동 업로드를 켠다.
+- `waymo_submission.storage_state_path`: 로그인 상태 파일 경로이다. 기본값은
+  `secrets/waymo/waymo_storage_state.json`이다.
+- `waymo_submission.poll_submission_status=false`: 업로드 후 점수 페이지를 계속 확인하지
+  않는다.
+
+추가 참고:
+
+- validation 실행에서는 `waymo_submission.enabled=true`만 주면 업로드까지 진행된다.
+- `torchrun` DDP에서도 rank 0만 한 번 입력을 받고, 나머지 rank는 그 입력이 끝날 때까지
+  대기한다.
+- 서버에서는 기본으로 headless Chromium을 사용한다.
+- 서버에 설치된 Chrome을 쓰고 싶으면 `waymo_submission.browser_channel=chrome` 또는
+  `waymo_submission.browser_executable_path=/path/to/chrome`를 지정한다.
+- Chromium launch 전에 `CONDA_PREFIX/lib`를 `LD_LIBRARY_PATH` 앞에 자동으로 추가하고,
+  Playwright bundled browser 외에도 system Chrome과
+  `~/.cache/ms-playwright/chromium-*/chrome-linux/chrome` 경로를 자동 탐색해 재시도한다.
+- 브라우저 launch에 실패하면 저장된 storage state 쿠키를 사용해 Waymo 업로드 API로
+  자동 fallback한다.
+- 로그인 만료나 페이지 구조 변경으로 실패하면
+  `logs/<task_name>/runs/<timestamp>/waymo_submission_debug/` 아래에 디버그 파일이 남는다.
+- 점수 페이지까지 자동 확인하고 싶으면 `waymo_submission.poll_submission_status=true`를 줄
+  수 있지만 UI 변경에 영향을 받을 수 있어 기본값은 `false`이다.
+
+test 자동 제출은 실수 방지를 위해 기본으로 꺼져 있다. Waymo test set은 계정당 30일에
+3번만 제출할 수 있으므로 test 업로드를 할 때는 아래 옵션을 추가로 넣어야 한다.
+
+```bash
+... action=test \
+    waymo_submission.enabled=true \
+    waymo_submission.submit_test=true
+```
+
 ### Dynamic traffic-light staleness for SMART baselines
 
 The SMART token baseline now uses the same traffic-light input semantics as the
