@@ -18,7 +18,7 @@ model:
       criterium: topk_prob
       num_k: 48 # for k most likely
       temp: 1.0
-    wosac_submission:
+    sim_agents_submission:
       is_active: true
       method_name: "SMART-tiny-CLSFT"
       authors: [Anonymous]

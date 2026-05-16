@@ -51,7 +51,7 @@ model_config:
     time_span: 30
     num_historical_steps: 11
     num_future_steps: 80
-  wosac_submission:
+  sim_agents_submission:
     is_active: false
     method_name: "SMART-tiny-CLSFT"
     authors: [Anonymous]

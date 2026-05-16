@@ -24,10 +24,10 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import (
     CrossEntropy,
+    SimAgentsSubmission,
     SimAgentsMetrics,
     TokenCls,
     WOSACDistributionMetrics,
-    WOSACSubmission,
     log_and_reset_wosac_distribution_metric,
     minADE,
     update_wosac_distribution_metric_from_model,
@@ -36,7 +36,7 @@ from src.smart.modules.smart_decoder import SMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
-from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
 
 class SMART(LightningModule):
@@ -62,7 +62,9 @@ class SMART(LightningModule):
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
         self.sim_agents_metrics = SimAgentsMetrics("val_closed")
-        self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
+        self.sim_agents_submission = SimAgentsSubmission(
+            **model_config.sim_agents_submission
+        )
         wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
         self.wosac_distribution_metrics = WOSACDistributionMetrics(
             "val_closed",
@@ -169,7 +171,7 @@ class SMART(LightningModule):
         return int(val_batch_size)
 
     def _apply_scorer_scene_num_overrides(self) -> None:
-        if self.wosac_submission.is_active:
+        if self.sim_agents_submission.is_active:
             return
 
         scorer_scene_num = self.scorer_scene_num
@@ -524,26 +526,18 @@ class SMART(LightningModule):
 
             # ! Sim Agents submission / metrics
             scenario_rollouts = None
-            if self.wosac_submission.is_active:  # ! save WOSAC submission
-                self.wosac_submission.update(
+            if self.sim_agents_submission.is_active:
+                self.sim_agents_submission.update(
                     scenario_id=data["scenario_id"],
                     agent_id=data["agent"]["id"],
                     agent_batch=data["agent"]["batch"],
                     pred_traj=pred_traj,
                     pred_z=pred_z,
                     pred_head=pred_head,
-                    global_rank=self.global_rank,
                 )
-                _gpu_dict_sync = self.wosac_submission.compute()
-                if self.global_rank == 0:
-                    for k in _gpu_dict_sync.keys():  # single gpu fix
-                        if type(_gpu_dict_sync[k]) is list:
-                            _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
-                    scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
-                    self.wosac_submission.aggregate_rollouts(scenario_rollouts)
-                self.wosac_submission.reset()
+                scenario_rollouts = self.sim_agents_submission.aggregate_current_batch()
 
-            else:  # ! compute metrics, disable if save WOSAC submission
+            else:  # ! compute metrics, disable if saving Sim Agents submission
                 self.minADE.update(
                     pred=pred_traj,
                     target=data["agent"]["position"][
@@ -598,7 +592,7 @@ class SMART(LightningModule):
             epoch_distribution_metrics = log_and_reset_wosac_distribution_metric(
                 self.wosac_distribution_metrics
             )
-            if not self.wosac_submission.is_active:
+            if not self.sim_agents_submission.is_active:
                 if (
                     torch.distributed.is_available()
                     and torch.distributed.is_initialized()
@@ -647,14 +641,13 @@ class SMART(LightningModule):
                 self.sim_agents_metrics.reset()
                 self.minADE.reset()
 
-            if self.global_rank == 0:
-                if self.wosac_submission.is_active:
-                    if epoch_distribution_metrics:
-                        epoch_distribution_metrics["epoch"] = (
-                            self.log_epoch if self.log_epoch >= 0 else self.current_epoch
-                        )
-                        self.logger.log_metrics(epoch_distribution_metrics)
-                    self.wosac_submission.save_sub_file()
+            if self.sim_agents_submission.is_active:
+                if self.global_rank == 0 and epoch_distribution_metrics:
+                    epoch_distribution_metrics["epoch"] = (
+                        self.log_epoch if self.log_epoch >= 0 else self.current_epoch
+                    )
+                    self.logger.log_metrics(epoch_distribution_metrics)
+                self.sim_agents_submission.save_sub_file()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -699,24 +692,16 @@ class SMART(LightningModule):
             include_gt=False,
         )
 
-        # ! WOSAC submission save
-        self.wosac_submission.update(
+        # ! Sim Agents submission save
+        self.sim_agents_submission.update(
             scenario_id=data["scenario_id"],
             agent_id=data["agent"]["id"],
             agent_batch=data["agent"]["batch"],
             pred_traj=pred_traj,
             pred_z=pred_z,
             pred_head=pred_head,
-            global_rank=self.global_rank,
         )
-        _gpu_dict_sync = self.wosac_submission.compute()
-        if self.global_rank == 0:
-            for k in _gpu_dict_sync.keys():  # single gpu fix
-                if type(_gpu_dict_sync[k]) is list:
-                    _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
-            scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
-            self.wosac_submission.aggregate_rollouts(scenario_rollouts)
-        self.wosac_submission.reset()
+        self.sim_agents_submission.aggregate_current_batch()
 
     def on_test_epoch_end(self):
         epoch_distribution_metrics = log_and_reset_wosac_distribution_metric(
@@ -725,4 +710,4 @@ class SMART(LightningModule):
         if self.global_rank == 0:
             if epoch_distribution_metrics:
                 self.logger.log_metrics(epoch_distribution_metrics)
-            self.wosac_submission.save_sub_file()
+        self.sim_agents_submission.save_sub_file()

@@ -32,7 +32,7 @@ from src.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
-_DEFAULT_WAYMO_ARCHIVE_NAME = "wosac_submission.tar.gz"
+_DEFAULT_WAYMO_ARCHIVE_NAME = "sim_agents_2025_submission.tar.gz"
 _PRIMARY_RANK_ENV_KEYS = ("RANK", "SLURM_PROCID", "LOCAL_RANK")
 _SUPPORTED_BROWSER_NAMES = {"chromium", "firefox", "webkit"}
 _SUPPORTED_EVALUATION_SETS = {"validation", "test"}
@@ -587,9 +587,9 @@ def _resolve_method_name(cfg: DictConfig) -> str | None:
     if not model_config:
         return None
 
-    submission_cfg = model_config.get("wosac_submission")
+    submission_cfg = model_config.get("sim_agents_submission")
     if not submission_cfg:
-        submission_cfg = model_config.get("sim_agents_submission")
+        submission_cfg = model_config.get("wosac_submission")
     if not submission_cfg:
         return None
 

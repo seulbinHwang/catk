@@ -74,7 +74,7 @@ The default script runs with single GPU. We use DDP for multi GPU training and v
 To reproduce our final results, you should follow the following steps
 1. Use [scripts/train.sh](scripts/train.sh) with the [BC pre-training config](configs/experiment/pre_bc.yaml) to pre-train the SMART-tiny 7M model.
 2. Use [scripts/train.sh](scripts/train.sh) with the [CLSFT with CAT-K config](configs/experiment/clsft.yaml) to fine-tune the SMART-tiny model pre-trained in step 1.
-3. Use [scripts/wosac_sub.sh](scripts/wosac_sub.sh) to pack the submission fille for `validate` or `test` split. Upload the `wosac_submission.tar.gz` file located in `logs` folder to the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) such that you can evaluate the model fine-tuned in step 2 on the WOSAC leaderboard.
+3. Use [scripts/wosac_sub.sh](scripts/wosac_sub.sh) to pack the submission file for `validate` or `test` split. Upload the `sim_agents_2025_submission.tar.gz` file located in `logs` folder to the [2025 Sim Agents leaderboard](https://waymo.com/open/challenges/2025/sim-agents/) such that you can evaluate the model fine-tuned in step 2 on the leaderboard.
 4. Alternatively, you can do local validation with [scripts/local_val.sh](scripts/local_val.sh).
 
 ### 공정 비교용 SMART NTP 학습 agent selection
@@ -103,10 +103,10 @@ agent 집합도 맞춰야 한다. 이를 위해 `configs/experiment/pre_bc.yaml`
 closed-loop validation realism 점수가 가장 높았던 가중치를 best checkpoint로
 저장한다.
 
-### WOSAC submission 실행 시 fast metric 비활성화
+### 2025 Sim Agents submission 실행 시 fast metric 비활성화
 
 `configs/experiment/wosac_sub.yaml`은 제출 파일 생성 전용 설정이다. 이 모드에서는
-WOSAC submission protobuf를 저장하는 것이 목적이고, validation 중 fast Sim Agents
+2025 Sim Agents submission protobuf를 저장하는 것이 목적이고, validation 중 fast Sim Agents
 metric을 따로 누적해 로깅할 필요가 없다. 따라서 해당 config는
 `n_batch_sim_agents_metric: 0`과 `scorer_scene_num: 0`을 명시해서 local fast metric
 계산을 끈다.
@@ -115,9 +115,24 @@ SMART 모델도 submission 모드에서는 scorer scene 수 자동 조정을 적
 이렇게 하면 제출 파일의 내용은 유지하면서, 로깅되지 않을 metric state를 만들기
 위해 앞쪽 validation batch를 불필요하게 평가하는 일을 피할 수 있다.
 
+### 2025 Sim Agents submission shard 처리
+
+SMART NTP main 브랜치도 KFM의 `semi_control_stable`과 같은 개념의
+`SimAgentsSubmission` exporter를 사용한다. DDP validation/test dataloader는 각 rank가
+서로 다른 scenario shard를 이미 한 번씩만 처리하므로, 제출 파일 생성 단계에서는 rank
+간 rollout tensor를 다시 모으지 않는다. 각 rank는 자기 rank-local batch를 바로
+`ScenarioRollouts`로 변환해 `sim_agents_2025_submission/` 아래에
+`submission-rankXX-YYYYY.binproto` shard로 저장한다.
+
+epoch end에서는 모든 rank가 남은 shard를 flush한 뒤 barrier로 저장 완료를 맞춘다.
+그 다음 rank 0만 `sim_agents_2025_submission.tar.gz`를 만들고, tar 내부 member 이름은
+`submission.binproto-00000-of-000NN` 형식으로 통일한다. 이 구조는 rank별 shard 경계와
+최종 archive member naming을 명확히 해서 2025 Sim Agents 제출 기준에서 SMART NTP와
+KFM의 평가/제출 파이프라인을 맞춘다.
+
 ### SSH 서버에서 Waymo 사이트로 자동 업로드
 
-SSH 서버에서도 `wosac_submission.tar.gz`를 만든 뒤 바로 Waymo 사이트에 업로드할 수
+SSH 서버에서도 `sim_agents_2025_submission.tar.gz`를 만든 뒤 바로 Waymo 사이트에 업로드할 수
 있다. Google 로그인은 한 번 필요하므로, GUI가 있는 PC에서 로그인 상태를 저장한 뒤
 서버에서는 그 JSON 내용을 붙여넣는 방식으로 쓰는 편이 안전하다. 로그인 상태 파일의
 기본 위치는 아래와 같다.
@@ -180,12 +195,12 @@ torchrun \
   paths.cache_root="$CACHE_ROOT" \
   ckpt_path=/path/to/model.ckpt \
   task_name=smart_ntp_waymo_val_ddp6 \
-  model.model_config.wosac_submission.method_name="SMART-NTP-7M" \
-  model.model_config.wosac_submission.authors=[Anonymous] \
-  model.model_config.wosac_submission.affiliation="YOUR_AFFILIATION" \
-  model.model_config.wosac_submission.description="YOUR_DESCRIPTION" \
-  model.model_config.wosac_submission.method_link="YOUR_METHOD_LINK" \
-  model.model_config.wosac_submission.account_name="YOUR_ACCOUNT_NAME" \
+  model.model_config.sim_agents_submission.method_name="SMART-NTP-7M" \
+  model.model_config.sim_agents_submission.authors=[Anonymous] \
+  model.model_config.sim_agents_submission.affiliation="YOUR_AFFILIATION" \
+  model.model_config.sim_agents_submission.description="YOUR_DESCRIPTION" \
+  model.model_config.sim_agents_submission.method_link="YOUR_METHOD_LINK" \
+  model.model_config.sim_agents_submission.account_name="YOUR_ACCOUNT_NAME" \
   waymo_submission.enabled=true \
   waymo_submission.poll_submission_status=false
 ```
