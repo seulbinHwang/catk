@@ -796,15 +796,16 @@ class SMART(LightningModule):
         )
 
         # ! Sim Agents submission save
-        self.sim_agents_submission.update(
-            scenario_id=data["scenario_id"],
-            agent_id=data["agent"]["id"],
-            agent_batch=data["agent"]["batch"],
-            pred_traj=pred_traj,
-            pred_z=pred_z,
-            pred_head=pred_head,
-        )
-        self.sim_agents_submission.aggregate_current_batch()
+        if self.sim_agents_submission.is_active:
+            self.sim_agents_submission.update(
+                scenario_id=data["scenario_id"],
+                agent_id=data["agent"]["id"],
+                agent_batch=data["agent"]["batch"],
+                pred_traj=pred_traj,
+                pred_z=pred_z,
+                pred_head=pred_head,
+            )
+            self.sim_agents_submission.aggregate_current_batch()
 
     def on_test_epoch_end(self):
         epoch_distribution_metrics = log_and_reset_wosac_distribution_metric(
@@ -813,4 +814,5 @@ class SMART(LightningModule):
         if self.global_rank == 0:
             if epoch_distribution_metrics:
                 self._log_metrics_to_logger(epoch_distribution_metrics)
-        self.sim_agents_submission.save_sub_file()
+        if self.sim_agents_submission.is_active:
+            self.sim_agents_submission.save_sub_file()

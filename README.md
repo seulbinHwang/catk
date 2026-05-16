@@ -142,6 +142,13 @@ epoch end에서는 모든 rank가 남은 shard를 flush한 뒤 barrier로 저장
 최종 archive member naming을 명확히 해서 2025 Sim Agents 제출 기준에서 SMART NTP와
 KFM의 평가/제출 파이프라인을 맞춘다.
 
+`action=test`도 기본 설정에서는 `sim_agents_submission.is_active=false`이므로 제출
+shard를 만들지 않는다. 이 경우 test loop는 distribution metric만 계산하고
+`SimAgentsSubmission` exporter를 호출하지 않는다. 제출 파일을 만들려면
+`experiment=wosac_sub`처럼 `model.model_config.sim_agents_submission.is_active=true`인
+설정을 사용해야 한다. 이 guard는 실수로 기본 test 설정을 실행했을 때 inactive
+exporter가 `update()`/`save_sub_file()`에서 깨지는 일을 막기 위한 안전장치이다.
+
 ### SSH 서버에서 Waymo 사이트로 자동 업로드
 
 SSH 서버에서도 `sim_agents_2025_submission.tar.gz`를 만든 뒤 바로 Waymo 사이트에 업로드할 수
