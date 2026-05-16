@@ -26,6 +26,9 @@ DEFAULT_CACHE_ROOT_BY_POD = {
     "hsb-npc-training": "/mnt/nuplan/womd_v1_3/SMART_cache",
     "hsb-npc-training2": "/workspace/womd_v1_3/SMART_cache",
 }
+STRICT_BATCH26_EXPERIMENT = "pre_bc_h100x4x2"
+STRICT_TRAIN_BATCH_SIZE = "26"
+STRICT_ACCUMULATE_GRAD_BATCHES = "1"
 
 
 def shq(value: object) -> str:
@@ -79,6 +82,56 @@ def parse_pod_cache_roots(values: list[str]) -> dict[str, str]:
             )
         roots[pod] = path
     return roots
+
+
+def split_extra_hydra_overrides(overrides: str) -> list[str]:
+    if not overrides.strip():
+        return []
+    try:
+        return shlex.split(overrides)
+    except ValueError as exc:
+        raise ValueError(f"--extra-hydra-overrides is not shell-parseable: {exc}") from exc
+
+
+def validate_strict_batch26_pretrain(args: argparse.Namespace) -> None:
+    if args.stop:
+        return
+    if args.action != "fit" or args.experiment != STRICT_BATCH26_EXPERIMENT:
+        return
+
+    if args.train_batch_size and args.train_batch_size != STRICT_TRAIN_BATCH_SIZE:
+        raise ValueError(
+            f"{STRICT_BATCH26_EXPERIMENT} must use train_batch_size="
+            f"{STRICT_TRAIN_BATCH_SIZE}, but got --train-batch-size "
+            f"{args.train_batch_size!r}."
+        )
+    if (
+        args.accumulate_grad_batches
+        and args.accumulate_grad_batches != STRICT_ACCUMULATE_GRAD_BATCHES
+    ):
+        raise ValueError(
+            f"{STRICT_BATCH26_EXPERIMENT} must use accumulate_grad_batches="
+            f"{STRICT_ACCUMULATE_GRAD_BATCHES}, but got "
+            f"--accumulate-grad-batches {args.accumulate_grad_batches!r}."
+        )
+
+    for override in split_extra_hydra_overrides(args.extra_hydra_overrides):
+        if override.startswith("data.train_batch_size="):
+            value = override.split("=", 1)[1]
+            if value != STRICT_TRAIN_BATCH_SIZE:
+                raise ValueError(
+                    f"{STRICT_BATCH26_EXPERIMENT} must use data.train_batch_size="
+                    f"{STRICT_TRAIN_BATCH_SIZE}, but got override {override!r}."
+                )
+        elif override.startswith("trainer.accumulate_grad_batches="):
+            value = override.split("=", 1)[1]
+            if value != STRICT_ACCUMULATE_GRAD_BATCHES:
+                raise ValueError(
+                    f"{STRICT_BATCH26_EXPERIMENT} must use "
+                    f"trainer.accumulate_grad_batches="
+                    f"{STRICT_ACCUMULATE_GRAD_BATCHES}, but got override "
+                    f"{override!r}."
+                )
 
 
 def cache_root_for_pod(args: argparse.Namespace, pod: str) -> str:
@@ -398,6 +451,10 @@ def parse_args() -> argparse.Namespace:
 
     try:
         args.pod_cache_root_map = parse_pod_cache_roots(args.pod_cache_root)
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        validate_strict_batch26_pretrain(args)
     except ValueError as exc:
         parser.error(str(exc))
 

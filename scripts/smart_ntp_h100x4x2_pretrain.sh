@@ -79,6 +79,45 @@ PY
   esac
 }
 
+validate_strict_batch26_pretrain_overrides() {
+  local experiment="$1"
+  local action="$2"
+  shift 2
+
+  if [[ "$experiment" != "pre_bc_h100x4x2" || "$action" != "fit" ]]; then
+    return 0
+  fi
+
+  if [[ -n "${TRAIN_BATCH_SIZE:-}" && "${TRAIN_BATCH_SIZE}" != "26" ]]; then
+    log "ERROR: pre_bc_h100x4x2 must use train_batch_size=26; got TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}."
+    exit 2
+  fi
+  if [[ -n "${ACCUMULATE_GRAD_BATCHES:-}" && "${ACCUMULATE_GRAD_BATCHES}" != "1" ]]; then
+    log "ERROR: pre_bc_h100x4x2 must use accumulate_grad_batches=1; got ACCUMULATE_GRAD_BATCHES=${ACCUMULATE_GRAD_BATCHES}."
+    exit 2
+  fi
+
+  local override key value
+  for override in "$@"; do
+    key="${override%%=*}"
+    value="${override#*=}"
+    case "$key" in
+      data.train_batch_size)
+        if [[ "$value" != "26" ]]; then
+          log "ERROR: pre_bc_h100x4x2 must use data.train_batch_size=26; got override ${override}."
+          exit 2
+        fi
+        ;;
+      trainer.accumulate_grad_batches)
+        if [[ "$value" != "1" ]]; then
+          log "ERROR: pre_bc_h100x4x2 must use trainer.accumulate_grad_batches=1; got override ${override}."
+          exit 2
+        fi
+        ;;
+    esac
+  done
+}
+
 main() {
   export LOGLEVEL="${LOGLEVEL:-INFO}"
   export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
@@ -145,6 +184,15 @@ main() {
   if ! [[ "$trainer_devices" =~ ^[0-9]+$ ]] || (( trainer_devices < 1 )); then
     log "ERROR: resolved trainer.devices must be a positive integer; got: $trainer_devices"
     exit 2
+  fi
+  local extra_overrides=()
+  if [[ -n "${CATK_HYDRA_OVERRIDES:-}" ]]; then
+    read -r -a extra_overrides <<< "$CATK_HYDRA_OVERRIDES"
+  fi
+  if (( ${#extra_overrides[@]} > 0 )); then
+    validate_strict_batch26_pretrain_overrides "$experiment" "$action" "${extra_overrides[@]}" "$@"
+  else
+    validate_strict_batch26_pretrain_overrides "$experiment" "$action" "$@"
   fi
 
   log "starting SMART NTP H100x4x2 pretrain"
@@ -217,8 +265,7 @@ main() {
   if [[ -n "${CATK_LR:-}" ]]; then
     app_args+=(model.model_config.lr="$CATK_LR")
   fi
-  if [[ -n "${CATK_HYDRA_OVERRIDES:-}" ]]; then
-    read -r -a extra_overrides <<< "$CATK_HYDRA_OVERRIDES"
+  if (( ${#extra_overrides[@]} > 0 )); then
     app_args+=("${extra_overrides[@]}")
   fi
   app_args+=("$@")

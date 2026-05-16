@@ -165,6 +165,12 @@ agent node가 같은 map feature를 참조한다. 지도 자체는 시간에 따
 light처럼 시간 의존적인 값은 map-agent edge feature로 들어가므로, 이 방식은 objective를
 바꾸지 않으면서 H100x4x2 batch 26 학습의 map-agent attention 메모리 사용량을 줄인다.
 
+이 launcher와 내부 실행 스크립트는 `pre_bc_h100x4x2` fit 실행에서
+`data.train_batch_size=26`, `trainer.accumulate_grad_batches=1`을 강제한다. 따라서
+`--train-batch-size 2`, `--accumulate-grad-batches 13`,
+`--extra-hydra-overrides 'data.train_batch_size=2 ...'`처럼 공정비교 batch 조건을 깨는
+override가 들어오면 학습을 시작하기 전에 실패한다.
+
 기본 cache root는 pod별로 다르다.
 
 - `hsb-npc-training`: `/mnt/nuplan/womd_v1_3/SMART_cache`
