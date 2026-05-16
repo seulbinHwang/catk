@@ -23,12 +23,13 @@ model:
       temp: 1.0
     sim_agents_submission:
       is_active: true
-      method_name: "SMART-tiny-CLSFT"
-      authors: [Anonymous]
-      affiliation: YOUR_AFFILIATION
-      description: YOUR_DESCRIPTION
-      method_link: YOUR_METHOD_LINK
-      account_name: YOUR_ACCOUNT_NAME
+      method_name: "SMART-NTP-7M"
+      authors: [Seulbin Hwang, Kiyoung Om]
+      affiliation: NaverLabs
+      description: Next-token prediction baseline for simulating realistic agents.
+      method_link: "not available yet"
+      account_name: "h.sb@naverlabs.com"
+      num_model_parameters: "7M"
 
 ckpt_path: YOUR_MODEL.ckpt
 
@@ -36,12 +37,16 @@ trainer:
   limit_train_batches: 1.0
   limit_val_batches: 1.0
   limit_test_batches: 1.0
-  check_val_every_n_epoch: 16
+  check_val_every_n_epoch: 2
+  precision: bf16-mixed
+  gradient_clip_val: 5.0
 
 data:
-  train_batch_size: 16
-  val_batch_size: 16
-  test_batch_size: 16
-  num_workers: 16
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 8
+  num_workers: 4
+  prefetch_factor: 1
   shuffle: false
-  pin_memory: false
+  pin_memory: true
+  persistent_workers: true

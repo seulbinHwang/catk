@@ -5,12 +5,12 @@ wandb:
   name: ${task_name}
   save_dir: "${paths.output_dir}"
   offline: False
-  id: null # pass correct id to resume experiment!
-  anonymous: null # enable anonymous logging
-  project: clsft-catk
-  log_model: False # upload lightning ckpts
-  prefix: "" # a string to put at the beginning of metric keys
-  entity: null # null이면 wandb 기본 entity (보통 사용자 본인)를 사용. 팀 entity로 보내려면 logger.wandb.entity=<id>로 override.
+  id: null # 같은 실험을 이어서 기록하려면 올바른 id를 넘긴다.
+  anonymous: null # 익명 logging을 켜려면 설정한다.
+  project: SMART-FLOW
+  log_model: all # Lightning checkpoint를 W&B model artifact로 업로드한다.
+  prefix: "" # metric key 앞에 붙일 문자열
+  entity: jksg01019-naver-labs
   group: ""
   tags: []
   job_type: ""
