@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from src.smart.modules.flow_agent_decoder import SMARTFlowAgentDecoder
+from src.smart.modules.kinematic_control import CYCLIST_TYPE_ID, VEHICLE_TYPE_ID
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 
 
@@ -43,6 +44,11 @@ def _build_control_target_processor() -> FlowTokenProcessor:
     processor.control_cyclist_yaw_scale_rad = 0.06
     processor.control_vehicle_no_slip_point_ratio = 0.0
     processor.control_cyclist_no_slip_point_ratio = 0.0
+    # 합성 testbed의 큰 teleport가 0.5초 substep alignment에서 6m+ distortion을 만들 수
+    # 있으므로 기본 fixture는 filter를 꺼둡니다. 개별 filter 테스트에서만 켭니다.
+    processor.control_alignment_filter_enabled = False
+    processor.control_alignment_filter_vehicle_max_error_m = 6.0
+    processor.control_alignment_filter_cyclist_max_error_m = 2.2
 
     def match_from_passed_trajectory(valid, pos, heading, agent_type, agent_shape):
         coarse_steps = list(range(processor.shift, valid.shape[1], processor.shift))
@@ -287,6 +293,80 @@ def test_pedestrian_control_flow_keeps_valid_midsteps_before_invalid_endpoint() 
     anchor2_idx = active_anchor_offsets.index(2)
     expected_mask = torch.tensor([True] * 4 + [False] * 16)
     assert torch.equal(flow_train_loss_mask[anchor2_idx].cpu(), expected_mask)
+
+
+def test_control_alignment_filter_thresholds_per_agent_type() -> None:
+    """vehicle/cyclist max-error threshold가 type별로 다르게 적용되는지 직접 확인합니다."""
+    processor = _build_control_target_processor()
+    processor.control_alignment_filter_enabled = True
+    processor.control_alignment_filter_vehicle_max_error_m = 6.0
+    processor.control_alignment_filter_cyclist_max_error_m = 2.2
+
+    # 3개 agent: cyclist(>2.2m), vehicle(<6m), cyclist(<2.2m).
+    raw_pos = torch.zeros((3, 30, 2), dtype=torch.float32)
+    aligned_pos = raw_pos.clone()
+    # 모든 agent에 raw_step=10 이후 distortion을 직접 주입합니다.
+    aligned_pos[0, 11:31, 0] = 3.0  # 3m: cyclist 2.2m 기준 초과
+    aligned_pos[1, 11:31, 0] = 3.0  # 3m: vehicle 6.0m 기준 이내
+    aligned_pos[2, 11:31, 0] = 1.5  # 1.5m: cyclist 2.2m 기준 이내
+    agent_type = torch.tensor(
+        [CYCLIST_TYPE_ID, VEHICLE_TYPE_ID, CYCLIST_TYPE_ID], dtype=torch.long
+    )
+    future_loss_mask = torch.ones((3, 20), dtype=torch.bool)
+
+    mask = processor._build_control_alignment_filter_mask(
+        raw_pos=raw_pos,
+        aligned_pos=aligned_pos,
+        agent_type=agent_type,
+        raw_step=10,
+        future_loss_mask=future_loss_mask,
+    )
+
+    assert mask.tolist() == [False, True, True]
+
+
+def test_control_alignment_filter_disabled_keeps_all_anchors() -> None:
+    """enabled=false면 distortion이 커도 anchor를 그대로 둡니다."""
+    processor = _build_control_target_processor()
+    processor.control_alignment_filter_enabled = False
+
+    raw_pos = torch.zeros((1, 30, 2), dtype=torch.float32)
+    aligned_pos = raw_pos.clone()
+    aligned_pos[0, 11:31, 0] = 100.0  # 100m: 모든 기본 기준 초과
+    agent_type = torch.tensor([VEHICLE_TYPE_ID], dtype=torch.long)
+    future_loss_mask = torch.ones((1, 20), dtype=torch.bool)
+
+    mask = processor._build_control_alignment_filter_mask(
+        raw_pos=raw_pos,
+        aligned_pos=aligned_pos,
+        agent_type=agent_type,
+        raw_step=10,
+        future_loss_mask=future_loss_mask,
+    )
+
+    assert mask.tolist() == [True]
+
+
+def test_control_alignment_filter_ignores_pedestrian() -> None:
+    """pedestrian/holonomic target은 raw GT를 그대로 쓰므로 filter에서 무한대 기준을 받습니다."""
+    processor = _build_control_target_processor()
+    processor.control_alignment_filter_enabled = True
+
+    raw_pos = torch.zeros((1, 30, 2), dtype=torch.float32)
+    aligned_pos = raw_pos.clone()
+    aligned_pos[0, 11:31, 0] = 1000.0  # 비현실적인 distortion이라도 통과시켜야 합니다.
+    agent_type = torch.ones((1,), dtype=torch.long)  # PEDESTRIAN_TYPE_ID
+    future_loss_mask = torch.ones((1, 20), dtype=torch.bool)
+
+    mask = processor._build_control_alignment_filter_mask(
+        raw_pos=raw_pos,
+        aligned_pos=aligned_pos,
+        agent_type=agent_type,
+        raw_step=10,
+        future_loss_mask=future_loss_mask,
+    )
+
+    assert mask.tolist() == [True]
 
 
 def test_anchor_context_uses_mask_width_and_ignores_extra_tail_context() -> None:
