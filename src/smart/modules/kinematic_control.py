@@ -714,8 +714,10 @@ def build_transition_aligned_control_trajectory(
             vehicle/cyclist no-slip point offset ratio가 0보다 클 때 씁니다.
         current_step: raw 관측 현재 시점입니다. 이 시점까지는 raw 상태를 보존하고,
             이후 step만 kinematic transition으로 실행한 상태로 대체합니다.
-        commit_steps: endpoint control을 만들 raw step 간격입니다. 기본값 5는
-            10Hz cache 기준 0.5초입니다. block 내부 0.1초 상태는 substep 실행으로 채웁니다.
+        commit_steps: vehicle/cyclist endpoint control을 만들 raw step 간격입니다.
+            기본값 5는 10Hz cache 기준 0.5초입니다. block 내부 0.1초 상태는
+            vehicle/cyclist에 대해서만 substep 실행으로 채웁니다. holonomic agent는
+            raw 0.1초 GT를 그대로 따라가는 per-step control을 씁니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
@@ -800,17 +802,14 @@ def build_transition_aligned_control_trajectory(
         )
         nonhol_sub_control = block_control / float(block_len)
 
-        for sub_idx, raw_step in enumerate(range(block_start + 1, block_end + 1), start=1):
+        for raw_step in range(block_start + 1, block_end + 1):
             step_control = nonhol_sub_control
             if bool(holonomic_mask.any().item()):
-                fraction = float(sub_idx) / float(block_len)
-                interp_pos = block_start_pos + fraction * (target_pos - block_start_pos)
-                interp_head = wrap_angle(block_start_head + fraction * block_control[:, 2])
                 holonomic_control = _inverse_control_step(
                     source_pos=roll_pos,
                     source_head=roll_head,
-                    target_pos=interp_pos,
-                    target_head=interp_head,
+                    target_pos=pos[:, raw_step],
+                    target_head=heading[:, raw_step],
                     holonomic_mask=torch.ones_like(holonomic_mask),
                     no_slip_offset=torch.zeros_like(no_slip_offset),
                 )
@@ -827,6 +826,9 @@ def build_transition_aligned_control_trajectory(
                 holonomic_mask=holonomic_mask,
                 no_slip_offset=no_slip_offset,
             )
+            if bool(holonomic_mask.any().item()):
+                roll_pos = torch.where(holonomic_mask.unsqueeze(-1), pos[:, raw_step], roll_pos)
+                roll_head = torch.where(holonomic_mask, heading[:, raw_step], roll_head)
             aligned_pos[:, raw_step] = roll_pos
             aligned_heading[:, raw_step] = roll_head
             step_control_norm = step_control.clone()

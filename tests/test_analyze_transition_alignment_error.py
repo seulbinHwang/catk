@@ -237,3 +237,38 @@ def test_analyze_record_masks_invalid_block_endpoint_pollution() -> None:
     summary_off = summarize_stats(analyze_record(record, cfg_off), cfg_off)
     assert summary_off["vehicle"]["step_error"]["count"] > summary["vehicle"]["step_error"]["count"]
     assert summary_off["vehicle"]["step_error"]["max_m"] > 100.0
+
+
+def test_analyze_record_does_not_mask_pedestrian_valid_midsteps_before_invalid_endpoint() -> None:
+    pos = np.full((1, 11, 2), 1000.0, dtype=np.float32)
+    pos[0, 1:5, 1] = np.arange(1, 5, dtype=np.float32)
+    pos[0, 5] = 0.0
+    heading = np.zeros((1, 11), dtype=np.float32)
+    valid = np.ones((1, 11), dtype=bool)
+    valid[0, 5] = False
+    record = {
+        "pos": pos,
+        "heading": heading,
+        "valid": valid,
+        "vel": np.zeros((1, 11, 2), dtype=np.float32),
+        "type": np.array([1], dtype=np.int16),
+        "length": np.array([0.8], dtype=np.float32),
+        "shape": np.array([[0.8, 0.8, 1.7]], dtype=np.float32),
+    }
+    cfg = AlignmentStatsConfig(
+        current_step=0,
+        commit_steps=5,
+        flow_window_steps=5,
+        num_anchors=2,
+        max_future_steps=10,
+        vehicle_no_slip_point_ratio=0.0,
+        cyclist_no_slip_point_ratio=0.0,
+        hist_bins=2000,
+        hist_max_error_m=2000.0,
+        mask_by_aligned_substep_validity=True,
+    )
+
+    summary = summarize_stats(analyze_record(record, cfg), cfg)
+
+    assert summary["pedestrian"]["step_error"]["count"] == 9
+    assert summary["pedestrian"]["step_error"]["max_m"] == 0.0

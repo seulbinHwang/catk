@@ -11,6 +11,7 @@ from src.smart.modules.kinematic_control import (
     DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
     DEFAULT_CONTROL_POS_SCALE_M,
     DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    PEDESTRIAN_TYPE_ID,
     POSE_FLOW_DIM,
     build_transition_aligned_control_trajectory,
     compute_aligned_substep_validity,
@@ -154,6 +155,15 @@ class FlowTokenProcessor(TokenProcessor):
                 current_step=self.shift * 2,
                 commit_steps=self.shift,
             )
+            holonomic_target_mask = tokenized_agent["type"].to(device=valid.device) == PEDESTRIAN_TYPE_ID
+            if self.use_holonomic_model_only:
+                holonomic_target_mask = torch.ones_like(holonomic_target_mask)
+            if bool(holonomic_target_mask.any().item()):
+                aligned_substep_valid = torch.where(
+                    holonomic_target_mask.unsqueeze(1),
+                    valid,
+                    aligned_substep_valid,
+                )
             tokenized_agent.update(
                 self._match_agent_token(
                     valid=valid,

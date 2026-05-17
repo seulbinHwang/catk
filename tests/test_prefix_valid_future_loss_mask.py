@@ -258,6 +258,37 @@ def test_control_flow_loss_mask_excludes_substeps_with_invalid_block_endpoint() 
     del raw_steps
 
 
+def test_pedestrian_control_flow_keeps_valid_midsteps_before_invalid_endpoint() -> None:
+    """Pedestrian은 raw 0.1s holonomic target이므로 invalid endpoint 오염 전파를 받지 않습니다."""
+    processor = _build_control_target_processor()
+    tokenized_agent = {
+        "type": torch.ones((1,), dtype=torch.long),  # pedestrian
+        "shape": torch.tensor([[0.8, 0.8, 1.7]], dtype=torch.float32),
+        "token_agent_shape": torch.tensor([[1.0, 1.0]], dtype=torch.float32),
+    }
+    processed_agent = _build_processed_agent_for_full_womd_horizon()
+    processed_agent["pos"][0, :, 0] = 1000.0
+    processed_agent["pos"][0, 21:25, 1] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    processed_agent["pos"][0, 25] = torch.tensor([0.0, 0.0])  # placeholder
+    processed_agent["valid"][0, 25] = False
+
+    out = processor._build_flow_targets(
+        data={"agent": {}},
+        tokenized_agent=tokenized_agent,
+        processed_agent=processed_agent,
+    )
+
+    flow_train_mask = out["flow_train_mask"]
+    flow_train_loss_mask = out["flow_train_loss_mask"]
+    active_anchor_offsets = [i for i in range(16) if bool(flow_train_mask[0, i])]
+
+    assert 3 not in active_anchor_offsets  # raw_step=25 current itself is invalid.
+    assert 2 in active_anchor_offsets  # raw_step=20 keeps valid raw steps 21..24.
+    anchor2_idx = active_anchor_offsets.index(2)
+    expected_mask = torch.tensor([True] * 4 + [False] * 16)
+    assert torch.equal(flow_train_loss_mask[anchor2_idx].cpu(), expected_mask)
+
+
 def test_anchor_context_uses_mask_width_and_ignores_extra_tail_context() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     encoded = torch.arange(2 * 18 * 3, dtype=torch.float32).view(2, 18, 3)

@@ -389,16 +389,17 @@ def test_transition_aligned_vehicle_uses_block_endpoint_substeps() -> None:
     torch.testing.assert_close(control_norm_by_step[0, 1:6, 1], torch.zeros(5))
 
 
-def test_transition_aligned_pedestrian_interpolates_block_endpoint() -> None:
+def test_transition_aligned_pedestrian_keeps_raw_per_step_path() -> None:
     pos = torch.zeros((1, 6, 2), dtype=torch.float32)
     pos[0, 1:5, 0] = -3.0
     pos[0, 1:5, 1] = 7.0
     pos[0, 5] = torch.tensor([5.0, 5.0])
     heading = torch.zeros((1, 6), dtype=torch.float32)
+    heading[0, 1:5] = torch.tensor([0.2, -0.1, 0.3, -0.2])
     heading[0, 5] = 0.5
     agent_type = torch.tensor([PEDESTRIAN_TYPE_ID])
 
-    aligned_pos, aligned_head, _ = build_transition_aligned_control_trajectory(
+    aligned_pos, aligned_head, control_norm_by_step = build_transition_aligned_control_trajectory(
         pos=pos,
         heading=heading,
         agent_type=agent_type,
@@ -407,10 +408,9 @@ def test_transition_aligned_pedestrian_interpolates_block_endpoint() -> None:
         **CONTROL_YAW_SCALE_KWARGS,
     )
 
-    expected_xy = torch.arange(1, 6, dtype=torch.float32).unsqueeze(-1).repeat(1, 2)
-    expected_head = torch.linspace(0.1, 0.5, 5)
-    torch.testing.assert_close(aligned_pos[0, 1:6], expected_xy, atol=1.0e-5, rtol=1.0e-5)
-    torch.testing.assert_close(aligned_head[0, 1:6], expected_head, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(aligned_pos, pos, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(aligned_head, heading, atol=1.0e-5, rtol=1.0e-5)
+    assert torch.any(control_norm_by_step[0, 1:5, 1].abs() > 1.0e-6)
 
 
 def test_pedestrian_uses_pedestrian_type_id_constant() -> None:

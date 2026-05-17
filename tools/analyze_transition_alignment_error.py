@@ -285,17 +285,14 @@ def transition_aligned_position_error(
         )
         nonhol_sub_control = block_control / float(block_len)
 
-        for sub_idx, raw_step in enumerate(range(block_start + 1, block_end + 1), start=1):
+        for raw_step in range(block_start + 1, block_end + 1):
             step_control = nonhol_sub_control
             if np.any(holonomic_mask):
-                fraction = float(sub_idx) / float(block_len)
-                interp_pos = block_start_pos + fraction * (target_pos - block_start_pos)
-                interp_head = wrap_angle(block_start_head + fraction * block_control[:, 2])
                 holonomic_control = _inverse_control_step_np(
                     source_pos=roll_pos,
                     source_head=roll_head,
-                    target_pos=interp_pos,
-                    target_head=interp_head,
+                    target_pos=pos[:, raw_step].astype(np.float32, copy=False),
+                    target_head=heading[:, raw_step].astype(np.float32, copy=False),
                     holonomic_mask=np.ones_like(holonomic_mask, dtype=bool),
                     no_slip_offset=np.zeros_like(no_slip_offset),
                 )
@@ -308,6 +305,15 @@ def transition_aligned_position_error(
                 holonomic_mask=holonomic_mask,
                 no_slip_offset=no_slip_offset,
             )
+            if np.any(holonomic_mask):
+                roll_pos = np.where(holonomic_mask[:, None], pos[:, raw_step], roll_pos).astype(
+                    np.float32,
+                    copy=False,
+                )
+                roll_head = np.where(holonomic_mask, heading[:, raw_step], roll_head).astype(
+                    np.float32,
+                    copy=False,
+                )
             future_idx = raw_step - current_step - 1
             errors[:, future_idx] = np.linalg.norm(roll_pos - pos[:, raw_step], axis=-1)
 
@@ -528,6 +534,15 @@ def analyze_record(record: dict[str, np.ndarray], cfg: AlignmentStatsConfig) -> 
             current_step=int(cfg.current_step),
             commit_steps=int(cfg.commit_steps),
         )
+        holonomic_target_mask = record["type"] == TYPE_IDS["pedestrian"]
+        if cfg.use_holonomic_model_only:
+            holonomic_target_mask = np.ones_like(holonomic_target_mask, dtype=bool)
+        if np.any(holonomic_target_mask):
+            aligned_substep_valid = np.where(
+                holonomic_target_mask[:, None],
+                record["valid"],
+                aligned_substep_valid,
+            )
         aligned_current = aligned_substep_valid[:, int(cfg.current_step)]
         aligned_future = aligned_substep_valid[
             :, int(cfg.current_step) + 1 : int(cfg.current_step) + 1 + errors.shape[1]
