@@ -138,6 +138,7 @@ class FlowTokenProcessor(TokenProcessor):
                 agent_type=tokenized_agent["type"],
                 agent_length=tokenized_agent["shape"][:, 0],
                 current_step=self.shift * 2,
+                commit_steps=self.shift,
                 pos_scale_m=self.control_pos_scale_m,
                 vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
                 pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,

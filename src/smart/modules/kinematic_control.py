@@ -617,6 +617,77 @@ def build_rolling_control_target(
     )
 
 
+def _inverse_control_step(
+    source_pos: Tensor,
+    source_head: Tensor,
+    target_pos: Tensor,
+    target_head: Tensor,
+    holonomic_mask: Tensor,
+    no_slip_offset: Tensor,
+) -> Tensor:
+    delta_head = wrap_angle(target_head - source_head)
+    delta_vec = target_pos - source_pos
+
+    cos_head = source_head.cos()
+    sin_head = source_head.sin()
+    source_heading_vec = torch.stack([cos_head, sin_head], dim=-1)
+    target_heading_vec = torch.stack([target_head.cos(), target_head.sin()], dim=-1)
+
+    ped_delta_s = delta_vec[:, 0] * cos_head + delta_vec[:, 1] * sin_head
+    ped_delta_n = -delta_vec[:, 0] * sin_head + delta_vec[:, 1] * cos_head
+
+    mid_head = source_head + 0.5 * delta_head
+    h_mid = torch.stack([mid_head.cos(), mid_head.sin()], dim=-1)
+    source_no_slip_pos = source_pos - no_slip_offset.unsqueeze(-1) * source_heading_vec
+    target_no_slip_pos = target_pos - no_slip_offset.unsqueeze(-1) * target_heading_vec
+    nonhol_delta_vec = target_no_slip_pos - source_no_slip_pos
+    nonhol_proj = (nonhol_delta_vec * h_mid).sum(dim=-1)
+    nonhol_delta_s = nonhol_proj / safe_sinc(0.5 * delta_head)
+
+    delta_s = torch.where(holonomic_mask, ped_delta_s, nonhol_delta_s)
+    delta_n = torch.where(holonomic_mask, ped_delta_n, torch.zeros_like(ped_delta_n))
+    return torch.stack([delta_s, delta_n, delta_head], dim=-1)
+
+
+def _decode_control_step(
+    source_pos: Tensor,
+    source_head: Tensor,
+    control: Tensor,
+    holonomic_mask: Tensor,
+    no_slip_offset: Tensor,
+) -> tuple[Tensor, Tensor]:
+    delta_s = control[:, 0]
+    delta_n = control[:, 1]
+    delta_head = control[:, 2]
+
+    cos_head = source_head.cos()
+    sin_head = source_head.sin()
+    next_head = wrap_angle(source_head + delta_head)
+    delta_pos_ped = torch.stack(
+        [
+            delta_s * cos_head - delta_n * sin_head,
+            delta_s * sin_head + delta_n * cos_head,
+        ],
+        dim=-1,
+    )
+
+    mid_head = source_head + 0.5 * delta_head
+    arc_scale = delta_s * safe_sinc(0.5 * delta_head)
+    delta_pos_nonhol = torch.stack(
+        [arc_scale * mid_head.cos(), arc_scale * mid_head.sin()],
+        dim=-1,
+    )
+    if bool((no_slip_offset != 0.0).any().item()):
+        current_heading_vec = torch.stack([cos_head, sin_head], dim=-1)
+        next_heading_vec = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+        delta_pos_nonhol = delta_pos_nonhol + no_slip_offset.unsqueeze(-1) * (
+            next_heading_vec - current_heading_vec
+        )
+
+    delta_pos = torch.where(holonomic_mask.unsqueeze(-1), delta_pos_ped, delta_pos_nonhol)
+    return source_pos + delta_pos, next_head
+
+
 def build_transition_aligned_control_trajectory(
     pos: Tensor,
     heading: Tensor,
@@ -624,6 +695,7 @@ def build_transition_aligned_control_trajectory(
     agent_length: Tensor | None = None,
     *,
     current_step: int,
+    commit_steps: int = 5,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
     vehicle_yaw_scale_rad: float,
     pedestrian_yaw_scale_rad: float,
@@ -642,6 +714,8 @@ def build_transition_aligned_control_trajectory(
             vehicle/cyclist no-slip point offset ratio가 0보다 클 때 씁니다.
         current_step: raw 관측 현재 시점입니다. 이 시점까지는 raw 상태를 보존하고,
             이후 step만 kinematic transition으로 실행한 상태로 대체합니다.
+        commit_steps: endpoint control을 만들 raw step 간격입니다. 기본값 5는
+            10Hz cache 기준 0.5초입니다. block 내부 0.1초 상태는 substep 실행으로 채웁니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
@@ -666,12 +740,16 @@ def build_transition_aligned_control_trajectory(
         )
     if tuple(agent_type.shape) != (pos.shape[0],):
         raise ValueError(f"agent_type must have shape [N], got {tuple(agent_type.shape)}.")
+    _validate_agent_type(agent_type)
     current_step = int(current_step)
     if current_step < 0 or current_step >= pos.shape[1]:
         raise ValueError(
             "current_step must be inside the trajectory horizon, "
             f"got current_step={current_step}, n_step={pos.shape[1]}."
         )
+    commit_steps = int(commit_steps)
+    if commit_steps <= 0:
+        raise ValueError(f"commit_steps must be positive, got {commit_steps}.")
 
     aligned_pos = pos.clone()
     aligned_heading = heading.clone()
@@ -679,40 +757,81 @@ def build_transition_aligned_control_trajectory(
     if current_step + 1 >= pos.shape[1]:
         return aligned_pos, aligned_heading, control_norm_by_step
 
-    future_control_norm = build_rolling_control_target(
-        future_pos=pos[:, current_step + 1 :],
-        future_head=heading[:, current_step + 1 :],
-        current_pos=pos[:, current_step],
-        current_head=heading[:, current_step],
+    device = pos.device
+    dtype = pos.dtype
+    agent_type_device = agent_type.to(device=device)
+    holonomic_mask = agent_type_device == PEDESTRIAN_TYPE_ID
+    if use_holonomic_model_only:
+        holonomic_mask = torch.ones_like(holonomic_mask)
+    no_slip_offset = _resolve_no_slip_point_offset(
         agent_type=agent_type,
         agent_length=agent_length,
-        pos_scale_m=pos_scale_m,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+        use_holonomic_model_only=use_holonomic_model_only,
+        dtype=dtype,
+        device=device,
+    )
+    yaw_scale = resolve_control_yaw_scale(
+        agent_type=agent_type,
         vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
-        use_holonomic_model_only=use_holonomic_model_only,
-        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
-        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+        dtype=dtype,
+        device=device,
     )
-    control_norm_by_step[:, current_step + 1 :] = future_control_norm
-    future_control = denormalize_control(
-        control_norm=future_control_norm,
-        pos_scale_m=pos_scale_m,
-        agent_type=agent_type,
-        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
-        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
-        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
-    )
-    future_pos_aligned, future_head_aligned = decode_control_sequence(
-        control=future_control,
-        agent_type=agent_type,
-        agent_length=agent_length,
-        current_pos=pos[:, current_step],
-        current_head=heading[:, current_step],
-        use_holonomic_model_only=use_holonomic_model_only,
-        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
-        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
-    )
-    aligned_pos[:, current_step + 1 :] = future_pos_aligned
-    aligned_heading[:, current_step + 1 :] = future_head_aligned
+
+    roll_pos = pos[:, current_step].clone()
+    roll_head = heading[:, current_step].clone()
+    for block_start in range(current_step, pos.shape[1] - 1, commit_steps):
+        block_end = min(block_start + commit_steps, pos.shape[1] - 1)
+        block_len = block_end - block_start
+        target_pos = pos[:, block_end]
+        target_head = heading[:, block_end]
+        block_start_pos = roll_pos.clone()
+        block_start_head = roll_head.clone()
+        block_control = _inverse_control_step(
+            source_pos=block_start_pos,
+            source_head=block_start_head,
+            target_pos=target_pos,
+            target_head=target_head,
+            holonomic_mask=holonomic_mask,
+            no_slip_offset=no_slip_offset,
+        )
+        nonhol_sub_control = block_control / float(block_len)
+
+        for sub_idx, raw_step in enumerate(range(block_start + 1, block_end + 1), start=1):
+            step_control = nonhol_sub_control
+            if bool(holonomic_mask.any().item()):
+                fraction = float(sub_idx) / float(block_len)
+                interp_pos = block_start_pos + fraction * (target_pos - block_start_pos)
+                interp_head = wrap_angle(block_start_head + fraction * block_control[:, 2])
+                holonomic_control = _inverse_control_step(
+                    source_pos=roll_pos,
+                    source_head=roll_head,
+                    target_pos=interp_pos,
+                    target_head=interp_head,
+                    holonomic_mask=torch.ones_like(holonomic_mask),
+                    no_slip_offset=torch.zeros_like(no_slip_offset),
+                )
+                step_control = torch.where(
+                    holonomic_mask.unsqueeze(-1),
+                    holonomic_control,
+                    nonhol_sub_control,
+                )
+
+            roll_pos, roll_head = _decode_control_step(
+                source_pos=roll_pos,
+                source_head=roll_head,
+                control=step_control,
+                holonomic_mask=holonomic_mask,
+                no_slip_offset=no_slip_offset,
+            )
+            aligned_pos[:, raw_step] = roll_pos
+            aligned_heading[:, raw_step] = roll_head
+            step_control_norm = step_control.clone()
+            step_control_norm[:, :2] = step_control[:, :2] / float(pos_scale_m)
+            step_control_norm[:, 2] = step_control[:, 2] / yaw_scale
+            control_norm_by_step[:, raw_step] = step_control_norm
+
     return aligned_pos, aligned_heading, control_norm_by_step

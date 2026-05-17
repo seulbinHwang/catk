@@ -364,6 +364,54 @@ def test_transition_aligned_trajectory_keeps_history_raw_and_projects_future() -
     torch.testing.assert_close(aligned_head[:, 2:], heading[:, 2:], atol=1.0e-5, rtol=1.0e-5)
 
 
+def test_transition_aligned_vehicle_uses_block_endpoint_substeps() -> None:
+    pos = torch.zeros((1, 6, 2), dtype=torch.float32)
+    pos[0, 1:5, 1] = 10.0
+    pos[0, 5] = torch.tensor([5.0, 0.0])
+    heading = torch.zeros((1, 6), dtype=torch.float32)
+    agent_type = torch.tensor([VEHICLE_TYPE_ID])
+
+    aligned_pos, aligned_head, control_norm_by_step = build_transition_aligned_control_trajectory(
+        pos=pos,
+        heading=heading,
+        agent_type=agent_type,
+        current_step=0,
+        commit_steps=5,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+
+    expected_x = torch.arange(1, 6, dtype=torch.float32)
+    torch.testing.assert_close(aligned_pos[0, 1:6, 0], expected_x)
+    torch.testing.assert_close(aligned_pos[0, 1:6, 1], torch.zeros(5))
+    torch.testing.assert_close(aligned_head[0, 1:6], torch.zeros(5))
+    torch.testing.assert_close(control_norm_by_step[0, 1:6, 0], torch.ones(5))
+    torch.testing.assert_close(control_norm_by_step[0, 1:6, 1], torch.zeros(5))
+
+
+def test_transition_aligned_pedestrian_interpolates_block_endpoint() -> None:
+    pos = torch.zeros((1, 6, 2), dtype=torch.float32)
+    pos[0, 1:5, 0] = -3.0
+    pos[0, 1:5, 1] = 7.0
+    pos[0, 5] = torch.tensor([5.0, 5.0])
+    heading = torch.zeros((1, 6), dtype=torch.float32)
+    heading[0, 5] = 0.5
+    agent_type = torch.tensor([PEDESTRIAN_TYPE_ID])
+
+    aligned_pos, aligned_head, _ = build_transition_aligned_control_trajectory(
+        pos=pos,
+        heading=heading,
+        agent_type=agent_type,
+        current_step=0,
+        commit_steps=5,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+
+    expected_xy = torch.arange(1, 6, dtype=torch.float32).unsqueeze(-1).repeat(1, 2)
+    expected_head = torch.linspace(0.1, 0.5, 5)
+    torch.testing.assert_close(aligned_pos[0, 1:6], expected_xy, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(aligned_head[0, 1:6], expected_head, atol=1.0e-5, rtol=1.0e-5)
+
+
 def test_pedestrian_uses_pedestrian_type_id_constant() -> None:
     assert PEDESTRIAN_TYPE_ID == 1
     assert VEHICLE_TYPE_ID == 0

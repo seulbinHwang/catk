@@ -144,6 +144,93 @@ def preprocess_agent_record(record: dict[str, np.ndarray], cfg: AlignmentStatsCo
     }
 
 
+def _resolve_no_slip_offset_np(
+    agent_type: np.ndarray,
+    agent_length: np.ndarray,
+    cfg: AlignmentStatsConfig,
+) -> np.ndarray:
+    ratio = np.zeros((agent_type.shape[0],), dtype=np.float32)
+    ratio[agent_type == TYPE_IDS["vehicle"]] = float(cfg.vehicle_no_slip_point_ratio)
+    ratio[agent_type == TYPE_IDS["cyclist"]] = float(cfg.cyclist_no_slip_point_ratio)
+    if cfg.use_holonomic_model_only:
+        ratio.fill(0.0)
+    return ratio * agent_length.astype(np.float32, copy=False)
+
+
+def _inverse_control_step_np(
+    source_pos: np.ndarray,
+    source_head: np.ndarray,
+    target_pos: np.ndarray,
+    target_head: np.ndarray,
+    holonomic_mask: np.ndarray,
+    no_slip_offset: np.ndarray,
+) -> np.ndarray:
+    delta_head = wrap_angle(target_head - source_head)
+    delta_vec = target_pos - source_pos
+
+    cos_head = np.cos(source_head)
+    sin_head = np.sin(source_head)
+    source_heading_vec = np.stack([cos_head, sin_head], axis=-1)
+    target_heading_vec = np.stack([np.cos(target_head), np.sin(target_head)], axis=-1)
+
+    ped_delta_s = delta_vec[:, 0] * cos_head + delta_vec[:, 1] * sin_head
+    ped_delta_n = -delta_vec[:, 0] * sin_head + delta_vec[:, 1] * cos_head
+
+    mid_head = source_head + 0.5 * delta_head
+    h_mid = np.stack([np.cos(mid_head), np.sin(mid_head)], axis=-1)
+    source_no_slip_pos = source_pos - no_slip_offset[:, None] * source_heading_vec
+    target_no_slip_pos = target_pos - no_slip_offset[:, None] * target_heading_vec
+    nonhol_delta_vec = target_no_slip_pos - source_no_slip_pos
+    nonhol_proj = np.sum(nonhol_delta_vec * h_mid, axis=-1)
+    nonhol_delta_s = nonhol_proj / safe_sinc(0.5 * delta_head)
+
+    delta_s = np.where(holonomic_mask, ped_delta_s, nonhol_delta_s)
+    delta_n = np.where(holonomic_mask, ped_delta_n, np.zeros_like(ped_delta_n))
+    return np.stack([delta_s, delta_n, delta_head], axis=-1).astype(np.float32, copy=False)
+
+
+def _decode_control_step_np(
+    source_pos: np.ndarray,
+    source_head: np.ndarray,
+    control: np.ndarray,
+    holonomic_mask: np.ndarray,
+    no_slip_offset: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    delta_s = control[:, 0]
+    delta_n = control[:, 1]
+    delta_head = control[:, 2]
+
+    cos_head = np.cos(source_head)
+    sin_head = np.sin(source_head)
+    next_head = wrap_angle(source_head + delta_head)
+    delta_pos_ped = np.stack(
+        [
+            delta_s * cos_head - delta_n * sin_head,
+            delta_s * sin_head + delta_n * cos_head,
+        ],
+        axis=-1,
+    )
+
+    mid_head = source_head + 0.5 * delta_head
+    arc_scale = delta_s * safe_sinc(0.5 * delta_head)
+    delta_pos_nonhol = np.stack(
+        [arc_scale * np.cos(mid_head), arc_scale * np.sin(mid_head)],
+        axis=-1,
+    )
+    if np.any(no_slip_offset != 0.0):
+        current_heading_vec = np.stack([cos_head, sin_head], axis=-1)
+        next_heading_vec = np.stack([np.cos(next_head), np.sin(next_head)], axis=-1)
+        delta_pos_nonhol = delta_pos_nonhol + no_slip_offset[:, None] * (
+            next_heading_vec - current_heading_vec
+        )
+
+    delta_pos = np.where(holonomic_mask[:, None], delta_pos_ped, delta_pos_nonhol)
+    return (
+        (source_pos + delta_pos).astype(np.float32, copy=False),
+        next_head.astype(np.float32, copy=False),
+    )
+
+
 def transition_aligned_position_error(
     pos: np.ndarray,
     heading: np.ndarray,
@@ -158,6 +245,9 @@ def transition_aligned_position_error(
         raise ValueError(f"heading must have shape [N, T], got {heading.shape}.")
     if current_step < 0 or current_step >= pos.shape[1]:
         raise ValueError(f"current_step={current_step} is outside n_step={pos.shape[1]}.")
+    commit_steps = int(cfg.commit_steps)
+    if commit_steps <= 0:
+        raise ValueError(f"commit_steps must be positive, got {commit_steps}.")
 
     num_agent = pos.shape[0]
     future_len = pos.shape[1] - current_step - 1
@@ -169,44 +259,56 @@ def transition_aligned_position_error(
     holonomic_mask = agent_type == TYPE_IDS["pedestrian"]
     if cfg.use_holonomic_model_only:
         holonomic_mask = np.ones_like(holonomic_mask, dtype=bool)
-
-    ratio = np.zeros((num_agent,), dtype=np.float32)
-    ratio[agent_type == TYPE_IDS["vehicle"]] = float(cfg.vehicle_no_slip_point_ratio)
-    ratio[agent_type == TYPE_IDS["cyclist"]] = float(cfg.cyclist_no_slip_point_ratio)
-    if cfg.use_holonomic_model_only:
-        ratio.fill(0.0)
-    no_slip_offset = ratio * agent_length.astype(np.float32, copy=False)
+    no_slip_offset = _resolve_no_slip_offset_np(
+        agent_type=agent_type,
+        agent_length=agent_length,
+        cfg=cfg,
+    )
 
     errors = np.zeros((num_agent, future_len), dtype=np.float32)
-    for future_idx, raw_step in enumerate(range(current_step + 1, pos.shape[1])):
-        target_pos = pos[:, raw_step]
-        target_head = heading[:, raw_step]
-        source_pos = roll_pos
-        source_head = roll_head
-        delta_head = wrap_angle(target_head - source_head)
 
-        cos_head = np.cos(source_head)
-        sin_head = np.sin(source_head)
-        source_heading_vec = np.stack([cos_head, sin_head], axis=-1)
-        target_heading_vec = np.stack([np.cos(target_head), np.sin(target_head)], axis=-1)
-
-        mid_head = source_head + 0.5 * delta_head
-        h_mid = np.stack([np.cos(mid_head), np.sin(mid_head)], axis=-1)
-        source_no_slip_pos = source_pos - no_slip_offset[:, None] * source_heading_vec
-        target_no_slip_pos = target_pos - no_slip_offset[:, None] * target_heading_vec
-        nonhol_delta_vec = target_no_slip_pos - source_no_slip_pos
-        nonhol_proj = np.sum(nonhol_delta_vec * h_mid, axis=-1)
-        nonhol_next_pos = (
-            source_pos
-            + nonhol_proj[:, None] * h_mid
-            + no_slip_offset[:, None] * (target_heading_vec - source_heading_vec)
+    for block_start in range(current_step, pos.shape[1] - 1, commit_steps):
+        block_end = min(block_start + commit_steps, pos.shape[1] - 1)
+        block_len = block_end - block_start
+        target_pos = pos[:, block_end].astype(np.float32, copy=False)
+        target_head = heading[:, block_end].astype(np.float32, copy=False)
+        block_start_pos = roll_pos.copy()
+        block_start_head = roll_head.copy()
+        block_control = _inverse_control_step_np(
+            source_pos=block_start_pos,
+            source_head=block_start_head,
+            target_pos=target_pos,
+            target_head=target_head,
+            holonomic_mask=holonomic_mask,
+            no_slip_offset=no_slip_offset,
         )
+        nonhol_sub_control = block_control / float(block_len)
 
-        next_pos = np.where(holonomic_mask[:, None], target_pos, nonhol_next_pos)
-        next_head = wrap_angle(source_head + delta_head)
-        errors[:, future_idx] = np.linalg.norm(next_pos - target_pos, axis=-1)
-        roll_pos = next_pos.astype(np.float32, copy=False)
-        roll_head = next_head.astype(np.float32, copy=False)
+        for sub_idx, raw_step in enumerate(range(block_start + 1, block_end + 1), start=1):
+            step_control = nonhol_sub_control
+            if np.any(holonomic_mask):
+                fraction = float(sub_idx) / float(block_len)
+                interp_pos = block_start_pos + fraction * (target_pos - block_start_pos)
+                interp_head = wrap_angle(block_start_head + fraction * block_control[:, 2])
+                holonomic_control = _inverse_control_step_np(
+                    source_pos=roll_pos,
+                    source_head=roll_head,
+                    target_pos=interp_pos,
+                    target_head=interp_head,
+                    holonomic_mask=np.ones_like(holonomic_mask, dtype=bool),
+                    no_slip_offset=np.zeros_like(no_slip_offset),
+                )
+                step_control = np.where(holonomic_mask[:, None], holonomic_control, nonhol_sub_control)
+
+            roll_pos, roll_head = _decode_control_step_np(
+                source_pos=roll_pos,
+                source_head=roll_head,
+                control=step_control,
+                holonomic_mask=holonomic_mask,
+                no_slip_offset=no_slip_offset,
+            )
+            future_idx = raw_step - current_step - 1
+            errors[:, future_idx] = np.linalg.norm(roll_pos - pos[:, raw_step], axis=-1)
 
     return errors
 
@@ -669,8 +771,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Measure raw-vs-transition-aligned position error over WOMD SMART cache. "
-            "The tool mirrors the use_kinematic_control_flow=True target preprocessing "
-            "without modifying cache files."
+            "The tool mirrors the use_kinematic_control_flow=True 0.5s endpoint + "
+            "kinematic substep preprocessing without modifying cache files."
         )
     )
     parser.add_argument(
@@ -690,7 +792,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--progress-interval", type=int, default=10_000)
     parser.add_argument("--current-step", type=int, default=10)
-    parser.add_argument("--commit-steps", type=int, default=5)
+    parser.add_argument("--commit-steps", type=int, default=5, help="Raw 10Hz steps per endpoint commit.")
     parser.add_argument("--flow-window-steps", type=int, default=20)
     parser.add_argument("--num-anchors", type=int, default=16)
     parser.add_argument("--max-future-steps", type=int, default=80)
