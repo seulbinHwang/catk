@@ -500,6 +500,7 @@ torchrun ... -m src.run \
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
 - `model.model_config.token_processor.use_holonomic_model_only=true`를 켜면 ablation용으로 vehicle / cyclist에도 pedestrian과 같은 holonomic decoder를 적용합니다. 이때 vehicle / cyclist의 `delta_n`도 학습 target과 rollout 복원에 사용됩니다. 기본값 `false`는 기존 agent-type-aware non-holonomic/holonomic 혼합 방식입니다.
 - `use_kinematic_control_flow=true`에서는 관측 history와 현재 시작 pose는 raw GT를 유지하고, 현재 이후 future만 inference와 같은 kinematic transition으로 한 번 실행해 transition-aligned trajectory를 만듭니다. 각 anchor의 context position/heading, motion token, future control target, open-loop metric target은 모두 이 같은 궤적에서 잘라 씁니다. 따라서 target에만 별도로 rolling projection을 다시 적용하지 않습니다.
+- 학습에서는 `control_alignment_filter.enabled=true`가 기본으로 켜져 있습니다. 이 필터는 vehicle/cyclist를 holonomic으로 바꾸지 않고 non-holonomic control target을 그대로 유지하되, raw GT와 transition-aligned trajectory의 위치 차이가 너무 큰 학습 anchor만 loss에서 제외합니다. 기본 기준은 vehicle `5.0m`, cyclist `2.0m`입니다. pedestrian은 holonomic이라 별도 기준을 두지 않습니다. 이 필터는 학습 target 선택에만 적용되며 validation, closed-loop rollout, fast RMM, WOSAC 제출물 생성의 평가 agent 선택은 바꾸지 않습니다.
 - transition-aligned trajectory가 raw GT future를 얼마나 왜곡하는지 확인하려면 아래 도구를 먼저 돌립니다. 이 도구는 SMART cache를 읽기만 하며, cache 생성 로직이나 cache 파일은 바꾸지 않습니다. token processor와 같은 heading clean / 이전 token step extrapolation을 적용한 뒤 raw step `10` 이후의 raw 위치와 transition-aligned 위치 사이의 L2 오차를 집계합니다. worker는 여러 pkl을 chunk 단위로 합산한 뒤 histogram만 반환하므로, 전체 training split 전수 분석에서도 IPC 비용이 작습니다.
 
 ```bash
@@ -513,6 +514,7 @@ python tools/analyze_transition_alignment_error.py \
 ```
 
   주요 출력은 세 가지입니다. `step_error`는 current 이후 유효한 모든 10Hz future step의 raw-vs-aligned 위치 오차 분포이고, `agent_max_error`는 agent별 future 전체의 최대 오차이며, `anchor_window_max_error`는 실제 Flow 학습 anchor window 안에서 loss에 들어가는 step들의 최대 오차입니다. 기본값은 현재 control-space preset과 맞춘 `vehicle_no_slip_point_ratio=0.2289518863`, `cyclist_no_slip_point_ratio=0.0495847873`, `anchor_valid_mode=prefix`입니다. `all / vehicle / pedestrian / cyclist`별 p50/p90/p99/p99.9, threshold 초과율, horizon별 mean/max를 JSON에 저장합니다. `heuristic_status=warn`은 보수적인 sanity flag일 뿐이고, 최종 판단은 type별 tail과 threshold 초과율을 보고 정합니다. 특히 vehicle/cyclist의 `anchor_window_max_error` p99나 `>1m` 비율이 크면 transition-aligned supervision이 raw 궤적을 과하게 왜곡한다는 신호이므로 no-slip ratio, holonomic ablation, 또는 이 방식 자체를 재검토해야 합니다.
+- `control_alignment_filter`는 위 분석에서 확인된 tail outlier를 학습에서만 막는 안전장치입니다. 예를 들어 cyclist의 `anchor_window_max_error` p99가 `0.691m` 수준이면 `2.0m` 기준은 대부분의 정상 cyclist anchor를 유지하면서 수십 meter급 GT jump만 제거합니다. 기준을 비교하려면 `model.model_config.token_processor.control_alignment_filter.cyclist_max_error_m=1.0`처럼 override해서 ablation합니다.
 - `model.model_config.token_processor.control_vehicle_no_slip_point_ratio`와 `model.model_config.token_processor.control_cyclist_no_slip_point_ratio`는 vehicle / cyclist의 non-holonomic 제약을 box center가 아니라 box center 뒤쪽의 effective no-slip point에 적용합니다. offset은 각 agent type별로 `ratio * WOMD box length`이며, 최종 metric/rollout pose는 여전히 box center로 복원됩니다. 기본값은 전체 SMART cache training split에서 추정한 `vehicle=0.2289518863`, `cyclist=0.0495847873`입니다. 이 값으로 validation residual median은 vehicle `0.0958m -> 0.0203m`, cyclist `0.0222m -> 0.0213m`로 줄었습니다. 두 값을 모두 `0.0`으로 두면 기존 box-center midpoint arc rule과 같은 동작입니다. pedestrian과 `use_holonomic_model_only=true` 경로에서는 이 값이 적용되지 않습니다. 학습 target 생성과 decoder rollout은 이 token processor 값을 단일 기준으로 공유하므로, decoder 쪽 동일 key만 따로 다르게 override하면 실행 초기에 에러를 냅니다.
 - 실제 cache에서 no-slip point ratio를 추정하려면 아래 도구를 씁니다. `CACHE_ROOT`는 README의 cache 생성 절차에서 쓰는 동일한 경로이며, fitting은 training split만 사용하고 validation split은 residual 개선율 확인에만 사용합니다.
 
@@ -552,6 +554,10 @@ model:
       control_pos_scale_m: 1.0
       control_vehicle_no_slip_point_ratio: 0.2289518863
       control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_alignment_filter:
+        enabled: true
+        vehicle_max_error_m: 5.0
+        cyclist_max_error_m: 2.0
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20
       control_cyclist_yaw_scale_rad: 0.06

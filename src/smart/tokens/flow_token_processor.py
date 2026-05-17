@@ -8,10 +8,12 @@ from torch_geometric.data import HeteroData
 
 from src.smart.modules.kinematic_control import (
     CONTROL_FLOW_DIM,
+    CYCLIST_TYPE_ID,
     DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
     DEFAULT_CONTROL_POS_SCALE_M,
     DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
     POSE_FLOW_DIM,
+    VEHICLE_TYPE_ID,
     build_transition_aligned_control_trajectory,
     validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
@@ -22,6 +24,11 @@ from src.smart.utils import transform_to_local, validate_flow_window_steps
 
 FLOW_CONTEXT_TOKEN_COUNT = 18
 FLOW_TRAIN_ANCHOR_COUNT = 16
+DEFAULT_CONTROL_ALIGNMENT_FILTER_CONFIG = {
+    "enabled": True,
+    "vehicle_max_error_m": 5.0,
+    "cyclist_max_error_m": 2.0,
+}
 
 
 class FlowTokenProcessor(TokenProcessor):
@@ -43,6 +50,7 @@ class FlowTokenProcessor(TokenProcessor):
         control_cyclist_yaw_scale_rad: float | None = None,
         control_vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
         control_cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
+        control_alignment_filter: Dict[str, object] | None = None,
     ) -> None:
         super().__init__(
             map_token_file=map_token_file,
@@ -58,6 +66,22 @@ class FlowTokenProcessor(TokenProcessor):
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.use_holonomic_model_only = bool(use_holonomic_model_only)
         self.control_pos_scale_m = float(control_pos_scale_m)
+        filter_config = dict(DEFAULT_CONTROL_ALIGNMENT_FILTER_CONFIG)
+        if control_alignment_filter is not None:
+            filter_config.update(dict(control_alignment_filter))
+        self.control_alignment_filter_enabled = bool(filter_config["enabled"])
+        self.control_alignment_filter_vehicle_max_error_m = float(filter_config["vehicle_max_error_m"])
+        self.control_alignment_filter_cyclist_max_error_m = float(filter_config["cyclist_max_error_m"])
+        if self.control_alignment_filter_vehicle_max_error_m <= 0.0:
+            raise ValueError(
+                "control_alignment_filter.vehicle_max_error_m must be positive, "
+                f"got {self.control_alignment_filter_vehicle_max_error_m}."
+            )
+        if self.control_alignment_filter_cyclist_max_error_m <= 0.0:
+            raise ValueError(
+                "control_alignment_filter.cyclist_max_error_m must be positive, "
+                f"got {self.control_alignment_filter_cyclist_max_error_m}."
+            )
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
         self.control_cyclist_yaw_scale_rad = control_cyclist_yaw_scale_rad
@@ -195,7 +219,14 @@ class FlowTokenProcessor(TokenProcessor):
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
                 future_loss_mask = self._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
-                anchor_mask = current_valid & future_loss_mask.any(dim=1)
+                alignment_filter_mask = self._build_control_alignment_filter_mask(
+                    raw_pos=pos,
+                    aligned_pos=target_pos,
+                    agent_type=tokenized_agent["type"],
+                    raw_step=raw_step,
+                    future_loss_mask=future_loss_mask,
+                )
+                anchor_mask = current_valid & future_loss_mask.any(dim=1) & alignment_filter_mask
                 train_anchor_mask = anchor_mask & train_mask
                 if not train_anchor_mask.any():
                     continue
@@ -352,6 +383,46 @@ class FlowTokenProcessor(TokenProcessor):
             }
         )
         return tokenized_agent
+
+    def _build_control_alignment_filter_mask(
+        self,
+        raw_pos: Tensor,
+        aligned_pos: Tensor,
+        agent_type: Tensor,
+        raw_step: int,
+        future_loss_mask: Tensor,
+    ) -> Tensor:
+        """raw와 aligned 위치 차이가 너무 큰 control-space 학습 anchor를 제외합니다."""
+        if not self.use_kinematic_control_flow or not getattr(self, "control_alignment_filter_enabled", True):
+            return torch.ones(raw_pos.shape[0], device=raw_pos.device, dtype=torch.bool)
+
+        future_start = int(raw_step) + 1
+        available_len = min(
+            int(self.flow_window_steps),
+            max(0, raw_pos.shape[1] - future_start),
+            max(0, aligned_pos.shape[1] - future_start),
+            future_loss_mask.shape[1],
+        )
+        if available_len <= 0:
+            return torch.ones(raw_pos.shape[0], device=raw_pos.device, dtype=torch.bool)
+
+        step_mask = future_loss_mask[:, :available_len].to(device=raw_pos.device, dtype=torch.bool)
+        error = torch.linalg.vector_norm(
+            aligned_pos[:, future_start : future_start + available_len]
+            - raw_pos[:, future_start : future_start + available_len],
+            dim=-1,
+        )
+        max_error = error.masked_fill(~step_mask, -torch.inf).amax(dim=1)
+
+        threshold = raw_pos.new_full((raw_pos.shape[0],), torch.inf)
+        agent_type_device = agent_type.to(device=raw_pos.device)
+        threshold[agent_type_device == VEHICLE_TYPE_ID] = float(
+            getattr(self, "control_alignment_filter_vehicle_max_error_m", 5.0)
+        )
+        threshold[agent_type_device == CYCLIST_TYPE_ID] = float(
+            getattr(self, "control_alignment_filter_cyclist_max_error_m", 2.0)
+        )
+        return max_error <= threshold
 
     def _assert_flow_train_anchor_context_valid(
         self,

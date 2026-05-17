@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from src.smart.modules.flow_agent_decoder import SMARTFlowAgentDecoder
+from src.smart.modules.kinematic_control import CYCLIST_TYPE_ID, VEHICLE_TYPE_ID
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 
 
@@ -43,6 +44,9 @@ def _build_control_target_processor() -> FlowTokenProcessor:
     processor.control_cyclist_yaw_scale_rad = 0.06
     processor.control_vehicle_no_slip_point_ratio = 0.0
     processor.control_cyclist_no_slip_point_ratio = 0.0
+    processor.control_alignment_filter_enabled = True
+    processor.control_alignment_filter_vehicle_max_error_m = 5.0
+    processor.control_alignment_filter_cyclist_max_error_m = 2.0
 
     def match_from_passed_trajectory(valid, pos, heading, agent_type, agent_shape):
         coarse_steps = list(range(processor.shift, valid.shape[1], processor.shift))
@@ -198,6 +202,34 @@ def test_control_flow_targets_retokenize_context_from_transition_aligned_future(
     # transition-aligned future rather than the raw lateral-offset GT.
     torch.testing.assert_close(out["ctx_sampled_pos"][0, 1], processed_agent["pos"][0, 10])
     torch.testing.assert_close(out["ctx_sampled_pos"][0, 2, 1], torch.tensor(0.0))
+
+
+def test_control_alignment_filter_removes_large_cyclist_distortion_only() -> None:
+    processor = _build_control_target_processor()
+    tokenized_agent = {
+        "type": torch.tensor([CYCLIST_TYPE_ID, VEHICLE_TYPE_ID], dtype=torch.long),
+        "shape": torch.tensor([[0.8, 1.9, 1.5], [2.0, 4.8, 1.5]], dtype=torch.float32),
+        "token_agent_shape": torch.tensor([[0.8, 1.9], [2.0, 4.8]], dtype=torch.float32),
+    }
+    processed_agent = _build_processed_agent_for_full_womd_horizon()
+    processed_agent = {
+        "valid": processed_agent["valid"].repeat(2, 1),
+        "pos": processed_agent["pos"].repeat(2, 1, 1),
+        "heading": processed_agent["heading"].repeat(2, 1),
+    }
+    processed_agent["pos"][:, 11:, 0] = torch.arange(1, 81, dtype=torch.float32)
+    processed_agent["pos"][:, 11:, 1] = 3.0
+
+    out = processor._build_flow_targets(
+        data={"agent": {}},
+        tokenized_agent=tokenized_agent,
+        processed_agent=processed_agent,
+    )
+
+    assert out["flow_train_mask"][0].tolist() == [False] * 16
+    assert out["flow_train_mask"][1].tolist() == [True] * 16
+    assert tuple(out["flow_train_clean_norm"].shape) == (16, 20, 3)
+    assert out["flow_train_agent_type"].tolist() == [VEHICLE_TYPE_ID] * 16
 
 
 def test_anchor_context_uses_mask_width_and_ignores_extra_tail_context() -> None:
