@@ -39,7 +39,6 @@ class FlowTokenProcessor(TokenProcessor):
         use_prefix_valid_future_loss_mask: bool = False,
         use_kinematic_control_flow: bool = False,
         use_holonomic_model_only: bool = False,
-        use_rolling_supervision: bool = True,
         control_pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
         control_vehicle_yaw_scale_rad: float | None = None,
         control_pedestrian_yaw_scale_rad: float | None = None,
@@ -61,7 +60,6 @@ class FlowTokenProcessor(TokenProcessor):
         self.use_prefix_valid_future_loss_mask = bool(use_prefix_valid_future_loss_mask)
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.use_holonomic_model_only = bool(use_holonomic_model_only)
-        self.use_rolling_supervision = bool(use_rolling_supervision)
         self.control_pos_scale_m = float(control_pos_scale_m)
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
@@ -622,7 +620,6 @@ class FlowTokenProcessor(TokenProcessor):
                     pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                     cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
                     use_holonomic_model_only=self.use_holonomic_model_only,
-                    use_rolling_supervision=self.use_rolling_supervision,
                     vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
                     cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
                 )
@@ -638,7 +635,6 @@ class FlowTokenProcessor(TokenProcessor):
                 pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                 cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
                 use_holonomic_model_only=self.use_holonomic_model_only,
-                use_rolling_supervision=self.use_rolling_supervision,
                 vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
                 cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
             )

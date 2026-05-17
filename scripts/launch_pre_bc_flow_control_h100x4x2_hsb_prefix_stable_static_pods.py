@@ -9,7 +9,6 @@ V100x47 stable experiment's control-space semantics:
 * use_prefix_valid_future_loss_mask=true
 * use_kinematic_control_flow=true
 * use_holonomic_model_only=true
-* use_rolling_supervision=true
 * control_round_trip_max_position_error_m=0.5
 
 The script does not create, delete, or restart pods. It only starts/replaces the
@@ -33,7 +32,6 @@ DEFAULT_EXTRA_HYDRA_OVERRIDES = (
     "model.model_config.token_processor.use_prefix_valid_future_loss_mask=true",
     "model.model_config.token_processor.use_kinematic_control_flow=true",
     "model.model_config.token_processor.use_holonomic_model_only=true",
-    "model.model_config.token_processor.use_rolling_supervision=true",
     "model.model_config.token_processor.control_round_trip_max_position_error_m=0.5",
     "model.model_config.decoder.flow_window_steps=20",
 )

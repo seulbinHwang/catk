@@ -46,7 +46,6 @@ def _make_control_processor() -> FlowTokenProcessor:
     processor.flow_target_dim = 3
     processor.use_kinematic_control_flow = True
     processor.use_holonomic_model_only = False
-    processor.use_rolling_supervision = True
     processor.control_pos_scale_m = 1.0
     processor.control_vehicle_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_vehicle_yaw_scale_rad"]
     processor.control_pedestrian_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_pedestrian_yaw_scale_rad"]
@@ -130,7 +129,6 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     decoder.use_kinematic_control_flow = True
     decoder.use_holonomic_model_only = False
-    decoder.use_rolling_supervision = True
     decoder.flow_window_steps = 2
     decoder.flow_state_dim = 3
     decoder.control_pos_scale_m = 1.0

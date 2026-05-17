@@ -505,11 +505,10 @@ def build_rolling_control_target(
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
     use_holonomic_model_only: bool = False,
-    use_rolling_supervision: bool = True,
     vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
     cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
 ) -> Tensor:
-    """GT pose를 control label로 바꿉니다.
+    """GT pose를 decoder-consistent rolling control label로 바꿉니다.
 
     Args:
         future_pos: GT 미래 위치입니다. shape은 ``[N, T, 2]`` 입니다.
@@ -525,10 +524,6 @@ def build_rolling_control_target(
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
         use_holonomic_model_only: ``True`` 이면 vehicle/cyclist도 pedestrian과 같은
             holonomic inverse/decoder projection을 사용합니다.
-        use_rolling_supervision: ``True`` 이면 decoder-consistent rolling supervision을
-            사용합니다. ``False`` 이면 각 step의 raw GT pose pair만으로 inverse control을
-            만듭니다. ``use_holonomic_model_only=True`` 에서는 두 방식이 같은 target을
-            만듭니다.
         vehicle_no_slip_point_ratio: vehicle box length에 곱해 no-slip point가 box center
             뒤쪽으로 얼마나 떨어져 있는지 정합니다.
         cyclist_no_slip_point_ratio: cyclist box length에 곱해 no-slip point가 box center
@@ -572,15 +567,8 @@ def build_rolling_control_target(
     for step_idx in range(future_pos.shape[1]):
         target_pos = future_pos[:, step_idx]
         target_head = future_head[:, step_idx]
-        if use_rolling_supervision:
-            source_pos = roll_pos
-            source_head = roll_head
-        elif step_idx == 0:
-            source_pos = current_pos
-            source_head = current_head
-        else:
-            source_pos = future_pos[:, step_idx - 1]
-            source_head = future_head[:, step_idx - 1]
+        source_pos = roll_pos
+        source_head = roll_head
         delta_head = wrap_angle(target_head - source_head)
         delta_vec = target_pos - source_pos
 
@@ -609,14 +597,13 @@ def build_rolling_control_target(
         step_control = torch.stack([delta_s, delta_n, delta_head], dim=-1)
         control_steps.append(step_control)
 
-        if use_rolling_supervision:
-            nonhol_next_pos = (
-                roll_pos
-                + nonhol_proj.unsqueeze(-1) * h_mid
-                + no_slip_offset.unsqueeze(-1) * (target_heading_vec - source_heading_vec)
-            )
-            roll_pos = torch.where(holonomic_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
-            roll_head = wrap_angle(roll_head + delta_head)
+        nonhol_next_pos = (
+            roll_pos
+            + nonhol_proj.unsqueeze(-1) * h_mid
+            + no_slip_offset.unsqueeze(-1) * (target_heading_vec - source_heading_vec)
+        )
+        roll_pos = torch.where(holonomic_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
+        roll_head = wrap_angle(roll_head + delta_head)
 
     if len(control_steps) == 0:
         return future_pos.new_zeros((future_pos.shape[0], 0, CONTROL_FLOW_DIM))
@@ -644,11 +631,10 @@ def build_rolling_control_target_with_round_trip_error(
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
     use_holonomic_model_only: bool = False,
-    use_rolling_supervision: bool = True,
     vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
     cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
 ) -> tuple[Tensor, Tensor]:
-    """GT pose를 control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
+    """GT pose를 rolling control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
 
     Args:
         future_pos: GT 미래 위치입니다. shape은 ``[N, T, 2]`` 입니다.
@@ -663,8 +649,6 @@ def build_rolling_control_target_with_round_trip_error(
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
         use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic inverse/decoder를 씁니다.
-        use_rolling_supervision: ``True`` 이면 decoder-consistent rolling supervision을
-            사용하고, ``False`` 이면 raw GT pose pair inverse를 사용합니다.
         vehicle_no_slip_point_ratio: vehicle box length에 곱하는 no-slip point offset 비율입니다.
         cyclist_no_slip_point_ratio: cyclist box length에 곱하는 no-slip point offset 비율입니다.
 
@@ -685,7 +669,6 @@ def build_rolling_control_target_with_round_trip_error(
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
         use_holonomic_model_only=use_holonomic_model_only,
-        use_rolling_supervision=use_rolling_supervision,
         vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
         cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )

@@ -138,7 +138,6 @@ def build_anchor0_normalized_committed_control(
     pedestrian_yaw_scale_rad: float,
     cyclist_yaw_scale_rad: float,
     use_holonomic_model_only: bool = False,
-    use_rolling_supervision: bool = True,
     vehicle_no_slip_point_ratio: float = 0.0,
     cyclist_no_slip_point_ratio: float = 0.0,
     pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
@@ -156,8 +155,6 @@ def build_anchor0_normalized_committed_control(
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
         use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic control
             projection을 씁니다.
-        use_rolling_supervision: ``True`` 이면 decoder-consistent rolling projection을
-            사용하고, ``False`` 이면 raw pose pair inverse를 사용합니다.
         vehicle_no_slip_point_ratio: vehicle box length에 곱하는 no-slip point offset 비율입니다.
         cyclist_no_slip_point_ratio: cyclist box length에 곱하는 no-slip point offset 비율입니다.
         pose_pos_scale_m: pose-space 위치 정규화 scale입니다.
@@ -214,7 +211,6 @@ def build_anchor0_normalized_committed_control(
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
         use_holonomic_model_only=use_holonomic_model_only,
-        use_rolling_supervision=use_rolling_supervision,
         vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
         cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )

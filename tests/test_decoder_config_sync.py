@@ -11,7 +11,6 @@ def _token_processor_stub(**overrides):
     values = {
         "use_kinematic_control_flow": True,
         "use_holonomic_model_only": False,
-        "use_rolling_supervision": True,
         "control_pos_scale_m": 1.0,
         "control_vehicle_no_slip_point_ratio": 0.25,
         "control_cyclist_no_slip_point_ratio": 0.05,

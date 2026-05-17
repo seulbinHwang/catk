@@ -54,7 +54,6 @@ class AnalysisConfig:
     control_vehicle_no_slip_point_ratio: float = 0.2289518863
     control_cyclist_no_slip_point_ratio: float = 0.0495847873
     use_holonomic_model_only: bool = False
-    use_rolling_supervision: bool = True
     hist_max_error_m: float = 20.0
     hist_bins: int = 20_000
     recommend_quantile: float = 99.5
@@ -249,15 +248,8 @@ def _round_trip_error_np(
     for step_idx in range(num_step):
         target_pos = future_pos[:, step_idx]
         target_head = future_head[:, step_idx]
-        if cfg.use_rolling_supervision:
-            source_pos = build_roll_pos
-            source_head = build_roll_head
-        elif step_idx == 0:
-            source_pos = current_pos
-            source_head = current_head
-        else:
-            source_pos = future_pos[:, step_idx - 1]
-            source_head = future_head[:, step_idx - 1]
+        source_pos = build_roll_pos
+        source_head = build_roll_head
 
         delta_head = _wrap_angle_np(target_head - source_head)
         mid_head = source_head + np.float32(0.5) * delta_head
@@ -327,12 +319,11 @@ def _round_trip_error_np(
             + nonhol_proj[:, None] * h_mid
             + no_slip_offset[:, None] * (target_heading_vec - source_heading_vec)
         )
-        if cfg.use_rolling_supervision:
-            if np.any(holonomic_mask):
-                build_next_pos = build_next_pos.copy()
-                build_next_pos[holonomic_mask] = target_pos[holonomic_mask]
-            build_roll_pos = build_next_pos
-            build_roll_head = _wrap_angle_np(build_roll_head + delta_head)
+        if np.any(holonomic_mask):
+            build_next_pos = build_next_pos.copy()
+            build_next_pos[holonomic_mask] = target_pos[holonomic_mask]
+        build_roll_pos = build_next_pos
+        build_roll_head = _wrap_angle_np(build_roll_head + delta_head)
 
         diff = next_decode_pos - target_pos
         error[:, step_idx] = np.sqrt(np.sum(diff * diff, axis=-1, dtype=np.float32))
@@ -814,8 +805,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-vehicle-no-slip-point-ratio", type=float, default=0.2289518863)
     parser.add_argument("--control-cyclist-no-slip-point-ratio", type=float, default=0.0495847873)
     parser.add_argument("--use-holonomic-model-only", action="store_true")
-    parser.add_argument("--no-use-rolling-supervision", dest="use_rolling_supervision", action="store_false")
-    parser.set_defaults(use_rolling_supervision=True)
     parser.add_argument("--hist-max-error-m", type=float, default=20.0)
     parser.add_argument("--hist-bins", type=int, default=20_000)
     parser.add_argument("--thresholds", default="0.5,1,1.5,2,3,5,10")
@@ -842,7 +831,6 @@ def main() -> None:
         control_vehicle_no_slip_point_ratio=args.control_vehicle_no_slip_point_ratio,
         control_cyclist_no_slip_point_ratio=args.control_cyclist_no_slip_point_ratio,
         use_holonomic_model_only=bool(args.use_holonomic_model_only),
-        use_rolling_supervision=bool(args.use_rolling_supervision),
         hist_max_error_m=args.hist_max_error_m,
         hist_bins=args.hist_bins,
         recommend_quantile=args.recommend_quantile,

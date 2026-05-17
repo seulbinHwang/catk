@@ -39,7 +39,6 @@ class SMARTFlowDecoder(nn.Module):
         flow_window_steps: int = 20,
         use_kinematic_control_flow: bool = False,
         use_holonomic_model_only: bool = False,
-        use_rolling_supervision: bool = True,
         control_pos_scale_m: float = 1.0,
         control_vehicle_no_slip_point_ratio: float = 0.0,
         control_cyclist_no_slip_point_ratio: float = 0.0,
@@ -93,7 +92,6 @@ class SMARTFlowDecoder(nn.Module):
             use_stop_motion=use_stop_motion,
             lqr_commit=lqr_commit,
             use_holonomic_model_only=use_holonomic_model_only,
-            use_rolling_supervision=use_rolling_supervision,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:

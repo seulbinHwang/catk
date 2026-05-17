@@ -40,10 +40,7 @@ model_config:
     # false: vehicle/cyclist는 non-holonomic, pedestrian은 holonomic.
     # true: vehicle/cyclist까지 pedestrian과 같은 holonomic model을 적용합니다.
     use_holonomic_model_only: false
-    # true: decoder-consistent rolling supervision으로 GT control label을 만듭니다.
-    # false: 각 step의 raw GT pose pair만으로 inverse control label을 만듭니다.
-    # use_holonomic_model_only=true일 때는 두 방식이 같은 target을 만듭니다.
-    use_rolling_supervision: true
+    # GT control label은 항상 decoder-consistent rolling supervision으로 만듭니다.
     control_pos_scale_m: 1.0
     # vehicle/cyclist의 non-holonomic no-slip point를 box center 뒤쪽으로
     # box length * 이 비율만큼 옮깁니다. 값은 전체 SMART cache training split에서 추정했습니다.
@@ -126,7 +123,6 @@ model_config:
     # decoder 쪽만 다른 값으로 override하면 SMARTFlow 초기화 단계에서 에러를 냅니다.
     use_kinematic_control_flow: ${model.model_config.token_processor.use_kinematic_control_flow}
     use_holonomic_model_only: ${model.model_config.token_processor.use_holonomic_model_only}
-    use_rolling_supervision: ${model.model_config.token_processor.use_rolling_supervision}
     control_pos_scale_m: ${model.model_config.token_processor.control_pos_scale_m}
     control_vehicle_no_slip_point_ratio: ${model.model_config.token_processor.control_vehicle_no_slip_point_ratio}
     control_cyclist_no_slip_point_ratio: ${model.model_config.token_processor.control_cyclist_no_slip_point_ratio}

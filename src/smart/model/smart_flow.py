@@ -63,7 +63,6 @@ from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_
 _TOKEN_PROCESSOR_DECODER_SHARED_KEYS = (
     "use_kinematic_control_flow",
     "use_holonomic_model_only",
-    "use_rolling_supervision",
     "control_pos_scale_m",
     "control_vehicle_no_slip_point_ratio",
     "control_cyclist_no_slip_point_ratio",
@@ -2007,7 +2006,6 @@ class SMARTFlow(LightningModule):
                 pedestrian_yaw_scale_rad=self.encoder.agent_encoder.control_pedestrian_yaw_scale_rad,
                 cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
                 use_holonomic_model_only=self.encoder.agent_encoder.use_holonomic_model_only,
-                use_rolling_supervision=self.encoder.agent_encoder.use_rolling_supervision,
                 vehicle_no_slip_point_ratio=self.encoder.agent_encoder.control_vehicle_no_slip_point_ratio,
                 cyclist_no_slip_point_ratio=self.encoder.agent_encoder.control_cyclist_no_slip_point_ratio,
             )
