@@ -5,11 +5,15 @@ import pickle
 import numpy as np
 import torch
 
-from src.smart.modules.kinematic_control import build_transition_aligned_control_trajectory
+from src.smart.modules.kinematic_control import (
+    build_transition_aligned_control_trajectory,
+    compute_aligned_substep_validity,
+)
 from tools.analyze_transition_alignment_error import (
     AlignmentStatsConfig,
     analyze_file,
     analyze_record,
+    compute_aligned_substep_validity_np,
     summarize_stats,
     transition_aligned_position_error,
 )
@@ -165,3 +169,71 @@ def test_analyze_file_reads_cache_pickle(tmp_path) -> None:
 
     assert summary["all"]["step_error"]["count"] == 6
     assert summary["vehicle"]["agent_max_error"]["max_m"] == 1.0
+
+
+def test_aligned_substep_validity_numpy_matches_torch() -> None:
+    rng = np.random.default_rng(0)
+    valid_np = (rng.random((4, 91)) > 0.05)
+    valid_np[:, 10] = True  # current_step always valid for this comparison
+    torch_result = compute_aligned_substep_validity(
+        torch.from_numpy(valid_np), current_step=10, commit_steps=5
+    ).numpy()
+    np_result = compute_aligned_substep_validity_np(valid_np, current_step=10, commit_steps=5)
+    np.testing.assert_array_equal(np_result, torch_result)
+
+
+def test_analyze_record_masks_invalid_block_endpoint_pollution() -> None:
+    # 1 vehicle, 11 raw steps. valid at all but step 5 (invalid endpoint of
+    # block (0, 5]). Place the agent far from origin so the (0, 0) placeholder
+    # would otherwise produce massive distortion at mid-steps 1..4 and 6..9.
+    pos = np.full((1, 11, 2), 1000.0, dtype=np.float32)
+    pos[0, 5] = 0.0
+    heading = np.zeros((1, 11), dtype=np.float32)
+    valid = np.ones((1, 11), dtype=bool)
+    valid[0, 5] = False
+    vel = np.zeros((1, 11, 2), dtype=np.float32)
+    record = {
+        "pos": pos,
+        "heading": heading,
+        "valid": valid,
+        "vel": vel,
+        "type": np.array([0], dtype=np.int16),
+        "length": np.array([4.8], dtype=np.float32),
+        "shape": np.array([[4.8, 2.0, 1.5]], dtype=np.float32),
+    }
+    cfg = AlignmentStatsConfig(
+        current_step=0,
+        commit_steps=5,
+        flow_window_steps=5,
+        num_anchors=2,
+        max_future_steps=10,
+        vehicle_no_slip_point_ratio=0.0,
+        cyclist_no_slip_point_ratio=0.0,
+        hist_bins=2000,
+        hist_max_error_m=2000.0,
+        mask_by_aligned_substep_validity=True,
+    )
+
+    summary = summarize_stats(analyze_record(record, cfg), cfg)
+    # With masking ON, the polluted steps 1..4 and 6..9 are excluded. The block
+    # endpoint at step 10 re-anchors (clean) and step 5 is masked by raw valid,
+    # so only step 10 survives, with negligible error.
+    assert summary["vehicle"]["step_error"]["count"] == 1
+    assert summary["vehicle"]["step_error"]["max_m"] < 1.0
+
+    # With masking OFF, the polluted mid-steps slip back in.
+    cfg_off = AlignmentStatsConfig(
+        current_step=0,
+        commit_steps=5,
+        flow_window_steps=5,
+        num_anchors=2,
+        max_future_steps=10,
+        vehicle_no_slip_point_ratio=0.0,
+        cyclist_no_slip_point_ratio=0.0,
+        hist_bins=2000,
+        hist_max_error_m=2000.0,
+        mask_by_aligned_substep_validity=False,
+    )
+    summary_off = summarize_stats(analyze_record(record, cfg_off), cfg_off)
+    assert summary_off["vehicle"]["step_error"]["count"] > summary["vehicle"]["step_error"]["count"]
+    assert summary_off["vehicle"]["step_error"]["max_m"] > 100.0

@@ -200,6 +200,64 @@ def test_control_flow_targets_retokenize_context_from_transition_aligned_future(
     torch.testing.assert_close(out["ctx_sampled_pos"][0, 2, 1], torch.tensor(0.0))
 
 
+def test_control_flow_loss_mask_excludes_substeps_with_invalid_block_endpoint() -> None:
+    """Block endpoint이 invalid면 prefix-valid 안의 substep도 loss에서 제외해야 합니다."""
+    processor = _build_control_target_processor()
+    tokenized_agent = {
+        "type": torch.zeros((1,), dtype=torch.long),  # vehicle
+        "shape": torch.tensor([[2.0, 4.8, 1.5]], dtype=torch.float32),
+        "token_agent_shape": torch.tensor([[2.0, 4.8]], dtype=torch.float32),
+    }
+    processed_agent = _build_processed_agent_for_full_womd_horizon()
+    # Make raw step 25 invalid → block (20, 25] endpoint invalid.
+    # Place a non-trivial offset so the invalid placeholder (0, 0) would otherwise
+    # pull substeps 21..24 strongly toward origin.
+    processed_agent["pos"][0, :, 0] = 1000.0
+    processed_agent["pos"][0, 25] = torch.tensor([0.0, 0.0])  # placeholder
+    processed_agent["valid"][0, 25] = False
+    # All other future steps remain valid.
+
+    out = processor._build_flow_targets(
+        data={"agent": {}},
+        tokenized_agent=tokenized_agent,
+        processed_agent=processed_agent,
+    )
+
+    # Recover which anchor slots ended up active.
+    flow_train_mask = out["flow_train_mask"]  # [n_agent, 16]
+    flow_train_loss_mask = out["flow_train_loss_mask"]  # [n_active, 20]
+
+    # 16 anchors at raw_step in [10, 15, ..., 85]. With raw step 25 invalid:
+    #   - Anchor at raw_step=25 has current_valid=False -> excluded.
+    #   - Anchor at raw_step=20: prefix-valid in window 21..40 would normally cover
+    #     21..24 (4 valid steps before invalid 25). aligned_substep_valid masks all
+    #     four (block (20, 25] mid-steps with invalid endpoint) -> loss-mask sum
+    #     for this anchor becomes 0, so the anchor is dropped.
+    active_anchor_offsets = [i for i in range(16) if bool(flow_train_mask[0, i])]
+    # Anchor offsets correspond to raw_steps 10, 15, 20, 25, 30, ..., 85.
+    # raw_step=25 (offset 3) excluded; raw_step=20 (offset 2) excluded because its
+    # loss window only covered 21..24 and all four are masked.
+    assert 3 not in active_anchor_offsets  # raw_step=25 anchor dropped (invalid current)
+    assert 2 not in active_anchor_offsets  # raw_step=20 anchor dropped (loss all masked)
+    # Anchors before raw_step=20 (i.e. raw_step=10, 15) should still be active.
+    assert 0 in active_anchor_offsets
+    assert 1 in active_anchor_offsets
+    # Anchors at raw_step=30+ should still be active.
+    for i in (4, 5):
+        assert i in active_anchor_offsets
+
+    # For the surviving anchor at raw_step=10 (offset 0), the loss must end at
+    # step 20 — substeps 21..24 are masked by aligned_substep_valid.
+    raw_steps = [5 * (i + 2) for i in range(16)]
+    anchor0_idx = active_anchor_offsets.index(0)
+    # raw_step=10 → loss window covers raw 11..30 mapped to indices 0..19. We
+    # expect indices 0..9 (steps 11..20) True, indices 10..19 False (steps 21..30
+    # where 21..24 are aligned-invalid and 25..30 are raw-invalid by prefix mask).
+    expected_mask = torch.tensor([True] * 10 + [False] * 10)
+    assert torch.equal(flow_train_loss_mask[anchor0_idx].cpu(), expected_mask)
+    del raw_steps
+
+
 def test_anchor_context_uses_mask_width_and_ignores_extra_tail_context() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     encoded = torch.arange(2 * 18 * 3, dtype=torch.float32).view(2, 18, 3)

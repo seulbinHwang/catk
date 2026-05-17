@@ -835,3 +835,68 @@ def build_transition_aligned_control_trajectory(
             control_norm_by_step[:, raw_step] = step_control_norm
 
     return aligned_pos, aligned_heading, control_norm_by_step
+
+
+def compute_aligned_substep_validity(
+    valid: Tensor,
+    current_step: int,
+    commit_steps: int = 5,
+) -> Tensor:
+    """transition-aligned 궤적의 step별 신뢰성 mask를 계산합니다.
+
+    rolling은 ``commit_steps`` 마다 한 번 endpoint inverse projection으로 control을
+    만들고 그 control을 ``commit_steps`` 개의 substep으로 나눠 적용합니다. block
+    endpoint의 raw GT가 invalid면 ``(0, 0)`` placeholder가 inverse target으로
+    들어가 그 block의 mid-step과 다음 block의 mid-step까지 (0, 0) 쪽으로 끌려가
+    오염됩니다. 이 함수는 그 오염을 step 단위로 식별합니다.
+
+    Args:
+        valid: 각 agent, 각 step의 raw GT 유효 여부입니다. shape은 ``[N, T]`` 입니다.
+        current_step: rolling이 시작되는 raw 시점입니다.
+        commit_steps: endpoint commit 사이의 raw step 간격입니다. 기본 5는 0.5초.
+
+    Returns:
+        shape ``[N, T]`` bool tensor입니다. ``True`` 인 step은 transition-aligned
+        궤적이 raw GT에 거의 일치합니다. ``False`` 인 step은 invalid endpoint의
+        ``(0, 0)`` placeholder가 inverse projection에 들어가 rolling 상태가 오염된
+        step입니다. 학습 loss mask와 ``current_pos`` 선택은 이 값과 ``AND`` 해야
+        합니다.
+
+        규칙:
+
+        - ``current_step`` 은 raw GT를 그대로 쓰므로
+          ``aligned_valid[:, current_step] = valid[:, current_step]`` 입니다.
+        - block ``(a, b]`` 의 mid-step ``a < k < b``:
+          ``aligned_valid[:, k] = aligned_valid[:, a] AND valid[:, b]``.
+        - block ``(a, b]`` 의 endpoint ``k = b``:
+          ``aligned_valid[:, b] = valid[:, b]`` (valid면 re-anchor).
+    """
+    if valid.dtype != torch.bool:
+        raise ValueError(f"valid must be bool, got {valid.dtype}.")
+    if valid.ndim != 2:
+        raise ValueError(f"valid must have shape [N, T], got {tuple(valid.shape)}.")
+    current_step = int(current_step)
+    n_step = int(valid.shape[1])
+    if current_step < 0 or current_step >= n_step:
+        raise ValueError(
+            f"current_step={current_step} must be inside [0, {n_step})."
+        )
+    commit_steps = int(commit_steps)
+    if commit_steps <= 0:
+        raise ValueError(f"commit_steps must be positive, got {commit_steps}.")
+
+    aligned_valid = torch.zeros_like(valid)
+    aligned_valid[:, current_step] = valid[:, current_step]
+    block_start = current_step
+    while block_start < n_step - 1:
+        block_end = min(block_start + commit_steps, n_step - 1)
+        endpoint_valid = valid[:, block_end]
+        source_clean = aligned_valid[:, block_start]
+        mid_valid = source_clean & endpoint_valid
+        if block_end > block_start + 1:
+            aligned_valid[:, block_start + 1 : block_end] = mid_valid.unsqueeze(1).expand(
+                -1, block_end - block_start - 1
+            )
+        aligned_valid[:, block_end] = endpoint_valid
+        block_start = block_end
+    return aligned_valid

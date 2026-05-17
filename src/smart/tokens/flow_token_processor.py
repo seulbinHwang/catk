@@ -13,6 +13,7 @@ from src.smart.modules.kinematic_control import (
     DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
     POSE_FLOW_DIM,
     build_transition_aligned_control_trajectory,
+    compute_aligned_substep_validity,
     validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
 )
@@ -127,6 +128,7 @@ class FlowTokenProcessor(TokenProcessor):
         target_pos = pos
         target_heading = heading
         transition_control_norm_by_step: Tensor | None = None
+        aligned_substep_valid: Tensor | None = None
         if self.use_kinematic_control_flow:
             (
                 target_pos,
@@ -146,6 +148,11 @@ class FlowTokenProcessor(TokenProcessor):
                 use_holonomic_model_only=self.use_holonomic_model_only,
                 vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
                 cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
+            )
+            aligned_substep_valid = compute_aligned_substep_validity(
+                valid=valid,
+                current_step=self.shift * 2,
+                commit_steps=self.shift,
             )
             tokenized_agent.update(
                 self._match_agent_token(
@@ -196,6 +203,13 @@ class FlowTokenProcessor(TokenProcessor):
             for anchor_offset, raw_step in enumerate(raw_current_steps):
                 current_valid = valid[:, raw_step]
                 future_loss_mask = self._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
+                if aligned_substep_valid is not None:
+                    current_valid = current_valid & aligned_substep_valid[:, raw_step]
+                    future_loss_mask = self._intersect_aligned_substep_validity(
+                        future_loss_mask=future_loss_mask,
+                        aligned_substep_valid=aligned_substep_valid,
+                        raw_step=raw_step,
+                    )
                 anchor_mask = current_valid & future_loss_mask.any(dim=1)
                 train_anchor_mask = anchor_mask & train_mask
                 if not train_anchor_mask.any():
@@ -465,6 +479,44 @@ class FlowTokenProcessor(TokenProcessor):
         prefix_valid = available_future_valid.to(dtype=torch.long).cumprod(dim=1).bool()
         future_loss_mask[:, :available_len] = prefix_valid
         return future_loss_mask
+
+    def _intersect_aligned_substep_validity(
+        self,
+        future_loss_mask: Tensor,
+        aligned_substep_valid: Tensor,
+        raw_step: int,
+    ) -> Tensor:
+        """raw GT 기준 loss mask에 transition-aligned step 신뢰성 mask를 ``AND`` 합니다.
+
+        ``use_kinematic_control_flow=True`` 에서는 0.5초 endpoint substep rolling이
+        invalid GT placeholder를 inverse projection에 그대로 쓰기 때문에 prefix-valid
+        loss가 cover하는 substep이라도 aligned 좌표는 ``(0, 0)`` 쪽으로 오염될 수
+        있습니다. 이 helper는 그런 substep을 loss에서 제외합니다.
+
+        Args:
+            future_loss_mask: raw valid에서만 만든 loss mask입니다.
+                shape은 ``[n_agent, flow_window_steps]`` 입니다.
+            aligned_substep_valid: transition-aligned 궤적 step별 신뢰성입니다.
+                shape은 ``[n_agent, n_step]`` 입니다.
+            raw_step: 해당 anchor의 현재 raw step입니다.
+
+        Returns:
+            Tensor: ``future_loss_mask`` 와 같은 shape이고, aligned에서도 valid한
+                step만 ``True`` 입니다.
+        """
+        future_start = int(raw_step) + 1
+        available_len = min(
+            int(self.flow_window_steps),
+            max(0, aligned_substep_valid.shape[1] - future_start),
+        )
+        if available_len <= 0:
+            return future_loss_mask
+        aligned_window = aligned_substep_valid[:, future_start : future_start + available_len].to(
+            device=future_loss_mask.device, dtype=torch.bool
+        )
+        masked = future_loss_mask.clone()
+        masked[:, :available_len] = masked[:, :available_len] & aligned_window
+        return masked
 
     def _build_anchor_clean_norm(
         self,

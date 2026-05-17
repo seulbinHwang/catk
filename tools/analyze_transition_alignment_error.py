@@ -39,6 +39,7 @@ class AlignmentStatsConfig:
     warn_step_p99_m: float = 0.50
     warn_anchor_max_p99_m: float = 1.0
     warn_agent_max_p99_m: float = 2.0
+    mask_by_aligned_substep_validity: bool = True
 
 
 def wrap_angle(angle: np.ndarray) -> np.ndarray:
@@ -390,11 +391,57 @@ def _accumulate_future_step(
     )
 
 
+def compute_aligned_substep_validity_np(
+    valid: np.ndarray,
+    current_step: int,
+    commit_steps: int = 5,
+) -> np.ndarray:
+    """``src.smart.modules.kinematic_control.compute_aligned_substep_validity`` 의 numpy 버전.
+
+    transition-aligned 궤적이 raw GT에 일치하는 step만 ``True`` 인 mask를 만듭니다.
+    invalid endpoint의 ``(0, 0)`` placeholder가 inverse projection에 들어가 mid-step과
+    다음 block의 mid-step까지 끌려가는 오염을 step 단위로 식별합니다.
+
+    Args:
+        valid: ``[N, T]`` bool array입니다.
+        current_step: rolling이 시작되는 raw 시점입니다.
+        commit_steps: 0.5초 endpoint 간 raw step 간격입니다.
+
+    Returns:
+        ``[N, T]`` bool array. ``True`` 인 step만 학습 loss에 안전하게 쓸 수 있습니다.
+    """
+    if valid.ndim != 2:
+        raise ValueError(f"valid must have shape [N, T], got {valid.shape}.")
+    current_step = int(current_step)
+    n_step = int(valid.shape[1])
+    if current_step < 0 or current_step >= n_step:
+        raise ValueError(f"current_step={current_step} must be inside [0, {n_step}).")
+    commit_steps = int(commit_steps)
+    if commit_steps <= 0:
+        raise ValueError(f"commit_steps must be positive, got {commit_steps}.")
+
+    valid_bool = valid.astype(bool, copy=False)
+    aligned_valid = np.zeros_like(valid_bool)
+    aligned_valid[:, current_step] = valid_bool[:, current_step]
+    block_start = current_step
+    while block_start < n_step - 1:
+        block_end = min(block_start + commit_steps, n_step - 1)
+        endpoint_valid = valid_bool[:, block_end]
+        source_clean = aligned_valid[:, block_start]
+        mid_valid = source_clean & endpoint_valid
+        if block_end > block_start + 1:
+            aligned_valid[:, block_start + 1 : block_end] = mid_valid[:, None]
+        aligned_valid[:, block_end] = endpoint_valid
+        block_start = block_end
+    return aligned_valid
+
+
 def _build_anchor_window_max_errors(
     errors: np.ndarray,
     valid: np.ndarray,
     agent_type: np.ndarray,
     cfg: AlignmentStatsConfig,
+    aligned_substep_valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     current_step = int(cfg.current_step)
     flow_window_steps = int(cfg.flow_window_steps)
@@ -435,6 +482,12 @@ def _build_anchor_window_max_errors(
         else:
             raise ValueError(f"Unsupported anchor_valid_mode={cfg.anchor_valid_mode!r}.")
 
+        if aligned_substep_valid is not None:
+            aligned_current = aligned_substep_valid[:, raw_step]
+            aligned_window = aligned_substep_valid[:, future_start : future_start + available_len]
+            loss_mask = loss_mask & aligned_window
+            current_valid = current_valid & aligned_current
+
         anchor_mask = current_valid & loss_mask.any(axis=1)
         if not np.any(anchor_mask):
             continue
@@ -468,11 +521,25 @@ def analyze_record(record: dict[str, np.ndarray], cfg: AlignmentStatsConfig) -> 
     current_valid = record["valid"][:, int(cfg.current_step)]
     future_valid = record["valid"][:, int(cfg.current_step) + 1 : int(cfg.current_step) + 1 + errors.shape[1]]
     step_mask = current_valid[:, None] & future_valid
+    aligned_substep_valid: np.ndarray | None = None
+    if cfg.mask_by_aligned_substep_validity:
+        aligned_substep_valid = compute_aligned_substep_validity_np(
+            valid=record["valid"],
+            current_step=int(cfg.current_step),
+            commit_steps=int(cfg.commit_steps),
+        )
+        aligned_current = aligned_substep_valid[:, int(cfg.current_step)]
+        aligned_future = aligned_substep_valid[
+            :, int(cfg.current_step) + 1 : int(cfg.current_step) + 1 + errors.shape[1]
+        ]
+        step_mask = step_mask & aligned_current[:, None] & aligned_future
+        current_valid = current_valid & aligned_current
     anchor_max_values, anchor_types = _build_anchor_window_max_errors(
         errors=errors,
         valid=record["valid"],
         agent_type=record["type"],
         cfg=cfg,
+        aligned_substep_valid=aligned_substep_valid,
     )
 
     for type_name, type_id in TYPE_IDS.items():
@@ -806,6 +873,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warn-step-p99-m", type=float, default=0.50)
     parser.add_argument("--warn-anchor-max-p99-m", type=float, default=1.0)
     parser.add_argument("--warn-agent-max-p99-m", type=float, default=2.0)
+    parser.add_argument(
+        "--no-mask-by-aligned-substep-validity",
+        dest="mask_by_aligned_substep_validity",
+        action="store_false",
+        help=(
+            "기본값(True)은 학습이 실제로 보는 분포를 측정하기 위해 invalid block "
+            "endpoint로 인해 오염된 substep을 통계에서 제외합니다. 이 옵션을 끄면 "
+            "rolling 자체의 raw distortion을 그대로 봅니다 (오염 substep 포함)."
+        ),
+    )
+    parser.set_defaults(mask_by_aligned_substep_validity=True)
     parser.add_argument("--output-json", type=Path, default=None)
     return parser.parse_args()
 
@@ -830,6 +908,7 @@ def main() -> None:
         warn_step_p99_m=args.warn_step_p99_m,
         warn_anchor_max_p99_m=args.warn_anchor_max_p99_m,
         warn_agent_max_p99_m=args.warn_agent_max_p99_m,
+        mask_by_aligned_substep_validity=bool(args.mask_by_aligned_substep_validity),
     )
     result = analyze_transition_alignment(
         cache_root=args.cache_root,

@@ -11,6 +11,7 @@ from src.smart.modules.kinematic_control import (
     VEHICLE_TYPE_ID,
     build_rolling_control_target,
     build_transition_aligned_control_trajectory,
+    compute_aligned_substep_validity,
     control_norm_to_pose_norm,
     decode_control_sequence,
     denormalize_control,
@@ -416,6 +417,68 @@ def test_pedestrian_uses_pedestrian_type_id_constant() -> None:
     assert PEDESTRIAN_TYPE_ID == 1
     assert VEHICLE_TYPE_ID == 0
     assert CYCLIST_TYPE_ID == 2
+
+
+def test_aligned_substep_validity_handles_all_valid_trajectory() -> None:
+    valid = torch.ones((2, 11), dtype=torch.bool)
+    aligned_valid = compute_aligned_substep_validity(valid, current_step=0, commit_steps=5)
+    assert aligned_valid.shape == valid.shape
+    assert torch.equal(aligned_valid, torch.ones_like(valid))
+
+
+def test_aligned_substep_validity_flags_block_endpoint_invalid() -> None:
+    # 2 agents, T=11, current_step=0, commit_steps=5.
+    valid = torch.ones((2, 11), dtype=torch.bool)
+    valid[1, 5] = False  # invalid endpoint of block (0, 5]
+
+    aligned_valid = compute_aligned_substep_validity(valid, current_step=0, commit_steps=5)
+    # Agent 0: all-valid → all True.
+    assert torch.equal(aligned_valid[0], torch.ones(11, dtype=torch.bool))
+    # Agent 1:
+    #   step 0   : valid[0]=True → True
+    #   steps 1-4: clean[0] AND valid[5] = True AND False = False
+    #   step 5   : endpoint, valid[5] = False
+    #   steps 6-9: clean[5] AND valid[10] = False AND True = False
+    #   step 10  : endpoint, valid[10] = True
+    expected = torch.tensor(
+        [True, False, False, False, False, False, False, False, False, False, True]
+    )
+    assert torch.equal(aligned_valid[1], expected)
+
+
+def test_aligned_substep_validity_recovers_after_re_anchor() -> None:
+    # invalid endpoint then valid endpoint should recover at the next valid endpoint.
+    # current_step=0, commit_steps=5, T=16: blocks (0,5], (5,10], (10,15].
+    valid = torch.ones((1, 16), dtype=torch.bool)
+    valid[0, 5] = False  # invalid endpoint of first block
+    aligned_valid = compute_aligned_substep_validity(valid, current_step=0, commit_steps=5)
+    expected = torch.tensor(
+        [True,  # step 0 current
+         False, False, False, False,  # block (0,5] mid: clean[0]=True AND valid[5]=False
+         False,  # block (0,5] endpoint: valid[5]=False
+         False, False, False, False,  # block (5,10] mid: clean[5]=False AND valid[10]=True = False
+         True,  # block (5,10] endpoint: valid[10]=True, re-anchors
+         True, True, True, True,  # block (10,15] mid: clean[10]=True AND valid[15]=True = True
+         True]  # block (10,15] endpoint
+    )
+    assert torch.equal(aligned_valid[0], expected)
+
+
+def test_aligned_substep_validity_propagates_from_invalid_current_step() -> None:
+    # If current_step itself is invalid, the whole rolling is unreliable until
+    # a re-anchor at the next valid block endpoint.
+    valid = torch.ones((1, 11), dtype=torch.bool)
+    valid[0, 0] = False  # current_step invalid
+    aligned_valid = compute_aligned_substep_validity(valid, current_step=0, commit_steps=5)
+    # step 0: valid[0]=False → False
+    # mid 1-4: clean[0]=False AND valid[5]=True = False
+    # endpoint 5: valid[5]=True → True (re-anchors)
+    # mid 6-9: clean[5]=True AND valid[10]=True = True
+    # endpoint 10: valid[10]=True → True
+    expected = torch.tensor(
+        [False, False, False, False, False, True, True, True, True, True, True]
+    )
+    assert torch.equal(aligned_valid[0], expected)
 
 
 def test_control_norm_to_pose_norm_returns_pose_space_shape() -> None:
