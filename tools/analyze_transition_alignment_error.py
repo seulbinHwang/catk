@@ -295,9 +295,10 @@ def _build_anchor_window_max_errors(
     cfg: AlignmentStatsConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
     current_step = int(cfg.current_step)
+    flow_window_steps = int(cfg.flow_window_steps)
     anchor_values: list[np.ndarray] = []
     anchor_type_values: list[np.ndarray] = []
-    if errors.size == 0:
+    if errors.size == 0 or flow_window_steps <= 0:
         return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.int16)
 
     for anchor_idx in range(int(cfg.num_anchors)):
@@ -308,11 +309,18 @@ def _build_anchor_window_max_errors(
         if future_start >= valid.shape[1]:
             continue
 
-        available_len = min(
-            int(cfg.flow_window_steps),
-            valid.shape[1] - future_start,
-            errors.shape[1] - (future_start - current_step - 1),
-        )
+        error_start = future_start - current_step - 1
+        if error_start < 0:
+            continue
+
+        remaining_valid_len = valid.shape[1] - future_start
+        remaining_error_len = errors.shape[1] - error_start
+        if cfg.anchor_valid_mode == "full" and (
+            remaining_valid_len < flow_window_steps or remaining_error_len < flow_window_steps
+        ):
+            continue
+
+        available_len = min(flow_window_steps, remaining_valid_len, remaining_error_len)
         if available_len <= 0:
             continue
 
@@ -329,7 +337,6 @@ def _build_anchor_window_max_errors(
         if not np.any(anchor_mask):
             continue
 
-        error_start = future_start - current_step - 1
         window_errors = errors[:, error_start : error_start + available_len]
         masked_errors = np.where(loss_mask, window_errors, -np.inf)
         max_error = masked_errors.max(axis=1)

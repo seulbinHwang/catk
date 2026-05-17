@@ -99,6 +99,42 @@ def test_analyze_record_reports_vehicle_distortion_and_pedestrian_zero() -> None
     assert summary["all"]["anchor_window_max_error"]["count"] > 0
 
 
+def test_prefix_anchor_valid_mode_keeps_short_tail_window() -> None:
+    cfg = AlignmentStatsConfig(
+        current_step=0,
+        commit_steps=1,
+        flow_window_steps=2,
+        num_anchors=2,
+        max_future_steps=3,
+        anchor_valid_mode="prefix",
+        vehicle_no_slip_point_ratio=0.0,
+        cyclist_no_slip_point_ratio=0.0,
+        hist_bins=1000,
+    )
+
+    summary = summarize_stats(analyze_record(_simple_record(), cfg), cfg)
+
+    assert summary["all"]["anchor_window_max_error"]["count"] == 2
+
+
+def test_full_anchor_valid_mode_excludes_short_tail_window() -> None:
+    cfg = AlignmentStatsConfig(
+        current_step=0,
+        commit_steps=1,
+        flow_window_steps=2,
+        num_anchors=2,
+        max_future_steps=3,
+        anchor_valid_mode="full",
+        vehicle_no_slip_point_ratio=0.0,
+        cyclist_no_slip_point_ratio=0.0,
+        hist_bins=1000,
+    )
+
+    summary = summarize_stats(analyze_record(_simple_record(), cfg), cfg)
+
+    assert summary["all"]["anchor_window_max_error"]["count"] == 0
+
+
 def test_analyze_file_reads_cache_pickle(tmp_path) -> None:
     record = _simple_record()
     agent = {
