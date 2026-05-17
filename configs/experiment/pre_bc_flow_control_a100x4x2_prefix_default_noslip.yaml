@@ -7,7 +7,7 @@
 # from the old box-center ratio 0.0/0.0 to the code defaults:
 #   * vehicle: 0.2289518863
 #   * cyclist: 0.0495847873
-# while keeping prefix-valid supervision and the 0.5m round-trip filter fixed.
+# while keeping prefix-valid transition-aligned supervision fixed.
 
 defaults:
   - pre_bc_flow_control_a100x4x2_prefix_valid
@@ -21,4 +21,3 @@ model:
       use_prefix_valid_future_loss_mask: true
       control_vehicle_no_slip_point_ratio: 0.2289518863
       control_cyclist_no_slip_point_ratio: 0.0495847873
-      control_round_trip_max_position_error_m: 0.5

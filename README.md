@@ -496,10 +496,10 @@ torchrun ... -m src.run \
   task_name=flow_control_space_pretrain
 ```
 
-- GT control label은 기존 cache 안의 GT pose에서 batch 생성 시점에 on-the-fly로 만듭니다. 별도 target cache는 필요 없습니다.
+- GT control label과 current 이후 입력 문맥은 기존 cache 안의 GT pose에서 batch 생성 시점에 on-the-fly로 만듭니다. 별도 target cache는 필요 없고, SMART cache를 만드는 과정도 바꾸지 않습니다.
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
 - `model.model_config.token_processor.use_holonomic_model_only=true`를 켜면 ablation용으로 vehicle / cyclist에도 pedestrian과 같은 holonomic decoder를 적용합니다. 이때 vehicle / cyclist의 `delta_n`도 학습 target과 rollout 복원에 사용됩니다. 기본값 `false`는 기존 agent-type-aware non-holonomic/holonomic 혼합 방식입니다.
-- GT control label은 항상 decoder-consistent rolling projection 방식으로 만듭니다. 매 step마다 raw GT 현재 pose가 아니라 직전 control을 kinematic decoder에 통과시킨 pose를 다음 inverse의 현재 pose로 씁니다.
+- `use_kinematic_control_flow=true`에서는 관측 history와 현재 시작 pose는 raw GT를 유지하고, 현재 이후 future만 inference와 같은 kinematic transition으로 한 번 실행해 transition-aligned trajectory를 만듭니다. 각 anchor의 context position/heading, motion token, future control target, open-loop metric target은 모두 이 같은 궤적에서 잘라 씁니다. 따라서 target에만 별도로 rolling projection을 다시 적용하지 않습니다.
 - `model.model_config.token_processor.control_vehicle_no_slip_point_ratio`와 `model.model_config.token_processor.control_cyclist_no_slip_point_ratio`는 vehicle / cyclist의 non-holonomic 제약을 box center가 아니라 box center 뒤쪽의 effective no-slip point에 적용합니다. offset은 각 agent type별로 `ratio * WOMD box length`이며, 최종 metric/rollout pose는 여전히 box center로 복원됩니다. 기본값은 전체 SMART cache training split에서 추정한 `vehicle=0.2289518863`, `cyclist=0.0495847873`입니다. 이 값으로 validation residual median은 vehicle `0.0958m -> 0.0203m`, cyclist `0.0222m -> 0.0213m`로 줄었습니다. 두 값을 모두 `0.0`으로 두면 기존 box-center midpoint arc rule과 같은 동작입니다. pedestrian과 `use_holonomic_model_only=true` 경로에서는 이 값이 적용되지 않습니다. 학습 target 생성과 decoder rollout은 이 token processor 값을 단일 기준으로 공유하므로, decoder 쪽 동일 key만 따로 다르게 override하면 실행 초기에 에러를 냅니다.
 - 실제 cache에서 no-slip point ratio를 추정하려면 아래 도구를 씁니다. `CACHE_ROOT`는 README의 cache 생성 절차에서 쓰는 동일한 경로이며, fitting은 training split만 사용하고 validation split은 residual 개선율 확인에만 사용합니다.
 
@@ -514,21 +514,6 @@ python tools/estimate_control_no_slip_rho.py \
 
   이 도구는 vehicle / cyclist를 분리해서 0.5초 sliding segment를 만들고, agent별 bounded weighted median을 먼저 구한 뒤 type별 capped weighted median으로 `rho_vehicle`, `rho_cyclist` 후보를 출력합니다. segment filter는 `|p[t+5]-p[t]| >= 0.25m`, `|2L sin(delta_yaw/2)| >= 0.10m` 두 개만 씁니다. 전체 SMART cache에서 `training 486,995`개 파일로 fitting하고 `validation 44,097`개 파일로 residual을 확인한 기본 후보는 `rho_vehicle=0.2289518863`, `rho_cyclist=0.0495847873`입니다. 출력의 `residual` 항목은 `before = b`, `after = b - rho * c`의 validation median absolute residual과 개선율입니다. validation 개선율이 양수인지 먼저 확인한 뒤 실험 config에 반영하세요.
 - control-space 정규화는 위치 이동량에는 공통 `control_pos_scale_m=1.0`을 쓰고, yaw에는 config로 관리되는 agent type별 scale을 씁니다. 기본 preset은 `control_vehicle_yaw_scale_rad=0.025`, `control_cyclist_yaw_scale_rad=0.06`, `control_pedestrian_yaw_scale_rad=0.20`입니다. control-space target 생성과 복원 경로에는 항상 `agent_type`이 필요합니다. metric/rollout용 pose-space 복원은 기존 규약대로 위치를 `x/20`, `y/20`으로 정규화합니다.
-- control-space 학습에서는 GT pose를 control label로 만든 뒤 다시 pose로 복원했을 때, loss에 들어가는 미래 step 기준 최대 위치 오차가 `control_round_trip_max_position_error_m`보다 큰 anchor를 학습에서 제외합니다. 기본값은 `0.5m`이며, 평가 경로에는 적용하지 않습니다. 기본 no-slip point ratio 기준 전체 training cache 분석에서 `0.5m`는 약 `0.21%`의 anchor만 제거하면서 vehicle round-trip tail을 크게 줄인 값입니다.
-- `control_round_trip_max_position_error_m` 값을 데이터 분포에서 고르려면 training cache에 대해 아래 분석 도구를 먼저 돌립니다. 이 값은 anchor별로 “loss에 실제 들어가는 미래 step들의 GT -> control -> pose 복원 위치 오차 중 최대값”을 기준으로 집계하므로, 학습 필터가 보는 값과 같은 의미입니다.
-
-```bash
-export CACHE_ROOT=/path/to/womd_v1_3/SMART_cache
-python tools/analyze_control_round_trip_error.py \
-  --split training \
-  --flow-window-steps 20 \
-  --thresholds 0.5,1,1.5,2,3,5,10 \
-  --num-workers 48 \
-  --chunksize 512 \
-  --output-json outputs/control_round_trip_training.json
-```
-
-  prefix-valid 실험이면 `--use-prefix-valid-future-loss-mask`를 같이 켜고, `use_holonomic_model_only`, `control_vehicle_no_slip_point_ratio`, `control_cyclist_no_slip_point_ratio`를 바꾼 실험이면 도구에도 같은 옵션을 넘겨야 합니다. 이 분석 도구는 파일 내부 anchor 계산을 NumPy로 벡터화하고 worker별 file chunk 단위로 histogram을 합쳐 IPC 비용을 줄입니다. 현재 컨테이너에서는 `--num-workers 48 --chunksize 512`가 training `486,995`개 파일을 20분 안에 끝내는 기준 설정입니다. 출력은 전체/vehicle/pedestrian/cyclist별 anchor max error percentile, step error percentile, threshold별 anchor 제거율을 포함합니다. 기본 추천값은 전체 anchor max error의 p99.5를 `0.25m` 단위로 올림한 값입니다. 실전적으로는 이 추천값과 threshold table을 함께 보고, 정상적인 대다수 anchor를 유지하면서 명백한 non-holonomic projection outlier만 제거하는 값을 고릅니다.
 - 추가 trajectory loss, x0 loss, open-loop auxiliary loss, 속도/가속도/yaw-rate 제약 loss는 이 옵션에서 새로 추가하지 않습니다. 학습 loss는 control-space Flow Matching loss 하나입니다.
 - validation / rollout / metric 경로에서는 control 예측을 기존 pose-space 표현으로 복원해 기존 open-loop metric과 closed-loop rollout을 그대로 계산합니다.
 
@@ -557,10 +542,9 @@ model:
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20
       control_cyclist_yaw_scale_rad: 0.06
-      control_round_trip_max_position_error_m: 0.5
 ```
 
-기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_fullvalid_roundtrip05_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`이라 effective global batch는 `208`이며, 기본 lr은 `6e-4`입니다. `use_prefix_valid_future_loss_mask=false`라 전체 2초 미래가 유효한 anchor만 학습하고, `control_round_trip_max_position_error_m=0.5`로 round-trip 이상치 anchor를 거릅니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
+기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_fullvalid_execctx_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2`입니다. 기본 `train_batch_size`는 `26`이라 effective global batch는 `208`이며, 기본 lr은 `6e-4`입니다. `use_prefix_valid_future_loss_mask=false`라 전체 2초 미래가 유효한 anchor만 학습합니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
 
 tmux 확인:
 
@@ -583,13 +567,13 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --stop
 
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
-`testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`, round-trip filter `0.5m`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
+`testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_a100x4x2_static_pods.py --replace
 ```
 
-이 launcher는 `configs/experiment/pre_bc_flow_control_a100x4x2_prefix_valid.yaml`을 사용합니다. 해당 preset은 `pre_bc_flow_control_2x4_h100`을 상속하므로 `train_batch_size=26`, `trainer.num_nodes=2`, `trainer.devices=4`, `precision=bf16-mixed`, `lr=6e-4`, `control_round_trip_max_position_error_m=0.5`는 그대로 유지합니다.
+이 launcher는 `configs/experiment/pre_bc_flow_control_a100x4x2_prefix_valid.yaml`을 사용합니다. 해당 preset은 `pre_bc_flow_control_2x4_h100`을 상속하므로 `train_batch_size=26`, `trainer.num_nodes=2`, `trainer.devices=4`, `precision=bf16-mixed`, `lr=6e-4`는 그대로 유지합니다.
 
 ```yaml
 model:
@@ -597,12 +581,11 @@ model:
     token_processor:
       use_kinematic_control_flow: true
       use_prefix_valid_future_loss_mask: true
-      control_round_trip_max_position_error_m: 0.5
 ```
 
 현재 브랜치의 `use_prefix_valid_future_loss_mask=true`는 가까운 미래부터 처음 끊기기 전까지의 연속 valid prefix 전체를 loss에 반영합니다.
 
-기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_roundtrip05_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
+기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_execctx_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
 
 tmux 확인:
 
@@ -642,10 +625,9 @@ model:
       use_prefix_valid_future_loss_mask: true
       control_vehicle_no_slip_point_ratio: 0.2289518863
       control_cyclist_no_slip_point_ratio: 0.0495847873
-      control_round_trip_max_position_error_m: 0.5
 ```
 
-기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_default_noslip_roundtrip05_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix-default-noslip`입니다. 실행 전에 실제 kubectl 명령을 확인하려면:
+기본 실험 이름은 `flow_control_space_pretrain_a100x4x2_prefix_default_noslip_execctx_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-a100x4x2-prefix-default-noslip`입니다. 실행 전에 실제 kubectl 명령을 확인하려면:
 
 ```bash
 python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_pods.py --dry-run
@@ -659,7 +641,7 @@ python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_
 
 #### V100 47GPU prefix-valid default no-slip ratio pretrain
 
-W&B의 `flow_control_space_pretrain_a100x4x2_prefix_default_noslip_roundtrip05_lr6e-4_bs26`와 objective 설정을 맞추고, hardware만 `sv~svvvv + testsv~testsvvvv + fv~fvvvvv` V100 47GPU fleet로 바꾸려면 아래 전용 launcher를 씁니다.
+W&B의 A100x4x2 prefix-valid default no-slip objective 설정을 맞추고, hardware만 `sv~svvvv + testsv~testsvvvv + fv~fvvvvv` V100 47GPU fleet로 바꾸려면 아래 전용 launcher를 씁니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py --replace
@@ -674,7 +656,7 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 
 비교 의도:
 
-- A100 run과 같은 control-space / non-holonomic / default no-slip ratio / round-trip filter 설정을 유지합니다.
+- A100 run과 같은 control-space / non-holonomic / default no-slip ratio 설정을 유지합니다.
 - `f278261 Add tail-prefix flow pretraining anchors` 이후의 `18-token / 16-anchor` Tail-Prefix supervision을 사용합니다.
 - hardware만 A100x4 pod 2개에서 V100 47GPU static fleet로 바꿉니다.
 
@@ -689,7 +671,6 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 - `model.model_config.token_processor.use_prefix_valid_future_loss_mask=true`
 - `model.model_config.token_processor.control_vehicle_no_slip_point_ratio=0.2289518863`
 - `model.model_config.token_processor.control_cyclist_no_slip_point_ratio=0.0495847873`
-- `model.model_config.token_processor.control_round_trip_max_position_error_m=0.5`
 - `trainer.precision=16-mixed`
 - `data.train_batch_size=4`, effective global batch `4 * 47 = 188`
 
@@ -697,7 +678,7 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 
 이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=4`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, `4 -> 2`처럼 batch를 낮추지 않습니다.
 
-기본 실험 이름은 `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4`이고, tmux session 이름은 `catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix`입니다.
+기본 실험 이름은 `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_execctx_lr6e-4_bs4`이고, tmux session 이름은 `catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix`입니다.
 
 실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:
 
@@ -736,7 +717,6 @@ scripts/launch_pre_bc_flow_control_v100x47_static_pods.py
 - `model.model_config.decoder.flow_window_steps=20`
 - `model.model_config.token_processor.use_kinematic_control_flow=true`
 - `model.model_config.token_processor.use_prefix_valid_future_loss_mask=true`
-- `model.model_config.token_processor.control_round_trip_max_position_error_m=0.5`
 - `data.train_batch_size=4`, effective global batch `4 * 47 = 188`
 - `model.model_config.lr=6e-4`
 
@@ -2432,4 +2412,4 @@ road_cache/
 - control-space Flow Matching에서 position scale은 계속 `1.0m` 공통값을 씁니다.
 - yaw scale은 agent type별로 적용합니다: vehicle `0.025rad`, cyclist `0.06rad`, pedestrian `0.20rad`.
 - 이 변경은 정규화/역정규화 좌표계만 바꾸며, decoder 구조와 loss 구성은 바꾸지 않습니다.
-- 학습 target 생성, metric용 pose 복원, round-trip error 계산 모두 같은 type-aware yaw scale을 씁니다.
+- transition-aligned 학습 target 생성과 metric용 pose 복원 모두 같은 type-aware yaw scale을 씁니다.

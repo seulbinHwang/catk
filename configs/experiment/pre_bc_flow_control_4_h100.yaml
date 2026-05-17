@@ -7,7 +7,7 @@
 #   * token processor builds GT labels on the fly as [delta_s, delta_n, delta_yaw].
 #   * decoder flow state dimension switches from pose-space 4D to control-space 3D.
 #   * metric/rollout paths restore predictions back to pose-space internally.
-#   * training masks GT anchors whose control round-trip position error is too large.
+#   * current-after-observation context and targets come from one transition-aligned trajectory.
 
 defaults:
   - pre_bc_flow_4_h100
@@ -22,4 +22,3 @@ model:
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20
       control_cyclist_yaw_scale_rad: 0.06
-      control_round_trip_max_position_error_m: 0.5

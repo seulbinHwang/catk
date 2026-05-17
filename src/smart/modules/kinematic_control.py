@@ -7,7 +7,6 @@ from torch import Tensor
 POSE_FLOW_DIM = 4
 CONTROL_FLOW_DIM = 3
 DEFAULT_CONTROL_POS_SCALE_M = 1.0
-DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M = 0.5
 DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO = 0.0
 DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO = 0.0
 POSE_NORM_POS_SCALE_M = 20.0
@@ -618,14 +617,13 @@ def build_rolling_control_target(
     )
 
 
-def build_rolling_control_target_with_round_trip_error(
-    future_pos: Tensor,
-    future_head: Tensor,
-    current_pos: Tensor,
-    current_head: Tensor,
+def build_transition_aligned_control_trajectory(
+    pos: Tensor,
+    heading: Tensor,
     agent_type: Tensor,
     agent_length: Tensor | None = None,
     *,
+    current_step: int,
     pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
     vehicle_yaw_scale_rad: float,
     pedestrian_yaw_scale_rad: float,
@@ -633,17 +631,17 @@ def build_rolling_control_target_with_round_trip_error(
     use_holonomic_model_only: bool = False,
     vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
     cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
-) -> tuple[Tensor, Tensor]:
-    """GT pose를 rolling control label로 바꾸고 복원 위치 오차를 함께 계산합니다.
+) -> tuple[Tensor, Tensor, Tensor]:
+    """관측 현재 이후를 한 번의 transition-consistent 실행 궤적으로 바꿉니다.
 
     Args:
-        future_pos: GT 미래 위치입니다. shape은 ``[N, T, 2]`` 입니다.
-        future_head: GT 미래 방향입니다. shape은 ``[N, T]`` 입니다.
-        current_pos: anchor 현재 위치입니다. shape은 ``[N, 2]`` 입니다.
-        current_head: anchor 현재 방향입니다. shape은 ``[N]`` 입니다.
+        pos: raw 중심점 전체 시계열입니다. shape은 ``[N, T, 2]`` 입니다.
+        heading: raw heading 전체 시계열입니다. shape은 ``[N, T]`` 입니다.
         agent_type: agent 종류입니다. shape은 ``[N]`` 입니다.
         agent_length: WOMD box length입니다. shape은 ``[N]`` 입니다.
             vehicle/cyclist no-slip point offset ratio가 0보다 클 때 씁니다.
+        current_step: raw 관측 현재 시점입니다. 이 시점까지는 raw 상태를 보존하고,
+            이후 step만 kinematic transition으로 실행한 상태로 대체합니다.
         pos_scale_m: 이동량 정규화에 쓸 meter 단위 값입니다.
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
@@ -653,15 +651,39 @@ def build_rolling_control_target_with_round_trip_error(
         cyclist_no_slip_point_ratio: cyclist box length에 곱하는 no-slip point offset 비율입니다.
 
     Returns:
-        tuple[Tensor, Tensor]:
-            정규화된 control label과 step별 위치 복원 오차입니다.
-            shape은 각각 ``[N, T, 3]`` 과 ``[N, T]`` 입니다.
+        tuple[Tensor, Tensor, Tensor]:
+            transition-aligned 위치, heading, 그리고 raw step별 정규화 control입니다.
+            위치/heading shape은 각각 ``[N, T, 2]`` 와 ``[N, T]`` 입니다.
+            control shape은 ``[N, T, 3]`` 이며, ``control[:, t]`` 는
+            ``t - 1 -> t`` transition control입니다. ``t <= current_step`` 값은 0입니다.
     """
-    control_norm = build_rolling_control_target(
-        future_pos=future_pos,
-        future_head=future_head,
-        current_pos=current_pos,
-        current_head=current_head,
+    if pos.ndim != 3 or pos.shape[-1] != 2:
+        raise ValueError(f"pos must have shape [N, T, 2], got {tuple(pos.shape)}.")
+    if tuple(heading.shape) != tuple(pos.shape[:2]):
+        raise ValueError(
+            "heading must have shape [N, T], "
+            f"got {tuple(heading.shape)} for pos {tuple(pos.shape)}."
+        )
+    if tuple(agent_type.shape) != (pos.shape[0],):
+        raise ValueError(f"agent_type must have shape [N], got {tuple(agent_type.shape)}.")
+    current_step = int(current_step)
+    if current_step < 0 or current_step >= pos.shape[1]:
+        raise ValueError(
+            "current_step must be inside the trajectory horizon, "
+            f"got current_step={current_step}, n_step={pos.shape[1]}."
+        )
+
+    aligned_pos = pos.clone()
+    aligned_heading = heading.clone()
+    control_norm_by_step = pos.new_zeros((pos.shape[0], pos.shape[1], CONTROL_FLOW_DIM))
+    if current_step + 1 >= pos.shape[1]:
+        return aligned_pos, aligned_heading, control_norm_by_step
+
+    future_control_norm = build_rolling_control_target(
+        future_pos=pos[:, current_step + 1 :],
+        future_head=heading[:, current_step + 1 :],
+        current_pos=pos[:, current_step],
+        current_head=heading[:, current_step],
         agent_type=agent_type,
         agent_length=agent_length,
         pos_scale_m=pos_scale_m,
@@ -672,23 +694,25 @@ def build_rolling_control_target_with_round_trip_error(
         vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
         cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )
-    control = denormalize_control(
-        control_norm=control_norm,
+    control_norm_by_step[:, current_step + 1 :] = future_control_norm
+    future_control = denormalize_control(
+        control_norm=future_control_norm,
         pos_scale_m=pos_scale_m,
         agent_type=agent_type,
         vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
-    decoded_pos, _ = decode_control_sequence(
-        control=control,
+    future_pos_aligned, future_head_aligned = decode_control_sequence(
+        control=future_control,
         agent_type=agent_type,
         agent_length=agent_length,
-        current_pos=current_pos,
-        current_head=current_head,
+        current_pos=pos[:, current_step],
+        current_head=heading[:, current_step],
         use_holonomic_model_only=use_holonomic_model_only,
         vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
         cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )
-    round_trip_error_m = torch.linalg.vector_norm(decoded_pos - future_pos, dim=-1)
-    return control_norm, round_trip_error_m
+    aligned_pos[:, current_step + 1 :] = future_pos_aligned
+    aligned_heading[:, current_step + 1 :] = future_head_aligned
+    return aligned_pos, aligned_heading, control_norm_by_step

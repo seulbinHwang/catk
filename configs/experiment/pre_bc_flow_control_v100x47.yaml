@@ -40,7 +40,6 @@ model:
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20
       control_cyclist_yaw_scale_rad: 0.06
-      control_round_trip_max_position_error_m: 0.5
 
 ckpt_path: null
 

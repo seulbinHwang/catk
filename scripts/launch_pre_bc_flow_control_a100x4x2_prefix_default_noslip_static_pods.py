@@ -22,7 +22,7 @@ DEFAULT_PODS = ("testa", "testaa")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_a100x4x2_prefix_default_noslip"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_a100x4x2_prefix_default_noslip_"
-    "roundtrip05_lr6e-4_bs26"
+    "execctx_lr6e-4_bs26"
 )
 DEFAULT_SESSION = "catk-control-pretrain-a100x4x2-prefix-default-noslip"
 

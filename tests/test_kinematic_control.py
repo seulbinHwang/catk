@@ -10,7 +10,7 @@ from src.smart.modules.kinematic_control import (
     PEDESTRIAN_TYPE_ID,
     VEHICLE_TYPE_ID,
     build_rolling_control_target,
-    build_rolling_control_target_with_round_trip_error,
+    build_transition_aligned_control_trajectory,
     control_norm_to_pose_norm,
     decode_control_sequence,
     denormalize_control,
@@ -204,14 +204,14 @@ def test_vehicle_no_slip_point_ratio_requires_agent_length() -> None:
         )
 
 
-def test_holonomic_model_only_lets_vehicle_use_lateral_channel_and_round_trip() -> None:
+def test_holonomic_model_only_lets_vehicle_use_lateral_channel_and_reconstruct() -> None:
     current_pos = torch.tensor([[0.0, 0.0]])
     current_head = torch.tensor([0.0])
     future_pos = torch.tensor([[[1.0, 0.2], [2.0, 0.5]]])
     future_head = torch.tensor([[0.1, 0.2]])
     agent_type = torch.tensor([VEHICLE_TYPE_ID])
 
-    control_norm, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
+    control_norm = build_rolling_control_target(
         future_pos=future_pos,
         future_head=future_head,
         current_pos=current_pos,
@@ -232,7 +232,6 @@ def test_holonomic_model_only_lets_vehicle_use_lateral_channel_and_round_trip() 
     assert torch.any(control[..., 1].abs() > 1.0e-6)
     torch.testing.assert_close(decoded_pos, future_pos, atol=1.0e-5, rtol=1.0e-5)
     torch.testing.assert_close(decoded_head, future_head, atol=1.0e-5, rtol=1.0e-5)
-    torch.testing.assert_close(round_trip_error_m, torch.zeros_like(round_trip_error_m), atol=1.0e-5, rtol=1.0e-5)
 
 
 def test_cyclist_rolling_control_uses_no_lateral_channel_and_round_trips() -> None:
@@ -335,43 +334,34 @@ def test_rolling_projection_round_trip_for_vehicle_uses_decoder_consistent_pose(
     torch.testing.assert_close(decoded_pos[:, 0], expected_pos, atol=1.0e-5, rtol=1.0e-5)
 
 
-def test_round_trip_error_reports_vehicle_lateral_teleport() -> None:
-    current_pos = torch.tensor([[0.0, 0.0]])
-    current_head = torch.tensor([0.0])
-    future_pos = torch.tensor([[[0.0, 6.0]]])
-    future_head = torch.tensor([[0.0]])
+def test_transition_aligned_trajectory_keeps_history_raw_and_projects_future() -> None:
+    pos = torch.zeros((1, 4, 2), dtype=torch.float32)
+    pos[0, 0] = torch.tensor([-1.0, 0.5])
+    pos[0, 1] = torch.tensor([0.0, 0.0])
+    pos[0, 2] = torch.tensor([0.0, 6.0])
+    pos[0, 3] = torch.tensor([1.0, 6.0])
+    heading = torch.zeros((1, 4), dtype=torch.float32)
     agent_type = torch.tensor([VEHICLE_TYPE_ID])
 
-    control_norm, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
-        future_pos=future_pos,
-        future_head=future_head,
-        current_pos=current_pos,
-        current_head=current_head,
+    aligned_pos, aligned_head, control_norm_by_step = build_transition_aligned_control_trajectory(
+        pos=pos,
+        heading=heading,
+        agent_type=agent_type,
+        current_step=1,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+
+    control = denormalize_control(
+        control_norm_by_step[:, 2:],
         agent_type=agent_type,
         **CONTROL_YAW_SCALE_KWARGS,
     )
 
-    assert tuple(control_norm.shape) == (1, 1, 3)
-    torch.testing.assert_close(round_trip_error_m, torch.tensor([[6.0]]), atol=1.0e-5, rtol=1.0e-5)
-
-
-def test_round_trip_error_is_zero_for_pedestrian() -> None:
-    current_pos = torch.tensor([[0.0, 0.0]])
-    current_head = torch.tensor([0.0])
-    future_pos = torch.tensor([[[0.0, 6.0]]])
-    future_head = torch.tensor([[0.0]])
-    agent_type = torch.tensor([PEDESTRIAN_TYPE_ID])
-
-    _, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
-        future_pos=future_pos,
-        future_head=future_head,
-        current_pos=current_pos,
-        current_head=current_head,
-        agent_type=agent_type,
-        **CONTROL_YAW_SCALE_KWARGS,
-    )
-
-    torch.testing.assert_close(round_trip_error_m, torch.zeros_like(round_trip_error_m))
+    torch.testing.assert_close(aligned_pos[:, :2], pos[:, :2])
+    torch.testing.assert_close(aligned_head[:, :2], heading[:, :2])
+    torch.testing.assert_close(control[..., 1], torch.zeros_like(control[..., 1]))
+    torch.testing.assert_close(aligned_pos[:, 2, 1], torch.zeros(1), atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(aligned_head[:, 2:], heading[:, 2:], atol=1.0e-5, rtol=1.0e-5)
 
 
 def test_pedestrian_uses_pedestrian_type_id_constant() -> None:

@@ -7,6 +7,7 @@ from src.smart.modules.flow_agent_decoder import SMARTFlowAgentDecoder
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.modules.kinematic_control import (
     VEHICLE_TYPE_ID,
+    build_transition_aligned_control_trajectory,
     control_norm_to_pose_norm,
 )
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
@@ -55,27 +56,37 @@ def _make_control_processor() -> FlowTokenProcessor:
     return processor
 
 
-def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
+def test_control_metric_target_uses_transition_aligned_projection() -> None:
     processor = _make_control_processor()
     pos = torch.zeros((1, 3, 2), dtype=torch.float32)
     pos[0, 1] = torch.tensor([0.0, 1.0])
     pos[0, 2] = torch.tensor([0.0, 2.0])
     heading = torch.zeros((1, 3), dtype=torch.float32)
-    current_pos = pos[:, 0]
-    current_head = heading[:, 0]
     agent_type = torch.tensor([VEHICLE_TYPE_ID])
     agent_length = torch.tensor([4.0])
     anchor_mask = torch.tensor([True])
-
-    control_target = processor._build_anchor_clean_norm(
+    aligned_pos, aligned_heading, transition_control_norm_by_step = build_transition_aligned_control_trajectory(
         pos=pos,
         heading=heading,
-        current_pos=current_pos,
-        current_head=current_head,
         agent_type=agent_type,
         agent_length=agent_length,
+        current_step=0,
+        pos_scale_m=processor.control_pos_scale_m,
+        vehicle_yaw_scale_rad=processor.control_vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=processor.control_pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=processor.control_cyclist_yaw_scale_rad,
+        vehicle_no_slip_point_ratio=processor.control_vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=processor.control_cyclist_no_slip_point_ratio,
+    )
+
+    control_target = processor._build_anchor_clean_norm(
+        pos=aligned_pos,
+        heading=aligned_heading,
+        current_pos=aligned_pos[:, 0],
+        current_head=aligned_heading[:, 0],
         anchor_mask=anchor_mask,
         raw_step=0,
+        transition_control_norm_by_step=transition_control_norm_by_step,
     )
     projection_target = control_norm_to_pose_norm(
         control_norm=control_target,
@@ -87,21 +98,20 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
         vehicle_no_slip_point_ratio=processor.control_vehicle_no_slip_point_ratio,
         cyclist_no_slip_point_ratio=processor.control_cyclist_no_slip_point_ratio,
     )
-    raw_metric_target = processor._build_anchor_clean_norm(
-        pos=pos,
-        heading=heading,
-        current_pos=current_pos,
-        current_head=current_head,
-        agent_type=agent_type,
-        agent_length=agent_length,
+    aligned_metric_target = processor._build_anchor_clean_norm(
+        pos=aligned_pos,
+        heading=aligned_heading,
+        current_pos=aligned_pos[:, 0],
+        current_head=aligned_heading[:, 0],
         anchor_mask=anchor_mask,
         raw_step=0,
         force_pose_space=True,
+        transition_control_norm_by_step=transition_control_norm_by_step,
     )
 
     assert tuple(control_target.shape) == (1, 2, 3)
-    assert tuple(raw_metric_target.shape) == (1, 2, 4)
-    torch.testing.assert_close(raw_metric_target[0, :, 1], torch.tensor([1.0 / 20.0, 2.0 / 20.0]))
+    assert tuple(aligned_metric_target.shape) == (1, 2, 4)
+    torch.testing.assert_close(aligned_metric_target, projection_target)
     torch.testing.assert_close(projection_target[0, :, 1], torch.zeros(2))
 
 

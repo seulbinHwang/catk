@@ -18,7 +18,6 @@ def _build_processor(use_prefix_valid_future_loss_mask: bool) -> FlowTokenProces
     processor = FlowTokenProcessor.__new__(FlowTokenProcessor)
     processor.flow_window_steps = 5
     processor.use_prefix_valid_future_loss_mask = use_prefix_valid_future_loss_mask
-    processor.control_round_trip_max_position_error_m = 5.0
     return processor
 
 
@@ -30,7 +29,36 @@ def _build_target_processor(use_prefix_valid_future_loss_mask: bool) -> FlowToke
     processor.flow_target_dim = 4
     processor.use_prefix_valid_future_loss_mask = use_prefix_valid_future_loss_mask
     processor.use_kinematic_control_flow = False
-    processor.control_round_trip_max_position_error_m = 5.0
+    return processor
+
+
+def _build_control_target_processor() -> FlowTokenProcessor:
+    processor = _build_target_processor(use_prefix_valid_future_loss_mask=True)
+    processor.use_kinematic_control_flow = True
+    processor.flow_target_dim = 3
+    processor.use_holonomic_model_only = False
+    processor.control_pos_scale_m = 1.0
+    processor.control_vehicle_yaw_scale_rad = 0.025
+    processor.control_pedestrian_yaw_scale_rad = 0.20
+    processor.control_cyclist_yaw_scale_rad = 0.06
+    processor.control_vehicle_no_slip_point_ratio = 0.0
+    processor.control_cyclist_no_slip_point_ratio = 0.0
+
+    def match_from_passed_trajectory(valid, pos, heading, agent_type, agent_shape):
+        coarse_steps = list(range(processor.shift, valid.shape[1], processor.shift))
+        shape = (pos.shape[0], len(coarse_steps))
+        token_idx = torch.zeros(shape, dtype=torch.long, device=pos.device)
+        return {
+            "valid_mask": valid[:, coarse_steps],
+            "gt_idx": token_idx,
+            "gt_pos": pos[:, coarse_steps],
+            "gt_heading": heading[:, coarse_steps],
+            "sampled_idx": token_idx,
+            "sampled_pos": pos[:, coarse_steps],
+            "sampled_heading": heading[:, coarse_steps],
+        }
+
+    processor._match_agent_token = match_from_passed_trajectory
     return processor
 
 
@@ -42,6 +70,7 @@ def _build_tokenized_agent_for_18_context() -> dict[str, torch.Tensor]:
         "valid_mask": torch.ones((1, 18), dtype=torch.bool),
         "type": torch.zeros((1,), dtype=torch.long),
         "shape": torch.tensor([[2.0, 4.8, 1.5]], dtype=torch.float32),
+        "token_agent_shape": torch.tensor([[2.0, 4.8]], dtype=torch.float32),
     }
 
 
@@ -107,35 +136,6 @@ def test_full_window_future_loss_mask_keeps_original_behavior() -> None:
     assert torch.equal(loss_mask, expected)
 
 
-def test_control_round_trip_keep_mask_filters_only_large_valid_step_error() -> None:
-    """유효한 미래 step에서만 5m 초과 복원 오차 anchor를 제거하는지 확인합니다."""
-    processor = _build_processor(use_prefix_valid_future_loss_mask=True)
-
-    round_trip_error_m = torch.tensor(
-        [
-            [0.0, 4.9, 9.0, 0.0, 0.0],
-            [0.0, 5.1, 0.0, 0.0, 0.0],
-            [0.0, 5.0, 0.0, 0.0, 0.0],
-        ]
-    )
-    future_loss_mask = torch.tensor(
-        [
-            [True, True, False, False, False],
-            [True, True, True, False, False],
-            [True, True, True, False, False],
-        ],
-        dtype=torch.bool,
-    )
-
-    keep_mask = processor._build_control_round_trip_keep_mask(
-        round_trip_error_m=round_trip_error_m,
-        future_loss_mask=future_loss_mask,
-    )
-
-    expected = torch.tensor([True, False, True], dtype=torch.bool)
-    assert torch.equal(keep_mask, expected)
-
-
 def test_flow_targets_use_18_context_and_16_prefix_valid_anchors() -> None:
     processor = _build_target_processor(use_prefix_valid_future_loss_mask=True)
 
@@ -171,6 +171,33 @@ def test_flow_targets_keep_16_anchor_slots_for_full_window_mode() -> None:
         out["flow_train_loss_mask"].sum(dim=1).cpu(),
         torch.tensor([20] * 13),
     )
+
+
+def test_control_flow_targets_retokenize_context_from_transition_aligned_future() -> None:
+    processor = _build_control_target_processor()
+    tokenized_agent = {
+        "type": torch.zeros((1,), dtype=torch.long),
+        "shape": torch.tensor([[2.0, 4.8, 1.5]], dtype=torch.float32),
+        "token_agent_shape": torch.tensor([[2.0, 4.8]], dtype=torch.float32),
+    }
+    processed_agent = _build_processed_agent_for_full_womd_horizon()
+    processed_agent["pos"][0, 11:, 0] = torch.arange(1, 81, dtype=torch.float32)
+    processed_agent["pos"][0, 11:, 1] = 1.0
+
+    out = processor._build_flow_targets(
+        data={"agent": {}},
+        tokenized_agent=tokenized_agent,
+        processed_agent=processed_agent,
+    )
+
+    assert tuple(out["flow_train_clean_norm"].shape) == (16, 20, 3)
+    torch.testing.assert_close(out["flow_train_clean_norm"][0, :, 1], torch.zeros(20))
+    torch.testing.assert_close(out["flow_train_clean_metric_norm"][0, :, 1], torch.zeros(20))
+    # token 0/1 are observed raw history ending at raw step 5/10; token 2 is the
+    # first current-after-observation context token and must come from the
+    # transition-aligned future rather than the raw lateral-offset GT.
+    torch.testing.assert_close(out["ctx_sampled_pos"][0, 1], processed_agent["pos"][0, 10])
+    torch.testing.assert_close(out["ctx_sampled_pos"][0, 2, 1], torch.tensor(0.0))
 
 
 def test_anchor_context_uses_mask_width_and_ignores_extra_tail_context() -> None:

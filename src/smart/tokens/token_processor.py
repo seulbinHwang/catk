@@ -130,11 +130,14 @@ class TokenProcessor(torch.nn.Module):
         self,
         data: HeteroData,
         return_preprocessed: bool = False,
+        match_tokens: bool = True,
     ) -> Dict[str, Tensor] | tuple[Dict[str, Tensor], Dict[str, Tensor]]:
         """
         Args:
             data: 원본 에이전트 정보가 들어있는 배치입니다.
             return_preprocessed: True면 토큰 결과와 함께 전처리된 시계열을 같이 돌려줍니다.
+            match_tokens: False면 token matching을 건너뜁니다. 호출자가 전처리된
+                시계열을 다른 상태계로 바꾼 뒤 직접 ``_match_agent_token`` 을 적용할 때 씁니다.
 
         Returns:
             Dict[str, Tensor] | tuple[Dict[str, Tensor], Dict[str, Tensor]]:
@@ -206,14 +209,15 @@ class TokenProcessor(torch.nn.Module):
                 }
             )
 
-        token_dict = self._match_agent_token(
-            valid=valid,
-            pos=pos,
-            heading=heading,
-            agent_type=agent_type,
-            agent_shape=agent_shape,
-        )
-        tokenized_agent.update(token_dict)
+        if match_tokens:
+            token_dict = self._match_agent_token(
+                valid=valid,
+                pos=pos,
+                heading=heading,
+                agent_type=agent_type,
+                agent_shape=agent_shape,
+            )
+            tokenized_agent.update(token_dict)
 
         if return_preprocessed:
             return tokenized_agent, {

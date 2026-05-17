@@ -3,8 +3,8 @@
 # V100x47 counterpart of
 # `pre_bc_flow_control_a100x4x2_prefix_default_noslip`.
 #
-# This preset keeps the same objective-side settings as the A100x4x2 W&B run:
-#   flow_control_space_pretrain_a100x4x2_prefix_default_noslip_roundtrip05_lr6e-4_bs26
+# This preset keeps the same objective-side settings as the A100x4x2
+# prefix-default-no-slip control run.
 #
 # Intended differences:
 #   * f278261 tail-prefix data expansion is active through
@@ -31,7 +31,6 @@ model:
       use_prefix_valid_future_loss_mask: true
       control_vehicle_no_slip_point_ratio: 0.2289518863
       control_cyclist_no_slip_point_ratio: 0.0495847873
-      control_round_trip_max_position_error_m: 0.5
 
 data:
   train_batch_size: 4

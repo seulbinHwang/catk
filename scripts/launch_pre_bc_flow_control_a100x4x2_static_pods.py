@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default="pre_bc_flow_control_a100x4x2_prefix_valid")
     parser.add_argument(
         "--task-name",
-        default="flow_control_space_pretrain_a100x4x2_prefix_roundtrip05_lr6e-4_bs26",
+        default="flow_control_space_pretrain_a100x4x2_prefix_execctx_lr6e-4_bs26",
     )
     parser.add_argument("--session", default="catk-control-pretrain-a100x4x2-prefix")
     parser.add_argument("--initial-bs", type=int, default=26)

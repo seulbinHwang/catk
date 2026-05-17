@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Launch the V100x47 prefix-valid default no-slip control pretrain.
 
-This is the static V100-fleet counterpart of the A100x4x2 W&B run:
-
-    flow_control_space_pretrain_a100x4x2_prefix_default_noslip_roundtrip05_lr6e-4_bs26
+This is the static V100-fleet counterpart of the A100x4x2 prefix-default-no-slip run.
 
 It reuses the generic V100x47 launcher for heterogeneous pod GPU counts,
 manual rank offsets, checkpoint sync, and OOM restart. Unlike the fallback
@@ -41,7 +39,7 @@ DEFAULT_PODS = (
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_v100x47_prefix_default_noslip"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_"
-    "roundtrip05_lr6e-4_bs4"
+    "execctx_lr6e-4_bs4"
 )
 DEFAULT_SESSION = "catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix"
 

@@ -10,11 +10,9 @@ from src.smart.modules.kinematic_control import (
     CONTROL_FLOW_DIM,
     DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
     DEFAULT_CONTROL_POS_SCALE_M,
-    DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
     DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
     POSE_FLOW_DIM,
-    build_rolling_control_target,
-    build_rolling_control_target_with_round_trip_error,
+    build_transition_aligned_control_trajectory,
     validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
 )
@@ -45,7 +43,6 @@ class FlowTokenProcessor(TokenProcessor):
         control_cyclist_yaw_scale_rad: float | None = None,
         control_vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
         control_cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
-        control_round_trip_max_position_error_m: float = DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
     ) -> None:
         super().__init__(
             map_token_file=map_token_file,
@@ -81,14 +78,6 @@ class FlowTokenProcessor(TokenProcessor):
                 pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                 cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
             )
-        self.control_round_trip_max_position_error_m = float(
-            control_round_trip_max_position_error_m
-        )
-        if self.control_round_trip_max_position_error_m <= 0.0:
-            raise ValueError(
-                "control_round_trip_max_position_error_m must be positive, "
-                f"got {self.control_round_trip_max_position_error_m}."
-            )
         self.flow_target_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
 
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
@@ -105,6 +94,7 @@ class FlowTokenProcessor(TokenProcessor):
         tokenized_agent, processed_agent = self.tokenize_agent(
             data,
             return_preprocessed=True,
+            match_tokens=not self.use_kinematic_control_flow,
         )
         tokenized_agent = self._build_flow_targets(
             data=data,
@@ -133,6 +123,38 @@ class FlowTokenProcessor(TokenProcessor):
         valid = processed_agent["valid"]
         pos = processed_agent["pos"]
         heading = processed_agent["heading"]
+
+        target_pos = pos
+        target_heading = heading
+        transition_control_norm_by_step: Tensor | None = None
+        if self.use_kinematic_control_flow:
+            (
+                target_pos,
+                target_heading,
+                transition_control_norm_by_step,
+            ) = build_transition_aligned_control_trajectory(
+                pos=pos,
+                heading=heading,
+                agent_type=tokenized_agent["type"],
+                agent_length=tokenized_agent["shape"][:, 0],
+                current_step=self.shift * 2,
+                pos_scale_m=self.control_pos_scale_m,
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+                use_holonomic_model_only=self.use_holonomic_model_only,
+                vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+                cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
+            )
+            tokenized_agent.update(
+                self._match_agent_token(
+                    valid=valid,
+                    pos=target_pos,
+                    heading=target_heading,
+                    agent_type=tokenized_agent["type"],
+                    agent_shape=tokenized_agent["token_agent_shape"],
+                )
+            )
 
         ctx_sampled_idx = tokenized_agent["sampled_idx"][:, :FLOW_CONTEXT_TOKEN_COUNT].contiguous()
         ctx_sampled_pos = tokenized_agent["sampled_pos"][:, :FLOW_CONTEXT_TOKEN_COUNT].contiguous()
@@ -178,37 +200,19 @@ class FlowTokenProcessor(TokenProcessor):
                 if not train_anchor_mask.any():
                     continue
 
-                current_pos = pos[:, raw_step]
-                current_head = heading[:, raw_step]
+                current_pos = target_pos[:, raw_step]
+                current_head = target_heading[:, raw_step]
                 selected_future_loss_mask = future_loss_mask[train_anchor_mask]
-                flow_clean_result = self._build_anchor_clean_norm(
-                    pos=pos,
-                    heading=heading,
+                flow_train_clean_norm = self._build_anchor_clean_norm(
+                    pos=target_pos,
+                    heading=target_heading,
                     current_pos=current_pos,
                     current_head=current_head,
-                    agent_type=tokenized_agent["type"],
-                    agent_length=tokenized_agent["shape"][:, 0],
                     anchor_mask=train_anchor_mask,
                     raw_step=raw_step,
                     future_loss_mask=selected_future_loss_mask,
-                    return_round_trip_error=self.use_kinematic_control_flow,
+                    transition_control_norm_by_step=transition_control_norm_by_step,
                 )
-                if self.use_kinematic_control_flow:
-                    flow_train_clean_norm, round_trip_error_m = flow_clean_result
-                    keep_mask = self._build_control_round_trip_keep_mask(
-                        round_trip_error_m=round_trip_error_m,
-                        future_loss_mask=selected_future_loss_mask,
-                    )
-                    if not bool(keep_mask.all().item()):
-                        selected_agent_index = train_anchor_mask.nonzero(as_tuple=False).flatten()
-                        kept_agent_index = selected_agent_index[keep_mask]
-                        filtered_train_anchor_mask = torch.zeros_like(train_anchor_mask)
-                        filtered_train_anchor_mask[kept_agent_index] = True
-                        train_anchor_mask = filtered_train_anchor_mask
-                        flow_train_clean_norm = flow_train_clean_norm[keep_mask]
-                        selected_future_loss_mask = selected_future_loss_mask[keep_mask]
-                else:
-                    flow_train_clean_norm = flow_clean_result
 
                 flow_train_mask[:, anchor_offset] = train_anchor_mask
                 if not train_anchor_mask.any():
@@ -216,16 +220,15 @@ class FlowTokenProcessor(TokenProcessor):
 
                 flow_train_metric_norm = (
                     self._build_anchor_clean_norm(
-                        pos=pos,
-                        heading=heading,
+                        pos=target_pos,
+                        heading=target_heading,
                         current_pos=current_pos,
                         current_head=current_head,
-                        agent_type=tokenized_agent["type"],
-                        agent_length=tokenized_agent["shape"][:, 0],
                         anchor_mask=train_anchor_mask,
                         raw_step=raw_step,
                         future_loss_mask=selected_future_loss_mask,
                         force_pose_space=True,
+                        transition_control_norm_by_step=transition_control_norm_by_step,
                     )
                     if self.use_kinematic_control_flow
                     else flow_train_clean_norm
@@ -298,27 +301,25 @@ class FlowTokenProcessor(TokenProcessor):
             flow_eval_agent_type_chunks.append(tokenized_agent["type"][anchor_mask])
             flow_eval_agent_length_chunks.append(tokenized_agent["shape"][anchor_mask, 0])
             flow_eval_clean_norm = self._build_anchor_clean_norm(
-                pos=pos,
-                heading=heading,
-                current_pos=pos[:, raw_step],
-                current_head=heading[:, raw_step],
-                agent_type=tokenized_agent["type"],
-                agent_length=tokenized_agent["shape"][:, 0],
+                pos=target_pos,
+                heading=target_heading,
+                current_pos=target_pos[:, raw_step],
+                current_head=target_heading[:, raw_step],
                 anchor_mask=anchor_mask,
                 raw_step=raw_step,
+                transition_control_norm_by_step=transition_control_norm_by_step,
             )
             flow_eval_chunks.append(flow_eval_clean_norm)
             flow_eval_metric_chunks.append(
                 self._build_anchor_clean_norm(
-                    pos=pos,
-                    heading=heading,
-                    current_pos=pos[:, raw_step],
-                    current_head=heading[:, raw_step],
-                    agent_type=tokenized_agent["type"],
-                    agent_length=tokenized_agent["shape"][:, 0],
+                    pos=target_pos,
+                    heading=target_heading,
+                    current_pos=target_pos[:, raw_step],
+                    current_head=target_heading[:, raw_step],
                     anchor_mask=anchor_mask,
                     raw_step=raw_step,
                     force_pose_space=True,
+                    transition_control_norm_by_step=transition_control_norm_by_step,
                 )
                 if self.use_kinematic_control_flow
                 else flow_eval_clean_norm
@@ -351,34 +352,6 @@ class FlowTokenProcessor(TokenProcessor):
             }
         )
         return tokenized_agent
-
-    def _build_control_round_trip_keep_mask(
-        self,
-        round_trip_error_m: Tensor,
-        future_loss_mask: Tensor,
-    ) -> Tensor:
-        """control 복원 위치 오차가 설정값 이하인 anchor만 남깁니다."""
-        if round_trip_error_m.ndim != 2:
-            raise ValueError(
-                "round_trip_error_m must have shape [n_valid_anchor, flow_window_steps], "
-                f"got {tuple(round_trip_error_m.shape)}."
-            )
-        if tuple(future_loss_mask.shape) != tuple(round_trip_error_m.shape):
-            raise ValueError(
-                "future_loss_mask shape must match round_trip_error_m: "
-                f"expected={tuple(round_trip_error_m.shape)}, actual={tuple(future_loss_mask.shape)}."
-            )
-        if round_trip_error_m.shape[0] == 0:
-            return torch.zeros((0,), device=round_trip_error_m.device, dtype=torch.bool)
-
-        mask = future_loss_mask.to(device=round_trip_error_m.device, dtype=torch.bool)
-        masked_error_m = torch.where(
-            mask,
-            round_trip_error_m,
-            torch.zeros_like(round_trip_error_m),
-        )
-        max_position_error_m = masked_error_m.max(dim=1).values
-        return max_position_error_m <= self.control_round_trip_max_position_error_m
 
     def _assert_flow_train_anchor_context_valid(
         self,
@@ -498,14 +471,12 @@ class FlowTokenProcessor(TokenProcessor):
         heading: Tensor,
         current_pos: Tensor,
         current_head: Tensor,
-        agent_type: Tensor,
-        agent_length: Tensor | None,
         anchor_mask: Tensor,
         raw_step: int,
         future_loss_mask: Tensor | None = None,
-        return_round_trip_error: bool = False,
         force_pose_space: bool = False,
-    ) -> Tensor | Tuple[Tensor, Tensor]:
+        transition_control_norm_by_step: Tensor | None = None,
+    ) -> Tensor:
         """한 anchor에서 실제로 쓰는 agent만 골라 미래 목표를 만듭니다.
 
         Args:
@@ -513,42 +484,95 @@ class FlowTokenProcessor(TokenProcessor):
             heading: 전처리된 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
             current_pos: 현재 coarse anchor 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 coarse anchor 방향입니다. shape은 ``[n_agent]`` 입니다.
-            agent_type: agent 종류입니다. shape은 ``[n_agent]`` 입니다.
-            agent_length: WOMD box length입니다. shape은 ``[n_agent]`` 입니다.
             anchor_mask: 이번 anchor를 실제로 학습 또는 평가에 쓰는지 나타냅니다.
                 shape은 ``[n_agent]`` 입니다.
             raw_step: 현재 coarse anchor가 가리키는 10Hz 시점 번호입니다.
             future_loss_mask: loss에 포함할 미래 step입니다.
                 shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
                 값이 없으면 전체 window를 모두 사용합니다.
-            return_round_trip_error: control-space label의 복원 위치 오차도 함께 돌려줄지 정합니다.
-            force_pose_space: control-space 학습 중에도 raw GT 기준 pose-space target을
-                만들어 open-loop metric 정답으로 쓸 때 켭니다.
+            force_pose_space: control-space 학습 중에도 transition-aligned pose-space
+                target을 만들어 open-loop metric 정답으로 쓸 때 켭니다.
+            transition_control_norm_by_step: ``use_kinematic_control_flow=True`` 일 때
+                관측 현재 이후 전체 궤적을 한 번만 변환하며 만든 raw-step별 control입니다.
+                shape은 ``[n_agent, n_step, 3]`` 입니다.
 
         Returns:
-            Tensor | Tuple[Tensor, Tensor]:
+            Tensor:
                 정규화된 미래 목표입니다.
                 pose-space에서는 ``[n_valid_anchor, flow_window_steps, 4]`` 이고,
                 control-space에서는 ``[n_valid_anchor, flow_window_steps, 3]`` 입니다.
-                ``return_round_trip_error=True`` 이면 두 번째 값으로 meter 단위 복원 오차
-                ``[n_valid_anchor, flow_window_steps]`` 를 함께 돌려줍니다.
         """
-        if force_pose_space and return_round_trip_error:
-            raise ValueError("force_pose_space cannot be combined with return_round_trip_error.")
         num_valid_anchor = int(anchor_mask.sum().item())
         if num_valid_anchor == 0:
             target_dim = POSE_FLOW_DIM if force_pose_space else self.flow_target_dim
-            empty_target = pos.new_zeros((0, self.flow_window_steps, target_dim))
-            if return_round_trip_error:
-                return empty_target, pos.new_zeros((0, self.flow_window_steps))
-            return empty_target
+            return pos.new_zeros((0, self.flow_window_steps, target_dim))
+
+        future_start = raw_step + 1
+        future_end = future_start + self.flow_window_steps
+
+        if self.use_kinematic_control_flow and not force_pose_space:
+            if future_loss_mask is None:
+                if future_end > pos.shape[1]:
+                    raise ValueError(
+                        "Requested flow future window exceeds the available sequence length: "
+                        f"raw_step={raw_step}, flow_window_steps={self.flow_window_steps}, "
+                        f"n_step={pos.shape[1]}."
+                    )
+            else:
+                expected_shape = (num_valid_anchor, self.flow_window_steps)
+                if tuple(future_loss_mask.shape) != expected_shape:
+                    raise ValueError(
+                        "future_loss_mask shape must match selected anchors and flow_window_steps: "
+                        f"expected={expected_shape}, actual={tuple(future_loss_mask.shape)}."
+                    )
+                future_loss_mask = future_loss_mask.to(device=pos.device, dtype=torch.bool)
+                valid_step_count = future_loss_mask.long().sum(dim=1)
+                if bool((valid_step_count <= 0).any().item()):
+                    raise ValueError("future_loss_mask must contain at least one valid future step per anchor.")
+
+            if transition_control_norm_by_step is None:
+                raise ValueError(
+                    "transition_control_norm_by_step is required for control-space flow targets."
+                )
+            if (
+                transition_control_norm_by_step.ndim != 3
+                or transition_control_norm_by_step.shape[-1] != CONTROL_FLOW_DIM
+            ):
+                raise ValueError(
+                    "transition_control_norm_by_step must have shape [n_agent, n_step, 3], "
+                    f"got {tuple(transition_control_norm_by_step.shape)}."
+                )
+            if transition_control_norm_by_step.shape[0] != pos.shape[0]:
+                raise ValueError(
+                    "transition_control_norm_by_step agent count must match pos: "
+                    f"got {transition_control_norm_by_step.shape[0]} and {pos.shape[0]}."
+                )
+            control_start = raw_step + 1
+            control_target = pos.new_zeros((num_valid_anchor, self.flow_window_steps, CONTROL_FLOW_DIM))
+            available_len = min(
+                self.flow_window_steps,
+                max(0, transition_control_norm_by_step.shape[1] - control_start),
+            )
+            if available_len > 0:
+                control_target[:, :available_len] = transition_control_norm_by_step[
+                    anchor_mask,
+                    control_start : control_start + available_len,
+                ]
+            if future_loss_mask is not None:
+                control_target = control_target.masked_fill(
+                    ~future_loss_mask.unsqueeze(-1),
+                    0.0,
+                )
+            elif available_len != self.flow_window_steps:
+                raise ValueError(
+                    "Requested control future window exceeds the available transition horizon: "
+                    f"raw_step={raw_step}, flow_window_steps={self.flow_window_steps}, "
+                    f"n_step={transition_control_norm_by_step.shape[1]}."
+                )
+            return control_target
 
         selected_current_pos = current_pos[anchor_mask]
         selected_current_head = current_head[anchor_mask]
-        selected_agent_type = agent_type[anchor_mask]
-        selected_agent_length = agent_length[anchor_mask] if agent_length is not None else None
-        future_start = raw_step + 1
-        future_end = future_start + self.flow_window_steps
 
         if future_loss_mask is None:
             if future_end > pos.shape[1]:
@@ -605,42 +629,6 @@ class FlowTokenProcessor(TokenProcessor):
                 last_valid_head.unsqueeze(1),
                 future_head,
             )
-
-        if self.use_kinematic_control_flow and not force_pose_space:
-            if return_round_trip_error:
-                return build_rolling_control_target_with_round_trip_error(
-                    future_pos=future_pos,
-                    future_head=future_head,
-                    current_pos=selected_current_pos,
-                    current_head=selected_current_head,
-                    agent_type=selected_agent_type,
-                    agent_length=selected_agent_length,
-                    pos_scale_m=self.control_pos_scale_m,
-                    vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
-                    pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
-                    cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
-                    use_holonomic_model_only=self.use_holonomic_model_only,
-                    vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
-                    cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
-                )
-            return build_rolling_control_target(
-                future_pos=future_pos,
-                future_head=future_head,
-                current_pos=selected_current_pos,
-                current_head=selected_current_head,
-                agent_type=selected_agent_type,
-                agent_length=selected_agent_length,
-                pos_scale_m=self.control_pos_scale_m,
-                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
-                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
-                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
-                use_holonomic_model_only=self.use_holonomic_model_only,
-                vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
-                cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
-            )
-
-        if return_round_trip_error:
-            raise ValueError("return_round_trip_error is only supported for control-space flow targets.")
 
         future_pos_local, future_head_local = transform_to_local(
             pos_global=future_pos,
