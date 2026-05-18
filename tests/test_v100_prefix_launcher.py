@@ -44,12 +44,15 @@ def test_latest_prefix_v100_launcher_uses_distinct_task_name() -> None:
     )
 
     assert "launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py" in result.stdout
-    assert "--branch semi_control_stable" in result.stdout
+    assert "--branch semi_control_stable_original" in result.stdout
     assert (
         "flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_"
-        "roundtrip05_lr6e-4_bs4_stable_latest"
+        "roundtrip05_lr6e-4_bs5_stable_original_latest"
     ) in result.stdout
-    assert "catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix-stable-latest" in result.stdout
+    assert (
+        "catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix-"
+        "stable-original-latest"
+    ) in result.stdout
 
 
 def test_oom_retry_preflight_builds_metadata_on_all_pods() -> None:

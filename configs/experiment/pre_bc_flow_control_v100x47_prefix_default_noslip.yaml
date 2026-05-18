@@ -13,8 +13,8 @@
 #       sv/svv/svvv/svvvv: 4 pods x 4 V100
 #       testsv/testsvv/testsvvv/testsvvvv: 4 pods x 4 V100
 #       fv/fvv/fvvv/fvvvv/fvvvvv: 5 pods x 3 V100
-#   * Per-rank train batch stays at the V100-safe value 4, so effective global
-#     batch is 188 instead of the A100x4x2 run's 208.
+#   * Per-rank train batch is 5 with train_use_eval_agent_selection=false, so
+#     effective global batch is 235.
 
 defaults:
   - pre_bc_flow_control_v100x47
@@ -35,10 +35,10 @@ model:
       control_round_trip_max_position_error_m: 0.5
 
 data:
-  train_batch_size: 4
+  train_batch_size: 5
   val_batch_size: 4
   test_batch_size: 4
-  train_use_eval_agent_selection: true
+  train_use_eval_agent_selection: false
   train_memory_balanced_batches: true
   train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
   train_memory_balance_metadata_num_workers: 8
