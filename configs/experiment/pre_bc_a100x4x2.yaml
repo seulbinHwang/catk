@@ -8,7 +8,7 @@
 #   * 2 nodes
 #   * 4 A100 80GB GPUs per node
 #   * 8 total DDP ranks
-#   * train_batch_size 20 * 8 GPUs = effective global batch 160
+#   * train_batch_size 26 * 8 GPUs = effective global batch 208
 #   * lr=6e-4, warmup=4, lr_min_ratio=1e-2
 
 defaults:
