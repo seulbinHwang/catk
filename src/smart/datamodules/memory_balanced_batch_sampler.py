@@ -149,11 +149,12 @@ def _init_metadata_worker() -> None:
 
 
 def fingerprint_raw_paths(raw_paths: Sequence[str]) -> str:
-    """Fingerprint dataset identity without baking machine-specific prefixes."""
+    """Fingerprint the exact SMART cache path list used by the dataloader."""
 
     digest = hashlib.sha1()
     for path in raw_paths:
-        digest.update(Path(path).name.encode("utf-8"))
+        resolved_path = Path(path).expanduser().resolve(strict=False)
+        digest.update(str(resolved_path).encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -244,7 +245,7 @@ def load_or_build_memory_metadata(
 ) -> MemoryBalanceMetadata:
     """Load cached sample-size metadata, building it once when allowed.
 
-    The cache intentionally stores only counts and a basename fingerprint. It
+    The cache intentionally stores only counts and a path-list fingerprint. It
     never mutates the dataset cache files themselves.
     """
 

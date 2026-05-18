@@ -718,20 +718,17 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 
 metadata cache는 학습 cache 파일을 수정하지 않습니다. metadata build가 필요할 때는 pkl decode가 CPU 병목이므로 `ProcessPoolExecutor`로 여러 프로세스가 cache pkl을 병렬 스캔하고, 결과는 tensor payload로 저장합니다. 같은 cache가 있으면 학습 중에는 pkl을 다시 스캔하지 않습니다. 따라서 steady-state 학습 속도에 추가되는 비용은 epoch 시작 시 작은 tensor 정렬과 index list 생성뿐입니다. Lightning의 기본 distributed sampler가 이 batch sampler를 덮어쓰지 않도록 이 preset은 `trainer.use_distributed_sampler=false`를 명시합니다.
 
-V100x47 production preset은 학습 시작 중 조용히 긴 metadata build가 들어가는 것을 막기 위해 `data.train_memory_balance_build_on_missing=false`를 사용합니다. 새 pod 또는 새 log path에서 cache가 없다면 학습 전에 각 pod에서 먼저 prebuild합니다:
+V100x47 production preset은 학습 프로세스 안에서 조용히 긴 metadata build가 들어가는 것을 막기 위해 `data.train_memory_balance_build_on_missing=false`를 사용합니다. 대신 이 전용 launcher가 첫 attempt 전에 master pod(`sv`)에서 같은 `REMOTE_LOG_DIR`와 같은 master-pod `CACHE_ROOT` 기준으로 metadata cache를 preflight 생성/검증합니다. 기본 cache 위치는 아래와 같습니다.
 
-```bash
-python tools/build_memory_balance_metadata.py \
-  --raw-dir "$CACHE_ROOT/training" \
-  --cache-path "$REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt" \
-  --num-workers 8
+```text
+$REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt
 ```
 
-이전 metadata build가 비정상 종료되어 `.lock` 디렉터리만 남은 경우에는 같은 명령에 `--force`를 붙여 기존 metadata 파일과 stale lock을 함께 지운 뒤 다시 생성합니다. 다른 metadata build가 실제로 실행 중일 때는 `--force`를 쓰지 않습니다.
+따라서 위 launcher command만 실행해도 metadata cache가 없거나 stale인 경우 학습 시작 전에 먼저 만들어집니다. metadata fingerprint는 pkl basename만 보지 않고 dataloader가 실제로 사용할 SMART cache path list까지 포함하므로, 다른 cache root에서 만든 metadata를 같은 파일명이라는 이유만으로 재사용하지 않습니다. 이 preset은 모든 학습 pod가 같은 SMART cache mount path를 본다는 전제에서 metadata cache 하나를 공유합니다. pod별 cache root를 바꾸는 경우에는 모든 pod가 같은 path fingerprint를 보도록 mount path를 맞추거나, `--pod-cache-root POD=PATH` 설정이 master pod preflight와 실제 학습 경로 사이에서 어긋나지 않게 확인합니다.
 
-이미 만들어진 metadata cache는 약 수 MB 크기라 load가 빠릅니다. cache가 없는 상태에서 ad-hoc으로 학습 프로세스 안에서 build까지 허용해야 할 때만 `data.train_memory_balance_build_on_missing=true`를 override합니다.
+metadata를 강제로 다시 만들려면 `--force-memory-metadata-rebuild`를 붙입니다. 이전 metadata build가 비정상 종료되어 `.lock` 디렉터리만 남은 경우에만 사용하고, 다른 metadata build가 실제로 실행 중일 때는 쓰지 않습니다. preflight를 명시적으로 건너뛰어야 하는 특수 상황에서는 `--skip-memory-metadata-preflight`를 붙일 수 있지만, 그러면 cache가 없거나 stale일 때 학습 시작 전에 실패합니다. cache가 없는 상태에서 ad-hoc으로 학습 프로세스 안에서 build까지 허용해야 할 때만 `data.train_memory_balance_build_on_missing=true`를 override합니다.
 
-이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=4`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, `4 -> 2`처럼 batch를 낮추지 않습니다.
+이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=4`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, `4 -> 2`처럼 batch를 낮추지 않습니다. 다만 같은 batch size에서 반복 OOM이 무한히 이어지는 것을 막기 위해 기본 `--max-same-bs-oom-retries=3` 이후에는 중단합니다.
 
 기본 실험 이름은 `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4`이고, tmux session 이름은 `catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix`입니다.
 

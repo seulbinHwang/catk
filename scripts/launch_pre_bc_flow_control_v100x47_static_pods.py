@@ -114,6 +114,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--initial-bs", type=int, default=4)
     parser.add_argument("--oom-step", type=int, default=2)
+    parser.add_argument(
+        "--max-same-bs-oom-retries",
+        type=int,
+        default=3,
+        help=(
+            "Maximum CUDA OOM retries when --oom-step=0 keeps train_batch_size "
+            "unchanged. Prevents an endless same-batch retry loop."
+        ),
+    )
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--poll-interval", type=int, default=30)
     parser.add_argument("--master-port", default="29531")
@@ -140,6 +149,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--memory-metadata-preflight",
+        action="store_true",
+        help=(
+            "Build/validate the memory-balanced batch metadata on the master "
+            "pod before starting the distributed training attempt."
+        ),
+    )
+    parser.add_argument(
+        "--memory-metadata-cache-path",
+        default="",
+        help=(
+            "Remote metadata cache path used by data.train_memory_balance_metadata_cache. "
+            "Defaults to REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt."
+        ),
+    )
+    parser.add_argument("--memory-metadata-num-workers", type=int, default=8)
+    parser.add_argument(
+        "--memory-metadata-force-rebuild",
+        action="store_true",
+        help="Remove an existing memory metadata cache/stale lock before prebuilding.",
+    )
+    parser.add_argument(
         "--replace",
         action="store_true",
         help="Accepted for consistency; retry launcher already replaces the tmux session each attempt.",
@@ -158,8 +189,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--initial-bs must be >= 1")
     if args.oom_step < 0:
         parser.error("--oom-step must be >= 0")
+    if args.max_same_bs_oom_retries < 0:
+        parser.error("--max-same-bs-oom-retries must be >= 0")
     if args.min_bs < 1:
         parser.error("--min-bs must be >= 1")
+    if args.memory_metadata_num_workers < 1:
+        parser.error("--memory-metadata-num-workers must be >= 1")
     return args
 
 
@@ -216,6 +251,7 @@ def main() -> int:
             "MANUAL_RANK_OFFSETS": "1",
             "INITIAL_BS": str(args.initial_bs),
             "OOM_STEP": str(args.oom_step),
+            "MAX_SAME_BS_OOM_RETRIES": str(args.max_same_bs_oom_retries),
             "MIN_BS": str(args.min_bs),
             "POLL_INTERVAL": str(args.poll_interval),
             "LEARNING_RATE": str(args.learning_rate),
@@ -234,6 +270,18 @@ def main() -> int:
     env.update({name: value for name, value in optional_env.items() if value})
     if args.pod_cache_root:
         env["POD_CACHE_ROOTS"] = " ".join(args.pod_cache_root)
+    if args.memory_metadata_preflight:
+        env.update(
+            {
+                "MEMORY_BALANCE_PREFLIGHT": "1",
+                "MEMORY_BALANCE_METADATA_CACHE": args.memory_metadata_cache_path
+                or f"{args.remote_log_dir.rstrip('/')}/dataset_metadata/womd_training_memory_balance_v1.pt",
+                "MEMORY_BALANCE_METADATA_NUM_WORKERS": str(args.memory_metadata_num_workers),
+                "MEMORY_BALANCE_METADATA_FORCE_REBUILD": "1"
+                if args.memory_metadata_force_rebuild
+                else "0",
+            }
+        )
 
     command = ["bash", str(RETRY_SCRIPT)]
     if args.dry_run:
@@ -256,6 +304,7 @@ def main() -> int:
                 "MANUAL_RANK_OFFSETS",
                 "INITIAL_BS",
                 "OOM_STEP",
+                "MAX_SAME_BS_OOM_RETRIES",
                 "MIN_BS",
                 "POLL_INTERVAL",
                 "LEARNING_RATE",
@@ -265,6 +314,10 @@ def main() -> int:
                 "MAX_EPOCHS",
                 "EXTRA_HYDRA_OVERRIDES",
                 "POD_CACHE_ROOTS",
+                "MEMORY_BALANCE_PREFLIGHT",
+                "MEMORY_BALANCE_METADATA_CACHE",
+                "MEMORY_BALANCE_METADATA_NUM_WORKERS",
+                "MEMORY_BALANCE_METADATA_FORCE_REBUILD",
             ]
         ):
             if name in env:

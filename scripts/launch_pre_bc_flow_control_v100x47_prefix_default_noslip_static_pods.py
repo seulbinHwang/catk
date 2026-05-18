@@ -8,7 +8,7 @@ This is the static V100-fleet counterpart of the A100x4x2 W&B run:
 It reuses the generic V100x47 launcher for heterogeneous pod GPU counts,
 manual rank offsets, checkpoint sync, and OOM restart. Unlike the fallback
 launchers, this wrapper keeps train_batch_size unchanged after OOM and only
-resumes from the latest checkpoint.
+resumes from the latest checkpoint, with a finite same-batch retry limit.
 """
 
 from __future__ import annotations
@@ -105,6 +105,15 @@ def parse_args() -> argparse.Namespace:
             "train_batch_size unchanged and only resumes from the latest checkpoint."
         ),
     )
+    parser.add_argument(
+        "--max-same-bs-oom-retries",
+        type=int,
+        default=3,
+        help=(
+            "Maximum CUDA OOM retries when train_batch_size is kept unchanged "
+            "by --oom-step=0."
+        ),
+    )
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--poll-interval", type=int, default=30)
     parser.add_argument("--master-port", default="29561")
@@ -126,6 +135,28 @@ def parse_args() -> argparse.Namespace:
         metavar="POD=PATH",
         help="Override CACHE_ROOT for one pod. Can be repeated.",
     )
+    parser.add_argument(
+        "--skip-memory-metadata-preflight",
+        action="store_true",
+        help=(
+            "Skip the default master-pod preflight that builds/validates the "
+            "memory-balanced batch metadata cache before training."
+        ),
+    )
+    parser.add_argument(
+        "--memory-metadata-cache-path",
+        default="",
+        help=(
+            "Remote metadata cache path. Defaults to "
+            "REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt."
+        ),
+    )
+    parser.add_argument("--memory-metadata-num-workers", type=int, default=8)
+    parser.add_argument(
+        "--force-memory-metadata-rebuild",
+        action="store_true",
+        help="Remove the existing metadata cache/stale lock before prebuilding.",
+    )
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--stop", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -137,8 +168,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--initial-bs must be >= 1")
     if args.oom_step < 0:
         parser.error("--oom-step must be >= 0")
+    if args.max_same_bs_oom_retries < 0:
+        parser.error("--max-same-bs-oom-retries must be >= 0")
     if args.min_bs < 1:
         parser.error("--min-bs must be >= 1")
+    if args.memory_metadata_num_workers < 1:
+        parser.error("--memory-metadata-num-workers must be >= 1")
     return args
 
 
@@ -171,6 +206,8 @@ def main() -> int:
         str(args.initial_bs),
         "--oom-step",
         str(args.oom_step),
+        "--max-same-bs-oom-retries",
+        str(args.max_same_bs_oom_retries),
         "--min-bs",
         str(args.min_bs),
         "--poll-interval",
@@ -196,6 +233,22 @@ def main() -> int:
         command.extend(["--extra-hydra-overrides", args.extra_hydra_overrides])
     for mapping in args.pod_cache_root:
         command.extend(["--pod-cache-root", mapping])
+    if not args.skip_memory_metadata_preflight and not args.stop:
+        metadata_cache_path = args.memory_metadata_cache_path or (
+            f"{args.remote_log_dir.rstrip('/')}/dataset_metadata/"
+            "womd_training_memory_balance_v1.pt"
+        )
+        command.extend(
+            [
+                "--memory-metadata-preflight",
+                "--memory-metadata-cache-path",
+                metadata_cache_path,
+                "--memory-metadata-num-workers",
+                str(args.memory_metadata_num_workers),
+            ]
+        )
+        if args.force_memory_metadata_rebuild:
+            command.append("--memory-metadata-force-rebuild")
     if args.replace:
         command.append("--replace")
     if args.stop:

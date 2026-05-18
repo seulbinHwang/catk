@@ -10,6 +10,7 @@
 #   * first attempt: data.train_batch_size=26
 #   * on CUDA OOM: reduce batch by OOM_STEP and resume from the latest epoch_last.ckpt
 #     If OOM_STEP=0, keep the same batch size and only resume.
+#     In same-batch mode, abort after MAX_SAME_BS_OOM_RETRIES repeated OOM retries.
 #   * on retryable external exits such as SIGTERM/SIGABRT: keep the batch size
 #     and resume from the latest epoch_last.ckpt
 #   * stop at MIN_BS=20 unless overridden
@@ -37,6 +38,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 MANUAL_RANK_OFFSETS="${MANUAL_RANK_OFFSETS:-0}"
 INITIAL_BS="${INITIAL_BS:-26}"
 OOM_STEP="${OOM_STEP:-2}"
+MAX_SAME_BS_OOM_RETRIES="${MAX_SAME_BS_OOM_RETRIES:-3}"
 MIN_BS="${MIN_BS:-20}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-134,143}"
@@ -47,6 +49,11 @@ LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
+MEMORY_BALANCE_PREFLIGHT="${MEMORY_BALANCE_PREFLIGHT:-0}"
+MEMORY_BALANCE_METADATA_CACHE="${MEMORY_BALANCE_METADATA_CACHE:-}"
+MEMORY_BALANCE_METADATA_NUM_WORKERS="${MEMORY_BALANCE_METADATA_NUM_WORKERS:-8}"
+MEMORY_BALANCE_METADATA_FORCE_REBUILD="${MEMORY_BALANCE_METADATA_FORCE_REBUILD:-0}"
+DEFAULT_CACHE_ROOT="${DEFAULT_CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
 
 read -r -a POD_ARRAY <<< "$PODS"
 if (( ${#POD_ARRAY[@]} < 2 )); then
@@ -65,6 +72,79 @@ log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
 
 remote_quote() {
   printf '%q' "$1"
+}
+
+cache_root_for_pod() {
+  local pod="$1"
+  local mapping mapping_pod mapping_path
+  local -a pod_cache_root_array
+  if [[ -n "$POD_CACHE_ROOTS" ]]; then
+    read -r -a pod_cache_root_array <<< "$POD_CACHE_ROOTS"
+    for mapping in "${pod_cache_root_array[@]}"; do
+      if [[ "$mapping" == *=* ]]; then
+        mapping_pod="${mapping%%=*}"
+        mapping_path="${mapping#*=}"
+        if [[ "$mapping_pod" == "$pod" && -n "$mapping_path" ]]; then
+          printf '%s\n' "$mapping_path"
+          return 0
+        fi
+      fi
+    done
+  fi
+  if [[ -n "$CACHE_ROOT" ]]; then
+    printf '%s\n' "$CACHE_ROOT"
+    return 0
+  fi
+  case "$pod" in
+    hsb-npc-training)
+      printf '%s\n' "/mnt/nuplan/womd_v1_3/SMART_cache"
+      ;;
+    *)
+      printf '%s\n' "$DEFAULT_CACHE_ROOT"
+      ;;
+  esac
+}
+
+prebuild_memory_balance_metadata() {
+  if [[ "$MEMORY_BALANCE_PREFLIGHT" != "1" ]]; then
+    return 0
+  fi
+
+  local cache_root metadata_cache raw_dir force_arg git_cmd metadata_cache_q raw_dir_q project_root_q branch_q git_ref_q workers_q
+  cache_root="$(cache_root_for_pod "$MASTER_POD")"
+  metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
+  raw_dir="${cache_root%/}/training"
+  force_arg=""
+  if [[ "$MEMORY_BALANCE_METADATA_FORCE_REBUILD" == "1" ]]; then
+    force_arg="--force"
+  fi
+
+  metadata_cache_q="$(remote_quote "$metadata_cache")"
+  raw_dir_q="$(remote_quote "$raw_dir")"
+  project_root_q="$(remote_quote "$PROJECT_ROOT")"
+  branch_q="$(remote_quote "$BRANCH")"
+  git_ref_q="$(remote_quote "$GIT_REF")"
+  workers_q="$(remote_quote "$MEMORY_BALANCE_METADATA_NUM_WORKERS")"
+
+  if [[ -n "$GIT_REF" ]]; then
+    git_cmd="git fetch origin ${branch_q} && git checkout ${git_ref_q}"
+  else
+    git_cmd="git fetch origin ${branch_q} && { git checkout ${branch_q} 2>/dev/null || git checkout -B ${branch_q} origin/${branch_q}; } && git pull --ff-only origin ${branch_q}"
+  fi
+
+  log "prebuilding memory-balance metadata on ${MASTER_POD}: raw_dir=${raw_dir} cache=${metadata_cache}"
+  kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "
+set -euo pipefail
+cd ${project_root_q}
+${git_cmd}
+mkdir -p \"\$(dirname ${metadata_cache_q})\"
+test -d ${raw_dir_q}
+python tools/build_memory_balance_metadata.py \
+  --raw-dir ${raw_dir_q} \
+  --cache-path ${metadata_cache_q} \
+  --num-workers ${workers_q} \
+  ${force_arg}
+"
 }
 
 remote_run_root() {
@@ -297,6 +377,11 @@ copy_attempt_log() {
 bs="$INITIAL_BS"
 attempt=0
 non_oom_retry_count=0
+same_bs_oom_retry_count=0
+if ! prebuild_memory_balance_metadata; then
+  log "memory-balance metadata preflight failed. Aborting before distributed training."
+  exit 1
+fi
 while (( bs >= MIN_BS )); do
   attempt=$(( attempt + 1 ))
   attempt_log="${LOCAL_RETRY_LOG_DIR}/attempt_$(printf '%03d' "$attempt")_bs${bs}.log"
@@ -328,9 +413,15 @@ while (( bs >= MIN_BS )); do
   if [[ "$ATTEMPT_EXIT_REASON" == "oom" ]] || grep -Eq "$OOM_REGEX" "$attempt_log"; then
     non_oom_retry_count=0
     if (( OOM_STEP == 0 )); then
+      same_bs_oom_retry_count=$(( same_bs_oom_retry_count + 1 ))
+      if (( same_bs_oom_retry_count > MAX_SAME_BS_OOM_RETRIES )); then
+        log "OOM detected at bs=${bs} for ${same_bs_oom_retry_count} same-batch attempts; MAX_SAME_BS_OOM_RETRIES=${MAX_SAME_BS_OOM_RETRIES}. Aborting."
+        exit 1
+      fi
       log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Keeping bs=${bs} and resuming from the latest checkpoint."
       continue
     fi
+    same_bs_oom_retry_count=0
     new_bs=$(( bs - OOM_STEP ))
     log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Lowering to bs=${new_bs}."
     if (( new_bs < MIN_BS )); then

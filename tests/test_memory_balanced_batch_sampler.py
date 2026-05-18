@@ -90,6 +90,35 @@ def test_metadata_cache_loads_tensor_payload_without_rebuilding(tmp_path: Path) 
     assert torch.allclose(weights, torch.tensor([3.06, 5.08], dtype=torch.float64))
 
 
+def test_metadata_cache_rejects_same_filenames_from_different_root(tmp_path: Path) -> None:
+    raw_dir_a = tmp_path / "cache_a" / "training"
+    raw_dir_b = tmp_path / "cache_b" / "training"
+    raw_dir_a.mkdir(parents=True)
+    raw_dir_b.mkdir(parents=True)
+    for raw_dir in (raw_dir_a, raw_dir_b):
+        _write_sample(raw_dir / "same_name.pkl", agent_count=2, current_valid=1, map_count=3)
+
+    cache_path = tmp_path / "metadata.pt"
+    load_or_build_memory_metadata(
+        [str(raw_dir_a / "same_name.pkl")],
+        cache_path=str(cache_path),
+        num_workers=1,
+        build_on_missing=True,
+    )
+
+    try:
+        load_or_build_memory_metadata(
+            [str(raw_dir_b / "same_name.pkl")],
+            cache_path=str(cache_path),
+            num_workers=1,
+            build_on_missing=False,
+        )
+    except FileNotFoundError as exc:
+        assert "missing or stale" in str(exc)
+    else:
+        raise AssertionError("metadata cache should be stale for a different cache root")
+
+
 def test_old_list_payload_still_loads(tmp_path: Path) -> None:
     raw_paths = [str(tmp_path / "a.pkl"), str(tmp_path / "b.pkl")]
     cache_path = tmp_path / "old_metadata.pt"
