@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", "/mnt/nuplan/projects/catk"))
     parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or current_branch())
+    parser.add_argument(
+        "--git-ref",
+        default=os.environ.get("CATK_GIT_REF", ""),
+        help="Exact git ref/SHA to checkout on every pod instead of the branch head.",
+    )
     parser.add_argument("--remote-log-dir", default=os.environ.get("REMOTE_LOG_DIR", "/mnt/nuplan/projects/catk/logs"))
     parser.add_argument("--experiment", default="pre_bc_flow_control_a100x4x2_prefix_valid")
     parser.add_argument(
@@ -157,6 +162,7 @@ def main() -> int:
             "PODS": " ".join(args.pods),
             "PROJECT_ROOT": args.project_root,
             "BRANCH": args.branch,
+            "GIT_REF": args.git_ref,
             "TASK_NAME": args.task_name,
             "SESSION": args.session,
             "EXPERIMENT": args.experiment,
@@ -192,6 +198,7 @@ def main() -> int:
                 "PODS",
                 "PROJECT_ROOT",
                 "BRANCH",
+                "GIT_REF",
                 "TASK_NAME",
                 "SESSION",
                 "EXPERIMENT",

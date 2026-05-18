@@ -501,7 +501,7 @@ torchrun ... -m src.run \
 - `model.model_config.token_processor.use_holonomic_model_only=true`를 켜면 ablation용으로 vehicle / cyclist에도 pedestrian과 같은 holonomic decoder를 적용합니다. 이때 vehicle / cyclist의 `delta_n`도 학습 target과 rollout 복원에 사용됩니다. 기본값 `false`는 기존 agent-type-aware non-holonomic/holonomic 혼합 방식입니다.
 - `use_kinematic_control_flow=true`에서는 관측 history와 현재 시작 pose는 raw GT를 유지하고, 현재 이후 future만 control decoder가 실제로 실행할 수 있는 transition-aligned trajectory로 만듭니다. vehicle/cyclist는 raw GT를 0.1초마다 다시 projection하지 않고, 0.5초 endpoint마다 한 번 control을 만든 뒤 내부 0.1초 상태를 kinematic substep 실행으로 채웁니다. 반면 pedestrian은 holonomic decoder가 raw 0.1초 displacement를 그대로 실행할 수 있으므로 endpoint 보간을 강제하지 않고 raw per-step holonomic control을 씁니다. `use_holonomic_model_only=true` ablation에서도 holonomic으로 취급되는 agent는 같은 raw per-step target을 사용합니다. 각 anchor의 context position/heading, motion token, future control target, open-loop metric target은 모두 이 type-aware trajectory에서 잘라 씁니다. 따라서 target에만 별도로 rolling projection을 다시 적용하지 않습니다.
 - vehicle/cyclist의 endpoint+substep 방식은 0.5초 block endpoint가 invalid GT일 때 그 block의 mid-step (와 다음 block의 mid-step)이 invalid placeholder `(0, 0)` 좌표 쪽으로 끌려가 km 단위의 supervision 왜곡을 만들 수 있습니다. WOMD raw step `25`가 invalid인 사례에서 `prefix-valid` loss는 step `11..22`를 학습 대상으로 두는데 step `20 -> 25` block 안에 있는 step `21..22`의 aligned 좌표가 raw GT에서 수백 m 떨어져 학습 신호를 망가뜨립니다. 그래서 `kinematic_control.compute_aligned_substep_validity`를 도입해 non-holonomic block endpoint가 invalid면 그 block의 mid-step 전체와 endpoint 자체를 학습에서 제외합니다. source가 오염된 다음 block의 mid-step도 동일 규칙으로 함께 제외되고, 다음 valid endpoint에서 rolling이 re-anchor되면 자동으로 다시 살아납니다. pedestrian/holonomic raw per-step target은 endpoint 오염 전파가 없으므로 일반 raw valid/prefix mask만 적용합니다. validation, closed-loop rollout, fast RMM, WOSAC 제출물 생성은 영향 받지 않습니다.
-- 학습에서는 `control_alignment_filter.enabled=true`가 기본으로 켜져 있습니다. 이 필터는 vehicle/cyclist를 holonomic으로 바꾸지 않고 non-holonomic control target을 그대로 유지하되, raw GT와 transition-aligned trajectory의 anchor-window L2 오차가 type별 기준을 넘는 학습 anchor만 loss에서 제외합니다. 0.5초 endpoint+substep 분포(`outputs/transition_alignment_training.json`)의 vehicle `p99=0.473m`, `p99.9=1.575m`, cyclist `p99=0.751m`, `p99.9=9.999m (saturated)`을 기준으로 OLD `semi_control_rolling` 브랜치(`vehicle 12.4x p99`, `cyclist 2.9x p99` headroom)와 같은 비율을 유지하도록 기본값을 vehicle `6.0m`, cyclist `2.2m`로 둡니다. 이 값은 vehicle은 `p99.99` 너머만 제거(약 0.011% drop)하고, cyclist는 `2.2m`를 넘는 약 0.65%의 anchor를 제거합니다 — 대부분 `>5m` 수십 m급 GT jump와 saturated tail입니다. pedestrian/holonomic target은 raw GT를 그대로 쓰므로 거리가 0이라 영향이 없습니다. 이 필터는 학습 anchor 선택에만 적용되며 validation, closed-loop rollout, fast RMM, WOSAC 제출물 생성의 평가 agent 선택은 바꾸지 않습니다. 기준을 ablation하려면 `model.model_config.token_processor.control_alignment_filter.cyclist_max_error_m=1.0`처럼 override합니다.
+- 학습에서는 `control_alignment_filter.enabled=true`가 기본으로 켜져 있습니다. 이 필터는 vehicle/cyclist를 holonomic으로 바꾸지 않고 non-holonomic control target을 그대로 유지하되, raw GT와 transition-aligned trajectory의 anchor-window L2 오차가 type별 기준을 넘는 학습 anchor만 loss에서 제외합니다. 0.5초 endpoint+substep 분포(`outputs/transition_alignment_training.json`)의 vehicle `p99=0.473m`, `p99.9=1.575m`, cyclist `p99=0.751m`, `p99.9=9.999m (saturated)`을 기준으로 기본값을 vehicle `2.0m`, cyclist `2.2m`로 둡니다. vehicle `2.0m`는 정상 분포의 p99.9보다 약간 큰 값이라 대부분의 vehicle supervision을 유지하면서 수 m~수백 m급 GT jump만 제거하고, cyclist `2.2m`는 부족한 cyclist 표본을 과하게 버리지 않으면서 saturated tail을 잘라냅니다. pedestrian/holonomic target은 raw GT를 그대로 쓰므로 거리가 0이라 영향이 없습니다. 이 필터는 학습 anchor 선택에만 적용되며 validation, closed-loop rollout, fast RMM, WOSAC 제출물 생성의 평가 agent 선택은 바꾸지 않습니다. 기준을 ablation하려면 `model.model_config.token_processor.control_alignment_filter.cyclist_max_error_m=1.0`처럼 override합니다.
 - transition-aligned trajectory가 raw GT future를 얼마나 왜곡하는지 확인하려면 아래 도구를 먼저 돌립니다. 이 도구는 SMART cache를 읽기만 하며, cache 생성 로직이나 cache 파일은 바꾸지 않습니다. token processor와 같은 heading clean / 이전 token step extrapolation을 적용한 뒤 raw step `10` 이후의 raw 위치와 transition-aligned 위치 사이의 L2 오차를 집계합니다. worker는 여러 pkl을 chunk 단위로 합산한 뒤 histogram만 반환하므로, 전체 training split 전수 분석에서도 IPC 비용이 작습니다.
 
 ```bash
@@ -656,6 +656,70 @@ python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_
 
 ```bash
 python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_pods.py --stop
+```
+
+#### testa/testaa A100x4x2 0.5s endpoint-balanced control-space pretrain
+
+`semi_control_rolling_0.5` 브랜치의 주 실험은 아래 전용 launcher를 씁니다. 이미 `testa/testaa`에서 다른 multi-node 학습이 돌고 있다면 그 학습이 끝난 뒤에 실행하세요.
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_endpoint_balanced_static_pods.py \
+  --prebuild-metadata \
+  --replace
+```
+
+실제 pod에 명령을 보내기 전에 확인만 하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_endpoint_balanced_static_pods.py \
+  --prebuild-metadata \
+  --dry-run
+```
+
+이 launcher는 `configs/experiment/pre_bc_flow_control_a100x4x2_endpoint_balanced.yaml`을 사용합니다. 핵심 설정은 아래와 같습니다.
+
+```yaml
+model:
+  model_config:
+    lr: 6e-4
+    decoder:
+      flow_window_steps: 20
+    token_processor:
+      use_kinematic_control_flow: true
+      use_holonomic_model_only: false
+      use_prefix_valid_future_loss_mask: true
+      control_vehicle_no_slip_point_ratio: 0.2289518863
+      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_alignment_filter:
+        enabled: true
+        vehicle_max_error_m: 2.0
+        cyclist_max_error_m: 2.2
+data:
+  train_use_eval_agent_selection: true
+  train_memory_balanced_batches: true
+  train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
+  train_memory_balance_build_on_missing: false
+trainer:
+  use_distributed_sampler: false
+```
+
+의도는 control-space Flow target을 실행 가능한 상태 흐름에 맞추는 것입니다. vehicle/cyclist는 0.5초 endpoint 기준 control을 만들고 내부 5개 0.1초 상태는 kinematic substep으로 채웁니다. pedestrian은 holonomic이라 raw 0.1초 target을 유지합니다. invalid endpoint로 오염될 수 있는 non-holonomic substep과 raw-vs-aligned 오차가 큰 anchor는 train loss에서만 제외합니다.
+
+`--prebuild-metadata`는 SMART cache를 읽어서 memory-balanced sampler용 metadata만 만듭니다. SMART cache 생성 과정이나 cache 파일은 수정하지 않습니다. 이전 metadata build가 비정상 종료되어 stale lock이 남았을 때만 `--force-metadata`를 추가하세요.
+
+기본 task 이름은 `flow_control_space_pretrain_a100x4x2_endpoint_substep_balanced_lr6e-4_bs26`, tmux session 이름은 `catk-control-pretrain-a100x4x2-endpoint-balanced`입니다. 기본 per-GPU batch는 `26`이라 A100 8GPU 기준 effective batch는 `208`이고, CUDA OOM fallback은 `26 -> 24 -> 22 -> 20`입니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-control-pretrain-a100x4x2-endpoint-balanced
+kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-control-pretrain-a100x4x2-endpoint-balanced
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x4x2_endpoint_balanced_static_pods.py --stop
 ```
 
 #### V100 47GPU prefix-valid default no-slip ratio pretrain
