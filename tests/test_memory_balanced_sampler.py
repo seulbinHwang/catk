@@ -4,6 +4,8 @@ import os
 import pickle
 
 import torch
+from lightning.fabric.utilities.data import _set_sampler_epoch
+from torch.utils.data import DataLoader
 
 from src.smart.datasets.scalable_dataset import MultiDataset
 from src.smart.datamodules.memory_balanced_sampler import (
@@ -79,6 +81,26 @@ def test_memory_balanced_sampler_epoch_changes_order() -> None:
     epoch1 = _collect_rank_batches(agent_counts, rank=0, epoch=1)
 
     assert epoch0 != epoch1
+
+
+def test_memory_balanced_sampler_epoch_is_visible_to_lightning() -> None:
+    agent_counts = [50, 45, 40, 35, 30, 25, 20, 15]
+    sampler = MemoryBalancedDistributedBatchSampler(
+        raw_paths=_fake_paths(len(agent_counts)),
+        batch_size=2,
+        num_replicas=2,
+        rank=0,
+        shuffle=True,
+        seed=7,
+        metadata_entries=_metadata_from_agent_counts(agent_counts),
+        weight_key="agent_count",
+        bucket_size_multiplier=4,
+    )
+    loader = DataLoader(list(range(len(agent_counts))), batch_sampler=sampler)
+
+    _set_sampler_epoch(loader, 3)
+
+    assert sampler.epoch == 3
 
 
 def test_memory_metadata_cache_reads_agent_valid_and_map_counts(tmp_path) -> None:
