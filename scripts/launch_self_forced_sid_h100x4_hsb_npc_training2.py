@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch SiD self-forced H100x4 training on the existing hsb-npc-training2 pod.
+"""Launch SiD self-forced H100x4 training on the existing hsb-npc-training-2 pod.
 
 This launcher never creates, deletes, or restarts pods. It only uses
 ``kubectl exec`` to start or stop a tmux session inside the already-running
@@ -14,7 +14,7 @@ import subprocess
 
 
 DEFAULT_NAMESPACE = "p-pnc"
-DEFAULT_POD = "hsb-npc-training2"
+DEFAULT_POD = "hsb-npc-training-2"
 DEFAULT_CONTAINER = "main"
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_BRANCH = "self_forcing_w_track_loss"
@@ -36,7 +36,7 @@ DEFAULT_TASK_NAME = (
     "flow_self_forced_sid_h100x4_hsb_npc_training2_"
     "use_stop_motion_false_estimator_warmup_1_lr1e-6_bs28"
 )
-DEFAULT_SESSION = "catk-sf-sid-h100x4-hsb-npc-training2"
+DEFAULT_SESSION = "catk-sf-sid-h100x4-hsb-npc-training-2"
 
 
 def shq(value: object) -> str:
@@ -123,18 +123,18 @@ set -a
 source {shq(env_file)}
 set +a
 
-echo "[self-forced-sid-h100x4-hsb-npc-training2] pod=$(hostname) task=${{TASK_NAME}}"
-echo "[self-forced-sid-h100x4-hsb-npc-training2] started at $(date '+%F %T')"
-echo "[self-forced-sid-h100x4-hsb-npc-training2] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}}"
-echo "[self-forced-sid-h100x4-hsb-npc-training2] lr=${{CATK_LR}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
-echo "[self-forced-sid-h100x4-hsb-npc-training2] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
-echo "[self-forced-sid-h100x4-hsb-npc-training2] pretrain_ckpt=${{PRETRAIN_CKPT}}"
-echo "[self-forced-sid-h100x4-hsb-npc-training2] attach survives after exit; press Ctrl-b d to detach"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] pod=$(hostname) task=${{TASK_NAME}}"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] started at $(date '+%F %T')"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}}"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] lr=${{CATK_LR}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] pretrain_ckpt=${{PRETRAIN_CKPT}}"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] attach survives after exit; press Ctrl-b d to detach"
 echo
 
 ensure_pretrain_checkpoint() {{
   if [[ -f "$PRETRAIN_CKPT" ]]; then
-    echo "[self-forced-sid-h100x4-hsb-npc-training2] using cached pretrain checkpoint: $PRETRAIN_CKPT"
+    echo "[self-forced-sid-h100x4-hsb-npc-training-2] using cached pretrain checkpoint: $PRETRAIN_CKPT"
     return 0
   fi
 
@@ -142,7 +142,7 @@ ensure_pretrain_checkpoint() {{
   lock_dir="${{PRETRAIN_CKPT}}.download.lock"
 
   if mkdir "$lock_dir" 2>/dev/null; then
-    echo "[self-forced-sid-h100x4-hsb-npc-training2] downloading W&B artifact: $WANDB_PRETRAIN_ARTIFACT"
+    echo "[self-forced-sid-h100x4-hsb-npc-training-2] downloading W&B artifact: $WANDB_PRETRAIN_ARTIFACT"
     python - <<'PY'
 import glob
 import os
@@ -187,19 +187,19 @@ PY
     status=$?
     rm -rf "$lock_dir"
     if (( status != 0 )); then
-      echo "[self-forced-sid-h100x4-hsb-npc-training2] W&B artifact download failed with status $status" >&2
+      echo "[self-forced-sid-h100x4-hsb-npc-training-2] W&B artifact download failed with status $status" >&2
       return "$status"
     fi
   else
-    echo "[self-forced-sid-h100x4-hsb-npc-training2] waiting for checkpoint download lock: $lock_dir"
+    echo "[self-forced-sid-h100x4-hsb-npc-training-2] waiting for checkpoint download lock: $lock_dir"
     for _ in $(seq 1 180); do
       if [[ -f "$PRETRAIN_CKPT" ]]; then
-        echo "[self-forced-sid-h100x4-hsb-npc-training2] checkpoint appeared: $PRETRAIN_CKPT"
+        echo "[self-forced-sid-h100x4-hsb-npc-training-2] checkpoint appeared: $PRETRAIN_CKPT"
         return 0
       fi
       sleep 10
     done
-    echo "[self-forced-sid-h100x4-hsb-npc-training2] timed out waiting for $PRETRAIN_CKPT" >&2
+    echo "[self-forced-sid-h100x4-hsb-npc-training-2] timed out waiting for $PRETRAIN_CKPT" >&2
     return 4
   fi
 
@@ -209,8 +209,8 @@ PY
 ensure_pretrain_checkpoint
 status=$?
 if (( status != 0 )); then
-  echo "[self-forced-sid-h100x4-hsb-npc-training2] checkpoint preparation failed with status $status"
-  echo "[self-forced-sid-h100x4-hsb-npc-training2] leaving shell open for inspection"
+  echo "[self-forced-sid-h100x4-hsb-npc-training-2] checkpoint preparation failed with status $status"
+  echo "[self-forced-sid-h100x4-hsb-npc-training-2] leaving shell open for inspection"
   exec bash
 fi
 
@@ -218,8 +218,8 @@ bash scripts/self_forced_h100_4_with_oom_retry.sh
 status=$?
 
 echo
-echo "[self-forced-sid-h100x4-hsb-npc-training2] exited with status $status at $(date '+%F %T')"
-echo "[self-forced-sid-h100x4-hsb-npc-training2] leaving shell open for inspection"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] exited with status $status at $(date '+%F %T')"
+echo "[self-forced-sid-h100x4-hsb-npc-training-2] leaving shell open for inspection"
 exec bash
 """
 
@@ -342,7 +342,7 @@ def exec_in_pod(args: argparse.Namespace, script: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch H100x4 self-forced training on the existing hsb-npc-training2 pod.",
+        description="Launch H100x4 self-forced training on the existing hsb-npc-training-2 pod.",
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--pod", default=DEFAULT_POD)

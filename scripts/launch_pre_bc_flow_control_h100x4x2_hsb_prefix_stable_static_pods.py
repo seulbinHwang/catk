@@ -2,7 +2,7 @@
 """Launch H100x4x2 control-space pretrain with the V100x47 stable logic.
 
 This launcher targets the already-running ``hsb-npc-training`` and
-``hsb-npc-training2`` pods. It reuses the H100x4x2 retry launcher so the
+``hsb-npc-training-2`` pods. It reuses the H100x4x2 retry launcher so the
 hardware-sensitive settings stay H100-friendly, while explicitly matching the
 V100x47 stable experiment's control-space semantics:
 
@@ -26,7 +26,7 @@ from pathlib import Path
 
 BASE_LAUNCHER = Path(__file__).with_name("launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py")
 
-DEFAULT_PODS = ("hsb-npc-training", "hsb-npc-training2")
+DEFAULT_PODS = ("hsb-npc-training", "hsb-npc-training-2")
 DEFAULT_EXTRA_HYDRA_OVERRIDES = (
     "model.model_config.token_processor.use_prefix_valid_future_loss_mask=true",
     "model.model_config.token_processor.use_kinematic_control_flow=true",
@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Launch H100x4x2 prefix-valid control-space pretrain on "
-            "hsb-npc-training and hsb-npc-training2."
+            "hsb-npc-training and hsb-npc-training-2."
         )
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", "p-pnc"))

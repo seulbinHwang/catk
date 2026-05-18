@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the existing hsb-npc-training / hsb-npc-training2 H100x4x2 pretrain
+# Launch the existing hsb-npc-training / hsb-npc-training-2 H100x4x2 pretrain
 # pipeline with automatic batch-size fallback on CUDA OOM.
 #
 # This script runs on the local machine that has kubectl access. It never
@@ -8,11 +8,11 @@
 #
 # Default behavior:
 #   * first attempt: data.train_batch_size=26
-#   * on CUDA OOM: reduce batch by OOM_STEP and resume from the latest epoch_last.ckpt
-#     If OOM_STEP=0, keep the same batch size and only resume.
+#   * on CUDA OOM: reduce batch by OOM_STEP and resume from the latest epoch_last.ckpt.
+#     If OOM_STEP=0, keep the same batch size; set MAX_OOM_ATTEMPTS to cap retries.
 #   * on retryable external exits such as SIGTERM/SIGABRT: keep the batch size
 #     and resume from the latest epoch_last.ckpt
-#   * stop at MIN_BS=20 unless overridden
+#   * stop at MIN_BS=20 unless overridden, or at MAX_OOM_ATTEMPTS when set
 
 set -uo pipefail
 
@@ -21,7 +21,7 @@ cd "$REPO_ROOT"
 
 NAMESPACE="${NAMESPACE:-p-pnc}"
 CONTAINER="${CONTAINER:-main}"
-PODS="${PODS:-hsb-npc-training hsb-npc-training2}"
+PODS="${PODS:-hsb-npc-training hsb-npc-training-2}"
 PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk}"
 BRANCH="${BRANCH:-self_forcing_bugfix}"
 GIT_REF="${GIT_REF:-}"
@@ -38,6 +38,7 @@ MANUAL_RANK_OFFSETS="${MANUAL_RANK_OFFSETS:-0}"
 INITIAL_BS="${INITIAL_BS:-26}"
 OOM_STEP="${OOM_STEP:-2}"
 MIN_BS="${MIN_BS:-20}"
+MAX_OOM_ATTEMPTS="${MAX_OOM_ATTEMPTS:-0}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-134,143}"
 MAX_NON_OOM_RETRIES="${MAX_NON_OOM_RETRIES:-3}"
@@ -62,6 +63,14 @@ OOM_REGEX='OutOfMemoryError|CUDA out of memory|c10::OutOfMemoryError|cuda runtim
 
 timestamp() { date '+%F %T %Z'; }
 log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
+
+oom_attempt_limit_label() {
+  if (( MAX_OOM_ATTEMPTS > 0 )); then
+    printf '%s' "$MAX_OOM_ATTEMPTS"
+  else
+    printf '%s' "unlimited"
+  fi
+}
 
 remote_quote() {
   printf '%q' "$1"
@@ -296,6 +305,7 @@ copy_attempt_log() {
 
 bs="$INITIAL_BS"
 attempt=0
+oom_attempt_count=0
 non_oom_retry_count=0
 while (( bs >= MIN_BS )); do
   attempt=$(( attempt + 1 ))
@@ -327,8 +337,14 @@ while (( bs >= MIN_BS )); do
 
   if [[ "$ATTEMPT_EXIT_REASON" == "oom" ]] || grep -Eq "$OOM_REGEX" "$attempt_log"; then
     non_oom_retry_count=0
+    oom_attempt_count=$(( oom_attempt_count + 1 ))
+    if (( MAX_OOM_ATTEMPTS > 0 && oom_attempt_count >= MAX_OOM_ATTEMPTS )); then
+      log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}); reached MAX_OOM_ATTEMPTS=${MAX_OOM_ATTEMPTS}. Stopping without lowering batch size."
+      stop_attempt_sessions
+      exit 1
+    fi
     if (( OOM_STEP == 0 )); then
-      log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Keeping bs=${bs} and resuming from the latest checkpoint."
+      log "OOM detected at bs=${bs} (exit=${ATTEMPT_EXIT_CODE}). Keeping bs=${bs} and resuming from the latest checkpoint (${oom_attempt_count}/$(oom_attempt_limit_label) OOM attempts used)."
       continue
     fi
     new_bs=$(( bs - OOM_STEP ))

@@ -2,7 +2,7 @@
 
 # ============================================================================
 # Self-Forced SiD-lite NPFM fine-tuning preset for one 4x H100 pod:
-# hsb-npc-training2.
+# hsb-npc-training-2.
 #
 # The matching launcher downloads the W&B artifact
 # `jksg01019-naver-labs/SMART-FLOW/epoch-last-g3zr84tp:v64` to:

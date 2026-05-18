@@ -560,9 +560,9 @@ python tools/estimate_control_no_slip_rho.py \
 
 pose-space checkpoint와 control-space checkpoint는 Flow decoder 입출력 차원이 다르므로 서로 섞어 resume하지 않는 것을 권장합니다. 기존 pose-space pretrain weight를 control-space 실험의 초기값으로 재사용하려면 Flow decoder head/encoder 차원 차이를 어떻게 처리할지 별도 migration 정책이 필요합니다.
 
-#### hsb-npc-training/hsb-npc-training2 H100x4x2 control-space pretrain
+#### hsb-npc-training/hsb-npc-training-2 H100x4x2 control-space pretrain
 
-`hsb-npc-training`, `hsb-npc-training2` 두 H100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다.
+`hsb-npc-training`, `hsb-npc-training-2` 두 H100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --replace
@@ -595,7 +595,7 @@ tmux 확인:
 
 ```bash
 kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-control-pretrain-h100x4x2
-kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-control-pretrain-h100x4x2
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x4x2
 ```
 
 실행 전에 실제 kubectl 명령을 확인하려면:
@@ -610,9 +610,9 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --dry-run
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --stop
 ```
 
-#### hsb-npc-training/hsb-npc-training2 H100x4x2 execution-context balanced pretrain
+#### hsb-npc-training/hsb-npc-training-2 H100x4x2 execution-context balanced pretrain
 
-`semi_control_rolling` 브랜치의 실행상태 문맥 정렬 학습을 `hsb-npc-training`, `hsb-npc-training2` 두 H100x4 pod에서 돌릴 때는 아래 전용 launcher를 씁니다. 이 launcher도 기존 running pod 안에 tmux session만 만들며 pod를 새로 만들거나 재시작하지 않습니다. **이미 두 pod에서 다른 학습이 돌고 있으면 실행하지 말고, 해당 학습이 끝난 뒤에만 사용합니다.**
+`semi_control_rolling` 브랜치의 실행상태 문맥 정렬 학습을 `hsb-npc-training`, `hsb-npc-training-2` 두 H100x4 pod에서 돌릴 때는 아래 전용 launcher를 씁니다. 이 launcher도 기존 running pod 안에 tmux session만 만들며 pod를 새로 만들거나 재시작하지 않습니다. **이미 두 pod에서 다른 학습이 돌고 있으면 실행하지 말고, 해당 학습이 끝난 뒤에만 사용합니다.**
 
 ```bash
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_pods.py \
@@ -628,7 +628,27 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_p
   --dry-run
 ```
 
-이 launcher는 `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml`을 사용합니다. 실험 의도는 다음 설정으로 고정됩니다.
+이 launcher는 `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml`을 사용합니다. 이 실험은 control-space pretrain을 closed-loop inference 때 실제로 실행되는 상태 흐름에 더 가깝게 맞추고, raw GT와 kinematic execution이 크게 어긋나는 supervision과 dense-scene OOM 리스크를 줄이는 목적입니다.
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling` |
+| 대상 pod | `hsb-npc-training`, `hsb-npc-training-2` |
+| GPU 구성 | H100 4장 x 2 pod = 8 GPU |
+| launcher | `scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_pods.py` |
+| experiment config | `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml` |
+| task name | `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26` |
+| tmux session | `catk-control-pretrain-h100x4x2-execctx-balanced` |
+| per-GPU batch | `26` |
+| effective global batch | `26 x 8 = 208` |
+| learning rate | `6e-4` |
+| flow horizon | `20` steps = 2초 |
+| 핵심 supervision | `use_kinematic_control_flow=true`, prefix-valid future loss, execution-context aligned trajectory |
+| outlier filter | vehicle `2.0m`, cyclist `2.0m` |
+| OOM 완화 | agent 수 기반 memory-balanced batch sampler, OOM 시 batch를 낮추지 않고 `26 -> 26 -> 26`까지 재시도 후 종료 |
+| metadata 정책 | `--prebuild-metadata`로 sampler metadata를 먼저 만들고, 학습 중 missing build는 금지 |
+
+핵심 Hydra 설정은 다음으로 고정됩니다.
 
 ```yaml
 model:
@@ -659,13 +679,13 @@ trainer:
 
 `--prebuild-metadata`는 각 pod의 SMART cache training split을 읽어서 memory-balanced sampler용 metadata만 미리 만듭니다. SMART cache 파일 자체는 수정하지 않습니다. 이 preset은 학습 중 metadata build가 조용히 오래 도는 것을 막기 위해 `train_memory_balance_build_on_missing=false`를 쓰므로, metadata cache가 없는 첫 실행에서는 `--prebuild-metadata`를 반드시 함께 줍니다. launcher는 `--prebuild-metadata` 없이 실행될 때 각 pod에서 metadata cache 파일이 보이는지 먼저 확인하고, 없으면 학습을 시작하기 전에 실패합니다. metadata 위치를 바꾸려면 `--metadata-cache-path /abs/path/to/cache.pt`를 쓰면 되고, launcher가 prebuild `--cache-path`와 training `data.train_memory_balance_metadata_cache` override를 같은 경로로 맞춥니다. 이전 metadata build가 비정상 종료되어 `.lock`만 남아 있으면 `--force-metadata`를 추가해 stale lock을 정리한 뒤 다시 생성합니다. 실제 build가 돌고 있는 중에는 `--force-metadata`를 쓰지 않습니다.
 
-기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2-execctx-balanced`입니다. 기본 `train_batch_size=26`, 8 GPU 기준 effective global batch는 `208`입니다. CUDA OOM이 발생하면 기존 H100x4x2 retry wrapper와 동일하게 최신 `epoch_last.ckpt`를 기준으로 resume하며, 기본 fallback은 `26 -> 24 -> 22 -> 20`입니다.
+기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2-execctx-balanced`입니다. 기본 `train_batch_size=26`, 8 GPU 기준 effective global batch는 `208`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 최신 `epoch_last.ckpt`를 기준으로 resume하지만, effective batch를 유지하기 위해 batch size는 낮추지 않습니다. 기본 OOM 정책은 `--oom-step=0 --max-oom-attempts=3`이며, `26 -> 26 -> 26` 세 번 모두 OOM이면 더 이상 재시도하지 않고 우아하게 종료합니다.
 
 tmux 확인:
 
 ```bash
 kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-control-pretrain-h100x4x2-execctx-balanced
-kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-control-pretrain-h100x4x2-execctx-balanced
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x4x2-execctx-balanced
 ```
 
 실험 코드만 멈추고 pod는 그대로 두려면:
@@ -1234,20 +1254,20 @@ torchrun \
 
 ### 5.10 H100 4장짜리 pod 2개로 multi-node Flow Matching pretrain
 
-이미 떠 있는 `hsb-npc-training`, `hsb-npc-training2` pod를 그대로 살려 두고, 각 pod의 H100 4장씩 총 8 GPU로 하나의 pretrain run을 돌릴 때 쓰는 경로입니다. **이 경로는 pod를 새로 만들거나 지우거나 재시작하지 않습니다.** launcher는 `kubectl exec`로 기존 running pod 안에 들어가 tmux 세션과 `torchrun`만 시작합니다.
+이미 떠 있는 `hsb-npc-training`, `hsb-npc-training-2` pod를 그대로 살려 두고, 각 pod의 H100 4장씩 총 8 GPU로 하나의 pretrain run을 돌릴 때 쓰는 경로입니다. **이 경로는 pod를 새로 만들거나 지우거나 재시작하지 않습니다.** launcher는 `kubectl exec`로 기존 running pod 안에 들어가 tmux 세션과 `torchrun`만 시작합니다.
 
 - preset 파일: `configs/experiment/pre_bc_flow_2x4_h100.yaml`
 - pod launcher: `scripts/launch_h100x4_multinode_pretrain_tmux.py`
 - pod 내부 실행 wrapper: `scripts/h100x4_multinode_pretrain.sh`
 - OOM fallback launcher: `scripts/h100x4_multinode_pretrain_with_oom_retry.sh`
 - 기본 구성: `NNODES=2`, `NPROC_PER_NODE=4`, `trainer.num_nodes=2`, `trainer.devices=4`
-- 기본 pod별 `CACHE_ROOT`: `hsb-npc-training=/mnt/nuplan/womd_v1_3/SMART_cache`, `hsb-npc-training2=/workspace/womd_v1_3/SMART_cache`
+- 기본 pod별 `CACHE_ROOT`: `hsb-npc-training=/mnt/nuplan/womd_v1_3/SMART_cache`, `hsb-npc-training-2=/workspace/womd_v1_3/SMART_cache`
 - 기본 per-GPU batch: `data.train_batch_size=26`
 - 기본 effective global batch: `26 * 8 GPUs = 208`
 - 기본 lr: `6e-4`
 - 기본 horizon: `flow_window_steps=20`
 - validation 중 WOSAC scoring이 오래 걸려도 DDP가 조기 timeout 나지 않도록 `trainer=ddp`의 process group timeout은 4시간입니다.
-- `pre_bc_flow_2x4_h100` preset은 `TQDMProgressBar(refresh_rate=1)`와 `trainer.enable_progress_bar=true`를 명시합니다. launcher 기본 pod 순서에서는 `hsb-npc-training`이 node rank 0/global rank 0이므로, `check_val_every_n_epoch=32`로 fit-time validation이 시작될 때 validation tqdm 진행률은 `hsb-npc-training`의 `catk-h100x4-pretrain` tmux 주 pane에 표시됩니다. `hsb-npc-training2`는 non-zero rank라 같은 progress bar를 중복 출력하지 않는 것이 정상입니다.
+- `pre_bc_flow_2x4_h100` preset은 `TQDMProgressBar(refresh_rate=1)`와 `trainer.enable_progress_bar=true`를 명시합니다. launcher 기본 pod 순서에서는 `hsb-npc-training`이 node rank 0/global rank 0이므로, `check_val_every_n_epoch=32`로 fit-time validation이 시작될 때 validation tqdm 진행률은 `hsb-npc-training`의 `catk-h100x4-pretrain` tmux 주 pane에 표시됩니다. `hsb-npc-training-2`는 non-zero rank라 같은 progress bar를 중복 출력하지 않는 것이 정상입니다.
 - launcher는 각 pod 안에 쓰는 env 파일에 pod별 `CACHE_ROOT`를 따로 기록합니다. 두 pod가 같은 mount path를 공유하는 경우에만 `--cache-root <PATH>`로 전체 override를 쓰고, pod별 경로를 바꿔야 하면 `--pod-cache-root POD=PATH`를 반복해서 넘깁니다.
 - 이 기본값은 H100x4x2 global batch `208` 기준으로 `6e-4`를 사용합니다. 이전 보수적 설정과 같은 per-GPU batch를 유지해야 하는 ablation이면 `--train-batch-size 20`을 쓰고, 기존 6xH100과 global batch까지 맞춰야 하는 ablation이면 `--train-batch-size 15 --learning-rate 4e-4`를 쓰세요.
 
@@ -1256,7 +1276,7 @@ torchrun \
 ```bash
 python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --namespace p-pnc \
-  --pods hsb-npc-training hsb-npc-training2 \
+  --pods hsb-npc-training hsb-npc-training-2 \
   --container main \
   --project-root /mnt/nuplan/projects/catk \
   --branch self_forcing_bugfix \
@@ -1288,7 +1308,7 @@ retry wrapper의 로컬 attempt 로그는 `logs/_h100x4_multinode_pretrain_oom_r
 
 ```bash
 kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-h100x4-pretrain
-kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-h100x4-pretrain
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-h100x4-pretrain
 ```
 
 중단도 pod가 아니라 tmux session만 종료합니다.
@@ -1296,7 +1316,7 @@ kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-h100x
 ```bash
 python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --namespace p-pnc \
-  --pods hsb-npc-training hsb-npc-training2 \
+  --pods hsb-npc-training hsb-npc-training-2 \
   --stop
 ```
 
@@ -1305,7 +1325,7 @@ python scripts/launch_h100x4_multinode_pretrain_tmux.py \
 ```bash
 python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --namespace p-pnc \
-  --pods hsb-npc-training hsb-npc-training2 \
+  --pods hsb-npc-training hsb-npc-training-2 \
   --task-name flow_pretrain_h100x4x2_smoke \
   --limit-train-batches 20 \
   --limit-val-batches 0 \
@@ -1313,7 +1333,7 @@ python scripts/launch_h100x4_multinode_pretrain_tmux.py \
   --replace
 ```
 
-manual launch가 필요하면 각 pod 안에서 같은 repo로 이동해 아래 환경변수를 다르게 주고 같은 wrapper를 실행합니다. rank 0은 `hsb-npc-training`, rank 1은 `hsb-npc-training2`입니다.
+manual launch가 필요하면 각 pod 안에서 같은 repo로 이동해 아래 환경변수를 다르게 주고 같은 wrapper를 실행합니다. rank 0은 `hsb-npc-training`, rank 1은 `hsb-npc-training-2`입니다.
 
 ```bash
 # hsb-npc-training
@@ -1324,7 +1344,7 @@ export CACHE_ROOT=/mnt/nuplan/womd_v1_3/SMART_cache
 export TASK_NAME=flow_semi_continuous_pretrain_h100x4x2
 bash scripts/h100x4_multinode_pretrain.sh
 
-# hsb-npc-training2
+# hsb-npc-training-2
 export NNODES=2 NPROC_PER_NODE=4 NODE_RANK=1
 export MASTER_ADDR=<hsb-npc-training Pod IP>
 export MASTER_PORT=29511
@@ -1337,7 +1357,7 @@ batch를 더 공격적으로 키우고 싶으면 launcher 인자로 override 합
 
 ```bash
 python scripts/launch_h100x4_multinode_pretrain_tmux.py \
-  --pods hsb-npc-training hsb-npc-training2 \
+  --pods hsb-npc-training hsb-npc-training-2 \
   --train-batch-size 28 \
   --task-name flow_pretrain_h100x4x2_bs28 \
   --replace
@@ -1707,9 +1727,9 @@ kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-sf-h10
 python scripts/launch_self_forced_h100x4_hsb_npc_training.py --stop
 ```
 
-#### 1-node x 4 H100 hsb-npc-training2 SiD self-forced 실행
+#### 1-node x 4 H100 hsb-npc-training-2 SiD self-forced 실행
 
-H100 4장짜리 `hsb-npc-training2` pod 하나에서 SiD objective로 self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다. 이 launcher는 기존 pod를 만들거나 지우거나 재시작하지 않고, `kubectl exec`로 이미 떠 있는 pod 안에 tmux 세션과 학습 프로세스만 띄웁니다. pod에 다른 실험이 돌고 있으면 실제 실행 대신 dry-run만 확인하세요.
+H100 4장짜리 `hsb-npc-training-2` pod 하나에서 SiD objective로 self-forced fine-tuning을 돌릴 때는 아래 preset과 launcher를 사용합니다. 이 launcher는 기존 pod를 만들거나 지우거나 재시작하지 않고, `kubectl exec`로 이미 떠 있는 pod 안에 tmux 세션과 학습 프로세스만 띄웁니다. pod에 다른 실험이 돌고 있으면 실제 실행 대신 dry-run만 확인하세요.
 
 ```text
 configs/experiment/self_forced_npfm_sid_h100x4_hsb_npc_training2.yaml
@@ -1718,7 +1738,7 @@ scripts/launch_self_forced_sid_h100x4_hsb_npc_training2.py
 
 기본 실험 설정:
 
-- 대상 pod: `hsb-npc-training2`
+- 대상 pod: `hsb-npc-training-2`
 - `trainer.num_nodes=1`, `trainer.devices=4` -> 총 4 DDP ranks
 - H100용 `trainer.precision=bf16-mixed`
 - `trainer.max_epochs=10`, `trainer.check_val_every_n_epoch=2`
@@ -1752,7 +1772,7 @@ python scripts/launch_self_forced_sid_h100x4_hsb_npc_training2.py --replace
 attach:
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-sf-sid-h100x4-hsb-npc-training2
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-sf-sid-h100x4-hsb-npc-training-2
 ```
 
 중지:
@@ -2251,7 +2271,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 -m src.run
 ### 2-node 4x H100 학습
 
 ```bash
-python scripts/launch_h100x4_multinode_pretrain_tmux.py --pods hsb-npc-training hsb-npc-training2 --task-name flow_semi_continuous_pretrain_h100x4x2 --replace
+python scripts/launch_h100x4_multinode_pretrain_tmux.py --pods hsb-npc-training hsb-npc-training-2 --task-name flow_semi_continuous_pretrain_h100x4x2 --replace
 ```
 
 ### validation 평가

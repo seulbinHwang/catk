@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Launch H100x4x2 kinematic control-space pretrain on "
-            "hsb-npc-training and hsb-npc-training2."
+            "hsb-npc-training and hsb-npc-training-2."
         )
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", "p-pnc"))
@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pods",
         nargs="+",
-        default=os.environ.get("PODS", "hsb-npc-training hsb-npc-training2").split(),
+        default=os.environ.get("PODS", "hsb-npc-training hsb-npc-training-2").split(),
     )
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", "/mnt/nuplan/projects/catk"))
     parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or current_branch())
@@ -70,6 +70,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", default="catk-control-pretrain-h100x4x2")
     parser.add_argument("--initial-bs", type=int, default=26)
     parser.add_argument("--oom-step", type=int, default=2)
+    parser.add_argument(
+        "--max-oom-attempts",
+        type=int,
+        default=0,
+        help="Stop after this many OOM attempts. Use 0 for no explicit cap.",
+    )
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--poll-interval", type=int, default=30)
     parser.add_argument("--master-port", default="29511")
@@ -111,8 +117,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("this preset expects exactly two H100x4 pods")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
-    if args.oom_step < 1:
-        parser.error("--oom-step must be >= 1")
+    if args.oom_step < 0:
+        parser.error("--oom-step must be >= 0")
+    if args.max_oom_attempts < 0:
+        parser.error("--max-oom-attempts must be >= 0")
     if args.min_bs < 1:
         parser.error("--min-bs must be >= 1")
     if args.nproc_per_node < 1:
@@ -172,6 +180,7 @@ def main() -> int:
             "NPROC_PER_NODE": str(args.nproc_per_node),
             "INITIAL_BS": str(args.initial_bs),
             "OOM_STEP": str(args.oom_step),
+            "MAX_OOM_ATTEMPTS": str(args.max_oom_attempts),
             "MIN_BS": str(args.min_bs),
             "POLL_INTERVAL": str(args.poll_interval),
         }
@@ -208,6 +217,7 @@ def main() -> int:
                 "NPROC_PER_NODE",
                 "INITIAL_BS",
                 "OOM_STEP",
+                "MAX_OOM_ATTEMPTS",
                 "MIN_BS",
                 "POLL_INTERVAL",
                 "POD_CACHE_ROOTS",

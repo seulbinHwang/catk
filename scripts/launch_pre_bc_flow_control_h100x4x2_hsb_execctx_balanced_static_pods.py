@@ -2,7 +2,7 @@
 """Launch the semi_control_rolling execution-context pretrain on H100x4x2.
 
 This launcher targets the already-running ``hsb-npc-training`` and
-``hsb-npc-training2`` pods. It does not create, delete, or restart pods. It
+``hsb-npc-training-2`` pods. It does not create, delete, or restart pods. It
 only prepares the optional memory-balance metadata cache and starts/replaces
 the configured tmux training session inside the existing pods.
 """
@@ -21,7 +21,7 @@ BASE_LAUNCHER = Path(__file__).with_name(
     "launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py"
 )
 
-DEFAULT_PODS = ("hsb-npc-training", "hsb-npc-training2")
+DEFAULT_PODS = ("hsb-npc-training", "hsb-npc-training-2")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4x2_execctx_balanced"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26"
@@ -30,7 +30,7 @@ DEFAULT_SESSION = "catk-control-pretrain-h100x4x2-execctx-balanced"
 DEFAULT_METADATA_CACHE_RELATIVE = "dataset_metadata/womd_training_memory_balance_v1.pt"
 DEFAULT_CACHE_ROOT_BY_POD = {
     "hsb-npc-training": "/mnt/nuplan/womd_v1_3/SMART_cache",
-    "hsb-npc-training2": "/workspace/womd_v1_3/SMART_cache",
+    "hsb-npc-training-2": "/workspace/womd_v1_3/SMART_cache",
 }
 
 
@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Launch H100x4x2 execution-context-aligned control-space pretrain "
-            "on hsb-npc-training and hsb-npc-training2."
+            "on hsb-npc-training and hsb-npc-training-2."
         )
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", "p-pnc"))
@@ -134,7 +134,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--initial-bs", type=int, default=26)
-    parser.add_argument("--oom-step", type=int, default=2)
+    parser.add_argument("--oom-step", type=int, default=0)
+    parser.add_argument(
+        "--max-oom-attempts",
+        type=int,
+        default=3,
+        help=(
+            "Stop after this many OOM attempts. The default keeps "
+            "train_batch_size=26 for three OOM attempts, then exits cleanly."
+        ),
+    )
     parser.add_argument("--min-bs", type=int, default=20)
     parser.add_argument("--poll-interval", type=int, default=30)
     parser.add_argument("--master-port", default="29571")
@@ -190,8 +199,10 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"this preset expects exactly {len(DEFAULT_PODS)} H100x4 pods")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
-    if args.oom_step < 1:
-        parser.error("--oom-step must be >= 1")
+    if args.oom_step < 0:
+        parser.error("--oom-step must be >= 0")
+    if args.max_oom_attempts < 0:
+        parser.error("--max-oom-attempts must be >= 0")
     if args.min_bs < 1:
         parser.error("--min-bs must be >= 1")
     if args.nproc_per_node < 1:
@@ -307,6 +318,8 @@ def main() -> int:
         str(args.initial_bs),
         "--oom-step",
         str(args.oom_step),
+        "--max-oom-attempts",
+        str(args.max_oom_attempts),
         "--min-bs",
         str(args.min_bs),
         "--poll-interval",
