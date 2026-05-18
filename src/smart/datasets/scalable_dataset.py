@@ -77,7 +77,11 @@ class MultiDataset(Dataset):
         road_num_rollouts_per_scenario: int = 1,
     ) -> None:
         raw_dir = Path(raw_dir)
-        self._raw_paths = [p.as_posix() for p in sorted(raw_dir.glob("*"))]
+        self._raw_paths = [
+            p.as_posix()
+            for p in sorted(raw_dir.glob("*"))
+            if p.is_file() and not p.name.startswith(".")
+        ]
         self._road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
         self._raw_path_groups: Optional[List[List[str]]] = None
 

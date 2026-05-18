@@ -37,6 +37,7 @@ trainer:
   gradient_clip_val: 1.0
   sync_batchnorm: false
   accumulate_grad_batches: 1
+  use_distributed_sampler: false
 
 callbacks:
   tqdm_progress_bar:
@@ -53,3 +54,7 @@ data:
   test_batch_size: 16
   num_workers: 4
   train_use_eval_agent_selection: true
+  train_memory_balanced_batching: true
+  train_memory_balance_metadata_num_workers: 8
+  train_memory_balance_weight_key: agent_quadratic
+  train_memory_balance_bucket_size_multiplier: 50
