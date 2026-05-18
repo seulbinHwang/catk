@@ -703,6 +703,8 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 
 이 preset은 `train_use_eval_agent_selection=true`로 모든 agent를 살리기 때문에, dense scene 몇 개가 한 rank의 local batch에 같이 들어가면 CUDA peak가 크게 튈 수 있습니다. 그래서 pkl별 `agent_count`, current-step valid agent 수, map polyline 수만 한 번 스캔해 metadata cache로 저장하고, 이후 epoch마다 무거운 scene이 local batch 안에 몰리지 않도록 balanced batch sampler가 index 순서만 재배치합니다. 모델, loss, per-rank batch size, effective global batch `188`은 바뀌지 않고, 학습 objective도 그대로입니다.
 
+`shuffle=true`일 때 balanced batch sampler는 Lightning의 epoch hook을 받아 매 epoch `seed + epoch`으로 새 순서를 만듭니다. 즉 memory-balanced 제약은 유지하되, epoch마다 같은 batch 순서가 반복되지는 않습니다.
+
 metadata cache는 학습 cache 파일을 수정하지 않습니다. cache가 없으면 첫 실행에서 한 번 생성하고, 같은 cache가 있으면 학습 중에는 pkl을 다시 스캔하지 않습니다. 따라서 steady-state 학습 속도에 추가되는 비용은 epoch 시작 시 작은 tensor 정렬과 index list 생성뿐입니다. Lightning의 기본 distributed sampler가 이 batch sampler를 덮어쓰지 않도록 이 preset은 `trainer.use_distributed_sampler=false`를 명시합니다.
 
 이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=4`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, `4 -> 2`처럼 batch를 낮추지 않습니다.

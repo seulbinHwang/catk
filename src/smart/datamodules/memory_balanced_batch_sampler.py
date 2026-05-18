@@ -302,6 +302,10 @@ class MemoryBalancedDistributedBatchSampler(Sampler[list[int]]):
     def __len__(self) -> int:
         return self.num_global_batches
 
+    @property
+    def sampler(self):
+        return self
+
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
