@@ -78,6 +78,7 @@
 - [Waymo Open Motion Dataset](https://waymo.com/open/download/)을 다운로드한다. 이 저장소는 v1.2.1을 사용한다.
 - [scripts/cache_womd.sh](scripts/cache_womd.sh)를 사용해 dataset을 pickle 파일로 전처리하면 학습과 평가 중 data loading을 빠르게 할 수 있다.
 - `training`, `validation`, `testing` 세 split을 모두 cache로 만들어야 한다.
+- cache 생성 시 `crosswalk`, `speed_bump`, `driveway`는 서로 다른 map surface category로 보존된다. Point type은 각각 `9`, `10`, `11`을 사용하고, polygon category embedding도 `lane`, `road_edge`, `road_line`, `crosswalk`, `speed_bump`, `driveway` 6종을 입력받는다. 예전 cache처럼 `speed_bump`/`driveway`가 `crosswalk`로 합쳐져 있으면 네트워크가 세 surface를 구분할 수 없으므로, 이 구분을 쓰려면 cache를 새로 생성해야 한다.
 
 ## 코드 실행
 
