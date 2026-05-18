@@ -393,13 +393,30 @@ class SMARTAgentEncoder(nn.Module):
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        edge_index_pl2a = radius(
-            x=pos_s[:, :2],
-            y=pos_pl[:, :2],
+        # ``torch_cluster.radius`` 도 ``radius_graph`` 와 마찬가지로 batch index 가
+        # 단조 비감소 순서로 들어와야 그룹 분리가 silent 가정으로 동작합니다.
+        # caller 는 ``batch_s`` 를 ``tokenized_agent["batch"].repeat(n_step)`` 으로
+        # 만들기 때문에 step 사이마다 큰 scene 번호에서 작은 값으로 떨어집니다.
+        # 그대로 호출하면 같은 scene 안의 map-agent edge 가 silent 하게 일부
+        # 누락돼 일부 agent 가 자기 scene 의 지도 정보를 받지 못하고 학습됩니다.
+        # 호출 직전에 양쪽 batch 를 정렬해 ``radius`` 를 부르고, 받은 edge index
+        # 를 원래 순서로 되돌려 downstream feature 계산이 그대로 작동하도록 합니다.
+        sort_order_x = torch.argsort(batch_s, stable=True)
+        sort_order_y = torch.argsort(batch_pl, stable=True)
+        edge_index_pl2a_sorted = radius(
+            x=pos_s[sort_order_x, :2],
+            y=pos_pl[sort_order_y, :2],
             r=self.pl2a_radius,
-            batch_x=batch_s,
-            batch_y=batch_pl,
+            batch_x=batch_s[sort_order_x],
+            batch_y=batch_pl[sort_order_y],
             max_num_neighbors=300,
+        )
+        edge_index_pl2a = torch.stack(
+            [
+                sort_order_y[edge_index_pl2a_sorted[0]],
+                sort_order_x[edge_index_pl2a_sorted[1]],
+            ],
+            dim=0,
         )
         edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
         if light_type is None:
