@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+from src.smart.metrics.flow_metrics import flow_matching_loss
 from src.smart.modules.flow_local_decoder import HierarchicalFlowDecoder
 
 
@@ -156,6 +157,54 @@ def test_same_chunk_agent_attention_ignores_invalid_future_chunks() -> None:
     )
 
     assert torch.allclose(base_output[0], changed_output[0], atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_same_chunk_agent_attention_ignores_invalid_steps_in_partial_chunk() -> None:
+    decoder = _build_decoder()
+    anchor_hidden = torch.randn(2, 8)
+    x_t_norm = torch.randn(2, 10, 4)
+    tau = torch.full((2,), 0.52)
+    interaction_group = torch.tensor([0, 0], dtype=torch.long)
+    close_pos = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
+    head = torch.zeros(2)
+    future_valid_mask = torch.ones(2, 10, dtype=torch.bool)
+    future_valid_mask[1, 3:] = False
+
+    base_output = decoder(
+        anchor_hidden,
+        x_t_norm,
+        tau,
+        future_valid_mask=future_valid_mask,
+        interaction_group=interaction_group,
+        interaction_pos=close_pos,
+        interaction_head=head,
+    )
+    changed_x_t_norm = x_t_norm.clone()
+    changed_x_t_norm[1, 3:] = torch.randn_like(changed_x_t_norm[1, 3:]) * 50.0
+    changed_output = decoder(
+        anchor_hidden,
+        changed_x_t_norm,
+        tau,
+        future_valid_mask=future_valid_mask,
+        interaction_group=interaction_group,
+        interaction_pos=close_pos,
+        interaction_head=head,
+    )
+
+    assert torch.allclose(
+        base_output[future_valid_mask],
+        changed_output[future_valid_mask],
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
+
+    target = torch.randn_like(base_output)
+    changed_target = target.clone()
+    changed_target[1, 3:] = torch.randn_like(changed_target[1, 3:]) * 50.0
+    base_loss = flow_matching_loss(base_output, target, valid_mask=future_valid_mask)
+    changed_loss = flow_matching_loss(changed_output, changed_target, valid_mask=future_valid_mask)
+
+    assert torch.allclose(base_loss, changed_loss, atol=1.0e-6, rtol=1.0e-6)
 
 
 def test_default_control_decoder_parameter_count_includes_agent_chunk_attention() -> None:
