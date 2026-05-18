@@ -164,6 +164,11 @@ def _default_metadata_cache_path(raw_paths: Sequence[str]) -> Path:
     return raw_dir.parent / ".catk_metadata" / filename
 
 
+def memory_metadata_lock_path(cache_path: str | Path) -> Path:
+    cache_path = Path(cache_path).expanduser()
+    return cache_path.with_suffix(cache_path.suffix + ".lock")
+
+
 def _as_int64_tensor(value) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.int64).cpu().flatten().contiguous()
 
@@ -259,7 +264,7 @@ def load_or_build_memory_metadata(
         )
 
     resolved_cache_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_dir = resolved_cache_path.with_suffix(resolved_cache_path.suffix + ".lock")
+    lock_dir = memory_metadata_lock_path(resolved_cache_path)
     start_time = time.monotonic()
     owns_lock = False
     while True:

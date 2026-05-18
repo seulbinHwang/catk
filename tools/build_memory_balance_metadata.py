@@ -9,6 +9,7 @@ files.
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.smart.datamodules.memory_balanced_batch_sampler import (  # noqa: E402
     load_or_build_memory_metadata,
+    memory_metadata_lock_path,
 )
 
 
@@ -42,7 +44,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Remove an existing metadata cache before rebuilding it.",
+        help=(
+            "Remove an existing metadata cache and stale metadata lock before "
+            "rebuilding. Do not use while another metadata build is active."
+        ),
     )
     return parser.parse_args()
 
@@ -57,8 +62,15 @@ def main() -> int:
     if not raw_paths:
         raise FileNotFoundError(f"no files matched {args.pattern!r} under {raw_dir}")
 
-    if args.force and cache_path.exists():
-        cache_path.unlink()
+    if args.force:
+        lock_path = memory_metadata_lock_path(cache_path)
+        if cache_path.exists():
+            cache_path.unlink()
+        if lock_path.exists():
+            if lock_path.is_dir():
+                shutil.rmtree(lock_path)
+            else:
+                lock_path.unlink()
 
     start_time = time.perf_counter()
     metadata = load_or_build_memory_metadata(

@@ -1,4 +1,6 @@
 import pickle
+import subprocess
+import sys
 from pathlib import Path
 
 import torch
@@ -8,6 +10,7 @@ from src.smart.datamodules.memory_balanced_batch_sampler import (
     fingerprint_raw_paths,
     load_or_build_memory_metadata,
     memory_balance_weights,
+    memory_metadata_lock_path,
 )
 
 
@@ -114,3 +117,36 @@ def test_old_list_payload_still_loads(tmp_path: Path) -> None:
     assert loaded.current_valid_agent_count.tolist() == [2, 4]
     assert loaded.valid_agent_step_count.tolist() == [15, 25]
     assert loaded.map_count.tolist() == [7, 9]
+
+
+def test_prebuild_force_removes_stale_lock_dir(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    _write_sample(raw_dir / "sample.pkl", agent_count=2, current_valid=1, map_count=3)
+
+    cache_path = tmp_path / "metadata.pt"
+    lock_path = memory_metadata_lock_path(cache_path)
+    lock_path.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "tools" / "build_memory_balance_metadata.py"),
+            "--raw-dir",
+            str(raw_dir),
+            "--cache-path",
+            str(cache_path),
+            "--num-workers",
+            "1",
+            "--force",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "memory-balance metadata ready" in result.stdout
+    assert cache_path.is_file()
+    assert not lock_path.exists()

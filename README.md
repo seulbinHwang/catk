@@ -717,6 +717,8 @@ python tools/build_memory_balance_metadata.py \
   --num-workers 8
 ```
 
+이전 metadata build가 비정상 종료되어 `.lock` 디렉터리만 남은 경우에는 같은 명령에 `--force`를 붙여 기존 metadata 파일과 stale lock을 함께 지운 뒤 다시 생성합니다. 다른 metadata build가 실제로 실행 중일 때는 `--force`를 쓰지 않습니다.
+
 이미 만들어진 metadata cache는 약 수 MB 크기라 load가 빠릅니다. cache가 없는 상태에서 ad-hoc으로 학습 프로세스 안에서 build까지 허용해야 할 때만 `data.train_memory_balance_build_on_missing=true`를 override합니다.
 
 이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=4`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, `4 -> 2`처럼 batch를 낮추지 않습니다.
