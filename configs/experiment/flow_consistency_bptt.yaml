@@ -49,11 +49,22 @@ model:
       # anchor stride: 매 N번째 2Hz step만 anchor로 사용
       # stride=4 → [0,4,8,12] 4개, stride=1 → 전체 14개
       ocsc_anchor_stride: 4
-      # 일관성 loss: "l2" (MSE), "smooth_l1", "l1"
+      # 일관성 loss: "l2" (MSE), "smooth_l1", "l1", "pwil" (PWIL coupling W_1 upper bound)
       ocsc_loss_type: l2
       # true (권장): proper MMD² with self-terms (mode collapse 방지)
       # false: 기존 paired L2 mean (ablation 비교용)
       ocsc_use_mmd: true
+      # PWIL 모드 (loss_type=="pwil") 의 coupling 알고리즘:
+      #   "hungarian" (M=G 필수, exact W_1 — scipy linear_sum_assignment)
+      #   "greedy"    (M≠G 허용, PWIL 원논문 nearest-first mass transport)
+      #   "uniform"   (γ=1/(GM), ablation baseline — 가장 느슨한 bound)
+      ocsc_pwil_coupling: "hungarian"
+      # True → per-CL transport cost c 에 α(1-exp(-β c)) bounded reward 변환 (loss ∈ [0, α]).
+      # False → raw transport cost <d, γ> 직접 minimize (W_1 upper bound 그대로).
+      ocsc_pwil_use_exp_reward: true
+      ocsc_pwil_alpha: 1.0
+      # β · typical(c) ≈ 1 영역으로 튜닝 (saturation 회피).
+      ocsc_pwil_beta: 5.0
       # False: current policy 로 open-loop target 생성 (학습 중 target 도 변함)
       # True: frozen pretrained policy 로 open-loop target 생성
       ocsc_use_pretrained_ref: false
