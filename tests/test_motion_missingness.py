@@ -86,7 +86,7 @@ def _make_flow_decoder() -> SMARTFlowAgentDecoder:
     decoder.use_lqr = False
     decoder.use_stop_motion = False
     decoder.flow_ode = _ZeroFlowODE(decoder)
-    decoder.flow_decoder = lambda hidden, x_t, tau: x_t
+    decoder.flow_decoder = lambda hidden, x_t, tau, **kwargs: x_t
     decoder.commit_bridge = _StraightCommitBridge()
     decoder.token_emb_veh = _ZeroTokenEmbedding()
     decoder.token_emb_ped = _ZeroTokenEmbedding()

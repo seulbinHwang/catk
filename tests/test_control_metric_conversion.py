@@ -148,7 +148,7 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
     decoder.control_vehicle_no_slip_point_ratio = 0.0
     decoder.control_cyclist_no_slip_point_ratio = 0.0
     decoder.flow_ode = _DummyFlowODE()
-    decoder.flow_decoder = lambda hidden, x_t, tau, future_valid_mask=None: x_t
+    decoder.flow_decoder = lambda hidden, x_t, tau, **kwargs: x_t
     decoder.build_anchor_context = lambda **kwargs: {
         "ctx_hidden_pack": torch.zeros((1, 2, 1)),
         "anchor_hidden": torch.zeros((1, 1, 1)),

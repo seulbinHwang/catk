@@ -39,6 +39,42 @@
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 2025 Sim Agents proto와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
+### Same-chunk Agent-Agent Attention
+
+`HierarchicalFlowDecoder`는 chunk mixer 2개 뒤, step refiner 앞에 **same-chunk agent-agent attention**을 추가했습니다.
+기존 구조가 한 agent 내부의 4개 0.5초 chunk를 정렬했다면, 새 block은 같은 scene-anchor group 안에서
+같은 chunk 번호끼리 agent 간 상호작용을 한 번 더 반영합니다.
+이 attention은 dense all-to-all이 아니라 `SMARTAgentEncoder`의 agent-agent relation처럼 **거리 기반 radius graph**로 만듭니다.
+기본 반경은 `decoder.a2a_radius=60.0m`이며, 같은 group과 같은 0.5초 chunk에 속한 가까운 agent끼리만 연결합니다.
+
+학습에는 여러 anchor 시점이 함께 펼쳐지므로 실제 group은 `scene id + anchor index`로 만듭니다.
+그래서 같은 scene이라도 서로 다른 anchor 시점의 미래 chunk가 attention으로 섞이지 않습니다.
+closed-loop rollout처럼 한 번에 하나의 현재 시점만 생성하는 경로에서는 scene id가 그대로 group 역할을 합니다.
+graph를 만들 때는 현재 anchor의 위치 `[N, 2]`, heading `[N]`, group `[N]`을 같이 사용합니다.
+edge feature는 거리, 수신 agent 기준 상대 방향, 상대 heading으로 구성하고 Fourier embedding 뒤 graph attention에 넣습니다.
+
+무효 agent와 무효 chunk도 graph 단계에서 제외합니다. 학습 open-loop에서는 유효 anchor만 먼저 pack하고,
+prefix-valid mask 때문에 미래가 없는 chunk는 radius graph의 node 후보에서 빼며, attention 뒤에도 해당 chunk 출력을 0으로 유지합니다.
+closed-loop rollout에서는 현재 살아 있는 active agent만 pack하므로 사라진 agent는 interaction graph에 들어가지 않습니다.
+
+기본 control-flow 설정 기준 구조는 아래와 같습니다.
+
+| 순서 | 구조 | 입력 shape | 출력 shape | 파라미터 수 | 역할 |
+|---:|---|---|---|---:|---|
+| 1 | 장면 문맥 투영 | `[N, 128]` | `[N, 96]` | 21,888 | agent별 장면 문맥을 flow 내부 차원으로 변환 |
+| 2 | noisy future / time 인코딩 | `[N, 20, 3]`, `[N]` | `[N, 4, 5, 96]` | 포함 | 0.1초 step별 noisy future 표현 생성 |
+| 3 | 0.5초 chunk 요약 | `[N, 4, 5, 96]` | `[N, 4, 96]` | 30,432 | 5개 step을 1개 chunk 표현으로 요약 |
+| 4 | chunk mixer 1 | `[N, 4, 96]` | `[N, 4, 96]` | 167,424 | agent 내부에서 4개 chunk의 시간 흐름 정렬 |
+| 5 | chunk mixer 2 | `[N, 4, 96]` | `[N, 4, 96]` | 167,424 | agent 내부 temporal plan 추가 정렬 |
+| 6 | same-chunk radius graph agent-agent attention | `[N, 4, 96]` + group `[N]` + position `[N, 2]` + heading `[N]` | `[N, 4, 96]` | 200,892 | 같은 group, 같은 0.5초 chunk, 60m 이내 agent 간 상호작용 반영 |
+| 7 | chunk 내부 step refiner | step `[N, 4, 5, 96]`, chunk `[N, 4, 96]` | `[N, 20, 96]` | 93,408 | 각 chunk 안 5개 step의 세부 움직임 정리 |
+| 8 | per-step velocity head | `[N, 20, 96]` | `[N, 20, 3]` | 9,603 | 각 0.1초 step의 flow 방향 출력 |
+
+이 변경으로 `HierarchicalFlowDecoder` 파라미터 수는 **490,179개에서 691,071개**로 늘었습니다.
+추가된 block의 파라미터 수는 **200,892개**입니다.
+구조가 바뀌었기 때문에 이전 `HierarchicalFlowDecoder` checkpoint와 strict 로드는 호환되지 않습니다.
+이 브랜치에서는 새 pretrain을 기준으로 사용합니다.
+
 ### Fast WOSAC Metric
 
 - TrajTok의 `wosac_fast_eval_tool.fast_sim_agents_metrics` 구현을 `src/smart/metrics/wosac_fast_eval_tool/` 아래에 vendoring했습니다.

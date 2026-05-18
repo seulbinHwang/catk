@@ -337,6 +337,10 @@ class SMARTFlowDecoder(nn.Module):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        agent_batch: Tensor | None = None,
+        interaction_group: Tensor | None = None,
+        interaction_pos: Tensor | None = None,
+        interaction_head: Tensor | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -358,6 +362,10 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            agent_batch=agent_batch,
+            interaction_group=interaction_group,
+            interaction_pos=interaction_pos,
+            interaction_head=interaction_head,
         )
 
     def flow_norm_to_pose_metric_norm(

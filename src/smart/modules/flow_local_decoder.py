@@ -7,15 +7,21 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_cluster import radius_graph
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch_geometric.utils import subgraph
 
+from src.smart.layers.attention_layer import AttentionLayer
+from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.tokens.agent_token_matching import (
     build_agent_type_masks,
     match_token_idx_from_local_contour,
 )
 from src.smart.utils import (
+    angle_between_2d_vectors,
     cal_polygon_contour,
     safe_angle_from_2d_vector,
+    safe_norm_2d,
     transform_to_global,
     transform_to_local,
     wrap_angle,
@@ -573,6 +579,166 @@ class HalfSecondChunkMixerBlock(nn.Module):
         return chunk_tokens
 
 
+class SameChunkAgentAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        flow_dim: int,
+        num_heads: int,
+        head_dim: int,
+        num_freq_bands: int,
+        radius: float,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.radius = float(radius)
+        self.max_num_neighbors = 300
+        self.r_a2a_emb = FourierEmbedding(
+            input_dim=3,
+            hidden_dim=flow_dim,
+            num_freq_bands=num_freq_bands,
+        )
+        self.a2a_attn = AttentionLayer(
+            hidden_dim=flow_dim,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dropout=dropout,
+            bipartite=False,
+            has_pos_emb=True,
+        )
+
+    def _build_interaction_group(
+        self,
+        interaction_group: torch.Tensor | None,
+        num_anchor: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if interaction_group is None:
+            return torch.zeros(num_anchor, device=device, dtype=torch.long)
+        if tuple(interaction_group.shape) != (num_anchor,):
+            raise ValueError(
+                "interaction_group must have shape [n_valid_anchor], "
+                f"got {tuple(interaction_group.shape)} for n_valid_anchor={num_anchor}."
+            )
+        return interaction_group.to(device=device, dtype=torch.long)
+
+    def _build_same_chunk_edges(
+        self,
+        interaction_pos: torch.Tensor,
+        interaction_head: torch.Tensor,
+        interaction_group: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None,
+        num_chunks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_anchor = interaction_pos.shape[0]
+        _, inverse_group = torch.unique(interaction_group, sorted=True, return_inverse=True)
+        num_groups = int(inverse_group.max().item()) + 1
+        chunk_idx = torch.arange(num_chunks, device=interaction_pos.device)
+
+        pos_s = interaction_pos.unsqueeze(0).expand(num_chunks, num_anchor, 2).reshape(-1, 2)
+        head_s = interaction_head.unsqueeze(0).expand(num_chunks, num_anchor).reshape(-1)
+        head_vector_s = torch.stack([head_s.cos(), head_s.sin()], dim=-1)
+        batch_s = (
+            inverse_group.unsqueeze(0).expand(num_chunks, num_anchor)
+            + chunk_idx.view(num_chunks, 1) * num_groups
+        ).reshape(-1)
+        if chunk_valid_mask is None:
+            valid_mask = torch.ones(
+                num_chunks * num_anchor,
+                device=interaction_pos.device,
+                dtype=torch.bool,
+            )
+        else:
+            valid_mask = chunk_valid_mask.transpose(0, 1).reshape(-1).bool()
+
+        edge_index = radius_graph(
+            x=pos_s,
+            r=self.radius,
+            batch=batch_s,
+            loop=False,
+            max_num_neighbors=self.max_num_neighbors,
+        )
+        edge_index = subgraph(subset=valid_mask, edge_index=edge_index)[0]
+        rel_pos = pos_s[edge_index[0]] - pos_s[edge_index[1]]
+        rel_head = wrap_angle(head_s[edge_index[0]] - head_s[edge_index[1]])
+        edge_attr = torch.stack(
+            [
+                safe_norm_2d(rel_pos[:, :2]),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vector_s[edge_index[1]],
+                    nbr_vector=rel_pos[:, :2],
+                ),
+                rel_head,
+            ],
+            dim=-1,
+        )
+        edge_attr = self.r_a2a_emb(continuous_inputs=edge_attr, categorical_embs=None)
+        return edge_index, edge_attr
+
+    def forward(
+        self,
+        chunk_tokens: torch.Tensor,
+        context: torch.Tensor,
+        tau_emb: torch.Tensor,
+        interaction_group: torch.Tensor | None = None,
+        interaction_pos: torch.Tensor | None = None,
+        interaction_head: torch.Tensor | None = None,
+        chunk_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        num_anchor, num_chunks, dim = chunk_tokens.shape
+        if num_anchor == 0:
+            return chunk_tokens
+        if tuple(context.shape) != (num_anchor, dim):
+            raise ValueError(
+                "context shape must match chunk token batch and dim: "
+                f"expected={(num_anchor, dim)}, actual={tuple(context.shape)}."
+            )
+        if tuple(tau_emb.shape) != (num_anchor, dim):
+            raise ValueError(
+                "tau_emb shape must match chunk token batch and dim: "
+                f"expected={(num_anchor, dim)}, actual={tuple(tau_emb.shape)}."
+            )
+        if chunk_valid_mask is not None and tuple(chunk_valid_mask.shape) != (num_anchor, num_chunks):
+            raise ValueError(
+                "chunk_valid_mask must have shape [n_valid_anchor, n_chunk], "
+                f"expected={(num_anchor, num_chunks)}, actual={tuple(chunk_valid_mask.shape)}."
+            )
+        if interaction_pos is None and interaction_head is None:
+            return chunk_tokens
+        if interaction_pos is None or interaction_head is None:
+            raise ValueError("interaction_pos and interaction_head must be provided together.")
+        if tuple(interaction_pos.shape) != (num_anchor, 2):
+            raise ValueError(
+                "interaction_pos must have shape [n_valid_anchor, 2], "
+                f"expected={(num_anchor, 2)}, actual={tuple(interaction_pos.shape)}."
+            )
+        if tuple(interaction_head.shape) != (num_anchor,):
+            raise ValueError(
+                "interaction_head must have shape [n_valid_anchor], "
+                f"expected={(num_anchor,)}, actual={tuple(interaction_head.shape)}."
+            )
+
+        interaction_group = self._build_interaction_group(
+            interaction_group=interaction_group,
+            num_anchor=num_anchor,
+            device=chunk_tokens.device,
+        )
+        interaction_pos = interaction_pos.to(device=chunk_tokens.device, dtype=chunk_tokens.dtype)
+        interaction_head = interaction_head.to(device=chunk_tokens.device, dtype=chunk_tokens.dtype)
+        edge_index, edge_attr = self._build_same_chunk_edges(
+            interaction_pos=interaction_pos,
+            interaction_head=interaction_head,
+            interaction_group=interaction_group,
+            chunk_valid_mask=chunk_valid_mask,
+            num_chunks=num_chunks,
+        )
+        chunk_tokens_s = chunk_tokens.transpose(0, 1).reshape(num_chunks * num_anchor, dim)
+        updated_tokens = self.a2a_attn(chunk_tokens_s, edge_attr, edge_index)
+        updated_tokens = updated_tokens.view(num_chunks, num_anchor, dim).transpose(0, 1)
+        if chunk_valid_mask is not None:
+            updated_tokens = updated_tokens * chunk_valid_mask.to(dtype=updated_tokens.dtype).unsqueeze(-1)
+        return updated_tokens
+
+
 class ChunkStepRefiner(nn.Module):
     def __init__(self, flow_dim: int, num_heads: int) -> None:
         super().__init__()
@@ -676,9 +842,13 @@ class HierarchicalFlowDecoder(nn.Module):
         flow_dim: int,
         num_future_steps: int = 20,
         num_chunk_heads: int = 4,
+        head_dim: int | None = None,
+        num_freq_bands: int = 64,
         num_chunk_layers: int = 2,
         chunk_size: int = 5,
         flow_state_dim: int = 4,
+        a2a_radius: float = 60.0,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
         if int(num_future_steps) <= 0:
@@ -705,6 +875,14 @@ class HierarchicalFlowDecoder(nn.Module):
                 for _ in range(num_chunk_layers)
             ]
         )
+        self.same_chunk_agent_mixer = SameChunkAgentAttentionBlock(
+            flow_dim=flow_dim,
+            num_heads=num_chunk_heads,
+            head_dim=int(head_dim) if head_dim is not None else max(1, flow_dim // num_chunk_heads),
+            num_freq_bands=num_freq_bands,
+            radius=a2a_radius,
+            dropout=dropout,
+        )
         self.step_refiner = ChunkStepRefiner(
             flow_dim=flow_dim,
             num_heads=num_chunk_heads,
@@ -717,6 +895,9 @@ class HierarchicalFlowDecoder(nn.Module):
         x_t_norm: torch.Tensor,
         tau: torch.Tensor,
         future_valid_mask: torch.Tensor | None = None,
+        interaction_group: torch.Tensor | None = None,
+        interaction_pos: torch.Tensor | None = None,
+        interaction_head: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         anchor_hidden : (N, H) -> context : (N, D)
@@ -765,6 +946,15 @@ class HierarchicalFlowDecoder(nn.Module):
                 tau_emb=tau_emb,
                 chunk_valid_mask=chunk_valid_mask,
             )
+        chunk_tokens = self.same_chunk_agent_mixer(
+            chunk_tokens=chunk_tokens,
+            context=context,
+            tau_emb=tau_emb,
+            interaction_group=interaction_group,
+            interaction_pos=interaction_pos,
+            interaction_head=interaction_head,
+            chunk_valid_mask=chunk_valid_mask,
+        )
         """
         input
             step_tokens : (B, 20, D)

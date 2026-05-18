@@ -2853,6 +2853,9 @@ open_metric_dict:
                 anchor_mask=denoise_pred["anchor_mask"],
                 sampling_scheme=self.validation_rollout_sampling,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
+                interaction_group=denoise_pred.get("anchor_interaction_group"),
+                interaction_pos=denoise_pred.get("anchor_interaction_pos"),
+                interaction_head=denoise_pred.get("anchor_interaction_head"),
             )
             open_pred_metric_norm = eval_generator.flow_norm_to_pose_metric_norm(
                 value=open_pred_clean_norm,
