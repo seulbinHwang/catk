@@ -191,6 +191,38 @@ build 중 pod가 죽어 `.lock` 파일만 남은 경우에는 lock heartbeat가 
 30초 뒤 자동 회수한다. 살아 있는 builder를 기다리는 rank도 1초 단위로 cache 생성을 다시
 확인하므로, stale lock 때문에 학습 준비가 장시간 멈추는 경로를 피한다.
 
+H100x4x2 실행 스크립트는 Hydra config 값을 바꾸지 않고도 학습 수학과 무관한 logging hook을
+제어할 수 있다. 기본값으로 `CATK_WANDB_WATCH=0`을 설정해
+`WandbLogger.watch(model, log="all")` hook을 끈다. 이 hook은 gradient와 parameter
+histogram을 W&B에 수집하기 위한 장치이고, loss, optimizer update, checkpoint 저장,
+scalar metric logging, W&B run 자체에는 영향을 주지 않는다. 필요하면 `CATK_WANDB_WATCH=1`을
+지정해 기존처럼 gradient/parameter watch를 다시 켤 수 있다.
+
+SMART attention layer에는 학습 loss나 평가에서 쓰지 않는 attention weight 저장도 제거되어
+있다. 이 값은 `detach()`된 디버그성 tensor였고 repo 내부 사용처가 없으므로, 제거해도
+forward 결과와 gradient는 동일하다.
+
+deterministic tokenization sidecar cache도 옵션으로 제공한다. `SMART_NTP_TOKEN_CACHE=1`을
+주면 scene별 agent/map tokenization 결과를 raw pickle 옆 숨김 폴더에 저장하고, 다음 epoch부터
+같은 token 파일과 같은 deterministic sampling 설정일 때 재사용한다. 이 cache에는 token index와
+raw target tensor만 저장하며, 학습되는 embedding이나 graph attention 출력은 저장하지 않는다.
+원본 raw pickle의 크기/수정 시간이 바뀌면 이전 sidecar는 자동으로 무시한다.
+다만 `wo-pvc-800`의 4GPU smoke 기준에서는 token cache warm run이 기본 경로보다 빨라지지 않아
+H100x4x2 스크립트 기본값은 `SMART_NTP_TOKEN_CACHE=0`이다. graph topology cache는 기본
+구현에 넣지 않는다. 현재 SMART NTP decoder는 학습 중 history edge를 확률적으로 drop하므로,
+그 graph를 고정 cache로 재사용하면 학습 결과가 달라질 수 있다.
+
+`wo-pvc-800`에서 1노드 4GPU, `data.train_batch_size=8`, train 30 batch smoke로 확인한
+참고 수치는 아래와 같다. 2노드 정식 batch 26과 절대 시간이 같지는 않으며, 30 batch smoke에서는
+run 간 노이즈도 있다. 따라서 이 변경을 획기적 가속으로 해석하지 않고, 학습 결과를 바꾸지 않는
+안전한 부수 작업 정리와 optional cache 기능으로만 취급한다.
+
+- 기존 경로: 49.44초, batch당 1.65초
+- attention weight 저장 제거 후: 48.75초, batch당 1.63초
+- 현재 코드에서 `CATK_WANDB_WATCH=0`: 49.72초, batch당 1.66초
+- 현재 코드에서 `CATK_WANDB_WATCH=1`: 47.11초, batch당 1.57초
+- token cache warm run: 50.78초, batch당 1.69초라 기본값으로 켜지 않음
+
 이 launcher와 내부 실행 스크립트는 `pre_bc_h100x4x2` fit 실행에서
 `data.train_batch_size=26`, `trainer.accumulate_grad_batches=1`을 강제한다. 따라서
 `--train-batch-size 2`, `--accumulate-grad-batches 13`,
