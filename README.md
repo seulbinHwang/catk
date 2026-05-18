@@ -664,7 +664,6 @@ python scripts/launch_pre_bc_flow_control_a100x4x2_prefix_default_noslip_static_
 
 ```bash
 python scripts/launch_pre_bc_flow_control_a100x4x2_endpoint_balanced_static_pods.py \
-  --prebuild-metadata \
   --replace
 ```
 
@@ -672,7 +671,6 @@ python scripts/launch_pre_bc_flow_control_a100x4x2_endpoint_balanced_static_pods
 
 ```bash
 python scripts/launch_pre_bc_flow_control_a100x4x2_endpoint_balanced_static_pods.py \
-  --prebuild-metadata \
   --dry-run
 ```
 
@@ -705,7 +703,7 @@ trainer:
 
 의도는 control-space Flow target을 실행 가능한 상태 흐름에 맞추는 것입니다. vehicle/cyclist는 0.5초 endpoint 기준 control을 만들고 내부 5개 0.1초 상태는 kinematic substep으로 채웁니다. pedestrian은 holonomic이라 raw 0.1초 target을 유지합니다. invalid endpoint로 오염될 수 있는 non-holonomic substep과 raw-vs-aligned 오차가 큰 anchor는 train loss에서만 제외합니다.
 
-`--prebuild-metadata`는 SMART cache를 읽어서 memory-balanced sampler용 metadata만 만듭니다. SMART cache 생성 과정이나 cache 파일은 수정하지 않습니다. metadata 위치를 바꾸고 싶으면 `--metadata-cache-path /abs/path/to/cache.pt`를 쓰면 되고, launcher가 prebuild `--cache-path`와 training `data.train_memory_balance_metadata_cache` override를 같은 경로로 맞춥니다. 이전 metadata build가 비정상 종료되어 stale lock이 남았을 때만 `--force-metadata`를 추가하세요.
+이 launcher는 학습을 시작하기 전에 각 pod에서 SMART cache를 읽어 memory-balanced sampler용 metadata cache가 있는지 확인하고, 없거나 stale이면 자동으로 다시 만듭니다. SMART cache 생성 과정이나 cache 파일은 수정하지 않습니다. metadata 위치를 바꾸고 싶으면 `--metadata-cache-path /abs/path/to/cache.pt`를 쓰면 되고, launcher가 prebuild `--cache-path`와 training `data.train_memory_balance_metadata_cache` override를 같은 경로로 맞춥니다. 이전 metadata build가 비정상 종료되어 stale lock이 남았을 때만 `--force-metadata`를 추가하세요.
 
 기본 task 이름은 `flow_control_space_pretrain_a100x4x2_endpoint_substep_balanced_lr6e-4_bs26`, tmux session 이름은 `catk-control-pretrain-a100x4x2-endpoint-balanced`입니다. 기본 per-GPU batch는 `26`이라 A100 8GPU 기준 effective batch는 `208`이고, CUDA OOM fallback은 `26 -> 24 -> 22 -> 20`입니다.
 

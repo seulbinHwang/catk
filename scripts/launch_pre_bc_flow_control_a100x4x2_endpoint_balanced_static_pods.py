@@ -2,9 +2,9 @@
 """Launch the semi_control_rolling_0.5 endpoint-balanced pretrain on A100x4x2.
 
 This launcher targets the already-running ``testa`` and ``testaa`` pods. It
-does not create, delete, or restart pods. It only prepares the optional
-memory-balance metadata cache and starts/replaces the configured tmux training
-session inside the existing pods.
+does not create, delete, or restart pods. It first ensures the memory-balance
+metadata cache is present and fresh, then starts/replaces the configured tmux
+training session inside the existing pods.
 """
 
 from __future__ import annotations
@@ -172,7 +172,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prebuild-metadata",
         action="store_true",
-        help="Build the memory-balance metadata cache on each pod before launch.",
+        help=(
+            "Deprecated no-op kept for compatibility. The launcher now always "
+            "ensures the memory-balance metadata cache before training."
+        ),
     )
     parser.add_argument(
         "--force-metadata",
@@ -223,7 +226,7 @@ def run_pod_command(args: argparse.Namespace, pod: str, script: str) -> int:
     return subprocess.call(command)
 
 
-def prebuild_metadata(args: argparse.Namespace) -> int:
+def ensure_metadata(args: argparse.Namespace) -> int:
     cache_path = metadata_cache_path(args)
     for pod in args.pods:
         cache_root = cache_root_for_pod(args, pod)
@@ -255,8 +258,8 @@ def prebuild_metadata(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
-    if args.prebuild_metadata and not args.stop:
-        status = prebuild_metadata(args)
+    if not args.stop:
+        status = ensure_metadata(args)
         if status != 0:
             return status
 
