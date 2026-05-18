@@ -21,6 +21,11 @@ from torch_geometric.transforms import BaseTransform
 from src.smart.datasets import MultiDataset
 
 from .exact_distributed_sampler import ExactDistributedSampler
+from .memory_balanced_batch_sampler import (
+    MemoryBalancedDistributedBatchSampler,
+    load_or_build_memory_metadata,
+    memory_balance_weights,
+)
 from .random_fraction_distributed_sampler import RandomFractionDistributedSampler
 from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
 
@@ -64,6 +69,15 @@ class MultiDataModule(LightningDataModule):
         train_max_num: int,
         train_use_eval_agent_selection: bool = False,
         train_epoch_sample_fraction: float = 1.0,
+        train_memory_balanced_batches: bool = False,
+        train_memory_balance_metadata_cache: Optional[str] = None,
+        train_memory_balance_metadata_num_workers: int = 8,
+        train_memory_balance_build_on_missing: bool = True,
+        train_memory_balance_agent_weight: float = 1.0,
+        train_memory_balance_current_valid_agent_weight: float = 1.0,
+        train_memory_balance_valid_agent_step_weight: float = 0.0,
+        train_memory_balance_map_weight: float = 0.02,
+        train_memory_balance_seed: int = 0,
     ) -> None:
         super(MultiDataModule, self).__init__()
         if not 0.0 < float(train_epoch_sample_fraction) <= 1.0:
@@ -75,6 +89,23 @@ class MultiDataModule(LightningDataModule):
         self.val_batch_size = val_batch_size
         self.test_batch_size = test_batch_size
         self.train_epoch_sample_fraction = float(train_epoch_sample_fraction)
+        self.train_memory_balanced_batches = bool(train_memory_balanced_batches)
+        self.train_memory_balance_metadata_cache = train_memory_balance_metadata_cache
+        self.train_memory_balance_metadata_num_workers = int(
+            train_memory_balance_metadata_num_workers
+        )
+        self.train_memory_balance_build_on_missing = bool(
+            train_memory_balance_build_on_missing
+        )
+        self.train_memory_balance_agent_weight = float(train_memory_balance_agent_weight)
+        self.train_memory_balance_current_valid_agent_weight = float(
+            train_memory_balance_current_valid_agent_weight
+        )
+        self.train_memory_balance_valid_agent_step_weight = float(
+            train_memory_balance_valid_agent_step_weight
+        )
+        self.train_memory_balance_map_weight = float(train_memory_balance_map_weight)
+        self.train_memory_balance_seed = int(train_memory_balance_seed)
         self.shuffle = shuffle
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor if num_workers > 0 else None
@@ -144,18 +175,50 @@ class MultiDataModule(LightningDataModule):
             rank=global_rank,
         )
 
+    def _build_memory_balanced_batch_sampler(self):
+        world_size, global_rank = self._get_trainer_world_info()
+        metadata = load_or_build_memory_metadata(
+            self.train_dataset.raw_paths,
+            cache_path=self.train_memory_balance_metadata_cache,
+            num_workers=self.train_memory_balance_metadata_num_workers,
+            build_on_missing=self.train_memory_balance_build_on_missing,
+        )
+        sample_weight = memory_balance_weights(
+            metadata,
+            agent_weight=self.train_memory_balance_agent_weight,
+            current_valid_agent_weight=self.train_memory_balance_current_valid_agent_weight,
+            valid_agent_step_weight=self.train_memory_balance_valid_agent_step_weight,
+            map_weight=self.train_memory_balance_map_weight,
+        )
+        return MemoryBalancedDistributedBatchSampler(
+            sample_weight=sample_weight,
+            batch_size=self.train_batch_size,
+            num_replicas=world_size,
+            rank=global_rank,
+            shuffle=self.shuffle,
+            seed=self.train_memory_balance_seed,
+            fraction=self.train_epoch_sample_fraction,
+        )
+
     def train_dataloader(self) -> TRAIN_DATALOADERS:
         if not hasattr(self, "train_dataset"):
             self.refresh_train_dataset()
 
-        loader_kwargs = {
+        base_loader_kwargs = {
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
             "persistent_workers": self.persistent_workers,
-            "drop_last": False,
         }
         if self.prefetch_factor is not None:
-            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+            base_loader_kwargs["prefetch_factor"] = self.prefetch_factor
+
+        if self.train_memory_balanced_batches:
+            batch_sampler = self._build_memory_balanced_batch_sampler()
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=batch_sampler,
+                **base_loader_kwargs,
+            )
 
         sampler = self._build_train_fraction_sampler()
         return DataLoader(
@@ -163,7 +226,8 @@ class MultiDataModule(LightningDataModule):
             batch_size=self.train_batch_size,
             shuffle=self.shuffle if sampler is None else False,
             sampler=sampler,
-            **loader_kwargs,
+            drop_last=False,
+            **base_loader_kwargs,
         )
 
     def _build_eval_sampler(self, dataset):
