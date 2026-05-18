@@ -59,6 +59,9 @@ def test_oom_retry_preflight_builds_metadata_on_all_pods() -> None:
     ).read_text()
 
     assert "prebuild_memory_balance_metadata_for_pod()" in script
+    assert "copy_memory_balance_metadata_from_master()" in script
+    assert "validate_memory_balance_metadata_on_pod()" in script
     assert 'for pod in "${POD_ARRAY[@]}"; do' in script
-    assert 'prebuild_memory_balance_metadata_for_pod "$pod"' in script
+    assert 'copy_memory_balance_metadata_from_master "$pod"' in script
+    assert 'validate_memory_balance_metadata_on_pod "$pod"' in script
     assert "memory-balance metadata preflight ready on all" in script

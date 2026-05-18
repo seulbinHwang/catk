@@ -105,9 +105,29 @@ cache_root_for_pod() {
   esac
 }
 
+sync_project_for_pod() {
+  local pod="$1"
+  local git_cmd project_root_q branch_q git_ref_q
+  project_root_q="$(remote_quote "$PROJECT_ROOT")"
+  branch_q="$(remote_quote "$BRANCH")"
+  git_ref_q="$(remote_quote "$GIT_REF")"
+
+  if [[ -n "$GIT_REF" ]]; then
+    git_cmd="git fetch origin ${branch_q} && git checkout ${git_ref_q}"
+  else
+    git_cmd="git fetch origin ${branch_q} && { git checkout ${branch_q} 2>/dev/null || git checkout -B ${branch_q} origin/${branch_q}; } && git pull --ff-only origin ${branch_q}"
+  fi
+
+  kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
+set -euo pipefail
+cd ${project_root_q}
+${git_cmd}
+"
+}
+
 prebuild_memory_balance_metadata_for_pod() {
   local pod="$1"
-  local cache_root metadata_cache raw_dir force_arg git_cmd metadata_cache_q raw_dir_q project_root_q branch_q git_ref_q workers_q
+  local cache_root metadata_cache raw_dir force_arg metadata_cache_q raw_dir_q project_root_q workers_q
   cache_root="$(cache_root_for_pod "$pod")"
   metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
   raw_dir="${cache_root%/}/training"
@@ -119,21 +139,13 @@ prebuild_memory_balance_metadata_for_pod() {
   metadata_cache_q="$(remote_quote "$metadata_cache")"
   raw_dir_q="$(remote_quote "$raw_dir")"
   project_root_q="$(remote_quote "$PROJECT_ROOT")"
-  branch_q="$(remote_quote "$BRANCH")"
-  git_ref_q="$(remote_quote "$GIT_REF")"
   workers_q="$(remote_quote "$MEMORY_BALANCE_METADATA_NUM_WORKERS")"
 
-  if [[ -n "$GIT_REF" ]]; then
-    git_cmd="git fetch origin ${branch_q} && git checkout ${git_ref_q}"
-  else
-    git_cmd="git fetch origin ${branch_q} && { git checkout ${branch_q} 2>/dev/null || git checkout -B ${branch_q} origin/${branch_q}; } && git pull --ff-only origin ${branch_q}"
-  fi
-
   log "prebuilding memory-balance metadata on ${pod}: raw_dir=${raw_dir} cache=${metadata_cache}"
+  sync_project_for_pod "$pod"
   kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
 set -euo pipefail
 cd ${project_root_q}
-${git_cmd}
 mkdir -p \"\$(dirname ${metadata_cache_q})\"
 test -d ${raw_dir_q}
 python tools/build_memory_balance_metadata.py \
@@ -144,28 +156,89 @@ python tools/build_memory_balance_metadata.py \
 "
 }
 
+copy_memory_balance_metadata_from_master() {
+  local pod="$1"
+  local metadata_cache tmp_cache metadata_cache_q tmp_cache_q
+  if [[ "$pod" == "$MASTER_POD" ]]; then
+    return 0
+  fi
+
+  metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
+  tmp_cache="${metadata_cache}.tmp.${MASTER_POD}.$$"
+  metadata_cache_q="$(remote_quote "$metadata_cache")"
+  tmp_cache_q="$(remote_quote "$tmp_cache")"
+
+  log "copying memory-balance metadata from ${MASTER_POD} to ${pod}: cache=${metadata_cache}"
+  kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "
+set -euo pipefail
+test -s ${metadata_cache_q}
+cat ${metadata_cache_q}
+" | kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
+set -euo pipefail
+mkdir -p \"\$(dirname ${metadata_cache_q})\"
+cat > ${tmp_cache_q}
+mv ${tmp_cache_q} ${metadata_cache_q}
+"
+}
+
+validate_memory_balance_metadata_on_pod() {
+  local pod="$1"
+  local cache_root metadata_cache raw_dir metadata_cache_q raw_dir_q project_root_q workers_q
+  cache_root="$(cache_root_for_pod "$pod")"
+  metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
+  raw_dir="${cache_root%/}/training"
+  metadata_cache_q="$(remote_quote "$metadata_cache")"
+  raw_dir_q="$(remote_quote "$raw_dir")"
+  project_root_q="$(remote_quote "$PROJECT_ROOT")"
+  workers_q="$(remote_quote "$MEMORY_BALANCE_METADATA_NUM_WORKERS")"
+
+  log "validating memory-balance metadata on ${pod}: raw_dir=${raw_dir} cache=${metadata_cache}"
+  sync_project_for_pod "$pod"
+  kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
+set -euo pipefail
+cd ${project_root_q}
+test -d ${raw_dir_q}
+python tools/build_memory_balance_metadata.py \
+  --raw-dir ${raw_dir_q} \
+  --cache-path ${metadata_cache_q} \
+  --num-workers ${workers_q}
+"
+}
+
 prebuild_memory_balance_metadata() {
   if [[ "$MEMORY_BALANCE_PREFLIGHT" != "1" ]]; then
     return 0
   fi
 
-  local pod pid status failed=0
-  local -a preflight_pids=()
+  local pod status failed=0 master_cache_root pod_cache_root
+  master_cache_root="$(cache_root_for_pod "$MASTER_POD")"
+
+  prebuild_memory_balance_metadata_for_pod "$MASTER_POD"
+  status=$?
+  if (( status != 0 )); then
+    log "memory-balance metadata preflight failed on ${MASTER_POD} (exit=${status})"
+    return "$status"
+  fi
+  log "memory-balance metadata preflight ready on ${MASTER_POD}"
+
   for pod in "${POD_ARRAY[@]}"; do
-    (
-      if prebuild_memory_balance_metadata_for_pod "$pod"; then
+    if [[ "$pod" == "$MASTER_POD" ]]; then
+      continue
+    fi
+    pod_cache_root="$(cache_root_for_pod "$pod")"
+    if [[ "$pod_cache_root" == "$master_cache_root" ]]; then
+      if copy_memory_balance_metadata_from_master "$pod" && validate_memory_balance_metadata_on_pod "$pod"; then
         log "memory-balance metadata preflight ready on ${pod}"
       else
         status=$?
         log "memory-balance metadata preflight failed on ${pod} (exit=${status})"
-        exit "$status"
+        failed=1
       fi
-    ) &
-    preflight_pids+=("$!")
-  done
-
-  for pid in "${preflight_pids[@]}"; do
-    if ! wait "$pid"; then
+    elif prebuild_memory_balance_metadata_for_pod "$pod"; then
+      log "memory-balance metadata preflight ready on ${pod}"
+    else
+      status=$?
+      log "memory-balance metadata preflight failed on ${pod} (exit=${status})"
       failed=1
     fi
   done
