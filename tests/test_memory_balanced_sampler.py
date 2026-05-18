@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import pickle
 
 import torch
@@ -107,6 +108,42 @@ def test_memory_metadata_cache_reads_agent_valid_and_map_counts(tmp_path) -> Non
     assert entries[0]["valid_agent_steps"] == 273
     assert entries[0]["map_point_count"] == 17
     assert entries[0]["file_size"] > 0
+
+
+def test_memory_metadata_cache_reclaims_stale_lock(tmp_path) -> None:
+    raw_dir = tmp_path / "training"
+    raw_dir.mkdir()
+    raw_path = raw_dir / "sample.pkl"
+    data = {
+        "agent": {
+            "position": torch.zeros(2, 91, 3),
+            "valid_mask": torch.ones(2, 91, dtype=torch.bool),
+        },
+        "pt_token": {
+            "position": torch.zeros(5, 2),
+        },
+    }
+    with open(raw_path, "wb") as handle:
+        pickle.dump(data, handle)
+
+    metadata_path = tmp_path / "metadata.pkl"
+    lock_path = metadata_path.with_suffix(metadata_path.suffix + ".lock")
+    lock_path.write_text("pid=999999 host=dead-builder time=0\n")
+    old_mtime = lock_path.stat().st_mtime - 60.0
+    os.utime(lock_path, (old_mtime, old_mtime))
+
+    entries = load_or_build_memory_metadata(
+        [raw_path.as_posix()],
+        metadata_path=metadata_path.as_posix(),
+        num_workers=0,
+        lock_timeout_seconds=1.0,
+        lock_stale_seconds=0.01,
+        lock_poll_seconds=0.1,
+    )
+
+    assert entries[0]["agent_count"] == 2
+    assert metadata_path.exists()
+    assert not lock_path.exists()
 
 
 def test_multidataset_ignores_hidden_metadata_cache(tmp_path) -> None:

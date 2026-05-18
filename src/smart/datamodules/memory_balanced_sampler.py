@@ -2,6 +2,8 @@ import math
 import os
 import pickle
 import random
+import socket
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -11,6 +13,9 @@ from torch.utils.data import Sampler
 
 
 _METADATA_VERSION = 1
+_DEFAULT_LOCK_STALE_SECONDS = 30.0
+_DEFAULT_LOCK_POLL_SECONDS = 1.0
+_LOCK_HEARTBEAT_INTERVAL_SECONDS = 5.0
 
 
 def _get_nested_shape0(data: dict, *keys: str) -> int:
@@ -83,16 +88,63 @@ def _build_metadata_entries(
         return list(executor.map(_read_raw_sample_metadata, raw_paths, chunksize=64))
 
 
+def _is_lock_stale(lock_path: Path, stale_seconds: float) -> bool:
+    try:
+        lock_mtime = lock_path.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return time.time() - lock_mtime > stale_seconds
+
+
+def _remove_stale_lock_if_needed(lock_path: Path, stale_seconds: float) -> bool:
+    if stale_seconds <= 0 or not _is_lock_stale(lock_path, stale_seconds):
+        return False
+    try:
+        lock_path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+
+
+def _start_lock_heartbeat(
+    lock_path: Path,
+    stop_event: threading.Event,
+    stale_seconds: float,
+) -> threading.Thread | None:
+    if stale_seconds <= 0:
+        return None
+    interval = min(_LOCK_HEARTBEAT_INTERVAL_SECONDS, max(1.0, stale_seconds / 3.0))
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(interval):
+            try:
+                os.utime(lock_path, None)
+            except FileNotFoundError:
+                return
+
+    thread = threading.Thread(
+        target=_heartbeat,
+        name="memory-balanced-metadata-lock-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def load_or_build_memory_metadata(
     raw_paths: Sequence[str],
     metadata_path: str | None = None,
     num_workers: int = 0,
     lock_timeout_seconds: float = 14400.0,
+    lock_stale_seconds: float = _DEFAULT_LOCK_STALE_SECONDS,
+    lock_poll_seconds: float = _DEFAULT_LOCK_POLL_SECONDS,
 ) -> list[dict]:
     """Load or build per-scenario metadata used for memory-aware batching."""
     raw_paths = list(raw_paths)
     cache_path = _metadata_cache_path(raw_paths, metadata_path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_poll_seconds = max(0.1, float(lock_poll_seconds))
+    lock_stale_seconds = float(lock_stale_seconds)
 
     cached = _load_metadata_cache(cache_path, raw_paths)
     if cached is not None:
@@ -108,15 +160,26 @@ def load_or_build_memory_metadata(
             cached = _load_metadata_cache(cache_path, raw_paths)
             if cached is not None:
                 return cached
+            if _remove_stale_lock_if_needed(lock_path, lock_stale_seconds):
+                continue
             if time.monotonic() - start_time > lock_timeout_seconds:
                 raise TimeoutError(
                     f"Timed out waiting for memory-balanced metadata cache: {cache_path}"
                 )
-            time.sleep(5.0)
+            time.sleep(lock_poll_seconds)
 
+    stop_heartbeat = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
     try:
         with os.fdopen(lock_fd, "w") as handle:
-            handle.write(f"pid={os.getpid()} time={time.time()}\n")
+            handle.write(
+                f"pid={os.getpid()} host={socket.gethostname()} time={time.time()}\n"
+            )
+        heartbeat_thread = _start_lock_heartbeat(
+            lock_path,
+            stop_event=stop_heartbeat,
+            stale_seconds=lock_stale_seconds,
+        )
         cached = _load_metadata_cache(cache_path, raw_paths)
         if cached is not None:
             return cached
@@ -132,6 +195,9 @@ def load_or_build_memory_metadata(
         os.replace(tmp_path, cache_path)
         return entries
     finally:
+        stop_heartbeat.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1.0)
         try:
             lock_path.unlink()
         except FileNotFoundError:
