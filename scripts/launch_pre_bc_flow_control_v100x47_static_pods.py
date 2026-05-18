@@ -40,6 +40,7 @@ DEFAULT_EXTRA_HYDRA_OVERRIDES = (
     "trainer.strategy.cluster_environment._target_="
     "src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment"
 )
+MEMORY_METADATA_CACHE_OVERRIDE_KEY = "data.train_memory_balance_metadata_cache"
 
 
 def current_branch() -> str:
@@ -59,6 +60,17 @@ def current_branch() -> str:
 
 def shq(value: object) -> str:
     return shlex.quote(str(value))
+
+
+def has_hydra_override(overrides: str, key: str) -> bool:
+    if not overrides:
+        return False
+    try:
+        parts = shlex.split(overrides)
+    except ValueError:
+        parts = overrides.split()
+    prefixes = (f"{key}=", f"+{key}=", f"++{key}=", f"~{key}", f"~{key}=")
+    return any(part == key or part.startswith(prefixes) for part in parts)
 
 
 def validate_nproc_per_node(value: str) -> str:
@@ -258,8 +270,22 @@ def main() -> int:
             "VAL_BATCH_SIZE": str(args.val_batch_size),
         }
     )
+    metadata_cache_hydra_override = ""
+    if args.memory_metadata_cache_path and not has_hydra_override(
+        args.extra_hydra_overrides,
+        MEMORY_METADATA_CACHE_OVERRIDE_KEY,
+    ):
+        metadata_cache_hydra_override = (
+            f"{MEMORY_METADATA_CACHE_OVERRIDE_KEY}={args.memory_metadata_cache_path}"
+        )
     extra_hydra_overrides = " ".join(
-        part for part in (DEFAULT_EXTRA_HYDRA_OVERRIDES, args.extra_hydra_overrides) if part
+        part
+        for part in (
+            DEFAULT_EXTRA_HYDRA_OVERRIDES,
+            metadata_cache_hydra_override,
+            args.extra_hydra_overrides,
+        )
+        if part
     )
     optional_env = {
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,

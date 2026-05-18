@@ -724,7 +724,7 @@ V100x47 production preset은 학습 프로세스 안에서 조용히 긴 metadat
 $REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt
 ```
 
-따라서 위 launcher command만 실행해도 metadata cache가 없거나 stale인 경우 학습 시작 전에 먼저 만들어집니다. metadata fingerprint는 pkl basename만 보지 않고 dataloader가 실제로 사용할 SMART cache path list까지 포함하므로, 다른 cache root에서 만든 metadata를 같은 파일명이라는 이유만으로 재사용하지 않습니다. V100 pod들의 `/mnt/nuplan/projects/catk/logs`가 pod-local일 수 있으므로 preflight는 master pod에서 만든 metadata payload를 같은 `CACHE_ROOT`를 쓰는 나머지 pod로 복사한 뒤 각 pod에서 다시 validate합니다. pod별 cache root를 바꾸는 경우에는 `--pod-cache-root POD=PATH` 설정이 각 pod의 실제 학습 경로와 일치해야 합니다.
+따라서 위 launcher command만 실행해도 metadata cache가 없거나 stale인 경우 학습 시작 전에 먼저 만들어집니다. `--memory-metadata-cache-path`를 지정하면 preflight build/validate와 실제 datamodule의 `data.train_memory_balance_metadata_cache` Hydra override가 같은 파일을 보도록 같이 설정됩니다. metadata fingerprint는 pkl basename만 보지 않고 dataloader가 실제로 사용할 SMART cache path list까지 포함하므로, 다른 cache root에서 만든 metadata를 같은 파일명이라는 이유만으로 재사용하지 않습니다. V100 pod들의 `/mnt/nuplan/projects/catk/logs`가 pod-local일 수 있으므로 preflight는 master pod에서 만든 metadata payload를 같은 `CACHE_ROOT`를 쓰는 나머지 pod로 복사한 뒤 각 pod에서 다시 validate합니다. pod별 cache root를 바꾸는 경우에는 `--pod-cache-root POD=PATH` 설정이 각 pod의 실제 학습 경로와 일치해야 합니다.
 
 metadata build 중인 프로세스는 `.lock` 디렉터리 heartbeat를 갱신합니다. 프로세스가 죽어 heartbeat가 끊긴 stale lock은 기본 30초 뒤 자동 회수되므로, 이전 prebuild 실패 때문에 다음 V100x47 실행이 2시간씩 대기하지 않습니다. metadata를 강제로 다시 만들려면 `--force-memory-metadata-rebuild`를 붙입니다. 다른 metadata build가 실제로 실행 중일 때는 쓰지 않습니다. preflight를 명시적으로 건너뛰어야 하는 특수 상황에서는 `--skip-memory-metadata-preflight`를 붙일 수 있지만, 그러면 cache가 없거나 stale일 때 학습 시작 전에 실패합니다. cache가 없는 상태에서 ad-hoc으로 학습 프로세스 안에서 build까지 허용해야 할 때만 `data.train_memory_balance_build_on_missing=true`를 override합니다.
 
@@ -760,7 +760,7 @@ python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_latest_s
 | map-agent edge fix | `bba4a5b` 이후 코드 포함: map-agent `radius` 호출 전 batch 정렬로 same-scene map edge silent drop 방지 |
 | batch / lr | per-rank `train_batch_size=4`, effective global batch `188`, `lr=6e-4` |
 | bs4 memory guard | `detach_train_metric_clean=true`, `use_training_activation_checkpointing=true`, `training_activation_checkpoint_start_layer=3`. Loss/target/anchor/model capacity는 그대로 두고 train metric clean 복원 graph와 후반 agent-context/Flow local activation 저장량만 줄임 |
-| metadata preflight | 13개 V100 pod 전체에서 memory-balanced metadata를 학습 시작 전에 생성/복사/검증. latest wrapper는 다른 V100 run과 cache 파일을 공유하지 않도록 기본 `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_v1_stable_latest.pt`를 사용. stale `.lock`은 heartbeat 기준 기본 30초 뒤 자동 회수 |
+| metadata preflight | 13개 V100 pod 전체에서 memory-balanced metadata를 학습 시작 전에 생성/복사/검증. latest wrapper는 다른 V100 run과 cache 파일을 공유하지 않도록 기본 `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_v1_stable_latest.pt`를 사용하고, 같은 path를 `data.train_memory_balance_metadata_cache`에도 넘김. stale `.lock`은 heartbeat 기준 기본 30초 뒤 자동 회수 |
 | stale run cleanup | `--replace` 정리 시 stale `torchrun_pgid`가 현재 cleanup shell process group과 충돌하거나 같은 task 프로세스가 없으면 group kill을 건너뛰고 pgid 파일만 회수함 |
 | OOM 동작 | 기본 `--oom-step=0`: batch size는 줄이지 않고 checkpoint에서 재개. 같은 batch 반복 OOM은 기본 3회 뒤 중단 |
 
