@@ -6,7 +6,6 @@ from typing import Dict
 import torch
 from omegaconf import DictConfig
 from torch_cluster import radius_graph
-from torch.utils.checkpoint import checkpoint
 from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
@@ -77,9 +76,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         lqr_commit: DictConfig | None = None,
-        use_training_activation_checkpointing: bool = False,
-        training_activation_checkpoint_start_layer: int = 0,
-        detach_train_metric_clean: bool = False,
     ) -> None:
         super().__init__(
             hidden_dim=hidden_dim,
@@ -104,13 +100,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.use_holonomic_model_only = bool(use_holonomic_model_only)
         self.use_rolling_supervision = bool(use_rolling_supervision)
-        self.use_training_activation_checkpointing = bool(
-            use_training_activation_checkpointing
-        )
-        self.training_activation_checkpoint_start_layer = int(
-            training_activation_checkpoint_start_layer
-        )
-        self.detach_train_metric_clean = bool(detach_train_metric_clean)
         self.control_pos_scale_m = float(control_pos_scale_m)
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
         self.control_pedestrian_yaw_scale_rad = control_pedestrian_yaw_scale_rad
@@ -146,7 +135,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_chunk_layers=flow_num_chunk_layers,
             chunk_size=self.shift,
             flow_state_dim=self.flow_state_dim,
-            use_training_activation_checkpointing=self.use_training_activation_checkpointing,
         )
         self.flow_ode = FlowODE(
             eps=flow_solver_eps,
@@ -193,69 +181,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             control_cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
             control_vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
             control_cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
-        )
-
-    def _activation_checkpoint_enabled(self, layer_idx: int | None = None) -> bool:
-        if layer_idx is not None and layer_idx < self.training_activation_checkpoint_start_layer:
-            return False
-        return (
-            self.use_training_activation_checkpointing
-            and self.training
-            and torch.is_grad_enabled()
-        )
-
-    def _run_attention_layer(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        r: torch.Tensor | None,
-        edge_index: torch.Tensor,
-        layer_idx: int,
-    ) -> torch.Tensor:
-        if not self._activation_checkpoint_enabled(layer_idx):
-            return layer(x, r, edge_index)
-        if isinstance(x, tuple):
-            if r is None:
-                return checkpoint(
-                    lambda x_src_, x_dst_, edge_index_: layer(
-                        (x_src_, x_dst_),
-                        None,
-                        edge_index_,
-                    ),
-                    x[0],
-                    x[1],
-                    edge_index,
-                    use_reentrant=False,
-                    preserve_rng_state=True,
-                )
-            return checkpoint(
-                lambda x_src_, x_dst_, r_, edge_index_: layer(
-                    (x_src_, x_dst_),
-                    r_,
-                    edge_index_,
-                ),
-                x[0],
-                x[1],
-                r,
-                edge_index,
-                use_reentrant=False,
-                preserve_rng_state=True,
-            )
-        if r is None:
-            return checkpoint(
-                lambda x_, edge_index_: layer(x_, None, edge_index_),
-                x,
-                edge_index,
-                use_reentrant=False,
-                preserve_rng_state=True,
-            )
-        return checkpoint(
-            lambda x_, r_, edge_index_: layer(x_, r_, edge_index_),
-            x,
-            r,
-            edge_index,
-            use_reentrant=False,
-            preserve_rng_state=True,
         )
 
     def build_interaction_edge(
@@ -920,28 +845,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         feat_map = map_feature["pt_token"]
         for i in range(self.num_layers):
             feat_a = feat_a.flatten(0, 1)
-            feat_a = self._run_attention_layer(
-                self.t_attn_layers[i],
-                feat_a,
-                r_t,
-                edge_index_t,
-                layer_idx=i,
-            )
+            feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
             feat_a = feat_a.view(n_agent, n_step, -1).transpose(0, 1).flatten(0, 1)
-            feat_a = self._run_attention_layer(
-                self.pt2a_attn_layers[i],
-                (feat_map, feat_a),
-                r_pl2a,
-                edge_index_pl2a,
-                layer_idx=i,
-            )
-            feat_a = self._run_attention_layer(
-                self.a2a_attn_layers[i],
-                feat_a,
-                r_a2a,
-                edge_index_a2a,
-                layer_idx=i,
-            )
+            feat_a = self.pt2a_attn_layers[i]((feat_map, feat_a), r_pl2a, edge_index_pl2a)
+            feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
             feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
         return feat_a
 
@@ -1046,23 +953,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_sample.tau,
             future_valid_mask=flow_loss_mask,
         )
-        if (
-            self.detach_train_metric_clean
-            and self.training
-            and torch.is_grad_enabled()
-        ):
-            with torch.no_grad():
-                flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
-                    flow_sample.x_t.detach(),
-                    flow_pred_norm.detach(),
-                    flow_sample.tau.detach(),
-                )
-        else:
-            flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
-                flow_sample.x_t,
-                flow_pred_norm,
-                flow_sample.tau,
-            )
+        flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
+            flow_sample.x_t,
+            flow_pred_norm,
+            flow_sample.tau,
+        )
         output = {
             "flow_pred_norm": flow_pred_norm,
             "flow_target_norm": flow_sample.target,

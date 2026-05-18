@@ -759,7 +759,6 @@ python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_latest_s
 | Flow target mask | `use_prefix_valid_future_loss_mask=true`: tail anchor의 없는 미래 suffix는 loss와 future-step decoding에서 제외 |
 | map-agent edge fix | `bba4a5b` 이후 코드 포함: map-agent `radius` 호출 전 batch 정렬로 same-scene map edge silent drop 방지 |
 | batch / lr | per-rank `train_batch_size=4`, effective global batch `188`, `lr=6e-4` |
-| bs4 memory guard | `detach_train_metric_clean=true`, `use_training_activation_checkpointing=true`, `training_activation_checkpoint_start_layer=3`. Loss/target/anchor/model capacity는 그대로 두고 train metric clean 복원 graph와 후반 agent-context/Flow local activation 저장량만 줄임 |
 | metadata preflight | 13개 V100 pod 전체에서 memory-balanced metadata를 학습 시작 전에 생성/복사/검증. latest wrapper는 다른 V100 run과 cache 파일을 공유하지 않도록 기본 `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_v1_stable_latest.pt`를 사용하고, 같은 path를 `data.train_memory_balance_metadata_cache`에도 넘김. stale `.lock`은 heartbeat 기준 기본 30초 뒤 자동 회수 |
 | stale run cleanup | `--replace` 정리 시 stale `torchrun_pgid`가 현재 cleanup shell process group과 충돌하거나 같은 task 프로세스가 없으면 group kill을 건너뛰고 pgid 파일만 회수함 |
 | OOM 동작 | 기본 `--oom-step=0`: batch size는 줄이지 않고 checkpoint에서 재개. 같은 batch 반복 OOM은 기본 3회 뒤 중단 |
