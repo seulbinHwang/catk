@@ -70,6 +70,17 @@ def metadata_cache_path(args: argparse.Namespace) -> str:
     return f"{args.remote_log_dir.rstrip('/')}/{DEFAULT_METADATA_CACHE_RELATIVE}"
 
 
+def training_extra_hydra_overrides(args: argparse.Namespace) -> str:
+    overrides: list[str] = []
+    if args.extra_hydra_overrides:
+        overrides.append(args.extra_hydra_overrides)
+    if args.metadata_cache_path:
+        overrides.append(
+            f"data.train_memory_balance_metadata_cache={args.metadata_cache_path}"
+        )
+    return " ".join(overrides)
+
+
 def remote_git_prepare_script(args: argparse.Namespace) -> str:
     branch_ref = f"refs/heads/{args.branch}"
     origin_ref = f"origin/{args.branch}"
@@ -244,10 +255,30 @@ def prebuild_metadata(args: argparse.Namespace) -> int:
     return 0
 
 
+def verify_metadata_cache(args: argparse.Namespace) -> int:
+    cache_path = metadata_cache_path(args)
+    for pod in args.pods:
+        script = (
+            f"if [[ ! -f {shq(cache_path)} ]]; then "
+            f"echo {shq('[metadata-check] missing memory-balance metadata cache: ' + cache_path)} >&2; "
+            "echo '[metadata-check] rerun with --prebuild-metadata, or pass --metadata-cache-path to an existing cache.' >&2; "
+            "exit 2; "
+            "fi"
+        )
+        status = run_pod_command(args, pod, script)
+        if status != 0:
+            return status
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     if args.prebuild_metadata and not args.stop:
         status = prebuild_metadata(args)
+        if status != 0:
+            return status
+    elif not args.stop:
+        status = verify_metadata_cache(args)
         if status != 0:
             return status
 
@@ -299,8 +330,9 @@ def main() -> int:
         command.extend(["--limit-val-batches", args.limit_val_batches])
     if args.max_epochs:
         command.extend(["--max-epochs", args.max_epochs])
-    if args.extra_hydra_overrides:
-        command.extend(["--extra-hydra-overrides", args.extra_hydra_overrides])
+    extra_hydra_overrides = training_extra_hydra_overrides(args)
+    if extra_hydra_overrides:
+        command.extend(["--extra-hydra-overrides", extra_hydra_overrides])
     if args.cache_root:
         for pod in args.pods:
             command.extend(["--pod-cache-root", f"{pod}={args.cache_root}"])

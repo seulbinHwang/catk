@@ -631,7 +631,7 @@ trainer:
   use_distributed_sampler: false
 ```
 
-`--prebuild-metadata`는 각 pod의 SMART cache training split을 읽어서 memory-balanced sampler용 metadata만 미리 만듭니다. SMART cache 파일 자체는 수정하지 않습니다. 이전 metadata build가 비정상 종료되어 `.lock`만 남아 있으면 `--force-metadata`를 추가해 stale lock을 정리한 뒤 다시 생성합니다. 실제 build가 돌고 있는 중에는 `--force-metadata`를 쓰지 않습니다.
+`--prebuild-metadata`는 각 pod의 SMART cache training split을 읽어서 memory-balanced sampler용 metadata만 미리 만듭니다. SMART cache 파일 자체는 수정하지 않습니다. 이 preset은 학습 중 metadata build가 조용히 오래 도는 것을 막기 위해 `train_memory_balance_build_on_missing=false`를 쓰므로, metadata cache가 없는 첫 실행에서는 `--prebuild-metadata`를 반드시 함께 줍니다. launcher는 `--prebuild-metadata` 없이 실행될 때 각 pod에서 metadata cache 파일이 보이는지 먼저 확인하고, 없으면 학습을 시작하기 전에 실패합니다. metadata 위치를 바꾸려면 `--metadata-cache-path /abs/path/to/cache.pt`를 쓰면 되고, launcher가 prebuild `--cache-path`와 training `data.train_memory_balance_metadata_cache` override를 같은 경로로 맞춥니다. 이전 metadata build가 비정상 종료되어 `.lock`만 남아 있으면 `--force-metadata`를 추가해 stale lock을 정리한 뒤 다시 생성합니다. 실제 build가 돌고 있는 중에는 `--force-metadata`를 쓰지 않습니다.
 
 기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2-execctx-balanced`입니다. 기본 `train_batch_size=26`, 8 GPU 기준 effective global batch는 `208`입니다. CUDA OOM이 발생하면 기존 H100x4x2 retry wrapper와 동일하게 최신 `epoch_last.ckpt`를 기준으로 resume하며, 기본 fallback은 `26 -> 24 -> 22 -> 20`입니다.
 
