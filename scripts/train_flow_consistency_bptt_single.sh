@@ -142,8 +142,22 @@ OCSC_N_OL_ROLLOUTS="${OCSC_N_OL_ROLLOUTS:--1}"
 #   use_mmd 자동 false 강제. M>=G 필요 (그 외는 비활성).
 OCSC_OL_NEAREST_MATCH="${OCSC_OL_NEAREST_MATCH:-false}"
 # OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-smooth_l1}"
+# OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-pwil}"
+#   "l2" | "smooth_l1" | "l1" : 기존 paired L2 류
+#   "pwil"                    : PWIL coupling (Wasserstein-1 upper bound). OCSC_PWIL_* 토글 사용.
 OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
 OCSC_USE_MMD="${OCSC_USE_MMD:-false}"
+# PWIL coupling 알고리즘 (OCSC_LOSS_TYPE=pwil 일 때만 효과):
+#   "hungarian" (M=G 필수, exact W_1 — scipy linear_sum_assignment 사용)
+#   "greedy"    (M≠G 허용, PWIL 원논문 nearest-first mass transport)
+#   "uniform"   (γ=1/(GM), ablation baseline — 가장 느슨한 bound)
+OCSC_PWIL_COUPLING="${OCSC_PWIL_COUPLING:-hungarian}"
+# True → per-CL transport cost c_i 에 α(1 - exp(-β c_i)) bounded reward 변환 (loss ∈ [0, α]).
+# False → raw transport cost <d, γ> 직접 minimize (W_1 upper bound 그대로).
+OCSC_PWIL_USE_EXP_REWARD="${OCSC_PWIL_USE_EXP_REWARD:-true}"
+OCSC_PWIL_ALPHA="${OCSC_PWIL_ALPHA:-1.0}"
+# β · typical(c) ≈ 1 영역으로 튜닝. c < 0.1 이면 β 키우고, c > 1 이면 β 줄이기.
+OCSC_PWIL_BETA="${OCSC_PWIL_BETA:-5.0}"
 OCSC_ANCHOR_STRIDE="${OCSC_ANCHOR_STRIDE:-1}"
 OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 OCSC_TARGET_MAX_STEPS="${OCSC_TARGET_MAX_STEPS:-2}"
@@ -278,6 +292,9 @@ echo "CKPT_PATH=${CKPT_PATH}"
 echo "NPROC=${NPROC_PER_NODE} TRAIN_B=${TRAIN_B} MAX_EPOCHS=${MAX_EPOCHS} LIMIT_TRAIN=${LIMIT_TRAIN_BATCHES}"
 echo "SEED=${SEED} DATA_SHUFFLE=${DATA_SHUFFLE} DETERMINISTIC=${TRAINER_DETERMINISTIC}"
 echo "OCSC_N_ROLLOUTS=${OCSC_N_ROLLOUTS} OCSC_LOSS_TYPE=${OCSC_LOSS_TYPE} OCSC_TARGET=${OCSC_TARGET_MAX_STEPS}cs OCSC_PRED=${OCSC_PRED_MAX_STEPS}cs"
+if [ "${OCSC_LOSS_TYPE}" = "pwil" ]; then
+  echo "OCSC_PWIL_COUPLING=${OCSC_PWIL_COUPLING} use_exp_reward=${OCSC_PWIL_USE_EXP_REWARD} alpha=${OCSC_PWIL_ALPHA} beta=${OCSC_PWIL_BETA}"
+fi
 echo "OCSC_HEADING_WEIGHT=${OCSC_HEADING_WEIGHT} OCSC_POSITION_WEIGHT=${OCSC_POSITION_WEIGHT} OCSC_REL_DISP_WEIGHT=${OCSC_REL_DISP_WEIGHT}"
 echo "OCSC_FM_REG_LAMBDA=${OCSC_FM_REG_LAMBDA} OCSC_GT_TARGET=${OCSC_GT_TARGET} OCSC_GT_RES=${OCSC_GT_RESOLUTION} OCSC_OL_RES=${OCSC_OL_RESOLUTION}"
 echo "OCSC_EVAL_HARD_RMM=${OCSC_EVAL_HARD_RMM} interval=${OCSC_EVAL_HARD_RMM_INTERVAL}"
@@ -340,6 +357,10 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.ocsc_ol_nearest_match="${OCSC_OL_NEAREST_MATCH}" \
   model.model_config.finetune.ocsc_loss_type="${OCSC_LOSS_TYPE}" \
   model.model_config.finetune.ocsc_use_mmd="${OCSC_USE_MMD}" \
+  model.model_config.finetune.ocsc_pwil_coupling="${OCSC_PWIL_COUPLING}" \
+  model.model_config.finetune.ocsc_pwil_use_exp_reward="${OCSC_PWIL_USE_EXP_REWARD}" \
+  model.model_config.finetune.ocsc_pwil_alpha="${OCSC_PWIL_ALPHA}" \
+  model.model_config.finetune.ocsc_pwil_beta="${OCSC_PWIL_BETA}" \
   model.model_config.finetune.ocsc_anchor_stride="${OCSC_ANCHOR_STRIDE}" \
   model.model_config.finetune.ocsc_use_pretrained_ref="${OCSC_USE_PRETRAINED_REF}" \
   model.model_config.finetune.ocsc_target_max_steps="${OCSC_TARGET_MAX_STEPS}" \

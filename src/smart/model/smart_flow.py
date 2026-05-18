@@ -38,6 +38,15 @@ from src.smart.metrics.mmd_consistency_loss import (
     mmd_precompute_sigma_sq,
     mmd_per_rollout_proxy,
 )
+from src.smart.metrics.pwil_consistency_loss import (
+    pwil_pairwise_distance,
+    pwil_row_distance,
+    pwil_hungarian_coupling,
+    pwil_greedy_coupling,
+    pwil_uniform_coupling,
+    pwil_loss,
+    pwil_loss_per_cl_row,
+)
 from src.smart.modules.flow_kinematic_projection import KinematicProjection
 from src.smart.utils.geometry import wrap_angle
 from src.smart.utils.rollout import transform_to_local
@@ -1325,9 +1334,53 @@ class SMARTFlow(LightningModule):
                 f"[ocsc_ft] ocsc_ol_nearest_match=True: forcing use_mmd=False (paired L2 with argmin target)"
             )
             use_mmd = False
+        # ── PWIL mode 호환성 (loss_type=="pwil" 일 때만 작동) ──────────────────
+        _is_pwil = (loss_type == "pwil")
+        pwil_coupling = str(getattr(self.finetune_config, "ocsc_pwil_coupling", "hungarian")).lower()
+        pwil_use_exp_reward = bool(getattr(self.finetune_config, "ocsc_pwil_use_exp_reward", True))
+        pwil_alpha = float(getattr(self.finetune_config, "ocsc_pwil_alpha", 1.0))
+        pwil_beta = float(getattr(self.finetune_config, "ocsc_pwil_beta", 5.0))
+        if _is_pwil:
+            if pwil_coupling not in ("hungarian", "greedy", "uniform"):
+                raise ValueError(
+                    f"[ocsc_ft] ocsc_pwil_coupling={pwil_coupling!r} invalid; "
+                    "expected one of: hungarian, greedy, uniform."
+                )
+            if pwil_coupling == "hungarian" and M_ol != G:
+                raise ValueError(
+                    f"[ocsc_ft] PWIL hungarian requires M (ocsc_n_ol_rollouts) == G "
+                    f"(ocsc_n_rollouts); got M={M_ol}, G={G}. Use 'greedy' for asymmetric."
+                )
+            if pwil_coupling == "greedy" and M_ol < G:
+                log.warning(
+                    f"[ocsc_ft] PWIL greedy: M={M_ol} < G={G} — coupling is feasible but "
+                    "OL coverage is sparse; consider M >= G."
+                )
+            if use_mmd:
+                log.warning("[ocsc_ft] loss_type=pwil: forcing use_mmd=False (incompatible).")
+                use_mmd = False
+            if _nearest_match:
+                log.warning(
+                    "[ocsc_ft] loss_type=pwil: forcing ocsc_ol_nearest_match=False "
+                    "(PWIL coupling replaces nearest_match)."
+                )
+                _nearest_match = False
+            if _shared_ol:
+                # M < G broadcast 는 PWIL coupling 의미가 없음.
+                raise ValueError(
+                    f"[ocsc_ft] PWIL incompatible with _shared_ol (M={M_ol} < G={G} broadcast). "
+                    "Set ocsc_n_ol_rollouts >= ocsc_n_rollouts."
+                )
         # ocsc_gt_target=True: open-loop sample 대신 GT 궤적을 target으로 사용.
         # CL 예측을 2Hz로 다운샘플 후 GT(2Hz)와 비교.
         use_gt_target = bool(getattr(self.finetune_config, "ocsc_gt_target", False))
+        if _is_pwil and use_gt_target:
+            raise ValueError(
+                "[ocsc_ft] loss_type=pwil + ocsc_gt_target=True is incompatible: "
+                "PWIL requires an OL sample distribution (M>=1 OL samples) — "
+                "GT is a single trajectory and yields a degenerate coupling. "
+                "Use 'l2' / 'smooth_l1' with ocsc_gt_target=True for paired-to-GT mode."
+            )
         # GT resolution: "2hz" (default, 기존) | "10hz" (raw fine 10Hz GT, no downsample).
         gt_resolution = str(getattr(self.finetune_config, "ocsc_gt_resolution", "2hz")).lower()
         if gt_resolution not in ("2hz", "10hz"):
@@ -1828,10 +1881,17 @@ class SMARTFlow(LightningModule):
                     # so ∂proxy_g/∂θ == ∂MMD²/∂cl_g · ∂cl_g/∂θ  (exact contribution of rollout g).
                     # Summing over g: exact ∂MMD²/∂θ.
                     _do_seq_mmd = use_mmd and G >= 2
+                    # PWIL sequential: MMD 2-pass 트릭과 동형.
+                    #   Pass 1 (no_grad): G CL rollouts → cl_norms_det → coupling γ 계산 (고정).
+                    #   Pass 2 (with grad): rollout g 별 row 거리 ↔ γ[:,g,:] contribution → backward.
+                    # γ 가 θ 와 독립이라 row 별 contribution 합 = full ∂L/∂θ (exact).
+                    _do_seq_pwil = _is_pwil and G >= 2
                     cl_norms_det: list[Tensor] = []
                     sigma_sq_seq: Tensor | None = None
+                    gamma_seq: Tensor | None = None
+                    ol_sliced_det_pw: list[Tensor] = []
 
-                    if _do_seq_mmd:
+                    if _do_seq_mmd or _do_seq_pwil:
                         # Pass 1 ─────────────────────────────────────────────
                         with torch.no_grad():
                             for g in range(G):
@@ -1875,7 +1935,38 @@ class SMARTFlow(LightningModule):
                                 cl_norms_det.append(_cl_norm_det)
                                 del _traj_d, _head_d
 
-                        if use_gt_target:
+                        if _do_seq_pwil:
+                            # ol_norms 이미 _ol_slice_fn 적용 전; detach + slice → coupling.
+                            ol_sliced_det_pw = [_ol_slice_fn(o.detach()) for o in ol_norms]
+                            with torch.no_grad():
+                                _d_seq = pwil_pairwise_distance(
+                                    cl_norms_det, ol_sliced_det_pw,
+                                    pos_weight=pos_w, heading_weight=heading_w,
+                                )  # [N_active, G, M_ol]
+                                if pwil_coupling == "hungarian":
+                                    gamma_seq = pwil_hungarian_coupling(_d_seq)
+                                elif pwil_coupling == "greedy":
+                                    gamma_seq = pwil_greedy_coupling(_d_seq)
+                                else:
+                                    gamma_seq = pwil_uniform_coupling(_d_seq)
+                                _pw_transport_seq = (_d_seq * gamma_seq).sum(dim=(-2, -1)).mean().item()
+                                _pw_GM_s = float(gamma_seq.shape[-2] * gamma_seq.shape[-1])
+                                _gn_s = gamma_seq * _pw_GM_s
+                                _pw_entropy_seq = -(_gn_s * torch.log(_gn_s.clamp(min=1e-12))).sum(dim=(-2, -1)).mean().item()
+                                # actual training loss (raw transport 또는 bounded reward 변환).
+                                _pw_loss_seq = pwil_loss(
+                                    d=_d_seq, gamma=gamma_seq,
+                                    use_exp_reward=pwil_use_exp_reward,
+                                    alpha=pwil_alpha, beta=pwil_beta,
+                                ).item()
+                            total_loss_accum += _pw_loss_seq
+                            if not hasattr(self, "_pwil_log_accum"):
+                                self._pwil_log_accum = {"transport": 0.0, "entropy": 0.0, "count": 0}
+                            self._pwil_log_accum["transport"] += _pw_transport_seq
+                            self._pwil_log_accum["entropy"] += _pw_entropy_seq
+                            self._pwil_log_accum["count"] += 1
+                            del _d_seq, _gn_s
+                        elif use_gt_target:
                             _gt_slice = _slice_consistency_suffix_2hz(gt_norm_anchor)
                             _ol_ref_list = [_gt_slice] * G
                             sigma_sq_seq = mmd_precompute_sigma_sq(
@@ -1959,6 +2050,23 @@ class SMARTFlow(LightningModule):
                             )
                             (proxy_g / n_anchors_total).backward()
                             del proxy_g
+                        elif _do_seq_pwil and gamma_seq is not None:
+                            # row 거리 (grad through cl_norm_g) ↔ γ[:, g, :] (constant) contribution.
+                            # contribution = (per-CL loss g)/(n_active · G); g 합 = full pwil_loss.
+                            _d_row_g = pwil_row_distance(
+                                cl_norm_g, ol_sliced_det_pw,
+                                pos_weight=pos_w, heading_weight=heading_w,
+                            )  # [N_active, M_ol]
+                            _gamma_row_g = gamma_seq[:, g, :]  # [N_active, M_ol]
+                            _n_active_g = int(_d_row_g.shape[0])
+                            loss_g = pwil_loss_per_cl_row(
+                                d_row=_d_row_g, gamma_row=_gamma_row_g,
+                                use_exp_reward=pwil_use_exp_reward,
+                                alpha=pwil_alpha, beta=pwil_beta,
+                                G=G, n_active=_n_active_g,
+                            )
+                            (loss_g / n_anchors_total).backward()
+                            del _d_row_g, _gamma_row_g, loss_g
                         elif use_gt_target:
                             loss_g = _consistency_loss_gt(cl_norm_g, _gt_slice_pass2, _gt_valid_slice)
                             total_loss_accum += loss_g.item()
@@ -2055,6 +2163,41 @@ class SMARTFlow(LightningModule):
                             cl_stack, ol_stack,
                             pos_weight=pos_w, heading_weight=heading_w,
                         )
+                    elif _is_pwil:
+                        # PWIL coupling: γ (no_grad) 로 valid transport plan 구성 후
+                        #   L = Σ γ[i,j] · d(CL_i, OL_j) (mean over anchor).
+                        # Hungarian (G=M): exact W_1. greedy: PWIL faithful, G≠M 허용.
+                        # bounded reward 변환 (use_exp_reward): 원논문 r=α exp(-β c) 형태.
+                        cl_sliced_pw = [_ol_slice_fn(cl_norms[g]) for g in range(G)]
+                        ol_sliced_pw = [_ol_slice_fn(ol_norms[m].detach()) for m in range(M_ol)]
+                        d_mat_pw = pwil_pairwise_distance(
+                            cl_sliced_pw, ol_sliced_pw,
+                            pos_weight=pos_w, heading_weight=heading_w,
+                        )  # [N_active, G, M_ol]
+                        with torch.no_grad():
+                            if pwil_coupling == "hungarian":
+                                gamma_pw = pwil_hungarian_coupling(d_mat_pw)
+                            elif pwil_coupling == "greedy":
+                                gamma_pw = pwil_greedy_coupling(d_mat_pw)
+                            else:  # "uniform"
+                                gamma_pw = pwil_uniform_coupling(d_mat_pw)
+                        anchor_loss = pwil_loss(
+                            d=d_mat_pw, gamma=gamma_pw,
+                            use_exp_reward=pwil_use_exp_reward,
+                            alpha=pwil_alpha, beta=pwil_beta,
+                        )
+                        # 진단 누적 (anchor 평균; final log 에서 epoch 평균).
+                        with torch.no_grad():
+                            _pw_transport = (d_mat_pw.detach() * gamma_pw).sum(dim=(-2, -1)).mean().item()
+                            _pw_GM = float(gamma_pw.shape[-2] * gamma_pw.shape[-1])
+                            _gn = gamma_pw * _pw_GM
+                            _pw_entropy = -(_gn * torch.log(_gn.clamp(min=1e-12))).sum(dim=(-2, -1)).mean().item()
+                        if not hasattr(self, "_pwil_log_accum"):
+                            self._pwil_log_accum = {"transport": 0.0, "entropy": 0.0, "count": 0}
+                        self._pwil_log_accum["transport"] += _pw_transport
+                        self._pwil_log_accum["entropy"] += _pw_entropy
+                        self._pwil_log_accum["count"] += 1
+                        del d_mat_pw, gamma_pw, cl_sliced_pw, ol_sliced_pw
                     else:
                         cl_sliced_pl = [_ol_slice_fn(cl_norms[g]) for g in range(G)]
                         if _nearest_match:
@@ -2181,6 +2324,20 @@ class SMARTFlow(LightningModule):
             ret["train/fm_reg_loss"] = torch.tensor(
                 fm_reg_accum, dtype=torch.float32, device=agent_batch.device,
             )
+        # PWIL 진단 (anchor 평균; coupling 의 quality 모니터링).
+        # mean_transport: <d, γ> 평균 — W_1 (또는 그 upper bound) estimate.
+        # coupling_entropy: log(G·M) (uniform) ~ 0 (deterministic) 사이; hungarian 은 정확히 log(G).
+        if _is_pwil and hasattr(self, "_pwil_log_accum") and self._pwil_log_accum["count"] > 0:
+            _cnt = max(1, int(self._pwil_log_accum["count"]))
+            ret["train/pwil_mean_transport"] = torch.tensor(
+                self._pwil_log_accum["transport"] / _cnt,
+                dtype=torch.float32, device=agent_batch.device,
+            )
+            ret["train/pwil_coupling_entropy"] = torch.tensor(
+                self._pwil_log_accum["entropy"] / _cnt,
+                dtype=torch.float32, device=agent_batch.device,
+            )
+            self._pwil_log_accum = {"transport": 0.0, "entropy": 0.0, "count": 0}
 
         # Mode collapse 진단 (마지막 anchor, no extra compute)
         if _diag_pred_traj is not None and _diag_pred_traj.shape[1] >= 2 and _diag_active_mask is not None:

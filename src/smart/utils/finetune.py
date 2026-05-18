@@ -35,8 +35,15 @@ class FinetuneConfig:
         ocsc_n_ol_rollouts: M — open-loop sample 개수. ``-1`` 이면 G 와 동일.
             M > G 또는 nearest_match 면 ``ocsc_use_mmd`` 자동 False.
         ocsc_ol_nearest_match: 각 CL rollout g 에 대해 M 개 OL 중 argmin paired L2 target.
-        ocsc_loss_type: "l2" | "smooth_l1" | "l1".
+        ocsc_loss_type: "l2" | "smooth_l1" | "l1" | "pwil".
+            "pwil" 은 PWIL coupling (Wasserstein-1 upper bound) — ocsc_pwil_* 토글 사용.
         ocsc_use_mmd: True → MMD². False → rollout 별 paired L2.
+        ocsc_pwil_coupling: PWIL 모드의 coupling 알고리즘.
+            "hungarian" (G=M 필수, exact W_1) | "greedy" (PWIL 원논문, G≠M 허용) | "uniform".
+        ocsc_pwil_use_exp_reward: True → per-CL transport cost 에 ``α(1 - exp(-β c))`` 변환.
+            False → raw transport cost ``<d, γ>`` 직접 minimize.
+        ocsc_pwil_alpha: bounded reward scale (use_exp_reward=True 전용; loss ∈ [0, α]).
+        ocsc_pwil_beta: bounded reward decay 계수; ``β · typical(c) ≈ 1`` 으로 튜닝.
         ocsc_use_pretrained_ref: True → frozen pretrained ref decoder 로 OL 생성.
         ocsc_target_max_steps: open-loop target rollout 에서 실행할 coarse step 수.
         ocsc_pred_max_steps: closed-loop prediction rollout 에서 실행할 coarse step 수.
@@ -82,6 +89,19 @@ class FinetuneConfig:
     ocsc_anchor_stride: int = 1
     ocsc_loss_type: str = "l2"
     ocsc_use_mmd: bool = True
+    # ── PWIL (Primal Wasserstein Imitation Learning) coupling 토글 ────────────
+    #: PWIL 모드 (loss_type="pwil") 의 coupling 알고리즘.
+    #: "hungarian": scipy linear_sum_assignment, G=M 필수, exact W_1.
+    #: "greedy": PWIL 원논문 faithful, G≠M 허용, nearest-first mass transport.
+    #: "uniform": γ=1/(GM), ablation baseline (가장 느슨한 bound).
+    ocsc_pwil_coupling: str = "hungarian"
+    #: True → per-CL transport cost c_i 에 ``α(1 - exp(-β c_i))`` 변환 (bounded reward).
+    #: False → raw transport cost ``<d, γ>`` 직접 minimize (W_1 upper bound 그대로).
+    ocsc_pwil_use_exp_reward: bool = True
+    #: bounded reward scale; use_exp_reward=True 일 때 loss ∈ [0, α].
+    ocsc_pwil_alpha: float = 1.0
+    #: bounded reward decay 계수; β · typical(c) ≈ 1 로 튜닝 (saturation 영역 회피).
+    ocsc_pwil_beta: float = 5.0
     ocsc_use_pretrained_ref: bool = False
     ocsc_target_max_steps: int = 4
     ocsc_pred_max_steps: int = 4
@@ -195,6 +215,10 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         ocsc_anchor_stride=int(_read_config_value(finetune, "ocsc_anchor_stride", 1)),
         ocsc_loss_type=str(_read_config_value(finetune, "ocsc_loss_type", "l2")),
         ocsc_use_mmd=bool(_read_config_value(finetune, "ocsc_use_mmd", True)),
+        ocsc_pwil_coupling=str(_read_config_value(finetune, "ocsc_pwil_coupling", "hungarian")),
+        ocsc_pwil_use_exp_reward=bool(_read_config_value(finetune, "ocsc_pwil_use_exp_reward", True)),
+        ocsc_pwil_alpha=float(_read_config_value(finetune, "ocsc_pwil_alpha", 1.0)),
+        ocsc_pwil_beta=float(_read_config_value(finetune, "ocsc_pwil_beta", 5.0)),
         ocsc_use_pretrained_ref=bool(_read_config_value(finetune, "ocsc_use_pretrained_ref", False)),
         ocsc_target_max_steps=int(_read_config_value(finetune, "ocsc_target_max_steps", 4)),
         ocsc_pred_max_steps=int(_read_config_value(finetune, "ocsc_pred_max_steps", 4)),
