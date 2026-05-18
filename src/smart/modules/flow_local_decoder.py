@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.checkpoint import checkpoint
 
 from src.smart.tokens.agent_token_matching import (
     build_agent_type_masks,
@@ -679,6 +680,7 @@ class HierarchicalFlowDecoder(nn.Module):
         num_chunk_layers: int = 2,
         chunk_size: int = 5,
         flow_state_dim: int = 4,
+        use_training_activation_checkpointing: bool = False,
     ) -> None:
         super().__init__()
         if int(num_future_steps) <= 0:
@@ -693,6 +695,9 @@ class HierarchicalFlowDecoder(nn.Module):
         num_chunks = int(num_future_steps) // int(chunk_size)
         self.context_projector = AnchorContextProjector(context_dim, flow_dim)
         self.flow_state_dim = int(flow_state_dim)
+        self.use_training_activation_checkpointing = bool(
+            use_training_activation_checkpointing
+        )
         self.noisy_future_encoder = NormalizedNoisyFutureEncoder(
             flow_dim=flow_dim,
             num_chunks=num_chunks,
@@ -710,6 +715,100 @@ class HierarchicalFlowDecoder(nn.Module):
             num_heads=num_chunk_heads,
         )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
+
+    def _activation_checkpoint_enabled(self) -> bool:
+        return (
+            self.use_training_activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        )
+
+    def _run_chunk_mixer(
+        self,
+        block: HalfSecondChunkMixerBlock,
+        chunk_tokens: torch.Tensor,
+        context: torch.Tensor,
+        tau_emb: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not self._activation_checkpoint_enabled():
+            return block(
+                chunk_tokens=chunk_tokens,
+                context=context,
+                tau_emb=tau_emb,
+                chunk_valid_mask=chunk_valid_mask,
+            )
+        if chunk_valid_mask is None:
+            return checkpoint(
+                lambda chunk_tokens_, context_, tau_emb_: block(
+                    chunk_tokens=chunk_tokens_,
+                    context=context_,
+                    tau_emb=tau_emb_,
+                    chunk_valid_mask=None,
+                ),
+                chunk_tokens,
+                context,
+                tau_emb,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+        return checkpoint(
+            lambda chunk_tokens_, context_, tau_emb_, chunk_valid_mask_: block(
+                chunk_tokens=chunk_tokens_,
+                context=context_,
+                tau_emb=tau_emb_,
+                chunk_valid_mask=chunk_valid_mask_,
+            ),
+            chunk_tokens,
+            context,
+            tau_emb,
+            chunk_valid_mask,
+            use_reentrant=False,
+            preserve_rng_state=True,
+        )
+
+    def _run_step_refiner(
+        self,
+        step_tokens: torch.Tensor,
+        chunk_tokens: torch.Tensor,
+        context: torch.Tensor,
+        step_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not self._activation_checkpoint_enabled():
+            return self.step_refiner(
+                step_tokens=step_tokens,
+                chunk_tokens=chunk_tokens,
+                context=context,
+                step_valid_mask=step_valid_mask,
+            )
+        if step_valid_mask is None:
+            return checkpoint(
+                lambda step_tokens_, chunk_tokens_, context_: self.step_refiner(
+                    step_tokens=step_tokens_,
+                    chunk_tokens=chunk_tokens_,
+                    context=context_,
+                    step_valid_mask=None,
+                ),
+                step_tokens,
+                chunk_tokens,
+                context,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+        return checkpoint(
+            lambda step_tokens_, chunk_tokens_, context_, step_valid_mask_: self.step_refiner(
+                step_tokens=step_tokens_,
+                chunk_tokens=chunk_tokens_,
+                context=context_,
+                step_valid_mask=step_valid_mask_,
+            ),
+            step_tokens,
+            chunk_tokens,
+            context,
+            step_valid_mask,
+            use_reentrant=False,
+            preserve_rng_state=True,
+        )
 
     def forward(
         self,
@@ -759,7 +858,8 @@ class HierarchicalFlowDecoder(nn.Module):
             
         """
         for block in self.chunk_mixers:
-            chunk_tokens = block(
+            chunk_tokens = self._run_chunk_mixer(
+                block=block,
                 chunk_tokens=chunk_tokens,
                 context=context,
                 tau_emb=tau_emb,
@@ -779,7 +879,7 @@ class HierarchicalFlowDecoder(nn.Module):
         output
             step_tokens : (b, 20, D)
         """
-        step_tokens = self.step_refiner(
+        step_tokens = self._run_step_refiner(
             step_tokens=step_tokens,
             chunk_tokens=chunk_tokens,
             context=context,
