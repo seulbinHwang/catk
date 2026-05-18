@@ -11,7 +11,6 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import os
 from typing import List
 
 import hydra
@@ -41,11 +40,6 @@ from src.utils.resume_checkpoint import resolve_fit_resume_ckpt_path
 log = RankedLogger(__name__, rank_zero_only=True)
 
 torch.set_float32_matmul_precision("high")
-
-
-def wandb_watch_enabled() -> bool:
-    value = os.environ.get("CATK_WANDB_WATCH", "1").strip().lower()
-    return value not in {"0", "false", "no", "off"}
 
 
 def build_road_cache_callback(cfg: DictConfig) -> RoadCacheRefreshCallback:
@@ -88,7 +82,7 @@ def run(cfg: DictConfig) -> None:
     log.info(f"Instantiating loggers...")
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
     for _logger in logger:
-        if isinstance(_logger, WandbLogger) and wandb_watch_enabled():
+        if isinstance(_logger, WandbLogger):
             _logger.watch(model, log="all")
 
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")

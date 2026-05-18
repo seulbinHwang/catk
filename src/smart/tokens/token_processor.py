@@ -13,8 +13,7 @@
 
 import os
 import pickle
-from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Dict, Tuple
 
 import torch
 from omegaconf import DictConfig
@@ -27,11 +26,6 @@ from src.smart.utils import (
     transform_to_global,
     transform_to_local,
     wrap_angle,
-)
-from src.smart.tokens.token_cache import (
-    CACHE_VERSION,
-    save_token_cache,
-    token_cache_enabled,
 )
 
 
@@ -50,162 +44,15 @@ class TokenProcessor(torch.nn.Module):
         self.shift = 5
 
         module_dir = os.path.dirname(__file__)
-        agent_token_path = os.path.join(module_dir, agent_token_file)
-        map_token_path = os.path.join(module_dir, map_token_file)
-        self._token_cache_fingerprint = self._make_cache_fingerprint(
-            map_token_path=map_token_path,
-            agent_token_path=agent_token_path,
-        )
-        self.init_agent_token(agent_token_path)
-        self.init_map_token(map_token_path)
+        self.init_agent_token(os.path.join(module_dir, agent_token_file))
+        self.init_map_token(os.path.join(module_dir, map_token_file))
         self.n_token_agent = self.agent_token_all_veh.shape[0]
 
     @torch.no_grad()
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
-        if self._can_use_train_token_cache():
-            cached = self._tokenize_from_cache(data)
-            if cached is not None:
-                return cached
-
         tokenized_map = self.tokenize_map(data)
         tokenized_agent = self.tokenize_agent(data)
-        if self._can_use_train_token_cache():
-            self._save_token_cache(data, tokenized_map, tokenized_agent)
         return tokenized_map, tokenized_agent
-
-    def _can_use_train_token_cache(self) -> bool:
-        return (
-            token_cache_enabled()
-            and self.training
-            and int(self.map_token_sampling.num_k) == 1
-            and int(self.agent_token_sampling.num_k) == 1
-        )
-
-    @staticmethod
-    def _file_stamp(path: str) -> str:
-        stat = Path(path).stat()
-        return f"{Path(path).name}:{stat.st_size}:{stat.st_mtime_ns}"
-
-    def _make_cache_fingerprint(self, map_token_path: str, agent_token_path: str) -> str:
-        return "|".join(
-            [
-                f"v={CACHE_VERSION}",
-                f"shift={self.shift}",
-                f"map={self._file_stamp(map_token_path)}",
-                f"agent={self._file_stamp(agent_token_path)}",
-            ]
-        )
-
-    def _tokenize_from_cache(
-        self, data: HeteroData
-    ) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]] | None:
-        cache = getattr(data, "smart_ntp_token_cache", None)
-        if not isinstance(cache, dict):
-            return None
-        fingerprints = cache.get("fingerprint")
-        if isinstance(fingerprints, str):
-            fingerprints = [fingerprints]
-        if not isinstance(fingerprints, list) or any(
-            fingerprint != self._token_cache_fingerprint for fingerprint in fingerprints
-        ):
-            return None
-
-        map_cache = cache.get("map")
-        agent_cache = cache.get("agent")
-        if not isinstance(map_cache, dict) or not isinstance(agent_cache, dict):
-            return None
-
-        device = data["agent"]["position"].device
-        agent_shape, token_traj_all, token_traj = self._get_agent_shape_and_token_traj(
-            data["agent"]["type"]
-        )
-        tokenized_map = {
-            "position": data["map_save"]["traj_pos"][:, 0].contiguous(),
-            "orientation": data["map_save"]["traj_theta"],
-            "token_idx": map_cache["token_idx"].to(device=device),
-            "token_traj_src": self.map_token_traj_src,
-            "type": data["pt_token"]["type"].long(),
-            "pl_type": data["pt_token"]["pl_type"].long(),
-            "light_type": data["pt_token"]["light_type"].long(),
-            "batch": data["pt_token"]["batch"],
-        }
-        tokenized_agent = {
-            "num_graphs": data.num_graphs,
-            "type": data["agent"]["type"],
-            "shape": data["agent"]["shape"],
-            "ego_mask": data["agent"]["role"][:, 0],
-            "token_agent_shape": agent_shape,
-            "batch": data["agent"]["batch"],
-            "token_traj_all": token_traj_all,
-            "token_traj": token_traj,
-        }
-        for key in [
-            "gt_pos_raw",
-            "gt_head_raw",
-            "gt_valid_raw",
-            "valid_mask",
-            "gt_idx",
-            "gt_pos",
-            "gt_heading",
-            "sampled_idx",
-            "sampled_pos",
-            "sampled_heading",
-        ]:
-            tokenized_agent[key] = agent_cache[key].to(device=device)
-        for key in ["veh", "ped", "cyc"]:
-            tokenized_agent[f"trajectory_token_{key}"] = getattr(
-                self, f"agent_token_all_{key}"
-            )[:, -1].flatten(1, 2)
-        return tokenized_map, tokenized_agent
-
-    @staticmethod
-    def _detach_cpu_dict(source: Dict[str, Tensor], keys: list[str]) -> Dict[str, Tensor]:
-        return {key: source[key].detach().cpu() for key in keys}
-
-    def _save_token_cache(
-        self,
-        data: HeteroData,
-        tokenized_map: Dict[str, Tensor],
-        tokenized_agent: Dict[str, Tensor],
-    ) -> None:
-        raw_paths = getattr(data, "raw_path", None)
-        if isinstance(raw_paths, str):
-            raw_paths = [raw_paths]
-        if not isinstance(raw_paths, list) or len(raw_paths) != int(data.num_graphs):
-            return
-
-        agent_batch = data["agent"]["batch"]
-        map_batch = data["pt_token"]["batch"]
-        for graph_idx, raw_path in enumerate(raw_paths):
-            agent_mask = agent_batch == graph_idx
-            map_mask = map_batch == graph_idx
-            payload: dict[str, Any] = {
-                "version": CACHE_VERSION,
-                "fingerprint": self._token_cache_fingerprint,
-                "map": {
-                    "token_idx": tokenized_map["token_idx"][map_mask].detach().cpu(),
-                },
-                "agent": self._detach_cpu_dict(
-                    tokenized_agent,
-                    [
-                        "gt_pos_raw",
-                        "gt_head_raw",
-                        "gt_valid_raw",
-                        "valid_mask",
-                        "gt_idx",
-                        "gt_pos",
-                        "gt_heading",
-                        "sampled_idx",
-                        "sampled_pos",
-                        "sampled_heading",
-                    ],
-                ),
-            }
-            payload["agent"] = {
-                key: value[agent_mask.detach().cpu()]
-                for key, value in payload["agent"].items()
-            }
-            save_token_cache(str(raw_path), payload)
 
     def init_map_token(self, map_token_traj_path, argmin_sample_len=3) -> None:
         map_token_traj = pickle.load(open(map_token_traj_path, "rb"))["traj_src"]

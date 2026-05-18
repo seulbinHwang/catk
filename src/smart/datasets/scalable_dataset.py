@@ -19,11 +19,6 @@ from typing import Callable, Dict, List, Optional
 
 from torch_geometric.data import Dataset
 
-from src.smart.tokens.token_cache import (
-    empty_token_cache,
-    load_token_cache,
-    token_cache_enabled,
-)
 from src.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -131,16 +126,6 @@ class MultiDataset(Dataset):
         raw_path = self._select_raw_path(idx)
         with open(raw_path, "rb") as handle:
             data = pickle.load(handle)
-
-        if token_cache_enabled():
-            data["raw_path"] = raw_path
-            token_cache = load_token_cache(raw_path)
-            if token_cache is None:
-                num_agent_token_steps = (
-                    int(data["agent"]["position"].shape[1]) - 1
-                ) // 5
-                token_cache = empty_token_cache(num_agent_token_steps)
-            data["smart_ntp_token_cache"] = token_cache
 
         if self._tfrecord_dir is not None:
             data["tfrecord_path"] = (
