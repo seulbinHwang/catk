@@ -448,11 +448,16 @@ terminate_task_processes() {
 pgid_file=${run_root_q}/${pod_q}.torchrun_pgid
 if [[ -f \"\$pgid_file\" ]]; then
   pgid=\"\$(cat \"\$pgid_file\" 2>/dev/null || true)\"
-  if [[ -n \"\$pgid\" && \"\$pgid\" != \"0\" ]]; then
+  pgid=\"\${pgid//[[:space:]]/}\"
+  current_pgid=\"\$(ps -o pgid= -p \"\$\$\" 2>/dev/null | tr -d '[:space:]')\"
+  if [[ \"\$pgid\" =~ ^[0-9]+$ && \"\$pgid\" != \"0\" && \"\$pgid\" != \"\$current_pgid\" ]] &&
+     ps -eo pgid=,cmd= | awk -v pgid=\"\$pgid\" -v task=\"\$TASK_NAME_TO_STOP\" \
+       '\$1 == pgid && index(\$0, task) > 0 { found = 1 } END { exit found ? 0 : 1 }'; then
     kill -TERM -- \"-\$pgid\" 2>/dev/null || true
     sleep ${grace}
     kill -KILL -- \"-\$pgid\" 2>/dev/null || true
   fi
+  rm -f \"\$pgid_file\" 2>/dev/null || true
 fi
 terminate_task_processes
 tmux kill-session -t ${session_q} 2>/dev/null || true
