@@ -1,17 +1,16 @@
 # @package _global_
 
 # ============================================================================
-# Pretrain preset for 6x H100 80GB with `flow_window_steps=80` (8s horizon).
-# Derived from `pre_bc_flow.yaml` with two targeted changes:
-#   * `model.model_config.decoder.flow_window_steps=80` (vs. 20 = 2s).
-#   * `data.train_batch_size=18` (vs. 20 = 2s default).
+# Pretrain preset for 6x H100 80GB with the default 2s Flow horizon.
+# This file intentionally pins the same shape as `pre_bc_flow.yaml` so the
+# `pre_bc_flow_6_h100` experiment name is not affected by future model defaults:
+#   * `model.model_config.decoder.flow_window_steps=20`.
+#   * `data.train_batch_size=26`.
+#   * memory-balanced train batches are enabled for all-agent training.
 #
-# bs=18 is the measured per-GPU ceiling at flow_window_steps=80 on 6x H100 80GB
-# after commit b12e653 enabled AttentionLayer activation checkpointing. The
-# longer flow horizon combined with semi-continuous anchor selection keeps more
-# dense per-batch targets than the 2s default, so bs cannot be pushed as high.
-# bs=19 OOMed at step 121 (rank 2) and bs=20 OOMed at step 430 (rank 0) in
-# 500-step probes.
+# This is not an 8s / 80-step preset. For long-horizon probes, override
+# `model.model_config.decoder.flow_window_steps=80` and lower
+# `data.train_batch_size` explicitly after a memory probe.
 # ============================================================================
 
 defaults:
@@ -40,6 +39,7 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 1.0
   sync_batchnorm: false
+  use_distributed_sampler: false
 
 callbacks:
   model_checkpoint:
@@ -53,3 +53,7 @@ data:
   num_workers: 4
   prefetch_factor: 1
   train_use_eval_agent_selection: true
+  train_memory_balanced_batches: true
+  train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
+  train_memory_balance_metadata_num_workers: 8
+  train_memory_balance_build_on_missing: true
