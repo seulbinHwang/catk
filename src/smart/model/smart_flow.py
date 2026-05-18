@@ -1950,9 +1950,9 @@ class SMARTFlow(LightningModule):
                                 else:
                                     gamma_seq = pwil_uniform_coupling(_d_seq)
                                 _pw_transport_seq = (_d_seq * gamma_seq).sum(dim=(-2, -1)).mean().item()
-                                _pw_GM_s = float(gamma_seq.shape[-2] * gamma_seq.shape[-1])
-                                _gn_s = gamma_seq * _pw_GM_s
-                                _pw_entropy_seq = -(_gn_s * torch.log(_gn_s.clamp(min=1e-12))).sum(dim=(-2, -1)).mean().item()
+                                # 표준 entropy (gamma 가 이미 anchor 별 합=1 분포):
+                                #   hungarian = log(G), uniform = log(G·M), greedy = 중간.
+                                _pw_entropy_seq = -(gamma_seq * torch.log(gamma_seq.clamp(min=1e-12))).sum(dim=(-2, -1)).mean().item()
                                 # actual training loss (raw transport 또는 bounded reward 변환).
                                 _pw_loss_seq = pwil_loss(
                                     d=_d_seq, gamma=gamma_seq,
@@ -1965,7 +1965,7 @@ class SMARTFlow(LightningModule):
                             self._pwil_log_accum["transport"] += _pw_transport_seq
                             self._pwil_log_accum["entropy"] += _pw_entropy_seq
                             self._pwil_log_accum["count"] += 1
-                            del _d_seq, _gn_s
+                            del _d_seq
                         elif use_gt_target:
                             _gt_slice = _slice_consistency_suffix_2hz(gt_norm_anchor)
                             _ol_ref_list = [_gt_slice] * G
@@ -2187,11 +2187,11 @@ class SMARTFlow(LightningModule):
                             alpha=pwil_alpha, beta=pwil_beta,
                         )
                         # 진단 누적 (anchor 평균; final log 에서 epoch 평균).
+                        # gamma 는 이미 anchor 별 합=1 인 distribution → 표준 entropy 직접 계산:
+                        #   hungarian = log(G), uniform = log(G·M), greedy = 중간값.
                         with torch.no_grad():
                             _pw_transport = (d_mat_pw.detach() * gamma_pw).sum(dim=(-2, -1)).mean().item()
-                            _pw_GM = float(gamma_pw.shape[-2] * gamma_pw.shape[-1])
-                            _gn = gamma_pw * _pw_GM
-                            _pw_entropy = -(_gn * torch.log(_gn.clamp(min=1e-12))).sum(dim=(-2, -1)).mean().item()
+                            _pw_entropy = -(gamma_pw * torch.log(gamma_pw.clamp(min=1e-12))).sum(dim=(-2, -1)).mean().item()
                         if not hasattr(self, "_pwil_log_accum"):
                             self._pwil_log_accum = {"transport": 0.0, "entropy": 0.0, "count": 0}
                         self._pwil_log_accum["transport"] += _pw_transport
