@@ -39,6 +39,16 @@
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 2025 Sim Agents proto와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
 
+### Map-to-Agent Radius Batch Sorting
+
+`SMARTAgentEncoder.build_map2agent_edge`의 `torch_cluster.radius` 호출에도 같은 sorted-batch silent 가정이 적용됩니다.
+caller(flow_agent_decoder)는 `batch_s = tokenized_agent["batch"].repeat(n_step)`으로 같은 scene 번호 묶음을 step마다 반복해서 넘기는데,
+이 배열은 step 사이마다 큰 scene 번호에서 작은 값으로 떨어져 단조 비감소 조건을 만족하지 못합니다.
+그대로 호출하면 같은 scene 안의 map-agent edge가 silent하게 절반 가까이 누락돼, 일부 agent/time-step이 자기 scene의 지도 정보를 받지 못한 채 학습됩니다.
+WOSAC RMM의 map-based 항목(`offroad_indication_likelihood`, `distance_to_road_edge_likelihood`, `traffic_light_violation_likelihood`)에 직접 영향을 줄 수 있는 문제이므로,
+`build_map2agent_edge`는 `radius` 호출 직전에 agent 쪽과 map 쪽 batch를 모두 `argsort`로 정렬하고, 받은 edge index를 원래 순서로 되돌려 downstream feature 계산이 그대로 작동하도록 합니다.
+회귀 테스트 `test_map2agent_edge_no_silent_drop_cpu` / `_gpu`가 production 패킹·위치 분포에서 brute-force로 계산한 기대 edge 수와 실제 생성된 edge 수가 일치하는지 CPU/GPU 양쪽에서 확인합니다.
+
 ### Fast WOSAC Metric
 
 - TrajTok의 `wosac_fast_eval_tool.fast_sim_agents_metrics` 구현을 `src/smart/metrics/wosac_fast_eval_tool/` 아래에 vendoring했습니다.
