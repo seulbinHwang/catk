@@ -216,6 +216,12 @@ selection을 전제로 한다. 이전에 넓은 all-agent 학습 모드
 map-agent attention에서 CUDA OOM이 발생했으므로, 두 결과를 같은 학습 대상 agent set으로
 해석하면 안 된다.
 
+`69603f8` 기준으로 `testa/testaa`에서 `pre_bc_a100x4x2`, 2 nodes, 8 ranks,
+`data.train_batch_size=26`, `data.train_use_eval_agent_selection=false`, train 1 batch,
+validation 1 batch smoke를 실행했지만 첫 train batch의 map-agent attention에서 CUDA OOM이
+발생했다. 따라서 이 설정은 문법적으로 compose되고 launcher guard도 통과하지만, 현재 A100
+80GB pod에서는 그대로 정식 학습을 시작하면 안 된다.
+
 기본 cache root는 pod별로 다르다.
 
 - `testa`: `/workspace/womd_v1_3/SMART_cache`
