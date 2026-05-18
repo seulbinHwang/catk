@@ -697,6 +697,7 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 - `data.train_batch_size=4`, effective global batch `4 * 47 = 188`
 - `data.train_memory_balanced_batches=true`
 - `data.train_memory_balance_metadata_cache=${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt`
+- `data.train_memory_balance_build_on_missing=false`
 - `trainer.use_distributed_sampler=false`
 
 `data.train_batch_size=4`는 기존 V100x47 안정 설정을 따른 값입니다. A100x4x2 run의 effective global batch는 `26 * 8 = 208`이므로 완전히 같지는 않지만, V100 32GB fleet에서 memory-safe한 기본값을 쓰고 lr은 A100 run과 같은 `6e-4`로 고정합니다.
@@ -705,7 +706,18 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 
 `shuffle=true`일 때 balanced batch sampler는 Lightning의 epoch hook을 받아 매 epoch `seed + epoch`으로 새 순서를 만듭니다. 즉 memory-balanced 제약은 유지하되, epoch마다 같은 batch 순서가 반복되지는 않습니다.
 
-metadata cache는 학습 cache 파일을 수정하지 않습니다. cache가 없으면 첫 실행에서 한 번 생성하고, 같은 cache가 있으면 학습 중에는 pkl을 다시 스캔하지 않습니다. 따라서 steady-state 학습 속도에 추가되는 비용은 epoch 시작 시 작은 tensor 정렬과 index list 생성뿐입니다. Lightning의 기본 distributed sampler가 이 batch sampler를 덮어쓰지 않도록 이 preset은 `trainer.use_distributed_sampler=false`를 명시합니다.
+metadata cache는 학습 cache 파일을 수정하지 않습니다. metadata build가 필요할 때는 pkl decode가 CPU 병목이므로 `ProcessPoolExecutor`로 여러 프로세스가 cache pkl을 병렬 스캔하고, 결과는 tensor payload로 저장합니다. 같은 cache가 있으면 학습 중에는 pkl을 다시 스캔하지 않습니다. 따라서 steady-state 학습 속도에 추가되는 비용은 epoch 시작 시 작은 tensor 정렬과 index list 생성뿐입니다. Lightning의 기본 distributed sampler가 이 batch sampler를 덮어쓰지 않도록 이 preset은 `trainer.use_distributed_sampler=false`를 명시합니다.
+
+V100x47 production preset은 학습 시작 중 조용히 긴 metadata build가 들어가는 것을 막기 위해 `data.train_memory_balance_build_on_missing=false`를 사용합니다. 새 pod 또는 새 log path에서 cache가 없다면 학습 전에 각 pod에서 먼저 prebuild합니다:
+
+```bash
+python tools/build_memory_balance_metadata.py \
+  --raw-dir "$CACHE_ROOT/training" \
+  --cache-path "$REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt" \
+  --num-workers 8
+```
+
+이미 만들어진 metadata cache는 약 수 MB 크기라 load가 빠릅니다. cache가 없는 상태에서 ad-hoc으로 학습 프로세스 안에서 build까지 허용해야 할 때만 `data.train_memory_balance_build_on_missing=true`를 override합니다.
 
 이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=4`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, `4 -> 2`처럼 batch를 낮추지 않습니다.
 

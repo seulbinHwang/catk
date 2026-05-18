@@ -42,7 +42,7 @@ data:
   train_memory_balanced_batches: true
   train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
   train_memory_balance_metadata_num_workers: 8
-  train_memory_balance_build_on_missing: true
+  train_memory_balance_build_on_missing: false
   train_memory_balance_agent_weight: 1.0
   train_memory_balance_current_valid_agent_weight: 1.0
   train_memory_balance_valid_agent_step_weight: 0.0

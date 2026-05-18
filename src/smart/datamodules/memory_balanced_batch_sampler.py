@@ -5,7 +5,7 @@ import math
 import os
 import pickle
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
@@ -25,6 +25,39 @@ class SampleMemoryMetadata:
     current_valid_agent_count: int
     valid_agent_step_count: int
     map_count: int
+
+
+@dataclass(frozen=True)
+class MemoryBalanceMetadata:
+    """Tensorized per-cache-file fields used only for train batch ordering."""
+
+    agent_count: torch.Tensor
+    current_valid_agent_count: torch.Tensor
+    valid_agent_step_count: torch.Tensor
+    map_count: torch.Tensor
+
+    def __len__(self) -> int:
+        return int(self.agent_count.numel())
+
+    @classmethod
+    def from_samples(cls, samples: Iterable[SampleMemoryMetadata]) -> "MemoryBalanceMetadata":
+        agent_count = []
+        current_valid_agent_count = []
+        valid_agent_step_count = []
+        map_count = []
+        for item in samples:
+            agent_count.append(int(item.agent_count))
+            current_valid_agent_count.append(int(item.current_valid_agent_count))
+            valid_agent_step_count.append(int(item.valid_agent_step_count))
+            map_count.append(int(item.map_count))
+        return cls(
+            agent_count=torch.as_tensor(agent_count, dtype=torch.int64),
+            current_valid_agent_count=torch.as_tensor(
+                current_valid_agent_count, dtype=torch.int64
+            ),
+            valid_agent_step_count=torch.as_tensor(valid_agent_step_count, dtype=torch.int64),
+            map_count=torch.as_tensor(map_count, dtype=torch.int64),
+        )
 
 
 def _shape0(value) -> int:
@@ -104,6 +137,17 @@ def _extract_sample_metadata(path: str) -> SampleMemoryMetadata:
     )
 
 
+def _init_metadata_worker() -> None:
+    try:
+        torch.set_num_threads(1)
+    except RuntimeError:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+
 def fingerprint_raw_paths(raw_paths: Sequence[str]) -> str:
     """Fingerprint dataset identity without baking machine-specific prefixes."""
 
@@ -120,16 +164,48 @@ def _default_metadata_cache_path(raw_paths: Sequence[str]) -> Path:
     return raw_dir.parent / ".catk_metadata" / filename
 
 
-def _build_metadata(raw_paths: Sequence[str], num_workers: int) -> list[SampleMemoryMetadata]:
+def _as_int64_tensor(value) -> torch.Tensor:
+    return torch.as_tensor(value, dtype=torch.int64).cpu().flatten().contiguous()
+
+
+def _payload_to_metadata(payload: dict) -> MemoryBalanceMetadata:
+    return MemoryBalanceMetadata(
+        agent_count=_as_int64_tensor(payload["agent_count"]),
+        current_valid_agent_count=_as_int64_tensor(payload["current_valid_agent_count"]),
+        valid_agent_step_count=_as_int64_tensor(payload["valid_agent_step_count"]),
+        map_count=_as_int64_tensor(payload["map_count"]),
+    )
+
+
+def _metadata_payload(
+    metadata: MemoryBalanceMetadata, raw_paths: Sequence[str]
+) -> dict[str, object]:
+    return {
+        "version": METADATA_VERSION,
+        "num_samples": len(raw_paths),
+        "fingerprint": fingerprint_raw_paths(raw_paths),
+        "agent_count": metadata.agent_count,
+        "current_valid_agent_count": metadata.current_valid_agent_count,
+        "valid_agent_step_count": metadata.valid_agent_step_count,
+        "map_count": metadata.map_count,
+    }
+
+
+def _build_metadata(raw_paths: Sequence[str], num_workers: int) -> MemoryBalanceMetadata:
     if num_workers <= 1:
-        return [_extract_sample_metadata(path) for path in raw_paths]
-    with ThreadPoolExecutor(max_workers=int(num_workers)) as executor:
-        return list(executor.map(_extract_sample_metadata, raw_paths, chunksize=128))
+        return MemoryBalanceMetadata.from_samples(
+            _extract_sample_metadata(path) for path in raw_paths
+        )
+    with ProcessPoolExecutor(
+        max_workers=int(num_workers), initializer=_init_metadata_worker
+    ) as executor:
+        samples = executor.map(_extract_sample_metadata, raw_paths, chunksize=128)
+        return MemoryBalanceMetadata.from_samples(samples)
 
 
 def _load_metadata_file(
     cache_path: Path, raw_paths: Sequence[str]
-) -> list[SampleMemoryMetadata] | None:
+) -> MemoryBalanceMetadata | None:
     if not cache_path.is_file():
         return None
     try:
@@ -144,20 +220,13 @@ def _load_metadata_file(
     if payload.get("fingerprint") != expected_fingerprint:
         return None
 
-    return [
-        SampleMemoryMetadata(
-            agent_count=int(agent_count),
-            current_valid_agent_count=int(current_valid_agent_count),
-            valid_agent_step_count=int(valid_agent_step_count),
-            map_count=int(map_count),
-        )
-        for agent_count, current_valid_agent_count, valid_agent_step_count, map_count in zip(
-            payload["agent_count"],
-            payload["current_valid_agent_count"],
-            payload["valid_agent_step_count"],
-            payload["map_count"],
-        )
-    ]
+    try:
+        metadata = _payload_to_metadata(payload)
+    except KeyError:
+        return None
+    if len(metadata) != len(raw_paths):
+        return None
+    return metadata
 
 
 def load_or_build_memory_metadata(
@@ -167,7 +236,7 @@ def load_or_build_memory_metadata(
     num_workers: int,
     build_on_missing: bool,
     lock_timeout_sec: int = 7200,
-) -> list[SampleMemoryMetadata]:
+) -> MemoryBalanceMetadata:
     """Load cached sample-size metadata, building it once when allowed.
 
     The cache intentionally stores only counts and a basename fingerprint. It
@@ -207,7 +276,7 @@ def load_or_build_memory_metadata(
                     "Timed out waiting for train memory-balance metadata cache: "
                     f"{resolved_cache_path}"
                 )
-            time.sleep(10)
+            time.sleep(1)
 
     try:
         loaded = _load_metadata_file(resolved_cache_path, raw_paths)
@@ -215,15 +284,7 @@ def load_or_build_memory_metadata(
             return loaded
 
         metadata = _build_metadata(raw_paths, num_workers=num_workers)
-        payload = {
-            "version": METADATA_VERSION,
-            "num_samples": len(raw_paths),
-            "fingerprint": fingerprint_raw_paths(raw_paths),
-            "agent_count": [item.agent_count for item in metadata],
-            "current_valid_agent_count": [item.current_valid_agent_count for item in metadata],
-            "valid_agent_step_count": [item.valid_agent_step_count for item in metadata],
-            "map_count": [item.map_count for item in metadata],
-        }
+        payload = _metadata_payload(metadata, raw_paths)
         tmp_path = resolved_cache_path.with_suffix(
             resolved_cache_path.suffix + f".tmp.{os.getpid()}"
         )
@@ -239,13 +300,23 @@ def load_or_build_memory_metadata(
 
 
 def memory_balance_weights(
-    metadata: Iterable[SampleMemoryMetadata],
+    metadata: MemoryBalanceMetadata | Iterable[SampleMemoryMetadata],
     *,
     agent_weight: float,
     current_valid_agent_weight: float,
     valid_agent_step_weight: float,
     map_weight: float,
 ) -> torch.Tensor:
+    if isinstance(metadata, MemoryBalanceMetadata):
+        return (
+            float(agent_weight) * metadata.agent_count.to(torch.float64)
+            + float(current_valid_agent_weight)
+            * metadata.current_valid_agent_count.to(torch.float64)
+            + float(valid_agent_step_weight)
+            * metadata.valid_agent_step_count.to(torch.float64)
+            + float(map_weight) * metadata.map_count.to(torch.float64)
+        )
+
     values = []
     for item in metadata:
         values.append(
