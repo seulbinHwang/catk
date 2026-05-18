@@ -110,7 +110,7 @@ def _patch_smart_flow_config() -> None:
     text = _replace_once(
         text=text,
         old="""    flow_window_steps: ${model.model_config.decoder.flow_window_steps}\n""",
-        new="""    flow_window_steps: ${model.model_config.decoder.flow_window_steps}\n    # false: 기존 방식. flow_window_steps 전체 미래가 유효한 anchor만 학습합니다.\n    # true: 가장 가까운 미래부터 연속으로 유효한 prefix만 loss를 주고 학습합니다.\n    use_prefix_valid_future_loss_mask: false\n""",
+        new="""    flow_window_steps: ${model.model_config.decoder.flow_window_steps}\n    # false: 기존 방식. flow_window_steps 전체 미래가 유효한 anchor만 학습합니다.\n    # true: 가장 가까운 미래부터 연속으로 유효한 prefix만 loss를 주고 학습합니다.\n    use_prefix_valid_future_loss_mask: true\n""",
         file_path=SMART_FLOW_CONFIG_PATH,
     )
     _write_text(SMART_FLOW_CONFIG_PATH, text)

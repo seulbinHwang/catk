@@ -24,7 +24,7 @@ python tools/apply_prefix_valid_future_loss_patch.py
 model:
   model_config:
     token_processor:
-      use_prefix_valid_future_loss_mask: false
+      use_prefix_valid_future_loss_mask: true
 ```
 
 3. `README.md`
