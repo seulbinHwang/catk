@@ -22,8 +22,8 @@ fi
 
 echo "[SMART_CACHE_UPLOAD] Using CPUSET=${CPUSET}, NUM_CPUS=${NUM_CPUS}"
 
-LOCAL_DIR="/media/user/E/dataset/womd_v1_3/SMART_cache"
-REMOTE_DIR="labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache"
+LOCAL_DIR="/media/user/E/dataset/womd_v1_3/SMART_cache_0519"
+REMOTE_DIR="labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache_0519"
 
 if [ ! -d "$LOCAL_DIR" ]; then
   echo "ERROR: Local directory not found: $LOCAL_DIR"

@@ -284,14 +284,14 @@ bash scripts/download_smart_cache_from_nubes.sh <remote_dir> <local_dir>
 
 ```bash
 bash scripts/download_smart_cache_from_nubes.sh \
-  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
+  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache_0519 \
   "$CACHE_ROOT"
 ```
 
 또는 환경변수로 넘겨도 됩니다.
 
 ```bash
-REMOTE_DIR=labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache \
+REMOTE_DIR=labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache_0519 \
 LOCAL_DIR="$CACHE_ROOT" \
 bash scripts/download_smart_cache_from_nubes.sh
 ```

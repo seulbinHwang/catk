@@ -23,7 +23,7 @@ import sys
 
 DEFAULT_SSH_HOST = "user@10.60.188.78"
 DEFAULT_REMOTE_PROJECT_ROOT = "/media/user/E/projects/catk"
-DEFAULT_REMOTE_CACHE_ROOT = "/media/user/E/dataset/womd_v1_3/SMART_cache"
+DEFAULT_REMOTE_CACHE_ROOT = "/media/user/E/dataset/womd_v1_3/SMART_cache_0519"
 DEFAULT_REMOTE_LOG_DIR = "/media/user/D/catk_fast_wosac_logs"
 DEFAULT_SOURCE_NAMESPACE = "p-pnc"
 DEFAULT_SOURCE_POD = "testsv"
