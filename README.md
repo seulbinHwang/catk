@@ -57,6 +57,13 @@ edge feature는 거리, 수신 agent 기준 상대 방향, 상대 heading으로 
 prefix-valid mask 때문에 미래가 없는 chunk는 radius graph의 node 후보에서 빼며, attention 뒤에도 해당 chunk 출력을 0으로 유지합니다.
 closed-loop rollout에서는 현재 살아 있는 active agent만 pack하므로 사라진 agent는 interaction graph에 들어가지 않습니다.
 
+`torch_cluster.radius_graph`는 batch index가 단조 비감소 순서로 들어와야 그룹 분리가 정상 동작하는 silent 가정이 있습니다.
+학습 packing은 anchor 단위로 묶여 `agent_batch * num_anchor + anchor_idx` group ID가 anchor 사이를 오갈 때마다 작은 값으로 떨어집니다.
+그대로 호출하면 GPU 경로에서 다른 (scene, anchor) group끼리 silent하게 엣지가 생겨 미래 anchor 정보가 학습 시 누수됩니다.
+그래서 `_build_same_chunk_edges`는 `radius_graph` 호출 직전에 `batch_s`를 `argsort`로 정렬해 노드 위치도 같이 재배열하고,
+받은 엣지 인덱스를 원래 순서로 되돌려 동일한 packing 의미를 유지합니다.
+회귀 테스트 `test_same_chunk_agent_attention_blocks_cross_anchor_leakage_*`가 production과 같은 패킹·위치 분포에서 cross-group 엣지가 0인지 CPU/GPU 양쪽에서 확인합니다.
+
 기본 control-flow 설정 기준 구조는 아래와 같습니다.
 
 | 순서 | 구조 | 입력 shape | 출력 shape | 파라미터 수 | 역할 |

@@ -650,13 +650,23 @@ class SameChunkAgentAttentionBlock(nn.Module):
         else:
             valid_mask = chunk_valid_mask.transpose(0, 1).reshape(-1).bool()
 
-        edge_index = radius_graph(
-            x=pos_s,
+        # ``radius_graph`` 는 batch가 단조 비감소 순서로 들어와야 그룹 분리가
+        # 정상 동작합니다. anchor 단위로 묶인 학습 패킹은 ``batch_s`` 가
+        # 정렬되어 있지 않아 silent하게 그룹을 가로지르는 엣지가 생성됩니다.
+        # 따라서 호출 직전에 한 번 정렬하고, 받은 엣지 인덱스를 원래 순서로
+        # 되돌립니다.
+        sort_order = torch.argsort(batch_s, stable=True)
+        pos_s_sorted = pos_s[sort_order]
+        batch_s_sorted = batch_s[sort_order]
+
+        edge_index_sorted = radius_graph(
+            x=pos_s_sorted,
             r=self.radius,
-            batch=batch_s,
+            batch=batch_s_sorted,
             loop=False,
             max_num_neighbors=self.max_num_neighbors,
         )
+        edge_index = sort_order[edge_index_sorted]
         edge_index = subgraph(subset=valid_mask, edge_index=edge_index)[0]
         rel_pos = pos_s[edge_index[0]] - pos_s[edge_index[1]]
         rel_head = wrap_angle(head_s[edge_index[0]] - head_s[edge_index[1]])
