@@ -4,6 +4,9 @@ import hashlib
 import math
 import os
 import pickle
+import shutil
+import socket
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -15,6 +18,9 @@ from torch.utils.data import Sampler
 
 
 METADATA_VERSION = 1
+DEFAULT_LOCK_STALE_SEC = 30.0
+DEFAULT_LOCK_POLL_SEC = 1.0
+LOCK_HEARTBEAT_INTERVAL_SEC = 5.0
 
 
 @dataclass(frozen=True)
@@ -170,6 +176,64 @@ def memory_metadata_lock_path(cache_path: str | Path) -> Path:
     return cache_path.with_suffix(cache_path.suffix + ".lock")
 
 
+def _metadata_lock_owner_path(lock_dir: Path) -> Path:
+    return lock_dir / "owner.txt"
+
+
+def _is_lock_stale(lock_dir: Path, stale_sec: float) -> bool:
+    if stale_sec <= 0:
+        return False
+    try:
+        lock_mtime = lock_dir.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    return time.time() - lock_mtime > stale_sec
+
+
+def _remove_lock_path(lock_dir: Path) -> bool:
+    try:
+        if lock_dir.is_dir():
+            shutil.rmtree(lock_dir)
+        else:
+            lock_dir.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def _remove_stale_lock_if_needed(lock_dir: Path, stale_sec: float) -> bool:
+    if not _is_lock_stale(lock_dir, stale_sec):
+        return False
+    return _remove_lock_path(lock_dir)
+
+
+def _start_lock_heartbeat(
+    lock_dir: Path,
+    stop_event: threading.Event,
+    stale_sec: float,
+) -> threading.Thread | None:
+    if stale_sec <= 0:
+        return None
+    interval = min(LOCK_HEARTBEAT_INTERVAL_SEC, max(1.0, stale_sec / 3.0))
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(interval):
+            try:
+                os.utime(lock_dir, None)
+            except FileNotFoundError:
+                return
+
+    thread = threading.Thread(
+        target=_heartbeat,
+        name="memory-balance-metadata-lock-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 def _as_int64_tensor(value) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.int64).cpu().flatten().contiguous()
 
@@ -242,6 +306,8 @@ def load_or_build_memory_metadata(
     num_workers: int,
     build_on_missing: bool,
     lock_timeout_sec: int = 7200,
+    lock_stale_sec: float = DEFAULT_LOCK_STALE_SEC,
+    lock_poll_sec: float = DEFAULT_LOCK_POLL_SEC,
 ) -> MemoryBalanceMetadata:
     """Load cached sample-size metadata, building it once when allowed.
 
@@ -266,6 +332,8 @@ def load_or_build_memory_metadata(
 
     resolved_cache_path.parent.mkdir(parents=True, exist_ok=True)
     lock_dir = memory_metadata_lock_path(resolved_cache_path)
+    lock_stale_sec = float(lock_stale_sec)
+    lock_poll_sec = max(0.1, float(lock_poll_sec))
     start_time = time.monotonic()
     owns_lock = False
     while True:
@@ -277,14 +345,26 @@ def load_or_build_memory_metadata(
             loaded = _load_metadata_file(resolved_cache_path, raw_paths)
             if loaded is not None:
                 return loaded
+            if _remove_stale_lock_if_needed(lock_dir, lock_stale_sec):
+                continue
             if time.monotonic() - start_time > lock_timeout_sec:
                 raise TimeoutError(
                     "Timed out waiting for train memory-balance metadata cache: "
                     f"{resolved_cache_path}"
                 )
-            time.sleep(1)
+            time.sleep(lock_poll_sec)
 
+    stop_heartbeat = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
     try:
+        _metadata_lock_owner_path(lock_dir).write_text(
+            f"pid={os.getpid()} host={socket.gethostname()} time={time.time()}\n"
+        )
+        heartbeat_thread = _start_lock_heartbeat(
+            lock_dir=lock_dir,
+            stop_event=stop_heartbeat,
+            stale_sec=lock_stale_sec,
+        )
         loaded = _load_metadata_file(resolved_cache_path, raw_paths)
         if loaded is not None:
             return loaded
@@ -298,11 +378,11 @@ def load_or_build_memory_metadata(
         os.replace(tmp_path, resolved_cache_path)
         return metadata
     finally:
+        stop_heartbeat.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1.0)
         if owns_lock:
-            try:
-                os.rmdir(lock_dir)
-            except OSError:
-                pass
+            _remove_lock_path(lock_dir)
 
 
 def memory_balance_weights(

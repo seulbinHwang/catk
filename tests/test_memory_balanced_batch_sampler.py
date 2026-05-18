@@ -1,6 +1,8 @@
+import os
 import pickle
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -177,5 +179,34 @@ def test_prebuild_force_removes_stale_lock_dir(tmp_path: Path) -> None:
     )
 
     assert "memory-balance metadata ready" in result.stdout
+    assert cache_path.is_file()
+    assert not lock_path.exists()
+
+
+def test_metadata_cache_reclaims_stale_lock_dir(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    raw_path = raw_dir / "sample.pkl"
+    _write_sample(raw_path, agent_count=2, current_valid=1, map_count=3)
+
+    cache_path = tmp_path / "metadata.pt"
+    lock_path = memory_metadata_lock_path(cache_path)
+    lock_path.mkdir()
+    (lock_path / "owner.txt").write_text("pid=999999 host=dead-builder time=0\n")
+    old_mtime = time.time() - 60.0
+    # Directory mtime is the stale-lock signal used by the loader.
+    os.utime(lock_path, (old_mtime, old_mtime))
+
+    metadata = load_or_build_memory_metadata(
+        [str(raw_path)],
+        cache_path=str(cache_path),
+        num_workers=1,
+        build_on_missing=True,
+        lock_timeout_sec=2,
+        lock_stale_sec=0.01,
+        lock_poll_sec=0.1,
+    )
+
+    assert metadata.agent_count.tolist() == [2]
     assert cache_path.is_file()
     assert not lock_path.exists()
