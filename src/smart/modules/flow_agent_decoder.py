@@ -75,7 +75,23 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         lqr_commit: DictConfig | None = None,
+        agent_num_freq_bands: int | None = None,
+        agent_head_dim: int | None = None,
     ) -> None:
+        resolved_agent_num_freq_bands = (
+            num_freq_bands if agent_num_freq_bands is None else int(agent_num_freq_bands)
+        )
+        resolved_agent_head_dim = head_dim if agent_head_dim is None else int(agent_head_dim)
+        if resolved_agent_num_freq_bands <= 0:
+            raise ValueError(
+                "agent_num_freq_bands must be positive, "
+                f"got {resolved_agent_num_freq_bands}."
+            )
+        if resolved_agent_head_dim <= 0:
+            raise ValueError(
+                "agent_head_dim must be positive, "
+                f"got {resolved_agent_head_dim}."
+            )
         super().__init__(
             hidden_dim=hidden_dim,
             num_historical_steps=num_historical_steps,
@@ -83,10 +99,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             time_span=time_span,
             pl2a_radius=pl2a_radius,
             a2a_radius=a2a_radius,
-            num_freq_bands=num_freq_bands,
+            num_freq_bands=resolved_agent_num_freq_bands,
             num_layers=num_layers,
             num_heads=num_heads,
-            head_dim=head_dim,
+            head_dim=resolved_agent_head_dim,
             dropout=dropout,
             hist_drop_prob=hist_drop_prob,
             n_token_agent=n_token_agent,
@@ -123,7 +139,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.r_a2a_emb = FourierEmbedding(
             input_dim=6,
             hidden_dim=hidden_dim,
-            num_freq_bands=num_freq_bands,
+            num_freq_bands=resolved_agent_num_freq_bands,
         )
         self.flow_decoder = HierarchicalFlowDecoder(
             context_dim=hidden_dim,

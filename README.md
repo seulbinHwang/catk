@@ -97,6 +97,39 @@ WOSAC RMM의 map-based 항목(`offroad_indication_likelihood`, `distance_to_road
 구조가 바뀌었기 때문에 이전 `HierarchicalFlowDecoder` checkpoint와 strict 로드는 호환되지 않습니다.
 이 브랜치에서는 새 pretrain을 기준으로 사용합니다.
 
+#### Agent-context 파라미터 보정
+
+same-chunk agent-agent attention으로 늘어난 **200,892개**를 보정하기 위해, flow local decoder가 아니라
+`SMARTFlowAgentDecoder`의 agent-context encoder에만 전용 폭 설정을 둡니다.
+
+```yaml
+model:
+  model_config:
+    decoder:
+      head_dim: 15
+      num_freq_bands: 64
+      agent_head_dim: 14
+      agent_num_freq_bands: 60
+```
+
+`head_dim`과 `num_freq_bands`는 map encoder와 `HierarchicalFlowDecoder`에 그대로 쓰이고,
+`agent_head_dim`과 `agent_num_freq_bands`만 `SMARTFlowAgentDecoder`의 context encoder에 적용됩니다.
+따라서 `HierarchicalFlowDecoder` 파라미터 수는 **691,071개로 유지**됩니다.
+
+실측 파라미터 변화는 아래와 같습니다.
+
+| 항목 | 기존 설정 | 보정 설정 | 변화 |
+|---|---:|---:|---:|
+| map encoder | 968,968 | 968,968 | 0 |
+| `HierarchicalFlowDecoder` | 691,071 | 691,071 | 0 |
+| `SMARTFlowAgentDecoder` 중 HFD 제외 영역 | 5,719,792 | 5,520,732 | -199,060 |
+| 전체 `SMARTFlowDecoder` | 7,379,831 | 7,180,771 | -199,060 |
+
+즉, 새 same-chunk block의 **+200,892개** 중 **199,060개**를 agent-context encoder에서 상쇄합니다.
+남는 차이는 **+1,832개**입니다. layer 수, attention head 수, graph radius, hidden dimension은 유지하고
+attention 내부 폭과 Fourier band만 줄이므로, agent 상호작용 구조 자체를 줄이는 것보다 WOSAC RMM 성능 하락 위험이 작습니다.
+이 설정은 agent-context encoder의 projection shape을 바꾸므로, 보정 전 checkpoint와 strict 로드는 호환되지 않습니다.
+
 ### Fast WOSAC Metric
 
 - TrajTok의 `wosac_fast_eval_tool.fast_sim_agents_metrics` 구현을 `src/smart/metrics/wosac_fast_eval_tool/` 아래에 vendoring했습니다.

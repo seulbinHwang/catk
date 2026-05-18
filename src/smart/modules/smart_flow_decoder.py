@@ -48,6 +48,8 @@ class SMARTFlowDecoder(nn.Module):
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         lqr_commit: DictConfig | None = None,
+        agent_num_freq_bands: int | None = None,
+        agent_head_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.map_encoder = SMARTMapDecoder(
@@ -92,6 +94,8 @@ class SMARTFlowDecoder(nn.Module):
             use_stop_motion=use_stop_motion,
             lqr_commit=lqr_commit,
             use_holonomic_model_only=use_holonomic_model_only,
+            agent_num_freq_bands=agent_num_freq_bands,
+            agent_head_dim=agent_head_dim,
         )
 
     def encode_map(self, tokenized_map: Dict[str, Tensor]) -> Dict[str, Tensor]:

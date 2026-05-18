@@ -106,6 +106,10 @@ model_config:
     num_freq_bands: 64
     num_heads: 8
     head_dim: 15
+    # SMARTFlowAgentDecoder의 context encoder에만 적용합니다.
+    # HierarchicalFlowDecoder는 위 head_dim/num_freq_bands 값을 그대로 유지합니다.
+    agent_num_freq_bands: 60
+    agent_head_dim: 14
     dropout: 0.1
     hist_drop_prob: 0.1
     num_map_layers: 3
