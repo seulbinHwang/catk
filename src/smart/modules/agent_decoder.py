@@ -454,13 +454,25 @@ class SMARTAgentDecoder(nn.Module):
             shift_steps=self.shift,
         )
         light_time_delta_flat = light_time_delta_norm.transpose(0, 1).reshape(-1)
-        edge_index_pl2a = radius(
-            x=pos_s[:, :2],
-            y=pos_pl[:, :2],
+        # torch_cluster.radius assumes grouped batch ids. With static map tokens,
+        # agent ids arrive as [scene0..N, scene0..N, ...] across time steps, so
+        # sort before radius and restore the original indices afterward.
+        sort_order_x = torch.argsort(batch_s, stable=True)
+        sort_order_y = torch.argsort(batch_pl, stable=True)
+        edge_index_pl2a_sorted = radius(
+            x=pos_s[sort_order_x, :2],
+            y=pos_pl[sort_order_y, :2],
             r=self.pl2a_radius,
-            batch_x=batch_s,
-            batch_y=batch_pl,
+            batch_x=batch_s[sort_order_x],
+            batch_y=batch_pl[sort_order_y],
             max_num_neighbors=300,
+        )
+        edge_index_pl2a = torch.stack(
+            [
+                sort_order_y[edge_index_pl2a_sorted[0]],
+                sort_order_x[edge_index_pl2a_sorted[1]],
+            ],
+            dim=0,
         )
         edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
         edge_light_type = light_type[edge_index_pl2a[0]]

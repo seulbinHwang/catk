@@ -166,6 +166,12 @@ SMART NTP decoder는 static map feature를 시간 step마다 복제하지 않고
 agent node가 같은 map feature를 참조한다. 지도 자체는 시간에 따라 바뀌지 않고, traffic
 light처럼 시간 의존적인 값은 map-agent edge feature로 들어가므로, 이 방식은 objective를
 바꾸지 않으면서 H100x4x2 batch 26 학습의 map-agent attention 메모리 사용량을 줄인다.
+이때 agent node는 시간축으로 펼쳐져 scene id 순서가 step마다 반복되므로, map-agent
+radius graph를 만들기 전에 batch id를 정렬하고 edge index를 원래 순서로 되돌린다.
+이 보정이 없으면 다른 scene의 지도가 섞이지는 않더라도, 같은 scene 안에서 agent가
+봐야 할 map edge가 일부 조용히 누락될 수 있다. 따라서 현재 main의 SMART NTP 학습과
+추론은 static map token을 유지하면서도 각 agent/time-step이 의도한 같은-scene map
+context를 빠짐없이 받도록 처리한다.
 
 이 preset은 `data.train_memory_balanced_batching=true`도 켠다. 이 sampler는 각 training
 pickle의 agent 수, valid agent-step 수, map point 수를 metadata cache로 한 번 기록한 뒤,
