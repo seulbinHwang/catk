@@ -732,8 +732,19 @@ class SameChunkAgentAttentionBlock(nn.Module):
             num_anchor=num_anchor,
             device=chunk_tokens.device,
         )
-        interaction_pos = interaction_pos.to(device=chunk_tokens.device, dtype=chunk_tokens.dtype)
-        interaction_head = interaction_head.to(device=chunk_tokens.device, dtype=chunk_tokens.dtype)
+        # ``bf16-mixed`` 학습에서 ``chunk_tokens.dtype`` 은 ``bfloat16`` 이지만,
+        # Waymo 좌표는 수천~수만 m 까지 커질 수 있어 bf16 으로 내리면 위치
+        # 해상도가 m 단위 이상으로 거칠어집니다. 그러면 60m radius graph 의
+        # 엣지가 빠지거나 잘못 생겨 학습 시 graph topology 가 흔들립니다.
+        # 따라서 graph 구성과 edge feature 계산에 쓰이는 좌표·heading 은
+        # 항상 float32 로 유지하고, 이후 Fourier embedding 의 nn.Linear 가
+        # autocast 로 attention dtype 에 맞게 결과를 캐스팅하도록 둡니다.
+        interaction_pos = interaction_pos.to(
+            device=chunk_tokens.device, dtype=torch.float32
+        )
+        interaction_head = interaction_head.to(
+            device=chunk_tokens.device, dtype=torch.float32
+        )
         edge_index, edge_attr = self._build_same_chunk_edges(
             interaction_pos=interaction_pos,
             interaction_head=interaction_head,

@@ -64,6 +64,13 @@ closed-loop rollout에서는 현재 살아 있는 active agent만 pack하므로 
 받은 엣지 인덱스를 원래 순서로 되돌려 동일한 packing 의미를 유지합니다.
 회귀 테스트 `test_same_chunk_agent_attention_blocks_cross_anchor_leakage_*`가 production과 같은 패킹·위치 분포에서 cross-group 엣지가 0인지 CPU/GPU 양쪽에서 확인합니다.
 
+`bf16-mixed` 학습에서는 `chunk_tokens.dtype`이 `bfloat16`이라 graph 구성용 좌표도 같이 bf16으로 내려가면 m 단위 해상도 손실이 발생합니다.
+Waymo 좌표는 수천~수만 m까지 커질 수 있어 bf16 캐스팅 시 60m radius graph 경계 근처 엣지가 빠지거나 잘못 생성됩니다.
+그래서 `forward`는 `interaction_pos` / `interaction_head`를 항상 `float32`로 끌어올려 `_build_same_chunk_edges`에 넘기고,
+Fourier embedding 안 `nn.Linear`가 autocast로 결과를 attention dtype에 맞게 캐스팅하도록 둡니다.
+회귀 테스트 `test_same_chunk_agent_attention_keeps_graph_coords_fp32_when_tokens_are_bf16`과
+`test_same_chunk_agent_attention_bf16_input_pos_promoted_to_fp32`가 bf16 입력 시에도 graph 좌표가 fp32로 유지되는지 보장합니다.
+
 기본 control-flow 설정 기준 구조는 아래와 같습니다.
 
 | 순서 | 구조 | 입력 shape | 출력 shape | 파라미터 수 | 역할 |

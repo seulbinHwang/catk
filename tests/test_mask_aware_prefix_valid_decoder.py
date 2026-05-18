@@ -383,6 +383,123 @@ def test_same_chunk_agent_attention_blocks_cross_anchor_leakage_gpu() -> None:
     )
 
 
+class _BlockAbort(Exception):
+    """Spy 가 dtype 만 캡처하고 attention 까지 가지 않도록 사용하는 sentinel."""
+
+
+def _spy_build_same_chunk_edges(block, captured: dict) -> None:
+    """``_build_same_chunk_edges`` 호출 직전 좌표 dtype 만 캡처하고 즉시 중단합니다.
+
+    이렇게 하면 attention 단까지 가지 않으니 bf16/fp32 dtype 혼합으로 인한
+    nn.Linear 충돌 없이 graph 경로 dtype 만 검증할 수 있습니다.
+    """
+
+    def capture_dtypes(*args, **kwargs):
+        captured["pos_dtype"] = kwargs["interaction_pos"].dtype
+        captured["head_dtype"] = kwargs["interaction_head"].dtype
+        raise _BlockAbort
+
+    block._build_same_chunk_edges = capture_dtypes  # type: ignore[assignment]
+
+
+def test_same_chunk_agent_attention_keeps_graph_coords_fp32_when_tokens_are_bf16() -> None:
+    """``chunk_tokens.dtype`` 이 bf16 일 때도 graph 좌표가 fp32 로 유지되는지 확인합니다.
+
+    Waymo 좌표는 수천~수만 m 까지 커집니다. 이전 코드는 ``interaction_pos`` 와
+    ``interaction_head`` 를 ``chunk_tokens.dtype`` 으로 캐스팅했기 때문에
+    bf16-mixed 학습 경로에서 좌표 해상도가 m 단위 이상으로 거칠어졌습니다.
+    수정 후에는 ``forward`` 가 graph 경로 좌표를 항상 float32 로 유지하므로,
+    bf16 토큰 입력에 대해서도 ``_build_same_chunk_edges`` 가 받는 좌표는
+    fp32 여야 합니다.
+    """
+    torch.manual_seed(0)
+    block = SameChunkAgentAttentionBlock(
+        flow_dim=16,
+        num_heads=4,
+        head_dim=4,
+        num_freq_bands=64,
+        radius=60.0,
+    )
+
+    captured: dict[str, torch.dtype] = {}
+    _spy_build_same_chunk_edges(block, captured)
+
+    num_anchor = 8
+    chunk_tokens = torch.randn(num_anchor, 4, 16, dtype=torch.bfloat16)
+    context = torch.randn(num_anchor, 16, dtype=torch.bfloat16)
+    tau_emb = torch.randn(num_anchor, 16, dtype=torch.bfloat16)
+    interaction_pos = torch.randn(num_anchor, 2) * 50.0 + torch.tensor(
+        [10000.0, 5000.0]
+    )
+    interaction_head = torch.zeros(num_anchor)
+    interaction_group = torch.zeros(num_anchor, dtype=torch.long)
+
+    try:
+        _ = block.forward(
+            chunk_tokens=chunk_tokens,
+            context=context,
+            tau_emb=tau_emb,
+            interaction_group=interaction_group,
+            interaction_pos=interaction_pos,
+            interaction_head=interaction_head,
+        )
+    except _BlockAbort:
+        pass
+
+    assert captured["pos_dtype"] == torch.float32, (
+        f"graph 좌표가 fp32 가 아닙니다: {captured['pos_dtype']}"
+    )
+    assert captured["head_dtype"] == torch.float32, (
+        f"graph heading 이 fp32 가 아닙니다: {captured['head_dtype']}"
+    )
+
+
+def test_same_chunk_agent_attention_bf16_input_pos_promoted_to_fp32() -> None:
+    """호출자가 실수로 bf16 좌표를 넘겨도 ``forward`` 가 fp32 로 끌어올려야 합니다.
+
+    학습 단에서는 데이터셋 좌표가 fp32 로 들어오지만, 외부 호출 경로에서 잘못
+    bf16 으로 캐스팅된 좌표가 들어와도 graph 구성 단계 좌표는 fp32 로 다시
+    promote 되어 m 단위 해상도 손실이 없어야 합니다.
+    """
+    torch.manual_seed(0)
+    block = SameChunkAgentAttentionBlock(
+        flow_dim=16,
+        num_heads=4,
+        head_dim=4,
+        num_freq_bands=64,
+        radius=60.0,
+    )
+
+    captured: dict[str, torch.dtype] = {}
+    _spy_build_same_chunk_edges(block, captured)
+
+    num_anchor = 6
+    chunk_tokens = torch.randn(num_anchor, 4, 16, dtype=torch.bfloat16)
+    context = torch.randn(num_anchor, 16, dtype=torch.bfloat16)
+    tau_emb = torch.randn(num_anchor, 16, dtype=torch.bfloat16)
+    # 호출자가 잘못 bf16 으로 캐스팅한 Waymo-스케일 좌표를 흉내냅니다.
+    interaction_pos = (
+        torch.randn(num_anchor, 2) * 50.0 + torch.tensor([10000.0, 5000.0])
+    ).to(dtype=torch.bfloat16)
+    interaction_head = torch.zeros(num_anchor, dtype=torch.bfloat16)
+    interaction_group = torch.zeros(num_anchor, dtype=torch.long)
+
+    try:
+        _ = block.forward(
+            chunk_tokens=chunk_tokens,
+            context=context,
+            tau_emb=tau_emb,
+            interaction_group=interaction_group,
+            interaction_pos=interaction_pos,
+            interaction_head=interaction_head,
+        )
+    except _BlockAbort:
+        pass
+
+    assert captured["pos_dtype"] == torch.float32
+    assert captured["head_dtype"] == torch.float32
+
+
 def test_default_control_decoder_parameter_count_includes_agent_chunk_attention() -> None:
     decoder = HierarchicalFlowDecoder(
         context_dim=128,
