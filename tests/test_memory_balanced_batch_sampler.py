@@ -121,6 +121,23 @@ def test_metadata_cache_rejects_same_filenames_from_different_root(tmp_path: Pat
         raise AssertionError("metadata cache should be stale for a different cache root")
 
 
+def test_corrupt_metadata_cache_rebuilds_when_allowed(tmp_path: Path) -> None:
+    raw_path = tmp_path / "sample.pkl"
+    _write_sample(raw_path, agent_count=2, current_valid=1, map_count=3)
+    cache_path = tmp_path / "metadata.pt"
+    cache_path.write_bytes(b"")
+
+    metadata = load_or_build_memory_metadata(
+        [str(raw_path)],
+        cache_path=str(cache_path),
+        num_workers=1,
+        build_on_missing=True,
+    )
+
+    assert metadata.agent_count.tolist() == [2]
+    assert cache_path.stat().st_size > 0
+
+
 def test_old_list_payload_still_loads(tmp_path: Path) -> None:
     raw_paths = [str(tmp_path / "a.pkl"), str(tmp_path / "b.pkl")]
     cache_path = tmp_path / "old_metadata.pt"

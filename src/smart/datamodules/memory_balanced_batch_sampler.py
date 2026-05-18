@@ -279,9 +279,12 @@ def _load_metadata_file(
     if not cache_path.is_file():
         return None
     try:
-        payload = torch.load(cache_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        payload = torch.load(cache_path, map_location="cpu")
+        try:
+            payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            payload = torch.load(cache_path, map_location="cpu")
+    except (EOFError, OSError, RuntimeError, ValueError, pickle.UnpicklingError):
+        return None
     expected_fingerprint = fingerprint_raw_paths(raw_paths)
     if payload.get("version") != METADATA_VERSION:
         return None

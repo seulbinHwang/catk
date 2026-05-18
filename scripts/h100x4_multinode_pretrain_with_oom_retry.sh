@@ -173,10 +173,11 @@ copy_memory_balance_metadata_from_master() {
 set -euo pipefail
 test -s ${metadata_cache_q}
 cat ${metadata_cache_q}
-" | kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
+" | kubectl exec -i -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
 set -euo pipefail
 mkdir -p \"\$(dirname ${metadata_cache_q})\"
 cat > ${tmp_cache_q}
+test -s ${tmp_cache_q}
 mv ${tmp_cache_q} ${metadata_cache_q}
 "
 }
