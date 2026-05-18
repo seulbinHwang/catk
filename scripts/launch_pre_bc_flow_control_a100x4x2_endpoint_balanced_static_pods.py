@@ -68,6 +68,17 @@ def metadata_cache_path(args: argparse.Namespace) -> str:
     return f"{args.remote_log_dir.rstrip('/')}/{DEFAULT_METADATA_CACHE_RELATIVE}"
 
 
+def training_extra_hydra_overrides(args: argparse.Namespace) -> str:
+    overrides: list[str] = []
+    if args.extra_hydra_overrides:
+        overrides.append(args.extra_hydra_overrides)
+    if args.metadata_cache_path:
+        overrides.append(
+            f"data.train_memory_balance_metadata_cache={args.metadata_cache_path}"
+        )
+    return " ".join(overrides)
+
+
 def remote_git_prepare_script(args: argparse.Namespace) -> str:
     branch_ref = f"refs/heads/{args.branch}"
     origin_ref = f"origin/{args.branch}"
@@ -297,8 +308,9 @@ def main() -> int:
         command.extend(["--limit-val-batches", args.limit_val_batches])
     if args.max_epochs:
         command.extend(["--max-epochs", args.max_epochs])
-    if args.extra_hydra_overrides:
-        command.extend(["--extra-hydra-overrides", args.extra_hydra_overrides])
+    extra_hydra_overrides = training_extra_hydra_overrides(args)
+    if extra_hydra_overrides:
+        command.extend(["--extra-hydra-overrides", extra_hydra_overrides])
     if args.cache_root:
         for pod in args.pods:
             command.extend(["--pod-cache-root", f"{pod}={args.cache_root}"])
