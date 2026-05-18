@@ -41,7 +41,7 @@ DEFAULT_PODS = (
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_v100x47_prefix_default_noslip"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_"
-    "roundtrip05_lr6e-4_bs5"
+    "roundtrip05_lr6e-4_bs4"
 )
 DEFAULT_SESSION = "catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix"
 
@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
         default="gpu",
         help="Use 'gpu' to spawn one worker per visible GPU on each pod.",
     )
-    parser.add_argument("--initial-bs", type=int, default=5)
+    parser.add_argument("--initial-bs", type=int, default=4)
     parser.add_argument(
         "--oom-step",
         type=int,

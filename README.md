@@ -704,16 +704,16 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 - `model.model_config.token_processor.control_cyclist_no_slip_point_ratio=0.0495847873`
 - `model.model_config.token_processor.control_round_trip_max_position_error_m=0.5`
 - `trainer.precision=16-mixed`
-- `data.train_batch_size=5`, effective global batch `5 * 47 = 235`
+- `data.train_batch_size=4`, effective global batch `4 * 47 = 188`
 - `data.train_use_eval_agent_selection=false`
 - `data.train_memory_balanced_batches=true`
 - `data.train_memory_balance_metadata_cache=${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt`
 - `data.train_memory_balance_build_on_missing=false`
 - `trainer.use_distributed_sampler=false`
 
-`data.train_batch_size=5`는 `train_use_eval_agent_selection=false`로 학습 agent 수를 기본 train transform 기준으로 제한하는 전략에 맞춘 값입니다. A100x4x2 run의 effective global batch는 `26 * 8 = 208`이므로 완전히 같지는 않지만, V100 47GPU fleet에서는 effective global batch가 `235`가 되고 lr은 A100 run과 같은 `6e-4`로 고정합니다.
+`data.train_batch_size=4`는 `train_use_eval_agent_selection=false`로 학습 agent 수를 기본 train transform 기준으로 제한하면서도 V100 32GB에서 더 보수적으로 운용하기 위한 값입니다. A100x4x2 run의 effective global batch는 `26 * 8 = 208`이므로 완전히 같지는 않지만, V100 47GPU fleet에서는 effective global batch가 `188`이 되고 lr은 A100 run과 같은 `6e-4`로 고정합니다.
 
-이 preset은 `train_use_eval_agent_selection=false`를 사용하므로 학습에서는 기본 train transform의 agent selection을 따릅니다. memory-balanced batch sampler는 그대로 켜 두어 pkl별 `agent_count`, current-step valid agent 수, map polyline 수를 기준으로 무거운 scene이 한 rank local batch에 몰리지 않도록 index 순서만 재배치합니다. 모델, loss, per-rank batch size, effective global batch `235`는 바꾸지 않고, 학습 objective도 그대로입니다.
+이 preset은 `train_use_eval_agent_selection=false`를 사용하므로 학습에서는 기본 train transform의 agent selection을 따릅니다. memory-balanced batch sampler는 그대로 켜 두어 pkl별 `agent_count`, current-step valid agent 수, map polyline 수를 기준으로 무거운 scene이 한 rank local batch에 몰리지 않도록 index 순서만 재배치합니다. 모델, loss, per-rank batch size, effective global batch `188`은 바꾸지 않고, 학습 objective도 그대로입니다.
 
 `shuffle=true`일 때 balanced batch sampler는 Lightning의 epoch hook을 받아 매 epoch `seed + epoch`으로 새 순서를 만듭니다. 즉 memory-balanced 제약은 유지하되, epoch마다 같은 batch 순서가 반복되지는 않습니다.
 
@@ -729,9 +729,9 @@ $REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt
 
 metadata build 중인 프로세스는 `.lock` 디렉터리 heartbeat를 갱신합니다. 프로세스가 죽어 heartbeat가 끊긴 stale lock은 기본 30초 뒤 자동 회수되므로, 이전 prebuild 실패 때문에 다음 V100x47 실행이 2시간씩 대기하지 않습니다. metadata를 강제로 다시 만들려면 `--force-memory-metadata-rebuild`를 붙입니다. 다른 metadata build가 실제로 실행 중일 때는 쓰지 않습니다. preflight를 명시적으로 건너뛰어야 하는 특수 상황에서는 `--skip-memory-metadata-preflight`를 붙일 수 있지만, 그러면 cache가 없거나 stale일 때 학습 시작 전에 실패합니다. cache가 없는 상태에서 ad-hoc으로 학습 프로세스 안에서 build까지 허용해야 할 때만 `data.train_memory_balance_build_on_missing=true`를 override합니다.
 
-이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=5`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, `5 -> 4`처럼 batch를 낮추지 않습니다. 다만 같은 batch size에서 반복 OOM이 무한히 이어지는 것을 막기 위해 기본 `--max-same-bs-oom-retries=3` 이후에는 중단합니다.
+이 전용 launcher는 OOM fallback을 끄는 것이 기본값입니다. CUDA OOM이 어느 pod 로그에서든 관측되면 전체 multi-node job을 정리하고 rank 0의 최신 `epoch_last.ckpt`를 기준 checkpoint로 확정해 peer pod로 동기화한 뒤, `train_batch_size=4`를 유지한 채 같은 설정으로 다시 시작합니다. 즉 기본 `--oom-step=0`이며, batch를 더 낮추지 않습니다. 다만 같은 batch size에서 반복 OOM이 무한히 이어지는 것을 막기 위해 기본 `--max-same-bs-oom-retries=3` 이후에는 중단합니다.
 
-기본 실험 이름은 `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs5`이고, tmux session 이름은 `catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix`입니다.
+기본 실험 이름은 `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4`이고, tmux session 이름은 `catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix`입니다.
 
 실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:
 
@@ -741,7 +741,7 @@ python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_p
 
 ##### V100 47GPU latest semi_control_stable_original tail-prefix run
 
-기존 V100x47 tail-prefix 계열 설정은 유지하되, `semi_control_stable_original` 최신 코드에서 `train_use_eval_agent_selection=false`, `train_batch_size=5` 전략으로 새 실험을 시작하려면 아래 wrapper를 씁니다. 이 wrapper는 같은 preset과 같은 V100 47GPU fleet를 쓰지만, 기존 run과 log/checkpoint/W&B task name이 섞이지 않도록 기본 task/session 이름만 분리합니다.
+기존 V100x47 tail-prefix 계열 설정은 유지하되, `semi_control_stable_original` 최신 코드에서 `train_use_eval_agent_selection=false`, `train_batch_size=4` 전략으로 새 실험을 시작하려면 아래 wrapper를 씁니다. 이 wrapper는 같은 preset과 같은 V100 47GPU fleet를 쓰지만, 기존 run과 log/checkpoint/W&B task name이 섞이지 않도록 기본 task/session 이름만 분리합니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_latest_static_pods.py --replace
@@ -753,13 +753,13 @@ python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_latest_s
 | 내부 base launcher | `scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py` |
 | branch | `semi_control_stable_original` 최신 head. `--git-ref`를 넘기지 않으면 각 pod에서 launch 시점의 branch head를 checkout |
 | experiment config | `configs/experiment/pre_bc_flow_control_v100x47_prefix_default_noslip.yaml` |
-| 기본 task name | `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs5_stable_original_latest` |
-| 기존 W&B run과의 차이 | 동일 계열 설정이지만 최신 `semi_control_stable_original` 코드 기준이며, `train_use_eval_agent_selection=false`, `train_batch_size=5`를 사용. 기존 task name을 재사용하지 않아 과거 run resume/log 혼선을 피함 |
+| 기본 task name | `flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4_stable_original_latest` |
+| 기존 W&B run과의 차이 | 동일 계열 설정이지만 최신 `semi_control_stable_original` 코드 기준이며, `train_use_eval_agent_selection=false`, `train_batch_size=4`를 사용. 기존 task name을 재사용하지 않아 과거 run resume/log 혼선을 피함 |
 | pod / GPU | `sv svv svvv svvvv testsv testsvv testsvvv testsvvvv fv fvv fvvv fvvvv fvvvvv`, 총 V100 47 rank |
 | context / anchor | `FLOW_CONTEXT_TOKEN_COUNT=18`, `FLOW_TRAIN_ANCHOR_COUNT=16` |
 | Flow target mask | `use_prefix_valid_future_loss_mask=true`: tail anchor의 없는 미래 suffix는 loss와 future-step decoding에서 제외 |
 | map-agent edge fix | `bba4a5b` 이후 코드 포함: map-agent `radius` 호출 전 batch 정렬로 same-scene map edge silent drop 방지 |
-| batch / lr | per-rank `train_batch_size=5`, effective global batch `235`, `lr=6e-4` |
+| batch / lr | per-rank `train_batch_size=4`, effective global batch `188`, `lr=6e-4` |
 | train agent selection | `train_use_eval_agent_selection=false`: 학습에서는 기본 train agent selection을 사용 |
 | metadata preflight | 13개 V100 pod 전체에서 memory-balanced metadata를 학습 시작 전에 생성/복사/검증. latest wrapper는 다른 V100 run과 cache 파일을 공유하지 않도록 기본 `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_v1_stable_original_latest.pt`를 사용하고, 같은 path를 `data.train_memory_balance_metadata_cache`에도 넘김. stale `.lock`은 heartbeat 기준 기본 30초 뒤 자동 회수 |
 | stale run cleanup | `--replace` 정리 시 stale `torchrun_pgid`가 현재 cleanup shell process group과 충돌하거나 같은 task 프로세스가 없으면 group kill을 건너뛰고 pgid 파일만 회수함 |
@@ -780,7 +780,7 @@ tmux new-session -d -s catk-v100x47-stable-original-latest-controller \
   "set -o pipefail; PYTHONUNBUFFERED=1 python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_latest_static_pods.py --replace 2>&1 | tee -a logs/_manual_launch/v100x47_prefix_default_noslip_latest.out; echo controller_exit=\${PIPESTATUS[0]}; exec bash"
 ```
 
-local controller 로그는 `logs/_manual_launch/v100x47_prefix_default_noslip_latest.out`에 남고, attempt별 통합 로그는 `logs/_h100x4_multinode_pretrain_oom_retry/flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs5_stable_original_latest/` 아래에 저장됩니다.
+local controller 로그는 `logs/_manual_launch/v100x47_prefix_default_noslip_latest.out`에 남고, attempt별 통합 로그는 `logs/_h100x4_multinode_pretrain_oom_retry/flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4_stable_original_latest/` 아래에 저장됩니다.
 
 latest run tmux 확인:
 

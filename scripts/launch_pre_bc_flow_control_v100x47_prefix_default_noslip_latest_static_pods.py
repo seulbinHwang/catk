@@ -6,7 +6,7 @@ launcher and only changes the default task/session names so a latest
 ``semi_control_stable_original`` run does not accidentally resume or mix with the older
 W&B run:
 
-    flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs5
+    flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ BASE_LAUNCHER = Path(__file__).with_name(
 
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_"
-    "roundtrip05_lr6e-4_bs5_stable_original_latest"
+    "roundtrip05_lr6e-4_bs4_stable_original_latest"
 )
 DEFAULT_SESSION = (
     "catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix-stable-original-latest"

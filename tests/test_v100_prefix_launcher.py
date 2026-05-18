@@ -47,7 +47,7 @@ def test_latest_prefix_v100_launcher_uses_distinct_task_name() -> None:
     assert "--branch semi_control_stable_original" in result.stdout
     assert (
         "flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_"
-        "roundtrip05_lr6e-4_bs5_stable_original_latest"
+        "roundtrip05_lr6e-4_bs4_stable_original_latest"
     ) in result.stdout
     assert (
         "catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix-"
