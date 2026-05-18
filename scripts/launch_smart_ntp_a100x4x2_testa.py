@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch SMART NTP H100x4x2 pretrain on hsb-npc-training{,2}.
+"""Launch SMART NTP A100x4x2 pretrain on testa/testaa.
 
 This launcher never creates, deletes, or restarts pods. It only runs
 ``kubectl exec`` against already-running pods and starts/kills tmux sessions
@@ -17,17 +17,17 @@ import sys
 
 
 DEFAULT_NAMESPACE = "p-pnc"
-DEFAULT_PODS = ["hsb-npc-training", "hsb-npc-training2"]
+DEFAULT_PODS = ["testa", "testaa"]
 DEFAULT_BRANCH = "main"
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_CACHE_ROOT_BY_POD = {
-    "hsb-npc-training": "/mnt/nuplan/womd_v1_3/SMART_cache",
-    "hsb-npc-training2": "/workspace/womd_v1_3/SMART_cache",
+    "testa": "/workspace/womd_v1_3/SMART_cache",
+    "testaa": "/workspace/womd_v1_3/SMART_cache",
 }
-STRICT_BATCH26_EXPERIMENT = "pre_bc_h100x4x2"
-STRICT_TRAIN_BATCH_SIZE = "26"
+STRICT_A100_EXPERIMENT = "pre_bc_a100x4x2"
+STRICT_TRAIN_BATCH_SIZE = "20"
 STRICT_ACCUMULATE_GRAD_BATCHES = "1"
 
 
@@ -93,15 +93,15 @@ def split_extra_hydra_overrides(overrides: str) -> list[str]:
         raise ValueError(f"--extra-hydra-overrides is not shell-parseable: {exc}") from exc
 
 
-def validate_strict_batch26_pretrain(args: argparse.Namespace) -> None:
+def validate_strict_a100_pretrain(args: argparse.Namespace) -> None:
     if args.stop:
         return
-    if args.action != "fit" or args.experiment != STRICT_BATCH26_EXPERIMENT:
+    if args.action != "fit" or args.experiment != STRICT_A100_EXPERIMENT:
         return
 
     if args.train_batch_size and args.train_batch_size != STRICT_TRAIN_BATCH_SIZE:
         raise ValueError(
-            f"{STRICT_BATCH26_EXPERIMENT} must use train_batch_size="
+            f"{STRICT_A100_EXPERIMENT} must use train_batch_size="
             f"{STRICT_TRAIN_BATCH_SIZE}, but got --train-batch-size "
             f"{args.train_batch_size!r}."
         )
@@ -110,7 +110,7 @@ def validate_strict_batch26_pretrain(args: argparse.Namespace) -> None:
         and args.accumulate_grad_batches != STRICT_ACCUMULATE_GRAD_BATCHES
     ):
         raise ValueError(
-            f"{STRICT_BATCH26_EXPERIMENT} must use accumulate_grad_batches="
+            f"{STRICT_A100_EXPERIMENT} must use accumulate_grad_batches="
             f"{STRICT_ACCUMULATE_GRAD_BATCHES}, but got "
             f"--accumulate-grad-batches {args.accumulate_grad_batches!r}."
         )
@@ -120,14 +120,14 @@ def validate_strict_batch26_pretrain(args: argparse.Namespace) -> None:
             value = override.split("=", 1)[1]
             if value != STRICT_TRAIN_BATCH_SIZE:
                 raise ValueError(
-                    f"{STRICT_BATCH26_EXPERIMENT} must use data.train_batch_size="
+                    f"{STRICT_A100_EXPERIMENT} must use data.train_batch_size="
                     f"{STRICT_TRAIN_BATCH_SIZE}, but got override {override!r}."
                 )
         elif override.startswith("trainer.accumulate_grad_batches="):
             value = override.split("=", 1)[1]
             if value != STRICT_ACCUMULATE_GRAD_BATCHES:
                 raise ValueError(
-                    f"{STRICT_BATCH26_EXPERIMENT} must use "
+                    f"{STRICT_A100_EXPERIMENT} must use "
                     f"trainer.accumulate_grad_batches="
                     f"{STRICT_ACCUMULATE_GRAD_BATCHES}, but got override "
                     f"{override!r}."
@@ -202,7 +202,7 @@ echo "[tmux-run] started at $(date '+%F %T')"
 echo "[tmux-run] attach survives after exit; press Ctrl-b d to detach"
 echo
 
-bash scripts/smart_ntp_h100x4x2_pretrain.sh
+bash scripts/smart_ntp_a100x4x2_pretrain.sh
 status=$?
 echo
 echo "[tmux-run] exited with status $status at $(date '+%F %T')"
@@ -232,7 +232,7 @@ def render_start_command(
     task_name: str,
 ) -> str:
     safe_task = task_name.replace("/", "_")
-    run_root = f"{args.log_dir.rstrip('/')}/tmux_smart_ntp_h100x4x2/{safe_task}"
+    run_root = f"{args.log_dir.rstrip('/')}/tmux_smart_ntp_a100x4x2/{safe_task}"
     env_file = f"{run_root}/{pod}.env"
     run_file = f"{run_root}/{pod}_run.sh"
     monitor_file = f"{run_root}/{pod}_monitor.sh"
@@ -375,7 +375,7 @@ def exec_in_pod(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Start SMART NTP H100x4x2 pretrain in tmux on existing pods.",
+        description="Start SMART NTP A100x4x2 pretrain in tmux on existing pods.",
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", DEFAULT_NAMESPACE))
     parser.add_argument(
@@ -422,9 +422,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="With --auto-resume, start from scratch if no checkpoint is found.",
     )
-    parser.add_argument("--experiment", default="pre_bc_h100x4x2")
+    parser.add_argument("--experiment", default="pre_bc_a100x4x2")
     parser.add_argument("--task-name", default="")
-    parser.add_argument("--session", default="catk-smart-ntp-h100x4x2")
+    parser.add_argument("--session", default="catk-smart-ntp-a100x4x2")
     parser.add_argument("--master-addr", default="")
     parser.add_argument("--master-port", default="29521")
     parser.add_argument("--nproc-per-node", default="4")
@@ -454,12 +454,12 @@ def parse_args() -> argparse.Namespace:
     except ValueError as exc:
         parser.error(str(exc))
     try:
-        validate_strict_batch26_pretrain(args)
+        validate_strict_a100_pretrain(args)
     except ValueError as exc:
         parser.error(str(exc))
 
     if len(args.pods) != 2 and not args.stop:
-        parser.error("this preset expects exactly two H100x4 pods")
+        parser.error("this preset expects exactly two A100x4 pods")
     if args.action in {"validate", "test"} and not args.ckpt_path and not args.stop:
         parser.error(f"--ckpt-path is required when --action={args.action}")
     if args.monitor_interval < 1:
@@ -468,7 +468,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--nproc-per-node must be a positive integer")
     if not args.task_name:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.task_name = f"smart_ntp_pretrain_h100x4x2_{stamp}"
+        args.task_name = f"smart_ntp_pretrain_a100x4x2_{stamp}"
     return args
 
 

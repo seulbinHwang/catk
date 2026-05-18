@@ -1,14 +1,14 @@
 # @package _global_
 
-# SMART NTP pretrain preset for two H100x4 nodes.
+# SMART NTP pretrain preset for two A100x4 nodes.
 #
 # This config intentionally keeps the SMART model, tokenization, loss, and
 # sampling logic from `pre_bc`. Only the training/runtime recipe is aligned with
-# the H100x4x2 flow-control pretrain recipe used on semi_control_stable:
+# the A100x4x2 flow-control pretrain recipe used on semi_control_stable:
 #   * 2 nodes
-#   * 4 H100 80GB GPUs per node
+#   * 4 A100 80GB GPUs per node
 #   * 8 total DDP ranks
-#   * train_batch_size 26 * 8 GPUs = effective global batch 208
+#   * train_batch_size 20 * 8 GPUs = effective global batch 160
 #   * lr=6e-4, warmup=4, lr_min_ratio=1e-2
 
 defaults:
@@ -49,7 +49,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 26
+  train_batch_size: 20
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4

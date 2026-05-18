@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run SMART NTP pretrain across two existing static H100x4 pods/nodes.
+# Run SMART NTP pretrain across two existing static A100x4 pods/nodes.
 #
-# This script is executed inside every node. For the hsb-npc-training pair,
-# prefer launching it through scripts/launch_smart_ntp_h100x4x2_hsb.py.
+# This script is executed inside every node. For the testa/testaa pair,
+# prefer launching it through scripts/launch_smart_ntp_a100x4x2_testa.py.
 # Manual use is also supported by setting NODE_RANK, MASTER_ADDR, MASTER_PORT,
 # NNODES, and NPROC_PER_NODE. It never creates, deletes, or restarts pods.
 set -Eeuo pipefail
@@ -15,11 +15,8 @@ default_cache_root() {
   local pod_name
   pod_name="$(hostname)"
   case "$pod_name" in
-    hsb-npc-training2*)
+    testa*|testaa*)
       printf '%s\n' "/workspace/womd_v1_3/SMART_cache"
-      ;;
-    hsb-npc-training*)
-      printf '%s\n' "/mnt/nuplan/womd_v1_3/SMART_cache"
       ;;
     *)
       printf '%s\n' "/workspace/womd_v1_3/SMART_cache"
@@ -79,21 +76,21 @@ PY
   esac
 }
 
-validate_strict_batch26_pretrain_overrides() {
+validate_strict_a100_pretrain_overrides() {
   local experiment="$1"
   local action="$2"
   shift 2
 
-  if [[ "$experiment" != "pre_bc_h100x4x2" || "$action" != "fit" ]]; then
+  if [[ "$experiment" != "pre_bc_a100x4x2" || "$action" != "fit" ]]; then
     return 0
   fi
 
-  if [[ -n "${TRAIN_BATCH_SIZE:-}" && "${TRAIN_BATCH_SIZE}" != "26" ]]; then
-    log "ERROR: pre_bc_h100x4x2 must use train_batch_size=26; got TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}."
+  if [[ -n "${TRAIN_BATCH_SIZE:-}" && "${TRAIN_BATCH_SIZE}" != "20" ]]; then
+    log "ERROR: pre_bc_a100x4x2 must use train_batch_size=20; got TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}."
     exit 2
   fi
   if [[ -n "${ACCUMULATE_GRAD_BATCHES:-}" && "${ACCUMULATE_GRAD_BATCHES}" != "1" ]]; then
-    log "ERROR: pre_bc_h100x4x2 must use accumulate_grad_batches=1; got ACCUMULATE_GRAD_BATCHES=${ACCUMULATE_GRAD_BATCHES}."
+    log "ERROR: pre_bc_a100x4x2 must use accumulate_grad_batches=1; got ACCUMULATE_GRAD_BATCHES=${ACCUMULATE_GRAD_BATCHES}."
     exit 2
   fi
 
@@ -104,13 +101,13 @@ validate_strict_batch26_pretrain_overrides() {
     case "$key" in
       data.train_batch_size)
         if [[ "$value" != "26" ]]; then
-          log "ERROR: pre_bc_h100x4x2 must use data.train_batch_size=26; got override ${override}."
+          log "ERROR: pre_bc_a100x4x2 must use data.train_batch_size=20; got override ${override}."
           exit 2
         fi
         ;;
       trainer.accumulate_grad_batches)
         if [[ "$value" != "1" ]]; then
-          log "ERROR: pre_bc_h100x4x2 must use trainer.accumulate_grad_batches=1; got override ${override}."
+          log "ERROR: pre_bc_a100x4x2 must use trainer.accumulate_grad_batches=1; got override ${override}."
           exit 2
         fi
         ;;
@@ -145,9 +142,9 @@ main() {
   local node_rank="${NODE_RANK:-}"
   local master_addr="${MASTER_ADDR:-}"
   local master_port="${MASTER_PORT:-29521}"
-  local experiment="${CATK_EXPERIMENT:-pre_bc_h100x4x2}"
+  local experiment="${CATK_EXPERIMENT:-pre_bc_a100x4x2}"
   local action="${CATK_ACTION:-fit}"
-  local task_name="${TASK_NAME:-smart_ntp_pretrain_h100x4x2}"
+  local task_name="${TASK_NAME:-smart_ntp_pretrain_a100x4x2}"
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
   local auto_resume="${CATK_AUTO_RESUME:-false}"
   local resume_task_name="${CATK_RESUME_TASK_NAME:-}"
@@ -190,12 +187,12 @@ main() {
     read -r -a extra_overrides <<< "$CATK_HYDRA_OVERRIDES"
   fi
   if (( ${#extra_overrides[@]} > 0 )); then
-    validate_strict_batch26_pretrain_overrides "$experiment" "$action" "${extra_overrides[@]}" "$@"
+    validate_strict_a100_pretrain_overrides "$experiment" "$action" "${extra_overrides[@]}" "$@"
   else
-    validate_strict_batch26_pretrain_overrides "$experiment" "$action" "$@"
+    validate_strict_a100_pretrain_overrides "$experiment" "$action" "$@"
   fi
 
-  log "starting SMART NTP H100x4x2 pretrain"
+  log "starting SMART NTP A100x4x2 pretrain"
   log "  experiment:       $experiment"
   log "  action:           $action"
   log "  task_name:        $task_name"
