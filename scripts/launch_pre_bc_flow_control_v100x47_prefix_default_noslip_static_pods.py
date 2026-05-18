@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
         "--skip-memory-metadata-preflight",
         action="store_true",
         help=(
-            "Skip the default master-pod preflight that builds/validates the "
+            "Skip the default per-pod preflight that builds/validates the "
             "memory-balanced batch metadata cache before training."
         ),
     )

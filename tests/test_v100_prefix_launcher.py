@@ -50,3 +50,15 @@ def test_latest_prefix_v100_launcher_uses_distinct_task_name() -> None:
         "roundtrip05_lr6e-4_bs4_stable_latest"
     ) in result.stdout
     assert "catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix-stable-latest" in result.stdout
+
+
+def test_oom_retry_preflight_builds_metadata_on_all_pods() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    script = (
+        repo_root / "scripts" / "h100x4_multinode_pretrain_with_oom_retry.sh"
+    ).read_text()
+
+    assert "prebuild_memory_balance_metadata_for_pod()" in script
+    assert 'for pod in "${POD_ARRAY[@]}"; do' in script
+    assert 'prebuild_memory_balance_metadata_for_pod "$pod"' in script
+    assert "memory-balance metadata preflight ready on all" in script

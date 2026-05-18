@@ -152,8 +152,8 @@ def parse_args() -> argparse.Namespace:
         "--memory-metadata-preflight",
         action="store_true",
         help=(
-            "Build/validate the memory-balanced batch metadata on the master "
-            "pod before starting the distributed training attempt."
+            "Build/validate the memory-balanced batch metadata on every pod "
+            "before starting the distributed training attempt."
         ),
     )
     parser.add_argument(

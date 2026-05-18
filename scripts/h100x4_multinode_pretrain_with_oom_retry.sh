@@ -105,13 +105,10 @@ cache_root_for_pod() {
   esac
 }
 
-prebuild_memory_balance_metadata() {
-  if [[ "$MEMORY_BALANCE_PREFLIGHT" != "1" ]]; then
-    return 0
-  fi
-
+prebuild_memory_balance_metadata_for_pod() {
+  local pod="$1"
   local cache_root metadata_cache raw_dir force_arg git_cmd metadata_cache_q raw_dir_q project_root_q branch_q git_ref_q workers_q
-  cache_root="$(cache_root_for_pod "$MASTER_POD")"
+  cache_root="$(cache_root_for_pod "$pod")"
   metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
   raw_dir="${cache_root%/}/training"
   force_arg=""
@@ -132,8 +129,8 @@ prebuild_memory_balance_metadata() {
     git_cmd="git fetch origin ${branch_q} && { git checkout ${branch_q} 2>/dev/null || git checkout -B ${branch_q} origin/${branch_q}; } && git pull --ff-only origin ${branch_q}"
   fi
 
-  log "prebuilding memory-balance metadata on ${MASTER_POD}: raw_dir=${raw_dir} cache=${metadata_cache}"
-  kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "
+  log "prebuilding memory-balance metadata on ${pod}: raw_dir=${raw_dir} cache=${metadata_cache}"
+  kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
 set -euo pipefail
 cd ${project_root_q}
 ${git_cmd}
@@ -145,6 +142,38 @@ python tools/build_memory_balance_metadata.py \
   --num-workers ${workers_q} \
   ${force_arg}
 "
+}
+
+prebuild_memory_balance_metadata() {
+  if [[ "$MEMORY_BALANCE_PREFLIGHT" != "1" ]]; then
+    return 0
+  fi
+
+  local pod pid status failed=0
+  local -a preflight_pids=()
+  for pod in "${POD_ARRAY[@]}"; do
+    (
+      if prebuild_memory_balance_metadata_for_pod "$pod"; then
+        log "memory-balance metadata preflight ready on ${pod}"
+      else
+        status=$?
+        log "memory-balance metadata preflight failed on ${pod} (exit=${status})"
+        exit "$status"
+      fi
+    ) &
+    preflight_pids+=("$!")
+  done
+
+  for pid in "${preflight_pids[@]}"; do
+    if ! wait "$pid"; then
+      failed=1
+    fi
+  done
+
+  if (( failed != 0 )); then
+    return 1
+  fi
+  log "memory-balance metadata preflight ready on all ${#POD_ARRAY[@]} pods"
 }
 
 remote_run_root() {
