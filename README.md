@@ -768,15 +768,16 @@ dry-run으로 실제로 어떤 base launcher를 호출하는지 확인하려면:
 python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_latest_static_pods.py --dry-run --replace
 ```
 
-실제 장기 학습을 시작할 때는 local retry supervisor가 학습 종료 또는 실패까지 살아 있어야 하므로, 아래처럼 `nohup`으로 띄웁니다:
+실제 장기 학습을 시작할 때는 local retry supervisor가 학습 종료 또는 실패까지 살아 있어야 하므로, 아래처럼 local `tmux` controller로 띄웁니다:
 
 ```bash
 mkdir -p logs/_manual_launch
-nohup python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_latest_static_pods.py --replace \
-  > logs/_manual_launch/v100x47_prefix_default_noslip_latest.out 2>&1 &
+tmux new-session -d -s catk-v100x47-stable-latest-controller \
+  -c "$PWD" \
+  "set -o pipefail; PYTHONUNBUFFERED=1 python scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_latest_static_pods.py --replace 2>&1 | tee -a logs/_manual_launch/v100x47_prefix_default_noslip_latest.out; echo controller_exit=\${PIPESTATUS[0]}; exec bash"
 ```
 
-local supervisor 로그는 `logs/_manual_launch/v100x47_prefix_default_noslip_latest.out`에 남고, attempt별 통합 로그는 `logs/_h100x4_multinode_pretrain_oom_retry/flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4_stable_latest/` 아래에 저장됩니다.
+local controller 로그는 `logs/_manual_launch/v100x47_prefix_default_noslip_latest.out`에 남고, attempt별 통합 로그는 `logs/_h100x4_multinode_pretrain_oom_retry/flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs4_stable_latest/` 아래에 저장됩니다.
 
 latest run tmux 확인:
 
