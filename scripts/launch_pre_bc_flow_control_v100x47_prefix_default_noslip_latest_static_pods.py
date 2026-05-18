@@ -30,6 +30,10 @@ DEFAULT_TASK_NAME = (
 DEFAULT_SESSION = (
     "catk-control-pretrain-v100x47-prefix-default-noslip-tailprefix-stable-latest"
 )
+DEFAULT_REMOTE_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
+DEFAULT_METADATA_CACHE_BASENAME = (
+    "womd_training_memory_balance_v1_stable_latest.pt"
+)
 
 
 def shq(value: object) -> str:
@@ -49,8 +53,41 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     return parser.parse_known_args()
 
 
+def has_passthrough_option(args: list[str], option: str) -> bool:
+    prefix = option + "="
+    return any(arg == option or arg.startswith(prefix) for arg in args)
+
+
+def passthrough_option_value(args: list[str], option: str, default: str) -> str:
+    prefix = option + "="
+    for index, arg in enumerate(args):
+        if arg.startswith(prefix):
+            return arg[len(prefix) :]
+        if arg == option and index + 1 < len(args):
+            return args[index + 1]
+    return default
+
+
 def main() -> int:
     args, passthrough = parse_args()
+    if (
+        "--stop" not in passthrough
+        and not has_passthrough_option(passthrough, "--memory-metadata-cache-path")
+    ):
+        remote_log_dir = passthrough_option_value(
+            passthrough,
+            "--remote-log-dir",
+            os.environ.get("REMOTE_LOG_DIR", DEFAULT_REMOTE_LOG_DIR),
+        )
+        passthrough = [
+            *passthrough,
+            "--memory-metadata-cache-path",
+            str(
+                Path(remote_log_dir.rstrip("/"))
+                / "dataset_metadata"
+                / DEFAULT_METADATA_CACHE_BASENAME
+            ),
+        ]
     command = [
         sys.executable,
         str(BASE_LAUNCHER),
