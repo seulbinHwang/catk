@@ -584,6 +584,70 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --dry-run
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --stop
 ```
 
+#### hsb-npc-training/hsb-npc-training2 H100x4x2 execution-context balanced pretrain
+
+`semi_control_rolling` 브랜치의 실행상태 문맥 정렬 학습을 `hsb-npc-training`, `hsb-npc-training2` 두 H100x4 pod에서 돌릴 때는 아래 전용 launcher를 씁니다. 이 launcher도 기존 running pod 안에 tmux session만 만들며 pod를 새로 만들거나 재시작하지 않습니다. **이미 두 pod에서 다른 학습이 돌고 있으면 실행하지 말고, 해당 학습이 끝난 뒤에만 사용합니다.**
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_pods.py \
+  --prebuild-metadata \
+  --replace
+```
+
+실행 전에는 반드시 dry-run으로 pod, branch, task name, metadata prebuild 명령을 확인합니다. dry-run은 pod 안에서 명령을 실행하지 않고 출력만 합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_pods.py \
+  --prebuild-metadata \
+  --dry-run
+```
+
+이 launcher는 `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml`을 사용합니다. 실험 의도는 다음 설정으로 고정됩니다.
+
+```yaml
+model:
+  model_config:
+    lr: 6e-4
+    decoder:
+      flow_window_steps: 20
+    token_processor:
+      use_kinematic_control_flow: true
+      use_holonomic_model_only: false
+      use_prefix_valid_future_loss_mask: true
+      control_vehicle_no_slip_point_ratio: 0.2289518863
+      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_alignment_filter:
+        enabled: true
+        vehicle_max_error_m: 2.0
+        cyclist_max_error_m: 2.0
+
+data:
+  train_use_eval_agent_selection: true
+  train_memory_balanced_batches: true
+  train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
+  train_memory_balance_build_on_missing: false
+
+trainer:
+  use_distributed_sampler: false
+```
+
+`--prebuild-metadata`는 각 pod의 SMART cache training split을 읽어서 memory-balanced sampler용 metadata만 미리 만듭니다. SMART cache 파일 자체는 수정하지 않습니다. 이전 metadata build가 비정상 종료되어 `.lock`만 남아 있으면 `--force-metadata`를 추가해 stale lock을 정리한 뒤 다시 생성합니다. 실제 build가 돌고 있는 중에는 `--force-metadata`를 쓰지 않습니다.
+
+기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2-execctx-balanced`입니다. 기본 `train_batch_size=26`, 8 GPU 기준 effective global batch는 `208`입니다. CUDA OOM이 발생하면 기존 H100x4x2 retry wrapper와 동일하게 최신 `epoch_last.ckpt`를 기준으로 resume하며, 기본 fallback은 `26 -> 24 -> 22 -> 20`입니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-control-pretrain-h100x4x2-execctx-balanced
+kubectl exec -it -n p-pnc hsb-npc-training2 -c main -- tmux attach -t catk-control-pretrain-h100x4x2-execctx-balanced
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_pods.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.

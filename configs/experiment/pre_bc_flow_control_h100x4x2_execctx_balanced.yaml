@@ -1,0 +1,51 @@
+# @package _global_
+
+# H100x4x2 execution-context-aligned control-space pretrain.
+#
+# This preset keeps the H100x4x2 training shape from
+# `pre_bc_flow_control_2x4_h100`, but makes the semi_control_rolling objective
+# explicit:
+#   * context and targets after the observed current state are sliced from one
+#     transition-aligned trajectory;
+#   * prefix-valid future loss keeps usable tail anchors;
+#   * raw-vs-transition-aligned distortion outliers are filtered from train
+#     anchors only;
+#   * all train agents are kept, with memory-balanced batches reducing the
+#     chance that dense scenes collide in one local batch.
+
+defaults:
+  - pre_bc_flow_control_2x4_h100
+  - _self_
+
+model:
+  model_config:
+    lr: 6e-4
+    decoder:
+      flow_window_steps: 20
+    token_processor:
+      use_kinematic_control_flow: true
+      use_holonomic_model_only: false
+      use_prefix_valid_future_loss_mask: true
+      control_vehicle_no_slip_point_ratio: 0.2289518863
+      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_alignment_filter:
+        enabled: true
+        vehicle_max_error_m: 2.0
+        cyclist_max_error_m: 2.0
+
+data:
+  train_batch_size: 26
+  val_batch_size: 16
+  test_batch_size: 16
+  train_use_eval_agent_selection: true
+  train_memory_balanced_batches: true
+  train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
+  train_memory_balance_metadata_num_workers: 8
+  train_memory_balance_build_on_missing: false
+  train_memory_balance_agent_weight: 1.0
+  train_memory_balance_current_valid_agent_weight: 1.0
+  train_memory_balance_valid_agent_step_weight: 0.0
+  train_memory_balance_map_weight: 0.02
+
+trainer:
+  use_distributed_sampler: false
