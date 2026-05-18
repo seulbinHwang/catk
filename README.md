@@ -556,7 +556,7 @@ model:
       control_cyclist_no_slip_point_ratio: 0.0495847873
       control_alignment_filter:
         enabled: true
-        vehicle_max_error_m: 5.0
+        vehicle_max_error_m: 2.0
         cyclist_max_error_m: 2.0
       control_vehicle_yaw_scale_rad: 0.025
       control_pedestrian_yaw_scale_rad: 0.20

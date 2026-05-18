@@ -50,7 +50,7 @@ model_config:
     # vehicle/cyclist는 non-holonomic으로 유지하고, 기준을 넘는 anchor만 loss에서 제외합니다.
     control_alignment_filter:
       enabled: true
-      vehicle_max_error_m: 5.0
+      vehicle_max_error_m: 2.0
       cyclist_max_error_m: 2.0
     # control-space yaw normalization is agent type-aware and config-managed.
     control_vehicle_yaw_scale_rad: 0.025
