@@ -305,16 +305,26 @@ torchrun \
   task_name=flow_semi_continuous_pretrain_h1006
 ```
 
-`pre_bc_flow` 기본 `data.train_batch_size=28` 는 6x H100 80GB 에서 OOM 없이 throughput 을 최대로 끌어올리도록 실측으로 맞춘 값입니다.
+`pre_bc_flow` 기본값은 2초 Flow horizon입니다.
 
-- 측정 조건: 커스텀 Lightning callback 으로 per-step `peak_reserved` 와 `sec/step` 을 DDP 6-GPU 에서 직접 측정.
-- `train_batch_size=20` (이전 기본): 500-step 기준 step 당 0.92s, peak reserved 약 49% -> 여유는 많지만 throughput 손해.
-- `train_batch_size=28` (현재 기본): 500-step 기준 step 당 1.21s, peak reserved 최대 약 83% -> baseline 대비 epoch 당 약 6.5% 단축 (`H100x6` 기준 64 epoch 환산 약 4시간 절약).
-- `train_batch_size=30`: 500-step 기준 peak reserved 약 88% 까지 올라 OOM margin 이 얇습니다.
-- `train_batch_size=32`: 실측에서 71 step 만에 OOM 으로 학습이 죽었습니다.
-- 따라서 6x H100 80GB 에서는 `28` 이상으로 올리지 않는 것을 권장합니다. 더 작은 GPU 에서는 아래 예시처럼 override 로 낮춰 쓰면 됩니다.
+- `model.model_config.decoder.flow_window_steps=20`
+- `data.train_batch_size=26`
+- `data.train_use_eval_agent_selection=true`
+- `data.train_memory_balanced_batches=true`
+- `trainer.use_distributed_sampler=false`
 
-`flow_window_steps=80` 으로 학습할 때는 6x H100 80GB 에서 `data.train_batch_size=14` 를 쓰세요.
+`train_use_eval_agent_selection=true`에서는 학습에서도 모든 평가 대상 agent를 살리므로 dense scene이 한 rank batch에 몰리면 CUDA peak가 튈 수 있습니다. 그래서 기본 pretrain도 memory-balanced batch sampler를 켭니다. sampler는 pkl별 agent 수 / current valid agent 수 / map point 수 같은 metadata로 batch 순서만 균형 있게 바꾸며, 학습 objective나 per-GPU batch size는 바꾸지 않습니다.
+
+기본 `pre_bc_flow`는 직접 실행 편의성을 위해 `train_memory_balance_build_on_missing=true`입니다. metadata cache가 없으면 첫 실행에서 한 번 생성됩니다. 시작 지연을 피하려면 학습 전에 미리 만듭니다.
+
+```bash
+python tools/build_memory_balance_metadata.py \
+  --raw-dir "$CACHE_ROOT/training" \
+  --cache-path "$LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt" \
+  --num-workers 8
+```
+
+`flow_window_steps=80` 으로 학습할 때는 이 브랜치에서 전용 8초 preset을 제공하지 않습니다. 8초 실험은 아래처럼 명시적으로 horizon과 batch size를 override한 뒤 별도 memory probe로 안전한 batch를 다시 잡으세요.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
@@ -332,7 +342,7 @@ torchrun \
   data.train_batch_size=14
 ```
 
-`flow_window_steps=80` + 6x H100 80GB 조합은 `configs/experiment/pre_bc_flow_6_h100.yaml` preset으로 묶어 두었습니다. 이 preset은 `flow_window_steps=80`, `data.train_batch_size=18` 고정값을 쓰며, activation checkpointing이 켜져 있는 상태에서 500-step probe로 OOM 없이 안정 (rank 0 peak 약 87%) 인 것을 실측한 값입니다. bs=19/20은 각각 step 121 / step 430에서 OOM 났습니다. 1 epoch 예상 시간은 약 2.2시간 (global batch 108, step당 약 1.76s, epoch 당 ~4509 step).
+`configs/experiment/pre_bc_flow_6_h100.yaml`은 이름 그대로 6x H100용 기본 2초 pretrain preset입니다. 이 preset은 `flow_window_steps=20`, `data.train_batch_size=26`, memory-balanced sampler를 고정합니다. 8초 / 80-step 학습으로 해석하면 안 됩니다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
@@ -345,7 +355,7 @@ torchrun \
   trainer=ddp \
   trainer.devices=6 \
   paths.cache_root="$CACHE_ROOT" \
-  task_name=flow_semi_continuous_pretrain_h1006_fw80
+  task_name=flow_semi_continuous_pretrain_h1006_2s
 ```
 
 ### 5.1 학습 설정을 거칠게 이해하는 법
@@ -1135,7 +1145,7 @@ torchrun \
 메모리 관련 주의:
 
 - 이 fine-tuning은 기존 pretrain보다 한 batch 안에 들어오는 agent 수와 학습 대상 anchor 수가 늘 수 있으므로 GPU memory 사용량이 더 커질 수 있습니다.
-- 그래서 6x H100 pretrain 기본값(`train_batch_size=28`)보다 보수적으로 `train_batch_size=20`을 쓰는 preset입니다.
+- 그래서 6x H100 pretrain 기본값(`train_batch_size=26`)보다 보수적으로 `train_batch_size=20`을 쓰는 preset입니다.
 - 그래도 OOM이 나면 가장 먼저 `data.train_batch_size`를 `16`, `12`처럼 더 줄이는 편이 안전합니다.
 
 자주 바꾸는 override 예시는 아래와 같습니다.

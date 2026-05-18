@@ -24,6 +24,7 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 1.0
   sync_batchnorm: false
+  use_distributed_sampler: false
 
 callbacks:
   model_checkpoint:
@@ -37,3 +38,7 @@ data:
   num_workers: 4
   prefetch_factor: 1
   train_use_eval_agent_selection: true
+  train_memory_balanced_batches: true
+  train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
+  train_memory_balance_metadata_num_workers: 8
+  train_memory_balance_build_on_missing: true
