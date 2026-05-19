@@ -85,9 +85,12 @@ validate_strict_a100_pretrain_overrides() {
     return 0
   fi
 
-  if [[ -n "${TRAIN_BATCH_SIZE:-}" && "${TRAIN_BATCH_SIZE}" != "26" ]]; then
-    log "ERROR: pre_bc_a100x4x2 must use train_batch_size=26; got TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}."
-    exit 2
+  local max_train_batch_size=24
+  if [[ -n "${TRAIN_BATCH_SIZE:-}" ]]; then
+    if ! [[ "$TRAIN_BATCH_SIZE" =~ ^[0-9]+$ ]] || (( TRAIN_BATCH_SIZE < 1 || TRAIN_BATCH_SIZE > max_train_batch_size )); then
+      log "ERROR: pre_bc_a100x4x2 must use train_batch_size in [1, ${max_train_batch_size}]; got TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}."
+      exit 2
+    fi
   fi
   if [[ -n "${ACCUMULATE_GRAD_BATCHES:-}" && "${ACCUMULATE_GRAD_BATCHES}" != "1" ]]; then
     log "ERROR: pre_bc_a100x4x2 must use accumulate_grad_batches=1; got ACCUMULATE_GRAD_BATCHES=${ACCUMULATE_GRAD_BATCHES}."
@@ -100,8 +103,8 @@ validate_strict_a100_pretrain_overrides() {
     value="${override#*=}"
     case "$key" in
       data.train_batch_size)
-        if [[ "$value" != "26" ]]; then
-          log "ERROR: pre_bc_a100x4x2 must use data.train_batch_size=26; got override ${override}."
+        if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > max_train_batch_size )); then
+          log "ERROR: pre_bc_a100x4x2 must use data.train_batch_size in [1, ${max_train_batch_size}]; got override ${override}."
           exit 2
         fi
         ;;

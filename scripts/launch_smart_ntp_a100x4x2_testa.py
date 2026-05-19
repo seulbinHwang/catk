@@ -27,7 +27,7 @@ DEFAULT_CACHE_ROOT_BY_POD = {
     "testaa": "/workspace/womd_v1_3/SMART_cache",
 }
 STRICT_A100_EXPERIMENT = "pre_bc_a100x4x2"
-STRICT_TRAIN_BATCH_SIZE = "26"
+MAX_A100_TRAIN_BATCH_SIZE = 24
 STRICT_ACCUMULATE_GRAD_BATCHES = "1"
 
 
@@ -99,12 +99,20 @@ def validate_strict_a100_pretrain(args: argparse.Namespace) -> None:
     if args.action != "fit" or args.experiment != STRICT_A100_EXPERIMENT:
         return
 
-    if args.train_batch_size and args.train_batch_size != STRICT_TRAIN_BATCH_SIZE:
-        raise ValueError(
-            f"{STRICT_A100_EXPERIMENT} must use train_batch_size="
-            f"{STRICT_TRAIN_BATCH_SIZE}, but got --train-batch-size "
-            f"{args.train_batch_size!r}."
-        )
+    if args.train_batch_size:
+        try:
+            train_batch_size = int(args.train_batch_size)
+        except ValueError as exc:
+            raise ValueError(
+                f"--train-batch-size must be a positive integer, got "
+                f"{args.train_batch_size!r}."
+            ) from exc
+        if train_batch_size < 1 or train_batch_size > MAX_A100_TRAIN_BATCH_SIZE:
+            raise ValueError(
+                f"{STRICT_A100_EXPERIMENT} must use train_batch_size in "
+                f"[1, {MAX_A100_TRAIN_BATCH_SIZE}], but got "
+                f"--train-batch-size {args.train_batch_size!r}."
+            )
     if (
         args.accumulate_grad_batches
         and args.accumulate_grad_batches != STRICT_ACCUMULATE_GRAD_BATCHES
@@ -118,10 +126,18 @@ def validate_strict_a100_pretrain(args: argparse.Namespace) -> None:
     for override in split_extra_hydra_overrides(args.extra_hydra_overrides):
         if override.startswith("data.train_batch_size="):
             value = override.split("=", 1)[1]
-            if value != STRICT_TRAIN_BATCH_SIZE:
+            try:
+                train_batch_size = int(value)
+            except ValueError as exc:
                 raise ValueError(
-                    f"{STRICT_A100_EXPERIMENT} must use data.train_batch_size="
-                    f"{STRICT_TRAIN_BATCH_SIZE}, but got override {override!r}."
+                    f"{STRICT_A100_EXPERIMENT} requires integer "
+                    f"data.train_batch_size, but got override {override!r}."
+                ) from exc
+            if train_batch_size < 1 or train_batch_size > MAX_A100_TRAIN_BATCH_SIZE:
+                raise ValueError(
+                    f"{STRICT_A100_EXPERIMENT} must use data.train_batch_size "
+                    f"in [1, {MAX_A100_TRAIN_BATCH_SIZE}], but got override "
+                    f"{override!r}."
                 )
         elif override.startswith("trainer.accumulate_grad_batches="):
             value = override.split("=", 1)[1]
