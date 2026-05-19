@@ -79,8 +79,11 @@ model:
       # EMA 시작 step.  Self-Forcing paper 200; 우리는 0 (즉시).
       dmd_ema_start_step: 0
       # ── BPTT tricks (OCSC 와 공유) ─────────────────────────────────
-      # DMD 는 set_model_for_finetuning 의 self_forcing_dmd 분기에서 ENTIRE model
-      # trainable 로 강제 — flow_ft_target/flow_velocity_head_only 는 이 모드에서 무시.
+      # flow_ft_target:
+      #   "full"      → ENTIRE model trainable (Self-Forcing paper convention)
+      #   "default"   → flow_decoder 만 trainable (encoder/attention/map freeze, OCSC-style)
+      #   "velocity_head"|"chunk_mixers_and_velocity_head"|"step_refiner_and_velocity_head"
+      #               → flow_decoder 의 sub-component 만 학습 (OCSC scope handler 재사용)
       flow_velocity_head_only: false
       flow_ft_target: "full"
       # adjoint off (activation 저장, backward 시 재계산 X) → GPU util ↑.

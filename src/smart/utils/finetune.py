@@ -359,26 +359,36 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             "Supported: 'ocsc_ft', 'road_ft', 'self_forcing_dmd'."
         )
 
-    # ── Self-Forcing DMD: 전체 model trainable (encoder/attention/embeddings/flow_decoder)
-    # 단 residual_velocity_head 만 freeze.  paper convention (WanDiffusionWrapper full FT) 와 일치.
+    # ── Self-Forcing DMD: flow_ft_target 토글 honor.
+    # - "full":   ENTIRE model trainable (encoder + attention + map + flow_decoder).
+    #             Self-Forcing paper convention (WanDiffusionWrapper full FT).
+    # - 그 외:    OCSC 분기로 fall-through → flow_decoder (혹은 sub-component) 만 학습,
+    #             encoder/attention/map 은 freeze.  안정성 우선 ablation 시 사용.
     if config.mode == "self_forcing_dmd":
-        _set_requires_grad(model, True)
-        residual_head_dmd = None
-        try:
-            residual_head_dmd = model.agent_encoder.flow_decoder.residual_velocity_head
-        except AttributeError:
-            pass
-        if residual_head_dmd is not None:
-            for p in residual_head_dmd.parameters():
-                p.data.zero_()
-            _set_requires_grad(residual_head_dmd, False)
-        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        _dmd_target = str(getattr(config, "flow_ft_target", "full")).lower()
+        if _dmd_target == "full":
+            _set_requires_grad(model, True)
+            residual_head_dmd = None
+            try:
+                residual_head_dmd = model.agent_encoder.flow_decoder.residual_velocity_head
+            except AttributeError:
+                pass
+            if residual_head_dmd is not None:
+                for p in residual_head_dmd.parameters():
+                    p.data.zero_()
+                _set_requires_grad(residual_head_dmd, False)
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            log.info(
+                f"Finetuning mode (self_forcing_dmd, flow_ft_target=full): ENTIRE model trainable "
+                f"({n_trainable:,} params: encoder + attention + map + flow_decoder), "
+                "residual_velocity_head zeroed+frozen."
+            )
+            return config
+        # flow_ft_target != "full" → OCSC 분기 (아래) 로 fall-through.
         log.info(
-            f"Finetuning mode (self_forcing_dmd): ENTIRE model trainable "
-            f"({n_trainable:,} params: encoder + attention + map + flow_decoder), "
-            "residual_velocity_head zeroed+frozen."
+            f"Finetuning mode (self_forcing_dmd, flow_ft_target={_dmd_target!r}): "
+            "deferring to OCSC-style scope handler (encoder/attention/map frozen)."
         )
-        return config
 
     # ── OCSC / RoaD: 전체 모델 freeze 후 flow_decoder 만 unfreeze ────────────
     _set_requires_grad(model, False)
