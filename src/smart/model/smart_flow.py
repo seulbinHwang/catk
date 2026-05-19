@@ -2667,12 +2667,442 @@ class SMARTFlow(LightningModule):
         return ret
 
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Self-Forcing DMD (Distribution Matching Distillation) fine-tuning
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _run_flow_dmd_ft_step(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        data: dict | None = None,
+    ) -> dict:
+        """Self-Forcing DMD step (anchor-sequential CL rollout + two manual_backward).
+
+        Algorithm (per anchor):
+          1. Generator CL rollout (with grad) → x_gen ∈ [n_active, T_10hz, 4]
+             (anchor-local normalized [x/20, y/20, cos, sin]).
+          2. Sample diffusion timestep τ ~ U(eps, 1), noise ε.
+             x_τ = σ_t · ε + τ · x_gen.detach()  (score 입력은 stop_grad)
+          3. DMD generator loss (real/fake 모두 stop_grad 로 score evaluation):
+             g = (1/β) · v_fake − v_real  (spec 의 부호와 일관:
+             ∂L/∂x_gen = g 가 되어 update 후 x_gen ← x_gen + lr·(v_real − v_fake/β)).
+             normalizer = mean|x_gen.detach()| (per anchor, dmd_normalize 시).
+             target = (x_gen − g/normalizer).detach()
+             L_gen = 0.5 · MSE(x_gen, target)  → manual_backward (opt_gen 만)
+          4. Fake_score (critic) FM loss on generator's own rollout:
+             sample = flow_ode.sample(x_gen.detach())
+             v_fake = fake_score(active_hidden.detach(), sample.x_t, sample.tau)
+             L_fake = flow_matching_loss(v_fake, sample.target)  → manual_backward (opt_fake 만)
+
+        Hyperparams (FinetuneConfig):
+          dmd_beta, dmd_n_rollouts (G), dmd_pred_max_steps, dmd_use_real_score,
+          dmd_normalize, dmd_anchor_stride, dmd_strict_active_mask,
+          dmd_warmup_fake_only_steps, dmd_eval_hard_rmm[_interval].
+          BPTT 토글 (bptt_use_adjoint, bptt_last_n_solver_steps,
+          bptt_grad_clip_traj, bptt_warm_coarse_steps, bptt_last_coarse_only)
+          은 OCSC 와 동일하게 적용.
+        """
+        # ── Hyperparams ──────────────────────────────────────────────────────
+        G = max(1, int(getattr(self.finetune_config, "dmd_n_rollouts", 1)))
+        pred_max_steps_raw = int(getattr(self.finetune_config, "dmd_pred_max_steps", 2))
+        pred_max_steps: int | None = pred_max_steps_raw if pred_max_steps_raw > 0 else None
+        beta = float(getattr(self.finetune_config, "dmd_beta", 1.0))
+        if beta <= 0.0:
+            raise ValueError(f"dmd_beta must be > 0, got {beta}")
+        inv_beta = 1.0 / beta
+        use_real = bool(getattr(self.finetune_config, "dmd_use_real_score", True))
+        use_normalize = bool(getattr(self.finetune_config, "dmd_normalize", True))
+        strict_active = bool(getattr(self.finetune_config, "dmd_strict_active_mask", True))
+        anchor_stride = max(1, int(getattr(self.finetune_config, "dmd_anchor_stride", 1)))
+        warmup_fake_only = int(getattr(self.finetune_config, "dmd_warmup_fake_only_steps", 0))
+        eval_hard_rmm = bool(getattr(self.finetune_config, "dmd_eval_hard_rmm", True))
+        eval_hard_rmm_interval = max(1, int(getattr(self.finetune_config, "dmd_eval_hard_rmm_interval", 1)))
+        use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
+        warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
+        last_coarse_only = bool(getattr(self.finetune_config, "bptt_last_coarse_only", False))
+        if last_coarse_only and pred_max_steps is not None and pred_max_steps > 1:
+            warm_coarse = pred_max_steps - 1
+        grad_clip = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 1.0))
+        last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
+        _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
+
+        # ── Validation ──────────────────────────────────────────────────────
+        if data is None:
+            raise ValueError("self_forcing_dmd requires `data` dict with scenario metadata.")
+        if "tfrecord_path" not in data or "scenario_id" not in data:
+            raise KeyError("self_forcing_dmd requires data['tfrecord_path'] and data['scenario_id'].")
+        agent_ids = None
+        try:
+            agent_ids = data["agent"]["id"]
+        except Exception:
+            pass
+        if agent_ids is None:
+            try:
+                agent_ids = data["id"]
+            except Exception:
+                pass
+        if agent_ids is None:
+            raise KeyError("self_forcing_dmd requires agent object ids: data['agent']['id'] (or data['id']).")
+        if int(agent_ids.shape[0]) != int(tokenized_agent["batch"].shape[0]):
+            raise ValueError("agent id count mismatch")
+        if self.fake_score_decoder is None:
+            raise RuntimeError("self_forcing_dmd: fake_score_decoder is None (expected from __init__).")
+        if use_real and self.ref_flow_decoder is None:
+            raise RuntimeError(
+                "self_forcing_dmd: dmd_use_real_score=True but ref_flow_decoder is None."
+            )
+
+        agent_batch = tokenized_agent["batch"]
+        device = agent_batch.device
+        _global_step = int(getattr(self, "global_step", 0))
+        skip_gen = (_global_step < warmup_fake_only)  # 초기엔 fake_score 만 학습
+
+        # ── 1. Encode map + full rollout cache (no_grad; encoder/trunk frozen) ─
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+            rollout_cache = self.encoder.agent_encoder.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
+
+        _agent_enc = self.encoder.agent_encoder
+        flow_ode = _agent_enc.flow_ode
+        flow_decoder = _agent_enc.flow_decoder
+        fake_score = self.fake_score_decoder
+        ref_score = self.ref_flow_decoder
+
+        # Apply BPTT toggles to FlowODE.
+        flow_ode.use_adjoint_for_bptt = use_adjoint
+        flow_ode.last_n_grad_solver_steps = (
+            min(last_n_solver, flow_ode.solver_steps) if last_n_solver > 0 else 0
+        )
+
+        # ── Anchor index selection (strided over GT 2Hz timeline) ────────────
+        step_current_2hz = int(rollout_cache["valid_window"].shape[1])
+        total_2hz_steps = int(tokenized_agent["gt_pos"].shape[1])
+        pred_steps = pred_max_steps_raw if pred_max_steps_raw > 0 else 2
+        valid_anchor_end = max(1, total_2hz_steps - pred_steps)
+        all_anchor_indices = list(range(0, valid_anchor_end, anchor_stride))
+        n_anchors_total = max(1, len(all_anchor_indices))
+
+        # ── grad-clip hook helper (CL trajectory level) ──────────────────────
+        def _make_norm_clip_hook(max_norm: float):
+            def _hook(g: Tensor) -> Tensor:
+                g = torch.nan_to_num(g, nan=0.0, posinf=max_norm, neginf=-max_norm)
+                g_norm = g.norm()
+                if g_norm > max_norm:
+                    g = g * (max_norm / g_norm)
+                return g
+            return _hook
+
+        # ── world → anchor-local normalized helper ───────────────────────────
+        def _cl_to_norm(cl_xy, cl_head, current_pos_active, current_head_active):
+            return self._world_traj_to_flow_norm(
+                pred_traj=cl_xy,
+                pred_head=cl_head,
+                current_pos=current_pos_active,
+                current_head=current_head_active,
+            )
+
+        # ── Logging accumulators ─────────────────────────────────────────────
+        gen_loss_accum = 0.0
+        fake_loss_accum = 0.0
+        score_diff_norm_accum = 0.0
+        v_real_norm_accum = 0.0
+        v_fake_norm_accum = 0.0
+        normalizer_mean_accum = 0.0
+        n_valid_anchors = 0
+        n_dmd_terms = 0  # generator term count (skip_gen 시 0)
+
+        _seq_keys = {"gt_pos", "gt_heading", "valid_mask", "gt_idx"}
+
+        # ── Anchor sequential loop ───────────────────────────────────────────
+        for anchor_idx in all_anchor_indices:
+            # 3a. Build anchor tokenized_agent (slice views).
+            hist_start = max(0, anchor_idx + 1 - step_current_2hz)
+            tokenized_agent_anchor: dict[str, Tensor] = {}
+            for key, value in tokenized_agent.items():
+                if (
+                    key in _seq_keys
+                    and torch.is_tensor(value)
+                    and value.dim() >= 2
+                ):
+                    tokenized_agent_anchor[key] = value[:, hist_start : anchor_idx + 1]
+                else:
+                    tokenized_agent_anchor[key] = value
+
+            # 3b. Build anchor rollout_cache (no_grad).
+            with torch.no_grad():
+                rollout_cache_anchor = _agent_enc.prepare_inference_cache(
+                    tokenized_agent=tokenized_agent_anchor,
+                    map_feature=map_feature,
+                )
+            active_mask = rollout_cache_anchor["valid_window"][:, -1]
+            if strict_active:
+                _T_future_raw = pred_steps * _shift
+                _anchor_now_10hz = (anchor_idx + 1) * _shift
+                _future_start = _anchor_now_10hz + 1
+                _future_end = _future_start + _T_future_raw
+                _raw_valid_full = data["agent"]["valid_mask"]
+                _seq_len = _raw_valid_full.shape[1]
+                if _future_end <= _seq_len and _T_future_raw > 0:
+                    _future_valid = _raw_valid_full[:, _future_start:_future_end].all(dim=1)
+                else:
+                    _future_valid = torch.zeros(
+                        _raw_valid_full.shape[0], dtype=torch.bool, device=_raw_valid_full.device,
+                    )
+                active_mask = active_mask & _future_valid
+            if not bool(active_mask.any()):
+                del rollout_cache_anchor
+                continue
+
+            current_pos_active = rollout_cache_anchor["pos_window"][:, -1][active_mask]
+            current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
+            active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
+            n_valid_anchors += 1
+
+            # 3c. CL rollout (G times, each with full_grad).
+            # G=1 (DMD default): single rollout per anchor (Self-Forcing 와 동일).
+            # G>1: 같은 anchor 에서 여러 sample 로 DMD 신호 평균 (variance reduction).
+            for g in range(G):
+                pred_traj_g, _pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
+                    data=data,
+                    tokenized_agent=tokenized_agent_anchor,
+                    map_feature=map_feature,
+                    rollout_cache=rollout_cache_anchor,
+                    rollout_indices=[g],
+                    return_anchor_hidden=True,
+                    full_grad=True,
+                    max_steps=pred_max_steps,
+                    warm_coarse_steps=warm_coarse,
+                )
+                if pred_traj_g.requires_grad and grad_clip > 0:
+                    pred_traj_g.register_hook(_make_norm_clip_hook(grad_clip))
+                if pred_head_g.requires_grad and grad_clip > 0:
+                    pred_head_g.register_hook(_make_norm_clip_hook(grad_clip))
+
+                _T = pred_traj_g.shape[-2]
+                x_gen = _cl_to_norm(
+                    pred_traj_g[active_mask, 0, :_T, :],   # [n_active, T_10hz, 2]
+                    pred_head_g[active_mask, 0, :_T],      # [n_active, T_10hz]
+                    current_pos_active,
+                    current_head_active,
+                ).to(dtype=torch.float32)                  # [n_active, T_10hz, 4]
+
+                # 3d. Sample diffusion timestep + noise (FlowODE 의 path 수식 그대로).
+                # x_t = σ_t · noise + τ · x_gen.detach()  → score 입력은 stop_grad.
+                # x_gen 자체는 별도 경로로 MSE trick 에 들어가 generator grad 를 받음.
+                with torch.no_grad():
+                    x_gen_d = x_gen.detach()
+                    tau = torch.rand(
+                        x_gen_d.shape[0], device=x_gen_d.device, dtype=x_gen_d.dtype
+                    ) * (1.0 - flow_ode.eps) + flow_ode.eps                # [n_active]
+                    noise = torch.randn_like(x_gen_d)
+                    view_tau = tau.view(-1, 1, 1)
+                    view_sigma = flow_ode._sigma_t(tau).view(-1, 1, 1)
+                    x_t = view_sigma * noise + view_tau * x_gen_d            # [n_active, T_10hz, 4]
+                    cond_d = active_hidden.detach().to(dtype=torch.float32)
+
+                    if use_real and ref_score is not None:
+                        v_real = ref_score(cond_d, x_t, tau).to(dtype=torch.float32)
+                    else:
+                        v_real = torch.zeros_like(x_t)
+                    v_fake_eval = fake_score(cond_d, x_t, tau).to(dtype=torch.float32)
+
+                    # DMD synthetic gradient.  ∂L/∂x_gen 가 g 가 되어 update 후
+                    # x_gen ← x_gen + lr · (v_real − v_fake/β) 가 되도록 부호 설정.
+                    g_dmd = inv_beta * v_fake_eval - v_real                 # [n_active, T, 4]
+                    if use_normalize:
+                        normalizer = x_gen_d.abs().mean(
+                            dim=(-2, -1), keepdim=True
+                        ).clamp_min(1e-7)
+                        g_n = g_dmd / normalizer
+                        normalizer_mean_accum += float(normalizer.mean().item())
+                    else:
+                        g_n = g_dmd
+                        normalizer_mean_accum += 1.0
+
+                    # logging stats (no_grad ctx)
+                    _score_diff = (v_real - v_fake_eval).abs().mean().item()
+                    score_diff_norm_accum += float(_score_diff)
+                    v_real_norm_accum += float(v_real.abs().mean().item())
+                    v_fake_norm_accum += float(v_fake_eval.abs().mean().item())
+
+                # 3e. DMD generator loss (skip during warmup).
+                if not skip_gen:
+                    target = (x_gen - g_n).detach()
+                    L_gen = 0.5 * F.mse_loss(x_gen, target, reduction="mean")
+                    # anchor 평균 (anchor 수로 나눠 합산 → batch 평균과 일관).
+                    L_gen_scaled = L_gen / float(n_anchors_total * G)
+                    if torch.isfinite(L_gen_scaled).all():
+                        self.manual_backward(L_gen_scaled)
+                        gen_loss_accum += float(L_gen.item())
+                        n_dmd_terms += 1
+                    else:
+                        log.warning(f"[dmd] non-finite L_gen at anchor={anchor_idx}, g={g}; skipping")
+
+                # 3f. Fake_score (critic) FM loss on generator's own sample.
+                # x_gen detach + anchor_hidden detach → grad 는 fake_score params 로만.
+                sample_fk = flow_ode.sample(x_gen.detach().to(dtype=torch.float32), target_type="velocity")
+                v_fk = fake_score(
+                    active_hidden.detach().to(dtype=torch.float32),
+                    sample_fk.x_t,
+                    sample_fk.tau,
+                )
+                L_fake = flow_matching_loss(v_fk, sample_fk.target)
+                L_fake_scaled = L_fake / float(n_anchors_total * G)
+                if torch.isfinite(L_fake_scaled).all():
+                    self.manual_backward(L_fake_scaled)
+                    fake_loss_accum += float(L_fake.item())
+                else:
+                    log.warning(f"[dmd] non-finite L_fake at anchor={anchor_idx}, g={g}; skipping")
+
+                # cleanup per-rollout intermediates
+                del pred_traj_g, pred_head_g, x_gen, x_gen_d, x_t, v_fake_eval
+                if use_real:
+                    del v_real
+
+            del rollout_cache_anchor
+
+        # ── Logging dict ─────────────────────────────────────────────────────
+        _denom = max(1, n_valid_anchors * G)
+        ret: dict = {
+            "train/dmd/gen_loss": torch.tensor(
+                gen_loss_accum / max(1, n_dmd_terms), dtype=torch.float32, device=device,
+            ),
+            "train/dmd/fake_loss": torch.tensor(
+                fake_loss_accum / _denom, dtype=torch.float32, device=device,
+            ),
+            "train/dmd/score_diff_norm": torch.tensor(
+                score_diff_norm_accum / _denom, dtype=torch.float32, device=device,
+            ),
+            "train/dmd/v_real_norm": torch.tensor(
+                v_real_norm_accum / _denom, dtype=torch.float32, device=device,
+            ),
+            "train/dmd/v_fake_norm": torch.tensor(
+                v_fake_norm_accum / _denom, dtype=torch.float32, device=device,
+            ),
+            "train/dmd/normalizer_mean": torch.tensor(
+                normalizer_mean_accum / _denom, dtype=torch.float32, device=device,
+            ),
+            "train/dmd/beta": torch.tensor(beta, dtype=torch.float32, device=device),
+            "train/dmd/n_valid_anchors": torch.tensor(
+                float(n_valid_anchors), dtype=torch.float32, device=device,
+            ),
+            "train/dmd/skip_gen": torch.tensor(
+                1.0 if skip_gen else 0.0, dtype=torch.float32, device=device,
+            ),
+            # alias for top-line dashboard
+            "train/loss": torch.tensor(
+                gen_loss_accum / max(1, n_dmd_terms) if not skip_gen
+                else fake_loss_accum / _denom,
+                dtype=torch.float32, device=device,
+            ),
+        }
+
+        # ── HardRMM monitoring (optional, free-running closed-loop) ──────────
+        if (
+            eval_hard_rmm
+            and self._ocsc_train_hard_rmm is not None
+            and (_global_step % eval_hard_rmm_interval == 0)
+        ):
+            try:
+                _G_rmm = max(1, int(getattr(self, "n_rollout_closed_val", 4)))
+                with torch.no_grad():
+                    rmm_traj_all, rmm_z_all, rmm_head_all, _ = self._run_parallel_rollout_chunk(
+                        data=data,
+                        tokenized_agent=tokenized_agent,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache,
+                        rollout_indices=list(range(_G_rmm)),
+                        return_anchor_hidden=True,
+                        full_grad=False,
+                        max_steps=None,
+                    )
+                hard_rmm_val = self._compute_ocsc_train_hard_rmm(
+                    scenario_files=list(data["tfrecord_path"]),
+                    agent_ids=agent_ids,
+                    agent_batch=agent_batch,
+                    traj_list=[rmm_traj_all[:, g] for g in range(_G_rmm)],
+                    z_list=[rmm_z_all[:, g] for g in range(_G_rmm)],
+                    head_list=[rmm_head_all[:, g] for g in range(_G_rmm)],
+                    metric=self._ocsc_train_hard_rmm,
+                )
+                if hard_rmm_val is not None:
+                    ret["train/dmd/hard_rmm"] = torch.tensor(
+                        hard_rmm_val, dtype=torch.float32, device=device,
+                    )
+                    log.info(
+                        f"[dmd] step={_global_step} gen_loss={gen_loss_accum/max(1, n_dmd_terms):.4f} "
+                        f"fake_loss={fake_loss_accum/_denom:.4f} hard_rmm={hard_rmm_val:.4f} "
+                        f"score_diff={score_diff_norm_accum/_denom:.4f} beta={beta:.2f}"
+                    )
+            except Exception as exc:
+                log.warning(f"[dmd] hard_rmm eval failed at step={_global_step}: {exc}")
+
+        # ── DDP all-reduce dummy: 모든 trainable param (gen + fake) 을 dummy graph 에 연결.
+        # OCSC 패턴 그대로 — anchor 수가 GPU 마다 달라도 deadlock 없이 1회 all-reduce.
+        _ddp_dummy = sum(
+            p.sum() * 0.0 for p in self.parameters() if p.requires_grad
+        )
+        if self.fake_score_decoder is not None:
+            _ddp_dummy = _ddp_dummy + sum(
+                p.sum() * 0.0 for p in self.fake_score_decoder.parameters() if p.requires_grad
+            )
+        ret["loss"] = _ddp_dummy
+        return ret
+
     def training_step(self, data, batch_idx):
+        tokenized_map, tokenized_agent = self.token_processor(data)
+
+        # ── DMD: two-optimizer alternating (gen + fake_score) ────────────────
+        if self._is_dmd_ft_enabled():
+            opts = self.optimizers()
+            # Lightning manual mode: returns list when configure_optimizers returns multiple.
+            if not isinstance(opts, (list, tuple)):
+                raise RuntimeError(
+                    "self_forcing_dmd expects two optimizers; got single optimizer. "
+                    "Check configure_optimizers."
+                )
+            opt_gen, opt_fake = opts[0], opts[1]
+            opt_gen.zero_grad()
+            opt_fake.zero_grad()
+
+            _ddp_model = getattr(getattr(self, "trainer", None) and self.trainer.strategy, "model", None)
+            _no_sync_ctx = (
+                _ddp_model.no_sync()
+                if _ddp_model is not None and hasattr(_ddp_model, "no_sync")
+                else contextlib.nullcontext()
+            )
+            with _no_sync_ctx:
+                diag = self._run_flow_dmd_ft_step(tokenized_map, tokenized_agent, data)
+
+            # Final DDP all-reduce (grad 는 anchor loop 에서 이미 누적됨; dummy=0).
+            if "loss" in diag:
+                self.manual_backward(diag["loss"])
+
+            for k, v in diag.items():
+                if k == "loss":
+                    continue
+                if isinstance(v, (Tensor, float)):
+                    self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+
+            # Optional separate gen grad clip (overrides bptt_grad_clip_traj for opt.step).
+            _dmd_clip = float(getattr(self.finetune_config, "dmd_gen_grad_clip", 0.0) or 0.0)
+            _bptt_clip = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 0.0) or 0.0)
+            _gen_clip = _dmd_clip if _dmd_clip > 0 else _bptt_clip
+            if _gen_clip > 0:
+                self.clip_gradients(opt_gen, gradient_clip_val=_gen_clip)
+                self.clip_gradients(opt_fake, gradient_clip_val=_gen_clip)
+
+            opt_gen.step()
+            opt_fake.step()
+            return
+
         opt = self.optimizers()
         sch = self.lr_schedulers()
         opt.zero_grad()
-
-        tokenized_map, tokenized_agent = self.token_processor(data)
 
         if self._is_ocsc_ft_enabled():
             # DDP multi-GPU: 모든 .backward() 호출을 no_sync 컨텍스트 안에서 실행해
