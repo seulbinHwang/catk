@@ -17,3 +17,4 @@ secrets/waymo/playwright_profile/
 paper/
 paper_assets/
 overleaf/
+.claude/
