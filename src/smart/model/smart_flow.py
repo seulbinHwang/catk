@@ -116,7 +116,9 @@ class SMARTFlow(LightningModule):
             model_config.finetune,
         )
         self.ref_flow_decoder: nn.Module | None = None
-        # DMD (self_forcing_dmd) 의 fake_score (critic) 사본.  on_train_start 에서 deepcopy.
+        # DMD (self_forcing_dmd) 의 fake_score (critic) 사본.
+        # __init__ 시점에 deepcopy 해서 configure_optimizers 가 param 을 등록할 수 있게 함.
+        # 가중치는 on_train_start 에서 main flow_decoder (pretrained ckpt 적용 후) 로 in-place sync.
         self.fake_score_decoder: nn.Module | None = None
         if self.finetune_config.enabled and self.finetune_config.mode not in (
             "ocsc_ft", "road_ft", "self_forcing_dmd"
@@ -124,6 +126,18 @@ class SMARTFlow(LightningModule):
             raise ValueError(
                 f"Unsupported finetune mode: {self.finetune_config.mode}. "
                 "Supported: 'ocsc_ft', 'road_ft', 'self_forcing_dmd'."
+            )
+        if self._is_dmd_ft_enabled():
+            from copy import deepcopy
+            self.fake_score_decoder = deepcopy(self.encoder.agent_encoder.flow_decoder)
+            # set_model_for_finetuning 으로 trunk 일부 가 freeze 됐어도 critic 은 full update.
+            for p in self.fake_score_decoder.parameters():
+                p.requires_grad_(True)
+            n_params = sum(p.numel() for p in self.fake_score_decoder.parameters())
+            log.info(
+                f"[{self.finetune_config.mode}] fake_score_decoder constructed "
+                f"({n_params:,} params, all trainable). Weights will be synced from "
+                "main flow_decoder in on_train_start (post-ckpt-load)."
             )
 
         self.minADE = minADE()
@@ -150,13 +164,16 @@ class SMARTFlow(LightningModule):
             cpd_reference=wosac_cpd_reference,
         )
 
-        # OCSC / RoaD: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
+        # OCSC / RoaD / DMD: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
         _is_ocsc = self.finetune_config.enabled and self.finetune_config.mode == "ocsc_ft"
         _is_road = self.finetune_config.enabled and self.finetune_config.mode == "road_ft"
+        _is_dmd = self.finetune_config.enabled and self.finetune_config.mode == "self_forcing_dmd"
         _want_train_rmm = (
             _is_ocsc and bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
         ) or (
             _is_road and bool(getattr(self.finetune_config, "road_eval_hard_rmm", False))
+        ) or (
+            _is_dmd and bool(getattr(self.finetune_config, "dmd_eval_hard_rmm", True))
         )
         if _want_train_rmm:
             self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc")
@@ -1166,18 +1183,16 @@ class SMARTFlow(LightningModule):
                 p.requires_grad_(False)
             print(f"[{self.finetune_config.mode}] frozen reference model created from pretrained checkpoint.")
 
-        # DMD: fake_score_decoder (critic) — generator 와 동일 architecture, trainable, pretrained init.
-        # 별도 optimizer 로 alternating update (configure_optimizers 에서 분리).
-        if self._is_dmd_ft_enabled() and self.fake_score_decoder is None:
-            from copy import deepcopy
-            flow_decoder = self.encoder.agent_encoder.flow_decoder
-            self.fake_score_decoder = deepcopy(flow_decoder)
-            # set_model_for_finetuning 으로 generator 측 일부 param 이 freeze 됐어도
-            # fake_score 사본은 전체 trainable 로 강제 (critic 은 full update 가 표준).
-            for p in self.fake_score_decoder.parameters():
-                p.requires_grad_(True)
-            n_params = sum(p.numel() for p in self.fake_score_decoder.parameters())
-            print(f"[{self.finetune_config.mode}] fake_score_decoder (critic) created from pretrained checkpoint ({n_params:,} params, all trainable).")
+        # DMD: fake_score_decoder 는 __init__ 에서 이미 생성됨 (configure_optimizers 가 참조해야 하므로).
+        # 여기서는 pretrained ckpt 적용 후의 main flow_decoder 가중치로 in-place sync.
+        # (deepcopy 가 아니라 load_state_dict 를 써서 optimizer 의 param 참조를 유지.)
+        if self._is_dmd_ft_enabled() and self.fake_score_decoder is not None:
+            cur_state = self.encoder.agent_encoder.flow_decoder.state_dict()
+            self.fake_score_decoder.load_state_dict(cur_state, strict=True)
+            print(
+                f"[{self.finetune_config.mode}] fake_score_decoder synced from main "
+                "flow_decoder (post-ckpt-load init)."
+            )
 
         # ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
         # gradients (exploding Jacobian, numerical instability). Register nan_to_num
@@ -3118,6 +3133,43 @@ class SMARTFlow(LightningModule):
                         (current_step - self.lr_warmup_steps) / max(total_steps - self.lr_warmup_steps, 1),
                     )
                 )
+            )
+
+        # ── DMD (self_forcing_dmd): generator / fake_score 두 optimizer 분리 ──────
+        if self._is_dmd_ft_enabled():
+            if self.fake_score_decoder is None:
+                raise RuntimeError(
+                    "self_forcing_dmd: fake_score_decoder is None. "
+                    "Expected __init__ to deepcopy from flow_decoder."
+                )
+            fake_param_ids = {id(p) for p in self.fake_score_decoder.parameters()}
+            gen_params = [
+                p for p in self.parameters()
+                if p.requires_grad and id(p) not in fake_param_ids
+            ]
+            fake_params = [p for p in self.fake_score_decoder.parameters() if p.requires_grad]
+            if not gen_params:
+                raise RuntimeError("self_forcing_dmd: no trainable generator params.")
+            if not fake_params:
+                raise RuntimeError("self_forcing_dmd: no trainable fake_score params.")
+            fake_lr_scale = float(getattr(self.finetune_config, "dmd_fake_lr_scale", 1.0))
+            opt_gen = torch.optim.AdamW(
+                gen_params, lr=self.lr, weight_decay=self.weight_decay,
+            )
+            opt_fake = torch.optim.AdamW(
+                fake_params, lr=self.lr * fake_lr_scale, weight_decay=self.weight_decay,
+            )
+            sch_gen = LambdaLR(opt_gen, lr_lambda=lr_lambda)
+            sch_fake = LambdaLR(opt_fake, lr_lambda=lr_lambda)
+            log.info(
+                f"[self_forcing_dmd] two-optimizer setup: "
+                f"opt_gen={len(gen_params)} param tensors @ lr={self.lr:.2e}; "
+                f"opt_fake={len(fake_params)} param tensors @ lr={self.lr*fake_lr_scale:.2e} "
+                f"(scale={fake_lr_scale})."
+            )
+            return (
+                {"optimizer": opt_gen, "lr_scheduler": {"scheduler": sch_gen, "interval": self.lr_scheduler_unit, "frequency": 1}},
+                {"optimizer": opt_fake, "lr_scheduler": {"scheduler": sch_fake, "interval": self.lr_scheduler_unit, "frequency": 1}},
             )
 
         trainable_params = [p for p in self.parameters() if p.requires_grad]
