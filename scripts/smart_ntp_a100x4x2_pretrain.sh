@@ -135,6 +135,7 @@ main() {
   export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
   export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-14400}"
   export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
+  export CATK_ATTENTION_GRAPH_FP32="${CATK_ATTENTION_GRAPH_FP32:-1}"
 
   activate_conda_if_available
 
@@ -206,6 +207,7 @@ main() {
   log "  master_addr:      $master_addr"
   log "  master_port:      $master_port"
   log "  cache_root:       $cache_root"
+  log "  graph_attn_fp32:  $CATK_ATTENTION_GRAPH_FP32"
   if [[ -n "$ckpt_path" ]]; then
     log "  ckpt_path:        $ckpt_path"
   elif [[ "$auto_resume" == "true" || "$auto_resume" == "1" ]]; then
