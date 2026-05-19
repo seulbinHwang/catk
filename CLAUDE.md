@@ -85,7 +85,14 @@ src/smart/tokens/token_processor.py / flow_token_processor.py
 src/smart/metrics/mmd_consistency_loss.py / wosac_metametric_pytorch.py / wosac_metric_features_torch/
 configs/experiment/flow_consistency_bptt.yaml   # OCSC 실험 config
 scripts/train_flow_consistency_bptt_single.sh   # OCSC single-GPU 런처
+configs/experiment/flow_dmd.yaml                # Self-Forcing DMD 실험 config
+scripts/train_flow_dmd_single.sh                # Self-Forcing DMD single-GPU 런처
 ```
+
+`_run_flow_dmd_ft_step` (smart_flow.py 신규): Self-Forcing DMD.  Anchor sequential
+루프 + 2 manual_backward (gen / fake_score).  ref_flow_decoder 를 real_score 로 재사용,
+__init__ 에서 deepcopy 한 self.fake_score_decoder 를 critic 으로 학습.  configure_optimizers
+가 [opt_gen, opt_fake] tuple 반환 → training_step 의 DMD branch 가 두 opt.step() 분리.
 
 ## OCSC 핵심 토글 (launcher default)
 
@@ -109,6 +116,36 @@ scripts/train_flow_consistency_bptt_single.sh   # OCSC single-GPU 런처
 | `BPTT_USE_ADJOINT` | true | flow_ode model_fn checkpoint |
 | `BPTT_LAST_COARSE_ONLY` | false | 마지막 1 coarse step 만 grad — ⚠ schema fix 후 진짜 동작 |
 | `FLOW_VELOCITY_HEAD_ONLY` | true | velocity_head 만 학습 |
+
+## Self-Forcing DMD 핵심 토글 (mode `self_forcing_dmd`, launcher default)
+
+알고리즘 요약:  generator (main flow_decoder) 가 CL rollout → x_gen;  τ~U sample 후
+score networks (ref=real, fake=critic) 로 synthetic gradient `g=(1/β)·v_fake−v_real` 계산
+→ MSE trick 으로 opt_gen update.  같은 anchor 에서 fake_score 를 x_gen.detach() 에 대한
+FM loss 로 opt_fake update.  ref_flow_decoder 는 frozen, fake_score_decoder 는 __init__
+에서 main 으로부터 deepcopy 후 on_train_start 에서 in-place state_dict sync.
+
+| key | default | 의미 |
+|---|---|---|
+| `DMD_BETA` | **1.0** | entropy knob. <1 diversity↑ (smoothing), >1 sharpening |
+| `DMD_N_ROLLOUTS` (G) | 1 | 시나리오당 closed-loop rollout 수 (variance reduction) |
+| `DMD_PRED_MAX_STEPS` | 2 | CL coarse step (×0.5s) |
+| `DMD_USE_REAL_SCORE` | true | frozen ref_flow_decoder 를 real_score teacher 로 사용 |
+| `DMD_FAKE_LR_SCALE` | 1.0 | lr_fake = lr_gen × scale |
+| `DMD_NORMALIZE` | true | Self-Forcing abs-mean normalizer |
+| `DMD_ANCHOR_STRIDE` | 1 | 매 N번째 2Hz step 만 anchor |
+| `DMD_STRICT_ACTIVE_MASK` | true | future fine step 모두 valid 인 agent 만 anchor |
+| `DMD_WARMUP_FAKE_ONLY_STEPS` | 0 | 초기 N step fake_score-only (cold-start 안전) |
+| `DMD_GEN_GRAD_CLIP` | 0.0 | gen 별도 clip (0 = BPTT_GRAD_CLIP_TRAJ 따름) |
+| `DMD_EVAL_HARD_RMM` / `_INTERVAL` | true / 5 | HardRMM 모니터링 |
+| `FLOW_FT_TARGET` | **full** | DMD generator 측은 decoder 전체 학습이 표준 |
+| `BPTT_USE_ADJOINT` | true | 3× decoder 메모리 (gen+ref+fake) 부담 완화 |
+
+**Logged keys (wandb)**:  `train/dmd/{gen_loss, fake_loss, score_diff_norm, v_real_norm,
+v_fake_norm, normalizer_mean, beta, n_valid_anchors, skip_gen, hard_rmm}` + `train/loss` alias.
+
+**β=1 sanity 기대값**:  pretrained 85MB 근처 RMM ≈ 0.7669 ±0.005 stable.  `score_diff_norm`
+은 0 에서 시작해 학습 중 0.01~0.1 범위로 증가 (fake_score 가 generator 따라잡으며 분리되는 신호).
 
 ## 5/10 검증된 best 셋팅 (85MB OCSC_clean, M=24 OL, b32)
 
