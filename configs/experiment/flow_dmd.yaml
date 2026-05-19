@@ -63,8 +63,9 @@ model:
       dmd_anchor_stride: 4
       # future fine step 모두 valid 인 agent 만 DMD anchor 사용 (OCSC 와 일관).
       dmd_strict_active_mask: true
-      # 초기 N step 은 fake_score 만 update.  0 = 즉시 alternating.
-      dmd_warmup_fake_only_steps: 0
+      # 초기 N training batch fake_score-only (critic warmup; cold-start 안전).
+      # ⚠ Self-Forcing 정합 "N batch" 의미 — smart_flow.py 의 _batches_that_stepped 카운터 기준.
+      dmd_warmup_fake_only_steps: 200
       # generator backward 후 별도 grad clip.  Self-Forcing max_grad_norm 10.0.
       dmd_gen_grad_clip: 10.0
       # ── Self-Forcing align (critic update cadence, AdamW betas, EMA) ──

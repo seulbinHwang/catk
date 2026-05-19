@@ -2776,8 +2776,14 @@ class SMARTFlow(LightningModule):
 
         agent_batch = tokenized_agent["batch"]
         device = agent_batch.device
-        _global_step = int(getattr(self, "global_step", 0))
-        skip_gen = (_global_step < warmup_fake_only)  # 초기엔 fake_score 만 학습
+        # warmup 은 "N training batches" 의미.  Lightning manual optimization 에서
+        # self.global_step 은 LightningOptimizer.step() 호출 횟수의 합이라 두 optimizer
+        # 사용 시 batch 보다 빠르게 (≈ 1.2×) 증가 → "warmup=N global_steps" 가 의도보다
+        # 일찍 끝남.  _batches_that_stepped 는 실제 training batch 카운터.
+        _batch_step = int(
+            getattr(self.trainer.fit_loop.epoch_loop, "_batches_that_stepped", 0)
+        )
+        skip_gen = (_batch_step < warmup_fake_only)  # 초기엔 fake_score 만 학습
 
         # ── 1. Encode map + full rollout cache (no_grad; encoder/trunk frozen) ─
         with torch.no_grad():
@@ -3093,19 +3099,35 @@ class SMARTFlow(LightningModule):
                 torch.nn.utils.clip_grad_norm_(_gen_params, max_norm=_gen_clip)
                 torch.nn.utils.clip_grad_norm_(_fake_params, max_norm=_gen_clip)
 
+            # ── Warmup / cadence counters (batch-based, NOT self.global_step) ─
+            # self.global_step 은 manual mode 의 opt.step() 합산 → 두 opt 사용 시
+            # batch 보다 빠르게 증가.  warmup 과 k:1 cadence 모두 "training batch"
+            # 단위가 의미라 _batches_that_stepped 를 reference 로.
+            _batch_step = int(
+                getattr(self.trainer.fit_loop.epoch_loop, "_batches_that_stepped", 0)
+            )
+            _warmup_steps = int(getattr(self.finetune_config, "dmd_warmup_fake_only_steps", 0))
+            _skip_gen = (_batch_step < _warmup_steps)
+
             # ── k:1 cadence (Self-Forcing dfake_gen_update_ratio).
-            # critic 매 step update, generator 매 k step (default 1 — full alternating).
+            # critic 매 batch update, generator 매 k batch (default 1 — full alternating).
             gen_update_ratio = max(1, int(getattr(self.finetune_config, "dmd_gen_update_ratio", 1)))
-            _do_gen_step = (int(getattr(self, "global_step", 0)) % gen_update_ratio == 0)
-            if _do_gen_step:
+            _do_gen_step = (_batch_step % gen_update_ratio == 0)
+
+            # warmup 중에는 L_gen 자체가 _run_flow_dmd_ft_step 에서 backward 안 됨 →
+            # opt_gen.step() 호출은 grad=None 으로 노옵이지만, 의도 명시 차원에서 가드.
+            if (not _skip_gen) and _do_gen_step:
                 opt_gen.step()
             opt_fake.step()
 
             # ── EMA on generator (instantaneous gen step 후 EMA update; validation 시 swap).
+            # warmup 중엔 generator 안 변하므로 EMA 도 자가 = 자가 (무해)이지만 명시 가드.
+            _ema_start = int(getattr(self.finetune_config, "dmd_ema_start_step", 0))
             if (
                 self.gen_ema is not None
+                and (not _skip_gen)
                 and _do_gen_step
-                and int(getattr(self, "global_step", 0)) >= int(getattr(self.finetune_config, "dmd_ema_start_step", 0))
+                and _batch_step >= _ema_start
             ):
                 _ema_w = float(getattr(self.finetune_config, "dmd_ema_weight", 0.0))
                 if _ema_w > 0.0:
