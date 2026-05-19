@@ -104,8 +104,8 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-0}"
 DMD_BETA="${DMD_BETA:-1.0}"
 # 시나리오당 closed-loop rollout 수 (G).  보통 1 충분.
 DMD_N_ROLLOUTS="${DMD_N_ROLLOUTS:-1}"
-# closed-loop rollout coarse(2Hz) step 수.
-DMD_PRED_MAX_STEPS="${DMD_PRED_MAX_STEPS:-2}"
+# closed-loop rollout coarse(2Hz) step 수.  T_10hz=N×shift; flow_decoder T=20 hardcode → N=4 필수.
+DMD_PRED_MAX_STEPS="${DMD_PRED_MAX_STEPS:-4}"
 # frozen ref_flow_decoder 를 real_score teacher 로 사용 (true 권장).
 DMD_USE_REAL_SCORE="${DMD_USE_REAL_SCORE:-true}"
 # fake_score lr scale (lr_fake = lr_gen × scale).

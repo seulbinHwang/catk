@@ -129,7 +129,7 @@ FM loss 로 opt_fake update.  ref_flow_decoder 는 frozen, fake_score_decoder �
 |---|---|---|
 | `DMD_BETA` | **1.0** | entropy knob. <1 diversity↑ (smoothing), >1 sharpening |
 | `DMD_N_ROLLOUTS` (G) | 1 | 시나리오당 closed-loop rollout 수 (variance reduction) |
-| `DMD_PRED_MAX_STEPS` | 2 | CL coarse step (×0.5s) |
+| `DMD_PRED_MAX_STEPS` | **4** | CL coarse step (×0.5s).  T_10hz=N×5; flow_decoder T=20 hardcode → N=4 필수 |
 | `DMD_USE_REAL_SCORE` | true | frozen ref_flow_decoder 를 real_score teacher 로 사용 |
 | `DMD_FAKE_LR_SCALE` | 1.0 | lr_fake = lr_gen × scale |
 | `DMD_NORMALIZE` | true | Self-Forcing abs-mean normalizer |

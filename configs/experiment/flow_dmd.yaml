@@ -48,8 +48,10 @@ model:
       dmd_beta: 1.0
       # G — 시나리오당 closed-loop rollout 수 (variance reduction).  보통 1 충분.
       dmd_n_rollouts: 1
-      # closed-loop rollout coarse(2Hz) step 수 (2 × 0.5s = 1초 horizon).
-      dmd_pred_max_steps: 2
+      # closed-loop rollout coarse(2Hz) step 수.  T_10hz = N × shift.
+      # flow_decoder.noisy_future_encoder 는 T=20 hardcode → shift=5 라면 N=4 필수.
+      # (다른 값 사용 시 score evaluation 단계에서 runtime error.)
+      dmd_pred_max_steps: 4
       # frozen pretrained ref_flow_decoder 를 real_score teacher 로 사용.
       # false 면 v_real=0 (BC-style fake_score 만; 디버그용, DMD signal 사라짐).
       dmd_use_real_score: true

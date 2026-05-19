@@ -2727,6 +2727,21 @@ class SMARTFlow(LightningModule):
         last_n_solver = int(getattr(self.finetune_config, "bptt_last_n_solver_steps", 0))
         _shift = int(getattr(self.encoder.agent_encoder, "shift", 5))
 
+        # score networks (flow_decoder) 의 noisy_future_encoder 가 T=num_steps hardcode.
+        # pred_max_steps × shift 가 num_steps 와 일치해야 score forward 가능.
+        _flow_decoder = self.encoder.agent_encoder.flow_decoder
+        _expected_T = int(
+            getattr(_flow_decoder, "num_future_steps", None)
+            or getattr(getattr(_flow_decoder, "noisy_future_encoder", None), "num_steps", 20)
+        )
+        _actual_T = (pred_max_steps if pred_max_steps is not None else 0) * _shift
+        if _actual_T != _expected_T:
+            raise ValueError(
+                f"self_forcing_dmd: dmd_pred_max_steps × shift ({_actual_T}) must equal "
+                f"flow_decoder.noisy_future_encoder.num_steps ({_expected_T}).  "
+                f"With shift={_shift}, set dmd_pred_max_steps={_expected_T // _shift}."
+            )
+
         # ── Validation ──────────────────────────────────────────────────────
         if data is None:
             raise ValueError("self_forcing_dmd requires `data` dict with scenario metadata.")

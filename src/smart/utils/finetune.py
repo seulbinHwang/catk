@@ -168,8 +168,10 @@ class FinetuneConfig:
     dmd_beta: float = 1.0
     #: 시나리오당 closed-loop rollout 수 (G).  Generator sample 다양화 용도.
     dmd_n_rollouts: int = 1
-    #: closed-loop rollout 의 coarse(2Hz) step 수.
-    dmd_pred_max_steps: int = 2
+    #: closed-loop rollout 의 coarse(2Hz) step 수.  T_10hz = N × shift.
+    #: score networks (flow_decoder) 는 T_10hz = 20 (= num_steps) 을 hardcode 하므로
+    #: shift=5 일 때 반드시 dmd_pred_max_steps=4 (4×5=20).  다른 값이면 runtime error.
+    dmd_pred_max_steps: int = 4
     #: True → frozen pretrained ref_flow_decoder 를 real_score teacher 로 사용.
     #: False → BC-style fake_score-only update (디버그용; DMD signal 사라짐).
     dmd_use_real_score: bool = True
