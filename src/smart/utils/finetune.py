@@ -156,6 +156,38 @@ class FinetuneConfig:
     #: 매 training step free-running closed-loop hard RMM 모니터링.
     road_eval_hard_rmm: bool = False
     road_eval_hard_rmm_interval: int = 10
+    # ── Self-Forcing DMD (Distribution Matching Distillation) ──────────────────
+    # mode="self_forcing_dmd" 분기.  Generator (main flow_decoder) + frozen real_score
+    # (ref_flow_decoder, OCSC ref 패턴 재사용) + trainable fake_score (별도 deepcopy).
+    # 매 step DMD synthetic-gradient 와 fake_score FM loss 를 alternating 으로 update.
+    #
+    # DMD gradient (spec):
+    #   ∇_θ J = E[(s_real(x_τ) − (1/β) · s_fake(x_τ)) · ∇_θ x_τ]
+    # β=1 vanilla / β<1 diversity↑ / β>1 sharpening↑.
+    #: entropy knob.  1.0 = vanilla DMD, <1 = diversity 강조, >1 = realism 강조.
+    dmd_beta: float = 1.0
+    #: 시나리오당 closed-loop rollout 수 (G).  Generator sample 다양화 용도.
+    dmd_n_rollouts: int = 1
+    #: closed-loop rollout 의 coarse(2Hz) step 수.
+    dmd_pred_max_steps: int = 2
+    #: True → frozen pretrained ref_flow_decoder 를 real_score teacher 로 사용.
+    #: False → BC-style fake_score-only update (디버그용; DMD signal 사라짐).
+    dmd_use_real_score: bool = True
+    #: fake_score optimizer learning rate scale (lr_fake = lr_gen × scale).
+    dmd_fake_lr_scale: float = 1.0
+    #: True → Self-Forcing 의 abs-mean normalizer 적용 (synthetic grad stability).
+    dmd_normalize: bool = True
+    #: 매 N 번째 2Hz step 만 DMD anchor 로 사용.
+    dmd_anchor_stride: int = 1
+    #: True → future fine step 모두 valid 인 agent 만 DMD anchor 로 사용.
+    dmd_strict_active_mask: bool = True
+    #: 초기 N step 은 fake_score 만 update (generator no-op).  cold-start 안정성.
+    dmd_warmup_fake_only_steps: int = 0
+    #: generator backward 후 별도 gradient clip (0 = OCSC 의 bptt_grad_clip_traj 따름).
+    dmd_gen_grad_clip: float = 0.0
+    #: 매 training step hard RMM 모니터링.
+    dmd_eval_hard_rmm: bool = True
+    dmd_eval_hard_rmm_interval: int = 1
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -246,6 +278,18 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         road_strict_active_mask=bool(_read_config_value(finetune, "road_strict_active_mask", True)),
         road_eval_hard_rmm=bool(_read_config_value(finetune, "road_eval_hard_rmm", False)),
         road_eval_hard_rmm_interval=int(_read_config_value(finetune, "road_eval_hard_rmm_interval", 10)),
+        dmd_beta=float(_read_config_value(finetune, "dmd_beta", 1.0)),
+        dmd_n_rollouts=int(_read_config_value(finetune, "dmd_n_rollouts", 1)),
+        dmd_pred_max_steps=int(_read_config_value(finetune, "dmd_pred_max_steps", 2)),
+        dmd_use_real_score=bool(_read_config_value(finetune, "dmd_use_real_score", True)),
+        dmd_fake_lr_scale=float(_read_config_value(finetune, "dmd_fake_lr_scale", 1.0)),
+        dmd_normalize=bool(_read_config_value(finetune, "dmd_normalize", True)),
+        dmd_anchor_stride=int(_read_config_value(finetune, "dmd_anchor_stride", 1)),
+        dmd_strict_active_mask=bool(_read_config_value(finetune, "dmd_strict_active_mask", True)),
+        dmd_warmup_fake_only_steps=int(_read_config_value(finetune, "dmd_warmup_fake_only_steps", 0)),
+        dmd_gen_grad_clip=float(_read_config_value(finetune, "dmd_gen_grad_clip", 0.0)),
+        dmd_eval_hard_rmm=bool(_read_config_value(finetune, "dmd_eval_hard_rmm", True)),
+        dmd_eval_hard_rmm_interval=int(_read_config_value(finetune, "dmd_eval_hard_rmm_interval", 1)),
     )
 
 
@@ -295,10 +339,10 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             )
         return config
 
-    if config.mode not in ("ocsc_ft", "road_ft"):
+    if config.mode not in ("ocsc_ft", "road_ft", "self_forcing_dmd"):
         raise ValueError(
             f"Unsupported finetune mode: {config.mode}. "
-            "Supported: 'ocsc_ft', 'road_ft'."
+            "Supported: 'ocsc_ft', 'road_ft', 'self_forcing_dmd'."
         )
 
     # 전체 모델 freeze 후 flow_decoder만 unfreeze
