@@ -2683,9 +2683,11 @@ class SMARTFlow(LightningModule):
           2. Sample diffusion timestep τ ~ U(eps, 1), noise ε.
              x_τ = σ_t · ε + τ · x_gen.detach()  (score 입력은 stop_grad)
           3. DMD generator loss (real/fake 모두 stop_grad 로 score evaluation):
-             g = (1/β) · v_fake − v_real  (spec 의 부호와 일관:
-             ∂L/∂x_gen = g 가 되어 update 후 x_gen ← x_gen + lr·(v_real − v_fake/β)).
-             normalizer = mean|x_gen.detach()| (per anchor, dmd_normalize 시).
+             pred_x0_{real,fake} = β_path · x_t + σ_t · v_{real,fake}
+                                   (Self-Forcing DMD convention: predicted clean x_0)
+             g = (1/β) · pred_x0_fake − pred_x0_real
+             (∂L/∂x_gen = g/normalizer 가 되어 update 후 x_gen 이 real 쪽으로 이동)
+             normalizer = mean|pred_x0_real.detach()| per anchor (dmd_normalize 시).
              target = (x_gen − g/normalizer).detach()
              L_gen = 0.5 · MSE(x_gen, target)  → manual_backward (opt_gen 만)
           4. Fake_score (critic) FM loss on generator's own rollout:
@@ -2904,11 +2906,22 @@ class SMARTFlow(LightningModule):
                         v_real = torch.zeros_like(x_t)
                     v_fake_eval = fake_score(cond_d, x_t, tau).to(dtype=torch.float32)
 
-                    # DMD synthetic gradient.  ∂L/∂x_gen 가 g 가 되어 update 후
-                    # x_gen ← x_gen + lr · (v_real − v_fake/β) 가 되도록 부호 설정.
-                    g_dmd = inv_beta * v_fake_eval - v_real                 # [n_active, T, 4]
+                    # Convert velocity → predicted clean x_0 (Self-Forcing DMD convention).
+                    #   pred_x0 = β_path · x_t + σ_t · v   (FlowODE.predict_clean_from_velocity)
+                    # ⚠ velocity 직접 사용 시 σ_t weighting 누락으로 high-noise τ 에서
+                    # noise direction 이 score difference 에 섞여 RMM 폭락 사례 (5/19 β=1 -8.6%).
+                    # pred_x0 변환 후 차이를 사용해야 Self-Forcing 정확 port.
+                    beta_path = flow_ode._beta()
+                    pred_x0_real = beta_path * x_t + view_sigma * v_real
+                    pred_x0_fake = beta_path * x_t + view_sigma * v_fake_eval
+
+                    # DMD synthetic gradient (entropy-weighted Self-Forcing form).
+                    #   g = (1/β) · pred_x0_fake − pred_x0_real
+                    # β=1: vanilla Self-Forcing.  β<1: pred_x0_fake 증폭 → diversity.
+                    g_dmd = inv_beta * pred_x0_fake - pred_x0_real          # [n_active, T, 4]
                     if use_normalize:
-                        normalizer = x_gen_d.abs().mean(
+                        # Self-Forcing 원본: abs(p_real).mean(spatial).
+                        normalizer = pred_x0_real.abs().mean(
                             dim=(-2, -1), keepdim=True
                         ).clamp_min(1e-7)
                         g_n = g_dmd / normalizer
@@ -2917,11 +2930,11 @@ class SMARTFlow(LightningModule):
                         g_n = g_dmd
                         normalizer_mean_accum += 1.0
 
-                    # logging stats (no_grad ctx)
-                    _score_diff = (v_real - v_fake_eval).abs().mean().item()
+                    # logging stats (no_grad ctx) — pred_x0 space 차이 (semantic 일관).
+                    _score_diff = (pred_x0_real - pred_x0_fake).abs().mean().item()
                     score_diff_norm_accum += float(_score_diff)
-                    v_real_norm_accum += float(v_real.abs().mean().item())
-                    v_fake_norm_accum += float(v_fake_eval.abs().mean().item())
+                    v_real_norm_accum += float(pred_x0_real.abs().mean().item())
+                    v_fake_norm_accum += float(pred_x0_fake.abs().mean().item())
 
                 # 3e. DMD generator loss (skip during warmup).
                 if not skip_gen:
