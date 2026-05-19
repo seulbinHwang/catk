@@ -68,9 +68,6 @@ model:
       dmd_warmup_fake_only_steps: 0
       # generator backward 후 별도 grad clip.  0 = bptt_grad_clip_traj 따름.
       dmd_gen_grad_clip: 0.0
-      # HardRMM 모니터링 (매 N training step).
-      dmd_eval_hard_rmm: true
-      dmd_eval_hard_rmm_interval: 5
       # ── BPTT tricks (OCSC 와 공유) ─────────────────────────────────
       # generator 측 학습 대상 module.  "full" (DMD 권장, decoder 전체 update)
       # 또는 "velocity_head" / "step_refiner_and_velocity_head" 등.

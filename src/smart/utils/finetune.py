@@ -187,9 +187,6 @@ class FinetuneConfig:
     dmd_warmup_fake_only_steps: int = 0
     #: generator backward 후 별도 gradient clip (0 = OCSC 의 bptt_grad_clip_traj 따름).
     dmd_gen_grad_clip: float = 0.0
-    #: 매 training step hard RMM 모니터링.
-    dmd_eval_hard_rmm: bool = True
-    dmd_eval_hard_rmm_interval: int = 1
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -290,8 +287,6 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         dmd_strict_active_mask=bool(_read_config_value(finetune, "dmd_strict_active_mask", True)),
         dmd_warmup_fake_only_steps=int(_read_config_value(finetune, "dmd_warmup_fake_only_steps", 0)),
         dmd_gen_grad_clip=float(_read_config_value(finetune, "dmd_gen_grad_clip", 0.0)),
-        dmd_eval_hard_rmm=bool(_read_config_value(finetune, "dmd_eval_hard_rmm", True)),
-        dmd_eval_hard_rmm_interval=int(_read_config_value(finetune, "dmd_eval_hard_rmm_interval", 1)),
     )
 
 

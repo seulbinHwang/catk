@@ -164,16 +164,14 @@ class SMARTFlow(LightningModule):
             cpd_reference=wosac_cpd_reference,
         )
 
-        # OCSC / RoaD / DMD: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
+        # OCSC / RoaD: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
+        # (DMD 는 train-time RMM 모니터링 비활성 — 의도적으로 미지원.)
         _is_ocsc = self.finetune_config.enabled and self.finetune_config.mode == "ocsc_ft"
         _is_road = self.finetune_config.enabled and self.finetune_config.mode == "road_ft"
-        _is_dmd = self.finetune_config.enabled and self.finetune_config.mode == "self_forcing_dmd"
         _want_train_rmm = (
             _is_ocsc and bool(getattr(self.finetune_config, "ocsc_eval_hard_rmm", True))
         ) or (
             _is_road and bool(getattr(self.finetune_config, "road_eval_hard_rmm", False))
-        ) or (
-            _is_dmd and bool(getattr(self.finetune_config, "dmd_eval_hard_rmm", True))
         )
         if _want_train_rmm:
             self._ocsc_train_hard_rmm: HardSimAgentsMetrics | None = HardSimAgentsMetrics("train_ocsc")
@@ -2698,7 +2696,8 @@ class SMARTFlow(LightningModule):
         Hyperparams (FinetuneConfig):
           dmd_beta, dmd_n_rollouts (G), dmd_pred_max_steps, dmd_use_real_score,
           dmd_normalize, dmd_anchor_stride, dmd_strict_active_mask,
-          dmd_warmup_fake_only_steps, dmd_eval_hard_rmm[_interval].
+          dmd_warmup_fake_only_steps, dmd_gen_grad_clip, dmd_fake_lr_scale.
+          (train-time HardRMM 모니터링 미지원 — validation 의 RMM 만 사용.)
           BPTT 토글 (bptt_use_adjoint, bptt_last_n_solver_steps,
           bptt_grad_clip_traj, bptt_warm_coarse_steps, bptt_last_coarse_only)
           은 OCSC 와 동일하게 적용.
@@ -2716,8 +2715,6 @@ class SMARTFlow(LightningModule):
         strict_active = bool(getattr(self.finetune_config, "dmd_strict_active_mask", True))
         anchor_stride = max(1, int(getattr(self.finetune_config, "dmd_anchor_stride", 1)))
         warmup_fake_only = int(getattr(self.finetune_config, "dmd_warmup_fake_only_steps", 0))
-        eval_hard_rmm = bool(getattr(self.finetune_config, "dmd_eval_hard_rmm", True))
-        eval_hard_rmm_interval = max(1, int(getattr(self.finetune_config, "dmd_eval_hard_rmm_interval", 1)))
         use_adjoint = bool(getattr(self.finetune_config, "bptt_use_adjoint", False))
         warm_coarse = int(getattr(self.finetune_config, "bptt_warm_coarse_steps", 0))
         last_coarse_only = bool(getattr(self.finetune_config, "bptt_last_coarse_only", False))
@@ -2743,24 +2740,6 @@ class SMARTFlow(LightningModule):
             )
 
         # ── Validation ──────────────────────────────────────────────────────
-        if data is None:
-            raise ValueError("self_forcing_dmd requires `data` dict with scenario metadata.")
-        if "tfrecord_path" not in data or "scenario_id" not in data:
-            raise KeyError("self_forcing_dmd requires data['tfrecord_path'] and data['scenario_id'].")
-        agent_ids = None
-        try:
-            agent_ids = data["agent"]["id"]
-        except Exception:
-            pass
-        if agent_ids is None:
-            try:
-                agent_ids = data["id"]
-            except Exception:
-                pass
-        if agent_ids is None:
-            raise KeyError("self_forcing_dmd requires agent object ids: data['agent']['id'] (or data['id']).")
-        if int(agent_ids.shape[0]) != int(tokenized_agent["batch"].shape[0]):
-            raise ValueError("agent id count mismatch")
         if self.fake_score_decoder is None:
             raise RuntimeError("self_forcing_dmd: fake_score_decoder is None (expected from __init__).")
         if use_real and self.ref_flow_decoder is None:
@@ -3016,45 +2995,7 @@ class SMARTFlow(LightningModule):
             ),
         }
 
-        # ── HardRMM monitoring (optional, free-running closed-loop) ──────────
-        if (
-            eval_hard_rmm
-            and self._ocsc_train_hard_rmm is not None
-            and (_global_step % eval_hard_rmm_interval == 0)
-        ):
-            try:
-                _G_rmm = max(1, int(getattr(self, "n_rollout_closed_val", 4)))
-                with torch.no_grad():
-                    rmm_traj_all, rmm_z_all, rmm_head_all, _ = self._run_parallel_rollout_chunk(
-                        data=data,
-                        tokenized_agent=tokenized_agent,
-                        map_feature=map_feature,
-                        rollout_cache=rollout_cache,
-                        rollout_indices=list(range(_G_rmm)),
-                        return_anchor_hidden=True,
-                        full_grad=False,
-                        max_steps=None,
-                    )
-                hard_rmm_val = self._compute_ocsc_train_hard_rmm(
-                    scenario_files=list(data["tfrecord_path"]),
-                    agent_ids=agent_ids,
-                    agent_batch=agent_batch,
-                    traj_list=[rmm_traj_all[:, g] for g in range(_G_rmm)],
-                    z_list=[rmm_z_all[:, g] for g in range(_G_rmm)],
-                    head_list=[rmm_head_all[:, g] for g in range(_G_rmm)],
-                    metric=self._ocsc_train_hard_rmm,
-                )
-                if hard_rmm_val is not None:
-                    ret["train/dmd/hard_rmm"] = torch.tensor(
-                        hard_rmm_val, dtype=torch.float32, device=device,
-                    )
-                    log.info(
-                        f"[dmd] step={_global_step} gen_loss={gen_loss_accum/max(1, n_dmd_terms):.4f} "
-                        f"fake_loss={fake_loss_accum/_denom:.4f} hard_rmm={hard_rmm_val:.4f} "
-                        f"score_diff={score_diff_norm_accum/_denom:.4f} beta={beta:.2f}"
-                    )
-            except Exception as exc:
-                log.warning(f"[dmd] hard_rmm eval failed at step={_global_step}: {exc}")
+        # (DMD: train-time HardRMM 모니터링 미지원 — validation 단계의 RMM 만 신뢰.)
 
         # ── DDP all-reduce dummy: 모든 trainable param (gen + fake) 을 dummy graph 에 연결.
         # OCSC 패턴 그대로 — anchor 수가 GPU 마다 달라도 deadlock 없이 1회 all-reduce.

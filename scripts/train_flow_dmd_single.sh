@@ -120,9 +120,6 @@ DMD_STRICT_ACTIVE_MASK="${DMD_STRICT_ACTIVE_MASK:-true}"
 DMD_WARMUP_FAKE_ONLY_STEPS="${DMD_WARMUP_FAKE_ONLY_STEPS:-0}"
 # generator 별도 grad clip (0 = bptt_grad_clip_traj 따름).
 DMD_GEN_GRAD_CLIP="${DMD_GEN_GRAD_CLIP:-0.0}"
-# HardRMM 모니터링 (DMD step 비싸니 interval 5 권장).
-DMD_EVAL_HARD_RMM="${DMD_EVAL_HARD_RMM:-true}"
-DMD_EVAL_HARD_RMM_INTERVAL="${DMD_EVAL_HARD_RMM_INTERVAL:-5}"
 
 # ── BPTT (OCSC 와 공유) ────────────────────────────────────────────────────
 # Memory 3× decoder 이므로 adjoint 강력 권장.
@@ -164,7 +161,6 @@ echo "SEED=${SEED} DATA_SHUFFLE=${DATA_SHUFFLE} DETERMINISTIC=${TRAINER_DETERMIN
 echo "DMD_BETA=${DMD_BETA} DMD_N_ROLLOUTS=${DMD_N_ROLLOUTS} DMD_PRED=${DMD_PRED_MAX_STEPS}cs DMD_USE_REAL_SCORE=${DMD_USE_REAL_SCORE}"
 echo "DMD_FAKE_LR_SCALE=${DMD_FAKE_LR_SCALE} DMD_NORMALIZE=${DMD_NORMALIZE} DMD_ANCHOR_STRIDE=${DMD_ANCHOR_STRIDE}"
 echo "DMD_STRICT=${DMD_STRICT_ACTIVE_MASK} DMD_WARMUP=${DMD_WARMUP_FAKE_ONLY_STEPS} DMD_GEN_CLIP=${DMD_GEN_GRAD_CLIP}"
-echo "DMD_EVAL_HARD_RMM=${DMD_EVAL_HARD_RMM} interval=${DMD_EVAL_HARD_RMM_INTERVAL}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_GRAD_CLIP=${BPTT_GRAD_CLIP_TRAJ} LR=${LR}"
 echo "FLOW_VELOCITY_HEAD_ONLY=${FLOW_VELOCITY_HEAD_ONLY} FLOW_FT_TARGET=${FLOW_FT_TARGET}"
 echo "OMP=${OMP_NUM_THREADS} MKL=${MKL_NUM_THREADS} NUM_WORKERS=${NUM_WORKERS} WOSAC_HARD_POOL=${WOSAC_HARD_POOL_WORKERS}"
@@ -228,8 +224,6 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.dmd_strict_active_mask="${DMD_STRICT_ACTIVE_MASK}" \
   model.model_config.finetune.dmd_warmup_fake_only_steps="${DMD_WARMUP_FAKE_ONLY_STEPS}" \
   model.model_config.finetune.dmd_gen_grad_clip="${DMD_GEN_GRAD_CLIP}" \
-  model.model_config.finetune.dmd_eval_hard_rmm="${DMD_EVAL_HARD_RMM}" \
-  model.model_config.finetune.dmd_eval_hard_rmm_interval="${DMD_EVAL_HARD_RMM_INTERVAL}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
   model.model_config.finetune.bptt_last_n_coarse_steps="${BPTT_LAST_N_COARSE_STEPS}" \
