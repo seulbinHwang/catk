@@ -1,0 +1,113 @@
+# @package _global_
+# Self-Forcing DMD (Distribution Matching Distillation) fine-tuning experiment config.
+#
+# 알고리즘 (per training step):
+#   1. Generator (main flow_decoder) 가 closed-loop rollout 으로 x_gen 생성 (grad ON).
+#   2. Diffusion timestep τ ~ U(eps, 1), noise ε → x_t = σ_t·ε + τ·x_gen.detach().
+#   3. DMD synthetic gradient (Self-Forcing MSE trick):
+#        g = (1/β)·v_fake(x_t) − v_real(x_t)   (real_score, fake_score 모두 stop_grad)
+#        target = (x_gen − g/normalizer).detach()
+#        L_gen = 0.5·MSE(x_gen, target) → opt_gen 만 update.
+#   4. Fake_score (critic) FM loss on generator's own sample (grad → opt_fake 만).
+#
+# β=1 : vanilla Self-Forcing DMD 재현.
+# β<1 : fake_score 항 ×(1/β) 증폭 → entropy↑, diversity↑.
+# β>1 : sharpening → realism↑, mode collapse risk.
+
+defaults:
+  - override /model: smart_flow
+
+action: finetune
+
+model:
+  model_config:
+    lr: 5e-6
+    lr_warmup_steps: 0
+    lr_total_steps: -1
+    lr_min_ratio: 0.1
+    weight_decay: 1e-4
+    lr_scheduler_unit: step
+    n_rollout_closed_val: 4
+    n_batch_sim_agents_metric: 2
+    validation_metric: hard
+    wosac_torch_compile: true
+    n_vis_batch: 1
+    n_vis_scenario: 2
+    n_vis_rollout: 4
+    val_open_loop: true
+    val_closed_loop: true
+    decoder:
+      flow_solver_steps: 4
+    kinematic_projection:
+      enabled: false
+    finetune:
+      enabled: true
+      mode: self_forcing_dmd
+      # ── DMD 핵심 파라미터 ────────────────────────────────────────────
+      # entropy knob (spec 의 β).  1.0 = vanilla DMD, <1 = diversity 강조, >1 = sharpening.
+      dmd_beta: 1.0
+      # G — 시나리오당 closed-loop rollout 수 (variance reduction).  보통 1 충분.
+      dmd_n_rollouts: 1
+      # closed-loop rollout coarse(2Hz) step 수 (2 × 0.5s = 1초 horizon).
+      dmd_pred_max_steps: 2
+      # frozen pretrained ref_flow_decoder 를 real_score teacher 로 사용.
+      # false 면 v_real=0 (BC-style fake_score 만; 디버그용, DMD signal 사라짐).
+      dmd_use_real_score: true
+      # fake_score (critic) optimizer lr scale (lr_fake = lr_gen × scale).
+      dmd_fake_lr_scale: 1.0
+      # Self-Forcing 의 abs-mean normalizer 적용 (synthetic gradient scale 안정화).
+      dmd_normalize: true
+      # 매 N 번째 2Hz step 만 DMD anchor 로 사용.  stride=1 → 모든 anchor.
+      dmd_anchor_stride: 1
+      # future fine step 모두 valid 인 agent 만 DMD anchor 사용 (OCSC 와 일관).
+      dmd_strict_active_mask: true
+      # 초기 N step 은 fake_score 만 update (gen no-op).  cold-start 안정성.
+      # 0 = 즉시 alternating.  fake_score 폭주 시 100~500 권장.
+      dmd_warmup_fake_only_steps: 0
+      # generator backward 후 별도 grad clip.  0 = bptt_grad_clip_traj 따름.
+      dmd_gen_grad_clip: 0.0
+      # HardRMM 모니터링 (매 N training step).
+      dmd_eval_hard_rmm: true
+      dmd_eval_hard_rmm_interval: 5
+      # ── BPTT tricks (OCSC 와 공유) ─────────────────────────────────
+      # generator 측 학습 대상 module.  "full" (DMD 권장, decoder 전체 update)
+      # 또는 "velocity_head" / "step_refiner_and_velocity_head" 등.
+      flow_velocity_head_only: false
+      flow_ft_target: "full"
+      bptt_use_adjoint: true
+      bptt_grad_clip_traj: 1.0
+      bptt_sequential_rollouts: false
+      bptt_warm_coarse_steps: 0
+      bptt_last_n_coarse_steps: 0
+      bptt_last_n_solver_steps: 0
+      bptt_last_coarse_only: false
+
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.01
+  check_val_every_n_epoch: null
+  val_check_interval: 500
+  max_epochs: 10
+  log_every_n_steps: 1
+  precision: 32-true
+  gradient_clip_val: 0
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+    save_top_k: -1
+
+data:
+  train_batch_size: 16
+  val_batch_size: 4
+  num_workers: 4
+  prefetch_factor: 1
+  # DMD 도 tfrecord 가 필요합니다 (hard RMM monitoring 용).
+  # 없으면 dmd_eval_hard_rmm=false 로 끄면 됩니다.
+  train_raw_dir: ${paths.cache_root}/validation
+  train_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
+  train_use_val_transform: true
