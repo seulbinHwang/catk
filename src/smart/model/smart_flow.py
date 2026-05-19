@@ -2889,122 +2889,124 @@ class SMARTFlow(LightningModule):
             active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
             n_valid_anchors += 1
 
-            # 3c. CL rollout (G times, each with full_grad).
-            # G=1 (DMD default): single rollout per anchor (Self-Forcing 와 동일).
-            # G>1: 같은 anchor 에서 여러 sample 로 DMD 신호 평균 (variance reduction).
-            for g in range(G):
-                pred_traj_g, _pred_z_g, pred_head_g, _ = self._run_parallel_rollout_chunk(
-                    data=data,
-                    tokenized_agent=tokenized_agent_anchor,
-                    map_feature=map_feature,
-                    rollout_cache=rollout_cache_anchor,
-                    rollout_indices=[g],
-                    return_anchor_hidden=True,
-                    full_grad=True,
-                    max_steps=pred_max_steps,
-                    warm_coarse_steps=warm_coarse,
-                )
-                if pred_traj_g.requires_grad and grad_clip > 0:
-                    pred_traj_g.register_hook(_make_norm_clip_hook(grad_clip))
-                if pred_head_g.requires_grad and grad_clip > 0:
-                    pred_head_g.register_hook(_make_norm_clip_hook(grad_clip))
+            # 3c. CL rollout — G parallel (OCSC paired L2 패턴 차용).
+            # G 개의 rollout 을 batch dim 으로 묶어 ODE solver 1 회 호출.
+            # output shape:  pred_traj_all [B, G, T_10hz, 2], pred_head_all [B, G, T_10hz]
+            pred_traj_all, _pred_z_all, pred_head_all, _ = self._run_parallel_rollout_chunk(
+                data=data,
+                tokenized_agent=tokenized_agent_anchor,
+                map_feature=map_feature,
+                rollout_cache=rollout_cache_anchor,
+                rollout_indices=list(range(G)),
+                return_anchor_hidden=True,
+                full_grad=True,
+                max_steps=pred_max_steps,
+                warm_coarse_steps=warm_coarse,
+            )
+            if pred_traj_all.requires_grad and grad_clip > 0:
+                pred_traj_all.register_hook(_make_norm_clip_hook(grad_clip))
+            if pred_head_all.requires_grad and grad_clip > 0:
+                pred_head_all.register_hook(_make_norm_clip_hook(grad_clip))
 
-                _T = pred_traj_g.shape[-2]
-                x_gen = _cl_to_norm(
-                    pred_traj_g[active_mask, 0, :_T, :],   # [n_active, T_10hz, 2]
-                    pred_head_g[active_mask, 0, :_T],      # [n_active, T_10hz]
-                    current_pos_active,
-                    current_head_active,
-                ).to(dtype=torch.float32)                  # [n_active, T_10hz, 4]
+            _T = pred_traj_all.shape[-2]
+            # active_mask 선적용 후 G 를 batch dim 으로 flatten: [n_active*G, T, ...].
+            _traj_act = pred_traj_all[active_mask]              # [n_active, G, T, 2]
+            _head_act = pred_head_all[active_mask]              # [n_active, G, T]
+            n_active = _traj_act.shape[0]
+            _traj_flat = _traj_act.reshape(n_active * G, _T, 2)
+            _head_flat = _head_act.reshape(n_active * G, _T)
+            _pos_rep = current_pos_active.repeat_interleave(G, dim=0)        # [n_active*G, 2]
+            _head_rep = current_head_active.repeat_interleave(G, dim=0)      # [n_active*G]
+            x_gen = _cl_to_norm(
+                _traj_flat, _head_flat, _pos_rep, _head_rep,
+            ).to(dtype=torch.float32)                                        # [n_active*G, T, 4]
 
-                # 3d. Sample diffusion timestep + noise (FlowODE 의 path 수식 그대로).
-                # x_t = σ_t · noise + τ · x_gen.detach()  → score 입력은 stop_grad.
-                # x_gen 자체는 별도 경로로 MSE trick 에 들어가 generator grad 를 받음.
-                with torch.no_grad():
-                    x_gen_d = x_gen.detach()
-                    tau = torch.rand(
-                        x_gen_d.shape[0], device=x_gen_d.device, dtype=x_gen_d.dtype
-                    ) * (1.0 - flow_ode.eps) + flow_ode.eps                # [n_active]
-                    noise = torch.randn_like(x_gen_d)
-                    view_tau = tau.view(-1, 1, 1)
-                    view_sigma = flow_ode._sigma_t(tau).view(-1, 1, 1)
-                    x_t = view_sigma * noise + view_tau * x_gen_d            # [n_active, T_10hz, 4]
-                    cond_d = active_hidden.detach().to(dtype=torch.float32)
+            # 3d. Sample diffusion timestep + noise (FlowODE 의 path 수식 그대로).
+            # τ, noise 는 n_active*G 차원에서 독립 sample (G 개의 rollout 마다 다른 τ).
+            with torch.no_grad():
+                x_gen_d = x_gen.detach()
+                tau = torch.rand(
+                    x_gen_d.shape[0], device=x_gen_d.device, dtype=x_gen_d.dtype
+                ) * (1.0 - flow_ode.eps) + flow_ode.eps                # [n_active*G]
+                noise = torch.randn_like(x_gen_d)
+                view_tau = tau.view(-1, 1, 1)
+                view_sigma = flow_ode._sigma_t(tau).view(-1, 1, 1)
+                x_t = view_sigma * noise + view_tau * x_gen_d            # [n_active*G, T, 4]
+                # cond 도 G 만큼 expand: [n_active, hidden] → [n_active*G, hidden].
+                cond_d = active_hidden.detach().to(dtype=torch.float32).repeat_interleave(G, dim=0)
 
-                    if use_real and ref_score is not None:
-                        v_real = ref_score(cond_d, x_t, tau).to(dtype=torch.float32)
-                    else:
-                        v_real = torch.zeros_like(x_t)
-                    v_fake_eval = fake_score(cond_d, x_t, tau).to(dtype=torch.float32)
-
-                    # Convert velocity → predicted clean x_0 (Self-Forcing DMD convention).
-                    #   pred_x0 = β_path · x_t + σ_t · v   (FlowODE.predict_clean_from_velocity)
-                    # ⚠ velocity 직접 사용 시 σ_t weighting 누락으로 high-noise τ 에서
-                    # noise direction 이 score difference 에 섞여 RMM 폭락 사례 (5/19 β=1 -8.6%).
-                    # pred_x0 변환 후 차이를 사용해야 Self-Forcing 정확 port.
-                    beta_path = flow_ode._beta()
-                    pred_x0_real = beta_path * x_t + view_sigma * v_real
-                    pred_x0_fake = beta_path * x_t + view_sigma * v_fake_eval
-
-                    # DMD synthetic gradient (entropy-weighted Self-Forcing form).
-                    #   g = (1/β) · pred_x0_fake − pred_x0_real
-                    # β=1: vanilla Self-Forcing.  β<1: pred_x0_fake 증폭 → diversity.
-                    g_dmd = inv_beta * pred_x0_fake - pred_x0_real          # [n_active, T, 4]
-                    if use_normalize:
-                        # Self-Forcing 원본: abs(p_real).mean(spatial).
-                        normalizer = pred_x0_real.abs().mean(
-                            dim=(-2, -1), keepdim=True
-                        ).clamp_min(1e-7)
-                        g_n = g_dmd / normalizer
-                        normalizer_mean_accum += float(normalizer.mean().item())
-                    else:
-                        g_n = g_dmd
-                        normalizer_mean_accum += 1.0
-
-                    # logging stats (no_grad ctx) — pred_x0 space 차이 (semantic 일관).
-                    _score_diff = (pred_x0_real - pred_x0_fake).abs().mean().item()
-                    score_diff_norm_accum += float(_score_diff)
-                    v_real_norm_accum += float(pred_x0_real.abs().mean().item())
-                    v_fake_norm_accum += float(pred_x0_fake.abs().mean().item())
-
-                # 3e. DMD generator loss (skip during warmup).
-                if not skip_gen:
-                    target = (x_gen - g_n).detach()
-                    L_gen = 0.5 * F.mse_loss(x_gen, target, reduction="mean")
-                    # anchor 평균 (anchor 수로 나눠 합산 → batch 평균과 일관).
-                    L_gen_scaled = L_gen / float(n_anchors_total * G)
-                    if torch.isfinite(L_gen_scaled).all():
-                        self.manual_backward(L_gen_scaled)
-                        gen_loss_accum += float(L_gen.item())
-                        n_dmd_terms += 1
-                    else:
-                        log.warning(f"[dmd] non-finite L_gen at anchor={anchor_idx}, g={g}; skipping")
-
-                # 3f. Fake_score (critic) FM loss on generator's own sample.
-                # x_gen detach + anchor_hidden detach → grad 는 fake_score params 로만.
-                sample_fk = flow_ode.sample(x_gen.detach().to(dtype=torch.float32), target_type="velocity")
-                v_fk = fake_score(
-                    active_hidden.detach().to(dtype=torch.float32),
-                    sample_fk.x_t,
-                    sample_fk.tau,
-                )
-                L_fake = flow_matching_loss(v_fk, sample_fk.target)
-                L_fake_scaled = L_fake / float(n_anchors_total * G)
-                if torch.isfinite(L_fake_scaled).all():
-                    self.manual_backward(L_fake_scaled)
-                    fake_loss_accum += float(L_fake.item())
+                if use_real and ref_score is not None:
+                    v_real = ref_score(cond_d, x_t, tau).to(dtype=torch.float32)
                 else:
-                    log.warning(f"[dmd] non-finite L_fake at anchor={anchor_idx}, g={g}; skipping")
+                    v_real = torch.zeros_like(x_t)
+                v_fake_eval = fake_score(cond_d, x_t, tau).to(dtype=torch.float32)
 
-                # cleanup per-rollout intermediates
-                del pred_traj_g, pred_head_g, x_gen, x_gen_d, x_t, v_fake_eval
-                if use_real:
-                    del v_real
+                # Convert velocity → predicted clean x_0 (Self-Forcing DMD convention).
+                #   pred_x0 = β_path · x_t + σ_t · v   (FlowODE.predict_clean_from_velocity)
+                beta_path = flow_ode._beta()
+                pred_x0_real = beta_path * x_t + view_sigma * v_real
+                pred_x0_fake = beta_path * x_t + view_sigma * v_fake_eval
 
+                # DMD synthetic gradient (entropy-weighted Self-Forcing form).
+                #   g = (1/β) · pred_x0_fake − pred_x0_real
+                g_dmd = inv_beta * pred_x0_fake - pred_x0_real          # [n_active*G, T, 4]
+                if use_normalize:
+                    # Self-Forcing 원본: abs(p_real).mean(spatial).  G 마다 독립 normalizer.
+                    normalizer = pred_x0_real.abs().mean(
+                        dim=(-2, -1), keepdim=True
+                    ).clamp_min(1e-7)
+                    g_n = g_dmd / normalizer
+                    normalizer_mean_accum += float(normalizer.mean().item())
+                else:
+                    g_n = g_dmd
+                    normalizer_mean_accum += 1.0
+
+                # logging stats (no_grad ctx) — pred_x0 space 차이 (semantic 일관).
+                _score_diff = (pred_x0_real - pred_x0_fake).abs().mean().item()
+                score_diff_norm_accum += float(_score_diff)
+                v_real_norm_accum += float(pred_x0_real.abs().mean().item())
+                v_fake_norm_accum += float(pred_x0_fake.abs().mean().item())
+
+            # 3e. DMD generator loss (skip during warmup).
+            # MSE 는 n_active*G 전 elements 평균 → G 차원도 자동 평균.
+            if not skip_gen:
+                target = (x_gen - g_n).detach()
+                L_gen = 0.5 * F.mse_loss(x_gen, target, reduction="mean")
+                L_gen_scaled = L_gen / float(n_anchors_total)
+                if torch.isfinite(L_gen_scaled).all():
+                    self.manual_backward(L_gen_scaled)
+                    gen_loss_accum += float(L_gen.item())
+                    n_dmd_terms += 1
+                else:
+                    log.warning(f"[dmd] non-finite L_gen at anchor={anchor_idx}; skipping")
+
+            # 3f. Fake_score (critic) FM loss on generator's own sample.
+            # x_gen detach + cond detach → grad 는 fake_score params 로만.
+            sample_fk = flow_ode.sample(x_gen.detach().to(dtype=torch.float32), target_type="velocity")
+            v_fk = fake_score(
+                cond_d,           # 이미 [n_active*G, hidden], detach 상태.
+                sample_fk.x_t,
+                sample_fk.tau,
+            )
+            L_fake = flow_matching_loss(v_fk, sample_fk.target)
+            L_fake_scaled = L_fake / float(n_anchors_total)
+            if torch.isfinite(L_fake_scaled).all():
+                self.manual_backward(L_fake_scaled)
+                fake_loss_accum += float(L_fake.item())
+            else:
+                log.warning(f"[dmd] non-finite L_fake at anchor={anchor_idx}; skipping")
+
+            # cleanup per-anchor intermediates
+            del pred_traj_all, pred_head_all, _traj_act, _head_act
+            del _traj_flat, _head_flat, _pos_rep, _head_rep
+            del x_gen, x_gen_d, x_t, v_fake_eval
+            if use_real:
+                del v_real
             del rollout_cache_anchor
 
         # ── Logging dict ─────────────────────────────────────────────────────
-        _denom = max(1, n_valid_anchors * G)
+        # G parallel: anchor 당 누적이 한 번씩 (G 차원은 mean() 안에 흡수됨).
+        _denom = max(1, n_valid_anchors)
         ret: dict = {
             "train/dmd/gen_loss": torch.tensor(
                 gen_loss_accum / max(1, n_dmd_terms), dtype=torch.float32, device=device,
