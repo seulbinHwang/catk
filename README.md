@@ -55,6 +55,35 @@ WOSAC RMM의 map-based 항목(`offroad_indication_likelihood`, `distance_to_road
 따라서 downstream relation feature 계산과 attention 입력 shape은 그대로 유지하면서, 원래 의도한 같은-scene map-agent 연결을 복구합니다.
 회귀 테스트 `test_map2agent_edge_no_silent_drop_cpu` / `_gpu`가 production packing과 같은 입력에서 brute-force 기대 edge 수와 실제 edge 수가 일치하는지 확인합니다.
 
+### Fused/Segmented Graph Attention for `AttentionLayer`
+
+`AttentionLayer`는 큰 graph attention에서 PyG `MessagePassing` 경로 대신 CAT-K 전용 segmented CUDA attention을 사용할 수 있습니다. 기본 정책은 `hybrid`입니다. edge 수가 작은 attention은 기존 PyG 경로를 그대로 쓰고, edge 수가 큰 attention만 segmented CUDA 경로로 보냅니다.
+
+이 변경은 네트워크 구조와 학습 config를 바꾸지 않습니다.
+
+- `hidden_dim`, head 수, head dimension, layer 수는 그대로입니다.
+- map-map / map-agent / temporal / agent-agent edge 생성 방식과 radius는 그대로입니다.
+- relation embedding과 attention 수식은 그대로입니다.
+- loss, optimizer, batch size는 그대로입니다.
+
+바뀌는 것은 attention 계산 실행 방식입니다. 큰 edge set에서는 target node 기준으로 edge를 정렬하고, score/softmax/value aggregation을 CUDA extension에서 처리합니다. 그래서 PyG `MessagePassing`이 만들던 edge별 attention 중간값 저장량을 줄입니다.
+
+같은 edge set을 여러 layer가 반복해서 쓰는 곳에서는 `GraphAttentionMetadata`를 한 번 만들고 재사용합니다. 이 metadata는 target 기준 edge 정렬, target별 edge 시작 위치, 정렬된 relation feature를 담습니다. 따라서 layer마다 같은 edge 정렬 작업을 반복하지 않습니다.
+
+실측 기준으로 `testa + testaa` A100 8장, `train_batch_size=12`, 80 train step에서 `82eeae3d` 직전 대비:
+
+- peak reserved memory: `73.57% -> 58.90%`
+- train speed: `0.411 it/s -> 0.642 it/s`
+- 64 epoch train-only 예상 시간: `9.13일 -> 5.86일`
+
+원인 분리 ablation에서 `82eeae3d`에 PyG backend를 강제하면 memory는 줄지 않았고, 속도만 일부 개선됐습니다. 따라서 메모리 절감의 주된 원인은 segmented CUDA attention이고, 부수적인 속도 개선은 edge metadata 정렬/재사용 refactor에서 나옵니다.
+
+검증:
+
+```bash
+python -m pytest tests/test_segmented_graph_attention.py -q
+```
+
 ### Fast WOSAC Metric
 
 - TrajTok의 `wosac_fast_eval_tool.fast_sim_agents_metrics` 구현을 `src/smart/metrics/wosac_fast_eval_tool/` 아래에 vendoring했습니다.

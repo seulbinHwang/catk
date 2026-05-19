@@ -9,6 +9,7 @@ from torch_cluster import radius_graph
 from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
+from src.smart.layers.segmented_graph_attention import build_graph_attention_metadata
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
 from src.smart.modules.dynamic_light_time import (
     build_constant_light_time_delta_norm,
@@ -840,13 +841,50 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             light_type=map_feature.get("light_type"),
         )
 
+        t_metadata = build_graph_attention_metadata(
+            edge_index=edge_index_t,
+            num_dst_nodes=n_agent * n_step,
+        )
+        r_t = t_metadata.reorder_edge_features(r_t)
+        edge_index_t = t_metadata.sorted_edge_index
+        pl2a_metadata = build_graph_attention_metadata(
+            edge_index=edge_index_pl2a,
+            num_dst_nodes=n_agent * n_step,
+        )
+        r_pl2a = pl2a_metadata.reorder_edge_features(r_pl2a)
+        edge_index_pl2a = pl2a_metadata.sorted_edge_index
+        a2a_metadata = build_graph_attention_metadata(
+            edge_index=edge_index_a2a,
+            num_dst_nodes=n_agent * n_step,
+        )
+        r_a2a = a2a_metadata.reorder_edge_features(r_a2a)
+        edge_index_a2a = a2a_metadata.sorted_edge_index
+
         feat_map = map_feature["pt_token"]
         for i in range(self.num_layers):
             feat_a = feat_a.flatten(0, 1)
-            feat_a = self.t_attn_layers[i](feat_a, r_t, edge_index_t)
+            feat_a = self.t_attn_layers[i](
+                feat_a,
+                r_t,
+                edge_index_t,
+                attention_metadata=t_metadata,
+                r_is_sorted=True,
+            )
             feat_a = feat_a.view(n_agent, n_step, -1).transpose(0, 1).flatten(0, 1)
-            feat_a = self.pt2a_attn_layers[i]((feat_map, feat_a), r_pl2a, edge_index_pl2a)
-            feat_a = self.a2a_attn_layers[i](feat_a, r_a2a, edge_index_a2a)
+            feat_a = self.pt2a_attn_layers[i](
+                (feat_map, feat_a),
+                r_pl2a,
+                edge_index_pl2a,
+                attention_metadata=pl2a_metadata,
+                r_is_sorted=True,
+            )
+            feat_a = self.a2a_attn_layers[i](
+                feat_a,
+                r_a2a,
+                edge_index_a2a,
+                attention_metadata=a2a_metadata,
+                r_is_sorted=True,
+            )
             feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
         return feat_a
 
@@ -1092,6 +1130,25 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             mask=valid_window,
         )
 
+        t_metadata = build_graph_attention_metadata(
+            edge_index=edge_index_t,
+            num_dst_nodes=n_agent * n_step,
+        )
+        r_t = t_metadata.reorder_edge_features(r_t)
+        edge_index_t = t_metadata.sorted_edge_index
+        pl2a_metadata = build_graph_attention_metadata(
+            edge_index=edge_index_pl2a,
+            num_dst_nodes=n_agent * n_step,
+        )
+        r_pl2a = pl2a_metadata.reorder_edge_features(r_pl2a)
+        edge_index_pl2a = pl2a_metadata.sorted_edge_index
+        a2a_metadata = build_graph_attention_metadata(
+            edge_index=edge_index_a2a,
+            num_dst_nodes=n_agent * n_step,
+        )
+        r_a2a = a2a_metadata.reorder_edge_features(r_a2a)
+        edge_index_a2a = a2a_metadata.sorted_edge_index
+
         feat_map = map_feature["pt_token"]
         feat_a_t_dict: Dict[int, torch.Tensor] = {}
         feat_a_now = feat_a[:, -1].clone()
@@ -1101,10 +1158,24 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 temporal_feat.flatten(0, 1),
                 r_t,
                 edge_index_t,
+                attention_metadata=t_metadata,
+                r_is_sorted=True,
             ).view(n_agent, n_step, -1)
             temporal_feat = temporal_feat.transpose(0, 1).flatten(0, 1)
-            temporal_feat = self.pt2a_attn_layers[i]((feat_map, temporal_feat), r_pl2a, edge_index_pl2a)
-            temporal_feat = self.a2a_attn_layers[i](temporal_feat, r_a2a, edge_index_a2a)
+            temporal_feat = self.pt2a_attn_layers[i](
+                (feat_map, temporal_feat),
+                r_pl2a,
+                edge_index_pl2a,
+                attention_metadata=pl2a_metadata,
+                r_is_sorted=True,
+            )
+            temporal_feat = self.a2a_attn_layers[i](
+                temporal_feat,
+                r_a2a,
+                edge_index_a2a,
+                attention_metadata=a2a_metadata,
+                r_is_sorted=True,
+            )
             temporal_feat = temporal_feat.view(n_step, n_agent, -1).transpose(0, 1)
             feat_a_now = temporal_feat[:, -1]
             if i + 1 < self.num_layers:
