@@ -120,6 +120,10 @@ class SMARTFlow(LightningModule):
         # __init__ 시점에 deepcopy 해서 configure_optimizers 가 param 을 등록할 수 있게 함.
         # 가중치는 on_train_start 에서 main flow_decoder (pretrained ckpt 적용 후) 로 in-place sync.
         self.fake_score_decoder: nn.Module | None = None
+        # DMD generator EMA (Self-Forcing 표준).  dmd_ema_weight > 0 일 때 활성.
+        # 학습은 instantaneous weights 로, validation 은 EMA weights 로 (on_validation_start/end swap).
+        self.gen_ema: nn.Module | None = None
+        self._gen_ema_swap_backup: Dict[str, Tensor] | None = None
         if self.finetune_config.enabled and self.finetune_config.mode not in (
             "ocsc_ft", "road_ft", "self_forcing_dmd"
         ):
@@ -139,6 +143,18 @@ class SMARTFlow(LightningModule):
                 f"({n_params:,} params, all trainable). Weights will be synced from "
                 "main flow_decoder in on_train_start (post-ckpt-load)."
             )
+            # Generator EMA — dmd_ema_weight > 0 일 때만 생성.
+            # validation 시 instantaneous ↔ EMA swap.
+            _ema_w = float(getattr(self.finetune_config, "dmd_ema_weight", 0.0))
+            if _ema_w > 0.0:
+                self.gen_ema = deepcopy(self.encoder.agent_encoder.flow_decoder)
+                for p in self.gen_ema.parameters():
+                    p.requires_grad_(False)
+                log.info(
+                    f"[{self.finetune_config.mode}] gen_ema constructed "
+                    f"(decay={_ema_w}, start_step={getattr(self.finetune_config, 'dmd_ema_start_step', 0)}). "
+                    "Weights will be synced from main flow_decoder in on_train_start."
+                )
 
         self.minADE = minADE()
         if bool(getattr(model_config, "wosac_torch_compile", False)):
@@ -1190,6 +1206,15 @@ class SMARTFlow(LightningModule):
             print(
                 f"[{self.finetune_config.mode}] fake_score_decoder synced from main "
                 "flow_decoder (post-ckpt-load init)."
+            )
+
+        # DMD: gen_ema 도 동일 (post-ckpt) main flow_decoder 로 sync.
+        if self._is_dmd_ft_enabled() and self.gen_ema is not None:
+            cur_state = self.encoder.agent_encoder.flow_decoder.state_dict()
+            self.gen_ema.load_state_dict(cur_state, strict=True)
+            print(
+                f"[{self.finetune_config.mode}] gen_ema synced from main flow_decoder "
+                "(post-ckpt-load init)."
             )
 
         # ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
@@ -3057,9 +3082,8 @@ class SMARTFlow(LightningModule):
                 if isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
-            # Optional separate gen grad clip (overrides bptt_grad_clip_traj for opt.step).
-            # Lightning 의 self.clip_gradients 는 manual mode + Trainer.gradient_clip_val 와
-            # 충돌하므로 torch.nn.utils.clip_grad_norm_ 을 직접 호출.
+            # Optional separate gen grad clip.  Lightning 의 self.clip_gradients 는 manual mode
+            # + Trainer.gradient_clip_val 와 충돌하므로 torch.nn.utils.clip_grad_norm_ 직접 호출.
             _dmd_clip = float(getattr(self.finetune_config, "dmd_gen_grad_clip", 0.0) or 0.0)
             _bptt_clip = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 0.0) or 0.0)
             _gen_clip = _dmd_clip if _dmd_clip > 0 else _bptt_clip
@@ -3069,8 +3093,28 @@ class SMARTFlow(LightningModule):
                 torch.nn.utils.clip_grad_norm_(_gen_params, max_norm=_gen_clip)
                 torch.nn.utils.clip_grad_norm_(_fake_params, max_norm=_gen_clip)
 
-            opt_gen.step()
+            # ── k:1 cadence (Self-Forcing dfake_gen_update_ratio).
+            # critic 매 step update, generator 매 k step (default 1 — full alternating).
+            gen_update_ratio = max(1, int(getattr(self.finetune_config, "dmd_gen_update_ratio", 1)))
+            _do_gen_step = (int(getattr(self, "global_step", 0)) % gen_update_ratio == 0)
+            if _do_gen_step:
+                opt_gen.step()
             opt_fake.step()
+
+            # ── EMA on generator (instantaneous gen step 후 EMA update; validation 시 swap).
+            if (
+                self.gen_ema is not None
+                and _do_gen_step
+                and int(getattr(self, "global_step", 0)) >= int(getattr(self.finetune_config, "dmd_ema_start_step", 0))
+            ):
+                _ema_w = float(getattr(self.finetune_config, "dmd_ema_weight", 0.0))
+                if _ema_w > 0.0:
+                    with torch.no_grad():
+                        cur_fd = self.encoder.agent_encoder.flow_decoder
+                        for p_ema, p_cur in zip(self.gen_ema.parameters(), cur_fd.parameters()):
+                            p_ema.mul_(_ema_w).add_(p_cur.detach(), alpha=(1.0 - _ema_w))
+                        for b_ema, b_cur in zip(self.gen_ema.buffers(), cur_fd.buffers()):
+                            b_ema.copy_(b_cur)
             return
 
         opt = self.optimizers()
@@ -3291,6 +3335,36 @@ class SMARTFlow(LightningModule):
             metric_dict=fp_metric_dict,
             sample_count=int(target_clean_norm.shape[0]),
         )
+
+    def on_validation_start(self) -> None:
+        """DMD: validation 직전에 generator 의 instantaneous weight 를 EMA 로 swap.
+
+        gen_ema.state_dict() 를 main flow_decoder 에 in-place load_state_dict 로 적용.
+        instantaneous state 는 self._gen_ema_swap_backup 에 보관.  on_validation_end 에서 복원.
+        """
+        if (
+            self._is_dmd_ft_enabled()
+            and self.gen_ema is not None
+            and float(getattr(self.finetune_config, "dmd_ema_weight", 0.0)) > 0.0
+        ):
+            cur_fd = self.encoder.agent_encoder.flow_decoder
+            # Backup instantaneous state (clone to avoid aliasing).
+            self._gen_ema_swap_backup = {
+                k: v.detach().clone() for k, v in cur_fd.state_dict().items()
+            }
+            cur_fd.load_state_dict(self.gen_ema.state_dict(), strict=True)
+            log.info(f"[dmd] on_validation_start: swapped flow_decoder → gen_ema weights.")
+
+    def on_validation_end(self) -> None:
+        """DMD: validation 후 instantaneous weight 복원."""
+        if (
+            self._is_dmd_ft_enabled()
+            and self._gen_ema_swap_backup is not None
+        ):
+            cur_fd = self.encoder.agent_encoder.flow_decoder
+            cur_fd.load_state_dict(self._gen_ema_swap_backup, strict=True)
+            self._gen_ema_swap_backup = None
+            log.info(f"[dmd] on_validation_end: restored flow_decoder ← instantaneous weights.")
 
     def validation_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -3556,11 +3630,15 @@ class SMARTFlow(LightningModule):
             if not fake_params:
                 raise RuntimeError("self_forcing_dmd: no trainable fake_score params.")
             fake_lr_scale = float(getattr(self.finetune_config, "dmd_fake_lr_scale", 1.0))
+            adam_beta1 = float(getattr(self.finetune_config, "dmd_adam_beta1", 0.9))
+            adam_beta2 = float(getattr(self.finetune_config, "dmd_adam_beta2", 0.999))
             opt_gen = torch.optim.AdamW(
-                gen_params, lr=self.lr, weight_decay=self.weight_decay,
+                gen_params, lr=self.lr, betas=(adam_beta1, adam_beta2),
+                weight_decay=self.weight_decay,
             )
             opt_fake = torch.optim.AdamW(
-                fake_params, lr=self.lr * fake_lr_scale, weight_decay=self.weight_decay,
+                fake_params, lr=self.lr * fake_lr_scale, betas=(adam_beta1, adam_beta2),
+                weight_decay=self.weight_decay,
             )
             sch_gen = LambdaLR(opt_gen, lr_lambda=lr_lambda)
             sch_fake = LambdaLR(opt_fake, lr_lambda=lr_lambda)
@@ -3568,7 +3646,7 @@ class SMARTFlow(LightningModule):
                 f"[self_forcing_dmd] two-optimizer setup: "
                 f"opt_gen={len(gen_params)} param tensors @ lr={self.lr:.2e}; "
                 f"opt_fake={len(fake_params)} param tensors @ lr={self.lr*fake_lr_scale:.2e} "
-                f"(scale={fake_lr_scale})."
+                f"(scale={fake_lr_scale}); AdamW betas=({adam_beta1}, {adam_beta2})."
             )
             return (
                 {"optimizer": opt_gen, "lr_scheduler": {"scheduler": sch_gen, "interval": self.lr_scheduler_unit, "frequency": 1}},
@@ -3614,11 +3692,11 @@ class SMARTFlow(LightningModule):
         if not strict:
             return incompatible_keys
 
-        # fake_score_decoder: DMD mode 에서만 on_train_start 가 deepcopy 로 생성하므로
-        # (a) DMD-saved ckpt 를 non-DMD 모드에서 load 시 unexpected 로 허용,
-        # (b) non-DMD ckpt 를 DMD 모드에서 load 시 missing 으로 허용 (on_train_start 가 채움).
-        _allowed_missing = ("residual_velocity_head", "fake_score_decoder")
-        _allowed_unexpected = ("ref_flow_decoder", "fake_score_decoder")
+        # fake_score_decoder / gen_ema: DMD mode 에서만 __init__ 또는 on_train_start 가
+        # deepcopy 로 생성하므로 (a) DMD-saved ckpt 를 non-DMD 모드에서 load 시 unexpected 로
+        # 허용, (b) non-DMD ckpt 를 DMD 모드에서 load 시 missing 으로 허용.
+        _allowed_missing = ("residual_velocity_head", "fake_score_decoder", "gen_ema")
+        _allowed_unexpected = ("ref_flow_decoder", "fake_score_decoder", "gen_ema")
         missing_keys = [
             key
             for key in incompatible_keys.missing_keys

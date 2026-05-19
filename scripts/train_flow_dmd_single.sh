@@ -120,6 +120,16 @@ DMD_STRICT_ACTIVE_MASK="${DMD_STRICT_ACTIVE_MASK:-true}"
 DMD_WARMUP_FAKE_ONLY_STEPS="${DMD_WARMUP_FAKE_ONLY_STEPS:-0}"
 # generator 별도 grad clip (0 = bptt_grad_clip_traj 따름).
 DMD_GEN_GRAD_CLIP="${DMD_GEN_GRAD_CLIP:-0.0}"
+# ── Self-Forcing align (critic update cadence, AdamW betas, EMA) ─────────
+# critic 매 step, generator 매 N step (Self-Forcing default 5).
+DMD_GEN_UPDATE_RATIO="${DMD_GEN_UPDATE_RATIO:-1}"
+# AdamW betas — Self-Forcing default (0.0, 0.999) for GAN-style stability.
+DMD_ADAM_BETA1="${DMD_ADAM_BETA1:-0.9}"
+DMD_ADAM_BETA2="${DMD_ADAM_BETA2:-0.999}"
+# Generator EMA decay (0 = disabled).  Self-Forcing default 0.99.
+DMD_EMA_WEIGHT="${DMD_EMA_WEIGHT:-0.0}"
+# EMA 시작 step (0 = step 0 즉시 시작, Self-Forcing default 200).
+DMD_EMA_START_STEP="${DMD_EMA_START_STEP:-0}"
 
 # ── BPTT (OCSC 와 공유) ────────────────────────────────────────────────────
 # Memory 3× decoder 이므로 adjoint 강력 권장.
@@ -161,6 +171,7 @@ echo "SEED=${SEED} DATA_SHUFFLE=${DATA_SHUFFLE} DETERMINISTIC=${TRAINER_DETERMIN
 echo "DMD_BETA=${DMD_BETA} DMD_N_ROLLOUTS=${DMD_N_ROLLOUTS} DMD_PRED=${DMD_PRED_MAX_STEPS}cs DMD_USE_REAL_SCORE=${DMD_USE_REAL_SCORE}"
 echo "DMD_FAKE_LR_SCALE=${DMD_FAKE_LR_SCALE} DMD_NORMALIZE=${DMD_NORMALIZE} DMD_ANCHOR_STRIDE=${DMD_ANCHOR_STRIDE}"
 echo "DMD_STRICT=${DMD_STRICT_ACTIVE_MASK} DMD_WARMUP=${DMD_WARMUP_FAKE_ONLY_STEPS} DMD_GEN_CLIP=${DMD_GEN_GRAD_CLIP}"
+echo "DMD_GEN_UPDATE_RATIO=${DMD_GEN_UPDATE_RATIO} DMD_ADAM_BETA=(${DMD_ADAM_BETA1}, ${DMD_ADAM_BETA2}) DMD_EMA=${DMD_EMA_WEIGHT} start=${DMD_EMA_START_STEP}"
 echo "BPTT_USE_ADJOINT=${BPTT_USE_ADJOINT} BPTT_GRAD_CLIP=${BPTT_GRAD_CLIP_TRAJ} LR=${LR}"
 echo "FLOW_VELOCITY_HEAD_ONLY=${FLOW_VELOCITY_HEAD_ONLY} FLOW_FT_TARGET=${FLOW_FT_TARGET}"
 echo "OMP=${OMP_NUM_THREADS} MKL=${MKL_NUM_THREADS} NUM_WORKERS=${NUM_WORKERS} WOSAC_HARD_POOL=${WOSAC_HARD_POOL_WORKERS}"
@@ -224,6 +235,11 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.dmd_strict_active_mask="${DMD_STRICT_ACTIVE_MASK}" \
   model.model_config.finetune.dmd_warmup_fake_only_steps="${DMD_WARMUP_FAKE_ONLY_STEPS}" \
   model.model_config.finetune.dmd_gen_grad_clip="${DMD_GEN_GRAD_CLIP}" \
+  model.model_config.finetune.dmd_gen_update_ratio="${DMD_GEN_UPDATE_RATIO}" \
+  model.model_config.finetune.dmd_adam_beta1="${DMD_ADAM_BETA1}" \
+  model.model_config.finetune.dmd_adam_beta2="${DMD_ADAM_BETA2}" \
+  model.model_config.finetune.dmd_ema_weight="${DMD_EMA_WEIGHT}" \
+  model.model_config.finetune.dmd_ema_start_step="${DMD_EMA_START_STEP}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
   model.model_config.finetune.bptt_last_n_coarse_steps="${BPTT_LAST_N_COARSE_STEPS}" \

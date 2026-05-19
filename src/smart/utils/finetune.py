@@ -187,6 +187,18 @@ class FinetuneConfig:
     dmd_warmup_fake_only_steps: int = 0
     #: generator backward 후 별도 gradient clip (0 = OCSC 의 bptt_grad_clip_traj 따름).
     dmd_gen_grad_clip: float = 0.0
+    #: critic update 빈도 비율.  매 step fake_score 학습, 매 N step 만 generator step.
+    #: Self-Forcing default 5 (critic 이 generator 보다 5배 자주 학습 → critic lag 방지).
+    dmd_gen_update_ratio: int = 1
+    #: AdamW beta1 for both opt_gen and opt_fake.  Self-Forcing default 0.0
+    #: (GAN-style — momentum 없음, adversarial oscillation 방지).
+    dmd_adam_beta1: float = 0.9
+    #: AdamW beta2.  Self-Forcing default 0.999.
+    dmd_adam_beta2: float = 0.999
+    #: Generator EMA decay (per gen step).  0 = disabled.  Self-Forcing default 0.99.
+    dmd_ema_weight: float = 0.0
+    #: EMA update 시작 step (0 = step 0 부터 즉시 EMA 적용).  Self-Forcing default 200.
+    dmd_ema_start_step: int = 0
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -287,6 +299,11 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         dmd_strict_active_mask=bool(_read_config_value(finetune, "dmd_strict_active_mask", True)),
         dmd_warmup_fake_only_steps=int(_read_config_value(finetune, "dmd_warmup_fake_only_steps", 0)),
         dmd_gen_grad_clip=float(_read_config_value(finetune, "dmd_gen_grad_clip", 0.0)),
+        dmd_gen_update_ratio=int(_read_config_value(finetune, "dmd_gen_update_ratio", 1)),
+        dmd_adam_beta1=float(_read_config_value(finetune, "dmd_adam_beta1", 0.9)),
+        dmd_adam_beta2=float(_read_config_value(finetune, "dmd_adam_beta2", 0.999)),
+        dmd_ema_weight=float(_read_config_value(finetune, "dmd_ema_weight", 0.0)),
+        dmd_ema_start_step=int(_read_config_value(finetune, "dmd_ema_start_step", 0)),
     )
 
 
@@ -342,7 +359,28 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
             "Supported: 'ocsc_ft', 'road_ft', 'self_forcing_dmd'."
         )
 
-    # 전체 모델 freeze 후 flow_decoder만 unfreeze
+    # ── Self-Forcing DMD: 전체 model trainable (encoder/attention/embeddings/flow_decoder)
+    # 단 residual_velocity_head 만 freeze.  paper convention (WanDiffusionWrapper full FT) 와 일치.
+    if config.mode == "self_forcing_dmd":
+        _set_requires_grad(model, True)
+        residual_head_dmd = None
+        try:
+            residual_head_dmd = model.agent_encoder.flow_decoder.residual_velocity_head
+        except AttributeError:
+            pass
+        if residual_head_dmd is not None:
+            for p in residual_head_dmd.parameters():
+                p.data.zero_()
+            _set_requires_grad(residual_head_dmd, False)
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        log.info(
+            f"Finetuning mode (self_forcing_dmd): ENTIRE model trainable "
+            f"({n_trainable:,} params: encoder + attention + map + flow_decoder), "
+            "residual_velocity_head zeroed+frozen."
+        )
+        return config
+
+    # ── OCSC / RoaD: 전체 모델 freeze 후 flow_decoder 만 unfreeze ────────────
     _set_requires_grad(model, False)
     try:
         flow_decoder = model.agent_encoder.flow_decoder
@@ -438,7 +476,7 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
     # ── 기본: 전체 flow_decoder 학습 ─────────────────────────────────────────
     _set_requires_grad(flow_decoder, True)
 
-    # residual_velocity_head는 0으로 초기화 후 freeze (base velocity만 학습)
+    # residual_velocity_head는 0으로 초기화 후 freeze (모든 모드 공통 — 의미 없음).
     if residual_head is not None:
         for p in residual_head.parameters():
             p.data.zero_()

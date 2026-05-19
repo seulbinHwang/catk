@@ -68,6 +68,16 @@ model:
       dmd_warmup_fake_only_steps: 0
       # generator backward 후 별도 grad clip.  0 = bptt_grad_clip_traj 따름.
       dmd_gen_grad_clip: 0.0
+      # ── Self-Forcing align (critic update cadence, AdamW betas, EMA) ──
+      # critic 매 step, generator 매 N step (Self-Forcing default 5).
+      dmd_gen_update_ratio: 1
+      # AdamW betas — Self-Forcing default (0.0, 0.999) for GAN-style stability.
+      dmd_adam_beta1: 0.9
+      dmd_adam_beta2: 0.999
+      # Generator EMA decay (0 = disabled).  Self-Forcing default 0.99.
+      dmd_ema_weight: 0.0
+      # EMA 시작 step (0 = step 0 부터 즉시 적용, Self-Forcing default 200).
+      dmd_ema_start_step: 0
       # ── BPTT tricks (OCSC 와 공유) ─────────────────────────────────
       # generator 측 학습 대상 module.  "full" (DMD 권장, decoder 전체 update)
       # 또는 "velocity_head" / "step_refiner_and_velocity_head" 등.
