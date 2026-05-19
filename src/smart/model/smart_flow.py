@@ -682,6 +682,49 @@ class SMARTFlow(LightningModule):
         sample_count = int(pred_dict["flow_clean_norm"].shape[0])
         return loss, metric_dict, sample_count, has_loss_targets
 
+    def _log_train_workload(
+        self,
+        *,
+        data,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        pred_dict: Dict[str, Tensor],
+        sample_count: int,
+    ) -> None:
+        """Log actual train work so sampler changes can be compared fairly."""
+        device = pred_dict["flow_clean_norm"].device
+        num_graphs = int(getattr(data, "num_graphs", 0) or 0)
+        if num_graphs <= 0:
+            try:
+                num_graphs = int(data["ptr"].numel()) - 1
+            except (KeyError, TypeError, AttributeError):
+                num_graphs = 0
+
+        loss_mask = pred_dict.get("flow_loss_mask")
+        if loss_mask is None:
+            valid_anchor_step_count = int(sample_count) * int(self.flow_window_steps)
+        else:
+            valid_anchor_step_count = int(
+                loss_mask.to(device=device, dtype=torch.bool).sum().item()
+            )
+
+        workload_items = {
+            "train/workload_scenarios": float(num_graphs),
+            "train/workload_agents": float(tokenized_agent["batch"].numel()),
+            "train/workload_map_tokens": float(tokenized_map["batch"].numel()),
+            "train/workload_valid_anchors": float(sample_count),
+            "train/workload_valid_anchor_steps": float(valid_anchor_step_count),
+        }
+        for name, value in workload_items.items():
+            self.log(
+                name,
+                torch.tensor(value, device=device, dtype=torch.float32),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+
     def _update_weighted_validation_metrics(
         self,
         metric_store: nn.ModuleDict,
@@ -2427,9 +2470,21 @@ class SMARTFlow(LightningModule):
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
-        fm_loss, open_metric_dict, _, has_open_loop_targets = self._open_loop_denoise_metrics(
+        (
+            fm_loss,
+            open_metric_dict,
+            sample_count,
+            has_open_loop_targets,
+        ) = self._open_loop_denoise_metrics(
             pred,
             zero_loss_module=self.encoder,
+        )
+        self._log_train_workload(
+            data=data,
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
+            pred_dict=pred,
+            sample_count=sample_count,
         )
         total_loss = fm_loss
         has_open_loop_targets_global = self._sync_distributed_bool_any(
@@ -2744,9 +2799,21 @@ fm_loss:
 open_metric_dict: 
     Dict[str, Tensor]
         """
-        fm_loss, open_metric_dict, _, has_open_loop_targets = self._open_loop_denoise_metrics(
+        (
+            fm_loss,
+            open_metric_dict,
+            sample_count,
+            has_open_loop_targets,
+        ) = self._open_loop_denoise_metrics(
             pred,
             zero_loss_module=self,
+        )
+        self._log_train_workload(
+            data=data,
+            tokenized_map=tokenized_map,
+            tokenized_agent=tokenized_agent,
+            pred_dict=pred,
+            sample_count=sample_count,
         )
         self._automatic_open_loop_has_target_since_step = (
             self._automatic_open_loop_has_target_since_step or has_open_loop_targets

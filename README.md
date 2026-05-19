@@ -55,6 +55,40 @@ WOSAC RMM의 map-based 항목(`offroad_indication_likelihood`, `distance_to_road
 따라서 downstream relation feature 계산과 attention 입력 shape은 그대로 유지하면서, 원래 의도한 같은-scene map-agent 연결을 복구합니다.
 회귀 테스트 `test_map2agent_edge_no_silent_drop_cpu` / `_gpu`가 production packing과 같은 입력에서 brute-force 기대 edge 수와 실제 edge 수가 일치하는지 확인합니다.
 
+### Fused Graph Attention for `AttentionLayer`
+
+Pretrain에서 CUDA peak memory를 줄이기 위해 `AttentionLayer`는 PyG `MessagePassing` 기반 edge-wise attention이나 `5e4297e`의 PyTorch chunk loop 대신 FlashAttention varlen 기반 graph attention을 사용합니다.
+
+이 변경은 네트워크 구조와 config를 바꾸지 않습니다.
+
+- `hidden_dim`, `num_heads`, `head_dim`, layer 수는 그대로입니다.
+- map-map / map-agent / temporal / agent-agent edge 생성 방식은 그대로입니다.
+- radius, `max_num_neighbors`, relation embedding, loss, optimizer, batch size는 그대로입니다.
+- attention 수식은 `softmax(q · (k + relation_key)) · (v + relation_value)` 그대로입니다.
+
+변경되는 것은 `AttentionLayer` 내부 계산 방식뿐입니다. CUDA에서는 target node별 neighbor edge를 variable-length key/value sequence로 넘겨 FlashAttention kernel에서 softmax와 value 합산을 처리합니다. backward에서는 edge tensor를 chunk 단위로 다시 만들어 현재 chunk의 gradient만 계산합니다. 따라서 edge별 score, attention weight, weighted value를 큰 tensor로 오래 저장하지 않습니다.
+
+필수 조건:
+
+```bash
+python -m pip install -r install/requirements.txt
+```
+
+`install/requirements.txt`에는 PyTorch 2.4.1/CUDA 12에 맞는 `flash-attn` wheel이 포함되어 있습니다. CUDA tensor에서 FlashAttention을 불러올 수 없으면 기존 PyG 경로로 조용히 fallback하지 않고 즉시 에러를 냅니다. CPU에서는 unit test용 reference path만 사용합니다.
+
+검증:
+
+```bash
+python -m pytest tests/test_graph_flash_attention.py -q
+```
+
+실제 pretrain에서 확인할 항목:
+
+- 같은 `data.train_batch_size` 기준 peak CUDA memory
+- `train/step_time` 또는 samples/sec
+- 초기 수천 step의 loss curve
+- validation metric drift
+
 ### Fast WOSAC Metric
 
 - TrajTok의 `wosac_fast_eval_tool.fast_sim_agents_metrics` 구현을 `src/smart/metrics/wosac_fast_eval_tool/` 아래에 vendoring했습니다.

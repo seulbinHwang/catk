@@ -175,6 +175,13 @@ def render_env_file(
     for name, value in optional_env.items():
         if value not in (None, ""):
             lines.append(export_line(name, value))
+    for item in args.remote_env:
+        if "=" not in item:
+            raise ValueError(f"--remote-env must use KEY=VALUE, got {item!r}.")
+        name, value = item.split("=", 1)
+        if not name:
+            raise ValueError(f"--remote-env must include a non-empty KEY, got {item!r}.")
+        lines.append(export_line(name, value))
     return "\n".join(lines) + "\n"
 
 
@@ -715,6 +722,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", default="")
     parser.add_argument("--learning-rate", default="")
     parser.add_argument("--extra-hydra-overrides", default="")
+    parser.add_argument(
+        "--remote-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra environment variable exported inside each pod tmux run.",
+    )
     parser.add_argument("--monitor-interval", type=int, default=30)
     parser.add_argument("--no-monitor-pane", action="store_true")
     parser.add_argument("--replace", action="store_true")

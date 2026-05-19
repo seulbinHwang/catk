@@ -427,3 +427,128 @@ class MemoryBalancedDistributedBatchSampler(Sampler[list[int]]):
         stop = self.num_global_batches * self.num_replicas
         for bin_idx in range(start, stop, self.num_replicas):
             yield bins[bin_idx].tolist()
+
+
+class MemoryBudgetDistributedBatchSampler(Sampler[list[int]]):
+    """Distributed variable-size batch sampler with a per-rank memory budget.
+
+    ``max_batch_size`` is an upper bound, not a fixed size. Each rank packs its
+    shard until adding the next sample would exceed ``target_weight``. All ranks
+    still yield the same number of batches so DDP does not hang.
+    """
+
+    def __init__(
+        self,
+        *,
+        sample_weight: torch.Tensor,
+        max_batch_size: int,
+        target_weight: float,
+        min_batch_size: int,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool,
+        seed: int = 0,
+        fraction: float = 1.0,
+    ) -> None:
+        if max_batch_size < 1:
+            raise ValueError(f"max_batch_size must be positive, got {max_batch_size}.")
+        if min_batch_size < 1:
+            raise ValueError(f"min_batch_size must be positive, got {min_batch_size}.")
+        if min_batch_size > max_batch_size:
+            raise ValueError(
+                "min_batch_size must be <= max_batch_size, "
+                f"got {min_batch_size} and {max_batch_size}."
+            )
+        if target_weight <= 0.0:
+            raise ValueError(f"target_weight must be positive, got {target_weight}.")
+        if num_replicas < 1:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}.")
+        if not 0 <= rank < num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}.")
+        if not 0.0 < float(fraction) <= 1.0:
+            raise ValueError(f"fraction must be in (0, 1], got {fraction}.")
+        if sample_weight.dim() != 1:
+            raise ValueError("sample_weight must be a 1D tensor.")
+        if sample_weight.numel() == 0:
+            raise ValueError("sample_weight must contain at least one sample.")
+
+        self.sample_weight = sample_weight.detach().cpu().to(torch.float64)
+        self.max_batch_size = int(max_batch_size)
+        self.target_weight = float(target_weight)
+        self.min_batch_size = int(min_batch_size)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.fraction = float(fraction)
+        self.epoch = 0
+
+        self.dataset_size = int(self.sample_weight.numel())
+        self.subset_size = max(1, int(math.floor(self.dataset_size * self.fraction)))
+
+    @property
+    def sampler(self):
+        return self
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self._num_batches_for_epoch(self.epoch)
+
+    def _selected_indices(self, generator: torch.Generator) -> torch.Tensor:
+        if self.shuffle:
+            indices = torch.randperm(self.dataset_size, generator=generator)
+        else:
+            indices = torch.arange(self.dataset_size)
+        return indices[: self.subset_size]
+
+    def _pack_rank_indices(self, indices: torch.Tensor) -> list[list[int]]:
+        batches: list[list[int]] = []
+        current: list[int] = []
+        current_weight = 0.0
+        for value in indices.tolist():
+            idx = int(value)
+            weight = float(self.sample_weight[idx].item())
+            would_exceed_budget = (
+                current
+                and len(current) >= self.min_batch_size
+                and current_weight + weight > self.target_weight
+            )
+            would_exceed_size = current and len(current) >= self.max_batch_size
+            if would_exceed_budget or would_exceed_size:
+                batches.append(current)
+                current = []
+                current_weight = 0.0
+            current.append(idx)
+            current_weight += weight
+        if current:
+            batches.append(current)
+        return batches
+
+    def _batches_by_rank(self, generator: torch.Generator) -> list[list[list[int]]]:
+        selected = self._selected_indices(generator)
+        batches_by_rank = []
+        for rank in range(self.num_replicas):
+            rank_indices = selected[rank:: self.num_replicas]
+            batches = self._pack_rank_indices(rank_indices)
+            if not batches:
+                fallback = int(selected[rank % int(selected.numel())].item())
+                batches = [[fallback]]
+            batches_by_rank.append(batches)
+        return batches_by_rank
+
+    def _num_batches_for_epoch(self, epoch: int) -> int:
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + int(epoch))
+        batches_by_rank = self._batches_by_rank(generator)
+        return max(len(batches) for batches in batches_by_rank)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        batches_by_rank = self._batches_by_rank(generator)
+        num_batches = max(len(batches) for batches in batches_by_rank)
+        rank_batches = batches_by_rank[self.rank]
+        for batch_idx in range(num_batches):
+            yield list(rank_batches[batch_idx % len(rank_batches)])
