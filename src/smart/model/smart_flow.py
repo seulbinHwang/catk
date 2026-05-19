@@ -116,10 +116,14 @@ class SMARTFlow(LightningModule):
             model_config.finetune,
         )
         self.ref_flow_decoder: nn.Module | None = None
-        if self.finetune_config.enabled and self.finetune_config.mode not in ("ocsc_ft", "road_ft"):
+        # DMD (self_forcing_dmd) 의 fake_score (critic) 사본.  on_train_start 에서 deepcopy.
+        self.fake_score_decoder: nn.Module | None = None
+        if self.finetune_config.enabled and self.finetune_config.mode not in (
+            "ocsc_ft", "road_ft", "self_forcing_dmd"
+        ):
             raise ValueError(
                 f"Unsupported finetune mode: {self.finetune_config.mode}. "
-                "Supported: 'ocsc_ft', 'road_ft'."
+                "Supported: 'ocsc_ft', 'road_ft', 'self_forcing_dmd'."
             )
 
         self.minADE = minADE()
@@ -1134,15 +1138,27 @@ class SMARTFlow(LightningModule):
             and self.finetune_config.mode == "road_ft"
         )
 
+    def _is_dmd_ft_enabled(self) -> bool:
+        return bool(
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "self_forcing_dmd"
+        )
+
     def on_train_start(self) -> None:
-        # OCSC: ref_flow_decoder 를 항상 생성 (open-loop target 및 delta HardRMM 모니터링 공용)
-        # ocsc_use_pretrained_ref=False 여도 delta 계산을 위해 frozen ref 가 필요하다.
+        # OCSC / DMD: ref_flow_decoder 를 항상 생성 (open-loop target / real_score teacher / delta HardRMM 모니터링 공용)
+        # OCSC: ocsc_use_pretrained_ref=False 여도 delta 계산을 위해 frozen ref 가 필요.
+        # DMD: dmd_use_real_score=True (기본) 일 때 real_score teacher 로 사용.
         _needs_ref_ocsc = (
             self.finetune_config.enabled
             and self.ref_flow_decoder is None
             and self.finetune_config.mode == "ocsc_ft"
         )
-        if _needs_ref_ocsc:
+        _needs_ref_dmd = (
+            self._is_dmd_ft_enabled()
+            and self.ref_flow_decoder is None
+            and bool(getattr(self.finetune_config, "dmd_use_real_score", True))
+        )
+        if _needs_ref_ocsc or _needs_ref_dmd:
             from copy import deepcopy
             flow_decoder = self.encoder.agent_encoder.flow_decoder
             self.ref_flow_decoder = deepcopy(flow_decoder)
@@ -1150,10 +1166,23 @@ class SMARTFlow(LightningModule):
                 p.requires_grad_(False)
             print(f"[{self.finetune_config.mode}] frozen reference model created from pretrained checkpoint.")
 
+        # DMD: fake_score_decoder (critic) — generator 와 동일 architecture, trainable, pretrained init.
+        # 별도 optimizer 로 alternating update (configure_optimizers 에서 분리).
+        if self._is_dmd_ft_enabled() and self.fake_score_decoder is None:
+            from copy import deepcopy
+            flow_decoder = self.encoder.agent_encoder.flow_decoder
+            self.fake_score_decoder = deepcopy(flow_decoder)
+            # set_model_for_finetuning 으로 generator 측 일부 param 이 freeze 됐어도
+            # fake_score 사본은 전체 trainable 로 강제 (critic 은 full update 가 표준).
+            for p in self.fake_score_decoder.parameters():
+                p.requires_grad_(True)
+            n_params = sum(p.numel() for p in self.fake_score_decoder.parameters())
+            print(f"[{self.finetune_config.mode}] fake_score_decoder (critic) created from pretrained checkpoint ({n_params:,} params, all trainable).")
+
         # ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
         # gradients (exploding Jacobian, numerical instability). Register nan_to_num
         # hooks on trainable parameters so any NaN/Inf gradient is zeroed out.
-        if self._is_ocsc_ft_enabled() or self._is_road_ft_enabled():
+        if self._is_ocsc_ft_enabled() or self._is_road_ft_enabled() or self._is_dmd_ft_enabled():
             # NaN → 0, Inf → finite large value (not 0) so the optimizer still
             # sees the direction even under mild overflow.
             n_hooked = 0
@@ -3130,8 +3159,11 @@ class SMARTFlow(LightningModule):
         if not strict:
             return incompatible_keys
 
-        _allowed_missing = ("residual_velocity_head",)
-        _allowed_unexpected = ("ref_flow_decoder",)
+        # fake_score_decoder: DMD mode 에서만 on_train_start 가 deepcopy 로 생성하므로
+        # (a) DMD-saved ckpt 를 non-DMD 모드에서 load 시 unexpected 로 허용,
+        # (b) non-DMD ckpt 를 DMD 모드에서 load 시 missing 으로 허용 (on_train_start 가 채움).
+        _allowed_missing = ("residual_velocity_head", "fake_score_decoder")
+        _allowed_unexpected = ("ref_flow_decoder", "fake_score_decoder")
         missing_keys = [
             key
             for key in incompatible_keys.missing_keys
