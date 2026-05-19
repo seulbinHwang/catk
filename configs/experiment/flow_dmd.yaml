@@ -21,7 +21,7 @@ action: finetune
 
 model:
   model_config:
-    lr: 5e-6
+    lr: 2.0e-6                      # Self-Forcing default (paper)
     lr_warmup_steps: 0
     lr_total_steps: -1
     lr_min_ratio: 0.1
@@ -55,36 +55,36 @@ model:
       # frozen pretrained ref_flow_decoder 를 real_score teacher 로 사용.
       # false 면 v_real=0 (BC-style fake_score 만; 디버그용, DMD signal 사라짐).
       dmd_use_real_score: true
-      # fake_score (critic) optimizer lr scale (lr_fake = lr_gen × scale).
-      dmd_fake_lr_scale: 1.0
+      # fake_score (critic) lr scale.  Self-Forcing: lr_critic = lr_gen / 5 = 2e-6 × 0.2.
+      dmd_fake_lr_scale: 0.2
       # Self-Forcing 의 abs-mean normalizer 적용 (synthetic gradient scale 안정화).
       dmd_normalize: true
-      # 매 N 번째 2Hz step 만 DMD anchor 로 사용.  stride=1 → 모든 anchor.
-      dmd_anchor_stride: 1
+      # 매 N 번째 2Hz step 만 DMD anchor 로 사용.  stride=4 → 4 anchor/scenario (GPU util ↑).
+      dmd_anchor_stride: 4
       # future fine step 모두 valid 인 agent 만 DMD anchor 사용 (OCSC 와 일관).
       dmd_strict_active_mask: true
-      # 초기 N step 은 fake_score 만 update (gen no-op).  cold-start 안정성.
-      # 0 = 즉시 alternating.  fake_score 폭주 시 100~500 권장.
+      # 초기 N step 은 fake_score 만 update.  0 = 즉시 alternating.
       dmd_warmup_fake_only_steps: 0
-      # generator backward 후 별도 grad clip.  0 = bptt_grad_clip_traj 따름.
-      dmd_gen_grad_clip: 0.0
+      # generator backward 후 별도 grad clip.  Self-Forcing max_grad_norm 10.0.
+      dmd_gen_grad_clip: 10.0
       # ── Self-Forcing align (critic update cadence, AdamW betas, EMA) ──
-      # critic 매 step, generator 매 N step (Self-Forcing default 5).
-      dmd_gen_update_ratio: 1
-      # AdamW betas — Self-Forcing default (0.0, 0.999) for GAN-style stability.
-      dmd_adam_beta1: 0.9
+      # critic 매 step, generator 매 N step.  Self-Forcing default 5.
+      dmd_gen_update_ratio: 5
+      # AdamW betas — Self-Forcing (0.0, 0.999) GAN-style stability (no momentum).
+      dmd_adam_beta1: 0.0
       dmd_adam_beta2: 0.999
-      # Generator EMA decay (0 = disabled).  Self-Forcing default 0.99.
-      dmd_ema_weight: 0.0
-      # EMA 시작 step (0 = step 0 부터 즉시 적용, Self-Forcing default 200).
+      # Generator EMA decay.  Self-Forcing default 0.99.
+      dmd_ema_weight: 0.99
+      # EMA 시작 step.  Self-Forcing paper 200; 우리는 0 (즉시).
       dmd_ema_start_step: 0
       # ── BPTT tricks (OCSC 와 공유) ─────────────────────────────────
-      # generator 측 학습 대상 module.  "full" (DMD 권장, decoder 전체 update)
-      # 또는 "velocity_head" / "step_refiner_and_velocity_head" 등.
+      # DMD 는 set_model_for_finetuning 의 self_forcing_dmd 분기에서 ENTIRE model
+      # trainable 로 강제 — flow_ft_target/flow_velocity_head_only 는 이 모드에서 무시.
       flow_velocity_head_only: false
       flow_ft_target: "full"
-      bptt_use_adjoint: true
-      bptt_grad_clip_traj: 1.0
+      # adjoint off (activation 저장, backward 시 재계산 X) → GPU util ↑.
+      bptt_use_adjoint: false
+      bptt_grad_clip_traj: 10.0
       bptt_sequential_rollouts: false
       bptt_warm_coarse_steps: 0
       bptt_last_n_coarse_steps: 0

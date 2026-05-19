@@ -1,16 +1,21 @@
 #!/bin/sh
 # =============================================================================
-# Self-Forcing DMD single-GPU launcher — quick smoke / β ablation
-# train_flow_consistency_bptt_single.sh 의 DMD 버전.
+# Self-Forcing DMD single-GPU launcher.  Defaults aligned with β=1 baseline (v6).
 # =============================================================================
 # 사용법:
-#   sh scripts/train_flow_dmd_single.sh
-#   DMD_BETA=0.5 MAX_EPOCHS=1 LIMIT_TRAIN_BATCHES=10 sh scripts/train_flow_dmd_single.sh
+#   sh scripts/train_flow_dmd_single.sh                                   # β=1 baseline
+#   DMD_BETA=0.7 sh scripts/train_flow_dmd_single.sh                      # β=0.7 ablation
+#   MAX_EPOCHS=1 LIMIT_TRAIN_BATCHES=10 sh scripts/train_flow_dmd_single.sh  # smoke
 #
-# DMD 특징 (vs OCSC):
-#   - 2 optimizer alternating: opt_gen (main flow_decoder) + opt_fake (critic 사본).
-#   - Memory: ~3× flow_decoder (main + ref + fake_score).  BPTT_USE_ADJOINT=true 권장.
-#   - HardRMM 모니터링 주기 5 step (DMD step 자체가 OCSC 보다 비싸므로).
+# 적용된 Self-Forcing 정합 설정 (paper port):
+#   - 전체 model trainable (encoder+attention+map+flow_decoder), residual freeze
+#   - lr_gen=2e-6, lr_critic=lr_gen×0.2=4e-7 (lr_critic=lr_gen/5)
+#   - critic:gen update ratio = 5:1 (DMD_GEN_UPDATE_RATIO=5)
+#   - AdamW betas=(0.0, 0.999) — GAN-style, no momentum
+#   - Generator EMA decay=0.99, start step 0 (즉시 적용, warmup 없음)
+#   - max_grad_norm 10.0 (gen / critic 각각)
+#   - VAL_CHECK_INTERVAL=50 (빠른 RMM trend)
+#   - anchor stride 4, TRAIN_B=32, NUM_WORKERS=4, WOSAC pool 4
 # =============================================================================
 
 export LOGLEVEL=INFO
@@ -21,7 +26,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-${OMP_NUM_THREADS}}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-${OMP_NUM_THREADS}}"
-export WOSAC_HARD_POOL_WORKERS="${WOSAC_HARD_POOL_WORKERS:-16}"
+export WOSAC_HARD_POOL_WORKERS="${WOSAC_HARD_POOL_WORKERS:-4}"
 export WOSAC_REAL_POOL_WORKERS="${WOSAC_REAL_POOL_WORKERS:-16}"
 export WOSAC_VERIFY="${WOSAC_VERIFY:-0}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -47,19 +52,19 @@ CKPT_PATH="${CKPT_PATH:-/home2/pnc2/repos_python/project/logs/pretrained/epoch_l
 TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
 
-# ── Single-scenario / smoke defaults ─────────────────────────────────────────
+# ── Defaults aligned with β=1 baseline (v6, Self-Forcing port) ─────────────
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-TRAIN_B="${TRAIN_B:-8}"
+TRAIN_B="${TRAIN_B:-32}"          # forward batch (GPU mem ~45 GB on A100 80 GB)
 VAL_B="${VAL_B:-16}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-0.01}"
 MAX_EPOCHS="${MAX_EPOCHS:-20}"
-VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-200}"
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-50}"          # 빠른 RMM 추세 (50 step ≈ ~8 min)
 CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-1}"
 LOG_EVERY_N_STEPS="${LOG_EVERY_N_STEPS:-1}"
 PRECISION="${PRECISION:-32-true}"
-NUM_WORKERS="${NUM_WORKERS:-12}"
+NUM_WORKERS="${NUM_WORKERS:-4}"   # 학습 중 CPU 효율 (이전 default 12 는 과도)
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-8}"
 PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
 PIN_MEMORY="${PIN_MEMORY:-true}"
@@ -67,8 +72,8 @@ SEED="${SEED:-817}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 TRAINER_DETERMINISTIC="${TRAINER_DETERMINISTIC:-true}"
 
-# DMD: pretrained 근처 stable 학습을 위해 보수적 LR.
-LR="${LR:-1e-6}"
+# Self-Forcing 정합 (paper default).  generator lr.
+LR="${LR:-2e-6}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-0.1}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
@@ -108,36 +113,37 @@ DMD_N_ROLLOUTS="${DMD_N_ROLLOUTS:-1}"
 DMD_PRED_MAX_STEPS="${DMD_PRED_MAX_STEPS:-4}"
 # frozen ref_flow_decoder 를 real_score teacher 로 사용 (true 권장).
 DMD_USE_REAL_SCORE="${DMD_USE_REAL_SCORE:-true}"
-# fake_score lr scale (lr_fake = lr_gen × scale).
-DMD_FAKE_LR_SCALE="${DMD_FAKE_LR_SCALE:-1.0}"
+# fake_score lr scale.  Self-Forcing: lr_critic = lr_gen / 5 = 2e-6 × 0.2 = 4e-7.
+DMD_FAKE_LR_SCALE="${DMD_FAKE_LR_SCALE:-0.2}"
 # Self-Forcing abs-mean normalizer (synthetic grad scale 안정화).
 DMD_NORMALIZE="${DMD_NORMALIZE:-true}"
-# anchor stride.
-DMD_ANCHOR_STRIDE="${DMD_ANCHOR_STRIDE:-1}"
+# anchor stride.  stride=4 → anchor 4개/scenario (GPU util ↑).
+DMD_ANCHOR_STRIDE="${DMD_ANCHOR_STRIDE:-4}"
 # future fine step valid 한 agent 만 anchor 로.
 DMD_STRICT_ACTIVE_MASK="${DMD_STRICT_ACTIVE_MASK:-true}"
 # 초기 N step fake_score-only warmup.
 DMD_WARMUP_FAKE_ONLY_STEPS="${DMD_WARMUP_FAKE_ONLY_STEPS:-0}"
-# generator 별도 grad clip (0 = bptt_grad_clip_traj 따름).
-DMD_GEN_GRAD_CLIP="${DMD_GEN_GRAD_CLIP:-0.0}"
+# generator 별도 grad clip — Self-Forcing max_grad_norm_generator default 10.0.
+DMD_GEN_GRAD_CLIP="${DMD_GEN_GRAD_CLIP:-10.0}"
 # ── Self-Forcing align (critic update cadence, AdamW betas, EMA) ─────────
-# critic 매 step, generator 매 N step (Self-Forcing default 5).
-DMD_GEN_UPDATE_RATIO="${DMD_GEN_UPDATE_RATIO:-1}"
-# AdamW betas — Self-Forcing default (0.0, 0.999) for GAN-style stability.
-DMD_ADAM_BETA1="${DMD_ADAM_BETA1:-0.9}"
+# critic 매 step, generator 매 N step.  Self-Forcing default 5.
+DMD_GEN_UPDATE_RATIO="${DMD_GEN_UPDATE_RATIO:-5}"
+# AdamW betas — Self-Forcing (0.0, 0.999) for GAN-style stability (no momentum).
+DMD_ADAM_BETA1="${DMD_ADAM_BETA1:-0.0}"
 DMD_ADAM_BETA2="${DMD_ADAM_BETA2:-0.999}"
-# Generator EMA decay (0 = disabled).  Self-Forcing default 0.99.
-DMD_EMA_WEIGHT="${DMD_EMA_WEIGHT:-0.0}"
-# EMA 시작 step (0 = step 0 즉시 시작, Self-Forcing default 200).
+# Generator EMA decay.  Self-Forcing default 0.99.
+DMD_EMA_WEIGHT="${DMD_EMA_WEIGHT:-0.99}"
+# EMA 시작 step.  Self-Forcing default 200 (paper); 우리는 0 (즉시 적용 — warmup 없음).
 DMD_EMA_START_STEP="${DMD_EMA_START_STEP:-0}"
 
 # ── BPTT (OCSC 와 공유) ────────────────────────────────────────────────────
-# Memory 3× decoder 이므로 adjoint 강력 권장.
-BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-true}"
+# DMD 는 adjoint off (= activation 저장, backward forward 재계산 X) — GPU util ↑.
+BPTT_USE_ADJOINT="${BPTT_USE_ADJOINT:-false}"
 BPTT_WARM_COARSE_STEPS="${BPTT_WARM_COARSE_STEPS:-0}"
 BPTT_LAST_N_COARSE_STEPS="${BPTT_LAST_N_COARSE_STEPS:-0}"
 BPTT_LAST_N_SOLVER_STEPS="${BPTT_LAST_N_SOLVER_STEPS:-0}"
-BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-1.0}"
+# CL trajectory level grad clip — Self-Forcing max_grad_norm 10.0.
+BPTT_GRAD_CLIP_TRAJ="${BPTT_GRAD_CLIP_TRAJ:-10.0}"
 BPTT_LAST_COARSE_ONLY="${BPTT_LAST_COARSE_ONLY:-false}"
 # DMD generator 측 학습 대상: "full" 권장 (decoder 전체 update).
 # "velocity_head" 등 부분 학습은 critic 도 같은 분기 따라가도록 자동 처리.
