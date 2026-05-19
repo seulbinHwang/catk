@@ -37,7 +37,7 @@ data:
   train_batch_size: 26
   val_batch_size: 16
   test_batch_size: 16
-  train_use_eval_agent_selection: true
+  train_use_eval_agent_selection: false
   train_memory_balanced_batches: true
   train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
   train_memory_balance_metadata_num_workers: 8

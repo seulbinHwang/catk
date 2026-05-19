@@ -77,4 +77,4 @@ data:
   test_batch_size: 4
   num_workers: 2
   prefetch_factor: 1
-  train_use_eval_agent_selection: true
+  train_use_eval_agent_selection: false

@@ -325,11 +325,11 @@ torchrun \
 
 - `model.model_config.decoder.flow_window_steps=20`
 - `data.train_batch_size=26`
-- `data.train_use_eval_agent_selection=true`
+- `data.train_use_eval_agent_selection=false`
 - `data.train_memory_balanced_batches=true`
 - `trainer.use_distributed_sampler=false`
 
-`train_use_eval_agent_selection=true`에서는 학습에서도 모든 평가 대상 agent를 살리므로 dense scene이 한 rank batch에 몰리면 CUDA peak가 튈 수 있습니다. 그래서 기본 pretrain도 memory-balanced batch sampler를 켭니다. sampler는 pkl별 agent 수 / current valid agent 수 / map point 수 같은 metadata로 batch 순서만 균형 있게 바꾸며, 학습 objective나 per-GPU batch size는 바꾸지 않습니다.
+`train_use_eval_agent_selection=false`에서는 학습에서도 모든 평가 대상 agent를 살리므로 dense scene이 한 rank batch에 몰리면 CUDA peak가 튈 수 있습니다. 그래서 기본 pretrain도 memory-balanced batch sampler를 켭니다. sampler는 pkl별 agent 수 / current valid agent 수 / map point 수 같은 metadata로 batch 순서만 균형 있게 바꾸며, 학습 objective나 per-GPU batch size는 바꾸지 않습니다.
 
 기본 `pre_bc_flow`는 직접 실행 편의성을 위해 `train_memory_balance_build_on_missing=true`입니다. metadata cache가 없으면 첫 실행에서 한 번 생성됩니다. 시작 지연을 피하려면 학습 전에 미리 만듭니다.
 
@@ -403,7 +403,7 @@ torchrun ... -m src.run \
 
 ```bash
 # pretrain에서 validation/추론과 같은 agent 기준 사용
-... data.train_use_eval_agent_selection=true
+... data.train_use_eval_agent_selection=false
 ```
 
 ### 5.1.2 NTP-Aligned Tail-Prefix Flow Supervision
@@ -668,7 +668,7 @@ model:
         cyclist_max_error_m: 2.0
 
 data:
-  train_use_eval_agent_selection: true
+  train_use_eval_agent_selection: false
   train_memory_balanced_batches: true
   train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
   train_memory_balance_build_on_missing: false
@@ -809,7 +809,7 @@ scripts/launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py
 
 `data.train_batch_size=4`는 기존 V100x47 안정 설정을 따른 값입니다. A100x4x2 run의 effective global batch는 `26 * 8 = 208`이므로 완전히 같지는 않지만, V100 32GB fleet에서 memory-safe한 기본값을 쓰고 lr은 A100 run과 같은 `6e-4`로 고정합니다.
 
-이 preset은 `train_use_eval_agent_selection=true`로 모든 agent를 살리기 때문에, dense scene 몇 개가 한 rank의 local batch에 같이 들어가면 CUDA peak가 크게 튈 수 있습니다. 그래서 pkl별 `agent_count`, current-step valid agent 수, map polyline 수만 한 번 스캔해 metadata cache로 저장하고, 이후 epoch마다 무거운 scene이 local batch 안에 몰리지 않도록 balanced batch sampler가 index 순서만 재배치합니다. 모델, loss, per-rank batch size, effective global batch `188`은 바뀌지 않고, 학습 objective도 그대로입니다.
+이 preset은 `train_use_eval_agent_selection=false`로 모든 agent를 살리기 때문에, dense scene 몇 개가 한 rank의 local batch에 같이 들어가면 CUDA peak가 크게 튈 수 있습니다. 그래서 pkl별 `agent_count`, current-step valid agent 수, map polyline 수만 한 번 스캔해 metadata cache로 저장하고, 이후 epoch마다 무거운 scene이 local batch 안에 몰리지 않도록 balanced batch sampler가 index 순서만 재배치합니다. 모델, loss, per-rank batch size, effective global batch `188`은 바뀌지 않고, 학습 objective도 그대로입니다.
 
 `shuffle=true`일 때 balanced batch sampler는 Lightning의 epoch hook을 받아 매 epoch `seed + epoch`으로 새 순서를 만듭니다. 즉 memory-balanced 제약은 유지하되, epoch마다 같은 batch 순서가 반복되지는 않습니다.
 
@@ -1135,7 +1135,7 @@ open-loop metric suffix의 `2s`는 기본 horizon 기준이며, `model.model_con
 `configs/experiment/finetune_flow_range.yaml`은
 **기존 flow checkpoint를 pure Flow Matching loss로 이어서, 학습 범위만 넓혀 새 fine-tuning run을 시작하는 설정**입니다.
 
-핵심은 `data.train_use_eval_agent_selection=true` 입니다.
+핵심은 `data.train_use_eval_agent_selection=false` 입니다.
 이 값이 켜지면 학습에서도 validation/추론과 같은 transform을 그대로 써서
 기존 학습 경로의 150m 입력 제한과 `train_mask` / `train_max_num` 제한 없이
 더 넓은 agent/anchor 범위로 FM loss를 다시 학습합니다.
@@ -1161,13 +1161,13 @@ torchrun \
 
 중요한 차이:
 
-- 이 경로는 `experiment=pre_bc_flow` + `data.train_use_eval_agent_selection=true`를 매번 길게 적지 않도록 묶어둔 preset입니다.
+- 이 경로는 `experiment=pre_bc_flow` + `data.train_use_eval_agent_selection=false`를 매번 길게 적지 않도록 묶어둔 preset입니다.
 - 즉, **pure FM fine-tuning** 입니다.
 - 첫 시작은 반드시 `action=finetune`를 사용합니다.
 - 현재 구현은 `torch.load(ckpt)["state_dict"]`만 읽고 새 optimizer / lr scheduler / epoch / global step으로 다시 시작합니다.
 - 따라서 pretrained checkpoint에서 새 FM fine-tuning run을 시작할 때만 `action=finetune`를 쓰고,
 - 시작한 fine-tuning run이 중단됐으면 그 다음부터는 위 `5.4 중단된 학습 재개하기` 방식대로 `action=fit` + 이 fine-tuning run의 `last.ckpt` 또는 `epoch_last.ckpt`를 써야 합니다.
-- `data.train_use_eval_agent_selection=true`일 때는 `WaymoTargetBuilderVal()`을 학습 transform으로 쓰므로 `data.train_max_num`은 실제로 사용되지 않습니다.
+- `data.train_use_eval_agent_selection=false`일 때는 `WaymoTargetBuilderVal()`을 학습 transform으로 쓰므로 `data.train_max_num`은 실제로 사용되지 않습니다.
 
 `finetune_flow_range` 기본 설정은 아래와 같습니다.
 
@@ -1176,7 +1176,7 @@ torchrun \
 - train batch size: `20`
 - val batch size: `16`
 - validation 주기: `4` epoch마다
-- `data.train_use_eval_agent_selection=true`
+- `data.train_use_eval_agent_selection=false`
 
 메모리 관련 주의:
 
