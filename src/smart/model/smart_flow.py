@@ -3104,12 +3104,16 @@ class SMARTFlow(LightningModule):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
             # Optional separate gen grad clip (overrides bptt_grad_clip_traj for opt.step).
+            # Lightning 의 self.clip_gradients 는 manual mode + Trainer.gradient_clip_val 와
+            # 충돌하므로 torch.nn.utils.clip_grad_norm_ 을 직접 호출.
             _dmd_clip = float(getattr(self.finetune_config, "dmd_gen_grad_clip", 0.0) or 0.0)
             _bptt_clip = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 0.0) or 0.0)
             _gen_clip = _dmd_clip if _dmd_clip > 0 else _bptt_clip
             if _gen_clip > 0:
-                self.clip_gradients(opt_gen, gradient_clip_val=_gen_clip)
-                self.clip_gradients(opt_fake, gradient_clip_val=_gen_clip)
+                _gen_params = [p for g in opt_gen.param_groups for p in g["params"]]
+                _fake_params = [p for g in opt_fake.param_groups for p in g["params"]]
+                torch.nn.utils.clip_grad_norm_(_gen_params, max_norm=_gen_clip)
+                torch.nn.utils.clip_grad_norm_(_fake_params, max_norm=_gen_clip)
 
             opt_gen.step()
             opt_fake.step()
