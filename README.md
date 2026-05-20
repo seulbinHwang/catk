@@ -729,6 +729,7 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_stati
 | OOM 완화 | agent 수 기반 memory-balanced batch sampler |
 | heterogeneous 설정 | `HeterogeneousDDPStrategy`, `HeterogeneousTorchElasticEnvironment` |
 | metadata 정책 | `--prebuild-metadata`로 sampler metadata를 먼저 만들고, 학습 중 missing build는 금지 |
+| validation 주기 | 기본 `check_val_every_n_epoch=32` |
 
 실제 6-H100 probe 결과 `train_batch_size=20`을 기본값으로 선택했습니다.
 
@@ -741,6 +742,21 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_stati
 | 26 | train forward 중 OOM | 156 | - | 약 79GB 사용 후 OOM | - | 제외 |
 
 따라서 이 6-GPU 조합에서는 `train_batch_size=20`이 안정성과 완료 속도의 균형이 가장 좋습니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다.
+
+6-GPU heterogeneous run의 안전장치는 다음과 같습니다.
+
+- launcher는 `data.train_memory_balanced_batches=true`와 `trainer.use_distributed_sampler=false`를 항상 마지막 Hydra override로 고정합니다. 이 조합에서는 memory-balanced batch sampler가 `trainer.world_size=6`을 읽어 rank별 데이터를 나누므로, 6개 GPU가 같은 train sample을 반복해서 보는 사고를 막습니다.
+- `--extra-hydra-overrides`로 `data.train_memory_balanced_batches=false` 또는 `trainer.use_distributed_sampler=true`를 넣으면 launcher가 학습 시작 전에 실패합니다.
+- datamodule도 distributed fallback을 갖습니다. 다른 실험에서 memory-balanced sampler를 끄더라도 `world_size>1`이면 train dataloader가 PyTorch `DistributedSampler`를 붙여 rank별 train sample을 나눕니다. 즉 이 launcher의 강제 설정은 OOM 완화를 위한 운영 정책이고, datamodule fallback은 중복 학습을 막는 마지막 안전장치입니다.
+- `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-2`는 rank `4~5`를 받습니다. 내부 sampler/W&B runtime metric은 실제 `world_size=6` 기준입니다. Lightning의 device summary처럼 local device 수와 node 수를 따로 보여주는 출력은 4+2 구성을 완전히 설명하지 못할 수 있으므로, step 수와 global batch는 launcher의 `manual world_size: 6` 및 W&B `train_setup/global_batch_size=120`을 기준으로 확인합니다.
+- 기본 64 epoch 학습에서는 fit-time validation이 epoch `31`, `63` 종료 후 총 2번 실행됩니다. 더 자주 RMM을 확인해야 하면 runtime 비용을 감수하고 아래처럼 16 epoch 주기로 실행합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods.py \
+  --prebuild-metadata \
+  --replace \
+  --check-val-every-n-epoch 16
+```
 
 `--prebuild-metadata`는 각 pod의 SMART cache training split을 읽어서 memory-balanced sampler용 metadata만 미리 만듭니다. SMART cache 파일 자체는 수정하지 않습니다. metadata 위치를 바꾸려면 `--metadata-cache-path /abs/path/to/cache.pt`를 쓰면 되고, launcher가 prebuild `--cache-path`와 training `data.train_memory_balance_metadata_cache` override를 같은 경로로 맞춥니다. 이전 metadata build가 비정상 종료되어 `.lock`만 남아 있으면 `--force-metadata`를 추가해 stale lock을 정리한 뒤 다시 생성합니다. 실제 build가 돌고 있는 중에는 `--force-metadata`를 쓰지 않습니다.
 

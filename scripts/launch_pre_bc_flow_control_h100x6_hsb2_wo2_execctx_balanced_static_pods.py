@@ -35,6 +35,10 @@ HETEROGENEOUS_STRATEGY_OVERRIDES = (
     "trainer.strategy._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy",
     "+trainer.strategy.cluster_environment._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment",
 )
+PINNED_BOOLEAN_OVERRIDES = {
+    "data.train_memory_balanced_batches": "true",
+    "trainer.use_distributed_sampler": "false",
+}
 
 
 def shq(value: object) -> str:
@@ -73,14 +77,51 @@ def metadata_cache_path(args: argparse.Namespace) -> str:
     return f"{args.remote_log_dir.rstrip('/')}/{DEFAULT_METADATA_CACHE_RELATIVE}"
 
 
+def hydra_override_key_value(token: str) -> tuple[str, str] | None:
+    if "=" not in token:
+        return None
+    key, value = token.split("=", 1)
+    return key.lstrip("+").strip(), value.strip().lower()
+
+
+def validate_extra_hydra_overrides(parser: argparse.ArgumentParser, overrides: str) -> None:
+    if not overrides:
+        return
+    try:
+        tokens = shlex.split(overrides)
+    except ValueError as exc:
+        parser.error(f"--extra-hydra-overrides could not be parsed: {exc}")
+    for token in tokens:
+        parsed = hydra_override_key_value(token)
+        if parsed is None:
+            continue
+        key, value = parsed
+        if key in PINNED_BOOLEAN_OVERRIDES and value != PINNED_BOOLEAN_OVERRIDES[key]:
+            parser.error(
+                f"{key}={value} is unsafe for the heterogeneous H100x6 launcher. "
+                f"This launcher pins {key}={PINNED_BOOLEAN_OVERRIDES[key]}."
+            )
+        if key == "trainer.check_val_every_n_epoch":
+            parser.error(
+                "Use --check-val-every-n-epoch instead of overriding "
+                "trainer.check_val_every_n_epoch through --extra-hydra-overrides."
+            )
+
+
 def training_extra_hydra_overrides(args: argparse.Namespace) -> str:
-    overrides = [
-        f"data.train_memory_balance_metadata_cache={metadata_cache_path(args)}",
-        "data.train_memory_balance_build_on_missing=false",
-        *HETEROGENEOUS_STRATEGY_OVERRIDES,
-    ]
+    overrides: list[str] = []
     if args.extra_hydra_overrides:
         overrides.append(args.extra_hydra_overrides)
+    overrides.extend(
+        [
+            "data.train_memory_balanced_batches=true",
+            f"data.train_memory_balance_metadata_cache={metadata_cache_path(args)}",
+            "data.train_memory_balance_build_on_missing=false",
+            "trainer.use_distributed_sampler=false",
+            f"trainer.check_val_every_n_epoch={args.check_val_every_n_epoch}",
+            *HETEROGENEOUS_STRATEGY_OVERRIDES,
+        ]
+    )
     return " ".join(overrides)
 
 
@@ -161,6 +202,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--max-epochs", default="")
     parser.add_argument(
+        "--check-val-every-n-epoch",
+        type=int,
+        default=32,
+        help=(
+            "Validation cadence for the H100x6 run. Default keeps the 64-epoch "
+            "pretrain at two fit-time validations; use 16 for four validations."
+        ),
+    )
+    parser.add_argument(
         "--extra-hydra-overrides",
         default="",
         help="Additional space-separated Hydra overrides appended after the preset.",
@@ -207,6 +257,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("--train-batch-size must be >= 1")
     if args.metadata_num_workers < 1:
         parser.error("--metadata-num-workers must be >= 1")
+    if args.check_val_every_n_epoch < 1:
+        parser.error("--check-val-every-n-epoch must be >= 1")
+    validate_extra_hydra_overrides(parser, args.extra_hydra_overrides)
     try:
         args.pod_cache_root_map = parse_pod_cache_roots(args.pod_cache_root)
     except argparse.ArgumentTypeError as exc:
