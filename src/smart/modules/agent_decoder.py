@@ -23,9 +23,9 @@ from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.modules.dynamic_light_time import (
+    NO_LANE_STATE_LIGHT_TYPE,
     build_constant_light_time_delta_norm,
-    mask_light_time_delta_norm_by_light_type,
-    resolve_light_time_delta_norm,
+    resolve_step_light_time_delta_norm,
 )
 from src.smart.utils import (
     angle_between_2d_vectors,
@@ -67,13 +67,18 @@ class SMARTAgentDecoder(nn.Module):
 
         input_dim_x_a = 3
         input_dim_r_t = 4
-        input_dim_r_pt2a = 4
+        input_dim_r_pt2a = 3
         input_dim_r_a2a = 6
         input_dim_token = 8
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
-        self.light_pl2a_emb = nn.Embedding(5, hidden_dim)
+        self.light_relation_type_emb = nn.Embedding(5, hidden_dim)
+        self.light_relation_time_emb = FourierEmbedding(
+            input_dim=1,
+            hidden_dim=hidden_dim,
+            num_freq_bands=num_freq_bands,
+        )
 
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
@@ -433,27 +438,11 @@ class SMARTAgentDecoder(nn.Module):
         light_type: Optional[torch.Tensor] = None,
         light_time_delta_norm: Optional[torch.Tensor] = None,
     ):
+        n_agent, n_step = pos_a.shape[:2]
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        if light_type is None:
-            light_type = torch.zeros(
-                pos_pl.shape[0],
-                device=pos_pl.device,
-                dtype=torch.long,
-            )
-        else:
-            light_type = light_type.to(device=pos_pl.device, dtype=torch.long)
-        light_time_delta_norm = resolve_light_time_delta_norm(
-            light_time_delta_norm=light_time_delta_norm,
-            num_agents=pos_a.shape[0],
-            num_steps=pos_a.shape[1],
-            device=pos_pl.device,
-            dtype=pos_pl.dtype,
-            shift_steps=self.shift,
-        )
-        light_time_delta_flat = light_time_delta_norm.transpose(0, 1).reshape(-1)
         # torch_cluster.radius assumes grouped batch ids. With static map tokens,
         # agent ids arrive as [scene0..N, scene0..N, ...] across time steps, so
         # sort before radius and restore the original indices afterward.
@@ -475,12 +464,6 @@ class SMARTAgentDecoder(nn.Module):
             dim=0,
         )
         edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
-        edge_light_type = light_type[edge_index_pl2a[0]]
-        edge_light_time_delta_norm = light_time_delta_flat[edge_index_pl2a[1]]
-        edge_light_time_delta_norm = mask_light_time_delta_norm_by_light_type(
-            light_time_delta_norm=edge_light_time_delta_norm,
-            light_type=edge_light_type,
-        )
         rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
         rel_orient_pl2a = wrap_angle(
             orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]]
@@ -493,15 +476,79 @@ class SMARTAgentDecoder(nn.Module):
                     nbr_vector=rel_pos_pl2a[:, :2],
                 ),
                 rel_orient_pl2a,
-                edge_light_time_delta_norm,
             ],
             dim=-1,
         )
-        r_pl2a = self.r_pt2a_emb(
-            continuous_inputs=r_pl2a,
-            categorical_embs=[self.light_pl2a_emb(edge_light_type)],
+        r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
+        r_pl2a = r_pl2a + self._build_light_relation_bias(
+            edge_index_pl2a=edge_index_pl2a,
+            light_type=light_type,
+            light_time_delta_norm=light_time_delta_norm,
+            num_map=pos_pl.shape[0],
+            num_agents=n_agent,
+            num_steps=n_step,
+            device=r_pl2a.device,
+            dtype=r_pl2a.dtype,
         )
         return edge_index_pl2a, r_pl2a
+
+    def _build_light_relation_bias(
+        self,
+        edge_index_pl2a: torch.Tensor,
+        light_type: Optional[torch.Tensor],
+        light_time_delta_norm: Optional[torch.Tensor],
+        *,
+        num_map: int,
+        num_agents: int,
+        num_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if edge_index_pl2a.numel() == 0 or num_map <= 0 or num_steps <= 0:
+            return torch.zeros(
+                edge_index_pl2a.shape[1],
+                self.hidden_dim,
+                device=device,
+                dtype=dtype,
+            )
+        if light_type is None:
+            light_type = torch.zeros(num_map, device=device, dtype=torch.long)
+        else:
+            light_type = light_type.to(device=device, dtype=torch.long)
+
+        step_light_time = resolve_step_light_time_delta_norm(
+            light_time_delta_norm=light_time_delta_norm,
+            num_steps=num_steps,
+            num_agents=num_agents,
+            device=device,
+            dtype=dtype,
+            shift_steps=self.shift,
+        )
+        num_light_types = self.light_relation_type_emb.num_embeddings
+        light_type_grid = torch.arange(
+            num_light_types,
+            device=device,
+            dtype=torch.long,
+        ).view(1, num_light_types).expand(num_steps, num_light_types)
+        light_time_grid = step_light_time.view(num_steps, 1).expand(
+            num_steps,
+            num_light_types,
+        )
+        light_bias_table = self.light_relation_time_emb(
+            continuous_inputs=light_time_grid.reshape(-1, 1),
+            categorical_embs=[
+                self.light_relation_type_emb(light_type_grid.reshape(-1))
+            ],
+        ).view(num_steps, num_light_types, self.hidden_dim)
+
+        edge_light_type = light_type[edge_index_pl2a[0]]
+        edge_step = torch.div(edge_index_pl2a[1], num_agents, rounding_mode="floor")
+        edge_light_type = edge_light_type.clamp(min=0, max=num_light_types - 1)
+        light_bias = light_bias_table[edge_step, edge_light_type]
+        has_observed_light = edge_light_type != NO_LANE_STATE_LIGHT_TYPE
+        return light_bias.masked_fill(~has_observed_light.unsqueeze(-1), 0.0).to(
+            dtype=dtype
+        )
 
     @staticmethod
     def _build_sampling_generators_by_batch(
@@ -713,6 +760,17 @@ class SMARTAgentDecoder(nn.Module):
                 edge_index_t[1] = (edge_index_t[1] + 1) // n_step - 1
 
             # In the inference stage, we only infer the current stage for recurrent
+            light_time_delta_norm = (
+                None
+                if t == 0
+                else build_constant_light_time_delta_norm(
+                    num_agents=n_agent,
+                    num_steps=hist_step,
+                    delta_seconds=float(t * self.shift) * 0.1,
+                    device=pos_a.device,
+                    dtype=pos_a.dtype,
+                )
+            )
             edge_index_pl2a, r_pl2a = self.build_map2agent_edge(
                 pos_pl=map_feature["position"],  # [n_pl, 2]
                 orient_pl=map_feature["orientation"],  # [n_pl]
@@ -723,18 +781,9 @@ class SMARTAgentDecoder(nn.Module):
                 batch_s=batch_s_pl2a,  # [n_agent*hist_step]
                 batch_pl=map_feature["batch"],  # [n_pl]
                 light_type=map_feature.get("light_type"),
-                light_time_delta_norm=(
-                    None
-                    if t == 0
-                    else build_constant_light_time_delta_norm(
-                        num_agents=n_agent,
-                        num_steps=hist_step,
-                        delta_seconds=float(t * self.shift) * 0.1,
-                        device=pos_a.device,
-                        dtype=pos_a.dtype,
-                    )
-                ),
+                light_time_delta_norm=light_time_delta_norm,
             )
+            feat_map = map_feature["pt_token"]
             motion_a = None
             motion_valid_a = None
             if hist_step == 1 and pos_a.shape[1] >= 2:
@@ -767,7 +816,7 @@ class SMARTAgentDecoder(nn.Module):
                     _feat_temporal = _feat_temporal.transpose(0, 1).flatten(0, 1)
 
                     _feat_temporal = self.pt2a_attn_layers[i](
-                        (map_feature["pt_token"], _feat_temporal), r_pl2a, edge_index_pl2a
+                        (feat_map, _feat_temporal), r_pl2a, edge_index_pl2a
                     )
                     _feat_temporal = self.a2a_attn_layers[i](
                         _feat_temporal, r_a2a, edge_index_a2a
@@ -792,7 +841,7 @@ class SMARTAgentDecoder(nn.Module):
                     # ).view(n_agent, n_step, -1)[:, -1]
 
                     feat_a_now = self.pt2a_attn_layers[i](
-                        (map_feature["pt_token"], feat_a_now), r_pl2a, edge_index_pl2a
+                        (feat_map, feat_a_now), r_pl2a, edge_index_pl2a
                     )
                     feat_a_now = self.a2a_attn_layers[i](
                         feat_a_now, r_a2a, edge_index_a2a

@@ -615,15 +615,24 @@ test 자동 제출은 실수 방지를 위해 기본으로 꺼져 있다. Waymo 
 SMART token baseline은 이제 방법론 비교에 사용한 control-space flow 실험과 같은
 traffic-light 입력 의미를 사용한다. Traffic-light state는 더 이상 static map-token
 feature로 embedding되지 않는다. Map encoder는 현재 관측된 light state만 metadata로
-보관하고, agent-to-lane attention relation에는 아래 정보가 들어간다.
+보관하고, agent-to-lane relation에 sparse factorized light bias를 더한다.
 
 - 해당 lane의 현재 관측 traffic-light state
 - `prediction_time - observed_light_time`으로 정의되는 normalized staleness scalar
 
 이 scalar는 `[-1s, 6s]`로 clip한 뒤 `6s`로 나눈다. 관측된 light가 없는 map element는
-staleness 값을 0으로 유지하고, 관측된 `UNKNOWN` light는 경과 시간 값을 그대로 가진다.
+light relation bias와 staleness 값을 0으로 유지하고, 관측된 `UNKNOWN` light는 경과 시간
+값을 그대로 가진다.
 따라서 입력 의미는 traffic light를 영구적인 map 속성으로 취급하는 것이 아니라,
 "이 lane은 Δt초 전에 state S로 관측되었다"가 된다.
+
+구현상 map token은 시간축으로 복제하지 않고 항상 `[N_map, H]` static source로 유지한다.
+Map-to-agent relation은 먼저 순수 기하 정보 `distance / bearing / relative heading`만으로
+embedding하고, traffic-light state/staleness는 작은 `[time_step, light_type]` bias table로
+factorize해서 해당 lane edge에 더한다. `NO_LANE_STATE` edge의 bias는 0이고, 관측된
+`UNKNOWN` light는 다른 관측 light처럼 staleness bias를 가진다. 이 구조는 신호등 의미는
+유지하면서, edge마다 4D Fourier relation을 만들거나 map token 전체를 시간축으로 늘리는
+비용을 피한다.
 
 SMART closed-loop rollout에서는 첫 번째 예측 0.5초 block이 현재 light를 `0s`
 staleness로 보고, 이후 block은 `0.5s`, `1.0s`, ... staleness를 사용한다. Cache builder도

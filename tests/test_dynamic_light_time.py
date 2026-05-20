@@ -7,6 +7,7 @@ from src.smart.modules.dynamic_light_time import (
     mask_light_time_delta_norm_by_light_type,
     normalize_light_time_delta_seconds,
     resolve_light_time_delta_norm,
+    resolve_step_light_time_delta_norm,
     validate_observed_current_raw_step,
 )
 
@@ -63,6 +64,26 @@ def test_resolve_light_time_accepts_scalar_and_checks_shape():
             light_time_delta_norm=torch.ones(4),
             num_agents=2,
             num_steps=3,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+
+
+def test_resolve_step_light_time_reduces_to_time_axis():
+    actual = resolve_step_light_time_delta_norm(
+        light_time_delta_norm=torch.tensor([[0.1, 0.2], [0.1, 0.2]]),
+        num_agents=2,
+        num_steps=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(actual, torch.tensor([0.1, 0.2]))
+
+    with pytest.raises(ValueError):
+        resolve_step_light_time_delta_norm(
+            light_time_delta_norm=torch.ones(3, 2),
+            num_agents=2,
+            num_steps=2,
             device=torch.device("cpu"),
             dtype=torch.float32,
         )

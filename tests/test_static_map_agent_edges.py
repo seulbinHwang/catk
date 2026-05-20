@@ -38,8 +38,6 @@ def test_map_to_agent_edges_use_static_map_tokens_across_time() -> None:
     agent_batch = torch.tensor([0, 1])
     batch_s = agent_batch.repeat(pos_a.shape[1])
     batch_pl = torch.tensor([0, 1])
-    light_type = torch.tensor([1, 2])
-
     edge_index, edge_attr = decoder.build_map2agent_edge(
         pos_pl=pos_pl,
         orient_pl=orient_pl,
@@ -49,7 +47,6 @@ def test_map_to_agent_edges_use_static_map_tokens_across_time() -> None:
         mask=mask,
         batch_s=batch_s,
         batch_pl=batch_pl,
-        light_type=light_type,
     )
 
     assert edge_index.shape[0] == 2
@@ -113,3 +110,29 @@ def test_map_to_agent_edges_keep_all_same_scene_edges_with_repeated_agent_batche
     assert not bool(torch.all(batch_s[:-1] <= batch_s[1:]))
     assert edge_index.shape[1] == int(expected_edges.item())
     assert bool(torch.all(batch_pl[edge_index[0]] == batch_s[edge_index[1]]))
+
+
+def test_dynamic_light_bias_is_sparse_relation_feature_not_map_token_feature() -> None:
+    decoder = _make_decoder()
+    edge_index = torch.tensor(
+        [
+            [0, 1, 1],
+            [0, 1, 5],
+        ]
+    )
+
+    light_bias = decoder._build_light_relation_bias(
+        edge_index_pl2a=edge_index,
+        light_type=torch.tensor([0, 2]),
+        light_time_delta_norm=None,
+        num_map=2,
+        num_agents=4,
+        num_steps=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert decoder.r_pt2a_emb.input_dim == 3
+    torch.testing.assert_close(light_bias[0], torch.zeros_like(light_bias[0]))
+    assert not bool(torch.allclose(light_bias[1], torch.zeros_like(light_bias[1])))
+    assert not bool(torch.allclose(light_bias[1], light_bias[2]))

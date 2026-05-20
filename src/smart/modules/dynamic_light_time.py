@@ -136,3 +136,57 @@ def resolve_light_time_delta_norm(
         "light_time_delta_norm must be None, scalar, 1D, or 2D tensor, "
         f"got {value.ndim}D."
     )
+
+
+def resolve_step_light_time_delta_norm(
+    *,
+    light_time_delta_norm: Optional[torch.Tensor],
+    num_steps: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    shift_steps: int = 5,
+    num_agents: Optional[int] = None,
+) -> torch.Tensor:
+    """Resolve traffic-light staleness to one value per model time step."""
+    if num_steps < 0:
+        raise ValueError(f"num_steps must be non-negative, got {num_steps}.")
+    if num_steps == 0:
+        return torch.zeros((0,), device=device, dtype=dtype)
+
+    if light_time_delta_norm is None:
+        return build_context_light_time_delta_norm(
+            num_agents=1,
+            num_steps=num_steps,
+            device=device,
+            dtype=dtype,
+            shift_steps=shift_steps,
+        )[0]
+
+    value = light_time_delta_norm.to(device=device, dtype=dtype)
+    if value.ndim == 0:
+        return value.view(1).expand(num_steps)
+    if value.ndim == 1:
+        if value.shape[0] != num_steps:
+            raise ValueError(
+                "1D light_time_delta_norm must have length num_steps, "
+                f"got {value.shape[0]} and {num_steps}."
+            )
+        return value
+    if value.ndim == 2:
+        if value.shape[1] != num_steps:
+            raise ValueError(
+                "2D light_time_delta_norm must have shape [num_agents, num_steps], "
+                f"got {tuple(value.shape)} with num_steps={num_steps}."
+            )
+        if num_agents is not None and value.shape[0] not in (0, 1, int(num_agents)):
+            raise ValueError(
+                "2D light_time_delta_norm first dimension must match num_agents "
+                f"or be 1, got {value.shape[0]} and {num_agents}."
+            )
+        if value.shape[0] == 0:
+            return torch.zeros((num_steps,), device=device, dtype=dtype)
+        return value[0]
+    raise ValueError(
+        "light_time_delta_norm must be None, scalar, 1D, or 2D tensor, "
+        f"got {value.ndim}D."
+    )
