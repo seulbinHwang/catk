@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from torch.utils.data.distributed import DistributedSampler
 
 from src.smart.datamodules.scalable_datamodule import (
     MultiDataModule,
@@ -59,6 +60,24 @@ def test_datamodule_constructs_both_train_selection_modes() -> None:
 
     assert isinstance(legacy_dm.train_transform, WaymoTargetBuilderTrain)
     assert isinstance(eval_dm.train_transform, WaymoTargetBuilderVal)
+
+
+def test_train_dataloader_shards_ddp_when_memory_balancing_is_disabled(
+    monkeypatch,
+) -> None:
+    dm = _make_datamodule(train_use_eval_agent_selection=True)
+    dm.shuffle = True
+    dm.train_memory_balanced_batching = False
+    dm.train_dataset = list(range(32))
+    dm._train_dataset_raw_dir = dm.train_raw_dir
+    dm._train_dataset_road_group_size = dm.road_num_rollouts_per_scenario
+    monkeypatch.setattr(dm, "_get_trainer_world_info", lambda: (8, 3))
+
+    loader = dm.train_dataloader()
+
+    assert isinstance(loader.sampler, DistributedSampler)
+    assert loader.sampler.num_replicas == 8
+    assert loader.sampler.rank == 3
 
 
 def _make_agent_data() -> dict:

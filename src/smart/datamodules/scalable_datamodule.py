@@ -15,6 +15,7 @@ from typing import Optional
 
 from lightning import LightningDataModule
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.loader import DataLoader
 from torch_geometric.transforms import BaseTransform
 
@@ -176,10 +177,12 @@ class MultiDataModule(LightningDataModule):
                 persistent_workers=self.persistent_workers,
             )
 
+        sampler = self._build_train_sampler(self.train_dataset)
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
-            shuffle=self.shuffle,
+            shuffle=self.shuffle if sampler is None else False,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
@@ -193,6 +196,19 @@ class MultiDataModule(LightningDataModule):
         world_size = int(getattr(trainer, "world_size", 1) or 1)
         global_rank = int(getattr(trainer, "global_rank", 0) or 0)
         return max(1, world_size), global_rank
+
+    def _build_train_sampler(self, dataset):
+        world_size, global_rank = self._get_trainer_world_info()
+        if world_size <= 1:
+            return None
+        return DistributedSampler(
+            dataset=dataset,
+            num_replicas=world_size,
+            rank=global_rank,
+            shuffle=self.shuffle,
+            seed=self.train_memory_balance_seed,
+            drop_last=False,
+        )
 
     def _build_eval_sampler(self, dataset):
         world_size, global_rank = self._get_trainer_world_info()
