@@ -377,7 +377,7 @@ torchrun ... -m src.run \
 
 ### 5.1.1 학습 agent 선택을 validation/추론과 같게 맞추기
 
-기본값은 `data.train_use_eval_agent_selection=false` 입니다.
+기본값은 `data.train_use_eval_agent_selection=true` 입니다.
 
 - `false`면 기존과 같습니다. 학습 입력 agent는 ego 기준 150m 안만 남기고, 학습 대상은 ego/예측 특별 대상과 ego 기준 100m 안이면서 미래 유효 길이가 충분한 agent 중 최대 `data.train_max_num`개를 사용합니다.
 - `true`면 학습에서도 validation/추론용 transform을 그대로 사용합니다. 따라서 별도의 150m 입력 제한과 `train_mask` / `train_max_num` 제한을 추가하지 않습니다. 이 경우 학습 입력 agent와 학습 대상 anchor가 validation/추론과 같은 기준으로 정해집니다.
@@ -1151,14 +1151,9 @@ torchrun \
 ... trainer.limit_val_batches=1.0
 ```
 
-학습 범위를 "validation/추론과 완전히 같은 기준"으로 넓히는 것이 아니라,
-기존 train 규칙 안에서 학습 대상 수만 늘리고 싶다면 아래처럼 하면 됩니다.
-
-```bash
-... data.train_use_eval_agent_selection=false data.train_max_num=48
-```
-
-다만 이 경우에도 150m 입력 제한과 ego 기준 100m 학습 대상 제한은 그대로 남습니다.
+`data.train_use_eval_agent_selection=true`에서는 validation/추론과 같은 agent 선택 규칙을 쓰므로
+`data.train_max_num`은 적용되지 않습니다. 메모리가 빠듯하면 학습 대상 수를 다시 제한하는 대신
+batch size, memory-balanced sampler, worker 수를 먼저 조정하는 것을 권장합니다.
 
 ### 5.9 4x H100 80GB 에서 Flow Matching pretrain
 
