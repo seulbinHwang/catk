@@ -112,7 +112,7 @@ def test_map_to_agent_edges_keep_all_same_scene_edges_with_repeated_agent_batche
     assert bool(torch.all(batch_pl[edge_index[0]] == batch_s[edge_index[1]]))
 
 
-def test_dynamic_light_bias_is_sparse_relation_feature_not_map_token_feature() -> None:
+def test_dynamic_light_relation_uses_pre_to_out_factorization() -> None:
     decoder = _make_decoder()
     edge_index = torch.tensor(
         [
@@ -120,8 +120,16 @@ def test_dynamic_light_bias_is_sparse_relation_feature_not_map_token_feature() -
             [0, 1, 5],
         ]
     )
+    geometry_relation = torch.tensor(
+        [
+            [1.0, 0.1, 0.0],
+            [1.0, 0.1, 0.0],
+            [1.0, 0.1, 0.0],
+        ]
+    )
 
-    light_bias = decoder._build_light_relation_bias(
+    actual = decoder._build_map2agent_relation_embedding(
+        geometry_relation=geometry_relation,
         edge_index_pl2a=edge_index,
         light_type=torch.tensor([0, 2]),
         light_time_delta_norm=None,
@@ -132,7 +140,49 @@ def test_dynamic_light_bias_is_sparse_relation_feature_not_map_token_feature() -
         dtype=torch.float32,
     )
 
-    assert decoder.r_pt2a_emb.input_dim == 3
-    torch.testing.assert_close(light_bias[0], torch.zeros_like(light_bias[0]))
-    assert not bool(torch.allclose(light_bias[1], torch.zeros_like(light_bias[1])))
-    assert not bool(torch.allclose(light_bias[1], light_bias[2]))
+    assert decoder.r_pt2a_emb.input_dim == 4
+    assert actual.shape == (edge_index.shape[1], decoder.hidden_dim)
+    assert not bool(torch.allclose(actual[0], torch.zeros_like(actual[0])))
+    assert not bool(torch.allclose(actual[1], actual[2]))
+
+
+def test_no_lane_state_uses_zero_stale_scalar_not_zero_relation_bias() -> None:
+    decoder = _make_decoder()
+    edge_index = torch.tensor(
+        [
+            [0, 0],
+            [0, 1],
+        ]
+    )
+    geometry_relation = torch.tensor(
+        [
+            [1.0, 0.1, 0.0],
+            [1.0, 0.1, 0.0],
+        ]
+    )
+
+    actual = decoder._build_map2agent_relation_embedding(
+        geometry_relation=geometry_relation,
+        edge_index_pl2a=edge_index,
+        light_type=torch.tensor([0]),
+        light_time_delta_norm=torch.tensor([0.25, 0.75]),
+        num_map=1,
+        num_agents=1,
+        num_steps=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    expected = decoder._build_map2agent_relation_embedding(
+        geometry_relation=geometry_relation,
+        edge_index_pl2a=edge_index,
+        light_type=torch.tensor([0]),
+        light_time_delta_norm=torch.tensor([0.0, 0.0]),
+        num_map=1,
+        num_agents=1,
+        num_steps=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert not bool(torch.allclose(actual[0], torch.zeros_like(actual[0])))

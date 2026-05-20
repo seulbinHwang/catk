@@ -620,27 +620,39 @@ test 자동 제출은 실수 방지를 위해 기본으로 꺼져 있다. Waymo 
 
 ### SMART 기준 모델의 동적 신호등 관측 경과 시간
 
-SMART token baseline은 이제 방법론 비교에 사용한 control-space flow 실험과 같은
-traffic-light 입력 의미를 사용한다. Traffic-light state는 더 이상 static map-token
-feature로 embedding되지 않는다. Map encoder는 현재 관측된 light state만 metadata로
-보관하고, agent-to-lane relation에 sparse factorized light bias를 더한다.
+SMART token baseline은 방법론 비교에 사용한 control-space flow 실험과 같은
+traffic-light 입력 의미를 사용한다. Traffic-light state는 static map-token feature로
+embedding하지 않는다. Map encoder는 현재 관측된 light state만 metadata로 보관하고,
+map-to-agent relation을 만들 때 아래 정보를 함께 사용한다.
 
 - 해당 lane의 현재 관측 traffic-light state
 - `prediction_time - observed_light_time`으로 정의되는 normalized staleness scalar
 
 이 scalar는 `[-1s, 6s]`로 clip한 뒤 `6s`로 나눈다. 관측된 light가 없는 map element는
-light relation bias와 staleness 값을 0으로 유지하고, 관측된 `UNKNOWN` light는 경과 시간
-값을 그대로 가진다.
-따라서 입력 의미는 traffic light를 영구적인 map 속성으로 취급하는 것이 아니라,
-"이 lane은 Δt초 전에 state S로 관측되었다"가 된다.
+`NO_LANE_STATE` type을 유지하고 stale scalar만 `0`으로 둔다. 관측된 `UNKNOWN` light는
+신호가 관측된 lane으로 취급하므로 경과 시간 값을 그대로 가진다. 따라서 입력 의미는 traffic
+light를 영구적인 map 속성으로 취급하는 것이 아니라, "이 lane은 Δt초 전에 state S로
+관측되었다"가 된다.
 
 구현상 map token은 시간축으로 복제하지 않고 항상 `[N_map, H]` static source로 유지한다.
-Map-to-agent relation은 먼저 순수 기하 정보 `distance / bearing / relative heading`만으로
-embedding하고, traffic-light state/staleness는 작은 `[time_step, light_type]` bias table로
-factorize해서 해당 lane edge에 더한다. `NO_LANE_STATE` edge의 bias는 0이고, 관측된
-`UNKNOWN` light는 다른 관측 light처럼 staleness bias를 가진다. 이 구조는 신호등 의미는
-유지하면서, edge마다 4D Fourier relation을 만들거나 map token 전체를 시간축으로 늘리는
-비용을 피한다.
+Map-to-agent relation은 `f6e96cf8`의 의미를 보존하기 위해 최종 projection 직전 표현에서
+아래처럼 합산한다.
+
+```text
+relation_pre(edge)
+= geometry_pre(edge)
++ stale_time_pre(time_step)
++ light_type_embedding(lane)
+
+relation(edge) = r_pt2a_emb.to_out(relation_pre(edge))
+```
+
+`geometry_pre(edge)`는 `distance / bearing / relative heading` 세 값을 edge 단위로 계산한다.
+`stale_time_pre(time_step)`은 edge마다 다시 계산하지 않고 model time step 수만큼만 계산한 뒤
+edge의 destination time step으로 gather한다. `NO_LANE_STATE` edge는 stale scalar를 0으로
+바꾼 뒤 같은 수식을 사용하므로, f6e96cf8처럼 type 0 embedding은 남고 stale 시간만 제거된다.
+이 구조는 edge마다 4D Fourier relation을 새로 만들지 않으면서도, `to_out` 이후에 별도 bias를
+더하는 방식보다 f6e96cf8의 relation embedding 함수 형태에 더 가깝다.
 
 SMART closed-loop rollout에서는 첫 번째 예측 0.5초 block이 현재 light를 `0s`
 staleness로 보고, 이후 block은 `0.5s`, `1.0s`, ... staleness를 사용한다. Cache builder도
