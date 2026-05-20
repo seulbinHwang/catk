@@ -18,6 +18,7 @@ trainer:
   devices: -1
   num_nodes: 2
   precision: bf16-mixed
+  check_val_every_n_epoch: 16
 
 data:
   train_batch_size: 22

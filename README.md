@@ -618,9 +618,10 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 | round-trip filter | `control_round_trip_max_position_error_m=0.5` |
 | precision | `bf16-mixed` |
 | batch / lr | per-rank `train_batch_size=22`, effective global batch `132`, `lr=6e-4` |
+| fit-time validation | `check_val_every_n_epoch=16`, 64 epoch 중 15/31/47/63 epoch 이후 4회 평가 |
 | metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc.pt` preflight 생성/검증 |
 
-두 pod의 local GPU 수가 `4 + 2`로 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를 쓰면 안 됩니다. 이 launcher는 `--manual-rank-offsets` 경로를 사용해 `hsb-npc-training`에 rank `0~3`, `wo-pvc`에 rank `4~5`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment` / `HeterogeneousDDPStrategy`로 Lightning의 homogeneous world-size 가정을 완화합니다.
+두 pod의 local GPU 수가 `4 + 2`로 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를 쓰면 안 됩니다. 이 launcher는 `--manual-rank-offsets` 경로를 사용해 `hsb-npc-training`에 rank `0~3`, `wo-pvc`에 rank `4~5`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment` / `HeterogeneousDDPStrategy`로 Lightning의 homogeneous world-size 가정을 완화합니다. sampler, validation sharding, Fast WOSAC scorer는 launcher가 넣은 실제 `WORLD_SIZE=6`을 기준으로 동작하도록 회귀 테스트로 고정합니다.
 
 batch size probe 결과:
 
@@ -632,7 +633,7 @@ batch size probe 결과:
 | 23 | 성공, 3.242분 | 94.92% | 장기 학습에는 마진 부족 |
 | 24 | 성공, 3.309분 | 97.19% | OOM 위험이 높아 제외 |
 
-따라서 이 6 H100 조합에서는 `train_batch_size=22`를 기본값으로 둡니다. `bs=23/24`는 짧은 probe에서는 통과했지만, peak reserved가 너무 높아 full pretrain 중 dense scene이나 allocator fragmentation이 겹치면 CUDA OOM 가능성이 큽니다. 500-step `bs=22` probe 기준 step time은 약 `1.87s`이고, training split `486,996`개 / global batch `132` 기준 한 epoch는 약 `3,690` step입니다. 64 epoch train-only 예상 시간은 약 `123h`(`5.1일`)이며, 32 epoch마다 도는 validation 시간은 별도로 추가됩니다. launcher의 기본 OOM fallback은 `22 -> 21 -> 20`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt`를 peer pod로 동기화한 뒤 재개합니다.
+따라서 이 6 H100 조합에서는 `train_batch_size=22`를 기본값으로 둡니다. `bs=23/24`는 짧은 probe에서는 통과했지만, peak reserved가 너무 높아 full pretrain 중 dense scene이나 allocator fragmentation이 겹치면 CUDA OOM 가능성이 큽니다. 500-step `bs=22` probe 기준 step time은 약 `1.87s`이고, training split `486,996`개 / global batch `132` 기준 한 epoch는 약 `3,690` step입니다. 64 epoch train-only 예상 시간은 약 `123h`(`5.1일`)이며, validation은 16 epoch마다 총 4회 추가됩니다. launcher의 기본 OOM fallback은 `22 -> 21 -> 20`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt`를 peer pod로 동기화한 뒤 재개합니다.
 
 실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:
 
