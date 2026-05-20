@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-15}"
-TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs${TRAIN_BATCH_SIZE}_main}"
+TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs${TRAIN_BATCH_SIZE}_freq102_main}"
 
 python scripts/launch_smart_ntp_a100x4x2_testa.py \
   --replace \

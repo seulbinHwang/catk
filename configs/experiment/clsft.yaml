@@ -12,7 +12,7 @@ model:
     n_vis_scenario: 0
     n_vis_rollout: 0
     decoder:
-      num_freq_bands: 66
+      num_freq_bands: 102
     token_processor:
       map_token_sampling: # open-loop
         num_k: 1 # for k nearest neighbors
