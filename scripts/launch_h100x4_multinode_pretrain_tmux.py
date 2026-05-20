@@ -545,7 +545,7 @@ git checkout -f {shq(args.git_ref)}
     elif args.pull:
         branch_ref = f"refs/heads/{args.branch}"
         origin_ref = f"origin/{args.branch}"
-        fetch_refspec = f"{args.branch}:refs/remotes/origin/{args.branch}"
+        fetch_refspec = f"+{args.branch}:refs/remotes/origin/{args.branch}"
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
 git fetch origin {shq(fetch_refspec)}

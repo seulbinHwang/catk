@@ -691,6 +691,72 @@ kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-cont
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_pods.py --stop
 ```
 
+#### hsb-npc-training-2/wo-pvc-2 H100x6 execution-context balanced pretrain
+
+`semi_control_rolling` 최신 코드 기준으로 `hsb-npc-training-2` H100 4장과 `wo-pvc-2` H100 2장을 묶어 총 6 GPU pretrain을 돌릴 때는 아래 전용 launcher를 씁니다. 이 launcher도 기존 running pod 안에 tmux session만 만들며 pod를 새로 만들거나 재시작하지 않습니다. **이미 두 pod에서 다른 학습이 돌고 있으면 실행하지 말고, 해당 학습이 끝난 뒤에만 사용합니다.**
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods.py \
+  --prebuild-metadata \
+  --replace
+```
+
+실행 전에는 dry-run으로 pod, branch, task name, metadata prebuild 명령을 확인합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods.py \
+  --prebuild-metadata \
+  --dry-run
+```
+
+이 구성은 4 GPU pod와 2 GPU pod를 섞어 쓰므로 일반 DDP의 `devices x num_nodes` 가정과 맞지 않습니다. launcher는 `--manual-rank-offsets`와 heterogeneous Lightning strategy를 함께 사용해 `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-2`는 rank `4~5`, 전체 world size는 `6`으로 고정합니다.
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling` |
+| 대상 pod | `hsb-npc-training-2`, `wo-pvc-2` |
+| GPU 구성 | H100 4장 + H100 2장 = 6 GPU |
+| launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods.py` |
+| experiment config | `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml` |
+| task name | `flow_control_space_pretrain_h100x6_hsb2_wo2_execctx_prefix_balanced_lr6e-4_bs20` |
+| tmux session | `catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced` |
+| per-GPU batch | `20` |
+| effective global batch | `20 x 6 = 120` |
+| learning rate | `6e-4` |
+| flow horizon | `20` steps = 2초 |
+| 핵심 supervision | `use_kinematic_control_flow=true`, prefix-valid future loss, execution-context aligned trajectory |
+| outlier filter | vehicle `2.0m`, cyclist `2.0m` |
+| OOM 완화 | agent 수 기반 memory-balanced batch sampler |
+| heterogeneous 설정 | `HeterogeneousDDPStrategy`, `HeterogeneousTorchElasticEnvironment` |
+| metadata 정책 | `--prebuild-metadata`로 sampler metadata를 먼저 만들고, 학습 중 missing build는 금지 |
+
+실제 6-H100 probe 결과 `train_batch_size=20`을 기본값으로 선택했습니다.
+
+| per-GPU batch | probe 결과 | global batch | 속도 | peak reserved | 64 epoch train-only 추정 | 판단 |
+|---:|---|---:|---:|---:|---:|---|
+| 12 | 40 step 성공 | 72 | 0.97 it/s | 57.19% | 123.97 h / 5.17 d | 안정적이지만 느림 |
+| 20 | 80 step 성공 | 120 | 0.69 it/s | 91.88% | 104.38 h / 4.35 d | 기본값 |
+| 21 | 80 step 성공 | 126 | 0.65 it/s | 94.94% | 105.89 h / 4.41 d | 더 크지만 더 느리고 여유가 작음 |
+| 22 | 40 step 성공 | 132 | 0.63 it/s | 98.36% | 103.79 h / 4.32 d | 장기 학습 OOM 위험이 큼 |
+| 26 | train forward 중 OOM | 156 | - | 약 79GB 사용 후 OOM | - | 제외 |
+
+따라서 이 6-GPU 조합에서는 `train_batch_size=20`이 안정성과 완료 속도의 균형이 가장 좋습니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다.
+
+`--prebuild-metadata`는 각 pod의 SMART cache training split을 읽어서 memory-balanced sampler용 metadata만 미리 만듭니다. SMART cache 파일 자체는 수정하지 않습니다. metadata 위치를 바꾸려면 `--metadata-cache-path /abs/path/to/cache.pt`를 쓰면 되고, launcher가 prebuild `--cache-path`와 training `data.train_memory_balance_metadata_cache` override를 같은 경로로 맞춥니다. 이전 metadata build가 비정상 종료되어 `.lock`만 남아 있으면 `--force-metadata`를 추가해 stale lock을 정리한 뒤 다시 생성합니다. 실제 build가 돌고 있는 중에는 `--force-metadata`를 쓰지 않습니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
