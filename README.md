@@ -83,8 +83,9 @@ conda run -n catk python tools/compare_fast_wosac_metric.py \
 - flow encoder의 motion feature는 이제 `motion value = 0` 과 별도 `motion_valid` 입력을 함께 씁니다.
 - 첫 context step 또는 invalid/valid 경계처럼 이전 coarse motion을 정의할 수 없는 경우에는 motion 값을 `0`으로 두고 `motion_valid=0`으로 표시합니다.
 - 실제로 유효한 연속 coarse step에서 정지한 agent는 motion 값이 `0`이어도 `motion_valid=1`이므로 missing motion과 구분됩니다.
-- flow 전용 agent-agent relation의 relative motion에도 `rel_motion_valid`를 추가해, 관계 feature 안에서도 알 수 없는 상대 motion과 실제 0 상대 motion을 분리합니다.
-- 이 설계는 `x_a_emb`와 flow `r_a2a_emb` 입력 차원을 바꾸므로, 예전 pretrained checkpoint와의 호환 경로는 제공하지 않습니다. 새 pretrain을 기준으로 사용합니다.
+- agent-agent relation feature는 edge마다 motion을 다시 붙이지 않고 기존 기하 정보 `distance / bearing / relative heading` 3D만 사용합니다.
+- 대신 a2a radius graph를 만들 때 유효하지 않은 agent state는 neighbor 후보에서 먼저 제외합니다. 따라서 missing motion 정보는 agent node feature에만 들어가고, 주변 agent의 missingness는 attention의 sender/receiver hidden state를 통해 전달됩니다.
+- 이 구조는 motion missingness 의미는 유지하면서 edge 수에 비례하던 relative-motion embedding 비용을 제거합니다. `x_a_emb` 입력 차원은 motion_valid 추가로 바뀌었고, 6D a2a relation을 사용한 중간 checkpoint도 현재 3D a2a relation 구조와 shape이 맞지 않으므로 새 pretrain을 기준으로 사용합니다.
 
 ### Closed-loop Retokenize Rule
 

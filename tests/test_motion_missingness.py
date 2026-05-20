@@ -24,6 +24,7 @@ class _ZeroCategoricalEmbedding:
 class _RecordingEmbedding:
     def __init__(self) -> None:
         self.continuous_inputs: torch.Tensor | None = None
+        self.input_dim = 3
 
     def __call__(self, continuous_inputs, categorical_embs=None):
         self.continuous_inputs = continuous_inputs.detach().clone()
@@ -147,9 +148,10 @@ def _make_context_inputs():
 
 
 def _fake_same_step_edges(x, r, batch, loop, max_num_neighbors):
-    # step-major flattened indices for 3 agents x 3 steps:
-    # final step edges 2 -> 0 and 2 -> 1 exercise invalid-boundary vs stationary motion.
-    return torch.tensor([[8, 8], [6, 7]], device=x.device, dtype=torch.long)
+    # build_interaction_edge now filters invalid nodes before radius_graph.
+    # These filtered-node indices map back to original step-major edges
+    # final-step agent2 -> agent0 and agent2 -> agent1.
+    return torch.tensor([[7, 7], [5, 6]], device=x.device, dtype=torch.long)
 
 
 def _run_encode_context_with_recorded_motion():
@@ -239,9 +241,7 @@ def test_open_loop_train_context_preserves_motion_missingness() -> None:
     assert motion_features[2, -1].item() == 0.0  # invalid/valid boundary, zero value but missing.
     assert motion_features[5, -1].item() == 1.0  # stationary, zero value and valid.
     torch.testing.assert_close(motion_features[5, 0], torch.tensor(0.0), atol=1.0e-5, rtol=0.0)
-    torch.testing.assert_close(relation_features[:, 3], torch.tensor([0.0, 1.0]))
-    torch.testing.assert_close(relation_features[:, 4], torch.tensor([0.0, 0.0]))
-    torch.testing.assert_close(relation_features[:, -1], torch.tensor([0.0, 1.0]))
+    assert relation_features.shape[-1] == 3
 
 
 def test_open_loop_eval_context_preserves_motion_missingness() -> None:
@@ -250,36 +250,47 @@ def test_open_loop_eval_context_preserves_motion_missingness() -> None:
     assert motion_features[0, -1].item() == 0.0  # first context step has no previous motion.
     assert motion_features[2, -1].item() == 0.0
     assert motion_features[8, -1].item() == 1.0
-    torch.testing.assert_close(relation_features[:, 3], torch.tensor([0.0, 1.0]))
-    torch.testing.assert_close(relation_features[:, 4], torch.tensor([0.0, 0.0]))
-    torch.testing.assert_close(relation_features[:, -1], torch.tensor([0.0, 1.0]))
+    assert relation_features.shape[-1] == 3
 
 
-def test_recent_coarse_motion_returns_value_and_validity() -> None:
-    pos_window = torch.tensor(
+def test_interaction_edge_uses_geometry_only_and_skips_invalid_before_radius() -> None:
+    decoder = _make_flow_decoder()
+    pos = torch.tensor(
         [
-            [[0.0, 0.0], [0.0, 0.0]],
-            [[0.0, 0.0], [3.0, 4.0]],
-            [[0.0, 0.0], [10.0, 0.0]],
+            [[0.0, 0.0]],
+            [[1.0, 0.0]],
+            [[2.0, 0.0]],
         ]
     )
-    valid_window = torch.tensor(
-        [
-            [True, True],
-            [True, True],
-            [False, True],
-        ]
-    )
+    head = torch.zeros(3, 1)
+    head_vector = torch.stack([head.cos(), head.sin()], dim=-1)
+    mask = torch.tensor([[True], [False], [True]])
+    batch_s = torch.zeros(3, dtype=torch.long)
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
 
-    recent_motion, recent_motion_valid = SMARTFlowAgentDecoder._build_recent_coarse_motion(
-        pos_window=pos_window,
-        valid_window=valid_window,
-    )
+    def fake_radius_graph(x, r, batch, loop, max_num_neighbors):
+        calls.append((x.detach().clone(), batch.detach().clone()))
+        return torch.tensor([[0, 1], [1, 0]], device=x.device, dtype=torch.long)
 
-    assert recent_motion_valid.tolist() == [True, True, False]
-    assert torch.allclose(recent_motion[0], torch.zeros(2))
-    assert torch.allclose(recent_motion[1], torch.tensor([3.0, 4.0]))
-    assert torch.allclose(recent_motion[2], torch.zeros(2))
+    original_radius_graph = flow_agent_decoder_module.radius_graph
+    flow_agent_decoder_module.radius_graph = fake_radius_graph
+    try:
+        edge_index, relation = decoder.build_interaction_edge(
+            pos_a=pos,
+            head_a=head,
+            head_vector_a=head_vector,
+            batch_s=batch_s,
+            mask=mask,
+        )
+    finally:
+        flow_agent_decoder_module.radius_graph = original_radius_graph
+
+    assert relation.shape[-1] == 1
+    assert decoder.r_a2a_emb.continuous_inputs is not None
+    assert decoder.r_a2a_emb.continuous_inputs.shape[-1] == 3
+    assert calls[0][0].shape[0] == 2
+    assert calls[0][1].shape[0] == 2
+    assert 1 not in edge_index.reshape(-1).tolist()
 
 
 def _make_rollout_tokenized_agent(valid_mask: torch.Tensor, pos: torch.Tensor | None = None):
@@ -325,7 +336,7 @@ def _empty_map_feature():
 
 
 def _fake_two_step_edges(x, r, batch, loop, max_num_neighbors):
-    return torch.tensor([[5, 5], [3, 4]], device=x.device, dtype=torch.long)
+    return torch.tensor([[4, 4], [2, 3]], device=x.device, dtype=torch.long)
 
 
 def test_closed_loop_initial_cache_preserves_motion_missingness() -> None:
@@ -357,9 +368,7 @@ def test_closed_loop_initial_cache_preserves_motion_missingness() -> None:
     assert motion_features[1, -1].item() == 0.0
     assert motion_features[3, -1].item() == 1.0
     assert motion_features[5, -1].item() == 1.0
-    torch.testing.assert_close(relation_features[:, 3], torch.tensor([0.0, 1.0]))
-    torch.testing.assert_close(relation_features[:, 4], torch.tensor([0.0, 0.0]))
-    torch.testing.assert_close(relation_features[:, -1], torch.tensor([0.0, 1.0]))
+    assert relation_features.shape[-1] == 3
 
 
 def _make_rollout_cache_for_update_test():
@@ -398,15 +407,14 @@ def _make_rollout_cache_for_update_test():
     }, tokenized_agent
 
 
-def _run_rollout_and_record_recent_motion_valid(self_forced_epoch: int | None):
+def _run_rollout_and_record_interaction_kwargs(self_forced_epoch: int | None):
     decoder = _make_flow_decoder()
     rollout_cache, tokenized_agent = _make_rollout_cache_for_update_test()
-    records: list[torch.Tensor] = []
+    records: list[dict] = []
     original_build_interaction_edge = decoder.build_interaction_edge
 
     def record_build_interaction_edge(*args, **kwargs):
-        if kwargs.get("motion_valid_a") is not None:
-            records.append(kwargs["motion_valid_a"].detach().clone())
+        records.append(dict(kwargs))
         return torch.zeros((2, 0), dtype=torch.long), torch.zeros((0, 1))
 
     decoder.build_interaction_edge = record_build_interaction_edge
@@ -422,40 +430,20 @@ def _run_rollout_and_record_recent_motion_valid(self_forced_epoch: int | None):
     return records
 
 
-def test_closed_loop_update_passes_recent_motion_validity_to_relation_input() -> None:
-    records = _run_rollout_and_record_recent_motion_valid(self_forced_epoch=None)
+def test_closed_loop_update_does_not_pass_motion_to_relation_input() -> None:
+    records = _run_rollout_and_record_interaction_kwargs(self_forced_epoch=None)
 
     assert len(records) == 1
-    assert records[0].shape == (3, 1)
-    assert records[0].all()
+    assert "motion_a" not in records[0]
+    assert "motion_valid_a" not in records[0]
 
 
-def test_self_forced_training_rollout_keeps_recent_motion_validity() -> None:
-    records = _run_rollout_and_record_recent_motion_valid(self_forced_epoch=0)
+def test_self_forced_training_rollout_does_not_pass_motion_to_relation_input() -> None:
+    records = _run_rollout_and_record_interaction_kwargs(self_forced_epoch=0)
 
     assert len(records) == 1
-    assert records[0].shape == (3, 1)
-    assert records[0].all()
-
-
-def test_external_motion_requires_validity_mask() -> None:
-    pos = torch.zeros(2, 1, 2)
-    head = torch.zeros(2, 1)
-    head_vector = torch.zeros(2, 1, 2)
-    head_vector[..., 0] = 1.0
-    mask = torch.ones(2, 1, dtype=torch.bool)
-    batch_s = torch.zeros(2, dtype=torch.long)
-
-    with pytest.raises(ValueError, match="motion_valid_a is required"):
-        SMARTFlowAgentDecoder.build_interaction_edge(
-            None,
-            pos_a=pos,
-            head_a=head,
-            head_vector_a=head_vector,
-            batch_s=batch_s,
-            mask=mask,
-            motion_a=pos,
-        )
+    assert "motion_a" not in records[0]
+    assert "motion_valid_a" not in records[0]
 
 
 def test_old_motion_feature_checkpoint_fails_with_clear_message() -> None:
@@ -465,13 +453,34 @@ def test_old_motion_feature_checkpoint_fails_with_clear_message() -> None:
         "state_dict",
         lambda: {
             "encoder.agent_encoder.x_a_emb.freqs.weight": torch.zeros((3, 4)),
-            "encoder.agent_encoder.r_a2a_emb.freqs.weight": torch.zeros((6, 4)),
+            "encoder.agent_encoder.r_a2a_emb.freqs.weight": torch.zeros((3, 4)),
         },
     )
     checkpoint = {
         "state_dict": {
             "encoder.agent_encoder.x_a_emb.freqs.weight": torch.zeros((2, 4)),
             "encoder.agent_encoder.r_a2a_emb.freqs.weight": torch.zeros((3, 4)),
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="requires a fresh pretrain checkpoint"):
+        model._assert_motion_missingness_checkpoint_compatible(checkpoint)
+
+
+def test_six_dim_relation_checkpoint_fails_with_clear_message() -> None:
+    model = SMARTFlow.__new__(SMARTFlow)
+    object.__setattr__(
+        model,
+        "state_dict",
+        lambda: {
+            "encoder.agent_encoder.x_a_emb.freqs.weight": torch.zeros((3, 4)),
+            "encoder.agent_encoder.r_a2a_emb.freqs.weight": torch.zeros((3, 4)),
+        },
+    )
+    checkpoint = {
+        "state_dict": {
+            "encoder.agent_encoder.x_a_emb.freqs.weight": torch.zeros((3, 4)),
+            "encoder.agent_encoder.r_a2a_emb.freqs.weight": torch.zeros((6, 4)),
         }
     }
 

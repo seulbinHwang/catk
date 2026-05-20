@@ -16,7 +16,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch_cluster import radius, radius_graph
-from torch_geometric.utils import dense_to_sparse, subgraph
+from torch_geometric.utils import dense_to_sparse
 
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
@@ -347,14 +347,26 @@ class SMARTAgentEncoder(nn.Module):
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
+
+        valid_node_idx = torch.nonzero(mask, as_tuple=False).flatten()
+        if valid_node_idx.numel() == 0:
+            edge_index_a2a = torch.empty(2, 0, device=pos_a.device, dtype=torch.long)
+            r_a2a = self.r_a2a_emb(
+                continuous_inputs=pos_a.new_zeros((0, self.r_a2a_emb.input_dim)),
+                categorical_embs=None,
+            )
+            return edge_index_a2a, r_a2a
+
+        pos_valid = pos_s[valid_node_idx]
+        batch_valid = batch_s[valid_node_idx]
         edge_index_a2a = radius_graph(
-            x=pos_s[:, :2],
+            x=pos_valid[:, :2],
             r=self.a2a_radius,
-            batch=batch_s,
+            batch=batch_valid,
             loop=False,
             max_num_neighbors=300,
         )
-        edge_index_a2a = subgraph(subset=mask, edge_index=edge_index_a2a)[0]
+        edge_index_a2a = valid_node_idx[edge_index_a2a]
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
         r_a2a = torch.stack(
