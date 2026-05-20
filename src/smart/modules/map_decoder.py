@@ -19,7 +19,6 @@ from torch_cluster import radius_graph
 
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from src.smart.layers.segmented_graph_attention import build_graph_attention_metadata
 from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
 
 
@@ -101,20 +100,8 @@ class SMARTMapDecoder(nn.Module):
             dim=-1,
         )
         r_pt2pt = self.r_pt2pt_emb(continuous_inputs=r_pt2pt, categorical_embs=None)
-        pt2pt_metadata = build_graph_attention_metadata(
-            edge_index=edge_index_pt2pt,
-            num_dst_nodes=x_pt.size(0),
-        )
-        edge_index_pt2pt = pt2pt_metadata.sorted_edge_index
-        r_pt2pt = pt2pt_metadata.reorder_edge_features(r_pt2pt)
         for i in range(self.num_layers):
-            x_pt = self.pt2pt_layers[i](
-                x_pt,
-                r_pt2pt,
-                edge_index_pt2pt,
-                attention_metadata=pt2pt_metadata,
-                r_is_sorted=True,
-            )
+            x_pt = self.pt2pt_layers[i](x_pt, r_pt2pt, edge_index_pt2pt)
 
         return {
             "pt_token": x_pt,

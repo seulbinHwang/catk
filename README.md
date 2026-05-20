@@ -249,41 +249,6 @@ selection을 전제로 한다. 이전에 넓은 all-agent 학습 모드
 map-agent attention에서 CUDA OOM이 발생했으므로, 두 결과를 같은 학습 대상 agent set으로
 해석하면 안 된다.
 
-#### AttentionLayer segmented CUDA attention
-
-`AttentionLayer`는 edge 수가 큰 graph attention에서 기존 PyG `MessagePassing` 대신
-CAT-K 전용 segmented CUDA attention을 사용할 수 있다. 기본 정책은 `hybrid`다. 작은
-attention은 기존 PyG 경로를 유지하고, edge 수가 큰 attention만 segmented CUDA 경로로
-보낸다.
-
-이 경로는 네트워크 구조와 학습 config를 바꾸지 않는다. q/k/v projection, relation
-embedding, edge set, radius, sparse softmax 수식, loss target은 그대로다. 바뀌는 것은
-큰 edge set의 attention 실행 방식뿐이다. target node 기준으로 edge를 정렬한 뒤,
-score/softmax/value aggregation을 CUDA extension에서 처리해 PyG 경로가 만들던 큰 edge별
-중간 activation 저장량을 줄인다.
-
-main의 SMART NTP 경로에서는 map point-to-point, temporal, map-to-agent, agent-to-agent
-attention이 같은 edge 구조를 여러 layer에서 반복 사용한다. 그래서 각 decoder는
-`GraphAttentionMetadata`를 edge 생성 직후 한 번 만들고, 정렬된 edge와 relation feature를
-모든 attention layer에 재사용한다. 이 재사용은 수식을 바꾸지 않고 반복 정렬 비용만 줄인다.
-
-관련 환경 변수는 아래와 같다.
-
-| 변수 | 기본값 | 의미 |
-|---|---|---|
-| `CATK_ATTENTION_LAYER_BACKEND` | `hybrid` | `pyg`, `segmented`, `hybrid` 중 attention backend 선택 |
-| `CATK_HYBRID_SEGMENTED_EDGE_THRESHOLD` | `100000` | `hybrid`에서 segmented CUDA로 넘길 edge 수 기준 |
-| `CATK_GRAPH_ATTENTION_BACKEND` | `cuda_segmented` | segmented 경로의 실제 backend. 검증용으로 `torch_reference` 사용 가능 |
-| `CATK_ATTENTION_GRAPH_FP32` | launcher에서 `1` | bf16 mixed precision에서도 graph attention aggregation만 fp32로 계산 |
-
-segmented CUDA backend는 CUDA toolkit의 `nvcc`와 `ninja`가 있는 PyTorch 환경에서 처음
-호출될 때 JIT build된다. backend를 끄고 기존 PyG 경로만 쓰려면
-`CATK_ATTENTION_LAYER_BACKEND=pyg`로 실행한다. 수식 검증은 아래 명령으로 확인한다.
-
-```bash
-python -m pytest tests/test_segmented_graph_attention.py -q
-```
-
 과거 `69603f8` 기준으로 `testa/testaa`에서 `data.train_batch_size=26`,
 `data.train_use_eval_agent_selection=false`, train 1 batch, validation 1 batch smoke를
 실행했을 때 첫 train batch의 map-agent attention에서 CUDA OOM이 발생했다. 최신 main 기준
