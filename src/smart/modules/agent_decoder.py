@@ -11,7 +11,6 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-import math
 from typing import Dict, Optional
 
 import torch
@@ -25,7 +24,7 @@ from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.modules.dynamic_light_time import (
     NO_LANE_STATE_LIGHT_TYPE,
-    normalize_light_time_delta_seconds,
+    build_constant_light_time_delta_norm,
     resolve_step_light_time_delta_norm,
 )
 from src.smart.utils import (
@@ -68,13 +67,18 @@ class SMARTAgentDecoder(nn.Module):
 
         input_dim_x_a = 3
         input_dim_r_t = 4
-        input_dim_r_pt2a = 4
+        input_dim_r_pt2a = 3
         input_dim_r_a2a = 3
         input_dim_token = 8
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
         self.light_relation_type_emb = nn.Embedding(5, hidden_dim)
+        self.light_relation_time_emb = FourierEmbedding(
+            input_dim=1,
+            hidden_dim=hidden_dim,
+            num_freq_bands=num_freq_bands,
+        )
 
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
@@ -444,133 +448,21 @@ class SMARTAgentDecoder(nn.Module):
             ],
             dim=-1,
         )
-        r_pl2a = self._build_map2agent_relation_embedding(
-            geometry_relation=r_pl2a,
+        r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
+        r_pl2a = r_pl2a + self._build_light_relation_bias(
             edge_index_pl2a=edge_index_pl2a,
             light_type=light_type,
             light_time_delta_norm=light_time_delta_norm,
             num_map=pos_pl.shape[0],
             num_agents=n_agent,
             num_steps=n_step,
-            device=pos_pl.device,
-            dtype=pos_pl.dtype,
+            device=r_pl2a.device,
+            dtype=r_pl2a.dtype,
         )
         return edge_index_pl2a, r_pl2a
 
-    @staticmethod
-    def _build_selected_fourier_pre_embedding(
-        embedding: FourierEmbedding,
-        continuous_inputs: torch.Tensor,
-        *,
-        input_dim_offset: int,
-    ) -> torch.Tensor:
-        """FourierEmbedding의 최종 projection 직전 표현을 선택 차원만 계산한다.
-
-        Args:
-            embedding: 사용할 FourierEmbedding 모듈이다.
-            continuous_inputs: 선택한 연속값 입력이다. Shape은 ``[N, D]``이다.
-            input_dim_offset: ``continuous_inputs``의 첫 번째 열이 원래 embedding의 몇 번째
-                입력 차원인지 나타낸다.
-
-        Returns:
-            최종 ``to_out``을 지나기 전의 합산 표현이다. Shape은 ``[N, hidden_dim]``이다.
-
-        Raises:
-            ValueError: 입력 차원 수가 맞지 않거나 embedding 범위를 벗어나면 발생한다.
-        """
-        if continuous_inputs.ndim != 2:
-            raise ValueError(
-                "continuous_inputs must have shape [num_items, num_dims], "
-                f"got {tuple(continuous_inputs.shape)}."
-            )
-        num_dims = int(continuous_inputs.shape[1])
-        if num_dims <= 0:
-            raise ValueError("continuous_inputs must contain at least one dimension.")
-        input_dim_offset = int(input_dim_offset)
-        if input_dim_offset < 0 or input_dim_offset + num_dims > embedding.input_dim:
-            raise ValueError(
-                "selected Fourier input dimensions exceed embedding.input_dim, "
-                f"offset={input_dim_offset}, num_dims={num_dims}, "
-                f"input_dim={embedding.input_dim}."
-            )
-        if embedding.freqs is None:
-            raise ValueError("FourierEmbedding with input_dim=0 cannot embed continuous inputs.")
-
-        # continuous_inputs: [N, D]
-        # freqs: [D, F]
-        # encoded: [N, D, 2F + 1]
-        freqs = embedding.freqs.weight[
-            input_dim_offset : input_dim_offset + num_dims
-        ]
-        encoded = continuous_inputs.unsqueeze(-1) * freqs.unsqueeze(0) * 2 * math.pi
-        encoded = torch.cat(
-            [encoded.cos(), encoded.sin(), continuous_inputs.unsqueeze(-1)],
-            dim=-1,
-        )
-        pre_embeddings = [
-            embedding.mlps[input_dim_offset + dim_idx](encoded[:, dim_idx])
-            for dim_idx in range(num_dims)
-        ]
-        return torch.stack(pre_embeddings).sum(dim=0)
-
-    def _build_stale_time_pre_embedding_by_step(
+    def _build_light_relation_bias(
         self,
-        step_light_time_delta_norm: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """신호등 stale-time 표현을 time step 수만큼만 계산한다.
-
-        Args:
-            step_light_time_delta_norm: 정규화된 stale-time 값이다. Shape은 ``[num_steps]``이다.
-
-        Returns:
-            첫 번째 값은 step별 stale-time pre-embedding이며 shape은
-            ``[num_steps, hidden_dim]``이다. 두 번째 값은 stale-time scalar가 0일 때의
-            pre-embedding이며 shape은 ``[hidden_dim]``이다.
-
-        Raises:
-            ValueError: 입력이 1차원이 아니면 발생한다.
-        """
-        if step_light_time_delta_norm.ndim != 1:
-            raise ValueError(
-                "step_light_time_delta_norm must have shape [num_steps], "
-                f"got {tuple(step_light_time_delta_norm.shape)}."
-            )
-        step_stale_pre = self._build_selected_fourier_pre_embedding(
-            embedding=self.r_pt2a_emb,
-            continuous_inputs=step_light_time_delta_norm.view(-1, 1),
-            input_dim_offset=3,
-        )
-        zero_stale = step_light_time_delta_norm.new_zeros((1, 1))
-        zero_stale_pre = self._build_selected_fourier_pre_embedding(
-            embedding=self.r_pt2a_emb,
-            continuous_inputs=zero_stale,
-            input_dim_offset=3,
-        )[0]
-        return step_stale_pre, zero_stale_pre
-
-    @staticmethod
-    def _build_scalar_light_time_delta_norm(
-        *,
-        delta_seconds: float,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """closed-loop 한 block의 stale-time 값을 scalar tensor로 만든다.
-
-        Args:
-            delta_seconds: 현재 예측 block에서 관측 시점 이후 지난 시간이다.
-            device: 결과 tensor를 둘 장치이다.
-            dtype: 결과 tensor의 dtype이다.
-
-        Returns:
-            정규화된 stale-time scalar이다. Shape은 ``[]``이다.
-        """
-        delta = torch.as_tensor(float(delta_seconds), device=device, dtype=dtype)
-        return normalize_light_time_delta_seconds(delta)
-
-    def _build_map2agent_relation_embedding(
-        self,
-        geometry_relation: torch.Tensor,
         edge_index_pl2a: torch.Tensor,
         light_type: Optional[torch.Tensor],
         light_time_delta_norm: Optional[torch.Tensor],
@@ -581,66 +473,17 @@ class SMARTAgentDecoder(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """map-to-agent relation을 f6e96cf8 의미 그대로 더 싸게 만든다.
-
-        Args:
-            geometry_relation: edge별 거리, 방향, 상대 heading이다. Shape은 ``[E, 3]``이다.
-            edge_index_pl2a: map token에서 agent/time token으로 가는 edge index이다.
-                Shape은 ``[2, E]``이다.
-            light_type: map token별 현재 관측 신호등 상태이다. Shape은 ``[num_map]``이다.
-                값이 없으면 모든 map token을 ``NO_LANE_STATE``로 본다.
-            light_time_delta_norm: 정규화된 stale-time 입력이다. ``None``, scalar,
-                ``[num_steps]``, 또는 ``[num_agents, num_steps]``를 받을 수 있다.
-            num_map: map token 수이다.
-            num_agents: agent 수이다.
-            num_steps: 현재 relation이 포함하는 model time step 수이다.
-            device: 계산 장치이다.
-            dtype: 연속값 계산 dtype이다.
-
-        Returns:
-            AttentionLayer에 넣을 relation embedding이다. Shape은 ``[E, hidden_dim]``이다.
-
-        Raises:
-            ValueError: 입력 shape이 relation 구성과 맞지 않으면 발생한다.
-        """
-        if geometry_relation.ndim != 2 or geometry_relation.shape[1] != 3:
-            raise ValueError(
-                "geometry_relation must have shape [num_edges, 3], "
-                f"got {tuple(geometry_relation.shape)}."
+        if edge_index_pl2a.numel() == 0 or num_map <= 0 or num_steps <= 0:
+            return torch.zeros(
+                edge_index_pl2a.shape[1],
+                self.hidden_dim,
+                device=device,
+                dtype=dtype,
             )
-        if edge_index_pl2a.ndim != 2 or edge_index_pl2a.shape[0] != 2:
-            raise ValueError(
-                "edge_index_pl2a must have shape [2, num_edges], "
-                f"got {tuple(edge_index_pl2a.shape)}."
-            )
-        if geometry_relation.shape[0] != edge_index_pl2a.shape[1]:
-            raise ValueError(
-                "geometry_relation and edge_index_pl2a must contain the same number "
-                f"of edges, got {geometry_relation.shape[0]} and {edge_index_pl2a.shape[1]}."
-            )
-
-        geometry_pre = self._build_selected_fourier_pre_embedding(
-            embedding=self.r_pt2a_emb,
-            continuous_inputs=geometry_relation.to(device=device, dtype=dtype),
-            input_dim_offset=0,
-        )
-        if edge_index_pl2a.numel() == 0:
-            return self.r_pt2a_emb.to_out(geometry_pre)
-        if num_map <= 0 or num_agents <= 0 or num_steps <= 0:
-            raise ValueError(
-                "num_map, num_agents, and num_steps must be positive when edges exist, "
-                f"got {num_map}, {num_agents}, {num_steps}."
-            )
-
         if light_type is None:
-            light_type_for_map = torch.zeros(num_map, device=device, dtype=torch.long)
+            light_type = torch.zeros(num_map, device=device, dtype=torch.long)
         else:
-            light_type_for_map = light_type.to(device=device, dtype=torch.long)
-            if light_type_for_map.shape[0] != num_map:
-                raise ValueError(
-                    "light_type must have shape [num_map], "
-                    f"got {tuple(light_type_for_map.shape)} and num_map={num_map}."
-                )
+            light_type = light_type.to(device=device, dtype=torch.long)
 
         step_light_time = resolve_step_light_time_delta_norm(
             light_time_delta_norm=light_time_delta_norm,
@@ -650,32 +493,31 @@ class SMARTAgentDecoder(nn.Module):
             dtype=dtype,
             shift_steps=self.shift,
         )
-        stale_pre_by_step, zero_stale_pre = self._build_stale_time_pre_embedding_by_step(
-            step_light_time_delta_norm=step_light_time,
-        )
-
         num_light_types = self.light_relation_type_emb.num_embeddings
-        edge_light_type_raw = light_type_for_map[edge_index_pl2a[0]]
-        edge_light_type = edge_light_type_raw.clamp(min=0, max=num_light_types - 1)
-        edge_step = torch.div(edge_index_pl2a[1], num_agents, rounding_mode="floor")
-        edge_step = edge_step.clamp(min=0, max=num_steps - 1)
+        light_type_grid = torch.arange(
+            num_light_types,
+            device=device,
+            dtype=torch.long,
+        ).view(1, num_light_types).expand(num_steps, num_light_types)
+        light_time_grid = step_light_time.view(num_steps, 1).expand(
+            num_steps,
+            num_light_types,
+        )
+        light_bias_table = self.light_relation_time_emb(
+            continuous_inputs=light_time_grid.reshape(-1, 1),
+            categorical_embs=[
+                self.light_relation_type_emb(light_type_grid.reshape(-1))
+            ],
+        ).view(num_steps, num_light_types, self.hidden_dim)
 
-        # edge_light_stale_pre: [E, hidden_dim]
-        # NO_LANE_STATE는 f6e96cf8과 같이 stale scalar만 0으로 둔다.
-        # light type 0 embedding은 그대로 들어가므로 "완전한 zero bias"와 다르다.
-        edge_stale_pre = stale_pre_by_step[edge_step]
-        has_observed_light = edge_light_type_raw != NO_LANE_STATE_LIGHT_TYPE
-        edge_stale_pre = torch.where(
-            has_observed_light.unsqueeze(-1),
-            edge_stale_pre,
-            zero_stale_pre.view(1, -1),
+        edge_light_type = light_type[edge_index_pl2a[0]]
+        edge_step = torch.div(edge_index_pl2a[1], num_agents, rounding_mode="floor")
+        edge_light_type = edge_light_type.clamp(min=0, max=num_light_types - 1)
+        light_bias = light_bias_table[edge_step, edge_light_type]
+        has_observed_light = edge_light_type != NO_LANE_STATE_LIGHT_TYPE
+        return light_bias.masked_fill(~has_observed_light.unsqueeze(-1), 0.0).to(
+            dtype=dtype
         )
-        relation_pre = (
-            geometry_pre
-            + edge_stale_pre
-            + self.light_relation_type_emb(edge_light_type)
-        )
-        return self.r_pt2a_emb.to_out(relation_pre)
 
     @staticmethod
     def _build_sampling_generators_by_batch(
@@ -890,7 +732,9 @@ class SMARTAgentDecoder(nn.Module):
             light_time_delta_norm = (
                 None
                 if t == 0
-                else self._build_scalar_light_time_delta_norm(
+                else build_constant_light_time_delta_norm(
+                    num_agents=n_agent,
+                    num_steps=hist_step,
                     delta_seconds=float(t * self.shift) * 0.1,
                     device=pos_a.device,
                     dtype=pos_a.dtype,
