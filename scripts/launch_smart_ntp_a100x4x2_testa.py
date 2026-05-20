@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch SMART NTP A100x4x2 pretrain on testa/testaa.
+"""Launch SMART NTP A100/H100 x4x2 pretrain on existing pods.
 
 This launcher never creates, deletes, or restarts pods. It only runs
 ``kubectl exec`` against already-running pods and starts/kills tmux sessions
@@ -391,7 +391,7 @@ def exec_in_pod(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Start SMART NTP A100x4x2 pretrain in tmux on existing pods.",
+        description="Start SMART NTP A100/H100 x4x2 pretrain in tmux on existing pods.",
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", DEFAULT_NAMESPACE))
     parser.add_argument(
@@ -475,7 +475,7 @@ def parse_args() -> argparse.Namespace:
         parser.error(str(exc))
 
     if len(args.pods) != 2 and not args.stop:
-        parser.error("this preset expects exactly two A100x4 pods")
+        parser.error("this preset expects exactly two x4 GPU pods")
     if args.action in {"validate", "test"} and not args.ckpt_path and not args.stop:
         parser.error(f"--ckpt-path is required when --action={args.action}")
     if args.monitor_interval < 1:
