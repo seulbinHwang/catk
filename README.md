@@ -708,15 +708,21 @@ context에 motion missingness를 드러낸다. 각 agent motion feature는
 유효하지 않은 coarse displacement는 0으로 채우고, `motion_valid=0`은 이 0 displacement가
 실제 정지가 아니라 motion missing에서 온 값임을 모델에 알려준다.
 
-Agent-to-agent relation feature에도 receiver frame 기준 sender/receiver 상대 coarse
-motion과 relative-motion validity bit가 들어간다. 양쪽 중 하나라도 motion이 missing이면
-relative motion channel은 0으로 채우고 validity bit는 `0`이 된다.
+Agent-to-agent relation feature는 edge마다 다시 motion을 붙이지 않고 기존 기하 정보
+`distance / bearing / relative heading`만 사용한다. 대신 a2a radius graph를 만들 때
+유효하지 않은 agent state는 애초에 neighbor 후보에서 제외한다. 따라서 "실제 정지"와
+"missing이라서 0으로 채운 motion"의 구분은 agent node feature에만 존재하고, 주변 agent의
+missingness 정보는 attention의 sender/receiver hidden state를 통해 전달된다. 이 구조는
+08a2e89의 missingness 의미는 유지하면서 edge 수에 비례하던 relative-motion embedding
+비용을 제거한다.
 
 이 변경은 SMART token validity나 loss masking을 바꾸지 않는다. SMART는 여전히 두 coarse
 endpoint token이 valid일 때 0.5초 token을 valid로 본다. Control-flow branch는 더 엄격한
 fine-step segment validity를 사용할 수 있다. 이 변경은 shared context feature에서 사용할 수
-있는 missingness 정보만 맞춘다. Embedding input dimension이 바뀌었기 때문에, 이 변경 이전의
-SMART checkpoint는 새 pretraining run과 shape이 호환되지 않는다.
+있는 missingness 정보만 맞춘다. Agent node embedding input dimension은 motion_valid 추가로
+바뀌었기 때문에, 이 변경 이전의 SMART checkpoint는 새 pretraining run과 shape이 호환되지
+않는다. 또한 08a2e89처럼 6D a2a relation을 사용한 중간 checkpoint도 현재 3D a2a relation
+구조와 shape이 맞지 않는다.
 
 ### WOSAC-CPD / WOSAC-CES 분포 지표
 
