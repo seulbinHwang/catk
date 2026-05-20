@@ -63,18 +63,15 @@ conda run -n catk python tools/compare_fast_wosac_metric.py \
   --json-output artifacts/fast_wosac_compare_3scenarios.json
 ```
 
-### Dynamic Traffic-Light Staleness Feature
+### 정적 교통 신호 Map Feature
 
-- 교통 신호는 더 이상 정적 map token feature로 섞지 않습니다.
-- 현재 관측된 신호 상태는 agent가 주변 lane을 읽는 단계에서만 사용합니다.
-- 이때 신호 상태와 함께 `예측 기준 시점 - 신호 관측 시점` 시간 차를 넣습니다.
-- 시간 차는 실제 신호가 관측된 lane(`UNKNOWN/STOP/GO/CAUTION`)에만 붙이고, 신호가 없는 lane / lane이 아닌 지도 요소 / dummy map에는 `0`을 넣습니다.
-- 시간 차는 `[-1초, +6초]` 범위로 clip 한 뒤 `6초` 로 나눠 정규화합니다.
-- WOMD cache 생성 시 `scenario.current_time_index == 10` 을 강제 검사합니다. 이 값은 stale time 계산에서 “현재 관측 신호가 raw step 10에서 관측됐다”는 기준이므로, 다른 현재 시점의 cache는 조용히 사용하지 않고 fail-fast합니다.
-- 따라서 모델 입력 의미는 `이 lane은 빨간불이다` 가 아니라 `이 lane은 Δt초 전에 빨간불로 관측됐다` 입니다.
-- pretrain과 closed-loop 추론 모두 실제 미래 신호를 입력하지 않고, 현재 관측 신호와 경과 시간만 사용합니다.
-- closed-loop validation/test에서 여러 rollout을 병렬 실행할 때도 traffic-light 상태를 map token과 같은 순서로 복제합니다.
-- 이 변경은 map encoder의 정적 traffic-light embedding을 제거하고, agent-lane relation 쪽에 동적 traffic-light embedding과 시간 차 scalar를 추가하므로 기존 pretrained checkpoint와 호환되지 않습니다. 새 pretrain을 기준으로 사용합니다.
+- `f6e96cf8`의 동적 traffic-light staleness 입력은 `semi_control_stable`에서 사용하지 않습니다.
+- 교통 신호는 다시 map token의 정적 categorical feature로만 들어갑니다.
+- `SMARTMapDecoder`는 cache의 `light_type`을 map point embedding에 더하고, encoder 출력에는 별도 `light_type` metadata를 넘기지 않습니다.
+- agent-lane relation은 `distance / bearing / relative heading` 3D 기하 정보만 사용합니다.
+- `prediction_time - observed_light_time` scalar를 만들지 않으므로, pretrain / CAT-K fine-tuning / RoaD fine-tuning / closed-loop validation / WOSAC 제출 경로 모두 rollout block 진행 시간에 따라 신호 입력이 바뀌지 않습니다.
+- 현재 관측 신호 상태 자체는 cache에 저장된 현재 map token feature로만 소비하며, 미래 traffic-light 상태를 입력하지 않습니다.
+- 이 구조는 동적 stale relation feature를 제거하고 static map-token `light_type` embedding을 복원하므로, 동적 stale 입력을 전제로 학습한 checkpoint와는 구조적으로 호환되지 않습니다. 이 브랜치 최신 pretrain을 기준으로 사용합니다.
 
 ### Motion Missingness Feature
 
@@ -2477,7 +2474,7 @@ python src/run.py \
 2. 각 scenario마다 RoaD rollout 3개를 생성합니다.
 3. 각 0.5초 block마다 현재 closed-loop scene에서 후보 64개를 temperature 0.8로 새로 만들고, GT future와 사각형 4개 꼭지점 평균 거리가 가장 작은 후보를 agent별로 고릅니다.
 4. 선택된 후보의 앞 0.5초만 scene에 반영하고, 이 과정을 16번 반복해 8초 future를 만듭니다.
-5. 선택된 future를 기존 WOMD `.pkl` schema와 같은 RoaD `.pkl` cache로 저장합니다. 이때 traffic-light 상태 자체는 원본 현재 관측값을 유지하고, block이 진행될수록 stale time scalar만 증가시킵니다. 즉 RoaD cache 생성 중에도 미래 traffic-light 상태를 보거나 동적으로 갱신하지 않습니다.
+5. 선택된 future를 기존 WOMD `.pkl` schema와 같은 RoaD `.pkl` cache로 저장합니다. Traffic-light 입력은 원본 현재 관측값에서 만든 정적 map token feature로만 유지하며, RoaD block이 진행돼도 별도 stale time scalar를 만들거나 미래 traffic-light 상태를 보지 않습니다.
 6. 생성된 3N개 cache 중 scenario마다 하나만 균등하게 골라 selected cache 폴더를 만듭니다.
 7. selected cache N개만 사용해 1 epoch 학습합니다. 따라서 optimizer update 수는 기존 CAT-K fine-tuning 1 epoch와 같습니다.
 8. epoch 종료 후 다음 epoch용 RoaD cache를 최신 모델로 다시 만들고, 이미 사용한 이전 epoch cache는 삭제합니다.

@@ -211,26 +211,22 @@ class SMARTFlowDecoder(nn.Module):
         self,
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
-        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, object]:
         return self.agent_encoder.prepare_inference_cache(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            light_time_start_seconds=light_time_start_seconds,
         )
 
     def prepare_training_rollout_cache(
         self,
         tokenized_agent: Dict[str, Tensor],
         map_feature: Dict[str, Tensor],
-        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, object]:
         """self-forced 학습에서 gradient를 유지한 rollout cache를 만듭니다.
 
         Args:
             tokenized_agent: 평가 모드 기준 agent token 사전입니다.
             map_feature: 현재 decoder가 만든 map feature입니다.
-            light_time_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다.
 
         Returns:
             Dict[str, object]: N초 self-rollout에 사용할 초기 cache입니다.
@@ -238,7 +234,6 @@ class SMARTFlowDecoder(nn.Module):
         return self.agent_encoder.prepare_training_rollout_cache(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
-            light_time_start_seconds=light_time_start_seconds,
         )
 
     def rollout_from_cache(
@@ -251,7 +246,6 @@ class SMARTFlowDecoder(nn.Module):
         scenario_sampling_seeds: Tensor | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
-        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
@@ -262,7 +256,6 @@ class SMARTFlowDecoder(nn.Module):
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
-            light_time_start_seconds=light_time_start_seconds,
         )
 
     def training_rollout_from_cache(
@@ -277,7 +270,6 @@ class SMARTFlowDecoder(nn.Module):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
-        light_time_start_seconds: float = 0.0,
     ) -> Dict[str, Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -290,7 +282,6 @@ class SMARTFlowDecoder(nn.Module):
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 평가 길이를 실행합니다.
             use_stop_motion: self-forced 학습 rollout 전용 stop-motion 사용 여부입니다.
-            light_time_start_seconds: 외부 생성기가 이미 진행한 rollout 시간입니다.
 
         Returns:
             Dict[str, Tensor]: committed self-rollout 결과입니다.
@@ -306,7 +297,6 @@ class SMARTFlowDecoder(nn.Module):
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
             use_stop_motion=use_stop_motion,
-            light_time_start_seconds=light_time_start_seconds,
         )
 
     def path_flow_velocity_for_anchor0(
