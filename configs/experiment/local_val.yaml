@@ -8,7 +8,10 @@ model:
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
-    n_batch_sim_agents_metric: 100
+    # Use scene count as the source of truth so DDP/world-size changes do not
+    # silently fall back to the model default scorer subset.
+    scorer_scene_num: 1680
+    n_batch_sim_agents_metric: 105
     val_open_loop: false
     val_closed_loop: true
     decoder:

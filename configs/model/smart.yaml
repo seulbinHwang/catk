@@ -12,7 +12,7 @@ model_config:
   # Positive values auto-set n_batch_sim_agents_metric from world_size and
   # val_batch_size so scorer work is comparable across GPU counts. Set null or
   # 0 to keep the explicit n_batch_sim_agents_metric value.
-  scorer_scene_num: 840
+  scorer_scene_num: 1680
   # Fast checkpoint-only validation during fit. This limits fit-time validation
   # to the Fast WOSAC scorer batches only, so keep it false for full validation.
   fit_time_fast_validation_only: false
