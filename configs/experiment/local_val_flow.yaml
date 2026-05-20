@@ -8,7 +8,10 @@ model:
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
-    n_batch_sim_agents_metric: 100
+    # scorer_scene_num is the authoritative Fast WOSAC budget. Keep the
+    # explicit batch knob at 0 so it cannot look like an independent setting.
+    n_batch_sim_agents_metric: 0
+    scorer_scene_num: 1680
     val_open_loop: true
     val_closed_loop: true
     n_rollout_closed_val: 32
@@ -19,7 +22,8 @@ ckpt_path: YOUR_MODEL.ckpt
 
 trainer:
   limit_train_batches: 1.0
-  limit_val_batches: 60
+  # Single-GPU default: 1680 scenes / val_batch_size 4 = 420 batches.
+  limit_val_batches: 420
   limit_test_batches: 1.0
   check_val_every_n_epoch: 2
   precision: bf16-mixed

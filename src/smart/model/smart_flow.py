@@ -172,6 +172,7 @@ class SMARTFlow(LightningModule):
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
         self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
         self._scorer_scene_num_last_key: tuple[int, int, int] | None = None
+        self._scorer_batch_budget_last_key: tuple[int, int] | None = None
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
         self.open_metric_names = {
@@ -415,9 +416,11 @@ class SMARTFlow(LightningModule):
         if val_batch_size is None:
             return
 
+        previous_n_batch = int(self.n_batch_sim_agents_metric)
         per_rank_scenes = math.ceil(scorer_scene_num / world_size)
         n_batch_override = max(1, math.ceil(per_rank_scenes / val_batch_size))
         self.n_batch_sim_agents_metric = int(n_batch_override)
+        approx_scenes = int(self.n_batch_sim_agents_metric) * val_batch_size * world_size
 
         current_key = (int(scorer_scene_num), int(world_size), int(val_batch_size))
         if self._scorer_scene_num_last_key == current_key:
@@ -426,9 +429,88 @@ class SMARTFlow(LightningModule):
         if getattr(trainer, "is_global_zero", True):
             print(
                 "[scorer_scene_num] Fast WOSAC sim_agents_2025 scorer batch 수를 "
-                f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric} 으로 설정합니다 "
+                f"n_batch_sim_agents_metric={previous_n_batch} -> "
+                f"{self.n_batch_sim_agents_metric} 으로 설정합니다 "
                 f"(requested_scenes={scorer_scene_num}, world_size={world_size}, "
-                f"val_batch_size={val_batch_size}).",
+                f"val_batch_size={val_batch_size}, approx_scenes={approx_scenes}). "
+                "scorer_scene_num=null 또는 0이면 이 자동 덮어쓰기를 끕니다.",
+                flush=True,
+            )
+
+    def _resolve_planned_val_batches(self) -> int | None:
+        """Lightning trainer가 현재 계획한 validation batch 수를 읽습니다."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+
+        num_val_batches = getattr(trainer, "num_val_batches", None)
+        if isinstance(num_val_batches, (list, tuple)):
+            if len(num_val_batches) == 0:
+                return None
+            num_val_batches = num_val_batches[0]
+
+        if isinstance(num_val_batches, bool):
+            return None
+        if isinstance(num_val_batches, int):
+            return max(0, int(num_val_batches))
+        if isinstance(num_val_batches, float) and math.isfinite(num_val_batches):
+            return max(0, int(math.ceil(num_val_batches)))
+        return None
+
+    def _resolve_validation_batch_limit_count(self) -> int | None:
+        """현재 ``trainer.limit_val_batches`` 가 허용하는 batch 수를 batch 단위로 읽습니다."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+
+        limit_val_batches = getattr(trainer, "limit_val_batches", None)
+        if isinstance(limit_val_batches, bool):
+            return None
+        if isinstance(limit_val_batches, int):
+            return max(0, int(limit_val_batches))
+        if isinstance(limit_val_batches, float):
+            if not math.isfinite(limit_val_batches):
+                return None
+            if limit_val_batches >= 1.0:
+                planned_batches = self._resolve_planned_val_batches()
+                return planned_batches if planned_batches is not None else None
+            if limit_val_batches > 0.0:
+                return self._resolve_planned_val_batches()
+            return 0
+        return None
+
+    def _ensure_scorer_validation_batch_budget(self) -> None:
+        """Fast WOSAC scorer가 요청한 scene budget만큼 validation batch를 볼 수 있게 합니다."""
+        if not self.val_closed_loop or self.sim_agents_submission.is_active:
+            return
+
+        try:
+            target_batches = int(self.n_batch_sim_agents_metric)
+        except (TypeError, ValueError):
+            return
+        if target_batches <= 0:
+            return
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+
+        current_batches = self._resolve_validation_batch_limit_count()
+        if current_batches is None or current_batches >= target_batches:
+            return
+
+        if self._fit_time_original_limit_val_batches is None:
+            self._fit_time_original_limit_val_batches = getattr(trainer, "limit_val_batches", None)
+        trainer.limit_val_batches = target_batches
+
+        current_key = (int(target_batches), int(current_batches))
+        if self._scorer_batch_budget_last_key == current_key:
+            return
+        self._scorer_batch_budget_last_key = current_key
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[scorer_scene_num] Fast WOSAC scorer가 요청한 scene 수를 채점할 수 있도록 "
+                f"trainer.limit_val_batches를 {current_batches} -> {target_batches} batch로 늘립니다.",
                 flush=True,
             )
 
@@ -2341,6 +2423,7 @@ class SMARTFlow(LightningModule):
             None
         """
         self._apply_scorer_scene_num_overrides()
+        self._ensure_scorer_validation_batch_budget()
         self._apply_fit_time_validation_batch_limit()
         self._sync_self_forced_auxiliary_models()
         self._prepare_self_forced_generator_ema()
@@ -2348,6 +2431,7 @@ class SMARTFlow(LightningModule):
     def on_validation_start(self) -> None:
         """validation 시작 직전에 scorer batch 수 자동 조정을 다시 시도합니다."""
         self._apply_scorer_scene_num_overrides()
+        self._ensure_scorer_validation_batch_budget()
 
     def on_fit_end(self) -> None:
         """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.
