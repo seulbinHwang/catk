@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.utils.checkpoint import checkpoint
 
 from src.smart.tokens.agent_token_matching import (
     build_agent_type_masks,
@@ -655,6 +656,200 @@ class ChunkStepRefiner(nn.Module):
         return step_tokens
 
 
+class FlashFutureMixerBlock(nn.Module):
+    def __init__(
+        self,
+        flow_dim: int,
+        num_heads: int,
+        mlp_expansion: int = 4,
+    ) -> None:
+        super().__init__()
+        if flow_dim % num_heads != 0:
+            raise ValueError(
+                "flow_dim must be divisible by num_heads for FlashFutureMixerBlock, "
+                f"got flow_dim={flow_dim}, num_heads={num_heads}."
+            )
+        if int(mlp_expansion) < 1:
+            raise ValueError(f"mlp_expansion must be >= 1, got {mlp_expansion}.")
+        self.flow_dim = int(flow_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.flow_dim // self.num_heads
+
+        self.attn_norm = nn.LayerNorm(flow_dim)
+        self.qkv_proj = nn.Linear(flow_dim, flow_dim * 3)
+        self.out_proj = nn.Linear(flow_dim, flow_dim)
+
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(flow_dim * 2, flow_dim * 2),
+            nn.SiLU(),
+            nn.Linear(flow_dim * 2, flow_dim * 3),
+        )
+
+        mlp_hidden_dim = flow_dim * int(mlp_expansion)
+        self.mlp_norm = nn.LayerNorm(flow_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(flow_dim, mlp_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_hidden_dim, flow_dim),
+        )
+
+    def _modulate(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        scale, bias, gate = cond.chunk(3, dim=-1)
+        return x + torch.sigmoid(gate).unsqueeze(1) * (
+            x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1)
+        )
+
+    @staticmethod
+    def _build_safe_key_mask(step_valid_mask: torch.Tensor) -> torch.Tensor:
+        key_mask = step_valid_mask.bool()
+        all_invalid = ~key_mask.any(dim=1)
+        if bool(all_invalid.any().item()):
+            key_mask = key_mask.clone()
+            key_mask[all_invalid, 0] = True
+        return key_mask
+
+    def _self_attention(
+        self,
+        x: torch.Tensor,
+        step_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        batch_size, num_steps, dim = x.shape
+        qkv = self.qkv_proj(x).view(
+            batch_size,
+            num_steps,
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        attn_mask = None
+        if step_valid_mask is not None:
+            if tuple(step_valid_mask.shape) != (batch_size, num_steps):
+                raise ValueError(
+                    "step_valid_mask shape must match future tokens: "
+                    f"expected={(batch_size, num_steps)}, actual={tuple(step_valid_mask.shape)}."
+                )
+            attn_mask = self._build_safe_key_mask(step_valid_mask).view(
+                batch_size,
+                1,
+                1,
+                num_steps,
+            )
+
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(batch_size, num_steps, dim)
+        return self.out_proj(attn_out)
+
+    def forward(
+        self,
+        step_tokens: torch.Tensor,
+        context: torch.Tensor,
+        tau_emb: torch.Tensor,
+        step_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
+
+        attn_in = self._modulate(self.attn_norm(step_tokens), cond)
+        step_tokens = step_tokens + self._self_attention(attn_in, step_valid_mask)
+        if step_valid_mask is not None:
+            step_tokens = step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
+
+        mlp_in = self._modulate(self.mlp_norm(step_tokens), cond)
+        step_tokens = step_tokens + self.mlp(mlp_in)
+        if step_valid_mask is not None:
+            step_tokens = step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
+        return step_tokens
+
+
+class FlashFutureMixerRefiner(nn.Module):
+    def __init__(
+        self,
+        flow_dim: int,
+        num_heads: int,
+        num_layers: int,
+        num_chunks: int,
+        chunk_size: int,
+        mlp_expansion: int = 4,
+        use_activation_checkpoint: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_chunks = int(num_chunks)
+        self.chunk_size = int(chunk_size)
+        self.num_steps = self.num_chunks * self.chunk_size
+        self.chunk_embed = nn.Embedding(self.num_chunks, flow_dim)
+        self.use_activation_checkpoint = bool(use_activation_checkpoint)
+        self.context_proj = nn.Linear(flow_dim, flow_dim)
+        self.pre_proj = nn.Linear(flow_dim, flow_dim)
+        self.layers = nn.ModuleList(
+            [
+                FlashFutureMixerBlock(
+                    flow_dim=flow_dim,
+                    num_heads=num_heads,
+                    mlp_expansion=mlp_expansion,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        step_tokens: torch.Tensor,
+        chunk_tokens: torch.Tensor,
+        context: torch.Tensor,
+        tau_emb: torch.Tensor,
+        step_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch_size, num_chunks, chunk_size, dim = step_tokens.shape
+        if num_chunks != self.num_chunks or chunk_size != self.chunk_size:
+            raise ValueError(
+                "FlashFutureMixerRefiner received unexpected chunk layout: "
+                f"expected=({self.num_chunks}, {self.chunk_size}), "
+                f"actual=({num_chunks}, {chunk_size})."
+            )
+
+        chunk_ids = torch.arange(num_chunks, device=step_tokens.device)
+        step_tokens = step_tokens + chunk_tokens.unsqueeze(2)
+        step_tokens = step_tokens + self.chunk_embed(chunk_ids).view(1, num_chunks, 1, dim)
+        step_tokens = step_tokens + self.context_proj(context).view(batch_size, 1, 1, dim)
+        step_tokens = self.pre_proj(step_tokens).view(batch_size, self.num_steps, dim)
+
+        for layer in self.layers:
+            if self.use_activation_checkpoint and self.training:
+                step_tokens = checkpoint(
+                    lambda tokens, ctx, tau_cond, block=layer: block(
+                        step_tokens=tokens,
+                        context=ctx,
+                        tau_emb=tau_cond,
+                        step_valid_mask=step_valid_mask,
+                    ),
+                    step_tokens,
+                    context,
+                    tau_emb,
+                    use_reentrant=False,
+                )
+            else:
+                step_tokens = layer(
+                    step_tokens=step_tokens,
+                    context=context,
+                    tau_emb=tau_emb,
+                    step_valid_mask=step_valid_mask,
+                )
+        if step_valid_mask is not None:
+            step_tokens = step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
+        return step_tokens
+
+
 class FlowVelocityHead(nn.Module):
     def __init__(self, flow_dim: int, flow_state_dim: int = 4) -> None:
         super().__init__()
@@ -679,6 +874,9 @@ class HierarchicalFlowDecoder(nn.Module):
         num_chunk_layers: int = 2,
         chunk_size: int = 5,
         flow_state_dim: int = 4,
+        use_future_mixer: bool = False,
+        future_mixer_mlp_expansion: int = 4,
+        future_mixer_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if int(num_future_steps) <= 0:
@@ -699,16 +897,29 @@ class HierarchicalFlowDecoder(nn.Module):
             chunk_size=int(chunk_size),
             flow_state_dim=self.flow_state_dim,
         )
-        self.chunk_mixers = nn.ModuleList(
-            [
-                HalfSecondChunkMixerBlock(flow_dim=flow_dim, num_heads=num_chunk_heads)
-                for _ in range(num_chunk_layers)
-            ]
-        )
-        self.step_refiner = ChunkStepRefiner(
-            flow_dim=flow_dim,
-            num_heads=num_chunk_heads,
-        )
+        self.use_future_mixer = bool(use_future_mixer)
+        if self.use_future_mixer:
+            self.chunk_mixers = nn.ModuleList()
+            self.step_refiner = FlashFutureMixerRefiner(
+                flow_dim=flow_dim,
+                num_heads=num_chunk_heads,
+                num_layers=num_chunk_layers,
+                num_chunks=num_chunks,
+                chunk_size=int(chunk_size),
+                mlp_expansion=int(future_mixer_mlp_expansion),
+                use_activation_checkpoint=bool(future_mixer_checkpoint),
+            )
+        else:
+            self.chunk_mixers = nn.ModuleList(
+                [
+                    HalfSecondChunkMixerBlock(flow_dim=flow_dim, num_heads=num_chunk_heads)
+                    for _ in range(num_chunk_layers)
+                ]
+            )
+            self.step_refiner = ChunkStepRefiner(
+                flow_dim=flow_dim,
+                num_heads=num_chunk_heads,
+            )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
 
     def forward(
@@ -758,13 +969,14 @@ class HierarchicalFlowDecoder(nn.Module):
             
             
         """
-        for block in self.chunk_mixers:
-            chunk_tokens = block(
-                chunk_tokens=chunk_tokens,
-                context=context,
-                tau_emb=tau_emb,
-                chunk_valid_mask=chunk_valid_mask,
-            )
+        if not self.use_future_mixer:
+            for block in self.chunk_mixers:
+                chunk_tokens = block(
+                    chunk_tokens=chunk_tokens,
+                    context=context,
+                    tau_emb=tau_emb,
+                    chunk_valid_mask=chunk_valid_mask,
+                )
         """
         input
             step_tokens : (B, 20, D)
@@ -779,12 +991,21 @@ class HierarchicalFlowDecoder(nn.Module):
         output
             step_tokens : (b, 20, D)
         """
-        step_tokens = self.step_refiner(
-            step_tokens=step_tokens,
-            chunk_tokens=chunk_tokens,
-            context=context,
-            step_valid_mask=step_valid_mask,
-        )
+        if self.use_future_mixer:
+            step_tokens = self.step_refiner(
+                step_tokens=step_tokens,
+                chunk_tokens=chunk_tokens,
+                context=context,
+                tau_emb=tau_emb,
+                step_valid_mask=step_valid_mask,
+            )
+        else:
+            step_tokens = self.step_refiner(
+                step_tokens=step_tokens,
+                chunk_tokens=chunk_tokens,
+                context=context,
+                step_valid_mask=step_valid_mask,
+            )
         """
         output : (B, 20, 4)
         """

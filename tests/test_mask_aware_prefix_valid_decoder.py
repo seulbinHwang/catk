@@ -5,7 +5,7 @@ import torch
 from src.smart.modules.flow_local_decoder import HierarchicalFlowDecoder
 
 
-def _build_decoder(flow_state_dim: int = 4) -> HierarchicalFlowDecoder:
+def _build_decoder(flow_state_dim: int = 4, use_future_mixer: bool = False) -> HierarchicalFlowDecoder:
     torch.manual_seed(1234)
     decoder = HierarchicalFlowDecoder(
         context_dim=8,
@@ -15,6 +15,7 @@ def _build_decoder(flow_state_dim: int = 4) -> HierarchicalFlowDecoder:
         num_chunk_layers=1,
         chunk_size=5,
         flow_state_dim=flow_state_dim,
+        use_future_mixer=use_future_mixer,
     )
     decoder.eval()
     return decoder
@@ -35,6 +36,23 @@ def test_full_valid_mask_preserves_original_output() -> None:
 
 def test_invalid_tail_does_not_change_valid_prefix_output() -> None:
     decoder = _build_decoder()
+    anchor_hidden = torch.randn(2, 8)
+    x_t_norm = torch.randn(2, 10, 4)
+    tau = torch.full((2,), 0.61)
+    prefix_mask = torch.zeros(2, 10, dtype=torch.bool)
+    prefix_mask[:, :3] = True
+
+    changed_tail = x_t_norm.clone()
+    changed_tail[:, 3:] = torch.randn_like(changed_tail[:, 3:]) * 50.0
+
+    base_output = decoder(anchor_hidden, x_t_norm, tau, future_valid_mask=prefix_mask)
+    changed_output = decoder(anchor_hidden, changed_tail, tau, future_valid_mask=prefix_mask)
+
+    assert torch.allclose(base_output[:, :3], changed_output[:, :3], atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_future_mixer_invalid_tail_does_not_change_valid_prefix_output() -> None:
+    decoder = _build_decoder(use_future_mixer=True)
     anchor_hidden = torch.randn(2, 8)
     x_t_norm = torch.randn(2, 10, 4)
     tau = torch.full((2,), 0.61)

@@ -63,6 +63,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_solver_steps: int,
         flow_solver_method: str,
         flow_solver_eps: float,
+        flow_use_future_mixer: bool = False,
+        flow_future_mixer_mlp_expansion: int = 4,
+        flow_future_mixer_checkpoint: bool = False,
         use_kinematic_control_flow: bool = False,
         use_holonomic_model_only: bool = False,
         control_pos_scale_m: float = 1.0,
@@ -133,6 +136,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_chunk_layers=flow_num_chunk_layers,
             chunk_size=self.shift,
             flow_state_dim=self.flow_state_dim,
+            use_future_mixer=flow_use_future_mixer,
+            future_mixer_mlp_expansion=flow_future_mixer_mlp_expansion,
+            future_mixer_checkpoint=flow_future_mixer_checkpoint,
         )
         self.flow_ode = FlowODE(
             eps=flow_solver_eps,
