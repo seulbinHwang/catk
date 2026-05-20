@@ -21,10 +21,6 @@ from torch_geometric.utils import dense_to_sparse, subgraph
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from src.smart.modules.dynamic_light_time import (
-    mask_light_time_delta_norm_by_light_type,
-    resolve_light_time_delta_norm,
-)
 from src.smart.utils import angle_between_2d_vectors, safe_norm_2d, weight_init, wrap_angle
 
 
@@ -61,7 +57,7 @@ class SMARTAgentEncoder(nn.Module):
 
         input_dim_x_a = 3
         input_dim_r_t = 4
-        input_dim_r_pt2a = 4
+        input_dim_r_pt2a = 3
         input_dim_r_a2a = 3
         token_num_steps = 6
         token_num_vertices = 4
@@ -70,7 +66,6 @@ class SMARTAgentEncoder(nn.Module):
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
-        self.light_pl2a_emb = nn.Embedding(5, hidden_dim)
 
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
@@ -386,8 +381,6 @@ class SMARTAgentEncoder(nn.Module):
         mask,
         batch_s,
         batch_pl,
-        light_type: Optional[torch.Tensor] = None,
-        light_time_delta_norm: Optional[torch.Tensor] = None,
     ):
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
@@ -419,29 +412,6 @@ class SMARTAgentEncoder(nn.Module):
             dim=0,
         )
         edge_index_pl2a = edge_index_pl2a[:, mask_pl2a[edge_index_pl2a[1]]]
-        if light_type is None:
-            light_type = torch.zeros(
-                pos_pl.shape[0],
-                device=pos_pl.device,
-                dtype=torch.long,
-            )
-        else:
-            light_type = light_type.to(device=pos_pl.device, dtype=torch.long)
-        light_time_delta_norm = resolve_light_time_delta_norm(
-            light_time_delta_norm=light_time_delta_norm,
-            num_agents=pos_a.shape[0],
-            num_steps=pos_a.shape[1],
-            device=pos_pl.device,
-            dtype=pos_pl.dtype,
-            shift_steps=self.shift,
-        )
-        light_time_delta_flat = light_time_delta_norm.transpose(0, 1).reshape(-1)
-        edge_light_time_delta_norm = light_time_delta_flat[edge_index_pl2a[1]]
-        edge_light_type = light_type[edge_index_pl2a[0]]
-        edge_light_time_delta_norm = mask_light_time_delta_norm_by_light_type(
-            light_time_delta_norm=edge_light_time_delta_norm,
-            light_type=edge_light_type,
-        )
         rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
         rel_orient_pl2a = wrap_angle(
             orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]]
@@ -454,12 +424,8 @@ class SMARTAgentEncoder(nn.Module):
                     nbr_vector=rel_pos_pl2a[:, :2],
                 ),
                 rel_orient_pl2a,
-                edge_light_time_delta_norm,
             ],
             dim=-1,
         )
-        r_pl2a = self.r_pt2a_emb(
-            continuous_inputs=r_pl2a,
-            categorical_embs=[self.light_pl2a_emb(edge_light_type)],
-        )
+        r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
         return edge_index_pl2a, r_pl2a

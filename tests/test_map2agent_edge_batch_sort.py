@@ -27,11 +27,6 @@ def _make_encoder() -> SMARTAgentEncoder:
     encoder.pl2a_radius = 100.0
     encoder.shift = 5
     encoder.r_pt2a_emb = _IdentityRelation()
-    encoder.light_pl2a_emb = lambda light_type: torch.zeros(
-        (light_type.shape[0], 1),
-        device=light_type.device,
-        dtype=torch.float32,
-    )
     return encoder
 
 
@@ -92,7 +87,6 @@ def _build_map2agent_inputs(
         "mask": mask.to(device=device),
         "batch_s": batch_s.to(device=device),
         "batch_pl": map_batch.to(device=device),
-        "light_type": torch.zeros(num_map, dtype=torch.long, device=device),
         "_num_agent": num_agent,
         "_num_steps": num_steps,
     }
@@ -139,8 +133,6 @@ def _run_and_count(device: torch.device) -> tuple[int, int, int]:
         mask=inputs["mask"],
         batch_s=inputs["batch_s"],
         batch_pl=inputs["batch_pl"],
-        light_type=inputs["light_type"],
-        light_time_delta_norm=None,
     )
     src_batch = inputs["batch_pl"][edge_index[0]]
     dst_batch = inputs["batch_s"][edge_index[1]]
