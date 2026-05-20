@@ -23,11 +23,8 @@ default_cache_root() {
   local pod_name
   pod_name="$(hostname)"
   case "$pod_name" in
-    hsb-npc-training-2*)
+    hsb-npc-training*|hsb-npc-training-2*)
       printf '%s\n' "/workspace/womd_v1_3/SMART_cache"
-      ;;
-    hsb-npc-training*)
-      printf '%s\n' "/mnt/nuplan/womd_v1_3/SMART_cache"
       ;;
     *)
       printf '%s\n' "/workspace/womd_v1_3/SMART_cache"

@@ -29,7 +29,7 @@ DEFAULT_TASK_NAME = (
 DEFAULT_SESSION = "catk-control-pretrain-h100x4x2-execctx-balanced"
 DEFAULT_METADATA_CACHE_RELATIVE = "dataset_metadata/womd_training_memory_balance_v1.pt"
 DEFAULT_CACHE_ROOT_BY_POD = {
-    "hsb-npc-training": "/mnt/nuplan/womd_v1_3/SMART_cache",
+    "hsb-npc-training": "/workspace/womd_v1_3/SMART_cache",
     "hsb-npc-training-2": "/workspace/womd_v1_3/SMART_cache",
 }
 

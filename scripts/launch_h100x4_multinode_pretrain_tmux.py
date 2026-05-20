@@ -22,7 +22,7 @@ DEFAULT_BRANCH = os.environ.get("CATK_BRANCH", "self_forcing_bugfix")
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_CACHE_ROOT_BY_POD = {
-    "hsb-npc-training": "/mnt/nuplan/womd_v1_3/SMART_cache",
+    "hsb-npc-training": "/workspace/womd_v1_3/SMART_cache",
     "hsb-npc-training-2": "/workspace/womd_v1_3/SMART_cache",
 }
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"

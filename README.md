@@ -1261,7 +1261,7 @@ torchrun \
 - pod 내부 실행 wrapper: `scripts/h100x4_multinode_pretrain.sh`
 - OOM fallback launcher: `scripts/h100x4_multinode_pretrain_with_oom_retry.sh`
 - 기본 구성: `NNODES=2`, `NPROC_PER_NODE=4`, `trainer.num_nodes=2`, `trainer.devices=4`
-- 기본 pod별 `CACHE_ROOT`: `hsb-npc-training=/mnt/nuplan/womd_v1_3/SMART_cache`, `hsb-npc-training-2=/workspace/womd_v1_3/SMART_cache`
+- 기본 pod별 `CACHE_ROOT`: `hsb-npc-training=/workspace/womd_v1_3/SMART_cache`, `hsb-npc-training-2=/workspace/womd_v1_3/SMART_cache`
 - 기본 per-GPU batch: `data.train_batch_size=26`
 - 기본 effective global batch: `26 * 8 GPUs = 208`
 - 기본 lr: `6e-4`
@@ -1340,7 +1340,7 @@ manual launch가 필요하면 각 pod 안에서 같은 repo로 이동해 아래 
 export NNODES=2 NPROC_PER_NODE=4 NODE_RANK=0
 export MASTER_ADDR=<hsb-npc-training Pod IP>
 export MASTER_PORT=29511
-export CACHE_ROOT=/mnt/nuplan/womd_v1_3/SMART_cache
+export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
 export TASK_NAME=flow_semi_continuous_pretrain_h100x4x2
 bash scripts/h100x4_multinode_pretrain.sh
 
