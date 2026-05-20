@@ -616,6 +616,7 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 | Flow target mask | `use_prefix_valid_future_loss_mask=true` |
 | control target | kinematic control-space, rolling supervision, default no-slip ratio |
 | round-trip filter | `control_round_trip_max_position_error_m=0.5` |
+| model parameters | 총 `7,045,051`개, trainable `7,045,051`개 |
 | precision | `bf16-mixed` |
 | batch / lr | per-rank `train_batch_size=22`, effective global batch `132`, `lr=6e-4` |
 | fit-time validation | `check_val_every_n_epoch=16`, 64 epoch 중 15/31/47/63 epoch 이후 4회 평가 |
