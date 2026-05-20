@@ -1266,7 +1266,7 @@ torchrun \
 - 기본 effective global batch: `26 * 8 GPUs = 208`
 - 기본 lr: `6e-4`
 - 기본 horizon: `flow_window_steps=20`
-- 실험용 `model.model_config.decoder.flow_use_future_mixer=true`는 `flash-attn` 패키지의 varlen FlashAttention 2 경로를 직접 사용합니다. `future_valid_mask`는 연속 prefix 길이로 변환되어 invalid future token은 attention 입력에서 제외됩니다. 이 옵션은 기본값이 `false`이며, CUDA 실행 환경에는 `flash-attn==2.8.3` 수준의 FA2 패키지가 설치되어 있어야 합니다.
+- 실험용 `model.model_config.decoder.flow_use_future_mixer=true`는 `flow_future_mixer_attention_backend`로 `fa2`/`fa3`/`fa4` backend를 고를 수 있습니다. `future_valid_mask`는 연속 prefix 길이로 변환되어 invalid future token은 attention 입력에서 제외됩니다. 기본 backend는 `fa2`이고, CUDA 실행 환경에는 backend별 FlashAttention 패키지가 설치되어 있어야 합니다. 현재 H100 pod 실측 기준 `fa2`만 학습 backward가 통과했고, `fa3`는 `flash_attn_3` extension이 없으며, `fa4`는 `flash-attn-4==4.0.0b13` import 후에도 `head_dim=24` backward smoke에서 CuTeDSL verification error가 발생했습니다.
 - validation 중 WOSAC scoring이 오래 걸려도 DDP가 조기 timeout 나지 않도록 `trainer=ddp`의 process group timeout은 4시간입니다.
 - `pre_bc_flow_2x4_h100` preset은 `TQDMProgressBar(refresh_rate=1)`와 `trainer.enable_progress_bar=true`를 명시합니다. launcher 기본 pod 순서에서는 `hsb-npc-training`이 node rank 0/global rank 0이므로, `check_val_every_n_epoch=32`로 fit-time validation이 시작될 때 validation tqdm 진행률은 `hsb-npc-training`의 `catk-h100x4-pretrain` tmux 주 pane에 표시됩니다. `hsb-npc-training-2`는 non-zero rank라 같은 progress bar를 중복 출력하지 않는 것이 정상입니다.
 - launcher는 각 pod 안에 쓰는 env 파일에 pod별 `CACHE_ROOT`를 따로 기록합니다. 두 pod가 같은 mount path를 공유하는 경우에만 `--cache-root <PATH>`로 전체 override를 쓰고, pod별 경로를 바꿔야 하면 `--pod-cache-root POD=PATH`를 반복해서 넘깁니다.

@@ -9,9 +9,19 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 try:
-    from flash_attn import flash_attn_varlen_qkvpacked_func
+    from flash_attn import flash_attn_varlen_qkvpacked_func as flash_attn_2_varlen_qkvpacked_func
 except Exception:  # pragma: no cover - optional CUDA dependency
-    flash_attn_varlen_qkvpacked_func = None
+    flash_attn_2_varlen_qkvpacked_func = None
+
+try:
+    from hopper.flash_attn_interface import flash_attn_varlen_func as flash_attn_3_varlen_func
+except Exception:  # pragma: no cover - optional CUDA dependency
+    flash_attn_3_varlen_func = None
+
+try:
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn_4_varlen_func
+except Exception:  # pragma: no cover - optional CUDA dependency
+    flash_attn_4_varlen_func = None
 
 from src.smart.tokens.agent_token_matching import (
     build_agent_type_masks,
@@ -83,6 +93,7 @@ class LQRCommitBridgeConfig:
 # is not close to full. `ChunkStepRefiner` only attends over seq_len=5, so
 # forcing the math SDPA kernel here is cheap and avoids that failure mode.
 _SDPA_SAFE_BACKENDS = [SDPBackend.MATH]
+_FUTURE_MIXER_BACKENDS = {"fa2", "fa3", "fa4"}
 
 
 def _continuous_prefix_mask(valid_mask: torch.Tensor) -> torch.Tensor:
@@ -672,6 +683,7 @@ class FlashFutureMixerBlock(nn.Module):
         flow_dim: int,
         num_heads: int,
         mlp_expansion: int = 4,
+        attention_backend: str = "fa2",
     ) -> None:
         super().__init__()
         if flow_dim % num_heads != 0:
@@ -684,6 +696,13 @@ class FlashFutureMixerBlock(nn.Module):
         self.flow_dim = int(flow_dim)
         self.num_heads = int(num_heads)
         self.head_dim = self.flow_dim // self.num_heads
+        attention_backend = str(attention_backend).lower()
+        if attention_backend not in _FUTURE_MIXER_BACKENDS:
+            raise ValueError(
+                "attention_backend must be one of "
+                f"{sorted(_FUTURE_MIXER_BACKENDS)}, got {attention_backend!r}."
+            )
+        self.attention_backend = attention_backend
 
         self.attn_norm = nn.LayerNorm(flow_dim)
         self.qkv_proj = nn.Linear(flow_dim, flow_dim * 3)
@@ -738,34 +757,14 @@ class FlashFutureMixerBlock(nn.Module):
             output[batch_idx, :seq_len] = torch.einsum("hij,jhd->ihd", attn, v)
         return output
 
-    def _flash_varlen_attention(
+    def _pack_prefix_qkv(
         self,
         qkv: torch.Tensor,
         lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        if not qkv.is_cuda:
-            return self._reference_varlen_attention(qkv=qkv, lengths=lengths)
-        if flash_attn_varlen_qkvpacked_func is None:
-            raise RuntimeError(
-                "flow_use_future_mixer=true requires the flash-attn package on CUDA. "
-                "Install flash-attn or disable flow_use_future_mixer."
-            )
-        if qkv.dtype not in (torch.float16, torch.bfloat16):
-            raise RuntimeError(
-                "FlashAttention 2 future mixer requires fp16 or bf16 qkv tensors on CUDA; "
-                f"got dtype={qkv.dtype}. Use mixed precision or disable flow_use_future_mixer."
-            )
-
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         batch_size, num_steps, _, num_heads, head_dim = qkv.shape
-        output = qkv.new_zeros(batch_size, num_steps, num_heads, head_dim)
-        if batch_size == 0:
-            return output
-
         lengths = lengths.to(device=qkv.device, dtype=torch.int32)
         active_lengths = lengths[lengths > 0]
-        if active_lengths.numel() == 0:
-            return output
-
         step_ids = torch.arange(num_steps, device=qkv.device)
         prefix_token_mask = step_ids.unsqueeze(0) < lengths.unsqueeze(1)
         qkv_packed = qkv[prefix_token_mask].contiguous()
@@ -777,15 +776,90 @@ class FlashFutureMixerBlock(nn.Module):
         cu_seqlens[0] = 0
         cu_seqlens[1:] = active_lengths.cumsum(dim=0)
         max_seqlen = int(active_lengths.max().item())
+        return qkv_packed, prefix_token_mask, cu_seqlens, active_lengths, max_seqlen
 
-        out_packed = flash_attn_varlen_qkvpacked_func(
-            qkv_packed,
-            cu_seqlens,
-            max_seqlen,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=False,
+    def _require_cuda_flash_backend(
+        self,
+        qkv: torch.Tensor,
+        backend_name: str,
+        backend_func: object,
+    ) -> None:
+        if backend_func is None:
+            raise RuntimeError(
+                f"flow_use_future_mixer=true with backend={backend_name!r} requires the "
+                f"{backend_name.upper()} package/interface on CUDA."
+            )
+        if qkv.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                f"FlashAttention future mixer backend={backend_name!r} requires fp16 or bf16 "
+                f"qkv tensors on CUDA; got dtype={qkv.dtype}. Use mixed precision or disable "
+                "flow_use_future_mixer."
+            )
+
+    def _flash_varlen_attention(
+        self,
+        qkv: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        if not qkv.is_cuda:
+            return self._reference_varlen_attention(qkv=qkv, lengths=lengths)
+
+        batch_size, num_steps, _, num_heads, head_dim = qkv.shape
+        output = qkv.new_zeros(batch_size, num_steps, num_heads, head_dim)
+        if batch_size == 0:
+            return output
+
+        lengths = lengths.to(device=qkv.device, dtype=torch.int32)
+        active_lengths = lengths[lengths > 0]
+        if active_lengths.numel() == 0:
+            return output
+
+        qkv_packed, prefix_token_mask, cu_seqlens, _, max_seqlen = self._pack_prefix_qkv(
+            qkv=qkv,
+            lengths=lengths,
         )
+
+        if self.attention_backend == "fa2":
+            self._require_cuda_flash_backend(qkv, "fa2", flash_attn_2_varlen_qkvpacked_func)
+            out_packed = flash_attn_2_varlen_qkvpacked_func(
+                qkv_packed,
+                cu_seqlens,
+                max_seqlen,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=False,
+            )
+        elif self.attention_backend == "fa3":
+            self._require_cuda_flash_backend(qkv, "fa3", flash_attn_3_varlen_func)
+            q, k, v = qkv_packed.unbind(dim=1)
+            out_packed = flash_attn_3_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                causal=False,
+            )
+        elif self.attention_backend == "fa4":
+            self._require_cuda_flash_backend(qkv, "fa4", flash_attn_4_varlen_func)
+            q, k, v = qkv_packed.unbind(dim=1)
+            out_packed = flash_attn_4_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                causal=False,
+            )
+            if isinstance(out_packed, tuple):
+                out_packed = out_packed[0]
+        else:  # pragma: no cover - guarded in __init__
+            raise AssertionError(f"Unsupported future mixer attention backend: {self.attention_backend}")
+
         output[prefix_token_mask] = out_packed
         return output
 
@@ -854,6 +928,7 @@ class FlashFutureMixerRefiner(nn.Module):
         chunk_size: int,
         mlp_expansion: int = 4,
         use_activation_checkpoint: bool = False,
+        attention_backend: str = "fa2",
     ) -> None:
         super().__init__()
         self.num_chunks = int(num_chunks)
@@ -869,6 +944,7 @@ class FlashFutureMixerRefiner(nn.Module):
                     flow_dim=flow_dim,
                     num_heads=num_heads,
                     mlp_expansion=mlp_expansion,
+                    attention_backend=attention_backend,
                 )
                 for _ in range(num_layers)
             ]
@@ -949,6 +1025,7 @@ class HierarchicalFlowDecoder(nn.Module):
         use_future_mixer: bool = False,
         future_mixer_mlp_expansion: int = 4,
         future_mixer_checkpoint: bool = False,
+        future_mixer_attention_backend: str = "fa2",
     ) -> None:
         super().__init__()
         if int(num_future_steps) <= 0:
@@ -980,6 +1057,7 @@ class HierarchicalFlowDecoder(nn.Module):
                 chunk_size=int(chunk_size),
                 mlp_expansion=int(future_mixer_mlp_expansion),
                 use_activation_checkpoint=bool(future_mixer_checkpoint),
+                attention_backend=str(future_mixer_attention_backend),
             )
         else:
             self.chunk_mixers = nn.ModuleList(

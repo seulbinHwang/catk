@@ -123,6 +123,7 @@ model_config:
     flow_use_future_mixer: false
     flow_future_mixer_mlp_expansion: 4
     flow_future_mixer_checkpoint: false
+    flow_future_mixer_attention_backend: fa2
     flow_solver_steps: 32
     flow_solver_method: euler
     flow_solver_eps: 1.0e-3
