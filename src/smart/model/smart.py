@@ -390,13 +390,17 @@ class SMART(LightningModule):
                 map_feature["orientation"],
                 repeat_count,
             ),
-            "light_type": self._repeat_tensor_on_first_dim(map_feature["light_type"], repeat_count),
             "batch": self._expand_batch_index_for_rollouts(
                 map_feature["batch"],
                 repeat_count=repeat_count,
                 num_graphs=num_graphs,
             ),
         }
+        if "light_type" in map_feature:
+            expanded_map_feature["light_type"] = self._repeat_tensor_on_first_dim(
+                map_feature["light_type"],
+                repeat_count,
+            )
         return expanded_map_feature
 
     def _build_parallel_rollout_tokenized_agent(

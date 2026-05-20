@@ -613,39 +613,22 @@ test 자동 제출은 실수 방지를 위해 기본으로 꺼져 있다. Waymo 
 경고 메시지가 깨지는 현상을 피하기 위함이다. 이 파일에 새 로그 호출을 추가할 때도
 같은 패턴을 따라야 한다.
 
-### SMART 기준 모델의 동적 신호등 관측 경과 시간
+### SMART 기준 모델의 신호등 입력
 
-SMART token baseline은 이제 방법론 비교에 사용한 control-space flow 실험과 같은
-traffic-light 입력 의미를 사용한다. Traffic-light state는 더 이상 static map-token
-feature로 embedding되지 않는다. Map encoder는 현재 관측된 light state만 metadata로
-보관하고, agent-to-lane relation에 sparse factorized light bias를 더한다.
+`f6e96cf8`의 동적 traffic-light staleness 경로는 적용하지 않는다. 현재 SMART token
+baseline은 traffic-light type을 map token의 static categorical feature로만 사용한다.
+`SMARTMapDecoder`는 cache의 `light_type`을 map point embedding에 더하지만, agent-to-lane
+relation에는 traffic-light state나 관측 경과 시간을 넣지 않는다.
 
-- 해당 lane의 현재 관측 traffic-light state
-- `prediction_time - observed_light_time`으로 정의되는 normalized staleness scalar
-
-이 scalar는 `[-1s, 6s]`로 clip한 뒤 `6s`로 나눈다. 관측된 light가 없는 map element는
-light relation bias와 staleness 값을 0으로 유지하고, 관측된 `UNKNOWN` light는 경과 시간
-값을 그대로 가진다.
-따라서 입력 의미는 traffic light를 영구적인 map 속성으로 취급하는 것이 아니라,
-"이 lane은 Δt초 전에 state S로 관측되었다"가 된다.
-
-구현상 map token은 시간축으로 복제하지 않고 항상 `[N_map, H]` static source로 유지한다.
-Map-to-agent relation은 먼저 순수 기하 정보 `distance / bearing / relative heading`만으로
-embedding하고, traffic-light state/staleness는 작은 `[time_step, light_type]` bias table로
-factorize해서 해당 lane edge에 더한다. `NO_LANE_STATE` edge의 bias는 0이고, 관측된
-`UNKNOWN` light는 다른 관측 light처럼 staleness bias를 가진다. 이 구조는 신호등 의미는
-유지하면서, edge마다 4D Fourier relation을 만들거나 map token 전체를 시간축으로 늘리는
-비용을 피한다.
-
-SMART closed-loop rollout에서는 첫 번째 예측 0.5초 block이 현재 light를 `0s`
-staleness로 보고, 이후 block은 `0.5s`, `1.0s`, ... staleness를 사용한다. Cache builder도
-WOMD scenario가 표준 current raw step `10`을 사용하는지 확인하므로, 관측 light timestamp와
-model staleness convention이 어긋나지 않는다.
+따라서 map-to-agent relation은 `distance / bearing / relative heading` 3D 기하 정보만
+사용한다. `prediction_time - observed_light_time` 같은 rollout-time-dependent staleness
+scalar를 만들지 않으며, `NO_LANE_STATE`와 관측된 `UNKNOWN`도 별도 dynamic relation bias로
+처리하지 않는다. Cache에 저장된 `light_type`은 static map-token feature로만 소비된다.
 
 SMART closed-loop validation/test는 모든 `n_rollout_closed_val` rollout을 하나의
 rollout-major batch로 실행한다. Map encoder는 한 번만 평가하고, 그 뒤 `pt_token`,
-`position`, `orientation`, `batch`, `light_type`을 rollout-specific batch offset과 함께
-확장한다. Agent tensor도 같은 rollout 순서로 확장하며, output은 metric, WOSAC submission,
+`position`, `orientation`, `batch`를 rollout-specific batch offset과 함께 확장한다.
+Agent tensor도 같은 rollout 순서로 확장하며, output은 metric, WOSAC submission,
 visualization code가 보기 전에 `[agent, rollout, time, ...]` 형태로 되돌린다. 이렇게 하면
 공개 validation/test 결과 interface는 유지하면서 rollout마다 inference를 반복 호출하는 일을
 줄일 수 있다.
