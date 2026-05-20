@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
+
+try:
+    from flash_attn import flash_attn_varlen_qkvpacked_func
+except Exception:  # pragma: no cover - optional CUDA dependency
+    flash_attn_varlen_qkvpacked_func = None
 
 from src.smart.tokens.agent_token_matching import (
     build_agent_type_masks,
@@ -80,6 +83,12 @@ class LQRCommitBridgeConfig:
 # is not close to full. `ChunkStepRefiner` only attends over seq_len=5, so
 # forcing the math SDPA kernel here is cheap and avoids that failure mode.
 _SDPA_SAFE_BACKENDS = [SDPBackend.MATH]
+
+
+def _continuous_prefix_mask(valid_mask: torch.Tensor) -> torch.Tensor:
+    if valid_mask.ndim != 2:
+        raise ValueError(f"valid_mask must have shape [batch, steps], got {tuple(valid_mask.shape)}.")
+    return valid_mask.bool().to(dtype=torch.int32).cumprod(dim=1).to(dtype=torch.bool)
 
 
 @dataclass
@@ -478,6 +487,7 @@ class NormalizedNoisyFutureEncoder(nn.Module):
                     f"expected={tuple(x_t_norm.shape[:2])}, actual={tuple(future_valid_mask.shape)}."
                 )
             future_valid_mask = future_valid_mask.to(device=x_t_norm.device, dtype=torch.bool)
+            future_valid_mask = _continuous_prefix_mask(future_valid_mask)
             if bool(future_valid_mask.all().item()):
                 future_valid_mask = None
 
@@ -700,13 +710,84 @@ class FlashFutureMixerBlock(nn.Module):
         )
 
     @staticmethod
-    def _build_safe_key_mask(step_valid_mask: torch.Tensor) -> torch.Tensor:
-        key_mask = step_valid_mask.bool()
-        all_invalid = ~key_mask.any(dim=1)
-        if bool(all_invalid.any().item()):
-            key_mask = key_mask.clone()
-            key_mask[all_invalid, 0] = True
-        return key_mask
+    def _prefix_lengths(step_valid_mask: torch.Tensor, num_steps: int) -> torch.Tensor:
+        if tuple(step_valid_mask.shape[-1:]) != (num_steps,):
+            raise ValueError(
+                "step_valid_mask last dimension must match future token count: "
+                f"expected={num_steps}, actual={tuple(step_valid_mask.shape)}."
+            )
+        return _continuous_prefix_mask(step_valid_mask).sum(dim=1).to(dtype=torch.int32)
+
+    def _reference_varlen_attention(
+        self,
+        qkv: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_steps, _, num_heads, head_dim = qkv.shape
+        output = qkv.new_zeros(batch_size, num_steps, num_heads, head_dim)
+        scale = float(head_dim) ** -0.5
+        for batch_idx in range(batch_size):
+            seq_len = int(lengths[batch_idx].item())
+            if seq_len <= 0:
+                continue
+            q = qkv[batch_idx, :seq_len, 0]
+            k = qkv[batch_idx, :seq_len, 1]
+            v = qkv[batch_idx, :seq_len, 2]
+            scores = torch.einsum("ihd,jhd->hij", q, k) * scale
+            attn = torch.softmax(scores, dim=-1)
+            output[batch_idx, :seq_len] = torch.einsum("hij,jhd->ihd", attn, v)
+        return output
+
+    def _flash_varlen_attention(
+        self,
+        qkv: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        if not qkv.is_cuda:
+            return self._reference_varlen_attention(qkv=qkv, lengths=lengths)
+        if flash_attn_varlen_qkvpacked_func is None:
+            raise RuntimeError(
+                "flow_use_future_mixer=true requires the flash-attn package on CUDA. "
+                "Install flash-attn or disable flow_use_future_mixer."
+            )
+        if qkv.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                "FlashAttention 2 future mixer requires fp16 or bf16 qkv tensors on CUDA; "
+                f"got dtype={qkv.dtype}. Use mixed precision or disable flow_use_future_mixer."
+            )
+
+        batch_size, num_steps, _, num_heads, head_dim = qkv.shape
+        output = qkv.new_zeros(batch_size, num_steps, num_heads, head_dim)
+        if batch_size == 0:
+            return output
+
+        lengths = lengths.to(device=qkv.device, dtype=torch.int32)
+        active_lengths = lengths[lengths > 0]
+        if active_lengths.numel() == 0:
+            return output
+
+        step_ids = torch.arange(num_steps, device=qkv.device)
+        prefix_token_mask = step_ids.unsqueeze(0) < lengths.unsqueeze(1)
+        qkv_packed = qkv[prefix_token_mask].contiguous()
+        cu_seqlens = torch.empty(
+            active_lengths.numel() + 1,
+            device=qkv.device,
+            dtype=torch.int32,
+        )
+        cu_seqlens[0] = 0
+        cu_seqlens[1:] = active_lengths.cumsum(dim=0)
+        max_seqlen = int(active_lengths.max().item())
+
+        out_packed = flash_attn_varlen_qkvpacked_func(
+            qkv_packed,
+            cu_seqlens,
+            max_seqlen,
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=False,
+        )
+        output[prefix_token_mask] = out_packed
+        return output
 
     def _self_attention(
         self,
@@ -720,35 +801,26 @@ class FlashFutureMixerBlock(nn.Module):
             3,
             self.num_heads,
             self.head_dim,
-        )
-        q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        attn_mask = None
+        ).contiguous()
         if step_valid_mask is not None:
             if tuple(step_valid_mask.shape) != (batch_size, num_steps):
                 raise ValueError(
                     "step_valid_mask shape must match future tokens: "
                     f"expected={(batch_size, num_steps)}, actual={tuple(step_valid_mask.shape)}."
                 )
-            attn_mask = self._build_safe_key_mask(step_valid_mask).view(
-                batch_size,
-                1,
-                1,
+            lengths = self._prefix_lengths(step_valid_mask=step_valid_mask, num_steps=num_steps)
+        else:
+            lengths = torch.full(
+                (batch_size,),
                 num_steps,
+                device=x.device,
+                dtype=torch.int32,
             )
-
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=False,
+        attn_out = self._flash_varlen_attention(qkv=qkv, lengths=lengths).reshape(
+            batch_size,
+            num_steps,
+            dim,
         )
-        attn_out = attn_out.transpose(1, 2).reshape(batch_size, num_steps, dim)
         return self.out_proj(attn_out)
 
     def forward(

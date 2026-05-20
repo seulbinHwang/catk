@@ -68,6 +68,25 @@ def test_future_mixer_invalid_tail_does_not_change_valid_prefix_output() -> None
     assert torch.allclose(base_output[:, :3], changed_output[:, :3], atol=1.0e-6, rtol=1.0e-6)
 
 
+def test_future_mixer_uses_continuous_prefix_not_later_valid_holes() -> None:
+    decoder = _build_decoder(use_future_mixer=True)
+    anchor_hidden = torch.randn(2, 8)
+    x_t_norm = torch.randn(2, 10, 4)
+    tau = torch.full((2,), 0.61)
+    prefix_with_later_true = torch.zeros(2, 10, dtype=torch.bool)
+    prefix_with_later_true[:, :3] = True
+    prefix_with_later_true[:, 5:8] = True
+
+    changed_tail = x_t_norm.clone()
+    changed_tail[:, 3:] = torch.randn_like(changed_tail[:, 3:]) * 50.0
+
+    base_output = decoder(anchor_hidden, x_t_norm, tau, future_valid_mask=prefix_with_later_true)
+    changed_output = decoder(anchor_hidden, changed_tail, tau, future_valid_mask=prefix_with_later_true)
+
+    assert torch.allclose(base_output[:, :3], changed_output[:, :3], atol=1.0e-6, rtol=1.0e-6)
+    assert torch.allclose(base_output[:, 3:], changed_output[:, 3:], atol=1.0e-6, rtol=1.0e-6)
+
+
 def test_control_state_dim_prefix_mask() -> None:
     decoder = _build_decoder(flow_state_dim=3)
     anchor_hidden = torch.randn(2, 8)
