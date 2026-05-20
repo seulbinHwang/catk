@@ -718,11 +718,13 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_stati
 | GPU 구성 | H100 4장 + H100 2장 = 6 GPU |
 | launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods.py` |
 | experiment config | `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml` |
-| task name | `flow_control_space_pretrain_h100x6_hsb2_wo2_execctx_prefix_balanced_lr6e-4_bs20` |
+| task name | `flow_control_space_pretrain_h100x6_hsb2_wo2_execctx_prefix_balanced_fd108_lr6e-4_bs20` |
 | tmux session | `catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced` |
 | per-GPU batch | `20` |
 | effective global batch | `20 x 6 = 120` |
 | learning rate | `6e-4` |
+| flow decoder dim | `108` |
+| 실측 모델 파라미터 | `7,172,419` total / trainable |
 | flow horizon | `20` steps = 2초 |
 | 핵심 supervision | `use_kinematic_control_flow=true`, prefix-valid future loss, execution-context aligned trajectory |
 | outlier filter | vehicle `2.0m`, cyclist `2.0m` |

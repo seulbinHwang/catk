@@ -23,7 +23,7 @@ DEFAULT_PODS = ("hsb-npc-training-2", "wo-pvc-2")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4x2_execctx_balanced"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_h100x6_hsb2_wo2_"
-    "execctx_prefix_balanced_lr6e-4_bs20"
+    "execctx_prefix_balanced_fd108_lr6e-4_bs20"
 )
 DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced"
 DEFAULT_METADATA_CACHE_RELATIVE = "dataset_metadata/womd_training_memory_balance_v1.pt"
