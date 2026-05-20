@@ -7,7 +7,6 @@ import torch
 from omegaconf import DictConfig
 from torch_cluster import radius_graph
 from torch.utils.checkpoint import checkpoint
-from torch_geometric.utils import subgraph
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
@@ -130,7 +129,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             )
         self.flow_state_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
         self.r_a2a_emb = FourierEmbedding(
-            input_dim=6,
+            input_dim=3,
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
@@ -267,63 +266,33 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         head_vector_a: torch.Tensor,
         batch_s: torch.Tensor,
         mask: torch.Tensor,
-        motion_a: torch.Tensor | None = None,
-        motion_valid_a: torch.Tensor | None = None,
     ):
         mask_flat = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
 
-        if motion_a is None:
-            motion_a = self._build_motion_vector(pos_a, mask)
-            motion_valid_a = self._build_motion_valid_mask(pos_a, mask)
-        else:
-            if motion_a.shape != pos_a.shape:
-                raise ValueError(
-                    "motion_a shape must match pos_a shape, "
-                    f"got {tuple(motion_a.shape)} and {tuple(pos_a.shape)}"
-                )
-            if motion_valid_a is None:
-                raise ValueError(
-                    "motion_valid_a is required when motion_a is provided. "
-                    "Missing motion must not be treated as valid zero motion."
-                )
-            if tuple(motion_valid_a.shape) != tuple(motion_a.shape[:2]):
-                raise ValueError(
-                    "motion_valid_a shape must match the first two dimensions of motion_a, "
-                    f"got {tuple(motion_valid_a.shape)} and {tuple(motion_a.shape[:2])}"
-                )
-        motion_valid_a = motion_valid_a.bool()
-        motion_s = motion_a.transpose(0, 1).reshape(-1, 2)
-        motion_valid_s = motion_valid_a.transpose(0, 1).reshape(-1)
+        valid_node_idx = torch.nonzero(mask_flat, as_tuple=False).flatten()
+        if valid_node_idx.numel() == 0:
+            edge_index_a2a = torch.empty(2, 0, device=pos_a.device, dtype=torch.long)
+            r_a2a = self.r_a2a_emb(
+                continuous_inputs=pos_a.new_zeros((0, self.r_a2a_emb.input_dim)),
+                categorical_embs=None,
+            )
+            return edge_index_a2a, r_a2a
 
+        pos_valid = pos_s[valid_node_idx]
+        batch_valid = batch_s[valid_node_idx]
         edge_index_a2a = radius_graph(
-            x=pos_s[:, :2],
+            x=pos_valid[:, :2],
             r=self.a2a_radius,
-            batch=batch_s,
+            batch=batch_valid,
             loop=False,
             max_num_neighbors=300,
         )
-        edge_index_a2a = subgraph(subset=mask_flat, edge_index=edge_index_a2a)[0]
+        edge_index_a2a = valid_node_idx[edge_index_a2a]
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
-
-        # Use coarse-step relative displacement instead of raw m/s velocity so the
-        # added relation channels stay on a meter-scale comparable to the existing
-        # distance feature without introducing another global normalization rule.
-        rel_motion = motion_s[edge_index_a2a[0]] - motion_s[edge_index_a2a[1]]
-        rel_motion_valid = (
-            motion_valid_s[edge_index_a2a[0]]
-            & motion_valid_s[edge_index_a2a[1]]
-        )
-        recv_head = head_s[edge_index_a2a[1]]
-        recv_cos = recv_head.cos()
-        recv_sin = recv_head.sin()
-        rel_motion_long = rel_motion[:, 0] * recv_cos + rel_motion[:, 1] * recv_sin
-        rel_motion_lat = -rel_motion[:, 0] * recv_sin + rel_motion[:, 1] * recv_cos
-        rel_motion_long = rel_motion_long.masked_fill(~rel_motion_valid, 0.0)
-        rel_motion_lat = rel_motion_lat.masked_fill(~rel_motion_valid, 0.0)
 
         r_a2a = torch.stack(
             [
@@ -333,9 +302,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     nbr_vector=rel_pos_a2a[:, :2],
                 ),
                 rel_head_a2a,
-                rel_motion_long,
-                rel_motion_lat,
-                rel_motion_valid.to(dtype=rel_motion_long.dtype),
             ],
             dim=-1,
         )
@@ -366,41 +332,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             * num_graphs
         )
         return batch.repeat(num_steps) + step_offsets
-
-    @staticmethod
-    def _build_recent_coarse_motion(
-        pos_window: torch.Tensor,
-        valid_window: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """마지막 두 coarse 상태 차이로 최근 이동량을 만듭니다.
-
-        Args:
-            pos_window: 최근 coarse 중심점 창입니다.
-                shape은 ``[n_agent, n_step, 2]`` 입니다.
-            valid_window: 같은 창의 유효 여부입니다.
-                shape은 ``[n_agent, n_step]`` 입니다.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]:
-                각 agent의 최근 coarse 이동량과 그 유효 여부입니다.
-                shape은 각각 ``[n_agent, 2]`` 와 ``[n_agent]`` 입니다.
-                마지막 두 상태가 모두 유효하지 않으면 이동량은 0, 유효 여부는
-                ``False`` 로 둡니다.
-        """
-        recent_motion = pos_window.new_zeros((pos_window.shape[0], pos_window.shape[-1]))
-        recent_motion_valid = torch.zeros(
-            pos_window.shape[0],
-            device=pos_window.device,
-            dtype=torch.bool,
-        )
-        if pos_window.shape[1] < 2:
-            return recent_motion, recent_motion_valid
-
-        recent_motion_valid = valid_window[:, -1] & valid_window[:, -2]
-        recent_motion[recent_motion_valid] = (
-            pos_window[recent_motion_valid, -1] - pos_window[recent_motion_valid, -2]
-        )
-        return recent_motion, recent_motion_valid
 
     def _build_initial_exec_state_history(
         self,
@@ -1660,18 +1591,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     batch_s=tokenized_agent["batch"],
                     batch_pl=map_feature["batch"],
                 )
-                recent_motion, recent_motion_valid = self._build_recent_coarse_motion(
-                    pos_window=pos_window,
-                    valid_window=valid_window,
-                )
                 edge_index_a2a, r_a2a = self.build_interaction_edge(
                     pos_a=pos_window[:, -1:],
                     head_a=head_window[:, -1:],
                     head_vector_a=head_vector_window[:, -1:],
                     batch_s=tokenized_agent["batch"],
                     mask=inference_mask[:, -1:],
-                    motion_a=recent_motion.unsqueeze(1),
-                    motion_valid_a=recent_motion_valid.unsqueeze(1),
                 )
 
                 for i in range(self.num_layers):
