@@ -1,0 +1,26 @@
+# @package _global_
+
+# Prefix-valid default no-slip control-space pretrain for an H100 4+2 fleet:
+#   hsb-npc-training: 4x H100
+#   wo-pvc:           2x H100
+#
+# The objective-side settings intentionally match the V100x47 default no-slip
+# stable recipe: 18-token / 16-anchor tail-prefix supervision, kinematic
+# control-space targets, rolling supervision, and the default vehicle/cyclist
+# no-slip ratios. Hardware-specific changes are limited to H100 bf16 precision,
+# two heterogeneous nodes, and the measured safe per-rank batch.
+
+defaults:
+  - pre_bc_flow_control_v100x47_prefix_default_noslip
+  - _self_
+
+trainer:
+  devices: -1
+  num_nodes: 2
+  precision: bf16-mixed
+
+data:
+  train_batch_size: 22
+  val_batch_size: 12
+  test_batch_size: 12
+  train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc.pt

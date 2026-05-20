@@ -65,3 +65,35 @@ def test_oom_retry_preflight_builds_metadata_on_all_pods() -> None:
     assert 'copy_memory_balance_metadata_from_master "$pod"' in script
     assert 'validate_memory_balance_metadata_on_pod "$pod"' in script
     assert "memory-balance metadata preflight ready on all" in script
+    assert "CATK_REMOTE_PYTHON" in script
+    assert "${remote_python_q} tools/build_memory_balance_metadata.py" in script
+
+
+def test_h100x4_h100x2_launcher_dry_run_uses_workspace_cache_and_bs22() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(
+                repo_root
+                / "scripts"
+                / "launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py"
+            ),
+            "--dry-run",
+            "--replace",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "PODS='hsb-npc-training wo-pvc'" in result.stdout
+    assert "NPROC_PER_NODE=gpu" in result.stdout
+    assert "MANUAL_RANK_OFFSETS=1" in result.stdout
+    assert "INITIAL_BS=22" in result.stdout
+    assert "OOM_STEP=1" in result.stdout
+    assert "hsb-npc-training=/workspace/womd_v1_3/SMART_cache" in result.stdout
+    assert "wo-pvc=/workspace/womd_v1_3/SMART_cache" in result.stdout
+    assert "womd_training_memory_balance_h100x6_hsb_wo_pvc.pt" in result.stdout
+    assert "pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip" in result.stdout

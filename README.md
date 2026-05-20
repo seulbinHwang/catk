@@ -591,6 +591,68 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --dry-run
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --stop
 ```
 
+#### hsb-npc-training/wo-pvc H100x4+H100x2 prefix-valid default no-slip ratio pretrain
+
+`hsb-npc-training`의 H100 4장과 `wo-pvc`의 H100 2장을 묶어 `semi_control_stable` 최신 prefix-valid default no-slip control-space pretrain을 돌릴 때는 아래 launcher를 씁니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --replace
+```
+
+이 launcher는 아래 preset과 static pod 구성을 사용합니다.
+
+```text
+configs/experiment/pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip.yaml
+scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py
+```
+
+기본 설정:
+
+| 항목 | 설정 |
+|---|---|
+| pod / GPU | `hsb-npc-training` 4 H100 + `wo-pvc` 2 H100 = 총 6 rank |
+| cache root | 두 pod 모두 `/workspace/womd_v1_3/SMART_cache` |
+| context / anchor | `18-token / 16-anchor` Tail-Prefix supervision |
+| Flow target mask | `use_prefix_valid_future_loss_mask=true` |
+| control target | kinematic control-space, rolling supervision, default no-slip ratio |
+| round-trip filter | `control_round_trip_max_position_error_m=0.5` |
+| precision | `bf16-mixed` |
+| batch / lr | per-rank `train_batch_size=22`, effective global batch `132`, `lr=6e-4` |
+| metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc.pt` preflight 생성/검증 |
+
+두 pod의 local GPU 수가 `4 + 2`로 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를 쓰면 안 됩니다. 이 launcher는 `--manual-rank-offsets` 경로를 사용해 `hsb-npc-training`에 rank `0~3`, `wo-pvc`에 rank `4~5`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment` / `HeterogeneousDDPStrategy`로 Lightning의 homogeneous world-size 가정을 완화합니다.
+
+batch size probe 결과:
+
+| per-rank batch | probe 결과 | worst peak reserved | 판단 |
+|---:|---:|---:|---|
+| 12 | 성공, 2.160분 | 51.01% | 안전하지만 느림 |
+| 20 | 성공, 2.946분 | 81.96% | 안전 |
+| 22 | 100-step 성공, 3.129분 / 500-step 성공, 15.603분 | 90.21% | 기본값 |
+| 23 | 성공, 3.242분 | 94.92% | 장기 학습에는 마진 부족 |
+| 24 | 성공, 3.309분 | 97.19% | OOM 위험이 높아 제외 |
+
+따라서 이 6 H100 조합에서는 `train_batch_size=22`를 기본값으로 둡니다. `bs=23/24`는 짧은 probe에서는 통과했지만, peak reserved가 너무 높아 full pretrain 중 dense scene이나 allocator fragmentation이 겹치면 CUDA OOM 가능성이 큽니다. 500-step `bs=22` probe 기준 step time은 약 `1.87s`이고, training split `486,996`개 / global batch `132` 기준 한 epoch는 약 `3,690` step입니다. 64 epoch train-only 예상 시간은 약 `123h`(`5.1일`)이며, 32 epoch마다 도는 validation 시간은 별도로 추가됩니다. launcher의 기본 OOM fallback은 `22 -> 21 -> 20`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt`를 peer pod로 동기화한 뒤 재개합니다.
+
+실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --dry-run --replace
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-prefix-default-noslip
+kubectl exec -it -n p-pnc wo-pvc -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-prefix-default-noslip
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`, round-trip filter `0.5m`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.

@@ -54,6 +54,7 @@ MEMORY_BALANCE_METADATA_CACHE="${MEMORY_BALANCE_METADATA_CACHE:-}"
 MEMORY_BALANCE_METADATA_NUM_WORKERS="${MEMORY_BALANCE_METADATA_NUM_WORKERS:-8}"
 MEMORY_BALANCE_METADATA_FORCE_REBUILD="${MEMORY_BALANCE_METADATA_FORCE_REBUILD:-0}"
 DEFAULT_CACHE_ROOT="${DEFAULT_CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
+CATK_REMOTE_PYTHON="${CATK_REMOTE_PYTHON:-/mnt/nuplan/miniforge/envs/catk/bin/python}"
 
 read -r -a POD_ARRAY <<< "$PODS"
 if (( ${#POD_ARRAY[@]} < 2 )); then
@@ -127,7 +128,7 @@ ${git_cmd}
 
 prebuild_memory_balance_metadata_for_pod() {
   local pod="$1"
-  local cache_root metadata_cache raw_dir force_arg metadata_cache_q raw_dir_q project_root_q workers_q
+  local cache_root metadata_cache raw_dir force_arg metadata_cache_q raw_dir_q project_root_q workers_q remote_python_q
   cache_root="$(cache_root_for_pod "$pod")"
   metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
   raw_dir="${cache_root%/}/training"
@@ -140,6 +141,7 @@ prebuild_memory_balance_metadata_for_pod() {
   raw_dir_q="$(remote_quote "$raw_dir")"
   project_root_q="$(remote_quote "$PROJECT_ROOT")"
   workers_q="$(remote_quote "$MEMORY_BALANCE_METADATA_NUM_WORKERS")"
+  remote_python_q="$(remote_quote "$CATK_REMOTE_PYTHON")"
 
   log "prebuilding memory-balance metadata on ${pod}: raw_dir=${raw_dir} cache=${metadata_cache}"
   sync_project_for_pod "$pod"
@@ -148,7 +150,7 @@ set -euo pipefail
 cd ${project_root_q}
 mkdir -p \"\$(dirname ${metadata_cache_q})\"
 test -d ${raw_dir_q}
-python tools/build_memory_balance_metadata.py \
+${remote_python_q} tools/build_memory_balance_metadata.py \
   --raw-dir ${raw_dir_q} \
   --cache-path ${metadata_cache_q} \
   --num-workers ${workers_q} \
@@ -184,7 +186,7 @@ mv ${tmp_cache_q} ${metadata_cache_q}
 
 validate_memory_balance_metadata_on_pod() {
   local pod="$1"
-  local cache_root metadata_cache raw_dir metadata_cache_q raw_dir_q project_root_q workers_q
+  local cache_root metadata_cache raw_dir metadata_cache_q raw_dir_q project_root_q workers_q remote_python_q
   cache_root="$(cache_root_for_pod "$pod")"
   metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
   raw_dir="${cache_root%/}/training"
@@ -192,6 +194,7 @@ validate_memory_balance_metadata_on_pod() {
   raw_dir_q="$(remote_quote "$raw_dir")"
   project_root_q="$(remote_quote "$PROJECT_ROOT")"
   workers_q="$(remote_quote "$MEMORY_BALANCE_METADATA_NUM_WORKERS")"
+  remote_python_q="$(remote_quote "$CATK_REMOTE_PYTHON")"
 
   log "validating memory-balance metadata on ${pod}: raw_dir=${raw_dir} cache=${metadata_cache}"
   sync_project_for_pod "$pod"
@@ -199,7 +202,7 @@ validate_memory_balance_metadata_on_pod() {
 set -euo pipefail
 cd ${project_root_q}
 test -d ${raw_dir_q}
-python tools/build_memory_balance_metadata.py \
+${remote_python_q} tools/build_memory_balance_metadata.py \
   --raw-dir ${raw_dir_q} \
   --cache-path ${metadata_cache_q} \
   --num-workers ${workers_q}
