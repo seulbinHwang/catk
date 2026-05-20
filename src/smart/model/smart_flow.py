@@ -173,6 +173,7 @@ class SMARTFlow(LightningModule):
         self.n_batch_sim_agents_metric = model_config.n_batch_sim_agents_metric
         self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
         self._scorer_scene_num_last_key: tuple[int, int, int] | None = None
+        self._scorer_val_limit_last_key: tuple[int, int | float, int] | None = None
         self._fit_time_original_limit_val_batches: int | float | None = None
         self._fit_time_checkpoint_only_validation_enabled = False
         self.open_metric_names = {
@@ -432,6 +433,90 @@ class SMARTFlow(LightningModule):
                 f"val_batch_size={val_batch_size}).",
                 flush=True,
             )
+
+    def _estimate_val_batches_per_rank(self) -> int | None:
+        """현재 rank에서 실행 가능한 validation batch 수를 추정합니다."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return None
+        val_dataset = getattr(datamodule, "val_dataset", None)
+        if val_dataset is None:
+            return None
+        try:
+            dataset_len = int(len(val_dataset))
+        except (TypeError, ValueError):
+            return None
+        if dataset_len <= 0:
+            return None
+        val_batch_size = self._resolve_val_batch_size()
+        if val_batch_size is None:
+            return None
+
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        if world_size <= 0:
+            world_size = 1
+        global_rank = int(getattr(trainer, "global_rank", 0) or 0)
+        shard_size, remainder = divmod(dataset_len, world_size)
+        rank_samples = shard_size + int(global_rank < remainder)
+        return max(1, math.ceil(rank_samples / val_batch_size))
+
+    def _ensure_validation_limit_reaches_scorer_batches(self) -> None:
+        """Fast WOSAC scorer가 요청 scene 수까지 도달하도록 val loop cap을 보정합니다."""
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        try:
+            target_batches = int(self.n_batch_sim_agents_metric)
+        except (TypeError, ValueError):
+            return
+        if target_batches <= 0:
+            return
+
+        limit_val_batches = getattr(trainer, "limit_val_batches", None)
+        if isinstance(limit_val_batches, bool) or limit_val_batches is None:
+            return
+
+        resolved_batches: int | None = None
+        if isinstance(limit_val_batches, int):
+            if limit_val_batches <= 0:
+                return
+            resolved_batches = int(limit_val_batches)
+        elif isinstance(limit_val_batches, float):
+            if limit_val_batches <= 0.0:
+                return
+            if limit_val_batches >= 1.0:
+                return
+            total_batches = self._estimate_val_batches_per_rank()
+            if total_batches is None:
+                return
+            resolved_batches = int(total_batches * limit_val_batches)
+        else:
+            return
+
+        if resolved_batches >= target_batches:
+            return
+
+        old_limit = limit_val_batches
+        trainer.limit_val_batches = target_batches
+        current_key = (target_batches, old_limit, resolved_batches)
+        if self._scorer_val_limit_last_key == current_key:
+            return
+        self._scorer_val_limit_last_key = current_key
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[scorer_scene_num] Fast WOSAC scorer가 요청 scene 수까지 평가하도록 "
+                f"trainer.limit_val_batches를 {old_limit}에서 {target_batches}로 늘립니다 "
+                f"(기존 resolved_val_batches={resolved_batches}).",
+                flush=True,
+            )
+
+    def _configure_fast_wosac_validation_scope(self) -> None:
+        """scorer scene 수와 validation loop cap을 함께 정렬합니다."""
+        self._apply_scorer_scene_num_overrides()
+        self._ensure_validation_limit_reaches_scorer_batches()
 
     def _apply_fit_time_validation_batch_limit(self) -> None:
         """학습 중 validation에서 앞쪽 일부 batch만 돌도록 trainer 값을 바꿉니다.
@@ -2342,14 +2427,19 @@ class SMARTFlow(LightningModule):
         Returns:
             None
         """
-        self._apply_scorer_scene_num_overrides()
+        self._configure_fast_wosac_validation_scope()
         self._apply_fit_time_validation_batch_limit()
         self._sync_self_forced_auxiliary_models()
         self._prepare_self_forced_generator_ema()
 
     def on_validation_start(self) -> None:
         """validation 시작 직전에 scorer batch 수 자동 조정을 다시 시도합니다."""
-        self._apply_scorer_scene_num_overrides()
+        self._configure_fast_wosac_validation_scope()
+
+    def setup(self, stage: str) -> None:
+        """validation dataloader cap이 scorer scene 수보다 작지 않도록 미리 맞춥니다."""
+        if stage in {"fit", "validate"}:
+            self._configure_fast_wosac_validation_scope()
 
     def on_fit_end(self) -> None:
         """학습이 끝나면 임시로 바꾼 validation 제한 값을 정리합니다.

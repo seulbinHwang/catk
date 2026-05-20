@@ -939,7 +939,7 @@ python scripts/launch_pre_bc_flow_control_v100x47_static_pods.py --stop
   token / raw branch 를 유지합니다.
 - `model.model_config.n_batch_sim_agents_metric`는 validation 중 Fast WOSAC scorer를 실제로 돌릴 앞쪽 batch 수입니다. `smart_flow` 기본값은 `10`, `local_val_flow`는 `100`, `sim_agents_sub_flow`는 `0`입니다. 단, `model.model_config.scorer_scene_num`이 양의 정수이면 이 값은 validation 시작 시 자동으로 덮어써집니다.
 - `model.model_config.scorer_scene_num`는 GPU 개수와 validation batch size가 달라도 Fast WOSAC scorer에 들어가는 scene 규모를 비슷하게 맞추기 위한 기준값입니다. 기본값은 `1680` 입니다. 실제 적용식은 `n_batch_sim_agents_metric = max(1, ceil(ceil(scorer_scene_num / world_size) / val_batch_size))` 입니다. `null` 또는 `0` 으로 두면 자동 덮어쓰기를 끄고 명시한 `n_batch_sim_agents_metric` 값을 그대로 씁니다.
-- `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다.
+- `trainer.limit_val_batches`는 validation에 실제로 사용할 batch 양입니다. `0.1`이면 전체 validation batch의 10%, `1.0`이면 전체, 정수 `20`이면 앞 20 batch만 평가합니다. 다만 `scorer_scene_num`이 양수이고 `limit_val_batches`가 Fast WOSAC 채점에 필요한 batch 수보다 작으면, 실행 시 `limit_val_batches`를 필요한 batch 수까지 자동으로 늘립니다.
 - `data.val_batch_size`는 validation batch당 scene 수입니다. 키우면 validation은 빨라질 수 있지만 GPU memory 사용량도 같이 늘어납니다. `scorer_scene_num` 자동 덮어쓰기가 켜져 있으면 이 값이 `n_batch_sim_agents_metric` 계산식의 분모가 됩니다.
 - Fast WOSAC scorer 기준 총 채점 scene 수는 `scorer_scene_num`이 켜져 있으면 대략 `n_batch_sim_agents_metric x val_batch_size x world_size` 입니다. batch 단위로만 자르므로 요청값보다 조금 커질 수 있습니다. 끈 경우에는 대략 `min(실행한 val batch 수, n_batch_sim_agents_metric) x val_batch_size x world_size` 입니다.
 - closed-loop rollout 총 수는 대략 `(실행한 val batch 수) x val_batch_size x n_rollout_closed_val` 입니다.
@@ -1891,9 +1891,9 @@ python -m src.run \
 
 주의:
 
-- `local_val_flow` 기본값은 `trainer.limit_val_batches=60` 이라 빠른 local check용입니다.
+- `local_val_flow` 기본값은 `model.model_config.scorer_scene_num=1680` 입니다. 따라서 1GPU / `val_batch_size=4`에서는 Fast WOSAC scorer가 약 1680 scene을 보도록 `limit_val_batches=60`이 실행 중 `420` batch로 늘어납니다. 6GPU / `val_batch_size=4`에서는 rank당 `70` batch가 필요합니다.
 - 전체 validation set을 돌리고 싶으면 `trainer.limit_val_batches=1.0` 을 추가하면 됩니다.
-- 현재 `local_val_flow`는 `model.model_config.n_batch_sim_agents_metric=100` 이라 실행한 validation batch 전체에 대해 Fast WOSAC scorer를 돌립니다.
+- `scorer_scene_num=null` 또는 `0` 으로 끄면 예전처럼 `n_batch_sim_agents_metric`와 `trainer.limit_val_batches`를 직접 조합해 더 작은 quick check를 만들 수 있습니다.
 
 ### 6.2 Validation set에서 open-loop만 보고 싶을 때
 
