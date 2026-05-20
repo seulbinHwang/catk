@@ -5,6 +5,7 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
@@ -845,6 +846,12 @@ class FlashFutureMixerBlock(nn.Module):
         elif self.attention_backend == "fa4":
             self._require_cuda_flash_backend(qkv, "fa4", flash_attn_4_varlen_func)
             q, k, v = qkv_packed.unbind(dim=1)
+            padded_head_dim = 1 << max(5, (int(head_dim) - 1).bit_length())
+            if padded_head_dim != int(head_dim):
+                pad_width = padded_head_dim - int(head_dim)
+                q = F.pad(q, (0, pad_width))
+                k = F.pad(k, (0, pad_width))
+                v = F.pad(v, (0, pad_width))
             out_packed = flash_attn_4_varlen_func(
                 q,
                 k,
@@ -853,10 +860,13 @@ class FlashFutureMixerBlock(nn.Module):
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
+                softmax_scale=float(head_dim) ** -0.5,
                 causal=False,
             )
             if isinstance(out_packed, tuple):
                 out_packed = out_packed[0]
+            if padded_head_dim != int(head_dim):
+                out_packed = out_packed[..., :head_dim]
         else:  # pragma: no cover - guarded in __init__
             raise AssertionError(f"Unsupported future mixer attention backend: {self.attention_backend}")
 
