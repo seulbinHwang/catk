@@ -66,23 +66,33 @@ class SMARTMapDecoder(nn.Module):
         self.token_emb = MLPEmbedding(input_dim=22, hidden_dim=hidden_dim)
         self.apply(weight_init)
 
-    def forward(self, tokenized_map: Dict) -> Dict[str, torch.Tensor]:
-        pos_pt = tokenized_map["position"]
-        orient_pt = tokenized_map["orientation"]
-        orient_vector_pt = torch.stack([orient_pt.cos(), orient_pt.sin()], dim=-1)
-        pt_token_emb_src = self.token_emb(tokenized_map["token_traj_src"])
-        x_pt = pt_token_emb_src[tokenized_map["token_idx"]]
+    def _cached_pt2pt_matches_config(self, tokenized_map: Dict) -> bool:
+        if "edge_index_pt2pt" not in tokenized_map or "r_pt2pt_raw" not in tokenized_map:
+            return False
+        cached_radius = tokenized_map.get("pt2pt_radius")
+        if cached_radius is not None:
+            if not torch.allclose(
+                cached_radius.to(dtype=torch.float32),
+                cached_radius.new_tensor(float(self.pl2pl_radius)),
+            ):
+                return False
+        cached_max_neighbors = tokenized_map.get("pt2pt_max_num_neighbors")
+        if cached_max_neighbors is not None:
+            if not torch.all(cached_max_neighbors == 100):
+                return False
+        return True
 
-        x_pt_categorical_embs = [
-            self.type_pt_emb(tokenized_map["type"]),
-            self.polygon_type_emb(tokenized_map["pl_type"]),
-            self.light_pl_emb(tokenized_map["light_type"]),
-        ]
-        x_pt = x_pt + torch.stack(x_pt_categorical_embs).sum(dim=0)
+    def _build_pt2pt_geometry(
+        self,
+        pos_pt: torch.Tensor,
+        orient_pt: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        orient_vector_pt = torch.stack([orient_pt.cos(), orient_pt.sin()], dim=-1)
         edge_index_pt2pt = radius_graph(
             x=pos_pt,
             r=self.pl2pl_radius,
-            batch=tokenized_map["batch"],
+            batch=batch,
             loop=False,
             max_num_neighbors=100,
         )
@@ -90,7 +100,7 @@ class SMARTMapDecoder(nn.Module):
         rel_orient_pt2pt = wrap_angle(
             orient_pt[edge_index_pt2pt[0]] - orient_pt[edge_index_pt2pt[1]]
         )
-        r_pt2pt = torch.stack(
+        r_pt2pt_raw = torch.stack(
             [
                 torch.norm(rel_pos_pt2pt[:, :2], p=2, dim=-1),
                 angle_between_2d_vectors(
@@ -101,6 +111,29 @@ class SMARTMapDecoder(nn.Module):
             ],
             dim=-1,
         )
+        return edge_index_pt2pt, r_pt2pt_raw
+
+    def forward(self, tokenized_map: Dict) -> Dict[str, torch.Tensor]:
+        pos_pt = tokenized_map["position"]
+        orient_pt = tokenized_map["orientation"]
+        pt_token_emb_src = self.token_emb(tokenized_map["token_traj_src"])
+        x_pt = pt_token_emb_src[tokenized_map["token_idx"]]
+
+        x_pt_categorical_embs = [
+            self.type_pt_emb(tokenized_map["type"]),
+            self.polygon_type_emb(tokenized_map["pl_type"]),
+            self.light_pl_emb(tokenized_map["light_type"]),
+        ]
+        x_pt = x_pt + torch.stack(x_pt_categorical_embs).sum(dim=0)
+        if self._cached_pt2pt_matches_config(tokenized_map):
+            edge_index_pt2pt = tokenized_map["edge_index_pt2pt"]
+            r_pt2pt = tokenized_map["r_pt2pt_raw"].to(dtype=pos_pt.dtype)
+        else:
+            edge_index_pt2pt, r_pt2pt = self._build_pt2pt_geometry(
+                pos_pt=pos_pt,
+                orient_pt=orient_pt,
+                batch=tokenized_map["batch"],
+            )
         r_pt2pt = self.r_pt2pt_emb(continuous_inputs=r_pt2pt, categorical_embs=None)
         for i in range(self.num_layers):
             x_pt = self.pt2pt_layers[i](x_pt, r_pt2pt, edge_index_pt2pt)
