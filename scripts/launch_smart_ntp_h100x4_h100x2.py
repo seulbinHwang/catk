@@ -36,7 +36,7 @@ STRICT_ACCUMULATE_GRAD_BATCHES = "1"
 DEFAULT_EXTRA_HYDRA_OVERRIDES = (
     "trainer.strategy._target_="
     "src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy "
-    "trainer.strategy.cluster_environment._target_="
+    "+trainer.strategy.cluster_environment._target_="
     "src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment"
 )
 
