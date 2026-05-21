@@ -19,6 +19,10 @@ import torch
 from torch import Tensor
 from torch_geometric.data import HeteroData
 
+from src.smart.tokens.agent_token_matching import (
+    build_agent_type_masks,
+    match_token_idx_from_local_contour,
+)
 from src.smart.utils import (
     cal_polygon_contour,
     transform_to_global,
@@ -163,8 +167,8 @@ class TokenProcessor(torch.nn.Module):
             valid=valid,
             pos=pos,
             heading=heading,
+            agent_type=data["agent"]["type"],
             agent_shape=agent_shape,
-            token_traj=token_traj,
         )
         tokenized_agent.update(token_dict)
         return tokenized_agent
@@ -174,8 +178,8 @@ class TokenProcessor(torch.nn.Module):
         valid: Tensor,  # [n_agent, n_step]
         pos: Tensor,  # [n_agent, n_step, 2]
         heading: Tensor,  # [n_agent, n_step]
+        agent_type: Tensor,  # [n_agent]
         agent_shape: Tensor,  # [n_agent, 2]
-        token_traj: Tensor,  # [n_agent, n_token, 4, 2]
     ) -> Dict[str, Tensor]:
         """n_step_token=n_step//5
         n_step_token=18 for train with BC.
@@ -193,8 +197,6 @@ class TokenProcessor(torch.nn.Module):
             "sampled_heading": [n_agent, n_step_token]
         """
         n_agent, n_step = valid.shape
-        range_a = torch.arange(n_agent)
-
         prev_pos, prev_head = pos[:, 0], heading[:, 0]  # [n_agent, 2], [n_agent]
 
         out_dict = {
@@ -214,27 +216,33 @@ class TokenProcessor(torch.nn.Module):
 
             #! gt_contour: [n_agent, 4, 2] in global coord
             gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
-            gt_contour = gt_contour.unsqueeze(1)  # [n_agent, 1, 4, 2]
 
-            # ! tokenize without sampling
-            token_world_gt = transform_to_global(
-                pos_local=token_traj.flatten(1, 2),  # [n_agent, n_token*4, 2]
-                head_local=None,
+            gt_contour_local, _ = transform_to_local(
+                pos_global=gt_contour,
+                head_global=None,
                 pos_now=prev_pos,  # [n_agent, 2]
                 head_now=prev_head,  # [n_agent]
-            )[0].view(*token_traj.shape)
-            token_idx_gt = torch.argmin(
-                torch.norm(token_world_gt - gt_contour, dim=-1).sum(-1), dim=-1
-            )  # [n_agent]
-            # [n_agent, 4, 2]
-            token_contour_gt = token_world_gt[range_a, token_idx_gt]
+            )
+            # ! tokenize without sampling. Matching in the previous-token local
+            # frame is equivalent to transforming every token to global coords,
+            # but avoids materializing [n_agent, n_token, 4, 2] every step.
+            token_idx_gt = self._match_token_idx_from_local_contour(
+                agent_type=agent_type,
+                contour_local=gt_contour_local,
+                reduction="sum",
+            )
+            token_pos_gt, token_head_gt = self._token_pose_from_index(
+                agent_type=agent_type,
+                token_idx=token_idx_gt,
+                ref_pos=prev_pos,
+                ref_head=prev_head,
+            )
 
             # udpate prev_pos, prev_head
             prev_head = heading[:, i].clone()
-            dxy = token_contour_gt[:, 0] - token_contour_gt[:, 3]
-            prev_head[_valid_mask] = torch.arctan2(dxy[:, 1], dxy[:, 0])[_valid_mask]
+            prev_head[_valid_mask] = token_head_gt[_valid_mask]
             prev_pos = pos[:, i].clone()
-            prev_pos[_valid_mask] = token_contour_gt.mean(1)[_valid_mask]
+            prev_pos[_valid_mask] = token_pos_gt[_valid_mask]
             # add to output dict
             out_dict["gt_idx"].append(token_idx_gt)
             out_dict["gt_pos"].append(
@@ -250,6 +258,57 @@ class TokenProcessor(torch.nn.Module):
             out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
         out_dict = {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
         return out_dict
+
+    def _match_token_idx_from_local_contour(
+        self,
+        agent_type: Tensor,
+        contour_local: Tensor,
+        reduction: str,
+    ) -> Tensor:
+        """Choose nearest agent token directly in the previous-token local frame."""
+        return match_token_idx_from_local_contour(
+            agent_type=agent_type,
+            contour_local=contour_local,
+            token_bank_all_veh=self.agent_token_all_veh[:, -1],
+            token_bank_all_ped=self.agent_token_all_ped[:, -1],
+            token_bank_all_cyc=self.agent_token_all_cyc[:, -1],
+            reduction=reduction,
+        )
+
+    def _token_pose_from_index(
+        self,
+        agent_type: Tensor,
+        token_idx: Tensor,
+        ref_pos: Tensor,
+        ref_head: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """Convert selected local token contours back to global center/heading."""
+        token_pos = ref_pos.clone()
+        token_head = ref_head.clone()
+
+        for token_key, mask in build_agent_type_masks(agent_type).items():
+            if not mask.any():
+                continue
+
+            token_bank = getattr(self, f"agent_token_all_{token_key}")[:, -1]
+            token_contour_local = token_bank[token_idx[mask]]
+            token_center_local = token_contour_local.mean(dim=1)
+            token_center_global, _ = transform_to_global(
+                pos_local=token_center_local.unsqueeze(1),
+                head_local=None,
+                pos_now=ref_pos[mask],
+                head_now=ref_head[mask],
+            )
+            token_pos[mask] = token_center_global.squeeze(1)
+
+            token_dxy_local = token_contour_local[:, 0] - token_contour_local[:, 3]
+            token_head_local = torch.arctan2(
+                token_dxy_local[:, 1],
+                token_dxy_local[:, 0],
+            )
+            token_head[mask] = wrap_angle(ref_head[mask] + token_head_local)
+
+        return token_pos, token_head
 
     @staticmethod
     def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
@@ -312,11 +371,7 @@ class TokenProcessor(torch.nn.Module):
         token_traj_all: [n_agent, n_token, 6, 4, 2]
         token_traj: [n_agent, n_token, 4, 2]
         """
-        agent_type_masks = {
-            "veh": agent_type == 0,
-            "ped": agent_type == 1,
-            "cyc": agent_type == 2,
-        }
+        agent_type_masks = build_agent_type_masks(agent_type)
         agent_shape = 0.0
         token_traj_all = 0.0
         for k, mask in agent_type_masks.items():

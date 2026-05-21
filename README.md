@@ -748,6 +748,13 @@ token boundary까지 위치/heading/velocity/valid를 외삽해 최소 하나의
 처리한다. 규칙은 기존 loop와 같고, `t=10`인데 raw step 5가 invalid인 history 보강
 예외도 유지한다.
 
+Agent token matching은 기존과 같은 teacher-forced recurrence를 유지한다. 다만 각
+coarse step마다 모든 candidate token을 agent별 global 좌표로 펼쳐 비교하지 않고,
+정답 contour를 직전 token 상태 기준 local 좌표로 한 번 옮긴 뒤 static local token bank와
+직접 비교한다. rigid transform은 거리 순서를 보존하므로 선택되는 nearest token,
+`gt_*`, `sampled_*` 의미는 기존 구현과 같다. 큰 batch에서 peak tensor가 튀지 않도록
+query agent 축만 chunk 단위로 나눠 처리한다.
+
 DDP validation/test에서는 각 rank가 validation/test sample을 복제 없이 정확히 한
 번씩 나눠 처리한다. 일반 distributed sampler처럼 dataset 길이를 world size에 맞추기
 위해 뒤쪽 sample을 padding 복제하지 않으므로, 멀티 GPU 평가에서 같은 scenario가
