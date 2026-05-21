@@ -165,6 +165,30 @@ class FlowTokenProcessor(TokenProcessor):
         )
 
         if self.training:
+            if self.use_kinematic_control_flow:
+                tokenized_agent = self._build_kinematic_flow_train_targets_batched(
+                    tokenized_agent=tokenized_agent,
+                    pos=pos,
+                    heading=heading,
+                    valid=valid,
+                    train_mask=train_mask,
+                    ctx_valid=ctx_valid,
+                    raw_current_steps=raw_current_steps,
+                    dtype=dtype,
+                    device=device,
+                )
+                for key in [
+                    "valid_mask",
+                    "gt_idx",
+                    "gt_pos",
+                    "gt_heading",
+                    "sampled_idx",
+                    "sampled_pos",
+                    "sampled_heading",
+                ]:
+                    tokenized_agent.pop(key, None)
+                return tokenized_agent
+
             flow_train_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
             flow_train_chunks: List[Tensor] = []
             flow_train_metric_chunks: List[Tensor] = []
@@ -353,6 +377,248 @@ class FlowTokenProcessor(TokenProcessor):
             }
         )
         return tokenized_agent
+
+    def _build_kinematic_flow_train_targets_batched(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        pos: Tensor,
+        heading: Tensor,
+        valid: Tensor,
+        train_mask: Tensor,
+        ctx_valid: Tensor,
+        raw_current_steps: List[int],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Dict[str, Tensor]:
+        """control-space train anchors를 한 번에 모아 target을 만듭니다.
+
+        각 anchor의 future prefix 길이는 ``future_loss_mask`` row로 보존하고,
+        round-trip keep mask 적용 뒤에도 anchor 순서와 agent 순서를 유지합니다.
+        """
+        num_agent = pos.shape[0]
+        num_anchor = len(raw_current_steps)
+        flow_train_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
+
+        candidate_anchor_offsets: List[Tensor] = []
+        candidate_agent_indices: List[Tensor] = []
+        candidate_current_pos: List[Tensor] = []
+        candidate_current_head: List[Tensor] = []
+        candidate_future_pos: List[Tensor] = []
+        candidate_future_head: List[Tensor] = []
+        candidate_future_loss_mask: List[Tensor] = []
+
+        for anchor_offset, raw_step in enumerate(raw_current_steps):
+            current_valid = valid[:, raw_step]
+            future_loss_mask = self._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
+            train_anchor_mask = current_valid & future_loss_mask.any(dim=1) & train_mask
+            if not train_anchor_mask.any():
+                continue
+
+            selected_agent_index = train_anchor_mask.nonzero(as_tuple=False).flatten()
+            selected_current_pos = pos[selected_agent_index, raw_step]
+            selected_current_head = heading[selected_agent_index, raw_step]
+            selected_future_loss_mask = future_loss_mask[selected_agent_index]
+            future_pos, future_head = self._build_selected_anchor_future_window(
+                pos=pos,
+                heading=heading,
+                selected_agent_index=selected_agent_index,
+                selected_current_pos=selected_current_pos,
+                selected_current_head=selected_current_head,
+                raw_step=raw_step,
+                future_loss_mask=selected_future_loss_mask,
+            )
+
+            candidate_anchor_offsets.append(
+                torch.full(
+                    (selected_agent_index.shape[0],),
+                    anchor_offset,
+                    device=device,
+                    dtype=torch.long,
+                )
+            )
+            candidate_agent_indices.append(selected_agent_index)
+            candidate_current_pos.append(selected_current_pos)
+            candidate_current_head.append(selected_current_head)
+            candidate_future_pos.append(future_pos)
+            candidate_future_head.append(future_head)
+            candidate_future_loss_mask.append(selected_future_loss_mask)
+
+        if len(candidate_agent_indices) == 0:
+            self._assert_flow_train_anchor_context_valid(
+                flow_train_mask=flow_train_mask,
+                ctx_valid=ctx_valid,
+            )
+            tokenized_agent.update(
+                {
+                    "flow_train_mask": flow_train_mask,
+                    "flow_train_clean_norm": torch.zeros(
+                        (0, self.flow_window_steps, self.flow_target_dim),
+                        device=device,
+                        dtype=dtype,
+                    ),
+                    "flow_train_clean_metric_norm": torch.zeros(
+                        (0, self.flow_window_steps, POSE_FLOW_DIM),
+                        device=device,
+                        dtype=dtype,
+                    ),
+                    "flow_train_loss_mask": torch.zeros(
+                        (0, self.flow_window_steps),
+                        device=device,
+                        dtype=torch.bool,
+                    ),
+                    "flow_train_agent_type": torch.zeros(
+                        (0,),
+                        device=device,
+                        dtype=tokenized_agent["type"].dtype,
+                    ),
+                    "flow_train_agent_length": torch.zeros((0,), device=device, dtype=dtype),
+                }
+            )
+            return tokenized_agent
+
+        anchor_offsets = torch.cat(candidate_anchor_offsets, dim=0)
+        agent_indices = torch.cat(candidate_agent_indices, dim=0)
+        current_pos = torch.cat(candidate_current_pos, dim=0)
+        current_head = torch.cat(candidate_current_head, dim=0)
+        future_pos = torch.cat(candidate_future_pos, dim=0)
+        future_head = torch.cat(candidate_future_head, dim=0)
+        future_loss_mask = torch.cat(candidate_future_loss_mask, dim=0)
+        agent_type = tokenized_agent["type"][agent_indices]
+        agent_length = tokenized_agent["shape"][agent_indices, 0]
+
+        flow_train_clean_norm, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
+            future_pos=future_pos,
+            future_head=future_head,
+            current_pos=current_pos,
+            current_head=current_head,
+            agent_type=agent_type,
+            agent_length=agent_length,
+            pos_scale_m=self.control_pos_scale_m,
+            vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            use_holonomic_model_only=self.use_holonomic_model_only,
+            use_rolling_supervision=self.use_rolling_supervision,
+            vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
+        )
+        keep_mask = self._build_control_round_trip_keep_mask(
+            round_trip_error_m=round_trip_error_m,
+            future_loss_mask=future_loss_mask,
+        )
+
+        kept_agent_indices = agent_indices[keep_mask]
+        kept_anchor_offsets = anchor_offsets[keep_mask]
+        flow_train_mask[kept_agent_indices, kept_anchor_offsets] = True
+        self._assert_flow_train_anchor_context_valid(
+            flow_train_mask=flow_train_mask,
+            ctx_valid=ctx_valid,
+        )
+
+        flow_train_clean_norm = flow_train_clean_norm[keep_mask]
+        future_loss_mask = future_loss_mask[keep_mask]
+        current_pos = current_pos[keep_mask]
+        current_head = current_head[keep_mask]
+        future_pos = future_pos[keep_mask]
+        future_head = future_head[keep_mask]
+        agent_type = agent_type[keep_mask]
+        agent_length = agent_length[keep_mask]
+        flow_train_metric_norm = self._build_pose_space_target_from_future_window(
+            future_pos=future_pos,
+            future_head=future_head,
+            current_pos=current_pos,
+            current_head=current_head,
+        )
+
+        tokenized_agent.update(
+            {
+                "flow_train_mask": flow_train_mask,
+                "flow_train_clean_norm": flow_train_clean_norm,
+                "flow_train_clean_metric_norm": flow_train_metric_norm,
+                "flow_train_loss_mask": future_loss_mask,
+                "flow_train_agent_type": agent_type,
+                "flow_train_agent_length": agent_length,
+            }
+        )
+        return tokenized_agent
+
+    def _build_selected_anchor_future_window(
+        self,
+        pos: Tensor,
+        heading: Tensor,
+        selected_agent_index: Tensor,
+        selected_current_pos: Tensor,
+        selected_current_head: Tensor,
+        raw_step: int,
+        future_loss_mask: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        """선택된 anchor-agent row의 valid prefix 미래 window를 만듭니다."""
+        num_selected = selected_agent_index.shape[0]
+        expected_shape = (num_selected, self.flow_window_steps)
+        if tuple(future_loss_mask.shape) != expected_shape:
+            raise ValueError(
+                "future_loss_mask shape must match selected anchors and flow_window_steps: "
+                f"expected={expected_shape}, actual={tuple(future_loss_mask.shape)}."
+            )
+        future_loss_mask = future_loss_mask.to(device=pos.device, dtype=torch.bool)
+        valid_step_count = future_loss_mask.long().sum(dim=1)
+        if bool((valid_step_count <= 0).any().item()):
+            raise ValueError("future_loss_mask must contain at least one valid future step per anchor.")
+
+        future_start = raw_step + 1
+        future_pos = selected_current_pos.unsqueeze(1).expand(-1, self.flow_window_steps, -1).clone()
+        future_head = selected_current_head.unsqueeze(1).expand(-1, self.flow_window_steps).clone()
+
+        available_len = min(self.flow_window_steps, max(0, pos.shape[1] - future_start))
+        if available_len > 0:
+            step_slice = slice(future_start, future_start + available_len)
+            future_pos[:, :available_len] = pos[selected_agent_index, step_slice]
+            future_head[:, :available_len] = heading[selected_agent_index, step_slice]
+
+        last_valid_index = valid_step_count - 1
+        last_valid_pos = future_pos.gather(
+            dim=1,
+            index=last_valid_index.view(-1, 1, 1).expand(-1, 1, future_pos.shape[-1]),
+        ).squeeze(1)
+        last_valid_head = future_head.gather(
+            dim=1,
+            index=last_valid_index.view(-1, 1),
+        ).squeeze(1)
+        invalid_future_mask = ~future_loss_mask
+        future_pos = torch.where(
+            invalid_future_mask.unsqueeze(-1),
+            last_valid_pos.unsqueeze(1),
+            future_pos,
+        )
+        future_head = torch.where(
+            invalid_future_mask,
+            last_valid_head.unsqueeze(1),
+            future_head,
+        )
+        return future_pos, future_head
+
+    def _build_pose_space_target_from_future_window(
+        self,
+        future_pos: Tensor,
+        future_head: Tensor,
+        current_pos: Tensor,
+        current_head: Tensor,
+    ) -> Tensor:
+        future_pos_local, future_head_local = transform_to_local(
+            pos_global=future_pos,
+            head_global=future_head,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        return torch.stack(
+            [
+                future_pos_local[..., 0] / 20.0,
+                future_pos_local[..., 1] / 20.0,
+                future_head_local.cos(),
+                future_head_local.sin(),
+            ],
+            dim=-1,
+        )
 
     def _build_control_round_trip_keep_mask(
         self,

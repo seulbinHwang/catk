@@ -34,6 +34,22 @@ def _build_target_processor(use_prefix_valid_future_loss_mask: bool) -> FlowToke
     return processor
 
 
+def _build_kinematic_target_processor(use_prefix_valid_future_loss_mask: bool) -> FlowTokenProcessor:
+    processor = _build_target_processor(use_prefix_valid_future_loss_mask)
+    processor.flow_target_dim = 3
+    processor.use_kinematic_control_flow = True
+    processor.use_holonomic_model_only = False
+    processor.use_rolling_supervision = True
+    processor.control_pos_scale_m = 1.0
+    processor.control_vehicle_yaw_scale_rad = 0.025
+    processor.control_pedestrian_yaw_scale_rad = 0.20
+    processor.control_cyclist_yaw_scale_rad = 0.06
+    processor.control_vehicle_no_slip_point_ratio = 0.2289518863
+    processor.control_cyclist_no_slip_point_ratio = 0.0495847873
+    processor.control_round_trip_max_position_error_m = 0.5
+    return processor
+
+
 def _build_tokenized_agent_for_18_context() -> dict[str, torch.Tensor]:
     return {
         "sampled_idx": torch.zeros((1, 18), dtype=torch.long),
@@ -42,6 +58,172 @@ def _build_tokenized_agent_for_18_context() -> dict[str, torch.Tensor]:
         "valid_mask": torch.ones((1, 18), dtype=torch.bool),
         "type": torch.zeros((1,), dtype=torch.long),
         "shape": torch.tensor([[2.0, 4.8, 1.5]], dtype=torch.float32),
+    }
+
+
+def _clone_tensor_dict(values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {key: value.clone() for key, value in values.items()}
+
+
+def _build_multi_agent_tokenized_agent() -> dict[str, torch.Tensor]:
+    num_agent = 4
+    return {
+        "sampled_idx": torch.zeros((num_agent, 18), dtype=torch.long),
+        "sampled_pos": torch.zeros((num_agent, 18, 2), dtype=torch.float32),
+        "sampled_heading": torch.zeros((num_agent, 18), dtype=torch.float32),
+        "valid_mask": torch.ones((num_agent, 18), dtype=torch.bool),
+        "type": torch.tensor([0, 1, 2, 0], dtype=torch.long),
+        "shape": torch.tensor(
+            [
+                [4.8, 2.0, 1.5],
+                [0.8, 0.8, 1.7],
+                [1.8, 0.6, 1.6],
+                [4.4, 2.1, 1.5],
+            ],
+            dtype=torch.float32,
+        ),
+    }
+
+
+def _build_multi_agent_processed_agent() -> dict[str, torch.Tensor]:
+    num_agent = 4
+    raw_step = torch.arange(91, dtype=torch.float32)
+    pos = torch.zeros((num_agent, 91, 2), dtype=torch.float32)
+    heading = torch.zeros((num_agent, 91), dtype=torch.float32)
+    valid = torch.ones((num_agent, 91), dtype=torch.bool)
+
+    pos[0, :, 0] = raw_step * 0.35
+    pos[0, :, 1] = torch.sin(raw_step * 0.08) * 0.5
+    heading[0] = raw_step * 0.01
+
+    pos[1, :, 0] = raw_step * 0.05
+    pos[1, :, 1] = raw_step * 0.08
+    heading[1] = raw_step * 0.02
+
+    pos[2, :, 0] = raw_step * 0.18
+    pos[2, :, 1] = torch.cos(raw_step * 0.05) * 0.3
+    heading[2] = raw_step * 0.015
+
+    pos[3, :, 0] = raw_step * 0.2
+    pos[3, :, 1] = torch.where(raw_step >= 71, torch.tensor(4.0), torch.zeros_like(raw_step))
+    heading[3] = 0.0
+
+    valid[1, 82:] = False
+    valid[2, 76:] = False
+    valid[3, 72:] = False
+    return {"valid": valid, "pos": pos, "heading": heading}
+
+
+def _build_flow_targets_anchor_loop_reference(
+    processor: FlowTokenProcessor,
+    data: dict,
+    tokenized_agent: dict[str, torch.Tensor],
+    processed_agent: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    valid = processed_agent["valid"]
+    pos = processed_agent["pos"]
+    heading = processed_agent["heading"]
+    ctx_valid = tokenized_agent["valid_mask"][:, :18].contiguous()
+    num_agent = pos.shape[0]
+    num_anchor = 16
+    raw_current_steps = [processor.shift * (anchor_idx + 2) for anchor_idx in range(num_anchor)]
+    train_mask = data["agent"].get(
+        "train_mask",
+        torch.ones(num_agent, device=pos.device, dtype=torch.bool),
+    ).bool()
+
+    flow_train_mask = torch.zeros(num_agent, num_anchor, device=pos.device, dtype=torch.bool)
+    flow_train_chunks = []
+    flow_train_metric_chunks = []
+    flow_train_loss_mask_chunks = []
+    flow_train_agent_type_chunks = []
+    flow_train_agent_length_chunks = []
+
+    for anchor_offset, raw_step in enumerate(raw_current_steps):
+        future_loss_mask = processor._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
+        train_anchor_mask = valid[:, raw_step] & future_loss_mask.any(dim=1) & train_mask
+        if not bool(train_anchor_mask.any().item()):
+            continue
+
+        selected_future_loss_mask = future_loss_mask[train_anchor_mask]
+        flow_train_clean_norm, round_trip_error_m = processor._build_anchor_clean_norm(
+            pos=pos,
+            heading=heading,
+            current_pos=pos[:, raw_step],
+            current_head=heading[:, raw_step],
+            agent_type=tokenized_agent["type"],
+            agent_length=tokenized_agent["shape"][:, 0],
+            anchor_mask=train_anchor_mask,
+            raw_step=raw_step,
+            future_loss_mask=selected_future_loss_mask,
+            return_round_trip_error=True,
+        )
+        keep_mask = processor._build_control_round_trip_keep_mask(
+            round_trip_error_m=round_trip_error_m,
+            future_loss_mask=selected_future_loss_mask,
+        )
+        if not bool(keep_mask.all().item()):
+            selected_agent_index = train_anchor_mask.nonzero(as_tuple=False).flatten()
+            kept_agent_index = selected_agent_index[keep_mask]
+            filtered_train_anchor_mask = torch.zeros_like(train_anchor_mask)
+            filtered_train_anchor_mask[kept_agent_index] = True
+            train_anchor_mask = filtered_train_anchor_mask
+            flow_train_clean_norm = flow_train_clean_norm[keep_mask]
+            selected_future_loss_mask = selected_future_loss_mask[keep_mask]
+
+        flow_train_mask[:, anchor_offset] = train_anchor_mask
+        if not bool(train_anchor_mask.any().item()):
+            continue
+
+        flow_train_metric_norm = processor._build_anchor_clean_norm(
+            pos=pos,
+            heading=heading,
+            current_pos=pos[:, raw_step],
+            current_head=heading[:, raw_step],
+            agent_type=tokenized_agent["type"],
+            agent_length=tokenized_agent["shape"][:, 0],
+            anchor_mask=train_anchor_mask,
+            raw_step=raw_step,
+            future_loss_mask=selected_future_loss_mask,
+            force_pose_space=True,
+        )
+        flow_train_chunks.append(flow_train_clean_norm)
+        flow_train_metric_chunks.append(flow_train_metric_norm)
+        flow_train_loss_mask_chunks.append(selected_future_loss_mask)
+        flow_train_agent_type_chunks.append(tokenized_agent["type"][train_anchor_mask])
+        flow_train_agent_length_chunks.append(tokenized_agent["shape"][train_anchor_mask, 0])
+
+    processor._assert_flow_train_anchor_context_valid(
+        flow_train_mask=flow_train_mask,
+        ctx_valid=ctx_valid,
+    )
+    return {
+        "flow_train_mask": flow_train_mask,
+        "flow_train_clean_norm": processor._concat_flow_chunks(
+            chunks=flow_train_chunks,
+            dtype=pos.dtype,
+            device=pos.device,
+        ),
+        "flow_train_clean_metric_norm": processor._concat_flow_chunks(
+            chunks=flow_train_metric_chunks,
+            dtype=pos.dtype,
+            device=pos.device,
+            target_dim=4,
+        ),
+        "flow_train_loss_mask": processor._concat_mask_chunks(
+            chunks=flow_train_loss_mask_chunks,
+            device=pos.device,
+        ),
+        "flow_train_agent_type": processor._concat_vector_chunks(
+            chunks=flow_train_agent_type_chunks,
+            dtype=tokenized_agent["type"].dtype,
+            device=pos.device,
+        ),
+        "flow_train_agent_length": processor._concat_vector_chunks(
+            chunks=flow_train_agent_length_chunks,
+            dtype=pos.dtype,
+            device=pos.device,
+        ),
     }
 
 
@@ -170,6 +352,35 @@ def test_flow_targets_keep_16_anchor_slots_for_full_window_mode() -> None:
     torch.testing.assert_close(
         out["flow_train_loss_mask"].sum(dim=1).cpu(),
         torch.tensor([20] * 13),
+    )
+
+
+def test_batched_kinematic_flow_targets_match_anchor_loop_reference() -> None:
+    processor = _build_kinematic_target_processor(use_prefix_valid_future_loss_mask=True)
+    data = {"agent": {"train_mask": torch.tensor([True, True, True, True])}}
+    tokenized_agent = _build_multi_agent_tokenized_agent()
+    processed_agent = _build_multi_agent_processed_agent()
+
+    expected = _build_flow_targets_anchor_loop_reference(
+        processor=processor,
+        data=data,
+        tokenized_agent=_clone_tensor_dict(tokenized_agent),
+        processed_agent=_clone_tensor_dict(processed_agent),
+    )
+    actual = processor._build_flow_targets(
+        data=data,
+        tokenized_agent=_clone_tensor_dict(tokenized_agent),
+        processed_agent=_clone_tensor_dict(processed_agent),
+    )
+
+    assert torch.equal(actual["flow_train_mask"], expected["flow_train_mask"])
+    assert torch.equal(actual["flow_train_loss_mask"], expected["flow_train_loss_mask"])
+    assert torch.equal(actual["flow_train_agent_type"], expected["flow_train_agent_type"])
+    torch.testing.assert_close(actual["flow_train_agent_length"], expected["flow_train_agent_length"])
+    torch.testing.assert_close(actual["flow_train_clean_norm"], expected["flow_train_clean_norm"])
+    torch.testing.assert_close(
+        actual["flow_train_clean_metric_norm"],
+        expected["flow_train_clean_metric_norm"],
     )
 
 
