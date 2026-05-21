@@ -23,6 +23,7 @@ from src.smart.datamodules.memory_balanced_batch_sampler import (  # noqa: E402
     load_or_build_memory_metadata,
     memory_metadata_lock_path,
 )
+from src.smart.cache_filter import is_smart_cache_sample_file  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,7 +59,9 @@ def main() -> int:
     cache_path = Path(args.cache_path).expanduser()
     if not raw_dir.is_dir():
         raise NotADirectoryError(f"raw dir does not exist: {raw_dir}")
-    raw_paths = sorted(str(path) for path in raw_dir.glob(args.pattern))
+    raw_paths = sorted(
+        str(path) for path in raw_dir.glob(args.pattern) if is_smart_cache_sample_file(path)
+    )
     if not raw_paths:
         raise FileNotFoundError(f"no files matched {args.pattern!r} under {raw_dir}")
 

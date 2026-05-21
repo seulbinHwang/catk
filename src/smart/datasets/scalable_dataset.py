@@ -17,6 +17,7 @@ from typing import Callable, List, Optional
 
 from torch_geometric.data import Dataset
 
+from src.smart.cache_filter import is_smart_cache_sample_file
 from src.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -34,7 +35,9 @@ class MultiDataset(Dataset):
             raise FileNotFoundError(f"Dataset directory does not exist: {raw_dir}")
         if not raw_dir.is_dir():
             raise NotADirectoryError(f"Dataset path is not a directory: {raw_dir}")
-        self._raw_paths = [p.as_posix() for p in sorted(raw_dir.glob("*"))]
+        self._raw_paths = [
+            p.as_posix() for p in sorted(raw_dir.iterdir()) if is_smart_cache_sample_file(p)
+        ]
         self._num_samples = len(self._raw_paths)
 
         self._tfrecord_dir = Path(tfrecord_dir) if tfrecord_dir is not None else None
