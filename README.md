@@ -33,8 +33,8 @@
   clip 합니다.
 - heading 2-vector와 pedestrian velocity 2-vector는 raw `atan2` 대신 safe angle 복원으로 처리해
   `(0, 0)` 또는 near-zero vector backward에서 gradient NaN이 나지 않도록 막습니다.
-- 학습 중에는 non-finite parameter, `fm_loss`, `total_loss`, gradient를 fail-fast로 감지해
-  NaN checkpoint가 조용히 저장되지 않도록 즉시 중단합니다.
+- 학습 중에는 `fm_loss`와 `total_loss` 같은 scalar loss의 non-finite를 fail-fast로 감지합니다.
+  정상 step의 속도를 위해 전체 parameter/gradient tensor를 매 step 스캔하지는 않습니다.
 - closed-loop local 평가는 `SimAgentsMetrics`가 vendored TrajTok Fast WOSAC 2025 evaluator를 호출해 `val_closed/sim_agents_2025/*`와 `val_closed/sim_agents_2025_mean/*`를 기록합니다.
 - submission export는 `SimAgentsSubmission`이 2025 submission shard와 `sim_agents_2025_submission.tar.gz`를 생성합니다.
 - 설치 시점에 2025 Sim Agents proto와 `traffic_light_violation` 관련 2025 필드가 실제로 있는지 바로 검증합니다.
@@ -2423,7 +2423,7 @@ K commit block 수 = flow_window_steps / 5
 - Generator EMA는 Generator에만 적용합니다. `F_psi` 는 현재 online Generator가 만든 분포를 따라가야 하므로 EMA를 두지 않고, `F_rho` 는 pretrained 기준점이라 계속 frozen 상태로 둡니다.
 - bf16-mixed 안전 backward boundary. self-forced 경로의 forward 와 loss 계산은 mixed precision 으로 유지하되, `manual_backward` 호출 순간만 autocast 를 끄고 scalar loss 를 fp32 로 넘깁니다. 이는 manual optimization 에서 반복 backward 를 수행할 때 PyTorch autocast promote 규칙이 backward graph 의 dtype 을 다시 분류하다가 실패하는 문제를 피하기 위한 경계입니다.
 - autograd-safe temporal edge remap. training rollout 에서는 temporal relation embedding 계산에 쓴 원본 `edge_index_t` 를 in-place 수정하지 않고, current-agent attention 용 remapped edge index 를 새 tensor 로 만들어 사용합니다.
-- autograd-safe geometry helpers. agent encoder / flow agent decoder 의 edge feature (relative position norm, relative angle) 는 정지 또는 중첩된 agent 가 만드는 영벡터에 대해 backward 가 정의되지 않습니다 (`torch.norm` 의 `x/||x||` 가 `0/0`, `atan2(0, 0)` 의 `1/(y²+x²)` 가 `1/0`). self-forced rollout 처럼 이 feature 들이 살아있는 backward graph 의 일부가 되는 경로에서 한 번이라도 영벡터가 들어오면 NaN gradient 가 encoder weight 까지 흘러 학습이 첫 step 에서 죽습니다. 이를 막기 위해 `safe_norm_2d` helper 가 `(sum(x²) + eps).sqrt()` 형태로 norm 의 backward 분모를 strictly positive 로 유지하고, `angle_between_2d_vectors` 는 상대 벡터가 0일 때 기준 heading 방향을 대체값으로 써서 상대각 0 의미를 보존합니다. flow heading 복원도 `safe_angle_from_2d_vector` 로 통일해 heading vector 가 `[0, 0]` 일 때 `atan2(0, 0)` backward 가 생기지 않게 했습니다. self-forced generator backward 에서 non-finite 가 재발하면 `committed_path_norm`, `path_delta`, `target_path_norm` 요약과 첫 non-finite gradient 이름을 함께 출력하되, 정상 step 에서는 큰 텐서를 스캔하지 않습니다.
+- autograd-safe geometry helpers. agent encoder / flow agent decoder 의 edge feature (relative position norm, relative angle) 는 정지 또는 중첩된 agent 가 만드는 영벡터에 대해 backward 가 정의되지 않습니다 (`torch.norm` 의 `x/||x||` 가 `0/0`, `atan2(0, 0)` 의 `1/(y²+x²)` 가 `1/0`). self-forced rollout 처럼 이 feature 들이 살아있는 backward graph 의 일부가 되는 경로에서 한 번이라도 영벡터가 들어오면 NaN gradient 가 encoder weight 까지 흘러 학습이 첫 step 에서 죽습니다. 이를 막기 위해 `safe_norm_2d` helper 가 `(sum(x²) + eps).sqrt()` 형태로 norm 의 backward 분모를 strictly positive 로 유지하고, `angle_between_2d_vectors` 는 상대 벡터가 0일 때 기준 heading 방향을 대체값으로 써서 상대각 0 의미를 보존합니다. flow heading 복원도 `safe_angle_from_2d_vector` 로 통일해 heading vector 가 `[0, 0]` 일 때 `atan2(0, 0)` backward 가 생기지 않게 했습니다. self-forced generator loss 에서 non-finite 가 재발하면 `committed_path_norm`, `path_delta`, `target_path_norm` 요약을 함께 출력하되, 정상 step 에서는 큰 텐서를 스캔하지 않습니다.
 
 ### Self-Forced random terminal denoising
 
