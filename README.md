@@ -146,6 +146,29 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh
 `TRAIN_BATCH_SIZE=16 bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh`
 처럼 환경 변수로 넘긴다.
 
+장기 학습 중 CUDA OOM이 나면 batch를 자동으로 낮춰 이어가야 하므로, 실험을 계속 살리는
+목적의 wrapper도 별도로 둔다.
+
+```bash
+bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh
+```
+
+이 retry wrapper는 기본 `INITIAL_BS=13`, `OOM_STEP=1`, `MIN_BS=8`이다.
+각 attempt는 같은 task name 아래에서 시작하고, pod tmux 로그에
+`CUDA out of memory` / `torch.OutOfMemoryError` 같은 OOM marker가 보이면 두 pod의
+학습 session을 정리한 뒤 `logs/<task_name>/runs/*/checkpoints/epoch_last.ckpt` 중
+가장 최신 checkpoint를 찾아 다음 attempt의 `ckpt_path`로 넘긴다. 즉 OOM 이후에는
+`data.train_batch_size`만 1 줄이고 optimizer, scheduler, epoch, global step을 가능한 한
+보존해서 resume한다. checkpoint가 아직 없으면 같은 task name으로 새 attempt를 시작한다.
+OOM이 아닌 실패는 조용히 batch를 낮추지 않고 중단한다.
+
+주요 override는 환경 변수로 지정한다.
+
+```bash
+INITIAL_BS=13 MIN_BS=10 TASK_NAME=smart_ntp_pretrain_a100x4x2_retry_main \
+  bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh
+```
+
 launcher는 pod를 만들거나 지우지 않는다. 로컬에서 `kubectl exec`로 이미 떠 있는 두 pod에
 접속한 뒤, 각 pod 안에서 같은 이름의 tmux session을 시작한다. 기본 namespace는 `p-pnc`,
 기본 pod 목록은 `testa testaa`, 원격 저장소 위치는
