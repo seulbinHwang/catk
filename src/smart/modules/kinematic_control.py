@@ -673,39 +673,126 @@ def build_rolling_control_target_with_round_trip_error(
             정규화된 control label과 step별 위치 복원 오차입니다.
             shape은 각각 ``[N, T, 3]`` 과 ``[N, T]`` 입니다.
     """
-    control_norm = build_rolling_control_target(
-        future_pos=future_pos,
-        future_head=future_head,
-        current_pos=current_pos,
-        current_head=current_head,
+    if not use_rolling_supervision:
+        control_norm = build_rolling_control_target(
+            future_pos=future_pos,
+            future_head=future_head,
+            current_pos=current_pos,
+            current_head=current_head,
+            agent_type=agent_type,
+            agent_length=agent_length,
+            pos_scale_m=pos_scale_m,
+            vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
+            use_holonomic_model_only=use_holonomic_model_only,
+            use_rolling_supervision=False,
+            vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+        )
+        control = denormalize_control(
+            control_norm=control_norm,
+            pos_scale_m=pos_scale_m,
+            agent_type=agent_type,
+            vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
+        )
+        decoded_pos, _ = decode_control_sequence(
+            control=control,
+            agent_type=agent_type,
+            agent_length=agent_length,
+            current_pos=current_pos,
+            current_head=current_head,
+            use_holonomic_model_only=use_holonomic_model_only,
+            vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+        )
+        round_trip_error_m = torch.linalg.vector_norm(decoded_pos - future_pos, dim=-1)
+        return control_norm, round_trip_error_m
+
+    if future_pos.ndim != 3 or future_pos.shape[-1] != 2:
+        raise ValueError(f"future_pos must have shape [N, T, 2], got {tuple(future_pos.shape)}.")
+    if tuple(future_head.shape) != tuple(future_pos.shape[:2]):
+        raise ValueError(
+            "future_head must have shape [N, T], "
+            f"got {tuple(future_head.shape)} for future_pos {tuple(future_pos.shape)}."
+        )
+    if tuple(current_pos.shape) != (future_pos.shape[0], 2):
+        raise ValueError(f"current_pos must have shape [N, 2], got {tuple(current_pos.shape)}.")
+    if tuple(current_head.shape) != (future_pos.shape[0],):
+        raise ValueError(f"current_head must have shape [N], got {tuple(current_head.shape)}.")
+    if tuple(agent_type.shape) != (future_pos.shape[0],):
+        raise ValueError(f"agent_type must have shape [N], got {tuple(agent_type.shape)}.")
+    _validate_agent_type(agent_type)
+
+    if future_pos.shape[1] == 0:
+        return (
+            future_pos.new_zeros((future_pos.shape[0], 0, CONTROL_FLOW_DIM)),
+            future_pos.new_zeros((future_pos.shape[0], 0)),
+        )
+
+    roll_pos = current_pos.clone()
+    roll_head = current_head.clone()
+    holonomic_mask = agent_type.to(device=future_pos.device) == PEDESTRIAN_TYPE_ID
+    if use_holonomic_model_only:
+        holonomic_mask = torch.ones_like(holonomic_mask)
+    no_slip_offset = _resolve_no_slip_point_offset(
         agent_type=agent_type,
         agent_length=agent_length,
-        pos_scale_m=pos_scale_m,
-        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
-        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
-        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
-        use_holonomic_model_only=use_holonomic_model_only,
-        use_rolling_supervision=use_rolling_supervision,
         vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
         cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+        use_holonomic_model_only=use_holonomic_model_only,
+        dtype=future_pos.dtype,
+        device=future_pos.device,
     )
-    control = denormalize_control(
-        control_norm=control_norm,
-        pos_scale_m=pos_scale_m,
-        agent_type=agent_type,
-        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
-        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
-        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
-    )
-    decoded_pos, _ = decode_control_sequence(
+    control_steps: list[Tensor] = []
+    round_trip_error_steps: list[Tensor] = []
+
+    for step_idx in range(future_pos.shape[1]):
+        target_pos = future_pos[:, step_idx]
+        target_head = future_head[:, step_idx]
+        source_pos = roll_pos
+        source_head = roll_head
+        delta_head = wrap_angle(target_head - source_head)
+        delta_vec = target_pos - source_pos
+
+        cos_head = source_head.cos()
+        sin_head = source_head.sin()
+        source_heading_vec = torch.stack([cos_head, sin_head], dim=-1)
+        target_heading_vec = torch.stack([target_head.cos(), target_head.sin()], dim=-1)
+
+        ped_delta_s = delta_vec[:, 0] * cos_head + delta_vec[:, 1] * sin_head
+        ped_delta_n = -delta_vec[:, 0] * sin_head + delta_vec[:, 1] * cos_head
+
+        mid_head = source_head + 0.5 * delta_head
+        h_mid = torch.stack([mid_head.cos(), mid_head.sin()], dim=-1)
+        source_no_slip_pos = source_pos - no_slip_offset.unsqueeze(-1) * source_heading_vec
+        target_no_slip_pos = target_pos - no_slip_offset.unsqueeze(-1) * target_heading_vec
+        nonhol_delta_vec = target_no_slip_pos - source_no_slip_pos
+        nonhol_proj = (nonhol_delta_vec * h_mid).sum(dim=-1)
+        nonhol_delta_s = nonhol_proj / safe_sinc(0.5 * delta_head)
+
+        delta_s = torch.where(holonomic_mask, ped_delta_s, nonhol_delta_s)
+        delta_n = torch.where(holonomic_mask, ped_delta_n, torch.zeros_like(ped_delta_n))
+        control_steps.append(torch.stack([delta_s, delta_n, delta_head], dim=-1))
+
+        nonhol_next_pos = (
+            roll_pos
+            + nonhol_proj.unsqueeze(-1) * h_mid
+            + no_slip_offset.unsqueeze(-1) * (target_heading_vec - source_heading_vec)
+        )
+        roll_pos = torch.where(holonomic_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
+        roll_head = wrap_angle(roll_head + delta_head)
+        round_trip_error_steps.append(torch.linalg.vector_norm(roll_pos - target_pos, dim=-1))
+
+    control = torch.stack(control_steps, dim=1)
+    control_norm = normalize_control(
         control=control,
+        pos_scale_m=pos_scale_m,
         agent_type=agent_type,
-        agent_length=agent_length,
-        current_pos=current_pos,
-        current_head=current_head,
-        use_holonomic_model_only=use_holonomic_model_only,
-        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
-        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
-    round_trip_error_m = torch.linalg.vector_norm(decoded_pos - future_pos, dim=-1)
-    return control_norm, round_trip_error_m
+    return control_norm, torch.stack(round_trip_error_steps, dim=1)

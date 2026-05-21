@@ -24,6 +24,36 @@ CONTROL_YAW_SCALE_KWARGS = {
 }
 
 
+def _reference_round_trip_error(
+    control_norm: torch.Tensor,
+    future_pos: torch.Tensor,
+    current_pos: torch.Tensor,
+    current_head: torch.Tensor,
+    agent_type: torch.Tensor,
+    agent_length: torch.Tensor | None = None,
+    *,
+    use_holonomic_model_only: bool = False,
+    vehicle_no_slip_point_ratio: float = 0.0,
+    cyclist_no_slip_point_ratio: float = 0.0,
+) -> torch.Tensor:
+    control = denormalize_control(
+        control_norm,
+        agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+    decoded_pos, _ = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        current_pos=current_pos,
+        current_head=current_head,
+        use_holonomic_model_only=use_holonomic_model_only,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+    )
+    return torch.linalg.vector_norm(decoded_pos - future_pos, dim=-1)
+
+
 def test_pedestrian_rolling_control_reconstructs_target_position() -> None:
     current_pos = torch.tensor([[0.0, 0.0]])
     current_head = torch.tensor([0.0])
@@ -439,6 +469,67 @@ def test_round_trip_error_is_zero_for_pedestrian() -> None:
     )
 
     torch.testing.assert_close(round_trip_error_m, torch.zeros_like(round_trip_error_m))
+
+
+def test_fused_round_trip_error_matches_separate_decode_reference() -> None:
+    generator = torch.Generator().manual_seed(20260521)
+    current_pos = torch.randn((9, 2), generator=generator)
+    current_head = torch.randn((9,), generator=generator) * 0.5
+    increments = torch.randn((9, 7, 2), generator=generator) * 0.4
+    future_pos = current_pos.unsqueeze(1) + increments.cumsum(dim=1)
+    future_head = current_head.unsqueeze(1) + torch.randn((9, 7), generator=generator) * 0.15
+    agent_type = torch.tensor(
+        [
+            VEHICLE_TYPE_ID,
+            PEDESTRIAN_TYPE_ID,
+            CYCLIST_TYPE_ID,
+            VEHICLE_TYPE_ID,
+            PEDESTRIAN_TYPE_ID,
+            CYCLIST_TYPE_ID,
+            VEHICLE_TYPE_ID,
+            PEDESTRIAN_TYPE_ID,
+            CYCLIST_TYPE_ID,
+        ],
+        dtype=torch.long,
+    )
+    agent_length = torch.tensor([4.8, 0.8, 1.8, 4.2, 0.7, 1.6, 5.0, 0.9, 1.7])
+
+    expected_control_norm = build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        vehicle_no_slip_point_ratio=0.2289518863,
+        cyclist_no_slip_point_ratio=0.0495847873,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+    expected_round_trip_error = _reference_round_trip_error(
+        control_norm=expected_control_norm,
+        future_pos=future_pos,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        vehicle_no_slip_point_ratio=0.2289518863,
+        cyclist_no_slip_point_ratio=0.0495847873,
+    )
+
+    control_norm, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        vehicle_no_slip_point_ratio=0.2289518863,
+        cyclist_no_slip_point_ratio=0.0495847873,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+
+    assert torch.equal(control_norm, expected_control_norm)
+    torch.testing.assert_close(round_trip_error_m, expected_round_trip_error, atol=1.0e-5, rtol=1.0e-5)
 
 
 def test_pedestrian_uses_pedestrian_type_id_constant() -> None:
