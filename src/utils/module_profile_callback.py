@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict
 from pathlib import Path
 from types import MethodType
@@ -27,18 +28,21 @@ class ModuleProfileCallback(Callback):
         warmup_steps: int = 5,
         active_steps: int = 20,
         profile_all_ranks: bool = True,
+        profile_token_processor_detail: bool = False,
     ) -> None:
         super().__init__()
         self.output_dir = Path(output_dir)
         self.warmup_steps = int(warmup_steps)
         self.active_steps = int(active_steps)
         self.profile_all_ranks = bool(profile_all_ranks)
+        self.profile_token_processor_detail = bool(profile_token_processor_detail)
         self._seen_train_batches = 0
         self._active_batches = 0
         self._active = False
         self._device: torch.device | None = None
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._wrapped_methods: list[tuple[object, str, object]] = []
+        self._wrapped_functions: list[tuple[object, str, object]] = []
         self._batch_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
         self._batch_backward_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = defaultdict(list)
         self._step_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
@@ -46,6 +50,8 @@ class ModuleProfileCallback(Callback):
         self._backward_totals: dict[str, float] = defaultdict(float)
         self._counts: dict[str, int] = defaultdict(int)
         self._backward_counts: dict[str, int] = defaultdict(int)
+        self._wall_totals: dict[str, float] = defaultdict(float)
+        self._wall_counts: dict[str, int] = defaultdict(int)
         self._params: dict[str, int] = {}
 
     @staticmethod
@@ -109,24 +115,145 @@ class ModuleProfileCallback(Callback):
         method_name: str,
         label: str,
         params: int = 0,
+        label_fn: Callable[[object, tuple[object, ...], dict[str, object]], str] | None = None,
     ) -> None:
         original = getattr(obj, method_name)
         self._params[label] = int(params)
 
         def wrapped(instance, *args, **kwargs):
+            active_label = label_fn(instance, args, kwargs) if label_fn is not None else label
+            self._params.setdefault(active_label, int(params))
+            wall_start = time.perf_counter() if self._active else None
+            self._record_pre(active_label)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self._record_post(active_label)
+                if wall_start is not None:
+                    self._wall_totals[active_label] += (time.perf_counter() - wall_start) * 1000.0
+                    self._wall_counts[active_label] += 1
+
+        setattr(obj, method_name, MethodType(wrapped, obj))
+        self._wrapped_methods.append((obj, method_name, original))
+
+    def _wrap_function(
+        self,
+        namespace: object,
+        function_name: str,
+        label: str,
+        params: int = 0,
+    ) -> None:
+        original = getattr(namespace, function_name)
+        self._params[label] = int(params)
+
+        def wrapped(*args, **kwargs):
+            wall_start = time.perf_counter() if self._active else None
             self._record_pre(label)
             try:
                 return original(*args, **kwargs)
             finally:
                 self._record_post(label)
+                if wall_start is not None:
+                    self._wall_totals[label] += (time.perf_counter() - wall_start) * 1000.0
+                    self._wall_counts[label] += 1
 
-        setattr(obj, method_name, MethodType(wrapped, obj))
-        self._wrapped_methods.append((obj, method_name, original))
+        setattr(namespace, function_name, wrapped)
+        self._wrapped_functions.append((namespace, function_name, original))
 
     def _restore_wrapped_methods(self) -> None:
         for obj, method_name, original in self._wrapped_methods:
             setattr(obj, method_name, original)
         self._wrapped_methods.clear()
+        for namespace, function_name, original in self._wrapped_functions:
+            setattr(namespace, function_name, original)
+        self._wrapped_functions.clear()
+
+    def _add_token_processor_detail_wrappers(self, token_processor: object) -> None:
+        def anchor_clean_label(
+            _instance: object,
+            _args: tuple[object, ...],
+            kwargs: dict[str, object],
+        ) -> str:
+            if bool(kwargs.get("force_pose_space", False)):
+                return "token_processor.detail.flow_targets.pose_metric_target"
+            if bool(kwargs.get("return_round_trip_error", False)):
+                return "token_processor.detail.flow_targets.control_target_roundtrip"
+            return "token_processor.detail.flow_targets.control_target"
+
+        def match_token_label(
+            _instance: object,
+            args: tuple[object, ...],
+            kwargs: dict[str, object],
+        ) -> str:
+            sample_topk = kwargs.get("sample_topk", args[4] if len(args) > 4 else False)
+            suffix = "sample_topk" if bool(sample_topk) else "argmin"
+            return f"token_processor.detail.agent.match_token_idx.{suffix}"
+
+        method_specs: list[
+            tuple[
+                str,
+                str,
+                Callable[[object, tuple[object, ...], dict[str, object]], str] | None,
+            ]
+        ] = [
+            ("forward", "token_processor.detail.forward", None),
+            ("tokenize_map", "token_processor.detail.tokenize_map", None),
+            ("tokenize_agent", "token_processor.detail.tokenize_agent", None),
+            ("_clean_heading", "token_processor.detail.agent.clean_heading", None),
+            (
+                "_extrapolate_agent_to_prev_token_step",
+                "token_processor.detail.agent.extrapolate_prev_token_step",
+                None,
+            ),
+            ("_match_agent_token", "token_processor.detail.agent.match_agent_token", None),
+            (
+                "_build_local_contour_sequence",
+                "token_processor.detail.agent.build_local_contour_sequence",
+                None,
+            ),
+            (
+                "_match_token_idx_from_local_contour",
+                "token_processor.detail.agent.match_token_idx",
+                match_token_label,
+            ),
+            ("_build_flow_targets", "token_processor.detail.flow_targets.total", None),
+            (
+                "_build_anchor_future_loss_mask",
+                "token_processor.detail.flow_targets.future_loss_mask",
+                None,
+            ),
+            (
+                "_build_anchor_clean_norm",
+                "token_processor.detail.flow_targets.anchor_clean_norm",
+                anchor_clean_label,
+            ),
+            (
+                "_build_control_round_trip_keep_mask",
+                "token_processor.detail.flow_targets.round_trip_keep_mask",
+                None,
+            ),
+            ("_concat_flow_chunks", "token_processor.detail.flow_targets.concat_flow_chunks", None),
+            ("_concat_mask_chunks", "token_processor.detail.flow_targets.concat_mask_chunks", None),
+            ("_concat_vector_chunks", "token_processor.detail.flow_targets.concat_vector_chunks", None),
+        ]
+        for method_name, label, label_fn in method_specs:
+            if hasattr(token_processor, method_name):
+                self._wrap_method(token_processor, method_name, label, params=0, label_fn=label_fn)
+
+        try:
+            import src.smart.tokens.flow_token_processor as flow_token_processor_module
+        except Exception:
+            return
+        self._wrap_function(
+            flow_token_processor_module,
+            "build_rolling_control_target_with_round_trip_error",
+            "token_processor.detail.control_target.round_trip_function",
+        )
+        self._wrap_function(
+            flow_token_processor_module,
+            "build_rolling_control_target",
+            "token_processor.detail.control_target.function",
+        )
 
     def on_fit_start(self, trainer: Trainer, pl_module: nn.Module) -> None:
         if not torch.cuda.is_available():
@@ -191,11 +318,14 @@ class ModuleProfileCallback(Callback):
         )
         self._wrap_method(agent_context.flow_ode, "sample", "flow_ode.sample", params=0)
         self._wrap_method(agent_context, "_to_pose_metric_norm", "flow_decoder.pose_metric_conversion", params=0)
+        if self.profile_token_processor_detail:
+            self._add_token_processor_detail_wrappers(pl_module.token_processor)
 
         rank_zero_info(
             "[module_profile] enabled "
             f"warmup_steps={self.warmup_steps} active_steps={self.active_steps} "
-            f"profile_all_ranks={self.profile_all_ranks}"
+            f"profile_all_ranks={self.profile_all_ranks} "
+            f"profile_token_processor_detail={self.profile_token_processor_detail}"
         )
 
     def on_train_batch_start(self, trainer: Trainer, pl_module: nn.Module, batch, batch_idx: int) -> None:
@@ -260,6 +390,8 @@ class ModuleProfileCallback(Callback):
             "total_profiled_ms_per_batch": total,
             "forward_calls": self._counts.get(label, 0),
             "backward_hook_calls": self._backward_counts.get(label, 0),
+            "wall_ms_per_batch": self._wall_totals.get(label, 0.0) / max(1, active_batches),
+            "wall_calls": self._wall_counts.get(label, 0),
             "ms_per_million_params": (total / (params / 1_000_000.0)) if params > 0 else None,
         }
 
@@ -272,7 +404,12 @@ class ModuleProfileCallback(Callback):
             torch.cuda.synchronize(self._device)
         active_batches = max(1, self._active_batches)
         total_step_ms = sum(start.elapsed_time(end) for start, end in self._step_events)
-        labels = sorted(set(self._params) | set(self._totals) | set(self._backward_totals))
+        labels = sorted(
+            set(self._params)
+            | set(self._totals)
+            | set(self._backward_totals)
+            | set(self._wall_totals)
+        )
         rows = [self._row(label, active_batches) for label in labels]
         payload = {
             "rank": int(trainer.global_rank),
