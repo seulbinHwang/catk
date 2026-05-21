@@ -640,6 +640,19 @@ batch size probe 결과:
 
 Agent tokenization의 첫 valid 이전 token-step 외삽은 agent별 Python loop 대신 batch mask/index 연산으로 처리합니다. 외삽 규칙은 기존과 같습니다. 첫 valid step을 기준으로 직전 coarse token boundary까지 `vel[first_valid] * 0.1` 간격으로 위치를 뒤쪽으로 채우고, velocity/heading/valid도 같은 prefix 구간에 복사합니다. `t=10`인데 raw step 5가 invalid인 history 보강 예외도 유지합니다. H100 4+2, per-rank `train_batch_size=15`, 6-rank 평균 profile 기준으로 이 변경은 외삽 구간을 `35.29ms -> 0.49ms`로 줄였고, token processor 전체는 `99.70ms -> 65.43ms`, 전체 train step은 `1133.86ms -> 1107.43ms`로 줄었습니다. 기존 loop reference 대비 위치/heading/velocity 오차는 `1e-6` 이하이며 valid mask는 동일합니다.
 
+Agent trajectory token matching도 coarse step을 하나씩 반복하지 않고, 모든 coarse segment query를 `[agent, coarse_step]` 축으로 묶어 처리합니다. global contour는 segment window 전체에 대해 한 번에 만들고, type별 token bank argmin은 전체 valid query를 모은 뒤 chunked deterministic argmin으로 계산합니다. invalid segment는 기존과 같이 최종 `valid_mask=false`, token index/pose/heading 0으로 유지합니다. 기존 loop reference 대비 `valid_mask`, token index는 exact match이고, pose/heading은 `1e-6` 이하로 일치합니다. 이 경로는 token processor 공통 경로라 train, fine tuning, validation, closed-loop rollout, WOSAC submission이 모두 같은 deterministic token matching을 사용합니다.
+
+H100 4+2, per-rank `train_batch_size=15`, 6-rank 평균 profile 기준:
+
+| 구간 | 이전 | batched matching | 변화 |
+|---|---:|---:|---:|
+| token processor 전체 | `63.91ms` | `44.85ms` | `-29.8%` |
+| `tokenize_agent` | `42.55ms` | `23.67ms` | `-44.4%` |
+| `match_agent_token` | `29.67ms` | `10.65ms` | `-64.1%` |
+| contour 생성 | `6.79ms` | `0.72ms` | `-89.4%` |
+| token argmin | `20.06ms` | `9.53ms` | `-52.5%` |
+| 전체 train step | `1093.61ms` | `1087.18ms` | `-0.59%` |
+
 실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:
 
 ```bash

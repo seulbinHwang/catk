@@ -210,6 +210,11 @@ class ModuleProfileCallback(Callback):
                 None,
             ),
             (
+                "_build_local_contour_windows",
+                "token_processor.detail.agent.build_local_contour_windows",
+                None,
+            ),
+            (
                 "_match_token_idx_from_local_contour",
                 "token_processor.detail.agent.match_token_idx",
                 match_token_label,

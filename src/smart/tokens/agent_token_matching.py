@@ -6,6 +6,9 @@ import torch
 from torch import Tensor
 
 
+DEFAULT_TOKEN_MATCH_QUERY_CHUNK_SIZE = 4096
+
+
 def build_agent_type_masks(agent_type: Tensor) -> Dict[str, Tensor]:
     """차종별 마스크를 만듭니다.
 
@@ -92,6 +95,7 @@ def match_token_idx_from_local_contour(
     token_bank_all_ped: Tensor,
     token_bank_all_cyc: Tensor,
     reduction: str,
+    query_chunk_size: int = DEFAULT_TOKEN_MATCH_QUERY_CHUNK_SIZE,
 ) -> Tensor:
     """로컬 좌표의 coarse 경로 전체를 기준으로 토큰 번호를 고릅니다.
 
@@ -107,14 +111,19 @@ def match_token_idx_from_local_contour(
         token_bank_all_cyc: 자전거 토큰 은행입니다. shape은
             ``[n_token, 6, 4, 2]`` 또는 ``[n_token, 4, 2]`` 입니다.
         reduction: 점별 거리를 ``sum`` 또는 ``mean`` 으로 줄이는 방법입니다.
+        query_chunk_size: 한 번에 매칭할 query 개수입니다. 큰 batch로 묶은
+            tokenization에서 peak memory가 튀지 않도록 query 축만 나눕니다.
 
     Returns:
         Tensor:
             선택된 토큰 번호입니다. shape은 ``[n_agent]`` 입니다.
 
     Raises:
-        ValueError: reduction 값이 잘못됐거나 샘플링 온도가 없을 때 발생합니다.
+        ValueError: reduction 값이 잘못됐거나 chunk 크기가 0 이하일 때 발생합니다.
     """
+    if query_chunk_size <= 0:
+        raise ValueError(f"query_chunk_size must be positive, got {query_chunk_size}.")
+
     token_idx = torch.zeros(
         agent_type.shape[0],
         device=agent_type.device,
@@ -130,15 +139,20 @@ def match_token_idx_from_local_contour(
         if not mask.any():
             continue
 
+        query_indices = mask.nonzero(as_tuple=True)[0]
         token_bank, contour_local_masked = _align_token_bank_and_query(
             token_bank=token_banks[token_key],
             contour_local=contour_local[mask],
         )
-        dist = torch.norm(
-            token_bank.unsqueeze(0) - contour_local_masked.unsqueeze(1),
-            dim=-1,
-        )
-        dist = _reduce_match_distance(dist=dist, reduction=reduction)
-        token_idx[mask] = torch.argmin(dist, dim=-1)
+        matched_chunks = []
+        for start in range(0, contour_local_masked.shape[0], query_chunk_size):
+            contour_chunk = contour_local_masked[start : start + query_chunk_size]
+            dist = torch.norm(
+                token_bank.unsqueeze(0) - contour_chunk.unsqueeze(1),
+                dim=-1,
+            )
+            dist = _reduce_match_distance(dist=dist, reduction=reduction)
+            matched_chunks.append(torch.argmin(dist, dim=-1))
+        token_idx[query_indices] = torch.cat(matched_chunks, dim=0)
 
     return token_idx
