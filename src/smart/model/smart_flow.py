@@ -717,6 +717,119 @@ class SMARTFlow(LightningModule):
             torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
         return bool(flag.item())
 
+    def _sync_open_loop_train_log_pack(
+        self,
+        *,
+        total_loss: Tensor,
+        fm_loss: Tensor,
+        open_metric_dict: Dict[str, Tensor],
+        has_open_loop_targets: bool,
+    ) -> tuple[Dict[str, Tensor], bool]:
+        """Open-loop train logging scalars와 target flag를 한 번에 동기화합니다.
+
+        Lightning의 metric별 ``sync_dist=True`` 와 별도 bool all-reduce를 분리해
+        호출하면 같은 train step에서 작은 collective가 여러 번 발생합니다. 여기서는
+        logging용 detached scalar와 has-target flag만 pack해 한 번의 SUM all-reduce로
+        rank 평균 metric과 global-any target flag를 함께 만듭니다. Loss/gradient
+        경로는 건드리지 않습니다.
+        """
+        device = total_loss.device
+        metric_tensors = [
+            total_loss.detach(),
+            fm_loss.detach(),
+            open_metric_dict[self.open_metric_names["ade"]].detach(),
+            open_metric_dict[self.open_metric_names["fde"]].detach(),
+            open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
+            open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
+        ]
+        packed = torch.stack(
+            [
+                metric.to(device=device, dtype=torch.float32).reshape(())
+                for metric in metric_tensors
+            ]
+            + [
+                torch.tensor(
+                    float(bool(has_open_loop_targets)),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            ]
+        )
+        if self._distributed_available_and_initialized():
+            torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+            packed = packed / float(torch.distributed.get_world_size())
+
+        synced_metrics = {
+            "loss": packed[0],
+            "loss_fm": packed[1],
+            self.open_metric_names["ade"]: packed[2],
+            self.open_metric_names["fde"]: packed[3],
+            self.open_metric_names["yaw_ade"]: packed[4],
+            self.open_metric_names["yaw_fde"]: packed[5],
+        }
+        has_targets_global = bool(packed[6].item() > 0.0)
+        return synced_metrics, has_targets_global
+
+    def _log_synced_open_loop_train_metrics(
+        self,
+        synced_metrics: Dict[str, Tensor],
+    ) -> None:
+        """이미 rank 평균으로 동기화된 open-loop train metric을 기록합니다."""
+        self.log(
+            "train/loss",
+            synced_metrics["loss"],
+            on_step=True,
+            on_epoch=True,
+            sync_dist=False,
+            batch_size=1,
+            rank_zero_only=True,
+        )
+        self.log(
+            "train/loss_fm",
+            synced_metrics["loss_fm"],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=False,
+            batch_size=1,
+            rank_zero_only=True,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['ade']}",
+            synced_metrics[self.open_metric_names["ade"]],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=False,
+            batch_size=1,
+            rank_zero_only=True,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['fde']}",
+            synced_metrics[self.open_metric_names["fde"]],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=False,
+            batch_size=1,
+            rank_zero_only=True,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['yaw_ade']}",
+            synced_metrics[self.open_metric_names["yaw_ade"]],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=False,
+            batch_size=1,
+            rank_zero_only=True,
+        )
+        self.log(
+            f"train/{self.train_open_metric_names['yaw_fde']}",
+            synced_metrics[self.open_metric_names["yaw_fde"]],
+            on_step=False,
+            on_epoch=True,
+            sync_dist=False,
+            batch_size=1,
+            rank_zero_only=True,
+        )
+
     def _open_loop_denoise_metrics(
         self,
         pred_dict: Dict[str, Tensor],
@@ -2492,9 +2605,11 @@ class SMARTFlow(LightningModule):
             zero_loss_module=self.encoder,
         )
         total_loss = fm_loss
-        has_open_loop_targets_global = self._sync_distributed_bool_any(
-            has_open_loop_targets,
-            device=total_loss.device,
+        synced_log_metrics, has_open_loop_targets_global = self._sync_open_loop_train_log_pack(
+            total_loss=total_loss,
+            fm_loss=fm_loss,
+            open_metric_dict=open_metric_dict,
+            has_open_loop_targets=has_open_loop_targets,
         )
 
         generator_optimizer = self.optimizers()[0]
@@ -2515,40 +2630,7 @@ class SMARTFlow(LightningModule):
             self._clear_self_forced_generator_gradients()
             self.untoggle_optimizer(generator_optimizer)
 
-        self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log(
-            f"train/{self.train_open_metric_names['ade']}",
-            open_metric_dict[self.open_metric_names["ade"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['fde']}",
-            open_metric_dict[self.open_metric_names["fde"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_ade']}",
-            open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_fde']}",
-            open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
+        self._log_synced_open_loop_train_metrics(synced_log_metrics)
         return total_loss.detach()
 
     def _training_step_self_forced(self, data, batch_idx):
@@ -2801,9 +2883,6 @@ open_metric_dict:
             pred,
             zero_loss_module=self,
         )
-        self._automatic_open_loop_has_target_since_step = (
-            self._automatic_open_loop_has_target_since_step or has_open_loop_targets
-        )
 
         total_loss = fm_loss
         if not torch.isfinite(fm_loss):
@@ -2814,50 +2893,23 @@ open_metric_dict:
                 f"{self._summarize_nonfinite_tensor(total_loss)}"
             )
 
-        self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/loss_fm", fm_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log(
-            f"train/{self.train_open_metric_names['ade']}",
-            open_metric_dict[self.open_metric_names["ade"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
+        synced_log_metrics, has_open_loop_targets_global = self._sync_open_loop_train_log_pack(
+            total_loss=total_loss,
+            fm_loss=fm_loss,
+            open_metric_dict=open_metric_dict,
+            has_open_loop_targets=has_open_loop_targets,
         )
-        self.log(
-            f"train/{self.train_open_metric_names['fde']}",
-            open_metric_dict[self.open_metric_names["fde"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
+        self._automatic_open_loop_has_target_since_step = (
+            self._automatic_open_loop_has_target_since_step or has_open_loop_targets_global
         )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_ade']}",
-            open_metric_dict[self.open_metric_names["yaw_ade"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_fde']}",
-            open_metric_dict[self.open_metric_names["yaw_fde"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=1,
-        )
+        self._log_synced_open_loop_train_metrics(synced_log_metrics)
         return total_loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
         """DDP 전체에 target이 없는 automatic optimization step의 업데이트를 막습니다."""
         if not bool(getattr(self, "automatic_optimization", True)):
             return
-        has_open_loop_targets_global = self._sync_distributed_bool_any(
-            self._automatic_open_loop_has_target_since_step,
-            device=self._optimizer_parameter_device(optimizer),
-        )
+        has_open_loop_targets_global = bool(self._automatic_open_loop_has_target_since_step)
         self._skip_next_automatic_optimizer_step = not has_open_loop_targets_global
         if not has_open_loop_targets_global:
             optimizer.zero_grad(set_to_none=True)
