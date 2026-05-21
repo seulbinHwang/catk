@@ -201,7 +201,10 @@ class SMARTFlow(LightningModule):
         self.scenario_diversity_metrics = ScenarioDiversityMetrics(
             prefix="val_closed",
             lat_threshold_m=float(getattr(model_config, "diversity_lat_threshold_m", 1.75)),
-            stop_speed_mps=float(getattr(model_config, "diversity_stop_speed_mps", 0.5)),
+            stop_speed_mps=float(getattr(model_config, "diversity_stop_speed_mps", 1.0)),
+            backward_vlon_deadzone_mps=float(
+                getattr(model_config, "diversity_vlon_deadzone_mps", 0.5)
+            ),
         )
 
         # OCSC / RoaD: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)

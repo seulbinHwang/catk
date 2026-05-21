@@ -15,9 +15,11 @@
 행동 토큰은 3x3 격자입니다.
 
   종방향 (longitudinal): 윈도우 평균 속도 기반.
-    - mean_speed < stop_speed       -> 1 (정지)
-    - 그 외 mean(v . heading) > 0   -> 2 (전진)
-    - 그 외                         -> 0 (후진)
+    - mean_speed < stop_speed                 -> 1 (정지)
+    - mean(v . heading) < -backward_deadzone  -> 0 (후진)
+    - 그 외                                   -> 2 (전진)
+  후진은 단순 부호가 아니라 deadzone 보다 뚜렷하게 음수일 때만 인정합니다.
+  저속 agent의 heading/velocity 부호 노이즈가 후진으로 오분류되는 것을 막습니다.
   횡방향 (lateral): 윈도우-시작 agent frame에서의 횡변위 ``dy'`` 기반.
     - dy' >  lat_threshold -> 2 (좌)
     - dy' < -lat_threshold -> 0 (우)
@@ -67,7 +69,8 @@ class ScenarioDiversityMetrics(Metric):
         self,
         prefix: str,
         lat_threshold_m: float = 1.75,
-        stop_speed_mps: float = 0.5,
+        stop_speed_mps: float = 1.0,
+        backward_vlon_deadzone_mps: float = 0.5,
         window_seconds: float = 4.0,
         stride_seconds: float = 2.0,
         dt_seconds: float = 0.1,
@@ -79,7 +82,12 @@ class ScenarioDiversityMetrics(Metric):
             prefix: W&B / Lightning log key의 앞부분 이름입니다.
             lat_threshold_m: 좌/우 판정 횡변위 임계값(m)입니다. 기본 1.75는
                 차선 반폭에 해당합니다.
-            stop_speed_mps: 정지 판정 평균 속도 임계값(m/s)입니다.
+            stop_speed_mps: 정지 판정 평균 속도 임계값(m/s)입니다. 이 값 미만이면
+                정지로 봅니다.
+            backward_vlon_deadzone_mps: 후진 판정 deadzone(m/s)입니다. 정지가
+                아니면서 평균 종방향 속도가 ``-이 값`` 보다 작을 때만 후진으로
+                봅니다. 저속 agent의 heading/velocity 부호 노이즈를 후진으로
+                오분류하지 않도록 하는 장치입니다.
             window_seconds: 한 윈도우의 길이(초)입니다.
             stride_seconds: 윈도우 사이 간격(초)입니다.
             dt_seconds: rollout 한 스텝의 시간 간격(초)입니다. 10Hz면 0.1입니다.
@@ -90,12 +98,17 @@ class ScenarioDiversityMetrics(Metric):
             raise ValueError(f"lat_threshold_m must be positive, got {lat_threshold_m}.")
         if stop_speed_mps < 0.0:
             raise ValueError(f"stop_speed_mps must be non-negative, got {stop_speed_mps}.")
+        if backward_vlon_deadzone_mps < 0.0:
+            raise ValueError(
+                f"backward_vlon_deadzone_mps must be non-negative, got {backward_vlon_deadzone_mps}."
+            )
         if dt_seconds <= 0.0:
             raise ValueError(f"dt_seconds must be positive, got {dt_seconds}.")
 
         self.prefix = str(prefix).rstrip("/")
         self.lat_threshold = float(lat_threshold_m)
         self.stop_speed = float(stop_speed_mps)
+        self.vlon_deadzone = float(backward_vlon_deadzone_mps)
         self.dt = float(dt_seconds)
         self.eps = float(eps)
 
@@ -245,11 +258,15 @@ class ScenarioDiversityMetrics(Metric):
         mean_speed = velocity.norm(dim=-1).mean(dim=-1)
         vlon_neg_frac = (v_lon < 0.0).to(torch.float32).mean(dim=-1)
 
+        # 정지: 평균 속력이 임계 미만. 후진: 정지가 아니면서 종방향 속도가
+        # deadzone 보다 뚜렷하게 음수일 때만. deadzone 안쪽(저속 부호 노이즈)은
+        # 모두 전진으로 봅니다.
         is_stop = mean_speed < self.stop_speed
+        is_back = (~is_stop) & (mean_v_lon < -self.vlon_deadzone)
         lon = torch.where(
             is_stop,
             torch.ones_like(mean_v_lon),
-            torch.where(mean_v_lon > 0.0, torch.full_like(mean_v_lon, 2.0), torch.zeros_like(mean_v_lon)),
+            torch.where(is_back, torch.zeros_like(mean_v_lon), torch.full_like(mean_v_lon, 2.0)),
         ).long()
 
         # 횡방향: 윈도우-시작 frame에서 끝점의 종/횡변위 dx', dy'.
