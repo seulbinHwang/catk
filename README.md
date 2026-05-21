@@ -234,8 +234,9 @@ python scripts/launch_smart_ntp_h100x4_h100x2.py \
 ```
 
 기본 experiment는 `configs/experiment/pre_bc_a100x4x2.yaml`이다. 이 config는
-`pre_bc`를 상속하므로 SMART backbone, next-token prediction loss, token sampling,
-agent selection, `num_freq_bands: 66` 같은 모델/알고리즘 설정은 바꾸지 않는다. 대신
+`pre_bc`를 상속하므로 SMART backbone, next-token prediction loss,
+deterministic nearest-token tokenization, agent selection, `num_freq_bands: 66`
+같은 모델/알고리즘 설정은 바꾸지 않는다. 대신
 `semi_control_stable`의 x4x2 control-space pretrain recipe와 학습 실행 조건을 맞추기
 위해 아래 training/runtime 값만 명시한다.
 
@@ -732,6 +733,14 @@ Stochastic SMART validation/test sampling은 `validation_closed_seed`, `scenario
 rollout index에서 만든 rollout/scenario별 seed를 사용한다. 각 expanded scenario는
 closed-loop token rollout 동안 자기 `torch.Generator`를 유지하므로, `topk_prob`
 sampling은 rollout을 하나씩 실행하는지 큰 rollout batch로 실행하는지에 영향을 받지 않는다.
+
+학습/검증 입력을 만드는 `TokenProcessor`의 map/agent token matching은 stochastic
+top-k sampling을 쓰지 않는다. 지도 token은 항상 가장 가까운 token을 고르고, agent
+token의 `sampled_*` 상태도 기존 기본값 `num_k=1, temp=1.0`과 동일하게
+teacher-forced nearest-token `gt_*` 상태와 같게 만든다. 따라서 tokenization에는
+별도 `map_token_sampling` / `agent_token_sampling` config가 없다. 위
+validation/test sampling 설명은 closed-loop rollout 중 모델 출력 token을 고르는
+정책에만 해당한다.
 
 DDP validation/test에서는 각 rank가 validation/test sample을 복제 없이 정확히 한
 번씩 나눠 처리한다. 일반 distributed sampler처럼 dataset 길이를 world size에 맞추기

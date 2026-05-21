@@ -16,9 +16,7 @@ import pickle
 from typing import Dict, Tuple
 
 import torch
-from omegaconf import DictConfig
 from torch import Tensor
-from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
 from src.smart.utils import (
@@ -35,12 +33,8 @@ class TokenProcessor(torch.nn.Module):
         self,
         map_token_file: str,
         agent_token_file: str,
-        map_token_sampling: DictConfig,
-        agent_token_sampling: DictConfig,
     ) -> None:
         super(TokenProcessor, self).__init__()
-        self.map_token_sampling = map_token_sampling
-        self.agent_token_sampling = agent_token_sampling
         self.shift = 5
 
         module_dir = os.path.dirname(__file__)
@@ -95,20 +89,7 @@ class TokenProcessor(torch.nn.Module):
             dim=(-2, -1),
         )  # [n_pl, n_token]
 
-        if self.training and (self.map_token_sampling.num_k > 1):
-            topk_dists, topk_indices = torch.topk(
-                dist,
-                self.map_token_sampling.num_k,
-                dim=-1,
-                largest=False,
-                sorted=False,
-            )  # [n_pl, K]
-
-            topk_logits = (-1e-6 - topk_dists) / self.map_token_sampling.temp
-            _samples = Categorical(logits=topk_logits).sample()  # [n_pl] in K
-            token_idx = topk_indices[torch.arange(len(_samples)), _samples].contiguous()
-        else:
-            token_idx = torch.argmin(dist, dim=-1)
+        token_idx = torch.argmin(dist, dim=-1)
 
         tokenized_map = {
             "position": traj_pos[:, 0].contiguous(),  # [n_pl, 2]
@@ -206,17 +187,15 @@ class TokenProcessor(torch.nn.Module):
             # ! at step [5, 10, 15, ..., 90]
             "gt_pos": [n_agent, n_step_token, 2]
             "gt_heading": [n_agent, n_step_token]
-            # ! noisy sampling for training data augmentation
+            # ! deterministic rollout state used by open-loop training
             "sampled_idx": [n_agent, n_step_token]
             "sampled_pos": [n_agent, n_step_token, 2]
             "sampled_heading": [n_agent, n_step_token]
         """
-        num_k = self.agent_token_sampling.num_k if self.training else 1
         n_agent, n_step = valid.shape
         range_a = torch.arange(n_agent)
 
         prev_pos, prev_head = pos[:, 0], heading[:, 0]  # [n_agent, 2], [n_agent]
-        prev_pos_sample, prev_head_sample = pos[:, 0], heading[:, 0]
 
         out_dict = {
             "valid_mask": [],
@@ -263,47 +242,12 @@ class TokenProcessor(torch.nn.Module):
             )
             out_dict["gt_heading"].append(prev_head.masked_fill(_invalid_mask, 0))
 
-            # ! tokenize from sampled rollout state
-            if num_k == 1:  # K=1 means no sampling
-                out_dict["sampled_idx"].append(out_dict["gt_idx"][-1])
-                out_dict["sampled_pos"].append(out_dict["gt_pos"][-1])
-                out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
-            else:
-                # contour: [n_agent, n_token, 4, 2], 2HZ, global coord
-                token_world_sample = transform_to_global(
-                    pos_local=token_traj.flatten(1, 2),  # [n_agent, n_token*4, 2]
-                    head_local=None,
-                    pos_now=prev_pos_sample,  # [n_agent, 2]
-                    head_now=prev_head_sample,  # [n_agent]
-                )[0].view(*token_traj.shape)
-
-                # dist: [n_agent, n_token]
-                dist = torch.norm(token_world_sample - gt_contour, dim=-1).mean(-1)
-                topk_dists, topk_indices = torch.topk(
-                    dist, num_k, dim=-1, largest=False, sorted=False
-                )  # [n_agent, K]
-
-                topk_logits = (-1.0 * topk_dists) / self.agent_token_sampling.temp
-                _samples = Categorical(logits=topk_logits).sample()  # [n_agent] in K
-                token_idx_sample = topk_indices[range_a, _samples]
-                token_contour_sample = token_world_sample[range_a, token_idx_sample]
-
-                # udpate prev_pos_sample, prev_head_sample
-                prev_head_sample = heading[:, i].clone()
-                dxy = token_contour_sample[:, 0] - token_contour_sample[:, 3]
-                prev_head_sample[_valid_mask] = torch.arctan2(dxy[:, 1], dxy[:, 0])[
-                    _valid_mask
-                ]
-                prev_pos_sample = pos[:, i].clone()
-                prev_pos_sample[_valid_mask] = token_contour_sample.mean(1)[_valid_mask]
-                # add to output dict
-                out_dict["sampled_idx"].append(token_idx_sample)
-                out_dict["sampled_pos"].append(
-                    prev_pos_sample.masked_fill(_invalid_mask.unsqueeze(1), 0.0)
-                )
-                out_dict["sampled_heading"].append(
-                    prev_head_sample.masked_fill(_invalid_mask, 0.0)
-                )
+            # The historical default used num_k=1, so the sampled rollout state was
+            # exactly the nearest-token teacher-forced state. Keep that behavior as
+            # the only tokenization path.
+            out_dict["sampled_idx"].append(out_dict["gt_idx"][-1])
+            out_dict["sampled_pos"].append(out_dict["gt_pos"][-1])
+            out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
         out_dict = {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
         return out_dict
 
