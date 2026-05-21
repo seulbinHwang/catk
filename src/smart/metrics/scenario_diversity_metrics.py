@@ -48,6 +48,11 @@ _LON_NAMES = ("back", "stop", "fwd")
 _LAT_NAMES = ("right", "straight", "left")
 _CELL_NAMES = tuple(f"{lon}_{lat}" for lon in _LON_NAMES for lat in _LAT_NAMES)
 
+# backward 오분류 진단용 속도 히스토그램 bin (m/s).
+_BACK_SPEED_EDGES = (0.5, 1.0, 2.0, 4.0, 8.0)
+_BACK_SPEED_BIN_NAMES = ("lt0.5", "0.5_1", "1_2", "2_4", "4_8", "gt8")
+_N_SPEED_BIN = len(_BACK_SPEED_BIN_NAMES)
+
 
 class ScenarioDiversityMetrics(Metric):
     """closed-loop rollout의 행동(intent) 다양성을 누적 계산합니다.
@@ -114,6 +119,16 @@ class ScenarioDiversityMetrics(Metric):
         self.add_state("coverage_sum", default=torch.zeros(w, dtype=torch.float64), dist_reduce_fx="sum")
         self.add_state("mode_sum", default=torch.zeros(w, dtype=torch.float64), dist_reduce_fx="sum")
         self.add_state("aw_count", default=torch.zeros(w, dtype=torch.float64), dist_reduce_fx="sum")
+
+        # backward 토큰 진단: "어색한" 후진 분류가 실제 후진인지 저속 오분류인지 점검용.
+        self.add_state("back_count", default=torch.zeros((), dtype=torch.float64), dist_reduce_fx="sum")
+        self.add_state("back_speed_sum", default=torch.zeros((), dtype=torch.float64), dist_reduce_fx="sum")
+        self.add_state("back_vlon_sum", default=torch.zeros((), dtype=torch.float64), dist_reduce_fx="sum")
+        self.add_state("back_dx_sum", default=torch.zeros((), dtype=torch.float64), dist_reduce_fx="sum")
+        self.add_state("back_negfrac_sum", default=torch.zeros((), dtype=torch.float64), dist_reduce_fx="sum")
+        self.add_state(
+            "back_speed_hist", default=torch.zeros(_N_SPEED_BIN, dtype=torch.float64), dist_reduce_fx="sum"
+        )
 
     def update(
         self,
@@ -186,7 +201,7 @@ class ScenarioDiversityMetrics(Metric):
         log_max = math.log(min(_N_TOKEN, n_rollout))
 
         for w_idx, (s, e) in enumerate(self._windows):
-            token = self._classify_window(full_pos, full_head, s, e)  # [n_valid, G]
+            token, diag = self._classify_window(full_pos, full_head, s, e)  # [n_valid, G]
             onehot = F.one_hot(token, _N_TOKEN).to(torch.float32)     # [n_valid, G, 9]
             count_k = onehot.sum(dim=1)                               # [n_valid, 9]
 
@@ -200,8 +215,11 @@ class ScenarioDiversityMetrics(Metric):
             self.mode_sum[w_idx] += mode.sum(dtype=torch.float64)
             self.aw_count[w_idx] += float(n_valid)
             self.token_hist[w_idx] += count_k.sum(dim=0).to(torch.float64)
+            self._accumulate_backward_diag(token, diag)
 
-    def _classify_window(self, full_pos: Tensor, full_head: Tensor, s: int, e: int) -> Tensor:
+    def _classify_window(
+        self, full_pos: Tensor, full_head: Tensor, s: int, e: int
+    ) -> tuple[Tensor, Dict[str, Tensor]]:
         """한 윈도우의 모든 (agent, rollout)에 행동 토큰을 매깁니다.
 
         Args:
@@ -212,7 +230,11 @@ class ScenarioDiversityMetrics(Metric):
             e: 윈도우 끝 스텝 인덱스입니다.
 
         Returns:
-            Tensor: 행동 토큰입니다. shape은 ``[n_valid, n_rollout]`` 이며 값은 0..8 입니다.
+            tuple[Tensor, Dict[str, Tensor]]: 행동 토큰(shape ``[n_valid, n_rollout]``,
+                값 0..8)과 backward 진단용 텐서 사전입니다. 사전의 각 값 shape은
+                ``[n_valid, n_rollout]`` 이며 ``mean_speed`` / ``mean_v_lon`` /
+                ``dx`` (윈도우-시작 frame 종방향 순변위) / ``vlon_neg_frac``
+                (윈도우 내 v_lon<0 스텝 비율) 입니다.
         """
         # 종방향: 윈도우 내 각 스텝의 (velocity . heading) 평균과 평균 속력.
         velocity = (full_pos[:, :, s + 1 : e + 1, :] - full_pos[:, :, s:e, :]) / self.dt
@@ -221,6 +243,7 @@ class ScenarioDiversityMetrics(Metric):
         v_lon = velocity[..., 0] * head_cos + velocity[..., 1] * head_sin
         mean_v_lon = v_lon.mean(dim=-1)
         mean_speed = velocity.norm(dim=-1).mean(dim=-1)
+        vlon_neg_frac = (v_lon < 0.0).to(torch.float32).mean(dim=-1)
 
         is_stop = mean_speed < self.stop_speed
         lon = torch.where(
@@ -229,18 +252,51 @@ class ScenarioDiversityMetrics(Metric):
             torch.where(mean_v_lon > 0.0, torch.full_like(mean_v_lon, 2.0), torch.zeros_like(mean_v_lon)),
         ).long()
 
-        # 횡방향: 윈도우-시작 frame에서 끝점의 횡변위 dy'.
+        # 횡방향: 윈도우-시작 frame에서 끝점의 종/횡변위 dx', dy'.
         origin = full_pos[:, :, s, :]
         psi0 = full_head[:, :, s]
         rel = full_pos[:, :, e, :] - origin
-        dy = -rel[..., 0] * torch.sin(psi0) + rel[..., 1] * torch.cos(psi0)
+        cos0 = torch.cos(psi0)
+        sin0 = torch.sin(psi0)
+        dx = rel[..., 0] * cos0 + rel[..., 1] * sin0
+        dy = -rel[..., 0] * sin0 + rel[..., 1] * cos0
         lat = torch.where(
             dy > self.lat_threshold,
             torch.full_like(dy, 2.0),
             torch.where(dy < -self.lat_threshold, torch.zeros_like(dy), torch.ones_like(dy)),
         ).long()
 
-        return lon * _N_LAT + lat
+        token = lon * _N_LAT + lat
+        diag = {
+            "mean_speed": mean_speed,
+            "mean_v_lon": mean_v_lon,
+            "dx": dx,
+            "vlon_neg_frac": vlon_neg_frac,
+        }
+        return token, diag
+
+    def _accumulate_backward_diag(self, token: Tensor, diag: Dict[str, Tensor]) -> None:
+        """backward로 분류된 (agent, rollout)의 운동 통계를 누적합니다.
+
+        후진 토큰이 실제 후진(종방향으로 명확히 음의 이동)인지, 저속 agent의
+        heading/velocity 불일치로 인한 오분류인지 사후 점검하기 위한 진단입니다.
+
+        Args:
+            token: 행동 토큰입니다. shape은 ``[n_valid, n_rollout]`` 입니다.
+            diag: ``_classify_window`` 가 돌려준 진단 텐서 사전입니다.
+        """
+        back_mask = (token // _N_LAT) == 0  # lon == 0 (후진)
+        if not bool(back_mask.any()):
+            return
+        back_speed = diag["mean_speed"][back_mask]
+        self.back_count += float(back_speed.numel())
+        self.back_speed_sum += back_speed.sum(dtype=torch.float64)
+        self.back_vlon_sum += diag["mean_v_lon"][back_mask].sum(dtype=torch.float64)
+        self.back_dx_sum += diag["dx"][back_mask].sum(dtype=torch.float64)
+        self.back_negfrac_sum += diag["vlon_neg_frac"][back_mask].sum(dtype=torch.float64)
+        edges = torch.tensor(_BACK_SPEED_EDGES, device=back_speed.device, dtype=back_speed.dtype)
+        buckets = torch.bucketize(back_speed, edges)
+        self.back_speed_hist += torch.bincount(buckets, minlength=_N_SPEED_BIN).to(torch.float64)
 
     @staticmethod
     def _variance_decomposition(
@@ -346,6 +402,27 @@ class ScenarioDiversityMetrics(Metric):
             )
 
         metric_dict[f"{self.prefix}/diversity/n_agent"] = self.aw_count[0].to(torch.float32)
+
+        # backward 토큰 진단: 실제 후진 vs 저속 오분류 점검.
+        back_n = self.back_count.clamp_min(1.0)
+        metric_dict[f"{self.prefix}/diversity/diag/back_count"] = self.back_count.to(torch.float32)
+        metric_dict[f"{self.prefix}/diversity/diag/back_speed_mean"] = (
+            self.back_speed_sum / back_n
+        ).to(torch.float32)
+        metric_dict[f"{self.prefix}/diversity/diag/back_vlon_mean"] = (
+            self.back_vlon_sum / back_n
+        ).to(torch.float32)
+        metric_dict[f"{self.prefix}/diversity/diag/back_dx_mean"] = (
+            self.back_dx_sum / back_n
+        ).to(torch.float32)
+        metric_dict[f"{self.prefix}/diversity/diag/back_vlon_neg_frac"] = (
+            self.back_negfrac_sum / back_n
+        ).to(torch.float32)
+        back_hist_total = self.back_speed_hist.sum().clamp_min(1.0)
+        for bin_index, bin_name in enumerate(_BACK_SPEED_BIN_NAMES):
+            metric_dict[f"{self.prefix}/diversity/diag/back_speed_hist/{bin_name}"] = (
+                self.back_speed_hist[bin_index] / back_hist_total
+            ).to(torch.float32)
         return metric_dict
 
 
