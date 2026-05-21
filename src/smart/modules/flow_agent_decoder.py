@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import os
 from typing import Dict
 
 import torch
 from omegaconf import DictConfig
 from torch_cluster import radius_graph
-from torch.utils.checkpoint import checkpoint
 
 from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
@@ -72,8 +70,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         lqr_commit: DictConfig | None = None,
-        use_training_activation_checkpointing: bool = False,
-        training_activation_checkpoint_start_layer: int = 0,
         detach_train_metric_clean: bool = False,
     ) -> None:
         super().__init__(
@@ -99,12 +95,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.use_holonomic_model_only = bool(use_holonomic_model_only)
         self.use_rolling_supervision = bool(use_rolling_supervision)
-        self.use_training_activation_checkpointing = bool(
-            use_training_activation_checkpointing
-        )
-        self.training_activation_checkpoint_start_layer = int(
-            training_activation_checkpoint_start_layer
-        )
         self.detach_train_metric_clean = bool(detach_train_metric_clean)
         self.control_pos_scale_m = float(control_pos_scale_m)
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad
@@ -141,7 +131,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_chunk_layers=flow_num_chunk_layers,
             chunk_size=self.shift,
             flow_state_dim=self.flow_state_dim,
-            use_training_activation_checkpointing=self.use_training_activation_checkpointing,
         )
         self.flow_ode = FlowODE(
             eps=flow_solver_eps,
@@ -190,21 +179,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             control_cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
         )
 
-    def _activation_checkpoint_enabled(self, layer_idx: int | None = None) -> bool:
-        checkpoint_start_layer = int(
-            getattr(self, "training_activation_checkpoint_start_layer", 0)
-        )
-        if layer_idx is not None and layer_idx < checkpoint_start_layer:
-            return False
-        use_activation_checkpointing = bool(
-            getattr(self, "use_training_activation_checkpointing", False)
-        )
-        return (
-            use_activation_checkpointing
-            and self.training
-            and torch.is_grad_enabled()
-        )
-
     def _run_attention_layer(
         self,
         layer: torch.nn.Module,
@@ -213,51 +187,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         edge_index: torch.Tensor,
         layer_idx: int,
     ) -> torch.Tensor:
-        if not self._activation_checkpoint_enabled(layer_idx):
-            return layer(x, r, edge_index)
-        if isinstance(x, tuple):
-            if r is None:
-                return checkpoint(
-                    lambda x_src_, x_dst_, edge_index_: layer(
-                        (x_src_, x_dst_),
-                        None,
-                        edge_index_,
-                    ),
-                    x[0],
-                    x[1],
-                    edge_index,
-                    use_reentrant=False,
-                    preserve_rng_state=True,
-                )
-            return checkpoint(
-                lambda x_src_, x_dst_, r_, edge_index_: layer(
-                    (x_src_, x_dst_),
-                    r_,
-                    edge_index_,
-                ),
-                x[0],
-                x[1],
-                r,
-                edge_index,
-                use_reentrant=False,
-                preserve_rng_state=True,
-            )
-        if r is None:
-            return checkpoint(
-                lambda x_, edge_index_: layer(x_, None, edge_index_),
-                x,
-                edge_index,
-                use_reentrant=False,
-                preserve_rng_state=True,
-            )
-        return checkpoint(
-            lambda x_, r_, edge_index_: layer(x_, r_, edge_index_),
-            x,
-            r,
-            edge_index,
-            use_reentrant=False,
-            preserve_rng_state=True,
-        )
+        del layer_idx
+        return layer(x, r, edge_index)
 
     def build_interaction_edge(
         self,

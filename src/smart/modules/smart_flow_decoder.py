@@ -49,8 +49,6 @@ class SMARTFlowDecoder(nn.Module):
         use_lqr: bool = False,
         use_stop_motion: bool = False,
         lqr_commit: DictConfig | None = None,
-        use_training_activation_checkpointing: bool = False,
-        training_activation_checkpoint_start_layer: int = 0,
         detach_train_metric_clean: bool = False,
     ) -> None:
         super().__init__()
@@ -97,8 +95,6 @@ class SMARTFlowDecoder(nn.Module):
             lqr_commit=lqr_commit,
             use_holonomic_model_only=use_holonomic_model_only,
             use_rolling_supervision=use_rolling_supervision,
-            use_training_activation_checkpointing=use_training_activation_checkpointing,
-            training_activation_checkpoint_start_layer=training_activation_checkpoint_start_layer,
             detach_train_metric_clean=detach_train_metric_clean,
         )
 

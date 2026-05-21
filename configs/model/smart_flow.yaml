@@ -116,10 +116,8 @@ model_config:
     flow_solver_steps: 32
     flow_solver_method: euler
     flow_solver_eps: 1.0e-3
-    # Training-only memory controls. Defaults are off so existing experiments
-    # keep identical execution unless an experiment preset opts in.
-    use_training_activation_checkpointing: false
-    training_activation_checkpoint_start_layer: 0
+    # Training-only metric memory control. It does not change loss/target/model
+    # capacity and only detaches train metric clean reconstruction graphs.
     detach_train_metric_clean: false
     # 아래 control-space 공유 설정은 token_processor 값을 단일 기준으로 사용합니다.
     # decoder 쪽만 다른 값으로 override하면 SMARTFlow 초기화 단계에서 에러를 냅니다.
