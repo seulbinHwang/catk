@@ -33,6 +33,31 @@ class FourierEmbedding(nn.Module):
         )
         self.apply(weight_init)
 
+    def _embed_continuous_loop(self, continuous_inputs: torch.Tensor) -> torch.Tensor:
+        x = continuous_inputs.unsqueeze(-1) * self.freqs.weight * 2 * math.pi
+        # Warning: if your data are noisy, don't use learnable sinusoidal embedding
+        x = torch.cat([x.cos(), x.sin(), continuous_inputs.unsqueeze(-1)], dim=-1)
+        continuous_embs: List[Optional[torch.Tensor]] = [None] * self.input_dim
+        for i in range(self.input_dim):
+            continuous_embs[i] = self.mlps[i](x[:, i])
+        return torch.stack(continuous_embs).sum(dim=0)
+
+    def _embed_continuous_accumulated(self, continuous_inputs: torch.Tensor) -> torch.Tensor:
+        x = continuous_inputs.unsqueeze(-1) * self.freqs.weight * 2 * math.pi
+        # Warning: if your data are noisy, don't use learnable sinusoidal embedding
+        x = torch.cat([x.cos(), x.sin(), continuous_inputs.unsqueeze(-1)], dim=-1)
+        continuous_emb = self.mlps[0](x[:, 0])
+        for i in range(1, self.input_dim):
+            continuous_emb = continuous_emb + self.mlps[i](x[:, i])
+        return continuous_emb
+
+    @staticmethod
+    def _sum_embeddings(embs: List[torch.Tensor]) -> torch.Tensor:
+        x = embs[0]
+        for emb in embs[1:]:
+            x = x + emb
+        return x
+
     def forward(
         self,
         continuous_inputs: Optional[torch.Tensor] = None,
@@ -40,19 +65,13 @@ class FourierEmbedding(nn.Module):
     ) -> torch.Tensor:
         if continuous_inputs is None:
             if categorical_embs is not None:
-                x = torch.stack(categorical_embs).sum(dim=0)
+                x = self._sum_embeddings(categorical_embs)
             else:
                 raise ValueError("Both continuous_inputs and categorical_embs are None")
         else:
-            x = continuous_inputs.unsqueeze(-1) * self.freqs.weight * 2 * math.pi
-            # Warning: if your data are noisy, don't use learnable sinusoidal embedding
-            x = torch.cat([x.cos(), x.sin(), continuous_inputs.unsqueeze(-1)], dim=-1)
-            continuous_embs: List[Optional[torch.Tensor]] = [None] * self.input_dim
-            for i in range(self.input_dim):
-                continuous_embs[i] = self.mlps[i](x[:, i])
-            x = torch.stack(continuous_embs).sum(dim=0)
+            x = self._embed_continuous_accumulated(continuous_inputs)
             if categorical_embs is not None:
-                x = x + torch.stack(categorical_embs).sum(dim=0)
+                x = x + self._sum_embeddings(categorical_embs)
         return self.to_out(x)
 
 
