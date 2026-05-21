@@ -124,14 +124,35 @@ class ModuleTimeProfilerCallback(Callback):
         agent_encoder = encoder.agent_encoder
 
         map_attn = list(map_encoder.pt2pt_layers)
+        map_embedding_modules = [
+            map_encoder.type_pt_emb,
+            map_encoder.polygon_type_emb,
+            map_encoder.light_pl_emb,
+            map_encoder.r_pt2pt_emb,
+            map_encoder.token_emb,
+        ]
         t_attn = list(agent_encoder.t_attn_layers)
         pt2a_attn = list(agent_encoder.pt2a_attn_layers)
         a2a_attn = list(agent_encoder.a2a_attn_layers)
         head = agent_encoder.token_predict_head
+        agent_embedding_modules = [
+            agent_encoder.type_a_emb,
+            agent_encoder.shape_emb,
+            agent_encoder.x_a_emb,
+            agent_encoder.r_t_emb,
+            agent_encoder.r_pt2a_emb,
+            agent_encoder.r_a2a_emb,
+            agent_encoder.token_emb_veh,
+            agent_encoder.token_emb_ped,
+            agent_encoder.token_emb_cyc,
+            agent_encoder.fusion_emb,
+        ]
 
         self._add_hooks("map_encoder_total", [map_encoder])
+        self._add_hooks("map_embedding_modules", map_embedding_modules)
         self._add_hooks("map_pt2pt_attention", map_attn)
         self._add_hooks("agent_encoder_total", [agent_encoder])
+        self._add_hooks("agent_embedding_modules", agent_embedding_modules)
         self._add_hooks("agent_temporal_attention", t_attn)
         self._add_hooks("agent_map2agent_attention", pt2a_attn)
         self._add_hooks("agent_agent2agent_attention", a2a_attn)
@@ -141,16 +162,13 @@ class ModuleTimeProfilerCallback(Callback):
         self._params_by_category = {
             "map_encoder_total": self._unique_param_count([map_encoder]),
             "map_pt2pt_attention": self._unique_param_count(map_attn),
-            "map_embedding_edge_build": self._param_count_excluding(map_encoder, map_attn),
+            "map_embedding_edge_build": self._unique_param_count(map_embedding_modules),
             "agent_encoder_total": self._unique_param_count([agent_encoder]),
             "agent_temporal_attention": self._unique_param_count(t_attn),
             "agent_map2agent_attention": self._unique_param_count(pt2a_attn),
             "agent_agent2agent_attention": self._unique_param_count(a2a_attn),
             "token_predict_head": self._unique_param_count([head]),
-            "agent_embedding_edge_build": self._param_count_excluding(
-                agent_encoder,
-                [*t_attn, *pt2a_attn, *a2a_attn, head],
-            ),
+            "agent_embedding_edge_build": self._unique_param_count(agent_embedding_modules),
             "training_loss": self._unique_param_count([pl_module.training_loss]),
             "optimizer_ddp_logging_other": 0,
         }
@@ -205,8 +223,10 @@ class ModuleTimeProfilerCallback(Callback):
             }
             for category in [
                 "map_encoder_total",
+                "map_embedding_modules",
                 "map_pt2pt_attention",
                 "agent_encoder_total",
+                "agent_embedding_modules",
                 "agent_temporal_attention",
                 "agent_map2agent_attention",
                 "agent_agent2agent_attention",
@@ -229,7 +249,7 @@ class ModuleTimeProfilerCallback(Callback):
             }
 
         map_other_fwd = raw["map_encoder_total"]["forward_ms"] - raw["map_pt2pt_attention"]["forward_ms"]
-        map_other_bwd = raw["map_encoder_total"]["backward_ms"] - raw["map_pt2pt_attention"]["backward_ms"]
+        map_other_bwd = raw["map_embedding_modules"]["backward_ms"]
 
         agent_children = [
             "agent_temporal_attention",
@@ -240,9 +260,7 @@ class ModuleTimeProfilerCallback(Callback):
         agent_other_fwd = raw["agent_encoder_total"]["forward_ms"] - sum(
             raw[name]["forward_ms"] for name in agent_children
         )
-        agent_other_bwd = raw["agent_encoder_total"]["backward_ms"] - sum(
-            raw[name]["backward_ms"] for name in agent_children
-        )
+        agent_other_bwd = raw["agent_embedding_modules"]["backward_ms"]
 
         rows = [
             row(
