@@ -218,11 +218,19 @@ class ModuleProfileCallback(Callback):
             torch.cuda.synchronize(self._device)
             for label, pairs in self._batch_events.items():
                 for start, end in pairs:
-                    self._totals[label] += float(start.elapsed_time(end))
+                    try:
+                        elapsed_ms = float(start.elapsed_time(end))
+                    except RuntimeError:
+                        continue
+                    self._totals[label] += elapsed_ms
                     self._counts[label] += 1
             for label, pairs in self._batch_backward_events.items():
                 for start, end in pairs:
-                    self._backward_totals[label] += float(start.elapsed_time(end))
+                    try:
+                        elapsed_ms = float(start.elapsed_time(end))
+                    except RuntimeError:
+                        continue
+                    self._backward_totals[label] += elapsed_ms
                     self._backward_counts[label] += 1
             self._active_batches += 1
             if self._active_batches >= self.active_steps:
