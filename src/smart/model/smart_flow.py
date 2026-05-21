@@ -2459,15 +2459,6 @@ class SMARTFlow(LightningModule):
                 return name, param
         return None
 
-    def _find_first_nonfinite_gradient(self) -> tuple[str, Tensor] | None:
-        """처음 발견한 non-finite gradient를 반환합니다."""
-        for name, param in self.named_parameters():
-            if not param.requires_grad or param.grad is None:
-                continue
-            if not torch.isfinite(param.grad).all():
-                return name, param.grad
-        return None
-
     @staticmethod
     def _summarize_nonfinite_tensor(tensor: Tensor) -> str:
         """non-finite tensor의 요약 문자열을 만듭니다."""
@@ -2899,27 +2890,12 @@ open_metric_dict:
         self._skip_next_automatic_optimizer_step = False
 
     def on_after_backward(self) -> None:
-        """역전파 직후 non-finite gradient를 fail-fast로 잡습니다.
+        """Backward 이후 추가 gradient scan을 수행하지 않습니다.
 
-        설명:
-            ``precision='16-mixed'`` 에서는 Lightning이 ``GradScaler`` 로 loss를 스케일해
-            backward를 수행하므로, 이 시점의 gradient는 정상적으로 scaled 상태이고
-            fp16 overflow로 인한 inf/NaN도 흔하게 발생합니다. ``GradScaler.step`` 이
-            optimizer step을 자동으로 건너뛰고 scale factor를 낮춰 회복하므로, scaler가
-            활성인 경로에서는 여기서 ``raise`` 하지 않습니다. scaler가 없는 경로
-            (bf16 / 32-true) 에서는 기존대로 fail-fast를 유지합니다.
+        Loss/parameter non-finite fail-fast는 forward 경로에 남기고, 매 step 모든
+        gradient를 순회하던 debug-only 검사는 제거해 pretrain step latency를 줄입니다.
         """
-        if self._get_amp_grad_scaler() is not None:
-            return
-        bad_grad = self._find_first_nonfinite_gradient()
-        if bad_grad is None:
-            return
-        bad_name, bad_tensor = bad_grad
-        raise RuntimeError(
-            "Detected non-finite gradient after backward: "
-            f"{bad_name} ({self._summarize_nonfinite_tensor(bad_tensor)})"
-            f"{self._format_self_forced_backward_context()}"
-        )
+        return
 
     def validation_step(self, data, batch_idx):
         eval_generator = self._get_eval_generator()
