@@ -242,6 +242,7 @@ class ModuleProfileCallback(Callback):
 
         try:
             import src.smart.tokens.flow_token_processor as flow_token_processor_module
+            import src.smart.modules.kinematic_control as kinematic_control_module
         except Exception:
             return
         self._wrap_function(
@@ -253,6 +254,26 @@ class ModuleProfileCallback(Callback):
             flow_token_processor_module,
             "build_rolling_control_target",
             "token_processor.detail.control_target.function",
+        )
+        self._wrap_function(
+            kinematic_control_module,
+            "build_rolling_control_target",
+            "token_processor.detail.control_target.build_rolling_control_target",
+        )
+        self._wrap_function(
+            kinematic_control_module,
+            "normalize_control",
+            "token_processor.detail.control_target.normalize_control",
+        )
+        self._wrap_function(
+            kinematic_control_module,
+            "denormalize_control",
+            "token_processor.detail.control_target.denormalize_control",
+        )
+        self._wrap_function(
+            kinematic_control_module,
+            "decode_control_sequence",
+            "token_processor.detail.control_target.decode_control_sequence",
         )
 
     def on_fit_start(self, trainer: Trainer, pl_module: nn.Module) -> None:
