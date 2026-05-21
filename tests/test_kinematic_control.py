@@ -364,6 +364,68 @@ def test_transition_aligned_trajectory_keeps_history_raw_and_projects_future() -
     torch.testing.assert_close(aligned_head[:, 2:], heading[:, 2:], atol=1.0e-5, rtol=1.0e-5)
 
 
+def test_transition_aligned_trajectory_matches_control_round_trip_decode() -> None:
+    torch.manual_seed(0)
+    n_agent = 6
+    n_step = 24
+    current_step = 10
+    agent_type = torch.tensor(
+        [
+            VEHICLE_TYPE_ID,
+            PEDESTRIAN_TYPE_ID,
+            CYCLIST_TYPE_ID,
+            VEHICLE_TYPE_ID,
+            CYCLIST_TYPE_ID,
+            PEDESTRIAN_TYPE_ID,
+        ]
+    )
+    agent_length = torch.tensor([4.8, 1.0, 2.0, 5.1, 1.8, 0.9])
+    pos = torch.randn(n_agent, n_step, 2).cumsum(dim=1) * 0.2
+    heading = torch.randn(n_agent, n_step).cumsum(dim=1) * 0.05
+    no_slip_kwargs = {
+        "vehicle_no_slip_point_ratio": 0.2289518863,
+        "cyclist_no_slip_point_ratio": 0.0495847873,
+    }
+
+    aligned_pos, aligned_head, control_norm_by_step = build_transition_aligned_control_trajectory(
+        pos=pos,
+        heading=heading,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        current_step=current_step,
+        **CONTROL_YAW_SCALE_KWARGS,
+        **no_slip_kwargs,
+    )
+    future_control = denormalize_control(
+        control_norm=control_norm_by_step[:, current_step + 1 :],
+        agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+    round_trip_pos, round_trip_head = decode_control_sequence(
+        control=future_control,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        current_pos=pos[:, current_step],
+        current_head=heading[:, current_step],
+        **no_slip_kwargs,
+    )
+
+    torch.testing.assert_close(aligned_pos[:, : current_step + 1], pos[:, : current_step + 1])
+    torch.testing.assert_close(aligned_head[:, : current_step + 1], heading[:, : current_step + 1])
+    torch.testing.assert_close(
+        aligned_pos[:, current_step + 1 :],
+        round_trip_pos,
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+    torch.testing.assert_close(
+        aligned_head[:, current_step + 1 :],
+        round_trip_head,
+        atol=2.0e-5,
+        rtol=2.0e-5,
+    )
+
+
 def test_pedestrian_uses_pedestrian_type_id_constant() -> None:
     assert PEDESTRIAN_TYPE_ID == 1
     assert VEHICLE_TYPE_ID == 0

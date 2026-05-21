@@ -532,6 +532,41 @@ def build_rolling_control_target(
         Tensor: 정규화된 rolling control label입니다. shape은 ``[N, T, 3]`` 입니다.
             마지막 차원은 ``[앞뒤 이동량, 좌우 이동량, 방향 변화량]`` 입니다.
     """
+    control_norm, _, _ = _build_rolling_control_target_and_aligned_pose(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        pos_scale_m=pos_scale_m,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
+        use_holonomic_model_only=use_holonomic_model_only,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+    )
+    return control_norm
+
+
+def _build_rolling_control_target_and_aligned_pose(
+    future_pos: Tensor,
+    future_head: Tensor,
+    current_pos: Tensor,
+    current_head: Tensor,
+    agent_type: Tensor,
+    agent_length: Tensor | None = None,
+    *,
+    pos_scale_m: float = DEFAULT_CONTROL_POS_SCALE_M,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
+    use_holonomic_model_only: bool = False,
+    vehicle_no_slip_point_ratio: float = DEFAULT_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """rolling control target과 그 control이 실행한 aligned pose를 한 번에 만듭니다."""
     if future_pos.ndim != 3 or future_pos.shape[-1] != 2:
         raise ValueError(f"future_pos must have shape [N, T, 2], got {tuple(future_pos.shape)}.")
     if tuple(future_head.shape) != tuple(future_pos.shape[:2]):
@@ -562,6 +597,8 @@ def build_rolling_control_target(
         device=future_pos.device,
     )
     control_steps: list[Tensor] = []
+    pos_steps: list[Tensor] = []
+    head_steps: list[Tensor] = []
 
     for step_idx in range(future_pos.shape[1]):
         target_pos = future_pos[:, step_idx]
@@ -603,11 +640,17 @@ def build_rolling_control_target(
         )
         roll_pos = torch.where(holonomic_mask.unsqueeze(-1), target_pos, nonhol_next_pos)
         roll_head = wrap_angle(roll_head + delta_head)
+        pos_steps.append(roll_pos)
+        head_steps.append(roll_head)
 
     if len(control_steps) == 0:
-        return future_pos.new_zeros((future_pos.shape[0], 0, CONTROL_FLOW_DIM))
+        return (
+            future_pos.new_zeros((future_pos.shape[0], 0, CONTROL_FLOW_DIM)),
+            future_pos.new_zeros((future_pos.shape[0], 0, 2)),
+            future_pos.new_zeros((future_pos.shape[0], 0)),
+        )
     control = torch.stack(control_steps, dim=1)
-    return normalize_control(
+    control_norm = normalize_control(
         control=control,
         pos_scale_m=pos_scale_m,
         agent_type=agent_type,
@@ -615,6 +658,7 @@ def build_rolling_control_target(
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
         cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
     )
+    return control_norm, torch.stack(pos_steps, dim=1), torch.stack(head_steps, dim=1)
 
 
 def build_transition_aligned_control_trajectory(
@@ -679,7 +723,11 @@ def build_transition_aligned_control_trajectory(
     if current_step + 1 >= pos.shape[1]:
         return aligned_pos, aligned_heading, control_norm_by_step
 
-    future_control_norm = build_rolling_control_target(
+    (
+        future_control_norm,
+        future_pos_aligned,
+        future_head_aligned,
+    ) = _build_rolling_control_target_and_aligned_pose(
         future_pos=pos[:, current_step + 1 :],
         future_head=heading[:, current_step + 1 :],
         current_pos=pos[:, current_step],
@@ -695,24 +743,6 @@ def build_transition_aligned_control_trajectory(
         cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
     )
     control_norm_by_step[:, current_step + 1 :] = future_control_norm
-    future_control = denormalize_control(
-        control_norm=future_control_norm,
-        pos_scale_m=pos_scale_m,
-        agent_type=agent_type,
-        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
-        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
-        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
-    )
-    future_pos_aligned, future_head_aligned = decode_control_sequence(
-        control=future_control,
-        agent_type=agent_type,
-        agent_length=agent_length,
-        current_pos=pos[:, current_step],
-        current_head=heading[:, current_step],
-        use_holonomic_model_only=use_holonomic_model_only,
-        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
-        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
-    )
     aligned_pos[:, current_step + 1 :] = future_pos_aligned
     aligned_heading[:, current_step + 1 :] = future_head_aligned
     return aligned_pos, aligned_heading, control_norm_by_step
