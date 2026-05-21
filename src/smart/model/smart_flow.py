@@ -134,14 +134,28 @@ class SMARTFlow(LightningModule):
         if self._is_dmd_ft_enabled():
             from copy import deepcopy
             self.fake_score_decoder = deepcopy(self.encoder.agent_encoder.flow_decoder)
-            # set_model_for_finetuning 으로 trunk 일부 가 freeze 됐어도 critic 은 full update.
-            for p in self.fake_score_decoder.parameters():
-                p.requires_grad_(True)
+            # fake_score 의 학습 scope 결정 (dmd_fake_ft_scope):
+            #   "full"   = 모든 param trainable (Self-Forcing 기본; main 이 velocity_head only
+            #              여도 critic 은 full FT — paper convention).
+            #   "mirror" = main flow_decoder 의 requires_grad mask 를 그대로 따라감
+            #              (deepcopy 가 mask 도 복사하므로 별도 처리 불필요).  ablation 용.
+            _fake_scope = str(getattr(self.finetune_config, "dmd_fake_ft_scope", "full")).lower()
+            if _fake_scope == "full":
+                for p in self.fake_score_decoder.parameters():
+                    p.requires_grad_(True)
+            elif _fake_scope != "mirror":
+                log.warning(
+                    f"[{self.finetune_config.mode}] unknown dmd_fake_ft_scope={_fake_scope!r}; "
+                    "falling back to 'full' (all fake_score params trainable)."
+                )
+                for p in self.fake_score_decoder.parameters():
+                    p.requires_grad_(True)
             n_params = sum(p.numel() for p in self.fake_score_decoder.parameters())
+            n_train = sum(p.numel() for p in self.fake_score_decoder.parameters() if p.requires_grad)
             log.info(
                 f"[{self.finetune_config.mode}] fake_score_decoder constructed "
-                f"({n_params:,} params, all trainable). Weights will be synced from "
-                "main flow_decoder in on_train_start (post-ckpt-load)."
+                f"({n_params:,} total params, {n_train:,} trainable; scope={_fake_scope}). "
+                "Weights will be synced from main flow_decoder in on_train_start (post-ckpt-load)."
             )
             # Generator EMA — dmd_ema_weight > 0 일 때만 생성.
             # validation 시 instantaneous ↔ EMA swap.

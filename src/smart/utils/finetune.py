@@ -199,6 +199,10 @@ class FinetuneConfig:
     dmd_ema_weight: float = 0.0
     #: EMA update 시작 step (0 = step 0 부터 즉시 EMA 적용).  Self-Forcing default 200.
     dmd_ema_start_step: int = 0
+    #: fake_score_decoder 의 학습 scope.  "full" = 전체 trainable (Self-Forcing default).
+    #: "mirror" = main flow_decoder 의 requires_grad mask 그대로 적용 (gen 이 velocity_head
+    #: only 면 fake 도 velocity_head only).  ablation 용.
+    dmd_fake_ft_scope: str = "full"
 
 
 def _read_config_value(config: Any, key: str, default: Any) -> Any:
@@ -304,6 +308,7 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         dmd_adam_beta2=float(_read_config_value(finetune, "dmd_adam_beta2", 0.999)),
         dmd_ema_weight=float(_read_config_value(finetune, "dmd_ema_weight", 0.0)),
         dmd_ema_start_step=int(_read_config_value(finetune, "dmd_ema_start_step", 0)),
+        dmd_fake_ft_scope=str(_read_config_value(finetune, "dmd_fake_ft_scope", "full")),
     )
 
 

@@ -114,6 +114,10 @@ DMD_ADAM_BETA2="${DMD_ADAM_BETA2:-0.999}"
 DMD_EMA_WEIGHT="${DMD_EMA_WEIGHT:-0.99}"
 # EMA 시작 step.  Self-Forcing default 200 (paper); 우리는 0 (즉시 적용 — warmup 없음).
 DMD_EMA_START_STEP="${DMD_EMA_START_STEP:-0}"
+# fake_score 학습 scope:
+#   "full"   (default, Self-Forcing 정합): 모든 param trainable.
+#   "mirror": main flow_decoder 의 requires_grad mask 따라감 (gen velhead only 면 fake 도 velhead only).
+DMD_FAKE_FT_SCOPE="${DMD_FAKE_FT_SCOPE:-full}"
 
 # ── BPTT (OCSC 와 공유) ────────────────────────────────────────────────────
 # DMD 는 adjoint off (= activation 저장, backward forward 재계산 X) — GPU util ↑.
@@ -225,6 +229,7 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.dmd_adam_beta2="${DMD_ADAM_BETA2}" \
   model.model_config.finetune.dmd_ema_weight="${DMD_EMA_WEIGHT}" \
   model.model_config.finetune.dmd_ema_start_step="${DMD_EMA_START_STEP}" \
+  model.model_config.finetune.dmd_fake_ft_scope="${DMD_FAKE_FT_SCOPE}" \
   model.model_config.finetune.bptt_use_adjoint="${BPTT_USE_ADJOINT}" \
   model.model_config.finetune.bptt_warm_coarse_steps="${BPTT_WARM_COARSE_STEPS}" \
   model.model_config.finetune.bptt_last_n_coarse_steps="${BPTT_LAST_N_COARSE_STEPS}" \

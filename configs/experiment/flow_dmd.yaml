@@ -78,6 +78,10 @@ model:
       dmd_ema_weight: 0.99
       # EMA 시작 step.  Self-Forcing paper 200; 우리는 0 (즉시).
       dmd_ema_start_step: 0
+      # fake_score 학습 scope:
+      #   "full"   → 모든 param trainable (Self-Forcing 정합).
+      #   "mirror" → main flow_decoder 의 requires_grad mask 그대로 (gen velhead only 면 fake 도 동일).
+      dmd_fake_ft_scope: "full"
       # ── BPTT tricks (OCSC 와 공유) ─────────────────────────────────
       # flow_ft_target:
       #   "full"      → ENTIRE model trainable (Self-Forcing paper convention)
