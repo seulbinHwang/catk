@@ -583,19 +583,37 @@ class TokenProcessor(torch.nn.Module):
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         # [n_agent], max will give the first True step
         first_valid_step = torch.max(valid, dim=1).indices
+        n_step_to_extrapolate = first_valid_step.remainder(self.shift)
 
-        for i, t in enumerate(first_valid_step):  # extrapolate to previous 5th step.
-            n_step_to_extrapolate = t % self.shift
-            if (t == 10) and (not valid[i, 10 - self.shift]):
-                # such that at least one token is valid in the history.
-                n_step_to_extrapolate = self.shift
+        prev_token_step = 10 - self.shift
+        if 0 <= prev_token_step < valid.shape[1]:
+            needs_history_token = (first_valid_step == 10) & (~valid[:, prev_token_step])
+            n_step_to_extrapolate = torch.where(
+                needs_history_token,
+                torch.full_like(n_step_to_extrapolate, self.shift),
+                n_step_to_extrapolate,
+            )
 
-            if n_step_to_extrapolate > 0:
-                vel[i, t - n_step_to_extrapolate : t] = vel[i, t]
-                valid[i, t - n_step_to_extrapolate : t] = True
-                heading[i, t - n_step_to_extrapolate : t] = heading[i, t]
+        step_index = torch.arange(valid.shape[1], device=valid.device).unsqueeze(0)
+        fill_start = first_valid_step - n_step_to_extrapolate
+        fill_mask = (
+            (n_step_to_extrapolate > 0).unsqueeze(1)
+            & (step_index >= fill_start.unsqueeze(1))
+            & (step_index < first_valid_step.unsqueeze(1))
+        )
+        if not bool(fill_mask.any().item()):
+            return valid, pos, heading, vel
 
-                for j in range(n_step_to_extrapolate):
-                    pos[i, t - j - 1] = pos[i, t - j] - vel[i, t] * 0.1
+        agent_index, step_index_flat = fill_mask.nonzero(as_tuple=True)
+        source_step = first_valid_step[agent_index]
+        source_vel = vel[agent_index, source_step]
+
+        valid[agent_index, step_index_flat] = True
+        vel[agent_index, step_index_flat] = source_vel
+        heading[agent_index, step_index_flat] = heading[agent_index, source_step]
+        delta_step = (source_step - step_index_flat).to(dtype=pos.dtype).unsqueeze(-1)
+        pos[agent_index, step_index_flat] = (
+            pos[agent_index, source_step] - source_vel * (0.1 * delta_step)
+        )
 
         return valid, pos, heading, vel
