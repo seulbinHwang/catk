@@ -742,6 +742,12 @@ teacher-forced nearest-token `gt_*` 상태와 같게 만든다. 따라서 tokeni
 validation/test sampling 설명은 closed-loop rollout 중 모델 출력 token을 고르는
 정책에만 해당한다.
 
+Agent tokenization에서 첫 valid step이 coarse token boundary와 어긋난 경우, 직전
+token boundary까지 위치/heading/velocity/valid를 외삽해 최소 하나의 history token이
+유효하도록 만든다. 이 외삽은 agent별 Python loop가 아니라 batch mask/index 연산으로
+처리한다. 규칙은 기존 loop와 같고, `t=10`인데 raw step 5가 invalid인 history 보강
+예외도 유지한다.
+
 DDP validation/test에서는 각 rank가 validation/test sample을 복제 없이 정확히 한
 번씩 나눠 처리한다. 일반 distributed sampler처럼 dataset 길이를 world size에 맞추기
 위해 뒤쪽 sample을 padding 복제하지 않으므로, 멀티 GPU 평가에서 같은 scenario가
