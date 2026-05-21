@@ -22,6 +22,12 @@ from src.utils import RankedLogger
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
+def _is_cache_sample_path(path: Path) -> bool:
+    """Return true only for visible SMART scenario cache pickle files."""
+
+    return path.is_file() and path.suffix == ".pkl" and not path.name.startswith(".")
+
+
 class MultiDataset(Dataset):
     def __init__(
         self,
@@ -34,7 +40,11 @@ class MultiDataset(Dataset):
             raise FileNotFoundError(f"Dataset directory does not exist: {raw_dir}")
         if not raw_dir.is_dir():
             raise NotADirectoryError(f"Dataset path is not a directory: {raw_dir}")
-        self._raw_paths = [p.as_posix() for p in sorted(raw_dir.glob("*"))]
+        self._raw_paths = [
+            p.as_posix()
+            for p in sorted(raw_dir.glob("*.pkl"))
+            if _is_cache_sample_path(p)
+        ]
         self._num_samples = len(self._raw_paths)
 
         self._tfrecord_dir = Path(tfrecord_dir) if tfrecord_dir is not None else None
