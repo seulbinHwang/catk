@@ -523,6 +523,7 @@ torchrun ... -m src.run \
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
 - `model.model_config.token_processor.use_holonomic_model_only=true`를 켜면 ablation용으로 vehicle / cyclist에도 pedestrian과 같은 holonomic decoder를 적용합니다. 이때 vehicle / cyclist의 `delta_n`도 학습 target과 rollout 복원에 사용됩니다. 기본값 `false`는 기존 agent-type-aware non-holonomic/holonomic 혼합 방식입니다.
 - map / agent motion token matching은 항상 deterministic nearest-token argmin을 씁니다. 이전 `map_token_sampling.num_k=1`, `agent_token_sampling.num_k=1` 기본값과 같은 동작을 고정한 것이며, stochastic top-k sampling config와 Categorical sampling 경로는 제거했습니다. 따라서 학습, validation, fast RMM, WOSAC submission 생성에서 tokenization은 train/eval mode와 무관하게 같은 nearest-token 규칙을 따릅니다.
+- agent trajectory token matching은 coarse token step을 하나씩 반복하지 않고, 모든 `[agent, coarse_step]` segment를 한 번에 local contour로 만든 뒤 valid query만 type별 token bank와 deterministic argmin으로 매칭합니다. query 축은 chunk로 나눠 peak memory를 제한합니다. invalid segment는 기존과 같이 `valid_mask=false`, token index/pose/heading `0`으로 남기므로 학습 target과 평가 경로의 의미는 바뀌지 않습니다.
 - `use_kinematic_control_flow=true`에서는 관측 history와 현재 시작 pose는 raw GT를 유지하고, 현재 이후 future만 inference와 같은 kinematic transition으로 한 번 실행해 transition-aligned trajectory를 만듭니다. 각 anchor의 context position/heading, motion token, future control target, open-loop metric target은 모두 이 같은 궤적에서 잘라 씁니다. 따라서 target에만 별도로 rolling projection을 다시 적용하지 않습니다.
 - 학습에서는 `control_alignment_filter.enabled=true`가 기본으로 켜져 있습니다. 이 필터는 vehicle/cyclist를 holonomic으로 바꾸지 않고 non-holonomic control target을 그대로 유지하되, raw GT와 transition-aligned trajectory의 위치 차이가 너무 큰 학습 anchor만 loss에서 제외합니다. 기본 기준은 vehicle `2.0m`, cyclist `2.0m`입니다. pedestrian은 holonomic이라 별도 기준을 두지 않습니다. 이 필터는 학습 target 선택에만 적용되며 validation, closed-loop rollout, fast RMM, WOSAC 제출물 생성의 평가 agent 선택은 바꾸지 않습니다.
 - transition-aligned trajectory가 raw GT future를 얼마나 왜곡하는지 확인하려면 아래 도구를 먼저 돌립니다. 이 도구는 SMART cache를 읽기만 하며, cache 생성 로직이나 cache 파일은 바꾸지 않습니다. token processor와 같은 heading clean / 이전 token step extrapolation을 적용한 뒤 raw step `10` 이후의 raw 위치와 transition-aligned 위치 사이의 L2 오차를 집계합니다. worker는 여러 pkl을 chunk 단위로 합산한 뒤 histogram만 반환하므로, 전체 training split 전수 분석에서도 IPC 비용이 작습니다.
@@ -745,6 +746,15 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_stati
 | 26 | train forward 중 OOM | 156 | - | 약 79GB 사용 후 OOM | - | 제외 |
 
 따라서 이 6-GPU 조합에서는 `train_batch_size=20`이 안정성과 완료 속도의 균형이 가장 좋습니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다.
+
+Agent trajectory token matching은 모든 coarse segment를 batched query로 묶어 처리합니다. `hsb-npc-training-2`, `wo-pvc-2` H100에서 같은 synthetic workload(`n_agent=1536`, `n_step=91`, 실제 token bank 사용)를 기준으로 reference loop와 비교했을 때 `valid_mask`, `gt_idx`, `sampled_idx`는 exact match이고 pose/heading 최대 오차는 `0.0`이었습니다.
+
+| pod | 이전 `_match_agent_token` | batched matching | 변화 | peak allocated |
+|---|---:|---:|---:|---:|
+| `hsb-npc-training-2` | `45.43ms` | `27.69ms` | `-39.1%` | `329MiB -> 633MiB` |
+| `wo-pvc-2` | `45.03ms` | `27.59ms` | `-38.7%` | `329MiB -> 633MiB` |
+
+이 peak memory 증가는 token matching 구간의 일시 버퍼 기준이며, H100 전체 메모리 대비 작습니다. 대신 token processor 병목 중 agent token matching 부분은 약 39% 줄어듭니다.
 
 6-GPU heterogeneous run의 안전장치는 다음과 같습니다.
 

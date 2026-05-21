@@ -310,50 +310,73 @@ class TokenProcessor(torch.nn.Module):
                 coarse 간격 기준의 정답 토큰과 샘플 토큰, 그리고 실제 coarse 상태를 담은 사전입니다.
                 모든 항목의 첫 차원은 ``n_agent`` 이고 두 번째 차원은 ``n_step_token`` 입니다.
         """
-        _, n_step = valid.shape
+        n_agent, n_step = valid.shape
+        device = pos.device
 
-        prev_pos = pos[:, 0].clone()  # [n_agent, 2]
-        prev_head = heading[:, 0].clone()  # [n_agent]
+        coarse_end_steps = torch.arange(self.shift, n_step, self.shift, device=device)
+        n_token_step = int(coarse_end_steps.numel())
+        if n_token_step == 0:
+            empty_bool = valid.new_zeros((n_agent, 0))
+            empty_idx = torch.zeros((n_agent, 0), device=device, dtype=torch.long)
+            empty_pos = pos.new_zeros((n_agent, 0, 2))
+            empty_heading = heading.new_zeros((n_agent, 0))
+            return {
+                "valid_mask": empty_bool,
+                "gt_idx": empty_idx,
+                "gt_pos": empty_pos,
+                "gt_heading": empty_heading,
+                "sampled_idx": empty_idx,
+                "sampled_pos": empty_pos,
+                "sampled_heading": empty_heading,
+            }
 
-        out_dict = {
-            "valid_mask": [],
-            "gt_idx": [],
-            "gt_pos": [],
-            "gt_heading": [],
-            "sampled_idx": [],
-            "sampled_pos": [],
-            "sampled_heading": [],
-        }
+        coarse_start_steps = coarse_end_steps - self.shift
+        window_offsets = torch.arange(self.shift + 1, device=device)
+        segment_step_index = coarse_start_steps.unsqueeze(1) + window_offsets.unsqueeze(0)
 
-        for i in range(self.shift, n_step, self.shift):
-            segment_valid_mask = valid[:, i - self.shift : i + 1].all(dim=1)
-            invalid_mask = ~segment_valid_mask
-            out_dict["valid_mask"].append(segment_valid_mask)
+        segment_valid_mask = valid[:, segment_step_index].all(dim=-1)
+        invalid_mask = ~segment_valid_mask
 
-            gt_contour_local = self._build_local_contour_sequence(
-                pos_seq=pos[:, i - self.shift : i + 1],
-                heading_seq=heading[:, i - self.shift : i + 1],
-                ref_pos=prev_pos,
-                ref_head=prev_head,
+        token_idx_gt = torch.zeros(
+            (n_agent, n_token_step),
+            device=device,
+            dtype=torch.long,
+        )
+        valid_flat = segment_valid_mask.reshape(-1)
+        if bool(valid_flat.any().item()):
+            gt_contour_local = self._build_local_contour_windows(
+                pos=pos,
+                heading=heading,
                 agent_shape=agent_shape,
+                coarse_start_steps=coarse_start_steps,
+                segment_step_index=segment_step_index,
             )
-            token_idx_gt = self._match_token_idx_from_local_contour(
-                agent_type=agent_type,
-                contour_local=gt_contour_local,
+            flat_agent_type = agent_type.unsqueeze(1).expand(-1, n_token_step).reshape(-1)
+            token_idx_gt_flat = token_idx_gt.reshape(-1)
+            token_idx_gt_flat[valid_flat] = self._match_token_idx_from_local_contour(
+                agent_type=flat_agent_type[valid_flat],
+                contour_local=gt_contour_local.reshape(
+                    n_agent * n_token_step,
+                    self.shift + 1,
+                    4,
+                    2,
+                )[valid_flat],
                 reduction="sum",
-            ).masked_fill(invalid_mask, 0)
+            )
+            token_idx_gt = token_idx_gt_flat.view(n_agent, n_token_step)
 
-            prev_head = heading[:, i].clone()
-            prev_pos = pos[:, i].clone()
+        gt_pos = pos[:, coarse_end_steps].masked_fill(invalid_mask.unsqueeze(-1), 0.0)
+        gt_heading = heading[:, coarse_end_steps].masked_fill(invalid_mask, 0.0)
 
-            out_dict["gt_idx"].append(token_idx_gt)
-            out_dict["gt_pos"].append(prev_pos.masked_fill(invalid_mask.unsqueeze(1), 0.0))
-            out_dict["gt_heading"].append(prev_head.masked_fill(invalid_mask, 0.0))
-            out_dict["sampled_idx"].append(out_dict["gt_idx"][-1])
-            out_dict["sampled_pos"].append(out_dict["gt_pos"][-1])
-            out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
-
-        return {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
+        return {
+            "valid_mask": segment_valid_mask,
+            "gt_idx": token_idx_gt,
+            "gt_pos": gt_pos,
+            "gt_heading": gt_heading,
+            "sampled_idx": token_idx_gt,
+            "sampled_pos": gt_pos,
+            "sampled_heading": gt_heading,
+        }
 
     def _build_agent_type_masks(self, agent_type: Tensor) -> Dict[str, Tensor]:
         """차종별 마스크를 한 번에 만듭니다.
@@ -430,6 +453,53 @@ class TokenProcessor(torch.nn.Module):
             head_now=ref_head,
         )
         return contour_local_flat.view(pos_seq.shape[0], pos_seq.shape[1], 4, 2)
+
+    def _build_local_contour_windows(
+        self,
+        pos: Tensor,
+        heading: Tensor,
+        agent_shape: Tensor,
+        coarse_start_steps: Tensor,
+        segment_step_index: Tensor,
+    ) -> Tensor:
+        """모든 coarse segment의 local contour를 한 번에 만듭니다.
+
+        Args:
+            pos: 전체 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전체 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            agent_shape: 토큰화에 쓰는 고정 가로, 세로 크기입니다.
+                shape은 ``[n_agent, 2]`` 입니다.
+            coarse_start_steps: 각 coarse segment의 시작 raw step입니다.
+                shape은 ``[n_token_step]`` 입니다.
+            segment_step_index: 각 coarse segment가 참조하는 raw step index입니다.
+                shape은 ``[n_token_step, shift + 1]`` 입니다.
+
+        Returns:
+            Tensor:
+                local 좌표의 사각형 경로입니다.
+                shape은 ``[n_agent, n_token_step, shift + 1, 4, 2]`` 입니다.
+        """
+        n_agent = pos.shape[0]
+        n_token_step = int(coarse_start_steps.numel())
+        n_seq = int(segment_step_index.shape[1])
+
+        pos_seq = pos[:, segment_step_index]
+        heading_seq = heading[:, segment_step_index]
+        contour_global = cal_polygon_contour(
+            pos=pos_seq,
+            head=heading_seq,
+            width_length=agent_shape[:, None, None],
+        )
+
+        ref_pos = pos[:, coarse_start_steps].reshape(n_agent * n_token_step, 2)
+        ref_head = heading[:, coarse_start_steps].reshape(n_agent * n_token_step)
+        contour_local_flat, _ = transform_to_local(
+            pos_global=contour_global.reshape(n_agent * n_token_step, n_seq * 4, 2),
+            head_global=None,
+            pos_now=ref_pos,
+            head_now=ref_head,
+        )
+        return contour_local_flat.view(n_agent, n_token_step, n_seq, 4, 2)
 
     def _match_token_idx_from_local_contour(
         self,
