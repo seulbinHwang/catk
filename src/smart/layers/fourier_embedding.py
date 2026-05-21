@@ -1,4 +1,5 @@
 import math
+import os
 from typing import List, Optional
 
 import torch
@@ -31,6 +32,10 @@ class FourierEmbedding(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
         )
+        self._compiled_embed_continuous = None
+        self._compile_continuous = os.environ.get(
+            "CATK_COMPILE_FOURIER_EMBEDDING", "1"
+        ).lower() not in {"0", "false", "off", "no"}
         self.apply(weight_init)
 
     def _embed_continuous_loop(self, continuous_inputs: torch.Tensor) -> torch.Tensor:
@@ -51,6 +56,22 @@ class FourierEmbedding(nn.Module):
             continuous_emb = continuous_emb + self.mlps[i](x[:, i])
         return continuous_emb
 
+    def _embed_continuous(self, continuous_inputs: torch.Tensor) -> torch.Tensor:
+        if not self._compile_continuous or not torch.cuda.is_available():
+            return self._embed_continuous_accumulated(continuous_inputs)
+        try:
+            if self._compiled_embed_continuous is None:
+                self._compiled_embed_continuous = torch.compile(
+                    self._embed_continuous_accumulated,
+                    dynamic=True,
+                    mode="reduce-overhead",
+                )
+            return self._compiled_embed_continuous(continuous_inputs)
+        except Exception:
+            self._compile_continuous = False
+            self._compiled_embed_continuous = None
+            return self._embed_continuous_accumulated(continuous_inputs)
+
     @staticmethod
     def _sum_embeddings(embs: List[torch.Tensor]) -> torch.Tensor:
         x = embs[0]
@@ -69,7 +90,7 @@ class FourierEmbedding(nn.Module):
             else:
                 raise ValueError("Both continuous_inputs and categorical_embs are None")
         else:
-            x = self._embed_continuous_accumulated(continuous_inputs)
+            x = self._embed_continuous(continuous_inputs)
             if categorical_embs is not None:
                 x = x + self._sum_embeddings(categorical_embs)
         return self.to_out(x)
