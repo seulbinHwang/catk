@@ -756,6 +756,13 @@ Agent trajectory token matching은 모든 coarse segment를 batched query로 묶
 
 이 peak memory 증가는 token matching 구간의 일시 버퍼 기준이며, H100 전체 메모리 대비 작습니다. 대신 token processor 병목 중 agent token matching 부분은 약 39% 줄어듭니다.
 
+Flow target 생성도 anchor 16개를 하나씩 반복하지 않고, 모든 anchor의 future mask / alignment filter / selected target gather를 batched tensor 연산으로 처리합니다. 동일 synthetic workload(`n_agent=1536`, `n_step=91`)에서 old anchor-loop reference와 비교했을 때 train/eval 모두 `flow_*_mask`, `flow_*_agent_type`, `flow_*_agent_length`는 exact match이고, `flow_*_clean_norm`, `flow_*_clean_metric_norm`의 최대 오차는 `0.0`이었습니다.
+
+| pod | 이전 `_build_flow_targets` | batched anchors | 변화 | peak allocated |
+|---|---:|---:|---:|---:|
+| `hsb-npc-training-2` | `80.73ms` | `62.57ms` | `-22.5%` | `645MiB -> 644MiB` |
+| `wo-pvc-2` | `76.26ms` | `61.40ms` | `-19.5%` | `645MiB -> 644MiB` |
+
 6-GPU heterogeneous run의 안전장치는 다음과 같습니다.
 
 - launcher는 `data.train_memory_balanced_batches=true`와 `trainer.use_distributed_sampler=false`를 항상 마지막 Hydra override로 고정합니다. 이 조합에서는 memory-balanced batch sampler가 `trainer.world_size=6`을 읽어 rank별 데이터를 나누므로, 6개 GPU가 같은 train sample을 반복해서 보는 사고를 막습니다.
