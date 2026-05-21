@@ -10,6 +10,10 @@ model_config:
   # Optional: set to flow-pretrain CPD value to log DPR (CPD/CPD_ref).
   # CPD/CES are always evaluated regardless of this value.
   wosac_cpd_reference: null
+  # Scenario behavior-diversity metric (val_closed/diversity/*) thresholds.
+  # 횡변위 좌/우 판정 임계값(m, 차선 반폭)과 정지 판정 평균 속도(m/s).
+  diversity_lat_threshold_m: 1.75
+  diversity_stop_speed_mps: 0.5
   n_batch_sim_agents_metric: 10
   sim_agents_metric_workers: 3
   # "real": 공식 TF SimAgents RMM (subprocess, 정확), "hard": PyTorch hard RMM (인-프로세스, 빠름)

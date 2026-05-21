@@ -18,11 +18,14 @@ import torch.nn.functional as F
 
 from src.smart.metrics import (
     HardSimAgentsMetrics,
+    ScenarioDiversityMetrics,
     SimAgentsMetrics,
     SimAgentsSubmission,
     WOSACDistributionMetrics,
+    log_and_reset_scenario_diversity_metric,
     log_and_reset_wosac_distribution_metric,
     minADE,
+    update_scenario_diversity_metric_from_model,
     update_wosac_distribution_metric_from_model,
 )
 from src.smart.metrics.flow_metrics import (
@@ -192,6 +195,13 @@ class SMARTFlow(LightningModule):
         self.test_wosac_distribution_metrics = WOSACDistributionMetrics(
             prefix="test",
             cpd_reference=wosac_cpd_reference,
+        )
+
+        # Generated scenario의 행동(intent) 수준 다양성 metric (CPD 와 함께 로깅).
+        self.scenario_diversity_metrics = ScenarioDiversityMetrics(
+            prefix="val_closed",
+            lat_threshold_m=float(getattr(model_config, "diversity_lat_threshold_m", 1.75)),
+            stop_speed_mps=float(getattr(model_config, "diversity_stop_speed_mps", 0.5)),
         )
 
         # OCSC / RoaD: per-step HardRMM 모니터링용 인-프로세스 metric 객체 (current + ref)
@@ -3481,6 +3491,12 @@ class SMARTFlow(LightningModule):
                 data=data,
                 pred_traj=pred_traj,
             )
+            update_scenario_diversity_metric_from_model(
+                model=self,
+                data=data,
+                pred_traj=pred_traj,
+                pred_head=pred_head,
+            )
 
             scenario_rollouts = None
             if self.sim_agents_submission.is_active:
@@ -3525,6 +3541,10 @@ class SMARTFlow(LightningModule):
         log_and_reset_wosac_distribution_metric(
             model=self,
             metric=self.wosac_distribution_metrics,
+        )
+        log_and_reset_scenario_diversity_metric(
+            model=self,
+            metric=self.scenario_diversity_metrics,
         )
         if self.val_open_loop:
             epoch_open_metrics = self._compute_and_reset_validation_metrics(
