@@ -201,7 +201,11 @@ class ModuleTimeProfilerCallback(Callback):
             torch.cuda.synchronize(self._device)
             for key, pairs in self._batch_events.items():
                 for start, end in pairs:
-                    self._totals_ms[key] += float(start.elapsed_time(end))
+                    try:
+                        elapsed_ms = float(start.elapsed_time(end))
+                    except RuntimeError:
+                        continue
+                    self._totals_ms[key] += elapsed_ms
                     self._counts[key] += 1
             self._profiled_batches += 1
             if self._profiled_batches >= self.profile_steps:
