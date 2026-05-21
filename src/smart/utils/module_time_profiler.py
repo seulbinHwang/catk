@@ -119,6 +119,7 @@ class ModuleTimeProfilerCallback(Callback):
             return
 
         self._device = pl_module.device
+        token_processor = pl_module.token_processor
         encoder = pl_module.encoder
         map_encoder = encoder.map_encoder
         agent_encoder = encoder.agent_encoder
@@ -148,6 +149,7 @@ class ModuleTimeProfilerCallback(Callback):
             agent_encoder.fusion_emb,
         ]
 
+        self._add_hooks("token_processor", [token_processor])
         self._add_hooks("map_encoder_total", [map_encoder])
         self._add_hooks("map_embedding_modules", map_embedding_modules)
         self._add_hooks("map_pt2pt_attention", map_attn)
@@ -160,6 +162,7 @@ class ModuleTimeProfilerCallback(Callback):
         self._add_hooks("training_loss", [pl_module.training_loss])
 
         self._params_by_category = {
+            "token_processor": self._unique_param_count([token_processor]),
             "map_encoder_total": self._unique_param_count([map_encoder]),
             "map_pt2pt_attention": self._unique_param_count(map_attn),
             "map_embedding_edge_build": self._unique_param_count(map_embedding_modules),
@@ -222,6 +225,7 @@ class ModuleTimeProfilerCallback(Callback):
                 "backward_ms": self._category_ms(category, "backward"),
             }
             for category in [
+                "token_processor",
                 "map_encoder_total",
                 "map_embedding_modules",
                 "map_pt2pt_attention",
@@ -263,6 +267,12 @@ class ModuleTimeProfilerCallback(Callback):
         agent_other_bwd = raw["agent_embedding_modules"]["backward_ms"]
 
         rows = [
+            row(
+                "token_processor",
+                raw["token_processor"]["forward_ms"],
+                raw["token_processor"]["backward_ms"],
+                self._params_by_category["token_processor"],
+            ),
             row(
                 "map_embedding_edge_build",
                 map_other_fwd,
