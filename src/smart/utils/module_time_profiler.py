@@ -24,11 +24,13 @@ class ModuleTimeProfilerCallback(Callback):
         warmup_steps: int = 10,
         profile_steps: int = 30,
         output_json: str | None = None,
+        write_all_ranks: bool = False,
     ) -> None:
         super().__init__()
         self.warmup_steps = int(warmup_steps)
         self.profile_steps = int(profile_steps)
         self.output_json = output_json
+        self.write_all_ranks = bool(write_all_ranks)
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._active = False
         self._seen_train_batches = 0
@@ -332,8 +334,20 @@ class ModuleTimeProfilerCallback(Callback):
         rows.append(other)
         return rows
 
+    def _rank_output_path(self, trainer: Trainer) -> Path:
+        if self.output_json is None:
+            raise ValueError("output_json is required to build profiler output path.")
+        output = Path(self.output_json)
+        if "{rank}" in str(output):
+            return Path(str(output).format(rank=int(trainer.global_rank)))
+        if self.write_all_ranks:
+            return output.with_name(
+                f"{output.stem}.rank{int(trainer.global_rank):02d}{output.suffix}"
+            )
+        return output
+
     def _dump_summary(self, trainer: Trainer) -> None:
-        if not trainer.is_global_zero:
+        if not self.write_all_ranks and not trainer.is_global_zero:
             return
         if not self._step_events:
             return
@@ -342,6 +356,8 @@ class ModuleTimeProfilerCallback(Callback):
         total_step_ms = sum(start.elapsed_time(end) for start, end in self._step_events)
         rows = self._derived_rows(total_step_ms=total_step_ms)
         payload = {
+            "global_rank": int(trainer.global_rank),
+            "world_size": int(trainer.world_size),
             "warmup_steps": self.warmup_steps,
             "profile_steps": self._profiled_batches,
             "total_step_ms": total_step_ms,
@@ -356,8 +372,9 @@ class ModuleTimeProfilerCallback(Callback):
             },
         }
         text = json.dumps(payload, indent=2, sort_keys=True)
-        rank_zero_info("[module_profiler] summary:\n" + text)
+        if trainer.is_global_zero:
+            rank_zero_info("[module_profiler] summary:\n" + text)
         if self.output_json:
-            output = Path(self.output_json)
+            output = self._rank_output_path(trainer)
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(text + "\n", encoding="utf-8")
