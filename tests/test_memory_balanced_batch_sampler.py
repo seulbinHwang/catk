@@ -172,6 +172,12 @@ def test_prebuild_force_removes_stale_lock_dir(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()
     _write_sample(raw_dir / "sample.pkl", agent_count=2, current_valid=1, map_count=3)
+    _write_sample(
+        raw_dir / ".catk_memory_balanced_metadata_v1.pkl",
+        agent_count=99,
+        current_valid=99,
+        map_count=99,
+    )
 
     cache_path = tmp_path / "metadata.pt"
     lock_path = memory_metadata_lock_path(cache_path)
@@ -196,6 +202,7 @@ def test_prebuild_force_removes_stale_lock_dir(tmp_path: Path) -> None:
     )
 
     assert "memory-balance metadata ready" in result.stdout
+    assert "samples=1" in result.stdout
     assert cache_path.is_file()
     assert not lock_path.exists()
 

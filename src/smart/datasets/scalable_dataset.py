@@ -22,7 +22,7 @@ from src.utils import RankedLogger
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
-def _is_cache_sample_path(path: Path) -> bool:
+def is_cache_sample_path(path: Path) -> bool:
     """Return true only for visible SMART scenario cache pickle files."""
 
     return path.is_file() and path.suffix == ".pkl" and not path.name.startswith(".")
@@ -43,7 +43,7 @@ class MultiDataset(Dataset):
         self._raw_paths = [
             p.as_posix()
             for p in sorted(raw_dir.glob("*.pkl"))
-            if _is_cache_sample_path(p)
+            if is_cache_sample_path(p)
         ]
         self._num_samples = len(self._raw_paths)
 
