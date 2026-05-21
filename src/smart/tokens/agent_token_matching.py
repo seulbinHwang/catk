@@ -4,7 +4,6 @@ from typing import Dict, Tuple
 
 import torch
 from torch import Tensor
-from torch.distributions import Categorical
 
 
 def build_agent_type_masks(agent_type: Tensor) -> Dict[str, Tensor]:
@@ -93,9 +92,6 @@ def match_token_idx_from_local_contour(
     token_bank_all_ped: Tensor,
     token_bank_all_cyc: Tensor,
     reduction: str,
-    num_k: int = 1,
-    sample_topk: bool = False,
-    sampling_temp: float | None = None,
 ) -> Tensor:
     """로컬 좌표의 coarse 경로 전체를 기준으로 토큰 번호를 고릅니다.
 
@@ -111,16 +107,13 @@ def match_token_idx_from_local_contour(
         token_bank_all_cyc: 자전거 토큰 은행입니다. shape은
             ``[n_token, 6, 4, 2]`` 또는 ``[n_token, 4, 2]`` 입니다.
         reduction: 점별 거리를 ``sum`` 또는 ``mean`` 으로 줄이는 방법입니다.
-        num_k: 샘플 후보 개수입니다.
-        sample_topk: True면 top-k 안에서 하나를 뽑습니다.
-        sampling_temp: top-k 샘플링에 쓰는 온도값입니다.
 
     Returns:
         Tensor:
             선택된 토큰 번호입니다. shape은 ``[n_agent]`` 입니다.
 
     Raises:
-        ValueError: reduction 값이 잘못됐거나 샘플링 온도가 없을 때 발생합니다.
+        ValueError: reduction 값이 잘못됐을 때 발생합니다.
     """
     token_idx = torch.zeros(
         agent_type.shape[0],
@@ -147,24 +140,6 @@ def match_token_idx_from_local_contour(
         )
         dist = _reduce_match_distance(dist=dist, reduction=reduction)
 
-        if sample_topk and (num_k > 1):
-            if sampling_temp is None:
-                raise ValueError("sampling_temp is required when sample_topk is True")
-            top_k = min(num_k, dist.shape[1])
-            topk_dists, topk_indices = torch.topk(
-                dist,
-                top_k,
-                dim=-1,
-                largest=False,
-                sorted=False,
-            )
-            topk_logits = (-1.0 * topk_dists) / sampling_temp
-            samples = Categorical(logits=topk_logits).sample()
-            token_idx[mask] = topk_indices[
-                torch.arange(samples.shape[0], device=samples.device),
-                samples,
-            ]
-        else:
-            token_idx[mask] = torch.argmin(dist, dim=-1)
+        token_idx[mask] = torch.argmin(dist, dim=-1)
 
     return token_idx

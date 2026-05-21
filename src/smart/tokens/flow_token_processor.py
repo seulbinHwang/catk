@@ -38,8 +38,6 @@ class FlowTokenProcessor(TokenProcessor):
         self,
         map_token_file: str,
         agent_token_file: str,
-        map_token_sampling,
-        agent_token_sampling,
         flow_window_steps: int = 20,
         use_prefix_valid_future_loss_mask: bool = False,
         use_kinematic_control_flow: bool = False,
@@ -55,8 +53,6 @@ class FlowTokenProcessor(TokenProcessor):
         super().__init__(
             map_token_file=map_token_file,
             agent_token_file=agent_token_file,
-            map_token_sampling=map_token_sampling,
-            agent_token_sampling=agent_token_sampling,
         )
         self.flow_window_steps = validate_flow_window_steps(
             flow_window_steps=flow_window_steps,

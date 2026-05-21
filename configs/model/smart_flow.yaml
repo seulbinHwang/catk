@@ -56,12 +56,6 @@ model_config:
     control_vehicle_yaw_scale_rad: 0.025
     control_pedestrian_yaw_scale_rad: 0.20
     control_cyclist_yaw_scale_rad: 0.06
-    map_token_sampling:
-      num_k: 1
-      temp: 1.0
-    agent_token_sampling:
-      num_k: 1
-      temp: 1.0
   validation_rollout_sampling:
     sample_steps: 32
     sample_method: euler
