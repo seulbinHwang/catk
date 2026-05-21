@@ -34,8 +34,6 @@ from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
 def build_train_agent_target_builder(
     train_max_num: int,
     train_use_eval_agent_selection: bool,
-    map_pt2pt_radius: Optional[float],
-    map_pt2pt_max_num_neighbors: int,
 ) -> BaseTransform:
     """학습용 agent 선택 규칙에 맞는 transform을 고릅니다.
 
@@ -50,15 +48,8 @@ def build_train_agent_target_builder(
         BaseTransform: 학습 데이터셋에 붙일 transform 객체입니다.
     """
     if train_use_eval_agent_selection:
-        return WaymoTargetBuilderVal(
-            map_pt2pt_radius=map_pt2pt_radius,
-            map_pt2pt_max_num_neighbors=map_pt2pt_max_num_neighbors,
-        )
-    return WaymoTargetBuilderTrain(
-        train_max_num,
-        map_pt2pt_radius=map_pt2pt_radius,
-        map_pt2pt_max_num_neighbors=map_pt2pt_max_num_neighbors,
-    )
+        return WaymoTargetBuilderVal()
+    return WaymoTargetBuilderTrain(train_max_num)
 
 
 class MultiDataModule(LightningDataModule):
@@ -88,8 +79,6 @@ class MultiDataModule(LightningDataModule):
         train_memory_balance_valid_agent_step_weight: float = 0.0,
         train_memory_balance_map_weight: float = 0.02,
         train_memory_balance_seed: int = 0,
-        map_pt2pt_cache_radius: Optional[float] = None,
-        map_pt2pt_cache_max_num_neighbors: int = 100,
     ) -> None:
         super(MultiDataModule, self).__init__()
         if not 0.0 < float(train_epoch_sample_fraction) <= 1.0:
@@ -118,12 +107,6 @@ class MultiDataModule(LightningDataModule):
         )
         self.train_memory_balance_map_weight = float(train_memory_balance_map_weight)
         self.train_memory_balance_seed = int(train_memory_balance_seed)
-        self.map_pt2pt_cache_radius = (
-            None if map_pt2pt_cache_radius is None else float(map_pt2pt_cache_radius)
-        )
-        self.map_pt2pt_cache_max_num_neighbors = int(
-            map_pt2pt_cache_max_num_neighbors
-        )
         self.shuffle = shuffle
         self.num_workers = num_workers
         self.prefetch_factor = prefetch_factor if num_workers > 0 else None
@@ -137,17 +120,9 @@ class MultiDataModule(LightningDataModule):
         self.train_transform = build_train_agent_target_builder(
             train_max_num=train_max_num,
             train_use_eval_agent_selection=train_use_eval_agent_selection,
-            map_pt2pt_radius=self.map_pt2pt_cache_radius,
-            map_pt2pt_max_num_neighbors=self.map_pt2pt_cache_max_num_neighbors,
         )
-        self.val_transform = WaymoTargetBuilderVal(
-            map_pt2pt_radius=self.map_pt2pt_cache_radius,
-            map_pt2pt_max_num_neighbors=self.map_pt2pt_cache_max_num_neighbors,
-        )
-        self.test_transform = WaymoTargetBuilderVal(
-            map_pt2pt_radius=self.map_pt2pt_cache_radius,
-            map_pt2pt_max_num_neighbors=self.map_pt2pt_cache_max_num_neighbors,
-        )
+        self.val_transform = WaymoTargetBuilderVal()
+        self.test_transform = WaymoTargetBuilderVal()
 
     def refresh_train_dataset(self, train_raw_dir: Optional[str] = None) -> None:
         """학습용 cache 폴더를 바꾼 뒤 train dataset을 다시 만듭니다.

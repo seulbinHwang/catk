@@ -30,8 +30,6 @@ from src.smart.utils import (
     wrap_angle,
 )
 
-MAP_PT2PT_EDGE_TYPE = ("map_save", "pt2pt", "map_save")
-
 
 class TokenProcessor(torch.nn.Module):
 
@@ -107,17 +105,6 @@ class TokenProcessor(torch.nn.Module):
             "light_type": data["pt_token"]["light_type"].long(),  # [n_pl]
             "batch": data["pt_token"]["batch"],  # [n_pl]
         }
-        if MAP_PT2PT_EDGE_TYPE in data.edge_types:
-            pt2pt_store = data[MAP_PT2PT_EDGE_TYPE]
-            if "edge_index" in pt2pt_store and "r_raw" in pt2pt_store:
-                tokenized_map["edge_index_pt2pt"] = pt2pt_store["edge_index"]
-                tokenized_map["r_pt2pt_raw"] = pt2pt_store["r_raw"]
-                if "radius" in pt2pt_store:
-                    tokenized_map["pt2pt_radius"] = pt2pt_store["radius"]
-                if "max_num_neighbors" in pt2pt_store:
-                    tokenized_map["pt2pt_max_num_neighbors"] = pt2pt_store[
-                        "max_num_neighbors"
-                    ]
         return tokenized_map
 
     def tokenize_agent(
