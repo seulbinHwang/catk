@@ -55,12 +55,6 @@ model_config:
     control_cyclist_yaw_scale_rad: 0.06
     # control-space 학습에서 GT -> control -> pose 복원 위치 오차가 이 값보다 큰 anchor는 학습에서 제외합니다.
     control_round_trip_max_position_error_m: 0.5
-    map_token_sampling:
-      num_k: 1
-      temp: 1.0
-    agent_token_sampling:
-      num_k: 1
-      temp: 1.0
   validation_rollout_sampling:
     sample_steps: 32
     sample_method: euler

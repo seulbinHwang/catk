@@ -182,12 +182,10 @@ class ModuleProfileCallback(Callback):
 
         def match_token_label(
             _instance: object,
-            args: tuple[object, ...],
-            kwargs: dict[str, object],
+            _args: tuple[object, ...],
+            _kwargs: dict[str, object],
         ) -> str:
-            sample_topk = kwargs.get("sample_topk", args[4] if len(args) > 4 else False)
-            suffix = "sample_topk" if bool(sample_topk) else "argmin"
-            return f"token_processor.detail.agent.match_token_idx.{suffix}"
+            return "token_processor.detail.agent.match_token_idx.argmin"
 
         method_specs: list[
             tuple[

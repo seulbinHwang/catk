@@ -16,9 +16,7 @@ import pickle
 from typing import Dict, Tuple
 
 import torch
-from omegaconf import DictConfig
 from torch import Tensor
-from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
 from src.smart.tokens.agent_token_matching import (
@@ -39,12 +37,8 @@ class TokenProcessor(torch.nn.Module):
         self,
         map_token_file: str,
         agent_token_file: str,
-        map_token_sampling: DictConfig,
-        agent_token_sampling: DictConfig,
     ) -> None:
         super(TokenProcessor, self).__init__()
-        self.map_token_sampling = map_token_sampling
-        self.agent_token_sampling = agent_token_sampling
         self.shift = 5
 
         module_dir = os.path.dirname(__file__)
@@ -99,20 +93,7 @@ class TokenProcessor(torch.nn.Module):
             dim=(-2, -1),
         )  # [n_pl, n_token]
 
-        if self.training and (self.map_token_sampling.num_k > 1):
-            topk_dists, topk_indices = torch.topk(
-                dist,
-                self.map_token_sampling.num_k,
-                dim=-1,
-                largest=False,
-                sorted=False,
-            )  # [n_pl, K]
-
-            topk_logits = (-1e-6 - topk_dists) / self.map_token_sampling.temp
-            _samples = Categorical(logits=topk_logits).sample()  # [n_pl] in K
-            token_idx = topk_indices[torch.arange(len(_samples)), _samples].contiguous()
-        else:
-            token_idx = torch.argmin(dist, dim=-1)
+        token_idx = torch.argmin(dist, dim=-1)
 
         tokenized_map = {
             "position": traj_pos[:, 0].contiguous(),  # [n_pl, 2]
@@ -325,13 +306,10 @@ class TokenProcessor(torch.nn.Module):
                 coarse 간격 기준의 정답 토큰과 샘플 토큰, 그리고 실제 coarse 상태를 담은 사전입니다.
                 모든 항목의 첫 차원은 ``n_agent`` 이고 두 번째 차원은 ``n_step_token`` 입니다.
         """
-        num_k = self.agent_token_sampling.num_k if self.training else 1
         _, n_step = valid.shape
 
         prev_pos = pos[:, 0].clone()  # [n_agent, 2]
         prev_head = heading[:, 0].clone()  # [n_agent]
-        prev_pos_sample = prev_pos.clone()
-        prev_head_sample = prev_head.clone()
 
         out_dict = {
             "valid_mask": [],
@@ -359,8 +337,6 @@ class TokenProcessor(torch.nn.Module):
                 agent_type=agent_type,
                 contour_local=gt_contour_local,
                 reduction="sum",
-                num_k=1,
-                sample_topk=False,
             ).masked_fill(invalid_mask, 0)
 
             prev_head = heading[:, i].clone()
@@ -370,39 +346,9 @@ class TokenProcessor(torch.nn.Module):
             out_dict["gt_pos"].append(prev_pos.masked_fill(invalid_mask.unsqueeze(1), 0.0))
             out_dict["gt_heading"].append(prev_head.masked_fill(invalid_mask, 0.0))
 
-            if num_k == 1:
-                out_dict["sampled_idx"].append(out_dict["gt_idx"][-1])
-                out_dict["sampled_pos"].append(out_dict["gt_pos"][-1])
-                out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
-                prev_pos_sample = pos[:, i].clone()
-                prev_head_sample = heading[:, i].clone()
-                continue
-
-            sampled_contour_local = self._build_local_contour_sequence(
-                pos_seq=pos[:, i - self.shift : i + 1],
-                heading_seq=heading[:, i - self.shift : i + 1],
-                ref_pos=prev_pos_sample,
-                ref_head=prev_head_sample,
-                agent_shape=agent_shape,
-            )
-            token_idx_sample = self._match_token_idx_from_local_contour(
-                agent_type=agent_type,
-                contour_local=sampled_contour_local,
-                reduction="mean",
-                num_k=num_k,
-                sample_topk=True,
-            ).masked_fill(invalid_mask, 0)
-
-            prev_head_sample = heading[:, i].clone()
-            prev_pos_sample = pos[:, i].clone()
-
-            out_dict["sampled_idx"].append(token_idx_sample)
-            out_dict["sampled_pos"].append(
-                prev_pos_sample.masked_fill(invalid_mask.unsqueeze(1), 0.0)
-            )
-            out_dict["sampled_heading"].append(
-                prev_head_sample.masked_fill(invalid_mask, 0.0)
-            )
+            out_dict["sampled_idx"].append(out_dict["gt_idx"][-1])
+            out_dict["sampled_pos"].append(out_dict["gt_pos"][-1])
+            out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
 
         return {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
 
@@ -487,8 +433,6 @@ class TokenProcessor(torch.nn.Module):
         agent_type: Tensor,
         contour_local: Tensor,
         reduction: str,
-        num_k: int,
-        sample_topk: bool,
     ) -> Tensor:
         """로컬 좌표에서 바로 토큰 번호를 고릅니다.
 
@@ -498,8 +442,6 @@ class TokenProcessor(torch.nn.Module):
                 기본 shape은 ``[n_agent, 6, 4, 2]`` 이고, 호환을 위해
                 ``[n_agent, 4, 2]`` 도 받을 수 있습니다.
             reduction: 점별 거리를 ``sum`` 또는 ``mean`` 으로 줄이는 방법입니다.
-            num_k: 샘플 후보 개수입니다.
-            sample_topk: True면 top-k 안에서 하나를 뽑고, False면 가장 가까운 하나만 고릅니다.
 
         Returns:
             Tensor:
@@ -512,9 +454,6 @@ class TokenProcessor(torch.nn.Module):
             token_bank_all_ped=self.agent_token_all_ped,
             token_bank_all_cyc=self.agent_token_all_cyc,
             reduction=reduction,
-            num_k=num_k,
-            sample_topk=sample_topk,
-            sampling_temp=float(self.agent_token_sampling.temp),
         )
 
     def _token_pose_from_index(

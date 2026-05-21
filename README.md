@@ -414,6 +414,8 @@ model.model_config.token_processor.use_prefix_valid_future_loss_mask=false  # fu
 - 이 옵션은 `FlowTokenProcessor`에서 학습 target을 만들 때 적용되므로 pretrain, 일반 fine tuning, self-forced fine tuning에서 같은 방식으로 동작합니다.
 - README 기준 cache를 그대로 만들었다면 cache 재생성은 필요 없습니다. pkl cache 자체에서 partial-valid agent/anchor를 직접 삭제한 경우에만 cache를 다시 만들어야 합니다.
 
+Map/agent trajectory token matching은 항상 deterministic argmin으로 수행합니다. 이전의 `map_token_sampling.num_k/temp`, `agent_token_sampling.num_k/temp` top-k sampling 옵션은 기본값 `num_k=1`에서 쓰이지 않던 경로였으므로 제거했습니다. 따라서 학습, fine tuning, validation, closed-loop inference, WOSAC submission 모두 같은 token matching 규칙을 사용합니다.
+
 기존 pretrained checkpoint를 prefix-valid 목표로 이어서 학습할 때는 `action=finetune`을 씁니다. 이 방식은 모델 weight만 불러오고 optimizer / scheduler는 새로 시작합니다. 모델 전체를 학습하려면 `model.model_config.finetune.enabled=false`를 유지합니다.
 
 #### H100 4GPU 단일 pod prefix-valid fine tuning

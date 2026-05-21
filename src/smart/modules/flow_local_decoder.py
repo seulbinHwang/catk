@@ -1137,8 +1137,6 @@ class ContinuousCommitBridge:
             token_bank_all_ped=token_bank_all_ped,
             token_bank_all_cyc=token_bank_all_cyc,
             reduction="sum",
-            num_k=1,
-            sample_topk=False,
         )
 
     def restore_token_state(
@@ -1282,8 +1280,6 @@ class ContinuousCommitBridge:
             token_bank_all_ped=token_bank_all_ped,
             token_bank_all_cyc=token_bank_all_cyc,
             reduction="sum",
-            num_k=1,
-            sample_topk=False,
         )
         return raw_token_idx, raw_token_idx == stop_token_idx
 
