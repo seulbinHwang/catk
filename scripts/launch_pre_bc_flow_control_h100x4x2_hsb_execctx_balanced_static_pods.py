@@ -24,7 +24,7 @@ BASE_LAUNCHER = Path(__file__).with_name(
 DEFAULT_PODS = ("hsb-npc-training", "hsb-npc-training-2")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4x2_execctx_balanced"
 DEFAULT_TASK_NAME = (
-    "flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26"
+    "flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs20"
 )
 DEFAULT_SESSION = "catk-control-pretrain-h100x4x2-execctx-balanced"
 DEFAULT_METADATA_CACHE_RELATIVE = "dataset_metadata/womd_training_memory_balance_v1.pt"
@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--initial-bs", type=int, default=26)
+    parser.add_argument("--initial-bs", type=int, default=20)
     parser.add_argument("--oom-step", type=int, default=0)
     parser.add_argument(
         "--max-oom-attempts",
@@ -141,7 +141,7 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help=(
             "Stop after this many OOM attempts. The default keeps "
-            "train_batch_size=26 for three OOM attempts, then exits cleanly."
+            "train_batch_size=20 for three OOM attempts, then exits cleanly."
         ),
     )
     parser.add_argument("--min-bs", type=int, default=20)

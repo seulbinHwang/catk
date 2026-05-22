@@ -636,15 +636,15 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_p
 | GPU 구성 | H100 4장 x 2 pod = 8 GPU |
 | launcher | `scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_pods.py` |
 | experiment config | `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml` |
-| task name | `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26` |
+| task name | `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs20` |
 | tmux session | `catk-control-pretrain-h100x4x2-execctx-balanced` |
-| per-GPU batch | `26` |
-| effective global batch | `26 x 8 = 208` |
+| per-GPU batch | `20` |
+| effective global batch | `20 x 8 = 160` |
 | learning rate | `6e-4` |
 | flow horizon | `20` steps = 2초 |
 | 핵심 supervision | `use_kinematic_control_flow=true`, prefix-valid future loss, execution-context aligned trajectory |
 | outlier filter | vehicle `2.0m`, cyclist `2.0m` |
-| OOM 완화 | agent 수 기반 memory-balanced batch sampler, OOM 시 batch를 낮추지 않고 `26 -> 26 -> 26`까지 재시도 후 종료 |
+| OOM 완화 | agent 수 기반 memory-balanced batch sampler, OOM 시 batch를 낮추지 않고 `20 -> 20 -> 20`까지 재시도 후 종료 |
 | metadata 정책 | `--prebuild-metadata`로 sampler metadata를 먼저 만들고, 학습 중 missing build는 금지 |
 
 핵심 Hydra 설정은 다음으로 고정됩니다.
@@ -667,6 +667,7 @@ model:
         cyclist_max_error_m: 2.0
 
 data:
+  train_batch_size: 20
   train_use_eval_agent_selection: true
   train_memory_balanced_batches: true
   train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
@@ -678,7 +679,7 @@ trainer:
 
 `--prebuild-metadata`는 각 pod의 SMART cache training split을 읽어서 memory-balanced sampler용 metadata만 미리 만듭니다. SMART cache 파일 자체는 수정하지 않습니다. 이 preset은 학습 중 metadata build가 조용히 오래 도는 것을 막기 위해 `train_memory_balance_build_on_missing=false`를 쓰므로, metadata cache가 없는 첫 실행에서는 `--prebuild-metadata`를 반드시 함께 줍니다. launcher는 `--prebuild-metadata` 없이 실행될 때 각 pod에서 metadata cache 파일이 보이는지 먼저 확인하고, 없으면 학습을 시작하기 전에 실패합니다. metadata 위치를 바꾸려면 `--metadata-cache-path /abs/path/to/cache.pt`를 쓰면 되고, launcher가 prebuild `--cache-path`와 training `data.train_memory_balance_metadata_cache` override를 같은 경로로 맞춥니다. 이전 metadata build가 비정상 종료되어 `.lock`만 남아 있으면 `--force-metadata`를 추가해 stale lock을 정리한 뒤 다시 생성합니다. 실제 build가 돌고 있는 중에는 `--force-metadata`를 쓰지 않습니다.
 
-기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs26`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2-execctx-balanced`입니다. 기본 `train_batch_size=26`, 8 GPU 기준 effective global batch는 `208`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 최신 `epoch_last.ckpt`를 기준으로 resume하지만, effective batch를 유지하기 위해 batch size는 낮추지 않습니다. 기본 OOM 정책은 `--oom-step=0 --max-oom-attempts=3`이며, `26 -> 26 -> 26` 세 번 모두 OOM이면 더 이상 재시도하지 않고 우아하게 종료합니다.
+기본 실험 이름은 `flow_control_space_pretrain_h100x4x2_execctx_prefix_balanced_lr6e-4_bs20`이고, tmux session 이름은 `catk-control-pretrain-h100x4x2-execctx-balanced`입니다. 기본 `train_batch_size=20`, 8 GPU 기준 effective global batch는 `160`입니다. CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 최신 `epoch_last.ckpt`를 기준으로 resume하지만, effective batch를 유지하기 위해 batch size는 낮추지 않습니다. 기본 OOM 정책은 `--oom-step=0 --max-oom-attempts=3`이며, `20 -> 20 -> 20` 세 번 모두 OOM이면 더 이상 재시도하지 않고 우아하게 종료합니다.
 
 tmux 확인:
 
@@ -740,9 +741,8 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_stati
 | per-GPU batch | probe 결과 | global batch | 속도 | peak reserved | 64 epoch train-only 추정 | 판단 |
 |---:|---|---:|---:|---:|---:|---|
 | 12 | 40 step 성공 | 72 | 0.97 it/s | 57.19% | 123.97 h / 5.17 d | 안정적이지만 느림 |
-| 20 | 80 step 성공 | 120 | 0.69 it/s | 91.88% | 104.38 h / 4.35 d | 기본값 |
-| 21 | 80 step 성공 | 126 | 0.65 it/s | 94.94% | 105.89 h / 4.41 d | 더 크지만 더 느리고 여유가 작음 |
-| 22 | 40 step 성공 | 132 | 0.63 it/s | 98.36% | 103.79 h / 4.32 d | 장기 학습 OOM 위험이 큼 |
+| 20 | 50 step 성공 | 120 | 1.08 it/s | 75.18 GiB reserved (~95.0%) | 약 67.1 h / 2.80 d | 기본값 |
+| 21 | 약 4 step 후 OOM | 126 | - | OOM 직전 76.51 GiB reserved (~96.7%) | - | 제외 |
 | 26 | train forward 중 OOM | 156 | - | 약 79GB 사용 후 OOM | - | 제외 |
 
 따라서 이 6-GPU 조합에서는 `train_batch_size=20`이 안정성과 완료 속도의 균형이 가장 좋습니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다.
