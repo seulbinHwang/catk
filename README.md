@@ -324,53 +324,23 @@ batch capacity를 다시 측정했다. training cache `486,996`개 기준으로 
 fp32 graph attention 기본 적용과 batch 14가 모두 OOM 위험을 키우므로 기본값은 안정성을
 우선해 `CATK_ATTENTION_GRAPH_FP32=0`, batch 13으로 둔다.
 
-#### Relation K/V projection compile 최적화
+#### relation KV compile 최적화 제외
 
-`AttentionLayer`의 relation K/V projection 경로는 기본적으로 compile-friendly 함수로 분리되어 있다.
-구체적으로 `attn_prenorm_r -> to_k_r/to_v_r -> view` 계산을 `_relation_kv_project()`에서 처리하고,
-CUDA에서는 `CATK_COMPILE_ATTENTION_RELATION_KV`가 꺼져 있지 않으면
-`torch.compile(dynamic=True, mode="reduce-overhead")`로 한 번 compile해서 재사용한다.
+A100x4x2 `testa/testaa` 기준으로 relation K/V projection compile 최적화는 기본 경로에서
+사용하지 않는다. 해당 방식은 수식 자체를 바꾸지는 않지만, 현재 A100 pretrain의 end-to-end
+training-only 시간 기준으로 이득이 확인되지 않았고 오히려 총 학습 시간이 늘어나는 쪽으로
+관측됐다. 따라서 `AttentionLayer`는 relation feature를 기존 PyG `MessagePassing` 경로 안에서
+직접 `to_k_r` / `to_v_r`로 projection한다. `CATK_COMPILE_ATTENTION_RELATION_KV` 같은 별도
+compile toggle은 제공하지 않는다.
 
-이 변경은 아래 항목을 바꾸지 않는다.
-
-- 모델 구조와 파라미터 수
-- edge set, radius, neighbor 수
-- destination별 softmax 단위
-- dropout, loss target, optimizer 설정
-- `CATK_ATTENTION_GRAPH_FP32` 기본값
-
-비활성화가 필요하면 실행 환경에 아래를 지정한다.
-
-```bash
-export CATK_COMPILE_ATTENTION_RELATION_KV=0
-```
-
-A100x4x2 `testa/testaa`에서 `experiment=pre_bc_a100x4x2`, validation off,
-`CATK_ATTENTION_GRAPH_FP32=0`, `data.train_use_eval_agent_selection=true` 조건으로 확인한 결과는 아래와 같다.
-첫 step compile overhead는 장기 pretrain에서 amortize되므로, 예상 시간은 steady-state 기준으로 계산했다.
-
-| 조건 | batch | 결과 | steady-state 속도 | 64epoch train-only 추정 | 메모리/OOM |
-|---|---:|---|---:|---:|---|
-| 적용 전 | 18 | 실패 | - | - | 122/160 step 부근 OOM |
-| 적용 전 | 16 | 성공 | `0.476 it/s` | 약 `142.1 h` | 통과 |
-| 적용 후 | 16 | 성공 | `0.514 it/s` | 약 `131.5 h` | 통과 |
-| 적용 후 | 18 | 성공 | `0.476 it/s` | 약 `126.3 h` | sampled max 약 `74.3 GiB`, OOM 없음 |
-
-적용 전후 수식 근접성은 별도 CUDA smoke로 확인했다.
-
-| 비교 | 결과 |
-|---|---:|
-| 기존 eager vs 최적화 eager output max diff | `1.1920928955078125e-06` |
-| 기존 eager vs 최적화 eager gradient max diff | `2.7939677238464355e-09` |
-| compile path finite smoke | 통과 |
-
-따라서 이 최적화는 A100 pretrain에서도 채택한다. 적용 후에는 batch16 기준 속도도 개선됐고,
-baseline에서 OOM이었던 batch18도 통과해 train-only 예상 시간이 약 `142.1 h -> 126.3 h`로 줄었다.
-
-현재 A100x4x2 `testa/testaa` pretrain 기본값은 `CATK_ATTENTION_GRAPH_FP32=0`,
-`data.train_use_eval_agent_selection=true`, `data.train_batch_size=13`이다. 위 시간은 train-only 추정이며,
-`check_val_every_n_epoch=16` validation과 checkpoint overhead는 별도로 더해진다. RMM checkpoint 선택용 fast scorer는
-`model.model_config.scorer_scene_num=1680`을 기준으로 validation batch 수를 자동 계산한다.
+따라서 현재 A100x4x2 `testa/testaa` pretrain 기본값은
+`CATK_ATTENTION_GRAPH_FP32=0`, `data.train_use_eval_agent_selection=true`,
+`data.train_batch_size=13`이다. 위 시간은 train-only 추정이며,
+`check_val_every_n_epoch=16` validation과 checkpoint overhead는 별도로 더해진다.
+RMM checkpoint 선택용 fast scorer는 `model.model_config.scorer_scene_num=1680`을 기준으로
+validation batch 수를 자동 계산한다. A100x4x2 기본 `val_batch_size=13`, world size 8에서는
+rank당 17 batch, 전체 약 1680개 scenario가 RMM 계산에 들어간다. 64 epoch 학습에서는
+validation이 16 epoch마다 실행되어 총 4번의 checkpoint 후보를 만든다.
 
 기본 cache root는 pod별로 다르다.
 
