@@ -133,6 +133,7 @@ def remote_git_prepare_script(args: argparse.Namespace) -> str:
         return " && ".join(
             [
                 f"git config --global --add safe.directory {shq(args.project_root)} || true",
+                f"git update-ref -d {shq(f'refs/remotes/origin/{args.branch}')} || true",
                 f"git fetch origin --prune {shq(fetch_refspec)}",
                 f"git checkout -f {shq(args.git_ref)}",
             ]
@@ -142,6 +143,7 @@ def remote_git_prepare_script(args: argparse.Namespace) -> str:
     return " && ".join(
         [
             f"git config --global --add safe.directory {shq(args.project_root)} || true",
+            f"git update-ref -d {shq(f'refs/remotes/origin/{args.branch}')} || true",
             f"git fetch origin --prune {shq(fetch_refspec)}",
             (
                 f"if git show-ref --verify --quiet {shq(branch_ref)}; then "
