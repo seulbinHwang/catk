@@ -683,6 +683,48 @@ kubectl exec -it -n p-pnc wo-pvc -c main -- tmux attach -t catk-control-pretrain
 python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --stop
 ```
 
+#### hsb-npc-training-2/wo-pvc-2 H100x4+H100x2 prefix-valid default no-slip ratio pretrain
+
+`hsb-npc-training-2`의 H100 4장과 `wo-pvc-2`의 H100 2장을 묶어 같은 `semi_control_stable` control-space pretrain을 돌릴 때는 아래 전용 wrapper를 씁니다. 이 wrapper도 기존 running pod 안의 tmux session과 학습 프로세스만 만들거나 교체하며, pod를 새로 만들거나 재시작하지 않습니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_hsb2_wo2_prefix_default_noslip_static_pods.py --replace
+```
+
+실행 전에 실제 pod, branch, task name, metadata cache 경로, retry wrapper 환경을 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_hsb2_wo2_prefix_default_noslip_static_pods.py --dry-run --replace
+```
+
+기본 설정:
+
+| 항목 | 설정 |
+|---|---|
+| pod / GPU | `hsb-npc-training-2` 4 H100 + `wo-pvc-2` 2 H100 = 총 6 rank |
+| config | `configs/experiment/pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip.yaml` |
+| cache root | 두 pod 모두 `/workspace/womd_v1_3/SMART_cache` |
+| task name | `flow_control_space_pretrain_h100x4_h100x2_hsb2_wo2_prefix_default_noslip_lr6e-4_bs18` |
+| tmux session | `catk-control-pretrain-h100x4-h100x2-hsb2-wo2-prefix-default-noslip` |
+| 시작 batch / lr | per-rank `train_batch_size=18`, effective global batch `108`, `lr=6e-4` |
+| OOM fallback | CUDA OOM 감지 시 최신 rank-0 `epoch_last.ckpt` 또는 `last.ckpt`에서 resume하며 `18 -> 17 -> 16 -> ... -> 12` 순서로 1씩 낮춤 |
+| metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_h100x6_hsb2_wo2.pt` preflight 생성/검증 |
+
+OOM fallback은 학습 수식이나 데이터 선택 규칙을 바꾸지 않고, 실패한 시점 이후 최신 저장 checkpoint를 기준으로 재시작합니다. 단, checkpoint는 epoch 마지막 기준으로 저장되므로 OOM 직전 mini-batch까지 완전히 이어지는 것은 아니며, 저장된 최신 `epoch_last.ckpt` 또는 `last.ckpt` 기준으로 resume합니다. `bs=18`이 장기 학습에서 안정적이면 그대로 진행하고, OOM이 실제로 발생한 경우에만 batch를 1씩 낮춥니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-hsb2-wo2-prefix-default-noslip
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-hsb2-wo2-prefix-default-noslip
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_hsb2_wo2_prefix_default_noslip_static_pods.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`, round-trip filter `0.5m`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
