@@ -141,9 +141,9 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh
 ```
 
 이 wrapper는 `scripts/launch_smart_ntp_a100x4x2_testa.py`를 호출하며, 기본
-`TRAIN_BATCH_SIZE=15`와 task name
-`smart_ntp_pretrain_a100x4x2_bs15_main`을 사용한다. 다른 batch를 실험하려면
-`TRAIN_BATCH_SIZE=16 bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh`
+`TRAIN_BATCH_SIZE=13`과 task name
+`smart_ntp_pretrain_a100x4x2_bs13_main`을 사용한다. 다른 batch를 실험하려면
+`TRAIN_BATCH_SIZE=14 bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh`
 처럼 환경 변수로 넘긴다.
 
 장기 학습 중 CUDA OOM이 나면 batch를 자동으로 낮춰 이어가야 하므로, 실험을 계속 살리는
@@ -186,7 +186,7 @@ bash scripts/start_smart_ntp_h100x4_h100x2_pretrain.sh
 ```
 
 이 wrapper는 `scripts/launch_smart_ntp_h100x4_h100x2.py`를 호출하며, 기본 task name은
-`smart_ntp_pretrain_h100x4_h100x2_bs15_main`이다. 기본 cache root는 두 pod 모두
+`smart_ntp_pretrain_h100x4_h100x2_bs13_main`이다. 기본 cache root는 두 pod 모두
 `/workspace/womd_v1_3/SMART_cache`이고, 기본 experiment는 기존 A100x4x2와 같은
 `pre_bc_a100x4x2`이다. 즉 SMART NTP 모델, tokenization, loss, validation scorer,
 memory-balanced sampler 설정은 유지하고, 실행 pod/GPU 배치만 `4 + 2`로 바꾼다.
@@ -205,8 +205,8 @@ validation sharding은 launcher가 export한 실제 `WORLD_SIZE=6` 기준으로 
 | pod / GPU | `hsb-npc-training` 4GPU + `wo-pvc` 2GPU |
 | total DDP ranks | 6 |
 | experiment | `pre_bc_a100x4x2` |
-| per-rank batch | `data.train_batch_size=15` |
-| effective global batch | 90 |
+| per-rank batch | `data.train_batch_size=13` |
+| effective global batch | 78 |
 | precision | `bf16-mixed` |
 | lr / warmup / min ratio | `6e-4` / `4` / `1e-2` |
 | validation | `scorer_scene_num=1680`, `check_val_every_n_epoch=16` |
@@ -215,7 +215,7 @@ validation sharding은 launcher가 export한 실제 `WORLD_SIZE=6` 기준으로 
 같은 per-rank batch를 바꾸려면 A100 wrapper와 동일하게 환경 변수로 넘긴다.
 
 ```bash
-TRAIN_BATCH_SIZE=16 bash scripts/start_smart_ntp_h100x4_h100x2_pretrain.sh
+TRAIN_BATCH_SIZE=14 bash scripts/start_smart_ntp_h100x4_h100x2_pretrain.sh
 ```
 
 실행 중 tmux에 붙으려면 아래 명령을 사용한다.
@@ -230,7 +230,7 @@ kubectl exec -it -n p-pnc wo-pvc -c main -- tmux attach -t catk-smart-ntp-h100x4
 ```bash
 python scripts/launch_smart_ntp_h100x4_h100x2.py \
   --stop \
-  --task-name smart_ntp_pretrain_h100x4_h100x2_bs15_main
+  --task-name smart_ntp_pretrain_h100x4_h100x2_bs13_main
 ```
 
 기본 experiment는 `configs/experiment/pre_bc_a100x4x2.yaml`이다. 이 config는
@@ -241,13 +241,13 @@ deterministic nearest-token tokenization, agent selection, `num_freq_bands: 66`
 위해 아래 training/runtime 값만 명시한다.
 
 - `trainer.devices: 4`, `trainer.num_nodes: 2`
-- `data.train_batch_size: 15`, 즉 8개 rank 기준 effective global batch 120
+- `data.train_batch_size: 13`, 즉 8개 rank 기준 effective global batch 104
 - `model.model_config.lr: 6e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
 - `model.model_config.scorer_scene_num: 1680`
 - `trainer.max_epochs: 64`, `check_val_every_n_epoch: 16`
 - `trainer.precision: bf16-mixed`, `gradient_clip_val: 1.0`,
   `accumulate_grad_batches: 1`
-- `data.val_batch_size: 15`, `data.test_batch_size: 15`, `num_workers: 4`
+- `data.val_batch_size: 13`, `data.test_batch_size: 13`, `num_workers: 4`
 - `data.train_memory_balanced_batching: true`,
   `trainer.use_distributed_sampler: false`
 
@@ -273,7 +273,7 @@ attention 내부 계산 dtype 경계뿐이다.
 이 preset은 `data.train_memory_balanced_batching=true`도 켠다. 이 sampler는 각 training
 pickle의 agent 수, valid agent-step 수, map point 수를 metadata cache로 한 번 기록한 뒤,
 agent가 많은 scene이 같은 rank-local batch에 몰리지 않도록 batch 순서만 다시 짠다.
-학습 objective, 모델 구조, per-GPU `train_batch_size=15`, 전체 effective batch 120은
+학습 objective, 모델 구조, per-GPU `train_batch_size=13`, 전체 effective batch 104는
 그대로 유지된다. 대신 random shuffle 순서가 바뀌므로 기존 run을 resume하더라도 bitwise로
 완전히 같은 sample 순서는 아니다.
 
@@ -305,32 +305,27 @@ build 중 pod가 죽어 `.lock` 파일만 남은 경우에는 lock heartbeat가 
 검증할 수 있는 범위인 `24` 이하의 양의 정수만 허용한다. `--accumulate-grad-batches 2`처럼
 gradient accumulation을 켜는 override는 학습을 시작하기 전에 실패한다.
 
-`main@99e052e`, `testa/testaa`, A100 4장 x 2 pod, validation off, 200 train step,
+`main@7dd61c4`, `testa/testaa`, A100 4장 x 2 pod, validation off,
 `CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=true` 조건에서
 batch capacity를 다시 측정했다. training cache `486,996`개 기준으로 64 epoch train-only
 시간을 추정하면 아래와 같다.
 
-| per-GPU batch | 결과 | 200-step 시간 | 속도 | 관측 peak memory | 64 epoch train-only 예상 |
+| per-GPU batch | 결과 | 500-step 시간 | 속도 | 관측 peak memory | 64 epoch train-only 예상 |
 |---:|---|---:|---:|---:|---:|
-| 12 | 통과 | `3:19` | `1.00 it/s` | `62,827 MiB` | 약 `89.7시간` |
-| 13 | 통과 | `3:33` | `0.93 it/s` | `66,721 MiB` | 약 `88.7시간` |
-| 14 | 통과 | `3:47` | `0.88 it/s` | `69,573 MiB` | 약 `87.8시간` |
-| 15 | 통과 | `4:03` | `0.82 it/s` | `78,069 MiB` | 약 `87.7시간` |
-| 16 | 200-step 통과, 장기 OOM 위험 큼 | `4:17` | `0.78 it/s` | `79,929 MiB` | 약 `86.9시간` |
-| 17 | CUDA OOM | step 29에서 실패 | `0.74 it/s` | `80,949 MiB` | 사용 안 함 |
+| 13 | 통과 | `7:05` | `1.17 it/s` | `79,267 MiB` | 약 `71.2시간` |
+| 14 | CUDA OOM | step 205에서 실패 | `1.07 it/s` | `80,747 MiB` | 사용 안 함 |
 
-batch 16은 200-step smoke에서는 가장 빠르지만 A100 80GB에서 남는 메모리가 약 2 GiB뿐이고,
-바로 다음 batch 17은 같은 조건에서 CUDA OOM이 났다. 장기 pretrain 기본값은 안정성을 우선해
-batch 15로 둔다. batch 15는 batch 16보다 train-only 예상 시간이 약 0.8시간 길지만,
-관측 peak memory 여유가 약 3.8 GiB로 더 크다.
+`7dd61c4`의 Fourier embedding compile 경로는 step 속도를 크게 줄이지만 peak memory도
+늘린다. A100 80GB 장기 pretrain에서는 batch 14가 OOM이므로, 기본값은 안정성을 우선해
+batch 13으로 둔다.
 
 따라서 현재 A100x4x2 `testa/testaa` pretrain 기본값은
 `CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=true`,
-`data.train_batch_size=15`이다. 위 시간은 train-only 추정이며,
+`data.train_batch_size=13`이다. 위 시간은 train-only 추정이며,
 `check_val_every_n_epoch=16` validation과 checkpoint overhead는 별도로 더해진다.
 RMM checkpoint 선택용 fast scorer는 `model.model_config.scorer_scene_num=1680`을 기준으로
-validation batch 수를 자동 계산한다. A100x4x2 기본 `val_batch_size=15`, world size 8에서는
-rank당 14 batch, 전체 약 1680개 scenario가 RMM 계산에 들어간다. 64 epoch 학습에서는
+validation batch 수를 자동 계산한다. A100x4x2 기본 `val_batch_size=13`, world size 8에서는
+rank당 17 batch, 전체 약 1680개 scenario가 RMM 계산에 들어간다. 64 epoch 학습에서는
 validation이 16 epoch마다 실행되어 총 4번의 checkpoint 후보를 만든다.
 
 기본 cache root는 pod별로 다르다.
