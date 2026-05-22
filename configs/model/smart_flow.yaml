@@ -8,6 +8,10 @@ model_config:
   # Optional: set this to the flow-pretrain CPD value only when you want DPR.
   # CPD/CES are always evaluated regardless of this value.
   wosac_cpd_reference: null
+  # Fixed WOSAC-CPD/CES normalization scale from the training cache.
+  # Order: vehicle, pedestrian, cyclist. Validation/test metrics use this
+  # value first; if it is null, validation falls back to GT-derived scale.
+  wosac_distribution_type_scale: [22.3461620418, 4.5793447978, 18.5374388830]
   n_batch_sim_agents_metric: 10
   # Positive values auto-set n_batch_sim_agents_metric from world_size and
   # val_batch_size so scorer work is comparable across GPU counts. Set null or

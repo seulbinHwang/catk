@@ -1912,6 +1912,16 @@ closed-loop validation과 Sim Agents submission export에서는 모델이 실제
 - `test/WOSAC-CPD/value`: test submission export에서 계산되는 CPD입니다. test set은 GT 미래를 제공하지 않으므로 CES는 기록하지 않습니다.
 - `*/WOSAC-CPD/DPR`: `model.model_config.wosac_cpd_reference`에 flow-pretrain CPD를 넣었을 때만 기록됩니다. 값은 `현재 CPD / 기준 CPD` 입니다.
 
+CPD/CES 정규화 scale은 기본적으로 training cache 전체에서 offline 계산한 agent type별 고정값을 사용합니다. 순서는 `vehicle`, `pedestrian`, `cyclist`입니다.
+
+```yaml
+model:
+  model_config:
+    wosac_distribution_type_scale: [22.3461620418, 4.5793447978, 18.5374388830]
+```
+
+고정 scale이 있으면 validation/test CPD/CES는 항상 이 값을 우선 사용합니다. 그래서 `val_closed/WOSAC-CPD/value`와 `test/WOSAC-CPD/value`가 같은 normalization 기준을 공유합니다. `model.model_config.wosac_distribution_type_scale=null`로 명시하면 기존 동작처럼 validation GT에서 scale을 fallback 계산합니다. Test split에는 GT future가 없으므로 고정 scale이 없을 때는 test CPD가 raw 단위로 계산됩니다.
+
 이 metric들은 학습 step에서는 계산하지 않고, validation/test closed-loop rollout이 만들어진 뒤에만 계산합니다. `n_rollout_closed_val`이 16이면 이미 생성된 16개 rollout만 사용하고 별도 rollout을 추가 생성하지 않습니다.
 
 ### Self-forced Generated Estimator Warmup

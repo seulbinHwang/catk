@@ -142,13 +142,20 @@ class SMARTFlow(LightningModule):
         )
         self.sim_agents_submission = SimAgentsSubmission(**model_config.sim_agents_submission)
         wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
+        wosac_distribution_type_scale = getattr(
+            model_config,
+            "wosac_distribution_type_scale",
+            None,
+        )
         self.wosac_distribution_metrics = WOSACDistributionMetrics(
             prefix="val_closed",
             cpd_reference=wosac_cpd_reference,
+            type_scale=wosac_distribution_type_scale,
         )
         self.test_wosac_distribution_metrics = WOSACDistributionMetrics(
             prefix="test",
             cpd_reference=wosac_cpd_reference,
+            type_scale=wosac_distribution_type_scale,
         )
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
