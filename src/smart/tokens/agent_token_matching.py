@@ -88,6 +88,31 @@ def _reduce_match_distance(dist: Tensor, reduction: str) -> Tensor:
     raise ValueError(f"Unsupported reduction: {reduction}")
 
 
+def _flatten_match_xy(points: Tensor) -> Tuple[Tensor, Tensor]:
+    """매칭용 점 좌표를 x/y별 contiguous matrix로 펼칩니다."""
+    return (
+        points[..., 0].flatten(1).contiguous(),
+        points[..., 1].flatten(1).contiguous(),
+    )
+
+
+def _match_token_idx_from_flat_xy(
+    token_x: Tensor,
+    token_y: Tensor,
+    contour_x: Tensor,
+    contour_y: Tensor,
+    reduction: str,
+) -> Tensor:
+    if reduction not in {"sum", "mean"}:
+        raise ValueError(f"Unsupported reduction: {reduction}")
+    dx = contour_x.unsqueeze(1) - token_x.unsqueeze(0)
+    dx.square_()
+    dy = contour_y.unsqueeze(1) - token_y.unsqueeze(0)
+    dx.addcmul_(dy, dy)
+    dx.sqrt_()
+    return torch.argmin(dx.sum(dim=-1), dim=-1)
+
+
 def match_token_idx_from_local_contour(
     agent_type: Tensor,
     contour_local: Tensor,
@@ -144,15 +169,20 @@ def match_token_idx_from_local_contour(
             token_bank=token_banks[token_key],
             contour_local=contour_local[mask],
         )
+        token_x, token_y = _flatten_match_xy(token_bank)
         matched_chunks = []
         for start in range(0, contour_local_masked.shape[0], query_chunk_size):
             contour_chunk = contour_local_masked[start : start + query_chunk_size]
-            dist = torch.norm(
-                token_bank.unsqueeze(0) - contour_chunk.unsqueeze(1),
-                dim=-1,
+            contour_x, contour_y = _flatten_match_xy(contour_chunk)
+            matched_chunks.append(
+                _match_token_idx_from_flat_xy(
+                    token_x=token_x,
+                    token_y=token_y,
+                    contour_x=contour_x,
+                    contour_y=contour_y,
+                    reduction=reduction,
+                )
             )
-            dist = _reduce_match_distance(dist=dist, reduction=reduction)
-            matched_chunks.append(torch.argmin(dist, dim=-1))
         token_idx[query_indices] = torch.cat(matched_chunks, dim=0)
 
     return token_idx
