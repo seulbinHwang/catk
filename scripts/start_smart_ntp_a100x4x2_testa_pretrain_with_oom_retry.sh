@@ -2,7 +2,7 @@
 # Launch SMART NTP A100x4x2 pretrain on existing testa/testaa pods with
 # automatic CUDA OOM fallback.
 #
-# The first attempt starts at INITIAL_BS=13 by default. If any pod log contains
+# The first attempt starts at INITIAL_BS=12 by default. If any pod log contains
 # a CUDA OOM marker, the script stops the distributed job, finds the newest
 # epoch_last.ckpt under the same task name, lowers data.train_batch_size by
 # OOM_STEP=1, and starts the next attempt from that checkpoint.
@@ -21,7 +21,7 @@ PODS="${PODS:-testa testaa}"
 PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk}"
 BRANCH="${BRANCH:-main}"
 GIT_REF="${GIT_REF:-}"
-TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main}"
+TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs12_oom_retry_main}"
 SESSION="${SESSION:-catk-smart-ntp-a100x4x2}"
 EXPERIMENT="${EXPERIMENT:-pre_bc_a100x4x2}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
@@ -29,7 +29,7 @@ CACHE_ROOT="${CACHE_ROOT:-}"
 POD_CACHE_ROOTS="${POD_CACHE_ROOTS:-}"
 MASTER_PORT="${MASTER_PORT:-29521}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-INITIAL_BS="${INITIAL_BS:-13}"
+INITIAL_BS="${INITIAL_BS:-12}"
 OOM_STEP="${OOM_STEP:-1}"
 MIN_BS="${MIN_BS:-8}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"

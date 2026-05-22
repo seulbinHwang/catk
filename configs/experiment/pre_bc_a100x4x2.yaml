@@ -9,7 +9,7 @@
 #   * 2 nodes
 #   * 4 A100/H100 GPUs per node
 #   * 8 total DDP ranks
-#   * train_batch_size 13 * 8 GPUs = effective global batch 104
+#   * train_batch_size 12 * 8 GPUs = effective global batch 96
 #   * lr=6e-4, warmup=4, lr_min_ratio=1e-2
 #   * fast RMM scorer uses about 1680 validation scenarios every 16 epochs
 
@@ -52,9 +52,9 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 13
-  val_batch_size: 13
-  test_batch_size: 13
+  train_batch_size: 12
+  val_batch_size: 12
+  test_batch_size: 12
   num_workers: 4
   train_use_eval_agent_selection: true
   train_memory_balanced_batching: true
