@@ -171,6 +171,12 @@ def render_env_file(
         "MAX_EPOCHS": args.max_epochs,
         "CATK_LR": args.learning_rate,
         "CATK_HYDRA_OVERRIDES": args.extra_hydra_overrides,
+        "CATK_COMPILE_ATTENTION_RELATION_KV": os.environ.get(
+            "CATK_COMPILE_ATTENTION_RELATION_KV", ""
+        ),
+        "CATK_COMPILE_FOURIER_EMBEDDING": os.environ.get(
+            "CATK_COMPILE_FOURIER_EMBEDDING", ""
+        ),
     }
     for name, value in optional_env.items():
         if value not in (None, ""):

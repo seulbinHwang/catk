@@ -25,9 +25,9 @@ BASE_LAUNCHER = Path(__file__).with_name("launch_h100x4_multinode_pretrain_tmux.
 
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_h100x6_hsb2_wo2_"
-    "execctx_prefix_balanced_lr6e-4_bs18_oomretry"
+    "execctx_prefix_balanced_lr6e-4_bs20_oomretry"
 )
-DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs18-retry"
+DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs20-retry"
 
 
 def shq(value: object) -> str:
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=h100x6.DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--initial-bs", type=int, default=18)
+    parser.add_argument("--initial-bs", type=int, default=20)
     parser.add_argument(
         "--oom-step",
         type=int,
@@ -120,6 +120,25 @@ def parse_args() -> argparse.Namespace:
         "--extra-hydra-overrides",
         default="",
         help="Additional space-separated Hydra overrides appended before pinned overrides.",
+    )
+    parser.add_argument(
+        "--compile-attention-relation-kv",
+        choices=("0", "1"),
+        default=os.environ.get("CATK_COMPILE_ATTENTION_RELATION_KV", "0"),
+        help=(
+            "Forward CATK_COMPILE_ATTENTION_RELATION_KV to remote pods. "
+            "Default 0 matches the one-epoch-stable H100x6 bs20 probe and avoids "
+            "torch.compile CUDA graph pool failures seen in long runs."
+        ),
+    )
+    parser.add_argument(
+        "--compile-fourier-embedding",
+        choices=("0", "1"),
+        default=os.environ.get("CATK_COMPILE_FOURIER_EMBEDDING", "0"),
+        help=(
+            "Forward CATK_COMPILE_FOURIER_EMBEDDING to remote pods. "
+            "Default 0 keeps the retry run on the eager path used by the stable bs20 probe."
+        ),
     )
     parser.add_argument(
         "--cache-root",
@@ -253,6 +272,8 @@ def retry_environment(args: argparse.Namespace) -> dict[str, str]:
             "LIMIT_VAL_BATCHES": str(args.limit_val_batches),
             "MAX_EPOCHS": str(args.max_epochs),
             "EXTRA_HYDRA_OVERRIDES": h100x6.training_extra_hydra_overrides(args),
+            "CATK_COMPILE_ATTENTION_RELATION_KV": args.compile_attention_relation_kv,
+            "CATK_COMPILE_FOURIER_EMBEDDING": args.compile_fourier_embedding,
         }
     )
     return env
@@ -287,6 +308,8 @@ def print_retry_command(args: argparse.Namespace) -> None:
         "LIMIT_VAL_BATCHES",
         "MAX_EPOCHS",
         "EXTRA_HYDRA_OVERRIDES",
+        "CATK_COMPILE_ATTENTION_RELATION_KV",
+        "CATK_COMPILE_FOURIER_EMBEDDING",
     ]
     print(
         " ".join(f"{key}={shq(env[key])}" for key in keys)

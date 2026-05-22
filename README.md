@@ -817,9 +817,9 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretra
 python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods.py --stop
 ```
 
-##### H100x6 batch-18 OOM fallback launcher
+##### H100x6 batch-20 OOM fallback launcher
 
-`train_batch_size=18`에서 시작하고 CUDA OOM이 발생하면 같은 task의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size`를 1씩 낮춰 resume하려면 아래 launcher를 씁니다. pod는 만들거나 삭제하지 않고, 기존 `hsb-npc-training-2`, `wo-pvc-2` 내부 tmux session만 교체합니다.
+`train_batch_size=20`에서 시작하고 CUDA OOM이 발생하면 같은 task의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size`를 1씩 낮춰 resume하려면 아래 launcher를 씁니다. pod는 만들거나 삭제하지 않고, 기존 `hsb-npc-training-2`, `wo-pvc-2` 내부 tmux session만 교체합니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py \
@@ -838,15 +838,24 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_r
 | 항목 | 값 |
 |---|---|
 | launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py` |
-| task name | `flow_control_space_pretrain_h100x6_hsb2_wo2_execctx_prefix_balanced_lr6e-4_bs18_oomretry` |
-| tmux session | `catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs18-retry` |
-| 시작 per-GPU batch | `18` |
-| 시작 effective global batch | `18 x 6 = 108` |
-| OOM fallback | `18 -> 17 -> 16 -> ...` |
+| task name | `flow_control_space_pretrain_h100x6_hsb2_wo2_execctx_prefix_balanced_lr6e-4_bs20_oomretry` |
+| tmux session | `catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs20-retry` |
+| 시작 per-GPU batch | `20` |
+| 시작 effective global batch | `20 x 6 = 120` |
+| OOM fallback | `20 -> 19 -> 18 -> ...` |
 | resume 기준 | rank 0 log dir 아래 최신 `epoch_last.ckpt`, 없으면 `last.ckpt` |
 | 학습 설정 | 위 H100x6 execution-context balanced pretrain과 동일 |
 
 이 launcher는 `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false`, heterogeneous DDP strategy, metadata cache path override를 단발 H100x6 launcher와 동일하게 고정합니다. 즉 OOM fallback으로 바뀌는 것은 per-GPU batch size뿐이고, supervision, loss mask, transition-aligned target, outlier filter, validation 주기, validation rollout 수는 동일합니다.
+
+직전 H100x6 probe에서 기본 compile 경로는 `train_batch_size=16`에서도 epoch 말미에 CUDA graph tree 오류가 난 반면, eager 경로는 `train_batch_size=20`으로 epoch 0을 통과했습니다. 그래서 이 retry launcher는 기본적으로 아래 값을 remote tmux env에 전달합니다.
+
+```bash
+CATK_COMPILE_ATTENTION_RELATION_KV=0
+CATK_COMPILE_FOURIER_EMBEDDING=0
+```
+
+둘 다 학습 수식이나 데이터 의미를 바꾸는 설정이 아니라 compile 최적화 경로만 끄는 설정입니다. compile 경로를 다시 검증하려면 `--compile-attention-relation-kv 1 --compile-fourier-embedding 1`을 명시합니다.
 
 실험 코드만 멈추고 pod는 그대로 두려면:
 
