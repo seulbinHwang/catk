@@ -482,8 +482,7 @@ class WOSACDistributionMetrics(Metric):
         if bool(valid_type.any()):
             scale[valid_type] = torch.sqrt(
                 self.scale_sq_sum[valid_type] / self.scale_count[valid_type].clamp_min(self.eps)
-                + self.eps
-            ) + self.eps
+            )
         return scale.clamp_min(self.eps)
 
     def compute(self) -> Dict[str, Tensor]:
@@ -715,6 +714,10 @@ def update_wosac_distribution_metric_from_model(
         include_gt: ``True``이면 validation GT로 CES와 type scale을 계산합니다.
             ``False``이면 CPD만 계산합니다.
     """
+    update_key = _prediction_update_key(metric=metric, data=data, pred_traj=pred_traj)
+    if getattr(metric, "_last_wosac_distribution_update_key", None) == update_key:
+        return
+
     update_wosac_distribution_metric_from_batch(
         metric=metric,
         data=data,
@@ -722,6 +725,26 @@ def update_wosac_distribution_metric_from_model(
         num_historical_steps=int(getattr(model, "num_historical_steps")),
         include_gt=include_gt,
     )
+    setattr(metric, "_last_wosac_distribution_update_key", update_key)
+
+
+def _prediction_update_key(
+    metric: WOSACDistributionMetrics,
+    data: Any,
+    pred_traj: Tensor,
+) -> tuple[int, int, int]:
+    """같은 rollout을 두 번 누적하지 않기 위한 식별자를 만듭니다.
+
+    Args:
+        metric: 갱신 대상 metric입니다.
+        data: validation 또는 test batch 객체입니다.
+        pred_traj: closed-loop rollout 위치 텐서입니다.
+
+    Returns:
+        tuple[int, int, int]: metric, batch, 예측 텐서의 식별자입니다.
+    """
+    data_ptr = int(pred_traj.data_ptr()) if pred_traj.numel() > 0 else 0
+    return (id(metric), id(data), data_ptr)
 
 
 def log_and_reset_wosac_distribution_metric(
@@ -737,4 +760,6 @@ def log_and_reset_wosac_distribution_metric(
     """
     metric_dict = metric.compute()
     metric.reset()
+    if hasattr(metric, "_last_wosac_distribution_update_key"):
+        delattr(metric, "_last_wosac_distribution_update_key")
     return metric_dict
