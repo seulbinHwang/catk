@@ -22,6 +22,11 @@ from torch_geometric.utils import dense_to_sparse
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
+from src.smart.modules.dynamic_light_time import (
+    NO_LANE_STATE_LIGHT_TYPE,
+    build_constant_light_time_delta_norm,
+    resolve_light_time_delta_norm,
+)
 from src.smart.utils import (
     angle_between_2d_vectors,
     sample_next_token_traj,
@@ -68,6 +73,7 @@ class SMARTAgentDecoder(nn.Module):
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
+        self.light_pl2a_emb = nn.Embedding(5, hidden_dim)
 
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
@@ -81,6 +87,11 @@ class SMARTAgentDecoder(nn.Module):
         )
         self.r_pt2a_emb = FourierEmbedding(
             input_dim=input_dim_r_pt2a,
+            hidden_dim=hidden_dim,
+            num_freq_bands=num_freq_bands,
+        )
+        self.light_time_pl2a_emb = FourierEmbedding(
+            input_dim=1,
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
@@ -145,6 +156,12 @@ class SMARTAgentDecoder(nn.Module):
             input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=n_token_agent
         )
         self.apply(weight_init)
+
+    def _zero_light_pl2a_parameter_dependency(self, dtype: torch.dtype) -> torch.Tensor:
+        zero = self.light_pl2a_emb.weight.reshape(-1)[0].to(dtype=dtype) * 0.0
+        for param in self.light_time_pl2a_emb.parameters():
+            zero = zero + param.reshape(-1)[0].to(dtype=dtype) * 0.0
+        return zero
 
     def agent_token_embedding(
         self,
@@ -393,11 +410,17 @@ class SMARTAgentDecoder(nn.Module):
         mask,  # [n_agent, n_step]
         batch_s,  # [n_agent*n_step]
         batch_pl,  # [n_pl]
+        light_type: Optional[torch.Tensor] = None,
+        light_time_delta_norm: Optional[torch.Tensor] = None,
     ):
+        n_agent, n_step = pos_a.shape[:2]
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
+        has_light_type = light_type is not None
+        if has_light_type:
+            light_type = light_type.to(device=pos_pl.device, dtype=torch.long)
         # torch_cluster.radius assumes grouped batch ids. With static map tokens,
         # agent ids arrive as [scene0..N, scene0..N, ...] across time steps, so
         # sort before radius and restore the original indices afterward.
@@ -435,6 +458,33 @@ class SMARTAgentDecoder(nn.Module):
             dim=-1,
         )
         r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
+        if has_light_type and edge_index_pl2a.numel() > 0:
+            # Some ranks can see a batch without signaled map edges. Keep the
+            # conditional light-staleness parameters in the DDP graph without
+            # changing relation values.
+            r_pl2a = r_pl2a + self._zero_light_pl2a_parameter_dependency(r_pl2a.dtype)
+            edge_light_type = light_type[edge_index_pl2a[0]]
+            signal_edge_mask = edge_light_type != NO_LANE_STATE_LIGHT_TYPE
+            if signal_edge_mask.any():
+                light_time_delta_norm = resolve_light_time_delta_norm(
+                    light_time_delta_norm=light_time_delta_norm,
+                    num_agents=n_agent,
+                    num_steps=n_step,
+                    device=pos_pl.device,
+                    dtype=pos_pl.dtype,
+                    shift_steps=self.shift,
+                )
+                light_time_delta_flat = light_time_delta_norm.transpose(0, 1).reshape(-1)
+                signal_edge_index = signal_edge_mask.nonzero(as_tuple=False).flatten()
+                signal_light_type = edge_light_type[signal_edge_index]
+                signal_light_time = light_time_delta_flat[
+                    edge_index_pl2a[1, signal_edge_index]
+                ].unsqueeze(-1)
+                light_bias = self.light_time_pl2a_emb(
+                    continuous_inputs=signal_light_time,
+                    categorical_embs=[self.light_pl2a_emb(signal_light_type)],
+                )
+                r_pl2a = r_pl2a.index_add(0, signal_edge_index, light_bias)
         return edge_index_pl2a, r_pl2a
 
     @staticmethod
@@ -511,6 +561,7 @@ class SMARTAgentDecoder(nn.Module):
             mask=mask,  # [n_agent, n_step]
             batch_s=batch_s_pl2a,  # [n_agent*n_step]
             batch_pl=batch_pl,  # [n_pl]
+            light_type=map_feature.get("light_type"),
         )
 
         # ! attention layers
@@ -654,6 +705,18 @@ class SMARTAgentDecoder(nn.Module):
                 mask=inference_mask[:, -hist_step:],  # [n_agent, hist_step]
                 batch_s=batch_s_pl2a,  # [n_agent*hist_step]
                 batch_pl=map_feature["batch"],  # [n_pl]
+                light_type=map_feature.get("light_type"),
+                light_time_delta_norm=(
+                    None
+                    if t == 0
+                    else build_constant_light_time_delta_norm(
+                        num_agents=n_agent,
+                        num_steps=1,
+                        delta_seconds=float(t * self.shift) * 0.1,
+                        device=pos_a.device,
+                        dtype=pos_a.dtype,
+                    )
+                ),
             )
             feat_map = map_feature["pt_token"]
             edge_index_a2a, r_a2a = self.build_interaction_edge(
