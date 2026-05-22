@@ -88,13 +88,20 @@ class SMART(LightningModule):
             **model_config.sim_agents_submission
         )
         wosac_cpd_reference = getattr(model_config, "wosac_cpd_reference", None)
+        wosac_distribution_type_scale = getattr(
+            model_config,
+            "wosac_distribution_type_scale",
+            None,
+        )
         self.wosac_distribution_metrics = WOSACDistributionMetrics(
             "val_closed",
             cpd_reference=wosac_cpd_reference,
+            type_scale=wosac_distribution_type_scale,
         )
         self.test_wosac_distribution_metrics = WOSACDistributionMetrics(
             "test",
             cpd_reference=wosac_cpd_reference,
+            type_scale=wosac_distribution_type_scale,
         )
         self.training_loss = CrossEntropy(**model_config.training_loss)
 
