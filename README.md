@@ -620,23 +620,23 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 | round-trip filter | `control_round_trip_max_position_error_m=0.5` |
 | model parameters | 총 `7,045,051`개, trainable `7,045,051`개 |
 | precision | `bf16-mixed` |
-| batch / lr | per-rank `train_batch_size=22`, effective global batch `132`, `lr=6e-4` |
+| batch / lr | per-rank `train_batch_size=16`, effective global batch `96`, `lr=6e-4` |
 | fit-time validation | `check_val_every_n_epoch=16`, 64 epoch 중 15/31/47/63 epoch 이후 4회 평가 |
 | metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc.pt` preflight 생성/검증 |
 
 두 pod의 local GPU 수가 `4 + 2`로 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를 쓰면 안 됩니다. 이 launcher는 `--manual-rank-offsets` 경로를 사용해 `hsb-npc-training`에 rank `0~3`, `wo-pvc`에 rank `4~5`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment` / `HeterogeneousDDPStrategy`로 Lightning의 homogeneous world-size 가정을 완화합니다. sampler, validation sharding, Fast WOSAC scorer는 launcher가 넣은 실제 `WORLD_SIZE=6`을 기준으로 동작하도록 회귀 테스트로 고정합니다.
 
-batch size probe 결과:
+최신 `3779b42` 기준 batch size probe 결과:
 
 | per-rank batch | probe 결과 | worst peak reserved | 판단 |
 |---:|---:|---:|---|
-| 12 | 성공, 2.160분 | 51.01% | 안전하지만 느림 |
-| 20 | 성공, 2.946분 | 81.96% | 안전 |
-| 22 | 100-step 성공, 3.129분 / 500-step 성공, 15.603분 | 90.21% | 기본값 |
-| 23 | 성공, 3.242분 | 94.92% | 장기 학습에는 마진 부족 |
-| 24 | 성공, 3.309분 | 97.19% | OOM 위험이 높아 제외 |
+| 20 | OOM | - | 제외 |
+| 19 | OOM | `98.31%` | 제외 |
+| 18 | OOM | - | 제외 |
+| 17 | 160-step 성공 | `93.33%` | 가능하지만 장기 학습 마진 부족 |
+| 16 | 160-step 성공 | `86.25%` | 기본값 |
 
-따라서 이 6 H100 조합에서는 `train_batch_size=22`를 기본값으로 둡니다. `bs=23/24`는 짧은 probe에서는 통과했지만, peak reserved가 너무 높아 full pretrain 중 dense scene이나 allocator fragmentation이 겹치면 CUDA OOM 가능성이 큽니다. 500-step `bs=22` probe 기준 step time은 약 `1.87s`이고, training split `486,996`개 / global batch `132` 기준 한 epoch는 약 `3,690` step입니다. 64 epoch train-only 예상 시간은 약 `123h`(`5.1일`)이며, validation은 16 epoch마다 총 4회 추가됩니다. launcher의 기본 OOM fallback은 `22 -> 21 -> 20`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt`를 peer pod로 동기화한 뒤 재개합니다.
+따라서 이 6 H100 조합에서는 `train_batch_size=16`을 기본값으로 둡니다. `bs=17`은 짧은 probe에서는 통과했지만, peak reserved가 이미 `93%`를 넘어서 full pretrain 중 dense scene이나 allocator fragmentation이 겹치면 CUDA OOM 가능성이 큽니다. 160-step `bs=16` probe 기준 step time은 약 `0.88s`이고, training split `486,996`개 / global batch `96` 기준 한 epoch는 약 `5,073` step입니다. 64 epoch train-only 예상 시간은 약 `79.5h`(`3.3일`)이며, validation은 16 epoch마다 총 4회 추가됩니다. launcher의 기본 OOM fallback은 `16 -> 15`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt`를 peer pod로 동기화한 뒤 재개합니다.
 
 Agent tokenization의 첫 valid 이전 token-step 외삽은 agent별 Python loop 대신 batch mask/index 연산으로 처리합니다. 외삽 규칙은 기존과 같습니다. 첫 valid step을 기준으로 직전 coarse token boundary까지 `vel[first_valid] * 0.1` 간격으로 위치를 뒤쪽으로 채우고, velocity/heading/valid도 같은 prefix 구간에 복사합니다. `t=10`인데 raw step 5가 invalid인 history 보강 예외도 유지합니다. H100 4+2, per-rank `train_batch_size=15`, 6-rank 평균 profile 기준으로 이 변경은 외삽 구간을 `35.29ms -> 0.49ms`로 줄였고, token processor 전체는 `99.70ms -> 65.43ms`, 전체 train step은 `1133.86ms -> 1107.43ms`로 줄었습니다. 기존 loop reference 대비 위치/heading/velocity 오차는 `1e-6` 이하이며 valid mask는 동일합니다.
 
