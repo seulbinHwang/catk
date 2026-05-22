@@ -763,6 +763,20 @@ Flow target 생성도 anchor 16개를 하나씩 반복하지 않고, 모든 anch
 | `hsb-npc-training-2` | `80.73ms` | `62.57ms` | `-22.5%` | `645MiB -> 644MiB` |
 | `wo-pvc-2` | `76.26ms` | `61.40ms` | `-19.5%` | `645MiB -> 644MiB` |
 
+`AttentionLayer`는 relation feature의 `LayerNorm(r) + to_k_r/to_v_r` 경로를 compile-friendly 함수로 묶어 실행합니다. edge 생성, relation embedding 값, destination softmax, dropout, weighted scatter-add, gate/update 수식은 그대로 유지하고 relation K/V projection 실행 방식만 바꿉니다. 파라미터 수와 `state_dict` key도 바뀌지 않습니다. 문제가 의심되면 환경변수 `CATK_COMPILE_ATTENTION_RELATION_KV=0`으로 eager 경로를 강제할 수 있습니다.
+
+H100x6 `train_batch_size=20`에서 같은 20개 profiled batch 기준으로 이전 eager 경로와 비교했습니다. synthetic attention equivalence test에서는 compiled/eager 모두 output 최대 차이 `1.91e-6`, 입력 gradient 최대 차이 `1.86e-9`, parameter gradient 최대 차이 `1.12e-8` 이내였습니다.
+
+| 구간 | 이전 | relation K/V compile | 변화 |
+|---|---:|---:|---:|
+| batch total | `948.41ms` | `759.08ms` | `-20.0%` |
+| forward until backward | `313.22ms` | `305.88ms` | `-2.3%` |
+| backward total | `615.80ms` | `433.63ms` | `-29.6%` |
+| agent `pt2a` attention 6 layers | `332.90ms` | `178.23ms` | `-46.5%` |
+| map `pt2pt` attention 3 layers | `193.11ms` | `147.33ms` | `-23.7%` |
+
+첫 batch에서는 `torch.compile` warmup 비용이 생길 수 있지만, long pretrain에서는 이후 반복 batch에서 amortize됩니다.
+
 6-GPU heterogeneous run의 안전장치는 다음과 같습니다.
 
 - launcher는 `data.train_memory_balanced_batches=true`와 `trainer.use_distributed_sampler=false`를 항상 마지막 Hydra override로 고정합니다. 이 조합에서는 memory-balanced batch sampler가 `trainer.world_size=6`을 읽어 rank별 데이터를 나누므로, 6개 GPU가 같은 train sample을 반복해서 보는 사고를 막습니다.
