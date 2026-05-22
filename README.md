@@ -69,14 +69,14 @@ conda run -n catk python tools/compare_fast_wosac_metric.py \
   --json-output artifacts/fast_wosac_compare_3scenarios.json
 ```
 
-### 정적 신호등 지도 특징
+### 신호등 stale map-agent 입력
 
-- 교통 신호는 rollout 시간에 따라 변하는 agent-lane relation feature로 넣지 않습니다.
-- 현재 관측된 traffic-light type은 cache의 map token categorical feature로만 사용합니다.
-- `SMARTMapDecoder`는 `light_type` embedding을 map token embedding에 더하고, 이후 map-to-agent relation은 `distance / bearing / relative heading` 3D 기하 정보만 사용합니다.
-- 따라서 `prediction_time - observed_light_time` 같은 stale time scalar를 만들지 않고, RoaD/cache generation/closed-loop validation/test/submission에서도 traffic-light 경과 시간을 따로 갱신하지 않습니다.
-- 이 구조는 `main`의 `99e052e9`와 같은 의미입니다. 신호등 정보는 static map context로 유지하되, rollout block이 진행될수록 같은 현재 신호에 시간 bias를 추가하던 동적 경로는 사용하지 않습니다.
-- `light_type` embedding이 map encoder로 이동했기 때문에 동적 stale relation을 사용하던 중간 checkpoint와는 shape이 호환되지 않습니다. 새 pretrain을 기준으로 사용합니다.
+- 현재 관측된 traffic-light type은 기존처럼 map token categorical feature로도 들어가며, 동시에 map-to-agent relation의 신호등 bias 입력으로도 사용합니다.
+- map-to-agent relation의 기본 geometry는 `distance / bearing / relative heading` 3D를 유지합니다. 모든 map-agent edge를 4D relation으로 키우지 않고, 실제 관측 신호가 있는 edge에만 `light_type + stale_time` embedding bias를 더합니다.
+- stale scalar는 `prediction_time - observed_light_time`이며 `[-1s, 6s]`로 clip한 뒤 `6s`로 나눕니다. 관측 신호가 없는 lane은 light bias를 계산하지 않아 비용과 메모리를 줄입니다.
+- closed-loop rollout에서는 첫 0.5초 block이 현재 신호를 `0s` stale로 보고, 이후 block은 `0.5s`, `1.0s`, ... stale로 갱신합니다. 학습/validation/test/submission 경로 모두 같은 규칙을 씁니다.
+- cache builder는 WOMD 표준 현재 raw step `10`을 검증합니다. cache schema 자체는 바꾸지 않고, 기존 `light_type`을 동적 relation 입력으로 해석합니다.
+- `light_time_pl2a_emb`가 추가되어 신호등 stale 입력을 쓰지 않던 checkpoint와는 shape이 호환되지 않습니다. 새 pretrain을 기준으로 사용합니다.
 
 ### Motion Missingness Feature
 

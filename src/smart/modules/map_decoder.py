@@ -109,5 +109,6 @@ class SMARTMapDecoder(nn.Module):
             "pt_token": x_pt,
             "position": pos_pt,
             "orientation": orient_pt,
+            "light_type": tokenized_map["light_type"],
             "batch": tokenized_map["batch"],
         }
