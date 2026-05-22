@@ -18,7 +18,8 @@ cd "$REPO_ROOT"
 NAMESPACE="${NAMESPACE:-p-pnc}"
 CONTAINER="${CONTAINER:-main}"
 PODS="${PODS:-testa testaa}"
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk}"
+PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_smart_ntp_a100x4x2_oom_retry_main}"
+REPO_URL="${REPO_URL:-https://github.com/seulbinHwang/catk.git}"
 BRANCH="${BRANCH:-main}"
 GIT_REF="${GIT_REF:-}"
 TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs12_oom_retry_main}"
@@ -73,6 +74,45 @@ timestamp() { date '+%F %T %Z'; }
 log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
 remote_quote() { printf '%q' "$1"; }
 
+prepare_project_root() {
+  local pod repo_q root_q branch_q git_ref_q script
+  repo_q="$(remote_quote "$REPO_URL")"
+  root_q="$(remote_quote "$PROJECT_ROOT")"
+  branch_q="$(remote_quote "$BRANCH")"
+  git_ref_q="$(remote_quote "$GIT_REF")"
+
+  for pod in "${POD_ARRAY[@]}"; do
+    script="
+set -Eeuo pipefail
+repo=${repo_q}
+root=${root_q}
+branch=${branch_q}
+git_ref=${git_ref_q}
+mkdir -p \"\$(dirname \"\$root\")\"
+if [ ! -d \"\$root/.git\" ]; then
+  git clone \"\$repo\" \"\$root\"
+fi
+cd \"\$root\"
+git config --global --add safe.directory \"\$root\" || true
+git fetch origin --prune
+if [ -n \"\$git_ref\" ]; then
+  git checkout --detach \"\$git_ref\"
+else
+  git checkout -B \"\$branch\" \"origin/\$branch\"
+fi
+git status --short --branch
+git rev-parse --short HEAD
+"
+    log "preparing project root on ${pod}: ${PROJECT_ROOT}"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      printf 'kubectl exec -n %q %q -c %q -- bash -lc %q\n' \
+        "$NAMESPACE" "$pod" "$CONTAINER" "$script"
+    else
+      kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "$script"
+    fi
+  done
+}
+
 safe_task_name() {
   printf '%s\n' "${TASK_NAME//\//_}"
 }
@@ -119,6 +159,7 @@ stop_attempt_sessions() {
     --pods "${POD_ARRAY[@]}"
     --container "$CONTAINER"
     --project-root "$PROJECT_ROOT"
+    --no-pull
     --branch "$BRANCH"
     --task-name "$TASK_NAME"
     --session "$SESSION"
@@ -144,6 +185,7 @@ start_attempt() {
     --pods "${POD_ARRAY[@]}"
     --container "$CONTAINER"
     --project-root "$PROJECT_ROOT"
+    --no-pull
     --branch "$BRANCH"
     --experiment "$EXPERIMENT"
     --task-name "$TASK_NAME"
@@ -264,6 +306,8 @@ copy_attempt_log() {
 bs="$INITIAL_BS"
 attempt=0
 non_oom_retry_count=0
+
+prepare_project_root
 
 while (( bs >= MIN_BS )); do
   attempt=$(( attempt + 1 ))

@@ -141,9 +141,9 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh
 ```
 
 이 wrapper는 `scripts/launch_smart_ntp_a100x4x2_testa.py`를 호출하며, 기본
-`TRAIN_BATCH_SIZE=13`과 task name
-`smart_ntp_pretrain_a100x4x2_bs13_main`을 사용한다. 다른 batch를 실험하려면
-`TRAIN_BATCH_SIZE=14 bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh`
+`TRAIN_BATCH_SIZE=12`와 task name
+`smart_ntp_pretrain_a100x4x2_bs12_main`을 사용한다. 다른 batch를 실험하려면
+`TRAIN_BATCH_SIZE=11 bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh`
 처럼 환경 변수로 넘긴다.
 
 장기 학습 중 CUDA OOM이 나면 batch를 자동으로 낮춰 이어가야 하므로, 실험을 계속 살리는
@@ -153,7 +153,7 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh
 bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh
 ```
 
-이 retry wrapper는 기본 `INITIAL_BS=13`, `OOM_STEP=1`, `MIN_BS=8`이다.
+이 retry wrapper는 기본 `INITIAL_BS=12`, `OOM_STEP=1`, `MIN_BS=8`이다.
 각 attempt는 같은 task name 아래에서 시작하고, pod tmux 로그에
 `CUDA out of memory` / `torch.OutOfMemoryError` 같은 OOM marker가 보이면 두 pod의
 학습 session을 정리한 뒤 `logs/<task_name>/runs/*/checkpoints/epoch_last.ckpt` 중
@@ -162,18 +162,24 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh
 보존해서 resume한다. checkpoint가 아직 없으면 같은 task name으로 새 attempt를 시작한다.
 OOM이 아닌 실패는 조용히 batch를 낮추지 않고 중단한다.
 
+retry wrapper는 기본적으로 pod 안의 `/tmp/catk_smart_ntp_a100x4x2_oom_retry_main`에
+script-managed clean checkout을 준비하고, 매 attempt 전에 그 checkout을 `origin/main`으로
+맞춘다. 따라서 기존 `/mnt/nuplan/projects/catk` checkout에 로컬 수정이나 detached HEAD가
+남아 있어도 retry 학습 실행에는 영향을 주지 않는다. 다른 위치를 쓰려면
+`PROJECT_ROOT=/path/to/checkout`을 명시한다.
+
 주요 override는 환경 변수로 지정한다.
 
 ```bash
-INITIAL_BS=13 MIN_BS=10 TASK_NAME=smart_ntp_pretrain_a100x4x2_retry_main \
+INITIAL_BS=12 MIN_BS=10 TASK_NAME=smart_ntp_pretrain_a100x4x2_retry_main \
   bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh
 ```
 
 launcher는 pod를 만들거나 지우지 않는다. 로컬에서 `kubectl exec`로 이미 떠 있는 두 pod에
 접속한 뒤, 각 pod 안에서 같은 이름의 tmux session을 시작한다. 기본 namespace는 `p-pnc`,
-기본 pod 목록은 `testa testaa`, 원격 저장소 위치는
-`/mnt/nuplan/projects/catk`, branch는 `main`이다. 실행 전에 각 pod에서 `git pull --ff-only
-origin main`을 수행하므로, 현재 main에 push된 코드를 기준으로 학습한다.
+기본 pod 목록은 `testa testaa`, branch는 `main`이다. 일반 launcher의 기본 원격 저장소
+위치는 `/mnt/nuplan/projects/catk`이며, retry wrapper는 위에서 설명한 `/tmp` clean checkout을
+기본으로 사용한다. 실행 전에 각 pod에서 대상 checkout을 현재 main에 맞춰 학습한다.
 H100 pod에서 실행하려면 `--pods hsb-npc-training hsb-npc-training-2`를 명시한다.
 
 #### H100 4+2 heterogeneous SMART NTP pretrain
