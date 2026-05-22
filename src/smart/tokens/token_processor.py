@@ -31,6 +31,20 @@ from src.smart.utils import (
 )
 
 
+def _clean_heading_dense_impl(valid: Tensor, heading: Tensor) -> Tensor:
+    valid_pairs = valid[:, :-1] & valid[:, 1:]
+    cleaned_steps = [heading[:, 0]]
+    prev_heading = heading[:, 0]
+    for i in range(heading.shape[1] - 1):
+        raw_next_heading = heading[:, i + 1]
+        heading_diff = torch.abs(wrap_angle(prev_heading - raw_next_heading))
+        change_needed = (heading_diff > 1.5) & valid_pairs[:, i]
+        next_heading = torch.where(change_needed, prev_heading, raw_next_heading)
+        cleaned_steps.append(next_heading)
+        prev_heading = next_heading
+    return torch.stack(cleaned_steps, dim=1)
+
+
 class TokenProcessor(torch.nn.Module):
 
     def __init__(
@@ -302,12 +316,7 @@ class TokenProcessor(torch.nn.Module):
 
     @staticmethod
     def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
-        valid_pairs = valid[:, :-1] & valid[:, 1:]
-        for i in range(heading.shape[1] - 1):
-            heading_diff = torch.abs(wrap_angle(heading[:, i] - heading[:, i + 1]))
-            change_needed = (heading_diff > 1.5) & valid_pairs[:, i]
-            heading[:, i + 1][change_needed] = heading[:, i][change_needed]
-        return heading
+        return _clean_heading_dense_impl(valid=valid, heading=heading)
 
     def _extrapolate_agent_to_prev_token_step(
         self,
