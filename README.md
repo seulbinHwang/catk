@@ -324,215 +324,53 @@ batch capacity를 다시 측정했다. training cache `486,996`개 기준으로 
 fp32 graph attention 기본 적용과 batch 14가 모두 OOM 위험을 키우므로 기본값은 안정성을
 우선해 `CATK_ATTENTION_GRAPH_FP32=0`, batch 13으로 둔다.
 
-#### 334cbce 유사 relation KV compile 실험 인수인계
+#### Relation K/V projection compile 최적화
 
-이 절은 `334cbce`와 같은 개념의 최적화를 현재 `main`에 적용할지 판단하기 위해 진행하던
-중간 실험 기록이다. 다음 Codex가 그대로 이어서 측정할 수 있도록 남긴다.
+`AttentionLayer`의 relation K/V projection 경로는 기본적으로 compile-friendly 함수로 분리되어 있다.
+구체적으로 `attn_prenorm_r -> to_k_r/to_v_r -> view` 계산을 `_relation_kv_project()`에서 처리하고,
+CUDA에서는 `CATK_COMPILE_ATTENTION_RELATION_KV`가 꺼져 있지 않으면
+`torch.compile(dynamic=True, mode="reduce-overhead")`로 한 번 compile해서 재사용한다.
 
-핵심 전제는 다음과 같다.
+이 변경은 아래 항목을 바꾸지 않는다.
 
-- 기준 branch는 `main`이고, 측정 시작 시점의 기준 커밋은
-  `af0afaaf0f158a8f2b0120ac65a3c9dda9bf765a`이다.
-- `ea5fea3c`의 "A100 SMART NTP fp32 graph attention 기본 적용" 로직은 현재 main 기본
-  경로에서 빠져 있다. 따라서 이 실험은 `ea2fe2f9` 방식이 아니라, `334cbce`의 원래 의도에
-  가까운 relation K/V projection compile 최적화를 현재 main 조건에서 다시 보는 것이다.
-- main 기본값은 `CATK_ATTENTION_GRAPH_FP32=0`이다. 즉 graph attention aggregation 전체를
-  fp32로 올리는 실험이 아니다.
-- 아직 이 최적화는 main 코드에 채택하지 않았다. 아래 `/tmp/catk_334_after`에만 실험용으로
-  적용되어 있다.
+- 모델 구조와 파라미터 수
+- edge set, radius, neighbor 수
+- destination별 softmax 단위
+- dropout, loss target, optimizer 설정
+- `CATK_ATTENTION_GRAPH_FP32` 기본값
 
-현재 pod 상태 기준 실험 checkout은 아래와 같다.
-
-| 위치 | 의미 |
-|---|---|
-| local `/tmp/catk_relkv_probe` | 실험용 relation KV compile patch가 들어 있는 임시 checkout |
-| `testa:/tmp/catk_334_before` | 기준 main `af0afaa`, patch 없음 |
-| `testaa:/tmp/catk_334_before` | 기준 main `af0afaa`, patch 없음 |
-| `testa:/tmp/catk_334_after` | 기준 main `af0afaa` + relation KV compile patch |
-| `testaa:/tmp/catk_334_after` | 기준 main `af0afaa` + relation KV compile patch |
-
-patch 내용은 개념적으로 아래와 같다.
-
-1. `AttentionLayer`에서 `attn_prenorm_r -> to_k_r/to_v_r -> view` 경로를
-   `_relation_kv_project()`로 분리한다.
-2. CUDA에서는 `CATK_COMPILE_ATTENTION_RELATION_KV`가 꺼져 있지 않으면 이 함수를
-   `torch.compile(dynamic=True, mode="reduce-overhead")`로 한 번 compile해서 재사용한다.
-3. `message()` 안에서 raw relation `r`를 받아 매번 `to_k_r/to_v_r`를 부르는 대신,
-   `_attn_block()`에서 미리 만든 `r_k`, `r_v`를 넘긴다.
-4. 수식, 파라미터 수, edge set, dropout, softmax 단위, loss target은 바꾸지 않는다.
-
-실험용 patch가 살아 있는지 확인하려면 아래를 실행한다.
+비활성화가 필요하면 실행 환경에 아래를 지정한다.
 
 ```bash
-for pod in testa testaa; do
-  kubectl exec -n p-pnc "$pod" -c main -- bash -lc '
-    echo "[$HOSTNAME before]"
-    git -C /tmp/catk_334_before rev-parse --short HEAD
-    echo "[$HOSTNAME after]"
-    git -C /tmp/catk_334_after rev-parse --short HEAD
-    grep -n "CATK_COMPILE_ATTENTION_RELATION_KV\\|_relation_kv_project" \
-      /tmp/catk_334_after/src/smart/layers/attention_layer.py | head -20
-  '
-done
+export CATK_COMPILE_ATTENTION_RELATION_KV=0
 ```
 
-실험용 checkout이 사라졌으면, 같은 patch를 다시 만든 뒤 두 pod에 반영해야 한다. 현재 local
-환경에서는 `/tmp/catk_relkv_probe/src/smart/layers/attention_layer.py`가 patch 적용본이다.
-그 파일을 기준으로 pod의 `/tmp/catk_334_after/src/smart/layers/attention_layer.py`에 복사하면 된다.
+A100x4x2 `testa/testaa`에서 `experiment=pre_bc_a100x4x2`, validation off,
+`CATK_ATTENTION_GRAPH_FP32=0`, `data.train_use_eval_agent_selection=true` 조건으로 확인한 결과는 아래와 같다.
+첫 step compile overhead는 장기 pretrain에서 amortize되므로, 예상 시간은 steady-state 기준으로 계산했다.
 
-적용 전후 수식 근접성은 `testa`에서 별도 CUDA smoke script로 확인했다.
+| 조건 | batch | 결과 | steady-state 속도 | 64epoch train-only 추정 | 메모리/OOM |
+|---|---:|---|---:|---:|---|
+| 적용 전 | 18 | 실패 | - | - | 122/160 step 부근 OOM |
+| 적용 전 | 16 | 성공 | `0.476 it/s` | 약 `142.1 h` | 통과 |
+| 적용 후 | 16 | 성공 | `0.514 it/s` | 약 `131.5 h` | 통과 |
+| 적용 후 | 18 | 성공 | `0.476 it/s` | 약 `126.3 h` | sampled max 약 `74.3 GiB`, OOM 없음 |
+
+적용 전후 수식 근접성은 별도 CUDA smoke로 확인했다.
 
 | 비교 | 결과 |
 |---|---:|
-| 기존 eager vs patch eager output max diff | `1.1920928955078125e-06` |
-| 기존 eager vs patch eager gradient max diff | `2.7939677238464355e-09` |
-| patch compile path finite smoke | `True` |
+| 기존 eager vs 최적화 eager output max diff | `1.1920928955078125e-06` |
+| 기존 eager vs 최적화 eager gradient max diff | `2.7939677238464355e-09` |
+| compile path finite smoke | 통과 |
 
-따라서 현재까지 확인한 범위에서는 output/gradient 차이는 학습 결과에 영향을 줄 수준이 아니다.
+따라서 이 최적화는 A100 pretrain에서도 채택한다. 적용 후에는 batch16 기준 속도도 개선됐고,
+baseline에서 OOM이었던 batch18도 통과해 train-only 예상 시간이 약 `142.1 h -> 126.3 h`로 줄었다.
 
-지금까지의 A100x4x2 `testa/testaa` 측정 결과는 아래와 같다. 모든 측정은
-`experiment=pre_bc_a100x4x2`, validation off, `max_epochs=1`, `CATK_ATTENTION_GRAPH_FP32=0`,
-`data.train_use_eval_agent_selection=true` 조건이다.
-
-| 조건 | task name | 결과 | 관측 내용 |
-|---|---|---|---|
-| baseline, batch 20 | `relkv_before_bs20_120` | CUDA OOM | testaa rank5, 약 25 step 근처. GPU 1이 약 `78.96 GiB` 사용 중 `1.07 GiB` 추가 allocation 실패 |
-| baseline, batch 18 | `relkv_before_bs18_160` | CUDA OOM | testaa rank6, 122/160 step 뒤. GPU 2가 약 `78.78 GiB` 사용 중 `1.63 GiB` 추가 allocation 실패 |
-| baseline, batch 16 | `relkv_before_bs16_120` | 통과 | 이전 측정에서 120/120 완료. 누적 기준 약 `0.45 it/s` |
-| patch, batch 16 | `relkv_after_bs16_120` | 통과 | 이전 측정에서 120/120 완료. 첫 step compile overhead 포함 누적 약 `0.44 it/s`; compile overhead 제외 steady-state는 baseline보다 빠를 가능성이 있어 재측정 필요 |
-
-중단 시점에는 live 학습 세션을 정리했다. 이어서 할 일은 아래 순서가 가장 안전하다.
-
-1. `baseline batch 16`과 `patch batch 16`을 같은 step 수로 다시 실행한다. 누적 속도와 별도로
-   첫 step compile overhead를 제외한 steady-state 속도를 계산한다.
-2. `patch batch 18`을 실행한다. baseline batch 18은 OOM이므로, patch batch 18이 통과하면
-   max batch가 개선된 것이다.
-3. patch batch 18이 OOM이면, patch도 안정 최대 batch는 16으로 본다.
-4. 최종 판단은 "안정 최대 batch 기준 64 epoch train-only 예상 시간"으로 한다. 단순 누적
-   progress bar 속도만 쓰지 말고, `torch.compile` 첫 step overhead는 장기 pretrain에서 거의
-   amortize되므로 steady-state도 같이 계산한다.
-
-이어서 실행할 대표 명령은 아래와 같다.
-
-```bash
-# baseline batch 16 재측정
-python scripts/launch_smart_ntp_a100x4x2_testa.py \
-  --namespace p-pnc \
-  --pods testa testaa \
-  --container main \
-  --project-root /tmp/catk_334_before \
-  --no-pull \
-  --experiment pre_bc_a100x4x2 \
-  --session catk-smart-ntp-a100x4x2 \
-  --task-name relkv_before_bs16_200 \
-  --master-port 29537 \
-  --nproc-per-node 4 \
-  --log-dir /mnt/nuplan/projects/catk/logs \
-  --train-batch-size 16 \
-  --val-batch-size 16 \
-  --test-batch-size 16 \
-  --limit-train-batches 200 \
-  --limit-val-batches 0 \
-  --max-epochs 1 \
-  --monitor-interval 10 \
-  --replace
-
-# patch batch 16 재측정
-python scripts/launch_smart_ntp_a100x4x2_testa.py \
-  --namespace p-pnc \
-  --pods testa testaa \
-  --container main \
-  --project-root /tmp/catk_334_after \
-  --no-pull \
-  --experiment pre_bc_a100x4x2 \
-  --session catk-smart-ntp-a100x4x2 \
-  --task-name relkv_after_bs16_200 \
-  --master-port 29538 \
-  --nproc-per-node 4 \
-  --log-dir /mnt/nuplan/projects/catk/logs \
-  --train-batch-size 16 \
-  --val-batch-size 16 \
-  --test-batch-size 16 \
-  --limit-train-batches 200 \
-  --limit-val-batches 0 \
-  --max-epochs 1 \
-  --monitor-interval 10 \
-  --replace
-
-# patch batch 18 capacity 확인
-python scripts/launch_smart_ntp_a100x4x2_testa.py \
-  --namespace p-pnc \
-  --pods testa testaa \
-  --container main \
-  --project-root /tmp/catk_334_after \
-  --no-pull \
-  --experiment pre_bc_a100x4x2 \
-  --session catk-smart-ntp-a100x4x2 \
-  --task-name relkv_after_bs18_160 \
-  --master-port 29539 \
-  --nproc-per-node 4 \
-  --log-dir /mnt/nuplan/projects/catk/logs \
-  --train-batch-size 18 \
-  --val-batch-size 18 \
-  --test-batch-size 18 \
-  --limit-train-batches 160 \
-  --limit-val-batches 0 \
-  --max-epochs 1 \
-  --monitor-interval 10 \
-  --replace
-```
-
-실험 중단 명령은 아래와 같다.
-
-```bash
-python scripts/launch_smart_ntp_a100x4x2_testa.py \
-  --namespace p-pnc \
-  --pods testa testaa \
-  --container main \
-  --project-root /tmp/catk_334_before \
-  --no-pull \
-  --session catk-smart-ntp-a100x4x2 \
-  --task-name relkv_cleanup \
-  --stop
-```
-
-로그 확인 명령은 아래를 쓰면 된다.
-
-```bash
-kubectl exec -n p-pnc testa -c main -- bash -lc \
-  'tail -120 /mnt/nuplan/projects/catk/logs/tmux_smart_ntp_a100x4x2/<TASK_NAME>/testa.tmux.log'
-
-kubectl exec -n p-pnc testaa -c main -- bash -lc \
-  'grep -a -n -E "CUDA out of memory|OutOfMemory|FAILED|Signal|RuntimeError|Traceback|NCCL" \
-   /mnt/nuplan/projects/catk/logs/tmux_smart_ntp_a100x4x2/<TASK_NAME>/testaa.tmux.log | tail -80'
-
-kubectl exec -n p-pnc testa -c main -- \
-  nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader
-
-kubectl exec -n p-pnc testaa -c main -- \
-  nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader
-```
-
-다음 Codex에게 그대로 줄 수 있는 요청문:
-
-```text
-main README의 "334cbce 유사 relation KV compile 실험 인수인계" 절을 읽고,
-현재 main@af0afaa 기준으로 /tmp/catk_334_before와 /tmp/catk_334_after를 사용해
-testa/testaa A100x4x2에서 relation KV compile patch 전후를 이어서 측정해줘.
-이미 확인된 사실은 baseline batch20 OOM, baseline batch18 OOM, baseline batch16 통과,
-patch batch16 통과야. 이어서 baseline/patch batch16 200-step steady-state 속도와
-patch batch18 capacity를 측정하고, 안정 최대 batch 기준 64 epoch train-only 예상 시간을
-비교해서 334cbce 유사 최적화를 A100 main에 채택할지 결론 내려줘.
-```
-
-따라서 현재 A100x4x2 `testa/testaa` pretrain 기본값은
-`CATK_ATTENTION_GRAPH_FP32=0`, `data.train_use_eval_agent_selection=true`,
-`data.train_batch_size=13`이다. 위 시간은 train-only 추정이며,
-`check_val_every_n_epoch=16` validation과 checkpoint overhead는 별도로 더해진다.
-RMM checkpoint 선택용 fast scorer는 `model.model_config.scorer_scene_num=1680`을 기준으로
-validation batch 수를 자동 계산한다. A100x4x2 기본 `val_batch_size=13`, world size 8에서는
-rank당 17 batch, 전체 약 1680개 scenario가 RMM 계산에 들어간다. 64 epoch 학습에서는
-validation이 16 epoch마다 실행되어 총 4번의 checkpoint 후보를 만든다.
+현재 A100x4x2 `testa/testaa` pretrain 기본값은 `CATK_ATTENTION_GRAPH_FP32=0`,
+`data.train_use_eval_agent_selection=true`, `data.train_batch_size=13`이다. 위 시간은 train-only 추정이며,
+`check_val_every_n_epoch=16` validation과 checkpoint overhead는 별도로 더해진다. RMM checkpoint 선택용 fast scorer는
+`model.model_config.scorer_scene_num=1680`을 기준으로 validation batch 수를 자동 계산한다.
 
 기본 cache root는 pod별로 다르다.
 
