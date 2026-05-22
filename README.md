@@ -735,6 +735,7 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_stati
 | heterogeneous 설정 | `HeterogeneousDDPStrategy`, `HeterogeneousTorchElasticEnvironment` |
 | metadata 정책 | `--prebuild-metadata`로 sampler metadata를 먼저 만들고, 학습 중 missing build는 금지 |
 | validation 주기 | 기본 `check_val_every_n_epoch=32` |
+| fit-time closed-loop rollout 수 | 기본 `n_rollout_closed_val=32` |
 
 실제 6-H100 probe 결과 `train_batch_size=20`을 기본값으로 선택했습니다.
 
@@ -746,6 +747,15 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_stati
 | 26 | train forward 중 OOM | 156 | - | 약 79GB 사용 후 OOM | - | 제외 |
 
 따라서 이 6-GPU 조합에서는 `train_batch_size=20`이 안정성과 완료 속도의 균형이 가장 좋습니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다.
+
+H100x6 launcher는 학습 중 Fast RMM validation의 분산을 줄이기 위해 `model.model_config.n_rollout_closed_val=32`를 기본값으로 고정합니다. 필요하면 `--n-rollout-closed-val 16`처럼 명시적으로 바꿀 수 있습니다. `hsb-npc-training-2` 4 GPU + `wo-pvc-2` 2 GPU에서 `limit_train_batches=1`, `limit_val_batches=1`, `train_batch_size=2`, `val_batch_size=16` 조건으로 직접 비교했을 때 validation 1 batch 시간은 다음과 같았습니다.
+
+| `n_rollout_closed_val` | validation 1 batch | 관측 GPU peak |
+|---:|---:|---:|
+| 16 | 약 `33s` | 약 `22.4GB` |
+| 32 | 약 `41s` | 약 `37.9GB` |
+
+현재 preset의 fit-time validation은 `scorer_scene_num=1680`, world size `6`, `val_batch_size=16` 기준으로 rank당 약 18개 validation batch를 처리합니다. 위 probe를 단순 외삽하면 validation 1회는 `n_rollout_closed_val=16` 대비 약 `+2.4분`, 기본 64 epoch 학습의 validation 2회 전체로는 약 `+4.8분` 늘어나는 수준입니다. 메모리는 rollout 수 증가에 따라 유의미하게 늘지만 H100 80GB 기준 관측 peak는 아직 여유가 있었고, closed-loop rollout 경로에는 CUDA OOM 시 rollout chunk를 줄여 재시도하는 fallback이 있어 validation batch가 바로 치명적으로 실패할 가능성은 낮습니다.
 
 Agent trajectory token matching은 모든 coarse segment를 batched query로 묶어 처리합니다. `hsb-npc-training-2`, `wo-pvc-2` H100에서 같은 synthetic workload(`n_agent=1536`, `n_step=91`, 실제 token bank 사용)를 기준으로 reference loop와 비교했을 때 `valid_mask`, `gt_idx`, `sampled_idx`는 exact match이고 pose/heading 최대 오차는 `0.0`이었습니다.
 
@@ -836,7 +846,7 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_r
 | resume 기준 | rank 0 log dir 아래 최신 `epoch_last.ckpt`, 없으면 `last.ckpt` |
 | 학습 설정 | 위 H100x6 execution-context balanced pretrain과 동일 |
 
-이 launcher는 `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false`, heterogeneous DDP strategy, metadata cache path override를 단발 H100x6 launcher와 동일하게 고정합니다. 즉 OOM fallback으로 바뀌는 것은 per-GPU batch size뿐이고, supervision, loss mask, transition-aligned target, outlier filter, validation 주기는 동일합니다.
+이 launcher는 `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false`, heterogeneous DDP strategy, metadata cache path override를 단발 H100x6 launcher와 동일하게 고정합니다. 즉 OOM fallback으로 바뀌는 것은 per-GPU batch size뿐이고, supervision, loss mask, transition-aligned target, outlier filter, validation 주기, validation rollout 수는 동일합니다.
 
 실험 코드만 멈추고 pod는 그대로 두려면:
 

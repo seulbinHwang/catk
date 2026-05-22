@@ -98,6 +98,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nproc-per-node", default="gpu", choices=("gpu", "auto"))
     parser.add_argument("--learning-rate", default="6e-4")
     parser.add_argument("--val-batch-size", default="16")
+    parser.add_argument(
+        "--n-rollout-closed-val",
+        type=int,
+        default=32,
+        help=(
+            "Number of closed-loop rollouts per scenario during validation. "
+            "Forwarded to the H100x6 launcher defaults."
+        ),
+    )
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--max-epochs", default="")
@@ -156,6 +165,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"this preset expects exactly {len(h100x6.DEFAULT_PODS)} pods")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
+    if args.n_rollout_closed_val < 1:
+        parser.error("--n-rollout-closed-val must be >= 1")
     if args.oom_step < 1:
         parser.error("--oom-step must be >= 1")
     if args.min_bs < 1:

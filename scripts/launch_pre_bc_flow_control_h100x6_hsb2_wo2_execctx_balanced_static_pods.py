@@ -119,6 +119,7 @@ def training_extra_hydra_overrides(args: argparse.Namespace) -> str:
             "data.train_memory_balance_build_on_missing=false",
             "trainer.use_distributed_sampler=false",
             f"trainer.check_val_every_n_epoch={args.check_val_every_n_epoch}",
+            f"model.model_config.n_rollout_closed_val={args.n_rollout_closed_val}",
             *HETEROGENEOUS_STRATEGY_OVERRIDES,
         ]
     )
@@ -197,6 +198,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", type=int, default=20)
     parser.add_argument("--learning-rate", default="6e-4")
     parser.add_argument("--val-batch-size", default="16")
+    parser.add_argument(
+        "--n-rollout-closed-val",
+        type=int,
+        default=32,
+        help=(
+            "Number of closed-loop rollouts per scenario during validation. "
+            "The H100x6 run uses 32 by default for a lower-variance fit-time Fast RMM score."
+        ),
+    )
     parser.add_argument("--master-port", default="29620")
     parser.add_argument("--checkpoint-sync-port", default="29621")
     parser.add_argument("--nproc-per-node", default="gpu", choices=("gpu", "auto"))
@@ -257,6 +267,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"this preset expects exactly {len(DEFAULT_PODS)} pods")
     if args.train_batch_size < 1:
         parser.error("--train-batch-size must be >= 1")
+    if args.n_rollout_closed_val < 1:
+        parser.error("--n-rollout-closed-val must be >= 1")
     if args.metadata_num_workers < 1:
         parser.error("--metadata-num-workers must be >= 1")
     if args.check_val_every_n_epoch < 1:
