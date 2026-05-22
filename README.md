@@ -653,6 +653,15 @@ H100 4+2, per-rank `train_batch_size=15`, 6-rank 평균 profile 기준:
 | token argmin | `20.06ms` | `9.53ms` | `-52.5%` |
 | 전체 train step | `1093.61ms` | `1087.18ms` | `-0.59%` |
 
+Attention layer의 relation path는 `LayerNorm(r) -> relation K/V projection`을 하나의 compile-friendly 함수로 묶어 실행합니다. state_dict 키와 trainable parameter 수는 그대로이며, graph edge/radius/head/layer/hidden dim도 바꾸지 않습니다. `CATK_COMPILE_ATTENTION_RELATION_KV=0`을 주면 기존 eager 함수형 경로로 비활성화할 수 있습니다. 기존 module path 대비 H100에서 forward 최대 오차는 `1.7e-6`, 입력/parameter gradient 최대 오차는 `1e-9` 수준입니다. H100 4+2, per-rank `train_batch_size=16`, 6-rank 평균 profile 기준:
+
+| 구간 | 기존 | relation K/V compile | 변화 |
+|---|---:|---:|---:|
+| 전체 train step | `734.98ms` | `539.14ms` | `-26.6%` |
+| map-to-agent attention | `270.09ms` | `145.33ms` | `-46.2%` |
+| map point-to-point attention | `125.71ms` | `67.30ms` | `-46.5%` |
+| agent-to-agent attention | `48.65ms` | `38.21ms` | `-21.5%` |
+
 실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:
 
 ```bash
