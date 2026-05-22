@@ -1087,6 +1087,11 @@ class SMARTFlow(LightningModule):
                 num_graphs=num_graphs,
             ),
         }
+        if "light_type" in map_feature:
+            expanded_map_feature["light_type"] = self._repeat_tensor_on_first_dim(
+                map_feature["light_type"],
+                repeat_count,
+            )
         return expanded_map_feature
 
     def _build_parallel_rollout_tokenized_agent(

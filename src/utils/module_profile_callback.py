@@ -332,7 +332,13 @@ class ModuleProfileCallback(Callback):
             agent_context,
             "build_map2agent_edge",
             "agent_context.map2agent_edge_build",
-            params=self._unique_param_count([agent_context.r_pt2a_emb]),
+            params=self._unique_param_count(
+                [
+                    agent_context.r_pt2a_emb,
+                    agent_context.light_pl2a_emb,
+                    agent_context.light_time_pl2a_emb,
+                ]
+            ),
         )
         self._wrap_method(
             agent_context,
