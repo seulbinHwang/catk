@@ -247,13 +247,13 @@ deterministic nearest-token tokenization, agent selection, `num_freq_bands: 66`
 위해 아래 training/runtime 값만 명시한다.
 
 - `trainer.devices: 4`, `trainer.num_nodes: 2`
-- `data.train_batch_size: 12`, 즉 8개 rank 기준 effective global batch 96
+- `data.train_batch_size: 13`, 즉 8개 rank 기준 effective global batch 104
 - `model.model_config.lr: 6e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
 - `model.model_config.scorer_scene_num: 1680`
 - `trainer.max_epochs: 64`, `check_val_every_n_epoch: 16`
 - `trainer.precision: bf16-mixed`, `gradient_clip_val: 1.0`,
   `accumulate_grad_batches: 1`
-- `data.val_batch_size: 12`, `data.test_batch_size: 12`, `num_workers: 4`
+- `data.val_batch_size: 13`, `data.test_batch_size: 13`, `num_workers: 4`
 - `data.train_memory_balanced_batching: true`,
   `trainer.use_distributed_sampler: false`
 
@@ -276,17 +276,10 @@ message 생성, scatter aggregation으로 이어지는 graph attention 경로만
 모델 구조, 파라미터 수, edge set, radius, loss target은 바뀌지 않는다. 바뀌는 것은
 attention 내부 계산 dtype 경계뿐이다.
 
-또한 `AttentionLayer`의 relation `LayerNorm -> key/value projection` 경로는 기본으로
-`torch.compile` 친화 함수로 묶어 실행한다. 이 경로는
-`CATK_COMPILE_ATTENTION_RELATION_KV=0`으로 끌 수 있다. 수식과 파라미터 수는 그대로이며,
-relation key/value projection을 PyG `message()` 내부 작은 op로 남겨두지 않고 한 번에
-계산하도록 정리한 최적화다. A100에서는 이 최적화가 step time을 줄였지만 peak memory를
-늘리므로, 현재 `testa/testaa` 기본 batch는 OOM 여유를 고려해 12로 둔다.
-
 이 preset은 `data.train_memory_balanced_batching=true`도 켠다. 이 sampler는 각 training
 pickle의 agent 수, valid agent-step 수, map point 수를 metadata cache로 한 번 기록한 뒤,
 agent가 많은 scene이 같은 rank-local batch에 몰리지 않도록 batch 순서만 다시 짠다.
-학습 objective, 모델 구조, per-GPU `train_batch_size=12`, 전체 effective batch 96은
+학습 objective, 모델 구조, per-GPU `train_batch_size=13`, 전체 effective batch 104는
 그대로 유지된다. 대신 random shuffle 순서가 바뀌므로 기존 run을 resume하더라도 bitwise로
 완전히 같은 sample 순서는 아니다.
 
@@ -318,30 +311,27 @@ build 중 pod가 죽어 `.lock` 파일만 남은 경우에는 lock heartbeat가 
 검증할 수 있는 범위인 `24` 이하의 양의 정수만 허용한다. `--accumulate-grad-batches 2`처럼
 gradient accumulation을 켜는 override는 학습을 시작하기 전에 실패한다.
 
-relation K/V compile 최적화 적용 후, `testa/testaa`, A100 4장 x 2 pod, validation off,
+`main@7dd61c4`, `testa/testaa`, A100 4장 x 2 pod, validation off,
 `CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=true` 조건에서
-batch capacity를 다시 측정했다.
-training cache `486,996`개 기준으로 64 epoch train-only 시간을 추정하면 아래와 같다.
+batch capacity를 다시 측정했다. training cache `486,996`개 기준으로 64 epoch train-only
+시간을 추정하면 아래와 같다.
 
-| per-GPU batch | 결과 | profiler 기준 step time | 속도 | 관측 peak memory | 64 epoch train-only 예상 |
+| per-GPU batch | 결과 | 500-step 시간 | 속도 | 관측 peak memory | 64 epoch train-only 예상 |
 |---:|---|---:|---:|---:|---:|
-| 13 | CUDA OOM | 첫 train step 부근 실패 | - | 약 `78,811 MiB` 후 추가 `784 MiB` 할당 실패 | 사용 안 함 |
-| 12 | 통과 | `654.6 ms/step` | `1.53 it/s` | 약 `75,181 MiB` | 약 `59.0시간` |
+| 13 | 통과 | `7:05` | `1.17 it/s` | `79,267 MiB` | 약 `71.2시간` |
+| 14 | CUDA OOM | step 205에서 실패 | `1.07 it/s` | `80,747 MiB` | 사용 안 함 |
 
-relation K/V compile 경로는 step 속도를 줄이지만 peak memory도 늘린다. A100 80GB 장기
-pretrain에서는 batch 13이 OOM이므로, 기본값은 안정성을 우선해 batch 12로 둔다. 같은
-profiling 조건에서 기존 relation K/V 경로의 batch 13은 `768.4 ms/step`, 64 epoch train-only
-약 `64.0시간`으로 측정되었고, compile 경로 batch 12는 batch가 낮아져 step 수가 늘어도
-전체 train-only 예상 시간이 약 `59.0시간`으로 줄었다.
+`7dd61c4`의 Fourier embedding compile 경로는 step 속도를 크게 줄이지만 peak memory도
+늘린다. A100 80GB 장기 pretrain에서는 batch 14가 OOM이므로, 기본값은 안정성을 우선해
+batch 13으로 둔다.
 
 따라서 현재 A100x4x2 `testa/testaa` pretrain 기본값은
 `CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=true`,
-`CATK_COMPILE_ATTENTION_RELATION_KV=1`, `data.train_batch_size=12`이다. 위 시간은
-train-only 추정이며,
+`data.train_batch_size=13`이다. 위 시간은 train-only 추정이며,
 `check_val_every_n_epoch=16` validation과 checkpoint overhead는 별도로 더해진다.
 RMM checkpoint 선택용 fast scorer는 `model.model_config.scorer_scene_num=1680`을 기준으로
-validation batch 수를 자동 계산한다. A100x4x2 기본 `val_batch_size=12`, world size 8에서는
-rank당 18 batch, 전체 약 1680개 scenario가 RMM 계산에 들어간다. 64 epoch 학습에서는
+validation batch 수를 자동 계산한다. A100x4x2 기본 `val_batch_size=13`, world size 8에서는
+rank당 17 batch, 전체 약 1680개 scenario가 RMM 계산에 들어간다. 64 epoch 학습에서는
 validation이 16 epoch마다 실행되어 총 4번의 checkpoint 후보를 만든다.
 
 기본 cache root는 pod별로 다르다.
