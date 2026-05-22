@@ -94,9 +94,11 @@ def test_empty_target_automatic_step_clears_zero_grads_before_adamw_decay() -> N
 def test_empty_local_target_keeps_grad_when_another_rank_has_target() -> None:
     model = _make_minimal_model()
     optimizer = torch.optim.AdamW(model.encoder.parameters(), lr=1.0, weight_decay=0.1)
-    model._automatic_open_loop_has_target_since_step = False
+    # The DDP any-target flag is synchronized in training_step with the packed
+    # train logging reduce. on_before_optimizer_step only consumes that cached
+    # global flag so it does not launch a second collective.
+    model._automatic_open_loop_has_target_since_step = True
     model._skip_next_automatic_optimizer_step = False
-    model._sync_distributed_bool_any = lambda value, *, device=None: True  # type: ignore[method-assign]
 
     loss = model._build_trainable_connected_zero_loss(model.encoder)
     loss.backward()
