@@ -21,7 +21,7 @@ model:
     lr: 4e-4
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
-    n_rollout_closed_val: 16
+    n_rollout_closed_val: 32
     sim_agents_context_cache_size: 64
     n_vis_batch: 0
     n_vis_scenario: 0

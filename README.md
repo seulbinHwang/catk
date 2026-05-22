@@ -748,7 +748,7 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_stati
 
 따라서 이 6-GPU 조합에서는 `train_batch_size=20`이 안정성과 완료 속도의 균형이 가장 좋습니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다.
 
-H100x6 launcher는 학습 중 Fast RMM validation의 분산을 줄이기 위해 `model.model_config.n_rollout_closed_val=32`를 기본값으로 고정합니다. 필요하면 `--n-rollout-closed-val 16`처럼 명시적으로 바꿀 수 있습니다. `hsb-npc-training-2` 4 GPU + `wo-pvc-2` 2 GPU에서 `limit_train_batches=1`, `limit_val_batches=1`, `train_batch_size=2`, `val_batch_size=16` 조건으로 직접 비교했을 때 validation 1 batch 시간은 다음과 같았습니다.
+H100x6 launcher는 학습 중 Fast RMM validation의 분산을 줄이기 위해 `model.model_config.n_rollout_closed_val=32`를 기본값으로 고정합니다. 필요하면 `--n-rollout-closed-val 64`처럼 명시적으로 더 키울 수 있습니다. `hsb-npc-training-2` 4 GPU + `wo-pvc-2` 2 GPU에서 `limit_train_batches=1`, `limit_val_batches=1`, `train_batch_size=2`, `val_batch_size=16` 조건으로 직접 비교했을 때 validation 1 batch 시간은 다음과 같았습니다.
 
 | `n_rollout_closed_val` | validation 1 batch | 관측 GPU peak |
 |---:|---:|---:|
@@ -1073,7 +1073,7 @@ python scripts/launch_pre_bc_flow_control_v100x47_static_pods.py --stop
 - `model.model_config.val_open_loop=true/false`로 open-loop validation on/off를 바꿉니다.
 - `model.model_config.val_closed_loop=true/false`로 closed-loop validation on/off를 바꿉니다.
 - validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
-- `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. 현재 `pre_bc_flow` 기본값은 `16`입니다.
+- `model.model_config.n_rollout_closed_val`는 `val_closed_loop`에서 scene당 몇 번 rollout sampling할지 정합니다. 현재 `pre_bc_flow` 기본값은 `32`입니다.
 - `model.model_config.decoder.flow_window_steps`는 flow matching이 한 번에 생성하는 10Hz 미래 길이입니다. 기본값은 `20` step, 즉 `2초`입니다.
 - `5`의 배수여야 하며 `decoder.num_future_steps`보다 클 수 없습니다.
 - `model.model_config.decoder.closed_loop_rollout_mode=raw_fm|matched_token_chunk`로 closed-loop에서 실제로 export/score/video에 쓰는 10Hz rollout 표현을 고릅니다. 기본값은 `raw_fm`이며, `matched_token_chunk`도 내부 문맥 상태 자체는 실제 FM commit을 유지합니다.
@@ -1374,7 +1374,7 @@ torchrun \
 - `flow_window_steps=20` 을 preset 자체에서 고정합니다. 이 horizon 에 맞춰 아래 batch size 상한을 실측했기 때문에 모델 default 가 바뀌더라도 4x H100 메모리 프로파일이 유지됩니다.
 - `train_batch_size=52` 가 기본값입니다. 커밋 `b12e653` 에서 추가된 `AttentionLayer` activation recomputation 이 기본으로 켜진 상태에서 4x H100 80GB 로 실측한 상한입니다. `trainer.devices=4`, `accumulate_grad_batches=1` -> effective global batch **`208`**.
 - `lr=2.667e-4` 는 이전 per-GPU bs=20 (global 80) 기준으로 맞춰둔 값입니다. 새 global batch 208 에 선형 LR scaling rule 을 적용하려면 `model.model_config.lr=6.933e-4` (= `4e-4 * 208/120`) 로 CLI override 하세요. optimizer 동작을 무언 중에 바꾸지 않기 위해 default 는 기존 값을 유지합니다.
-- `max_epochs(=64)`, `check_val_every_n_epoch(=8)`, `limit_val_batches(=0.1)`, `val_batch_size(=16)`, `n_rollout_closed_val(=16)` 은 6xH100 preset 과 동일합니다.
+- `max_epochs(=64)`, `check_val_every_n_epoch(=8)`, `limit_val_batches(=0.1)`, `val_batch_size(=16)`, `n_rollout_closed_val(=32)` 은 6xH100 preset 과 동일합니다.
 - `flow_window_steps=20`, 4x H100 80GB 에서 `AttentionLayer` activation recomputation 이 켜진 상태로 실측한 per-GPU 메모리 수치입니다.
   - `bs=40`: peak reserved 약 80.2%
   - `bs=48`: peak reserved 약 85.3%
@@ -1986,7 +1986,7 @@ closed-loop validation과 Sim Agents submission export에서는 모델이 실제
 - `test/WOSAC-CPD/value`: test submission export에서 계산되는 CPD입니다. test set은 GT 미래를 제공하지 않으므로 CES는 기록하지 않습니다.
 - `*/WOSAC-CPD/DPR`: `model.model_config.wosac_cpd_reference`에 flow-pretrain CPD를 넣었을 때만 기록됩니다. 값은 `현재 CPD / 기준 CPD` 입니다.
 
-이 metric들은 학습 step에서는 계산하지 않고, validation/test closed-loop rollout이 만들어진 뒤에만 계산합니다. `n_rollout_closed_val`이 16이면 이미 생성된 16개 rollout만 사용하고 별도 rollout을 추가 생성하지 않습니다.
+이 metric들은 학습 step에서는 계산하지 않고, validation/test closed-loop rollout이 만들어진 뒤에만 계산합니다. `n_rollout_closed_val`이 32이면 이미 생성된 32개 rollout만 사용하고 별도 rollout을 추가 생성하지 않습니다.
 
 CPD/CES normalization은 기본적으로 training cache 전체에서 offline으로 계산한 agent type별 future-motion scale을 고정값으로 사용합니다. 순서는 `vehicle, pedestrian, cyclist`입니다.
 
