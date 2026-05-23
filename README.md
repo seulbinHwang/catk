@@ -757,7 +757,7 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_r
 | OOM 완화 | agent 수 기반 memory-balanced batch sampler + OOM 발생 시 batch-size 1씩 감소 후 checkpoint resume |
 | heterogeneous 설정 | `HeterogeneousDDPStrategy`, `HeterogeneousTorchElasticEnvironment` |
 | metadata 정책 | `--prebuild-metadata`로 sampler metadata를 먼저 만들고, 학습 중 missing build는 금지 |
-| validation 주기 | 기본 `check_val_every_n_epoch=32` |
+| validation 주기 | 기본 `check_val_every_n_epoch=16` |
 | fit-time closed-loop rollout 수 | 기본 `n_rollout_closed_val=32` |
 
 최신 코드 기준 H100x6 probe 결과 `train_batch_size=19`를 기본 시작값으로 선택했습니다.
@@ -803,7 +803,7 @@ Flow target 생성도 anchor 16개를 하나씩 반복하지 않고, 모든 anch
 - `--extra-hydra-overrides`로 `data.train_memory_balanced_batches=false` 또는 `trainer.use_distributed_sampler=true`를 넣으면 launcher가 학습 시작 전에 실패합니다.
 - datamodule도 distributed fallback을 갖습니다. 다른 실험에서 memory-balanced sampler를 끄더라도 `world_size>1`이면 train dataloader가 PyTorch `DistributedSampler`를 붙여 rank별 train sample을 나눕니다. 즉 이 launcher의 강제 설정은 OOM 완화를 위한 운영 정책이고, datamodule fallback은 중복 학습을 막는 마지막 안전장치입니다.
 - `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-1`은 rank `4~5`를 받습니다. 내부 sampler/W&B runtime metric은 실제 `world_size=6` 기준입니다. Lightning의 device summary처럼 local device 수와 node 수를 따로 보여주는 출력은 4+2 구성을 완전히 설명하지 못할 수 있으므로, step 수와 global batch는 launcher의 `manual world_size: 6` 및 W&B `train_setup/global_batch_size=114`를 기준으로 확인합니다.
-- 기본 64 epoch 학습에서는 fit-time validation이 epoch `31`, `63` 종료 후 총 2번 실행됩니다. 더 자주 RMM을 확인해야 하면 runtime 비용을 감수하고 아래처럼 16 epoch 주기로 실행합니다.
+- 기본 64 epoch 학습에서는 fit-time validation이 `check_val_every_n_epoch=16` 기준으로 epoch `15`, `31`, `47`, `63` 종료 후 총 4번 실행됩니다. 다른 주기가 필요하면 아래처럼 명시적으로 override합니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py \

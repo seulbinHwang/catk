@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--check-val-every-n-epoch",
         type=int,
-        default=32,
+        default=16,
         help="Validation cadence for the 64-epoch pretrain.",
     )
     parser.add_argument(

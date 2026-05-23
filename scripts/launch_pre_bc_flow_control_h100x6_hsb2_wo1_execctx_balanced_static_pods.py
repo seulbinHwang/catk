@@ -216,10 +216,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--check-val-every-n-epoch",
         type=int,
-        default=32,
+        default=16,
         help=(
-            "Validation cadence for the H100x6 run. Default keeps the 64-epoch "
-            "pretrain at two fit-time validations; use 16 for four validations."
+            "Validation cadence for the H100x6 run. Default runs four fit-time "
+            "validations during the 64-epoch pretrain."
         ),
     )
     parser.add_argument(
