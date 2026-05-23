@@ -4,7 +4,7 @@
 Targets existing pods only:
 
 * hsb-npc-training: 4 visible H100 GPUs
-* wo-pvc:           2 visible H100 GPUs
+* wo-pvc-1:         2 visible H100 GPUs
 
 The launcher uses the generic heterogeneous-rank retry wrapper, so it never
 creates, deletes, or restarts pods. It starts/replaces only the configured tmux
@@ -24,7 +24,7 @@ from pathlib import Path
 RETRY_SCRIPT = Path(__file__).with_name("h100x4_multinode_pretrain_with_oom_retry.sh")
 BASE_LAUNCHER = Path(__file__).with_name("launch_h100x4_multinode_pretrain_tmux.py")
 
-DEFAULT_PODS = ("hsb-npc-training", "wo-pvc")
+DEFAULT_PODS = ("hsb-npc-training", "wo-pvc-1")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_"
@@ -32,7 +32,7 @@ DEFAULT_TASK_NAME = (
 )
 DEFAULT_SESSION = "catk-control-pretrain-h100x4-h100x2-prefix-default-noslip"
 DEFAULT_METADATA_CACHE = (
-    "dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc.pt"
+    "dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc1.pt"
 )
 DEFAULT_EXTRA_HYDRA_OVERRIDES = (
     "trainer.strategy._target_="
@@ -134,7 +134,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Remote metadata cache path. Defaults to "
-            "REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc.pt."
+            "REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc1.pt."
         ),
     )
     parser.add_argument("--memory-metadata-num-workers", type=int, default=8)
@@ -167,7 +167,7 @@ def main() -> int:
     )
     pod_cache_roots = args.pod_cache_root or [
         "hsb-npc-training=/workspace/womd_v1_3/SMART_cache",
-        "wo-pvc=/workspace/womd_v1_3/SMART_cache",
+        "wo-pvc-1=/workspace/womd_v1_3/SMART_cache",
     ]
     extra_hydra_overrides = " ".join(
         part

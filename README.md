@@ -593,9 +593,9 @@ python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --dry-run
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_static_pods.py --stop
 ```
 
-#### hsb-npc-training/wo-pvc H100x4+H100x2 prefix-valid default no-slip ratio pretrain
+#### hsb-npc-training/wo-pvc-1 H100x4+H100x2 prefix-valid default no-slip ratio pretrain
 
-`hsb-npc-training`의 H100 4장과 `wo-pvc`의 H100 2장을 묶어 `semi_control_stable` 최신 prefix-valid default no-slip control-space pretrain을 돌릴 때는 아래 launcher를 씁니다.
+`hsb-npc-training`의 H100 4장과 `wo-pvc-1`의 H100 2장을 묶어 `semi_control_stable` 최신 prefix-valid default no-slip control-space pretrain을 돌릴 때는 아래 launcher를 씁니다. `wo-pvc-1`은 기존 문제 node를 피해서 재스케줄한 pod이며, 기본 NCCL DDP smoke를 통과한 조합입니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --replace
@@ -612,7 +612,7 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 
 | 항목 | 설정 |
 |---|---|
-| pod / GPU | `hsb-npc-training` 4 H100 + `wo-pvc` 2 H100 = 총 6 rank |
+| pod / GPU | `hsb-npc-training` 4 H100 + `wo-pvc-1` 2 H100 = 총 6 rank |
 | cache root | 두 pod 모두 `/workspace/womd_v1_3/SMART_cache` |
 | context / anchor | `18-token / 16-anchor` Tail-Prefix supervision |
 | Flow target mask | `use_prefix_valid_future_loss_mask=true` |
@@ -622,9 +622,9 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 | precision | `bf16-mixed` |
 | batch / lr | per-rank `train_batch_size=17`, effective global batch `102`, `lr=6e-4` |
 | fit-time validation | `check_val_every_n_epoch=16`, 64 epoch 중 15/31/47/63 epoch 이후 4회 평가 |
-| metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc.pt` preflight 생성/검증 |
+| metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc1.pt` preflight 생성/검증 |
 
-두 pod의 local GPU 수가 `4 + 2`로 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를 쓰면 안 됩니다. 이 launcher는 `--manual-rank-offsets` 경로를 사용해 `hsb-npc-training`에 rank `0~3`, `wo-pvc`에 rank `4~5`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment` / `HeterogeneousDDPStrategy`로 Lightning의 homogeneous world-size 가정을 완화합니다. sampler, validation sharding, Fast WOSAC scorer는 launcher가 넣은 실제 `WORLD_SIZE=6`을 기준으로 동작하도록 회귀 테스트로 고정합니다.
+두 pod의 local GPU 수가 `4 + 2`로 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를 쓰면 안 됩니다. 이 launcher는 `--manual-rank-offsets` 경로를 사용해 `hsb-npc-training`에 rank `0~3`, `wo-pvc-1`에 rank `4~5`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment` / `HeterogeneousDDPStrategy`로 Lightning의 homogeneous world-size 가정을 완화합니다. sampler, validation sharding, Fast WOSAC scorer는 launcher가 넣은 실제 `WORLD_SIZE=6`을 기준으로 동작하도록 회귀 테스트로 고정합니다.
 
 H100 4+2 batch size probe 결과:
 
@@ -665,7 +665,7 @@ tmux 확인:
 
 ```bash
 kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-prefix-default-noslip
-kubectl exec -it -n p-pnc wo-pvc -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-prefix-default-noslip
+kubectl exec -it -n p-pnc wo-pvc-1 -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-prefix-default-noslip
 ```
 
 실험 코드만 멈추고 pod는 그대로 두려면:
