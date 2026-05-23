@@ -64,7 +64,10 @@ class FourierEmbedding(nn.Module):
                 self._compiled_embed_continuous = torch.compile(
                     self._embed_continuous_accumulated,
                     dynamic=True,
-                    mode="reduce-overhead",
+                    # SMART batches have dynamic edge counts. CUDA graph capture
+                    # can keep stale graph-pool storage alive across backward
+                    # passes, so keep Inductor compilation but disable cudagraphs.
+                    options={"triton.cudagraphs": False},
                 )
             return self._compiled_embed_continuous(continuous_inputs)
         except Exception:
