@@ -626,7 +626,7 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 
 두 pod의 local GPU 수가 `4 + 2`로 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를 쓰면 안 됩니다. 이 launcher는 `--manual-rank-offsets` 경로를 사용해 `hsb-npc-training`에 rank `0~3`, `wo-pvc`에 rank `4~5`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment` / `HeterogeneousDDPStrategy`로 Lightning의 homogeneous world-size 가정을 완화합니다. sampler, validation sharding, Fast WOSAC scorer는 launcher가 넣은 실제 `WORLD_SIZE=6`을 기준으로 동작하도록 회귀 테스트로 고정합니다.
 
-최신 `334cbce` 기준 batch size probe 결과:
+H100 4+2 batch size probe 결과:
 
 | per-rank batch | probe 결과 | worst peak reserved | 판단 |
 |---:|---:|---:|---|
@@ -638,7 +638,7 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 | 17 | 160-step 성공, full run 초기 1k step 정상 진행 | `89.98%` | 기본값 |
 | 16 | 160-step 성공 | `86.25%` | OOM fallback 1순위 |
 
-따라서 이 6 H100 조합에서는 `train_batch_size=17`을 기본 시작값으로 둡니다. 334cbce의 relation K/V compile 최적화 이후 `bs17`은 full run 초기 1k step 이상에서 worst peak reserved 약 `90%`로 정상 진행했고, `bs18~20`은 OOM 없이 짧게 통과하더라도 peak가 `94~96%`라 장기 학습에는 위험합니다. training split `486,995`개 / global batch `102` 기준 한 epoch는 약 `4,775` step입니다. full run 초반 측정 기준 한 epoch는 약 `52분`, 64 epoch train-only 예상 시간은 약 `56h`이며, validation은 16 epoch마다 총 4회 추가됩니다. launcher의 기본 OOM fallback은 `17 -> 16 -> 15 -> ... -> 12`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt` 또는 `last.ckpt`를 peer pod로 동기화한 뒤 재개합니다. 더 낮은 batch까지 자동 재시도해야 하면 `--min-bs`를 더 낮게 override합니다.
+따라서 이 6 H100 조합에서는 `train_batch_size=17`을 기본 시작값으로 둡니다. `bs17`은 full run 초기 1k step 이상에서 worst peak reserved 약 `90%`로 정상 진행했고, `bs18~20`은 OOM 없이 짧게 통과하더라도 peak가 `94~96%`라 장기 학습에는 위험합니다. training split `486,995`개 / global batch `102` 기준 한 epoch는 약 `4,775` step입니다. launcher의 기본 OOM fallback은 `17 -> 16 -> 15 -> ... -> 12`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt` 또는 `last.ckpt`를 peer pod로 동기화한 뒤 재개합니다. 더 낮은 batch까지 자동 재시도해야 하면 `--min-bs`를 더 낮게 override합니다.
 
 Agent tokenization의 첫 valid 이전 token-step 외삽은 agent별 Python loop 대신 batch mask/index 연산으로 처리합니다. 외삽 규칙은 기존과 같습니다. 첫 valid step을 기준으로 직전 coarse token boundary까지 `vel[first_valid] * 0.1` 간격으로 위치를 뒤쪽으로 채우고, velocity/heading/valid도 같은 prefix 구간에 복사합니다. `t=10`인데 raw step 5가 invalid인 history 보강 예외도 유지합니다. H100 4+2, per-rank `train_batch_size=15`, 6-rank 평균 profile 기준으로 이 변경은 외삽 구간을 `35.29ms -> 0.49ms`로 줄였고, token processor 전체는 `99.70ms -> 65.43ms`, 전체 train step은 `1133.86ms -> 1107.43ms`로 줄었습니다. 기존 loop reference 대비 위치/heading/velocity 오차는 `1e-6` 이하이며 valid mask는 동일합니다.
 
@@ -654,15 +654,6 @@ H100 4+2, per-rank `train_batch_size=15`, 6-rank 평균 profile 기준:
 | contour 생성 | `6.79ms` | `0.72ms` | `-89.4%` |
 | token argmin | `20.06ms` | `9.53ms` | `-52.5%` |
 | 전체 train step | `1093.61ms` | `1087.18ms` | `-0.59%` |
-
-Attention layer의 relation path는 `LayerNorm(r) -> relation K/V projection`을 하나의 compile-friendly 함수로 묶어 실행합니다. state_dict 키와 trainable parameter 수는 그대로이며, graph edge/radius/head/layer/hidden dim도 바꾸지 않습니다. `CATK_COMPILE_ATTENTION_RELATION_KV=0`을 주면 기존 eager 함수형 경로로 비활성화할 수 있습니다. 기존 module path 대비 H100에서 forward 최대 오차는 `1.7e-6`, 입력/parameter gradient 최대 오차는 `1e-9` 수준입니다. H100 4+2, per-rank `train_batch_size=16`, 6-rank 평균 profile 기준:
-
-| 구간 | 기존 | relation K/V compile | 변화 |
-|---|---:|---:|---:|
-| 전체 train step | `734.98ms` | `539.14ms` | `-26.6%` |
-| map-to-agent attention | `270.09ms` | `145.33ms` | `-46.2%` |
-| map point-to-point attention | `125.71ms` | `67.30ms` | `-46.5%` |
-| agent-to-agent attention | `48.65ms` | `38.21ms` | `-21.5%` |
 
 실행 전에 실제 환경 변수와 retry wrapper만 확인하려면:
 

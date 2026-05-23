@@ -1,9 +1,7 @@
-import os
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
 
@@ -52,42 +50,10 @@ class AttentionLayer(MessagePassing):
             self.attn_prenorm_x_dst = self.attn_prenorm_x_src
         if has_pos_emb:
             self.attn_prenorm_r = nn.LayerNorm(hidden_dim)
-            self._compiled_relation_kv_project = None
-            self._compile_relation_kv_project = os.environ.get(
-                "CATK_COMPILE_ATTENTION_RELATION_KV", "1"
-            ).lower() not in {"0", "false", "off", "no"}
         self.attn_postnorm = nn.LayerNorm(hidden_dim)
         self.ff_prenorm = nn.LayerNorm(hidden_dim)
         self.ff_postnorm = nn.LayerNorm(hidden_dim)
         self.apply(weight_init)
-
-    def _relation_kv_project_eager(self, r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        r = F.layer_norm(
-            r,
-            self.attn_prenorm_r.normalized_shape,
-            self.attn_prenorm_r.weight,
-            self.attn_prenorm_r.bias,
-            self.attn_prenorm_r.eps,
-        )
-        k_r = F.linear(r, self.to_k_r.weight, self.to_k_r.bias).view(-1, self.num_heads, self.head_dim)
-        v_r = F.linear(r, self.to_v_r.weight, self.to_v_r.bias).view(-1, self.num_heads, self.head_dim)
-        return k_r, v_r
-
-    def _relation_kv_project(self, r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self._compile_relation_kv_project or not torch.cuda.is_available():
-            return self._relation_kv_project_eager(r)
-        try:
-            if self._compiled_relation_kv_project is None:
-                self._compiled_relation_kv_project = torch.compile(
-                    self._relation_kv_project_eager,
-                    dynamic=True,
-                    mode="reduce-overhead",
-                )
-            return self._compiled_relation_kv_project(r)
-        except Exception:
-            self._compile_relation_kv_project = False
-            self._compiled_relation_kv_project = None
-            return self._relation_kv_project_eager(r)
 
     def forward(
         self,
@@ -102,6 +68,8 @@ class AttentionLayer(MessagePassing):
             x_src = self.attn_prenorm_x_src(x_src)
             x_dst = self.attn_prenorm_x_dst(x_dst)
             x = x[1]
+        if self.has_pos_emb and r is not None:
+            r = self.attn_prenorm_r(r)
         x = x + self.attn_postnorm(self._attn_block(x_src, x_dst, r, edge_index))
         x = x + self.ff_postnorm(self._ff_block(self.ff_prenorm(x)))
         return x
@@ -111,14 +79,13 @@ class AttentionLayer(MessagePassing):
         q_i: torch.Tensor,
         k_j: torch.Tensor,
         v_j: torch.Tensor,
-        r_k: Optional[torch.Tensor],
-        r_v: Optional[torch.Tensor],
+        r: Optional[torch.Tensor],
         index: torch.Tensor,
         ptr: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        if r_k is not None and r_v is not None:
-            k_j = k_j + r_k
-            v_j = v_j + r_v
+        if self.has_pos_emb and r is not None:
+            k_j = k_j + self.to_k_r(r).view(-1, self.num_heads, self.head_dim)
+            v_j = v_j + self.to_v_r(r).view(-1, self.num_heads, self.head_dim)
         sim = (q_i * k_j).sum(dim=-1) * self.scale
         attn = softmax(sim, index, ptr)
         attn = self.attn_drop(attn)
@@ -139,11 +106,7 @@ class AttentionLayer(MessagePassing):
         q = self.to_q(x_dst).view(-1, self.num_heads, self.head_dim)
         k = self.to_k(x_src).view(-1, self.num_heads, self.head_dim)
         v = self.to_v(x_src).view(-1, self.num_heads, self.head_dim)
-        r_k: Optional[torch.Tensor] = None
-        r_v: Optional[torch.Tensor] = None
-        if self.has_pos_emb and r is not None:
-            r_k, r_v = self._relation_kv_project(r)
-        agg = self.propagate(edge_index=edge_index, x_dst=x_dst, q=q, k=k, v=v, r_k=r_k, r_v=r_v)
+        agg = self.propagate(edge_index=edge_index, x_dst=x_dst, q=q, k=k, v=v, r=r)
         return self.to_out(agg)
 
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
