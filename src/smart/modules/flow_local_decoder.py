@@ -476,8 +476,6 @@ class NormalizedNoisyFutureEncoder(nn.Module):
                     f"expected={tuple(x_t_norm.shape[:2])}, actual={tuple(future_valid_mask.shape)}."
                 )
             future_valid_mask = future_valid_mask.to(device=x_t_norm.device, dtype=torch.bool)
-            if bool(future_valid_mask.all().item()):
-                future_valid_mask = None
 
         step_tokens = step_tokens.view(
             batch_size,
@@ -532,9 +530,7 @@ class HalfSecondChunkMixerBlock(nn.Module):
     def _build_safe_key_padding_mask(self, chunk_valid_mask: torch.Tensor) -> torch.Tensor:
         key_padding_mask = ~chunk_valid_mask.bool()
         all_masked = key_padding_mask.all(dim=1)
-        if bool(all_masked.any().item()):
-            key_padding_mask = key_padding_mask.clone()
-            key_padding_mask[all_masked] = False
+        key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
         return key_padding_mask
 
     def forward(
@@ -610,9 +606,7 @@ class ChunkStepRefiner(nn.Module):
             chunk_size,
         ).bool()
         all_masked = key_padding_mask.all(dim=1)
-        if bool(all_masked.any().item()):
-            key_padding_mask = key_padding_mask.clone()
-            key_padding_mask[all_masked] = False
+        key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
         return key_padding_mask
 
     def forward(
