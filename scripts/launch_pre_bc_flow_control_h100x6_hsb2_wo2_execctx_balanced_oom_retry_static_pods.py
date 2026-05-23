@@ -122,25 +122,6 @@ def parse_args() -> argparse.Namespace:
         help="Additional space-separated Hydra overrides appended before pinned overrides.",
     )
     parser.add_argument(
-        "--compile-attention-relation-kv",
-        choices=("0", "1"),
-        default=os.environ.get("CATK_COMPILE_ATTENTION_RELATION_KV", "0"),
-        help=(
-            "Forward CATK_COMPILE_ATTENTION_RELATION_KV to remote pods. "
-            "Default 0 matches the stable H100x6 bs19 run and avoids "
-            "torch.compile CUDA graph pool failures seen in long runs."
-        ),
-    )
-    parser.add_argument(
-        "--compile-fourier-embedding",
-        choices=("0", "1"),
-        default=os.environ.get("CATK_COMPILE_FOURIER_EMBEDDING", "0"),
-        help=(
-            "Forward CATK_COMPILE_FOURIER_EMBEDDING to remote pods. "
-            "Default 0 keeps the retry run on the eager path used by the stable bs19 run."
-        ),
-    )
-    parser.add_argument(
         "--cache-root",
         default=os.environ.get("CACHE_ROOT", ""),
         help="Use one CACHE_ROOT for every pod. Pod-specific defaults are used when omitted.",
@@ -272,8 +253,6 @@ def retry_environment(args: argparse.Namespace) -> dict[str, str]:
             "LIMIT_VAL_BATCHES": str(args.limit_val_batches),
             "MAX_EPOCHS": str(args.max_epochs),
             "EXTRA_HYDRA_OVERRIDES": h100x6.training_extra_hydra_overrides(args),
-            "CATK_COMPILE_ATTENTION_RELATION_KV": args.compile_attention_relation_kv,
-            "CATK_COMPILE_FOURIER_EMBEDDING": args.compile_fourier_embedding,
         }
     )
     return env
@@ -308,8 +287,6 @@ def print_retry_command(args: argparse.Namespace) -> None:
         "LIMIT_VAL_BATCHES",
         "MAX_EPOCHS",
         "EXTRA_HYDRA_OVERRIDES",
-        "CATK_COMPILE_ATTENTION_RELATION_KV",
-        "CATK_COMPILE_FOURIER_EMBEDDING",
     ]
     print(
         " ".join(f"{key}={shq(env[key])}" for key in keys)

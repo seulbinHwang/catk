@@ -842,15 +842,6 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_r
 
 이 launcher는 `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false`, heterogeneous DDP strategy, metadata cache path override를 단발 H100x6 launcher와 동일하게 고정합니다. 즉 OOM fallback으로 바뀌는 것은 per-GPU batch size뿐이고, supervision, loss mask, transition-aligned target, outlier filter, validation 주기, validation rollout 수는 동일합니다.
 
-직전 H100x6 probe에서 compile CUDA graph 경로는 dynamic edge-count batch와 충돌할 수 있음을 확인했습니다. 그래서 이 retry launcher는 기본적으로 아래 값을 remote tmux env에 전달합니다.
-
-```bash
-CATK_COMPILE_ATTENTION_RELATION_KV=0
-CATK_COMPILE_FOURIER_EMBEDDING=0
-```
-
-둘 다 학습 수식이나 데이터 의미를 바꾸는 설정이 아니라 compile 최적화 경로만 끄는 설정입니다. compile 경로를 다시 검증하려면 `--compile-attention-relation-kv 1 --compile-fourier-embedding 1`을 명시합니다.
-
 실험 코드만 멈추고 pod는 그대로 두려면:
 
 ```bash
