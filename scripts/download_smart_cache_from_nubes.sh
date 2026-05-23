@@ -4,6 +4,7 @@ set -Eeuo pipefail
 # ---------------- CPU / 동시성 설정 ----------------
 CPUSET="${CPUSET:-}"
 PROGRESS_INTERVAL_SEC="${PROGRESS_INTERVAL_SEC:-60}"
+DEFAULT_NUBES_JOBS=96
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -136,17 +137,7 @@ _detect_available_cpus
 
 export DP_MAX_CPUS="${AVAILABLE_CPUS}"
 
-if [[ -z "${NUBES_JOBS:-}" ]]; then
-  if [[ "$AVAILABLE_CPUS" -le 4 ]]; then
-    NUBES_JOBS="$AVAILABLE_CPUS"
-  elif [[ "$AVAILABLE_CPUS" -le 8 ]]; then
-    NUBES_JOBS=$(( AVAILABLE_CPUS - 1 ))
-  elif [[ "$AVAILABLE_CPUS" -le 16 ]]; then
-    NUBES_JOBS=$(( AVAILABLE_CPUS - 2 ))
-  else
-    NUBES_JOBS=$(( (AVAILABLE_CPUS * 4) / 5 ))
-  fi
-fi
+NUBES_JOBS="${NUBES_JOBS:-$DEFAULT_NUBES_JOBS}"
 
 if [[ "$NUBES_JOBS" -lt 1 ]]; then
   NUBES_JOBS=1

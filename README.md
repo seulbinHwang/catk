@@ -272,6 +272,7 @@ $CACHE_ROOT/
 ### 4.4 Nubes 에서 캐시 다운로드
 
 이미 만들어진 pkl 캐시를 쓰고 싶다면 `scripts/download_smart_cache_from_nubes.sh` 를 사용할 수 있습니다.
+이 스크립트는 기본적으로 Nubes 다운로드를 `-j 96` 병렬 작업으로 수행합니다. 다른 병렬도를 쓰려면 `NUBES_JOBS` 환경변수로 override합니다.
 
 기본 사용법:
 
