@@ -634,7 +634,7 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 | round-trip filter | `control_round_trip_max_position_error_m=0.5` |
 | model parameters | 총 `7,045,051`개, trainable `7,045,051`개 |
 | precision | `bf16-mixed` |
-| batch / lr | per-rank `train_batch_size=17`, effective global batch `102`, `lr=6e-4` |
+| batch / lr | per-rank `train_batch_size=20`, effective global batch `120`, `lr=6e-4` |
 | fit-time validation | preset과 launcher override 모두 `check_val_every_n_epoch=16`으로 고정, 64 epoch 중 15/31/47/63 epoch 이후 4회 평가 |
 | metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc2.pt` preflight 생성/검증 |
 
@@ -645,14 +645,10 @@ H100 4+2 batch size probe 결과:
 | per-rank batch | probe 결과 | worst peak reserved | 판단 |
 |---:|---:|---:|---|
 | 22 | OOM | - | 제외 |
-| 21 | OOM | - | 제외 |
-| 20 | 160-step 성공 | `95.45%` | 장기 학습 마진 부족 |
-| 19 | 160-step 성공 | `94.17%` | 장기 학습 마진 부족 |
-| 18 | 160-step 성공 | `96.31%` | 장기 학습 마진 부족 |
-| 17 | 160-step 성공, full run 초기 1k step 정상 진행 | `89.98%` | 기본값 |
-| 16 | 160-step 성공 | `86.25%` | OOM fallback 1순위 |
+| 21 | 12-step 성공 | `80613 / 81559 MiB` | full epoch 마진 부족 |
+| 20 | 64-step 성공 | `77739 / 81559 MiB` | 기본값 |
 
-따라서 이 6 H100 조합에서는 `train_batch_size=17`을 기본 시작값으로 둡니다. `bs17`은 full run 초기 1k step 이상에서 worst peak reserved 약 `90%`로 정상 진행했고, `bs18~20`은 OOM 없이 짧게 통과하더라도 peak가 `94~96%`라 장기 학습에는 위험합니다. training split `486,995`개 / global batch `102` 기준 한 epoch는 약 `4,775` step입니다. launcher의 기본 OOM fallback은 `17 -> 16 -> 15 -> ... -> 12`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt` 또는 `last.ckpt`를 peer pod로 동기화한 뒤 재개합니다. 더 낮은 batch까지 자동 재시도해야 하면 `--min-bs`를 더 낮게 override합니다.
+따라서 이 6 H100 조합에서는 `train_batch_size=20`을 기본 시작값으로 둡니다. `bs22`는 `wo-pvc-2`에서 실제 OOM이 났고, `bs21`은 짧은 probe는 통과했지만 peak가 약 `80.6GB / 81.6GB`라 full epoch 안정권으로 보지 않습니다. `bs20`은 64-step probe에서 peak 약 `77.7GB / 81.6GB`로 통과했습니다. training split `486,995`개 / global batch `120` 기준 한 epoch는 약 `4,059` step입니다. launcher의 기본 OOM fallback은 `20 -> 19 -> 18 -> ... -> 12`이며, fallback이 발생하면 최신 rank-0 `epoch_last.ckpt` 또는 `last.ckpt`를 peer pod로 동기화한 뒤 재개합니다. 더 낮은 batch까지 자동 재시도해야 하면 `--min-bs`를 더 낮게 override합니다.
 
 Agent tokenization의 첫 valid 이전 token-step 외삽은 agent별 Python loop 대신 batch mask/index 연산으로 처리합니다. 외삽 규칙은 기존과 같습니다. 첫 valid step을 기준으로 직전 coarse token boundary까지 `vel[first_valid] * 0.1` 간격으로 위치를 뒤쪽으로 채우고, velocity/heading/valid도 같은 prefix 구간에 복사합니다. `t=10`인데 raw step 5가 invalid인 history 보강 예외도 유지합니다. H100 4+2, per-rank `train_batch_size=15`, 6-rank 평균 profile 기준으로 이 변경은 외삽 구간을 `35.29ms -> 0.49ms`로 줄였고, token processor 전체는 `99.70ms -> 65.43ms`, 전체 train step은 `1133.86ms -> 1107.43ms`로 줄었습니다. 기존 loop reference 대비 위치/heading/velocity 오차는 `1e-6` 이하이며 valid mask는 동일합니다.
 

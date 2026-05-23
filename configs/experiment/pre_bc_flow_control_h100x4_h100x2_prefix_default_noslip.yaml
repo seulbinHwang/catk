@@ -21,7 +21,7 @@ trainer:
   check_val_every_n_epoch: 16
 
 data:
-  train_batch_size: 17
+  train_batch_size: 20
   val_batch_size: 12
   test_batch_size: 12
   train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc2.pt
