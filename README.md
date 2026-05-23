@@ -295,6 +295,9 @@ bash scripts/download_smart_cache_from_nubes.sh \
   "$CACHE_ROOT"
 ```
 
+이 다운로드 스크립트는 기본적으로 `nubescli dir-download -j 96`으로 실행합니다.
+다른 병렬도를 쓰려면 `NUBES_JOBS=48`처럼 환경변수로 override합니다.
+
 또는 환경변수로 넘겨도 됩니다.
 
 ```bash

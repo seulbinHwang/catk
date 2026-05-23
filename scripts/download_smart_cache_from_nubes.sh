@@ -136,17 +136,7 @@ _detect_available_cpus
 
 export DP_MAX_CPUS="${AVAILABLE_CPUS}"
 
-if [[ -z "${NUBES_JOBS:-}" ]]; then
-  if [[ "$AVAILABLE_CPUS" -le 4 ]]; then
-    NUBES_JOBS="$AVAILABLE_CPUS"
-  elif [[ "$AVAILABLE_CPUS" -le 8 ]]; then
-    NUBES_JOBS=$(( AVAILABLE_CPUS - 1 ))
-  elif [[ "$AVAILABLE_CPUS" -le 16 ]]; then
-    NUBES_JOBS=$(( AVAILABLE_CPUS - 2 ))
-  else
-    NUBES_JOBS=$(( (AVAILABLE_CPUS * 4) / 5 ))
-  fi
-fi
+NUBES_JOBS="${NUBES_JOBS:-96}"
 
 if [[ "$NUBES_JOBS" -lt 1 ]]; then
   NUBES_JOBS=1
