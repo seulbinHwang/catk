@@ -22,7 +22,7 @@ fi
 
 echo "[SMART_CACHE_UPLOAD] Using CPUSET=${CPUSET}, NUM_CPUS=${NUM_CPUS}"
 
-LOCAL_DIR="/media/user/E/dataset/womd_v1_3/SMART_cache_0523"
+LOCAL_DIR="/media/user/D/dataset/womd_v1_3/SMART_cache_0523"
 REMOTE_DIR="labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_cache_0523"
 
 if [ ! -d "$LOCAL_DIR" ]; then
