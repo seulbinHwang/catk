@@ -103,6 +103,22 @@ def parse_pod_cache_roots(values: list[str]) -> dict[str, str]:
     return roots
 
 
+def parse_remote_env(values: list[str]) -> list[tuple[str, str]]:
+    env_items: list[tuple[str, str]] = []
+    for value in values:
+        if "=" not in value:
+            raise ValueError(
+                "--remote-env entries must use NAME=VALUE, "
+                f"but got: {value!r}"
+            )
+        name, env_value = value.split("=", 1)
+        name = name.strip()
+        if not name or not name.replace("_", "").isalnum() or name[0].isdigit():
+            raise ValueError(f"--remote-env has invalid variable name: {name!r}")
+        env_items.append((name, env_value))
+    return env_items
+
+
 def validate_nproc_per_node(value: str) -> str:
     if value in {"auto", "gpu"}:
         return value
@@ -175,6 +191,8 @@ def render_env_file(
     for name, value in optional_env.items():
         if value not in (None, ""):
             lines.append(export_line(name, value))
+    for name, value in args.remote_env_items:
+        lines.append(export_line(name, value))
     return "\n".join(lines) + "\n"
 
 
@@ -715,6 +733,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", default="")
     parser.add_argument("--learning-rate", default="")
     parser.add_argument("--extra-hydra-overrides", default="")
+    parser.add_argument(
+        "--remote-env",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="Export an additional environment variable inside each remote tmux run.",
+    )
     parser.add_argument("--monitor-interval", type=int, default=30)
     parser.add_argument("--no-monitor-pane", action="store_true")
     parser.add_argument("--replace", action="store_true")
@@ -724,6 +749,10 @@ def parse_args() -> argparse.Namespace:
 
     try:
         args.pod_cache_root_map = parse_pod_cache_roots(args.pod_cache_root)
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        args.remote_env_items = parse_remote_env(args.remote_env)
     except ValueError as exc:
         parser.error(str(exc))
 

@@ -25,9 +25,9 @@ BASE_LAUNCHER = Path(__file__).with_name("launch_h100x4_multinode_pretrain_tmux.
 
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_h100x6_hsb2_wo1_"
-    "execctx_prefix_balanced_lr6e-4_bs20_oomretry"
+    "execctx_prefix_balanced_lr6e-4_bs18_oomretry"
 )
-DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs20-retry"
+DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs18-retry"
 
 
 def shq(value: object) -> str:
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=h100x6.DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--initial-bs", type=int, default=20)
+    parser.add_argument("--initial-bs", type=int, default=18)
     parser.add_argument(
         "--oom-step",
         type=int,
@@ -98,6 +98,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nproc-per-node", default="gpu", choices=("gpu", "auto"))
     parser.add_argument("--learning-rate", default="6e-4")
     parser.add_argument("--val-batch-size", default="16")
+    parser.add_argument(
+        "--nccl-algo",
+        default=os.environ.get("NCCL_ALGO", "Ring"),
+        help="NCCL_ALGO exported in each remote tmux run. Default avoids 4+2 default NCCL hangs.",
+    )
+    parser.add_argument(
+        "--nccl-proto",
+        default=os.environ.get("NCCL_PROTO", "Simple"),
+        help="NCCL_PROTO exported in each remote tmux run. Default avoids 4+2 default NCCL hangs.",
+    )
     parser.add_argument(
         "--n-rollout-closed-val",
         type=int,
@@ -249,6 +259,14 @@ def retry_environment(args: argparse.Namespace) -> dict[str, str]:
             "POLL_INTERVAL": str(args.poll_interval),
             "LEARNING_RATE": str(args.learning_rate),
             "VAL_BATCH_SIZE": str(args.val_batch_size),
+            "REMOTE_ENV_OVERRIDES": " ".join(
+                item
+                for item in (
+                    f"NCCL_ALGO={args.nccl_algo}" if args.nccl_algo else "",
+                    f"NCCL_PROTO={args.nccl_proto}" if args.nccl_proto else "",
+                )
+                if item
+            ),
             "LIMIT_TRAIN_BATCHES": str(args.limit_train_batches),
             "LIMIT_VAL_BATCHES": str(args.limit_val_batches),
             "MAX_EPOCHS": str(args.max_epochs),
@@ -283,6 +301,7 @@ def print_retry_command(args: argparse.Namespace) -> None:
         "POLL_INTERVAL",
         "LEARNING_RATE",
         "VAL_BATCH_SIZE",
+        "REMOTE_ENV_OVERRIDES",
         "LIMIT_TRAIN_BATCHES",
         "LIMIT_VAL_BATCHES",
         "MAX_EPOCHS",

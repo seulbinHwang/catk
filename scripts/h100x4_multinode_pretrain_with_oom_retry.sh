@@ -48,6 +48,7 @@ LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
+REMOTE_ENV_OVERRIDES="${REMOTE_ENV_OVERRIDES:-}"
 
 read -r -a POD_ARRAY <<< "$PODS"
 if (( ${#POD_ARRAY[@]} < 2 )); then
@@ -175,6 +176,13 @@ start_attempt() {
   fi
   if [[ -n "$EXTRA_HYDRA_OVERRIDES" ]]; then
     cmd+=(--extra-hydra-overrides "$EXTRA_HYDRA_OVERRIDES")
+  fi
+  if [[ -n "$REMOTE_ENV_OVERRIDES" ]]; then
+    read -r -a remote_env_array <<< "$REMOTE_ENV_OVERRIDES"
+    local env_mapping
+    for env_mapping in "${remote_env_array[@]}"; do
+      cmd+=(--remote-env "$env_mapping")
+    done
   fi
 
   log "launcher command:"

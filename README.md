@@ -735,7 +735,12 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_r
   --dry-run
 ```
 
-이 구성은 4 GPU pod와 2 GPU pod를 섞어 쓰므로 일반 DDP의 `devices x num_nodes` 가정과 맞지 않습니다. launcher는 `--manual-rank-offsets`와 heterogeneous Lightning strategy를 함께 사용해 `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-1`은 rank `4~5`, 전체 world size는 `6`으로 고정합니다. 기본 실행은 OOM-retry wrapper를 사용합니다. 첫 시도는 현재 최신 코드에서 안정 상한으로 확인한 `train_batch_size=20`이고, CUDA OOM이 감지되면 최신 `epoch_last.ckpt`를 찾아 같은 실험을 `19 -> 18 -> ...` 순서로 낮춰 resume합니다.
+이 구성은 4 GPU pod와 2 GPU pod를 섞어 쓰므로 일반 DDP의 `devices x num_nodes` 가정과 맞지 않습니다. launcher는 `--manual-rank-offsets`와 heterogeneous Lightning strategy를 함께 사용해 `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-1`은 rank `4~5`, 전체 world size는 `6`으로 고정합니다. 기본 실행은 OOM-retry wrapper를 사용합니다. 첫 시도는 `train_batch_size=18`이고, CUDA OOM이 감지되면 최신 `epoch_last.ckpt`를 찾아 같은 실험을 `17 -> 16 -> ...` 순서로 낮춰 resume합니다.
+
+이 pod 조합은 실제 pretrain smoke에서 기본 DDP/NCCL 설정만으로는 첫 train batch가 멈추거나 NCCL `message truncated` 에러가 날 수 있었습니다. 따라서 launcher는 다음 안정화 설정을 기본으로 고정합니다.
+
+- `trainer.strategy.find_unused_parameters=true`: Flow training graph의 조건부 경로가 DDP gradient sync를 막지 않도록 합니다.
+- `NCCL_ALGO=Ring`, `NCCL_PROTO=Simple`: `hsb-npc-training-2 4GPU + wo-pvc-1 2GPU` heterogeneous layout에서 NCCL 기본 경로의 collective mismatch를 피합니다.
 
 | 항목 | 값 |
 |---|---|
@@ -744,10 +749,10 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_r
 | GPU 구성 | H100 4장 + H100 2장 = 6 GPU |
 | launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py` |
 | experiment config | `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml` |
-| task name | `flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_balanced_lr6e-4_bs20_oomretry` |
-| tmux session | `catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs20-retry` |
-| per-GPU batch | 첫 시도 `20`, OOM 시 `1`씩 감소 |
-| effective global batch | 첫 시도 `20 x 6 = 120` |
+| task name | `flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_balanced_lr6e-4_bs18_oomretry` |
+| tmux session | `catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs18-retry` |
+| per-GPU batch | 첫 시도 `18`, OOM 시 `1`씩 감소 |
+| effective global batch | 첫 시도 `18 x 6 = 108` |
 | learning rate | `6e-4` |
 | flow decoder dim | `96` |
 | 실측 모델 파라미터 | `7,045,051` total / trainable |
@@ -756,21 +761,22 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_r
 | outlier filter | vehicle `2.0m`, cyclist `2.0m` |
 | OOM 완화 | agent 수 기반 memory-balanced batch sampler + OOM 발생 시 batch-size 1씩 감소 후 checkpoint resume |
 | heterogeneous 설정 | `HeterogeneousDDPStrategy`, `HeterogeneousTorchElasticEnvironment` |
+| DDP/NCCL 안정화 | `find_unused_parameters=true`, `NCCL_ALGO=Ring`, `NCCL_PROTO=Simple` |
 | metadata 정책 | `--prebuild-metadata`로 sampler metadata를 먼저 만들고, 학습 중 missing build는 금지 |
 | validation 주기 | 기본 `check_val_every_n_epoch=16` |
 | fit-time closed-loop rollout 수 | 기본 `n_rollout_closed_val=32` |
 
-최신 코드 기준 H100x6 probe 결과 `train_batch_size=20`을 기본 시작값으로 선택했습니다.
+기존 H100x6 probe에서는 `train_batch_size=20`까지 짧은 구간을 통과했지만, 이후 `hsb-npc-training-2 4GPU + wo-pvc-1 2GPU` 조합에서 첫 train batch DDP/NCCL 정체가 재현되었습니다. 현재 launcher는 이 문제를 피하기 위해 `find_unused_parameters=true`, `NCCL_ALGO=Ring`, `NCCL_PROTO=Simple`을 기본 적용하고, full-run 시작 batch는 더 보수적인 `train_batch_size=18`로 둡니다.
 
 | per-GPU batch | probe 결과 | global batch | 속도 | peak reserved | 64 epoch train-only 추정 | 판단 |
 |---:|---|---:|---:|---:|---:|---|
 | 12 | 40 step 성공 | 72 | 0.97 it/s | 57.19% | 123.97 h / 5.17 d | 안정적이지만 느림 |
 | 19 | 최신 코드에서 train loop 진입 및 기존 retry 로그 기준 1 epoch 이상 진행 확인 | 114 | 약 0.85~0.86 it/s | 약 79.4GB 사용 / 81.6GB | 약 88.5~89 h / 3.7 d | fallback 후보 |
-| 20 | 동일 pod 조합 probe 기준 안정 상한으로 선택 | 120 | 약 0.84~0.85 it/s | worst reserved 약 94.7% | 약 85~86 h / 3.6 d | 기본 시작값 |
+| 20 | 짧은 probe는 통과했지만 이후 4+2 DDP/NCCL 안정화 필요성이 확인됨 | 120 | 약 0.84~0.85 it/s | worst reserved 약 94.7% | 약 85~86 h / 3.6 d | full-run 기본값에서 제외 |
 | 21 | 짧은 probe는 통과했지만 reserved peak가 약 98.3%까지 상승 | 126 | - | OOM 여유 부족 | - | full-epoch 안정성 부족 |
 | 26 | train forward 중 OOM | 156 | - | 약 79GB 사용 후 OOM | - | 제외 |
 
-따라서 이 6-GPU 조합에서는 `train_batch_size=20`을 먼저 시도하고, full-epoch 중 CUDA OOM이 실제로 발생하면 `19`부터 낮춰 resume하는 정책이 가장 빠릅니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다. 기본 OOM-retry launcher는 `bs20`에서 CUDA OOM이 발생할 경우 `bs19`부터 자동 resume합니다.
+따라서 현재 6-GPU 조합에서는 `train_batch_size=18`을 먼저 시도하고, full-epoch 중 CUDA OOM이 실제로 발생하면 `17`부터 낮춰 resume합니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다.
 
 H100x6 launcher는 학습 중 Fast RMM validation의 분산을 줄이기 위해 `model.model_config.n_rollout_closed_val=32`를 기본값으로 고정합니다. 필요하면 `--n-rollout-closed-val 64`처럼 명시적으로 더 키울 수 있습니다. H100x6 4+2 GPU 조합에서 `limit_train_batches=1`, `limit_val_batches=1`, `train_batch_size=2`, `val_batch_size=16` 조건으로 직접 비교했을 때 validation 1 batch 시간은 다음과 같았습니다.
 
@@ -824,8 +830,8 @@ kubectl exec -it -n p-pnc wo-pvc-1 -c main -- tmux attach -t catk-control-pretra
 OOM-retry 기본 실험을 attach하려면:
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs20-retry
-kubectl exec -it -n p-pnc wo-pvc-1 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs20-retry
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs18-retry
+kubectl exec -it -n p-pnc wo-pvc-1 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs18-retry
 ```
 
 실험 코드만 멈추고 pod는 그대로 두려면:
@@ -834,9 +840,9 @@ kubectl exec -it -n p-pnc wo-pvc-1 -c main -- tmux attach -t catk-control-pretra
 python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py --stop
 ```
 
-##### H100x6 batch-20 OOM fallback launcher
+##### H100x6 batch-18 OOM fallback launcher
 
-`train_batch_size=20`에서 시작하고 CUDA OOM이 발생하면 같은 task의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size`를 1씩 낮춰 resume하려면 아래 launcher를 씁니다. pod는 만들거나 삭제하지 않고, 기존 `hsb-npc-training-2`, `wo-pvc-1` 내부 tmux session만 교체합니다.
+`train_batch_size=18`에서 시작하고 CUDA OOM이 발생하면 같은 task의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size`를 1씩 낮춰 resume하려면 아래 launcher를 씁니다. pod는 만들거나 삭제하지 않고, 기존 `hsb-npc-training-2`, `wo-pvc-1` 내부 tmux session만 교체합니다.
 
 ```bash
 python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py \
@@ -855,15 +861,15 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_r
 | 항목 | 값 |
 |---|---|
 | launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py` |
-| task name | `flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_balanced_lr6e-4_bs20_oomretry` |
-| tmux session | `catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs20-retry` |
-| 시작 per-GPU batch | `20` |
-| 시작 effective global batch | `20 x 6 = 120` |
-| OOM fallback | `20 -> 19 -> 18 -> ...` |
+| task name | `flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_balanced_lr6e-4_bs18_oomretry` |
+| tmux session | `catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs18-retry` |
+| 시작 per-GPU batch | `18` |
+| 시작 effective global batch | `18 x 6 = 108` |
+| OOM fallback | `18 -> 17 -> 16 -> ...` |
 | resume 기준 | rank 0 log dir 아래 최신 `epoch_last.ckpt`, 없으면 `last.ckpt` |
 | 학습 설정 | 위 H100x6 execution-context balanced pretrain과 동일 |
 
-이 launcher는 `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false`, heterogeneous DDP strategy, metadata cache path override를 단발 H100x6 launcher와 동일하게 고정합니다. 즉 OOM fallback으로 바뀌는 것은 per-GPU batch size뿐이고, supervision, loss mask, transition-aligned target, outlier filter, validation 주기, validation rollout 수는 동일합니다.
+이 launcher는 `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false`, heterogeneous DDP strategy, `find_unused_parameters=true`, `NCCL_ALGO=Ring`, `NCCL_PROTO=Simple`, metadata cache path override를 단발 H100x6 launcher와 동일하게 고정합니다. 즉 OOM fallback으로 바뀌는 것은 per-GPU batch size뿐이고, supervision, loss mask, transition-aligned target, outlier filter, validation 주기, validation rollout 수는 동일합니다.
 
 실험 코드만 멈추고 pod는 그대로 두려면:
 

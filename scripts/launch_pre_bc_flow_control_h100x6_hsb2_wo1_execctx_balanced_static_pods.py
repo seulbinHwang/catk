@@ -23,7 +23,7 @@ DEFAULT_PODS = ("hsb-npc-training-2", "wo-pvc-1")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4x2_execctx_balanced"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_h100x6_hsb2_wo1_"
-    "execctx_prefix_balanced_lr6e-4_bs20"
+    "execctx_prefix_balanced_lr6e-4_bs18"
 )
 DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced"
 DEFAULT_METADATA_CACHE_RELATIVE = "dataset_metadata/womd_training_memory_balance_v1.pt"
@@ -33,6 +33,7 @@ DEFAULT_CACHE_ROOT_BY_POD = {
 }
 HETEROGENEOUS_STRATEGY_OVERRIDES = (
     "trainer.strategy._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy",
+    "trainer.strategy.find_unused_parameters=true",
     "+trainer.strategy.cluster_environment._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment",
 )
 PINNED_BOOLEAN_OVERRIDES = {
@@ -195,9 +196,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--train-batch-size", type=int, default=20)
+    parser.add_argument("--train-batch-size", type=int, default=18)
     parser.add_argument("--learning-rate", default="6e-4")
     parser.add_argument("--val-batch-size", default="16")
+    parser.add_argument(
+        "--nccl-algo",
+        default=os.environ.get("NCCL_ALGO", "Ring"),
+        help="NCCL_ALGO exported in each remote tmux run. Default avoids 4+2 default NCCL hangs.",
+    )
+    parser.add_argument(
+        "--nccl-proto",
+        default=os.environ.get("NCCL_PROTO", "Simple"),
+        help="NCCL_PROTO exported in each remote tmux run. Default avoids 4+2 default NCCL hangs.",
+    )
     parser.add_argument(
         "--n-rollout-closed-val",
         type=int,
@@ -384,6 +395,10 @@ def base_launcher_command(args: argparse.Namespace) -> list[str]:
         "--extra-hydra-overrides",
         training_extra_hydra_overrides(args),
     ]
+    if args.nccl_algo:
+        command.extend(["--remote-env", f"NCCL_ALGO={args.nccl_algo}"])
+    if args.nccl_proto:
+        command.extend(["--remote-env", f"NCCL_PROTO={args.nccl_proto}"])
     if args.git_ref:
         command.extend(["--git-ref", args.git_ref])
     if args.no_pull:
