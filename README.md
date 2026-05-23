@@ -940,6 +940,42 @@ python scripts/launch_pre_bc_flow_control_a100x7_testas_execctx_balanced_oom_ret
 python scripts/launch_pre_bc_flow_control_a100x7_testas_execctx_balanced_oom_retry_static_pod.py --stop
 ```
 
+장기 학습에서는 로컬 터미널이 끊겨도 OOM retry가 계속 살아 있어야 하므로, `testas`
+pod 내부 tmux에서 직접 batch-size fallback을 수행하는 remote supervisor를 권장합니다.
+아래 명령은 `train_batch_size=17`에서 시작하고, CUDA OOM이 감지되면 최신 checkpoint를
+찾아 `16 -> 15 -> ...` 순서로 낮춰 같은 task를 resume합니다. pod는 종료하거나
+재시작하지 않습니다.
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- bash -lc '
+  cd /mnt/nuplan/projects/catk
+  bash scripts/launch_pre_bc_flow_control_a100x7_testas_remote_oom_retry.sh \
+    --replace \
+    --initial-bs 17 \
+    --min-bs 1 \
+    --task-name flow_control_space_pretrain_a100x7_testas_execctx_prefix_balanced_lr6e-4_bs17_remote_oomretry \
+    --session catk-control-pretrain-a100x7-testas-execctx-balanced-bs17-remote-retry
+'
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- tmux attach -t catk-control-pretrain-a100x7-testas-execctx-balanced-bs17-remote-retry
+```
+
+중지:
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- bash -lc '
+  cd /mnt/nuplan/projects/catk
+  bash scripts/launch_pre_bc_flow_control_a100x7_testas_remote_oom_retry.sh \
+    --stop \
+    --task-name flow_control_space_pretrain_a100x7_testas_execctx_prefix_balanced_lr6e-4_bs17_remote_oomretry \
+    --session catk-control-pretrain-a100x7-testas-execctx-balanced-bs17-remote-retry
+'
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
