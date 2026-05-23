@@ -38,7 +38,8 @@ DEFAULT_EXTRA_HYDRA_OVERRIDES = (
     "trainer.strategy._target_="
     "src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy "
     "trainer.strategy.cluster_environment._target_="
-    "src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment"
+    "src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment "
+    "trainer.check_val_every_n_epoch=16"
 )
 
 

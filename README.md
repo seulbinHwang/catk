@@ -635,7 +635,7 @@ scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_po
 | model parameters | 총 `7,045,051`개, trainable `7,045,051`개 |
 | precision | `bf16-mixed` |
 | batch / lr | per-rank `train_batch_size=17`, effective global batch `102`, `lr=6e-4` |
-| fit-time validation | `check_val_every_n_epoch=16`, 64 epoch 중 15/31/47/63 epoch 이후 4회 평가 |
+| fit-time validation | preset과 launcher override 모두 `check_val_every_n_epoch=16`으로 고정, 64 epoch 중 15/31/47/63 epoch 이후 4회 평가 |
 | metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc2.pt` preflight 생성/검증 |
 
 두 pod의 local GPU 수가 `4 + 2`로 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를 쓰면 안 됩니다. 이 launcher는 `--manual-rank-offsets` 경로를 사용해 `hsb-npc-training`에 rank `0~3`, `wo-pvc-2`에 rank `4~5`를 직접 배정하고, `HeterogeneousTorchElasticEnvironment` / `HeterogeneousDDPStrategy`로 Lightning의 homogeneous world-size 가정을 완화합니다. sampler, validation sharding, Fast WOSAC scorer는 launcher가 넣은 실제 `WORLD_SIZE=6`을 기준으로 동작하도록 회귀 테스트로 고정합니다.
