@@ -195,6 +195,24 @@ class SMARTFlow(LightningModule):
             "yaw_ade": f"ADEyaw{self.flow_horizon_tag}",
             "yaw_fde": f"FDEyaw{self.flow_horizon_tag}",
         }
+        self._train_open_epoch_log_names = (
+            "train/loss",
+            "train/loss_fm",
+            f"train/{self.train_open_metric_names['ade']}",
+            f"train/{self.train_open_metric_names['fde']}",
+            f"train/{self.train_open_metric_names['yaw_ade']}",
+            f"train/{self.train_open_metric_names['yaw_fde']}",
+        )
+        self.register_buffer(
+            "_train_open_epoch_metric_sums",
+            torch.zeros(len(self._train_open_epoch_log_names), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_train_open_epoch_metric_counts",
+            torch.zeros(len(self._train_open_epoch_log_names), dtype=torch.float32),
+            persistent=False,
+        )
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
@@ -328,6 +346,7 @@ class SMARTFlow(LightningModule):
         self._self_forced_generator_ema_loaded_from_checkpoint = False
         self._self_forced_backward_context: Dict[str, Tensor] | None = None
         self._automatic_open_loop_has_target_since_step = False
+        self._automatic_open_loop_has_target_pending: list[tuple[Tensor, Any | None]] = []
         self._skip_next_automatic_optimizer_step = False
         if self.self_forced_enabled:
             if not (0.0 <= self.self_forced_ema_weight < 1.0):
@@ -728,24 +747,50 @@ class SMARTFlow(LightningModule):
             torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
         return bool(flag.item())
 
-    def _sync_open_loop_train_log_pack(
+    def _start_distributed_bool_any(
+        self,
+        value: bool,
+        *,
+        device: torch.device | None = None,
+    ) -> tuple[Tensor, Any | None]:
+        """DDP any bool sync를 시작하고, 가능하면 backward와 겹치도록 async work를 반환합니다."""
+        sync_device = device if device is not None else self._first_parameter_device(self)
+        flag = torch.tensor(int(bool(value)), device=sync_device, dtype=torch.long)
+        if self._distributed_available_and_initialized():
+            work = torch.distributed.all_reduce(
+                flag,
+                op=torch.distributed.ReduceOp.MAX,
+                async_op=True,
+            )
+            return flag, work
+        return flag, None
+
+    @staticmethod
+    def _finish_distributed_bool_any(pending: tuple[Tensor, Any | None]) -> bool:
+        """_start_distributed_bool_any 결과를 기다린 뒤 Python bool로 반환합니다."""
+        flag, work = pending
+        if work is not None:
+            work.wait()
+        return bool(flag.item())
+
+    def _accumulate_open_loop_train_epoch_metrics(
         self,
         *,
         total_loss: Tensor,
         fm_loss: Tensor,
         open_metric_dict: Dict[str, Tensor],
-        has_open_loop_targets: bool,
-    ) -> tuple[Dict[str, Tensor], bool]:
-        """Train open-loop scalar logs and has-target flag를 한 번에 동기화합니다.
+        sample_count: int,
+    ) -> None:
+        """Open-loop train metric을 epoch 말 global 평균용으로 local 누적합니다.
 
-        Lightning의 metric별 ``sync_dist=True`` 와 optimizer hook의 bool all-reduce를
-        분리해 호출하면 같은 train step에서 여러 번의 작은 collective가 발생합니다.
-        여기서는 로깅용 detached scalar와 has-target flag만 pack해 한 번의 SUM
-        all-reduce로 rank 평균 metric과 global-any target flag를 함께 만듭니다.
-        Loss/gradient 경로는 건드리지 않습니다.
+        Train step마다 logging metric 전체를 DDP 동기화하면 작은 collective가
+        매 batch 발생합니다. 학습 loss/backward 경로는 그대로 두고, detached scalar
+        값만 buffer에 누적한 뒤 epoch 끝에서 한 번만 동기화합니다.
         """
-        device = total_loss.device
-        metric_tensors = [
+        weight = float(max(int(sample_count), 0))
+        if weight <= 0.0:
+            return
+        values = [
             total_loss.detach(),
             fm_loss.detach(),
             open_metric_dict[self.open_metric_names["ade"]].detach(),
@@ -753,93 +798,62 @@ class SMARTFlow(LightningModule):
             open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
             open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
         ]
-        packed = torch.stack(
+        value_tensor = torch.stack(
             [
-                metric.to(device=device, dtype=torch.float32).reshape(())
-                for metric in metric_tensors
-            ]
-            + [
-                torch.tensor(
-                    float(bool(has_open_loop_targets)),
-                    device=device,
+                value.to(
+                    device=self._train_open_epoch_metric_sums.device,
                     dtype=torch.float32,
-                )
+                ).reshape(())
+                for value in values
             ]
         )
+        weight_tensor = value_tensor.new_full(value_tensor.shape, weight)
+        self._train_open_epoch_metric_sums += value_tensor * weight_tensor
+        self._train_open_epoch_metric_counts += weight_tensor
+
+    def _reset_open_loop_train_epoch_metrics(self) -> None:
+        self._train_open_epoch_metric_sums.zero_()
+        self._train_open_epoch_metric_counts.zero_()
+
+    def _compute_and_reset_open_loop_train_epoch_metrics(self) -> Dict[str, Tensor]:
+        """누적 train metric을 DDP 전체에서 합산한 뒤 epoch 평균으로 반환합니다."""
+        packed = torch.cat(
+            [
+                self._train_open_epoch_metric_sums.detach().clone(),
+                self._train_open_epoch_metric_counts.detach().clone(),
+            ],
+            dim=0,
+        )
+        self._reset_open_loop_train_epoch_metrics()
         if self._distributed_available_and_initialized():
             torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
-            packed = packed / float(torch.distributed.get_world_size())
 
-        synced_metrics = {
-            "loss": packed[0],
-            "loss_fm": packed[1],
-            self.open_metric_names["ade"]: packed[2],
-            self.open_metric_names["fde"]: packed[3],
-            self.open_metric_names["yaw_ade"]: packed[4],
-            self.open_metric_names["yaw_fde"]: packed[5],
+        n_metric = len(self._train_open_epoch_log_names)
+        sums = packed[:n_metric]
+        counts = packed[n_metric:]
+        metrics: Dict[str, Tensor] = {}
+        for idx, name in enumerate(self._train_open_epoch_log_names):
+            count = counts[idx]
+            if bool((count > 0).item()):
+                metrics[name] = sums[idx] / count.clamp_min(1.0)
+        return metrics
+
+    def _log_open_loop_train_epoch_metrics(self) -> None:
+        """W&B에는 step별 global sync 없이 epoch 말 train metric만 정확히 남깁니다."""
+        metrics = self._compute_and_reset_open_loop_train_epoch_metrics()
+        if not metrics or not self.trainer.is_global_zero:
+            return
+        loggers = getattr(self.trainer, "loggers", None)
+        if loggers is None:
+            logger = getattr(self.trainer, "logger", None)
+            loggers = [logger] if logger is not None else []
+        metrics_to_log = {
+            name: float(value.detach().cpu().item())
+            for name, value in metrics.items()
         }
-        has_targets_global = bool(packed[6].item() > 0.0)
-        return synced_metrics, has_targets_global
-
-    def _log_synced_open_loop_train_metrics(
-        self,
-        synced_metrics: Dict[str, Tensor],
-    ) -> None:
-        """이미 rank 평균으로 동기화된 open-loop train metric을 기록합니다."""
-        self.log(
-            "train/loss",
-            synced_metrics["loss"],
-            on_step=True,
-            on_epoch=True,
-            sync_dist=False,
-            batch_size=1,
-            rank_zero_only=True,
-        )
-        self.log(
-            "train/loss_fm",
-            synced_metrics["loss_fm"],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=False,
-            batch_size=1,
-            rank_zero_only=True,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['ade']}",
-            synced_metrics[self.open_metric_names["ade"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=False,
-            batch_size=1,
-            rank_zero_only=True,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['fde']}",
-            synced_metrics[self.open_metric_names["fde"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=False,
-            batch_size=1,
-            rank_zero_only=True,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_ade']}",
-            synced_metrics[self.open_metric_names["yaw_ade"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=False,
-            batch_size=1,
-            rank_zero_only=True,
-        )
-        self.log(
-            f"train/{self.train_open_metric_names['yaw_fde']}",
-            synced_metrics[self.open_metric_names["yaw_fde"]],
-            on_step=False,
-            on_epoch=True,
-            sync_dist=False,
-            batch_size=1,
-            rank_zero_only=True,
-        )
+        for logger in loggers:
+            if logger is not None:
+                logger.log_metrics(metrics_to_log, step=self.global_step)
 
     def _open_loop_denoise_metrics(
         self,
@@ -2620,16 +2634,20 @@ class SMARTFlow(LightningModule):
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
-        fm_loss, open_metric_dict, _, has_open_loop_targets = self._open_loop_denoise_metrics(
+        fm_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
             pred,
             zero_loss_module=self.encoder,
         )
         total_loss = fm_loss
-        synced_log_metrics, has_open_loop_targets_global = self._sync_open_loop_train_log_pack(
+        self._accumulate_open_loop_train_epoch_metrics(
             total_loss=total_loss,
             fm_loss=fm_loss,
             open_metric_dict=open_metric_dict,
-            has_open_loop_targets=has_open_loop_targets,
+            sample_count=sample_count,
+        )
+        has_open_loop_targets_pending = self._start_distributed_bool_any(
+            has_open_loop_targets,
+            device=total_loss.device,
         )
 
         generator_optimizer = self.optimizers()[0]
@@ -2639,6 +2657,9 @@ class SMARTFlow(LightningModule):
             self._prepare_self_forced_generator_backward_boundary()
             self._manual_backward_without_autocast(total_loss)
             self._assert_self_forced_generator_update_isolated()
+            has_open_loop_targets_global = self._finish_distributed_bool_any(
+                has_open_loop_targets_pending
+            )
             if has_open_loop_targets_global:
                 self._clip_and_step_with_optional_scaler(
                     generator_optimizer,
@@ -2650,7 +2671,6 @@ class SMARTFlow(LightningModule):
             self._clear_self_forced_generator_gradients()
             self.untoggle_optimizer(generator_optimizer)
 
-        self._log_synced_open_loop_train_metrics(synced_log_metrics)
         return total_loss.detach()
 
     def _training_step_self_forced(self, data, batch_idx):
@@ -2899,7 +2919,7 @@ fm_loss:
 open_metric_dict: 
     Dict[str, Tensor]
         """
-        fm_loss, open_metric_dict, _, has_open_loop_targets = self._open_loop_denoise_metrics(
+        fm_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
             pred,
             zero_loss_module=self,
         )
@@ -2912,16 +2932,17 @@ open_metric_dict:
                 f"{self._summarize_nonfinite_tensor(total_loss)}"
             )
 
-        synced_log_metrics, has_open_loop_targets_global = self._sync_open_loop_train_log_pack(
+        self._accumulate_open_loop_train_epoch_metrics(
             total_loss=total_loss,
             fm_loss=fm_loss,
             open_metric_dict=open_metric_dict,
-            has_open_loop_targets=has_open_loop_targets,
+            sample_count=sample_count,
         )
-        self._automatic_open_loop_has_target_since_step = (
-            self._automatic_open_loop_has_target_since_step or has_open_loop_targets_global
+        has_open_loop_targets_pending = self._start_distributed_bool_any(
+            has_open_loop_targets,
+            device=total_loss.device,
         )
-        self._log_synced_open_loop_train_metrics(synced_log_metrics)
+        self._automatic_open_loop_has_target_pending.append(has_open_loop_targets_pending)
         return total_loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
@@ -2929,6 +2950,12 @@ open_metric_dict:
         if not bool(getattr(self, "automatic_optimization", True)):
             return
         has_open_loop_targets_global = bool(self._automatic_open_loop_has_target_since_step)
+        if self._automatic_open_loop_has_target_pending:
+            has_open_loop_targets_global = any(
+                self._finish_distributed_bool_any(pending)
+                for pending in self._automatic_open_loop_has_target_pending
+            )
+            self._automatic_open_loop_has_target_pending.clear()
         self._skip_next_automatic_optimizer_step = not has_open_loop_targets_global
         if not has_open_loop_targets_global:
             optimizer.zero_grad(set_to_none=True)
@@ -3144,12 +3171,18 @@ open_metric_dict:
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return [optimizer], [lr_scheduler]
 
+    def on_train_epoch_start(self) -> None:
+        """새 epoch의 open-loop train metric accumulator를 초기화합니다."""
+        self._reset_open_loop_train_epoch_metrics()
+        self._automatic_open_loop_has_target_pending.clear()
+
     def on_train_epoch_end(self) -> None:
         """self-forced manual optimization에서 scheduler가 있으면 epoch마다 한 번 진행합니다.
 
         Returns:
             None
         """
+        self._log_open_loop_train_epoch_metrics()
         if not self.self_forced_enabled:
             return
         schedulers = self.lr_schedulers()
