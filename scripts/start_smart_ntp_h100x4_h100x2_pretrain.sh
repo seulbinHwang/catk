@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start SMART NTP pretrain on hsb-npc-training(H100x4) + wo-pvc-1(H100x2).
+# Start SMART NTP pretrain on hsb-npc-training(H100x4) + wo-pvc-2(H100x2).
 #
 # This is a thin convenience wrapper around launch_smart_ntp_h100x4_h100x2.py.
 # It never creates, deletes, or restarts pods.

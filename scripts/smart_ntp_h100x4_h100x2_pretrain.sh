@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run SMART NTP pretrain across existing static H100 pods with uneven GPU counts.
 #
-# The intended layout is hsb-npc-training(H100x4) + wo-pvc-1(H100x2). Prefer
+# The intended layout is hsb-npc-training(H100x4) + wo-pvc-2(H100x2). Prefer
 # launching through scripts/launch_smart_ntp_h100x4_h100x2.py, which exports
 # explicit RANK/WORLD_SIZE values for the 4+2 heterogeneous process layout.
 set -Eeuo pipefail
