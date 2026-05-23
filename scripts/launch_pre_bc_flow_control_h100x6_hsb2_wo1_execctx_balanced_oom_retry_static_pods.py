@@ -2,7 +2,7 @@
 """Launch H100x6 execution-context pretrain with batch-size OOM fallback.
 
 This wrapper targets the already-running ``hsb-npc-training-2`` H100x4 pod
-and ``wo-pvc-2`` H100x2 pod. It never creates, deletes, or restarts pods. It
+and ``wo-pvc-1`` H100x2 pod. It never creates, deletes, or restarts pods. It
 prepares/verifies the memory-balance metadata cache, then runs the shared
 OOM-retry controller so CUDA OOM lowers ``train_batch_size`` by one and resumes
 from the latest checkpoint.
@@ -17,17 +17,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-import launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods as h100x6
+import launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_static_pods as h100x6
 
 
 RETRY_SCRIPT = Path(__file__).with_name("h100x4_multinode_pretrain_with_oom_retry.sh")
 BASE_LAUNCHER = Path(__file__).with_name("launch_h100x4_multinode_pretrain_tmux.py")
 
 DEFAULT_TASK_NAME = (
-    "flow_control_space_pretrain_h100x6_hsb2_wo2_"
+    "flow_control_space_pretrain_h100x6_hsb2_wo1_"
     "execctx_prefix_balanced_lr6e-4_bs19_oomretry"
 )
-DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs19-retry"
+DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs19-retry"
 
 
 def shq(value: object) -> str:
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Launch semi_control_rolling H100x6 pretrain on hsb-npc-training-2 "
-            "and wo-pvc-2 with train_batch_size OOM fallback."
+            "and wo-pvc-1 with train_batch_size OOM fallback."
         )
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", "p-pnc"))

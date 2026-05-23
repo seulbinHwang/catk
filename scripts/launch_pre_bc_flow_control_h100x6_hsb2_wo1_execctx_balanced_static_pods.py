@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Launch execution-context pretrain on hsb-npc-training-2 + wo-pvc-2.
+"""Launch execution-context pretrain on hsb-npc-training-2 + wo-pvc-1.
 
 This launcher targets the already-running ``hsb-npc-training-2`` H100x4 pod
-and ``wo-pvc-2`` H100x2 pod. It does not create, delete, or restart pods. It
+and ``wo-pvc-1`` H100x2 pod. It does not create, delete, or restart pods. It
 only prepares the optional memory-balance metadata cache and starts/replaces
 the configured tmux training session inside the existing pods.
 """
@@ -19,17 +19,17 @@ from pathlib import Path
 
 BASE_LAUNCHER = Path(__file__).with_name("launch_h100x4_multinode_pretrain_tmux.py")
 
-DEFAULT_PODS = ("hsb-npc-training-2", "wo-pvc-2")
+DEFAULT_PODS = ("hsb-npc-training-2", "wo-pvc-1")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4x2_execctx_balanced"
 DEFAULT_TASK_NAME = (
-    "flow_control_space_pretrain_h100x6_hsb2_wo2_"
+    "flow_control_space_pretrain_h100x6_hsb2_wo1_"
     "execctx_prefix_balanced_lr6e-4_bs19"
 )
-DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced"
+DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced"
 DEFAULT_METADATA_CACHE_RELATIVE = "dataset_metadata/womd_training_memory_balance_v1.pt"
 DEFAULT_CACHE_ROOT_BY_POD = {
     "hsb-npc-training-2": "/workspace/womd_v1_3/SMART_cache",
-    "wo-pvc-2": "/workspace/womd_v1_3/SMART_cache",
+    "wo-pvc-1": "/workspace/womd_v1_3/SMART_cache",
 }
 HETEROGENEOUS_STRATEGY_OVERRIDES = (
     "trainer.strategy._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy",
@@ -160,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Launch 6-H100 execution-context-aligned control-space pretrain on "
-            "hsb-npc-training-2 and wo-pvc-2."
+            "hsb-npc-training-2 and wo-pvc-1."
         )
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", "p-pnc"))

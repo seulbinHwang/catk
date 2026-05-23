@@ -10,7 +10,7 @@ def _load_launcher_module():
     script_path = (
         repo_root
         / "scripts"
-        / "launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_static_pods.py"
+        / "launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_static_pods.py"
     )
     spec = importlib.util.spec_from_file_location("h100x6_launcher", script_path)
     assert spec is not None and spec.loader is not None

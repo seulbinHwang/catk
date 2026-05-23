@@ -548,7 +548,7 @@ torchrun ... -m src.run \
 - 학습에서는 `control_alignment_filter.enabled=true`가 기본으로 켜져 있습니다. 이 필터는 vehicle/cyclist를 holonomic으로 바꾸지 않고 non-holonomic control target을 그대로 유지하되, raw GT와 transition-aligned trajectory의 위치 차이가 너무 큰 학습 anchor만 loss에서 제외합니다. 기본 기준은 vehicle `2.0m`, cyclist `2.0m`입니다. pedestrian은 holonomic이라 별도 기준을 두지 않습니다. 이 필터는 학습 target 선택에만 적용되며 validation, closed-loop rollout, fast RMM, WOSAC 제출물 생성의 평가 agent 선택은 바꾸지 않습니다.
 - cache-time control alignment는 `build_transition_aligned_control_trajectory` 결과까지만 저장합니다. 구체적으로 `aligned_pos`, `aligned_heading`, `transition_control_norm_by_step`의 current 이후 future 구간과 numeric config key만 저장합니다. `_build_flow_targets`의 anchor 선택, prefix-valid future loss mask, alignment threshold filter, pose metric target gather는 학습/검증 설정에 따라 달라져야 하므로 online token processor에 남겨둡니다. aligned coarse token id matching도 token bank와 matching algorithm 버전에 묶이므로 cache에 넣지 않습니다.
 - cached control alignment는 `algorithm_version`, `current_step`, `control_pos_scale_m`, type별 yaw scale, `use_holonomic_model_only`, vehicle/cyclist no-slip ratio가 현재 token processor config와 맞을 때만 사용합니다. `train_use_eval_agent_selection=false`처럼 transform이 `valid_mask`를 바꾸는 경로나 RoaD/fine-tuning처럼 old cache를 쓰는 경로에서는 자동으로 online 계산으로 fallback합니다. 따라서 pretrain, fine-tuning, open-loop validation, closed-loop validation, fast RMM, WOSAC submission 경로의 target/mask 의미는 기존과 같습니다.
-- H100x6 `hsb-npc-training-2 + wo-pvc-2`에서 training subset 3,600개, `train_batch_size=15`, 40 train batch, validation off 조건으로 직접 비교한 결과 raw/old cache fallback은 `time/train_epoch_minutes=0.90815`, control-alignment cache 사용은 `0.86628`이었습니다. pretrain train loop 기준 약 `4.6%` 빨라졌고, `worst_peak_reserved_pct`는 `67.7414% -> 67.7439%`로 유의미한 증가가 없었습니다. 같은 augmented cache로 train 1 batch + closed-loop validation 1 batch smoke도 정상 종료했습니다.
+- H100x6 4+2 pod 조합에서 training subset 3,600개, `train_batch_size=15`, 40 train batch, validation off 조건으로 직접 비교한 결과 raw/old cache fallback은 `time/train_epoch_minutes=0.90815`, control-alignment cache 사용은 `0.86628`이었습니다. pretrain train loop 기준 약 `4.6%` 빨라졌고, `worst_peak_reserved_pct`는 `67.7414% -> 67.7439%`로 유의미한 증가가 없었습니다. 같은 augmented cache로 train 1 batch + closed-loop validation 1 batch smoke도 정상 종료했습니다.
 - transition-aligned trajectory가 raw GT future를 얼마나 왜곡하는지 확인하려면 아래 도구를 먼저 돌립니다. 이 도구는 SMART cache를 읽기만 하며, cache 생성 로직이나 cache 파일은 바꾸지 않습니다. token processor와 같은 heading clean / 이전 token step extrapolation을 적용한 뒤 raw step `10` 이후의 raw 위치와 transition-aligned 위치 사이의 L2 오차를 집계합니다. worker는 여러 pkl을 chunk 단위로 합산한 뒤 histogram만 반환하므로, 전체 training split 전수 분석에서도 IPC 비용이 작습니다.
 
 ```bash
@@ -717,12 +717,12 @@ kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-cont
 python scripts/launch_pre_bc_flow_control_h100x4x2_hsb_execctx_balanced_static_pods.py --stop
 ```
 
-#### hsb-npc-training-2/wo-pvc-2 H100x6 execution-context balanced pretrain
+#### hsb-npc-training-2/wo-pvc-1 H100x6 execution-context balanced pretrain
 
-`semi_control_rolling` 최신 코드 기준으로 `hsb-npc-training-2` H100 4장과 `wo-pvc-2` H100 2장을 묶어 총 6 GPU pretrain을 돌릴 때는 아래 전용 launcher를 씁니다. 이 launcher도 기존 running pod 안에 tmux session만 만들며 pod를 새로 만들거나 재시작하지 않습니다. **이미 두 pod에서 다른 학습이 돌고 있으면 실행하지 말고, 해당 학습이 끝난 뒤에만 사용합니다.**
+`semi_control_rolling` 최신 코드 기준으로 `hsb-npc-training-2` H100 4장과 `wo-pvc-1` H100 2장을 묶어 총 6 GPU pretrain을 돌릴 때는 아래 전용 launcher를 씁니다. 이 launcher도 기존 running pod 안에 tmux session만 만들며 pod를 새로 만들거나 재시작하지 않습니다. **이미 두 pod에서 다른 학습이 돌고 있으면 실행하지 말고, 해당 학습이 끝난 뒤에만 사용합니다.**
 
 ```bash
-python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py \
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py \
   --prebuild-metadata \
   --replace
 ```
@@ -730,22 +730,22 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_r
 실행 전에는 dry-run으로 pod, branch, task name, metadata prebuild 명령을 확인합니다.
 
 ```bash
-python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py \
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py \
   --prebuild-metadata \
   --dry-run
 ```
 
-이 구성은 4 GPU pod와 2 GPU pod를 섞어 쓰므로 일반 DDP의 `devices x num_nodes` 가정과 맞지 않습니다. launcher는 `--manual-rank-offsets`와 heterogeneous Lightning strategy를 함께 사용해 `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-2`는 rank `4~5`, 전체 world size는 `6`으로 고정합니다. 기본 실행은 OOM-retry wrapper를 사용합니다. 첫 시도는 현재 최신 코드에서 안정 상한으로 확인한 `train_batch_size=19`이고, CUDA OOM이 감지되면 최신 `epoch_last.ckpt`를 찾아 같은 실험을 `18 -> 17 -> ...` 순서로 낮춰 resume합니다.
+이 구성은 4 GPU pod와 2 GPU pod를 섞어 쓰므로 일반 DDP의 `devices x num_nodes` 가정과 맞지 않습니다. launcher는 `--manual-rank-offsets`와 heterogeneous Lightning strategy를 함께 사용해 `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-1`은 rank `4~5`, 전체 world size는 `6`으로 고정합니다. 기본 실행은 OOM-retry wrapper를 사용합니다. 첫 시도는 현재 최신 코드에서 안정 상한으로 확인한 `train_batch_size=19`이고, CUDA OOM이 감지되면 최신 `epoch_last.ckpt`를 찾아 같은 실험을 `18 -> 17 -> ...` 순서로 낮춰 resume합니다.
 
 | 항목 | 값 |
 |---|---|
 | 대상 브랜치 | `semi_control_rolling` |
-| 대상 pod | `hsb-npc-training-2`, `wo-pvc-2` |
+| 대상 pod | `hsb-npc-training-2`, `wo-pvc-1` |
 | GPU 구성 | H100 4장 + H100 2장 = 6 GPU |
-| launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py` |
+| launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py` |
 | experiment config | `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml` |
-| task name | `flow_control_space_pretrain_h100x6_hsb2_wo2_execctx_prefix_balanced_lr6e-4_bs19_oomretry` |
-| tmux session | `catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs19-retry` |
+| task name | `flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_balanced_lr6e-4_bs19_oomretry` |
+| tmux session | `catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs19-retry` |
 | per-GPU batch | 첫 시도 `19`, OOM 시 `1`씩 감소 |
 | effective global batch | 첫 시도 `19 x 6 = 114` |
 | learning rate | `6e-4` |
@@ -772,7 +772,7 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_r
 
 따라서 이 6-GPU 조합에서는 `train_batch_size=19`가 안정성과 완료 속도의 균형이 가장 좋습니다. 위 추정치는 train step만 기준으로 계산한 값이며, fit-time validation과 checkpoint/W&B overhead가 추가되면 실제 wall-clock은 더 길어질 수 있습니다. 기본 OOM-retry launcher는 `bs19`에서도 CUDA OOM이 발생할 경우 `bs18`부터 자동 resume합니다.
 
-H100x6 launcher는 학습 중 Fast RMM validation의 분산을 줄이기 위해 `model.model_config.n_rollout_closed_val=32`를 기본값으로 고정합니다. 필요하면 `--n-rollout-closed-val 64`처럼 명시적으로 더 키울 수 있습니다. `hsb-npc-training-2` 4 GPU + `wo-pvc-2` 2 GPU에서 `limit_train_batches=1`, `limit_val_batches=1`, `train_batch_size=2`, `val_batch_size=16` 조건으로 직접 비교했을 때 validation 1 batch 시간은 다음과 같았습니다.
+H100x6 launcher는 학습 중 Fast RMM validation의 분산을 줄이기 위해 `model.model_config.n_rollout_closed_val=32`를 기본값으로 고정합니다. 필요하면 `--n-rollout-closed-val 64`처럼 명시적으로 더 키울 수 있습니다. H100x6 4+2 GPU 조합에서 `limit_train_batches=1`, `limit_val_batches=1`, `train_batch_size=2`, `val_batch_size=16` 조건으로 직접 비교했을 때 validation 1 batch 시간은 다음과 같았습니다.
 
 | `n_rollout_closed_val` | validation 1 batch | 관측 GPU peak |
 |---:|---:|---:|
@@ -781,12 +781,12 @@ H100x6 launcher는 학습 중 Fast RMM validation의 분산을 줄이기 위해 
 
 현재 preset의 fit-time validation은 `scorer_scene_num=1680`, world size `6`, `val_batch_size=16` 기준으로 rank당 약 18개 validation batch를 처리합니다. 위 probe를 단순 외삽하면 validation 1회는 `n_rollout_closed_val=16` 대비 약 `+2.4분`, 기본 64 epoch 학습의 validation 2회 전체로는 약 `+4.8분` 늘어나는 수준입니다. 메모리는 rollout 수 증가에 따라 유의미하게 늘지만 H100 80GB 기준 관측 peak는 아직 여유가 있었고, closed-loop rollout 경로에는 CUDA OOM 시 rollout chunk를 줄여 재시도하는 fallback이 있어 validation batch가 바로 치명적으로 실패할 가능성은 낮습니다.
 
-Agent trajectory token matching은 모든 coarse segment를 batched query로 묶어 처리합니다. `hsb-npc-training-2`, `wo-pvc-2` H100에서 같은 synthetic workload(`n_agent=1536`, `n_step=91`, 실제 token bank 사용)를 기준으로 reference loop와 비교했을 때 `valid_mask`, `gt_idx`, `sampled_idx`는 exact match이고 pose/heading 최대 오차는 `0.0`이었습니다.
+Agent trajectory token matching은 모든 coarse segment를 batched query로 묶어 처리합니다. H100x6 4+2 GPU 조합에서 같은 synthetic workload(`n_agent=1536`, `n_step=91`, 실제 token bank 사용)를 기준으로 reference loop와 비교했을 때 `valid_mask`, `gt_idx`, `sampled_idx`는 exact match이고 pose/heading 최대 오차는 `0.0`이었습니다.
 
 | pod | 이전 `_match_agent_token` | batched matching | 변화 | peak allocated |
 |---|---:|---:|---:|---:|
 | `hsb-npc-training-2` | `45.43ms` | `27.69ms` | `-39.1%` | `329MiB -> 633MiB` |
-| `wo-pvc-2` | `45.03ms` | `27.59ms` | `-38.7%` | `329MiB -> 633MiB` |
+| 2-GPU 보조 pod | `45.03ms` | `27.59ms` | `-38.7%` | `329MiB -> 633MiB` |
 
 이 peak memory 증가는 token matching 구간의 일시 버퍼 기준이며, H100 전체 메모리 대비 작습니다. 대신 token processor 병목 중 agent token matching 부분은 약 39% 줄어듭니다.
 
@@ -795,18 +795,18 @@ Flow target 생성도 anchor 16개를 하나씩 반복하지 않고, 모든 anch
 | pod | 이전 `_build_flow_targets` | batched anchors | 변화 | peak allocated |
 |---|---:|---:|---:|---:|
 | `hsb-npc-training-2` | `80.73ms` | `62.57ms` | `-22.5%` | `645MiB -> 644MiB` |
-| `wo-pvc-2` | `76.26ms` | `61.40ms` | `-19.5%` | `645MiB -> 644MiB` |
+| 2-GPU 보조 pod | `76.26ms` | `61.40ms` | `-19.5%` | `645MiB -> 644MiB` |
 
 6-GPU heterogeneous run의 안전장치는 다음과 같습니다.
 
 - launcher는 `data.train_memory_balanced_batches=true`와 `trainer.use_distributed_sampler=false`를 항상 마지막 Hydra override로 고정합니다. 이 조합에서는 memory-balanced batch sampler가 `trainer.world_size=6`을 읽어 rank별 데이터를 나누므로, 6개 GPU가 같은 train sample을 반복해서 보는 사고를 막습니다.
 - `--extra-hydra-overrides`로 `data.train_memory_balanced_batches=false` 또는 `trainer.use_distributed_sampler=true`를 넣으면 launcher가 학습 시작 전에 실패합니다.
 - datamodule도 distributed fallback을 갖습니다. 다른 실험에서 memory-balanced sampler를 끄더라도 `world_size>1`이면 train dataloader가 PyTorch `DistributedSampler`를 붙여 rank별 train sample을 나눕니다. 즉 이 launcher의 강제 설정은 OOM 완화를 위한 운영 정책이고, datamodule fallback은 중복 학습을 막는 마지막 안전장치입니다.
-- `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-2`는 rank `4~5`를 받습니다. 내부 sampler/W&B runtime metric은 실제 `world_size=6` 기준입니다. Lightning의 device summary처럼 local device 수와 node 수를 따로 보여주는 출력은 4+2 구성을 완전히 설명하지 못할 수 있으므로, step 수와 global batch는 launcher의 `manual world_size: 6` 및 W&B `train_setup/global_batch_size=114`를 기준으로 확인합니다.
+- `hsb-npc-training-2`는 rank `0~3`, `wo-pvc-1`은 rank `4~5`를 받습니다. 내부 sampler/W&B runtime metric은 실제 `world_size=6` 기준입니다. Lightning의 device summary처럼 local device 수와 node 수를 따로 보여주는 출력은 4+2 구성을 완전히 설명하지 못할 수 있으므로, step 수와 global batch는 launcher의 `manual world_size: 6` 및 W&B `train_setup/global_batch_size=114`를 기준으로 확인합니다.
 - 기본 64 epoch 학습에서는 fit-time validation이 epoch `31`, `63` 종료 후 총 2번 실행됩니다. 더 자주 RMM을 확인해야 하면 runtime 비용을 감수하고 아래처럼 16 epoch 주기로 실행합니다.
 
 ```bash
-python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py \
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py \
   --prebuild-metadata \
   --replace \
   --check-val-every-n-epoch 16
@@ -817,29 +817,29 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_r
 tmux 확인:
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced
-kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced
+kubectl exec -it -n p-pnc wo-pvc-1 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced
 ```
 
 OOM-retry 기본 실험을 attach하려면:
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs19-retry
-kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs19-retry
+kubectl exec -it -n p-pnc hsb-npc-training-2 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs19-retry
+kubectl exec -it -n p-pnc wo-pvc-1 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs19-retry
 ```
 
 실험 코드만 멈추고 pod는 그대로 두려면:
 
 ```bash
-python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py --stop
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py --stop
 ```
 
 ##### H100x6 batch-19 OOM fallback launcher
 
-`train_batch_size=19`에서 시작하고 CUDA OOM이 발생하면 같은 task의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size`를 1씩 낮춰 resume하려면 아래 launcher를 씁니다. pod는 만들거나 삭제하지 않고, 기존 `hsb-npc-training-2`, `wo-pvc-2` 내부 tmux session만 교체합니다.
+`train_batch_size=19`에서 시작하고 CUDA OOM이 발생하면 같은 task의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size`를 1씩 낮춰 resume하려면 아래 launcher를 씁니다. pod는 만들거나 삭제하지 않고, 기존 `hsb-npc-training-2`, `wo-pvc-1` 내부 tmux session만 교체합니다.
 
 ```bash
-python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py \
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py \
   --prebuild-metadata \
   --replace
 ```
@@ -847,16 +847,16 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_r
 실행 전 dry-run:
 
 ```bash
-python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py \
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py \
   --prebuild-metadata \
   --dry-run
 ```
 
 | 항목 | 값 |
 |---|---|
-| launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py` |
-| task name | `flow_control_space_pretrain_h100x6_hsb2_wo2_execctx_prefix_balanced_lr6e-4_bs19_oomretry` |
-| tmux session | `catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced-bs19-retry` |
+| launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py` |
+| task name | `flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_balanced_lr6e-4_bs19_oomretry` |
+| tmux session | `catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs19-retry` |
 | 시작 per-GPU batch | `19` |
 | 시작 effective global batch | `19 x 6 = 114` |
 | OOM fallback | `19 -> 18 -> 17 -> ...` |
@@ -868,7 +868,7 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_r
 실험 코드만 멈추고 pod는 그대로 두려면:
 
 ```bash
-python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo2_execctx_balanced_oom_retry_static_pods.py --stop
+python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py --stop
 ```
 
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
