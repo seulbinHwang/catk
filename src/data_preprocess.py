@@ -12,6 +12,7 @@
 # its affiliates is strictly prohibited.
 
 import multiprocessing
+import os
 import pickle
 from argparse import ArgumentParser
 from functools import partial
@@ -80,6 +81,36 @@ _polygon_light_type = [
     "LANE_STATE_GO",
     "LANE_STATE_CAUTION",
 ]
+
+
+def _configure_preprocess_worker_threads(worker_threads: int) -> None:
+    if worker_threads <= 0:
+        return
+
+    thread_value = str(worker_threads)
+    for env_name in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ[env_name] = thread_value
+
+    try:
+        torch.set_num_threads(worker_threads)
+    except RuntimeError:
+        pass
+    try:
+        torch.set_num_interop_threads(worker_threads)
+    except RuntimeError:
+        pass
+
+    try:
+        tf.config.threading.set_intra_op_parallelism_threads(worker_threads)
+        tf.config.threading.set_inter_op_parallelism_threads(worker_threads)
+    except RuntimeError:
+        pass
 
 
 def get_agent_features(
@@ -524,7 +555,10 @@ def batch_process9s_transformer(
     split,
     num_workers,
     control_alignment_cache_config: ControlAlignmentCacheConfig | None = None,
+    worker_threads: int = 1,
 ):
+    _configure_preprocess_worker_threads(worker_threads)
+
     output_dir = Path(output_dir)
     output_dir_tfrecords_splitted = None
     if split == "validation":
@@ -543,7 +577,11 @@ def batch_process9s_transformer(
         control_alignment_cache_config=control_alignment_cache_config,
     )
 
-    with multiprocessing.Pool(num_workers) as p:
+    with multiprocessing.Pool(
+        num_workers,
+        initializer=_configure_preprocess_worker_threads,
+        initargs=(worker_threads,),
+    ) as p:
         r = list(tqdm(p.imap_unordered(func, packages), total=len(packages)))
 
 
@@ -559,6 +597,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument(
+        "--worker_threads",
+        type=int,
+        default=1,
+        help=(
+            "Torch/TF/BLAS threads per preprocessing worker. The default keeps "
+            "high --num_workers cache builds from oversubscribing CPU threads. "
+            "Set to 0 to keep library defaults."
+        ),
+    )
     parser.add_argument(
         "--disable_control_alignment_cache",
         action="store_true",
@@ -624,4 +672,5 @@ if __name__ == "__main__":
         args.split,
         num_workers=args.num_workers,
         control_alignment_cache_config=control_alignment_cache_config,
+        worker_threads=args.worker_threads,
     )

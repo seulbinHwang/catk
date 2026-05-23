@@ -273,6 +273,7 @@ $CACHE_ROOT/
 - `validation_tfrecords_splitted/`는 `validation` 캐시 생성 시 자동 생성됩니다.
 - `validation_tfrecords_splitted/`는 local evaluation, 2025 Sim Agents metric 계산, mp4 visualization에 필요합니다.
 - `semi_control_rolling`의 `src.data_preprocess`는 기본적으로 control-space 학습용 derived field도 함께 저장합니다. 저장되는 값은 raw current 이후의 `control_aligned_future_pos`, `control_aligned_future_heading`, `control_transition_norm_future`, `control_alignment_cache_key`이며, anchor 선택이나 loss mask는 저장하지 않습니다. 이 값들은 `use_kinematic_control_flow=true` 학습에서 transition-aligned trajectory를 매 batch 다시 만들지 않기 위한 속도 최적화입니다.
+- `src.data_preprocess`는 `--num_workers 56` 같은 고병렬 캐시 생성에서 worker마다 Torch/TF/BLAS thread가 과도하게 늘어나는 것을 막기 위해 기본적으로 worker당 thread를 1개로 제한합니다. 캐시 결과물은 동일하며, 특별히 라이브러리 기본 thread 설정을 쓰고 싶을 때만 `--worker_threads 0`을 넘깁니다.
 - 기존 pkl cache처럼 derived field가 없는 cache도 계속 사용할 수 있습니다. 그 경우 학습 중 token processor가 기존 방식대로 transition-aligned trajectory를 on-the-fly로 만듭니다. 일부 파일만 새 포맷인 split은 collate 오류를 피하기 위해 old-cache mode로 정규화하거나, 첫 파일이 새 포맷인데 뒤 파일이 old 포맷이면 명확한 에러를 냅니다. 운영에서는 split 전체를 한 번에 재생성하는 것을 권장합니다.
 - control-cache 생성을 끄려면 cache 생성 시 `--disable_control_alignment_cache`를 넘깁니다. no-slip ratio, yaw scale, holonomic ablation 값을 cache 생성 기본값과 다르게 쓸 실험이면 같은 값을 `src.data_preprocess` 인자로 맞춰 만들거나, 기존 cache를 쓰고 online fallback으로 두세요.
 
