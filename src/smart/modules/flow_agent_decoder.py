@@ -22,7 +22,6 @@ from src.smart.modules.kinematic_control import (
     validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
 )
-from src.smart.modules.dynamic_light_time import build_constant_light_time_delta_norm
 from src.smart.modules.self_forced_rollout_detach import (
     detach_training_rollout_state,
 )
@@ -701,7 +700,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             mask=mask,
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
-            light_type=map_feature.get("light_type"),
         )
 
         feat_map = map_feature["pt_token"]
@@ -933,7 +931,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             mask=valid_window,
             batch_s=batch_s_pl2a,
             batch_pl=map_feature["batch"],
-            light_type=map_feature.get("light_type"),
         )
         edge_index_a2a, r_a2a = self.build_interaction_edge(
             pos_a=pos_window,
@@ -1476,14 +1473,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     mask=inference_mask[:, -1:],
                     batch_s=tokenized_agent["batch"],
                     batch_pl=map_feature["batch"],
-                    light_type=map_feature.get("light_type"),
-                    light_time_delta_norm=build_constant_light_time_delta_norm(
-                        num_agents=n_agent,
-                        num_steps=1,
-                        delta_seconds=float(t * self.shift) * 0.1,
-                        device=pos_window.device,
-                        dtype=pos_window.dtype,
-                    ),
                 )
                 edge_index_a2a, r_a2a = self.build_interaction_edge(
                     pos_a=pos_window[:, -1:],
