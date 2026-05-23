@@ -2,7 +2,7 @@
 # Launch SMART NTP A100x4x2 pretrain on existing testa/testaa pods with
 # automatic CUDA OOM fallback.
 #
-# The first attempt starts at INITIAL_BS=12 by default. If any pod log contains
+# The first attempt starts at INITIAL_BS=16 by default. If any pod log contains
 # a CUDA OOM marker, the script stops the distributed job, finds the newest
 # epoch_last.ckpt under the same task name, lowers data.train_batch_size by
 # OOM_STEP=1, and starts the next attempt from that checkpoint.
@@ -22,7 +22,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_smart_ntp_a100x4x2_oom_retry_main}"
 REPO_URL="${REPO_URL:-https://github.com/seulbinHwang/catk.git}"
 BRANCH="${BRANCH:-main}"
 GIT_REF="${GIT_REF:-}"
-TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs12_oom_retry_main}"
+TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs16_oom_retry_main}"
 SESSION="${SESSION:-catk-smart-ntp-a100x4x2}"
 EXPERIMENT="${EXPERIMENT:-pre_bc_a100x4x2}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
@@ -30,14 +30,14 @@ CACHE_ROOT="${CACHE_ROOT:-}"
 POD_CACHE_ROOTS="${POD_CACHE_ROOTS:-}"
 MASTER_PORT="${MASTER_PORT:-29521}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
-INITIAL_BS="${INITIAL_BS:-12}"
+INITIAL_BS="${INITIAL_BS:-16}"
 OOM_STEP="${OOM_STEP:-1}"
 MIN_BS="${MIN_BS:-8}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 MAX_NON_OOM_RETRIES="${MAX_NON_OOM_RETRIES:-2}"
 RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-134,143}"
-VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-}"
-TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-12}"
+TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-12}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
@@ -177,8 +177,8 @@ stop_attempt_sessions() {
 start_attempt() {
   local bs="$1"
   local ckpt_path="$2"
-  local val_bs="${VAL_BATCH_SIZE:-$bs}"
-  local test_bs="${TEST_BATCH_SIZE:-$bs}"
+  local val_bs="$VAL_BATCH_SIZE"
+  local test_bs="$TEST_BATCH_SIZE"
   local -a cmd=(
     python scripts/launch_smart_ntp_a100x4x2_testa.py
     --namespace "$NAMESPACE"
