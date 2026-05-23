@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch SMART NTP pretrain on hsb-npc-training(H100x4) + wo-pvc(H100x2).
+"""Launch SMART NTP pretrain on hsb-npc-training(H100x4) + wo-pvc-1(H100x2).
 
 This launcher never creates, deletes, or restarts pods. It only runs
 ``kubectl exec`` against already-running pods and starts/kills tmux sessions
@@ -17,18 +17,18 @@ import sys
 
 
 DEFAULT_NAMESPACE = "p-pnc"
-DEFAULT_PODS = ["hsb-npc-training", "wo-pvc"]
+DEFAULT_PODS = ["hsb-npc-training", "wo-pvc-1"]
 DEFAULT_BRANCH = "main"
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_CACHE_ROOT_BY_POD = {
     "hsb-npc-training": "/workspace/womd_v1_3/SMART_cache",
-    "wo-pvc": "/workspace/womd_v1_3/SMART_cache",
+    "wo-pvc-1": "/workspace/womd_v1_3/SMART_cache",
 }
 DEFAULT_GPU_COUNT_BY_POD = {
     "hsb-npc-training": 4,
-    "wo-pvc": 2,
+    "wo-pvc-1": 2,
 }
 STRICT_EXPERIMENT = "pre_bc_a100x4x2"
 MAX_TRAIN_BATCH_SIZE = 24
