@@ -25,9 +25,9 @@ BASE_LAUNCHER = Path(__file__).with_name("launch_h100x4_multinode_pretrain_tmux.
 
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_h100x6_hsb2_wo1_"
-    "execctx_prefix_balanced_lr6e-4_bs19_oomretry"
+    "execctx_prefix_balanced_lr6e-4_bs20_oomretry"
 )
-DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs19-retry"
+DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo1-execctx-balanced-bs20-retry"
 
 
 def shq(value: object) -> str:
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=h100x6.DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--initial-bs", type=int, default=19)
+    parser.add_argument("--initial-bs", type=int, default=20)
     parser.add_argument(
         "--oom-step",
         type=int,
