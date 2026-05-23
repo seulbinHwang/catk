@@ -34,7 +34,7 @@ model:
         cyclist_max_error_m: 2.0
 
 data:
-  train_batch_size: 20
+  train_batch_size: 19
   val_batch_size: 16
   test_batch_size: 16
   train_use_eval_agent_selection: true

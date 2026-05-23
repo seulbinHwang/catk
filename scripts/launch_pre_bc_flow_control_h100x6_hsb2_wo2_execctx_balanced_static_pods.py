@@ -23,7 +23,7 @@ DEFAULT_PODS = ("hsb-npc-training-2", "wo-pvc-2")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4x2_execctx_balanced"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_h100x6_hsb2_wo2_"
-    "execctx_prefix_balanced_lr6e-4_bs20"
+    "execctx_prefix_balanced_lr6e-4_bs19"
 )
 DEFAULT_SESSION = "catk-control-pretrain-h100x6-hsb2-wo2-execctx-balanced"
 DEFAULT_METADATA_CACHE_RELATIVE = "dataset_metadata/womd_training_memory_balance_v1.pt"
@@ -195,7 +195,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--train-batch-size", type=int, default=20)
+    parser.add_argument("--train-batch-size", type=int, default=19)
     parser.add_argument("--learning-rate", default="6e-4")
     parser.add_argument("--val-batch-size", default="16")
     parser.add_argument(
