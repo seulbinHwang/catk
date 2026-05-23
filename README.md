@@ -272,6 +272,9 @@ $CACHE_ROOT/
 - `training/`, `validation/`, `testing/`에는 시나리오별 `.pkl`이 저장됩니다.
 - `validation_tfrecords_splitted/`는 `validation` 캐시 생성 시 자동 생성됩니다.
 - `validation_tfrecords_splitted/`는 local evaluation, 2025 Sim Agents metric 계산, mp4 visualization에 필요합니다.
+- `semi_control_rolling`의 `src.data_preprocess`는 기본적으로 control-space 학습용 derived field도 함께 저장합니다. 저장되는 값은 raw current 이후의 `control_aligned_future_pos`, `control_aligned_future_heading`, `control_transition_norm_future`, `control_alignment_cache_key`이며, anchor 선택이나 loss mask는 저장하지 않습니다. 이 값들은 `use_kinematic_control_flow=true` 학습에서 transition-aligned trajectory를 매 batch 다시 만들지 않기 위한 속도 최적화입니다.
+- 기존 pkl cache처럼 derived field가 없는 cache도 계속 사용할 수 있습니다. 그 경우 학습 중 token processor가 기존 방식대로 transition-aligned trajectory를 on-the-fly로 만듭니다. 일부 파일만 새 포맷인 split은 collate 오류를 피하기 위해 old-cache mode로 정규화하거나, 첫 파일이 새 포맷인데 뒤 파일이 old 포맷이면 명확한 에러를 냅니다. 운영에서는 split 전체를 한 번에 재생성하는 것을 권장합니다.
+- control-cache 생성을 끄려면 cache 생성 시 `--disable_control_alignment_cache`를 넘깁니다. no-slip ratio, yaw scale, holonomic ablation 값을 cache 생성 기본값과 다르게 쓸 실험이면 같은 값을 `src.data_preprocess` 인자로 맞춰 만들거나, 기존 cache를 쓰고 online fallback으로 두세요.
 
 ### 4.4 Nubes 에서 캐시 다운로드
 
@@ -519,13 +522,16 @@ torchrun ... -m src.run \
   task_name=flow_control_space_pretrain
 ```
 
-- GT control label과 current 이후 입력 문맥은 기존 cache 안의 GT pose에서 batch 생성 시점에 on-the-fly로 만듭니다. 별도 target cache는 필요 없고, SMART cache를 만드는 과정도 바꾸지 않습니다.
+- GT control label과 current 이후 입력 문맥은 SMART cache 안의 GT pose에서 만듭니다. 최신 cache에는 raw current 이후 transition-aligned future state/control을 derived field로 미리 저장해 batch 생성 시 반복 계산을 줄입니다. 이 derived field가 없거나 active control config와 맞지 않으면 기존처럼 batch 생성 시점에 on-the-fly로 계산합니다.
 - vehicle / cyclist는 `delta_n=0`인 wheelbase-free non-holonomic decoder를 사용하고, pedestrian은 `delta_s`, `delta_n`을 모두 쓰는 holonomic decoder를 사용합니다.
 - `model.model_config.token_processor.use_holonomic_model_only=true`를 켜면 ablation용으로 vehicle / cyclist에도 pedestrian과 같은 holonomic decoder를 적용합니다. 이때 vehicle / cyclist의 `delta_n`도 학습 target과 rollout 복원에 사용됩니다. 기본값 `false`는 기존 agent-type-aware non-holonomic/holonomic 혼합 방식입니다.
 - map / agent motion token matching은 항상 deterministic nearest-token argmin을 씁니다. 이전 `map_token_sampling.num_k=1`, `agent_token_sampling.num_k=1` 기본값과 같은 동작을 고정한 것이며, stochastic top-k sampling config와 Categorical sampling 경로는 제거했습니다. 따라서 학습, validation, fast RMM, WOSAC submission 생성에서 tokenization은 train/eval mode와 무관하게 같은 nearest-token 규칙을 따릅니다.
 - agent trajectory token matching은 coarse token step을 하나씩 반복하지 않고, 모든 `[agent, coarse_step]` segment를 한 번에 local contour로 만든 뒤 valid query만 type별 token bank와 deterministic argmin으로 매칭합니다. query 축은 chunk로 나눠 peak memory를 제한합니다. invalid segment는 기존과 같이 `valid_mask=false`, token index/pose/heading `0`으로 남기므로 학습 target과 평가 경로의 의미는 바뀌지 않습니다.
 - `use_kinematic_control_flow=true`에서는 관측 history와 현재 시작 pose는 raw GT를 유지하고, 현재 이후 future만 inference와 같은 kinematic transition으로 한 번 실행해 transition-aligned trajectory를 만듭니다. 각 anchor의 context position/heading, motion token, future control target, open-loop metric target은 모두 이 같은 궤적에서 잘라 씁니다. 따라서 target에만 별도로 rolling projection을 다시 적용하지 않습니다.
 - 학습에서는 `control_alignment_filter.enabled=true`가 기본으로 켜져 있습니다. 이 필터는 vehicle/cyclist를 holonomic으로 바꾸지 않고 non-holonomic control target을 그대로 유지하되, raw GT와 transition-aligned trajectory의 위치 차이가 너무 큰 학습 anchor만 loss에서 제외합니다. 기본 기준은 vehicle `2.0m`, cyclist `2.0m`입니다. pedestrian은 holonomic이라 별도 기준을 두지 않습니다. 이 필터는 학습 target 선택에만 적용되며 validation, closed-loop rollout, fast RMM, WOSAC 제출물 생성의 평가 agent 선택은 바꾸지 않습니다.
+- cache-time control alignment는 `build_transition_aligned_control_trajectory` 결과까지만 저장합니다. 구체적으로 `aligned_pos`, `aligned_heading`, `transition_control_norm_by_step`의 current 이후 future 구간과 numeric config key만 저장합니다. `_build_flow_targets`의 anchor 선택, prefix-valid future loss mask, alignment threshold filter, pose metric target gather는 학습/검증 설정에 따라 달라져야 하므로 online token processor에 남겨둡니다. aligned coarse token id matching도 token bank와 matching algorithm 버전에 묶이므로 cache에 넣지 않습니다.
+- cached control alignment는 `algorithm_version`, `current_step`, `control_pos_scale_m`, type별 yaw scale, `use_holonomic_model_only`, vehicle/cyclist no-slip ratio가 현재 token processor config와 맞을 때만 사용합니다. `train_use_eval_agent_selection=false`처럼 transform이 `valid_mask`를 바꾸는 경로나 RoaD/fine-tuning처럼 old cache를 쓰는 경로에서는 자동으로 online 계산으로 fallback합니다. 따라서 pretrain, fine-tuning, open-loop validation, closed-loop validation, fast RMM, WOSAC submission 경로의 target/mask 의미는 기존과 같습니다.
+- H100x6 `hsb-npc-training-2 + wo-pvc-2`에서 training subset 3,600개, `train_batch_size=15`, 40 train batch, validation off 조건으로 직접 비교한 결과 raw/old cache fallback은 `time/train_epoch_minutes=0.90815`, control-alignment cache 사용은 `0.86628`이었습니다. pretrain train loop 기준 약 `4.6%` 빨라졌고, `worst_peak_reserved_pct`는 `67.7414% -> 67.7439%`로 유의미한 증가가 없었습니다. 같은 augmented cache로 train 1 batch + closed-loop validation 1 batch smoke도 정상 종료했습니다.
 - transition-aligned trajectory가 raw GT future를 얼마나 왜곡하는지 확인하려면 아래 도구를 먼저 돌립니다. 이 도구는 SMART cache를 읽기만 하며, cache 생성 로직이나 cache 파일은 바꾸지 않습니다. token processor와 같은 heading clean / 이전 token step extrapolation을 적용한 뒤 raw step `10` 이후의 raw 위치와 transition-aligned 위치 사이의 L2 오차를 집계합니다. worker는 여러 pkl을 chunk 단위로 합산한 뒤 histogram만 반환하므로, 전체 training split 전수 분석에서도 IPC 비용이 작습니다.
 
 ```bash

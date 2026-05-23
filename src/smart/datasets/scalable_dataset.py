@@ -18,6 +18,10 @@ from typing import Callable, List, Optional
 from torch_geometric.data import Dataset
 
 from src.smart.cache_filter import is_smart_cache_sample_file
+from src.smart.tokens.control_alignment_cache import (
+    has_control_alignment_cache_fields,
+    strip_control_alignment_cache_fields,
+)
 from src.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -47,6 +51,9 @@ class MultiDataset(Dataset):
             )
         if self._num_samples == 0:
             raise FileNotFoundError(f"No cached samples found under: {raw_dir}")
+        self._uses_control_alignment_cache = self._sample_has_control_alignment_cache(
+            self._raw_paths[0]
+        )
 
         log.info("Length of {} dataset is ".format(raw_dir) + str(self._num_samples))
         super(MultiDataset, self).__init__(
@@ -63,9 +70,30 @@ class MultiDataset(Dataset):
     def get(self, idx: int):
         with open(self.raw_paths[idx], "rb") as handle:
             data = pickle.load(handle)
+        self._normalize_optional_control_alignment_cache(data, self.raw_paths[idx])
 
         if self._tfrecord_dir is not None:
             data["tfrecord_path"] = (
                 self._tfrecord_dir / (data["scenario_id"] + ".tfrecords")
             ).as_posix()
         return data
+
+    @staticmethod
+    def _sample_has_control_alignment_cache(path: str) -> bool:
+        with open(path, "rb") as handle:
+            data = pickle.load(handle)
+        return has_control_alignment_cache_fields(data["agent"])
+
+    def _normalize_optional_control_alignment_cache(self, data, path: str) -> None:
+        has_cache = has_control_alignment_cache_fields(data["agent"])
+        if self._uses_control_alignment_cache:
+            if not has_cache:
+                raise ValueError(
+                    "Mixed SMART cache formats detected. The first sample contains "
+                    "control-alignment cache fields, but this sample does not: "
+                    f"{path}. Regenerate the split completely or remove the partial "
+                    "new-cache files."
+                )
+            return
+        if has_cache:
+            strip_control_alignment_cache_fields(data["agent"])

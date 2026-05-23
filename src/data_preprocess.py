@@ -27,6 +27,16 @@ from tqdm import tqdm
 from waymo_open_dataset.protos import scenario_pb2
 
 from src.smart.modules.dynamic_light_time import validate_observed_current_raw_step
+from src.smart.tokens.control_alignment_cache import (
+    DEFAULT_CACHE_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
+    DEFAULT_CACHE_CONTROL_CYCLIST_YAW_SCALE_RAD,
+    DEFAULT_CACHE_CONTROL_PEDESTRIAN_YAW_SCALE_RAD,
+    DEFAULT_CACHE_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    DEFAULT_CACHE_CONTROL_VEHICLE_YAW_SCALE_RAD,
+    CONTROL_ALIGNMENT_CACHE_CURRENT_STEP,
+    ControlAlignmentCacheConfig,
+    attach_control_alignment_cache_fields,
+)
 from src.smart.utils.geometry import wrap_angle
 from src.smart.utils.preprocess import get_polylines_from_polygon, preprocess_map
 
@@ -457,7 +467,13 @@ def decode_dynamic_map_states_from_proto(dynamic_map_states):
     return dynamic_map_infos
 
 
-def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
+def wm2argo(
+    file_path,
+    split,
+    output_dir,
+    output_dir_tfrecords_splitted,
+    control_alignment_cache_config: ControlAlignmentCacheConfig | None = None,
+):
     dataset = tf.data.TFRecordDataset(
         file_path, compression_type="", num_parallel_reads=3
     )
@@ -486,6 +502,11 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
             num_historical_steps=current_time_index + 1,
             num_steps=91,
         )
+        if control_alignment_cache_config is not None:
+            attach_control_alignment_cache_fields(
+                data,
+                config=control_alignment_cache_config,
+            )
 
         data["scenario_id"] = scenario_id
         with open(output_dir / f"{scenario_id}.pkl", "wb+") as f:
@@ -497,7 +518,13 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
                 file_writer.write(tf_data)
 
 
-def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
+def batch_process9s_transformer(
+    input_dir,
+    output_dir,
+    split,
+    num_workers,
+    control_alignment_cache_config: ControlAlignmentCacheConfig | None = None,
+):
     output_dir = Path(output_dir)
     output_dir_tfrecords_splitted = None
     if split == "validation":
@@ -513,6 +540,7 @@ def batch_process9s_transformer(input_dir, output_dir, split, num_workers):
         split=split,
         output_dir=output_dir,
         output_dir_tfrecords_splitted=output_dir_tfrecords_splitted,
+        control_alignment_cache_config=control_alignment_cache_config,
     )
 
     with multiprocessing.Pool(num_workers) as p:
@@ -531,8 +559,69 @@ if __name__ == "__main__":
     )
     parser.add_argument("--split", type=str, default="validation")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument(
+        "--disable_control_alignment_cache",
+        action="store_true",
+        help=(
+            "Do not store precomputed transition-aligned future state/control fields. "
+            "By default semi_control_rolling cache generation includes them."
+        ),
+    )
+    parser.add_argument(
+        "--control_current_step",
+        type=int,
+        default=CONTROL_ALIGNMENT_CACHE_CURRENT_STEP,
+    )
+    parser.add_argument("--control_pos_scale_m", type=float, default=1.0)
+    parser.add_argument(
+        "--control_vehicle_yaw_scale_rad",
+        type=float,
+        default=DEFAULT_CACHE_CONTROL_VEHICLE_YAW_SCALE_RAD,
+    )
+    parser.add_argument(
+        "--control_pedestrian_yaw_scale_rad",
+        type=float,
+        default=DEFAULT_CACHE_CONTROL_PEDESTRIAN_YAW_SCALE_RAD,
+    )
+    parser.add_argument(
+        "--control_cyclist_yaw_scale_rad",
+        type=float,
+        default=DEFAULT_CACHE_CONTROL_CYCLIST_YAW_SCALE_RAD,
+    )
+    parser.add_argument(
+        "--use_holonomic_model_only",
+        action="store_true",
+        help="Build cache with holonomic controls for all agent types.",
+    )
+    parser.add_argument(
+        "--control_vehicle_no_slip_point_ratio",
+        type=float,
+        default=DEFAULT_CACHE_CONTROL_VEHICLE_NO_SLIP_POINT_RATIO,
+    )
+    parser.add_argument(
+        "--control_cyclist_no_slip_point_ratio",
+        type=float,
+        default=DEFAULT_CACHE_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
+    )
     args = parser.parse_args()
 
+    control_alignment_cache_config = None
+    if not args.disable_control_alignment_cache:
+        control_alignment_cache_config = ControlAlignmentCacheConfig(
+            current_step=args.control_current_step,
+            pos_scale_m=args.control_pos_scale_m,
+            vehicle_yaw_scale_rad=args.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=args.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=args.control_cyclist_yaw_scale_rad,
+            use_holonomic_model_only=args.use_holonomic_model_only,
+            vehicle_no_slip_point_ratio=args.control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=args.control_cyclist_no_slip_point_ratio,
+        )
+
     batch_process9s_transformer(
-        args.input_dir, args.output_dir, args.split, num_workers=args.num_workers
+        args.input_dir,
+        args.output_dir,
+        args.split,
+        num_workers=args.num_workers,
+        control_alignment_cache_config=control_alignment_cache_config,
     )

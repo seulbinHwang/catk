@@ -18,6 +18,14 @@ from src.smart.modules.kinematic_control import (
     validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
 )
+from src.smart.tokens.control_alignment_cache import (
+    CONTROL_ALIGNED_FUTURE_HEADING_KEY,
+    CONTROL_ALIGNED_FUTURE_POS_KEY,
+    CONTROL_ALIGNMENT_CACHE_CURRENT_STEP,
+    CONTROL_TRANSITION_NORM_FUTURE_KEY,
+    ControlAlignmentCacheConfig,
+    validate_control_alignment_cache_fields,
+)
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils import transform_to_local, validate_flow_window_steps
 
@@ -98,6 +106,18 @@ class FlowTokenProcessor(TokenProcessor):
                 pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
                 cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
             )
+            self.control_alignment_cache_config = ControlAlignmentCacheConfig(
+                current_step=CONTROL_ALIGNMENT_CACHE_CURRENT_STEP,
+                pos_scale_m=self.control_pos_scale_m,
+                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+                use_holonomic_model_only=self.use_holonomic_model_only,
+                vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+                cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
+            )
+        else:
+            self.control_alignment_cache_config = None
         self.flow_target_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
 
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
@@ -148,24 +168,36 @@ class FlowTokenProcessor(TokenProcessor):
         target_heading = heading
         transition_control_norm_by_step: Tensor | None = None
         if self.use_kinematic_control_flow:
-            (
-                target_pos,
-                target_heading,
-                transition_control_norm_by_step,
-            ) = build_transition_aligned_control_trajectory(
+            cached_transition = self._load_precomputed_transition_alignment(
+                data=data,
                 pos=pos,
                 heading=heading,
-                agent_type=tokenized_agent["type"],
-                agent_length=tokenized_agent["shape"][:, 0],
-                current_step=self.shift * 2,
-                pos_scale_m=self.control_pos_scale_m,
-                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
-                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
-                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
-                use_holonomic_model_only=self.use_holonomic_model_only,
-                vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
-                cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
             )
+            if cached_transition is not None:
+                (
+                    target_pos,
+                    target_heading,
+                    transition_control_norm_by_step,
+                ) = cached_transition
+            else:
+                (
+                    target_pos,
+                    target_heading,
+                    transition_control_norm_by_step,
+                ) = build_transition_aligned_control_trajectory(
+                    pos=pos,
+                    heading=heading,
+                    agent_type=tokenized_agent["type"],
+                    agent_length=tokenized_agent["shape"][:, 0],
+                    current_step=self.shift * 2,
+                    pos_scale_m=self.control_pos_scale_m,
+                    vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+                    pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+                    cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+                    use_holonomic_model_only=self.use_holonomic_model_only,
+                    vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+                    cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
+                )
             tokenized_agent.update(
                 self._match_agent_token(
                     valid=valid,
@@ -315,6 +347,61 @@ class FlowTokenProcessor(TokenProcessor):
             }
         )
         return tokenized_agent
+
+    def _load_precomputed_transition_alignment(
+        self,
+        data: HeteroData,
+        pos: Tensor,
+        heading: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor] | None:
+        """Use cache-time transition-aligned state/control when it is config-safe.
+
+        The precomputed cache is only valid for unmodified raw ``valid_mask``.
+        ``WaymoTargetBuilderTrain`` mutates validity when
+        ``train_use_eval_agent_selection=false`` and adds ``train_mask``; in
+        that case we deliberately fall back to online construction.
+        """
+        config = getattr(self, "control_alignment_cache_config", None)
+        if config is None:
+            return None
+        if "train_mask" in data["agent"]:
+            return None
+        if int(config.current_step) != int(self.shift) * 2:
+            return None
+
+        agent_data = data["agent"]
+        if not validate_control_alignment_cache_fields(
+            agent_data,
+            expected_config=config,
+            expected_n_agent=int(pos.shape[0]),
+            expected_n_step=int(pos.shape[1]),
+            device=pos.device,
+        ):
+            return None
+
+        future_start = int(config.current_step) + 1
+        aligned_future_pos = agent_data[CONTROL_ALIGNED_FUTURE_POS_KEY].to(
+            device=pos.device,
+            dtype=pos.dtype,
+        )
+        aligned_future_heading = agent_data[CONTROL_ALIGNED_FUTURE_HEADING_KEY].to(
+            device=heading.device,
+            dtype=heading.dtype,
+        )
+        transition_control_future = agent_data[CONTROL_TRANSITION_NORM_FUTURE_KEY].to(
+            device=pos.device,
+            dtype=pos.dtype,
+        )
+
+        target_pos = pos.clone()
+        target_heading = heading.clone()
+        transition_control_norm_by_step = pos.new_zeros(
+            (pos.shape[0], pos.shape[1], CONTROL_FLOW_DIM)
+        )
+        target_pos[:, future_start:] = aligned_future_pos
+        target_heading[:, future_start:] = aligned_future_heading
+        transition_control_norm_by_step[:, future_start:] = transition_control_future
+        return target_pos, target_heading, transition_control_norm_by_step
 
     def _build_all_anchor_future_loss_mask(self, valid: Tensor, raw_steps: Tensor) -> Tensor:
         """모든 anchor의 future loss mask를 한 번에 만듭니다."""
