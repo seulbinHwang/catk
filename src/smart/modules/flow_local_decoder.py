@@ -6,8 +6,6 @@ from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from src.smart.tokens.agent_token_matching import (
     build_agent_type_masks,
@@ -70,15 +68,6 @@ class LQRCommitBridgeConfig:
     accel_tau_s: float = 0.2
     curvature_tau_s: float = 0.05
     min_speed_for_curvature_clip_mps: float = 0.5
-
-
-# On sm_80 (A100) the flash / memory-efficient SDPA kernels inside
-# `nn.MultiheadAttention` can exceed their grid-dim limit on large
-# batches with many agents, causing
-# `RuntimeError: CUDA error: invalid configuration argument` even when VRAM
-# is not close to full. `ChunkStepRefiner` only attends over seq_len=5, so
-# forcing the math SDPA kernel here is cheap and avoids that failure mode.
-_SDPA_SAFE_BACKENDS = [SDPBackend.MATH]
 
 
 @dataclass
@@ -500,19 +489,94 @@ class NormalizedNoisyFutureEncoder(nn.Module):
 
 
 class HalfSecondChunkMixerBlock(nn.Module):
-    def __init__(self, flow_dim: int, num_heads: int) -> None:
+    def __init__(self, flow_dim: int, num_chunks: int) -> None:
         super().__init__()
-        self.attn_norm = nn.LayerNorm(flow_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=flow_dim,
-            num_heads=num_heads,
-            batch_first=True,
+        self.num_chunks = int(num_chunks)
+        token_hidden_dim = max(self.num_chunks * 4, 8)
+
+        self.token_norm = nn.LayerNorm(flow_dim)
+        self.token_mixer = nn.Sequential(
+            nn.Linear(self.num_chunks, token_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(token_hidden_dim, self.num_chunks),
         )
 
         self.cond_mlp = nn.Sequential(
             nn.Linear(flow_dim * 2, flow_dim * 2),
             nn.SiLU(),
             nn.Linear(flow_dim * 2, flow_dim * 3),
+        )
+
+        self.mlp_norm = nn.LayerNorm(flow_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(flow_dim, flow_dim * 4),
+            nn.SiLU(),
+            nn.Linear(flow_dim * 4, flow_dim),
+        )
+
+    def _modulate(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        scale, bias, gate = cond.chunk(3, dim=-1)
+        return x + torch.sigmoid(gate).unsqueeze(1) * (
+            x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1)
+        )
+
+    def _apply_mask(
+        self,
+        chunk_tokens: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if chunk_valid_mask is None:
+            return chunk_tokens
+        if tuple(chunk_valid_mask.shape) != tuple(chunk_tokens.shape[:2]):
+            raise ValueError(
+                "chunk_valid_mask shape must match chunk_tokens first two dimensions: "
+                f"expected={tuple(chunk_tokens.shape[:2])}, actual={tuple(chunk_valid_mask.shape)}."
+            )
+        return chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
+
+    def forward(
+        self,
+        chunk_tokens: torch.Tensor,
+        context: torch.Tensor,
+        tau_emb: torch.Tensor,
+        chunk_valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if chunk_tokens.shape[1] != self.num_chunks:
+            raise ValueError(
+                f"HalfSecondChunkMixerBlock expected {self.num_chunks} chunks, "
+                f"got {chunk_tokens.shape[1]}."
+            )
+
+        chunk_tokens = self._apply_mask(chunk_tokens, chunk_valid_mask)
+        token_in = self.token_norm(chunk_tokens)
+        token_delta = self.token_mixer(token_in.transpose(1, 2)).transpose(1, 2)
+        chunk_tokens = self._apply_mask(chunk_tokens + token_delta, chunk_valid_mask)
+
+        cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
+        mlp_in = self._modulate(self.mlp_norm(chunk_tokens), cond)
+        return self._apply_mask(chunk_tokens + self.mlp(mlp_in), chunk_valid_mask)
+
+
+class ChunkStepRefiner(nn.Module):
+    def __init__(self, flow_dim: int, num_steps: int) -> None:
+        super().__init__()
+        self.num_steps = int(num_steps)
+        self.context_proj = nn.Linear(flow_dim, flow_dim)
+        self.pre_proj = nn.Linear(flow_dim, flow_dim)
+
+        token_hidden_dim = max(self.num_steps * 4, 32)
+        self.token_norm = nn.LayerNorm(flow_dim)
+        self.token_mixer = nn.Sequential(
+            nn.Linear(self.num_steps, token_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(token_hidden_dim, self.num_steps),
+        )
+
+        cond_hidden_dim = max((flow_dim * 3) // 4, 1)
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(flow_dim * 2, cond_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(cond_hidden_dim, flow_dim * 3),
         )
 
         self.mlp_norm = nn.LayerNorm(flow_dim)
@@ -528,125 +592,47 @@ class HalfSecondChunkMixerBlock(nn.Module):
             x * (1.0 + scale.unsqueeze(1)) + bias.unsqueeze(1)
         )
 
-    def _build_safe_key_padding_mask(self, chunk_valid_mask: torch.Tensor) -> torch.Tensor:
-        key_padding_mask = ~chunk_valid_mask.bool()
-        all_masked = key_padding_mask.all(dim=1)
-        key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
-        return key_padding_mask
-
-    def forward(
+    def _apply_mask(
         self,
-        chunk_tokens: torch.Tensor,
-        context: torch.Tensor,
-        tau_emb: torch.Tensor,
-        chunk_valid_mask: torch.Tensor | None = None,
+        step_tokens: torch.Tensor,
+        step_valid_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        attn_in = self.attn_norm(chunk_tokens)
-        # Force math SDPA kernel: H100's flash/mem-efficient kernels save
-        # uninitialized memory as placeholders, which backward later reads as
-        # NaN and propagates into encoder weight gradients (silently corrupting
-        # training). ChunkStepRefiner uses the same guard for the same reason.
-        with sdpa_kernel(_SDPA_SAFE_BACKENDS):
-            if chunk_valid_mask is None:
-                attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
-            else:
-                attn_out, _ = self.attn(
-                    attn_in,
-                    attn_in,
-                    attn_in,
-                    key_padding_mask=self._build_safe_key_padding_mask(chunk_valid_mask),
-                    need_weights=False,
-                )
-        chunk_tokens = chunk_tokens + attn_out
-        if chunk_valid_mask is not None:
-            chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
-
-        cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
-        mlp_in = self._modulate(self.mlp_norm(chunk_tokens), cond)
-        chunk_tokens = chunk_tokens + self.mlp(mlp_in)
-        if chunk_valid_mask is not None:
-            chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
-        return chunk_tokens
-
-
-class ChunkStepRefiner(nn.Module):
-    def __init__(self, flow_dim: int, num_heads: int) -> None:
-        super().__init__()
-        self.context_proj = nn.Linear(flow_dim, flow_dim)
-        self.pre_proj = nn.Linear(flow_dim, flow_dim)
-
-        self.attn_norm = nn.LayerNorm(flow_dim)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=flow_dim,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-
-        self.mlp_norm = nn.LayerNorm(flow_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(flow_dim, flow_dim * 2),
-            nn.SiLU(),
-            nn.Linear(flow_dim * 2, flow_dim),
-        )
-
-    def _build_safe_step_key_padding_mask(
-        self,
-        step_valid_mask: torch.Tensor,
-        batch_size: int,
-        num_chunks: int,
-        chunk_size: int,
-    ) -> torch.Tensor:
-        expected_shape = (batch_size, num_chunks * chunk_size)
-        if tuple(step_valid_mask.shape) != expected_shape:
+        if step_valid_mask is None:
+            return step_tokens
+        if tuple(step_valid_mask.shape) != tuple(step_tokens.shape[:2]):
             raise ValueError(
-                "step_valid_mask shape must match flattened future steps: "
-                f"expected={expected_shape}, actual={tuple(step_valid_mask.shape)}."
+                "step_valid_mask shape must match step_tokens first two dimensions: "
+                f"expected={tuple(step_tokens.shape[:2])}, actual={tuple(step_valid_mask.shape)}."
             )
-        key_padding_mask = ~step_valid_mask.view(batch_size, num_chunks, chunk_size).reshape(
-            batch_size * num_chunks,
-            chunk_size,
-        ).bool()
-        all_masked = key_padding_mask.all(dim=1)
-        key_padding_mask = key_padding_mask & ~all_masked.unsqueeze(1)
-        return key_padding_mask
+        return step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
 
     def forward(
         self,
         step_tokens: torch.Tensor,
         chunk_tokens: torch.Tensor,
         context: torch.Tensor,
+        tau_emb: torch.Tensor,
         step_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, num_chunks, chunk_size, dim = step_tokens.shape
+        if num_chunks * chunk_size != self.num_steps:
+            raise ValueError(
+                f"ChunkStepRefiner expected {self.num_steps} steps, got {num_chunks * chunk_size}."
+            )
 
         step_tokens = step_tokens + chunk_tokens.unsqueeze(2)
         step_tokens = step_tokens + self.context_proj(context).view(batch_size, 1, 1, dim)
         step_tokens = self.pre_proj(step_tokens)
 
-        step_tokens = step_tokens.view(batch_size * num_chunks, chunk_size, dim)
-        attn_in = self.attn_norm(step_tokens)
-        with sdpa_kernel(_SDPA_SAFE_BACKENDS):
-            if step_valid_mask is None:
-                attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
-            else:
-                attn_out, _ = self.attn(
-                    attn_in,
-                    attn_in,
-                    attn_in,
-                    key_padding_mask=self._build_safe_step_key_padding_mask(
-                        step_valid_mask=step_valid_mask,
-                        batch_size=batch_size,
-                        num_chunks=num_chunks,
-                        chunk_size=chunk_size,
-                    ),
-                    need_weights=False,
-                )
-        step_tokens = step_tokens + attn_out
-        step_tokens = step_tokens + self.mlp(self.mlp_norm(step_tokens))
-        step_tokens = step_tokens.view(batch_size, num_chunks * chunk_size, dim)
-        if step_valid_mask is not None:
-            step_tokens = step_tokens * step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
-        return step_tokens
+        step_tokens = step_tokens.view(batch_size, self.num_steps, dim)
+        step_tokens = self._apply_mask(step_tokens, step_valid_mask)
+        token_in = self.token_norm(step_tokens)
+        token_delta = self.token_mixer(token_in.transpose(1, 2)).transpose(1, 2)
+        step_tokens = self._apply_mask(step_tokens + token_delta, step_valid_mask)
+
+        cond = self.cond_mlp(torch.cat([context, tau_emb], dim=-1))
+        mlp_in = self._modulate(self.mlp_norm(step_tokens), cond)
+        return self._apply_mask(step_tokens + self.mlp(mlp_in), step_valid_mask)
 
 
 class FlowVelocityHead(nn.Module):
@@ -695,13 +681,13 @@ class HierarchicalFlowDecoder(nn.Module):
         )
         self.chunk_mixers = nn.ModuleList(
             [
-                HalfSecondChunkMixerBlock(flow_dim=flow_dim, num_heads=num_chunk_heads)
+                HalfSecondChunkMixerBlock(flow_dim=flow_dim, num_chunks=num_chunks)
                 for _ in range(num_chunk_layers)
             ]
         )
         self.step_refiner = ChunkStepRefiner(
             flow_dim=flow_dim,
-            num_heads=num_chunk_heads,
+            num_steps=int(num_future_steps),
         )
         self.velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
 
@@ -777,6 +763,7 @@ class HierarchicalFlowDecoder(nn.Module):
             step_tokens=step_tokens,
             chunk_tokens=chunk_tokens,
             context=context,
+            tau_emb=tau_emb,
             step_valid_mask=step_valid_mask,
         )
         """
