@@ -85,10 +85,7 @@ class AttentionLayer(MessagePassing):
                 self._compiled_relation_kv_project = torch.compile(
                     self._relation_kv_project_eager,
                     dynamic=True,
-                    # Edge counts change across SMART batches. Keep compilation
-                    # for the relation K/V projection, but avoid CUDA graph
-                    # replay state that can outlive dynamic backward tensors.
-                    options={"triton.cudagraphs": False},
+                    mode="reduce-overhead",
                 )
             return self._compiled_relation_kv_project(r)
         except Exception:
