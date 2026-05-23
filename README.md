@@ -871,6 +871,75 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_r
 python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py --stop
 ```
 
+#### testas A100x7 execution-context balanced pretrain
+
+`semi_control_rolling_fd` 브랜치에서 `testas` 단일 pod의 A100 80GB 7장을 모두 써서 위 H100x6 execution-context balanced pretrain과 같은 objective를 돌리려면 아래 launcher를 씁니다. 이 launcher는 기존 running pod 안에 tmux session만 만들며 pod를 새로 만들거나 재시작하지 않습니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x7_testas_execctx_balanced_oom_retry_static_pod.py \
+  --prebuild-metadata \
+  --replace
+```
+
+실행 전에는 dry-run으로 pod, branch, metadata prebuild 명령을 확인합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x7_testas_execctx_balanced_oom_retry_static_pod.py \
+  --prebuild-metadata \
+  --dry-run
+```
+
+이 구성은 단일 노드이므로 H100x6처럼 heterogeneous rank offset을 쓰지 않습니다. `torchrun --standalone --nproc_per_node=7` 로 7개 local rank를 띄우고, Lightning trainer는 `devices=7`, `num_nodes=1`로 override합니다. 실험 config는 H100x6와 같은 `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml`을 쓰되, hardware shape만 A100x7에 맞춥니다.
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling_fd` |
+| 대상 pod | `testas` |
+| GPU 구성 | A100 80GB 7장, 단일 노드 |
+| launcher | `scripts/launch_pre_bc_flow_control_a100x7_testas_execctx_balanced_oom_retry_static_pod.py` |
+| experiment config | `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml` |
+| task name | `flow_control_space_pretrain_a100x7_testas_execctx_prefix_balanced_lr6e-4_bs16_oomretry` |
+| tmux session | `catk-control-pretrain-a100x7-testas-execctx-balanced-bs16-retry` |
+| per-GPU batch | 첫 시도 `16`, OOM 시 `1`씩 감소 |
+| effective global batch | 첫 시도 `16 x 7 = 112` |
+| learning rate | `6e-4` |
+| precision | `bf16-mixed` |
+| flow horizon | `20` steps = 2초 |
+| 핵심 supervision | `use_kinematic_control_flow=true`, prefix-valid future loss, execution-context aligned trajectory |
+| outlier filter | vehicle `2.0m`, cyclist `2.0m` |
+| OOM 완화 | agent 수 기반 memory-balanced batch sampler + OOM 발생 시 batch-size 1씩 감소 후 checkpoint resume |
+| metadata 정책 | `--prebuild-metadata`로 sampler metadata를 먼저 만들고, 학습 중 missing build는 금지 |
+| validation 주기 | 기본 `check_val_every_n_epoch=32` |
+| fit-time closed-loop rollout 수 | 기본 `n_rollout_closed_val=32` |
+
+기본 batch를 `16`으로 둔 이유는 H100x6 기본 global batch `19 x 6 = 114`와 거의 같은 optimizer batch 규모를 유지하기 위해서입니다. A100x7에서는 `16 x 7 = 112`라서 같은 lr `6e-4`를 쓰면서 H100x6 recipe와 학습 동역학을 최대한 가깝게 맞춥니다. 더 큰 batch를 시험하려면 `--initial-bs 17`처럼 올릴 수 있지만, 채택 기준은 OOM 여부가 아니라 `it/s x global batch`와 loss 안정성입니다.
+
+`--prebuild-metadata`는 `testas`의 SMART cache training split을 읽어서 memory-balanced sampler용 metadata만 미리 만듭니다. SMART cache 파일 자체는 수정하지 않습니다. metadata 위치를 바꾸려면 `--metadata-cache-path /abs/path/to/cache.pt`를 쓰면 되고, launcher가 prebuild `--cache-path`와 training `data.train_memory_balance_metadata_cache` override를 같은 경로로 맞춥니다. 이전 metadata build가 비정상 종료되어 `.lock`만 남아 있으면 `--force-metadata`를 추가해 stale lock을 정리한 뒤 다시 생성합니다. 실제 build가 돌고 있는 중에는 `--force-metadata`를 쓰지 않습니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- tmux attach -t catk-control-pretrain-a100x7-testas-execctx-balanced-bs16-retry
+```
+
+짧은 smoke test만 돌려서 launcher/환경을 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x7_testas_execctx_balanced_oom_retry_static_pod.py \
+  --replace \
+  --limit-train-batches 1 \
+  --limit-val-batches 0 \
+  --max-epochs 1 \
+  --task-name smoke_a100x7_testas_fd \
+  --session catk-smoke-a100x7-fd
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x7_testas_execctx_balanced_oom_retry_static_pod.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
