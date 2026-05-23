@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -55,6 +56,11 @@ class AttentionLayer(MessagePassing):
         self.ff_postnorm = nn.LayerNorm(hidden_dim)
         self.apply(weight_init)
 
+    @staticmethod
+    def _graph_attention_fp32_enabled() -> bool:
+        value = os.environ.get("CATK_ATTENTION_GRAPH_FP32", "0")
+        return value.lower() in {"1", "true", "yes", "on"}
+
     def forward(
         self,
         x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -106,7 +112,23 @@ class AttentionLayer(MessagePassing):
         q = self.to_q(x_dst).view(-1, self.num_heads, self.head_dim)
         k = self.to_k(x_src).view(-1, self.num_heads, self.head_dim)
         v = self.to_v(x_src).view(-1, self.num_heads, self.head_dim)
-        agg = self.propagate(edge_index=edge_index, x_dst=x_dst, q=q, k=k, v=v, r=r)
+        if (
+            self._graph_attention_fp32_enabled()
+            and q.is_cuda
+            and torch.is_autocast_enabled("cuda")
+        ):
+            agg_dtype = q.dtype
+            with torch.autocast(device_type="cuda", enabled=False):
+                agg = self.propagate(
+                    edge_index=edge_index,
+                    x_dst=x_dst.float(),
+                    q=q.float(),
+                    k=k.float(),
+                    v=v.float(),
+                    r=r.float() if r is not None else None,
+                ).to(dtype=agg_dtype)
+        else:
+            agg = self.propagate(edge_index=edge_index, x_dst=x_dst, q=q, k=k, v=v, r=r)
         return self.to_out(agg)
 
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:

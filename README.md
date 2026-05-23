@@ -87,6 +87,19 @@ conda run -n catk python tools/compare_fast_wosac_metric.py \
 - 대신 a2a radius graph를 만들 때 유효하지 않은 agent state는 neighbor 후보에서 먼저 제외합니다. 따라서 missing motion 정보는 agent node feature에만 들어가고, 주변 agent의 missingness는 attention의 sender/receiver hidden state를 통해 전달됩니다.
 - 이 구조는 motion missingness 의미는 유지하면서 edge 수에 비례하던 relative-motion embedding 비용을 제거합니다. `x_a_emb` 입력 차원은 motion_valid 추가로 바뀌었고, 6D a2a relation을 사용한 중간 checkpoint도 현재 3D a2a relation 구조와 shape이 맞지 않으므로 새 pretrain을 기준으로 사용합니다.
 
+### Graph Attention FP32 Aggregation
+
+`bf16-mixed` 학습에서는 q/k/v projection, FFN 같은 dense 연산은 mixed precision 이득을
+유지하되, PyG `MessagePassing` 기반 graph attention aggregation만 fp32로 계산할 수
+있습니다. `CATK_ATTENTION_GRAPH_FP32=1`이면 `AttentionLayer`가 sparse softmax,
+message 생성, scatter aggregation 구간을 autocast 밖에서 fp32로 실행한 뒤 원래 dtype으로
+되돌립니다. 모델 구조, 파라미터 수, edge set, loss target은 바뀌지 않습니다.
+
+이 경로는 A100에서 bf16 sparse graph attention backward가 느려지는 현상을 완충하기 위한
+기본 실행 경로입니다. `scripts/h100x4_multinode_pretrain.sh`는 기본으로
+`CATK_ATTENTION_GRAPH_FP32=1`을 설정합니다. 필요하면 실행 전에
+`CATK_ATTENTION_GRAPH_FP32=0`을 명시해 기존 pure autocast 경로로 되돌릴 수 있습니다.
+
 ### Closed-loop Retokenize Rule
 
 - `retokenize` 자체는 **현재 실제 coarse 상태 + 이번 0.5초 raw FM commit 5점**을 합친 6개 점 경로를 기준으로
