@@ -122,6 +122,9 @@ trainer:
   precision: 32-true
   gradient_clip_val: 0
   sync_batchnorm: false
+  # resume 시 partial val (limit_val_batches × num_batches < 1 batch) 로 인한
+  # high-variance RMM artifact 방지 — Lightning sanity_val 자체 비활성.
+  num_sanity_val_steps: 0
 
 callbacks:
   model_checkpoint:

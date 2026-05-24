@@ -3597,6 +3597,19 @@ class SMARTFlow(LightningModule):
                                 self._cleanup_local_video(video_path)
 
     def on_validation_epoch_end(self):
+        # Sanity check (또는 trainer.fit ckpt_path resume 직후 Lightning 이 partial val 을
+        # trigger 하는 경로) 에서는 metric 누적이 1~2 batch 분량뿐이라 high-variance 한
+        # RMM/CPD/diversity 값이 [val_closed] 로깅에 노출되어 "RMM 이 갑자기 튐" 처럼
+        # 보이는 artifact 가 발생합니다.  결과 노출은 건너뛰고 metric state 만 reset 해
+        # 다음 정상 full val 에 partial 결과가 누적되지 않도록 합니다.
+        if bool(getattr(self.trainer, "sanity_checking", False)):
+            self.wosac_distribution_metrics.reset()
+            self.scenario_diversity_metrics.reset()
+            if self.val_closed_loop and not self.sim_agents_submission.is_active:
+                self.sim_agents_metrics.reset()
+                self.minADE.reset()
+            return
+
         log_and_reset_wosac_distribution_metric(
             model=self,
             metric=self.wosac_distribution_metrics,
