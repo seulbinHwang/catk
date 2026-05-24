@@ -33,7 +33,7 @@ TRAIN_RAW_DIR="${TRAIN_RAW_DIR:-${CACHE_ROOT}/train_with_tfrecords}"
 TRAIN_TFRECORDS_SPLITTED="${TRAIN_TFRECORDS_SPLITTED:-${CACHE_ROOT}/train_with_tfrecords_tfrecords_splitted}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-TRAIN_B="${TRAIN_B:-32}"          
+TRAIN_B="${TRAIN_B:-16}"
 VAL_B="${VAL_B:-16}"
 TRAIN_MAX_NUM="${TRAIN_MAX_NUM:-32}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
@@ -52,7 +52,7 @@ DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 TRAINER_DETERMINISTIC="${TRAINER_DETERMINISTIC:-true}"
 
 # Self-Forcing 정합 (paper default).  generator lr.
-LR="${LR:-2e-6}"
+LR="${LR:-1e-7}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-0.1}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
@@ -93,7 +93,7 @@ DMD_PRED_MAX_STEPS="${DMD_PRED_MAX_STEPS:-4}"
 # frozen ref_flow_decoder 를 real_score teacher 로 사용 (true 권장).
 DMD_USE_REAL_SCORE="${DMD_USE_REAL_SCORE:-true}"
 # fake_score lr scale.  Self-Forcing: lr_critic = lr_gen / 5 = 2e-6 × 0.2 = 4e-7.
-DMD_FAKE_LR_SCALE="${DMD_FAKE_LR_SCALE:-0.2}"
+DMD_FAKE_LR_SCALE="${DMD_FAKE_LR_SCALE:-1.0}"
 # Self-Forcing abs-mean normalizer (synthetic grad scale 안정화).
 DMD_NORMALIZE="${DMD_NORMALIZE:-true}"
 # anchor stride.  stride=4 → anchor 4개/scenario (GPU util ↑).
@@ -101,17 +101,17 @@ DMD_ANCHOR_STRIDE="${DMD_ANCHOR_STRIDE:-4}"
 # future fine step valid 한 agent 만 anchor 로.
 DMD_STRICT_ACTIVE_MASK="${DMD_STRICT_ACTIVE_MASK:-true}"
 # 초기 N step fake_score-only warmup.
-DMD_WARMUP_FAKE_ONLY_STEPS="${DMD_WARMUP_FAKE_ONLY_STEPS:-200}"
+DMD_WARMUP_FAKE_ONLY_STEPS="${DMD_WARMUP_FAKE_ONLY_STEPS:-0}"
 # generator 별도 grad clip — Self-Forcing max_grad_norm_generator default 10.0.
 DMD_GEN_GRAD_CLIP="${DMD_GEN_GRAD_CLIP:-10.0}"
 # ── Self-Forcing align (critic update cadence, AdamW betas, EMA) ─────────
 # critic 매 step, generator 매 N step.  Self-Forcing default 5.
-DMD_GEN_UPDATE_RATIO="${DMD_GEN_UPDATE_RATIO:-5}"
+DMD_GEN_UPDATE_RATIO="${DMD_GEN_UPDATE_RATIO:-3}"
 # AdamW betas — Self-Forcing (0.0, 0.999) for GAN-style stability (no momentum).
 DMD_ADAM_BETA1="${DMD_ADAM_BETA1:-0.0}"
 DMD_ADAM_BETA2="${DMD_ADAM_BETA2:-0.999}"
 # Generator EMA decay.  Self-Forcing default 0.99.
-DMD_EMA_WEIGHT="${DMD_EMA_WEIGHT:-0.99}"
+DMD_EMA_WEIGHT="${DMD_EMA_WEIGHT:-0.0}"
 # EMA 시작 step.  Self-Forcing default 200 (paper); 우리는 0 (즉시 적용 — warmup 없음).
 DMD_EMA_START_STEP="${DMD_EMA_START_STEP:-0}"
 # fake_score 학습 scope:
