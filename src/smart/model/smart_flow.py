@@ -127,6 +127,14 @@ class SMARTFlow(LightningModule):
         # 학습은 instantaneous weights 로, validation 은 EMA weights 로 (on_validation_start/end swap).
         self.gen_ema: nn.Module | None = None
         self._gen_ema_swap_backup: Dict[str, Tensor] | None = None
+        # Resume 안전 플래그: ckpt 에서 ref_flow_decoder / fake_score_decoder / gen_ema
+        # 키가 복원됐는지 ``load_state_dict`` 가 갱신합니다.  on_train_start 는 이 플래그를
+        # 보고 "첫 학습일 때만" main 으로 in-place sync 하도록 분기합니다.  무조건 sync 하면
+        # resume 시 학습된 critic / EMA / pretrained ref 가 모두 fine-tuned main 으로
+        # 덮어써져 RMM 이 튐 — 그 회귀 방지용입니다.
+        self._ref_synced_from_ckpt: bool = False
+        self._fake_score_synced_from_ckpt: bool = False
+        self._gen_ema_synced_from_ckpt: bool = False
         if self.finetune_config.enabled and self.finetune_config.mode not in (
             "ocsc_ft", "road_ft", "self_forcing_dmd"
         ):
@@ -172,6 +180,28 @@ class SMARTFlow(LightningModule):
                     f"(decay={_ema_w}, start_step={getattr(self.finetune_config, 'dmd_ema_start_step', 0)}). "
                     "Weights will be synced from main flow_decoder in on_train_start."
                 )
+
+        # OCSC / DMD ref_flow_decoder placeholder.  __init__ 에서 미리 만들어두면 ckpt 의
+        # ``ref_flow_decoder.*`` 키가 load_state_dict 단계에서 그대로 복원됩니다 (resume 시
+        # frozen pretrained ref 보존).  pretrained baseline ckpt 에는 ref 키가 없으므로
+        # on_train_start 가 main 으로 in-place sync 합니다.
+        _ocsc_needs_ref = (
+            self.finetune_config.enabled
+            and self.finetune_config.mode == "ocsc_ft"
+        )
+        _dmd_needs_ref = (
+            self._is_dmd_ft_enabled()
+            and bool(getattr(self.finetune_config, "dmd_use_real_score", True))
+        )
+        if _ocsc_needs_ref or _dmd_needs_ref:
+            from copy import deepcopy
+            self.ref_flow_decoder = deepcopy(self.encoder.agent_encoder.flow_decoder)
+            for p in self.ref_flow_decoder.parameters():
+                p.requires_grad_(False)
+            log.info(
+                f"[{self.finetune_config.mode}] ref_flow_decoder placeholder created in __init__ "
+                "(will be restored from ckpt at load_state_dict, or synced from main in on_train_start)."
+            )
 
         self.minADE = minADE()
         if bool(getattr(model_config, "wosac_torch_compile", False)):
@@ -1203,46 +1233,54 @@ class SMARTFlow(LightningModule):
         )
 
     def on_train_start(self) -> None:
-        # OCSC / DMD: ref_flow_decoder 를 항상 생성 (open-loop target / real_score teacher / delta HardRMM 모니터링 공용)
-        # OCSC: ocsc_use_pretrained_ref=False 여도 delta 계산을 위해 frozen ref 가 필요.
-        # DMD: dmd_use_real_score=True (기본) 일 때 real_score teacher 로 사용.
-        _needs_ref_ocsc = (
-            self.finetune_config.enabled
-            and self.ref_flow_decoder is None
-            and self.finetune_config.mode == "ocsc_ft"
-        )
-        _needs_ref_dmd = (
-            self._is_dmd_ft_enabled()
-            and self.ref_flow_decoder is None
-            and bool(getattr(self.finetune_config, "dmd_use_real_score", True))
-        )
-        if _needs_ref_ocsc or _needs_ref_dmd:
-            from copy import deepcopy
-            flow_decoder = self.encoder.agent_encoder.flow_decoder
-            self.ref_flow_decoder = deepcopy(flow_decoder)
-            for p in self.ref_flow_decoder.parameters():
-                p.requires_grad_(False)
-            print(f"[{self.finetune_config.mode}] frozen reference model created from pretrained checkpoint.")
+        # ref_flow_decoder / fake_score_decoder / gen_ema 는 __init__ 에서 미리 생성됩니다.
+        # ckpt 에 동명 키가 있으면 load_state_dict 단계에서 이미 복원되어 있으므로
+        # (= resume 경로), 첫 학습 (pretrained baseline ckpt 에 동명 키 없음) 에 한해
+        # 현재 main flow_decoder (= 방금 적용된 ckpt weight) 로 in-place sync 합니다.
+        # 여기서 무조건 sync 하면 resume 시 학습된 critic / EMA / pretrained ref 가 모두
+        # fine-tuned main 으로 덮어써져 RMM 이 튀므로 (구 동작) 플래그 분기를 둡니다.
+        flow_decoder = self.encoder.agent_encoder.flow_decoder
+        cur_state = flow_decoder.state_dict()
 
-        # DMD: fake_score_decoder 는 __init__ 에서 이미 생성됨 (configure_optimizers 가 참조해야 하므로).
-        # 여기서는 pretrained ckpt 적용 후의 main flow_decoder 가중치로 in-place sync.
-        # (deepcopy 가 아니라 load_state_dict 를 써서 optimizer 의 param 참조를 유지.)
-        if self._is_dmd_ft_enabled() and self.fake_score_decoder is not None:
-            cur_state = self.encoder.agent_encoder.flow_decoder.state_dict()
-            self.fake_score_decoder.load_state_dict(cur_state, strict=True)
-            print(
-                f"[{self.finetune_config.mode}] fake_score_decoder synced from main "
-                "flow_decoder (post-ckpt-load init)."
-            )
+        if self.ref_flow_decoder is not None:
+            if not self._ref_synced_from_ckpt:
+                self.ref_flow_decoder.load_state_dict(cur_state, strict=True)
+                for p in self.ref_flow_decoder.parameters():
+                    p.requires_grad_(False)
+                log.info(
+                    f"[{self.finetune_config.mode}] ref_flow_decoder synced from main "
+                    "flow_decoder (first run; not restored from ckpt)."
+                )
+            else:
+                log.info(
+                    f"[{self.finetune_config.mode}] ref_flow_decoder restored from ckpt "
+                    "— preserved (resume)."
+                )
 
-        # DMD: gen_ema 도 동일 (post-ckpt) main flow_decoder 로 sync.
-        if self._is_dmd_ft_enabled() and self.gen_ema is not None:
-            cur_state = self.encoder.agent_encoder.flow_decoder.state_dict()
-            self.gen_ema.load_state_dict(cur_state, strict=True)
-            print(
-                f"[{self.finetune_config.mode}] gen_ema synced from main flow_decoder "
-                "(post-ckpt-load init)."
-            )
+        if self.fake_score_decoder is not None:
+            if not self._fake_score_synced_from_ckpt:
+                self.fake_score_decoder.load_state_dict(cur_state, strict=True)
+                log.info(
+                    f"[{self.finetune_config.mode}] fake_score_decoder synced from main "
+                    "flow_decoder (first run; not restored from ckpt)."
+                )
+            else:
+                log.info(
+                    f"[{self.finetune_config.mode}] fake_score_decoder restored from ckpt "
+                    "— preserved (resume)."
+                )
+
+        if self.gen_ema is not None:
+            if not self._gen_ema_synced_from_ckpt:
+                self.gen_ema.load_state_dict(cur_state, strict=True)
+                log.info(
+                    f"[{self.finetune_config.mode}] gen_ema synced from main flow_decoder "
+                    "(first run; not restored from ckpt)."
+                )
+            else:
+                log.info(
+                    f"[{self.finetune_config.mode}] gen_ema restored from ckpt — preserved (resume)."
+                )
 
         # ocsc_ft: BPTT backward through ODE steps can produce NaN/Inf
         # gradients (exploding Jacobian, numerical instability). Register nan_to_num
@@ -3749,14 +3787,24 @@ class SMARTFlow(LightningModule):
         Returns:
             _IncompatibleKeys: PyTorch가 돌려주는 키 검사 결과입니다.
         """
+        # Resume 안전: ckpt 에 ref_flow_decoder / fake_score_decoder / gen_ema 키가
+        # 들어 있는지 추적해 on_train_start 가 main sync 를 건너뛸지 (resume 보존)
+        # 또는 main 으로 sync 할지 (첫 학습) 분기합니다.
+        self._ref_synced_from_ckpt = any(k.startswith("ref_flow_decoder.") for k in state_dict)
+        self._fake_score_synced_from_ckpt = any(k.startswith("fake_score_decoder.") for k in state_dict)
+        self._gen_ema_synced_from_ckpt = any(k.startswith("gen_ema.") for k in state_dict)
+
         incompatible_keys = super().load_state_dict(state_dict, strict=False, assign=assign)
         if not strict:
             return incompatible_keys
 
-        # fake_score_decoder / gen_ema: DMD mode 에서만 __init__ 또는 on_train_start 가
-        # deepcopy 로 생성하므로 (a) DMD-saved ckpt 를 non-DMD 모드에서 load 시 unexpected 로
-        # 허용, (b) non-DMD ckpt 를 DMD 모드에서 load 시 missing 으로 허용.
-        _allowed_missing = ("residual_velocity_head", "fake_score_decoder", "gen_ema")
+        # ref_flow_decoder / fake_score_decoder / gen_ema 는 mode/EMA 설정에 따라 model 에
+        # 있을 수도 없을 수도 있어 양방향 (missing / unexpected) 으로 모두 허용합니다.
+        # (예: pretrained baseline ckpt 에는 ref / fake_score 가 없음 → missing 허용;
+        # OCSC ckpt 에는 ref 만 있음; DMD ckpt 에는 ref + fake_score (+ gen_ema) 있음.)
+        _allowed_missing = (
+            "residual_velocity_head", "ref_flow_decoder", "fake_score_decoder", "gen_ema",
+        )
         _allowed_unexpected = ("ref_flow_decoder", "fake_score_decoder", "gen_ema")
         missing_keys = [
             key
