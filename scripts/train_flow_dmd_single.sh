@@ -86,6 +86,11 @@ WOSAC_TORCH_COMPILE="${WOSAC_TORCH_COMPILE:-0}"
 # ── DMD 핵심 파라미터 ───────────────────────────────────────────────────────
 # entropy knob (spec β).  1.0 = vanilla DMD, <1 = diversity↑, >1 = sharpening.
 DMD_BETA="${DMD_BETA:-1.0}"
+# β annealing schedule — cold-start bias (β<1 시 fake≈real 시기의 (1/β-1)·v_real 인위적
+# 밀어내기) 회피용.  warmup 동안 β=1.0 유지 → anneal 동안 1.0 → DMD_BETA linear ramp →
+# 이후 DMD_BETA 고정.  0/0 이면 annealing 비활성 (β 고정).
+DMD_BETA_WARMUP_STEPS="${DMD_BETA_WARMUP_STEPS:-0}"
+DMD_BETA_ANNEAL_STEPS="${DMD_BETA_ANNEAL_STEPS:-0}"
 # 시나리오당 closed-loop rollout 수 (G).  보통 1 충분.
 DMD_N_ROLLOUTS="${DMD_N_ROLLOUTS:-4}"
 # closed-loop rollout coarse(2Hz) step 수.  T_10hz=N×shift; flow_decoder T=20 hardcode → N=4 필수.
@@ -215,6 +220,8 @@ torchrun --nproc_per_node="${NPROC_PER_NODE}" --master_port="${PORT}" --rdzv_end
   model.model_config.finetune.flow_velocity_head_only="${FLOW_VELOCITY_HEAD_ONLY}" \
   model.model_config.finetune.flow_ft_target="${FLOW_FT_TARGET}" \
   model.model_config.finetune.dmd_beta="${DMD_BETA}" \
+  model.model_config.finetune.dmd_beta_warmup_steps="${DMD_BETA_WARMUP_STEPS}" \
+  model.model_config.finetune.dmd_beta_anneal_steps="${DMD_BETA_ANNEAL_STEPS}" \
   model.model_config.finetune.dmd_n_rollouts="${DMD_N_ROLLOUTS}" \
   model.model_config.finetune.dmd_pred_max_steps="${DMD_PRED_MAX_STEPS}" \
   model.model_config.finetune.dmd_use_real_score="${DMD_USE_REAL_SCORE}" \

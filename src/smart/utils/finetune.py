@@ -166,6 +166,12 @@ class FinetuneConfig:
     # β=1 vanilla / β<1 diversity↑ / β>1 sharpening↑.
     #: entropy knob.  1.0 = vanilla DMD, <1 = diversity 강조, >1 = realism 강조.
     dmd_beta: float = 1.0
+    #: β annealing — 첫 N step β=1.0 유지 (warmup), 이후 M step 동안 linear ramp
+    #: 1.0 → dmd_beta, 그 후 dmd_beta 고정.  0/0 이면 annealing 비활성 (β 고정).
+    #: cold-start (fake≈real) 에서 β<1 이 (1/β-1)·v_real 만큼 systematic bias 를
+    #: 주어 generator 가 잘못된 방향으로 밀려나는 회귀를 막기 위한 schedule.
+    dmd_beta_warmup_steps: int = 0
+    dmd_beta_anneal_steps: int = 0
     #: 시나리오당 closed-loop rollout 수 (G).  Generator sample 다양화 용도.
     dmd_n_rollouts: int = 1
     #: closed-loop rollout 의 coarse(2Hz) step 수.  T_10hz = N × shift.
@@ -294,6 +300,8 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         road_eval_hard_rmm=bool(_read_config_value(finetune, "road_eval_hard_rmm", False)),
         road_eval_hard_rmm_interval=int(_read_config_value(finetune, "road_eval_hard_rmm_interval", 10)),
         dmd_beta=float(_read_config_value(finetune, "dmd_beta", 1.0)),
+        dmd_beta_warmup_steps=int(_read_config_value(finetune, "dmd_beta_warmup_steps", 0)),
+        dmd_beta_anneal_steps=int(_read_config_value(finetune, "dmd_beta_anneal_steps", 0)),
         dmd_n_rollouts=int(_read_config_value(finetune, "dmd_n_rollouts", 1)),
         dmd_pred_max_steps=int(_read_config_value(finetune, "dmd_pred_max_steps", 2)),
         dmd_use_real_score=bool(_read_config_value(finetune, "dmd_use_real_score", True)),

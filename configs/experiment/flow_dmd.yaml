@@ -46,6 +46,12 @@ model:
       # ── DMD 핵심 파라미터 ────────────────────────────────────────────
       # entropy knob (spec 의 β).  1.0 = vanilla DMD, <1 = diversity 강조, >1 = sharpening.
       dmd_beta: 1.0
+      # β annealing schedule — cold-start (fake≈real) 에서 β<1 이 (1/β-1)·v_real 만큼
+      # systematic bias 를 주어 generator 가 잘못된 방향으로 밀려나는 회귀 방지용.
+      # warmup 동안 β=1.0 유지 → anneal 동안 1.0 → dmd_beta linear ramp → 이후 dmd_beta 고정.
+      # 0/0 이면 annealing 비활성 (β 고정).
+      dmd_beta_warmup_steps: 0
+      dmd_beta_anneal_steps: 0
       # G — 시나리오당 closed-loop rollout 수 (variance reduction).
       # 운영 default 4 (v22).  Self-Forcing paper 는 1 충분이라 함.
       dmd_n_rollouts: 4

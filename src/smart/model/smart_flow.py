@@ -2798,9 +2798,27 @@ class SMARTFlow(LightningModule):
         G = max(1, int(getattr(self.finetune_config, "dmd_n_rollouts", 1)))
         pred_max_steps_raw = int(getattr(self.finetune_config, "dmd_pred_max_steps", 2))
         pred_max_steps: int | None = pred_max_steps_raw if pred_max_steps_raw > 0 else None
-        beta = float(getattr(self.finetune_config, "dmd_beta", 1.0))
+        # β annealing — cold-start (fake≈real) 에서 β<1 이 (1/β-1)·v_real 만큼 systematic
+        # bias 를 주어 generator 가 잘못된 방향으로 밀려나는 회귀를 막기 위해 학습 초반에
+        # β 를 1.0 에서 target 으로 점진적으로 낮춥니다.  warmup 동안 β=1.0 유지 → anneal
+        # 동안 linear ramp 1.0 → dmd_beta → 이후 dmd_beta 고정.
+        beta_final = float(getattr(self.finetune_config, "dmd_beta", 1.0))
+        beta_warmup = int(getattr(self.finetune_config, "dmd_beta_warmup_steps", 0))
+        beta_anneal = int(getattr(self.finetune_config, "dmd_beta_anneal_steps", 0))
+        _batches_stepped = int(
+            getattr(self.trainer.fit_loop.epoch_loop, "_batches_that_stepped", 0)
+        )
+        if beta_final == 1.0 or beta_anneal <= 0:
+            beta = beta_final
+        elif _batches_stepped < beta_warmup:
+            beta = 1.0
+        elif _batches_stepped < beta_warmup + beta_anneal:
+            _progress = (_batches_stepped - beta_warmup) / float(beta_anneal)
+            beta = 1.0 + (beta_final - 1.0) * _progress
+        else:
+            beta = beta_final
         if beta <= 0.0:
-            raise ValueError(f"dmd_beta must be > 0, got {beta}")
+            raise ValueError(f"dmd_beta_effective must be > 0, got {beta} (target={beta_final}).")
         inv_beta = 1.0 / beta
         use_real = bool(getattr(self.finetune_config, "dmd_use_real_score", True))
         use_normalize = bool(getattr(self.finetune_config, "dmd_normalize", True))
