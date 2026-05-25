@@ -33,6 +33,7 @@ DEFAULT_TASK_NAME = (
     "execctx_prefix_balanced_lr2e-4_bs4_oomretry"
 )
 DEFAULT_SESSION = "catk-control-pretrain-v100x4x2-sv-svv-execctx-balanced"
+DEFAULT_INITIAL_BS = 4
 
 
 def shq(value: object) -> str:
@@ -78,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--initial-bs", type=int, default=4)
+    parser.add_argument("--initial-bs", type=int, default=DEFAULT_INITIAL_BS)
     parser.add_argument("--oom-step", type=int, default=1)
     parser.add_argument("--min-bs", type=int, default=1)
     parser.add_argument(

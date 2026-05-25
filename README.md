@@ -893,8 +893,8 @@ scripts/launch_pre_bc_flow_control_v100x4x2_svv_svvv_execctx_balanced_oom_retry_
 - 대상 pod: `svv`, `svvv`
 - GPU 구성: V100 4장 x 2 pod = 8 GPU
 - precision: `16-mixed` (`bf16-mixed`는 H100/A100 전용 경로로 보고 V100 기본값에서 제외)
-- 시작 per-GPU batch: `4`, OOM fallback `4 -> 3 -> 2 -> 1`
-- 시작 effective global batch: `4 x 8 = 32`
+- 시작 per-GPU train batch: `3`, OOM fallback `3 -> 2 -> 1`
+- 시작 effective global train batch: `3 x 8 = 24`
 - learning rate: `2e-4`
 - fit-time closed-loop rollout 수: `n_rollout_closed_val=16`
 - metadata 정책: H100x6 launcher와 같이 memory-balanced sampler metadata를 먼저 만들고, 학습 중 missing build는 금지
