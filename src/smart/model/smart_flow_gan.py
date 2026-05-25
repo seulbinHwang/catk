@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 import torch
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from src.smart.model.smart_flow import SMARTFlow
 from src.smart.modules.self_forced_gan_cache import (
@@ -108,6 +109,9 @@ class SMARTFlowGAN(SMARTFlow):
             _cfg(self.self_forced_gan_config, "interaction_sender_chunk_size", 0)
         )
         self.gan_map_rollout_chunk_size = int(_cfg(self.self_forced_gan_config, "map_rollout_chunk_size", 0))
+        self.gan_checkpoint_discriminator = bool(
+            _cfg(self.self_forced_gan_config, "checkpoint_discriminator", False)
+        )
         self.gan_ema_weight = float(_cfg(self.self_forced_gan_config, "ema_weight", 0.99))
         self.gan_ema_start_step = int(_cfg(self.self_forced_gan_config, "ema_start_step", 50))
         self.gan_student_unfrozen_range = str(
@@ -409,6 +413,20 @@ class SMARTFlowGAN(SMARTFlow):
             map_valid_mask=context["map_valid_mask"],
         )
 
+    def _gan_forward_discriminator_for_backward(
+        self,
+        rollout_pose: Tensor,
+        context: Dict[str, Tensor | int],
+    ) -> Tensor:
+        """Run discriminator forward with optional activation checkpointing."""
+        if not self.gan_checkpoint_discriminator or not torch.is_grad_enabled():
+            return self._gan_forward_discriminator(rollout_pose, context)
+
+        def forward_fn(pose: Tensor) -> Tensor:
+            return self._gan_forward_discriminator(pose, context)
+
+        return checkpoint(forward_fn, rollout_pose, use_reentrant=False)
+
     def _compute_gan_finite_difference_regularizer(
         self,
         rollout_pose: Tensor,
@@ -428,7 +446,7 @@ class SMARTFlowGAN(SMARTFlow):
         current_pose = context["current_pose"]
         agent_type = context["agent_type"]
         rollout_pose = rollout_pose.detach()
-        base = self._gan_forward_discriminator(rollout_pose, context)
+        base = self._gan_forward_discriminator_for_backward(rollout_pose, context)
         perturbed = add_rollout_pose_perturbation(
             rollout_pose,
             current_pose=current_pose,
@@ -437,7 +455,7 @@ class SMARTFlowGAN(SMARTFlow):
             position_sigma=self.gan_position_sigma,
             yaw_sigma=self.gan_yaw_sigma,
         )
-        perturbed_logit = self._gan_forward_discriminator(perturbed, context)
+        perturbed_logit = self._gan_forward_discriminator_for_backward(perturbed, context)
         return ((perturbed_logit - base) / max(self.gan_position_sigma, 1.0e-6)).square().mean()
 
     def _gan_should_step_accumulated_optimizer(self, batch_idx: int) -> bool:
@@ -499,14 +517,14 @@ class SMARTFlowGAN(SMARTFlow):
                 real_logit_value = self._gan_forward_discriminator(real_pose.detach(), context).detach()
                 fake_logit_value = self._gan_forward_discriminator(fake_pose.detach(), context).detach()
 
-            fake_logit = self._gan_forward_discriminator(fake_pose.detach(), context)
+            fake_logit = self._gan_forward_discriminator_for_backward(fake_pose.detach(), context)
             d_fake = relativistic_discriminator_loss(real_logit_value, fake_logit)
             fake_logit_for_margin = fake_logit.detach()
             with self._gan_backward_sync_context(step_accumulated):
                 self._manual_backward_without_autocast(d_fake / accumulate)
             del fake_logit, d_fake
 
-            real_logit = self._gan_forward_discriminator(real_pose.detach(), context)
+            real_logit = self._gan_forward_discriminator_for_backward(real_pose.detach(), context)
             d_real = relativistic_discriminator_loss(real_logit, fake_logit_value)
             real_logit_for_margin = real_logit.detach()
             with self._gan_backward_sync_context(step_accumulated):
@@ -552,7 +570,7 @@ class SMARTFlowGAN(SMARTFlow):
                     generator_optimizer.zero_grad(set_to_none=True)
                 with frozen_parameters(self.gan_discriminator):
                     real_logit_for_g = self._gan_forward_discriminator(real_pose.detach(), context).detach()
-                    fake_logit_for_g = self._gan_forward_discriminator(fake_pose, context)
+                    fake_logit_for_g = self._gan_forward_discriminator_for_backward(fake_pose, context)
                     g_loss = relativistic_generator_loss(real_logit_for_g, fake_logit_for_g)
                 with self._gan_backward_sync_context(step_accumulated):
                     self._manual_backward_without_autocast(g_loss / accumulate)
@@ -632,6 +650,7 @@ class SMARTFlowGAN(SMARTFlow):
                 f"map_sender_chunk_size={self.gan_map_sender_chunk_size}, "
                 f"interaction_sender_chunk_size={self.gan_interaction_sender_chunk_size}, "
                 f"map_rollout_chunk_size={self.gan_map_rollout_chunk_size}, "
+                f"checkpoint_discriminator={self.gan_checkpoint_discriminator}, "
                 f"critic_trainable_params={self.gan_discriminator.count_trainable_parameters()}",
                 flush=True,
             )

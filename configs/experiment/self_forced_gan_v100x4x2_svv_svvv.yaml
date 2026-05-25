@@ -25,6 +25,7 @@ model:
       map_sender_chunk_size: 4096
       interaction_sender_chunk_size: 0
       map_rollout_chunk_size: 1
+      checkpoint_discriminator: true
       sampling:
         backprop_last_k: 8
 

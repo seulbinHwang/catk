@@ -207,6 +207,7 @@ python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py --
 | teacher/student set | K=16 유지 |
 | teacher cache | scene당 32 rollout 유지 |
 | fake rollout backprop | 마지막 8 step |
+| discriminator checkpointing | backward 때 discriminator activation 재계산 |
 | validation rollout | 8 |
 
 아래 두 메모리 안정화는 `svv + svvv` V100 멀티노드 환경에서도
@@ -223,6 +224,9 @@ discriminator map query chunk를 `16 -> 1`로 낮춰 계산합니다.
 map sender token도 한 번에 전부 보지 않고 `4096`개 단위 streaming softmax로 처리합니다.
 K=16 rollout set도 map attention에서는 rollout 1개 단위로 나눠 같은 score를 계산합니다.
 agent-agent interaction query chunk는 상대적으로 작아서 `4`를 유지합니다.
+GAN-active 구간에서는 discriminator forward activation을 backward 때 재계산해서,
+K=16 student adversarial path와 R1/R2 finite-difference regularization의 peak memory를
+V100 32GB 안으로 낮춥니다.
 
 | 항목 | svv + svvv 특화 대응 |
 |---|---|
