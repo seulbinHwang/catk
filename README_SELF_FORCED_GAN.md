@@ -202,6 +202,8 @@ python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py --
 | node/GPU | 2 nodes x 4 V100 = 8 ranks |
 | precision | `16-mixed` |
 | train microbatch | rank당 1 scene |
+| gradient accumulation | manual optimization 기준 12 microbatch |
+| effective train scene batch | 96 scene / optimizer step |
 | teacher/student set | K=16 유지 |
 | teacher cache | scene당 32 rollout 유지 |
 | fake rollout backprop | 마지막 8 step |
@@ -211,6 +213,9 @@ python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py --
 Set-level Self-Forced GAN Fine-tuning을 돌리기 위해 적용한 특화 대응입니다.
 먼저 rank당 train microbatch를 1까지 줄였고, 그 상태에서도 V100 OOM이 발생해서
 학습 의미를 바꾸지 않는 범위에서 순간 CUDA memory peak만 낮췄습니다.
+`SMARTFlowGAN`은 Lightning manual optimization을 쓰므로, V100 launcher의 기본
+gradient accumulation 12는 `trainer.accumulate_grad_batches`가 아니라
+`self_forced_gan.manual_accumulate_grad_batches`로 적용합니다.
 
 | 항목 | svv + svvv 특화 대응 |
 |---|---|

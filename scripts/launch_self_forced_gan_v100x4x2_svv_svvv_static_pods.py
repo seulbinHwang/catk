@@ -835,9 +835,18 @@ def matching_teacher_cache_available(args: argparse.Namespace) -> bool:
 
 
 def base_launcher_command(args: argparse.Namespace) -> list[str]:
+    effective_scene_batch = (
+        int(args.train_batch_size)
+        * int(args.nproc_per_node)
+        * len(args.pods)
+        * int(args.accumulate_grad_batches)
+    )
     extra_overrides = [
         f"paths.teacher_gan_cache_root={args.teacher_cache_root}",
         f"trainer.precision={args.precision}",
+        "trainer.accumulate_grad_batches=1",
+        f"model.model_config.self_forced_gan.manual_accumulate_grad_batches={int(args.accumulate_grad_batches)}",
+        f"model.model_config.self_forced_gan.effective_scene_batch={effective_scene_batch}",
     ]
     if args.disable_validation:
         extra_overrides.extend(
@@ -886,8 +895,6 @@ def base_launcher_command(args: argparse.Namespace) -> list[str]:
         args.log_dir,
         "--train-batch-size",
         str(args.train_batch_size),
-        "--accumulate-grad-batches",
-        str(args.accumulate_grad_batches),
         "--val-batch-size",
         str(args.val_batch_size),
         "--max-epochs",

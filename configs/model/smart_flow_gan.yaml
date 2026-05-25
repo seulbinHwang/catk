@@ -62,6 +62,7 @@ model_config:
     r1_weight: 0.1
     r2_weight: 0.1
     gradient_clip_val: 1.0
+    manual_accumulate_grad_batches: 1
     ema_weight: 0.99
     ema_start_step: 50
     detach_block_transition: false

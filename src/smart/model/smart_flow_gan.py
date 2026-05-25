@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+from contextlib import nullcontext
 from typing import Any, Dict
 
 import torch
@@ -93,6 +94,11 @@ class SMARTFlowGAN(SMARTFlow):
         self.gan_position_sigma = float(_cfg(self.self_forced_gan_config, "position_sigma", 0.01))
         self.gan_yaw_sigma = float(_cfg(self.self_forced_gan_config, "yaw_sigma", 0.01))
         self.gan_gradient_clip_val = float(_cfg(self.self_forced_gan_config, "gradient_clip_val", 1.0))
+        self.gan_manual_accumulate_grad_batches = int(
+            _cfg(self.self_forced_gan_config, "manual_accumulate_grad_batches", 1)
+        )
+        if self.gan_manual_accumulate_grad_batches < 1:
+            raise ValueError("self_forced_gan.manual_accumulate_grad_batches must be >= 1.")
         self.gan_ema_weight = float(_cfg(self.self_forced_gan_config, "ema_weight", 0.99))
         self.gan_ema_start_step = int(_cfg(self.self_forced_gan_config, "ema_start_step", 50))
         self.gan_student_unfrozen_range = str(
@@ -420,6 +426,26 @@ class SMARTFlowGAN(SMARTFlow):
         perturbed_logit = self._gan_forward_discriminator(perturbed, context)
         return ((perturbed_logit - base) / max(self.gan_position_sigma, 1.0e-6)).square().mean()
 
+    def _gan_should_step_accumulated_optimizer(self, batch_idx: int) -> bool:
+        """manual optimization에서 gradient accumulation step 경계를 판단합니다."""
+        accumulate = max(1, int(self.gan_manual_accumulate_grad_batches))
+        if (int(batch_idx) + 1) % accumulate == 0:
+            return True
+        return bool(getattr(self.trainer, "is_last_batch", False))
+
+    def _gan_is_accumulation_start(self, batch_idx: int) -> bool:
+        """현재 microbatch가 accumulation window 시작인지 판단합니다."""
+        accumulate = max(1, int(self.gan_manual_accumulate_grad_batches))
+        return int(batch_idx) % accumulate == 0
+
+    def _gan_backward_sync_context(self, should_step: bool):
+        """DDP manual accumulation 중 non-step microbatch의 gradient sync를 생략합니다."""
+        strategy = getattr(getattr(self, "trainer", None), "strategy", None)
+        no_backward_sync = getattr(strategy, "no_backward_sync", None)
+        if callable(no_backward_sync):
+            return no_backward_sync(self, enabled=not bool(should_step))
+        return nullcontext()
+
     def _training_step_self_forced_gan(self, data, batch_idx):
         """set-level GAN fine-tuning 한 step을 실행합니다.
 
@@ -444,43 +470,52 @@ class SMARTFlowGAN(SMARTFlow):
             fake_pose = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
 
         generator_optimizer, discriminator_optimizer = self.optimizers()
+        accumulate = max(1, int(self.gan_manual_accumulate_grad_batches))
+        accumulation_start = self._gan_is_accumulation_start(batch_idx)
+        step_accumulated = self._gan_should_step_accumulated_optimizer(batch_idx)
         r1_log = real_pose.new_zeros(())
         r2_log = real_pose.new_zeros(())
 
         self.toggle_optimizer(discriminator_optimizer)
         try:
-            discriminator_optimizer.zero_grad(set_to_none=True)
+            if accumulation_start:
+                discriminator_optimizer.zero_grad(set_to_none=True)
             real_logit = self._gan_forward_discriminator(real_pose.detach(), context)
             fake_logit = self._gan_forward_discriminator(fake_pose.detach(), context)
             d_adv = relativistic_discriminator_loss(real_logit, fake_logit)
             real_logit_for_margin = real_logit.detach()
             fake_logit_for_margin = fake_logit.detach()
-            self._manual_backward_without_autocast(d_adv)
+            with self._gan_backward_sync_context(step_accumulated):
+                self._manual_backward_without_autocast(d_adv / accumulate)
             d_loss = d_adv.detach()
             del real_logit, fake_logit, d_adv
 
             if self.gan_r1_weight > 0.0:
                 r1 = self._compute_gan_finite_difference_regularizer(real_pose, context)
                 r1_log = r1.detach()
-                self._manual_backward_without_autocast(self.gan_r1_weight * r1)
+                with self._gan_backward_sync_context(step_accumulated):
+                    self._manual_backward_without_autocast((self.gan_r1_weight * r1) / accumulate)
                 d_loss = d_loss + self.gan_r1_weight * r1_log
                 del r1
             if self.gan_r2_weight > 0.0:
                 r2 = self._compute_gan_finite_difference_regularizer(fake_pose, context)
                 r2_log = r2.detach()
-                self._manual_backward_without_autocast(self.gan_r2_weight * r2)
+                with self._gan_backward_sync_context(step_accumulated):
+                    self._manual_backward_without_autocast((self.gan_r2_weight * r2) / accumulate)
                 d_loss = d_loss + self.gan_r2_weight * r2_log
                 del r2
-            self._clip_and_step_with_optional_scaler(
-                discriminator_optimizer,
-                gradient_clip_val=self.gan_gradient_clip_val,
-                gradient_clip_algorithm="norm",
-            )
-            self.gan_discriminator_update_count.add_(1)
-            if warmup_active:
-                self.gan_warmup_update_count.add_(1)
+            if step_accumulated:
+                self._clip_and_step_with_optional_scaler(
+                    discriminator_optimizer,
+                    gradient_clip_val=self.gan_gradient_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+                self.gan_discriminator_update_count.add_(1)
+                if warmup_active:
+                    self.gan_warmup_update_count.add_(1)
         finally:
-            discriminator_optimizer.zero_grad(set_to_none=True)
+            if step_accumulated:
+                discriminator_optimizer.zero_grad(set_to_none=True)
             self.untoggle_optimizer(discriminator_optimizer)
 
         if warmup_active:
@@ -489,20 +524,24 @@ class SMARTFlowGAN(SMARTFlow):
         else:
             self.toggle_optimizer(generator_optimizer)
             try:
-                generator_optimizer.zero_grad(set_to_none=True)
+                if accumulation_start:
+                    generator_optimizer.zero_grad(set_to_none=True)
                 with frozen_parameters(self.gan_discriminator):
                     real_logit_for_g = self._gan_forward_discriminator(real_pose.detach(), context).detach()
                     fake_logit_for_g = self._gan_forward_discriminator(fake_pose, context)
                     g_loss = relativistic_generator_loss(real_logit_for_g, fake_logit_for_g)
-                self._manual_backward_without_autocast(g_loss)
-                self._clip_and_step_with_optional_scaler(
-                    generator_optimizer,
-                    gradient_clip_val=self.gan_gradient_clip_val,
-                    gradient_clip_algorithm="norm",
-                )
-                self._update_gan_generator_ema_after_step()
+                with self._gan_backward_sync_context(step_accumulated):
+                    self._manual_backward_without_autocast(g_loss / accumulate)
+                if step_accumulated:
+                    self._clip_and_step_with_optional_scaler(
+                        generator_optimizer,
+                        gradient_clip_val=self.gan_gradient_clip_val,
+                        gradient_clip_algorithm="norm",
+                    )
+                    self._update_gan_generator_ema_after_step()
             finally:
-                generator_optimizer.zero_grad(set_to_none=True)
+                if step_accumulated:
+                    generator_optimizer.zero_grad(set_to_none=True)
                 self.untoggle_optimizer(generator_optimizer)
             total_loss = g_loss.detach()
 
@@ -515,6 +554,8 @@ class SMARTFlowGAN(SMARTFlow):
         self.log("train/gan/r2", r2_log, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/gan/warmup_active", float(warmup_active), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/gan/warmup_updates", float(self.gan_resolved_warmup_updates), on_step=False, on_epoch=True, sync_dist=False, batch_size=1)
+        self.log("train/gan/manual_accumulate_grad_batches", float(accumulate), on_step=False, on_epoch=True, sync_dist=False, batch_size=1)
+        self.log("train/gan/optimizer_step_boundary", float(step_accumulated), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         return total_loss
 
     def training_step(self, data, batch_idx):
@@ -561,6 +602,7 @@ class SMARTFlowGAN(SMARTFlow):
                 "[self_forced_gan] resolved_warmup_updates="
                 f"{self.gan_resolved_warmup_updates}, "
                 f"effective_scene_batch={self.gan_effective_scene_batch}, "
+                f"manual_accumulate_grad_batches={self.gan_manual_accumulate_grad_batches}, "
                 f"critic_trainable_params={self.gan_discriminator.count_trainable_parameters()}",
                 flush=True,
             )

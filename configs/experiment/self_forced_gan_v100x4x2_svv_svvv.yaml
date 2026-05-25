@@ -18,7 +18,8 @@ model:
   model_config:
     n_rollout_closed_val: 8
     self_forced_gan:
-      effective_scene_batch: 8
+      effective_scene_batch: 96
+      manual_accumulate_grad_batches: 12
       sampling:
         backprop_last_k: 8
 
