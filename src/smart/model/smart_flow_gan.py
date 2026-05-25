@@ -494,15 +494,25 @@ class SMARTFlowGAN(SMARTFlow):
         try:
             if accumulation_start:
                 discriminator_optimizer.zero_grad(set_to_none=True)
-            real_logit = self._gan_forward_discriminator(real_pose.detach(), context)
+
+            with torch.no_grad():
+                real_logit_value = self._gan_forward_discriminator(real_pose.detach(), context).detach()
+                fake_logit_value = self._gan_forward_discriminator(fake_pose.detach(), context).detach()
+
             fake_logit = self._gan_forward_discriminator(fake_pose.detach(), context)
-            d_adv = relativistic_discriminator_loss(real_logit, fake_logit)
-            real_logit_for_margin = real_logit.detach()
+            d_fake = relativistic_discriminator_loss(real_logit_value, fake_logit)
             fake_logit_for_margin = fake_logit.detach()
             with self._gan_backward_sync_context(step_accumulated):
-                self._manual_backward_without_autocast(d_adv / accumulate)
-            d_loss = d_adv.detach()
-            del real_logit, fake_logit, d_adv
+                self._manual_backward_without_autocast(d_fake / accumulate)
+            del fake_logit, d_fake
+
+            real_logit = self._gan_forward_discriminator(real_pose.detach(), context)
+            d_real = relativistic_discriminator_loss(real_logit, fake_logit_value)
+            real_logit_for_margin = real_logit.detach()
+            with self._gan_backward_sync_context(step_accumulated):
+                self._manual_backward_without_autocast(d_real / accumulate)
+            d_loss = relativistic_discriminator_loss(real_logit_value, fake_logit_value).detach()
+            del real_logit, d_real, real_logit_value, fake_logit_value
 
             if self.gan_r1_weight > 0.0:
                 r1 = self._compute_gan_finite_difference_regularizer(real_pose, context)
