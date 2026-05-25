@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Launch V100x4x2 execution-context pretrain on sv + svv.
+"""Launch V100x4x2 execution-context pretrain on two static V100x4 pods.
 
-This wrapper targets the already-running ``sv`` and ``svv`` V100x4 pods. It
-does not create, delete, or restart pods. It prepares or verifies the
-memory-balance metadata cache, then starts the shared tmux OOM-retry launcher.
+This shared wrapper defaults to the already-running ``sv`` and ``svv`` V100x4
+pods, and pod-specific entrypoints may override the defaults before calling
+``main()``. It does not create, delete, or restart pods. It prepares or verifies
+the memory-balance metadata cache, then starts the shared tmux OOM-retry
+launcher.
 
 The key hardware adaptation from the H100x6 4+2 launcher is that this run uses
 8 homogeneous V100 ranks with fp16 mixed precision and a smaller per-rank batch.
@@ -40,8 +42,8 @@ def shq(value: object) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Launch semi_control_rolling_gan V100x4x2 pretrain on sv and svv "
-            "with train_batch_size OOM fallback."
+            "Launch semi_control_rolling_gan V100x4x2 pretrain on two static "
+            "V100x4 pods with train_batch_size OOM fallback."
         )
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", "p-pnc"))

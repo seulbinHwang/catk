@@ -878,19 +878,19 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_r
 python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py --stop
 ```
 
-#### sv/svv V100x4x2 execution-context balanced pretrain
+#### svv/svvv V100x4x2 execution-context balanced pretrain
 
-`semi_control_rolling_gan` 브랜치에서 위 H100x6 4+2 pod 실험을 `sv`, `svv` 두 V100x4 pod로 옮겨 돌릴 때는 아래 V100 전용 preset과 launcher를 씁니다. pod는 새로 만들거나 재시작하지 않고, 기존 running pod 안에 tmux session만 만듭니다.
+`semi_control_rolling_gan` 브랜치에서 위 H100x6 4+2 pod 실험을 `svv`, `svvv` 두 V100x4 pod로 옮겨 돌릴 때는 아래 V100 전용 preset과 launcher를 씁니다. pod는 새로 만들거나 재시작하지 않고, 기존 running pod 안에 tmux session만 만듭니다.
 
 ```text
 configs/experiment/pre_bc_flow_control_v100x4x2_execctx_balanced.yaml
-scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_retry_static_pods.py
+scripts/launch_pre_bc_flow_control_v100x4x2_svv_svvv_execctx_balanced_oom_retry_static_pods.py
 ```
 
 기본 설정:
 
 - 대상 브랜치: `semi_control_rolling_gan`
-- 대상 pod: `sv`, `svv`
+- 대상 pod: `svv`, `svvv`
 - GPU 구성: V100 4장 x 2 pod = 8 GPU
 - precision: `16-mixed` (`bf16-mixed`는 H100/A100 전용 경로로 보고 V100 기본값에서 제외)
 - 시작 per-GPU batch: `4`, OOM fallback `4 -> 3 -> 2 -> 1`
@@ -902,7 +902,7 @@ scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_retry_st
 실행:
 
 ```bash
-python scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_retry_static_pods.py \
+python scripts/launch_pre_bc_flow_control_v100x4x2_svv_svvv_execctx_balanced_oom_retry_static_pods.py \
   --prebuild-metadata \
   --replace
 ```
@@ -910,7 +910,7 @@ python scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_r
 실행 전 dry-run:
 
 ```bash
-python scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_retry_static_pods.py \
+python scripts/launch_pre_bc_flow_control_v100x4x2_svv_svvv_execctx_balanced_oom_retry_static_pods.py \
   --prebuild-metadata \
   --dry-run
 ```
@@ -918,11 +918,11 @@ python scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_r
 짧은 smoke는 같은 launcher에 batch 수와 epoch만 제한해서 확인합니다.
 
 ```bash
-python scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_retry_static_pods.py \
+python scripts/launch_pre_bc_flow_control_v100x4x2_svv_svvv_execctx_balanced_oom_retry_static_pods.py \
   --prebuild-metadata \
   --replace \
-  --task-name flow_control_space_pretrain_v100x4x2_sv_svv_smoke \
-  --session catk-control-pretrain-v100x4x2-smoke \
+  --task-name flow_control_space_pretrain_v100x4x2_svv_svvv_smoke \
+  --session catk-control-pretrain-v100x4x2-svv-svvv-smoke \
   --limit-train-batches 1 \
   --limit-val-batches 0 \
   --max-epochs 1
@@ -931,14 +931,14 @@ python scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_r
 tmux 확인:
 
 ```bash
-kubectl exec -it -n p-pnc sv -c main -- tmux attach -t catk-control-pretrain-v100x4x2-sv-svv-execctx-balanced
-kubectl exec -it -n p-pnc svv -c main -- tmux attach -t catk-control-pretrain-v100x4x2-sv-svv-execctx-balanced
+kubectl exec -it -n p-pnc svv -c main -- tmux attach -t catk-control-pretrain-v100x4x2-svv-svvv-execctx-balanced
+kubectl exec -it -n p-pnc svvv -c main -- tmux attach -t catk-control-pretrain-v100x4x2-svv-svvv-execctx-balanced
 ```
 
 실험 코드만 멈추고 pod는 그대로 두려면:
 
 ```bash
-python scripts/launch_pre_bc_flow_control_v100x4x2_sv_svv_execctx_balanced_oom_retry_static_pods.py --stop
+python scripts/launch_pre_bc_flow_control_v100x4x2_svv_svvv_execctx_balanced_oom_retry_static_pods.py --stop
 ```
 
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
