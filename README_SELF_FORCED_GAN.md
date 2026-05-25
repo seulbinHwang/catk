@@ -33,6 +33,7 @@ tools/validate_self_forced_gan_cache.py
 ## Teacher cache 형식
 
 multi-node 학습에서는 teacher real set을 online으로 만들지 말고, 학습 전에 offline cache로 고정합니다.
+가장 안전한 운영 방식은 한 노드에서 한 번 만든 cache를 모든 학습 노드가 같은 경로로 공유하거나, byte-identical하게 복사해서 쓰는 것입니다. 각 노드가 같은 scene의 teacher cache를 따로 생성하면 seed 설계상 같은 rollout을 의도하더라도 CUDA/library 비결정성 때문에 미세한 차이가 생길 수 있습니다.
 각 scene 파일은 `.pt` dict로 저장합니다.
 
 ```python
