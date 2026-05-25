@@ -8,6 +8,7 @@ import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 import torch
@@ -34,11 +35,28 @@ def _parse_args() -> argparse.Namespace:
             "Each scene is saved as one .pt file containing rollout_pose [R,20,N,4]."
         )
     )
-    parser.add_argument("--ckpt-path", required=True, type=Path, help="Pretrained teacher Lightning checkpoint.")
+    parser.add_argument("--ckpt-path", type=Path, help="Pretrained teacher Lightning checkpoint.")
     parser.add_argument("--output-root", required=True, type=Path, help="Directory where scene .pt cache files are saved.")
     parser.add_argument("--split", default="train", choices=("train", "val", "validation", "test"))
     parser.add_argument("--rollouts-per-scene", type=int, default=32)
     parser.add_argument("--max-scenes", type=int, default=None, help="Debug limit. Omit to build the full split.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of scenes to encode together on one GPU worker.",
+    )
+    parser.add_argument(
+        "--rollout-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of teacher rollouts to sample in one flow call. "
+            "Defaults to --rollouts-per-scene."
+        ),
+    )
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of cache builder shards.")
+    parser.add_argument("--shard-index", type=int, default=0, help="This builder shard index.")
     parser.add_argument("--seed", type=int, default=817)
     parser.add_argument(
         "--device",
@@ -58,6 +76,11 @@ def _parse_args() -> argparse.Namespace:
         help="Optional CUDA autocast dtype used during teacher sampling.",
     )
     parser.add_argument("--skip-existing", action="store_true", help="Do not rebuild scene files that already exist.")
+    parser.add_argument(
+        "--merge-shard-indexes",
+        action="store_true",
+        help="Only merge index.shard_* files under --output-root into index.json.",
+    )
     parser.add_argument("--config-name", default="run", help="Hydra config name under configs/.")
     parser.add_argument(
         "--override",
@@ -71,7 +94,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _default_overrides() -> list[str]:
+def _default_overrides(args: argparse.Namespace) -> list[str]:
     return [
         "experiment=self_forced_gan_h100_6",
         "action=validate",
@@ -82,9 +105,9 @@ def _default_overrides() -> list[str]:
         "model.model_config.n_vis_batch=0",
         "model.model_config.n_vis_scenario=0",
         "model.model_config.n_vis_rollout=0",
-        "data.train_batch_size=1",
-        "data.val_batch_size=1",
-        "data.test_batch_size=1",
+        f"data.train_batch_size={int(args.batch_size)}",
+        f"data.val_batch_size={int(args.batch_size)}",
+        f"data.test_batch_size={int(args.batch_size)}",
         "data.shuffle=false",
         "data.num_workers=0",
         "data.prefetch_factor=null",
@@ -99,7 +122,7 @@ def _default_overrides() -> list[str]:
 
 
 def _compose_config(args: argparse.Namespace):
-    overrides = _default_overrides() + list(args.override)
+    overrides = _default_overrides(args) + list(args.override)
     with initialize_config_dir(config_dir=str(REPO_ROOT / "configs"), version_base=None):
         cfg = compose(config_name=args.config_name, overrides=overrides, return_hydra_config=True)
     with open_dict(cfg):
@@ -149,6 +172,16 @@ def _select_dataloader(datamodule: Any, split: str):
     if normalized == "val":
         return datamodule.val_dataloader()
     return datamodule.test_dataloader()
+
+
+def _attach_shard_trainer(datamodule: Any, *, num_shards: int, shard_index: int) -> None:
+    if int(num_shards) <= 1:
+        return
+    object.__setattr__(
+        datamodule,
+        "trainer",
+        SimpleNamespace(world_size=int(num_shards), global_rank=int(shard_index)),
+    )
 
 
 def _to_device(batch: Any, device: torch.device) -> Any:
@@ -277,6 +310,107 @@ def _sample_teacher_rollout_pose(
     return pose
 
 
+def _sample_teacher_rollout_pose_chunk(
+    *,
+    model: Any,
+    anchor_context: dict[str, Tensor],
+    tokenized_agent: dict[str, Tensor],
+    anchor_mask: Tensor,
+    scenario_ids: list[str],
+    rollout_indices: list[int],
+    base_seed: int,
+) -> Tensor:
+    n_agent = int(anchor_mask.shape[0])
+    n_rollout = len(rollout_indices)
+    flow_window_steps = int(model.flow_window_steps)
+    flow_state_dim = int(model.encoder.agent_encoder.flow_state_dim)
+    device = anchor_mask.device
+    dtype = anchor_context["anchor_hidden"].dtype
+    pose = torch.zeros((n_rollout, n_agent, flow_window_steps, 4), device=device, dtype=dtype)
+    if n_rollout == 0 or not bool(anchor_mask.any()):
+        return pose
+
+    agent_encoder = model.encoder.agent_encoder
+    anchor_hidden_valid = agent_encoder._pack_anchor_hidden(
+        anchor_context["anchor_hidden"],
+        anchor_context["anchor_mask"],
+    )
+    n_valid = int(anchor_hidden_valid.shape[0])
+    valid_agent_batch = tokenized_agent["batch"][anchor_mask]
+    x_init = torch.empty(
+        (n_rollout, n_valid, flow_window_steps, flow_state_dim),
+        device=device,
+        dtype=dtype,
+    )
+    noise_scale = float(getattr(model.validation_rollout_sampling, "noise_scale", 1.0))
+    for out_idx, rollout_index in enumerate(rollout_indices):
+        for scene_index, scenario_id in enumerate(scenario_ids):
+            scene_valid_mask = valid_agent_batch == int(scene_index)
+            if not bool(scene_valid_mask.any()):
+                continue
+            generator = torch.Generator(device=device)
+            generator.manual_seed(_stable_seed(base_seed, str(scenario_id), int(rollout_index)))
+            x_init[out_idx, scene_valid_mask] = torch.randn(
+                int(scene_valid_mask.sum().item()),
+                flow_window_steps,
+                flow_state_dim,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            ) * noise_scale
+
+    hidden_batched = (
+        anchor_hidden_valid.unsqueeze(0)
+        .expand(n_rollout, n_valid, anchor_hidden_valid.shape[-1])
+        .reshape(n_rollout * n_valid, anchor_hidden_valid.shape[-1])
+    )
+    x_init_flat = x_init.reshape(n_rollout * n_valid, flow_window_steps, flow_state_dim)
+    flow_sample_steps = getattr(
+        model.validation_rollout_sampling,
+        "sample_steps",
+        agent_encoder.flow_ode.solver_steps,
+    )
+    flow_sample_method = getattr(
+        model.validation_rollout_sampling,
+        "sample_method",
+        agent_encoder.flow_ode.solver_method,
+    )
+    sample_norm_flat = agent_encoder.flow_ode.generate(
+        x_init=x_init_flat,
+        model_fn=lambda x_t, tau: agent_encoder.flow_decoder(hidden_batched, x_t, tau),
+        steps=flow_sample_steps,
+        method=flow_sample_method,
+        backprop_last_k=None,
+    )
+    agent_type = tokenized_agent["type"][anchor_mask]
+    agent_length = tokenized_agent["shape"][anchor_mask, 0] if "shape" in tokenized_agent else None
+    sample_pose_norm = model.encoder.flow_norm_to_pose_metric_norm(
+        value=sample_norm_flat,
+        agent_type=agent_type.repeat(n_rollout),
+        agent_length=agent_length.repeat(n_rollout) if agent_length is not None else None,
+    ).reshape(n_rollout, n_valid, flow_window_steps, -1)
+    pos_local = sample_pose_norm[..., :2] * float(POSE_NORM_POS_SCALE_M)
+    head_local = torch.atan2(sample_pose_norm[..., 3], sample_pose_norm[..., 2])
+    current_pos = tokenized_agent["ctx_sampled_pos"][anchor_mask, 1]
+    current_head = tokenized_agent["ctx_sampled_heading"][anchor_mask, 1]
+    pos_global, head_global = transform_to_global(
+        pos_local=pos_local.reshape(n_rollout * n_valid, flow_window_steps, 2),
+        head_local=head_local.reshape(n_rollout * n_valid, flow_window_steps),
+        pos_now=current_pos.repeat(n_rollout, 1),
+        head_now=current_head.repeat(n_rollout),
+    )
+    pose_valid = torch.cat(
+        [
+            pos_global.reshape(n_rollout, n_valid, flow_window_steps, 2),
+            torch.cos(head_global).reshape(n_rollout, n_valid, flow_window_steps).unsqueeze(-1),
+            torch.sin(head_global).reshape(n_rollout, n_valid, flow_window_steps).unsqueeze(-1),
+        ],
+        dim=-1,
+    )
+    pose[:, anchor_mask] = pose_valid
+    return pose
+
+
 @torch.no_grad()
 def _generate_batch_rollout_set(
     *,
@@ -285,6 +419,7 @@ def _generate_batch_rollout_set(
     rollouts_per_scene: int,
     base_seed: int,
     amp_dtype: str,
+    rollout_batch_size: int,
 ) -> tuple[Tensor, Tensor]:
     tokenized_map, tokenized_agent = model._build_eval_tokenized_inputs(data)
     map_feature = model.encoder.encode_map(tokenized_map)
@@ -299,22 +434,24 @@ def _generate_batch_rollout_set(
         map_feature=map_feature,
         anchor_mask=anchor_mask,
     )
-    scenario_key = "|".join(_scenario_id_list(data["scenario_id"]))
-    rollouts: list[Tensor] = []
+    scenario_ids = _scenario_id_list(data["scenario_id"])
+    rollout_chunks: list[Tensor] = []
     device = next(model.parameters()).device
     with _amp_context(device, amp_dtype):
-        for rollout_index in range(int(rollouts_per_scene)):
-            seed = _stable_seed(base_seed, scenario_key, rollout_index)
-            rollouts.append(
-                _sample_teacher_rollout_pose(
+        for start in range(0, int(rollouts_per_scene), int(rollout_batch_size)):
+            end = min(start + int(rollout_batch_size), int(rollouts_per_scene))
+            rollout_chunks.append(
+                _sample_teacher_rollout_pose_chunk(
                     model=model,
                     anchor_context=anchor_context,
                     tokenized_agent=tokenized_agent,
                     anchor_mask=anchor_mask,
-                    sampling_seed=seed,
+                    scenario_ids=scenario_ids,
+                    rollout_indices=list(range(start, end)),
+                    base_seed=int(base_seed),
                 )
             )
-    return torch.stack(rollouts, dim=0).contiguous(), anchor_mask
+    return torch.cat(rollout_chunks, dim=0).contiguous(), anchor_mask
 
 
 def _read_index(index_path: Path) -> dict[str, str]:
@@ -336,6 +473,36 @@ def _write_index(index_path: Path, index: dict[str, str]) -> None:
         json.dump(index, fp, indent=2, sort_keys=True)
         fp.write("\n")
     os.replace(tmp_path, index_path)
+
+
+def _merge_shard_indexes(output_root: Path, *, num_shards: int | None = None) -> None:
+    if num_shards is None or int(num_shards) <= 1:
+        shard_paths = sorted(output_root.glob("index.shard_*.json"))
+    else:
+        shard_paths = [
+            output_root / f"index.shard_{shard_index:05d}_of_{int(num_shards):05d}.json"
+            for shard_index in range(int(num_shards))
+        ]
+    if not shard_paths:
+        raise FileNotFoundError(f"No shard index files found under {output_root}")
+    merged: dict[str, str] = {}
+    missing = [path for path in shard_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Missing shard index files: " + ", ".join(str(path) for path in missing[:20])
+        )
+    for path in shard_paths:
+        shard_index = _read_index(path)
+        overlap = set(merged).intersection(shard_index)
+        if overlap:
+            raise ValueError(f"Duplicate scenario ids while merging {path}: {sorted(overlap)[:5]}")
+        merged.update(shard_index)
+    _write_index(output_root / "index.json", merged)
+    print(
+        f"[teacher_cache] merged_shards={len(shard_paths)} entries={len(merged)} "
+        f"index={output_root / 'index.json'}",
+        flush=True,
+    )
 
 
 def _save_scene_cache(
@@ -385,8 +552,23 @@ def _save_scene_cache(
 
 def main() -> None:
     args = _parse_args()
+    if args.merge_shard_indexes:
+        output_root = args.output_root.expanduser().resolve()
+        _merge_shard_indexes(output_root, num_shards=int(args.num_shards))
+        return
+    if args.ckpt_path is None:
+        raise ValueError("--ckpt-path is required unless --merge-shard-indexes is set.")
     if args.rollouts_per_scene <= 0:
         raise ValueError("--rollouts-per-scene must be positive.")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if args.num_shards <= 0:
+        raise ValueError("--num-shards must be positive.")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= shard_index < num_shards.")
+    rollout_batch_size = int(args.rollout_batch_size or args.rollouts_per_scene)
+    if rollout_batch_size <= 0:
+        raise ValueError("--rollout-batch-size must be positive.")
     output_root = args.output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     index_path = output_root / "index.json"
@@ -394,6 +576,11 @@ def main() -> None:
 
     cfg = _compose_config(args)
     datamodule = instantiate(cfg.data)
+    _attach_shard_trainer(
+        datamodule,
+        num_shards=int(args.num_shards),
+        shard_index=int(args.shard_index),
+    )
     model = instantiate(cfg.model, _recursive_=False)
     _load_teacher_checkpoint(model, args.ckpt_path.expanduser().resolve())
 
@@ -406,20 +593,20 @@ def main() -> None:
     storage_dtype = _storage_dtype(args.storage_dtype)
     processed = 0
     written = 0
+    shard_max_scenes = args.max_scenes
+    if args.max_scenes is not None and args.num_shards > 1:
+        shard_max_scenes = args.max_scenes // args.num_shards + int(
+            args.shard_index < (args.max_scenes % args.num_shards)
+        )
     started = time.monotonic()
     for batch_index, data in enumerate(dataloader):
         data = _to_device(data, device)
         scenario_ids = _scenario_id_list(data["scenario_id"])
-        if len(scenario_ids) != 1:
-            raise ValueError(
-                "Teacher cache builder expects batch size 1 so each scene has independent "
-                f"sampling seeds. Got {len(scenario_ids)} scenes. Do not override data.*_batch_size."
-            )
         if args.skip_existing and all((output_root / (_sanitize_scenario_id(sid) + ".pt")).exists() for sid in scenario_ids):
             for sid in scenario_ids:
                 index[str(sid)] = _sanitize_scenario_id(sid) + ".pt"
             processed += len(scenario_ids)
-            if args.max_scenes is not None and processed >= args.max_scenes:
+            if shard_max_scenes is not None and processed >= shard_max_scenes:
                 break
             continue
 
@@ -429,9 +616,10 @@ def main() -> None:
             rollouts_per_scene=int(args.rollouts_per_scene),
             base_seed=int(args.seed),
             amp_dtype=str(args.amp_dtype),
+            rollout_batch_size=rollout_batch_size,
         )
         for scene_index, scenario_id in enumerate(scenario_ids):
-            if args.max_scenes is not None and processed >= args.max_scenes:
+            if shard_max_scenes is not None and processed >= shard_max_scenes:
                 break
             did_write = _save_scene_cache(
                 output_root=output_root,
@@ -455,9 +643,11 @@ def main() -> None:
                 f"elapsed_sec={elapsed:.1f} output_root={output_root}",
                 flush=True,
             )
-        if args.max_scenes is not None and processed >= args.max_scenes:
+        if shard_max_scenes is not None and processed >= shard_max_scenes:
             break
 
+    if args.num_shards > 1:
+        index_path = output_root / f"index.shard_{int(args.shard_index):05d}_of_{int(args.num_shards):05d}.json"
     _write_index(index_path, index)
     elapsed = time.monotonic() - started
     print(

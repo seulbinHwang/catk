@@ -68,6 +68,8 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
   --output-root "$TEACHER_GAN_CACHE_ROOT" \
   --split train \
   --rollouts-per-scene 32 \
+  --batch-size 32 \
+  --rollout-batch-size 32 \
   --storage-dtype float16 \
   --override paths.cache_root="$CACHE_ROOT"
 ```
@@ -76,6 +78,10 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
 context에서 2초 open-loop trajectory를 32개 샘플링하여 scene별 `.pt` 파일로 저장합니다.
 sampling target에는 future GT를 넣지 않고, 저장된 `valid_mask`는 현재 context에서 teacher
 sampling을 실제로 수행한 agent만 표시합니다.
+
+속도 최적화 경로에서는 scene batch와 rollout batch를 함께 사용합니다. 기존의
+scene 1개 x rollout 32개 순차 생성과 같은 teacher/cache 의미를 유지하되, 여러 scene의
+context encode와 32개 rollout sampling을 GPU batch로 묶어 처리합니다.
 
 ## 기본 학습 실행
 
@@ -121,24 +127,47 @@ pretrain 시작점은 W&B run
 최신 `epoch-last-*` model artifact입니다. launcher가 W&B API로 최신 artifact를 찾아 rank 0
 pod에 내려받고, torchrun 시작 전에 rank 1 pod로 같은 checkpoint를 검증 복사합니다.
 
-먼저 teacher cache가 없으면 한 번 생성합니다. multi-node 학습에서는 같은 cache를 양쪽 pod가
-byte-identical하게 봐야 하므로, rank 0에서 만든 뒤 rank 1로 동기화합니다.
+먼저 teacher cache가 없으면 한 번 생성합니다. `svv + svvv`에서는 8개 V100을 모두 cache
+builder shard로 사용하고, 각 pod가 만든 shard를 pod-to-pod direct stream으로 교환한 뒤
+양쪽 pod에서 같은 `index.json`을 merge합니다. 학습 시에는 양쪽 pod가 같은 cache root를
+읽습니다.
 
 ```bash
 python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
   --build-teacher-cache \
+  --build-cache-only \
+  --parallel-teacher-cache \
   --sync-teacher-cache \
-  --skip-existing-teacher-cache \
+  --teacher-cache-batch-size 32 \
+  --teacher-cache-rollout-batch-size 32 \
   --replace
 ```
+
+실측 기준으로 4096 scene cache를 생성, shard 교환, index merge, 양쪽 pod validate까지
+`100.97s`가 걸렸습니다. train split 전체 486,995 scene 기준 단순 외삽 예상은 약 3.3시간이고,
+cache 용량은 약 82.3GiB입니다.
 
 실행 전 smoke는 cache 일부만 만들어 1 train batch를 통과시키는 방식으로 확인합니다.
 
 ```bash
 python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
   --build-teacher-cache \
+  --build-cache-only \
+  --parallel-teacher-cache \
   --teacher-cache-max-scenes 32 \
   --sync-teacher-cache \
+  --teacher-cache-batch-size 32 \
+  --teacher-cache-rollout-batch-size 32 \
+  --replace
+```
+
+cache smoke가 끝난 뒤 1 train batch를 통과시키려면 이미 만든 smoke cache root를 지정해서
+학습 smoke를 별도로 실행합니다.
+
+```bash
+python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
+  --skip-pretrain-download \
+  --teacher-cache-root "$TEACHER_GAN_CACHE_ROOT" \
   --limit-train-batches 1 \
   --disable-validation \
   --max-epochs 1 \
