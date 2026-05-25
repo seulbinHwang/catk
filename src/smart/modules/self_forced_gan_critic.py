@@ -253,9 +253,9 @@ class RadiusAttentionLayer(nn.Module):
             chunk_sum = exp_logits.sum(dim=4)
             chunk_context = torch.einsum(
                 "bkeqsh,bkeshd->bkeqhd",
-                exp_logits,
-                v[..., start:end, :, :].float(),
-            )
+                exp_logits.to(dtype=v.dtype),
+                v[..., start:end, :, :],
+            ).float()
 
             next_max = torch.maximum(max_logit, chunk_max)
             safe_next_max = torch.where(torch.isfinite(next_max), next_max, torch.zeros_like(next_max))
