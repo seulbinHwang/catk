@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Launch Set-level Self-Forced GAN fine-tuning on svv + svvv.
+"""Launch Set-level Self-Forced GAN fine-tuning on static pods.
 
-This launcher targets two already-running static V100x4 pods. It never creates,
-deletes, or restarts pods. It prepares the W&B pretrain checkpoint on rank 0,
+This launcher defaults to two already-running static V100x4 pods. Pod-specific
+entrypoints may override the defaults before calling ``main()``. It never
+creates, deletes, or restarts pods. It prepares the W&B pretrain checkpoint,
 optionally builds/syncs the offline teacher rollout cache, then delegates the
-actual tmux multi-node run to ``launch_h100x4_multinode_pretrain_tmux.py``.
+actual tmux run to ``launch_h100x4_multinode_pretrain_tmux.py``.
 """
 
 from __future__ import annotations
@@ -32,6 +33,15 @@ DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "self_forced_gan_v100x4x2_svv_svvv"
 DEFAULT_TASK_NAME = "sf_gan_k16_v100x4x2_svv_svvv"
 DEFAULT_SESSION = "catk-sf-gan-v100x4x2-svv-svvv"
+DEFAULT_DESCRIPTION = "Launch Set-level Self-Forced GAN fine-tuning on svv + svvv V100x4 pods."
+DEFAULT_EXPECTED_POD_COUNT = 2
+DEFAULT_MASTER_PORT = "29670"
+DEFAULT_CHECKPOINT_SYNC_PORT = "29671"
+DEFAULT_NPROC_PER_NODE = 4
+DEFAULT_TRAIN_BATCH_SIZE = 1
+DEFAULT_VAL_BATCH_SIZE = 2
+DEFAULT_PRECISION = "16-mixed"
+DEFAULT_TEACHER_CACHE_GPUS_PER_POD = 4
 DEFAULT_WANDB_ENTITY = "jksg01019-naver-labs"
 DEFAULT_WANDB_PROJECT = "SMART-FLOW"
 DEFAULT_WANDB_PRETRAIN_TASK = (
@@ -927,7 +937,7 @@ def stop_command(args: argparse.Namespace) -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch Set-level Self-Forced GAN fine-tuning on svv + svvv V100x4 pods.",
+        description=DEFAULT_DESCRIPTION,
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--container", default=DEFAULT_CONTAINER)
@@ -956,12 +966,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
-    parser.add_argument("--master-port", default="29670")
-    parser.add_argument("--checkpoint-sync-port", default="29671")
-    parser.add_argument("--nproc-per-node", type=int, default=4)
-    parser.add_argument("--train-batch-size", type=int, default=1)
-    parser.add_argument("--val-batch-size", type=int, default=2)
-    parser.add_argument("--precision", default="16-mixed")
+    parser.add_argument("--master-port", default=DEFAULT_MASTER_PORT)
+    parser.add_argument("--checkpoint-sync-port", default=DEFAULT_CHECKPOINT_SYNC_PORT)
+    parser.add_argument("--nproc-per-node", type=int, default=DEFAULT_NPROC_PER_NODE)
+    parser.add_argument("--train-batch-size", type=int, default=DEFAULT_TRAIN_BATCH_SIZE)
+    parser.add_argument("--val-batch-size", type=int, default=DEFAULT_VAL_BATCH_SIZE)
+    parser.add_argument("--precision", default=DEFAULT_PRECISION)
     parser.add_argument("--max-epochs", default="6")
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
@@ -981,7 +991,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-cache-data-num-workers", type=int, default=0)
     parser.add_argument("--teacher-cache-data-prefetch-factor", type=int, default=2)
     parser.add_argument("--teacher-cache-save-workers", type=int, default=4)
-    parser.add_argument("--teacher-cache-gpus-per-pod", type=int, default=4)
+    parser.add_argument("--teacher-cache-gpus-per-pod", type=int, default=DEFAULT_TEACHER_CACHE_GPUS_PER_POD)
     parser.add_argument("--teacher-cache-sync-port", default="29720")
     parser.add_argument("--teacher-cache-direct-pod-sync", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--parallel-teacher-cache", action="store_true")
@@ -996,10 +1006,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-monitor-pane", action="store_true")
     args = parser.parse_args()
-    if len(args.pods) != 2 and not args.stop:
-        parser.error("this preset expects exactly two pods")
-    if args.nproc_per_node != 4 and not args.stop:
-        parser.error("--nproc-per-node must be 4 for svv/svvv V100x4 pods")
+    if len(args.pods) != DEFAULT_EXPECTED_POD_COUNT and not args.stop:
+        parser.error(f"this preset expects exactly {DEFAULT_EXPECTED_POD_COUNT} pod(s)")
+    if args.nproc_per_node != DEFAULT_NPROC_PER_NODE and not args.stop:
+        parser.error(f"--nproc-per-node must be {DEFAULT_NPROC_PER_NODE} for this preset")
     if args.teacher_cache_rollouts < 32:
         parser.error("--teacher-cache-rollouts must be at least 32 for K=16 sampling from cache[32]")
     if args.teacher_cache_seed < 0:
@@ -1016,6 +1026,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--teacher-cache-save-workers must be >= 0")
     if args.teacher_cache_gpus_per_pod < 1:
         parser.error("--teacher-cache-gpus-per-pod must be >= 1")
+    if args.sync_teacher_cache and len(args.pods) < 2 and not args.stop:
+        parser.error("--sync-teacher-cache requires at least two pods")
     return args
 
 
@@ -1054,7 +1066,7 @@ def main() -> int:
                     print(f"[launcher] syncing teacher cache to {args.pods[1]}")
                     sync_directory(args, args.pods[0], args.pods[1], args.teacher_cache_root)
 
-    print("[launcher] validating teacher cache on both pods")
+    print("[launcher] validating teacher cache on configured pod(s)")
     validate_started = time.monotonic()
     run_pod_scripts_parallel(
         args,

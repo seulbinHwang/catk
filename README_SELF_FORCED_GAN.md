@@ -104,6 +104,70 @@ torchrun --standalone --nproc_per_node=6 -m src.run \
   ckpt_path=<path-to-2s-pretrain.ckpt>
 ```
 
+## hsb-npc-training-1 H100x6 단일 pod 실행
+
+`hsb-npc-training-1`처럼 H100 80GB 6장이 한 pod에 있는 경우는 V100x4x2 멀티노드와 다르게
+노드 간 rendezvous와 teacher cache sync가 필요 없습니다. 전용 launcher는 같은
+Set-level Self-Forced GAN objective와 같은 pinned pretrain checkpoint를 쓰되, H100에 맞춰
+`self_forced_gan_h100_6` preset, `bf16-mixed`, `nproc_per_node=6`, rank당 train microbatch 2를
+기본값으로 둡니다.
+
+| 항목 | 값 |
+|---|---:|
+| node/GPU | 1 node x 6 H100 = 6 ranks |
+| precision | `bf16-mixed` |
+| train microbatch | rank당 2 scene |
+| effective train scene batch | 12 scene / step |
+| teacher/student set | K=16 유지 |
+| teacher cache | scene당 32 rollout 유지 |
+| teacher cache build | 6 GPU shard, pod 내부 merge |
+| validation rollout | 32 |
+
+cache smoke는 32 scene만 만들어 launcher, checkpoint, teacher cache builder, cache validator를
+먼저 확인합니다.
+
+```bash
+python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py \
+  --build-teacher-cache \
+  --build-cache-only \
+  --parallel-teacher-cache \
+  --teacher-cache-max-scenes 32 \
+  --teacher-cache-batch-size 32 \
+  --teacher-cache-rollout-batch-size 32 \
+  --replace
+```
+
+cache smoke가 끝난 뒤 같은 smoke cache root로 1 train batch를 통과시킵니다.
+
+```bash
+python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py \
+  --skip-pretrain-download \
+  --teacher-cache-max-scenes 32 \
+  --limit-train-batches 1 \
+  --disable-validation \
+  --max-epochs 1 \
+  --extra-hydra-overrides "data.shuffle=false data.train_epoch_sample_fraction=1.0" \
+  --task-name sf_gan_k16_h100x6_hsb_npc_training_1_smoke \
+  --session catk-sf-gan-h100x6-hsb-npc-training-1-smoke \
+  --replace
+```
+
+전체 학습은 smoke 옵션인 `--teacher-cache-max-scenes`, `--limit-train-batches`,
+`--disable-validation`, `--max-epochs 1`, smoke용 task/session override를 제거하고 실행합니다.
+
+```bash
+python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py \
+  --build-teacher-cache \
+  --parallel-teacher-cache \
+  --replace
+```
+
+중지할 때는 pod를 삭제하지 말고 tmux session과 해당 task process만 종료합니다.
+
+```bash
+python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py --stop
+```
+
 ## svv + svvv V100x4x2 실행
 
 `svv`, `svvv`는 각각 V100 32GB 4장이라 H100 preset을 그대로 쓰지 않습니다. 전용 preset은
