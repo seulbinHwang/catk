@@ -44,6 +44,7 @@ RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-134,143}"
 MAX_NON_OOM_RETRIES="${MAX_NON_OOM_RETRIES:-3}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-}"
+ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
@@ -164,6 +165,9 @@ start_attempt() {
   fi
   if [[ -n "$VAL_BATCH_SIZE" ]]; then
     cmd+=(--val-batch-size "$VAL_BATCH_SIZE")
+  fi
+  if [[ -n "$ACCUMULATE_GRAD_BATCHES" ]]; then
+    cmd+=(--accumulate-grad-batches "$ACCUMULATE_GRAD_BATCHES")
   fi
   if [[ -n "$LIMIT_TRAIN_BATCHES" ]]; then
     cmd+=(--limit-train-batches "$LIMIT_TRAIN_BATCHES")

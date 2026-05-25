@@ -34,6 +34,7 @@ DEFAULT_TASK_NAME = (
 )
 DEFAULT_SESSION = "catk-control-pretrain-v100x4x2-sv-svv-execctx-balanced"
 DEFAULT_INITIAL_BS = 4
+DEFAULT_ACCUMULATE_GRAD_BATCHES = ""
 
 
 def shq(value: object) -> str:
@@ -113,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--max-epochs", default="")
+    parser.add_argument("--accumulate-grad-batches", default=DEFAULT_ACCUMULATE_GRAD_BATCHES)
     parser.add_argument("--check-val-every-n-epoch", type=int, default=16)
     parser.add_argument(
         "--extra-hydra-overrides",
@@ -270,6 +272,7 @@ def retry_environment(args: argparse.Namespace) -> dict[str, str]:
             "POLL_INTERVAL": str(args.poll_interval),
             "LEARNING_RATE": str(args.learning_rate),
             "VAL_BATCH_SIZE": str(args.val_batch_size),
+            "ACCUMULATE_GRAD_BATCHES": str(args.accumulate_grad_batches),
             "REMOTE_ENV_OVERRIDES": remote_env_overrides(args),
             "LIMIT_TRAIN_BATCHES": str(args.limit_train_batches),
             "LIMIT_VAL_BATCHES": str(args.limit_val_batches),
@@ -305,6 +308,7 @@ def print_retry_command(args: argparse.Namespace) -> None:
         "POLL_INTERVAL",
         "LEARNING_RATE",
         "VAL_BATCH_SIZE",
+        "ACCUMULATE_GRAD_BATCHES",
         "REMOTE_ENV_OVERRIDES",
         "LIMIT_TRAIN_BATCHES",
         "LIMIT_VAL_BATCHES",

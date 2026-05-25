@@ -11,8 +11,8 @@
 # Differences from the H100x6 4+2 recipe documented in README:
 #   * homogeneous 2 pod x 4 GPU layout, world size 8;
 #   * V100-safe `precision=16-mixed` instead of bf16;
-#   * conservative per-GPU train batch 3 with OOM fallback in the launcher;
-#   * lower LR scaled for the smaller starting global batch, 3 * 8 = 24;
+#   * conservative per-GPU train batch 2 with OOM fallback in the launcher;
+#   * gradient accumulation 7, so the optimizer-step batch is 2 * 8 * 7 = 112;
 #   * lower fit-time closed-loop rollout count to keep V100 validation memory
 #     below the 32GB device limit.
 
@@ -30,13 +30,14 @@ trainer:
   devices: 4
   num_nodes: 2
   precision: 16-mixed
+  accumulate_grad_batches: 7
   check_val_every_n_epoch: 16
   max_epochs: 64
   strategy:
     find_unused_parameters: true
 
 data:
-  train_batch_size: 3
+  train_batch_size: 2
   val_batch_size: 4
   test_batch_size: 4
   num_workers: 2
