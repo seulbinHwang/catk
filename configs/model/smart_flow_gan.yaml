@@ -65,6 +65,8 @@ model_config:
     manual_accumulate_grad_batches: 1
     map_query_chunk_size: 16
     interaction_query_chunk_size: 16
+    map_sender_chunk_size: 0
+    interaction_sender_chunk_size: 0
     ema_weight: 0.99
     ema_start_step: 50
     detach_block_transition: false

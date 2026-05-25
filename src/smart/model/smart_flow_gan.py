@@ -103,6 +103,10 @@ class SMARTFlowGAN(SMARTFlow):
         self.gan_interaction_query_chunk_size = int(
             _cfg(self.self_forced_gan_config, "interaction_query_chunk_size", 16)
         )
+        self.gan_map_sender_chunk_size = int(_cfg(self.self_forced_gan_config, "map_sender_chunk_size", 0))
+        self.gan_interaction_sender_chunk_size = int(
+            _cfg(self.self_forced_gan_config, "interaction_sender_chunk_size", 0)
+        )
         self.gan_ema_weight = float(_cfg(self.self_forced_gan_config, "ema_weight", 0.99))
         self.gan_ema_start_step = int(_cfg(self.self_forced_gan_config, "ema_start_step", 50))
         self.gan_student_unfrozen_range = str(
@@ -136,6 +140,8 @@ class SMARTFlowGAN(SMARTFlow):
             interaction_radius_m=float(model_config.decoder.a2a_radius),
             map_query_chunk_size=self.gan_map_query_chunk_size,
             interaction_query_chunk_size=self.gan_interaction_query_chunk_size,
+            map_sender_chunk_size=self.gan_map_sender_chunk_size,
+            interaction_sender_chunk_size=self.gan_interaction_sender_chunk_size,
         )
         self.gan_generator_ema = copy.deepcopy(self.encoder)
         self.gan_generator_ema.requires_grad_(False)
@@ -611,6 +617,8 @@ class SMARTFlowGAN(SMARTFlow):
                 f"manual_accumulate_grad_batches={self.gan_manual_accumulate_grad_batches}, "
                 f"map_query_chunk_size={self.gan_map_query_chunk_size}, "
                 f"interaction_query_chunk_size={self.gan_interaction_query_chunk_size}, "
+                f"map_sender_chunk_size={self.gan_map_sender_chunk_size}, "
+                f"interaction_sender_chunk_size={self.gan_interaction_sender_chunk_size}, "
                 f"critic_trainable_params={self.gan_discriminator.count_trainable_parameters()}",
                 flush=True,
             )

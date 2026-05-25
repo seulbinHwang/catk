@@ -179,7 +179,14 @@ def _build_relation_features(
 class RadiusAttentionLayer(nn.Module):
     """radius mask와 기하 relation bias를 쓰는 작은 multi-head attention입니다."""
 
-    def __init__(self, hidden_dim: int, *, num_heads: int = 4, relation_dim: int = 3) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        relation_dim: int = 3,
+        sender_chunk_size: int = 0,
+    ) -> None:
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}.")
@@ -187,6 +194,7 @@ class RadiusAttentionLayer(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = hidden_dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.sender_chunk_size = max(0, int(sender_chunk_size))
 
         self.query = nn.Linear(hidden_dim, hidden_dim)
         self.key = nn.Linear(hidden_dim, hidden_dim)
@@ -198,6 +206,74 @@ class RadiusAttentionLayer(nn.Module):
         )
         self.output = nn.Linear(hidden_dim, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
+
+    def _streaming_context(
+        self,
+        *,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        relation: Tensor,
+        attention_mask: Tensor,
+    ) -> Tensor:
+        """sender chunk 단위의 stable softmax attention context를 계산합니다."""
+        bsz, n_rollout, n_endpoint, n_query, n_head, head_dim = q.shape
+        n_sender = k.shape[3]
+        chunk_size = max(1, self.sender_chunk_size)
+        device = q.device
+        max_logit = torch.full(
+            (bsz, n_rollout, n_endpoint, n_query, n_head),
+            -torch.inf,
+            device=device,
+            dtype=torch.float32,
+        )
+        normalizer = torch.zeros_like(max_logit)
+        accumulator = torch.zeros(
+            bsz,
+            n_rollout,
+            n_endpoint,
+            n_query,
+            n_head,
+            head_dim,
+            device=device,
+            dtype=torch.float32,
+        )
+        for start in range(0, n_sender, chunk_size):
+            end = min(start + chunk_size, n_sender)
+            logits = torch.einsum("bkeqhd,bkeshd->bkeqsh", q, k[..., start:end, :, :]).float()
+            logits = logits * self.scale
+            logits = logits + self.relation_bias(relation[..., start:end, :]).float()
+            mask = attention_mask[..., start:end].unsqueeze(-1)
+            masked_logits = logits.masked_fill(~mask, -torch.inf)
+
+            chunk_max = masked_logits.amax(dim=4)
+            safe_chunk_max = torch.where(torch.isfinite(chunk_max), chunk_max, torch.zeros_like(chunk_max))
+            exp_logits = torch.exp(masked_logits - safe_chunk_max.unsqueeze(4))
+            exp_logits = exp_logits * mask.to(dtype=exp_logits.dtype)
+            chunk_sum = exp_logits.sum(dim=4)
+            chunk_context = torch.einsum(
+                "bkeqsh,bkeshd->bkeqhd",
+                exp_logits,
+                v[..., start:end, :, :].float(),
+            )
+
+            next_max = torch.maximum(max_logit, chunk_max)
+            safe_next_max = torch.where(torch.isfinite(next_max), next_max, torch.zeros_like(next_max))
+            old_scale = torch.where(
+                torch.isfinite(max_logit),
+                torch.exp(max_logit - safe_next_max),
+                torch.zeros_like(max_logit),
+            )
+            chunk_scale = torch.where(
+                torch.isfinite(chunk_max),
+                torch.exp(chunk_max - safe_next_max),
+                torch.zeros_like(chunk_max),
+            )
+            accumulator = accumulator * old_scale.unsqueeze(-1) + chunk_context * chunk_scale.unsqueeze(-1)
+            normalizer = normalizer * old_scale + chunk_sum * chunk_scale
+            max_logit = next_max
+
+        return accumulator / normalizer.clamp_min(1.0e-6).unsqueeze(-1)
 
     def forward(
         self,
@@ -232,15 +308,23 @@ class RadiusAttentionLayer(nn.Module):
             bsz, n_rollout, n_endpoint, n_sender, self.num_heads, self.head_dim
         )
 
-        logits = torch.einsum("bkeqhd,bkeshd->bkeqsh", q, k) * self.scale
-        logits = logits + self.relation_bias(relation)
-        mask = attention_mask.unsqueeze(-1)
-        masked_logits = logits.masked_fill(~mask, -1.0e4)
-        weights = torch.softmax(masked_logits, dim=4)
-        weights = weights * mask.to(dtype=weights.dtype)
-        weights = weights / weights.sum(dim=4, keepdim=True).clamp_min(1.0e-6)
-
-        context = torch.einsum("bkeqsh,bkeshd->bkeqhd", weights, v)
+        if self.sender_chunk_size > 0 and n_sender > self.sender_chunk_size:
+            context = self._streaming_context(
+                q=q,
+                k=k,
+                v=v,
+                relation=relation,
+                attention_mask=attention_mask,
+            ).to(dtype=query_token.dtype)
+        else:
+            logits = torch.einsum("bkeqhd,bkeshd->bkeqsh", q, k) * self.scale
+            logits = logits + self.relation_bias(relation)
+            mask = attention_mask.unsqueeze(-1)
+            masked_logits = logits.masked_fill(~mask, -1.0e4)
+            weights = torch.softmax(masked_logits, dim=4)
+            weights = weights * mask.to(dtype=weights.dtype)
+            weights = weights / weights.sum(dim=4, keepdim=True).clamp_min(1.0e-6)
+            context = torch.einsum("bkeqsh,bkeshd->bkeqhd", weights, v)
         context = context.reshape(bsz, n_rollout, n_endpoint, n_query, hidden_dim)
         return self.norm(query_token + self.output(context))
 
@@ -280,11 +364,17 @@ class MapComplianceEncoder(nn.Module):
         radius_m: float = 30.0,
         num_heads: int = 4,
         query_chunk_size: int = 16,
+        sender_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
         self.query_chunk_size = max(1, int(query_chunk_size))
-        self.attention = RadiusAttentionLayer(hidden_dim, num_heads=num_heads, relation_dim=3)
+        self.attention = RadiusAttentionLayer(
+            hidden_dim,
+            num_heads=num_heads,
+            relation_dim=3,
+            sender_chunk_size=sender_chunk_size,
+        )
         self.endpoint_pool = EndpointPool(hidden_dim)
 
     def forward(
@@ -351,11 +441,17 @@ class InteractionEncoder(nn.Module):
         radius_m: float = 60.0,
         num_heads: int = 4,
         query_chunk_size: int = 16,
+        sender_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
         self.query_chunk_size = max(1, int(query_chunk_size))
-        self.attention = RadiusAttentionLayer(hidden_dim, num_heads=num_heads, relation_dim=3)
+        self.attention = RadiusAttentionLayer(
+            hidden_dim,
+            num_heads=num_heads,
+            relation_dim=3,
+            sender_chunk_size=sender_chunk_size,
+        )
         self.endpoint_pool = EndpointPool(hidden_dim)
 
     def forward(
@@ -426,6 +522,8 @@ class SelfForcedGANDiscriminator(nn.Module):
         num_attention_heads: int = 4,
         map_query_chunk_size: int = 16,
         interaction_query_chunk_size: int = 16,
+        map_sender_chunk_size: int = 0,
+        interaction_sender_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -450,12 +548,14 @@ class SelfForcedGANDiscriminator(nn.Module):
             radius_m=map_radius_m,
             num_heads=num_attention_heads,
             query_chunk_size=map_query_chunk_size,
+            sender_chunk_size=map_sender_chunk_size,
         )
         self.interaction_encoder = InteractionEncoder(
             hidden_dim=hidden_dim,
             radius_m=interaction_radius_m,
             num_heads=num_attention_heads,
             query_chunk_size=interaction_query_chunk_size,
+            sender_chunk_size=interaction_sender_chunk_size,
         )
         self.agent_pool = PoolingProjection(hidden_dim * 4, hidden_dim)
         self.scalar_head = nn.Sequential(
