@@ -61,6 +61,18 @@ def _parse_args() -> argparse.Namespace:
             "Defaults to --rollouts-per-scene."
         ),
     )
+    parser.add_argument(
+        "--data-num-workers",
+        type=int,
+        default=0,
+        help="DataLoader workers used by each cache builder process.",
+    )
+    parser.add_argument(
+        "--data-prefetch-factor",
+        type=int,
+        default=2,
+        help="DataLoader prefetch factor when --data-num-workers is positive.",
+    )
     parser.add_argument("--num-shards", type=int, default=1, help="Total number of cache builder shards.")
     parser.add_argument("--shard-index", type=int, default=0, help="This builder shard index.")
     parser.add_argument("--seed", type=int, default=817)
@@ -245,6 +257,8 @@ def _manifest_payload(
             "amp_dtype": str(args.amp_dtype),
             "num_shards": int(args.num_shards),
             "shard_index": int(args.shard_index),
+            "data_num_workers": int(args.data_num_workers),
+            "data_prefetch_factor": int(args.data_prefetch_factor),
         },
         "dataset": {
             "split": "val" if args.split == "validation" else str(args.split),
@@ -332,10 +346,10 @@ def _default_overrides(args: argparse.Namespace) -> list[str]:
         f"data.val_batch_size={int(args.batch_size)}",
         f"data.test_batch_size={int(args.batch_size)}",
         "data.shuffle=false",
-        "data.num_workers=0",
-        "data.prefetch_factor=null",
+        f"data.num_workers={int(args.data_num_workers)}",
+        f"data.prefetch_factor={int(args.data_prefetch_factor) if int(args.data_num_workers) > 0 else 'null'}",
         "data.pin_memory=false",
-        "data.persistent_workers=false",
+        f"data.persistent_workers={'true' if int(args.data_num_workers) > 0 else 'false'}",
         "data.train_use_eval_agent_selection=true",
         "data.train_epoch_sample_fraction=1.0",
         "data.train_memory_balanced_batches=false",
@@ -380,11 +394,44 @@ def _load_teacher_checkpoint(model: torch.nn.Module, ckpt_path: Path, checkpoint
         )
 
 
-def _select_dataloader(datamodule: Any, split: str):
+def _loader_kwargs_from_datamodule(datamodule: Any) -> dict[str, Any]:
+    kwargs = {
+        "num_workers": int(getattr(datamodule, "num_workers", 0)),
+        "pin_memory": bool(getattr(datamodule, "pin_memory", False)),
+        "persistent_workers": bool(getattr(datamodule, "persistent_workers", False)),
+    }
+    prefetch_factor = getattr(datamodule, "prefetch_factor", None)
+    if prefetch_factor is not None:
+        kwargs["prefetch_factor"] = int(prefetch_factor)
+    return kwargs
+
+
+def _select_dataloader(datamodule: Any, split: str, *, args: argparse.Namespace):
     normalized = "val" if split == "validation" else split
     stage = {"train": "fit", "val": "validate", "test": "test"}[normalized]
     datamodule.setup(stage)
     if normalized == "train":
+        if int(args.num_shards) > 1:
+            from torch_geometric.loader import DataLoader
+
+            from src.smart.datamodules.exact_distributed_sampler import ExactDistributedSampler
+
+            dataset = getattr(datamodule, "train_dataset")
+            sampler = ExactDistributedSampler(
+                dataset=dataset,
+                num_replicas=int(args.num_shards),
+                rank=int(args.shard_index),
+                shuffle=False,
+                seed=int(args.seed),
+            )
+            return DataLoader(
+                dataset,
+                batch_size=int(args.batch_size),
+                shuffle=False,
+                sampler=sampler,
+                drop_last=False,
+                **_loader_kwargs_from_datamodule(datamodule),
+            )
         return datamodule.train_dataloader()
     if normalized == "val":
         return datamodule.val_dataloader()
@@ -628,7 +675,7 @@ def _sample_teacher_rollout_pose_chunk(
     return pose
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def _generate_batch_rollout_set(
     *,
     model: Any,
@@ -840,6 +887,10 @@ def main() -> None:
         raise ValueError("--rollouts-per-scene must be positive.")
     if args.batch_size <= 0:
         raise ValueError("--batch-size must be positive.")
+    if args.data_num_workers < 0:
+        raise ValueError("--data-num-workers must be non-negative.")
+    if args.data_prefetch_factor <= 0:
+        raise ValueError("--data-prefetch-factor must be positive.")
     if args.num_shards <= 0:
         raise ValueError("--num-shards must be positive.")
     if not 0 <= args.shard_index < args.num_shards:
@@ -868,7 +919,7 @@ def main() -> None:
     split_scene_count = None
 
     device = torch.device(args.device)
-    dataloader = _select_dataloader(datamodule, args.split)
+    dataloader = _select_dataloader(datamodule, args.split, args=args)
     split_scene_count = _dataset_scene_count(dataloader)
     identity = _cache_identity(
         args=args,

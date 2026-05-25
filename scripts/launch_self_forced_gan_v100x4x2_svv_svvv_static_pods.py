@@ -10,10 +10,12 @@ actual tmux multi-node run to ``launch_h100x4_multinode_pretrain_tmux.py``.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -307,6 +309,8 @@ def render_teacher_cache_build_script(args: argparse.Namespace, *, max_scenes: s
     skip_arg = " --skip-existing" if args.skip_existing_teacher_cache else ""
     batch_arg = f" --batch-size {int(args.teacher_cache_batch_size)}"
     rollout_batch_arg = f" --rollout-batch-size {int(args.teacher_cache_rollout_batch_size)}"
+    data_workers_arg = f" --data-num-workers {int(args.teacher_cache_data_num_workers)}"
+    prefetch_arg = f" --data-prefetch-factor {int(args.teacher_cache_data_prefetch_factor)}"
     return f"""set -Eeuo pipefail
 cd {shq(args.project_root)}
 if [[ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]]; then
@@ -327,6 +331,8 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
   --device cuda:0{max_arg}{skip_arg} \
   {batch_arg} \
   {rollout_batch_arg} \
+  {data_workers_arg} \
+  {prefetch_arg} \
   --override paths.cache_root="$CACHE_ROOT" \
   --override experiment={shq(args.experiment)}
 PYTHONPATH=. python tools/validate_self_forced_gan_cache.py "$TEACHER_GAN_CACHE_ROOT" --max-files {int(args.validate_cache_max_files)}
@@ -361,6 +367,8 @@ def render_parallel_teacher_cache_build_script(
                     "--device cuda:0",
                     f"--batch-size {int(args.teacher_cache_batch_size)}",
                     f"--rollout-batch-size {int(args.teacher_cache_rollout_batch_size)}",
+                    f"--data-num-workers {int(args.teacher_cache_data_num_workers)}",
+                    f"--data-prefetch-factor {int(args.teacher_cache_data_prefetch_factor)}",
                     f"--num-shards {int(num_shards)}",
                     f"--shard-index {int(shard_index)}",
                     max_arg,
@@ -414,6 +422,8 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
   --check-manifest{max_arg} \
   --batch-size {int(args.teacher_cache_batch_size)} \
   --rollout-batch-size {int(args.teacher_cache_rollout_batch_size)} \
+  --data-num-workers {int(args.teacher_cache_data_num_workers)} \
+  --data-prefetch-factor {int(args.teacher_cache_data_prefetch_factor)} \
   --override paths.cache_root="$CACHE_ROOT" \
   --override experiment={shq(args.experiment)}
 PYTHONPATH=. python tools/validate_self_forced_gan_cache.py "$TEACHER_GAN_CACHE_ROOT" --max-files {int(args.validate_cache_max_files)}
@@ -626,8 +636,32 @@ rm -f "$list_file"
         raise subprocess.CalledProcessError(dest.returncode, dest.args)
 
 
+def run_pod_scripts_parallel(
+    args: argparse.Namespace,
+    jobs: list[tuple[str, str]],
+    *,
+    label: str,
+) -> None:
+    if len(jobs) <= 1:
+        for pod, script in jobs:
+            exec_in_pod(args, pod, script)
+        return
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        futures = {
+            executor.submit(exec_in_pod, args, pod, script): pod
+            for pod, script in jobs
+        }
+        for future in as_completed(futures):
+            pod = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                raise RuntimeError(f"{label} failed on {pod}") from exc
+
+
 def build_teacher_cache_parallel(args: argparse.Namespace) -> None:
     num_shards = len(args.pods) * int(args.teacher_cache_gpus_per_pod)
+    started = time.monotonic()
     print(
         "[launcher] parallel teacher cache build "
         f"pods={len(args.pods)} gpus_per_pod={args.teacher_cache_gpus_per_pod} "
@@ -662,51 +696,81 @@ def build_teacher_cache_parallel(args: argparse.Namespace) -> None:
             failures[0][1],
             f"parallel teacher cache build failed: {failures}",
         )
+    print(
+        f"[launcher] teacher cache shard builders finished elapsed_sec={time.monotonic() - started:.1f}",
+        flush=True,
+    )
 
     if len(args.pods) > 1:
         if not args.sync_teacher_cache:
             raise ValueError("--parallel-teacher-cache with multiple pods requires --sync-teacher-cache.")
         shards_per_pod = int(args.teacher_cache_gpus_per_pod)
         print(f"[launcher] exchanging teacher cache shard files between {args.pods[0]} and {args.pods[1]}")
-        sync_teacher_cache_shards(
-            args,
-            args.pods[0],
-            args.pods[1],
-            shard_start=0,
-            shard_end=shards_per_pod,
-            num_shards=num_shards,
-        )
-        sync_teacher_cache_shards(
-            args,
-            args.pods[1],
-            args.pods[0],
-            shard_start=shards_per_pod,
-            shard_end=num_shards,
-            num_shards=num_shards,
+        sync_started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    sync_teacher_cache_shards,
+                    args,
+                    args.pods[0],
+                    args.pods[1],
+                    shard_start=0,
+                    shard_end=shards_per_pod,
+                    num_shards=num_shards,
+                ),
+                executor.submit(
+                    sync_teacher_cache_shards,
+                    args,
+                    args.pods[1],
+                    args.pods[0],
+                    shard_start=shards_per_pod,
+                    shard_end=num_shards,
+                    num_shards=num_shards,
+                ),
+            ]
+            for future in as_completed(futures):
+                future.result()
+        print(
+            f"[launcher] teacher cache shard exchange finished elapsed_sec={time.monotonic() - sync_started:.1f}",
+            flush=True,
         )
 
     print("[launcher] merging shard indexes on all cache pods")
-    for pod in args.pods:
-        exec_in_pod(
-            args,
-            pod,
-            render_merge_teacher_cache_index_script(args, num_shards=num_shards),
-        )
+    merge_started = time.monotonic()
+    run_pod_scripts_parallel(
+        args,
+        [
+            (pod, render_merge_teacher_cache_index_script(args, num_shards=num_shards))
+            for pod in args.pods
+        ],
+        label="teacher cache index merge",
+    )
+    print(
+        f"[launcher] teacher cache index merge finished elapsed_sec={time.monotonic() - merge_started:.1f}",
+        flush=True,
+    )
 
 
 def matching_teacher_cache_available(args: argparse.Namespace) -> bool:
     outputs = {}
-    for pod in args.pods:
-        try:
-            outputs[pod] = exec_in_pod(
+    with ThreadPoolExecutor(max_workers=len(args.pods)) as executor:
+        futures = {
+            executor.submit(
+                exec_in_pod,
                 args,
                 pod,
                 render_teacher_cache_manifest_check_script(args, max_scenes=args.teacher_cache_max_scenes),
                 capture=True,
-            )
-        except subprocess.CalledProcessError:
-            print(f"[launcher] no matching teacher cache manifest on {pod}", flush=True)
-            return False
+            ): pod
+            for pod in args.pods
+        }
+        for future in as_completed(futures):
+            pod = futures[future]
+            try:
+                outputs[pod] = future.result()
+            except subprocess.CalledProcessError:
+                print(f"[launcher] no matching teacher cache manifest on {pod}", flush=True)
+                return False
     for pod, output in outputs.items():
         if output:
             print(f"[launcher] matching teacher cache on {pod}:\n{output}", flush=True)
@@ -873,6 +937,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-cache-seed", type=int, default=817)
     parser.add_argument("--teacher-cache-batch-size", type=int, default=32)
     parser.add_argument("--teacher-cache-rollout-batch-size", type=int, default=32)
+    parser.add_argument("--teacher-cache-data-num-workers", type=int, default=2)
+    parser.add_argument("--teacher-cache-data-prefetch-factor", type=int, default=2)
     parser.add_argument("--teacher-cache-gpus-per-pod", type=int, default=4)
     parser.add_argument("--teacher-cache-sync-port", default="29720")
     parser.add_argument("--teacher-cache-direct-pod-sync", action=argparse.BooleanOptionalAction, default=True)
@@ -900,6 +966,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--teacher-cache-batch-size must be >= 1")
     if args.teacher_cache_rollout_batch_size < 1:
         parser.error("--teacher-cache-rollout-batch-size must be >= 1")
+    if args.teacher_cache_data_num_workers < 0:
+        parser.error("--teacher-cache-data-num-workers must be >= 0")
+    if args.teacher_cache_data_prefetch_factor < 1:
+        parser.error("--teacher-cache-data-prefetch-factor must be >= 1")
     if args.teacher_cache_gpus_per_pod < 1:
         parser.error("--teacher-cache-gpus-per-pod must be >= 1")
     return args
@@ -912,9 +982,12 @@ def main() -> int:
 
     if not args.skip_pretrain_download:
         target_pods = args.pods if args.parallel_teacher_cache else [args.pods[0]]
-        for pod in target_pods:
-            print(f"[launcher] preparing latest W&B pretrain checkpoint on {pod}")
-            exec_in_pod(args, pod, render_pretrain_download_script(args))
+        print(f"[launcher] preparing latest W&B pretrain checkpoint on {', '.join(target_pods)}")
+        run_pod_scripts_parallel(
+            args,
+            [(pod, render_pretrain_download_script(args)) for pod in target_pods],
+            label="pretrain checkpoint preparation",
+        )
 
     resolve_teacher_cache_root(args)
 
@@ -937,8 +1010,16 @@ def main() -> int:
                     sync_directory(args, args.pods[0], args.pods[1], args.teacher_cache_root)
 
     print("[launcher] validating teacher cache on both pods")
-    for pod in args.pods:
-        exec_in_pod(args, pod, render_cache_validate_script(args))
+    validate_started = time.monotonic()
+    run_pod_scripts_parallel(
+        args,
+        [(pod, render_cache_validate_script(args)) for pod in args.pods],
+        label="teacher cache validation",
+    )
+    print(
+        f"[launcher] teacher cache validation finished elapsed_sec={time.monotonic() - validate_started:.1f}",
+        flush=True,
+    )
     if args.build_cache_only:
         print("[launcher] build-cache-only requested; skipping multi-node training launch")
         return 0
