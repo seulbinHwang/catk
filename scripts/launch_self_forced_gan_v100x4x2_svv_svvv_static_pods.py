@@ -39,6 +39,7 @@ DEFAULT_MASTER_PORT = "29670"
 DEFAULT_CHECKPOINT_SYNC_PORT = "29671"
 DEFAULT_NPROC_PER_NODE = 4
 DEFAULT_TRAIN_BATCH_SIZE = 1
+DEFAULT_ACCUMULATE_GRAD_BATCHES = 12
 DEFAULT_VAL_BATCH_SIZE = 2
 DEFAULT_PRECISION = "16-mixed"
 DEFAULT_TEACHER_CACHE_GPUS_PER_POD = 4
@@ -885,6 +886,8 @@ def base_launcher_command(args: argparse.Namespace) -> list[str]:
         args.log_dir,
         "--train-batch-size",
         str(args.train_batch_size),
+        "--accumulate-grad-batches",
+        str(args.accumulate_grad_batches),
         "--val-batch-size",
         str(args.val_batch_size),
         "--max-epochs",
@@ -977,6 +980,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-sync-port", default=DEFAULT_CHECKPOINT_SYNC_PORT)
     parser.add_argument("--nproc-per-node", type=int, default=DEFAULT_NPROC_PER_NODE)
     parser.add_argument("--train-batch-size", type=int, default=DEFAULT_TRAIN_BATCH_SIZE)
+    parser.add_argument("--accumulate-grad-batches", type=int, default=DEFAULT_ACCUMULATE_GRAD_BATCHES)
     parser.add_argument("--val-batch-size", type=int, default=DEFAULT_VAL_BATCH_SIZE)
     parser.add_argument("--precision", default=DEFAULT_PRECISION)
     parser.add_argument("--max-epochs", default="6")
