@@ -26,6 +26,7 @@ model:
       interaction_sender_chunk_size: 0
       map_rollout_chunk_size: 1
       checkpoint_discriminator: true
+      resample_fake_for_generator: true
       sampling:
         backprop_last_k: 8
 

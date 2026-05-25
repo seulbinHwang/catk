@@ -112,6 +112,9 @@ class SMARTFlowGAN(SMARTFlow):
         self.gan_checkpoint_discriminator = bool(
             _cfg(self.self_forced_gan_config, "checkpoint_discriminator", False)
         )
+        self.gan_resample_fake_for_generator = bool(
+            _cfg(self.self_forced_gan_config, "resample_fake_for_generator", False)
+        )
         self.gan_ema_weight = float(_cfg(self.self_forced_gan_config, "ema_weight", 0.99))
         self.gan_ema_start_step = int(_cfg(self.self_forced_gan_config, "ema_start_step", 50))
         self.gan_student_unfrozen_range = str(
@@ -495,11 +498,11 @@ class SMARTFlowGAN(SMARTFlow):
         real_pose = self._load_gan_real_set(data, context)
 
         warmup_active = self._is_gan_warmup_active()
-        if warmup_active:
+        if warmup_active or self.gan_resample_fake_for_generator:
             with torch.no_grad():
-                fake_pose = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
+                fake_pose_for_d = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
         else:
-            fake_pose = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
+            fake_pose_for_d = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
 
         generator_optimizer, discriminator_optimizer = self.optimizers()
         accumulate = max(1, int(self.gan_manual_accumulate_grad_batches))
@@ -515,9 +518,9 @@ class SMARTFlowGAN(SMARTFlow):
 
             with torch.no_grad():
                 real_logit_value = self._gan_forward_discriminator(real_pose.detach(), context).detach()
-                fake_logit_value = self._gan_forward_discriminator(fake_pose.detach(), context).detach()
+                fake_logit_value = self._gan_forward_discriminator(fake_pose_for_d.detach(), context).detach()
 
-            fake_logit = self._gan_forward_discriminator_for_backward(fake_pose.detach(), context)
+            fake_logit = self._gan_forward_discriminator_for_backward(fake_pose_for_d.detach(), context)
             d_fake = relativistic_discriminator_loss(real_logit_value, fake_logit)
             fake_logit_for_margin = fake_logit.detach()
             with self._gan_backward_sync_context(step_accumulated):
@@ -540,7 +543,7 @@ class SMARTFlowGAN(SMARTFlow):
                 d_loss = d_loss + self.gan_r1_weight * r1_log
                 del r1
             if self.gan_r2_weight > 0.0:
-                r2 = self._compute_gan_finite_difference_regularizer(fake_pose, context)
+                r2 = self._compute_gan_finite_difference_regularizer(fake_pose_for_d, context)
                 r2_log = r2.detach()
                 with self._gan_backward_sync_context(step_accumulated):
                     self._manual_backward_without_autocast((self.gan_r2_weight * r2) / accumulate)
@@ -564,6 +567,11 @@ class SMARTFlowGAN(SMARTFlow):
             total_loss = d_loss.detach()
             g_loss = real_pose.new_zeros(())
         else:
+            if self.gan_resample_fake_for_generator:
+                del fake_pose_for_d
+                fake_pose = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
+            else:
+                fake_pose = fake_pose_for_d
             self.toggle_optimizer(generator_optimizer)
             try:
                 if accumulation_start:
@@ -651,6 +659,7 @@ class SMARTFlowGAN(SMARTFlow):
                 f"interaction_sender_chunk_size={self.gan_interaction_sender_chunk_size}, "
                 f"map_rollout_chunk_size={self.gan_map_rollout_chunk_size}, "
                 f"checkpoint_discriminator={self.gan_checkpoint_discriminator}, "
+                f"resample_fake_for_generator={self.gan_resample_fake_for_generator}, "
                 f"critic_trainable_params={self.gan_discriminator.count_trainable_parameters()}",
                 flush=True,
             )
