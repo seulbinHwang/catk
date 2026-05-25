@@ -42,6 +42,12 @@ DEFAULT_TRAIN_BATCH_SIZE = 1
 DEFAULT_VAL_BATCH_SIZE = 2
 DEFAULT_PRECISION = "16-mixed"
 DEFAULT_TEACHER_CACHE_GPUS_PER_POD = 4
+DEFAULT_TEACHER_CACHE_BATCH_SIZE = 32
+DEFAULT_TEACHER_CACHE_ROLLOUT_BATCH_SIZE = 32
+DEFAULT_TEACHER_CACHE_DATA_NUM_WORKERS = 0
+DEFAULT_TEACHER_CACHE_DATA_PREFETCH_FACTOR = 2
+DEFAULT_TEACHER_CACHE_SAVE_WORKERS = 4
+DEFAULT_TEACHER_CACHE_AMP_DTYPE = "float16"
 DEFAULT_WANDB_ENTITY = "jksg01019-naver-labs"
 DEFAULT_WANDB_PROJECT = "SMART-FLOW"
 DEFAULT_WANDB_PRETRAIN_TASK = (
@@ -356,6 +362,7 @@ def render_teacher_cache_build_script(args: argparse.Namespace, *, max_scenes: s
     data_workers_arg = f" --data-num-workers {int(args.teacher_cache_data_num_workers)}"
     prefetch_arg = f" --data-prefetch-factor {int(args.teacher_cache_data_prefetch_factor)}"
     save_workers_arg = f" --save-workers {int(args.teacher_cache_save_workers)}"
+    amp_dtype_arg = f" --amp-dtype {shq(args.teacher_cache_amp_dtype)}"
     return f"""set -Eeuo pipefail
 cd {shq(args.project_root)}
 if [[ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]]; then
@@ -372,7 +379,7 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
   --rollouts-per-scene {int(args.teacher_cache_rollouts)} \
   --seed {int(args.teacher_cache_seed)} \
   --storage-dtype float16 \
-  --amp-dtype float16 \
+  {amp_dtype_arg} \
   --device cuda:0{max_arg}{skip_arg} \
   {batch_arg} \
   {rollout_batch_arg} \
@@ -409,7 +416,7 @@ def render_parallel_teacher_cache_build_script(
                     f"--rollouts-per-scene {int(args.teacher_cache_rollouts)}",
                     f"--seed {int(args.teacher_cache_seed)}",
                     "--storage-dtype float16",
-                    "--amp-dtype float16",
+                    f"--amp-dtype {shq(args.teacher_cache_amp_dtype)}",
                     "--device cuda:0",
                     f"--batch-size {int(args.teacher_cache_batch_size)}",
                     f"--rollout-batch-size {int(args.teacher_cache_rollout_batch_size)}",
@@ -465,7 +472,7 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
   --rollouts-per-scene {int(args.teacher_cache_rollouts)} \
   --seed {int(args.teacher_cache_seed)} \
   --storage-dtype float16 \
-  --amp-dtype float16 \
+  --amp-dtype {shq(args.teacher_cache_amp_dtype)} \
   --check-manifest{max_arg} \
   --batch-size {int(args.teacher_cache_batch_size)} \
   --rollout-batch-size {int(args.teacher_cache_rollout_batch_size)} \
@@ -986,12 +993,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--teacher-cache-rollouts", type=int, default=32)
     parser.add_argument("--teacher-cache-seed", type=int, default=817)
-    parser.add_argument("--teacher-cache-batch-size", type=int, default=32)
-    parser.add_argument("--teacher-cache-rollout-batch-size", type=int, default=32)
-    parser.add_argument("--teacher-cache-data-num-workers", type=int, default=0)
-    parser.add_argument("--teacher-cache-data-prefetch-factor", type=int, default=2)
-    parser.add_argument("--teacher-cache-save-workers", type=int, default=4)
+    parser.add_argument("--teacher-cache-batch-size", type=int, default=DEFAULT_TEACHER_CACHE_BATCH_SIZE)
+    parser.add_argument("--teacher-cache-rollout-batch-size", type=int, default=DEFAULT_TEACHER_CACHE_ROLLOUT_BATCH_SIZE)
+    parser.add_argument("--teacher-cache-data-num-workers", type=int, default=DEFAULT_TEACHER_CACHE_DATA_NUM_WORKERS)
+    parser.add_argument(
+        "--teacher-cache-data-prefetch-factor",
+        type=int,
+        default=DEFAULT_TEACHER_CACHE_DATA_PREFETCH_FACTOR,
+    )
+    parser.add_argument("--teacher-cache-save-workers", type=int, default=DEFAULT_TEACHER_CACHE_SAVE_WORKERS)
     parser.add_argument("--teacher-cache-gpus-per-pod", type=int, default=DEFAULT_TEACHER_CACHE_GPUS_PER_POD)
+    parser.add_argument(
+        "--teacher-cache-amp-dtype",
+        choices=("none", "float16", "bfloat16"),
+        default=DEFAULT_TEACHER_CACHE_AMP_DTYPE,
+    )
     parser.add_argument("--teacher-cache-sync-port", default="29720")
     parser.add_argument("--teacher-cache-direct-pod-sync", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--parallel-teacher-cache", action="store_true")

@@ -121,6 +121,9 @@ Set-level Self-Forced GAN objective와 같은 pinned pretrain checkpoint를 쓰�
 | teacher/student set | K=16 유지 |
 | teacher cache | scene당 32 rollout 유지 |
 | teacher cache build | 6 GPU shard, pod 내부 merge |
+| cache build batch | GPU당 scene batch 32, rollout batch 32 |
+| cache build workers | GPU process당 data workers 2, save workers 8 |
+| cache build AMP | `float16` |
 | validation rollout | 32 |
 
 cache smoke는 32 scene만 만들어 launcher, checkpoint, teacher cache builder, cache validator를
@@ -134,6 +137,9 @@ python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py \
   --teacher-cache-max-scenes 32 \
   --teacher-cache-batch-size 32 \
   --teacher-cache-rollout-batch-size 32 \
+  --teacher-cache-data-num-workers 2 \
+  --teacher-cache-save-workers 8 \
+  --teacher-cache-amp-dtype float16 \
   --replace
 ```
 
@@ -161,6 +167,11 @@ python scripts/launch_self_forced_gan_h100x6_hsb_npc_training_1_static_pod.py \
   --parallel-teacher-cache \
   --replace
 ```
+
+H100x6 단일 pod에서 1536 scene smoke cache로 측정한 결과, GPU당 batch를 64/96으로 키우거나
+bf16 AMP를 쓰는 것보다 scene batch 32, rollout batch 32, data workers 2, save workers 8,
+float16 AMP가 가장 빨랐습니다. 이 설정은 checkpoint, seed, rollout 수, scenario index를 바꾸지
+않으므로 cache 의미는 유지하고, DataLoader/저장 병렬도만 H100x6 pod에 맞춰 더 씁니다.
 
 중지할 때는 pod를 삭제하지 말고 tmux session과 해당 task process만 종료합니다.
 
