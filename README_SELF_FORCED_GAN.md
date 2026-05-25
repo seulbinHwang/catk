@@ -109,15 +109,15 @@ torchrun --standalone --nproc_per_node=6 -m src.run \
 `hsb-npc-training-1`처럼 H100 80GB 6장이 한 pod에 있는 경우는 V100x4x2 멀티노드와 다르게
 노드 간 rendezvous와 teacher cache sync가 필요 없습니다. 전용 launcher는 같은
 Set-level Self-Forced GAN objective와 같은 pinned pretrain checkpoint를 쓰되, H100에 맞춰
-`self_forced_gan_h100_6` preset, `bf16-mixed`, `nproc_per_node=6`, rank당 train microbatch 2를
+`self_forced_gan_h100_6` preset, `bf16-mixed`, `nproc_per_node=6`, rank당 train microbatch 1을
 기본값으로 둡니다.
 
 | 항목 | 값 |
 |---|---:|
 | node/GPU | 1 node x 6 H100 = 6 ranks |
 | precision | `bf16-mixed` |
-| train microbatch | rank당 2 scene |
-| effective train scene batch | 12 scene / step |
+| train microbatch | rank당 1 scene |
+| effective train scene batch | 6 scene / step |
 | teacher/student set | K=16 유지 |
 | teacher cache | scene당 32 rollout 유지 |
 | teacher cache build | 6 GPU shard, pod 내부 merge |
@@ -172,6 +172,13 @@ H100x6 단일 pod에서 1536 scene smoke cache로 측정한 결과, GPU당 batch
 bf16 AMP를 쓰는 것보다 scene batch 32, rollout batch 32, data workers 2, save workers 8,
 float16 AMP가 가장 빨랐습니다. 이 설정은 checkpoint, seed, rollout 수, scenario index를 바꾸지
 않으므로 cache 의미는 유지하고, DataLoader/저장 병렬도만 H100x6 pod에 맞춰 더 씁니다.
+
+Fine-tuning train batch는 full teacher cache와 실제 H100x6 DDP 경로에서 OOM 경계를 probe한
+결과 rank당 1 scene으로 고정합니다. Rank당 3 scene은 첫 backward에서 CUDA OOM이 발생했고,
+rank당 2 scene도 8-batch stability probe 중 CUDA OOM이 발생했습니다. Rank당 1 scene은
+16 train batch stability probe를 status 0으로 통과했고, 해당 probe의
+`worst_peak_reserved_pct_epoch_max`는 33.56%였습니다. 따라서 epoch 전체 안정성을 우선하는
+기본값은 `train_batch_size=1`입니다.
 
 중지할 때는 pod를 삭제하지 말고 tmux session과 해당 task process만 종료합니다.
 

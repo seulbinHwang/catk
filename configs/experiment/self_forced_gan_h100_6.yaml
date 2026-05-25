@@ -73,9 +73,9 @@ callbacks:
 
 data:
   # GAN fine-tuning은 scene x rollout set이 실제 batch 단위입니다.
-  # per-GPU microbatch는 OOM이 안 나는 범위에서 1~2부터 probe하고,
-  # multi-node global scene batch가 64~128이 되도록 GPU 수를 늘립니다.
-  train_batch_size: 2
+  # hsb-npc-training-1 H100x6에서는 rank당 2 scene도 multi-batch probe 중
+  # CUDA OOM이 발생했으므로, epoch 안정성을 우선해 rank당 1 scene을 기본값으로 둡니다.
+  train_batch_size: 1
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
