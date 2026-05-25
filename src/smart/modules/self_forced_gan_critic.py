@@ -232,7 +232,7 @@ class RadiusAttentionLayer(nn.Module):
             bsz, n_rollout, n_endpoint, n_sender, self.num_heads, self.head_dim
         )
 
-        logits = (q.unsqueeze(4) * k.unsqueeze(3)).sum(dim=-1) * self.scale
+        logits = torch.einsum("bkeqhd,bkeshd->bkeqsh", q, k) * self.scale
         logits = logits + self.relation_bias(relation)
         mask = attention_mask.unsqueeze(-1)
         masked_logits = logits.masked_fill(~mask, -1.0e4)
@@ -240,7 +240,7 @@ class RadiusAttentionLayer(nn.Module):
         weights = weights * mask.to(dtype=weights.dtype)
         weights = weights / weights.sum(dim=4, keepdim=True).clamp_min(1.0e-6)
 
-        context = (weights.unsqueeze(-1) * v.unsqueeze(3)).sum(dim=4)
+        context = torch.einsum("bkeqsh,bkeshd->bkeqhd", weights, v)
         context = context.reshape(bsz, n_rollout, n_endpoint, n_query, hidden_dim)
         return self.norm(query_token + self.output(context))
 
