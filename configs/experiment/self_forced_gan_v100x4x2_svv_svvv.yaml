@@ -22,7 +22,7 @@ model:
       manual_accumulate_grad_batches: 12
       map_query_chunk_size: 1
       interaction_query_chunk_size: 4
-      map_sender_chunk_size: 64
+      map_sender_chunk_size: 512
       interaction_sender_chunk_size: 0
       map_rollout_chunk_size: 1
       sampling:
