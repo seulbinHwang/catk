@@ -439,11 +439,11 @@ class SMARTFlowGAN(SMARTFlow):
         return int(batch_idx) % accumulate == 0
 
     def _gan_backward_sync_context(self, should_step: bool):
-        """DDP manual accumulation 중 non-step microbatch의 gradient sync를 생략합니다."""
-        strategy = getattr(getattr(self, "trainer", None), "strategy", None)
-        no_backward_sync = getattr(strategy, "no_backward_sync", None)
-        if callable(no_backward_sync):
-            return no_backward_sync(self, enabled=not bool(should_step))
+        """manual accumulation backward context입니다.
+
+        V100x4x2에서는 DDP ``no_sync``가 non-step microbatch의 bucket memory peak를
+        키워 rank별 OOM을 만들 수 있어 sync는 매 microbatch 유지합니다.
+        """
         return nullcontext()
 
     def _training_step_self_forced_gan(self, data, batch_idx):
