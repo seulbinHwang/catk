@@ -63,6 +63,8 @@ model_config:
     r2_weight: 0.1
     gradient_clip_val: 1.0
     manual_accumulate_grad_batches: 1
+    map_query_chunk_size: 16
+    interaction_query_chunk_size: 16
     ema_weight: 0.99
     ema_start_step: 50
     detach_block_transition: false

@@ -218,6 +218,8 @@ gradient accumulation 12는 `trainer.accumulate_grad_batches`가 아니라
 `self_forced_gan.manual_accumulate_grad_batches`로 적용합니다.
 V100 32GB에서는 DDP `no_sync`가 non-step microbatch의 순간 메모리 피크를 키울 수 있어,
 gradient sync는 매 microbatch 유지하고 optimizer step만 12 microbatch마다 수행합니다.
+또한 hard scene의 map/agent radius attention peak를 낮추기 위해 V100 preset은
+discriminator query chunk를 `16 -> 4`로 낮춰 계산합니다.
 
 | 항목 | svv + svvv 특화 대응 |
 |---|---|
