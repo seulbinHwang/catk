@@ -7,7 +7,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,6 +74,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=2,
         help="DataLoader prefetch factor when --data-num-workers is positive.",
+    )
+    parser.add_argument(
+        "--save-workers",
+        type=int,
+        default=4,
+        help="Background torch.save workers per cache builder process.",
     )
     parser.add_argument("--num-shards", type=int, default=1, help="Total number of cache builder shards.")
     parser.add_argument("--shard-index", type=int, default=0, help="This builder shard index.")
@@ -259,6 +267,7 @@ def _manifest_payload(
             "shard_index": int(args.shard_index),
             "data_num_workers": int(args.data_num_workers),
             "data_prefetch_factor": int(args.data_prefetch_factor),
+            "save_workers": int(args.save_workers),
         },
         "dataset": {
             "split": "val" if args.split == "validation" else str(args.split),
@@ -829,16 +838,22 @@ def _merge_shard_manifests(output_root: Path, *, num_shards: int, index_entries:
     )
 
 
-def _save_scene_cache(
+def _write_scene_payload(output_path: Path, payload: dict[str, Tensor]) -> None:
+    tmp_path = output_path.with_suffix(output_path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, output_path)
+
+
+def _save_scene_cache_cpu(
     *,
     output_root: Path,
-    index: dict[str, str],
     scenario_id: str,
-    rollout_set: Tensor,
-    data: Any,
-    anchor_mask: Tensor,
+    rollout_set_cpu: Tensor,
+    agent_batch_cpu: Tensor,
+    agent_id_cpu: Tensor,
+    agent_type_cpu: Tensor,
+    anchor_mask_cpu: Tensor,
     scene_index: int,
-    storage_dtype: torch.dtype,
     base_seed: int,
     rollouts_per_scene: int,
     overwrite: bool,
@@ -846,17 +861,15 @@ def _save_scene_cache(
     file_name = _sanitize_scenario_id(scenario_id) + ".pt"
     output_path = output_root / file_name
     if output_path.exists() and not overwrite:
-        index[str(scenario_id)] = file_name
         return False
 
-    agent_batch = data["agent"]["batch"]
-    scene_mask = agent_batch == int(scene_index)
-    scene_rollout = rollout_set[:, scene_mask].permute(0, 2, 1, 3).contiguous()
-    scene_valid = anchor_mask[scene_mask].detach().cpu()
+    scene_mask = agent_batch_cpu == int(scene_index)
+    scene_rollout = rollout_set_cpu[:, scene_mask].permute(0, 2, 1, 3).contiguous()
+    scene_valid = anchor_mask_cpu[scene_mask]
     payload = {
-        "rollout_pose": scene_rollout.detach().cpu().to(dtype=storage_dtype),
-        "agent_id": data["agent"]["id"][scene_mask].detach().cpu().long(),
-        "agent_type": data["agent"]["type"][scene_mask].detach().cpu().long(),
+        "rollout_pose": scene_rollout,
+        "agent_id": agent_id_cpu[scene_mask].long(),
+        "agent_type": agent_type_cpu[scene_mask].long(),
         "valid_mask": scene_valid.bool(),
         "seed": torch.tensor(
             [_stable_seed(base_seed, str(scenario_id), rollout_idx) for rollout_idx in range(rollouts_per_scene)],
@@ -867,10 +880,7 @@ def _save_scene_cache(
             dtype=torch.long,
         ),
     }
-    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, output_path)
-    index[str(scenario_id)] = file_name
+    _write_scene_payload(output_path, payload)
     return True
 
 
@@ -891,6 +901,8 @@ def main() -> None:
         raise ValueError("--data-num-workers must be non-negative.")
     if args.data_prefetch_factor <= 0:
         raise ValueError("--data-prefetch-factor must be positive.")
+    if args.save_workers < 0:
+        raise ValueError("--save-workers must be non-negative.")
     if args.num_shards <= 0:
         raise ValueError("--num-shards must be positive.")
     if not 0 <= args.shard_index < args.num_shards:
@@ -968,52 +980,92 @@ def main() -> None:
             args.shard_index < (args.max_scenes % args.num_shards)
         )
     started = time.monotonic()
-    for batch_index, data in enumerate(dataloader):
-        data = _to_device(data, device)
-        scenario_ids = _scenario_id_list(data["scenario_id"])
-        if skip_existing and all((output_root / (_sanitize_scenario_id(sid) + ".pt")).exists() for sid in scenario_ids):
-            for sid in scenario_ids:
-                index[str(sid)] = _sanitize_scenario_id(sid) + ".pt"
-            processed += len(scenario_ids)
-            if shard_max_scenes is not None and processed >= shard_max_scenes:
-                break
-            continue
+    save_executor = (
+        ThreadPoolExecutor(max_workers=int(args.save_workers))
+        if int(args.save_workers) > 0
+        else None
+    )
+    pending_saves: set[Future[bool]] = set()
+    max_pending_saves = max(1, int(args.save_workers) * 8)
 
-        rollout_set, anchor_mask = _generate_batch_rollout_set(
-            model=model,
-            data=data,
-            rollouts_per_scene=int(args.rollouts_per_scene),
-            base_seed=int(args.seed),
-            amp_dtype=str(args.amp_dtype),
-            rollout_batch_size=rollout_batch_size,
+    def drain_saves(*, block: bool) -> None:
+        nonlocal written, pending_saves
+        if not pending_saves:
+            return
+        done, pending = wait(
+            pending_saves,
+            return_when=ALL_COMPLETED if block else FIRST_COMPLETED,
         )
-        for scene_index, scenario_id in enumerate(scenario_ids):
+        pending_saves = set(pending)
+        for future in done:
+            written += int(future.result())
+
+    try:
+        for batch_index, data in enumerate(dataloader):
+            data = _to_device(data, device)
+            scenario_ids = _scenario_id_list(data["scenario_id"])
+            if skip_existing and all((output_root / (_sanitize_scenario_id(sid) + ".pt")).exists() for sid in scenario_ids):
+                for sid in scenario_ids:
+                    index[str(sid)] = _sanitize_scenario_id(sid) + ".pt"
+                processed += len(scenario_ids)
+                if shard_max_scenes is not None and processed >= shard_max_scenes:
+                    break
+                continue
+
+            rollout_set, anchor_mask = _generate_batch_rollout_set(
+                model=model,
+                data=data,
+                rollouts_per_scene=int(args.rollouts_per_scene),
+                base_seed=int(args.seed),
+                amp_dtype=str(args.amp_dtype),
+                rollout_batch_size=rollout_batch_size,
+            )
+            rollout_set_cpu = rollout_set.detach().cpu().to(dtype=storage_dtype)
+            agent_batch_cpu = data["agent"]["batch"].detach().cpu()
+            agent_id_cpu = data["agent"]["id"].detach().cpu()
+            agent_type_cpu = data["agent"]["type"].detach().cpu()
+            anchor_mask_cpu = anchor_mask.detach().cpu()
+            for scene_index, scenario_id in enumerate(scenario_ids):
+                if shard_max_scenes is not None and processed >= shard_max_scenes:
+                    break
+                file_name = _sanitize_scenario_id(str(scenario_id)) + ".pt"
+                index[str(scenario_id)] = file_name
+                save_kwargs = {
+                    "output_root": output_root,
+                    "scenario_id": str(scenario_id),
+                    "rollout_set_cpu": rollout_set_cpu,
+                    "agent_batch_cpu": agent_batch_cpu,
+                    "agent_id_cpu": agent_id_cpu,
+                    "agent_type_cpu": agent_type_cpu,
+                    "anchor_mask_cpu": anchor_mask_cpu,
+                    "scene_index": scene_index,
+                    "base_seed": int(args.seed),
+                    "rollouts_per_scene": int(args.rollouts_per_scene),
+                    "overwrite": not skip_existing,
+                }
+                if save_executor is None:
+                    written += int(_save_scene_cache_cpu(**save_kwargs))
+                else:
+                    pending_saves.add(save_executor.submit(_save_scene_cache_cpu, **save_kwargs))
+                    if len(pending_saves) >= max_pending_saves:
+                        drain_saves(block=False)
+                processed += 1
+            if batch_index == 0 or processed % 100 == 0:
+                drain_saves(block=False)
+                elapsed = time.monotonic() - started
+                print(
+                    f"[teacher_cache] processed={processed} written={written} "
+                    f"pending_saves={len(pending_saves)} elapsed_sec={elapsed:.1f} output_root={output_root}",
+                    flush=True,
+                )
             if shard_max_scenes is not None and processed >= shard_max_scenes:
                 break
-            did_write = _save_scene_cache(
-                output_root=output_root,
-                index=index,
-                scenario_id=str(scenario_id),
-                rollout_set=rollout_set,
-                data=data,
-                anchor_mask=anchor_mask,
-                scene_index=scene_index,
-                storage_dtype=storage_dtype,
-                base_seed=int(args.seed),
-                rollouts_per_scene=int(args.rollouts_per_scene),
-                overwrite=not skip_existing,
-            )
-            written += int(did_write)
-            processed += 1
-        if batch_index == 0 or processed % 100 == 0:
-            elapsed = time.monotonic() - started
-            print(
-                f"[teacher_cache] processed={processed} written={written} "
-                f"elapsed_sec={elapsed:.1f} output_root={output_root}",
-                flush=True,
-            )
-        if shard_max_scenes is not None and processed >= shard_max_scenes:
-            break
+    finally:
+        try:
+            drain_saves(block=True)
+        finally:
+            if save_executor is not None:
+                save_executor.shutdown(wait=True)
 
     _write_index(index_path, index)
     manifest_path = output_root / MANIFEST_NAME

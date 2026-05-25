@@ -142,7 +142,10 @@ builder shard로 사용하고, 각 pod가 만든 shard를 pod-to-pod direct stre
 cache builder는 train split sharding에 `ExactDistributedSampler`를 사용합니다. train scene 수가
 8개 shard로 나누어떨어지지 않아도 padding duplicate 없이 각 scene을 정확히 한 번만 생성합니다.
 launcher는 양방향 shard 교환, 양쪽 pod의 index merge, 양쪽 pod의 validator를 병렬로 실행합니다.
-각 GPU builder는 기본 `--teacher-cache-data-num-workers 2`로 다음 scene batch를 prefetch합니다.
+각 GPU builder는 기본 `--teacher-cache-data-num-workers 0`으로 dataset을 직접 읽습니다. 실측상
+V100 pod에서는 dataloader worker를 늘리는 것보다 안정적으로 빨랐습니다. 대신 GPU가 다음 batch를
+생성하는 동안 per-scene `torch.save`가 background worker에서 진행되도록
+`--teacher-cache-save-workers 4`를 기본으로 사용합니다.
 
 launcher는 기본적으로 checkpoint별 subdir를 자동으로 붙입니다. 예를 들어 최신 W&B
 checkpoint가 `epoch-last-sqverrgj:v36`, epoch 35, global step 162360이면 cache root는
@@ -168,7 +171,8 @@ python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
   --sync-teacher-cache \
   --teacher-cache-batch-size 32 \
   --teacher-cache-rollout-batch-size 32 \
-  --teacher-cache-data-num-workers 2 \
+  --teacher-cache-data-num-workers 0 \
+  --teacher-cache-save-workers 4 \
   --replace
 ```
 
@@ -180,10 +184,15 @@ manifest가 맞지 않는 stale cache에서는 이 옵션을 주더라도 기존
 checkpoint별 subdir 자동 생성을 끄고 직접 지정한 cache root를 그대로 쓰려면
 `--no-teacher-cache-keyed-root`를 추가합니다. 이 경우에도 manifest identity 검증은 유지됩니다.
 
-4096 scene 기준 실측 범위는 `100.97s`에서 `129.24s`였습니다. 가장 최근 측정에서는 shard
-builder `110.5s`, 양방향 shard 교환 `3.9s`, 양쪽 index merge `5.4s`, 양쪽 validate `4.9s`,
-end-to-end `129.24s`가 걸렸습니다. train split 전체 486,995 scene 기준 단순 외삽 예상은
-약 3.3~4.3시간이고, cache 용량은 약 82.3GiB입니다.
+최신 측정은 `svv + svvv`의 V100 8장, `batch_size=32`, `rollout_batch_size=32`,
+`data_num_workers=0`, `save_workers=4` 기준입니다. 8192 scene cache build는 shard builder
+`146.1s`, 양방향 shard 교환 `4.0s`, 양쪽 index merge `3.8s`, 양쪽 validate `3.7s`,
+end-to-end `161.92s`가 걸렸습니다. train split 전체 486,995 scene 기준 단순 외삽 예상은
+약 `2.67h`입니다. 이전 최신 측정 `4.27h` 대비 약 `1.60x` 빨라졌습니다.
+
+8192 scene cache의 실측 용량은 `1.526GB`입니다. 이를 train split 전체로 단순 외삽하면 약
+`90.7GB` / `84.5GiB`이며, scene별 agent 수 분포 차이를 감안해 cache root에는 최소 90GiB
+이상의 여유를 두는 것을 권장합니다.
 
 실행 전 smoke는 cache 일부만 만들어 1 train batch를 통과시키는 방식으로 확인합니다.
 

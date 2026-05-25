@@ -311,6 +311,7 @@ def render_teacher_cache_build_script(args: argparse.Namespace, *, max_scenes: s
     rollout_batch_arg = f" --rollout-batch-size {int(args.teacher_cache_rollout_batch_size)}"
     data_workers_arg = f" --data-num-workers {int(args.teacher_cache_data_num_workers)}"
     prefetch_arg = f" --data-prefetch-factor {int(args.teacher_cache_data_prefetch_factor)}"
+    save_workers_arg = f" --save-workers {int(args.teacher_cache_save_workers)}"
     return f"""set -Eeuo pipefail
 cd {shq(args.project_root)}
 if [[ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]]; then
@@ -333,6 +334,7 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
   {rollout_batch_arg} \
   {data_workers_arg} \
   {prefetch_arg} \
+  {save_workers_arg} \
   --override paths.cache_root="$CACHE_ROOT" \
   --override experiment={shq(args.experiment)}
 PYTHONPATH=. python tools/validate_self_forced_gan_cache.py "$TEACHER_GAN_CACHE_ROOT" --max-files {int(args.validate_cache_max_files)}
@@ -369,6 +371,7 @@ def render_parallel_teacher_cache_build_script(
                     f"--rollout-batch-size {int(args.teacher_cache_rollout_batch_size)}",
                     f"--data-num-workers {int(args.teacher_cache_data_num_workers)}",
                     f"--data-prefetch-factor {int(args.teacher_cache_data_prefetch_factor)}",
+                    f"--save-workers {int(args.teacher_cache_save_workers)}",
                     f"--num-shards {int(num_shards)}",
                     f"--shard-index {int(shard_index)}",
                     max_arg,
@@ -424,6 +427,7 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
   --rollout-batch-size {int(args.teacher_cache_rollout_batch_size)} \
   --data-num-workers {int(args.teacher_cache_data_num_workers)} \
   --data-prefetch-factor {int(args.teacher_cache_data_prefetch_factor)} \
+  --save-workers {int(args.teacher_cache_save_workers)} \
   --override paths.cache_root="$CACHE_ROOT" \
   --override experiment={shq(args.experiment)}
 PYTHONPATH=. python tools/validate_self_forced_gan_cache.py "$TEACHER_GAN_CACHE_ROOT" --max-files {int(args.validate_cache_max_files)}
@@ -937,8 +941,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-cache-seed", type=int, default=817)
     parser.add_argument("--teacher-cache-batch-size", type=int, default=32)
     parser.add_argument("--teacher-cache-rollout-batch-size", type=int, default=32)
-    parser.add_argument("--teacher-cache-data-num-workers", type=int, default=2)
+    parser.add_argument("--teacher-cache-data-num-workers", type=int, default=0)
     parser.add_argument("--teacher-cache-data-prefetch-factor", type=int, default=2)
+    parser.add_argument("--teacher-cache-save-workers", type=int, default=4)
     parser.add_argument("--teacher-cache-gpus-per-pod", type=int, default=4)
     parser.add_argument("--teacher-cache-sync-port", default="29720")
     parser.add_argument("--teacher-cache-direct-pod-sync", action=argparse.BooleanOptionalAction, default=True)
@@ -970,6 +975,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--teacher-cache-data-num-workers must be >= 0")
     if args.teacher_cache_data_prefetch_factor < 1:
         parser.error("--teacher-cache-data-prefetch-factor must be >= 1")
+    if args.teacher_cache_save_workers < 0:
+        parser.error("--teacher-cache-save-workers must be >= 0")
     if args.teacher_cache_gpus_per_pod < 1:
         parser.error("--teacher-cache-gpus-per-pod must be >= 1")
     return args
