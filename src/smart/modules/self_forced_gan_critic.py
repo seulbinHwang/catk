@@ -211,14 +211,14 @@ class RadiusAttentionLayer(nn.Module):
         self,
         *,
         q: Tensor,
-        k: Tensor,
-        v: Tensor,
+        key_token: Tensor,
+        value_token: Tensor,
         relation: Tensor,
         attention_mask: Tensor,
     ) -> Tensor:
         """sender chunk 단위의 stable softmax attention context를 계산합니다."""
         bsz, n_rollout, n_endpoint, n_query, n_head, head_dim = q.shape
-        n_sender = k.shape[3]
+        n_sender = key_token.shape[3]
         chunk_size = max(1, self.sender_chunk_size)
         device = q.device
         max_logit = torch.full(
@@ -240,7 +240,14 @@ class RadiusAttentionLayer(nn.Module):
         )
         for start in range(0, n_sender, chunk_size):
             end = min(start + chunk_size, n_sender)
-            logits = torch.einsum("bkeqhd,bkeshd->bkeqsh", q, k[..., start:end, :, :]).float()
+            chunk_sender = end - start
+            k_chunk = self.key(key_token[..., start:end, :]).reshape(
+                bsz, n_rollout, n_endpoint, chunk_sender, n_head, head_dim
+            )
+            v_chunk = self.value(value_token[..., start:end, :]).reshape(
+                bsz, n_rollout, n_endpoint, chunk_sender, n_head, head_dim
+            )
+            logits = torch.einsum("bkeqhd,bkeshd->bkeqsh", q, k_chunk).float()
             logits = logits * self.scale
             logits = logits + self.relation_bias(relation[..., start:end, :]).float()
             mask = attention_mask[..., start:end].unsqueeze(-1)
@@ -253,8 +260,8 @@ class RadiusAttentionLayer(nn.Module):
             chunk_sum = exp_logits.sum(dim=4)
             chunk_context = torch.einsum(
                 "bkeqsh,bkeshd->bkeqhd",
-                exp_logits.to(dtype=v.dtype),
-                v[..., start:end, :, :],
+                exp_logits.to(dtype=v_chunk.dtype),
+                v_chunk,
             ).float()
 
             next_max = torch.maximum(max_logit, chunk_max)
@@ -301,22 +308,22 @@ class RadiusAttentionLayer(nn.Module):
         q = self.query(query_token).reshape(
             bsz, n_rollout, n_endpoint, n_query, self.num_heads, self.head_dim
         )
-        k = self.key(key_token).reshape(
-            bsz, n_rollout, n_endpoint, n_sender, self.num_heads, self.head_dim
-        )
-        v = self.value(value_token).reshape(
-            bsz, n_rollout, n_endpoint, n_sender, self.num_heads, self.head_dim
-        )
 
         if self.sender_chunk_size > 0 and n_sender > self.sender_chunk_size:
             context = self._streaming_context(
                 q=q,
-                k=k,
-                v=v,
+                key_token=key_token,
+                value_token=value_token,
                 relation=relation,
                 attention_mask=attention_mask,
             ).to(dtype=query_token.dtype)
         else:
+            k = self.key(key_token).reshape(
+                bsz, n_rollout, n_endpoint, n_sender, self.num_heads, self.head_dim
+            )
+            v = self.value(value_token).reshape(
+                bsz, n_rollout, n_endpoint, n_sender, self.num_heads, self.head_dim
+            )
             logits = torch.einsum("bkeqhd,bkeshd->bkeqsh", q, k) * self.scale
             logits = logits + self.relation_bias(relation)
             mask = attention_mask.unsqueeze(-1)
