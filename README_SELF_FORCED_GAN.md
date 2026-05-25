@@ -110,14 +110,16 @@ torchrun --standalone --nproc_per_node=6 -m src.run \
 노드 간 rendezvous와 teacher cache sync가 필요 없습니다. 전용 launcher는 같은
 Set-level Self-Forced GAN objective와 같은 pinned pretrain checkpoint를 쓰되, H100에 맞춰
 `self_forced_gan_h100_6` preset, `bf16-mixed`, `nproc_per_node=6`, rank당 train microbatch 1을
-기본값으로 둡니다.
+기본값으로 둡니다. Optimizer step은 `gradient_accumulation=16`으로 수행합니다.
 
 | 항목 | 값 |
 |---|---:|
 | node/GPU | 1 node x 6 H100 = 6 ranks |
 | precision | `bf16-mixed` |
 | train microbatch | rank당 1 scene |
-| effective train scene batch | 6 scene / step |
+| gradient accumulation | 16 |
+| micro-step scene batch | 6 scene / micro-step |
+| optimizer-step scene batch | 96 scene / optimizer step |
 | teacher/student set | K=16 유지 |
 | teacher cache | scene당 32 rollout 유지 |
 | teacher cache build | 6 GPU shard, pod 내부 merge |
@@ -179,6 +181,10 @@ rank당 2 scene도 8-batch stability probe 중 CUDA OOM이 발생했습니다. R
 16 train batch stability probe를 status 0으로 통과했고, 해당 probe의
 `worst_peak_reserved_pct_epoch_max`는 33.56%였습니다. 따라서 epoch 전체 안정성을 우선하는
 기본값은 `train_batch_size=1`입니다.
+
+이 batch 크기에서 optimizer-step effective batch를 키우기 위해 H100x6 launcher와
+`self_forced_gan_h100_6` preset은 `trainer.accumulate_grad_batches=16`을 기본값으로 둡니다.
+따라서 한 optimizer step은 `1 scene/rank x 6 ranks x 16 accumulation = 96 scenes`입니다.
 
 중지할 때는 pod를 삭제하지 말고 tmux session과 해당 task process만 종료합니다.
 

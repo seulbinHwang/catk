@@ -62,6 +62,7 @@ trainer:
   limit_val_batches: 0.1
   precision: bf16-mixed
   gradient_clip_val: null
+  accumulate_grad_batches: 16
   sync_batchnorm: false
   strategy:
     find_unused_parameters: true
