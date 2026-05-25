@@ -365,10 +365,12 @@ class MapComplianceEncoder(nn.Module):
         num_heads: int = 4,
         query_chunk_size: int = 16,
         sender_chunk_size: int = 0,
+        rollout_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
         self.query_chunk_size = max(1, int(query_chunk_size))
+        self.rollout_chunk_size = max(0, int(rollout_chunk_size))
         self.attention = RadiusAttentionLayer(
             hidden_dim,
             num_heads=num_heads,
@@ -394,39 +396,45 @@ class MapComplianceEncoder(nn.Module):
         if n_map == 0:
             return endpoint_token, self.endpoint_pool(endpoint_token)
 
-        map_token = map_context[:, None, None, :, :].expand(
-            bsz, n_rollout, n_endpoint, n_map, hidden_dim
-        )
         map_xy = map_position[:, None, None, None, :, :]
         sender_yaw = map_orientation[:, None, None, None, :]
-        output_chunks: list[Tensor] = []
-        for start in range(0, n_agent, self.query_chunk_size):
-            end = min(start + self.query_chunk_size, n_agent)
-            endpoint_pose_chunk = endpoint_pose[..., start:end, :]
-            endpoint_xy = endpoint_pose_chunk[..., :2]
-            delta_xy = map_xy - endpoint_xy.unsqueeze(4)
-            receiver_yaw = _yaw_from_pose(endpoint_pose_chunk).unsqueeze(4)
-            relation, distance = _build_relation_features(
-                delta_xy=delta_xy,
-                receiver_yaw=receiver_yaw,
-                sender_yaw=sender_yaw,
-                radius_m=self.radius_m,
+        rollout_step = self.rollout_chunk_size if self.rollout_chunk_size > 0 else n_rollout
+        rollout_chunks: list[Tensor] = []
+        for rollout_start in range(0, n_rollout, rollout_step):
+            rollout_end = min(rollout_start + rollout_step, n_rollout)
+            rollout_width = rollout_end - rollout_start
+            map_token = map_context[:, None, None, :, :].expand(
+                bsz, rollout_width, n_endpoint, n_map, hidden_dim
             )
-            attention_mask = (
-                valid_mask[:, None, None, start:end, None]
-                & map_valid_mask[:, None, None, None, :]
-                & (distance <= self.radius_m)
-            )
-            output_chunks.append(
-                self.attention(
-                    query_token=endpoint_token[..., start:end, :],
-                    key_token=map_token,
-                    value_token=map_token,
-                    relation=relation,
-                    attention_mask=attention_mask,
+            agent_chunks: list[Tensor] = []
+            for start in range(0, n_agent, self.query_chunk_size):
+                end = min(start + self.query_chunk_size, n_agent)
+                endpoint_pose_chunk = endpoint_pose[:, rollout_start:rollout_end, :, start:end, :]
+                endpoint_xy = endpoint_pose_chunk[..., :2]
+                delta_xy = map_xy - endpoint_xy.unsqueeze(4)
+                receiver_yaw = _yaw_from_pose(endpoint_pose_chunk).unsqueeze(4)
+                relation, distance = _build_relation_features(
+                    delta_xy=delta_xy,
+                    receiver_yaw=receiver_yaw,
+                    sender_yaw=sender_yaw,
+                    radius_m=self.radius_m,
                 )
-            )
-        map_aware_endpoint = torch.cat(output_chunks, dim=3)
+                attention_mask = (
+                    valid_mask[:, None, None, start:end, None]
+                    & map_valid_mask[:, None, None, None, :]
+                    & (distance <= self.radius_m)
+                )
+                agent_chunks.append(
+                    self.attention(
+                        query_token=endpoint_token[:, rollout_start:rollout_end, :, start:end, :],
+                        key_token=map_token,
+                        value_token=map_token,
+                        relation=relation,
+                        attention_mask=attention_mask,
+                    )
+                )
+            rollout_chunks.append(torch.cat(agent_chunks, dim=3))
+        map_aware_endpoint = torch.cat(rollout_chunks, dim=1)
         map_agent_token = self.endpoint_pool(map_aware_endpoint)
         return map_aware_endpoint, map_agent_token
 
@@ -524,6 +532,7 @@ class SelfForcedGANDiscriminator(nn.Module):
         interaction_query_chunk_size: int = 16,
         map_sender_chunk_size: int = 0,
         interaction_sender_chunk_size: int = 0,
+        map_rollout_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -549,6 +558,7 @@ class SelfForcedGANDiscriminator(nn.Module):
             num_heads=num_attention_heads,
             query_chunk_size=map_query_chunk_size,
             sender_chunk_size=map_sender_chunk_size,
+            rollout_chunk_size=map_rollout_chunk_size,
         )
         self.interaction_encoder = InteractionEncoder(
             hidden_dim=hidden_dim,

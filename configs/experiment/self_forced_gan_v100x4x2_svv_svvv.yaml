@@ -24,6 +24,7 @@ model:
       interaction_query_chunk_size: 4
       map_sender_chunk_size: 64
       interaction_sender_chunk_size: 0
+      map_rollout_chunk_size: 1
       sampling:
         backprop_last_k: 8
 
