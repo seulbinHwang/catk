@@ -389,55 +389,36 @@ class SMARTFlowGAN(SMARTFlow):
             map_valid_mask=context["map_valid_mask"],
         )
 
-    def _compute_gan_r1_r2(
+    def _compute_gan_finite_difference_regularizer(
         self,
-        real_pose: Tensor,
-        fake_pose: Tensor,
+        rollout_pose: Tensor,
         context: Dict[str, Tensor | int],
-    ) -> tuple[Tensor, Tensor]:
-        """finite-difference 방식 R1/R2 regularization을 계산합니다.
+    ) -> Tensor:
+        """finite-difference 방식 discriminator smoothness penalty를 계산합니다.
 
         Args:
-            real_pose: teacher rollout set입니다. shape은 ``[B, K, 20, N, 4]`` 입니다.
-            fake_pose: student rollout set입니다. shape은 ``[B, K, 20, N, 4]`` 입니다.
+            rollout_pose: teacher 또는 student rollout set입니다. shape은
+                ``[B, K, 20, N, 4]`` 입니다.
             context: discriminator context입니다.
 
         Returns:
-            tuple[Tensor, Tensor]: R1과 R2 scalar입니다.
+            Tensor: finite-difference smoothness penalty scalar입니다.
         """
-        zero = real_pose.new_zeros(())
-        if self.gan_r1_weight <= 0.0 and self.gan_r2_weight <= 0.0:
-            return zero, zero
         scale = self.gan_discriminator.position_type_scale
         current_pose = context["current_pose"]
         agent_type = context["agent_type"]
-        r1 = zero
-        r2 = zero
-        if self.gan_r1_weight > 0.0:
-            real_base = self._gan_forward_discriminator(real_pose.detach(), context)
-            real_pert = add_rollout_pose_perturbation(
-                real_pose.detach(),
-                current_pose=current_pose,
-                agent_type=agent_type,
-                position_type_scale=scale,
-                position_sigma=self.gan_position_sigma,
-                yaw_sigma=self.gan_yaw_sigma,
-            )
-            real_pert_logit = self._gan_forward_discriminator(real_pert, context)
-            r1 = ((real_pert_logit - real_base) / max(self.gan_position_sigma, 1.0e-6)).square().mean()
-        if self.gan_r2_weight > 0.0:
-            fake_base = self._gan_forward_discriminator(fake_pose.detach(), context)
-            fake_pert = add_rollout_pose_perturbation(
-                fake_pose.detach(),
-                current_pose=current_pose,
-                agent_type=agent_type,
-                position_type_scale=scale,
-                position_sigma=self.gan_position_sigma,
-                yaw_sigma=self.gan_yaw_sigma,
-            )
-            fake_pert_logit = self._gan_forward_discriminator(fake_pert, context)
-            r2 = ((fake_pert_logit - fake_base) / max(self.gan_position_sigma, 1.0e-6)).square().mean()
-        return r1, r2
+        rollout_pose = rollout_pose.detach()
+        base = self._gan_forward_discriminator(rollout_pose, context)
+        perturbed = add_rollout_pose_perturbation(
+            rollout_pose,
+            current_pose=current_pose,
+            agent_type=agent_type,
+            position_type_scale=scale,
+            position_sigma=self.gan_position_sigma,
+            yaw_sigma=self.gan_yaw_sigma,
+        )
+        perturbed_logit = self._gan_forward_discriminator(perturbed, context)
+        return ((perturbed_logit - base) / max(self.gan_position_sigma, 1.0e-6)).square().mean()
 
     def _training_step_self_forced_gan(self, data, batch_idx):
         """set-level GAN fine-tuning 한 step을 실행합니다.
@@ -463,6 +444,8 @@ class SMARTFlowGAN(SMARTFlow):
             fake_pose = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
 
         generator_optimizer, discriminator_optimizer = self.optimizers()
+        r1_log = real_pose.new_zeros(())
+        r2_log = real_pose.new_zeros(())
 
         self.toggle_optimizer(discriminator_optimizer)
         try:
@@ -470,9 +453,24 @@ class SMARTFlowGAN(SMARTFlow):
             real_logit = self._gan_forward_discriminator(real_pose.detach(), context)
             fake_logit = self._gan_forward_discriminator(fake_pose.detach(), context)
             d_adv = relativistic_discriminator_loss(real_logit, fake_logit)
-            r1, r2 = self._compute_gan_r1_r2(real_pose, fake_pose, context)
-            d_loss = d_adv + self.gan_r1_weight * r1 + self.gan_r2_weight * r2
-            self._manual_backward_without_autocast(d_loss)
+            real_logit_for_margin = real_logit.detach()
+            fake_logit_for_margin = fake_logit.detach()
+            self._manual_backward_without_autocast(d_adv)
+            d_loss = d_adv.detach()
+            del real_logit, fake_logit, d_adv
+
+            if self.gan_r1_weight > 0.0:
+                r1 = self._compute_gan_finite_difference_regularizer(real_pose, context)
+                r1_log = r1.detach()
+                self._manual_backward_without_autocast(self.gan_r1_weight * r1)
+                d_loss = d_loss + self.gan_r1_weight * r1_log
+                del r1
+            if self.gan_r2_weight > 0.0:
+                r2 = self._compute_gan_finite_difference_regularizer(fake_pose, context)
+                r2_log = r2.detach()
+                self._manual_backward_without_autocast(self.gan_r2_weight * r2)
+                d_loss = d_loss + self.gan_r2_weight * r2_log
+                del r2
             self._clip_and_step_with_optional_scaler(
                 discriminator_optimizer,
                 gradient_clip_val=self.gan_gradient_clip_val,
@@ -508,13 +506,13 @@ class SMARTFlowGAN(SMARTFlow):
                 self.untoggle_optimizer(generator_optimizer)
             total_loss = g_loss.detach()
 
-        margin = (real_logit.detach() - fake_logit.detach()).mean()
+        margin = (real_logit_for_margin - fake_logit_for_margin).mean()
         self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/gan/d_loss", d_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/gan/g_loss", g_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/gan/d_margin", margin, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/gan/r1", r1.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/gan/r2", r2.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/gan/r1", r1_log, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/gan/r2", r2_log, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/gan/warmup_active", float(warmup_active), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/gan/warmup_updates", float(self.gan_resolved_warmup_updates), on_step=False, on_epoch=True, sync_dist=False, batch_size=1)
         return total_loss

@@ -125,8 +125,8 @@ main() {
   local manual_rank_offset="${MANUAL_RANK_OFFSET:-}"
   local manual_world_size="${MANUAL_WORLD_SIZE:-}"
 
-  if [[ "$action" != "fit" && "$action" != "validate" && "$action" != "test" ]]; then
-    log "ERROR: CATK_ACTION must be fit, validate, or test for this pretrain wrapper; got: $action"
+  if [[ "$action" != "fit" && "$action" != "finetune" && "$action" != "validate" && "$action" != "test" ]]; then
+    log "ERROR: CATK_ACTION must be fit, finetune, validate, or test for this pretrain wrapper; got: $action"
     exit 2
   fi
   if [[ "$action" != "fit" && -z "$ckpt_path" ]]; then
@@ -186,7 +186,7 @@ main() {
     trainer=ddp
     trainer.devices="$trainer_devices"
     trainer.num_nodes="$nnodes"
-    trainer.enable_progress_bar=true
+    +trainer.enable_progress_bar=true
     paths.cache_root="$cache_root"
     task_name="$task_name"
   )

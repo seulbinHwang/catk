@@ -1,0 +1,49 @@
+# @package _global_
+
+# Set-level self-forcing GAN fine-tuning preset for svv + svvv.
+#
+# Hardware:
+#   * svv:  4x Tesla V100 32GB
+#   * svvv: 4x Tesla V100 32GB
+#
+# This keeps the intended K=16 teacher/student rollout-set discriminator path,
+# but swaps H100-only bf16 for V100-safe fp16 mixed precision and reduces the
+# per-rank scene microbatch to one.
+
+defaults:
+  - self_forced_gan_h100_6
+  - _self_
+
+model:
+  model_config:
+    n_rollout_closed_val: 8
+    self_forced_gan:
+      effective_scene_batch: 8
+      sampling:
+        backprop_last_k: 8
+
+trainer:
+  num_nodes: 2
+  devices: 4
+  precision: 16-mixed
+  max_epochs: 6
+  check_val_every_n_epoch: 1
+  limit_train_batches: 1.0
+  limit_val_batches: 0.02
+  sync_batchnorm: false
+  strategy:
+    find_unused_parameters: true
+
+callbacks:
+  model_checkpoint:
+    monitor: null
+    mode: min
+
+data:
+  train_batch_size: 1
+  val_batch_size: 2
+  test_batch_size: 2
+  num_workers: 2
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
+  train_epoch_sample_fraction: 0.5

@@ -701,7 +701,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--action",
-        choices=["fit", "validate", "test"],
+        choices=["fit", "finetune", "validate", "test"],
         default="fit",
     )
     parser.add_argument("--ckpt-path", default="")
@@ -758,8 +758,8 @@ def parse_args() -> argparse.Namespace:
 
     if len(args.pods) < 2 and not args.stop:
         parser.error("--pods must contain at least two pods for multi-node training")
-    if args.manual_rank_offsets and args.action != "fit" and not args.stop:
-        parser.error("--manual-rank-offsets is only wired for action=fit")
+    if args.manual_rank_offsets and args.action not in {"fit", "finetune"} and not args.stop:
+        parser.error("--manual-rank-offsets is only wired for action=fit or action=finetune")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
     if args.action in {"validate", "test"} and not args.ckpt_path and not args.stop:

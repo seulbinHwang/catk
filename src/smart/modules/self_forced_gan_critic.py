@@ -273,9 +273,17 @@ class SceneConditionFusion(nn.Module):
 class MapComplianceEncoder(nn.Module):
     """4개 endpoint에서 map token과 radius cross-attention을 수행합니다."""
 
-    def __init__(self, hidden_dim: int, *, radius_m: float = 30.0, num_heads: int = 4) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        radius_m: float = 30.0,
+        num_heads: int = 4,
+        query_chunk_size: int = 16,
+    ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
+        self.query_chunk_size = max(1, int(query_chunk_size))
         self.attention = RadiusAttentionLayer(hidden_dim, num_heads=num_heads, relation_dim=3)
         self.endpoint_pool = EndpointPool(hidden_dim)
 
@@ -299,29 +307,36 @@ class MapComplianceEncoder(nn.Module):
         map_token = map_context[:, None, None, :, :].expand(
             bsz, n_rollout, n_endpoint, n_map, hidden_dim
         )
-        endpoint_xy = endpoint_pose[..., :2]
         map_xy = map_position[:, None, None, None, :, :]
-        delta_xy = map_xy - endpoint_xy.unsqueeze(4)
-        receiver_yaw = _yaw_from_pose(endpoint_pose).unsqueeze(4)
         sender_yaw = map_orientation[:, None, None, None, :]
-        relation, distance = _build_relation_features(
-            delta_xy=delta_xy,
-            receiver_yaw=receiver_yaw,
-            sender_yaw=sender_yaw,
-            radius_m=self.radius_m,
-        )
-        attention_mask = (
-            valid_mask[:, None, None, :, None]
-            & map_valid_mask[:, None, None, None, :]
-            & (distance <= self.radius_m)
-        )
-        map_aware_endpoint = self.attention(
-            query_token=endpoint_token,
-            key_token=map_token,
-            value_token=map_token,
-            relation=relation,
-            attention_mask=attention_mask,
-        )
+        output_chunks: list[Tensor] = []
+        for start in range(0, n_agent, self.query_chunk_size):
+            end = min(start + self.query_chunk_size, n_agent)
+            endpoint_pose_chunk = endpoint_pose[..., start:end, :]
+            endpoint_xy = endpoint_pose_chunk[..., :2]
+            delta_xy = map_xy - endpoint_xy.unsqueeze(4)
+            receiver_yaw = _yaw_from_pose(endpoint_pose_chunk).unsqueeze(4)
+            relation, distance = _build_relation_features(
+                delta_xy=delta_xy,
+                receiver_yaw=receiver_yaw,
+                sender_yaw=sender_yaw,
+                radius_m=self.radius_m,
+            )
+            attention_mask = (
+                valid_mask[:, None, None, start:end, None]
+                & map_valid_mask[:, None, None, None, :]
+                & (distance <= self.radius_m)
+            )
+            output_chunks.append(
+                self.attention(
+                    query_token=endpoint_token[..., start:end, :],
+                    key_token=map_token,
+                    value_token=map_token,
+                    relation=relation,
+                    attention_mask=attention_mask,
+                )
+            )
+        map_aware_endpoint = torch.cat(output_chunks, dim=3)
         map_agent_token = self.endpoint_pool(map_aware_endpoint)
         return map_aware_endpoint, map_agent_token
 
@@ -329,9 +344,17 @@ class MapComplianceEncoder(nn.Module):
 class InteractionEncoder(nn.Module):
     """4개 endpoint에서 agent-agent radius attention을 수행합니다."""
 
-    def __init__(self, hidden_dim: int, *, radius_m: float = 60.0, num_heads: int = 4) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        radius_m: float = 60.0,
+        num_heads: int = 4,
+        query_chunk_size: int = 16,
+    ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
+        self.query_chunk_size = max(1, int(query_chunk_size))
         self.attention = RadiusAttentionLayer(hidden_dim, num_heads=num_heads, relation_dim=3)
         self.endpoint_pool = EndpointPool(hidden_dim)
 
@@ -345,32 +368,38 @@ class InteractionEncoder(nn.Module):
         """interaction-aware endpoint token과 pooled agent token을 반환합니다."""
         bsz, n_rollout, n_endpoint, n_agent, _ = endpoint_token.shape
         endpoint_xy = endpoint_pose[..., :2]
-        receiver_xy = endpoint_xy.unsqueeze(4)
         sender_xy = endpoint_xy.unsqueeze(3)
-        delta_xy = sender_xy - receiver_xy
         yaw = _yaw_from_pose(endpoint_pose)
-        receiver_yaw = yaw.unsqueeze(4)
         sender_yaw = yaw.unsqueeze(3)
-        relation, distance = _build_relation_features(
-            delta_xy=delta_xy,
-            receiver_yaw=receiver_yaw,
-            sender_yaw=sender_yaw,
-            radius_m=self.radius_m,
-        )
         not_self = ~torch.eye(n_agent, device=endpoint_token.device, dtype=torch.bool)
-        attention_mask = (
-            valid_mask[:, None, None, :, None]
-            & valid_mask[:, None, None, None, :]
-            & not_self.view(1, 1, 1, n_agent, n_agent)
-            & (distance <= self.radius_m)
-        )
-        interaction_endpoint = self.attention(
-            query_token=endpoint_token,
-            key_token=endpoint_token,
-            value_token=endpoint_token,
-            relation=relation,
-            attention_mask=attention_mask,
-        )
+        output_chunks: list[Tensor] = []
+        for start in range(0, n_agent, self.query_chunk_size):
+            end = min(start + self.query_chunk_size, n_agent)
+            receiver_xy = endpoint_xy[..., start:end, :].unsqueeze(4)
+            delta_xy = sender_xy - receiver_xy
+            receiver_yaw = yaw[..., start:end].unsqueeze(4)
+            relation, distance = _build_relation_features(
+                delta_xy=delta_xy,
+                receiver_yaw=receiver_yaw,
+                sender_yaw=sender_yaw,
+                radius_m=self.radius_m,
+            )
+            attention_mask = (
+                valid_mask[:, None, None, start:end, None]
+                & valid_mask[:, None, None, None, :]
+                & not_self[start:end, :].view(1, 1, 1, end - start, n_agent)
+                & (distance <= self.radius_m)
+            )
+            output_chunks.append(
+                self.attention(
+                    query_token=endpoint_token[..., start:end, :],
+                    key_token=endpoint_token,
+                    value_token=endpoint_token,
+                    relation=relation,
+                    attention_mask=attention_mask,
+                )
+            )
+        interaction_endpoint = torch.cat(output_chunks, dim=3)
         interaction_agent_token = self.endpoint_pool(interaction_endpoint)
         return interaction_endpoint, interaction_agent_token
 

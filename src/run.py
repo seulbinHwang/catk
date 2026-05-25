@@ -59,7 +59,11 @@ def _is_self_forced_enabled(cfg: DictConfig) -> bool:
     model_cfg = cfg.get("model")
     model_config = model_cfg.get("model_config") if model_cfg else None
     self_forced_cfg = model_config.get("self_forced") if model_config else None
-    return bool(self_forced_cfg and self_forced_cfg.get("enabled", False))
+    self_forced_gan_cfg = model_config.get("self_forced_gan") if model_config else None
+    return bool(
+        (self_forced_cfg and self_forced_cfg.get("enabled", False))
+        or (self_forced_gan_cfg and self_forced_gan_cfg.get("enabled", False))
+    )
 
 
 def _load_lightning_checkpoint(ckpt_path: str) -> dict[str, Any]:
@@ -81,8 +85,20 @@ def _is_self_forced_auxiliary_key(key: str) -> bool:
     return (
         key.startswith("self_forced_target_teacher.")
         or key.startswith("self_forced_generated_estimator.")
+        or key.startswith("gan_discriminator.")
+        or key.startswith("gan_generator_ema.")
+        or key.startswith("gan_generator_update_count")
+        or key.startswith("gan_generator_ema_ready")
+        or key.startswith("gan_discriminator_update_count")
+        or key.startswith("gan_warmup_update_count")
         or ".self_forced_target_teacher." in key
         or ".self_forced_generated_estimator." in key
+        or ".gan_discriminator." in key
+        or ".gan_generator_ema." in key
+        or ".gan_generator_update_count" in key
+        or ".gan_generator_ema_ready" in key
+        or ".gan_discriminator_update_count" in key
+        or ".gan_warmup_update_count" in key
     )
 
 
@@ -133,10 +149,22 @@ def _checkpoint_has_self_forced_auxiliary_state(checkpoint: dict[str, Any]) -> b
     prefixes = (
         "self_forced_target_teacher.",
         "self_forced_generated_estimator.",
+        "gan_discriminator.",
+        "gan_generator_ema.",
+        "gan_generator_update_count",
+        "gan_generator_ema_ready",
+        "gan_discriminator_update_count",
+        "gan_warmup_update_count",
     )
     infixes = (
         ".self_forced_target_teacher.",
         ".self_forced_generated_estimator.",
+        ".gan_discriminator.",
+        ".gan_generator_ema.",
+        ".gan_generator_update_count",
+        ".gan_generator_ema_ready",
+        ".gan_discriminator_update_count",
+        ".gan_warmup_update_count",
     )
     return any(
         str(key).startswith(prefixes) or any(infix in str(key) for infix in infixes)
@@ -155,7 +183,8 @@ def _validate_self_forced_checkpoint_action(
     if cfg.action == "finetune" and has_aux_state:
         raise ValueError(
             "ckpt_path looks like a self-forced training checkpoint because it contains "
-            "'self_forced_target_teacher' or 'self_forced_generated_estimator' state. "
+            "'self_forced_target_teacher', 'self_forced_generated_estimator', "
+            "or GAN auxiliary state. "
             "Do not load it with action=finetune, which starts a new weight-only run and "
             "can discard the resume semantics of F_rho/F_psi. Use action=fit with the "
             "self-forced checkpoint to perform a full Lightning resume."
@@ -163,7 +192,7 @@ def _validate_self_forced_checkpoint_action(
     if cfg.action == "fit" and cfg.get("ckpt_path") and not has_aux_state:
         raise ValueError(
             "self-forced action=fit expects a self-forced checkpoint containing "
-            "'self_forced_target_teacher' and 'self_forced_generated_estimator' state. "
+            "self-forced or GAN auxiliary state. "
             "The provided ckpt_path does not look like a self-forced resume checkpoint. "
             "Use action=finetune for the first self-forced run from a pretrained "
             "Generator checkpoint."

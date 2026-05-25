@@ -91,6 +91,75 @@ torchrun --standalone --nproc_per_node=6 -m src.run \
   ckpt_path=<path-to-2s-pretrain.ckpt>
 ```
 
+## svv + svvv V100x4x2 실행
+
+`svv`, `svvv`는 각각 V100 32GB 4장이라 H100 preset을 그대로 쓰지 않습니다. 전용 preset은
+`self_forced_gan_v100x4x2_svv_svvv`이고, 핵심 차이는 다음입니다.
+
+| 항목 | 값 |
+|---|---:|
+| node/GPU | 2 nodes x 4 V100 = 8 ranks |
+| precision | `16-mixed` |
+| train microbatch | rank당 1 scene |
+| teacher/student set | K=16 유지 |
+| teacher cache | scene당 32 rollout 유지 |
+| fake rollout backprop | 마지막 8 step |
+| validation rollout | 8 |
+
+아래 두 메모리 안정화는 `svv + svvv` V100 멀티노드 환경에서도
+Set-level Self-Forced GAN Fine-tuning을 돌리기 위해 적용한 특화 대응입니다.
+먼저 rank당 train microbatch를 1까지 줄였고, 그 상태에서도 V100 OOM이 발생해서
+학습 의미를 바꾸지 않는 범위에서 순간 CUDA memory peak만 낮췄습니다.
+
+| 항목 | svv + svvv 특화 대응 |
+|---|---|
+| discriminator map/agent attention | map-agent, agent-agent attention을 전체 agent query에 대해 한 번에 만들지 않고 agent query chunk 단위로 나눠 계산합니다. |
+| R1/R2 finite-difference regularization | discriminator loss, R1, R2의 큰 graph를 동시에 들고 있지 않고 같은 loss 항을 순차 backward로 반영해 live graph 크기를 줄입니다. |
+
+pretrain 시작점은 W&B run
+`flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_balanced_lr6e-4_bs18_oomretry`의
+최신 `epoch-last-*` model artifact입니다. launcher가 W&B API로 최신 artifact를 찾아 rank 0
+pod에 내려받고, torchrun 시작 전에 rank 1 pod로 같은 checkpoint를 검증 복사합니다.
+
+먼저 teacher cache가 없으면 한 번 생성합니다. multi-node 학습에서는 같은 cache를 양쪽 pod가
+byte-identical하게 봐야 하므로, rank 0에서 만든 뒤 rank 1로 동기화합니다.
+
+```bash
+python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
+  --build-teacher-cache \
+  --sync-teacher-cache \
+  --skip-existing-teacher-cache \
+  --replace
+```
+
+실행 전 smoke는 cache 일부만 만들어 1 train batch를 통과시키는 방식으로 확인합니다.
+
+```bash
+python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
+  --build-teacher-cache \
+  --teacher-cache-max-scenes 32 \
+  --sync-teacher-cache \
+  --limit-train-batches 1 \
+  --disable-validation \
+  --max-epochs 1 \
+  --extra-hydra-overrides "data.shuffle=false data.train_epoch_sample_fraction=1.0" \
+  --task-name sf_gan_k16_v100x4x2_svv_svvv_smoke \
+  --session catk-sf-gan-v100x4x2-svv-svvv-smoke \
+  --replace
+```
+
+32-scene smoke는 launcher/script wiring과 V100 memory path를 검증하기 위한 최소 실행입니다.
+전체 학습은 train split 전체에 대한 teacher cache를 먼저 만든 뒤 실행해야 합니다.
+
+중지할 때는 pod를 삭제하지 말고 tmux session과 해당 task process만 종료합니다.
+
+```bash
+python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
+  --task-name sf_gan_k16_v100x4x2_svv_svvv \
+  --session catk-sf-gan-v100x4x2-svv-svvv \
+  --stop
+```
+
 기본값은 다음입니다.
 
 | 항목 | 값 |
