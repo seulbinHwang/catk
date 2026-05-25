@@ -20,7 +20,7 @@ model:
     self_forced_gan:
       effective_scene_batch: 96
       manual_accumulate_grad_batches: 12
-      map_query_chunk_size: 4
+      map_query_chunk_size: 1
       interaction_query_chunk_size: 4
       sampling:
         backprop_last_k: 8
