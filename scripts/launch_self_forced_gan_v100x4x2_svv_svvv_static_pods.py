@@ -38,6 +38,7 @@ DEFAULT_WANDB_PRETRAIN_TASK = (
     "flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_balanced_"
     "lr6e-4_bs18_oomretry"
 )
+DEFAULT_WANDB_PRETRAIN_ARTIFACT = "epoch-last-sqverrgj:v38"
 DEFAULT_PRETRAIN_CKPT = (
     "/workspace/flow_control_space_pretrain_h100x6_hsb2_wo1_execctx_prefix_"
     "balanced_lr6e-4_bs18_oomretry/latest/epoch_last.ckpt"
@@ -167,6 +168,38 @@ download_dir = Path(os.environ["PRETRAIN_DOWNLOAD_DIR"])
 force = os.environ.get("FORCE_PRETRAIN_DOWNLOAD") == "1"
 marker_path = target_ckpt.with_suffix(target_ckpt.suffix + ".wandb.json")
 
+def expected_marker_from_artifact_ref(value):
+    if not value:
+        return None
+    artifact_name = value.split("/")[-1]
+    if ":" not in artifact_name:
+        return None
+    version = artifact_name.rsplit(":", 1)[1]
+    return {{
+        "artifact": artifact_name,
+        "version": version,
+        "qualified_artifact": value,
+    }}
+
+expected_marker = expected_marker_from_artifact_ref(artifact_ref)
+if expected_marker and target_ckpt.is_file() and marker_path.is_file() and not force:
+    try:
+        current = json.loads(marker_path.read_text())
+    except Exception:
+        current = {{}}
+    if (
+        current.get("artifact") == expected_marker["artifact"]
+        and current.get("version") == expected_marker["version"]
+    ):
+        checkpoint = torch.load(target_ckpt, map_location="cpu", weights_only=False)
+        print(
+            "[pretrain] using cached pinned W&B checkpoint "
+            f"artifact={{expected_marker['artifact']}} epoch={{checkpoint.get('epoch')}} "
+            f"global_step={{checkpoint.get('global_step')}} path={{target_ckpt}}",
+            flush=True,
+        )
+        raise SystemExit(0)
+
 api = wandb.Api(timeout=60)
 if artifact_ref:
     artifact = api.artifact(artifact_ref)
@@ -209,8 +242,9 @@ if target_ckpt.is_file() and marker_path.is_file() and not force:
         and current.get("version") == resolved["version"]
     ):
         checkpoint = torch.load(target_ckpt, map_location="cpu", weights_only=False)
+        mode = "pinned" if artifact_ref else "latest"
         print(
-            "[pretrain] using cached latest W&B checkpoint "
+            f"[pretrain] using cached {{mode}} W&B checkpoint "
             f"artifact={{artifact.name}} epoch={{checkpoint.get('epoch')}} "
             f"global_step={{checkpoint.get('global_step')}} path={{target_ckpt}}",
             flush=True,
@@ -911,8 +945,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-pretrain-task", default=DEFAULT_WANDB_PRETRAIN_TASK)
     parser.add_argument(
         "--wandb-pretrain-artifact",
-        default="",
-        help="Optional exact artifact ref. If omitted, the latest epoch-last artifact from --wandb-pretrain-task is used.",
+        default=DEFAULT_WANDB_PRETRAIN_ARTIFACT,
+        help=(
+            "Exact model artifact ref. Defaults to the pinned epoch-last-sqverrgj:v38. "
+            "Pass an empty string to resolve the latest epoch-last artifact from --wandb-pretrain-task."
+        ),
     )
     parser.add_argument("--force-pretrain-download", action="store_true")
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
@@ -989,7 +1026,8 @@ def main() -> int:
 
     if not args.skip_pretrain_download:
         target_pods = args.pods if args.parallel_teacher_cache else [args.pods[0]]
-        print(f"[launcher] preparing latest W&B pretrain checkpoint on {', '.join(target_pods)}")
+        mode = "pinned" if args.wandb_pretrain_artifact else "latest"
+        print(f"[launcher] preparing {mode} W&B pretrain checkpoint on {', '.join(target_pods)}")
         run_pod_scripts_parallel(
             args,
             [(pod, render_pretrain_download_script(args)) for pod in target_pods],
