@@ -1,0 +1,140 @@
+_target_: src.smart.model.smart_flow_gan.SMARTFlowGAN
+model_config:
+  lr: 1.0e-6
+  lr_warmup_steps: 2
+  lr_total_steps: ${trainer.max_epochs}
+  lr_min_ratio: 0.01
+  n_rollout_closed_val: 32
+  wosac_cpd_reference: null
+  wosac_distribution_type_scale: [22.3461620418, 4.5793447978, 18.5374388830]
+  n_batch_sim_agents_metric: 10
+  scorer_scene_num: 1680
+  sim_agents_metric_workers: 0
+  n_vis_batch: 0
+  n_vis_scenario: 0
+  n_vis_rollout: 0
+  vis_ghost_gt: false
+  vis_flow_preview: true
+  delete_local_videos_after_wandb_upload: false
+  val_open_loop: true
+  val_closed_loop: true
+  validation_open_seed: 0
+  validation_closed_seed: 0
+  token_processor:
+    map_token_file: "map_traj_token5.pkl"
+    agent_token_file: "agent_vocab_555_s2.pkl"
+    flow_window_steps: ${model.model_config.decoder.flow_window_steps}
+    use_prefix_valid_future_loss_mask: true
+    use_kinematic_control_flow: true
+    use_holonomic_model_only: false
+    control_pos_scale_m: 1.0
+    control_vehicle_no_slip_point_ratio: 0.2289518863
+    control_cyclist_no_slip_point_ratio: 0.0495847873
+    control_alignment_filter:
+      enabled: true
+      vehicle_max_error_m: 2.0
+      cyclist_max_error_m: 2.0
+    control_vehicle_yaw_scale_rad: 0.025
+    control_pedestrian_yaw_scale_rad: 0.20
+    control_cyclist_yaw_scale_rad: 0.06
+  validation_rollout_sampling:
+    sample_steps: 32
+    sample_method: euler
+    noise_scale: 1.0
+  # 기존 DMD/SiD self_forced 경로는 끕니다. GAN 경로는 self_forced_gan이 담당합니다.
+  self_forced:
+    enabled: false
+  self_forced_gan:
+    enabled: true
+    start_epoch: 0
+    teacher_cache_root: null
+    teacher_cache_size: 32
+    rollout_set_size: 16
+    effective_scene_batch: 64
+    warmup_scene_exposure: 64000
+    warmup_min_updates: 500
+    warmup_max_updates: 1500
+    student_unfrozen_range: full_flow_decoder
+    student_lr: 1.0e-6
+    discriminator_lr: 5.0e-6
+    position_sigma: 0.01
+    yaw_sigma: 0.01
+    r1_weight: 0.1
+    r2_weight: 0.1
+    gradient_clip_val: 1.0
+    ema_weight: 0.99
+    ema_start_step: 50
+    detach_block_transition: false
+    use_stop_motion: false
+    sampling:
+      sample_steps: 32
+      sample_method: euler
+      noise_scale: 1.0
+      backprop_last_k: 16
+      random_terminal_step:
+        enabled: true
+        scope: global_batch
+        policy: all
+        min_executed_steps: 24
+  decoder:
+    hidden_dim: 128
+    num_freq_bands: 64
+    num_heads: 8
+    head_dim: 15
+    dropout: 0.1
+    hist_drop_prob: 0.1
+    num_map_layers: 3
+    num_agent_layers: 6
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    a2a_radius: 60
+    time_span: 30
+    num_historical_steps: 11
+    num_future_steps: 80
+    flow_window_steps: 20
+    flow_dim: 96
+    flow_num_chunk_heads: 4
+    flow_num_chunk_layers: 2
+    flow_solver_steps: 32
+    flow_solver_method: euler
+    flow_solver_eps: 1.0e-3
+    use_kinematic_control_flow: ${model.model_config.token_processor.use_kinematic_control_flow}
+    use_holonomic_model_only: ${model.model_config.token_processor.use_holonomic_model_only}
+    control_pos_scale_m: ${model.model_config.token_processor.control_pos_scale_m}
+    control_vehicle_no_slip_point_ratio: ${model.model_config.token_processor.control_vehicle_no_slip_point_ratio}
+    control_cyclist_no_slip_point_ratio: ${model.model_config.token_processor.control_cyclist_no_slip_point_ratio}
+    control_vehicle_yaw_scale_rad: ${model.model_config.token_processor.control_vehicle_yaw_scale_rad}
+    control_pedestrian_yaw_scale_rad: ${model.model_config.token_processor.control_pedestrian_yaw_scale_rad}
+    control_cyclist_yaw_scale_rad: ${model.model_config.token_processor.control_cyclist_yaw_scale_rad}
+    closed_loop_rollout_mode: raw_fm
+    use_lqr: false
+    use_stop_motion: true
+    lqr_commit:
+      dt: 0.1
+      history_steps: 6
+      horizon_steps: 10
+      velocity_smooth_lambda: 1.0e-4
+      curvature_smooth_lambda: 1.0e-2
+      curvature_init_reg: 1.0e-10
+      stop_speed_mps: 0.2
+      stop_speed_kp: 0.5
+      longitudinal_q: 10.0
+      longitudinal_r: 0.0
+      lateral_q_lat: 1.0
+      lateral_q_head: 10.0
+      lateral_q_kappa: 0.0
+      lateral_r: 0.0
+      accel_tau_s: 0.0
+      curvature_tau_s: 0.0
+      min_speed_for_curvature_clip_mps: 0.5
+  sim_agents_submission:
+    is_active: false
+    method_name: "SMART-flow-GAN"
+    authors: [Seulbin Hwang, Kiyoung Om]
+    affiliation: NaverLabs
+    description: Set-level self-forcing GAN fine-tuning for closed-loop traffic simulation.
+    method_link: "not available yet"
+    account_name: "h.sb@naverlabs.com"
+  finetune:
+    enabled: false
+    train_full_flow_decoder_only: false

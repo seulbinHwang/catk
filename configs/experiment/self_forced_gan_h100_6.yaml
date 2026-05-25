@@ -1,0 +1,84 @@
+# @package _global_
+
+# Set-level self-forcing GAN fine-tuning preset for 6x H100 80GB.
+# Main idea:
+#   real = frozen teacher open-loop rollout set, K=16 sampled from offline cache[32]
+#   fake = student closed-loop rollout set, K=16
+#   D(scene, rollout_set) -> scalar logit
+
+defaults:
+  - override /model: smart_flow_gan
+  - override /trainer: ddp
+
+action: finetune
+ckpt_path: null
+
+model:
+  model_config:
+    lr: 1.0e-6
+    val_open_loop: true
+    val_closed_loop: true
+    n_rollout_closed_val: 32
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    self_forced_gan:
+      enabled: true
+      teacher_cache_root: ${paths.teacher_gan_cache_root}
+      teacher_cache_size: 32
+      rollout_set_size: 16
+      effective_scene_batch: 64
+      warmup_scene_exposure: 64000
+      warmup_min_updates: 500
+      warmup_max_updates: 1500
+      student_unfrozen_range: full_flow_decoder
+      student_lr: 1.0e-6
+      discriminator_lr: 5.0e-6
+      r1_weight: 0.1
+      r2_weight: 0.1
+      position_sigma: 0.01
+      yaw_sigma: 0.01
+      ema_weight: 0.99
+      ema_start_step: 50
+      sampling:
+        sample_steps: 32
+        sample_method: euler
+        noise_scale: 1.0
+        backprop_last_k: 16
+        random_terminal_step:
+          enabled: true
+          scope: global_batch
+          policy: all
+          min_executed_steps: 24
+
+paths:
+  teacher_gan_cache_root: null
+
+trainer:
+  devices: 6
+  max_epochs: 6
+  check_val_every_n_epoch: 1
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  precision: bf16-mixed
+  gradient_clip_val: null
+  sync_batchnorm: false
+  strategy:
+    find_unused_parameters: true
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  # GAN fine-tuning은 scene x rollout set이 실제 batch 단위입니다.
+  # per-GPU microbatch는 OOM이 안 나는 범위에서 1~2부터 probe하고,
+  # multi-node global scene batch가 64~128이 되도록 GPU 수를 늘립니다.
+  train_batch_size: 2
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
+  train_epoch_sample_fraction: 0.5

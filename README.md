@@ -4,6 +4,7 @@
 기본 실행 경로와 문서, 스크립트는 모두 `smart_flow` 계열만 사용하며 CrossEntropy 기반 next-token 경로는 제거했습니다.
 현재 closed-loop local 평가는 **TrajTok Fast WOSAC 2025 metric**을 사용하고, 제출 export는 **Waymo 2025 Sim Agents** 형식을 사용합니다.
 
+- Set-level self-forced GAN fine-tuning 사용법은 [README_SELF_FORCED_GAN.md](README_SELF_FORCED_GAN.md)를 참고합니다.
 - 기존 SMART의 map/context trunk를 그대로 재사용하고, agent 쪽만 flow decoder로 바꿔 scene-context 품질을 유지합니다.
 - `FlowTokenProcessor`는 18-token context pack과 16개 NTP-aligned anchor를 만들고,
   tail anchor는 존재하는 future prefix에만 Flow loss를 줍니다.
