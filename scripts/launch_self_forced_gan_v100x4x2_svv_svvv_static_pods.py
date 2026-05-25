@@ -244,6 +244,64 @@ PY
 """
 
 
+def render_teacher_cache_key_script(args: argparse.Namespace) -> str:
+    return f"""set -Eeuo pipefail
+cd {shq(args.project_root)}
+if [[ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]]; then
+  source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
+  conda activate catk
+fi
+python - <<'PY'
+import json
+import re
+from pathlib import Path
+
+import torch
+
+ckpt_path = Path({args.pretrain_ckpt!r})
+marker_path = ckpt_path.with_suffix(ckpt_path.suffix + ".wandb.json")
+marker = {{}}
+if marker_path.exists():
+    try:
+        marker = json.loads(marker_path.read_text())
+    except Exception:
+        marker = {{}}
+checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+artifact = marker.get("artifact") or marker.get("qualified_artifact") or ckpt_path.stem
+artifact = artifact.split("/")[-1]
+artifact_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(artifact)).strip("._-") or "checkpoint"
+epoch = checkpoint.get("epoch")
+global_step = checkpoint.get("global_step")
+parts = [
+    artifact_key,
+    f"epoch{{epoch}}" if epoch is not None else "epoch_unknown",
+    f"gs{{global_step}}" if global_step is not None else "gs_unknown",
+    f"seed{int(args.teacher_cache_seed)}",
+    f"k{int(args.teacher_cache_rollouts)}",
+    "fp16",
+]
+if {bool(args.teacher_cache_max_scenes)!r}:
+    parts.append({("max" + str(args.teacher_cache_max_scenes))!r})
+print("_".join(parts))
+PY
+"""
+
+
+def resolve_teacher_cache_root(args: argparse.Namespace) -> None:
+    if not args.teacher_cache_keyed_root:
+        return
+    if args.dry_run:
+        key = "checkpoint_keyed_teacher_cache"
+    else:
+        key = exec_in_pod(args, args.pods[0], render_teacher_cache_key_script(args), capture=True).strip()
+    if not key:
+        raise RuntimeError("failed to resolve teacher cache key")
+    base = Path(args.teacher_cache_root)
+    if base.name != key:
+        args.teacher_cache_root = str(base / key)
+    print(f"[launcher] resolved checkpoint-keyed teacher cache root: {args.teacher_cache_root}", flush=True)
+
+
 def render_teacher_cache_build_script(args: argparse.Namespace, *, max_scenes: str) -> str:
     max_arg = f" --max-scenes {shq(max_scenes)}" if max_scenes else ""
     skip_arg = " --skip-existing" if args.skip_existing_teacher_cache else ""
@@ -263,6 +321,7 @@ PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
   --output-root "$TEACHER_GAN_CACHE_ROOT" \
   --split train \
   --rollouts-per-scene {int(args.teacher_cache_rollouts)} \
+  --seed {int(args.teacher_cache_seed)} \
   --storage-dtype float16 \
   --amp-dtype float16 \
   --device cuda:0{max_arg}{skip_arg} \
@@ -296,6 +355,7 @@ def render_parallel_teacher_cache_build_script(
                     f"--output-root \"$TEACHER_GAN_CACHE_ROOT\"",
                     "--split train",
                     f"--rollouts-per-scene {int(args.teacher_cache_rollouts)}",
+                    f"--seed {int(args.teacher_cache_seed)}",
                     "--storage-dtype float16",
                     "--amp-dtype float16",
                     "--device cuda:0",
@@ -330,6 +390,33 @@ for pid in "${{pids[@]}}"; do
   wait "$pid" || status=1
 done
 exit "$status"
+"""
+
+
+def render_teacher_cache_manifest_check_script(args: argparse.Namespace, *, max_scenes: str) -> str:
+    max_arg = f" --max-scenes {shq(max_scenes)}" if max_scenes else ""
+    return f"""set -Eeuo pipefail
+cd {shq(args.project_root)}
+if [[ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]]; then
+  source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
+  conda activate catk
+fi
+export CACHE_ROOT={shq(args.cache_root)}
+export TEACHER_GAN_CACHE_ROOT={shq(args.teacher_cache_root)}
+PYTHONPATH=. python tools/build_self_forced_gan_teacher_cache.py \
+  --ckpt-path {shq(args.pretrain_ckpt)} \
+  --output-root "$TEACHER_GAN_CACHE_ROOT" \
+  --split train \
+  --rollouts-per-scene {int(args.teacher_cache_rollouts)} \
+  --seed {int(args.teacher_cache_seed)} \
+  --storage-dtype float16 \
+  --amp-dtype float16 \
+  --check-manifest{max_arg} \
+  --batch-size {int(args.teacher_cache_batch_size)} \
+  --rollout-batch-size {int(args.teacher_cache_rollout_batch_size)} \
+  --override paths.cache_root="$CACHE_ROOT" \
+  --override experiment={shq(args.experiment)}
+PYTHONPATH=. python tools/validate_self_forced_gan_cache.py "$TEACHER_GAN_CACHE_ROOT" --max-files {int(args.validate_cache_max_files)}
 """
 
 
@@ -448,6 +535,9 @@ for shard_index in range({int(shard_start)}, {int(shard_end)}):
     if not index_path.exists():
         raise FileNotFoundError(index_path)
     entries.append(index_name)
+    manifest_name = f"teacher_cache_manifest.shard_{{shard_index:05d}}_of_{{num_shards:05d}}.json"
+    if (root / manifest_name).exists():
+        entries.append(manifest_name)
     log_name = f"shard_{{shard_index:05d}}.log"
     if (root / log_name).exists():
         entries.append(log_name)
@@ -602,6 +692,26 @@ def build_teacher_cache_parallel(args: argparse.Namespace) -> None:
             pod,
             render_merge_teacher_cache_index_script(args, num_shards=num_shards),
         )
+
+
+def matching_teacher_cache_available(args: argparse.Namespace) -> bool:
+    outputs = {}
+    for pod in args.pods:
+        try:
+            outputs[pod] = exec_in_pod(
+                args,
+                pod,
+                render_teacher_cache_manifest_check_script(args, max_scenes=args.teacher_cache_max_scenes),
+                capture=True,
+            )
+        except subprocess.CalledProcessError:
+            print(f"[launcher] no matching teacher cache manifest on {pod}", flush=True)
+            return False
+    for pod, output in outputs.items():
+        if output:
+            print(f"[launcher] matching teacher cache on {pod}:\n{output}", flush=True)
+    print("[launcher] matching teacher cache is already available on all pods; skipping build", flush=True)
+    return True
 
 
 def base_launcher_command(args: argparse.Namespace) -> list[str]:
@@ -760,12 +870,15 @@ def parse_args() -> argparse.Namespace:
         help="Debug/smoke limit for cache building. Omit when building the full train cache.",
     )
     parser.add_argument("--teacher-cache-rollouts", type=int, default=32)
+    parser.add_argument("--teacher-cache-seed", type=int, default=817)
     parser.add_argument("--teacher-cache-batch-size", type=int, default=32)
     parser.add_argument("--teacher-cache-rollout-batch-size", type=int, default=32)
     parser.add_argument("--teacher-cache-gpus-per-pod", type=int, default=4)
     parser.add_argument("--teacher-cache-sync-port", default="29720")
     parser.add_argument("--teacher-cache-direct-pod-sync", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--parallel-teacher-cache", action="store_true")
+    parser.add_argument("--teacher-cache-keyed-root", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reuse-matching-teacher-cache", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-existing-teacher-cache", action="store_true")
     parser.add_argument("--sync-teacher-cache", action="store_true")
     parser.add_argument("--validate-cache-max-files", type=int, default=16)
@@ -781,6 +894,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--nproc-per-node must be 4 for svv/svvv V100x4 pods")
     if args.teacher_cache_rollouts < 32:
         parser.error("--teacher-cache-rollouts must be at least 32 for K=16 sampling from cache[32]")
+    if args.teacher_cache_seed < 0:
+        parser.error("--teacher-cache-seed must be >= 0")
     if args.teacher_cache_batch_size < 1:
         parser.error("--teacher-cache-batch-size must be >= 1")
     if args.teacher_cache_rollout_batch_size < 1:
@@ -801,19 +916,25 @@ def main() -> int:
             print(f"[launcher] preparing latest W&B pretrain checkpoint on {pod}")
             exec_in_pod(args, pod, render_pretrain_download_script(args))
 
+    resolve_teacher_cache_root(args)
+
     if args.build_teacher_cache:
-        if args.parallel_teacher_cache:
-            build_teacher_cache_parallel(args)
-        else:
-            print(f"[launcher] building teacher cache on {args.pods[0]}: {args.teacher_cache_root}")
-            exec_in_pod(
-                args,
-                args.pods[0],
-                render_teacher_cache_build_script(args, max_scenes=args.teacher_cache_max_scenes),
-            )
-            if args.sync_teacher_cache:
-                print(f"[launcher] syncing teacher cache to {args.pods[1]}")
-                sync_directory(args, args.pods[0], args.pods[1], args.teacher_cache_root)
+        cache_ready = False
+        if args.reuse_matching_teacher_cache:
+            cache_ready = matching_teacher_cache_available(args)
+        if not cache_ready:
+            if args.parallel_teacher_cache:
+                build_teacher_cache_parallel(args)
+            else:
+                print(f"[launcher] building teacher cache on {args.pods[0]}: {args.teacher_cache_root}")
+                exec_in_pod(
+                    args,
+                    args.pods[0],
+                    render_teacher_cache_build_script(args, max_scenes=args.teacher_cache_max_scenes),
+                )
+                if args.sync_teacher_cache:
+                    print(f"[launcher] syncing teacher cache to {args.pods[1]}")
+                    sync_directory(args, args.pods[0], args.pods[1], args.teacher_cache_root)
 
     print("[launcher] validating teacher cache on both pods")
     for pod in args.pods:

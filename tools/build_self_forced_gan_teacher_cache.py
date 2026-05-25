@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import datetime as _datetime
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from contextlib import nullcontext
@@ -26,6 +28,10 @@ from hydra.utils import instantiate  # noqa: E402
 from src.smart.modules.kinematic_control import POSE_NORM_POS_SCALE_M  # noqa: E402
 from src.smart.modules.self_forced_gan_cache import _sanitize_scenario_id  # noqa: E402
 from src.smart.utils import transform_to_global  # noqa: E402
+
+MANIFEST_SCHEMA_VERSION = 1
+MANIFEST_NAME = "teacher_cache_manifest.json"
+EXPECTED_MANIFEST_NAME = "teacher_cache_manifest.expected.json"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -77,6 +83,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-existing", action="store_true", help="Do not rebuild scene files that already exist.")
     parser.add_argument(
+        "--check-manifest",
+        action="store_true",
+        help="Exit successfully only when teacher_cache_manifest.json matches this build request.",
+    )
+    parser.add_argument(
         "--merge-shard-indexes",
         action="store_true",
         help="Only merge index.shard_* files under --output-root into index.json.",
@@ -92,6 +103,218 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _run_git(args: list[str]) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=REPO_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _repo_metadata() -> dict[str, Any]:
+    status = _run_git(["status", "--short"])
+    return {
+        "commit": _run_git(["rev-parse", "HEAD"]),
+        "branch": _run_git(["branch", "--show-current"]),
+        "dirty": bool(status),
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fp:
+        for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_checkpoint_file(ckpt_path: Path) -> dict[str, Any]:
+    try:
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        raise ValueError(f"Checkpoint must be a Lightning checkpoint with state_dict: {ckpt_path}")
+    if not isinstance(checkpoint["state_dict"], dict):
+        raise ValueError(f"Checkpoint state_dict must be a mapping: {ckpt_path}")
+    return checkpoint
+
+
+def _checkpoint_metadata(ckpt_path: Path, checkpoint: dict[str, Any]) -> dict[str, Any]:
+    marker_path = ckpt_path.with_suffix(ckpt_path.suffix + ".wandb.json")
+    marker: dict[str, Any] = {}
+    if marker_path.exists():
+        try:
+            raw_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if isinstance(raw_marker, dict):
+                marker = raw_marker
+        except Exception:
+            marker = {}
+    return {
+        "path": str(ckpt_path),
+        "sha256": _sha256_file(ckpt_path),
+        "epoch": checkpoint.get("epoch"),
+        "global_step": checkpoint.get("global_step"),
+        "wandb": marker,
+    }
+
+
+def _dataset_scene_count(dataloader: Any) -> int | None:
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None:
+        return None
+    try:
+        return int(len(dataset))
+    except Exception:
+        return None
+
+
+def _cache_identity(
+    *,
+    args: argparse.Namespace,
+    checkpoint_meta: dict[str, Any],
+    split_scene_count: int | None,
+    flow_window_steps: int,
+) -> dict[str, Any]:
+    wandb_meta = checkpoint_meta.get("wandb") or {}
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "checkpoint": {
+            "sha256": checkpoint_meta.get("sha256"),
+            "epoch": checkpoint_meta.get("epoch"),
+            "global_step": checkpoint_meta.get("global_step"),
+            "artifact": wandb_meta.get("artifact"),
+            "version": wandb_meta.get("version"),
+            "qualified_artifact": wandb_meta.get("qualified_artifact"),
+        },
+        "cache": {
+            "split": "val" if args.split == "validation" else str(args.split),
+            "rollouts_per_scene": int(args.rollouts_per_scene),
+            "seed": int(args.seed),
+            "storage_dtype": str(args.storage_dtype),
+            "flow_window_steps": int(flow_window_steps),
+            "max_scenes": int(args.max_scenes) if args.max_scenes is not None else None,
+        },
+        "dataset": {
+            "split_scene_count": split_scene_count,
+        },
+    }
+
+
+def _manifest_payload(
+    *,
+    status: str,
+    identity: dict[str, Any],
+    checkpoint_meta: dict[str, Any],
+    args: argparse.Namespace,
+    split_scene_count: int | None,
+    processed: int | None = None,
+    written: int | None = None,
+    index_entries: int | None = None,
+    pt_file_count: int | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "status": status,
+        "created_at_utc": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
+        "cache_identity": identity,
+        "checkpoint": checkpoint_meta,
+        "repo": _repo_metadata(),
+        "builder": {
+            "script": "tools/build_self_forced_gan_teacher_cache.py",
+            "batch_size": int(args.batch_size),
+            "rollout_batch_size": int(args.rollout_batch_size or args.rollouts_per_scene),
+            "amp_dtype": str(args.amp_dtype),
+            "num_shards": int(args.num_shards),
+            "shard_index": int(args.shard_index),
+        },
+        "dataset": {
+            "split": "val" if args.split == "validation" else str(args.split),
+            "split_scene_count": split_scene_count,
+        },
+        "files": {
+            "expected_file_count": processed,
+            "index_entries": index_entries,
+            "pt_file_count": pt_file_count,
+            "written": written,
+        },
+    }
+
+
+def _read_manifest(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as fp:
+        manifest = json.load(fp)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Manifest must be a dict: {path}")
+    return manifest
+
+
+def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
+    tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as fp:
+        json.dump(_json_safe(payload), fp, indent=2, sort_keys=True)
+        fp.write("\n")
+    os.replace(tmp_path, path)
+
+
+def _manifest_identity_matches(output_root: Path, identity: dict[str, Any], *, allow_expected: bool) -> bool:
+    candidates = [output_root / MANIFEST_NAME]
+    if allow_expected:
+        candidates.append(output_root / EXPECTED_MANIFEST_NAME)
+    for path in candidates:
+        manifest = _read_manifest(path)
+        if manifest is None:
+            continue
+        if manifest.get("cache_identity") == identity:
+            return True
+    return False
+
+
+def _check_complete_manifest(output_root: Path, identity: dict[str, Any]) -> None:
+    manifest_path = output_root / MANIFEST_NAME
+    manifest = _read_manifest(manifest_path)
+    if manifest is None:
+        raise FileNotFoundError(f"Missing {manifest_path}")
+    if manifest.get("status") != "complete":
+        raise ValueError(f"{manifest_path} is not complete: status={manifest.get('status')!r}")
+    if manifest.get("cache_identity") != identity:
+        raise ValueError(f"{manifest_path} does not match this checkpoint/cache request")
+    files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+    expected = files.get("expected_file_count")
+    index_entries = files.get("index_entries")
+    index = _read_index(output_root / "index.json")
+    if expected is not None and len(index) != int(expected):
+        raise ValueError(f"index.json entries={len(index)} expected={expected}")
+    if index_entries is not None and len(index) != int(index_entries):
+        raise ValueError(f"index.json entries={len(index)} manifest_index_entries={index_entries}")
+    missing = [
+        rel_path
+        for rel_path in index.values()
+        if not (output_root / rel_path).exists()
+    ]
+    if missing:
+        raise FileNotFoundError(f"Missing cache files listed by index.json: {missing[:5]}")
+    print(f"[teacher_cache] manifest_ok path={manifest_path} entries={len(index)}", flush=True)
 
 
 def _default_overrides(args: argparse.Namespace) -> list[str]:
@@ -136,16 +359,10 @@ def _compose_config(args: argparse.Namespace):
     return cfg
 
 
-def _load_teacher_checkpoint(model: torch.nn.Module, ckpt_path: Path) -> None:
-    try:
-        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    except TypeError:
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
-    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
-        raise ValueError(f"Checkpoint must be a Lightning checkpoint with state_dict: {ckpt_path}")
+def _load_teacher_checkpoint(model: torch.nn.Module, ckpt_path: Path, checkpoint: dict[str, Any] | None = None) -> None:
+    if checkpoint is None:
+        checkpoint = _load_checkpoint_file(ckpt_path)
     state_dict = checkpoint["state_dict"]
-    if not isinstance(state_dict, dict):
-        raise ValueError(f"Checkpoint state_dict must be a mapping: {ckpt_path}")
     load_result = model.load_state_dict(state_dict, strict=False)
     if load_result.missing_keys:
         print(
@@ -475,7 +692,7 @@ def _write_index(index_path: Path, index: dict[str, str]) -> None:
     os.replace(tmp_path, index_path)
 
 
-def _merge_shard_indexes(output_root: Path, *, num_shards: int | None = None) -> None:
+def _merge_shard_indexes(output_root: Path, *, num_shards: int | None = None) -> dict[str, str]:
     if num_shards is None or int(num_shards) <= 1:
         shard_paths = sorted(output_root.glob("index.shard_*.json"))
     else:
@@ -501,6 +718,66 @@ def _merge_shard_indexes(output_root: Path, *, num_shards: int | None = None) ->
     print(
         f"[teacher_cache] merged_shards={len(shard_paths)} entries={len(merged)} "
         f"index={output_root / 'index.json'}",
+        flush=True,
+    )
+    return merged
+
+
+def _merge_shard_manifests(output_root: Path, *, num_shards: int, index_entries: int) -> None:
+    expected_manifest = _read_manifest(output_root / EXPECTED_MANIFEST_NAME)
+    shard_paths = [
+        output_root / f"teacher_cache_manifest.shard_{shard_index:05d}_of_{int(num_shards):05d}.json"
+        for shard_index in range(int(num_shards))
+    ]
+    existing_shard_paths = [path for path in shard_paths if path.exists()]
+    shard_manifests = [_read_manifest(path) for path in existing_shard_paths]
+    if shard_manifests:
+        if len(shard_manifests) != int(num_shards):
+            missing = [path for path in shard_paths if not path.exists()]
+            raise FileNotFoundError(
+                "Missing shard manifest files: " + ", ".join(str(path) for path in missing[:20])
+            )
+        first_identity = shard_manifests[0].get("cache_identity")
+        mismatched = [
+            path
+            for path, manifest in zip(existing_shard_paths, shard_manifests)
+            if manifest.get("cache_identity") != first_identity
+        ]
+        if mismatched:
+            raise ValueError("Shard manifest identity mismatch: " + ", ".join(str(path) for path in mismatched[:5]))
+        source = shard_manifests[0]
+    elif expected_manifest is not None:
+        source = expected_manifest
+    else:
+        print(
+            f"[teacher_cache] no shard manifests found under {output_root}; skipping final manifest write",
+            flush=True,
+        )
+        return
+
+    files = source.get("files") if isinstance(source.get("files"), dict) else {}
+    total_written = sum(
+        int((manifest.get("files") or {}).get("written") or 0)
+        for manifest in shard_manifests
+        if isinstance(manifest, dict)
+    )
+    payload = dict(source)
+    payload["status"] = "complete"
+    payload["created_at_utc"] = _datetime.datetime.now(_datetime.timezone.utc).isoformat()
+    payload["files"] = {
+        **files,
+        "expected_file_count": int(index_entries),
+        "index_entries": int(index_entries),
+        "pt_file_count": len(list(output_root.glob("*.pt"))),
+        "written": total_written if shard_manifests else files.get("written"),
+    }
+    payload["shards"] = {
+        "num_shards": int(num_shards),
+        "manifest_count": len(shard_manifests),
+    }
+    _write_manifest(output_root / MANIFEST_NAME, payload)
+    print(
+        f"[teacher_cache] wrote_manifest={output_root / MANIFEST_NAME} entries={index_entries}",
         flush=True,
     )
 
@@ -554,7 +831,8 @@ def main() -> None:
     args = _parse_args()
     if args.merge_shard_indexes:
         output_root = args.output_root.expanduser().resolve()
-        _merge_shard_indexes(output_root, num_shards=int(args.num_shards))
+        merged = _merge_shard_indexes(output_root, num_shards=int(args.num_shards))
+        _merge_shard_manifests(output_root, num_shards=int(args.num_shards), index_entries=len(merged))
         return
     if args.ckpt_path is None:
         raise ValueError("--ckpt-path is required unless --merge-shard-indexes is set.")
@@ -572,8 +850,13 @@ def main() -> None:
     output_root = args.output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     index_path = output_root / "index.json"
+    if args.num_shards > 1:
+        index_path = output_root / f"index.shard_{int(args.shard_index):05d}_of_{int(args.num_shards):05d}.json"
     index = _read_index(index_path)
 
+    ckpt_path = args.ckpt_path.expanduser().resolve()
+    checkpoint = _load_checkpoint_file(ckpt_path)
+    checkpoint_meta = _checkpoint_metadata(ckpt_path, checkpoint)
     cfg = _compose_config(args)
     datamodule = instantiate(cfg.data)
     _attach_shard_trainer(
@@ -582,13 +865,48 @@ def main() -> None:
         shard_index=int(args.shard_index),
     )
     model = instantiate(cfg.model, _recursive_=False)
-    _load_teacher_checkpoint(model, args.ckpt_path.expanduser().resolve())
+    split_scene_count = None
 
     device = torch.device(args.device)
+    dataloader = _select_dataloader(datamodule, args.split)
+    split_scene_count = _dataset_scene_count(dataloader)
+    identity = _cache_identity(
+        args=args,
+        checkpoint_meta=checkpoint_meta,
+        split_scene_count=split_scene_count,
+        flow_window_steps=int(getattr(model, "flow_window_steps", 20)),
+    )
+    if args.check_manifest:
+        try:
+            _check_complete_manifest(output_root, identity)
+        except Exception as exc:
+            print(f"[teacher_cache] manifest_miss reason={exc}", file=sys.stderr, flush=True)
+            raise SystemExit(2) from None
+        return
+
+    skip_existing = bool(args.skip_existing)
+    if skip_existing and not _manifest_identity_matches(output_root, identity, allow_expected=True):
+        print(
+            "[teacher_cache] --skip-existing requested but no matching complete/expected "
+            "manifest was found; existing files will be rebuilt instead of trusted.",
+            flush=True,
+        )
+        skip_existing = False
+    _write_manifest(
+        output_root / EXPECTED_MANIFEST_NAME,
+        _manifest_payload(
+            status="expected",
+            identity=identity,
+            checkpoint_meta=checkpoint_meta,
+            args=args,
+            split_scene_count=split_scene_count,
+        ),
+    )
+
+    _load_teacher_checkpoint(model, ckpt_path, checkpoint)
     model.to(device)
     model.eval()
     model.requires_grad_(False)
-    dataloader = _select_dataloader(datamodule, args.split)
 
     storage_dtype = _storage_dtype(args.storage_dtype)
     processed = 0
@@ -602,7 +920,7 @@ def main() -> None:
     for batch_index, data in enumerate(dataloader):
         data = _to_device(data, device)
         scenario_ids = _scenario_id_list(data["scenario_id"])
-        if args.skip_existing and all((output_root / (_sanitize_scenario_id(sid) + ".pt")).exists() for sid in scenario_ids):
+        if skip_existing and all((output_root / (_sanitize_scenario_id(sid) + ".pt")).exists() for sid in scenario_ids):
             for sid in scenario_ids:
                 index[str(sid)] = _sanitize_scenario_id(sid) + ".pt"
             processed += len(scenario_ids)
@@ -632,7 +950,7 @@ def main() -> None:
                 storage_dtype=storage_dtype,
                 base_seed=int(args.seed),
                 rollouts_per_scene=int(args.rollouts_per_scene),
-                overwrite=not args.skip_existing,
+                overwrite=not skip_existing,
             )
             written += int(did_write)
             processed += 1
@@ -646,13 +964,30 @@ def main() -> None:
         if shard_max_scenes is not None and processed >= shard_max_scenes:
             break
 
-    if args.num_shards > 1:
-        index_path = output_root / f"index.shard_{int(args.shard_index):05d}_of_{int(args.num_shards):05d}.json"
     _write_index(index_path, index)
+    manifest_path = output_root / MANIFEST_NAME
+    if args.num_shards > 1:
+        manifest_path = output_root / (
+            f"teacher_cache_manifest.shard_{int(args.shard_index):05d}_of_{int(args.num_shards):05d}.json"
+        )
+    _write_manifest(
+        manifest_path,
+        _manifest_payload(
+            status="complete",
+            identity=identity,
+            checkpoint_meta=checkpoint_meta,
+            args=args,
+            split_scene_count=split_scene_count,
+            processed=processed,
+            written=written,
+            index_entries=len(index),
+            pt_file_count=len(list(output_root.glob("*.pt"))) if args.num_shards <= 1 else None,
+        ),
+    )
     elapsed = time.monotonic() - started
     print(
         f"[teacher_cache] done processed={processed} written={written} "
-        f"index={index_path} elapsed_sec={elapsed:.1f}",
+        f"index={index_path} manifest={manifest_path} elapsed_sec={elapsed:.1f}",
         flush=True,
     )
 

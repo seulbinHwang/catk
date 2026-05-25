@@ -79,6 +79,13 @@ context에서 2초 open-loop trajectory를 32개 샘플링하여 scene별 `.pt` 
 sampling target에는 future GT를 넣지 않고, 저장된 `valid_mask`는 현재 context에서 teacher
 sampling을 실제로 수행한 agent만 표시합니다.
 
+cache 생성이 정상 완료되면 root에 `teacher_cache_manifest.json`을 저장합니다. manifest에는
+checkpoint W&B artifact/epoch/global step, checkpoint SHA256, repo commit, split, scene 수,
+`rollouts_per_scene`, seed, 저장 dtype, `index.json` entry 수가 기록됩니다. 중간에 끊긴
+작업은 같은 cache identity를 담은 `teacher_cache_manifest.expected.json`이 있을 때만
+`--skip-existing`로 이어받습니다. manifest가 없거나 현재 checkpoint/cache 설정과 다르면
+기존 `.pt` 파일을 신뢰하지 않고 다시 생성합니다.
+
 속도 최적화 경로에서는 scene batch와 rollout batch를 함께 사용합니다. 기존의
 scene 1개 x rollout 32개 순차 생성과 같은 teacher/cache 의미를 유지하되, 여러 scene의
 context encode와 32개 rollout sampling을 GPU batch로 묶어 처리합니다.
@@ -132,6 +139,22 @@ builder shard로 사용하고, 각 pod가 만든 shard를 pod-to-pod direct stre
 양쪽 pod에서 같은 `index.json`을 merge합니다. 학습 시에는 양쪽 pod가 같은 cache root를
 읽습니다.
 
+launcher는 기본적으로 checkpoint별 subdir를 자동으로 붙입니다. 예를 들어 최신 W&B
+checkpoint가 `epoch-last-sqverrgj:v36`, epoch 35, global step 162360이면 cache root는
+아래처럼 해석됩니다.
+
+```text
+$TEACHER_GAN_CACHE_ROOT/epoch-last-sqverrgj_v36_epoch35_gs162360_seed817_k32_fp16
+```
+
+`--teacher-cache-max-scenes`를 쓰는 smoke cache는 같은 full cache root를 오염시키지 않도록
+key 뒤에 `max32` 같은 suffix가 추가됩니다.
+
+build 전에 양쪽 pod에서 `teacher_cache_manifest.json`과 cache validator를 확인합니다.
+manifest가 현재 checkpoint/cache identity와 일치하고 validator가 통과하면 cache build를
+통째로 skip합니다. 같은 checkpoint cache를 재사용하려면 기존 cache root를 그대로 두고
+동일한 launcher command를 다시 실행하면 됩니다.
+
 ```bash
 python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
   --build-teacher-cache \
@@ -142,6 +165,14 @@ python scripts/launch_self_forced_gan_v100x4x2_svv_svvv_static_pods.py \
   --teacher-cache-rollout-batch-size 32 \
   --replace
 ```
+
+강제로 다시 만들고 싶으면 `--no-reuse-matching-teacher-cache`를 추가합니다. 이전 실행이
+중간에 끊겨 같은 manifest identity의 partial cache만 남아 있을 때는
+`--skip-existing-teacher-cache`를 추가하면 이미 완료된 scene 파일만 건너뛰고 이어받습니다.
+manifest가 맞지 않는 stale cache에서는 이 옵션을 주더라도 기존 파일을 재사용하지 않습니다.
+
+checkpoint별 subdir 자동 생성을 끄고 직접 지정한 cache root를 그대로 쓰려면
+`--no-teacher-cache-keyed-root`를 추가합니다. 이 경우에도 manifest identity 검증은 유지됩니다.
 
 실측 기준으로 4096 scene cache를 생성, shard 교환, index merge, 양쪽 pod validate까지
 `100.97s`가 걸렸습니다. train split 전체 486,995 scene 기준 단순 외삽 예상은 약 3.3시간이고,
