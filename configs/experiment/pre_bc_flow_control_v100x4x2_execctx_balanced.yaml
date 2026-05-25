@@ -1,0 +1,52 @@
+# @package _global_
+
+# V100x4x2 execution-context-aligned control-space pretrain.
+#
+# This is the V100 counterpart of
+# `pre_bc_flow_control_h100x4x2_execctx_balanced`, intended for the static
+# `sv` + `svv` pods:
+#   * sv:  4x Tesla V100 32GB
+#   * svv: 4x Tesla V100 32GB
+#
+# Differences from the H100x6 4+2 recipe documented in README:
+#   * homogeneous 2 pod x 4 GPU layout, world size 8;
+#   * V100-safe `precision=16-mixed` instead of bf16;
+#   * conservative per-GPU train batch 4 with OOM fallback in the launcher;
+#   * lower LR scaled for the smaller starting global batch, 4 * 8 = 32;
+#   * lower fit-time closed-loop rollout count to keep V100 validation memory
+#     below the 32GB device limit.
+
+defaults:
+  - pre_bc_flow_control_h100x4x2_execctx_balanced
+  - _self_
+
+model:
+  model_config:
+    lr: 2.0e-4
+    n_rollout_closed_val: 16
+    sim_agents_context_cache_size: 32
+
+trainer:
+  devices: 4
+  num_nodes: 2
+  precision: 16-mixed
+  check_val_every_n_epoch: 16
+  max_epochs: 64
+  strategy:
+    find_unused_parameters: true
+
+data:
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 4
+  num_workers: 2
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
+  train_memory_balanced_batches: true
+  train_memory_balance_metadata_cache: ${paths.log_dir}/dataset_metadata/womd_training_memory_balance_v1.pt
+  train_memory_balance_metadata_num_workers: 8
+  train_memory_balance_build_on_missing: false
+  train_memory_balance_agent_weight: 1.0
+  train_memory_balance_current_valid_agent_weight: 1.0
+  train_memory_balance_valid_agent_step_weight: 0.0
+  train_memory_balance_map_weight: 0.02
