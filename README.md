@@ -1026,6 +1026,49 @@ kubectl exec -it -n p-pnc testas -c main -- tmux attach -t fast-rmm-epoch-sweep-
 python scripts/launch_fast_rmm_epoch_sweep_a100x7_testas_static_pod.py --stop
 ```
 
+#### testas A100x7 Fast-RMM best checkpoint Waymo validation submission
+
+`flow_control_space_pretrain_a100x7_testas_execctx_prefix_balanced_lr6e-4_bs17_remote_oomretry` 학습이 끝난 뒤, Fast-RMM epoch sweep을 먼저 돌리고 `BEST_BY_RMM`으로 뽑힌 checkpoint를 Waymo 2025 Sim Agents validation 제출 파일로 export/upload하려면 아래 통합 launcher를 씁니다.
+
+```bash
+python scripts/launch_fast_rmm_sweep_then_waymo_a100x7_testas_static_pod.py \
+  --replace
+```
+
+이 launcher의 기본 artifact collection은 해당 완료 run의 `epoch-last-kngl2eq8`입니다. 다른 W&B run을 평가하려면 `--artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id>`를 명시합니다.
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_fast_rmm_sweep_then_waymo_a100x7_testas_static_pod.py \
+  --epoch-versions 63:v53 \
+  --dry-run
+```
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling_fd` |
+| 대상 pod | `testas` |
+| GPU 구성 | A100 80GB 7장, 단일 노드 |
+| Fast-RMM sweep launcher | `scripts/launch_fast_rmm_epoch_sweep_a100x7_testas_static_pod.py` |
+| Waymo submission launcher | `scripts/launch_waymo_submission_from_best_a100x7_testas_static_pod.py` |
+| 통합 launcher | `scripts/launch_fast_rmm_sweep_then_waymo_a100x7_testas_static_pod.py` |
+| 기본 artifact prefix | `jksg01019-naver-labs/SMART-FLOW/epoch-last-kngl2eq8` |
+| 기본 평가 범위 | W&B metadata epoch `57~64` |
+| Fast-RMM val batch | `16` |
+| Waymo submission val batch | `16` |
+| rollout 수 | `n_rollout_closed_val=32` |
+| Waymo evaluation set | `validation` |
+| Waymo storage state | `/mnt/nuplan/projects/catk/secrets/waymo/waymo_storage_state.json` |
+
+동작 순서는 명확합니다. 먼저 `testas`에서 Fast-RMM sweep tmux를 띄워 epoch별 closed-loop validation을 수행합니다. sweep이 `epoch_sweep_summary.txt`에 `BEST_BY_RMM`을 기록하면, 통합 launcher가 그 epoch의 checkpoint 경로를 manifest에서 찾아 Waymo validation submission tmux를 새로 띄웁니다. pod는 생성/삭제/재시작하지 않습니다.
+
+중지:
+
+```bash
+python scripts/launch_fast_rmm_sweep_then_waymo_a100x7_testas_static_pod.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
