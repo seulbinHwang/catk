@@ -4,9 +4,9 @@
 #
 # This is the V100 counterpart of
 # `pre_bc_flow_control_h100x4x2_execctx_balanced`, intended for two static
-# V100x4 pods such as `testsv` + `svvv`:
+# V100x4 pods such as `testsv` + `svv`:
 #   * testsv: 4x Tesla V100 32GB
-#   * svvv: 4x Tesla V100 32GB
+#   * svv:    4x Tesla V100 32GB
 #
 # Differences from the H100x6 4+2 recipe documented in README:
 #   * homogeneous 2 pod x 4 GPU layout, world size 8;

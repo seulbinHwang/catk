@@ -2,13 +2,13 @@
 """Launch Set-level Self-Forced GAN fine-tuning on hsb-npc-training-1.
 
 This is the single-pod H100x6 entrypoint for the same K=16 set-level
-self-forced GAN fine-tuning used by the testsv/svvv V100 launcher. The H100 preset
+self-forced GAN fine-tuning used by the testsv/svv V100 launcher. The H100 preset
 keeps bf16 mixed precision and uses all 6 local GPUs in one torchrun group.
 """
 
 from __future__ import annotations
 
-import launch_self_forced_gan_v100x4x2_testsv_svvv_static_pods as base
+import launch_self_forced_gan_v100x4x2_testsv_svv_static_pods as base
 
 
 base.DEFAULT_PODS = ("hsb-npc-training-1",)
