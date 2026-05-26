@@ -982,6 +982,72 @@ kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- tmux attach -t fast-rmm-
 python scripts/launch_fast_rmm_epoch_sweep_h100x6_hsb1_static_pod.py --stop
 ```
 
+#### hsb-npc-training-1 H100x6 best-RMM Waymo validation 제출
+
+위 Fast-RMM sweep이 끝난 뒤 RMM이 가장 높은 checkpoint로 validation split 전체의 Waymo Sim Agents 궤적 제출물을 만들고 자동 업로드하려면 아래 launcher를 쓴다. 이 launcher도 pod를 만들거나 삭제하지 않고, 기존 `hsb-npc-training-1` pod 안에 제출용 tmux session만 만든다. **같은 pod에서 학습이나 Fast-RMM sweep이 아직 돌고 있으면 실행하지 않는다.**
+
+기본 동작은 `<remote_log_dir>/<sweep_name>/epoch_sweep_summary.txt`의 `BEST_BY_RMM` 행을 읽고, 같은 sweep의 `epoch_sweep_manifest.tsv`에서 해당 epoch의 checkpoint 경로를 찾아 사용한다.
+
+```bash
+python scripts/launch_waymo_submission_from_best_h100x6_hsb1_static_pod.py \
+  --sweep-name fast_rmm_epoch_sweep_<run_id>_h100x6_hsb1 \
+  --task-name flow_control_waymo_val_best_rmm_<run_id>_h100x6_hsb1 \
+  --replace
+```
+
+특정 checkpoint를 직접 지정하려면:
+
+```bash
+python scripts/launch_waymo_submission_from_best_h100x6_hsb1_static_pod.py \
+  --ckpt-path /mnt/nuplan/projects/catk/logs/<sweep_name>/ckpts/epoch_061.ckpt \
+  --task-name flow_control_waymo_val_epoch061_h100x6_hsb1 \
+  --replace
+```
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_waymo_submission_from_best_h100x6_hsb1_static_pod.py \
+  --ckpt-path /tmp/fake.ckpt \
+  --dry-run --replace
+```
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling` |
+| 대상 pod | `hsb-npc-training-1` |
+| GPU 구성 | H100 6장, single node |
+| launcher | `scripts/launch_waymo_submission_from_best_h100x6_hsb1_static_pod.py` |
+| checkpoint 선택 | Fast-RMM sweep summary의 `BEST_BY_RMM` epoch |
+| experiment/action | `experiment=sim_agents_sub_flow`, `action=validate` |
+| rollout 수 | `n_rollout_closed_val=32` |
+| val batch | per-rank `val_batch_size=48`, 필요 시 `--val-batch-size 24`로 낮춤 |
+| 자동 업로드 | `waymo_submission.enabled=true`, validation 제출만 허용 |
+| storage state | 기본 `${project_root}/secrets/waymo/waymo_storage_state.json` |
+| tmux session | `catk-flow-waymo-val-submission-h100x6-hsb1` |
+
+Waymo 로그인 상태 파일 경로가 다르면 다음처럼 지정한다.
+
+```bash
+python scripts/launch_waymo_submission_from_best_h100x6_hsb1_static_pod.py \
+  --waymo-storage-state-path /path/to/waymo_storage_state.json \
+  --replace
+```
+
+제출 shard archive는 rank 0에서 생성된다. `pigz`가 있으면 병렬 gzip을 우선 사용하고, 없으면 Python gzip으로 fallback한다. 기본 압축 레벨은 `CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL=1`이다. 멀티 노드 경로를 다시 쓸 경우를 위해 shard streaming은 `.part` 임시 파일을 거쳐 완료 후 rename하고, rank 0 수신 측은 실패 연결을 바로 최종 실패로 남기지 않고 재시도를 기다린다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- tmux attach -t catk-flow-waymo-val-submission-h100x6-hsb1
+```
+
+제출 작업만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_waymo_submission_from_best_h100x6_hsb1_static_pod.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
