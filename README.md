@@ -736,6 +736,61 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t fast-rmm-epoch-swee
 python scripts/launch_fast_rmm_epoch_sweep_h100x4_h100x2_static_pods.py --stop
 ```
 
+#### testa/testaa A100x4x2 epoch-last artifact Fast-RMM sweep
+
+같은 epoch-last artifact sweep을 `testa` 4 A100 + `testaa` 4 A100에서 돌릴 때는 아래 launcher를 씁니다. 동작 방식은 H100 4+2 sweep과 같고, pod를 새로 만들거나 재시작하지 않으며 기존 pod 안에 tmux session만 만듭니다.
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_a100x4x2_testa_testaa_static_pods.py --replace
+```
+
+기본값은 `x5f9g0ce` pretrain의 마지막 8개 epoch sweep에 맞춰져 있습니다.
+
+| 항목 | 기본값 |
+|---|---|
+| pods | `testa` 4 A100 + `testaa` 4 A100 |
+| experiment | `pre_bc_flow_control_a100x4x2_prefix_default_noslip` |
+| artifact prefix | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce` |
+| epoch versions | `56:v52,57:v53,58:v54,59:v55,60:v56,61:v57,62:v58,63:v60` |
+| validation mode | `val_closed_loop=true`, `val_open_loop=false` |
+| rollout count | `n_rollout_closed_val=32` |
+| RMM scene target | `scorer_scene_num=1680` |
+| val batch / batches | per-rank `val_batch_size=42`, `limit_val_batches=auto -> 5` |
+| W&B group | `fast_rmm_epoch_sweep_x5f9g0ce_a100x4x2_rmm_only_bs42` |
+| tmux session | `fast-rmm-epoch-sweep-a100x4x2-testa-testaa` |
+
+`val_batch_size=42`는 8 rank 기준 `42 * 8 * 5 = 1680` scene을 평가합니다. 이 경로는 open-loop validation을 생략하고 closed-loop Fast-RMM만 실행하므로, 마지막 epoch들 중 RMM 기준 최고 checkpoint를 고르는 용도입니다.
+
+다른 run에 재사용할 때는 artifact prefix와 epoch-version mapping만 바꿉니다.
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_a100x4x2_testa_testaa_static_pods.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --epoch-versions 56:v52,57:v53,58:v54,59:v55,60:v56,61:v57,62:v58,63:v60 \
+  --sweep-name fast_rmm_epoch_sweep_<run_id>_a100x4x2 \
+  --wandb-group fast_rmm_epoch_sweep_<run_id>_a100x4x2_rmm_only_bs42 \
+  --replace
+```
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_a100x4x2_testa_testaa_static_pods.py --dry-run --replace
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t fast-rmm-epoch-sweep-a100x4x2-testa-testaa
+kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t fast-rmm-epoch-sweep-a100x4x2-testa-testaa
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_a100x4x2_testa_testaa_static_pods.py --stop
+```
+
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 61 Waymo validation 제출
 
 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 61 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.

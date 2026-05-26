@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch a fast-RMM checkpoint sweep on existing H100 4+2 pods.
+"""Launch a fast-RMM checkpoint sweep on existing testa/testaa A100 4+4 pods.
 
 This launcher is intentionally conservative:
 
@@ -8,9 +8,9 @@ This launcher is intentionally conservative:
 * it evaluates closed-loop Fast WOSAC/RMM only, skipping open-loop validation;
 * it downloads W&B ``epoch-last`` artifact versions to each pod before running.
 
-Default values match the post-training sweep for run ``x5f9g0ce``:
-epochs 56..63 from ``epoch-last-x5f9g0ce`` artifacts, val batch size 48, and
-six validation batches, i.e. 48 * 6 ranks * 6 batches = 1728 scenes.
+Default values mirror the H100 4+2 Fast-RMM sweep, but run on two A100x4 pods.
+By default it evaluates epochs 56..63 from ``epoch-last-x5f9g0ce`` artifacts
+with 32 closed-loop rollouts and about 1.7k validation scenes.
 """
 
 from __future__ import annotations
@@ -26,21 +26,21 @@ from dataclasses import dataclass
 
 DEFAULT_NAMESPACE = "p-pnc"
 DEFAULT_CONTAINER = "main"
-DEFAULT_PODS = ("hsb-npc-training", "wo-pvc-2")
+DEFAULT_PODS = ("testa", "testaa")
 DEFAULT_BRANCH = "semi_control_stable"
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_REMOTE_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
-DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip"
+DEFAULT_EXPERIMENT = "pre_bc_flow_control_a100x4x2_prefix_default_noslip"
 DEFAULT_ARTIFACT_PREFIX = "jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce"
 DEFAULT_EPOCH_VERSIONS = (
     "56:v52,57:v53,58:v54,59:v55,60:v56,61:v57,62:v58,63:v60"
 )
-DEFAULT_SESSION = "fast-rmm-epoch-sweep-h100x4-h100x2"
-DEFAULT_SWEEP_NAME = "fast_rmm_epoch_sweep_x5f9g0ce"
-DEFAULT_WANDB_GROUP = "fast_rmm_epoch_sweep_x5f9g0ce_rmm_only_bs48"
-DEFAULT_MASTER_PORT = "29860"
-DEFAULT_VAL_BATCH_SIZE = 48
+DEFAULT_SESSION = "fast-rmm-epoch-sweep-a100x4x2-testa-testaa"
+DEFAULT_SWEEP_NAME = "fast_rmm_epoch_sweep_x5f9g0ce_a100x4x2"
+DEFAULT_WANDB_GROUP = "fast_rmm_epoch_sweep_x5f9g0ce_a100x4x2_rmm_only_bs42"
+DEFAULT_MASTER_PORT = "29882"
+DEFAULT_VAL_BATCH_SIZE = 42
 DEFAULT_SCORER_SCENE_NUM = 1680
 DEFAULT_N_ROLLOUT_CLOSED_VAL = 32
 
@@ -91,7 +91,7 @@ def pod_ip(namespace: str, pod: str, *, dry_run: bool) -> str:
 
 def pod_gpu_count(namespace: str, container: str, pod: str, *, dry_run: bool) -> int:
     if dry_run:
-        return 4 if pod == DEFAULT_PODS[0] else 2
+        return 4
     output = run_kubectl(
         [
             "exec",
@@ -170,7 +170,7 @@ def render_worker_script(
     run_log_dir = f"{run_root}/run_logs_rmm_only_bs{args.val_batch_size}"
     status_file = f"{run_root}/{layout.pod}.status"
     tags = (
-        f"[fast_rmm,epoch_sweep,h100x6,{args.branch},"
+        f"[fast_rmm,epoch_sweep,a100x4x2,{args.branch},"
         f"{args.sweep_name},rmm_only,bs{args.val_batch_size}]"
     )
     return f"""#!/usr/bin/env bash
@@ -384,13 +384,15 @@ def render_start_command(
     if args.git_ref:
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
-git fetch origin --prune {shq(args.branch + ':refs/remotes/origin/' + args.branch)}
+git update-ref -d {shq('refs/remotes/origin/' + args.branch)} || true
+git fetch origin --prune {shq('+' + args.branch + ':refs/remotes/origin/' + args.branch)}
 git checkout -f {shq(args.git_ref)}
 """
     elif args.pull:
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
-git fetch origin {shq(args.branch + ':refs/remotes/origin/' + args.branch)}
+git update-ref -d {shq('refs/remotes/origin/' + args.branch)} || true
+git fetch origin --prune {shq('+' + args.branch + ':refs/remotes/origin/' + args.branch)}
 if git show-ref --verify --quiet {shq('refs/heads/' + args.branch)}; then
   git checkout {shq(args.branch)}
 else
@@ -484,7 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate multiple W&B epoch-last checkpoint artifact versions with "
-            "closed-loop Fast RMM on existing H100x4+H100x2 pods."
+            "closed-loop Fast RMM on existing testa/testaa A100x4x2 pods."
         )
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", DEFAULT_NAMESPACE))
