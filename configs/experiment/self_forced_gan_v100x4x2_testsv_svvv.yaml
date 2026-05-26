@@ -1,9 +1,9 @@
 # @package _global_
 
-# Set-level self-forcing GAN fine-tuning preset for svv + svvv.
+# Set-level self-forcing GAN fine-tuning preset for testsv + svvv.
 #
 # Hardware:
-#   * svv:  4x Tesla V100 32GB
+#   * testsv: 4x Tesla V100 32GB
 #   * svvv: 4x Tesla V100 32GB
 #
 # This keeps the intended K=16 teacher/student rollout-set discriminator path,
