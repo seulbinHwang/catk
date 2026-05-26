@@ -816,6 +816,8 @@ python scripts/launch_fast_rmm_sample_steps_sweep_a100x4x2_testa_testaa_static_p
 | W&B group | `fast_rmm_sample_steps_sweep_epoch061_x5f9g0ce_a100x4x2_bs42` |
 | tmux session | `fast-rmm-sample-steps-sweep-a100x4x2-testa-testaa` |
 
+각 sample step 평가는 별도 DDP validation 프로세스로 순차 실행됩니다. 런처는 NCCL/TCP rendezvous 재사용 충돌을 피하려고 `--master-port`를 시작 포트로 쓰고, sample step index마다 포트를 하나씩 올려 씁니다. 기본값은 `29882..29892`입니다. 각 평가가 끝난 뒤에는 다음 평가 전 기본 15초를 대기합니다.
+
 다른 checkpoint나 step list에 재사용할 때는 artifact version과 `--sample-steps`만 바꿉니다.
 
 ```bash

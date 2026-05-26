@@ -42,6 +42,7 @@ DEFAULT_SESSION = "fast-rmm-sample-steps-sweep-a100x4x2-testa-testaa"
 DEFAULT_SWEEP_NAME = "fast_rmm_sample_steps_sweep_epoch061_x5f9g0ce_a100x4x2"
 DEFAULT_WANDB_GROUP = "fast_rmm_sample_steps_sweep_epoch061_x5f9g0ce_a100x4x2_bs42"
 DEFAULT_MASTER_PORT = "29882"
+DEFAULT_INTER_RUN_SLEEP_SEC = 15
 DEFAULT_VAL_BATCH_SIZE = 42
 DEFAULT_SCORER_SCENE_NUM = 1680
 DEFAULT_N_ROLLOUT_CLOSED_VAL = 32
@@ -200,7 +201,8 @@ EXPERIMENT={shq(args.experiment)}
 SWEEP_NAME={shq(args.sweep_name)}
 WANDB_GROUP={shq(args.wandb_group)}
 MASTER_ADDR={shq(master_addr)}
-MASTER_PORT={shq(args.master_port)}
+BASE_MASTER_PORT={shq(args.master_port)}
+INTER_RUN_SLEEP_SEC={int(args.inter_run_sleep_sec)}
 NODE_RANK={layout.node_rank}
 NPROC_PER_NODE={layout.local_world_size}
 MANUAL_RANK_OFFSET={layout.rank_offset}
@@ -251,6 +253,8 @@ PY
 
 run_one_sample_steps() {{
   local sample_steps="$1"
+  local sample_index="$2"
+  local master_port="$((BASE_MASTER_PORT + sample_index))"
   local ckpt
   ckpt="$(download_ckpt_if_needed)"
   local padded_epoch padded_steps
@@ -260,7 +264,7 @@ run_one_sample_steps() {{
   local task_dir="$RUN_LOG_DIR/$task_name"
   mkdir -p "$task_dir"
 
-  echo "[$(date '+%F %T')] START epoch=$CHECKPOINT_EPOCH sample_steps=$sample_steps task=$task_name ckpt=$ckpt port=$MASTER_PORT" | tee -a "$STATUS_FILE"
+  echo "[$(date '+%F %T')] START epoch=$CHECKPOINT_EPOCH sample_steps=$sample_steps task=$task_name ckpt=$ckpt port=$master_port" | tee -a "$STATUS_FILE"
 
   export CACHE_ROOT
   export NNODES=2
@@ -268,7 +272,7 @@ run_one_sample_steps() {{
   export TRAINER_DEVICES="$NPROC_PER_NODE"
   export NODE_RANK
   export MASTER_ADDR
-  export MASTER_PORT
+  export MASTER_PORT="$master_port"
   export MANUAL_RANK_OFFSET
   export MANUAL_WORLD_SIZE
   export CATK_EXPERIMENT="$EXPERIMENT"
@@ -291,11 +295,12 @@ run_one_sample_steps() {{
     return "$status"
   fi
   echo "[$(date '+%F %T')] DONE sample_steps=$sample_steps" | tee -a "$STATUS_FILE"
+  sleep "$INTER_RUN_SLEEP_SEC"
 }}
 
 IFS=',' read -r -a sample_steps_values <<< {shq(','.join(str(s) for s in args.sample_steps))}
-for sample_steps in "${{sample_steps_values[@]}}"; do
-  run_one_sample_steps "$sample_steps"
+for sample_index in "${{!sample_steps_values[@]}}"; do
+  run_one_sample_steps "${{sample_steps_values[$sample_index]}}" "$sample_index"
 done
 
 echo "[$(date '+%F %T')] sweep complete pod={layout.pod}" | tee -a "$STATUS_FILE"
@@ -460,6 +465,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sweep-name", default=DEFAULT_SWEEP_NAME)
     parser.add_argument("--wandb-group", default=DEFAULT_WANDB_GROUP)
     parser.add_argument("--master-port", default=DEFAULT_MASTER_PORT)
+    parser.add_argument(
+        "--inter-run-sleep-sec",
+        type=int,
+        default=int(os.environ.get("CATK_FAST_RMM_INTER_RUN_SLEEP_SEC", DEFAULT_INTER_RUN_SLEEP_SEC)),
+        help=(
+            "Seconds to wait after each sequential DDP validation. This gives NCCL/TCP "
+            "rendezvous sockets time to settle before the next sample_steps run."
+        ),
+    )
     parser.add_argument("--val-batch-size", type=int, default=DEFAULT_VAL_BATCH_SIZE)
     parser.add_argument("--limit-val-batches", default="auto")
     parser.add_argument("--scorer-scene-num", type=int, default=DEFAULT_SCORER_SCENE_NUM)
@@ -487,6 +501,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--epoch must be >= 0")
     if args.n_rollout_closed_val < 1:
         parser.error("--n-rollout-closed-val must be >= 1")
+    if args.inter_run_sleep_sec < 0:
+        parser.error("--inter-run-sleep-sec must be >= 0")
+    try:
+        int(args.master_port)
+    except ValueError:
+        parser.error("--master-port must be an integer because sequential sweep points use port offsets")
     return args
 
 
@@ -532,6 +552,10 @@ def main() -> None:
     checkpoint_artifact = render_epoch_artifact(args.artifact_prefix, args.artifact_version)
 
     print(f"[launcher] master: {args.pods[0]} ({master_addr}:{args.master_port})")
+    print(
+        "[launcher] per-sample-step ports: "
+        f"{args.master_port}..{int(args.master_port) + len(args.sample_steps) - 1}"
+    )
     print(f"[launcher] world_size: {world_size}")
     print(f"[launcher] val_batch_size: {args.val_batch_size}")
     print(f"[launcher] limit_val_batches: {limit_val_batches}")
