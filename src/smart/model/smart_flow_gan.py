@@ -366,18 +366,33 @@ class SMARTFlowGAN(SMARTFlow):
             Tensor: fake rollout set입니다. shape은 ``[B, K, 20, N, 4]`` 입니다.
         """
         fake_items: list[Tensor] = []
-        for _ in range(int(self.gan_rollout_set_size)):
-            rollout = self._run_self_forced_rollout(tokenized_map, tokenized_agent)
-            pred_traj = rollout["pred_traj_10hz"][:, : self.flow_window_steps, :]
-            pred_head = rollout["pred_head_10hz"][:, : self.flow_window_steps]
-            fake_pose = pack_rollout_prediction_to_set(
-                pred_traj=pred_traj,
-                pred_head=pred_head,
-                batch_index=context["agent_batch"],
-                batch_size=int(context["batch_size"]),
-                n_max_agent=int(context["n_max_agent"]),
-            )
-            fake_items.append(fake_pose)
+        encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
+        try:
+            map_feature = self.encoder.encode_map(tokenized_map)
+            rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
+            for _ in range(int(self.gan_rollout_set_size)):
+                rollout = self.encoder.training_rollout_from_cache(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_scheme=self.self_forced_sampling,
+                    rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
+                    self_forced_epoch=int(self.current_epoch),
+                    detach_block_transition=self.self_forced_detach_block_transition,
+                    use_stop_motion=self.self_forced_use_stop_motion,
+                )
+                pred_traj = rollout["pred_traj_10hz"][:, : self.flow_window_steps, :]
+                pred_head = rollout["pred_head_10hz"][:, : self.flow_window_steps]
+                fake_pose = pack_rollout_prediction_to_set(
+                    pred_traj=pred_traj,
+                    pred_head=pred_head,
+                    batch_index=context["agent_batch"],
+                    batch_size=int(context["batch_size"]),
+                    n_max_agent=int(context["n_max_agent"]),
+                )
+                fake_items.append(fake_pose)
+        finally:
+            self._restore_module_training_modes(encoder_modes)
         return torch.stack(fake_items, dim=1).contiguous()
 
     def _gan_forward_discriminator(self, rollout_pose: Tensor, context: Dict[str, Tensor | int]) -> Tensor:
