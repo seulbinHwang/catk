@@ -791,6 +791,63 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t fast-rmm-epoch-sweep-
 python scripts/launch_fast_rmm_epoch_sweep_a100x4x2_testa_testaa_static_pods.py --stop
 ```
 
+#### testa/testaa A100x4x2 epoch 61 Flow sample-steps Fast-RMM sweep
+
+epoch 61 checkpoint 하나를 고정하고, Flow closed-loop rollout 안의 denoising step 수가 RMM에 미치는 영향을 보려면 아래 launcher를 씁니다. 여기서 바꾸는 값은 rollout 샘플 개수인 `n_rollout_closed_val`이 아니라, 한 rollout을 생성할 때 쓰는 Flow denoising depth인 `model.model_config.validation_rollout_sampling.sample_steps`입니다.
+
+```bash
+python scripts/launch_fast_rmm_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py --replace
+```
+
+기본 설정:
+
+| 항목 | 기본값 |
+|---|---|
+| pods | `testa` 4 A100 + `testaa` 4 A100 |
+| experiment | `pre_bc_flow_control_a100x4x2_prefix_default_noslip` |
+| checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| checkpoint epoch | `61` |
+| swept config | `model.model_config.validation_rollout_sampling.sample_steps` |
+| sample steps | `4,8,12,16,20,24,32,40,48,56,64` |
+| fixed rollout count | `n_rollout_closed_val=32` |
+| validation mode | `val_closed_loop=true`, `val_open_loop=false` |
+| RMM scene target | `scorer_scene_num=1680` |
+| val batch / batches | per-rank `val_batch_size=42`, `limit_val_batches=auto -> 5` |
+| W&B group | `fast_rmm_sample_steps_sweep_epoch061_x5f9g0ce_a100x4x2_bs42` |
+| tmux session | `fast-rmm-sample-steps-sweep-a100x4x2-testa-testaa` |
+
+다른 checkpoint나 step list에 재사용할 때는 artifact version과 `--sample-steps`만 바꿉니다.
+
+```bash
+python scripts/launch_fast_rmm_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --epoch 61 \
+  --artifact-version v57 \
+  --sample-steps 4,8,12,16,20,24,32,40,48,56,64 \
+  --sweep-name fast_rmm_sample_steps_sweep_epoch061_<run_id>_a100x4x2 \
+  --wandb-group fast_rmm_sample_steps_sweep_epoch061_<run_id>_a100x4x2_bs42 \
+  --replace
+```
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_fast_rmm_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py --dry-run --replace
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t fast-rmm-sample-steps-sweep-a100x4x2-testa-testaa
+kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t fast-rmm-sample-steps-sweep-a100x4x2-testa-testaa
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_fast_rmm_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py --stop
+```
+
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 61 Waymo validation 제출
 
 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 61 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.
