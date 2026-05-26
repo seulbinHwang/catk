@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch_cluster import radius
+from torch_geometric.utils import softmax
 
 
 @dataclass(frozen=True)
@@ -336,6 +338,78 @@ class RadiusAttentionLayer(nn.Module):
         return self.norm(query_token + self.output(context))
 
 
+class SparseRadiusAttentionLayer(nn.Module):
+    """Sparse radius edge만 쓰는 map-to-endpoint multi-head attention입니다."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        relation_dim: int = 3,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}.")
+        self.hidden_dim = int(hidden_dim)
+        self.num_heads = int(num_heads)
+        self.head_dim = hidden_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.relation_bias = nn.Sequential(
+            nn.Linear(relation_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, num_heads),
+        )
+        self.output = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        *,
+        query_token: Tensor,
+        key_token: Tensor,
+        value_token: Tensor,
+        relation: Tensor,
+        edge_index: Tensor,
+    ) -> Tensor:
+        """Sparse graph attention을 적용합니다.
+
+        Args:
+            query_token: receiver endpoint token입니다. shape은 ``[Q, H]`` 입니다.
+            key_token: sender map token입니다. shape은 ``[S, H]`` 입니다.
+            value_token: sender map token입니다. shape은 ``[S, H]`` 입니다.
+            relation: edge별 map-to-endpoint relation입니다. shape은 ``[E, 3]`` 입니다.
+            edge_index: ``[source_map, target_endpoint]`` sparse edge입니다. shape은 ``[2, E]`` 입니다.
+
+        Returns:
+            Tensor: attention update를 더한 receiver token입니다. shape은 ``[Q, H]`` 입니다.
+        """
+        n_query = query_token.shape[0]
+        hidden_dim = query_token.shape[-1]
+        q = self.query(query_token).view(n_query, self.num_heads, self.head_dim)
+
+        if edge_index.numel() == 0:
+            context = query_token.new_zeros(n_query, hidden_dim)
+            return self.norm(query_token + self.output(context))
+
+        source, target = edge_index[0], edge_index[1]
+        k = self.key(key_token).view(-1, self.num_heads, self.head_dim)
+        v = self.value(value_token).view(-1, self.num_heads, self.head_dim)
+        logits = (q[target] * k[source]).sum(dim=-1) * self.scale
+        logits = logits + self.relation_bias(relation)
+        weights = softmax(logits.float(), target, num_nodes=n_query).to(dtype=v.dtype)
+        messages = v[source] * weights.unsqueeze(-1)
+        context = query_token.new_zeros(n_query, self.num_heads, self.head_dim)
+        messages = messages.to(dtype=context.dtype)
+        context.index_add_(0, target, messages)
+        context = context.reshape(n_query, hidden_dim)
+        return self.norm(query_token + self.output(context))
+
+
 class EndpointPool(nn.Module):
     """4개 endpoint token을 mean+max pooling으로 agent token 하나로 줄입니다."""
 
@@ -362,7 +436,7 @@ class SceneConditionFusion(nn.Module):
 
 
 class MapComplianceEncoder(nn.Module):
-    """4개 endpoint에서 map token과 radius cross-attention을 수행합니다."""
+    """4개 endpoint에서 30m radius map token만 sparse cross-attention합니다."""
 
     def __init__(
         self,
@@ -378,13 +452,89 @@ class MapComplianceEncoder(nn.Module):
         self.radius_m = float(radius_m)
         self.query_chunk_size = max(1, int(query_chunk_size))
         self.rollout_chunk_size = max(0, int(rollout_chunk_size))
-        self.attention = RadiusAttentionLayer(
+        self.attention = SparseRadiusAttentionLayer(
             hidden_dim,
             num_heads=num_heads,
             relation_dim=3,
-            sender_chunk_size=sender_chunk_size,
         )
         self.endpoint_pool = EndpointPool(hidden_dim)
+
+    def _build_sparse_map_edges(
+        self,
+        *,
+        endpoint_pose: Tensor,
+        map_position: Tensor,
+        map_orientation: Tensor,
+        map_valid_mask: Tensor,
+        valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """SMARTAgentEncoder.build_map2agent_edge와 같은 radius edge를 만듭니다."""
+        bsz, n_rollout, n_endpoint, n_agent, _ = endpoint_pose.shape
+        n_map = map_position.shape[1]
+        device = endpoint_pose.device
+
+        endpoint_xy = endpoint_pose[..., :2].reshape(-1, 2)
+        endpoint_yaw = _yaw_from_pose(endpoint_pose).reshape(-1)
+        map_xy = map_position.reshape(-1, 2)
+        map_yaw = map_orientation.reshape(-1)
+
+        scene_index = torch.arange(bsz, device=device, dtype=torch.long)
+        query_batch = (
+            scene_index[:, None, None, None]
+            .expand(bsz, n_rollout, n_endpoint, n_agent)
+            .reshape(-1)
+        )
+        map_batch = scene_index[:, None].expand(bsz, n_map).reshape(-1)
+        query_valid = (
+            valid_mask[:, None, None, :]
+            .expand(bsz, n_rollout, n_endpoint, n_agent)
+            .reshape(-1)
+            .bool()
+        )
+        map_valid = map_valid_mask.reshape(-1).bool()
+
+        valid_query_index = query_valid.nonzero(as_tuple=False).flatten()
+        valid_map_index = map_valid.nonzero(as_tuple=False).flatten()
+        if valid_query_index.numel() == 0 or valid_map_index.numel() == 0:
+            empty_edge = torch.empty(2, 0, device=device, dtype=torch.long)
+            empty_relation = endpoint_pose.new_zeros((0, 3))
+            return empty_edge, empty_relation
+
+        # torch_cluster.radius는 batch index가 단조 비감소라고 가정합니다.
+        # SMARTAgentEncoder와 같이 호출 직전에 양쪽 batch를 안정 정렬하고,
+        # 반환 edge를 원래 flatten index로 되돌립니다.
+        query_sort = torch.argsort(query_batch[valid_query_index], stable=True)
+        map_sort = torch.argsort(map_batch[valid_map_index], stable=True)
+        sorted_query_index = valid_query_index[query_sort]
+        sorted_map_index = valid_map_index[map_sort]
+        edge_index_sorted = radius(
+            x=endpoint_xy[sorted_query_index],
+            y=map_xy[sorted_map_index],
+            r=self.radius_m,
+            batch_x=query_batch[sorted_query_index],
+            batch_y=map_batch[sorted_map_index],
+            max_num_neighbors=300,
+        )
+        if edge_index_sorted.numel() == 0:
+            empty_edge = torch.empty(2, 0, device=device, dtype=torch.long)
+            empty_relation = endpoint_pose.new_zeros((0, 3))
+            return empty_edge, empty_relation
+
+        edge_index = torch.stack(
+            [
+                sorted_map_index[edge_index_sorted[0]],
+                sorted_query_index[edge_index_sorted[1]],
+            ],
+            dim=0,
+        )
+        delta_xy = map_xy[edge_index[0]] - endpoint_xy[edge_index[1]]
+        relation, _ = _build_relation_features(
+            delta_xy=delta_xy,
+            receiver_yaw=endpoint_yaw[edge_index[1]],
+            sender_yaw=map_yaw[edge_index[0]],
+            radius_m=self.radius_m,
+        )
+        return edge_index, relation
 
     def forward(
         self,
@@ -403,45 +553,20 @@ class MapComplianceEncoder(nn.Module):
         if n_map == 0:
             return endpoint_token, self.endpoint_pool(endpoint_token)
 
-        map_xy = map_position[:, None, None, None, :, :]
-        sender_yaw = map_orientation[:, None, None, None, :]
-        rollout_step = self.rollout_chunk_size if self.rollout_chunk_size > 0 else n_rollout
-        rollout_chunks: list[Tensor] = []
-        for rollout_start in range(0, n_rollout, rollout_step):
-            rollout_end = min(rollout_start + rollout_step, n_rollout)
-            rollout_width = rollout_end - rollout_start
-            map_token = map_context[:, None, None, :, :].expand(
-                bsz, rollout_width, n_endpoint, n_map, hidden_dim
-            )
-            agent_chunks: list[Tensor] = []
-            for start in range(0, n_agent, self.query_chunk_size):
-                end = min(start + self.query_chunk_size, n_agent)
-                endpoint_pose_chunk = endpoint_pose[:, rollout_start:rollout_end, :, start:end, :]
-                endpoint_xy = endpoint_pose_chunk[..., :2]
-                delta_xy = map_xy - endpoint_xy.unsqueeze(4)
-                receiver_yaw = _yaw_from_pose(endpoint_pose_chunk).unsqueeze(4)
-                relation, distance = _build_relation_features(
-                    delta_xy=delta_xy,
-                    receiver_yaw=receiver_yaw,
-                    sender_yaw=sender_yaw,
-                    radius_m=self.radius_m,
-                )
-                attention_mask = (
-                    valid_mask[:, None, None, start:end, None]
-                    & map_valid_mask[:, None, None, None, :]
-                    & (distance <= self.radius_m)
-                )
-                agent_chunks.append(
-                    self.attention(
-                        query_token=endpoint_token[:, rollout_start:rollout_end, :, start:end, :],
-                        key_token=map_token,
-                        value_token=map_token,
-                        relation=relation,
-                        attention_mask=attention_mask,
-                    )
-                )
-            rollout_chunks.append(torch.cat(agent_chunks, dim=3))
-        map_aware_endpoint = torch.cat(rollout_chunks, dim=1)
+        edge_index, relation = self._build_sparse_map_edges(
+            endpoint_pose=endpoint_pose,
+            map_position=map_position,
+            map_orientation=map_orientation,
+            map_valid_mask=map_valid_mask,
+            valid_mask=valid_mask,
+        )
+        map_aware_endpoint = self.attention(
+            query_token=endpoint_token.reshape(-1, hidden_dim),
+            key_token=map_context.reshape(-1, hidden_dim),
+            value_token=map_context.reshape(-1, hidden_dim),
+            relation=relation,
+            edge_index=edge_index,
+        ).reshape(bsz, n_rollout, n_endpoint, n_agent, hidden_dim)
         map_agent_token = self.endpoint_pool(map_aware_endpoint)
         return map_aware_endpoint, map_agent_token
 
