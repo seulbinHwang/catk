@@ -89,7 +89,7 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_eps=flow_solver_eps,
             closed_loop_rollout_mode=closed_loop_rollout_mode,
             use_lqr=use_lqr,
-            use_stop_motion=use_stop_motion,
+            use_stop_motion=False,
             lqr_commit=lqr_commit,
             use_holonomic_model_only=use_holonomic_model_only,
         )
@@ -273,7 +273,7 @@ class SMARTFlowDecoder(nn.Module):
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 평가 길이를 실행합니다.
-            use_stop_motion: self-forced 학습 rollout 전용 stop-motion 사용 여부입니다.
+            use_stop_motion: 호환성용 인자입니다. stop-motion은 항상 비활성화됩니다.
 
         Returns:
             Dict[str, Tensor]: committed self-rollout 결과입니다.
@@ -288,7 +288,7 @@ class SMARTFlowDecoder(nn.Module):
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
-            use_stop_motion=use_stop_motion,
+            use_stop_motion=False,
         )
 
     def path_flow_velocity_for_anchor0(

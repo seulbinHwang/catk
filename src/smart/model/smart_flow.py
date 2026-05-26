@@ -274,11 +274,9 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
-        self.self_forced_use_stop_motion = (
-            bool(getattr(self.self_forced_config, "use_stop_motion", False))
-            if self.self_forced_config is not None
-            else False
-        )
+        # Stop-motion is globally disabled. Keep the config key accepted for
+        # old launchers, but do not allow it to alter training rollouts.
+        self.self_forced_use_stop_motion = False
         self.self_forced_guidance_tau_low = (
             float(getattr(self.self_forced_config, "clean_dmd_tau_low", 0.02))
             if self.self_forced_config is not None

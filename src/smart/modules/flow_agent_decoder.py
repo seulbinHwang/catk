@@ -142,7 +142,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             )
         self.closed_loop_rollout_mode = closed_loop_rollout_mode
         self.use_lqr = bool(use_lqr)
-        self.use_stop_motion = bool(use_stop_motion)
+        # Stop-motion is intentionally disabled for every experiment path.
+        # Keep the constructor argument for config compatibility, but never
+        # let overrides enable the gate.
+        self.use_stop_motion = False
         lqr_commit_cfg = LQRCommitBridgeConfig(
             dt=float(getattr(lqr_commit, "dt", 0.1)) if lqr_commit is not None else 0.1,
             history_steps=int(getattr(lqr_commit, "history_steps", 6)) if lqr_commit is not None else 6,
@@ -165,7 +168,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.commit_bridge = ContinuousCommitBridge(
             commit_steps=self.shift,
             use_lqr=self.use_lqr,
-            use_stop_motion=self.use_stop_motion,
+            use_stop_motion=False,
             config=lqr_commit_cfg,
             use_kinematic_control_flow=self.use_kinematic_control_flow,
             use_holonomic_model_only=self.use_holonomic_model_only,
@@ -1292,11 +1295,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 함께 반환합니다.
         """
         state = self._clone_rollout_cache(rollout_cache)
-        rollout_use_stop_motion = (
-            self.use_stop_motion
-            if use_stop_motion is None
-            else bool(use_stop_motion)
-        )
+        rollout_use_stop_motion = False
 
         n_agent = int(state["n_agent"])
         total_step_future_2hz = int(state["n_step_future_2hz"])
@@ -1868,8 +1867,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 ``flow_window_steps / 5`` 를 넘깁니다.
             self_forced_epoch: 현재 self-forced epoch입니다. ``None`` 이면 training
                 random terminal denoising step을 끕니다.
-            use_stop_motion: ``None``이면 decoder 기본 inference 설정을 사용합니다.
-                self-forced 학습에서는 별도 config 값을 넘겨 inference 설정과 분리합니다.
+            use_stop_motion: 호환성용 인자입니다. stop-motion은 항상 비활성화됩니다.
         Returns:
             Dict[str, torch.Tensor]: N초 committed self-rollout 결과입니다.
         """
@@ -1884,7 +1882,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
-            use_stop_motion=use_stop_motion,
+            use_stop_motion=False,
         )
 
     def path_flow_velocity_for_anchor0(

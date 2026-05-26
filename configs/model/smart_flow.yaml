@@ -133,7 +133,7 @@ model_config:
     control_cyclist_yaw_scale_rad: ${model.model_config.token_processor.control_cyclist_yaw_scale_rad}
     closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
     use_lqr: false
-    use_stop_motion: true
+    use_stop_motion: false
     lqr_commit:
       dt: 0.1
       history_steps: 6
