@@ -384,7 +384,7 @@ run_one_epoch() {{
   export LOG_DIR="$task_dir"
   export VAL_BATCH_SIZE
   export LIMIT_VAL_BATCHES
-  export CATK_HYDRA_OVERRIDES="trainer.strategy._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy trainer.strategy.cluster_environment._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment model.model_config.val_closed_loop=true model.model_config.val_open_loop=false model.model_config.n_rollout_closed_val=${{N_ROLLOUT_CLOSED_VAL}} model.model_config.scorer_scene_num=${{SCORER_SCENE_NUM}} logger.wandb.group=${{WANDB_GROUP}} logger.wandb.job_type=fast_rmm_epoch_sweep logger.wandb.tags={tags} logger.wandb.log_model=false"
+  export CATK_HYDRA_OVERRIDES="trainer.strategy._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousDDPStrategy +trainer.strategy.cluster_environment._target_=src.smart.utils.heterogeneous_torchelastic.HeterogeneousTorchElasticEnvironment model.model_config.val_closed_loop=true model.model_config.val_open_loop=false model.model_config.n_rollout_closed_val=${{N_ROLLOUT_CLOSED_VAL}} model.model_config.scorer_scene_num=${{SCORER_SCENE_NUM}} logger.wandb.group=${{WANDB_GROUP}} logger.wandb.job_type=fast_rmm_epoch_sweep logger.wandb.tags={tags} logger.wandb.log_model=false"
 
   set +e
   bash scripts/h100x4_multinode_pretrain.sh 2>&1 | tee "$task_dir/{args.pod}.log"
