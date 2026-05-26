@@ -976,6 +976,59 @@ kubectl exec -it -n p-pnc testas -c main -- bash -lc '
 '
 ```
 
+#### testas A100x7 epoch-last artifact Fast-RMM sweep
+
+`testas`에서 돌린 A100x7 pretrain이 끝난 뒤, 마지막 구간의 `epoch_last.ckpt` W&B artifacts를 다시 받아 Fast-RMM closed-loop validation만 반복 평가하려면 아래 launcher를 씁니다. 이 launcher는 pod를 만들거나 삭제하거나 재시작하지 않고, 기존 `testas` pod 안에 전용 tmux session만 만듭니다. **학습이 아직 같은 pod에서 돌고 있으면 실행하지 않습니다.**
+
+기본 의도는 W&B metadata epoch `57~64`에 해당하는 `epoch_last.ckpt` 8개를 같은 validation 설정으로 평가해서, W&B에서 checkpoint별 RMM을 한 그래프로 비교하는 것입니다. `epoch_last` artifact version은 run마다 달라지므로 launcher가 W&B artifact metadata의 `epoch` 값을 읽어 자동으로 고릅니다.
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_a100x7_testas_static_pod.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --sweep-name fast_rmm_epoch_sweep_<run_id>_a100x7_testas \
+  --wandb-group fast_rmm_epoch_sweep_<run_id>_a100x7_testas_rmm_only_bs16 \
+  --replace
+```
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_a100x7_testas_static_pod.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --dry-run
+```
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling_fd` |
+| 대상 pod | `testas` |
+| GPU 구성 | A100 80GB 7장, 단일 노드 |
+| launcher | `scripts/launch_fast_rmm_epoch_sweep_a100x7_testas_static_pod.py` |
+| 기본 평가 범위 | W&B metadata epoch `57~64`의 `epoch_last.ckpt` artifact |
+| task label | zero-based epoch `56~63` |
+| artifact mapping | W&B metadata에서 자동 해결 |
+| validation 종류 | closed-loop Fast-RMM only (`val_closed_loop=true`, `val_open_loop=false`) |
+| rollout 수 | `n_rollout_closed_val=32` |
+| scorer scene 수 | `1680` |
+| 기본 val batch | `16` |
+| 기본 `limit_val_batches` | `auto`, A100x7/bs16 기준 `15` |
+| 실제 평가 scene 수 | `16 x 7 x 15 = 1680` |
+| tmux session | `fast-rmm-epoch-sweep-a100x7-testas` |
+
+기본값은 `--epoch-metadata-values 57-64`입니다. 특정 artifact version을 강제로 쓰고 싶을 때만 `--epoch-versions 56:v2,57:v3,...`처럼 명시합니다. 학습이 아직 해당 epoch까지 artifact를 업로드하지 않았다면 launcher는 평가를 시작하기 전에 실패합니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- tmux attach -t fast-rmm-epoch-sweep-a100x7-testas
+```
+
+평가 sweep만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_a100x7_testas_static_pod.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
