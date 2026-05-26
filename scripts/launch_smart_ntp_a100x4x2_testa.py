@@ -197,6 +197,11 @@ def render_env_file(
         "MAX_EPOCHS": args.max_epochs,
         "CATK_LR": args.learning_rate,
         "CATK_HYDRA_OVERRIDES": args.extra_hydra_overrides,
+        "CATK_SUBMISSION_STREAM_SHARDS": os.environ.get("CATK_SUBMISSION_STREAM_SHARDS", ""),
+        "CATK_SUBMISSION_SHARD_STREAM_PORT": os.environ.get(
+            "CATK_SUBMISSION_SHARD_STREAM_PORT",
+            "",
+        ),
     }
     for name, value in optional_env.items():
         if value not in (None, ""):

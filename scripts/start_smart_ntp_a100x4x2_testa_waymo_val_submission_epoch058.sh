@@ -18,6 +18,11 @@ POLL_SUBMISSION_STATUS="${POLL_SUBMISSION_STATUS:-false}"
 GIT_REF="${GIT_REF:-origin/main}"
 NO_PULL="${NO_PULL:-false}"
 
+# testa/testaa use the same path strings but not the same filesystem. Stream
+# non-master-node submission shards to rank 0 before creating the Waymo archive.
+export CATK_SUBMISSION_STREAM_SHARDS="${CATK_SUBMISSION_STREAM_SHARDS:-1}"
+export CATK_SUBMISSION_SHARD_STREAM_PORT="${CATK_SUBMISSION_SHARD_STREAM_PORT:-29631}"
+
 extra_overrides=(
   "waymo_submission.enabled=true"
   "waymo_submission.submit_validate=true"
