@@ -21,6 +21,7 @@ RUN_ID="${RUN_ID:-${CATK_RUN_ID:-$(date +%Y%m%d_%H%M%S)}}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-48}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-1.0}"
 POLL_SUBMISSION_STATUS="${POLL_SUBMISSION_STATUS:-false}"
+WAYMO_UPLOAD_TIMEOUT_MS="${WAYMO_UPLOAD_TIMEOUT_MS:-7200000}"
 GIT_REF="${GIT_REF:-origin/semi_control_stable}"
 NO_PULL="${NO_PULL:-false}"
 MASTER_PORT="${MASTER_PORT:-29651}"
@@ -29,8 +30,8 @@ CHECKPOINT_SYNC_PORT="${CHECKPOINT_SYNC_PORT:-29652}"
 if [[ -z "${CKPT_PATH}" ]]; then
   echo "ERROR: CKPT_PATH is required." >&2
   echo "Example:" >&2
-  echo "  CKPT_PATH=/mnt/nuplan/projects/catk/checkpoints/flow_run/epoch_062/epoch_last.ckpt \\" >&2
-  echo "  TASK_NAME=flow_control_waymo_val_epoch062_h100x4_h100x2 \\" >&2
+  echo "  CKPT_PATH=/mnt/nuplan/projects/catk/checkpoints/flow_run/epoch_061/epoch_last.ckpt \\" >&2
+  echo "  TASK_NAME=flow_control_waymo_val_epoch061_h100x4_h100x2 \\" >&2
   echo "  bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission.sh" >&2
   exit 2
 fi
@@ -39,12 +40,15 @@ fi
 # submission shards to rank 0 before creating the Waymo tar.gz archive.
 export CATK_SUBMISSION_STREAM_SHARDS="${CATK_SUBMISSION_STREAM_SHARDS:-1}"
 export CATK_SUBMISSION_SHARD_STREAM_PORT="${CATK_SUBMISSION_SHARD_STREAM_PORT:-29653}"
+export CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS="${CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS:-16}"
+export CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL="${CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL:-1}"
 
 extra_overrides=(
   "waymo_submission.enabled=true"
   "waymo_submission.submit_validate=true"
   "waymo_submission.submit_test=false"
   "waymo_submission.poll_submission_status=${POLL_SUBMISSION_STATUS}"
+  "waymo_submission.upload_timeout_ms=${WAYMO_UPLOAD_TIMEOUT_MS}"
   "logger.wandb.job_type=waymo_validation_submission"
 )
 

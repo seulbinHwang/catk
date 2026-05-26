@@ -736,14 +736,14 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t fast-rmm-epoch-swee
 python scripts/launch_fast_rmm_epoch_sweep_h100x4_h100x2_static_pods.py --stop
 ```
 
-#### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 62 Waymo validation 제출
+#### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 61 Waymo validation 제출
 
-`flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 62 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.
+`flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 61 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.
 
 ```bash
-CKPT_PATH=/path/to/epoch_062/epoch_last.ckpt \
-TASK_NAME=flow_control_waymo_val_epoch062_h100x4_h100x2 \
-bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch062.sh
+CKPT_PATH=/path/to/epoch_061/epoch_last.ckpt \
+TASK_NAME=flow_control_waymo_val_epoch061_h100x4_h100x2 \
+bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch061.sh
 ```
 
 일반 checkpoint에 재사용할 때는 generic wrapper를 직접 호출합니다.
@@ -767,7 +767,25 @@ bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission.sh
 | shard 처리 | `CATK_SUBMISSION_STREAM_SHARDS=1`로 `wo-pvc-2` shard를 rank 0으로 streaming 후 tar.gz 생성 |
 | 자동 업로드 | `waymo_submission.enabled=true`, validation 제출만 허용, test 제출은 꺼짐 |
 
-`CKPT_PATH`는 rank 0인 `hsb-npc-training`에서 읽을 수 있는 실제 epoch 62 checkpoint 경로여야 합니다. 다른 pod에 같은 파일이 없으면 launcher가 rank 0 checkpoint를 `wo-pvc-2`의 같은 경로로 동기화한 뒤 validation을 시작합니다. W&B artifact에서 내려받은 checkpoint를 쓰는 경우에도 최종 파일 경로를 `CKPT_PATH`에 지정하면 됩니다.
+`CKPT_PATH`는 rank 0인 `hsb-npc-training`에서 읽을 수 있는 실제 epoch 61 checkpoint 경로여야 합니다. 다른 pod에 같은 파일이 없으면 launcher가 rank 0 checkpoint를 `wo-pvc-2`의 같은 경로로 동기화한 뒤 validation을 시작합니다. W&B artifact에서 내려받은 checkpoint를 쓰는 경우에도 최종 파일 경로를 `CKPT_PATH`에 지정하면 됩니다.
+
+멀티 노드 제출 shard 수집은 실패 중간 파일을 최종 shard로 남기지 않도록 `.part` 임시 파일을 거쳐 완료 후 rename합니다. 네트워크가 끊기면 rank 0은 서버를 바로 종료하지 않고 송신 rank의 재시도를 기다립니다. 기본 재시도 횟수는 `CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS=16`이며 필요하면 늘릴 수 있습니다. `tar.gz` 생성은 `pigz`가 있으면 병렬 gzip을 우선 사용하고, 없으면 Python gzip으로 fallback합니다. 압축 레벨은 기본 `CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL=1`입니다.
+
+rollout은 끝났지만 shard 수집이나 archive/upload 단계만 실패했다면 rollout을 다시 돌리지 않고 아래 finalizer로 복구합니다. 기본값은 `wo-pvc-2`의 `submission-rank04...05-*.binproto` shard를 `hsb-npc-training`의 `sim_agents_2025_submission_rank0_collect/`로 복사한 뒤, rank 0~5 shard가 모두 있는지 확인하고 archive를 만든 다음 업로드합니다.
+
+```bash
+python scripts/finalize_flow_control_h100x4_h100x2_waymo_submission.py \
+  --run-dir /mnt/nuplan/projects/catk/logs/<TASK_NAME>/runs/<RUN_ID> \
+  --upload
+```
+
+이미 archive까지 만들어진 상태에서 업로드만 재시도하려면:
+
+```bash
+python scripts/finalize_flow_control_h100x4_h100x2_waymo_submission.py \
+  --run-dir /mnt/nuplan/projects/catk/logs/<TASK_NAME>/runs/<RUN_ID> \
+  --skip-copy --skip-archive --upload
+```
 
 Waymo 자동 제출에는 로그인 상태 파일이 필요합니다. 기본 위치는 repository root 기준 아래 경로입니다.
 
@@ -779,15 +797,15 @@ secrets/waymo/waymo_storage_state.json
 
 ```bash
 WAYMO_STORAGE_STATE_PATH=/path/to/waymo_storage_state.json \
-CKPT_PATH=/path/to/epoch_062/epoch_last.ckpt \
-bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch062.sh
+CKPT_PATH=/path/to/epoch_061/epoch_last.ckpt \
+bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch061.sh
 ```
 
 실행 전 dry-run으로 pod/환경 변수/Hydra override만 확인하려면:
 
 ```bash
-CKPT_PATH=/tmp/fake_epoch062.ckpt \
-bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch062.sh --dry-run
+CKPT_PATH=/tmp/fake_epoch061.ckpt \
+bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch061.sh --dry-run
 ```
 
 tmux 확인:

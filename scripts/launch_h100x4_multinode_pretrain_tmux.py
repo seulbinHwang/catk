@@ -175,6 +175,14 @@ def render_env_file(
         "CATK_HYDRA_OVERRIDES": args.extra_hydra_overrides,
         "CATK_SUBMISSION_STREAM_SHARDS": os.environ.get("CATK_SUBMISSION_STREAM_SHARDS", ""),
         "CATK_SUBMISSION_SHARD_STREAM_PORT": os.environ.get("CATK_SUBMISSION_SHARD_STREAM_PORT", ""),
+        "CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS": os.environ.get(
+            "CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS",
+            "",
+        ),
+        "CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL": os.environ.get(
+            "CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL",
+            "",
+        ),
     }
     for name, value in optional_env.items():
         if value not in (None, ""):
