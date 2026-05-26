@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 
 from src.smart.modules.self_forced_gan_critic import (
@@ -8,6 +10,8 @@ from src.smart.modules.self_forced_gan_critic import (
     RadiusAttentionLayer,
     SelfForcedGANDiscriminator,
     SparseRadiusAttentionLayer,
+    add_rollout_pose_perturbation,
+    relativistic_discriminator_loss,
 )
 
 
@@ -256,3 +260,103 @@ def test_gan_discriminator_sparse_map_compliance_backward() -> None:
     interaction_grad = discriminator.interaction_encoder.attention.query.weight.grad
     assert interaction_grad is not None
     assert torch.isfinite(interaction_grad).all()
+
+
+def test_gan_discriminator_reused_base_logit_matches_recomputed_regularizer_gradient() -> None:
+    torch.manual_seed(11)
+    bsz, n_rollout, n_step, n_agent, n_map, hidden_dim = 1, 2, 20, 3, 5, 16
+    discriminator = SelfForcedGANDiscriminator(
+        hidden_dim=hidden_dim,
+        n_rollout=n_rollout,
+        n_step=n_step,
+        num_attention_heads=4,
+        map_radius_m=10.0,
+    )
+    recompute_model = copy.deepcopy(discriminator)
+    reuse_model = copy.deepcopy(discriminator)
+
+    real_pose = torch.randn(bsz, n_rollout, n_step, n_agent, 4)
+    fake_pose = torch.randn(bsz, n_rollout, n_step, n_agent, 4)
+    for pose in (real_pose, fake_pose):
+        yaw = torch.randn(bsz, n_rollout, n_step, n_agent)
+        pose[..., 2] = torch.cos(yaw)
+        pose[..., 3] = torch.sin(yaw)
+    current_pose = real_pose[:, 0, 0].detach().clone()
+    context = {
+        "current_pose": current_pose,
+        "agent_type": torch.tensor([[0, 1, 2]], dtype=torch.long),
+        "valid_mask": torch.tensor([[True, True, True]]),
+        "agent_context": torch.randn(bsz, n_agent, hidden_dim),
+        "map_context": torch.randn(bsz, n_map, hidden_dim),
+        "map_position": torch.randn(bsz, n_map, 2),
+        "map_orientation": torch.zeros(bsz, n_map),
+        "map_valid_mask": torch.ones(bsz, n_map, dtype=torch.bool),
+    }
+
+    def forward(model: SelfForcedGANDiscriminator, pose: torch.Tensor) -> torch.Tensor:
+        return model(pose, **context)
+
+    def finite_difference(
+        model: SelfForcedGANDiscriminator,
+        pose: torch.Tensor,
+        *,
+        base_logit: torch.Tensor | None,
+        seed: int,
+    ) -> torch.Tensor:
+        torch.manual_seed(seed)
+        pose = pose.detach()
+        base = forward(model, pose) if base_logit is None else base_logit
+        perturbed = add_rollout_pose_perturbation(
+            pose,
+            current_pose=context["current_pose"],
+            agent_type=context["agent_type"],
+            position_type_scale=model.position_type_scale,
+            position_sigma=0.01,
+            yaw_sigma=0.01,
+        )
+        perturbed_logit = forward(model, perturbed)
+        return ((perturbed_logit - base) / 0.01).square().mean()
+
+    recompute_real = forward(recompute_model, real_pose.detach())
+    recompute_fake = forward(recompute_model, fake_pose.detach())
+    recompute_loss = relativistic_discriminator_loss(recompute_real, recompute_fake)
+    recompute_loss = recompute_loss + 0.1 * finite_difference(
+        recompute_model,
+        real_pose,
+        base_logit=None,
+        seed=101,
+    )
+    recompute_loss = recompute_loss + 0.1 * finite_difference(
+        recompute_model,
+        fake_pose,
+        base_logit=None,
+        seed=202,
+    )
+    recompute_loss.backward()
+
+    reuse_real = forward(reuse_model, real_pose.detach())
+    reuse_fake = forward(reuse_model, fake_pose.detach())
+    reuse_loss = relativistic_discriminator_loss(reuse_real, reuse_fake)
+    reuse_loss = reuse_loss + 0.1 * finite_difference(
+        reuse_model,
+        real_pose,
+        base_logit=reuse_real,
+        seed=101,
+    )
+    reuse_loss = reuse_loss + 0.1 * finite_difference(
+        reuse_model,
+        fake_pose,
+        base_logit=reuse_fake,
+        seed=202,
+    )
+    reuse_loss.backward()
+
+    for recompute_param, reuse_param in zip(
+        recompute_model.parameters(),
+        reuse_model.parameters(),
+    ):
+        if recompute_param.grad is None:
+            assert reuse_param.grad is None
+            continue
+        assert reuse_param.grad is not None
+        assert torch.allclose(recompute_param.grad, reuse_param.grad, atol=1.0e-5, rtol=1.0e-4)

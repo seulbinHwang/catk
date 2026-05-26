@@ -420,6 +420,8 @@ class SMARTFlowGAN(SMARTFlow):
         self,
         rollout_pose: Tensor,
         context: Dict[str, Tensor | int],
+        *,
+        base_logit: Tensor | None = None,
     ) -> Tensor:
         """finite-difference 방식 discriminator smoothness penalty를 계산합니다.
 
@@ -427,6 +429,8 @@ class SMARTFlowGAN(SMARTFlow):
             rollout_pose: teacher 또는 student rollout set입니다. shape은
                 ``[B, K, 20, N, 4]`` 입니다.
             context: discriminator context입니다.
+            base_logit: 이미 계산된 ``D(rollout_pose)``입니다. 같은 D update 안에서
+                base score를 공유할 때 사용합니다.
 
         Returns:
             Tensor: finite-difference smoothness penalty scalar입니다.
@@ -435,7 +439,11 @@ class SMARTFlowGAN(SMARTFlow):
         current_pose = context["current_pose"]
         agent_type = context["agent_type"]
         rollout_pose = rollout_pose.detach()
-        base = self._gan_forward_discriminator_for_backward(rollout_pose, context)
+        base = (
+            self._gan_forward_discriminator_for_backward(rollout_pose, context)
+            if base_logit is None
+            else base_logit
+        )
         perturbed = add_rollout_pose_perturbation(
             rollout_pose,
             current_pose=current_pose,
@@ -502,39 +510,38 @@ class SMARTFlowGAN(SMARTFlow):
             if accumulation_start:
                 discriminator_optimizer.zero_grad(set_to_none=True)
 
-            with torch.no_grad():
-                real_logit_value = self._gan_forward_discriminator(real_pose.detach(), context).detach()
-                fake_logit_value = self._gan_forward_discriminator(fake_pose_for_d.detach(), context).detach()
-
-            fake_logit = self._gan_forward_discriminator_for_backward(fake_pose_for_d.detach(), context)
-            d_fake = relativistic_discriminator_loss(real_logit_value, fake_logit)
-            fake_logit_for_margin = fake_logit.detach()
-            with self._gan_backward_sync_context(step_accumulated):
-                self._manual_backward_without_autocast(d_fake / accumulate)
-            del fake_logit, d_fake
-
-            real_logit = self._gan_forward_discriminator_for_backward(real_pose.detach(), context)
-            d_real = relativistic_discriminator_loss(real_logit, fake_logit_value)
+            real_pose_for_d = real_pose.detach()
+            fake_pose_for_d_detached = fake_pose_for_d.detach()
+            real_logit = self._gan_forward_discriminator_for_backward(real_pose_for_d, context)
+            fake_logit = self._gan_forward_discriminator_for_backward(fake_pose_for_d_detached, context)
+            d_adv = relativistic_discriminator_loss(real_logit, fake_logit)
             real_logit_for_margin = real_logit.detach()
-            with self._gan_backward_sync_context(step_accumulated):
-                self._manual_backward_without_autocast(d_real / accumulate)
-            d_loss = relativistic_discriminator_loss(real_logit_value, fake_logit_value).detach()
-            del real_logit, d_real, real_logit_value, fake_logit_value
+            fake_logit_for_margin = fake_logit.detach()
+            d_total = d_adv
+            d_loss = d_adv.detach()
 
             if self.gan_r1_weight > 0.0:
-                r1 = self._compute_gan_finite_difference_regularizer(real_pose, context)
+                r1 = self._compute_gan_finite_difference_regularizer(
+                    real_pose_for_d,
+                    context,
+                    base_logit=real_logit,
+                )
                 r1_log = r1.detach()
-                with self._gan_backward_sync_context(step_accumulated):
-                    self._manual_backward_without_autocast((self.gan_r1_weight * r1) / accumulate)
+                d_total = d_total + self.gan_r1_weight * r1
                 d_loss = d_loss + self.gan_r1_weight * r1_log
-                del r1
             if self.gan_r2_weight > 0.0:
-                r2 = self._compute_gan_finite_difference_regularizer(fake_pose_for_d, context)
+                r2 = self._compute_gan_finite_difference_regularizer(
+                    fake_pose_for_d_detached,
+                    context,
+                    base_logit=fake_logit,
+                )
                 r2_log = r2.detach()
-                with self._gan_backward_sync_context(step_accumulated):
-                    self._manual_backward_without_autocast((self.gan_r2_weight * r2) / accumulate)
+                d_total = d_total + self.gan_r2_weight * r2
                 d_loss = d_loss + self.gan_r2_weight * r2_log
-                del r2
+            with self._gan_backward_sync_context(step_accumulated):
+                self._manual_backward_without_autocast(d_total / accumulate)
+            del real_logit, fake_logit, d_adv, d_total, real_pose_for_d, fake_pose_for_d_detached
+
             if step_accumulated:
                 self._clip_and_step_with_optional_scaler(
                     discriminator_optimizer,
