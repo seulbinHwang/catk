@@ -927,6 +927,63 @@ kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- tmux attach -t catk-cont
 python scripts/launch_pre_bc_flow_control_h100x6_hsb1_execctx_balanced_static_pod.py --stop
 ```
 
+#### hsb-npc-training-1 H100x6 epoch-last artifact Fast-RMM sweep
+
+`hsb-npc-training-1`에서 돌린 H100x6 pretrain이 끝난 뒤, 마지막 구간의 `epoch_last.ckpt` W&B artifacts를 다시 받아 Fast-RMM closed-loop validation만 반복 평가하려면 아래 launcher를 쓴다. 이 launcher는 pod를 만들거나 삭제하거나 재시작하지 않고, 기존 `hsb-npc-training-1` pod 안에 전용 tmux session만 만든다. **학습이 아직 같은 pod에서 돌고 있으면 실행하지 않는다.**
+
+기본 의도는 epoch `56~63`(표기상 57~64 epoch)의 `epoch_last.ckpt` 8개를 같은 validation 설정으로 평가해서, W&B에서 checkpoint별 RMM을 한 그래프로 비교하는 것이다. launcher는 W&B artifact metadata의 `epoch` 값을 읽어서 기본 `57~64` completed epoch에 해당하는 artifact version을 자동으로 고른다.
+각 epoch 평가가 모두 끝나면 launcher가 W&B run summary를 다시 조회해 epoch별 `RMM / CPD / CES` 표를 만들고, RMM이 가장 높은 epoch과 해당 `RMM / CPD / CES`를 `epoch_sweep_summary.txt`와 tmux/status 로그 마지막에 남긴다.
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_h100x6_hsb1_static_pod.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --sweep-name fast_rmm_epoch_sweep_<run_id>_h100x6_hsb1 \
+  --wandb-group fast_rmm_epoch_sweep_<run_id>_h100x6_hsb1_rmm_only_bs48 \
+  --replace
+```
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_h100x6_hsb1_static_pod.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --dry-run
+```
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling` |
+| 대상 pod | `hsb-npc-training-1` |
+| GPU 구성 | H100 6장, single node |
+| launcher | `scripts/launch_fast_rmm_epoch_sweep_h100x6_hsb1_static_pod.py` |
+| 기본 평가 범위 | W&B metadata epoch `57~64`의 `epoch_last.ckpt` artifact |
+| task label | zero-based epoch `56~63` |
+| artifact mapping | W&B metadata에서 자동 해결 |
+| validation 종류 | closed-loop Fast-RMM only (`val_closed_loop=true`, `val_open_loop=false`) |
+| rollout 수 | `n_rollout_closed_val=32` |
+| scorer scene 수 | `1680` |
+| 기본 val batch | `48` |
+| 기본 `limit_val_batches` | `auto`, H100x6/bs48 기준 `6` |
+| 실제 평가 scene 수 | `48 x 6 x 6 = 1728` |
+| tmux session | `fast-rmm-epoch-sweep-h100x6-hsb1` |
+| 결과 요약 파일 | `<remote_log_dir>/<sweep_name>/epoch_sweep_summary.txt` |
+
+artifact version은 W&B run마다 달라질 수 있으므로 직접 하드코딩하지 않는다. 기본값은 `--epoch-metadata-values 57-64`이며, launcher가 `epoch-last-<run_id>` artifact collection을 조회해 각 metadata epoch의 최신 version을 고른다. 특정 version을 강제로 쓰고 싶을 때만 `--epoch-versions 56:v2,57:v3,...`처럼 명시한다. 학습이 아직 해당 epoch까지 artifact를 업로드하지 않았다면 launcher는 평가를 시작하기 전에 실패한다.
+
+GPU 메모리가 부족하면 validation batch만 낮춘다. 예를 들어 `--val-batch-size 32`를 쓰면 `limit_val_batches=auto`가 H100x6 기준 `9`로 계산되어 `32 x 6 x 9 = 1728` scene을 평가한다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- tmux attach -t fast-rmm-epoch-sweep-h100x6-hsb1
+```
+
+평가 sweep만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_h100x6_hsb1_static_pod.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
