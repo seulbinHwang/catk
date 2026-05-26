@@ -22,6 +22,7 @@ VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-12}"
 TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-12}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-1.0}"
 POLL_SUBMISSION_STATUS="${POLL_SUBMISSION_STATUS:-false}"
+WAYMO_UPLOAD_TIMEOUT_MS="${WAYMO_UPLOAD_TIMEOUT_MS:-7200000}"
 GIT_REF="${GIT_REF:-origin/main}"
 NO_PULL="${NO_PULL:-false}"
 
@@ -38,12 +39,15 @@ fi
 # non-master-node submission shards to rank 0 before creating the Waymo archive.
 export CATK_SUBMISSION_STREAM_SHARDS="${CATK_SUBMISSION_STREAM_SHARDS:-1}"
 export CATK_SUBMISSION_SHARD_STREAM_PORT="${CATK_SUBMISSION_SHARD_STREAM_PORT:-29631}"
+export CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS="${CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS:-16}"
+export CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL="${CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL:-1}"
 
 extra_overrides=(
   "waymo_submission.enabled=true"
   "waymo_submission.submit_validate=true"
   "waymo_submission.submit_test=false"
   "waymo_submission.poll_submission_status=${POLL_SUBMISSION_STATUS}"
+  "waymo_submission.upload_timeout_ms=${WAYMO_UPLOAD_TIMEOUT_MS}"
   "logger.wandb.job_type=waymo_validation_submission"
 )
 

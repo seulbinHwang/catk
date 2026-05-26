@@ -738,6 +738,30 @@ submission shard:
 `testa`로 스트리밍해서 모은 뒤, rank 0에서 하나의
 `sim_agents_2025_submission.tar.gz`를 만든다. 이 수집 단계가 없으면 rank 0이 자기 pod의
 shard만 archive에 넣을 수 있으므로 `testa/testaa` 제출에는 이 기본값을 끄지 않는다.
+수집 중 네트워크 연결이 끊기면 rank 0은 partial shard를 `.part` 임시 파일로만 남기고,
+송신 rank의 재시도를 기다린다. 재시도 횟수는 기본 `16`회이며 필요하면
+`CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS`로 늘릴 수 있다. `tar.gz` 생성은 `pigz`가
+설치되어 있으면 병렬 gzip을 우선 사용하고, 없으면 Python gzip으로 fallback한다. 압축 레벨은
+기본 `CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL=1`이며, 큰 validation 제출물에서 archive 생성
+시간을 줄이기 위한 값이다. 압축률을 더 중시하는 환경에서는 값을 높일 수 있다. 큰 archive
+업로드가 브라우저 timeout에 걸리지 않도록 업로드 제한 시간은 기본
+`WAYMO_UPLOAD_TIMEOUT_MS=7200000`으로 둔다.
+
+만약 rollout은 끝났는데 shard 수집이나 archive/upload 단계만 실패했다면 rollout을 다시 돌리지
+않고 아래 복구 스크립트로 완전한 shard를 다시 모아 archive를 만들고 업로드한다. 이 스크립트는
+`testaa`의 원본 `submission-rank04...07-*.binproto` 76개를 `testa`의
+`sim_agents_2025_submission_rank0_collect/`로 복사한 뒤, 총 152개 shard와 의심스러운 작은
+파일이 없는지 검증한다.
+
+```bash
+python scripts/finalize_smart_ntp_a100x4x2_testa_waymo_submission.py \
+  --run-dir /mnt/nuplan/projects/catk/logs/<TASK_NAME>/runs/<RUN_ID> \
+  --upload
+```
+
+이미 `testaa` shard를 수집 디렉터리로 복사해 둔 상태에서 archive/upload만 다시 하고 싶으면
+`--skip-copy`를 추가한다. 이미 올바른 `sim_agents_2025_submission.tar.gz`까지 만들어진
+상태에서 업로드만 재시도하려면 `--skip-copy --skip-archive --upload`를 쓴다.
 
 실행 중 기본 확인 명령은 아래와 같다.
 

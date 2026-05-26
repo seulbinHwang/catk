@@ -15,6 +15,7 @@ import os
 import shutil
 import socket
 import struct
+import subprocess
 import tarfile
 import time
 from pathlib import Path
@@ -171,17 +172,72 @@ class SimAgentsSubmission(Metric):
 
         num_shards = len(shard_files)
         log.info(f"Saving Sim Agents 2025 submission files to {tar_file_name}")
-        with tarfile.open(tar_file_name, "w:gz") as tar:
-            for shard_index, shard_path in enumerate(shard_files):
-                tar.add(
-                    shard_path.as_posix(),
-                    arcname=self._build_archive_member_name(
-                        shard_index=shard_index,
-                        num_shards=num_shards,
-                    ),
-                )
+        compresslevel = int(os.environ.get("CATK_SUBMISSION_TAR_GZ_COMPRESSLEVEL", "1"))
+        self._save_submission_archive(
+            shard_files=shard_files,
+            tar_file_name=tar_file_name,
+            compresslevel=compresslevel,
+        )
         log.info(f"DONE: Saved Sim Agents 2025 submission files to {tar_file_name}")
         self.i_file = 0
+
+    def _save_submission_archive(
+        self,
+        shard_files: List[Path],
+        tar_file_name: str,
+        compresslevel: int,
+    ) -> None:
+        pigz_path = shutil.which("pigz")
+        if pigz_path is None:
+            with tarfile.open(tar_file_name, "w:gz", compresslevel=compresslevel) as tar:
+                num_shards = len(shard_files)
+                for shard_index, shard_path in enumerate(shard_files):
+                    tar.add(
+                        shard_path.as_posix(),
+                        arcname=self._build_archive_member_name(
+                            shard_index=shard_index,
+                            num_shards=num_shards,
+                        ),
+                    )
+            return
+
+        archive_path = Path(tar_file_name)
+        link_dir = archive_path.parent / f".{archive_path.name}.links.tmp"
+        if link_dir.exists():
+            shutil.rmtree(link_dir)
+        link_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            num_shards = len(shard_files)
+            member_names: list[str] = []
+            for shard_index, shard_path in enumerate(shard_files):
+                member_name = self._build_archive_member_name(
+                    shard_index=shard_index,
+                    num_shards=num_shards,
+                )
+                os.link(shard_path, link_dir / member_name)
+                member_names.append(member_name)
+
+            with archive_path.open("wb") as output_file:
+                tar_proc = subprocess.Popen(
+                    ["tar", "-C", link_dir.as_posix(), "-cf", "-", *member_names],
+                    stdout=subprocess.PIPE,
+                )
+                assert tar_proc.stdout is not None
+                pigz_proc = subprocess.Popen(
+                    [pigz_path, f"-{compresslevel}"],
+                    stdin=tar_proc.stdout,
+                    stdout=output_file,
+                )
+                tar_proc.stdout.close()
+                pigz_rc = pigz_proc.wait()
+                tar_rc = tar_proc.wait()
+            if tar_rc != 0 or pigz_rc != 0:
+                raise RuntimeError(
+                    f"Failed to create Sim Agents 2025 submission archive with pigz "
+                    f"(tar_rc={tar_rc}, pigz_rc={pigz_rc})."
+                )
+        finally:
+            shutil.rmtree(link_dir, ignore_errors=True)
 
     def _collect_multinode_shards_if_requested(self) -> Path:
         """Collect per-node submission shards onto global rank 0 before tar export.
@@ -238,14 +294,38 @@ class SimAgentsSubmission(Metric):
             return
 
         port = int(os.environ.get("CATK_SUBMISSION_SHARD_STREAM_PORT", "29631"))
+        max_attempts = max(
+            expected_connections * 3,
+            int(os.environ.get("CATK_SUBMISSION_SHARD_STREAM_MAX_ATTEMPTS", "16")),
+        )
+        successful_connections = 0
+        attempts = 0
+
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind(("0.0.0.0", port))
             server.listen(expected_connections)
-            for _ in range(expected_connections):
+            while successful_connections < expected_connections and attempts < max_attempts:
+                attempts += 1
                 conn, _ = server.accept()
                 with conn:
-                    self._receive_one_rank_shards(conn, collect_dir)
+                    try:
+                        self._receive_one_rank_shards(conn, collect_dir)
+                    except Exception as exc:
+                        log.warning(
+                            "Failed while receiving Sim Agents 2025 submission shards "
+                            f"on attempt {attempts}/{max_attempts}; waiting for sender retry. "
+                            f"Error: {exc}"
+                        )
+                        continue
+                    successful_connections += 1
+
+        if successful_connections != expected_connections:
+            raise RuntimeError(
+                "Failed to collect all remote Sim Agents 2025 submission shards: "
+                f"{successful_connections}/{expected_connections} connections succeeded "
+                f"after {attempts} attempts."
+            )
 
     def _send_local_shards_to_rank0(self) -> None:
         host = os.environ.get("MASTER_ADDR", "127.0.0.1")
@@ -274,14 +354,25 @@ class SimAgentsSubmission(Metric):
             safe_name = Path(name).name
             file_size = cls._recv_uint64(conn)
             output_path = collect_dir / safe_name
-            with output_path.open("wb") as output_file:
-                remaining = file_size
-                while remaining > 0:
-                    chunk = conn.recv(min(8 * 1024 * 1024, remaining))
-                    if not chunk:
-                        raise RuntimeError(f"Connection closed while receiving {safe_name}.")
-                    output_file.write(chunk)
-                    remaining -= len(chunk)
+            tmp_output_path = output_path.with_suffix(output_path.suffix + ".part")
+            try:
+                with tmp_output_path.open("wb") as output_file:
+                    remaining = file_size
+                    while remaining > 0:
+                        chunk = conn.recv(min(8 * 1024 * 1024, remaining))
+                        if not chunk:
+                            raise RuntimeError(f"Connection closed while receiving {safe_name}.")
+                        output_file.write(chunk)
+                        remaining -= len(chunk)
+                tmp_size = tmp_output_path.stat().st_size
+                if tmp_size != file_size:
+                    raise RuntimeError(
+                        f"Received size mismatch for {safe_name}: expected {file_size}, got {tmp_size}."
+                    )
+                tmp_output_path.replace(output_path)
+            except Exception:
+                tmp_output_path.unlink(missing_ok=True)
+                raise
 
     @classmethod
     def _send_one_rank_shards(cls, conn: socket.socket, shard_files: List[Path]) -> None:
