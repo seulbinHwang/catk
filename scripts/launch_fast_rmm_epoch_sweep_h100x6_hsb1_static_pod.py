@@ -13,8 +13,10 @@ training tmux session is still using the same GPUs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -51,6 +53,14 @@ class SweepEpoch:
 
 def shq(value: object) -> str:
     return shlex.quote(str(value))
+
+
+def wandb_tag(value: object, *, max_len: int = 64) -> str:
+    tag = re.sub(r"[^0-9A-Za-z_.:-]+", "_", str(value)).strip("_") or "tag"
+    if len(tag) <= max_len:
+        return tag
+    digest = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:8]
+    return f"{tag[: max_len - 9]}_{digest}"
 
 
 def run_kubectl(args: list[str], *, capture: bool = False, dry_run: bool = False) -> str:
@@ -219,10 +229,18 @@ def render_worker_script(
     manifest_file = f"{run_root}/epoch_sweep_manifest.tsv"
     summary_file = f"{run_root}/epoch_sweep_summary.txt"
     epoch_csv = ",".join(str(item.epoch) for item in args.epoch_versions)
-    tags = (
-        f"[fast_rmm,epoch_sweep,h100x6,{args.branch},"
-        f"{args.sweep_name},rmm_only,bs{args.val_batch_size}]"
-    )
+    tags = "[" + ",".join(
+        wandb_tag(tag)
+        for tag in (
+            "fast_rmm",
+            "epoch_sweep",
+            "h100x6",
+            args.branch,
+            args.sweep_name,
+            "rmm_only",
+            f"bs{args.val_batch_size}",
+        )
+    ) + "]"
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
 

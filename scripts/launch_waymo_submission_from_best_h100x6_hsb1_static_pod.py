@@ -12,6 +12,7 @@ Waymo auto-upload.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shlex
@@ -39,6 +40,14 @@ DEFAULT_N_ROLLOUT_CLOSED_VAL = 32
 
 def shq(value: object) -> str:
     return shlex.quote(str(value))
+
+
+def wandb_tag(value: object, *, max_len: int = 64) -> str:
+    tag = re.sub(r"[^0-9A-Za-z_.:-]+", "_", str(value)).strip("_") or "tag"
+    if len(tag) <= max_len:
+        return tag
+    digest = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:8]
+    return f"{tag[: max_len - 9]}_{digest}"
 
 
 def run_kubectl(args: list[str], *, capture: bool = False, dry_run: bool = False) -> str:
@@ -87,10 +96,17 @@ git pull --ff-only origin {shq(args.branch)}
 def render_worker_script(args: argparse.Namespace) -> str:
     run_root = f"{args.remote_log_dir.rstrip('/')}/{args.task_name}"
     status_file = f"{run_root}/{args.pod}.status"
-    tags = (
-        f"[waymo_submission,h100x6,{args.branch},{args.task_name},"
-        "best_fast_rmm_epoch,validation]"
-    )
+    tags = "[" + ",".join(
+        wandb_tag(tag)
+        for tag in (
+            "waymo_submission",
+            "h100x6",
+            args.branch,
+            args.task_name,
+            "best_fast_rmm_epoch",
+            "validation",
+        )
+    ) + "]"
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
 
