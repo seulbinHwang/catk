@@ -219,8 +219,6 @@ def test_gan_discriminator_sparse_map_compliance_backward() -> None:
         n_step=n_step,
         num_attention_heads=4,
         map_radius_m=5.0,
-        map_query_chunk_size=1,
-        map_sender_chunk_size=2,
     )
     rollout_pose = torch.randn(bsz, n_rollout, n_step, n_agent, 4)
     yaw = torch.randn(bsz, n_rollout, n_step, n_agent)

@@ -445,15 +445,10 @@ class MapComplianceEncoder(nn.Module):
         radius_m: float = 30.0,
         max_map_neighbors: int = 300,
         num_heads: int = 4,
-        query_chunk_size: int = 16,
-        sender_chunk_size: int = 0,
-        rollout_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
         self.max_map_neighbors = int(max_map_neighbors)
-        self.query_chunk_size = max(1, int(query_chunk_size))
-        self.rollout_chunk_size = max(0, int(rollout_chunk_size))
         self.attention = SparseRadiusAttentionLayer(
             hidden_dim,
             num_heads=num_heads,
@@ -582,12 +577,9 @@ class InteractionEncoder(nn.Module):
         *,
         radius_m: float = 60.0,
         num_heads: int = 4,
-        query_chunk_size: int = 16,
-        sender_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
-        self.query_chunk_size = max(1, int(query_chunk_size))
         self.attention = SparseRadiusAttentionLayer(
             hidden_dim,
             num_heads=num_heads,
@@ -697,11 +689,6 @@ class SelfForcedGANDiscriminator(nn.Module):
         map_radius_m: float = 30.0,
         interaction_radius_m: float = 60.0,
         num_attention_heads: int = 4,
-        map_query_chunk_size: int = 16,
-        interaction_query_chunk_size: int = 16,
-        map_sender_chunk_size: int = 0,
-        interaction_sender_chunk_size: int = 0,
-        map_rollout_chunk_size: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -725,16 +712,11 @@ class SelfForcedGANDiscriminator(nn.Module):
             hidden_dim=hidden_dim,
             radius_m=map_radius_m,
             num_heads=num_attention_heads,
-            query_chunk_size=map_query_chunk_size,
-            sender_chunk_size=map_sender_chunk_size,
-            rollout_chunk_size=map_rollout_chunk_size,
         )
         self.interaction_encoder = InteractionEncoder(
             hidden_dim=hidden_dim,
             radius_m=interaction_radius_m,
             num_heads=num_attention_heads,
-            query_chunk_size=interaction_query_chunk_size,
-            sender_chunk_size=interaction_sender_chunk_size,
         )
         self.agent_pool = PoolingProjection(hidden_dim * 4, hidden_dim)
         self.scalar_head = nn.Sequential(
