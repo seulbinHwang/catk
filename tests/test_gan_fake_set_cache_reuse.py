@@ -38,11 +38,22 @@ class _CountingRolloutEncoder(torch.nn.Module):
         self.rollout_calls += 1
         self.detach_block_transition_flags.append(bool(detach_block_transition))
         self.last_scenario_sampling_seeds = scenario_sampling_seeds
-        n_agent = int(tokenized_agent["n_agent"])
+        n_agent = (
+            int(tokenized_agent["batch"].numel())
+            if "batch" in tokenized_agent
+            else int(tokenized_agent["n_agent"])
+        )
         n_step = int(tokenized_agent["n_step"])
-        value = rollout_cache["scale"] * float(self.rollout_calls)
-        pred_traj = value.expand(n_agent, n_step, 2)
-        pred_head = value.new_zeros((n_agent, n_step))
+        if tokenized_agent.get("seed_value_mode", False):
+            seed_values = (scenario_sampling_seeds[tokenized_agent["batch"]] % 1000).to(
+                dtype=rollout_cache["scale"].dtype
+            )
+            pred_traj = rollout_cache["scale"] * seed_values.view(n_agent, 1, 1).expand(n_agent, n_step, 2)
+            pred_head = rollout_cache["scale"].new_zeros((n_agent, n_step))
+        else:
+            value = rollout_cache["scale"] * float(self.rollout_calls)
+            pred_traj = value.expand(n_agent, n_step, 2)
+            pred_head = value.new_zeros((n_agent, n_step))
         return {"pred_traj_10hz": pred_traj, "pred_head_10hz": pred_head}
 
 
@@ -193,6 +204,63 @@ def test_gan_fake_set_forwards_detach_block_transition() -> None:
     )
 
     assert fake.encoder.detach_block_transition_flags == [True, True, True]
+
+
+def test_gan_fake_set_grouped_rollout_preserves_seed_order() -> None:
+    fake = _FakeGAN(k=4, n_step=3)
+    fake.gan_fake_set_g_group_size = 2
+    context = {
+        "agent_batch": torch.tensor([0, 0, 1]),
+        "batch_size": 2,
+        "scenario_ids": ("scene-a", "scene-b"),
+        "n_max_agent": 2,
+    }
+    tokenized_agent = {
+        "n_agent": 3,
+        "n_step": 3,
+        "batch": torch.tensor([0, 0, 1]),
+        "num_graphs": 2,
+        "seed_value_mode": True,
+    }
+    map_feature = {
+        "scale": fake.encoder.scale,
+        "batch": torch.tensor([0, 1]),
+        "pt_token": torch.ones(2, 1),
+    }
+    rollout_cache = {
+        "scale": fake.encoder.scale,
+        "n_agent": 3,
+        "state": torch.arange(3.0).unsqueeze(-1),
+    }
+
+    output = SMARTFlowGAN._sample_gan_fake_set(
+        fake,
+        tokenized_map={},
+        tokenized_agent=tokenized_agent,
+        context=context,
+        map_feature=map_feature,
+        rollout_cache=rollout_cache,
+        stream="g",
+    )
+
+    expected_scene_a = torch.tensor(
+        [
+            SMARTFlowGAN._make_gan_rollout_seed(fake, "scene-a", stream="g", rollout_idx=idx) % 1000
+            for idx in range(4)
+        ],
+        dtype=output.dtype,
+    )
+    expected_scene_b = torch.tensor(
+        [
+            SMARTFlowGAN._make_gan_rollout_seed(fake, "scene-b", stream="g", rollout_idx=idx) % 1000
+            for idx in range(4)
+        ],
+        dtype=output.dtype,
+    )
+    assert fake.encoder.rollout_calls == 2
+    assert output.shape == (2, 4, 3, 2, 4)
+    assert torch.equal(output[0, :, 0, 0, 0], expected_scene_a)
+    assert torch.equal(output[1, :, 0, 0, 0], expected_scene_b)
 
 
 def test_gan_rollout_seed_is_scene_and_rollout_based() -> None:

@@ -25,6 +25,8 @@ model:
       manual_accumulate_grad_batches: 1
       checkpoint_discriminator: false
       resample_fake_for_generator: true
+      fake_set_d_group_size: 16
+      fake_set_g_group_size: 16
       sampling:
         backprop_last_k: 8
 

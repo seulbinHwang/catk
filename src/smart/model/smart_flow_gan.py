@@ -101,6 +101,14 @@ class SMARTFlowGAN(SMARTFlow):
         )
         if self.gan_manual_accumulate_grad_batches < 1:
             raise ValueError("self_forced_gan.manual_accumulate_grad_batches must be >= 1.")
+        self.gan_fake_set_d_group_size = int(
+            _cfg(self.self_forced_gan_config, "fake_set_d_group_size", 1)
+        )
+        self.gan_fake_set_g_group_size = int(
+            _cfg(self.self_forced_gan_config, "fake_set_g_group_size", 1)
+        )
+        if self.gan_fake_set_d_group_size < 1 or self.gan_fake_set_g_group_size < 1:
+            raise ValueError("self_forced_gan fake set group sizes must be >= 1.")
         self.gan_checkpoint_discriminator = bool(
             _cfg(self.self_forced_gan_config, "checkpoint_discriminator", False)
         )
@@ -382,6 +390,143 @@ class SMARTFlowGAN(SMARTFlow):
         ]
         return torch.tensor(seeds, dtype=torch.long, device=device)
 
+    @staticmethod
+    def _repeat_first_dim(value: Tensor, repeat_count: int) -> Tensor:
+        """첫 번째 축을 rollout group 수만큼 복제합니다."""
+        if repeat_count <= 1:
+            return value
+        repeat_shape = (int(repeat_count),) + (1,) * (value.dim() - 1)
+        return value.repeat(repeat_shape)
+
+    @staticmethod
+    def _repeat_nested_agent_value(value: object, *, n_agent: int, repeat_count: int) -> object:
+        """agent 축을 가진 cache 내부 값을 rollout group 수만큼 복제합니다."""
+        if torch.is_tensor(value):
+            if value.dim() > 0 and int(value.shape[0]) == int(n_agent):
+                return SMARTFlowGAN._repeat_first_dim(value, repeat_count)
+            return value
+        if isinstance(value, dict):
+            return {
+                key: SMARTFlowGAN._repeat_nested_agent_value(
+                    nested_value,
+                    n_agent=n_agent,
+                    repeat_count=repeat_count,
+                )
+                for key, nested_value in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                SMARTFlowGAN._repeat_nested_agent_value(
+                    nested_value,
+                    n_agent=n_agent,
+                    repeat_count=repeat_count,
+                )
+                for nested_value in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                SMARTFlowGAN._repeat_nested_agent_value(
+                    nested_value,
+                    n_agent=n_agent,
+                    repeat_count=repeat_count,
+                )
+                for nested_value in value
+            )
+        return value
+
+    @staticmethod
+    def _expand_tokenized_agent_for_gan_group(
+        tokenized_agent: Dict[str, Tensor],
+        *,
+        repeat_count: int,
+        batch_size: int,
+    ) -> Dict[str, object]:
+        """동일 scene batch를 rollout group 수만큼 독립 그래프로 펼칩니다."""
+        if repeat_count <= 1:
+            return tokenized_agent
+        if "batch" not in tokenized_agent:
+            raise KeyError("tokenized_agent must contain 'batch' for grouped GAN rollout.")
+        agent_batch = tokenized_agent["batch"]
+        n_agent = int(agent_batch.shape[0])
+        expanded: Dict[str, object] = {}
+        for key, value in tokenized_agent.items():
+            if key == "batch":
+                expanded[key] = torch.cat(
+                    [agent_batch + group_idx * int(batch_size) for group_idx in range(int(repeat_count))],
+                    dim=0,
+                )
+            elif key == "num_graphs":
+                expanded[key] = int(batch_size) * int(repeat_count)
+            elif torch.is_tensor(value) and value.dim() > 0 and int(value.shape[0]) == n_agent:
+                expanded[key] = SMARTFlowGAN._repeat_first_dim(value, repeat_count)
+            else:
+                expanded[key] = value
+        return expanded
+
+    @staticmethod
+    def _expand_map_feature_for_gan_group(
+        map_feature: Dict[str, Tensor],
+        *,
+        repeat_count: int,
+        batch_size: int,
+    ) -> Dict[str, Tensor]:
+        """map token batch를 rollout group 수만큼 독립 그래프로 펼칩니다."""
+        if repeat_count <= 1:
+            return map_feature
+        if "batch" not in map_feature:
+            raise KeyError("map_feature must contain 'batch' for grouped GAN rollout.")
+        map_batch = map_feature["batch"]
+        n_map = int(map_batch.shape[0])
+        expanded: Dict[str, Tensor] = {}
+        for key, value in map_feature.items():
+            if key == "batch":
+                expanded[key] = torch.cat(
+                    [map_batch + group_idx * int(batch_size) for group_idx in range(int(repeat_count))],
+                    dim=0,
+                )
+            elif torch.is_tensor(value) and value.dim() > 0 and int(value.shape[0]) == n_map:
+                expanded[key] = SMARTFlowGAN._repeat_first_dim(value, repeat_count)
+            else:
+                expanded[key] = value
+        return expanded
+
+    @staticmethod
+    def _expand_rollout_cache_for_gan_group(
+        rollout_cache: Dict[str, object],
+        *,
+        repeat_count: int,
+    ) -> Dict[str, object]:
+        """rollout cache의 agent별 상태를 rollout group 수만큼 독립 복제합니다."""
+        if repeat_count <= 1:
+            return rollout_cache
+        n_agent = int(rollout_cache["n_agent"])
+        expanded: Dict[str, object] = {}
+        for key, value in rollout_cache.items():
+            if key == "n_agent":
+                expanded[key] = n_agent * int(repeat_count)
+            else:
+                expanded[key] = SMARTFlowGAN._repeat_nested_agent_value(
+                    value,
+                    n_agent=n_agent,
+                    repeat_count=repeat_count,
+                )
+        return expanded
+
+    def _resolve_gan_fake_rollout_group_size(self, *, grad_enabled: bool) -> int:
+        """현재 fake 생성 경로에서 사용할 rollout group 크기를 정합니다."""
+        configured = (
+            getattr(self, "gan_fake_set_g_group_size", 1)
+            if bool(grad_enabled)
+            else getattr(self, "gan_fake_set_d_group_size", 1)
+        )
+        configured = min(int(configured), int(self.gan_rollout_set_size))
+        random_cfg = getattr(self.self_forced_sampling, "random_terminal_step", None)
+        if random_cfg is not None and bool(getattr(random_cfg, "enabled", False)):
+            policy = str(getattr(random_cfg, "policy", "paper_uniform"))
+            if policy != "all":
+                return 1
+        return max(1, configured)
+
     @contextmanager
     def _gan_prepared_rollout_scene(
         self,
@@ -428,17 +573,56 @@ class SMARTFlowGAN(SMARTFlow):
             scenario_ids = context.get("scenario_ids")
             if scenario_ids is None:
                 raise KeyError("GAN batch context must contain 'scenario_ids'.")
-            for rollout_idx in range(int(self.gan_rollout_set_size)):
-                scenario_sampling_seeds = self._get_gan_rollout_scenario_seeds(
-                    scenario_ids=scenario_ids,
-                    stream=stream,
-                    rollout_idx=rollout_idx,
-                    device=tokenized_agent["batch"].device,
-                )
+            batch_size = int(context["batch_size"])
+            n_agent = int(tokenized_agent["batch"].shape[0])
+            group_size = SMARTFlowGAN._resolve_gan_fake_rollout_group_size(
+                self,
+                grad_enabled=torch.is_grad_enabled()
+            )
+            for rollout_start in range(0, int(self.gan_rollout_set_size), group_size):
+                rollout_end = min(int(self.gan_rollout_set_size), rollout_start + group_size)
+                rollout_count = rollout_end - rollout_start
+                if rollout_count > 1:
+                    group_tokenized_agent = SMARTFlowGAN._expand_tokenized_agent_for_gan_group(
+                        tokenized_agent,
+                        repeat_count=rollout_count,
+                        batch_size=batch_size,
+                    )
+                    group_map_feature = SMARTFlowGAN._expand_map_feature_for_gan_group(
+                        prepared_map_feature,
+                        repeat_count=rollout_count,
+                        batch_size=batch_size,
+                    )
+                    group_rollout_cache = SMARTFlowGAN._expand_rollout_cache_for_gan_group(
+                        prepared_rollout_cache,
+                        repeat_count=rollout_count,
+                    )
+                    scenario_sampling_seeds = torch.cat(
+                        [
+                            self._get_gan_rollout_scenario_seeds(
+                                scenario_ids=scenario_ids,
+                                stream=stream,
+                                rollout_idx=rollout_idx,
+                                device=tokenized_agent["batch"].device,
+                            )
+                            for rollout_idx in range(rollout_start, rollout_end)
+                        ],
+                        dim=0,
+                    )
+                else:
+                    group_tokenized_agent = tokenized_agent
+                    group_map_feature = prepared_map_feature
+                    group_rollout_cache = prepared_rollout_cache
+                    scenario_sampling_seeds = self._get_gan_rollout_scenario_seeds(
+                        scenario_ids=scenario_ids,
+                        stream=stream,
+                        rollout_idx=rollout_start,
+                        device=tokenized_agent["batch"].device,
+                    )
                 rollout = self.encoder.training_rollout_from_cache(
-                    rollout_cache=prepared_rollout_cache,
-                    tokenized_agent=tokenized_agent,
-                    map_feature=prepared_map_feature,
+                    rollout_cache=group_rollout_cache,
+                    tokenized_agent=group_tokenized_agent,
+                    map_feature=group_map_feature,
                     sampling_scheme=self.self_forced_sampling,
                     scenario_sampling_seeds=scenario_sampling_seeds,
                     rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
@@ -446,16 +630,26 @@ class SMARTFlowGAN(SMARTFlow):
                     detach_block_transition=self.self_forced_detach_block_transition,
                     use_stop_motion=self.self_forced_use_stop_motion,
                 )
-                pred_traj = rollout["pred_traj_10hz"][:, : self.flow_window_steps, :]
-                pred_head = rollout["pred_head_10hz"][:, : self.flow_window_steps]
-                fake_pose = pack_rollout_prediction_to_set(
-                    pred_traj=pred_traj,
-                    pred_head=pred_head,
-                    batch_index=context["agent_batch"],
-                    batch_size=int(context["batch_size"]),
-                    n_max_agent=int(context["n_max_agent"]),
-                )
-                fake_items.append(fake_pose)
+                for group_idx in range(rollout_count):
+                    agent_start = group_idx * n_agent
+                    agent_end = agent_start + n_agent
+                    pred_traj = rollout["pred_traj_10hz"][
+                        agent_start:agent_end,
+                        : self.flow_window_steps,
+                        :,
+                    ]
+                    pred_head = rollout["pred_head_10hz"][
+                        agent_start:agent_end,
+                        : self.flow_window_steps,
+                    ]
+                    fake_pose = pack_rollout_prediction_to_set(
+                        pred_traj=pred_traj,
+                        pred_head=pred_head,
+                        batch_index=context["agent_batch"],
+                        batch_size=batch_size,
+                        n_max_agent=int(context["n_max_agent"]),
+                    )
+                    fake_items.append(fake_pose)
             return torch.stack(fake_items, dim=1).contiguous()
 
         if map_feature is not None and rollout_cache is not None:
