@@ -2806,9 +2806,15 @@ class SMARTFlow(LightningModule):
           skip_gen: True 면 step 4 (generator backward) 전체 skip; fake-only warmup.
           fake_grad_clip: opt_fake.step() 직전 clip_grad_norm_ max_norm.  0 = no clip.
 
-        Note: anchor 마다 opt_fake.step() 이 no_sync 컨텍스트 안에서 호출되므로
-              multi-GPU 환경 (NPROC>1) 에서는 critic grad 가 local-only.  현재 launcher
-              default 가 single GPU 라 무관.
+        Multi-GPU 안전성:
+          - 함수는 caller 의 no_sync 컨텍스트 안에서 호출됨 (gen backward 를 local
+            누적하고 batch 끝 dummy backward 로 한 번에 allreduce 하는 패턴).
+          - Fake_score grad 는 no_sync 가 막은 allreduce 를 우회해 anchor 마다 명시적
+            torch.distributed.all_reduce 로 직접 평균 → critic 이 GPU 간 동기된 weights
+            로 step 됨.
+          - GPU 간 collective 호출 횟수 동기를 위해 anchor 진입 시 local active flag 를
+            global OR-reduce; mismatched GPU 는 fake_score 모든 params 에 dummy 0
+            backward 로 호출 횟수 맞춤 (find_unused_parameters=False 호환).
         """
         # ── Hyperparams ──────────────────────────────────────────────────────
         G = max(1, int(getattr(self.finetune_config, "dmd_n_rollouts", 1)))
@@ -2938,6 +2944,44 @@ class SMARTFlow(LightningModule):
 
         _seq_keys = {"gt_pos", "gt_heading", "valid_mask", "gt_idx"}
 
+        # ── DDP state (multi-GPU 안전성) ─────────────────────────────────────
+        _dist_avail = torch.distributed.is_available() and torch.distributed.is_initialized()
+        _world_size = torch.distributed.get_world_size() if _dist_avail else 1
+        is_distributed = _dist_avail and _world_size > 1
+
+        # ── Fake_score 의 params (anchor 마다 dummy backward / allreduce 시 사용) ─
+        _fake_score_params = [p for p in fake_score.parameters() if p.requires_grad]
+        # Generator (flow_decoder) 의 trainable params (dummy gen backward 시 사용).
+        _flow_dec_params = [p for p in flow_decoder.parameters() if p.requires_grad]
+
+        def _dummy_backward(params, scale: float = 0.0):
+            """params 모든 param 을 graph 에 touch 하는 zero loss → manual_backward.
+
+            find_unused_parameters=False 호환 + DDP backward hook 가 expected param
+            집합을 trigger 하도록 보장.
+            """
+            if not params:
+                return
+            _ld = sum(p.sum() * scale for p in params)
+            self.manual_backward(_ld)
+
+        def _allreduce_grads(params):
+            """명시적 collective allreduce — caller no_sync 컨텍스트 우회용.
+
+            DDP 의 자동 hook 는 no_sync ctx 안에서 skip 되므로 fake_score 의 critic
+            step 직전에 직접 호출.  grad=None 인 param 은 zero 로 채워 collective
+            shape mismatch 방지.
+            """
+            if not is_distributed or not params:
+                return
+            for p in params:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+                torch.distributed.all_reduce(
+                    p.grad, op=torch.distributed.ReduceOp.SUM
+                )
+                p.grad.div_(_world_size)
+
         # ── Per-anchor setup helper (phase 1/2 공유) ─────────────────────────
         # active_mask 가 모두 False 면 None 반환 → caller skip.
         def _setup_anchor(anchor_idx: int):
@@ -2986,11 +3030,45 @@ class SMARTFlow(LightningModule):
 
         # ════════════════════════════════════════════════════════════════════
         # Anchor-local fake-first loop (single rollout per anchor)
+        # Multi-GPU 동기: anchor 진입 시 local active flag 를 global OR-reduce → 모든
+        # GPU 가 동일 anchor 집합 처리.  local=False 인 GPU 는 dummy backward 로
+        # collective 호출 횟수 매칭.
         # ════════════════════════════════════════════════════════════════════
         for anchor_idx in all_anchor_indices:
             anchor_setup = _setup_anchor(anchor_idx)
-            if anchor_setup is None:
+            local_has_active = anchor_setup is not None
+
+            # ── Global active flag (모든 GPU 가 동일 결정) ────────────────────
+            if is_distributed:
+                _flag = torch.tensor(
+                    [1.0 if local_has_active else 0.0],
+                    device=device, dtype=torch.float32,
+                )
+                torch.distributed.all_reduce(
+                    _flag, op=torch.distributed.ReduceOp.SUM
+                )
+                global_has_active = bool(_flag.item() > 0)
+            else:
+                global_has_active = local_has_active
+
+            if not global_has_active:
+                # 어느 GPU 에도 active anchor 없음 → 모두 skip (collective 안 함).
                 continue
+
+            # ── local=False 인 GPU: dummy 처리 (collective 호출 횟수 맞춤) ────
+            if not local_has_active:
+                # Fake-side dummy backward → allreduce → step (zero update).
+                _dummy_backward(_fake_score_params, scale=0.0)
+                _allreduce_grads(_fake_score_params)
+                if opt_fake is not None:
+                    opt_fake.step()
+                    opt_fake.zero_grad()
+                # Gen-side dummy backward (skip_gen 이면 skip — 다른 GPU 도 동일하게 skip).
+                if not skip_gen:
+                    _dummy_backward(_flow_dec_params, scale=0.0)
+                continue
+
+            # ── 정상 처리 ─────────────────────────────────────────────────────
             (
                 tokenized_agent_anchor, rollout_cache_anchor, active_mask,
                 current_pos_active, current_head_active, active_hidden,
@@ -3041,18 +3119,26 @@ class SMARTFlow(LightningModule):
                 self.manual_backward(L_fake_scaled)
                 fake_loss_accum += float(L_fake.item())
             else:
-                log.warning(f"[dmd] non-finite L_fake at anchor={anchor_idx}; skipping")
+                # non-finite — dummy backward 로 collective 호출 횟수 맞춤.
+                _dummy_backward(_fake_score_params, scale=0.0)
+                log.warning(f"[dmd] non-finite L_fake at anchor={anchor_idx}; dummy backward")
 
-            # ── 3. ★ Critic step IMMEDIATELY (anchor-local fake-first) ──────
-            # 다음 step (gen backward) 의 v_fake_eval 이 refreshed 가 되도록 step 호출.
+            # ── 3. ★ Critic step (anchor-local fake-first) ──────────────────
+            # caller 의 no_sync ctx 가 DDP 자동 allreduce 를 막으므로, fake_score grad
+            # 를 명시적으로 dist.all_reduce 한 후 step.  이로써 generator 가 다음 step
+            # 에서 사용할 v_fake_eval 이 GPU 간 동기된 refreshed critic 의 결과.
+            _allreduce_grads(_fake_score_params)
             if opt_fake is not None:
-                _fake_params = [p for g in opt_fake.param_groups for p in g["params"]]
                 if fake_grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(_fake_params, max_norm=fake_grad_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                        _fake_score_params, max_norm=fake_grad_clip,
+                    )
                 opt_fake.step()
                 opt_fake.zero_grad()
 
             # ── 4. Generator loss (skip_gen 이면 skip) ───────────────────────
+            # Gen backward 는 no_sync (caller 가 ctx 제공) → local 누적, batch 끝 dummy
+            # backward 로 한 번에 allreduce.
             if not skip_gen:
                 with torch.no_grad():
                     x_gen_d = x_gen.detach()
@@ -3099,7 +3185,9 @@ class SMARTFlow(LightningModule):
                     gen_loss_accum += float(L_gen.item())
                     n_dmd_terms += 1
                 else:
-                    log.warning(f"[dmd] non-finite L_gen at anchor={anchor_idx}; skipping")
+                    # dummy gen backward 로 collective 호출 횟수 맞춤.
+                    _dummy_backward(_flow_dec_params, scale=0.0)
+                    log.warning(f"[dmd] non-finite L_gen at anchor={anchor_idx}; dummy backward")
                 n_gen_anchors += 1
 
                 del x_gen_d, x_t, v_fake_eval
