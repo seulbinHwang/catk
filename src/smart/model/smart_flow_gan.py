@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 
 import torch
 from torch import Tensor
@@ -312,6 +313,7 @@ class SMARTFlowGAN(SMARTFlow):
         ).bool()
         return {
             "batch_size": batch_size,
+            "scenario_ids": tuple(str(scenario_id) for scenario_id in scenario_ids),
             "n_max_agent": n_max_agent,
             "n_max_map": n_max_map,
             "agent_batch": agent_batch,
@@ -347,6 +349,34 @@ class SMARTFlowGAN(SMARTFlow):
         context["valid_mask"] = context["valid_mask"] & teacher_valid
         return real_pose
 
+    def _make_gan_rollout_seed(self, scenario_id: str, *, stream: str, rollout_idx: int) -> int:
+        """GAN fake rollout seed를 scene/stream/rollout 기준으로 고정합니다."""
+        seed_payload = (
+            f"{self.validation_closed_seed}:gan:{int(self.current_epoch)}:"
+            f"{str(stream)}:{str(scenario_id)}:{int(rollout_idx)}"
+        ).encode("utf-8")
+        digest = hashlib.blake2b(seed_payload, digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
+
+    def _get_gan_rollout_scenario_seeds(
+        self,
+        scenario_ids: Sequence[str],
+        *,
+        stream: str,
+        rollout_idx: int,
+        device: torch.device,
+    ) -> Tensor:
+        """현재 batch의 scene별 GAN fake rollout seed tensor를 만듭니다."""
+        seeds = [
+            self._make_gan_rollout_seed(
+                scenario_id=str(scenario_id),
+                stream=stream,
+                rollout_idx=int(rollout_idx),
+            )
+            for scenario_id in scenario_ids
+        ]
+        return torch.tensor(seeds, dtype=torch.long, device=device)
+
     @contextmanager
     def _gan_prepared_rollout_scene(
         self,
@@ -370,6 +400,7 @@ class SMARTFlowGAN(SMARTFlow):
         *,
         map_feature: Dict[str, Tensor] | None = None,
         rollout_cache: Dict[str, object] | None = None,
+        stream: str = "shared",
     ) -> Tensor:
         """student closed-loop rollout set K개를 생성합니다.
 
@@ -389,12 +420,22 @@ class SMARTFlowGAN(SMARTFlow):
             prepared_rollout_cache: Dict[str, object],
         ) -> Tensor:
             fake_items: list[Tensor] = []
-            for _ in range(int(self.gan_rollout_set_size)):
+            scenario_ids = context.get("scenario_ids")
+            if scenario_ids is None:
+                raise KeyError("GAN batch context must contain 'scenario_ids'.")
+            for rollout_idx in range(int(self.gan_rollout_set_size)):
+                scenario_sampling_seeds = self._get_gan_rollout_scenario_seeds(
+                    scenario_ids=scenario_ids,
+                    stream=stream,
+                    rollout_idx=rollout_idx,
+                    device=tokenized_agent["batch"].device,
+                )
                 rollout = self.encoder.training_rollout_from_cache(
                     rollout_cache=prepared_rollout_cache,
                     tokenized_agent=tokenized_agent,
                     map_feature=prepared_map_feature,
                     sampling_scheme=self.self_forced_sampling,
+                    scenario_sampling_seeds=scenario_sampling_seeds,
                     rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
                     self_forced_epoch=int(self.current_epoch),
                     detach_block_transition=self.self_forced_detach_block_transition,
@@ -540,6 +581,7 @@ class SMARTFlowGAN(SMARTFlow):
                         context,
                         map_feature=map_feature,
                         rollout_cache=rollout_cache,
+                        stream="d",
                     )
             else:
                 fake_pose_for_d = self._sample_gan_fake_set(
@@ -548,6 +590,7 @@ class SMARTFlowGAN(SMARTFlow):
                     context,
                     map_feature=map_feature,
                     rollout_cache=rollout_cache,
+                    stream="shared",
                 )
 
             generator_optimizer, discriminator_optimizer = self.optimizers()
@@ -622,6 +665,7 @@ class SMARTFlowGAN(SMARTFlow):
                         context,
                         map_feature=map_feature,
                         rollout_cache=rollout_cache,
+                        stream="g",
                     )
                 else:
                     fake_pose = fake_pose_for_d

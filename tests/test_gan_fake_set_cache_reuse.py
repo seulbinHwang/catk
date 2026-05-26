@@ -32,8 +32,10 @@ class _CountingRolloutEncoder(torch.nn.Module):
         self_forced_epoch,
         detach_block_transition,
         use_stop_motion,
+        scenario_sampling_seeds=None,
     ):
         self.rollout_calls += 1
+        self.last_scenario_sampling_seeds = scenario_sampling_seeds
         n_agent = int(tokenized_agent["n_agent"])
         n_step = int(tokenized_agent["n_step"])
         value = rollout_cache["scale"] * float(self.rollout_calls)
@@ -48,6 +50,7 @@ class _FakeGAN:
         self.gan_rollout_set_size = k
         self.flow_window_steps = n_step
         self.self_forced_sampling = {}
+        self.validation_closed_seed = 0
         self.current_epoch = 0
         self.self_forced_detach_block_transition = False
         self.self_forced_use_stop_motion = False
@@ -70,19 +73,32 @@ class _FakeGAN:
     def _gan_prepared_rollout_scene(self, tokenized_map, tokenized_agent):
         return SMARTFlowGAN._gan_prepared_rollout_scene(self, tokenized_map, tokenized_agent)
 
+    def _make_gan_rollout_seed(self, scenario_id, *, stream, rollout_idx):
+        return SMARTFlowGAN._make_gan_rollout_seed(self, scenario_id, stream=stream, rollout_idx=rollout_idx)
+
+    def _get_gan_rollout_scenario_seeds(self, scenario_ids, *, stream, rollout_idx, device):
+        return SMARTFlowGAN._get_gan_rollout_scenario_seeds(
+            self,
+            scenario_ids,
+            stream=stream,
+            rollout_idx=rollout_idx,
+            device=device,
+        )
+
 
 def test_gan_fake_set_reuses_scene_preparation_once_and_keeps_gradients() -> None:
     fake = _FakeGAN(k=4, n_step=3)
     context = {
         "agent_batch": torch.tensor([0, 0]),
         "batch_size": 1,
+        "scenario_ids": ("scene-a",),
         "n_max_agent": 2,
     }
 
     output = SMARTFlowGAN._sample_gan_fake_set(
         fake,
         tokenized_map={},
-        tokenized_agent={"n_agent": 2, "n_step": 3},
+        tokenized_agent={"n_agent": 2, "n_step": 3, "batch": torch.tensor([0, 0])},
         context=context,
     )
 
@@ -104,6 +120,7 @@ def test_gan_fake_set_uses_provided_scene_preparation_without_recomputing() -> N
     context = {
         "agent_batch": torch.tensor([0, 0]),
         "batch_size": 1,
+        "scenario_ids": ("scene-a",),
         "n_max_agent": 2,
     }
     map_feature = {"scale": fake.encoder.scale}
@@ -112,7 +129,7 @@ def test_gan_fake_set_uses_provided_scene_preparation_without_recomputing() -> N
     output = SMARTFlowGAN._sample_gan_fake_set(
         fake,
         tokenized_map={},
-        tokenized_agent={"n_agent": 2, "n_step": 3},
+        tokenized_agent={"n_agent": 2, "n_step": 3, "batch": torch.tensor([0, 0])},
         context=context,
         map_feature=map_feature,
         rollout_cache=rollout_cache,
@@ -136,6 +153,7 @@ def test_gan_fake_set_requires_prepared_scene_inputs_together() -> None:
     context = {
         "agent_batch": torch.tensor([0]),
         "batch_size": 1,
+        "scenario_ids": ("scene-a",),
         "n_max_agent": 1,
     }
 
@@ -143,7 +161,7 @@ def test_gan_fake_set_requires_prepared_scene_inputs_together() -> None:
         SMARTFlowGAN._sample_gan_fake_set(
             fake,
             tokenized_map={},
-            tokenized_agent={"n_agent": 1, "n_step": 3},
+            tokenized_agent={"n_agent": 1, "n_step": 3, "batch": torch.tensor([0])},
             context=context,
             map_feature={"scale": fake.encoder.scale},
         )
@@ -151,3 +169,36 @@ def test_gan_fake_set_requires_prepared_scene_inputs_together() -> None:
         assert "map_feature and rollout_cache" in str(exc)
     else:
         raise AssertionError("Expected ValueError when only one prepared scene input is provided.")
+
+
+def test_gan_rollout_seed_is_scene_and_rollout_based() -> None:
+    fake = _FakeGAN(k=1, n_step=3)
+
+    seed_a_first = SMARTFlowGAN._make_gan_rollout_seed(
+        fake,
+        "scene-a",
+        stream="g",
+        rollout_idx=3,
+    )
+    seed_a_second = SMARTFlowGAN._make_gan_rollout_seed(
+        fake,
+        "scene-a",
+        stream="g",
+        rollout_idx=3,
+    )
+    seed_other_rollout = SMARTFlowGAN._make_gan_rollout_seed(
+        fake,
+        "scene-a",
+        stream="g",
+        rollout_idx=4,
+    )
+    seed_other_stream = SMARTFlowGAN._make_gan_rollout_seed(
+        fake,
+        "scene-a",
+        stream="d",
+        rollout_idx=3,
+    )
+
+    assert seed_a_first == seed_a_second
+    assert seed_a_first != seed_other_rollout
+    assert seed_a_first != seed_other_stream
