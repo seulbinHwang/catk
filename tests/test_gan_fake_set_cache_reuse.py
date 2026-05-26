@@ -67,6 +67,9 @@ class _FakeGAN:
     def _get_self_forced_rollout_steps_2hz(self) -> int:
         return 1
 
+    def _gan_prepared_rollout_scene(self, tokenized_map, tokenized_agent):
+        return SMARTFlowGAN._gan_prepared_rollout_scene(self, tokenized_map, tokenized_agent)
+
 
 def test_gan_fake_set_reuses_scene_preparation_once_and_keeps_gradients() -> None:
     fake = _FakeGAN(k=4, n_step=3)
@@ -94,3 +97,57 @@ def test_gan_fake_set_reuses_scene_preparation_once_and_keeps_gradients() -> Non
     output[..., 0].sum().backward()
     assert fake.encoder.scale.grad is not None
     assert bool(torch.isfinite(fake.encoder.scale.grad).item())
+
+
+def test_gan_fake_set_uses_provided_scene_preparation_without_recomputing() -> None:
+    fake = _FakeGAN(k=4, n_step=3)
+    context = {
+        "agent_batch": torch.tensor([0, 0]),
+        "batch_size": 1,
+        "n_max_agent": 2,
+    }
+    map_feature = {"scale": fake.encoder.scale}
+    rollout_cache = {"scale": fake.encoder.scale}
+
+    output = SMARTFlowGAN._sample_gan_fake_set(
+        fake,
+        tokenized_map={},
+        tokenized_agent={"n_agent": 2, "n_step": 3},
+        context=context,
+        map_feature=map_feature,
+        rollout_cache=rollout_cache,
+    )
+
+    assert fake.switch_calls == 0
+    assert fake.restore_calls == 0
+    assert fake.encoder.encode_calls == 0
+    assert fake.encoder.prepare_calls == 0
+    assert fake.encoder.rollout_calls == 4
+    assert output.shape == (1, 4, 3, 2, 4)
+    assert torch.equal(output[0, :, 0, 0, 0], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+
+    output[..., 0].sum().backward()
+    assert fake.encoder.scale.grad is not None
+    assert bool(torch.isfinite(fake.encoder.scale.grad).item())
+
+
+def test_gan_fake_set_requires_prepared_scene_inputs_together() -> None:
+    fake = _FakeGAN(k=1, n_step=3)
+    context = {
+        "agent_batch": torch.tensor([0]),
+        "batch_size": 1,
+        "n_max_agent": 1,
+    }
+
+    try:
+        SMARTFlowGAN._sample_gan_fake_set(
+            fake,
+            tokenized_map={},
+            tokenized_agent={"n_agent": 1, "n_step": 3},
+            context=context,
+            map_feature={"scale": fake.encoder.scale},
+        )
+    except ValueError as exc:
+        assert "map_feature and rollout_cache" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError when only one prepared scene input is provided.")

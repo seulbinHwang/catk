@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict
 
 import torch
@@ -347,11 +347,29 @@ class SMARTFlowGAN(SMARTFlow):
         context["valid_mask"] = context["valid_mask"] & teacher_valid
         return real_pose
 
+    @contextmanager
+    def _gan_prepared_rollout_scene(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ):
+        """GAN step 안에서 공유할 inference-mode scene state를 준비합니다."""
+        encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
+        try:
+            map_feature = self.encoder.encode_map(tokenized_map)
+            rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
+            yield map_feature, rollout_cache
+        finally:
+            self._restore_module_training_modes(encoder_modes)
+
     def _sample_gan_fake_set(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         context: Dict[str, Tensor | int],
+        *,
+        map_feature: Dict[str, Tensor] | None = None,
+        rollout_cache: Dict[str, object] | None = None,
     ) -> Tensor:
         """student closed-loop rollout set K개를 생성합니다.
 
@@ -363,16 +381,19 @@ class SMARTFlowGAN(SMARTFlow):
         Returns:
             Tensor: fake rollout set입니다. shape은 ``[B, K, 20, N, 4]`` 입니다.
         """
-        fake_items: list[Tensor] = []
-        encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
-        try:
-            map_feature = self.encoder.encode_map(tokenized_map)
-            rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
+        if (map_feature is None) != (rollout_cache is None):
+            raise ValueError("map_feature and rollout_cache must be provided together.")
+
+        def sample_from_prepared_scene(
+            prepared_map_feature: Dict[str, Tensor],
+            prepared_rollout_cache: Dict[str, object],
+        ) -> Tensor:
+            fake_items: list[Tensor] = []
             for _ in range(int(self.gan_rollout_set_size)):
                 rollout = self.encoder.training_rollout_from_cache(
-                    rollout_cache=rollout_cache,
+                    rollout_cache=prepared_rollout_cache,
                     tokenized_agent=tokenized_agent,
-                    map_feature=map_feature,
+                    map_feature=prepared_map_feature,
                     sampling_scheme=self.self_forced_sampling,
                     rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
                     self_forced_epoch=int(self.current_epoch),
@@ -389,9 +410,16 @@ class SMARTFlowGAN(SMARTFlow):
                     n_max_agent=int(context["n_max_agent"]),
                 )
                 fake_items.append(fake_pose)
-        finally:
-            self._restore_module_training_modes(encoder_modes)
-        return torch.stack(fake_items, dim=1).contiguous()
+            return torch.stack(fake_items, dim=1).contiguous()
+
+        if map_feature is not None and rollout_cache is not None:
+            return sample_from_prepared_scene(map_feature, rollout_cache)
+
+        with self._gan_prepared_rollout_scene(tokenized_map, tokenized_agent) as (
+            prepared_map_feature,
+            prepared_rollout_cache,
+        ):
+            return sample_from_prepared_scene(prepared_map_feature, prepared_rollout_cache)
 
     def _gan_forward_discriminator(self, rollout_pose: Tensor, context: Dict[str, Tensor | int]) -> Tensor:
         """discriminator forward를 실행합니다.
@@ -499,109 +527,126 @@ class SMARTFlowGAN(SMARTFlow):
             Tensor: logging용 detached loss입니다.
         """
         tokenized_map, tokenized_agent = self._build_eval_tokenized_inputs(data)
-        map_feature = self.encoder.encode_map(tokenized_map)
-        rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
-        context = self._build_gan_batch_context(data, tokenized_agent, rollout_cache, map_feature)
-        real_pose = self._load_gan_real_set(data, context)
+        with self._gan_prepared_rollout_scene(tokenized_map, tokenized_agent) as (map_feature, rollout_cache):
+            context = self._build_gan_batch_context(data, tokenized_agent, rollout_cache, map_feature)
+            real_pose = self._load_gan_real_set(data, context)
 
-        warmup_active = self._is_gan_warmup_active()
-        if warmup_active or self.gan_resample_fake_for_generator:
-            with torch.no_grad():
-                fake_pose_for_d = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
-        else:
-            fake_pose_for_d = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
-
-        generator_optimizer, discriminator_optimizer = self.optimizers()
-        accumulate = max(1, int(self.gan_manual_accumulate_grad_batches))
-        accumulation_start = self._gan_is_accumulation_start(batch_idx)
-        step_accumulated = self._gan_should_step_accumulated_optimizer(batch_idx)
-        r1_log = real_pose.new_zeros(())
-        r2_log = real_pose.new_zeros(())
-
-        self.toggle_optimizer(discriminator_optimizer)
-        try:
-            if accumulation_start:
-                discriminator_optimizer.zero_grad(set_to_none=True)
-
-            real_pose_for_d = real_pose.detach()
-            fake_pose_for_d_detached = fake_pose_for_d.detach()
-            real_logit = self._gan_forward_discriminator_for_backward(real_pose_for_d, context)
-            fake_logit = self._gan_forward_discriminator_for_backward(fake_pose_for_d_detached, context)
-            d_adv = relativistic_discriminator_loss(real_logit, fake_logit)
-            real_logit_for_margin = real_logit.detach()
-            fake_logit_for_margin = fake_logit.detach()
-            d_loss = d_adv.detach()
-            with self._gan_backward_sync_context(step_accumulated):
-                self._manual_backward_without_autocast(d_adv / accumulate)
-            del real_logit, fake_logit, d_adv
-
-            if self.gan_r1_weight > 0.0:
-                r1 = self._compute_gan_finite_difference_regularizer(
-                    real_pose_for_d,
-                    context,
-                )
-                r1_log = r1.detach()
-                d_loss = d_loss + self.gan_r1_weight * r1_log
-                with self._gan_backward_sync_context(step_accumulated):
-                    self._manual_backward_without_autocast((self.gan_r1_weight * r1) / accumulate)
-                del r1
-            if self.gan_r2_weight > 0.0:
-                r2 = self._compute_gan_finite_difference_regularizer(
-                    fake_pose_for_d_detached,
-                    context,
-                )
-                r2_log = r2.detach()
-                d_loss = d_loss + self.gan_r2_weight * r2_log
-                with self._gan_backward_sync_context(step_accumulated):
-                    self._manual_backward_without_autocast((self.gan_r2_weight * r2) / accumulate)
-                del r2
-            del real_pose_for_d, fake_pose_for_d_detached
-
-            if step_accumulated:
-                self._clip_and_step_with_optional_scaler(
-                    discriminator_optimizer,
-                    gradient_clip_val=self.gan_gradient_clip_val,
-                    gradient_clip_algorithm="norm",
-                )
-                self.gan_discriminator_update_count.add_(1)
-                if warmup_active:
-                    self.gan_warmup_update_count.add_(1)
-        finally:
-            if step_accumulated:
-                discriminator_optimizer.zero_grad(set_to_none=True)
-            self.untoggle_optimizer(discriminator_optimizer)
-
-        if warmup_active:
-            total_loss = d_loss.detach()
-            g_loss = real_pose.new_zeros(())
-        else:
-            if self.gan_resample_fake_for_generator:
-                del fake_pose_for_d
-                fake_pose = self._sample_gan_fake_set(tokenized_map, tokenized_agent, context)
+            warmup_active = self._is_gan_warmup_active()
+            if warmup_active or self.gan_resample_fake_for_generator:
+                with torch.no_grad():
+                    fake_pose_for_d = self._sample_gan_fake_set(
+                        tokenized_map,
+                        tokenized_agent,
+                        context,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache,
+                    )
             else:
-                fake_pose = fake_pose_for_d
-            self.toggle_optimizer(generator_optimizer)
+                fake_pose_for_d = self._sample_gan_fake_set(
+                    tokenized_map,
+                    tokenized_agent,
+                    context,
+                    map_feature=map_feature,
+                    rollout_cache=rollout_cache,
+                )
+
+            generator_optimizer, discriminator_optimizer = self.optimizers()
+            accumulate = max(1, int(self.gan_manual_accumulate_grad_batches))
+            accumulation_start = self._gan_is_accumulation_start(batch_idx)
+            step_accumulated = self._gan_should_step_accumulated_optimizer(batch_idx)
+            r1_log = real_pose.new_zeros(())
+            r2_log = real_pose.new_zeros(())
+
+            self.toggle_optimizer(discriminator_optimizer)
             try:
                 if accumulation_start:
-                    generator_optimizer.zero_grad(set_to_none=True)
-                with frozen_parameters(self.gan_discriminator):
-                    real_logit_for_g = self._gan_forward_discriminator(real_pose.detach(), context).detach()
-                    fake_logit_for_g = self._gan_forward_discriminator_for_backward(fake_pose, context)
-                    g_loss = relativistic_generator_loss(real_logit_for_g, fake_logit_for_g)
+                    discriminator_optimizer.zero_grad(set_to_none=True)
+
+                real_pose_for_d = real_pose.detach()
+                fake_pose_for_d_detached = fake_pose_for_d.detach()
+                real_logit = self._gan_forward_discriminator_for_backward(real_pose_for_d, context)
+                fake_logit = self._gan_forward_discriminator_for_backward(fake_pose_for_d_detached, context)
+                d_adv = relativistic_discriminator_loss(real_logit, fake_logit)
+                real_logit_for_margin = real_logit.detach()
+                fake_logit_for_margin = fake_logit.detach()
+                d_loss = d_adv.detach()
                 with self._gan_backward_sync_context(step_accumulated):
-                    self._manual_backward_without_autocast(g_loss / accumulate)
+                    self._manual_backward_without_autocast(d_adv / accumulate)
+                del real_logit, fake_logit, d_adv
+
+                if self.gan_r1_weight > 0.0:
+                    r1 = self._compute_gan_finite_difference_regularizer(
+                        real_pose_for_d,
+                        context,
+                    )
+                    r1_log = r1.detach()
+                    d_loss = d_loss + self.gan_r1_weight * r1_log
+                    with self._gan_backward_sync_context(step_accumulated):
+                        self._manual_backward_without_autocast((self.gan_r1_weight * r1) / accumulate)
+                    del r1
+                if self.gan_r2_weight > 0.0:
+                    r2 = self._compute_gan_finite_difference_regularizer(
+                        fake_pose_for_d_detached,
+                        context,
+                    )
+                    r2_log = r2.detach()
+                    d_loss = d_loss + self.gan_r2_weight * r2_log
+                    with self._gan_backward_sync_context(step_accumulated):
+                        self._manual_backward_without_autocast((self.gan_r2_weight * r2) / accumulate)
+                    del r2
+                del real_pose_for_d, fake_pose_for_d_detached
+
                 if step_accumulated:
                     self._clip_and_step_with_optional_scaler(
-                        generator_optimizer,
+                        discriminator_optimizer,
                         gradient_clip_val=self.gan_gradient_clip_val,
                         gradient_clip_algorithm="norm",
                     )
-                    self._update_gan_generator_ema_after_step()
+                    self.gan_discriminator_update_count.add_(1)
+                    if warmup_active:
+                        self.gan_warmup_update_count.add_(1)
             finally:
                 if step_accumulated:
-                    generator_optimizer.zero_grad(set_to_none=True)
-                self.untoggle_optimizer(generator_optimizer)
-            total_loss = g_loss.detach()
+                    discriminator_optimizer.zero_grad(set_to_none=True)
+                self.untoggle_optimizer(discriminator_optimizer)
+
+            if warmup_active:
+                total_loss = d_loss.detach()
+                g_loss = real_pose.new_zeros(())
+            else:
+                if self.gan_resample_fake_for_generator:
+                    del fake_pose_for_d
+                    fake_pose = self._sample_gan_fake_set(
+                        tokenized_map,
+                        tokenized_agent,
+                        context,
+                        map_feature=map_feature,
+                        rollout_cache=rollout_cache,
+                    )
+                else:
+                    fake_pose = fake_pose_for_d
+                self.toggle_optimizer(generator_optimizer)
+                try:
+                    if accumulation_start:
+                        generator_optimizer.zero_grad(set_to_none=True)
+                    with frozen_parameters(self.gan_discriminator):
+                        real_logit_for_g = self._gan_forward_discriminator(real_pose.detach(), context).detach()
+                        fake_logit_for_g = self._gan_forward_discriminator_for_backward(fake_pose, context)
+                        g_loss = relativistic_generator_loss(real_logit_for_g, fake_logit_for_g)
+                    with self._gan_backward_sync_context(step_accumulated):
+                        self._manual_backward_without_autocast(g_loss / accumulate)
+                    if step_accumulated:
+                        self._clip_and_step_with_optional_scaler(
+                            generator_optimizer,
+                            gradient_clip_val=self.gan_gradient_clip_val,
+                            gradient_clip_algorithm="norm",
+                        )
+                        self._update_gan_generator_ema_after_step()
+                finally:
+                    if step_accumulated:
+                        generator_optimizer.zero_grad(set_to_none=True)
+                    self.untoggle_optimizer(generator_optimizer)
+                total_loss = g_loss.detach()
 
         margin = (real_logit_for_margin - fake_logit_for_margin).mean()
         self.log("train/loss", total_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
