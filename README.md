@@ -681,10 +681,25 @@ torchrun \
   waymo_submission.poll_submission_status=false
 ```
 
-#### epoch 58 SMART NTP validation 제출
+#### SMART NTP A100x4x2 validation 제출 반복 실행
 
-`testa + testaa`의 A100 8개로 epoch 58 checkpoint에서 full validation-set
-Waymo Sim Agents 제출물을 만들고 자동 업로드할 때는 아래 스크립트를 쓴다.
+`testa + testaa`의 A100 8개로 full validation-set Waymo Sim Agents 제출물을 만들고
+자동 업로드할 때는 아래 범용 스크립트를 쓴다. 이 스크립트는 기존 pod 안에서만 tmux
+session을 띄우며, pod를 생성하거나 삭제하지 않는다.
+
+```bash
+CKPT_PATH=/path/to/epoch_last.ckpt \
+TASK_NAME=smart_ntp_waymo_val_epochXXX_a100x4x2 \
+bash scripts/start_smart_ntp_a100x4x2_testa_waymo_val_submission.sh
+```
+
+반복 실행 시에는 `TASK_NAME`을 매번 다르게 잡는 것을 권장한다. 그러면 이전 probe나
+부분 실행 결과와 새 제출물이 같은 output directory에 섞이지 않는다. 필요하면
+`RUN_ID=2026-05-26_20-45-00`처럼 run directory 이름도 직접 고정할 수 있다. 직접
+지정하지 않으면 launcher가 한 번 만든 run id를 모든 distributed rank에 공통으로
+전달한다.
+
+epoch 58 checkpoint를 다시 제출하려면 아래 preset을 그대로 쓴다.
 
 ```bash
 bash scripts/start_smart_ntp_a100x4x2_testa_waymo_val_submission_epoch058.sh
@@ -709,11 +724,62 @@ upload:
   waymo_submission.enabled=true
   waymo_submission.submit_validate=true
   waymo_submission.submit_test=false
+submission shard:
+  CATK_SUBMISSION_STREAM_SHARDS=1
 ```
 
 이 checkpoint는 1부터 세는 epoch 58, zero-based checkpoint epoch `057`에 해당한다.
 기본 `wosac_sub` 설정은 full validation submission 전용이므로 fast-RMM 집계와 video 저장은
 끄고, Waymo 제출 형식의 `sim_agents_2025_submission.tar.gz`를 만든다.
+
+`testa`와 `testaa`는 같은 경로 문자열을 쓰더라도 실제 파일시스템이 공유되지 않을 수 있다.
+따라서 이 스크립트는 기본으로 `CATK_SUBMISSION_STREAM_SHARDS=1`을 켠다. validation 종료 후
+`testaa` 쪽 rank가 만든 `submission-rank04...07-*.binproto` shard를 rank 0 pod인
+`testa`로 스트리밍해서 모은 뒤, rank 0에서 하나의
+`sim_agents_2025_submission.tar.gz`를 만든다. 이 수집 단계가 없으면 rank 0이 자기 pod의
+shard만 archive에 넣을 수 있으므로 `testa/testaa` 제출에는 이 기본값을 끄지 않는다.
+
+실행 중 기본 확인 명령은 아래와 같다.
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- \
+  tmux attach -t catk-smart-ntp-waymo-val-submission-a100x4x2
+
+kubectl exec -n p-pnc testa -c main -- bash -lc '
+TASK=smart_ntp_waymo_val_epochXXX_a100x4x2
+LOG=/mnt/nuplan/projects/catk/logs/tmux_smart_ntp_a100x4x2/${TASK}/testa.tmux.log
+grep -o "Validation DataLoader 0:.*" "$LOG" | tail -n 1
+'
+```
+
+제출 형식 sanity check는 생성된 shard가 생긴 뒤 아래처럼 확인한다. 이 검사는 실행 중인
+validation process를 건드리지 않고, 이미 저장된 protobuf shard만 읽는다.
+
+```bash
+kubectl exec -n p-pnc testa -c main -- bash -lc '
+python - <<PY
+from pathlib import Path
+from waymo_open_dataset.protos import sim_agents_submission_pb2
+
+task = "smart_ntp_waymo_val_epochXXX_a100x4x2"
+run = "YYYY-MM-DD_HH-MM-SS"
+base = Path(f"/mnt/nuplan/projects/catk/logs/{task}/runs/{run}/sim_agents_2025_submission")
+for path in sorted(base.glob("submission-rank*.binproto")):
+    msg = sim_agents_submission_pb2.SimAgentsChallengeSubmission()
+    msg.ParseFromString(path.read_bytes())
+    ids = [r.scenario_id for r in msg.scenario_rollouts]
+    horizons = set()
+    rollout_counts = set()
+    for scenario in msg.scenario_rollouts:
+        rollout_counts.add(len(scenario.joint_scenes))
+        for joint_scene in scenario.joint_scenes:
+            for traj in joint_scene.simulated_trajectories:
+                horizons.add(len(traj.center_x))
+    print(path.name, "scenarios", len(ids), "unique", len(set(ids)),
+          "rollouts", sorted(rollout_counts), "horizon", sorted(horizons))
+PY
+'
+```
 
 자동 업로드를 위해서는 Waymo 로그인 상태가 필요하다. 가장 안전한 방법은 GUI가 있는 PC에서
 아래 명령으로 storage state를 만든 뒤,
