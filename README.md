@@ -1048,6 +1048,62 @@ kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- tmux attach -t catk-flow
 python scripts/launch_waymo_submission_from_best_h100x6_hsb1_static_pod.py --stop
 ```
 
+#### hsb-npc-training-1 H100x6 Fast-RMM sweep 후 best-RMM Waymo 제출 통합 실행
+
+Fast-RMM epoch sweep을 먼저 돌리고, 그 결과에서 `RMM`이 가장 높은 epoch의 checkpoint로 Waymo validation 제출까지 이어서 실행하려면 아래 통합 launcher를 쓴다. 이 launcher는 pod를 만들거나 삭제하지 않고, 기존 `hsb-npc-training-1` pod 안에서 sweep이 끝날 때까지 기다린 뒤 best checkpoint 제출 launcher를 시작한다. **같은 pod에서 학습, sweep, submission이 이미 돌고 있으면 실행하지 않는다.**
+
+```bash
+python scripts/launch_fast_rmm_sweep_then_waymo_h100x6_hsb1_static_pod.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --sweep-name fast_rmm_epoch_sweep_<run_id>_h100x6_hsb1 \
+  --sweep-wandb-group fast_rmm_epoch_sweep_<run_id>_h100x6_hsb1_rmm_only_bs48 \
+  --submission-task-name flow_control_waymo_val_best_rmm_<run_id>_h100x6_hsb1 \
+  --submission-wandb-group waymo_submission_best_rmm_<run_id>_h100x6_hsb1 \
+  --replace
+```
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling` |
+| 대상 pod | `hsb-npc-training-1` |
+| GPU 구성 | H100 6장, single node |
+| launcher | `scripts/launch_fast_rmm_sweep_then_waymo_h100x6_hsb1_static_pod.py` |
+| 1단계 | `scripts/launch_fast_rmm_epoch_sweep_h100x6_hsb1_static_pod.py` |
+| 2단계 | `scripts/launch_waymo_submission_from_best_h100x6_hsb1_static_pod.py` |
+| best checkpoint 기준 | sweep summary의 `BEST_BY_RMM` |
+| 기본 평가 범위 | W&B metadata epoch `57~64` |
+| rollout 수 | `n_rollout_closed_val=32` |
+| 기본 Fast-RMM scene 수 | `scorer_scene_num=1680` |
+| 기본 val batch | sweep/submission 모두 per-rank `48` |
+
+동작 확인용으로 submission까지 시작하지 않고 sweep summary와 best epoch 파싱만 확인하려면:
+
+```bash
+python scripts/launch_fast_rmm_sweep_then_waymo_h100x6_hsb1_static_pod.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --epoch-versions 63:v9 \
+  --sweep-limit-val-batches 1 \
+  --scorer-scene-num 48 \
+  --sweep-name codex_smoke_fast_rmm_then_waymo \
+  --submission-task-name codex_smoke_waymo_from_best \
+  --replace \
+  --skip-submission
+```
+
+실행 전 전체 명령만 확인하려면:
+
+```bash
+python scripts/launch_fast_rmm_sweep_then_waymo_h100x6_hsb1_static_pod.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --dry-run
+```
+
+통합 launcher가 만든 작업을 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_fast_rmm_sweep_then_waymo_h100x6_hsb1_static_pod.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.
