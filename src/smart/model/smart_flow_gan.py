@@ -517,30 +517,32 @@ class SMARTFlowGAN(SMARTFlow):
             d_adv = relativistic_discriminator_loss(real_logit, fake_logit)
             real_logit_for_margin = real_logit.detach()
             fake_logit_for_margin = fake_logit.detach()
-            d_total = d_adv
             d_loss = d_adv.detach()
+            with self._gan_backward_sync_context(step_accumulated):
+                self._manual_backward_without_autocast(d_adv / accumulate)
+            del real_logit, fake_logit, d_adv
 
             if self.gan_r1_weight > 0.0:
                 r1 = self._compute_gan_finite_difference_regularizer(
                     real_pose_for_d,
                     context,
-                    base_logit=real_logit,
                 )
                 r1_log = r1.detach()
-                d_total = d_total + self.gan_r1_weight * r1
                 d_loss = d_loss + self.gan_r1_weight * r1_log
+                with self._gan_backward_sync_context(step_accumulated):
+                    self._manual_backward_without_autocast((self.gan_r1_weight * r1) / accumulate)
+                del r1
             if self.gan_r2_weight > 0.0:
                 r2 = self._compute_gan_finite_difference_regularizer(
                     fake_pose_for_d_detached,
                     context,
-                    base_logit=fake_logit,
                 )
                 r2_log = r2.detach()
-                d_total = d_total + self.gan_r2_weight * r2
                 d_loss = d_loss + self.gan_r2_weight * r2_log
-            with self._gan_backward_sync_context(step_accumulated):
-                self._manual_backward_without_autocast(d_total / accumulate)
-            del real_logit, fake_logit, d_adv, d_total, real_pose_for_d, fake_pose_for_d_detached
+                with self._gan_backward_sync_context(step_accumulated):
+                    self._manual_backward_without_autocast((self.gan_r2_weight * r2) / accumulate)
+                del r2
+            del real_pose_for_d, fake_pose_for_d_detached
 
             if step_accumulated:
                 self._clip_and_step_with_optional_scaler(

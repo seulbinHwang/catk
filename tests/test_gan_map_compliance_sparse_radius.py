@@ -274,6 +274,7 @@ def test_gan_discriminator_reused_base_logit_matches_recomputed_regularizer_grad
     )
     recompute_model = copy.deepcopy(discriminator)
     reuse_model = copy.deepcopy(discriminator)
+    sequential_model = copy.deepcopy(discriminator)
 
     real_pose = torch.randn(bsz, n_rollout, n_step, n_agent, 4)
     fake_pose = torch.randn(bsz, n_rollout, n_step, n_agent, 4)
@@ -351,6 +352,26 @@ def test_gan_discriminator_reused_base_logit_matches_recomputed_regularizer_grad
     )
     reuse_loss.backward()
 
+    sequential_real = forward(sequential_model, real_pose.detach())
+    sequential_fake = forward(sequential_model, fake_pose.detach())
+    sequential_adv = relativistic_discriminator_loss(sequential_real, sequential_fake)
+    sequential_adv.backward()
+    del sequential_real, sequential_fake, sequential_adv
+    sequential_r1 = finite_difference(
+        sequential_model,
+        real_pose,
+        base_logit=None,
+        seed=101,
+    )
+    (0.1 * sequential_r1).backward()
+    sequential_r2 = finite_difference(
+        sequential_model,
+        fake_pose,
+        base_logit=None,
+        seed=202,
+    )
+    (0.1 * sequential_r2).backward()
+
     for recompute_param, reuse_param in zip(
         recompute_model.parameters(),
         reuse_model.parameters(),
@@ -360,3 +381,13 @@ def test_gan_discriminator_reused_base_logit_matches_recomputed_regularizer_grad
             continue
         assert reuse_param.grad is not None
         assert torch.allclose(recompute_param.grad, reuse_param.grad, atol=1.0e-5, rtol=1.0e-4)
+
+    for recompute_param, sequential_param in zip(
+        recompute_model.parameters(),
+        sequential_model.parameters(),
+    ):
+        if recompute_param.grad is None:
+            assert sequential_param.grad is None
+            continue
+        assert sequential_param.grad is not None
+        assert torch.allclose(recompute_param.grad, sequential_param.grad, atol=1.0e-5, rtol=1.0e-4)
