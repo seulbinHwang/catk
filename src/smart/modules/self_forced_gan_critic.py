@@ -436,13 +436,14 @@ class SceneConditionFusion(nn.Module):
 
 
 class MapComplianceEncoder(nn.Module):
-    """4개 endpoint에서 30m radius map token만 sparse cross-attention합니다."""
+    """각 endpoint가 30m radius 안의 map token을 sparse cross-attention합니다."""
 
     def __init__(
         self,
         hidden_dim: int,
         *,
         radius_m: float = 30.0,
+        max_map_neighbors: int = 300,
         num_heads: int = 4,
         query_chunk_size: int = 16,
         sender_chunk_size: int = 0,
@@ -450,6 +451,7 @@ class MapComplianceEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
+        self.max_map_neighbors = int(max_map_neighbors)
         self.query_chunk_size = max(1, int(query_chunk_size))
         self.rollout_chunk_size = max(0, int(rollout_chunk_size))
         self.attention = SparseRadiusAttentionLayer(
@@ -508,12 +510,12 @@ class MapComplianceEncoder(nn.Module):
         sorted_query_index = valid_query_index[query_sort]
         sorted_map_index = valid_map_index[map_sort]
         edge_index_sorted = radius(
-            x=endpoint_xy[sorted_query_index],
-            y=map_xy[sorted_map_index],
+            x=map_xy[sorted_map_index],
+            y=endpoint_xy[sorted_query_index],
             r=self.radius_m,
-            batch_x=query_batch[sorted_query_index],
-            batch_y=map_batch[sorted_map_index],
-            max_num_neighbors=300,
+            batch_x=map_batch[sorted_map_index],
+            batch_y=query_batch[sorted_query_index],
+            max_num_neighbors=self.max_map_neighbors,
         )
         if edge_index_sorted.numel() == 0:
             empty_edge = torch.empty(2, 0, device=device, dtype=torch.long)
@@ -522,8 +524,8 @@ class MapComplianceEncoder(nn.Module):
 
         edge_index = torch.stack(
             [
-                sorted_map_index[edge_index_sorted[0]],
-                sorted_query_index[edge_index_sorted[1]],
+                sorted_map_index[edge_index_sorted[1]],
+                sorted_query_index[edge_index_sorted[0]],
             ],
             dim=0,
         )

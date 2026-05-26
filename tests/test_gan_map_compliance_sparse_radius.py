@@ -93,6 +93,46 @@ def test_map_compliance_builds_only_same_scene_radius_edges() -> None:
     assert torch.all(relation[:, 0] <= 1.0 + 1.0e-6)
 
 
+def test_map_compliance_caps_map_tokens_per_endpoint_not_endpoints_per_map() -> None:
+    encoder = MapComplianceEncoder(hidden_dim=8, radius_m=2.0, num_heads=2)
+
+    endpoint_pose = torch.zeros(1, 1, 1, 301, 4)
+    endpoint_pose[..., 2] = 1.0
+    map_position = torch.zeros(1, 1, 2)
+    map_orientation = torch.zeros(1, 1)
+    valid_mask = torch.ones(1, 301, dtype=torch.bool)
+    map_valid_mask = torch.ones(1, 1, dtype=torch.bool)
+
+    edge_index, _ = encoder._build_sparse_map_edges(
+        endpoint_pose=endpoint_pose,
+        map_position=map_position,
+        map_orientation=map_orientation,
+        map_valid_mask=map_valid_mask,
+        valid_mask=valid_mask,
+    )
+
+    assert edge_index.shape[1] == 301
+    assert torch.equal(edge_index[1].sort().values, torch.arange(301))
+
+    endpoint_pose = torch.zeros(1, 1, 1, 1, 4)
+    endpoint_pose[..., 2] = 1.0
+    map_position = torch.zeros(1, 305, 2)
+    map_orientation = torch.zeros(1, 305)
+    valid_mask = torch.ones(1, 1, dtype=torch.bool)
+    map_valid_mask = torch.ones(1, 305, dtype=torch.bool)
+
+    edge_index, _ = encoder._build_sparse_map_edges(
+        endpoint_pose=endpoint_pose,
+        map_position=map_position,
+        map_orientation=map_orientation,
+        map_valid_mask=map_valid_mask,
+        valid_mask=valid_mask,
+    )
+
+    assert edge_index.shape[1] == 300
+    assert torch.equal(edge_index[1], torch.zeros(300, dtype=torch.long))
+
+
 def test_interaction_builds_only_same_endpoint_radius_edges() -> None:
     encoder = InteractionEncoder(hidden_dim=8, radius_m=2.0, num_heads=2)
     bsz, n_rollout, n_endpoint, n_agent = 2, 2, 2, 4
