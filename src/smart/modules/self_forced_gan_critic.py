@@ -443,7 +443,7 @@ class MapComplianceEncoder(nn.Module):
         hidden_dim: int,
         *,
         radius_m: float = 30.0,
-        max_map_neighbors: int = 300,
+        max_map_neighbors: int = 100,
         num_heads: int = 4,
     ) -> None:
         super().__init__()
@@ -576,10 +576,12 @@ class InteractionEncoder(nn.Module):
         hidden_dim: int,
         *,
         radius_m: float = 60.0,
+        max_agent_neighbors: int = 100,
         num_heads: int = 4,
     ) -> None:
         super().__init__()
         self.radius_m = float(radius_m)
+        self.max_agent_neighbors = int(max_agent_neighbors)
         self.attention = SparseRadiusAttentionLayer(
             hidden_dim,
             num_heads=num_heads,
@@ -627,7 +629,7 @@ class InteractionEncoder(nn.Module):
             r=self.radius_m,
             batch=graph_index[sorted_node_index],
             loop=False,
-            max_num_neighbors=300,
+            max_num_neighbors=self.max_agent_neighbors,
         )
         if edge_index_sorted.numel() == 0:
             empty_edge = torch.empty(2, 0, device=device, dtype=torch.long)

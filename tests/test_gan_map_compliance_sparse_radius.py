@@ -133,8 +133,8 @@ def test_map_compliance_caps_map_tokens_per_endpoint_not_endpoints_per_map() -> 
         valid_mask=valid_mask,
     )
 
-    assert edge_index.shape[1] == 300
-    assert torch.equal(edge_index[1], torch.zeros(300, dtype=torch.long))
+    assert edge_index.shape[1] == 100
+    assert torch.equal(edge_index[1], torch.zeros(100, dtype=torch.long))
 
 
 def test_interaction_builds_only_same_endpoint_radius_edges() -> None:
