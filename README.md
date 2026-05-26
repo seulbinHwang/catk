@@ -684,6 +684,61 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretra
 python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --stop
 ```
 
+#### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch-last artifact Fast-RMM sweep
+
+학습이 끝난 뒤 마지막 여러 epoch 중 RMM이 가장 높은 checkpoint를 고를 때는 아래 launcher를 씁니다. 이 launcher는 W&B `epoch-last-<run_id>` artifact version들을 내려받고, 각 checkpoint에 대해 closed-loop Fast-RMM validation만 실행합니다. pod를 새로 만들거나 재시작하지 않고, 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 안에 tmux session만 만듭니다.
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_h100x4_h100x2_static_pods.py --replace
+```
+
+기본값은 `x5f9g0ce` pretrain의 마지막 8개 epoch sweep에 맞춰져 있습니다.
+
+| 항목 | 기본값 |
+|---|---|
+| pods | `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 |
+| experiment | `pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip` |
+| artifact prefix | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce` |
+| epoch versions | `56:v52,57:v53,58:v54,59:v55,60:v56,61:v57,62:v58,63:v60` |
+| validation mode | `val_closed_loop=true`, `val_open_loop=false` |
+| rollout count | `n_rollout_closed_val=32` |
+| RMM scene target | `scorer_scene_num=1680` |
+| val batch / batches | per-rank `val_batch_size=48`, `limit_val_batches=auto -> 6` |
+| W&B group | `fast_rmm_epoch_sweep_x5f9g0ce_rmm_only_bs48` |
+| tmux session | `fast-rmm-epoch-sweep-h100x4-h100x2` |
+
+`val_batch_size=48`은 6 rank 기준 `48 * 6 * 6 = 1728` scene을 평가합니다. 실제 probe에서 `bs96`은 PyTorch 내부 `nonzero` tensor 크기 한계로 실패했고, `bs70`은 GPU 메모리 peak가 약 `80.6GB / 81.6GB`까지 올라가 안정권으로 보지 않습니다. 그래서 기본값은 RMM scene 수를 유지하면서 OOM 여유가 있는 `bs48`입니다. 이 설정은 open-loop validation을 생략하므로 checkpoint ranking용 RMM sweep에 맞춘 경로입니다.
+
+다른 run에 재사용할 때는 artifact prefix와 epoch-version mapping만 바꿉니다.
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_h100x4_h100x2_static_pods.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --epoch-versions 56:v52,57:v53,58:v54,59:v55,60:v56,61:v57,62:v58,63:v60 \
+  --sweep-name fast_rmm_epoch_sweep_<run_id> \
+  --wandb-group fast_rmm_epoch_sweep_<run_id>_rmm_only_bs48 \
+  --replace
+```
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_h100x4_h100x2_static_pods.py --dry-run --replace
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t fast-rmm-epoch-sweep-h100x4-h100x2
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t fast-rmm-epoch-sweep-h100x4-h100x2
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_fast_rmm_epoch_sweep_h100x4_h100x2_static_pods.py --stop
+```
+
 #### hsb-npc-training-2/wo-pvc-1 H100x4+H100x2 prefix-valid default no-slip ratio pretrain
 
 `hsb-npc-training-2`의 H100 4장과 `wo-pvc-1`의 H100 2장을 묶어 같은 `semi_control_stable` control-space pretrain을 돌릴 때는 아래 전용 wrapper를 씁니다. 이 wrapper도 기존 running pod 안의 tmux session과 학습 프로세스만 만들거나 교체하며, pod를 새로 만들거나 재시작하지 않습니다.
