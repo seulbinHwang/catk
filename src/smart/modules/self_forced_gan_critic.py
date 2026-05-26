@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch_cluster import radius
+from torch_cluster import radius, radius_graph
 from torch_geometric.utils import softmax
 
 
@@ -572,7 +572,7 @@ class MapComplianceEncoder(nn.Module):
 
 
 class InteractionEncoder(nn.Module):
-    """4개 endpoint에서 agent-agent radius attention을 수행합니다."""
+    """4개 endpoint에서 60m radius agent-agent만 sparse attention합니다."""
 
     def __init__(
         self,
@@ -586,13 +586,69 @@ class InteractionEncoder(nn.Module):
         super().__init__()
         self.radius_m = float(radius_m)
         self.query_chunk_size = max(1, int(query_chunk_size))
-        self.attention = RadiusAttentionLayer(
+        self.attention = SparseRadiusAttentionLayer(
             hidden_dim,
             num_heads=num_heads,
             relation_dim=3,
-            sender_chunk_size=sender_chunk_size,
         )
         self.endpoint_pool = EndpointPool(hidden_dim)
+
+    def _build_sparse_interaction_edges(
+        self,
+        *,
+        endpoint_pose: Tensor,
+        valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """SMARTAgentEncoder.build_interaction_edge와 같은 radius graph를 만듭니다."""
+        bsz, n_rollout, n_endpoint, n_agent, _ = endpoint_pose.shape
+        device = endpoint_pose.device
+
+        endpoint_xy = endpoint_pose[..., :2].reshape(-1, 2)
+        endpoint_yaw = _yaw_from_pose(endpoint_pose).reshape(-1)
+        graph_index = (
+            torch.arange(bsz * n_rollout * n_endpoint, device=device, dtype=torch.long)
+            .view(bsz, n_rollout, n_endpoint, 1)
+            .expand(bsz, n_rollout, n_endpoint, n_agent)
+            .reshape(-1)
+        )
+        endpoint_valid = (
+            valid_mask[:, None, None, :]
+            .expand(bsz, n_rollout, n_endpoint, n_agent)
+            .reshape(-1)
+            .bool()
+        )
+        valid_node_index = endpoint_valid.nonzero(as_tuple=False).flatten()
+        if valid_node_index.numel() == 0:
+            empty_edge = torch.empty(2, 0, device=device, dtype=torch.long)
+            empty_relation = endpoint_pose.new_zeros((0, 3))
+            return empty_edge, empty_relation
+
+        # radius_graph도 batch index 정렬을 전제합니다. 현재 flatten 순서는 이미
+        # graph별로 정렬되지만, SMARTAgentEncoder의 radius 처리처럼 명시적으로
+        # 안정 정렬해 batch ordering 의존성을 제거합니다.
+        sort_order = torch.argsort(graph_index[valid_node_index], stable=True)
+        sorted_node_index = valid_node_index[sort_order]
+        edge_index_sorted = radius_graph(
+            x=endpoint_xy[sorted_node_index],
+            r=self.radius_m,
+            batch=graph_index[sorted_node_index],
+            loop=False,
+            max_num_neighbors=300,
+        )
+        if edge_index_sorted.numel() == 0:
+            empty_edge = torch.empty(2, 0, device=device, dtype=torch.long)
+            empty_relation = endpoint_pose.new_zeros((0, 3))
+            return empty_edge, empty_relation
+
+        edge_index = sorted_node_index[edge_index_sorted]
+        delta_xy = endpoint_xy[edge_index[0]] - endpoint_xy[edge_index[1]]
+        relation, _ = _build_relation_features(
+            delta_xy=delta_xy,
+            receiver_yaw=endpoint_yaw[edge_index[1]],
+            sender_yaw=endpoint_yaw[edge_index[0]],
+            radius_m=self.radius_m,
+        )
+        return edge_index, relation
 
     def forward(
         self,
@@ -602,40 +658,19 @@ class InteractionEncoder(nn.Module):
         valid_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """interaction-aware endpoint token과 pooled agent token을 반환합니다."""
-        bsz, n_rollout, n_endpoint, n_agent, _ = endpoint_token.shape
-        endpoint_xy = endpoint_pose[..., :2]
-        sender_xy = endpoint_xy.unsqueeze(3)
-        yaw = _yaw_from_pose(endpoint_pose)
-        sender_yaw = yaw.unsqueeze(3)
-        not_self = ~torch.eye(n_agent, device=endpoint_token.device, dtype=torch.bool)
-        output_chunks: list[Tensor] = []
-        for start in range(0, n_agent, self.query_chunk_size):
-            end = min(start + self.query_chunk_size, n_agent)
-            receiver_xy = endpoint_xy[..., start:end, :].unsqueeze(4)
-            delta_xy = sender_xy - receiver_xy
-            receiver_yaw = yaw[..., start:end].unsqueeze(4)
-            relation, distance = _build_relation_features(
-                delta_xy=delta_xy,
-                receiver_yaw=receiver_yaw,
-                sender_yaw=sender_yaw,
-                radius_m=self.radius_m,
-            )
-            attention_mask = (
-                valid_mask[:, None, None, start:end, None]
-                & valid_mask[:, None, None, None, :]
-                & not_self[start:end, :].view(1, 1, 1, end - start, n_agent)
-                & (distance <= self.radius_m)
-            )
-            output_chunks.append(
-                self.attention(
-                    query_token=endpoint_token[..., start:end, :],
-                    key_token=endpoint_token,
-                    value_token=endpoint_token,
-                    relation=relation,
-                    attention_mask=attention_mask,
-                )
-            )
-        interaction_endpoint = torch.cat(output_chunks, dim=3)
+        bsz, n_rollout, n_endpoint, n_agent, hidden_dim = endpoint_token.shape
+        edge_index, relation = self._build_sparse_interaction_edges(
+            endpoint_pose=endpoint_pose,
+            valid_mask=valid_mask,
+        )
+        flat_token = endpoint_token.reshape(-1, hidden_dim)
+        interaction_endpoint = self.attention(
+            query_token=flat_token,
+            key_token=flat_token,
+            value_token=flat_token,
+            relation=relation,
+            edge_index=edge_index,
+        ).reshape(bsz, n_rollout, n_endpoint, n_agent, hidden_dim)
         interaction_agent_token = self.endpoint_pool(interaction_endpoint)
         return interaction_endpoint, interaction_agent_token
 
