@@ -8,8 +8,8 @@
 #
 # This keeps the intended K=16 teacher/student rollout-set discriminator path,
 # but swaps H100-only bf16 for V100-safe fp16 mixed precision and reduces the
-# per-rank scene microbatch to four while preserving the global effective
-# scene batch through manual GAN accumulation.
+# per-rank scene microbatch to twelve while preserving the global effective
+# scene batch without extra manual GAN accumulation.
 
 defaults:
   - self_forced_gan_h100_6
@@ -18,9 +18,11 @@ defaults:
 model:
   model_config:
     n_rollout_closed_val: 8
+    self_forced:
+      detach_block_transition: true
     self_forced_gan:
       effective_scene_batch: 96
-      manual_accumulate_grad_batches: 3
+      manual_accumulate_grad_batches: 1
       checkpoint_discriminator: false
       resample_fake_for_generator: true
       sampling:
@@ -44,7 +46,7 @@ callbacks:
     mode: min
 
 data:
-  train_batch_size: 4
+  train_batch_size: 12
   val_batch_size: 2
   test_batch_size: 2
   num_workers: 2

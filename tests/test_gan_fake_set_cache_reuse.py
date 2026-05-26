@@ -12,6 +12,7 @@ class _CountingRolloutEncoder(torch.nn.Module):
         self.encode_calls = 0
         self.prepare_calls = 0
         self.rollout_calls = 0
+        self.detach_block_transition_flags = []
 
     def encode_map(self, tokenized_map):
         self.encode_calls += 1
@@ -35,6 +36,7 @@ class _CountingRolloutEncoder(torch.nn.Module):
         scenario_sampling_seeds=None,
     ):
         self.rollout_calls += 1
+        self.detach_block_transition_flags.append(bool(detach_block_transition))
         self.last_scenario_sampling_seeds = scenario_sampling_seeds
         n_agent = int(tokenized_agent["n_agent"])
         n_step = int(tokenized_agent["n_step"])
@@ -169,6 +171,28 @@ def test_gan_fake_set_requires_prepared_scene_inputs_together() -> None:
         assert "map_feature and rollout_cache" in str(exc)
     else:
         raise AssertionError("Expected ValueError when only one prepared scene input is provided.")
+
+
+def test_gan_fake_set_forwards_detach_block_transition() -> None:
+    fake = _FakeGAN(k=3, n_step=3)
+    fake.self_forced_detach_block_transition = True
+    context = {
+        "agent_batch": torch.tensor([0, 0]),
+        "batch_size": 1,
+        "scenario_ids": ("scene-a",),
+        "n_max_agent": 2,
+    }
+
+    SMARTFlowGAN._sample_gan_fake_set(
+        fake,
+        tokenized_map={},
+        tokenized_agent={"n_agent": 2, "n_step": 3, "batch": torch.tensor([0, 0])},
+        context=context,
+        map_feature={"scale": fake.encoder.scale},
+        rollout_cache={"scale": fake.encoder.scale},
+    )
+
+    assert fake.encoder.detach_block_transition_flags == [True, True, True]
 
 
 def test_gan_rollout_seed_is_scene_and_rollout_based() -> None:

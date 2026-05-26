@@ -117,8 +117,13 @@ class SMARTFlowGAN(SMARTFlow):
             "sampling",
             self.validation_rollout_sampling,
         )
+        gan_detach_default = _cfg(
+            getattr(model_config, "self_forced", None),
+            "detach_block_transition",
+            False,
+        )
         self.self_forced_detach_block_transition = bool(
-            _cfg(self.self_forced_gan_config, "detach_block_transition", False)
+            _cfg(self.self_forced_gan_config, "detach_block_transition", gan_detach_default)
         )
         self.self_forced_use_stop_motion = False
 
