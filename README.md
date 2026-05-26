@@ -877,6 +877,56 @@ python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_r
 python scripts/launch_pre_bc_flow_control_h100x6_hsb2_wo1_execctx_balanced_oom_retry_static_pods.py --stop
 ```
 
+#### hsb-npc-training-1 H100x6 single-node execution-context balanced pretrain
+
+`hsb-npc-training-1`처럼 한 pod 안에 H100 6장이 보이는 경우에는 아래 single-node launcher를 쓴다. 이 launcher는 기존 running pod 안에 tmux session만 만들며, pod를 새로 만들거나 삭제하지 않는다. **이미 `hsb-npc-training-1`에서 다른 학습이 돌고 있으면 실행하지 않는다.**
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb1_execctx_balanced_static_pod.py \
+  --prebuild-metadata \
+  --replace
+```
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb1_execctx_balanced_static_pod.py \
+  --prebuild-metadata \
+  --dry-run
+```
+
+이 구성은 `hsb-npc-training-2 4GPU + wo-pvc-1 2GPU`와 같은 6 GPU pretrain recipe를 단일 노드 6 GPU DDP로 실행한다. 따라서 heterogeneous rank offset이나 보수적 NCCL `Ring/Simple` 우회 설정은 쓰지 않고, 한 pod 안에서 `torchrun --nproc_per_node=6` 경로를 사용한다. 다만 같은 Flow training graph 안정성을 위해 `trainer.strategy.find_unused_parameters=true`는 유지한다.
+
+| 항목 | 값 |
+|---|---|
+| 대상 브랜치 | `semi_control_rolling` |
+| 대상 pod | `hsb-npc-training-1` |
+| GPU 구성 | H100 6장, single node |
+| launcher | `scripts/launch_pre_bc_flow_control_h100x6_hsb1_execctx_balanced_static_pod.py` |
+| experiment config | `configs/experiment/pre_bc_flow_control_h100x4x2_execctx_balanced.yaml` |
+| task name | `flow_control_space_pretrain_h100x6_hsb1_execctx_prefix_balanced_lr6e-4_bs18` |
+| tmux session | `catk-control-pretrain-h100x6-hsb1-execctx-balanced` |
+| per-GPU batch | 기본 `18` |
+| effective global batch | `18 x 6 = 108` |
+| learning rate | `6e-4` |
+| cache root | 기본 `/workspace/womd_v1_3/SMART_cache` |
+| memory-balanced sampler | 사용, metadata missing build는 금지 |
+| DDP 안정화 | `find_unused_parameters=true` |
+| validation 주기 | 기본 `check_val_every_n_epoch=16` |
+| fit-time closed-loop rollout 수 | 기본 `n_rollout_closed_val=32` |
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb1-execctx-balanced
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb1_execctx_balanced_static_pod.py --stop
+```
+
 #### testa/testaa A100x4x2 prefix-valid control-space pretrain
 
 `testa`, `testaa` 두 A100x4 pod를 묶어 control-space Flow Matching pretrain을 돌릴 때는 아래 launcher를 씁니다. H100x4x2 control-space recipe와 같은 global batch `208`, lr `6e-4`를 쓰되, `use_prefix_valid_future_loss_mask=true`를 켭니다.

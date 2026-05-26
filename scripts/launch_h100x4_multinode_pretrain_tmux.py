@@ -756,8 +756,8 @@ def parse_args() -> argparse.Namespace:
     except ValueError as exc:
         parser.error(str(exc))
 
-    if len(args.pods) < 2 and not args.stop:
-        parser.error("--pods must contain at least two pods for multi-node training")
+    if len(args.pods) < 1 and not args.stop:
+        parser.error("--pods must contain at least one pod")
     if args.manual_rank_offsets and args.action != "fit" and not args.stop:
         parser.error("--manual-rank-offsets is only wired for action=fit")
     if args.monitor_interval < 1:
