@@ -30,9 +30,16 @@ from __future__ import annotations
 import contextlib
 import os
 import pickle
+import sys
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Callable
+
+# project root (parent of scripts/) 를 import path 에 추가 — src.* 모듈 접근용.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import hydra
 import lightning as L
@@ -179,12 +186,49 @@ def main(cfg: DictConfig) -> None:
 
     model._trainer = _FakeTrainer()  # bypass Lightning trainer
 
+    # ── optional torch.compile for flow_decoder family ──────────────────
+    # PROFILE_COMPILE=1 → flow_decoder / fake_score / ref_score 의 forward 를
+    # torch.compile 로 감싸 kernel fusion + dispatch overhead 제거 효과 측정.
+    # dynamic=True 로 anchor 마다 다른 n_active shape 에 대한 recompile 폭주 방지.
+    # NOTE: 첫 호출 시 graph capture 가 무거우므로 PROFILE_WARMUP_STEPS≥2 권장.
+    if os.environ.get("PROFILE_COMPILE", "0") == "1":
+        _compile_mode = os.environ.get("PROFILE_COMPILE_MODE", "default")
+        print(f"[profile] torch.compile applied (mode={_compile_mode}, dynamic=True)")
+        agent_enc = model.encoder.agent_encoder
+        agent_enc.flow_decoder = torch.compile(
+            agent_enc.flow_decoder, dynamic=True, mode=_compile_mode,
+        )
+        if model.fake_score_decoder is not None:
+            model.fake_score_decoder = torch.compile(
+                model.fake_score_decoder, dynamic=True, mode=_compile_mode,
+            )
+        if model.ref_flow_decoder is not None:
+            model.ref_flow_decoder = torch.compile(
+                model.ref_flow_decoder, dynamic=True, mode=_compile_mode,
+            )
+
     # ── monkey-patch manual_backward (DMD step is manual-mode) ──────────
     def _noop_backward(loss):  # we keep grad accum but profile its time
         with timings.section("backward_total"):
             loss.backward()
 
     model.manual_backward = _noop_backward  # type: ignore[assignment]
+
+    # ── autocast precision (Lightning trainer 미사용이라 직접 wrap) ──────
+    # PROFILE_PRECISION:
+    #   "32-true"     (default)            : fp32, no autocast
+    #   "bf16-mixed"                       : torch.autocast(cuda, bfloat16)
+    #   "16-mixed"                         : torch.autocast(cuda, float16) — GradScaler 불필요 (학습 정확도 검증 X, 측정용)
+    _profile_precision = os.environ.get("PROFILE_PRECISION", "32-true")
+    if _profile_precision == "bf16-mixed":
+        _autocast_ctx = lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        print(f"[profile] autocast: bf16-mixed")
+    elif _profile_precision == "16-mixed":
+        _autocast_ctx = lambda: torch.autocast(device_type="cuda", dtype=torch.float16)
+        print(f"[profile] autocast: 16-mixed (NOTE: no GradScaler — fp16 grad may overflow; timing-only)")
+    else:
+        _autocast_ctx = lambda: contextlib.nullcontext()
+        print(f"[profile] precision: 32-true (no autocast)")
 
     # ── token_processor (one-time, outside DMD step) ────────────────────
     timings_warmup = Timings()
@@ -213,11 +257,12 @@ def main(cfg: DictConfig) -> None:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         try:
-            diag = model._run_flow_dmd_ft_step(tokenized_map, tokenized_agent, data)
-            # final DDP dummy backward (DMD step 끝에서 reduce 용으로 묶는 grad=0 path)
-            if "loss" in diag:
-                with t.section("backward_total"):
-                    diag["loss"].backward()
+            with _autocast_ctx():
+                diag = model._run_flow_dmd_ft_step(tokenized_map, tokenized_agent, data)
+                # final DDP dummy backward (DMD step 끝에서 reduce 용으로 묶는 grad=0 path)
+                if "loss" in diag:
+                    with t.section("backward_total"):
+                        diag["loss"].backward()
         finally:
             torch.cuda.synchronize()
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -249,11 +294,16 @@ def main(cfg: DictConfig) -> None:
         elapsed = _run_one_step(timings_warmup)
         print(f"  warmup {i + 1}/{n_warmup}: {elapsed:.1f} ms")
 
+    # reset peak so the measurement window 는 warmup 이후 부터 잡힘.
+    torch.cuda.reset_peak_memory_stats()
     total_elapsed = 0.0
     for i in range(n_measure):
         elapsed = _run_one_step(timings)
         total_elapsed += elapsed
-        print(f"  measure {i + 1}/{n_measure}: {elapsed:.1f} ms")
+        peak_mb = torch.cuda.max_memory_allocated() / (1024.0 ** 2)
+        resv_mb = torch.cuda.max_memory_reserved() / (1024.0 ** 2)
+        print(f"  measure {i + 1}/{n_measure}: {elapsed:.1f} ms  "
+              f"peak_alloc={peak_mb:.0f}MB  peak_reserved={resv_mb:.0f}MB")
 
     print()
     print("=" * 70)
