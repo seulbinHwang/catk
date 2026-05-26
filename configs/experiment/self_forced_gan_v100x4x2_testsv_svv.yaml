@@ -20,7 +20,7 @@ model:
     self_forced_gan:
       effective_scene_batch: 96
       manual_accumulate_grad_batches: 12
-      checkpoint_discriminator: true
+      checkpoint_discriminator: false
       resample_fake_for_generator: true
       sampling:
         backprop_last_k: 8
