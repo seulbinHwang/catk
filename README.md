@@ -681,6 +681,73 @@ torchrun \
   waymo_submission.poll_submission_status=false
 ```
 
+#### epoch 58 SMART NTP validation 제출
+
+`testa + testaa`의 A100 8개로 epoch 58 checkpoint에서 full validation-set
+Waymo Sim Agents 제출물을 만들고 자동 업로드할 때는 아래 스크립트를 쓴다.
+
+```bash
+bash scripts/start_smart_ntp_a100x4x2_testa_waymo_val_submission_epoch058.sh
+```
+
+기본값은 아래와 같다.
+
+```text
+checkpoint:
+  /mnt/nuplan/projects/catk/checkpoints/smart_ntp_rmm_sweep_rj5nc4v1/epoch_057.ckpt
+experiment:
+  wosac_sub
+action:
+  validate
+pods:
+  testa, testaa
+rollouts:
+  n_rollout_closed_val=32
+validation:
+  trainer.limit_val_batches=1.0
+upload:
+  waymo_submission.enabled=true
+  waymo_submission.submit_validate=true
+  waymo_submission.submit_test=false
+```
+
+이 checkpoint는 1부터 세는 epoch 58, zero-based checkpoint epoch `057`에 해당한다.
+기본 `wosac_sub` 설정은 full validation submission 전용이므로 fast-RMM 집계와 video 저장은
+끄고, Waymo 제출 형식의 `sim_agents_2025_submission.tar.gz`를 만든다.
+
+자동 업로드를 위해서는 Waymo 로그인 상태가 필요하다. 가장 안전한 방법은 GUI가 있는 PC에서
+아래 명령으로 storage state를 만든 뒤,
+
+```bash
+python scripts/waymo_save_storage_state.py --browser-channel chrome
+```
+
+rank 0 pod의 project root 아래에 다음 파일로 배치하는 것이다.
+
+```text
+secrets/waymo/waymo_storage_state.json
+```
+
+다른 위치를 쓰려면 실행 시 아래처럼 지정한다.
+
+```bash
+WAYMO_STORAGE_STATE_PATH=/path/to/waymo_storage_state.json \
+bash scripts/start_smart_ntp_a100x4x2_testa_waymo_val_submission_epoch058.sh
+```
+
+서버에 storage state 파일이 없으면 실행 시작 직후 rank 0 프로세스가 JSON 붙여넣기를
+기다린다. 이 스크립트는 tmux detached session으로 실행되므로, 붙여넣기 방식으로 진행하려면
+아래 명령으로 `testa`의 session에 붙어서 프롬프트에 JSON 전체를 입력한다.
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- \
+  tmux attach -t catk-smart-ntp-waymo-val-submission-a100x4x2
+```
+
+제출 metadata는 `configs/experiment/wosac_sub.yaml`의 기본값을 사용한다. 제출명, 저자,
+소속, 설명, 계정명을 바꾸려면 `EXTRA_HYDRA_OVERRIDES`로
+`model.model_config.sim_agents_submission.*` 값을 넘긴다.
+
 핵심 옵션:
 
 - `waymo_submission.enabled=true`: 자동 업로드를 켠다.

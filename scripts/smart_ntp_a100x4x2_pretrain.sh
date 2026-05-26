@@ -223,7 +223,7 @@ main() {
     trainer=ddp
     trainer.devices="$trainer_devices"
     trainer.num_nodes="$nnodes"
-    trainer.enable_progress_bar=true
+    ++trainer.enable_progress_bar=true
     paths.cache_root="$cache_root"
     task_name="$task_name"
   )
