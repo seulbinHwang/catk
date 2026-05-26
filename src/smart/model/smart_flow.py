@@ -2764,35 +2764,51 @@ class SMARTFlow(LightningModule):
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         data: dict | None = None,
+        opt_fake=None,
+        skip_gen: bool = False,
+        fake_grad_clip: float = 0.0,
     ) -> dict:
-        """Self-Forcing DMD step (anchor-sequential CL rollout + two manual_backward).
+        """Self-Forcing DMD step — anchor-local fake-first (single rollout per anchor).
 
-        Algorithm (per anchor):
-          1. Generator CL rollout (with grad) → x_gen ∈ [n_active, T_10hz, 4]
-             (anchor-local normalized [x/20, y/20, cos, sin]).
-          2. Sample diffusion timestep τ ~ U(eps, 1), noise ε.
-             x_τ = σ_t · ε + τ · x_gen.detach()  (score 입력은 stop_grad)
-          3. DMD generator loss (real/fake 모두 stop_grad 로 score evaluation):
-             pred_x0_{real,fake} = β_path · x_t + σ_t · v_{real,fake}
-                                   (Self-Forcing DMD convention: predicted clean x_0)
-             g = (1/β) · pred_x0_fake − pred_x0_real
-             (∂L/∂x_gen = g/normalizer 가 되어 update 후 x_gen 이 real 쪽으로 이동)
-             normalizer = mean|pred_x0_real.detach()| per anchor (dmd_normalize 시).
-             target = (x_gen − g/normalizer).detach()
-             L_gen = 0.5 · MSE(x_gen, target)  → manual_backward (opt_gen 만)
-          4. Fake_score (critic) FM loss on generator's own rollout:
-             sample = flow_ode.sample(x_gen.detach())
-             v_fake = fake_score(active_hidden.detach(), sample.x_t, sample.tau)
-             L_fake = flow_matching_loss(v_fake, sample.target)  → manual_backward (opt_fake 만)
+        Per-anchor 흐름 (rollout 1회, fake 가 gen 보다 먼저 step):
+          1. CL rollout (with grad) → x_gen ∈ [n_active*G, T_10hz, 4]
+          2. Fake_score FM loss on x_gen.detach():
+               sample = flow_ode.sample(x_gen.detach())
+               v_fake = fake_score(cond_d, sample.x_t, sample.tau)
+               L_fake = FM(v_fake, sample.target) / n_anchors_total
+               manual_backward(L_fake)        ← x_gen.detach() 입력이라 generator
+                                                  graph 와 독립; gen graph 보존.
+          3. opt_fake.step() + zero_grad()    ← ★ anchor 마다 즉시 critic 갱신
+          4. Generator loss (skip_gen 이면 skip):
+               with no_grad:
+                 τ, x_t = σ·ε + τ·x_gen.detach()
+                 v_real = ref_score(cond_d, x_t, τ)      (frozen)
+                 v_fake_eval = fake_score(cond_d, x_t, τ) (이미 step 4 에서 refreshed)
+                 pred_x0_{r,f} = β_path·x_t + σ·v_{r,f}
+                 g = (1/β)·pred_x0_fake − pred_x0_real
+                 g_n = g / normalizer
+               target = (x_gen − g_n).detach()
+               L_gen = 0.5 · MSE(x_gen, target) / n_anchors_total
+               manual_backward(L_gen)
+
+        opt_gen.step() 은 함수 외부 (training_step) 에서 1회만 호출 (모든 anchor 누적 후).
 
         Hyperparams (FinetuneConfig):
           dmd_beta, dmd_n_rollouts (G), dmd_pred_max_steps, dmd_use_real_score,
           dmd_normalize, dmd_anchor_stride, dmd_strict_active_mask,
-          dmd_warmup_fake_only_steps, dmd_gen_grad_clip, dmd_fake_lr_scale.
+          dmd_gen_grad_clip, dmd_fake_lr_scale.
           (train-time HardRMM 모니터링 미지원 — validation 의 RMM 만 사용.)
           BPTT 토글 (bptt_use_adjoint, bptt_last_n_solver_steps,
-          bptt_grad_clip_traj, bptt_warm_coarse_steps, bptt_last_coarse_only)
-          은 OCSC 와 동일하게 적용.
+          bptt_grad_clip_traj, bptt_warm_coarse_steps, bptt_last_coarse_only).
+
+        Args:
+          opt_fake: critic optimizer.  Per-anchor step 함수 내부 호출.  None 이면 skip.
+          skip_gen: True 면 step 4 (generator backward) 전체 skip; fake-only warmup.
+          fake_grad_clip: opt_fake.step() 직전 clip_grad_norm_ max_norm.  0 = no clip.
+
+        Note: anchor 마다 opt_fake.step() 이 no_sync 컨텍스트 안에서 호출되므로
+              multi-GPU 환경 (NPROC>1) 에서는 critic grad 가 local-only.  현재 launcher
+              default 가 single GPU 라 무관.
         """
         # ── Hyperparams ──────────────────────────────────────────────────────
         G = max(1, int(getattr(self.finetune_config, "dmd_n_rollouts", 1)))
@@ -2859,14 +2875,8 @@ class SMARTFlow(LightningModule):
 
         agent_batch = tokenized_agent["batch"]
         device = agent_batch.device
-        # warmup 은 "N training batches" 의미.  Lightning manual optimization 에서
-        # self.global_step 은 LightningOptimizer.step() 호출 횟수의 합이라 두 optimizer
-        # 사용 시 batch 보다 빠르게 (≈ 1.2×) 증가 → "warmup=N global_steps" 가 의도보다
-        # 일찍 끝남.  _batches_that_stepped 는 실제 training batch 카운터.
-        _batch_step = int(
-            getattr(self.trainer.fit_loop.epoch_loop, "_batches_that_stepped", 0)
-        )
-        skip_gen = (_batch_step < warmup_fake_only)  # 초기엔 fake_score 만 학습
+        # skip_gen 은 외부 (training_step) 에서 결정되어 인자로 전달됨.
+        # warmup_fake_only 자체는 hyperparam 으로만 보관, gating 은 caller 책임.
 
         # ── 1. Encode map + full rollout cache (no_grad; encoder/trunk frozen) ─
         with torch.no_grad():
@@ -2922,14 +2932,15 @@ class SMARTFlow(LightningModule):
         v_real_norm_accum = 0.0
         v_fake_norm_accum = 0.0
         normalizer_mean_accum = 0.0
-        n_valid_anchors = 0
-        n_dmd_terms = 0  # generator term count (skip_gen 시 0)
+        n_valid_anchors = 0   # phase 1 (fake) anchor count
+        n_gen_anchors = 0     # phase 2 (gen) anchor count — score_diff_norm 등 분모
+        n_dmd_terms = 0       # phase 2 backward 횟수 (skip_gen / non-finite skip 시 미증가)
 
         _seq_keys = {"gt_pos", "gt_heading", "valid_mask", "gt_idx"}
 
-        # ── Anchor sequential loop ───────────────────────────────────────────
-        for anchor_idx in all_anchor_indices:
-            # 3a. Build anchor tokenized_agent (slice views).
+        # ── Per-anchor setup helper (phase 1/2 공유) ─────────────────────────
+        # active_mask 가 모두 False 면 None 반환 → caller skip.
+        def _setup_anchor(anchor_idx: int):
             hist_start = max(0, anchor_idx + 1 - step_current_2hz)
             tokenized_agent_anchor: dict[str, Tensor] = {}
             for key, value in tokenized_agent.items():
@@ -2942,7 +2953,6 @@ class SMARTFlow(LightningModule):
                 else:
                     tokenized_agent_anchor[key] = value
 
-            # 3b. Build anchor rollout_cache (no_grad).
             with torch.no_grad():
                 rollout_cache_anchor = _agent_enc.prepare_inference_cache(
                     tokenized_agent=tokenized_agent_anchor,
@@ -2960,21 +2970,34 @@ class SMARTFlow(LightningModule):
                     _future_valid = _raw_valid_full[:, _future_start:_future_end].all(dim=1)
                 else:
                     _future_valid = torch.zeros(
-                        _raw_valid_full.shape[0], dtype=torch.bool, device=_raw_valid_full.device,
+                        _raw_valid_full.shape[0],
+                        dtype=torch.bool, device=_raw_valid_full.device,
                     )
                 active_mask = active_mask & _future_valid
             if not bool(active_mask.any()):
-                del rollout_cache_anchor
-                continue
-
+                return None
             current_pos_active = rollout_cache_anchor["pos_window"][:, -1][active_mask]
             current_head_active = rollout_cache_anchor["head_window"][:, -1][active_mask]
             active_hidden = rollout_cache_anchor["feat_a_now"][active_mask]
+            return (
+                tokenized_agent_anchor, rollout_cache_anchor, active_mask,
+                current_pos_active, current_head_active, active_hidden,
+            )
+
+        # ════════════════════════════════════════════════════════════════════
+        # Anchor-local fake-first loop (single rollout per anchor)
+        # ════════════════════════════════════════════════════════════════════
+        for anchor_idx in all_anchor_indices:
+            anchor_setup = _setup_anchor(anchor_idx)
+            if anchor_setup is None:
+                continue
+            (
+                tokenized_agent_anchor, rollout_cache_anchor, active_mask,
+                current_pos_active, current_head_active, active_hidden,
+            ) = anchor_setup
             n_valid_anchors += 1
 
-            # 3c. CL rollout — G parallel (OCSC paired L2 패턴 차용).
-            # G 개의 rollout 을 batch dim 으로 묶어 ODE solver 1 회 호출.
-            # output shape:  pred_traj_all [B, G, T_10hz, 2], pred_head_all [B, G, T_10hz]
+            # ── 1. CL rollout (with grad) — anchor 당 1회만. ─────────────────
             pred_traj_all, _pred_z_all, pred_head_all, _ = self._run_parallel_rollout_chunk(
                 data=data,
                 tokenized_agent=tokenized_agent_anchor,
@@ -2992,67 +3015,82 @@ class SMARTFlow(LightningModule):
                 pred_head_all.register_hook(_make_norm_clip_hook(grad_clip))
 
             _T = pred_traj_all.shape[-2]
-            # active_mask 선적용 후 G 를 batch dim 으로 flatten: [n_active*G, T, ...].
             _traj_act = pred_traj_all[active_mask]              # [n_active, G, T, 2]
             _head_act = pred_head_all[active_mask]              # [n_active, G, T]
             n_active = _traj_act.shape[0]
             _traj_flat = _traj_act.reshape(n_active * G, _T, 2)
             _head_flat = _head_act.reshape(n_active * G, _T)
-            _pos_rep = current_pos_active.repeat_interleave(G, dim=0)        # [n_active*G, 2]
-            _head_rep = current_head_active.repeat_interleave(G, dim=0)      # [n_active*G]
+            _pos_rep = current_pos_active.repeat_interleave(G, dim=0)
+            _head_rep = current_head_active.repeat_interleave(G, dim=0)
             x_gen = _cl_to_norm(
                 _traj_flat, _head_flat, _pos_rep, _head_rep,
-            ).to(dtype=torch.float32)                                        # [n_active*G, T, 4]
+            ).to(dtype=torch.float32)                            # [n_active*G, T, 4]
+            cond_d = active_hidden.detach().to(
+                dtype=torch.float32
+            ).repeat_interleave(G, dim=0)                        # [n_active*G, hidden]
 
-            # 3d. Sample diffusion timestep + noise (FlowODE 의 path 수식 그대로).
-            # τ, noise 는 n_active*G 차원에서 독립 sample (G 개의 rollout 마다 다른 τ).
-            with torch.no_grad():
-                x_gen_d = x_gen.detach()
-                tau = torch.rand(
-                    x_gen_d.shape[0], device=x_gen_d.device, dtype=x_gen_d.dtype
-                ) * (1.0 - flow_ode.eps) + flow_ode.eps                # [n_active*G]
-                noise = torch.randn_like(x_gen_d)
-                view_tau = tau.view(-1, 1, 1)
-                view_sigma = flow_ode._sigma_t(tau).view(-1, 1, 1)
-                x_t = view_sigma * noise + view_tau * x_gen_d            # [n_active*G, T, 4]
-                # cond 도 G 만큼 expand: [n_active, hidden] → [n_active*G, hidden].
-                cond_d = active_hidden.detach().to(dtype=torch.float32).repeat_interleave(G, dim=0)
+            # ── 2. Fake_score FM loss on x_gen.detach() ──────────────────────
+            # x_gen.detach() 입력이므로 generator graph 와 독립.  manual_backward
+            # 호출이 generator graph 를 release 하지 않음 → step 4 의 L_gen backward
+            # 에서 같은 x_gen 그래프 재사용 가능.
+            sample_fk = flow_ode.sample(x_gen.detach(), target_type="velocity")
+            v_fk = fake_score(cond_d, sample_fk.x_t, sample_fk.tau)
+            L_fake = flow_matching_loss(v_fk, sample_fk.target)
+            L_fake_scaled = L_fake / float(n_anchors_total)
+            if torch.isfinite(L_fake_scaled).all():
+                self.manual_backward(L_fake_scaled)
+                fake_loss_accum += float(L_fake.item())
+            else:
+                log.warning(f"[dmd] non-finite L_fake at anchor={anchor_idx}; skipping")
 
-                if use_real and ref_score is not None:
-                    v_real = ref_score(cond_d, x_t, tau).to(dtype=torch.float32)
-                else:
-                    v_real = torch.zeros_like(x_t)
-                v_fake_eval = fake_score(cond_d, x_t, tau).to(dtype=torch.float32)
+            # ── 3. ★ Critic step IMMEDIATELY (anchor-local fake-first) ──────
+            # 다음 step (gen backward) 의 v_fake_eval 이 refreshed 가 되도록 step 호출.
+            if opt_fake is not None:
+                _fake_params = [p for g in opt_fake.param_groups for p in g["params"]]
+                if fake_grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(_fake_params, max_norm=fake_grad_clip)
+                opt_fake.step()
+                opt_fake.zero_grad()
 
-                # Convert velocity → predicted clean x_0 (Self-Forcing DMD convention).
-                #   pred_x0 = β_path · x_t + σ_t · v   (FlowODE.predict_clean_from_velocity)
-                beta_path = flow_ode._beta()
-                pred_x0_real = beta_path * x_t + view_sigma * v_real
-                pred_x0_fake = beta_path * x_t + view_sigma * v_fake_eval
-
-                # DMD synthetic gradient (entropy-weighted Self-Forcing form).
-                #   g = (1/β) · pred_x0_fake − pred_x0_real
-                g_dmd = inv_beta * pred_x0_fake - pred_x0_real          # [n_active*G, T, 4]
-                if use_normalize:
-                    # Self-Forcing 원본: abs(p_real).mean(spatial).  G 마다 독립 normalizer.
-                    normalizer = pred_x0_real.abs().mean(
-                        dim=(-2, -1), keepdim=True
-                    ).clamp_min(1e-7)
-                    g_n = g_dmd / normalizer
-                    normalizer_mean_accum += float(normalizer.mean().item())
-                else:
-                    g_n = g_dmd
-                    normalizer_mean_accum += 1.0
-
-                # logging stats (no_grad ctx) — pred_x0 space 차이 (semantic 일관).
-                _score_diff = (pred_x0_real - pred_x0_fake).abs().mean().item()
-                score_diff_norm_accum += float(_score_diff)
-                v_real_norm_accum += float(pred_x0_real.abs().mean().item())
-                v_fake_norm_accum += float(pred_x0_fake.abs().mean().item())
-
-            # 3e. DMD generator loss (skip during warmup).
-            # MSE 는 n_active*G 전 elements 평균 → G 차원도 자동 평균.
+            # ── 4. Generator loss (skip_gen 이면 skip) ───────────────────────
             if not skip_gen:
+                with torch.no_grad():
+                    x_gen_d = x_gen.detach()
+                    tau = torch.rand(
+                        x_gen_d.shape[0], device=x_gen_d.device, dtype=x_gen_d.dtype
+                    ) * (1.0 - flow_ode.eps) + flow_ode.eps
+                    noise = torch.randn_like(x_gen_d)
+                    view_tau = tau.view(-1, 1, 1)
+                    view_sigma = flow_ode._sigma_t(tau).view(-1, 1, 1)
+                    x_t = view_sigma * noise + view_tau * x_gen_d
+
+                    if use_real and ref_score is not None:
+                        v_real = ref_score(cond_d, x_t, tau).to(dtype=torch.float32)
+                    else:
+                        v_real = torch.zeros_like(x_t)
+                    # Critic 은 step 3 에서 이미 갱신 → refreshed weights.
+                    v_fake_eval = fake_score(cond_d, x_t, tau).to(dtype=torch.float32)
+
+                    beta_path = flow_ode._beta()
+                    pred_x0_real = beta_path * x_t + view_sigma * v_real
+                    pred_x0_fake = beta_path * x_t + view_sigma * v_fake_eval
+
+                    g_dmd = inv_beta * pred_x0_fake - pred_x0_real
+                    if use_normalize:
+                        normalizer = pred_x0_real.abs().mean(
+                            dim=(-2, -1), keepdim=True
+                        ).clamp_min(1e-7)
+                        g_n = g_dmd / normalizer
+                        normalizer_mean_accum += float(normalizer.mean().item())
+                    else:
+                        g_n = g_dmd
+                        normalizer_mean_accum += 1.0
+
+                    _score_diff = (pred_x0_real - pred_x0_fake).abs().mean().item()
+                    score_diff_norm_accum += float(_score_diff)
+                    v_real_norm_accum += float(pred_x0_real.abs().mean().item())
+                    v_fake_norm_accum += float(pred_x0_fake.abs().mean().item())
+
                 target = (x_gen - g_n).detach()
                 L_gen = 0.5 * F.mse_loss(x_gen, target, reduction="mean")
                 L_gen_scaled = L_gen / float(n_anchors_total)
@@ -3062,52 +3100,39 @@ class SMARTFlow(LightningModule):
                     n_dmd_terms += 1
                 else:
                     log.warning(f"[dmd] non-finite L_gen at anchor={anchor_idx}; skipping")
+                n_gen_anchors += 1
 
-            # 3f. Fake_score (critic) FM loss on generator's own sample.
-            # x_gen detach + cond detach → grad 는 fake_score params 로만.
-            sample_fk = flow_ode.sample(x_gen.detach().to(dtype=torch.float32), target_type="velocity")
-            v_fk = fake_score(
-                cond_d,           # 이미 [n_active*G, hidden], detach 상태.
-                sample_fk.x_t,
-                sample_fk.tau,
-            )
-            L_fake = flow_matching_loss(v_fk, sample_fk.target)
-            L_fake_scaled = L_fake / float(n_anchors_total)
-            if torch.isfinite(L_fake_scaled).all():
-                self.manual_backward(L_fake_scaled)
-                fake_loss_accum += float(L_fake.item())
-            else:
-                log.warning(f"[dmd] non-finite L_fake at anchor={anchor_idx}; skipping")
+                del x_gen_d, x_t, v_fake_eval
+                if use_real:
+                    del v_real
 
-            # cleanup per-anchor intermediates
             del pred_traj_all, pred_head_all, _traj_act, _head_act
             del _traj_flat, _head_flat, _pos_rep, _head_rep
-            del x_gen, x_gen_d, x_t, v_fake_eval
-            if use_real:
-                del v_real
-            del rollout_cache_anchor
+            del x_gen, cond_d, rollout_cache_anchor
 
         # ── Logging dict ─────────────────────────────────────────────────────
-        # G parallel: anchor 당 누적이 한 번씩 (G 차원은 mean() 안에 흡수됨).
-        _denom = max(1, n_valid_anchors)
+        # fake_loss / n_valid_anchors = phase 1 (모든 anchor).
+        # score_diff_norm 등 / n_gen_anchors = phase 2 (skip_gen 시 0).
+        _denom_fake = max(1, n_valid_anchors)
+        _denom_gen = max(1, n_gen_anchors)
         ret: dict = {
             "train/dmd/gen_loss": torch.tensor(
                 gen_loss_accum / max(1, n_dmd_terms), dtype=torch.float32, device=device,
             ),
             "train/dmd/fake_loss": torch.tensor(
-                fake_loss_accum / _denom, dtype=torch.float32, device=device,
+                fake_loss_accum / _denom_fake, dtype=torch.float32, device=device,
             ),
             "train/dmd/score_diff_norm": torch.tensor(
-                score_diff_norm_accum / _denom, dtype=torch.float32, device=device,
+                score_diff_norm_accum / _denom_gen, dtype=torch.float32, device=device,
             ),
             "train/dmd/v_real_norm": torch.tensor(
-                v_real_norm_accum / _denom, dtype=torch.float32, device=device,
+                v_real_norm_accum / _denom_gen, dtype=torch.float32, device=device,
             ),
             "train/dmd/v_fake_norm": torch.tensor(
-                v_fake_norm_accum / _denom, dtype=torch.float32, device=device,
+                v_fake_norm_accum / _denom_gen, dtype=torch.float32, device=device,
             ),
             "train/dmd/normalizer_mean": torch.tensor(
-                normalizer_mean_accum / _denom, dtype=torch.float32, device=device,
+                normalizer_mean_accum / _denom_gen, dtype=torch.float32, device=device,
             ),
             "train/dmd/beta": torch.tensor(beta, dtype=torch.float32, device=device),
             "train/dmd/n_valid_anchors": torch.tensor(
@@ -3119,7 +3144,7 @@ class SMARTFlow(LightningModule):
             # alias for top-line dashboard
             "train/loss": torch.tensor(
                 gen_loss_accum / max(1, n_dmd_terms) if not skip_gen
-                else fake_loss_accum / _denom,
+                else fake_loss_accum / _denom_fake,
                 dtype=torch.float32, device=device,
             ),
         }
@@ -3141,7 +3166,7 @@ class SMARTFlow(LightningModule):
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
 
-        # ── DMD: two-optimizer alternating (gen + fake_score) ────────────────
+        # ── DMD: fake-first anchor-local (gen + fake_score) ──────────────────
         if self._is_dmd_ft_enabled():
             opts = self.optimizers()
             # Lightning manual mode: returns list when configure_optimizers returns multiple.
@@ -3154,6 +3179,30 @@ class SMARTFlow(LightningModule):
             opt_gen.zero_grad()
             opt_fake.zero_grad()
 
+            # ── Warmup / cadence counters (batch-based, NOT self.global_step) ─
+            # self.global_step 은 manual mode 의 opt.step() 합산 → 두 opt 사용 시
+            # batch 보다 빠르게 증가.  warmup 과 k:1 cadence 모두 "training batch"
+            # 단위가 의미라 _batches_that_stepped 를 reference 로.
+            _batch_step = int(
+                getattr(self.trainer.fit_loop.epoch_loop, "_batches_that_stepped", 0)
+            )
+            _warmup_steps = int(getattr(self.finetune_config, "dmd_warmup_fake_only_steps", 0))
+            _skip_gen_warmup = (_batch_step < _warmup_steps)
+
+            # ── k:1 cadence (Self-Forcing fake_gen_update_ratio).
+            # critic 매 batch update, generator 매 k batch (default 1 — full alternating).
+            gen_update_ratio = max(1, int(getattr(self.finetune_config, "dmd_gen_update_ratio", 1)))
+            _do_gen_step = (_batch_step % gen_update_ratio == 0)
+            # Generator 가 학습 안 되는 batch 면 함수 내부에서 phase 2 (L_gen backward) 자체 skip.
+            _skip_gen = _skip_gen_warmup or (not _do_gen_step)
+
+            # Grad clip 결정.  Generator clip 은 anchor loop 끝 (외부) 에서 적용.
+            # Fake clip 은 anchor 마다 opt_fake.step() 직전 함수 내부에서 적용.
+            _dmd_clip = float(getattr(self.finetune_config, "dmd_gen_grad_clip", 0.0) or 0.0)
+            _bptt_clip = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 0.0) or 0.0)
+            _gen_clip = _dmd_clip if _dmd_clip > 0 else _bptt_clip
+            _fake_clip = _bptt_clip
+
             _ddp_model = getattr(getattr(self, "trainer", None) and self.trainer.strategy, "model", None)
             _no_sync_ctx = (
                 _ddp_model.no_sync()
@@ -3161,7 +3210,12 @@ class SMARTFlow(LightningModule):
                 else contextlib.nullcontext()
             )
             with _no_sync_ctx:
-                diag = self._run_flow_dmd_ft_step(tokenized_map, tokenized_agent, data)
+                diag = self._run_flow_dmd_ft_step(
+                    tokenized_map, tokenized_agent, data,
+                    opt_fake=opt_fake,
+                    skip_gen=_skip_gen,
+                    fake_grad_clip=_fake_clip,
+                )
 
             # Final DDP all-reduce (grad 는 anchor loop 에서 이미 누적됨; dummy=0).
             if "loss" in diag:
@@ -3173,45 +3227,23 @@ class SMARTFlow(LightningModule):
                 if isinstance(v, (Tensor, float)):
                     self.log(k, v, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
 
-            # Optional separate gen grad clip.  Lightning 의 self.clip_gradients 는 manual mode
-            # + Trainer.gradient_clip_val 와 충돌하므로 torch.nn.utils.clip_grad_norm_ 직접 호출.
-            _dmd_clip = float(getattr(self.finetune_config, "dmd_gen_grad_clip", 0.0) or 0.0)
-            _bptt_clip = float(getattr(self.finetune_config, "bptt_grad_clip_traj", 0.0) or 0.0)
-            _gen_clip = _dmd_clip if _dmd_clip > 0 else _bptt_clip
-            if _gen_clip > 0:
+            # Generator grad clip (anchor loop 끝, opt_gen.step() 전).
+            # Lightning 의 self.clip_gradients 는 manual mode + Trainer.gradient_clip_val
+            # 와 충돌 → torch.nn.utils.clip_grad_norm_ 직접 호출.
+            if (not _skip_gen) and _gen_clip > 0:
                 _gen_params = [p for g in opt_gen.param_groups for p in g["params"]]
-                _fake_params = [p for g in opt_fake.param_groups for p in g["params"]]
                 torch.nn.utils.clip_grad_norm_(_gen_params, max_norm=_gen_clip)
-                torch.nn.utils.clip_grad_norm_(_fake_params, max_norm=_gen_clip)
 
-            # ── Warmup / cadence counters (batch-based, NOT self.global_step) ─
-            # self.global_step 은 manual mode 의 opt.step() 합산 → 두 opt 사용 시
-            # batch 보다 빠르게 증가.  warmup 과 k:1 cadence 모두 "training batch"
-            # 단위가 의미라 _batches_that_stepped 를 reference 로.
-            _batch_step = int(
-                getattr(self.trainer.fit_loop.epoch_loop, "_batches_that_stepped", 0)
-            )
-            _warmup_steps = int(getattr(self.finetune_config, "dmd_warmup_fake_only_steps", 0))
-            _skip_gen = (_batch_step < _warmup_steps)
-
-            # ── k:1 cadence (Self-Forcing dfake_gen_update_ratio).
-            # critic 매 batch update, generator 매 k batch (default 1 — full alternating).
-            gen_update_ratio = max(1, int(getattr(self.finetune_config, "dmd_gen_update_ratio", 1)))
-            _do_gen_step = (_batch_step % gen_update_ratio == 0)
-
-            # warmup 중에는 L_gen 자체가 _run_flow_dmd_ft_step 에서 backward 안 됨 →
-            # opt_gen.step() 호출은 grad=None 으로 노옵이지만, 의도 명시 차원에서 가드.
-            if (not _skip_gen) and _do_gen_step:
+            # Generator step (fake-first 순서: critic 은 함수 내부에서 anchor 마다 step 됨).
+            if not _skip_gen:
                 opt_gen.step()
-            opt_fake.step()
 
             # ── EMA on generator (instantaneous gen step 후 EMA update; validation 시 swap).
-            # warmup 중엔 generator 안 변하므로 EMA 도 자가 = 자가 (무해)이지만 명시 가드.
+            # warmup / cadence skip 시엔 generator 안 변하므로 EMA 도 자가 = 자가 (무해)이지만 명시 가드.
             _ema_start = int(getattr(self.finetune_config, "dmd_ema_start_step", 0))
             if (
                 self.gen_ema is not None
                 and (not _skip_gen)
-                and _do_gen_step
                 and _batch_step >= _ema_start
             ):
                 _ema_w = float(getattr(self.finetune_config, "dmd_ema_weight", 0.0))
