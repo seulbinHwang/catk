@@ -197,6 +197,10 @@ main() {
   if [[ -n "${LOG_DIR:-}" ]]; then
     app_args+=(paths.log_dir="$LOG_DIR")
   fi
+  if [[ -n "${CATK_RUN_ID:-}" ]]; then
+    local hydra_log_dir="${LOG_DIR:-${PWD}/logs}"
+    app_args+=(hydra.run.dir="${hydra_log_dir%/}/${task_name}/runs/${CATK_RUN_ID}")
+  fi
   if [[ -n "${TRAIN_BATCH_SIZE:-}" ]]; then
     app_args+=(data.train_batch_size="$TRAIN_BATCH_SIZE")
   fi

@@ -739,6 +739,67 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t fast-rmm-epoch-swee
 python scripts/launch_fast_rmm_epoch_sweep_h100x4_h100x2_static_pods.py --stop
 ```
 
+#### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 62 Waymo validation 제출
+
+`flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 62 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.
+
+```bash
+CKPT_PATH=/path/to/epoch_062/epoch_last.ckpt \
+TASK_NAME=flow_control_waymo_val_epoch062_h100x4_h100x2 \
+bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch062.sh
+```
+
+일반 checkpoint에 재사용할 때는 generic wrapper를 직접 호출합니다.
+
+```bash
+CKPT_PATH=/path/to/model.ckpt \
+TASK_NAME=flow_control_waymo_val_custom_h100x4_h100x2 \
+bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission.sh
+```
+
+기본 설정:
+
+| 항목 | 설정 |
+|---|---|
+| pods | `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 = 총 6 rank |
+| experiment/action | `experiment=sim_agents_sub_flow`, `action=validate` |
+| rollout count | `n_rollout_closed_val=32` |
+| val batch | per-rank `VAL_BATCH_SIZE=48`, 필요 시 `VAL_BATCH_SIZE=24` 또는 `12`로 override |
+| cache root | 두 pod 모두 `/workspace/womd_v1_3/SMART_cache` |
+| tmux session | `catk-flow-waymo-val-submission-h100x4-h100x2` |
+| shard 처리 | `CATK_SUBMISSION_STREAM_SHARDS=1`로 `wo-pvc-2` shard를 rank 0으로 streaming 후 tar.gz 생성 |
+| 자동 업로드 | `waymo_submission.enabled=true`, validation 제출만 허용, test 제출은 꺼짐 |
+
+`CKPT_PATH`는 rank 0인 `hsb-npc-training`에서 읽을 수 있는 실제 epoch 62 checkpoint 경로여야 합니다. 다른 pod에 같은 파일이 없으면 launcher가 rank 0 checkpoint를 `wo-pvc-2`의 같은 경로로 동기화한 뒤 validation을 시작합니다. W&B artifact에서 내려받은 checkpoint를 쓰는 경우에도 최종 파일 경로를 `CKPT_PATH`에 지정하면 됩니다.
+
+Waymo 자동 제출에는 로그인 상태 파일이 필요합니다. 기본 위치는 repository root 기준 아래 경로입니다.
+
+```text
+secrets/waymo/waymo_storage_state.json
+```
+
+다른 경로를 쓰려면:
+
+```bash
+WAYMO_STORAGE_STATE_PATH=/path/to/waymo_storage_state.json \
+CKPT_PATH=/path/to/epoch_062/epoch_last.ckpt \
+bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch062.sh
+```
+
+실행 전 dry-run으로 pod/환경 변수/Hydra override만 확인하려면:
+
+```bash
+CKPT_PATH=/tmp/fake_epoch062.ckpt \
+bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission_epoch062.sh --dry-run
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-flow-waymo-val-submission-h100x4-h100x2
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-flow-waymo-val-submission-h100x4-h100x2
+```
+
 #### hsb-npc-training-2/wo-pvc-1 H100x4+H100x2 prefix-valid default no-slip ratio pretrain
 
 `hsb-npc-training-2`의 H100 4장과 `wo-pvc-1`의 H100 2장을 묶어 같은 `semi_control_stable` control-space pretrain을 돌릴 때는 아래 전용 wrapper를 씁니다. 이 wrapper도 기존 running pod 안의 tmux session과 학습 프로세스만 만들거나 교체하며, pod를 새로 만들거나 재시작하지 않습니다.

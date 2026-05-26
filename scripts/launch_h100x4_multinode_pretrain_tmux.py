@@ -153,6 +153,8 @@ def render_env_file(
         export_line("LOG_DIR", args.log_dir),
         export_line("RUN_ROOT", run_root),
     ]
+    if args.run_id:
+        lines.append(export_line("CATK_RUN_ID", args.run_id))
     if manual_rank_offset is not None and manual_world_size is not None:
         lines.extend(
             [
@@ -171,6 +173,8 @@ def render_env_file(
         "MAX_EPOCHS": args.max_epochs,
         "CATK_LR": args.learning_rate,
         "CATK_HYDRA_OVERRIDES": args.extra_hydra_overrides,
+        "CATK_SUBMISSION_STREAM_SHARDS": os.environ.get("CATK_SUBMISSION_STREAM_SHARDS", ""),
+        "CATK_SUBMISSION_SHARD_STREAM_PORT": os.environ.get("CATK_SUBMISSION_SHARD_STREAM_PORT", ""),
     }
     for name, value in optional_env.items():
         if value not in (None, ""):
@@ -715,6 +719,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", default="")
     parser.add_argument("--learning-rate", default="")
     parser.add_argument("--extra-hydra-overrides", default="")
+    parser.add_argument(
+        "--run-id",
+        default=os.environ.get("CATK_RUN_ID", ""),
+        help=(
+            "Fixed Hydra run id shared by all pods. When set, the remote wrapper "
+            "passes hydra.run.dir=${LOG_DIR}/${TASK_NAME}/runs/${RUN_ID}."
+        ),
+    )
     parser.add_argument("--monitor-interval", type=int, default=30)
     parser.add_argument("--no-monitor-pane", action="store_true")
     parser.add_argument("--replace", action="store_true")
@@ -729,8 +741,6 @@ def parse_args() -> argparse.Namespace:
 
     if len(args.pods) < 2 and not args.stop:
         parser.error("--pods must contain at least two pods for multi-node training")
-    if args.manual_rank_offsets and args.action != "fit" and not args.stop:
-        parser.error("--manual-rank-offsets is only wired for action=fit")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
     if args.action in {"validate", "test"} and not args.ckpt_path and not args.stop:
@@ -761,6 +771,8 @@ def main() -> None:
     print(f"[launcher] checkpoint sync: {master_addr}:{args.checkpoint_sync_port}")
     print(f"[launcher] task_name: {args.task_name}")
     print(f"[launcher] session:   {args.session}")
+    if args.run_id:
+        print(f"[launcher] run_id:    {args.run_id}")
     print("[launcher] cache roots:")
     for pod in args.pods:
         print(f"  {pod}: {cache_root_for_pod(args, pod)}")
