@@ -145,7 +145,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             )
         self.closed_loop_rollout_mode = closed_loop_rollout_mode
         self.use_lqr = bool(use_lqr)
-        self.use_stop_motion = bool(use_stop_motion)
+        # Stop-motion gating is intentionally disabled for every experiment in
+        # this branch. Keep the constructor argument for checkpoint/config
+        # compatibility, but never let a Hydra override re-enable it.
+        self.use_stop_motion = False
         lqr_commit_cfg = LQRCommitBridgeConfig(
             dt=float(getattr(lqr_commit, "dt", 0.1)) if lqr_commit is not None else 0.1,
             history_steps=int(getattr(lqr_commit, "history_steps", 6)) if lqr_commit is not None else 6,
@@ -168,7 +171,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.commit_bridge = ContinuousCommitBridge(
             commit_steps=self.shift,
             use_lqr=self.use_lqr,
-            use_stop_motion=self.use_stop_motion,
+            use_stop_motion=False,
             config=lqr_commit_cfg,
             use_kinematic_control_flow=self.use_kinematic_control_flow,
             use_holonomic_model_only=self.use_holonomic_model_only,
@@ -1340,11 +1343,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 함께 반환합니다.
         """
         state = self._clone_rollout_cache(rollout_cache)
-        rollout_use_stop_motion = (
-            self.use_stop_motion
-            if use_stop_motion is None
-            else bool(use_stop_motion)
-        )
+        # Always keep stop-motion disabled, including self-forced rollout calls
+        # that pass an explicit use_stop_motion argument.
+        rollout_use_stop_motion = False
 
         n_agent = int(state["n_agent"])
         total_step_future_2hz = int(state["n_step_future_2hz"])

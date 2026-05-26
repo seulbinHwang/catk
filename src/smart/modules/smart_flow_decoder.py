@@ -91,7 +91,7 @@ class SMARTFlowDecoder(nn.Module):
             flow_solver_eps=flow_solver_eps,
             closed_loop_rollout_mode=closed_loop_rollout_mode,
             use_lqr=use_lqr,
-            use_stop_motion=use_stop_motion,
+            use_stop_motion=False,
             lqr_commit=lqr_commit,
             use_holonomic_model_only=use_holonomic_model_only,
             use_rolling_supervision=use_rolling_supervision,
@@ -292,7 +292,7 @@ class SMARTFlowDecoder(nn.Module):
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
-            use_stop_motion=use_stop_motion,
+            use_stop_motion=False,
         )
 
     def path_flow_velocity_for_anchor0(

@@ -74,8 +74,7 @@ model_config:
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
     detach_block_transition: false
-    # Self-forced training rollout 전용 stop-motion gate입니다. Validation /
-    # test / submission inference는 decoder.use_stop_motion을 따릅니다.
+    # Stop-motion gate는 전 경로에서 사용하지 않습니다. 값은 false로 고정합니다.
     use_stop_motion: false
     estimator_updates_per_step: 5
     estimator_warmup_epochs: 1
@@ -136,7 +135,7 @@ model_config:
     control_cyclist_yaw_scale_rad: ${model.model_config.token_processor.control_cyclist_yaw_scale_rad}
     closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
     use_lqr: false
-    use_stop_motion: true
+    use_stop_motion: false
     lqr_commit:
       dt: 0.1
       history_steps: 6
