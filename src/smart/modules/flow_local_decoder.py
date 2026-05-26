@@ -814,7 +814,7 @@ class ContinuousCommitBridge:
         self.commit_steps = int(commit_steps)
         self.pos_scale_m = float(pos_scale_m)
         self.use_lqr = bool(use_lqr)
-        self.use_stop_motion = bool(use_stop_motion)
+        self.use_stop_motion = False
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         self.use_holonomic_model_only = bool(use_holonomic_model_only)
         self.control_pos_scale_m = float(control_pos_scale_m)

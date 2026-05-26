@@ -396,10 +396,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--oom-step must be >= 1")
     if args.min_bs < 1:
         parser.error("--min-bs must be >= 1")
-    if args.self_forced_use_stop_motion not in {"true", "false"}:
-        parser.error("--self-forced-use-stop-motion must be 'true' or 'false'")
-    if args.decoder_use_stop_motion not in {"", "true", "false"}:
-        parser.error("--decoder-use-stop-motion must be empty, 'true', or 'false'")
+    if args.self_forced_use_stop_motion != "false":
+        parser.error("--self-forced-use-stop-motion is fixed to 'false' on this branch")
+    if args.decoder_use_stop_motion not in {"", "false"}:
+        parser.error("--decoder-use-stop-motion is fixed to empty or 'false' on this branch")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
     if not args.pretrain_ckpt:

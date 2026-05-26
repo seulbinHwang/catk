@@ -119,9 +119,7 @@ class SMARTFlowGAN(SMARTFlow):
         self.self_forced_detach_block_transition = bool(
             _cfg(self.self_forced_gan_config, "detach_block_transition", False)
         )
-        self.self_forced_use_stop_motion = bool(
-            _cfg(self.self_forced_gan_config, "use_stop_motion", False)
-        )
+        self.self_forced_use_stop_motion = False
 
         position_type_scale = tuple(
             float(value) for value in getattr(model_config, "wosac_distribution_type_scale")

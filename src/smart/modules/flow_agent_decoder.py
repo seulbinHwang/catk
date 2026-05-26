@@ -142,7 +142,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             )
         self.closed_loop_rollout_mode = closed_loop_rollout_mode
         self.use_lqr = bool(use_lqr)
-        self.use_stop_motion = bool(use_stop_motion)
+        self.use_stop_motion = False
         lqr_commit_cfg = LQRCommitBridgeConfig(
             dt=float(getattr(lqr_commit, "dt", 0.1)) if lqr_commit is not None else 0.1,
             history_steps=int(getattr(lqr_commit, "history_steps", 6)) if lqr_commit is not None else 6,
@@ -165,7 +165,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.commit_bridge = ContinuousCommitBridge(
             commit_steps=self.shift,
             use_lqr=self.use_lqr,
-            use_stop_motion=self.use_stop_motion,
+            use_stop_motion=False,
             config=lqr_commit_cfg,
             use_kinematic_control_flow=self.use_kinematic_control_flow,
             use_holonomic_model_only=self.use_holonomic_model_only,
@@ -1292,11 +1292,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 함께 반환합니다.
         """
         state = self._clone_rollout_cache(rollout_cache)
-        rollout_use_stop_motion = (
-            self.use_stop_motion
-            if use_stop_motion is None
-            else bool(use_stop_motion)
-        )
+        rollout_use_stop_motion = False
 
         n_agent = int(state["n_agent"])
         total_step_future_2hz = int(state["n_step_future_2hz"])
@@ -1564,7 +1560,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
                 active_agent_type = tokenized_agent["type"][active_mask]
-                active_agent_length = tokenized_agent["shape"][active_mask, 0]
+                agent_shape = (
+                    tokenized_agent["shape"]
+                    if "shape" in tokenized_agent
+                    else tokenized_agent["token_agent_shape"]
+                )
+                active_agent_length = agent_shape[active_mask, 0]
                 if return_flow_2s_preview:
                     y_hat_metric_norm = self._to_pose_metric_norm(
                         y_hat_norm,

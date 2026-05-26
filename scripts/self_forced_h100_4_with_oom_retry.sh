@@ -29,8 +29,8 @@
 #   EXPERIMENT=self_forced_npfm_h100_4
 #   CATK_LR=                     Optional Generator learning-rate override.
 #   ESTIMATOR_WARMUP_EPOCHS=     Optional self-forced warmup override.
-#   SELF_FORCED_USE_STOP_MOTION= Optional training rollout stop-motion gate.
-#   DECODER_USE_STOP_MOTION=     Optional validation/test inference gate.
+#   SELF_FORCED_USE_STOP_MOTION= Must be false when set.
+#   DECODER_USE_STOP_MOTION=     Must be false when set.
 #   LIMIT_TRAIN_BATCHES=         Optional Trainer limit_train_batches override.
 #   LIMIT_VAL_BATCHES=           Optional Trainer limit_val_batches override.
 #   MAX_EPOCHS=                  Optional Trainer max_epochs override.
@@ -95,6 +95,14 @@ if [[ -n "${CATK_LR:-}" ]]; then
 fi
 if [[ -n "${ESTIMATOR_WARMUP_EPOCHS:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}")
+fi
+if [[ "${SELF_FORCED_USE_STOP_MOTION:-false}" != "false" ]]; then
+  echo "ERROR: SELF_FORCED_USE_STOP_MOTION is fixed to false on this branch." >&2
+  exit 2
+fi
+if [[ "${DECODER_USE_STOP_MOTION:-false}" != "false" ]]; then
+  echo "ERROR: DECODER_USE_STOP_MOTION is fixed to false on this branch." >&2
+  exit 2
 fi
 if [[ -n "${SELF_FORCED_USE_STOP_MOTION:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.use_stop_motion=${SELF_FORCED_USE_STOP_MOTION}")
