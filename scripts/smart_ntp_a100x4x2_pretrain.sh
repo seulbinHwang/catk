@@ -149,6 +149,7 @@ main() {
   local experiment="${CATK_EXPERIMENT:-pre_bc_a100x4x2}"
   local action="${CATK_ACTION:-fit}"
   local task_name="${TASK_NAME:-smart_ntp_pretrain_a100x4x2}"
+  local run_id="${CATK_RUN_ID:-}"
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
   local auto_resume="${CATK_AUTO_RESUME:-false}"
   local resume_task_name="${CATK_RESUME_TASK_NAME:-}"
@@ -227,6 +228,9 @@ main() {
     paths.cache_root="$cache_root"
     task_name="$task_name"
   )
+  if [[ -n "$run_id" ]]; then
+    app_args+=("hydra.run.dir=${LOG_DIR:-${PWD}/logs}/${task_name}/runs/${run_id}")
+  fi
 
   if [[ -n "$ckpt_path" ]]; then
     app_args+=(ckpt_path="$ckpt_path")
