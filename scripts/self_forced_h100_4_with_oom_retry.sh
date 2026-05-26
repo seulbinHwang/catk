@@ -96,12 +96,8 @@ fi
 if [[ -n "${ESTIMATOR_WARMUP_EPOCHS:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}")
 fi
-if [[ -n "${SELF_FORCED_USE_STOP_MOTION:-}" ]]; then
-  EXTRA_OVERRIDES+=("model.model_config.self_forced.use_stop_motion=${SELF_FORCED_USE_STOP_MOTION}")
-fi
-if [[ -n "${DECODER_USE_STOP_MOTION:-}" ]]; then
-  EXTRA_OVERRIDES+=("model.model_config.decoder.use_stop_motion=${DECODER_USE_STOP_MOTION}")
-fi
+EXTRA_OVERRIDES+=("model.model_config.self_forced.use_stop_motion=false")
+EXTRA_OVERRIDES+=("model.model_config.decoder.use_stop_motion=false")
 if [[ -n "${UNFROZEN_RANGE:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.unfrozen_range=${UNFROZEN_RANGE}")
 fi
