@@ -249,8 +249,8 @@ fi
 """
     )
     training_guard = "" if args.allow_while_training else f"""
-if tmux ls 2>/dev/null | grep -E 'catk-control-pretrain-h100x6|control-pretrain-h100x6' >/dev/null; then
-  echo "[launcher] a pretrain tmux session is still present on {args.pod}; refusing to start submission." >&2
+if pgrep -af 'python .*src\\.run|torchrun .*src\\.run' 2>/dev/null | grep -E 'action=fit|pretrain|control_space_pretrain' >/dev/null; then
+  echo "[launcher] active pretrain process is still running on {args.pod}; refusing to start submission." >&2
   echo "[launcher] pass --allow-while-training only if you intentionally want to share GPUs." >&2
   exit 4
 fi
