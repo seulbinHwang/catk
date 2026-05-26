@@ -760,6 +760,7 @@ bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission.sh
 |---|---|
 | pods | `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 = 총 6 rank |
 | experiment/action | `experiment=sim_agents_sub_flow`, `action=validate` |
+| DDP strategy | 4+2 heterogeneous pod 구성을 위해 `HeterogeneousDDPStrategy` / `HeterogeneousTorchElasticEnvironment`를 launcher가 자동 지정 |
 | rollout count | `n_rollout_closed_val=32` |
 | val batch | per-rank `VAL_BATCH_SIZE=48`, 필요 시 `VAL_BATCH_SIZE=24` 또는 `12`로 override |
 | cache root | 두 pod 모두 `/workspace/womd_v1_3/SMART_cache` |

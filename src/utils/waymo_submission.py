@@ -214,21 +214,21 @@ def maybe_prepare_waymo_storage_state(cfg: DictConfig) -> PreparedWaymoStorageSt
             cfg.waymo_submission.storage_state_path = storage_state_path.as_posix()
         return PreparedWaymoStorageState(storage_state_path=storage_state_path)
 
+    if not is_primary_process():
+        # Only rank 0 submits to Waymo. In static multi-pod jobs the Waymo
+        # storage-state file may intentionally exist only on the primary pod,
+        # so non-primary ranks must not wait on a pod-local coordination file.
+        return None
+
     runtime_dir = _resolve_waymo_storage_state_runtime_dir(root_dir=root_dir)
     runtime_storage_state_path = runtime_dir / _WAYMO_STORAGE_STATE_RUNTIME_FILENAME
     status_path = runtime_dir / _WAYMO_STORAGE_STATE_STATUS_FILENAME
-    if is_primary_process():
-        prepared = _prepare_waymo_storage_state_on_primary(
-            configured_path=storage_state_path,
-            runtime_dir=runtime_dir,
-            runtime_storage_state_path=runtime_storage_state_path,
-            status_path=status_path,
-        )
-    else:
-        prepared = _wait_for_waymo_storage_state_from_primary(
-            configured_path=storage_state_path,
-            status_path=status_path,
-        )
+    prepared = _prepare_waymo_storage_state_on_primary(
+        configured_path=storage_state_path,
+        runtime_dir=runtime_dir,
+        runtime_storage_state_path=runtime_storage_state_path,
+        status_path=status_path,
+    )
 
     with open_dict(cfg.waymo_submission):
         cfg.waymo_submission.storage_state_path = prepared.storage_state_path.as_posix()
