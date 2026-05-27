@@ -60,6 +60,12 @@ model:
       # 매 inner step 마다 critic update + DMD/SiD direction backward (grad accumulate, 메모리는
       # 한 rollout 분량 유지).  default 1 = 기존 동작.  4 정도면 OCSC 와 정합.
       n_rollouts: 1
+      # OCSC dmd_anchor_stride 정합 (multi-anchor).  한 closed-loop rollout 안에서 stride 2Hz step
+      # 간격으로 n_anchors 개 anchor 잡고 각각 DMD/SiD step.  학습 신호 N anchors 배.
+      # rollout 길이가 자동으로 늘어남: (n_anchors-1)*stride + window/shift 2Hz step.
+      # default = 1 anchor (anchor 0 만), behavior-preserving.  OCSC 정합은 4 / 4.
+      n_anchors: 1
+      anchor_stride: 1
       # smart_flow.py는 아래 키들도 read 하지만 base smart_flow.yaml에는 정의되어 있지
       # 않습니다. struct mode에서 CLI override가 막히지 않도록 default를 여기서 명시
       # (값은 smart_flow.py 기본값과 동일 → behavior-preserving).

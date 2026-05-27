@@ -324,6 +324,20 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
+        # OCSC dmd_anchor_stride 정합 — 한 closed-loop rollout 안에서 stride 간격으로 여러
+        # anchor 잡아 각각 DMD/SiD step.  학습 신호 N anchors 배.  default = 1 anchor (anchor 0
+        # 만), behavior-preserving.  rollout 길이가 자동으로 (n_anchors-1)*stride + window/shift
+        # 만큼 늘어남.
+        self.self_forced_n_anchors = (
+            max(1, int(getattr(self.self_forced_config, "n_anchors", 1)))
+            if self.self_forced_config is not None
+            else 1
+        )
+        self.self_forced_anchor_stride = (
+            max(1, int(getattr(self.self_forced_config, "anchor_stride", 1)))
+            if self.self_forced_config is not None
+            else 1
+        )
         # critic(generated estimator) LR.  config에 estimator_lr이 양수로 명시되어 있으면
         # 그 절대값을 그대로 사용 (generator LR 과 동일하게 두고 싶을 때 유용).  값이 없거나
         # ``null`` / ``<= 0`` 이면 기존 비례 관계 ``lr / estimator_updates_per_step`` 을 그대로
@@ -2120,17 +2134,20 @@ class SMARTFlow(LightningModule):
         return tokenized_map, tokenized_agent
 
     def _get_self_forced_rollout_steps_2hz(self) -> int:
-        """flow_window_steps에 맞춘 0.5초 commit block 수를 계산합니다.
+        """0.5 초 commit block 수.
 
-        Returns:
-            int: ``flow_window_steps / 5`` 로 얻은 N초 self-rollout block 수입니다.
+        multi-anchor 학습 (n_anchors > 1) 시 마지막 anchor 의 window 끝까지 rollout 이
+        필요하므로 ``(n_anchors - 1) * anchor_stride + flow_window_steps / 5`` 로 늘어남.
+        single-anchor (default) 면 기존 동작과 동일 (``flow_window_steps / 5``).
         """
         if self.flow_window_steps % 5 != 0:
             raise ValueError(
                 "self-forced NPFM assumes flow_window_steps is divisible by 5, "
                 f"got {self.flow_window_steps}."
             )
-        return max(1, int(self.flow_window_steps // 5))
+        window_2hz = int(self.flow_window_steps // 5)
+        extra = (int(self.self_forced_n_anchors) - 1) * int(self.self_forced_anchor_stride)
+        return max(1, window_2hz + max(0, extra))
 
     def _sample_flow_state_from_clean(self, clean_path_norm: Tensor):
         """현재 Generator의 flow path 규칙으로 전체 tau 구간의 noisy path를 만듭니다.
@@ -2156,27 +2173,30 @@ class SMARTFlow(LightningModule):
         noisy_path_norm: Tensor,
         tau: Tensor,
         anchor_mask: Tensor,
+        anchor_idx: int = 0,
     ) -> Dict[str, Tensor]:
-        """주어진 decoder가 noisy N초 path를 어떻게 clean path로 보는지 계산합니다.
+        """주어진 decoder 가 noisy path 를 어떻게 clean 으로 보는지 계산합니다.
 
         Args:
-            decoder: ``F_rho`` 또는 ``F_psi`` 역할의 decoder입니다.
-            tokenized_map: 평가 모드 map token 사전입니다.
-            tokenized_agent: 평가 모드 agent token 사전입니다.
-            noisy_path_norm: noisy path입니다. shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
-            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+            decoder: ``F_rho`` (teacher) 또는 ``F_psi`` (critic) 역할의 decoder.
+            tokenized_map: 평가 모드 map token 사전.
+            tokenized_agent: 평가 모드 agent token 사전.
+            noisy_path_norm: noisy path ``[n_valid_agent, F_win, flow_state_dim]``.
+            tau: flow interpolation time ``[n_valid_agent]``.
+            anchor_mask: 사용할 anchor 의 agent mask ``[n_agent]``.
+            anchor_idx: 사용할 anchor index (>= 0, default 0).
 
         Returns:
-            Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
+            ``{"velocity": ..., "clean": ...}``.
         """
         map_feature = decoder.encode_map(tokenized_map)
-        return decoder.path_flow_velocity_for_anchor0(
+        return decoder.path_flow_velocity_for_anchor_k(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             path_noisy_norm=noisy_path_norm,
             tau=tau,
             anchor_mask=anchor_mask,
+            anchor_idx=int(anchor_idx),
         )
 
     def _build_self_forced_zero_metrics(self, reference: Tensor) -> Dict[str, Tensor]:
@@ -2234,30 +2254,31 @@ class SMARTFlow(LightningModule):
         self,
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
+        anchor_idx: int = 0,
     ) -> tuple[Tensor, Tensor]:
-        """committed rollout을 첫 anchor 기준 packed N초 flow state로 변환합니다.
+        """committed rollout 을 ``anchor_idx`` 번째 anchor 기준 packed flow state 로 변환합니다.
 
         Args:
             rollout: ``_run_self_forced_rollout`` 의 출력입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
+            anchor_idx: 사용할 flow anchor 인덱스 (>= 0).  default 0 = 기존 동작.
 
         Returns:
-            tuple[Tensor, Tensor]: packed flow state와 agent mask입니다.
-                pose-space shape은 ``[n_valid_agent, F_win, 4]`` 이고,
-                control-space shape은 ``[n_valid_agent, F_win, 3]`` 이며,
-                mask shape은 ``[n_agent]`` 입니다.
-
-        Notes:
-            random terminal N은 self-rollout을 어디에서 끊을지만 정합니다.
-            이후 generated estimator 학습과 generator update의 noising tau는
-            여기서 전달하지 않습니다.
+            tuple[Tensor, Tensor]: packed flow state 와 anchor 별 agent mask.
         """
-        anchor_mask = get_anchor0_valid_mask(tokenized_agent)
-        committed_path_norm = build_anchor0_normalized_committed_path(
+        from src.smart.modules.self_forced_path_flow import (
+            build_anchor_k_normalized_committed_path,
+            get_anchor_k_valid_mask,
+        )
+        anchor_mask = get_anchor_k_valid_mask(tokenized_agent, anchor_idx=int(anchor_idx))
+        committed_path_norm = build_anchor_k_normalized_committed_path(
             pred_traj_10hz=rollout["pred_traj_10hz"],
             pred_head_10hz=rollout["pred_head_10hz"],
             tokenized_agent=tokenized_agent,
             flow_window_steps=self.flow_window_steps,
+            anchor_idx=int(anchor_idx),
+            anchor_stride_2hz=int(self.self_forced_anchor_stride),
+            shift=int(self.encoder.agent_encoder.shift),
         )
         packed_path_norm = committed_path_norm[anchor_mask]
         if self.use_kinematic_control_flow:
@@ -2284,6 +2305,7 @@ class SMARTFlow(LightningModule):
         anchor_mask: Tensor,
         *,
         has_committed_path_global: bool | None = None,
+        anchor_idx: int = 0,
     ) -> Tensor:
         """detached self-rollout으로 generated estimator F_psi를 online 업데이트합니다.
 
@@ -2349,6 +2371,7 @@ class SMARTFlow(LightningModule):
                             noisy_path_norm=noisy_path_norm,
                             tau=tau,
                             anchor_mask=estimator_anchor_mask,
+                            anchor_idx=int(anchor_idx),
                         )
                         last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
                     else:
@@ -2377,6 +2400,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_idx: int = 0,
     ) -> Tensor:
         """clean-DMD 방향을 고정된 평가자 출력으로 계산합니다.
 
@@ -2419,6 +2443,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                anchor_idx=int(anchor_idx),
             )
             generated_pred = self._predict_path_flow_clean_estimate(
                 decoder=self.self_forced_generated_estimator,
@@ -2427,6 +2452,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                anchor_idx=int(anchor_idx),
             )
             path_delta = build_clean_dmd_direction(
                 committed_path_norm=clean_for_guidance,
@@ -2470,6 +2496,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_idx: int = 0,
     ) -> tuple[Tensor, Tensor]:
         """같은 noisy path에서 teacher와 generated estimator의 clean 예측을 구합니다.
 
@@ -2504,6 +2531,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                anchor_idx=int(anchor_idx),
             )
             generated_pred = self._predict_path_flow_clean_estimate(
                 decoder=self.self_forced_generated_estimator,
@@ -2512,6 +2540,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                anchor_idx=int(anchor_idx),
             )
 
         if hasattr(self, "_assert_self_forced_generator_update_isolated"):
@@ -2524,6 +2553,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_idx: int = 0,
     ) -> Tensor:
         """Self-forced rollout path에 SiD-lite loss를 계산합니다.
 
@@ -2544,6 +2574,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            anchor_idx=int(anchor_idx),
         )
         self._set_self_forced_backward_context(
             committed_path_norm=committed_path_norm,
@@ -2564,6 +2595,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_idx: int = 0,
     ) -> Tensor:
         """설정에 따라 DMD-style 또는 SiD-style generator loss를 계산합니다.
 
@@ -2585,6 +2617,7 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent,
                 committed_path_norm=committed_path_norm,
                 anchor_mask=anchor_mask,
+                anchor_idx=int(anchor_idx),
             )
 
         path_delta = self._compute_self_forced_direction(
@@ -2592,6 +2625,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            anchor_idx=int(anchor_idx),
         )
         target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
         self._set_self_forced_backward_context(
@@ -2778,6 +2812,8 @@ class SMARTFlow(LightningModule):
             generator_optimizer.zero_grad(set_to_none=True)
             self._prepare_self_forced_generator_backward_boundary()
 
+        n_anchors = max(1, int(self.self_forced_n_anchors))
+        denom = float(n_rollouts * n_anchors)
         try:
             for _ in range(n_rollouts):
                 if in_estimator_warmup:
@@ -2785,65 +2821,70 @@ class SMARTFlow(LightningModule):
                         rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
                 else:
                     rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
-                committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
-                    rollout=rollout,
-                    tokenized_agent=tokenized_agent_eval,
-                )
-                has_committed_local = committed_path_norm.numel() > 0
-                has_committed_global = self._sync_distributed_bool_any(
-                    has_committed_local,
-                    device=committed_path_norm.device,
-                )
-                any_committed_global = any_committed_global or has_committed_global
-                rollout_results.append((rollout, committed_path_norm, anchor_mask, has_committed_local))
 
-                # critic update — 매 rollout 마다.
-                gen_estimator_loss = self._update_generated_path_flow_estimator(
-                    tokenized_map=tokenized_map_eval,
-                    tokenized_agent=tokenized_agent_eval,
-                    committed_path_norm=committed_path_norm,
-                    anchor_mask=anchor_mask,
-                    has_committed_path_global=has_committed_global,
-                )
-                per_rollout_gen_est_losses.append(gen_estimator_loss)
+                for anchor_idx in range(n_anchors):
+                    committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
+                        rollout=rollout,
+                        tokenized_agent=tokenized_agent_eval,
+                        anchor_idx=anchor_idx,
+                    )
+                    has_committed_local = committed_path_norm.numel() > 0
+                    has_committed_global = self._sync_distributed_bool_any(
+                        has_committed_local,
+                        device=committed_path_norm.device,
+                    )
+                    any_committed_global = any_committed_global or has_committed_global
+                    rollout_results.append((rollout, committed_path_norm, anchor_mask, has_committed_local))
 
-                if in_estimator_warmup or not has_committed_global:
-                    # warmup 중이거나 valid anchor 없는 batch — generator backward skip.
-                    continue
-
-                # DMD/SiD direction backward — grad accumulate.
-                if has_committed_local:
-                    sf_loss_i = self._compute_self_forced_distribution_matching_loss(
+                    # critic update — 매 (rollout, anchor) 마다.
+                    gen_estimator_loss = self._update_generated_path_flow_estimator(
                         tokenized_map=tokenized_map_eval,
                         tokenized_agent=tokenized_agent_eval,
                         committed_path_norm=committed_path_norm,
                         anchor_mask=anchor_mask,
+                        has_committed_path_global=has_committed_global,
+                        anchor_idx=anchor_idx,
                     )
-                else:
-                    sf_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
-                anchor_loss_i = (
-                    fm_loss
-                    if fm_loss is not None
-                    else committed_path_norm.new_zeros(())
-                )
-                last_anchor_loss_val = anchor_loss_i
-                total_loss_i = (
-                    self.self_forced_weight * sf_loss_i
-                    + self.self_forced_anchor_weight * anchor_loss_i
-                ) / float(n_rollouts)
-                if not torch.isfinite(total_loss_i):
-                    context = self._format_self_forced_backward_context()
+                    per_rollout_gen_est_losses.append(gen_estimator_loss)
+
+                    if in_estimator_warmup or not has_committed_global:
+                        # warmup 중이거나 valid anchor 없는 batch — generator backward skip.
+                        continue
+
+                    # DMD/SiD direction backward — grad accumulate / (n_rollouts * n_anchors).
+                    if has_committed_local:
+                        sf_loss_i = self._compute_self_forced_distribution_matching_loss(
+                            tokenized_map=tokenized_map_eval,
+                            tokenized_agent=tokenized_agent_eval,
+                            committed_path_norm=committed_path_norm,
+                            anchor_mask=anchor_mask,
+                            anchor_idx=anchor_idx,
+                        )
+                    else:
+                        sf_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
+                    anchor_loss_i = (
+                        fm_loss
+                        if fm_loss is not None
+                        else committed_path_norm.new_zeros(())
+                    )
+                    last_anchor_loss_val = anchor_loss_i
+                    total_loss_i = (
+                        self.self_forced_weight * sf_loss_i
+                        + self.self_forced_anchor_weight * anchor_loss_i
+                    ) / denom
+                    if not torch.isfinite(total_loss_i):
+                        context = self._format_self_forced_backward_context()
+                        self._clear_self_forced_backward_context()
+                        raise RuntimeError(
+                            "Non-finite self-forced total_loss detected: "
+                            f"{self._summarize_nonfinite_tensor(total_loss_i)}"
+                            f"{context}"
+                        )
+                    self._manual_backward_without_autocast(total_loss_i)
+                    self._assert_self_forced_generator_update_isolated()
+                    per_rollout_sf_losses.append(sf_loss_i.detach())
+                    per_rollout_total_losses.append(total_loss_i.detach() * denom)
                     self._clear_self_forced_backward_context()
-                    raise RuntimeError(
-                        "Non-finite self-forced total_loss detected: "
-                        f"{self._summarize_nonfinite_tensor(total_loss_i)}"
-                        f"{context}"
-                    )
-                self._manual_backward_without_autocast(total_loss_i)
-                self._assert_self_forced_generator_update_isolated()
-                per_rollout_sf_losses.append(sf_loss_i.detach())
-                per_rollout_total_losses.append(total_loss_i.detach() * float(n_rollouts))
-                self._clear_self_forced_backward_context()
 
             # ── warmup-only batch: gen optimizer step 생략하고 warmup 종료 처리.
             if in_estimator_warmup:

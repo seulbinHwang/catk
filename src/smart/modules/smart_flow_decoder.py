@@ -303,24 +303,33 @@ class SMARTFlowDecoder(nn.Module):
         tau: Tensor,
         anchor_mask: Tensor,
     ) -> Dict[str, Tensor]:
-        """첫 flow anchor의 noisy N초 path에 대한 velocity와 clean estimate를 계산합니다.
-
-        Args:
-            tokenized_agent: 평가 모드 기준 agent token 사전입니다.
-            map_feature: 이 decoder가 직접 만든 map feature입니다.
-            path_noisy_norm: noisy path입니다. shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
-            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
-
-        Returns:
-            Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
-        """
-        return self.agent_encoder.path_flow_velocity_for_anchor0(
+        """``path_flow_velocity_for_anchor_k(..., anchor_idx=0)`` 의 alias."""
+        return self.path_flow_velocity_for_anchor_k(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             path_noisy_norm=path_noisy_norm,
             tau=tau,
             anchor_mask=anchor_mask,
+            anchor_idx=0,
+        )
+
+    def path_flow_velocity_for_anchor_k(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        path_noisy_norm: Tensor,
+        tau: Tensor,
+        anchor_mask: Tensor,
+        anchor_idx: int = 0,
+    ) -> Dict[str, Tensor]:
+        """``anchor_idx`` 번째 flow anchor 의 noisy path 에 대한 velocity / clean estimate."""
+        return self.agent_encoder.path_flow_velocity_for_anchor_k(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            path_noisy_norm=path_noisy_norm,
+            tau=tau,
+            anchor_mask=anchor_mask,
+            anchor_idx=anchor_idx,
         )
 
 

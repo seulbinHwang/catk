@@ -53,20 +53,125 @@ def get_anchor0_valid_mask(tokenized_agent: Dict[str, Tensor]) -> Tensor:
         Tensor: 첫 anchor를 self-forced 학습에 쓸지 나타내는 마스크입니다.
             shape은 ``[n_agent]`` 입니다.
     """
+    return get_anchor_k_valid_mask(tokenized_agent, anchor_idx=0)
+
+
+def get_anchor_k_valid_mask(tokenized_agent: Dict[str, Tensor], anchor_idx: int) -> Tensor:
+    """``anchor_idx`` 번째 flow anchor의 유효 agent 마스크를 돌려줍니다.
+
+    Args:
+        tokenized_agent: ``FlowTokenProcessor`` 가 만든 에이전트 사전입니다.
+            평가 모드에서는 ``flow_eval_mask`` (shape ``[n_agent, n_anchor]``) 가 들어 있어야 합니다.
+        anchor_idx: 사용할 anchor 인덱스입니다.  0 이면 ``get_anchor0_valid_mask`` 와 같습니다.
+
+    Returns:
+        Tensor: 해당 anchor 가 self-forced 학습 대상인지 나타내는 ``[n_agent]`` 마스크.
+    """
+    if not isinstance(anchor_idx, int) or anchor_idx < 0:
+        raise ValueError(f"anchor_idx must be a non-negative int, got {anchor_idx!r}.")
     if "flow_eval_mask" in tokenized_agent:
         flow_eval_mask = tokenized_agent["flow_eval_mask"]
         if flow_eval_mask.dim() != 2 or flow_eval_mask.shape[1] == 0:
             raise ValueError(
                 "flow_eval_mask must have shape [n_agent, n_anchor] with at least one anchor."
             )
-        return flow_eval_mask[:, 0].bool()
+        if anchor_idx >= flow_eval_mask.shape[1]:
+            raise ValueError(
+                "anchor_idx exceeds flow_eval_mask anchor count: "
+                f"got {anchor_idx}, max={flow_eval_mask.shape[1] - 1}."
+            )
+        return flow_eval_mask[:, anchor_idx].bool()
 
+    # Fallback (학습 외 path)
+    if anchor_idx != 0:
+        raise KeyError(
+            "tokenized_agent must contain flow_eval_mask when anchor_idx > 0."
+        )
     if "valid_mask" not in tokenized_agent:
         raise KeyError("tokenized_agent must contain either flow_eval_mask or valid_mask.")
     valid_mask = tokenized_agent["valid_mask"]
     if valid_mask.dim() != 2 or valid_mask.shape[1] == 0:
         raise ValueError("valid_mask must have shape [n_agent, n_step].")
     return valid_mask[:, -1].bool()
+
+
+def build_anchor_k_normalized_committed_path(
+    pred_traj_10hz: Tensor,
+    pred_head_10hz: Tensor,
+    tokenized_agent: Dict[str, Tensor],
+    flow_window_steps: int,
+    anchor_idx: int = 0,
+    anchor_stride_2hz: int = 1,
+    shift: int = 5,
+    pos_scale_m: float = 20.0,
+) -> Tensor:
+    """``anchor_idx`` 번째 anchor 기준의 정규화 committed path 를 만듭니다.
+
+    anchor 위치는 closed-loop rollout 의 시작 시점 기준 ``anchor_idx * anchor_stride_2hz``
+    × ``shift`` (= 0.5초 commit block) 10Hz step 입니다.  origin 은 anchor 0 일 때
+    ``ctx_sampled_pos[:, 1]`` (history 끝) 이고, ``anchor_idx > 0`` 일 때는
+    ``pred_traj_10hz[:, start_10hz - 1]`` (rollout 진행 후 commit pose) 입니다.
+
+    Args:
+        pred_traj_10hz: closed-loop 결과 ``[n_agent, T_rollout, 2]``.
+        pred_head_10hz: closed-loop 결과 heading ``[n_agent, T_rollout]``.
+        tokenized_agent: 평가 모드 토큰.  ``ctx_sampled_pos / ctx_sampled_heading`` 필요.
+        flow_window_steps: pretrain flow window 10Hz step 수.
+        anchor_idx: 사용할 anchor 인덱스 (>= 0).
+        anchor_stride_2hz: anchor 사이 간격 (2Hz step).
+        shift: 0.5초당 10Hz step 수 (= 5).
+        pos_scale_m: 위치 정규화 scale.
+
+    Returns:
+        Tensor ``[n_valid_anchor_k_agent, flow_window_steps, 4]``.
+    """
+    if anchor_idx < 0:
+        raise ValueError(f"anchor_idx must be non-negative, got {anchor_idx}.")
+    if anchor_stride_2hz < 1:
+        raise ValueError(f"anchor_stride_2hz must be >= 1, got {anchor_stride_2hz}.")
+    if pred_traj_10hz.dim() != 3 or pred_traj_10hz.shape[-1] != 2:
+        raise ValueError("pred_traj_10hz must have shape [n_agent, T, 2].")
+    if pred_head_10hz.shape[:2] != pred_traj_10hz.shape[:2]:
+        raise ValueError("pred_head_10hz must have shape [n_agent, T] matching pred_traj_10hz.")
+    start_10hz = int(anchor_idx) * int(anchor_stride_2hz) * int(shift)
+    end_10hz = start_10hz + int(flow_window_steps)
+    if pred_traj_10hz.shape[1] < end_10hz:
+        raise ValueError(
+            "Committed rollout shorter than anchor window: "
+            f"need {end_10hz} 10Hz steps for anchor_idx={anchor_idx} "
+            f"(stride_2hz={anchor_stride_2hz}, shift={shift}, window={flow_window_steps}), "
+            f"got {pred_traj_10hz.shape[1]}."
+        )
+    if "ctx_sampled_pos" not in tokenized_agent or "ctx_sampled_heading" not in tokenized_agent:
+        raise KeyError("tokenized_agent must contain ctx_sampled_pos and ctx_sampled_heading.")
+
+    path_pos = pred_traj_10hz[:, start_10hz:end_10hz]
+    path_head = pred_head_10hz[:, start_10hz:end_10hz]
+
+    if anchor_idx == 0:
+        current_pos = tokenized_agent["ctx_sampled_pos"][:, 1]
+        current_head = tokenized_agent["ctx_sampled_heading"][:, 1]
+    else:
+        # rollout commit pose at last step before this anchor.
+        origin_step = start_10hz - 1
+        current_pos = pred_traj_10hz[:, origin_step]
+        current_head = pred_head_10hz[:, origin_step]
+
+    path_pos_local, path_head_local = transform_to_local(
+        pos_global=path_pos,
+        head_global=path_head,
+        pos_now=current_pos,
+        head_now=current_head,
+    )
+    return torch.stack(
+        [
+            path_pos_local[..., 0] / float(pos_scale_m),
+            path_pos_local[..., 1] / float(pos_scale_m),
+            path_head_local.cos(),
+            path_head_local.sin(),
+        ],
+        dim=-1,
+    )
 
 
 def build_anchor0_normalized_committed_path(

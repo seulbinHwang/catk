@@ -239,6 +239,12 @@ ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-3}"
 # OCSC dmd_n_rollouts 정합 — 같은 anchor 0 에서 N rollout 으로 DMD direction variance ↓.
 # default 1 = 기존 동작.  forward 비용 N 배 (메모리는 한 rollout 분량 유지: grad accumulate).
 SF_N_ROLLOUTS="${SF_N_ROLLOUTS:-1}"
+# OCSC dmd_anchor_stride 정합 — 한 closed-loop rollout 안에서 stride (2Hz step) 간격으로
+# n_anchors 개 anchor 잡고 각각 DMD/SiD step.  학습 신호 N anchors 배.  rollout 길이가
+# 자동으로 (n_anchors-1)*stride + window/shift 2Hz step 까지 늘어남.  default 1/1 = 기존 동작.
+# OCSC 정합은 4/4.  실제 학습 비용 ≈ n_rollouts × n_anchors 배.
+SF_N_ANCHORS="${SF_N_ANCHORS:-1}"
+SF_ANCHOR_STRIDE="${SF_ANCHOR_STRIDE:-1}"
 # critic LR 절대값 override.  양수면 그 값 그대로 사용 (default 1e-6 = generator LR 과 동일).
 # null 이면 기존 비례식 ``LR / ESTIMATOR_UPDATES_PER_STEP`` 으로 fallback.
 ESTIMATOR_LR="${ESTIMATOR_LR:-${LR}}"
@@ -395,7 +401,8 @@ echo "  Self-Forced ★:"
 echo "    objective=${DM_OBJECTIVE} dmd_beta=${DMD_BETA} sid_alpha=${SID_ALPHA}"
 echo "    weight=${SF_WEIGHT} path_step=${SF_PATH_STEP_SIZE}"
 echo "    use_anchor_fm=${USE_ANCHOR_FM} anchor_weight=${ANCHOR_WEIGHT}"
-echo "    estimator_per_step=${ESTIMATOR_UPDATES_PER_STEP} estimator_lr=${ESTIMATOR_LR} n_rollouts=${SF_N_ROLLOUTS}"
+echo "    estimator_per_step=${ESTIMATOR_UPDATES_PER_STEP} estimator_lr=${ESTIMATOR_LR}"
+echo "    n_rollouts=${SF_N_ROLLOUTS} n_anchors=${SF_N_ANCHORS} anchor_stride=${SF_ANCHOR_STRIDE}"
 echo "    estimator_warmup_steps=${ESTIMATOR_WARMUP_STEPS} estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "    unfrozen_range=${SF_UNFROZEN_RANGE}"
 echo "    ema_weight=${SF_EMA_WEIGHT} ema_start=${SF_EMA_START_STEP}  (default OFF; sweep 후 0.99/50 으로 복원)"
@@ -501,6 +508,8 @@ torchrun \
   model.model_config.self_forced.estimator_updates_per_step="${ESTIMATOR_UPDATES_PER_STEP}" \
   model.model_config.self_forced.estimator_lr="${ESTIMATOR_LR}" \
   model.model_config.self_forced.n_rollouts="${SF_N_ROLLOUTS}" \
+  model.model_config.self_forced.n_anchors="${SF_N_ANCHORS}" \
+  model.model_config.self_forced.anchor_stride="${SF_ANCHOR_STRIDE}" \
   model.model_config.self_forced.estimator_warmup_steps="${ESTIMATOR_WARMUP_STEPS}" \
   model.model_config.self_forced.estimator_warmup_epochs="${ESTIMATOR_WARMUP_EPOCHS}" \
   model.model_config.self_forced.initialize_aux_from_generator_on_fit_start="${SF_INIT_AUX_FROM_GEN}" \

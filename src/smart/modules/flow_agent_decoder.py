@@ -1946,21 +1946,46 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         tau: torch.Tensor,
         anchor_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """첫 flow anchor의 noisy path에 대한 flow velocity를 예측합니다.
+        """첫 flow anchor 의 noisy path 에 대한 flow velocity 를 예측합니다.
+
+        ``path_flow_velocity_for_anchor_k(..., anchor_idx=0)`` 의 alias 입니다.  기존 호출
+        호환을 위해 유지합니다.
+        """
+        return self.path_flow_velocity_for_anchor_k(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            path_noisy_norm=path_noisy_norm,
+            tau=tau,
+            anchor_mask=anchor_mask,
+            anchor_idx=0,
+        )
+
+    def path_flow_velocity_for_anchor_k(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        path_noisy_norm: torch.Tensor,
+        tau: torch.Tensor,
+        anchor_mask: torch.Tensor,
+        anchor_idx: int = 0,
+    ) -> Dict[str, torch.Tensor]:
+        """``anchor_idx`` 번째 flow anchor 의 noisy path 에 대한 velocity / clean 을 예측합니다.
 
         Args:
-            tokenized_agent: 평가 모드 기준 토큰 사전입니다.
-            map_feature: 이 decoder가 직접 만든 지도 특징입니다.
-            path_noisy_norm: noisy N초 flow state입니다.
-                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
-            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent 마스크입니다. shape은 ``[n_agent]`` 입니다.
+            tokenized_agent: 평가 모드 기준 토큰 사전.
+            map_feature: 이 decoder 가 직접 만든 지도 특징.
+            path_noisy_norm: noisy N 초 flow state.
+                pose-space ``[n_valid_agent, flow_window_steps, 4]`` 또는
+                control-space ``[n_valid_agent, flow_window_steps, 3]``.
+            tau: flow interpolation time. shape ``[n_valid_agent]``.
+            anchor_mask: 사용할 anchor 에서 유효한 agent mask. shape ``[n_agent]``.
+            anchor_idx: 사용할 flow anchor 인덱스 (>= 0).
 
         Returns:
-            Dict[str, torch.Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다. 두 텐서 shape은
-            ``[n_valid_agent, flow_window_steps, flow_state_dim]`` 입니다.
+            ``{"velocity": ..., "clean": ...}`` (각 shape ``[n_valid_agent, flow_window_steps, flow_state_dim]``).
         """
+        if not isinstance(anchor_idx, int) or anchor_idx < 0:
+            raise ValueError(f"anchor_idx must be a non-negative int, got {anchor_idx!r}.")
         if path_noisy_norm.numel() == 0:
             empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
             return {"velocity": empty, "clean": empty}
@@ -1983,12 +2008,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
         )
-        if ctx_hidden_pack.shape[1] < 2:
+        required = 2 + anchor_idx
+        if ctx_hidden_pack.shape[1] < required:
             raise ValueError(
-                "path_flow_velocity_for_anchor0 requires at least one leading context "
-                "token and one anchor token."
+                f"path_flow_velocity_for_anchor_k requires ctx_hidden_pack length >= {required} "
+                f"for anchor_idx={anchor_idx}, got {ctx_hidden_pack.shape[1]}."
             )
-        anchor_hidden = ctx_hidden_pack[:, 1:2, :]
+        anchor_hidden = ctx_hidden_pack[:, 1 + anchor_idx : 2 + anchor_idx, :]
         single_anchor_mask = anchor_mask.bool().view(-1, 1)
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
         velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
