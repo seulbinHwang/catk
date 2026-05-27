@@ -422,7 +422,7 @@ def _run_rollout_and_record_interaction_kwargs(self_forced_epoch: int | None):
         rollout_cache=rollout_cache,
         tokenized_agent=tokenized_agent,
         map_feature=_empty_map_feature(),
-        sampling_scheme=SimpleNamespace(noise_scale=0.0, sample_steps=1, sample_method="euler"),
+        sampling_scheme=SimpleNamespace(noise_scale=0.0, sample_steps=16, sample_method="euler"),
         rollout_steps_2hz=2,
         self_forced_epoch=self_forced_epoch,
     )

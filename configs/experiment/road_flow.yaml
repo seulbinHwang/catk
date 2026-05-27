@@ -13,7 +13,7 @@ road:
   rollouts_per_scenario: 3
   candidates_per_agent: 64
   temperature: 0.8
-  sample_steps: 32
+  sample_steps: 16
   sample_method: euler
   rollout_steps: 80
   commit_steps: 5

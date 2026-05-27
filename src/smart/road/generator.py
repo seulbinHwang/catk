@@ -26,7 +26,7 @@ class RoadGenerationConfig:
     commit_steps: int = 5
     selection_horizon_steps: int = 20
     temperature: float = 0.8
-    sample_steps: int = 32
+    sample_steps: int = 16
     sample_method: str = "euler"
     generation_batch_size: int = 1
     candidate_micro_batch_size: int = 4
