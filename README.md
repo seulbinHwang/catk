@@ -850,6 +850,67 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t fast-rmm-sample-steps
 python scripts/launch_fast_rmm_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py --stop
 ```
 
+#### testa/testaa A100x4x2 epoch 61 Flow midpoint sample-steps Fast-RMM sweep
+
+epoch 61 checkpoint 하나를 고정하고, Flow solver를 `midpoint`로 바꾼 상태에서 denoising step 수가 RMM에 미치는 영향을 보려면 아래 launcher를 씁니다. Fast-RMM rollout에서는 `validation_rollout_sampling.sample_method`가 실제 sampling method로 전달되므로, 이 launcher는 `model.model_config.decoder.flow_solver_method=midpoint`와 `model.model_config.validation_rollout_sampling.sample_method=midpoint`를 함께 고정합니다.
+
+```bash
+python scripts/launch_fast_rmm_midpoint_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py --replace
+```
+
+기본 설정:
+
+| 항목 | 기본값 |
+|---|---|
+| pods | `testa` 4 A100 + `testaa` 4 A100 |
+| experiment | `pre_bc_flow_control_a100x4x2_prefix_default_noslip` |
+| checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| checkpoint epoch | `61` |
+| fixed solver | `model.model_config.decoder.flow_solver_method=midpoint`, `model.model_config.validation_rollout_sampling.sample_method=midpoint` |
+| swept config | `model.model_config.validation_rollout_sampling.sample_steps` |
+| sample steps | `2,4,6,8,10,12,16,20,24,28,32` |
+| stop-motion | `model.model_config.decoder.use_stop_motion=false`, `model.model_config.self_forced.use_stop_motion=false` |
+| fixed rollout count | `n_rollout_closed_val=32` |
+| validation mode | `val_closed_loop=true`, `val_open_loop=false` |
+| RMM scene target | `scorer_scene_num=1680` |
+| val batch / batches | per-rank `val_batch_size=42`, `limit_val_batches=auto -> 5` |
+| W&B group | `fast_rmm_midpoint_sample_steps_sweep_epoch061_x5f9g0ce_a100x4x2_bs42` |
+| tmux session | `fast-rmm-midpoint-sample-steps-sweep-a100x4x2-testa-testaa` |
+
+각 sample step 평가는 별도 DDP validation 프로세스로 순차 실행됩니다. 기본 master port 범위는 `29930..29940`입니다.
+
+다른 checkpoint에 재사용할 때는 artifact version과 sweep 이름만 바꿉니다.
+
+```bash
+python scripts/launch_fast_rmm_midpoint_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py \
+  --artifact-prefix jksg01019-naver-labs/SMART-FLOW/epoch-last-<run_id> \
+  --epoch 61 \
+  --artifact-version v57 \
+  --sample-steps 2,4,6,8,10,12,16,20,24,28,32 \
+  --sweep-name fast_rmm_midpoint_sample_steps_sweep_epoch061_<run_id>_a100x4x2 \
+  --wandb-group fast_rmm_midpoint_sample_steps_sweep_epoch061_<run_id>_a100x4x2_bs42 \
+  --replace
+```
+
+실행 전 dry-run:
+
+```bash
+python scripts/launch_fast_rmm_midpoint_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py --dry-run --replace
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t fast-rmm-midpoint-sample-steps-sweep-a100x4x2-testa-testaa
+kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t fast-rmm-midpoint-sample-steps-sweep-a100x4x2-testa-testaa
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_fast_rmm_midpoint_sample_steps_sweep_a100x4x2_testa_testaa_static_pods.py --stop
+```
+
 #### testa/testaa A100x4x2 epoch 61 Flow noise-scale Fast-RMM sweep
 
 epoch 61 checkpoint와 `sample_steps=16`은 고정하고, closed-loop rollout 시작 Gaussian noise 크기만 바꿔 RMM 변화를 보려면 아래 launcher를 씁니다. 실제 rollout에서 쓰이는 값은 `eval_sampling_noise.noise_scale`이 아니라 `model.model_config.validation_rollout_sampling.noise_scale`입니다.
