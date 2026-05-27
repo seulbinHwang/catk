@@ -2794,8 +2794,8 @@ class SMARTFlow(LightningModule):
                         sync_dist=True,
                         batch_size=1,
                     )
-                self.log("train/sf_anchor_fm_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-                self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("train/sf_anchor_fm_enabled", 0.0, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
                 return zero_loss.detach()
             generator_optimizer = self.optimizers()[0]
             self.toggle_optimizer(generator_optimizer)
@@ -2811,7 +2811,7 @@ class SMARTFlow(LightningModule):
                 self._clear_self_forced_generator_gradients()
                 self.untoggle_optimizer(generator_optimizer)
             self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss_fm", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
             return fm_loss.detach()
 
         gen_estimator_loss = self._update_generated_path_flow_estimator(
@@ -2870,16 +2870,19 @@ class SMARTFlow(LightningModule):
         finally:
             self._clear_self_forced_backward_context()
 
+        # Sweep 시 step 별 loss 추이를 봐야 하므로 on_step=True 로 통일.  (이전 on_step=False
+        # 였던 키는 epoch end 까지 wandb 에 안 찍혀서 매 200 step val 직전엔 generator/critic
+        # loss 가 보이지 않는 문제가 있었음.)
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         if fm_loss is not None:
-            self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/loss_fm", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         if self.self_forced_distribution_matching_objective == "dmd":
-            self.log("train/sf_dmd_beta", float(self.self_forced_dmd_beta), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
-        self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/sf_dmd_beta", float(self.self_forced_dmd_beta), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         if "sf_terminal_s_by_scenario" in rollout:
             self.log(
                 "train/sf_terminal_s_mean",
