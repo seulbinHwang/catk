@@ -115,7 +115,13 @@ NUM_NODES="${NUM_NODES:-1}"
 MAX_EPOCHS="${MAX_EPOCHS:-16}"                 # self_forced_npfm 기본 16
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"   # 1.0=전체, smoke 시 2 등 정수도 가능
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-0.1}"      # self_forced_npfm 기본 0.1
-CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-8}"
+# Validation 빈도:
+#   - step 단위 평가 (잘 되는 세팅 빠르게 탐색용; default 200 step):
+#       VAL_CHECK_INTERVAL=<int>  +  CHECK_VAL_EVERY_N_EPOCH=null
+#   - epoch 단위 평가 (긴 학습용):
+#       VAL_CHECK_INTERVAL=null   +  CHECK_VAL_EVERY_N_EPOCH=<int>
+VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-200}"
+CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-null}"
 # precision: bf16-mixed (default), fp16-mixed, 32-true (재현 디버그용)
 PRECISION="${PRECISION:-bf16-mixed}"
 # self-forced 는 manual optimization 이라 Lightning 의 trainer.gradient_clip_val 을 쓰지 않음.
@@ -340,7 +346,7 @@ echo "  CACHE_ROOT=${CACHE_ROOT}"
 echo "------------------------------------------------------------"
 echo "  Trainer: max_epochs=${MAX_EPOCHS} precision=${PRECISION}"
 echo "    limit_train=${LIMIT_TRAIN_BATCHES} limit_val=${LIMIT_VAL_BATCHES}"
-echo "    check_val_every_n=${CHECK_VAL_EVERY_N_EPOCH} seed=${SEED}"
+echo "    val_check_interval=${VAL_CHECK_INTERVAL} check_val_every_n=${CHECK_VAL_EVERY_N_EPOCH} seed=${SEED}"
 echo "  Data: train_B=${TRAIN_B} val_B=${VAL_B} workers=${NUM_WORKERS}"
 echo "    epoch_sample_frac=${TRAIN_EPOCH_SAMPLE_FRACTION}"
 echo "  Generator: lr=${LR} warmup=${LR_WARMUP_STEPS} total=${LR_TOTAL_STEPS}"
@@ -394,6 +400,7 @@ torchrun \
   trainer.max_epochs="${MAX_EPOCHS}" \
   trainer.limit_train_batches="${LIMIT_TRAIN_BATCHES}" \
   trainer.limit_val_batches="${LIMIT_VAL_BATCHES}" \
+  trainer.val_check_interval="${VAL_CHECK_INTERVAL}" \
   trainer.check_val_every_n_epoch="${CHECK_VAL_EVERY_N_EPOCH}" \
   trainer.precision="${PRECISION}" \
   trainer.gradient_clip_val="${GRADIENT_CLIP_VAL}" \
