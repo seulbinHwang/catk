@@ -876,8 +876,10 @@ bash scripts/start_flow_control_h100x4_h100x2_waymo_val_submission.sh
 | experiment/action | `experiment=sim_agents_sub_flow`, `action=validate` |
 | DDP strategy | 4+2 heterogeneous pod 구성을 위해 `HeterogeneousDDPStrategy` / `HeterogeneousTorchElasticEnvironment`를 launcher가 자동 지정 |
 | rollout count | `n_rollout_closed_val=32` |
+| Flow denoising steps | `model.model_config.validation_rollout_sampling.sample_steps=16`, 필요 시 `WAYMO_FLOW_SAMPLE_STEPS=<N>`으로 override |
 | val batch | per-rank `VAL_BATCH_SIZE=48`, 필요 시 `VAL_BATCH_SIZE=24` 또는 `12`로 override |
 | cache root | 두 pod 모두 `/workspace/womd_v1_3/SMART_cache` |
+| output/log root | 기본 `LOG_DIR=/workspace/exp_logs`; `sim_agents_2025_submission` shard와 `tar.gz`도 이 경로 아래에 저장 |
 | tmux session | `catk-flow-waymo-val-submission-h100x4-h100x2` |
 | shard 처리 | `CATK_SUBMISSION_STREAM_SHARDS=1`로 `wo-pvc-2` shard를 rank 0으로 streaming 후 tar.gz 생성 |
 | 자동 업로드 | `waymo_submission.enabled=true`, validation 제출만 허용, test 제출은 꺼짐 |
@@ -890,7 +892,7 @@ rollout은 끝났지만 shard 수집이나 archive/upload 단계만 실패했다
 
 ```bash
 python scripts/finalize_flow_control_h100x4_h100x2_waymo_submission.py \
-  --run-dir /mnt/nuplan/projects/catk/logs/<TASK_NAME>/runs/<RUN_ID> \
+  --run-dir /workspace/exp_logs/<TASK_NAME>/runs/<RUN_ID> \
   --upload
 ```
 
@@ -898,7 +900,7 @@ python scripts/finalize_flow_control_h100x4_h100x2_waymo_submission.py \
 
 ```bash
 python scripts/finalize_flow_control_h100x4_h100x2_waymo_submission.py \
-  --run-dir /mnt/nuplan/projects/catk/logs/<TASK_NAME>/runs/<RUN_ID> \
+  --run-dir /workspace/exp_logs/<TASK_NAME>/runs/<RUN_ID> \
   --skip-copy --skip-archive --upload
 ```
 

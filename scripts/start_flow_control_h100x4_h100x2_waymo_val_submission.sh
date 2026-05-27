@@ -18,8 +18,10 @@ CKPT_PATH="${CKPT_PATH:-}"
 TASK_NAME="${TASK_NAME:-flow_control_waymo_val_h100x4_h100x2_$(date +%Y%m%d_%H%M%S)}"
 SESSION="${SESSION:-catk-flow-waymo-val-submission-h100x4-h100x2}"
 RUN_ID="${RUN_ID:-${CATK_RUN_ID:-$(date +%Y%m%d_%H%M%S)}}"
+LOG_DIR="${LOG_DIR:-/workspace/exp_logs}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-48}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-1.0}"
+WAYMO_FLOW_SAMPLE_STEPS="${WAYMO_FLOW_SAMPLE_STEPS:-16}"
 POLL_SUBMISSION_STATUS="${POLL_SUBMISSION_STATUS:-false}"
 WAYMO_UPLOAD_TIMEOUT_MS="${WAYMO_UPLOAD_TIMEOUT_MS:-7200000}"
 GIT_REF="${GIT_REF:-origin/semi_control_stable}"
@@ -51,6 +53,7 @@ extra_overrides=(
   "waymo_submission.submit_test=false"
   "waymo_submission.poll_submission_status=${POLL_SUBMISSION_STATUS}"
   "waymo_submission.upload_timeout_ms=${WAYMO_UPLOAD_TIMEOUT_MS}"
+  "model.model_config.validation_rollout_sampling.sample_steps=${WAYMO_FLOW_SAMPLE_STEPS}"
   "logger.wandb.job_type=waymo_validation_submission"
 )
 
@@ -75,6 +78,7 @@ launcher_args=(
   --task-name "${TASK_NAME}"
   --session "${SESSION}"
   --run-id "${RUN_ID}"
+  --log-dir "${LOG_DIR}"
   --ckpt-path "${CKPT_PATH}"
   --nproc-per-node gpu
   --manual-rank-offsets
