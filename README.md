@@ -260,7 +260,7 @@ python scripts/launch_smart_ntp_h100x4_h100x2.py \
 
 기본 experiment는 `configs/experiment/pre_bc_a100x4x2.yaml`이다. 이 config는
 `pre_bc`를 상속하므로 SMART backbone, next-token prediction loss,
-deterministic nearest-token tokenization, agent selection, `num_freq_bands: 66`
+deterministic nearest-token tokenization, agent selection, `num_freq_bands: 88`
 같은 모델/알고리즘 설정은 바꾸지 않는다. 대신
 `semi_control_stable`의 x4x2 control-space pretrain recipe와 학습 실행 조건을 맞추기
 위해 아래 training/runtime 값만 명시한다.
@@ -456,7 +456,7 @@ checkpoint가 없으면 에러를 내고 새 학습을 시작하지 않는다. c
 `--allow-missing-resume-checkpoint`를 명시한다.
 
 중요한 제약은 resume 시 모델/config가 checkpoint와 호환되어야 한다는 점이다. 예를 들어
-SMART 공정 비교 pretrain은 `num_freq_bands: 66`을 쓰므로, resume도 같은
+SMART 공정 비교 pretrain은 `num_freq_bands: 88`을 쓰므로, resume도 같은
 `experiment=pre_bc` 또는 `pre_bc_a100x4x2` 계열 설정으로 실행해야 한다.
 
 학습 batch, learning rate, epoch 수 같은 실험 파라미터를 바꿔야 할 때는 launcher option을
@@ -489,14 +489,14 @@ closed-loop validation realism 점수가 가장 높았던 가중치를 best chec
 side-effect를 만들지 않는다.
 
 같은 config는 SMART NTP의 capacity 보정을 위해
-`model.model_config.decoder.num_freq_bands: 66`도 명시한다. 최신 main 코드에서
-`experiment=pre_bc`와 `num_freq_bands=66`으로 SMART 모델을 실제 instantiate해 센
-총 파라미터 수는 7,043,232개이며, 모두 trainable parameter이다.
+`model.model_config.decoder.num_freq_bands: 88`도 명시한다. 최신 main 코드에서
+`experiment=pre_bc`와 `num_freq_bands=88`으로 SMART 모델을 실제 instantiate해 센
+총 파라미터 수는 7,093,544개이며, 모두 trainable parameter이다.
 순수 `configs/model/smart.yaml` 기본값인 `num_freq_bands=64` 기준 총 파라미터 수는
 7,035,008개이다.
 
 `local_val`, `wosac_sub`, `clsft`, `road_clsft`도 같은 pretrain checkpoint를 그대로
-읽어야 하므로 `model.model_config.decoder.num_freq_bands: 66`을 명시한다. 이 값을
+읽어야 하므로 `model.model_config.decoder.num_freq_bands: 88`을 명시한다. 이 값을
 빠뜨리면 `pre_bc`에서 저장한 checkpoint의 Fourier embedding weight shape이 기본
 SMART 값인 `64`와 맞지 않아 checkpoint load 단계에서 실패한다.
 
