@@ -166,7 +166,7 @@ LR_MIN_RATIO="${LR_MIN_RATIO:-1.0}"   # 1.0 = decay 없음 (self-forced 외 분�
 
 # Validation rollout 비용 제어
 N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-16}"
-N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-10}"
+N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-100000}"
 SCORER_SCENE_NUM="${SCORER_SCENE_NUM:-1680}"
 SIM_AGENTS_METRIC_WORKERS="${SIM_AGENTS_METRIC_WORKERS:-0}"
 
@@ -279,8 +279,9 @@ SAMPLING_RTS_SCOPE="${SAMPLING_RTS_SCOPE:-global_batch}"   # global_batch | per_
 SAMPLING_RTS_POLICY="${SAMPLING_RTS_POLICY:-all}"
 # paper_uniform 일 때만 의미. policy=all 이면 dead.
 SAMPLING_RTS_MIN_EXECUTED_STEPS="${SAMPLING_RTS_MIN_EXECUTED_STEPS:-${SAMPLING_SAMPLE_STEPS}}"
-# policy=all 일 때 마지막 K step 에만 gradient. sample_steps 와 동일하면 전체 backward.
-SAMPLING_RTS_BACKPROP_LAST_K="${SAMPLING_RTS_BACKPROP_LAST_K:-${SAMPLING_SAMPLE_STEPS}}"
+# policy=all 일 때 마지막 K step 에만 gradient. 8 = Self-Forcing paper default (메모리 절약).
+# 모든 step backward 가 필요하면 SAMPLING_RTS_BACKPROP_LAST_K=${SAMPLING_SAMPLE_STEPS} 로 export.
+SAMPLING_RTS_BACKPROP_LAST_K="${SAMPLING_RTS_BACKPROP_LAST_K:-8}"
 
 # ────────────────────────────────────────────────────────────────────────
 # 6.5. Validation rollout sampling — main 학습 시 val closed-loop와 동기화 ★

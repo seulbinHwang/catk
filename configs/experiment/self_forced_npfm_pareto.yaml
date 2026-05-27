@@ -63,10 +63,10 @@ model:
       clean_dmd_tau_low: 0.02
       clean_dmd_tau_high: 0.98
       sampling:
-        # Fully fine-tune default: 16 step 전체 실행 + 16 step 전체 backward.
-        # 메모리 안 맞으면 backprop_last_k 를 8 등으로 줄이거나
-        # random_terminal_step.policy=paper_uniform 으로 전환.
-        backprop_last_k: 16
+        # 16 step 전체 실행 + 마지막 8 step 에만 backward (Self-Forcing paper default).
+        # 메모리 안 맞으면 더 줄이거나 (예: 4) policy=paper_uniform 으로 전환.
+        # 모든 step backward 가 필요하면 backprop_last_k=16.
+        backprop_last_k: 8
         random_terminal_step:
           policy: all
           # paper_uniform 으로 전환할 때만 의미.  policy=all 에선 dead.
