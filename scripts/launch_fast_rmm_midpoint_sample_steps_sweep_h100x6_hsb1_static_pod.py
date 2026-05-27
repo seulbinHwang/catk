@@ -169,8 +169,8 @@ def render_worker_script(
     run_log_dir = f"{run_root}/run_logs_rmm_only_bs{args.val_batch_size}"
     status_file = f"{run_root}/{layout.pod}.status"
     tags = (
-        f"[fast_rmm,midpoint_sample_steps_sweep,h100x6,hsb1,{args.branch},"
-        f"{args.sweep_name},epoch{args.epoch:03d},rmm_only,bs{args.val_batch_size}]"
+        f"[fast_rmm,midpoint_steps,h100x6,hsb1,{args.branch},"
+        f"epoch{args.epoch:03d},rmm_only,bs{args.val_batch_size}]"
     )
     return f"""#!/usr/bin/env bash
 set -Eeuo pipefail
