@@ -681,6 +681,46 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretra
 python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --stop
 ```
 
+#### hsb-npc-training/wo-pvc-2 H100x4+H100x2 holonomic ablation pretrain
+
+기존 W&B run `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20`와 같은 하드웨어, lr, tail-prefix supervision, round-trip threshold를 쓰되 `use_holonomic_model_only=true`를 켜고 per-rank `train_batch_size=18`로 학습하는 비교 실험은 아래 launcher를 씁니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_holonomic_static_pods.py --replace
+```
+
+이 launcher는 기존 H100 4+2 default no-slip launcher를 재사용하면서 Hydra override 마지막에 아래 값을 강제합니다.
+
+```text
+model.model_config.token_processor.use_holonomic_model_only=true
+```
+
+따라서 실험 차이는 vehicle / cyclist도 pedestrian처럼 holonomic control decoder를 쓰는 점과 per-rank `train_batch_size=18`을 쓰는 점입니다. control-space 학습, prefix-valid target, `lr=6e-4`, H100 `4+2` heterogeneous DDP, memory-balanced metadata, OOM retry 경로는 기존 default no-slip 실험과 같습니다.
+
+기본값:
+
+| 항목 | 설정 |
+|---|---|
+| branch | `semi_control_holonomic` |
+| experiment config | `pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip` |
+| task name | `flow_control_space_pretrain_h100x4_h100x2_holonomic_tailprefix_roundtrip05_lr6e-4_bs18` |
+| tmux session | `catk-control-pretrain-h100x4-h100x2-holonomic` |
+| pod / GPU | `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 |
+| batch / lr | per-rank `train_batch_size=18`, effective global batch `108`, `lr=6e-4` |
+| changed objective flag | `use_holonomic_model_only=true` |
+
+실행 전에 실제 kubectl / tmux 명령을 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_holonomic_static_pods.py --dry-run --replace
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_holonomic_static_pods.py --stop
+```
+
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch-last artifact Fast-RMM sweep
 
 학습이 끝난 뒤 마지막 여러 epoch 중 RMM이 가장 높은 checkpoint를 고를 때는 아래 launcher를 씁니다. 이 launcher는 W&B `epoch-last-<run_id>` artifact version들을 내려받고, 각 checkpoint에 대해 closed-loop Fast-RMM validation만 실행합니다. pod를 새로 만들거나 재시작하지 않고, 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 안에 tmux session만 만듭니다.

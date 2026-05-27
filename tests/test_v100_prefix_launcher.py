@@ -69,7 +69,7 @@ def test_oom_retry_preflight_builds_metadata_on_all_pods() -> None:
     assert "${remote_python_q} tools/build_memory_balance_metadata.py" in script
 
 
-def test_h100x4_h100x2_launcher_dry_run_uses_workspace_cache_and_bs17() -> None:
+def test_h100x4_h100x2_launcher_dry_run_uses_workspace_cache_and_bs20() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
         [
@@ -91,12 +91,42 @@ def test_h100x4_h100x2_launcher_dry_run_uses_workspace_cache_and_bs17() -> None:
     assert "PODS='hsb-npc-training wo-pvc-2'" in result.stdout
     assert "NPROC_PER_NODE=gpu" in result.stdout
     assert "MANUAL_RANK_OFFSETS=1" in result.stdout
-    assert "INITIAL_BS=17" in result.stdout
+    assert "INITIAL_BS=20" in result.stdout
     assert "OOM_STEP=1" in result.stdout
     assert "hsb-npc-training=/workspace/womd_v1_3/SMART_cache" in result.stdout
     assert "wo-pvc-2=/workspace/womd_v1_3/SMART_cache" in result.stdout
     assert "womd_training_memory_balance_h100x6_hsb_wo_pvc2.pt" in result.stdout
     assert "pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip" in result.stdout
+
+
+def test_h100x4_h100x2_holonomic_wrapper_forces_only_holonomic_override() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(
+                repo_root
+                / "scripts"
+                / "launch_pre_bc_flow_control_h100x4_h100x2_holonomic_static_pods.py"
+            ),
+            "--dry-run",
+            "--replace",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py" in result.stdout
+    assert "BRANCH=semi_control_holonomic" in result.stdout
+    assert "PODS='hsb-npc-training wo-pvc-2'" in result.stdout
+    assert "INITIAL_BS=18" in result.stdout
+    assert "LEARNING_RATE=6e-4" in result.stdout
+    assert "VAL_BATCH_SIZE=12" in result.stdout
+    assert "flow_control_space_pretrain_h100x4_h100x2_holonomic_tailprefix_roundtrip05_lr6e-4_bs18" in result.stdout
+    assert "catk-control-pretrain-h100x4-h100x2-holonomic" in result.stdout
+    assert "model.model_config.token_processor.use_holonomic_model_only=true" in result.stdout
 
 
 def test_h100x4_h100x2_hsb2_wrapper_targets_wo_pvc1() -> None:
