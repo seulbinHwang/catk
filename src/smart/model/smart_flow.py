@@ -316,6 +316,14 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
+        # OCSC dmd_n_rollouts 정합 — 같은 anchor 0 에서 N rollout 으로 DMD direction variance↓.
+        # 매 inner rollout 마다 critic update + DMD/SiD backward (grad accumulate); generator
+        # optimizer step 은 batch 당 한 번.  default 1 = 기존 동작.
+        self.self_forced_n_rollouts = (
+            max(1, int(getattr(self.self_forced_config, "n_rollouts", 1)))
+            if self.self_forced_config is not None
+            else 1
+        )
         # critic(generated estimator) LR.  config에 estimator_lr이 양수로 명시되어 있으면
         # 그 절대값을 그대로 사용 (generator LR 과 동일하게 두고 싶을 때 유용).  값이 없거나
         # ``null`` / ``<= 0`` 이면 기존 비례 관계 ``lr / estimator_updates_per_step`` 을 그대로
@@ -2744,20 +2752,7 @@ class SMARTFlow(LightningModule):
         # RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
         # 가 난다.
         in_estimator_warmup = self._is_self_forced_estimator_warmup_active()
-        if in_estimator_warmup:
-            with torch.no_grad():
-                rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
-        else:
-            rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
-        committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
-            rollout=rollout,
-            tokenized_agent=tokenized_agent_eval,
-        )
-        has_committed_path_local = committed_path_norm.numel() > 0
-        has_committed_path_global = self._sync_distributed_bool_any(
-            has_committed_path_local,
-            device=committed_path_norm.device,
-        )
+        n_rollouts = max(1, int(self.self_forced_n_rollouts))
         has_anchor_fm_targets_global = False
         if fm_loss is not None:
             has_anchor_fm_targets_global = self._sync_distributed_bool_any(
@@ -2765,110 +2760,170 @@ class SMARTFlow(LightningModule):
                 device=fm_loss.device,
             )
 
-        if not has_committed_path_global:
-            if in_estimator_warmup:
-                return self._finish_self_forced_estimator_warmup_step(None)
-            if fm_loss is None or not has_anchor_fm_targets_global:
-                zero_loss = (
-                    fm_loss
-                    if fm_loss is not None
-                    else self._build_trainable_connected_zero_loss(self.encoder)
-                )
-                generator_optimizer = self.optimizers()[0]
-                self.toggle_optimizer(generator_optimizer)
-                try:
-                    generator_optimizer.zero_grad(set_to_none=True)
-                    self._prepare_self_forced_generator_backward_boundary()
-                    self._manual_backward_without_autocast(zero_loss)
-                    self._assert_self_forced_generator_update_isolated()
-                finally:
-                    self._clear_self_forced_generator_gradients()
-                    self.untoggle_optimizer(generator_optimizer)
-                self.log("train/loss", zero_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                if fm_loss is not None:
-                    self.log(
-                        "train/loss_fm",
-                        fm_loss.detach(),
-                        on_step=False,
-                        on_epoch=True,
-                        sync_dist=True,
-                        batch_size=1,
-                    )
-                self.log("train/sf_anchor_fm_enabled", 0.0, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-                return zero_loss.detach()
-            generator_optimizer = self.optimizers()[0]
+        # ── Multi-rollout: 한 batch 안에서 같은 anchor 0 에 대해 N rollout 진행.
+        #    매 rollout 마다 (1) closed-loop rollout (2) critic update (3) DMD/SiD loss 의
+        #    backward (grad accumulate / N).  최종 generator optimizer step 은 loop 밖에서 1번.
+        #    OCSC dmd_n_rollouts 정합.  N=1 이면 기존 single-rollout 동작과 동일.
+        rollout_results = []  # (rollout dict, committed_path_norm, anchor_mask, has_committed_local)
+        per_rollout_gen_est_losses = []
+        per_rollout_sf_losses = []
+        per_rollout_total_losses = []
+        any_committed_global = False
+        last_anchor_loss_val: Tensor | None = None
+
+        # generator optimizer: warmup 이 아니면 학습 step 진행하므로 미리 toggle.
+        generator_optimizer = self.optimizers()[0] if not in_estimator_warmup else None
+        if generator_optimizer is not None:
             self.toggle_optimizer(generator_optimizer)
             generator_optimizer.zero_grad(set_to_none=True)
             self._prepare_self_forced_generator_backward_boundary()
-            try:
+
+        try:
+            for _ in range(n_rollouts):
+                if in_estimator_warmup:
+                    with torch.no_grad():
+                        rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+                else:
+                    rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+                committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
+                    rollout=rollout,
+                    tokenized_agent=tokenized_agent_eval,
+                )
+                has_committed_local = committed_path_norm.numel() > 0
+                has_committed_global = self._sync_distributed_bool_any(
+                    has_committed_local,
+                    device=committed_path_norm.device,
+                )
+                any_committed_global = any_committed_global or has_committed_global
+                rollout_results.append((rollout, committed_path_norm, anchor_mask, has_committed_local))
+
+                # critic update — 매 rollout 마다.
+                gen_estimator_loss = self._update_generated_path_flow_estimator(
+                    tokenized_map=tokenized_map_eval,
+                    tokenized_agent=tokenized_agent_eval,
+                    committed_path_norm=committed_path_norm,
+                    anchor_mask=anchor_mask,
+                    has_committed_path_global=has_committed_global,
+                )
+                per_rollout_gen_est_losses.append(gen_estimator_loss)
+
+                if in_estimator_warmup or not has_committed_global:
+                    # warmup 중이거나 valid anchor 없는 batch — generator backward skip.
+                    continue
+
+                # DMD/SiD direction backward — grad accumulate.
+                if has_committed_local:
+                    sf_loss_i = self._compute_self_forced_distribution_matching_loss(
+                        tokenized_map=tokenized_map_eval,
+                        tokenized_agent=tokenized_agent_eval,
+                        committed_path_norm=committed_path_norm,
+                        anchor_mask=anchor_mask,
+                    )
+                else:
+                    sf_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
+                anchor_loss_i = (
+                    fm_loss
+                    if fm_loss is not None
+                    else committed_path_norm.new_zeros(())
+                )
+                last_anchor_loss_val = anchor_loss_i
+                total_loss_i = (
+                    self.self_forced_weight * sf_loss_i
+                    + self.self_forced_anchor_weight * anchor_loss_i
+                ) / float(n_rollouts)
+                if not torch.isfinite(total_loss_i):
+                    context = self._format_self_forced_backward_context()
+                    self._clear_self_forced_backward_context()
+                    raise RuntimeError(
+                        "Non-finite self-forced total_loss detected: "
+                        f"{self._summarize_nonfinite_tensor(total_loss_i)}"
+                        f"{context}"
+                    )
+                self._manual_backward_without_autocast(total_loss_i)
+                self._assert_self_forced_generator_update_isolated()
+                per_rollout_sf_losses.append(sf_loss_i.detach())
+                per_rollout_total_losses.append(total_loss_i.detach() * float(n_rollouts))
+                self._clear_self_forced_backward_context()
+
+            # ── warmup-only batch: gen optimizer step 생략하고 warmup 종료 처리.
+            if in_estimator_warmup:
+                avg_gen_est = (
+                    torch.stack(
+                        [v.detach().float() for v in per_rollout_gen_est_losses if v is not None]
+                    ).mean()
+                    if any(v is not None for v in per_rollout_gen_est_losses)
+                    else None
+                )
+                return self._finish_self_forced_estimator_warmup_step(avg_gen_est)
+
+            # ── valid anchor 가 한 번도 없었던 batch — 기존 zero-loss / fm-only 경로.
+            if not any_committed_global:
+                self._clear_self_forced_generator_gradients()
+                if fm_loss is None or not has_anchor_fm_targets_global:
+                    zero_loss = (
+                        fm_loss
+                        if fm_loss is not None
+                        else self._build_trainable_connected_zero_loss(self.encoder)
+                    )
+                    self._prepare_self_forced_generator_backward_boundary()
+                    self._manual_backward_without_autocast(zero_loss)
+                    self._assert_self_forced_generator_update_isolated()
+                    self._clear_self_forced_generator_gradients()
+                    self.log("train/loss", zero_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                    if fm_loss is not None:
+                        self.log("train/loss_fm", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                    self.log("train/sf_anchor_fm_enabled", 0.0, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                    self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                    return zero_loss.detach()
+                self._prepare_self_forced_generator_backward_boundary()
                 self._manual_backward_without_autocast(fm_loss)
                 self._assert_self_forced_generator_update_isolated()
                 if has_anchor_fm_targets_global:
                     self._clip_and_step_with_optional_scaler(generator_optimizer)
                     self._update_self_forced_generator_ema_after_step()
-            finally:
                 self._clear_self_forced_generator_gradients()
-                self.untoggle_optimizer(generator_optimizer)
-            self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            self.log("train/loss_fm", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
-            return fm_loss.detach()
+                self.log("train/loss", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log("train/loss_fm", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+                return fm_loss.detach()
 
-        gen_estimator_loss = self._update_generated_path_flow_estimator(
-            tokenized_map=tokenized_map_eval,
-            tokenized_agent=tokenized_agent_eval,
-            committed_path_norm=committed_path_norm,
-            anchor_mask=anchor_mask,
-            has_committed_path_global=has_committed_path_global,
-        )
-        if in_estimator_warmup:
-            return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
-        if has_committed_path_local:
-            sf_loss = self._compute_self_forced_distribution_matching_loss(
-                tokenized_map=tokenized_map_eval,
-                tokenized_agent=tokenized_agent_eval,
-                committed_path_norm=committed_path_norm,
-                anchor_mask=anchor_mask,
+            # ── 정상 multi-rollout step: 누적된 grad 로 generator optimizer.step().
+            self._clip_and_step_with_optional_scaler(
+                generator_optimizer,
+                gradient_clip_val=self.self_forced_gradient_clip_val,
+                gradient_clip_algorithm="norm",
             )
-        else:
-            sf_loss = self._build_trainable_connected_zero_loss(self.encoder)
+            self._update_self_forced_generator_ema_after_step()
+            self._clear_self_forced_generator_gradients()
+        finally:
+            if generator_optimizer is not None:
+                self.untoggle_optimizer(generator_optimizer)
+            self._clear_self_forced_backward_context()
+
+        # ── Logging 변수: rollout 평균.
+        rollout = rollout_results[-1][0]
+        committed_path_norm = rollout_results[-1][1]
+        sf_loss = (
+            torch.stack(per_rollout_sf_losses).mean()
+            if per_rollout_sf_losses
+            else self._build_trainable_connected_zero_loss(self.encoder).detach()
+        )
+        gen_estimator_loss = (
+            torch.stack(
+                [v.detach().float() for v in per_rollout_gen_est_losses if v is not None]
+            ).mean()
+            if any(v is not None for v in per_rollout_gen_est_losses)
+            else torch.zeros((), device=self.device, dtype=torch.float32)
+        )
         anchor_loss = (
-            fm_loss
-            if fm_loss is not None
+            last_anchor_loss_val
+            if last_anchor_loss_val is not None
             else committed_path_norm.new_zeros(())
         )
         total_loss = (
-            self.self_forced_weight * sf_loss
-            + self.self_forced_anchor_weight * anchor_loss
+            torch.stack(per_rollout_total_losses).mean()
+            if per_rollout_total_losses
+            else (self.self_forced_weight * sf_loss + self.self_forced_anchor_weight * anchor_loss).detach()
         )
-        if not torch.isfinite(total_loss):
-            context = self._format_self_forced_backward_context()
-            self._clear_self_forced_backward_context()
-            raise RuntimeError(
-                "Non-finite self-forced total_loss detected: "
-                f"{self._summarize_nonfinite_tensor(total_loss)}"
-                f"{context}"
-            )
-
-        generator_optimizer = self.optimizers()[0]
-        try:
-            self.toggle_optimizer(generator_optimizer)
-            try:
-                generator_optimizer.zero_grad(set_to_none=True)
-                self._prepare_self_forced_generator_backward_boundary()
-                self._manual_backward_without_autocast(total_loss)
-                self._assert_self_forced_generator_update_isolated()
-                self._clip_and_step_with_optional_scaler(
-                    generator_optimizer,
-                    gradient_clip_val=self.self_forced_gradient_clip_val,
-                    gradient_clip_algorithm="norm",
-                )
-                self._update_self_forced_generator_ema_after_step()
-                self._clear_self_forced_generator_gradients()
-            finally:
-                self.untoggle_optimizer(generator_optimizer)
-        finally:
-            self._clear_self_forced_backward_context()
 
         # Sweep 시 step 별 loss 추이를 봐야 하므로 on_step=True 로 통일.  (이전 on_step=False
         # 였던 키는 epoch end 까지 wandb 에 안 찍혀서 매 200 step val 직전엔 generator/critic

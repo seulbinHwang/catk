@@ -56,6 +56,10 @@ model:
       # 나중에 best 세팅으로 재학습할 때 ema_weight: 0.99 / ema_start_step: 50 로 복원.
       ema_weight: 0.0
       ema_start_step: 1000000000
+      # OCSC dmd_n_rollouts 정합 (variance reduction).  같은 anchor 0 에서 N rollout 돌려
+      # 매 inner step 마다 critic update + DMD/SiD direction backward (grad accumulate, 메모리는
+      # 한 rollout 분량 유지).  default 1 = 기존 동작.  4 정도면 OCSC 와 정합.
+      n_rollouts: 1
       # smart_flow.py는 아래 키들도 read 하지만 base smart_flow.yaml에는 정의되어 있지
       # 않습니다. struct mode에서 CLI override가 막히지 않도록 default를 여기서 명시
       # (값은 smart_flow.py 기본값과 동일 → behavior-preserving).
