@@ -177,6 +177,23 @@ INITIAL_BS=16 MIN_BS=10 TASK_NAME=smart_ntp_pretrain_a100x4x2_retry_main \
   bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh
 ```
 
+`smart_ntp_pretrain_a100x4x2_bs16_oom_retry_main_20260523`와 같은 A100x4x2
+SMART NTP pretrain recipe를 기준으로 하되, train batch size를 14에서 시작하고
+`5a31008`의 예전 main 입력 특징 원복을 반영한 original run을 새로 시작하려면 아래
+전용 wrapper를 사용한다.
+
+```bash
+bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_legacy_inputs_oom_retry.sh
+```
+
+이 wrapper는 일반 OOM retry wrapper를 그대로 호출한다. 기본값은 `testa testaa`,
+`experiment=pre_bc_a100x4x2`, `INITIAL_BS=14`, `OOM_STEP=1`, `MIN_BS=8`,
+`VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12`이고, task name은
+`smart_ntp_pretrain_a100x4x2_bs14_oom_retry_main_original_legacy_inputs`이다. 따라서 과거
+W&B run의 학습 recipe를 기준으로 하되, 이번 run은 `original` 이름과 batch 14 시작값으로
+구분되고, 모델 입력 특징은 현재 main의 `5a31008` 이후 상태를 따른다. 다른 이름으로
+기록하려면 `TASK_NAME=...`을 환경 변수로 넘긴다.
+
 launcher는 pod를 만들거나 지우지 않는다. 로컬에서 `kubectl exec`로 이미 떠 있는 두 pod에
 접속한 뒤, 각 pod 안에서 같은 이름의 tmux session을 시작한다. 기본 namespace는 `p-pnc`,
 기본 pod 목록은 `testa testaa`, branch는 `main`이다. 일반 launcher의 기본 원격 저장소
