@@ -685,6 +685,53 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretra
 python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --stop
 ```
 
+#### hsb-npc-training-1 H100x6 train+validation prefix-valid default no-slip pretrain
+
+W&B의 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20`와 objective 설정을 맞추되, 학습 데이터를 `training + validation` 전체로 확장하고 실행 하드웨어를 `hsb-npc-training-1` 단일 H100 6GPU pod로 바꿔 돌리려면 아래 launcher를 씁니다. 이 launcher는 기존 pod를 새로 만들거나 재시작하지 않고, pod 안의 tmux session과 학습 프로세스만 만들거나 교체합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb1_prefix_default_noslip_static_pod.py --replace
+```
+
+기본 설정:
+
+| 항목 | 설정 |
+|---|---|
+| pod / GPU | `hsb-npc-training-1` 단일 pod, H100 6장 |
+| experiment config | `configs/experiment/pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip.yaml` |
+| train split | `${CACHE_ROOT}/training` + `${CACHE_ROOT}/validation`을 하나의 train epoch으로 사용 |
+| fit-time validation split | 기존과 동일하게 `${CACHE_ROOT}/validation`만 별도 validation dataloader로 사용 |
+| W&B/task name | `flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18` |
+| tmux session | `catk-control-pretrain-h100x6-hsb1-prefix-default-noslip-train-plus-validation` |
+| context / anchor | `18-token / 16-anchor` Tail-Prefix supervision |
+| Flow target mask | `use_prefix_valid_future_loss_mask=true` |
+| control target | kinematic control-space, rolling supervision, default no-slip ratio |
+| round-trip filter | `control_round_trip_max_position_error_m=0.5` |
+| precision | `bf16-mixed` |
+| batch / lr | per-rank `train_batch_size=18`, effective global batch `108`, `lr=6e-4` |
+| epoch / fit-time validation | `max_epochs=128`, `check_val_every_n_epoch=16` |
+| metadata | `${REMOTE_LOG_DIR}/dataset_metadata/womd_training_validation_memory_balance_h100x6_hsb1.pt` preflight 생성/검증 |
+
+이 launcher는 4+2 heterogeneous multi-node 경로를 쓰지 않습니다. `NNODES=1`, `NPROC_PER_NODE=6`으로 `hsb-npc-training-1` 내부 6GPU만 사용하고, config 상속에 남아 있는 heterogeneous strategy를 `lightning.pytorch.strategies.DDPStrategy`로 명시적으로 되돌립니다. 학습 objective, train+val split, memory-balanced sampler 설정은 4+2 preset과 같고, metadata cache만 단일 pod 전용 파일로 분리합니다.
+
+실행 전에 실제 remote 명령과 metadata preflight 대상을 확인하려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb1_prefix_default_noslip_static_pod.py --dry-run --replace
+```
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- tmux attach -t catk-control-pretrain-h100x6-hsb1-prefix-default-noslip-train-plus-validation
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x6_hsb1_prefix_default_noslip_static_pod.py --stop
+```
+
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch-last artifact Fast-RMM sweep
 
 학습이 끝난 뒤 마지막 여러 epoch 중 RMM이 가장 높은 checkpoint를 고를 때는 아래 launcher를 씁니다. 이 launcher는 W&B `epoch-last-<run_id>` artifact version들을 내려받고, 각 checkpoint에 대해 closed-loop Fast-RMM validation만 실행합니다. pod를 새로 만들거나 재시작하지 않고, 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 안에 tmux session만 만듭니다.

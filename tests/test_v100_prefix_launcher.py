@@ -123,3 +123,37 @@ def test_h100x4_h100x2_hsb2_wrapper_targets_wo_pvc1() -> None:
     assert "flow_control_space_pretrain_h100x4_h100x2_hsb2_wo1_prefix_default_noslip_lr6e-4_bs18" in result.stdout
     assert "catk-control-pretrain-h100x4-h100x2-hsb2-wo1-prefix-default-noslip" in result.stdout
     assert "womd_training_validation_memory_balance_h100x6_hsb2_wo1.pt" in result.stdout
+
+
+def test_h100x6_hsb1_launcher_dry_run_uses_train_validation_split() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(
+                repo_root
+                / "scripts"
+                / "launch_pre_bc_flow_control_h100x6_hsb1_prefix_default_noslip_static_pod.py"
+            ),
+            "--dry-run",
+            "--replace",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "hsb-npc-training-1" in result.stdout
+    assert "semi_control_stable_w_val" in result.stdout
+    assert "pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip" in result.stdout
+    assert "flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18" in result.stdout
+    assert "womd_training_validation_memory_balance_h100x6_hsb1.pt" in result.stdout
+    assert "--raw-dir /workspace/womd_v1_3/SMART_cache/training" in result.stdout
+    assert "--raw-dir /workspace/womd_v1_3/SMART_cache/validation" in result.stdout
+    assert "export NNODES=1" in result.stdout
+    assert "export NPROC_PER_NODE=6" in result.stdout
+    assert "export TRAIN_BATCH_SIZE=18" in result.stdout
+    assert "export MAX_EPOCHS=128" in result.stdout
+    assert "trainer.strategy._target_=lightning.pytorch.strategies.DDPStrategy" in result.stdout
+    assert "trainer.strategy.cluster_environment=null" in result.stdout
