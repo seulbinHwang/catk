@@ -757,6 +757,65 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretra
 python scripts/launch_pre_bc_flow_control_h100x4_h100x2_hsb_wo2_wo_category_static_pods.py --stop
 ```
 
+#### testas A100x7 wo-category + wo-traffic-time ablation pretrain
+
+`semi_control_stable_wo_category_wo_traffic_time` 브랜치에서 위 wo-category
+H100 4+2 실험
+`flow_control_space_pretrain_h100x4_h100x2_wo_category_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs18`
+과 같은 학습 recipe를 쓰되, `b4f737c`의 traffic-time relation ablation까지 반영한
+pretrain을 `testas` 단일 A100 7GPU pod에서 돌릴 때는 아래 launcher를 씁니다.
+pod를 새로 만들거나 재시작하지 않고, `testas` 안에 tmux session만 만듭니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x7_testas_wo_category_wo_traffic_time_static_pod.py \
+  --prebuild-metadata \
+  --replace
+```
+
+실행 전에는 dry-run으로 branch, task name, metadata path, tmux 명령을 확인합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x7_testas_wo_category_wo_traffic_time_static_pod.py \
+  --prebuild-metadata \
+  --dry-run \
+  --replace
+```
+
+기본 설정:
+
+| 항목 | 설정 |
+|---|---|
+| branch | `semi_control_stable_wo_category_wo_traffic_time` |
+| pod / GPU | `testas` A100 7GPU = 총 7 rank |
+| cache root | `/workspace/womd_v1_3/SMART_cache` |
+| category ablation | 최신 cache를 쓰더라도 `speed_bump`, `driveway`를 embedding 직전에 `crosswalk` 계열로 접음 |
+| traffic-time ablation | agent가 map을 볼 때 rollout 기준 traffic-light stale time relation bias를 쓰지 않음 |
+| experiment config | `configs/experiment/pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip.yaml` |
+| 시작 batch / lr | per-rank `train_batch_size=16`, effective global batch `112`, `lr=6e-4` |
+| validation 주기 | `check_val_every_n_epoch=16` |
+| metadata | `/mnt/nuplan/projects/catk/logs/dataset_metadata/womd_training_memory_balance_a100x7_testas_wo_category_wo_traffic_time.pt` |
+| task name | `flow_control_space_pretrain_a100x7_wo_category_wo_traffic_time_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs16` |
+| tmux session | `catk-control-pretrain-a100x7-wo-category-wo-traffic-time` |
+
+이 실험은 H100 4+2 wo-category baseline과 같은 control-space Flow pretrain 설정을 씁니다.
+단, 하드웨어가 6GPU에서 7GPU로 바뀌고 A100 메모리 여유를 더 두기 위해 per-rank batch는
+`16`으로 둡니다. 이때 effective global batch는 `112`입니다. 실험 차이는 branch의 ablation 로직입니다. 모델은
+`speed_bump / driveway` category를 구분하지 않고, map-agent relation에서 신호등 stale
+time 정보를 직접 받지 않습니다. static traffic-light map token 정보는 기존 branch 설계대로
+유지됩니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- tmux attach -t catk-control-pretrain-a100x7-wo-category-wo-traffic-time
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_a100x7_testas_wo_category_wo_traffic_time_static_pod.py --stop
+```
+
 #### hsb-npc-training/wo-pvc-1 H100x4+H100x2 wo-category ablation pretrain
 
 `semi_control_stable_wo_category` 브랜치에서 `crosswalk / speed_bump / driveway`
