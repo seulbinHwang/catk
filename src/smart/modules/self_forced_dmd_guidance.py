@@ -9,6 +9,7 @@ def build_clean_dmd_direction(
     target_clean_norm: Tensor,
     generated_clean_norm: Tensor,
     normalizer_eps: float = 1.0e-3,
+    dmd_beta: float = 1.0,
 ) -> Tensor:
     """teacher와 generated estimator의 clean path 차이로 DMD 방향을 만듭니다.
 
@@ -20,6 +21,10 @@ def build_clean_dmd_direction(
         generated_clean_norm: generated estimator가 같은 noisy path에서 추정한 clean path입니다.
             shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
         normalizer_eps: agent별 정규화 분모의 최소값입니다.
+        dmd_beta: Self-Forcing entropy knob입니다. ``1.0`` 이면 vanilla DMD,
+            ``< 1.0`` 이면 fake(generated) 항을 키워 entropy/diversity가 늘고,
+            ``> 1.0`` 이면 sharpening (realism↑, mode collapse 위험)입니다.
+            ``0`` 이하면 ``ValueError`` 입니다.
 
     Returns:
         Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
@@ -27,11 +32,18 @@ def build_clean_dmd_direction(
 
     설명:
         이 함수는 raw velocity 차이나 시간/노이즈 계수가 섞인 값을 그대로 쓰지 않습니다.
-        먼저 ``target_clean_norm - generated_clean_norm`` 방향을 만들고, 각 agent의 전체
-        미래 path 기준으로 ``committed_path_norm``과 ``target_clean_norm`` 사이의 평균
-        거리로 나눕니다. 이렇게 하면 teacher가 보는 방향은 유지하면서도 특정 tau 구간에서
-        target path가 과하게 커지는 문제를 줄일 수 있습니다.
+        ``target_clean_norm - (1/dmd_beta)*generated_clean_norm`` 방향을 만들고, 각
+        agent의 전체 미래 path 기준으로 ``committed_path_norm``과 ``target_clean_norm``
+        사이의 평균 거리로 나눕니다. 이렇게 하면 teacher가 보는 방향은 유지하면서도 특정
+        tau 구간에서 target path가 과하게 커지는 문제를 줄일 수 있습니다.
+
+        β=1.0이면 기존 ``(R - F)/normalizer`` 와 정확히 같으므로 default behavior가
+        보존됩니다. 이 인자는 reference Self-Forcing ``g = (1/β)·F − R`` 형태의 entropy
+        knob를 우리 path-direction MSE 형식과 부호 맞춰 옮겨 온 것입니다 (call site에서는
+        ``committed + step_size * direction`` 을 generator target으로 씁니다).
     """
+    if not (float(dmd_beta) > 0.0):
+        raise ValueError(f"dmd_beta must be > 0, got {dmd_beta}.")
     expected_shape = tuple(committed_path_norm.shape)
     if tuple(target_clean_norm.shape) != expected_shape:
         raise ValueError(
@@ -53,7 +65,8 @@ def build_clean_dmd_direction(
     target_clean = target_clean_norm.float()
     generated_clean = generated_clean_norm.float()
 
-    clean_dmd_direction = target_clean - generated_clean
+    inv_beta = 1.0 / float(dmd_beta)
+    clean_dmd_direction = target_clean - inv_beta * generated_clean
     reduce_dims = tuple(range(1, committed.dim()))
     agent_distance = (committed - target_clean).abs().mean(
         dim=reduce_dims,

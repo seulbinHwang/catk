@@ -113,6 +113,7 @@ bash scripts/local_val_flow.sh
 3. **수정 완료 후 정합성 검증**: 변경 후에는 짧은 테스트(pytest 일부 + `python -c "from src.smart..."` 등)로 import/실행 오류가 없는지 확인.
 4. **새 branch에서 작업**: 큰 실험/알고리즘 변경은 새 branch로 분리.
 5. **TaskCreate / TaskUpdate로 진행상황 추적**.
+6. **GPU는 2번, 3번만 사용**. 모든 학습/평가/smoke 실행은 `CUDA_VISIBLE_DEVICES=2,3` (single GPU 시 `2` 또는 `3`)를 명시. 다른 GPU는 다른 사용자/작업이 점유 중일 수 있음.
 
 ## 7. 자주 쓰는 검증 명령
 
