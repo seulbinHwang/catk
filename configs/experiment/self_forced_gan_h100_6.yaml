@@ -41,7 +41,7 @@ model:
       ema_weight: 0.99
       ema_start_step: 50
       sampling:
-        sample_steps: 32
+        sample_steps: 16
         sample_method: euler
         noise_scale: 1.0
         backprop_last_k: 16
@@ -49,7 +49,7 @@ model:
           enabled: true
           scope: global_batch
           policy: all
-          min_executed_steps: 24
+          min_executed_steps: 16
 
 paths:
   teacher_gan_cache_root: null

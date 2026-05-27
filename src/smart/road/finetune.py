@@ -66,7 +66,7 @@ def build_road_runtime_config(cfg: DictConfig) -> RoadRuntimeConfig:
         commit_steps=int(road_cfg.get("commit_steps", 5)),
         selection_horizon_steps=int(road_cfg.get("selection_horizon_steps", 20)),
         temperature=float(road_cfg.get("temperature", 0.8)),
-        sample_steps=int(road_cfg.get("sample_steps", 32)),
+        sample_steps=int(road_cfg.get("sample_steps", 16)),
         sample_method=str(road_cfg.get("sample_method", "euler")),
         generation_batch_size=int(road_cfg.get("generation_batch_size", 1)),
         candidate_micro_batch_size=int(road_cfg.get("candidate_micro_batch_size", 4)),

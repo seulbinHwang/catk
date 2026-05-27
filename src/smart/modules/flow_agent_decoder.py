@@ -531,7 +531,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_sample_steps = getattr(
             sampling_scheme,
             "sample_steps",
-            self.flow_ode.solver_steps,
+            16,
         )
         flow_sample_method = getattr(
             sampling_scheme,
@@ -1208,7 +1208,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         if not bool(getattr(random_cfg, "enabled", False)):
             return None, None
 
-        sample_steps = int(getattr(sampling_scheme, "sample_steps", self.flow_ode.solver_steps))
+        sample_steps = int(getattr(sampling_scheme, "sample_steps", 16))
         if sample_steps <= 0:
             raise ValueError(f"sample_steps must be positive, got {sample_steps}.")
         if int(num_scenario) < 0:
@@ -1231,7 +1231,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 f"got {scope!r}."
             )
 
-        min_executed_steps = int(getattr(random_cfg, "min_executed_steps", 24))
+        min_executed_steps = int(getattr(random_cfg, "min_executed_steps", 16))
         if min_executed_steps < 1 or min_executed_steps > sample_steps:
             raise ValueError(
                 "random_terminal_step.min_executed_steps must be in [1, sample_steps], "
@@ -1530,7 +1530,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 flow_sample_steps = int(getattr(
                     sampling_scheme,
                     "sample_steps",
-                    self.flow_ode.solver_steps,
+                    16,
                 ))
                 flow_sample_method = getattr(
                     sampling_scheme,

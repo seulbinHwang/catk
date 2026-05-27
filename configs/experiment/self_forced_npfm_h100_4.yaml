@@ -68,7 +68,7 @@ model:
       ema_weight: 0.99
       ema_start_step: 50
       sampling:
-        sample_steps: 32
+        sample_steps: 16
         sample_method: euler
         noise_scale: 1.0
         # policy=all이면 마지막 K denoising step에만 gradient를 남깁니다.
@@ -79,7 +79,7 @@ model:
           # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
           # all: 항상 sample_steps 전체를 실행하고 sampling.backprop_last_k step만 역전파합니다.
           policy: all
-          min_executed_steps: 24
+          min_executed_steps: 16
 
 ckpt_path: null
 

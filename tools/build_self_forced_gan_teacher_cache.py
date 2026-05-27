@@ -641,7 +641,7 @@ def _sample_teacher_rollout_pose_chunk(
     flow_sample_steps = getattr(
         model.validation_rollout_sampling,
         "sample_steps",
-        agent_encoder.flow_ode.solver_steps,
+        16,
     )
     flow_sample_method = getattr(
         model.validation_rollout_sampling,
