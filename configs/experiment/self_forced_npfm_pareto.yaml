@@ -32,5 +32,14 @@ model:
       use_anchor_flow_matching_loss: false
       # vanilla DMD로 시작 (β annealing은 본 plan 범위 밖).
       dmd_beta: 1.0
+      # smart_flow.py는 아래 키들도 read 하지만 base smart_flow.yaml에는 정의되어 있지
+      # 않습니다. struct mode에서 CLI override가 막히지 않도록 default를 여기서 명시
+      # (값은 smart_flow.py 기본값과 동일 → behavior-preserving).
+      clean_dmd_normalizer_eps: 1.0e-3
+      clean_dmd_tau_low: 0.02
+      clean_dmd_tau_high: 0.98
+      sampling:
+        # policy=all 일 때만 의미. 마지막 K step에만 gradient 흐르도록 제한.
+        backprop_last_k: 8
     # Pareto 추적용: pretrained baseline CPD 값을 넣으면 DPR(보존율)이 자동 로그됩니다.
     wosac_cpd_reference: null
