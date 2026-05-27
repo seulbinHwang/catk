@@ -165,7 +165,7 @@ LR_TOTAL_STEPS="${LR_TOTAL_STEPS:-${MAX_EPOCHS}}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-1.0}"   # 1.0 = decay 없음 (self-forced 외 분기에서 의미)
 
 # Validation rollout 비용 제어
-N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-32}"
+N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-16}"
 N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-10}"
 SCORER_SCENE_NUM="${SCORER_SCENE_NUM:-1680}"
 SIM_AGENTS_METRIC_WORKERS="${SIM_AGENTS_METRIC_WORKERS:-0}"
@@ -266,12 +266,21 @@ SAMPLING_SAMPLE_METHOD="${SAMPLING_SAMPLE_METHOD:-euler}"
 SAMPLING_NOISE_SCALE="${SAMPLING_NOISE_SCALE:-1.0}"
 
 
+# Random Terminal Step (RTS) — 학습 시 어느 denoising step 에 gradient 를 흘릴지 정책.
+# default 는 "fully fine-tune": policy=all + backprop_last_k=sample_steps (=16).
+# 16 step 모두 실행하고 16 step 모두 backward — 메모리 가장 많지만 정직한 학습.
+# 메모리 안 맞으면 SAMPLING_RTS_BACKPROP_LAST_K=8 로 줄이거나,
+# SAMPLING_RTS_POLICY=paper_uniform 으로 Self-Forcing 논문 방식 (매 batch K 균등 샘플) 전환.
+SAMPLING_RTS_ENABLED="${SAMPLING_RTS_ENABLED:-true}"
+SAMPLING_RTS_SCOPE="${SAMPLING_RTS_SCOPE:-global_batch}"   # global_batch | per_scenario
 # Policy:
-#   - paper_uniform : 실행 denoising step K 를 min_executed_steps..sample_steps 범위에서 균등.
-#   - all           : 항상 sample_steps 전체 실행, gradient 는 마지막 backprop_last_k 개에만.
-SAMPLING_RTS_POLICY="${SAMPLING_RTS_POLICY:-paper_uniform}"
-SAMPLING_RTS_MIN_EXECUTED_STEPS="${SAMPLING_RTS_MIN_EXECUTED_STEPS:-16}"
-SAMPLING_RTS_BACKPROP_LAST_K="${SAMPLING_RTS_BACKPROP_LAST_K:-8}"  # policy=all 일 때만
+#   - all           : 항상 sample_steps 전체 실행, gradient 는 마지막 backprop_last_k step.
+#   - paper_uniform : 실행 step K 를 min_executed_steps..sample_steps 에서 균등 샘플.
+SAMPLING_RTS_POLICY="${SAMPLING_RTS_POLICY:-all}"
+# paper_uniform 일 때만 의미. policy=all 이면 dead.
+SAMPLING_RTS_MIN_EXECUTED_STEPS="${SAMPLING_RTS_MIN_EXECUTED_STEPS:-${SAMPLING_SAMPLE_STEPS}}"
+# policy=all 일 때 마지막 K step 에만 gradient. sample_steps 와 동일하면 전체 backward.
+SAMPLING_RTS_BACKPROP_LAST_K="${SAMPLING_RTS_BACKPROP_LAST_K:-${SAMPLING_SAMPLE_STEPS}}"
 
 # ────────────────────────────────────────────────────────────────────────
 # 6.5. Validation rollout sampling — main 학습 시 val closed-loop와 동기화 ★

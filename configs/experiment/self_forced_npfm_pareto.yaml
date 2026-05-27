@@ -63,8 +63,14 @@ model:
       clean_dmd_tau_low: 0.02
       clean_dmd_tau_high: 0.98
       sampling:
-        # policy=all 일 때만 의미. 마지막 K step에만 gradient 흐르도록 제한.
-        backprop_last_k: 8
+        # Fully fine-tune default: 16 step 전체 실행 + 16 step 전체 backward.
+        # 메모리 안 맞으면 backprop_last_k 를 8 등으로 줄이거나
+        # random_terminal_step.policy=paper_uniform 으로 전환.
+        backprop_last_k: 16
+        random_terminal_step:
+          policy: all
+          # paper_uniform 으로 전환할 때만 의미.  policy=all 에선 dead.
+          min_executed_steps: 16
     # Pareto 추적용: pretrained baseline CPD 값을 넣으면 DPR(보존율)이 자동 로그됩니다.
     wosac_cpd_reference: null
 
