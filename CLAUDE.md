@@ -106,6 +106,31 @@ bash scripts/local_val_flow.sh
 - `road_finetune`: RoaD 알고리즘 사용 (`src/smart/road/`).
 - `validate`/`test`: trainer.validate/test 호출.
 
+**Pretrained checkpoint** (모든 fine-tuning 시 `ckpt_path=`로 지정):
+
+```
+logs/pretrained/pretrained.ckpt
+```
+
+**Training 세팅(최종 resolved config) 확인 방법** — Hydra가 여러 yaml을 합쳐 만든 cfg를 보고 싶을 때:
+
+1. **Repo 안 yaml 직접 보기** (소스 단계의 default):
+   - `configs/run.yaml` — 최상위 + 어떤 experiment / model / data / trainer / callbacks / logger / paths / hydra 를 가져올지
+   - `configs/experiment/<name>.yaml` — 현재 실험이 override하는 핵심 key (★ 가장 먼저 볼 곳)
+   - `configs/model/smart_flow.yaml` — 모델 + `model_config.*` (flow window, decoder, self_forced 등)
+   - `configs/data/waymo.yaml` — datamodule, batch size, num_workers
+   - `configs/trainer/{default,ddp}.yaml` — precision, devices, max_epochs, grad clip
+   - `configs/callbacks/default.yaml` (+ `model_checkpoint.yaml` 등) — monitor key/mode, top-k
+   - `configs/logger/wandb.yaml` — entity/project/offline
+   - `configs/paths/default.yaml`, `configs/hydra/default.yaml` — output dir 규칙, log dir
+2. **실행 시 콘솔에 출력되는 config tree** — `src/run.py:main`이 시작 시 `print_config_tree`로 resolved cfg 트리를 색깔 입혀 출력 (이 출력이 가장 빠른 확인 방법).
+3. **실행 후 output dir 파일** — `logs/<task_name>/runs/<YYYY-MM-DD>_<HH-MM-SS>/` 아래에 자동 저장됨:
+   - `config_tree.log` — 콘솔과 같은 resolved cfg 트리 텍스트
+   - `.hydra/config.yaml` — 최종 합쳐진 cfg (yaml 그대로)
+   - `.hydra/overrides.yaml` — CLI에서 override한 항목
+   - `.hydra/hydra.yaml` — Hydra 자체 메타
+4. **CLI에서 미리보기 (실행 없이)** — `python -m src.run experiment=<name> -c job` 또는 `-c hydra` 등 `-c` 플래그로 부분 cfg만 출력.
+
 ## 6. 작업 시 룰 (사용자 지정)
 
 1. **한국어로 답변할 것.** 코드/명령어를 제외한 텍스트는 항상 한글.
