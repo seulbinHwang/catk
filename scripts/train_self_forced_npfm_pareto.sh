@@ -98,8 +98,9 @@ ACTION="${ACTION:-finetune}"
 SEED="${SEED:-817}"
 
 # WOMD cache root (configs/paths/default.yaml 의 cache_root override).
-# 이 repo default 는 /scratch/cache/SMART; 실험 머신마다 override 권장.
-CACHE_ROOT="${CACHE_ROOT:-/scratch/cache/SMART}"
+# OCSC_clean 학습이 쓰던 경로를 default 로 사용.  cache root 안에는
+# training/ validation/ testing/ validation_tfrecords_splitted/ 가 있어야 함.
+CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
 
 # Pretrained backbone checkpoint — fine-tune entry point.
 # 기본값은 이 repo 안의 logs/pretrained/pretrained.ckpt (CLAUDE.md §5 참조).
