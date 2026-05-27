@@ -1,0 +1,36 @@
+# @package _global_
+
+# Pareto(RMM × CPD) fine-tuning preset.
+# 기존 self_forced_npfm을 그대로 상속하면서, 이 작업의 baseline knob 만 명시합니다:
+#   - generator distribution matching = DMD (entropy knob dmd_beta=1.0 = vanilla)
+#   - open-loop FM regularizer (anchor FM loss) = OFF
+#   - WOSAC CPD 정규화 scale은 smart_flow.yaml 기본 (training cache offline 값) 유지
+#   - DPR(보존율) tracking을 위해 baseline CPD를 model_config.wosac_cpd_reference 에 넣을
+#     수 있도록 슬롯만 남겨둠 (값은 sweep 시 override).
+#
+# 사용 예 (smoke; GPU 2 또는 3 사용):
+#   CUDA_VISIBLE_DEVICES=3 conda run -n catk torchrun -m src.run \
+#     experiment=self_forced_npfm_pareto action=finetune \
+#     ckpt_path=<pretrain.ckpt> task_name=pareto_dmd_smoke \
+#     trainer.devices=1 trainer.num_nodes=1 \
+#     trainer.max_epochs=1 trainer.limit_train_batches=2 trainer.limit_val_batches=2
+#
+# Sweep 시 자주 바꾸는 knob:
+#   - model.model_config.self_forced.dmd_beta ∈ {0.5, 0.75, 1.0, 1.25, 1.5}
+#   - model.model_config.self_forced.distribution_matching_objective ∈ {dmd, sid}
+#   - model.model_config.self_forced.sampling.noise_scale ∈ {1.0, 1.2, 1.5}
+#   - model.model_config.self_forced.sampling.random_terminal_step.policy ∈ {paper_uniform, all}
+
+defaults:
+  - self_forced_npfm
+  - _self_
+
+model:
+  model_config:
+    self_forced:
+      distribution_matching_objective: dmd
+      use_anchor_flow_matching_loss: false
+      # vanilla DMD로 시작 (β annealing은 본 plan 범위 밖).
+      dmd_beta: 1.0
+    # Pareto 추적용: pretrained baseline CPD 값을 넣으면 DPR(보존율)이 자동 로그됩니다.
+    wosac_cpd_reference: null
