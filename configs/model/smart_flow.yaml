@@ -60,7 +60,7 @@ model_config:
     # control-space 학습에서 GT -> control -> pose 복원 위치 오차가 이 값보다 큰 anchor는 학습에서 제외합니다.
     control_round_trip_max_position_error_m: 0.5
   validation_rollout_sampling:
-    sample_steps: 32
+    sample_steps: 16
     sample_method: euler
     noise_scale: 1.0
   self_forced:
@@ -88,7 +88,7 @@ model_config:
     # applies clip_gradients() itself.
     gradient_clip_val: 1.0
     sampling:
-      sample_steps: 32
+      sample_steps: 16
       sample_method: euler
       noise_scale: 1.0
       random_terminal_step:
@@ -96,7 +96,7 @@ model_config:
         scope: global_batch
         # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
         policy: paper_uniform
-        min_executed_steps: 24
+        min_executed_steps: 16
   decoder:
     hidden_dim: 128
     num_freq_bands: 64

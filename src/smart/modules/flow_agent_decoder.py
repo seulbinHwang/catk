@@ -1281,7 +1281,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 f"got {scope!r}."
             )
 
-        min_executed_steps = int(getattr(random_cfg, "min_executed_steps", 24))
+        min_executed_steps = int(getattr(random_cfg, "min_executed_steps", 16))
         if min_executed_steps < 1 or min_executed_steps > sample_steps:
             raise ValueError(
                 "random_terminal_step.min_executed_steps must be in [1, sample_steps], "
