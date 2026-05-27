@@ -690,6 +690,66 @@ kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretra
 python scripts/launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py --stop
 ```
 
+#### hsb-npc-training/wo-pvc-2 H100x4+H100x2 wo-category ablation pretrain
+
+`semi_control_stable_wo_category` 브랜치에서 기존 `semi_control_stable`
+H100 4+2 실험
+`flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20`
+과 같은 학습 recipe를 쓰되, `crosswalk / speed_bump / driveway` category 세분화만 끈
+ablation을 돌릴 때는 아래 wrapper를 씁니다. 시작 batch는 메모리 여유를 위해 per-rank
+`18`로 둡니다. pod를 새로 만들거나 재시작하지 않고, 기존 `hsb-npc-training` 4 H100 +
+`wo-pvc-2` 2 H100 pod 안에 tmux session만 만듭니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_hsb_wo2_wo_category_static_pods.py --replace
+```
+
+실행 전에는 dry-run으로 pod, branch, task name, metadata path를 확인합니다.
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_hsb_wo2_wo_category_static_pods.py \
+  --dry-run \
+  --replace
+```
+
+기본 설정:
+
+| 항목 | 설정 |
+|---|---|
+| branch | `semi_control_stable_wo_category` |
+| pod / GPU | `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 = 총 6 rank |
+| cache root | 두 pod 모두 `/workspace/womd_v1_3/SMART_cache` |
+| category ablation | cache 생성 시에도, 모델 입력 시에도 `speed_bump`, `driveway`를 `crosswalk` 계열로 합침 |
+| map vocab | point type `10`개, polygon type `4`개 |
+| experiment config | `configs/experiment/pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip.yaml` |
+| 시작 batch / lr | per-rank `train_batch_size=18`, effective global batch `108`, `lr=6e-4` |
+| OOM fallback | `18 -> 17 -> 16 -> ... -> 12`, 최신 checkpoint 기준 자동 resume |
+| metadata | `/mnt/nuplan/projects/catk/logs/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc2_wo_category.pt` |
+| task name | `flow_control_space_pretrain_h100x4_h100x2_wo_category_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs18` |
+| tmux session | `catk-control-pretrain-h100x4-h100x2-wo-category` |
+
+이 launcher는 baseline H100 4+2 launcher와 같은 config 파일을 사용합니다. 따라서
+tail-prefix supervision, prefix-valid future loss mask, default no-slip ratio,
+round-trip `0.5m` filter, `check_val_every_n_epoch=16`, heterogeneous rank 배정,
+memory-balanced sampler 동작은 기존 `semi_control_stable` H100 4+2 pretrain과 같습니다.
+차이는 branch가 `semi_control_stable_wo_category`이고, map category folding으로 모델이
+`speed_bump`와 `driveway`를 `crosswalk`와 구분하지 못한다는 점입니다. 최신 cache에
+`point type 10/11` 또는 `polygon type 4/5`가 들어 있어도 embedding 직전에 각각 `9`와
+`3`으로 접히므로, 최신 cache를 그대로 써도 wo-category ablation 의도가 유지됩니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-wo-category
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-control-pretrain-h100x4-h100x2-wo-category
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_pre_bc_flow_control_h100x4_h100x2_hsb_wo2_wo_category_static_pods.py --stop
+```
+
 #### hsb-npc-training/wo-pvc-1 H100x4+H100x2 wo-category ablation pretrain
 
 `semi_control_stable_wo_category` 브랜치에서 `crosswalk / speed_bump / driveway`
