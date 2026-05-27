@@ -3,8 +3,9 @@
 # SMART NTP pretrain preset for two A100/H100 x4 nodes.
 #
 # This config intentionally keeps the SMART model, deterministic nearest-token
-# tokenization, loss, and rollout sampling logic from `pre_bc`. Only the
-# training/runtime recipe is aligned with
+# tokenization, and loss from `pre_bc`. The fit-time closed-loop validation
+# sampling is aligned with WOSAC submission by using top-48 candidates. The
+# remaining training/runtime recipe is aligned with
 # the x4x2 flow-control pretrain recipe used on semi_control_stable:
 #   * 2 nodes
 #   * 4 A100/H100 GPUs per node
@@ -27,6 +28,10 @@ model:
     n_vis_batch: 0
     n_vis_scenario: 0
     n_vis_rollout: 0
+    validation_rollout_sampling:
+      criterium: topk_prob
+      num_k: 48
+      temp: 1.0
 
 trainer:
   devices: 4

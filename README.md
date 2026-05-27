@@ -261,7 +261,8 @@ python scripts/launch_smart_ntp_h100x4_h100x2.py \
 기본 experiment는 `configs/experiment/pre_bc_a100x4x2.yaml`이다. 이 config는
 `pre_bc`를 상속하므로 SMART backbone, next-token prediction loss,
 deterministic nearest-token tokenization, agent selection, `num_freq_bands: 88`
-같은 모델/알고리즘 설정은 바꾸지 않는다. 대신
+같은 모델/알고리즘 설정은 유지한다. 단, 학습 중 closed-loop validation은 WOSAC
+submission과 같은 후보 폭을 쓰도록 `validation_rollout_sampling.num_k: 48`을 명시한다. 그 외에는
 `semi_control_stable`의 x4x2 control-space pretrain recipe와 학습 실행 조건을 맞추기
 위해 아래 training/runtime 값만 명시한다.
 
@@ -269,6 +270,7 @@ deterministic nearest-token tokenization, agent selection, `num_freq_bands: 88`
 - `data.train_batch_size: 16`, 즉 8개 rank 기준 effective global batch 128
 - `model.model_config.lr: 6e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
 - `model.model_config.scorer_scene_num: 1680`
+- `model.model_config.validation_rollout_sampling.num_k: 48`
 - `trainer.max_epochs: 64`, `check_val_every_n_epoch: 16`
 - `trainer.precision: bf16-mixed`, `gradient_clip_val: 1.0`,
   `accumulate_grad_batches: 1`
@@ -357,7 +359,8 @@ compile toggle은 제공하지 않는다.
 RMM checkpoint 선택용 fast scorer는 `model.model_config.scorer_scene_num=1680`을 기준으로
 validation batch 수를 자동 계산한다. A100x4x2 기본 `val_batch_size=12`, world size 8에서는
 rank당 18 batch, 전체 약 1680개 scenario가 RMM 계산에 들어간다. 64 epoch 학습에서는
-validation이 16 epoch마다 실행되어 총 4번의 checkpoint 후보를 만든다.
+validation이 16 epoch마다 실행되어 총 4번의 checkpoint 후보를 만든다. 이 fit-time
+closed-loop validation의 rollout 후보 폭은 `validation_rollout_sampling.num_k=48`이다.
 
 기본 cache root는 pod별로 다르다.
 
