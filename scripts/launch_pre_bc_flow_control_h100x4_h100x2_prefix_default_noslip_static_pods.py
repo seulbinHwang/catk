@@ -32,7 +32,7 @@ DEFAULT_TASK_NAME = (
 )
 DEFAULT_SESSION = "catk-control-pretrain-h100x4-h100x2-prefix-default-noslip"
 DEFAULT_METADATA_CACHE = (
-    "dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc2.pt"
+    "dataset_metadata/womd_training_validation_memory_balance_h100x6_hsb_wo_pvc2.pt"
 )
 DEFAULT_EXTRA_HYDRA_OVERRIDES = (
     "trainer.strategy._target_="
@@ -79,7 +79,7 @@ def run_stop(args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Launch semi_control_stable H100x4 + H100x2 prefix-valid default "
+            "Launch semi_control_stable_w_val H100x4 + H100x2 prefix-valid default "
             "no-slip control-space pretrain."
         )
     )
@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("PODS", " ".join(DEFAULT_PODS)).split(),
     )
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", "/mnt/nuplan/projects/catk"))
-    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable")
+    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable_w_val")
     parser.add_argument(
         "--git-ref",
         default=os.environ.get("CATK_GIT_REF", ""),
@@ -135,10 +135,18 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Remote metadata cache path. Defaults to "
-            "REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_h100x6_hsb_wo_pvc2.pt."
+            "REMOTE_LOG_DIR/dataset_metadata/womd_training_validation_memory_balance_h100x6_hsb_wo_pvc2.pt."
         ),
     )
     parser.add_argument("--memory-metadata-num-workers", type=int, default=8)
+    parser.add_argument(
+        "--memory-metadata-raw-subdirs",
+        default="training validation",
+        help=(
+            "Space-separated CACHE_ROOT subdirectories used to build train "
+            "memory metadata. This branch defaults to training+validation."
+        ),
+    )
     parser.add_argument("--force-memory-metadata-rebuild", action="store_true")
     parser.add_argument("--replace", action="store_true")
     parser.add_argument("--stop", action="store_true")
@@ -223,6 +231,7 @@ def main() -> int:
                 "MEMORY_BALANCE_METADATA_FORCE_REBUILD": "1"
                 if args.force_memory_metadata_rebuild
                 else "0",
+                "MEMORY_BALANCE_RAW_SUBDIRS": args.memory_metadata_raw_subdirs,
             }
         )
 
@@ -261,6 +270,7 @@ def main() -> int:
                 "MEMORY_BALANCE_METADATA_CACHE",
                 "MEMORY_BALANCE_METADATA_NUM_WORKERS",
                 "MEMORY_BALANCE_METADATA_FORCE_REBUILD",
+                "MEMORY_BALANCE_RAW_SUBDIRS",
             ]
         ):
             if name in env:

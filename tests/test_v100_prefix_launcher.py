@@ -20,7 +20,7 @@ def test_prefix_v100_launcher_dry_run_enables_metadata_preflight() -> None:
 
     assert "--memory-metadata-preflight" in result.stdout
     assert "--memory-metadata-cache-path" in result.stdout
-    assert "dataset_metadata/womd_training_memory_balance_v1.pt" in result.stdout
+    assert "dataset_metadata/womd_training_validation_memory_balance_v1.pt" in result.stdout
     assert "--max-same-bs-oom-retries 3" in result.stdout
 
 
@@ -44,7 +44,7 @@ def test_latest_prefix_v100_launcher_uses_distinct_task_name() -> None:
     )
 
     assert "launch_pre_bc_flow_control_v100x47_prefix_default_noslip_static_pods.py" in result.stdout
-    assert "--branch semi_control_stable" in result.stdout
+    assert "--branch semi_control_stable_w_val" in result.stdout
     assert (
         "flow_control_space_pretrain_v100x47_prefix_default_noslip_tailprefix_"
         "roundtrip05_lr6e-4_bs4_stable_latest"
@@ -91,11 +91,12 @@ def test_h100x4_h100x2_launcher_dry_run_uses_workspace_cache_and_bs17() -> None:
     assert "PODS='hsb-npc-training wo-pvc-2'" in result.stdout
     assert "NPROC_PER_NODE=gpu" in result.stdout
     assert "MANUAL_RANK_OFFSETS=1" in result.stdout
-    assert "INITIAL_BS=17" in result.stdout
+    assert "INITIAL_BS=20" in result.stdout
     assert "OOM_STEP=1" in result.stdout
     assert "hsb-npc-training=/workspace/womd_v1_3/SMART_cache" in result.stdout
     assert "wo-pvc-2=/workspace/womd_v1_3/SMART_cache" in result.stdout
-    assert "womd_training_memory_balance_h100x6_hsb_wo_pvc2.pt" in result.stdout
+    assert "womd_training_validation_memory_balance_h100x6_hsb_wo_pvc2.pt" in result.stdout
+    assert "MEMORY_BALANCE_RAW_SUBDIRS='training validation'" in result.stdout
     assert "pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip" in result.stdout
 
 
@@ -121,4 +122,4 @@ def test_h100x4_h100x2_hsb2_wrapper_targets_wo_pvc1() -> None:
     assert "--pods hsb-npc-training-2 wo-pvc-1" in result.stdout
     assert "flow_control_space_pretrain_h100x4_h100x2_hsb2_wo1_prefix_default_noslip_lr6e-4_bs18" in result.stdout
     assert "catk-control-pretrain-h100x4-h100x2-hsb2-wo1-prefix-default-noslip" in result.stdout
-    assert "womd_training_memory_balance_h100x6_hsb2_wo1.pt" in result.stdout
+    assert "womd_training_validation_memory_balance_h100x6_hsb2_wo1.pt" in result.stdout

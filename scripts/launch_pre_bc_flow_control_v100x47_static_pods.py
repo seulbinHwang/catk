@@ -102,7 +102,7 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("PODS", " ".join(DEFAULT_PODS)).split(),
     )
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", "/mnt/nuplan/projects/catk"))
-    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable")
+    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable_w_val")
     parser.add_argument(
         "--git-ref",
         default=os.environ.get("CATK_GIT_REF", ""),
@@ -173,10 +173,18 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Remote metadata cache path used by data.train_memory_balance_metadata_cache. "
-            "Defaults to REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt."
+            "Defaults to REMOTE_LOG_DIR/dataset_metadata/womd_training_validation_memory_balance_v1.pt."
         ),
     )
     parser.add_argument("--memory-metadata-num-workers", type=int, default=8)
+    parser.add_argument(
+        "--memory-metadata-raw-subdirs",
+        default="training validation",
+        help=(
+            "Space-separated CACHE_ROOT subdirectories used for train memory "
+            "metadata preflight. This branch defaults to training+validation."
+        ),
+    )
     parser.add_argument(
         "--memory-metadata-force-rebuild",
         action="store_true",
@@ -301,11 +309,12 @@ def main() -> int:
             {
                 "MEMORY_BALANCE_PREFLIGHT": "1",
                 "MEMORY_BALANCE_METADATA_CACHE": args.memory_metadata_cache_path
-                or f"{args.remote_log_dir.rstrip('/')}/dataset_metadata/womd_training_memory_balance_v1.pt",
+                or f"{args.remote_log_dir.rstrip('/')}/dataset_metadata/womd_training_validation_memory_balance_v1.pt",
                 "MEMORY_BALANCE_METADATA_NUM_WORKERS": str(args.memory_metadata_num_workers),
                 "MEMORY_BALANCE_METADATA_FORCE_REBUILD": "1"
                 if args.memory_metadata_force_rebuild
                 else "0",
+                "MEMORY_BALANCE_RAW_SUBDIRS": args.memory_metadata_raw_subdirs,
             }
         )
 
@@ -344,6 +353,7 @@ def main() -> int:
                 "MEMORY_BALANCE_METADATA_CACHE",
                 "MEMORY_BALANCE_METADATA_NUM_WORKERS",
                 "MEMORY_BALANCE_METADATA_FORCE_REBUILD",
+                "MEMORY_BALANCE_RAW_SUBDIRS",
             ]
         ):
             if name in env:

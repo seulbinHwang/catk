@@ -67,6 +67,7 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        train_raw_dirs: Optional[list[str]] = None,
         train_use_eval_agent_selection: bool = False,
         train_epoch_sample_fraction: float = 1.0,
         train_memory_balanced_batches: bool = False,
@@ -112,6 +113,7 @@ class MultiDataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
         self.train_raw_dir = train_raw_dir
+        self.train_raw_dirs = list(train_raw_dirs) if train_raw_dirs else None
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
@@ -123,7 +125,9 @@ class MultiDataModule(LightningDataModule):
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
 
-    def refresh_train_dataset(self, train_raw_dir: Optional[str] = None) -> None:
+    def refresh_train_dataset(
+        self, train_raw_dir: Optional[str | list[str]] = None
+    ) -> None:
         """학습용 cache 폴더를 바꾼 뒤 train dataset을 다시 만듭니다.
 
         Args:
@@ -134,8 +138,15 @@ class MultiDataModule(LightningDataModule):
             None
         """
         if train_raw_dir is not None:
-            self.train_raw_dir = str(train_raw_dir)
-        self.train_dataset = MultiDataset(self.train_raw_dir, self.train_transform)
+            if isinstance(train_raw_dir, list):
+                self.train_raw_dirs = [str(path) for path in train_raw_dir]
+                self.train_raw_dir = self.train_raw_dirs[0]
+            else:
+                self.train_raw_dir = str(train_raw_dir)
+                self.train_raw_dirs = None
+
+        raw_dirs = self.train_raw_dirs if self.train_raw_dirs else self.train_raw_dir
+        self.train_dataset = MultiDataset(raw_dirs, self.train_transform)
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:

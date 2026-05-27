@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("PODS", " ".join(DEFAULT_PODS)).split(),
     )
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", "/mnt/nuplan/projects/catk"))
-    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable")
+    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable_w_val")
     parser.add_argument(
         "--git-ref",
         default=os.environ.get("CATK_GIT_REF", ""),
@@ -148,7 +148,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help=(
             "Remote metadata cache path. Defaults to "
-            "REMOTE_LOG_DIR/dataset_metadata/womd_training_memory_balance_v1.pt."
+            "REMOTE_LOG_DIR/dataset_metadata/womd_training_validation_memory_balance_v1.pt."
         ),
     )
     parser.add_argument("--memory-metadata-num-workers", type=int, default=8)
@@ -236,7 +236,7 @@ def main() -> int:
     if not args.skip_memory_metadata_preflight and not args.stop:
         metadata_cache_path = args.memory_metadata_cache_path or (
             f"{args.remote_log_dir.rstrip('/')}/dataset_metadata/"
-            "womd_training_memory_balance_v1.pt"
+            "womd_training_validation_memory_balance_v1.pt"
         )
         command.extend(
             [

@@ -207,6 +207,46 @@ def test_prebuild_force_removes_stale_lock_dir(tmp_path: Path) -> None:
     assert not lock_path.exists()
 
 
+def test_prebuild_accepts_multiple_raw_dirs(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    train_dir = tmp_path / "training"
+    val_dir = tmp_path / "validation"
+    train_dir.mkdir()
+    val_dir.mkdir()
+    _write_sample(train_dir / "train.pkl", agent_count=2, current_valid=1, map_count=3)
+    _write_sample(val_dir / "val.pkl", agent_count=4, current_valid=2, map_count=5)
+
+    cache_path = tmp_path / "metadata.pt"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "tools" / "build_memory_balance_metadata.py"),
+            "--raw-dir",
+            str(train_dir),
+            "--raw-dir",
+            str(val_dir),
+            "--cache-path",
+            str(cache_path),
+            "--num-workers",
+            "1",
+        ],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "samples=2" in result.stdout
+    assert "raw_dirs=2" in result.stdout
+    loaded = load_or_build_memory_metadata(
+        [str(train_dir / "train.pkl"), str(val_dir / "val.pkl")],
+        cache_path=str(cache_path),
+        num_workers=1,
+        build_on_missing=False,
+    )
+    assert loaded.agent_count.tolist() == [2, 4]
+
+
 def test_metadata_cache_reclaims_stale_lock_dir(tmp_path: Path) -> None:
     raw_dir = tmp_path / "raw"
     raw_dir.mkdir()

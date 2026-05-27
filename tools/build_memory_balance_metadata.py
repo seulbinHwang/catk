@@ -32,8 +32,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--raw-dir",
+        action="append",
         required=True,
-        help="Directory containing train SMART cache pkl files, e.g. $CACHE_ROOT/training.",
+        help=(
+            "Directory containing SMART cache pkl files. Repeat this option to "
+            "build one metadata cache over multiple train source directories."
+        ),
     )
     parser.add_argument(
         "--cache-path",
@@ -55,15 +59,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    raw_dir = Path(args.raw_dir).expanduser()
+    raw_dirs = [Path(raw_dir).expanduser() for raw_dir in args.raw_dir]
     cache_path = Path(args.cache_path).expanduser()
-    if not raw_dir.is_dir():
-        raise NotADirectoryError(f"raw dir does not exist: {raw_dir}")
-    raw_paths = sorted(
-        str(path) for path in raw_dir.glob(args.pattern) if is_cache_sample_path(path)
-    )
+    for raw_dir in raw_dirs:
+        if not raw_dir.is_dir():
+            raise NotADirectoryError(f"raw dir does not exist: {raw_dir}")
+    raw_paths = []
+    for raw_dir in raw_dirs:
+        raw_paths.extend(
+            str(path)
+            for path in sorted(raw_dir.glob(args.pattern))
+            if is_cache_sample_path(path)
+        )
     if not raw_paths:
-        raise FileNotFoundError(f"no files matched {args.pattern!r} under {raw_dir}")
+        raise FileNotFoundError(
+            f"no files matched {args.pattern!r} under {raw_dirs}"
+        )
 
     if args.force:
         lock_path = memory_metadata_lock_path(cache_path)
@@ -85,7 +96,8 @@ def main() -> int:
     elapsed_sec = time.perf_counter() - start_time
     print(
         "memory-balance metadata ready: "
-        f"samples={len(metadata)} cache={cache_path} elapsed_sec={elapsed_sec:.2f}"
+        f"samples={len(metadata)} raw_dirs={len(raw_dirs)} "
+        f"cache={cache_path} elapsed_sec={elapsed_sec:.2f}"
     )
     return 0
 

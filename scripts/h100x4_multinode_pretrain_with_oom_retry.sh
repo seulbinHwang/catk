@@ -129,29 +129,37 @@ ${git_cmd}
 prebuild_memory_balance_metadata_for_pod() {
   local pod="$1"
   local cache_root metadata_cache raw_dir force_arg metadata_cache_q raw_dir_q project_root_q workers_q remote_python_q
+  local raw_dir_args="" raw_dir_tests="" raw_dir_log="" raw_subdir
+  local -a raw_subdirs
   cache_root="$(cache_root_for_pod "$pod")"
   metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
-  raw_dir="${cache_root%/}/training"
+  read -r -a raw_subdirs <<< "${MEMORY_BALANCE_RAW_SUBDIRS:-training}"
+  for raw_subdir in "${raw_subdirs[@]}"; do
+    raw_dir="${cache_root%/}/${raw_subdir#/}"
+    raw_dir_q="$(remote_quote "$raw_dir")"
+    raw_dir_args+=" --raw-dir ${raw_dir_q}"
+    raw_dir_tests+="test -d ${raw_dir_q}; "
+    raw_dir_log+="${raw_dir_log:+,}${raw_dir}"
+  done
   force_arg=""
   if [[ "$MEMORY_BALANCE_METADATA_FORCE_REBUILD" == "1" ]]; then
     force_arg="--force"
   fi
 
   metadata_cache_q="$(remote_quote "$metadata_cache")"
-  raw_dir_q="$(remote_quote "$raw_dir")"
   project_root_q="$(remote_quote "$PROJECT_ROOT")"
   workers_q="$(remote_quote "$MEMORY_BALANCE_METADATA_NUM_WORKERS")"
   remote_python_q="$(remote_quote "$CATK_REMOTE_PYTHON")"
 
-  log "prebuilding memory-balance metadata on ${pod}: raw_dir=${raw_dir} cache=${metadata_cache}"
+  log "prebuilding memory-balance metadata on ${pod}: raw_dirs=${raw_dir_log} cache=${metadata_cache}"
   sync_project_for_pod "$pod"
   kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
 set -euo pipefail
 cd ${project_root_q}
 mkdir -p \"\$(dirname ${metadata_cache_q})\"
-test -d ${raw_dir_q}
+${raw_dir_tests}
 ${remote_python_q} tools/build_memory_balance_metadata.py \
-  --raw-dir ${raw_dir_q} \
+  ${raw_dir_args} \
   --cache-path ${metadata_cache_q} \
   --num-workers ${workers_q} \
   ${force_arg}
@@ -187,23 +195,31 @@ mv ${tmp_cache_q} ${metadata_cache_q}
 validate_memory_balance_metadata_on_pod() {
   local pod="$1"
   local cache_root metadata_cache raw_dir metadata_cache_q raw_dir_q project_root_q workers_q remote_python_q
+  local raw_dir_args="" raw_dir_tests="" raw_dir_log="" raw_subdir
+  local -a raw_subdirs
   cache_root="$(cache_root_for_pod "$pod")"
   metadata_cache="${MEMORY_BALANCE_METADATA_CACHE:-${REMOTE_LOG_DIR%/}/dataset_metadata/womd_training_memory_balance_v1.pt}"
-  raw_dir="${cache_root%/}/training"
+  read -r -a raw_subdirs <<< "${MEMORY_BALANCE_RAW_SUBDIRS:-training}"
+  for raw_subdir in "${raw_subdirs[@]}"; do
+    raw_dir="${cache_root%/}/${raw_subdir#/}"
+    raw_dir_q="$(remote_quote "$raw_dir")"
+    raw_dir_args+=" --raw-dir ${raw_dir_q}"
+    raw_dir_tests+="test -d ${raw_dir_q}; "
+    raw_dir_log+="${raw_dir_log:+,}${raw_dir}"
+  done
   metadata_cache_q="$(remote_quote "$metadata_cache")"
-  raw_dir_q="$(remote_quote "$raw_dir")"
   project_root_q="$(remote_quote "$PROJECT_ROOT")"
   workers_q="$(remote_quote "$MEMORY_BALANCE_METADATA_NUM_WORKERS")"
   remote_python_q="$(remote_quote "$CATK_REMOTE_PYTHON")"
 
-  log "validating memory-balance metadata on ${pod}: raw_dir=${raw_dir} cache=${metadata_cache}"
+  log "validating memory-balance metadata on ${pod}: raw_dirs=${raw_dir_log} cache=${metadata_cache}"
   sync_project_for_pod "$pod"
   kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
 set -euo pipefail
 cd ${project_root_q}
-test -d ${raw_dir_q}
+${raw_dir_tests}
 ${remote_python_q} tools/build_memory_balance_metadata.py \
-  --raw-dir ${raw_dir_q} \
+  ${raw_dir_args} \
   --cache-path ${metadata_cache_q} \
   --num-workers ${workers_q}
 "

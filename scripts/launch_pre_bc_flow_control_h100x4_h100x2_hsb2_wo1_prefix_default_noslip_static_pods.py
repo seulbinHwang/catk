@@ -3,7 +3,7 @@
 
 This is a thin preset wrapper around
 ``launch_pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip_static_pods.py``.
-It keeps the same semi_control_stable experiment/config, but targets the
+It keeps the same semi_control_stable_w_val experiment/config, but targets the
 hsb-npc-training-2 and wo-pvc-1 static pods and starts OOM retry from
 ``train_batch_size=18`` with one-batch decrements.
 """
@@ -40,7 +40,7 @@ DEFAULT_ARGS = [
     "--pod-cache-root",
     "wo-pvc-1=/workspace/womd_v1_3/SMART_cache",
     "--memory-metadata-cache-path",
-    "/mnt/nuplan/projects/catk/logs/dataset_metadata/womd_training_memory_balance_h100x6_hsb2_wo1.pt",
+    "/mnt/nuplan/projects/catk/logs/dataset_metadata/womd_training_validation_memory_balance_h100x6_hsb2_wo1.pt",
 ]
 
 

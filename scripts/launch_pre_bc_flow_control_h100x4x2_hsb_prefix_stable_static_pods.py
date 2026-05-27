@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("PODS", " ".join(DEFAULT_PODS)).split(),
     )
     parser.add_argument("--project-root", default=os.environ.get("PROJECT_ROOT", "/mnt/nuplan/projects/catk"))
-    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable")
+    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or "semi_control_stable_w_val")
     parser.add_argument("--remote-log-dir", default=os.environ.get("REMOTE_LOG_DIR", "/mnt/nuplan/projects/catk/logs"))
     parser.add_argument("--experiment", default="pre_bc_flow_control_2x4_h100")
     parser.add_argument(
