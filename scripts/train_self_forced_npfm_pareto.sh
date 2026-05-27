@@ -125,6 +125,15 @@ VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-200}"
 CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-null}"
 # precision: bf16-mixed (default), fp16-mixed, 32-true (재현 디버그용)
 PRECISION="${PRECISION:-bf16-mixed}"
+# DDP strategy.  self-forced 의 estimator backward 에는 일부 generator 파라미터가
+# 잡히지 않는 step 이 있어 Lightning 기본 ddp (find_unused_parameters=False) 가
+# RuntimeError 를 냄.  multi-GPU 면 ddp_find_unused_parameters_true 를 default 로,
+# 1 GPU 면 auto.
+if [ "${NPROC_PER_NODE}" -gt 1 ] || [ "${NUM_NODES}" -gt 1 ]; then
+  TRAINER_STRATEGY="${TRAINER_STRATEGY:-ddp_find_unused_parameters_true}"
+else
+  TRAINER_STRATEGY="${TRAINER_STRATEGY:-auto}"
+fi
 # self-forced 는 manual optimization 이라 Lightning 의 trainer.gradient_clip_val 을 쓰지 않음.
 # 실제 grad clip 은 model.model_config.self_forced.gradient_clip_val (아래 SF_GRAD_CLIP) 이 담당.
 GRADIENT_CLIP_VAL="${GRADIENT_CLIP_VAL:-null}"
@@ -372,7 +381,7 @@ echo "  EXPERIMENT=${MY_EXPERIMENT}  TASK=${MY_TASK_NAME}"
 echo "  CKPT_PATH=${CKPT_PATH}"
 echo "  CACHE_ROOT=${CACHE_ROOT}"
 echo "------------------------------------------------------------"
-echo "  Trainer: max_epochs=${MAX_EPOCHS} precision=${PRECISION}"
+echo "  Trainer: max_epochs=${MAX_EPOCHS} precision=${PRECISION} strategy=${TRAINER_STRATEGY}"
 echo "    limit_train=${LIMIT_TRAIN_BATCHES} limit_val=${LIMIT_VAL_BATCHES}"
 echo "    val_check_interval=${VAL_CHECK_INTERVAL} check_val_every_n=${CHECK_VAL_EVERY_N_EPOCH} seed=${SEED}"
 echo "  Data: train_B=${TRAIN_B} val_B=${VAL_B} workers=${NUM_WORKERS}"
@@ -431,6 +440,7 @@ torchrun \
   trainer.val_check_interval="${VAL_CHECK_INTERVAL}" \
   trainer.check_val_every_n_epoch="${CHECK_VAL_EVERY_N_EPOCH}" \
   trainer.precision="${PRECISION}" \
+  trainer.strategy="${TRAINER_STRATEGY}" \
   trainer.gradient_clip_val="${GRADIENT_CLIP_VAL}" \
   trainer.sync_batchnorm="${SYNC_BATCHNORM}" \
   trainer.num_sanity_val_steps="${NUM_SANITY_VAL_STEPS}" \
