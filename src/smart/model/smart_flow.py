@@ -2377,6 +2377,15 @@ class SMARTFlow(LightningModule):
                         last_loss = self._build_trainable_connected_zero_loss(
                             self.self_forced_generated_estimator,
                         )
+                    # anchor k 의 valid agent 가 critic forward 동안 사라지거나 (anchor_mask
+                    # 가 모두 False) flow_matching_loss 가 empty path 분기로 빠지면
+                    # last_loss 가 grad-free leaf 가 된다.  backward 직전에 grad 가 있는지
+                    # 확인하고, 없으면 critic param 에 연결된 trainable zero loss 로 fallback
+                    # (DDP 동기화를 위해 모든 rank 가 동일한 backward graph 를 가져야 함).
+                    if not last_loss.requires_grad:
+                        last_loss = self._build_trainable_connected_zero_loss(
+                            self.self_forced_generated_estimator,
+                        )
                     self._manual_backward_without_autocast(last_loss)
                     self._assert_self_forced_estimator_update_isolated()
                     self._clip_and_step_with_optional_scaler(
@@ -2879,6 +2888,11 @@ class SMARTFlow(LightningModule):
                             f"{self._summarize_nonfinite_tensor(total_loss_i)}"
                             f"{context}"
                         )
+                    # anchor k 의 forward 가 empty path 분기로 빠지면 sf_loss_i 가 grad-free
+                    # leaf 가 되어 backward 시 "no grad_fn" RuntimeError 가 난다.
+                    # DDP 동기화 위해 항상 generator param 에 연결된 trainable zero loss 로 fallback.
+                    if not total_loss_i.requires_grad:
+                        total_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
                     # multi-anchor 학습 시 같은 rollout 결과를 anchor 들이 share 하므로
                     # 마지막 anchor 전까지 graph 를 유지해야 두 번째 anchor backward 가
                     # 끊긴 graph 로 들어가는 race 를 막을 수 있다.
