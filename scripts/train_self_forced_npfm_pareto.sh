@@ -151,11 +151,18 @@ TRAIN_USE_EVAL_AGENT_SELECTION="${TRAIN_USE_EVAL_AGENT_SELECTION:-true}"
 # ────────────────────────────────────────────────────────────────────────
 # 5. Generator 학습 (model.model_config)
 # ────────────────────────────────────────────────────────────────────────
-# self_forced_npfm 기본 lr 2e-4. distillation 단계라 pretrain LR (5e-4) 보다 낮게.
-LR="${LR:-2e-4}"
-LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-2}"
+# Self-Forcing 학습에서는 smart_flow.py:configure_optimizers 가 self_forced_enabled=True
+# 인 경우 LambdaLR (cosine warmup/decay) 을 만들지 않고, generator/critic 두 AdamW
+# optimizer 를 self.lr 그대로 고정 LR 로 만들어 반환합니다. 따라서 아래 4개 중 LR 만
+# 실제 적용되고, LR_WARMUP_STEPS / LR_TOTAL_STEPS / LR_MIN_RATIO 는 self-forced 분기에서는
+# dead key 입니다 (config 에는 들어가지만 사용되지 않음). 일관성과 fallback (self-forced
+# disable 시) 을 위해 그대로 노출만 해 둡니다.
+#
+# Critic(generated estimator) LR = LR / ESTIMATOR_UPDATES_PER_STEP 가 자동 적용됩니다.
+LR="${LR:-1.0e-6}"                # 사용자 지정 고정 LR (warmup 없음)
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
 LR_TOTAL_STEPS="${LR_TOTAL_STEPS:-${MAX_EPOCHS}}"
-LR_MIN_RATIO="${LR_MIN_RATIO:-1e-2}"
+LR_MIN_RATIO="${LR_MIN_RATIO:-1.0}"   # 1.0 = decay 없음 (self-forced 외 분기에서 의미)
 
 # Validation rollout 비용 제어
 N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-32}"
@@ -353,7 +360,7 @@ echo "    limit_train=${LIMIT_TRAIN_BATCHES} limit_val=${LIMIT_VAL_BATCHES}"
 echo "    val_check_interval=${VAL_CHECK_INTERVAL} check_val_every_n=${CHECK_VAL_EVERY_N_EPOCH} seed=${SEED}"
 echo "  Data: train_B=${TRAIN_B} val_B=${VAL_B} workers=${NUM_WORKERS}"
 echo "    epoch_sample_frac=${TRAIN_EPOCH_SAMPLE_FRACTION}"
-echo "  Generator: lr=${LR} warmup=${LR_WARMUP_STEPS} total=${LR_TOTAL_STEPS}"
+echo "  Generator: lr=${LR} (self-forced 에선 고정 LR; warmup/decay 무시됨)"
 echo "    closed_loop_rollout_mode=${CLOSED_LOOP_ROLLOUT_MODE} use_lqr=${DECODER_USE_LQR}"
 echo "  Self-Forced ★:"
 echo "    objective=${DM_OBJECTIVE} dmd_beta=${DMD_BETA} sid_alpha=${SID_ALPHA}"

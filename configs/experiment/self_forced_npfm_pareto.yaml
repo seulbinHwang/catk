@@ -27,6 +27,12 @@ defaults:
 
 model:
   model_config:
+    # Self-Forcing 학습에서는 configure_optimizers 가 LR scheduler 를 만들지 않고
+    # generator/critic AdamW 가 self.lr 을 고정으로 사용합니다 (smart_flow.py:3178+).
+    # 잘 되는 세팅 빠른 탐색용 고정 1e-6.  critic LR = lr / estimator_updates_per_step.
+    lr: 1.0e-6
+    lr_warmup_steps: 0
+    lr_min_ratio: 1.0
     self_forced:
       distribution_matching_objective: dmd
       use_anchor_flow_matching_loss: false
