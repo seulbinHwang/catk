@@ -219,8 +219,12 @@ SF_DETACH_BLOCK_TRANSITION="${SF_DETACH_BLOCK_TRANSITION:-false}"
 # critic (generated estimator) 업데이트 cadence — generator 1 step 당 estimator N step.
 # reference Self-Forcing 의 dfake_gen_update_ratio 대응.
 ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-5}"
-# critic 만 학습하는 초기 warmup epoch 수 (generator update 보류).
-ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-1}"
+# critic 만 학습하는 초기 warmup 구간. step / epoch 두 단위가 OR 로 결합되며,
+# 둘 다 0 이면 warmup 없이 바로 generator+critic 동시 학습으로 들어갑니다.
+# default 는 self_forced_npfm_pareto.yaml 의 200 step / 0 epoch 입니다
+# (잘 되는 세팅 빠른 탐색용; epoch 기반은 1 epoch 가 너무 길 때를 피하기 위해 끔).
+ESTIMATOR_WARMUP_STEPS="${ESTIMATOR_WARMUP_STEPS:-200}"
+ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-0}"
 # fit_start 시점에 teacher/estimator 를 main encoder 의 weight 로 재동기화할지 (fresh finetune ↔ resume).
 SF_INIT_AUX_FROM_GEN="${SF_INIT_AUX_FROM_GEN:-true}"
 
@@ -356,7 +360,7 @@ echo "    objective=${DM_OBJECTIVE} dmd_beta=${DMD_BETA} sid_alpha=${SID_ALPHA}"
 echo "    weight=${SF_WEIGHT} path_step=${SF_PATH_STEP_SIZE}"
 echo "    use_anchor_fm=${USE_ANCHOR_FM} anchor_weight=${ANCHOR_WEIGHT}"
 echo "    estimator_per_step=${ESTIMATOR_UPDATES_PER_STEP}"
-echo "    estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
+echo "    estimator_warmup_steps=${ESTIMATOR_WARMUP_STEPS} estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "    unfrozen_range=${SF_UNFROZEN_RANGE}"
 echo "    ema_weight=${SF_EMA_WEIGHT} ema_start=${SF_EMA_START_STEP}"
 echo "    grad_clip=${SF_GRAD_CLIP}"
@@ -458,6 +462,7 @@ torchrun \
   model.model_config.self_forced.sid_normalizer_eps="${SID_NORMALIZER_EPS}" \
   model.model_config.self_forced.detach_block_transition="${SF_DETACH_BLOCK_TRANSITION}" \
   model.model_config.self_forced.estimator_updates_per_step="${ESTIMATOR_UPDATES_PER_STEP}" \
+  model.model_config.self_forced.estimator_warmup_steps="${ESTIMATOR_WARMUP_STEPS}" \
   model.model_config.self_forced.estimator_warmup_epochs="${ESTIMATOR_WARMUP_EPOCHS}" \
   model.model_config.self_forced.initialize_aux_from_generator_on_fit_start="${SF_INIT_AUX_FROM_GEN}" \
   model.model_config.self_forced.unfrozen_range="${SF_UNFROZEN_RANGE}" \

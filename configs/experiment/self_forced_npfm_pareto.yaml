@@ -32,6 +32,12 @@ model:
       use_anchor_flow_matching_loss: false
       # vanilla DMD로 시작 (β annealing은 본 plan 범위 밖).
       dmd_beta: 1.0
+      # step 단위 estimator warmup (fake/critic only 학습 구간).
+      # epoch 단위 estimator_warmup_epochs 와 OR 로 결합되며, 둘 다 0 이면 warmup 없이
+      # 바로 generator+critic 동시 학습. 잘 되는 세팅 빠른 탐색용 default 200 step.
+      estimator_warmup_steps: 200
+      # step warmup 만 단독으로 쓰려면 epoch warmup 은 0 으로.
+      estimator_warmup_epochs: 0
       # smart_flow.py는 아래 키들도 read 하지만 base smart_flow.yaml에는 정의되어 있지
       # 않습니다. struct mode에서 CLI override가 막히지 않도록 default를 여기서 명시
       # (값은 smart_flow.py 기본값과 동일 → behavior-preserving).

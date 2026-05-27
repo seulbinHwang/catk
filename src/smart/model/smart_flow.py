@@ -46,7 +46,9 @@ from src.smart.modules.self_forced_update_separation import (
 )
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
+    is_self_forced_estimator_warmup_step,
     resolve_self_forced_estimator_warmup_epochs,
+    resolve_self_forced_estimator_warmup_steps,
 )
 from src.smart.modules.self_forced_trainable_range import (
     apply_self_forced_unfrozen_range,
@@ -319,6 +321,9 @@ class SMARTFlow(LightningModule):
         )
         self.self_forced_estimator_warmup_epochs = (
             resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
+        )
+        self.self_forced_estimator_warmup_steps = (
+            resolve_self_forced_estimator_warmup_steps(self.self_forced_config)
         )
         self.self_forced_initialize_aux_on_fit_start = (
             bool(getattr(self.self_forced_config, "initialize_aux_from_generator_on_fit_start", True))
@@ -1586,12 +1591,22 @@ class SMARTFlow(LightningModule):
         return scenario_rollouts
 
     def _is_self_forced_estimator_warmup_active(self) -> bool:
-        """현재 epoch에서 generated estimator만 먼저 적응시킬지 판단합니다."""
-        return is_self_forced_estimator_warmup_epoch(
+        """현재 epoch 또는 global step 이 generated estimator 사전 적응 구간인지 판단합니다.
+
+        epoch 기반 warmup (``estimator_warmup_epochs``) 과 step 기반 warmup
+        (``estimator_warmup_steps``) 중 하나라도 활성이면 warmup 으로 봅니다.
+        둘 다 0 이면 즉시 generator+critic 동시 학습으로 들어갑니다.
+        """
+        epoch_active = is_self_forced_estimator_warmup_epoch(
             current_epoch=int(self.current_epoch),
             self_forced_start_epoch=int(self.self_forced_start_epoch),
             estimator_warmup_epochs=int(self.self_forced_estimator_warmup_epochs),
         )
+        step_active = is_self_forced_estimator_warmup_step(
+            global_step=int(self.global_step),
+            estimator_warmup_steps=int(self.self_forced_estimator_warmup_steps),
+        )
+        return epoch_active or step_active
 
     def _finish_self_forced_estimator_warmup_step(
         self,

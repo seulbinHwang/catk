@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 DEFAULT_SELF_FORCED_ESTIMATOR_WARMUP_EPOCHS = 1
+DEFAULT_SELF_FORCED_ESTIMATOR_WARMUP_STEPS = 0
 
 
 def _get_config_value(config: object | None, key: str, default: object) -> object:
@@ -83,3 +84,58 @@ def is_self_forced_estimator_warmup_epoch(
     if warmup_epochs <= 0:
         return False
     return start_epoch <= current_epoch < start_epoch + warmup_epochs
+
+
+def resolve_self_forced_estimator_warmup_steps(config: object | None) -> int:
+    """generated estimator만 먼저 학습할 step 수를 확정합니다.
+
+    Args:
+        config: ``model.model_config.self_forced`` 설정입니다.
+
+    Returns:
+        int: generator update를 건너뛰고 generated estimator만 학습할 global step 수입니다.
+        ``0`` 이면 step 기반 warmup을 끕니다.
+
+    설명:
+        ``estimator_warmup_epochs`` 와 별개로 사용할 수 있는 step 기반 hook 입니다.
+        잘 되는 세팅을 빠르게 탐색할 때 (epoch 1 이 수천 step 인 경우) 짧게 잡고 싶을 때
+        쓰며, 두 값 모두 양수면 둘 중 하나라도 활성이면 warmup 으로 봅니다.
+    """
+    raw_steps = _get_config_value(
+        config=config,
+        key="estimator_warmup_steps",
+        default=DEFAULT_SELF_FORCED_ESTIMATOR_WARMUP_STEPS,
+    )
+    warmup_steps = int(raw_steps)
+    if warmup_steps < 0:
+        raise ValueError(
+            "self_forced.estimator_warmup_steps must be non-negative, "
+            f"got {warmup_steps}."
+        )
+    return warmup_steps
+
+
+def is_self_forced_estimator_warmup_step(
+    *,
+    global_step: int,
+    estimator_warmup_steps: int,
+) -> bool:
+    """현재 global step 이 generated estimator 사전 적응 구간인지 판단합니다.
+
+    Args:
+        global_step: Lightning ``self.global_step`` 입니다 (학습 시작부터 0).
+        estimator_warmup_steps: generated estimator만 학습할 step 수입니다.
+
+    Returns:
+        bool: 현재 step 이 사전 적응 구간이면 ``True`` 입니다.
+
+    설명:
+        epoch 단위 warmup 과 달리 항상 학습 시작 ``global_step=0`` 부터 셉니다.
+        ``self_forced_start_epoch`` 이 0 이 아닌 경우에는 epoch warmup 과 OR 로 결합
+        하므로, step warmup 만 단독 사용할 때는 ``self_forced_start_epoch=0`` 으로
+        두는 게 자연스럽습니다.
+    """
+    warmup_steps = int(estimator_warmup_steps)
+    if warmup_steps <= 0:
+        return False
+    return int(global_step) < warmup_steps
