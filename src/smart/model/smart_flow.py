@@ -244,6 +244,17 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1.0e-3
         )
+        # Self-Forcing entropy knob (constant β; β annealing은 추후 작업).
+        # β=1.0 → 기존 동작 그대로. β<1 → fake 항 1/β 배 (entropy↑). β>1 → sharpening.
+        self.self_forced_dmd_beta = (
+            float(getattr(self.self_forced_config, "dmd_beta", 1.0))
+            if self.self_forced_config is not None
+            else 1.0
+        )
+        if not (self.self_forced_dmd_beta > 0.0):
+            raise ValueError(
+                f"self_forced.dmd_beta must be > 0, got {self.self_forced_dmd_beta}."
+            )
         self.self_forced_distribution_matching_objective = (
             str(getattr(self.self_forced_config, "distribution_matching_objective", "dmd")).lower()
             if self.self_forced_config is not None
@@ -2387,6 +2398,7 @@ class SMARTFlow(LightningModule):
                 target_clean_norm=target_pred["clean"],
                 generated_clean_norm=generated_pred["clean"],
                 normalizer_eps=self.self_forced_direction_normalizer_eps,
+                dmd_beta=self.self_forced_dmd_beta,
             )
 
         self._assert_self_forced_generator_update_isolated()
@@ -2828,6 +2840,8 @@ class SMARTFlow(LightningModule):
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        if self.self_forced_distribution_matching_objective == "dmd":
+            self.log("train/sf_dmd_beta", float(self.self_forced_dmd_beta), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
