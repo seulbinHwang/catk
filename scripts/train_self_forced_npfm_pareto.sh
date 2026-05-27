@@ -225,7 +225,7 @@ SF_DETACH_BLOCK_TRANSITION="${SF_DETACH_BLOCK_TRANSITION:-false}"
 
 # critic (generated estimator) 업데이트 cadence — generator 1 step 당 estimator N step.
 # reference Self-Forcing 의 dfake_gen_update_ratio 대응.
-ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-5}"
+ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-3}"
 # critic LR 절대값 override.  양수면 그 값 그대로 사용 (default 1e-6 = generator LR 과 동일).
 # null 이면 기존 비례식 ``LR / ESTIMATOR_UPDATES_PER_STEP`` 으로 fallback.
 ESTIMATOR_LR="${ESTIMATOR_LR:-${LR}}"
@@ -245,9 +245,14 @@ SF_INIT_AUX_FROM_GEN="${SF_INIT_AUX_FROM_GEN:-true}"
 #   - full                  : encoder/decoder 모두 학습 (예전 호환)
 SF_UNFROZEN_RANGE="${SF_UNFROZEN_RANGE:-except_map_encoder}"
 
-# Generator EMA — Self-Forcing paper 기본 0.99
-SF_EMA_WEIGHT="${SF_EMA_WEIGHT:-0.99}"
-SF_EMA_START_STEP="${SF_EMA_START_STEP:-50}"
+# Generator EMA — sweep 단계에선 default OFF (validation 이 online weight 직접 측정).
+# 학습 loss / gradient 에는 영향 없고, validation rollout 시 _get_eval_generator 가
+# EMA module 을 쓰는지 여부만 결정함 (smart_flow.py L1749). EMA 켜고 학습하고 싶으면
+#   SF_EMA_WEIGHT=0.99 SF_EMA_START_STEP=50 bash ...
+# 로 export. SF_EMA_START_STEP 을 매우 큰 값으로 두는 것 자체가 EMA update compute 도
+# 거의 끔 (_update_self_forced_generator_ema_after_step 의 early return).
+SF_EMA_WEIGHT="${SF_EMA_WEIGHT:-0.0}"
+SF_EMA_START_STEP="${SF_EMA_START_STEP:-1000000000}"
 
 # Manual optimization 안에서 직접 거는 grad clip (Trainer.gradient_clip_val 대신)
 SF_GRAD_CLIP="${SF_GRAD_CLIP:-1.0}"
@@ -260,9 +265,7 @@ SAMPLING_SAMPLE_STEPS="${SAMPLING_SAMPLE_STEPS:-16}"
 SAMPLING_SAMPLE_METHOD="${SAMPLING_SAMPLE_METHOD:-euler}"
 SAMPLING_NOISE_SCALE="${SAMPLING_NOISE_SCALE:-1.0}"
 
-# Random terminal step (gradient 흘릴 위치 무작위화)
-SAMPLING_RTS_ENABLED="${SAMPLING_RTS_ENABLED:-true}"
-SAMPLING_RTS_SCOPE="${SAMPLING_RTS_SCOPE:-global_batch}"    # global_batch | per_scenario
+
 # Policy:
 #   - paper_uniform : 실행 denoising step K 를 min_executed_steps..sample_steps 범위에서 균등.
 #   - all           : 항상 sample_steps 전체 실행, gradient 는 마지막 backprop_last_k 개에만.
@@ -372,7 +375,7 @@ echo "    use_anchor_fm=${USE_ANCHOR_FM} anchor_weight=${ANCHOR_WEIGHT}"
 echo "    estimator_per_step=${ESTIMATOR_UPDATES_PER_STEP} estimator_lr=${ESTIMATOR_LR}"
 echo "    estimator_warmup_steps=${ESTIMATOR_WARMUP_STEPS} estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "    unfrozen_range=${SF_UNFROZEN_RANGE}"
-echo "    ema_weight=${SF_EMA_WEIGHT} ema_start=${SF_EMA_START_STEP}"
+echo "    ema_weight=${SF_EMA_WEIGHT} ema_start=${SF_EMA_START_STEP}  (default OFF; sweep 후 0.99/50 으로 복원)"
 echo "    grad_clip=${SF_GRAD_CLIP}"
 echo "  Sampling (train self-forced rollout):"
 echo "    sample_steps=${SAMPLING_SAMPLE_STEPS} method=${SAMPLING_SAMPLE_METHOD}"

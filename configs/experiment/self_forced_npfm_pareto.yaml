@@ -49,6 +49,13 @@ model:
       #   estimator_lr = lr / estimator_updates_per_step
       # 으로 fallback (Self-Forcing dfake_gen_update_ratio 관습).
       estimator_lr: 1.0e-6
+      # Generator EMA off (잘 되는 세팅 빠른 탐색용).
+      # ema_weight 는 학습 loss / gradient 에 영향 없고 오직 validation rollout 시
+      # _get_eval_generator 가 EMA module 을 쓰는지 여부만 결정합니다 (smart_flow.py L1749).
+      # sweep 단계에선 validation 이 online weight 결과를 직접 보여주도록 둘 다 꺼 두고,
+      # 나중에 best 세팅으로 재학습할 때 ema_weight: 0.99 / ema_start_step: 50 로 복원.
+      ema_weight: 0.0
+      ema_start_step: 1000000000
       # smart_flow.py는 아래 키들도 read 하지만 base smart_flow.yaml에는 정의되어 있지
       # 않습니다. struct mode에서 CLI override가 막히지 않도록 default를 여기서 명시
       # (값은 smart_flow.py 기본값과 동일 → behavior-preserving).
