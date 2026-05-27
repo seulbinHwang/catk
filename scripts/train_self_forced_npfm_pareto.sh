@@ -251,6 +251,25 @@ SAMPLING_RTS_MIN_EXECUTED_STEPS="${SAMPLING_RTS_MIN_EXECUTED_STEPS:-16}"
 SAMPLING_RTS_BACKPROP_LAST_K="${SAMPLING_RTS_BACKPROP_LAST_K:-8}"  # policy=all 일 때만
 
 # ────────────────────────────────────────────────────────────────────────
+# 6.5. Validation rollout sampling — main 학습 시 val closed-loop와 동기화 ★
+# ────────────────────────────────────────────────────────────────────────
+# smart_flow.yaml 의 model_config.validation_rollout_sampling 은 다음 두 곳에서 함께 쓰입니다:
+#   (A) Main flow pretrain / fine-tune yaml (pre_bc_flow_*, finetune_flow_*) 의
+#       validation 단계 closed-loop rollout
+#   (B) Self-forced fine-tuning (이 launcher) 의 validation 단계 closed-loop rollout
+#
+# Training-time self-forced rollout sampling (SAMPLING_* 위 섹션) 과 분리되어 있어,
+# DMD_BETA / SAMPLING_NOISE_SCALE 같은 sweep knob 을 학습 측에서만 바꾸면 validation 측
+# rollout 분포는 default 16/euler/1.0 그대로 유지됩니다. RMM/CPD 측정 일관성을 위해
+# 이 hook 의 default 를 학습 측 값과 자동 동기화해 두고, 필요 시 별도 override 가능.
+#
+# Note: validation rollout 은 random terminal step 이 없습니다 (deterministic 평가).
+# 그래서 RTS 관련 키는 여기 없고 sample_steps / sample_method / noise_scale 만 노출합니다.
+VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-${SAMPLING_SAMPLE_STEPS}}"
+VAL_SAMPLE_METHOD="${VAL_SAMPLE_METHOD:-${SAMPLING_SAMPLE_METHOD}}"
+VAL_NOISE_SCALE="${VAL_NOISE_SCALE:-${SAMPLING_NOISE_SCALE}}"
+
+# ────────────────────────────────────────────────────────────────────────
 # 7. Pareto(RMM × CPD) 추적
 # ────────────────────────────────────────────────────────────────────────
 # CPD 정규화 scale.  실험 간 비교 가능성을 위해 같은 값을 유지하는 게 좋습니다.
@@ -335,11 +354,13 @@ echo "    estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "    unfrozen_range=${SF_UNFROZEN_RANGE}"
 echo "    ema_weight=${SF_EMA_WEIGHT} ema_start=${SF_EMA_START_STEP}"
 echo "    grad_clip=${SF_GRAD_CLIP}"
-echo "  Sampling:"
+echo "  Sampling (train self-forced rollout):"
 echo "    sample_steps=${SAMPLING_SAMPLE_STEPS} method=${SAMPLING_SAMPLE_METHOD}"
 echo "    noise_scale=${SAMPLING_NOISE_SCALE}"
 echo "    rts: policy=${SAMPLING_RTS_POLICY} min_executed=${SAMPLING_RTS_MIN_EXECUTED_STEPS}"
 echo "         backprop_last_k=${SAMPLING_RTS_BACKPROP_LAST_K} scope=${SAMPLING_RTS_SCOPE}"
+echo "  Sampling (val closed-loop; main pretrain val 과 동기화):"
+echo "    sample_steps=${VAL_SAMPLE_STEPS} method=${VAL_SAMPLE_METHOD} noise_scale=${VAL_NOISE_SCALE}"
 echo "  Pareto:"
 echo "    wosac_distribution_type_scale=${WOSAC_DIST_TYPE_SCALE}"
 echo "    wosac_cpd_reference=${WOSAC_CPD_REFERENCE}"
@@ -444,6 +465,9 @@ torchrun \
   model.model_config.self_forced.sampling.random_terminal_step.policy="${SAMPLING_RTS_POLICY}" \
   model.model_config.self_forced.sampling.random_terminal_step.min_executed_steps="${SAMPLING_RTS_MIN_EXECUTED_STEPS}" \
   model.model_config.self_forced.sampling.backprop_last_k="${SAMPLING_RTS_BACKPROP_LAST_K}" \
+  model.model_config.validation_rollout_sampling.sample_steps="${VAL_SAMPLE_STEPS}" \
+  model.model_config.validation_rollout_sampling.sample_method="${VAL_SAMPLE_METHOD}" \
+  model.model_config.validation_rollout_sampling.noise_scale="${VAL_NOISE_SCALE}" \
   ${PREFETCH_ARG} \
   ${EXTRA_ARGS}
 
