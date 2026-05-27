@@ -22,11 +22,6 @@ from torch_geometric.utils import dense_to_sparse
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from src.smart.modules.dynamic_light_time import (
-    NO_LANE_STATE_LIGHT_TYPE,
-    build_constant_light_time_delta_norm,
-    resolve_light_time_delta_norm,
-)
 from src.smart.utils import (
     angle_between_2d_vectors,
     sample_next_token_traj,
@@ -65,7 +60,7 @@ class SMARTAgentDecoder(nn.Module):
         self.shift = 5
         self.hist_drop_prob = hist_drop_prob
 
-        input_dim_x_a = 3
+        input_dim_x_a = 2
         input_dim_r_t = 4
         input_dim_r_pt2a = 3
         input_dim_r_a2a = 3
@@ -73,8 +68,6 @@ class SMARTAgentDecoder(nn.Module):
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
-        self.light_pl2a_emb = nn.Embedding(5, hidden_dim)
-
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
             hidden_dim=hidden_dim,
@@ -87,11 +80,6 @@ class SMARTAgentDecoder(nn.Module):
         )
         self.r_pt2a_emb = FourierEmbedding(
             input_dim=input_dim_r_pt2a,
-            hidden_dim=hidden_dim,
-            num_freq_bands=num_freq_bands,
-        )
-        self.light_time_pl2a_emb = FourierEmbedding(
-            input_dim=1,
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
@@ -157,12 +145,6 @@ class SMARTAgentDecoder(nn.Module):
         )
         self.apply(weight_init)
 
-    def _zero_light_pl2a_parameter_dependency(self, dtype: torch.dtype) -> torch.Tensor:
-        zero = self.light_pl2a_emb.weight.reshape(-1)[0].to(dtype=dtype) * 0.0
-        for param in self.light_time_pl2a_emb.parameters():
-            zero = zero + param.reshape(-1)[0].to(dtype=dtype) * 0.0
-        return zero
-
     def agent_token_embedding(
         self,
         agent_token_index,  # [n_agent, n_step]
@@ -173,7 +155,6 @@ class SMARTAgentDecoder(nn.Module):
         head_vector_a,  # [n_agent, n_step, 2]
         agent_type,  # [n_agent]
         agent_shape,  # [n_agent, 3]
-        valid_mask: Optional[torch.Tensor] = None,  # [n_agent, n_step]
         inference=False,
     ):
         n_agent, n_step, traj_dim = pos_a.shape
@@ -195,11 +176,22 @@ class SMARTAgentDecoder(nn.Module):
         agent_token_emb[ped_mask] = agent_token_emb_ped[agent_token_index[ped_mask]]
         agent_token_emb[cyc_mask] = agent_token_emb_cyc[agent_token_index[cyc_mask]]
 
-        feature_a = self._build_motion_feature(
-            pos_a=pos_a,
-            head_vector_a=head_vector_a,
-            valid_mask=valid_mask,
-        )  # [n_agent, n_step, 3]
+        motion_vector_a = torch.cat(
+            [
+                pos_a.new_zeros(agent_token_index.shape[0], 1, traj_dim),
+                pos_a[:, 1:] - pos_a[:, :-1],
+            ],
+            dim=1,
+        )  # [n_agent, n_step, 2]
+        feature_a = torch.stack(
+            [
+                torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
+                angle_between_2d_vectors(
+                    ctr_vector=head_vector_a, nbr_vector=motion_vector_a[:, :, :2]
+                ),
+            ],
+            dim=-1,
+        )  # [n_agent, n_step, 2]
         categorical_embs = [
             self.type_a_emb(agent_type.long()),
             self.shape_emb(agent_shape),
@@ -230,81 +222,6 @@ class SMARTAgentDecoder(nn.Module):
             )
         else:
             return feat_a  # [n_agent, n_step, hidden_dim]
-
-    @staticmethod
-    def _build_motion_valid_mask(
-        pos_a: torch.Tensor,
-        valid_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        n_agent, n_step, _ = pos_a.shape
-        if valid_mask is None:
-            raise ValueError(
-                "valid_mask is required for SMART motion features. Missing motion "
-                "must not be treated as valid stationary motion."
-            )
-        if tuple(valid_mask.shape) != (n_agent, n_step):
-            raise ValueError(
-                "valid_mask shape must match the first two dimensions of pos_a, "
-                f"got {tuple(valid_mask.shape)} and {(n_agent, n_step)}."
-            )
-
-        motion_valid_a = torch.zeros(
-            n_agent,
-            n_step,
-            device=pos_a.device,
-            dtype=torch.bool,
-        )
-        if n_step > 1:
-            motion_valid_a[:, 1:] = valid_mask[:, 1:].bool() & valid_mask[:, :-1].bool()
-        return motion_valid_a
-
-    @staticmethod
-    def _build_motion_vector(
-        pos_a: torch.Tensor,
-        valid_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        n_agent, n_step, traj_dim = pos_a.shape
-        motion_vector_a = pos_a.new_zeros(n_agent, n_step, traj_dim)
-        if n_step <= 1:
-            return motion_vector_a
-
-        motion_valid_a = SMARTAgentDecoder._build_motion_valid_mask(pos_a, valid_mask)
-        step_delta = pos_a[:, 1:] - pos_a[:, :-1]
-        step_delta = step_delta.masked_fill(~motion_valid_a[:, 1:].unsqueeze(-1), 0.0)
-        motion_vector_a[:, 1:] = step_delta
-        return motion_vector_a
-
-    @staticmethod
-    def _build_motion_feature_from_vector(
-        motion_vector_a: torch.Tensor,
-        head_vector_a: torch.Tensor,
-        motion_valid_a: torch.Tensor,
-    ) -> torch.Tensor:
-        return torch.stack(
-            [
-                torch.norm(motion_vector_a[..., :2], p=2, dim=-1),
-                angle_between_2d_vectors(
-                    ctr_vector=head_vector_a,
-                    nbr_vector=motion_vector_a[..., :2],
-                ),
-                motion_valid_a.to(dtype=motion_vector_a.dtype),
-            ],
-            dim=-1,
-        )
-
-    @staticmethod
-    def _build_motion_feature(
-        pos_a: torch.Tensor,
-        head_vector_a: torch.Tensor,
-        valid_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        motion_vector_a = SMARTAgentDecoder._build_motion_vector(pos_a, valid_mask)
-        motion_valid_a = SMARTAgentDecoder._build_motion_valid_mask(pos_a, valid_mask)
-        return SMARTAgentDecoder._build_motion_feature_from_vector(
-            motion_vector_a=motion_vector_a,
-            head_vector_a=head_vector_a,
-            motion_valid_a=motion_valid_a,
-        )
 
     def build_temporal_edge(
         self,
@@ -410,17 +327,11 @@ class SMARTAgentDecoder(nn.Module):
         mask,  # [n_agent, n_step]
         batch_s,  # [n_agent*n_step]
         batch_pl,  # [n_pl]
-        light_type: Optional[torch.Tensor] = None,
-        light_time_delta_norm: Optional[torch.Tensor] = None,
     ):
-        n_agent, n_step = pos_a.shape[:2]
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        has_light_type = light_type is not None
-        if has_light_type:
-            light_type = light_type.to(device=pos_pl.device, dtype=torch.long)
         # torch_cluster.radius assumes grouped batch ids. With static map tokens,
         # agent ids arrive as [scene0..N, scene0..N, ...] across time steps, so
         # sort before radius and restore the original indices afterward.
@@ -458,33 +369,6 @@ class SMARTAgentDecoder(nn.Module):
             dim=-1,
         )
         r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
-        if has_light_type and edge_index_pl2a.numel() > 0:
-            # Some ranks can see a batch without signaled map edges. Keep the
-            # conditional light-staleness parameters in the DDP graph without
-            # changing relation values.
-            r_pl2a = r_pl2a + self._zero_light_pl2a_parameter_dependency(r_pl2a.dtype)
-            edge_light_type = light_type[edge_index_pl2a[0]]
-            signal_edge_mask = edge_light_type != NO_LANE_STATE_LIGHT_TYPE
-            if signal_edge_mask.any():
-                light_time_delta_norm = resolve_light_time_delta_norm(
-                    light_time_delta_norm=light_time_delta_norm,
-                    num_agents=n_agent,
-                    num_steps=n_step,
-                    device=pos_pl.device,
-                    dtype=pos_pl.dtype,
-                    shift_steps=self.shift,
-                )
-                light_time_delta_flat = light_time_delta_norm.transpose(0, 1).reshape(-1)
-                signal_edge_index = signal_edge_mask.nonzero(as_tuple=False).flatten()
-                signal_light_type = edge_light_type[signal_edge_index]
-                signal_light_time = light_time_delta_flat[
-                    edge_index_pl2a[1, signal_edge_index]
-                ].unsqueeze(-1)
-                light_bias = self.light_time_pl2a_emb(
-                    continuous_inputs=signal_light_time,
-                    categorical_embs=[self.light_pl2a_emb(signal_light_type)],
-                )
-                r_pl2a = r_pl2a.index_add(0, signal_edge_index, light_bias)
         return edge_index_pl2a, r_pl2a
 
     @staticmethod
@@ -523,7 +407,6 @@ class SMARTAgentDecoder(nn.Module):
             head_vector_a=head_vector_a,  # [n_agent, n_step, 2]
             agent_type=tokenized_agent["type"],  # [n_agent]
             agent_shape=tokenized_agent["shape"],  # [n_agent, 3]
-            valid_mask=mask,  # [n_agent, n_step]
         )  # feat_a: [n_agent, n_step, hidden_dim]
 
         # ! build temporal, interaction and map2agent edges
@@ -561,7 +444,6 @@ class SMARTAgentDecoder(nn.Module):
             mask=mask,  # [n_agent, n_step]
             batch_s=batch_s_pl2a,  # [n_agent*n_step]
             batch_pl=batch_pl,  # [n_pl]
-            light_type=map_feature.get("light_type"),
         )
 
         # ! attention layers
@@ -635,7 +517,6 @@ class SMARTAgentDecoder(nn.Module):
             head_vector_a=head_vector_a,
             agent_type=tokenized_agent["type"],
             agent_shape=tokenized_agent["shape"],
-            valid_mask=tokenized_agent["valid_mask"][:, :step_current_2hz],
             inference=True,
         )
 
@@ -705,18 +586,6 @@ class SMARTAgentDecoder(nn.Module):
                 mask=inference_mask[:, -hist_step:],  # [n_agent, hist_step]
                 batch_s=batch_s_pl2a,  # [n_agent*hist_step]
                 batch_pl=map_feature["batch"],  # [n_pl]
-                light_type=map_feature.get("light_type"),
-                light_time_delta_norm=(
-                    None
-                    if t == 0
-                    else build_constant_light_time_delta_norm(
-                        num_agents=n_agent,
-                        num_steps=1,
-                        delta_seconds=float(t * self.shift) * 0.1,
-                        device=pos_a.device,
-                        dtype=pos_a.dtype,
-                    )
-                ),
             )
             feat_map = map_feature["pt_token"]
             edge_index_a2a, r_a2a = self.build_interaction_edge(
@@ -859,15 +728,15 @@ class SMARTAgentDecoder(nn.Module):
 
             # ! get feat_a_next
             motion_vector_a = pos_a[:, -1] - pos_a[:, -2]  # [n_agent, 2]
-            motion_valid_a = pred_valid[:, n_step] & pred_valid[:, t_now]
-            motion_vector_a = motion_vector_a.masked_fill(
-                ~motion_valid_a.unsqueeze(-1),
-                0.0,
-            )
-            x_a = self._build_motion_feature_from_vector(
-                motion_vector_a=motion_vector_a,
-                head_vector_a=head_vector_a[:, -1],
-                motion_valid_a=motion_valid_a,
+            x_a = torch.stack(
+                [
+                    torch.norm(motion_vector_a[:, :2], p=2, dim=-1),
+                    angle_between_2d_vectors(
+                        ctr_vector=head_vector_a[:, -1],
+                        nbr_vector=motion_vector_a[:, :2],
+                    ),
+                ],
+                dim=-1,
             )
             # [n_agent, hidden_dim]
             x_a = self.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)

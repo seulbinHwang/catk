@@ -26,31 +26,6 @@ class _IdentityRelation:
         return continuous_inputs
 
 
-class _ZeroLightEmbedding:
-    def __call__(self, light_type):
-        return torch.zeros(light_type.numel(), 3, device=light_type.device)
-
-
-class _LightTimeIdentity:
-    def __call__(self, continuous_inputs, categorical_embs=None):
-        out = continuous_inputs.expand(-1, 3)
-        if categorical_embs is not None:
-            for emb in categorical_embs:
-                out = out + emb
-        return out
-
-
-def _make_light_test_decoder() -> SMARTAgentDecoder:
-    decoder = SMARTAgentDecoder.__new__(SMARTAgentDecoder)
-    decoder.pl2a_radius = 100.0
-    decoder.shift = 5
-    decoder.r_pt2a_emb = _IdentityRelation()
-    decoder.light_pl2a_emb = _ZeroLightEmbedding()
-    decoder.light_time_pl2a_emb = _LightTimeIdentity()
-    decoder._zero_light_pl2a_parameter_dependency = lambda dtype: torch.zeros((), dtype=dtype)
-    return decoder
-
-
 def test_map_to_agent_edges_use_static_map_tokens_across_time() -> None:
     decoder = _make_decoder()
 
@@ -140,46 +115,3 @@ def test_map_to_agent_edges_keep_all_same_scene_edges_with_repeated_agent_batche
     assert not bool(torch.all(batch_s[:-1] <= batch_s[1:]))
     assert edge_index.shape[1] == int(expected_edges.item())
     assert bool(torch.all(batch_pl[edge_index[0]] == batch_s[edge_index[1]]))
-
-
-def test_map_to_agent_stale_time_only_applies_to_signal_lanes() -> None:
-    decoder = _make_light_test_decoder()
-    pos_pl = torch.tensor([[0.0, 0.0], [1.0, 0.0]])
-    orient_pl = torch.zeros(2)
-    pos_a = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]])
-    head_a = torch.zeros(1, 2)
-    head_vector_a = torch.stack([head_a.cos(), head_a.sin()], dim=-1)
-    mask = torch.ones(1, 2, dtype=torch.bool)
-    batch_s = torch.zeros(2, dtype=torch.long)
-    batch_pl = torch.zeros(2, dtype=torch.long)
-    light_type = torch.tensor([0, 3], dtype=torch.long)
-    light_time_delta_norm = torch.tensor([[0.25, 0.5]])
-
-    edge_index, relation = decoder.build_map2agent_edge(
-        pos_pl=pos_pl,
-        orient_pl=orient_pl,
-        pos_a=pos_a,
-        head_a=head_a,
-        head_vector_a=head_vector_a,
-        mask=mask,
-        batch_s=batch_s,
-        batch_pl=batch_pl,
-        light_type=light_type,
-        light_time_delta_norm=light_time_delta_norm,
-    )
-
-    base_relation = relation.clone()
-    base_relation[:, 0] -= torch.linalg.vector_norm(
-        pos_pl[edge_index[0]] - pos_a.reshape(-1, 2)[edge_index[1]],
-        dim=-1,
-    )
-    for edge_idx in range(edge_index.shape[1]):
-        map_idx = int(edge_index[0, edge_idx].item())
-        dst_idx = int(edge_index[1, edge_idx].item())
-        expected_stale = 0.0 if map_idx == 0 else float(
-            light_time_delta_norm.reshape(-1)[dst_idx]
-        )
-        torch.testing.assert_close(
-            base_relation[edge_idx],
-            torch.full((3,), expected_stale),
-        )

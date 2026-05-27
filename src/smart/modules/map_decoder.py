@@ -22,6 +22,14 @@ from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.utils import angle_between_2d_vectors, weight_init, wrap_angle
 
 
+def _fold_legacy_surface_categories(
+    point_type: torch.Tensor, polygon_type: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    point_type = torch.where(point_type >= 10, point_type.new_full((), 9), point_type)
+    polygon_type = torch.where(polygon_type >= 4, polygon_type.new_full((), 3), polygon_type)
+    return point_type, polygon_type
+
+
 class SMARTMapDecoder(nn.Module):
 
     def __init__(
@@ -38,8 +46,8 @@ class SMARTMapDecoder(nn.Module):
         self.pl2pl_radius = pl2pl_radius
         self.num_layers = num_layers
 
-        self.type_pt_emb = nn.Embedding(12, hidden_dim)
-        self.polygon_type_emb = nn.Embedding(6, hidden_dim)
+        self.type_pt_emb = nn.Embedding(10, hidden_dim)
+        self.polygon_type_emb = nn.Embedding(4, hidden_dim)
         self.light_pl_emb = nn.Embedding(5, hidden_dim)
 
         input_dim_r_pt2pt = 3
@@ -72,10 +80,13 @@ class SMARTMapDecoder(nn.Module):
         orient_vector_pt = torch.stack([orient_pt.cos(), orient_pt.sin()], dim=-1)
         pt_token_emb_src = self.token_emb(tokenized_map["token_traj_src"])
         x_pt = pt_token_emb_src[tokenized_map["token_idx"]]
+        point_type, polygon_type = _fold_legacy_surface_categories(
+            tokenized_map["type"], tokenized_map["pl_type"]
+        )
 
         x_pt_categorical_embs = [
-            self.type_pt_emb(tokenized_map["type"]),
-            self.polygon_type_emb(tokenized_map["pl_type"]),
+            self.type_pt_emb(point_type),
+            self.polygon_type_emb(polygon_type),
             self.light_pl_emb(tokenized_map["light_type"]),
         ]
         x_pt = x_pt + torch.stack(x_pt_categorical_embs).sum(dim=0)
