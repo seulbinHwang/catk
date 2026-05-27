@@ -21,10 +21,6 @@ from torch_geometric.utils import dense_to_sparse
 from src.smart.layers import MLPLayer
 from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
-from src.smart.modules.dynamic_light_time import (
-    NO_LANE_STATE_LIGHT_TYPE,
-    resolve_light_time_delta_norm,
-)
 from src.smart.utils import angle_between_2d_vectors, safe_norm_2d, weight_init, wrap_angle
 
 
@@ -70,7 +66,6 @@ class SMARTAgentEncoder(nn.Module):
 
         self.type_a_emb = nn.Embedding(3, hidden_dim)
         self.shape_emb = MLPLayer(3, hidden_dim, hidden_dim)
-        self.light_pl2a_emb = nn.Embedding(5, hidden_dim)
         self.x_a_emb = FourierEmbedding(
             input_dim=input_dim_x_a,
             hidden_dim=hidden_dim,
@@ -83,11 +78,6 @@ class SMARTAgentEncoder(nn.Module):
         )
         self.r_pt2a_emb = FourierEmbedding(
             input_dim=input_dim_r_pt2a,
-            hidden_dim=hidden_dim,
-            num_freq_bands=num_freq_bands,
-        )
-        self.light_time_pl2a_emb = FourierEmbedding(
-            input_dim=1,
             hidden_dim=hidden_dim,
             num_freq_bands=num_freq_bands,
         )
@@ -401,17 +391,11 @@ class SMARTAgentEncoder(nn.Module):
         mask,
         batch_s,
         batch_pl,
-        light_type: Optional[torch.Tensor] = None,
-        light_time_delta_norm: Optional[torch.Tensor] = None,
     ):
-        n_agent, n_step = pos_a.shape[:2]
         mask_pl2a = mask.transpose(0, 1).reshape(-1)
         pos_s = pos_a.transpose(0, 1).flatten(0, 1)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
-        has_light_type = light_type is not None
-        if has_light_type:
-            light_type = light_type.to(device=pos_pl.device, dtype=torch.long)
         # ``torch_cluster.radius`` 도 ``radius_graph`` 와 마찬가지로 batch index 가
         # 단조 비감소 순서로 들어와야 그룹 분리가 silent 가정으로 동작합니다.
         # caller 는 ``batch_s`` 를 ``tokenized_agent["batch"].repeat(n_step)`` 으로
@@ -454,27 +438,4 @@ class SMARTAgentEncoder(nn.Module):
             dim=-1,
         )
         r_pl2a = self.r_pt2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
-        if has_light_type and edge_index_pl2a.numel() > 0:
-            edge_light_type = light_type[edge_index_pl2a[0]]
-            signal_edge_mask = edge_light_type != NO_LANE_STATE_LIGHT_TYPE
-            if signal_edge_mask.any():
-                light_time_delta_norm = resolve_light_time_delta_norm(
-                    light_time_delta_norm=light_time_delta_norm,
-                    num_agents=n_agent,
-                    num_steps=n_step,
-                    device=pos_pl.device,
-                    dtype=pos_pl.dtype,
-                    shift_steps=self.shift,
-                )
-                light_time_delta_flat = light_time_delta_norm.transpose(0, 1).reshape(-1)
-                signal_edge_index = signal_edge_mask.nonzero(as_tuple=False).flatten()
-                signal_light_type = edge_light_type[signal_edge_index]
-                signal_light_time = light_time_delta_flat[
-                    edge_index_pl2a[1, signal_edge_index]
-                ].unsqueeze(-1)
-                light_bias = self.light_time_pl2a_emb(
-                    continuous_inputs=signal_light_time,
-                    categorical_embs=[self.light_pl2a_emb(signal_light_type)],
-                )
-                r_pl2a = r_pl2a.index_add(0, signal_edge_index, light_bias)
         return edge_index_pl2a, r_pl2a

@@ -11,7 +11,6 @@ def test_parallel_rollout_map_feature_keeps_static_map_features_only() -> None:
         "pt_token": torch.tensor([[1.0], [2.0]]),
         "position": torch.tensor([[0.0, 0.0], [1.0, 1.0]]),
         "orientation": torch.tensor([0.0, 1.0]),
-        "light_type": torch.tensor([0, 3]),
         "batch": torch.tensor([0, 1]),
     }
 
@@ -22,5 +21,5 @@ def test_parallel_rollout_map_feature_keeps_static_map_features_only() -> None:
     )
 
     assert expanded["pt_token"].flatten().tolist() == [1.0, 2.0, 1.0, 2.0, 1.0, 2.0]
-    assert expanded["light_type"].tolist() == [0, 3, 0, 3, 0, 3]
+    assert "light_type" not in expanded
     assert expanded["batch"].tolist() == [0, 1, 2, 3, 4, 5]
