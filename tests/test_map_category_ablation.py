@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from src.data_preprocess import decode_map_features_from_proto, get_map_features
-from src.smart.modules.map_decoder import SMARTMapDecoder
+from src.smart.modules.map_decoder import SMARTMapDecoder, _fold_legacy_surface_categories
 
 
 class _MapFeature:
@@ -62,3 +62,55 @@ def test_map_decoder_uses_pre_category_vocab_sizes() -> None:
 
     assert decoder.type_pt_emb.num_embeddings == 10
     assert decoder.polygon_type_emb.num_embeddings == 4
+
+
+def test_latest_cache_surface_categories_are_folded_before_embedding() -> None:
+    point_type = torch.tensor([0, 8, 9, 10, 11], dtype=torch.long)
+    polygon_type = torch.tensor([0, 2, 3, 4, 5], dtype=torch.long)
+
+    folded_point_type, folded_polygon_type = _fold_legacy_surface_categories(
+        point_type=point_type,
+        polygon_type=polygon_type,
+    )
+
+    assert folded_point_type.tolist() == [0, 8, 9, 9, 9]
+    assert folded_polygon_type.tolist() == [0, 2, 3, 3, 3]
+
+    decoder = SMARTMapDecoder(
+        hidden_dim=16,
+        pl2pl_radius=50.0,
+        num_freq_bands=4,
+        num_layers=1,
+        num_heads=2,
+        head_dim=8,
+        dropout=0.0,
+    )
+    decoder.type_pt_emb(folded_point_type)
+    decoder.polygon_type_emb(folded_polygon_type)
+
+
+def test_map_decoder_accepts_latest_cache_surface_category_ids() -> None:
+    decoder = SMARTMapDecoder(
+        hidden_dim=16,
+        pl2pl_radius=50.0,
+        num_freq_bands=4,
+        num_layers=0,
+        num_heads=2,
+        head_dim=8,
+        dropout=0.0,
+    )
+
+    output = decoder(
+        {
+            "position": torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32),
+            "orientation": torch.zeros(2, dtype=torch.float32),
+            "token_traj_src": torch.zeros(1, 22, dtype=torch.float32),
+            "token_idx": torch.zeros(2, dtype=torch.long),
+            "type": torch.tensor([10, 11], dtype=torch.long),
+            "pl_type": torch.tensor([4, 5], dtype=torch.long),
+            "light_type": torch.zeros(2, dtype=torch.long),
+            "batch": torch.zeros(2, dtype=torch.long),
+        }
+    )
+
+    assert output["pt_token"].shape == (2, 16)
