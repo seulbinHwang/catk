@@ -45,24 +45,10 @@ from src.smart.utils.preprocess import get_polylines_from_polygon, preprocess_ma
 #     "BROKEN": 6,
 #     "SOLID_SINGLE": 7,
 #     "DOUBLE": 8,
-#     # for crosswalk / speed bump / driveway
+#     # for crosswalk, speed bump and drive way
 #     "TYPE_CROSSWALK": 9,
-#     "TYPE_SPEED_BUMP": 10,
-#     "TYPE_DRIVEWAY": 11,
 # }
-_polygon_types = [
-    "lane",
-    "road_edge",
-    "road_line",
-    "crosswalk",
-    "speed_bump",
-    "driveway",
-]
-_surface_point_type = {
-    "crosswalk": 9,
-    "speed_bump": 10,
-    "driveway": 11,
-}
+_polygon_types = ["lane", "road_edge", "road_line", "crosswalk"]
 _polygon_light_type = [
     "NO_LANE_STATE",
     "LANE_STATE_UNKNOWN",
@@ -296,7 +282,7 @@ def decode_tracks_from_proto(scenario):
 
 
 def decode_map_features_from_proto(map_features):
-    map_infos = {feature_name: [] for feature_name in _polygon_types}
+    map_infos = {"lane": [], "road_edge": [], "road_line": [], "crosswalk": []}
     polylines = []
     point_cnt = 0
     for mf in map_features:
@@ -383,12 +369,11 @@ def decode_map_features_from_proto(map_features):
                 polylines.append(cur_polyline)
                 point_cnt += len(cur_polyline)
 
-
-        elif feature_data_type in _surface_point_type:
+        elif feature_data_type in ["speed_bump", "driveway", "crosswalk"]:
             xyz = np.array([[p.x, p.y, p.z] for p in feature.polygon])
             polygon_idx = np.linspace(0, xyz.shape[0], 4, endpoint=False, dtype=int)
             pl_polygon = get_polylines_from_polygon(xyz[polygon_idx])
-            cur_info = {"id": mf.id, "type": _surface_point_type[feature_data_type]}
+            cur_info = {"id": mf.id, "type": 9}
 
             cur_polyline = np.stack(
                 [
@@ -399,7 +384,7 @@ def decode_map_features_from_proto(map_features):
             )
 
             cur_info["polyline_index"] = (point_cnt, point_cnt + len(cur_polyline))
-            map_infos[feature_data_type].append(cur_info)
+            map_infos["crosswalk"].append(cur_info)
             polylines.append(cur_polyline)
             point_cnt += len(cur_polyline)
 

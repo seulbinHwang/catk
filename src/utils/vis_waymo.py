@@ -85,9 +85,7 @@ class VisWaymo:
             (COLOR_BUTTER, 2),  # BROKEN = 6
             (COLOR_MAGENTA, 2),  # SOLID_SINGLE = 7
             (COLOR_SCARLET_RED, 2),  # DOUBLE = 8
-            (COLOR_SKY_BLUE_0, 4),  # CROSSWALK = 9
-            (COLOR_CHAMELEON, 4),  # SPEED_BUMP = 10
-            (COLOR_VIOLET, 4),  # DRIVEWAY = 11
+            (COLOR_SKY_BLUE_0, 4),  # CROSSWALK / SPEED_BUMP / DRIVEWAY = 9
         ]
 
         self.tl_style = [
@@ -616,17 +614,13 @@ def get_map_features(
             mp_id.append(mf.id)
             mp_type.append(feature_type_new)
             mp_xyz.append([[p.x, p.y, p.z] for p in feature.polyline][::2])
-        elif feature_data_type in ["crosswalk", "speed_bump", "driveway"]:
+        elif feature_data_type in ["speed_bump", "driveway", "crosswalk"]:
             xyz = np.array([[p.x, p.y, p.z] for p in feature.polygon])
             polygon_idx = np.linspace(0, xyz.shape[0], 4, endpoint=False, dtype=int)
             pl_polygon = _get_polylines_from_polygon(xyz[polygon_idx])
             mp_xyz.extend(pl_polygon)
             mp_id.extend([mf.id] * len(pl_polygon))
-            pl_type = {
-                "crosswalk": 9,
-                "speed_bump": 10,
-                "driveway": 11,
-            }[feature_data_type]
+            pl_type = 9
             mp_type.extend([pl_type] * len(pl_polygon))
         else:
             raise ValueError

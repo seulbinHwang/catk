@@ -38,8 +38,8 @@ class SMARTMapDecoder(nn.Module):
         self.pl2pl_radius = pl2pl_radius
         self.num_layers = num_layers
 
-        self.type_pt_emb = nn.Embedding(12, hidden_dim)
-        self.polygon_type_emb = nn.Embedding(6, hidden_dim)
+        self.type_pt_emb = nn.Embedding(10, hidden_dim)
+        self.polygon_type_emb = nn.Embedding(4, hidden_dim)
         self.light_pl_emb = nn.Embedding(5, hidden_dim)
 
         input_dim_r_pt2pt = 3

@@ -233,6 +233,12 @@ export CACHE_ROOT=/mnt/nuplan/womd_v1_3/SMART_cache
 학습과 평가는 원본 TFRecord가 아니라 시나리오별 `.pkl` 캐시를 사용합니다.
 canonical 경로는 `src.data_preprocess`를 직접 호출하는 것입니다.
 
+`semi_control_stable_wo_category` 브랜치는 map surface category 세분화 ablation입니다.
+이 브랜치에서 새로 만드는 cache는 `speed_bump`와 `driveway`를 별도 category로 저장하지 않고
+기존 방식처럼 `crosswalk` 계열로 합칩니다. 따라서 map point type은 `0..9`,
+polygon type은 `0..3`만 사용하며, `SMARTMapDecoder`의 category embedding도
+`type_pt_emb=10`, `polygon_type_emb=4` 기준입니다.
+
 ### 4.1 training 캐시
 
 ```bash
