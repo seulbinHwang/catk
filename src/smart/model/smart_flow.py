@@ -2736,7 +2736,15 @@ class SMARTFlow(LightningModule):
             )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
-        if self._is_self_forced_estimator_warmup_active():
+        # Warmup 상태를 batch 진입 시점에 한 번만 평가해 캐시. estimator optimizer step 사이에
+        # self.global_step 이 증가하면서 한 batch 안의 첫 호출과 마지막 호출 결과가 갈리는
+        # race 를 막아야 한다. race 가 발생하면 첫 호출에서 rollout 을 torch.no_grad() 로
+        # 돌고 두 번째 호출에선 warmup off 로 판정되어 generator backward 로 진입,
+        # committed_path_norm 에 graph 가 없는 상태에서 backward 가 시도되어
+        # RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
+        # 가 난다.
+        in_estimator_warmup = self._is_self_forced_estimator_warmup_active()
+        if in_estimator_warmup:
             with torch.no_grad():
                 rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
         else:
@@ -2758,7 +2766,7 @@ class SMARTFlow(LightningModule):
             )
 
         if not has_committed_path_global:
-            if self._is_self_forced_estimator_warmup_active():
+            if in_estimator_warmup:
                 return self._finish_self_forced_estimator_warmup_step(None)
             if fm_loss is None or not has_anchor_fm_targets_global:
                 zero_loss = (
@@ -2813,7 +2821,7 @@ class SMARTFlow(LightningModule):
             anchor_mask=anchor_mask,
             has_committed_path_global=has_committed_path_global,
         )
-        if self._is_self_forced_estimator_warmup_active():
+        if in_estimator_warmup:
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
         if has_committed_path_local:
             sf_loss = self._compute_self_forced_distribution_matching_loss(
