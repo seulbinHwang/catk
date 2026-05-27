@@ -226,6 +226,9 @@ SF_DETACH_BLOCK_TRANSITION="${SF_DETACH_BLOCK_TRANSITION:-false}"
 # critic (generated estimator) 업데이트 cadence — generator 1 step 당 estimator N step.
 # reference Self-Forcing 의 dfake_gen_update_ratio 대응.
 ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-5}"
+# critic LR 절대값 override.  양수면 그 값 그대로 사용 (default 1e-6 = generator LR 과 동일).
+# null 이면 기존 비례식 ``LR / ESTIMATOR_UPDATES_PER_STEP`` 으로 fallback.
+ESTIMATOR_LR="${ESTIMATOR_LR:-${LR}}"
 # critic 만 학습하는 초기 warmup 구간. step / epoch 두 단위가 OR 로 결합되며,
 # 둘 다 0 이면 warmup 없이 바로 generator+critic 동시 학습으로 들어갑니다.
 # default 는 self_forced_npfm_pareto.yaml 의 200 step / 0 epoch 입니다
@@ -366,7 +369,7 @@ echo "  Self-Forced ★:"
 echo "    objective=${DM_OBJECTIVE} dmd_beta=${DMD_BETA} sid_alpha=${SID_ALPHA}"
 echo "    weight=${SF_WEIGHT} path_step=${SF_PATH_STEP_SIZE}"
 echo "    use_anchor_fm=${USE_ANCHOR_FM} anchor_weight=${ANCHOR_WEIGHT}"
-echo "    estimator_per_step=${ESTIMATOR_UPDATES_PER_STEP}"
+echo "    estimator_per_step=${ESTIMATOR_UPDATES_PER_STEP} estimator_lr=${ESTIMATOR_LR}"
 echo "    estimator_warmup_steps=${ESTIMATOR_WARMUP_STEPS} estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "    unfrozen_range=${SF_UNFROZEN_RANGE}"
 echo "    ema_weight=${SF_EMA_WEIGHT} ema_start=${SF_EMA_START_STEP}"
@@ -469,6 +472,7 @@ torchrun \
   model.model_config.self_forced.sid_normalizer_eps="${SID_NORMALIZER_EPS}" \
   model.model_config.self_forced.detach_block_transition="${SF_DETACH_BLOCK_TRANSITION}" \
   model.model_config.self_forced.estimator_updates_per_step="${ESTIMATOR_UPDATES_PER_STEP}" \
+  model.model_config.self_forced.estimator_lr="${ESTIMATOR_LR}" \
   model.model_config.self_forced.estimator_warmup_steps="${ESTIMATOR_WARMUP_STEPS}" \
   model.model_config.self_forced.estimator_warmup_epochs="${ESTIMATOR_WARMUP_EPOCHS}" \
   model.model_config.self_forced.initialize_aux_from_generator_on_fit_start="${SF_INIT_AUX_FROM_GEN}" \
