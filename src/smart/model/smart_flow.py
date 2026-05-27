@@ -1912,24 +1912,23 @@ class SMARTFlow(LightningModule):
                 + "; ".join(mismatches)
             )
 
-    def _manual_backward_without_autocast(self, loss: Tensor) -> None:
-        """manual optimization의 backward만 autocast 밖에서 실행합니다.
+    def _manual_backward_without_autocast(self, loss: Tensor, retain_graph: bool = False) -> None:
+        """manual optimization 의 backward 만 autocast 밖에서 실행합니다.
 
         Args:
-            loss: backward를 수행할 scalar loss입니다.
-
-        Returns:
-            None
+            loss: backward 를 수행할 scalar loss.
+            retain_graph: ``True`` 면 backward 후 graph 를 유지합니다.
+                multi-anchor 학습 시 같은 rollout 결과를 여러 anchor 가 share 하므로
+                마지막 anchor 전까지 ``True`` 로 두어야 graph free 시점이 안 겹칩니다.
 
         설명:
-            ``loss.float()`` 으로 fp32 캐스팅을 유지합니다. ``precision='16-mixed'`` 인
-            경우 Lightning의 precision plugin이 ``manual_backward`` 안에서
-            ``GradScaler.scale`` 을 적용하므로, 이후 step은
-            ``_clip_and_step_with_optional_scaler`` 를 통해 unscale → clip → step → update
-            순서를 지킵니다.
+            ``loss.float()`` 으로 fp32 캐스팅을 유지합니다. ``precision='16-mixed'`` 인 경우
+            Lightning 의 precision plugin 이 ``manual_backward`` 안에서 ``GradScaler.scale`` 을
+            적용하므로, 이후 step 은 ``_clip_and_step_with_optional_scaler`` 를 통해
+            unscale → clip → step → update 순서를 지킵니다.
         """
         with torch.autocast(device_type=loss.device.type, enabled=False):
-            self.manual_backward(loss.float())
+            self.manual_backward(loss.float(), retain_graph=retain_graph)
 
     def _get_amp_grad_scaler(self) -> Any | None:
         """fp16 mixed precision에서 Lightning이 만든 GradScaler를 가져옵니다.
@@ -2880,7 +2879,14 @@ class SMARTFlow(LightningModule):
                             f"{self._summarize_nonfinite_tensor(total_loss_i)}"
                             f"{context}"
                         )
-                    self._manual_backward_without_autocast(total_loss_i)
+                    # multi-anchor 학습 시 같은 rollout 결과를 anchor 들이 share 하므로
+                    # 마지막 anchor 전까지 graph 를 유지해야 두 번째 anchor backward 가
+                    # 끊긴 graph 로 들어가는 race 를 막을 수 있다.
+                    is_last_anchor_in_rollout = anchor_idx == n_anchors - 1
+                    self._manual_backward_without_autocast(
+                        total_loss_i,
+                        retain_graph=not is_last_anchor_in_rollout,
+                    )
                     self._assert_self_forced_generator_update_isolated()
                     per_rollout_sf_losses.append(sf_loss_i.detach())
                     per_rollout_total_losses.append(total_loss_i.detach() * denom)
