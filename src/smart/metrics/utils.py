@@ -21,10 +21,53 @@ from src.smart.utils import cal_polygon_contour, transform_to_local, wrap_angle
 
 
 @torch.no_grad()
+def get_prob_targets_from_index(
+    gt_idx: Tensor,  # [n_agent, n_step]
+    token_traj: Tensor,  # [n_agent, n_token, 4, 2]
+    label_smoothing: float = 0.0,
+    spatial_aware_smoothing: bool = False,
+) -> Tensor:  # [n_agent, n_step, n_token] prob, last dim sum up to 1
+    closest_token_mask = one_hot(gt_idx, num_classes=token_traj.shape[1]).to(bool)
+    prob_target = torch.zeros(
+        gt_idx.shape[0],
+        gt_idx.shape[1],
+        token_traj.shape[1],
+        device=gt_idx.device,
+        dtype=token_traj.dtype,
+    )
+
+    if label_smoothing <= 0:
+        prob_target[closest_token_mask] = 1.0
+        return prob_target
+
+    if not spatial_aware_smoothing:
+        prob_target[closest_token_mask] = 1.0
+        return prob_target
+
+    gt_token_traj = torch.gather(
+        token_traj,
+        dim=1,
+        index=gt_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 4, 2),
+    )
+    dists = torch.norm(
+        gt_token_traj[:, :, None, :, :] - token_traj[:, None, :, :, :],
+        dim=-1,
+    ).mean(-1)
+    prob_target[closest_token_mask] = 1.0 - label_smoothing
+    inv_sq_dist = 1.0 / ((1.0e-4 + dists) ** 2)
+    inv_sq_dist = inv_sq_dist.masked_fill(closest_token_mask, 0.0)
+    normalizer = inv_sq_dist.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+    prob_target += inv_sq_dist / normalizer * label_smoothing
+    return prob_target
+
+
+@torch.no_grad()
 def get_prob_targets(
     target: Tensor,  # [n_agent, n_step, 3] x,y,yaw in local coord
     token_agent_shape: Tensor,  # [n_agent, 2]
     token_traj: Tensor,  # [n_agent, n_token, 4, 2]
+    label_smoothing: float = 0.0,
+    spatial_aware_smoothing: bool = False,
 ) -> Tensor:  # [n_agent, n_step, n_token] prob, last dim sum up to 1
     # ! tokenize to index, then compute prob
     contour = cal_polygon_contour(
@@ -40,10 +83,12 @@ def get_prob_targets(
         .argmin(-1)
     )  # [n_agent, n_step]
 
-    # [n_agent, n_step, n_token] bool
-    prob_target = one_hot(target_token_index, num_classes=token_traj.shape[1])
-    prob_target = prob_target.to(target.dtype)
-    return prob_target
+    return get_prob_targets_from_index(
+        gt_idx=target_token_index,
+        token_traj=token_traj,
+        label_smoothing=label_smoothing,
+        spatial_aware_smoothing=spatial_aware_smoothing,
+    )
 
 
 @torch.no_grad()

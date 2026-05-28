@@ -38,7 +38,7 @@
 2025년 1월
 - **WOSAC 최고 수준 성능**: CAT-K는 [WOSAC 리더보드](https://waymo.com/open/challenges/2024/sim-agents/) 1위를 달성했다. agent token vocabulary 문제를 해결한 뒤 fine-tuned model은 **0.7702** RMM을 달성했다. 리더보드에는 공개하지 않았지만 BC로 32 epoch만 학습한 재현 SMART-tiny-7M도 **0.7671** RMM을 달성했고, 이는 당시 2위 방법과 비슷한 수준이다. 재현 절차도 비교적 단순하다.
 
-- **agent token vocabulary 문제**: 기존에 사용하던 [agent token vocabulary 파일](src/smart/tokens/cluster_frame_5_2048_remove_duplicate.pkl)은 [SMART 저장소](https://github.com/rainmaker22/SMART/blob/main/smart/tokens/cluster_frame_5_2048.pkl)에서 가져온 것이지만, 최적 성능 재현용이 아니라 sanity check 용도였다. 이를 해결하기 위해 [trajectory clustering 스크립트](src/smart/tokens/traj_clustering.py)를 추가하고 [적절한 agent token vocabulary](src/smart/tokens/agent_vocab_555_s2.pkl)를 새로 만들었다. 이 스크립트는 SMART의 [k-disk clustering 스크립트](https://github.com/rainmaker22/SMART/blob/main/scripts/traj_clstering.py)를 기반으로 한다. 업데이트된 agent token 덕분에 모든 traffic simulation model에서 RMM이 약 +0.0060 개선되었다.
+- **TrajTok agent token vocabulary**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. SMART 계열 학습은 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)을 사용하며, loss는 spatial-aware label smoothing을 적용한다.
 
 ## 설치
 

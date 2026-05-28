@@ -3,15 +3,18 @@ from __future__ import annotations
 import torch
 from torch_geometric.data import HeteroData
 
-from src.smart.tokens.agent_token_matching import match_token_idx_from_local_contour
+from src.smart.tokens.agent_token_matching import (
+    build_agent_type_masks,
+    match_token_idx_from_local_contour,
+)
 from src.smart.tokens.token_processor import TokenProcessor
-from src.smart.utils import cal_polygon_contour, transform_to_global
+from src.smart.utils import cal_polygon_contour, merge_by_type, transform_to_global
 
 
 def _make_processor() -> TokenProcessor:
     processor = TokenProcessor(
         map_token_file="map_traj_token5.pkl",
-        agent_token_file="agent_vocab_555_s2.pkl",
+        agent_token_file="trajtok_vocab.pkl",
     )
     processor.train()
     return processor
@@ -136,14 +139,24 @@ def _reference_tokenize_agent(processor: TokenProcessor, data: HeteroData) -> di
         heading,
         vel,
     )
-    return _reference_match_agent_token_loop(
-        processor,
-        valid=valid,
-        pos=pos,
-        heading=heading,
-        agent_shape=agent_shape,
-        token_traj=token_traj,
-    )
+    out_by_type = {}
+    type_mask = build_agent_type_masks(data["agent"]["type"])
+    for agent_type, mask in type_mask.items():
+        out_by_type[agent_type] = _reference_match_agent_token_loop(
+            processor,
+            valid=valid[mask],
+            pos=pos[mask],
+            heading=heading[mask],
+            agent_shape=agent_shape[mask],
+            token_traj=token_traj[agent_type],
+        )
+    return {
+        key: merge_by_type(
+            {agent_type: value[key] for agent_type, value in out_by_type.items()},
+            type_mask,
+        )
+        for key in ("valid_mask", "gt_idx", "gt_pos", "gt_heading", "sampled_idx", "sampled_pos", "sampled_heading")
+    }
 
 
 def test_agent_token_matching_is_type_aware_argmin() -> None:

@@ -29,7 +29,7 @@ model_config:
   validation_closed_seed: 0
   token_processor:
     map_token_file: "map_traj_token5.pkl"
-    agent_token_file: "agent_vocab_555_s2.pkl"
+    agent_token_file: "trajtok_vocab.pkl"
   validation_rollout_sampling:
     criterium: topk_prob
     num_k: 5 # for k most likely
@@ -42,7 +42,7 @@ model_config:
     hidden_dim: 128
     num_freq_bands: 64
     num_heads: 8
-    head_dim: 16
+    head_dim: 11
     dropout: 0.1
     hist_drop_prob: 0.1
     num_map_layers: 3
@@ -68,5 +68,6 @@ model_config:
     use_gt_raw: true
     gt_thresh_scale_length: -1.0  # {"veh": 4.8, "cyc": 2.0, "ped": 1.0}
     label_smoothing: 0.1
+    spatial_aware_smoothing: true
     rollout_as_gt: false
   finetune: false

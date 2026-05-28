@@ -24,6 +24,7 @@ from src.smart.layers.attention_layer import AttentionLayer
 from src.smart.layers.fourier_embedding import FourierEmbedding, MLPEmbedding
 from src.smart.utils import (
     angle_between_2d_vectors,
+    merge_by_type,
     sample_next_token_traj,
     transform_to_global,
     weight_init,
@@ -47,7 +48,7 @@ class SMARTAgentDecoder(nn.Module):
         head_dim: int,
         dropout: float,
         hist_drop_prob: float,
-        n_token_agent: int,
+        n_token_agent: int | Dict[str, int],
     ) -> None:
         super(SMARTAgentDecoder, self).__init__()
         self.hidden_dim = hidden_dim
@@ -59,6 +60,8 @@ class SMARTAgentDecoder(nn.Module):
         self.num_layers = num_layers
         self.shift = 5
         self.hist_drop_prob = hist_drop_prob
+        self.n_token_agent = n_token_agent
+        self.multi_token_size = isinstance(n_token_agent, dict)
 
         input_dim_x_a = 2
         input_dim_r_t = 4
@@ -140,9 +143,21 @@ class SMARTAgentDecoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.token_predict_head = MLPLayer(
-            input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=n_token_agent
-        )
+        if self.multi_token_size:
+            self.token_predict_head = nn.ModuleDict(
+                {
+                    agent_type: MLPLayer(
+                        input_dim=hidden_dim,
+                        hidden_dim=hidden_dim,
+                        output_dim=n_token,
+                    )
+                    for agent_type, n_token in n_token_agent.items()
+                }
+            )
+        else:
+            self.token_predict_head = MLPLayer(
+                input_dim=hidden_dim, hidden_dim=hidden_dim, output_dim=n_token_agent
+            )
         self.apply(weight_init)
 
     def agent_token_embedding(
@@ -156,6 +171,7 @@ class SMARTAgentDecoder(nn.Module):
         agent_type,  # [n_agent]
         agent_shape,  # [n_agent, 3]
         inference=False,
+        **kwargs,
     ):
         n_agent, n_step, traj_dim = pos_a.shape
         _device = pos_a.device
@@ -461,12 +477,22 @@ class SMARTAgentDecoder(nn.Module):
             feat_a = feat_a.view(n_step, n_agent, -1).transpose(0, 1)
 
         # ! final mlp to get outputs
-        next_token_logits = self.token_predict_head(feat_a)
+        type_mask = tokenized_agent["type_mask"]
+        if self.multi_token_size:
+            next_token_logits = {
+                agent_type: self.token_predict_head[agent_type](feat_a[mask])[:, 1:-1]
+                for agent_type, mask in type_mask.items()
+            }
+        else:
+            next_token_logits = self.token_predict_head(feat_a)[:, 1:-1]
 
         return {
             # action that goes from [(10->15), ..., (85->90)]
-            "next_token_logits": next_token_logits[:, 1:-1],  # [n_agent, 16, n_token]
+            "next_token_logits": next_token_logits,  # type -> [n_agent_type, 16, n_token_type]
             "next_token_valid": tokenized_agent["valid_mask"][:, 1:-1],  # [n_agent, 16]
+            "gt_idx": tokenized_agent["gt_idx"][:, 2:],  # [n_agent, 16]
+            "gt_valid_mask": tokenized_agent["valid_mask"][:, 2:],  # [n_agent, 16]
+            "type_mask": type_mask,
             # for step {5, 10, ..., 90} and act [(0->5), (5->10), ..., (85->90)]
             "pred_pos": tokenized_agent["sampled_pos"],  # [n_agent, 18, 2]
             "pred_head": tokenized_agent["sampled_heading"],  # [n_agent, 18]
@@ -489,6 +515,7 @@ class SMARTAgentDecoder(nn.Module):
         scenario_sampling_seeds: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         n_agent = tokenized_agent["valid_mask"].shape[0]
+        type_mask = tokenized_agent["type_mask"]
         n_step_future_10hz = self.num_future_steps  # 80
         n_step_future_2hz = n_step_future_10hz // self.shift  # 16
         step_current_10hz = self.num_historical_steps - 1  # 10
@@ -529,7 +556,11 @@ class SMARTAgentDecoder(nn.Module):
             )
 
         pred_valid = tokenized_agent["valid_mask"].clone()
-        next_token_logits_list = []
+        next_token_logits_list = (
+            {agent_type: [] for agent_type in type_mask}
+            if self.multi_token_size
+            else []
+        )
         next_token_action_list = []
         feat_a_t_dict = {}
         sampling_generators_by_batch = self._build_sampling_generators_by_batch(
@@ -646,25 +677,62 @@ class SMARTAgentDecoder(nn.Module):
                         )
 
             # ! get outputs
-            next_token_logits = self.token_predict_head(feat_a_now)
-            next_token_logits_list.append(next_token_logits)  # [n_agent, n_token]
+            if self.multi_token_size:
+                next_token_idx_by_type = {}
+                next_token_traj_all_by_type = {}
+                for agent_type, mask in type_mask.items():
+                    if not bool(mask.any()):
+                        token_bank = tokenized_agent["token_traj_all"][agent_type]
+                        next_token_idx_by_type[agent_type] = torch.empty(
+                            0, dtype=torch.long, device=feat_a_now.device
+                        )
+                        next_token_traj_all_by_type[agent_type] = token_bank.new_zeros(
+                            (0,) + tuple(token_bank.shape[2:])
+                        )
+                        continue
 
-            next_token_idx, next_token_traj_all = sample_next_token_traj(
-                token_traj=tokenized_agent["token_traj"],
-                token_traj_all=tokenized_agent["token_traj_all"],
-                sampling_scheme=sampling_scheme,
-                # ! for most-likely sampling
-                next_token_logits=next_token_logits,
-                # ! for nearest-pos sampling
-                pos_now=pos_a[:, t_now],  # [n_agent, 2]
-                head_now=head_a[:, t_now],  # [n_agent]
-                pos_next_gt=tokenized_agent["gt_pos_raw"][:, n_step],  # [n_agent, 2]
-                head_next_gt=tokenized_agent["gt_head_raw"][:, n_step],  # [n_agent]
-                valid_next_gt=tokenized_agent["gt_valid_raw"][:, n_step],  # [n_agent]
-                token_agent_shape=tokenized_agent["token_agent_shape"],  # [n_token, 2]
-                sampling_generators_by_batch=sampling_generators_by_batch,
-                sampling_batch=sampling_batch,
-            )  # next_token_idx: [n_agent], next_token_traj_all: [n_agent, 6, 4, 2]
+                    next_token_logits_type = self.token_predict_head[agent_type](
+                        feat_a_now[mask]
+                    )
+                    next_token_logits_list[agent_type].append(next_token_logits_type)
+                    next_idx_type, next_traj_type = sample_next_token_traj(
+                        token_traj=tokenized_agent["token_traj"][agent_type],
+                        token_traj_all=tokenized_agent["token_traj_all"][agent_type],
+                        sampling_scheme=sampling_scheme,
+                        next_token_logits=next_token_logits_type,
+                        pos_now=pos_a[mask, t_now],
+                        head_now=head_a[mask, t_now],
+                        pos_next_gt=tokenized_agent["gt_pos_raw"][mask, n_step],
+                        head_next_gt=tokenized_agent["gt_head_raw"][mask, n_step],
+                        valid_next_gt=tokenized_agent["gt_valid_raw"][mask, n_step],
+                        token_agent_shape=tokenized_agent["token_agent_shape"][mask],
+                        sampling_generators_by_batch=sampling_generators_by_batch,
+                        sampling_batch=(
+                            sampling_batch[mask] if sampling_batch is not None else None
+                        ),
+                    )
+                    next_token_idx_by_type[agent_type] = next_idx_type
+                    next_token_traj_all_by_type[agent_type] = next_traj_type
+
+                next_token_idx = merge_by_type(next_token_idx_by_type, type_mask)
+                next_token_traj_all = merge_by_type(next_token_traj_all_by_type, type_mask)
+            else:
+                next_token_logits = self.token_predict_head(feat_a_now)
+                next_token_logits_list.append(next_token_logits)  # [n_agent, n_token]
+                next_token_idx, next_token_traj_all = sample_next_token_traj(
+                    token_traj=tokenized_agent["token_traj"],
+                    token_traj_all=tokenized_agent["token_traj_all"],
+                    sampling_scheme=sampling_scheme,
+                    next_token_logits=next_token_logits,
+                    pos_now=pos_a[:, t_now],
+                    head_now=head_a[:, t_now],
+                    pos_next_gt=tokenized_agent["gt_pos_raw"][:, n_step],
+                    head_next_gt=tokenized_agent["gt_head_raw"][:, n_step],
+                    valid_next_gt=tokenized_agent["gt_valid_raw"][:, n_step],
+                    token_agent_shape=tokenized_agent["token_agent_shape"],
+                    sampling_generators_by_batch=sampling_generators_by_batch,
+                    sampling_batch=sampling_batch,
+                )  # next_token_idx: [n_agent], next_token_traj_all: [n_agent, 6, 4, 2]
 
             diff_xy = next_token_traj_all[:, -1, 0] - next_token_traj_all[:, -1, 3]
             next_token_action_list.append(
@@ -745,10 +813,22 @@ class SMARTAgentDecoder(nn.Module):
             feat_a_next = self.fusion_emb(feat_a_next)
             feat_a = torch.cat([feat_a, feat_a_next], dim=1)
 
+        if self.multi_token_size:
+            next_token_logits_out = {
+                agent_type: torch.stack(logits, dim=1)
+                for agent_type, logits in next_token_logits_list.items()
+                if len(logits) > 0
+            }
+        else:
+            next_token_logits_out = torch.stack(next_token_logits_list, dim=1)
+
         out_dict = {
             # action that goes from [(10->15), ..., (85->90)]
-            "next_token_logits": torch.stack(next_token_logits_list, dim=1),
+            "next_token_logits": next_token_logits_out,
             "next_token_valid": pred_valid[:, 1:-1],  # [n_agent, 16]
+            "gt_idx": tokenized_agent["gt_idx"][:, 2:],  # [n_agent, 16]
+            "gt_valid_mask": tokenized_agent["valid_mask"][:, 2:],  # [n_agent, 16]
+            "type_mask": type_mask,
             # for step {5, 10, ..., 90} and act [(0->5), (5->10), ..., (85->90)]
             "pred_pos": pos_a,  # [n_agent, 18, 2]
             "pred_head": head_a,  # [n_agent, 18]

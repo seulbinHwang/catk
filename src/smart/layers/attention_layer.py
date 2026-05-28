@@ -9,6 +9,26 @@ from torch_geometric.utils import softmax
 from src.smart.utils import weight_init
 
 
+class SwiGLUFFN(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int | None = None,
+        out_features: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        hidden_features = (int(hidden_features * 2 / 3) + 7) // 8 * 8
+        self.w12 = nn.Linear(in_features, 2 * hidden_features, bias=bias)
+        self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = self.w12(x).chunk(2, dim=-1)
+        return self.w3(torch.nn.functional.silu(x1) * x2)
+
+
 class AttentionLayer(MessagePassing):
 
     def __init__(
@@ -37,12 +57,7 @@ class AttentionLayer(MessagePassing):
         self.to_g = nn.Linear(head_dim * num_heads + hidden_dim, head_dim * num_heads)
         self.to_out = nn.Linear(head_dim * num_heads, hidden_dim)
         self.attn_drop = nn.Dropout(dropout)
-        self.ff_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-        )
+        self.ff_mlp = SwiGLUFFN(hidden_dim, hidden_dim * 4, hidden_dim)
         if bipartite:
             self.attn_prenorm_x_src = nn.LayerNorm(hidden_dim)
             self.attn_prenorm_x_dst = nn.LayerNorm(hidden_dim)
