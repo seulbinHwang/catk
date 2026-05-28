@@ -1084,6 +1084,28 @@ torchrun -m src.run \
   task_name=rlftsim
 ```
 
+논문과 같은 총 8개 V100을 `svvvv-2-1`부터 `svvvv-2-4`까지 4개 pod, pod당 2개
+GPU로 사용할 때는 아래 wrapper를 쓴다. RLFTSim은 scenario마다 closed-loop rollout 4개를
+동시에 만들기 때문에 32GB V100에서 in-memory `train_batch_size=8`은 OOM이 난다. 이
+wrapper는 기본적으로 `train_batch_size=1`과 `accumulate_grad_batches=8`을 사용해서
+optimizer step 기준 GPU/process당 batch 8을 맞춘다. 따라서 전체 effective scenario batch는
+`8 GPUs * 8 = 64`이다. V100은 bf16 mixed precision을 지원하지 않으므로 launcher가
+`trainer.precision=16-mixed`를 기본으로 붙이고, V100 메모리에 맞춰 graph attention FP32
+강제 모드는 기본으로 끈다.
+
+```bash
+CKPT_PATH=/path/to/SMART_BC_PRETRAINED.ckpt \
+bash scripts/start_smart_rlftsim_v100x2x4.sh
+```
+
+파이프라인 smoke 검증만 하려면 같은 launcher에 batch 제한을 걸 수 있다.
+
+```bash
+CKPT_PATH=/path/to/SMART_BC_PRETRAINED.ckpt \
+LIMIT_TRAIN_BATCHES=8 LIMIT_VAL_BATCHES=1 \
+bash scripts/start_smart_rlftsim_v100x2x4.sh
+```
+
 ### RoaD 미세조정
 
 이 저장소는 아래 config를 통해 RoaD 스타일 closed-loop fine-tuning도 지원한다.

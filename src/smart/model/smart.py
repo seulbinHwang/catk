@@ -271,6 +271,8 @@ class SMART(LightningModule):
             )
         self._rlftsim_ref_encoder = None
         self._last_rlftsim_kl: float | None = None
+        self._rlftsim_kl_accum_sum = 0.0
+        self._rlftsim_kl_accum_count = 0
 
     @staticmethod
     def _repeat_tensor_on_first_dim(tensor: torch.Tensor, repeat_count: int) -> torch.Tensor:
@@ -538,6 +540,33 @@ class SMART(LightningModule):
             max(self.rlftsim_kl_min, self.rlftsim_kl_beta),
         )
 
+    def _record_rlftsim_kl_for_controller(self, kl: torch.Tensor) -> None:
+        self._rlftsim_kl_accum_sum += float(kl.detach().item())
+        self._rlftsim_kl_accum_count += 1
+
+    def _consume_rlftsim_kl_for_controller(self) -> None:
+        if self._rlftsim_kl_accum_count <= 0:
+            return
+        self._last_rlftsim_kl = (
+            self._rlftsim_kl_accum_sum / float(self._rlftsim_kl_accum_count)
+        )
+        self._rlftsim_kl_accum_sum = 0.0
+        self._rlftsim_kl_accum_count = 0
+
+    def _is_rlftsim_optimizer_step_boundary(self, batch_idx: int) -> bool:
+        trainer = getattr(self, "trainer", None)
+        accumulate_grad_batches = int(
+            getattr(trainer, "accumulate_grad_batches", 1) or 1
+        )
+        if accumulate_grad_batches <= 1:
+            return True
+        if (int(batch_idx) + 1) % accumulate_grad_batches == 0:
+            return True
+        num_training_batches = getattr(trainer, "num_training_batches", None)
+        if isinstance(num_training_batches, int):
+            return int(batch_idx) + 1 >= num_training_batches
+        return False
+
     def _validate_rlftsim_batch(self, data) -> None:
         if "tfrecord_path" not in data:
             raise RuntimeError(
@@ -576,6 +605,9 @@ class SMART(LightningModule):
     def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
         if not self.rlftsim_enabled:
             return
+        if not self._is_rlftsim_optimizer_step_boundary(batch_idx):
+            return
+        self._consume_rlftsim_kl_for_controller()
         self._update_rlftsim_kl_controller()
         if self.rlftsim_ref_sync_steps <= 0:
             return
@@ -1145,7 +1177,7 @@ class SMART(LightningModule):
         if self.rlftsim_entropy_bonus != 0.0:
             loss = loss - float(self.rlftsim_entropy_bonus) * entropy
 
-        self._last_rlftsim_kl = float(kl.detach().item())
+        self._record_rlftsim_kl_for_controller(kl)
         self.log("train/rlftsim_loss", loss, on_step=True, batch_size=1)
         self.log("train/rlftsim_policy_loss", policy_loss, on_step=True, batch_size=1)
         self.log("train/rlftsim_kl", kl.detach(), on_step=True, batch_size=1)

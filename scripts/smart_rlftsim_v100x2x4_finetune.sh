@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# Run goal-free RLFTSim fine-tuning on one node of a homogeneous V100x2x4 job.
+#
+# This script is executed inside each pod by
+# scripts/launch_smart_rlftsim_v100x2x4.py. It expects NODE_RANK,
+# MASTER_ADDR, NNODES, and NPROC_PER_NODE to be exported by the launcher.
+set -Eeuo pipefail
+
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+default_cache_root() {
+  printf '%s\n' "/workspace/womd_v1_3/SMART_cache"
+}
+
+activate_conda_if_available() {
+  if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then
+    if command -v python >/dev/null 2>&1 && command -v torchrun >/dev/null 2>&1; then
+      log "conda env already active: ${CONDA_DEFAULT_ENV}"
+      return 0
+    fi
+    log "conda env marker is set (${CONDA_DEFAULT_ENV}), but PATH is incomplete; reactivating."
+  fi
+
+  local conda_root="${CONDA_ROOT:-/mnt/nuplan/miniforge}"
+  if [[ -f "$conda_root/etc/profile.d/conda.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "$conda_root/etc/profile.d/conda.sh"
+    conda activate "${CATK_CONDA_ENV:-catk}" 2>/dev/null \
+      || conda activate base 2>/dev/null \
+      || true
+    log "conda env: ${CONDA_DEFAULT_ENV:-unknown}"
+    return 0
+  fi
+
+  if command -v conda >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    source "$(conda info --base)/etc/profile.d/conda.sh"
+    conda activate "${CATK_CONDA_ENV:-catk}" 2>/dev/null \
+      || conda activate base 2>/dev/null \
+      || true
+    log "conda env: ${CONDA_DEFAULT_ENV:-unknown}"
+    return 0
+  fi
+
+  log "conda not found; using current Python."
+}
+
+resolve_trainer_devices() {
+  local requested="$1"
+  case "$requested" in
+    gpu|auto)
+      python - <<'PY'
+import torch
+
+count = torch.cuda.device_count()
+if count < 1:
+    raise SystemExit("no CUDA devices are visible")
+print(count)
+PY
+      ;;
+    *)
+      printf '%s\n' "$requested"
+      ;;
+  esac
+}
+
+main() {
+  export LOGLEVEL="${LOGLEVEL:-INFO}"
+  export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"
+  export TF_CPP_MIN_LOG_LEVEL="${TF_CPP_MIN_LOG_LEVEL:-2}"
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+  export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+  export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+  export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+  export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
+  export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-eth0}"
+  export NCCL_SOCKET_FAMILY="${NCCL_SOCKET_FAMILY:-AF_INET}"
+  export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+  export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+  export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+  export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-14400}"
+  export TORCH_NCCL_BLOCKING_WAIT="${TORCH_NCCL_BLOCKING_WAIT:-0}"
+  export CATK_ATTENTION_GRAPH_FP32="${CATK_ATTENTION_GRAPH_FP32:-1}"
+
+  activate_conda_if_available
+
+  local cache_root="${CACHE_ROOT:-$(default_cache_root)}"
+  local nnodes="${NNODES:-4}"
+  local nproc_per_node="${NPROC_PER_NODE:-2}"
+  local trainer_devices="${TRAINER_DEVICES:-}"
+  local node_rank="${NODE_RANK:-}"
+  local master_addr="${MASTER_ADDR:-}"
+  local master_port="${MASTER_PORT:-29561}"
+  local experiment="${CATK_EXPERIMENT:-rlftsim}"
+  local action="${CATK_ACTION:-rlftsim_finetune}"
+  local task_name="${TASK_NAME:-smart_rlftsim_v100x2x4}"
+  local run_id="${CATK_RUN_ID:-}"
+  local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
+
+  case "$action" in
+    rlftsim_finetune|validate|test) ;;
+    *)
+      log "ERROR: CATK_ACTION must be rlftsim_finetune, validate, or test; got: $action"
+      exit 2
+      ;;
+  esac
+  if [[ -z "$ckpt_path" ]]; then
+    log "ERROR: CATK_CKPT_PATH or CKPT_PATH is required for RLFTSim runs."
+    exit 2
+  fi
+  if [[ ! -f "$ckpt_path" ]]; then
+    log "ERROR: checkpoint does not exist in this node: $ckpt_path"
+    exit 2
+  fi
+  if [[ "$nnodes" -gt 1 && -z "$node_rank" ]]; then
+    log "ERROR: multi-node launch requires NODE_RANK."
+    exit 2
+  fi
+  if [[ "$nnodes" -gt 1 && -z "$master_addr" ]]; then
+    log "ERROR: multi-node launch requires MASTER_ADDR."
+    exit 2
+  fi
+  if [[ ! -d "$cache_root" ]]; then
+    log "ERROR: CACHE_ROOT does not exist in this node: $cache_root"
+    exit 2
+  fi
+  if [[ "$action" == "rlftsim_finetune" && ! -d "$cache_root/training_tfrecords_splitted" ]]; then
+    log "ERROR: RLFTSim training requires $cache_root/training_tfrecords_splitted."
+    exit 2
+  fi
+  if [[ ! -d "$cache_root/validation_tfrecords_splitted" ]]; then
+    log "ERROR: validation fast RMM requires $cache_root/validation_tfrecords_splitted."
+    exit 2
+  fi
+  if [[ -z "$trainer_devices" ]]; then
+    trainer_devices="$(resolve_trainer_devices "$nproc_per_node")"
+  fi
+  if ! [[ "$trainer_devices" =~ ^[0-9]+$ ]] || (( trainer_devices < 1 )); then
+    log "ERROR: resolved trainer.devices must be a positive integer; got: $trainer_devices"
+    exit 2
+  fi
+
+  local extra_overrides=()
+  if [[ -n "${CATK_HYDRA_OVERRIDES:-}" ]]; then
+    read -r -a extra_overrides <<< "$CATK_HYDRA_OVERRIDES"
+  fi
+
+  log "starting SMART RLFTSim V100x2x4 run"
+  log "  experiment:       $experiment"
+  log "  action:           $action"
+  log "  task_name:        $task_name"
+  log "  run_id:           ${run_id:-auto}"
+  log "  nnodes:           $nnodes"
+  log "  nproc_per_node:   $nproc_per_node"
+  log "  trainer.devices:  $trainer_devices"
+  log "  node_rank:        ${node_rank:-0}"
+  log "  master_addr:      $master_addr"
+  log "  master_port:      $master_port"
+  log "  cache_root:       $cache_root"
+  log "  ckpt_path:        $ckpt_path"
+  log "  graph_attn_fp32:  $CATK_ATTENTION_GRAPH_FP32"
+
+  local app_args=(
+    -m src.run
+    experiment="$experiment"
+    action="$action"
+    trainer=ddp
+    trainer.devices="$trainer_devices"
+    trainer.num_nodes="$nnodes"
+    ++trainer.enable_progress_bar=true
+    paths.cache_root="$cache_root"
+    task_name="$task_name"
+    ckpt_path="$ckpt_path"
+  )
+  if [[ -n "$run_id" ]]; then
+    app_args+=("hydra.run.dir=${LOG_DIR:-${PWD}/logs}/${task_name}/runs/${run_id}")
+  fi
+  if [[ -n "${LOG_DIR:-}" ]]; then
+    app_args+=(paths.log_dir="$LOG_DIR")
+  fi
+  if [[ -n "${TRAIN_BATCH_SIZE:-}" ]]; then
+    app_args+=(data.train_batch_size="$TRAIN_BATCH_SIZE")
+  fi
+  if [[ -n "${VAL_BATCH_SIZE:-}" ]]; then
+    app_args+=(data.val_batch_size="$VAL_BATCH_SIZE")
+  fi
+  if [[ -n "${TEST_BATCH_SIZE:-}" ]]; then
+    app_args+=(data.test_batch_size="$TEST_BATCH_SIZE")
+  fi
+  if [[ -n "${ACCUMULATE_GRAD_BATCHES:-}" ]]; then
+    app_args+=(trainer.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES")
+  fi
+  if [[ -n "${LIMIT_TRAIN_BATCHES:-}" ]]; then
+    app_args+=(trainer.limit_train_batches="$LIMIT_TRAIN_BATCHES")
+  fi
+  if [[ -n "${LIMIT_VAL_BATCHES:-}" ]]; then
+    app_args+=(trainer.limit_val_batches="$LIMIT_VAL_BATCHES")
+  fi
+  if [[ -n "${LIMIT_TEST_BATCHES:-}" ]]; then
+    app_args+=(trainer.limit_test_batches="$LIMIT_TEST_BATCHES")
+  fi
+  if [[ -n "${MAX_EPOCHS:-}" ]]; then
+    app_args+=(trainer.max_epochs="$MAX_EPOCHS")
+  fi
+  if [[ -n "${CATK_LR:-}" ]]; then
+    app_args+=(model.model_config.lr="$CATK_LR")
+  fi
+  if (( ${#extra_overrides[@]} > 0 )); then
+    app_args+=("${extra_overrides[@]}")
+  fi
+  app_args+=("$@")
+
+  local torchrun_args=(
+    --nnodes "$nnodes"
+    --nproc_per_node "$nproc_per_node"
+    --node_rank "${node_rank:-0}"
+    --master_addr "$master_addr"
+    --master_port "$master_port"
+    "${app_args[@]}"
+  )
+
+  log "torchrun command:"
+  printf '  %q' torchrun "${torchrun_args[@]}"
+  printf '\n'
+  exec torchrun "${torchrun_args[@]}"
+}
+
+main "$@"
