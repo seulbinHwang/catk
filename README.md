@@ -188,10 +188,13 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_legacy_inputs_oom_retry.sh
 
 이 wrapper는 일반 OOM retry wrapper를 그대로 호출한다. 기본값은 `testa testaa`,
 `experiment=pre_bc_a100x4x2`, `INITIAL_BS=14`, `OOM_STEP=1`, `MIN_BS=8`,
-`VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12`이고, task name은
+`VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12`이고,
+`data.train_use_eval_agent_selection=false`를 항상 추가한다. task name은
 `smart_ntp_pretrain_a100x4x2_bs14_oom_retry_main_original_legacy_inputs`이다. 따라서 과거
 W&B run의 학습 recipe를 기준으로 하되, 이번 run은 `original` 이름과 batch 14 시작값으로
-구분되고, 모델 입력 특징은 현재 main의 `5a31008` 이후 상태를 따른다. 다른 이름으로
+구분되고, 모델 입력 특징은 현재 main의 `5a31008` 이후 상태를 따른다. 학습 target
+selection은 validation/eval agent selection을 쓰지 않고, legacy SMART pretrain처럼
+ego 기준 거리와 `train_max_num`을 거친 학습 전용 `train_mask`를 사용한다. 다른 이름으로
 기록하려면 `TASK_NAME=...`을 환경 변수로 넘긴다.
 
 launcher는 pod를 만들거나 지우지 않는다. 로컬에서 `kubectl exec`로 이미 떠 있는 두 pod에
