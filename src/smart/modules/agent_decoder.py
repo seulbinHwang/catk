@@ -513,8 +513,10 @@ class SMARTAgentDecoder(nn.Module):
         map_feature: Dict[str, torch.Tensor],
         sampling_scheme: DictConfig,
         scenario_sampling_seeds: Optional[torch.Tensor] = None,
+        forced_next_token_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         n_agent = tokenized_agent["valid_mask"].shape[0]
+        range_a = torch.arange(n_agent, device=tokenized_agent["valid_mask"].device)
         type_mask = tokenized_agent["type_mask"]
         n_step_future_10hz = self.num_future_steps  # 80
         n_step_future_2hz = n_step_future_10hz // self.shift  # 16
@@ -572,6 +574,16 @@ class SMARTAgentDecoder(nn.Module):
             if sampling_generators_by_batch is not None
             else None
         )
+        if forced_next_token_idx is not None:
+            expected_shape = (n_agent, n_step_future_2hz)
+            if tuple(forced_next_token_idx.shape) != expected_shape:
+                raise ValueError(
+                    "forced_next_token_idx must have shape "
+                    f"{expected_shape}, got {tuple(forced_next_token_idx.shape)}."
+                )
+            forced_next_token_idx = forced_next_token_idx.to(
+                device=pos_a.device, dtype=torch.long
+            )
         for t in range(n_step_future_2hz):  # 0 -> 15
             t_now = step_current_2hz - 1 + t  # 1 -> 16
             n_step = t_now + 1  # 2 -> 17
@@ -695,22 +707,31 @@ class SMARTAgentDecoder(nn.Module):
                         feat_a_now[mask]
                     )
                     next_token_logits_list[agent_type].append(next_token_logits_type)
-                    next_idx_type, next_traj_type = sample_next_token_traj(
-                        token_traj=tokenized_agent["token_traj"][agent_type],
-                        token_traj_all=tokenized_agent["token_traj_all"][agent_type],
-                        sampling_scheme=sampling_scheme,
-                        next_token_logits=next_token_logits_type,
-                        pos_now=pos_a[mask, t_now],
-                        head_now=head_a[mask, t_now],
-                        pos_next_gt=tokenized_agent["gt_pos_raw"][mask, n_step],
-                        head_next_gt=tokenized_agent["gt_head_raw"][mask, n_step],
-                        valid_next_gt=tokenized_agent["gt_valid_raw"][mask, n_step],
-                        token_agent_shape=tokenized_agent["token_agent_shape"][mask],
-                        sampling_generators_by_batch=sampling_generators_by_batch,
-                        sampling_batch=(
-                            sampling_batch[mask] if sampling_batch is not None else None
-                        ),
-                    )
+                    if forced_next_token_idx is None:
+                        next_idx_type, next_traj_type = sample_next_token_traj(
+                            token_traj=tokenized_agent["token_traj"][agent_type],
+                            token_traj_all=tokenized_agent["token_traj_all"][agent_type],
+                            sampling_scheme=sampling_scheme,
+                            next_token_logits=next_token_logits_type,
+                            pos_now=pos_a[mask, t_now],
+                            head_now=head_a[mask, t_now],
+                            pos_next_gt=tokenized_agent["gt_pos_raw"][mask, n_step],
+                            head_next_gt=tokenized_agent["gt_head_raw"][mask, n_step],
+                            valid_next_gt=tokenized_agent["gt_valid_raw"][mask, n_step],
+                            token_agent_shape=tokenized_agent["token_agent_shape"][mask],
+                            sampling_generators_by_batch=sampling_generators_by_batch,
+                            sampling_batch=(
+                                sampling_batch[mask] if sampling_batch is not None else None
+                            ),
+                        )
+                    else:
+                        range_type = torch.arange(
+                            int(mask.sum()), device=feat_a_now.device
+                        )
+                        next_idx_type = forced_next_token_idx[mask, t]
+                        next_traj_type = tokenized_agent["token_traj_all"][agent_type][
+                            range_type, next_idx_type
+                        ]
                     next_token_idx_by_type[agent_type] = next_idx_type
                     next_token_traj_all_by_type[agent_type] = next_traj_type
 
@@ -719,20 +740,26 @@ class SMARTAgentDecoder(nn.Module):
             else:
                 next_token_logits = self.token_predict_head(feat_a_now)
                 next_token_logits_list.append(next_token_logits)  # [n_agent, n_token]
-                next_token_idx, next_token_traj_all = sample_next_token_traj(
-                    token_traj=tokenized_agent["token_traj"],
-                    token_traj_all=tokenized_agent["token_traj_all"],
-                    sampling_scheme=sampling_scheme,
-                    next_token_logits=next_token_logits,
-                    pos_now=pos_a[:, t_now],
-                    head_now=head_a[:, t_now],
-                    pos_next_gt=tokenized_agent["gt_pos_raw"][:, n_step],
-                    head_next_gt=tokenized_agent["gt_head_raw"][:, n_step],
-                    valid_next_gt=tokenized_agent["gt_valid_raw"][:, n_step],
-                    token_agent_shape=tokenized_agent["token_agent_shape"],
-                    sampling_generators_by_batch=sampling_generators_by_batch,
-                    sampling_batch=sampling_batch,
-                )  # next_token_idx: [n_agent], next_token_traj_all: [n_agent, 6, 4, 2]
+                if forced_next_token_idx is None:
+                    next_token_idx, next_token_traj_all = sample_next_token_traj(
+                        token_traj=tokenized_agent["token_traj"],
+                        token_traj_all=tokenized_agent["token_traj_all"],
+                        sampling_scheme=sampling_scheme,
+                        next_token_logits=next_token_logits,
+                        pos_now=pos_a[:, t_now],
+                        head_now=head_a[:, t_now],
+                        pos_next_gt=tokenized_agent["gt_pos_raw"][:, n_step],
+                        head_next_gt=tokenized_agent["gt_head_raw"][:, n_step],
+                        valid_next_gt=tokenized_agent["gt_valid_raw"][:, n_step],
+                        token_agent_shape=tokenized_agent["token_agent_shape"],
+                        sampling_generators_by_batch=sampling_generators_by_batch,
+                        sampling_batch=sampling_batch,
+                    )  # next_token_idx: [n_agent], next_token_traj_all: [n_agent, 6, 4, 2]
+                else:
+                    next_token_idx = forced_next_token_idx[:, t]
+                    next_token_traj_all = tokenized_agent["token_traj_all"][
+                        range_a, next_token_idx
+                    ]
 
             diff_xy = next_token_traj_all[:, -1, 0] - next_token_traj_all[:, -1, 3]
             next_token_action_list.append(

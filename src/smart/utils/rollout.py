@@ -301,6 +301,17 @@ def sample_next_token_traj(
     range_a = torch.arange(next_token_logits.shape[0], device=device)
     next_token_logits = next_token_logits.detach()
 
+    if sampling_scheme.criterium in {"categorical", "full_prob"}:
+        temperature = float(sampling_scheme.temp)
+        if temperature <= 0:
+            raise ValueError(f"temperature should be positive, got {temperature}")
+        samples = _sample_categorical_logits_by_batch(
+            logits=next_token_logits / temperature,
+            batch_index=sampling_batch,
+            generators_by_batch=sampling_generators_by_batch,
+        )
+        return samples, token_traj_all[range_a, samples]
+
     if sampling_scheme.criterium == "road_samplek_dist":
         candidate_indices = sample_policy_token_candidates(
             next_token_logits=next_token_logits,

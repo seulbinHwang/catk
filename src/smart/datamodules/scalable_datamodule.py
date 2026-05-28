@@ -49,6 +49,7 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        train_tfrecords_splitted: Optional[str] = None,
         train_use_eval_agent_selection: bool = False,
         road_num_rollouts_per_scenario: int = 1,
         train_memory_balanced_batching: bool = False,
@@ -69,6 +70,7 @@ class MultiDataModule(LightningDataModule):
         self.train_raw_dir = train_raw_dir
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
+        self.train_tfrecords_splitted = train_tfrecords_splitted
         self.val_tfrecords_splitted = val_tfrecords_splitted
         self.train_use_eval_agent_selection = train_use_eval_agent_selection
         self.road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
@@ -116,6 +118,7 @@ class MultiDataModule(LightningDataModule):
         self.train_dataset = MultiDataset(
             self.train_raw_dir,
             self.train_transform,
+            tfrecord_dir=self.train_tfrecords_splitted,
             road_num_rollouts_per_scenario=self.road_num_rollouts_per_scenario,
         )
         self._train_dataset_raw_dir = self.train_raw_dir

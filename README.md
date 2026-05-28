@@ -1053,6 +1053,37 @@ python -m src.run \
 
 `n_rollout_closed_val=32`이면 metric은 32개 rollout을 사용한다. 이 값을 16으로 바꾸면 이미 생성된 16개 rollout을 사용한다.
 
+### RLFTSim 미세조정
+
+`configs/experiment/rlftsim.yaml`은 goal-free RLFTSim 스타일 fine-tuning 설정이다.
+Pretrained SMART checkpoint에서 시작해 scenario마다 closed-loop rollout 4개를 만들고,
+Fast WOSAC 2025 RMM의 leave-one-out 차이로 MLOO reward를 계산한 뒤 REINFORCE +
+reference KL regularization으로 업데이트한다. 목표 조건부 제어는 넣지 않는다.
+
+기본 실행값은 논문 설정에 맞춰 `lr=3e-6`, `train_batch_size=8`, `max_epochs=1`,
+`gradient_clip_val=1.0`, `rlftsim.train_rollouts_per_scenario=4`,
+`rlftsim.kl_target=0.01`로 둔다. 평가와 제출은 기존 closed-loop 경로를 그대로 쓰며,
+`n_rollout_closed_val=32`이면 Fast RMM/Sim Agents submission도 32 rollout 기준이다.
+
+RLFTSim reward는 map-based/traffic-light feature까지 포함한 Fast RMM을 계산해야 하므로
+train split도 scenario별 TFRecord가 필요하다. 원본 WOMD TFRecord package가 있다면:
+
+```bash
+python scripts/split_waymo_tfrecords_by_scenario.py \
+  --input-dir /path/to/womd/scenario/training \
+  --output-dir "$CACHE_ROOT/training_tfrecords_splitted"
+```
+
+그다음 아래처럼 실행한다.
+
+```bash
+torchrun -m src.run \
+  experiment=rlftsim \
+  paths.cache_root="$CACHE_ROOT" \
+  ckpt_path=/path/to/SMART_BC_PRETRAINED.ckpt \
+  task_name=rlftsim
+```
+
 ### RoaD 미세조정
 
 이 저장소는 아래 config를 통해 RoaD 스타일 closed-loop fine-tuning도 지원한다.

@@ -8,6 +8,7 @@ pin_memory: true
 persistent_workers: true
 train_raw_dir: ${paths.cache_root}/training
 val_raw_dir: ${paths.cache_root}/validation
+train_tfrecords_splitted: null
 val_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
 test_raw_dir: ${paths.cache_root}/testing
 train_max_num: 32
