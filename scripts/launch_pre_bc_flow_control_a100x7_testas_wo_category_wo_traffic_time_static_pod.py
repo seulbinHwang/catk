@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch wo-category + wo-traffic-time ablation pretrain on the testas A100x7 pod.
+"""Launch holonomic wo-category + wo-traffic-time ablation pretrain on testas A100x7.
 
 This launcher targets one existing pod only. It never creates, deletes, or
 restarts pods; it starts/stops only one tmux session and task-specific training
@@ -25,14 +25,15 @@ DEFAULT_REMOTE_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip"
 DEFAULT_TASK_NAME = (
     "flow_control_space_pretrain_a100x7_wo_category_wo_traffic_time_"
-    "prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs16"
+    "holonomic_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs16"
 )
-DEFAULT_SESSION = "catk-control-pretrain-a100x7-wo-category-wo-traffic-time"
+DEFAULT_SESSION = "catk-control-pretrain-a100x7-wo-category-wo-traffic-time-holonomic"
 DEFAULT_METADATA_CACHE = (
     "dataset_metadata/"
     "womd_training_memory_balance_a100x7_testas_wo_category_wo_traffic_time.pt"
 )
 DEFAULT_REMOTE_PYTHON = "/mnt/nuplan/miniforge/envs/catk/bin/python"
+DEFAULT_HOLONOMIC_OVERRIDE = "model.model_config.token_processor.use_holonomic_model_only=true"
 
 
 def shq(value: object) -> str:
@@ -219,6 +220,7 @@ def render_remote_train_script(args: argparse.Namespace, *, gpu_count: int) -> s
             f"data.train_memory_balance_metadata_cache={metadata}",
             "data.train_memory_balance_build_on_missing=false",
             args.extra_hydra_overrides.strip(),
+            DEFAULT_HOLONOMIC_OVERRIDE,
         )
         if part
     )
@@ -258,9 +260,10 @@ RUN_LOG={shq(run_log)}
 mkdir -p "$RUN_ROOT"
 cd "$PROJECT_ROOT"
 
-echo "[$(date '+%F %T')] A100x7 wo-category + wo-traffic-time pretrain start" | tee -a "$RUN_LOG"
+echo "[$(date '+%F %T')] A100x7 holonomic wo-category + wo-traffic-time pretrain start" | tee -a "$RUN_LOG"
 echo "branch={args.branch} commit=$(git rev-parse --short HEAD)" | tee -a "$RUN_LOG"
 echo "pod={args.pod} gpu_count={gpu_count} train_batch_size={args.train_batch_size} val_batch_size={args.val_batch_size}" | tee -a "$RUN_LOG"
+echo "holonomic_override={DEFAULT_HOLONOMIC_OVERRIDE}" | tee -a "$RUN_LOG"
 echo "metadata={metadata}" | tee -a "$RUN_LOG"
 
 export CATK_EXPERIMENT={shq(args.experiment)}
@@ -321,7 +324,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Launch semi_control_stable_wo_category_wo_traffic_time pretrain on "
-            "the existing testas A100x7 pod."
+            "the existing testas A100x7 pod with use_holonomic_model_only=true."
         )
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", DEFAULT_NAMESPACE))
