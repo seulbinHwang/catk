@@ -267,6 +267,19 @@ class SMARTFlow(LightningModule):
                 "self_forced.distribution_matching_objective must be 'dmd' or 'sid', "
                 f"got {self.self_forced_distribution_matching_objective}."
             )
+        # Backprop 검증용 proxy loss.  none → 실제 DMD/SiD.  l2_to_zero → committed_path_norm 의
+        # 제곱 평균을 minimize (encoder 가 path 를 0 으로 줄이도록 학습).  l2_to_gt → anchor k 의
+        # GT path 와 의 L2 (closed-loop BC).  l2_to_gt 는 replicate-aware (n_rollouts>1 OK).
+        self.self_forced_debug_proxy_loss = (
+            str(getattr(self.self_forced_config, "debug_proxy_loss", "none")).lower()
+            if self.self_forced_config is not None
+            else "none"
+        )
+        if self.self_forced_debug_proxy_loss not in {"none", "l2_to_zero", "l2_to_gt"}:
+            raise ValueError(
+                "self_forced.debug_proxy_loss must be 'none', 'l2_to_zero', or 'l2_to_gt', "
+                f"got {self.self_forced_debug_proxy_loss}."
+            )
         self.self_forced_sid_alpha = (
             float(getattr(self.self_forced_config, "sid_alpha", 1.0))
             if self.self_forced_config is not None
@@ -317,8 +330,9 @@ class SMARTFlow(LightningModule):
             else 1
         )
         # OCSC dmd_n_rollouts 정합 — 같은 anchor 0 에서 N rollout 으로 DMD direction variance↓.
-        # 매 inner rollout 마다 critic update + DMD/SiD backward (grad accumulate); generator
-        # optimizer step 은 batch 당 한 번.  default 1 = 기존 동작.
+        # 구현은 batch-replicate: scenario 를 N 장 복제해 단일 rollout 한 번에 N noise tape 처리.
+        # walltime ≈ 1× (sequential 대비), VRAM 은 ~N 배.  critic / DMD direction 도 같은 packed
+        # dim 에서 작동하므로 별도 분기 없이 평균에 포함됨.  default 1 = 기존 동작.
         self.self_forced_n_rollouts = (
             max(1, int(getattr(self.self_forced_config, "n_rollouts", 1)))
             if self.self_forced_config is not None
@@ -2132,6 +2146,118 @@ class SMARTFlow(LightningModule):
         self._set_token_processor_training_mode(was_training)
         return tokenized_map, tokenized_agent
 
+    # vocab-shared / packed-eval 텐서는 replicate 대상이 아님.  첫 dim 이 n_agent 와
+    # 우연히 같아도 잘못 늘리지 않게 명시 skip-set 으로 보호.
+    _SELF_FORCED_REPLICATE_SKIP_KEYS = frozenset(
+        {
+            # vocab buffers (shape [vocab_size, ...])
+            "trajectory_token_veh",
+            "trajectory_token_ped",
+            "trajectory_token_cyc",
+            "token_bank_all_veh",
+            "token_bank_all_ped",
+            "token_bank_all_cyc",
+            "token_traj_src",
+            # packed eval-only tensors (self-forced critic/DMD 에서 미사용)
+            "flow_eval_clean_norm",
+            "flow_eval_clean_metric_norm",
+            "flow_eval_agent_type",
+            "flow_eval_agent_length",
+            "flow_train_clean_norm",
+            "flow_train_clean_metric_norm",
+            "flow_train_loss_mask",
+            "flow_train_agent_type",
+            "flow_train_agent_length",
+        }
+    )
+
+    def _replicate_token_dict_along_first_dim(
+        self,
+        token_dict: Dict[str, Tensor],
+        first_dim_size: int,
+        num_graphs: int,
+        repeat_count: int,
+    ) -> Dict[str, Tensor]:
+        """첫 dim 이 ``first_dim_size`` 인 모든 tensor 를 ``repeat_count`` 배로 복제합니다.
+
+        ``batch`` 는 ``+ i*num_graphs`` 로 offset, ``num_graphs`` 는 ``× repeat_count`` 로
+        scale, vocab-shared / packed eval 텐서는 그대로 통과시킵니다.
+        """
+        if repeat_count == 1:
+            return token_dict
+        replicated: Dict[str, Tensor] = {}
+        for key, value in token_dict.items():
+            if key == "num_graphs":
+                replicated[key] = int(value) * repeat_count
+                continue
+            if key == "batch":
+                replicated[key] = self._expand_batch_index_for_rollouts(
+                    value,
+                    repeat_count=repeat_count,
+                    num_graphs=num_graphs,
+                )
+                continue
+            if key in self._SELF_FORCED_REPLICATE_SKIP_KEYS:
+                replicated[key] = value
+                continue
+            if torch.is_tensor(value) and value.dim() >= 1 and value.shape[0] == first_dim_size:
+                replicated[key] = self._repeat_tensor_on_first_dim(value, repeat_count)
+                continue
+            replicated[key] = value
+        return replicated
+
+    def _build_self_forced_replicated_tokens(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        repeat_count: int,
+    ) -> tuple[Dict[str, Tensor], Dict[str, Tensor]]:
+        """self-forced rollout 을 N 배 batch 로 묶기 위해 두 dict 를 복제합니다.
+
+        Args:
+            tokenized_map: ``_build_eval_tokenized_inputs`` 가 만든 map token.
+            tokenized_agent: ``_build_eval_tokenized_inputs`` 가 만든 agent token.
+            repeat_count: rollout 복제 수 (``self_forced_n_rollouts`` 값).
+
+        Returns:
+            tuple: ``(replicated_tokenized_map, replicated_tokenized_agent)``.
+            ``repeat_count == 1`` 이면 입력을 그대로 돌려줍니다.
+
+        설명:
+            scenario 를 N 장 복제해서 한 번의 closed-loop rollout 으로 N 개의 noise tape
+            샘플을 동시에 굴리기 위함입니다.  agent-dim / map-dim tensor 는 첫 dim 으로
+            repeat 하고, ``batch`` 는 ``+ i*num_graphs`` 로 offset 해서 PyG 가 N 배 큰
+            장면 묶음으로 인식하도록 만듭니다.  vocab buffer 와 packed eval-only tensor
+            는 변경하지 않습니다 (self-forced critic/DMD pass 에서 사용되지 않음).
+        """
+        if repeat_count <= 1:
+            return tokenized_map, tokenized_agent
+        if "batch" not in tokenized_agent or "num_graphs" not in tokenized_agent:
+            raise KeyError(
+                "tokenized_agent must contain 'batch' and 'num_graphs' for self-forced "
+                "rollout replication."
+            )
+        if "batch" not in tokenized_map:
+            raise KeyError(
+                "tokenized_map must contain 'batch' for self-forced rollout replication."
+            )
+        num_graphs = int(tokenized_agent["num_graphs"])
+        n_agent = int(tokenized_agent["batch"].shape[0])
+        n_pl = int(tokenized_map["batch"].shape[0])
+        replicated_agent = self._replicate_token_dict_along_first_dim(
+            token_dict=tokenized_agent,
+            first_dim_size=n_agent,
+            num_graphs=num_graphs,
+            repeat_count=repeat_count,
+        )
+        replicated_map = self._replicate_token_dict_along_first_dim(
+            token_dict=tokenized_map,
+            first_dim_size=n_pl,
+            num_graphs=num_graphs,
+            repeat_count=repeat_count,
+        )
+        return replicated_map, replicated_agent
+
     def _get_self_forced_rollout_steps_2hz(self) -> int:
         """0.5 초 commit block 수.
 
@@ -2597,6 +2723,98 @@ class SMARTFlow(LightningModule):
             normalizer_eps=self.self_forced_sid_normalizer_eps,
         )
 
+    def _compute_self_forced_debug_proxy_loss(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        committed_path_norm: Tensor,
+        anchor_idx: int = 0,
+    ) -> Tensor:
+        """Backprop 검증용 proxy loss.
+
+        Args:
+            tokenized_agent: 평가 모드 agent token 사전 (n_rollouts>1 이면 replicate 된 상태).
+            committed_path_norm: Generator 가 실행한 self-forced path. shape은 ``[n_pack, F_win, C]``.
+            anchor_idx: 사용할 anchor 인덱스.
+
+        Returns:
+            Tensor: scalar proxy loss.
+
+        설명:
+            ``l2_to_zero`` 는 committed path 의 제곱 평균.  encoder 가 path 출력을 0 으로
+            줄이도록 학습 → loss 가 0 으로 단조 감소해야 backprop 정상.
+            ``l2_to_gt`` 는 anchor k 의 GT path (``flow_eval_clean_norm`` 의 anchor k chunk) 와의
+            L2.  n_rollouts>1 이면 GT chunk 를 N 배로 repeat 해 committed shape 에 맞춤
+            (committed_path_norm 은 replica 0 agents → replica 1 agents → ... 순으로 packed 됨).
+        """
+        mode = self.self_forced_debug_proxy_loss
+        if committed_path_norm.numel() == 0:
+            return committed_path_norm.new_zeros(())
+        if mode == "l2_to_zero":
+            return committed_path_norm.float().square().mean()
+        if mode != "l2_to_gt":
+            raise ValueError(f"unsupported debug_proxy_loss={mode}")
+        if "flow_eval_clean_norm" not in tokenized_agent or "flow_eval_mask" not in tokenized_agent:
+            raise KeyError(
+                "l2_to_gt requires 'flow_eval_clean_norm' and 'flow_eval_mask' in tokenized_agent."
+            )
+        flow_eval_mask = tokenized_agent["flow_eval_mask"]
+        flow_eval_clean_norm = tokenized_agent["flow_eval_clean_norm"]
+        # replicate 후에도 flow_eval_clean_norm 은 원본 packed 유지 (skip set).
+        # replica 수 = replicated_n_agent / orig_n_agent.  flow_eval_mask 는 replica 간 동일하므로
+        # 첫 n_orig_agent 만 보고 n_per_anchor 계산 → 원본 anchor k chunk 추출.
+        replicated_n_agent = int(flow_eval_mask.shape[0])
+        max_anchor = int(flow_eval_mask.shape[1])
+        if not (0 <= anchor_idx < max_anchor):
+            raise ValueError(
+                f"anchor_idx={anchor_idx} out of range [0, {max_anchor})."
+            )
+        n_rollouts = max(1, int(self.self_forced_n_rollouts))
+        if replicated_n_agent % n_rollouts != 0:
+            raise RuntimeError(
+                "replicated agent count not divisible by n_rollouts: "
+                f"replicated_n_agent={replicated_n_agent}, n_rollouts={n_rollouts}."
+            )
+        n_orig_agent = replicated_n_agent // n_rollouts
+        orig_flow_eval_mask = flow_eval_mask[:n_orig_agent]
+        n_per_anchor = orig_flow_eval_mask.sum(dim=0)  # [n_anchor]
+        start = int(n_per_anchor[:anchor_idx].sum().item())
+        end = start + int(n_per_anchor[anchor_idx].item())
+        gt_chunk = flow_eval_clean_norm[start:end]  # [n_per_anchor_k, F_win, 4]
+        if gt_chunk.shape[-1] != committed_path_norm.shape[-1]:
+            # control-space (3-dim committed) vs pose-space (4-dim GT) — pose 4d 만 비교.
+            min_dim = min(gt_chunk.shape[-1], committed_path_norm.shape[-1])
+            gt_chunk = gt_chunk[..., :min_dim]
+            committed_for_loss = committed_path_norm[..., :min_dim]
+        else:
+            committed_for_loss = committed_path_norm
+        if n_rollouts > 1:
+            gt_chunk = gt_chunk.repeat(n_rollouts, *([1] * (gt_chunk.dim() - 1)))
+        if gt_chunk.shape != committed_for_loss.shape:
+            raise RuntimeError(
+                "l2_to_gt shape mismatch after replication: "
+                f"committed={tuple(committed_for_loss.shape)}, gt={tuple(gt_chunk.shape)}."
+            )
+        # OCSC parity: 2 Hz coarse + weighted (pos_w=1.0, head_w=0.01).
+        #   - 10 Hz fine path → 0.5 s commit 끝점만 (idx = shift-1, 2*shift-1, ...).
+        #     fine-step jitter 와 token snap 오차의 영향을 줄임.
+        #   - heading 은 작은 가중치 — stopped agent 의 noisy heading GT 영향을 누그러뜨림.
+        shift = int(self.encoder.agent_encoder.shift)
+        if committed_for_loss.shape[1] >= shift:
+            committed_coarse = committed_for_loss[:, shift - 1 :: shift, :]
+            gt_coarse = gt_chunk[:, shift - 1 :: shift, :]
+        else:
+            committed_coarse = committed_for_loss
+            gt_coarse = gt_chunk
+        committed_coarse_f = committed_coarse.float()
+        gt_coarse_f = gt_coarse.float().to(committed_coarse_f.device)
+        pos_w = 1.0
+        head_w = 0.01
+        pos_loss = (committed_coarse_f[..., :2] - gt_coarse_f[..., :2]).square().mean()
+        if committed_coarse_f.shape[-1] >= 4 and gt_coarse_f.shape[-1] >= 4:
+            head_loss = (committed_coarse_f[..., 2:4] - gt_coarse_f[..., 2:4]).square().mean()
+            return pos_w * pos_loss + head_w * head_loss
+        return pos_w * pos_loss
+
     def _compute_self_forced_distribution_matching_loss(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -2619,6 +2837,12 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: scalar 분포 맞춤 loss입니다. shape은 ``[]`` 입니다.
         """
+        if self.self_forced_debug_proxy_loss != "none":
+            return self._compute_self_forced_debug_proxy_loss(
+                tokenized_agent=tokenized_agent,
+                committed_path_norm=committed_path_norm,
+                anchor_idx=int(anchor_idx),
+            )
         if self.self_forced_distribution_matching_objective == "sid":
             return self._compute_self_forced_sid_loss(
                 tokenized_map=tokenized_map,
@@ -2786,6 +3010,17 @@ class SMARTFlow(LightningModule):
             )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
+        # ── Batched n_rollouts: scenario 를 N 장 복제해서 한 번의 closed-loop rollout 으로
+        #    N 개의 noise tape 샘플을 동시에 굴린다.  agent dim 이 N 배가 되어 packed
+        #    committed_path_norm 도 자동으로 N 배 — critic / DMD direction 호출은 무수정.
+        #    sequential N forward 와 비교해 walltime ≈ 1×, variance 1/N.
+        n_rollouts = max(1, int(self.self_forced_n_rollouts))
+        if n_rollouts > 1:
+            tokenized_map_eval, tokenized_agent_eval = self._build_self_forced_replicated_tokens(
+                tokenized_map=tokenized_map_eval,
+                tokenized_agent=tokenized_agent_eval,
+                repeat_count=n_rollouts,
+            )
         # Warmup 상태를 batch 진입 시점에 한 번만 평가해 캐시. estimator optimizer step 사이에
         # self.global_step 이 증가하면서 한 batch 안의 첫 호출과 마지막 호출 결과가 갈리는
         # race 를 막아야 한다. race 가 발생하면 첫 호출에서 rollout 을 torch.no_grad() 로
@@ -2794,7 +3029,6 @@ class SMARTFlow(LightningModule):
         # RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn
         # 가 난다.
         in_estimator_warmup = self._is_self_forced_estimator_warmup_active()
-        n_rollouts = max(1, int(self.self_forced_n_rollouts))
         has_anchor_fm_targets_global = False
         if fm_loss is not None:
             has_anchor_fm_targets_global = self._sync_distributed_bool_any(
@@ -2802,10 +3036,9 @@ class SMARTFlow(LightningModule):
                 device=fm_loss.device,
             )
 
-        # ── Multi-rollout: 한 batch 안에서 같은 anchor 0 에 대해 N rollout 진행.
-        #    매 rollout 마다 (1) closed-loop rollout (2) critic update (3) DMD/SiD loss 의
-        #    backward (grad accumulate / N).  최종 generator optimizer step 은 loop 밖에서 1번.
-        #    OCSC dmd_n_rollouts 정합.  N=1 이면 기존 single-rollout 동작과 동일.
+        # ── Single batched rollout + anchor loop 만 남김.
+        #    rollout 축은 이미 agent dim 에 packed 되어 있어 sf_loss/critic 평균에 자동 포함.
+        #    denom 은 n_anchors 로만 나누고 (n_rollouts 는 batch 안에서 평균됨).
         rollout_results = []  # (rollout dict, committed_path_norm, anchor_mask, has_committed_local)
         per_rollout_gen_est_losses = []
         per_rollout_sf_losses = []
@@ -2821,90 +3054,89 @@ class SMARTFlow(LightningModule):
             self._prepare_self_forced_generator_backward_boundary()
 
         n_anchors = max(1, int(self.self_forced_n_anchors))
-        denom = float(n_rollouts * n_anchors)
+        denom = float(n_anchors)
         try:
-            for _ in range(n_rollouts):
-                if in_estimator_warmup:
-                    with torch.no_grad():
-                        rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
-                else:
+            if in_estimator_warmup:
+                with torch.no_grad():
                     rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+            else:
+                rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
 
-                for anchor_idx in range(n_anchors):
-                    committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
-                        rollout=rollout,
-                        tokenized_agent=tokenized_agent_eval,
-                        anchor_idx=anchor_idx,
-                    )
-                    has_committed_local = committed_path_norm.numel() > 0
-                    has_committed_global = self._sync_distributed_bool_any(
-                        has_committed_local,
-                        device=committed_path_norm.device,
-                    )
-                    any_committed_global = any_committed_global or has_committed_global
-                    rollout_results.append((rollout, committed_path_norm, anchor_mask, has_committed_local))
+            for anchor_idx in range(n_anchors):
+                committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
+                    rollout=rollout,
+                    tokenized_agent=tokenized_agent_eval,
+                    anchor_idx=anchor_idx,
+                )
+                has_committed_local = committed_path_norm.numel() > 0
+                has_committed_global = self._sync_distributed_bool_any(
+                    has_committed_local,
+                    device=committed_path_norm.device,
+                )
+                any_committed_global = any_committed_global or has_committed_global
+                rollout_results.append((rollout, committed_path_norm, anchor_mask, has_committed_local))
 
-                    # critic update — 매 (rollout, anchor) 마다.
-                    gen_estimator_loss = self._update_generated_path_flow_estimator(
+                # critic update — 매 anchor 마다.  agent dim 이 N×B 이므로 critic 도 동일 데이터 1 step 으로 봄.
+                gen_estimator_loss = self._update_generated_path_flow_estimator(
+                    tokenized_map=tokenized_map_eval,
+                    tokenized_agent=tokenized_agent_eval,
+                    committed_path_norm=committed_path_norm,
+                    anchor_mask=anchor_mask,
+                    has_committed_path_global=has_committed_global,
+                    anchor_idx=anchor_idx,
+                )
+                per_rollout_gen_est_losses.append(gen_estimator_loss)
+
+                if in_estimator_warmup or not has_committed_global:
+                    # warmup 중이거나 valid anchor 없는 batch — generator backward skip.
+                    continue
+
+                # DMD/SiD direction backward — grad accumulate / n_anchors.
+                if has_committed_local:
+                    sf_loss_i = self._compute_self_forced_distribution_matching_loss(
                         tokenized_map=tokenized_map_eval,
                         tokenized_agent=tokenized_agent_eval,
                         committed_path_norm=committed_path_norm,
                         anchor_mask=anchor_mask,
-                        has_committed_path_global=has_committed_global,
                         anchor_idx=anchor_idx,
                     )
-                    per_rollout_gen_est_losses.append(gen_estimator_loss)
-
-                    if in_estimator_warmup or not has_committed_global:
-                        # warmup 중이거나 valid anchor 없는 batch — generator backward skip.
-                        continue
-
-                    # DMD/SiD direction backward — grad accumulate / (n_rollouts * n_anchors).
-                    if has_committed_local:
-                        sf_loss_i = self._compute_self_forced_distribution_matching_loss(
-                            tokenized_map=tokenized_map_eval,
-                            tokenized_agent=tokenized_agent_eval,
-                            committed_path_norm=committed_path_norm,
-                            anchor_mask=anchor_mask,
-                            anchor_idx=anchor_idx,
-                        )
-                    else:
-                        sf_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
-                    anchor_loss_i = (
-                        fm_loss
-                        if fm_loss is not None
-                        else committed_path_norm.new_zeros(())
-                    )
-                    last_anchor_loss_val = anchor_loss_i
-                    total_loss_i = (
-                        self.self_forced_weight * sf_loss_i
-                        + self.self_forced_anchor_weight * anchor_loss_i
-                    ) / denom
-                    if not torch.isfinite(total_loss_i):
-                        context = self._format_self_forced_backward_context()
-                        self._clear_self_forced_backward_context()
-                        raise RuntimeError(
-                            "Non-finite self-forced total_loss detected: "
-                            f"{self._summarize_nonfinite_tensor(total_loss_i)}"
-                            f"{context}"
-                        )
-                    # anchor k 의 forward 가 empty path 분기로 빠지면 sf_loss_i 가 grad-free
-                    # leaf 가 되어 backward 시 "no grad_fn" RuntimeError 가 난다.
-                    # DDP 동기화 위해 항상 generator param 에 연결된 trainable zero loss 로 fallback.
-                    if not total_loss_i.requires_grad:
-                        total_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
-                    # multi-anchor 학습 시 같은 rollout 결과를 anchor 들이 share 하므로
-                    # 마지막 anchor 전까지 graph 를 유지해야 두 번째 anchor backward 가
-                    # 끊긴 graph 로 들어가는 race 를 막을 수 있다.
-                    is_last_anchor_in_rollout = anchor_idx == n_anchors - 1
-                    self._manual_backward_without_autocast(
-                        total_loss_i,
-                        retain_graph=not is_last_anchor_in_rollout,
-                    )
-                    self._assert_self_forced_generator_update_isolated()
-                    per_rollout_sf_losses.append(sf_loss_i.detach())
-                    per_rollout_total_losses.append(total_loss_i.detach() * denom)
+                else:
+                    sf_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
+                anchor_loss_i = (
+                    fm_loss
+                    if fm_loss is not None
+                    else committed_path_norm.new_zeros(())
+                )
+                last_anchor_loss_val = anchor_loss_i
+                total_loss_i = (
+                    self.self_forced_weight * sf_loss_i
+                    + self.self_forced_anchor_weight * anchor_loss_i
+                ) / denom
+                if not torch.isfinite(total_loss_i):
+                    context = self._format_self_forced_backward_context()
                     self._clear_self_forced_backward_context()
+                    raise RuntimeError(
+                        "Non-finite self-forced total_loss detected: "
+                        f"{self._summarize_nonfinite_tensor(total_loss_i)}"
+                        f"{context}"
+                    )
+                # anchor k 의 forward 가 empty path 분기로 빠지면 sf_loss_i 가 grad-free
+                # leaf 가 되어 backward 시 "no grad_fn" RuntimeError 가 난다.
+                # DDP 동기화 위해 항상 generator param 에 연결된 trainable zero loss 로 fallback.
+                if not total_loss_i.requires_grad:
+                    total_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
+                # multi-anchor 학습 시 같은 rollout 결과를 anchor 들이 share 하므로
+                # 마지막 anchor 전까지 graph 를 유지해야 두 번째 anchor backward 가
+                # 끊긴 graph 로 들어가는 race 를 막을 수 있다.
+                is_last_anchor_in_rollout = anchor_idx == n_anchors - 1
+                self._manual_backward_without_autocast(
+                    total_loss_i,
+                    retain_graph=not is_last_anchor_in_rollout,
+                )
+                self._assert_self_forced_generator_update_isolated()
+                per_rollout_sf_losses.append(sf_loss_i.detach())
+                per_rollout_total_losses.append(total_loss_i.detach() * denom)
+                self._clear_self_forced_backward_context()
 
             # ── warmup-only batch: gen optimizer step 생략하고 warmup 종료 처리.
             if in_estimator_warmup:

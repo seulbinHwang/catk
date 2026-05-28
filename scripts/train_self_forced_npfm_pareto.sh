@@ -204,6 +204,13 @@ DECODER_USE_LQR="${DECODER_USE_LQR:-false}"
 #   - sid : Score Identity Distillation        (sid_alpha 사용; DMD_BETA 무시)
 DM_OBJECTIVE="${DM_OBJECTIVE:-dmd}"
 
+# Backprop 검증용 proxy loss (debug 전용).  none / l2_to_zero / l2_to_gt.
+#   - none        : 실제 DMD/SiD (default)
+#   - l2_to_zero  : committed_path_norm.square().mean()  (path 를 0 으로 줄이도록 학습)
+#   - l2_to_gt    : anchor k GT path 와의 L2  (closed-loop BC, replicate-aware)
+# DMD/SiD 가 학습 안 될 때 backprop 자체 정상성 확인용.
+DEBUG_PROXY_LOSS="${DEBUG_PROXY_LOSS:-none}"
+
 # ── DMD 전용 knob ─────────────────────────────────────────────────────────
 # Entropy knob (build_clean_dmd_direction):
 #   - 1.0 (default) : vanilla DMD, 기존 동작 그대로 (R - F)/normalizer
@@ -237,7 +244,8 @@ SF_DETACH_BLOCK_TRANSITION="${SF_DETACH_BLOCK_TRANSITION:-false}"
 # reference Self-Forcing 의 dfake_gen_update_ratio 대응.
 ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-3}"
 # OCSC dmd_n_rollouts 정합 — 같은 anchor 0 에서 N rollout 으로 DMD direction variance ↓.
-# default 1 = 기존 동작.  forward 비용 N 배 (메모리는 한 rollout 분량 유지: grad accumulate).
+# 구현은 batch-replicate: scenario 를 N 장 복제해 단일 rollout 한 번에 N 개 noise tape 처리.
+# walltime ≈ 1× (sequential 대비), VRAM 은 ~N 배 (agent dim 이 N 배).  default 1 = 기존 동작.
 SF_N_ROLLOUTS="${SF_N_ROLLOUTS:-1}"
 # OCSC dmd_anchor_stride 정합 — 한 closed-loop rollout 안에서 stride (2Hz step) 간격으로
 # n_anchors 개 anchor 잡고 각각 DMD/SiD step.  학습 신호 N anchors 배.  rollout 길이가
@@ -257,11 +265,11 @@ ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-0}"
 # fit_start 시점에 teacher/estimator 를 main encoder 의 weight 로 재동기화할지 (fresh finetune ↔ resume).
 SF_INIT_AUX_FROM_GEN="${SF_INIT_AUX_FROM_GEN:-true}"
 
-# 학습 가능한 범위.
+# 학습 가능한 범위 (resolve_self_forced_unfrozen_range 가 받는 실제 값):
 #   - except_map_encoder    : map encoder 만 freeze (default)
-#   - all_unfrozen          : 모두 학습
-#   - flow_decoder_only     : flow_decoder 만 학습
-#   - full                  : encoder/decoder 모두 학습 (예전 호환)
+#   - middle                : flow_decoder + 마지막 agent context block 들
+#   - full_flow_decoder     : flow_decoder 전체 (velocity_head + flow attention 레이어)
+#   - velocity_head_only    : flow_decoder.velocity_head (마지막 MLP) 만 — 가장 보수적, debug 용
 SF_UNFROZEN_RANGE="${SF_UNFROZEN_RANGE:-except_map_encoder}"
 
 # Generator EMA — sweep 단계에선 default OFF (validation 이 online weight 직접 측정).
@@ -398,7 +406,7 @@ echo "    epoch_sample_frac=${TRAIN_EPOCH_SAMPLE_FRACTION}"
 echo "  Generator: lr=${LR} (self-forced 에선 고정 LR; warmup/decay 무시됨)"
 echo "    closed_loop_rollout_mode=${CLOSED_LOOP_ROLLOUT_MODE} use_lqr=${DECODER_USE_LQR}"
 echo "  Self-Forced ★:"
-echo "    objective=${DM_OBJECTIVE} dmd_beta=${DMD_BETA} sid_alpha=${SID_ALPHA}"
+echo "    objective=${DM_OBJECTIVE} dmd_beta=${DMD_BETA} sid_alpha=${SID_ALPHA} debug_proxy=${DEBUG_PROXY_LOSS}"
 echo "    weight=${SF_WEIGHT} path_step=${SF_PATH_STEP_SIZE}"
 echo "    use_anchor_fm=${USE_ANCHOR_FM} anchor_weight=${ANCHOR_WEIGHT}"
 echo "    estimator_per_step=${ESTIMATOR_UPDATES_PER_STEP} estimator_lr=${ESTIMATOR_LR}"
@@ -498,6 +506,7 @@ torchrun \
   model.model_config.self_forced.anchor_weight="${ANCHOR_WEIGHT}" \
   model.model_config.self_forced.use_anchor_flow_matching_loss="${USE_ANCHOR_FM}" \
   model.model_config.self_forced.distribution_matching_objective="${DM_OBJECTIVE}" \
+  model.model_config.self_forced.debug_proxy_loss="${DEBUG_PROXY_LOSS}" \
   model.model_config.self_forced.dmd_beta="${DMD_BETA}" \
   model.model_config.self_forced.clean_dmd_normalizer_eps="${CLEAN_DMD_NORMALIZER_EPS}" \
   model.model_config.self_forced.clean_dmd_tau_low="${CLEAN_DMD_TAU_LOW}" \

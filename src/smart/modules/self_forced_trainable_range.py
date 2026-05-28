@@ -9,6 +9,7 @@ SELF_FORCED_UNFROZEN_RANGES: Tuple[str, ...] = (
     "except_map_encoder",
     "middle",
     "full_flow_decoder",
+    "velocity_head_only",
 )
 DEFAULT_SELF_FORCED_UNFROZEN_RANGE = "except_map_encoder"
 
@@ -188,6 +189,33 @@ def _apply_full_flow_decoder_range(model: nn.Module) -> None:
     _set_requires_grad(_get_flow_decoder(model), True)
 
 
+def _apply_velocity_head_only_range(model: nn.Module) -> None:
+    """flow_decoder.velocity_head (마지막 flow MLP) 만 학습 가능하게 둡니다.
+
+    Args:
+        model: ``SMARTFlowDecoder`` 또는 같은 속성 구조를 가진 모듈입니다.
+
+    Returns:
+        None
+
+    설명:
+        가장 보수적인 범위.  encoder/agent context/flow chunk 까지 전부 freeze 하고
+        flow velocity 를 만드는 최종 MLP 만 self-forcing 학습 신호로 흡수.
+        debug 또는 layer-wise 학습 영향 분석 용도.
+    """
+    _set_requires_grad(model, False)
+    flow_decoder = _get_flow_decoder(model)
+    if flow_decoder is None:
+        return
+    velocity_head = getattr(flow_decoder, "velocity_head", None)
+    if velocity_head is None:
+        raise AttributeError(
+            "velocity_head_only range expects model.agent_encoder.flow_decoder.velocity_head; "
+            "got flow_decoder without velocity_head attribute."
+        )
+    _set_requires_grad(velocity_head, True)
+
+
 def count_trainable_parameters(model: nn.Module) -> int:
     """현재 학습 가능한 파라미터 개수를 셉니다.
 
@@ -242,6 +270,8 @@ def apply_self_forced_unfrozen_range(
         _apply_middle_range(model)
     elif resolved_range == "full_flow_decoder":
         _apply_full_flow_decoder_range(model)
+    elif resolved_range == "velocity_head_only":
+        _apply_velocity_head_only_range(model)
     else:
         valid_values = ", ".join(SELF_FORCED_UNFROZEN_RANGES)
         raise ValueError(
