@@ -49,23 +49,6 @@ class Variant:
 
 FALLBACK_VARIANTS: tuple[Variant, ...] = (
     Variant(
-        name="ocsc_lr1e6_evalselect_noshuffle",
-        note="Lower LR and keep fast eval-agent train selection; no shuffle, fp32, no clip.",
-        env={
-            "LR": "1.0e-6",
-            "DATA_SHUFFLE": "false",
-            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
-            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
-            "PRECISION": "32-true",
-            "GRADIENT_CLIP_VAL": "0",
-            "NUM_WORKERS": "12",
-            "PREFETCH_FACTOR": "4",
-            "EVAL_NUM_WORKERS": "12",
-            "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
-        },
-    ),
-    Variant(
         name="ocsc_lr1e6_evalselect_shuffle",
         note="Lower LR only, keeping the fast data path closest to the initial run.",
         env={
@@ -83,12 +66,13 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
         },
     ),
     Variant(
-        name="ocsc_m16_lr1e6_evalselect",
-        note="Increase OL target pool M to 16 while keeping the fast eval-agent selection.",
+        name="ocsc_m12_lr1e6_evalselect_b8",
+        note="Increase OL target pool with smaller train batch to avoid the M16 OOM mode.",
         env={
             "LR": "1.0e-6",
-            "OCSC_N_OL_ROLLOUTS": "16",
-            "DATA_SHUFFLE": "false",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "DATA_SHUFFLE": "true",
             "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
             "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
             "PRECISION": "32-true",
@@ -107,7 +91,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "LR": "1.0e-6",
             "OCSC_VELOCITY_HEAD_ONLY": "false",
             "OCSC_FULL_FLOW_DECODER": "false",
-            "DATA_SHUFFLE": "false",
+            "DATA_SHUFFLE": "true",
             "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
             "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
             "PRECISION": "32-true",
@@ -126,7 +110,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "LR": "1.0e-6",
             "OCSC_GT_TARGET": "true",
             "OCSC_OL_NEAREST_MATCH": "false",
-            "DATA_SHUFFLE": "false",
+            "DATA_SHUFFLE": "true",
             "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
             "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
             "PRECISION": "32-true",
