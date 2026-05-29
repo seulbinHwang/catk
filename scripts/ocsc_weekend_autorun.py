@@ -513,6 +513,7 @@ def monitor_run(
     log_path: Path,
     state_path: Path,
     stop_current: Any,
+    proc: subprocess.Popen[Any] | None = None,
 ) -> tuple[str, str]:
     last_summary = ""
     while True:
@@ -547,6 +548,9 @@ def monitor_run(
         ade = snap.get("ade", [])
         fde = snap.get("fde", [])
         train_loss = snap.get("train_loss", [])
+        if proc is not None and proc.poll() is not None and snap.get("state") != "finished":
+            status = "fail"
+            reason = f"local process exited rc={proc.returncode}"
         summary = (
             f"{run_label} run={run_id} status={status} reason={reason} "
             f"state={snap.get('state')} rmm={rmm[-3:]} ade={ade[-3:]} "
@@ -635,6 +639,12 @@ def main() -> int:
     parser.add_argument("--val-check-interval", type=int, default=200)
     parser.add_argument("--max-epochs", type=int, default=16)
     parser.add_argument("--skip-initial", action="store_true")
+    parser.add_argument(
+        "--start-variant-index",
+        type=int,
+        default=1,
+        help="1-based fallback variant index to start from after any initial-run monitoring.",
+    )
     args = parser.parse_args()
 
     args.repo_root = str(Path(args.repo_root).resolve())
@@ -660,7 +670,10 @@ def main() -> int:
             return 0
         log(f"initial run failed guard: {reason}; moving to fallback variants")
 
+    start_variant_index = max(1, args.start_variant_index)
     for idx, variant in enumerate(FALLBACK_VARIANTS, start=1):
+        if idx < start_variant_index:
+            continue
         if cutoff_reached(args.cutoff_ts):
             log(f"cutoff reached before launching {variant.name}; stopping autorun")
             return 0
@@ -680,6 +693,7 @@ def main() -> int:
             log_path=variant_log,
             state_path=state_path,
             stop_current=lambda proc=proc: terminate_process(proc),
+            proc=proc,
         )
         if status in {"finished", "cutoff"}:
             log(f"{variant.name} ended: {reason}")
