@@ -213,6 +213,31 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
         },
     ),
     Variant(
+        name="ocsc_steprefiner_lr2e7_wd1e2_guarded",
+        note=(
+            "Conservative step_refiner retry after the first-RMM guard failure: "
+            "keep the same trainable range and weight decay, but lower LR to protect RMM."
+        ),
+        env={
+            "LR": "2.0e-7",
+            "WEIGHT_DECAY": "1.0e-2",
+            "TRAIN_B": "8",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "false",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+        },
+    ),
+    Variant(
         name="ocsc_steprefiner_m12_lr5e7_wd1e2",
         note="Increase OL pool with step_refiner capacity while keeping the stable LR/weight decay pair.",
         env={
