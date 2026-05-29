@@ -2980,10 +2980,13 @@ class SMARTFlow(LightningModule):
         any_committed_global = False
         last_anchor_loss_val: Tensor | None = None
 
-        # generator optimizer: warmup 이 아니면 학습 step 진행하므로 미리 toggle.
+        # Do not Lightning-toggle the generator optimizer here.  This step also
+        # updates the generated estimator, and Lightning optimizer toggles are
+        # not stack-safe: nesting the estimator toggle inside a generator toggle
+        # can leave estimator params disabled after warmup.  Isolation is enforced
+        # by detached estimator inputs plus the gradient assertions below.
         generator_optimizer = self.optimizers()[0] if not in_estimator_warmup else None
         if generator_optimizer is not None:
-            self.toggle_optimizer(generator_optimizer)
             generator_optimizer.zero_grad(set_to_none=True)
             self._prepare_self_forced_generator_backward_boundary()
 
@@ -3125,8 +3128,6 @@ class SMARTFlow(LightningModule):
             self._update_self_forced_generator_ema_after_step()
             self._clear_self_forced_generator_gradients()
         finally:
-            if generator_optimizer is not None:
-                self.untoggle_optimizer(generator_optimizer)
             self._clear_self_forced_backward_context()
 
         # ── Logging 변수: rollout 평균.
