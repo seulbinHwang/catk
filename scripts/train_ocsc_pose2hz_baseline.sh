@@ -197,10 +197,10 @@ CHECK_VAL_EVERY_N_EPOCH="${CHECK_VAL_EVERY_N_EPOCH:-null}"
 # precision: bf16-mixed (default, H100 권장), fp16-mixed, 32-true (재현 디버그).
 PRECISION="${PRECISION:-bf16-mixed}"
 
-# DDP strategy.  velocity_head_only=True 면 다른 param 은 grad 없음 →
-# ddp_find_unused_parameters_true 권장 (단일 GPU 면 auto).
+# DDP strategy.  optimizer/DDP는 requires_grad=True 파라미터만 보므로 OCSC
+# velocity_head_only에서도 find_unused scan 없이 기본 DDP를 쓴다.
 if [ "${NPROC_PER_NODE}" -gt 1 ] || [ "${NUM_NODES}" -gt 1 ]; then
-  TRAINER_STRATEGY="${TRAINER_STRATEGY:-ddp_find_unused_parameters_true}"
+  TRAINER_STRATEGY="${TRAINER_STRATEGY:-ddp}"
 else
   TRAINER_STRATEGY="${TRAINER_STRATEGY:-auto}"
 fi
@@ -224,6 +224,11 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-1}"
 PERSISTENT_WORKERS="${PERSISTENT_WORKERS:-true}"
 PIN_MEMORY="${PIN_MEMORY:-true}"
+EVAL_NUM_WORKERS="${EVAL_NUM_WORKERS:-${NUM_WORKERS}}"
+EVAL_PREFETCH_FACTOR="${EVAL_PREFETCH_FACTOR:-${PREFETCH_FACTOR}}"
+EVAL_PERSISTENT_WORKERS="${EVAL_PERSISTENT_WORKERS:-true}"
+EVAL_PIN_MEMORY="${EVAL_PIN_MEMORY:-${PIN_MEMORY}}"
+EVAL_MULTIPROCESSING_CONTEXT="${EVAL_MULTIPROCESSING_CONTEXT:-spawn}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-true}"
 
 # OCSC 학습은 매 batch 의 closed-loop rollout 비용 큼 (G=4 CL).
@@ -369,6 +374,7 @@ echo "  Trainer: max_epochs=${MAX_EPOCHS} precision=${PRECISION} strategy=${TRAI
 echo "    limit_train=${LIMIT_TRAIN_BATCHES} limit_val=${LIMIT_VAL_BATCHES}"
 echo "    val_check_interval=${VAL_CHECK_INTERVAL} grad_clip=${GRADIENT_CLIP_VAL}"
 echo "  Data: train_B=${TRAIN_B} val_B=${VAL_B} workers=${NUM_WORKERS}"
+echo "    eval_workers=${EVAL_NUM_WORKERS} eval_mp=${EVAL_MULTIPROCESSING_CONTEXT}"
 echo "    epoch_sample_frac=${TRAIN_EPOCH_SAMPLE_FRACTION}"
 echo "  Generator: lr=${LR}"
 echo "  OCSC core ★:"
@@ -389,6 +395,14 @@ echo "============================================================"
 PREFETCH_ARG=""
 if [ "${NUM_WORKERS}" -gt 0 ]; then
   PREFETCH_ARG="data.prefetch_factor=${PREFETCH_FACTOR}"
+fi
+EVAL_PREFETCH_ARG=""
+if [ "${EVAL_NUM_WORKERS}" -gt 0 ]; then
+  EVAL_PREFETCH_ARG="data.eval_prefetch_factor=${EVAL_PREFETCH_FACTOR}"
+fi
+EVAL_MP_ARG=""
+if [ -n "${EVAL_MULTIPROCESSING_CONTEXT}" ]; then
+  EVAL_MP_ARG="data.eval_multiprocessing_context=${EVAL_MULTIPROCESSING_CONTEXT}"
 fi
 
 torchrun \
@@ -422,6 +436,9 @@ torchrun \
   data.num_workers="${NUM_WORKERS}" \
   data.persistent_workers="${PERSISTENT_WORKERS}" \
   data.pin_memory="${PIN_MEMORY}" \
+  data.eval_num_workers="${EVAL_NUM_WORKERS}" \
+  data.eval_persistent_workers="${EVAL_PERSISTENT_WORKERS}" \
+  data.eval_pin_memory="${EVAL_PIN_MEMORY}" \
   data.shuffle="${DATA_SHUFFLE}" \
   data.train_use_eval_agent_selection="${TRAIN_USE_EVAL_AGENT_SELECTION}" \
   data.train_epoch_sample_fraction="${TRAIN_EPOCH_SAMPLE_FRACTION}" \
@@ -459,6 +476,8 @@ torchrun \
   model.model_config.finetune.ocsc_heading_weight="${OCSC_HEADING_WEIGHT}" \
   model.model_config.self_forced.enabled=false \
   ${PREFETCH_ARG} \
+  ${EVAL_PREFETCH_ARG} \
+  ${EVAL_MP_ARG} \
   ${EXTRA_ARGS}
 
 echo "bash $(basename "$0") done!"

@@ -67,6 +67,11 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        eval_num_workers: Optional[int] = None,
+        eval_prefetch_factor: Optional[int] = None,
+        eval_pin_memory: Optional[bool] = None,
+        eval_persistent_workers: Optional[bool] = None,
+        eval_multiprocessing_context: Optional[str] = None,
         train_use_eval_agent_selection: bool = False,
         train_epoch_sample_fraction: float = 1.0,
         train_memory_balanced_batches: bool = False,
@@ -107,10 +112,29 @@ class MultiDataModule(LightningDataModule):
         self.train_memory_balance_map_weight = float(train_memory_balance_map_weight)
         self.train_memory_balance_seed = int(train_memory_balance_seed)
         self.shuffle = shuffle
-        self.num_workers = num_workers
-        self.prefetch_factor = prefetch_factor if num_workers > 0 else None
+        self.num_workers = int(num_workers)
+        self.prefetch_factor = prefetch_factor if self.num_workers > 0 else None
         self.pin_memory = pin_memory
-        self.persistent_workers = persistent_workers and num_workers > 0
+        self.persistent_workers = persistent_workers and self.num_workers > 0
+        self.eval_num_workers = (
+            self.num_workers if eval_num_workers is None else int(eval_num_workers)
+        )
+        self.eval_prefetch_factor = (
+            self.prefetch_factor
+            if eval_prefetch_factor is None
+            else eval_prefetch_factor
+        )
+        if self.eval_num_workers <= 0:
+            self.eval_prefetch_factor = None
+        self.eval_pin_memory = self.pin_memory if eval_pin_memory is None else eval_pin_memory
+        self.eval_persistent_workers = (
+            self.persistent_workers
+            if eval_persistent_workers is None
+            else eval_persistent_workers
+        ) and self.eval_num_workers > 0
+        self.eval_multiprocessing_context = self._normalize_multiprocessing_context(
+            eval_multiprocessing_context
+        )
         self.train_raw_dir = train_raw_dir
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
@@ -122,6 +146,43 @@ class MultiDataModule(LightningDataModule):
         )
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
+
+    @staticmethod
+    def _normalize_multiprocessing_context(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        context = str(value).strip().lower()
+        if context in {"", "none", "null"}:
+            return None
+        if context not in {"fork", "spawn", "forkserver"}:
+            raise ValueError(
+                "eval_multiprocessing_context must be one of "
+                f"[fork, spawn, forkserver, null], got {value}."
+            )
+        return context
+
+    def _build_train_loader_kwargs(self) -> dict:
+        loader_kwargs = {
+            "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": self.persistent_workers,
+        }
+        if self.prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        return loader_kwargs
+
+    def _build_eval_loader_kwargs(self) -> dict:
+        loader_kwargs = {
+            "num_workers": self.eval_num_workers,
+            "pin_memory": self.eval_pin_memory,
+            "persistent_workers": self.eval_persistent_workers,
+            "drop_last": False,
+        }
+        if self.eval_prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = self.eval_prefetch_factor
+        if self.eval_num_workers > 0 and self.eval_multiprocessing_context is not None:
+            loader_kwargs["multiprocessing_context"] = self.eval_multiprocessing_context
+        return loader_kwargs
 
     def refresh_train_dataset(self, train_raw_dir: Optional[str] = None) -> None:
         """학습용 cache 폴더를 바꾼 뒤 train dataset을 다시 만듭니다.
@@ -204,13 +265,7 @@ class MultiDataModule(LightningDataModule):
         if not hasattr(self, "train_dataset"):
             self.refresh_train_dataset()
 
-        base_loader_kwargs = {
-            "num_workers": self.num_workers,
-            "pin_memory": self.pin_memory,
-            "persistent_workers": self.persistent_workers,
-        }
-        if self.prefetch_factor is not None:
-            base_loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        base_loader_kwargs = self._build_train_loader_kwargs()
 
         if self.train_memory_balanced_batches:
             batch_sampler = self._build_memory_balanced_batch_sampler()
@@ -244,14 +299,7 @@ class MultiDataModule(LightningDataModule):
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
         sampler = self._build_eval_sampler(self.val_dataset)
-        loader_kwargs = {
-            "num_workers": self.num_workers,
-            "pin_memory": self.pin_memory,
-            "persistent_workers": self.persistent_workers,
-            "drop_last": False,
-        }
-        if self.prefetch_factor is not None:
-            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        loader_kwargs = self._build_eval_loader_kwargs()
 
         return DataLoader(
             self.val_dataset,
@@ -263,14 +311,7 @@ class MultiDataModule(LightningDataModule):
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
         sampler = self._build_eval_sampler(self.test_dataset)
-        loader_kwargs = {
-            "num_workers": self.num_workers,
-            "pin_memory": self.pin_memory,
-            "persistent_workers": self.persistent_workers,
-            "drop_last": False,
-        }
-        if self.prefetch_factor is not None:
-            loader_kwargs["prefetch_factor"] = self.prefetch_factor
+        loader_kwargs = self._build_eval_loader_kwargs()
 
         return DataLoader(
             self.test_dataset,

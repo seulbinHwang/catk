@@ -3414,6 +3414,189 @@ class SMARTFlow(LightningModule):
             return ol_pose_norm
         return ol_raw  # already pose 4-dim
 
+    def _ocsc_sample_open_loop_with_ref_batched(
+        self,
+        active_hidden: Tensor,
+        active_agent_type: Tensor,
+        active_agent_length: Tensor | None,
+        sample_count: int,
+        sampling_scheme,
+        seed_base: int,
+    ) -> Tensor:
+        """ref_flow_decoder OL samples를 sample 축으로 묶어 한 번에 생성합니다."""
+        from src.smart.modules.kinematic_control import control_norm_to_pose_norm
+
+        agent_enc = self.encoder.agent_encoder
+        sample_count = int(sample_count)
+        if sample_count < 1:
+            raise ValueError(f"sample_count must be positive, got {sample_count}.")
+
+        n_active = int(active_hidden.shape[0])
+        if n_active == 0:
+            return active_hidden.new_zeros((sample_count, 0, self.flow_window_steps, 4))
+
+        noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
+        x_init_chunks = []
+        for m in range(sample_count):
+            generator = torch.Generator(device=active_hidden.device)
+            generator.manual_seed(int(seed_base) + int(m))
+            x_init_chunks.append(
+                torch.randn(
+                    n_active,
+                    self.flow_window_steps,
+                    agent_enc.flow_state_dim,
+                    device=active_hidden.device,
+                    dtype=active_hidden.dtype,
+                    generator=generator,
+                ) * noise_scale
+            )
+        x_init_norm = torch.cat(x_init_chunks, dim=0)
+        repeated_hidden = (
+            active_hidden.unsqueeze(0)
+            .expand(sample_count, *active_hidden.shape)
+            .reshape(sample_count * n_active, *active_hidden.shape[1:])
+            .contiguous()
+        )
+        flow_sample_steps = int(getattr(
+            sampling_scheme,
+            "sample_steps",
+            agent_enc.flow_ode.solver_steps,
+        ))
+        flow_sample_method = getattr(
+            sampling_scheme,
+            "sample_method",
+            agent_enc.flow_ode.solver_method,
+        )
+        backprop_last_k = getattr(sampling_scheme, "backprop_last_k", None)
+
+        orig_fd = agent_enc.flow_decoder
+        if self.ref_flow_decoder is not None:
+            agent_enc.flow_decoder = self.ref_flow_decoder
+        try:
+            ol_raw = agent_enc.flow_ode.generate(
+                x_init=x_init_norm,
+                model_fn=lambda x_t, tau: agent_enc.flow_decoder(repeated_hidden, x_t, tau),
+                steps=flow_sample_steps,
+                method=flow_sample_method,
+                backprop_last_k=backprop_last_k,
+            )
+        finally:
+            agent_enc.flow_decoder = orig_fd
+
+        if self.use_kinematic_control_flow:
+            repeated_agent_type = (
+                active_agent_type.unsqueeze(0)
+                .expand(sample_count, n_active)
+                .reshape(sample_count * n_active)
+                .contiguous()
+            )
+            repeated_agent_length = None
+            if active_agent_length is not None:
+                repeated_agent_length = (
+                    active_agent_length.unsqueeze(0)
+                    .expand(sample_count, n_active)
+                    .reshape(sample_count * n_active)
+                    .contiguous()
+                )
+            ol_pose = control_norm_to_pose_norm(
+                control_norm=ol_raw,
+                agent_type=repeated_agent_type,
+                agent_length=repeated_agent_length,
+                pos_scale_m=agent_enc.control_pos_scale_m,
+                vehicle_yaw_scale_rad=agent_enc.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=agent_enc.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=agent_enc.control_cyclist_yaw_scale_rad,
+                use_holonomic_model_only=agent_enc.use_holonomic_model_only,
+                vehicle_no_slip_point_ratio=agent_enc.control_vehicle_no_slip_point_ratio,
+                cyclist_no_slip_point_ratio=agent_enc.control_cyclist_no_slip_point_ratio,
+            )
+            return ol_pose.reshape(sample_count, n_active, self.flow_window_steps, 4)
+        return ol_raw.reshape(sample_count, n_active, self.flow_window_steps, ol_raw.shape[-1])
+
+    def _ocsc_run_closed_loop_rollouts_batched(
+        self,
+        data,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        rollout_cache: Dict[str, object],
+        active_mask: Tensor,
+        current_pos_active: Tensor,
+        current_head_active: Tensor,
+        sampling_scheme,
+        rollout_count: int,
+        window_steps_10hz: int,
+        rollout_steps_2hz: int,
+    ) -> Tensor:
+        """OCSC closed-loop rollouts를 rollout 축으로 묶어 한 번에 실행합니다."""
+        agent_enc = self.encoder.agent_encoder
+        rollout_count = int(rollout_count)
+        if rollout_count < 1:
+            raise ValueError(f"rollout_count must be positive, got {rollout_count}.")
+
+        num_agent = int(tokenized_agent["batch"].shape[0])
+        num_graphs = len(data["scenario_id"])
+        scenario_seed_table = self._build_closed_loop_seed_table(
+            scenario_ids=data["scenario_id"],
+            rollout_indices=range(rollout_count),
+            device=tokenized_agent["batch"].device,
+        )
+        expanded_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
+            tokenized_agent=tokenized_agent,
+            repeat_count=rollout_count,
+            num_graphs=num_graphs,
+        )
+        expanded_map_feature = self._build_parallel_rollout_map_feature(
+            map_feature=map_feature,
+            repeat_count=rollout_count,
+            num_graphs=num_graphs,
+        )
+        expanded_rollout_cache = self._build_parallel_rollout_cache(
+            rollout_cache=rollout_cache,
+            repeat_count=rollout_count,
+        )
+        rollout = agent_enc.training_rollout_from_cache(
+            rollout_cache=expanded_rollout_cache,
+            tokenized_agent=expanded_tokenized_agent,
+            map_feature=expanded_map_feature,
+            sampling_scheme=sampling_scheme,
+            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+            rollout_steps_2hz=rollout_steps_2hz,
+        )
+
+        n_active = int(active_mask.sum().item())
+        traj = rollout["pred_traj_10hz"].reshape(
+            rollout_count,
+            num_agent,
+            *rollout["pred_traj_10hz"].shape[1:],
+        )[:, active_mask, :window_steps_10hz]
+        head = rollout["pred_head_10hz"].reshape(
+            rollout_count,
+            num_agent,
+            *rollout["pred_head_10hz"].shape[1:],
+        )[:, active_mask, :window_steps_10hz]
+
+        traj_flat = traj.contiguous().reshape(rollout_count * n_active, window_steps_10hz, 2)
+        head_flat = head.contiguous().reshape(rollout_count * n_active, window_steps_10hz)
+        pos_flat = (
+            current_pos_active.unsqueeze(0)
+            .expand(rollout_count, n_active, 2)
+            .reshape(rollout_count * n_active, 2)
+            .contiguous()
+        )
+        head_now_flat = (
+            current_head_active.unsqueeze(0)
+            .expand(rollout_count, n_active)
+            .reshape(rollout_count * n_active)
+            .contiguous()
+        )
+        cl_norm_flat = self._ocsc_world_traj_to_anchor0_pose_norm(
+            pred_pos_global=traj_flat,
+            pred_head_global=head_flat,
+            current_pos=pos_flat,
+            current_head=head_now_flat,
+        )
+        return cl_norm_flat.reshape(rollout_count, n_active, window_steps_10hz, 4)
+
     def _run_flow_ocsc_ft_step(self, data, batch_idx) -> Tensor:
         """OCSC (Open-Closed Self-Consistency) finetune training step.
 
@@ -3476,7 +3659,7 @@ class SMARTFlow(LightningModule):
         seed_base = int(batch_idx) * max(1, G + M) * 7919
 
         # 4. M open-loop targets (no_grad, ref_flow_decoder swap)
-        target_norms: list[Tensor] = []
+        target_stack: Tensor
         gt_valid: Tensor | None = None
         if use_gt_target:
             gt_target = self._ocsc_build_gt_target_norm(
@@ -3489,74 +3672,57 @@ class SMARTFlow(LightningModule):
             if gt_target is None:
                 return self._build_trainable_connected_zero_loss(self.encoder)
             gt_norm, gt_valid = gt_target
-            target_norms.append(gt_norm.detach())
+            target_stack = gt_norm.detach().unsqueeze(0)
         else:
             with torch.no_grad():
-                for m in range(M):
-                    target_norms.append(
-                        self._ocsc_sample_open_loop_with_ref(
-                            active_hidden=active_hidden,
-                            active_agent_type=active_agent_type,
-                            active_agent_length=active_agent_length,
-                            m=m,
-                            sampling_scheme=sampling_scheme,
-                            seed_base=seed_base + 10_000,
-                        ).detach()
-                    )
+                target_stack = self._ocsc_sample_open_loop_with_ref_batched(
+                    active_hidden=active_hidden,
+                    active_agent_type=active_agent_type,
+                    active_agent_length=active_agent_length,
+                    sample_count=M,
+                    sampling_scheme=sampling_scheme,
+                    seed_base=seed_base + 10_000,
+                ).detach()
 
         # 5. G closed-loop rollouts (with grad), normalize to anchor-0 local pose 4-dim
         #    `[x/20, y/20, cos, sin]`.  CL 은 world frame pose → anchor 0 local pose 변환.
-        cl_norms: list[Tensor] = []
         win_10hz = int(self.flow_window_steps)
         rollout_steps_2hz = max(1, win_10hz // int(agent_enc.shift))
-        scenario_device = tokenized_agent["batch"].device
-        for g in range(G):
-            seeds_g = self._get_closed_loop_scenario_seeds(
-                scenario_ids=data["scenario_id"],
-                rollout_idx=g,
-                device=scenario_device,
-            )
-            cache_g = agent_enc._clone_rollout_cache(rollout_cache)
-            rollout_g = agent_enc.training_rollout_from_cache(
-                rollout_cache=cache_g,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-                sampling_scheme=sampling_scheme,
-                scenario_sampling_seeds=seeds_g,
-                rollout_steps_2hz=rollout_steps_2hz,
-            )
-            traj_g = rollout_g["pred_traj_10hz"][active_mask, :win_10hz]    # [n_active, 20, 2]
-            head_g = rollout_g["pred_head_10hz"][active_mask, :win_10hz]    # [n_active, 20]
-            cl_norm_g = self._ocsc_world_traj_to_anchor0_pose_norm(
-                pred_pos_global=traj_g,
-                pred_head_global=head_g,
-                current_pos=current_pos_active,
-                current_head=current_head_active,
-            )  # [n_active, 20, 4]
-            cl_norms.append(cl_norm_g)
+        cl_stack = self._ocsc_run_closed_loop_rollouts_batched(
+            data=data,
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            rollout_cache=rollout_cache,
+            active_mask=active_mask,
+            current_pos_active=current_pos_active,
+            current_head_active=current_head_active,
+            sampling_scheme=sampling_scheme,
+            rollout_count=G,
+            window_steps_10hz=win_10hz,
+            rollout_steps_2hz=rollout_steps_2hz,
+        )  # [G, n_active, 20, 4]
 
         # 5b. 2 Hz coarse — 10 Hz fine 20 step 의 0.5 s 마다 끝점만 (idx shift-1, 2*shift-1, ...).
         # OCSC 경험: 10 Hz fine 매 step matching 보다 2 Hz coarse 가 학습 잘 됨.
         shift = int(agent_enc.shift)
-        if (cl_norms and cl_norms[0].shape[1] >= shift):
-            cl_norms = [c[:, shift - 1::shift, :] for c in cl_norms]
-            target_norms = [t[:, shift - 1::shift, :] for t in target_norms]
+        if cl_stack.shape[2] >= shift:
+            cl_stack = cl_stack[:, :, shift - 1::shift, :]
+            target_stack = target_stack[:, :, shift - 1::shift, :]
             if gt_valid is not None:
                 gt_valid = gt_valid[:, shift - 1::shift]
 
         # 6. paired loss (nearest_match or 단순 mean)
         if use_gt_target:
             # GT 1 개 target — 모든 CL g 가 GT 와 paired L2 → 평균.
-            target = target_norms[0]
+            target = target_stack[0]
             total_loss = sum(
                 self._ocsc_paired_pose_loss(cl_g, target, pos_w, head_w, valid_mask=gt_valid)
-                for cl_g in cl_norms
+                for cl_g in cl_stack
             ) / float(G)
         elif nearest_match:
             # per CL g, batch-flat argmin OL pool → paired L2 with one scene-level target.
-            target_stack = torch.stack(target_norms, dim=0)  # [M, n_active, T, C]
             losses = []
-            for g, cl_g in enumerate(cl_norms):
+            for g, cl_g in enumerate(cl_stack):
                 with torch.no_grad():
                     flat_diff = target_stack - cl_g.detach().unsqueeze(0)
                     flat_sq = flat_diff.float().square()
@@ -3576,8 +3742,8 @@ class SMARTFlow(LightningModule):
                     f"ocsc_ft: ocsc_ol_nearest_match=False requires M==G, got M={M}, G={G}."
                 )
             total_loss = sum(
-                self._ocsc_paired_pose_loss(cl_g, target_norms[g], pos_w, head_w)
-                for g, cl_g in enumerate(cl_norms)
+                self._ocsc_paired_pose_loss(cl_g, target_stack[g], pos_w, head_w)
+                for g, cl_g in enumerate(cl_stack)
             ) / float(G)
 
         if not torch.isfinite(total_loss):
@@ -3660,6 +3826,8 @@ open_metric_dict:
     def on_before_optimizer_step(self, optimizer) -> None:
         """DDP 전체에 target이 없는 automatic optimization step의 업데이트를 막습니다."""
         if not bool(getattr(self, "automatic_optimization", True)):
+            return
+        if self._is_ocsc_ft_enabled():
             return
         has_open_loop_targets_global = bool(self._automatic_open_loop_has_target_since_step)
         if self._automatic_open_loop_has_target_pending:
@@ -3879,7 +4047,10 @@ open_metric_dict:
             )
             return [generator_optimizer, generated_estimator_optimizer]
 
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        trainable_params = [param for param in self.parameters() if param.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable parameters found for optimization.")
+        optimizer = torch.optim.AdamW(trainable_params, lr=self.lr)
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return [optimizer], [lr_scheduler]
 
