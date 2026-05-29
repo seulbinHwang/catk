@@ -1,0 +1,222 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    kubernetes.io/limit-ranger: 'LimitRanger plugin set: cpu, memory request for init container install-nubescli; cpu, memory limit for init container install-nubescli'
+    mlx.navercorp.com/created-by: system:serviceaccount:a-nl10383:default
+    mlx.navercorp.com/requested-by: system:serviceaccount:a-nl10383:default
+    mlx.navercorp.com/updated-by: system:serviceaccount:a-nl10383:default
+    sidecar.istio.io/inject: 'false'
+  labels:
+    management.mlx.navercorp.com/project: pnc
+    management.mlx.navercorp.com/workspace: naverlabs
+    mlx.navercorp.com/esm-code: A013970
+    mlx.navercorp.com/is-gpu-requested: ''
+    mlx.navercorp.com/scheduled-by: admission-webhook
+    mlx.navercorp.com/top-owner-kind: v1.Pod
+    mlx.navercorp.com/top-owner-name: wo-pvc-11
+  name: wo-pvc-11
+  namespace: p-pnc
+spec:
+  nodeName: k1ncgs2-h100-i006v80031-n3r.nat-nfra.io
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: NotIn
+            values:
+            - k1ncgs2-h100-i006v80030-n3r.nat-nfra.io
+  containers:
+  - args:
+    - "set -Eeo pipefail\numask 002\nexport CACHE_ROOT=/workspace/womd_v1_3/SMART_cache\ntrap 'echo \"Exit (code $?) - keeping pod alive for inspection\"; sleep infinity' EXIT\n\nexport LANG=ko_KR.utf8\nexport LANGUAGE=ko_KR:ko\nexport LC_ALL=ko_KR.utf8\nexport LC_CTYPE=ko_KR.utf8\nexport TERM=xterm-256color\n\nexport PATH=/mnt/nuplan/miniforge/bin:$PATH\nif [ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]; then\n  source /mnt/nuplan/miniforge/etc/profile.d/conda.sh\n  conda activate catk 2>/dev/null || conda activate base 2>/dev/null || true\n  echo \"[startup] conda activated: $(conda info --envs | grep '*')\"\nelse\n  echo \"[startup] /mnt/nuplan/miniforge not found - using image default python\"\nfi\n\nif command -v pip &>/dev/null; then\n  pip install --no-cache-dir wandb || echo \"[startup] pip install wandb failed - continuing\"\n  wandb login --relogin \"$WANDB_API_KEY\" || echo \"[startup] wandb login failed - continuing\"\nelse\n  echo \"[startup] pip not found - skipping wandb setup\"\nfi\n\nmkdir -p \"$HOME\"\n\n# Configure .bashrc so tmux sessions also get conda activated\ncat >> \"$HOME/.bashrc\" <<'RCEOF'\nexport CACHE_ROOT=/workspace/womd_v1_3/SMART_cache\nif [ -f /mnt/nuplan/miniforge/etc/profile.d/conda.sh ]; then\n  source /mnt/nuplan/miniforge/etc/profile.d/conda.sh\n  conda activate catk 2>/dev/null || conda activate base 2>/dev/null || true\nfi\nRCEOF\n\nif infocmp tmux-256color >/dev/null 2>&1; then\n  TMUX_TERM=\"tmux-256color\"\nelse\n  TMUX_TERM=\"screen-256color\"\nfi\n\ncat > \"$HOME/.tmux.conf\" <<EOF\nset -g mouse on\nset -g history-limit 100000\nsetw -g mode-keys vi\nset -g default-terminal \"$TMUX_TERM\"\nset -g default-command \"/bin/bash\"\nEOF\n\nif [ ! -d \"$PROJECT_ROOT/.git\" ]; then\n  echo \"[startup] PROJECT_ROOT not found - attempting to clone repository into emptyDir\"\n  mkdir -p \"$(dirname \"$PROJECT_ROOT\")\"\n  git clone --depth 1 https://github.com/seulbinHwang/catk.git \"$PROJECT_ROOT\" || true\nfi\n\nif [ ! -d \"$PROJECT_ROOT/.git\" ]; then\n  echo \"[startup] PROJECT_ROOT is invalid: $PROJECT_ROOT\"\n  exit 1\nfi\n\ngit config --global --add safe.directory \"$PROJECT_ROOT\"\n\ncd \"$PROJECT_ROOT\"\nif git fetch; then\n  git stash || true\n  if git show-ref --verify --quiet refs/remotes/origin/semi_control_stable_original; then\n    if [ \"$(git rev-parse --abbrev-ref HEAD)\" = \"semi_control_stable_original\" ]; then\n      git checkout main\n    fi\n    git branch -D semi_control_stable_original 2>/dev/null || true\n    git checkout -b semi_control_stable_original origin/semi_control_stable_original\n    git pull\n  else\n    echo \"[startup] origin/semi_control_stable_original not found - keeping current branch $(git rev-parse --abbrev-ref HEAD)\"\n  fi\nelse\n  echo \"[startup] git fetch failed - keeping current checkout\"\nfi\n\nSESSION_NAME=\"npc-training2\"\ntmux new-session -d -s \"$SESSION_NAME\" -c \"$PROJECT_ROOT\"\ntmux split-window -h -t \"$SESSION_NAME:0\" -c \"$PROJECT_ROOT\"\ntmux select-layout -t \"$SESSION_NAME\" even-horizontal\n\necho \"Started tmux session '$SESSION_NAME'.\"\necho \"Claude path: $(command -v claude || echo unavailable)\"\nclaude --version\necho \"Headless login help: /mnt/nuplan/tools/claude-login-help\"\n/mnt/nuplan/tools/claude-login-help\n\nsleep infinity\n"
+    command:
+    - /bin/bash
+    - -c
+    env:
+    - name: LANG
+      value: ko_KR.utf8
+    - name: LANGUAGE
+      value: ko_KR:ko
+    - name: LC_ALL
+      value: ko_KR.utf8
+    - name: LC_CTYPE
+      value: ko_KR.utf8
+    - name: TERM
+      value: xterm-256color
+    - name: PROJECT_ROOT
+      value: /mnt/nuplan/projects/catk
+    - name: HOME
+      value: /mnt/nuplan/home
+    - name: PATH
+      value: /mnt/nuplan/miniforge/envs/catk/bin:/mnt/nuplan/miniforge/bin:/mnt/nuplan/tools:/mnt/nuplan/home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    - name: NUBES_GATEWAY_ADDRESS
+      value: c.nubes.sto.navercorp.com:8000
+    - name: WANDB_API_KEY
+      valueFrom:
+        secretKeyRef:
+          key: api-key
+          name: wandb-secret
+    - name: WANDB_ENTITY
+      value: jksg01019-naver-labs
+    - name: WANDB_PROJECT
+      value: SMART-FLOW
+    - name: WANDB_MODE
+      value: online
+    - name: N3R_CLUSTER_NAME
+      value: pgrsw2
+    - name: N3R_CLUSTER_NETWORK
+      value: production
+    - name: N3R_CLUSTER_PHASE
+      value: production
+    - name: TZ
+      value: Asia/Seoul
+    image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260519
+    name: main
+    resources:
+      limits:
+        cpu: '16'
+        memory: 500Gi
+        nvidia.com/gpu: '2'
+      requests:
+        cpu: '16'
+        memory: 400Gi
+        nvidia.com/gpu: '2'
+    securityContext:
+      allowPrivilegeEscalation: false
+    volumeMounts:
+    - mountPath: /mnt/nuplan
+      name: nuplan-storage
+    - mountPath: /dev/shm
+      name: dshm2
+  imagePullSecrets:
+  - name: pnc-secret
+  initContainers:
+  - command:
+    - /bin/sh
+    - -c
+    - for gpu in $(seq 0 1); do echo "Validating GPU $gpu/1"; ok=0; for i in 1 2 3; do CUDA_VISIBLE_DEVICES=$gpu timeout 30s /tmp/vectorAdd && ok=1 && break || sleep 5; done; [ $ok -eq 0 ] && echo "GPU $gpu FAILED" && exit 1; echo "GPU $gpu PASSED"; done
+    env:
+    - name: N3R_CLUSTER_NAME
+      value: pgrsw2
+    - name: N3R_CLUSTER_NETWORK
+      value: production
+    - name: N3R_CLUSTER_PHASE
+      value: production
+    - name: TZ
+      value: Asia/Seoul
+    image: mlx.n3r.reg.navercorp.com/mlx/cuda-sample:vectoradd-cuda11.7.1-ubuntu20.04
+    name: cuda-validator
+    resources:
+      limits:
+        cpu: 750m
+        memory: 750Mi
+        nvidia.com/gpu: '2'
+      requests:
+        cpu: 750m
+        memory: 750Mi
+        nvidia.com/gpu: '2'
+  - command:
+    - /bin/bash
+    - -c
+    - "set -Eeuo pipefail\numask 002\n\nmkdir -p /mnt/nuplan/tools\nmkdir -p /mnt/nuplan/logs\n\nif [ ! -s /mnt/nuplan/tools/nubescli ]; then\n  echo \"[init] nubescli not found - downloading...\"\n  if curl -fsSL -o /mnt/nuplan/tools/nubescli \\\n    http://owfsrepo.navercorp.com/nubes/dist/nubescli_latest/linux/nubescli; then\n    chmod +x /mnt/nuplan/tools/nubescli\n  else\n    echo \"[init] failed to download nubescli - continuing with a stub wrapper\"\n    cat > /mnt/nuplan/tools/nubescli <<'EOF'\n#!/usr/bin/env bash\necho \"[nubescli wrapper] nubescli is unavailable in this pod.\" >&2\nexit 1\nEOF\n    chmod +x /mnt/nuplan/tools/nubescli\n  fi\nelse\n  echo \"[init] nubescli already exists - skip download\"\nfi\n"
+    env:
+    - name: N3R_CLUSTER_NAME
+      value: pgrsw2
+    - name: N3R_CLUSTER_NETWORK
+      value: production
+    - name: N3R_CLUSTER_PHASE
+      value: production
+    - name: TZ
+      value: Asia/Seoul
+    image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260519
+    name: install-nubescli
+    resources:
+      limits:
+        cpu: 50m
+        memory: 512Mi
+      requests:
+        cpu: 50m
+        memory: 512Mi
+    securityContext:
+      allowPrivilegeEscalation: false
+    volumeMounts:
+    - mountPath: /mnt/nuplan
+      name: nuplan-storage
+  - command:
+    - /bin/bash
+    - -c
+    - "set -Eeuo pipefail\numask 002\n\nMINIFORGE_DIR=/mnt/nuplan/miniforge\n\nif [ -x \"$MINIFORGE_DIR/bin/conda\" ]; then\n  echo \"[init] miniforge already installed - skip\"\nelse\n  echo \"[init] Installing Miniforge...\"\n  curl -fsSL -o /tmp/miniforge.sh \\\n    https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh\n  bash /tmp/miniforge.sh -b -p \"$MINIFORGE_DIR\"\n  rm -f /tmp/miniforge.sh\n  echo \"[init] Miniforge installed at $MINIFORGE_DIR\"\nfi\n\nexport PATH=\"$MINIFORGE_DIR/bin:$PATH\"\nsource \"$MINIFORGE_DIR/etc/profile.d/conda.sh\"\nconda activate base\n\nif conda env list | awk '{print $1}' | grep -qx catk; then\n  echo \"[init] catk env already exists - skip creation\"\nelse\n  echo \"[init] Creating catk conda environment (python 3.11)...\"\n  conda create -y -n catk python=3.11\nfi\n\nconda activate catk\necho \"[init] Installing requirements...\"\npip install --no-cache-dir wandb || echo \"[init] wandb install failed - continuing\"\n\necho \"[init] Miniforge + catk env ready\"\nconda info --envs\n"
+    env:
+    - name: N3R_CLUSTER_NAME
+      value: pgrsw2
+    - name: N3R_CLUSTER_NETWORK
+      value: production
+    - name: N3R_CLUSTER_PHASE
+      value: production
+    - name: TZ
+      value: Asia/Seoul
+    image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260519
+    name: setup-miniforge
+    resources:
+      limits:
+        cpu: '2'
+        memory: 8Gi
+      requests:
+        cpu: '2'
+        memory: 8Gi
+    securityContext:
+      allowPrivilegeEscalation: false
+    volumeMounts:
+    - mountPath: /mnt/nuplan
+      name: nuplan-storage
+  - command:
+    - /bin/bash
+    - -c
+    - "set -Eeuo pipefail\numask 002\n\nexport HOME=/mnt/nuplan/home\nexport PATH=\"$HOME/.local/bin:/mnt/nuplan/tools:$PATH\"\n\nmkdir -p /mnt/nuplan/tools\nmkdir -p \"$HOME/.local/bin\"\nmkdir -p \"$HOME/.claude\"\nchmod 700 \"$HOME/.claude\"\n\nINSTALL_LOG=$(mktemp)\nif ! curl -fsSL https://claude.ai/install.sh | bash 2>&1 | tee \"$INSTALL_LOG\"; then\n  echo \"[init] Claude Code installation failed\" >&2\n  exit 1\nfi\n\nfor rc in \"$HOME/.bashrc\" \"$HOME/.zshrc\"; do\n  touch \"$rc\"\n  if ! grep -qxF 'export PATH=\"$HOME/.local/bin:$PATH\"' \"$rc\"; then\n    printf '\\nexport PATH=\"$HOME/.local/bin:$PATH\"\\n' >> \"$rc\"\n  fi\ndone\n\nif [ ! -x \"$HOME/.local/bin/claude\" ]; then\n  echo \"[init] expected Claude Code launcher not found at $HOME/.local/bin/claude\" >&2\n  find \"$HOME\" -maxdepth 5 -type f -name claude -perm -111 || true\n  exit 1\nfi\n\nln -sf \"$HOME/.local/bin/claude\" /mnt/nuplan/tools/claude\n\ncat > /mnt/nuplan/tools/claude-login-help <<'EOF'\n#!/usr/bin/env bash\ncat <<'EOT'\nClaude Code headless first login:\n1. Run: claude\n2. Select: Claude account with subscription\n3. Open the printed login URL on a separate browser-enabled device\n4. Finish SSO there and copy the returned code\n5. Paste that code back into this terminal\n6. Verify with: claude\n   Then run /status inside Claude Code if needed\nEOT\nEOF\nchmod +x /mnt/nuplan/tools/claude-login-help\n\nif grep -q 'Setup notes:' \"$INSTALL_LOG\"; then\n  echo \"[init] setup notes detected; PATH was preconfigured for /mnt/nuplan/home/.local/bin\"\nfi\n\necho \"[init] Claude Code ready\"\n/mnt/nuplan/tools/claude --version\n"
+    env:
+    - name: N3R_CLUSTER_NAME
+      value: pgrsw2
+    - name: N3R_CLUSTER_NETWORK
+      value: production
+    - name: N3R_CLUSTER_PHASE
+      value: production
+    - name: TZ
+      value: Asia/Seoul
+    image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260519
+    name: setup-claude-code
+    resources:
+      limits:
+        cpu: '1'
+        memory: 4Gi
+      requests:
+        cpu: '1'
+        memory: 4Gi
+    securityContext:
+      allowPrivilegeEscalation: false
+    volumeMounts:
+    - mountPath: /mnt/nuplan
+      name: nuplan-storage
+  nodeSelector:
+    mlx.navercorp.com/hardware-type: gpu
+    mlx.navercorp.com/zone: private-h100-ib-naverlabs-0
+  restartPolicy: OnFailure
+  securityContext:
+    fsGroup: 1000
+    sysctls:
+    - name: net.ipv4.tcp_keepalive_time
+      value: '600'
+    - name: net.ipv4.tcp_keepalive_intvl
+      value: '20'
+    - name: net.ipv4.tcp_keepalive_probes
+      value: '3'
+  serviceAccountName: default
+  terminationGracePeriodSeconds: 120
+  volumes:
+  - emptyDir: {}
+    name: nuplan-storage
+  - emptyDir:
+      medium: Memory
+      sizeLimit: 128Gi
+    name: dshm2
