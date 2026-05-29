@@ -136,6 +136,31 @@ class SMARTFlow(LightningModule):
             )
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
+        # ── OCSC (Open-Closed Self-Consistency) fine-tuning mode ──────────
+        # finetune.mode == "ocsc_ft" 이고 enabled=True 면 training_step 이
+        # self_forced 대신 _run_flow_ocsc_ft_step 으로 분기.
+        # 별도 ref_flow_decoder (frozen pretrained flow_decoder deepcopy) 만 둠.
+        self.finetune_config = model_config.finetune
+        self.ref_flow_decoder: nn.Module | None = None
+        ocsc_use_ref = bool(
+            self._is_ocsc_ft_enabled()
+            and getattr(self.finetune_config, "ocsc_use_pretrained_ref", True)
+        )
+        if ocsc_use_ref:
+            self.ref_flow_decoder = copy.deepcopy(self.encoder.agent_encoder.flow_decoder)
+            for p in self.ref_flow_decoder.parameters():
+                p.requires_grad_(False)
+
+        # velocity_head_only: set_model_for_finetuning 이 step_refiner 도 unfreeze 했으면
+        # 다시 freeze 해서 velocity_head 만 trainable (OCSC clean 의 flow_velocity_head_only 정합).
+        if self._is_ocsc_ft_enabled() and bool(
+            getattr(self.finetune_config, "velocity_head_only", False)
+        ):
+            step_refiner = getattr(self.encoder.agent_encoder.flow_decoder, "step_refiner", None)
+            if step_refiner is not None:
+                for p in step_refiner.parameters():
+                    p.requires_grad_(False)
+
         self.minADE = minADE()
         self.minADE_predict = minADE()
         self.sim_agents_metrics = SimAgentsMetrics(
@@ -267,18 +292,20 @@ class SMARTFlow(LightningModule):
                 "self_forced.distribution_matching_objective must be 'dmd' or 'sid', "
                 f"got {self.self_forced_distribution_matching_objective}."
             )
-        # Backprop 검증용 proxy loss.  none → 실제 DMD/SiD.  l2_to_zero → committed_path_norm 의
-        # 제곱 평균을 minimize (encoder 가 path 를 0 으로 줄이도록 학습).  l2_to_gt → anchor k 의
-        # GT path 와 의 L2 (closed-loop BC).  l2_to_gt 는 replicate-aware (n_rollouts>1 OK).
+        # Backprop 검증용 proxy loss.
+        #   none        → 실제 DMD/SiD
+        #   l2_to_zero  → committed_path_norm 의 제곱 평균 (sanity)
+        # GT BC / nearest BC 는 별도 mode 인 finetune.mode='ocsc_ft' 로 옮겼습니다.
         self.self_forced_debug_proxy_loss = (
             str(getattr(self.self_forced_config, "debug_proxy_loss", "none")).lower()
             if self.self_forced_config is not None
             else "none"
         )
-        if self.self_forced_debug_proxy_loss not in {"none", "l2_to_zero", "l2_to_gt"}:
+        if self.self_forced_debug_proxy_loss not in {"none", "l2_to_zero"}:
             raise ValueError(
-                "self_forced.debug_proxy_loss must be 'none', 'l2_to_zero', or 'l2_to_gt', "
-                f"got {self.self_forced_debug_proxy_loss}."
+                "self_forced.debug_proxy_loss must be 'none' or 'l2_to_zero'; "
+                f"got {self.self_forced_debug_proxy_loss}.  "
+                "GT BC / nearest BC 는 finetune.mode='ocsc_ft' 로 옮겼습니다."
             )
         self.self_forced_sid_alpha = (
             float(getattr(self.self_forced_config, "sid_alpha", 1.0))
@@ -2380,23 +2407,22 @@ class SMARTFlow(LightningModule):
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_idx: int = 0,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """committed rollout 을 ``anchor_idx`` 번째 anchor 기준 packed flow state 로 변환합니다.
 
-        Args:
-            rollout: ``_run_self_forced_rollout`` 의 출력입니다.
-            tokenized_agent: 평가 모드 agent token 사전입니다.
-            anchor_idx: 사용할 flow anchor 인덱스 (>= 0).  default 0 = 기존 동작.
-
         Returns:
-            tuple[Tensor, Tensor]: packed flow state 와 anchor 별 agent mask.
+            packed_path_norm: downstream default — use_kinematic_control_flow=True 면
+                control-space 3-dim, 아니면 pose-space 4-dim.  DMD/SiD critic / estimator 가 사용.
+            packed_path_pose_norm: 항상 pose-space 4-dim ``[x/20, y/20, cos, sin]``.
+                proxy_loss(l2_to_gt) 등 pose-space BC 가 사용.
+            anchor_mask: anchor 별 agent mask.
         """
         from src.smart.modules.self_forced_path_flow import (
             build_anchor_k_normalized_committed_path,
             get_anchor_k_valid_mask,
         )
         anchor_mask = get_anchor_k_valid_mask(tokenized_agent, anchor_idx=int(anchor_idx))
-        committed_path_norm = build_anchor_k_normalized_committed_path(
+        committed_path_norm_full = build_anchor_k_normalized_committed_path(
             pred_traj_10hz=rollout["pred_traj_10hz"],
             pred_head_10hz=rollout["pred_head_10hz"],
             tokenized_agent=tokenized_agent,
@@ -2405,10 +2431,10 @@ class SMARTFlow(LightningModule):
             anchor_stride_2hz=int(self.self_forced_anchor_stride),
             shift=int(self.encoder.agent_encoder.shift),
         )
-        packed_path_norm = committed_path_norm[anchor_mask]
+        packed_path_pose_norm = committed_path_norm_full[anchor_mask]
         if self.use_kinematic_control_flow:
             packed_path_norm = build_anchor0_normalized_committed_control(
-                committed_path_norm=packed_path_norm,
+                committed_path_norm=packed_path_pose_norm,
                 tokenized_agent=tokenized_agent,
                 anchor_mask=anchor_mask,
                 pos_scale_m=self.encoder.agent_encoder.control_pos_scale_m,
@@ -2420,7 +2446,9 @@ class SMARTFlow(LightningModule):
                 vehicle_no_slip_point_ratio=self.encoder.agent_encoder.control_vehicle_no_slip_point_ratio,
                 cyclist_no_slip_point_ratio=self.encoder.agent_encoder.control_cyclist_no_slip_point_ratio,
             )
-        return packed_path_norm, anchor_mask
+        else:
+            packed_path_norm = packed_path_pose_norm
+        return packed_path_norm, packed_path_pose_norm, anchor_mask
 
     def _update_generated_path_flow_estimator(
         self,
@@ -2731,89 +2759,15 @@ class SMARTFlow(LightningModule):
     ) -> Tensor:
         """Backprop 검증용 proxy loss.
 
-        Args:
-            tokenized_agent: 평가 모드 agent token 사전 (n_rollouts>1 이면 replicate 된 상태).
-            committed_path_norm: Generator 가 실행한 self-forced path. shape은 ``[n_pack, F_win, C]``.
-            anchor_idx: 사용할 anchor 인덱스.
-
-        Returns:
-            Tensor: scalar proxy loss.
-
-        설명:
-            ``l2_to_zero`` 는 committed path 의 제곱 평균.  encoder 가 path 출력을 0 으로
-            줄이도록 학습 → loss 가 0 으로 단조 감소해야 backprop 정상.
-            ``l2_to_gt`` 는 anchor k 의 GT path (``flow_eval_clean_norm`` 의 anchor k chunk) 와의
-            L2.  n_rollouts>1 이면 GT chunk 를 N 배로 repeat 해 committed shape 에 맞춤
-            (committed_path_norm 은 replica 0 agents → replica 1 agents → ... 순으로 packed 됨).
+        ``l2_to_zero`` 만 지원 (backprop sanity).  GT BC / nearest BC 는 별도 mode 인
+        ``finetune.mode='ocsc_ft'`` (``_run_flow_ocsc_ft_step``) 으로 옮겼습니다.
         """
         mode = self.self_forced_debug_proxy_loss
         if committed_path_norm.numel() == 0:
             return committed_path_norm.new_zeros(())
         if mode == "l2_to_zero":
             return committed_path_norm.float().square().mean()
-        if mode != "l2_to_gt":
-            raise ValueError(f"unsupported debug_proxy_loss={mode}")
-        if "flow_eval_clean_norm" not in tokenized_agent or "flow_eval_mask" not in tokenized_agent:
-            raise KeyError(
-                "l2_to_gt requires 'flow_eval_clean_norm' and 'flow_eval_mask' in tokenized_agent."
-            )
-        flow_eval_mask = tokenized_agent["flow_eval_mask"]
-        flow_eval_clean_norm = tokenized_agent["flow_eval_clean_norm"]
-        # replicate 후에도 flow_eval_clean_norm 은 원본 packed 유지 (skip set).
-        # replica 수 = replicated_n_agent / orig_n_agent.  flow_eval_mask 는 replica 간 동일하므로
-        # 첫 n_orig_agent 만 보고 n_per_anchor 계산 → 원본 anchor k chunk 추출.
-        replicated_n_agent = int(flow_eval_mask.shape[0])
-        max_anchor = int(flow_eval_mask.shape[1])
-        if not (0 <= anchor_idx < max_anchor):
-            raise ValueError(
-                f"anchor_idx={anchor_idx} out of range [0, {max_anchor})."
-            )
-        n_rollouts = max(1, int(self.self_forced_n_rollouts))
-        if replicated_n_agent % n_rollouts != 0:
-            raise RuntimeError(
-                "replicated agent count not divisible by n_rollouts: "
-                f"replicated_n_agent={replicated_n_agent}, n_rollouts={n_rollouts}."
-            )
-        n_orig_agent = replicated_n_agent // n_rollouts
-        orig_flow_eval_mask = flow_eval_mask[:n_orig_agent]
-        n_per_anchor = orig_flow_eval_mask.sum(dim=0)  # [n_anchor]
-        start = int(n_per_anchor[:anchor_idx].sum().item())
-        end = start + int(n_per_anchor[anchor_idx].item())
-        gt_chunk = flow_eval_clean_norm[start:end]  # [n_per_anchor_k, F_win, 4]
-        if gt_chunk.shape[-1] != committed_path_norm.shape[-1]:
-            # control-space (3-dim committed) vs pose-space (4-dim GT) — pose 4d 만 비교.
-            min_dim = min(gt_chunk.shape[-1], committed_path_norm.shape[-1])
-            gt_chunk = gt_chunk[..., :min_dim]
-            committed_for_loss = committed_path_norm[..., :min_dim]
-        else:
-            committed_for_loss = committed_path_norm
-        if n_rollouts > 1:
-            gt_chunk = gt_chunk.repeat(n_rollouts, *([1] * (gt_chunk.dim() - 1)))
-        if gt_chunk.shape != committed_for_loss.shape:
-            raise RuntimeError(
-                "l2_to_gt shape mismatch after replication: "
-                f"committed={tuple(committed_for_loss.shape)}, gt={tuple(gt_chunk.shape)}."
-            )
-        # OCSC parity: 2 Hz coarse + weighted (pos_w=1.0, head_w=0.01).
-        #   - 10 Hz fine path → 0.5 s commit 끝점만 (idx = shift-1, 2*shift-1, ...).
-        #     fine-step jitter 와 token snap 오차의 영향을 줄임.
-        #   - heading 은 작은 가중치 — stopped agent 의 noisy heading GT 영향을 누그러뜨림.
-        shift = int(self.encoder.agent_encoder.shift)
-        if committed_for_loss.shape[1] >= shift:
-            committed_coarse = committed_for_loss[:, shift - 1 :: shift, :]
-            gt_coarse = gt_chunk[:, shift - 1 :: shift, :]
-        else:
-            committed_coarse = committed_for_loss
-            gt_coarse = gt_chunk
-        committed_coarse_f = committed_coarse.float()
-        gt_coarse_f = gt_coarse.float().to(committed_coarse_f.device)
-        pos_w = 1.0
-        head_w = 0.01
-        pos_loss = (committed_coarse_f[..., :2] - gt_coarse_f[..., :2]).square().mean()
-        if committed_coarse_f.shape[-1] >= 4 and gt_coarse_f.shape[-1] >= 4:
-            head_loss = (committed_coarse_f[..., 2:4] - gt_coarse_f[..., 2:4]).square().mean()
-            return pos_w * pos_loss + head_w * head_loss
-        return pos_w * pos_loss
+        raise ValueError(f"unsupported debug_proxy_loss={mode}")
 
     def _compute_self_forced_distribution_matching_loss(
         self,
@@ -2822,6 +2776,7 @@ class SMARTFlow(LightningModule):
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
         anchor_idx: int = 0,
+        committed_path_pose_norm: Tensor | None = None,  # legacy; unused after OCSC port
     ) -> Tensor:
         """설정에 따라 DMD-style 또는 SiD-style generator loss를 계산합니다.
 
@@ -2833,11 +2788,13 @@ class SMARTFlow(LightningModule):
                 control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
+            committed_path_pose_norm: legacy unused (GT BC 가 별도 OCSC mode 로 옮겨감).
 
         Returns:
             Tensor: scalar 분포 맞춤 loss입니다. shape은 ``[]`` 입니다.
         """
         if self.self_forced_debug_proxy_loss != "none":
+            # l2_to_zero only — control-space committed 그대로.
             return self._compute_self_forced_debug_proxy_loss(
                 tokenized_agent=tokenized_agent,
                 committed_path_norm=committed_path_norm,
@@ -3063,10 +3020,12 @@ class SMARTFlow(LightningModule):
                 rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
 
             for anchor_idx in range(n_anchors):
-                committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
-                    rollout=rollout,
-                    tokenized_agent=tokenized_agent_eval,
-                    anchor_idx=anchor_idx,
+                committed_path_norm, committed_path_pose_norm, anchor_mask = (
+                    self._pack_self_forced_committed_rollout(
+                        rollout=rollout,
+                        tokenized_agent=tokenized_agent_eval,
+                        anchor_idx=anchor_idx,
+                    )
                 )
                 has_committed_local = committed_path_norm.numel() > 0
                 has_committed_global = self._sync_distributed_bool_any(
@@ -3097,6 +3056,7 @@ class SMARTFlow(LightningModule):
                         tokenized_map=tokenized_map_eval,
                         tokenized_agent=tokenized_agent_eval,
                         committed_path_norm=committed_path_norm,
+                        committed_path_pose_norm=committed_path_pose_norm,
                         anchor_mask=anchor_mask,
                         anchor_idx=anchor_idx,
                     )
@@ -3283,6 +3243,357 @@ class SMARTFlow(LightningModule):
             )
         return total_loss.detach()
 
+    def _is_ocsc_ft_enabled(self) -> bool:
+        """OCSC (Open-Closed Self-Consistency) fine-tune mode 활성 여부.
+
+        finetune.enabled=True 이고 finetune.mode == 'ocsc_ft' 일 때 True.
+        self_forced 와 격리되어 training_step 이 별도 분기.
+        """
+        ft = getattr(self, "finetune_config", None)
+        if ft is None:
+            return False
+        if not bool(getattr(ft, "enabled", False)):
+            return False
+        return str(getattr(ft, "mode", "none")).lower() == "ocsc_ft"
+
+    # ──────────────────────────────────────────────────────────────────────
+    # OCSC (Open-Closed Self-Consistency) finetune mode — single anchor (0)
+    #   알고리즘 (OCSC_clean 정합 단순화 버전, single anchor 0):
+    #     1. eval-mode tokenize + encode_map (no_grad).
+    #     2. prepare_inference_cache → active_mask, active_hidden, current_pos/head.
+    #     3. M open-loop samples (no_grad, ref_flow_decoder swap):
+    #          ol_norms[m] = _sample_open_loop_future_from_hidden(active_hidden, seed=m)
+    #          shape [n_active, 20, 4] = [x/20, y/20, cos, sin] in anchor-0 local frame.
+    #     4. G closed-loop rollouts (with grad), per g:
+    #          rollout_g = encoder.agent_encoder.training_rollout_from_cache(seed_g)
+    #          → pred_traj_10hz / pred_head_10hz, world frame
+    #          → transform to anchor-0 local + normalize ⇒ cl_norm_g shape [n_active, 20, 4]
+    #     5. nearest match (ocsc_ol_nearest_match=True) — per CL g, per agent:
+    #          m* = argmin_m mean_L2(cl_norm_g[a], ol_norm[m][a])
+    #        gt_target=True 면 OL pool 대신 GT 1 sample (M=1, no nearest).
+    #     6. paired L2:  pos_w * L2(pos) + head_w * L2(cos,sin), mean over agents/time.
+    #     7. backward (Lightning automatic_optimization).
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _ocsc_anchor0_origin(
+        self,
+        rollout_cache: Dict[str, object],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """anchor 0 = history end 의 active_mask / current_pos / current_head 를 뽑습니다."""
+        active_mask = rollout_cache["valid_window"][:, -1]
+        current_pos = rollout_cache["pos_window"][:, -1]
+        current_head = rollout_cache["head_window"][:, -1]
+        return active_mask, current_pos, current_head
+
+    def _ocsc_world_traj_to_anchor0_pose_norm(
+        self,
+        pred_pos_global: Tensor,    # [n_active, T, 2]
+        pred_head_global: Tensor,   # [n_active, T]
+        current_pos: Tensor,        # [n_active, 2]
+        current_head: Tensor,       # [n_active]
+        pos_scale_m: float = 20.0,
+    ) -> Tensor:
+        """closed-loop rollout 의 global pose 를 anchor-0 local pose-norm 4-dim 으로 변환.
+
+        Returns:
+            Tensor ``[n_active, T, 4]`` = ``[x/20, y/20, cos, sin]``.
+        """
+        from src.smart.utils.rollout import transform_to_local
+        pos_local, head_local = transform_to_local(
+            pos_global=pred_pos_global,
+            head_global=pred_head_global,
+            pos_now=current_pos,
+            head_now=current_head,
+        )
+        return torch.stack(
+            [
+                pos_local[..., 0] / float(pos_scale_m),
+                pos_local[..., 1] / float(pos_scale_m),
+                head_local.cos(),
+                head_local.sin(),
+            ],
+            dim=-1,
+        )
+
+    def _ocsc_build_gt_target_norm(
+        self,
+        data,
+        active_mask: Tensor,
+        current_pos: Tensor,
+        current_head: Tensor,
+        window_steps_10hz: int,
+    ) -> Tensor | None:
+        """GT (raw 10Hz) future pose 를 anchor-0 local pose-norm 4-dim 으로.
+
+        anchor 0 = history end (10Hz step index = num_historical_steps - 1 = 10).
+        future 는 step 11 .. 11+window_steps_10hz-1.
+        invalid future 가 있으면 단순화 — last-valid 로 채움 안 하고 그대로 변환.
+        """
+        try:
+            agent_data = data["agent"]
+            pos_full = agent_data["position"][..., :2]  # [N, T_seq, 2]
+            head_full = agent_data["heading"]            # [N, T_seq]
+            valid_full = agent_data["valid_mask"]        # [N, T_seq]
+        except Exception:
+            return None
+        num_hist_10hz = int(self.encoder.agent_encoder.num_historical_steps)
+        gt_start = num_hist_10hz
+        gt_end = gt_start + int(window_steps_10hz)
+        if pos_full.shape[1] < gt_end:
+            return None
+        gt_pos = pos_full[active_mask, gt_start:gt_end]
+        gt_head = head_full[active_mask, gt_start:gt_end]
+        return self._ocsc_world_traj_to_anchor0_pose_norm(
+            pred_pos_global=gt_pos,
+            pred_head_global=gt_head,
+            current_pos=current_pos,
+            current_head=current_head,
+        )
+
+    def _ocsc_paired_pose_loss(
+        self,
+        cl_norm: Tensor,   # [n_active, T, C]  C ∈ {3, 4}
+        target_norm: Tensor,  # [n_active, T, C]
+        pos_w: float,
+        head_w: float,
+    ) -> Tensor:
+        """anchor-0 local 정규화 텐서의 paired L2.
+
+        C=3 (control-space): pos=Δs/Δn (정규화), head=Δyaw (정규화) 1 ch.
+        C=4 (pose-space):    pos=Δx/Δy (/20),    head=Δcos/Δsin 2 ch.
+        """
+        diff = cl_norm.float() - target_norm.float().detach()
+        if diff.shape[-1] != target_norm.shape[-1]:
+            raise RuntimeError(
+                f"OCSC paired loss dim mismatch: cl={tuple(cl_norm.shape)} "
+                f"target={tuple(target_norm.shape)}."
+            )
+        pos_loss = diff[..., :2].square().mean()
+        head_dim_end = min(4, diff.shape[-1])
+        if head_dim_end > 2:
+            head_loss = diff[..., 2:head_dim_end].square().mean()
+            return pos_w * pos_loss + head_w * head_loss
+        return pos_w * pos_loss
+
+    def _ocsc_sample_open_loop_with_ref(
+        self,
+        active_hidden: Tensor,
+        active_agent_type: Tensor,
+        active_agent_length: Tensor | None,
+        m: int,
+        sampling_scheme,
+        seed_base: int,
+    ) -> Tensor:
+        """ref_flow_decoder 로 1 개 OL sample 생성 후 pose 4-dim 으로 변환 (no_grad).
+
+        student agent_encoder 의 flow_decoder 를 잠시 ref 로 swap 후 호출.
+        use_kinematic_control_flow=True 면 native output 이 control 3-dim 이므로
+        ``control_norm_to_pose_norm`` 으로 anchor 0 origin forward kinematic 누적해
+        pose 4-dim ``[x/20, y/20, cos, sin]`` 로 변환.
+        """
+        from src.smart.modules.kinematic_control import control_norm_to_pose_norm
+        agent_enc = self.encoder.agent_encoder
+        orig_fd = agent_enc.flow_decoder
+        if self.ref_flow_decoder is not None:
+            agent_enc.flow_decoder = self.ref_flow_decoder
+        try:
+            ol_raw = agent_enc._sample_open_loop_future_from_hidden(
+                anchor_hidden_valid=active_hidden,
+                sampling_scheme=sampling_scheme,
+                sampling_seed=int(seed_base) + int(m),
+            )
+        finally:
+            agent_enc.flow_decoder = orig_fd
+        # native dim: control 3-dim (use_kinematic_control_flow=True) or pose 4-dim (False).
+        if self.use_kinematic_control_flow:
+            ol_pose_norm = control_norm_to_pose_norm(
+                control_norm=ol_raw,
+                agent_type=active_agent_type,
+                agent_length=active_agent_length,
+                pos_scale_m=agent_enc.control_pos_scale_m,
+                vehicle_yaw_scale_rad=agent_enc.control_vehicle_yaw_scale_rad,
+                pedestrian_yaw_scale_rad=agent_enc.control_pedestrian_yaw_scale_rad,
+                cyclist_yaw_scale_rad=agent_enc.control_cyclist_yaw_scale_rad,
+                use_holonomic_model_only=agent_enc.use_holonomic_model_only,
+                vehicle_no_slip_point_ratio=agent_enc.control_vehicle_no_slip_point_ratio,
+                cyclist_no_slip_point_ratio=agent_enc.control_cyclist_no_slip_point_ratio,
+            )  # [n_active, 20, 4]
+            return ol_pose_norm
+        return ol_raw  # already pose 4-dim
+
+    def _run_flow_ocsc_ft_step(self, data, batch_idx) -> Tensor:
+        """OCSC (Open-Closed Self-Consistency) finetune training step.
+
+        single anchor (anchor 0 = history end) 버전.  manual_optimization 사용 안 함
+        (Lightning automatic_optimization=True 가정).
+        """
+        ft = self.finetune_config
+        G = int(getattr(ft, "ocsc_n_rollouts", 4))
+        M_raw = int(getattr(ft, "ocsc_n_ol_rollouts", -1))
+        M = G if M_raw <= 0 else max(1, M_raw)
+        nearest_match = bool(getattr(ft, "ocsc_ol_nearest_match", True))
+        use_gt_target = bool(getattr(ft, "ocsc_gt_target", False))
+        pos_w = float(getattr(ft, "ocsc_position_weight", 1.0))
+        head_w = float(getattr(ft, "ocsc_heading_weight", 0.01))
+
+        if use_gt_target and nearest_match:
+            nearest_match = False  # GT 1 개 target 이면 nearest 의미 없음
+
+        # 1. eval-mode tokenize
+        tokenized_map, tokenized_agent = self._build_eval_tokenized_inputs(data)
+
+        agent_enc = self.encoder.agent_encoder
+
+        # 2. encode_map (no_grad — map encoder frozen 전제)
+        with torch.no_grad():
+            map_feature = self.encoder.encode_map(tokenized_map)
+
+        # 3. prepare_inference_cache + anchor-0 origin (no_grad — student feature 는 ref/CL 공유)
+        with torch.no_grad():
+            rollout_cache = agent_enc.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
+        active_mask, current_pos, current_head = self._ocsc_anchor0_origin(rollout_cache)
+        if not bool(active_mask.any()):
+            return self._build_trainable_connected_zero_loss(self.encoder)
+        current_pos_active = current_pos[active_mask]
+        current_head_active = current_head[active_mask]
+        active_hidden = rollout_cache["feat_a_now"][active_mask]
+        active_agent_type = tokenized_agent["type"][active_mask]
+        active_agent_length = (
+            tokenized_agent["shape"][active_mask, 0]
+            if "shape" in tokenized_agent
+            else None
+        )
+
+        sampling_scheme = self.validation_rollout_sampling
+        seed_base = int(batch_idx) * max(1, G + M) * 7919
+
+        # 4. M open-loop targets (no_grad, ref_flow_decoder swap)
+        target_norms: list[Tensor] = []
+        if use_gt_target:
+            gt_norm = self._ocsc_build_gt_target_norm(
+                data=data,
+                active_mask=active_mask,
+                current_pos=current_pos_active,
+                current_head=current_head_active,
+                window_steps_10hz=self.flow_window_steps,
+            )
+            if gt_norm is None:
+                return self._build_trainable_connected_zero_loss(self.encoder)
+            target_norms.append(gt_norm.detach())
+        else:
+            with torch.no_grad():
+                for m in range(M):
+                    target_norms.append(
+                        self._ocsc_sample_open_loop_with_ref(
+                            active_hidden=active_hidden,
+                            active_agent_type=active_agent_type,
+                            active_agent_length=active_agent_length,
+                            m=m,
+                            sampling_scheme=sampling_scheme,
+                            seed_base=seed_base + 10_000,
+                        ).detach()
+                    )
+
+        # 5. G closed-loop rollouts (with grad), normalize to anchor-0 local pose 4-dim
+        #    `[x/20, y/20, cos, sin]`.  CL 은 world frame pose → anchor 0 local pose 변환.
+        cl_norms: list[Tensor] = []
+        win_10hz = int(self.flow_window_steps)
+        rollout_steps_2hz = max(1, win_10hz // int(agent_enc.shift))
+        scenario_device = tokenized_agent["batch"].device
+        for g in range(G):
+            seeds_g = self._get_closed_loop_scenario_seeds(
+                scenario_ids=data["scenario_id"],
+                rollout_idx=g,
+                device=scenario_device,
+            )
+            cache_g = agent_enc._clone_rollout_cache(rollout_cache)
+            rollout_g = agent_enc.training_rollout_from_cache(
+                rollout_cache=cache_g,
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                sampling_scheme=sampling_scheme,
+                scenario_sampling_seeds=seeds_g,
+                rollout_steps_2hz=rollout_steps_2hz,
+            )
+            traj_g = rollout_g["pred_traj_10hz"][active_mask, :win_10hz]    # [n_active, 20, 2]
+            head_g = rollout_g["pred_head_10hz"][active_mask, :win_10hz]    # [n_active, 20]
+            cl_norm_g = self._ocsc_world_traj_to_anchor0_pose_norm(
+                pred_pos_global=traj_g,
+                pred_head_global=head_g,
+                current_pos=current_pos_active,
+                current_head=current_head_active,
+            )  # [n_active, 20, 4]
+            cl_norms.append(cl_norm_g)
+
+        # 5b. 2 Hz coarse — 10 Hz fine 20 step 의 0.5 s 마다 끝점만 (idx shift-1, 2*shift-1, ...).
+        # OCSC 경험: 10 Hz fine 매 step matching 보다 2 Hz coarse 가 학습 잘 됨.
+        shift = int(agent_enc.shift)
+        if (cl_norms and cl_norms[0].shape[1] >= shift):
+            cl_norms = [c[:, shift - 1::shift, :] for c in cl_norms]
+            target_norms = [t[:, shift - 1::shift, :] for t in target_norms]
+
+        # 6. paired loss (nearest_match or 단순 mean)
+        if use_gt_target:
+            # GT 1 개 target — 모든 CL g 가 GT 와 paired L2 → 평균.
+            target = target_norms[0]
+            total_loss = sum(
+                self._ocsc_paired_pose_loss(cl_g, target, pos_w, head_w)
+                for cl_g in cl_norms
+            ) / float(G)
+        elif nearest_match:
+            # per CL g, per agent (anchor-flat) argmin OL pool → paired L2 with chosen.
+            # 효율: target 들을 stack [M, n_active, 20, 4]; per agent (n_active) 별 argmin over M
+            # 단 single anchor 라 agent 는 n_active 차원만.
+            target_stack = torch.stack(target_norms, dim=0)  # [M, n_active, T, C]
+            n_active = target_stack.shape[1]
+            t_dim = target_stack.shape[2]
+            c_dim = target_stack.shape[3]
+            # per-agent flat L2 across time and channels for nearest selection
+            # (pos+head with equal weight; OCSC clean 의 nearest_match 거리 측정은
+            # weighted 가 아닌 raw flat L2 사용 — 단순 매칭 거리, gradient 와 무관).
+            losses = []
+            for g, cl_g in enumerate(cl_norms):
+                with torch.no_grad():
+                    # [M, n_active, T, 4] vs [n_active, T, 4]
+                    flat_diff = target_stack - cl_g.detach().unsqueeze(0)
+                    # per agent flat L2 over T x 4
+                    flat_l2 = flat_diff.float().square().mean(dim=(-1, -2))  # [M, n_active]
+                    nearest_m = flat_l2.argmin(dim=0)  # [n_active]
+                # gather target by per-agent argmin: [n_active, T, 4]
+                # target_stack[m, a, :, :] -> use nearest_m
+                m_idx = nearest_m.view(1, -1, 1, 1).expand(1, n_active, t_dim, c_dim)
+                chosen = target_stack.gather(0, m_idx).squeeze(0)
+                losses.append(self._ocsc_paired_pose_loss(cl_g, chosen, pos_w, head_w))
+            total_loss = sum(losses) / float(G)
+        else:
+            # M == G, paired index (g, g) — 기본 paired L2 (ablation).
+            if M != G:
+                raise ValueError(
+                    f"ocsc_ft: ocsc_ol_nearest_match=False requires M==G, got M={M}, G={G}."
+                )
+            total_loss = sum(
+                self._ocsc_paired_pose_loss(cl_g, target_norms[g], pos_w, head_w)
+                for g, cl_g in enumerate(cl_norms)
+            ) / float(G)
+
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(
+                "Non-finite ocsc_ft loss: "
+                f"{self._summarize_nonfinite_tensor(total_loss)}"
+            )
+
+        self.log(
+            "train/ocsc_ft/loss",
+            total_loss.detach(),
+            on_step=True,
+            on_epoch=False,
+            batch_size=1,
+        )
+        return total_loss
+
     def training_step(self, data, batch_idx):
         """한 batch의 Flow Matching loss를 계산합니다.
 
@@ -3293,6 +3604,8 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: 최종 학습 loss입니다.
         """
+        if self._is_ocsc_ft_enabled():
+            return self._run_flow_ocsc_ft_step(data=data, batch_idx=batch_idx)
         if self.self_forced_enabled:
             if self._is_self_forced_active():
                 return self._training_step_self_forced(data=data, batch_idx=batch_idx)

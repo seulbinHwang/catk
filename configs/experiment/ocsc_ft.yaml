@@ -1,0 +1,87 @@
+# @package _global_
+
+# OCSC (Open-Closed Self-Consistency) fine-tuning experiment.
+# self_forced framework 와 격리.  finetune.mode=ocsc_ft + finetune.enabled=true 면
+# training_step 이 _run_flow_ocsc_ft_step 으로 분기 (single anchor 0 버전).
+#
+# 알고리즘 한 줄:
+#   매 batch 마다 anchor 0 기준으로
+#     M open-loop samples (frozen ref_flow_decoder)
+#     +  G closed-loop rollouts (student, with grad)
+#     +  per-CL argmin OL nearest match
+#     +  paired pose-norm L2 (pos_w=1.0, head_w=0.01)
+#   를 학습.
+#
+# 사용 예 (smoke; GPU 3):
+#   CUDA_VISIBLE_DEVICES=3 NPROC_PER_NODE=1 \
+#     MAX_EPOCHS=1 LIMIT_TRAIN_BATCHES=2 LIMIT_VAL_BATCHES=2 \
+#     MY_EXPERIMENT=ocsc_ft \
+#     bash scripts/train_ocsc_ft.sh
+#
+# 2 GPU 학습 (GPU 2, 3):
+#   CUDA_VISIBLE_DEVICES=2,3 NPROC_PER_NODE=2 \
+#     MY_TASK_NAME=ocsc_ft_v1 \
+#     bash scripts/train_ocsc_ft.sh
+
+defaults:
+  - override /model: smart_flow
+  - override /trainer: ddp
+
+action: finetune
+ckpt_path: null
+
+model:
+  model_config:
+    lr: 1.0e-6
+    lr_warmup_steps: 0
+    lr_min_ratio: 1.0
+    n_rollout_closed_val: 16
+    n_batch_sim_agents_metric: 100000
+    sim_agents_metric_workers: 0
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    self_forced:
+      enabled: false   # OCSC 와 격리
+    finetune:
+      enabled: true
+      mode: ocsc_ft
+      # train_full_flow_decoder_only=false + velocity_head_only=true → velocity_head 만 trainable
+      # (OCSC clean 의 flow_velocity_head_only=true 정합).
+      train_full_flow_decoder_only: false
+      velocity_head_only: true
+      # OCSC core knob
+      ocsc_n_rollouts: 4
+      ocsc_n_ol_rollouts: -1
+      ocsc_ol_nearest_match: true
+      ocsc_loss_type: l2
+      ocsc_gt_target: false
+      ocsc_use_pretrained_ref: true
+      ocsc_anchor_idx: 0
+      ocsc_position_weight: 1.0
+      ocsc_heading_weight: 0.01
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  val_check_interval: 200
+  check_val_every_n_epoch: null
+  max_epochs: 16
+  precision: bf16-mixed
+  gradient_clip_val: 1.0      # OCSC 는 automatic_optimization → Lightning clip 적용
+  sync_batchnorm: false
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+    save_top_k: 1
+
+data:
+  train_batch_size: 8
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
+  train_epoch_sample_fraction: 0.5

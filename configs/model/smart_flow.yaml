@@ -167,3 +167,19 @@ model_config:
   finetune:
     enabled: false
     train_full_flow_decoder_only: false
+    # ── OCSC (Open-Closed Self-Consistency) finetune mode ──────────────────
+    # mode 가 "ocsc_ft" 이고 enabled=true 이면 training_step 이 self_forced 대신
+    # _run_flow_ocsc_ft_step 으로 분기 (self_forced framework 와 격리).
+    mode: none                          # none / ocsc_ft
+    # velocity_head_only=true 면 set_model_for_finetuning 의 step_refiner unfreeze 이후
+    # __init__ 에서 step_refiner 를 다시 freeze → velocity_head 만 trainable (OCSC clean 정합).
+    velocity_head_only: false
+    ocsc_n_rollouts: 4                  # G — student closed-loop rollout 수
+    ocsc_n_ol_rollouts: -1              # M — open-loop sample 수.  -1 이면 G 와 동일
+    ocsc_ol_nearest_match: true         # 각 CL g 에 대해 M OL 중 argmin L2 매칭
+    ocsc_loss_type: l2                  # l2 (other types 미지원 in this minimal port)
+    ocsc_gt_target: false               # true → OL sample 대신 GT (single target, no nearest)
+    ocsc_use_pretrained_ref: true       # OL 생성에 frozen pretrained ref decoder 사용
+    ocsc_anchor_idx: 0                  # 사용할 anchor index (multi-anchor 미지원, 0 만 권장)
+    ocsc_position_weight: 1.0           # pos L2 weight
+    ocsc_heading_weight: 0.01           # heading (cos/sin) L2 weight
