@@ -578,11 +578,142 @@ def stop_tmux_target(target: str) -> None:
         return
     log(f"stopping tmux target {target}")
     for _ in range(2):
-        subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], check=False)
+        result = subprocess.run(
+            ["tmux", "send-keys", "-t", target, "C-c"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout).strip()
+            if message:
+                log(f"tmux stop failed for {target}: {message}")
         time.sleep(10)
 
 
-def terminate_process(proc: subprocess.Popen[Any] | None) -> None:
+def _process_table() -> dict[int, tuple[int, int, str]]:
+    result = subprocess.run(
+        ["ps", "-eo", "pid=,ppid=,pgid=,args="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    table: dict[int, tuple[int, int, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            pgid = int(parts[2])
+        except ValueError:
+            continue
+        table[pid] = (ppid, pgid, parts[3])
+    return table
+
+
+def _training_process_pids_for_task(task_name: str) -> set[int]:
+    if not task_name:
+        return set()
+    table = _process_table()
+    pids: set[int] = {
+        pid
+        for pid, (_ppid, _pgid, args) in table.items()
+        if task_name in args and ("src.run" in args or "torchrun" in args)
+    }
+    if not pids:
+        return set()
+
+    # Include the train script parent plus all dataloader/torch child workers.
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _pgid, _args) in table.items():
+        children.setdefault(ppid, []).append(pid)
+
+    queue = list(pids)
+    while queue:
+        pid = queue.pop()
+        ppid, _pgid, _args = table.get(pid, (0, 0, ""))
+        parent_info = table.get(ppid)
+        parent_args = parent_info[2] if parent_info is not None else ""
+        if (
+            parent_info is not None
+            and ppid not in pids
+            and (
+                "scripts/train_ocsc_ft.sh" in parent_args
+                or "torchrun" in parent_args
+                or "src.run" in parent_args
+            )
+        ):
+            pids.add(ppid)
+            queue.append(ppid)
+        for child_pid in children.get(pid, []):
+            if child_pid not in pids:
+                pids.add(child_pid)
+                queue.append(child_pid)
+    return pids
+
+
+def _process_groups_for_pids(pids: set[int]) -> set[int]:
+    table = _process_table()
+    pgids = {table[pid][1] for pid in pids if pid in table and table[pid][1] > 1}
+    return pgids
+
+
+def _existing_pids(pids: set[int]) -> set[int]:
+    existing: set[int] = set()
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        existing.add(pid)
+    return existing
+
+
+def _wait_for_pids_to_exit(pids: set[int], timeout_s: int) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not _existing_pids(pids):
+            return True
+        time.sleep(1)
+    return not _existing_pids(pids)
+
+
+def terminate_task_processes(task_name: str) -> None:
+    pids = _training_process_pids_for_task(task_name)
+    if not pids:
+        log(f"no training processes found for task {task_name}")
+        return
+    log(f"stopping task processes for {task_name}: pids={sorted(pids)[:12]}")
+    for sig, timeout_s in (
+        (signal.SIGINT, 20),
+        (signal.SIGTERM, 20),
+        (signal.SIGKILL, 5),
+    ):
+        pgids = _process_groups_for_pids(pids)
+        for pgid in sorted(pgids):
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError:
+                continue
+        if _wait_for_pids_to_exit(pids, timeout_s):
+            return
+    remaining = sorted(_existing_pids(pids))
+    if remaining:
+        log(f"processes still alive after SIGKILL for {task_name}: {remaining[:12]}")
+
+
+def stop_existing_run(target: str, log_path: Path) -> None:
+    stop_tmux_target(target)
+    terminate_task_processes(log_path.stem)
+
+
+def terminate_process(proc: subprocess.Popen[Any] | None, task_name: str | None = None) -> None:
+    if task_name:
+        terminate_task_processes(task_name)
     if proc is None or proc.poll() is not None:
         return
     log(f"stopping child process group pid={proc.pid}")
@@ -830,7 +961,10 @@ def main() -> int:
             run_label="initial",
             log_path=Path(args.initial_log_path),
             state_path=state_path,
-            stop_current=lambda: stop_tmux_target(args.initial_tmux_target),
+            stop_current=lambda: stop_existing_run(
+                args.initial_tmux_target,
+                Path(args.initial_log_path),
+            ),
         )
         if status in {"finished", "cutoff"}:
             log(f"initial run ended: {reason}")
@@ -859,7 +993,10 @@ def main() -> int:
             run_label=f"fallback_{idx}:{variant.name}",
             log_path=variant_log,
             state_path=state_path,
-            stop_current=lambda proc=proc: terminate_process(proc),
+            stop_current=lambda proc=proc, task_name=variant_log.stem: terminate_process(
+                proc,
+                task_name,
+            ),
             proc=proc,
         )
         if status in {"finished", "cutoff"}:
