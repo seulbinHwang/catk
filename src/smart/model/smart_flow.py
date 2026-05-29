@@ -3404,6 +3404,7 @@ class SMARTFlow(LightningModule):
         agent_enc = self.encoder.agent_encoder
         orig_fd = agent_enc.flow_decoder
         if self.ref_flow_decoder is not None:
+            self.ref_flow_decoder.eval()
             agent_enc.flow_decoder = self.ref_flow_decoder
         try:
             ol_raw = agent_enc._sample_open_loop_future_from_hidden(
@@ -3487,6 +3488,7 @@ class SMARTFlow(LightningModule):
 
         orig_fd = agent_enc.flow_decoder
         if self.ref_flow_decoder is not None:
+            self.ref_flow_decoder.eval()
             agent_enc.flow_decoder = self.ref_flow_decoder
         try:
             ol_raw = agent_enc.flow_ode.generate(
