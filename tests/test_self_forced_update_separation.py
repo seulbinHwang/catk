@@ -9,6 +9,7 @@ from src.smart.modules.self_forced_update_separation import (
     clear_module_gradients,
     detach_tensor_tree,
     module_gradients_disabled,
+    temporarily_clear_module_gradients,
 )
 
 
@@ -63,3 +64,20 @@ def test_assert_no_module_gradients_reports_and_clear_removes_gradients() -> Non
 
     clear_module_gradients(module)
     assert_no_module_gradients(module, "online Generator", "generated-estimator update")
+
+
+def test_temporarily_clear_module_gradients_restores_outer_gradients() -> None:
+    module = nn.Linear(2, 1)
+    module(torch.ones(1, 2)).sum().backward()
+    original_weight_grad = module.weight.grad
+    original_bias_grad = module.bias.grad
+
+    with temporarily_clear_module_gradients(module):
+        assert module.weight.grad is None
+        assert module.bias.grad is None
+        module(torch.ones(1, 2)).sum().backward()
+        assert module.weight.grad is not None
+        assert module.bias.grad is not None
+
+    assert module.weight.grad is original_weight_grad
+    assert module.bias.grad is original_bias_grad

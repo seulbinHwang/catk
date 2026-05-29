@@ -4,6 +4,7 @@ import copy
 import gc
 import hashlib
 import math
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
@@ -43,6 +44,7 @@ from src.smart.modules.self_forced_update_separation import (
     clear_module_gradients,
     detach_tensor_tree,
     module_gradients_disabled,
+    temporarily_clear_module_gradients,
 )
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
@@ -2446,6 +2448,7 @@ class SMARTFlow(LightningModule):
         *,
         has_committed_path_global: bool | None = None,
         anchor_idx: int = 0,
+        preserve_generator_gradients: bool = False,
     ) -> Tensor:
         """detached self-rollout으로 generated estimator F_psi를 online 업데이트합니다.
 
@@ -2459,6 +2462,10 @@ class SMARTFlow(LightningModule):
                 shape은 ``[n_agent]`` 입니다.
             has_committed_path_global: DDP 전체 rank 기준으로 self-forced path가 하나라도
                 있는지입니다. 값이 없으면 이 함수 안에서 동기화합니다.
+            anchor_idx: generated estimator가 볼 self-forced anchor index입니다.
+            preserve_generator_gradients: 이미 누적된 Generator gradient를 보존한 채
+                estimator update 분리성만 검사할지입니다. multi-anchor non-warmup에서는
+                이전 anchor의 Generator gradient가 이미 누적되어 있으므로 True로 둡니다.
 
         Returns:
             Tensor: 마지막 estimator update의 flow matching loss입니다.
@@ -2487,60 +2494,66 @@ class SMARTFlow(LightningModule):
         estimator_tokenized_agent = detach_tensor_tree(tokenized_agent)
         estimator_anchor_mask = anchor_mask.detach()
 
-        self.toggle_optimizer(optimizer)
-        self.self_forced_target_teacher.eval()
-        self.self_forced_generated_estimator.train()
-        try:
-            with module_gradients_disabled(self.encoder, self.self_forced_target_teacher):
-                for _ in range(self.self_forced_estimator_updates_per_step):
-                    optimizer.zero_grad(set_to_none=True)
-                    self._prepare_self_forced_estimator_backward_boundary()
-                    if has_committed_path_local:
-                        with torch.no_grad():
-                            flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
-                                clean_path,
-                                target_type="velocity",
+        generator_gradient_context = (
+            temporarily_clear_module_gradients(self.encoder)
+            if preserve_generator_gradients
+            else nullcontext()
+        )
+        with generator_gradient_context:
+            self.toggle_optimizer(optimizer)
+            self.self_forced_target_teacher.eval()
+            self.self_forced_generated_estimator.train()
+            try:
+                with module_gradients_disabled(self.encoder, self.self_forced_target_teacher):
+                    for _ in range(self.self_forced_estimator_updates_per_step):
+                        optimizer.zero_grad(set_to_none=True)
+                        self._prepare_self_forced_estimator_backward_boundary()
+                        if has_committed_path_local:
+                            with torch.no_grad():
+                                flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
+                                    clean_path,
+                                    target_type="velocity",
+                                )
+                            noisy_path_norm = flow_sample.x_t.detach()
+                            tau = flow_sample.tau.detach()
+                            flow_target = flow_sample.target.detach()
+                            pred_dict = self._predict_path_flow_clean_estimate(
+                                decoder=self.self_forced_generated_estimator,
+                                tokenized_map=estimator_tokenized_map,
+                                tokenized_agent=estimator_tokenized_agent,
+                                noisy_path_norm=noisy_path_norm,
+                                tau=tau,
+                                anchor_mask=estimator_anchor_mask,
+                                anchor_idx=int(anchor_idx),
                             )
-                        noisy_path_norm = flow_sample.x_t.detach()
-                        tau = flow_sample.tau.detach()
-                        flow_target = flow_sample.target.detach()
-                        pred_dict = self._predict_path_flow_clean_estimate(
-                            decoder=self.self_forced_generated_estimator,
-                            tokenized_map=estimator_tokenized_map,
-                            tokenized_agent=estimator_tokenized_agent,
-                            noisy_path_norm=noisy_path_norm,
-                            tau=tau,
-                            anchor_mask=estimator_anchor_mask,
-                            anchor_idx=int(anchor_idx),
+                            last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
+                        else:
+                            last_loss = self._build_trainable_connected_zero_loss(
+                                self.self_forced_generated_estimator,
+                            )
+                        # anchor k 의 valid agent 가 critic forward 동안 사라지거나 (anchor_mask
+                        # 가 모두 False) flow_matching_loss 가 empty path 분기로 빠지면
+                        # last_loss 가 grad-free leaf 가 된다.  backward 직전에 grad 가 있는지
+                        # 확인하고, 없으면 critic param 에 연결된 trainable zero loss 로 fallback
+                        # (DDP 동기화를 위해 모든 rank 가 동일한 backward graph 를 가져야 함).
+                        if not last_loss.requires_grad:
+                            last_loss = self._build_trainable_connected_zero_loss(
+                                self.self_forced_generated_estimator,
+                            )
+                        self._manual_backward_without_autocast(last_loss)
+                        self._assert_self_forced_estimator_update_isolated()
+                        self._clip_and_step_with_optional_scaler(
+                            optimizer,
+                            gradient_clip_val=self.self_forced_gradient_clip_val,
+                            gradient_clip_algorithm="norm",
                         )
-                        last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
-                    else:
-                        last_loss = self._build_trainable_connected_zero_loss(
-                            self.self_forced_generated_estimator,
-                        )
-                    # anchor k 의 valid agent 가 critic forward 동안 사라지거나 (anchor_mask
-                    # 가 모두 False) flow_matching_loss 가 empty path 분기로 빠지면
-                    # last_loss 가 grad-free leaf 가 된다.  backward 직전에 grad 가 있는지
-                    # 확인하고, 없으면 critic param 에 연결된 trainable zero loss 로 fallback
-                    # (DDP 동기화를 위해 모든 rank 가 동일한 backward graph 를 가져야 함).
-                    if not last_loss.requires_grad:
-                        last_loss = self._build_trainable_connected_zero_loss(
-                            self.self_forced_generated_estimator,
-                        )
-                    self._manual_backward_without_autocast(last_loss)
-                    self._assert_self_forced_estimator_update_isolated()
-                    self._clip_and_step_with_optional_scaler(
-                        optimizer,
-                        gradient_clip_val=self.self_forced_gradient_clip_val,
-                        gradient_clip_algorithm="norm",
-                    )
-                    self._clear_self_forced_auxiliary_gradients()
-                    self._clear_self_forced_generator_gradients()
-        finally:
-            self._clear_self_forced_auxiliary_gradients()
-            self._clear_self_forced_generator_gradients()
-            self.untoggle_optimizer(optimizer)
-            self._set_self_forced_auxiliary_modes()
+                        self._clear_self_forced_auxiliary_gradients()
+                        self._clear_self_forced_generator_gradients()
+            finally:
+                self._clear_self_forced_auxiliary_gradients()
+                self._clear_self_forced_generator_gradients()
+                self.untoggle_optimizer(optimizer)
+                self._set_self_forced_auxiliary_modes()
         return last_loss.detach()
 
     def _compute_self_forced_direction(
@@ -3024,6 +3037,7 @@ class SMARTFlow(LightningModule):
                     anchor_mask=anchor_mask,
                     has_committed_path_global=has_committed_global,
                     anchor_idx=anchor_idx,
+                    preserve_generator_gradients=(not in_estimator_warmup and anchor_idx > 0),
                 )
                 per_rollout_gen_est_losses.append(gen_estimator_loss)
 

@@ -138,6 +138,9 @@ class Supervisor:
                 "active_task": None,
                 "active_run_id": None,
                 "active_session": None,
+                "active_candidate": None,
+                "active_candidate_use_anchor": False,
+                "disable_anchor_candidates": False,
                 "stopped": False,
             }
         try:
@@ -149,6 +152,9 @@ class Supervisor:
                 "active_task": None,
                 "active_run_id": None,
                 "active_session": None,
+                "active_candidate": None,
+                "active_candidate_use_anchor": False,
+                "disable_anchor_candidates": False,
                 "stopped": False,
             }
 
@@ -347,11 +353,18 @@ class Supervisor:
 
     def next_candidate(self) -> Candidate | None:
         idx = int(self.state.get("candidate_index", 0))
-        if idx >= len(CANDIDATES):
-            return None
-        self.state["candidate_index"] = idx + 1
-        self.save_state()
-        return CANDIDATES[idx]
+        disable_anchor_candidates = bool(self.state.get("disable_anchor_candidates", False))
+        while idx < len(CANDIDATES):
+            candidate = CANDIDATES[idx]
+            idx += 1
+            self.state["candidate_index"] = idx
+            if disable_anchor_candidates and candidate.use_anchor.lower() == "true":
+                self.log(f"skipping anchor candidate after anchor failure: {candidate.name}")
+                self.save_state()
+                continue
+            self.save_state()
+            return candidate
+        return None
 
     def launch_candidate(self, candidate: Candidate) -> None:
         if not self.warmup_ckpt.exists():
@@ -460,6 +473,8 @@ class Supervisor:
         self.state["active_task"] = task
         self.state["active_run_id"] = None
         self.state["active_session"] = session
+        self.state["active_candidate"] = candidate.name
+        self.state["active_candidate_use_anchor"] = candidate.use_anchor.lower() == "true"
         self.save_state()
         self.log(f"launched candidate={candidate.name} task={task} session={session} notes={candidate.notes}")
 
@@ -499,14 +514,42 @@ class Supervisor:
             self.save_state()
             return
 
+        active_candidate = self.state.get("active_candidate")
+        active_candidate_use_anchor = bool(self.state.get("active_candidate_use_anchor", False))
         self.stop_active(task, reason)
         completed = list(self.state.get("completed_runs", []))
-        completed.append({"run_id": run_id, "task": task, "decision": decision, "reason": reason})
+        completed.append(
+            {
+                "run_id": run_id,
+                "task": task,
+                "candidate": active_candidate,
+                "use_anchor": active_candidate_use_anchor,
+                "decision": decision,
+                "reason": reason,
+            }
+        )
         self.state["completed_runs"] = completed
         self.state["active_task"] = None
         self.state["active_run_id"] = None
         self.state["active_session"] = None
+        self.state["active_candidate"] = None
+        self.state["active_candidate_use_anchor"] = False
         self.save_state()
+
+        if active_candidate_use_anchor:
+            self.state["disable_anchor_candidates"] = True
+            self.save_state()
+            self.log(
+                f"anchor candidate failed ({active_candidate}); disabling remaining anchor candidates."
+            )
+            candidate = self.next_candidate()
+            if candidate is None:
+                self.log("candidate queue exhausted after disabling anchor candidates; stopping supervisor.")
+                self.state["stopped"] = True
+                self.save_state()
+                return
+            self.launch_candidate(candidate)
+            return
 
         if decision == "stop_code_issue":
             self.log("code issue suspected; not relaunching automatically.")

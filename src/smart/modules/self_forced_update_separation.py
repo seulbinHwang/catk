@@ -57,6 +57,32 @@ def clear_module_gradients(module: nn.Module | None) -> None:
 
 
 @contextmanager
+def temporarily_clear_module_gradients(module: nn.Module | None) -> Iterator[None]:
+    """Temporarily clear a module's gradients and restore the prior values.
+
+    This is useful when a nested auxiliary update must assert that it did not
+    create gradients on a module that already has accumulated gradients from an
+    outer update.
+    """
+    if module is None:
+        yield
+        return
+
+    saved_gradients = [
+        (parameter, parameter.grad)
+        for parameter in module.parameters()
+        if parameter.grad is not None
+    ]
+    clear_module_gradients(module)
+    try:
+        yield
+    finally:
+        clear_module_gradients(module)
+        for parameter, gradient in saved_gradients:
+            parameter.grad = gradient
+
+
+@contextmanager
 def module_gradients_disabled(*modules: nn.Module | None) -> Iterator[None]:
     """주어진 모듈들의 parameter gradient 누적을 잠시 비활성화합니다.
 
