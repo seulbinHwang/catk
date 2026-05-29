@@ -6,7 +6,10 @@ launcher never creates, deletes, or restarts pods. It only runs ``kubectl exec``
 against already-running pods and starts/kills tmux sessions inside them.
 The default training batch is microbatch 1 with gradient accumulation 8, which
 keeps the optimizer-effective per-process scenario batch at the paper value 8
-without exceeding 32GB V100 memory during four-rollout RLFTSim unrolls.
+without exceeding 32GB V100 memory during four-rollout RLFTSim unrolls. For
+``rlftsim_finetune`` this accumulation is applied inside the RLFTSim manual
+optimization step because Lightning does not support automatic accumulation
+with manual optimization.
 """
 
 from __future__ import annotations

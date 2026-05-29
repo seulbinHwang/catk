@@ -15,6 +15,7 @@ import copy
 import gc
 import hashlib
 import math
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Sequence
 
@@ -258,8 +259,32 @@ class SMART(LightningModule):
             if self.rlftsim_config is not None
             else 0.005
         )
+        self.rlftsim_accumulate_grad_batches = int(
+            getattr(self.rlftsim_config, "accumulate_grad_batches", 1)
+            if self.rlftsim_config is not None
+            else 1
+        )
+        self.rlftsim_gradient_clip_val = float(
+            getattr(self.rlftsim_config, "gradient_clip_val", 1.0)
+            if self.rlftsim_config is not None
+            else 1.0
+        )
+        self.rlftsim_gradient_clip_algorithm = str(
+            getattr(self.rlftsim_config, "gradient_clip_algorithm", "norm")
+            if self.rlftsim_config is not None
+            else "norm"
+        )
+        self.rlftsim_replay_rollout_chunk_size = int(
+            getattr(self.rlftsim_config, "replay_rollout_chunk_size", 1)
+            if self.rlftsim_config is not None
+            else 1
+        )
         if self.rlftsim_enabled and self.rlftsim_rollouts_per_scenario < 2:
             raise ValueError("RLFTSim MLOO requires train_rollouts_per_scenario >= 2.")
+        if self.rlftsim_enabled and self.rlftsim_accumulate_grad_batches < 1:
+            raise ValueError("rlftsim.accumulate_grad_batches must be >= 1.")
+        if self.rlftsim_enabled and self.rlftsim_replay_rollout_chunk_size < 1:
+            raise ValueError("rlftsim.replay_rollout_chunk_size must be >= 1.")
         if self.rlftsim_enabled and self.rlftsim_sampling.criterium not in {
             "categorical",
             "full_prob",
@@ -269,6 +294,8 @@ class SMART(LightningModule):
                 "RLFTSim goal-free policy sampling must not depend on GT distance. "
                 "Use criterium=categorical, full_prob, or topk_prob."
             )
+        if self.rlftsim_enabled:
+            self.automatic_optimization = False
         self._rlftsim_ref_encoder = None
         self._last_rlftsim_kl: float | None = None
         self._rlftsim_kl_accum_sum = 0.0
@@ -554,14 +581,12 @@ class SMART(LightningModule):
         self._rlftsim_kl_accum_count = 0
 
     def _is_rlftsim_optimizer_step_boundary(self, batch_idx: int) -> bool:
-        trainer = getattr(self, "trainer", None)
-        accumulate_grad_batches = int(
-            getattr(trainer, "accumulate_grad_batches", 1) or 1
-        )
+        accumulate_grad_batches = int(self.rlftsim_accumulate_grad_batches)
         if accumulate_grad_batches <= 1:
             return True
         if (int(batch_idx) + 1) % accumulate_grad_batches == 0:
             return True
+        trainer = getattr(self, "trainer", None)
         num_training_batches = getattr(trainer, "num_training_batches", None)
         if isinstance(num_training_batches, int):
             return int(batch_idx) + 1 >= num_training_batches
@@ -996,7 +1021,18 @@ class SMART(LightningModule):
             "action_count": count.contiguous(),
         }
 
-    def _run_rlftsim_rollouts(
+    def _build_rlftsim_rollout_chunk_size_candidates(self) -> list[int]:
+        chunk_sizes: list[int] = []
+        current = max(1, int(self.rlftsim_rollouts_per_scenario))
+        while True:
+            if current not in chunk_sizes:
+                chunk_sizes.append(current)
+            if current == 1:
+                break
+            current = max(1, math.ceil(current / 2))
+        return chunk_sizes
+
+    def _run_rlftsim_sample_rollouts(
         self,
         tokenized_map: Dict[str, torch.Tensor],
         tokenized_agent: Dict[str, torch.Tensor],
@@ -1010,31 +1046,19 @@ class SMART(LightningModule):
         num_agent = int(tokenized_agent["batch"].shape[0])
         num_graphs = int(tokenized_agent["num_graphs"])
         rollout_indices = list(range(repeat_count))
-        chunk_sizes: list[int] = []
-        current = repeat_count
-        while True:
-            if current not in chunk_sizes:
-                chunk_sizes.append(current)
-            if current == 1:
-                break
-            current = max(1, math.ceil(current / 2))
 
         was_encoder_training = self.encoder.training
         self.encoder.eval()
         try:
-            map_feature = self.encoder.map_encoder(tokenized_map)
             with torch.no_grad():
-                ref_map_feature = self._rlftsim_ref_encoder.map_encoder(tokenized_map)
+                map_feature = self.encoder.map_encoder(tokenized_map)
 
             last_oom_error: RuntimeError | None = None
-            for chunk_size in chunk_sizes:
+            for chunk_size in self._build_rlftsim_rollout_chunk_size_candidates():
                 pred_traj_chunks: list[torch.Tensor] = []
                 pred_z_chunks: list[torch.Tensor] = []
                 pred_head_chunks: list[torch.Tensor] = []
-                log_prob_chunks: list[torch.Tensor] = []
-                kl_chunks: list[torch.Tensor] = []
-                entropy_chunks: list[torch.Tensor] = []
-                action_count_chunks: list[torch.Tensor] = []
+                forced_idx_chunks: list[torch.Tensor] = []
                 try:
                     for chunk_start in range(0, repeat_count, chunk_size):
                         chunk_rollout_indices = rollout_indices[
@@ -1043,11 +1067,6 @@ class SMART(LightningModule):
                         chunk_repeat = int(len(chunk_rollout_indices))
                         rollout_map_feature = self._build_parallel_rollout_map_feature(
                             map_feature=map_feature,
-                            repeat_count=chunk_repeat,
-                            num_graphs=num_graphs,
-                        )
-                        ref_rollout_map_feature = self._build_parallel_rollout_map_feature(
-                            map_feature=ref_map_feature,
                             repeat_count=chunk_repeat,
                             num_graphs=num_graphs,
                         )
@@ -1063,63 +1082,49 @@ class SMART(LightningModule):
                             rollout_indices=chunk_rollout_indices,
                             device=tokenized_agent["batch"].device,
                         )
-                        pred = self.encoder.agent_encoder.inference(
-                            rollout_tokenized_agent,
-                            rollout_map_feature,
-                            self.rlftsim_sampling,
-                            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
-                        )
-                        forced_next_token_idx = pred["pred_idx"][
+                        with torch.no_grad():
+                            pred = self.encoder.agent_encoder.inference(
+                                rollout_tokenized_agent,
+                                rollout_map_feature,
+                                self.rlftsim_sampling,
+                                scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+                            )
+                        forced_idx = pred["pred_idx"][
                             :, 2 : 2 + pred["next_token_valid"].shape[1]
                         ].detach()
-                        with torch.no_grad():
-                            ref_pred = self._rlftsim_ref_encoder.agent_encoder.inference(
-                                rollout_tokenized_agent,
-                                ref_rollout_map_feature,
-                                self.rlftsim_sampling,
-                                scenario_sampling_seeds=None,
-                                forced_next_token_idx=forced_next_token_idx,
-                            )
-                        stats = self._compute_rlftsim_policy_stats(
-                            pred=pred,
-                            ref_pred=ref_pred,
-                            rollout_tokenized_agent=rollout_tokenized_agent,
-                            repeat_count=chunk_repeat,
-                            num_graphs=num_graphs,
-                        )
                         pred_traj_chunks.append(
                             self._reshape_parallel_rollout_prediction(
-                                pred["pred_traj_10hz"],
+                                pred["pred_traj_10hz"].detach(),
                                 repeat_count=chunk_repeat,
                                 num_agent=num_agent,
                             )
                         )
                         pred_z_chunks.append(
                             self._reshape_parallel_rollout_prediction(
-                                pred["pred_z_10hz"],
+                                pred["pred_z_10hz"].detach(),
                                 repeat_count=chunk_repeat,
                                 num_agent=num_agent,
                             )
                         )
                         pred_head_chunks.append(
                             self._reshape_parallel_rollout_prediction(
-                                pred["pred_head_10hz"],
+                                pred["pred_head_10hz"].detach(),
                                 repeat_count=chunk_repeat,
                                 num_agent=num_agent,
                             )
                         )
-                        log_prob_chunks.append(stats["log_prob"])
-                        kl_chunks.append(stats["kl"])
-                        entropy_chunks.append(stats["entropy"])
-                        action_count_chunks.append(stats["action_count"])
+                        forced_idx_chunks.append(
+                            self._reshape_parallel_rollout_prediction(
+                                forced_idx,
+                                repeat_count=chunk_repeat,
+                                num_agent=num_agent,
+                            )
+                        )
                     return {
                         "pred_traj": torch.cat(pred_traj_chunks, dim=1),
                         "pred_z": torch.cat(pred_z_chunks, dim=1),
                         "pred_head": torch.cat(pred_head_chunks, dim=1),
-                        "log_prob": torch.cat(log_prob_chunks, dim=1),
-                        "kl": torch.cat(kl_chunks, dim=1),
-                        "entropy": torch.cat(entropy_chunks, dim=1),
-                        "action_count": torch.cat(action_count_chunks, dim=1),
+                        "forced_next_token_idx": torch.cat(forced_idx_chunks, dim=1),
                     }
                 except RuntimeError as error:
                     if (not self._is_cuda_out_of_memory(error)) or chunk_size == 1:
@@ -1129,10 +1134,7 @@ class SMART(LightningModule):
                         pred_traj_chunks,
                         pred_z_chunks,
                         pred_head_chunks,
-                        log_prob_chunks,
-                        kl_chunks,
-                        entropy_chunks,
-                        action_count_chunks,
+                        forced_idx_chunks,
                     )
                     self._cleanup_after_rollout_oom()
                     continue
@@ -1143,15 +1145,137 @@ class SMART(LightningModule):
             if was_encoder_training:
                 self.encoder.train()
 
+    def _compute_rlftsim_forced_replay_stats(
+        self,
+        *,
+        tokenized_map: Dict[str, torch.Tensor],
+        tokenized_agent: Dict[str, torch.Tensor],
+        forced_next_token_idx: torch.Tensor,
+        rollout_indices: Sequence[int],
+    ) -> dict[str, torch.Tensor]:
+        self._init_rlftsim_reference()
+        if self._rlftsim_ref_encoder is None:
+            raise RuntimeError("RLFTSim reference encoder was not initialized.")
+
+        if forced_next_token_idx.ndim != 3:
+            raise ValueError(
+                "forced_next_token_idx must have shape [n_agent, n_rollout, n_step], "
+                f"got {tuple(forced_next_token_idx.shape)}."
+            )
+
+        num_agent = int(tokenized_agent["batch"].shape[0])
+        num_graphs = int(tokenized_agent["num_graphs"])
+        chunk_repeat = int(len(rollout_indices))
+        if chunk_repeat <= 0:
+            raise ValueError("rollout_indices must not be empty.")
+
+        was_encoder_training = self.encoder.training
+        self.encoder.eval()
+        try:
+            map_feature = self.encoder.map_encoder(tokenized_map)
+            with torch.no_grad():
+                ref_map_feature = self._rlftsim_ref_encoder.map_encoder(tokenized_map)
+            rollout_map_feature = self._build_parallel_rollout_map_feature(
+                map_feature=map_feature,
+                repeat_count=chunk_repeat,
+                num_graphs=num_graphs,
+            )
+            ref_rollout_map_feature = self._build_parallel_rollout_map_feature(
+                map_feature=ref_map_feature,
+                repeat_count=chunk_repeat,
+                num_graphs=num_graphs,
+            )
+            rollout_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
+                tokenized_agent=tokenized_agent,
+                repeat_count=chunk_repeat,
+                num_graphs=num_graphs,
+            )
+            forced_chunk = forced_next_token_idx[:, list(rollout_indices)]
+            forced_chunk = (
+                forced_chunk.permute(1, 0, 2)
+                .reshape(chunk_repeat * num_agent, forced_chunk.shape[-1])
+                .contiguous()
+            )
+            pred = self.encoder.agent_encoder.inference(
+                rollout_tokenized_agent,
+                rollout_map_feature,
+                self.rlftsim_sampling,
+                scenario_sampling_seeds=None,
+                forced_next_token_idx=forced_chunk,
+            )
+            with torch.no_grad():
+                ref_pred = self._rlftsim_ref_encoder.agent_encoder.inference(
+                    rollout_tokenized_agent,
+                    ref_rollout_map_feature,
+                    self.rlftsim_sampling,
+                    scenario_sampling_seeds=None,
+                    forced_next_token_idx=forced_chunk,
+                )
+            return self._compute_rlftsim_policy_stats(
+                pred=pred,
+                ref_pred=ref_pred,
+                rollout_tokenized_agent=rollout_tokenized_agent,
+                repeat_count=chunk_repeat,
+                num_graphs=num_graphs,
+            )
+        finally:
+            if was_encoder_training:
+                self.encoder.train()
+
+    def _rlftsim_backward_sync_context(self, *, enabled: bool):
+        if enabled:
+            return nullcontext()
+        trainer = getattr(self, "trainer", None)
+        strategy = getattr(trainer, "strategy", None)
+        if strategy is not None and hasattr(strategy, "block_backward_sync"):
+            return strategy.block_backward_sync()
+        return nullcontext()
+
+    def _rlftsim_optimizer_step(self, optimizer) -> None:
+        if self.rlftsim_gradient_clip_val > 0.0:
+            parameters = [
+                parameter
+                for parameter in self.parameters()
+                if parameter.grad is not None
+            ]
+            if self.rlftsim_gradient_clip_algorithm == "norm":
+                torch.nn.utils.clip_grad_norm_(
+                    parameters,
+                    max_norm=self.rlftsim_gradient_clip_val,
+                )
+            elif self.rlftsim_gradient_clip_algorithm == "value":
+                torch.nn.utils.clip_grad_value_(
+                    parameters,
+                    clip_value=self.rlftsim_gradient_clip_val,
+                )
+            else:
+                raise ValueError(
+                    "rlftsim.gradient_clip_algorithm must be 'norm' or 'value', "
+                    f"got {self.rlftsim_gradient_clip_algorithm!r}."
+                )
+        optimizer.step()
+        scheduler = self.lr_schedulers()
+        if scheduler is not None:
+            scheduler.step()
+        optimizer.zero_grad()
+
     def _rlftsim_training_step(self, data, batch_idx):
         self._validate_rlftsim_batch(data)
+        optimizer = self.optimizers()
+        accumulate_grad_batches = int(self.rlftsim_accumulate_grad_batches)
+        is_accumulation_start = int(batch_idx) % max(1, accumulate_grad_batches) == 0
+        should_step_optimizer = self._is_rlftsim_optimizer_step_boundary(batch_idx)
+        if is_accumulation_start:
+            optimizer.zero_grad()
+
         tokenized_map, tokenized_agent = self.token_processor(data)
         self._ensure_tokenized_agent_z_raw(tokenized_agent, data)
-        rollout = self._run_rlftsim_rollouts(
-            tokenized_map=tokenized_map,
-            tokenized_agent=tokenized_agent,
-            scenario_ids=data["scenario_id"],
-        )
+        with torch.no_grad():
+            rollout = self._run_rlftsim_sample_rollouts(
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                scenario_ids=data["scenario_id"],
+            )
         if self.rlftsim_reward is None:
             raise RuntimeError("RLFTSim reward calculator is not initialized.")
         scenario_files = data["tfrecord_path"]
@@ -1170,24 +1294,68 @@ class SMART(LightningModule):
             reward_std = rewards.std(dim=1, keepdim=True).clamp_min(1.0e-6)
             rewards = rewards / reward_std
 
-        policy_loss = -(rollout["log_prob"] * rewards).mean()
-        kl = rollout["kl"].mean()
-        entropy = rollout["entropy"].mean()
-        loss = policy_loss + float(self.rlftsim_kl_beta) * kl
-        if self.rlftsim_entropy_bonus != 0.0:
-            loss = loss - float(self.rlftsim_entropy_bonus) * entropy
+        repeat_count = int(rewards.shape[1])
+        replay_chunk_size = max(1, int(self.rlftsim_replay_rollout_chunk_size))
+        loss_value = rewards.new_tensor(0.0)
+        policy_loss_value = rewards.new_tensor(0.0)
+        kl_value = rewards.new_tensor(0.0)
+        entropy_value = rewards.new_tensor(0.0)
+        for chunk_start in range(0, repeat_count, replay_chunk_size):
+            chunk_end = min(repeat_count, chunk_start + replay_chunk_size)
+            rollout_indices = list(range(chunk_start, chunk_end))
+            chunk_weight = float(chunk_end - chunk_start) / float(repeat_count)
+            sync_grad = should_step_optimizer and chunk_end >= repeat_count
+            with self._rlftsim_backward_sync_context(enabled=sync_grad):
+                stats = self._compute_rlftsim_forced_replay_stats(
+                    tokenized_map=tokenized_map,
+                    tokenized_agent=tokenized_agent,
+                    forced_next_token_idx=rollout["forced_next_token_idx"],
+                    rollout_indices=rollout_indices,
+                )
+                chunk_rewards = rewards[:, chunk_start:chunk_end]
+                chunk_policy_loss = -(stats["log_prob"] * chunk_rewards).mean()
+                chunk_kl = stats["kl"].mean()
+                chunk_entropy = stats["entropy"].mean()
+                chunk_loss = chunk_policy_loss + float(self.rlftsim_kl_beta) * chunk_kl
+                if self.rlftsim_entropy_bonus != 0.0:
+                    chunk_loss = chunk_loss - float(self.rlftsim_entropy_bonus) * chunk_entropy
+                self.manual_backward(
+                    chunk_loss
+                    * chunk_weight
+                    / float(max(1, accumulate_grad_batches))
+                )
+            loss_value = loss_value + chunk_loss.detach() * chunk_weight
+            policy_loss_value = (
+                policy_loss_value + chunk_policy_loss.detach() * chunk_weight
+            )
+            kl_value = kl_value + chunk_kl.detach() * chunk_weight
+            entropy_value = entropy_value + chunk_entropy.detach() * chunk_weight
+            del stats, chunk_loss, chunk_policy_loss, chunk_kl, chunk_entropy
 
-        self._record_rlftsim_kl_for_controller(kl)
-        self.log("train/rlftsim_loss", loss, on_step=True, batch_size=1)
-        self.log("train/rlftsim_policy_loss", policy_loss, on_step=True, batch_size=1)
-        self.log("train/rlftsim_kl", kl.detach(), on_step=True, batch_size=1)
+        if should_step_optimizer:
+            self._rlftsim_optimizer_step(optimizer)
+
+        self._record_rlftsim_kl_for_controller(kl_value)
+        self.log("train/rlftsim_loss", loss_value, on_step=True, batch_size=1)
+        self.log(
+            "train/rlftsim_policy_loss",
+            policy_loss_value,
+            on_step=True,
+            batch_size=1,
+        )
+        self.log("train/rlftsim_kl", kl_value, on_step=True, batch_size=1)
         self.log(
             "train/rlftsim_kl_beta",
             torch.tensor(self.rlftsim_kl_beta, device=self.device),
             on_step=True,
             batch_size=1,
         )
-        self.log("train/rlftsim_entropy", entropy.detach(), on_step=True, batch_size=1)
+        self.log(
+            "train/rlftsim_entropy",
+            entropy_value,
+            on_step=True,
+            batch_size=1,
+        )
         self.log(
             "train/rlftsim_reward_std",
             rewards.detach().std(),
@@ -1212,7 +1380,7 @@ class SMART(LightningModule):
             on_step=True,
             batch_size=1,
         )
-        return loss
+        return loss_value
 
     def training_step(self, data, batch_idx):
         if self.rlftsim_enabled:

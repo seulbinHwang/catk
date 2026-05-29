@@ -191,7 +191,14 @@ main() {
     app_args+=(data.test_batch_size="$TEST_BATCH_SIZE")
   fi
   if [[ -n "${ACCUMULATE_GRAD_BATCHES:-}" ]]; then
-    app_args+=(trainer.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES")
+    if [[ "$experiment" == "rlftsim" ]]; then
+      app_args+=(trainer.accumulate_grad_batches=1)
+      if [[ "$action" == "rlftsim_finetune" ]]; then
+        app_args+=(model.model_config.rlftsim.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES")
+      fi
+    else
+      app_args+=(trainer.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES")
+    fi
   fi
   if [[ -n "${LIMIT_TRAIN_BATCHES:-}" ]]; then
     app_args+=(trainer.limit_train_batches="$LIMIT_TRAIN_BATCHES")

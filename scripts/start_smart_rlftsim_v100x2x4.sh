@@ -24,7 +24,7 @@ export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 # Paper RLFTSim values. Direct in-memory RLFTSim batch 8 OOMs on 32GB V100s
 # because each sample carries four closed-loop rollouts. The preset therefore
 # keeps the optimizer-effective per-process batch at 8 with microbatch 1 and
-# Lightning gradient accumulation 8. Override TRAIN_BATCH_SIZE=8
+# RLFTSim-internal gradient accumulation 8. Override TRAIN_BATCH_SIZE=8
 # ACCUMULATE_GRAD_BATCHES=1 only if the model/config fits in memory.
 export LEARNING_RATE="${LEARNING_RATE:-3e-6}"
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
