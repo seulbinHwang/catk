@@ -467,6 +467,8 @@ def decision(
     min_validations: int,
     rmm_floor: float,
     rmm_min_gain: float,
+    rmm_latest_floor: float | None,
+    rmm_latest_floor_min_validations: int,
     open_min_rel_drop: float,
     open_min_abs_drop: float,
 ) -> tuple[str, str]:
@@ -484,6 +486,18 @@ def decision(
     n_val = len(rmm)
     if n_val < min_validations:
         return "wait", f"validations {n_val}/{min_validations}"
+
+    if (
+        rmm_latest_floor is not None
+        and n_val >= rmm_latest_floor_min_validations
+        and rmm
+        and rmm[-1] < rmm_latest_floor
+    ):
+        return (
+            "fail",
+            f"latest RMM {rmm[-1]:.8f} < latest floor {rmm_latest_floor:.8f} "
+            f"after {n_val} validations",
+        )
 
     rmm_gain = max(rmm) - rmm[0] if rmm else 0.0
     rmm_signal = rmm_gain >= rmm_min_gain
@@ -681,6 +695,8 @@ def monitor_run(
                 min_validations=args.min_validations,
                 rmm_floor=args.rmm_baseline - args.rmm_tolerance,
                 rmm_min_gain=args.rmm_min_gain,
+                rmm_latest_floor=args.rmm_latest_floor,
+                rmm_latest_floor_min_validations=args.rmm_latest_floor_min_validations,
                 open_min_rel_drop=args.open_min_rel_drop,
                 open_min_abs_drop=args.open_min_abs_drop,
             )
@@ -773,6 +789,13 @@ def main() -> int:
     parser.add_argument("--rmm-baseline", type=float, default=0.77927)
     parser.add_argument("--rmm-tolerance", type=float, default=0.0001)
     parser.add_argument("--rmm-min-gain", type=float, default=0.0002)
+    parser.add_argument(
+        "--rmm-latest-floor",
+        type=float,
+        default=None,
+        help="Optional post-warmup floor for the latest RMM. Disabled by default.",
+    )
+    parser.add_argument("--rmm-latest-floor-min-validations", type=int, default=3)
     parser.add_argument("--open-min-rel-drop", type=float, default=0.0005)
     parser.add_argument("--open-min-abs-drop", type=float, default=0.0001)
     parser.add_argument("--cuda-visible-devices", default="2,3")
