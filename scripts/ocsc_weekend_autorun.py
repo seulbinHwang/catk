@@ -163,23 +163,66 @@ def write_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def series_for_key(run: Any, key: str) -> list[float]:
-    values: list[float] = []
+    return [value for _, value in rows_for_key(run, key)]
+
+
+def rows_for_key(run: Any, key: str) -> list[tuple[int | None, float]]:
+    rows: list[tuple[int | None, float]] = []
     try:
-        for row in run.scan_history(keys=[key], page_size=1000):
+        for row in run.scan_history(keys=["_step", key], page_size=1000):
             value = row.get(key)
             if value is not None:
-                values.append(float(value))
+                step = row.get("_step")
+                rows.append((int(step) if step is not None else None, float(value)))
     except Exception:
-        values = []
+        rows = []
 
-    if values:
-        return values
+    if rows:
+        return rows
 
     try:
-        rows = run.history(keys=[key], pandas=False)
-        return [float(row[key]) for row in rows if row.get(key) is not None]
+        history_rows = run.history(keys=["_step", key], pandas=False)
+        return [
+            (
+                int(row["_step"]) if row.get("_step") is not None else None,
+                float(row[key]),
+            )
+            for row in history_rows
+            if row.get(key) is not None
+        ]
     except Exception:
         return []
+
+
+def collapse_adjacent_duplicate_rows(
+    rows: list[tuple[int | None, float]],
+    *,
+    max_step_gap: int = 2,
+    atol: float = 1e-12,
+) -> list[tuple[int | None, float]]:
+    """Collapse duplicate metric rows emitted around one validation boundary."""
+    collapsed: list[tuple[int | None, float]] = []
+    for step, value in rows:
+        if collapsed:
+            prev_step, prev_value = collapsed[-1]
+            adjacent_step = (
+                step is not None
+                and prev_step is not None
+                and 0 <= step - prev_step <= max_step_gap
+            )
+            if adjacent_step and abs(value - prev_value) <= atol:
+                collapsed[-1] = (step, value)
+                continue
+        collapsed.append((step, value))
+    return collapsed
+
+
+def values_for_rows(rows: list[tuple[int | None, float]]) -> list[float]:
+    return [value for _, value in rows]
+
+
+def validation_metric_series(run: Any, key: str) -> list[float]:
+    return values_for_rows(collapse_adjacent_duplicate_rows(rows_for_key(run, key)))
 
 
 def sampled_series_for_key(run: Any, key: str, samples: int = 100) -> list[float]:
@@ -239,7 +282,7 @@ def metric_snapshot(api: Any, project_path: str, run_id: str) -> dict[str, Any]:
     ade_key, ade = first_available_series(run, ADE_KEYS)
     fde_key, fde = first_available_series(run, FDE_KEYS)
     train_loss_key, train_loss = first_available_sampled_series(run, TRAIN_LOSS_KEYS)
-    rmm = series_for_key(run, RMM_KEY)
+    rmm = validation_metric_series(run, RMM_KEY)
     return {
         "state": run.state,
         "name": run.name,
