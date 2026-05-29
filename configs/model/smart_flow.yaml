@@ -1,6 +1,7 @@
 _target_: src.smart.model.smart_flow.SMARTFlow
 model_config:
   lr: 0.0005
+  weight_decay: 0.01
   lr_warmup_steps: 2
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.01

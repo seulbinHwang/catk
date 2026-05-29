@@ -151,6 +151,7 @@ TRAIN_USE_EVAL_AGENT_SELECTION="${TRAIN_USE_EVAL_AGENT_SELECTION:-true}"
 
 # ── Model / LR ──────────────────────────────────────────────────────────
 LR="${LR:-1.0e-6}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-1.0e-4}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
 LR_TOTAL_STEPS="${LR_TOTAL_STEPS:-${MAX_EPOCHS}}"
 LR_MIN_RATIO="${LR_MIN_RATIO:-1.0}"
@@ -216,7 +217,7 @@ echo "    limit_train=${LIMIT_TRAIN_BATCHES} limit_val=${LIMIT_VAL_BATCHES}"
 echo "    val_check_interval=${VAL_CHECK_INTERVAL} grad_clip=${GRADIENT_CLIP_VAL}"
 echo "  Data: train_B=${TRAIN_B} val_B=${VAL_B} workers=${NUM_WORKERS}"
 echo "    eval_workers=${EVAL_NUM_WORKERS} eval_mp=${EVAL_MULTIPROCESSING_CONTEXT}"
-echo "  Generator: lr=${LR}"
+echo "  Generator: lr=${LR} weight_decay=${WEIGHT_DECAY}"
 echo "  OCSC ★:"
 echo "    G(n_rollouts)=${OCSC_N_ROLLOUTS}  M(n_ol_rollouts)=${OCSC_N_OL_ROLLOUTS}"
 echo "    nearest_match=${OCSC_OL_NEAREST_MATCH}  gt_target=${OCSC_GT_TARGET}"
@@ -285,6 +286,7 @@ torchrun \
   logger.wandb.log_model="${WANDB_LOG_MODEL}" \
   logger.wandb.offline="${WANDB_OFFLINE}" \
   model.model_config.lr="${LR}" \
+  model.model_config.weight_decay="${WEIGHT_DECAY}" \
   model.model_config.lr_warmup_steps="${LR_WARMUP_STEPS}" \
   model.model_config.lr_total_steps="${LR_TOTAL_STEPS}" \
   model.model_config.lr_min_ratio="${LR_MIN_RATIO}" \

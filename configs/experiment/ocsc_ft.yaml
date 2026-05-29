@@ -33,6 +33,7 @@ ckpt_path: null
 model:
   model_config:
     lr: 1.0e-6
+    weight_decay: 1.0e-4
     lr_warmup_steps: 0
     lr_min_ratio: 1.0
     n_rollout_closed_val: 16

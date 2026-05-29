@@ -111,6 +111,7 @@ class SMARTFlow(LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.lr = model_config.lr
+        self.weight_decay = float(getattr(model_config, "weight_decay", 0.01))
         self.lr_warmup_steps = model_config.lr_warmup_steps
         self.lr_total_steps = model_config.lr_total_steps
         self.lr_min_ratio = model_config.lr_min_ratio
@@ -4094,7 +4095,11 @@ open_metric_dict:
             generator_params = [param for param in self.encoder.parameters() if param.requires_grad]
             if not generator_params:
                 raise RuntimeError("No trainable generator parameters found for self-forced optimization.")
-            generator_optimizer = torch.optim.AdamW(generator_params, lr=self.lr)
+            generator_optimizer = torch.optim.AdamW(
+                generator_params,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
             if self.self_forced_generated_estimator is None:
                 raise RuntimeError("self_forced_generated_estimator is not initialized.")
             estimator_params = [
@@ -4105,13 +4110,18 @@ open_metric_dict:
             generated_estimator_optimizer = torch.optim.AdamW(
                 estimator_params,
                 lr=self.self_forced_estimator_lr,
+                weight_decay=self.weight_decay,
             )
             return [generator_optimizer, generated_estimator_optimizer]
 
         trainable_params = [param for param in self.parameters() if param.requires_grad]
         if not trainable_params:
             raise RuntimeError("No trainable parameters found for optimization.")
-        optimizer = torch.optim.AdamW(trainable_params, lr=self.lr)
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
         lr_scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
         return [optimizer], [lr_scheduler]
 
