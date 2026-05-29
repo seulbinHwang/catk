@@ -37,7 +37,6 @@ class Candidate:
     name: str
     lr: str = "1.0e-7"
     estimator_lr: str = "1.0e-7"
-    beta: str = "1.0"
     use_anchor: str = "false"
     anchor_weight: str = "0.1"
     train_b: str = "4"
@@ -51,28 +50,24 @@ CANDIDATES = [
         name="lr5e8_beta1",
         lr="5.0e-8",
         estimator_lr="5.0e-8",
-        beta="1.0",
         notes="RMM low: reduce generator and estimator LR.",
     ),
     Candidate(
         name="lr2e8_beta1",
         lr="2.0e-8",
         estimator_lr="2.0e-8",
-        beta="1.0",
         notes="RMM low: reduce LR further while keeping beta fixed.",
     ),
     Candidate(
         name="lr1e8_beta1",
         lr="1.0e-8",
         estimator_lr="1.0e-8",
-        beta="1.0",
         notes="RMM low: final LR-only conservative attempt.",
     ),
     Candidate(
         name="lr1e7_beta1_anchor005",
         lr="1.0e-7",
         estimator_lr="1.0e-7",
-        beta="1.0",
         use_anchor="true",
         anchor_weight="0.05",
         notes="Keep beta fixed and add light anchor FM regularization.",
@@ -81,7 +76,6 @@ CANDIDATES = [
         name="lr5e8_beta1_anchor005",
         lr="5.0e-8",
         estimator_lr="5.0e-8",
-        beta="1.0",
         use_anchor="true",
         anchor_weight="0.05",
         notes="Lower LR plus light anchor FM regularization.",
@@ -90,7 +84,6 @@ CANDIDATES = [
         name="lr2e8_beta1_anchor005",
         lr="2.0e-8",
         estimator_lr="2.0e-8",
-        beta="1.0",
         use_anchor="true",
         anchor_weight="0.05",
         notes="Last conservative attempt: lower LR and light anchor, beta fixed.",
@@ -404,7 +397,7 @@ class Supervisor:
             "LR_WARMUP_STEPS": "0",
             "LR_MIN_RATIO": "1.0",
             "DM_OBJECTIVE": "dmd",
-            "DMD_BETA": candidate.beta,
+            "DMD_BETA": self.args.dmd_beta,
             "SF_ENABLED": "true",
             "SF_START_EPOCH": "0",
             "SF_WEIGHT": "1.0",
@@ -475,7 +468,6 @@ class Supervisor:
             name="oom_retry_b2",
             lr="5.0e-8",
             estimator_lr="5.0e-8",
-            beta="1.0",
             train_b="2",
             val_b="2",
             notes="OOM/NaN retry with half batch.",
@@ -538,7 +530,8 @@ class Supervisor:
             "started "
             f"pretrained_rmm={self.args.pretrained_rmm} "
             f"low_threshold={self.args.pretrained_rmm - self.args.rmm_low_margin} "
-            f"max_low_count={self.args.max_low_count} until={self.args.until_kst}"
+            f"max_low_count={self.args.max_low_count} "
+            f"dmd_beta_fixed={self.args.dmd_beta} until={self.args.until_kst}"
         )
         while not self.until_reached():
             if self.state.get("stopped"):
@@ -564,6 +557,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--meaningful-gain", type=float, default=0.002)
     parser.add_argument("--stagnation-min-points", type=int, default=5)
     parser.add_argument("--stagnation-margin", type=float, default=0.0005)
+    parser.add_argument("--dmd-beta", default="1.0")
     parser.add_argument("--interval-seconds", type=int, default=180)
     parser.add_argument("--until-kst", default="2026-06-01T09:00:00+09:00")
     parser.add_argument(
