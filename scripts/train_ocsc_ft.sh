@@ -180,6 +180,7 @@ OCSC_FULL_FLOW_DECODER="${OCSC_FULL_FLOW_DECODER:-false}"
 
 CHECKPOINT_MONITOR="${CHECKPOINT_MONITOR:-val_closed/sim_agents_2025/realism_meta_metric}"
 CHECKPOINT_MODE="${CHECKPOINT_MODE:-max}"
+CHECKPOINT_SAVE_LAST="${CHECKPOINT_SAVE_LAST:-true}"
 CHECKPOINT_SAVE_TOP_K="${CHECKPOINT_SAVE_TOP_K:-1}"
 
 WANDB_PROJECT="${WANDB_PROJECT:-clsft-catk}"
@@ -224,7 +225,7 @@ echo "    nearest_match=${OCSC_OL_NEAREST_MATCH}  gt_target=${OCSC_GT_TARGET}"
 echo "    use_ref=${OCSC_USE_PRETRAINED_REF}  anchor_idx=${OCSC_ANCHOR_IDX}  strict_active=${OCSC_STRICT_ACTIVE_MASK}"
 echo "    pos_w=${OCSC_POSITION_WEIGHT}  head_w=${OCSC_HEADING_WEIGHT}"
 echo "    velocity_head_only=${OCSC_VELOCITY_HEAD_ONLY}  full_flow_decoder=${OCSC_FULL_FLOW_DECODER}"
-echo "  Checkpoint: monitor=${CHECKPOINT_MONITOR} mode=${CHECKPOINT_MODE}"
+echo "  Checkpoint: monitor=${CHECKPOINT_MONITOR} mode=${CHECKPOINT_MODE} save_last=${CHECKPOINT_SAVE_LAST}"
 echo "============================================================"
 
 PREFETCH_ARG=""
@@ -279,6 +280,7 @@ torchrun \
   data.train_epoch_sample_fraction="${TRAIN_EPOCH_SAMPLE_FRACTION}" \
   callbacks.model_checkpoint.monitor="${CHECKPOINT_MONITOR}" \
   callbacks.model_checkpoint.mode="${CHECKPOINT_MODE}" \
+  callbacks.model_checkpoint.save_last="${CHECKPOINT_SAVE_LAST}" \
   callbacks.model_checkpoint.save_top_k="${CHECKPOINT_SAVE_TOP_K}" \
   logger.wandb.project="${WANDB_PROJECT}" \
   logger.wandb.entity="${WANDB_ENTITY}" \
