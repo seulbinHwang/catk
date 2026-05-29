@@ -71,8 +71,6 @@ model_config:
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
     distribution_matching_objective: dmd
-    # Backprop 검증용 proxy loss.  none / l2_to_zero / l2_to_gt.
-    debug_proxy_loss: none
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
     detach_block_transition: false

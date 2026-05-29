@@ -293,21 +293,6 @@ class SMARTFlow(LightningModule):
                 "self_forced.distribution_matching_objective must be 'dmd' or 'sid', "
                 f"got {self.self_forced_distribution_matching_objective}."
             )
-        # Backprop 검증용 proxy loss.
-        #   none        → 실제 DMD/SiD
-        #   l2_to_zero  → committed_path_norm 의 제곱 평균 (sanity)
-        # GT BC / nearest BC 는 별도 mode 인 finetune.mode='ocsc_ft' 로 옮겼습니다.
-        self.self_forced_debug_proxy_loss = (
-            str(getattr(self.self_forced_config, "debug_proxy_loss", "none")).lower()
-            if self.self_forced_config is not None
-            else "none"
-        )
-        if self.self_forced_debug_proxy_loss not in {"none", "l2_to_zero"}:
-            raise ValueError(
-                "self_forced.debug_proxy_loss must be 'none' or 'l2_to_zero'; "
-                f"got {self.self_forced_debug_proxy_loss}.  "
-                "GT BC / nearest BC 는 finetune.mode='ocsc_ft' 로 옮겼습니다."
-            )
         self.self_forced_sid_alpha = (
             float(getattr(self.self_forced_config, "sid_alpha", 1.0))
             if self.self_forced_config is not None
@@ -2415,7 +2400,7 @@ class SMARTFlow(LightningModule):
             packed_path_norm: downstream default — use_kinematic_control_flow=True 면
                 control-space 3-dim, 아니면 pose-space 4-dim.  DMD/SiD critic / estimator 가 사용.
             packed_path_pose_norm: 항상 pose-space 4-dim ``[x/20, y/20, cos, sin]``.
-                proxy_loss(l2_to_gt) 등 pose-space BC 가 사용.
+                metric / diagnostics 에서 pose-space 값이 필요할 때 사용합니다.
             anchor_mask: anchor 별 agent mask.
         """
         from src.smart.modules.self_forced_path_flow import (
@@ -2752,24 +2737,6 @@ class SMARTFlow(LightningModule):
             normalizer_eps=self.self_forced_sid_normalizer_eps,
         )
 
-    def _compute_self_forced_debug_proxy_loss(
-        self,
-        tokenized_agent: Dict[str, Tensor],
-        committed_path_norm: Tensor,
-        anchor_idx: int = 0,
-    ) -> Tensor:
-        """Backprop 검증용 proxy loss.
-
-        ``l2_to_zero`` 만 지원 (backprop sanity).  GT BC / nearest BC 는 별도 mode 인
-        ``finetune.mode='ocsc_ft'`` (``_run_flow_ocsc_ft_step``) 으로 옮겼습니다.
-        """
-        mode = self.self_forced_debug_proxy_loss
-        if committed_path_norm.numel() == 0:
-            return committed_path_norm.new_zeros(())
-        if mode == "l2_to_zero":
-            return committed_path_norm.float().square().mean()
-        raise ValueError(f"unsupported debug_proxy_loss={mode}")
-
     def _compute_self_forced_distribution_matching_loss(
         self,
         tokenized_map: Dict[str, Tensor],
@@ -2794,13 +2761,6 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: scalar 분포 맞춤 loss입니다. shape은 ``[]`` 입니다.
         """
-        if self.self_forced_debug_proxy_loss != "none":
-            # l2_to_zero only — control-space committed 그대로.
-            return self._compute_self_forced_debug_proxy_loss(
-                tokenized_agent=tokenized_agent,
-                committed_path_norm=committed_path_norm,
-                anchor_idx=int(anchor_idx),
-            )
         if self.self_forced_distribution_matching_objective == "sid":
             return self._compute_self_forced_sid_loss(
                 tokenized_map=tokenized_map,

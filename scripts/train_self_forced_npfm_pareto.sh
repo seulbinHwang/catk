@@ -215,13 +215,6 @@ DECODER_USE_LQR="${DECODER_USE_LQR:-false}"
 #   - sid : Score Identity Distillation        (sid_alpha 사용; DMD_BETA 무시)
 DM_OBJECTIVE="${DM_OBJECTIVE:-dmd}"
 
-# Backprop 검증용 proxy loss (debug 전용).  none / l2_to_zero / l2_to_gt.
-#   - none        : 실제 DMD/SiD (default)
-#   - l2_to_zero  : committed_path_norm.square().mean()  (path 를 0 으로 줄이도록 학습)
-#   - l2_to_gt    : anchor k GT path 와의 L2  (closed-loop BC, replicate-aware)
-# DMD/SiD 가 학습 안 될 때 backprop 자체 정상성 확인용.
-DEBUG_PROXY_LOSS="${DEBUG_PROXY_LOSS:-none}"
-
 # ── DMD 전용 knob ─────────────────────────────────────────────────────────
 # Entropy knob (build_clean_dmd_direction):
 #   - 1.0 (default) : vanilla DMD, 기존 동작 그대로 (R - F)/normalizer
@@ -417,7 +410,7 @@ echo "    epoch_sample_frac=${TRAIN_EPOCH_SAMPLE_FRACTION}"
 echo "  Generator: lr=${LR} (self-forced 에선 고정 LR; warmup/decay 무시됨)"
 echo "    closed_loop_rollout_mode=${CLOSED_LOOP_ROLLOUT_MODE} use_lqr=${DECODER_USE_LQR}"
 echo "  Self-Forced ★:"
-echo "    objective=${DM_OBJECTIVE} dmd_beta=${DMD_BETA} sid_alpha=${SID_ALPHA} debug_proxy=${DEBUG_PROXY_LOSS}"
+echo "    objective=${DM_OBJECTIVE} dmd_beta=${DMD_BETA} sid_alpha=${SID_ALPHA}"
 echo "    weight=${SF_WEIGHT} path_step=${SF_PATH_STEP_SIZE}"
 echo "    use_anchor_fm=${USE_ANCHOR_FM} anchor_weight=${ANCHOR_WEIGHT}"
 echo "    estimator_per_step=${ESTIMATOR_UPDATES_PER_STEP} estimator_lr=${ESTIMATOR_LR}"
@@ -517,7 +510,6 @@ torchrun \
   model.model_config.self_forced.anchor_weight="${ANCHOR_WEIGHT}" \
   model.model_config.self_forced.use_anchor_flow_matching_loss="${USE_ANCHOR_FM}" \
   model.model_config.self_forced.distribution_matching_objective="${DM_OBJECTIVE}" \
-  model.model_config.self_forced.debug_proxy_loss="${DEBUG_PROXY_LOSS}" \
   model.model_config.self_forced.dmd_beta="${DMD_BETA}" \
   model.model_config.self_forced.clean_dmd_normalizer_eps="${CLEAN_DMD_NORMALIZER_EPS}" \
   model.model_config.self_forced.clean_dmd_tau_low="${CLEAN_DMD_TAU_LOW}" \
