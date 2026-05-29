@@ -3435,11 +3435,18 @@ class SMARTFlow(LightningModule):
         active_hidden: Tensor,
         active_agent_type: Tensor,
         active_agent_length: Tensor | None,
+        tokenized_agent: Dict[str, Tensor],
+        active_mask: Tensor,
+        scenario_ids: Sequence[str],
         sample_count: int,
         sampling_scheme,
-        seed_base: int,
     ) -> Tensor:
-        """ref_flow_decoder OL samples를 sample 축으로 묶어 한 번에 생성합니다."""
+        """ref_flow_decoder OL samples를 sample 축으로 묶어 한 번에 생성합니다.
+
+        OCSC-clean은 OL target과 CL rollout의 첫 2초 noise tape을 같은
+        scenario seed에서 뽑습니다.  그래야 M>=G nearest-match에서도 첫 G개
+        OL 후보가 대응 CL rollout과 같은 stochastic branch를 공유합니다.
+        """
         from src.smart.modules.kinematic_control import control_norm_to_pose_norm
 
         agent_enc = self.encoder.agent_encoder
@@ -3451,22 +3458,15 @@ class SMARTFlow(LightningModule):
         if n_active == 0:
             return active_hidden.new_zeros((sample_count, 0, self.flow_window_steps, 4))
 
-        noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
-        x_init_chunks = []
-        for m in range(sample_count):
-            generator = torch.Generator(device=active_hidden.device)
-            generator.manual_seed(int(seed_base) + int(m))
-            x_init_chunks.append(
-                torch.randn(
-                    n_active,
-                    self.flow_window_steps,
-                    agent_enc.flow_state_dim,
-                    device=active_hidden.device,
-                    dtype=active_hidden.dtype,
-                    generator=generator,
-                ) * noise_scale
-            )
-        x_init_norm = torch.cat(x_init_chunks, dim=0)
+        x_init_norm = self._ocsc_build_open_loop_x_init_stack(
+            agent_enc=agent_enc,
+            tokenized_agent=tokenized_agent,
+            active_mask=active_mask,
+            scenario_ids=scenario_ids,
+            sample_count=sample_count,
+            sampling_scheme=sampling_scheme,
+            dtype=active_hidden.dtype,
+        ).reshape(sample_count * n_active, self.flow_window_steps, agent_enc.flow_state_dim)
         repeated_hidden = (
             active_hidden.unsqueeze(0)
             .expand(sample_count, *active_hidden.shape)
@@ -3528,6 +3528,48 @@ class SMARTFlow(LightningModule):
             )
             return ol_pose.reshape(sample_count, n_active, self.flow_window_steps, 4)
         return ol_raw.reshape(sample_count, n_active, self.flow_window_steps, ol_raw.shape[-1])
+
+    def _ocsc_build_open_loop_x_init_stack(
+        self,
+        *,
+        agent_enc,
+        tokenized_agent: Dict[str, Tensor],
+        active_mask: Tensor,
+        scenario_ids: Sequence[str],
+        sample_count: int,
+        sampling_scheme,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Build OL initial noise from the same scenario seeds used by CL rollout."""
+        sample_count = int(sample_count)
+        if sample_count < 1:
+            raise ValueError(f"sample_count must be positive, got {sample_count}.")
+        n_active = int(active_mask.sum().item())
+        if n_active == 0:
+            return active_mask.new_zeros(
+                (sample_count, 0, self.flow_window_steps, agent_enc.flow_state_dim),
+                dtype=dtype,
+            )
+
+        agent_batch = tokenized_agent["batch"]
+        scenario_seed_table = self._build_closed_loop_seed_table(
+            scenario_ids=scenario_ids,
+            rollout_indices=range(sample_count),
+            device=agent_batch.device,
+        )
+        x_init_chunks = []
+        for m in range(sample_count):
+            noise_tape = agent_enc._build_rollout_noise_tape(
+                num_agent=int(agent_batch.shape[0]),
+                tape_steps=int(self.flow_window_steps),
+                device=active_mask.device,
+                dtype=dtype,
+                sampling_scheme=sampling_scheme,
+                scenario_sampling_seeds=scenario_seed_table[m],
+                agent_batch=agent_batch,
+            )
+            x_init_chunks.append(noise_tape[active_mask, : self.flow_window_steps].contiguous())
+        return torch.stack(x_init_chunks, dim=0).contiguous()
 
     def _ocsc_run_closed_loop_rollouts_batched(
         self,
@@ -3672,7 +3714,6 @@ class SMARTFlow(LightningModule):
         )
 
         sampling_scheme = self.validation_rollout_sampling
-        seed_base = int(batch_idx) * max(1, G + M) * 7919
 
         # 4. M open-loop targets (no_grad, ref_flow_decoder swap)
         target_stack: Tensor
@@ -3695,9 +3736,11 @@ class SMARTFlow(LightningModule):
                     active_hidden=active_hidden,
                     active_agent_type=active_agent_type,
                     active_agent_length=active_agent_length,
+                    tokenized_agent=tokenized_agent,
+                    active_mask=active_mask,
+                    scenario_ids=data["scenario_id"],
                     sample_count=M,
                     sampling_scheme=sampling_scheme,
-                    seed_base=seed_base + 10_000,
                 ).detach()
 
         # 5. G closed-loop rollouts (with grad), normalize to anchor-0 local pose 4-dim
