@@ -68,7 +68,7 @@ fi
 export CACHE_ROOT
 CKPT_PATH="${CKPT_PATH:-logs/pretrained/pretrained.ckpt}"
 
-TMUX_LOG_TAIL="${TMUX_LOG_TAIL:-true}"
+TMUX_LOG_TAIL="${TMUX_LOG_TAIL:-false}"
 TMUX_LOG_PATH="${TMUX_LOG_PATH:-/tmp/${MY_TASK_NAME}.log}"
 TMUX_LOG_WINDOW="${TMUX_LOG_WINDOW:-${MY_TASK_NAME}:log}"
 TMUX_LOG_SESSION="${TMUX_LOG_SESSION:-}"
