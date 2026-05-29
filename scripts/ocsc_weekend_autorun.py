@@ -188,10 +188,14 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
         },
     ),
     Variant(
-        name="ocsc_steprefiner_lr1e6_wd1e4",
-        note="Retry step_refiner+velocity_head after shared-noise/ref-eval fixes and OCSC-clean weight decay.",
+        name="ocsc_steprefiner_lr5e7_wd1e2_retry",
+        note=(
+            "Retry the last setting with a healthy first validation: "
+            "step_refiner+velocity_head, LR=5e-7, and the historical OCSC default weight decay."
+        ),
         env={
-            "LR": "1.0e-6",
+            "LR": "5.0e-7",
+            "WEIGHT_DECAY": "1.0e-2",
             "TRAIN_B": "8",
             "OCSC_VELOCITY_HEAD_ONLY": "false",
             "OCSC_FULL_FLOW_DECODER": "false",
@@ -209,10 +213,11 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
         },
     ),
     Variant(
-        name="ocsc_steprefiner_m12_lr5e7_wd1e4",
-        note="Increase OL pool with step_refiner capacity and conservative LR.",
+        name="ocsc_steprefiner_m12_lr5e7_wd1e2",
+        note="Increase OL pool with step_refiner capacity while keeping the stable LR/weight decay pair.",
         env={
             "LR": "5.0e-7",
+            "WEIGHT_DECAY": "1.0e-2",
             "TRAIN_B": "8",
             "OCSC_N_OL_ROLLOUTS": "12",
             "OCSC_VELOCITY_HEAD_ONLY": "false",
@@ -251,10 +256,11 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
         },
     ),
     Variant(
-        name="ocsc_steprefiner_m16_lr5e7_b4_wd1e4",
-        note="Combine larger OL pool and step_refiner while keeping memory below the B16 OOM mode.",
+        name="ocsc_steprefiner_m16_lr5e7_b4_wd1e2",
+        note="Combine larger OL pool and step_refiner with the stable LR/weight decay pair.",
         env={
             "LR": "5.0e-7",
+            "WEIGHT_DECAY": "1.0e-2",
             "TRAIN_B": "4",
             "OCSC_N_OL_ROLLOUTS": "16",
             "OCSC_VELOCITY_HEAD_ONLY": "false",
