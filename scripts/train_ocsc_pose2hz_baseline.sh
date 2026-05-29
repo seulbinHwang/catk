@@ -81,6 +81,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_SILENT="${WANDB_SILENT:-false}"
 
+SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" && pwd)"
+
 # ────────────────────────────────────────────────────────────────────────
 # 1. Conda env activate
 # ────────────────────────────────────────────────────────────────────────
@@ -126,6 +128,51 @@ export CACHE_ROOT
 
 # Pretrained backbone checkpoint.  fine-tune 의 출발점.
 CKPT_PATH="${CKPT_PATH:-logs/pretrained/pretrained.ckpt}"
+
+TMUX_LOG_TAIL="${TMUX_LOG_TAIL:-true}"
+TMUX_LOG_PATH="${TMUX_LOG_PATH:-/tmp/${MY_TASK_NAME}.log}"
+TMUX_LOG_WINDOW="${TMUX_LOG_WINDOW:-${MY_TASK_NAME}:log}"
+TMUX_LOG_SESSION="${TMUX_LOG_SESSION:-}"
+
+is_true() {
+  case "$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+quote_sh() {
+  printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"
+}
+
+setup_tmux_log_tail() {
+  if ! is_true "${TMUX_LOG_TAIL}"; then
+    return 0
+  fi
+  if [ -z "${TMUX:-}" ] || [ -z "${TMUX_PANE:-}" ]; then
+    return 0
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "${TMUX_LOG_PATH}")"
+  : > "${TMUX_LOG_PATH}"
+
+  quoted_log="$(quote_sh "${TMUX_LOG_PATH}")"
+  tmux pipe-pane -o -t "${TMUX_PANE}" "cat >> ${quoted_log}" >/dev/null 2>&1 || true
+  trap 'tmux pipe-pane -t "${TMUX_PANE}" >/dev/null 2>&1 || true' EXIT HUP INT TERM
+
+  session="${TMUX_LOG_SESSION}"
+  if [ -z "${session}" ]; then
+    session="$(tmux display-message -p '#S' 2>/dev/null || true)"
+  fi
+  if [ -n "${session}" ]; then
+    TMUX_TAIL_WORKDIR="$(pwd)" "${SCRIPT_DIR}/tmux_tail_log.sh" "${TMUX_LOG_PATH}" "${TMUX_LOG_WINDOW}" "${session}" >/dev/null 2>&1 || true
+  fi
+}
+
+setup_tmux_log_tail
 
 # ────────────────────────────────────────────────────────────────────────
 # 3. Trainer (Lightning)
@@ -238,6 +285,9 @@ OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 #   현재 single anchor 만 지원 (multi-anchor 는 후속 port).  default 0.
 OCSC_ANCHOR_IDX="${OCSC_ANCHOR_IDX:-0}"
 
+# Strict active mask: future 2s가 모두 valid인 agent만 OCSC loss에 포함.
+OCSC_STRICT_ACTIVE_MASK="${OCSC_STRICT_ACTIVE_MASK:-true}"
+
 # Pose / heading weight:  pose 4-dim L2 의 두 component 가중치.
 #   pos_w * mean((Δx/20)²+(Δy/20)²) + head_w * mean((Δcos)²+(Δsin)²)
 #   OCSC clean 정합: pos_w=1.0, head_w=0.01 (heading 적게 — stopped agent noisy GT 영향 ↓).
@@ -325,7 +375,8 @@ echo "  OCSC core ★:"
 echo "    G(n_rollouts)=${OCSC_N_ROLLOUTS}  M(n_ol_rollouts)=${OCSC_N_OL_ROLLOUTS}"
 echo "    nearest_match=${OCSC_OL_NEAREST_MATCH}  loss_type=${OCSC_LOSS_TYPE}"
 echo "    gt_target=${OCSC_GT_TARGET}  use_ref=${OCSC_USE_PRETRAINED_REF}"
-echo "    anchor_idx=${OCSC_ANCHOR_IDX}  pos_w=${OCSC_POSITION_WEIGHT}  head_w=${OCSC_HEADING_WEIGHT}"
+echo "    anchor_idx=${OCSC_ANCHOR_IDX}  strict_active=${OCSC_STRICT_ACTIVE_MASK}"
+echo "    pos_w=${OCSC_POSITION_WEIGHT}  head_w=${OCSC_HEADING_WEIGHT}"
 echo "  Trainable range:"
 echo "    velocity_head_only=${OCSC_VELOCITY_HEAD_ONLY}  full_flow_decoder=${OCSC_FULL_FLOW_DECODER}"
 echo "  Checkpoint: monitor=${CHECKPOINT_MONITOR} mode=${CHECKPOINT_MODE}"
@@ -403,6 +454,7 @@ torchrun \
   model.model_config.finetune.ocsc_gt_target="${OCSC_GT_TARGET}" \
   model.model_config.finetune.ocsc_use_pretrained_ref="${OCSC_USE_PRETRAINED_REF}" \
   model.model_config.finetune.ocsc_anchor_idx="${OCSC_ANCHOR_IDX}" \
+  model.model_config.finetune.ocsc_strict_active_mask="${OCSC_STRICT_ACTIVE_MASK}" \
   model.model_config.finetune.ocsc_position_weight="${OCSC_POSITION_WEIGHT}" \
   model.model_config.finetune.ocsc_heading_weight="${OCSC_HEADING_WEIGHT}" \
   model.model_config.self_forced.enabled=false \

@@ -142,6 +142,7 @@ class SMARTFlow(LightningModule):
         # 별도 ref_flow_decoder (frozen pretrained flow_decoder deepcopy) 만 둠.
         self.finetune_config = model_config.finetune
         self.ref_flow_decoder: nn.Module | None = None
+        self._ref_flow_decoder_loaded_from_ckpt = False
         ocsc_use_ref = bool(
             self._is_ocsc_ft_enabled()
             and getattr(self.finetune_config, "ocsc_use_pretrained_ref", True)
@@ -2836,8 +2837,24 @@ class SMARTFlow(LightningModule):
         """
         self._configure_fast_wosac_validation_scope()
         self._apply_fit_time_validation_batch_limit()
+        self._sync_ocsc_ref_decoder_from_main_if_needed()
         self._sync_self_forced_auxiliary_models()
         self._prepare_self_forced_generator_ema()
+
+    def _sync_ocsc_ref_decoder_from_main_if_needed(self) -> None:
+        """Fresh OCSC finetune에서 frozen ref decoder를 ckpt-loaded main decoder와 맞춥니다."""
+        if self.ref_flow_decoder is None or not self._is_ocsc_ft_enabled():
+            return
+        if self._ref_flow_decoder_loaded_from_ckpt:
+            return
+        self.ref_flow_decoder.load_state_dict(
+            self.encoder.agent_encoder.flow_decoder.state_dict(),
+            strict=True,
+        )
+        for p in self.ref_flow_decoder.parameters():
+            p.requires_grad_(False)
+        self.ref_flow_decoder.eval()
+        self._ref_flow_decoder_loaded_from_ckpt = True
 
     def on_validation_start(self) -> None:
         """validation 시작 직전에 scorer batch 수 자동 조정을 다시 시도합니다."""
@@ -3322,12 +3339,12 @@ class SMARTFlow(LightningModule):
         current_pos: Tensor,
         current_head: Tensor,
         window_steps_10hz: int,
-    ) -> Tensor | None:
+    ) -> tuple[Tensor, Tensor] | None:
         """GT (raw 10Hz) future pose 를 anchor-0 local pose-norm 4-dim 으로.
 
         anchor 0 = history end (10Hz step index = num_historical_steps - 1 = 10).
         future 는 step 11 .. 11+window_steps_10hz-1.
-        invalid future 가 있으면 단순화 — last-valid 로 채움 안 하고 그대로 변환.
+        invalid future 는 loss 에서 mask 처리합니다.
         """
         try:
             agent_data = data["agent"]
@@ -3343,12 +3360,16 @@ class SMARTFlow(LightningModule):
             return None
         gt_pos = pos_full[active_mask, gt_start:gt_end]
         gt_head = head_full[active_mask, gt_start:gt_end]
-        return self._ocsc_world_traj_to_anchor0_pose_norm(
+        gt_valid = valid_full[active_mask, gt_start:gt_end]
+        if not bool(gt_valid.any()):
+            return None
+        gt_norm = self._ocsc_world_traj_to_anchor0_pose_norm(
             pred_pos_global=gt_pos,
             pred_head_global=gt_head,
             current_pos=current_pos,
             current_head=current_head,
         )
+        return gt_norm, gt_valid
 
     def _ocsc_paired_pose_loss(
         self,
@@ -3356,6 +3377,7 @@ class SMARTFlow(LightningModule):
         target_norm: Tensor,  # [n_active, T, C]
         pos_w: float,
         head_w: float,
+        valid_mask: Tensor | None = None,
     ) -> Tensor:
         """anchor-0 local 정규화 텐서의 paired L2.
 
@@ -3368,10 +3390,21 @@ class SMARTFlow(LightningModule):
                 f"OCSC paired loss dim mismatch: cl={tuple(cl_norm.shape)} "
                 f"target={tuple(target_norm.shape)}."
             )
-        pos_loss = diff[..., :2].square().mean()
+        if valid_mask is not None:
+            valid = valid_mask[..., : diff.shape[-2]].to(device=diff.device, dtype=diff.dtype)
+            if not bool(valid.any()):
+                return cl_norm.sum() * 0.0
+            mask = valid.unsqueeze(-1)
+            denom = mask.sum().clamp(min=1.0)
+            pos_loss = (diff[..., :2].square() * mask).sum() / denom
+        else:
+            pos_loss = diff[..., :2].square().mean()
         head_dim_end = min(4, diff.shape[-1])
         if head_dim_end > 2:
-            head_loss = diff[..., 2:head_dim_end].square().mean()
+            if valid_mask is not None:
+                head_loss = (diff[..., 2:head_dim_end].square() * mask).sum() / denom
+            else:
+                head_loss = diff[..., 2:head_dim_end].square().mean()
             return pos_w * pos_loss + head_w * head_loss
         return pos_w * pos_loss
 
@@ -3455,6 +3488,18 @@ class SMARTFlow(LightningModule):
                 map_feature=map_feature,
             )
         active_mask, current_pos, current_head = self._ocsc_anchor0_origin(rollout_cache)
+        if bool(getattr(ft, "ocsc_strict_active_mask", False)):
+            try:
+                valid_full = data["agent"]["valid_mask"]
+                num_hist_10hz = int(agent_enc.num_historical_steps)
+                future_start = num_hist_10hz
+                future_end = future_start + int(self.flow_window_steps)
+                if future_end <= int(valid_full.shape[1]):
+                    active_mask = active_mask & valid_full[:, future_start:future_end].all(dim=1)
+                else:
+                    active_mask = active_mask & torch.zeros_like(active_mask, dtype=torch.bool)
+            except Exception:
+                active_mask = active_mask & torch.zeros_like(active_mask, dtype=torch.bool)
         if not bool(active_mask.any()):
             return self._build_trainable_connected_zero_loss(self.encoder)
         current_pos_active = current_pos[active_mask]
@@ -3472,16 +3517,18 @@ class SMARTFlow(LightningModule):
 
         # 4. M open-loop targets (no_grad, ref_flow_decoder swap)
         target_norms: list[Tensor] = []
+        gt_valid: Tensor | None = None
         if use_gt_target:
-            gt_norm = self._ocsc_build_gt_target_norm(
+            gt_target = self._ocsc_build_gt_target_norm(
                 data=data,
                 active_mask=active_mask,
                 current_pos=current_pos_active,
                 current_head=current_head_active,
                 window_steps_10hz=self.flow_window_steps,
             )
-            if gt_norm is None:
+            if gt_target is None:
                 return self._build_trainable_connected_zero_loss(self.encoder)
+            gt_norm, gt_valid = gt_target
             target_norms.append(gt_norm.detach())
         else:
             with torch.no_grad():
@@ -3534,38 +3581,32 @@ class SMARTFlow(LightningModule):
         if (cl_norms and cl_norms[0].shape[1] >= shift):
             cl_norms = [c[:, shift - 1::shift, :] for c in cl_norms]
             target_norms = [t[:, shift - 1::shift, :] for t in target_norms]
+            if gt_valid is not None:
+                gt_valid = gt_valid[:, shift - 1::shift]
 
         # 6. paired loss (nearest_match or 단순 mean)
         if use_gt_target:
             # GT 1 개 target — 모든 CL g 가 GT 와 paired L2 → 평균.
             target = target_norms[0]
             total_loss = sum(
-                self._ocsc_paired_pose_loss(cl_g, target, pos_w, head_w)
+                self._ocsc_paired_pose_loss(cl_g, target, pos_w, head_w, valid_mask=gt_valid)
                 for cl_g in cl_norms
             ) / float(G)
         elif nearest_match:
-            # per CL g, per agent (anchor-flat) argmin OL pool → paired L2 with chosen.
-            # 효율: target 들을 stack [M, n_active, 20, 4]; per agent (n_active) 별 argmin over M
-            # 단 single anchor 라 agent 는 n_active 차원만.
+            # per CL g, batch-flat argmin OL pool → paired L2 with one scene-level target.
             target_stack = torch.stack(target_norms, dim=0)  # [M, n_active, T, C]
-            n_active = target_stack.shape[1]
-            t_dim = target_stack.shape[2]
-            c_dim = target_stack.shape[3]
-            # per-agent flat L2 across time and channels for nearest selection
-            # (pos+head with equal weight; OCSC clean 의 nearest_match 거리 측정은
-            # weighted 가 아닌 raw flat L2 사용 — 단순 매칭 거리, gradient 와 무관).
             losses = []
             for g, cl_g in enumerate(cl_norms):
                 with torch.no_grad():
-                    # [M, n_active, T, 4] vs [n_active, T, 4]
                     flat_diff = target_stack - cl_g.detach().unsqueeze(0)
-                    # per agent flat L2 over T x 4
-                    flat_l2 = flat_diff.float().square().mean(dim=(-1, -2))  # [M, n_active]
-                    nearest_m = flat_l2.argmin(dim=0)  # [n_active]
-                # gather target by per-agent argmin: [n_active, T, 4]
-                # target_stack[m, a, :, :] -> use nearest_m
-                m_idx = nearest_m.view(1, -1, 1, 1).expand(1, n_active, t_dim, c_dim)
-                chosen = target_stack.gather(0, m_idx).squeeze(0)
+                    flat_sq = flat_diff.float().square()
+                    d_pos = flat_sq[..., :2].sum(dim=(1, 2, 3))
+                    if flat_sq.shape[-1] > 2:
+                        d_head = flat_sq[..., 2:].sum(dim=(1, 2, 3))
+                    else:
+                        d_head = torch.zeros_like(d_pos)
+                    nearest_m = (pos_w * d_pos + head_w * d_head).argmin()
+                chosen = target_stack[int(nearest_m)]
                 losses.append(self._ocsc_paired_pose_loss(cl_g, chosen, pos_w, head_w))
             total_loss = sum(losses) / float(G)
         else:
@@ -3906,6 +3947,20 @@ open_metric_dict:
         else:
             scheduler = schedulers
         scheduler.step()
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, Any],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        self._ref_flow_decoder_loaded_from_ckpt = any(
+            str(key).startswith("ref_flow_decoder.") for key in state_dict.keys()
+        )
+        try:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        except TypeError:
+            return super().load_state_dict(state_dict, strict=strict)
 
     def test_step(self, data, batch_idx):
         eval_generator = self._get_eval_generator()
