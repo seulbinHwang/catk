@@ -52,7 +52,18 @@ MY_EXPERIMENT="${MY_EXPERIMENT:-ocsc_ft}"
 MY_TASK_NAME="${MY_TASK_NAME:-${MY_EXPERIMENT}-debug}"
 ACTION="${ACTION:-finetune}"
 SEED="${SEED:-817}"
-CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
+# WOMD cache root. Prefer the Ubuntu server cache and fall back to mounted pod caches.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if [ -f "${SCRIPT_DIR}/resolve_womd_cache_root.sh" ]; then
+  . "${SCRIPT_DIR}/resolve_womd_cache_root.sh"
+fi
+if command -v resolve_womd_cache_root >/dev/null 2>&1; then
+  RESOLVED_CACHE_ROOT="$(resolve_womd_cache_root)" || exit 1
+  CACHE_ROOT="${RESOLVED_CACHE_ROOT}"
+else
+  CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
+fi
+export CACHE_ROOT
 CKPT_PATH="${CKPT_PATH:-logs/pretrained/pretrained.ckpt}"
 
 # ── Trainer ─────────────────────────────────────────────────────────────

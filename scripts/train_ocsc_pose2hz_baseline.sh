@@ -111,7 +111,18 @@ SEED="${SEED:-817}"
 
 # WOMD cache root.  cache 안에는 training/ validation/ testing/
 # validation_tfrecords_splitted/ 폴더가 있어야 함.
-CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
+# Prefer the Ubuntu server cache and fall back to mounted pod caches.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if [ -f "${SCRIPT_DIR}/resolve_womd_cache_root.sh" ]; then
+  . "${SCRIPT_DIR}/resolve_womd_cache_root.sh"
+fi
+if command -v resolve_womd_cache_root >/dev/null 2>&1; then
+  RESOLVED_CACHE_ROOT="$(resolve_womd_cache_root)" || exit 1
+  CACHE_ROOT="${RESOLVED_CACHE_ROOT}"
+else
+  CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
+fi
+export CACHE_ROOT
 
 # Pretrained backbone checkpoint.  fine-tune 의 출발점.
 CKPT_PATH="${CKPT_PATH:-logs/pretrained/pretrained.ckpt}"

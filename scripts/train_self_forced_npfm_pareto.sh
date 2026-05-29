@@ -97,10 +97,21 @@ ACTION="${ACTION:-finetune}"
 # Random seed (run.yaml default 817)
 SEED="${SEED:-817}"
 
-# WOMD cache root (configs/paths/default.yaml 의 cache_root override).
-# OCSC_clean 학습이 쓰던 경로를 default 로 사용.  cache root 안에는
-# training/ validation/ testing/ validation_tfrecords_splitted/ 가 있어야 함.
-CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
+# WOMD cache root (configs/paths/default.yaml 의 cache_root override). Ubuntu
+# server path를 우선 사용하고, 없으면 Kubernetes pod의 mounted cache로 fallback.
+# cache root 안에는 training/ validation/ testing/ validation_tfrecords_splitted/
+# 가 있어야 함. CACHE_ROOT를 직접 주면 먼저 검사하고, 불완전하면 후보 경로로 fallback.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+if [ -f "${SCRIPT_DIR}/resolve_womd_cache_root.sh" ]; then
+  . "${SCRIPT_DIR}/resolve_womd_cache_root.sh"
+fi
+if command -v resolve_womd_cache_root >/dev/null 2>&1; then
+  RESOLVED_CACHE_ROOT="$(resolve_womd_cache_root)" || exit 1
+  CACHE_ROOT="${RESOLVED_CACHE_ROOT}"
+else
+  CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/smart_data/waymo_processed_catk_rebuild_parallel_v1}"
+fi
+export CACHE_ROOT
 
 # Pretrained backbone checkpoint — fine-tune entry point.
 # 기본값은 이 repo 안의 logs/pretrained/pretrained.ckpt (CLAUDE.md §5 참조).
