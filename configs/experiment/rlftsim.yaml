@@ -39,7 +39,7 @@ model:
       kl_max: 1e3
       reference_sync_steps: 500
       reference_sync_alpha: 0.005
-      accumulate_grad_batches: 8
+      accumulate_grad_batches: 4
       gradient_clip_val: 1.0
       gradient_clip_algorithm: norm
       replay_rollout_chunk_size: 2
@@ -65,7 +65,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 8
+  train_batch_size: 2
   val_batch_size: 8
   test_batch_size: 8
   num_workers: 8

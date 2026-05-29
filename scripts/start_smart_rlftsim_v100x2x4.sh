@@ -21,17 +21,16 @@ export CATK_ACTION="${CATK_ACTION:-rlftsim_finetune}"
 export CATK_EXPERIMENT="${CATK_EXPERIMENT:-rlftsim}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
 
-# Paper RLFTSim values. Direct in-memory RLFTSim batch 8 OOMs on 32GB V100s
-# because each sample carries four closed-loop rollouts. The preset therefore
-# keeps the optimizer-effective per-process batch at 8 with microbatch 1 and
-# RLFTSim-internal gradient accumulation 8. Override TRAIN_BATCH_SIZE=8
-# ACCUMULATE_GRAD_BATCHES=1 only if the model/config fits in memory.
+# Paper RLFTSim values. Direct in-memory RLFTSim batch 8 and batch 4 OOM on
+# 32GB V100s because each sample carries four closed-loop rollouts. The preset
+# therefore keeps the optimizer-effective per-process batch at 8 with
+# microbatch 2 and RLFTSim-internal gradient accumulation 4.
 export LEARNING_RATE="${LEARNING_RATE:-3e-6}"
-export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-8}"
 export TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-8}"
 export MAX_EPOCHS="${MAX_EPOCHS:-1}"
-export ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-8}"
+export ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-4}"
 export CATK_ATTENTION_GRAPH_FP32="${CATK_ATTENTION_GRAPH_FP32:-0}"
 
 exec python scripts/launch_smart_rlftsim_v100x2x4.py --branch "$BRANCH" "$@"

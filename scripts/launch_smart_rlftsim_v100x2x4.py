@@ -4,7 +4,7 @@
 The default layout is svvvv-2-1..svvvv-2-4, each with two V100 GPUs. The
 launcher never creates, deletes, or restarts pods. It only runs ``kubectl exec``
 against already-running pods and starts/kills tmux sessions inside them.
-The default training batch is microbatch 1 with gradient accumulation 8, which
+The default training batch is microbatch 2 with gradient accumulation 4, which
 keeps the optimizer-effective per-process scenario batch at the paper value 8
 without exceeding 32GB V100 memory during four-rollout RLFTSim unrolls. For
 ``rlftsim_finetune`` this accumulation is applied inside the RLFTSim manual
@@ -367,10 +367,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-port", default=os.environ.get("MASTER_PORT", "29561"))
     parser.add_argument("--nproc-per-node", default=os.environ.get("NPROC_PER_NODE", DEFAULT_NPROC_PER_NODE))
     parser.add_argument("--log-dir", default=os.environ.get("REMOTE_LOG_DIR", DEFAULT_LOG_DIR))
-    parser.add_argument("--train-batch-size", default=os.environ.get("TRAIN_BATCH_SIZE", "1"))
+    parser.add_argument("--train-batch-size", default=os.environ.get("TRAIN_BATCH_SIZE", "2"))
     parser.add_argument("--val-batch-size", default=os.environ.get("VAL_BATCH_SIZE", "8"))
     parser.add_argument("--test-batch-size", default=os.environ.get("TEST_BATCH_SIZE", "8"))
-    parser.add_argument("--accumulate-grad-batches", default=os.environ.get("ACCUMULATE_GRAD_BATCHES", "8"))
+    parser.add_argument("--accumulate-grad-batches", default=os.environ.get("ACCUMULATE_GRAD_BATCHES", "4"))
     parser.add_argument("--limit-train-batches", default=os.environ.get("LIMIT_TRAIN_BATCHES", ""))
     parser.add_argument("--limit-val-batches", default=os.environ.get("LIMIT_VAL_BATCHES", ""))
     parser.add_argument("--limit-test-batches", default=os.environ.get("LIMIT_TEST_BATCHES", ""))
