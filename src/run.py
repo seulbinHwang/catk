@@ -152,13 +152,20 @@ def _validate_self_forced_checkpoint_action(
         return
 
     has_aux_state = _checkpoint_has_self_forced_auxiliary_state(checkpoint)
-    if cfg.action == "finetune" and has_aux_state:
+    self_forced_cfg = cfg.model.model_config.self_forced
+    allow_auxiliary_finetune = bool(
+        self_forced_cfg.get("allow_auxiliary_finetune", False)
+    )
+    if cfg.action == "finetune" and has_aux_state and not allow_auxiliary_finetune:
         raise ValueError(
             "ckpt_path looks like a self-forced training checkpoint because it contains "
             "'self_forced_target_teacher' or 'self_forced_generated_estimator' state. "
             "Do not load it with action=finetune, which starts a new weight-only run and "
             "can discard the resume semantics of F_rho/F_psi. Use action=fit with the "
-            "self-forced checkpoint to perform a full Lightning resume."
+            "self-forced checkpoint to perform a full Lightning resume, or set "
+            "model.model_config.self_forced.allow_auxiliary_finetune=true when you "
+            "intentionally want a new optimizer/hyperparameter run initialized from "
+            "the warmup-trained auxiliary state."
         )
     if cfg.action == "fit" and cfg.get("ckpt_path") and not has_aux_state:
         raise ValueError(

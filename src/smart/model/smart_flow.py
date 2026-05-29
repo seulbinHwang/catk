@@ -1877,6 +1877,7 @@ class SMARTFlow(LightningModule):
             self._set_self_forced_auxiliary_modes()
             return
         if not self.self_forced_initialize_aux_on_fit_start:
+            self._set_self_forced_auxiliary_modes()
             return
 
         encoder_state = self.encoder.state_dict()
