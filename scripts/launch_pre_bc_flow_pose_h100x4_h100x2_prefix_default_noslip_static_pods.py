@@ -33,7 +33,7 @@ DEFAULT_PODS = ("hsb-npc-training", "wo-pvc-2")
 DEFAULT_EXPERIMENT = "pre_bc_flow_control_h100x4_h100x2_prefix_default_noslip"
 DEFAULT_TASK_NAME = (
     "flow_pose_space_pretrain_h100x4_h100x2_prefix_default_noslip_"
-    "lr6e-4_bs20"
+    "lr6e-4_bs18"
 )
 DEFAULT_SESSION = "catk-pose-pretrain-h100x4-h100x2-prefix-default-noslip"
 DEFAULT_METADATA_CACHE = (
@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--initial-bs", type=int, default=20)
+    parser.add_argument("--initial-bs", type=int, default=18)
     parser.add_argument("--oom-step", type=int, default=1)
     parser.add_argument("--min-bs", type=int, default=12)
     parser.add_argument("--poll-interval", type=int, default=30)
