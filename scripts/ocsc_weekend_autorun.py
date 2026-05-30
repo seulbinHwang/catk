@@ -565,6 +565,8 @@ def decision(
     rmm_min_gain: float,
     rmm_latest_floor: float | None,
     rmm_latest_floor_min_validations: int,
+    rmm_max_drop_from_best: float | None,
+    rmm_max_drop_min_validations: int,
     open_min_rel_drop: float,
     open_min_abs_drop: float,
 ) -> tuple[str, str]:
@@ -594,6 +596,20 @@ def decision(
             f"latest RMM {rmm[-1]:.8f} < latest floor {rmm_latest_floor:.8f} "
             f"after {n_val} validations",
         )
+
+    if (
+        rmm_max_drop_from_best is not None
+        and n_val >= rmm_max_drop_min_validations
+        and rmm
+    ):
+        best_rmm = max(rmm)
+        latest_drop = best_rmm - rmm[-1]
+        if latest_drop > rmm_max_drop_from_best:
+            return (
+                "fail",
+                f"latest RMM {rmm[-1]:.8f} is {latest_drop:.8f} below best "
+                f"{best_rmm:.8f} after {n_val} validations",
+            )
 
     rmm_gain = max(rmm) - rmm[0] if rmm else 0.0
     rmm_signal = rmm_gain >= rmm_min_gain
@@ -931,6 +947,8 @@ def monitor_run(
                 rmm_min_gain=args.rmm_min_gain,
                 rmm_latest_floor=args.rmm_latest_floor,
                 rmm_latest_floor_min_validations=args.rmm_latest_floor_min_validations,
+                rmm_max_drop_from_best=args.rmm_max_drop_from_best,
+                rmm_max_drop_min_validations=args.rmm_max_drop_min_validations,
                 open_min_rel_drop=args.open_min_rel_drop,
                 open_min_abs_drop=args.open_min_abs_drop,
             )
@@ -1030,6 +1048,16 @@ def main() -> int:
         help="Optional post-warmup floor for the latest RMM. Disabled by default.",
     )
     parser.add_argument("--rmm-latest-floor-min-validations", type=int, default=3)
+    parser.add_argument(
+        "--rmm-max-drop-from-best",
+        type=float,
+        default=None,
+        help=(
+            "Optional guard that fails a run when the latest RMM drifts this far "
+            "below its best observed validation RMM."
+        ),
+    )
+    parser.add_argument("--rmm-max-drop-min-validations", type=int, default=3)
     parser.add_argument("--open-min-rel-drop", type=float, default=0.0005)
     parser.add_argument("--open-min-abs-drop", type=float, default=0.0001)
     parser.add_argument("--cuda-visible-devices", default="2,3")
