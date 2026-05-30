@@ -217,7 +217,7 @@ bash scripts/start_smart_ntp_h100x4_h100x2_pretrain.sh
 `smart_ntp_pretrain_h100x4_h100x2_bs13_main`이다. 기본 cache root는 두 pod 모두
 `/workspace/womd_v1_3/SMART_cache`이고, 기본 experiment는 기존 A100x4x2와 같은
 `pre_bc_a100x4x2`이다. 즉 SMART NTP 모델, tokenization, loss, validation scorer,
-memory-balanced sampler 설정은 유지하고, 실행 pod/GPU 배치만 `4 + 2`로 바꾼다.
+일반 DDP rank별 data sharding 설정은 유지하고, 실행 pod/GPU 배치만 `4 + 2`로 바꾼다.
 
 두 pod의 local GPU 수가 다르기 때문에 homogeneous `torchrun --nproc_per_node=4`를
 쓰지 않는다. launcher가 각 pod의 GPU 수를 읽어 `hsb-npc-training`에는 rank `0~3`,
