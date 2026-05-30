@@ -116,7 +116,7 @@ sync_project_for_pod() {
   if [[ -n "$GIT_REF" ]]; then
     git_cmd="git fetch origin ${branch_q} && git checkout ${git_ref_q}"
   else
-    git_cmd="git fetch origin ${branch_q} && { git checkout ${branch_q} 2>/dev/null || git checkout -B ${branch_q} origin/${branch_q}; } && git pull --ff-only origin ${branch_q}"
+    git_cmd="git fetch origin +refs/heads/${branch_q}:refs/remotes/origin/${branch_q} && git checkout -B ${branch_q} origin/${branch_q} && git reset --hard origin/${branch_q}"
   fi
 
   kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "

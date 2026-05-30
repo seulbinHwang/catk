@@ -547,7 +547,7 @@ fi
 
     pull_block = ""
     if args.git_ref:
-        fetch_refspec = f"{args.branch}:refs/remotes/origin/{args.branch}"
+        fetch_refspec = f"refs/heads/{args.branch}:refs/remotes/origin/{args.branch}"
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
 git update-ref -d {shq(f"refs/remotes/origin/{args.branch}")} || true
@@ -557,16 +557,12 @@ git checkout -f {shq(args.git_ref)}
     elif args.pull:
         branch_ref = f"refs/heads/{args.branch}"
         origin_ref = f"origin/{args.branch}"
-        fetch_refspec = f"{args.branch}:refs/remotes/origin/{args.branch}"
+        fetch_refspec = f"refs/heads/{args.branch}:refs/remotes/origin/{args.branch}"
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
-git fetch origin {shq(fetch_refspec)}
-if git show-ref --verify --quiet {shq(branch_ref)}; then
-  git checkout {shq(args.branch)}
-else
-  git checkout -b {shq(args.branch)} {shq(origin_ref)}
-fi
-git pull --ff-only origin {shq(args.branch)}
+git fetch origin --prune {shq(f"+{fetch_refspec}")}
+git checkout -B {shq(args.branch)} {shq(origin_ref)}
+git reset --hard {shq(origin_ref)}
 """
 
     monitor_block = ""
