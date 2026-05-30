@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Launch UniMM Anchor-Based-4s on existing svvvv-2-{1..4} V100 pods.
+
+The launcher avoids touching the dirty shared checkout under
+``/mnt/nuplan/projects/catk`` by preparing a clean checkout in ``/tmp`` on each
+pod. It never creates, deletes, or restarts Kubernetes pods.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import shlex
+import subprocess
+import sys
+
+
+DEFAULT_NAMESPACE = "p-pnc"
+DEFAULT_PODS = ["svvvv-2-1", "svvvv-2-2", "svvvv-2-3", "svvvv-2-4"]
+DEFAULT_BRANCH = "UniMM"
+DEFAULT_REPO_URL = "https://github.com/seulbinHwang/catk.git"
+DEFAULT_PROJECT_ROOT = "/tmp/catk_unimm_v100x4x2"
+DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
+DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
+DEFAULT_ANCHOR_FILE = "/mnt/nuplan/projects/catk/artifacts/unimm/unimm_anchors_8s_k2048.pkl"
+
+
+def shq(value: object) -> str:
+    return shlex.quote(str(value))
+
+
+def env_line(name: str, value: object) -> str:
+    return f"{name}={shq(value)}"
+
+
+def run_kubectl(args: list[str], *, capture: bool = False) -> str:
+    result = subprocess.run(
+        ["kubectl", *args],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+    )
+    return result.stdout.strip() if capture else ""
+
+
+def pod_ip(namespace: str, pod: str) -> str:
+    return run_kubectl(
+        ["get", "pod", pod, "-n", namespace, "-o", "jsonpath={.status.podIP}"],
+        capture=True,
+    )
+
+
+def pod_gpu_count(namespace: str, container: str, pod: str) -> int:
+    output = run_kubectl(
+        [
+            "exec",
+            "-n",
+            namespace,
+            pod,
+            "-c",
+            container,
+            "--",
+            "bash",
+            "-lc",
+            "nvidia-smi -L 2>/dev/null | wc -l",
+        ],
+        capture=True,
+    )
+    return int(output.strip())
+
+
+def exec_in_pod(
+    namespace: str,
+    container: str,
+    pod: str,
+    script: str,
+    *,
+    dry_run: bool,
+) -> None:
+    cmd = ["exec", "-n", namespace, pod, "-c", container, "--", "bash", "-lc", script]
+    if dry_run:
+        print("kubectl " + " ".join(shq(part) for part in cmd))
+        return
+    run_kubectl(cmd)
+
+
+def prepare_checkout_block(args: argparse.Namespace) -> str:
+    return f"""
+if [ ! -d {shq(args.project_root)}/.git ]; then
+  rm -rf {shq(args.project_root)}
+  git clone {shq(args.repo_url)} {shq(args.project_root)}
+fi
+cd {shq(args.project_root)}
+git config --global --add safe.directory {shq(args.project_root)} || true
+git fetch origin --prune
+if git show-ref --verify --quiet refs/heads/{shq(args.branch)}; then
+  git checkout {shq(args.branch)}
+else
+  git checkout -b {shq(args.branch)} origin/{shq(args.branch)}
+fi
+git reset --hard origin/{shq(args.branch)}
+git clean -fdx
+"""
+
+
+def stop_command(session: str, task_name: str) -> str:
+    return f"""set -Eeuo pipefail
+if tmux has-session -t {shq(session)} 2>/dev/null; then
+  tmux kill-session -t {shq(session)}
+  echo "[launcher] stopped tmux session {session}"
+else
+  echo "[launcher] tmux session not found: {session}"
+fi
+mapfile -t pids < <(pgrep -f {shq(task_name)} 2>/dev/null || true)
+if (( ${{#pids[@]}} > 0 )); then
+  kill -TERM "${{pids[@]}}" 2>/dev/null || true
+fi
+"""
+
+
+def build_anchors_command(args: argparse.Namespace) -> str:
+    safe_task = args.task_name.replace("/", "_")
+    log_root = f"{args.log_dir.rstrip('/')}/tmux_unimm_v100x4x2/{safe_task}"
+    run_file = f"{log_root}/build_anchors.sh"
+    log_file = f"{log_root}/build_anchors.tmux.log"
+    script = f"""#!/usr/bin/env bash
+set -Eeuo pipefail
+cd {shq(args.project_root)}
+export CONDA_ROOT={shq(args.conda_root)}
+export CACHE_ROOT={shq(args.cache_root)}
+export OUTPUT={shq(args.anchor_file)}
+mkdir -p "$(dirname "$OUTPUT")"
+bash scripts/build_unimm_anchors.sh --device {shq(args.anchor_device)}
+"""
+    return f"""set -Eeuo pipefail
+{prepare_checkout_block(args)}
+mkdir -p {shq(log_root)}
+cat > {shq(run_file)} <<'UNIMM_BUILD'
+{script.rstrip()}
+UNIMM_BUILD
+chmod +x {shq(run_file)}
+: > {shq(log_file)}
+if tmux has-session -t {shq(args.session)} 2>/dev/null; then
+  tmux kill-session -t {shq(args.session)}
+fi
+tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_file)}
+tmux pipe-pane -t {shq(args.session)} -o {shq("cat >> " + log_file)}
+echo "[launcher] started anchor build tmux session {args.session}"
+echo "[launcher] log: {log_file}"
+"""
+
+
+def launch_command(
+    args: argparse.Namespace,
+    pod: str,
+    node_rank: int,
+    master_addr: str,
+    gpu_count: int,
+) -> str:
+    safe_task = args.task_name.replace("/", "_")
+    log_root = f"{args.log_dir.rstrip('/')}/tmux_unimm_v100x4x2/{safe_task}"
+    env_file = f"{log_root}/{pod}.env"
+    run_file = f"{log_root}/{pod}_run.sh"
+    log_file = f"{log_root}/{pod}.tmux.log"
+    hydra_overrides = args.extra_hydra_overrides
+    if args.smoke:
+        hydra_overrides = " ".join(
+            [
+                hydra_overrides,
+                "trainer.max_epochs=1",
+                "trainer.limit_train_batches=1",
+                "trainer.limit_val_batches=0",
+                "model.model_config.val_open_loop=false",
+                "model.model_config.val_closed_loop=false",
+                "logger.wandb.offline=true",
+                "logger.wandb.log_model=false",
+            ]
+        ).strip()
+    env_text = "\n".join(
+        [
+            env_line("CONDA_ROOT", args.conda_root),
+            env_line("CACHE_ROOT", args.cache_root),
+            env_line("UNIMM_ANCHOR_FILE", args.anchor_file),
+            env_line("NNODES", len(args.pods)),
+            env_line("NPROC_PER_NODE", gpu_count),
+            env_line("TRAINER_DEVICES", gpu_count),
+            env_line("NODE_RANK", node_rank),
+            env_line("MANUAL_RANK_OFFSET", node_rank * gpu_count),
+            env_line("MANUAL_WORLD_SIZE", len(args.pods) * gpu_count),
+            env_line("MASTER_ADDR", master_addr),
+            env_line("MASTER_PORT", args.master_port),
+            env_line("TASK_NAME", args.task_name),
+            env_line("CATK_ACTION", args.action),
+            env_line("LOG_DIR", args.log_dir),
+            env_line("TRAIN_BATCH_SIZE", args.train_batch_size),
+            env_line("VAL_BATCH_SIZE", args.val_batch_size),
+            env_line("TEST_BATCH_SIZE", args.test_batch_size),
+            env_line("WANDB_MODE", args.wandb_mode),
+            env_line("CATK_HYDRA_OVERRIDES", hydra_overrides),
+        ]
+    ) + "\n"
+    run_text = f"""#!/usr/bin/env bash
+set +e
+cd {shq(args.project_root)}
+set -a
+source {shq(env_file)}
+set +a
+echo "[tmux-run] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
+echo "[tmux-run] started at $(date '+%F %T')"
+bash scripts/unimm_v100x4x2_train.sh
+status=$?
+echo "[tmux-run] exited with status $status at $(date '+%F %T')"
+exec bash
+"""
+    replace_block = ""
+    if args.replace:
+        replace_block = f"""
+if tmux has-session -t {shq(args.session)} 2>/dev/null; then
+  tmux kill-session -t {shq(args.session)}
+fi
+"""
+    else:
+        replace_block = f"""
+if tmux has-session -t {shq(args.session)} 2>/dev/null; then
+  echo "[launcher] tmux session already exists: {args.session}" >&2
+  exit 3
+fi
+"""
+    return f"""set -Eeuo pipefail
+{prepare_checkout_block(args)}
+if [ ! -f {shq(args.anchor_file)} ]; then
+  echo "[launcher] anchor file is missing: {args.anchor_file}" >&2
+  echo "[launcher] run with --build-anchors first or set --anchor-file." >&2
+  exit 2
+fi
+{replace_block}
+mkdir -p {shq(log_root)}
+cat > {shq(env_file)} <<'UNIMM_ENV'
+{env_text.rstrip()}
+UNIMM_ENV
+cat > {shq(run_file)} <<'UNIMM_RUN'
+{run_text.rstrip()}
+UNIMM_RUN
+chmod +x {shq(run_file)}
+: > {shq(log_file)}
+tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_file)}
+tmux pipe-pane -t {shq(args.session)} -o {shq("cat >> " + log_file)}
+echo "[launcher] started tmux session {args.session} on pod {pod}"
+echo "[launcher] log: {log_file}"
+"""
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Launch UniMM Anchor-Based-4s on svvvv-2-{1..4} V100 pods.",
+    )
+    parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", DEFAULT_NAMESPACE))
+    parser.add_argument("--container", default=os.environ.get("CONTAINER", "main"))
+    parser.add_argument("--pods", nargs="+", default=os.environ.get("PODS", " ".join(DEFAULT_PODS)).split())
+    parser.add_argument("--repo-url", default=os.environ.get("CATK_REPO_URL", DEFAULT_REPO_URL))
+    parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH", DEFAULT_BRANCH))
+    parser.add_argument("--project-root", default=os.environ.get("REMOTE_PROJECT_ROOT", DEFAULT_PROJECT_ROOT))
+    parser.add_argument("--cache-root", default=os.environ.get("CACHE_ROOT", DEFAULT_CACHE_ROOT))
+    parser.add_argument("--log-dir", default=os.environ.get("REMOTE_LOG_DIR", DEFAULT_LOG_DIR))
+    parser.add_argument("--anchor-file", default=os.environ.get("UNIMM_ANCHOR_FILE", DEFAULT_ANCHOR_FILE))
+    parser.add_argument("--conda-root", default=os.environ.get("CONDA_ROOT", "/mnt/nuplan/miniforge"))
+    parser.add_argument("--action", choices=["fit", "validate", "test"], default="fit")
+    parser.add_argument("--task-name", default="")
+    parser.add_argument("--session", default="unimm-v100x4x2")
+    parser.add_argument("--master-port", default="29541")
+    parser.add_argument("--train-batch-size", default="4")
+    parser.add_argument("--val-batch-size", default="4")
+    parser.add_argument("--test-batch-size", default="4")
+    parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE", "online"))
+    parser.add_argument("--extra-hydra-overrides", default="")
+    parser.add_argument("--anchor-device", default="cuda")
+    parser.add_argument("--build-anchors", action="store_true")
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--replace", action="store_true")
+    parser.add_argument("--stop", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+    if len(args.pods) != 4 and not args.stop and not args.build_anchors:
+        parser.error("default V100 recipe expects exactly four pods")
+    if not args.task_name:
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = "smoke" if args.smoke else "train"
+        args.task_name = f"unimm_anchor_based_4s_v100x4x2_{suffix}_{stamp}"
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    if args.stop:
+        for pod in args.pods:
+            exec_in_pod(
+                args.namespace,
+                args.container,
+                pod,
+                stop_command(args.session, args.task_name),
+                dry_run=args.dry_run,
+            )
+        return
+
+    if args.build_anchors:
+        exec_in_pod(
+            args.namespace,
+            args.container,
+            args.pods[0],
+            build_anchors_command(args),
+            dry_run=args.dry_run,
+        )
+        return
+
+    master_addr = "<MASTER_POD_IP>" if args.dry_run else pod_ip(args.namespace, args.pods[0])
+    gpu_counts: dict[str, int] = {}
+    for pod in args.pods:
+        gpu_counts[pod] = 2 if args.dry_run else pod_gpu_count(args.namespace, args.container, pod)
+        if gpu_counts[pod] != 2:
+            raise RuntimeError(f"expected 2 GPUs in {pod}, found {gpu_counts[pod]}")
+
+    print(f"[launcher] master pod: {args.pods[0]} ({master_addr}:{args.master_port})")
+    print(f"[launcher] task_name: {args.task_name}")
+    print(f"[launcher] anchor:    {args.anchor_file}")
+    for node_rank, pod in enumerate(args.pods):
+        exec_in_pod(
+            args.namespace,
+            args.container,
+            pod,
+            launch_command(args, pod, node_rank, master_addr, gpu_counts[pod]),
+            dry_run=args.dry_run,
+        )
+
+    print("\nAttach commands:")
+    for pod in args.pods:
+        print(
+            "  kubectl exec -it "
+            f"-n {args.namespace} {pod} -c {args.container} -- "
+            f"tmux attach -t {args.session}"
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as exc:
+        sys.exit(exc.returncode)

@@ -1,0 +1,61 @@
+_target_: src.unimm.model.anchor_based_4s.UniMMAnchorBased4s
+model_config:
+  lr: 0.0005
+  weight_decay: 0.0001
+  lr_warmup_steps: 0
+  lr_total_steps: ${trainer.max_epochs}
+
+  anchor_file: ${paths.root_dir}/src/unimm/anchors/unimm_anchors_8s_k2048.pkl
+  num_historical_steps: 11
+  prediction_horizon_steps: 40
+  commit_steps: 5
+  match_steps: 5
+  first_context_step: 10
+  last_train_context_step: 50
+  anchor_heading_weight: 1.0
+  anchor_match_chunk_size: 4096
+
+  use_closed_loop_training: true
+  inference_temperature: 1.0
+  validation_closed_seed: 0
+  val_open_loop: true
+  val_closed_loop: true
+  n_rollout_closed_val: 32
+  n_batch_sim_agents_metric: 10
+  wosac_cpd_reference: null
+  wosac_distribution_type_scale: [22.3461620418, 4.5793447978, 18.5374388830]
+
+  n_vis_batch: 0
+  n_vis_scenario: 0
+  n_vis_rollout: 0
+  delete_local_videos_after_wandb_upload: true
+
+  loss_weights:
+    cls: 1.0
+    reg: 1.0
+
+  decoder:
+    # K=2048일 때 전체 모델이 약 7.1M parameters가 되도록 맞춘 값입니다.
+    hidden_dim: 232
+    num_freq_bands: 64
+    num_heads: 4
+    head_dim: 20
+    dropout: 0.1
+    num_map_layers: 1
+    num_agent_layers: 2
+    pl2pl_radius: 10
+    pl2a_radius: 30
+    a2a_radius: 60
+    time_span: 8
+    min_laplace_scale: 0.05
+    min_von_mises_concentration: 0.001
+
+  sim_agents_submission:
+    is_active: false
+    method_name: "UniMM-Anchor-Based-4s"
+    authors: [Anonymous]
+    affiliation: YOUR_AFFILIATION
+    description: "Anchor-based continuous mixture model with 2048 category anchors, 4s prediction horizon, and approximate posterior closed-loop training."
+    method_link: YOUR_METHOD_LINK
+    account_name: YOUR_ACCOUNT_NAME
+    num_model_parameters: "7M"
