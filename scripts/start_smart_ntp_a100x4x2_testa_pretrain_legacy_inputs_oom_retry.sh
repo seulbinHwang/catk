@@ -2,10 +2,12 @@
 # Re-run the measured SMART NTP A100x4x2 OOM-retry pretrain after the
 # 5a31008 legacy-input revert.
 #
-# This intentionally keeps the same runtime recipe as
+# This intentionally keeps the A100x4x2 OOM-retry runtime shape from
 # smart_ntp_pretrain_a100x4x2_bs16_oom_retry_main_20260523, except that this
-# wrapper starts from train batch size 14, records "original" in the task, and
-# uses the legacy SMART training target selection:
+# wrapper starts from train batch size 14, records "original" in the task,
+# uses the legacy SMART training target selection, and follows the d238-era
+# SMART optimizer scale (lr=5e-4, gradient_clip_val=0.5) through
+# pre_bc_a100x4x2:
 #   - testa + testaa
 #   - pre_bc_a100x4x2
 #   - INITIAL_BS=14, OOM_STEP=1, MIN_BS=8

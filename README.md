@@ -271,11 +271,11 @@ submission과 같은 후보 폭을 쓰도록 `validation_rollout_sampling.num_k:
 
 - `trainer.devices: 4`, `trainer.num_nodes: 2`
 - `data.train_batch_size: 16`, 즉 8개 rank 기준 effective global batch 128
-- `model.model_config.lr: 6e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
+- `model.model_config.lr: 5e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
 - `model.model_config.scorer_scene_num: 1680`
 - `model.model_config.validation_rollout_sampling.num_k: 48`
 - `trainer.max_epochs: 64`, `check_val_every_n_epoch: 16`
-- `trainer.precision: bf16-mixed`, `gradient_clip_val: 1.0`,
+- `trainer.precision: bf16-mixed`, `gradient_clip_val: 0.5`,
   `accumulate_grad_batches: 1`
 - `data.val_batch_size: 12`, `data.test_batch_size: 12`, `num_workers: 4`
 - `data.train_memory_balanced_batching: true`,

@@ -11,7 +11,8 @@
 #   * 4 A100/H100 GPUs per node
 #   * 8 total DDP ranks
 #   * train_batch_size 16 * 8 GPUs = effective global batch 128
-#   * lr=6e-4, warmup=4, lr_min_ratio=1e-2
+#   * lr=5e-4, warmup=4, lr_min_ratio=1e-2
+#   * gradient_clip_val=0.5
 #   * fast RMM scorer uses about 1680 validation scenarios every 16 epochs
 
 defaults:
@@ -20,7 +21,7 @@ defaults:
 
 model:
   model_config:
-    lr: 6e-4
+    lr: 5e-4
     lr_warmup_steps: 4
     lr_min_ratio: 1e-2
     scorer_scene_num: 1680
@@ -42,7 +43,7 @@ trainer:
   check_val_every_n_epoch: 16
   max_epochs: 64
   precision: bf16-mixed
-  gradient_clip_val: 1.0
+  gradient_clip_val: 0.5
   sync_batchnorm: false
   accumulate_grad_batches: 1
   use_distributed_sampler: false
