@@ -38,6 +38,11 @@ CRASH_PATTERNS = (
     "Exception:",
     "FAILED",
 )
+RECOVERY_CKPT_TOKEN = "__OCSC_RECOVERY_CKPT__"
+DEFAULT_RECOVERY_CKPT_PATH = (
+    "logs/ocsc_steprefiner_m12_lr5e7_wd1e2_20260530_064434/"
+    "runs/2026-05-30_06-44-55/checkpoints/epoch_000.ckpt"
+)
 
 
 @dataclass(frozen=True)
@@ -261,12 +266,72 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
         },
     ),
     Variant(
-        name="ocsc_m24_lr1e6_b4_wd1e4",
-        note="OCSC-clean style larger OL pool M=24 with OOM-safe microbatch.",
+        name="ocsc_steprefiner_m12_lr2e7_wd1e2_from_best",
+        note=(
+            "Recover from the best M12 checkpoint and lower LR to reduce late RMM drift "
+            "while keeping beta and the trainable range fixed."
+        ),
         env={
-            "LR": "1.0e-6",
+            "CKPT_PATH": RECOVERY_CKPT_TOKEN,
+            "LR": "2.0e-7",
+            "WEIGHT_DECAY": "1.0e-2",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "false",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+        },
+    ),
+    Variant(
+        name="ocsc_steprefiner_m12_lr1e7_wd1e2_from_best",
+        note=(
+            "More conservative best-checkpoint continuation if LR=2e-7 still drifts."
+        ),
+        env={
+            "CKPT_PATH": RECOVERY_CKPT_TOKEN,
+            "LR": "1.0e-7",
+            "WEIGHT_DECAY": "1.0e-2",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "false",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+        },
+    ),
+    Variant(
+        name="ocsc_steprefiner_m16_lr5e7_b4_wd1e2_from_best",
+        note=(
+            "Use the best M12 checkpoint, then increase the OL pool to M=16 with "
+            "the stable LR/weight decay pair."
+        ),
+        env={
+            "CKPT_PATH": RECOVERY_CKPT_TOKEN,
+            "LR": "5.0e-7",
+            "WEIGHT_DECAY": "1.0e-2",
             "TRAIN_B": "4",
-            "OCSC_N_OL_ROLLOUTS": "24",
+            "OCSC_N_OL_ROLLOUTS": "16",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "false",
             "DATA_SHUFFLE": "true",
             "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
             "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
@@ -281,15 +346,15 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
         },
     ),
     Variant(
-        name="ocsc_steprefiner_m16_lr5e7_b4_wd1e2",
-        note="Combine larger OL pool and step_refiner with the stable LR/weight decay pair.",
+        name="ocsc_m24_lr1e6_b4_wd1e4",
+        note=(
+            "OCSC-clean style larger OL pool M=24 with OOM-safe microbatch; keep "
+            "behind best-checkpoint recovery because lr=1e-6/wd=1e-4 was brittle."
+        ),
         env={
-            "LR": "5.0e-7",
-            "WEIGHT_DECAY": "1.0e-2",
+            "LR": "1.0e-6",
             "TRAIN_B": "4",
-            "OCSC_N_OL_ROLLOUTS": "16",
-            "OCSC_VELOCITY_HEAD_ONLY": "false",
-            "OCSC_FULL_FLOW_DECODER": "false",
+            "OCSC_N_OL_ROLLOUTS": "24",
             "DATA_SHUFFLE": "true",
             "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
             "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
@@ -806,6 +871,13 @@ def launch_variant(
     env = os.environ.copy()
     env.update(base_env(args))
     env.update(variant.env)
+    if env.get("CKPT_PATH") == RECOVERY_CKPT_TOKEN:
+        recovery_ckpt = Path(args.recovery_ckpt_path)
+        if not recovery_ckpt.is_absolute():
+            recovery_ckpt = Path(args.repo_root) / recovery_ckpt
+        env["CKPT_PATH"] = str(recovery_ckpt)
+        if not recovery_ckpt.exists():
+            log(f"warning: recovery checkpoint does not exist yet: {recovery_ckpt}")
     env["MY_TASK_NAME"] = task_name
     env["TMUX_LOG_PATH"] = str(log_path)
     command = ["bash", "scripts/train_ocsc_ft.sh"]
@@ -967,6 +1039,14 @@ def main() -> int:
     parser.add_argument("--limit-val-batches", default="0.1")
     parser.add_argument("--val-check-interval", type=int, default=200)
     parser.add_argument("--max-epochs", type=int, default=16)
+    parser.add_argument(
+        "--recovery-ckpt-path",
+        default=DEFAULT_RECOVERY_CKPT_PATH,
+        help=(
+            "Checkpoint used by best-checkpoint recovery variants. Relative paths "
+            "are resolved under repo-root."
+        ),
+    )
     parser.add_argument("--skip-initial", action="store_true")
     parser.add_argument(
         "--start-variant-index",
