@@ -278,8 +278,7 @@ submission과 같은 후보 폭을 쓰도록 `validation_rollout_sampling.num_k:
 - `trainer.precision: bf16-mixed`, `gradient_clip_val: 0.5`,
   `accumulate_grad_batches: 1`
 - `data.val_batch_size: 12`, `data.test_batch_size: 12`, `num_workers: 4`
-- `data.train_memory_balanced_batching: true`,
-  `trainer.use_distributed_sampler: false`
+- `trainer.use_distributed_sampler: false`
 
 SMART NTP decoder는 static map feature를 시간 step마다 복제하지 않고, 모든 token step의
 agent node가 같은 map feature를 참조한다. 지도 자체는 시간에 따라 바뀌지 않고, traffic
@@ -300,29 +299,12 @@ message 생성, scatter aggregation으로 이어지는 graph attention 경로만
 모델 구조, 파라미터 수, edge set, radius, loss target은 바뀌지 않는다. 바뀌는 것은
 attention 내부 계산 dtype 경계뿐이다.
 
-이 preset은 `data.train_memory_balanced_batching=true`도 켠다. 이 sampler는 각 training
-pickle의 agent 수, valid agent-step 수, map point 수를 metadata cache로 한 번 기록한 뒤,
-agent가 많은 scene이 같은 rank-local batch에 몰리지 않도록 batch 순서만 다시 짠다.
-학습 objective, 모델 구조, per-GPU `train_batch_size=16`, 전체 effective batch 128은
-그대로 유지된다. 대신 random shuffle 순서가 바뀌므로 기존 run을 resume하더라도 bitwise로
-완전히 같은 sample 순서는 아니다.
-
-안전장치로, `data.train_memory_balanced_batching=false`를 주더라도 DDP 학습에서는
-datamodule이 train dataloader에 `DistributedSampler`를 직접 넣는다. 따라서
-`trainer.use_distributed_sampler=false` 상태에서 memory-balanced sampler를 끄더라도
-8개 rank가 같은 training cache 전체를 반복해서 보는 상황은 발생하지 않는다. 이 fallback은
-memory balancing만 끄고, rank별 data sharding은 유지한다.
-
-metadata cache 기본 위치는 training cache 안의
-`.catk_memory_balanced_metadata_v1.pkl`이다. 파일이 없으면 같은 파일 시스템에서 한
-process만 cache를 만들고 나머지 rank는 기다린다. 이후 실행에서는 이 cache를 바로 읽으므로
-학습 step 속도에는 추가 비용이 없다. 이 숨김 cache 파일은 dataset sample 목록에서
-제외되도록 처리되어 다음 실행의 학습 데이터에 섞이지 않는다. A100x4x2 preset은 첫 생성 속도를 위해
-`data.train_memory_balance_metadata_num_workers=8`을 사용한다. cache를 다른 곳에 두고
-싶으면 `data.train_memory_balance_metadata_path=/path/to/metadata.pkl`로 지정한다. metadata
-build 중 pod가 죽어 `.lock` 파일만 남은 경우에는 lock heartbeat가 끊긴 것으로 보고 기본
-30초 뒤 자동 회수한다. 살아 있는 builder를 기다리는 rank도 1초 단위로 cache 생성을 다시
-확인하므로, stale lock 때문에 학습 준비가 장시간 멈추는 경로를 피한다.
+이 preset은 memory-balanced batch packing을 사용하지 않는다. 즉 agent-heavy scene을
+별도 metadata로 재배치하지 않고, 일반 shuffle 뒤 DDP rank별 shard를 사용한다. 다만
+`trainer.use_distributed_sampler=false` 상태에서도 datamodule이 train dataloader에
+`DistributedSampler`를 직접 넣기 때문에, 8개 rank가 같은 training cache 전체를 반복해서
+보는 상황은 발생하지 않는다. 따라서 memory-aware batch 재배치는 제거하되, rank별 data
+sharding 안전장치는 유지한다.
 
 이 launcher와 내부 실행 스크립트는 `pre_bc_a100x4x2` fit 실행에서
 `trainer.accumulate_grad_batches=1`을 강제하고, `data.train_batch_size`는 A100 80GB에서

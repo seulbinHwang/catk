@@ -22,7 +22,6 @@ from torch_geometric.transforms import BaseTransform
 from src.smart.datasets import MultiDataset
 
 from .exact_distributed_sampler import ExactDistributedSampler
-from .memory_balanced_sampler import MemoryBalancedDistributedBatchSampler
 from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
 
 
@@ -51,12 +50,6 @@ class MultiDataModule(LightningDataModule):
         train_max_num: int,
         train_use_eval_agent_selection: bool = False,
         road_num_rollouts_per_scenario: int = 1,
-        train_memory_balanced_batching: bool = False,
-        train_memory_balance_metadata_path: Optional[str] = None,
-        train_memory_balance_metadata_num_workers: int = 0,
-        train_memory_balance_weight_key: str = "agent_quadratic",
-        train_memory_balance_bucket_size_multiplier: int = 50,
-        train_memory_balance_seed: int = 0,
     ) -> None:
         super(MultiDataModule, self).__init__()
         self.train_batch_size = train_batch_size
@@ -72,16 +65,6 @@ class MultiDataModule(LightningDataModule):
         self.val_tfrecords_splitted = val_tfrecords_splitted
         self.train_use_eval_agent_selection = train_use_eval_agent_selection
         self.road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
-        self.train_memory_balanced_batching = train_memory_balanced_batching
-        self.train_memory_balance_metadata_path = train_memory_balance_metadata_path
-        self.train_memory_balance_metadata_num_workers = (
-            train_memory_balance_metadata_num_workers
-        )
-        self.train_memory_balance_weight_key = train_memory_balance_weight_key
-        self.train_memory_balance_bucket_size_multiplier = (
-            train_memory_balance_bucket_size_multiplier
-        )
-        self.train_memory_balance_seed = int(train_memory_balance_seed)
         self._train_dataset_raw_dir: Optional[str] = None
         self._train_dataset_road_group_size: Optional[int] = None
 
@@ -150,33 +133,6 @@ class MultiDataModule(LightningDataModule):
         if needs_rebuild:
             self._build_train_dataset()
 
-        if self.train_memory_balanced_batching:
-            if self.road_num_rollouts_per_scenario != 1:
-                raise ValueError(
-                    "train_memory_balanced_batching currently supports one pickle "
-                    "per dataset sample. Set road_num_rollouts_per_scenario=1."
-                )
-            world_size, global_rank = self._get_trainer_world_info()
-            batch_sampler = MemoryBalancedDistributedBatchSampler(
-                raw_paths=self.train_dataset.raw_paths,
-                batch_size=self.train_batch_size,
-                num_replicas=world_size,
-                rank=global_rank,
-                shuffle=self.shuffle,
-                seed=self.train_memory_balance_seed,
-                metadata_path=self.train_memory_balance_metadata_path,
-                metadata_num_workers=self.train_memory_balance_metadata_num_workers,
-                weight_key=self.train_memory_balance_weight_key,
-                bucket_size_multiplier=self.train_memory_balance_bucket_size_multiplier,
-            )
-            return DataLoader(
-                self.train_dataset,
-                batch_sampler=batch_sampler,
-                num_workers=self.num_workers,
-                pin_memory=self.pin_memory,
-                persistent_workers=self.persistent_workers,
-            )
-
         sampler = self._build_train_sampler(self.train_dataset)
         return DataLoader(
             self.train_dataset,
@@ -206,7 +162,6 @@ class MultiDataModule(LightningDataModule):
             num_replicas=world_size,
             rank=global_rank,
             shuffle=self.shuffle,
-            seed=self.train_memory_balance_seed,
             drop_last=False,
         )
 

@@ -62,12 +62,11 @@ def test_datamodule_constructs_both_train_selection_modes() -> None:
     assert isinstance(eval_dm.train_transform, WaymoTargetBuilderVal)
 
 
-def test_train_dataloader_shards_ddp_when_memory_balancing_is_disabled(
+def test_train_dataloader_shards_ddp_with_distributed_sampler(
     monkeypatch,
 ) -> None:
     dm = _make_datamodule(train_use_eval_agent_selection=True)
     dm.shuffle = True
-    dm.train_memory_balanced_batching = False
     dm.train_dataset = list(range(32))
     dm._train_dataset_raw_dir = dm.train_raw_dir
     dm._train_dataset_road_group_size = dm.road_num_rollouts_per_scenario
