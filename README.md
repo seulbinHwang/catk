@@ -236,7 +236,7 @@ validation sharding은 launcher가 export한 실제 `WORLD_SIZE=6` 기준으로 
 | per-rank batch | `data.train_batch_size=13` |
 | effective global batch | 78 |
 | precision | `bf16-mixed` |
-| lr / warmup / min ratio | `6e-4` / `4` / `1e-2` |
+| lr / warmup / min ratio | `5e-4` / `0` / `1e-2` |
 | validation | `scorer_scene_num=1680`, `check_val_every_n_epoch=16` |
 | graph attention dtype | `CATK_ATTENTION_GRAPH_FP32=1` |
 
@@ -271,7 +271,7 @@ submission과 같은 후보 폭을 쓰도록 `validation_rollout_sampling.num_k:
 
 - `trainer.devices: 4`, `trainer.num_nodes: 2`
 - `data.train_batch_size: 16`, 즉 8개 rank 기준 effective global batch 128
-- `model.model_config.lr: 5e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
+- `model.model_config.lr: 5e-4`, `lr_warmup_steps: 0`, `lr_min_ratio: 1e-2`
 - `model.model_config.scorer_scene_num: 1680`
 - `model.model_config.validation_rollout_sampling.num_k: 48`
 - `trainer.max_epochs: 64`, `check_val_every_n_epoch: 16`
