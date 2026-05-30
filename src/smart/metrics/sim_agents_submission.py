@@ -247,14 +247,18 @@ class SimAgentsSubmission(Metric):
         filesystem. In that case, set ``CATK_SUBMISSION_STREAM_SHARDS=1`` so
         non-master nodes stream their local shard files to rank 0 over TCP.
         """
+        rank = self._get_global_rank()
         if not (dist.is_available() and dist.is_initialized()):
             return self.submission_dir
-        if os.environ.get("CATK_SUBMISSION_STREAM_SHARDS", "0") not in {"1", "true", "TRUE"}:
+        world_size = int(dist.get_world_size())
+        local_world_size = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+        is_multinode = world_size > local_world_size
+        stream_setting = os.environ.get("CATK_SUBMISSION_STREAM_SHARDS")
+        stream_enabled = is_multinode if stream_setting is None else stream_setting in {"1", "true", "TRUE"}
+        if not stream_enabled:
             return self.submission_dir
 
-        rank = self._get_global_rank()
-        world_size = int(dist.get_world_size())
-        node_rank = int(os.environ.get("NODE_RANK", "0"))
+        node_rank = int(os.environ.get("NODE_RANK", os.environ.get("GROUP_RANK", rank // local_world_size)))
         gathered_node_ranks: list[int | None] = [None for _ in range(world_size)]
         dist.all_gather_object(gathered_node_ranks, node_rank)
         remote_ranks = [

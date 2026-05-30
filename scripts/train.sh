@@ -5,8 +5,8 @@ export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-MY_EXPERIMENT="pre_bc"
-MY_TASK_NAME=$MY_EXPERIMENT"-debug"
+MY_EXPERIMENT="mdg_pretrain"
+MY_TASK_NAME="${TASK_NAME:-$MY_EXPERIMENT-debug}"
 
 source "$(dirname "$0")/setup_runtime_env.sh"
 torchrun \
@@ -15,7 +15,7 @@ torchrun \
   paths.cache_root="$CACHE_ROOT" \
   task_name=$MY_TASK_NAME
 
-# ! below is for training with ddp
+# below is for multi-node/multi-GPU training with torchrun + Lightning DDP
 # torchrun \
 #   --rdzv_id $SLURM_JOB_ID \
 #   --rdzv_backend c10d \

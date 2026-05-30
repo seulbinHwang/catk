@@ -1,0 +1,45 @@
+# @package _global_
+
+defaults:
+  - override /data: mdg_waymo
+  - override /model: mdg
+
+task_name: mdg_wosac_submission
+ckpt_path: YOUR_MDG_MODEL.ckpt
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
+  limit_test_batches: 1.0
+  check_val_every_n_epoch: 1
+  precision: 16-mixed
+
+data:
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 4
+  num_workers: 8
+  shuffle: false
+  pin_memory: false
+  eval_max_agents: 128
+
+model:
+  model_config:
+    n_rollout_closed_val: 32
+    rollout_chunk_size: 1
+    replanning_interval: 10
+    closed_loop_denoising_steps: 16
+    n_batch_sim_agents_metric: 0
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    val_closed_loop: true
+    sim_agents_submission:
+      is_active: true
+      method_name: "MDG-WOSAC"
+      authors: [Seulbin Hwang]
+      affiliation: NaverLabs
+      description: Masked denoising generation for WOMD Sim Agents closed-loop simulation.
+      method_link: "not available yet"
+      account_name: "h.sb@naverlabs.com"
+      num_model_parameters: "7.11M"

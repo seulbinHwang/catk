@@ -1,0 +1,49 @@
+_target_: src.mdg.model.MDG
+model_config:
+  lr: 0.0002
+  weight_decay: 0.01
+  lr_warmup_steps: 1000
+  lr_decay_step: 2000
+  lr_decay_factor: 0.98
+  denoising_loss_weight: 1.0
+  action_loss_weight: 0.0
+  aux_loss_weight: 5.0
+  n_rollout_closed_val: 32
+  rollout_chunk_size: 1
+  replanning_interval: 10
+  closed_loop_denoising_steps: 16
+  validation_closed_seed: 0
+  val_closed_loop: true
+  n_batch_sim_agents_metric: 10
+  n_vis_batch: 0
+  n_vis_scenario: 0
+  n_vis_rollout: 0
+  delete_local_videos_after_wandb_upload: true
+  wosac_cpd_reference: null
+  wosac_distribution_type_scale: [22.3461620418, 4.5793447978, 18.5374388830]
+  backbone:
+    hidden_dim: 192
+    history_steps: 11
+    future_steps: 80
+    action_chunk: 2
+    map_waypoints: 16
+    num_noise_levels: 5
+    num_mixer_layers: 2
+    num_encoder_layers: 6
+    num_denoiser_blocks: 2
+    num_heads: 8
+    ffn_dim: 704
+    dropout: 0.1
+    predictor_modes: 6
+    num_relation_freq_bands: 4
+    action_mean: [0.0, 0.0]
+    action_std: [1.0, 0.5]
+  sim_agents_submission:
+    is_active: false
+    method_name: "MDG-WOSAC"
+    authors: [Anonymous]
+    affiliation: YOUR_AFFILIATION
+    description: YOUR_DESCRIPTION
+    method_link: YOUR_METHOD_LINK
+    account_name: YOUR_ACCOUNT_NAME
+    num_model_parameters: "7.11M"

@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - override /data: mdg_waymo
+  - override /model: mdg
+
+task_name: mdg_wosac_pretrain
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 10
+  check_val_every_n_epoch: 1
+  max_epochs: 20
+  gradient_clip_val: 1.0
+  precision: 16-mixed
+
+data:
+  train_batch_size: 4
+  val_batch_size: 4
+  test_batch_size: 4
+  num_workers: 8
+  train_max_agents: 64
+  eval_max_agents: 128
+
+model:
+  model_config:
+    n_batch_sim_agents_metric: 10
+    rollout_chunk_size: 1
+    closed_loop_denoising_steps: 16
+    val_closed_loop: true
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max

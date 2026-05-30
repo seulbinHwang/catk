@@ -5,8 +5,8 @@ export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 
 ACTION=validate # validate, test
-MY_EXPERIMENT="wosac_sub"
-MY_TASK_NAME=$MY_EXPERIMENT-$ACTION"-debug"
+MY_EXPERIMENT="mdg_wosac_sub"
+MY_TASK_NAME="${TASK_NAME:-$MY_EXPERIMENT-$ACTION-debug}"
 
 source "$(dirname "$0")/setup_runtime_env.sh"
 if [ -z "${CKPT_PATH:-}" ]; then

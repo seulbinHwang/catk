@@ -1,0 +1,443 @@
+from __future__ import annotations
+
+import numpy as np
+import torch
+from omegaconf import OmegaConf
+from waymo_open_dataset.utils.sim_agents import submission_specs
+
+from src.data_preprocess import build_mdg_map_features, build_mdg_traffic_signal_features, process_dynamic_map
+from src.mdg.data import collate_mdg_samples
+from src.mdg.geometry import relation_features
+from src.mdg.model import MDG
+from src.mdg.modules import _fourier_relation_features
+
+
+def _sample(index: int = 0) -> dict:
+    num_agents = 4
+    total_steps = 91
+    future_steps = 80
+    num_map = 5
+    map_waypoints = 16
+    num_signals = 3
+
+    time = torch.arange(total_steps, dtype=torch.float32) * 0.1
+    agent_speed = torch.tensor([3.0, 2.0, 1.0, 0.5])
+    agent_heading = torch.tensor([0.0, 0.2, -0.3, 1.0])
+    agent_origin = torch.tensor(
+        [
+            [0.0, 0.0],
+            [10.0, 2.0],
+            [-5.0, -3.0],
+            [3.0, 8.0],
+        ],
+        dtype=torch.float32,
+    )
+    direction = torch.stack((torch.cos(agent_heading), torch.sin(agent_heading)), dim=-1)
+    xy = agent_origin[:, None, :] + direction[:, None, :] * agent_speed[:, None, None] * time[None, :, None]
+    z = torch.zeros(num_agents, total_steps, 1)
+    position = torch.cat((xy, z), dim=-1)
+    velocity = direction[:, None, :] * agent_speed[:, None, None]
+    velocity = velocity.expand(num_agents, total_steps, 2).clone()
+    valid_mask = torch.ones(num_agents, total_steps, dtype=torch.bool)
+
+    map_x = torch.linspace(-20.0, 20.0, map_waypoints)
+    map_position = torch.zeros(num_map, map_waypoints, 2)
+    for poly_idx in range(num_map):
+        map_position[poly_idx, :, 0] = map_x
+        map_position[poly_idx, :, 1] = float(poly_idx) * 3.0
+    map_heading = torch.zeros(num_map, map_waypoints)
+
+    return {
+        "scenario_id": f"100{index}",
+        "tfrecord_path": None,
+        "agent_id": torch.arange(1, num_agents + 1, dtype=torch.long) + index * 10,
+        "agent_type": torch.tensor([0, 0, 1, 2], dtype=torch.long),
+        "agent_shape": torch.tensor(
+            [[4.5, 1.9, 1.5], [4.0, 1.8, 1.5], [0.8, 0.8, 1.7], [1.8, 0.6, 1.6]],
+            dtype=torch.float32,
+        ),
+        "agent_valid": torch.ones(num_agents, dtype=torch.bool),
+        "agent_position": position,
+        "agent_heading": agent_heading[:, None].expand(num_agents, total_steps).clone(),
+        "agent_velocity": velocity,
+        "agent_valid_mask": valid_mask,
+        "map_position": map_position,
+        "map_heading": map_heading,
+        "map_type": torch.zeros(num_map, dtype=torch.long),
+        "map_light_type": torch.zeros(num_map, dtype=torch.long),
+        "map_valid": torch.ones(num_map, dtype=torch.bool),
+        "signal_position": torch.zeros(num_signals, 2),
+        "signal_heading": torch.zeros(num_signals),
+        "signal_state": torch.arange(num_signals, dtype=torch.long),
+        "signal_valid": torch.ones(num_signals, dtype=torch.bool),
+    }
+
+
+def _small_model_config() -> OmegaConf:
+    return OmegaConf.create(
+        {
+            "lr": 2.0e-4,
+            "weight_decay": 0.01,
+            "lr_warmup_steps": 10,
+            "lr_decay_step": 20,
+            "lr_decay_factor": 0.98,
+            "denoising_loss_weight": 1.0,
+            "action_loss_weight": 0.1,
+            "aux_loss_weight": 5.0,
+            "n_rollout_closed_val": 2,
+            "rollout_chunk_size": 2,
+            "replanning_interval": 10,
+            "closed_loop_denoising_steps": 2,
+            "validation_closed_seed": 0,
+            "val_closed_loop": True,
+            "n_batch_sim_agents_metric": 0,
+            "n_vis_batch": 0,
+            "n_vis_scenario": 0,
+            "n_vis_rollout": 0,
+            "delete_local_videos_after_wandb_upload": True,
+            "wosac_cpd_reference": None,
+            "wosac_distribution_type_scale": [1.0, 1.0, 1.0],
+            "backbone": {
+                "hidden_dim": 16,
+                "history_steps": 11,
+                "future_steps": 80,
+                "action_chunk": 2,
+                "map_waypoints": 16,
+                "num_noise_levels": 5,
+                "num_mixer_layers": 1,
+                "num_encoder_layers": 1,
+                "num_denoiser_blocks": 1,
+                "num_heads": 4,
+                "ffn_dim": 32,
+                "dropout": 0.0,
+                "predictor_modes": 2,
+                "num_relation_freq_bands": 2,
+                "action_mean": [0.0, 0.0],
+                "action_std": [1.0, 0.5],
+            },
+            "sim_agents_submission": {
+                "is_active": False,
+                "method_name": "MDG-test",
+                "authors": ["test"],
+                "affiliation": "test",
+                "description": "test",
+                "method_link": "test",
+                "account_name": "test",
+                "num_model_parameters": "test",
+            },
+        }
+    )
+
+
+def test_mdg_training_forward_backward_and_rollout_shapes() -> None:
+    batch = collate_mdg_samples([_sample(0), _sample(1)])
+    model = MDG(_small_model_config())
+
+    out = model._training_forward(batch)
+    assert torch.isfinite(out["loss"])
+    out["loss"].backward()
+
+    pred = model.generate_closed_loop_rollouts(batch, num_rollouts=2)
+    assert tuple(pred["pred_pos"].shape) == (2, 4, 2, 80, 2)
+    assert tuple(pred["pred_heading"].shape) == (2, 4, 2, 80)
+
+    flat = model._flatten_rollouts(batch, pred)
+    assert tuple(flat["pred_traj"].shape) == (8, 2, 80, 2)
+    assert tuple(flat["pred_head"].shape) == (8, 2, 80)
+    assert tuple(flat["pred_z"].shape) == (8, 2, 80)
+
+
+def test_mdg_closed_loop_inference_uses_full_noise_n_step_replanning() -> None:
+    cfg = _small_model_config()
+    cfg.rollout_chunk_size = 2
+    cfg.replanning_interval = 10
+    cfg.closed_loop_denoising_steps = 3
+    batch = collate_mdg_samples([_sample(0)])
+    model = MDG(cfg)
+    model.eval()
+
+    full_noise_calls = []
+    denoise_calls = []
+    max_noise_level = model.backbone.num_noise_levels - 1
+    expected_schedule = model._closed_loop_mask_schedule(torch.device("cpu")).tolist()
+
+    def fake_full_noise_sample(rollout_batch, generator=None):
+        shape = (
+            rollout_batch["agent_position"].shape[0],
+            rollout_batch["agent_position"].shape[1],
+            model.backbone.action_steps,
+            2,
+        )
+        noise = torch.randn(
+            shape,
+            device=rollout_batch["agent_position"].device,
+            generator=generator,
+        )
+        mask = torch.full(shape[:-1], max_noise_level, dtype=torch.long, device=noise.device)
+        full_noise_calls.append((tuple(noise.shape), tuple(mask.shape), int(mask.min()), int(mask.max())))
+        return noise, mask
+
+    def fake_denoise_actions(rollout_batch, noised_action, mask_level, scene=None, compute_aux=True):
+        call_index = len(denoise_calls)
+        denoise_calls.append((tuple(noised_action.shape), tuple(mask_level.shape), int(mask_level.min()), int(mask_level.max()), scene, compute_aux))
+        expected_level = expected_schedule[call_index % cfg.closed_loop_denoising_steps]
+        assert bool((mask_level == expected_level).all())
+        assert scene is not None
+        assert compute_aux is False
+        bsz, num_agents = mask_level.shape[:2]
+        pred_action = torch.zeros(
+            bsz,
+            num_agents,
+            model.backbone.action_steps,
+            2,
+            device=noised_action.device,
+            dtype=noised_action.dtype,
+        )
+        pred_pos = torch.full(
+            (bsz, num_agents, model.num_future_steps, 2),
+            float(call_index),
+            device=noised_action.device,
+            dtype=noised_action.dtype,
+        )
+        pred_heading = torch.zeros(
+            bsz,
+            num_agents,
+            model.num_future_steps,
+            device=noised_action.device,
+            dtype=noised_action.dtype,
+        )
+        pred_speed = torch.zeros_like(pred_heading)
+        return pred_action, pred_pos, pred_heading, pred_speed, None, None
+
+    model.backbone.full_noise_sample = fake_full_noise_sample
+    model.backbone.denoise_actions = fake_denoise_actions
+
+    pred = model.generate_closed_loop_rollouts(batch, num_rollouts=2)
+
+    assert len(full_noise_calls) == model.num_future_steps // cfg.replanning_interval
+    assert len(denoise_calls) == len(full_noise_calls) * cfg.closed_loop_denoising_steps
+    assert all(call[2:] == (max_noise_level, max_noise_level) for call in full_noise_calls)
+    assert all(call[4] is denoise_calls[0][4] for call in denoise_calls[: cfg.closed_loop_denoising_steps])
+    assert tuple(pred["pred_pos"].shape) == (1, 4, 2, 80, 2)
+    for segment_idx in range(model.num_future_steps // cfg.replanning_interval):
+        start = segment_idx * cfg.replanning_interval
+        end = start + cfg.replanning_interval
+        expected_call_index = (segment_idx + 1) * cfg.closed_loop_denoising_steps - 1
+        expected = torch.full_like(pred["pred_pos"][:, :, :, start:end], float(expected_call_index))
+        torch.testing.assert_close(pred["pred_pos"][:, :, :, start:end], expected)
+
+
+def test_mdg_loss_decreases_on_fixed_corruption() -> None:
+    batch = collate_mdg_samples([_sample(0), _sample(1)])
+    model = MDG(_small_model_config())
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3, weight_decay=0.0)
+
+    losses = []
+    for _ in range(4):
+        torch.manual_seed(1234)
+        optimizer.zero_grad(set_to_none=True)
+        loss = model._training_forward(batch)["loss"]
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach()))
+
+    assert losses[-1] < losses[0]
+
+
+def test_mdg_default_loss_is_state_plus_aux_without_action_loss() -> None:
+    cfg = _small_model_config()
+    cfg.action_loss_weight = 0.0
+    batch = collate_mdg_samples([_sample(0), _sample(1)])
+    model = MDG(cfg)
+
+    torch.manual_seed(1234)
+    out = model._training_forward(batch)
+
+    torch.testing.assert_close(out["action_loss"], torch.zeros_like(out["action_loss"]))
+    expected = out["state_loss"] + cfg.aux_loss_weight * out["aux_loss"]
+    torch.testing.assert_close(out["loss"].detach(), expected)
+
+
+def test_mdg_lr_is_step_based_without_lightning_scheduler() -> None:
+    model = MDG(_small_model_config())
+    optimizer = model.configure_optimizers()
+
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert optimizer.param_groups[0]["lr"] == model.lr / model.lr_warmup_steps
+
+    model._set_optimizer_lr(optimizer, step=9)
+    assert optimizer.param_groups[0]["lr"] == model.lr
+
+    model._set_optimizer_lr(optimizer, step=30)
+    assert optimizer.param_groups[0]["lr"] == model.lr * model.lr_decay_factor
+
+
+def test_mdg_waymo_paper_contract_defaults() -> None:
+    model_cfg = OmegaConf.load("configs/model/mdg.yaml").model_config
+    data_cfg = OmegaConf.load("configs/data/mdg_waymo.yaml")
+    pretrain_cfg = OmegaConf.load("configs/experiment/mdg_pretrain.yaml")
+    submission_cfg = OmegaConf.load("configs/experiment/mdg_wosac_sub.yaml")
+
+    assert data_cfg.train_max_agents == 64
+    assert data_cfg.eval_max_agents == 128
+    assert data_cfg.max_map_polylines == 320
+    assert data_cfg.map_waypoints == 16
+    assert data_cfg.max_traffic_lights == 16
+
+    assert model_cfg.backbone.hidden_dim == 192
+    assert model_cfg.backbone.history_steps == 11
+    assert model_cfg.backbone.future_steps == 80
+    assert model_cfg.backbone.action_chunk == 2
+    assert model_cfg.backbone.num_noise_levels == 5
+    assert model_cfg.backbone.num_mixer_layers == 2
+    assert model_cfg.backbone.num_encoder_layers == 6
+    assert model_cfg.backbone.num_denoiser_blocks == 2
+    assert model_cfg.backbone.num_heads == 8
+    assert model_cfg.backbone.ffn_dim == 704
+    assert model_cfg.backbone.predictor_modes == 6
+    assert model_cfg.n_rollout_closed_val == 32
+    assert model_cfg.replanning_interval == 10
+    assert model_cfg.closed_loop_denoising_steps == 16
+    assert model_cfg.action_loss_weight == 0.0
+    assert model_cfg.aux_loss_weight == 5.0
+    assert model_cfg.sim_agents_submission.num_model_parameters == "7.11M"
+    assert submission_cfg.model.model_config.n_rollout_closed_val == 32
+    assert submission_cfg.model.model_config.replanning_interval == 10
+    assert submission_cfg.model.model_config.closed_loop_denoising_steps == 16
+    assert submission_cfg.model.model_config.val_closed_loop is True
+    assert submission_cfg.model.model_config.sim_agents_submission.is_active is True
+    assert pretrain_cfg.trainer.precision == "16-mixed"
+    assert pretrain_cfg.trainer.limit_val_batches == 10
+    assert submission_cfg.trainer.precision == "16-mixed"
+
+    model = MDG(model_cfg)
+    assert sum(p.numel() for p in model.parameters()) == 7_111_168
+
+
+def test_mdg_noise_schedule_and_fourier_relation_features() -> None:
+    model = MDG(_small_model_config())
+    alpha = model._alpha_schedule(torch.device("cpu"), torch.float32)
+    torch.testing.assert_close(alpha, torch.linspace(0.99, 0.01, 5))
+
+    for block in model.backbone.denoiser.blocks:
+        assert block.temporal.attn.rel_emb is None
+
+    batch = collate_mdg_samples([_sample(0), _sample(1)])
+    mask = model._sample_mask_levels(batch)
+    assert tuple(mask.shape) == (2, 4, 40)
+    assert int(mask.min()) >= 0
+    assert int(mask.max()) <= 4
+
+    rel = torch.zeros(2, 3, 4, 3)
+    encoded = _fourier_relation_features(rel, num_bands=2)
+    assert tuple(encoded.shape) == (2, 3, 4, 15)
+
+    pos = torch.zeros(1, 3, 2)
+    heading = torch.zeros(1, 3)
+    self_rel = relation_features(pos, heading, pos, heading)
+    torch.testing.assert_close(
+        self_rel[0, torch.arange(3), torch.arange(3)],
+        torch.full((3, 3), 1.0e-4),
+    )
+
+
+def test_mdg_temporal_mask_prefix_is_progressively_increasing() -> None:
+    model = MDG(_small_model_config())
+    batch = {"agent_valid": torch.ones(8, 4, dtype=torch.bool)}
+    original_rand = torch.rand
+
+    def force_temporal_masking(*args, **kwargs):
+        if len(args) == 1 and args[0] == ():
+            return torch.zeros((), device=kwargs.get("device", None))
+        return original_rand(*args, **kwargs)
+
+    torch.manual_seed(0)
+    torch.rand = force_temporal_masking
+    try:
+        mask = model._sample_mask_levels(batch)
+    finally:
+        torch.rand = original_rand
+
+    assert tuple(mask.shape) == (8, 4, 40)
+    saw_partial_temporal_mask = False
+    for sample_idx in range(mask.shape[0]):
+        row = mask[sample_idx, 0]
+        for agent_idx in range(mask.shape[1]):
+            torch.testing.assert_close(mask[sample_idx, agent_idx], row)
+
+        full_suffix = int((row == 4).sum().item())
+        if 0 < full_suffix < row.numel():
+            saw_partial_temporal_mask = True
+        prefix = row[: row.numel() - full_suffix] if full_suffix > 0 else row
+        suffix = row[row.numel() - full_suffix :] if full_suffix > 0 else row.new_empty(0)
+        if prefix.numel() > 1:
+            assert bool((prefix[1:] >= prefix[:-1]).all())
+            assert int(prefix.max().item()) <= 3
+        if suffix.numel() > 0:
+            assert bool((suffix == 4).all())
+
+    assert saw_partial_temporal_mask
+
+
+def test_mdg_traffic_signal_stop_points_are_cached() -> None:
+    dynamic_map = {
+        "lane_id": [np.array([[7, 8]])],
+        "state": [np.array([["LANE_STATE_STOP", "LANE_STATE_GO"]])],
+        "stop_point": [np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32)],
+    }
+    lights = process_dynamic_map(dynamic_map)
+    mdg_map = {
+        "position": torch.zeros(0, 16, 2, dtype=torch.float32),
+        "heading": torch.zeros(0, 16, dtype=torch.float32),
+        "light_type": torch.zeros(0, dtype=torch.long),
+    }
+    signal = build_mdg_traffic_signal_features(mdg_map, lights)
+
+    torch.testing.assert_close(signal["position"], torch.tensor([[1.5, 2.5], [3.5, 4.5]]))
+    assert signal["state"].tolist() == [2, 3]
+    assert signal["valid"].tolist() == [True, True]
+
+
+def test_mdg_map_cache_preserves_detailed_polyline_types() -> None:
+    map_data = {
+        "map_polygon": {
+            "type": torch.tensor([0, 1], dtype=torch.uint8),
+            "light_type": torch.tensor([0, 0], dtype=torch.uint8),
+        },
+        "map_point": {
+            "position": torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [0.0, 1.0],
+                    [1.0, 1.0],
+                ],
+                dtype=torch.float32,
+            ),
+            "type": torch.tensor([3, 3, 8, 8], dtype=torch.uint8),
+        },
+        ("map_point", "to", "map_polygon"): {
+            "edge_index": torch.tensor([[0, 1, 2, 3], [0, 0, 1, 1]], dtype=torch.long),
+        },
+    }
+
+    mdg_map = build_mdg_map_features(map_data, num_waypoints=16)
+
+    assert mdg_map["type"].tolist() == [3, 8]
+
+
+def test_mdg_active_submission_requires_waymo_rollout_count() -> None:
+    expected = submission_specs.get_submission_config(
+        submission_specs.ChallengeType.SIM_AGENTS
+    ).n_rollouts
+
+    MDG._check_sim_agents_submission_rollout_count(False, 1)
+    MDG._check_sim_agents_submission_rollout_count(True, expected)
+
+    try:
+        MDG._check_sim_agents_submission_rollout_count(True, expected - 1)
+    except ValueError as exc:
+        assert f"n_rollout_closed_val={expected}" in str(exc)
+    else:
+        raise AssertionError("active submission accepted an invalid rollout count")
