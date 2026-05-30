@@ -19,4 +19,5 @@ from src.smart.utils.rollout import (
     transform_to_global,
     transform_to_local,
 )
+from src.smart.utils.split_and_merge import merge_by_type, split_by_type
 from src.smart.utils.weight_init import weight_init

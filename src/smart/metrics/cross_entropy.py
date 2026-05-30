@@ -18,7 +18,12 @@ from torch import Tensor, tensor
 from torch.nn.functional import cross_entropy
 from torchmetrics.metric import Metric
 
-from .utils import get_euclidean_targets, get_prob_targets
+from .utils import (
+    get_euclidean_targets,
+    get_prob_targets,
+    get_prob_targets_from_index,
+)
+from src.smart.utils import merge_by_type, split_by_type
 
 
 class CrossEntropy(Metric):
@@ -33,19 +38,21 @@ class CrossEntropy(Metric):
         gt_thresh_scale_length: float,  # {"veh": 4.8, "cyc": 2.0, "ped": 1.0}
         label_smoothing: float,
         rollout_as_gt: bool,
+        spatial_aware_smoothing: bool = False,
     ) -> None:
         super().__init__()
         self.use_gt_raw = use_gt_raw
         self.gt_thresh_scale_length = gt_thresh_scale_length
         self.label_smoothing = label_smoothing
         self.rollout_as_gt = rollout_as_gt
+        self.spatial_aware_smoothing = spatial_aware_smoothing
         self.add_state("loss_sum", default=tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=tensor(0.0), dist_reduce_fx="sum")
 
     def update(
         self,
         # ! action that goes from [(10->15), ..., (85->90)]
-        next_token_logits: Tensor,  # [n_agent, 16, n_token]
+        next_token_logits: Tensor | dict[str, Tensor],  # [n_agent, 16, n_token] or type -> logits
         next_token_valid: Tensor,  # [n_agent, 16]
         # ! for step {5, 10, ..., 90} and act [(0->5), (5->10), ..., (85->90)]
         pred_pos: Tensor,  # [n_agent, 18, 2]
@@ -66,47 +73,106 @@ class CrossEntropy(Metric):
         train_mask: Optional[Tensor] = None,  # [n_agent]
         # ! for rollout_as_gt
         next_token_action: Optional[Tensor] = None,  # [n_agent, 16, 3]
+        gt_idx: Optional[Tensor] = None,  # [n_agent, 16]
+        gt_valid_mask: Optional[Tensor] = None,  # [n_agent, 16]
+        type_mask: Optional[dict[str, Tensor]] = None,
+        pred_idx: Optional[Tensor] = None,
         **kwargs,
     ) -> None:
-        # ! use raw or tokenized GT
-        if self.use_gt_raw:
-            gt_pos = gt_pos_raw
-            gt_head = gt_head_raw
-            gt_valid = gt_valid_raw
-
-        # ! GT is valid if it's close to the rollout.
-        if self.gt_thresh_scale_length > 0:
-            dist = torch.norm(pred_pos - gt_pos, dim=-1)  # [n_agent, n_step]
-            _thresh = token_agent_shape[:, 1] * self.gt_thresh_scale_length  # [n_agent]
-            gt_valid = gt_valid & (dist < _thresh.unsqueeze(1))  # [n_agent, n_step]
-
-        # ! get prob_targets
-        euclidean_target, euclidean_target_valid = get_euclidean_targets(
-            pred_pos=pred_pos,
-            pred_head=pred_head,
-            pred_valid=pred_valid,
-            gt_pos=gt_pos,
-            gt_head=gt_head,
-            gt_valid=gt_valid,
+        use_direct_gt_idx = (
+            gt_idx is not None
+            and gt_valid_mask is not None
+            and pred_idx is None
+            and not self.rollout_as_gt
         )
-        if self.rollout_as_gt and (next_token_action is not None):
-            euclidean_target = next_token_action
 
-        prob_target = get_prob_targets(
-            target=euclidean_target,  # [n_agent, n_step, 3] x,y,yaw in local
-            token_agent_shape=token_agent_shape,  # [n_agent, 2]
-            token_traj=token_traj,  # [n_agent, n_token, 4, 2]
-        )  # [n_agent, n_step, n_token] prob, last dim sum up to 1
+        if use_direct_gt_idx:
+            target_valid = gt_valid_mask
+        else:
+            # ! use raw or tokenized GT
+            if self.use_gt_raw:
+                gt_pos = gt_pos_raw
+                gt_head = gt_head_raw
+                gt_valid = gt_valid_raw
 
-        loss = cross_entropy(
-            next_token_logits.transpose(1, 2),  # [n_agent, n_token, n_step], logits
-            prob_target.transpose(1, 2),  # [n_agent, n_token, n_step], prob
-            reduction="none",
-            label_smoothing=self.label_smoothing,
-        )  # [n_agent, n_step=16]
+            # ! GT is valid if it's close to the rollout.
+            if self.gt_thresh_scale_length > 0:
+                dist = torch.norm(pred_pos - gt_pos, dim=-1)  # [n_agent, n_step]
+                _thresh = token_agent_shape[:, 1] * self.gt_thresh_scale_length
+                gt_valid = gt_valid & (dist < _thresh.unsqueeze(1))
+
+            euclidean_target, target_valid = get_euclidean_targets(
+                pred_pos=pred_pos,
+                pred_head=pred_head,
+                pred_valid=pred_valid,
+                gt_pos=gt_pos,
+                gt_head=gt_head,
+                gt_valid=gt_valid,
+            )
+            if self.rollout_as_gt and (next_token_action is not None):
+                euclidean_target = next_token_action
+
+        if isinstance(next_token_logits, dict):
+            if type_mask is None:
+                raise ValueError("type_mask is required for type-specific token logits.")
+            loss_by_type = {}
+            gt_idx_by_type = split_by_type(gt_idx, type_mask) if use_direct_gt_idx else None
+            target_by_type = (
+                split_by_type(euclidean_target, type_mask)
+                if not use_direct_gt_idx
+                else None
+            )
+            token_agent_shape_by_type = split_by_type(token_agent_shape, type_mask)
+            for agent_type, mask in type_mask.items():
+                if not bool(mask.any()) or agent_type not in next_token_logits:
+                    continue
+                if use_direct_gt_idx:
+                    prob_target = get_prob_targets_from_index(
+                        gt_idx=gt_idx_by_type[agent_type],
+                        token_traj=token_traj[agent_type],
+                        label_smoothing=self.label_smoothing,
+                        spatial_aware_smoothing=self.spatial_aware_smoothing,
+                    )
+                else:
+                    prob_target = get_prob_targets(
+                        target=target_by_type[agent_type],
+                        token_agent_shape=token_agent_shape_by_type[agent_type],
+                        token_traj=token_traj[agent_type],
+                        label_smoothing=self.label_smoothing,
+                        spatial_aware_smoothing=self.spatial_aware_smoothing,
+                    )
+                loss_by_type[agent_type] = cross_entropy(
+                    next_token_logits[agent_type].transpose(1, 2),
+                    prob_target.transpose(1, 2),
+                    reduction="none",
+                    label_smoothing=0.0 if self.spatial_aware_smoothing else self.label_smoothing,
+                )
+            loss = merge_by_type(loss_by_type, type_mask)
+        else:
+            if use_direct_gt_idx:
+                prob_target = get_prob_targets_from_index(
+                    gt_idx=gt_idx,
+                    token_traj=token_traj,
+                    label_smoothing=self.label_smoothing,
+                    spatial_aware_smoothing=self.spatial_aware_smoothing,
+                )
+            else:
+                prob_target = get_prob_targets(
+                    target=euclidean_target,
+                    token_agent_shape=token_agent_shape,
+                    token_traj=token_traj,
+                    label_smoothing=self.label_smoothing,
+                    spatial_aware_smoothing=self.spatial_aware_smoothing,
+                )
+            loss = cross_entropy(
+                next_token_logits.transpose(1, 2),
+                prob_target.transpose(1, 2),
+                reduction="none",
+                label_smoothing=0.0 if self.spatial_aware_smoothing else self.label_smoothing,
+            )
 
         # ! weighting final loss [n_agent, n_step]
-        loss_weighting_mask = next_token_valid & euclidean_target_valid
+        loss_weighting_mask = next_token_valid & target_valid
         if self.training and train_mask is not None:
             loss_weighting_mask &= train_mask.unsqueeze(1)  # [n_agent, n_step]
 

@@ -10,7 +10,7 @@ from src.smart.utils import transform_to_local
 def _make_processor() -> TokenProcessor:
     processor = TokenProcessor(
         map_token_file="map_traj_token5.pkl",
-        agent_token_file="agent_vocab_555_s2.pkl",
+        agent_token_file="trajtok_vocab.pkl",
     )
     processor.train()
     return processor

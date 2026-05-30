@@ -12,6 +12,7 @@ from src.smart.datamodules.target_builder import (
     WaymoTargetBuilderVal,
 )
 from src.smart.metrics.cross_entropy import CrossEntropy
+from src.smart.metrics.utils import get_prob_targets_from_index
 
 
 def test_target_builders_implement_basetransform_forward() -> None:
@@ -163,3 +164,20 @@ def test_cross_entropy_none_train_mask_matches_all_true_mask() -> None:
 
     torch.testing.assert_close(none_mask_metric.loss_sum, all_true_metric.loss_sum)
     torch.testing.assert_close(none_mask_metric.count, all_true_metric.count)
+
+
+def test_spatial_aware_smoothing_weights_nearby_tokens_more_than_far_tokens() -> None:
+    token_traj = torch.zeros(1, 3, 4, 2)
+    token_traj[:, 1, :, 0] = 1.0
+    token_traj[:, 2, :, 0] = 10.0
+
+    prob_target = get_prob_targets_from_index(
+        gt_idx=torch.tensor([[0]]),
+        token_traj=token_traj,
+        label_smoothing=0.2,
+        spatial_aware_smoothing=True,
+    )
+
+    torch.testing.assert_close(prob_target.sum(dim=-1), torch.ones(1, 1))
+    assert prob_target[0, 0, 0] == torch.tensor(0.8)
+    assert prob_target[0, 0, 1] > prob_target[0, 0, 2]

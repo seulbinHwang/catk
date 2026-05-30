@@ -39,7 +39,7 @@ class SMARTDecoder(nn.Module):
         head_dim: int,
         dropout: float,
         hist_drop_prob: float,
-        n_token_agent: int,
+        n_token_agent: int | Dict[str, int],
     ) -> None:
         super(SMARTDecoder, self).__init__()
         self.map_encoder = SMARTMapDecoder(

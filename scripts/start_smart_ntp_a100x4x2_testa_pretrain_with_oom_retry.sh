@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch SMART NTP A100x4x2 pretrain on existing testa/testaa pods with
+# Launch SMART NTP pretrain on existing x4 GPU pods with
 # automatic CUDA OOM fallback.
 #
 # The first attempt starts at INITIAL_BS=16 by default. If any pod log contains
@@ -8,7 +8,8 @@
 # OOM_STEP=1, and starts the next attempt from that checkpoint.
 #
 # This script runs on the local machine with kubectl access. It never creates,
-# deletes, or restarts pods.
+# deletes, or restarts pods. Defaults target the historical testa/testaa x4x2
+# recipe, but PODS can contain any positive number of x4 GPU pods.
 
 set -uo pipefail
 
@@ -46,8 +47,8 @@ EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
 read -r -a POD_ARRAY <<< "$PODS"
-if (( ${#POD_ARRAY[@]} != 2 )); then
-  echo "ERROR: PODS must contain exactly two x4 GPU pod names." >&2
+if (( ${#POD_ARRAY[@]} < 1 )); then
+  echo "ERROR: PODS must contain at least one x4 GPU pod name." >&2
   exit 2
 fi
 MASTER_POD="${POD_ARRAY[0]}"

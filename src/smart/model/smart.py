@@ -35,6 +35,7 @@ from src.smart.metrics import (
 )
 from src.smart.modules.smart_decoder import SMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
+from src.smart.utils import split_by_type
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
@@ -419,9 +420,19 @@ class SMART(LightningModule):
         if repeat_count == 1:
             return tokenized_agent
 
-        return {
+        expanded_type = self._repeat_tensor_on_first_dim(
+            tokenized_agent["type"], repeat_count
+        )
+        expanded_type_mask = {
+            "veh": expanded_type == 0,
+            "ped": expanded_type == 1,
+            "cyc": expanded_type == 2,
+        }
+
+        expanded = {
             "num_graphs": int(num_graphs) * repeat_count,
-            "type": self._repeat_tensor_on_first_dim(tokenized_agent["type"], repeat_count),
+            "type": expanded_type,
+            "type_mask": expanded_type_mask,
             "shape": self._repeat_tensor_on_first_dim(tokenized_agent["shape"], repeat_count),
             "token_agent_shape": self._repeat_tensor_on_first_dim(
                 tokenized_agent["token_agent_shape"],
@@ -432,17 +443,18 @@ class SMART(LightningModule):
                 repeat_count=repeat_count,
                 num_graphs=num_graphs,
             ),
-            "token_traj_all": self._repeat_tensor_on_first_dim(
-                tokenized_agent["token_traj_all"],
-                repeat_count,
-            ),
-            "token_traj": self._repeat_tensor_on_first_dim(
-                tokenized_agent["token_traj"],
-                repeat_count,
-            ),
+            "token_traj_all": {
+                agent_type: self._repeat_tensor_on_first_dim(value, repeat_count)
+                for agent_type, value in tokenized_agent["token_traj_all"].items()
+            },
+            "token_traj": {
+                agent_type: self._repeat_tensor_on_first_dim(value, repeat_count)
+                for agent_type, value in tokenized_agent["token_traj"].items()
+            },
             "trajectory_token_veh": tokenized_agent["trajectory_token_veh"],
             "trajectory_token_ped": tokenized_agent["trajectory_token_ped"],
             "trajectory_token_cyc": tokenized_agent["trajectory_token_cyc"],
+            "token_heading": tokenized_agent["token_heading"],
             "gt_pos_raw": self._repeat_tensor_on_first_dim(
                 tokenized_agent["gt_pos_raw"],
                 repeat_count,
@@ -470,6 +482,7 @@ class SMART(LightningModule):
                 repeat_count,
             ),
         }
+        return expanded
 
     @staticmethod
     def _reshape_parallel_rollout_prediction(
@@ -656,13 +669,34 @@ class SMART(LightningModule):
                 token_traj=tokenized_agent["token_traj"],  # [n_agent, n_token, 4, 2]
             )
 
-            self.TokenCls.update(
-                # action that goes from [(10->15), ..., (85->90)]
-                pred=pred["next_token_logits"],  # [n_agent, 16, n_token]
-                pred_valid=pred["next_token_valid"],  # [n_agent, 16]
-                target=tokenized_agent["gt_idx"][:, 2:],
-                target_valid=tokenized_agent["valid_mask"][:, 2:],
-            )
+            if isinstance(pred["next_token_logits"], dict):
+                pred_valid_by_type = split_by_type(
+                    pred["next_token_valid"], tokenized_agent["type_mask"]
+                )
+                target_by_type = split_by_type(
+                    tokenized_agent["gt_idx"][:, 2:], tokenized_agent["type_mask"]
+                )
+                target_valid_by_type = split_by_type(
+                    tokenized_agent["valid_mask"][:, 2:],
+                    tokenized_agent["type_mask"],
+                )
+                for agent_type, logits in pred["next_token_logits"].items():
+                    if logits.numel() == 0:
+                        continue
+                    self.TokenCls.update(
+                        pred=logits,
+                        pred_valid=pred_valid_by_type[agent_type],
+                        target=target_by_type[agent_type],
+                        target_valid=target_valid_by_type[agent_type],
+                    )
+            else:
+                self.TokenCls.update(
+                    # action that goes from [(10->15), ..., (85->90)]
+                    pred=pred["next_token_logits"],  # [n_agent, 16, n_token]
+                    pred_valid=pred["next_token_valid"],  # [n_agent, 16]
+                    target=tokenized_agent["gt_idx"][:, 2:],
+                    target_valid=tokenized_agent["valid_mask"][:, 2:],
+                )
             self.log(
                 "val_open/acc",
                 self.TokenCls,

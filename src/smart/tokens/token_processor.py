@@ -25,6 +25,7 @@ from src.smart.tokens.agent_token_matching import (
 )
 from src.smart.utils import (
     cal_polygon_contour,
+    merge_by_type,
     transform_to_global,
     transform_to_local,
     wrap_angle,
@@ -58,7 +59,16 @@ class TokenProcessor(torch.nn.Module):
         module_dir = os.path.dirname(__file__)
         self.init_agent_token(os.path.join(module_dir, agent_token_file))
         self.init_map_token(os.path.join(module_dir, map_token_file))
-        self.n_token_agent = self.agent_token_all_veh.shape[0]
+        self.n_token_agent = {
+            "veh": self.agent_token_all_veh.shape[0],
+            "ped": self.agent_token_all_ped.shape[0],
+            "cyc": self.agent_token_all_cyc.shape[0],
+        }
+        self.register_buffer(
+            "token_heading",
+            torch.arange(-179, 180, dtype=torch.float32) / 180 * torch.pi,
+            persistent=False,
+        )
 
     @torch.no_grad()
     def forward(self, data: HeteroData) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
@@ -155,12 +165,15 @@ class TokenProcessor(torch.nn.Module):
         tokenized_agent = {
             "num_graphs": data.num_graphs,
             "type": data["agent"]["type"],
+            "type_mask": build_agent_type_masks(data["agent"]["type"]),
             "shape": data["agent"]["shape"],
             "ego_mask": data["agent"]["role"][:, 0],  # [n_agent]
+            "role_mask": data["agent"]["role"].any(-1),  # [n_agent]
             "token_agent_shape": agent_shape,  # [n_agent, 2]
             "batch": data["agent"]["batch"],
-            "token_traj_all": token_traj_all,  # [n_agent, n_token, 6, 4, 2]
-            "token_traj": token_traj,  # [n_agent, n_token, 4, 2]
+            "token_traj_all": token_traj_all,  # type -> [n_agent_type, n_token_type, 6, 4, 2]
+            "token_heading": self.token_heading.to(pos.device),
+            "token_traj": token_traj,  # type -> [n_agent_type, n_token_type, 4, 2]
             # for step {5, 10, ..., 90}
             "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, n_step=18, 2]
             "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, n_step=18]
@@ -177,14 +190,27 @@ class TokenProcessor(torch.nn.Module):
             # [n_agent]
             tokenized_agent["gt_z_raw"] = data["agent"]["position"][:, 10, 2]
 
-        token_dict = self._match_agent_token(
-            valid=valid,
-            pos=pos,
-            heading=heading,
-            agent_shape=agent_shape,
-            token_traj=token_traj,
-        )
-        tokenized_agent.update(token_dict)
+        token_dict_by_type = {}
+        for agent_type, type_mask in tokenized_agent["type_mask"].items():
+            token_dict_by_type[agent_type] = self._match_agent_token(
+                valid=valid[type_mask],
+                pos=pos[type_mask],
+                heading=heading[type_mask],
+                agent_shape=agent_shape[type_mask],
+                token_traj=token_traj[agent_type],
+            )
+
+        for key in ("valid_mask", "token_idx", "tokenized_pos", "tokenized_heading"):
+            tokenized_agent[key] = merge_by_type(
+                {agent_type: data[key] for agent_type, data in token_dict_by_type.items()},
+                tokenized_agent["type_mask"],
+            )
+        tokenized_agent["gt_idx"] = tokenized_agent["token_idx"]
+        tokenized_agent["gt_pos"] = tokenized_agent["tokenized_pos"]
+        tokenized_agent["gt_heading"] = tokenized_agent["tokenized_heading"]
+        tokenized_agent["sampled_idx"] = tokenized_agent["token_idx"]
+        tokenized_agent["sampled_pos"] = tokenized_agent["tokenized_pos"]
+        tokenized_agent["sampled_heading"] = tokenized_agent["tokenized_heading"]
         return tokenized_agent
 
     def _match_agent_token(
@@ -216,12 +242,9 @@ class TokenProcessor(torch.nn.Module):
 
         out_dict = {
             "valid_mask": [],
-            "gt_idx": [],
-            "gt_pos": [],
-            "gt_heading": [],
-            "sampled_idx": [],
-            "sampled_pos": [],
-            "sampled_heading": [],
+            "token_idx": [],
+            "tokenized_pos": [],
+            "tokenized_heading": [],
         }
 
         for i in range(self.shift, n_step, self.shift):  # [5, 10, 15, ..., 90]
@@ -261,18 +284,11 @@ class TokenProcessor(torch.nn.Module):
             prev_pos = pos[:, i].clone()
             prev_pos[_valid_mask] = token_pos_gt[_valid_mask]
             # add to output dict
-            out_dict["gt_idx"].append(token_idx_gt)
-            out_dict["gt_pos"].append(
+            out_dict["token_idx"].append(token_idx_gt)
+            out_dict["tokenized_pos"].append(
                 prev_pos.masked_fill(_invalid_mask.unsqueeze(1), 0)
             )
-            out_dict["gt_heading"].append(prev_head.masked_fill(_invalid_mask, 0))
-
-            # The historical default used num_k=1, so the sampled rollout state was
-            # exactly the nearest-token teacher-forced state. Keep that behavior as
-            # the only tokenization path.
-            out_dict["sampled_idx"].append(out_dict["gt_idx"][-1])
-            out_dict["sampled_pos"].append(out_dict["gt_pos"][-1])
-            out_dict["sampled_heading"].append(out_dict["gt_heading"][-1])
+            out_dict["tokenized_heading"].append(prev_head.masked_fill(_invalid_mask, 0))
         out_dict = {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
         return out_dict
 
@@ -371,8 +387,9 @@ class TokenProcessor(torch.nn.Module):
         token_traj: [n_agent, n_token, 4, 2]
         """
         agent_type_masks = build_agent_type_masks(agent_type)
-        agent_shape = 0.0
-        token_traj_all = 0.0
+        agent_shape = torch.zeros(len(agent_type), 2, dtype=torch.float32, device=agent_type.device)
+        token_traj_all = {}
+        token_traj = {}
         for k, mask in agent_type_masks.items():
             if k == "veh":
                 width = 2.0
@@ -383,11 +400,9 @@ class TokenProcessor(torch.nn.Module):
             else:
                 width = 1.0
                 length = 1.0
-            agent_shape += torch.stack([width * mask, length * mask], dim=-1)
-
-            token_traj_all += mask[:, None, None, None, None] * (
-                getattr(self, f"agent_token_all_{k}").unsqueeze(0)
+            agent_shape[mask] = torch.tensor([width, length], dtype=agent_shape.dtype, device=agent_shape.device)
+            token_traj_all[k] = getattr(self, f"agent_token_all_{k}").unsqueeze(0).repeat(
+                int(mask.sum().item()), 1, 1, 1, 1
             )
-
-        token_traj = token_traj_all[:, :, -1, :, :].contiguous()
+            token_traj[k] = token_traj_all[k][:, :, -1, :, :].contiguous()
         return agent_shape, token_traj_all, token_traj
