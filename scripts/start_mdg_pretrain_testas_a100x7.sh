@@ -37,6 +37,8 @@ TASK_NAME="${TASK_NAME:-mdg_wosac_pretrain_testas_a100x7_bs${TRAIN_BATCH_SIZE}}"
 CATK_AUTO_RESUME="${CATK_AUTO_RESUME:-false}"
 CATK_RESUME_TASK_NAME="${CATK_RESUME_TASK_NAME:-}"
 CATK_RESUME_CHECKPOINT_NAME="${CATK_RESUME_CHECKPOINT_NAME:-epoch_last.ckpt}"
+CATK_RESUME_REQUIRE_CHECKPOINT="${CATK_RESUME_REQUIRE_CHECKPOINT:-true}"
+CATK_HYDRA_OVERRIDES="${CATK_HYDRA_OVERRIDES:-}"
 
 remote_quote() {
   printf '%q' "$1"
@@ -95,6 +97,8 @@ export TASK_NAME=$(remote_quote "$TASK_NAME")
 export CATK_AUTO_RESUME=$(remote_quote "$CATK_AUTO_RESUME")
 export CATK_RESUME_TASK_NAME=$(remote_quote "$CATK_RESUME_TASK_NAME")
 export CATK_RESUME_CHECKPOINT_NAME=$(remote_quote "$CATK_RESUME_CHECKPOINT_NAME")
+export CATK_RESUME_REQUIRE_CHECKPOINT=$(remote_quote "$CATK_RESUME_REQUIRE_CHECKPOINT")
+export CATK_HYDRA_OVERRIDES=$(remote_quote "$CATK_HYDRA_OVERRIDES")
 echo '[pretrain-start]' \$(date '+%F %T') task=$(remote_quote "$TASK_NAME") train_bs=$(remote_quote "$TRAIN_BATCH_SIZE") cache=$(remote_quote "$CACHE_ROOT") | tee -a $(remote_quote "$log_file")
 bash scripts/mdg_pretrain_a100x7.sh 2>&1 | tee -a $(remote_quote "$log_file")
 status=\${PIPESTATUS[0]}

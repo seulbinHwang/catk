@@ -269,6 +269,22 @@ bash scripts/start_mdg_pretrain_testas_a100x7.sh
 
 기본값은 A100 7장 단일 pod, `bf16-mixed`, per-GPU `train_batch_size=32`, global batch `224`, `max_epochs=64`이다. checkpoint monitor는 기존 pretrain과 동일하게 closed-loop metric `val_closed/sim_agents_2025/realism_meta_metric`을 `max` 기준으로 사용한다. 학습 중 validation 기본값은 `VAL_BATCH_SIZE=12`, `LIMIT_VAL_BATCHES=0.1`, `SCORER_SCENE_NUM=1680`, `N_BATCH_SIM_AGENTS_METRIC=10`이다. `SCORER_SCENE_NUM`이 양수이면 코드가 `N_BATCH_SIM_AGENTS_METRIC`을 런타임에 덮어쓴다. A100 7장에서는 `ceil(ceil(1680 / 7) / 12) = 20`이므로 rank마다 20 validation batch까지 Fast WOSAC scorer를 업데이트한다.
 
+CUDA OOM이 나면 자동으로 batch size를 낮춰 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`에서 resume하려면 OOM retry wrapper를 쓴다. 기본값은 `INITIAL_BS=32`, `OOM_STEP=2`, `MIN_BS=24`이며, OOM이 아닌 외부 종료 코드 `134,143`은 batch size를 유지하고 최대 2회 재시도한다.
+
+```bash
+cd /media/user/E/projects/catk
+git checkout MDG
+git pull --ff-only
+
+INITIAL_BS=32 \
+OOM_STEP=2 \
+MIN_BS=24 \
+TASK_NAME=mdg_wosac_pretrain_testas_a100x7_oom_retry_bs32 \
+bash scripts/start_mdg_pretrain_testas_a100x7_with_oom_retry.sh
+```
+
+이 wrapper는 testas pod를 새로 만들거나 재시작하지 않는다. 각 attempt마다 testas 내부 tmux session `mdg-pretrain-a100x7-oom-retry`를 교체하고, 로그에서 `OutOfMemoryError`, `CUDA out of memory`, `torch.OutOfMemoryError` 등을 감지하면 세션을 멈춘 뒤 `train_batch_size -= OOM_STEP`로 다시 시작한다. retry 로그는 로컬 repo의 `logs/_mdg_testas_a100x7_oom_retry/<TASK_NAME>/attempt_*.log`와 testas 내부 `${PROJECT_ROOT}/logs/testas_mdg_pretrain_a100x7_oom_retry/`에 남는다.
+
 MDG의 multi-step closed-loop denoising은 full-noise mask에서 시작해 clean mask로 내려가는 schedule을 쓴다. 현재 구현은 5-level discrete mask embedding을 사용하므로 `closed_loop_denoising_steps`를 `1..5` 범위로 제한한다. 기본값 `closed_loop_denoising_steps=5`, `num_noise_levels=5`에서는 `[4, 3, 2, 1, 0]` schedule로 모든 discrete noise level을 한 번씩 사용한다. 각 intermediate step은 모델의 clean action estimate를 다음 mask level로 다시 noising한 뒤 다음 denoising call에 넣는다. 논문 WOSAC leaderboard 설정은 one-step closed-loop denoising이므로 strict 재현을 원하면 `closed_loop_denoising_steps=1`로 실행한다.
 
 이 launcher는 기본적으로 `TRAIN_MEMORY_BALANCED_BATCHING=true`를 켠다. 이 기능은 `semi_control_stable`의 memory-balanced batching 개념을 MDG dataloader에 맞춘 것으로, training cache의 agent 수, 현재 valid agent 수, valid agent step 수, map 수 metadata를 만든 뒤 무거운 scene이 한 rank-local batch에 몰리지 않도록 batch sampler가 sample 순서를 재배치한다. metadata cache 기본 위치는 `${CACHE_ROOT}/.catk_metadata/training_mdg_memory_balance_v1.pt`이고, 첫 실행 때만 생성된다.
@@ -297,6 +313,13 @@ training split `486,995`개 기준 step 수는 `ceil(486995 / 224) = 2,175` step
 kubectl exec -it -n p-pnc testas -c main -- tmux attach -t mdg-pretrain-a100x7
 kubectl exec -n p-pnc testas -c main -- bash -lc \
   'tail -f /mnt/nuplan/projects/catk/logs/testas_mdg_pretrain_a100x7/*.log'
+```
+
+OOM retry wrapper로 띄운 run은 session/log path가 다르다.
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- tmux attach -t mdg-pretrain-a100x7-oom-retry
+tail -f logs/_mdg_testas_a100x7_oom_retry/<TASK_NAME>/attempt_*.log
 ```
 
 임시 throughput 디버깅 용도로만 closed-loop checkpoint를 끄려면 아래처럼 실행할 수 있다. 정식 pretrain에서는 사용하지 않는다.
