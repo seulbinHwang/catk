@@ -256,6 +256,8 @@ EXTRA_HYDRA_OVERRIDES='model.model_config.val_open_loop=false model.model_config
 
 retry wrapper의 로컬 로그는 `logs/_unimm_h100x3x2_oom_retry/<TASK_NAME>/attempt_*.log`에 저장되고, 원격 tmux 로그는 `/mnt/nuplan/projects/catk/logs/tmux_unimm_h100x3x2/<TASK_NAME>/`에 저장된다.
 
+H100 x3x2 launcher는 `--ckpt-path`가 지정되면 기본적으로 master pod의 checkpoint를 `/tmp/unimm_h100x3x2_synced_ckpts/<TASK_NAME>/` 아래로 복사하고, 같은 파일을 모든 pod의 동일 경로에 동기화한 뒤 그 경로를 Hydra `ckpt_path`로 넘긴다. 따라서 `validate`, `test`, OOM retry resume처럼 모든 rank가 checkpoint를 직접 읽어야 하는 실행에서도 rank0 pod에만 checkpoint가 있어서 worker rank가 깨지는 문제를 피한다. 정말 모든 pod가 같은 shared filesystem path를 보고 있다는 것이 확실할 때만 `--no-sync-ckpt`를 사용한다.
+
 중단:
 
 ```bash
@@ -267,23 +269,21 @@ python scripts/launch_unimm_h100x3x2.py --stop
 validation은 기본적으로 open-loop loss와 closed-loop WOSAC metric을 모두 계산한다.
 
 ```bash
-CACHE_ROOT=/path/to/SMART_cache \
-  bash scripts/train_unimm_anchor_based_4s.sh \
-  action=validate \
-  ckpt_path=/path/to/checkpoint.ckpt
+python scripts/launch_unimm_h100x3x2.py \
+  --action validate \
+  --ckpt-path /path/to/checkpoint.ckpt \
+  --val-batch-size 12 \
+  --replace
 ```
 
 submission 파일을 만들 때는 `sim_agents_submission.is_active=true`로 켜고, Waymo 요구 rollout 수와 metadata를 맞춘다.
 
 ```bash
-CACHE_ROOT=/path/to/SMART_cache \
-  bash scripts/train_unimm_anchor_based_4s.sh \
-  action=test \
-  ckpt_path=/path/to/checkpoint.ckpt \
-  model.model_config.sim_agents_submission.is_active=true \
-  model.model_config.sim_agents_submission.authors='[Your Name]' \
-  model.model_config.sim_agents_submission.affiliation='Your Affiliation' \
-  model.model_config.sim_agents_submission.account_name='Your Account'
+python scripts/launch_unimm_h100x3x2.py \
+  --action test \
+  --ckpt-path /path/to/checkpoint.ckpt \
+  --extra-hydra-overrides "model.model_config.sim_agents_submission.is_active=true model.model_config.sim_agents_submission.authors='[Your Name]' model.model_config.sim_agents_submission.affiliation='Your Affiliation' model.model_config.sim_agents_submission.account_name='Your Account'" \
+  --replace
 ```
 
 ## 구현상 해석

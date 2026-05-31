@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import os
+import posixpath
 import shlex
 import subprocess
 import sys
+import tempfile
 
 
 DEFAULT_NAMESPACE = "p-pnc"
@@ -48,6 +51,13 @@ def run_kubectl(args: list[str], *, capture: bool = False) -> str:
         stdout=subprocess.PIPE if capture else None,
     )
     return result.stdout.strip() if capture else ""
+
+
+def exec_capture_in_pod(namespace: str, container: str, pod: str, script: str) -> str:
+    return run_kubectl(
+        ["exec", "-n", namespace, pod, "-c", container, "--", "bash", "-lc", script],
+        capture=True,
+    )
 
 
 def pod_ip(namespace: str, pod: str) -> str:
@@ -89,6 +99,144 @@ def exec_in_pod(
         print("kubectl " + " ".join(shq(part) for part in cmd))
         return
     run_kubectl(cmd)
+
+
+def safe_remote_name(value: str) -> str:
+    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=6).hexdigest()
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+    safe = safe.strip("._-") or "task"
+    return f"{safe[:80]}_{digest}"
+
+
+def checkpoint_sync_path(args: argparse.Namespace) -> str:
+    basename = posixpath.basename(args.ckpt_path.rstrip("/")) or "checkpoint.ckpt"
+    return posixpath.join(
+        "/tmp/unimm_h100x3x2_synced_ckpts",
+        safe_remote_name(args.task_name),
+        basename,
+    )
+
+
+def remote_sha256(namespace: str, container: str, pod: str, path: str) -> str:
+    return exec_capture_in_pod(
+        namespace,
+        container,
+        pod,
+        f"sha256sum {shq(path)} | awk '{{print $1}}'",
+    ).strip()
+
+
+def copy_file_between_pods(
+    namespace: str,
+    container: str,
+    src_pod: str,
+    dst_pod: str,
+    src_path: str,
+    dst_path: str,
+) -> None:
+    dst_dir = posixpath.dirname(dst_path) or "."
+    local_name = posixpath.basename(dst_path.rstrip("/")) or "checkpoint.ckpt"
+    with tempfile.TemporaryDirectory(prefix="unimm_ckpt_sync_") as tmp_dir:
+        local_path = os.path.join(tmp_dir, local_name)
+        subprocess.run(
+            [
+                KUBECTL_BIN,
+                "cp",
+                "-n",
+                namespace,
+                "-c",
+                container,
+                f"{src_pod}:{src_path}",
+                local_path,
+            ],
+            check=True,
+        )
+        exec_in_pod(
+            namespace,
+            container,
+            dst_pod,
+            f"mkdir -p {shq(dst_dir)}",
+            dry_run=False,
+        )
+        subprocess.run(
+            [
+                KUBECTL_BIN,
+                "cp",
+                "-n",
+                namespace,
+                "-c",
+                container,
+                local_path,
+                f"{dst_pod}:{dst_path}",
+            ],
+            check=True,
+        )
+
+
+def sync_checkpoint_to_pods(args: argparse.Namespace) -> None:
+    if not args.ckpt_path or args.no_sync_ckpt:
+        return
+
+    source_pod = args.pods[0]
+    original_path = args.ckpt_path
+    synced_path = checkpoint_sync_path(args)
+    sync_dir = posixpath.dirname(synced_path) or "."
+    if args.dry_run:
+        print(
+            "[launcher] dry-run checkpoint sync: "
+            f"{source_pod}:{original_path} -> all pods:{synced_path}",
+            flush=True,
+        )
+        args.ckpt_path = synced_path
+        return
+
+    print(
+        "[launcher] syncing checkpoint for multi-node access: "
+        f"{source_pod}:{original_path} -> {synced_path}",
+        flush=True,
+    )
+    master_script = f"""
+set -Eeuo pipefail
+src={shq(original_path)}
+dst={shq(synced_path)}
+if [ ! -f "$src" ]; then
+  echo "[launcher] checkpoint not found on source pod {source_pod}: $src" >&2
+  exit 2
+fi
+mkdir -p {shq(sync_dir)}
+if [ "$(readlink -f "$src")" != "$(readlink -f "$dst" 2>/dev/null || true)" ]; then
+  cp -f --dereference "$src" "$dst"
+fi
+sha256sum "$dst" | awk '{{print $1}}'
+"""
+    source_sha = exec_capture_in_pod(
+        args.namespace,
+        args.container,
+        source_pod,
+        master_script,
+    ).strip().splitlines()[-1]
+    if not source_sha:
+        raise RuntimeError(f"failed to compute checkpoint sha256 on {source_pod}:{synced_path}")
+
+    for pod in args.pods[1:]:
+        print(f"[launcher] copying checkpoint to {pod}:{synced_path}", flush=True)
+        copy_file_between_pods(
+            args.namespace,
+            args.container,
+            source_pod,
+            pod,
+            synced_path,
+            synced_path,
+        )
+        pod_sha = remote_sha256(args.namespace, args.container, pod, synced_path)
+        if pod_sha != source_sha:
+            raise RuntimeError(
+                "checkpoint sync verification failed: "
+                f"{source_pod}:{source_sha} != {pod}:{pod_sha}"
+            )
+
+    args.ckpt_path = synced_path
+    print(f"[launcher] checkpoint sync complete: ckpt_path={args.ckpt_path}", flush=True)
 
 
 def prepare_checkout_block(args: argparse.Namespace) -> str:
@@ -326,6 +474,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-val-batches", default=os.environ.get("LIMIT_VAL_BATCHES", ""))
     parser.add_argument("--max-epochs", default=os.environ.get("MAX_EPOCHS", ""))
     parser.add_argument("--extra-hydra-overrides", default="")
+    parser.add_argument(
+        "--no-sync-ckpt",
+        action="store_true",
+        help=(
+            "Do not copy --ckpt-path into a same-path checkpoint file on every "
+            "pod. Only use this when the path is truly shared across all nodes."
+        ),
+    )
     parser.add_argument("--anchor-device", default="cuda")
     parser.add_argument("--build-anchors", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -375,9 +531,11 @@ def main() -> None:
         if gpu_counts[pod] != args.expected_gpus:
             raise RuntimeError(f"expected {args.expected_gpus} GPUs in {pod}, found {gpu_counts[pod]}")
 
-    print(f"[launcher] master pod: {args.pods[0]} ({master_addr}:{args.master_port})")
-    print(f"[launcher] task_name: {args.task_name}")
-    print(f"[launcher] anchor:    {args.anchor_file}")
+    sync_checkpoint_to_pods(args)
+
+    print(f"[launcher] master pod: {args.pods[0]} ({master_addr}:{args.master_port})", flush=True)
+    print(f"[launcher] task_name: {args.task_name}", flush=True)
+    print(f"[launcher] anchor:    {args.anchor_file}", flush=True)
     for node_rank, pod in enumerate(args.pods):
         exec_in_pod(
             args.namespace,
