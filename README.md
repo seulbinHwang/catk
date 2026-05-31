@@ -264,6 +264,7 @@ git checkout MDG
 git pull --ff-only
 
 TASK_NAME=mdg_wosac_pretrain_testas_a100x7_from_scratch_$(date +%Y%m%d_%H%M%S) \
+WANDB_MODE=online \
 TRAIN_BATCH_SIZE=32 \
 VAL_BATCH_SIZE=12 \
 DATA_NUM_WORKERS=4 \
@@ -271,7 +272,7 @@ REPLACE_SESSION=1 \
 bash scripts/start_mdg_pretrain_testas_a100x7.sh
 ```
 
-기본값은 A100 7장 단일 pod, `bf16-mixed`, per-GPU `train_batch_size=32`, global batch `224`, `max_epochs=64`이다. checkpoint monitor는 기존 pretrain과 동일하게 closed-loop metric `val_closed/sim_agents_2025/realism_meta_metric`을 `max` 기준으로 사용한다. 학습 중 validation 기본값은 `VAL_BATCH_SIZE=12`, `LIMIT_VAL_BATCHES=0.1`, `SCORER_SCENE_NUM=1680`, `N_BATCH_SIM_AGENTS_METRIC=10`이다. `SCORER_SCENE_NUM`이 양수이면 코드가 `N_BATCH_SIM_AGENTS_METRIC`을 런타임에 덮어쓴다. A100 7장에서는 `ceil(ceil(1680 / 7) / 12) = 20`이므로 rank마다 20 validation batch까지 Fast WOSAC scorer를 업데이트한다.
+기본값은 A100 7장 단일 pod, `bf16-mixed`, per-GPU `train_batch_size=32`, global batch `224`, `max_epochs=64`, `WANDB_MODE=online`이다. 따라서 testas 정식 pretrain은 W&B cloud에 실시간으로 기록된다. 네트워크가 막힌 디버깅 run만 `WANDB_MODE=offline`으로 명시한다. checkpoint monitor는 기존 pretrain과 동일하게 closed-loop metric `val_closed/sim_agents_2025/realism_meta_metric`을 `max` 기준으로 사용한다. 학습 중 validation 기본값은 `VAL_BATCH_SIZE=12`, `LIMIT_VAL_BATCHES=0.1`, `SCORER_SCENE_NUM=1680`, `N_BATCH_SIM_AGENTS_METRIC=10`이다. `SCORER_SCENE_NUM`이 양수이면 코드가 `N_BATCH_SIM_AGENTS_METRIC`을 런타임에 덮어쓴다. A100 7장에서는 `ceil(ceil(1680 / 7) / 12) = 20`이므로 rank마다 20 validation batch까지 Fast WOSAC scorer를 업데이트한다.
 
 CUDA OOM이 나면 자동으로 batch size를 낮춰 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`에서 resume하려면 OOM retry wrapper를 쓴다. 기본값은 `INITIAL_BS=32`, `OOM_STEP=2`, `MIN_BS=24`이며, OOM이 아닌 외부 종료 코드 `134,143`은 batch size를 유지하고 최대 2회 재시도한다.
 
@@ -289,6 +290,7 @@ cd /media/user/E/projects/catk &&
 INITIAL_BS=32 \
 OOM_STEP=2 \
 MIN_BS=24 \
+WANDB_MODE=online \
 TASK_NAME=$TASK_NAME \
 bash scripts/start_mdg_pretrain_testas_a100x7_with_oom_retry.sh
 "

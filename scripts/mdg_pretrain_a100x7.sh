@@ -25,7 +25,7 @@ main() {
   export LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-1.0}"
   export LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-0.1}"
   export TASK_NAME="${TASK_NAME:-mdg_wosac_pretrain_testas_a100x7_bs${TRAIN_BATCH_SIZE}}"
-  export WANDB_MODE="${WANDB_MODE:-offline}"
+  export WANDB_MODE="${WANDB_MODE:-online}"
 
   local precision="${PRECISION:-bf16-mixed}"
   local data_num_workers="${DATA_NUM_WORKERS:-4}"
@@ -70,6 +70,7 @@ main() {
   log "  val_batch_size:   $VAL_BATCH_SIZE"
   log "  max_epochs:       $MAX_EPOCHS"
   log "  precision:        $precision"
+  log "  wandb_mode:       $WANDB_MODE"
   log "  val_closed_loop:  $val_closed_loop"
   log "  scorer_scene_num: $scorer_scene_num"
   log "  checkpoint:       $checkpoint_monitor ($checkpoint_mode)"
