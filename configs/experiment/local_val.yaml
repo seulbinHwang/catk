@@ -15,7 +15,7 @@ model:
     val_open_loop: false
     val_closed_loop: true
     decoder:
-      num_freq_bands: 66
+      num_freq_bands: 88
     validation_rollout_sampling:
       criterium: topk_prob
       num_k: 64 # for k most likely
