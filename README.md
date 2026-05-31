@@ -132,6 +132,34 @@ tail -f /media/user/F/dataset/womd_v1_3/MDG_cache/logs/testing.log
 포함한 전체 cache 예상 크기는 약 180GB 전후였다. 그래서 `/media/user/F`에 수백 GB 이상
 여유가 있으면 충분하지만, 장기 실행 전에는 script의 storage check 결과를 확인한다.
 
+생성된 MDG cache를 Nubes에 업로드하려면 아래 script를 사용한다. 기본 목적지는
+`labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache`이고, 기존 실험에서 가장 빨랐던
+`-j 96`을 기본값으로 둔다.
+
+```bash
+ssh user@10.60.188.78
+cd /media/user/E/projects/catk
+git checkout MDG
+git pull --ff-only
+tmux new-window -t hsb-rl-train -n mdg-upload \
+  'bash -lc "cd /media/user/E/projects/catk && bash scripts/upload_mdg_cache_to_nubes.sh"'
+```
+
+업로드 script 기본값:
+
+| 항목 | 기본값 |
+| --- | --- |
+| local cache | `/media/user/F/dataset/womd_v1_3/MDG_cache` |
+| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache` |
+| nubes jobs | 96 |
+| Nubes gateway | `c.nubes.sto.navercorp.com:8000` |
+| expected files | 620,109 |
+
+업로드 전 local file count를 검증하고, 업로드 후 `nubescli list -R`로 remote file count가
+620,109개인지 확인한다. 이미 존재하는 파일은 `nubescli dir-upload -s` 옵션으로 skip한다.
+cache root 아래 `logs/` 같은 부가 디렉터리가 있어도 Nubes에는 `training`, `validation`,
+`testing`, `validation_tfrecords_splitted` 4개 data split만 업로드한다.
+
 기본 config는 cache root 아래 split을 다음처럼 기대한다.
 
 ```text
