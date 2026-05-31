@@ -258,10 +258,75 @@ retry wrapper의 로컬 로그는 `logs/_unimm_h100x3x2_oom_retry/<TASK_NAME>/at
 
 H100 x3x2 launcher는 `--ckpt-path`가 지정되면 기본적으로 master pod의 checkpoint를 `/tmp/unimm_h100x3x2_synced_ckpts/<TASK_NAME>/` 아래로 복사하고, 같은 파일을 모든 pod의 동일 경로에 동기화한 뒤 그 경로를 Hydra `ckpt_path`로 넘긴다. 따라서 `validate`, `test`, OOM retry resume처럼 모든 rank가 checkpoint를 직접 읽어야 하는 실행에서도 rank0 pod에만 checkpoint가 있어서 worker rank가 깨지는 문제를 피한다. 정말 모든 pod가 같은 shared filesystem path를 보고 있다는 것이 확실할 때만 `--no-sync-ckpt`를 사용한다.
 
+from-scratch 학습-추론 파이프라인을 짧게 재검증하려면 아래 순서로 돌린다. 이 검증은 실제 `train_batch_size=32`, `val_batch_size=12`, H100 x3x2 DDP를 사용하되 batch/epoch 수만 줄여서 학습, 학습 중 validation, checkpoint 저장, explicit validation, test inference를 모두 통과시키는 용도다.
+
+```bash
+TASK_NAME=unimm_pipeline_fullcheck_fromscratch_$(date +%Y%m%d_%H%M%S)
+
+python scripts/launch_unimm_h100x3x2.py \
+  --action fit \
+  --task-name "$TASK_NAME" \
+  --session unimm-pipeline-fullcheck \
+  --master-port 29575 \
+  --train-batch-size 32 \
+  --val-batch-size 12 \
+  --wandb-mode offline \
+  --max-epochs 1 \
+  --limit-train-batches 2 \
+  --limit-val-batches 1 \
+  --extra-hydra-overrides 'trainer.check_val_every_n_epoch=1 model.model_config.n_rollout_closed_val=4 logger.wandb.offline=true logger.wandb.log_model=false' \
+  --replace
+
+CKPT=$(
+  kubectl exec hsb-npc-training-3-1 -- bash -lc \
+    "ls -t /mnt/nuplan/projects/catk/logs/${TASK_NAME}/runs/*/checkpoints/epoch_last.ckpt 2>/dev/null | head -1" |
+  tail -n 1 | tr -d '\r'
+)
+
+python scripts/launch_unimm_h100x3x2.py \
+  --action validate \
+  --task-name "${TASK_NAME}_validate" \
+  --session unimm-pipeline-fullcheck-validate \
+  --master-port 29576 \
+  --ckpt-path "$CKPT" \
+  --val-batch-size 12 \
+  --wandb-mode offline \
+  --limit-val-batches 1 \
+  --extra-hydra-overrides 'model.model_config.n_rollout_closed_val=4 logger.wandb.offline=true logger.wandb.log_model=false' \
+  --replace
+
+python scripts/launch_unimm_h100x3x2.py \
+  --action test \
+  --task-name "${TASK_NAME}_test" \
+  --session unimm-pipeline-fullcheck-test \
+  --master-port 29577 \
+  --ckpt-path "$CKPT" \
+  --test-batch-size 4 \
+  --wandb-mode offline \
+  --extra-hydra-overrides 'trainer.limit_test_batches=1 model.model_config.n_rollout_closed_val=4 logger.wandb.offline=true logger.wandb.log_model=false' \
+  --replace
+```
+
+실전 full pretrain은 아래처럼 OOM retry wrapper로 시작한다. 처음부터 학습할 때는 `CKPT_PATH`를 지정하지 않는다. wrapper는 CUDA OOM 또는 재시도 가능한 종료가 발생했을 때만 같은 `TASK_NAME`의 최신 checkpoint를 찾아 resume한다.
+
+```bash
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs192_$(date +%Y%m%d_%H%M%S) \
+SESSION=unimm-h100x3x2 \
+MASTER_PORT=29578 \
+INITIAL_BS=32 \
+OOM_STEP=4 \
+MIN_BS=16 \
+WANDB_MODE=online \
+  bash scripts/launch_unimm_h100x3x2_with_oom_retry.sh
+```
+
 중단:
 
 ```bash
-python scripts/launch_unimm_h100x3x2.py --stop
+python scripts/launch_unimm_h100x3x2.py \
+  --stop \
+  --task-name "$TASK_NAME" \
+  --session unimm-h100x3x2
 ```
 
 ## Validation / Test / Submission
