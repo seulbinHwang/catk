@@ -14,6 +14,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 
 
 DEFAULT_NAMESPACE = "p-pnc"
@@ -58,6 +59,161 @@ def pod_ip(namespace: str, pod: str) -> str:
         ],
         capture=True,
     )
+
+
+def remote_file_size(
+    *,
+    namespace: str,
+    container: str,
+    pod: str,
+    path: str,
+) -> int | None:
+    try:
+        output = run_kubectl(
+            [
+                "exec",
+                "-n",
+                namespace,
+                pod,
+                "-c",
+                container,
+                "--",
+                "bash",
+                "-lc",
+                f"stat -c '%s' {shq(path)}",
+            ],
+            capture=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    try:
+        return int(output)
+    except ValueError:
+        return None
+
+
+def sync_checkpoint_to_pods(args: argparse.Namespace) -> None:
+    """Ensure an explicit ckpt_path is available at the same path on all pods."""
+    if not args.ckpt_path or len(args.pods) < 2:
+        return
+
+    source_pod = args.pods[0]
+    source_size = remote_file_size(
+        namespace=args.namespace,
+        container=args.container,
+        pod=source_pod,
+        path=args.ckpt_path,
+    )
+    if not source_size:
+        raise RuntimeError(
+            f"checkpoint does not exist or has invalid size on {source_pod}: "
+            f"{args.ckpt_path}"
+        )
+
+    for pod in args.pods[1:]:
+        target_size = remote_file_size(
+            namespace=args.namespace,
+            container=args.container,
+            pod=pod,
+            path=args.ckpt_path,
+        )
+        if target_size == source_size:
+            continue
+        if args.dry_run:
+            print(
+                "[launcher] dry-run checkpoint sync: "
+                f"{source_pod}:{args.ckpt_path} -> {pod}:{args.ckpt_path}"
+            )
+            continue
+
+        if target_size is None:
+            print(f"[launcher] checkpoint missing on {pod}; copying from {source_pod}.")
+        else:
+            print(
+                f"[launcher] checkpoint size differs on {pod} "
+                f"({target_size} != {source_size}); replacing it."
+            )
+
+        ckpt_dir = os.path.dirname(args.ckpt_path)
+        tmp_path = f"{args.ckpt_path}.tmp.{os.getpid()}"
+        run_kubectl(
+            [
+                "exec",
+                "-n",
+                args.namespace,
+                pod,
+                "-c",
+                args.container,
+                "--",
+                "bash",
+                "-lc",
+                f"mkdir -p {shq(ckpt_dir)}",
+            ],
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="catk_ckpt_sync_",
+            suffix=".ckpt",
+            delete=False,
+        ) as local_tmp:
+            local_tmp_path = local_tmp.name
+        try:
+            subprocess.run(
+                [
+                    "kubectl",
+                    "cp",
+                    "-n",
+                    args.namespace,
+                    "-c",
+                    args.container,
+                    f"{source_pod}:{args.ckpt_path}",
+                    local_tmp_path,
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "kubectl",
+                    "cp",
+                    "-n",
+                    args.namespace,
+                    "-c",
+                    args.container,
+                    local_tmp_path,
+                    f"{pod}:{tmp_path}",
+                ],
+                check=True,
+            )
+            run_kubectl(
+                [
+                    "exec",
+                    "-n",
+                    args.namespace,
+                    pod,
+                    "-c",
+                    args.container,
+                    "--",
+                    "bash",
+                    "-lc",
+                    f"mv {shq(tmp_path)} {shq(args.ckpt_path)}",
+                ],
+            )
+        finally:
+            try:
+                os.unlink(local_tmp_path)
+            except FileNotFoundError:
+                pass
+
+        copied_size = remote_file_size(
+            namespace=args.namespace,
+            container=args.container,
+            pod=pod,
+            path=args.ckpt_path,
+        )
+        if copied_size != source_size:
+            raise RuntimeError(
+                f"checkpoint copy size mismatch on {pod}: "
+                f"{copied_size} != {source_size}"
+            )
 
 
 def export_line(name: str, value: object) -> str:
@@ -530,6 +686,8 @@ def main() -> None:
     print("[launcher] cache roots:")
     for pod in args.pods:
         print(f"  {pod}: {cache_root_for_pod(args, pod)}")
+
+    sync_checkpoint_to_pods(args)
 
     for rank, pod in enumerate(args.pods):
         script = render_start_command(

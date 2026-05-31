@@ -48,6 +48,7 @@ EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 SKIP_LOCAL_CHECKOUT_GUARD="${SKIP_LOCAL_CHECKOUT_GUARD:-0}"
+FRESH_START="${FRESH_START:-0}"
 
 if [[ -z "$PYTHON_BIN" ]]; then
   if command -v python >/dev/null 2>&1; then
@@ -432,7 +433,12 @@ prepare_project_root
 while (( bs >= MIN_BS )); do
   attempt=$(( attempt + 1 ))
   attempt_log="${LOCAL_RETRY_LOG_DIR}/attempt_$(printf '%03d' "$attempt")_bs${bs}.log"
-  latest_ckpt="$(find_latest_epoch_last_ckpt)"
+  if [[ "$FRESH_START" == "1" && "$attempt" == "1" ]]; then
+    latest_ckpt=""
+    log "Attempt #${attempt}: FRESH_START=1; ignoring any existing task-local checkpoint for the first attempt."
+  else
+    latest_ckpt="$(find_latest_epoch_last_ckpt)"
+  fi
 
   if [[ -n "$latest_ckpt" ]]; then
     log "Attempt #${attempt}: bs=${bs}, resume ckpt=${latest_ckpt}"
