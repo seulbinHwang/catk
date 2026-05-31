@@ -187,22 +187,25 @@ hsb-npc-training-3-1, hsb-npc-training-3-2
 python scripts/launch_unimm_h100x3x2.py \
   --smoke \
   --smoke-batches 2 \
-  --train-batch-size 5 \
+  --train-batch-size 32 \
   --replace
 ```
 
 batch size OOM 탐색은 validation을 끈 smoke run으로 작은 값에서 큰 값 순서로 확인한다.
 
 ```bash
-python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 5 --replace
-python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 6 --replace
+python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 16 --replace
+python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 24 --replace
+python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 40 --train-batch-size 32 --replace
 ```
+
+2026-05-31 기준 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 `train_batch_size=32`가 40 batch smoke run을 CUDA OOM 없이 통과했다. 이 값은 per-GPU batch size이고 global batch size는 `32 x 6 = 192`이다.
 
 전체 학습:
 
 ```bash
 python scripts/launch_unimm_h100x3x2.py \
-  --train-batch-size 5 \
+  --train-batch-size 32 \
   --replace
 ```
 
