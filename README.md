@@ -10,7 +10,7 @@
 - 출력: 최대 128개 agent의 8초 미래 궤적 32개.
 - 학습 target: future trajectory를 acceleration / yaw-rate action으로 바꾼 continuous action tensor.
 - denoising: agent-time별 Gaussian mask, `K=5`, alpha schedule `0.99 -> 0.01`.
-- inference: full Gaussian noise에서 1-step denoising.
+- inference: full Gaussian noise에서 시작하며, validation/test/submission 기본값은 16-step denoising이다.
 - closed-loop: Waymax 없이 repo 내부 rollout으로 1Hz replanning을 수행한다. 매 1초 구간만 history에 반영하고 다시 MDG를 호출해 80 step을 채운다.
 - 평가/제출: 기존 Fast WOSAC metric, RMM, WOSAC submission archive 생성 코드를 재사용한다.
 
@@ -73,9 +73,64 @@ WANDB_MODE=offline python -m src.run experiment=mdg_pretrain logger=[] callbacks
 
 WOMD 원본 TFRecord를 받은 뒤 cache를 만든다. 기존 SMART cache도 fallback으로 읽을 수 있지만, 새로 cache를 만들면 `mdg_map`, `mdg_traffic_signal` 필드가 추가되어 MDG 입력과 더 잘 맞는다. `mdg_traffic_signal`은 WOMD `dynamic_map_states`의 현재 phase와 stop point를 저장한다.
 
+기본 단일 split cache script는 다음처럼 실행한다.
+
 ```bash
+DATA_SPLIT=validation \
+WOMD_INPUT_DIR=/path/to/womd_v1_3/scenario \
+CACHE_ROOT=/path/to/MDG_cache \
 bash scripts/cache_womd.sh
 ```
+
+`ssh user@10.60.188.78`의 `/media/user/E/dataset/womd_v1_3/scenario` 원본 TFRecord에서
+`/media/user/F/dataset/womd_v1_3/MDG_cache`를 빠르게 만들 때는 전용 병렬 script를 사용한다.
+이 script는 `training`, `validation`, `testing`을 동시에 처리하고, validation용
+`validation_tfrecords_splitted`도 함께 만든다.
+
+```bash
+ssh user@10.60.188.78
+cd /media/user/E/projects/catk
+git checkout MDG
+git pull --ff-only
+tmux new-window -t hsb-rl-train -n mdg-cache \
+  'bash -lc "cd /media/user/E/projects/catk && bash scripts/cache_mdg_womd_10_60_188_78.sh"'
+```
+
+전용 script의 기본값:
+
+| 항목 | 기본값 |
+| --- | --- |
+| raw WOMD root | `/media/user/E/dataset/womd_v1_3/scenario` |
+| cache root | `/media/user/F/dataset/womd_v1_3/MDG_cache` |
+| conda env | `catk` |
+| log dir | `/media/user/F/dataset/womd_v1_3/MDG_cache/logs` |
+| worker 배분 | CPU 개수 기준 training 83%, validation 10%, testing 나머지 |
+| 128 logical CPU 기준 | training 106, validation 12, testing 10 |
+| 최소 여유 공간 검사 | 300GB |
+| 최소 inode 검사 | 1,000,000 |
+
+진행 상황은 아래 로그에서 확인한다.
+
+```bash
+tail -f /media/user/F/dataset/womd_v1_3/MDG_cache/logs/supervisor.log
+tail -f /media/user/F/dataset/womd_v1_3/MDG_cache/logs/training.log
+tail -f /media/user/F/dataset/womd_v1_3/MDG_cache/logs/validation.log
+tail -f /media/user/F/dataset/womd_v1_3/MDG_cache/logs/testing.log
+```
+
+완료 기준 count는 WOMD v1.3 Sim Agents split 기준으로 다음과 같다.
+
+| 출력 디렉터리 | 기대 파일 수 |
+| --- | ---: |
+| `training` | 486,995 |
+| `validation` | 44,097 |
+| `validation_tfrecords_splitted` | 44,097 |
+| `testing` | 44,920 |
+
+`/media/user/F` 저장 공간은 script 시작 전에 `df -h`와 `df -ih`로 검사한다. 실제 계측에서는
+기존 SMART cache 대비 MDG pickle 크기 비율이 약 1.38배였고, validation split TFRecord까지
+포함한 전체 cache 예상 크기는 약 180GB 전후였다. 그래서 `/media/user/F`에 수백 GB 이상
+여유가 있으면 충분하지만, 장기 실행 전에는 script의 storage check 결과를 확인한다.
 
 기본 config는 cache root 아래 split을 다음처럼 기대한다.
 
@@ -98,7 +153,7 @@ ${paths.cache_root}/testing
 단일 노드 기본 실행:
 
 ```bash
-CACHE_ROOT=/workspace/womd_v1_3/SMART_cache bash scripts/train.sh
+CACHE_ROOT=/workspace/womd_v1_3/MDG_cache bash scripts/train.sh
 ```
 
 직접 실행:
@@ -106,7 +161,7 @@ CACHE_ROOT=/workspace/womd_v1_3/SMART_cache bash scripts/train.sh
 ```bash
 python -m src.run \
   experiment=mdg_pretrain \
-  paths.cache_root=/workspace/womd_v1_3/SMART_cache \
+  paths.cache_root=/workspace/womd_v1_3/MDG_cache \
   task_name=mdg_wosac_pretrain
 ```
 
@@ -118,7 +173,7 @@ export NPROC_PER_NODE=2
 export MASTER_ADDR=<rank0-pod-ip>
 export MASTER_PORT=29531
 export NODE_RANK=<0|1|2|3>
-export CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
+export CACHE_ROOT=/workspace/womd_v1_3/MDG_cache
 
 torchrun \
   --nnodes "$NNODES" \
@@ -144,7 +199,7 @@ V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다
 checkpoint 검증:
 
 ```bash
-CKPT_PATH=/path/to/model.ckpt CACHE_ROOT=/workspace/womd_v1_3/SMART_cache bash scripts/local_val.sh
+CKPT_PATH=/path/to/model.ckpt CACHE_ROOT=/workspace/womd_v1_3/MDG_cache bash scripts/local_val.sh
 ```
 
 Fast WOSAC metric을 직접 켜는 핵심 조건:
@@ -154,7 +209,7 @@ python -m src.run \
   experiment=mdg_pretrain \
   action=validate \
   ckpt_path=/path/to/model.ckpt \
-  paths.cache_root=/workspace/womd_v1_3/SMART_cache \
+  paths.cache_root=/workspace/womd_v1_3/MDG_cache \
   model.model_config.n_rollout_closed_val=32 \
   model.model_config.closed_loop_denoising_steps=16 \
   model.model_config.n_batch_sim_agents_metric=10 \
@@ -170,7 +225,7 @@ validation split 제출물:
 ```bash
 ACTION=validate \
 CKPT_PATH=/path/to/model.ckpt \
-CACHE_ROOT=/workspace/womd_v1_3/SMART_cache \
+CACHE_ROOT=/workspace/womd_v1_3/MDG_cache \
 bash scripts/wosac_sub.sh
 ```
 
@@ -179,7 +234,7 @@ test split 제출물:
 ```bash
 ACTION=test \
 CKPT_PATH=/path/to/model.ckpt \
-CACHE_ROOT=/workspace/womd_v1_3/SMART_cache \
+CACHE_ROOT=/workspace/womd_v1_3/MDG_cache \
 bash scripts/wosac_sub.sh
 ```
 
