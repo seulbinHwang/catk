@@ -43,6 +43,10 @@ DEFAULT_RECOVERY_CKPT_PATH = (
     "logs/ocsc_steprefiner_m12_lr5e7_wd1e2_20260530_064434/"
     "runs/2026-05-30_06-44-55/checkpoints/epoch_000.ckpt"
 )
+LONG_M12_BEST_CKPT_PATH = (
+    "logs/ocsc_steprefiner_m12_lr1e7_wd1e2_from_best_20260530_194330/"
+    "runs/2026-05-30_19-43-52/checkpoints/epoch_000.ckpt"
+)
 
 
 @dataclass(frozen=True)
@@ -359,6 +363,86 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
             "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
             "EXTRA_ARGS": "trainer.accumulate_grad_batches=4",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+        },
+    ),
+    Variant(
+        name="ocsc_steprefiner_m12_lr8e8_wd1e2_from_long_best",
+        note=(
+            "Resume from the long M12 run's best-RMM checkpoint and use a lower "
+            "LR than 1e-7 to keep the open-loop signal while reducing late RMM drift."
+        ),
+        env={
+            "CKPT_PATH": LONG_M12_BEST_CKPT_PATH,
+            "LR": "8.0e-8",
+            "WEIGHT_DECAY": "1.0e-2",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "false",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+        },
+    ),
+    Variant(
+        name="ocsc_steprefiner_m12_lr5e8_wd1e2_from_long_best",
+        note=(
+            "More conservative long-best continuation if 8e-8 still shows RMM drift."
+        ),
+        env={
+            "CKPT_PATH": LONG_M12_BEST_CKPT_PATH,
+            "LR": "5.0e-8",
+            "WEIGHT_DECAY": "1.0e-2",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "false",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+        },
+    ),
+    Variant(
+        name="ocsc_steprefiner_m12_lr5e8_wd1e3_from_long_best",
+        note=(
+            "Keep the conservative 5e-8 LR but relax weight decay if the clean-style "
+            "1e-2 decay is contributing to RMM drift."
+        ),
+        env={
+            "CKPT_PATH": LONG_M12_BEST_CKPT_PATH,
+            "LR": "5.0e-8",
+            "WEIGHT_DECAY": "1.0e-3",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "false",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
             "PRECISION": "32-true",
             "GRADIENT_CLIP_VAL": "0",
             "NUM_WORKERS": "12",
