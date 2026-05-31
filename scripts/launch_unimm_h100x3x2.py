@@ -278,7 +278,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-port", default="29551")
     parser.add_argument("--expected-gpus", type=int, default=DEFAULT_EXPECTED_GPUS)
     parser.add_argument("--train-batch-size", default="32")
-    parser.add_argument("--val-batch-size", default="4")
+    parser.add_argument("--val-batch-size", default="12")
     parser.add_argument("--test-batch-size", default="4")
     parser.add_argument("--learning-rate", default=os.environ.get("UNIMM_LEARNING_RATE", DEFAULT_LEARNING_RATE))
     parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE", "online"))

@@ -27,6 +27,9 @@
 | epochs | 64 |
 | base batch size | 32 scenes global |
 | H100 x3x2 effective batch size | 192 scenes global |
+| H100 x3x2 validation batch size | 72 scenes global |
+| validation interval | every 16 epochs |
+| fit-time scorer scenes | 1680 |
 | 모델 크기 | K=2048 기준 약 4.1M parameters |
 
 논문에서 명시한 핵심은 `2048 anchors + continuous regression + Tpred=4s + closed-loop samples + approximate posterior policy + Tpost=Tz*=0.5s`다. 현재 구현도 이 조합만 대상으로 한다.
@@ -206,6 +209,8 @@ python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 40 --train-batch
 
 2026-05-31 기준 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 `train_batch_size=32`가 40 batch smoke run을 CUDA OOM 없이 통과했다. 이 값은 per-GPU batch size이고 global batch size는 `32 x 6 = 192`이다.
 
+H100 x3x2 validation은 per-GPU batch size 12, global batch size `12 x 6 = 72`로 실행한다. 학습 중 validation은 `check_val_every_n_epoch=16` 주기로 돌며, Fast WOSAC `sim_agents_2025` scorer는 `scorer_scene_num=1680` 기준으로 GPU 수와 validation batch size에 맞춰 batch 수를 계산한다. H100 x3x2 기본값에서는 `ceil(ceil(1680 / 6) / 12) = 24`이므로 `n_batch_sim_agents_metric=24`로 자동 조정된다.
+
 LR은 기존 기준인 effective batch size 32, lr 0.0005에서 sqrt scaling으로 조정한다.
 
 ```text
@@ -221,6 +226,7 @@ scaled_lr = 0.0005 * sqrt(192 / 32) = 0.001224744871
 ```bash
 python scripts/launch_unimm_h100x3x2.py \
   --train-batch-size 32 \
+  --val-batch-size 12 \
   --replace
 ```
 
@@ -270,7 +276,7 @@ CACHE_ROOT=/path/to/SMART_cache \
 | posterior threshold | category별 nearest-anchor 0.5초 error 95% quantile |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 
-이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 192에 맞춰 sqrt scaling을 적용한다. Scheduler는 epoch index 0에서 multiplier 1.0으로 시작하고 epoch index 64에서 multiplier 0.0이 되도록 계산한다.
+이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 192에 맞춰 sqrt scaling을 적용한다. Scheduler는 epoch index 0에서 multiplier 1.0으로 시작하고 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
 
 ## 빠른 검증
 

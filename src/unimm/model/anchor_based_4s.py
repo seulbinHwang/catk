@@ -138,6 +138,8 @@ class UniMMAnchorBased4s(LightningModule):
         self.inference_temperature = float(model_config.inference_temperature)
         self.validation_closed_seed = int(model_config.validation_closed_seed)
         self.n_batch_sim_agents_metric = int(model_config.n_batch_sim_agents_metric)
+        self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
+        self._scorer_scene_num_last_key: tuple[int, int, int] | None = None
         self.n_vis_batch = int(model_config.n_vis_batch)
         self.n_vis_scenario = int(model_config.n_vis_scenario)
         self.n_vis_rollout = int(model_config.n_vis_rollout)
@@ -168,6 +170,69 @@ class UniMMAnchorBased4s(LightningModule):
         except ValueError:
             output_dir = "."
         self.video_dir = Path(output_dir) / "videos"
+
+    def _resolve_val_batch_size(self) -> int | None:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return None
+        val_batch_size = getattr(datamodule, "val_batch_size", None)
+        if not isinstance(val_batch_size, int) or val_batch_size <= 0:
+            return None
+        return int(val_batch_size)
+
+    def _apply_scorer_scene_num_overrides(self) -> None:
+        if self.sim_agents_submission.is_active:
+            return
+
+        scorer_scene_num = self.scorer_scene_num
+        if scorer_scene_num is None:
+            return
+        try:
+            scorer_scene_num = int(scorer_scene_num)
+        except (TypeError, ValueError):
+            return
+        if scorer_scene_num <= 0:
+            return
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        if world_size <= 0:
+            world_size = 1
+
+        val_batch_size = self._resolve_val_batch_size()
+        if val_batch_size is None:
+            return
+
+        per_rank_scenes = math.ceil(scorer_scene_num / world_size)
+        self.n_batch_sim_agents_metric = max(
+            1,
+            math.ceil(per_rank_scenes / val_batch_size),
+        )
+
+        current_key = (int(scorer_scene_num), int(world_size), int(val_batch_size))
+        if self._scorer_scene_num_last_key == current_key:
+            return
+        self._scorer_scene_num_last_key = current_key
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[scorer_scene_num] Fast WOSAC sim_agents_2025 scorer batch count set to "
+                f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric} "
+                f"(requested_scenes={scorer_scene_num}, world_size={world_size}, "
+                f"val_batch_size={val_batch_size}).",
+                flush=True,
+            )
+
+    def on_fit_start(self) -> None:
+        self._apply_scorer_scene_num_overrides()
+
+    def on_validation_start(self) -> None:
+        self._apply_scorer_scene_num_overrides()
 
     @staticmethod
     def _repeat_tensor_on_first_dim(tensor: torch.Tensor, repeat_count: int) -> torch.Tensor:

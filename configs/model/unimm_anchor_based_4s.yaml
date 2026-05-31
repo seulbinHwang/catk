@@ -22,6 +22,10 @@ model_config:
   val_closed_loop: true
   n_rollout_closed_val: 32
   n_batch_sim_agents_metric: 10
+  # Positive values auto-set n_batch_sim_agents_metric from world_size and
+  # val_batch_size so fit-time Fast WOSAC scorer work is comparable across
+  # GPU counts. Set null or 0 to keep the explicit n_batch_sim_agents_metric.
+  scorer_scene_num: 1680
   wosac_cpd_reference: null
   wosac_distribution_type_scale: [22.3461620418, 4.5793447978, 18.5374388830]
 

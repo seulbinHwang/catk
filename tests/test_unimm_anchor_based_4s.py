@@ -1,6 +1,7 @@
 import math
 import pickle
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from omegaconf import OmegaConf
@@ -384,6 +385,29 @@ def test_unimm_lr_schedule_starts_at_initial_lr_and_decays_to_zero(tmp_path: Pat
     optimizers, schedulers = model.configure_optimizers()
     assert math.isclose(optimizers[0].param_groups[0]["lr"], 0.001224744871)
     assert schedulers[0]["interval"] == "epoch"
+
+
+def test_unimm_scorer_scene_num_sets_metric_batch_count(tmp_path: Path):
+    anchor_path = tmp_path / "anchors.pkl"
+    with anchor_path.open("wb") as handle:
+        pickle.dump(_make_anchor_payload(), handle)
+
+    model = UniMMAnchorBased4s(
+        _make_model_cfg(
+            anchor_path,
+            n_batch_sim_agents_metric=10,
+            scorer_scene_num=1680,
+        )
+    )
+    model._trainer = SimpleNamespace(
+        world_size=6,
+        datamodule=SimpleNamespace(val_batch_size=12),
+        is_global_zero=False,
+    )
+
+    model._apply_scorer_scene_num_overrides()
+
+    assert model.n_batch_sim_agents_metric == 24
 
 
 def test_unimm_inference_rollout_commits_half_second_chunks(tmp_path: Path, monkeypatch):
