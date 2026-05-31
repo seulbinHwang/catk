@@ -2,7 +2,7 @@ _target_: src.unimm.model.anchor_based_4s.UniMMAnchorBased4s
 model_config:
   lr: 0.0005
   weight_decay: 0.0001
-  lr_warmup_steps: 0
+  lr_warmup_steps: 4
   lr_total_steps: ${trainer.max_epochs}
 
   anchor_file: ${paths.root_dir}/src/unimm/anchors/unimm_anchors_8s_k2048.pkl

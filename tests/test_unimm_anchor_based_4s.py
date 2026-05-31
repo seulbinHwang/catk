@@ -387,6 +387,29 @@ def test_unimm_lr_schedule_starts_at_initial_lr_and_decays_to_zero(tmp_path: Pat
     assert schedulers[0]["interval"] == "epoch"
 
 
+def test_unimm_lr_schedule_warms_up_then_decays_to_zero(tmp_path: Path):
+    anchor_path = tmp_path / "anchors.pkl"
+    with anchor_path.open("wb") as handle:
+        pickle.dump(_make_anchor_payload(), handle)
+
+    model = UniMMAnchorBased4s(
+        _make_model_cfg(
+            anchor_path,
+            lr=0.001224744871,
+            lr_warmup_steps=4,
+            lr_total_steps=64,
+        )
+    )
+
+    assert math.isclose(model._lr_multiplier(0), 0.25)
+    assert math.isclose(model._lr_multiplier(1), 0.5)
+    assert math.isclose(model._lr_multiplier(2), 0.75)
+    assert math.isclose(model._lr_multiplier(3), 1.0)
+    assert math.isclose(model._lr_multiplier(4), 1.0)
+    assert math.isclose(model._lr_multiplier(34), 0.5)
+    assert math.isclose(model._lr_multiplier(64), 0.0, abs_tol=1e-12)
+
+
 def test_unimm_scorer_scene_num_sets_metric_batch_count(tmp_path: Path):
     anchor_path = tmp_path / "anchors.pkl"
     with anchor_path.open("wb") as handle:

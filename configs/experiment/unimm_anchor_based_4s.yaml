@@ -33,6 +33,7 @@ model:
   model_config:
     lr: 0.0005
     weight_decay: 0.0001
+    lr_warmup_steps: 4
     lr_total_steps: ${trainer.max_epochs}
     scorer_scene_num: 1680
     n_vis_batch: 0

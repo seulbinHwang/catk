@@ -656,7 +656,7 @@ class UniMMAnchorBased4s(LightningModule):
             self.sim_agents_submission.save_sub_file()
 
     def _lr_multiplier(self, current_epoch: int) -> float:
-        """Cosine-to-zero multiplier with exact initial LR at epoch 0."""
+        """Epoch-wise linear warmup followed by cosine-to-zero decay."""
         current_epoch = max(int(current_epoch), 0)
         warmup_steps = max(int(self.lr_warmup_steps), 0)
         total_steps = max(int(self.lr_total_steps), 1)
