@@ -44,6 +44,18 @@ MAX_EPOCHS="${MAX_EPOCHS:-}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
+PYTHON_BIN="${PYTHON_BIN:-}"
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    echo "ERROR: neither python nor python3 was found on PATH." >&2
+    exit 2
+  fi
+fi
 
 read -r -a POD_ARRAY <<< "$PODS"
 if (( ${#POD_ARRAY[@]} != 2 )); then
@@ -154,7 +166,7 @@ find_latest_epoch_last_ckpt() {
 
 stop_attempt_sessions() {
   local -a cmd=(
-    python scripts/launch_smart_ntp_a100x4x2_testa.py
+    "$PYTHON_BIN" scripts/launch_smart_ntp_a100x4x2_testa.py
     --namespace "$NAMESPACE"
     --pods "${POD_ARRAY[@]}"
     --container "$CONTAINER"
@@ -180,7 +192,7 @@ start_attempt() {
   local val_bs="$VAL_BATCH_SIZE"
   local test_bs="$TEST_BATCH_SIZE"
   local -a cmd=(
-    python scripts/launch_smart_ntp_a100x4x2_testa.py
+    "$PYTHON_BIN" scripts/launch_smart_ntp_a100x4x2_testa.py
     --namespace "$NAMESPACE"
     --pods "${POD_ARRAY[@]}"
     --container "$CONTAINER"

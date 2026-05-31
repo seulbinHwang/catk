@@ -197,6 +197,33 @@ selection은 validation/eval agent selection을 쓰지 않고, legacy SMART pret
 ego 기준 거리와 `train_max_num`을 거친 학습 전용 `train_mask`를 사용한다. 다른 이름으로
 기록하려면 `TASK_NAME=...`을 환경 변수로 넘긴다.
 
+`smart_ntp_pretrain_a100x4x2_bs14_oom_retry_main_original_legacy_inputs_trainselectfalse_20260528`
+의 후속 공정 비교 run으로, 기존 legacy-inputs/trainselectfalse recipe는 유지하면서
+`main@5069a44`의 `3406b070..5069a44` 변경까지 포함한 코드를 학습하려면 아래 wrapper를
+사용한다.
+
+```bash
+bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_legacy_inputs_trainselectfalse_post5069_oom_retry.sh
+```
+
+기본 task name은
+`smart_ntp_pretrain_a100x4x2_bs14_oom_retry_main_original_legacy_inputs_trainselectfalse_post5069_20260531`이다.
+이 wrapper는 비교 기준 run과 같이 `testa testaa`, `INITIAL_BS=14`,
+`VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12`, `data.train_use_eval_agent_selection=false`를
+사용한다. 차이는 학습 checkout을 `main@5069a44`로 pin해서, 아래 후속 변경을 포함한다는
+점이다.
+
+| 항목 | 기존 `...trainselectfalse_20260528` | 후속 `...post5069_20260531` |
+|---|---|---|
+| 코드 기준 | legacy-inputs/trainselectfalse 당시 main | `main@5069a44` |
+| 학습 대상 선택 | `train_use_eval_agent_selection=false` | 동일 |
+| 시작 train batch | 14, OOM 시 1씩 감소 | 동일 |
+| validation/test batch | 12 / 12 | 동일 |
+| Fourier band | `num_freq_bands=88` | 동일 |
+| optimizer recipe | 기존 run 기준 | `lr=5e-4`, warmup 0, gradient clip 0.5가 명시된 최신 preset |
+| batching | 기존 run 기준 | memory-balanced batching 제거 후 일반 DDP sharding 기준 |
+| agent interaction 후보 | 기존 run 기준 | valid-agent 후보 구성 원복 후 코드 기준 |
+
 launcher는 pod를 만들거나 지우지 않는다. 로컬에서 `kubectl exec`로 이미 떠 있는 두 pod에
 접속한 뒤, 각 pod 안에서 같은 이름의 tmux session을 시작한다. 기본 namespace는 `p-pnc`,
 기본 pod 목록은 `testa testaa`, branch는 `main`이다. 일반 launcher의 기본 원격 저장소
