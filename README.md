@@ -256,14 +256,18 @@ V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다
 
 `testas` 파드에 cache가 `/workspace/womd_v1_3/MDG_cache`로 준비되어 있으면, `ssh user@10.60.188.78`에서 아래처럼 학습을 시작한다.
 
+처음부터 새 run을 시작하려면 기존 run과 다른 `TASK_NAME`을 사용한다. `start_mdg_pretrain_testas_a100x7.sh`는 기본적으로 `CATK_AUTO_RESUME=false`라 checkpoint를 자동으로 이어받지 않는다. 단, OOM retry wrapper는 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`를 찾아 재시도에 사용하므로, 완전히 새 학습은 반드시 새 `TASK_NAME`으로 시작한다.
+
 ```bash
 cd /media/user/E/projects/catk
 git checkout MDG
 git pull --ff-only
 
+TASK_NAME=mdg_wosac_pretrain_testas_a100x7_from_scratch_$(date +%Y%m%d_%H%M%S) \
 TRAIN_BATCH_SIZE=32 \
 VAL_BATCH_SIZE=12 \
 DATA_NUM_WORKERS=4 \
+REPLACE_SESSION=1 \
 bash scripts/start_mdg_pretrain_testas_a100x7.sh
 ```
 
@@ -271,16 +275,23 @@ bash scripts/start_mdg_pretrain_testas_a100x7.sh
 
 CUDA OOM이 나면 자동으로 batch size를 낮춰 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`에서 resume하려면 OOM retry wrapper를 쓴다. 기본값은 `INITIAL_BS=32`, `OOM_STEP=2`, `MIN_BS=24`이며, OOM이 아닌 외부 종료 코드 `134,143`은 batch size를 유지하고 최대 2회 재시도한다.
 
+wrapper는 학습이 끝날 때까지 foreground에서 monitor하므로, 장시간 학습은 host tmux 안에서 실행하는 것을 권장한다.
+
 ```bash
 cd /media/user/E/projects/catk
 git checkout MDG
 git pull --ff-only
 
+TASK_NAME=mdg_wosac_pretrain_testas_a100x7_from_scratch_$(date +%Y%m%d_%H%M%S)
+
+tmux new-session -d -s mdg-pretrain-supervisor "
+cd /media/user/E/projects/catk &&
 INITIAL_BS=32 \
 OOM_STEP=2 \
 MIN_BS=24 \
-TASK_NAME=mdg_wosac_pretrain_testas_a100x7_oom_retry_bs32 \
+TASK_NAME=$TASK_NAME \
 bash scripts/start_mdg_pretrain_testas_a100x7_with_oom_retry.sh
+"
 ```
 
 이 wrapper는 testas pod를 새로 만들거나 재시작하지 않는다. 각 attempt마다 testas 내부 tmux session `mdg-pretrain-a100x7-oom-retry`를 교체하고, 로그에서 `OutOfMemoryError`, `CUDA out of memory`, `torch.OutOfMemoryError` 등을 감지하면 세션을 멈춘 뒤 `train_batch_size -= OOM_STEP`로 다시 시작한다. retry 로그는 로컬 repo의 `logs/_mdg_testas_a100x7_oom_retry/<TASK_NAME>/attempt_*.log`와 testas 내부 `${PROJECT_ROOT}/logs/testas_mdg_pretrain_a100x7_oom_retry/`에 남는다.
