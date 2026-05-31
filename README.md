@@ -171,6 +171,47 @@ python scripts/launch_unimm_v100x4x2.py --replace
 python scripts/launch_unimm_v100x4x2.py --stop
 ```
 
+## H100 2 Pod 실행
+
+대상 pod:
+
+```text
+hsb-npc-training-3-1, hsb-npc-training-3-2
+```
+
+각 pod는 H100 3장을 쓰므로 전체 world size는 `2 nodes x 3 GPUs = 6`이다. launcher는 기존 shared checkout을 건드리지 않고 각 pod의 `/tmp/catk_unimm_h100x3x2`에 clean checkout을 만든다. 기본 anchor는 `UniMM` 브랜치에 커밋된 파일을 사용한다.
+
+분산 학습 smoke run:
+
+```bash
+python scripts/launch_unimm_h100x3x2.py \
+  --smoke \
+  --smoke-batches 2 \
+  --train-batch-size 5 \
+  --replace
+```
+
+batch size OOM 탐색은 validation을 끈 smoke run으로 작은 값에서 큰 값 순서로 확인한다.
+
+```bash
+python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 5 --replace
+python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 6 --replace
+```
+
+전체 학습:
+
+```bash
+python scripts/launch_unimm_h100x3x2.py \
+  --train-batch-size 5 \
+  --replace
+```
+
+중단:
+
+```bash
+python scripts/launch_unimm_h100x3x2.py --stop
+```
+
 ## Validation / Test / Submission
 
 validation은 기본적으로 open-loop loss와 closed-loop WOSAC metric을 모두 계산한다.
