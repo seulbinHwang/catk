@@ -26,6 +26,7 @@ DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_ANCHOR_FILE = ""
 DEFAULT_EXPECTED_GPUS = 3
+DEFAULT_LEARNING_RATE = "0.001224744871"
 KUBECTL_BIN = os.environ.get("KUBECTL_BIN") or (
     "/usr/local/bin/kubectl" if os.path.exists("/usr/local/bin/kubectl") else "kubectl"
 )
@@ -201,6 +202,7 @@ def launch_command(
             env_line("TRAIN_BATCH_SIZE", args.train_batch_size),
             env_line("VAL_BATCH_SIZE", args.val_batch_size),
             env_line("TEST_BATCH_SIZE", args.test_batch_size),
+            env_line("LEARNING_RATE", args.learning_rate),
             env_line("WANDB_MODE", args.wandb_mode),
             env_line("CATK_HYDRA_OVERRIDES", hydra_overrides),
         ]
@@ -278,6 +280,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-batch-size", default="32")
     parser.add_argument("--val-batch-size", default="4")
     parser.add_argument("--test-batch-size", default="4")
+    parser.add_argument("--learning-rate", default=os.environ.get("UNIMM_LEARNING_RATE", DEFAULT_LEARNING_RATE))
     parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE", "online"))
     parser.add_argument("--extra-hydra-overrides", default="")
     parser.add_argument("--anchor-device", default="cuda")

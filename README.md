@@ -18,10 +18,12 @@
 | positive matching horizon `Tz*` | 0.5초, 5 step |
 | optimizer | AdamW |
 | weight decay | 0.0001 |
-| initial lr | 0.0005 |
+| base initial lr | 0.0005 |
+| H100 x3x2 initial lr | 0.001224744871 |
 | schedule | cosine annealing to 0 |
 | epochs | 64 |
-| paper batch size | 32 scenes global |
+| base batch size | 32 scenes global |
+| H100 x3x2 effective batch size | 192 scenes global |
 | 모델 크기 | K=2048 기준 약 4.1M parameters |
 
 논문에서 명시한 핵심은 `2048 anchors + continuous regression + Tpred=4s + closed-loop samples + approximate posterior policy + Tpost=Tz*=0.5s`다. 현재 구현도 이 조합만 대상으로 한다.
@@ -201,6 +203,14 @@ python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 40 --train-batch
 
 2026-05-31 기준 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 `train_batch_size=32`가 40 batch smoke run을 CUDA OOM 없이 통과했다. 이 값은 per-GPU batch size이고 global batch size는 `32 x 6 = 192`이다.
 
+LR은 기존 기준인 effective batch size 32, lr 0.0005에서 sqrt scaling으로 조정한다.
+
+```text
+scaled_lr = 0.0005 * sqrt(192 / 32) = 0.001224744871
+```
+
+`scripts/launch_unimm_h100x3x2.py`의 기본 `--learning-rate`는 이 값이며, 실행 시 `model.model_config.lr=0.001224744871` Hydra override로 전달된다.
+
 전체 학습:
 
 ```bash
@@ -255,7 +265,7 @@ CACHE_ROOT=/path/to/SMART_cache \
 | posterior threshold | category별 nearest-anchor 0.5초 error 95% quantile |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 
-이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, lr/weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs로 설정한다.
+이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 192에 맞춰 sqrt scaling을 적용한다.
 
 ## 빠른 검증
 

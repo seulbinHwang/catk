@@ -119,6 +119,9 @@ main() {
   if [[ -n "${TEST_BATCH_SIZE:-}" ]]; then
     app_args+=(data.test_batch_size="$TEST_BATCH_SIZE")
   fi
+  if [[ -n "${LEARNING_RATE:-}" ]]; then
+    app_args+=(model.model_config.lr="$LEARNING_RATE")
+  fi
   if [[ -n "${LIMIT_TRAIN_BATCHES:-}" ]]; then
     app_args+=(trainer.limit_train_batches="$LIMIT_TRAIN_BATCHES")
   fi
@@ -145,6 +148,7 @@ main() {
   log "  nproc_per_node:  $nproc_per_node"
   log "  node_rank:       ${node_rank:-0}"
   log "  precision:       $trainer_precision"
+  log "  learning_rate:   ${LEARNING_RATE:-config default}"
   log "  master_addr:     $master_addr"
   log "  master_port:     $master_port"
   log "  cache_root:      $cache_root"
