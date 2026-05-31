@@ -1,3 +1,4 @@
+import math
 import pickle
 from pathlib import Path
 
@@ -361,6 +362,28 @@ def test_unimm_inference_samples_components_instead_of_argmax(tmp_path: Path):
 
     assert sampled.max().item() == 1
     assert model._sample_component(logits, None).shape == (256,)
+
+
+def test_unimm_lr_schedule_starts_at_initial_lr_and_decays_to_zero(tmp_path: Path):
+    anchor_path = tmp_path / "anchors.pkl"
+    with anchor_path.open("wb") as handle:
+        pickle.dump(_make_anchor_payload(), handle)
+
+    model = UniMMAnchorBased4s(
+        _make_model_cfg(
+            anchor_path,
+            lr=0.001224744871,
+            lr_warmup_steps=0,
+            lr_total_steps=64,
+        )
+    )
+
+    assert math.isclose(model._lr_multiplier(0), 1.0)
+    assert math.isclose(model._lr_multiplier(32), 0.5)
+    assert math.isclose(model._lr_multiplier(64), 0.0, abs_tol=1e-12)
+    optimizers, schedulers = model.configure_optimizers()
+    assert math.isclose(optimizers[0].param_groups[0]["lr"], 0.001224744871)
+    assert schedulers[0]["interval"] == "epoch"
 
 
 def test_unimm_inference_rollout_commits_half_second_chunks(tmp_path: Path, monkeypatch):

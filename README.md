@@ -21,6 +21,9 @@
 | base initial lr | 0.0005 |
 | H100 x3x2 initial lr | 0.001224744871 |
 | schedule | cosine annealing to 0 |
+| final lr | 0 |
+| warmup | 0 epoch |
+| total decay epochs | 64 |
 | epochs | 64 |
 | base batch size | 32 scenes global |
 | H100 x3x2 effective batch size | 192 scenes global |
@@ -211,6 +214,8 @@ scaled_lr = 0.0005 * sqrt(192 / 32) = 0.001224744871
 
 `scripts/launch_unimm_h100x3x2.py`의 기본 `--learning-rate`는 이 값이며, 실행 시 `model.model_config.lr=0.001224744871` Hydra override로 전달된다.
 
+스케줄은 논문과 같은 cosine annealing to zero를 유지하되, 64 epoch 학습에 맞춰 decay 끝점을 64 epoch 끝으로 둔다. warmup은 논문에 명시되지 않았고 LR도 linear scaling보다 보수적인 sqrt scaling이므로 `lr_warmup_steps=0`을 유지한다. 구현상 `lr_total_steps=${trainer.max_epochs}`라서 H100 x3x2 기본 실행은 `0.001224744871 -> 0`을 64 epoch 동안 no-restart cosine으로 감소시킨다.
+
 전체 학습:
 
 ```bash
@@ -265,7 +270,7 @@ CACHE_ROOT=/path/to/SMART_cache \
 | posterior threshold | category별 nearest-anchor 0.5초 error 95% quantile |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 
-이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 192에 맞춰 sqrt scaling을 적용한다.
+이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 192에 맞춰 sqrt scaling을 적용한다. Scheduler는 epoch index 0에서 multiplier 1.0으로 시작하고 epoch index 64에서 multiplier 0.0이 되도록 계산한다.
 
 ## 빠른 검증
 

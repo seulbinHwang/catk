@@ -590,6 +590,19 @@ class UniMMAnchorBased4s(LightningModule):
         if self.sim_agents_submission.is_active:
             self.sim_agents_submission.save_sub_file()
 
+    def _lr_multiplier(self, current_epoch: int) -> float:
+        """Cosine-to-zero multiplier with exact initial LR at epoch 0."""
+        current_epoch = max(int(current_epoch), 0)
+        warmup_steps = max(int(self.lr_warmup_steps), 0)
+        total_steps = max(int(self.lr_total_steps), 1)
+        if warmup_steps > 0 and current_epoch < warmup_steps:
+            return float(current_epoch + 1) / float(warmup_steps)
+
+        decay_start = warmup_steps if warmup_steps > 0 else 0
+        decay_steps = max(total_steps - decay_start, 1)
+        progress = min(1.0, max(0.0, (current_epoch - decay_start) / decay_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
             self.parameters(),
@@ -597,12 +610,8 @@ class UniMMAnchorBased4s(LightningModule):
             weight_decay=self.weight_decay,
         )
 
-        def lr_lambda(_current_step):
-            current_epoch = self.current_epoch + 1
-            if self.lr_warmup_steps > 0 and current_epoch < self.lr_warmup_steps:
-                return float(current_epoch) / float(max(self.lr_warmup_steps, 1))
-            denom = max(self.lr_total_steps - self.lr_warmup_steps, 1)
-            progress = min(1.0, max(0.0, (current_epoch - self.lr_warmup_steps) / denom))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+        def lr_lambda(current_epoch):
+            return self._lr_multiplier(current_epoch)
 
-        return [optimizer], [LambdaLR(optimizer, lr_lambda=lr_lambda)]
+        scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+        return [optimizer], [{"scheduler": scheduler, "interval": "epoch"}]
