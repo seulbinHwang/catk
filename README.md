@@ -39,17 +39,19 @@
 | auxiliary loss weight | 5 |
 | model parameters | 7.11M |
 | optimizer | AdamW |
-| learning rate | 0.0002 |
+| learning rate | 0.00052915 |
 | weight decay | 0.01 |
-| LR warmup | 1000 steps |
-| LR decay | 2000 steps마다 0.98 |
+| LR warmup | 457 steps |
+| LR decay | 914 steps마다 0.98 |
 | precision | 16-mixed on V100, bf16-mixed on BF16 지원 GPU |
-| epochs | 20 |
+| epochs | 64 |
 | grad clip | 1.0 |
 
 MDG의 `[N, Ta, 5]` physical state는 `x, y, cos(heading), sin(heading), speed`로 둔다. raw heading 대신 `cos/sin`을 쓰면 angle wrapping 불연속이 줄어든다. `Ta=40 -> T=80` 복원은 action 하나를 0.1초 step 두 번에 걸쳐 적분한다.
 
 기본 모델 파라미터 수는 `7,111,168`개다. 모듈별로는 scene encoder `4,017,374`, denoiser `2,778,434`, auxiliary predictor `315,360`개다. encoder/denoiser/mixer depth와 attention head 수는 유지하고, `D=192`, `FFN=704`로 폭만 줄인 설정이다.
+
+learning rate는 기존 effective batch `32`에서 쓰던 `0.0002`를 기준으로, testas A100 7장 기본 effective batch `32 * 7 = 224`에 맞춰 sqrt scaling을 적용했다. 계산식은 `0.0002 * sqrt(224 / 32) = 0.00052915`다. LR schedule은 논문 설정인 global batch `32`, `20 epochs`, warmup `1000 steps`, decay interval `2000 steps`를 기준으로 전체 학습 진행률을 보존하도록 조정했다. 우리 설정은 global batch가 7배 크고 epoch이 `20 -> 64`로 `3.2`배 길어졌으므로 step scale은 `(64 / 20) / 7 = 0.457142...`이다. 따라서 warmup은 `1000 * 0.457142 ~= 457 steps`, decay interval은 `2000 * 0.457142 ~= 914 steps`로 둔다. decay factor `0.98`은 유지한다.
 
 ## 설치
 
@@ -160,6 +162,31 @@ tmux new-window -t hsb-rl-train -n mdg-upload \
 cache root 아래 `logs/` 같은 부가 디렉터리가 있어도 Nubes에는 `training`, `validation`,
 `testing`, `validation_tfrecords_splitted` 4개 data split만 업로드한다.
 
+Nubes에 업로드된 MDG cache를 `testas` 파드의 `/workspace/womd_v1_3/MDG_cache`로
+다운로드하려면 `ssh user@10.60.188.78`에서 아래 script를 실행한다.
+
+```bash
+cd /media/user/E/projects/catk
+git checkout MDG
+git pull --ff-only
+bash scripts/download_mdg_cache_to_testas.sh
+```
+
+다운로드 script 기본값:
+
+| 항목 | 기본값 |
+| --- | --- |
+| pod | `testas` |
+| local cache | `/workspace/womd_v1_3/MDG_cache` |
+| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache` |
+| nubes jobs | 96 |
+| expected files | 620,109 |
+
+`download_mdg_cache_to_testas.sh`는 `testas` 내부의 `/mnt/nuplan/projects/catk`를 `MDG`
+브랜치로 맞춘 뒤, pod 내부 tmux session `mdg-cache-download`에서
+`download_mdg_cache_from_nubes.sh`를 실행한다. 로그는
+`/workspace/womd_v1_3/logs/download_mdg_cache_from_nubes_*.log`에 남는다.
+
 기본 config는 cache root 아래 split을 다음처럼 기대한다.
 
 ```text
@@ -183,6 +210,9 @@ ${paths.cache_root}/testing
 ```bash
 CACHE_ROOT=/workspace/womd_v1_3/MDG_cache bash scripts/train.sh
 ```
+
+`CACHE_ROOT`를 명시하지 않는 경우에도 MDG 브랜치의 기본 학습/launcher script는
+`/workspace/womd_v1_3/MDG_cache`를 기본 cache root로 사용한다.
 
 직접 실행:
 
@@ -221,6 +251,68 @@ torchrun \
 논문 설정은 L40S 8장 기준이고 precision은 bf16이다. V100은 bf16을 지원하지 않으므로 기본 학습/제출 config는 `trainer.precision=16-mixed`로 둔다. L40S/A100/H100처럼 bf16을 지원하는 GPU에서는 `trainer.precision=bf16-mixed`로 바꿔도 된다.
 V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다. 모델 구조나 `eval_max_agents=128`, `n_rollout_closed_val=32`, `closed_loop_denoising_steps=16`은 제출 검증에서 유지해야 한다.
 학습 중 validation은 closed-loop 32 rollout과 16-step denoising을 포함하므로 `mdg_pretrain` 기본값은 `trainer.limit_val_batches=10`으로 제한한다. 전체 validation/submission은 `mdg_wosac_sub` 또는 별도 validate/test 실행에서 수행한다.
+
+### testas A100 7장 pretrain
+
+`testas` 파드에 cache가 `/workspace/womd_v1_3/MDG_cache`로 준비되어 있으면, `ssh user@10.60.188.78`에서 아래처럼 학습을 시작한다.
+
+```bash
+cd /media/user/E/projects/catk
+git checkout MDG
+git pull --ff-only
+
+TRAIN_BATCH_SIZE=32 \
+VAL_BATCH_SIZE=1 \
+DATA_NUM_WORKERS=4 \
+bash scripts/start_mdg_pretrain_testas_a100x7.sh
+```
+
+기본값은 A100 7장 단일 pod, `bf16-mixed`, per-GPU `train_batch_size=32`, global batch `224`, `max_epochs=64`이다. checkpoint monitor는 기존 pretrain과 동일하게 closed-loop metric `val_closed/sim_agents_2025/realism_meta_metric`을 `max` 기준으로 사용한다. closed-loop validation은 32 rollout과 16-step denoising을 수행하므로 `VAL_BATCH_SIZE=1`, `N_BATCH_SIM_AGENTS_METRIC=10`을 기본값으로 둔다.
+
+이 launcher는 기본적으로 `TRAIN_MEMORY_BALANCED_BATCHING=true`를 켠다. 이 기능은 `semi_control_stable`의 memory-balanced batching 개념을 MDG dataloader에 맞춘 것으로, training cache의 agent 수, 현재 valid agent 수, valid agent step 수, map 수 metadata를 만든 뒤 무거운 scene이 한 rank-local batch에 몰리지 않도록 batch sampler가 sample 순서를 재배치한다. metadata cache 기본 위치는 `${CACHE_ROOT}/.catk_metadata/training_mdg_memory_balance_v1.pt`이고, 첫 실행 때만 생성된다.
+
+denoiser는 inter-agent / agent-scene relation이 action timestep `Ta=40` 동안 변하지 않는 점을 이용해 relation embedding을 time-shared로 계산한다. 즉 기존처럼 `[B, N*Ta, S, D]` relation activation을 물리적으로 만들지 않고 `[B, N, S, D]`를 timestep 전체에서 공유한다. temporal attention은 relation bias가 없으므로 PyTorch SDPA 경로를 사용한다. 이 변경은 attention 수식, 학습 objective, 모델 파라미터 수를 바꾸지 않는 실행 최적화다.
+
+testas A100 7장 튜닝 결과는 다음과 같다.
+
+| per-GPU train batch | 결과 |
+| ---: | --- |
+| 36 | 32 step 통과, peak `78,493 MiB`, 약 `0.86 it/s`; 메모리 여유가 작고 sample/sec도 낮아 운영 기본값에서 제외 |
+| 34 | 96 step 통과, peak `74,229 MiB`, 약 `0.95 it/s` |
+| 32 | 96 step 통과, peak `70,647 MiB`, 약 `1.01 it/s`; closed-loop checkpoint monitor smoke도 통과 |
+| 28 | 48 step 통과, peak `61,321 MiB`, 약 `1.11 it/s` |
+| 24 | 48 step 통과, peak `52,963 MiB`, 약 `1.27 it/s` |
+| 20 | 48 step 통과, peak `44,417 MiB`, 약 `1.49 it/s` |
+| 10 | 48 step 통과, peak `22,955 MiB`, 약 `2.59 it/s` |
+
+MDG pretrain은 agent/map tensor를 각각 `[B, 64, ...]`, `[B, 320, ...]`로 고정 pad하므로, SMART/PyG 계열처럼 scene별 graph 크기 차이가 CUDA activation shape을 크게 바꾸지는 않는다. memory-balanced batching은 무거운 scene/rank 편중을 줄이는 안정화 용도로 유지한다. `bs=34`도 통과하지만 `bs=32`와 예상 epoch time이 거의 같고 메모리 여유가 더 작으므로, 운영 기본값은 안정성과 처리량을 함께 고려해 `TRAIN_BATCH_SIZE=32`로 둔다.
+
+training split `486,995`개 기준 step 수는 `ceil(486995 / 224) = 2,175` step/epoch이다. 최적화 후 memory-balanced `bs=32` 96-step probe에서 약 `1.01 it/s`가 관측되었고, 보수적으로 0.95-1.01 it/s를 잡으면 train step만 기준으로 1 epoch는 약 36-38분이다. 여기에 closed-loop validation 10 batch가 추가되므로 실제 wall-clock은 validation 수행 시간만큼 더 길어진다.
+
+진행 확인:
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- tmux attach -t mdg-pretrain-a100x7
+kubectl exec -n p-pnc testas -c main -- bash -lc \
+  'tail -f /mnt/nuplan/projects/catk/logs/testas_mdg_pretrain_a100x7/*.log'
+```
+
+임시 throughput 디버깅 용도로만 closed-loop checkpoint를 끄려면 아래처럼 실행할 수 있다. 정식 pretrain에서는 사용하지 않는다.
+
+```bash
+VAL_CLOSED_LOOP=false \
+N_BATCH_SIM_AGENTS_METRIC=0 \
+CHECKPOINT_MONITOR=val/loss \
+CHECKPOINT_MODE=min \
+bash scripts/start_mdg_pretrain_testas_a100x7.sh
+```
+
+memory-balanced batching을 끄고 비교하려면 아래처럼 실행한다.
+
+```bash
+TRAIN_MEMORY_BALANCED_BATCHING=false \
+bash scripts/start_mdg_pretrain_testas_a100x7.sh
+```
 
 ## 검증
 
@@ -281,7 +373,7 @@ pytest -q tests/test_mdg_pipeline.py
 
 ```bash
 python src/run.py action=fit \
-  paths.cache_root=womd_v1_3/cache/SMART \
+  paths.cache_root=/workspace/womd_v1_3/MDG_cache \
   logger=[] callbacks=[] \
   trainer.accelerator=cpu trainer.devices=1 trainer.precision=32 \
   trainer.limit_train_batches=1 trainer.limit_val_batches=0 trainer.max_epochs=1 \
@@ -300,7 +392,7 @@ Fast WOSAC 1-batch 스모크:
 
 ```bash
 CATK_TF_INTRA_OP_THREADS=1 CATK_TF_INTER_OP_THREADS=1 python src/run.py action=validate \
-  paths.cache_root=womd_v1_3/cache/SMART \
+  paths.cache_root=/workspace/womd_v1_3/MDG_cache \
   logger=[] callbacks=[] \
   trainer.accelerator=cpu trainer.devices=1 trainer.precision=32 \
   trainer.limit_val_batches=1 \

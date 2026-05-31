@@ -158,18 +158,142 @@ class RelativeMHA(nn.Module):
             rel_heads = rel_emb.view(bsz, num_query, num_key, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
             logits = (q.unsqueeze(3) * (k.unsqueeze(2) + rel_heads)).sum(dim=-1)
         else:
-            logits = torch.matmul(q, k.transpose(-2, -1))
+            attn_mask = None
+            if key_valid is not None:
+                attn_mask = key_valid[:, None, None, :]
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+            out = out.transpose(1, 2).contiguous().view(bsz, num_query, self.hidden_dim)
+            return self.out_proj(out)
 
         logits = logits / (self.head_dim ** 0.5)
         if key_valid is not None:
             logits = logits.masked_fill(~key_valid[:, None, None, :], -1.0e4)
         attn = self.dropout(torch.softmax(logits, dim=-1))
 
-        if rel_heads is not None:
-            out = (attn.unsqueeze(-1) * (v.unsqueeze(2) + rel_heads)).sum(dim=3)
-        else:
-            out = torch.matmul(attn, v)
+        out = (attn.unsqueeze(-1) * (v.unsqueeze(2) + rel_heads)).sum(dim=3)
         out = out.transpose(1, 2).contiguous().view(bsz, num_query, self.hidden_dim)
+        return self.out_proj(out)
+
+    def _shared_relation_heads(self, rel: Tensor) -> Tensor:
+        if self.rel_emb is None:
+            raise RuntimeError("Time-shared relation attention requires relation bias parameters.")
+        bsz, num_query, num_key = rel.shape[:3]
+        rel_emb = self.rel_emb(_fourier_relation_features(rel, self.num_relation_freq_bands))
+        return rel_emb.view(bsz, num_query, num_key, self.num_heads, self.head_dim).permute(0, 3, 1, 2, 4)
+
+    def forward_time_shared_self(
+        self,
+        query: Tensor,
+        key_value: Tensor,
+        rel: Tensor,
+        key_valid: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Relation-aware attention over agents with a separate time axis.
+
+        ``query`` and ``key_value`` have shape ``[B, T, N, D]`` while ``rel`` has
+        shape ``[B, N, N, 3]``. This is mathematically equivalent to flattening
+        ``[B, T]`` and repeating ``rel`` for each timestep, but it embeds the
+        relation tensor only once per scene.
+        """
+        bsz, num_time, num_query, _ = query.shape
+        num_key = int(key_value.shape[2])
+        q = self.q_proj(query).view(
+            bsz,
+            num_time,
+            num_query,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 1, 3, 2, 4)
+        k = self.k_proj(key_value).view(
+            bsz,
+            num_time,
+            num_key,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 1, 3, 2, 4)
+        v = self.v_proj(key_value).view(
+            bsz,
+            num_time,
+            num_key,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 1, 3, 2, 4)
+        rel_heads = self._shared_relation_heads(rel)
+
+        logits = torch.matmul(q, k.transpose(-2, -1))
+        logits = logits + torch.einsum("bthqd,bhqkd->bthqk", q, rel_heads)
+        logits = logits / (self.head_dim ** 0.5)
+        if key_valid is not None:
+            logits = logits.masked_fill(~key_valid[:, None, None, None, :], -1.0e4)
+        attn = self.dropout(torch.softmax(logits, dim=-1))
+
+        out = torch.matmul(attn, v)
+        out = out + torch.einsum("bthqk,bhqkd->bthqd", attn, rel_heads)
+        out = out.permute(0, 1, 3, 2, 4).contiguous().view(
+            bsz,
+            num_time,
+            num_query,
+            self.hidden_dim,
+        )
+        return self.out_proj(out)
+
+    def forward_time_shared_scene(
+        self,
+        query: Tensor,
+        key_value: Tensor,
+        rel: Tensor,
+        key_valid: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Relation-aware attention from agent-time queries to scene tokens.
+
+        ``query`` has shape ``[B, N, T, D]`` and ``rel`` has shape
+        ``[B, N, S, 3]``. Relation embeddings are shared across the ``T`` action
+        timesteps instead of materialized as ``[B, N*T, S, D]``.
+        """
+        bsz, num_agents, num_time, _ = query.shape
+        num_key = int(key_value.shape[1])
+        q = self.q_proj(query).view(
+            bsz,
+            num_agents,
+            num_time,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 2, 3, 1, 4)
+        k = self.k_proj(key_value).view(
+            bsz,
+            num_key,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 2, 1, 3)
+        v = self.v_proj(key_value).view(
+            bsz,
+            num_key,
+            self.num_heads,
+            self.head_dim,
+        ).permute(0, 2, 1, 3)
+        rel_heads = self._shared_relation_heads(rel)
+
+        logits = torch.einsum("bthnd,bhsd->bthns", q, k)
+        logits = logits + torch.einsum("bthnd,bhnsd->bthns", q, rel_heads)
+        logits = logits / (self.head_dim ** 0.5)
+        if key_valid is not None:
+            logits = logits.masked_fill(~key_valid[:, None, None, None, :], -1.0e4)
+        attn = self.dropout(torch.softmax(logits, dim=-1))
+
+        out = torch.einsum("bthns,bhsd->bthnd", attn, v)
+        out = out + torch.einsum("bthns,bhnsd->bthnd", attn, rel_heads)
+        out = out.permute(0, 3, 1, 2, 4).contiguous().view(
+            bsz,
+            num_agents,
+            num_time,
+            self.hidden_dim,
+        )
         return self.out_proj(out)
 
 
@@ -225,7 +349,7 @@ class CrossAttentionBlock(nn.Module):
         query: Tensor,
         key_value: Tensor,
         rel: Optional[Tensor],
-        key_valid: Tensor,
+        key_valid: Optional[Tensor],
         query_valid: Optional[Tensor] = None,
     ) -> Tensor:
         y = self.attn(
@@ -239,6 +363,40 @@ class CrossAttentionBlock(nn.Module):
         if query_valid is not None:
             query = query * query_valid.unsqueeze(-1).to(dtype=query.dtype)
         return query
+
+    def forward_time_shared_self(
+        self,
+        query: Tensor,
+        rel: Tensor,
+        key_valid: Tensor,
+    ) -> Tensor:
+        y = self.attn.forward_time_shared_self(
+            self.q_norm(query),
+            self.kv_norm(query),
+            rel=rel,
+            key_valid=key_valid,
+        )
+        query = query + self.attn_drop(y)
+        query = query + self.ffn(self.ffn_norm(query))
+        return query * key_valid[:, None, :, None].to(dtype=query.dtype)
+
+    def forward_time_shared_scene(
+        self,
+        query: Tensor,
+        key_value: Tensor,
+        rel: Tensor,
+        key_valid: Tensor,
+        query_valid: Tensor,
+    ) -> Tensor:
+        y = self.attn.forward_time_shared_scene(
+            self.q_norm(query),
+            self.kv_norm(key_value),
+            rel=rel,
+            key_valid=key_valid,
+        )
+        query = query + self.attn_drop(y)
+        query = query + self.ffn(self.ffn_norm(query))
+        return query * query_valid[:, :, None, None].to(dtype=query.dtype)
 
 
 @dataclass
@@ -526,20 +684,20 @@ class DenoiserBlock(nn.Module):
         temporal = self.temporal(temporal, temporal, rel=None, key_valid=None)
         x = temporal.reshape(bsz, num_agents, action_steps, hidden_dim)
 
-        inter = x.permute(0, 2, 1, 3).reshape(bsz * action_steps, num_agents, hidden_dim)
+        inter = x.permute(0, 2, 1, 3)
         rel_aa = relation_features(
             scene.agent_anchor_pos,
             scene.agent_anchor_heading,
             scene.agent_anchor_pos,
             scene.agent_anchor_heading,
         )
-        rel_aa = rel_aa.unsqueeze(1).expand(-1, action_steps, -1, -1, -1)
-        rel_aa = rel_aa.reshape(bsz * action_steps, num_agents, num_agents, 3)
-        valid_aa = agent_valid.unsqueeze(1).expand(-1, action_steps, -1).reshape(bsz * action_steps, num_agents)
-        inter = self.inter_agent(inter, inter, rel=rel_aa, key_valid=valid_aa, query_valid=valid_aa)
-        x = inter.reshape(bsz, action_steps, num_agents, hidden_dim).permute(0, 2, 1, 3)
+        inter = self.inter_agent.forward_time_shared_self(
+            inter,
+            rel=rel_aa,
+            key_valid=agent_valid,
+        )
+        x = inter.permute(0, 2, 1, 3)
 
-        query = x.reshape(bsz, num_agents * action_steps, hidden_dim)
         rel_as = relation_features(
             scene.agent_anchor_pos,
             scene.agent_anchor_heading,
@@ -549,17 +707,13 @@ class DenoiserBlock(nn.Module):
         )
         diag = torch.arange(num_agents, device=rel_as.device)
         rel_as[:, diag, diag] = 1.0e-4
-        rel_as = rel_as.unsqueeze(2).expand(-1, -1, action_steps, -1, -1)
-        rel_as = rel_as.reshape(bsz, num_agents * action_steps, scene.context.shape[1], 3)
-        query_valid = agent_valid.unsqueeze(-1).expand(-1, -1, action_steps).reshape(bsz, num_agents * action_steps)
-        query = self.scene(
-            query,
+        x = self.scene.forward_time_shared_scene(
+            x,
             scene.context,
             rel=rel_as,
             key_valid=scene.valid,
-            query_valid=query_valid,
+            query_valid=agent_valid,
         )
-        x = query.reshape(bsz, num_agents, action_steps, hidden_dim)
         return x * agent_valid[:, :, None, None].to(dtype=x.dtype)
 
 

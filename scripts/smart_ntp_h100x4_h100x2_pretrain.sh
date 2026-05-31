@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run SMART NTP pretrain across existing static H100 pods with uneven GPU counts.
+# Run MDG pretrain across existing static H100 pods with uneven GPU counts.
 #
 # The intended layout is hsb-npc-training(H100x4) + wo-pvc-2(H100x2). Prefer
 # launching through scripts/launch_smart_ntp_h100x4_h100x2.py, which exports
@@ -11,7 +11,7 @@ log() {
 }
 
 default_cache_root() {
-  printf '%s\n' "/workspace/womd_v1_3/SMART_cache"
+  printf '%s\n' "/workspace/womd_v1_3/MDG_cache"
 }
 
 activate_conda_if_available() {
@@ -136,9 +136,9 @@ main() {
   local node_rank="${NODE_RANK:-}"
   local master_addr="${MASTER_ADDR:-}"
   local master_port="${MASTER_PORT:-29531}"
-  local experiment="${CATK_EXPERIMENT:-pre_bc_a100x4x2}"
+  local experiment="${CATK_EXPERIMENT:-mdg_pretrain}"
   local action="${CATK_ACTION:-fit}"
-  local task_name="${TASK_NAME:-smart_ntp_pretrain_h100x4_h100x2}"
+  local task_name="${TASK_NAME:-mdg_wosac_pretrain_h100x4_h100x2}"
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
   local auto_resume="${CATK_AUTO_RESUME:-false}"
   local resume_task_name="${CATK_RESUME_TASK_NAME:-}"
@@ -189,7 +189,7 @@ main() {
     validate_strict_pretrain_overrides "$experiment" "$action" "$@"
   fi
 
-  log "starting SMART NTP H100x4+H100x2 pretrain"
+  log "starting MDG H100x4+H100x2 pretrain"
   log "  experiment:       $experiment"
   log "  action:           $action"
   log "  task_name:        $task_name"

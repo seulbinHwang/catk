@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run SMART NTP pretrain across two existing static A100x4 pods/nodes.
+# Run MDG pretrain across two existing static A100x4 pods/nodes.
 #
 # This script is executed inside every node. For the testa/testaa pair,
 # prefer launching it through scripts/launch_smart_ntp_a100x4x2_testa.py.
@@ -16,10 +16,10 @@ default_cache_root() {
   pod_name="$(hostname)"
   case "$pod_name" in
     testa*|testaa*)
-      printf '%s\n' "/workspace/womd_v1_3/SMART_cache"
+      printf '%s\n' "/workspace/womd_v1_3/MDG_cache"
       ;;
     *)
-      printf '%s\n' "/workspace/womd_v1_3/SMART_cache"
+      printf '%s\n' "/workspace/womd_v1_3/MDG_cache"
       ;;
   esac
 }
@@ -146,9 +146,9 @@ main() {
   local node_rank="${NODE_RANK:-}"
   local master_addr="${MASTER_ADDR:-}"
   local master_port="${MASTER_PORT:-29521}"
-  local experiment="${CATK_EXPERIMENT:-pre_bc_a100x4x2}"
+  local experiment="${CATK_EXPERIMENT:-mdg_pretrain}"
   local action="${CATK_ACTION:-fit}"
-  local task_name="${TASK_NAME:-smart_ntp_pretrain_a100x4x2}"
+  local task_name="${TASK_NAME:-mdg_wosac_pretrain_a100x4x2}"
   local run_id="${CATK_RUN_ID:-}"
   local ckpt_path="${CATK_CKPT_PATH:-${CKPT_PATH:-}}"
   local auto_resume="${CATK_AUTO_RESUME:-false}"
@@ -197,7 +197,7 @@ main() {
     validate_strict_a100_pretrain_overrides "$experiment" "$action" "$@"
   fi
 
-  log "starting SMART NTP A100x4x2 pretrain"
+  log "starting MDG A100x4x2 pretrain"
   log "  experiment:       $experiment"
   log "  action:           $action"
   log "  task_name:        $task_name"

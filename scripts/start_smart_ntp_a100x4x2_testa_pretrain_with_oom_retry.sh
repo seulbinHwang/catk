@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch SMART NTP A100x4x2 pretrain on existing testa/testaa pods with
+# Launch MDG A100x4x2 pretrain on existing testa/testaa pods with
 # automatic CUDA OOM fallback.
 #
 # The first attempt starts at INITIAL_BS=16 by default. If any pod log contains
@@ -20,13 +20,13 @@ CONTAINER="${CONTAINER:-main}"
 PODS="${PODS:-testa testaa}"
 PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_smart_ntp_a100x4x2_oom_retry_main}"
 REPO_URL="${REPO_URL:-https://github.com/seulbinHwang/catk.git}"
-BRANCH="${BRANCH:-main}"
+BRANCH="${BRANCH:-MDG}"
 GIT_REF="${GIT_REF:-}"
-TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs16_oom_retry_main}"
-SESSION="${SESSION:-catk-smart-ntp-a100x4x2}"
-EXPERIMENT="${EXPERIMENT:-pre_bc_a100x4x2}"
+TASK_NAME="${TASK_NAME:-mdg_wosac_pretrain_a100x4x2_bs16_oom_retry_main}"
+SESSION="${SESSION:-catk-mdg-a100x4x2}"
+EXPERIMENT="${EXPERIMENT:-mdg_pretrain}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
-CACHE_ROOT="${CACHE_ROOT:-}"
+CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/MDG_cache}"
 POD_CACHE_ROOTS="${POD_CACHE_ROOTS:-}"
 MASTER_PORT="${MASTER_PORT:-29521}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"

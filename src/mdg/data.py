@@ -11,6 +11,11 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
+from src.mdg.memory_balanced_batch_sampler import (
+    MemoryBalancedDistributedBatchSampler,
+    load_or_build_memory_metadata,
+    memory_balance_weights,
+)
 from src.smart.datamodules.exact_distributed_sampler import ExactDistributedSampler
 
 
@@ -348,6 +353,16 @@ class MDGDataModule(LightningDataModule):
         max_map_polylines: int = 320,
         map_waypoints: int = 16,
         max_traffic_lights: int = 16,
+        train_memory_balanced_batching: bool = False,
+        train_memory_balanced_batches: Optional[bool] = None,
+        train_memory_balance_metadata_cache: Optional[str] = None,
+        train_memory_balance_metadata_num_workers: int = 8,
+        train_memory_balance_build_on_missing: bool = True,
+        train_memory_balance_agent_weight: float = 1.0,
+        train_memory_balance_current_valid_agent_weight: float = 1.0,
+        train_memory_balance_valid_agent_step_weight: float = 0.0,
+        train_memory_balance_map_weight: float = 0.02,
+        train_memory_balance_seed: int = 0,
     ) -> None:
         super().__init__()
         self.train_batch_size = train_batch_size
@@ -366,6 +381,21 @@ class MDGDataModule(LightningDataModule):
         self.max_map_polylines = max_map_polylines
         self.map_waypoints = map_waypoints
         self.max_traffic_lights = max_traffic_lights
+        if train_memory_balanced_batches is not None:
+            train_memory_balanced_batching = bool(train_memory_balanced_batches)
+        self.train_memory_balanced_batching = bool(train_memory_balanced_batching)
+        self.train_memory_balance_metadata_cache = train_memory_balance_metadata_cache
+        self.train_memory_balance_metadata_num_workers = int(train_memory_balance_metadata_num_workers)
+        self.train_memory_balance_build_on_missing = bool(train_memory_balance_build_on_missing)
+        self.train_memory_balance_agent_weight = float(train_memory_balance_agent_weight)
+        self.train_memory_balance_current_valid_agent_weight = float(
+            train_memory_balance_current_valid_agent_weight
+        )
+        self.train_memory_balance_valid_agent_step_weight = float(
+            train_memory_balance_valid_agent_step_weight
+        )
+        self.train_memory_balance_map_weight = float(train_memory_balance_map_weight)
+        self.train_memory_balance_seed = int(train_memory_balance_seed)
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage in {"fit", None}:
@@ -444,7 +474,40 @@ class MDGDataModule(LightningDataModule):
             collate_fn=collate_mdg_samples,
         )
 
+    def _build_memory_balanced_batch_sampler(self) -> MemoryBalancedDistributedBatchSampler:
+        world_size, rank = self._world_info()
+        metadata = load_or_build_memory_metadata(
+            self.train_dataset.raw_paths,
+            cache_path=self.train_memory_balance_metadata_cache,
+            num_workers=self.train_memory_balance_metadata_num_workers,
+            build_on_missing=self.train_memory_balance_build_on_missing,
+        )
+        sample_weight = memory_balance_weights(
+            metadata,
+            agent_weight=self.train_memory_balance_agent_weight,
+            current_valid_agent_weight=self.train_memory_balance_current_valid_agent_weight,
+            valid_agent_step_weight=self.train_memory_balance_valid_agent_step_weight,
+            map_weight=self.train_memory_balance_map_weight,
+        )
+        return MemoryBalancedDistributedBatchSampler(
+            sample_weight=sample_weight,
+            batch_size=self.train_batch_size,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=self.shuffle,
+            seed=self.train_memory_balance_seed,
+        )
+
     def train_dataloader(self) -> DataLoader:
+        if self.train_memory_balanced_batching:
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=self._build_memory_balanced_batch_sampler(),
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                persistent_workers=self.persistent_workers,
+                collate_fn=collate_mdg_samples,
+            )
         return self._dataloader(self.train_dataset, self.train_batch_size, self.shuffle)
 
     def val_dataloader(self) -> DataLoader:

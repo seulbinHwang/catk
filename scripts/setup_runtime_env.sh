@@ -26,10 +26,12 @@ source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
 if [ -z "${CACHE_ROOT:-}" ]; then
-  if [ -d "/media/user/E/dataset/womd_v1_3/SMART_cache" ]; then
-    CACHE_ROOT="/media/user/E/dataset/womd_v1_3/SMART_cache"
+  if [ -d "/workspace/womd_v1_3/MDG_cache" ]; then
+    CACHE_ROOT="/workspace/womd_v1_3/MDG_cache"
+  elif [ -d "/media/user/F/dataset/womd_v1_3/MDG_cache" ]; then
+    CACHE_ROOT="/media/user/F/dataset/womd_v1_3/MDG_cache"
   else
-    CACHE_ROOT="/scratch/cache/SMART"
+    CACHE_ROOT="/workspace/womd_v1_3/MDG_cache"
   fi
 fi
 export CACHE_ROOT

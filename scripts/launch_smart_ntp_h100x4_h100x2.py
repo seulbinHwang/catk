@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch SMART NTP pretrain on hsb-npc-training(H100x4) + wo-pvc-2(H100x2).
+"""Launch MDG pretrain on hsb-npc-training(H100x4) + wo-pvc-2(H100x2).
 
 This launcher never creates, deletes, or restarts pods. It only runs
 ``kubectl exec`` against already-running pods and starts/kills tmux sessions
@@ -18,13 +18,13 @@ import sys
 
 DEFAULT_NAMESPACE = "p-pnc"
 DEFAULT_PODS = ["hsb-npc-training", "wo-pvc-2"]
-DEFAULT_BRANCH = "main"
+DEFAULT_BRANCH = "MDG"
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
-DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
+DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/MDG_cache"
 DEFAULT_CACHE_ROOT_BY_POD = {
-    "hsb-npc-training": "/workspace/womd_v1_3/SMART_cache",
-    "wo-pvc-2": "/workspace/womd_v1_3/SMART_cache",
+    "hsb-npc-training": "/workspace/womd_v1_3/MDG_cache",
+    "wo-pvc-2": "/workspace/womd_v1_3/MDG_cache",
 }
 DEFAULT_GPU_COUNT_BY_POD = {
     "hsb-npc-training": 4,
@@ -454,7 +454,7 @@ def exec_in_pod(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Start SMART NTP H100x4+H100x2 pretrain in tmux on existing pods.",
+        description="Start MDG H100x4+H100x2 pretrain in tmux on existing pods.",
     )
     parser.add_argument("--namespace", default=os.environ.get("NAMESPACE", DEFAULT_NAMESPACE))
     parser.add_argument(
@@ -501,9 +501,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="With --auto-resume, start from scratch if no checkpoint is found.",
     )
-    parser.add_argument("--experiment", default=STRICT_EXPERIMENT)
+    parser.add_argument("--experiment", default="mdg_pretrain")
     parser.add_argument("--task-name", default="")
-    parser.add_argument("--session", default="catk-smart-ntp-h100x4-h100x2")
+    parser.add_argument("--session", default="catk-mdg-h100x4-h100x2")
     parser.add_argument("--master-addr", default="")
     parser.add_argument("--master-port", default="29531")
     parser.add_argument("--nproc-per-node", type=validate_nproc_per_node, default="gpu")
@@ -545,7 +545,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--monitor-interval must be >= 1")
     if not args.task_name:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.task_name = f"smart_ntp_pretrain_h100x4_h100x2_{stamp}"
+        args.task_name = f"mdg_wosac_pretrain_h100x4_h100x2_{stamp}"
     return args
 
 

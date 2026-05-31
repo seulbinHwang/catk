@@ -146,13 +146,13 @@ def compute_type_scale(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compute fixed WOSAC CPD/CES type scales from SMART training cache."
+        description="Compute fixed WOSAC CPD/CES type scales from MDG training cache."
     )
     parser.add_argument(
         "--train-dir",
         type=Path,
-        default=Path("/workspace/womd_v1_3/SMART_cache/training"),
-        help="SMART training cache directory containing scenario .pkl files.",
+        default=Path("/workspace/womd_v1_3/MDG_cache/training"),
+        help="MDG training cache directory containing scenario .pkl files.",
     )
     parser.add_argument("--num-historical-steps", type=int, default=11)
     parser.add_argument("--num-agent-types", type=int, default=3)
