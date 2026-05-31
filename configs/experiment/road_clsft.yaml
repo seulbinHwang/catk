@@ -12,7 +12,7 @@ model:
     n_vis_scenario: 0
     n_vis_rollout: 0
     decoder:
-      num_freq_bands: 88
+      num_freq_bands: 66
     training_rollout_sampling:
       criterium: topk_prob_sampled_with_dist
       num_k: -1
