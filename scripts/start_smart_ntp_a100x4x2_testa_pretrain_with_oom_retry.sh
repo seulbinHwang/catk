@@ -9,6 +9,8 @@
 #
 # This script runs on the local machine with kubectl access. It never creates,
 # deletes, or restarts pods.
+# It also guards against accidentally launching the SMART pretrain from a
+# different local branch whose wrapper defaults may point at another cache.
 
 set -uo pipefail
 
@@ -26,7 +28,7 @@ TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_a100x4x2_bs16_oom_retry_main}"
 SESSION="${SESSION:-catk-smart-ntp-a100x4x2}"
 EXPERIMENT="${EXPERIMENT:-pre_bc_a100x4x2}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
-CACHE_ROOT="${CACHE_ROOT:-}"
+CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
 POD_CACHE_ROOTS="${POD_CACHE_ROOTS:-}"
 MASTER_PORT="${MASTER_PORT:-29521}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
@@ -45,6 +47,7 @@ LEARNING_RATE="${LEARNING_RATE:-}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
+SKIP_LOCAL_CHECKOUT_GUARD="${SKIP_LOCAL_CHECKOUT_GUARD:-0}"
 
 if [[ -z "$PYTHON_BIN" ]]; then
   if command -v python >/dev/null 2>&1; then
@@ -85,6 +88,41 @@ OOM_REGEX='OutOfMemoryError|CUDA out of memory|c10::OutOfMemoryError|cuda runtim
 timestamp() { date '+%F %T %Z'; }
 log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
 remote_quote() { printf '%q' "$1"; }
+
+validate_local_launcher_checkout() {
+  if [[ "$SKIP_LOCAL_CHECKOUT_GUARD" == "1" ]]; then
+    log "SKIP_LOCAL_CHECKOUT_GUARD=1; not validating local launcher checkout."
+    return 0
+  fi
+  if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    log "ERROR: this wrapper must be launched from a git checkout of branch ${BRANCH}."
+    exit 2
+  fi
+
+  local local_branch local_head expected_head pinned_head
+  local_branch="$(git branch --show-current 2>/dev/null || true)"
+  local_head="$(git rev-parse HEAD)"
+
+  if [[ "$local_branch" == "$BRANCH" ]]; then
+    return 0
+  fi
+  if expected_head="$(git rev-parse --verify "origin/${BRANCH}" 2>/dev/null)"; then
+    if [[ "$local_head" == "$expected_head" ]]; then
+      return 0
+    fi
+  fi
+  if [[ -n "$GIT_REF" ]] && pinned_head="$(git rev-parse --verify "$GIT_REF" 2>/dev/null)"; then
+    if [[ "$local_head" == "$pinned_head" ]]; then
+      return 0
+    fi
+  fi
+
+  log "ERROR: refusing to launch SMART pretrain from local branch '${local_branch:-detached}' (${local_head:0:8})."
+  log "ERROR: expected local launcher checkout to be '${BRANCH}' or origin/${BRANCH}."
+  log "ERROR: this prevents accidentally using another branch's cache defaults."
+  log "ERROR: checkout ${BRANCH} first, or set SKIP_LOCAL_CHECKOUT_GUARD=1 only if you know the local launcher is compatible."
+  exit 2
+}
 
 prepare_project_root() {
   local pod repo_q root_q branch_q git_ref_q script
@@ -162,6 +200,75 @@ find_latest_epoch_last_ckpt() {
   runs_dir_q="$(remote_quote "$runs_dir")"
   cmd="{ ls -t ${runs_dir_q}/*/checkpoints/epoch_last.ckpt 2>/dev/null; ls -t ${runs_dir_q}/*/checkpoints/last.ckpt 2>/dev/null; } | head -1"
   kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "$cmd" 2>/dev/null | tr -d '\r'
+}
+
+remote_file_exists() {
+  local pod="$1"
+  local path="$2"
+  local path_q
+  path_q="$(remote_quote "$path")"
+  kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "[ -f ${path_q} ]" >/dev/null 2>&1
+}
+
+remote_file_size() {
+  local pod="$1"
+  local path="$2"
+  local path_q
+  path_q="$(remote_quote "$path")"
+  kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "stat -c '%s' ${path_q}" 2>/dev/null | tr -d '\r'
+}
+
+sync_resume_checkpoint_to_all_pods() {
+  local ckpt_path="$1"
+  local pod source_size target_size ckpt_dir tmp_path ckpt_path_q ckpt_dir_q tmp_path_q
+  if [[ -z "$ckpt_path" ]]; then
+    return 0
+  fi
+
+  if ! remote_file_exists "$MASTER_POD" "$ckpt_path"; then
+    log "ERROR: resume checkpoint does not exist on master pod ${MASTER_POD}: ${ckpt_path}"
+    exit 2
+  fi
+  source_size="$(remote_file_size "$MASTER_POD" "$ckpt_path")"
+  if [[ -z "$source_size" || "$source_size" == "0" ]]; then
+    log "ERROR: resume checkpoint on ${MASTER_POD} has invalid size: ${ckpt_path} (${source_size:-empty})"
+    exit 2
+  fi
+
+  ckpt_dir="$(dirname "$ckpt_path")"
+  ckpt_path_q="$(remote_quote "$ckpt_path")"
+  ckpt_dir_q="$(remote_quote "$ckpt_dir")"
+
+  for pod in "${POD_ARRAY[@]}"; do
+    if remote_file_exists "$pod" "$ckpt_path"; then
+      target_size="$(remote_file_size "$pod" "$ckpt_path")"
+      if [[ "$target_size" == "$source_size" ]]; then
+        continue
+      fi
+      log "resume checkpoint exists on ${pod} but size differs (${target_size} != ${source_size}); replacing it."
+    else
+      log "resume checkpoint missing on ${pod}; copying from ${MASTER_POD}."
+    fi
+
+    if [[ "$DRY_RUN" == "1" ]]; then
+      log "dry-run checkpoint sync: ${MASTER_POD}:${ckpt_path} -> ${pod}:${ckpt_path}"
+      continue
+    fi
+
+    tmp_path="${ckpt_path}.tmp.$$"
+    tmp_path_q="$(remote_quote "$tmp_path")"
+    kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "mkdir -p ${ckpt_dir_q}"
+    if ! kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "cat ${ckpt_path_q}" \
+      | kubectl exec -i -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "cat > ${tmp_path_q} && mv ${tmp_path_q} ${ckpt_path_q}"; then
+      log "ERROR: failed to copy resume checkpoint to ${pod}: ${ckpt_path}"
+      exit 2
+    fi
+    target_size="$(remote_file_size "$pod" "$ckpt_path")"
+    if [[ "$target_size" != "$source_size" ]]; then
+      log "ERROR: checkpoint copy size mismatch on ${pod}: ${target_size} != ${source_size}"
+      exit 2
+    fi
+  done
 }
 
 stop_attempt_sessions() {
@@ -319,6 +426,7 @@ bs="$INITIAL_BS"
 attempt=0
 non_oom_retry_count=0
 
+validate_local_launcher_checkout
 prepare_project_root
 
 while (( bs >= MIN_BS )); do
@@ -328,6 +436,7 @@ while (( bs >= MIN_BS )); do
 
   if [[ -n "$latest_ckpt" ]]; then
     log "Attempt #${attempt}: bs=${bs}, resume ckpt=${latest_ckpt}"
+    sync_resume_checkpoint_to_all_pods "$latest_ckpt"
   else
     log "Attempt #${attempt}: bs=${bs}, fresh fit (no epoch_last.ckpt found yet)"
   fi

@@ -153,7 +153,8 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain.sh
 bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh
 ```
 
-이 retry wrapper는 기본 `INITIAL_BS=16`, `OOM_STEP=1`, `MIN_BS=8`이다.
+이 retry wrapper는 기본 `INITIAL_BS=16`, `OOM_STEP=1`, `MIN_BS=8`이며,
+`CACHE_ROOT=/workspace/womd_v1_3/SMART_cache`를 명시적으로 넘긴다.
 validation/test batch는 기본 12로 유지한다. 즉 장기 학습의 시작 train batch는 16이고,
 OOM marker가 보이면 train batch만 15, 14, ... 순서로 낮춰 이어간다.
 각 attempt는 같은 task name 아래에서 시작하고, pod tmux 로그에
@@ -162,13 +163,21 @@ OOM marker가 보이면 train batch만 15, 14, ... 순서로 낮춰 이어간다
 가장 최신 checkpoint를 찾아 다음 attempt의 `ckpt_path`로 넘긴다. 즉 OOM 이후에는
 `data.train_batch_size`만 1 줄이고 optimizer, scheduler, epoch, global step을 가능한 한
 보존해서 resume한다. checkpoint가 아직 없으면 같은 task name으로 새 attempt를 시작한다.
+checkpoint가 master pod에만 남아 있을 수 있으므로, resume 전에 같은 checkpoint path를
+다른 pod에도 복사하고 파일 크기를 확인한 뒤 다음 attempt를 시작한다.
 OOM이 아닌 실패는 조용히 batch를 낮추지 않고 중단한다.
 
 retry wrapper는 기본적으로 pod 안의 `/tmp/catk_smart_ntp_a100x4x2_oom_retry_main`에
 script-managed clean checkout을 준비하고, 매 attempt 전에 그 checkout을 `origin/main`으로
 맞춘다. 따라서 기존 `/mnt/nuplan/projects/catk` checkout에 로컬 수정이나 detached HEAD가
 남아 있어도 retry 학습 실행에는 영향을 주지 않는다. 다른 위치를 쓰려면
-`PROJECT_ROOT=/path/to/checkout`을 명시한다.
+`PROJECT_ROOT=/path/to/checkout`을 명시한다. 단, launcher를 실행하는 로컬 checkout 자체가
+`main` 또는 `origin/main`이 아니면 wrapper가 시작 전에 중단한다. 이는 다른 브랜치의
+launcher/cache 기본값이 섞여 `/workspace/womd_v1_3/MDG_cache` 같은 잘못된 cache root로
+재시작되는 일을 막기 위한 guard다.
+개별 wrapper는 공통 retry wrapper를 현재 shell의 working directory가 아니라 자기 파일이 있는
+`scripts/` 디렉터리에서 해석하므로, 다른 checkout에서 절대경로로 실행해도 다른 브랜치의
+`scripts/`가 섞이지 않는다.
 
 주요 override는 환경 변수로 지정한다.
 
@@ -207,17 +216,19 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_legacy_inputs_trainselectfa
 ```
 
 기본 task name은
-`smart_ntp_pretrain_a100x4x2_bs14_oom_retry_main_original_legacy_inputs_trainselectfalse_post5069_20260531`이다.
-이 wrapper는 비교 기준 run과 같이 `testa testaa`, `INITIAL_BS=14`,
-`VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12`, `data.train_use_eval_agent_selection=false`를
-사용한다. 차이는 학습 checkout을 `main@5069a44`로 pin해서, 아래 후속 변경을 포함한다는
-점이다.
+`smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_post5069_20260531`이다.
+이 wrapper는 비교 기준 run과 같이 `testa testaa`, `VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12`,
+`data.train_use_eval_agent_selection=false`를 사용하되, 이전 batch 14 probe에서 OOM이 확인되어
+시작값은 `INITIAL_BS=13`으로 둔다. `CACHE_ROOT=/workspace/womd_v1_3/SMART_cache`도 wrapper가
+명시적으로 고정하므로, 로컬 shell에 다른 cache 기본값이 남아 있어도 SMART cache를 사용한다.
+차이는 학습 checkout을 `main@5069a44`로 pin해서, 아래 후속 변경을 포함한다는 점이다.
 
 | 항목 | 기존 `...trainselectfalse_20260528` | 후속 `...post5069_20260531` |
 |---|---|---|
 | 코드 기준 | legacy-inputs/trainselectfalse 당시 main | `main@5069a44` |
 | 학습 대상 선택 | `train_use_eval_agent_selection=false` | 동일 |
-| 시작 train batch | 14, OOM 시 1씩 감소 | 동일 |
+| 시작 train batch | 14, OOM 시 1씩 감소 | 13, OOM 시 1씩 감소 |
+| cache root | `/workspace/womd_v1_3/SMART_cache` | `/workspace/womd_v1_3/SMART_cache` 명시 고정 |
 | validation/test batch | 12 / 12 | 동일 |
 | Fourier band | `num_freq_bands=88` | 동일 |
 | optimizer recipe | 기존 run 기준 | `lr=5e-4`, warmup 0, gradient clip 0.5가 명시된 최신 preset |

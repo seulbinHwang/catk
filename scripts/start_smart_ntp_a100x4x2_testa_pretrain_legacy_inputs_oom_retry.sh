@@ -20,6 +20,8 @@
 # and the legacy train target selection used by d238-era SMART pretraining.
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 export PODS="${PODS:-testa testaa}"
 export BRANCH="${BRANCH:-main}"
 export EXPERIMENT="${EXPERIMENT:-pre_bc_a100x4x2}"
@@ -39,4 +41,4 @@ else
   export EXTRA_HYDRA_OVERRIDES="${LEGACY_TARGET_SELECTION_OVERRIDE}"
 fi
 
-exec bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh "$@"
+exec bash "${SCRIPT_DIR}/start_smart_ntp_a100x4x2_testa_pretrain_with_oom_retry.sh" "$@"
