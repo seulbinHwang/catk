@@ -250,7 +250,7 @@ torchrun \
 
 논문 설정은 L40S 8장 기준이고 precision은 bf16이다. V100은 bf16을 지원하지 않으므로 기본 학습/제출 config는 `trainer.precision=16-mixed`로 둔다. L40S/A100/H100처럼 bf16을 지원하는 GPU에서는 `trainer.precision=bf16-mixed`로 바꿔도 된다.
 V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다. 모델 구조나 `eval_max_agents=128`, `n_rollout_closed_val=32`, `closed_loop_denoising_steps=16`은 제출 검증에서 유지해야 한다.
-학습 중 validation은 closed-loop 32 rollout과 16-step denoising을 포함하므로 `mdg_pretrain` 기본값은 `trainer.limit_val_batches=10`으로 제한한다. 전체 validation/submission은 `mdg_wosac_sub` 또는 별도 validate/test 실행에서 수행한다.
+학습 중 validation은 closed-loop 32 rollout과 16-step denoising을 포함한다. `mdg_pretrain` 기본값은 `trainer.check_val_every_n_epoch=16`, `trainer.limit_val_batches=0.1`, `data.val_batch_size=12`이며, `model.model_config.scorer_scene_num=1680`이 켜져 있으면 GPU 수와 validation batch size에 맞춰 Fast WOSAC scorer batch 수를 자동으로 맞춘다. A100 7장, per-GPU validation batch 12에서는 per-rank `n_batch_sim_agents_metric=20`으로 보정되어 총 1,680개 scenario가 scorer에 들어간다. fit 중에는 checkpoint 점수 계산 시간을 제한하기 위해 validation loop cap도 이 scorer batch 수로 줄인다. 전체 validation/submission은 `mdg_wosac_sub` 또는 별도 validate/test 실행에서 수행한다.
 
 ### testas A100 7장 pretrain
 
@@ -262,12 +262,14 @@ git checkout MDG
 git pull --ff-only
 
 TRAIN_BATCH_SIZE=32 \
-VAL_BATCH_SIZE=1 \
+VAL_BATCH_SIZE=12 \
 DATA_NUM_WORKERS=4 \
 bash scripts/start_mdg_pretrain_testas_a100x7.sh
 ```
 
-기본값은 A100 7장 단일 pod, `bf16-mixed`, per-GPU `train_batch_size=32`, global batch `224`, `max_epochs=64`이다. checkpoint monitor는 기존 pretrain과 동일하게 closed-loop metric `val_closed/sim_agents_2025/realism_meta_metric`을 `max` 기준으로 사용한다. closed-loop validation은 32 rollout과 16-step denoising을 수행하므로 `VAL_BATCH_SIZE=1`, `N_BATCH_SIM_AGENTS_METRIC=10`을 기본값으로 둔다.
+기본값은 A100 7장 단일 pod, `bf16-mixed`, per-GPU `train_batch_size=32`, global batch `224`, `max_epochs=64`이다. checkpoint monitor는 기존 pretrain과 동일하게 closed-loop metric `val_closed/sim_agents_2025/realism_meta_metric`을 `max` 기준으로 사용한다. 학습 중 validation 기본값은 `VAL_BATCH_SIZE=12`, `LIMIT_VAL_BATCHES=0.1`, `SCORER_SCENE_NUM=1680`, `N_BATCH_SIM_AGENTS_METRIC=10`이다. `SCORER_SCENE_NUM`이 양수이면 코드가 `N_BATCH_SIM_AGENTS_METRIC`을 런타임에 덮어쓴다. A100 7장에서는 `ceil(ceil(1680 / 7) / 12) = 20`이므로 rank마다 20 validation batch까지 Fast WOSAC scorer를 업데이트한다.
+
+MDG의 multi-step closed-loop denoising은 full-noise mask에서 시작해 clean mask로 내려가는 schedule을 쓴다. 현재 기본값 `closed_loop_denoising_steps=16`, `num_noise_levels=5`에서는 mask level이 최고 level `4`에서 시작해 최종 level `0`으로 내려간다. 각 intermediate step은 모델의 clean action estimate를 다음 mask level로 다시 noising한 뒤 다음 denoising call에 넣는다. 논문 WOSAC leaderboard 설정은 one-step closed-loop denoising이지만, 이 구현은 사용자가 요청한 16-step validation/sampling 실험을 위해 같은 MDG mask-denoising 원리를 확장한 설정이다.
 
 이 launcher는 기본적으로 `TRAIN_MEMORY_BALANCED_BATCHING=true`를 켠다. 이 기능은 `semi_control_stable`의 memory-balanced batching 개념을 MDG dataloader에 맞춘 것으로, training cache의 agent 수, 현재 valid agent 수, valid agent step 수, map 수 metadata를 만든 뒤 무거운 scene이 한 rank-local batch에 몰리지 않도록 batch sampler가 sample 순서를 재배치한다. metadata cache 기본 위치는 `${CACHE_ROOT}/.catk_metadata/training_mdg_memory_balance_v1.pt`이고, 첫 실행 때만 생성된다.
 
@@ -332,7 +334,7 @@ python -m src.run \
   paths.cache_root=/workspace/womd_v1_3/MDG_cache \
   model.model_config.n_rollout_closed_val=32 \
   model.model_config.closed_loop_denoising_steps=16 \
-  model.model_config.n_batch_sim_agents_metric=10 \
+  model.model_config.scorer_scene_num=1680 \
   data.eval_max_agents=128
 ```
 

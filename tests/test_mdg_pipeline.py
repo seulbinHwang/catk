@@ -308,7 +308,10 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert submission_cfg.model.model_config.val_closed_loop is True
     assert submission_cfg.model.model_config.sim_agents_submission.is_active is True
     assert pretrain_cfg.trainer.precision == "16-mixed"
-    assert pretrain_cfg.trainer.limit_val_batches == 10
+    assert pretrain_cfg.trainer.limit_val_batches == 0.1
+    assert pretrain_cfg.trainer.check_val_every_n_epoch == 16
+    assert pretrain_cfg.data.val_batch_size == 12
+    assert pretrain_cfg.model.model_config.scorer_scene_num == 1680
     assert submission_cfg.trainer.precision == "16-mixed"
 
     model = MDG(model_cfg)
