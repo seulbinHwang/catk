@@ -21,7 +21,6 @@ data:
   num_workers: 8
   shuffle: false
   pin_memory: false
-  eval_max_agents: 128
 
 model:
   model_config:

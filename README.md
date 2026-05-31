@@ -23,7 +23,7 @@
 | action chunk | 2 |
 | reduced action steps | 40 |
 | train agents | 64 |
-| eval/submission agents | 128 |
+| eval/submission agents | all current-valid cached agents |
 | map polylines | 320 |
 | waypoints per polyline | 16 |
 | traffic lights | 16 |
@@ -249,7 +249,7 @@ torchrun \
 ```
 
 논문 설정은 L40S 8장 기준이고 precision은 bf16이다. V100은 bf16을 지원하지 않으므로 기본 학습/제출 config는 `trainer.precision=16-mixed`로 둔다. L40S/A100/H100처럼 bf16을 지원하는 GPU에서는 `trainer.precision=bf16-mixed`로 바꿔도 된다.
-V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다. 모델 구조나 `eval_max_agents=128`, `n_rollout_closed_val=32`, `closed_loop_denoising_steps=5`는 제출 검증에서 유지해야 한다.
+V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다. 학습은 논문 설정처럼 SDC 포함 nearest 64 agents를 쓰지만, validation/test/submission은 Fast WOSAC이 요구하는 `sim_agent_ids`가 누락되지 않도록 cache의 current-valid agents를 모두 유지하고 batch 안에서 agent 축을 동적 padding한다. 모델 구조, `n_rollout_closed_val=32`, `closed_loop_denoising_steps=5`는 제출 검증에서 유지해야 한다.
 학습 중 validation은 closed-loop 32 rollout과 5-step denoising을 포함한다. `mdg_pretrain` 기본값은 `trainer.check_val_every_n_epoch=16`, `trainer.limit_val_batches=0.1`, `data.val_batch_size=12`이며, `model.model_config.scorer_scene_num=1680`이 켜져 있으면 GPU 수와 validation batch size에 맞춰 Fast WOSAC scorer batch 수를 자동으로 맞춘다. A100 7장, per-GPU validation batch 12에서는 per-rank `n_batch_sim_agents_metric=20`으로 보정되어 총 1,680개 scenario가 scorer에 들어간다. fit 중에는 checkpoint 점수 계산 시간을 제한하기 위해 validation loop cap도 이 scorer batch 수로 줄인다. 전체 validation/submission은 `mdg_wosac_sub` 또는 별도 validate/test 실행에서 수행한다.
 
 ### testas A100 7장 pretrain
@@ -334,11 +334,10 @@ python -m src.run \
   paths.cache_root=/workspace/womd_v1_3/MDG_cache \
   model.model_config.n_rollout_closed_val=32 \
   model.model_config.closed_loop_denoising_steps=5 \
-  model.model_config.scorer_scene_num=1680 \
-  data.eval_max_agents=128
+  model.model_config.scorer_scene_num=1680
 ```
 
-`data.eval_max_agents`를 128보다 작게 줄이면 Waymo GT scenario의 agent 수와 prediction agent 수가 달라져 Fast WOSAC metric이 실패할 수 있다. 빠른 개발 스모크에서만 줄이고, metric/submission 검증은 128로 둔다.
+MDG eval/test/submission dataloader는 더 이상 `eval_max_agents` hard cap을 쓰지 않는다. 각 scene의 current-valid cached agents를 모두 유지한 뒤 batch-local max agent 수로 padding하므로, validation TFRecord의 `sim_agent_ids`가 128명을 넘는 scene도 Fast WOSAC metric에 필요한 prediction agent를 누락하지 않는다. 기존 command에 `data.eval_max_agents=...` override가 남아 있어도 deprecated no-op으로 무시된다.
 
 ## 제출물 생성
 
@@ -398,7 +397,7 @@ CATK_TF_INTRA_OP_THREADS=1 CATK_TF_INTER_OP_THREADS=1 python src/run.py action=v
   logger=[] callbacks=[] \
   trainer.accelerator=cpu trainer.devices=1 trainer.precision=32 \
   trainer.limit_val_batches=1 \
-  data.num_workers=0 data.val_batch_size=1 data.eval_max_agents=128 \
+  data.num_workers=0 data.val_batch_size=1 \
   data.max_map_polylines=16 data.max_traffic_lights=4 \
   model.model_config.n_rollout_closed_val=32 \
   model.model_config.closed_loop_denoising_steps=2 \
@@ -415,7 +414,7 @@ CATK_TF_INTRA_OP_THREADS=1 CATK_TF_INTER_OP_THREADS=1 python src/run.py action=v
 
 ## 코드 구조
 
-- `src/mdg/data.py`: WOMD cache loader, fixed-size MDG tensor 구성, DDP exact eval sampler.
+- `src/mdg/data.py`: WOMD cache loader, train nearest-64 구성, eval/test all-agent dynamic padding, DDP exact eval sampler.
 - `src/mdg/modules.py`: scene encoder, differentiable kinematic dynamics, MDG denoiser, auxiliary predictor.
 - `src/mdg/model.py`: LightningModule, mask/noise objective, 1~5-step closed-loop rollout, Fast WOSAC metric/submission 연결.
 - `src/mdg/geometry.py`: 좌표 변환, angle wrapping, relation feature.

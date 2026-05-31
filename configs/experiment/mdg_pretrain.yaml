@@ -21,7 +21,6 @@ data:
   test_batch_size: 4
   num_workers: 8
   train_max_agents: 64
-  eval_max_agents: 128
 
 model:
   model_config:

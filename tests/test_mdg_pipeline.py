@@ -148,6 +148,30 @@ def test_mdg_training_forward_backward_and_rollout_shapes() -> None:
     assert tuple(flat["pred_z"].shape) == (8, 2, 80)
 
 
+def test_mdg_collate_pads_variable_eval_agent_count() -> None:
+    sample_a = _sample(0)
+    sample_b = _sample(1)
+    for key in (
+        "agent_id",
+        "agent_type",
+        "agent_shape",
+        "agent_valid",
+        "agent_position",
+        "agent_heading",
+        "agent_velocity",
+        "agent_valid_mask",
+    ):
+        sample_b[key] = sample_b[key][:3]
+
+    batch = collate_mdg_samples([sample_a, sample_b])
+
+    assert tuple(batch["agent_id"].shape) == (2, 4)
+    assert batch["agent_id"][1, 3].item() == -1
+    assert batch["agent_valid"][1, 3].item() is False
+    assert batch["agent_valid_mask"][1, 3].any().item() is False
+    assert tuple(batch["map_position"].shape) == (2, 5, 16, 2)
+
+
 def test_mdg_closed_loop_inference_uses_full_noise_n_step_replanning() -> None:
     cfg = _small_model_config()
     cfg.rollout_chunk_size = 2
@@ -281,7 +305,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     submission_cfg = OmegaConf.load("configs/experiment/mdg_wosac_sub.yaml")
 
     assert data_cfg.train_max_agents == 64
-    assert data_cfg.eval_max_agents == 128
+    assert "eval_max_agents" not in data_cfg
     assert data_cfg.max_map_polylines == 320
     assert data_cfg.map_waypoints == 16
     assert data_cfg.max_traffic_lights == 16
@@ -312,7 +336,9 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert pretrain_cfg.trainer.limit_val_batches == 0.1
     assert pretrain_cfg.trainer.check_val_every_n_epoch == 16
     assert pretrain_cfg.data.val_batch_size == 12
+    assert "eval_max_agents" not in pretrain_cfg.data
     assert pretrain_cfg.model.model_config.scorer_scene_num == 1680
+    assert "eval_max_agents" not in submission_cfg.data
     assert submission_cfg.trainer.precision == "16-mixed"
 
     model = MDG(model_cfg)

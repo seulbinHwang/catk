@@ -11,7 +11,6 @@ val_raw_dir: ${paths.cache_root}/validation
 val_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
 test_raw_dir: ${paths.cache_root}/testing
 train_max_agents: 64
-eval_max_agents: 128
 max_map_polylines: 320
 map_waypoints: 16
 max_traffic_lights: 16

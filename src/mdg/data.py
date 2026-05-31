@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import pickle
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -87,6 +88,12 @@ def _select_nearest(
     return order[:max_count].cpu()
 
 
+def _select_current_valid(valid: Tensor, current_index: int) -> Tensor:
+    if valid.numel() == 0:
+        return torch.zeros(0, dtype=torch.long)
+    return torch.where(valid[:, current_index])[0].cpu()
+
+
 def _pad_first_dim(value: Tensor, size: int, pad_value: float | int | bool = 0) -> tuple[Tensor, Tensor]:
     out_shape = (size,) + tuple(value.shape[1:])
     out = torch.full(out_shape, pad_value, dtype=value.dtype)
@@ -169,7 +176,7 @@ class MDGDataset(Dataset):
     def __init__(
         self,
         raw_dir: str,
-        max_agents: int,
+        max_agents: Optional[int],
         max_map_polylines: int,
         map_waypoints: int,
         max_traffic_lights: int,
@@ -183,7 +190,7 @@ class MDGDataset(Dataset):
             for path in sorted(self.raw_dir.glob("*"))
             if path.is_file() and not path.name.startswith(".")
         ]
-        self.max_agents = int(max_agents)
+        self.max_agents = int(max_agents) if max_agents is not None else None
         self.max_map_polylines = int(max_map_polylines)
         self.map_waypoints = int(map_waypoints)
         self.max_traffic_lights = int(max_traffic_lights)
@@ -214,13 +221,18 @@ class MDGDataset(Dataset):
         sdc_candidates = torch.where(role[:, 0])[0]
         sdc_index = int(sdc_candidates[0].item()) if len(sdc_candidates) else 0
         center = position[sdc_index, current_index, :2]
-        selected_agents = _select_nearest(
-            positions=position[:, current_index, :2],
-            valid=valid[:, current_index],
-            center=center,
-            max_count=self.max_agents,
-            force_index=sdc_index,
-        )
+        if self.max_agents is None:
+            selected_agents = _select_current_valid(valid, current_index)
+            agent_tensor_size = int(selected_agents.numel())
+        else:
+            selected_agents = _select_nearest(
+                positions=position[:, current_index, :2],
+                valid=valid[:, current_index],
+                center=center,
+                max_count=self.max_agents,
+                force_index=sdc_index,
+            )
+            agent_tensor_size = self.max_agents
 
         position = position[selected_agents]
         heading = heading[selected_agents]
@@ -230,13 +242,13 @@ class MDGDataset(Dataset):
         agent_type = agent_type[selected_agents]
         agent_id = agent_id[selected_agents]
 
-        position_pad, agent_present = _pad_first_dim(position, self.max_agents)
-        heading_pad, _ = _pad_first_dim(heading, self.max_agents)
-        velocity_pad, _ = _pad_first_dim(velocity, self.max_agents)
-        valid_pad, _ = _pad_first_dim(valid, self.max_agents)
-        shape_pad, _ = _pad_first_dim(shape, self.max_agents)
-        type_pad, _ = _pad_first_dim(agent_type, self.max_agents)
-        id_pad, _ = _pad_first_dim(agent_id, self.max_agents, pad_value=-1)
+        position_pad, agent_present = _pad_first_dim(position, agent_tensor_size)
+        heading_pad, _ = _pad_first_dim(heading, agent_tensor_size)
+        velocity_pad, _ = _pad_first_dim(velocity, agent_tensor_size)
+        valid_pad, _ = _pad_first_dim(valid, agent_tensor_size)
+        shape_pad, _ = _pad_first_dim(shape, agent_tensor_size)
+        type_pad, _ = _pad_first_dim(agent_type, agent_tensor_size)
+        id_pad, _ = _pad_first_dim(agent_id, agent_tensor_size, pad_value=-1)
         agent_valid = agent_present & valid_pad[:, current_index]
 
         mdg_map = _extract_map(data, self.map_waypoints)
@@ -319,10 +331,38 @@ class MDGDataset(Dataset):
         }
 
 
-def _collate_values(values: Iterable[Any]) -> Any:
+_AGENT_PAD_VALUES: Dict[str, float | int | bool] = {
+    "agent_id": -1,
+    "agent_type": 0,
+    "agent_shape": 0.0,
+    "agent_valid": False,
+    "agent_position": 0.0,
+    "agent_heading": 0.0,
+    "agent_velocity": 0.0,
+    "agent_valid_mask": False,
+}
+
+
+def _pad_agent_tensor(value: Tensor, size: int, pad_value: float | int | bool) -> Tensor:
+    if int(value.shape[0]) == size:
+        return value
+    out_shape = (size,) + tuple(value.shape[1:])
+    out = torch.full(out_shape, pad_value, dtype=value.dtype)
+    if value.shape[0] > 0:
+        out[: value.shape[0]] = value
+    return out
+
+
+def _collate_values(key: str, values: Iterable[Any]) -> Any:
     values = list(values)
     first = values[0]
     if isinstance(first, Tensor):
+        if key in _AGENT_PAD_VALUES:
+            max_size = max(int(value.shape[0]) for value in values)
+            values = [
+                _pad_agent_tensor(value, max_size, _AGENT_PAD_VALUES[key])
+                for value in values
+            ]
         return torch.stack(values, dim=0)
     return values
 
@@ -331,7 +371,7 @@ def collate_mdg_samples(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not samples:
         raise ValueError("Cannot collate an empty MDG batch.")
     keys = samples[0].keys()
-    return {key: _collate_values(sample[key] for sample in samples) for key in keys}
+    return {key: _collate_values(key, (sample[key] for sample in samples)) for key in keys}
 
 
 class MDGDataModule(LightningDataModule):
@@ -349,7 +389,6 @@ class MDGDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_agents: int = 64,
-        eval_max_agents: int = 128,
         max_map_polylines: int = 320,
         map_waypoints: int = 16,
         max_traffic_lights: int = 16,
@@ -363,6 +402,7 @@ class MDGDataModule(LightningDataModule):
         train_memory_balance_valid_agent_step_weight: float = 0.0,
         train_memory_balance_map_weight: float = 0.02,
         train_memory_balance_seed: int = 0,
+        eval_max_agents: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.train_batch_size = train_batch_size
@@ -377,7 +417,13 @@ class MDGDataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
         self.train_max_agents = train_max_agents
-        self.eval_max_agents = eval_max_agents
+        if eval_max_agents is not None:
+            warnings.warn(
+                "data.eval_max_agents is deprecated and ignored. "
+                "MDG eval/test/submission now keep all current-valid cached agents "
+                "so Fast WOSAC sim_agent_ids are not truncated.",
+                stacklevel=2,
+            )
         self.max_map_polylines = max_map_polylines
         self.map_waypoints = map_waypoints
         self.max_traffic_lights = max_traffic_lights
@@ -409,7 +455,7 @@ class MDGDataModule(LightningDataModule):
             )
             self.val_dataset = MDGDataset(
                 raw_dir=self.val_raw_dir,
-                max_agents=self.eval_max_agents,
+                max_agents=None,
                 max_map_polylines=self.max_map_polylines,
                 map_waypoints=self.map_waypoints,
                 max_traffic_lights=self.max_traffic_lights,
@@ -419,7 +465,7 @@ class MDGDataModule(LightningDataModule):
         elif stage == "validate":
             self.val_dataset = MDGDataset(
                 raw_dir=self.val_raw_dir,
-                max_agents=self.eval_max_agents,
+                max_agents=None,
                 max_map_polylines=self.max_map_polylines,
                 map_waypoints=self.map_waypoints,
                 max_traffic_lights=self.max_traffic_lights,
@@ -429,7 +475,7 @@ class MDGDataModule(LightningDataModule):
         elif stage == "test":
             self.test_dataset = MDGDataset(
                 raw_dir=self.test_raw_dir,
-                max_agents=self.eval_max_agents,
+                max_agents=None,
                 max_map_polylines=self.max_map_polylines,
                 map_waypoints=self.map_waypoints,
                 max_traffic_lights=self.max_traffic_lights,
