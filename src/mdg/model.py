@@ -112,6 +112,13 @@ class MDG(LightningModule):
                 "model_config.closed_loop_denoising_steps must be >= 1, "
                 f"got {self.closed_loop_denoising_steps}."
             )
+        if self.closed_loop_denoising_steps > self.num_noise_levels:
+            raise ValueError(
+                "model_config.closed_loop_denoising_steps must be <= "
+                "model_config.backbone.num_noise_levels to avoid repeated discrete mask levels, "
+                f"got closed_loop_denoising_steps={self.closed_loop_denoising_steps}, "
+                f"num_noise_levels={self.num_noise_levels}."
+            )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
         return (

@@ -28,7 +28,7 @@ model:
     n_batch_sim_agents_metric: 10
     scorer_scene_num: 1680
     rollout_chunk_size: 1
-    closed_loop_denoising_steps: 16
+    closed_loop_denoising_steps: 5
     val_closed_loop: true
 
 callbacks:

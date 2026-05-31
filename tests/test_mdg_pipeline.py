@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 from waymo_open_dataset.utils.sim_agents import submission_specs
@@ -298,13 +299,13 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert model_cfg.backbone.predictor_modes == 6
     assert model_cfg.n_rollout_closed_val == 32
     assert model_cfg.replanning_interval == 10
-    assert model_cfg.closed_loop_denoising_steps == 16
+    assert model_cfg.closed_loop_denoising_steps == 5
     assert model_cfg.action_loss_weight == 0.0
     assert model_cfg.aux_loss_weight == 5.0
     assert model_cfg.sim_agents_submission.num_model_parameters == "7.11M"
     assert submission_cfg.model.model_config.n_rollout_closed_val == 32
     assert submission_cfg.model.model_config.replanning_interval == 10
-    assert submission_cfg.model.model_config.closed_loop_denoising_steps == 16
+    assert submission_cfg.model.model_config.closed_loop_denoising_steps == 5
     assert submission_cfg.model.model_config.val_closed_loop is True
     assert submission_cfg.model.model_config.sim_agents_submission.is_active is True
     assert pretrain_cfg.trainer.precision == "16-mixed"
@@ -316,6 +317,25 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
 
     model = MDG(model_cfg)
     assert sum(p.numel() for p in model.parameters()) == 7_111_168
+
+
+def test_mdg_closed_loop_denoising_steps_match_discrete_noise_levels() -> None:
+    cfg = _small_model_config()
+    expected = {
+        1: [4],
+        2: [4, 0],
+        3: [4, 2, 0],
+        4: [4, 3, 1, 0],
+        5: [4, 3, 2, 1, 0],
+    }
+    for steps, schedule in expected.items():
+        cfg.closed_loop_denoising_steps = steps
+        model = MDG(cfg)
+        assert model._closed_loop_mask_schedule(torch.device("cpu")).tolist() == schedule
+
+    cfg.closed_loop_denoising_steps = 6
+    with pytest.raises(ValueError, match="closed_loop_denoising_steps must be <="):
+        MDG(cfg)
 
 
 def test_mdg_noise_schedule_and_fourier_relation_features() -> None:
