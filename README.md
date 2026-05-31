@@ -20,7 +20,7 @@
 | weight decay | 0.0001 |
 | initial lr | 0.0005 |
 | schedule | cosine annealing to 0 |
-| epochs | 30 |
+| epochs | 64 |
 | paper batch size | 32 scenes global |
 | 모델 크기 | K=2048 기준 약 4.1M parameters |
 
@@ -37,7 +37,7 @@
 | `src/unimm/model/anchor_based_4s.py` | Lightning 학습, validation, closed-loop rollout, submission |
 | `scripts/build_unimm_anchors.py` | training cache에서 category별 8초 anchor 생성 |
 | `configs/model/unimm_anchor_based_4s.yaml` | 모델/하이퍼파라미터 |
-| `configs/experiment/unimm_anchor_based_4s.yaml` | 30 epoch 학습 recipe |
+| `configs/experiment/unimm_anchor_based_4s.yaml` | 64 epoch 학습 recipe |
 
 ## 환경 준비
 
@@ -255,7 +255,7 @@ CACHE_ROOT=/path/to/SMART_cache \
 | posterior threshold | category별 nearest-anchor 0.5초 error 95% quantile |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 
-이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, 30 epochs, AdamW, lr/weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다.
+이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, lr/weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs로 설정한다.
 
 ## 빠른 검증
 
@@ -264,4 +264,4 @@ python -m compileall -q src/unimm scripts/build_unimm_anchors.py scripts/launch_
 python -m pytest tests/test_unimm_anchor_based_4s.py -q
 ```
 
-실제 cache smoke test는 tiny anchor 파일을 만들어 `trainer.limit_train_batches=1`로 돌리면 된다. 전체 성능 재현은 full training cache로 2048 anchor를 만든 뒤 30 epoch 학습해야 한다.
+실제 cache smoke test는 tiny anchor 파일을 만들어 `trainer.limit_train_batches=1`로 돌리면 된다. 전체 성능 재현은 full training cache로 2048 anchor를 만든 뒤 64 epoch 학습해야 한다.

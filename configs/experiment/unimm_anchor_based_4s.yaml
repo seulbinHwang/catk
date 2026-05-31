@@ -7,7 +7,7 @@ action: fit
 ckpt_path: null
 
 trainer:
-  max_epochs: 30
+  max_epochs: 64
   limit_train_batches: 1.0
   limit_val_batches: 0.1
   check_val_every_n_epoch: 1
