@@ -230,6 +230,32 @@ python scripts/launch_unimm_h100x3x2.py \
   --replace
 ```
 
+OOM retry/resume 전체 학습:
+
+```bash
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs192_oom_retry \
+INITIAL_BS=32 \
+OOM_STEP=4 \
+MIN_BS=16 \
+  bash scripts/launch_unimm_h100x3x2_with_oom_retry.sh
+```
+
+이 래퍼는 첫 시도를 per-GPU `train_batch_size=32`로 시작한다. 두 pod 중 하나라도 CUDA OOM marker를 로그에 남기면 양쪽 `unimm-h100x3x2` tmux 학습 세션을 종료하고, 같은 `TASK_NAME`의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size -= OOM_STEP`으로 재시작한다. `OOM_STEP=0`이면 batch size를 낮추지 않고 `MAX_SAME_BS_OOM_RETRIES` 횟수만큼 같은 batch size로 재시도한다.
+
+짧은 검증 실행은 아래처럼 batch/epoch limit을 걸어 사용한다.
+
+```bash
+TASK_NAME=unimm_h100x3x2_oom_retry_smoke \
+MAX_EPOCHS=1 \
+LIMIT_TRAIN_BATCHES=1 \
+LIMIT_VAL_BATCHES=0 \
+WANDB_MODE=offline \
+EXTRA_HYDRA_OVERRIDES='model.model_config.val_open_loop=false model.model_config.val_closed_loop=false logger.wandb.offline=true logger.wandb.log_model=false' \
+  bash scripts/launch_unimm_h100x3x2_with_oom_retry.sh
+```
+
+retry wrapper의 로컬 로그는 `logs/_unimm_h100x3x2_oom_retry/<TASK_NAME>/attempt_*.log`에 저장되고, 원격 tmux 로그는 `/mnt/nuplan/projects/catk/logs/tmux_unimm_h100x3x2/<TASK_NAME>/`에 저장된다.
+
 중단:
 
 ```bash

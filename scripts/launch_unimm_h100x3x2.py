@@ -111,16 +111,45 @@ git clean -fdx
 
 
 def stop_command(session: str, task_name: str) -> str:
-    return f"""set -Eeuo pipefail
-if tmux has-session -t {shq(session)} 2>/dev/null; then
-  tmux kill-session -t {shq(session)}
-  echo "[launcher] stopped tmux session {session}"
-else
-  echo "[launcher] tmux session not found: {session}"
-fi
-mapfile -t pids < <(pgrep -f {shq(task_name)} 2>/dev/null || true)
+    return f"""set +e
+task_name={shq(task_name)}
+session={shq(session)}
+mapfile -t pids < <(
+  ps -eo pid=,cmd= |
+    awk -v task="task_name=${{task_name}}" '
+      $0 ~ task && ($0 ~ /(^|[ /])python([0-9.]*)?([[:space:]]|$)/ || $0 ~ /(^|[ /])torchrun([[:space:]]|$)/) {{ print $1 }}
+    ' |
+    while read -r pid; do
+      if [[ -n "$pid" && "$pid" != "$$" && "$pid" != "${{BASHPID:-}}" ]]; then
+        echo "$pid"
+      fi
+    done
+)
 if (( ${{#pids[@]}} > 0 )); then
+  echo "[launcher] terminating task processes for $task_name: ${{pids[*]}}"
   kill -TERM "${{pids[@]}}" 2>/dev/null || true
+  sleep "${{REMOTE_KILL_GRACE_SEC:-20}}"
+  mapfile -t pids < <(
+    ps -eo pid=,cmd= |
+      awk -v task="task_name=${{task_name}}" '
+        $0 ~ task && ($0 ~ /(^|[ /])python([0-9.]*)?([[:space:]]|$)/ || $0 ~ /(^|[ /])torchrun([[:space:]]|$)/) {{ print $1 }}
+      ' |
+      while read -r pid; do
+        if [[ -n "$pid" && "$pid" != "$$" && "$pid" != "${{BASHPID:-}}" ]]; then
+          echo "$pid"
+        fi
+      done
+  )
+  if (( ${{#pids[@]}} > 0 )); then
+    echo "[launcher] force killing task processes for $task_name: ${{pids[*]}}"
+    kill -KILL "${{pids[@]}}" 2>/dev/null || true
+  fi
+fi
+if tmux has-session -t "$session" 2>/dev/null; then
+  tmux kill-session -t "$session"
+  echo "[launcher] stopped tmux session $session"
+else
+  echo "[launcher] tmux session not found: $session"
 fi
 """
 
@@ -169,6 +198,8 @@ def launch_command(
     env_file = f"{log_root}/{pod}.env"
     run_file = f"{log_root}/{pod}_run.sh"
     log_file = f"{log_root}/{pod}.tmux.log"
+    status_file = f"{log_root}/{pod}.torchrun_status"
+    pgid_file = f"{log_root}/{pod}.torchrun_pgid"
     hydra_overrides = args.extra_hydra_overrides
     if args.smoke:
         hydra_overrides = " ".join(
@@ -204,6 +235,10 @@ def launch_command(
             env_line("TEST_BATCH_SIZE", args.test_batch_size),
             env_line("LEARNING_RATE", args.learning_rate),
             env_line("WANDB_MODE", args.wandb_mode),
+            env_line("CKPT_PATH", args.ckpt_path),
+            env_line("LIMIT_TRAIN_BATCHES", args.limit_train_batches),
+            env_line("LIMIT_VAL_BATCHES", args.limit_val_batches),
+            env_line("MAX_EPOCHS", args.max_epochs),
             env_line("CATK_HYDRA_OVERRIDES", hydra_overrides),
         ]
     ) + "\n"
@@ -213,10 +248,13 @@ cd {shq(args.project_root)}
 set -a
 source {shq(env_file)}
 set +a
+rm -f {shq(status_file)}
+ps -o pgid= -p "$$" | tr -d '[:space:]' > {shq(pgid_file)} 2>/dev/null || true
 echo "[tmux-run] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
 echo "[tmux-run] started at $(date '+%F %T')"
 bash scripts/unimm_h100x3x2_train.sh
 status=$?
+echo "$status" > {shq(status_file)}
 echo "[tmux-run] exited with status $status at $(date '+%F %T')"
 exec bash
 """
@@ -251,6 +289,7 @@ cat > {shq(run_file)} <<'UNIMM_RUN'
 UNIMM_RUN
 chmod +x {shq(run_file)}
 : > {shq(log_file)}
+rm -f {shq(status_file)} {shq(pgid_file)}
 tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_file)}
 tmux pipe-pane -t {shq(args.session)} -o {shq("cat >> " + log_file)}
 echo "[launcher] started tmux session {args.session} on pod {pod}"
@@ -282,6 +321,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-batch-size", default="4")
     parser.add_argument("--learning-rate", default=os.environ.get("UNIMM_LEARNING_RATE", DEFAULT_LEARNING_RATE))
     parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE", "online"))
+    parser.add_argument("--ckpt-path", default=os.environ.get("CKPT_PATH", ""))
+    parser.add_argument("--limit-train-batches", default=os.environ.get("LIMIT_TRAIN_BATCHES", ""))
+    parser.add_argument("--limit-val-batches", default=os.environ.get("LIMIT_VAL_BATCHES", ""))
+    parser.add_argument("--max-epochs", default=os.environ.get("MAX_EPOCHS", ""))
     parser.add_argument("--extra-hydra-overrides", default="")
     parser.add_argument("--anchor-device", default="cuda")
     parser.add_argument("--build-anchors", action="store_true")
