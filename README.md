@@ -446,7 +446,7 @@ CATK_TF_INTRA_OP_THREADS=1 CATK_TF_INTER_OP_THREADS=1 python src/run.py action=v
 ## 주의사항
 
 - Waymax는 사용하지 않는다. closed-loop 효과는 제출 궤적 내부에서 1Hz replanning으로 근사한다.
-- validation/test/submission은 기본적으로 full noise에서 시작해 16번 denoising한다. 같은 replanning segment 안에서는 scene encoder를 한 번만 실행하고 auxiliary predictor는 호출하지 않는다.
+- validation/test/submission은 기본적으로 full noise에서 시작해 `closed_loop_denoising_steps=5`로 denoising한다. 기본 schedule은 `[4, 3, 2, 1, 0]`이며, 같은 replanning segment 안에서는 scene encoder를 한 번만 실행하고 auxiliary predictor는 호출하지 않는다.
 - WOSAC 제출은 반드시 32 rollout이어야 한다. submission mode에서 다른 값이면 모델 초기화 시 실패한다.
 - evaluation/test DDP는 padding 없는 exact sampler를 사용한다. 제출 archive에서 scenario 중복이 생기지 않도록 하기 위함이다.
 - 기존 SMART cache는 fallback으로 읽히지만, 논문 설정에 더 가까운 입력을 쓰려면 MDG field가 포함된 cache를 새로 만드는 편이 낫다.
