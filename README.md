@@ -47,7 +47,7 @@
 | epochs | 64 |
 | grad clip | 1.0 |
 
-MDG의 `[N, Ta, 5]` physical state는 `x, y, cos(heading), sin(heading), speed`로 둔다. raw heading 대신 `cos/sin`을 쓰면 angle wrapping 불연속이 줄어든다. `Ta=40 -> T=80` 복원은 action 하나를 0.1초 step 두 번에 걸쳐 적분한다.
+MDG의 denoiser용 `[N, Ta, 5]` physical state는 agent 현재 pose 기준 local 표현인 `local_x, local_y, cos(relative_heading), sin(relative_heading), speed`로 둔다. raw heading 대신 `cos/sin`을 쓰면 angle wrapping 불연속이 줄어들고, 현재 heading 기준 local 좌표를 쓰면 같은 주행 패턴을 global heading과 무관하게 학습할 수 있다. WOSAC 제출/metric에 쓰는 rollout 출력은 기존처럼 global `position/heading/speed`를 유지한다. `Ta=40 -> T=80` 복원은 action 하나를 0.1초 step 두 번에 걸쳐 적분한다.
 
 Auxiliary predictor는 agent scene context에서 `[B,N,6,80,3]` trajectory modes를 출력한다. 논문 보충자료의 prediction loss 정의에 맞춰 best mode는 GT와의 `xy` L2 ADE가 가장 작은 mode로 고르고, 실제 auxiliary loss는 그 mode에 대한 Smooth L1을 적용한다. invalid agent/timestep은 loss에서 제외한다.
 

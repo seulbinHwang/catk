@@ -9,9 +9,9 @@ from waymo_open_dataset.utils.sim_agents import submission_specs
 
 from src.data_preprocess import build_mdg_map_features, build_mdg_traffic_signal_features, process_dynamic_map
 from src.mdg.data import collate_mdg_samples
-from src.mdg.geometry import relation_features
+from src.mdg.geometry import relation_features, rotate_points, wrap_angle
 from src.mdg.model import MDG
-from src.mdg.modules import _fourier_relation_features
+from src.mdg.modules import KinematicDynamics, _fourier_relation_features
 
 
 def _sample(index: int = 0) -> dict:
@@ -548,6 +548,50 @@ def test_mdg_temporal_mask_prefix_is_progressively_increasing() -> None:
 
     assert saw_partial_temporal_mask
     assert saw_agent_specific_prefix
+
+
+def test_mdg_dynamics_chunk_state_is_agent_local() -> None:
+    dynamics = KinematicDynamics(action_chunk=2, dt=0.1, action_mean=(0.0, 0.0), action_std=(1.0, 1.0))
+    action = torch.tensor(
+        [
+            [
+                [[0.20, 0.10], [-0.10, 0.05], [0.00, -0.20]],
+                [[0.05, -0.15], [0.10, 0.20], [-0.05, 0.00]],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    current_pos = torch.tensor([[[5.0, -2.0], [1.0, 4.0]]], dtype=torch.float32)
+    current_heading = torch.tensor([[0.3, -1.2]], dtype=torch.float32)
+    current_speed = torch.tensor([[3.0, 1.5]], dtype=torch.float32)
+
+    full_pos, full_heading, full_speed, chunk_state, _ = dynamics(
+        action,
+        current_pos,
+        current_heading,
+        current_speed,
+    )
+
+    rotation = torch.tensor(1.1, dtype=torch.float32)
+    translation = torch.tensor([10.0, -3.0], dtype=torch.float32)
+    rotated_pos = rotate_points(current_pos, rotation) + translation
+    rotated_heading = wrap_angle(current_heading + rotation)
+    rotated_full_pos, rotated_full_heading, rotated_full_speed, rotated_chunk_state, _ = dynamics(
+        action,
+        rotated_pos,
+        rotated_heading,
+        current_speed,
+    )
+
+    torch.testing.assert_close(rotated_chunk_state, chunk_state, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(rotated_full_pos, rotate_points(full_pos, rotation) + translation, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        wrap_angle(rotated_full_heading - full_heading - rotation),
+        torch.zeros_like(full_heading),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(rotated_full_speed, full_speed, atol=1e-5, rtol=1e-5)
 
 
 def test_mdg_traffic_signal_stop_points_are_cached() -> None:

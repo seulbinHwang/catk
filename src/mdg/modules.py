@@ -676,12 +676,13 @@ class KinematicDynamics(nn.Module):
         chunk_pos = full_pos.index_select(2, chunk_end_idx)
         chunk_heading = full_heading.index_select(2, chunk_end_idx)
         chunk_speed = full_speed.index_select(2, chunk_end_idx)
-        rel_pos = chunk_pos - current_pos.unsqueeze(2)
+        local_pos = global_to_local_xy(chunk_pos, current_pos, current_heading)
+        local_heading = wrap_angle(chunk_heading - current_heading.unsqueeze(-1))
         chunk_state = torch.cat(
             (
-                rel_pos,
-                torch.cos(chunk_heading).unsqueeze(-1),
-                torch.sin(chunk_heading).unsqueeze(-1),
+                local_pos,
+                torch.cos(local_heading).unsqueeze(-1),
+                torch.sin(local_heading).unsqueeze(-1),
                 chunk_speed.unsqueeze(-1),
             ),
             dim=-1,
