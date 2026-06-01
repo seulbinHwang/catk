@@ -4,10 +4,17 @@ set -euo pipefail
 : "${CONDA_ENV:=catk}"
 
 if [ -z "${CONDA_SH:-}" ]; then
+  if [ -n "${CONDA_ROOT:-}" ] && [ -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]; then
+    CONDA_SH="${CONDA_ROOT}/etc/profile.d/conda.sh"
+  fi
+fi
+
+if [ -z "${CONDA_SH:-}" ]; then
   for candidate in \
     "$HOME/miniconda3/etc/profile.d/conda.sh" \
     "$HOME/miniforge3/etc/profile.d/conda.sh" \
     "$HOME/miniforge/etc/profile.d/conda.sh" \
+    "/mnt/nuplan/miniforge/etc/profile.d/conda.sh" \
     "/media/user/E/miniforge/etc/profile.d/conda.sh"
   do
     if [ -f "$candidate" ]; then

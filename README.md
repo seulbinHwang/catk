@@ -30,7 +30,7 @@
 | H100 x3x2 validation batch size | 72 scenes global |
 | validation interval | every 16 epochs |
 | fit-time scorer scenes | 1680 |
-| 모델 크기 | K=2048 기준 약 4.1M parameters |
+| 모델 크기 | K=2048 기준 약 7.1M parameters |
 
 논문에서 명시한 핵심은 `2048 anchors + continuous regression + Tpred=4s + closed-loop samples + approximate posterior policy + Tpost=Tz*=0.5s`다. 현재 구현도 이 조합만 대상으로 한다.
 
@@ -74,7 +74,7 @@ ${CACHE_ROOT}/testing/*.pkl
 ## Anchor 생성
 
 UniMM Anchor-Based-4s는 학습 전에 category별 2048개 8초 anchor bank가 필요하다. 4초 모델은 이 8초 anchor의 앞 4초만 decoder 조건으로 사용하고, positive/posterior matching은 앞 0.5초만 사용한다.
-기본 anchor 생성은 논문 설정에 맞게 training cache의 모든 valid agent trajectory를 category별 k-means 입력으로 사용한다. 빠른 실험용으로만 `--max-per-type`에 양수를 지정해 type별 입력 수를 제한할 수 있다.
+기본 anchor 생성은 논문 설정에 맞게 training cache의 모든 valid agent trajectory를 category별 k-means 입력으로 사용한다. 빠른 mini-batch k-means로 초기화한 뒤, 전체 training trajectory를 chunk 단위로 빠짐없이 assignment/update하는 full-data Lloyd refinement를 수행한다. 빠른 실험용으로만 `--max-per-type`에 양수를 지정해 type별 입력 수를 제한할 수 있다.
 
 ```bash
 CACHE_ROOT=/path/to/SMART_cache \
@@ -103,6 +103,19 @@ OUTPUT=/path/to/unimm_anchors_8s_k2048.pkl \
   bash scripts/build_unimm_anchors.sh --device cuda
 ```
 
+기본 anchor build는 아래 설정을 쓴다.
+
+```text
+initialization: mini-batch k-means, 200 iterations, batch size 8192
+refinement: full-training-data Lloyd, max 20 sweeps, tol 1e-4
+assignment chunks: 2048 trajectory rows x 256 anchors
+distance: mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)
+heading_weight: 1.0
+empty cluster policy: high-error trajectory로 재초기화
+```
+
+이 distance는 학습/closed-loop에서 positive/posterior anchor를 고르는 기준과 동일하게 맞춘 것이다. `--lloyd-iters 0`을 주면 refinement를 끌 수 있지만, 논문 재현 목적의 기본 anchor에는 쓰지 않는다.
+
 anchor 파일은 pickle dict 형식이다.
 
 ```text
@@ -115,6 +128,7 @@ posterior_error_threshold:
 ```
 
 논문은 posterior plan error threshold의 정확한 값을 공개하지 않는다. 이 구현은 training trajectory의 nearest-anchor 0.5초 error 95% quantile을 category별 threshold로 저장한다.
+새 anchor bank를 만들면 component index의 의미가 바뀌므로 기존 checkpoint에서 resume하지 말고 scratch 학습을 시작한다.
 
 ## 학습
 
@@ -357,13 +371,13 @@ python scripts/launch_unimm_h100x3x2.py \
 
 | 항목 | 현재 선택 |
 | --- | --- |
-| hidden dimension | 176, K=2048 기준 약 4.1M parameters |
-| attention heads | 4 heads, head dim 16 |
+| hidden dimension | 232, K=2048 기준 약 7.1M parameters |
+| attention heads | 4 heads, head dim 20 |
 | activation | ReLU |
 | dropout | 0.1 |
 | map self-attention | 1 layer |
 | factorized attention | 2 layers |
-| distance `d(.,.)` | position squared error + heading squared error |
+| distance `d(.,.)` | `mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)` |
 | posterior threshold | category별 nearest-anchor 0.5초 error 95% quantile |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 

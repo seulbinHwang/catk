@@ -7,7 +7,13 @@ import torch
 from omegaconf import OmegaConf
 from torch_geometric.data import HeteroData
 
-from scripts.build_unimm_anchors import collect_training_trajectories, compute_threshold, minibatch_kmeans
+from scripts.build_unimm_anchors import (
+    collect_training_trajectories,
+    compute_threshold,
+    lloyd_refine_kmeans,
+    minibatch_kmeans,
+    nearest_anchor_assignment,
+)
 from src.unimm.losses import unimm_classification_loss
 from src.unimm.model.anchor_based_4s import UniMMAnchorBased4s
 from src.unimm.processor import UniMMProcessor
@@ -194,6 +200,41 @@ def test_unimm_minibatch_kmeans_builds_valid_anchor_bank():
     assert anchors.shape == (4, 80, 3)
     assert torch.isfinite(anchors).all()
     assert threshold >= 0.0
+
+
+def test_unimm_lloyd_refinement_uses_full_dataset_assignment():
+    trajectories = torch.zeros(24, 20, 3)
+    trajectories[:12, :, 0] = torch.linspace(0.1, 2.0, 20)
+    trajectories[12:, :, 1] = torch.linspace(0.1, 3.0, 20)
+    init = trajectories[torch.tensor([0, 1, 12, 13])].clone()
+    _, before = nearest_anchor_assignment(
+        trajectories=trajectories,
+        anchors=init,
+        heading_weight=1.0,
+        row_chunk_size=8,
+        anchor_chunk_size=2,
+    )
+
+    anchors, history = lloyd_refine_kmeans(
+        trajectories=trajectories,
+        centroids=init,
+        num_iters=3,
+        heading_weight=1.0,
+        row_chunk_size=8,
+        anchor_chunk_size=2,
+        tol=0.0,
+    )
+    _, after = nearest_anchor_assignment(
+        trajectories=trajectories,
+        anchors=anchors,
+        heading_weight=1.0,
+        row_chunk_size=8,
+        anchor_chunk_size=2,
+    )
+
+    assert anchors.shape == (4, 20, 3)
+    assert len(history) >= 1
+    assert after.mean() <= before.mean()
 
 
 def test_unimm_anchor_collection_reads_cache_file(tmp_path: Path):
