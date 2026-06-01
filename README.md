@@ -260,7 +260,7 @@ V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다
 
 ### testas A100 7장 pretrain
 
-`testas` 파드에 cache가 `/workspace/womd_v1_3/MDG_cache`로 준비되어 있으면, `ssh user@10.60.188.78`에서 아래처럼 학습을 시작한다.
+`testas` 파드에 cache가 `/workspace/womd_v1_3/MDG_cache`로 준비되어 있으면, `ssh user@10.60.188.78`에서 아래처럼 학습을 시작한다. 정식 run은 pod 안의 깨끗한 checkout인 `/mnt/nuplan/projects/catk_mdg_latest`를 사용한다. launcher가 해당 경로를 `origin/MDG` 최신 커밋으로 준비한 뒤 tmux에서 학습을 시작하므로, 예전 실험 산출물이나 dirty worktree가 섞이지 않는다.
 
 처음부터 새 run을 시작하려면 기존 run과 다른 `TASK_NAME`을 사용한다. `start_mdg_pretrain_testas_a100x7.sh`는 기본적으로 `CATK_AUTO_RESUME=false`라 checkpoint를 자동으로 이어받지 않는다. 단, OOM retry wrapper는 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`를 찾아 재시도에 사용하므로, 완전히 새 학습은 반드시 새 `TASK_NAME`으로 시작한다.
 
@@ -270,6 +270,7 @@ git checkout MDG
 git pull --ff-only
 
 TASK_NAME=mdg_wosac_pretrain_testas_a100x7_from_scratch_$(date +%Y%m%d_%H%M%S) \
+PROJECT_ROOT=/mnt/nuplan/projects/catk_mdg_latest \
 WANDB_MODE=online \
 TRAIN_BATCH_SIZE=32 \
 VAL_BATCH_SIZE=12 \
@@ -296,6 +297,7 @@ cd /media/user/E/projects/catk &&
 INITIAL_BS=32 \
 OOM_STEP=2 \
 MIN_BS=24 \
+PROJECT_ROOT=/mnt/nuplan/projects/catk_mdg_latest \
 WANDB_MODE=online \
 TASK_NAME=$TASK_NAME \
 bash scripts/start_mdg_pretrain_testas_a100x7_with_oom_retry.sh
@@ -341,7 +343,7 @@ training split `486,995`개 기준 step 수는 `ceil(486995 / 224) = 2,175` step
 ```bash
 kubectl exec -it -n p-pnc testas -c main -- tmux attach -t mdg-pretrain-a100x7
 kubectl exec -n p-pnc testas -c main -- bash -lc \
-  'tail -f /mnt/nuplan/projects/catk/logs/testas_mdg_pretrain_a100x7/*.log'
+  'tail -f /mnt/nuplan/projects/catk_mdg_latest/logs/testas_mdg_pretrain_a100x7/*.log'
 ```
 
 OOM retry wrapper로 띄운 run은 session/log path가 다르다.
