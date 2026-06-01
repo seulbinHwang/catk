@@ -241,6 +241,7 @@ class SMARTFlowDecoder(nn.Module):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: Tensor | None = None,
         return_flow_2s_preview: bool = False,
+        return_committed_control: bool = False,
         rollout_steps_2hz: int | None = None,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
@@ -251,6 +252,7 @@ class SMARTFlowDecoder(nn.Module):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=return_flow_2s_preview,
+            return_committed_control=return_committed_control,
             rollout_steps_2hz=rollout_steps_2hz,
         )
 
@@ -266,6 +268,7 @@ class SMARTFlowDecoder(nn.Module):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
+        return_committed_control: bool = False,
     ) -> Dict[str, Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -293,6 +296,7 @@ class SMARTFlowDecoder(nn.Module):
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
             use_stop_motion=False,
+            return_committed_control=return_committed_control,
         )
 
     def path_flow_velocity_for_anchor0(

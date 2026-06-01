@@ -59,6 +59,9 @@ model:
       ocsc_gt_target: false
       ocsc_use_pretrained_ref: true
       ocsc_anchor_idx: 0
+      ocsc_match_space: pose
+      ocsc_loss_window_steps: -1
+      ocsc_loss_temporal_stride: -1
       ocsc_strict_active_mask: true
       ocsc_position_weight: 1.0
       ocsc_heading_weight: 0.01

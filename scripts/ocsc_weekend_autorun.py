@@ -452,6 +452,91 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "SIM_AGENTS_METRIC_WORKERS": "3",
         },
     ),
+    Variant(
+        name="ocsc_velhead_m12_lr5e8_wd1e3_from_long_best",
+        note=(
+            "Keep LR=5e-8 and the best long-checkpoint recovery path, but reduce "
+            "trainable capacity to velocity_head only."
+        ),
+        env={
+            "CKPT_PATH": LONG_M12_BEST_CKPT_PATH,
+            "LR": "5.0e-8",
+            "WEIGHT_DECAY": "1.0e-3",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "OCSC_VELOCITY_HEAD_ONLY": "true",
+            "OCSC_FULL_FLOW_DECODER": "false",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+        },
+    ),
+    Variant(
+        name="ocsc_fullflow_m12_lr5e8_wd1e3_from_long_best",
+        note=(
+            "Keep LR=5e-8 and M=12, but increase trainable capacity to the full "
+            "flow decoder while leaving context/map encoders frozen."
+        ),
+        env={
+            "CKPT_PATH": LONG_M12_BEST_CKPT_PATH,
+            "LR": "5.0e-8",
+            "WEIGHT_DECAY": "1.0e-3",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "true",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+        },
+    ),
+    Variant(
+        name="ocsc_fullflow_control_m12_lr5e8_wd1e3_2s10hz_from_long_best",
+        note=(
+            "Diagnostic fallback: keep the 2s/10Hz full-flow setting, but match "
+            "OL and CL in raw 3D control space instead of integrated pose space."
+        ),
+        env={
+            "CKPT_PATH": LONG_M12_BEST_CKPT_PATH,
+            "LR": "5.0e-8",
+            "WEIGHT_DECAY": "1.0e-3",
+            "TRAIN_B": "8",
+            "OCSC_N_OL_ROLLOUTS": "12",
+            "OCSC_VELOCITY_HEAD_ONLY": "false",
+            "OCSC_FULL_FLOW_DECODER": "true",
+            "OCSC_MATCH_SPACE": "control",
+            "OCSC_LOSS_WINDOW_STEPS": "20",
+            "OCSC_LOSS_TEMPORAL_STRIDE": "1",
+            "DATA_SHUFFLE": "true",
+            "TRAIN_USE_EVAL_AGENT_SELECTION": "true",
+            "TRAIN_EPOCH_SAMPLE_FRACTION": "0.5",
+            "EXTRA_ARGS": "trainer.accumulate_grad_batches=2",
+            "PRECISION": "32-true",
+            "GRADIENT_CLIP_VAL": "0",
+            "NUM_WORKERS": "12",
+            "PREFETCH_FACTOR": "4",
+            "EVAL_NUM_WORKERS": "12",
+            "EVAL_PREFETCH_FACTOR": "2",
+            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "WANDB_TAGS": "[ocsc_control_match]",
+        },
+    ),
 )
 
 
@@ -666,9 +751,6 @@ def decision(
         return "fail", f"wandb state={state}"
 
     n_val = len(rmm)
-    if n_val < min_validations:
-        return "wait", f"validations {n_val}/{min_validations}"
-
     if (
         rmm_latest_floor is not None
         and n_val >= rmm_latest_floor_min_validations
@@ -694,6 +776,9 @@ def decision(
                 f"latest RMM {rmm[-1]:.8f} is {latest_drop:.8f} below best "
                 f"{best_rmm:.8f} after {n_val} validations",
             )
+
+    if n_val < min_validations:
+        return "wait", f"validations {n_val}/{min_validations}"
 
     rmm_gain = max(rmm) - rmm[0] if rmm else 0.0
     rmm_signal = rmm_gain >= rmm_min_gain
@@ -907,6 +992,26 @@ def stop_existing_run(target: str, log_path: Path) -> None:
     terminate_task_processes(log_path.stem)
 
 
+def pull_latest(repo_root: str) -> None:
+    log("git pull --ff-only before launch")
+    result = subprocess.run(
+        ["git", "pull", "--ff-only"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    output = "\n".join(
+        part.strip()
+        for part in (result.stdout, result.stderr)
+        if part and part.strip()
+    )
+    if output:
+        log(output.replace("\n", " | "))
+    if result.returncode != 0:
+        log(f"warning: git pull --ff-only failed with rc={result.returncode}; continuing launch")
+
+
 def terminate_process(proc: subprocess.Popen[Any] | None, task_name: str | None = None) -> None:
     if task_name:
         terminate_task_processes(task_name)
@@ -950,6 +1055,7 @@ def base_env(args: argparse.Namespace) -> dict[str, str]:
         "OCSC_N_OL_ROLLOUTS": "8",
         "OCSC_OL_NEAREST_MATCH": "true",
         "OCSC_USE_PRETRAINED_REF": "true",
+        "OCSC_MATCH_SPACE": "pose",
         "OCSC_STRICT_ACTIVE_MASK": "true",
         "OCSC_POSITION_WEIGHT": "1.0",
         "OCSC_HEADING_WEIGHT": "0.01",
@@ -965,6 +1071,8 @@ def launch_variant(
     args: argparse.Namespace,
     log_dir: Path,
 ) -> tuple[subprocess.Popen[Any], Path]:
+    if args.pull_before_launch:
+        pull_latest(args.repo_root)
     log_dir.mkdir(parents=True, exist_ok=True)
     task_name = f"{variant.name}_{time.strftime('%Y%m%d_%H%M%S')}"
     log_path = log_dir / f"{task_name}.log"
@@ -1160,6 +1268,12 @@ def main() -> int:
         ),
     )
     parser.add_argument("--skip-initial", action="store_true")
+    parser.add_argument(
+        "--pull-before-launch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run git pull --ff-only immediately before each fallback launch.",
+    )
     parser.add_argument(
         "--start-variant-index",
         type=int,

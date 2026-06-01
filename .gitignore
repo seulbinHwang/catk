@@ -3,3 +3,17 @@
 **/logs
 secrets/waymo/waymo_storage_state.json
 secrets/waymo/playwright_profile/
+
+# --- LaTeX / Overleaf 자료가 code repo 로 흘러들어오는 것 차단 ---
+# (figure asset 은 paper_assets/figures/ 에 두고 sync_figs_to_overleaf.sh 로만 내보냄)
+*.tex
+*.bib
+*.bbl
+*.blg
+*.aux
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+paper/
+paper_assets/
+overleaf/

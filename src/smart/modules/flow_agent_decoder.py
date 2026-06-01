@@ -1318,6 +1318,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         return_flow_2s_preview: bool = False,
+        return_committed_control: bool = False,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
@@ -1402,6 +1403,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         pred_flow_2s_traj = None
         pred_flow_2s_valid = None
+        pred_control_10hz = None
+        if return_committed_control:
+            if self.flow_state_dim != CONTROL_FLOW_DIM:
+                raise ValueError(
+                    "return_committed_control=True requires control-space flow output."
+                )
+            pred_control_10hz = torch.zeros(
+                (n_agent, n_step_future_10hz, self.flow_state_dim),
+                dtype=feat_a_now.dtype,
+                device=feat_a_now.device,
+            )
         if return_flow_2s_preview:
             pred_flow_2s_traj = torch.zeros(
                 (n_agent, n_step_future_2hz, self.flow_window_steps, 2),
@@ -1572,6 +1584,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             next_token_idx = pred_idx_window[:, -1].clone()
             commit_traj_step = pred_traj_10hz.new_zeros((n_agent, self.shift, 2))
             commit_head_step = pred_head_10hz.new_zeros((n_agent, self.shift))
+            commit_control_step = (
+                pred_control_10hz.new_zeros((n_agent, self.shift, self.flow_state_dim))
+                if pred_control_10hz is not None
+                else None
+            )
 
             if active_mask.any():
                 active_hidden = current_hidden[active_mask]
@@ -1629,6 +1646,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     )
                     pred_flow_2s_traj[active_mask, t] = preview_pos_global
                     pred_flow_2s_valid[active_mask, t] = True
+                if commit_control_step is not None:
+                    commit_control_step[active_mask] = y_hat_norm[:, : self.shift]
                 (
                     raw_commit_pos_act,
                     raw_commit_head_act,
@@ -1758,6 +1777,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
             pred_traj_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_traj_step
             pred_head_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_head_step
+            if pred_control_10hz is not None:
+                pred_control_10hz[:, t * self.shift : (t + 1) * self.shift] = commit_control_step
 
             next_pos_for_context = (
                 next_pos.detach() if terminal_step_by_agent is not None else next_pos
@@ -1842,6 +1863,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "pred_traj_10hz": pred_traj_10hz,
             "pred_head_10hz": pred_head_10hz,
         }
+        if pred_control_10hz is not None:
+            out_dict["pred_control_10hz"] = pred_control_10hz
         pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)
         out_dict["pred_z_10hz"] = pred_z.expand(-1, pred_traj_10hz.shape[1])
         if return_flow_2s_preview:
@@ -1864,6 +1887,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         return_flow_2s_preview: bool = False,
+        return_committed_control: bool = False,
         rollout_steps_2hz: int | None = None,
     ) -> Dict[str, torch.Tensor]:
         """평가와 제출에서 no-gradient closed-loop rollout을 실행합니다.
@@ -1889,6 +1913,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=return_flow_2s_preview,
+            return_committed_control=return_committed_control,
             rollout_steps_2hz=rollout_steps_2hz,
         )
 
@@ -1904,6 +1929,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
+        return_committed_control: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -1932,6 +1958,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             return_flow_2s_preview=False,
+            return_committed_control=return_committed_control,
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,

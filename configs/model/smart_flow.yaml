@@ -180,6 +180,9 @@ model_config:
     ocsc_gt_target: false               # true → OL sample 대신 GT (single target, no nearest)
     ocsc_use_pretrained_ref: true       # OL 생성에 frozen pretrained ref decoder 사용
     ocsc_anchor_idx: 0                  # 사용할 anchor index (multi-anchor 미지원, 0 만 권장)
-    ocsc_strict_active_mask: true       # future 2s 전체 valid agent 만 OCSC 학습
+    ocsc_match_space: pose              # pose / control. control = raw 3D control-space OCSC matching
+    ocsc_loss_window_steps: -1          # OCSC loss/CL rollout horizon in 10Hz steps; -1 = full flow_window_steps
+    ocsc_loss_temporal_stride: -1       # OCSC loss temporal stride in 10Hz steps; -1 = 2Hz coarse endpoints
+    ocsc_strict_active_mask: true       # loss horizon 전체 valid agent 만 OCSC 학습
     ocsc_position_weight: 1.0           # pos L2 weight
     ocsc_heading_weight: 0.01           # heading (cos/sin) L2 weight

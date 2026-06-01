@@ -172,6 +172,9 @@ OCSC_LOSS_TYPE="${OCSC_LOSS_TYPE:-l2}"
 OCSC_GT_TARGET="${OCSC_GT_TARGET:-false}"
 OCSC_USE_PRETRAINED_REF="${OCSC_USE_PRETRAINED_REF:-true}"
 OCSC_ANCHOR_IDX="${OCSC_ANCHOR_IDX:-0}"
+OCSC_MATCH_SPACE="${OCSC_MATCH_SPACE:-pose}"
+OCSC_LOSS_WINDOW_STEPS="${OCSC_LOSS_WINDOW_STEPS:--1}"
+OCSC_LOSS_TEMPORAL_STRIDE="${OCSC_LOSS_TEMPORAL_STRIDE:--1}"
 OCSC_STRICT_ACTIVE_MASK="${OCSC_STRICT_ACTIVE_MASK:-true}"
 OCSC_POSITION_WEIGHT="${OCSC_POSITION_WEIGHT:-1.0}"
 OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-0.01}"
@@ -222,7 +225,7 @@ echo "  Generator: lr=${LR} weight_decay=${WEIGHT_DECAY}"
 echo "  OCSC ★:"
 echo "    G(n_rollouts)=${OCSC_N_ROLLOUTS}  M(n_ol_rollouts)=${OCSC_N_OL_ROLLOUTS}"
 echo "    nearest_match=${OCSC_OL_NEAREST_MATCH}  gt_target=${OCSC_GT_TARGET}"
-echo "    use_ref=${OCSC_USE_PRETRAINED_REF}  anchor_idx=${OCSC_ANCHOR_IDX}  strict_active=${OCSC_STRICT_ACTIVE_MASK}"
+echo "    use_ref=${OCSC_USE_PRETRAINED_REF}  anchor_idx=${OCSC_ANCHOR_IDX}  match_space=${OCSC_MATCH_SPACE}  loss_window_steps=${OCSC_LOSS_WINDOW_STEPS}  loss_stride=${OCSC_LOSS_TEMPORAL_STRIDE}  strict_active=${OCSC_STRICT_ACTIVE_MASK}"
 echo "    pos_w=${OCSC_POSITION_WEIGHT}  head_w=${OCSC_HEADING_WEIGHT}"
 echo "    velocity_head_only=${OCSC_VELOCITY_HEAD_ONLY}  full_flow_decoder=${OCSC_FULL_FLOW_DECODER}"
 echo "  Checkpoint: monitor=${CHECKPOINT_MONITOR} mode=${CHECKPOINT_MODE} save_last=${CHECKPOINT_SAVE_LAST}"
@@ -309,6 +312,9 @@ torchrun \
   model.model_config.finetune.ocsc_gt_target="${OCSC_GT_TARGET}" \
   model.model_config.finetune.ocsc_use_pretrained_ref="${OCSC_USE_PRETRAINED_REF}" \
   model.model_config.finetune.ocsc_anchor_idx="${OCSC_ANCHOR_IDX}" \
+  model.model_config.finetune.ocsc_match_space="${OCSC_MATCH_SPACE}" \
+  model.model_config.finetune.ocsc_loss_window_steps="${OCSC_LOSS_WINDOW_STEPS}" \
+  model.model_config.finetune.ocsc_loss_temporal_stride="${OCSC_LOSS_TEMPORAL_STRIDE}" \
   model.model_config.finetune.ocsc_strict_active_mask="${OCSC_STRICT_ACTIVE_MASK}" \
   model.model_config.finetune.ocsc_position_weight="${OCSC_POSITION_WEIGHT}" \
   model.model_config.finetune.ocsc_heading_weight="${OCSC_HEADING_WEIGHT}" \

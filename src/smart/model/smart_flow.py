@@ -3393,6 +3393,7 @@ class SMARTFlow(LightningModule):
         m: int,
         sampling_scheme,
         seed_base: int,
+        output_space: str = "pose",
     ) -> Tensor:
         """ref_flow_decoder 로 1 개 OL sample 생성 후 pose 4-dim 으로 변환 (no_grad).
 
@@ -3415,6 +3416,11 @@ class SMARTFlow(LightningModule):
             )
         finally:
             agent_enc.flow_decoder = orig_fd
+        output_space = str(output_space).lower()
+        if output_space == "control":
+            if not self.use_kinematic_control_flow:
+                raise ValueError("OCSC control-space matching requires use_kinematic_control_flow=True.")
+            return ol_raw
         # native dim: control 3-dim (use_kinematic_control_flow=True) or pose 4-dim (False).
         if self.use_kinematic_control_flow:
             ol_pose_norm = control_norm_to_pose_norm(
@@ -3442,6 +3448,7 @@ class SMARTFlow(LightningModule):
         scenario_ids: Sequence[str],
         sample_count: int,
         sampling_scheme,
+        output_space: str = "pose",
     ) -> Tensor:
         """ref_flow_decoder OL samples를 sample 축으로 묶어 한 번에 생성합니다.
 
@@ -3453,12 +3460,18 @@ class SMARTFlow(LightningModule):
 
         agent_enc = self.encoder.agent_encoder
         sample_count = int(sample_count)
+        output_space = str(output_space).lower()
         if sample_count < 1:
             raise ValueError(f"sample_count must be positive, got {sample_count}.")
+        if output_space not in {"pose", "control"}:
+            raise ValueError(f"Unsupported OCSC output_space={output_space!r}.")
+        if output_space == "control" and not self.use_kinematic_control_flow:
+            raise ValueError("OCSC control-space matching requires use_kinematic_control_flow=True.")
 
         n_active = int(active_hidden.shape[0])
         if n_active == 0:
-            return active_hidden.new_zeros((sample_count, 0, self.flow_window_steps, 4))
+            last_dim = 3 if output_space == "control" else 4
+            return active_hidden.new_zeros((sample_count, 0, self.flow_window_steps, last_dim))
 
         x_init_norm = self._ocsc_build_open_loop_x_init_stack(
             agent_enc=agent_enc,
@@ -3502,6 +3515,8 @@ class SMARTFlow(LightningModule):
         finally:
             agent_enc.flow_decoder = orig_fd
 
+        if output_space == "control":
+            return ol_raw.reshape(sample_count, n_active, self.flow_window_steps, ol_raw.shape[-1])
         if self.use_kinematic_control_flow:
             repeated_agent_type = (
                 active_agent_type.unsqueeze(0)
@@ -3587,9 +3602,15 @@ class SMARTFlow(LightningModule):
         rollout_count: int,
         window_steps_10hz: int,
         rollout_steps_2hz: int,
+        match_space: str = "pose",
     ) -> Tensor:
         """OCSC closed-loop rollouts를 rollout 축으로 묶어 한 번에 실행합니다."""
         agent_enc = self.encoder.agent_encoder
+        match_space = str(match_space).lower()
+        if match_space not in {"pose", "control"}:
+            raise ValueError(f"Unsupported OCSC match_space={match_space!r}.")
+        if match_space == "control" and not self.use_kinematic_control_flow:
+            raise ValueError("OCSC control-space matching requires use_kinematic_control_flow=True.")
         rollout_count = int(rollout_count)
         if rollout_count < 1:
             raise ValueError(f"rollout_count must be positive, got {rollout_count}.")
@@ -3622,9 +3643,18 @@ class SMARTFlow(LightningModule):
             sampling_scheme=sampling_scheme,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
             rollout_steps_2hz=rollout_steps_2hz,
+            return_committed_control=(match_space == "control"),
         )
 
         n_active = int(active_mask.sum().item())
+        if match_space == "control":
+            control = rollout["pred_control_10hz"].reshape(
+                rollout_count,
+                num_agent,
+                *rollout["pred_control_10hz"].shape[1:],
+            )[:, active_mask, :window_steps_10hz]
+            return control.contiguous()
+
         traj = rollout["pred_traj_10hz"].reshape(
             rollout_count,
             num_agent,
@@ -3670,8 +3700,28 @@ class SMARTFlow(LightningModule):
         M = G if M_raw <= 0 else max(1, M_raw)
         nearest_match = bool(getattr(ft, "ocsc_ol_nearest_match", True))
         use_gt_target = bool(getattr(ft, "ocsc_gt_target", False))
+        match_space = str(getattr(ft, "ocsc_match_space", "pose")).lower()
+        if match_space not in {"pose", "control"}:
+            raise ValueError(f"Unsupported ocsc_match_space={match_space!r}; expected pose or control.")
+        if match_space == "control":
+            if not self.use_kinematic_control_flow:
+                raise ValueError("ocsc_match_space=control requires use_kinematic_control_flow=True.")
+            if use_gt_target:
+                raise ValueError("ocsc_match_space=control currently supports OL-ref targets only.")
         pos_w = float(getattr(ft, "ocsc_position_weight", 1.0))
         head_w = float(getattr(ft, "ocsc_heading_weight", 0.01))
+        loss_window_raw = int(getattr(ft, "ocsc_loss_window_steps", -1))
+        loss_window_steps_10hz = (
+            int(self.flow_window_steps)
+            if loss_window_raw <= 0
+            else min(int(loss_window_raw), int(self.flow_window_steps))
+        )
+        if loss_window_steps_10hz <= 0:
+            raise ValueError(
+                "ocsc_loss_window_steps must be positive or -1, "
+                f"got {loss_window_raw}."
+            )
+        loss_stride_raw = int(getattr(ft, "ocsc_loss_temporal_stride", -1))
 
         if use_gt_target and nearest_match:
             nearest_match = False  # GT 1 개 target 이면 nearest 의미 없음
@@ -3697,7 +3747,7 @@ class SMARTFlow(LightningModule):
                 valid_full = data["agent"]["valid_mask"]
                 num_hist_10hz = int(agent_enc.num_historical_steps)
                 future_start = num_hist_10hz
-                future_end = future_start + int(self.flow_window_steps)
+                future_end = future_start + int(loss_window_steps_10hz)
                 if future_end <= int(valid_full.shape[1]):
                     active_mask = active_mask & valid_full[:, future_start:future_end].all(dim=1)
                 else:
@@ -3727,7 +3777,7 @@ class SMARTFlow(LightningModule):
                 active_mask=active_mask,
                 current_pos=current_pos_active,
                 current_head=current_head_active,
-                window_steps_10hz=self.flow_window_steps,
+                window_steps_10hz=loss_window_steps_10hz,
             )
             if gt_target is None:
                 return self._build_trainable_connected_zero_loss(self.encoder)
@@ -3744,12 +3794,16 @@ class SMARTFlow(LightningModule):
                     scenario_ids=data["scenario_id"],
                     sample_count=M,
                     sampling_scheme=sampling_scheme,
+                    output_space=match_space,
                 ).detach()
+            if target_stack.shape[2] > loss_window_steps_10hz:
+                target_stack = target_stack[:, :, :loss_window_steps_10hz].contiguous()
 
-        # 5. G closed-loop rollouts (with grad), normalize to anchor-0 local pose 4-dim
-        #    `[x/20, y/20, cos, sin]`.  CL 은 world frame pose → anchor 0 local pose 변환.
-        win_10hz = int(self.flow_window_steps)
-        rollout_steps_2hz = max(1, win_10hz // int(agent_enc.shift))
+        # 5. G closed-loop rollouts (with grad), returned in the configured match space.
+        #    pose: world frame pose -> anchor-0 local `[x/20, y/20, cos, sin]`.
+        #    control: raw normalized committed `[delta_s, delta_n, delta_yaw]`.
+        win_10hz = int(loss_window_steps_10hz)
+        rollout_steps_2hz = max(1, math.ceil(win_10hz / int(agent_enc.shift)))
         cl_stack = self._ocsc_run_closed_loop_rollouts_batched(
             data=data,
             tokenized_agent=tokenized_agent,
@@ -3762,16 +3816,18 @@ class SMARTFlow(LightningModule):
             rollout_count=G,
             window_steps_10hz=win_10hz,
             rollout_steps_2hz=rollout_steps_2hz,
-        )  # [G, n_active, 20, 4]
+            match_space=match_space,
+        )  # pose: [G, n_active, T, 4], control: [G, n_active, T, 3]
 
-        # 5b. 2 Hz coarse — 10 Hz fine 20 step 의 0.5 s 마다 끝점만 (idx shift-1, 2*shift-1, ...).
-        # OCSC 경험: 10 Hz fine 매 step matching 보다 2 Hz coarse 가 학습 잘 됨.
+        # 5b. Temporal loss sampling.  Default(-1) preserves the historical 2 Hz
+        # coarse endpoints.  Set stride=1 to match all 10 Hz steps.
         shift = int(agent_enc.shift)
-        if cl_stack.shape[2] >= shift:
-            cl_stack = cl_stack[:, :, shift - 1::shift, :]
-            target_stack = target_stack[:, :, shift - 1::shift, :]
+        loss_temporal_stride = shift if loss_stride_raw <= 0 else max(1, int(loss_stride_raw))
+        if loss_temporal_stride > 1 and cl_stack.shape[2] >= loss_temporal_stride:
+            cl_stack = cl_stack[:, :, loss_temporal_stride - 1::loss_temporal_stride, :]
+            target_stack = target_stack[:, :, loss_temporal_stride - 1::loss_temporal_stride, :]
             if gt_valid is not None:
-                gt_valid = gt_valid[:, shift - 1::shift]
+                gt_valid = gt_valid[:, loss_temporal_stride - 1::loss_temporal_stride]
 
         # 6. paired loss (nearest_match or 단순 mean)
         if use_gt_target:
