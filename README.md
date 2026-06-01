@@ -213,8 +213,9 @@ CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=1 bash scripts/download_mdg_cache_to_testas.sh
 | clean before download | `CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=0` |
 | expected files | 620,109 |
 
-`download_mdg_cache_to_testas.sh`는 `testas` 내부의 `/mnt/nuplan/projects/catk`를 `MDG`
-브랜치로 맞춘 뒤, pod 내부 tmux session `mdg-cache-download`에서
+`download_mdg_cache_to_testas.sh`는 `testas` 내부의 전용 clean checkout
+`/mnt/nuplan/projects/catk_mdg_cache_download`를 `MDG` 브랜치로 맞춘 뒤,
+pod 내부 tmux session `mdg-cache-download`에서
 `download_mdg_cache_from_nubes.sh`를 실행한다. 로그는
 `/workspace/womd_v1_3/logs/download_mdg_cache_from_nubes_*.log`에 남는다.
 

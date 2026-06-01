@@ -7,7 +7,7 @@ set -Eeuo pipefail
 NAMESPACE="${NAMESPACE:-p-pnc}"
 POD="${POD:-testas}"
 CONTAINER="${CONTAINER:-main}"
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk}"
+PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk_mdg_cache_download}"
 BRANCH="${BRANCH:-MDG}"
 REMOTE_DIR="${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601}"
 CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/MDG_cache}"
