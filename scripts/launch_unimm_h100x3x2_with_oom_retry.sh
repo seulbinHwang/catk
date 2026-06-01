@@ -2,7 +2,7 @@
 # Launch UniMM Anchor-Based-4s on hsb-npc-training-3-{1,2} with automatic
 # CUDA OOM fallback.
 #
-# The first attempt starts at INITIAL_BS=30 by default. If any pod log contains
+# The first attempt starts at INITIAL_BS=26 by default. If any pod log contains
 # a CUDA OOM marker, the script stops the distributed job, finds the newest
 # epoch_last.ckpt under the same task name, lowers data.train_batch_size by
 # OOM_STEP, and starts the next attempt from that checkpoint. Non-OOM exits such
@@ -19,13 +19,13 @@ PODS="${PODS:-hsb-npc-training-3-1 hsb-npc-training-3-2}"
 PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_unimm_h100x3x2}"
 REPO_URL="${REPO_URL:-https://github.com/seulbinHwang/catk.git}"
 BRANCH="${BRANCH:-UniMM}"
-TASK_NAME="${TASK_NAME:-unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_oom_retry}"
+TASK_NAME="${TASK_NAME:-unimm_anchor_based_4s_h100x3x2_pretrain_globalbs156_oom_retry}"
 SESSION="${SESSION:-unimm-h100x3x2}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
 CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
 ANCHOR_FILE="${ANCHOR_FILE:-}"
 MASTER_PORT="${MASTER_PORT:-29551}"
-INITIAL_BS="${INITIAL_BS:-30}"
+INITIAL_BS="${INITIAL_BS:-26}"
 OOM_STEP="${OOM_STEP:-2}"
 MAX_SAME_BS_OOM_RETRIES="${MAX_SAME_BS_OOM_RETRIES:-3}"
 MIN_BS="${MIN_BS:-16}"
@@ -37,7 +37,7 @@ TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-4}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
-LEARNING_RATE="${LEARNING_RATE:-0.001185854123}"
+LEARNING_RATE="${LEARNING_RATE:-0.001103970108}"
 WANDB_MODE="${WANDB_MODE:-online}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"

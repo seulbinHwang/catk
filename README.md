@@ -19,14 +19,14 @@
 | optimizer | AdamW |
 | weight decay | 0.0001 |
 | base initial lr | 0.0005 |
-| H100 x3x2 initial lr | 0.001185854123 |
+| H100 x3x2 initial lr | 0.001103970108 |
 | schedule | cosine annealing to 0 |
 | final lr | 0 |
 | warmup | 4 epochs |
 | total decay epochs | 64 |
 | epochs | 64 |
 | base batch size | 32 scenes global |
-| H100 x3x2 effective batch size | 180 scenes global |
+| H100 x3x2 effective batch size | 156 scenes global |
 | H100 x3x2 validation batch size | 72 scenes global |
 | validation interval | every 16 epochs |
 | fit-time scorer scenes | 1680 |
@@ -225,7 +225,7 @@ hsb-npc-training-3-1, hsb-npc-training-3-2
 python scripts/launch_unimm_h100x3x2.py \
   --smoke \
   --smoke-batches 2 \
-  --train-batch-size 30 \
+  --train-batch-size 26 \
   --replace
 ```
 
@@ -234,28 +234,28 @@ batch size OOM 탐색은 validation을 끈 smoke run으로 작은 값에서 큰 
 ```bash
 python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 16 --replace
 python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 24 --replace
-python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 30 --replace
+python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 26 --replace
 ```
 
-2026-06-01 최신 `UniMM` 기준으로 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 `train_batch_size=32`는 backward 중 CUDA OOM이 재현됐다. `train_batch_size=31`은 짧은 2-batch smoke를 통과했지만 32와 한 scene 차이라 full-epoch 데이터 변동 여유가 너무 얇다. 안정 기본값은 per-GPU `train_batch_size=30`이고 global batch size는 `30 x 6 = 180`이다.
+2026-06-01 최신 `UniMM` 기준으로 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 `train_batch_size=32`는 backward 중 CUDA OOM이 재현됐다. `train_batch_size=31`은 짧은 2-batch smoke를 통과했지만 32와 한 scene 차이라 full-run 여유가 얇다. 이후 full-run OOM retry에서 `train_batch_size=30`과 `28`도 실제 학습 중 CUDA OOM이 재현됐고, `train_batch_size=26`은 같은 조건에서 200 step 이상 안정적으로 진행됐다. 안정 기본값은 per-GPU `train_batch_size=26`이고 global batch size는 `26 x 6 = 156`이다.
 
 H100 x3x2 validation은 per-GPU batch size 12, global batch size `12 x 6 = 72`로 실행한다. 학습 중 validation은 `check_val_every_n_epoch=16` 주기로 돌며, Fast WOSAC `sim_agents_2025` scorer는 `scorer_scene_num=1680` 기준으로 GPU 수와 validation batch size에 맞춰 batch 수를 계산한다. H100 x3x2 기본값에서는 `ceil(ceil(1680 / 6) / 12) = 24`이므로 `n_batch_sim_agents_metric=24`로 자동 조정된다.
 
 LR은 기존 기준인 effective batch size 32, lr 0.0005에서 sqrt scaling으로 조정한다.
 
 ```text
-scaled_lr = 0.0005 * sqrt(180 / 32) = 0.001185854123
+scaled_lr = 0.0005 * sqrt(156 / 32) = 0.001103970108
 ```
 
-`scripts/launch_unimm_h100x3x2.py`의 기본 `--learning-rate`는 이 값이며, 실행 시 `model.model_config.lr=0.001185854123` Hydra override로 전달된다.
+`scripts/launch_unimm_h100x3x2.py`의 기본 `--learning-rate`는 이 값이며, 실행 시 `model.model_config.lr=0.001103970108` Hydra override로 전달된다.
 
-스케줄은 cosine annealing to zero를 유지하되, 64 epoch 학습에 맞춰 decay 끝점을 64 epoch 끝으로 둔다. H100 x3x2 기본 실행은 SMART 비교 실험과 맞춰 `lr_warmup_steps=4`를 사용하고, warmup 이후 `0.001185854123 -> 0`을 no-restart cosine으로 감소시킨다.
+스케줄은 cosine annealing to zero를 유지하되, 64 epoch 학습에 맞춰 decay 끝점을 64 epoch 끝으로 둔다. H100 x3x2 기본 실행은 SMART 비교 실험과 맞춰 `lr_warmup_steps=4`를 사용하고, warmup 이후 `0.001103970108 -> 0`을 no-restart cosine으로 감소시킨다.
 
 전체 학습:
 
 ```bash
 python scripts/launch_unimm_h100x3x2.py \
-  --train-batch-size 30 \
+  --train-batch-size 26 \
   --val-batch-size 12 \
   --replace
 ```
@@ -263,14 +263,14 @@ python scripts/launch_unimm_h100x3x2.py \
 OOM retry/resume 전체 학습:
 
 ```bash
-TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_oom_retry \
-INITIAL_BS=30 \
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs156_oom_retry \
+INITIAL_BS=26 \
 OOM_STEP=2 \
 MIN_BS=16 \
   bash scripts/launch_unimm_h100x3x2_with_oom_retry.sh
 ```
 
-이 래퍼는 첫 시도를 per-GPU `train_batch_size=30`로 시작한다. 두 pod 중 하나라도 CUDA OOM marker를 로그에 남기면 양쪽 `unimm-h100x3x2` tmux 학습 세션을 종료하고, 같은 `TASK_NAME`의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size -= OOM_STEP`으로 재시작한다. 기본 `OOM_STEP=2`라서 `30 -> 28 -> 26 -> ...` 순서로 낮춘다. `OOM_STEP=0`이면 batch size를 낮추지 않고 `MAX_SAME_BS_OOM_RETRIES` 횟수만큼 같은 batch size로 재시도한다.
+이 래퍼는 첫 시도를 per-GPU `train_batch_size=26`으로 시작한다. 두 pod 중 하나라도 CUDA OOM marker를 로그에 남기면 양쪽 `unimm-h100x3x2` tmux 학습 세션을 종료하고, 같은 `TASK_NAME`의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size -= OOM_STEP`으로 재시작한다. 기본 `OOM_STEP=2`라서 `26 -> 24 -> 22 -> ...` 순서로 낮춘다. `OOM_STEP=0`이면 batch size를 낮추지 않고 `MAX_SAME_BS_OOM_RETRIES` 횟수만큼 같은 batch size로 재시도한다.
 
 짧은 검증 실행은 아래처럼 batch/epoch limit을 걸어 사용한다.
 
@@ -348,7 +348,7 @@ pushed launcher default smoke before batch retune:
   result=exit 0
 ```
 
-2026-06-01에 H100 x3x2 batch size를 다시 탐색했다. `train_batch_size=32`는 2-batch backward에서 CUDA OOM이 재현됐고, `train_batch_size=31`은 2-batch smoke를 통과했지만 full-epoch 안정 여유가 얇아 기본값으로 쓰지 않는다. 최종 기본값은 `train_batch_size=30`, OOM retry step 2다.
+2026-06-01에 H100 x3x2 batch size를 다시 탐색했다. `train_batch_size=32`는 2-batch backward에서 CUDA OOM이 재현됐고, `train_batch_size=31`은 2-batch smoke를 통과했지만 full-run 안정 여유가 얇아 기본값으로 쓰지 않는다. `train_batch_size=30`과 `28`은 full pretrain 시도 중 실제 CUDA OOM이 재현됐고, OOM retry가 2씩 낮춰 `train_batch_size=26`으로 재시작하는 것을 확인했다. 최종 기본값은 `train_batch_size=26`, OOM retry step 2다.
 
 ```text
 OOM boundary probes:
@@ -361,8 +361,12 @@ OOM boundary probes:
   bs=32, task_name=unimm_bs32_oom_probe_20260601_194330
     trainer.max_epochs=1, trainer.limit_train_batches=2
     result=CUDA OOM on rank1 during backward
+  full-run retry, task_name=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_lloyd_trajsum_posteriorcalib_20260601_195332
+    bs=30 -> CUDA OOM during real full-run training
+    bs=28 -> CUDA OOM during real full-run training
+    bs=26 -> RUNNING beyond 200 optimizer steps on both pods
 
-bs=30 full pipeline smoke:
+bs=30 full pipeline smoke before full-run OOM retune:
   task_name=unimm_pipeline_fullcheck_bs30_20260601_194705
   2 nodes x 3 H100, train_batch_size=30 per GPU, val_batch_size=12 per GPU
   learning_rate=0.001185854123
@@ -446,7 +450,7 @@ DDP fit smoke:
   and train/posterior_accept_rate_ctx_10...ctx_80
 ```
 
-from-scratch 학습-추론 파이프라인을 짧게 재검증하려면 아래 순서로 돌린다. 이 검증은 안정 기본값인 `train_batch_size=30`, `val_batch_size=12`, H100 x3x2 DDP를 사용하되 batch/epoch 수만 줄여서 학습, 학습 중 validation, checkpoint 저장, explicit validation, test inference를 모두 통과시키는 용도다.
+from-scratch 학습-추론 파이프라인을 짧게 재검증하려면 아래 순서로 돌린다. 이 검증은 안정 기본값인 `train_batch_size=26`, `val_batch_size=12`, H100 x3x2 DDP를 사용하되 batch/epoch 수만 줄여서 학습, 학습 중 validation, checkpoint 저장, explicit validation, test inference를 모두 통과시키는 용도다.
 
 ```bash
 TASK_NAME=unimm_pipeline_fullcheck_fromscratch_$(date +%Y%m%d_%H%M%S)
@@ -456,8 +460,8 @@ python scripts/launch_unimm_h100x3x2.py \
   --task-name "$TASK_NAME" \
   --session unimm-pipeline-fullcheck \
   --master-port 29575 \
-  --train-batch-size 30 \
-  --learning-rate 0.001185854123 \
+  --train-batch-size 26 \
+  --learning-rate 0.001103970108 \
   --val-batch-size 12 \
   --wandb-mode offline \
   --max-epochs 1 \
@@ -499,10 +503,10 @@ python scripts/launch_unimm_h100x3x2.py \
 실전 full pretrain은 아래처럼 OOM retry wrapper로 시작한다. 처음부터 학습할 때는 `CKPT_PATH`를 지정하지 않는다. wrapper는 CUDA OOM 또는 재시도 가능한 종료가 발생했을 때만 같은 `TASK_NAME`의 최신 checkpoint를 찾아 resume한다.
 
 ```bash
-TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_lloyd_trajsum_posteriorcalib_$(date +%Y%m%d_%H%M%S) \
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs156_lloyd_trajsum_posteriorcalib_$(date +%Y%m%d_%H%M%S) \
 SESSION=unimm-h100x3x2 \
 MASTER_PORT=29578 \
-INITIAL_BS=30 \
+INITIAL_BS=26 \
 OOM_STEP=2 \
 MIN_BS=16 \
 WANDB_MODE=online \
@@ -558,7 +562,7 @@ python scripts/launch_unimm_h100x3x2.py \
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 | regression loss reduction | valid timestep NLL을 trajectory 내부에서 sum, valid agent/context row 사이에서 mean |
 
-이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 180에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
+이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 156에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
 Loss 로그에서 `loss_reg`와 `loss_reg_traj_sum`은 학습에 쓰는 trajectory-sum NLL이고, `loss_reg_per_step`은 이전 timestep 평균 스케일을 확인하기 위한 보조 지표다. 이 objective scale 변경 후에는 기존 checkpoint resume보다 scratch pretrain을 사용한다.
 closed-loop posterior 품질 진단을 위해 학습 중 `train/posterior_accept_rate`, `train/posterior_error_mean`, `train/posterior_error_p50`, `train/posterior_error_p90`, `train/posterior_error_p95`, `train/posterior_error_over_threshold`, type별 accept rate, context-step별 accept rate를 로깅한다. threshold 값 자체는 논문에 공개되지 않았으므로, RMM 극대화를 위해 `0.80/0.90/0.95/0.99/inf` ablation은 scratch run 기준 validation RMM으로 비교한다.
 
