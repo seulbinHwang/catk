@@ -342,10 +342,11 @@ class MDG(LightningModule):
                 if remaining > 0:
                     progressive_max = torch.linspace(0, max_level - 1, remaining, device=device).round().long()
                     random_levels = torch.floor(
-                        torch.rand(remaining, device=device) * (progressive_max + 1).clamp_min(1)
+                        torch.rand((num_agents, remaining), device=device)
+                        * (progressive_max.view(1, remaining) + 1).clamp_min(1)
                     ).long()
-                    random_levels = torch.cummax(random_levels, dim=0).values
-                    mask[batch_index, :, :remaining] = random_levels.view(1, remaining)
+                    random_levels = torch.cummax(random_levels, dim=1).values
+                    mask[batch_index, :, :remaining] = random_levels
             else:
                 valid_indices = torch.where(valid[batch_index])[0]
                 num_full = int(round(delta * int(valid_indices.numel())))

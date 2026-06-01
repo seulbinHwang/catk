@@ -526,23 +526,28 @@ def test_mdg_temporal_mask_prefix_is_progressively_increasing() -> None:
 
     assert tuple(mask.shape) == (8, 4, 40)
     saw_partial_temporal_mask = False
+    saw_agent_specific_prefix = False
     for sample_idx in range(mask.shape[0]):
-        row = mask[sample_idx, 0]
         for agent_idx in range(mask.shape[1]):
-            torch.testing.assert_close(mask[sample_idx, agent_idx], row)
+            row = mask[sample_idx, agent_idx]
+            full_suffix = int((row == 4).sum().item())
+            prefix = row[: row.numel() - full_suffix] if full_suffix > 0 else row
+            suffix = row[row.numel() - full_suffix :] if full_suffix > 0 else row.new_empty(0)
+            if prefix.numel() > 1:
+                assert bool((prefix[1:] >= prefix[:-1]).all())
+                assert int(prefix.max().item()) <= 3
+            if suffix.numel() > 0:
+                assert bool((suffix == 4).all())
 
-        full_suffix = int((row == 4).sum().item())
-        if 0 < full_suffix < row.numel():
+        reference = mask[sample_idx, 0]
+        if any(not torch.equal(mask[sample_idx, agent_idx], reference) for agent_idx in range(1, mask.shape[1])):
+            saw_agent_specific_prefix = True
+        full_suffix = int((reference == 4).sum().item())
+        if 0 < full_suffix < reference.numel():
             saw_partial_temporal_mask = True
-        prefix = row[: row.numel() - full_suffix] if full_suffix > 0 else row
-        suffix = row[row.numel() - full_suffix :] if full_suffix > 0 else row.new_empty(0)
-        if prefix.numel() > 1:
-            assert bool((prefix[1:] >= prefix[:-1]).all())
-            assert int(prefix.max().item()) <= 3
-        if suffix.numel() > 0:
-            assert bool((suffix == 4).all())
 
     assert saw_partial_temporal_mask
+    assert saw_agent_specific_prefix
 
 
 def test_mdg_traffic_signal_stop_points_are_cached() -> None:
