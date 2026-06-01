@@ -17,6 +17,15 @@ from src.mdg.geometry import (
 )
 
 
+def _ensure_valid_attention_key(key_valid: Tensor) -> Tensor:
+    if key_valid.shape[-1] == 0:
+        return key_valid
+    has_key = key_valid.any(dim=-1, keepdim=True)
+    first_key = torch.zeros_like(key_valid)
+    first_key[..., 0] = True
+    return torch.where(has_key, key_valid, first_key)
+
+
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
@@ -160,6 +169,7 @@ class RelativeMHA(nn.Module):
         else:
             attn_mask = None
             if key_valid is not None:
+                key_valid = _ensure_valid_attention_key(key_valid)
                 attn_mask = key_valid[:, None, None, :]
             out = F.scaled_dot_product_attention(
                 q,
@@ -173,6 +183,7 @@ class RelativeMHA(nn.Module):
 
         logits = logits / (self.head_dim ** 0.5)
         if key_valid is not None:
+            key_valid = _ensure_valid_attention_key(key_valid)
             logits = logits.masked_fill(~key_valid[:, None, None, :], -1.0e4)
         attn = self.dropout(torch.softmax(logits, dim=-1))
 
@@ -230,7 +241,17 @@ class RelativeMHA(nn.Module):
         logits = logits + torch.einsum("bthqd,bhqkd->bthqk", q, rel_heads)
         logits = logits / (self.head_dim ** 0.5)
         if key_valid is not None:
-            logits = logits.masked_fill(~key_valid[:, None, None, None, :], -1.0e4)
+            key_valid = _ensure_valid_attention_key(key_valid)
+            if key_valid.dim() == 2:
+                valid = key_valid[:, None, None, None, :]
+            elif key_valid.dim() == 3:
+                valid = key_valid[:, :, None, None, :]
+            else:
+                raise ValueError(
+                    "time-shared self attention key_valid must have shape [B, N] "
+                    f"or [B, T, N], got {tuple(key_valid.shape)}."
+                )
+            logits = logits.masked_fill(~valid, -1.0e4)
         attn = self.dropout(torch.softmax(logits, dim=-1))
 
         out = torch.matmul(attn, v)
@@ -283,6 +304,7 @@ class RelativeMHA(nn.Module):
         logits = logits + torch.einsum("bthnd,bhnsd->bthns", q, rel_heads)
         logits = logits / (self.head_dim ** 0.5)
         if key_valid is not None:
+            key_valid = _ensure_valid_attention_key(key_valid)
             logits = logits.masked_fill(~key_valid[:, None, None, None, :], -1.0e4)
         attn = self.dropout(torch.softmax(logits, dim=-1))
 
@@ -369,6 +391,7 @@ class CrossAttentionBlock(nn.Module):
         query: Tensor,
         rel: Tensor,
         key_valid: Tensor,
+        query_valid: Optional[Tensor] = None,
     ) -> Tensor:
         y = self.attn.forward_time_shared_self(
             self.q_norm(query),
@@ -378,7 +401,17 @@ class CrossAttentionBlock(nn.Module):
         )
         query = query + self.attn_drop(y)
         query = query + self.ffn(self.ffn_norm(query))
-        return query * key_valid[:, None, :, None].to(dtype=query.dtype)
+        valid = key_valid if query_valid is None else query_valid
+        if valid.dim() == 2:
+            valid = valid[:, None, :, None]
+        elif valid.dim() == 3:
+            valid = valid[:, :, :, None]
+        else:
+            raise ValueError(
+                "time-shared self attention query_valid must have shape [B, N] "
+                f"or [B, T, N], got {tuple(valid.shape)}."
+            )
+        return query * valid.to(dtype=query.dtype)
 
     def forward_time_shared_scene(
         self,
@@ -396,7 +429,16 @@ class CrossAttentionBlock(nn.Module):
         )
         query = query + self.attn_drop(y)
         query = query + self.ffn(self.ffn_norm(query))
-        return query * query_valid[:, :, None, None].to(dtype=query.dtype)
+        if query_valid.dim() == 2:
+            valid = query_valid[:, :, None, None]
+        elif query_valid.dim() == 3:
+            valid = query_valid[:, :, :, None]
+        else:
+            raise ValueError(
+                "time-shared scene attention query_valid must have shape [B, N] "
+                f"or [B, N, T], got {tuple(query_valid.shape)}."
+            )
+        return query * valid.to(dtype=query.dtype)
 
 
 @dataclass
@@ -691,13 +733,29 @@ class DenoiserBlock(nn.Module):
         x: Tensor,
         agent_valid: Tensor,
         scene: SceneEncoding,
+        query_valid: Optional[Tensor] = None,
     ) -> Tensor:
         bsz, num_agents, action_steps, hidden_dim = x.shape
+        if query_valid is None:
+            query_valid = agent_valid[:, :, None].expand(-1, -1, action_steps)
+        else:
+            query_valid = query_valid & agent_valid[:, :, None]
+        valid_f = query_valid.to(dtype=x.dtype)
+        x = x * valid_f.unsqueeze(-1)
+
         temporal = x.reshape(bsz * num_agents, action_steps, hidden_dim)
-        temporal = self.temporal(temporal, temporal, rel=None, key_valid=None)
+        temporal_valid = query_valid.reshape(bsz * num_agents, action_steps)
+        temporal = self.temporal(
+            temporal,
+            temporal,
+            rel=None,
+            key_valid=temporal_valid,
+            query_valid=temporal_valid,
+        )
         x = temporal.reshape(bsz, num_agents, action_steps, hidden_dim)
 
         inter = x.permute(0, 2, 1, 3)
+        inter_valid = query_valid.permute(0, 2, 1)
         rel_aa = relation_features(
             scene.agent_anchor_pos,
             scene.agent_anchor_heading,
@@ -707,7 +765,8 @@ class DenoiserBlock(nn.Module):
         inter = self.inter_agent.forward_time_shared_self(
             inter,
             rel=rel_aa,
-            key_valid=agent_valid,
+            key_valid=inter_valid,
+            query_valid=inter_valid,
         )
         x = inter.permute(0, 2, 1, 3)
 
@@ -725,9 +784,9 @@ class DenoiserBlock(nn.Module):
             scene.context,
             rel=rel_as,
             key_valid=scene.valid,
-            query_valid=agent_valid,
+            query_valid=query_valid,
         )
-        return x * agent_valid[:, :, None, None].to(dtype=x.dtype)
+        return x * valid_f.unsqueeze(-1)
 
 
 class MDGDenoiser(nn.Module):
@@ -771,16 +830,27 @@ class MDGDenoiser(nn.Module):
             nn.Linear(hidden_dim, 2),
         )
 
-    def forward(self, noised_state: Tensor, mask_level: Tensor, scene: SceneEncoding) -> Tensor:
+    def forward(
+        self,
+        noised_state: Tensor,
+        mask_level: Tensor,
+        scene: SceneEncoding,
+        future_valid: Optional[Tensor] = None,
+    ) -> Tensor:
         bsz, num_agents, action_steps = mask_level.shape
         time_idx = torch.arange(action_steps, device=mask_level.device)
+        if future_valid is None:
+            query_valid = scene.agent_valid[:, :, None].expand(-1, -1, action_steps)
+        else:
+            query_valid = future_valid & scene.agent_valid[:, :, None]
+        valid_f = query_valid.to(dtype=noised_state.dtype)
         x = self.state_mlp(noised_state)
         x = x + self.mask_emb(mask_level)
         x = x + self.time_emb(time_idx).view(1, 1, action_steps, -1)
-        x = x * scene.agent_valid[:, :, None, None].to(dtype=x.dtype)
+        x = x * valid_f.unsqueeze(-1)
         for block in self.blocks:
-            x = block(x, scene.agent_valid, scene)
-        return self.out(x) * scene.agent_valid[:, :, None, None].to(dtype=x.dtype)
+            x = block(x, scene.agent_valid, scene, query_valid=query_valid)
+        return self.out(x) * valid_f.unsqueeze(-1)
 
 
 class AuxiliaryPredictor(nn.Module):
@@ -864,10 +934,17 @@ class MDGBackbone(nn.Module):
         mask_level: Tensor,
         scene: Optional[SceneEncoding] = None,
         compute_aux: bool = True,
+        future_valid: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, SceneEncoding, Optional[Tensor]]:
         if scene is None:
             scene = self.scene_encoder(batch)
         current_pos, current_heading, current_speed, current_velocity = self.current_state(batch)
+        if future_valid is not None:
+            noised_action = torch.where(
+                future_valid.unsqueeze(-1),
+                noised_action,
+                torch.zeros_like(noised_action),
+            )
         _, _, _, noised_state, _ = self.dynamics(
             noised_action,
             current_pos,
@@ -875,7 +952,7 @@ class MDGBackbone(nn.Module):
             current_speed,
             current_velocity=current_velocity,
         )
-        pred_action = self.denoiser(noised_state, mask_level, scene)
+        pred_action = self.denoiser(noised_state, mask_level, scene, future_valid=future_valid)
         pred_pos, pred_heading, pred_speed, pred_chunk_state, denorm_action = self.dynamics(
             pred_action,
             current_pos,

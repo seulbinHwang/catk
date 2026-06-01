@@ -410,6 +410,13 @@ class MDG(LightningModule):
             batch["agent_velocity"][:, :, self.num_historical_steps :, :2],
             dim=-1,
         )
+        valid_pos = future_valid.unsqueeze(-1)
+        pred_pos = torch.where(valid_pos, pred_pos, torch.zeros_like(pred_pos))
+        target_pos = torch.where(valid_pos, target_pos, torch.zeros_like(target_pos))
+        pred_heading = torch.where(future_valid, pred_heading, torch.zeros_like(pred_heading))
+        target_heading = torch.where(future_valid, target_heading, torch.zeros_like(target_heading))
+        pred_speed = torch.where(future_valid, pred_speed, torch.zeros_like(pred_speed))
+        target_speed = torch.where(future_valid, target_speed, torch.zeros_like(target_speed))
         pos_loss = F.mse_loss(pred_pos, target_pos, reduction="none").sum(dim=-1)
         pred_heading_vec = torch.stack((torch.cos(pred_heading), torch.sin(pred_heading)), dim=-1)
         target_heading_vec = torch.stack((torch.cos(target_heading), torch.sin(target_heading)), dim=-1)
@@ -431,8 +438,13 @@ class MDG(LightningModule):
         pred_chunk_state: Tensor,
         clean_chunk_state: Tensor,
         batch: Dict[str, Tensor],
+        chunk_valid: Tensor | None = None,
     ) -> Tensor:
-        chunk_valid = self._chunk_valid(batch)
+        if chunk_valid is None:
+            chunk_valid = self._chunk_valid(batch)
+        valid_state = chunk_valid.unsqueeze(-1)
+        pred_chunk_state = torch.where(valid_state, pred_chunk_state, torch.zeros_like(pred_chunk_state))
+        clean_chunk_state = torch.where(valid_state, clean_chunk_state, torch.zeros_like(clean_chunk_state))
         loss = F.mse_loss(pred_chunk_state, clean_chunk_state, reduction="none").sum(dim=-1)
         return (loss * chunk_valid.to(dtype=loss.dtype)).sum() / chunk_valid.sum().clamp_min(1).to(dtype=loss.dtype)
 
@@ -445,6 +457,7 @@ class MDG(LightningModule):
         local_heading = wrap_angle(future_heading - current_heading.unsqueeze(-1))
         target = torch.cat((local_pos, local_heading.unsqueeze(-1)), dim=-1)
         valid = self._future_valid(batch)
+        target = torch.where(valid.unsqueeze(-1), target, torch.zeros_like(target))
         target_expanded = target.unsqueeze(2).expand_as(aux)
         l2_score = torch.linalg.norm(aux[..., :2] - target_expanded[..., :2], dim=-1)
         l2_score = (l2_score * valid.unsqueeze(2).to(dtype=l2_score.dtype)).sum(dim=-1)
@@ -464,20 +477,24 @@ class MDG(LightningModule):
 
     def _training_forward(self, batch: Dict[str, Tensor], batch_idx: int | None = None) -> Dict[str, Tensor]:
         clean_action, clean_chunk_state = self.backbone.clean_actions_and_chunk_state_from_batch(batch)
+        chunk_valid = self._chunk_valid(batch)
         mask_level = self._sample_mask_levels(batch, batch_idx=batch_idx)
         noised_action = self._apply_noise(clean_action, mask_level)
         pred_action, pred_pos, pred_heading, pred_speed, pred_chunk_state, scene, aux = self.backbone.denoise_actions(
             batch,
             noised_action,
             mask_level,
+            future_valid=chunk_valid,
         )
         if aux is None:
             raise RuntimeError("Auxiliary predictor output is required during training.")
-        state_loss = self._chunk_state_loss(pred_chunk_state, clean_chunk_state, batch)
+        state_loss = self._chunk_state_loss(pred_chunk_state, clean_chunk_state, batch, chunk_valid=chunk_valid)
         if self.action_loss_weight > 0.0:
-            action_valid = self._chunk_valid(batch)
+            valid_action = chunk_valid.unsqueeze(-1)
+            pred_action = torch.where(valid_action, pred_action, torch.zeros_like(pred_action))
+            clean_action = torch.where(valid_action, clean_action, torch.zeros_like(clean_action))
             action_loss = F.smooth_l1_loss(pred_action, clean_action, reduction="none").sum(dim=-1)
-            action_loss = (action_loss * action_valid.to(dtype=action_loss.dtype)).sum() / action_valid.sum().clamp_min(1).to(dtype=action_loss.dtype)
+            action_loss = (action_loss * chunk_valid.to(dtype=action_loss.dtype)).sum() / chunk_valid.sum().clamp_min(1).to(dtype=action_loss.dtype)
         else:
             action_loss = state_loss.new_zeros(())
         if self.full_state_loss_weight > 0.0:

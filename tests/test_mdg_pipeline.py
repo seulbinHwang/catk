@@ -318,6 +318,72 @@ def test_mdg_default_loss_is_state_plus_aux_without_action_loss() -> None:
     torch.testing.assert_close(out["loss"].detach(), expected)
 
 
+def test_mdg_invalid_future_chunks_do_not_change_valid_denoiser_outputs() -> None:
+    batch = collate_mdg_samples([_sample(0)])
+    model = MDG(_small_model_config())
+    model.eval()
+
+    invalid_start = model.num_historical_steps + 20
+    batch["agent_valid_mask"][0, 0, invalid_start : invalid_start + model.backbone.action_chunk] = False
+    chunk_valid = model._chunk_valid(batch)
+    clean_action, _ = model.backbone.clean_actions_and_chunk_state_from_batch(batch)
+    mask_level = torch.full(
+        clean_action.shape[:-1],
+        model.num_noise_levels - 1,
+        dtype=torch.long,
+        device=clean_action.device,
+    )
+    perturbed_action = clean_action.clone()
+    perturbed_action[~chunk_valid] = 1000.0
+
+    with torch.no_grad():
+        pred_action, _, _, _, pred_chunk_state, _, _ = model.backbone.denoise_actions(
+            batch,
+            clean_action,
+            mask_level,
+            future_valid=chunk_valid,
+            compute_aux=False,
+        )
+        perturbed_pred_action, _, _, _, perturbed_chunk_state, _, _ = model.backbone.denoise_actions(
+            batch,
+            perturbed_action,
+            mask_level,
+            future_valid=chunk_valid,
+            compute_aux=False,
+        )
+
+    torch.testing.assert_close(
+        pred_action[chunk_valid],
+        perturbed_pred_action[chunk_valid],
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+    torch.testing.assert_close(
+        pred_chunk_state[chunk_valid],
+        perturbed_chunk_state[chunk_valid],
+        rtol=1.0e-5,
+        atol=1.0e-5,
+    )
+    torch.testing.assert_close(perturbed_pred_action[~chunk_valid], torch.zeros_like(perturbed_pred_action[~chunk_valid]))
+
+
+def test_mdg_invalid_future_nan_targets_are_excluded_from_training_loss() -> None:
+    sample = _sample(0)
+    invalid_start = 11 + 20
+    sample["agent_valid_mask"][0, invalid_start:] = False
+    sample["agent_position"][0, invalid_start:] = float("nan")
+    sample["agent_heading"][0, invalid_start:] = float("nan")
+    sample["agent_velocity"][0, invalid_start:] = float("nan")
+    batch = collate_mdg_samples([sample, _sample(1)])
+    model = MDG(_small_model_config())
+
+    out = model._training_forward(batch)
+
+    assert torch.isfinite(out["loss"])
+    assert torch.isfinite(out["state_loss"])
+    assert torch.isfinite(out["aux_loss"])
+
+
 def test_mdg_lr_is_step_based_without_lightning_scheduler() -> None:
     model = MDG(_small_model_config())
     optimizer = model.configure_optimizers()

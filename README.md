@@ -53,6 +53,8 @@ Auxiliary predictor는 agent scene context에서 `[B,N,6,80,3]` trajectory modes
 
 학습 mask의 `δ`는 DDP effective batch 전체에서 stratified uniform하게 분배한다. 각 rank가 local batch에서 따로 `linspace(0,1)`을 반복하지 않고, `global_batch = local_batch * world_size` 크기의 global bin permutation을 `global_step/current_epoch/batch_idx` seed로 만든 뒤 자기 rank slice만 사용한다. 통신은 없고 temporal/agent masking 로직은 논문 3.5와 동일하게 유지한다.
 
+학습 중 denoiser는 future validity도 chunk 단위로 반영한다. `action_chunk=2`이므로 두 future timestep이 모두 valid인 경우에만 `chunk_valid=[B,N,40]`가 true이며, false인 token은 noised action, denoiser input, temporal attention, inter-agent attention, scene-attention query에서 mask/zero 처리된다. 이 mask는 loss에서 invalid timestep을 제외하고 invalid scene/agent를 attention에서 masking한다는 논문 원칙을 denoiser future token에도 일관되게 적용한 것이다. validation/test/submission에서는 GT future validity가 없으므로 all-valid 생성 경로를 사용한다.
+
 기본 모델 파라미터 수는 `7,111,168`개다. 모듈별로는 scene encoder `4,017,374`, denoiser `2,778,434`, auxiliary predictor `315,360`개다. encoder/denoiser/mixer depth와 attention head 수는 유지하고, `D=192`, `FFN=704`로 폭만 줄인 설정이다.
 
 learning rate는 기존 effective batch `32`에서 쓰던 `0.0002`를 기준으로, testas A100 7장 기본 effective batch `32 * 7 = 224`에 맞춰 sqrt scaling을 적용했다. 계산식은 `0.0002 * sqrt(224 / 32) = 0.00052915`다. LR schedule은 논문 설정인 global batch `32`, `20 epochs`, warmup `1000 steps`, decay interval `2000 steps`를 기준으로 전체 학습 진행률을 보존하도록 조정했다. 우리 설정은 global batch가 7배 크고 epoch이 `20 -> 64`로 `3.2`배 길어졌으므로 step scale은 `(64 / 20) / 7 = 0.457142...`이다. 따라서 warmup은 `1000 * 0.457142 ~= 457 steps`, decay interval은 `2000 * 0.457142 ~= 914 steps`로 둔다. decay factor `0.98`은 유지한다.
