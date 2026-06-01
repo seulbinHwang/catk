@@ -18,7 +18,7 @@ trainer:
 
 model:
   model_config:
-    scorer_scene_num: 1680
+    scorer_scene_num: 1728
 
 data:
   train_batch_size: 26

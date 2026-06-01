@@ -497,7 +497,8 @@ class SMARTFlow(LightningModule):
 
         ``scorer_scene_num`` 이 양의 정수이면 전역 기준으로 그 정도의 scene을
         Fast WOSAC scorer에 넣을 수 있도록 ``n_batch_sim_agents_metric`` 을 per-rank
-        batch 수로 덮어씁니다. 별도의 scenario-level cap은 두지 않습니다.
+        batch 수로 덮어씁니다. 평가는 batch 단위로 잘리므로 실제 scene 수는
+        ``world_size * val_batch_size`` 의 배수가 됩니다.
         """
         scorer_scene_num = self.scorer_scene_num
         if scorer_scene_num is None:
@@ -521,11 +522,17 @@ class SMARTFlow(LightningModule):
         if val_batch_size is None:
             return
 
-        per_rank_scenes = math.ceil(scorer_scene_num / world_size)
-        n_batch_override = max(1, math.ceil(per_rank_scenes / val_batch_size))
+        global_val_batch_size = world_size * val_batch_size
+        n_batch_override = max(1, math.ceil(scorer_scene_num / global_val_batch_size))
+        effective_scene_num = n_batch_override * global_val_batch_size
         self.n_batch_sim_agents_metric = int(n_batch_override)
 
-        current_key = (int(scorer_scene_num), int(world_size), int(val_batch_size))
+        current_key = (
+            int(scorer_scene_num),
+            int(world_size),
+            int(val_batch_size),
+            int(effective_scene_num),
+        )
         if self._scorer_scene_num_last_key == current_key:
             return
         self._scorer_scene_num_last_key = current_key
@@ -534,7 +541,8 @@ class SMARTFlow(LightningModule):
                 "[scorer_scene_num] Fast WOSAC sim_agents_2025 scorer batch 수를 "
                 f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric} 으로 설정합니다 "
                 f"(requested_scenes={scorer_scene_num}, world_size={world_size}, "
-                f"val_batch_size={val_batch_size}).",
+                f"val_batch_size={val_batch_size}, global_val_batch_size={global_val_batch_size}, "
+                f"effective_scenes={effective_scene_num}).",
                 flush=True,
             )
 

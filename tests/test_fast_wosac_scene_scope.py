@@ -61,3 +61,22 @@ def test_scorer_scene_num_keeps_existing_val_limit_when_large_enough() -> None:
 
     assert model.n_batch_sim_agents_metric == 24
     assert trainer.limit_val_batches == 0.1
+
+
+def test_scorer_scene_num_uses_same_scene_count_for_two_and_four_gpu() -> None:
+    scene_counts = []
+    for world_size in (2, 4):
+        trainer = SimpleNamespace(
+            world_size=world_size,
+            global_rank=0,
+            limit_val_batches=0.1,
+            datamodule=SimpleNamespace(val_batch_size=16, val_dataset=range(44097)),
+            is_global_zero=False,
+        )
+        model = _model_for_scope(scorer_scene_num=1728, n_metric_batches=10, trainer=trainer)
+
+        model._configure_fast_wosac_validation_scope()
+
+        scene_counts.append(model.n_batch_sim_agents_metric * world_size * 16)
+
+    assert scene_counts == [1728, 1728]

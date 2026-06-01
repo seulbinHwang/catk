@@ -463,7 +463,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nproc-per-node", type=int, default=1)
     parser.add_argument("--val-batch-size", type=int, default=4)
     parser.add_argument("--limit-val-batches", default="auto")
-    parser.add_argument("--scorer-scene-num", type=int, default=1680)
+    parser.add_argument("--scorer-scene-num", type=int, default=1728)
     parser.add_argument("--n-rollout-closed-val", type=int, default=32)
     parser.add_argument("--precision", default="bf16-mixed")
     parser.add_argument("--num-workers", type=int, default=4)

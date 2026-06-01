@@ -441,7 +441,7 @@ class Supervisor:
             "VAL_NOISE_SCALE": "1.0",
             "N_ROLLOUT_CLOSED_VAL": "16",
             "N_BATCH_SIM_AGENTS_METRIC": "100000",
-            "SCORER_SCENE_NUM": "1680",
+            "SCORER_SCENE_NUM": "1728",
             "SIM_AGENTS_METRIC_WORKERS": "0",
             "VAL_OPEN_LOOP": "true",
             "VAL_CLOSED_LOOP": "true",

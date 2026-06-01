@@ -188,7 +188,7 @@ LR_MIN_RATIO="${LR_MIN_RATIO:-1.0}"   # 1.0 = decay 없음 (self-forced 외 분�
 # Validation rollout 비용 제어
 N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-16}"
 N_BATCH_SIM_AGENTS_METRIC="${N_BATCH_SIM_AGENTS_METRIC:-100000}"
-SCORER_SCENE_NUM="${SCORER_SCENE_NUM:-1680}"
+SCORER_SCENE_NUM="${SCORER_SCENE_NUM:-1728}"
 SIM_AGENTS_METRIC_WORKERS="${SIM_AGENTS_METRIC_WORKERS:-0}"
 
 # Visualization (epoch 마다 video upload)

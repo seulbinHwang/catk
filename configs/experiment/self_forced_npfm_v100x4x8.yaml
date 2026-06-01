@@ -35,7 +35,7 @@ model:
     lr: 1.0e-6
     # Keep the validation scorer workload stable across the 32-rank run:
     # ceil(ceil(1680 / 32) / val_batch_size=2) = 27 Fast WOSAC scorer batches.
-    scorer_scene_num: 1680
+    scorer_scene_num: 1728
     self_forced:
       use_stop_motion: false
       estimator_warmup_epochs: 1
