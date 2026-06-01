@@ -29,7 +29,7 @@ DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_ANCHOR_FILE = ""
 DEFAULT_EXPECTED_GPUS = 3
-DEFAULT_LEARNING_RATE = "0.001060660172"
+DEFAULT_LEARNING_RATE = "0.001185854123"
 KUBECTL_BIN = os.environ.get("KUBECTL_BIN") or (
     "/usr/local/bin/kubectl" if os.path.exists("/usr/local/bin/kubectl") else "kubectl"
 )
@@ -464,7 +464,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", default="unimm-h100x3x2")
     parser.add_argument("--master-port", default="29551")
     parser.add_argument("--expected-gpus", type=int, default=DEFAULT_EXPECTED_GPUS)
-    parser.add_argument("--train-batch-size", default="24")
+    parser.add_argument("--train-batch-size", default="30")
     parser.add_argument("--val-batch-size", default="12")
     parser.add_argument("--test-batch-size", default="4")
     parser.add_argument("--learning-rate", default=os.environ.get("UNIMM_LEARNING_RATE", DEFAULT_LEARNING_RATE))
