@@ -3,10 +3,7 @@ from __future__ import annotations
 import torch
 from torch_geometric.data import HeteroData
 
-from src.smart.tokens.agent_token_matching import (
-    build_agent_type_masks,
-    match_token_idx_from_local_contour,
-)
+from src.smart.tokens.agent_token_matching import build_agent_type_masks
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils import cal_polygon_contour, merge_by_type, transform_to_global, wrap_angle
 
@@ -159,53 +156,7 @@ def _reference_tokenize_agent(processor: TokenProcessor, data: HeteroData) -> di
     }
 
 
-def test_agent_token_matching_is_type_aware_argmin() -> None:
-    token_bank_veh = torch.tensor(
-        [
-            [[0.0, 0.0]],
-            [[2.0, 0.0]],
-            [[4.0, 0.0]],
-        ]
-    )
-    token_bank_ped = torch.tensor(
-        [
-            [[10.0, 0.0]],
-            [[12.0, 0.0]],
-            [[14.0, 0.0]],
-        ]
-    )
-    token_bank_cyc = torch.tensor(
-        [
-            [[20.0, 0.0]],
-            [[22.0, 0.0]],
-            [[24.0, 0.0]],
-        ]
-    )
-    agent_type = torch.tensor([0, 1, 2, 0, 1, 2])
-    contour_local = torch.tensor(
-        [
-            [[3.7, 0.0]],
-            [[10.2, 0.0]],
-            [[23.8, 0.0]],
-            [[-0.1, 0.0]],
-            [[13.7, 0.0]],
-            [[21.8, 0.0]],
-        ]
-    )
-
-    token_idx = match_token_idx_from_local_contour(
-        agent_type=agent_type,
-        contour_local=contour_local,
-        token_bank_all_veh=token_bank_veh,
-        token_bank_all_ped=token_bank_ped,
-        token_bank_all_cyc=token_bank_cyc,
-        reduction="sum",
-    )
-
-    torch.testing.assert_close(token_idx, torch.tensor([2, 0, 2, 0, 2, 1]))
-
-
-def test_local_agent_token_matching_matches_previous_global_expansion_loop() -> None:
+def test_agent_token_matching_matches_official_global_expansion_loop() -> None:
     processor = _make_processor()
     data = _make_agent_data()
 

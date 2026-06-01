@@ -19,10 +19,7 @@ import torch
 from torch import Tensor
 from torch_geometric.data import HeteroData
 
-from src.smart.tokens.agent_token_matching import (
-    build_agent_type_masks,
-    match_token_idx_from_local_contour,
-)
+from src.smart.tokens.agent_token_matching import build_agent_type_masks
 from src.smart.utils import (
     cal_polygon_contour,
     merge_by_type,
@@ -30,6 +27,9 @@ from src.smart.utils import (
     transform_to_local,
     wrap_angle,
 )
+
+
+DEFAULT_AGENT_TOKEN_MATCH_CHUNK_SIZE = 256
 
 
 def _clean_heading_dense_impl(valid: Tensor, heading: Tensor) -> Tensor:
@@ -59,6 +59,7 @@ class TokenProcessor(torch.nn.Module):
         module_dir = os.path.dirname(__file__)
         self.init_agent_token(os.path.join(module_dir, agent_token_file))
         self.init_map_token(os.path.join(module_dir, map_token_file))
+        self.agent_token_match_chunk_size = DEFAULT_AGENT_TOKEN_MATCH_CHUNK_SIZE
         self.n_token_agent = {
             "veh": self.agent_token_all_veh.shape[0],
             "ped": self.agent_token_all_ped.shape[0],
@@ -237,7 +238,6 @@ class TokenProcessor(torch.nn.Module):
             "sampled_heading": [n_agent, n_step_token]
         """
         n_agent, n_step = valid.shape
-        range_a = torch.arange(n_agent, device=valid.device)
         prev_pos, prev_head = pos[:, 0], heading[:, 0]  # [n_agent, 2], [n_agent]
 
         out_dict = {
@@ -254,35 +254,19 @@ class TokenProcessor(torch.nn.Module):
 
             #! gt_contour: [n_agent, 4, 2] in global coord
             gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
-
-            gt_contour_local, _ = transform_to_local(
-                pos_global=gt_contour,
-                head_global=None,
-                pos_now=prev_pos,  # [n_agent, 2]
-                head_now=prev_head,  # [n_agent]
-            )
-            # ! tokenize without sampling. Matching in the previous-token local
-            # frame is equivalent to transforming every token to global coords,
-            # but avoids materializing [n_agent, n_token, 4, 2] every step.
-            token_idx_gt = torch.argmin(
-                torch.norm(
-                    token_traj - gt_contour_local.unsqueeze(1),
-                    dim=-1,
-                ).sum(-1),
-                dim=-1,
-            )
-            token_contour_gt_local = token_traj[range_a, token_idx_gt]
-            token_pos_gt, token_head_gt = self._token_pose_from_local_contour(
-                token_contour_local=token_contour_gt_local,
-                ref_pos=prev_pos,
-                ref_head=prev_head,
+            token_idx_gt, token_contour_gt = self._match_official_global_agent_token(
+                token_traj=token_traj,
+                gt_contour=gt_contour,
+                prev_pos=prev_pos,
+                prev_head=prev_head,
             )
 
             # udpate prev_pos, prev_head
             prev_head = heading[:, i].clone()
-            prev_head[_valid_mask] = token_head_gt[_valid_mask]
+            dxy = token_contour_gt[:, 0] - token_contour_gt[:, 3]
+            prev_head[_valid_mask] = torch.arctan2(dxy[:, 1], dxy[:, 0])[_valid_mask]
             prev_pos = pos[:, i].clone()
-            prev_pos[_valid_mask] = token_pos_gt[_valid_mask]
+            prev_pos[_valid_mask] = token_contour_gt.mean(1)[_valid_mask]
             # add to output dict
             out_dict["token_idx"].append(token_idx_gt)
             out_dict["tokenized_pos"].append(
@@ -292,43 +276,54 @@ class TokenProcessor(torch.nn.Module):
         out_dict = {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
         return out_dict
 
-    def _match_token_idx_from_local_contour(
+    def _match_official_global_agent_token(
         self,
-        agent_type: Tensor,
-        contour_local: Tensor,
-        reduction: str,
-    ) -> Tensor:
-        """Choose nearest agent token directly in the previous-token local frame."""
-        return match_token_idx_from_local_contour(
-            agent_type=agent_type,
-            contour_local=contour_local,
-            token_bank_all_veh=self.agent_token_all_veh[:, -1],
-            token_bank_all_ped=self.agent_token_all_ped[:, -1],
-            token_bank_all_cyc=self.agent_token_all_cyc[:, -1],
-            reduction=reduction,
-        )
-
-    def _token_pose_from_local_contour(
-        self,
-        token_contour_local: Tensor,
-        ref_pos: Tensor,
-        ref_head: Tensor,
+        token_traj: Tensor,
+        gt_contour: Tensor,
+        prev_pos: Tensor,
+        prev_head: Tensor,
     ) -> Tuple[Tensor, Tensor]:
-        """Convert selected local token contours back to global center/heading."""
-        token_center_local = token_contour_local.mean(dim=1)
-        token_center_global, _ = transform_to_global(
-            pos_local=token_center_local.unsqueeze(1),
-            head_local=None,
-            pos_now=ref_pos,
-            head_now=ref_head,
-        )
+        """Match TrajTok agent tokens in the same global frame as the official code.
 
-        token_dxy_local = token_contour_local[:, 0] - token_contour_local[:, 3]
-        token_head_local = torch.arctan2(
-            token_dxy_local[:, 1],
-            token_dxy_local[:, 0],
-        )
-        return token_center_global.squeeze(1), wrap_angle(ref_head + token_head_local)
+        The official implementation materializes every candidate token in global
+        coordinates before the argmin. We keep that exact argmin/update
+        semantics, but split the agent axis to cap peak memory on large batches.
+        """
+        n_agent = token_traj.shape[0]
+        if n_agent == 0:
+            empty_idx = torch.empty(0, dtype=torch.long, device=token_traj.device)
+            empty_contour = token_traj.new_empty(
+                (0, token_traj.shape[-2], token_traj.shape[-1])
+            )
+            return empty_idx, empty_contour
+
+        chunk_size = min(self.agent_token_match_chunk_size, n_agent)
+        token_idx_chunks = []
+        token_contour_chunks = []
+        for start in range(0, n_agent, chunk_size):
+            end = min(start + chunk_size, n_agent)
+            token_world = transform_to_global(
+                pos_local=token_traj[start:end].flatten(1, 2),
+                head_local=None,
+                pos_now=prev_pos[start:end],
+                head_now=prev_head[start:end],
+            )[0].view_as(token_traj[start:end])
+            token_idx = torch.argmin(
+                torch.norm(
+                    token_world - gt_contour[start:end].unsqueeze(1),
+                    dim=-1,
+                ).sum(-1),
+                dim=-1,
+            )
+            token_idx_chunks.append(token_idx)
+            token_contour_chunks.append(
+                token_world[
+                    torch.arange(end - start, device=token_world.device),
+                    token_idx,
+                ]
+            )
+
+        return torch.cat(token_idx_chunks, dim=0), torch.cat(token_contour_chunks, dim=0)
 
     @staticmethod
     def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
@@ -343,38 +338,20 @@ class TokenProcessor(torch.nn.Module):
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         # [n_agent], max will give the first True step
         first_valid_step = torch.max(valid, dim=1).indices
-        n_step_to_extrapolate = first_valid_step.remainder(self.shift)
 
-        prev_token_step = 10 - self.shift
-        if 0 <= prev_token_step < valid.shape[1]:
-            needs_history_token = (first_valid_step == 10) & (~valid[:, prev_token_step])
-            n_step_to_extrapolate = torch.where(
-                needs_history_token,
-                torch.full_like(n_step_to_extrapolate, self.shift),
-                n_step_to_extrapolate,
-            )
+        for i, t in enumerate(first_valid_step):  # extrapolate to previous 5th step.
+            n_step_to_extrapolate = t % self.shift
+            if (t == 10) and (not valid[i, 10 - self.shift]):
+                # such that at least one token is valid in the history.
+                n_step_to_extrapolate = self.shift
 
-        step_index = torch.arange(valid.shape[1], device=valid.device).unsqueeze(0)
-        fill_start = first_valid_step - n_step_to_extrapolate
-        fill_mask = (
-            (n_step_to_extrapolate > 0).unsqueeze(1)
-            & (step_index >= fill_start.unsqueeze(1))
-            & (step_index < first_valid_step.unsqueeze(1))
-        )
-        if not bool(fill_mask.any().item()):
-            return valid, pos, heading, vel
+            if n_step_to_extrapolate > 0:
+                vel[i, t - n_step_to_extrapolate : t] = vel[i, t]
+                valid[i, t - n_step_to_extrapolate : t] = True
+                heading[i, t - n_step_to_extrapolate : t] = heading[i, t]
 
-        agent_index, step_index_flat = fill_mask.nonzero(as_tuple=True)
-        source_step = first_valid_step[agent_index]
-        source_vel = vel[agent_index, source_step]
-
-        valid[agent_index, step_index_flat] = True
-        vel[agent_index, step_index_flat] = source_vel
-        heading[agent_index, step_index_flat] = heading[agent_index, source_step]
-        delta_step = (source_step - step_index_flat).to(dtype=pos.dtype).unsqueeze(-1)
-        pos[agent_index, step_index_flat] = (
-            pos[agent_index, source_step] - source_vel * (0.1 * delta_step)
-        )
+                for j in range(n_step_to_extrapolate):
+                    pos[i, t - j - 1] = pos[i, t - j] - vel[i, t] * 0.1
 
         return valid, pos, heading, vel
 
