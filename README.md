@@ -200,6 +200,16 @@ pretrain을 시작하려면 아래 fresh wrapper를 사용한다.
 bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_legacy_inputs_trainselectfalse_fresh_oom_retry.sh
 ```
 
+실험 이름을 고정해서 마지막이 `_0601`로 끝나게 남기려면 아래 전용 wrapper를 사용한다.
+
+```bash
+bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_legacy_inputs_trainselectfalse_fresh_0601_oom_retry.sh
+```
+
+이 wrapper의 기본 task name은
+`smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_fresh_0601`이다.
+나머지 학습 recipe는 fresh wrapper와 같다.
+
 이 fresh wrapper는 기본적으로 `CACHE_ROOT=/workspace/womd_v1_3/SMART_cache`,
 `INITIAL_BS=13`, `OOM_STEP=1`, `MIN_BS=8`, `VAL_BATCH_SIZE=12`,
 `TEST_BATCH_SIZE=12`, `data.train_use_eval_agent_selection=false`를 사용한다.
