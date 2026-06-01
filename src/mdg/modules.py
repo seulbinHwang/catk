@@ -576,22 +576,26 @@ class KinematicDynamics(nn.Module):
         future_heading: Tensor,
         future_velocity: Tensor,
     ) -> Tensor:
-        bsz, num_agents, future_steps = future_heading.shape
+        _, _, future_steps = future_heading.shape
+        if future_steps % self.action_chunk != 0:
+            raise ValueError(
+                "future_steps must be divisible by action_chunk, "
+                f"got future_steps={future_steps}, action_chunk={self.action_chunk}."
+            )
         action_steps = future_steps // self.action_chunk
-        actions = []
-        prev_heading = current_heading
-        prev_speed = current_speed
-        for idx in range(action_steps):
-            end = (idx + 1) * self.action_chunk - 1
-            target_heading = future_heading[:, :, end]
-            target_speed = torch.linalg.norm(future_velocity[:, :, end, :2], dim=-1)
-            elapsed = self.dt * self.action_chunk
-            acc = (target_speed - prev_speed) / elapsed
-            yaw_rate = wrap_angle(target_heading - prev_heading) / elapsed
-            actions.append(torch.stack((acc, yaw_rate), dim=-1))
-            prev_speed = target_speed
-            prev_heading = target_heading
-        return self.normalize(torch.stack(actions, dim=2))
+        speed = torch.linalg.norm(future_velocity[:, :, :, :2], dim=-1)
+        prev_speed = torch.cat((current_speed.unsqueeze(-1), speed[:, :, :-1]), dim=-1)
+        prev_heading = torch.cat((current_heading.unsqueeze(-1), future_heading[:, :, :-1]), dim=-1)
+        per_step_acc = (speed - prev_speed) / self.dt
+        per_step_yaw_rate = wrap_angle(future_heading - prev_heading) / self.dt
+        per_step_action = torch.stack((per_step_acc, per_step_yaw_rate), dim=-1)
+        chunk_action = per_step_action.reshape(
+            *per_step_action.shape[:2],
+            action_steps,
+            self.action_chunk,
+            2,
+        ).mean(dim=3)
+        return self.normalize(chunk_action)
 
     def forward(
         self,
@@ -599,43 +603,52 @@ class KinematicDynamics(nn.Module):
         current_pos: Tensor,
         current_heading: Tensor,
         current_speed: Tensor,
+        current_velocity: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         action = self.denormalize(action)
         acc = action[..., 0]
         yaw_rate = action[..., 1]
-        pos = current_pos
-        heading = current_heading
-        speed = current_speed
-        full_pos = []
-        full_heading = []
-        full_speed = []
-        chunk_state = []
-        for idx in range(int(action.shape[2])):
-            for _ in range(self.action_chunk):
-                heading = wrap_angle(heading + yaw_rate[:, :, idx] * self.dt)
-                speed = speed + acc[:, :, idx] * self.dt
-                direction = heading_vector(heading)
-                pos = pos + direction * speed.unsqueeze(-1) * self.dt
-                full_pos.append(pos)
-                full_heading.append(heading)
-                full_speed.append(speed)
-            rel_pos = pos - current_pos
-            chunk_state.append(
-                torch.cat(
-                    (
-                        rel_pos,
-                        torch.cos(heading).unsqueeze(-1),
-                        torch.sin(heading).unsqueeze(-1),
-                        speed.unsqueeze(-1),
-                    ),
-                    dim=-1,
-                )
-            )
+        initial_velocity = (
+            current_velocity
+            if current_velocity is not None
+            else heading_vector(current_heading) * current_speed.unsqueeze(-1)
+        )
+        full_acc = acc.repeat_interleave(self.action_chunk, dim=2)
+        full_yaw_rate = yaw_rate.repeat_interleave(self.action_chunk, dim=2)
+
+        full_heading = wrap_angle(
+            current_heading.unsqueeze(-1) + torch.cumsum(full_yaw_rate * self.dt, dim=2)
+        )
+        full_speed = current_speed.unsqueeze(-1) + torch.cumsum(full_acc * self.dt, dim=2)
+
+        updated_velocity = heading_vector(full_heading) * full_speed.unsqueeze(-1)
+        velocity_for_position = torch.cat((initial_velocity.unsqueeze(2), updated_velocity[:, :, :-1]), dim=2)
+        full_pos = current_pos.unsqueeze(2) + torch.cumsum(velocity_for_position * self.dt, dim=2)
+
+        chunk_end_idx = torch.arange(
+            self.action_chunk - 1,
+            full_pos.shape[2],
+            self.action_chunk,
+            device=full_pos.device,
+        )
+        chunk_pos = full_pos.index_select(2, chunk_end_idx)
+        chunk_heading = full_heading.index_select(2, chunk_end_idx)
+        chunk_speed = full_speed.index_select(2, chunk_end_idx)
+        rel_pos = chunk_pos - current_pos.unsqueeze(2)
+        chunk_state = torch.cat(
+            (
+                rel_pos,
+                torch.cos(chunk_heading).unsqueeze(-1),
+                torch.sin(chunk_heading).unsqueeze(-1),
+                chunk_speed.unsqueeze(-1),
+            ),
+            dim=-1,
+        )
         return (
-            torch.stack(full_pos, dim=2),
-            torch.stack(full_heading, dim=2),
-            torch.stack(full_speed, dim=2),
-            torch.stack(chunk_state, dim=2),
+            full_pos,
+            full_heading,
+            full_speed,
+            chunk_state,
             action,
         )
 
@@ -837,12 +850,12 @@ class MDGBackbone(nn.Module):
         )
         self.aux_predictor = AuxiliaryPredictor(hidden_dim, predictor_modes, future_steps)
 
-    def current_state(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def current_state(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         pos = batch["agent_position"][:, :, self.history_steps - 1, :2]
         heading = batch["agent_heading"][:, :, self.history_steps - 1]
         velocity = batch["agent_velocity"][:, :, self.history_steps - 1, :2]
         speed = torch.linalg.norm(velocity, dim=-1)
-        return pos, heading, speed
+        return pos, heading, speed, velocity
 
     def denoise_actions(
         self,
@@ -854,12 +867,13 @@ class MDGBackbone(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, SceneEncoding, Optional[Tensor]]:
         if scene is None:
             scene = self.scene_encoder(batch)
-        current_pos, current_heading, current_speed = self.current_state(batch)
+        current_pos, current_heading, current_speed, current_velocity = self.current_state(batch)
         _, _, _, noised_state, _ = self.dynamics(
             noised_action,
             current_pos,
             current_heading,
             current_speed,
+            current_velocity=current_velocity,
         )
         pred_action = self.denoiser(noised_state, mask_level, scene)
         pred_pos, pred_heading, pred_speed, pred_chunk_state, denorm_action = self.dynamics(
@@ -867,12 +881,13 @@ class MDGBackbone(nn.Module):
             current_pos,
             current_heading,
             current_speed,
+            current_velocity=current_velocity,
         )
         aux = self.aux_predictor(scene.agent_context) if compute_aux else None
         return pred_action, pred_pos, pred_heading, pred_speed, scene, aux
 
     def clean_actions_from_batch(self, batch: dict[str, Tensor]) -> Tensor:
-        current_pos, current_heading, current_speed = self.current_state(batch)
+        current_pos, current_heading, current_speed, _ = self.current_state(batch)
         future_pos = batch["agent_position"][:, :, self.history_steps :, :2]
         future_heading = batch["agent_heading"][:, :, self.history_steps :]
         future_velocity = batch["agent_velocity"][:, :, self.history_steps :, :2]

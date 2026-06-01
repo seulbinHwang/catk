@@ -300,6 +300,16 @@ bash scripts/start_mdg_pretrain_testas_a100x7_with_oom_retry.sh
 
 MDG의 multi-step closed-loop denoising은 full-noise mask에서 시작해 clean mask로 내려가는 schedule을 쓴다. 현재 구현은 5-level discrete mask embedding을 사용하므로 `closed_loop_denoising_steps`를 `1..5` 범위로 제한한다. 기본값 `closed_loop_denoising_steps=5`, `num_noise_levels=5`에서는 `[4, 3, 2, 1, 0]` schedule로 모든 discrete noise level을 한 번씩 사용한다. 각 intermediate step은 모델의 clean action estimate를 다음 mask level로 다시 noising한 뒤 다음 denoising call에 넣는다. 논문 WOSAC leaderboard 설정은 one-step closed-loop denoising이므로 strict 재현을 원하면 `closed_loop_denoising_steps=1`로 실행한다.
 
+MDG dynamics는 논문이 참조한 VBD-style differentiable dynamics에 맞춰 action을 `[acceleration, yaw_rate]`로 두고, 0.1초 단위로 먼저 현재 velocity vector로 position을 전진한 뒤 heading/speed를 업데이트한다. forward dynamics는 action을 `[B, N, 40, 2]`에서 `[B, N, 80, 2]`로 펼친 뒤 `cumsum` 기반 batch 병렬 연산으로 계산하므로 Python timestep loop를 쓰지 않는다. 출력 shape은 그대로 `full_pos=[B,N,80,2]`, `full_heading=[B,N,80]`, `full_speed=[B,N,80]`, `chunk_state=[B,N,40,5]`이다. GT action inverse도 0.1초 per-step acceleration/yaw-rate를 먼저 계산한 다음 `action_chunk=2` 구간 평균으로 `[N, 40, 2]` action tensor를 만든다. hard speed clamp는 논문/VBD 식에 명시되어 있지 않으므로 기본값으로 넣지 않는다. dynamics round-trip 검증은 다음처럼 실행한다.
+
+```bash
+python scripts/check_mdg_dynamics_roundtrip.py \
+  --cache-root /workspace/womd_v1_3/MDG_cache \
+  --split validation \
+  --max-scenarios 128 \
+  --max-agents 64
+```
+
 이 launcher는 기본적으로 `TRAIN_MEMORY_BALANCED_BATCHING=true`를 켠다. 이 기능은 `semi_control_stable`의 memory-balanced batching 개념을 MDG dataloader에 맞춘 것으로, training cache의 agent 수, 현재 valid agent 수, valid agent step 수, map 수 metadata를 만든 뒤 무거운 scene이 한 rank-local batch에 몰리지 않도록 batch sampler가 sample 순서를 재배치한다. metadata cache 기본 위치는 `${CACHE_ROOT}/.catk_metadata/training_mdg_memory_balance_v1.pt`이고, 첫 실행 때만 생성된다.
 
 denoiser는 inter-agent / agent-scene relation이 action timestep `Ta=40` 동안 변하지 않는 점을 이용해 relation embedding을 time-shared로 계산한다. 즉 기존처럼 `[B, N*Ta, S, D]` relation activation을 물리적으로 만들지 않고 `[B, N, S, D]`를 timestep 전체에서 공유한다. temporal attention은 relation bias가 없으므로 PyTorch SDPA 경로를 사용한다. 이 변경은 attention 수식, 학습 objective, 모델 파라미터 수를 바꾸지 않는 실행 최적화다.
