@@ -103,7 +103,7 @@ KFM 계열 실험과 SMART NTP pretrain을 공정하게 비교할 때는 학습 
 agent 집합도 명시해야 한다. 현재 main 브랜치의 SMART NTP pretrain 기본값은
 `configs/data/waymo.yaml`, `configs/experiment/pre_bc.yaml`,
 `configs/experiment/pre_bc_a100x4x2.yaml` 모두에서
-`data.train_use_eval_agent_selection: true`를 사용한다.
+`data.train_use_eval_agent_selection: false`를 사용한다.
 
 이 설정에서는 validation과 같은 agent selection을 학습에도 사용한다. 학습 전용
 `train_mask`를 만들지 않으므로, SMART NTP loss는 별도 `train_mask` cap 없이
