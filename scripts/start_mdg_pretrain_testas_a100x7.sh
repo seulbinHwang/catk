@@ -7,7 +7,7 @@ set -Eeuo pipefail
 NAMESPACE="${NAMESPACE:-p-pnc}"
 POD="${POD:-testas}"
 CONTAINER="${CONTAINER:-main}"
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk}"
+PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk_mdg_pretrain}"
 BRANCH="${BRANCH:-MDG}"
 SESSION="${SESSION:-mdg-pretrain-a100x7}"
 LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/testas_mdg_pretrain_a100x7}"
