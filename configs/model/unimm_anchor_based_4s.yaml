@@ -11,7 +11,7 @@ model_config:
   commit_steps: 5
   match_steps: 5
   first_context_step: 10
-  last_train_context_step: 50
+  last_train_context_step: 85
   anchor_heading_weight: 1.0
   anchor_match_chunk_size: 4096
 

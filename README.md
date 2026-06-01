@@ -34,6 +34,7 @@
 
 논문에서 명시한 핵심은 `2048 anchors + continuous regression + Tpred=4s + closed-loop samples + approximate posterior policy + Tpost=Tz*=0.5s`다. 현재 구현도 이 조합만 대상으로 한다.
 Regression objective는 trajectory likelihood에 맞춰 valid timestep NLL을 agent/context row 내부에서 합산한 뒤 valid row 평균으로 줄인다. 기존 timestep 평균 스케일은 모니터링용 `loss_reg_per_step` 로그로만 남긴다.
+학습 context는 1초 history 끝인 raw step 10부터 8초 rollout 마지막 decision point인 raw step 85까지 `tau=0.5s` 간격으로 만든다. `Tpred=4s` 전체 GT가 남지 않는 late context는 `[40, 3]` target shape을 유지하되 남은 valid future만 supervision에 쓰고 나머지 timestep은 invalid mask로 제외한다.
 
 ## 코드 구조
 
@@ -296,6 +297,34 @@ explicit test:
   model.model_config.n_rollout_closed_val=2
 ```
 
+2026-06-01에 `last_train_context_step=85`와 late-context partial valid future padding 변경도 같은 H100 x3x2 pod에서 검증했다.
+
+```text
+direct processor/model checks on both pods:
+  context_indices = [1, ..., 16]  # raw step 10,15,...,85
+  target_local shape = [3, 16, 40, 3]
+  target_valid shape = [3, 16, 40]
+  final context raw step 85 has only first 5 target steps valid
+  synthetic training_step and 80-step closed-loop rollout both finite
+
+DDP fit smoke:
+  task_name=unimm_context85_ddp_smoke_20260601
+  2 nodes x 3 H100, train_batch_size=32 per GPU
+  trainer.max_epochs=1
+  trainer.limit_train_batches=1
+  trainer.limit_val_batches=0
+  result=exit 0, no CUDA OOM
+
+DDP fit + validation smoke:
+  task_name=unimm_context85_val_smoke_20260601
+  2 nodes x 3 H100, train_batch_size=8 per GPU, val_batch_size=4 per GPU
+  trainer.max_epochs=1
+  trainer.limit_train_batches=1
+  trainer.limit_val_batches=1
+  model.model_config.n_rollout_closed_val=2
+  result=exit 0, val_open and val_closed/sim_agents_2025 metrics produced
+```
+
 from-scratch 학습-추론 파이프라인을 짧게 재검증하려면 아래 순서로 돌린다. 이 검증은 실제 `train_batch_size=32`, `val_batch_size=12`, H100 x3x2 DDP를 사용하되 batch/epoch 수만 줄여서 학습, 학습 중 validation, checkpoint 저장, explicit validation, test inference를 모두 통과시키는 용도다.
 
 ```bash
@@ -403,6 +432,7 @@ python scripts/launch_unimm_h100x3x2.py \
 | factorized attention | 2 layers |
 | distance `d(.,.)` | `mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)` |
 | posterior threshold | category별 nearest-anchor 0.5초 error 95% quantile |
+| train context starts | raw step `10,15,...,85`; late context는 남은 valid future만 supervision |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 | regression loss reduction | valid timestep NLL을 trajectory 내부에서 sum, valid agent/context row 사이에서 mean |
 

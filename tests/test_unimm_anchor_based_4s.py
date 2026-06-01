@@ -90,7 +90,7 @@ def _make_model_cfg(anchor_path: Path, **overrides):
         "commit_steps": 5,
         "match_steps": 5,
         "first_context_step": 10,
-        "last_train_context_step": 50,
+        "last_train_context_step": 85,
         "anchor_heading_weight": 1.0,
         "anchor_match_chunk_size": 16,
         "use_closed_loop_training": True,
@@ -149,13 +149,16 @@ def test_unimm_processor_builds_closed_loop_training_batch():
         use_closed_loop=True,
     )
 
-    assert batch.target_local.shape == (3, 9, 40, 3)
-    assert batch.target_valid.shape == (3, 9, 40)
-    assert batch.z_star.shape == (3, 9)
-    assert batch.tokenized_agent["state_pos"].shape == (3, 10, 2)
-    assert batch.tokenized_agent["tracklet_pos"].shape == (3, 10, 5, 2)
-    assert batch.tokenized_agent["tracklet_head"].shape == (3, 10, 5)
-    assert batch.tokenized_agent["tracklet_valid"].shape == (3, 10, 5)
+    assert batch.target_local.shape == (3, 16, 40, 3)
+    assert batch.target_valid.shape == (3, 16, 40)
+    assert batch.z_star.shape == (3, 16)
+    assert batch.tokenized_agent["state_pos"].shape == (3, 17, 2)
+    assert batch.tokenized_agent["tracklet_pos"].shape == (3, 17, 5, 2)
+    assert batch.tokenized_agent["tracklet_head"].shape == (3, 17, 5)
+    assert batch.tokenized_agent["tracklet_valid"].shape == (3, 17, 5)
+    assert torch.equal(batch.context_indices, torch.arange(1, 17))
+    assert batch.target_valid[:, -1, :5].all()
+    assert not batch.target_valid[:, -1, 5:].any()
     assert torch.isfinite(batch.tokenized_agent["tracklet_pos"]).all()
 
 
@@ -313,7 +316,7 @@ def test_unimm_lightning_training_step_runs(tmp_path: Path):
             "commit_steps": 5,
             "match_steps": 5,
             "first_context_step": 10,
-            "last_train_context_step": 50,
+            "last_train_context_step": 85,
             "anchor_heading_weight": 1.0,
             "anchor_match_chunk_size": 16,
             "use_closed_loop_training": True,
@@ -376,7 +379,7 @@ def test_unimm_rollout_shapes(tmp_path: Path):
             "commit_steps": 5,
             "match_steps": 5,
             "first_context_step": 10,
-            "last_train_context_step": 50,
+            "last_train_context_step": 85,
             "anchor_heading_weight": 1.0,
             "anchor_match_chunk_size": 16,
             "use_closed_loop_training": True,

@@ -40,7 +40,7 @@ class UniMMProcessor(nn.Module):
         commit_steps: int = 5,
         match_steps: int = 5,
         first_context_step: int = 10,
-        last_train_context_step: int = 50,
+        last_train_context_step: int = 85,
         anchor_heading_weight: float = 1.0,
         anchor_match_chunk_size: int = 4096,
     ) -> None:
@@ -133,13 +133,25 @@ class UniMMProcessor(nn.Module):
         start_step: int,
         horizon_steps: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        end_step = start_step + horizon_steps
-        if end_step >= pos.shape[1]:
+        if horizon_steps < 1:
+            raise ValueError("horizon_steps must be positive")
+        if start_step < 0 or start_step >= pos.shape[1]:
             raise ValueError(
-                f"future window [{start_step + 1}, {end_step}] exceeds cache length {pos.shape[1]}"
+                f"start_step={start_step} is outside cache length {pos.shape[1]}"
             )
-        sl = slice(start_step + 1, end_step + 1)
-        return pos[:, sl], head[:, sl], valid[:, sl]
+
+        n_agent = pos.shape[0]
+        future_pos = pos.new_zeros((n_agent, horizon_steps, pos.shape[-1]))
+        future_head = head.new_zeros((n_agent, horizon_steps))
+        future_valid = valid.new_zeros((n_agent, horizon_steps))
+
+        available_steps = min(horizon_steps, max(pos.shape[1] - start_step - 1, 0))
+        if available_steps > 0:
+            sl = slice(start_step + 1, start_step + 1 + available_steps)
+            future_pos[:, :available_steps] = pos[:, sl]
+            future_head[:, :available_steps] = head[:, sl]
+            future_valid[:, :available_steps] = valid[:, sl]
+        return future_pos, future_head, future_valid
 
     def _build_targets(
         self,
