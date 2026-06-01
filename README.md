@@ -273,6 +273,29 @@ retry wrapper의 로컬 로그는 `logs/_unimm_h100x3x2_oom_retry/<TASK_NAME>/at
 
 H100 x3x2 launcher는 `--ckpt-path`가 지정되면 기본적으로 master pod의 checkpoint를 `/tmp/unimm_h100x3x2_synced_ckpts/<TASK_NAME>/` 아래로 복사하고, 같은 파일을 모든 pod의 동일 경로에 동기화한 뒤 그 경로를 Hydra `ckpt_path`로 넘긴다. 따라서 `validate`, `test`, OOM retry resume처럼 모든 rank가 checkpoint를 직접 읽어야 하는 실행에서도 rank0 pod에만 checkpoint가 있어서 worker rank가 깨지는 문제를 피한다. 정말 모든 pod가 같은 shared filesystem path를 보고 있다는 것이 확실할 때만 `--no-sync-ckpt`를 사용한다.
 
+2026-06-01에 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 최신 `UniMM` 코드 기준으로 아래 경로를 검증했다. 검증은 실제 `/workspace/womd_v1_3/SMART_cache`와 committed full-Lloyd anchor file을 사용했고, 모든 실행은 2 nodes x 3 H100 DDP에서 exit status 0으로 끝났다.
+
+```text
+fit smoke:
+  task_name=unimm_verify_8250_312_20260601
+  trainer.max_epochs=1
+  trainer.limit_train_batches=2
+  trainer.limit_val_batches=1
+  model.model_config.n_rollout_closed_val=2
+
+explicit validate:
+  task_name=unimm_verify_8250_312_validate_20260601
+  ckpt_path=<fit smoke epoch_last.ckpt, synced to both pods>
+  trainer.limit_val_batches=1
+  model.model_config.n_rollout_closed_val=2
+
+explicit test:
+  task_name=unimm_verify_8250_312_test_20260601
+  ckpt_path=<fit smoke epoch_last.ckpt, synced to both pods>
+  trainer.limit_test_batches=1
+  model.model_config.n_rollout_closed_val=2
+```
+
 from-scratch 학습-추론 파이프라인을 짧게 재검증하려면 아래 순서로 돌린다. 이 검증은 실제 `train_batch_size=32`, `val_batch_size=12`, H100 x3x2 DDP를 사용하되 batch/epoch 수만 줄여서 학습, 학습 중 validation, checkpoint 저장, explicit validation, test inference를 모두 통과시키는 용도다.
 
 ```bash
@@ -325,7 +348,7 @@ python scripts/launch_unimm_h100x3x2.py \
 실전 full pretrain은 아래처럼 OOM retry wrapper로 시작한다. 처음부터 학습할 때는 `CKPT_PATH`를 지정하지 않는다. wrapper는 CUDA OOM 또는 재시도 가능한 종료가 발생했을 때만 같은 `TASK_NAME`의 최신 checkpoint를 찾아 resume한다.
 
 ```bash
-TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs192_$(date +%Y%m%d_%H%M%S) \
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs192_lloyd_trajsum_$(date +%Y%m%d_%H%M%S) \
 SESSION=unimm-h100x3x2 \
 MASTER_PORT=29578 \
 INITIAL_BS=32 \
