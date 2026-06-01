@@ -324,7 +324,7 @@ python scripts/launch_smart_ntp_h100x4_h100x2.py \
 
 기본 experiment는 `configs/experiment/pre_bc_a100x4x2.yaml`이다. 이 config는
 `pre_bc`를 상속하므로 SMART backbone, next-token prediction loss,
-deterministic nearest-token tokenization, agent selection, `num_freq_bands: 88`
+deterministic nearest-token tokenization, agent selection, `num_freq_bands: 64`
 같은 모델/알고리즘 설정은 유지한다. 단, 학습 중 closed-loop validation은 WOSAC
 submission과 같은 후보 폭을 쓰도록 `validation_rollout_sampling.num_k: 48`을 명시한다. 그 외에는
 `semi_control_stable`의 x4x2 control-space pretrain recipe와 학습 실행 조건을 맞추기
@@ -505,7 +505,7 @@ checkpoint가 없으면 에러를 내고 새 학습을 시작하지 않는다. c
 `--allow-missing-resume-checkpoint`를 명시한다.
 
 중요한 제약은 resume 시 모델/config가 checkpoint와 호환되어야 한다는 점이다. 예를 들어
-SMART 공정 비교 pretrain은 `num_freq_bands: 88`을 쓰므로, resume도 같은
+SMART 공정 비교 pretrain은 `num_freq_bands: 64`를 쓰므로, resume도 같은
 `experiment=pre_bc` 또는 `pre_bc_a100x4x2` 계열 설정으로 실행해야 한다.
 
 학습 batch, learning rate, epoch 수 같은 실험 파라미터를 바꿔야 할 때는 launcher option을
@@ -537,17 +537,17 @@ closed-loop validation realism 점수가 가장 높았던 가중치를 best chec
 `n_vis_rollout: 0`을 명시해서 validation 중 rollout video 저장이라는 불필요한
 side-effect를 만들지 않는다.
 
-같은 config는 SMART NTP의 capacity 보정을 위해
-`model.model_config.decoder.num_freq_bands: 88`도 명시한다. 최신 main 코드에서
-`experiment=pre_bc`와 `num_freq_bands=88`으로 SMART 모델을 실제 instantiate해 센
-총 파라미터 수는 7,093,544개이며, 모두 trainable parameter이다.
-순수 `configs/model/smart.yaml` 기본값인 `num_freq_bands=64` 기준 총 파라미터 수는
-7,035,008개이다.
+같은 config는 SMART NTP의 Fourier geometry band를 기본 SMART 설정과 같은
+`model.model_config.decoder.num_freq_bands: 64`로 명시한다. 최신 main 코드에서
+`experiment=pre_bc`와 `num_freq_bands=64`로 SMART 모델을 실제 instantiate해 센
+총 파라미터 수는 7,001,024개이며, 모두 trainable parameter이다.
+이전 `num_freq_bands=88` 기준 총 파라미터 수는 7,093,544개였으므로,
+현재 설정은 92,520개 적다.
 
 `local_val`, `wosac_sub`, `clsft`, `road_clsft`도 같은 pretrain checkpoint를 그대로
-읽어야 하므로 `model.model_config.decoder.num_freq_bands: 88`을 명시한다. 이 값을
-빠뜨리면 `pre_bc`에서 저장한 checkpoint의 Fourier embedding weight shape이 기본
-SMART 값인 `64`와 맞지 않아 checkpoint load 단계에서 실패한다.
+읽어야 하므로 `model.model_config.decoder.num_freq_bands: 64`를 명시한다. 이 값을
+pretrain과 다르게 두면 Fourier embedding weight shape이 맞지 않아 checkpoint load
+단계에서 실패한다.
 
 RMM 계산 scene 수는 `model.model_config.scorer_scene_num`을 기준으로 맞춘다. 기본 SMART와
 공정 비교용 pretrain은 `1680`으로 설정되어 있으며, `configs/experiment/local_val.yaml`도
