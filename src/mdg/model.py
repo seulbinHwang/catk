@@ -295,15 +295,42 @@ class MDG(LightningModule):
     def _alpha_schedule(self, device: torch.device, dtype: torch.dtype) -> Tensor:
         return torch.linspace(0.99, 0.01, self.num_noise_levels, device=device, dtype=dtype)
 
-    def _sample_mask_levels(self, batch: Dict[str, Tensor]) -> Tensor:
+    def _distributed_world_rank(self) -> tuple[int, int]:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_world_size()), int(torch.distributed.get_rank())
+        trainer = getattr(self, "_trainer", None)
+        if trainer is not None:
+            return int(getattr(trainer, "world_size", 1) or 1), int(getattr(trainer, "global_rank", 0) or 0)
+        return 1, 0
+
+    def _masking_deltas(self, batch_size: int, device: torch.device, batch_idx: int | None = None) -> Tensor:
+        world_size, rank = self._distributed_world_rank()
+        global_batch_size = int(batch_size) * int(world_size)
+        if global_batch_size <= 1:
+            return torch.zeros(batch_size, device=device)
+
+        step = int(getattr(self, "global_step", 0))
+        epoch = int(getattr(self, "current_epoch", 0))
+        batch_offset = 0 if batch_idx is None else int(batch_idx)
+        seed = (
+            1_729
+            + 1_000_003 * step
+            + 10_007 * epoch
+            + 101 * batch_offset
+        ) % (2**63 - 1)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(seed)
+        bins = torch.randperm(global_batch_size, device=device, generator=generator)
+        local_bins = bins[rank * batch_size : (rank + 1) * batch_size]
+        return local_bins.to(dtype=torch.float32) / float(global_batch_size - 1)
+
+    def _sample_mask_levels(self, batch: Dict[str, Tensor], batch_idx: int | None = None) -> Tensor:
         valid = batch["agent_valid"]
         bsz, num_agents = valid.shape
         action_steps = self.backbone.action_steps
         device = valid.device
         max_level = self.num_noise_levels - 1
-        deltas = torch.linspace(0.0, 1.0, bsz, device=device)
-        if bsz > 1:
-            deltas = deltas[torch.randperm(bsz, device=device)]
+        deltas = self._masking_deltas(bsz, device=device, batch_idx=batch_idx)
         mask = torch.zeros((bsz, num_agents, action_steps), dtype=torch.long, device=device)
         for batch_index in range(bsz):
             delta = float(deltas[batch_index].item())
@@ -435,9 +462,9 @@ class MDG(LightningModule):
         agent_valid = batch["agent_valid"]
         return (best * agent_valid.to(dtype=best.dtype)).sum() / agent_valid.sum().clamp_min(1).to(dtype=best.dtype)
 
-    def _training_forward(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
+    def _training_forward(self, batch: Dict[str, Tensor], batch_idx: int | None = None) -> Dict[str, Tensor]:
         clean_action, clean_chunk_state = self.backbone.clean_actions_and_chunk_state_from_batch(batch)
-        mask_level = self._sample_mask_levels(batch)
+        mask_level = self._sample_mask_levels(batch, batch_idx=batch_idx)
         noised_action = self._apply_noise(clean_action, mask_level)
         pred_action, pred_pos, pred_heading, pred_speed, pred_chunk_state, scene, aux = self.backbone.denoise_actions(
             batch,
@@ -473,7 +500,7 @@ class MDG(LightningModule):
         }
 
     def training_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Tensor:
-        out = self._training_forward(batch)
+        out = self._training_forward(batch, batch_idx=batch_idx)
         self.log("train/loss", out["loss"], on_step=True, prog_bar=True, batch_size=1)
         self.log("train/state_loss", out["state_loss"], on_step=True, batch_size=1)
         self.log("train/action_loss", out["action_loss"], on_step=True, batch_size=1)
@@ -482,7 +509,7 @@ class MDG(LightningModule):
         return out["loss"]
 
     def validation_step(self, batch: Dict[str, Tensor], batch_idx: int) -> None:
-        out = self._training_forward(batch)
+        out = self._training_forward(batch, batch_idx=batch_idx)
         self.log("val/loss", out["loss"], on_epoch=True, sync_dist=True, batch_size=1)
         if not self.val_closed_loop:
             return

@@ -425,6 +425,22 @@ def test_mdg_noise_schedule_and_fourier_relation_features() -> None:
     )
 
 
+def test_mdg_masking_deltas_cover_global_ddp_batch(monkeypatch) -> None:
+    model = MDG(_small_model_config())
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 3)
+
+    bins = []
+    for rank in range(3):
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda rank=rank: rank)
+        deltas = model._masking_deltas(4, torch.device("cpu"), batch_idx=7)
+        bins.append(torch.round(deltas * 11).long())
+
+    all_bins = torch.cat(bins).sort().values
+    torch.testing.assert_close(all_bins, torch.arange(12))
+
+
 def test_mdg_temporal_mask_prefix_is_progressively_increasing() -> None:
     model = MDG(_small_model_config())
     batch = {"agent_valid": torch.ones(8, 4, dtype=torch.bool)}
