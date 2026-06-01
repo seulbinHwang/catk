@@ -25,6 +25,7 @@ from src.smart.metrics import (
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 from src.utils.vis_waymo import VisWaymo
 from src.unimm.anchors import (
+    AGENT_TYPE_NAMES,
     AnchorSpec,
     gather_anchors_by_type,
     load_anchor_file,
@@ -309,17 +310,36 @@ class UniMMAnchorBased4s(LightningModule):
             if bool(z_star_valid.any())
             else batch.z_star_error.sum().detach() * 0.0,
         }
+        posterior_stats = batch.posterior_stats
+        for stat_key in (
+            "accept_rate",
+            "error_mean",
+            "error_p50",
+            "error_p90",
+            "error_p95",
+            "error_over_threshold",
+        ):
+            if stat_key in posterior_stats:
+                logs[f"posterior_{stat_key}"] = posterior_stats[stat_key].detach()
+
+        type_rates = posterior_stats.get("accept_rate_by_type")
+        if type_rates is not None:
+            for type_idx, type_name in enumerate(AGENT_TYPE_NAMES):
+                if type_idx < int(type_rates.numel()):
+                    logs[f"posterior_accept_rate_{type_name}"] = type_rates[type_idx].detach()
+
+        context_rates = posterior_stats.get("accept_rate_by_context")
+        context_steps = posterior_stats.get("context_raw_steps")
+        if context_rates is not None and context_steps is not None:
+            for idx in range(int(context_rates.numel())):
+                raw_step = int(context_steps[idx].item())
+                logs[f"posterior_accept_rate_ctx_{raw_step}"] = context_rates[idx].detach()
         return total_loss, logs
 
     def training_step(self, data, batch_idx):
         loss, logs = self._forward_loss(data, use_closed_loop=self.use_closed_loop_training)
-        self.log("train/loss", logs["loss"], on_step=True, batch_size=1)
-        self.log("train/loss_cls", logs["loss_cls"], on_step=True, batch_size=1)
-        self.log("train/loss_reg", logs["loss_reg"], on_step=True, batch_size=1)
-        self.log("train/loss_reg_traj_sum", logs["loss_reg_traj_sum"], on_step=True, batch_size=1)
-        self.log("train/loss_reg_per_step", logs["loss_reg_per_step"], on_step=True, batch_size=1)
-        self.log("train/reg_cls_ratio", logs["reg_cls_ratio"], on_step=True, batch_size=1)
-        self.log("train/z_star_error", logs["z_star_error"], on_step=True, batch_size=1)
+        for key, value in logs.items():
+            self.log(f"train/{key}", value, on_step=True, batch_size=1)
         return loss
 
     def validation_step(self, data, batch_idx):

@@ -114,6 +114,7 @@ assignment chunks: 2048 trajectory rows x 256 anchors
 distance: mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)
 heading_weight: 1.0
 empty cluster policy: high-error trajectory로 재초기화
+posterior threshold calibration: raw context step 10,15,...,85의 nearest-anchor 0.5초 error 95% quantile
 ```
 
 이 distance는 학습/closed-loop에서 positive/posterior anchor를 고르는 기준과 동일하게 맞춘 것이다. `--lloyd-iters 0`을 주면 refinement를 끌 수 있지만, 논문 재현 목적의 기본 anchor에는 쓰지 않는다.
@@ -129,7 +130,20 @@ posterior_error_threshold:
   veh/ped/cyc별 threshold
 ```
 
-논문은 posterior plan error threshold의 정확한 값을 공개하지 않는다. 이 구현은 training trajectory의 nearest-anchor 0.5초 error 95% quantile을 category별 threshold로 저장한다.
+논문은 posterior plan error threshold의 정확한 값을 공개하지 않는다. 이 구현은 8초 rollout training 분포와 맞추기 위해 raw context step `10,15,...,85`에서 training trajectory의 nearest-anchor 0.5초 error 95% quantile을 category별 threshold로 저장한다. 기존 anchor 좌표는 유지하고 threshold만 다시 맞추려면 아래 명령을 쓴다.
+
+```bash
+python scripts/recompute_unimm_anchor_thresholds.py \
+  --train-cache-dir /workspace/womd_v1_3/SMART_cache/training \
+  --anchor-file src/unimm/anchors/unimm_anchors_8s_k2048.pkl \
+  --output src/unimm/anchors/unimm_anchors_8s_k2048.pkl \
+  --device cuda \
+  --threshold-start-step 10 \
+  --threshold-end-step 85 \
+  --threshold-step 5
+```
+
+현재 커밋된 anchor file의 posterior threshold는 full training cache 기준 `veh=0.0027350509`, `ped=0.0440671258`, `cyc=0.0091966363`이다. threshold 산정 window 수는 각각 `veh=184,926,339`, `ped=13,986,957`, `cyc=1,376,585`이다.
 새 anchor bank를 만들면 component index의 의미가 바뀌므로 기존 checkpoint에서 resume하지 말고 scratch 학습을 시작한다.
 
 ## 학습
@@ -325,6 +339,37 @@ DDP fit + validation smoke:
   result=exit 0, val_open and val_closed/sim_agents_2025 metrics produced
 ```
 
+2026-06-01에 posterior threshold 계측과 context-distribution threshold calibration도 같은 H100 x3x2 pod에서 검증했다. 검증 checkout은 `/tmp/catk_unimm_posterior_verify`를 사용했고, 실제 `/workspace/womd_v1_3/SMART_cache/training`과 committed anchor file을 사용했다.
+
+```text
+threshold recompute:
+  context steps = [10, 15, ..., 85]
+  quantile = 0.95
+  distance = mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)
+  result thresholds:
+    veh = 0.0027350509 from 184,926,339 windows
+    ped = 0.0440671258 from 13,986,957 windows
+    cyc = 0.0091966363 from 1,376,585 windows
+
+direct processor/model checks on both pods:
+  posterior_stats contains accept_rate, error_mean, error_p50/p90/p95,
+  error_over_threshold, type accept rates, and context accept rates
+  context accept-rate diagnostic steps = raw step 10,15,...,80
+  result=all direct checks passed
+
+DDP fit smoke:
+  task_name=unimm_posterior_threshold_ddp_smoke_20260601
+  2 nodes x 3 H100, train_batch_size=8 per GPU
+  trainer.max_epochs=1
+  trainer.limit_train_batches=1
+  trainer.limit_val_batches=0
+  result=exit 0, no CUDA OOM
+  logged keys include train/posterior_accept_rate,
+  train/posterior_error_mean, train/posterior_error_p50/p90/p95,
+  train/posterior_error_over_threshold, type rates,
+  and train/posterior_accept_rate_ctx_10...ctx_80
+```
+
 from-scratch 학습-추론 파이프라인을 짧게 재검증하려면 아래 순서로 돌린다. 이 검증은 실제 `train_batch_size=32`, `val_batch_size=12`, H100 x3x2 DDP를 사용하되 batch/epoch 수만 줄여서 학습, 학습 중 validation, checkpoint 저장, explicit validation, test inference를 모두 통과시키는 용도다.
 
 ```bash
@@ -431,18 +476,19 @@ python scripts/launch_unimm_h100x3x2.py \
 | map self-attention | 1 layer |
 | factorized attention | 2 layers |
 | distance `d(.,.)` | `mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)` |
-| posterior threshold | category별 nearest-anchor 0.5초 error 95% quantile |
+| posterior threshold | category별 raw context `10,15,...,85` nearest-anchor 0.5초 error 95% quantile |
 | train context starts | raw step `10,15,...,85`; late context는 남은 valid future만 supervision |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 | regression loss reduction | valid timestep NLL을 trajectory 내부에서 sum, valid agent/context row 사이에서 mean |
 
 이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 192에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
 Loss 로그에서 `loss_reg`와 `loss_reg_traj_sum`은 학습에 쓰는 trajectory-sum NLL이고, `loss_reg_per_step`은 이전 timestep 평균 스케일을 확인하기 위한 보조 지표다. 이 objective scale 변경 후에는 기존 checkpoint resume보다 scratch pretrain을 사용한다.
+closed-loop posterior 품질 진단을 위해 학습 중 `train/posterior_accept_rate`, `train/posterior_error_mean`, `train/posterior_error_p50`, `train/posterior_error_p90`, `train/posterior_error_p95`, `train/posterior_error_over_threshold`, type별 accept rate, context-step별 accept rate를 로깅한다. threshold 값 자체는 논문에 공개되지 않았으므로, RMM 극대화를 위해 `0.80/0.90/0.95/0.99/inf` ablation은 scratch run 기준 validation RMM으로 비교한다.
 
 ## 빠른 검증
 
 ```bash
-python -m compileall -q src/unimm scripts/build_unimm_anchors.py scripts/launch_unimm_v100x4x2.py
+python -m compileall -q src/unimm scripts/build_unimm_anchors.py scripts/recompute_unimm_anchor_thresholds.py scripts/launch_unimm_v100x4x2.py
 python -m pytest tests/test_unimm_anchor_based_4s.py -q
 ```
 

@@ -13,6 +13,7 @@ from src.smart.utils import transform_to_global, wrap_angle
 
 from .anchors import (
     AnchorSpec,
+    NUM_AGENT_TYPES,
     execute_local_anchor,
     gather_anchors_by_type,
     make_local_future,
@@ -29,6 +30,7 @@ class UniMMTrainingBatch:
     target_valid: Tensor
     z_star: Tensor
     z_star_error: Tensor
+    posterior_stats: Dict[str, Tensor]
 
 
 class UniMMProcessor(nn.Module):
@@ -194,13 +196,30 @@ class UniMMProcessor(nn.Module):
         posterior_threshold: Tensor | None,
         max_context_step: int,
         agent_type: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor]]:
         token_steps = self._state_token_steps(max_context_step)
         state_pos, state_head, state_valid = self._make_gt_state_sequence(pos, head, valid, token_steps)
         tracklet_pos, tracklet_head, tracklet_valid = self._make_gt_tracklet_sequence(pos, head, valid, token_steps)
         max_context_idx = len(token_steps) - 1
         if max_context_idx <= 1:
-            return state_pos, state_head, state_valid, tracklet_pos, tracklet_head, tracklet_valid
+            return (
+                state_pos,
+                state_head,
+                state_valid,
+                tracklet_pos,
+                tracklet_head,
+                tracklet_valid,
+                self._empty_posterior_stats(pos.device, pos.dtype),
+            )
+
+        error_values = []
+        error_over_threshold_values = []
+        valid_count = pos.new_zeros(())
+        accept_count = pos.new_zeros(())
+        type_valid_count = pos.new_zeros((NUM_AGENT_TYPES,))
+        type_accept_count = pos.new_zeros((NUM_AGENT_TYPES,))
+        context_accept_rates = []
+        context_raw_steps = []
 
         for ctx_idx in range(1, max_context_idx):
             raw_step = token_steps[ctx_idx]
@@ -243,6 +262,32 @@ class UniMMProcessor(nn.Module):
             if posterior_threshold is not None:
                 threshold = posterior_threshold.to(device=pos.device, dtype=post_error.dtype)[agent_type.long()]
                 use_posterior = post_error <= threshold
+                stats_valid = (fut_valid & state_valid[:, ctx_idx].unsqueeze(1))[
+                    :, : self.spec.num_match_steps
+                ].any(dim=-1)
+                if bool(stats_valid.any()):
+                    valid_error = post_error[stats_valid]
+                    valid_threshold = threshold[stats_valid].clamp_min(1e-12)
+                    valid_use = use_posterior[stats_valid]
+                    error_values.append(valid_error.detach())
+                    error_over_threshold_values.append((valid_error / valid_threshold).detach())
+                    valid_count = valid_count + stats_valid.to(dtype=pos.dtype).sum()
+                    accept_count = accept_count + (use_posterior & stats_valid).to(dtype=pos.dtype).sum()
+                    for type_idx in range(NUM_AGENT_TYPES):
+                        type_mask = (agent_type.long() == type_idx) & stats_valid
+                        if bool(type_mask.any()):
+                            type_valid_count[type_idx] = (
+                                type_valid_count[type_idx] + type_mask.to(dtype=pos.dtype).sum()
+                            )
+                            type_accept_count[type_idx] = (
+                                type_accept_count[type_idx]
+                                + (use_posterior & type_mask).to(dtype=pos.dtype).sum()
+                            )
+                    context_accept_rates.append(valid_use.to(dtype=pos.dtype).mean())
+                else:
+                    context_accept_rates.append(pos.new_zeros(()))
+                context_raw_steps.append(int(raw_step))
+
                 next_pos = torch.where(use_posterior.unsqueeze(1), next_pos, pos[:, raw_step + self.spec.num_commit_steps])
                 next_head = torch.where(use_posterior, next_head, head[:, raw_step + self.spec.num_commit_steps])
                 next_tracklet_pos = torch.where(
@@ -263,7 +308,93 @@ class UniMMProcessor(nn.Module):
             tracklet_head[:, ctx_idx + 1] = wrap_angle(next_tracklet_head)
             tracklet_valid[:, ctx_idx + 1] = next_tracklet_valid
 
-        return state_pos, state_head, state_valid, tracklet_pos, tracklet_head, tracklet_valid
+        posterior_stats = self._posterior_stats_from_values(
+            device=pos.device,
+            dtype=pos.dtype,
+            error_values=error_values,
+            error_over_threshold_values=error_over_threshold_values,
+            valid_count=valid_count,
+            accept_count=accept_count,
+            type_valid_count=type_valid_count,
+            type_accept_count=type_accept_count,
+            context_accept_rates=context_accept_rates,
+            context_raw_steps=context_raw_steps,
+        )
+        return (
+            state_pos,
+            state_head,
+            state_valid,
+            tracklet_pos,
+            tracklet_head,
+            tracklet_valid,
+            posterior_stats,
+        )
+
+    @staticmethod
+    def _empty_posterior_stats(device: torch.device, dtype: torch.dtype) -> Dict[str, Tensor]:
+        return {
+            "accept_rate": torch.zeros((), device=device, dtype=dtype),
+            "error_mean": torch.zeros((), device=device, dtype=dtype),
+            "error_p50": torch.zeros((), device=device, dtype=dtype),
+            "error_p90": torch.zeros((), device=device, dtype=dtype),
+            "error_p95": torch.zeros((), device=device, dtype=dtype),
+            "error_over_threshold": torch.zeros((), device=device, dtype=dtype),
+            "accept_rate_by_type": torch.zeros((NUM_AGENT_TYPES,), device=device, dtype=dtype),
+            "accept_rate_by_context": torch.zeros((0,), device=device, dtype=dtype),
+            "context_raw_steps": torch.zeros((0,), dtype=torch.long),
+        }
+
+    @staticmethod
+    def _posterior_stats_from_values(
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        error_values: Sequence[Tensor],
+        error_over_threshold_values: Sequence[Tensor],
+        valid_count: Tensor,
+        accept_count: Tensor,
+        type_valid_count: Tensor,
+        type_accept_count: Tensor,
+        context_accept_rates: Sequence[Tensor],
+        context_raw_steps: Sequence[int],
+    ) -> Dict[str, Tensor]:
+        if error_values:
+            errors = torch.cat([value.to(device=device, dtype=dtype) for value in error_values])
+            quantiles = torch.quantile(
+                errors.float(),
+                torch.tensor([0.5, 0.9, 0.95], device=device),
+            ).to(dtype=dtype)
+            error_mean = errors.mean()
+            error_over_threshold = torch.cat(
+                [value.to(device=device, dtype=dtype) for value in error_over_threshold_values]
+            ).mean()
+        else:
+            quantiles = torch.zeros((3,), device=device, dtype=dtype)
+            error_mean = torch.zeros((), device=device, dtype=dtype)
+            error_over_threshold = torch.zeros((), device=device, dtype=dtype)
+
+        accept_rate = accept_count / valid_count.clamp_min(1.0)
+        type_accept_rate = type_accept_count / type_valid_count.clamp_min(1.0)
+        context_accept_rate = (
+            torch.stack(list(context_accept_rates)).to(device=device, dtype=dtype)
+            if context_accept_rates
+            else torch.zeros((0,), device=device, dtype=dtype)
+        )
+        context_raw_step_tensor = torch.tensor(
+            list(context_raw_steps),
+            dtype=torch.long,
+        )
+        return {
+            "accept_rate": accept_rate.detach(),
+            "error_mean": error_mean.detach(),
+            "error_p50": quantiles[0].detach(),
+            "error_p90": quantiles[1].detach(),
+            "error_p95": quantiles[2].detach(),
+            "error_over_threshold": error_over_threshold.detach(),
+            "accept_rate_by_type": type_accept_rate.detach(),
+            "accept_rate_by_context": context_accept_rate.detach(),
+            "context_raw_steps": context_raw_step_tensor,
+        }
 
     def _base_agent_dict(
         self,
@@ -318,6 +449,7 @@ class UniMMProcessor(nn.Module):
                 tracklet_pos,
                 tracklet_head,
                 tracklet_valid,
+                posterior_stats,
             ) = self._build_approx_posterior_states(
                 pos=pos,
                 head=head,
@@ -330,6 +462,7 @@ class UniMMProcessor(nn.Module):
         else:
             state_pos, state_head, state_valid = self._make_gt_state_sequence(pos, head, valid, token_steps)
             tracklet_pos, tracklet_head, tracklet_valid = self._make_gt_tracklet_sequence(pos, head, valid, token_steps)
+            posterior_stats = self._empty_posterior_stats(pos.device, pos.dtype)
 
         target_local, target_valid = self._build_targets(
             pos=pos,
@@ -368,6 +501,7 @@ class UniMMProcessor(nn.Module):
             target_valid=target_valid,
             z_star=z_star.view(n_agent, n_context),
             z_star_error=z_star_error.view(n_agent, n_context),
+            posterior_stats=posterior_stats,
         )
 
     def build_rollout_seed(self, data: HeteroData) -> tuple[Dict[str, Tensor], Dict[str, Tensor], Tensor, Tensor, Tensor]:

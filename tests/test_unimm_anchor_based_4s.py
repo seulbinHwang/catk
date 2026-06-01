@@ -9,6 +9,7 @@ from torch_geometric.data import HeteroData
 
 from scripts.build_unimm_anchors import (
     collect_training_trajectories,
+    compute_context_thresholds_from_cache,
     compute_threshold,
     lloyd_refine_kmeans,
     minibatch_kmeans,
@@ -160,6 +161,13 @@ def test_unimm_processor_builds_closed_loop_training_batch():
     assert batch.target_valid[:, -1, :5].all()
     assert not batch.target_valid[:, -1, 5:].any()
     assert torch.isfinite(batch.tokenized_agent["tracklet_pos"]).all()
+    assert torch.isclose(batch.posterior_stats["accept_rate"], torch.tensor(1.0))
+    assert batch.posterior_stats["accept_rate_by_type"].shape == (3,)
+    assert batch.posterior_stats["accept_rate_by_context"].shape == (15,)
+    assert torch.equal(
+        batch.posterior_stats["context_raw_steps"],
+        torch.arange(10, 85, 5),
+    )
 
 
 def test_unimm_classification_loss_uses_positive_matching_horizon_only():
@@ -299,6 +307,38 @@ def test_unimm_anchor_collection_reads_cache_file(tmp_path: Path):
     assert trajectories["cyc"].shape == (1, 40, 3)
 
 
+def test_unimm_context_thresholds_use_late_context_windows(tmp_path: Path):
+    data = _make_data()
+    agent = {
+        key: data["agent"][key]
+        for key in ("position", "heading", "valid_mask", "type")
+    }
+    with (tmp_path / "sample.pkl").open("wb") as handle:
+        pickle.dump({"agent": agent}, handle)
+
+    payload = _make_anchor_payload()
+    anchors_by_name = {
+        name: torch.as_tensor(payload["anchors"][name], dtype=torch.float32)
+        for name in ("veh", "ped", "cyc")
+    }
+    thresholds, counts = compute_context_thresholds_from_cache(
+        train_cache_dir=tmp_path,
+        anchors_by_name=anchors_by_name,
+        match_steps=5,
+        context_steps=[10, 85],
+        quantile=0.95,
+        heading_weight=1.0,
+        row_chunk_size=8,
+        device=torch.device("cpu"),
+        num_workers=0,
+        collect_file_chunk_size=1,
+    )
+
+    assert set(thresholds) == {"veh", "ped", "cyc"}
+    assert counts == {"veh": 2, "ped": 2, "cyc": 2}
+    assert all(value >= 0.0 for value in thresholds.values())
+
+
 def test_unimm_lightning_training_step_runs(tmp_path: Path):
     anchor_path = tmp_path / "anchors.pkl"
     with anchor_path.open("wb") as handle:
@@ -358,8 +398,12 @@ def test_unimm_lightning_training_step_runs(tmp_path: Path):
         }
     )
     model = UniMMAnchorBased4s(cfg)
-    loss = model.training_step(_make_data(), 0)
+    loss, logs = model._forward_loss(_make_data(), use_closed_loop=True)
     assert torch.isfinite(loss)
+    assert "posterior_accept_rate" in logs
+    assert "posterior_error_p95" in logs
+    assert "posterior_accept_rate_veh" in logs
+    assert "posterior_accept_rate_ctx_80" in logs
 
 
 def test_unimm_rollout_shapes(tmp_path: Path):

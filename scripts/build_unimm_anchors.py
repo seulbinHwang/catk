@@ -91,6 +91,71 @@ def _extract_file_trajectory_groups(args: tuple[tuple[str, ...], int, int]) -> d
     return output
 
 
+def _extract_one_file_threshold_groups(
+    path_str: str,
+    match_steps: int,
+    context_steps: tuple[int, ...],
+) -> dict[int, np.ndarray]:
+    with Path(path_str).open("rb") as handle:
+        data = pickle.load(handle)
+
+    agent = data["agent"]
+    pos = agent["position"][..., :2].clone().contiguous()
+    head = TokenProcessor._clean_heading(agent["valid_mask"].clone(), agent["heading"].clone())
+    valid = agent["valid_mask"]
+    agent_type = agent["type"].long()
+
+    grouped: dict[int, list[torch.Tensor]] = defaultdict(list)
+    for start_step in context_steps:
+        if start_step < 0 or start_step + match_steps >= pos.shape[1]:
+            continue
+        future_valid = valid[:, start_step] & valid[:, start_step + 1 : start_step + match_steps + 1].all(dim=1)
+        rows = torch.nonzero(future_valid, as_tuple=False).flatten()
+        if rows.numel() == 0:
+            continue
+
+        row_types = agent_type[rows]
+        type_valid = (row_types >= 0) & (row_types < NUM_AGENT_TYPES)
+        rows = rows[type_valid]
+        row_types = row_types[type_valid]
+        if rows.numel() == 0:
+            continue
+
+        fut_pos = pos[rows, start_step + 1 : start_step + match_steps + 1]
+        fut_head = head[rows, start_step + 1 : start_step + match_steps + 1]
+        local_pos, local_head = transform_to_local(
+            pos_global=fut_pos,
+            head_global=fut_head,
+            pos_now=pos[rows, start_step],
+            head_now=head[rows, start_step],
+        )
+        traj = torch.cat([local_pos, wrap_angle(local_head).unsqueeze(-1)], dim=-1).cpu()
+        for type_idx in range(NUM_AGENT_TYPES):
+            mask = row_types == type_idx
+            if bool(mask.any()):
+                grouped[type_idx].append(traj[mask].contiguous())
+
+    output: dict[int, np.ndarray] = {}
+    for type_idx, parts in grouped.items():
+        merged = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        output[type_idx] = merged.numpy()
+    return output
+
+
+def _extract_file_threshold_groups(args: tuple[tuple[str, ...], int, tuple[int, ...]]) -> dict[int, np.ndarray]:
+    path_chunk, match_steps, context_steps = args
+    grouped: dict[int, list[np.ndarray]] = defaultdict(list)
+    for path_str in path_chunk:
+        groups = _extract_one_file_threshold_groups(path_str, match_steps, context_steps)
+        for type_idx, trajectories in groups.items():
+            grouped[type_idx].append(trajectories)
+
+    output: dict[int, np.ndarray] = {}
+    for type_idx, parts in grouped.items():
+        output[type_idx] = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+    return output
+
+
 def _worker_init() -> None:
     torch.set_num_threads(1)
 
@@ -442,6 +507,121 @@ def compute_threshold(
     return float(torch.cat(errors).quantile(quantile).item())
 
 
+def _quantile_1d(values: torch.Tensor, quantile: float) -> torch.Tensor:
+    if values.ndim != 1:
+        values = values.reshape(-1)
+    if values.numel() == 0:
+        raise ValueError("cannot compute quantile of an empty tensor")
+    if not 0.0 <= float(quantile) <= 1.0:
+        raise ValueError("quantile must be in [0, 1]")
+    if values.numel() == 1:
+        return values[0]
+
+    rank = float(quantile) * float(values.numel() - 1)
+    lower_rank = int(math.floor(rank))
+    upper_rank = int(math.ceil(rank))
+    lower_value = values.kthvalue(lower_rank + 1).values
+    if upper_rank == lower_rank:
+        return lower_value
+    upper_value = values.kthvalue(upper_rank + 1).values
+    weight = rank - lower_rank
+    return lower_value + (upper_value - lower_value) * weight
+
+
+@torch.no_grad()
+def compute_context_thresholds_from_cache(
+    train_cache_dir: Path,
+    anchors_by_name: dict[str, torch.Tensor],
+    match_steps: int,
+    context_steps: list[int] | tuple[int, ...],
+    quantile: float,
+    heading_weight: float,
+    row_chunk_size: int,
+    device: torch.device,
+    num_workers: int,
+    collect_file_chunk_size: int,
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Compute category posterior thresholds over every requested context start.
+
+    This reads short ``Tpost`` windows from the cache and streams nearest-anchor
+    errors in chunks, so it does not need to materialize all context windows at
+    once. The distance is intentionally the same ``anchor_distance`` used by
+    training-time posterior matching.
+    """
+
+    if match_steps < 1:
+        raise ValueError("match_steps must be positive")
+    if not context_steps:
+        raise ValueError("at least one context step is required")
+    if row_chunk_size < 1:
+        raise ValueError("row_chunk_size must be positive")
+    if collect_file_chunk_size < 1:
+        raise ValueError("collect_file_chunk_size must be positive")
+    if num_workers < 0:
+        raise ValueError("num_workers cannot be negative")
+
+    normalized_context_steps = tuple(int(step) for step in context_steps)
+    files = list(_iter_cache_files(train_cache_dir))
+    file_chunks = list(_chunked(files, collect_file_chunk_size))
+    worker_args = ((chunk, match_steps, normalized_context_steps) for chunk in file_chunks)
+
+    anchors_by_type = {
+        type_idx: anchors_by_name[name].to(device=device, dtype=torch.float32)[:, :match_steps].contiguous()
+        for type_idx, name in enumerate(AGENT_TYPE_NAMES)
+    }
+    error_blocks: dict[int, list[torch.Tensor]] = defaultdict(list)
+
+    def consume(groups: dict[int, np.ndarray]) -> None:
+        for type_idx, trajectories_np in groups.items():
+            if trajectories_np.size == 0:
+                continue
+            trajectories = torch.from_numpy(trajectories_np).to(device=device, dtype=torch.float32)
+            anchors = anchors_by_type[type_idx]
+            valid = torch.ones(trajectories.shape[:2], dtype=torch.bool, device=device)
+            for start in range(0, trajectories.shape[0], row_chunk_size):
+                chunk = trajectories[start : start + row_chunk_size]
+                chunk_valid = valid[start : start + row_chunk_size]
+                dist = anchor_distance(
+                    anchors=anchors,
+                    target_local=chunk,
+                    valid=chunk_valid,
+                    heading_weight=heading_weight,
+                )
+                error_blocks[type_idx].append(dist.min(dim=1).values.cpu())
+
+    if num_workers > 0:
+        ctx = get_context("fork")
+        with ctx.Pool(processes=num_workers, initializer=_worker_init) as pool:
+            iterator = pool.imap(_extract_file_threshold_groups, worker_args, chunksize=32)
+            for groups in tqdm(iterator, total=len(file_chunks), desc="collect threshold chunks"):
+                consume(groups)
+    else:
+        for groups in tqdm(
+            map(_extract_file_threshold_groups, worker_args),
+            total=len(file_chunks),
+            desc="collect threshold chunks",
+        ):
+            consume(groups)
+
+    thresholds: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for type_idx, name in enumerate(AGENT_TYPE_NAMES):
+        if not error_blocks[type_idx]:
+            raise RuntimeError(
+                f"no valid {name} posterior threshold windows found in {train_cache_dir} "
+                f"for context_steps={list(normalized_context_steps)}"
+            )
+        errors = torch.cat(error_blocks[type_idx], dim=0)
+        thresholds[name] = float(_quantile_1d(errors, float(quantile)).item())
+        counts[name] = int(errors.numel())
+        print(
+            f"{name}: context posterior threshold={thresholds[name]:.6f} "
+            f"from {counts[name]} windows",
+            flush=True,
+        )
+    return thresholds, counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build UniMM 8s category anchors from WOMD training cache.")
     parser.add_argument("--train-cache-dir", required=True)
@@ -502,6 +682,30 @@ def main() -> None:
     parser.add_argument("--heading-weight", type=float, default=1.0)
     parser.add_argument("--threshold-quantile", type=float, default=0.95)
     parser.add_argument(
+        "--threshold-start-step",
+        type=int,
+        default=10,
+        help="First raw context step used to calibrate posterior thresholds.",
+    )
+    parser.add_argument(
+        "--threshold-end-step",
+        type=int,
+        default=85,
+        help="Last raw context step used to calibrate posterior thresholds.",
+    )
+    parser.add_argument(
+        "--threshold-step",
+        type=int,
+        default=5,
+        help="Raw step stride for posterior threshold calibration contexts.",
+    )
+    parser.add_argument(
+        "--threshold-row-chunk-size",
+        type=int,
+        default=8192,
+        help="Trajectory rows per GPU threshold-distance chunk.",
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         help="Device for k-means and threshold computation: auto, cpu, cuda, cuda:0, ...",
@@ -528,6 +732,12 @@ def main() -> None:
         raise ValueError("--lloyd chunk sizes must be positive")
     if args.lloyd_tol < 0:
         raise ValueError("--lloyd-tol cannot be negative")
+    if args.threshold_step < 1:
+        raise ValueError("--threshold-step must be positive")
+    if args.threshold_end_step < args.threshold_start_step:
+        raise ValueError("--threshold-end-step must be >= --threshold-start-step")
+    if args.threshold_row_chunk_size < 1:
+        raise ValueError("--threshold-row-chunk-size must be positive")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -547,7 +757,6 @@ def main() -> None:
         collect_file_chunk_size=args.collect_file_chunk_size,
     )
     anchors: dict[str, torch.Tensor] = {}
-    thresholds: dict[str, float] = {}
     lloyd_history: dict[str, list[dict[str, float]]] = {}
     for type_idx, name in enumerate(AGENT_TYPE_NAMES):
         print(f"clustering {name}")
@@ -571,16 +780,23 @@ def main() -> None:
             tol=args.lloyd_tol,
             reinit_empty_clusters=not args.no_reinit_empty_clusters,
         )
-        thresholds[name] = compute_threshold(
-            trajectories=trajectories_for_type,
-            anchors=anchors[name],
-            match_steps=args.match_steps,
-            quantile=args.threshold_quantile,
-            heading_weight=args.heading_weight,
-            row_chunk_size=args.kmeans_batch_size,
-        )
-        anchors[name] = anchors[name].cpu()
-        print(f"{name}: posterior_error_threshold={thresholds[name]:.6f}")
+
+    threshold_context_steps = list(
+        range(args.threshold_start_step, args.threshold_end_step + 1, args.threshold_step)
+    )
+    thresholds, threshold_counts = compute_context_thresholds_from_cache(
+        train_cache_dir=train_cache_dir,
+        anchors_by_name=anchors,
+        match_steps=args.match_steps,
+        context_steps=threshold_context_steps,
+        quantile=args.threshold_quantile,
+        heading_weight=args.heading_weight,
+        row_chunk_size=args.threshold_row_chunk_size,
+        device=device,
+        num_workers=args.num_workers,
+        collect_file_chunk_size=args.collect_file_chunk_size,
+    )
+    anchors = {name: anchors[name].cpu() for name in AGENT_TYPE_NAMES}
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -593,6 +809,9 @@ def main() -> None:
             "distance_metric": "mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)",
             "kmeans_init": "mini_batch",
             "kmeans_refinement": "full_training_data_lloyd",
+            "threshold_source": "training_cache_context_starts",
+            "threshold_context_steps": threshold_context_steps,
+            "threshold_counts": threshold_counts,
             "empty_cluster_policy": (
                 "reinitialize_from_high_error_trajectories"
                 if not args.no_reinit_empty_clusters
