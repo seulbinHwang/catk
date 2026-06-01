@@ -17,6 +17,7 @@ NUBES_GATEWAY_ADDRESS="${NUBES_GATEWAY_ADDRESS:-c.nubes.sto.navercorp.com:8000}"
 SESSION="${SESSION:-mdg-cache-download}"
 LOG_DIR="${LOG_DIR:-/workspace/womd_v1_3/logs}"
 REPLACE_SESSION="${REPLACE_SESSION:-1}"
+CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD="${CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD:-0}"
 
 remote_quote() {
   printf '%q' "$1"
@@ -54,6 +55,21 @@ mkdir -p $(remote_quote "$LOG_DIR")
 export NUBES_GATEWAY_ADDRESS=$(remote_quote "$NUBES_GATEWAY_ADDRESS")
 export NUBES_JOBS=$(remote_quote "$NUBES_JOBS")
 export NUBES_RETRY=$(remote_quote "$NUBES_RETRY")
+if [ $(remote_quote "$CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD") = '1' ]; then
+  case $(remote_quote "$CACHE_ROOT") in
+    /workspace/womd_v1_3/MDG_cache|/workspace/womd_v1_3/MDG_cache/)
+      ;;
+    *)
+      echo '[download-clean] refusing to remove unexpected CACHE_ROOT=$(remote_quote "$CACHE_ROOT")' | tee -a $(remote_quote "$log_file")
+      exit 2
+      ;;
+  esac
+  if [ -d $(remote_quote "$CACHE_ROOT") ]; then
+    echo '[download-clean] removing existing cache root $(remote_quote "$CACHE_ROOT")' | tee -a $(remote_quote "$log_file")
+    du -sh $(remote_quote "$CACHE_ROOT") 2>/dev/null | tee -a $(remote_quote "$log_file") || true
+    rm -rf --one-file-system $(remote_quote "$CACHE_ROOT")
+  fi
+fi
 echo '[download-start]' \$(date '+%F %T') pod=$(remote_quote "$POD") remote=$(remote_quote "$REMOTE_DIR") local=$(remote_quote "$CACHE_ROOT") jobs=$(remote_quote "$NUBES_JOBS") | tee -a $(remote_quote "$log_file")
 bash scripts/download_mdg_cache_from_nubes.sh $(remote_quote "$REMOTE_DIR") $(remote_quote "$CACHE_ROOT") 2>&1 | tee -a $(remote_quote "$log_file")
 status=\${PIPESTATUS[0]}

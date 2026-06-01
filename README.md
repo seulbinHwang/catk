@@ -194,6 +194,14 @@ git pull --ff-only
 bash scripts/download_mdg_cache_to_testas.sh
 ```
 
+기존 `/workspace/womd_v1_3/MDG_cache`를 완전히 지우고 새로 받고 싶으면
+아래처럼 실행한다. 삭제 guard는 기본 cache path인
+`/workspace/womd_v1_3/MDG_cache`에만 동작한다.
+
+```bash
+CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=1 bash scripts/download_mdg_cache_to_testas.sh
+```
+
 다운로드 script 기본값:
 
 | 항목 | 기본값 |
@@ -202,6 +210,7 @@ bash scripts/download_mdg_cache_to_testas.sh
 | local cache | `/workspace/womd_v1_3/MDG_cache` |
 | Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601` |
 | nubes jobs | 96 |
+| clean before download | `CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=0` |
 | expected files | 620,109 |
 
 `download_mdg_cache_to_testas.sh`는 `testas` 내부의 `/mnt/nuplan/projects/catk`를 `MDG`
