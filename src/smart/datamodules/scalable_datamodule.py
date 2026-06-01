@@ -51,7 +51,7 @@ class MultiDataModule(LightningDataModule):
         train_max_num: int,
         train_use_eval_agent_selection: bool = False,
         road_num_rollouts_per_scenario: int = 1,
-        train_memory_balanced_batching: bool = False,
+        train_memory_balanced_batching: bool = True,
         train_memory_balance_metadata_path: Optional[str] = None,
         train_memory_balance_metadata_num_workers: int = 0,
         train_memory_balance_weight_key: str = "agent_quadratic",

@@ -301,16 +301,16 @@ message 생성, scatter aggregation으로 이어지는 graph attention 경로만
 모델 구조, 파라미터 수, edge set, radius, loss target은 바뀌지 않는다. 바뀌는 것은
 attention 내부 계산 dtype 경계뿐이다.
 
-이 preset은 `data.train_memory_balanced_batching=true`도 켠다. 이 sampler는 각 training
-pickle의 agent 수, valid agent-step 수, map point 수를 metadata cache로 한 번 기록한 뒤,
+기본 data config와 이 preset은 모두 `data.train_memory_balanced_batching=true`를 켠다.
+이 sampler는 각 training pickle의 agent 수, valid agent-step 수, map point 수를 metadata cache로 한 번 기록한 뒤,
 agent가 많은 scene이 같은 rank-local batch에 몰리지 않도록 batch 순서만 다시 짠다.
 학습 objective, 모델 구조, per-GPU `train_batch_size=16`, 전체 effective batch 128은
 그대로 유지된다. 대신 random shuffle 순서가 바뀌므로 기존 run을 resume하더라도 bitwise로
 완전히 같은 sample 순서는 아니다.
 
-안전장치로, `data.train_memory_balanced_batching=false`를 주더라도 DDP 학습에서는
+안전장치로, ablation에서 memory-balanced sampler를 명시적으로 끄더라도 DDP 학습에서는
 datamodule이 train dataloader에 `DistributedSampler`를 직접 넣는다. 따라서
-`trainer.use_distributed_sampler=false` 상태에서 memory-balanced sampler를 끄더라도
+`trainer.use_distributed_sampler=false` 상태에서 memory-balanced sampler를 끄는 경우에도
 8개 rank가 같은 training cache 전체를 반복해서 보는 상황은 발생하지 않는다. 이 fallback은
 memory balancing만 끄고, rank별 data sharding은 유지한다.
 
