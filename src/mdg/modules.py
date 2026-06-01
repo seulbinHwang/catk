@@ -864,7 +864,7 @@ class MDGBackbone(nn.Module):
         mask_level: Tensor,
         scene: Optional[SceneEncoding] = None,
         compute_aux: bool = True,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, SceneEncoding, Optional[Tensor]]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, SceneEncoding, Optional[Tensor]]:
         if scene is None:
             scene = self.scene_encoder(batch)
         current_pos, current_heading, current_speed, current_velocity = self.current_state(batch)
@@ -884,7 +884,7 @@ class MDGBackbone(nn.Module):
             current_velocity=current_velocity,
         )
         aux = self.aux_predictor(scene.agent_context) if compute_aux else None
-        return pred_action, pred_pos, pred_heading, pred_speed, scene, aux
+        return pred_action, pred_pos, pred_heading, pred_speed, pred_chunk_state, scene, aux
 
     def clean_actions_from_batch(self, batch: dict[str, Tensor]) -> Tensor:
         current_pos, current_heading, current_speed, _ = self.current_state(batch)
@@ -899,6 +899,28 @@ class MDGBackbone(nn.Module):
             future_heading=future_heading,
             future_velocity=future_velocity,
         )
+
+    def clean_actions_and_chunk_state_from_batch(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        current_pos, current_heading, current_speed, current_velocity = self.current_state(batch)
+        future_pos = batch["agent_position"][:, :, self.history_steps :, :2]
+        future_heading = batch["agent_heading"][:, :, self.history_steps :]
+        future_velocity = batch["agent_velocity"][:, :, self.history_steps :, :2]
+        clean_action = self.dynamics.trajectory_to_actions(
+            current_pos=current_pos,
+            current_heading=current_heading,
+            current_speed=current_speed,
+            future_pos=future_pos,
+            future_heading=future_heading,
+            future_velocity=future_velocity,
+        )
+        _, _, _, clean_chunk_state, _ = self.dynamics(
+            clean_action,
+            current_pos,
+            current_heading,
+            current_speed,
+            current_velocity=current_velocity,
+        )
+        return clean_action, clean_chunk_state
 
     def full_noise_sample(
         self,

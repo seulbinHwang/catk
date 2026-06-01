@@ -59,6 +59,7 @@ class MDG(LightningModule):
         self.denoising_loss_weight = float(model_config.denoising_loss_weight)
         self.aux_loss_weight = float(model_config.aux_loss_weight)
         self.action_loss_weight = float(model_config.action_loss_weight)
+        self.full_state_loss_weight = float(getattr(model_config, "full_state_loss_weight", 0.0))
         self.n_rollout_closed_val = int(model_config.n_rollout_closed_val)
         self.rollout_chunk_size = int(model_config.rollout_chunk_size)
         self.replanning_interval = int(model_config.replanning_interval)
@@ -390,6 +391,24 @@ class MDG(LightningModule):
         loss = pos_loss + heading_loss + speed_loss
         return (loss * future_valid.to(dtype=loss.dtype)).sum() / future_valid.sum().clamp_min(1).to(dtype=loss.dtype)
 
+    def _chunk_valid(self, batch: Dict[str, Tensor]) -> Tensor:
+        future_valid = self._future_valid(batch)
+        return future_valid.reshape(
+            *future_valid.shape[:2],
+            self.backbone.action_steps,
+            self.backbone.action_chunk,
+        ).all(dim=-1)
+
+    def _chunk_state_loss(
+        self,
+        pred_chunk_state: Tensor,
+        clean_chunk_state: Tensor,
+        batch: Dict[str, Tensor],
+    ) -> Tensor:
+        chunk_valid = self._chunk_valid(batch)
+        loss = F.mse_loss(pred_chunk_state, clean_chunk_state, reduction="none").sum(dim=-1)
+        return (loss * chunk_valid.to(dtype=loss.dtype)).sum() / chunk_valid.sum().clamp_min(1).to(dtype=loss.dtype)
+
     def _auxiliary_loss(self, aux: Tensor, batch: Dict[str, Tensor]) -> Tensor:
         future_pos = batch["agent_position"][:, :, self.num_historical_steps :, :2]
         future_heading = batch["agent_heading"][:, :, self.num_historical_steps :]
@@ -412,38 +431,39 @@ class MDG(LightningModule):
         return (best * agent_valid.to(dtype=best.dtype)).sum() / agent_valid.sum().clamp_min(1).to(dtype=best.dtype)
 
     def _training_forward(self, batch: Dict[str, Tensor]) -> Dict[str, Tensor]:
-        clean_action = self.backbone.clean_actions_from_batch(batch)
+        clean_action, clean_chunk_state = self.backbone.clean_actions_and_chunk_state_from_batch(batch)
         mask_level = self._sample_mask_levels(batch)
         noised_action = self._apply_noise(clean_action, mask_level)
-        pred_action, pred_pos, pred_heading, pred_speed, scene, aux = self.backbone.denoise_actions(
+        pred_action, pred_pos, pred_heading, pred_speed, pred_chunk_state, scene, aux = self.backbone.denoise_actions(
             batch,
             noised_action,
             mask_level,
         )
         if aux is None:
             raise RuntimeError("Auxiliary predictor output is required during training.")
-        state_loss = self._trajectory_state_loss(pred_pos, pred_heading, pred_speed, batch)
+        state_loss = self._chunk_state_loss(pred_chunk_state, clean_chunk_state, batch)
         if self.action_loss_weight > 0.0:
-            future_valid = self._future_valid(batch)
-            action_valid = future_valid.reshape(
-                *future_valid.shape[:2],
-                self.backbone.action_steps,
-                self.backbone.action_chunk,
-            ).all(dim=-1)
+            action_valid = self._chunk_valid(batch)
             action_loss = F.smooth_l1_loss(pred_action, clean_action, reduction="none").sum(dim=-1)
             action_loss = (action_loss * action_valid.to(dtype=action_loss.dtype)).sum() / action_valid.sum().clamp_min(1).to(dtype=action_loss.dtype)
         else:
             action_loss = state_loss.new_zeros(())
+        if self.full_state_loss_weight > 0.0:
+            full_state_loss = self._trajectory_state_loss(pred_pos, pred_heading, pred_speed, batch)
+        else:
+            full_state_loss = state_loss.new_zeros(())
         aux_loss = self._auxiliary_loss(aux, batch)
         total = (
             self.denoising_loss_weight * state_loss
             + self.action_loss_weight * action_loss
+            + self.full_state_loss_weight * full_state_loss
             + self.aux_loss_weight * aux_loss
         )
         return {
             "loss": total,
             "state_loss": state_loss.detach(),
             "action_loss": action_loss.detach(),
+            "full_state_loss": full_state_loss.detach(),
             "aux_loss": aux_loss.detach(),
         }
 
@@ -452,6 +472,7 @@ class MDG(LightningModule):
         self.log("train/loss", out["loss"], on_step=True, prog_bar=True, batch_size=1)
         self.log("train/state_loss", out["state_loss"], on_step=True, batch_size=1)
         self.log("train/action_loss", out["action_loss"], on_step=True, batch_size=1)
+        self.log("train/full_state_loss", out["full_state_loss"], on_step=True, batch_size=1)
         self.log("train/aux_loss", out["aux_loss"], on_step=True, batch_size=1)
         return out["loss"]
 
@@ -563,7 +584,7 @@ class MDG(LightningModule):
                 for step_index, noise_level in enumerate(mask_schedule):
                     if step_index > 0:
                         mask = torch.full_like(mask, noise_level)
-                    pred_action, pred_pos, pred_heading, pred_speed, _, _ = self.backbone.denoise_actions(
+                    pred_action, pred_pos, pred_heading, pred_speed, _, _, _ = self.backbone.denoise_actions(
                         rollout_batch,
                         noised_action,
                         mask,

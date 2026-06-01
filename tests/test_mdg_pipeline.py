@@ -232,7 +232,15 @@ def test_mdg_closed_loop_inference_uses_full_noise_n_step_replanning() -> None:
             dtype=noised_action.dtype,
         )
         pred_speed = torch.zeros_like(pred_heading)
-        return pred_action, pred_pos, pred_heading, pred_speed, None, None
+        pred_chunk_state = torch.zeros(
+            bsz,
+            num_agents,
+            model.backbone.action_steps,
+            5,
+            device=noised_action.device,
+            dtype=noised_action.dtype,
+        )
+        return pred_action, pred_pos, pred_heading, pred_speed, pred_chunk_state, None, None
 
     model.backbone.full_noise_sample = fake_full_noise_sample
     model.backbone.denoise_actions = fake_denoise_actions
