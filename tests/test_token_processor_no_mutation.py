@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch_geometric.data import HeteroData
 
@@ -27,6 +29,7 @@ def _make_agent_data() -> HeteroData:
 
     heading = torch.zeros(n_agent, n_step)
     heading[0, 15] = 3.2
+    heading[1, 15] = 2 * math.pi + 0.25
 
     position = torch.zeros(n_agent, n_step, 3)
     position[:, :, 0] = torch.arange(n_step, dtype=torch.float32)
@@ -82,6 +85,7 @@ def test_tokenize_agent_does_not_mutate_raw_agent_cache_fields() -> None:
 
     assert bool(tokenized_agent["gt_valid_raw"][1, 0])
     assert float(tokenized_agent["gt_head_raw"][0, 2]) == 0.0
+    torch.testing.assert_close(tokenized_agent["gt_head_raw"][1, 2], torch.tensor(0.25))
     for key, original in originals.items():
         torch.testing.assert_close(data["agent"][key], original)
 

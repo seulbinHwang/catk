@@ -8,7 +8,7 @@ from src.smart.tokens.agent_token_matching import (
     match_token_idx_from_local_contour,
 )
 from src.smart.tokens.token_processor import TokenProcessor
-from src.smart.utils import cal_polygon_contour, merge_by_type, transform_to_global
+from src.smart.utils import cal_polygon_contour, merge_by_type, transform_to_global, wrap_angle
 
 
 def _make_processor() -> TokenProcessor:
@@ -128,7 +128,7 @@ def _reference_tokenize_agent(processor: TokenProcessor, data: HeteroData) -> di
         data["agent"]["type"]
     )
     valid = data["agent"]["valid_mask"].clone()
-    heading = data["agent"]["heading"].clone()
+    heading = wrap_angle(data["agent"]["heading"].clone())
     pos = data["agent"]["position"][..., :2].clone().contiguous()
     vel = data["agent"]["velocity"].clone()
 

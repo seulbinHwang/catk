@@ -150,7 +150,7 @@ class TokenProcessor(torch.nn.Module):
 
         # ! get raw trajectory data
         valid = data["agent"]["valid_mask"].clone()  # [n_agent, n_step]
-        heading = data["agent"]["heading"].clone()  # [n_agent, n_step]
+        heading = wrap_angle(data["agent"]["heading"].clone())  # [n_agent, n_step]
         pos = data["agent"]["position"][..., :2].clone().contiguous()  # [n_agent, n_step, 2]
         vel = data["agent"]["velocity"].clone()  # [n_agent, n_step, 2]
 
