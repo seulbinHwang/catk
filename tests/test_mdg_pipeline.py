@@ -7,7 +7,12 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from waymo_open_dataset.utils.sim_agents import submission_specs
 
-from src.data_preprocess import build_mdg_map_features, build_mdg_traffic_signal_features, process_dynamic_map
+from src.data_preprocess import (
+    MDG_MAP_SAMPLING_VERSION,
+    build_mdg_map_features,
+    build_mdg_traffic_signal_features,
+    process_dynamic_map,
+)
 from src.mdg.data import collate_mdg_samples
 from src.mdg.geometry import relation_features, rotate_points, wrap_angle
 from src.mdg.model import MDG
@@ -639,6 +644,39 @@ def test_mdg_map_cache_preserves_detailed_polyline_types() -> None:
     mdg_map = build_mdg_map_features(map_data, num_waypoints=16)
 
     assert mdg_map["type"].tolist() == [3, 8]
+    assert mdg_map["sampling"] == MDG_MAP_SAMPLING_VERSION
+
+
+def test_mdg_map_cache_uses_arc_length_waypoint_sampling() -> None:
+    map_data = {
+        "map_polygon": {
+            "type": torch.tensor([0], dtype=torch.uint8),
+            "light_type": torch.tensor([0], dtype=torch.uint8),
+        },
+        "map_point": {
+            "position": torch.tensor(
+                [
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [101.0, 0.0],
+                ],
+                dtype=torch.float32,
+            ),
+            "type": torch.tensor([3, 3, 3], dtype=torch.uint8),
+        },
+        ("map_point", "to", "map_polygon"): {
+            "edge_index": torch.tensor([[0, 1, 2], [0, 0, 0]], dtype=torch.long),
+        },
+    }
+
+    mdg_map = build_mdg_map_features(map_data, num_waypoints=5)
+
+    torch.testing.assert_close(
+        mdg_map["position"][0, :, 0],
+        torch.linspace(0.0, 101.0, steps=5),
+    )
+    torch.testing.assert_close(mdg_map["position"][0, :, 1], torch.zeros(5))
+    torch.testing.assert_close(mdg_map["heading"][0], torch.zeros(5))
 
 
 def test_mdg_active_submission_requires_waymo_rollout_count() -> None:

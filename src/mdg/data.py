@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import pickle
 import warnings
 from pathlib import Path
@@ -32,8 +31,11 @@ def _as_tensor(value: Any, dtype: Optional[torch.dtype] = None) -> Tensor:
     return tensor
 
 
+MDG_MAP_SAMPLING_VERSION = "arclength_v1"
+
+
 def _interp_polyline(points: Tensor, headings: Tensor, num_waypoints: int) -> tuple[Tensor, Tensor]:
-    """Resample a polyline to a fixed number of waypoints by index interpolation."""
+    """Resample a polyline to a fixed number of waypoints by arc length."""
     n = int(points.shape[0])
     if n <= 0:
         return (
@@ -46,16 +48,28 @@ def _interp_polyline(points: Tensor, headings: Tensor, num_waypoints: int) -> tu
             headings[0:1].repeat(num_waypoints).float(),
         )
 
-    src = torch.linspace(0, n - 1, steps=num_waypoints, dtype=torch.float32)
-    low = torch.floor(src).long()
-    high = torch.clamp(low + 1, max=n - 1)
-    weight = (src - low.float()).unsqueeze(-1)
-    out_points = points[low] * (1.0 - weight) + points[high] * weight
+    points = points[:, :2].float()
+    segment = points[1:] - points[:-1]
+    segment_length = torch.linalg.norm(segment, dim=-1)
+    total_length = segment_length.sum()
+    if not torch.isfinite(total_length) or total_length <= 1e-6:
+        return (
+            points[0:1].repeat(num_waypoints, 1).float(),
+            headings[0:1].repeat(num_waypoints).float(),
+        )
 
-    heading_low = headings[low]
-    heading_high = headings[high]
-    delta = (heading_high - heading_low + math.pi) % (2 * math.pi) - math.pi
-    out_heading = heading_low + delta * weight.squeeze(-1)
+    target_distance = torch.linspace(0.0, float(total_length), steps=num_waypoints, dtype=torch.float32)
+    cumulative = torch.cat((torch.zeros(1, dtype=torch.float32), torch.cumsum(segment_length, dim=0)))
+    segment_idx = torch.searchsorted(cumulative, target_distance, right=True) - 1
+    segment_idx = segment_idx.clamp(0, segment_length.numel() - 1)
+    weight = ((target_distance - cumulative[segment_idx]) / segment_length[segment_idx].clamp_min(1e-6)).clamp(
+        0.0,
+        1.0,
+    )
+    out_points = points[segment_idx] * (1.0 - weight.unsqueeze(-1)) + points[segment_idx + 1] * weight.unsqueeze(-1)
+    out_segment = out_points[1:] - out_points[:-1]
+    out_heading = torch.atan2(out_segment[:, 1], out_segment[:, 0])
+    out_heading = torch.cat((out_heading, out_heading[-1:]), dim=0)
     return out_points.float(), out_heading.float()
 
 
@@ -196,6 +210,7 @@ class MDGDataset(Dataset):
         self.max_traffic_lights = int(max_traffic_lights)
         self.training = bool(training)
         self.tfrecord_dir = Path(tfrecord_dir) if tfrecord_dir is not None else None
+        self._warned_legacy_map_sampling = False
 
     def __len__(self) -> int:
         return len(self.raw_paths)
@@ -251,6 +266,16 @@ class MDGDataset(Dataset):
         id_pad, _ = _pad_first_dim(agent_id, agent_tensor_size, pad_value=-1)
         agent_valid = agent_present & valid_pad[:, current_index]
 
+        if not self._warned_legacy_map_sampling:
+            sampling = data.get("mdg_map", {}).get("sampling") if isinstance(data.get("mdg_map"), dict) else None
+            if sampling != MDG_MAP_SAMPLING_VERSION:
+                warnings.warn(
+                    "MDG cache was not generated with arclength_v1 map sampling. "
+                    "Regenerate the MDG cache to use arc-length-resampled 16-waypoint map polylines.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._warned_legacy_map_sampling = True
         mdg_map = _extract_map(data, self.map_waypoints)
         map_anchor = mdg_map["position"][:, 0, :2] if mdg_map["position"].numel() else torch.zeros(0, 2)
         selected_map = _select_nearest(

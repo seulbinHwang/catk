@@ -26,7 +26,6 @@ from scipy.interpolate import interp1d
 from tqdm import tqdm
 from waymo_open_dataset.protos import scenario_pb2
 
-from src.smart.utils.geometry import wrap_angle
 from src.smart.utils.preprocess import get_polylines_from_polygon, preprocess_map
 
 # agent_types = {0: "vehicle", 1: "pedestrian", 2: "cyclist"}
@@ -55,6 +54,7 @@ _polygon_light_type = [
     "LANE_STATE_GO",
     "LANE_STATE_CAUTION",
 ]
+MDG_MAP_SAMPLING_VERSION = "arclength_v1"
 
 
 def get_agent_features(
@@ -210,18 +210,30 @@ def _sample_polyline_fixed(points: torch.Tensor, num_waypoints: int = 16):
             points[0:1, :2].repeat(num_waypoints, 1).float(),
             torch.zeros(num_waypoints, dtype=torch.float32),
         )
-    segment = points[1:, :2] - points[:-1, :2]
-    source_heading = torch.atan2(segment[:, 1], segment[:, 0])
-    source_heading = torch.cat([source_heading, source_heading[-1:]], dim=0)
-    source_index = torch.linspace(0, points.shape[0] - 1, steps=num_waypoints)
-    low = torch.floor(source_index).long()
-    high = torch.clamp(low + 1, max=points.shape[0] - 1)
-    weight = (source_index - low.float()).unsqueeze(-1)
-    sampled_pos = points[low, :2] * (1.0 - weight) + points[high, :2] * weight
-    heading_low = source_heading[low]
-    heading_high = source_heading[high]
-    heading_delta = wrap_angle(heading_high - heading_low)
-    sampled_heading = heading_low + heading_delta * weight.squeeze(-1)
+
+    xy = points[:, :2].float()
+    segment = xy[1:] - xy[:-1]
+    segment_length = torch.linalg.norm(segment, dim=-1)
+    total_length = segment_length.sum()
+    if not torch.isfinite(total_length) or total_length <= 1e-6:
+        return (
+            xy[0:1].repeat(num_waypoints, 1).float(),
+            torch.zeros(num_waypoints, dtype=torch.float32),
+        )
+
+    target_distance = torch.linspace(0.0, float(total_length), steps=num_waypoints, dtype=torch.float32)
+    cumulative = torch.cat((torch.zeros(1, dtype=torch.float32), torch.cumsum(segment_length, dim=0)))
+    segment_idx = torch.searchsorted(cumulative, target_distance, right=True) - 1
+    segment_idx = segment_idx.clamp(0, segment_length.numel() - 1)
+    weight = ((target_distance - cumulative[segment_idx]) / segment_length[segment_idx].clamp_min(1e-6)).clamp(
+        0.0,
+        1.0,
+    )
+    sampled_pos = xy[segment_idx] * (1.0 - weight.unsqueeze(-1)) + xy[segment_idx + 1] * weight.unsqueeze(-1)
+
+    sampled_segment = sampled_pos[1:] - sampled_pos[:-1]
+    sampled_heading = torch.atan2(sampled_segment[:, 1], sampled_segment[:, 0])
+    sampled_heading = torch.cat([sampled_heading, sampled_heading[-1:]], dim=0)
     return sampled_pos.float(), sampled_heading.float()
 
 
@@ -258,6 +270,7 @@ def build_mdg_map_features(map_data: Dict[str, Any], num_waypoints: int = 16):
         "type": torch.stack(polyline_type, dim=0),
         "light_type": torch.stack(light_type, dim=0),
         "valid": torch.ones(len(positions), dtype=torch.bool),
+        "sampling": MDG_MAP_SAMPLING_VERSION,
     }
 
 

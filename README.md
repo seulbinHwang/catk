@@ -94,6 +94,13 @@ bash scripts/cache_womd.sh
 `/media/user/F/dataset/womd_v1_3/MDG_cache`를 빠르게 만들 때는 전용 병렬 script를 사용한다.
 이 script는 `training`, `validation`, `testing`을 동시에 처리하고, validation용
 `validation_tfrecords_splitted`도 함께 만든다.
+MDG map cache는 논문 입력 형태인 `Nm=320`, `Nw=16` polyline representation에 맞춰
+raw roadgraph polyline을 16개 waypoint로 줄인다. 현재 cache 생성 코드는 원본 vertex 순번이 아니라
+polyline의 실제 누적 길이를 기준으로 16개 waypoint를 균일하게 뽑는 `arclength_v1` sampling을 사용한다.
+이 방식은 lane/crosswalk/road-edge geometry를 거리 기준으로 보존하기 위한 선택이다.
+기존 index-sampled MDG cache에는 원본 point-level roadgraph가 남아 있지 않으므로, 이 변경을 학습에
+반영하려면 아래 cache 생성 절차로 `MDG_cache`를 다시 만들어야 한다. loader는 `arclength_v1`
+metadata가 없는 legacy cache를 읽으면 warning을 출력한다.
 
 ```bash
 ssh user@10.60.188.78
@@ -116,6 +123,7 @@ tmux new-window -t hsb-rl-train -n mdg-cache \
 | 128 logical CPU 기준 | training 106, validation 12, testing 10 |
 | 최소 여유 공간 검사 | 300GB |
 | 최소 inode 검사 | 1,000,000 |
+| map sampling | `arclength_v1` |
 
 진행 상황은 아래 로그에서 확인한다.
 
