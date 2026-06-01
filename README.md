@@ -262,9 +262,65 @@ python scripts/launch_smart_ntp_h100x4_h100x2.py \
   --task-name smart_ntp_pretrain_h100x4_h100x2_bs13_main
 ```
 
+#### TrajTok H100 4+2 OOM-retry pretrain
+
+`trajtok` 브랜치의 TrajTok recipe를 `hsb-npc-training` H100 4장과 `wo-pvc-2`
+H100 2장, 총 6 rank에서 실행하려면 아래 wrapper를 사용한다.
+
+```bash
+bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
+```
+
+이 wrapper는 `scripts/launch_smart_ntp_h100x4_h100x2.py`를 사용하므로 4+2처럼
+pod별 GPU 수가 다른 경우에도 각 local rank를 명시적으로 배정한다. 실행 전 두 pod의
+`PROJECT_ROOT`를 `origin/trajtok`으로 맞춘 뒤 tmux session을 시작한다. CUDA OOM marker가
+pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `epoch_last.ckpt` 또는
+`last.ckpt`를 찾아 `data.train_batch_size`를 `OOM_STEP`만큼 낮춰 재시작한다.
+
+기본값 기준 실행되는 실험은 아래와 같다.
+
+| 항목 | 값 |
+|---|---|
+| branch | `trajtok` |
+| pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
+| total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_oom_retry_trajtok_legacy_inputs_trainselectfalse_20260601` |
+| experiment | `pre_bc_a100x4x2` |
+| model/tokenizer | TrajTok vocab `trajtok_vocab.pkl`, type-specific agent heads, official global token matching |
+| decoder | `hidden_dim=128`, `num_heads=8`, `head_dim=15`, `num_map_layers=3`, `num_agent_layers=5` |
+| train batch | `INITIAL_BS=18` per rank, effective global batch 108 |
+| OOM retry | `MIN_BS=14`, `OOM_STEP=1`, latest task checkpoint resume |
+| validation/test batch | `VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12` |
+| optimizer schedule | `lr=6e-4`, `lr_warmup_steps=4`, `lr_min_ratio=1e-2` from `pre_bc_a100x4x2` |
+| precision / grad accumulation | `bf16-mixed`, `accumulate_grad_batches=1` |
+| train augmentation | `random_scene_scale_config: [0.8, 1.2]`, `random_time_shift_config.MAX_TIME_SHIFT=5` |
+| agent selection | `data.train_use_eval_agent_selection=false` |
+| train sampler | `data.train_memory_balanced_batching=true` |
+| smoothing | `spatial_aware_smoothing=true`, `spatial_aware_smoothing_mode=thinklab` |
+| validation | open-loop + closed-loop, `scorer_scene_num=1680`, top-48 rollout validation, every 16 epochs |
+| distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=true` |
+
+smoke test나 batch 조정은 환경 변수로만 바꾼다.
+
+```bash
+LIMIT_TRAIN_BATCHES=1 LIMIT_VAL_BATCHES=1 MAX_EPOCHS=1 \
+TASK_NAME=smart_ntp_pretrain_h100x4_h100x2_trajtok_smoke \
+SESSION=catk-smart-ntp-h100x4-h100x2-trajtok-smoke \
+bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
+```
+
+실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok
+
+STOP=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
+```
+
 기본 experiment는 `configs/experiment/pre_bc_a100x4x2.yaml`이다. 이 config는
 `pre_bc`를 상속하므로 SMART backbone, next-token prediction loss,
-deterministic nearest-token tokenization, agent selection, `num_freq_bands: 88`
+deterministic nearest-token tokenization, agent selection, `num_freq_bands: 64`
 같은 모델/알고리즘 설정은 유지한다. 단, 학습 중 closed-loop validation은 WOSAC
 submission과 같은 후보 폭을 쓰도록 `validation_rollout_sampling.num_k: 48`을 명시한다. 그 외에는
 `semi_control_stable`의 x4x2 control-space pretrain recipe와 학습 실행 조건을 맞추기
