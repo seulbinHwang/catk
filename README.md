@@ -7,7 +7,7 @@
 ## 구현 범위
 
 - 입력: WOMD agent history 1초(11 step), map polyline, traffic light.
-- 출력: 최대 128개 agent의 8초 미래 궤적 32개.
+- 출력: WOSAC eval/submission에서 요구되는 current-valid sim agents 전체의 8초 미래 궤적 32개.
 - 학습 target: future trajectory를 acceleration / yaw-rate action으로 바꾼 continuous action tensor.
 - denoising: agent-time별 Gaussian mask, `K=5`, alpha schedule `0.99 -> 0.01`.
 - inference: full Gaussian noise에서 시작하며, validation/test/submission 기본값은 5-step denoising이다.
