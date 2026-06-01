@@ -42,11 +42,11 @@ model_config:
     hidden_dim: 128
     num_freq_bands: 64
     num_heads: 8
-    head_dim: 11
+    head_dim: 15
     dropout: 0.1
     hist_drop_prob: 0.1
     num_map_layers: 3
-    num_agent_layers: 6
+    num_agent_layers: 5
     pl2pl_radius: 10
     pl2a_radius: 30
     a2a_radius: 60
