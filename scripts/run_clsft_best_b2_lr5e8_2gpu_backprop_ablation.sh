@@ -32,8 +32,10 @@ export CONDA_SH="${CONDA_SH:-/mnt/nuplan/miniforge/etc/profile.d/conda.sh}"
 export CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
 export CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
 
-export WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
-export WANDB_PROJECT="${WANDB_PROJECT:-clsft-catk}"
+# Some Kubernetes pods export stale W&B defaults in the environment. Force the
+# CLSFT destination unless the caller uses the explicit CLSFT_* escape hatch.
+export WANDB_ENTITY="${CLSFT_WANDB_ENTITY:-se99an}"
+export WANDB_PROJECT="${CLSFT_WANDB_PROJECT:-clsft-catk}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export CLEAR_WANDB_API_KEY="${CLEAR_WANDB_API_KEY:-true}"
 export WANDB_TAGS="${WANDB_TAGS:-[clsft,best_b2,2gpu,backprop_last_k_${BACKPROP_LAST_K}]}"
