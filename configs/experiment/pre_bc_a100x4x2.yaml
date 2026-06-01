@@ -62,6 +62,10 @@ data:
   test_batch_size: 12
   num_workers: 4
   train_use_eval_agent_selection: true
+  random_scene_scale_config:
+    SCALE_RANGE: [0.8, 1.2]
+  random_time_shift_config:
+    MAX_TIME_SHIFT: 5
   train_memory_balanced_batching: true
   train_memory_balance_metadata_num_workers: 8
   train_memory_balance_weight_key: agent_quadratic

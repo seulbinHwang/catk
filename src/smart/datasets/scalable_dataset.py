@@ -17,6 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+import numpy as np
 from torch_geometric.data import Dataset
 
 from src.utils import RankedLogger
@@ -75,6 +76,8 @@ class MultiDataset(Dataset):
         transform: Callable,
         tfrecord_dir: Optional[str] = None,
         road_num_rollouts_per_scenario: int = 1,
+        random_scene_scale_config: Optional[dict] = None,
+        random_time_shift_config: Optional[dict] = None,
     ) -> None:
         raw_dir = Path(raw_dir)
         self._raw_paths = [
@@ -94,6 +97,8 @@ class MultiDataset(Dataset):
             self._num_samples = len(self._raw_paths)
 
         self._tfrecord_dir = Path(tfrecord_dir) if tfrecord_dir is not None else None
+        self.random_scene_scale_config = random_scene_scale_config
+        self.random_time_shift_config = random_time_shift_config
 
         log.info("Length of {} dataset is ".format(raw_dir) + str(self._num_samples))
         super(MultiDataset, self).__init__(
@@ -131,4 +136,70 @@ class MultiDataset(Dataset):
             data["tfrecord_path"] = (
                 self._tfrecord_dir / (data["scenario_id"] + ".tfrecords")
             ).as_posix()
+
+        if self.random_scene_scale_config is not None:
+            data = self.random_scene_scale(self.random_scene_scale_config, data)
+        if self.random_time_shift_config is not None:
+            data = self.random_time_shift(self.random_time_shift_config, data)
+        return data
+
+    @staticmethod
+    def random_scene_scale(config: dict, data):
+        """공식 TrajTok train recipe와 같은 scene scale augmentation이다."""
+        scale_range = config["SCALE_RANGE"]
+        scale = np.random.uniform(scale_range[0], scale_range[1])
+        data["map_save"]["traj_pos"] *= scale
+        data["agent"]["position"][:, :, 0:2] *= scale
+        data["agent"]["velocity"][:, :, 0:2] *= scale
+        return data
+
+    @staticmethod
+    def random_time_shift(config: dict, data):
+        """예측 대상 agent가 유효한 current 주변 시점으로 train sample을 이동한다."""
+        max_time_shift = int(config["MAX_TIME_SHIFT"])
+        if max_time_shift <= 0:
+            return data
+
+        track_to_predict = data["agent"]["role"][:, 2]
+        if not bool(track_to_predict.any()):
+            return data
+
+        valid_time_mask = data["agent"]["valid_mask"][track_to_predict][
+            :, 10 - max_time_shift : 10 + max_time_shift
+        ]
+        valid_time_offset = valid_time_mask.all(dim=0).nonzero().reshape(-1)
+        if valid_time_offset.numel() == 0:
+            return data
+
+        choice = np.random.choice(valid_time_offset.detach().cpu().numpy())
+        time_shift = int(choice) - max_time_shift
+        if time_shift > 0:
+            data["agent"]["position"][:, :-time_shift, :] = data["agent"]["position"][
+                :, time_shift:, :
+            ].clone()
+            data["agent"]["velocity"][:, :-time_shift, :] = data["agent"]["velocity"][
+                :, time_shift:, :
+            ].clone()
+            data["agent"]["heading"][:, :-time_shift] = data["agent"]["heading"][
+                :, time_shift:
+            ].clone()
+            data["agent"]["position"][:, -time_shift:, :] = 0
+            data["agent"]["velocity"][:, -time_shift:, :] = 0
+            data["agent"]["heading"][:, -time_shift:] = 0
+            data["agent"]["valid_mask"][:, -time_shift:] = False
+        elif time_shift < 0:
+            time_shift = abs(time_shift)
+            data["agent"]["position"][:, time_shift:, :] = data["agent"]["position"][
+                :, :-time_shift, :
+            ].clone()
+            data["agent"]["velocity"][:, time_shift:, :] = data["agent"]["velocity"][
+                :, :-time_shift, :
+            ].clone()
+            data["agent"]["heading"][:, time_shift:] = data["agent"]["heading"][
+                :, :-time_shift
+            ].clone()
+            data["agent"]["position"][:, :time_shift, :] = 0
+            data["agent"]["velocity"][:, :time_shift, :] = 0
+            data["agent"]["heading"][:, :time_shift] = 0
+            data["agent"]["valid_mask"][:, :time_shift] = False
         return data

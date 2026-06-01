@@ -57,6 +57,8 @@ class MultiDataModule(LightningDataModule):
         train_memory_balance_weight_key: str = "agent_quadratic",
         train_memory_balance_bucket_size_multiplier: int = 50,
         train_memory_balance_seed: int = 0,
+        random_scene_scale_config: Optional[dict] = None,
+        random_time_shift_config: Optional[dict] = None,
     ) -> None:
         super(MultiDataModule, self).__init__()
         self.train_batch_size = train_batch_size
@@ -82,6 +84,8 @@ class MultiDataModule(LightningDataModule):
             train_memory_balance_bucket_size_multiplier
         )
         self.train_memory_balance_seed = int(train_memory_balance_seed)
+        self.random_scene_scale_config = random_scene_scale_config
+        self.random_time_shift_config = random_time_shift_config
         self._train_dataset_raw_dir: Optional[str] = None
         self._train_dataset_road_group_size: Optional[int] = None
 
@@ -117,6 +121,8 @@ class MultiDataModule(LightningDataModule):
             self.train_raw_dir,
             self.train_transform,
             road_num_rollouts_per_scenario=self.road_num_rollouts_per_scenario,
+            random_scene_scale_config=self.random_scene_scale_config,
+            random_time_shift_config=self.random_time_shift_config,
         )
         self._train_dataset_raw_dir = self.train_raw_dir
         self._train_dataset_road_group_size = self.road_num_rollouts_per_scenario

@@ -33,3 +33,7 @@ data:
   test_batch_size: 10
   num_workers: 10
   train_use_eval_agent_selection: true
+  random_scene_scale_config:
+    SCALE_RANGE: [0.8, 1.2]
+  random_time_shift_config:
+    MAX_TIME_SHIFT: 5
