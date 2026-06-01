@@ -150,7 +150,7 @@ validation split TFRecord까지 포함한 전체 MDG cache 예상 크기는 약 
 여유가 있으면 충분하지만, 장기 실행 전에는 script의 storage check 결과를 확인한다.
 
 생성된 MDG cache를 Nubes에 업로드하려면 아래 script를 사용한다. 기본 목적지는
-`labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache`이고, 기존 실험에서 가장 빨랐던
+`labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601`이고, 기존 실험에서 가장 빨랐던
 `-j 96`을 기본값으로 둔다.
 
 ```bash
@@ -167,7 +167,7 @@ tmux new-window -t hsb-rl-train -n mdg-upload \
 | 항목 | 기본값 |
 | --- | --- |
 | local cache | `/media/user/F/dataset/womd_v1_3/MDG_cache` |
-| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache` |
+| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601` |
 | nubes jobs | 96 |
 | Nubes gateway | `c.nubes.sto.navercorp.com:8000` |
 | expected files | 620,109 |
@@ -176,6 +176,13 @@ tmux new-window -t hsb-rl-train -n mdg-upload \
 620,109개인지 확인한다. 이미 존재하는 파일은 `nubescli dir-upload -s` 옵션으로 skip한다.
 cache root 아래 `logs/` 같은 부가 디렉터리가 있어도 Nubes에는 `training`, `validation`,
 `testing`, `validation_tfrecords_splitted` 4개 data split만 업로드한다.
+다른 remote snapshot에 올려야 하면 두 번째 인자로 remote path를 명시한다.
+
+```bash
+bash scripts/upload_mdg_cache_to_nubes.sh \
+  /media/user/F/dataset/womd_v1_3/MDG_cache \
+  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601
+```
 
 Nubes에 업로드된 MDG cache를 `testas` 파드의 `/workspace/womd_v1_3/MDG_cache`로
 다운로드하려면 `ssh user@10.60.188.78`에서 아래 script를 실행한다.
@@ -193,7 +200,7 @@ bash scripts/download_mdg_cache_to_testas.sh
 | --- | --- |
 | pod | `testas` |
 | local cache | `/workspace/womd_v1_3/MDG_cache` |
-| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache` |
+| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601` |
 | nubes jobs | 96 |
 | expected files | 620,109 |
 

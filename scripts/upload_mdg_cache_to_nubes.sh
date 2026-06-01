@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 LOCAL_DIR="${1:-${LOCAL_DIR:-/media/user/F/dataset/womd_v1_3/MDG_cache}}"
-REMOTE_DIR="${2:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache}}"
+REMOTE_DIR="${2:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601}}"
 NUBES_JOBS="${NUBES_JOBS:-96}"
 NUBES_RETRY="${NUBES_RETRY:-3}"
 NUBES_GATEWAY_ADDRESS="${NUBES_GATEWAY_ADDRESS:-c.nubes.sto.navercorp.com:8000}"
@@ -28,7 +28,7 @@ Usage:
 
 Defaults:
   local_dir  = /media/user/F/dataset/womd_v1_3/MDG_cache
-  remote_dir = labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache
+  remote_dir = labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601
 
 Environment:
   NUBES_JOBS=96
@@ -111,7 +111,8 @@ upload_split() {
   nubescli --retry "$NUBES_RETRY" dir-upload "$REMOTE_DIR/$split" \
     "$LOCAL_DIR/$split" \
     -s \
-    -j "$NUBES_JOBS"
+    -j "$NUBES_JOBS" \
+    --no-progress
   echo "[MDG_CACHE_UPLOAD] upload_split=$split end=$(date '+%F %T')"
 }
 

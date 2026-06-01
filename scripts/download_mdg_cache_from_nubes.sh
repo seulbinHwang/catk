@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 # Download the MDG WOMD cache from Nubes into a training pod.
 
-REMOTE_DIR="${1:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache}}"
+REMOTE_DIR="${1:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601}}"
 LOCAL_DIR="${2:-${LOCAL_DIR:-/workspace/womd_v1_3/MDG_cache}}"
 NUBES_JOBS="${NUBES_JOBS:-96}"
 NUBES_RETRY="${NUBES_RETRY:-3}"
@@ -30,7 +30,7 @@ Usage:
   bash scripts/download_mdg_cache_from_nubes.sh [remote_dir] [local_dir]
 
 Defaults:
-  remote_dir = labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache
+  remote_dir = labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601
   local_dir  = /workspace/womd_v1_3/MDG_cache
 
 Environment:
