@@ -29,7 +29,7 @@ from src.unimm.anchors import (
     gather_anchors_by_type,
     load_anchor_file,
 )
-from src.unimm.losses import unimm_classification_loss, unimm_nll_loss
+from src.unimm.losses import unimm_classification_loss, unimm_nll_loss, unimm_per_step_nll_loss
 from src.unimm.modules import UniMMAnchorBasedNetwork
 from src.unimm.processor import UniMMProcessor
 
@@ -294,12 +294,17 @@ class UniMMAnchorBased4s(LightningModule):
             match_steps=self.spec.num_match_steps,
         )
         reg_loss = unimm_nll_loss(pred, batch.target_local, target_valid)
+        reg_loss_per_step = unimm_per_step_nll_loss(pred, batch.target_local, target_valid)
         total_loss = float(self.loss_weights.cls) * cls_loss + float(self.loss_weights.reg) * reg_loss
         z_star_valid = target_valid[..., : self.spec.num_match_steps].any(dim=-1)
+        reg_cls_ratio = reg_loss.detach() / cls_loss.detach().abs().clamp_min(1e-6)
         logs = {
             "loss": total_loss,
             "loss_cls": cls_loss.detach(),
             "loss_reg": reg_loss.detach(),
+            "loss_reg_traj_sum": reg_loss.detach(),
+            "loss_reg_per_step": reg_loss_per_step.detach(),
+            "reg_cls_ratio": reg_cls_ratio,
             "z_star_error": batch.z_star_error[z_star_valid].mean().detach()
             if bool(z_star_valid.any())
             else batch.z_star_error.sum().detach() * 0.0,
@@ -311,6 +316,9 @@ class UniMMAnchorBased4s(LightningModule):
         self.log("train/loss", logs["loss"], on_step=True, batch_size=1)
         self.log("train/loss_cls", logs["loss_cls"], on_step=True, batch_size=1)
         self.log("train/loss_reg", logs["loss_reg"], on_step=True, batch_size=1)
+        self.log("train/loss_reg_traj_sum", logs["loss_reg_traj_sum"], on_step=True, batch_size=1)
+        self.log("train/loss_reg_per_step", logs["loss_reg_per_step"], on_step=True, batch_size=1)
+        self.log("train/reg_cls_ratio", logs["reg_cls_ratio"], on_step=True, batch_size=1)
         self.log("train/z_star_error", logs["z_star_error"], on_step=True, batch_size=1)
         return loss
 
@@ -328,6 +336,27 @@ class UniMMAnchorBased4s(LightningModule):
             self.log(
                 "val_open/loss_reg",
                 logs["loss_reg"],
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                "val_open/loss_reg_traj_sum",
+                logs["loss_reg_traj_sum"],
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                "val_open/loss_reg_per_step",
+                logs["loss_reg_per_step"],
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                "val_open/reg_cls_ratio",
+                logs["reg_cls_ratio"],
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=1,

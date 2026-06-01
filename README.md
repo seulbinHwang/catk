@@ -33,6 +33,7 @@
 | 모델 크기 | K=2048 기준 약 7.1M parameters |
 
 논문에서 명시한 핵심은 `2048 anchors + continuous regression + Tpred=4s + closed-loop samples + approximate posterior policy + Tpost=Tz*=0.5s`다. 현재 구현도 이 조합만 대상으로 한다.
+Regression objective는 trajectory likelihood에 맞춰 valid timestep NLL을 agent/context row 내부에서 합산한 뒤 valid row 평균으로 줄인다. 기존 timestep 평균 스케일은 모니터링용 `loss_reg_per_step` 로그로만 남긴다.
 
 ## 코드 구조
 
@@ -380,8 +381,10 @@ python scripts/launch_unimm_h100x3x2.py \
 | distance `d(.,.)` | `mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)` |
 | posterior threshold | category별 nearest-anchor 0.5초 error 95% quantile |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
+| regression loss reduction | valid timestep NLL을 trajectory 내부에서 sum, valid agent/context row 사이에서 mean |
 
 이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 192에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
+Loss 로그에서 `loss_reg`와 `loss_reg_traj_sum`은 학습에 쓰는 trajectory-sum NLL이고, `loss_reg_per_step`은 이전 timestep 평균 스케일을 확인하기 위한 보조 지표다. 이 objective scale 변경 후에는 기존 checkpoint resume보다 scratch pretrain을 사용한다.
 
 ## 빠른 검증
 
