@@ -19,6 +19,7 @@ from torch.nn.functional import cross_entropy
 from torchmetrics.metric import Metric
 
 from .utils import (
+    SPATIAL_SMOOTHING_MODE_THINKLAB,
     get_euclidean_targets,
     get_prob_targets,
     get_prob_targets_from_index,
@@ -39,6 +40,7 @@ class CrossEntropy(Metric):
         label_smoothing: float,
         rollout_as_gt: bool,
         spatial_aware_smoothing: bool = False,
+        spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_THINKLAB,
     ) -> None:
         super().__init__()
         self.use_gt_raw = use_gt_raw
@@ -46,6 +48,7 @@ class CrossEntropy(Metric):
         self.label_smoothing = label_smoothing
         self.rollout_as_gt = rollout_as_gt
         self.spatial_aware_smoothing = spatial_aware_smoothing
+        self.spatial_aware_smoothing_mode = spatial_aware_smoothing_mode
         self.add_state("loss_sum", default=tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=tensor(0.0), dist_reduce_fx="sum")
 
@@ -132,6 +135,7 @@ class CrossEntropy(Metric):
                         token_traj=token_traj[agent_type],
                         label_smoothing=self.label_smoothing,
                         spatial_aware_smoothing=self.spatial_aware_smoothing,
+                        spatial_aware_smoothing_mode=self.spatial_aware_smoothing_mode,
                     )
                 else:
                     prob_target = get_prob_targets(
@@ -140,6 +144,7 @@ class CrossEntropy(Metric):
                         token_traj=token_traj[agent_type],
                         label_smoothing=self.label_smoothing,
                         spatial_aware_smoothing=self.spatial_aware_smoothing,
+                        spatial_aware_smoothing_mode=self.spatial_aware_smoothing_mode,
                     )
                 loss_by_type[agent_type] = cross_entropy(
                     next_token_logits[agent_type].transpose(1, 2),
@@ -155,6 +160,7 @@ class CrossEntropy(Metric):
                     token_traj=token_traj,
                     label_smoothing=self.label_smoothing,
                     spatial_aware_smoothing=self.spatial_aware_smoothing,
+                    spatial_aware_smoothing_mode=self.spatial_aware_smoothing_mode,
                 )
             else:
                 prob_target = get_prob_targets(
@@ -163,6 +169,7 @@ class CrossEntropy(Metric):
                     token_traj=token_traj,
                     label_smoothing=self.label_smoothing,
                     spatial_aware_smoothing=self.spatial_aware_smoothing,
+                    spatial_aware_smoothing_mode=self.spatial_aware_smoothing_mode,
                 )
             loss = cross_entropy(
                 next_token_logits.transpose(1, 2),

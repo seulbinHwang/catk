@@ -19,6 +19,13 @@ from torch.nn.functional import one_hot
 
 from src.smart.utils import cal_polygon_contour, transform_to_local, wrap_angle
 
+SPATIAL_SMOOTHING_MODE_THINKLAB = "thinklab"
+SPATIAL_SMOOTHING_MODE_NORMALIZED = "normalized"
+SPATIAL_SMOOTHING_MODES = {
+    SPATIAL_SMOOTHING_MODE_THINKLAB,
+    SPATIAL_SMOOTHING_MODE_NORMALIZED,
+}
+
 
 @torch.no_grad()
 def get_prob_targets_from_index(
@@ -26,7 +33,8 @@ def get_prob_targets_from_index(
     token_traj: Tensor,  # [n_agent, n_token, 4, 2]
     label_smoothing: float = 0.0,
     spatial_aware_smoothing: bool = False,
-) -> Tensor:  # [n_agent, n_step, n_token] prob, last dim sum up to 1
+    spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_THINKLAB,
+) -> Tensor:  # [n_agent, n_step, n_token] prob
     closest_token_mask = one_hot(gt_idx, num_classes=token_traj.shape[1]).to(bool)
     prob_target = torch.zeros(
         gt_idx.shape[0],
@@ -43,6 +51,11 @@ def get_prob_targets_from_index(
     if not spatial_aware_smoothing:
         prob_target[closest_token_mask] = 1.0
         return prob_target
+    if spatial_aware_smoothing_mode not in SPATIAL_SMOOTHING_MODES:
+        raise ValueError(
+            "spatial_aware_smoothing_mode must be one of "
+            f"{sorted(SPATIAL_SMOOTHING_MODES)}, got {spatial_aware_smoothing_mode!r}."
+        )
 
     gt_token_traj = torch.gather(
         token_traj,
@@ -57,7 +70,10 @@ def get_prob_targets_from_index(
     inv_sq_dist = 1.0 / ((1.0e-4 + dists) ** 2)
     inv_sq_dist = inv_sq_dist.masked_fill(closest_token_mask, 0.0)
     normalizer = inv_sq_dist.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
-    prob_target += inv_sq_dist / normalizer * label_smoothing
+    neighbor_target = inv_sq_dist / normalizer
+    if spatial_aware_smoothing_mode == SPATIAL_SMOOTHING_MODE_THINKLAB:
+        neighbor_target = neighbor_target / normalizer
+    prob_target += neighbor_target * label_smoothing
     return prob_target
 
 
@@ -68,7 +84,8 @@ def get_prob_targets(
     token_traj: Tensor,  # [n_agent, n_token, 4, 2]
     label_smoothing: float = 0.0,
     spatial_aware_smoothing: bool = False,
-) -> Tensor:  # [n_agent, n_step, n_token] prob, last dim sum up to 1
+    spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_THINKLAB,
+) -> Tensor:  # [n_agent, n_step, n_token] prob
     # ! tokenize to index, then compute prob
     contour = cal_polygon_contour(
         target[..., :2],  # [n_agent, n_step, 2]
@@ -88,6 +105,7 @@ def get_prob_targets(
         token_traj=token_traj,
         label_smoothing=label_smoothing,
         spatial_aware_smoothing=spatial_aware_smoothing,
+        spatial_aware_smoothing_mode=spatial_aware_smoothing_mode,
     )
 
 
