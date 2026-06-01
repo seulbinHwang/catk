@@ -79,7 +79,9 @@ WANDB_MODE=offline python -m src.run experiment=mdg_pretrain logger=[] callbacks
 
 ## 데이터 생성
 
-WOMD 원본 TFRecord를 받은 뒤 cache를 만든다. 기존 SMART cache도 fallback으로 읽을 수 있지만, 새로 cache를 만들면 `mdg_map`, `mdg_traffic_signal` 필드가 추가되어 MDG 입력과 더 잘 맞는다. `mdg_traffic_signal`은 WOMD `dynamic_map_states`의 현재 phase와 stop point를 저장한다.
+WOMD 원본 TFRecord를 받은 뒤 MDG 전용 cache를 만든다. MDG 학습/평가/제출 코드는
+`mdg_map`, `mdg_traffic_signal` 필드가 있고 `mdg_map.sampling=arclength_v1`인 cache만 읽는다.
+`mdg_traffic_signal`은 WOMD `dynamic_map_states`의 현재 phase와 stop point를 저장한다.
 
 기본 단일 split cache script는 다음처럼 실행한다.
 
@@ -98,9 +100,8 @@ MDG map cache는 논문 입력 형태인 `Nm=320`, `Nw=16` polyline representati
 raw roadgraph polyline을 16개 waypoint로 줄인다. 현재 cache 생성 코드는 원본 vertex 순번이 아니라
 polyline의 실제 누적 길이를 기준으로 16개 waypoint를 균일하게 뽑는 `arclength_v1` sampling을 사용한다.
 이 방식은 lane/crosswalk/road-edge geometry를 거리 기준으로 보존하기 위한 선택이다.
-기존 index-sampled MDG cache에는 원본 point-level roadgraph가 남아 있지 않으므로, 이 변경을 학습에
-반영하려면 아래 cache 생성 절차로 `MDG_cache`를 다시 만들어야 한다. loader는 `arclength_v1`
-metadata가 없는 legacy cache를 읽으면 warning을 출력한다.
+`arclength_v1` metadata가 없는 cache는 지원하지 않으며, 아래 cache 생성 절차로 새 `MDG_cache`를
+만들어야 한다.
 
 ```bash
 ssh user@10.60.188.78
@@ -144,8 +145,8 @@ tail -f /media/user/F/dataset/womd_v1_3/MDG_cache/logs/testing.log
 | `testing` | 44,920 |
 
 `/media/user/F` 저장 공간은 script 시작 전에 `df -h`와 `df -ih`로 검사한다. 실제 계측에서는
-기존 SMART cache 대비 MDG pickle 크기 비율이 약 1.38배였고, validation split TFRecord까지
-포함한 전체 cache 예상 크기는 약 180GB 전후였다. 그래서 `/media/user/F`에 수백 GB 이상
+validation split TFRecord까지 포함한 전체 MDG cache 예상 크기는 약 180GB 전후였다.
+그래서 `/media/user/F`에 수백 GB 이상
 여유가 있으면 충분하지만, 장기 실행 전에는 script의 storage check 결과를 확인한다.
 
 생성된 MDG cache를 Nubes에 업로드하려면 아래 script를 사용한다. 기본 목적지는
@@ -488,4 +489,3 @@ CATK_TF_INTRA_OP_THREADS=1 CATK_TF_INTER_OP_THREADS=1 python src/run.py action=v
 - validation/test/submission은 기본적으로 full noise에서 시작해 `closed_loop_denoising_steps=5`로 denoising한다. 기본 schedule은 `[4, 3, 2, 1, 0]`이며, 같은 replanning segment 안에서는 scene encoder를 한 번만 실행하고 auxiliary predictor는 호출하지 않는다.
 - WOSAC 제출은 반드시 32 rollout이어야 한다. submission mode에서 다른 값이면 모델 초기화 시 실패한다.
 - evaluation/test DDP는 padding 없는 exact sampler를 사용한다. 제출 archive에서 scenario 중복이 생기지 않도록 하기 위함이다.
-- 기존 SMART cache는 fallback으로 읽히지만, 논문 설정에 더 가까운 입력을 쓰려면 MDG field가 포함된 cache를 새로 만드는 편이 낫다.

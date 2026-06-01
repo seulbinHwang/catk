@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pickle
 import pytest
 import torch
 import torch.nn.functional as F
@@ -13,7 +14,7 @@ from src.data_preprocess import (
     build_mdg_traffic_signal_features,
     process_dynamic_map,
 )
-from src.mdg.data import collate_mdg_samples
+from src.mdg.data import MDGDataset, collate_mdg_samples
 from src.mdg.geometry import relation_features, rotate_points, wrap_angle
 from src.mdg.model import MDG
 from src.mdg.modules import KinematicDynamics, _fourier_relation_features
@@ -677,6 +678,55 @@ def test_mdg_map_cache_uses_arc_length_waypoint_sampling() -> None:
     )
     torch.testing.assert_close(mdg_map["position"][0, :, 1], torch.zeros(5))
     torch.testing.assert_close(mdg_map["heading"][0], torch.zeros(5))
+
+
+def _write_minimal_mdg_cache(tmp_path, mdg_map: dict) -> None:
+    num_agents = 1
+    total_steps = 91
+    data = {
+        "scenario_id": "minimal_mdg_cache",
+        "agent": {
+            "position": torch.zeros(num_agents, total_steps, 3),
+            "heading": torch.zeros(num_agents, total_steps),
+            "velocity": torch.zeros(num_agents, total_steps, 2),
+            "valid_mask": torch.ones(num_agents, total_steps, dtype=torch.bool),
+            "shape": torch.ones(num_agents, 3),
+            "type": torch.zeros(num_agents, dtype=torch.long),
+            "role": torch.tensor([[True, False, False]]),
+            "id": torch.tensor([1], dtype=torch.long),
+        },
+        "mdg_map": mdg_map,
+        "mdg_traffic_signal": {
+            "position": torch.zeros(0, 2),
+            "heading": torch.zeros(0),
+            "state": torch.zeros(0, dtype=torch.long),
+            "valid": torch.zeros(0, dtype=torch.bool),
+        },
+    }
+    with (tmp_path / "minimal.pkl").open("wb") as handle:
+        pickle.dump(data, handle)
+
+
+def test_mdg_dataset_requires_arclength_map_cache(tmp_path) -> None:
+    mdg_map = {
+        "position": torch.zeros(1, 16, 2),
+        "heading": torch.zeros(1, 16),
+        "type": torch.zeros(1, dtype=torch.long),
+        "light_type": torch.zeros(1, dtype=torch.long),
+        "valid": torch.ones(1, dtype=torch.bool),
+    }
+    _write_minimal_mdg_cache(tmp_path, mdg_map)
+    dataset = MDGDataset(
+        raw_dir=str(tmp_path),
+        max_agents=1,
+        max_map_polylines=1,
+        map_waypoints=16,
+        max_traffic_lights=1,
+        training=False,
+    )
+
+    with pytest.raises(ValueError, match="arclength_v1"):
+        _ = dataset[0]
 
 
 def test_mdg_active_submission_requires_waymo_rollout_count() -> None:

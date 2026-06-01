@@ -34,55 +34,6 @@ def _as_tensor(value: Any, dtype: Optional[torch.dtype] = None) -> Tensor:
 MDG_MAP_SAMPLING_VERSION = "arclength_v1"
 
 
-def _interp_polyline(points: Tensor, headings: Tensor, num_waypoints: int) -> tuple[Tensor, Tensor]:
-    """Resample a polyline to a fixed number of waypoints by arc length."""
-    n = int(points.shape[0])
-    if n <= 0:
-        return (
-            torch.zeros(num_waypoints, 2, dtype=torch.float32),
-            torch.zeros(num_waypoints, dtype=torch.float32),
-        )
-    if n == 1:
-        return (
-            points[0:1].repeat(num_waypoints, 1).float(),
-            headings[0:1].repeat(num_waypoints).float(),
-        )
-
-    points = points[:, :2].float()
-    segment = points[1:] - points[:-1]
-    segment_length = torch.linalg.norm(segment, dim=-1)
-    total_length = segment_length.sum()
-    if not torch.isfinite(total_length) or total_length <= 1e-6:
-        return (
-            points[0:1].repeat(num_waypoints, 1).float(),
-            headings[0:1].repeat(num_waypoints).float(),
-        )
-
-    target_distance = torch.linspace(0.0, float(total_length), steps=num_waypoints, dtype=torch.float32)
-    cumulative = torch.cat((torch.zeros(1, dtype=torch.float32), torch.cumsum(segment_length, dim=0)))
-    segment_idx = torch.searchsorted(cumulative, target_distance, right=True) - 1
-    segment_idx = segment_idx.clamp(0, segment_length.numel() - 1)
-    weight = ((target_distance - cumulative[segment_idx]) / segment_length[segment_idx].clamp_min(1e-6)).clamp(
-        0.0,
-        1.0,
-    )
-    out_points = points[segment_idx] * (1.0 - weight.unsqueeze(-1)) + points[segment_idx + 1] * weight.unsqueeze(-1)
-    out_segment = out_points[1:] - out_points[:-1]
-    out_heading = torch.atan2(out_segment[:, 1], out_segment[:, 0])
-    out_heading = torch.cat((out_heading, out_heading[-1:]), dim=0)
-    return out_points.float(), out_heading.float()
-
-
-def _sample_polyline_from_points(points: Tensor, num_waypoints: int) -> tuple[Tensor, Tensor]:
-    if points.shape[0] <= 1:
-        heading = torch.zeros(points.shape[0], dtype=points.dtype, device=points.device)
-    else:
-        delta = points[1:] - points[:-1]
-        heading = torch.atan2(delta[:, 1], delta[:, 0])
-        heading = torch.cat((heading, heading[-1:]), dim=0)
-    return _interp_polyline(points[:, :2], heading, num_waypoints)
-
-
 def _select_nearest(
     positions: Tensor,
     valid: Tensor,
@@ -119,70 +70,45 @@ def _pad_first_dim(value: Tensor, size: int, pad_value: float | int | bool = 0) 
     return out, valid
 
 
-def _fallback_map_from_smart_cache(data: Dict[str, Any], num_waypoints: int) -> Dict[str, Tensor]:
-    traj_pos = _as_tensor(data["map_save"]["traj_pos"], torch.float32)
-    traj_theta = _as_tensor(data["map_save"]["traj_theta"], torch.float32)
-    poly_pos = []
-    poly_head = []
-    for idx in range(int(traj_pos.shape[0])):
-        pos_i, head_i = _interp_polyline(
-            traj_pos[idx, :, :2].float(),
-            traj_theta[idx : idx + 1].repeat(traj_pos.shape[1]).float(),
-            num_waypoints,
+def _extract_map(data: Dict[str, Any]) -> Dict[str, Tensor]:
+    if "mdg_map" not in data:
+        raise ValueError("MDG cache is missing the required 'mdg_map' field. Regenerate the cache with the MDG branch.")
+    mdg_map = data["mdg_map"]
+    sampling = mdg_map.get("sampling") if isinstance(mdg_map, dict) else None
+    if sampling != MDG_MAP_SAMPLING_VERSION:
+        raise ValueError(
+            "MDG cache must use arclength_v1 map sampling. "
+            f"Found sampling={sampling!r}; regenerate MDG_cache from raw WOMD TFRecords."
         )
-        poly_pos.append(pos_i)
-        poly_head.append(head_i)
-
+    required = ("position", "heading", "type", "light_type", "valid")
+    missing = [key for key in required if key not in mdg_map]
+    if missing:
+        raise ValueError(f"MDG cache mdg_map is missing required keys: {missing}")
     return {
-        "position": torch.stack(poly_pos, dim=0) if poly_pos else torch.zeros(0, num_waypoints, 2),
-        "heading": torch.stack(poly_head, dim=0) if poly_head else torch.zeros(0, num_waypoints),
-        "type": _as_tensor(data["pt_token"]["pl_type"], torch.long),
-        "light_type": _as_tensor(data["pt_token"]["light_type"], torch.long),
-        "valid": torch.ones(int(traj_pos.shape[0]), dtype=torch.bool),
+        "position": _as_tensor(mdg_map["position"], torch.float32),
+        "heading": _as_tensor(mdg_map["heading"], torch.float32),
+        "type": _as_tensor(mdg_map["type"], torch.long),
+        "light_type": _as_tensor(mdg_map["light_type"], torch.long),
+        "valid": _as_tensor(mdg_map["valid"], torch.bool),
     }
 
 
-def _extract_map(data: Dict[str, Any], num_waypoints: int) -> Dict[str, Tensor]:
-    if "mdg_map" in data:
-        mdg_map = data["mdg_map"]
-        return {
-            "position": _as_tensor(mdg_map["position"], torch.float32),
-            "heading": _as_tensor(mdg_map["heading"], torch.float32),
-            "type": _as_tensor(mdg_map["type"], torch.long),
-            "light_type": _as_tensor(mdg_map.get("light_type", torch.zeros(0)), torch.long),
-            "valid": _as_tensor(mdg_map.get("valid", torch.ones(len(mdg_map["position"]))), torch.bool),
-        }
-    return _fallback_map_from_smart_cache(data, num_waypoints)
-
-
-def _extract_traffic_signals(
-    data: Dict[str, Any],
-    map_position: Tensor,
-    map_heading: Tensor,
-    map_light_type: Tensor,
-) -> Dict[str, Tensor]:
-    if "mdg_traffic_signal" in data:
-        signal = data["mdg_traffic_signal"]
-        return {
-            "position": _as_tensor(signal["position"], torch.float32),
-            "heading": _as_tensor(signal.get("heading", torch.zeros(len(signal["position"]))), torch.float32),
-            "state": _as_tensor(signal["state"], torch.long),
-            "valid": _as_tensor(signal.get("valid", torch.ones(len(signal["position"]))), torch.bool),
-        }
-
-    signal_mask = map_light_type > 0
-    if not bool(signal_mask.any()):
-        return {
-            "position": torch.zeros(0, 2, dtype=torch.float32),
-            "heading": torch.zeros(0, dtype=torch.float32),
-            "state": torch.zeros(0, dtype=torch.long),
-            "valid": torch.zeros(0, dtype=torch.bool),
-        }
+def _extract_traffic_signals(data: Dict[str, Any]) -> Dict[str, Tensor]:
+    if "mdg_traffic_signal" not in data:
+        raise ValueError(
+            "MDG cache is missing the required 'mdg_traffic_signal' field. "
+            "Regenerate the cache with the MDG branch."
+        )
+    signal = data["mdg_traffic_signal"]
+    required = ("position", "heading", "state", "valid")
+    missing = [key for key in required if key not in signal]
+    if missing:
+        raise ValueError(f"MDG cache mdg_traffic_signal is missing required keys: {missing}")
     return {
-        "position": map_position[signal_mask, 0, :2].float(),
-        "heading": map_heading[signal_mask, 0].float(),
-        "state": map_light_type[signal_mask].long(),
-        "valid": torch.ones(int(signal_mask.sum()), dtype=torch.bool),
+        "position": _as_tensor(signal["position"], torch.float32),
+        "heading": _as_tensor(signal["heading"], torch.float32),
+        "state": _as_tensor(signal["state"], torch.long),
+        "valid": _as_tensor(signal["valid"], torch.bool),
     }
 
 
@@ -210,7 +136,6 @@ class MDGDataset(Dataset):
         self.max_traffic_lights = int(max_traffic_lights)
         self.training = bool(training)
         self.tfrecord_dir = Path(tfrecord_dir) if tfrecord_dir is not None else None
-        self._warned_legacy_map_sampling = False
 
     def __len__(self) -> int:
         return len(self.raw_paths)
@@ -266,17 +191,7 @@ class MDGDataset(Dataset):
         id_pad, _ = _pad_first_dim(agent_id, agent_tensor_size, pad_value=-1)
         agent_valid = agent_present & valid_pad[:, current_index]
 
-        if not self._warned_legacy_map_sampling:
-            sampling = data.get("mdg_map", {}).get("sampling") if isinstance(data.get("mdg_map"), dict) else None
-            if sampling != MDG_MAP_SAMPLING_VERSION:
-                warnings.warn(
-                    "MDG cache was not generated with arclength_v1 map sampling. "
-                    "Regenerate the MDG cache to use arc-length-resampled 16-waypoint map polylines.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self._warned_legacy_map_sampling = True
-        mdg_map = _extract_map(data, self.map_waypoints)
+        mdg_map = _extract_map(data)
         map_anchor = mdg_map["position"][:, 0, :2] if mdg_map["position"].numel() else torch.zeros(0, 2)
         selected_map = _select_nearest(
             positions=map_anchor,
@@ -301,12 +216,7 @@ class MDGDataset(Dataset):
             self.max_map_polylines,
         )
 
-        signal = _extract_traffic_signals(
-            data=data,
-            map_position=mdg_map["position"],
-            map_heading=mdg_map["heading"],
-            map_light_type=mdg_map["light_type"],
-        )
+        signal = _extract_traffic_signals(data)
         selected_signal = _select_nearest(
             positions=signal["position"],
             valid=signal["valid"],
