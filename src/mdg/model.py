@@ -418,15 +418,20 @@ class MDG(LightningModule):
         local_heading = wrap_angle(future_heading - current_heading.unsqueeze(-1))
         target = torch.cat((local_pos, local_heading.unsqueeze(-1)), dim=-1)
         valid = self._future_valid(batch)
+        target_expanded = target.unsqueeze(2).expand_as(aux)
+        l2_score = torch.linalg.norm(aux[..., :2] - target_expanded[..., :2], dim=-1)
+        l2_score = (l2_score * valid.unsqueeze(2).to(dtype=l2_score.dtype)).sum(dim=-1)
+        denom = valid.sum(dim=-1, keepdim=True).clamp_min(1).to(dtype=l2_score.dtype)
+        best_mode = (l2_score / denom).argmin(dim=-1)
+
         per_mode = F.smooth_l1_loss(
             aux,
-            target.unsqueeze(2).expand_as(aux),
+            target_expanded,
             reduction="none",
         ).sum(dim=-1)
         per_mode = (per_mode * valid.unsqueeze(2).to(dtype=per_mode.dtype)).sum(dim=-1)
-        denom = valid.sum(dim=-1, keepdim=True).clamp_min(1).to(dtype=per_mode.dtype)
-        per_mode = per_mode / denom
-        best = per_mode.min(dim=-1).values
+        per_mode = per_mode / denom.to(dtype=per_mode.dtype)
+        best = per_mode.gather(-1, best_mode.unsqueeze(-1)).squeeze(-1)
         agent_valid = batch["agent_valid"]
         return (best * agent_valid.to(dtype=best.dtype)).sum() / agent_valid.sum().clamp_min(1).to(dtype=best.dtype)
 

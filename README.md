@@ -49,6 +49,8 @@
 
 MDG의 `[N, Ta, 5]` physical state는 `x, y, cos(heading), sin(heading), speed`로 둔다. raw heading 대신 `cos/sin`을 쓰면 angle wrapping 불연속이 줄어든다. `Ta=40 -> T=80` 복원은 action 하나를 0.1초 step 두 번에 걸쳐 적분한다.
 
+Auxiliary predictor는 agent scene context에서 `[B,N,6,80,3]` trajectory modes를 출력한다. 논문 보충자료의 prediction loss 정의에 맞춰 best mode는 GT와의 `xy` L2 ADE가 가장 작은 mode로 고르고, 실제 auxiliary loss는 그 mode에 대한 Smooth L1을 적용한다. invalid agent/timestep은 loss에서 제외한다.
+
 기본 모델 파라미터 수는 `7,111,168`개다. 모듈별로는 scene encoder `4,017,374`, denoiser `2,778,434`, auxiliary predictor `315,360`개다. encoder/denoiser/mixer depth와 attention head 수는 유지하고, `D=192`, `FFN=704`로 폭만 줄인 설정이다.
 
 learning rate는 기존 effective batch `32`에서 쓰던 `0.0002`를 기준으로, testas A100 7장 기본 effective batch `32 * 7 = 224`에 맞춰 sqrt scaling을 적용했다. 계산식은 `0.0002 * sqrt(224 / 32) = 0.00052915`다. LR schedule은 논문 설정인 global batch `32`, `20 epochs`, warmup `1000 steps`, decay interval `2000 steps`를 기준으로 전체 학습 진행률을 보존하도록 조정했다. 우리 설정은 global batch가 7배 크고 epoch이 `20 -> 64`로 `3.2`배 길어졌으므로 step scale은 `(64 / 20) / 7 = 0.457142...`이다. 따라서 warmup은 `1000 * 0.457142 ~= 457 steps`, decay interval은 `2000 * 0.457142 ~= 914 steps`로 둔다. decay factor `0.98`은 유지한다.

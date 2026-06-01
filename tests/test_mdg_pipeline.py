@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 from waymo_open_dataset.utils.sim_agents import submission_specs
 
@@ -276,6 +277,31 @@ def test_mdg_loss_decreases_on_fixed_corruption() -> None:
         losses.append(float(loss.detach()))
 
     assert losses[-1] < losses[0]
+
+
+def test_mdg_auxiliary_loss_selects_best_mode_by_xy_l2() -> None:
+    batch = collate_mdg_samples([_sample(0)])
+    batch["agent_valid"][0, 1:] = False
+    batch["agent_valid_mask"][0, 1:] = False
+    model = MDG(_small_model_config())
+
+    future_pos = batch["agent_position"][:, :, model.num_historical_steps :, :2]
+    future_heading = batch["agent_heading"][:, :, model.num_historical_steps :]
+    current_pos = batch["agent_position"][:, :, model.num_historical_steps - 1, :2]
+    current_heading = batch["agent_heading"][:, :, model.num_historical_steps - 1]
+    local_pos = future_pos - current_pos.unsqueeze(2)
+    local_heading = future_heading - current_heading.unsqueeze(-1)
+    target = torch.cat((local_pos, local_heading.unsqueeze(-1)), dim=-1)
+    aux = target.unsqueeze(2).repeat(1, 1, 2, 1, 1)
+
+    aux[:, 0, 0, :, 0] += 2.0
+    aux[:, 0, 1, :, 0] += 0.1
+    aux[:, 0, 1, :, 2] += 4.0
+
+    loss = model._auxiliary_loss(aux, batch)
+    expected = F.smooth_l1_loss(aux[:, 0, 1], target[:, 0], reduction="none").sum(dim=-1).mean()
+
+    torch.testing.assert_close(loss, expected)
 
 
 def test_mdg_default_loss_is_state_plus_aux_without_action_loss() -> None:
