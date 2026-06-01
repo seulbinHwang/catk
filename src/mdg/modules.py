@@ -625,12 +625,18 @@ class KinematicDynamics(nn.Module):
                 f"got future_steps={future_steps}, action_chunk={self.action_chunk}."
             )
         action_steps = future_steps // self.action_chunk
-        speed = torch.linalg.norm(future_velocity[:, :, :, :2], dim=-1)
+        prev_pos = torch.cat((current_pos.unsqueeze(2), future_pos[:, :, :-1]), dim=2)
+        position_velocity = (future_pos - prev_pos) / self.dt
+        future_heading_vec = heading_vector(future_heading)
+        velocity_speed = (future_velocity[:, :, :, :2] * future_heading_vec).sum(dim=-1)
+        position_speed = (position_velocity * future_heading_vec).sum(dim=-1)
+        speed = torch.where(torch.isfinite(position_speed), position_speed, velocity_speed)
         prev_speed = torch.cat((current_speed.unsqueeze(-1), speed[:, :, :-1]), dim=-1)
         prev_heading = torch.cat((current_heading.unsqueeze(-1), future_heading[:, :, :-1]), dim=-1)
         per_step_acc = (speed - prev_speed) / self.dt
         per_step_yaw_rate = wrap_angle(future_heading - prev_heading) / self.dt
         per_step_action = torch.stack((per_step_acc, per_step_yaw_rate), dim=-1)
+        per_step_action = torch.where(torch.isfinite(per_step_action), per_step_action, torch.zeros_like(per_step_action))
         chunk_action = per_step_action.reshape(
             *per_step_action.shape[:2],
             action_steps,

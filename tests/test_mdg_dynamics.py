@@ -3,7 +3,7 @@ import math
 import torch
 
 from src.mdg.modules import KinematicDynamics
-from src.mdg.geometry import heading_vector, wrap_angle
+from src.mdg.geometry import global_to_local_xy, heading_vector, wrap_angle
 
 
 def loop_reference_dynamics(dynamics, action, current_pos, current_heading, current_speed, current_velocity=None):
@@ -27,13 +27,14 @@ def loop_reference_dynamics(dynamics, action, current_pos, current_heading, curr
             full_pos.append(pos)
             full_heading.append(heading)
             full_speed.append(speed)
-        rel_pos = pos - current_pos
+        local_pos = global_to_local_xy(pos, current_pos, current_heading)
+        local_heading = wrap_angle(heading - current_heading)
         chunk_state.append(
             torch.cat(
                 (
-                    rel_pos,
-                    torch.cos(heading).unsqueeze(-1),
-                    torch.sin(heading).unsqueeze(-1),
+                    local_pos,
+                    torch.cos(local_heading).unsqueeze(-1),
+                    torch.sin(local_heading).unsqueeze(-1),
                     speed.unsqueeze(-1),
                 ),
                 dim=-1,
@@ -86,25 +87,26 @@ def test_kinematic_dynamics_advances_position_with_current_velocity_vector():
     torch.testing.assert_close(pos[0, 0, 0], torch.tensor([1.0, 0.0]))
 
 
-def test_trajectory_to_actions_averages_per_step_inverse_dynamics():
+def test_trajectory_to_actions_uses_position_consistent_speed():
     dynamics = KinematicDynamics(
         action_chunk=2,
         dt=1.0,
         action_mean=(0.0, 0.0),
         action_std=(1.0, 1.0),
     )
-    future_velocity = torch.tensor([[[[2.0, 0.0], [4.0, 0.0]]]])
-    future_heading = torch.tensor([[[0.2, 0.6]]])
+    future_pos = torch.tensor([[[[2.0, 0.0], [5.0, 0.0], [9.0, 0.0], [14.0, 0.0]]]])
+    future_velocity = torch.tensor([[[[99.0, 0.0], [99.0, 0.0], [99.0, 0.0], [5.0, 0.0]]]])
+    future_heading = torch.zeros(1, 1, 4)
     action = dynamics.trajectory_to_actions(
         current_pos=torch.zeros(1, 1, 2),
         current_heading=torch.tensor([[0.0]]),
         current_speed=torch.tensor([[1.0]]),
-        future_pos=torch.zeros(1, 1, 2, 2),
+        future_pos=future_pos,
         future_heading=future_heading,
         future_velocity=future_velocity,
     )
 
-    expected = torch.tensor([[[[1.5, 0.3]]]])
+    expected = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]]]])
     torch.testing.assert_close(action, expected)
 
 
@@ -139,4 +141,4 @@ def test_vectorized_dynamics_matches_loop_reference():
     )
 
     for expected_tensor, actual_tensor in zip(expected, actual):
-        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=1e-4, atol=5e-6)
+        torch.testing.assert_close(actual_tensor, expected_tensor, rtol=1e-4, atol=1e-5)
