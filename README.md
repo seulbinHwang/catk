@@ -107,6 +107,40 @@ find /media/user/F/dataset/womd_v1_3/SMART_RAW_cache/validation_tfrecords_splitt
 grep -R "Traceback\\|Exception\\|No space left" /media/user/F/dataset/womd_v1_3/SMART_RAW_cache_build_logs || true
 ```
 
+### 10.60.188.83 SMART RAW cache Nubes 업로드
+
+생성된 SMART RAW cache를 Nubes에 업로드할 때는 [scripts/upload_smart_raw_cache_to_nubes.sh](scripts/upload_smart_raw_cache_to_nubes.sh)를 사용한다.
+
+기본 경로는 아래와 같다.
+
+```text
+local cache: /media/user/F/dataset/womd_v1_3/SMART_RAW_cache
+nubes path:  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_RAW_cache
+jobs:        96
+gateway:     c.nubes.sto.navercorp.com:8000
+```
+
+원격 머신에서 실행한다.
+
+```bash
+ssh user@10.60.188.83
+cd /tmp/catk_smart_cache_build
+bash scripts/upload_smart_raw_cache_to_nubes.sh
+```
+
+장기 작업으로 돌릴 때는 tmux를 사용한다.
+
+```bash
+tmux new -s smart-raw-cache-upload
+bash scripts/upload_smart_raw_cache_to_nubes.sh
+```
+
+업로드가 중간에 끊긴 경우 같은 명령을 다시 실행하면 된다. 기본 옵션은 `-s`라서 Nubes에 이미 있는 파일은 건너뛴다. 병렬도는 필요할 때만 조정한다.
+
+```bash
+JOBS=96 bash scripts/upload_smart_raw_cache_to_nubes.sh
+```
+
 ## Run the code
 In the scripts, we provide
 - [scripts/train.sh](scripts/train.sh) for training and fine-tuning.
