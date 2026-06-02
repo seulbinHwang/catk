@@ -61,7 +61,7 @@ data:
   val_batch_size: 12
   test_batch_size: 12
   num_workers: 4
-  train_use_eval_agent_selection: true
+  train_use_eval_agent_selection: false
   random_scene_scale_config:
     SCALE_RANGE: [0.8, 1.2]
   random_time_shift_config:

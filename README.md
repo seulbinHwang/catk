@@ -101,18 +101,12 @@
 ### 공정 비교용 SMART NTP 학습 대상 선택
 
 KFM 계열 실험과 SMART NTP pretrain을 공정하게 비교할 때는 학습 손실을 받는
-agent 집합도 명시해야 한다. 현재 main 브랜치의 SMART NTP pretrain 기본값은
+agent 집합도 명시해야 한다. 현재 trajtok 브랜치의 SMART NTP pretrain 기본값은
 `configs/data/waymo.yaml`, `configs/experiment/pre_bc.yaml`,
 `configs/experiment/pre_bc_a100x4x2.yaml` 모두에서
-`data.train_use_eval_agent_selection: true`를 사용한다.
+`data.train_use_eval_agent_selection: false`를 사용한다.
 
-이 설정에서는 validation과 같은 agent selection을 학습에도 사용한다. 학습 전용
-`train_mask`를 만들지 않으므로, SMART NTP loss는 별도 `train_mask` cap 없이
-valid agent/time 전체를 기준으로 계산된다. 따라서 `data.train_max_num`은 이 경로의
-학습 target 수를 제한하지 않는다.
-
-legacy 학습 전용 target selection이 필요한 비교 실험에서는 실행 시
-`data.train_use_eval_agent_selection=false`로 명시적으로 override해야 한다. 그 경우에만
+이 설정에서는 validation/eval agent selection을 학습 target selection으로 재사용하지 않고,
 ego 기준 150m 밖 agent valid mask를 자르고, role agent 또는 현재 100m 이내이면서 미래
 valid가 충분한 agent 중 scenario당 최대 `data.train_max_num`개까지 `train_mask`로 골라
 loss에 반영한다.
@@ -387,7 +381,7 @@ build 중 pod가 죽어 `.lock` 파일만 남은 경우에는 lock heartbeat가 
 gradient accumulation을 켜는 override는 학습을 시작하기 전에 실패한다.
 
 `main@f5020bc`, `testa/testaa`, A100 4장 x 2 pod, validation off,
-`CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=true` 조건에서
+`CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=false` 조건에서
 batch capacity를 1 epoch 기준으로 다시 측정했다. training cache `486,996`개 기준으로
 64 epoch train-only 시간을 추정하면 아래와 같다.
 
@@ -413,7 +407,7 @@ training-only 시간 기준으로 이득이 확인되지 않았고 오히려 총
 compile toggle은 제공하지 않는다.
 
 따라서 현재 A100x4x2 `testa/testaa` pretrain 기본값은
-`CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=true`,
+`CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=false`,
 `data.train_batch_size=16`이다. 위 시간은 train-only 추정이며,
 `check_val_every_n_epoch=16` validation과 checkpoint overhead는 별도로 더해진다.
 RMM checkpoint 선택용 fast scorer는 `model.model_config.scorer_scene_num=1680`을 기준으로
@@ -1167,8 +1161,8 @@ DDP 학습에는 `scripts/road_train.sh` 안의 DDP block을 사용한다. Rank 
 RoaD는 모델 자기 자신의 rollout을 그대로 새 정답으로 다시 학습시키는 방식이다.
 rollout이 도로 밖으로 폭주하거나 ego로부터 멀리 벗어나도, 캐시 단계에서는 거리 클립이나
 도로 이탈 같은 후처리 방어 로직을 **일부러 두지 않는다**. 모델이 만든 80 step rollout
-전체가 그대로 학습 신호가 된다. 우리는 항상 `data.train_use_eval_agent_selection=true`로
-학습하므로, 학습 transform이 거리를 잘라주는 가정도 없다.
+전체가 그대로 학습 신호가 된다. 우리는 항상 `data.train_use_eval_agent_selection=false`로
+학습하므로, 학습 전용 target selection의 거리/개수 제한 경로를 일관되게 사용한다.
 
 다만 `RoadCacheRefreshCallback`은 `trainer.precision`을 읽어 `bf16-mixed`/`16-mixed`일 때
 `generate_road_cache` 안의 inference를 `torch.autocast`로 감싼다. 학습 step과 cache
