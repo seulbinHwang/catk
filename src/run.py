@@ -42,8 +42,6 @@ from src.utils.waymo_submission import (
     maybe_submit_waymo_submission,
 )
 
-from src.smart.road import run_road_finetune
-
 log = RankedLogger(__name__, rank_zero_only=True)
 
 torch.set_float32_matmul_precision("high")
@@ -341,25 +339,6 @@ def run(cfg: DictConfig) -> None:
             allow_missing_self_forced_auxiliary=_is_self_forced_enabled(cfg),
         )
         trainer.fit(model=model, datamodule=datamodule)
-    elif cfg.action == "road_finetune":
-        if not cfg.get("ckpt_path"):
-            raise ValueError("action=road_finetune requires ckpt_path for weight-only initialization.")
-        checkpoint = _load_lightning_checkpoint(str(cfg.ckpt_path))
-        _validate_self_forced_checkpoint_action(cfg, checkpoint)
-        log.info("Starting RoaD fine-tuning!")
-        load_result = model.load_state_dict(checkpoint["state_dict"], strict=False)
-        _validate_finetune_loaded_trainable_params(
-            model=model,
-            missing_keys=load_result.missing_keys,
-            unexpected_keys=load_result.unexpected_keys,
-            allow_missing_self_forced_auxiliary=_is_self_forced_enabled(cfg),
-        )
-        run_road_finetune(
-            cfg=cfg,
-            datamodule=datamodule,
-            model=model,
-            trainer=trainer,
-        )
     elif cfg.action == "validate":
         log.info("Starting validating!")
         trainer.validate(
