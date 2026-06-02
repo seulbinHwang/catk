@@ -96,6 +96,9 @@ def _small_model_config() -> OmegaConf:
             "rollout_chunk_size": 2,
             "replanning_interval": 10,
             "closed_loop_denoising_steps": 2,
+            "closed_loop_denoising_schedule": "temporal",
+            "closed_loop_reuse_actions": True,
+            "closed_loop_reuse_alpha": [0.95, 0.90, 0.80, 0.01],
             "validation_closed_seed": 0,
             "val_closed_loop": True,
             "n_batch_sim_agents_metric": 0,
@@ -184,6 +187,7 @@ def test_mdg_closed_loop_inference_uses_full_noise_n_step_replanning() -> None:
     cfg.rollout_chunk_size = 2
     cfg.replanning_interval = 10
     cfg.closed_loop_denoising_steps = 3
+    cfg.closed_loop_reuse_actions = False
     batch = collate_mdg_samples([_sample(0)])
     model = MDG(cfg)
     model.eval()
@@ -191,7 +195,10 @@ def test_mdg_closed_loop_inference_uses_full_noise_n_step_replanning() -> None:
     full_noise_calls = []
     denoise_calls = []
     max_noise_level = model.backbone.num_noise_levels - 1
-    expected_schedule = model._closed_loop_mask_schedule(torch.device("cpu")).tolist()
+    expected_schedule = model._closed_loop_mask_schedule(
+        torch.device("cpu"),
+        action_steps=model.backbone.action_steps,
+    )
 
     def fake_full_noise_sample(rollout_batch, generator=None):
         shape = (
@@ -211,9 +218,9 @@ def test_mdg_closed_loop_inference_uses_full_noise_n_step_replanning() -> None:
 
     def fake_denoise_actions(rollout_batch, noised_action, mask_level, scene=None, compute_aux=True):
         call_index = len(denoise_calls)
-        denoise_calls.append((tuple(noised_action.shape), tuple(mask_level.shape), int(mask_level.min()), int(mask_level.max()), scene, compute_aux))
+        denoise_calls.append((tuple(noised_action.shape), tuple(mask_level.shape), float(mask_level.min()), float(mask_level.max()), scene, compute_aux))
         expected_level = expected_schedule[call_index % cfg.closed_loop_denoising_steps]
-        assert bool((mask_level == expected_level).all())
+        torch.testing.assert_close(mask_level, expected_level.view(1, 1, -1).expand_as(mask_level))
         assert scene is not None
         assert compute_aux is False
         bsz, num_agents = mask_level.shape[:2]
@@ -265,6 +272,76 @@ def test_mdg_closed_loop_inference_uses_full_noise_n_step_replanning() -> None:
         expected_call_index = (segment_idx + 1) * cfg.closed_loop_denoising_steps - 1
         expected = torch.full_like(pred["pred_pos"][:, :, :, start:end], float(expected_call_index))
         torch.testing.assert_close(pred["pred_pos"][:, :, :, start:end], expected)
+
+
+def test_mdg_closed_loop_reuses_shifted_action_after_first_replan() -> None:
+    cfg = _small_model_config()
+    cfg.rollout_chunk_size = 1
+    cfg.replanning_interval = 10
+    cfg.closed_loop_denoising_steps = 1
+    cfg.closed_loop_reuse_actions = True
+    batch = collate_mdg_samples([_sample(0)])
+    model = MDG(cfg)
+    model.eval()
+
+    apply_noise_calls = []
+    denoise_calls = []
+    full_noise_calls = []
+    action_steps = model.backbone.action_steps
+    shift_chunks = cfg.replanning_interval // model.backbone.action_chunk
+
+    def fake_full_noise_sample(rollout_batch, generator=None):
+        shape = (
+            rollout_batch["agent_position"].shape[0],
+            rollout_batch["agent_position"].shape[1],
+            action_steps,
+            2,
+        )
+        noise = torch.zeros(shape, device=rollout_batch["agent_position"].device)
+        mask = torch.full(shape[:-1], model.backbone.num_noise_levels - 1, dtype=torch.long, device=noise.device)
+        full_noise_calls.append(mask.clone())
+        return noise, mask
+
+    def fake_apply_noise(clean_action, mask_level, generator=None):
+        apply_noise_calls.append((clean_action.detach().clone(), mask_level.detach().clone()))
+        return clean_action
+
+    def fake_denoise_actions(rollout_batch, noised_action, mask_level, scene=None, compute_aux=True):
+        call_index = len(denoise_calls)
+        denoise_calls.append((noised_action.detach().clone(), mask_level.detach().clone(), scene, compute_aux))
+        bsz, num_agents = mask_level.shape[:2]
+        step_values = torch.arange(action_steps, device=noised_action.device, dtype=noised_action.dtype)
+        pred_action = torch.zeros(bsz, num_agents, action_steps, 2, device=noised_action.device, dtype=noised_action.dtype)
+        pred_action[..., 0] = step_values.view(1, 1, -1) + float(call_index * 100)
+        pred_pos = torch.full(
+            (bsz, num_agents, model.num_future_steps, 2),
+            float(call_index),
+            device=noised_action.device,
+            dtype=noised_action.dtype,
+        )
+        pred_heading = torch.zeros(bsz, num_agents, model.num_future_steps, device=noised_action.device, dtype=noised_action.dtype)
+        pred_speed = torch.zeros_like(pred_heading)
+        pred_chunk_state = torch.zeros(bsz, num_agents, action_steps, 5, device=noised_action.device, dtype=noised_action.dtype)
+        return pred_action, pred_pos, pred_heading, pred_speed, pred_chunk_state, None, None
+
+    model.backbone.full_noise_sample = fake_full_noise_sample
+    model._apply_noise = fake_apply_noise
+    model.backbone.denoise_actions = fake_denoise_actions
+
+    pred = model.generate_closed_loop_rollouts(batch, num_rollouts=1)
+
+    segment_count = model.num_future_steps // cfg.replanning_interval
+    assert len(full_noise_calls) == segment_count
+    assert len(apply_noise_calls) == segment_count - 1
+    assert len(denoise_calls) == segment_count
+    first_reuse_action, first_reuse_mask = apply_noise_calls[0]
+    expected_prefix = torch.arange(shift_chunks, action_steps, dtype=first_reuse_action.dtype).view(1, 1, -1)
+    torch.testing.assert_close(first_reuse_action[..., : action_steps - shift_chunks, 0], expected_prefix.expand_as(first_reuse_action[..., : action_steps - shift_chunks, 0]))
+    torch.testing.assert_close(first_reuse_action[..., action_steps - shift_chunks :, 0], torch.zeros_like(first_reuse_action[..., action_steps - shift_chunks :, 0]))
+    assert first_reuse_mask.dtype.is_floating_point
+    assert float(first_reuse_mask[..., :shift_chunks].max()) < 1.0
+    assert float(first_reuse_mask[..., -shift_chunks:].min()) > 3.9
+    assert tuple(pred["pred_pos"].shape) == (1, 4, 1, 80, 2)
 
 
 def test_mdg_loss_decreases_on_fixed_corruption() -> None:
@@ -430,12 +507,16 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert model_cfg.n_rollout_closed_val == 32
     assert model_cfg.replanning_interval == 10
     assert model_cfg.closed_loop_denoising_steps == 5
+    assert model_cfg.closed_loop_denoising_schedule == "temporal"
+    assert model_cfg.closed_loop_reuse_actions is True
+    assert list(model_cfg.closed_loop_reuse_alpha) == [0.95, 0.90, 0.80, 0.01]
     assert model_cfg.action_loss_weight == 0.0
     assert model_cfg.aux_loss_weight == 5.0
     assert model_cfg.sim_agents_submission.num_model_parameters == "7.11M"
     assert submission_cfg.model.model_config.n_rollout_closed_val == 32
     assert submission_cfg.model.model_config.replanning_interval == 10
     assert submission_cfg.model.model_config.closed_loop_denoising_steps == 5
+    assert submission_cfg.model.model_config.closed_loop_reuse_actions is True
     assert submission_cfg.model.model_config.val_closed_loop is True
     assert submission_cfg.model.model_config.sim_agents_submission.is_active is True
     assert pretrain_cfg.trainer.precision == "16-mixed"
@@ -451,23 +532,51 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert sum(p.numel() for p in model.parameters()) == 7_111_168
 
 
-def test_mdg_closed_loop_denoising_steps_match_discrete_noise_levels() -> None:
+def test_mdg_temporal_denoising_schedule_allows_arbitrary_steps() -> None:
     cfg = _small_model_config()
-    expected = {
-        1: [4],
-        2: [4, 0],
-        3: [4, 2, 0],
-        4: [4, 3, 1, 0],
-        5: [4, 3, 2, 1, 0],
-    }
-    for steps, schedule in expected.items():
-        cfg.closed_loop_denoising_steps = steps
-        model = MDG(cfg)
-        assert model._closed_loop_mask_schedule(torch.device("cpu")).tolist() == schedule
+    cfg.closed_loop_denoising_steps = 5
+    model = MDG(cfg)
+    schedule = model._closed_loop_mask_schedule(torch.device("cpu"), action_steps=40)
+    assert tuple(schedule.shape) == (5, 40)
+    expected_bands = torch.tensor(
+        [
+            [4, 4, 4, 4],
+            [3, 4, 4, 4],
+            [2, 3, 4, 4],
+            [1, 2, 3, 4],
+            [0, 1, 2, 3],
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(schedule[:, [0, 10, 20, 30]], expected_bands)
 
-    cfg.closed_loop_denoising_steps = 6
-    with pytest.raises(ValueError, match="closed_loop_denoising_steps must be <="):
+    cfg.closed_loop_denoising_steps = 16
+    model = MDG(cfg)
+    schedule = model._closed_loop_mask_schedule(torch.device("cpu"), action_steps=40)
+    assert tuple(schedule.shape) == (16, 40)
+    assert float(schedule.min()) >= 0.0
+    assert float(schedule.max()) <= 4.0
+    assert torch.unique(schedule).numel() > model.num_noise_levels
+
+    cfg.closed_loop_denoising_steps = 32
+    model = MDG(cfg)
+    schedule = model._closed_loop_mask_schedule(torch.device("cpu"), action_steps=40)
+    assert tuple(schedule.shape) == (32, 40)
+
+    cfg.closed_loop_denoising_steps = 0
+    with pytest.raises(ValueError, match="closed_loop_denoising_steps must be >= 1"):
         MDG(cfg)
+
+
+def test_mdg_fractional_mask_levels_interpolate_alpha_and_embeddings() -> None:
+    model = MDG(_small_model_config())
+    mask_level = torch.tensor([0.0, 0.5, 1.0, 4.0])
+    alpha = model._alpha_from_mask_level(mask_level, torch.float32)
+    expected = torch.tensor([0.99, (0.99 + 0.745) / 2.0, 0.745, 0.01])
+    torch.testing.assert_close(alpha, expected)
+
+    emb = model.backbone.denoiser._mask_embedding(mask_level.view(1, 1, -1))
+    assert tuple(emb.shape) == (1, 1, 4, model.backbone.denoiser.mask_emb.embedding_dim)
 
 
 def test_mdg_noise_schedule_and_fourier_relation_features() -> None:
@@ -607,12 +716,7 @@ def test_mdg_traffic_signal_stop_points_are_cached() -> None:
         "stop_point": [np.array([[[1.5, 2.5], [3.5, 4.5]]], dtype=np.float32)],
     }
     lights = process_dynamic_map(dynamic_map)
-    mdg_map = {
-        "position": torch.zeros(0, 16, 2, dtype=torch.float32),
-        "heading": torch.zeros(0, 16, dtype=torch.float32),
-        "light_type": torch.zeros(0, dtype=torch.long),
-    }
-    signal = build_mdg_traffic_signal_features(mdg_map, lights)
+    signal = build_mdg_traffic_signal_features(lights)
 
     torch.testing.assert_close(signal["position"], torch.tensor([[1.5, 2.5], [3.5, 4.5]]))
     assert signal["state"].tolist() == [2, 3]
@@ -622,6 +726,7 @@ def test_mdg_traffic_signal_stop_points_are_cached() -> None:
 def test_mdg_map_cache_preserves_detailed_polyline_types() -> None:
     map_data = {
         "map_polygon": {
+            "id": torch.tensor([100, 101], dtype=torch.long),
             "type": torch.tensor([0, 1], dtype=torch.uint8),
             "light_type": torch.tensor([0, 0], dtype=torch.uint8),
         },
@@ -651,6 +756,7 @@ def test_mdg_map_cache_preserves_detailed_polyline_types() -> None:
 def test_mdg_map_cache_uses_arc_length_waypoint_sampling() -> None:
     map_data = {
         "map_polygon": {
+            "id": torch.tensor([100], dtype=torch.long),
             "type": torch.tensor([0], dtype=torch.uint8),
             "light_type": torch.tensor([0], dtype=torch.uint8),
         },
@@ -701,6 +807,9 @@ def _write_minimal_mdg_cache(tmp_path, mdg_map: dict) -> None:
             "heading": torch.zeros(0),
             "state": torch.zeros(0, dtype=torch.long),
             "valid": torch.zeros(0, dtype=torch.bool),
+            "lane_id": torch.zeros(0, dtype=torch.long),
+            "time_step": torch.zeros(0, dtype=torch.long),
+            "version": "time_indexed_v1",
         },
     }
     with (tmp_path / "minimal.pkl").open("wb") as handle:
@@ -711,9 +820,11 @@ def test_mdg_dataset_requires_arclength_map_cache(tmp_path) -> None:
     mdg_map = {
         "position": torch.zeros(1, 16, 2),
         "heading": torch.zeros(1, 16),
+        "id": torch.zeros(1, dtype=torch.long),
         "type": torch.zeros(1, dtype=torch.long),
         "light_type": torch.zeros(1, dtype=torch.long),
         "valid": torch.ones(1, dtype=torch.bool),
+        "sampling": "legacy_index_v0",
     }
     _write_minimal_mdg_cache(tmp_path, mdg_map)
     dataset = MDGDataset(

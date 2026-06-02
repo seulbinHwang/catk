@@ -346,7 +346,9 @@ bash scripts/start_mdg_pretrain_testas_a100x7_with_oom_retry.sh
 
 이 wrapper는 testas pod를 새로 만들거나 재시작하지 않는다. 각 attempt마다 testas 내부 tmux session `mdg-pretrain-a100x7-oom-retry`를 교체하고, 로그에서 `OutOfMemoryError`, `CUDA out of memory`, `torch.OutOfMemoryError` 등을 감지하면 세션을 멈춘 뒤 `train_batch_size -= OOM_STEP`로 다시 시작한다. retry 로그는 로컬 repo의 `logs/_mdg_testas_a100x7_oom_retry/<TASK_NAME>/attempt_*.log`와 testas 내부 `${PROJECT_ROOT}/logs/testas_mdg_pretrain_a100x7_oom_retry/`에 남는다.
 
-MDG의 multi-step closed-loop denoising은 full-noise mask에서 시작해 논문 Figure S2의 temporal-axis schedule처럼 짧은 horizon부터 낮은 noise level로 내려간다. 현재 구현은 5-level discrete mask embedding을 사용하므로 `closed_loop_denoising_steps`를 `1..5` 범위로 제한한다. 기본값은 `closed_loop_denoising_steps=5`, `closed_loop_denoising_schedule=temporal`이다. action horizon 40 step을 4개 시간 band로 나누면 mask pattern은 `[4,4,4,4] -> [3,4,4,4] -> [2,3,4,4] -> [1,2,3,4] -> [0,1,2,3]`가 된다. 각 intermediate step은 모델의 clean action estimate를 다음 temporal mask로 다시 noising한 뒤 다음 denoising call에 넣는다. 같은 epoch-15 checkpoint에서 testas A100 7장으로 비교했을 때 336-scene Fast RMM realism meta는 global `[4,3,2,1,0]` schedule `0.68633`, temporal schedule `0.68890`이었다. 논문 WOSAC leaderboard 설정은 one-step closed-loop denoising이므로 strict 재현을 원하면 `closed_loop_denoising_steps=1`로 실행한다.
+MDG의 multi-step closed-loop denoising은 GT future를 쓰지 않고 full Gaussian noise에서 시작해, 논문 Figure S2의 temporal-axis schedule처럼 가까운 horizon부터 낮은 noise level로 내려간다. 기본값은 `closed_loop_denoising_steps=5`, `closed_loop_denoising_schedule=temporal`이다. action horizon 40 step을 4개 시간 band로 나누면 5-step mask pattern은 `[4,4,4,4] -> [3,4,4,4] -> [2,3,4,4] -> [1,2,3,4] -> [0,1,2,3]`가 된다. `closed_loop_denoising_steps=16`이나 `32`처럼 5보다 큰 값도 실행 가능하며, 이때는 discrete mask embedding과 alpha schedule을 연속 level로 선형 보간한다. 각 intermediate step은 모델의 clean action estimate를 다음 temporal mask로 다시 noising한 뒤 다음 denoising call에 넣는다. 같은 epoch-15 checkpoint에서 testas A100 7장으로 비교했을 때 336-scene Fast RMM realism meta는 global `[4,3,2,1,0]` schedule `0.68633`, temporal schedule `0.68890`이었다. 논문 WOSAC leaderboard 설정은 one-step closed-loop denoising이므로 strict 재현을 원하면 `closed_loop_denoising_steps=1`로 실행한다.
+
+closed-loop result reuse는 기본으로 켜져 있다. 첫 replanning segment는 논문 Algorithm 2처럼 full noise에서 시작하고, 이후 segment는 직전 denoised action `[B,N,40,2]`를 `replanning_interval/action_chunk=5` chunk만큼 shift해 앞쪽 35 chunk를 재사용한다. 뒤쪽 5 chunk는 새 tail로 두고, `closed_loop_reuse_alpha=[0.95,0.90,0.80,0.01]`를 mask level로 변환해 near/mid/far/tail 구간에 small perturbation부터 full-noise tail까지 차등 noising한다. 이 재사용은 rollout sample별로 독립적으로 적용되며 sample을 평균하지 않는다. ablation이나 논문 WOSAC one-step strict 재현이 필요하면 `model.model_config.closed_loop_reuse_actions=false`와 `model.model_config.closed_loop_denoising_steps=1`을 같이 지정한다.
 
 MDG dynamics는 논문이 참조한 VBD-style differentiable dynamics에 맞춰 action을 `[acceleration, yaw_rate]`로 두고, 0.1초 단위로 먼저 현재 velocity vector로 position을 전진한 뒤 heading/speed를 업데이트한다. forward dynamics는 action을 `[B, N, 40, 2]`에서 `[B, N, 80, 2]`로 펼친 뒤 `cumsum` 기반 batch 병렬 연산으로 계산하므로 Python timestep loop를 쓰지 않는다. 출력 shape은 그대로 `full_pos=[B,N,80,2]`, `full_heading=[B,N,80]`, `full_speed=[B,N,80]`, `chunk_state=[B,N,40,5]`이다. GT action inverse는 logged future position의 0.1초 displacement를 해당 timestep heading 방향으로 투영해 position-consistent speed를 먼저 만들고, 그 speed 변화량과 logged heading 변화량에서 0.1초 per-step acceleration/yaw-rate를 계산한 다음 `action_chunk=2` 구간 평균으로 `[N, 40, 2]` action tensor를 만든다. invalid gap 등으로 position-derived speed가 finite하지 않은 timestep만 logged velocity projection으로 fallback한다. denoising `state_loss`는 논문의 reduced action/state 구조에 맞춰 `pred_chunk_state=[B,N,40,5]`와 clean action을 같은 dynamics에 통과시킨 `clean_chunk_state=[B,N,40,5]` 사이의 MSE를 기본으로 쓴다. raw 80-step state loss는 `full_state_loss_weight=0.0` 기본값의 보조 옵션으로만 남긴다. hard speed clamp는 논문/VBD 식에 명시되어 있지 않으므로 기본값으로 넣지 않는다. dynamics round-trip 검증은 다음처럼 실행한다.
 
@@ -510,13 +512,13 @@ CATK_TF_INTRA_OP_THREADS=1 CATK_TF_INTER_OP_THREADS=1 python src/run.py action=v
 
 - `src/mdg/data.py`: WOMD cache loader, train nearest-64 구성, eval/test all-agent dynamic padding, DDP exact eval sampler.
 - `src/mdg/modules.py`: scene encoder, differentiable kinematic dynamics, MDG denoiser, auxiliary predictor.
-- `src/mdg/model.py`: LightningModule, mask/noise objective, 1~5-step closed-loop rollout, Fast WOSAC metric/submission 연결.
+- `src/mdg/model.py`: LightningModule, mask/noise objective, temporal-axis closed-loop rollout, action reuse, Fast WOSAC metric/submission 연결.
 - `src/mdg/geometry.py`: 좌표 변환, angle wrapping, relation feature.
 - `src/data_preprocess.py`: 새 cache 생성 시 MDG map/signal field 저장.
 
 ## 주의사항
 
 - Waymax는 사용하지 않는다. closed-loop 효과는 제출 궤적 내부에서 1Hz replanning으로 근사한다.
-- validation/test/submission은 기본적으로 full noise에서 시작해 `closed_loop_denoising_steps=5`, `closed_loop_denoising_schedule=temporal`로 denoising한다. 같은 replanning segment 안에서는 scene encoder를 한 번만 실행하고 auxiliary predictor는 호출하지 않는다.
+- validation/test/submission은 기본적으로 첫 segment는 full noise에서 시작하고, 이후 segment는 shifted action reuse를 적용한 뒤 `closed_loop_denoising_steps=5`, `closed_loop_denoising_schedule=temporal`로 denoising한다. 같은 replanning segment 안에서는 scene encoder를 한 번만 실행하고 auxiliary predictor는 호출하지 않는다.
 - WOSAC 제출은 반드시 32 rollout이어야 한다. submission mode에서 다른 값이면 모델 초기화 시 실패한다.
 - evaluation/test DDP는 padding 없는 exact sampler를 사용한다. 제출 archive에서 scenario 중복이 생기지 않도록 하기 위함이다.

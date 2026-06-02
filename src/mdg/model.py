@@ -71,6 +71,11 @@ class MDG(LightningModule):
         self.closed_loop_denoising_schedule = str(
             getattr(model_config, "closed_loop_denoising_schedule", "temporal")
         ).lower()
+        self.closed_loop_reuse_actions = bool(getattr(model_config, "closed_loop_reuse_actions", True))
+        self.closed_loop_reuse_alpha = tuple(
+            float(value)
+            for value in getattr(model_config, "closed_loop_reuse_alpha", (0.95, 0.90, 0.80, 0.01))
+        )
         self.validation_closed_seed = int(model_config.validation_closed_seed)
         self.val_closed_loop = bool(model_config.val_closed_loop)
         self.n_batch_sim_agents_metric = int(model_config.n_batch_sim_agents_metric)
@@ -120,18 +125,29 @@ class MDG(LightningModule):
                 "model_config.closed_loop_denoising_steps must be >= 1, "
                 f"got {self.closed_loop_denoising_steps}."
             )
-        if self.closed_loop_denoising_steps > self.num_noise_levels:
-            raise ValueError(
-                "model_config.closed_loop_denoising_steps must be <= "
-                "model_config.backbone.num_noise_levels to avoid repeated discrete mask levels, "
-                f"got closed_loop_denoising_steps={self.closed_loop_denoising_steps}, "
-                f"num_noise_levels={self.num_noise_levels}."
-            )
         if self.closed_loop_denoising_schedule not in {"global", "temporal"}:
             raise ValueError(
                 "model_config.closed_loop_denoising_schedule must be 'global' or 'temporal', "
                 f"got {self.closed_loop_denoising_schedule!r}."
             )
+        if self.closed_loop_reuse_actions:
+            if len(self.closed_loop_reuse_alpha) != 4:
+                raise ValueError(
+                    "model_config.closed_loop_reuse_alpha must contain four alpha values "
+                    "for near/mid/far/tail action chunks."
+                )
+            for value in self.closed_loop_reuse_alpha:
+                if not (0.0 < value <= 1.0):
+                    raise ValueError(
+                        "model_config.closed_loop_reuse_alpha values must be in (0, 1], "
+                        f"got {self.closed_loop_reuse_alpha}."
+                    )
+            if self.replanning_interval % self.backbone.action_chunk != 0:
+                raise ValueError(
+                    "closed-loop action reuse requires replanning_interval to be divisible by "
+                    f"action_chunk, got replanning_interval={self.replanning_interval}, "
+                    f"action_chunk={self.backbone.action_chunk}."
+                )
         if self.kinematic_chunk_filter and self.kinematic_max_step_displacement_m <= 0.0:
             raise ValueError(
                 "model_config.kinematic_max_step_displacement_m must be positive when "
@@ -312,6 +328,29 @@ class MDG(LightningModule):
     def _alpha_schedule(self, device: torch.device, dtype: torch.dtype) -> Tensor:
         return torch.linspace(0.99, 0.01, self.num_noise_levels, device=device, dtype=dtype)
 
+    def _alpha_from_mask_level(self, mask_level: Tensor, dtype: torch.dtype) -> Tensor:
+        alpha_schedule = self._alpha_schedule(mask_level.device, dtype)
+        if not torch.is_floating_point(mask_level):
+            return alpha_schedule[mask_level]
+
+        max_index = self.num_noise_levels - 1
+        level = mask_level.to(dtype=dtype).clamp(0.0, float(max_index))
+        lower = torch.floor(level).long()
+        upper = torch.ceil(level).long()
+        weight = level - lower.to(dtype=dtype)
+        lower_alpha = alpha_schedule[lower]
+        upper_alpha = alpha_schedule[upper]
+        return torch.lerp(lower_alpha, upper_alpha, weight)
+
+    def _mask_level_from_alpha(self, alpha: Tensor) -> Tensor:
+        alpha_schedule = self._alpha_schedule(alpha.device, alpha.dtype)
+        alpha_max = alpha_schedule[0]
+        alpha_min = alpha_schedule[-1]
+        max_level = float(self.num_noise_levels - 1)
+        denom = (alpha_max - alpha_min).clamp_min(torch.finfo(alpha.dtype).eps)
+        level = (alpha_max - torch.clamp(alpha, min=alpha_min, max=alpha_max)) / denom * max_level
+        return level.clamp(0.0, max_level)
+
     def _distributed_world_rank(self) -> tuple[int, int]:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             return int(torch.distributed.get_world_size()), int(torch.distributed.get_rank())
@@ -385,7 +424,7 @@ class MDG(LightningModule):
         mask_level: Tensor,
         generator: torch.Generator | None = None,
     ) -> Tensor:
-        alpha = self._alpha_schedule(clean_action.device, clean_action.dtype)[mask_level].unsqueeze(-1)
+        alpha = self._alpha_from_mask_level(mask_level, clean_action.dtype).unsqueeze(-1)
         noise = torch.randn(
             clean_action.shape,
             device=clean_action.device,
@@ -395,46 +434,87 @@ class MDG(LightningModule):
         return torch.sqrt(alpha) * clean_action + torch.sqrt(1.0 - alpha) * noise
 
     def _closed_loop_mask_schedule(self, device: torch.device, action_steps: int | None = None) -> Tensor:
-        max_level = self.num_noise_levels - 1
+        max_level = float(self.num_noise_levels - 1)
         if self.closed_loop_denoising_schedule == "global":
             if self.closed_loop_denoising_steps == 1:
-                return torch.tensor([max_level], dtype=torch.long, device=device)
+                return torch.tensor([max_level], dtype=torch.float32, device=device)
             schedule = torch.linspace(
                 max_level,
-                0,
+                0.0,
                 self.closed_loop_denoising_steps,
                 device=device,
-            ).round().long()
+                dtype=torch.float32,
+            )
             schedule[0] = max_level
-            schedule[-1] = 0
+            schedule[-1] = 0.0
             return schedule
 
         if action_steps is None:
             raise ValueError("action_steps is required for temporal closed-loop denoising schedule.")
         if self.closed_loop_denoising_steps == 1:
-            return torch.tensor([max_level], dtype=torch.long, device=device)
+            return torch.full((1, int(action_steps)), max_level, dtype=torch.float32, device=device)
 
         schedule = torch.linspace(
             max_level,
-            0,
+            0.0,
             self.closed_loop_denoising_steps,
             device=device,
-        ).round().long()
+            dtype=torch.float32,
+        )
         schedule[0] = max_level
         time_band = torch.div(
-            torch.arange(int(action_steps), device=device) * max_level,
+            torch.arange(int(action_steps), device=device) * int(max_level),
             int(action_steps),
             rounding_mode="floor",
-        ).long()
+        ).to(dtype=torch.float32)
         return torch.clamp(schedule[:, None] + time_band[None, :], max=max_level)
 
     @staticmethod
     def _expand_closed_loop_mask(mask_template: Tensor, reference_mask: Tensor) -> Tensor:
         if mask_template.ndim == 0:
-            return torch.full_like(reference_mask, int(mask_template.item()))
+            dtype = mask_template.dtype if torch.is_floating_point(mask_template) else reference_mask.dtype
+            return torch.full(reference_mask.shape, mask_template.item(), dtype=dtype, device=reference_mask.device)
         if mask_template.ndim == 1:
-            return mask_template.to(device=reference_mask.device, dtype=reference_mask.dtype).view(1, 1, -1).expand_as(reference_mask)
+            dtype = mask_template.dtype if torch.is_floating_point(mask_template) else reference_mask.dtype
+            return mask_template.to(device=reference_mask.device, dtype=dtype).view(1, 1, -1).expand(reference_mask.shape)
         raise ValueError(f"Closed-loop mask template must be scalar or [Ta], got shape {tuple(mask_template.shape)}.")
+
+    def _closed_loop_reuse_mask_template(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        action_steps: int,
+    ) -> Tensor:
+        shift_chunks = self.replanning_interval // self.backbone.action_chunk
+        shift_chunks = max(1, min(int(shift_chunks), int(action_steps)))
+        tail_start = max(0, int(action_steps) - shift_chunks)
+        mid_split = (shift_chunks + tail_start) // 2
+        alpha_values = torch.tensor(self.closed_loop_reuse_alpha, device=device, dtype=dtype)
+        mask_values = self._mask_level_from_alpha(alpha_values)
+        template = torch.empty(int(action_steps), device=device, dtype=dtype)
+        template[:shift_chunks] = mask_values[0]
+        template[shift_chunks:mid_split] = mask_values[1]
+        template[mid_split:tail_start] = mask_values[2]
+        template[tail_start:] = mask_values[3]
+        return template
+
+    def _reuse_shifted_action(self, previous_action: Tensor) -> Tensor:
+        shift_chunks = self.replanning_interval // self.backbone.action_chunk
+        if shift_chunks <= 0:
+            return previous_action
+        action_steps = int(previous_action.shape[2])
+        shifted = torch.zeros_like(previous_action)
+        if shift_chunks < action_steps:
+            shifted[:, :, : action_steps - shift_chunks] = previous_action[:, :, shift_chunks:]
+        return shifted
+
+    @staticmethod
+    def _apply_reuse_mask_schedule(mask_schedule: Tensor, reuse_mask_template: Tensor | None) -> Tensor:
+        if reuse_mask_template is None:
+            return mask_schedule
+        if mask_schedule.ndim == 1:
+            mask_schedule = mask_schedule[:, None].expand(-1, reuse_mask_template.shape[0])
+        return torch.minimum(mask_schedule, reuse_mask_template.view(1, -1).to(mask_schedule.dtype))
 
     def _future_valid(self, batch: Dict[str, Tensor]) -> Tensor:
         return (
@@ -709,6 +789,7 @@ class MDG(LightningModule):
                 dtype=batch["agent_position"].dtype,
             )
             output_speed = torch.zeros_like(output_heading)
+            previous_pred_action: Tensor | None = None
 
             for segment_start in range(0, self.num_future_steps, self.replanning_interval):
                 seeds = []
@@ -718,14 +799,26 @@ class MDG(LightningModule):
                 generator = torch.Generator(device=batch["agent_position"].device)
                 generator.manual_seed(int(sum(seeds) % (2**63 - 1)))
                 noised_action, mask = self.backbone.full_noise_sample(rollout_batch, generator=generator)
+                reuse_mask_template: Tensor | None = None
+                if self.closed_loop_reuse_actions and previous_pred_action is not None:
+                    reuse_clean_action = self._reuse_shifted_action(previous_pred_action)
+                    reuse_mask_template = self._closed_loop_reuse_mask_template(
+                        device=noised_action.device,
+                        dtype=noised_action.dtype,
+                        action_steps=int(noised_action.shape[2]),
+                    )
+                    mask = self._expand_closed_loop_mask(reuse_mask_template, mask)
+                    noised_action = self._apply_noise(reuse_clean_action, mask, generator=generator)
                 mask_schedule = self._closed_loop_mask_schedule(
                     noised_action.device,
                     action_steps=int(noised_action.shape[2]),
                 )
+                mask_schedule = self._apply_reuse_mask_schedule(mask_schedule, reuse_mask_template)
                 scene = self.backbone.scene_encoder(rollout_batch)
                 pred_pos: Tensor | None = None
                 pred_heading: Tensor | None = None
                 pred_speed: Tensor | None = None
+                pred_action: Tensor | None = None
                 for step_index, mask_template in enumerate(mask_schedule):
                     mask = self._expand_closed_loop_mask(mask_template, mask)
                     pred_action, pred_pos, pred_heading, pred_speed, _, _, _ = self.backbone.denoise_actions(
@@ -741,6 +834,9 @@ class MDG(LightningModule):
                         mask = next_mask
                 if pred_pos is None or pred_heading is None or pred_speed is None:
                     raise RuntimeError("Closed-loop denoising produced no prediction.")
+                if pred_action is None:
+                    raise RuntimeError("Closed-loop denoising produced no action prediction.")
+                previous_pred_action = pred_action.detach()
                 commit = min(self.replanning_interval, self.num_future_steps - segment_start)
                 output_pos[:, :, segment_start : segment_start + commit] = pred_pos[:, :, :commit]
                 output_heading[:, :, segment_start : segment_start + commit] = pred_heading[:, :, :commit]
