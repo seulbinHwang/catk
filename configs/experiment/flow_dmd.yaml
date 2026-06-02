@@ -124,3 +124,10 @@ data:
   prefetch_factor: 1
   train_use_eval_agent_selection: true
   train_epoch_sample_fraction: 0.5
+
+# wandb: 사용자(se99an) 계정의 clsft-catk 프로젝트로 로깅 (다른 OCSC/clsft 실험과 동일 위치).
+# repo 기본값(jksg01019-naver-labs / SMART-FLOW)은 권한/위치가 달라 override.
+logger:
+  wandb:
+    project: clsft-catk
+    entity: se99an
