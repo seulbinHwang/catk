@@ -2604,6 +2604,15 @@ class SMARTFlow(LightningModule):
         #   target = (x_gen − g_n).detach(),  L_gen = 0.5·MSE(x_gen, target)
         # β=1 vanilla / β<1 diversity↑ / β>1 sharpening.  (구 path_step_size·guidance-τ·
         # |committed−real| normalizer 는 OCSC 와 불일치라 제거.)
+        #
+        # ★ conditioning 공유 (OCSC cond_d 정합): OCSC 는 generator 인코더의 anchor hidden
+        # cond_d 1개를 real/fake score 가 공유하고 flow_decoder 가중치만 다르게 평가한다.
+        # 본 포트는 score 평가에서 teacher/estimator 가 각자 인코더로 anchor_hidden 을
+        # 재인코딩하지만, flow_dmd recipe 의 unfrozen_range=full_flow_decoder 로 generator/
+        # teacher/estimator 의 인코더가 모두 frozen-identical(=pretrained) 로 고정되므로
+        # 재인코딩 결과가 byte-identical → 동일 x_t·동일 conditioning 에서 flow_decoder 만
+        # 다른 OCSC 평가와 행동적으로 동치다.  (인코더를 학습시키는 scope 로 바꾸면 이
+        # 등가성이 깨지므로, 그때는 명시적 cond_d 주입이 필요하다.)
         if str(self.self_forced_distribution_matching_objective) != "dmd":
             raise ValueError(
                 "renew 포트 이후에는 OCSC self_forcing_dmd objective 만 지원합니다; "

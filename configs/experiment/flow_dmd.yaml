@@ -60,7 +60,14 @@ model:
       use_stop_motion: false
       # fresh finetune 은 pretrained Generator 로 target_teacher/critic/EMA sync.
       initialize_aux_from_generator_on_fit_start: true
-      unfrozen_range: except_map_encoder
+      # ── OCSC self_forcing_dmd 정합 (★ conditioning 공유) ──────────────
+      # full_flow_decoder = generator·critic 모두 agent_encoder.flow_decoder 만 학습,
+      # context/map 인코더는 freeze. teacher 는 전체 freeze.
+      # → gen/teacher/critic 의 인코더가 항상 frozen-identical → anchor conditioning
+      #   (anchor_hidden) 이 byte-identical → OCSC 의 단일 cond_d 공유와 행동적 동치.
+      #   real/fake score 는 동일 x_t·동일 conditioning 에서 flow_decoder 가중치만
+      #   다르게 평가됨 (OCSC ref vs fake_score 와 bit-정합).
+      unfrozen_range: full_flow_decoder
       # Generator EMA (Self-Forcing 표준). 0.0 이면 validation 이 online weight 사용.
       ema_weight: 0.99
       ema_start_step: 50
