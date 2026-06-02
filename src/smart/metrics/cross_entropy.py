@@ -19,7 +19,7 @@ from torch.nn.functional import cross_entropy
 from torchmetrics.metric import Metric
 
 from .utils import (
-    SPATIAL_SMOOTHING_MODE_THINKLAB,
+    SPATIAL_SMOOTHING_MODE_PAPER,
     get_euclidean_targets,
     get_prob_targets,
     get_prob_targets_from_index,
@@ -40,7 +40,7 @@ class CrossEntropy(Metric):
         label_smoothing: float,
         rollout_as_gt: bool,
         spatial_aware_smoothing: bool = False,
-        spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_THINKLAB,
+        spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_PAPER,
     ) -> None:
         super().__init__()
         self.use_gt_raw = use_gt_raw
@@ -72,6 +72,7 @@ class CrossEntropy(Metric):
         # ! for tokenization
         token_agent_shape: Tensor,  # [n_agent, 2]
         token_traj: Tensor,  # [n_agent, n_token, 4, 2]
+        token_trajectory: Optional[Tensor | dict[str, Tensor]] = None,
         # ! for filtering intersting agent for training
         train_mask: Optional[Tensor] = None,  # [n_agent]
         # ! for rollout_as_gt
@@ -129,10 +130,16 @@ class CrossEntropy(Metric):
             for agent_type, mask in type_mask.items():
                 if not bool(mask.any()) or agent_type not in next_token_logits:
                     continue
+                token_trajectory_type = (
+                    token_trajectory.get(agent_type)
+                    if isinstance(token_trajectory, dict)
+                    else None
+                )
                 if use_direct_gt_idx:
                     prob_target = get_prob_targets_from_index(
                         gt_idx=gt_idx_by_type[agent_type],
                         token_traj=token_traj[agent_type],
+                        token_trajectory=token_trajectory_type,
                         label_smoothing=self.label_smoothing,
                         spatial_aware_smoothing=self.spatial_aware_smoothing,
                         spatial_aware_smoothing_mode=self.spatial_aware_smoothing_mode,
@@ -158,6 +165,7 @@ class CrossEntropy(Metric):
                 prob_target = get_prob_targets_from_index(
                     gt_idx=gt_idx,
                     token_traj=token_traj,
+                    token_trajectory=token_trajectory if isinstance(token_trajectory, Tensor) else None,
                     label_smoothing=self.label_smoothing,
                     spatial_aware_smoothing=self.spatial_aware_smoothing,
                     spatial_aware_smoothing_mode=self.spatial_aware_smoothing_mode,

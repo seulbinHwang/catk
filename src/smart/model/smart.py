@@ -451,6 +451,7 @@ class SMART(LightningModule):
                 agent_type: self._repeat_tensor_on_first_dim(value, repeat_count)
                 for agent_type, value in tokenized_agent["token_traj"].items()
             },
+            "token_trajectory": tokenized_agent["token_trajectory"],
             "trajectory_token_veh": tokenized_agent["trajectory_token_veh"],
             "trajectory_token_ped": tokenized_agent["trajectory_token_ped"],
             "trajectory_token_cyc": tokenized_agent["trajectory_token_cyc"],
@@ -650,6 +651,7 @@ class SMART(LightningModule):
             **pred,
             token_agent_shape=tokenized_agent["token_agent_shape"],  # [n_agent, 2]
             token_traj=tokenized_agent["token_traj"],  # [n_agent, n_token, 4, 2]
+            token_trajectory=tokenized_agent["token_trajectory"],  # type -> [n_token, 5, 3]
             train_mask=train_mask,  # [n_agent]
             current_epoch=self.current_epoch,
         )
@@ -667,6 +669,7 @@ class SMART(LightningModule):
                 **pred,
                 token_agent_shape=tokenized_agent["token_agent_shape"],  # [n_agent, 2]
                 token_traj=tokenized_agent["token_traj"],  # [n_agent, n_token, 4, 2]
+                token_trajectory=tokenized_agent["token_trajectory"],  # type -> [n_token, 5, 3]
             )
 
             if isinstance(pred["next_token_logits"], dict):

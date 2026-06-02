@@ -11,7 +11,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -19,29 +19,63 @@ from torch.nn.functional import one_hot
 
 from src.smart.utils import cal_polygon_contour, transform_to_local, wrap_angle
 
+SPATIAL_SMOOTHING_MODE_PAPER = "paper"
 SPATIAL_SMOOTHING_MODE_THINKLAB = "thinklab"
 SPATIAL_SMOOTHING_MODE_NORMALIZED = "normalized"
 SPATIAL_SMOOTHING_MODES = {
+    SPATIAL_SMOOTHING_MODE_PAPER,
     SPATIAL_SMOOTHING_MODE_THINKLAB,
     SPATIAL_SMOOTHING_MODE_NORMALIZED,
 }
+SPATIAL_SMOOTHING_DISTANCE_CHUNK_SIZE = 512
+
+
+def _token_trajectory_distance_from_index(
+    gt_idx: Tensor,
+    token_trajectory: Tensor,  # [n_token, 5, 3]
+) -> Tensor:
+    flat_gt_idx = gt_idx.reshape(-1)
+    if flat_gt_idx.numel() == 0:
+        return token_trajectory.new_empty(*gt_idx.shape, token_trajectory.shape[0])
+    gt_token_trajectory = token_trajectory[flat_gt_idx]
+    dist_chunks = []
+    for start in range(
+        0,
+        gt_token_trajectory.shape[0],
+        SPATIAL_SMOOTHING_DISTANCE_CHUNK_SIZE,
+    ):
+        end = min(
+            start + SPATIAL_SMOOTHING_DISTANCE_CHUNK_SIZE,
+            gt_token_trajectory.shape[0],
+        )
+        gt_chunk = gt_token_trajectory[start:end]
+        pos_delta = gt_chunk[:, None, :, :2] - token_trajectory[None, :, :, :2]
+        head_delta = wrap_angle(
+            gt_chunk[:, None, :, 2] - token_trajectory[None, :, :, 2]
+        )
+        dist_chunks.append(
+            torch.sqrt(pos_delta.square().sum(-1) + head_delta.square()).mean(-1)
+        )
+    return torch.cat(dist_chunks, dim=0).view(*gt_idx.shape, token_trajectory.shape[0])
 
 
 @torch.no_grad()
 def get_prob_targets_from_index(
     gt_idx: Tensor,  # [n_agent, n_step]
     token_traj: Tensor,  # [n_agent, n_token, 4, 2]
+    token_trajectory: Optional[Tensor] = None,  # [n_token, 5, 3]
     label_smoothing: float = 0.0,
     spatial_aware_smoothing: bool = False,
-    spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_THINKLAB,
+    spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_PAPER,
 ) -> Tensor:  # [n_agent, n_step, n_token] prob
-    closest_token_mask = one_hot(gt_idx, num_classes=token_traj.shape[1]).to(bool)
+    n_token = token_trajectory.shape[0] if token_trajectory is not None else token_traj.shape[1]
+    closest_token_mask = one_hot(gt_idx, num_classes=n_token).to(bool)
     prob_target = torch.zeros(
         gt_idx.shape[0],
         gt_idx.shape[1],
-        token_traj.shape[1],
+        n_token,
         device=gt_idx.device,
-        dtype=token_traj.dtype,
+        dtype=(token_trajectory.dtype if token_trajectory is not None else token_traj.dtype),
     )
 
     if label_smoothing <= 0:
@@ -57,15 +91,18 @@ def get_prob_targets_from_index(
             f"{sorted(SPATIAL_SMOOTHING_MODES)}, got {spatial_aware_smoothing_mode!r}."
         )
 
-    gt_token_traj = torch.gather(
-        token_traj,
-        dim=1,
-        index=gt_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 4, 2),
-    )
-    dists = torch.norm(
-        gt_token_traj[:, :, None, :, :] - token_traj[:, None, :, :, :],
-        dim=-1,
-    ).mean(-1)
+    if token_trajectory is not None:
+        dists = _token_trajectory_distance_from_index(gt_idx, token_trajectory)
+    else:
+        gt_token_traj = torch.gather(
+            token_traj,
+            dim=1,
+            index=gt_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 4, 2),
+        )
+        dists = torch.norm(
+            gt_token_traj[:, :, None, :, :] - token_traj[:, None, :, :, :],
+            dim=-1,
+        ).mean(-1)
     prob_target[closest_token_mask] = 1.0 - label_smoothing
     inv_sq_dist = 1.0 / ((1.0e-4 + dists) ** 2)
     inv_sq_dist = inv_sq_dist.masked_fill(closest_token_mask, 0.0)
@@ -84,7 +121,7 @@ def get_prob_targets(
     token_traj: Tensor,  # [n_agent, n_token, 4, 2]
     label_smoothing: float = 0.0,
     spatial_aware_smoothing: bool = False,
-    spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_THINKLAB,
+    spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_PAPER,
 ) -> Tensor:  # [n_agent, n_step, n_token] prob
     # ! tokenize to index, then compute prob
     contour = cal_polygon_contour(
@@ -103,6 +140,7 @@ def get_prob_targets(
     return get_prob_targets_from_index(
         gt_idx=target_token_index,
         token_traj=token_traj,
+        token_trajectory=None,
         label_smoothing=label_smoothing,
         spatial_aware_smoothing=spatial_aware_smoothing,
         spatial_aware_smoothing_mode=spatial_aware_smoothing_mode,
