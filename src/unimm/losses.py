@@ -16,27 +16,16 @@ def unimm_nll_loss(
     """Continuous UniMM regression NLL.
 
     Position uses independent Laplace distributions. Heading uses independent
-    von Mises distributions. The trajectory likelihood is reduced by summing
-    valid timesteps within each agent/context row, then averaging valid rows.
+    von Mises distributions. The loss is averaged over valid timesteps so the
+    regression term stays on the same optimization scale as anchor
+    classification, including late rollout contexts with partial future labels.
     """
 
     per_step, weights = _unimm_per_step_nll(pred, target_local, target_valid)
-    per_row = (per_step * weights).sum(dim=-1)
-    valid_row = weights.sum(dim=-1) > 0
-    if not bool(valid_row.any()):
+    denom = weights.sum()
+    if not bool(denom > 0):
         return per_step.sum() * 0.0
-    return per_row[valid_row].mean()
-
-
-def unimm_per_step_nll_loss(
-    pred: Dict[str, Tensor],
-    target_local: Tensor,
-    target_valid: Tensor,
-) -> Tensor:
-    """Mean per-valid-timestep NLL for logging the old loss scale."""
-
-    per_step, weights = _unimm_per_step_nll(pred, target_local, target_valid)
-    return (per_step * weights).sum() / weights.sum().clamp_min(1.0)
+    return (per_step * weights).sum() / denom
 
 
 def _unimm_per_step_nll(

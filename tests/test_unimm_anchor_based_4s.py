@@ -15,7 +15,7 @@ from scripts.build_unimm_anchors import (
     minibatch_kmeans,
     nearest_anchor_assignment,
 )
-from src.unimm.losses import unimm_classification_loss, unimm_nll_loss, unimm_per_step_nll_loss
+from src.unimm.losses import unimm_classification_loss, unimm_nll_loss
 from src.unimm.model.anchor_based_4s import UniMMAnchorBased4s
 from src.unimm.processor import UniMMProcessor
 
@@ -186,7 +186,7 @@ def test_unimm_classification_loss_uses_positive_matching_horizon_only():
     assert loss.item() == 0.0
 
 
-def test_unimm_regression_loss_sums_timesteps_then_averages_rows():
+def test_unimm_regression_loss_averages_valid_timesteps():
     pred = {
         "mean_pos": torch.zeros(2, 3, 5, 2),
         "pos_scale": torch.ones(2, 3, 5, 2),
@@ -198,13 +198,13 @@ def test_unimm_regression_loss_sums_timesteps_then_averages_rows():
     target_valid[0, 0, :] = True
     target_valid[0, 1, :2] = True
 
-    loss_traj_sum = unimm_nll_loss(pred, target_local, target_valid)
-    loss_per_step = unimm_per_step_nll_loss(pred, target_local, target_valid)
+    loss = unimm_nll_loss(pred, target_local, target_valid)
+    per_step_loss = unimm_nll_loss(pred, target_local, target_valid[0:1, 0:1])
 
-    assert torch.allclose(loss_traj_sum, loss_per_step * 3.5)
+    assert torch.allclose(loss, per_step_loss)
 
 
-def test_unimm_regression_loss_is_horizon_sum_for_full_valid_rows():
+def test_unimm_regression_loss_scale_is_horizon_invariant():
     pred = {
         "mean_pos": torch.zeros(2, 3, 40, 2),
         "pos_scale": torch.ones(2, 3, 40, 2),
@@ -214,10 +214,16 @@ def test_unimm_regression_loss_is_horizon_sum_for_full_valid_rows():
     target_local = torch.zeros(2, 3, 40, 3)
     target_valid = torch.ones(2, 3, 40, dtype=torch.bool)
 
-    loss_traj_sum = unimm_nll_loss(pred, target_local, target_valid)
-    loss_per_step = unimm_per_step_nll_loss(pred, target_local, target_valid)
+    full_horizon_loss = unimm_nll_loss(pred, target_local, target_valid)
+    short_pred = {
+        "mean_pos": pred["mean_pos"][..., :5, :],
+        "pos_scale": pred["pos_scale"][..., :5, :],
+        "mean_head": pred["mean_head"][..., :5],
+        "head_concentration": pred["head_concentration"][..., :5],
+    }
+    short_horizon_loss = unimm_nll_loss(short_pred, target_local[..., :5, :], target_valid[..., :5])
 
-    assert torch.allclose(loss_traj_sum, loss_per_step * 40)
+    assert torch.allclose(full_horizon_loss, short_horizon_loss)
 
 
 def test_unimm_minibatch_kmeans_builds_valid_anchor_bank():

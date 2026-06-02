@@ -33,7 +33,7 @@
 | 모델 크기 | K=2048 기준 약 7.1M parameters |
 
 논문에서 명시한 핵심은 `2048 anchors + continuous regression + Tpred=4s + closed-loop samples + approximate posterior policy + Tpost=Tz*=0.5s`다. 현재 구현도 이 조합만 대상으로 한다.
-Regression objective는 trajectory likelihood에 맞춰 valid timestep NLL을 agent/context row 내부에서 합산한 뒤 valid row 평균으로 줄인다. 기존 timestep 평균 스케일은 모니터링용 `loss_reg_per_step` 로그로만 남긴다.
+Regression objective는 valid timestep의 Laplace/von Mises NLL 평균을 사용한다. 이 스케일은 anchor scorer의 classification CE와 균형을 맞춰, 2048개 anchor 중 올바른 component를 고르는 학습 신호가 regression에 압도되지 않게 한다.
 학습 context는 1초 history 끝인 raw step 10부터 8초 rollout 마지막 decision point인 raw step 85까지 `tau=0.5s` 간격으로 만든다. `Tpred=4s` 전체 GT가 남지 않는 late context는 `[40, 3]` target shape을 유지하되 남은 valid future만 supervision에 쓰고 나머지 timestep은 invalid mask로 제외한다.
 
 ## 코드 구조
@@ -450,6 +450,24 @@ DDP fit smoke:
   and train/posterior_accept_rate_ctx_10...ctx_80
 ```
 
+2026-06-02에 regression objective를 per-valid-timestep NLL mean으로 되돌린 뒤 H100 x3x2에서 다시 검증했다. 검증은 `origin/UniMM@103df9e` clean checkout, 실제 `/workspace/womd_v1_3/SMART_cache`, committed full-Lloyd anchor file, `train_batch_size=26`, `val_batch_size=12`, `learning_rate=0.001103970108` 조건으로 실행했다.
+
+```text
+fit + fit-time validation:
+  task_name=unimm_perstep_objective_verify2_20260602
+  2 nodes x 3 H100, train_batch_size=26 per GPU, val_batch_size=12 per GPU
+  trainer.max_epochs=1
+  trainer.limit_train_batches=20
+  trainer.limit_val_batches=1
+  trainer.check_val_every_n_epoch=1
+  model.model_config.n_rollout_closed_val=4
+  result=exit 0
+  train/loss_cls=3.71625
+  train/loss_reg=32.08650
+  train/reg_cls_ratio=8.63410
+  val_open/reg_cls_ratio=6.39625
+```
+
 from-scratch 학습-추론 파이프라인을 짧게 재검증하려면 아래 순서로 돌린다. 이 검증은 안정 기본값인 `train_batch_size=26`, `val_batch_size=12`, H100 x3x2 DDP를 사용하되 batch/epoch 수만 줄여서 학습, 학습 중 validation, checkpoint 저장, explicit validation, test inference를 모두 통과시키는 용도다.
 
 ```bash
@@ -503,7 +521,7 @@ python scripts/launch_unimm_h100x3x2.py \
 실전 full pretrain은 아래처럼 OOM retry wrapper로 시작한다. 처음부터 학습할 때는 `CKPT_PATH`를 지정하지 않는다. wrapper는 CUDA OOM 또는 재시도 가능한 종료가 발생했을 때만 같은 `TASK_NAME`의 최신 checkpoint를 찾아 resume한다.
 
 ```bash
-TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs156_lloyd_trajsum_posteriorcalib_$(date +%Y%m%d_%H%M%S) \
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs156_lloyd_perstep_posteriorcalib_$(date +%Y%m%d_%H%M%S) \
 SESSION=unimm-h100x3x2 \
 MASTER_PORT=29578 \
 INITIAL_BS=26 \
@@ -560,11 +578,11 @@ python scripts/launch_unimm_h100x3x2.py \
 | posterior threshold | category별 raw context `10,15,...,85` nearest-anchor 0.5초 error 95% quantile |
 | train context starts | raw step `10,15,...,85`; late context는 남은 valid future만 supervision |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
-| regression loss reduction | valid timestep NLL을 trajectory 내부에서 sum, valid agent/context row 사이에서 mean |
+| regression loss reduction | valid timestep NLL mean |
 
 이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 156에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
-Loss 로그에서 `loss_reg`와 `loss_reg_traj_sum`은 학습에 쓰는 trajectory-sum NLL이고, `loss_reg_per_step`은 이전 timestep 평균 스케일을 확인하기 위한 보조 지표다. 이 objective scale 변경 후에는 기존 checkpoint resume보다 scratch pretrain을 사용한다.
-closed-loop posterior 품질 진단을 위해 학습 중 `train/posterior_accept_rate`, `train/posterior_error_mean`, `train/posterior_error_p50`, `train/posterior_error_p90`, `train/posterior_error_p95`, `train/posterior_error_over_threshold`, type별 accept rate, context-step별 accept rate를 로깅한다. threshold 값 자체는 논문에 공개되지 않았으므로, RMM 극대화를 위해 `0.80/0.90/0.95/0.99/inf` ablation은 scratch run 기준 validation RMM으로 비교한다.
+Loss 로그에서 `loss_reg`는 학습에 쓰는 per-valid-timestep NLL 평균이고, `reg_cls_ratio`는 scorer classification과 regression의 상대 스케일을 확인하기 위한 진단값이다. objective scale이 달라졌으므로 기존 trajectory-sum checkpoint에서 resume하지 말고 scratch pretrain을 사용한다.
+closed-loop posterior 품질 진단을 위해 학습 중 `train/posterior_accept_rate`, `train/posterior_error_mean`, `train/posterior_error_p50`, `train/posterior_error_p90`, `train/posterior_error_p95`, `train/posterior_error_over_threshold`, type별 accept rate, context-step별 accept rate를 로깅한다.
 
 ## 빠른 검증
 
