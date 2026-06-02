@@ -63,6 +63,14 @@ class EgoGMMSMART(LightningModule):
         self.training_rollout_sampling = model_config.training_rollout_sampling
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
 
+    def _set_checkpoint_metrics(self, metrics: dict[str, torch.Tensor]) -> None:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                trainer.callback_metrics[key] = value.detach()
+
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
         if self.training_rollout_sampling.num_k <= 0:
@@ -213,14 +221,7 @@ class EgoGMMSMART(LightningModule):
         if self.val_closed_loop:
             epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
             epoch_sim_agents_metrics["val_closed/ADE"] = self.minADE.compute()
-            self.log_dict(
-                epoch_sim_agents_metrics,
-                on_epoch=True,
-                prog_bar=False,
-                logger=False,
-                sync_dist=False,
-                batch_size=1,
-            )
+            self._set_checkpoint_metrics(epoch_sim_agents_metrics)
             if self.global_rank == 0:
                 epoch_sim_agents_metrics["epoch"] = (
                     self.log_epoch if self.log_epoch >= 0 else self.current_epoch
