@@ -60,6 +60,10 @@ class MDG(LightningModule):
         self.aux_loss_weight = float(model_config.aux_loss_weight)
         self.action_loss_weight = float(model_config.action_loss_weight)
         self.full_state_loss_weight = float(getattr(model_config, "full_state_loss_weight", 0.0))
+        self.kinematic_chunk_filter = bool(getattr(model_config, "kinematic_chunk_filter", True))
+        self.kinematic_max_step_displacement_m = float(
+            getattr(model_config, "kinematic_max_step_displacement_m", 10.0)
+        )
         self.n_rollout_closed_val = int(model_config.n_rollout_closed_val)
         self.rollout_chunk_size = int(model_config.rollout_chunk_size)
         self.replanning_interval = int(model_config.replanning_interval)
@@ -127,6 +131,11 @@ class MDG(LightningModule):
             raise ValueError(
                 "model_config.closed_loop_denoising_schedule must be 'global' or 'temporal', "
                 f"got {self.closed_loop_denoising_schedule!r}."
+            )
+        if self.kinematic_chunk_filter and self.kinematic_max_step_displacement_m <= 0.0:
+            raise ValueError(
+                "model_config.kinematic_max_step_displacement_m must be positive when "
+                f"kinematic_chunk_filter is enabled, got {self.kinematic_max_step_displacement_m}."
             )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
@@ -470,6 +479,37 @@ class MDG(LightningModule):
             self.backbone.action_chunk,
         ).all(dim=-1)
 
+    def _kinematic_chunk_valid(
+        self,
+        batch: Dict[str, Tensor],
+        chunk_valid: Tensor | None = None,
+    ) -> Tensor:
+        if chunk_valid is None:
+            chunk_valid = self._chunk_valid(batch)
+        if not self.kinematic_chunk_filter:
+            return chunk_valid
+
+        current_pos = batch["agent_position"][:, :, self.num_historical_steps - 1 : self.num_historical_steps, :2]
+        future_pos = batch["agent_position"][
+            :, :, self.num_historical_steps : self.num_historical_steps + self.num_future_steps, :2
+        ]
+        traj_pos = torch.cat((current_pos, future_pos), dim=2)
+
+        current_valid = (
+            batch["agent_valid"].unsqueeze(-1)
+            & batch["agent_valid_mask"][:, :, self.num_historical_steps - 1 : self.num_historical_steps]
+        )
+        traj_valid = torch.cat((current_valid, self._future_valid(batch)), dim=2)
+        step_pair_valid = traj_valid[:, :, 1:] & traj_valid[:, :, :-1]
+        step_displacement = torch.linalg.norm(traj_pos[:, :, 1:] - traj_pos[:, :, :-1], dim=-1)
+        sane_step = (~step_pair_valid) | (step_displacement <= self.kinematic_max_step_displacement_m)
+        sane_chunk = sane_step.reshape(
+            *sane_step.shape[:2],
+            self.backbone.action_steps,
+            self.backbone.action_chunk,
+        ).all(dim=-1)
+        return chunk_valid & sane_chunk
+
     def _chunk_state_loss(
         self,
         pred_chunk_state: Tensor,
@@ -514,7 +554,11 @@ class MDG(LightningModule):
 
     def _training_forward(self, batch: Dict[str, Tensor], batch_idx: int | None = None) -> Dict[str, Tensor]:
         clean_action, clean_chunk_state = self.backbone.clean_actions_and_chunk_state_from_batch(batch)
-        chunk_valid = self._chunk_valid(batch)
+        raw_chunk_valid = self._chunk_valid(batch)
+        chunk_valid = self._kinematic_chunk_valid(batch, raw_chunk_valid)
+        valid_action = chunk_valid.unsqueeze(-1)
+        clean_action = torch.where(valid_action, clean_action, torch.zeros_like(clean_action))
+        clean_chunk_state = torch.where(valid_action, clean_chunk_state, torch.zeros_like(clean_chunk_state))
         mask_level = self._sample_mask_levels(batch, batch_idx=batch_idx)
         noised_action = self._apply_noise(clean_action, mask_level)
         pred_action, pred_pos, pred_heading, pred_speed, pred_chunk_state, scene, aux = self.backbone.denoise_actions(
@@ -551,6 +595,11 @@ class MDG(LightningModule):
             "action_loss": action_loss.detach(),
             "full_state_loss": full_state_loss.detach(),
             "aux_loss": aux_loss.detach(),
+            "valid_chunk_ratio": chunk_valid.to(dtype=state_loss.dtype).mean().detach(),
+            "kinematic_invalid_chunk_ratio": (
+                ((raw_chunk_valid & ~chunk_valid).sum().to(dtype=state_loss.dtype))
+                / raw_chunk_valid.sum().clamp_min(1).to(dtype=state_loss.dtype)
+            ).detach(),
         }
 
     def training_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Tensor:
@@ -560,6 +609,13 @@ class MDG(LightningModule):
         self.log("train/action_loss", out["action_loss"], on_step=True, batch_size=1)
         self.log("train/full_state_loss", out["full_state_loss"], on_step=True, batch_size=1)
         self.log("train/aux_loss", out["aux_loss"], on_step=True, batch_size=1)
+        self.log("train/valid_chunk_ratio", out["valid_chunk_ratio"], on_step=True, batch_size=1)
+        self.log(
+            "train/kinematic_invalid_chunk_ratio",
+            out["kinematic_invalid_chunk_ratio"],
+            on_step=True,
+            batch_size=1,
+        )
         return out["loss"]
 
     def validation_step(self, batch: Dict[str, Tensor], batch_idx: int) -> None:

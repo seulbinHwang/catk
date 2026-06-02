@@ -9,6 +9,8 @@ model_config:
   action_loss_weight: 0.0
   full_state_loss_weight: 0.0
   aux_loss_weight: 5.0
+  kinematic_chunk_filter: true
+  kinematic_max_step_displacement_m: 10.0
   n_rollout_closed_val: 32
   rollout_chunk_size: 1
   replanning_interval: 10
