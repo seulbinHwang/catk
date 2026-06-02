@@ -46,11 +46,23 @@ def set_model_for_finetuning(
         for p in module.parameters():
             p.requires_grad = True
 
+    def _freeze(module: torch.nn.Module | None) -> None:
+        if module is None:
+            return
+        for p in module.parameters():
+            p.requires_grad = False
+
     resolved_finetune_cfg = finetune if finetune_cfg is None else finetune_cfg
 
     if _is_finetune_enabled(resolved_finetune_cfg):
         for p in model.parameters():
             p.requires_grad = False
+
+        if _get_finetune_option(resolved_finetune_cfg, "train_except_map_encoder", False):
+            _unfreeze(model)
+            _freeze(getattr(model, "map_encoder", None))
+            log.info("Unfreezing all model parameters except map_encoder")
+            return
 
         if _get_finetune_option(resolved_finetune_cfg, "train_full_flow_decoder_only", False):
             try:

@@ -49,6 +49,7 @@ model:
       mode: ocsc_ft
       # train_full_flow_decoder_only=false + velocity_head_only=true → velocity_head 만 trainable
       # (OCSC clean 의 flow_velocity_head_only=true 정합).
+      train_except_map_encoder: false
       train_full_flow_decoder_only: false
       velocity_head_only: true
       # OCSC core knob

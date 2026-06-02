@@ -167,6 +167,7 @@ model_config:
     account_name: "h.sb@naverlabs.com"
   finetune:
     enabled: false
+    train_except_map_encoder: false
     train_full_flow_decoder_only: false
     # ── OCSC (Open-Closed Self-Consistency) finetune mode ──────────────────
     # mode 가 "ocsc_ft" 이고 enabled=true 이면 training_step 이 self_forced 대신

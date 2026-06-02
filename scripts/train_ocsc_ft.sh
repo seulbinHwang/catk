@@ -178,6 +178,7 @@ OCSC_LOSS_TEMPORAL_STRIDE="${OCSC_LOSS_TEMPORAL_STRIDE:--1}"
 OCSC_STRICT_ACTIVE_MASK="${OCSC_STRICT_ACTIVE_MASK:-true}"
 OCSC_POSITION_WEIGHT="${OCSC_POSITION_WEIGHT:-1.0}"
 OCSC_HEADING_WEIGHT="${OCSC_HEADING_WEIGHT:-0.01}"
+OCSC_EXCEPT_MAP_ENCODER="${OCSC_EXCEPT_MAP_ENCODER:-false}"
 OCSC_VELOCITY_HEAD_ONLY="${OCSC_VELOCITY_HEAD_ONLY:-true}"
 OCSC_FULL_FLOW_DECODER="${OCSC_FULL_FLOW_DECODER:-false}"
 
@@ -227,7 +228,7 @@ echo "    G(n_rollouts)=${OCSC_N_ROLLOUTS}  M(n_ol_rollouts)=${OCSC_N_OL_ROLLOUT
 echo "    nearest_match=${OCSC_OL_NEAREST_MATCH}  gt_target=${OCSC_GT_TARGET}"
 echo "    use_ref=${OCSC_USE_PRETRAINED_REF}  anchor_idx=${OCSC_ANCHOR_IDX}  match_space=${OCSC_MATCH_SPACE}  loss_window_steps=${OCSC_LOSS_WINDOW_STEPS}  loss_stride=${OCSC_LOSS_TEMPORAL_STRIDE}  strict_active=${OCSC_STRICT_ACTIVE_MASK}"
 echo "    pos_w=${OCSC_POSITION_WEIGHT}  head_w=${OCSC_HEADING_WEIGHT}"
-echo "    velocity_head_only=${OCSC_VELOCITY_HEAD_ONLY}  full_flow_decoder=${OCSC_FULL_FLOW_DECODER}"
+echo "    except_map_encoder=${OCSC_EXCEPT_MAP_ENCODER}  velocity_head_only=${OCSC_VELOCITY_HEAD_ONLY}  full_flow_decoder=${OCSC_FULL_FLOW_DECODER}"
 echo "  Checkpoint: monitor=${CHECKPOINT_MONITOR} mode=${CHECKPOINT_MODE} save_last=${CHECKPOINT_SAVE_LAST}"
 echo "============================================================"
 
@@ -303,6 +304,7 @@ torchrun \
   model.model_config.val_closed_loop="${VAL_CLOSED_LOOP}" \
   model.model_config.finetune.enabled=true \
   model.model_config.finetune.mode=ocsc_ft \
+  model.model_config.finetune.train_except_map_encoder="${OCSC_EXCEPT_MAP_ENCODER}" \
   model.model_config.finetune.velocity_head_only="${OCSC_VELOCITY_HEAD_ONLY}" \
   model.model_config.finetune.train_full_flow_decoder_only="${OCSC_FULL_FLOW_DECODER}" \
   model.model_config.finetune.ocsc_n_rollouts="${OCSC_N_ROLLOUTS}" \
@@ -324,4 +326,6 @@ torchrun \
   ${EVAL_MP_ARG} \
   ${EXTRA_ARGS}
 
-echo "bash $(basename "$0") done!"
+status=$?
+echo "bash $(basename "$0") done! status=${status}"
+exit "${status}"
