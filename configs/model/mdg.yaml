@@ -13,6 +13,7 @@ model_config:
   rollout_chunk_size: 1
   replanning_interval: 10
   closed_loop_denoising_steps: 5
+  closed_loop_denoising_schedule: temporal
   validation_closed_seed: 0
   val_closed_loop: true
   n_batch_sim_agents_metric: 10

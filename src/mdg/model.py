@@ -64,6 +64,9 @@ class MDG(LightningModule):
         self.rollout_chunk_size = int(model_config.rollout_chunk_size)
         self.replanning_interval = int(model_config.replanning_interval)
         self.closed_loop_denoising_steps = int(getattr(model_config, "closed_loop_denoising_steps", 1))
+        self.closed_loop_denoising_schedule = str(
+            getattr(model_config, "closed_loop_denoising_schedule", "temporal")
+        ).lower()
         self.validation_closed_seed = int(model_config.validation_closed_seed)
         self.val_closed_loop = bool(model_config.val_closed_loop)
         self.n_batch_sim_agents_metric = int(model_config.n_batch_sim_agents_metric)
@@ -119,6 +122,11 @@ class MDG(LightningModule):
                 "model_config.backbone.num_noise_levels to avoid repeated discrete mask levels, "
                 f"got closed_loop_denoising_steps={self.closed_loop_denoising_steps}, "
                 f"num_noise_levels={self.num_noise_levels}."
+            )
+        if self.closed_loop_denoising_schedule not in {"global", "temporal"}:
+            raise ValueError(
+                "model_config.closed_loop_denoising_schedule must be 'global' or 'temporal', "
+                f"got {self.closed_loop_denoising_schedule!r}."
             )
 
     def _should_enable_fit_time_checkpoint_only_validation(self) -> bool:
@@ -377,10 +385,26 @@ class MDG(LightningModule):
         )
         return torch.sqrt(alpha) * clean_action + torch.sqrt(1.0 - alpha) * noise
 
-    def _closed_loop_mask_schedule(self, device: torch.device) -> Tensor:
+    def _closed_loop_mask_schedule(self, device: torch.device, action_steps: int | None = None) -> Tensor:
         max_level = self.num_noise_levels - 1
+        if self.closed_loop_denoising_schedule == "global":
+            if self.closed_loop_denoising_steps == 1:
+                return torch.tensor([max_level], dtype=torch.long, device=device)
+            schedule = torch.linspace(
+                max_level,
+                0,
+                self.closed_loop_denoising_steps,
+                device=device,
+            ).round().long()
+            schedule[0] = max_level
+            schedule[-1] = 0
+            return schedule
+
+        if action_steps is None:
+            raise ValueError("action_steps is required for temporal closed-loop denoising schedule.")
         if self.closed_loop_denoising_steps == 1:
             return torch.tensor([max_level], dtype=torch.long, device=device)
+
         schedule = torch.linspace(
             max_level,
             0,
@@ -388,8 +412,20 @@ class MDG(LightningModule):
             device=device,
         ).round().long()
         schedule[0] = max_level
-        schedule[-1] = 0
-        return schedule
+        time_band = torch.div(
+            torch.arange(int(action_steps), device=device) * max_level,
+            int(action_steps),
+            rounding_mode="floor",
+        ).long()
+        return torch.clamp(schedule[:, None] + time_band[None, :], max=max_level)
+
+    @staticmethod
+    def _expand_closed_loop_mask(mask_template: Tensor, reference_mask: Tensor) -> Tensor:
+        if mask_template.ndim == 0:
+            return torch.full_like(reference_mask, int(mask_template.item()))
+        if mask_template.ndim == 1:
+            return mask_template.to(device=reference_mask.device, dtype=reference_mask.dtype).view(1, 1, -1).expand_as(reference_mask)
+        raise ValueError(f"Closed-loop mask template must be scalar or [Ta], got shape {tuple(mask_template.shape)}.")
 
     def _future_valid(self, batch: Dict[str, Tensor]) -> Tensor:
         return (
@@ -597,7 +633,6 @@ class MDG(LightningModule):
     @torch.no_grad()
     def generate_closed_loop_rollouts(self, batch: Dict[str, Tensor], num_rollouts: int) -> Dict[str, Tensor]:
         rollout_chunks: List[Dict[str, Tensor]] = []
-        mask_schedule = [int(level) for level in self._closed_loop_mask_schedule(torch.device("cpu")).tolist()]
         for start in range(0, int(num_rollouts), self.rollout_chunk_size):
             chunk_rollouts = min(self.rollout_chunk_size, int(num_rollouts) - start)
             rollout_batch = self._clone_batch_for_rollout(batch, chunk_rollouts)
@@ -627,13 +662,16 @@ class MDG(LightningModule):
                 generator = torch.Generator(device=batch["agent_position"].device)
                 generator.manual_seed(int(sum(seeds) % (2**63 - 1)))
                 noised_action, mask = self.backbone.full_noise_sample(rollout_batch, generator=generator)
+                mask_schedule = self._closed_loop_mask_schedule(
+                    noised_action.device,
+                    action_steps=int(noised_action.shape[2]),
+                )
                 scene = self.backbone.scene_encoder(rollout_batch)
                 pred_pos: Tensor | None = None
                 pred_heading: Tensor | None = None
                 pred_speed: Tensor | None = None
-                for step_index, noise_level in enumerate(mask_schedule):
-                    if step_index > 0:
-                        mask = torch.full_like(mask, noise_level)
+                for step_index, mask_template in enumerate(mask_schedule):
+                    mask = self._expand_closed_loop_mask(mask_template, mask)
                     pred_action, pred_pos, pred_heading, pred_speed, _, _, _ = self.backbone.denoise_actions(
                         rollout_batch,
                         noised_action,
@@ -642,8 +680,7 @@ class MDG(LightningModule):
                         compute_aux=False,
                     )
                     if step_index + 1 < len(mask_schedule):
-                        next_level = mask_schedule[step_index + 1]
-                        next_mask = torch.full_like(mask, next_level)
+                        next_mask = self._expand_closed_loop_mask(mask_schedule[step_index + 1], mask)
                         noised_action = self._apply_noise(pred_action, next_mask, generator=generator)
                         mask = next_mask
                 if pred_pos is None or pred_heading is None or pred_speed is None:
