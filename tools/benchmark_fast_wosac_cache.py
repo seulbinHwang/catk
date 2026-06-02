@@ -171,7 +171,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     metric = SimAgentsMetrics("bench", max_workers=args.max_workers)
     pass_seconds: list[float] = []
     pass_metrics: list[dict[str, float]] = []
-    pass_cache_metrics: list[dict[str, float]] = []
     for pass_idx in range(args.passes):
         if args.clear_before_each_pass:
             _clear_target_caches()
@@ -179,11 +178,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         start = time.perf_counter()
         metric.update_from_prediction_payloads(payloads)
         metrics = _metric_tensors_to_scalars(metric.compute())
-        cache_metrics = metric.get_cache_metrics(reset=False)
         _sync_device(device)
         pass_seconds.append(time.perf_counter() - start)
         pass_metrics.append(metrics)
-        pass_cache_metrics.append(cache_metrics)
         metric.reset()
 
     first_metrics = pass_metrics[0]
@@ -217,7 +214,6 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "max_repeat_metric_delta": float(max_repeat_delta),
         "metric_keys": sorted(first_metrics),
         "metrics_first_pass": first_metrics,
-        "cache_metrics_by_pass": pass_cache_metrics,
     }
     return summary
 

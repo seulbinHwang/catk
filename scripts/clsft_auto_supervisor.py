@@ -443,8 +443,6 @@ class Supervisor:
             "N_BATCH_SIM_AGENTS_METRIC": "100000",
             "SCORER_SCENE_NUM": "1728",
             "SIM_AGENTS_METRIC_WORKERS": "8",
-            "CATK_FAST_WOSAC_GT_CACHE_MAX_SCENARIOS": "50000",
-            "CATK_FAST_WOSAC_LOG_FEATURE_CACHE_MAX_SCENARIOS": "50000",
             "VAL_OPEN_LOOP": "true",
             "VAL_CLOSED_LOOP": "true",
             "N_VIS_BATCH": "0",
