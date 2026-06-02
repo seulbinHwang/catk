@@ -66,6 +66,35 @@ def test_flow_token_processor_no_longer_exposes_topk_sampling_config() -> None:
     assert not hasattr(processor, "agent_token_sampling")
 
 
+def test_token_processor_normalizes_extra_dim_agent_type() -> None:
+    processor = FlowTokenProcessor(
+        map_token_file="map_traj_token5.pkl",
+        agent_token_file="agent_vocab_555_s2.pkl",
+        flow_window_steps=20,
+        use_kinematic_control_flow=True,
+        control_vehicle_yaw_scale_rad=0.025,
+        control_pedestrian_yaw_scale_rad=0.20,
+        control_cyclist_yaw_scale_rad=0.06,
+    )
+    agent_type = torch.tensor([0, 1, 2], dtype=torch.uint8)
+    agent_type_singleton = agent_type.view(3, 1)
+    agent_type_one_hot = torch.nn.functional.one_hot(
+        agent_type.long(),
+        num_classes=3,
+    ).view(3, 1, 3)
+
+    torch.testing.assert_close(processor._normalize_agent_type(agent_type), agent_type)
+    torch.testing.assert_close(processor._normalize_agent_type(agent_type_singleton), agent_type)
+    torch.testing.assert_close(
+        processor._normalize_agent_type(agent_type_one_hot),
+        agent_type.long(),
+    )
+    torch.testing.assert_close(
+        processor._get_agent_shape(agent_type_one_hot),
+        processor._get_agent_shape(agent_type),
+    )
+
+
 def test_train_sampled_agent_token_matches_gt_token() -> None:
     processor = FlowTokenProcessor(
         map_token_file="map_traj_token5.pkl",
