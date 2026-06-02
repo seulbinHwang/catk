@@ -278,7 +278,7 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | branch | `trajtok` |
 | pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
-| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_oom_retry_trajtok_hidden124_trainselectfalse_20260602` |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_lr75e4_oom_retry_trajtok_hidden124_trainselectfalse_20260602` |
 | remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_hidden124_20260602` |
 | experiment | `pre_bc_a100x4x2` |
 | model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global token matching |
@@ -287,7 +287,7 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | train batch | `INITIAL_BS=18` per rank, effective global batch 108 |
 | OOM retry | `MIN_BS=14`, `OOM_STEP=1`, latest task checkpoint resume |
 | validation/test batch | `VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12` |
-| optimizer schedule | `lr=6e-4`, `lr_warmup_steps=4`, `lr_min_ratio=1e-2` from `pre_bc_a100x4x2` |
+| optimizer schedule | `lr=7.5e-4`, `lr_warmup_steps=4`, `lr_min_ratio=1e-2`; LR is sqrt-scaled from the paper recipe `5e-4 * sqrt(108 / 48)` |
 | precision / grad accumulation | `bf16-mixed`, `accumulate_grad_batches=1` |
 | train augmentation | `random_scene_scale_config: [0.8, 1.2]`, `random_time_shift_config.MAX_TIME_SHIFT=5` |
 | agent selection | `data.train_use_eval_agent_selection=false` |
