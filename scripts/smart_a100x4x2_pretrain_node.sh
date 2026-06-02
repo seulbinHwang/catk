@@ -52,6 +52,7 @@ HYDRA_OVERRIDES=(
   "trainer=ddp"
   "action=${ACTION:-fit}"
   "task_name=${TASK_NAME}"
+  "hydra.run.dir=${PROJECT_ROOT}/logs/${TASK_NAME}/runs/${RUN_ID:-$(date +%Y-%m-%d_%H-%M-%S)}"
   "paths.cache_root=${CACHE_ROOT}"
   "trainer.devices=${NPROC_PER_NODE}"
   "trainer.num_nodes=${NNODES}"
@@ -65,6 +66,9 @@ if [[ -n "${LIMIT_TRAIN_BATCHES:-}" ]]; then
 fi
 if [[ -n "${LIMIT_VAL_BATCHES:-}" ]]; then
   HYDRA_OVERRIDES+=("trainer.limit_val_batches=${LIMIT_VAL_BATCHES}")
+fi
+if [[ -n "${LIMIT_TEST_BATCHES:-}" ]]; then
+  HYDRA_OVERRIDES+=("trainer.limit_test_batches=${LIMIT_TEST_BATCHES}")
 fi
 if [[ -n "${MAX_EPOCHS:-}" ]]; then
   HYDRA_OVERRIDES+=("trainer.max_epochs=${MAX_EPOCHS}")

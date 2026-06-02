@@ -29,6 +29,11 @@ from src.utils import (
     log_hyperparameters,
     print_config_tree,
 )
+from src.utils.waymo_submission import (
+    cleanup_prepared_waymo_storage_state,
+    maybe_prepare_waymo_storage_state,
+    maybe_submit_waymo_submission,
+)
 
 log = RankedLogger(__name__, rank_zero_only=True)
 
@@ -93,14 +98,20 @@ def run(cfg: DictConfig) -> None:
 @hydra.main(config_path="../configs/", config_name="run.yaml", version_base=None)
 def main(cfg: DictConfig) -> None:
     torch.set_printoptions(precision=3)
+    prepared_waymo_storage_state = None
 
-    log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
-    print_config_tree(cfg, resolve=True, save_to_file=True)
+    try:
+        prepared_waymo_storage_state = maybe_prepare_waymo_storage_state(cfg)
 
-    run(cfg)  # train/val/test the model
+        log.info("Printing config tree with Rich! <cfg.extras.print_config=True>")
+        print_config_tree(cfg, resolve=True, save_to_file=True)
 
-    log.info("Closing wandb!")
-    wandb.finish()
+        run(cfg)  # train/val/test the model
+        maybe_submit_waymo_submission(cfg)
+    finally:
+        cleanup_prepared_waymo_storage_state(prepared_waymo_storage_state)
+        log.info("Closing wandb!")
+        wandb.finish()
     log.info(f"Output dir: {cfg.paths.output_dir}")
 
 

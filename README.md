@@ -266,6 +266,80 @@ for pod in testa testaa; do
 done
 ```
 
+### testa/testaa A100x4x2 Waymo Sim Agents 2025 제출
+
+학습이 끝난 checkpoint로 full validation set 또는 full test set에 대해 closed-loop rollout을 만들고, Waymo Sim Agents 2025 제출 archive를 만든 뒤 웹페이지에 자동 업로드하려면 아래 wrapper를 사용한다. 두 스크립트 모두 기존 `testa` / `testaa` pod 안에서만 tmux를 띄우며, pod를 만들거나 삭제하거나 재시작하지 않는다.
+
+validation set 제출:
+
+```bash
+CKPT_PATH=/mnt/nuplan/projects/catk/checkpoints/<run>/epoch_last.ckpt \
+TASK_NAME=smart_waymo_val_epochXXX_a100x4x2 \
+bash scripts/start_smart_a100x4x2_testa_waymo_val_submission.sh
+```
+
+test set 제출:
+
+```bash
+CKPT_PATH=/mnt/nuplan/projects/catk/checkpoints/<run>/epoch_last.ckpt \
+TASK_NAME=smart_waymo_test_epochXXX_a100x4x2 \
+bash scripts/start_smart_a100x4x2_testa_waymo_test_submission.sh
+```
+
+기본 실행 조건은 아래와 같다.
+
+| 항목 | validation 제출 | test 제출 |
+|---|---|---|
+| action | `validate` | `test` |
+| experiment | `sim_agents_sub` | `sim_agents_sub` |
+| branch | `SMART` | `SMART` |
+| pods | `testa testaa` | `testa testaa` |
+| GPU | A100 8개 | A100 8개 |
+| cache root | `/workspace/womd_v1_3/SMART_RAW_cache` | `/workspace/womd_v1_3/SMART_RAW_cache` |
+| rollout 수 | `32` | `32` |
+| rollout 후보 폭 | `top_k=48` | `top_k=48` |
+| metric path | Waymo Sim Agents 2025 | Waymo Sim Agents 2025 |
+| output | `sim_agents_2025_submission.tar.gz` | `sim_agents_2025_submission.tar.gz` |
+| auto upload | enabled | enabled |
+
+자동 업로드에는 Waymo 로그인 상태 파일이 필요하다. 기본 위치는 pod 안의 project root 기준 아래 경로다.
+
+```text
+secrets/waymo/waymo_storage_state.json
+```
+
+GUI가 있는 머신에서 로그인 상태를 만들 때는 아래 명령을 사용한다.
+
+```bash
+python scripts/waymo_save_storage_state.py --browser-channel chrome
+```
+
+다른 위치에 저장된 로그인 상태 파일을 쓰려면 실행 시 명시한다.
+
+```bash
+WAYMO_STORAGE_STATE_PATH=/path/to/waymo_storage_state.json \
+CKPT_PATH=/path/to/epoch_last.ckpt \
+bash scripts/start_smart_a100x4x2_testa_waymo_val_submission.sh
+```
+
+`CKPT_PATH`가 master pod인 `testa`에만 있으면 launcher가 같은 path로 `testaa`에 복사하고 파일 크기를 확인한 뒤 DDP 실행을 시작한다. launcher는 한 번 정한 `RUN_ID`를 모든 rank에 공통으로 전달해서 모든 shard가 같은 `logs/<TASK_NAME>/runs/<RUN_ID>/` 아래에 저장되도록 강제한다. `testa`와 `testaa`는 같은 경로 문자열을 쓰더라도 실제 파일시스템이 공유되지 않을 수 있으므로, 제출 shard는 기본적으로 `testaa`에서 `testa`로 스트리밍 수집된다.
+
+rollout은 끝났지만 shard 수집, archive 생성, 업로드 단계만 실패했다면 rollout을 다시 돌리지 않고 아래 복구 스크립트를 쓴다.
+
+```bash
+python scripts/finalize_smart_a100x4x2_testa_waymo_submission.py \
+  --run-dir /mnt/nuplan/projects/catk/logs/<TASK_NAME>/runs/<RUN_ID> \
+  --upload
+```
+
+이미 archive까지 만들어졌고 업로드만 재시도하려면:
+
+```bash
+python scripts/finalize_smart_a100x4x2_testa_waymo_submission.py \
+  --run-dir /mnt/nuplan/projects/catk/logs/<TASK_NAME>/runs/<RUN_ID> \
+  --skip-copy --skip-archive --upload
+```
+
 이 branch에서는 legacy metric/submission 경로를 지원하지 않는다. validation과 submission 관련 metric은 Waymo Sim Agents 2025 경로만 사용한다.
 
 ## Run the code
