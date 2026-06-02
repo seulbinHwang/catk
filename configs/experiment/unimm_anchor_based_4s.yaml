@@ -13,6 +13,7 @@ trainer:
   check_val_every_n_epoch: 16
   precision: bf16-mixed
   gradient_clip_val: 0.5
+  use_distributed_sampler: false
 
 callbacks:
   model_checkpoint:

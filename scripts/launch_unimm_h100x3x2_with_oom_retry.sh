@@ -2,7 +2,7 @@
 # Launch UniMM Anchor-Based-4s on hsb-npc-training-3-{1,2} with automatic
 # CUDA OOM fallback.
 #
-# The first attempt starts at INITIAL_BS=26 by default. If any pod log contains
+# The first attempt starts at INITIAL_BS=30 by default. If any pod log contains
 # a CUDA OOM marker, the script stops the distributed job, finds the newest
 # epoch_last.ckpt under the same task name, lowers data.train_batch_size by
 # OOM_STEP, and starts the next attempt from that checkpoint. Non-OOM exits such
@@ -19,13 +19,13 @@ PODS="${PODS:-hsb-npc-training-3-1 hsb-npc-training-3-2}"
 PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_unimm_h100x3x2}"
 REPO_URL="${REPO_URL:-https://github.com/seulbinHwang/catk.git}"
 BRANCH="${BRANCH:-UniMM}"
-TASK_NAME="${TASK_NAME:-unimm_anchor_based_4s_h100x3x2_pretrain_globalbs156_oom_retry}"
+TASK_NAME="${TASK_NAME:-unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_oom_retry}"
 SESSION="${SESSION:-unimm-h100x3x2}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
 CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
 ANCHOR_FILE="${ANCHOR_FILE:-}"
 MASTER_PORT="${MASTER_PORT:-29551}"
-INITIAL_BS="${INITIAL_BS:-26}"
+INITIAL_BS="${INITIAL_BS:-30}"
 OOM_STEP="${OOM_STEP:-2}"
 MAX_SAME_BS_OOM_RETRIES="${MAX_SAME_BS_OOM_RETRIES:-3}"
 MIN_BS="${MIN_BS:-16}"
@@ -37,7 +37,10 @@ TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-4}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
-LEARNING_RATE="${LEARNING_RATE:-0.001103970108}"
+LEARNING_RATE="${LEARNING_RATE:-}"
+BASE_LEARNING_RATE="${BASE_LEARNING_RATE:-0.0005}"
+BASE_GLOBAL_BATCH_SIZE="${BASE_GLOBAL_BATCH_SIZE:-32}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-3}"
 WANDB_MODE="${WANDB_MODE:-online}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -71,6 +74,26 @@ timestamp() { date '+%F %T %Z'; }
 log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
 remote_quote() { printf '%q' "$1"; }
 safe_task_name() { printf '%s\n' "${TASK_NAME//\//_}"; }
+
+learning_rate_for_batch() {
+  local bs="$1"
+  if [[ -n "$LEARNING_RATE" ]]; then
+    printf '%s\n' "$LEARNING_RATE"
+    return 0
+  fi
+  python3 - "$bs" "${#POD_ARRAY[@]}" "$GPUS_PER_NODE" "$BASE_LEARNING_RATE" "$BASE_GLOBAL_BATCH_SIZE" <<'PY'
+import math
+import sys
+
+batch_size = int(sys.argv[1])
+num_nodes = int(sys.argv[2])
+gpus_per_node = int(sys.argv[3])
+base_lr = float(sys.argv[4])
+base_global_batch = float(sys.argv[5])
+global_batch = batch_size * num_nodes * gpus_per_node
+print(f"{base_lr * math.sqrt(global_batch / base_global_batch):.12f}")
+PY
+}
 
 remote_run_root() {
   printf '%s/tmux_unimm_h100x3x2/%s' "${REMOTE_LOG_DIR%/}" "$(safe_task_name)"
@@ -123,6 +146,8 @@ find_latest_epoch_last_ckpt() {
 start_attempt() {
   local bs="$1"
   local ckpt_path="$2"
+  local attempt_lr
+  attempt_lr="$(learning_rate_for_batch "$bs")"
   local -a cmd=(
     python3 scripts/launch_unimm_h100x3x2.py
     --namespace "$NAMESPACE"
@@ -139,7 +164,7 @@ start_attempt() {
     --train-batch-size "$bs"
     --val-batch-size "$VAL_BATCH_SIZE"
     --test-batch-size "$TEST_BATCH_SIZE"
-    --learning-rate "$LEARNING_RATE"
+    --learning-rate "$attempt_lr"
     --wandb-mode "$WANDB_MODE"
     --replace
   )
@@ -167,6 +192,7 @@ start_attempt() {
   fi
 
   log "launcher command:"
+  log "attempt learning_rate=${attempt_lr}"
   printf '  %q' "${cmd[@]}"
   printf '\n'
   "${cmd[@]}"
