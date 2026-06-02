@@ -38,8 +38,8 @@
 2025년 1월
 - **WOSAC 최고 수준 성능**: CAT-K는 [WOSAC 리더보드](https://waymo.com/open/challenges/2024/sim-agents/) 1위를 달성했다. agent token vocabulary 문제를 해결한 뒤 fine-tuned model은 **0.7702** RMM을 달성했다. 리더보드에는 공개하지 않았지만 BC로 32 epoch만 학습한 재현 SMART-tiny-7M도 **0.7671** RMM을 달성했고, 이는 당시 2위 방법과 비슷한 수준이다. 재현 절차도 비교적 단순하다.
 
-- **TrajTok agent token vocabulary**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. SMART 계열 학습은 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)을 사용하며, loss는 TrajTok 공식 구현과 같은 `thinklab` spatial-aware label smoothing을 적용한다. 기존처럼 주변 token smoothing mass를 항상 보존하는 방식은 `spatial_aware_smoothing_mode: normalized` ablation으로만 켠다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. Agent token matching도 공식 구현과 같이 candidate token contour를 global frame으로 펼쳐 GT contour와 직접 비교한다. Pretrain train dataset은 공식 TrajTok recipe와 맞춰 cache를 읽은 뒤 메모리 상에서만 `random_scene_scale_config: {SCALE_RANGE: [0.8, 1.2]}`와 `random_time_shift_config: {MAX_TIME_SHIFT: 5}`를 적용한다. 이 augmentation은 train split에만 적용하며 validation/test/submission cache나 원본 pickle은 바꾸지 않는다.
-- **TrajTok 7M decoder capacity**: 기본 SMART decoder는 `hidden_dim=128`, `num_heads=8`, `head_dim=15`, `num_map_layers=3`, `num_agent_layers=5`를 사용한다. 직접 instantiate해 센 총 파라미터 수는 7,190,271개이며 모두 trainable parameter이다. 이 설정은 `head_dim=11`, `num_agent_layers=6`의 7,175,863개 설정보다 attention 폭을 공식 TrajTok의 128에 가까운 120으로 유지하고, 대신 agent refinement layer를 한 번 줄여 7M대 공정 비교 범위에 맞춘다.
+- **TrajTok paper-submit agent vocabulary**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Loss는 TrajTok 공식 구현과 같은 `thinklab` spatial-aware label smoothing을 적용한다. 기존처럼 주변 token smoothing mass를 항상 보존하는 방식은 `spatial_aware_smoothing_mode: normalized` ablation으로만 켠다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. Agent token matching도 공식 구현과 같이 candidate token contour를 global frame으로 펼쳐 GT contour와 직접 비교한다. Pretrain train dataset은 공식 TrajTok recipe와 맞춰 cache를 읽은 뒤 메모리 상에서만 `random_scene_scale_config: {SCALE_RANGE: [0.8, 1.2]}`와 `random_time_shift_config: {MAX_TIME_SHIFT: 5}`를 적용한다. 이 augmentation은 train split에만 적용하며 validation/test/submission cache나 원본 pickle은 바꾸지 않는다.
+- **TrajTok decoder capacity**: 기본 SMART decoder는 `hidden_dim=128`, `num_heads=8`, `head_dim=15`, `num_map_layers=3`, `num_agent_layers=5`를 사용한다. Paper-submit vocab 적용 후 6-rank H100 smoke의 Lightning model summary 기준 총 trainable parameter는 약 7.5M이고, 직접 instantiate한 decoder parameter 수는 7,548,633개다. 이전 public-code vocab `4701/3318/3036`에서 측정한 7,190,271개보다 커진 이유는 vehicle classifier head가 논문 submit vocab 크기에 맞춰 커졌기 때문이다. Attention 폭과 layer 수는 그대로 유지한다.
 
 ## 설치
 
@@ -280,7 +280,7 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
 | task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_oom_retry_trajtok_legacy_inputs_trainselectfalse_20260601` |
 | experiment | `pre_bc_a100x4x2` |
-| model/tokenizer | TrajTok vocab `trajtok_vocab.pkl`, type-specific agent heads, official global token matching |
+| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global token matching |
 | decoder | `hidden_dim=128`, `num_heads=8`, `head_dim=15`, `num_map_layers=3`, `num_agent_layers=5` |
 | train batch | `INITIAL_BS=18` per rank, effective global batch 108 |
 | OOM retry | `MIN_BS=14`, `OOM_STEP=1`, latest task checkpoint resume |
@@ -293,6 +293,23 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | smoothing | `spatial_aware_smoothing=true`, `spatial_aware_smoothing_mode=thinklab` |
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, top-48 rollout validation, every 16 epochs |
 | distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=true` |
+
+현재 TrajTok vocab은 paper-submit recipe 재현용으로 아래 조건에서 생성했다.
+
+```bash
+python -m src.smart.tokens.trajtok \
+  --raw-data-path /workspace/womd_v1_3/SMART_cache/training \
+  --traj-data-path /tmp/trajtok_paper_50k_traj_data.pkl \
+  --output-path src/smart/tokens/trajtok_vocab.pkl \
+  --max-workers 64 \
+  --max-file-nums 50000 \
+  --max-traj-nums 12000000
+```
+
+생성기는 arXiv:2506.21618 Table 1 grid와 Table 3 submit vocab size를 맞추도록
+class별 filtering threshold를 사용한다. 실 cache 기준 생성 결과는 `veh=8037`,
+`ped=2998`, `cyc=2798`이며, 논문 submit size `8040/3001/2798`에서 vehicle/ped는
+각각 3개 차이, cyclist는 exact다.
 
 smoke test나 batch 조정은 환경 변수로만 바꾼다.
 

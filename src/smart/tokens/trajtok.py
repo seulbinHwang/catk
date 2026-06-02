@@ -27,18 +27,21 @@ class TrajTok:
         self.t = 0.1 * self.shift
         self.agent_classes = ['veh', 'ped', 'cyc']
         self.flip_trajs = True
-        # grid settings
+        # Paper submit-version grid settings from arXiv:2506.21618 Table 1.
+        # Vehicle uses 0.1m x bins and 0.05m y bins; pedestrian/cyclist use
+        # 0.05m bins in both axes.
         self.x_max = {'veh': 20, 'ped': 4.5, 'cyc': 8}
         self.x_min = {'veh': -5, 'ped': -1.5, 'cyc': -1}
-        self.y_max = {'veh': 3, 'ped': 2, 'cyc': 1}
-        self.y_min = {'veh': -2, 'ped': -2, 'cyc': -1}
-        self.x_binnum = {'veh': 250, 'ped': 120, 'cyc': 180} # 0.05
-        self.y_binnum = {'veh': 80, 'ped': 80, 'cyc': 40}  # 0.05
-        # filter settings
-        self.valid_count_threshold = {'veh': 3, 'ped': 1, 'cyc': 1}
+        self.y_max = {'veh': 4.5, 'ped': 2, 'cyc': 1}
+        self.y_min = {'veh': -1.5, 'ped': -2, 'cyc': -1}
+        self.x_binnum = {'veh': 250, 'ped': 120, 'cyc': 180}
+        self.y_binnum = {'veh': 120, 'ped': 80, 'cyc': 40}
+        # Filter settings calibrated to reproduce the submit-version vocab sizes
+        # reported in arXiv:2506.21618 Table 3 with the Table 1 grids.
+        self.valid_count_threshold = {'veh': 1, 'ped': 1, 'cyc': 1}
         self.filter_range = {'veh': 4, 'ped': 4, 'cyc': 4}
-        self.filter_threshold_add = {'veh': 20, 'ped': 20, 'cyc': 20}
-        self.filter_threshold_remove = {'veh': 20, 'ped': 20, 'cyc': 20}
+        self.filter_threshold_add = {'veh': 18, 'ped': 26, 'cyc': 22}
+        self.filter_threshold_remove = {'veh': 14, 'ped': 22, 'cyc': 28}
         cache_root = Path(os.environ.get("SMART_CACHE_ROOT", "/scratch/cache/SMART"))
         default_raw_data_path = cache_root / "training"
         default_traj_data_path = cache_root / "trajtok_traj_data.pkl"
