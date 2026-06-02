@@ -248,14 +248,23 @@ bash scripts/start_smart_a100x4x2_testa_pretrain.sh
 실험 이름은 기본적으로 아래 형식으로 생성된다.
 
 ```text
-smart_pretrain_a100x4x2_smart_raw_staticmap_tokenfast_fast_rmm_<YYYYMMDD_HHMMSS>
+smart_pretrain_a100x4x2_smart_raw_staticmap_tokenfast_fast_rmm_v2_<YYYYMMDD_HHMMSS>
 ```
 
 고정 이름이나 batch를 쓰려면 환경 변수로 넘긴다.
 
 ```bash
-TASK_NAME=smart_pretrain_a100x4x2_smart_raw_staticmap_tokenfast_fast_rmm_probe \
+TASK_NAME=smart_pretrain_a100x4x2_smart_raw_staticmap_tokenfast_fast_rmm_v2_probe \
 TRAIN_BATCH_SIZE=10 \
+bash scripts/start_smart_a100x4x2_testa_pretrain.sh
+```
+
+2026-06-02 기준으로 검증한 full pretrain 실행은 아래 형태다. 이미 떠 있는
+`testa`/`testaa` pod 안에서만 tmux 학습 세션을 만들며, `SMART_RAW_cache`를
+그대로 사용한다.
+
+```bash
+TASK_NAME=smart_pretrain_a100x4x2_smart_raw_staticmap_tokenfast_fast_rmm_v2_20260602 \
 bash scripts/start_smart_a100x4x2_testa_pretrain.sh
 ```
 
