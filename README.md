@@ -229,6 +229,22 @@ bash scripts/start_smart_a100x4x2_testa_pretrain.sh
 | scorer scene 수 | 약 `1680` scenes |
 | W&B | online, project `SMART-FLOW`, entity `jksg01019-naver-labs` |
 
+현재 `SMART` pretrain 경로에는 학습 결과를 바꾸지 않는 것을 목표로 한 속도 최적화가 들어가 있다.
+
+| 최적화 | 의미 | 검증 결과 |
+|---|---|---|
+| static map 유지 | map token을 시간 step마다 복제하지 않고, 여러 시간의 agent token이 같은 static map token을 참조한다. 정렬된 실제 PyG batch 형태에서는 기존 time-expanded map edge와 같은 map-agent edge set을 만든다. | synthetic equivalence에서 edge count 동일, missing/extra 0, relation embedding 최대 오차 `3.6e-7` |
+| token processor local-contour matching | 기본 `num_k=1` agent token matching에서 global contour를 만든 뒤 다시 local frame으로 바꾸는 중간 계산을 줄이고, previous-token local frame에서 바로 matching한다. | token index mismatch 0, 위치 최대 오차 `3.8e-6`, heading 최대 오차 `1.3e-6` |
+
+`testa/testaa` A100x4x2에서 확인한 짧은 train-only speed probe 기준:
+
+| 조건 | 속도 |
+|---|---:|
+| 변경 전 SMART speed probe | 약 `0.98~0.99 it/s` |
+| 변경 후 80 train step probe | 약 `1.15~1.17 it/s` |
+
+따라서 같은 batch/validation 설정에서는 train step 기준 대략 `15~18%` 수준의 시간 단축을 기대한다. 실제 전체 학습 시간은 validation, checkpoint, W&B upload, DDP 상태에 따라 달라질 수 있다.
+
 실험 이름은 기본적으로 아래 형식으로 생성된다.
 
 ```text

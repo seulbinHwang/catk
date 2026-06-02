@@ -21,12 +21,27 @@ from torch import Tensor
 from torch.distributions import Categorical
 from torch_geometric.data import HeteroData
 
+from src.smart.tokens.agent_token_matching import build_agent_type_masks
 from src.smart.utils import (
     cal_polygon_contour,
     transform_to_global,
     transform_to_local,
     wrap_angle,
 )
+
+
+def _clean_heading_dense_impl(valid: Tensor, heading: Tensor) -> Tensor:
+    valid_pairs = valid[:, :-1] & valid[:, 1:]
+    cleaned_steps = [heading[:, 0]]
+    prev_heading = heading[:, 0]
+    for i in range(heading.shape[1] - 1):
+        raw_next_heading = heading[:, i + 1]
+        heading_diff = torch.abs(wrap_angle(prev_heading - raw_next_heading))
+        change_needed = (heading_diff > 1.5) & valid_pairs[:, i]
+        next_heading = torch.where(change_needed, prev_heading, raw_next_heading)
+        cleaned_steps.append(next_heading)
+        prev_heading = next_heading
+    return torch.stack(cleaned_steps, dim=1)
 
 
 class TokenProcessor(torch.nn.Module):
@@ -140,10 +155,12 @@ class TokenProcessor(torch.nn.Module):
         )
 
         # ! get raw trajectory data
-        valid = data["agent"]["valid_mask"]  # [n_agent, n_step]
-        heading = data["agent"]["heading"]  # [n_agent, n_step]
-        pos = data["agent"]["position"][..., :2].contiguous()  # [n_agent, n_step, 2]
-        vel = data["agent"]["velocity"]  # [n_agent, n_step, 2]
+        valid = data["agent"]["valid_mask"].clone()  # [n_agent, n_step]
+        heading = data["agent"]["heading"].clone()  # [n_agent, n_step]
+        pos = (
+            data["agent"]["position"][..., :2].contiguous().clone()
+        )  # [n_agent, n_step, 2]
+        vel = data["agent"]["velocity"].clone()  # [n_agent, n_step, 2]
 
         # ! agent, specifically vehicle's heading can be 180 degree off. We fix it here.
         heading = self._clean_heading(valid, heading)
@@ -213,7 +230,7 @@ class TokenProcessor(torch.nn.Module):
         """
         num_k = self.agent_token_sampling.num_k if self.training else 1
         n_agent, n_step = valid.shape
-        range_a = torch.arange(n_agent)
+        range_a = torch.arange(n_agent, device=valid.device)
 
         prev_pos, prev_head = pos[:, 0], heading[:, 0]  # [n_agent, 2], [n_agent]
         prev_pos_sample, prev_head_sample = pos[:, 0], heading[:, 0]
@@ -235,27 +252,29 @@ class TokenProcessor(torch.nn.Module):
 
             #! gt_contour: [n_agent, 4, 2] in global coord
             gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
-            gt_contour = gt_contour.unsqueeze(1)  # [n_agent, 1, 4, 2]
 
             # ! tokenize without sampling
-            token_world_gt = transform_to_global(
-                pos_local=token_traj.flatten(1, 2),  # [n_agent, n_token*4, 2]
-                head_local=None,
-                pos_now=prev_pos,  # [n_agent, 2]
-                head_now=prev_head,  # [n_agent]
-            )[0].view(*token_traj.shape)
+            gt_contour_local, _ = transform_to_local(
+                pos_global=gt_contour,  # [n_agent, 4, 2]
+                head_global=None,
+                pos_now=prev_pos,
+                head_now=prev_head,
+            )
             token_idx_gt = torch.argmin(
-                torch.norm(token_world_gt - gt_contour, dim=-1).sum(-1), dim=-1
+                torch.norm(token_traj - gt_contour_local.unsqueeze(1), dim=-1).sum(-1),
+                dim=-1,
             )  # [n_agent]
             # [n_agent, 4, 2]
-            token_contour_gt = token_world_gt[range_a, token_idx_gt]
+            token_contour_gt_local = token_traj[range_a, token_idx_gt]
+            token_pos_gt, token_head_gt = self._token_pose_from_local_contour(
+                token_contour_gt_local, prev_pos, prev_head
+            )
 
             # udpate prev_pos, prev_head
             prev_head = heading[:, i].clone()
-            dxy = token_contour_gt[:, 0] - token_contour_gt[:, 3]
-            prev_head[_valid_mask] = torch.arctan2(dxy[:, 1], dxy[:, 0])[_valid_mask]
+            prev_head[_valid_mask] = token_head_gt[_valid_mask]
             prev_pos = pos[:, i].clone()
-            prev_pos[_valid_mask] = token_contour_gt.mean(1)[_valid_mask]
+            prev_pos[_valid_mask] = token_pos_gt[_valid_mask]
             # add to output dict
             out_dict["gt_idx"].append(token_idx_gt)
             out_dict["gt_pos"].append(
@@ -278,7 +297,9 @@ class TokenProcessor(torch.nn.Module):
                 )[0].view(*token_traj.shape)
 
                 # dist: [n_agent, n_token]
-                dist = torch.norm(token_world_sample - gt_contour, dim=-1).mean(-1)
+                dist = torch.norm(
+                    token_world_sample - gt_contour.unsqueeze(1), dim=-1
+                ).mean(-1)
                 topk_dists, topk_indices = torch.topk(
                     dist, num_k, dim=-1, largest=False, sorted=False
                 )  # [n_agent, K]
@@ -309,12 +330,24 @@ class TokenProcessor(torch.nn.Module):
 
     @staticmethod
     def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
-        valid_pairs = valid[:, :-1] & valid[:, 1:]
-        for i in range(heading.shape[1] - 1):
-            heading_diff = torch.abs(wrap_angle(heading[:, i] - heading[:, i + 1]))
-            change_needed = (heading_diff > 1.5) & valid_pairs[:, i]
-            heading[:, i + 1][change_needed] = heading[:, i][change_needed]
-        return heading
+        return _clean_heading_dense_impl(valid, heading)
+
+    @staticmethod
+    def _token_pose_from_local_contour(
+        token_contour_local: Tensor,
+        prev_pos: Tensor,
+        prev_head: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
+        token_pos_local = token_contour_local.mean(1)
+        dxy_local = token_contour_local[:, 0] - token_contour_local[:, 3]
+        token_head_local = torch.arctan2(dxy_local[:, 1], dxy_local[:, 0])
+        token_pos_global, token_head_global = transform_to_global(
+            pos_local=token_pos_local.unsqueeze(1),
+            head_local=token_head_local.unsqueeze(1),
+            pos_now=prev_pos,
+            head_now=prev_head,
+        )
+        return token_pos_global.squeeze(1), wrap_angle(token_head_global.squeeze(1))
 
     def _extrapolate_agent_to_prev_token_step(
         self,
@@ -323,22 +356,36 @@ class TokenProcessor(torch.nn.Module):
         heading: Tensor,  # [n_agent, n_step]
         vel: Tensor,  # [n_agent, n_step, 2]
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        # [n_agent], max will give the first True step
+        n_agent, n_step = valid.shape
         first_valid_step = torch.max(valid, dim=1).indices
-
-        for i, t in enumerate(first_valid_step):  # extrapolate to previous 5th step.
-            n_step_to_extrapolate = t % self.shift
-            if (t == 10) and (not valid[i, 10 - self.shift]):
-                # such that at least one token is valid in the history.
-                n_step_to_extrapolate = self.shift
-
-            if n_step_to_extrapolate > 0:
-                vel[i, t - n_step_to_extrapolate : t] = vel[i, t]
-                valid[i, t - n_step_to_extrapolate : t] = True
-                heading[i, t - n_step_to_extrapolate : t] = heading[i, t]
-
-                for j in range(n_step_to_extrapolate):
-                    pos[i, t - j - 1] = pos[i, t - j] - vel[i, t] * 0.1
+        n_step_to_extrapolate = first_valid_step % self.shift
+        needs_history_token = (first_valid_step == 10) & (~valid[:, 10 - self.shift])
+        n_step_to_extrapolate = torch.where(
+            needs_history_token,
+            torch.full_like(n_step_to_extrapolate, self.shift),
+            n_step_to_extrapolate,
+        )
+        step_ids = torch.arange(n_step, device=valid.device).unsqueeze(0)
+        fill_start = (first_valid_step - n_step_to_extrapolate).unsqueeze(1)
+        fill_end = first_valid_step.unsqueeze(1)
+        fill_mask = (step_ids >= fill_start) & (step_ids < fill_end)
+        if fill_mask.any():
+            source_vel = vel[torch.arange(n_agent, device=valid.device), first_valid_step]
+            source_heading = heading[
+                torch.arange(n_agent, device=valid.device), first_valid_step
+            ]
+            valid = valid | fill_mask
+            vel = torch.where(fill_mask.unsqueeze(-1), source_vel.unsqueeze(1), vel)
+            heading = torch.where(fill_mask, source_heading.unsqueeze(1), heading)
+            delta_steps = (first_valid_step.unsqueeze(1) - step_ids).to(pos.dtype)
+            extrapolated_pos = (
+                pos[
+                    torch.arange(n_agent, device=valid.device),
+                    first_valid_step,
+                ].unsqueeze(1)
+                - source_vel.unsqueeze(1) * (delta_steps.unsqueeze(-1) * 0.1)
+            )
+            pos = torch.where(fill_mask.unsqueeze(-1), extrapolated_pos, pos)
 
         return valid, pos, heading, vel
 
@@ -350,11 +397,7 @@ class TokenProcessor(torch.nn.Module):
         token_traj_all: [n_agent, n_token, 6, 4, 2]
         token_traj: [n_agent, n_token, 4, 2]
         """
-        agent_type_masks = {
-            "veh": agent_type == 0,
-            "ped": agent_type == 1,
-            "cyc": agent_type == 2,
-        }
+        agent_type_masks = build_agent_type_masks(agent_type)
         agent_shape = 0.0
         token_traj_all = 0.0
         for k, mask in agent_type_masks.items():
