@@ -30,33 +30,48 @@ SPATIAL_SMOOTHING_MODES = {
 SPATIAL_SMOOTHING_DISTANCE_CHUNK_SIZE = 512
 
 
-def _token_trajectory_distance_from_index(
+def _get_prob_targets_from_trajectory_index(
     gt_idx: Tensor,
     token_trajectory: Tensor,  # [n_token, 5, 3]
+    label_smoothing: float,
+    spatial_aware_smoothing_mode: str,
 ) -> Tensor:
+    n_token = token_trajectory.shape[0]
+    prob_target = token_trajectory.new_zeros(*gt_idx.shape, n_token)
     flat_gt_idx = gt_idx.reshape(-1)
     if flat_gt_idx.numel() == 0:
-        return token_trajectory.new_empty(*gt_idx.shape, token_trajectory.shape[0])
-    gt_token_trajectory = token_trajectory[flat_gt_idx]
-    dist_chunks = []
+        return prob_target
+
+    flat_prob_target = prob_target.view(-1, n_token)
     for start in range(
         0,
-        gt_token_trajectory.shape[0],
+        flat_gt_idx.shape[0],
         SPATIAL_SMOOTHING_DISTANCE_CHUNK_SIZE,
     ):
         end = min(
             start + SPATIAL_SMOOTHING_DISTANCE_CHUNK_SIZE,
-            gt_token_trajectory.shape[0],
+            flat_gt_idx.shape[0],
         )
-        gt_chunk = gt_token_trajectory[start:end]
+        chunk_gt_idx = flat_gt_idx[start:end]
+        gt_chunk = token_trajectory[chunk_gt_idx]
         pos_delta = gt_chunk[:, None, :, :2] - token_trajectory[None, :, :, :2]
         head_delta = wrap_angle(
             gt_chunk[:, None, :, 2] - token_trajectory[None, :, :, 2]
         )
-        dist_chunks.append(
-            torch.sqrt(pos_delta.square().sum(-1) + head_delta.square()).mean(-1)
-        )
-    return torch.cat(dist_chunks, dim=0).view(*gt_idx.shape, token_trajectory.shape[0])
+        dists = torch.sqrt(pos_delta.square().sum(-1) + head_delta.square()).mean(-1)
+        inv_sq_dist = 1.0 / ((1.0e-4 + dists) ** 2)
+        inv_sq_dist.scatter_(1, chunk_gt_idx.unsqueeze(1), 0.0)
+        normalizer = inv_sq_dist.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+        neighbor_target = inv_sq_dist / normalizer
+        if spatial_aware_smoothing_mode == SPATIAL_SMOOTHING_MODE_THINKLAB:
+            neighbor_target = neighbor_target / normalizer
+
+        flat_prob_target[start:end] = neighbor_target * label_smoothing
+        flat_prob_target[
+            torch.arange(start, end, device=gt_idx.device),
+            chunk_gt_idx,
+        ] = 1.0 - label_smoothing
+    return prob_target
 
 
 @torch.no_grad()
@@ -68,8 +83,11 @@ def get_prob_targets_from_index(
     spatial_aware_smoothing: bool = False,
     spatial_aware_smoothing_mode: str = SPATIAL_SMOOTHING_MODE_PAPER,
 ) -> Tensor:  # [n_agent, n_step, n_token] prob
-    n_token = token_trajectory.shape[0] if token_trajectory is not None else token_traj.shape[1]
-    closest_token_mask = one_hot(gt_idx, num_classes=n_token).to(bool)
+    n_token = (
+        token_trajectory.shape[0]
+        if token_trajectory is not None
+        else token_traj.shape[1]
+    )
     prob_target = torch.zeros(
         gt_idx.shape[0],
         gt_idx.shape[1],
@@ -79,11 +97,11 @@ def get_prob_targets_from_index(
     )
 
     if label_smoothing <= 0:
-        prob_target[closest_token_mask] = 1.0
+        prob_target.scatter_(-1, gt_idx.unsqueeze(-1), 1.0)
         return prob_target
 
     if not spatial_aware_smoothing:
-        prob_target[closest_token_mask] = 1.0
+        prob_target.scatter_(-1, gt_idx.unsqueeze(-1), 1.0)
         return prob_target
     if spatial_aware_smoothing_mode not in SPATIAL_SMOOTHING_MODES:
         raise ValueError(
@@ -92,17 +110,23 @@ def get_prob_targets_from_index(
         )
 
     if token_trajectory is not None:
-        dists = _token_trajectory_distance_from_index(gt_idx, token_trajectory)
-    else:
-        gt_token_traj = torch.gather(
-            token_traj,
-            dim=1,
-            index=gt_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 4, 2),
+        return _get_prob_targets_from_trajectory_index(
+            gt_idx=gt_idx,
+            token_trajectory=token_trajectory,
+            label_smoothing=label_smoothing,
+            spatial_aware_smoothing_mode=spatial_aware_smoothing_mode,
         )
-        dists = torch.norm(
-            gt_token_traj[:, :, None, :, :] - token_traj[:, None, :, :, :],
-            dim=-1,
-        ).mean(-1)
+
+    closest_token_mask = one_hot(gt_idx, num_classes=n_token).to(bool)
+    gt_token_traj = torch.gather(
+        token_traj,
+        dim=1,
+        index=gt_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 4, 2),
+    )
+    dists = torch.norm(
+        gt_token_traj[:, :, None, :, :] - token_traj[:, None, :, :, :],
+        dim=-1,
+    ).mean(-1)
     prob_target[closest_token_mask] = 1.0 - label_smoothing
     inv_sq_dist = 1.0 / ((1.0e-4 + dists) ** 2)
     inv_sq_dist = inv_sq_dist.masked_fill(closest_token_mask, 0.0)
