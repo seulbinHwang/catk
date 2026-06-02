@@ -1,10 +1,10 @@
 #!/bin/sh
 # ==========================================================================
-# OCSC (Open-Closed Self-Consistency) fine-tuning launcher.
+# OCSC / soft-RMM closed-loop fine-tuning launcher.
 #
-# self_forced framework 와 격리된 별도 mode (finetune.mode=ocsc_ft).
-# training_step 이 _run_flow_ocsc_ft_step 으로 분기 — anchor 0 기준
-# G CL rollouts + M OL samples + nearest match + paired L2.
+# self_forced framework 와 격리된 별도 mode.
+#   finetune.mode=ocsc_ft
+#   finetune.mode=soft_rmm_propagation
 #
 # ── 사용 예 ───────────────────────────────────────────────────────────────
 #  1. 1 GPU smoke (cuda:3):
@@ -182,6 +182,21 @@ OCSC_EXCEPT_MAP_ENCODER="${OCSC_EXCEPT_MAP_ENCODER:-false}"
 OCSC_VELOCITY_HEAD_ONLY="${OCSC_VELOCITY_HEAD_ONLY:-true}"
 OCSC_FULL_FLOW_DECODER="${OCSC_FULL_FLOW_DECODER:-false}"
 
+FINETUNE_MODE="${FINETUNE_MODE:-${MY_EXPERIMENT}}"
+case "${FINETUNE_MODE}" in
+  ocsc_ft|soft_rmm_propagation) ;;
+  *) FINETUNE_MODE="ocsc_ft" ;;
+esac
+
+SOFT_RMM_N_ROLLOUTS="${SOFT_RMM_N_ROLLOUTS:-${OCSC_N_ROLLOUTS}}"
+SOFT_RMM_LOSS_WINDOW_STEPS="${SOFT_RMM_LOSS_WINDOW_STEPS:-15}"
+SOFT_RMM_MIN_HORIZON_STEPS="${SOFT_RMM_MIN_HORIZON_STEPS:-15}"
+SOFT_RMM_FIELDS="${SOFT_RMM_FIELDS:-[linear_speed,linear_acceleration,angular_speed,angular_acceleration]}"
+SOFT_RMM_RENORMALIZE_WEIGHTS="${SOFT_RMM_RENORMALIZE_WEIGHTS:-true}"
+SOFT_RMM_HISTOGRAM_TEMPERATURE="${SOFT_RMM_HISTOGRAM_TEMPERATURE:-1.0}"
+SOFT_RMM_INDICATOR_TEMPERATURE="${SOFT_RMM_INDICATOR_TEMPERATURE:-0.25}"
+SOFT_RMM_LOSS_WEIGHT="${SOFT_RMM_LOSS_WEIGHT:-1.0}"
+
 CHECKPOINT_MONITOR="${CHECKPOINT_MONITOR:-val_closed/sim_agents_2025/realism_meta_metric}"
 CHECKPOINT_MODE="${CHECKPOINT_MODE:-max}"
 CHECKPOINT_SAVE_LAST="${CHECKPOINT_SAVE_LAST:-true}"
@@ -223,12 +238,17 @@ echo "    val_check_interval=${VAL_CHECK_INTERVAL} grad_clip=${GRADIENT_CLIP_VAL
 echo "  Data: train_B=${TRAIN_B} val_B=${VAL_B} workers=${NUM_WORKERS}"
 echo "    eval_workers=${EVAL_NUM_WORKERS} eval_mp=${EVAL_MULTIPROCESSING_CONTEXT}"
 echo "  Generator: lr=${LR} weight_decay=${WEIGHT_DECAY}"
+echo "  Closed-loop fine-tune:"
+echo "    mode=${FINETUNE_MODE}"
 echo "  OCSC ★:"
 echo "    G(n_rollouts)=${OCSC_N_ROLLOUTS}  M(n_ol_rollouts)=${OCSC_N_OL_ROLLOUTS}"
 echo "    nearest_match=${OCSC_OL_NEAREST_MATCH}  gt_target=${OCSC_GT_TARGET}"
 echo "    use_ref=${OCSC_USE_PRETRAINED_REF}  anchor_idx=${OCSC_ANCHOR_IDX}  match_space=${OCSC_MATCH_SPACE}  loss_window_steps=${OCSC_LOSS_WINDOW_STEPS}  loss_stride=${OCSC_LOSS_TEMPORAL_STRIDE}  strict_active=${OCSC_STRICT_ACTIVE_MASK}"
 echo "    pos_w=${OCSC_POSITION_WEIGHT}  head_w=${OCSC_HEADING_WEIGHT}"
 echo "    except_map_encoder=${OCSC_EXCEPT_MAP_ENCODER}  velocity_head_only=${OCSC_VELOCITY_HEAD_ONLY}  full_flow_decoder=${OCSC_FULL_FLOW_DECODER}"
+echo "  soft-RMM:"
+echo "    G=${SOFT_RMM_N_ROLLOUTS}  horizon_steps=${SOFT_RMM_LOSS_WINDOW_STEPS}  fields=${SOFT_RMM_FIELDS}"
+echo "    hist_temp=${SOFT_RMM_HISTOGRAM_TEMPERATURE} indicator_temp=${SOFT_RMM_INDICATOR_TEMPERATURE} loss_weight=${SOFT_RMM_LOSS_WEIGHT}"
 echo "  Checkpoint: monitor=${CHECKPOINT_MONITOR} mode=${CHECKPOINT_MODE} save_last=${CHECKPOINT_SAVE_LAST}"
 echo "============================================================"
 
@@ -303,7 +323,7 @@ torchrun \
   model.model_config.val_open_loop="${VAL_OPEN_LOOP}" \
   model.model_config.val_closed_loop="${VAL_CLOSED_LOOP}" \
   model.model_config.finetune.enabled=true \
-  model.model_config.finetune.mode=ocsc_ft \
+  model.model_config.finetune.mode="${FINETUNE_MODE}" \
   model.model_config.finetune.train_except_map_encoder="${OCSC_EXCEPT_MAP_ENCODER}" \
   model.model_config.finetune.velocity_head_only="${OCSC_VELOCITY_HEAD_ONLY}" \
   model.model_config.finetune.train_full_flow_decoder_only="${OCSC_FULL_FLOW_DECODER}" \
@@ -320,6 +340,14 @@ torchrun \
   model.model_config.finetune.ocsc_strict_active_mask="${OCSC_STRICT_ACTIVE_MASK}" \
   model.model_config.finetune.ocsc_position_weight="${OCSC_POSITION_WEIGHT}" \
   model.model_config.finetune.ocsc_heading_weight="${OCSC_HEADING_WEIGHT}" \
+  model.model_config.finetune.soft_rmm_n_rollouts="${SOFT_RMM_N_ROLLOUTS}" \
+  model.model_config.finetune.soft_rmm_loss_window_steps="${SOFT_RMM_LOSS_WINDOW_STEPS}" \
+  model.model_config.finetune.soft_rmm_min_horizon_steps="${SOFT_RMM_MIN_HORIZON_STEPS}" \
+  model.model_config.finetune.soft_rmm_fields="${SOFT_RMM_FIELDS}" \
+  model.model_config.finetune.soft_rmm_renormalize_weights="${SOFT_RMM_RENORMALIZE_WEIGHTS}" \
+  model.model_config.finetune.soft_rmm_histogram_temperature="${SOFT_RMM_HISTOGRAM_TEMPERATURE}" \
+  model.model_config.finetune.soft_rmm_indicator_temperature="${SOFT_RMM_INDICATOR_TEMPERATURE}" \
+  model.model_config.finetune.soft_rmm_loss_weight="${SOFT_RMM_LOSS_WEIGHT}" \
   model.model_config.self_forced.enabled=false \
   ${PREFETCH_ARG} \
   ${EVAL_PREFETCH_ARG} \

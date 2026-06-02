@@ -19,7 +19,7 @@ _LaneType = map_pb2.LaneCenter.LaneType
 import time
 _distance_computation_total_time = 0.0
 _distance_computation_call_count = 0
-_LOG_FEATURE_CACHE: OrderedDict[tuple[str, bool, str], dict] = OrderedDict()
+_LOG_FEATURE_CACHE: OrderedDict[tuple[str, bool, str, int], dict] = OrderedDict()
 _LOG_FEATURE_CACHE_LOCK = threading.Lock()
 
 
@@ -51,7 +51,7 @@ def _clone_feature_tree(value, *, device: torch.device | str):
     return value
 
 
-def _log_feature_cache_key(gt_scenario: dict, version: str) -> tuple[str, bool, str]:
+def _log_feature_cache_key(gt_scenario: dict, version: str, horizon_steps: int) -> tuple[str, bool, str, int]:
     scenario_key = str(
         gt_scenario.get("_cache_scenario_file")
         or gt_scenario.get("scenario_id")
@@ -61,6 +61,7 @@ def _log_feature_cache_key(gt_scenario: dict, version: str) -> tuple[str, bool, 
         scenario_key,
         bool(gt_scenario.get("_cache_ego_only", False)),
         str(version),
+        int(horizon_steps),
     )
 @dataclasses.dataclass(frozen=True)
 class MetricFeatures:
@@ -143,7 +144,12 @@ def compute_metric_features(
         road_edge_tensors=None,
         lane_tensor_cache=None,
         traffic_signal_tensor_cache=None,
+        required_metric_fields: set[str] | None = None,
 ) -> dict:
+    required_fields = None if required_metric_fields is None else set(required_metric_fields)
+
+    def needs_any(*field_names: str) -> bool:
+        return required_fields is None or any(field_name in required_fields for field_name in field_names)
 
     if simulated_all_trajectories.shape[-1] == 9:
         simulated_all_trajectories = simulated_all_trajectories[...,[0,1,2,6]]
@@ -152,20 +158,46 @@ def compute_metric_features(
         simulated_all_trajectories = simulated_all_trajectories[:,:,11:,:]
         simulated_val_trajectories = simulated_val_trajectories[:,:,11:,:]
 
-    logged_all_trajectories_future = logged_all_trajectories[:,11:,:]
-    logged_all_trajectories_future_masks = logged_all_trajectorie_masks[:,11:]
-    logged_val_trajectories_future_masks = logged_val_trajectorie_masks[:,11:]
+    future_steps = int(simulated_all_trajectories.shape[-2])
+    hist_steps = 11
+    window_end = hist_steps + future_steps
+    if simulated_val_trajectories.shape[-2] != future_steps:
+        raise ValueError(
+            "simulated_all_trajectories and simulated_val_trajectories must have "
+            f"the same future length, got {future_steps} and "
+            f"{int(simulated_val_trajectories.shape[-2])}."
+        )
+    if int(logged_all_trajectories.shape[1]) < window_end:
+        raise ValueError(
+            "Logged trajectories are shorter than the requested metric horizon: "
+            f"need {window_end} history+future steps, got "
+            f"{int(logged_all_trajectories.shape[1])}."
+        )
+    if int(logged_val_trajectories.shape[1]) < window_end:
+        raise ValueError(
+            "Logged validation trajectories are shorter than the requested metric horizon: "
+            f"need {window_end} history+future steps, got "
+            f"{int(logged_val_trajectories.shape[1])}."
+        )
+
+    logged_all_trajectories_window = logged_all_trajectories[:, :window_end, :]
+    logged_all_trajectorie_masks_window = logged_all_trajectorie_masks[:, :window_end]
+    logged_val_trajectories_window = logged_val_trajectories[:, :window_end, :]
+    logged_val_trajectorie_masks_window = logged_val_trajectorie_masks[:, :window_end]
+    logged_all_trajectories_future = logged_all_trajectories[:, hist_steps:window_end, :]
+    logged_all_trajectories_future_masks = logged_all_trajectorie_masks[:, hist_steps:window_end]
+    logged_val_trajectories_future_masks = logged_val_trajectorie_masks[:, hist_steps:window_end]
 
     if use_log_validity:
         valid_mask = logged_all_trajectories_future_masks
     else:
         valid_mask = torch.ones_like(logged_all_trajectories_future_masks).bool()
 
-    simulated_all_trajectories_with_gt_history = torch.cat([logged_all_trajectories[:,:11,[0,1,2,6]].unsqueeze(0).repeat(simulated_all_trajectories.shape[0],1,1,1), simulated_all_trajectories],dim=-2)
-    simulated_val_trajectories_with_gt_history = torch.cat([logged_val_trajectories[:,:11,[0,1,2,6]].unsqueeze(0).repeat(simulated_val_trajectories.shape[0],1,1,1), simulated_val_trajectories],dim=-2)
+    simulated_all_trajectories_with_gt_history = torch.cat([logged_all_trajectories_window[:,:hist_steps,[0,1,2,6]].unsqueeze(0).repeat(simulated_all_trajectories.shape[0],1,1,1), simulated_all_trajectories],dim=-2)
+    simulated_val_trajectories_with_gt_history = torch.cat([logged_val_trajectories_window[:,:hist_steps,[0,1,2,6]].unsqueeze(0).repeat(simulated_val_trajectories.shape[0],1,1,1), simulated_val_trajectories],dim=-2)
 
-    displacement_error = torch.norm(simulated_val_trajectories_with_gt_history[...,0:3] - logged_val_trajectories[torch.newaxis,:,:,0:3], dim=-1)
-    ade_masks = logged_val_trajectorie_masks.unsqueeze(0).repeat(simulated_val_trajectories.shape[0],1,1)
+    displacement_error = torch.norm(simulated_val_trajectories_with_gt_history[...,0:3] - logged_val_trajectories_window[torch.newaxis,:,:,0:3], dim=-1)
+    ade_masks = logged_val_trajectorie_masks_window.unsqueeze(0).repeat(simulated_val_trajectories.shape[0],1,1)
     ades = torch.sum(torch.where(ade_masks, displacement_error, 0), dim=-1) / ade_masks.sum(dim=-1)
 
 
@@ -183,50 +215,69 @@ def compute_metric_features(
     angular_accel = angular_accel[:,:,11:]
     speed_validity, acceleration_validity = trajectory_features.compute_kinematic_validity(logged_val_trajectories_future_masks)
 
-    # Interactive features are computed between all simulated objects, but only
-    # scored for evaluated objects.
-    distances_to_objects = (
-        interaction_features.compute_distance_to_nearest_object(
-            boxes=torch.cat([simulated_all_trajectories[...,0:3],
-                             logged_all_trajectories_future[...,3:6].squeeze(0).repeat(simulated_all_trajectories.shape[0],1,1,1),
-                             simulated_all_trajectories[...,[3]]],dim=-1),
-            valid=valid_mask,
-            evaluated_object_mask=evaluated_object_mask
-            ))
-    is_colliding_per_step = torch.less(
-        distances_to_objects, interaction_features.COLLISION_DISTANCE_THRESHOLD)
+    n_rollout = int(simulated_all_trajectories.shape[0])
+    n_eval = int(evaluated_object_mask.sum().item())
+    feature_shape = (n_rollout, n_eval, future_steps)
+    if needs_any('distance_to_nearest_object', 'collision_indication'):
+        # Interactive features are computed between all simulated objects, but only
+        # scored for evaluated objects.
+        distances_to_objects = (
+            interaction_features.compute_distance_to_nearest_object(
+                boxes=torch.cat([simulated_all_trajectories[...,0:3],
+                                 logged_all_trajectories_future[...,3:6].squeeze(0).repeat(simulated_all_trajectories.shape[0],1,1,1),
+                                 simulated_all_trajectories[...,[3]]],dim=-1),
+                valid=valid_mask,
+                evaluated_object_mask=evaluated_object_mask
+                ))
+        is_colliding_per_step = torch.less(
+            distances_to_objects, interaction_features.COLLISION_DISTANCE_THRESHOLD)
+    else:
+        distances_to_objects = simulated_all_trajectories.new_zeros(feature_shape)
+        is_colliding_per_step = torch.zeros(feature_shape, dtype=torch.bool, device=simulated_all_trajectories.device)
 
-    times_to_collision = (
-        interaction_features.compute_time_to_collision_with_object_in_front(
-            center_x=simulated_all_trajectories_with_gt_history[...,0],
-            center_y=simulated_all_trajectories_with_gt_history[...,1],
-            length=logged_all_trajectories_future[...,3].squeeze(0).repeat(simulated_all_trajectories.shape[0],1,1),
-            width=logged_all_trajectories_future[...,4].squeeze(0).repeat(simulated_all_trajectories.shape[0],1,1),
-            heading=simulated_all_trajectories_with_gt_history[...,3],
+    if needs_any('time_to_collision'):
+        times_to_collision = (
+            interaction_features.compute_time_to_collision_with_object_in_front(
+                center_x=simulated_all_trajectories_with_gt_history[...,0],
+                center_y=simulated_all_trajectories_with_gt_history[...,1],
+                length=logged_all_trajectories_future[...,3].squeeze(0).repeat(simulated_all_trajectories.shape[0],1,1),
+                width=logged_all_trajectories_future[...,4].squeeze(0).repeat(simulated_all_trajectories.shape[0],1,1),
+                heading=simulated_all_trajectories_with_gt_history[...,3],
+                valid=valid_mask,
+                evaluated_object_mask=evaluated_object_mask,
+                seconds_per_step=0.1,
+            )
+        )
+    else:
+        times_to_collision = simulated_all_trajectories.new_zeros(feature_shape)
+
+    if needs_any('distance_to_road_edge', 'offroad_indication'):
+        distances_to_road_edge = map_metric_features.compute_distance_to_road_edge(
+            boxes=torch.cat([simulated_all_trajectories[...,0:3], logged_all_trajectories_future[...,3:6].squeeze(0).repeat(simulated_all_trajectories.shape[0],1,1,1), simulated_all_trajectories[...,[3]]],dim=-1),
             valid=valid_mask,
             evaluated_object_mask=evaluated_object_mask,
-            seconds_per_step=0.1,
+            road_edge_polylines=road_edges,
+            road_edge_tensors=road_edge_tensors,
         )
-    )
+    else:
+        distances_to_road_edge = simulated_all_trajectories.new_zeros(feature_shape)
 
-    distances_to_road_edge = map_metric_features.compute_distance_to_road_edge(
-        boxes=torch.cat([simulated_all_trajectories[...,0:3], logged_all_trajectories_future[...,3:6].squeeze(0).repeat(simulated_all_trajectories.shape[0],1,1,1), simulated_all_trajectories[...,[3]]],dim=-1),
-        valid=valid_mask,
-        evaluated_object_mask=evaluated_object_mask,
-        road_edge_polylines=road_edges,
-        road_edge_tensors=road_edge_tensors,
-    )
-
-    if version == '2025' and lane_polylines and traffic_signals:
+    if version == '2025' and needs_any('traffic_light_violation') and lane_polylines and traffic_signals:
         if use_log_validity:
-            traffic_light_valid = logged_all_trajectorie_masks
+            traffic_light_valid = logged_all_trajectorie_masks_window
         else:
             traffic_light_valid = torch.cat(
                 [
-                    logged_all_trajectorie_masks[:, :11],
-                    torch.ones_like(logged_all_trajectorie_masks[:, 11:], dtype=torch.bool),
+                    logged_all_trajectorie_masks_window[:, :hist_steps],
+                    torch.ones_like(logged_all_trajectorie_masks_window[:, hist_steps:], dtype=torch.bool),
                 ],
                 dim=1,
+            )
+        traffic_signals_window = traffic_signals[:window_end]
+        traffic_signal_tensor_cache_window = None
+        if traffic_signal_tensor_cache is not None:
+            traffic_signal_tensor_cache_window = tuple(
+                tensor[:window_end] for tensor in traffic_signal_tensor_cache
             )
         red_light_violations = traffic_light_features.compute_red_light_violation(
             center_x=simulated_all_trajectories_with_gt_history[...,0],
@@ -235,10 +286,10 @@ def compute_metric_features(
             evaluated_object_mask=evaluated_object_mask,
             lane_polylines=lane_polylines,
             lane_ids=lane_ids,
-            traffic_signals=traffic_signals,
+            traffic_signals=traffic_signals_window,
             lane_tensor_cache=lane_tensor_cache,
-            traffic_signal_tensor_cache=traffic_signal_tensor_cache,
-        )[:, :, 11:] #[n_rollout,n_agent,n_step]
+            traffic_signal_tensor_cache=traffic_signal_tensor_cache_window,
+        )[:, :, hist_steps:] #[n_rollout,n_agent,n_step]
     else:
         # Cannot compute red light violations without lanes and traffic signals,
         # so we assume no violations.
@@ -284,6 +335,7 @@ def _get_or_compute_log_features(
         *,
         gt_scenario: dict,
         version: str,
+        horizon_steps: int,
         object_ids: torch.Tensor,
         object_types: torch.Tensor,
         logged_all_trajectories: torch.Tensor,
@@ -297,9 +349,10 @@ def _get_or_compute_log_features(
         road_edge_tensors=None,
         lane_tensor_cache=None,
         traffic_signal_tensor_cache=None,
+        required_metric_fields: set[str] | None = None,
 ) -> dict:
-    cache_key = _log_feature_cache_key(gt_scenario, version)
-    cache_max_entries = _read_log_feature_cache_max_entries()
+    cache_key = _log_feature_cache_key(gt_scenario, version, horizon_steps)
+    cache_max_entries = 0 if required_metric_fields is not None else _read_log_feature_cache_max_entries()
     device = logged_all_trajectories.device
 
     if cache_max_entries > 0:
@@ -310,11 +363,16 @@ def _get_or_compute_log_features(
         if cached_features is not None:
             return _clone_feature_tree(cached_features, device=device)
 
+    hist_steps = 11
+    window_end = hist_steps + int(horizon_steps)
+    logged_all_future = logged_all_trajectories[:, hist_steps:window_end, [0, 1, 2, 6]]
+    logged_val_future = logged_val_trajectories[:, hist_steps:window_end, [0, 1, 2, 6]]
+
     log_features = compute_metric_features(
         object_ids,
         object_types,
-        logged_all_trajectories.unsqueeze(0),
-        logged_val_trajectories.unsqueeze(0),
+        logged_all_future.unsqueeze(0),
+        logged_val_future.unsqueeze(0),
         logged_val_trajectories,
         logged_val_trajectorie_masks,
         logged_all_trajectories,
@@ -329,6 +387,7 @@ def _get_or_compute_log_features(
         road_edge_tensors=road_edge_tensors,
         lane_tensor_cache=lane_tensor_cache,
         traffic_signal_tensor_cache=traffic_signal_tensor_cache,
+        required_metric_fields=required_metric_fields,
     )
 
     if cache_max_entries > 0:
@@ -344,6 +403,7 @@ def compute_scenario_rollouts_features(
         gt_scenario: dict,
         scenario_rollouts: dict,
         version: str,
+        required_metric_fields: set[str] | None = None,
 ) -> tuple[dict, dict]:
     """Computes the metrics features for both logged and simulated scenarios.
 
@@ -363,6 +423,11 @@ def compute_scenario_rollouts_features(
     evaluated_sim_agent_ids = gt_scenario['predict_agent_ids']
     pred_agent_ids = scenario_rollouts['agent_id']
     rollout_trajectories = scenario_rollouts['simulated_states']
+    metric_horizon_steps = int(
+        rollout_trajectories.shape[-2] - 11
+        if rollout_trajectories.shape[-2] == 91
+        else rollout_trajectories.shape[-2]
+    )
     gt_trajectories = gt_scenario['tracks']
     traffic_signals = gt_scenario['traffic_signals']
     lane_ids = gt_scenario['lane_ids']
@@ -387,6 +452,7 @@ def compute_scenario_rollouts_features(
     log_features = _get_or_compute_log_features(
         gt_scenario=gt_scenario,
         version=version,
+        horizon_steps=metric_horizon_steps,
         object_ids=all_agent_ids,
         object_types=evaluated_sim_agent_type,
         logged_all_trajectories=logged_all_trajectories,
@@ -400,6 +466,7 @@ def compute_scenario_rollouts_features(
         road_edge_tensors=road_edge_tensors,
         lane_tensor_cache=lane_tensor_cache,
         traffic_signal_tensor_cache=traffic_signal_tensor_cache,
+        required_metric_fields=required_metric_fields,
     )
     segment_num = 32
     sim_features = []
@@ -425,6 +492,7 @@ def compute_scenario_rollouts_features(
                 road_edge_tensors=road_edge_tensors,
                 lane_tensor_cache=lane_tensor_cache,
                 traffic_signal_tensor_cache=traffic_signal_tensor_cache,
+                required_metric_fields=required_metric_fields,
             )
         )
     if not sim_features:
@@ -449,4 +517,4 @@ def compute_scenario_rollouts_features(
     all_sim_feature['speed_validity'] = sim_features[0]['speed_validity']
     all_sim_feature['acceleration_validity'] = sim_features[0]['acceleration_validity']
 
-    return log_features, all_sim_feature, logged_val_trajectorie_masks[:,11:]
+    return log_features, all_sim_feature, logged_val_trajectorie_masks[:,11:11 + metric_horizon_steps]

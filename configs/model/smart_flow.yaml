@@ -170,9 +170,10 @@ model_config:
     train_except_map_encoder: false
     train_full_flow_decoder_only: false
     # ── OCSC (Open-Closed Self-Consistency) finetune mode ──────────────────
-    # mode 가 "ocsc_ft" 이고 enabled=true 이면 training_step 이 self_forced 대신
-    # _run_flow_ocsc_ft_step 으로 분기 (self_forced framework 와 격리).
-    mode: none                          # none / ocsc_ft
+    # mode 가 "ocsc_ft" 또는 "soft_rmm_propagation" 이고 enabled=true 이면
+    # training_step 이 self_forced 대신 closed-loop fine-tune step 으로 분기
+    # (self_forced framework 와 격리).
+    mode: none                          # none / ocsc_ft / soft_rmm_propagation
     # velocity_head_only=true 면 set_model_for_finetuning 의 step_refiner unfreeze 이후
     # __init__ 에서 step_refiner 를 다시 freeze → velocity_head 만 trainable (OCSC clean 정합).
     velocity_head_only: false
@@ -189,3 +190,18 @@ model_config:
     ocsc_strict_active_mask: true       # loss horizon 전체 valid agent 만 OCSC 학습
     ocsc_position_weight: 1.0           # pos L2 weight
     ocsc_heading_weight: 0.01           # heading (cos/sin) L2 weight
+    # ── soft-RMM propagation diagnostic mode ───────────────────────────────
+    # mode="soft_rmm_propagation" 일 때 OCSC의 closed-loop rollout 생성 경로를
+    # 재사용하고, differentiable fast-RMM proxy를 loss로 backprop합니다.
+    soft_rmm_n_rollouts: 4
+    soft_rmm_loss_window_steps: 15      # 10Hz step; 15 = 3 coarse frames @ shift=5 = 1.5s
+    soft_rmm_min_horizon_steps: 15
+    soft_rmm_fields:
+      - linear_speed
+      - linear_acceleration
+      - angular_speed
+      - angular_acceleration
+    soft_rmm_renormalize_weights: true
+    soft_rmm_histogram_temperature: 1.0
+    soft_rmm_indicator_temperature: 0.25
+    soft_rmm_loss_weight: 1.0

@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import sklearn.neighbors as sklearn_neighbors
 import torch
@@ -63,6 +65,89 @@ def log_likelihood_estimate_timeseries(
     return log_likelihood
 
 
+def soft_log_likelihood_estimate_timeseries(
+        feature_config: sim_agents_metrics_pb2.SimAgentMetricsConfig.FeatureConfig,
+        log_values: torch.Tensor,
+        sim_values: torch.Tensor,
+        *,
+        histogram_temperature: float = 1.0,
+        eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Differentiable counterpart of ``log_likelihood_estimate_timeseries``.
+
+    This keeps the same input/output contract as the fast WOSAC estimator, but
+    replaces hard histograms and sklearn KDE with torch-only soft estimates so
+    gradients can flow back to ``sim_values``.  It is an approximation for
+    optimization/debugging, not the official hard scorer.
+    """
+    if log_values.dim() != 2:
+        raise ValueError(f'Log values must be 2D tensor (Actual: {log_values.dim()}D)')
+    if sim_values.dim() != 3:
+        raise ValueError(f'Sim values must be 3D tensor (Actual: {sim_values.dim()}D)')
+
+    n_rollouts, n_objects, n_steps = sim_values.shape
+    if log_values.shape != (n_objects, n_steps):
+        raise ValueError(f'Log values must be of shape: {(n_objects, n_steps)} '
+                                         f'(Actual: {log_values.shape})')
+    if feature_config.independent_timesteps:
+        sim_values = torch.transpose(sim_values, 0, 1).reshape(n_objects, n_rollouts * n_steps)
+    else:
+        sim_values = torch.transpose(sim_values, 0, 2).reshape(n_objects * n_steps, n_rollouts)
+        log_values = log_values.reshape(n_objects * n_steps, 1)
+
+    estimator_kind = feature_config.WhichOneof('estimator')
+    if estimator_kind == 'histogram':
+        log_likelihood = soft_histogram_estimate(
+                feature_config.histogram,
+                log_values,
+                sim_values,
+                temperature=histogram_temperature,
+                eps=eps,
+        )
+    elif estimator_kind == 'kernel_density':
+        log_likelihood = soft_kernel_density_estimate(
+                feature_config.kernel_density,
+                log_values,
+                sim_values,
+                eps=eps,
+        )
+    elif estimator_kind == 'bernoulli':
+        log_likelihood = soft_bernoulli_estimate(
+                feature_config.bernoulli,
+                log_values,
+                sim_values,
+                eps=eps,
+        )
+    else:
+        raise ValueError('`FeatureConfig` contains an invalid estimator. '
+                                         f'Found: {estimator_kind}')
+
+    return log_likelihood.reshape(n_objects, n_steps)
+
+
+def soft_log_likelihood_estimate_scenario_level(
+        feature_config: sim_agents_metrics_pb2.SimAgentMetricsConfig.FeatureConfig,
+        log_values: torch.Tensor,
+        sim_values: torch.Tensor,
+        *,
+        histogram_temperature: float = 1.0,
+        eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Differentiable scenario-level likelihood estimate."""
+    if log_values.dim() != 1:
+        raise ValueError(f'Log values must be 1D tensor (Actual: {log_values.dim()}D)')
+    if sim_values.dim() != 2:
+        raise ValueError(f'Sim values must be 2D tensor (Actual: {sim_values.dim()}D)')
+    timeseries_log_likelihood = soft_log_likelihood_estimate_timeseries(
+            feature_config=feature_config,
+            log_values=log_values.unsqueeze(-1),
+            sim_values=sim_values.unsqueeze(-1),
+            histogram_temperature=histogram_temperature,
+            eps=eps,
+    )
+    return timeseries_log_likelihood[..., 0]
+
+
 def log_likelihood_estimate_scenario_level(
         feature_config: sim_agents_metrics_pb2.SimAgentMetricsConfig.FeatureConfig,
         log_values: torch.Tensor,
@@ -95,6 +180,96 @@ def log_likelihood_estimate_scenario_level(
             sim_values=sim_values.unsqueeze(-1))
     # Shape of `timeseries_log_likelihood`: (n_objects, 1).
     return timeseries_log_likelihood[..., 0]
+
+
+def soft_histogram_estimate(
+        config: sim_agents_metrics_pb2.SimAgentMetricsConfig.HistogramEstimate,
+        log_samples: torch.Tensor,
+        sim_samples: torch.Tensor,
+        *,
+        temperature: float = 1.0,
+        eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Soft, differentiable approximation of ``histogram_estimate``."""
+    batch_size = _assert_and_return_batch_size(log_samples, sim_samples)
+    num_bins = int(config.num_bins)
+    if num_bins <= 0:
+        raise ValueError(f'num_bins must be positive, got {num_bins}.')
+    min_val = float(config.min_val)
+    max_val = float(config.max_val)
+    bin_width = (max_val - min_val) / float(num_bins)
+    if bin_width <= 0.0:
+        raise ValueError('Histogram max_val must be larger than min_val.')
+
+    device = sim_samples.device
+    dtype = sim_samples.dtype if sim_samples.is_floating_point() else torch.float32
+    centers = torch.linspace(
+        min_val + 0.5 * bin_width,
+        max_val - 0.5 * bin_width,
+        num_bins,
+        dtype=dtype,
+        device=device,
+    )
+    sigma = max(float(temperature), eps) * bin_width
+    sim_clean = sim_samples.to(dtype=dtype).nan_to_num(max_val)
+    log_clean = log_samples.to(device=device, dtype=dtype).nan_to_num(max_val)
+
+    sim_logits = -0.5 * ((sim_clean.unsqueeze(-1) - centers) / sigma).square()
+    sim_bin_weights = torch.softmax(sim_logits, dim=-1)
+    sim_counts = sim_bin_weights.sum(dim=1)
+    sim_counts = sim_counts + float(config.additive_smoothing_pseudocount)
+    sim_probs = sim_counts / sim_counts.sum(dim=-1, keepdim=True).clamp_min(eps)
+
+    log_logits = -0.5 * ((log_clean.unsqueeze(-1) - centers) / sigma).square()
+    log_bin_weights = torch.softmax(log_logits, dim=-1)
+    log_probs = torch.log(sim_probs.clamp_min(eps))
+    return (log_bin_weights * log_probs.unsqueeze(1)).sum(dim=-1).reshape(batch_size, -1)
+
+
+def soft_kernel_density_estimate(
+        config: sim_agents_metrics_pb2.SimAgentMetricsConfig.KernelDensityEstimate,
+        log_samples: torch.Tensor,
+        sim_samples: torch.Tensor,
+        *,
+        eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Torch differentiable KDE estimate matching the official normalization."""
+    if config.bandwidth <= 0:
+        raise ValueError(
+                'Bandwidth needs to be positive for KernelDensity estimation.')
+    batch_size = _assert_and_return_batch_size(log_samples, sim_samples)
+    bandwidth = float(config.bandwidth)
+    dtype = sim_samples.dtype if sim_samples.is_floating_point() else torch.float32
+    log_clean = log_samples.to(device=sim_samples.device, dtype=dtype).nan_to_num(0.0)
+    sim_clean = sim_samples.to(dtype=dtype).nan_to_num(0.0)
+    log_kernel = -0.5 * ((log_clean.unsqueeze(-1) - sim_clean.unsqueeze(1)) / bandwidth).square()
+    scores = torch.logsumexp(log_kernel, dim=-1) - math.log(max(int(sim_samples.shape[1]), 1))
+    scores = scores - math.log(np.sqrt(2 * np.pi) * bandwidth)
+    max_score = 1 / (np.sqrt(2 * np.pi) * bandwidth)
+    del eps
+    return scores.reshape(batch_size, -1) - np.log(max_score)
+
+
+def soft_bernoulli_estimate(
+        config: sim_agents_metrics_pb2.SimAgentMetricsConfig.BernoulliEstimate,
+        log_samples: torch.Tensor,
+        sim_samples: torch.Tensor,
+        *,
+        eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Differentiable Bernoulli likelihood for hard or soft simulated samples."""
+    batch_size = _assert_and_return_batch_size(log_samples, sim_samples)
+    del batch_size
+    log_probs_target = log_samples.to(device=sim_samples.device, dtype=torch.float32)
+    sim_probs_sample = sim_samples.to(dtype=torch.float32)
+    smoothing = float(config.additive_smoothing_pseudocount)
+    positive_count = sim_probs_sample.sum(dim=1)
+    denom = float(sim_probs_sample.shape[1]) + 2.0 * smoothing
+    positive_prob = ((positive_count + smoothing) / max(denom, eps)).clamp(eps, 1.0 - eps)
+    return (
+        log_probs_target * torch.log(positive_prob.unsqueeze(1))
+        + (1.0 - log_probs_target) * torch.log1p(-positive_prob.unsqueeze(1))
+    )
 
 
 def histogram_estimate(
