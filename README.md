@@ -205,7 +205,11 @@ bash scripts/download_mdg_cache_to_testas.sh
 `/workspace/womd_v1_3/MDG_cache`에만 동작한다.
 
 ```bash
-CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=1 bash scripts/download_mdg_cache_to_testas.sh
+CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=1 \
+REMOTE_DIR=labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0602 \
+CACHE_ROOT=/workspace/womd_v1_3/MDG_cache \
+NUBES_JOBS=96 \
+bash scripts/download_mdg_cache_to_testas.sh
 ```
 
 다운로드 script 기본값:
@@ -224,6 +228,10 @@ CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=1 bash scripts/download_mdg_cache_to_testas.sh
 pod 내부 tmux session `mdg-cache-download`에서
 `download_mdg_cache_from_nubes.sh`를 실행한다. 로그는
 `/workspace/womd_v1_3/logs/download_mdg_cache_from_nubes_*.log`에 남는다.
+다운로드 로그에는 60초마다 `[download-progress]`가 찍히며, 파일 count 기반 percent와 ETA를 확인할 수 있다.
+완료 기준은 `training=486995`, `validation=44097`, `testing=44920`,
+`validation_tfrecords_splitted=44097`, total `620109`개가 모두 맞고
+`[MDG_CACHE_DOWNLOAD] COMPLETE`가 출력되는 것이다.
 
 기본 config는 cache root 아래 split을 다음처럼 기대한다.
 
