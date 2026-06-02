@@ -229,6 +229,20 @@ bash scripts/start_smart_a100x4x2_testa_pretrain.sh
 | scorer scene 수 | 약 `1680` scenes |
 | W&B | online, project `SMART-FLOW`, entity `jksg01019-naver-labs` |
 
+학습 속도 최적화는 아래 두 가지를 기본 적용한다.
+
+| 항목 | 기본 동작 | 학습 결과 영향 |
+|---|---|---|
+| unused attention weight 저장 제거 | `AttentionLayer`가 loss나 출력에 쓰지 않는 attention weight를 GPU에 따로 보관하지 않는다. | attention 수식과 출력은 바뀌지 않는다. |
+| FourierEmbedding compile | relation Fourier embedding 계산을 `torch.compile(dynamic=True, triton.cudagraphs=False)`로 묶어서 실행한다. | 수식과 파라미터는 유지되며, 부동소수점 연산 순서 차이 수준의 오차만 가능하다. |
+
+Fourier compile이 특정 PyTorch/CUDA 환경에서 문제를 만들면 아래처럼 eager 경로로 되돌릴 수 있다.
+
+```bash
+CATK_COMPILE_FOURIER_EMBEDDING=0 \
+bash scripts/start_smart_a100x4x2_testa_pretrain.sh
+```
+
 실험 이름은 기본적으로 아래 형식으로 생성된다.
 
 ```text
