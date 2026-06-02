@@ -235,10 +235,12 @@ class CrossEntropy(Metric):
                 if not bool(mask.any()) or agent_type not in next_token_logits:
                     continue
                 type_valid_mask = loss_weighting_mask[mask]
+                logits_type = next_token_logits[agent_type]
                 if not bool(type_valid_mask.any()):
+                    zero_touch = logits_type.sum() * 0.0
+                    loss_sum = zero_touch if loss_sum is None else loss_sum + zero_touch
                     continue
 
-                logits_type = next_token_logits[agent_type]
                 gt_idx_type = gt_idx[mask]
                 flat_valid = type_valid_mask.reshape(-1)
                 logits_valid = logits_type.reshape(-1, logits_type.shape[-1])[flat_valid]

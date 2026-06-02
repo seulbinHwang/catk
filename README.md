@@ -281,7 +281,7 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs102_lr75e4_oom_retry_trajtok_hidden124_fastce_trainselectfalse_20260602` |
 | remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_hidden124_20260602` |
 | experiment | `pre_bc_a100x4x2` |
-| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global token matching, direct CE valid-row filtering |
+| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
 | decoder | `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
 | model parameters | `8,247,013` total / trainable, 직접 SMART instantiate로 측정 |
 | train batch | `INITIAL_BS=17` per rank, effective global batch 102 |
@@ -294,7 +294,14 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | train sampler | `data.train_memory_balanced_batching=true` |
 | smoothing | `spatial_aware_smoothing=true`, `spatial_aware_smoothing_mode=paper`, full `[5, x/y/yaw]` trajectory distance |
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, top-48 rollout validation, every 16 epochs |
-| distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=true` |
+| distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=false` |
+
+TrajTok은 vehicle/pedestrian/cyclist type별 token classifier head를 따로 둔다. 어떤
+batch에 특정 type이 없거나 해당 type의 valid loss row가 없으면 DDP가 그 head를
+unused parameter로 볼 수 있으므로, loss 값은 바꾸지 않는 `0 * parameter_sum` /
+`0 * logits_sum` 경로를 붙인다. 이 zero-gradient touch 덕분에
+`find_unused_parameters=false`를 사용해도 type별 head gradient bucket이 항상 안전하게
+연결되고, PyTorch DDP의 unused-parameter extra traversal 비용은 피한다.
 
 현재 TrajTok vocab은 paper-submit recipe 재현용으로 아래 조건에서 생성했다.
 

@@ -6,8 +6,8 @@
 # ranks 0-3 to hsb-npc-training and ranks 4-5 to wo-pvc-2. It starts from the
 # same TrajTok fair-comparison recipe used by the H100x3x2 wrapper: trajtok
 # branch, pre_bc_a100x4x2 experiment, bf16 mixed precision, train/eval agent
-# selection disabled for training, and DDP unused-parameter detection for
-# type-specific classifier heads.
+# selection disabled for training, and zero-gradient-touched type-specific
+# classifier heads with DDP unused-parameter detection disabled.
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -67,7 +67,7 @@ fi
 
 FAIR_COMPARISON_OVERRIDES=(
   "trainer.precision=bf16-mixed"
-  "trainer.strategy.find_unused_parameters=true"
+  "trainer.strategy.find_unused_parameters=false"
   "data.train_use_eval_agent_selection=false"
   "data.train_memory_balanced_batching=true"
   "logger.wandb.group=smart_ntp_pretrain_trajtok_fair_compare"

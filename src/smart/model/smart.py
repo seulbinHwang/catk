@@ -655,6 +655,9 @@ class SMART(LightningModule):
             train_mask=train_mask,  # [n_agent]
             current_epoch=self.current_epoch,
         )
+        token_head_zero_grad_loss = pred.get("token_head_zero_grad_loss")
+        if token_head_zero_grad_loss is not None:
+            loss = loss + token_head_zero_grad_loss
         self.log("train/loss", loss, on_step=True, batch_size=1)
 
         return loss

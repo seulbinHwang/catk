@@ -17,8 +17,8 @@
 #   - data.train_use_eval_agent_selection=false
 #   - mixed precision intent, using fp16 because V100 does not natively support
 #     bf16 training
-#   - DDP unused-parameter detection, because TrajTok type-specific classifier
-#     heads are not guaranteed to be used on every rank in every batch
+#   - zero-gradient-touched type-specific classifier heads with DDP
+#     unused-parameter detection disabled
 #
 # Intentional differences:
 #   - latest trajtok branch instead of main
@@ -42,7 +42,7 @@ export TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-6}"
 
 FAIR_COMPARISON_OVERRIDES=(
   "trainer.precision=16-mixed"
-  "trainer.strategy.find_unused_parameters=true"
+  "trainer.strategy.find_unused_parameters=false"
   "data.train_use_eval_agent_selection=false"
   "logger.wandb.group=smart_ntp_pretrain_trajtok_fair_compare"
   "logger.wandb.job_type=pretrain_trajtok_fair_compare"

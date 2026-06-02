@@ -15,7 +15,8 @@
 #   - TrajTok vocab, type-specific decoder heads, and spatial-aware smoothing
 #   - data.train_use_eval_agent_selection=false
 #   - trainer.accumulate_grad_batches=1 from the preset
-#   - DDP unused-parameter detection for type-specific classifier heads
+#   - zero-gradient-touched type-specific classifier heads with DDP
+#     unused-parameter detection disabled
 #
 # H100-specific runtime choice:
 #   - bf16 mixed precision, because H100 supports bf16 natively.
@@ -37,7 +38,7 @@ export TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-12}"
 
 FAIR_COMPARISON_OVERRIDES=(
   "trainer.precision=bf16-mixed"
-  "trainer.strategy.find_unused_parameters=true"
+  "trainer.strategy.find_unused_parameters=false"
   "data.train_use_eval_agent_selection=false"
   "logger.wandb.group=smart_ntp_pretrain_trajtok_fair_compare"
   "logger.wandb.job_type=pretrain_trajtok_h100x3x2_fair_compare"

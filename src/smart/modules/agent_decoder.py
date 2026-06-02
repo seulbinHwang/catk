@@ -160,6 +160,26 @@ class SMARTAgentDecoder(nn.Module):
             )
         self.apply(weight_init)
 
+    def zero_grad_missing_token_heads(
+        self, type_mask: Dict[str, torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        if not self.multi_token_size:
+            return None
+
+        zero_loss = None
+        for agent_type, mask in type_mask.items():
+            if bool(mask.any()):
+                continue
+            head_zero = None
+            for param in self.token_predict_head[agent_type].parameters():
+                if not param.requires_grad:
+                    continue
+                term = param.sum() * 0.0
+                head_zero = term if head_zero is None else head_zero + term
+            if head_zero is not None:
+                zero_loss = head_zero if zero_loss is None else zero_loss + head_zero
+        return zero_loss
+
     def agent_token_embedding(
         self,
         agent_token_index,  # [n_agent, n_step]
@@ -489,6 +509,7 @@ class SMARTAgentDecoder(nn.Module):
         return {
             # action that goes from [(10->15), ..., (85->90)]
             "next_token_logits": next_token_logits,  # type -> [n_agent_type, 16, n_token_type]
+            "token_head_zero_grad_loss": self.zero_grad_missing_token_heads(type_mask),
             "next_token_valid": tokenized_agent["valid_mask"][:, 1:-1],  # [n_agent, 16]
             "gt_idx": tokenized_agent["gt_idx"][:, 2:],  # [n_agent, 16]
             "gt_valid_mask": tokenized_agent["valid_mask"][:, 2:],  # [n_agent, 16]
@@ -825,6 +846,7 @@ class SMARTAgentDecoder(nn.Module):
         out_dict = {
             # action that goes from [(10->15), ..., (85->90)]
             "next_token_logits": next_token_logits_out,
+            "token_head_zero_grad_loss": self.zero_grad_missing_token_heads(type_mask),
             "next_token_valid": pred_valid[:, 1:-1],  # [n_agent, 16]
             "gt_idx": tokenized_agent["gt_idx"][:, 2:],  # [n_agent, 16]
             "gt_valid_mask": tokenized_agent["valid_mask"][:, 2:],  # [n_agent, 16]
