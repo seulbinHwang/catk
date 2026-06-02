@@ -76,9 +76,10 @@ model:
       #   G개를 batch-replicate 로 동시에 굴려 DMD 신호 variance 를 1/G 로 줄임. VRAM ~G배.
       #   (구버전의 다중 time-anchor 는 self-rollout drift 버그라 제거 → 분산은 여기서 늘린다.)
       n_rollouts: 1
-      # ⚠ n_anchors 는 1 고정.  >1 (단일 rollout 다중 anchor 추출)은 OCSC GT-grounded anchor
-      #   와 다른 self-drift 버그라 코드에서 막혀 있음 (gt_pos history-only + base 전용 exec
-      #   fine-history 때문에 현재 kinematic 모델은 GT-grounded time-anchor 미지원).
+      # time-anchor 수.  OCSC GT-grounded per-anchor(🅐)로 정식 구현됨 — anchor 마다 GT
+      #   current(coarse step k+1, 10Hz shift*(k+2))에서 출발하는 별도 rollout 1 window.
+      #   >1 이면 시나리오당 학습 신호가 anchor 수만큼 늘어남(서로 다른 GT 시점).
+      #   anchor_stride 는 현재 coarse step 단위 1 고정 사용(anchor k current = step k+1).
       n_anchors: 1
       anchor_stride: 1
       sampling:

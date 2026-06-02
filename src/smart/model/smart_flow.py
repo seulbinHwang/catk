@@ -373,26 +373,12 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
-        # ── ★ anchor 추출 정합성 가드 (🅑→🅐) ────────────────────────────────
-        # 구 동작(🅑): 단일 closed-loop rollout 에서 anchor_idx*stride 만큼 들어간 window 를
-        #   잘라 다중 anchor 로 사용 → anchor_idx>0 은 generator 자기 rollout 의 drift 위에서
-        #   출발(GT-grounded 아님).  OCSC(🅐)는 anchor 마다 GT history 로 새로 출발하는데,
-        #   현재 kinematic 모델은 이를 지원하지 못한다:
-        #     (1) tokenized_agent["gt_pos"] 가 history-only (future GT 미포함; future 타깃은
-        #         flow_train_clean_norm 등 별도 키) → future anchor 를 슬라이스할 GT 가 없음.
-        #     (2) LQR/closed-loop 의 exec fine-history(rollout_init_fine_*) 가 base 시점 전용
-        #         → future anchor 의 10Hz history 재구성 불가.
-        #   따라서 OCSC-정합의 올바른 동작은 "단일 GT-grounded anchor(0) + n_rollouts(G)".
-        #   분산/밀도는 self_forced.n_rollouts (= OCSC dmd_n_rollouts) 로 늘린다.
-        if self.self_forced_enabled and int(self.self_forced_n_anchors) != 1:
-            raise ValueError(
-                "self_forced.n_anchors must be 1 in this branch. "
-                "다중 time-anchor(>1)는 단일 rollout 에서 window 를 잘라 쓰던 구 버그(🅑)로, "
-                "뒤 anchor 가 self-rollout drift 위에 얹혀 OCSC GT-grounded anchor 와 다릅니다. "
-                "현재 kinematic 모델은 gt_pos history-only + base 전용 exec fine-history 때문에 "
-                "OCSC 식 GT-grounded time-anchor 를 inference 수정 없이 지원할 수 없습니다. "
-                f"분산은 self_forced.n_rollouts(G)로 늘리세요. got n_anchors={int(self.self_forced_n_anchors)}."
-            )
+        # anchor 추출(🅐): OCSC GT-grounded per-anchor rollout 으로 정식 구현됨.
+        # _training_step_self_forced 가 anchor 마다 GT current 에서 출발하는 별도 rollout 을
+        # 돌리고(_build_self_forced_anchor_rollout_tokens), pack 은 anchor_grounded=True 로
+        # window 0 을 anchor k GT frame 기준 추출한다.  (구 🅑 의 단일 rollout 다중 window
+        # 추출 = self-rollout drift 버그는 제거.)  gt_pos 는 full-episode coarse 라 슬라이스
+        # 가능하고, exec fine-history 는 rollout_full_*_10hz 로 anchor current 에서 재생성.
         # critic(generated estimator) LR.  config에 estimator_lr이 양수로 명시되어 있으면
         # 그 절대값을 그대로 사용 (generator LR 과 동일하게 두고 싶을 때 유용).  값이 없거나
         # ``null`` / ``<= 0`` 이면 기존 비례 관계 ``lr / estimator_updates_per_step`` 을 그대로
@@ -2520,8 +2506,15 @@ class SMARTFlow(LightningModule):
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
         anchor_idx: int = 0,
+        anchor_grounded: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """committed rollout 을 ``anchor_idx`` 번째 anchor 기준 packed flow state 로 변환합니다.
+
+        ``anchor_grounded=True`` (OCSC GT-grounded per-anchor, 🅐): ``rollout`` 이 이미 anchor
+        ``anchor_idx`` 의 GT current 에서 출발한 별도 rollout 이라고 보고 window 0 을 추출,
+        frame 은 anchor ``anchor_idx`` 의 GT current(ctx_sampled_pos[:, 1+k]) 로 정규화한다.
+        ``tokenized_agent`` 은 원본(슬라이스 전) eval 토큰이어야 ctx_sampled / flow_eval_mask
+        가 anchor k 를 올바르게 가리킨다.
 
         Returns:
             packed_path_norm: downstream default — use_kinematic_control_flow=True 면
@@ -2543,6 +2536,7 @@ class SMARTFlow(LightningModule):
             anchor_idx=int(anchor_idx),
             anchor_stride_2hz=int(self.self_forced_anchor_stride),
             shift=int(self.encoder.agent_encoder.shift),
+            rollout_is_anchor_grounded=bool(anchor_grounded),
         )
         packed_path_pose_norm = committed_path_norm_full[anchor_mask]
         if self.use_kinematic_control_flow:
@@ -3025,18 +3019,26 @@ class SMARTFlow(LightningModule):
         n_anchors = max(1, int(self.self_forced_n_anchors))
         denom = float(n_anchors)
         try:
-            if in_estimator_warmup:
-                with torch.no_grad():
-                    rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
-            else:
-                rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
-
             for anchor_idx in range(n_anchors):
+                # OCSC GT-grounded per-anchor(🅐): anchor 마다 GT current 에서 출발하는 별도
+                # rollout.  anchor 입력 토큰 = coarse 키 [:, k:] 슬라이스 + fine-history 를
+                # current_raw_step=shift*(k+2) 로 재생성 (anchor_idx=0 은 원본 그대로).
+                anchor_rollout_tokens = self._build_self_forced_anchor_rollout_tokens(
+                    tokenized_agent_eval, anchor_idx
+                )
+                if in_estimator_warmup:
+                    with torch.no_grad():
+                        rollout = self._run_self_forced_rollout(tokenized_map_eval, anchor_rollout_tokens)
+                else:
+                    rollout = self._run_self_forced_rollout(tokenized_map_eval, anchor_rollout_tokens)
+                # pack 은 원본 tokenized_agent_eval 사용 (ctx_sampled frame + flow_eval_mask 가
+                # anchor_idx=k 의 GT 기준).  anchor_grounded=True → rollout window 0 추출.
                 committed_path_norm, committed_path_pose_norm, anchor_mask = (
                     self._pack_self_forced_committed_rollout(
                         rollout=rollout,
                         tokenized_agent=tokenized_agent_eval,
                         anchor_idx=anchor_idx,
+                        anchor_grounded=True,
                     )
                 )
                 has_committed_local = committed_path_norm.numel() > 0
