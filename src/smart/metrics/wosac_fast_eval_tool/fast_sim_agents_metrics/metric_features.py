@@ -21,10 +21,12 @@ _distance_computation_total_time = 0.0
 _distance_computation_call_count = 0
 _LOG_FEATURE_CACHE: OrderedDict[tuple[str, bool, str], dict] = OrderedDict()
 _LOG_FEATURE_CACHE_LOCK = threading.Lock()
+_LOG_FEATURE_CACHE_HITS = 0
+_LOG_FEATURE_CACHE_MISSES = 0
 
 
 def _read_log_feature_cache_max_entries() -> int:
-    raw_value = os.environ.get("CATK_FAST_WOSAC_LOG_FEATURE_CACHE_MAX_SCENARIOS", "4096")
+    raw_value = os.environ.get("CATK_FAST_WOSAC_LOG_FEATURE_CACHE_MAX_SCENARIOS", "50000")
     try:
         return max(0, int(raw_value))
     except ValueError as exc:
@@ -37,6 +39,31 @@ def _read_log_feature_cache_max_entries() -> int:
 def clear_log_feature_cache() -> None:
     with _LOG_FEATURE_CACHE_LOCK:
         _LOG_FEATURE_CACHE.clear()
+        reset_log_feature_cache_stats()
+
+
+def reset_log_feature_cache_stats() -> None:
+    global _LOG_FEATURE_CACHE_HITS, _LOG_FEATURE_CACHE_MISSES
+    _LOG_FEATURE_CACHE_HITS = 0
+    _LOG_FEATURE_CACHE_MISSES = 0
+
+
+def get_log_feature_cache_stats(*, reset: bool = False) -> dict[str, float]:
+    with _LOG_FEATURE_CACHE_LOCK:
+        hits = _LOG_FEATURE_CACHE_HITS
+        misses = _LOG_FEATURE_CACHE_MISSES
+        size = len(_LOG_FEATURE_CACHE)
+        max_entries = _read_log_feature_cache_max_entries()
+        if reset:
+            reset_log_feature_cache_stats()
+    total = hits + misses
+    return {
+        "hits": float(hits),
+        "misses": float(misses),
+        "hit_rate": float(hits / total) if total > 0 else 0.0,
+        "size": float(size),
+        "max_entries": float(max_entries),
+    }
 
 
 def _clone_feature_tree(value, *, device: torch.device | str):
@@ -297,7 +324,8 @@ def _get_or_compute_log_features(
         road_edge_tensors=None,
         lane_tensor_cache=None,
         traffic_signal_tensor_cache=None,
-) -> dict:
+	) -> dict:
+    global _LOG_FEATURE_CACHE_HITS, _LOG_FEATURE_CACHE_MISSES
     cache_key = _log_feature_cache_key(gt_scenario, version)
     cache_max_entries = _read_log_feature_cache_max_entries()
     device = logged_all_trajectories.device
@@ -307,8 +335,14 @@ def _get_or_compute_log_features(
             cached_features = _LOG_FEATURE_CACHE.get(cache_key)
             if cached_features is not None:
                 _LOG_FEATURE_CACHE.move_to_end(cache_key)
+                _LOG_FEATURE_CACHE_HITS += 1
+            else:
+                _LOG_FEATURE_CACHE_MISSES += 1
         if cached_features is not None:
             return _clone_feature_tree(cached_features, device=device)
+    else:
+        with _LOG_FEATURE_CACHE_LOCK:
+            _LOG_FEATURE_CACHE_MISSES += 1
 
     log_features = compute_metric_features(
         object_ids,

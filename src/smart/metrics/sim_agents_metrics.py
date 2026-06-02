@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import threading
+import hashlib
 from concurrent.futures import Future, ThreadPoolExecutor, wait as futures_wait
 from collections import OrderedDict
 from importlib.metadata import PackageNotFoundError, version
@@ -87,11 +88,14 @@ _TF_RUNTIME_CONFIGURED = False
 _TF_RUNTIME_LOCK = threading.Lock()
 _GT_SCENARIO_CACHE: OrderedDict[tuple[str, bool], dict] = OrderedDict()
 _GT_SCENARIO_CACHE_LOCK = threading.Lock()
+_GT_SCENARIO_CACHE_HITS = 0
+_GT_SCENARIO_CACHE_MISSES = 0
 
 
 def _clear_sim_agents_caches() -> None:
     with _GT_SCENARIO_CACHE_LOCK:
         _GT_SCENARIO_CACHE.clear()
+        _reset_gt_scenario_cache_stats_locked()
     fast_metric_features.clear_log_feature_cache()
 
 
@@ -106,7 +110,36 @@ def _read_nonnegative_int_env(var_name: str, default: int) -> int:
 
 
 def _gt_scenario_cache_max_entries() -> int:
-    return _read_nonnegative_int_env("CATK_FAST_WOSAC_GT_CACHE_MAX_SCENARIOS", 4096)
+    return _read_nonnegative_int_env("CATK_FAST_WOSAC_GT_CACHE_MAX_SCENARIOS", 50000)
+
+
+def _reset_gt_scenario_cache_stats_locked() -> None:
+    global _GT_SCENARIO_CACHE_HITS, _GT_SCENARIO_CACHE_MISSES
+    _GT_SCENARIO_CACHE_HITS = 0
+    _GT_SCENARIO_CACHE_MISSES = 0
+
+
+def _reset_gt_scenario_cache_stats() -> None:
+    with _GT_SCENARIO_CACHE_LOCK:
+        _reset_gt_scenario_cache_stats_locked()
+
+
+def _get_gt_scenario_cache_stats(*, reset: bool = False) -> dict[str, float]:
+    with _GT_SCENARIO_CACHE_LOCK:
+        hits = _GT_SCENARIO_CACHE_HITS
+        misses = _GT_SCENARIO_CACHE_MISSES
+        size = len(_GT_SCENARIO_CACHE)
+        max_entries = _gt_scenario_cache_max_entries()
+        if reset:
+            _reset_gt_scenario_cache_stats_locked()
+    total = hits + misses
+    return {
+        "hits": float(hits),
+        "misses": float(misses),
+        "hit_rate": float(hits / total) if total > 0 else 0.0,
+        "size": float(size),
+        "max_entries": float(max_entries),
+    }
 
 
 def _trim_gt_scenario_cache(max_entries: int) -> None:
@@ -264,6 +297,7 @@ def _load_gt_scenario_for_device(
     ego_only: bool,
     device: torch.device,
 ) -> dict:
+    global _GT_SCENARIO_CACHE_HITS, _GT_SCENARIO_CACHE_MISSES
     cache_key = (scenario_file, ego_only)
     cache_max_entries = _gt_scenario_cache_max_entries()
     gt_scenario = None
@@ -272,6 +306,12 @@ def _load_gt_scenario_for_device(
             gt_scenario = _GT_SCENARIO_CACHE.get(cache_key)
             if gt_scenario is not None:
                 _GT_SCENARIO_CACHE.move_to_end(cache_key)
+                _GT_SCENARIO_CACHE_HITS += 1
+            else:
+                _GT_SCENARIO_CACHE_MISSES += 1
+    else:
+        with _GT_SCENARIO_CACHE_LOCK:
+            _GT_SCENARIO_CACHE_MISSES += 1
     if gt_scenario is None:
         gt_scenario = extract_gt_scenario(
             _load_scenario_proto(scenario_file, ego_only),
@@ -512,6 +552,8 @@ class SimAgentsMetrics(Metric):
         self._executor: ThreadPoolExecutor | None = None
         self._pending_futures: list[Future] = []
         self._max_pending_futures = max(1, self._max_workers * 2)
+        self.cache_metric_namespace = f"{self.prefix}/{_SIM_AGENTS_2025_NAMESPACE}_cache"
+        self._reset_scenario_order_stats()
 
     @staticmethod
     def _compute_scenario_metrics(
@@ -529,6 +571,37 @@ class SimAgentsMetrics(Metric):
 
     def _use_worker_pool(self) -> bool:
         return self._max_workers > 1
+
+    def _reset_scenario_order_stats(self) -> None:
+        self._scenario_order_hasher = hashlib.blake2s(digest_size=8)
+        self._scenario_order_count = 0
+
+    def _record_scenario_file(self, scenario_file: str) -> None:
+        self._scenario_order_hasher.update(str(scenario_file).encode("utf-8"))
+        self._scenario_order_hasher.update(b"\0")
+        self._scenario_order_count += 1
+
+    def get_cache_metrics(self, *, reset: bool = False) -> dict[str, float]:
+        gt_stats = _get_gt_scenario_cache_stats(reset=reset)
+        log_stats = fast_metric_features.get_log_feature_cache_stats(reset=reset)
+        order_hash = int.from_bytes(self._scenario_order_hasher.digest()[:4], "big")
+        metrics = {
+            f"{self.cache_metric_namespace}/gt_cache_hits": gt_stats["hits"],
+            f"{self.cache_metric_namespace}/gt_cache_misses": gt_stats["misses"],
+            f"{self.cache_metric_namespace}/gt_cache_hit_rate": gt_stats["hit_rate"],
+            f"{self.cache_metric_namespace}/gt_cache_size": gt_stats["size"],
+            f"{self.cache_metric_namespace}/gt_cache_max_entries": gt_stats["max_entries"],
+            f"{self.cache_metric_namespace}/log_feature_cache_hits": log_stats["hits"],
+            f"{self.cache_metric_namespace}/log_feature_cache_misses": log_stats["misses"],
+            f"{self.cache_metric_namespace}/log_feature_cache_hit_rate": log_stats["hit_rate"],
+            f"{self.cache_metric_namespace}/log_feature_cache_size": log_stats["size"],
+            f"{self.cache_metric_namespace}/log_feature_cache_max_entries": log_stats["max_entries"],
+            f"{self.cache_metric_namespace}/scenario_order_count": float(self._scenario_order_count),
+            f"{self.cache_metric_namespace}/scenario_order_hash32": float(order_hash),
+        }
+        if reset:
+            self._reset_scenario_order_stats()
+        return metrics
 
     def _ensure_executor(self) -> ThreadPoolExecutor:
         if self._executor is None:
@@ -604,6 +677,7 @@ class SimAgentsMetrics(Metric):
     def reset(self) -> None:
         self._drain_completed_futures(wait=True, drain_all=True)
         super().reset()
+        self.get_cache_metrics(reset=True)
 
     def _update_metric_states(
         self,
@@ -686,6 +760,7 @@ class SimAgentsMetrics(Metric):
         self._update_count += 1
 
         for scenario_file, scenario_rollout in zip(scenario_files, scenario_rollouts):
+            self._record_scenario_file(scenario_file)
             if self._use_worker_pool():
                 self._submit_scenario_metrics_from_rollout(
                     scenario_file=scenario_file,
@@ -749,6 +824,7 @@ class SimAgentsMetrics(Metric):
             scenario_pred_z,
             scenario_pred_head,
         ) in scenario_payloads:
+            self._record_scenario_file(scenario_file)
             if self._use_worker_pool():
                 self._submit_scenario_metrics_from_arrays(
                     scenario_file=scenario_file,

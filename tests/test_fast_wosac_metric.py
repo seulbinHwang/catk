@@ -83,6 +83,20 @@ def test_sim_agents_metric_workers_match_sequential_payload_updates(monkeypatch)
     assert set(worker_output) == set(sequential_output)
     for key, sequential_value in sequential_output.items():
         torch.testing.assert_close(worker_output[key], sequential_value)
+    sequential_cache_metrics = sequential_metric.get_cache_metrics(reset=False)
+    worker_cache_metrics = worker_metric.get_cache_metrics(reset=False)
+    assert (
+        sequential_cache_metrics["bench/sim_agents_2025_cache/scenario_order_count"]
+        == len(payloads)
+    )
+    assert (
+        worker_cache_metrics["bench/sim_agents_2025_cache/scenario_order_count"]
+        == len(payloads)
+    )
+    assert (
+        worker_cache_metrics["bench/sim_agents_2025_cache/scenario_order_hash32"]
+        == sequential_cache_metrics["bench/sim_agents_2025_cache/scenario_order_hash32"]
+    )
 
 
 @pytest.mark.skipif(

@@ -20,8 +20,8 @@ model_config:
   # the same scenario count across OCSC/pretrain/DMD runs. Set null or 0 to
   # keep the explicit n_batch_sim_agents_metric value.
   scorer_scene_num: 1728
-  # Backward-compatible knob. Fast WOSAC runs on the current torch device and
-  # no longer launches the old official-scorer worker pool.
+  # Fast WOSAC scenario-level metric worker threads. Keep validation quality
+  # unchanged while parallelizing independent scenario scoring on CPU.
   sim_agents_metric_workers: 8
   n_vis_batch: 0
   n_vis_scenario: 0

@@ -4130,6 +4130,10 @@ open_metric_dict:
                 closed_loop_metric = epoch_sim_agents_metrics[self.closed_loop_metric_name]
                 if self.global_rank == 0 and minade_value is not None:
                     epoch_sim_agents_metrics[self.val_closed_minade_name] = minade_value
+                if self.global_rank == 0:
+                    epoch_sim_agents_metrics.update(
+                        self.sim_agents_metrics.get_cache_metrics(reset=False)
+                    )
                 self.log(
                     self.closed_loop_metric_name,
                     closed_loop_metric,

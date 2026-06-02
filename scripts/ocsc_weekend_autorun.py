@@ -1063,6 +1063,8 @@ def base_env(args: argparse.Namespace) -> dict[str, str]:
         "TMUX_LOG_TAIL": "false",
         "WANDB_TAGS": "[ocsc_weekend_autorun]",
         "WEIGHT_DECAY": "1.0e-4",
+        "CATK_FAST_WOSAC_GT_CACHE_MAX_SCENARIOS": "50000",
+        "CATK_FAST_WOSAC_LOG_FEATURE_CACHE_MAX_SCENARIOS": "50000",
     }
 
 
