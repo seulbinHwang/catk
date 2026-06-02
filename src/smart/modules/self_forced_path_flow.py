@@ -104,6 +104,7 @@ def build_anchor_k_normalized_committed_path(
     anchor_stride_2hz: int = 1,
     shift: int = 5,
     pos_scale_m: float = 20.0,
+    rollout_is_anchor_grounded: bool = False,
 ) -> Tensor:
     """``anchor_idx`` 번째 anchor 기준의 정규화 committed path 를 만듭니다.
 
@@ -111,6 +112,14 @@ def build_anchor_k_normalized_committed_path(
     × ``shift`` (= 0.5초 commit block) 10Hz step 입니다.  origin 은 anchor 0 일 때
     ``ctx_sampled_pos[:, 1]`` (history 끝) 이고, ``anchor_idx > 0`` 일 때는
     ``pred_traj_10hz[:, start_10hz - 1]`` (rollout 진행 후 commit pose) 입니다.
+
+    ``rollout_is_anchor_grounded=True`` (OCSC GT-grounded per-anchor, 🅐):
+      pred_traj_10hz 가 이미 anchor ``anchor_idx`` 의 GT current 에서 출발한 별도 rollout
+      이라고 가정한다.  그러면 추출은 rollout window 0 (``start_10hz=0``) 에서,
+      frame origin 은 self-rollout commit pose 가 아니라 anchor ``anchor_idx`` 의 GT current
+      (``ctx_sampled_pos[:, 1 + anchor_idx]``) 에서 잡는다.  (구 ``False`` 동작은 단일
+      rollout 에서 ``start_10hz`` 만큼 들어간 window 를 self-commit pose 기준으로 추출 →
+      anchor>0 이 self-rollout drift 위에 얹히는 🅑 버그.)
 
     Args:
         pred_traj_10hz: closed-loop 결과 ``[n_agent, T_rollout, 2]``.
@@ -133,14 +142,18 @@ def build_anchor_k_normalized_committed_path(
         raise ValueError("pred_traj_10hz must have shape [n_agent, T, 2].")
     if pred_head_10hz.shape[:2] != pred_traj_10hz.shape[:2]:
         raise ValueError("pred_head_10hz must have shape [n_agent, T] matching pred_traj_10hz.")
-    start_10hz = int(anchor_idx) * int(anchor_stride_2hz) * int(shift)
+    if rollout_is_anchor_grounded:
+        # 🅐 GT-grounded: rollout 이 이미 anchor 시점에서 출발 → window 0 추출.
+        start_10hz = 0
+    else:
+        start_10hz = int(anchor_idx) * int(anchor_stride_2hz) * int(shift)
     end_10hz = start_10hz + int(flow_window_steps)
     if pred_traj_10hz.shape[1] < end_10hz:
         raise ValueError(
             "Committed rollout shorter than anchor window: "
             f"need {end_10hz} 10Hz steps for anchor_idx={anchor_idx} "
-            f"(stride_2hz={anchor_stride_2hz}, shift={shift}, window={flow_window_steps}), "
-            f"got {pred_traj_10hz.shape[1]}."
+            f"(stride_2hz={anchor_stride_2hz}, shift={shift}, window={flow_window_steps}, "
+            f"anchor_grounded={rollout_is_anchor_grounded}), got {pred_traj_10hz.shape[1]}."
         )
     if "ctx_sampled_pos" not in tokenized_agent or "ctx_sampled_heading" not in tokenized_agent:
         raise KeyError("tokenized_agent must contain ctx_sampled_pos and ctx_sampled_heading.")
@@ -148,11 +161,17 @@ def build_anchor_k_normalized_committed_path(
     path_pos = pred_traj_10hz[:, start_10hz:end_10hz]
     path_head = pred_head_10hz[:, start_10hz:end_10hz]
 
-    if anchor_idx == 0:
+    if rollout_is_anchor_grounded:
+        # frame origin = anchor anchor_idx 의 GT current (ctx_sampled_pos[:, 1+k]).
+        # ctx_sampled_pos[:, 0]=anchor 0 history 시작, [:, 1]=anchor 0 current, …,
+        # [:, 1+k]=anchor k current (GT).  self-rollout commit pose 미사용.
+        current_pos = tokenized_agent["ctx_sampled_pos"][:, 1 + int(anchor_idx)]
+        current_head = tokenized_agent["ctx_sampled_heading"][:, 1 + int(anchor_idx)]
+    elif anchor_idx == 0:
         current_pos = tokenized_agent["ctx_sampled_pos"][:, 1]
         current_head = tokenized_agent["ctx_sampled_heading"][:, 1]
     else:
-        # rollout commit pose at last step before this anchor.
+        # rollout commit pose at last step before this anchor (🅑, self-rollout origin).
         origin_step = start_10hz - 1
         current_pos = pred_traj_10hz[:, origin_step]
         current_head = pred_head_10hz[:, origin_step]

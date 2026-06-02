@@ -2308,12 +2308,103 @@ class SMARTFlow(LightningModule):
         )
         return replicated_map, replicated_agent
 
+    @staticmethod
+    def _build_anchor_fine_exec_history(
+        pos10: Tensor,
+        head10: Tensor,
+        valid10: Tensor,
+        current_raw_step: int,
+        shift: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """anchor 의 current_raw_step(10Hz) 기준 최근 ``shift+1`` 개 fine exec-history.
+
+        base ``TokenProcessor._build_rollout_init_fine_history`` 를 임의 current_raw_step
+        으로 일반화 (OCSC GT-grounded per-anchor 용).  raw step
+        ``[current_raw_step-shift : current_raw_step+1]`` 을 쓰고 길이가 모자라면 앞을 반복.
+        VR4: 마지막 step 이 anchor current.
+        """
+        n_step = int(pos10.shape[1])
+        current_raw_step = min(int(current_raw_step), n_step - 1)
+        start = max(current_raw_step - int(shift), 0)
+        pos_h = pos10[:, start : current_raw_step + 1].contiguous()
+        head_h = head10[:, start : current_raw_step + 1].contiguous()
+        valid_h = valid10[:, start : current_raw_step + 1].contiguous()
+        history_len = int(shift) + 1
+        if pos_h.shape[1] < history_len:
+            pad = history_len - pos_h.shape[1]
+            pos_h = torch.cat([pos_h[:, :1].expand(-1, pad, -1), pos_h], dim=1)
+            head_h = torch.cat([head_h[:, :1].expand(-1, pad), head_h], dim=1)
+            valid_h = torch.cat([valid_h[:, :1].expand(-1, pad), valid_h], dim=1)
+        else:
+            pos_h = pos_h[:, -history_len:].contiguous()
+            head_h = head_h[:, -history_len:].contiguous()
+            valid_h = valid_h[:, -history_len:].contiguous()
+        return pos_h, head_h, valid_h
+
+    @staticmethod
+    def _anchor_rollout_tokens_static(
+        tokenized_agent: Dict[str, Tensor],
+        anchor_idx: int,
+        shift: int,
+    ) -> Dict[str, Tensor]:
+        """anchor ``anchor_idx`` 의 GT-grounded rollout 입력 토큰을 만든다 (🅐).
+
+        coarse 키(gt_pos/gt_heading/valid_mask/gt_idx)를 ``[:, anchor_idx:]`` 로 슬라이스
+        (VR3: cache 의 ``[:, :step_current_2hz]`` 가 anchor k history window 가 됨) 하고,
+        exec fine-history 를 anchor current_raw_step=``shift*(anchor_idx+2)`` 기준으로
+        rollout_full_*_10hz 에서 재생성 (VR4).  anchor_idx==0 이면 입력 그대로 (VR6).
+        score 평가용 ctx_* 키는 슬라이스하지 않는다 (anchor_idx 로 인덱싱).
+        """
+        k = int(anchor_idx)
+        if k == 0:
+            return tokenized_agent
+        out: Dict[str, Tensor] = dict(tokenized_agent)
+        for key in ("gt_pos", "gt_heading", "valid_mask", "gt_idx"):
+            v = tokenized_agent.get(key)
+            if torch.is_tensor(v) and v.dim() >= 2 and int(v.shape[1]) > k:
+                out[key] = v[:, k:].contiguous()
+        fine_keys = (
+            "rollout_full_pos_10hz",
+            "rollout_full_head_10hz",
+            "rollout_full_valid_10hz",
+        )
+        if all(fk in tokenized_agent for fk in fine_keys):
+            cur = int(shift) * (k + 2)
+            ph, hh, vh = SMARTFlow._build_anchor_fine_exec_history(
+                tokenized_agent["rollout_full_pos_10hz"],
+                tokenized_agent["rollout_full_head_10hz"],
+                tokenized_agent["rollout_full_valid_10hz"],
+                current_raw_step=cur,
+                shift=int(shift),
+            )
+            out["rollout_init_fine_pos_history"] = ph
+            out["rollout_init_fine_head_history"] = hh
+            out["rollout_init_fine_valid_history"] = vh
+            out["rollout_init_fine_pos_pair"] = ph[:, -2:].contiguous()
+            out["rollout_init_fine_head_pair"] = hh[:, -2:].contiguous()
+            out["rollout_init_fine_valid_pair"] = vh[:, -2:].contiguous()
+        for fk in fine_keys:
+            out.pop(fk, None)
+        return out
+
+    def _build_self_forced_anchor_rollout_tokens(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_idx: int,
+    ) -> Dict[str, Tensor]:
+        """``_anchor_rollout_tokens_static`` 의 instance wrapper (shift 주입)."""
+        return self._anchor_rollout_tokens_static(
+            tokenized_agent=tokenized_agent,
+            anchor_idx=int(anchor_idx),
+            shift=int(self.encoder.agent_encoder.shift),
+        )
+
     def _get_self_forced_rollout_steps_2hz(self) -> int:
         """0.5 초 commit block 수.
 
-        multi-anchor 학습 (n_anchors > 1) 시 마지막 anchor 의 window 끝까지 rollout 이
-        필요하므로 ``(n_anchors - 1) * anchor_stride + flow_window_steps / 5`` 로 늘어남.
-        single-anchor (default) 면 기존 동작과 동일 (``flow_window_steps / 5``).
+        OCSC GT-grounded per-anchor(🅐) 에서는 anchor 마다 별도 rollout 을 window 길이만큼만
+        돌리므로 항상 ``flow_window_steps / 5`` (= 1 window).  (구 🅑 의 단일 rollout 다중
+        window 추출용 ``(n_anchors-1)*stride`` 확장은 제거.)
         """
         if self.flow_window_steps % 5 != 0:
             raise ValueError(
@@ -2321,8 +2412,7 @@ class SMARTFlow(LightningModule):
                 f"got {self.flow_window_steps}."
             )
         window_2hz = int(self.flow_window_steps // 5)
-        extra = (int(self.self_forced_n_anchors) - 1) * int(self.self_forced_anchor_stride)
-        return max(1, window_2hz + max(0, extra))
+        return max(1, window_2hz)
 
     def _sample_flow_state_from_clean(self, clean_path_norm: Tensor):
         """현재 Generator의 flow path 규칙으로 전체 tau 구간의 noisy path를 만듭니다.

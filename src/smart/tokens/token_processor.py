@@ -198,6 +198,13 @@ class TokenProcessor(torch.nn.Module):
                     "rollout_init_fine_pos_history": rollout_init_fine_pos_history,
                     "rollout_init_fine_head_history": rollout_init_fine_head_history,
                     "rollout_init_fine_valid_history": rollout_init_fine_valid_history,
+                    # Full 10Hz GT trajectory (eval-only, additive).  OCSC self_forcing_dmd
+                    # GT-grounded per-anchor rollout 에서 anchor k(current_raw_step=shift*(k+2))
+                    # 의 fine exec-history 를 재구성하는 데 사용.  rollout 기본 동작에는 영향 없음
+                    # (base anchor 0 은 위 rollout_init_fine_*_history 를 그대로 사용).
+                    "rollout_full_pos_10hz": pos,
+                    "rollout_full_head_10hz": heading,
+                    "rollout_full_valid_10hz": valid,
                 }
             )
 
