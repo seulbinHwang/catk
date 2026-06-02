@@ -260,6 +260,14 @@ class SMART(LightningModule):
             if not self.sim_agents_submission.is_active:
                 epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
                 epoch_sim_agents_metrics["val_closed/ADE"] = self.minADE.compute()
+                self.log_dict(
+                    epoch_sim_agents_metrics,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=False,
+                    sync_dist=False,
+                    batch_size=1,
+                )
                 if self.global_rank == 0:
                     epoch_sim_agents_metrics["epoch"] = (
                         self.log_epoch if self.log_epoch >= 0 else self.current_epoch
