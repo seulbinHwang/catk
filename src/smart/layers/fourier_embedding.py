@@ -1,5 +1,4 @@
 import math
-import os
 from typing import List, Optional
 
 import torch
@@ -32,45 +31,7 @@ class FourierEmbedding(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self._compiled_embed_continuous = None
-        self._compile_continuous = os.environ.get(
-            "CATK_COMPILE_FOURIER_EMBEDDING", "1"
-        ).lower() not in {"0", "false", "off", "no"}
         self.apply(weight_init)
-
-    def _embed_continuous_accumulated(self, continuous_inputs: torch.Tensor) -> torch.Tensor:
-        x = continuous_inputs.unsqueeze(-1) * self.freqs.weight * 2 * math.pi
-        # Warning: if your data are noisy, don't use learnable sinusoidal embedding
-        x = torch.cat([x.cos(), x.sin(), continuous_inputs.unsqueeze(-1)], dim=-1)
-        continuous_emb = self.mlps[0](x[:, 0])
-        for i in range(1, self.input_dim):
-            continuous_emb = continuous_emb + self.mlps[i](x[:, i])
-        return continuous_emb
-
-    def _embed_continuous(self, continuous_inputs: torch.Tensor) -> torch.Tensor:
-        if not self._compile_continuous or not torch.cuda.is_available():
-            return self._embed_continuous_accumulated(continuous_inputs)
-        try:
-            if self._compiled_embed_continuous is None:
-                self._compiled_embed_continuous = torch.compile(
-                    self._embed_continuous_accumulated,
-                    dynamic=True,
-                    # SMART batches have dynamic edge counts. Keep Inductor
-                    # compilation but avoid CUDA graph capture across steps.
-                    options={"triton.cudagraphs": False},
-                )
-            return self._compiled_embed_continuous(continuous_inputs)
-        except Exception:
-            self._compile_continuous = False
-            self._compiled_embed_continuous = None
-            return self._embed_continuous_accumulated(continuous_inputs)
-
-    @staticmethod
-    def _sum_embeddings(embs: List[torch.Tensor]) -> torch.Tensor:
-        x = embs[0]
-        for emb in embs[1:]:
-            x = x + emb
-        return x
 
     def forward(
         self,
@@ -79,13 +40,19 @@ class FourierEmbedding(nn.Module):
     ) -> torch.Tensor:
         if continuous_inputs is None:
             if categorical_embs is not None:
-                x = self._sum_embeddings(categorical_embs)
+                x = torch.stack(categorical_embs).sum(dim=0)
             else:
                 raise ValueError("Both continuous_inputs and categorical_embs are None")
         else:
-            x = self._embed_continuous(continuous_inputs)
+            x = continuous_inputs.unsqueeze(-1) * self.freqs.weight * 2 * math.pi
+            # Warning: if your data are noisy, don't use learnable sinusoidal embedding
+            x = torch.cat([x.cos(), x.sin(), continuous_inputs.unsqueeze(-1)], dim=-1)
+            continuous_embs: List[Optional[torch.Tensor]] = [None] * self.input_dim
+            for i in range(self.input_dim):
+                continuous_embs[i] = self.mlps[i](x[:, i])
+            x = torch.stack(continuous_embs).sum(dim=0)
             if categorical_embs is not None:
-                x = x + self._sum_embeddings(categorical_embs)
+                x = x + torch.stack(categorical_embs).sum(dim=0)
         return self.to_out(x)
 
 
