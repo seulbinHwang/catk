@@ -28,7 +28,7 @@ from src.smart.utils import (
 )
 
 
-DEFAULT_AGENT_TOKEN_MATCH_CHUNK_SIZE = 256
+DEFAULT_AGENT_TOKEN_MATCH_CHUNK_SIZE = 384
 
 
 def _clean_heading_dense_impl(valid: Tensor, heading: Tensor) -> Tensor:
@@ -270,19 +270,28 @@ class TokenProcessor(torch.nn.Module):
             _invalid_mask = ~_valid_mask
             out_dict["valid_mask"].append(_valid_mask)
 
-            token_idx_gt, token_endpoint_gt = self._match_full_trajectory_agent_token(
-                token_trajectory=token_trajectory,
-                gt_pos=pos[:, i - self.shift + 1 : i + 1],
-                gt_heading=heading[:, i - self.shift + 1 : i + 1],
-                prev_pos=prev_pos,
-                prev_head=prev_head,
+            token_idx_gt = torch.zeros(
+                n_agent, dtype=torch.long, device=valid.device
             )
+
+            match_prev_pos, match_prev_head = prev_pos, prev_head
 
             # udpate prev_pos, prev_head
             prev_head = heading[:, i].clone()
-            prev_head[_valid_mask] = token_endpoint_gt[:, 2][_valid_mask]
             prev_pos = pos[:, i].clone()
-            prev_pos[_valid_mask] = token_endpoint_gt[:, :2][_valid_mask]
+            valid_idx = _valid_mask.nonzero(as_tuple=True)[0]
+            token_idx_valid, token_endpoint_valid = (
+                self._match_full_trajectory_agent_token(
+                    token_trajectory=token_trajectory,
+                    gt_pos=pos[valid_idx, i - self.shift + 1 : i + 1],
+                    gt_heading=heading[valid_idx, i - self.shift + 1 : i + 1],
+                    prev_pos=match_prev_pos[valid_idx],
+                    prev_head=match_prev_head[valid_idx],
+                )
+            )
+            token_idx_gt[valid_idx] = token_idx_valid
+            prev_head[valid_idx] = token_endpoint_valid[:, 2]
+            prev_pos[valid_idx] = token_endpoint_valid[:, :2]
             # add to output dict
             out_dict["token_idx"].append(token_idx_gt)
             out_dict["tokenized_pos"].append(

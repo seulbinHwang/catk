@@ -1047,13 +1047,29 @@ train cache로 외삽 벡터화를 검증했다.
 | 단일 H100 microbenchmark | batch size 13, 464 agents | 외삽 함수 `29.14ms -> 0.73ms`, 전체 `TokenProcessor` `87.79ms -> 59.12ms` |
 | H100 4+2 DDP profile | train batch size 13, 6 ranks, 10 measured steps | step `770.82ms -> 674.37ms` (`1.14x`), `TokenProcessor` `153.27ms -> 70.17ms` (`2.18x`) |
 
+추가로 agent token matching은 loss와 decoder edge에 실제로 쓰이는 valid coarse step만
+nearest-token matching을 수행한다. invalid coarse step의 token id는 mask 밖 값이라
+학습 supervision에 쓰이지 않으므로 0으로 둔다. valid step의 `token_idx`,
+`tokenized_pos`, `tokenized_heading`은 기존 all-agent matching과 같고, matching chunk
+size는 H100 microbenchmark에서 가장 빠른 `384`를 기본값으로 사용한다.
+
+2026-06-03에 같은 `hsb-npc-training` H100 4장 + `wo-pvc-2` H100 2장 환경에서 이
+추가 최적화를 검증했다.
+
+| 검증 | 조건 | 결과 |
+|---|---|---|
+| GPU unit parity | 실제 TrajTok vocab, CUDA, 2,048 vehicle token subset | 기존 거리식과 `idx_mismatch=0`, endpoint max abs `0.0` |
+| real-cache parity | train cache batch size 13, random scene scale/time shift 적용 | valid supervision `token_idx` mismatch `0`, `tokenized_pos/heading` max abs `0.0` |
+| H100 chunk sweep | 8 real train batches, TokenProcessor-only CUDA timing | chunk `256: 46.50ms`, `384: 45.22ms`, `512: 45.27ms`; `384` 선택 |
+| H100 4+2 DDP profile | train batch size 13, 6 ranks, 15 measured steps, validation off | step `659.91ms -> 646.80ms` (`1.020x`), `TokenProcessor` `72.35ms -> 61.74ms` (`1.172x`) |
+
 Agent token matching은 TrajTok 공식 구현과 같은 teacher-forced recurrence를 유지한다.
-각 coarse step마다 candidate token contour를 직전 token 상태 기준 global 좌표로 펼치고,
-global GT contour와 직접 비교해 nearest token을 고른다. 선택된 global token contour의
-중심과 heading으로 다음 step의 기준 pose를 갱신하므로, `gt_*`와 `sampled_*` label은
-공식 TrajTok tokenization과 일치한다. 큰 batch에서 peak tensor가 튀지 않도록 agent 축만
-chunk 단위로 나눠 처리하지만, chunk 안의 거리식과 argmin/update 규칙은 공식 구현과
-같다.
+각 coarse step마다 GT 0.5초 segment를 직전 token 상태 기준 local frame으로 변환하고,
+같은 local frame의 token trajectory와 평균 error를 비교해 nearest token을 고른다.
+선택된 token endpoint를 다시 global pose로 변환해 다음 step의 기준 pose를 갱신하므로,
+`gt_*`와 `sampled_*` label은 teacher-forced tokenization 의미를 유지한다. 큰 batch에서
+peak tensor가 튀지 않도록 agent 축만 chunk 단위로 나눠 처리하지만, chunk 안의 거리식과
+argmin/update 규칙은 같다.
 
 DDP validation/test에서는 각 rank가 validation/test sample을 복제 없이 정확히 한
 번씩 나눠 처리한다. 일반 distributed sampler처럼 dataset 길이를 world size에 맞추기
