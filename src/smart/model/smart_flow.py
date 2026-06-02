@@ -4,6 +4,7 @@ import copy
 import gc
 import hashlib
 import math
+import torch.nn.functional as F
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Sequence
@@ -286,6 +287,12 @@ class SMARTFlow(LightningModule):
             raise ValueError(
                 f"self_forced.dmd_beta must be > 0, got {self.self_forced_dmd_beta}."
             )
+        # OCSC self_forcing_dmd 정합: Self-Forcing abs-mean normalizer (|pred_x0_real|) on/off.
+        self.self_forced_dmd_normalize = (
+            bool(getattr(self.self_forced_config, "dmd_normalize", True))
+            if self.self_forced_config is not None
+            else True
+        )
         self.self_forced_distribution_matching_objective = (
             str(getattr(self.self_forced_config, "distribution_matching_objective", "dmd")).lower()
             if self.self_forced_config is not None
@@ -2784,29 +2791,109 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: scalar 분포 맞춤 loss입니다. shape은 ``[]`` 입니다.
         """
-        if self.self_forced_distribution_matching_objective == "sid":
-            return self._compute_self_forced_sid_loss(
+        # ── OCSC_clean self_forcing_dmd 정합 — Self-Forcing DMD synthetic gradient ──
+        # OCSC `_run_flow_dmd_ft_step` 의 generator loss 를 현재 inference primitive
+        # (`_predict_path_flow_clean_estimate`, `flow_ode`) 로 그대로 재현한다.
+        #   τ ~ U(eps, 1) (full range),  x_t = σ_τ·ε + τ·x_gen.detach()
+        #   pred_x0_{r,f} = β·x_t + σ_τ·v_{r,f}        (v = real/fake score velocity)
+        #   g = (1/β)·pred_x0_fake − pred_x0_real
+        #   g_n = g / normalizer,  normalizer = |pred_x0_real|.mean(path) (OCSC 정합)
+        #   target = (x_gen − g_n).detach(),  L_gen = 0.5·MSE(x_gen, target)
+        # β=1 vanilla / β<1 diversity↑ / β>1 sharpening.  (구 path_step_size·guidance-τ·
+        # |committed−real| normalizer 는 OCSC 와 불일치라 제거.)
+        if str(self.self_forced_distribution_matching_objective) != "dmd":
+            raise ValueError(
+                "renew 포트 이후에는 OCSC self_forcing_dmd objective 만 지원합니다; "
+                f"got distribution_matching_objective={self.self_forced_distribution_matching_objective!r}."
+            )
+        if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
+            raise RuntimeError("self-forced auxiliary models are not initialized.")
+
+        flow_ode = self.encoder.agent_encoder.flow_ode
+        beta = float(self._dmd_effective_beta())
+        inv_beta = 1.0 / beta
+        use_normalize = bool(self.self_forced_dmd_normalize)
+
+        x_gen = committed_path_norm  # generator graph (grad ON)
+        self.self_forced_target_teacher.eval()
+        self.self_forced_generated_estimator.eval()
+        self._clear_self_forced_auxiliary_gradients()
+        with torch.no_grad():
+            x_gen_d = x_gen.detach()
+            tau = torch.rand(
+                x_gen_d.shape[0], device=x_gen_d.device, dtype=x_gen_d.dtype
+            ) * (1.0 - float(flow_ode.eps)) + float(flow_ode.eps)
+            noise = torch.randn_like(x_gen_d)
+            view_tau = tau.view(-1, 1, 1)
+            view_sigma = flow_ode._sigma_t(tau).view(-1, 1, 1)
+            x_t = view_sigma * noise + view_tau * x_gen_d
+
+            real_pred = self._predict_path_flow_clean_estimate(
+                decoder=self.self_forced_target_teacher,
                 tokenized_map=tokenized_map,
                 tokenized_agent=tokenized_agent,
-                committed_path_norm=committed_path_norm,
+                noisy_path_norm=x_t,
+                tau=tau,
                 anchor_mask=anchor_mask,
                 anchor_idx=int(anchor_idx),
             )
+            fake_pred = self._predict_path_flow_clean_estimate(
+                decoder=self.self_forced_generated_estimator,
+                tokenized_map=tokenized_map,
+                tokenized_agent=tokenized_agent,
+                noisy_path_norm=x_t,
+                tau=tau,
+                anchor_mask=anchor_mask,
+                anchor_idx=int(anchor_idx),
+            )
+            beta_path = float(flow_ode._beta())
+            pred_x0_real = beta_path * x_t + view_sigma * real_pred["velocity"].to(dtype=x_t.dtype)
+            pred_x0_fake = beta_path * x_t + view_sigma * fake_pred["velocity"].to(dtype=x_t.dtype)
+            g_dmd = inv_beta * pred_x0_fake - pred_x0_real
+            if use_normalize:
+                normalizer = pred_x0_real.abs().mean(dim=(-2, -1), keepdim=True).clamp_min(1e-7)
+                g_n = g_dmd / normalizer
+            else:
+                g_n = g_dmd
+            g_n = torch.nan_to_num(g_n, nan=0.0, posinf=0.0, neginf=0.0)
 
-        path_delta = self._compute_self_forced_direction(
-            tokenized_map=tokenized_map,
-            tokenized_agent=tokenized_agent,
-            committed_path_norm=committed_path_norm,
-            anchor_mask=anchor_mask,
-            anchor_idx=int(anchor_idx),
-        )
-        target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
+        target = (x_gen - g_n.to(dtype=x_gen.dtype)).detach()
         self._set_self_forced_backward_context(
-            committed_path_norm=committed_path_norm,
-            path_delta=path_delta,
-            target_path_norm=target_path_norm,
+            committed_path_norm=x_gen,
+            dmd_direction=g_n,
+            target_path_norm=target,
         )
-        return masked_mean_square_loss(committed_path_norm, target_path_norm)
+        return 0.5 * F.mse_loss(x_gen, target, reduction="mean")
+
+    def _dmd_effective_beta(self) -> float:
+        """현재 step 의 effective DMD β (OCSC β annealing 정합).
+
+        warmup 동안 β=1.0 유지 → anneal 동안 1.0 → ``dmd_beta`` linear ramp →
+        이후 ``dmd_beta`` 고정.  warmup/anneal step 이 0 이면 상수 β(``dmd_beta``).
+        """
+        beta_final = float(self.self_forced_dmd_beta)
+        cfg = self.self_forced_config
+        beta_warmup = int(getattr(cfg, "dmd_beta_warmup_steps", 0) or 0) if cfg is not None else 0
+        beta_anneal = int(getattr(cfg, "dmd_beta_anneal_steps", 0) or 0) if cfg is not None else 0
+        if beta_final == 1.0 or beta_anneal <= 0:
+            beta = beta_final
+        else:
+            stepped = 0
+            _trainer = getattr(self, "trainer", None)
+            _fit_loop = getattr(_trainer, "fit_loop", None) if _trainer is not None else None
+            _epoch_loop = getattr(_fit_loop, "epoch_loop", None) if _fit_loop is not None else None
+            if _epoch_loop is not None:
+                stepped = int(getattr(_epoch_loop, "_batches_that_stepped", 0) or 0)
+            if stepped < beta_warmup:
+                beta = 1.0
+            elif stepped < beta_warmup + beta_anneal:
+                progress = (stepped - beta_warmup) / float(beta_anneal)
+                beta = 1.0 + (beta_final - 1.0) * progress
+            else:
+                beta = beta_final
+        if not (beta > 0.0):
+            raise ValueError(f"dmd_beta_effective must be > 0, got {beta} (target={beta_final}).")
+        return beta
 
     def on_fit_start(self) -> None:
         """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.
