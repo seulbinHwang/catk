@@ -410,8 +410,15 @@ class TokenProcessor(torch.nn.Module):
         while agent_type.dim() > 1:
             if agent_type.shape[-1] == 1:
                 agent_type = agent_type.squeeze(-1)
-            else:
+            elif (
+                agent_type.shape[-1] == 3
+                and bool((agent_type <= 1).all().item())
+                and bool((agent_type.sum(dim=-1) == 1).all().item())
+            ):
                 agent_type = agent_type.argmax(dim=-1)
+            else:
+                agent_type = agent_type.reshape(-1)
+                break
         return agent_type.reshape(-1)
 
     def _get_agent_shape(self, agent_type: Tensor) -> Tensor:
@@ -426,17 +433,17 @@ class TokenProcessor(torch.nn.Module):
                 마지막 차원은 ``[width, length]`` 순서입니다.
         """
         agent_type = self._normalize_agent_type(agent_type)
-        n_agent = agent_type.shape[0]
-        agent_shape = torch.zeros(
-            (n_agent, 2),
+        shape_table = torch.tensor(
+            [
+                [2.0, 4.8],
+                [1.0, 1.0],
+                [1.0, 2.0],
+            ],
             device=agent_type.device,
             dtype=torch.float32,
         )
-        agent_type_masks = self._build_agent_type_masks(agent_type)
-        agent_shape[agent_type_masks["veh"]] = agent_shape.new_tensor([2.0, 4.8])
-        agent_shape[agent_type_masks["ped"]] = agent_shape.new_tensor([1.0, 1.0])
-        agent_shape[agent_type_masks["cyc"]] = agent_shape.new_tensor([1.0, 2.0])
-        return agent_shape
+        agent_type_index = agent_type.long().clamp(min=0, max=shape_table.shape[0] - 1)
+        return shape_table[agent_type_index]
 
 
     def _build_local_contour_sequence(

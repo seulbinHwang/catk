@@ -82,6 +82,7 @@ def test_token_processor_normalizes_extra_dim_agent_type() -> None:
         agent_type.long(),
         num_classes=3,
     ).view(3, 1, 3)
+    batched_class_id = torch.tensor([[0, 1, 2], [2, 1, 0]], dtype=torch.uint8)
 
     torch.testing.assert_close(processor._normalize_agent_type(agent_type), agent_type)
     torch.testing.assert_close(processor._normalize_agent_type(agent_type_singleton), agent_type)
@@ -90,8 +91,26 @@ def test_token_processor_normalizes_extra_dim_agent_type() -> None:
         agent_type.long(),
     )
     torch.testing.assert_close(
+        processor._normalize_agent_type(batched_class_id),
+        torch.tensor([0, 1, 2, 2, 1, 0], dtype=torch.uint8),
+    )
+    torch.testing.assert_close(
         processor._get_agent_shape(agent_type_one_hot),
         processor._get_agent_shape(agent_type),
+    )
+    torch.testing.assert_close(
+        processor._get_agent_shape(batched_class_id),
+        torch.tensor(
+            [
+                [2.0, 4.8],
+                [1.0, 1.0],
+                [1.0, 2.0],
+                [1.0, 2.0],
+                [1.0, 1.0],
+                [2.0, 4.8],
+            ],
+            dtype=torch.float32,
+        ),
     )
 
 
