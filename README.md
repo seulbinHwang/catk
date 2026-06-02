@@ -278,10 +278,10 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | branch | `trajtok` |
 | pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
-| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs102_lr75e4_oom_retry_trajtok_hidden124_trainselectfalse_20260602` |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs102_lr75e4_oom_retry_trajtok_hidden124_fastce_trainselectfalse_20260602` |
 | remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_hidden124_20260602` |
 | experiment | `pre_bc_a100x4x2` |
-| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global token matching |
+| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global token matching, direct CE valid-row filtering |
 | decoder | `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
 | model parameters | `8,247,013` total / trainable, 직접 SMART instantiate로 측정 |
 | train batch | `INITIAL_BS=17` per rank, effective global batch 102 |
@@ -325,7 +325,7 @@ bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 장기 학습을 remote tmux에 시작한 뒤 로컬 shell을 바로 돌려받고 싶으면 `START_ONLY=1`을
 쓴다. 이 모드는 첫 attempt만 시작하고 OOM-retry loop를 붙이지 않으므로, OOM 자동 재시작까지
 원하면 `START_ONLY` 없이 wrapper를 그대로 실행한다.
-기본 task name은 `globalbs102`와 `lr75e4`를 포함하므로, 기존 `globalbs108` run의 checkpoint를
+기본 task name은 `globalbs102`, `lr75e4`, `fastce`를 포함하므로, 기존 `globalbs108` run의 checkpoint를
 이어 쓰지 않는 fresh start다. `globalbs108` 시도에서는 `INITIAL_BS=18`이 epoch 0의
 151/4510 step에서 CUDA OOM으로 실패했고, 같은 pod 조합에서 `INITIAL_BS=17`은 같은 지점을
 넘어 진행되는 것을 확인했다. 같은 task 안에서 OOM이 발생한 경우에만 해당 task의 최신
@@ -338,8 +338,8 @@ START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_ret
 실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok
-kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-fastce
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-fastce
 
 STOP=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 ```
