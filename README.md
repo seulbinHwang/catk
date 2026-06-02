@@ -248,13 +248,13 @@ bash scripts/start_smart_a100x4x2_testa_pretrain.sh
 실험 이름은 기본적으로 아래 형식으로 생성된다.
 
 ```text
-smart_pretrain_a100x4x2_smart_raw_fast_rmm_<YYYYMMDD_HHMMSS>
+smart_pretrain_a100x4x2_smart_raw_staticmap_tokenfast_fast_rmm_<YYYYMMDD_HHMMSS>
 ```
 
 고정 이름이나 batch를 쓰려면 환경 변수로 넘긴다.
 
 ```bash
-TASK_NAME=smart_pretrain_a100x4x2_smart_raw_fast_rmm_probe \
+TASK_NAME=smart_pretrain_a100x4x2_smart_raw_staticmap_tokenfast_fast_rmm_probe \
 TRAIN_BATCH_SIZE=10 \
 bash scripts/start_smart_a100x4x2_testa_pretrain.sh
 ```
