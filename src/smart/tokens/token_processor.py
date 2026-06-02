@@ -371,20 +371,45 @@ class TokenProcessor(torch.nn.Module):
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         # [n_agent], max will give the first True step
         first_valid_step = torch.max(valid, dim=1).indices
+        n_step_to_extrapolate = first_valid_step % self.shift
+        if valid.shape[1] > 10:
+            force_history_token = (first_valid_step == 10) & (
+                ~valid[:, 10 - self.shift]
+            )
+            n_step_to_extrapolate = torch.where(
+                force_history_token,
+                n_step_to_extrapolate.new_full((), self.shift),
+                n_step_to_extrapolate,
+            )
 
-        for i, t in enumerate(first_valid_step):  # extrapolate to previous 5th step.
-            n_step_to_extrapolate = t % self.shift
-            if (t == 10) and (not valid[i, 10 - self.shift]):
-                # such that at least one token is valid in the history.
-                n_step_to_extrapolate = self.shift
+        offsets = torch.arange(self.shift, device=valid.device)
+        start_step = first_valid_step - n_step_to_extrapolate
+        fill_times = start_step[:, None] + offsets[None, :]
+        fill_mask = offsets[None, :] < n_step_to_extrapolate[:, None]
 
-            if n_step_to_extrapolate > 0:
-                vel[i, t - n_step_to_extrapolate : t] = vel[i, t]
-                valid[i, t - n_step_to_extrapolate : t] = True
-                heading[i, t - n_step_to_extrapolate : t] = heading[i, t]
+        agent_idx = torch.arange(valid.shape[0], device=valid.device)[:, None]
+        agent_idx = agent_idx.expand_as(fill_times)[fill_mask]
+        fill_times = fill_times[fill_mask]
+        source_times = first_valid_step[agent_idx]
+        source_vel = vel[agent_idx, source_times]
+        source_heading = heading[agent_idx, source_times]
 
-                for j in range(n_step_to_extrapolate):
-                    pos[i, t - j - 1] = pos[i, t - j] - vel[i, t] * 0.1
+        valid[agent_idx, fill_times] = True
+        vel[agent_idx, fill_times] = source_vel
+        heading[agent_idx, fill_times] = source_heading
+        all_agents = torch.arange(valid.shape[0], device=valid.device)
+        for offset in range(self.shift):
+            active_mask = n_step_to_extrapolate > offset
+            active_agents = all_agents[active_mask]
+            if active_agents.numel() == 0:
+                continue
+            active_source_times = first_valid_step[active_agents]
+            source_pos_step = active_source_times - offset
+            target_pos_step = source_pos_step - 1
+            pos[active_agents, target_pos_step] = (
+                pos[active_agents, source_pos_step]
+                - vel[active_agents, active_source_times] * 0.1
+            )
 
         return valid, pos, heading, vel
 
