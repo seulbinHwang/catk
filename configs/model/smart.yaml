@@ -39,7 +39,7 @@ model_config:
     num_k: -1 # for k nearest neighbors, set to -1 to turn-off closed-loop training
     temp: 1.0
   decoder:
-    hidden_dim: 128
+    hidden_dim: 124
     num_freq_bands: 64
     num_heads: 8
     head_dim: 16
