@@ -325,6 +325,9 @@ bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 장기 학습을 remote tmux에 시작한 뒤 로컬 shell을 바로 돌려받고 싶으면 `START_ONLY=1`을
 쓴다. 이 모드는 첫 attempt만 시작하고 OOM-retry loop를 붙이지 않으므로, OOM 자동 재시작까지
 원하면 `START_ONLY` 없이 wrapper를 그대로 실행한다.
+기본 task name은 이전 `lr=6e-4` H100 4+2 run과 다르게 `lr75e4`를 포함하므로 처음 실행은
+기존 task checkpoint를 이어 쓰지 않는 fresh start다. 같은 `lr75e4` task 안에서 OOM이 발생한
+경우에만 해당 task의 최신 `epoch_last.ckpt`로 재시작한다.
 
 ```bash
 START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
