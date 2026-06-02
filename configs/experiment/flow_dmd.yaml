@@ -28,9 +28,10 @@ action: finetune
 
 model:
   model_config:
-    # Self-Forcing paper lr (critic = generator lr; dmd_fake_lr_scale=1.0 정합).
-    # 운영 시 1e-7 까지 낮춰 안정화 가능 (OCSC v22).
-    lr: 2.0e-6
+    # generator lr (static; self_forced 경로는 scheduler 없이 상수 lr).
+    lr: 1.0e-6
+    lr_warmup_steps: 0
+    lr_total_steps: -1
     n_rollout_closed_val: 32
     sim_agents_context_cache_size: 64
     n_vis_batch: 0
@@ -52,22 +53,24 @@ model:
       # pure DMD: BC anchor FM term 끔.
       use_anchor_flow_matching_loss: false
       anchor_weight: 0.0
-      # critic(fake_score) update: anchor 마다 1 FM step (Self-Forcing 정합).
-      estimator_updates_per_step: 1
-      # critic warmup 끔 (OCSC dmd_warmup_fake_only_steps=0 정합).
+      # cadence fake:gen = 3:1 — critic(fake) anchor 마다 3 FM step, generator 는 batch당 1 step.
+      estimator_updates_per_step: 3
+      # critic(fake) lr (절대값; >0 이면 lr/updates 비례식 대신 그대로 사용).
+      estimator_lr: 1.0e-5
+      # fake-only warmup: 첫 200 step 은 critic 만 학습(generator no-op).
+      estimator_warmup_steps: 200
       estimator_warmup_epochs: 0
       # Training self-rollout 전용. Inference/validation stop-motion 은 decoder 쪽.
       use_stop_motion: false
       # fresh finetune 은 pretrained Generator 로 target_teacher/critic/EMA sync.
       initialize_aux_from_generator_on_fit_start: true
-      # ── OCSC self_forcing_dmd 정합 (★ conditioning 공유) ──────────────
-      # full_flow_decoder = generator·critic 모두 agent_encoder.flow_decoder 만 학습,
-      # context/map 인코더는 freeze. teacher 는 전체 freeze.
-      # → gen/teacher/critic 의 인코더가 항상 frozen-identical → anchor conditioning
-      #   (anchor_hidden) 이 byte-identical → OCSC 의 단일 cond_d 공유와 행동적 동치.
-      #   real/fake score 는 동일 x_t·동일 conditioning 에서 flow_decoder 가중치만
-      #   다르게 평가됨 (OCSC ref vs fake_score 와 bit-정합).
-      unfrozen_range: full_flow_decoder
+      # ── 학습 scope (★ conditioning 공유) ──────────────────────────────
+      # velocity_head_only = generator·critic 모두 flow_decoder.velocity_head(=flow head)만
+      #   학습, 나머지(context/map 인코더, chunk/step) 전부 freeze. teacher 는 전체 freeze.
+      # → gen/teacher/critic 인코더가 항상 frozen-identical → anchor conditioning 이
+      #   byte-identical → OCSC 단일 cond_d 공유와 행동적 동치. real/fake 는 동일 x_t·
+      #   conditioning 에서 head 가중치만 다르게 평가됨.
+      unfrozen_range: velocity_head_only
       # Generator EMA (Self-Forcing 표준). 0.0 이면 validation 이 online weight 사용.
       ema_weight: 0.99
       ema_start_step: 50
@@ -76,12 +79,12 @@ model:
       #   G개를 batch-replicate 로 동시에 굴려 DMD 신호 variance 를 1/G 로 줄임. VRAM ~G배.
       #   (구버전의 다중 time-anchor 는 self-rollout drift 버그라 제거 → 분산은 여기서 늘린다.)
       n_rollouts: 1
-      # time-anchor 수.  OCSC GT-grounded per-anchor(🅐)로 정식 구현됨 — anchor 마다 GT
-      #   current(coarse step k+1, 10Hz shift*(k+2))에서 출발하는 별도 rollout 1 window.
-      #   >1 이면 시나리오당 학습 신호가 anchor 수만큼 늘어남(서로 다른 GT 시점).
-      #   anchor_stride 는 현재 coarse step 단위 1 고정 사용(anchor k current = step k+1).
-      n_anchors: 1
-      anchor_stride: 1
+      # time-anchor: OCSC GT-grounded per-anchor(🅐).  j 번째 anchor = token anchor j*stride
+      #   = GT coarse step (j*stride)+1 에서 출발하는 별도 rollout 1 window.
+      # n_anchors=4, anchor_stride=4(2초 간격, coarse 4 step) → anchor 가 ~1·3·5·7초 GT 시점.
+      #   제약: (n_anchors-1)*stride <= 15 (anchor grid 16).
+      n_anchors: 4
+      anchor_stride: 4
       sampling:
         sample_steps: 16
         sample_method: euler
@@ -97,7 +100,9 @@ ckpt_path: null
 trainer:
   limit_train_batches: 1.0
   limit_val_batches: 0.1
-  check_val_every_n_epoch: 8
+  # validation 을 400 train step 마다 (epoch 단위 아님).
+  check_val_every_n_epoch: null
+  val_check_interval: 400
   max_epochs: 16
   precision: bf16-mixed
   # Manual optimization → Lightning auto grad clip 금지. clip 은
@@ -112,7 +117,7 @@ callbacks:
     mode: max
 
 data:
-  train_batch_size: 8
+  train_batch_size: 16
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4

@@ -373,6 +373,19 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
+        # token anchor index 범위 가드: j 번째 anchor 의 token index = j*stride 가 anchor
+        # grid(FLOW_TRAIN_ANCHOR_COUNT=16 / FLOW_CONTEXT_TOKEN_COUNT=18)를 넘으면 안 됨.
+        # path_flow_velocity_for_anchor_k 는 ctx_hidden_pack 길이 >= 2+token 을 요구 → token<=16,
+        # flow_eval_mask 는 16 anchors → token<=15.  보수적으로 (n_anchors-1)*stride<=15.
+        if self.self_forced_enabled:
+            _max_token_anchor = (int(self.self_forced_n_anchors) - 1) * int(self.self_forced_anchor_stride)
+            if _max_token_anchor > 15:
+                raise ValueError(
+                    "self_forced (n_anchors-1)*anchor_stride must be <= 15 "
+                    f"(anchor grid 한계), got n_anchors={int(self.self_forced_n_anchors)}, "
+                    f"anchor_stride={int(self.self_forced_anchor_stride)} → max token anchor "
+                    f"index {_max_token_anchor}.  n_anchors 또는 anchor_stride 를 줄이세요."
+                )
         # anchor 추출(🅐): OCSC GT-grounded per-anchor rollout 으로 정식 구현됨.
         # _training_step_self_forced 가 anchor 마다 GT current 에서 출발하는 별도 rollout 을
         # 돌리고(_build_self_forced_anchor_rollout_tokens), pack 은 anchor_grounded=True 로
@@ -3020,11 +3033,15 @@ class SMARTFlow(LightningModule):
         denom = float(n_anchors)
         try:
             for anchor_idx in range(n_anchors):
+                # anchor_stride: anchor 간격(coarse 2Hz step).  j 번째 anchor 의 token anchor
+                # index = j*stride → GT coarse step (j*stride)+1.  stride=4 면 2초 간격
+                # (10Hz shift*(j*stride+2)).  stride=1 이면 연속(0.5초).
+                token_anchor_idx = int(anchor_idx) * int(self.self_forced_anchor_stride)
                 # OCSC GT-grounded per-anchor(🅐): anchor 마다 GT current 에서 출발하는 별도
                 # rollout.  anchor 입력 토큰 = coarse 키 [:, k:] 슬라이스 + fine-history 를
-                # current_raw_step=shift*(k+2) 로 재생성 (anchor_idx=0 은 원본 그대로).
+                # current_raw_step=shift*(k+2) 로 재생성 (token_anchor_idx=0 은 원본 그대로).
                 anchor_rollout_tokens = self._build_self_forced_anchor_rollout_tokens(
-                    tokenized_agent_eval, anchor_idx
+                    tokenized_agent_eval, token_anchor_idx
                 )
                 if in_estimator_warmup:
                     with torch.no_grad():
@@ -3032,12 +3049,12 @@ class SMARTFlow(LightningModule):
                 else:
                     rollout = self._run_self_forced_rollout(tokenized_map_eval, anchor_rollout_tokens)
                 # pack 은 원본 tokenized_agent_eval 사용 (ctx_sampled frame + flow_eval_mask 가
-                # anchor_idx=k 의 GT 기준).  anchor_grounded=True → rollout window 0 추출.
+                # token_anchor_idx 의 GT 기준).  anchor_grounded=True → rollout window 0 추출.
                 committed_path_norm, committed_path_pose_norm, anchor_mask = (
                     self._pack_self_forced_committed_rollout(
                         rollout=rollout,
                         tokenized_agent=tokenized_agent_eval,
-                        anchor_idx=anchor_idx,
+                        anchor_idx=token_anchor_idx,
                         anchor_grounded=True,
                     )
                 )
@@ -3056,7 +3073,7 @@ class SMARTFlow(LightningModule):
                     committed_path_norm=committed_path_norm,
                     anchor_mask=anchor_mask,
                     has_committed_path_global=has_committed_global,
-                    anchor_idx=anchor_idx,
+                    anchor_idx=token_anchor_idx,
                     preserve_generator_gradients=(not in_estimator_warmup and anchor_idx > 0),
                 )
                 per_rollout_gen_est_losses.append(gen_estimator_loss)
@@ -3073,7 +3090,7 @@ class SMARTFlow(LightningModule):
                         committed_path_norm=committed_path_norm,
                         committed_path_pose_norm=committed_path_pose_norm,
                         anchor_mask=anchor_mask,
-                        anchor_idx=anchor_idx,
+                        anchor_idx=token_anchor_idx,
                     )
                 else:
                     sf_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
