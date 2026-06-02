@@ -137,7 +137,7 @@ class TokenProcessor(torch.nn.Module):
                 - 추가 반환: ``valid [n_agent, n_step]``, ``pos [n_agent, n_step, 2]``,
                   ``heading [n_agent, n_step]``를 담은 전처리 결과 사전.
         """
-        agent_type = self._normalize_agent_type(data["agent"]["type"])
+        agent_type = data["agent"]["type"]
         agent_shape = self._get_agent_shape(agent_type)
 
         valid = data["agent"]["valid_mask"]
@@ -405,13 +405,6 @@ class TokenProcessor(torch.nn.Module):
         """
         return build_agent_type_masks(agent_type)
 
-    def _normalize_agent_type(self, agent_type: Tensor) -> Tensor:
-        if agent_type.dim() <= 1:
-            return agent_type
-        if agent_type.shape[-1] == 1:
-            return agent_type.reshape(-1)
-        return agent_type.argmax(dim=-1)
-
     def _get_agent_shape(self, agent_type: Tensor) -> Tensor:
         """토큰화에 쓰는 고정 가로, 세로 크기를 차종별로 붙입니다.
 
@@ -423,7 +416,6 @@ class TokenProcessor(torch.nn.Module):
                 토큰화 기준 가로, 세로 크기입니다. shape은 ``[n_agent, 2]`` 입니다.
                 마지막 차원은 ``[width, length]`` 순서입니다.
         """
-        agent_type = self._normalize_agent_type(agent_type)
         n_agent = agent_type.shape[0]
         agent_shape = torch.zeros(
             (n_agent, 2),

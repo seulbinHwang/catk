@@ -3791,69 +3791,6 @@ class SMARTFlow(LightningModule):
             "simulated_states": simulated_states,
         }
 
-    def _soft_rmm_build_gt_scenario_from_batch(
-        self,
-        data,
-        *,
-        scenario_index: int,
-    ) -> dict:
-        """Build the minimal GT scenario dict needed by fast metric features.
-
-        Train cache batches do not carry split TFRecord paths.  For kinematic
-        soft-RMM diagnostics we can still score against the cached GT trajectory
-        tensors directly.  Map/traffic-light fields are left empty, so callers
-        should keep ``soft_rmm_fields`` to kinematic metrics for train-set runs.
-        """
-        agent_batch = data["agent"]["batch"]
-        scenario_mask = agent_batch == int(scenario_index)
-        if not bool(scenario_mask.any()):
-            raise RuntimeError(f"No agents found for scenario_index={scenario_index}.")
-
-        agent = data["agent"]
-        position = agent["position"][scenario_mask]
-        heading = agent["heading"][scenario_mask]
-        shape = agent["shape"][scenario_mask]
-        valid_mask = agent["valid_mask"][scenario_mask]
-        agent_id = agent["id"][scenario_mask].to(dtype=torch.int64)
-        agent_type = agent["type"][scenario_mask]
-        if agent_type.dim() > 1:
-            if agent_type.shape[-1] == 1:
-                agent_type = agent_type.reshape(-1)
-            else:
-                agent_type = agent_type.argmax(dim=-1)
-
-        tracks = position.new_zeros((*position.shape[:2], 7))
-        tracks[..., :3] = position[..., :3]
-        tracks[..., 3:6] = shape[:, None, :3].expand(-1, position.shape[1], -1)
-        tracks[..., 6] = heading
-
-        role = agent.get("role", None)
-        predict_agent_ids = agent_id
-        if role is not None:
-            predict_mask = role[scenario_mask, 2].bool()
-            if bool(predict_mask.any()):
-                predict_agent_ids = agent_id[predict_mask]
-
-        scenario_ids = data.get("scenario_id", None)
-        scenario_id = (
-            str(scenario_ids[int(scenario_index)])
-            if scenario_ids is not None
-            else f"train_batch_{int(scenario_index)}"
-        )
-        return {
-            "scenario_id": scenario_id,
-            "object_ids": agent_id,
-            "object_types": agent_type.to(dtype=torch.int32),
-            "sim_agent_ids": agent_id,
-            "predict_agent_ids": predict_agent_ids,
-            "tracks": tracks,
-            "track_masks": valid_mask.bool(),
-            "traffic_signals": [[] for _ in range(int(position.shape[1]))],
-            "lane_ids": [],
-            "lane_polylines": [],
-            "road_edges": [],
-        }
-
     def _soft_rmm_metric_fields(self, ft) -> Sequence[str] | str | None:
         fields = getattr(
             ft,
@@ -3880,15 +3817,15 @@ class SMARTFlow(LightningModule):
         pred_head: Tensor,  # [G, N, T]
     ) -> tuple[Tensor, dict[str, Tensor]]:
         ft = self.finetune_config
+        if "tfrecord_path" not in data:
+            raise RuntimeError("soft_rmm_propagation requires data['tfrecord_path'] for GT scenario loading.")
         agent_batch = data["agent"]["batch"]
-        scenario_files = data.get("tfrecord_path", None)
-        scenario_ids = data.get("scenario_id", None)
-        if scenario_files is not None and scenario_ids is not None and len(scenario_files) != len(scenario_ids):
+        scenario_files = data["tfrecord_path"]
+        if len(scenario_files) != len(data["scenario_id"]):
             raise RuntimeError(
                 "soft_rmm_propagation expected tfrecord_path and scenario_id to have the same batch length, "
                 f"got {len(scenario_files)} and {len(data['scenario_id'])}."
             )
-        num_scenarios = len(scenario_ids) if scenario_ids is not None else int(agent_batch.max().item()) + 1
 
         rmm_values: list[Tensor] = []
         ade_values: list[Tensor] = []
@@ -3896,7 +3833,7 @@ class SMARTFlow(LightningModule):
         renormalize = bool(getattr(ft, "soft_rmm_renormalize_weights", True))
         histogram_temperature = float(getattr(ft, "soft_rmm_histogram_temperature", 1.0))
         indicator_temperature = float(getattr(ft, "soft_rmm_indicator_temperature", 0.25))
-        for scenario_index in range(int(num_scenarios)):
+        for scenario_index, scenario_file in enumerate(scenario_files):
             scenario_mask = agent_batch == int(scenario_index)
             if not bool(scenario_mask.any()):
                 continue
@@ -3909,17 +3846,11 @@ class SMARTFlow(LightningModule):
                 pred_z=scenario_pred_z,
                 pred_head=scenario_pred_head,
             )
-            if scenario_files is not None:
-                gt_scenario = _load_gt_scenario_for_device(
-                    scenario_file=str(scenario_files[scenario_index]),
-                    ego_only=False,
-                    device=pred_traj.device,
-                )
-            else:
-                gt_scenario = self._soft_rmm_build_gt_scenario_from_batch(
-                    data,
-                    scenario_index=scenario_index,
-                )
+            gt_scenario = _load_gt_scenario_for_device(
+                scenario_file=str(scenario_file),
+                ego_only=False,
+                device=pred_traj.device,
+            )
             metric_result = compute_differentiable_scenario_metrics_for_bundle(
                 config=self.sim_agents_metrics.sim_agents_config,
                 gt_scenario=gt_scenario,
