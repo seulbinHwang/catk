@@ -141,6 +141,60 @@ bash scripts/upload_smart_raw_cache_to_nubes.sh
 JOBS=96 bash scripts/upload_smart_raw_cache_to_nubes.sh
 ```
 
+### SMART RAW cache Nubes 다운로드
+
+Nubes에 업로드된 SMART RAW cache를 학습 파드로 내려받을 때는 [scripts/download_smart_raw_cache_from_nubes.sh](scripts/download_smart_raw_cache_from_nubes.sh)를 사용한다.
+
+기본 경로는 아래와 같다.
+
+```text
+nubes path:  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_RAW_cache
+pod cache:   /workspace/womd_v1_3/SMART_RAW_cache
+jobs:        96
+gateway:     c.nubes.sto.navercorp.com:8000
+```
+
+파드 안에서 직접 실행하는 기본 명령은 아래와 같다.
+
+```bash
+NUBES_JOBS=96 bash scripts/download_smart_raw_cache_from_nubes.sh
+```
+
+이미 원격 cache가 정상 업로드된 것을 확인했고, 가장 빠르게 내려받는 것이 목적이면 원격 파일 목록 생성 단계를 생략한다.
+
+```bash
+SKIP_REMOTE_LIST=1 NUBES_JOBS=96 bash scripts/download_smart_raw_cache_from_nubes.sh
+```
+
+`testa`, `testaa`, `testas` 같은 Kubernetes 파드에 동일 cache를 내려받을 때는 스크립트를 파드에 복사한 뒤 tmux로 장기 실행한다. 예시는 `testa` 기준이다.
+
+```bash
+kubectl cp -n p-pnc scripts/download_smart_raw_cache_from_nubes.sh \
+  testa:/tmp/download_smart_raw_cache_from_nubes.sh \
+  -c main
+
+kubectl exec -n p-pnc testa -c main -- bash -lc '
+chmod +x /tmp/download_smart_raw_cache_from_nubes.sh
+tmux new-session -d -s smart-raw-cache-download "
+  SKIP_REMOTE_LIST=1 \
+  NUBES_JOBS=96 \
+  REMOTE_DIR=labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/SMART_RAW_cache \
+  LOCAL_DIR=/workspace/womd_v1_3/SMART_RAW_cache \
+  bash /tmp/download_smart_raw_cache_from_nubes.sh \
+  2>&1 | tee /workspace/womd_v1_3/SMART_RAW_cache_download.log
+"
+'
+```
+
+진행 상황은 아래처럼 확인한다.
+
+```bash
+kubectl exec -n p-pnc testa -c main -- tmux capture-pane -pt smart-raw-cache-download -S -80
+kubectl exec -n p-pnc testa -c main -- bash -lc 'find /workspace/womd_v1_3/SMART_RAW_cache -type f | wc -l'
+```
+
+다운로드가 중간에 끊기면 같은 명령을 다시 실행하면 된다. 스크립트는 기본적으로 Nubes의 원격 파일 목록과 로컬 파일 수를 비교하고, `nubescli dir-download -s -j 96`으로 이미 존재하는 파일을 건너뛴다. `SKIP_REMOTE_LIST=1`을 쓰면 원격 목록 생성을 생략하고 바로 `dir-download`를 실행하므로 큰 cache를 처음 내려받을 때 더 빠르다.
+
 ## Run the code
 In the scripts, we provide
 - [scripts/train.sh](scripts/train.sh) for training and fine-tuning.
