@@ -65,6 +65,18 @@ class TokenProcessor(torch.nn.Module):
             "cyc": self.agent_token_all_cyc.shape[0],
         }
         self.register_buffer(
+            "agent_shape_by_type",
+            torch.tensor(
+                (
+                    (2.0, 4.8),  # veh
+                    (1.0, 1.0),  # ped
+                    (1.0, 2.0),  # cyc
+                ),
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
             "token_heading",
             torch.arange(-179, 180, dtype=torch.float32) / 180 * torch.pi,
             persistent=False,
@@ -153,6 +165,7 @@ class TokenProcessor(torch.nn.Module):
             token_traj_all,
             token_traj,
             token_trajectory,
+            agent_type_masks,
         ) = self._get_agent_shape_and_token_traj(data["agent"]["type"])
 
         # ! get raw trajectory data
@@ -172,7 +185,7 @@ class TokenProcessor(torch.nn.Module):
         tokenized_agent = {
             "num_graphs": data.num_graphs,
             "type": data["agent"]["type"],
-            "type_mask": build_agent_type_masks(data["agent"]["type"]),
+            "type_mask": agent_type_masks,
             "shape": data["agent"]["shape"],
             "ego_mask": data["agent"]["role"][:, 0],  # [n_agent]
             "role_mask": data["agent"]["role"].any(-1),  # [n_agent]
@@ -377,7 +390,13 @@ class TokenProcessor(torch.nn.Module):
 
     def _get_agent_shape_and_token_traj(
         self, agent_type: Tensor
-    ) -> Tuple[Tensor, Dict[str, Tensor], Dict[str, Tensor], Dict[str, Tensor]]:
+    ) -> Tuple[
+        Tensor,
+        Dict[str, Tensor],
+        Dict[str, Tensor],
+        Dict[str, Tensor],
+        Dict[str, Tensor],
+    ]:
         """
         agent_shape: [n_agent, 2]
         token_traj_all: [n_agent, n_token, 6, 4, 2]
@@ -385,21 +404,15 @@ class TokenProcessor(torch.nn.Module):
         token_trajectory: [n_token, 5, 3]
         """
         agent_type_masks = build_agent_type_masks(agent_type)
-        agent_shape = torch.zeros(len(agent_type), 2, dtype=torch.float32, device=agent_type.device)
+        agent_shape = self.agent_shape_by_type.new_zeros((len(agent_type), 2))
+        valid_type_mask = (agent_type >= 0) & (agent_type < self.agent_shape_by_type.shape[0])
+        agent_shape[valid_type_mask] = self.agent_shape_by_type[
+            agent_type[valid_type_mask].long()
+        ]
         token_traj_all = {}
         token_traj = {}
         token_trajectory = {}
         for k, mask in agent_type_masks.items():
-            if k == "veh":
-                width = 2.0
-                length = 4.8
-            elif k == "cyc":
-                width = 1.0
-                length = 2.0
-            else:
-                width = 1.0
-                length = 1.0
-            agent_shape[mask] = torch.tensor([width, length], dtype=agent_shape.dtype, device=agent_shape.device)
             n_agent_type = int(mask.sum().item())
             token_bank = getattr(self, f"agent_token_all_{k}")
             token_traj_all[k] = token_bank.unsqueeze(0).expand(
@@ -409,4 +422,4 @@ class TokenProcessor(torch.nn.Module):
                 n_agent_type, -1, -1, -1
             )
             token_trajectory[k] = getattr(self, f"agent_token_trajectory_{k}")
-        return agent_shape, token_traj_all, token_traj, token_trajectory
+        return agent_shape, token_traj_all, token_traj, token_trajectory, agent_type_masks

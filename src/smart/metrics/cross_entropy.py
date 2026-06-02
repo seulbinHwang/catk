@@ -91,7 +91,17 @@ class CrossEntropy(Metric):
         )
 
         if use_direct_gt_idx:
-            target_valid = gt_valid_mask
+            self._update_direct_gt_idx_loss(
+                next_token_logits=next_token_logits,
+                next_token_valid=next_token_valid,
+                gt_idx=gt_idx,
+                gt_valid_mask=gt_valid_mask,
+                token_traj=token_traj,
+                token_trajectory=token_trajectory,
+                train_mask=train_mask,
+                type_mask=type_mask,
+            )
+            return
         else:
             # ! use raw or tokenized GT
             if self.use_gt_raw:
@@ -193,6 +203,141 @@ class CrossEntropy(Metric):
 
         self.loss_sum += (loss * loss_weighting_mask).sum()
         self.count += (loss_weighting_mask > 0).sum()
+
+    def _update_direct_gt_idx_loss(
+        self,
+        next_token_logits: Tensor | dict[str, Tensor],
+        next_token_valid: Tensor,
+        gt_idx: Tensor,
+        gt_valid_mask: Tensor,
+        token_traj: Tensor | dict[str, Tensor],
+        token_trajectory: Optional[Tensor | dict[str, Tensor]],
+        train_mask: Optional[Tensor],
+        type_mask: Optional[dict[str, Tensor]],
+    ) -> None:
+        loss_weighting_mask = next_token_valid & gt_valid_mask
+        if self.training and train_mask is not None:
+            loss_weighting_mask &= train_mask.unsqueeze(1)
+
+        valid_count = loss_weighting_mask.sum()
+        if not bool(valid_count):
+            self.count += valid_count.to(dtype=self.count.dtype)
+            return
+
+        if isinstance(next_token_logits, dict):
+            if type_mask is None:
+                raise ValueError("type_mask is required for type-specific token logits.")
+            if not isinstance(token_traj, dict):
+                raise ValueError("type-specific token logits require type-specific token_traj.")
+
+            loss_sum = None
+            for agent_type, mask in type_mask.items():
+                if not bool(mask.any()) or agent_type not in next_token_logits:
+                    continue
+                type_valid_mask = loss_weighting_mask[mask]
+                if not bool(type_valid_mask.any()):
+                    continue
+
+                logits_type = next_token_logits[agent_type]
+                gt_idx_type = gt_idx[mask]
+                flat_valid = type_valid_mask.reshape(-1)
+                logits_valid = logits_type.reshape(-1, logits_type.shape[-1])[flat_valid]
+                gt_idx_valid = gt_idx_type.reshape(-1)[flat_valid]
+                token_trajectory_type = (
+                    token_trajectory.get(agent_type)
+                    if isinstance(token_trajectory, dict)
+                    else None
+                )
+                token_traj_type = token_traj[agent_type]
+                token_traj_rows = self._select_token_traj_rows(
+                    token_traj=token_traj_type,
+                    valid_mask=type_valid_mask,
+                    flat_valid=flat_valid,
+                    token_trajectory=token_trajectory_type,
+                )
+
+                loss_type = self._direct_gt_idx_loss_for_rows(
+                    logits=logits_valid,
+                    gt_idx=gt_idx_valid,
+                    token_traj=token_traj_rows,
+                    token_trajectory=token_trajectory_type,
+                )
+                loss_sum = loss_type if loss_sum is None else loss_sum + loss_type
+
+            if loss_sum is None:
+                self.count += valid_count.to(dtype=self.count.dtype)
+                return
+        else:
+            flat_valid = loss_weighting_mask.reshape(-1)
+            logits_valid = next_token_logits.reshape(-1, next_token_logits.shape[-1])[
+                flat_valid
+            ]
+            gt_idx_valid = gt_idx.reshape(-1)[flat_valid]
+            token_trajectory_tensor = (
+                token_trajectory if isinstance(token_trajectory, Tensor) else None
+            )
+            token_traj_rows = self._select_token_traj_rows(
+                token_traj=token_traj,
+                valid_mask=loss_weighting_mask,
+                flat_valid=flat_valid,
+                token_trajectory=token_trajectory_tensor,
+            )
+            loss_sum = self._direct_gt_idx_loss_for_rows(
+                logits=logits_valid,
+                gt_idx=gt_idx_valid,
+                token_traj=token_traj_rows,
+                token_trajectory=token_trajectory_tensor,
+            )
+
+        self.loss_sum += loss_sum
+        self.count += valid_count.to(dtype=self.count.dtype)
+
+    @staticmethod
+    def _select_token_traj_rows(
+        token_traj: Tensor,
+        valid_mask: Tensor,
+        flat_valid: Tensor,
+        token_trajectory: Optional[Tensor],
+    ) -> Tensor:
+        if token_trajectory is not None:
+            return token_traj
+
+        n_step = valid_mask.shape[1]
+        return (
+            token_traj[:, None, :, :, :]
+            .expand(-1, n_step, -1, -1, -1)
+            .reshape(-1, *token_traj.shape[1:])[flat_valid]
+        )
+
+    def _direct_gt_idx_loss_for_rows(
+        self,
+        logits: Tensor,
+        gt_idx: Tensor,
+        token_traj: Tensor,
+        token_trajectory: Optional[Tensor],
+    ) -> Tensor:
+        if self.spatial_aware_smoothing:
+            prob_target = get_prob_targets_from_index(
+                gt_idx=gt_idx.unsqueeze(1),
+                token_traj=token_traj,
+                token_trajectory=token_trajectory,
+                label_smoothing=self.label_smoothing,
+                spatial_aware_smoothing=self.spatial_aware_smoothing,
+                spatial_aware_smoothing_mode=self.spatial_aware_smoothing_mode,
+            ).squeeze(1)
+            return cross_entropy(
+                logits,
+                prob_target,
+                reduction="sum",
+                label_smoothing=0.0,
+            )
+
+        return cross_entropy(
+            logits,
+            gt_idx,
+            reduction="sum",
+            label_smoothing=self.label_smoothing,
+        )
 
     def compute(self) -> Tensor:
         return self.loss_sum / self.count
