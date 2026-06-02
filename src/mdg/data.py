@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import pickle
-import warnings
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
 from lightning import LightningDataModule
@@ -32,6 +31,9 @@ def _as_tensor(value: Any, dtype: Optional[torch.dtype] = None) -> Tensor:
 
 
 MDG_MAP_SAMPLING_VERSION = "arclength_v1"
+MDG_TRAFFIC_SIGNAL_VERSION = "time_indexed_v1"
+_DEFAULT_CURRENT_INDEX = _HISTORY_STEPS - 1
+_DEFAULT_TRAIN_ANCHOR_STEPS = tuple(range(_DEFAULT_CURRENT_INDEX, 81, 10))
 
 
 def _select_nearest(
@@ -59,6 +61,19 @@ def _select_current_valid(valid: Tensor, current_index: int) -> Tensor:
     return torch.where(valid[:, current_index])[0].cpu()
 
 
+def _time_shift_view(value: Tensor, anchor_step: int, pad_value: float | int | bool = 0) -> Tensor:
+    offset = int(anchor_step) - _DEFAULT_CURRENT_INDEX
+    if offset == 0:
+        return value
+    out = torch.full_like(value, pad_value)
+    src_start = max(0, offset)
+    dst_start = max(0, -offset)
+    length = min(int(value.shape[1]) - src_start, _TOTAL_STEPS - dst_start)
+    if length > 0:
+        out[:, dst_start : dst_start + length] = value[:, src_start : src_start + length]
+    return out
+
+
 def _pad_first_dim(value: Tensor, size: int, pad_value: float | int | bool = 0) -> tuple[Tensor, Tensor]:
     out_shape = (size,) + tuple(value.shape[1:])
     out = torch.full(out_shape, pad_value, dtype=value.dtype)
@@ -74,21 +89,23 @@ def _extract_map(data: Dict[str, Any]) -> Dict[str, Tensor]:
     if "mdg_map" not in data:
         raise ValueError("MDG cache is missing the required 'mdg_map' field. Regenerate the cache with the MDG branch.")
     mdg_map = data["mdg_map"]
-    sampling = mdg_map.get("sampling") if isinstance(mdg_map, dict) else None
+    required = ("position", "heading", "id", "type", "light_type", "valid", "sampling")
+    missing = [key for key in required if key not in mdg_map]
+    if missing:
+        raise ValueError(f"MDG cache mdg_map is missing required keys: {missing}")
+    sampling = mdg_map["sampling"]
     if sampling != MDG_MAP_SAMPLING_VERSION:
         raise ValueError(
             "MDG cache must use arclength_v1 map sampling. "
             f"Found sampling={sampling!r}; regenerate MDG_cache from raw WOMD TFRecords."
         )
-    required = ("position", "heading", "type", "light_type", "valid")
-    missing = [key for key in required if key not in mdg_map]
-    if missing:
-        raise ValueError(f"MDG cache mdg_map is missing required keys: {missing}")
+    light_type = _as_tensor(mdg_map["light_type"], torch.long)
     return {
         "position": _as_tensor(mdg_map["position"], torch.float32),
         "heading": _as_tensor(mdg_map["heading"], torch.float32),
+        "id": _as_tensor(mdg_map["id"], torch.long),
         "type": _as_tensor(mdg_map["type"], torch.long),
-        "light_type": _as_tensor(mdg_map["light_type"], torch.long),
+        "light_type": light_type,
         "valid": _as_tensor(mdg_map["valid"], torch.bool),
     }
 
@@ -100,16 +117,57 @@ def _extract_traffic_signals(data: Dict[str, Any]) -> Dict[str, Tensor]:
             "Regenerate the cache with the MDG branch."
         )
     signal = data["mdg_traffic_signal"]
-    required = ("position", "heading", "state", "valid")
+    required = ("position", "heading", "state", "valid", "lane_id", "time_step", "version")
     missing = [key for key in required if key not in signal]
     if missing:
         raise ValueError(f"MDG cache mdg_traffic_signal is missing required keys: {missing}")
+    version = signal["version"]
+    if version != MDG_TRAFFIC_SIGNAL_VERSION:
+        raise ValueError(
+            "MDG cache mdg_traffic_signal must be time_indexed_v1. "
+            f"Found version={version!r}; regenerate MDG_cache from raw WOMD TFRecords."
+        )
     return {
         "position": _as_tensor(signal["position"], torch.float32),
         "heading": _as_tensor(signal["heading"], torch.float32),
         "state": _as_tensor(signal["state"], torch.long),
         "valid": _as_tensor(signal["valid"], torch.bool),
+        "lane_id": _as_tensor(signal["lane_id"], torch.long),
+        "time_step": _as_tensor(signal["time_step"], torch.long),
+        "version": version,
     }
+
+
+def _select_signal_at_anchor(signal: Dict[str, Any], anchor_step: int) -> Dict[str, Tensor]:
+    valid = signal["valid"] & (signal["time_step"] == int(anchor_step))
+    return {
+        "position": signal["position"][valid],
+        "heading": signal["heading"][valid],
+        "state": signal["state"][valid],
+        "valid": signal["valid"][valid],
+        "lane_id": signal["lane_id"][valid],
+        "time_indexed": True,
+    }
+
+
+def _anchor_map_light_type(mdg_map: Dict[str, Tensor], signal_at_anchor: Dict[str, Tensor]) -> Tensor:
+    if mdg_map["id"].numel() == 0 or signal_at_anchor["lane_id"].numel() == 0:
+        return torch.zeros_like(mdg_map["light_type"])
+    by_lane = {
+        int(lane_id.item()): int(state.item())
+        for lane_id, state, valid in zip(
+            signal_at_anchor["lane_id"],
+            signal_at_anchor["state"],
+            signal_at_anchor["valid"],
+        )
+        if bool(valid.item())
+    }
+    if not by_lane:
+        return torch.zeros_like(mdg_map["light_type"])
+    return torch.as_tensor(
+        [by_lane.get(int(polyline_id.item()), 0) for polyline_id in mdg_map["id"]],
+        dtype=torch.long,
+    )
 
 
 class MDGDataset(Dataset):
@@ -122,6 +180,7 @@ class MDGDataset(Dataset):
         max_traffic_lights: int,
         training: bool,
         tfrecord_dir: Optional[str] = None,
+        train_anchor_steps: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__()
         self.raw_dir = Path(raw_dir)
@@ -136,6 +195,17 @@ class MDGDataset(Dataset):
         self.max_traffic_lights = int(max_traffic_lights)
         self.training = bool(training)
         self.tfrecord_dir = Path(tfrecord_dir) if tfrecord_dir is not None else None
+        if self.training:
+            anchors = tuple(int(step) for step in (train_anchor_steps or _DEFAULT_TRAIN_ANCHOR_STEPS))
+        else:
+            anchors = (_DEFAULT_CURRENT_INDEX,)
+        if not anchors:
+            raise ValueError("MDGDataset requires at least one anchor step.")
+        if min(anchors) < _DEFAULT_CURRENT_INDEX or max(anchors) >= _TOTAL_STEPS:
+            raise ValueError(
+                f"MDG anchor steps must be in [{_DEFAULT_CURRENT_INDEX}, {_TOTAL_STEPS - 1}], got {anchors}."
+            )
+        self.anchor_steps = anchors
 
     def __len__(self) -> int:
         return len(self.raw_paths)
@@ -144,9 +214,18 @@ class MDGDataset(Dataset):
         path = self.raw_paths[index]
         with path.open("rb") as handle:
             data = pickle.load(handle)
-        return self._build_sample(data)
+        anchor_step = self._sample_anchor_step()
+        return self._build_sample(data, anchor_step=anchor_step)
 
-    def _build_sample(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def _sample_anchor_step(self) -> int:
+        if len(self.anchor_steps) == 1:
+            return self.anchor_steps[0]
+        idx = int(torch.randint(len(self.anchor_steps), (1,)).item())
+        return self.anchor_steps[idx]
+
+    def _build_sample(self, data: Dict[str, Any], anchor_step: Optional[int] = None) -> Dict[str, Any]:
+        if anchor_step is None:
+            anchor_step = self.anchor_steps[0]
         agent = data["agent"]
         position = _as_tensor(agent["position"], torch.float32)
         heading = _as_tensor(agent["heading"], torch.float32)
@@ -157,7 +236,12 @@ class MDGDataset(Dataset):
         role = _as_tensor(agent["role"], torch.bool)
         agent_id = _as_tensor(agent["id"], torch.long)
 
-        current_index = _HISTORY_STEPS - 1
+        position = _time_shift_view(position, anchor_step, pad_value=0.0)
+        heading = _time_shift_view(heading, anchor_step, pad_value=0.0)
+        velocity = _time_shift_view(velocity, anchor_step, pad_value=0.0)
+        valid = _time_shift_view(valid, anchor_step, pad_value=False)
+
+        current_index = _DEFAULT_CURRENT_INDEX
         sdc_candidates = torch.where(role[:, 0])[0]
         sdc_index = int(sdc_candidates[0].item()) if len(sdc_candidates) else 0
         center = position[sdc_index, current_index, :2]
@@ -192,6 +276,9 @@ class MDGDataset(Dataset):
         agent_valid = agent_present & valid_pad[:, current_index]
 
         mdg_map = _extract_map(data)
+        signal = _extract_traffic_signals(data)
+        signal_at_anchor = _select_signal_at_anchor(signal, anchor_step=anchor_step)
+        map_light_type_all = _anchor_map_light_type(mdg_map, signal_at_anchor)
         map_anchor = mdg_map["position"][:, 0, :2] if mdg_map["position"].numel() else torch.zeros(0, 2)
         selected_map = _select_nearest(
             positions=map_anchor,
@@ -212,27 +299,26 @@ class MDGDataset(Dataset):
             self.max_map_polylines,
         )
         map_light_type, _ = _pad_first_dim(
-            mdg_map["light_type"][selected_map].clamp(min=0, max=8),
+            map_light_type_all[selected_map].clamp(min=0, max=8),
             self.max_map_polylines,
         )
 
-        signal = _extract_traffic_signals(data)
         selected_signal = _select_nearest(
-            positions=signal["position"],
-            valid=signal["valid"],
+            positions=signal_at_anchor["position"],
+            valid=signal_at_anchor["valid"],
             center=center,
             max_count=self.max_traffic_lights,
         )
         signal_position, signal_valid = _pad_first_dim(
-            signal["position"][selected_signal],
+            signal_at_anchor["position"][selected_signal],
             self.max_traffic_lights,
         )
         signal_heading, _ = _pad_first_dim(
-            signal["heading"][selected_signal],
+            signal_at_anchor["heading"][selected_signal],
             self.max_traffic_lights,
         )
         signal_state, _ = _pad_first_dim(
-            signal["state"][selected_signal].clamp(min=0, max=8),
+            signal_at_anchor["state"][selected_signal].clamp(min=0, max=8),
             self.max_traffic_lights,
         )
 
@@ -246,6 +332,7 @@ class MDGDataset(Dataset):
         return {
             "scenario_id": scenario_id,
             "tfrecord_path": tfrecord_path,
+            "anchor_step": torch.tensor(int(anchor_step), dtype=torch.long),
             "agent_id": id_pad,
             "agent_type": type_pad.long(),
             "agent_shape": shape_pad,
@@ -337,7 +424,7 @@ class MDGDataModule(LightningDataModule):
         train_memory_balance_valid_agent_step_weight: float = 0.0,
         train_memory_balance_map_weight: float = 0.02,
         train_memory_balance_seed: int = 0,
-        eval_max_agents: Optional[int] = None,
+        train_anchor_steps: Optional[Sequence[int]] = None,
     ) -> None:
         super().__init__()
         self.train_batch_size = train_batch_size
@@ -352,13 +439,6 @@ class MDGDataModule(LightningDataModule):
         self.pin_memory = pin_memory
         self.persistent_workers = persistent_workers and num_workers > 0
         self.train_max_agents = train_max_agents
-        if eval_max_agents is not None:
-            warnings.warn(
-                "data.eval_max_agents is deprecated and ignored. "
-                "MDG eval/test/submission now keep all current-valid cached agents "
-                "so Fast WOSAC sim_agent_ids are not truncated.",
-                stacklevel=2,
-            )
         self.max_map_polylines = max_map_polylines
         self.map_waypoints = map_waypoints
         self.max_traffic_lights = max_traffic_lights
@@ -377,6 +457,11 @@ class MDGDataModule(LightningDataModule):
         )
         self.train_memory_balance_map_weight = float(train_memory_balance_map_weight)
         self.train_memory_balance_seed = int(train_memory_balance_seed)
+        self.train_anchor_steps = (
+            tuple(int(step) for step in train_anchor_steps)
+            if train_anchor_steps is not None
+            else _DEFAULT_TRAIN_ANCHOR_STEPS
+        )
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage in {"fit", None}:
@@ -387,6 +472,7 @@ class MDGDataModule(LightningDataModule):
                 map_waypoints=self.map_waypoints,
                 max_traffic_lights=self.max_traffic_lights,
                 training=True,
+                train_anchor_steps=self.train_anchor_steps,
             )
             self.val_dataset = MDGDataset(
                 raw_dir=self.val_raw_dir,

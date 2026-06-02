@@ -38,6 +38,7 @@
 | relation Fourier bands | 4 |
 | auxiliary loss weight | 5 |
 | model parameters | 7.11M |
+| train anchors | `10,20,...,80` |
 | optimizer | AdamW |
 | learning rate | 0.00052915 |
 | weight decay | 0.01 |
@@ -82,8 +83,11 @@ WANDB_MODE=offline python -m src.run experiment=mdg_pretrain logger=[] callbacks
 ## 데이터 생성
 
 WOMD 원본 TFRecord를 받은 뒤 MDG 전용 cache를 만든다. MDG 학습/평가/제출 코드는
-`mdg_map`, `mdg_traffic_signal` 필드가 있고 `mdg_map.sampling=arclength_v1`인 cache만 읽는다.
-`mdg_traffic_signal`은 WOMD `dynamic_map_states`의 현재 phase와 stop point를 저장한다.
+`mdg_map.id`, `mdg_traffic_signal.lane_id`, `mdg_traffic_signal.time_step` 필드가 있고
+`mdg_map.sampling=arclength_v1`, `mdg_traffic_signal.version=time_indexed_v1`인 cache만 읽는다.
+`mdg_traffic_signal`은 WOMD `dynamic_map_states`의 모든 time step phase와 stop point를 저장한다.
+agent cache는 rolling-anchor training이 anchor 시점별 current-valid agent를 고를 수 있도록
+raw `t=10` current-valid agent만이 아니라 91 step 중 한 번이라도 valid한 track을 저장한다.
 
 기본 단일 split cache script는 다음처럼 실행한다.
 
@@ -102,8 +106,8 @@ MDG map cache는 논문 입력 형태인 `Nm=320`, `Nw=16` polyline representati
 raw roadgraph polyline을 16개 waypoint로 줄인다. 현재 cache 생성 코드는 원본 vertex 순번이 아니라
 polyline의 실제 누적 길이를 기준으로 16개 waypoint를 균일하게 뽑는 `arclength_v1` sampling을 사용한다.
 이 방식은 lane/crosswalk/road-edge geometry를 거리 기준으로 보존하기 위한 선택이다.
-`arclength_v1` metadata가 없는 cache는 지원하지 않으며, 아래 cache 생성 절차로 새 `MDG_cache`를
-만들어야 한다.
+`arclength_v1` map metadata와 `time_indexed_v1` signal metadata가 없는 cache는 지원하지 않으며,
+아래 cache 생성 절차로 새 `MDG_cache`를 만들어야 한다.
 
 ```bash
 ssh user@10.60.188.78
@@ -283,7 +287,7 @@ torchrun \
 ```
 
 논문 설정은 L40S 8장 기준이고 precision은 bf16이다. V100은 bf16을 지원하지 않으므로 기본 학습/제출 config는 `trainer.precision=16-mixed`로 둔다. L40S/A100/H100처럼 bf16을 지원하는 GPU에서는 `trainer.precision=bf16-mixed`로 바꿔도 된다.
-V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다. 학습은 논문 설정처럼 SDC 포함 nearest 64 agents를 쓰지만, validation/test/submission은 Fast WOSAC이 요구하는 `sim_agent_ids`가 누락되지 않도록 cache의 current-valid agents를 모두 유지하고 batch 안에서 agent 축을 동적 padding한다. 모델 구조, `n_rollout_closed_val=32`, `closed_loop_denoising_steps=5`는 제출 검증에서 유지해야 한다.
+V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다. 학습은 논문 설정처럼 SDC 포함 nearest 64 agents를 쓰고, 기본적으로 `data.train_anchor_steps=[10,20,30,40,50,60,70,80]` 중 한 anchor를 sample마다 뽑아 history/future/map/signal view를 만든다. 출력 tensor shape은 기존과 동일하게 current를 index 10에 맞추며, future suffix가 없는 tail anchor는 해당 future chunk를 invalid 처리해 loss와 denoiser attention에서 제외한다. validation/test/submission은 Fast WOSAC이 요구하는 `sim_agent_ids`가 누락되지 않도록 cache의 current-valid agents를 모두 유지하고 batch 안에서 agent 축을 동적 padding한다. 모델 구조, `n_rollout_closed_val=32`, `closed_loop_denoising_steps=5`는 제출 검증에서 유지해야 한다.
 학습 중 validation은 closed-loop 32 rollout과 5-step denoising을 포함한다. `mdg_pretrain` 기본값은 `trainer.check_val_every_n_epoch=16`, `trainer.limit_val_batches=0.1`, `data.val_batch_size=12`이며, `model.model_config.scorer_scene_num=1680`이 켜져 있으면 GPU 수와 validation batch size에 맞춰 Fast WOSAC scorer batch 수를 자동으로 맞춘다. A100 7장, per-GPU validation batch 12에서는 per-rank `n_batch_sim_agents_metric=20`으로 보정되어 총 1,680개 scenario가 scorer에 들어간다. fit 중에는 checkpoint 점수 계산 시간을 제한하기 위해 validation loop cap도 이 scorer batch 수로 줄인다. 전체 validation/submission은 `mdg_wosac_sub` 또는 별도 validate/test 실행에서 수행한다.
 
 ### testas A100 7장 pretrain
@@ -419,7 +423,7 @@ python -m src.run \
   model.model_config.scorer_scene_num=1680
 ```
 
-MDG eval/test/submission dataloader는 더 이상 `eval_max_agents` hard cap을 쓰지 않는다. 각 scene의 current-valid cached agents를 모두 유지한 뒤 batch-local max agent 수로 padding하므로, validation TFRecord의 `sim_agent_ids`가 128명을 넘는 scene도 Fast WOSAC metric에 필요한 prediction agent를 누락하지 않는다. 기존 command에 `data.eval_max_agents=...` override가 남아 있어도 deprecated no-op으로 무시된다.
+MDG eval/test/submission dataloader는 `eval_max_agents` hard cap을 쓰지 않는다. 각 scene의 current-valid cached agents를 모두 유지한 뒤 batch-local max agent 수로 padding하므로, validation TFRecord의 `sim_agent_ids`가 128명을 넘는 scene도 Fast WOSAC metric에 필요한 prediction agent를 누락하지 않는다.
 
 ## 제출물 생성
 

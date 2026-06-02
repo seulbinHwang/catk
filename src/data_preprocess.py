@@ -71,7 +71,7 @@ def get_agent_features(
 
     idx_agents_to_add = []
     for i in range(len(track_infos["object_id"])):
-        add_agent = track_infos["valid"][i, num_historical_steps - 1]
+        add_agent = track_infos["valid"][i].any()
 
         if add_agent:
             idx_agents_to_add.append(i)
@@ -179,6 +179,7 @@ def get_map_features(map_infos, tf_current_light, dim=2):
         ("map_point", "to", "map_polygon"): {},
     }
     map_data["map_polygon"]["num_nodes"] = num_polygons
+    map_data["map_polygon"]["id"] = torch.as_tensor(polygon_ids, dtype=torch.long)
     map_data["map_polygon"]["type"] = polygon_type
     map_data["map_polygon"]["light_type"] = polygon_light_type
     if len(num_points) == 0:
@@ -241,8 +242,10 @@ def build_mdg_map_features(map_data: Dict[str, Any], num_waypoints: int = 16):
     pt2pl = map_data[("map_point", "to", "map_polygon")]["edge_index"]
     positions = []
     headings = []
+    polygon_ids = []
     polyline_type = []
     light_type = []
+    map_polygon_ids = map_data["map_polygon"]["id"]
     for polygon_idx in sorted(torch.unique(pt2pl[1])):
         point_idx = pt2pl[0, pt2pl[1] == polygon_idx]
         if len(point_idx) == 0:
@@ -253,6 +256,7 @@ def build_mdg_map_features(map_data: Dict[str, Any], num_waypoints: int = 16):
         )
         positions.append(sampled_pos)
         headings.append(sampled_heading)
+        polygon_ids.append(map_polygon_ids[polygon_idx].long())
         polyline_type.append(map_data["map_point"]["type"][point_idx[0]].long())
         light_type.append(map_data["map_polygon"]["light_type"][polygon_idx].long())
 
@@ -260,13 +264,16 @@ def build_mdg_map_features(map_data: Dict[str, Any], num_waypoints: int = 16):
         return {
             "position": torch.zeros(1, num_waypoints, 2, dtype=torch.float32) + 6e4,
             "heading": torch.zeros(1, num_waypoints, dtype=torch.float32),
+            "id": torch.zeros(1, dtype=torch.long) - 1,
             "type": torch.zeros(1, dtype=torch.long),
             "light_type": torch.zeros(1, dtype=torch.long),
             "valid": torch.zeros(1, dtype=torch.bool),
+            "sampling": MDG_MAP_SAMPLING_VERSION,
         }
     return {
         "position": torch.stack(positions, dim=0),
         "heading": torch.stack(headings, dim=0),
+        "id": torch.stack(polygon_ids, dim=0),
         "type": torch.stack(polyline_type, dim=0),
         "light_type": torch.stack(light_type, dim=0),
         "valid": torch.ones(len(positions), dtype=torch.bool),
@@ -274,37 +281,38 @@ def build_mdg_map_features(map_data: Dict[str, Any], num_waypoints: int = 16):
     }
 
 
-def build_mdg_traffic_signal_features(mdg_map: Dict[str, torch.Tensor], tf_current_light: Optional[pd.DataFrame] = None):
-    if tf_current_light is not None and len(tf_current_light) > 0 and {"stop_x", "stop_y", "state"}.issubset(tf_current_light.columns):
+def build_mdg_traffic_signal_features(tf_lights: Optional[pd.DataFrame] = None):
+    required_columns = {"lane_id", "time_step", "stop_x", "stop_y", "state"}
+    if tf_lights is not None and len(tf_lights) > 0 and required_columns.issubset(tf_lights.columns):
         positions = torch.as_tensor(
-            tf_current_light[["stop_x", "stop_y"]].to_numpy(dtype=np.float32),
+            tf_lights[["stop_x", "stop_y"]].to_numpy(dtype=np.float32),
             dtype=torch.float32,
         )
         states = [
             _polygon_light_type.index(str(state)) if str(state) in _polygon_light_type else 1
-            for state in tf_current_light["state"].tolist()
+            for state in tf_lights["state"].tolist()
         ]
+        lane_id = torch.as_tensor(tf_lights["lane_id"].to_numpy(dtype=np.int64), dtype=torch.long)
+        time_step = torch.as_tensor(tf_lights["time_step"].to_numpy(dtype=np.int64), dtype=torch.long)
         valid = torch.isfinite(positions).all(dim=-1)
         return {
             "position": positions,
             "heading": torch.zeros(len(positions), dtype=torch.float32),
             "state": torch.as_tensor(states, dtype=torch.long),
             "valid": valid,
+            "lane_id": lane_id,
+            "time_step": time_step,
+            "version": "time_indexed_v1",
         }
 
-    signal_mask = mdg_map["light_type"] > 0
-    if not bool(signal_mask.any()):
-        return {
-            "position": torch.zeros(0, 2, dtype=torch.float32),
-            "heading": torch.zeros(0, dtype=torch.float32),
-            "state": torch.zeros(0, dtype=torch.long),
-            "valid": torch.zeros(0, dtype=torch.bool),
-        }
     return {
-        "position": mdg_map["position"][signal_mask, 0, :2],
-        "heading": mdg_map["heading"][signal_mask, 0],
-        "state": mdg_map["light_type"][signal_mask].long(),
-        "valid": torch.ones(int(signal_mask.sum()), dtype=torch.bool),
+        "position": torch.zeros(0, 2, dtype=torch.float32),
+        "heading": torch.zeros(0, dtype=torch.float32),
+        "state": torch.zeros(0, dtype=torch.long),
+        "valid": torch.zeros(0, dtype=torch.bool),
+        "lane_id": torch.zeros(0, dtype=torch.long),
+        "time_step": torch.zeros(0, dtype=torch.long),
+        "version": "time_indexed_v1",
     }
 
 
@@ -590,7 +598,7 @@ def wm2argo(file_path, split, output_dir, output_dir_tfrecords_splitted):
 
         data = preprocess_map(map_data)
         data["mdg_map"] = build_mdg_map_features(map_data)
-        data["mdg_traffic_signal"] = build_mdg_traffic_signal_features(data["mdg_map"], tf_current_light)
+        data["mdg_traffic_signal"] = build_mdg_traffic_signal_features(tf_lights)
         data["agent"] = get_agent_features(
             track_infos,
             split=split,
