@@ -4,6 +4,7 @@ import collections
 import dataclasses
 import os
 import time
+import threading
 from collections import OrderedDict
 
 import torch
@@ -19,6 +20,7 @@ import time
 _distance_computation_total_time = 0.0
 _distance_computation_call_count = 0
 _LOG_FEATURE_CACHE: OrderedDict[tuple[str, bool, str], dict] = OrderedDict()
+_LOG_FEATURE_CACHE_LOCK = threading.Lock()
 
 
 def _read_log_feature_cache_max_entries() -> int:
@@ -33,7 +35,8 @@ def _read_log_feature_cache_max_entries() -> int:
 
 
 def clear_log_feature_cache() -> None:
-    _LOG_FEATURE_CACHE.clear()
+    with _LOG_FEATURE_CACHE_LOCK:
+        _LOG_FEATURE_CACHE.clear()
 
 
 def _clone_feature_tree(value, *, device: torch.device | str):
@@ -299,10 +302,13 @@ def _get_or_compute_log_features(
     cache_max_entries = _read_log_feature_cache_max_entries()
     device = logged_all_trajectories.device
 
-    if cache_max_entries > 0 and cache_key in _LOG_FEATURE_CACHE:
-        cached_features = _LOG_FEATURE_CACHE.pop(cache_key)
-        _LOG_FEATURE_CACHE[cache_key] = cached_features
-        return _clone_feature_tree(cached_features, device=device)
+    if cache_max_entries > 0:
+        with _LOG_FEATURE_CACHE_LOCK:
+            cached_features = _LOG_FEATURE_CACHE.get(cache_key)
+            if cached_features is not None:
+                _LOG_FEATURE_CACHE.move_to_end(cache_key)
+        if cached_features is not None:
+            return _clone_feature_tree(cached_features, device=device)
 
     log_features = compute_metric_features(
         object_ids,
@@ -326,9 +332,11 @@ def _get_or_compute_log_features(
     )
 
     if cache_max_entries > 0:
-        _LOG_FEATURE_CACHE[cache_key] = _clone_feature_tree(log_features, device="cpu")
-        while len(_LOG_FEATURE_CACHE) > cache_max_entries:
-            _LOG_FEATURE_CACHE.popitem(last=False)
+        cached_features = _clone_feature_tree(log_features, device="cpu")
+        with _LOG_FEATURE_CACHE_LOCK:
+            _LOG_FEATURE_CACHE[cache_key] = cached_features
+            while len(_LOG_FEATURE_CACHE) > cache_max_entries:
+                _LOG_FEATURE_CACHE.popitem(last=False)
     return log_features
 
 

@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import os
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor, wait as futures_wait
 from collections import OrderedDict
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -82,11 +84,14 @@ _REQUIRED_2025_BUCKET_FIELDS = {
     "simulated_traffic_light_violation_rate",
 }
 _TF_RUNTIME_CONFIGURED = False
+_TF_RUNTIME_LOCK = threading.Lock()
 _GT_SCENARIO_CACHE: OrderedDict[tuple[str, bool], dict] = OrderedDict()
+_GT_SCENARIO_CACHE_LOCK = threading.Lock()
 
 
 def _clear_sim_agents_caches() -> None:
-    _GT_SCENARIO_CACHE.clear()
+    with _GT_SCENARIO_CACHE_LOCK:
+        _GT_SCENARIO_CACHE.clear()
     fast_metric_features.clear_log_feature_cache()
 
 
@@ -112,28 +117,29 @@ def _trim_gt_scenario_cache(max_entries: int) -> None:
 def _configure_tensorflow_runtime() -> None:
     """Keep TensorFlow as a lightweight TFRecord reader beside the torch metric."""
     global _TF_RUNTIME_CONFIGURED
-    if _TF_RUNTIME_CONFIGURED:
-        return
+    with _TF_RUNTIME_LOCK:
+        if _TF_RUNTIME_CONFIGURED:
+            return
 
-    intra_op_threads = max(1, _read_nonnegative_int_env("CATK_TF_INTRA_OP_THREADS", 1))
-    inter_op_threads = max(1, _read_nonnegative_int_env("CATK_TF_INTER_OP_THREADS", 1))
+        intra_op_threads = max(1, _read_nonnegative_int_env("CATK_TF_INTRA_OP_THREADS", 1))
+        inter_op_threads = max(1, _read_nonnegative_int_env("CATK_TF_INTER_OP_THREADS", 1))
 
-    try:
-        tf.config.set_visible_devices([], "GPU")
-    except RuntimeError:
-        pass
+        try:
+            tf.config.set_visible_devices([], "GPU")
+        except RuntimeError:
+            pass
 
-    try:
-        tf.config.threading.set_intra_op_parallelism_threads(intra_op_threads)
-    except RuntimeError:
-        pass
+        try:
+            tf.config.threading.set_intra_op_parallelism_threads(intra_op_threads)
+        except RuntimeError:
+            pass
 
-    try:
-        tf.config.threading.set_inter_op_parallelism_threads(inter_op_threads)
-    except RuntimeError:
-        pass
+        try:
+            tf.config.threading.set_inter_op_parallelism_threads(inter_op_threads)
+        except RuntimeError:
+            pass
 
-    _TF_RUNTIME_CONFIGURED = True
+        _TF_RUNTIME_CONFIGURED = True
 
 
 def _read_single_record_tfrecord(record_path: str) -> bytes:
@@ -260,7 +266,12 @@ def _load_gt_scenario_for_device(
 ) -> dict:
     cache_key = (scenario_file, ego_only)
     cache_max_entries = _gt_scenario_cache_max_entries()
-    gt_scenario = _GT_SCENARIO_CACHE.get(cache_key) if cache_max_entries > 0 else None
+    gt_scenario = None
+    if cache_max_entries > 0:
+        with _GT_SCENARIO_CACHE_LOCK:
+            gt_scenario = _GT_SCENARIO_CACHE.get(cache_key)
+            if gt_scenario is not None:
+                _GT_SCENARIO_CACHE.move_to_end(cache_key)
     if gt_scenario is None:
         gt_scenario = extract_gt_scenario(
             _load_scenario_proto(scenario_file, ego_only),
@@ -269,10 +280,9 @@ def _load_gt_scenario_for_device(
         gt_scenario["_cache_scenario_file"] = str(scenario_file)
         gt_scenario["_cache_ego_only"] = bool(ego_only)
         if cache_max_entries > 0:
-            _GT_SCENARIO_CACHE[cache_key] = gt_scenario
-            _trim_gt_scenario_cache(cache_max_entries)
-    elif cache_max_entries > 0:
-        _GT_SCENARIO_CACHE.move_to_end(cache_key)
+            with _GT_SCENARIO_CACHE_LOCK:
+                _GT_SCENARIO_CACHE[cache_key] = gt_scenario
+                _trim_gt_scenario_cache(cache_max_entries)
     return _clone_to_device(gt_scenario, device)
 
 
@@ -478,7 +488,7 @@ def _compute_scenario_metrics(
 class SimAgentsMetrics(Metric):
     """TrajTok Fast WOSAC 2025 evaluator wrapped as a torchmetrics Metric."""
 
-    def __init__(self, prefix: str, ego_only: bool = False, max_workers: int = 4) -> None:
+    def __init__(self, prefix: str, ego_only: bool = False, max_workers: int = 8) -> None:
         super().__init__()
         self.prefix = prefix
         self.ego_only = ego_only
@@ -498,9 +508,10 @@ class SimAgentsMetrics(Metric):
         for field_name in self.scenario_metric_field_names:
             self.add_state(field_name, default=tensor(0.0), dist_reduce_fx="sum")
         self.add_state("scenario_counter", default=tensor(0.0), dist_reduce_fx="sum")
-        # Kept for config compatibility. Fast WOSAC runs directly on the caller's
-        # torch device, so the old official-scorer worker pool is no longer used.
-        self._max_workers = int(max_workers)
+        self._max_workers = max(0, int(max_workers))
+        self._executor: ThreadPoolExecutor | None = None
+        self._pending_futures: list[Future] = []
+        self._max_pending_futures = max(1, self._max_workers * 2)
 
     @staticmethod
     def _compute_scenario_metrics(
@@ -516,11 +527,82 @@ class SimAgentsMetrics(Metric):
             ego_only=ego_only,
         )
 
+    def _use_worker_pool(self) -> bool:
+        return self._max_workers > 1
+
+    def _ensure_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix="fast-wosac",
+            )
+        return self._executor
+
+    def _submit_scenario_metrics_from_arrays(
+        self,
+        *,
+        scenario_file: str,
+        agent_id,
+        pred_traj,
+        pred_z,
+        pred_head,
+    ) -> None:
+        future = self._ensure_executor().submit(
+            _compute_scenario_metrics_from_arrays,
+            config=self.sim_agents_config,
+            scenario_file=scenario_file,
+            agent_id=agent_id,
+            pred_traj=pred_traj,
+            pred_z=pred_z,
+            pred_head=pred_head,
+            ego_only=self.ego_only,
+        )
+        self._pending_futures.append(future)
+        if len(self._pending_futures) >= self._max_pending_futures:
+            self._drain_completed_futures(wait=True)
+
+    def _submit_scenario_metrics_from_rollout(
+        self,
+        *,
+        scenario_file: str,
+        scenario_rollout: sim_agents_submission_pb2.ScenarioRollouts,
+    ) -> None:
+        future = self._ensure_executor().submit(
+            self._compute_scenario_metrics,
+            self.sim_agents_config,
+            scenario_file,
+            scenario_rollout,
+            self.ego_only,
+        )
+        self._pending_futures.append(future)
+        if len(self._pending_futures) >= self._max_pending_futures:
+            self._drain_completed_futures(wait=True)
+
     def _drain_completed_futures(self, wait: bool, drain_all: bool = False) -> None:
-        del wait, drain_all
-        return
+        if not self._pending_futures:
+            return
+
+        if drain_all:
+            futures_to_update = self._pending_futures
+            self._pending_futures = []
+        else:
+            if wait and not self._pending_futures[0].done():
+                futures_wait([self._pending_futures[0]])
+            drain_count = 0
+            for future in self._pending_futures:
+                if not future.done():
+                    break
+                drain_count += 1
+            if drain_count == 0:
+                return
+            futures_to_update = self._pending_futures[:drain_count]
+            self._pending_futures = self._pending_futures[drain_count:]
+
+        for future in futures_to_update:
+            self._update_metric_states(future.result())
 
     def reset(self) -> None:
+        self._drain_completed_futures(wait=True, drain_all=True)
         super().reset()
 
     def _update_metric_states(
@@ -543,6 +625,7 @@ class SimAgentsMetrics(Metric):
         return out_dict
 
     def get_state_tensor(self, device: torch.device) -> Tensor:
+        self._drain_completed_futures(wait=True, drain_all=True)
         state_values = [self.scenario_counter.detach().to(device=device)]
         state_values.extend(
             getattr(self, field_name).detach().to(device=device)
@@ -599,14 +682,23 @@ class SimAgentsMetrics(Metric):
         if len(scenario_rollouts) == 0:
             return
 
+        self._computed = None
+        self._update_count += 1
+
         for scenario_file, scenario_rollout in zip(scenario_files, scenario_rollouts):
-            scenario_metrics = self._compute_scenario_metrics(
-                self.sim_agents_config,
-                scenario_file,
-                scenario_rollout,
-                self.ego_only,
-            )
-            self._update_metric_states(scenario_metrics)
+            if self._use_worker_pool():
+                self._submit_scenario_metrics_from_rollout(
+                    scenario_file=scenario_file,
+                    scenario_rollout=scenario_rollout,
+                )
+            else:
+                scenario_metrics = self._compute_scenario_metrics(
+                    self.sim_agents_config,
+                    scenario_file,
+                    scenario_rollout,
+                    self.ego_only,
+                )
+                self._update_metric_states(scenario_metrics)
 
     @staticmethod
     def build_prediction_payloads(
@@ -657,16 +749,25 @@ class SimAgentsMetrics(Metric):
             scenario_pred_z,
             scenario_pred_head,
         ) in scenario_payloads:
-            scenario_metrics = _compute_scenario_metrics_from_arrays(
-                config=self.sim_agents_config,
-                scenario_file=scenario_file,
-                agent_id=scenario_agent_id,
-                pred_traj=scenario_pred_traj,
-                pred_z=scenario_pred_z,
-                pred_head=scenario_pred_head,
-                ego_only=self.ego_only,
-            )
-            self._update_metric_states(scenario_metrics)
+            if self._use_worker_pool():
+                self._submit_scenario_metrics_from_arrays(
+                    scenario_file=scenario_file,
+                    agent_id=scenario_agent_id,
+                    pred_traj=scenario_pred_traj,
+                    pred_z=scenario_pred_z,
+                    pred_head=scenario_pred_head,
+                )
+            else:
+                scenario_metrics = _compute_scenario_metrics_from_arrays(
+                    config=self.sim_agents_config,
+                    scenario_file=scenario_file,
+                    agent_id=scenario_agent_id,
+                    pred_traj=scenario_pred_traj,
+                    pred_z=scenario_pred_z,
+                    pred_head=scenario_pred_head,
+                    ego_only=self.ego_only,
+                )
+                self._update_metric_states(scenario_metrics)
 
     def update_from_prediction_tensors(
         self,
@@ -682,6 +783,30 @@ class SimAgentsMetrics(Metric):
 
         self._computed = None
         self._update_count += 1
+
+        if self._use_worker_pool():
+            for (
+                scenario_file,
+                scenario_agent_id,
+                scenario_pred_traj,
+                scenario_pred_z,
+                scenario_pred_head,
+            ) in self.build_prediction_payloads(
+                scenario_files=scenario_files,
+                agent_id=agent_id,
+                agent_batch=agent_batch,
+                pred_traj=pred_traj,
+                pred_z=pred_z,
+                pred_head=pred_head,
+            ):
+                self._submit_scenario_metrics_from_arrays(
+                    scenario_file=scenario_file,
+                    agent_id=scenario_agent_id,
+                    pred_traj=scenario_pred_traj,
+                    pred_z=scenario_pred_z,
+                    pred_head=scenario_pred_head,
+                )
+            return
 
         agent_batch_cpu = agent_batch.detach().to(device="cpu", dtype=torch.long)
         sizes = torch.bincount(agent_batch_cpu, minlength=len(scenario_files)).tolist()
@@ -704,6 +829,7 @@ class SimAgentsMetrics(Metric):
             start = end
 
     def compute(self) -> Dict[str, Tensor]:
+        self._drain_completed_futures(wait=True, drain_all=True)
         return self.compute_from_state_tensor(
             self.get_state_tensor(device=self.scenario_counter.device)
         )

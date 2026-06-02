@@ -73,7 +73,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -93,7 +93,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -114,7 +114,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -135,7 +135,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -153,7 +153,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -172,7 +172,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -193,7 +193,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -218,7 +218,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -243,7 +243,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -266,7 +266,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -293,7 +293,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -319,7 +319,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -346,7 +346,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -369,7 +369,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -396,7 +396,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -422,7 +422,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -449,7 +449,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -476,7 +476,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -503,7 +503,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
         },
     ),
     Variant(
@@ -533,7 +533,7 @@ FALLBACK_VARIANTS: tuple[Variant, ...] = (
             "PREFETCH_FACTOR": "4",
             "EVAL_NUM_WORKERS": "12",
             "EVAL_PREFETCH_FACTOR": "2",
-            "SIM_AGENTS_METRIC_WORKERS": "3",
+            "SIM_AGENTS_METRIC_WORKERS": "8",
             "WANDB_TAGS": "[ocsc_control_match]",
         },
     ),

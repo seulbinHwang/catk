@@ -168,7 +168,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         for scenario_path in scenario_paths
     ]
 
-    metric = SimAgentsMetrics("bench")
+    metric = SimAgentsMetrics("bench", max_workers=args.max_workers)
     pass_seconds: list[float] = []
     pass_metrics: list[dict[str, float]] = []
     for pass_idx in range(args.passes):
@@ -195,6 +195,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "num_scenarios": len(scenario_paths),
         "num_rollouts": int(args.num_rollouts),
         "passes": int(args.passes),
+        "max_workers": int(args.max_workers),
         "device": str(device),
         "clear_before_each_pass": bool(args.clear_before_each_pass),
         "cache_env": {
@@ -236,6 +237,7 @@ def main() -> None:
     parser.add_argument("--num-scenarios", type=int, default=4)
     parser.add_argument("--num-rollouts", type=int, default=32)
     parser.add_argument("--passes", type=int, default=3)
+    parser.add_argument("--max-workers", type=int, default=8)
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -251,6 +253,8 @@ def main() -> None:
         raise ValueError("--num-rollouts must be >= 1")
     if args.passes < 1:
         raise ValueError("--passes must be >= 1")
+    if args.max_workers < 1:
+        raise ValueError("--max-workers must be >= 1")
 
     summary = run_benchmark(args)
     text = json.dumps(summary, indent=2, sort_keys=True)

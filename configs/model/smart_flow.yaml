@@ -22,7 +22,7 @@ model_config:
   scorer_scene_num: 1728
   # Backward-compatible knob. Fast WOSAC runs on the current torch device and
   # no longer launches the old official-scorer worker pool.
-  sim_agents_metric_workers: 0
+  sim_agents_metric_workers: 8
   n_vis_batch: 0
   n_vis_scenario: 0
   n_vis_rollout: 0
