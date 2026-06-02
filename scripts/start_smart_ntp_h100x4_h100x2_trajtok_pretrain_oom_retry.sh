@@ -20,8 +20,8 @@ PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_hidden12
 REPO_URL="${REPO_URL:-https://github.com/seulbinHwang/catk.git}"
 BRANCH="${BRANCH:-trajtok}"
 GIT_REF="${GIT_REF:-}"
-TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_h100x4_h100x2_globalbs102_lr75e4_oom_retry_trajtok_hidden124_fastce_trainselectfalse_20260602}"
-SESSION="${SESSION:-catk-smart-ntp-h100x4-h100x2-trajtok-fastce}"
+TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_h100x4_h100x2_globalbs102_lr75e4_oom_retry_trajtok_hidden124_tokenmatchopt_trainselectfalse_20260603}"
+SESSION="${SESSION:-catk-smart-ntp-h100x4-h100x2-trajtok-tokenmatchopt}"
 EXPERIMENT="${EXPERIMENT:-pre_bc_a100x4x2}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
 CACHE_ROOT="${CACHE_ROOT:-}"
@@ -110,6 +110,9 @@ fi
 cd \"\$root\"
 git config --global --add safe.directory \"\$root\" || true
 git fetch origin --prune
+if ! git diff --quiet || ! git diff --cached --quiet || [ -n \"\$(git ls-files --others --exclude-standard)\" ]; then
+  git stash push --include-untracked -m \"codex-autostash-before-h100x4x2-trajtok-\$(date +%Y%m%d%H%M%S)\" || true
+fi
 if [ -n \"\$git_ref\" ]; then
   git checkout --detach \"\$git_ref\"
 else
