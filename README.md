@@ -64,6 +64,49 @@ Jan. 2025
 - Use [scripts/cache_womd.sh](scripts/cache_womd.sh) to preprocess the dataset into pickle files to accelerate data loading during the training and evaluation.
 - You should pack three datasets: `training`, `validation` and `testing`.
 
+### 10.60.188.83 SMART RAW cache 생성
+
+`SMART` 브랜치 기준 WOMD raw scenario를 새 SMART cache로 만들 때는 아래 경로를 사용한다.
+
+```text
+raw input:    /media/user/E/dataset/womd_v1_3/scenario
+cache output: /media/user/F/dataset/womd_v1_3/SMART_RAW_cache
+log output:   /media/user/F/dataset/womd_v1_3/SMART_RAW_cache_build_logs
+```
+
+원격 머신에서 장기 작업으로 실행한다.
+
+```bash
+ssh user@10.60.188.83
+tmux attach -t smart-raw-cache-build
+```
+
+세 split을 직접 다시 생성해야 하면 아래 명령을 같은 방식으로 실행한다. `validation` split은 validation metric과 submission에 필요한 `validation_tfrecords_splitted`도 함께 만든다.
+
+```bash
+source /media/user/E/miniforge/etc/profile.d/conda.sh
+conda activate catk
+cd /tmp/catk_smart_cache_build
+
+RAW_ROOT=/media/user/E/dataset/womd_v1_3/scenario
+CACHE_ROOT=/media/user/F/dataset/womd_v1_3/SMART_RAW_cache
+WORKERS=112
+
+python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT" --split training --num_workers "$WORKERS"
+python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT" --split validation --num_workers "$WORKERS"
+python -m src.data_preprocess --input_dir "$RAW_ROOT" --output_dir "$CACHE_ROOT" --split testing --num_workers "$WORKERS"
+```
+
+완료 후 최소 검증은 아래를 확인한다.
+
+```bash
+find /media/user/F/dataset/womd_v1_3/SMART_RAW_cache/training -maxdepth 1 -name '*.pkl' | wc -l
+find /media/user/F/dataset/womd_v1_3/SMART_RAW_cache/validation -maxdepth 1 -name '*.pkl' | wc -l
+find /media/user/F/dataset/womd_v1_3/SMART_RAW_cache/testing -maxdepth 1 -name '*.pkl' | wc -l
+find /media/user/F/dataset/womd_v1_3/SMART_RAW_cache/validation_tfrecords_splitted -maxdepth 1 -name '*.tfrecords' | wc -l
+grep -R "Traceback\\|Exception\\|No space left" /media/user/F/dataset/womd_v1_3/SMART_RAW_cache_build_logs || true
+```
+
 ## Run the code
 In the scripts, we provide
 - [scripts/train.sh](scripts/train.sh) for training and fine-tuning.
