@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 LOCAL_DIR="${1:-${LOCAL_DIR:-/media/user/F/dataset/womd_v1_3/MDG_cache}}"
-REMOTE_DIR="${2:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601}}"
+REMOTE_DIR="${2:-${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0602}}"
 NUBES_JOBS="${NUBES_JOBS:-96}"
 NUBES_RETRY="${NUBES_RETRY:-3}"
 NUBES_GATEWAY_ADDRESS="${NUBES_GATEWAY_ADDRESS:-c.nubes.sto.navercorp.com:8000}"
@@ -28,7 +28,7 @@ Usage:
 
 Defaults:
   local_dir  = /media/user/F/dataset/womd_v1_3/MDG_cache
-  remote_dir = labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601
+  remote_dir = labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0602
 
 Environment:
   NUBES_JOBS=96

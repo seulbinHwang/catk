@@ -98,7 +98,7 @@ CACHE_ROOT=/path/to/MDG_cache \
 bash scripts/cache_womd.sh
 ```
 
-`ssh user@10.60.188.78`의 `/media/user/E/dataset/womd_v1_3/scenario` 원본 TFRecord에서
+`ssh user@10.60.188.83`의 `/media/user/E/dataset/womd_v1_3/scenario` 원본 TFRecord에서
 `/media/user/F/dataset/womd_v1_3/MDG_cache`를 빠르게 만들 때는 전용 병렬 script를 사용한다.
 이 script는 `training`, `validation`, `testing`을 동시에 처리하고, validation용
 `validation_tfrecords_splitted`도 함께 만든다.
@@ -110,7 +110,7 @@ polyline의 실제 누적 길이를 기준으로 16개 waypoint를 균일하게 
 아래 cache 생성 절차로 새 `MDG_cache`를 만들어야 한다.
 
 ```bash
-ssh user@10.60.188.78
+ssh user@10.60.188.83
 cd /media/user/E/projects/catk
 git checkout MDG
 git pull --ff-only
@@ -151,16 +151,16 @@ tail -f /media/user/F/dataset/womd_v1_3/MDG_cache/logs/testing.log
 | `testing` | 44,920 |
 
 `/media/user/F` 저장 공간은 script 시작 전에 `df -h`와 `df -ih`로 검사한다. 실제 계측에서는
-validation split TFRecord까지 포함한 전체 MDG cache 예상 크기는 약 180GB 전후였다.
+validation split TFRecord까지 포함한 전체 MDG cache 실제 크기는 2026-06-02 재생성 기준 약 230GB였다.
 그래서 `/media/user/F`에 수백 GB 이상
 여유가 있으면 충분하지만, 장기 실행 전에는 script의 storage check 결과를 확인한다.
 
 생성된 MDG cache를 Nubes에 업로드하려면 아래 script를 사용한다. 기본 목적지는
-`labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601`이고, 기존 실험에서 가장 빨랐던
+`labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0602`이고, 기존 실험에서 가장 빨랐던
 `-j 96`을 기본값으로 둔다.
 
 ```bash
-ssh user@10.60.188.78
+ssh user@10.60.188.83
 cd /media/user/E/projects/catk
 git checkout MDG
 git pull --ff-only
@@ -173,7 +173,7 @@ tmux new-window -t hsb-rl-train -n mdg-upload \
 | 항목 | 기본값 |
 | --- | --- |
 | local cache | `/media/user/F/dataset/womd_v1_3/MDG_cache` |
-| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601` |
+| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0602` |
 | nubes jobs | 96 |
 | Nubes gateway | `c.nubes.sto.navercorp.com:8000` |
 | expected files | 620,109 |
@@ -187,11 +187,11 @@ cache root 아래 `logs/` 같은 부가 디렉터리가 있어도 Nubes에는 `t
 ```bash
 bash scripts/upload_mdg_cache_to_nubes.sh \
   /media/user/F/dataset/womd_v1_3/MDG_cache \
-  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601
+  labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0602
 ```
 
 Nubes에 업로드된 MDG cache를 `testas` 파드의 `/workspace/womd_v1_3/MDG_cache`로
-다운로드하려면 `ssh user@10.60.188.78`에서 아래 script를 실행한다.
+다운로드하려면 `ssh user@10.60.188.83`에서 아래 script를 실행한다.
 
 ```bash
 cd /media/user/E/projects/catk
@@ -214,7 +214,7 @@ CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=1 bash scripts/download_mdg_cache_to_testas.sh
 | --- | --- |
 | pod | `testas` |
 | local cache | `/workspace/womd_v1_3/MDG_cache` |
-| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601` |
+| Nubes remote | `labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0602` |
 | nubes jobs | 96 |
 | clean before download | `CLEAN_CACHE_ROOT_BEFORE_DOWNLOAD=0` |
 | expected files | 620,109 |
@@ -292,7 +292,7 @@ V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다
 
 ### testas A100 7장 pretrain
 
-`testas` 파드에 cache가 `/workspace/womd_v1_3/MDG_cache`로 준비되어 있으면, `ssh user@10.60.188.78`에서 아래처럼 학습을 시작한다. 정식 run은 pod 안의 전용 clean checkout인 `/mnt/nuplan/projects/catk_mdg_pretrain`을 사용한다. launcher의 `PROJECT_ROOT` 기본값도 이 경로다. launcher가 해당 경로를 `origin/MDG` 최신 커밋으로 준비한 뒤 tmux에서 학습을 시작하므로, 예전 실험 산출물이나 dirty worktree가 섞이지 않는다.
+`testas` 파드에 cache가 `/workspace/womd_v1_3/MDG_cache`로 준비되어 있으면, `ssh user@10.60.188.83`에서 아래처럼 학습을 시작한다. 정식 run은 pod 안의 전용 clean checkout인 `/mnt/nuplan/projects/catk_mdg_pretrain`을 사용한다. launcher의 `PROJECT_ROOT` 기본값도 이 경로다. launcher가 해당 경로를 `origin/MDG` 최신 커밋으로 준비한 뒤 tmux에서 학습을 시작하므로, 예전 실험 산출물이나 dirty worktree가 섞이지 않는다.
 
 처음부터 새 run을 시작하려면 기존 run과 다른 `TASK_NAME`을 사용한다. `start_mdg_pretrain_testas_a100x7.sh`는 기본적으로 `CATK_AUTO_RESUME=false`라 checkpoint를 자동으로 이어받지 않는다. 단, OOM retry wrapper는 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`를 찾아 재시도에 사용하므로, 완전히 새 학습은 반드시 새 `TASK_NAME`으로 시작한다.
 

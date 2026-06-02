@@ -2,14 +2,14 @@
 set -Eeuo pipefail
 
 # Start an MDG cache download inside the existing testas pod.
-# This script is intended to be run on ssh user@10.60.188.78.
+# This script is intended to be run on ssh user@10.60.188.83.
 
 NAMESPACE="${NAMESPACE:-p-pnc}"
 POD="${POD:-testas}"
 CONTAINER="${CONTAINER:-main}"
 PROJECT_ROOT="${PROJECT_ROOT:-/mnt/nuplan/projects/catk_mdg_cache_download}"
 BRANCH="${BRANCH:-MDG}"
-REMOTE_DIR="${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0601}"
+REMOTE_DIR="${REMOTE_DIR:-labs-mlops/ad/research/pnc/hsb/dataset/womd_v1_3/MDG_cache_0602}"
 CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/MDG_cache}"
 NUBES_JOBS="${NUBES_JOBS:-96}"
 NUBES_RETRY="${NUBES_RETRY:-3}"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Start MDG A100x7 pretrain inside the existing testas pod.
 #
-# This script is intended to be run on ssh user@10.60.188.78.
+# This script is intended to be run on ssh user@10.60.188.83.
 set -Eeuo pipefail
 
 NAMESPACE="${NAMESPACE:-p-pnc}"

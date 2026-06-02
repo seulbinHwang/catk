@@ -2,7 +2,7 @@
 # Launch MDG pretrain on the existing testas A100x7 pod with automatic
 # train_batch_size fallback on CUDA OOM.
 #
-# Run this script on ssh user@10.60.188.78, where kubectl can access testas.
+# Run this script on ssh user@10.60.188.83, where kubectl can access testas.
 # It never creates, deletes, or restarts pods. It only replaces the configured
 # tmux session inside the already-running testas pod.
 
