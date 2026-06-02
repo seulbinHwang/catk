@@ -72,9 +72,13 @@ model:
       ema_weight: 0.99
       ema_start_step: 50
       gradient_clip_val: 10.0
-      # 시나리오당 closed-loop rollout 수 G (variance reduction). VRAM ~G배.
+      # ★ 분산/밀도 knob = G (OCSC dmd_n_rollouts).  같은 GT-grounded base 에서 noise tape
+      #   G개를 batch-replicate 로 동시에 굴려 DMD 신호 variance 를 1/G 로 줄임. VRAM ~G배.
+      #   (구버전의 다중 time-anchor 는 self-rollout drift 버그라 제거 → 분산은 여기서 늘린다.)
       n_rollouts: 1
-      # 단일 anchor 0 (OCSC dmd_anchor_stride 대응; rollout 길이 자동).
+      # ⚠ n_anchors 는 1 고정.  >1 (단일 rollout 다중 anchor 추출)은 OCSC GT-grounded anchor
+      #   와 다른 self-drift 버그라 코드에서 막혀 있음 (gt_pos history-only + base 전용 exec
+      #   fine-history 때문에 현재 kinematic 모델은 GT-grounded time-anchor 미지원).
       n_anchors: 1
       anchor_stride: 1
       sampling:

@@ -373,6 +373,26 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
+        # ── ★ anchor 추출 정합성 가드 (🅑→🅐) ────────────────────────────────
+        # 구 동작(🅑): 단일 closed-loop rollout 에서 anchor_idx*stride 만큼 들어간 window 를
+        #   잘라 다중 anchor 로 사용 → anchor_idx>0 은 generator 자기 rollout 의 drift 위에서
+        #   출발(GT-grounded 아님).  OCSC(🅐)는 anchor 마다 GT history 로 새로 출발하는데,
+        #   현재 kinematic 모델은 이를 지원하지 못한다:
+        #     (1) tokenized_agent["gt_pos"] 가 history-only (future GT 미포함; future 타깃은
+        #         flow_train_clean_norm 등 별도 키) → future anchor 를 슬라이스할 GT 가 없음.
+        #     (2) LQR/closed-loop 의 exec fine-history(rollout_init_fine_*) 가 base 시점 전용
+        #         → future anchor 의 10Hz history 재구성 불가.
+        #   따라서 OCSC-정합의 올바른 동작은 "단일 GT-grounded anchor(0) + n_rollouts(G)".
+        #   분산/밀도는 self_forced.n_rollouts (= OCSC dmd_n_rollouts) 로 늘린다.
+        if self.self_forced_enabled and int(self.self_forced_n_anchors) != 1:
+            raise ValueError(
+                "self_forced.n_anchors must be 1 in this branch. "
+                "다중 time-anchor(>1)는 단일 rollout 에서 window 를 잘라 쓰던 구 버그(🅑)로, "
+                "뒤 anchor 가 self-rollout drift 위에 얹혀 OCSC GT-grounded anchor 와 다릅니다. "
+                "현재 kinematic 모델은 gt_pos history-only + base 전용 exec fine-history 때문에 "
+                "OCSC 식 GT-grounded time-anchor 를 inference 수정 없이 지원할 수 없습니다. "
+                f"분산은 self_forced.n_rollouts(G)로 늘리세요. got n_anchors={int(self.self_forced_n_anchors)}."
+            )
         # critic(generated estimator) LR.  config에 estimator_lr이 양수로 명시되어 있으면
         # 그 절대값을 그대로 사용 (generator LR 과 동일하게 두고 싶을 때 유용).  값이 없거나
         # ``null`` / ``<= 0`` 이면 기존 비례 관계 ``lr / estimator_updates_per_step`` 을 그대로
