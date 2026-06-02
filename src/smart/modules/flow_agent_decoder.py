@@ -1436,31 +1436,35 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_seeds=scenario_sampling_seeds,
             agent_batch=tokenized_agent["batch"],
         )
-        # Derive scenario count from the always-present `batch` index instead of
-        # `tokenized_agent["num_graphs"]`. The latter is only populated on the
-        # training-side `tokenized_agent` (built by `_build_eval_tokenized_inputs`)
-        # but is dropped by the validation/inference helper
-        # `_build_parallel_rollout_tokenized_agent`, so any read of "num_graphs"
-        # here would KeyError on the very first closed-loop validation step
-        # even though `_sample_training_terminal_step_for_batch` is a no-op for
-        # the eval path (`self_forced_epoch is None`). `batch` is required by
-        # downstream PyG ops in this same function and is therefore guaranteed
-        # to exist on every code path that reaches this point.
-        agent_batch_index = tokenized_agent["batch"]
-        num_scenario_for_random_s = (
-            int(agent_batch_index.max().item()) + 1
-            if agent_batch_index.numel() > 0
-            else 0
+        terminal_steps_by_scenario = None
+        terminal_s_by_scenario = None
+        random_terminal_cfg = getattr(sampling_scheme, "random_terminal_step", None)
+        should_sample_terminal_step = (
+            self_forced_epoch is not None
+            and random_terminal_cfg is not None
+            and bool(getattr(random_terminal_cfg, "enabled", False))
+            and str(getattr(random_terminal_cfg, "policy", "paper_uniform")) != "all"
         )
-        (
-            terminal_steps_by_scenario,
-            terminal_s_by_scenario,
-        ) = self._sample_training_terminal_step_for_batch(
-            sampling_scheme=sampling_scheme,
-            num_scenario=num_scenario_for_random_s,
-            device=feat_a_now.device,
-            self_forced_epoch=self_forced_epoch,
-        )
+        if should_sample_terminal_step:
+            # Derive scenario count from the always-present `batch` index instead
+            # of `tokenized_agent["num_graphs"]`. Keep this behind the random-s
+            # branch: `max().item()` synchronizes CUDA, and validation/OCSC paths
+            # do not need terminal-step sampling.
+            agent_batch_index = tokenized_agent["batch"]
+            num_scenario_for_random_s = (
+                int(agent_batch_index.max().item()) + 1
+                if agent_batch_index.numel() > 0
+                else 0
+            )
+            (
+                terminal_steps_by_scenario,
+                terminal_s_by_scenario,
+            ) = self._sample_training_terminal_step_for_batch(
+                sampling_scheme=sampling_scheme,
+                num_scenario=num_scenario_for_random_s,
+                device=feat_a_now.device,
+                self_forced_epoch=self_forced_epoch,
+            )
         terminal_step_by_agent = (
             terminal_steps_by_scenario[tokenized_agent["batch"]]
             if terminal_steps_by_scenario is not None
@@ -1471,7 +1475,21 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             if terminal_steps_by_scenario is not None and terminal_steps_by_scenario.numel() > 0
             else None
         )
-
+        flow_sample_steps = int(getattr(
+            sampling_scheme,
+            "sample_steps",
+            self.flow_ode.solver_steps,
+        ))
+        flow_sample_method = getattr(
+            sampling_scheme,
+            "sample_method",
+            self.flow_ode.solver_method,
+        )
+        flow_sample_backprop_last_k = (
+            self._resolve_training_backprop_last_k(sampling_scheme=sampling_scheme)
+            if terminal_step_by_agent is None
+            else None
+        )
         for t in range(n_step_future_2hz):
             if detach_block_transition and t > 0:
                 detached_state = detach_training_rollout_state(
@@ -1597,20 +1615,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     active_mask,
                     noise_start : noise_start + sample_window_steps,
                 ].contiguous()
-                flow_sample_steps = int(getattr(
-                    sampling_scheme,
-                    "sample_steps",
-                    self.flow_ode.solver_steps,
-                ))
-                flow_sample_method = getattr(
-                    sampling_scheme,
-                    "sample_method",
-                    self.flow_ode.solver_method,
-                )
                 if terminal_step_by_agent is None:
-                    flow_sample_backprop_last_k = self._resolve_training_backprop_last_k(
-                        sampling_scheme=sampling_scheme,
-                    )
                     y_hat_norm = self.flow_ode.generate(
                         x_init=x_init_norm,
                         model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),

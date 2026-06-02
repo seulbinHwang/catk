@@ -434,6 +434,48 @@ def test_self_forced_training_rollout_uses_geometry_only_relation_input() -> Non
     assert "motion_valid_a" not in records[0]
 
 
+def test_eval_rollout_skips_training_terminal_step_sampling() -> None:
+    decoder = _make_flow_decoder()
+    rollout_cache, tokenized_agent = _make_rollout_cache_for_update_test()
+
+    def fail_terminal_sampling(*args, **kwargs):
+        raise AssertionError("eval rollout must not sample training terminal steps")
+
+    decoder._sample_training_terminal_step_for_batch = fail_terminal_sampling
+    decoder._rollout_from_cache_impl(
+        rollout_cache=rollout_cache,
+        tokenized_agent=tokenized_agent,
+        map_feature=_empty_map_feature(),
+        sampling_scheme=SimpleNamespace(noise_scale=0.0, sample_steps=1, sample_method="euler"),
+        rollout_steps_2hz=2,
+        self_forced_epoch=None,
+    )
+
+
+def test_self_forced_policy_all_rollout_skips_terminal_step_sampling() -> None:
+    decoder = _make_flow_decoder()
+    rollout_cache, tokenized_agent = _make_rollout_cache_for_update_test()
+
+    def fail_terminal_sampling(*args, **kwargs):
+        raise AssertionError("policy=all must not sample a terminal step")
+
+    decoder._sample_training_terminal_step_for_batch = fail_terminal_sampling
+    decoder._rollout_from_cache_impl(
+        rollout_cache=rollout_cache,
+        tokenized_agent=tokenized_agent,
+        map_feature=_empty_map_feature(),
+        sampling_scheme=SimpleNamespace(
+            noise_scale=0.0,
+            sample_steps=1,
+            sample_method="euler",
+            random_terminal_step=SimpleNamespace(enabled=True, policy="all"),
+            backprop_last_k=1,
+        ),
+        rollout_steps_2hz=2,
+        self_forced_epoch=0,
+    )
+
+
 def test_old_motion_feature_checkpoint_fails_with_clear_message() -> None:
     model = SMARTFlow.__new__(SMARTFlow)
     object.__setattr__(
