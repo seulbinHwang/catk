@@ -8,6 +8,10 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+shq() {
+  printf "%q" "$1"
+}
+
 NAMESPACE="${NAMESPACE:-p-pnc}"
 CONTAINER="${CONTAINER:-main}"
 PODS="${PODS:-testa testaa}"
@@ -34,6 +38,26 @@ CKPT_PATH="${CKPT_PATH:-}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 WANDB_MODE="${WANDB_MODE:-online}"
 
+PROJECT_ROOT_Q="$(shq "$PROJECT_ROOT")"
+CACHE_ROOT_Q="$(shq "$CACHE_ROOT")"
+TASK_NAME_Q="$(shq "$TASK_NAME")"
+EXPERIMENT_Q="$(shq "$EXPERIMENT")"
+ACTION_Q="$(shq "$ACTION")"
+MASTER_PORT_Q="$(shq "$MASTER_PORT")"
+TRAIN_BATCH_SIZE_Q="$(shq "$TRAIN_BATCH_SIZE")"
+VAL_BATCH_SIZE_Q="$(shq "$VAL_BATCH_SIZE")"
+TEST_BATCH_SIZE_Q="$(shq "$TEST_BATCH_SIZE")"
+LIMIT_TRAIN_BATCHES_Q="$(shq "$LIMIT_TRAIN_BATCHES")"
+LIMIT_VAL_BATCHES_Q="$(shq "$LIMIT_VAL_BATCHES")"
+MAX_EPOCHS_Q="$(shq "$MAX_EPOCHS")"
+CKPT_PATH_Q="$(shq "$CKPT_PATH")"
+EXTRA_HYDRA_OVERRIDES_Q="$(shq "$EXTRA_HYDRA_OVERRIDES")"
+WANDB_MODE_Q="$(shq "$WANDB_MODE")"
+BRANCH_Q="$(shq "$BRANCH")"
+REPO_URL_Q="$(shq "$REPO_URL")"
+LOG_DIR_Q="$(shq "$LOG_DIR")"
+SESSION_Q="$(shq "$SESSION")"
+
 read -r -a POD_ARRAY <<< "$PODS"
 if [[ "${#POD_ARRAY[@]}" -lt 2 ]]; then
   echo "[launcher] PODS must contain two pods, got: ${PODS}" >&2
@@ -46,26 +70,30 @@ if [[ -z "$MASTER_ADDR" ]]; then
   echo "[launcher] failed to resolve master pod IP for ${MASTER_POD}" >&2
   exit 1
 fi
+MASTER_ADDR_Q="$(shq "$MASTER_ADDR")"
+NNODES_Q="$(shq "$NNODES")"
+NPROC_PER_NODE_Q="$(shq "$NPROC_PER_NODE")"
 
 REMOTE_SCRIPT="/tmp/smart_a100x4x2_pretrain_node.sh"
+REMOTE_SCRIPT_Q="$(shq "$REMOTE_SCRIPT")"
 
 prepare_pod() {
   local pod="$1"
   echo "[launcher] preparing ${pod}"
   kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
     set -Eeuo pipefail
-    if [[ ! -d ${PROJECT_ROOT@Q}/.git ]]; then
-      rm -rf ${PROJECT_ROOT@Q}
-      git clone ${REPO_URL@Q} ${PROJECT_ROOT@Q}
+    if [[ ! -d ${PROJECT_ROOT_Q}/.git ]]; then
+      rm -rf ${PROJECT_ROOT_Q}
+      git clone ${REPO_URL_Q} ${PROJECT_ROOT_Q}
     fi
-    cd ${PROJECT_ROOT@Q}
+    cd ${PROJECT_ROOT_Q}
     git fetch origin --prune
-    git checkout -B ${BRANCH@Q} origin/${BRANCH}
+    git checkout -B ${BRANCH_Q} origin/${BRANCH}
     git reset --hard origin/${BRANCH}
     for d in training validation testing validation_tfrecords_splitted; do
-      test -d ${CACHE_ROOT@Q}/\$d
+      test -d ${CACHE_ROOT_Q}/\$d
     done
-    mkdir -p ${LOG_DIR@Q}/${TASK_NAME@Q}
+    mkdir -p ${LOG_DIR_Q}/${TASK_NAME_Q}
   "
   kubectl cp -n "$NAMESPACE" -c "$CONTAINER" \
     "$REPO_ROOT/scripts/smart_a100x4x2_pretrain_node.sh" \
@@ -83,26 +111,26 @@ start_pod() {
   cat > "$local_run" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
-export PROJECT_ROOT=${PROJECT_ROOT@Q}
-export CACHE_ROOT=${CACHE_ROOT@Q}
-export TASK_NAME=${TASK_NAME@Q}
-export EXPERIMENT=${EXPERIMENT@Q}
-export ACTION=${ACTION@Q}
-export NNODES=${NNODES@Q}
-export NPROC_PER_NODE=${NPROC_PER_NODE@Q}
-export NODE_RANK=${rank@Q}
-export MASTER_ADDR=${MASTER_ADDR@Q}
-export MASTER_PORT=${MASTER_PORT@Q}
-export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE@Q}
-export VAL_BATCH_SIZE=${VAL_BATCH_SIZE@Q}
-export TEST_BATCH_SIZE=${TEST_BATCH_SIZE@Q}
-export LIMIT_TRAIN_BATCHES=${LIMIT_TRAIN_BATCHES@Q}
-export LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES@Q}
-export MAX_EPOCHS=${MAX_EPOCHS@Q}
-export CKPT_PATH=${CKPT_PATH@Q}
-export EXTRA_HYDRA_OVERRIDES=${EXTRA_HYDRA_OVERRIDES@Q}
-export WANDB_MODE=${WANDB_MODE@Q}
-bash ${REMOTE_SCRIPT@Q} 2>&1 | tee ${tmux_log@Q}
+export PROJECT_ROOT=${PROJECT_ROOT_Q}
+export CACHE_ROOT=${CACHE_ROOT_Q}
+export TASK_NAME=${TASK_NAME_Q}
+export EXPERIMENT=${EXPERIMENT_Q}
+export ACTION=${ACTION_Q}
+export NNODES=${NNODES_Q}
+export NPROC_PER_NODE=${NPROC_PER_NODE_Q}
+export NODE_RANK=$(shq "$rank")
+export MASTER_ADDR=${MASTER_ADDR_Q}
+export MASTER_PORT=${MASTER_PORT_Q}
+export TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE_Q}
+export VAL_BATCH_SIZE=${VAL_BATCH_SIZE_Q}
+export TEST_BATCH_SIZE=${TEST_BATCH_SIZE_Q}
+export LIMIT_TRAIN_BATCHES=${LIMIT_TRAIN_BATCHES_Q}
+export LIMIT_VAL_BATCHES=${LIMIT_VAL_BATCHES_Q}
+export MAX_EPOCHS=${MAX_EPOCHS_Q}
+export CKPT_PATH=${CKPT_PATH_Q}
+export EXTRA_HYDRA_OVERRIDES=${EXTRA_HYDRA_OVERRIDES_Q}
+export WANDB_MODE=${WANDB_MODE_Q}
+bash ${REMOTE_SCRIPT_Q} 2>&1 | tee $(shq "$tmux_log")
 EOF
   chmod +x "$local_run"
   kubectl cp -n "$NAMESPACE" -c "$CONTAINER" "$local_run" "$pod:$remote_run"
@@ -116,8 +144,8 @@ EOF
   echo "[launcher] starting ${pod} rank=${rank}"
   kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "
     set -Eeuo pipefail
-    mkdir -p ${LOG_DIR@Q}/${TASK_NAME@Q}
-    tmux new-session -d -s ${SESSION@Q} bash ${remote_run@Q}
+    mkdir -p ${LOG_DIR_Q}/${TASK_NAME_Q}
+    tmux new-session -d -s ${SESSION_Q} bash $(shq "$remote_run")
   "
 }
 
