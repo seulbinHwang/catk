@@ -766,7 +766,7 @@ class EgoGMMAgentDecoder(nn.Module):
             "next_token_action": torch.stack(next_token_action_list, dim=1),
         }
 
-        if not self.training:  # 10hz predictions for wosac evaluation and submission
+        if not self.training:  # 10hz predictions for Sim Agents evaluation and submission
             out_dict["pred_traj_10hz"] = pred_traj_10hz
             out_dict["pred_head_10hz"] = pred_head_10hz
             pred_z = tokenized_agent["gt_z_raw"].unsqueeze(1)  # [n_agent, 1]

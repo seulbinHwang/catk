@@ -5,7 +5,8 @@ model_config:
   lr_total_steps: ${trainer.max_epochs}
   lr_min_ratio: 0.05
   n_rollout_closed_val: 32
-  n_batch_wosac_metric: 10
+  n_batch_sim_agents_metric: 10
+  scorer_scene_num: null
   n_vis_batch: 2
   n_vis_scenario: 5
   n_vis_rollout: 5
@@ -43,7 +44,7 @@ model_config:
     time_span: 30
     num_historical_steps: 11
     num_future_steps: 80
-  wosac_submission:
+  sim_agents_submission:
     is_active: false
     method_name: "SMART-tiny-CLSFT"
     authors: [Anonymous]
@@ -51,6 +52,7 @@ model_config:
     description: YOUR_DESCRIPTION
     method_link: YOUR_METHOD_LINK
     account_name: YOUR_ACCOUNT_NAME
+    num_model_parameters: "7M"
   training_loss:
     use_gt_raw: true
     gt_thresh_scale_length: -1.0  # {"veh": 4.8, "cyc": 2.0, "ped": 1.0}

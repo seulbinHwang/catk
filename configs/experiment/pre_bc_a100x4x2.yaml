@@ -1,0 +1,56 @@
+# @package _global_
+
+# SMART branch pretrain preset for two existing x4 A100 pods.
+#
+# This keeps the SMART branch pretrain model/loss recipe from `pre_bc`, while
+# setting only the distributed runtime and fit-time validation protocol needed
+# for testa + testaa:
+#   * 2 nodes
+#   * 4 A100 GPUs per node
+#   * check_val_every_n_epoch=16
+#   * Fast Sim Agents 2025 scorer over about 1680 validation scenarios
+#   * validation rollout sampling aligned with submission-style top-48 candidates
+
+defaults:
+  - pre_bc
+  - _self_
+
+model:
+  model_config:
+    scorer_scene_num: 1680
+    n_rollout_closed_val: 32
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    validation_rollout_sampling:
+      criterium: topk_prob
+      num_k: 48
+      temp: 1.0
+
+trainer:
+  devices: 4
+  num_nodes: 2
+  enable_progress_bar: true
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 16
+  max_epochs: 64
+  gradient_clip_val: 0.5
+  sync_batchnorm: false
+  accumulate_grad_batches: 1
+  use_distributed_sampler: false
+
+callbacks:
+  tqdm_progress_bar:
+    _target_: lightning.pytorch.callbacks.TQDMProgressBar
+    refresh_rate: 1
+    process_position: 0
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  train_batch_size: 10
+  val_batch_size: 12
+  test_batch_size: 12
+  num_workers: 4

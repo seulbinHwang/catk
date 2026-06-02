@@ -21,16 +21,16 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from src.smart.metrics import (
     CrossEntropy,
+    SimAgentsMetrics,
+    SimAgentsSubmission,
     TokenCls,
-    WOSACMetrics,
-    WOSACSubmission,
     minADE,
 )
 from src.smart.modules.smart_decoder import SMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
-from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
 
 class SMART(LightningModule):
@@ -55,21 +55,82 @@ class SMART(LightningModule):
 
         self.minADE = minADE()
         self.TokenCls = TokenCls(max_guesses=5)
-        self.wosac_metrics = WOSACMetrics("val_closed")
-        self.wosac_submission = WOSACSubmission(**model_config.wosac_submission)
+        self.sim_agents_metrics = SimAgentsMetrics("val_closed")
+        self.sim_agents_submission = SimAgentsSubmission(
+            **model_config.sim_agents_submission
+        )
         self.training_loss = CrossEntropy(**model_config.training_loss)
 
         self.n_rollout_closed_val = model_config.n_rollout_closed_val
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
-        self.n_batch_wosac_metric = model_config.n_batch_wosac_metric
+        self.n_batch_sim_agents_metric = int(model_config.n_batch_sim_agents_metric)
+        self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
+        self._scorer_scene_num_last_key: tuple[int, int, int] | None = None
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
 
         self.training_rollout_sampling = model_config.training_rollout_sampling
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
+
+    def _resolve_val_batch_size(self) -> int | None:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return None
+        datamodule = getattr(trainer, "datamodule", None)
+        if datamodule is None:
+            return None
+        val_batch_size = getattr(datamodule, "val_batch_size", None)
+        if not isinstance(val_batch_size, int) or val_batch_size <= 0:
+            return None
+        return int(val_batch_size)
+
+    def _apply_scorer_scene_num_overrides(self) -> None:
+        if self.sim_agents_submission.is_active:
+            return
+
+        scorer_scene_num = self.scorer_scene_num
+        if scorer_scene_num is None:
+            return
+        try:
+            scorer_scene_num = int(scorer_scene_num)
+        except (TypeError, ValueError):
+            return
+        if scorer_scene_num <= 0:
+            return
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        if world_size <= 0:
+            world_size = 1
+
+        val_batch_size = self._resolve_val_batch_size()
+        if val_batch_size is None:
+            return
+
+        per_rank_scenes = math.ceil(scorer_scene_num / world_size)
+        self.n_batch_sim_agents_metric = max(
+            1,
+            math.ceil(per_rank_scenes / val_batch_size),
+        )
+
+        current_key = (int(scorer_scene_num), int(world_size), int(val_batch_size))
+        if self._scorer_scene_num_last_key == current_key:
+            return
+        self._scorer_scene_num_last_key = current_key
+        if getattr(trainer, "is_global_zero", True):
+            print(
+                "[scorer_scene_num] Fast Sim Agents 2025 scorer batch count set to "
+                f"n_batch_sim_agents_metric={self.n_batch_sim_agents_metric} "
+                f"(requested_scenes={scorer_scene_num}, world_size={world_size}, "
+                f"val_batch_size={val_batch_size}).",
+                flush=True,
+            )
 
     def training_step(self, data, batch_idx):
         tokenized_map, tokenized_agent = self.token_processor(data)
@@ -94,6 +155,7 @@ class SMART(LightningModule):
         return loss
 
     def validation_step(self, data, batch_idx):
+        self._apply_scorer_scene_num_overrides()
         tokenized_map, tokenized_agent = self.token_processor(data)
 
         # ! open-loop vlidation
@@ -136,28 +198,19 @@ class SMART(LightningModule):
             pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
             pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
 
-            # ! WOSAC
             scenario_rollouts = None
-            if self.wosac_submission.is_active:  # ! save WOSAC submission
-                self.wosac_submission.update(
+            if self.sim_agents_submission.is_active:  # ! save Sim Agents submission
+                self.sim_agents_submission.update(
                     scenario_id=data["scenario_id"],
                     agent_id=data["agent"]["id"],
                     agent_batch=data["agent"]["batch"],
                     pred_traj=pred_traj,
                     pred_z=pred_z,
                     pred_head=pred_head,
-                    global_rank=self.global_rank,
                 )
-                _gpu_dict_sync = self.wosac_submission.compute()
-                if self.global_rank == 0:
-                    for k in _gpu_dict_sync.keys():  # single gpu fix
-                        if type(_gpu_dict_sync[k]) is list:
-                            _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
-                    scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
-                    self.wosac_submission.aggregate_rollouts(scenario_rollouts)
-                self.wosac_submission.reset()
+                scenario_rollouts = self.sim_agents_submission.aggregate_current_batch()
 
-            else:  # ! compute metrics, disable if save WOSAC submission
+            else:  # ! compute metrics, disable when saving Sim Agents submission
                 self.minADE.update(
                     pred=pred_traj,
                     target=data["agent"]["position"][
@@ -168,8 +221,8 @@ class SMART(LightningModule):
                     ],
                 )
 
-                # WOSAC metrics
-                if batch_idx < self.n_batch_wosac_metric:
+                # Fast Sim Agents 2025 metrics
+                if batch_idx < self.n_batch_sim_agents_metric:
                     device = pred_traj.device
                     scenario_rollouts = get_scenario_rollouts(
                         scenario_id=get_scenario_id_int_tensor(
@@ -181,7 +234,9 @@ class SMART(LightningModule):
                         pred_z=pred_z,
                         pred_head=pred_head,
                     )
-                    self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
+                    self.sim_agents_metrics.update(
+                        data["tfrecord_path"], scenario_rollouts
+                    )
 
             # ! visualization
             if self.global_rank == 0 and batch_idx < self.n_vis_batch:
@@ -202,21 +257,20 @@ class SMART(LightningModule):
 
     def on_validation_epoch_end(self):
         if self.val_closed_loop:
-            if not self.wosac_submission.is_active:
-                epoch_wosac_metrics = self.wosac_metrics.compute()
-                epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
+            if not self.sim_agents_submission.is_active:
+                epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
+                epoch_sim_agents_metrics["val_closed/ADE"] = self.minADE.compute()
                 if self.global_rank == 0:
-                    epoch_wosac_metrics["epoch"] = (
+                    epoch_sim_agents_metrics["epoch"] = (
                         self.log_epoch if self.log_epoch >= 0 else self.current_epoch
                     )
-                    self.logger.log_metrics(epoch_wosac_metrics)
+                    self.logger.log_metrics(epoch_sim_agents_metrics)
 
-                self.wosac_metrics.reset()
+                self.sim_agents_metrics.reset()
                 self.minADE.reset()
 
-            if self.global_rank == 0:
-                if self.wosac_submission.is_active:
-                    self.wosac_submission.save_sub_file()
+            if self.sim_agents_submission.is_active:
+                self.sim_agents_submission.save_sub_file()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -260,25 +314,17 @@ class SMART(LightningModule):
         pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
         pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
 
-        # ! WOSAC submission save
-        self.wosac_submission.update(
+        # ! Sim Agents 2025 submission save
+        self.sim_agents_submission.update(
             scenario_id=data["scenario_id"],
             agent_id=data["agent"]["id"],
             agent_batch=data["agent"]["batch"],
             pred_traj=pred_traj,
             pred_z=pred_z,
             pred_head=pred_head,
-            global_rank=self.global_rank,
         )
-        _gpu_dict_sync = self.wosac_submission.compute()
-        if self.global_rank == 0:
-            for k in _gpu_dict_sync.keys():  # single gpu fix
-                if type(_gpu_dict_sync[k]) is list:
-                    _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
-            scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
-            self.wosac_submission.aggregate_rollouts(scenario_rollouts)
-        self.wosac_submission.reset()
+        self.sim_agents_submission.aggregate_current_batch()
 
     def on_test_epoch_end(self):
-        if self.global_rank == 0:
-            self.wosac_submission.save_sub_file()
+        if self.sim_agents_submission.is_active:
+            self.sim_agents_submission.save_sub_file()

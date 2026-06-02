@@ -25,17 +25,17 @@
 
 Apr. 2025
 - **Oral at CVPR 2025**: Cheers!
-- **Top on the WOSAC Leaderboard 2024**: With the Waymo Challenges 2025 coming up, the WOSAC 2024 leaderboard is now closed and our method remains in the 1st place.
+- **Waymo Sim Agents 2025 ready**: This branch evaluates closed-loop rollouts with the Waymo Sim Agents 2025 metric path only.
 
 Feb. 2025
 - **Paper accepted at CVPR 2025:** Cheers!
 
-- **Model checkpoints for WOSAC:** You can obtain the checkpoints for our WOSAC submission (SMART-tiny-CLSFT) by sending an email to Zhejun (zhejun.zhang94@gmail.com). In accordance with Waymo's terms, you must attach a screenshot showing that you are registered and logged into the [My Submissions](https://waymo.com/open/challenges/submissions) page of the Waymo Open Dataset.
+- **Model checkpoints for Sim Agents:** You can obtain the checkpoints for our Sim Agents submission (SMART-tiny-CLSFT) by sending an email to Zhejun (zhejun.zhang94@gmail.com). In accordance with Waymo's terms, you must attach a screenshot showing that you are registered and logged into the [My Submissions](https://waymo.com/open/challenges/submissions) page of the Waymo Open Dataset.
 
 - **SMART-mini and SMART-nano:** SMART-tiny with 7M parameters requires training on 8x A100 for a few days, which may be unaffordable in some cases. To address this, we have added config files for two smaller model, [smart_mini_3M.yaml](configs/model/smart_mini_3M.yaml) and [smart_nano_1M.yaml](configs/model/smart_nano_1M.yaml). Specifically, SMART-nano-1M can be trained on a single A100, but its performance is significantly worse. After pre-training and CAT-K fine-tuning, we achieved an RMM of 0.74 with SMART-nano-1M, which is 0.03 lower than that of SMART-tiny-7M. 
 
 Jan. 2025
-- **SoTA performance on WOSAC:** CAT-K is now rank #1 on the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/)! We resolved an issue in the agent token vocabulary, and now our fine-tuned model achieves an RMM of **0.7702**. Even our reproduced SMART-tiny-7M (not published on the leaderboard, trained only for 32 epochs via BC) achieves an RMM of **0.7671**, which is comparable to the current second-place method. Reproducing our results should be straightforward. Give it a try!
+- **Sim Agents benchmark note:** CAT-K resolves an issue in the agent token vocabulary and improves SMART-tiny closed-loop realism. This SMART branch keeps evaluation on the Waymo Sim Agents 2025 metric path.
 
 - **Issue in the agent token vocabulary:** We discovered that the [agent token vocabulary file](src/smart/tokens/cluster_frame_5_2048_remove_duplicate.pkl) we were using (borrowed from the [SMART repository](https://github.com/rainmaker22/SMART/blob/main/smart/tokens/cluster_frame_5_2048.pkl)) was intended only for sanity checks and not for reproducing optimal performance. To resolve this, we added a [script](src/smart/tokens/traj_clustering.py) and used it to build an [appropriate agent token vocabulary](src/smart/tokens/agent_vocab_555_s2.pkl). Our script is based on the [k-disk clustering script from SMART](https://github.com/rainmaker22/SMART/blob/main/scripts/traj_clstering.py). Thanks to the updated agent tokens, all our traffic simulation models saw a significant performance improvement of approximately +0.0060 RMM!
 
@@ -195,17 +195,90 @@ kubectl exec -n p-pnc testa -c main -- bash -lc 'find /workspace/womd_v1_3/SMART
 
 다운로드가 중간에 끊기면 같은 명령을 다시 실행하면 된다. 스크립트는 기본적으로 Nubes의 원격 파일 목록과 로컬 파일 수를 비교하고, `nubescli dir-download -s -j 96`으로 이미 존재하는 파일을 건너뛴다. `SKIP_REMOTE_LIST=1`을 쓰면 원격 목록 생성을 생략하고 바로 `dir-download`를 실행하므로 큰 cache를 처음 내려받을 때 더 빠르다.
 
+### testa/testaa A100x4x2 SMART pretrain
+
+`SMART` 브랜치의 기본 pretrain recipe를 유지하면서, 이미 떠 있는 `testa` 4 A100 + `testaa` 4 A100에서 멀티 노드 학습을 시작하려면 아래 wrapper를 사용한다. 이 launcher는 `kubectl exec`와 pod 내부 tmux만 사용하며, pod를 만들거나 삭제하거나 재시작하지 않는다.
+
+```bash
+bash scripts/start_smart_a100x4x2_testa_pretrain.sh
+```
+
+기본 실행 조건은 아래와 같다.
+
+| 항목 | 기본값 |
+|---|---|
+| branch | `SMART` |
+| pods | `testa testaa` |
+| GPU | pod당 4개, 총 8 A100 |
+| cache root | `/workspace/womd_v1_3/SMART_RAW_cache` |
+| experiment | `pre_bc_a100x4x2` |
+| action | `fit` |
+| train batch size | per-GPU `10`, effective `80` |
+| validation batch size | per-GPU `12` |
+| max epochs | `64` |
+| precision | `32-true` |
+| gradient clipping | `0.5` |
+| validation 주기 | `check_val_every_n_epoch=16` |
+| closed-loop rollout 수 | `32` |
+| validation rollout 후보 폭 | `top_k=48` |
+| fit-time fast scorer | Waymo Sim Agents 2025 only |
+| scorer scene 수 | 약 `1680` scenes |
+| W&B | online, project `SMART-FLOW`, entity `jksg01019-naver-labs` |
+
+실험 이름은 기본적으로 아래 형식으로 생성된다.
+
+```text
+smart_pretrain_a100x4x2_smart_raw_fast_rmm_<YYYYMMDD_HHMMSS>
+```
+
+고정 이름이나 batch를 쓰려면 환경 변수로 넘긴다.
+
+```bash
+TASK_NAME=smart_pretrain_a100x4x2_smart_raw_fast_rmm_probe \
+TRAIN_BATCH_SIZE=10 \
+bash scripts/start_smart_a100x4x2_testa_pretrain.sh
+```
+
+짧은 smoke test는 아래처럼 실행한다.
+
+```bash
+TASK_NAME=smart_pretrain_a100x4x2_smoke \
+LIMIT_TRAIN_BATCHES=2 \
+LIMIT_VAL_BATCHES=0 \
+MAX_EPOCHS=1 \
+WANDB_MODE=offline \
+bash scripts/start_smart_a100x4x2_testa_pretrain.sh
+```
+
+진행 확인:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-smart-a100x4x2-pretrain
+kubectl exec -n p-pnc testa -c main -- tmux capture-pane -pt catk-smart-a100x4x2-pretrain -S -80
+```
+
+학습 session만 우아하게 중단하고 pod는 유지하려면:
+
+```bash
+for pod in testa testaa; do
+  kubectl exec -n p-pnc "$pod" -c main -- \
+    tmux send-keys -t catk-smart-a100x4x2-pretrain C-c
+done
+```
+
+이 branch에서는 legacy metric/submission 경로를 지원하지 않는다. validation과 submission 관련 metric은 Waymo Sim Agents 2025 경로만 사용한다.
+
 ## Run the code
 In the scripts, we provide
 - [scripts/train.sh](scripts/train.sh) for training and fine-tuning.
 - [scripts/local_val.sh](scripts/local_val.sh) for local validation.
-- [scripts/wosac_sub.sh](scripts/wosac_sub.sh) for packing submission files.
+- [scripts/sim_agents_sub.sh](scripts/sim_agents_sub.sh) for packing Waymo Sim Agents 2025 submission files.
 
 The default script runs with single GPU. We use DDP for multi GPU training and validation, and the codes are also found in the bash scripts.
 To reproduce our final results, you should follow the following steps
 1. Use [scripts/train.sh](scripts/train.sh) with the [BC pre-training config](configs/experiment/pre_bc.yaml) to pre-train the SMART-tiny 7M model.
 2. Use [scripts/train.sh](scripts/train.sh) with the [CLSFT with CAT-K config](configs/experiment/clsft.yaml) to fine-tune the SMART-tiny model pre-trained in step 1.
-3. Use [scripts/wosac_sub.sh](scripts/wosac_sub.sh) to pack the submission fille for `validate` or `test` split. Upload the `wosac_submission.tar.gz` file located in `logs` folder to the [WOSAC leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) such that you can evaluate the model fine-tuned in step 2 on the WOSAC leaderboard.
+3. Use [scripts/sim_agents_sub.sh](scripts/sim_agents_sub.sh) to pack the submission file for `validate` or `test` split. This branch supports the Waymo Sim Agents 2025 metric/submission path only.
 4. Alternatively, you can do local validation with [scripts/local_val.sh](scripts/local_val.sh).
 
 For Gaussian Mixture Model (GMM) based ego policy, the procedure is similar, just use the following configs
@@ -216,8 +289,7 @@ For Gaussian Mixture Model (GMM) based ego policy, the procedure is similar, jus
 
 ## Performance
 
-The submission of our CAT-K fine-tuned SMART to the [WOSAC Leaderboard](https://waymo.com/open/challenges/2024/sim-agents/) is found [here](https://waymo.com/open/challenges/sim-agents/results/5ea7a3eb-7337/1731338655639000/).
-The submission of our reproduced SMART to the test split is found [here](https://waymo.com/open/challenges/sim-agents/results/5ea7a3eb-7337/1731391949275000/), note that it is not published to the leaderboard.
+This branch is configured for Waymo Sim Agents 2025 validation/submission. Legacy metric and submission code paths are intentionally not supported.
 
 ## Ablation configs
 

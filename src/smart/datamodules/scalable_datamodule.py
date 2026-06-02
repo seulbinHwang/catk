@@ -15,10 +15,12 @@ from typing import Optional
 
 from lightning import LightningDataModule
 from lightning.pytorch.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
+from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.loader import DataLoader
 
 from src.smart.datasets import MultiDataset
 
+from .exact_distributed_sampler import ExactDistributedSampler
 from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
 
 
@@ -75,21 +77,56 @@ class MultiDataModule(LightningDataModule):
             raise ValueError(f"{stage} should be one of [fit, validate, test]")
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
+        sampler = self._build_train_sampler(self.train_dataset)
         return DataLoader(
             self.train_dataset,
             batch_size=self.train_batch_size,
-            shuffle=self.shuffle,
+            shuffle=self.shuffle if sampler is None else False,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             persistent_workers=self.persistent_workers,
             drop_last=False,
         )
 
+    def _get_trainer_world_info(self) -> tuple[int, int]:
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return 1, 0
+        world_size = int(getattr(trainer, "world_size", 1) or 1)
+        global_rank = int(getattr(trainer, "global_rank", 0) or 0)
+        return max(1, world_size), global_rank
+
+    def _build_train_sampler(self, dataset):
+        world_size, global_rank = self._get_trainer_world_info()
+        if world_size <= 1:
+            return None
+        return DistributedSampler(
+            dataset=dataset,
+            num_replicas=world_size,
+            rank=global_rank,
+            shuffle=self.shuffle,
+            drop_last=False,
+        )
+
+    def _build_eval_sampler(self, dataset):
+        world_size, global_rank = self._get_trainer_world_info()
+        if world_size <= 1:
+            return None
+        return ExactDistributedSampler(
+            dataset=dataset,
+            num_replicas=world_size,
+            rank=global_rank,
+            shuffle=False,
+        )
+
     def val_dataloader(self) -> EVAL_DATALOADERS:
+        sampler = self._build_eval_sampler(self.val_dataset)
         return DataLoader(
             self.val_dataset,
             batch_size=self.val_batch_size,
             shuffle=False,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,  # False
             persistent_workers=self.persistent_workers,
@@ -97,10 +134,12 @@ class MultiDataModule(LightningDataModule):
         )
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
+        sampler = self._build_eval_sampler(self.test_dataset)
         return DataLoader(
             self.test_dataset,
             batch_size=self.test_batch_size,
             shuffle=False,
+            sampler=sampler,
             num_workers=self.num_workers,  # 0
             pin_memory=self.pin_memory,  # False
             persistent_workers=self.persistent_workers,

@@ -19,13 +19,13 @@ import torch
 from lightning import LightningModule
 from torch.optim.lr_scheduler import LambdaLR
 
-from src.smart.metrics import GMMADE, EgoNLL, WOSACMetrics, minADE
+from src.smart.metrics import GMMADE, EgoNLL, SimAgentsMetrics, minADE
 from src.smart.metrics.utils import get_euclidean_targets
 from src.smart.modules.ego_gmm_smart_decoder import EgoGMMSMARTDecoder
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.utils.vis_waymo import VisWaymo
-from src.utils.wosac_utils import get_scenario_id_int_tensor, get_scenario_rollouts
+from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
 
 class EgoGMMSMART(LightningModule):
@@ -46,7 +46,7 @@ class EgoGMMSMART(LightningModule):
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
         self.minADE = minADE()
-        self.wosac_metrics = WOSACMetrics("val_closed", ego_only=True)
+        self.sim_agents_metrics = SimAgentsMetrics("val_closed", ego_only=True)
         self.gmm_ade_pos = GMMADE()
         self.gmm_ade_head = GMMADE()
         self.training_loss = EgoNLL(**model_config.training_loss)
@@ -55,7 +55,7 @@ class EgoGMMSMART(LightningModule):
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
-        self.n_batch_wosac_metric = model_config.n_batch_wosac_metric
+        self.n_batch_sim_agents_metric = int(model_config.n_batch_sim_agents_metric)
 
         self.video_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         self.video_dir = Path(self.video_dir) / "videos"
@@ -160,7 +160,7 @@ class EgoGMMSMART(LightningModule):
             pred_z = torch.stack(pred_z, dim=1)  # [n_ag, n_rollout, n_step]
             pred_head = torch.stack(pred_head, dim=1)  # [n_ag, n_rollout, n_step]
 
-            # ! WOSAC
+            # ! Sim Agents 2025
             self.minADE.update(
                 pred=pred_traj[tokenized_agent["ego_mask"]],
                 target=data["agent"]["position"][
@@ -171,8 +171,8 @@ class EgoGMMSMART(LightningModule):
                 ][tokenized_agent["ego_mask"]],
             )
 
-            # WOSAC metrics
-            if batch_idx < self.n_batch_wosac_metric:
+            # Sim Agents 2025 metrics
+            if batch_idx < self.n_batch_sim_agents_metric:
                 device = pred_traj.device
                 scenario_rollouts = get_scenario_rollouts(
                     scenario_id=get_scenario_id_int_tensor(data["scenario_id"], device),
@@ -182,7 +182,9 @@ class EgoGMMSMART(LightningModule):
                     pred_z=pred_z,
                     pred_head=pred_head,
                 )
-                self.wosac_metrics.update(data["tfrecord_path"], scenario_rollouts)
+                self.sim_agents_metrics.update(
+                    data["tfrecord_path"], scenario_rollouts
+                )
 
             # ! visualization
             if self.global_rank == 0 and batch_idx < self.n_vis_batch:
@@ -209,15 +211,15 @@ class EgoGMMSMART(LightningModule):
 
     def on_validation_epoch_end(self):
         if self.val_closed_loop:
-            epoch_wosac_metrics = self.wosac_metrics.compute()
-            epoch_wosac_metrics["val_closed/ADE"] = self.minADE.compute()
+            epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
+            epoch_sim_agents_metrics["val_closed/ADE"] = self.minADE.compute()
             if self.global_rank == 0:
-                epoch_wosac_metrics["epoch"] = (
+                epoch_sim_agents_metrics["epoch"] = (
                     self.log_epoch if self.log_epoch >= 0 else self.current_epoch
                 )
-                self.logger.log_metrics(epoch_wosac_metrics)
+                self.logger.log_metrics(epoch_sim_agents_metrics)
 
-            self.wosac_metrics.reset()
+            self.sim_agents_metrics.reset()
             self.minADE.reset()
 
     def configure_optimizers(self):

@@ -4,7 +4,7 @@ export HYDRA_FULL_ERROR=1
 export TF_CPP_MIN_LOG_LEVEL=2
 
 ACTION=validate # validate, test
-MY_EXPERIMENT="wosac_sub"
+MY_EXPERIMENT="sim_agents_sub"
 MY_TASK_NAME=$MY_EXPERIMENT-$ACTION"-debug"
 
 source ~/miniconda3/etc/profile.d/conda.sh
