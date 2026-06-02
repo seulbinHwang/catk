@@ -13,7 +13,7 @@ test_raw_dir: ${paths.cache_root}/testing
 train_max_num: 32
 train_use_eval_agent_selection: true
 road_num_rollouts_per_scenario: 1
-train_memory_balanced_batching: false
+train_memory_balanced_batching: true
 train_memory_balance_metadata_path: null
 train_memory_balance_metadata_num_workers: 0
 train_memory_balance_weight_key: agent_quadratic

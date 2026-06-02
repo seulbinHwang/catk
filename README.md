@@ -237,7 +237,7 @@ python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-
 python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 26 --replace
 ```
 
-2026-06-01 최신 `UniMM` 기준으로 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 `train_batch_size=32`는 backward 중 CUDA OOM이 재현됐다. `train_batch_size=31`은 짧은 2-batch smoke를 통과했지만 32와 한 scene 차이라 full-run 여유가 얇다. 이후 full-run OOM retry에서 `train_batch_size=30`과 `28`도 실제 학습 중 CUDA OOM이 재현됐고, `train_batch_size=26`은 같은 조건에서 200 step 이상 안정적으로 진행됐다. 안정 기본값은 per-GPU `train_batch_size=26`이고 global batch size는 `26 x 6 = 156`이다.
+2026-06-01 최신 `UniMM` 기준으로 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 `train_batch_size=32`는 backward 중 CUDA OOM이 재현됐다. `train_batch_size=31`은 짧은 2-batch smoke를 통과했지만 32와 한 scene 차이라 full-run 여유가 얇다. 이후 full-run OOM retry에서 `train_batch_size=30`과 `28`도 실제 학습 중 CUDA OOM이 재현됐고, `train_batch_size=26`은 같은 조건에서 200 step 이상 안정적으로 진행됐다. 안정 기본값은 per-GPU `train_batch_size=26`이고 global batch size는 `26 x 6 = 156`이다. Train dataloader는 기본적으로 memory-balanced distributed batch sampler를 사용해 agent/map이 많은 dense scenario가 한 rank-local batch에 몰리는 것을 줄인다.
 
 H100 x3x2 validation은 per-GPU batch size 12, global batch size `12 x 6 = 72`로 실행한다. 학습 중 validation은 `check_val_every_n_epoch=16` 주기로 돌며, Fast WOSAC `sim_agents_2025` scorer는 `scorer_scene_num=1680` 기준으로 GPU 수와 validation batch size에 맞춰 batch 수를 계산한다. H100 x3x2 기본값에서는 `ceil(ceil(1680 / 6) / 12) = 24`이므로 `n_batch_sim_agents_metric=24`로 자동 조정된다.
 
