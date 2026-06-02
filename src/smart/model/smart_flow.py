@@ -23,10 +23,6 @@ from src.smart.metrics import (
     minADE,
     update_wosac_distribution_metric_from_model,
 )
-from src.smart.metrics.sim_agents_metrics import _load_gt_scenario_for_device
-from src.smart.metrics.wosac_fast_eval_tool.fast_sim_agents_metrics.metrics import (
-    compute_differentiable_scenario_metrics_for_bundle,
-)
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_future,
@@ -143,9 +139,9 @@ class SMARTFlow(LightningModule):
             )
         set_model_for_finetuning(self.encoder, model_config.finetune)
 
-        # ── closed-loop fine-tuning modes ─────────────────────────────────
-        # finetune.mode == "ocsc_ft" 또는 "soft_rmm_propagation" 이고 enabled=True 면
-        # self_forced 대신 별도 closed-loop training_step 으로 분기.
+        # ── OCSC (Open-Closed Self-Consistency) fine-tuning mode ──────────
+        # finetune.mode == "ocsc_ft" 이고 enabled=True 면 training_step 이
+        # self_forced 대신 _run_flow_ocsc_ft_step 으로 분기.
         # 별도 ref_flow_decoder (frozen pretrained flow_decoder deepcopy) 만 둠.
         self.finetune_config = model_config.finetune
         self.ref_flow_decoder: nn.Module | None = None
@@ -161,7 +157,7 @@ class SMARTFlow(LightningModule):
 
         # velocity_head_only: set_model_for_finetuning 이 step_refiner 도 unfreeze 했으면
         # 다시 freeze 해서 velocity_head 만 trainable (OCSC clean 의 flow_velocity_head_only 정합).
-        if self._is_closed_loop_finetune_mode_enabled() and bool(
+        if self._is_ocsc_ft_enabled() and bool(
             getattr(self.finetune_config, "velocity_head_only", False)
         ):
             step_refiner = getattr(self.encoder.agent_encoder.flow_decoder, "step_refiner", None)
@@ -3262,18 +3258,6 @@ class SMARTFlow(LightningModule):
             return False
         return str(getattr(ft, "mode", "none")).lower() == "ocsc_ft"
 
-    def _is_soft_rmm_propagation_enabled(self) -> bool:
-        """Soft differentiable RMM propagation fine-tune mode 활성 여부."""
-        ft = getattr(self, "finetune_config", None)
-        if ft is None:
-            return False
-        if not bool(getattr(ft, "enabled", False)):
-            return False
-        return str(getattr(ft, "mode", "none")).lower() == "soft_rmm_propagation"
-
-    def _is_closed_loop_finetune_mode_enabled(self) -> bool:
-        return self._is_ocsc_ft_enabled() or self._is_soft_rmm_propagation_enabled()
-
     # ──────────────────────────────────────────────────────────────────────
     # OCSC (Open-Closed Self-Consistency) finetune mode — single anchor (0)
     #   알고리즘 (OCSC_clean 정합 단순화 버전, single anchor 0):
@@ -3712,236 +3696,6 @@ class SMARTFlow(LightningModule):
         )
         return cl_norm_flat.reshape(rollout_count, n_active, window_steps_10hz, 4)
 
-    def _soft_rmm_run_closed_loop_world_rollouts_batched(
-        self,
-        data,
-        tokenized_agent: Dict[str, Tensor],
-        map_feature: Dict[str, Tensor],
-        rollout_cache: Dict[str, object],
-        sampling_scheme,
-        rollout_count: int,
-        window_steps_10hz: int,
-        rollout_steps_2hz: int,
-    ) -> dict[str, Tensor]:
-        """Run differentiable closed-loop rollouts and keep world-frame tensors."""
-        agent_enc = self.encoder.agent_encoder
-        rollout_count = int(rollout_count)
-        if rollout_count < 1:
-            raise ValueError(f"rollout_count must be positive, got {rollout_count}.")
-
-        num_agent = int(tokenized_agent["batch"].shape[0])
-        num_graphs = len(data["scenario_id"])
-        scenario_seed_table = self._build_closed_loop_seed_table(
-            scenario_ids=data["scenario_id"],
-            rollout_indices=range(rollout_count),
-            device=tokenized_agent["batch"].device,
-        )
-        expanded_tokenized_agent = self._build_parallel_rollout_tokenized_agent(
-            tokenized_agent=tokenized_agent,
-            repeat_count=rollout_count,
-            num_graphs=num_graphs,
-        )
-        expanded_map_feature = self._build_parallel_rollout_map_feature(
-            map_feature=map_feature,
-            repeat_count=rollout_count,
-            num_graphs=num_graphs,
-        )
-        expanded_rollout_cache = self._build_parallel_rollout_cache(
-            rollout_cache=rollout_cache,
-            repeat_count=rollout_count,
-        )
-        rollout = agent_enc.training_rollout_from_cache(
-            rollout_cache=expanded_rollout_cache,
-            tokenized_agent=expanded_tokenized_agent,
-            map_feature=expanded_map_feature,
-            sampling_scheme=sampling_scheme,
-            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
-            rollout_steps_2hz=rollout_steps_2hz,
-        )
-
-        def reshape_world_prediction(pred_tensor: Tensor) -> Tensor:
-            pred_tensor = pred_tensor.reshape(rollout_count, num_agent, *pred_tensor.shape[1:])
-            return pred_tensor[:, :, :window_steps_10hz].contiguous()
-
-        return {
-            "pred_traj": reshape_world_prediction(rollout["pred_traj_10hz"]),
-            "pred_z": reshape_world_prediction(rollout["pred_z_10hz"]),
-            "pred_head": reshape_world_prediction(rollout["pred_head_10hz"]),
-        }
-
-    def _soft_rmm_build_fast_bundle(
-        self,
-        *,
-        agent_id: Tensor,
-        pred_traj: Tensor,
-        pred_z: Tensor,
-        pred_head: Tensor,
-    ) -> dict[str, Tensor]:
-        """Pack differentiable rollout tensors without detaching gradients."""
-        simulated_states = torch.cat(
-            [
-                pred_traj,
-                pred_z.unsqueeze(-1),
-                pred_head.unsqueeze(-1),
-            ],
-            dim=-1,
-        ).contiguous()
-        return {
-            "agent_id": agent_id.to(device=pred_traj.device, dtype=torch.int32),
-            "simulated_states": simulated_states,
-        }
-
-    def _soft_rmm_metric_fields(self, ft) -> Sequence[str] | str | None:
-        fields = getattr(
-            ft,
-            "soft_rmm_fields",
-            [
-                "linear_speed",
-                "linear_acceleration",
-                "angular_speed",
-                "angular_acceleration",
-            ],
-        )
-        if fields is None:
-            return None
-        if isinstance(fields, str):
-            return fields
-        return tuple(str(field) for field in fields)
-
-    def _compute_soft_rmm_propagation_loss(
-        self,
-        data,
-        *,
-        pred_traj: Tensor,  # [G, N, T, 2]
-        pred_z: Tensor,     # [G, N, T]
-        pred_head: Tensor,  # [G, N, T]
-    ) -> tuple[Tensor, dict[str, Tensor]]:
-        ft = self.finetune_config
-        if "tfrecord_path" not in data:
-            raise RuntimeError("soft_rmm_propagation requires data['tfrecord_path'] for GT scenario loading.")
-        agent_batch = data["agent"]["batch"]
-        scenario_files = data["tfrecord_path"]
-        if len(scenario_files) != len(data["scenario_id"]):
-            raise RuntimeError(
-                "soft_rmm_propagation expected tfrecord_path and scenario_id to have the same batch length, "
-                f"got {len(scenario_files)} and {len(data['scenario_id'])}."
-            )
-
-        rmm_values: list[Tensor] = []
-        ade_values: list[Tensor] = []
-        fields = self._soft_rmm_metric_fields(ft)
-        renormalize = bool(getattr(ft, "soft_rmm_renormalize_weights", True))
-        histogram_temperature = float(getattr(ft, "soft_rmm_histogram_temperature", 1.0))
-        indicator_temperature = float(getattr(ft, "soft_rmm_indicator_temperature", 0.25))
-        for scenario_index, scenario_file in enumerate(scenario_files):
-            scenario_mask = agent_batch == int(scenario_index)
-            if not bool(scenario_mask.any()):
-                continue
-            scenario_pred_traj = pred_traj[:, scenario_mask]
-            scenario_pred_z = pred_z[:, scenario_mask]
-            scenario_pred_head = pred_head[:, scenario_mask]
-            bundle = self._soft_rmm_build_fast_bundle(
-                agent_id=data["agent"]["id"][scenario_mask],
-                pred_traj=scenario_pred_traj,
-                pred_z=scenario_pred_z,
-                pred_head=scenario_pred_head,
-            )
-            gt_scenario = _load_gt_scenario_for_device(
-                scenario_file=str(scenario_file),
-                ego_only=False,
-                device=pred_traj.device,
-            )
-            metric_result = compute_differentiable_scenario_metrics_for_bundle(
-                config=self.sim_agents_metrics.sim_agents_config,
-                gt_scenario=gt_scenario,
-                scenario_rollouts=bundle,
-                version="2025",
-                enabled_metric_fields=fields,
-                renormalize_metric_weights=renormalize,
-                histogram_temperature=histogram_temperature,
-                soft_indicator_temperature=indicator_temperature,
-            )
-            rmm_values.append(metric_result["metametric"])
-            ade_values.append(metric_result["average_displacement_error"].detach())
-
-        if not rmm_values:
-            zero = pred_traj.sum() * 0.0
-            return zero, {"soft_rmm": zero.detach(), "soft_ade": zero.detach()}
-
-        soft_rmm = torch.stack(rmm_values).mean()
-        if not torch.isfinite(soft_rmm):
-            raise RuntimeError(
-                "Non-finite soft_rmm_propagation metric: "
-                f"{self._summarize_nonfinite_tensor(soft_rmm)}"
-            )
-        loss_weight = float(getattr(ft, "soft_rmm_loss_weight", 1.0))
-        loss = loss_weight * (1.0 - soft_rmm)
-        soft_ade = torch.stack(ade_values).mean() if ade_values else soft_rmm.detach() * 0.0
-        return loss, {"soft_rmm": soft_rmm.detach(), "soft_ade": soft_ade.detach()}
-
-    def _run_flow_soft_rmm_propagation_step(self, data, batch_idx) -> Tensor:
-        """Closed-loop fine-tune step that backpropagates a soft fast-RMM proxy."""
-        del batch_idx
-        ft = self.finetune_config
-        rollout_count = int(getattr(ft, "soft_rmm_n_rollouts", getattr(ft, "ocsc_n_rollouts", 4)))
-        loss_window_raw = int(getattr(ft, "soft_rmm_loss_window_steps", getattr(ft, "ocsc_loss_window_steps", -1)))
-        window_steps_10hz = (
-            int(self.flow_window_steps)
-            if loss_window_raw <= 0
-            else min(int(loss_window_raw), int(self.flow_window_steps))
-        )
-        if window_steps_10hz <= 0:
-            raise ValueError(
-                "soft_rmm_loss_window_steps must be positive or -1, "
-                f"got {loss_window_raw}."
-            )
-        min_horizon = int(getattr(ft, "soft_rmm_min_horizon_steps", 15))
-        if window_steps_10hz < min_horizon:
-            raise ValueError(
-                "soft_rmm_propagation horizon is too short for stable acceleration features: "
-                f"got {window_steps_10hz}, require at least {min_horizon}."
-            )
-
-        tokenized_map, tokenized_agent = self._build_eval_tokenized_inputs(data)
-        agent_enc = self.encoder.agent_encoder
-        with torch.no_grad():
-            map_feature = self.encoder.encode_map(tokenized_map)
-            rollout_cache = agent_enc.prepare_inference_cache(
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
-            )
-
-        sampling_scheme = self.validation_rollout_sampling
-        rollout_steps_2hz = max(1, math.ceil(window_steps_10hz / int(agent_enc.shift)))
-        rollout = self._soft_rmm_run_closed_loop_world_rollouts_batched(
-            data=data,
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            rollout_cache=rollout_cache,
-            sampling_scheme=sampling_scheme,
-            rollout_count=rollout_count,
-            window_steps_10hz=window_steps_10hz,
-            rollout_steps_2hz=rollout_steps_2hz,
-        )
-        total_loss, log_values = self._compute_soft_rmm_propagation_loss(
-            data=data,
-            pred_traj=rollout["pred_traj"],
-            pred_z=rollout["pred_z"],
-            pred_head=rollout["pred_head"],
-        )
-        if not torch.isfinite(total_loss):
-            raise RuntimeError(
-                "Non-finite soft_rmm_propagation loss: "
-                f"{self._summarize_nonfinite_tensor(total_loss)}"
-            )
-
-        self.log("train/soft_rmm_propagation/loss", total_loss.detach(), on_step=True, on_epoch=False, batch_size=1)
-        self.log("train/soft_rmm_propagation/rmm", log_values["soft_rmm"], on_step=True, on_epoch=False, batch_size=1)
-        self.log("train/soft_rmm_propagation/ade", log_values["soft_ade"], on_step=True, on_epoch=False, batch_size=1)
-        self.log("train/soft_rmm_propagation/horizon_steps", float(window_steps_10hz), on_step=True, on_epoch=False, batch_size=1)
-        self.log("train/soft_rmm_propagation/n_rollouts", float(rollout_count), on_step=True, on_epoch=False, batch_size=1)
-        return total_loss
-
     def _run_flow_ocsc_ft_step(self, data, batch_idx) -> Tensor:
         """OCSC (Open-Closed Self-Consistency) finetune training step.
 
@@ -4145,8 +3899,6 @@ class SMARTFlow(LightningModule):
         """
         if self._is_ocsc_ft_enabled():
             return self._run_flow_ocsc_ft_step(data=data, batch_idx=batch_idx)
-        if self._is_soft_rmm_propagation_enabled():
-            return self._run_flow_soft_rmm_propagation_step(data=data, batch_idx=batch_idx)
         if self.self_forced_enabled:
             if self._is_self_forced_active():
                 return self._training_step_self_forced(data=data, batch_idx=batch_idx)
