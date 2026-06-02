@@ -319,9 +319,9 @@ REPLACE_SESSION=1 \
 bash scripts/start_mdg_pretrain_testas_a100x7.sh
 ```
 
-기본값은 A100 7장 단일 pod, `bf16-mixed`, per-GPU `train_batch_size=32`, global batch `224`, `max_epochs=64`, `WANDB_MODE=online`이다. 따라서 testas 정식 pretrain은 W&B cloud에 실시간으로 기록된다. 네트워크가 막힌 디버깅 run만 `WANDB_MODE=offline`으로 명시한다. checkpoint monitor는 기존 pretrain과 동일하게 closed-loop metric `val_closed/sim_agents_2025/realism_meta_metric`을 `max` 기준으로 사용한다. 학습 중 validation 기본값은 `VAL_BATCH_SIZE=12`, `LIMIT_VAL_BATCHES=0.1`, `SCORER_SCENE_NUM=1680`, `N_BATCH_SIM_AGENTS_METRIC=10`이다. `SCORER_SCENE_NUM`이 양수이면 코드가 `N_BATCH_SIM_AGENTS_METRIC`을 런타임에 덮어쓴다. A100 7장에서는 `ceil(ceil(1680 / 7) / 12) = 20`이므로 rank마다 20 validation batch까지 Fast WOSAC scorer를 업데이트한다.
+기본값은 A100 7장 단일 pod, `bf16-mixed`, per-GPU `train_batch_size=34`, global batch `238`, `max_epochs=64`, `WANDB_MODE=online`이다. 따라서 testas 정식 pretrain은 W&B cloud에 실시간으로 기록된다. 네트워크가 막힌 디버깅 run만 `WANDB_MODE=offline`으로 명시한다. checkpoint monitor는 기존 pretrain과 동일하게 closed-loop metric `val_closed/sim_agents_2025/realism_meta_metric`을 `max` 기준으로 사용한다. 학습 중 validation 기본값은 `VAL_BATCH_SIZE=12`, `LIMIT_VAL_BATCHES=0.1`, `SCORER_SCENE_NUM=1680`, `N_BATCH_SIM_AGENTS_METRIC=10`이다. `SCORER_SCENE_NUM`이 양수이면 코드가 `N_BATCH_SIM_AGENTS_METRIC`을 런타임에 덮어쓴다. A100 7장에서는 `ceil(ceil(1680 / 7) / 12) = 20`이므로 rank마다 20 validation batch까지 Fast WOSAC scorer를 업데이트한다. LR은 논문 global batch 32의 `2e-4`에서 sqrt scaling을 적용해 `0.00054544`로 둔다.
 
-CUDA OOM이 나면 자동으로 batch size를 낮춰 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`에서 resume하려면 OOM retry wrapper를 쓴다. 기본값은 `INITIAL_BS=32`, `OOM_STEP=2`, `MIN_BS=24`이며, OOM이 아닌 외부 종료 코드 `134,143`은 batch size를 유지하고 최대 2회 재시도한다.
+CUDA OOM이 나면 자동으로 batch size를 낮춰 같은 `TASK_NAME`의 최신 `epoch_last.ckpt`에서 resume하려면 OOM retry wrapper를 쓴다. 기본값은 `INITIAL_BS=34`, `OOM_STEP=2`, `MIN_BS=24`이며, OOM이 아닌 외부 종료 코드 `134,143`은 batch size를 유지하고 최대 2회 재시도한다.
 
 wrapper는 학습이 끝날 때까지 foreground에서 monitor하므로, 장시간 학습은 host tmux 안에서 실행하는 것을 권장한다.
 
@@ -334,7 +334,7 @@ TASK_NAME=mdg_wosac_pretrain_testas_a100x7_from_scratch_$(date +%Y%m%d_%H%M%S)
 
 tmux new-session -d -s mdg-pretrain-supervisor "
 cd /media/user/E/projects/catk &&
-INITIAL_BS=32 \
+INITIAL_BS=34 \
 OOM_STEP=2 \
 MIN_BS=24 \
 PROJECT_ROOT=/mnt/nuplan/projects/catk_mdg_pretrain \
@@ -366,19 +366,17 @@ denoiser는 inter-agent / agent-scene relation이 action timestep `Ta=40` 동안
 
 testas A100 7장 튜닝 결과는 다음과 같다.
 
-| per-GPU train batch | 결과 |
-| ---: | --- |
-| 36 | 32 step 통과, peak `78,493 MiB`, 약 `0.86 it/s`; 메모리 여유가 작고 sample/sec도 낮아 운영 기본값에서 제외 |
-| 34 | 96 step 통과, peak `74,229 MiB`, 약 `0.95 it/s` |
-| 32 | 96 step 통과, peak `70,647 MiB`, 약 `1.01 it/s`; closed-loop checkpoint monitor smoke도 통과 |
-| 28 | 48 step 통과, peak `61,321 MiB`, 약 `1.11 it/s` |
-| 24 | 48 step 통과, peak `52,963 MiB`, 약 `1.27 it/s` |
-| 20 | 48 step 통과, peak `44,417 MiB`, 약 `1.49 it/s` |
-| 10 | 48 step 통과, peak `22,955 MiB`, 약 `2.59 it/s` |
+| per-GPU train batch | global batch | 결과 |
+| ---: | ---: | --- |
+| 40 | 280 | 첫 train step에서 CUDA OOM |
+| 38 | 266 | 첫 train step에서 CUDA OOM |
+| 36 | 252 | 32 step 통과, peak `78,293 MiB`, 약 `0.91 it/s`; 처리량은 좋지만 장기 학습 메모리 여유가 작아 제외 |
+| 34 | 238 | 32 step 통과, peak `74,029 MiB`, 약 `0.96 it/s`; 처리량과 OOM 여유 균형이 가장 좋아 운영 기본값으로 선택 |
+| 32 | 224 | 32 step 통과, peak `69,787 MiB`, 약 `1.01 it/s`; 더 안전하지만 global batch가 작아 sample/sec는 `bs=34`보다 약간 낮음 |
 
-MDG pretrain은 agent/map tensor를 각각 `[B, 64, ...]`, `[B, 320, ...]`로 고정 pad하므로, SMART/PyG 계열처럼 scene별 graph 크기 차이가 CUDA activation shape을 크게 바꾸지는 않는다. memory-balanced batching은 무거운 scene/rank 편중을 줄이는 안정화 용도로 유지한다. `bs=34`도 통과하지만 `bs=32`와 예상 epoch time이 거의 같고 메모리 여유가 더 작으므로, 운영 기본값은 안정성과 처리량을 함께 고려해 `TRAIN_BATCH_SIZE=32`로 둔다.
+MDG pretrain은 agent/map tensor를 각각 `[B, 64, ...]`, `[B, 320, ...]`로 고정 pad하므로, SMART/PyG 계열처럼 scene별 graph 크기 차이가 CUDA activation shape을 크게 바꾸지는 않는다. memory-balanced batching은 무거운 scene/rank 편중을 줄이는 안정화 용도로 유지한다. `bs=36`도 통과하지만 80GB A100에서 peak가 78GB 이상이라 OOM retry 없이 장기 운영하기에는 여유가 작다. 따라서 운영 기본값은 안정성과 처리량을 함께 고려해 `TRAIN_BATCH_SIZE=34`로 둔다.
 
-training split `486,995`개 기준 step 수는 `ceil(486995 / 224) = 2,175` step/epoch이다. 최적화 후 memory-balanced `bs=32` 96-step probe에서 약 `1.01 it/s`가 관측되었고, 보수적으로 0.95-1.01 it/s를 잡으면 train step만 기준으로 1 epoch는 약 36-38분이다. 여기에 closed-loop validation 10 batch가 추가되므로 실제 wall-clock은 validation 수행 시간만큼 더 길어진다.
+training split `486,995`개 기준 `bs=34`, A100 7장의 step 수는 `ceil(486995 / 238) = 2,047` step/epoch이다. 32-step probe에서 약 `0.96 it/s`가 관측되었고, train step만 기준으로 1 epoch는 약 35-36분이다. 여기에 closed-loop validation 20 rank-local scorer batch가 추가되므로 실제 wall-clock은 validation 수행 시간만큼 더 길어진다.
 
 진행 확인:
 
