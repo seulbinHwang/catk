@@ -29,6 +29,8 @@ def compute_red_light_violation(
     lane_polylines: list,
     lane_ids: list[int],
     traffic_signals: list[list[map_pb2.TrafficSignalLaneState]],
+    lane_tensor_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    traffic_signal_tensor_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Computes red light violations for each of the evaluated objects."""
     if not lane_polylines:
@@ -84,11 +86,14 @@ def compute_red_light_violation(
     valid = valid[:, evaluated_object_indices]
     _, num_objects, _, _ = xy.shape
 
-    lane_tensor, lane_ids_tensor, lane_segment_valid = _tensorize_lane_polylines(
-        lane_polylines,
-        lane_ids,
-        seg_length=_LANE_POLYLINE_SEGMENT_LENGTH,
-    )
+    if lane_tensor_cache is None:
+        lane_tensor, lane_ids_tensor, lane_segment_valid = _tensorize_lane_polylines(
+            lane_polylines,
+            lane_ids,
+            seg_length=_LANE_POLYLINE_SEGMENT_LENGTH,
+        )
+    else:
+        lane_tensor, lane_ids_tensor, lane_segment_valid = lane_tensor_cache
     lane_tensor = lane_tensor.to(device)
     lane_ids_tensor = lane_ids_tensor.to(device)
     lane_segment_valid = lane_segment_valid.to(device)
@@ -103,9 +108,15 @@ def compute_red_light_violation(
     current_lane_id_flat = lane_ids_tensor[nearest_lane_index]
     current_lane_id = current_lane_id_flat.reshape(num_rollouts, num_objects, num_steps)
 
-    ts_lane_id, ts_state, ts_stop_point = _tensorize_traffic_signals(
-        traffic_signals, device=device
-    )
+    if traffic_signal_tensor_cache is None:
+        ts_lane_id, ts_state, ts_stop_point = _tensorize_traffic_signals(
+            traffic_signals, device=device
+        )
+    else:
+        ts_lane_id, ts_state, ts_stop_point = traffic_signal_tensor_cache
+        ts_lane_id = ts_lane_id.to(device)
+        ts_state = ts_state.to(device)
+        ts_stop_point = ts_stop_point.to(device)
     num_traffic_signals = ts_lane_id.shape[1]
 
     ts_match = current_lane_id.unsqueeze(-1) == ts_lane_id.unsqueeze(0).unsqueeze(0)

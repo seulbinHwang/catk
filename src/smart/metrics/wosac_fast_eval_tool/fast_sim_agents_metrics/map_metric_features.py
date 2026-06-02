@@ -53,7 +53,14 @@ def compute_distance_to_road_edge(
         boxes: torch.Tensor,
         valid: torch.Tensor,
         evaluated_object_mask: torch.Tensor,
-        road_edge_polylines: Sequence[torch.Tensor]
+        road_edge_polylines: Sequence[torch.Tensor],
+        road_edge_tensors: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ] | None = None,
     ) -> torch.Tensor:
     """Computes the distance to the road edge for each of the evaluated objects.
 
@@ -77,7 +84,7 @@ def compute_distance_to_road_edge(
         ValueError: When the `road_edge_polylines` is empty, i.e. there is no map
             information in the Scenario.
     """
-    if not road_edge_polylines:
+    if road_edge_tensors is None and not road_edge_polylines:
         raise ValueError('Missing road edges.')
     num_rollouts, num_objects, num_steps, num_features = boxes.shape
     boxes = boxes.reshape(num_rollouts * num_objects * num_steps, num_features)
@@ -95,8 +102,13 @@ def compute_distance_to_road_edge(
     # `flat_eval_corners` shape: (num_rollouts * num_evaluated_objects * num_steps * 4, 3).
     flat_eval_corners = eval_corners.reshape(-1, 3)
 
-    # Tensorize road edges.
-    polylines_tensor, use_left_neighbor, use_right_neighbor, left_neighbors, right_neighbors = _tensorize_polylines(road_edge_polylines, seg_length=50)
+    # Tensorize road edges once when the caller did not provide a cached static map.
+    if road_edge_tensors is None:
+        polylines_tensor, use_left_neighbor, use_right_neighbor, left_neighbors, right_neighbors = _tensorize_polylines(road_edge_polylines, seg_length=50)
+    else:
+        polylines_tensor, use_left_neighbor, use_right_neighbor, left_neighbors, right_neighbors = (
+            tensor.to(device=boxes.device) for tensor in road_edge_tensors
+        )
     #is_polyline_cyclic = _check_polyline_cycles(splited_polylines)
 
     # Compute distances for all query points.

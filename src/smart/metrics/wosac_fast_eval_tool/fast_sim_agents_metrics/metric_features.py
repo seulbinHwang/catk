@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import os
 import time
+from collections import OrderedDict
+
 import torch
 from waymo_open_dataset.protos import map_pb2
 from waymo_open_dataset.utils.sim_agents import submission_specs
@@ -15,6 +18,47 @@ _LaneType = map_pb2.LaneCenter.LaneType
 import time
 _distance_computation_total_time = 0.0
 _distance_computation_call_count = 0
+_LOG_FEATURE_CACHE: OrderedDict[tuple[str, bool, str], dict] = OrderedDict()
+
+
+def _read_log_feature_cache_max_entries() -> int:
+    raw_value = os.environ.get("CATK_FAST_WOSAC_LOG_FEATURE_CACHE_MAX_SCENARIOS", "4096")
+    try:
+        return max(0, int(raw_value))
+    except ValueError as exc:
+        raise RuntimeError(
+            "CATK_FAST_WOSAC_LOG_FEATURE_CACHE_MAX_SCENARIOS must be an integer, "
+            f"got {raw_value!r}."
+        ) from exc
+
+
+def clear_log_feature_cache() -> None:
+    _LOG_FEATURE_CACHE.clear()
+
+
+def _clone_feature_tree(value, *, device: torch.device | str):
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=device)
+    if isinstance(value, dict):
+        return {key: _clone_feature_tree(child, device=device) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_clone_feature_tree(child, device=device) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_feature_tree(child, device=device) for child in value)
+    return value
+
+
+def _log_feature_cache_key(gt_scenario: dict, version: str) -> tuple[str, bool, str]:
+    scenario_key = str(
+        gt_scenario.get("_cache_scenario_file")
+        or gt_scenario.get("scenario_id")
+        or ""
+    )
+    return (
+        scenario_key,
+        bool(gt_scenario.get("_cache_ego_only", False)),
+        str(version),
+    )
 @dataclasses.dataclass(frozen=True)
 class MetricFeatures:
     """Collection of features used to compute sim-agent metrics.
@@ -92,7 +136,10 @@ def compute_metric_features(
         lane_ids,
         lane_polylines,
         traffic_signals,
-        version
+        version,
+        road_edge_tensors=None,
+        lane_tensor_cache=None,
+        traffic_signal_tensor_cache=None,
 ) -> dict:
 
     if simulated_all_trajectories.shape[-1] == 9:
@@ -164,6 +211,7 @@ def compute_metric_features(
         valid=valid_mask,
         evaluated_object_mask=evaluated_object_mask,
         road_edge_polylines=road_edges,
+        road_edge_tensors=road_edge_tensors,
     )
 
     if version == '2025' and lane_polylines and traffic_signals:
@@ -184,7 +232,9 @@ def compute_metric_features(
             evaluated_object_mask=evaluated_object_mask,
             lane_polylines=lane_polylines,
             lane_ids=lane_ids,
-            traffic_signals=traffic_signals
+            traffic_signals=traffic_signals,
+            lane_tensor_cache=lane_tensor_cache,
+            traffic_signal_tensor_cache=traffic_signal_tensor_cache,
         )[:, :, 11:] #[n_rollout,n_agent,n_step]
     else:
         # Cannot compute red light violations without lanes and traffic signals,
@@ -227,6 +277,61 @@ def compute_metric_features(
 
 
 
+def _get_or_compute_log_features(
+        *,
+        gt_scenario: dict,
+        version: str,
+        object_ids: torch.Tensor,
+        object_types: torch.Tensor,
+        logged_all_trajectories: torch.Tensor,
+        logged_all_trajectorie_masks: torch.Tensor,
+        logged_val_trajectories: torch.Tensor,
+        logged_val_trajectorie_masks: torch.Tensor,
+        evaluated_object_mask: torch.Tensor,
+        lane_ids,
+        lane_polylines,
+        traffic_signals,
+        road_edge_tensors=None,
+        lane_tensor_cache=None,
+        traffic_signal_tensor_cache=None,
+) -> dict:
+    cache_key = _log_feature_cache_key(gt_scenario, version)
+    cache_max_entries = _read_log_feature_cache_max_entries()
+    device = logged_all_trajectories.device
+
+    if cache_max_entries > 0 and cache_key in _LOG_FEATURE_CACHE:
+        cached_features = _LOG_FEATURE_CACHE.pop(cache_key)
+        _LOG_FEATURE_CACHE[cache_key] = cached_features
+        return _clone_feature_tree(cached_features, device=device)
+
+    log_features = compute_metric_features(
+        object_ids,
+        object_types,
+        logged_all_trajectories.unsqueeze(0),
+        logged_val_trajectories.unsqueeze(0),
+        logged_val_trajectories,
+        logged_val_trajectorie_masks,
+        logged_all_trajectories,
+        logged_all_trajectorie_masks,
+        evaluated_object_mask,
+        gt_scenario['road_edges'],
+        True,
+        lane_ids,
+        lane_polylines,
+        traffic_signals,
+        version,
+        road_edge_tensors=road_edge_tensors,
+        lane_tensor_cache=lane_tensor_cache,
+        traffic_signal_tensor_cache=traffic_signal_tensor_cache,
+    )
+
+    if cache_max_entries > 0:
+        _LOG_FEATURE_CACHE[cache_key] = _clone_feature_tree(log_features, device="cpu")
+        while len(_LOG_FEATURE_CACHE) > cache_max_entries:
+            _LOG_FEATURE_CACHE.popitem(last=False)
+    return log_features
+
+
 def compute_scenario_rollouts_features(
         gt_scenario: dict,
         scenario_rollouts: dict,
@@ -254,6 +359,9 @@ def compute_scenario_rollouts_features(
     traffic_signals = gt_scenario['traffic_signals']
     lane_ids = gt_scenario['lane_ids']
     lane_polylines = gt_scenario['lane_polylines']
+    road_edge_tensors = gt_scenario.get('road_edge_tensors')
+    lane_tensor_cache = gt_scenario.get('lane_tensor_cache')
+    traffic_signal_tensor_cache = gt_scenario.get('traffic_signal_tensor_cache')
     non_evaluated_sim_agent_ids = all_sim_agent_ids[~torch.isin(all_sim_agent_ids, evaluated_sim_agent_ids)]
     all_sim_agent_ids = torch.cat([evaluated_sim_agent_ids, non_evaluated_sim_agent_ids])
     _, pred2_all_sim_indices = torch.where(all_sim_agent_ids.unsqueeze(1) == pred_agent_ids.unsqueeze(0))
@@ -268,14 +376,49 @@ def compute_scenario_rollouts_features(
     logged_val_trajectories = gt_trajectories[gt2_val_sim_indices]
     logged_val_trajectorie_masks = gt_scenario['track_masks'][gt2_val_sim_indices]
     evaluated_object_mask = torch.isin(all_sim_agent_ids, evaluated_sim_agent_ids)
-    log_features = compute_metric_features(
-        all_agent_ids, evaluated_sim_agent_type, logged_all_trajectories.unsqueeze(0), logged_val_trajectories.unsqueeze(0), logged_val_trajectories, logged_val_trajectorie_masks, logged_all_trajectories, logged_all_trajectorie_masks, evaluated_object_mask, gt_scenario['road_edges'],True, lane_ids, lane_polylines, traffic_signals, version)
+    log_features = _get_or_compute_log_features(
+        gt_scenario=gt_scenario,
+        version=version,
+        object_ids=all_agent_ids,
+        object_types=evaluated_sim_agent_type,
+        logged_all_trajectories=logged_all_trajectories,
+        logged_all_trajectorie_masks=logged_all_trajectorie_masks,
+        logged_val_trajectories=logged_val_trajectories,
+        logged_val_trajectorie_masks=logged_val_trajectorie_masks,
+        evaluated_object_mask=evaluated_object_mask,
+        lane_ids=lane_ids,
+        lane_polylines=lane_polylines,
+        traffic_signals=traffic_signals,
+        road_edge_tensors=road_edge_tensors,
+        lane_tensor_cache=lane_tensor_cache,
+        traffic_signal_tensor_cache=traffic_signal_tensor_cache,
+    )
     segment_num = 32
     sim_features = []
     for start in range(0, int(simulated_all_trajectories.shape[0]), segment_num):
         end = min(start + segment_num, int(simulated_all_trajectories.shape[0]))
-        sim_features.append(compute_metric_features(
-            all_agent_ids, evaluated_sim_agent_type, simulated_all_trajectories[start:end], simulated_val_trajectories[start:end], logged_val_trajectories, logged_val_trajectorie_masks, logged_all_trajectories, logged_all_trajectorie_masks, evaluated_object_mask, gt_scenario['road_edges'],False, lane_ids, lane_polylines, traffic_signals, version))
+        sim_features.append(
+            compute_metric_features(
+                all_agent_ids,
+                evaluated_sim_agent_type,
+                simulated_all_trajectories[start:end],
+                simulated_val_trajectories[start:end],
+                logged_val_trajectories,
+                logged_val_trajectorie_masks,
+                logged_all_trajectories,
+                logged_all_trajectorie_masks,
+                evaluated_object_mask,
+                gt_scenario['road_edges'],
+                False,
+                lane_ids,
+                lane_polylines,
+                traffic_signals,
+                version,
+                road_edge_tensors=road_edge_tensors,
+                lane_tensor_cache=lane_tensor_cache,
+                traffic_signal_tensor_cache=traffic_signal_tensor_cache,
+            )
+        )
     if not sim_features:
         raise ValueError("scenario_rollouts['simulated_states'] must contain at least one rollout.")
     all_sim_feature = {

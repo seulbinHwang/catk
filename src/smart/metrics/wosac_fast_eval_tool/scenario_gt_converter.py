@@ -5,6 +5,11 @@ from waymo_open_dataset.protos import scenario_pb2
 from waymo_open_dataset.utils.sim_agents import submission_specs
 from waymo_open_dataset.protos import map_pb2
 
+from src.smart.metrics.wosac_fast_eval_tool.fast_sim_agents_metrics import (
+    map_metric_features,
+    traffic_light_features,
+)
+
 _LaneType = map_pb2.LaneCenter.LaneType
 
 def extract_gt_scenario(scenario: scenario_pb2.Scenario, device='cpu') -> Dict:
@@ -60,6 +65,26 @@ def extract_gt_scenario(scenario: scenario_pb2.Scenario, device='cpu') -> Dict:
     for dynamic_map_state in dynamic_map_states:
         traffic_signals.append(list(dynamic_map_state.lane_states))
 
+    road_edge_tensors = None
+    if road_edges:
+        road_edge_tensors = map_metric_features._tensorize_polylines(
+            road_edges,
+            seg_length=50,
+        )
+
+    lane_tensor_cache = None
+    traffic_signal_tensor_cache = None
+    if lane_polylines and traffic_signals:
+        lane_tensor_cache = traffic_light_features._tensorize_lane_polylines(
+            lane_polylines,
+            lane_ids,
+            seg_length=traffic_light_features._LANE_POLYLINE_SEGMENT_LENGTH,
+        )
+        traffic_signal_tensor_cache = traffic_light_features._tensorize_traffic_signals(
+            traffic_signals,
+            device=torch.device(device),
+        )
+
     try:
         predict_agent_ids = torch.tensor(
             submission_specs.get_evaluation_sim_agent_ids(
@@ -81,12 +106,15 @@ def extract_gt_scenario(scenario: scenario_pb2.Scenario, device='cpu') -> Dict:
             'object_ids': object_ids.int(),
             'object_types': object_types,
             'road_edges': road_edges,
+            'road_edge_tensors': road_edge_tensors,
             'predict_index': predict_index.int(),
             'sim_agent_ids': torch.tensor(submission_specs.get_sim_agent_ids(scenario, submission_specs.ChallengeType.SIM_AGENTS), device=device).int(),
             'predict_agent_ids': predict_agent_ids,
             'lane_ids': lane_ids,
             'lane_polylines': lane_polylines,
+            'lane_tensor_cache': lane_tensor_cache,
             'traffic_signals': traffic_signals,
+            'traffic_signal_tensor_cache': traffic_signal_tensor_cache,
             }
 
 def gt_scenario_to_device(x, device):

@@ -3956,12 +3956,21 @@ open_metric_dict:
         if self._is_ocsc_ft_enabled():
             return
         has_open_loop_targets_global = bool(self._automatic_open_loop_has_target_since_step)
-        if self._automatic_open_loop_has_target_pending:
+        has_open_loop_target_pending = getattr(
+            self,
+            "_automatic_open_loop_has_target_pending",
+            None,
+        )
+        if has_open_loop_target_pending is None:
+            has_open_loop_targets_global = self._sync_distributed_bool_any(
+                has_open_loop_targets_global,
+            )
+        elif has_open_loop_target_pending:
             has_open_loop_targets_global = any(
                 self._finish_distributed_bool_any(pending)
-                for pending in self._automatic_open_loop_has_target_pending
+                for pending in has_open_loop_target_pending
             )
-            self._automatic_open_loop_has_target_pending.clear()
+            has_open_loop_target_pending.clear()
         self._skip_next_automatic_optimizer_step = not has_open_loop_targets_global
         if not has_open_loop_targets_global:
             optimizer.zero_grad(set_to_none=True)

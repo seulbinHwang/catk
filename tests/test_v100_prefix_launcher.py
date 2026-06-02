@@ -69,7 +69,7 @@ def test_oom_retry_preflight_builds_metadata_on_all_pods() -> None:
     assert "${remote_python_q} tools/build_memory_balance_metadata.py" in script
 
 
-def test_h100x4_h100x2_launcher_dry_run_uses_workspace_cache_and_bs17() -> None:
+def test_h100x4_h100x2_launcher_dry_run_uses_workspace_cache_and_bs20() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     result = subprocess.run(
         [
@@ -91,7 +91,7 @@ def test_h100x4_h100x2_launcher_dry_run_uses_workspace_cache_and_bs17() -> None:
     assert "PODS='hsb-npc-training wo-pvc-2'" in result.stdout
     assert "NPROC_PER_NODE=gpu" in result.stdout
     assert "MANUAL_RANK_OFFSETS=1" in result.stdout
-    assert "INITIAL_BS=17" in result.stdout
+    assert "INITIAL_BS=20" in result.stdout
     assert "OOM_STEP=1" in result.stdout
     assert "hsb-npc-training=/workspace/womd_v1_3/SMART_cache" in result.stdout
     assert "wo-pvc-2=/workspace/womd_v1_3/SMART_cache" in result.stdout
