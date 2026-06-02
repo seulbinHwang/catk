@@ -8,7 +8,7 @@
 # branch, pre_bc_a100x4x2 experiment, bf16 mixed precision, train/eval agent
 # selection disabled for training, and DDP unused-parameter detection for
 # type-specific classifier heads.
-set -uo pipefail
+set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -16,11 +16,11 @@ cd "$REPO_ROOT"
 NAMESPACE="${NAMESPACE:-p-pnc}"
 CONTAINER="${CONTAINER:-main}"
 PODS="${PODS:-hsb-npc-training wo-pvc-2}"
-PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_fair}"
+PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_hidden124_20260602}"
 REPO_URL="${REPO_URL:-https://github.com/seulbinHwang/catk.git}"
 BRANCH="${BRANCH:-trajtok}"
 GIT_REF="${GIT_REF:-}"
-TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_h100x4_h100x2_globalbs108_oom_retry_trajtok_legacy_inputs_trainselectfalse_20260601}"
+TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_h100x4_h100x2_globalbs108_oom_retry_trajtok_hidden124_trainselectfalse_20260602}"
 SESSION="${SESSION:-catk-smart-ntp-h100x4-h100x2-trajtok}"
 EXPERIMENT="${EXPERIMENT:-pre_bc_a100x4x2}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
@@ -42,6 +42,7 @@ LEARNING_RATE="${LEARNING_RATE:-}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
 STOP="${STOP:-0}"
+START_ONLY="${START_ONLY:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 read -r -a POD_ARRAY <<< "$PODS"
@@ -366,6 +367,11 @@ while (( bs >= MIN_BS )); do
   fi
   if [[ "$DRY_RUN" == "1" ]]; then
     log "dry-run completed after rendering the first attempt."
+    exit 0
+  fi
+  if [[ "$START_ONLY" == "1" ]]; then
+    log "START_ONLY=1; remote tmux sessions are running. OOM retry loop is not attached."
+    log "attach master: kubectl exec -it -n ${NAMESPACE} ${MASTER_POD} -c ${CONTAINER} -- tmux attach -t ${SESSION}"
     exit 0
   fi
 
