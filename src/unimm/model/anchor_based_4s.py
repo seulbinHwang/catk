@@ -115,6 +115,14 @@ class UniMMAnchorBased4s(LightningModule):
             last_train_context_step=int(model_config.last_train_context_step),
             anchor_heading_weight=float(model_config.anchor_heading_weight),
             anchor_match_chunk_size=int(model_config.anchor_match_chunk_size),
+            positive_tie_break_horizon_steps=getattr(
+                model_config,
+                "positive_tie_break_horizon_steps",
+                None,
+            ),
+            positive_tie_break_weight=float(
+                getattr(model_config, "positive_tie_break_weight", 0.0)
+            ),
         )
         self.network = UniMMAnchorBasedNetwork(
             hidden_dim=int(model_config.decoder.hidden_dim),

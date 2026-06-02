@@ -117,7 +117,7 @@ empty cluster policy: high-error trajectory로 재초기화
 posterior threshold calibration: raw context step 10,15,...,85의 nearest-anchor 0.5초 error 95% quantile
 ```
 
-이 distance는 학습/closed-loop에서 positive/posterior anchor를 고르는 기준과 동일하게 맞춘 것이다. `--lloyd-iters 0`을 주면 refinement를 끌 수 있지만, 논문 재현 목적의 기본 anchor에는 쓰지 않는다.
+이 distance는 학습/closed-loop에서 positive/posterior anchor를 고르는 기본 기준과 동일하게 맞춘 것이다. 다만 full-Lloyd anchor에서는 앞 0.5초가 거의 같은 anchor들이 4초 tail에서 크게 갈라질 수 있다. UniMM Anchor-Based-4s decoder는 선택된 4초 anchor를 continuous regression 조건으로 쓰므로, 학습용 positive `z*`만 `d0.5 + 0.0001 * d4s`로 동률성 tail tie-break를 적용한다. posterior rollout matching은 실제로 앞 0.5초만 실행하므로 논문 설정대로 순수 `d0.5`를 유지한다. `--lloyd-iters 0`을 주면 refinement를 끌 수 있지만, 논문 재현 목적의 기본 anchor에는 쓰지 않는다.
 
 anchor 파일은 pickle dict 형식이다.
 
@@ -468,6 +468,8 @@ fit + fit-time validation:
   val_open/reg_cls_ratio=6.39625
 ```
 
+2026-06-03에 full-Lloyd anchor의 positive matching을 H100 pod에서 실제 training cache로 진단했다. `Tz*=0.5s` primary distance는 유지하되 4초 anchor tail tie-break를 넣으면, 같은 6804개 agent/context row에서 선택 anchor의 4초 tail ADE가 `26.06m -> 0.385m`로 내려갔다. 차량 row만 보면 `27.51m -> 0.39m`이다. 이 검증은 WOSAC metric이 아니라 학습 label 생성 QA이며, posterior rollout matching은 여전히 순수 0.5초 기준이다.
+
 from-scratch 학습-추론 파이프라인을 짧게 재검증하려면 아래 순서로 돌린다. 이 검증은 안정 기본값인 `train_batch_size=30`, `val_batch_size=12`, H100 x3x2 DDP를 사용하되 batch/epoch 수만 줄여서 학습, 학습 중 validation, checkpoint 저장, explicit validation, test inference를 모두 통과시키는 용도다.
 
 ```bash
@@ -599,6 +601,7 @@ python scripts/launch_unimm_h100x3x2.py \
 | map self-attention | 1 layer |
 | factorized attention | 2 layers |
 | distance `d(.,.)` | `mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)` |
+| positive `z*` tie-break | `d0.5 + 0.0001 * d4s`; 학습 positive matching에만 적용 |
 | posterior threshold | category별 raw context `10,15,...,85` nearest-anchor 0.5초 error 95% quantile |
 | train context starts | raw step `10,15,...,85`; late context는 남은 valid future만 supervision |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |

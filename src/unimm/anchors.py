@@ -133,6 +133,8 @@ def match_anchors_by_type(
     horizon_steps: int,
     heading_weight: float = 1.0,
     row_chunk_size: int = 4096,
+    tie_break_horizon_steps: int | None = None,
+    tie_break_weight: float = 0.0,
 ) -> tuple[Tensor, Tensor]:
     """Find the nearest anchor index for every row, separated by agent type.
 
@@ -158,20 +160,46 @@ def match_anchors_by_type(
     )
     valid_h = valid[:, :horizon_steps] if valid is not None else None
     target_h = target_local[:, :horizon_steps]
+    use_tie_break = tie_break_horizon_steps is not None and float(tie_break_weight) > 0.0
+    tie_break_horizon = int(tie_break_horizon_steps or horizon_steps)
+    if use_tie_break:
+        tie_break_horizon = min(tie_break_horizon, int(target_local.shape[1]), int(anchors_by_type.shape[2]))
+        use_tie_break = tie_break_horizon > int(horizon_steps)
+    valid_tie = valid[:, :tie_break_horizon] if (use_tie_break and valid is not None) else None
+    target_tie = target_local[:, :tie_break_horizon] if use_tie_break else None
+
+    effective_row_chunk_size = int(row_chunk_size)
+    if use_tie_break:
+        # The 4s tie-break is exact, but the longer horizon has a larger
+        # temporary distance tensor. Keep chunks small enough for H100 runs.
+        effective_row_chunk_size = min(effective_row_chunk_size, 512)
 
     for type_idx in range(NUM_AGENT_TYPES):
         rows = torch.nonzero(agent_type == type_idx, as_tuple=False).flatten()
         if rows.numel() == 0:
             continue
         anchors = anchors_by_type[type_idx, :, :horizon_steps].to(device=device, dtype=target_local.dtype)
-        for start in range(0, rows.numel(), row_chunk_size):
-            chunk_rows = rows[start : start + row_chunk_size]
+        tie_anchors = (
+            anchors_by_type[type_idx, :, :tie_break_horizon].to(device=device, dtype=target_local.dtype)
+            if use_tie_break
+            else None
+        )
+        for start in range(0, rows.numel(), effective_row_chunk_size):
+            chunk_rows = rows[start : start + effective_row_chunk_size]
             dist = anchor_distance(
                 anchors=anchors,
                 target_local=target_h[chunk_rows],
                 valid=valid_h[chunk_rows] if valid_h is not None else None,
                 heading_weight=heading_weight,
             )
+            if use_tie_break and tie_anchors is not None and target_tie is not None:
+                tie_dist = anchor_distance(
+                    anchors=tie_anchors,
+                    target_local=target_tie[chunk_rows],
+                    valid=valid_tie[chunk_rows] if valid_tie is not None else None,
+                    heading_weight=heading_weight,
+                )
+                dist = dist + float(tie_break_weight) * tie_dist
             chunk_best, chunk_z = dist.min(dim=-1)
             z[chunk_rows] = chunk_z
             best[chunk_rows] = chunk_best

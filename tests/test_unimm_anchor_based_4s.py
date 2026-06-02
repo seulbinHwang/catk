@@ -16,6 +16,7 @@ from scripts.build_unimm_anchors import (
     nearest_anchor_assignment,
 )
 from src.unimm.losses import unimm_classification_loss, unimm_nll_loss
+from src.unimm.anchors import match_anchors_by_type
 from src.unimm.model.anchor_based_4s import UniMMAnchorBased4s
 from src.unimm.processor import UniMMProcessor
 
@@ -184,6 +185,38 @@ def test_unimm_classification_loss_uses_positive_matching_horizon_only():
     loss = unimm_classification_loss(logits, z_star, valid, match_steps=5)
 
     assert loss.item() == 0.0
+
+
+def test_unimm_positive_matching_tie_break_uses_prediction_tail():
+    anchors = torch.zeros(3, 2, 40, 3)
+    anchors[0, 0, 5:, 0] = 100.0
+    anchors[0, 1, 5:, 0] = 1.0
+    target = torch.zeros(1, 40, 3)
+    target[:, 5:, 0] = 1.0
+    valid = torch.ones(1, 40, dtype=torch.bool)
+    agent_type = torch.zeros(1, dtype=torch.long)
+
+    z_no_tie, _ = match_anchors_by_type(
+        anchors,
+        agent_type,
+        target,
+        valid,
+        horizon_steps=5,
+        row_chunk_size=4,
+    )
+    z_tie, _ = match_anchors_by_type(
+        anchors,
+        agent_type,
+        target,
+        valid,
+        horizon_steps=5,
+        row_chunk_size=4,
+        tie_break_horizon_steps=40,
+        tie_break_weight=1e-4,
+    )
+
+    assert z_no_tie.item() == 0
+    assert z_tie.item() == 1
 
 
 def test_unimm_regression_loss_averages_valid_timesteps():

@@ -45,6 +45,8 @@ class UniMMProcessor(nn.Module):
         last_train_context_step: int = 85,
         anchor_heading_weight: float = 1.0,
         anchor_match_chunk_size: int = 4096,
+        positive_tie_break_horizon_steps: int | None = None,
+        positive_tie_break_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.spec = AnchorSpec(
@@ -56,6 +58,10 @@ class UniMMProcessor(nn.Module):
         self.last_train_context_step = int(last_train_context_step)
         self.anchor_heading_weight = float(anchor_heading_weight)
         self.anchor_match_chunk_size = int(anchor_match_chunk_size)
+        self.positive_tie_break_horizon_steps = (
+            None if positive_tie_break_horizon_steps is None else int(positive_tie_break_horizon_steps)
+        )
+        self.positive_tie_break_weight = float(positive_tie_break_weight)
         if self.first_context_step % self.spec.num_commit_steps != 0:
             raise ValueError("first_context_step must align to commit_steps")
         if self.last_train_context_step % self.spec.num_commit_steps != 0:
@@ -484,6 +490,8 @@ class UniMMProcessor(nn.Module):
             horizon_steps=self.spec.num_match_steps,
             heading_weight=self.anchor_heading_weight,
             row_chunk_size=self.anchor_match_chunk_size,
+            tie_break_horizon_steps=self.positive_tie_break_horizon_steps,
+            tie_break_weight=self.positive_tie_break_weight,
         )
         return UniMMTrainingBatch(
             tokenized_map=tokenized_map,
