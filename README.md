@@ -215,6 +215,10 @@ bash scripts/start_smart_a100x4x2_testa_pretrain.sh
 | action | `fit` |
 | train batch size | per-GPU `10`, effective `80` |
 | validation batch size | per-GPU `12` |
+| effective train batch size | `80` = `10 × 8 GPU × accumulate_grad_batches 1` |
+| optimizer | `AdamW` |
+| learning rate | `5e-4` |
+| LR schedule | warmup `0`, epoch-wise cosine decay, `lr_min_ratio=0.01` |
 | max epochs | `64` |
 | precision | `32-true` |
 | gradient clipping | `0.5` |
@@ -247,6 +251,18 @@ LIMIT_TRAIN_BATCHES=2 \
 LIMIT_VAL_BATCHES=0 \
 MAX_EPOCHS=1 \
 WANDB_MODE=offline \
+bash scripts/start_smart_a100x4x2_testa_pretrain.sh
+```
+
+closed-loop validation / Fast Sim Agents 2025 scorer 경로까지 같이 확인하려면 아래처럼 validation smoke를 별도로 실행한다.
+
+```bash
+TASK_NAME=smart_pretrain_a100x4x2_val_smoke \
+SESSION=catk-smart-a100x4x2-validate-smoke \
+ACTION=validate \
+LIMIT_VAL_BATCHES=1 \
+WANDB_MODE=offline \
+EXTRA_HYDRA_OVERRIDES='model.model_config.n_rollout_closed_val=1 model.model_config.n_vis_batch=0 model.model_config.n_vis_scenario=0 model.model_config.n_vis_rollout=0' \
 bash scripts/start_smart_a100x4x2_testa_pretrain.sh
 ```
 

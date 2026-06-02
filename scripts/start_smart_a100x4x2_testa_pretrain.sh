@@ -156,7 +156,7 @@ prepare_pod() {
     fi
     cd ${PROJECT_ROOT_Q}
     git fetch origin --prune
-    git checkout -B ${BRANCH_Q} origin/${BRANCH}
+    git checkout -f -B ${BRANCH_Q} origin/${BRANCH}
     git reset --hard origin/${BRANCH}
     for d in training validation testing validation_tfrecords_splitted; do
       test -d ${CACHE_ROOT_Q}/\$d
