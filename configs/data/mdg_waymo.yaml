@@ -14,7 +14,7 @@ train_max_agents: 64
 max_map_polylines: 320
 map_waypoints: 16
 max_traffic_lights: 16
-train_memory_balanced_batching: false
+train_memory_balanced_batching: true
 train_memory_balance_metadata_cache: null
 train_memory_balance_metadata_num_workers: 8
 train_memory_balance_build_on_missing: true
