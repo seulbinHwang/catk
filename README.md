@@ -2726,7 +2726,7 @@ python scripts/launch_waymo_test_submission_h100x6_hsb1_static_pod.py \
 | action / experiment | `action=test`, `experiment=sim_agents_sub_flow` |
 | rollout count | `model.model_config.n_rollout_closed_val=32` |
 | solver / denoising | Euler, `model.model_config.validation_rollout_sampling.sample_steps=16` |
-| inference noise | `antithetic_pairs=true`, `noise_scale=1.016`, `validation_closed_seed=4` |
+| inference noise | `antithetic_pairs=false`, `noise_scale=1.0`, `validation_closed_seed=4` |
 | post-process | `use_lqr=false`, `use_stop_motion=false` |
 | method name | `Flow Agents 7M` |
 | authors / affiliation | `SB H`, `KO O` / `NLK` |

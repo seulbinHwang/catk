@@ -29,7 +29,7 @@ DEFAULT_ARTIFACT = "jksg01019-naver-labs/SMART-FLOW/epoch-last-mqfq3u39:v121"
 DEFAULT_EPOCH = 116
 DEFAULT_TASK_NAME = (
     "flow_agents_7m_waymo_test_epoch116_mqfq3u39_h100x6_hsb1_"
-    "sample16_euler_antithetic_noise1016"
+    "sample16_euler_iid_noise1000"
 )
 DEFAULT_SESSION = "catk-flow-waymo-test-submission-h100x6-hsb1"
 DEFAULT_TEST_BATCH_SIZE = 48
@@ -102,8 +102,8 @@ def render_remote_script(args: argparse.Namespace) -> str:
         "model.model_config.validation_closed_seed=4",
         "model.model_config.validation_rollout_sampling.sample_steps=16",
         "model.model_config.validation_rollout_sampling.sample_method=euler",
-        "model.model_config.validation_rollout_sampling.noise_scale=1.016",
-        "model.model_config.validation_rollout_sampling.antithetic_pairs=true",
+        "model.model_config.validation_rollout_sampling.noise_scale=1.0",
+        "model.model_config.validation_rollout_sampling.antithetic_pairs=false",
         "model.model_config.decoder.flow_solver_method=euler",
         "model.model_config.decoder.use_lqr=false",
         "model.model_config.decoder.use_stop_motion=false",
@@ -298,25 +298,24 @@ def render_start_command(args: argparse.Namespace) -> str:
             fi
             """
         )
-    script = strip_template_indent(
-        f"""\
-        set -Eeuo pipefail
-        cd {shq(args.project_root)}
-        {pull_block}
-        {replace_block}
-        mkdir -p {shq(run_root)}
-        cat > {shq(run_file)} <<'CATK_REMOTE_SCRIPT'
-        {remote_script_marker}
-        CATK_REMOTE_SCRIPT
-        chmod +x {shq(run_file)}
-        : > {shq(log_file)}
-        tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_file)}
-        tmux pipe-pane -t {shq(args.session)} -o {shq("cat >> " + log_file)}
-        echo "[launcher] started tmux session {args.session} on {args.pod}"
-        echo "[launcher] tmux log: {log_file}"
-        echo "[launcher] run dir: {args.log_dir.rstrip('/')}/{args.task_name}/runs/{args.run_id}"
-        """
-    )
+    # Keep the here-doc delimiter at column 0. If it is indented, the remote
+    # shell treats the launcher tail as part of the generated run script.
+    script = f"""set -Eeuo pipefail
+cd {shq(args.project_root)}
+{pull_block}
+{replace_block}
+mkdir -p {shq(run_root)}
+cat > {shq(run_file)} <<'CATK_REMOTE_SCRIPT'
+{remote_script_marker}
+CATK_REMOTE_SCRIPT
+chmod +x {shq(run_file)}
+: > {shq(log_file)}
+tmux new-session -d -s {shq(args.session)} -c {shq(args.project_root)} {shq(run_file)}
+tmux pipe-pane -t {shq(args.session)} -o {shq("cat >> " + log_file)}
+echo "[launcher] started tmux session {args.session} on {args.pod}"
+echo "[launcher] tmux log: {log_file}"
+echo "[launcher] run dir: {args.log_dir.rstrip('/')}/{args.task_name}/runs/{args.run_id}"
+"""
     return script.replace(remote_script_marker, remote_script.rstrip())
 
 
