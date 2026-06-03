@@ -117,7 +117,7 @@ empty cluster policy: high-error trajectory로 재초기화
 posterior threshold calibration: raw context step 10,15,...,85의 nearest-anchor 0.5초 error 95% quantile
 ```
 
-이 distance는 학습/closed-loop에서 positive/posterior anchor를 고르는 기본 기준과 동일하게 맞춘 것이다. 다만 full-Lloyd anchor에서는 앞 0.5초가 거의 같은 anchor들이 4초 tail에서 크게 갈라질 수 있다. UniMM Anchor-Based-4s decoder는 선택된 4초 anchor를 continuous regression 조건으로 쓰므로, 학습용 positive `z*`만 `d0.5 + 0.0001 * d4s`로 동률성 tail tie-break를 적용한다. posterior rollout matching은 실제로 앞 0.5초만 실행하므로 논문 설정대로 순수 `d0.5`를 유지한다. `--lloyd-iters 0`을 주면 refinement를 끌 수 있지만, 논문 재현 목적의 기본 anchor에는 쓰지 않는다.
+이 distance는 학습/closed-loop에서 positive/posterior anchor를 고르는 기본 기준과 동일하게 맞춘 것이다. 다만 full-Lloyd anchor에서는 앞 0.5초가 거의 같은 anchor들이 4초 tail에서 크게 갈라질 수 있다. UniMM Anchor-Based-4s decoder는 선택된 4초 anchor를 continuous regression 조건으로 쓰므로, 학습용 positive `z*`는 `d0.5`가 best와 `0.0001` 이내인 near-tie anchor들 안에서만 `d4s`로 tail tie-break를 적용한다. posterior rollout matching은 실제로 앞 0.5초만 실행하므로 논문 설정대로 순수 `d0.5`를 유지한다. `--lloyd-iters 0`을 주면 refinement를 끌 수 있지만, 논문 재현 목적의 기본 anchor에는 쓰지 않는다.
 
 anchor 파일은 pickle dict 형식이다.
 
@@ -606,6 +606,7 @@ python scripts/launch_unimm_h100x3x2.py \
 | posterior threshold | category별 raw context `10,15,...,85` nearest-anchor 0.5초 error 95% quantile |
 | train context starts | raw step `10,15,...,85`; late context는 남은 valid future만 supervision |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
+| heading concentration cap | `max_von_mises_concentration=100.0`; bf16/von Mises NLL의 과확신 NaN을 막는 수치 안정화 |
 | regression loss reduction | valid timestep NLL mean |
 
 이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 180에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.

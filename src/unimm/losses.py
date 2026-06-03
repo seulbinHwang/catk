@@ -37,7 +37,7 @@ def _unimm_per_step_nll(
     mean_pos = pred["mean_pos"].float()
     pos_scale = pred["pos_scale"].float().clamp_min(1.0e-6)
     mean_head = pred["mean_head"].float()
-    head_concentration = pred["head_concentration"].float().clamp_min(1.0e-6)
+    head_concentration = pred["head_concentration"].float().clamp(1.0e-6, 100.0)
 
     pos_dist = Laplace(mean_pos, pos_scale)
     pos_nll = -pos_dist.log_prob(target_local[..., :2]).sum(dim=-1)

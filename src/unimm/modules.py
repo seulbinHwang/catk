@@ -515,6 +515,7 @@ class UniMMMotionDecoder(nn.Module):
         num_prediction_steps: int,
         min_laplace_scale: float = 0.05,
         min_von_mises_concentration: float = 1e-3,
+        max_von_mises_concentration: float = 100.0,
     ) -> None:
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -522,6 +523,7 @@ class UniMMMotionDecoder(nn.Module):
         self.num_prediction_steps = int(num_prediction_steps)
         self.min_laplace_scale = float(min_laplace_scale)
         self.min_von_mises_concentration = float(min_von_mises_concentration)
+        self.max_von_mises_concentration = float(max_von_mises_concentration)
 
         self.scorer = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -550,6 +552,8 @@ class UniMMMotionDecoder(nn.Module):
         pos_scale = torch.nn.functional.softplus(raw[..., 3:5]) + self.min_laplace_scale
         concentration = (
             torch.nn.functional.softplus(raw[..., 5]) + self.min_von_mises_concentration
+        ).clamp_max(
+            self.max_von_mises_concentration
         )
         return {
             "mean_pos": mean_pos,
@@ -582,6 +586,7 @@ class UniMMAnchorBasedNetwork(nn.Module):
         dropout: float,
         min_laplace_scale: float,
         min_von_mises_concentration: float,
+        max_von_mises_concentration: float,
     ) -> None:
         super().__init__()
         self.map_encoder = UniMMMapEncoder(
@@ -610,6 +615,7 @@ class UniMMAnchorBasedNetwork(nn.Module):
             num_prediction_steps=num_prediction_steps,
             min_laplace_scale=min_laplace_scale,
             min_von_mises_concentration=min_von_mises_concentration,
+            max_von_mises_concentration=max_von_mises_concentration,
         )
 
     def encode(self, tokenized_map: Dict[str, Tensor], tokenized_agent: Dict[str, Tensor]) -> Tensor:

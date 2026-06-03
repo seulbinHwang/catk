@@ -55,6 +55,7 @@ model_config:
     time_span: 8
     min_laplace_scale: 0.05
     min_von_mises_concentration: 0.001
+    max_von_mises_concentration: 100.0
 
   sim_agents_submission:
     is_active: false

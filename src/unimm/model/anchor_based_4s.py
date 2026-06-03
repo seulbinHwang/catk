@@ -140,6 +140,9 @@ class UniMMAnchorBased4s(LightningModule):
             dropout=float(model_config.decoder.dropout),
             min_laplace_scale=float(model_config.decoder.min_laplace_scale),
             min_von_mises_concentration=float(model_config.decoder.min_von_mises_concentration),
+            max_von_mises_concentration=float(
+                getattr(model_config.decoder, "max_von_mises_concentration", 100.0)
+            ),
         )
 
         self.use_closed_loop_training = bool(model_config.use_closed_loop_training)

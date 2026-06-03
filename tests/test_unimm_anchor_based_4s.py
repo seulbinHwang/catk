@@ -18,6 +18,7 @@ from scripts.build_unimm_anchors import (
 from src.unimm.losses import unimm_classification_loss, unimm_nll_loss
 from src.unimm.anchors import match_anchors_by_type
 from src.unimm.model.anchor_based_4s import UniMMAnchorBased4s
+from src.unimm.modules import UniMMMotionDecoder
 from src.unimm.processor import UniMMProcessor
 
 
@@ -120,6 +121,7 @@ def _make_model_cfg(anchor_path: Path, **overrides):
             "time_span": 8,
             "min_laplace_scale": 0.05,
             "min_von_mises_concentration": 0.001,
+            "max_von_mises_concentration": 100.0,
         },
         "sim_agents_submission": {
             "is_active": False,
@@ -272,6 +274,29 @@ def test_unimm_regression_loss_scale_is_horizon_invariant():
     short_horizon_loss = unimm_nll_loss(short_pred, target_local[..., :5, :], target_valid[..., :5])
 
     assert torch.allclose(full_horizon_loss, short_horizon_loss)
+
+
+def test_unimm_motion_decoder_caps_heading_concentration():
+    decoder = UniMMMotionDecoder(
+        hidden_dim=4,
+        num_anchors=2,
+        num_prediction_steps=2,
+        min_laplace_scale=0.05,
+        min_von_mises_concentration=0.001,
+        max_von_mises_concentration=100.0,
+    )
+    with torch.no_grad():
+        for param in decoder.parameters():
+            param.zero_()
+        decoder.regressor[-1].bias[5::6].fill_(1000.0)
+
+    pred = decoder.decode_selected(
+        agent_embedding=torch.zeros(1, 4),
+        selected_anchor=torch.zeros(1, 2, 3),
+    )
+
+    assert torch.isfinite(pred["head_concentration"]).all()
+    assert pred["head_concentration"].max().item() == 100.0
 
 
 def test_unimm_minibatch_kmeans_builds_valid_anchor_bank():
@@ -438,6 +463,7 @@ def test_unimm_lightning_training_step_runs(tmp_path: Path):
                 "time_span": 8,
                 "min_laplace_scale": 0.05,
                 "min_von_mises_concentration": 0.001,
+                "max_von_mises_concentration": 100.0,
             },
             "sim_agents_submission": {
                 "is_active": False,
@@ -505,6 +531,7 @@ def test_unimm_rollout_shapes(tmp_path: Path):
                 "time_span": 8,
                 "min_laplace_scale": 0.05,
                 "min_von_mises_concentration": 0.001,
+                "max_von_mises_concentration": 100.0,
             },
             "sim_agents_submission": {
                 "is_active": False,
