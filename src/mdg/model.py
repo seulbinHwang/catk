@@ -62,7 +62,7 @@ class MDG(LightningModule):
         self.full_state_loss_weight = float(getattr(model_config, "full_state_loss_weight", 0.0))
         self.kinematic_chunk_filter = bool(getattr(model_config, "kinematic_chunk_filter", True))
         self.kinematic_max_step_displacement_m = float(
-            getattr(model_config, "kinematic_max_step_displacement_m", 10.0)
+            getattr(model_config, "kinematic_max_step_displacement_m", 5.0)
         )
         self.n_rollout_closed_val = int(model_config.n_rollout_closed_val)
         self.rollout_chunk_size = int(model_config.rollout_chunk_size)
