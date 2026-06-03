@@ -592,6 +592,8 @@ class SceneEncoder(nn.Module):
 
 
 class KinematicDynamics(nn.Module):
+    YAW_RATE_SPEED_THRESHOLD_MPS = 0.1
+
     def __init__(self, action_chunk: int, dt: float, action_mean: tuple[float, float], action_std: tuple[float, float]) -> None:
         super().__init__()
         self.action_chunk = int(action_chunk)
@@ -625,12 +627,7 @@ class KinematicDynamics(nn.Module):
                 f"got future_steps={future_steps}, action_chunk={self.action_chunk}."
             )
         action_steps = future_steps // self.action_chunk
-        prev_pos = torch.cat((current_pos.unsqueeze(2), future_pos[:, :, :-1]), dim=2)
-        position_velocity = (future_pos - prev_pos) / self.dt
-        future_heading_vec = heading_vector(future_heading)
-        velocity_speed = (future_velocity[:, :, :, :2] * future_heading_vec).sum(dim=-1)
-        position_speed = (position_velocity * future_heading_vec).sum(dim=-1)
-        speed = torch.where(torch.isfinite(position_speed), position_speed, velocity_speed)
+        speed = torch.linalg.norm(future_velocity[:, :, :, :2], dim=-1)
         prev_speed = torch.cat((current_speed.unsqueeze(-1), speed[:, :, :-1]), dim=-1)
         prev_heading = torch.cat((current_heading.unsqueeze(-1), future_heading[:, :, :-1]), dim=-1)
         per_step_acc = (speed - prev_speed) / self.dt
@@ -656,22 +653,22 @@ class KinematicDynamics(nn.Module):
         action = self.denormalize(action)
         acc = action[..., 0]
         yaw_rate = action[..., 1]
-        initial_velocity = (
-            current_velocity
-            if current_velocity is not None
-            else heading_vector(current_heading) * current_speed.unsqueeze(-1)
-        )
         full_acc = acc.repeat_interleave(self.action_chunk, dim=2)
         full_yaw_rate = yaw_rate.repeat_interleave(self.action_chunk, dim=2)
 
+        full_speed = current_speed.unsqueeze(-1) + torch.cumsum(full_acc * self.dt, dim=2)
+        full_speed = torch.clamp(full_speed, min=0.0)
+        full_yaw_rate = torch.where(
+            full_speed > self.YAW_RATE_SPEED_THRESHOLD_MPS,
+            full_yaw_rate,
+            torch.zeros_like(full_yaw_rate),
+        )
         full_heading = wrap_angle(
             current_heading.unsqueeze(-1) + torch.cumsum(full_yaw_rate * self.dt, dim=2)
         )
-        full_speed = current_speed.unsqueeze(-1) + torch.cumsum(full_acc * self.dt, dim=2)
 
         updated_velocity = heading_vector(full_heading) * full_speed.unsqueeze(-1)
-        velocity_for_position = torch.cat((initial_velocity.unsqueeze(2), updated_velocity[:, :, :-1]), dim=2)
-        full_pos = current_pos.unsqueeze(2) + torch.cumsum(velocity_for_position * self.dt, dim=2)
+        full_pos = current_pos.unsqueeze(2) + torch.cumsum(updated_velocity * self.dt, dim=2)
 
         chunk_end_idx = torch.arange(
             self.action_chunk - 1,
