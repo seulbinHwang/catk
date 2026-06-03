@@ -86,6 +86,9 @@ WOMD 원본 TFRecord를 받은 뒤 MDG 전용 cache를 만든다. MDG 학습/평
 `mdg_map.id`, `mdg_traffic_signal.lane_id`, `mdg_traffic_signal.time_step` 필드가 있고
 `mdg_map.sampling=arclength_v1`, `mdg_traffic_signal.version=time_indexed_v1`인 cache만 읽는다.
 `mdg_traffic_signal`은 WOMD `dynamic_map_states`의 모든 time step phase와 stop point를 저장한다.
+traffic light는 두 경로로 scene encoder에 들어간다. stop point 좌표가 유효한 신호는 별도 signal token으로
+들어가고, lane_id/state가 유효한 신호는 stop point 좌표가 없더라도 같은 lane의 map token에
+`map_light_emb`로 반영된다. 따라서 교차로 신호 상태가 좌표 누락 때문에 map context에서 사라지지 않는다.
 agent cache는 rolling-anchor training이 anchor 시점별 current-valid agent를 고를 수 있도록
 raw `t=10` current-valid agent만이 아니라 91 step 중 한 번이라도 valid한 track을 저장한다.
 

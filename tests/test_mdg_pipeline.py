@@ -721,6 +721,74 @@ def test_mdg_traffic_signal_stop_points_are_cached() -> None:
     torch.testing.assert_close(signal["position"], torch.tensor([[1.5, 2.5], [3.5, 4.5]]))
     assert signal["state"].tolist() == [2, 3]
     assert signal["valid"].tolist() == [True, True]
+    assert signal["state_valid"].tolist() == [True, True]
+
+
+def test_mdg_anchor_signal_state_updates_map_light_without_stop_point(tmp_path) -> None:
+    num_agents = 1
+    total_steps = 91
+    map_position = torch.zeros(2, 16, 2)
+    map_position[1, :, 0] = 50.0
+    data = {
+        "scenario_id": "signal_state_without_stop_point",
+        "agent": {
+            "position": torch.zeros(num_agents, total_steps, 3),
+            "heading": torch.zeros(num_agents, total_steps),
+            "velocity": torch.zeros(num_agents, total_steps, 2),
+            "valid_mask": torch.ones(num_agents, total_steps, dtype=torch.bool),
+            "shape": torch.ones(num_agents, 3),
+            "type": torch.zeros(num_agents, dtype=torch.long),
+            "role": torch.tensor([[True, False, False]]),
+            "id": torch.tensor([1], dtype=torch.long),
+        },
+        "mdg_map": {
+            "position": map_position,
+            "heading": torch.zeros(2, 16),
+            "id": torch.tensor([7, 8], dtype=torch.long),
+            "type": torch.zeros(2, dtype=torch.long),
+            "light_type": torch.zeros(2, dtype=torch.long),
+            "valid": torch.ones(2, dtype=torch.bool),
+            "sampling": "arclength_v1",
+        },
+        "mdg_traffic_signal": {
+            "position": torch.tensor([[float("nan"), float("nan")], [1.0, 1.0]]),
+            "heading": torch.zeros(2),
+            "state": torch.tensor([2, 3], dtype=torch.long),
+            "valid": torch.tensor([False, True]),
+            "lane_id": torch.tensor([7, 7], dtype=torch.long),
+            "time_step": torch.tensor([10, 20], dtype=torch.long),
+            "version": "time_indexed_v1",
+        },
+    }
+    with (tmp_path / "sample.pkl").open("wb") as handle:
+        pickle.dump(data, handle)
+
+    anchor_10_dataset = MDGDataset(
+        raw_dir=str(tmp_path),
+        max_agents=1,
+        max_map_polylines=2,
+        map_waypoints=16,
+        max_traffic_lights=1,
+        training=True,
+        train_anchor_steps=[10],
+    )
+    anchor_10 = anchor_10_dataset[0]
+    assert anchor_10["map_light_type"].tolist()[:2] == [2, 0]
+    assert anchor_10["signal_valid"].tolist() == [False]
+
+    anchor_20_dataset = MDGDataset(
+        raw_dir=str(tmp_path),
+        max_agents=1,
+        max_map_polylines=2,
+        map_waypoints=16,
+        max_traffic_lights=1,
+        training=True,
+        train_anchor_steps=[20],
+    )
+    anchor_20 = anchor_20_dataset[0]
+    assert anchor_20["map_light_type"].tolist()[:2] == [3, 0]
+    assert anchor_20["signal_valid"].tolist() == [True]
+    assert anchor_20["signal_state"].tolist() == [3]
 
 
 def test_mdg_map_cache_preserves_detailed_polyline_types() -> None:

@@ -127,25 +127,36 @@ def _extract_traffic_signals(data: Dict[str, Any]) -> Dict[str, Tensor]:
             "MDG cache mdg_traffic_signal must be time_indexed_v1. "
             f"Found version={version!r}; regenerate MDG_cache from raw WOMD TFRecords."
         )
+    lane_id = _as_tensor(signal["lane_id"], torch.long)
+    time_step = _as_tensor(signal["time_step"], torch.long)
+    state = _as_tensor(signal["state"], torch.long)
+    valid = _as_tensor(signal["valid"], torch.bool)
+    state_valid = _as_tensor(
+        signal.get("state_valid", (lane_id >= 0) & (time_step >= 0) & (state >= 0)),
+        torch.bool,
+    )
     return {
         "position": _as_tensor(signal["position"], torch.float32),
         "heading": _as_tensor(signal["heading"], torch.float32),
-        "state": _as_tensor(signal["state"], torch.long),
-        "valid": _as_tensor(signal["valid"], torch.bool),
-        "lane_id": _as_tensor(signal["lane_id"], torch.long),
-        "time_step": _as_tensor(signal["time_step"], torch.long),
+        "state": state,
+        "valid": valid,
+        "state_valid": state_valid,
+        "lane_id": lane_id,
+        "time_step": time_step,
         "version": version,
     }
 
 
 def _select_signal_at_anchor(signal: Dict[str, Any], anchor_step: int) -> Dict[str, Tensor]:
-    valid = signal["valid"] & (signal["time_step"] == int(anchor_step))
+    state_valid = signal.get("state_valid", signal["valid"])
+    at_anchor = state_valid & (signal["time_step"] == int(anchor_step))
     return {
-        "position": signal["position"][valid],
-        "heading": signal["heading"][valid],
-        "state": signal["state"][valid],
-        "valid": signal["valid"][valid],
-        "lane_id": signal["lane_id"][valid],
+        "position": signal["position"][at_anchor],
+        "heading": signal["heading"][at_anchor],
+        "state": signal["state"][at_anchor],
+        "valid": signal["valid"][at_anchor],
+        "state_valid": state_valid[at_anchor],
+        "lane_id": signal["lane_id"][at_anchor],
         "time_indexed": True,
     }
 
@@ -158,7 +169,7 @@ def _anchor_map_light_type(mdg_map: Dict[str, Tensor], signal_at_anchor: Dict[st
         for lane_id, state, valid in zip(
             signal_at_anchor["lane_id"],
             signal_at_anchor["state"],
-            signal_at_anchor["valid"],
+            signal_at_anchor.get("state_valid", signal_at_anchor["valid"]),
         )
         if bool(valid.item())
     }

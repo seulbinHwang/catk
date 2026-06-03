@@ -295,11 +295,13 @@ def build_mdg_traffic_signal_features(tf_lights: Optional[pd.DataFrame] = None):
         lane_id = torch.as_tensor(tf_lights["lane_id"].to_numpy(dtype=np.int64), dtype=torch.long)
         time_step = torch.as_tensor(tf_lights["time_step"].to_numpy(dtype=np.int64), dtype=torch.long)
         valid = torch.isfinite(positions).all(dim=-1)
+        state_valid = (lane_id >= 0) & (time_step >= 0)
         return {
             "position": positions,
             "heading": torch.zeros(len(positions), dtype=torch.float32),
             "state": torch.as_tensor(states, dtype=torch.long),
             "valid": valid,
+            "state_valid": state_valid,
             "lane_id": lane_id,
             "time_step": time_step,
             "version": "time_indexed_v1",
@@ -310,6 +312,7 @@ def build_mdg_traffic_signal_features(tf_lights: Optional[pd.DataFrame] = None):
         "heading": torch.zeros(0, dtype=torch.float32),
         "state": torch.zeros(0, dtype=torch.long),
         "valid": torch.zeros(0, dtype=torch.bool),
+        "state_valid": torch.zeros(0, dtype=torch.bool),
         "lane_id": torch.zeros(0, dtype=torch.long),
         "time_step": torch.zeros(0, dtype=torch.long),
         "version": "time_indexed_v1",
