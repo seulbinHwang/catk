@@ -278,16 +278,16 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | branch | `trajtok` |
 | pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
-| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs102_lr75e4_oom_retry_trajtok_hidden124_tokenmatchopt_trainselectfalse_20260603` |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs90_lr685e4_oom_retry_trajtok_hidden124_tokenmatchopt_trainselectfalse_20260603` |
 | remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_hidden124_20260602` |
 | experiment | `pre_bc_a100x4x2` |
 | model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
 | decoder | `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
 | model parameters | `8,247,013` total / trainable, 직접 SMART instantiate로 측정 |
-| train batch | `INITIAL_BS=17` per rank, effective global batch 102 |
-| OOM retry | `MIN_BS=13`, `OOM_STEP=2`, latest task checkpoint resume (`17 -> 15 -> 13`) |
+| train batch | `INITIAL_BS=15` per rank, effective global batch 90 |
+| OOM retry | `MIN_BS=13`, `OOM_STEP=2`, latest task checkpoint resume (`15 -> 13`) |
 | validation/test batch | `VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12` |
-| optimizer schedule | `lr=7.5e-4`, `lr_warmup_steps=4`, `lr_min_ratio=1e-2`; LR keeps the requested `lr75e4` setting from the H100 4+2 run |
+| optimizer schedule | `lr=6.85e-4`, `lr_warmup_steps=4`, `lr_min_ratio=1e-2`; LR follows sqrt scaling from the paper 48-batch `5e-4` recipe to effective batch 90 |
 | precision / grad accumulation | `bf16-mixed`, `accumulate_grad_batches=1` |
 | train augmentation | `random_scene_scale_config: [0.8, 1.2]`, `random_time_shift_config.MAX_TIME_SHIFT=5` |
 | agent selection | `data.train_use_eval_agent_selection=false` |
@@ -329,26 +329,28 @@ SESSION=catk-smart-ntp-h100x4-h100x2-trajtok-smoke \
 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 ```
 
-장기 학습을 remote tmux에 시작한 뒤 로컬 shell을 바로 돌려받고 싶으면 `START_ONLY=1`을
-쓴다. 이 모드는 첫 attempt만 시작하고 OOM-retry loop를 붙이지 않으므로, OOM 자동 재시작까지
-원하면 `START_ONLY` 없이 wrapper를 그대로 실행한다.
-기본 task name은 `globalbs102`, `lr75e4`, `tokenmatchopt`를 포함하므로, 기존 `globalbs108` run의 checkpoint를
-이어 쓰지 않는 fresh start다. `globalbs108` 시도에서는 `INITIAL_BS=18`이 epoch 0의
-151/4510 step에서 CUDA OOM으로 실패했고, 같은 pod 조합에서 `INITIAL_BS=17`은 같은 지점을
-넘어 진행되는 것을 확인했다. 같은 task 안에서 OOM이 발생한 경우에만 해당 task의 최신
-`epoch_last.ckpt`로 재시작한다.
+장기 학습에서 OOM 자동 재시작까지 원하면 `START_ONLY` 없이 wrapper를 계속 실행해야 한다.
+로컬 shell을 점유하지 않으려면 아래처럼 로컬 tmux 안에서 wrapper를 foreground로 둔다.
+기본 task name은 `globalbs90`, `lr685e4`, `tokenmatchopt`를 포함하므로, 기존
+`globalbs102`/`globalbs108` run의 checkpoint를 이어 쓰지 않는 fresh start다.
+`globalbs102` 시도에서는 `INITIAL_BS=17`이 epoch 0의 4524/4775 step 부근에서
+`wo-pvc-2` rank 5 CUDA OOM으로 실패했다. 따라서 현재 기본값은 `INITIAL_BS=15`이고,
+OOM이 발생하면 `bs=13`으로 낮춘 뒤 같은 task의 최신 `epoch_last.ckpt`로 재시작한다.
 remote `PROJECT_ROOT`에 미커밋 변경이나 untracked 파일이 있으면 wrapper가 먼저 `git stash
 push --include-untracked`로 보존한 뒤 `origin/trajtok`을 checkout한다.
 
 ```bash
+tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-gbs90-wrapper
+bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
+
 START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 ```
 
 실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-tokenmatchopt
-kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-tokenmatchopt
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-tokenmatchopt-gbs90
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-tokenmatchopt-gbs90
 
 STOP=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 ```
