@@ -3133,13 +3133,14 @@ class SMARTFlow(LightningModule):
                 # DDP 동기화 위해 항상 generator param 에 연결된 trainable zero loss 로 fallback.
                 if not total_loss_i.requires_grad:
                     total_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
-                # multi-anchor 학습 시 같은 rollout 결과를 anchor 들이 share 하므로
-                # 마지막 anchor 전까지 graph 를 유지해야 두 번째 anchor backward 가
-                # 끊긴 graph 로 들어가는 race 를 막을 수 있다.
-                is_last_anchor_in_rollout = anchor_idx == n_anchors - 1
+                # OCSC GT-grounded per-anchor(🅐): anchor 마다 독립 rollout(별도 graph)이므로
+                # backward 후 graph 를 retain 할 필요가 없다.  retain_graph=False 로 각 anchor
+                # 의 full-BPTT graph 를 즉시 해제 → peak 메모리 ~n_anchors 배 절감.  (구 🅑 의
+                # 단일 공유 rollout 에선 anchor 들이 같은 graph 를 써서 retain 이 필요했지만,
+                # 🅐 에선 불필요한 잔재였다.  gradient 는 generator param 에 계속 누적됨.)
                 self._manual_backward_without_autocast(
                     total_loss_i,
-                    retain_graph=not is_last_anchor_in_rollout,
+                    retain_graph=False,
                 )
                 self._assert_self_forced_generator_update_isolated()
                 per_rollout_sf_losses.append(sf_loss_i.detach())
