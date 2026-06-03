@@ -1074,9 +1074,18 @@ RMM 기준으로 antithetic pair가 더 높았으므로 repository 기본값은 
 | 0.7 | 0.774481 | 0.121340 | 0.096547 |
 | 0.8 | 0.778329 | 0.143602 | 0.094837 |
 | 0.9 | 0.780525 | 0.169850 | 0.094274 |
+| 0.96 | 0.781651 | 0.187995 | 0.094656 |
+| 0.97 | 0.781664 | 0.191210 | 0.094831 |
+| 0.98 | 0.781816 | 0.194725 | 0.095018 |
+| 0.99 | 0.781770 | 0.198165 | 0.095108 |
 | 1.0 | 0.781846 | 0.201687 | 0.095312 |
+| 1.01 | 0.781898 | 0.205243 | 0.095548 |
+| 1.02 | 0.781821 | 0.208967 | 0.095836 |
+| 1.03 | 0.781781 | 0.212847 | 0.096066 |
+| 1.04 | 0.781810 | 0.216404 | 0.096263 |
+| 1.05 | 0.781730 | 0.220319 | 0.096584 |
 
-이 sweep에서는 RMM 기준 `noise_scale=1.0` 이 가장 높았으므로 repository 기본값은 `model.model_config.validation_rollout_sampling.noise_scale=1.0` 으로 유지합니다.
+이 sweep에서는 RMM 기준 `noise_scale=1.01` 이 가장 높았으므로 repository 기본값은 `model.model_config.validation_rollout_sampling.noise_scale=1.01` 로 둡니다. `noise_scale=1.01` 은 기존 최고였던 `1.0` 대비 CPD는 높지만 CES도 소폭 높아지며, 최종 선택 기준은 RMM입니다.
 
 control-space Flow에서는 closed-loop rollout initial noise에 dim별 scale도 줄 수 있습니다. 이 값은 `model.model_config.validation_rollout_sampling.control_dim_noise_scale=[longitudinal,lateral,yaw]` 로 설정하며, 기본값은 `[1.0,1.0,1.0]` 입니다. 이 옵션은 checkpoint, model parameter, solver, denoising step 수를 바꾸지 않고 control-space initial noise의 각 dim 분산만 조절합니다. control-space가 아닌 decoder 경로에서는 적용하지 않습니다.
 
