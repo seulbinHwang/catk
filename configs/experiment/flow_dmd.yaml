@@ -60,7 +60,7 @@ model:
       # cadence fake:gen = 3:1 — critic(fake) anchor 마다 3 FM step, generator 는 batch당 1 step.
       estimator_updates_per_step: 3
       # critic(fake) lr (절대값; >0 이면 lr/updates 비례식 대신 그대로 사용).
-      estimator_lr: 1.0e-5
+      estimator_lr: 1.0e-4
       # fake-only warmup: 첫 200 step 은 critic 만 학습(generator no-op).
       estimator_warmup_steps: 200
       estimator_warmup_epochs: 0
