@@ -237,7 +237,7 @@ python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-
 python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 30 --replace
 ```
 
-2026-06-02 최신 `UniMM` 기준으로 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 memory-balanced train sampler를 켠 뒤 batch size를 다시 탐색했다. `train_batch_size=36`, `34`, `31`은 backward 중 CUDA OOM이 재현됐고, `train_batch_size=32`는 4-batch smoke는 통과했지만 200-batch smoke에서 CUDA OOM이 재현됐다. `train_batch_size=30`은 200-batch train-only smoke를 exit status 0으로 통과했다. 안정 기본값은 per-GPU `train_batch_size=30`이고 global batch size는 `30 x 6 = 180`이다. Train dataloader는 기본적으로 memory-balanced distributed batch sampler를 사용해 agent/map이 많은 dense scenario가 한 rank-local batch에 몰리는 것을 줄인다. 이 sampler가 이미 rank별 batch를 직접 나누므로 UniMM trainer는 `use_distributed_sampler=false`로 둔다.
+2026-06-03 최신 `UniMM@807b82a` 기준으로 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 memory-balanced train sampler와 positive anchor tail tie-break를 켠 상태로 batch size를 다시 탐색했다. `train_batch_size=32`는 200-batch train-only smoke에서 CUDA OOM이 재현됐고, `train_batch_size=30`은 200-batch train-only smoke를 exit status 0으로 통과했다. 안정 기본값은 per-GPU `train_batch_size=30`이고 global batch size는 `30 x 6 = 180`이다. Train dataloader는 기본적으로 memory-balanced distributed batch sampler를 사용해 agent/map이 많은 dense scenario가 한 rank-local batch에 몰리는 것을 줄인다. 이 sampler가 이미 rank별 batch를 직접 나누므로 UniMM trainer는 `use_distributed_sampler=false`로 둔다.
 
 H100 x3x2 validation은 per-GPU batch size 12, global batch size `12 x 6 = 72`로 실행한다. 학습 중 validation은 `check_val_every_n_epoch=16` 주기로 돌며, Fast WOSAC `sim_agents_2025` scorer는 `scorer_scene_num=1680` 기준으로 GPU 수와 validation batch size에 맞춰 batch 수를 계산한다. H100 x3x2 기본값에서는 `ceil(ceil(1680 / 6) / 12) = 24`이므로 `n_batch_sim_agents_metric=24`로 자동 조정된다.
 
@@ -547,13 +547,14 @@ explicit test:
 실전 full pretrain은 아래처럼 OOM retry wrapper로 시작한다. 처음부터 학습할 때는 `CKPT_PATH`를 지정하지 않는다. wrapper는 CUDA OOM 또는 재시도 가능한 종료가 발생했을 때만 같은 `TASK_NAME`의 최신 checkpoint를 찾아 resume한다.
 
 ```bash
-TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_lloyd_perstep_membal_$(date +%Y%m%d_%H%M%S) \
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_temp1_$(date +%Y%m%d_%H%M%S) \
 SESSION=unimm-h100x3x2 \
 MASTER_PORT=29578 \
 INITIAL_BS=30 \
 OOM_STEP=2 \
 MIN_BS=16 \
 WANDB_MODE=online \
+EXTRA_HYDRA_OVERRIDES="model.model_config.inference_temperature=1.0 model.model_config.scorer_scene_num=1680" \
   bash scripts/launch_unimm_h100x3x2_with_oom_retry.sh
 ```
 
