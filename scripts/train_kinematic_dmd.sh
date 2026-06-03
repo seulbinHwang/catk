@@ -23,7 +23,10 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3}"
 
 CATK_CONDA_ENV="${CATK_CONDA_ENV:-catk}"
-. "$(dirname "$0")/_activate_conda.sh"
+# conda 활성화 (self-contained; _activate_conda.sh 의존 X).
+CONDA_SH="${CONDA_SH:-/home2/pnc2/miniforge3/etc/profile.d/conda.sh}"
+if [ -f "${CONDA_SH}" ]; then . "${CONDA_SH}"; fi
+if command -v conda >/dev/null 2>&1; then conda activate "${CATK_CONDA_ENV}" || true; fi
 
 # ── 실행 메타 ───────────────────────────────────────────────────────────────
 EXPERIMENT="${EXPERIMENT:-flow_dmd}"
