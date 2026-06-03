@@ -93,6 +93,7 @@ class _WaymoSubmissionRuntime:
     poll_interval_seconds: int
     save_debug_artifacts: bool
     method_name: str | None
+    dry_run: bool
 
     @property
     def debug_dir(self) -> Path:
@@ -575,6 +576,7 @@ def _build_runtime_config(cfg: DictConfig) -> _WaymoSubmissionRuntime:
         poll_interval_seconds=int(submission_cfg.get("poll_interval_seconds")),
         save_debug_artifacts=bool(submission_cfg.get("save_debug_artifacts")),
         method_name=method_name,
+        dry_run=bool(submission_cfg.get("dry_run", False)),
     )
 
 
@@ -661,6 +663,25 @@ class _WaymoSubmissionUploader:
                         "Could not find a file input in the Waymo submission form."
                     )
 
+                if self.runtime.dry_run:
+                    self._save_debug_artifacts(
+                        page,
+                        f"challenge-page-dry-run-{self.runtime.evaluation_set}-form-found",
+                    )
+                    log.info(
+                        "Waymo dry-run: found the %s upload form for %s; "
+                        "not attaching the archive and not submitting.",
+                        self.runtime.evaluation_set,
+                        self.runtime.archive_path,
+                    )
+                    context.storage_state(path=self.runtime.storage_state_path.as_posix())
+                    return WaymoSubmissionResult(
+                        archive_path=self.runtime.archive_path,
+                        challenge_url=self.runtime.challenge_url,
+                        submissions_url=self.runtime.submissions_url,
+                        debug_dir=self.runtime.debug_dir,
+                    )
+
                 file_input.set_input_files(self.runtime.archive_path.as_posix())
                 submitted = self._submit_form(page, submit_section, file_input)
                 if not submitted:
@@ -722,6 +743,18 @@ class _WaymoSubmissionUploader:
             f"http-challenge-page-before-{self.runtime.evaluation_set}-submit",
             challenge_response.text,
         )
+        if self.runtime.dry_run:
+            log.info(
+                "Waymo dry-run: HTTP fallback verified signed-in access to %s; "
+                "not requesting an upload URL and not submitting.",
+                self.runtime.challenge_url,
+            )
+            return WaymoSubmissionResult(
+                archive_path=self.runtime.archive_path,
+                challenge_url=self.runtime.challenge_url,
+                submissions_url=self.runtime.submissions_url,
+                debug_dir=self.runtime.debug_dir,
+            )
 
         archive_size = self.runtime.archive_path.stat().st_size
         upload_metadata_response = session.get(

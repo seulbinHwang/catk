@@ -32,6 +32,7 @@ seed: 817
 
 waymo_submission:
   enabled: false
+  dry_run: false
   submit_validate: true
   submit_test: false
   evaluation_set: null
