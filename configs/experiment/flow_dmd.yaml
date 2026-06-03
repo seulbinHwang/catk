@@ -29,7 +29,10 @@ action: finetune
 model:
   model_config:
     # generator lr (static; self_forced 경로는 scheduler 없이 상수 lr).
-    lr: 1.0e-6
+    # 단일-scene overfit sweep 에서 검증된 안정-상승 최적점: lr 5e-5 × cadence 16:1
+    #   (estimator_updates=4).  RMM STABLE_RISING d=+0.019, 크래시 없음.  좌우(lr 4e-5 FLAT,
+    #   1e-4 폭주 / cadence 12·20:1 FLAT, 8:1·48:1 crash)로 둘러싼 전역 peak.
+    lr: 5.0e-5
     lr_warmup_steps: 0
     lr_total_steps: -1
     # ── validation 세팅: 기존 pareto(self_forced_npfm_pareto) run 과 정합 ──
@@ -67,8 +70,9 @@ model:
       # pure DMD: BC anchor FM term 끔.
       use_anchor_flow_matching_loss: false
       anchor_weight: 0.0
-      # cadence fake:gen = 3:1 — critic(fake) anchor 마다 3 FM step, generator 는 batch당 1 step.
-      estimator_updates_per_step: 3
+      # cadence fake:gen = n_anchors(4)×updates = 16:1 — sweep 에서 유일하게 안정-상승한
+      # 지점.  8:1 은 crash, 12·20:1 은 FLAT, 48:1 은 crash/FLAT.  16:1 이 좁은 peak.
+      estimator_updates_per_step: 4
       # critic(fake) lr (절대값; >0 이면 lr/updates 비례식 대신 그대로 사용).
       estimator_lr: 1.0e-4
       # fake-only warmup: 첫 200 step 은 critic 만 학습(generator no-op).

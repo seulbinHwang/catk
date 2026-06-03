@@ -37,10 +37,11 @@ WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
 WANDB_PROJECT="${WANDB_PROJECT:-clsft-catk}"
 
 # ── 하이퍼파라미터 (기본 = 방금 돌린 값; flow_dmd.yaml 과 동일, override 가능) ──
-GEN_LR="${GEN_LR:-1.0e-6}"             # generator lr (static, no decay)
+GEN_LR="${GEN_LR:-5.0e-5}"             # generator lr (static, no decay) — sweep 검증 peak
 FAKE_LR="${FAKE_LR:-1.0e-4}"           # critic(fake_score) lr
 UNFROZEN_RANGE="${UNFROZEN_RANGE:-velocity_head_only}"   # flow head only
-ESTIMATOR_UPDATES="${ESTIMATOR_UPDATES:-3}"              # cadence fake:gen = 3:1
+# cadence fake:gen = n_anchors(4)×updates = 16:1 — 단일 scene sweep 유일 안정-상승 지점.
+ESTIMATOR_UPDATES="${ESTIMATOR_UPDATES:-4}"
 FAKE_WARMUP="${FAKE_WARMUP:-200}"                        # fake-only warmup steps
 N_ANCHORS="${N_ANCHORS:-4}"                             # GT-grounded time-anchor 수
 ANCHOR_STRIDE="${ANCHOR_STRIDE:-4}"                     # 4 coarse step = 2초 간격
