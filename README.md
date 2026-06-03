@@ -356,6 +356,42 @@ checkpoint-sync test smoke:
   result=exit status 0
 ```
 
+2026-06-03 23:46 KST에 최신 `UniMM@1dbe124` 기준으로 학습-추론 파이프라인을 코드 레벨과 실제 cache/GPU로 다시 감사했다. 검토 대상은 `src/unimm/model/anchor_based_4s.py`, `src/unimm/processor.py`, `src/unimm/anchors.py`, `src/unimm/losses.py`, `src/unimm/modules.py`, datamodule, memory-balanced sampler, H100 launcher였다.
+
+```text
+actual-cache source QA:
+  pod=hsb-npc-training-3-1
+  cache_root=/workspace/womd_v1_3/SMART_cache
+  context_indices=[1,2,...,16]  # raw step 10..85
+  target_local_shape=(59,16,40,3)
+  target_valid_shape=(59,16,40)
+  context85_invalid_suffix_count=0
+  z_star_range=0..2039
+  posterior_accept_rate=0.93153
+  posterior_error_p95=0.00540
+  loss=38.36959, loss_cls=7.76818, loss_reg=30.60141
+  reg_cls_ratio=3.93933
+  bad_grads=[]
+  rollout_shapes=(24,2,80,2)/(24,2,80)/(24,2,80)
+  result=UNIMM_PIPELINE_QA_OK
+
+DDP train-only optimization smoke:
+  task_name=unimm_h100x3x2_code_audit_train20_20260603_234402
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=30
+  trainer.max_epochs=1
+  trainer.limit_train_batches=20
+  trainer.limit_val_batches=0
+  result=exit status 0
+  final_train_loss=8.96504
+  final_train_loss_cls=4.85498
+  final_train_loss_reg=4.11006
+  final_reg_cls_ratio=0.84657
+  final_posterior_accept_rate=0.91873
+```
+
+이 감사에서 context 10..85 생성, late-context partial-valid padding, 0.5초 positive matching과 near-tie tail tie-break, posterior fallback, NLL loss finite check, gradient finite check, closed-loop rollout tensor shape, 2-node DDP 초기 최적화 감소 추세를 확인했다. 원격 pod에는 `pytest`가 설치되어 있지 않아 pytest 대신 실제 cache batch를 직접 통과시키는 runtime QA와 20-batch DDP smoke로 검증했다.
+
 짧은 검증 실행은 아래처럼 batch/epoch limit을 걸어 사용한다.
 
 ```bash
