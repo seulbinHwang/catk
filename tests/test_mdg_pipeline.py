@@ -95,7 +95,7 @@ def _small_model_config() -> OmegaConf:
             "n_rollout_closed_val": 2,
             "rollout_chunk_size": 2,
             "replanning_interval": 10,
-            "closed_loop_denoising_steps": 2,
+            "closed_loop_denoising_steps": 1,
             "closed_loop_denoising_schedule": "temporal",
             "closed_loop_reuse_actions": True,
             "closed_loop_reuse_alpha": [0.95, 0.90, 0.80, 0.01],
@@ -534,6 +534,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
 
 def test_mdg_temporal_denoising_schedule_allows_arbitrary_steps() -> None:
     cfg = _small_model_config()
+    cfg.closed_loop_reuse_actions = False
     cfg.closed_loop_denoising_steps = 5
     model = MDG(cfg)
     schedule = model._closed_loop_mask_schedule(torch.device("cpu"), action_steps=40)
@@ -565,6 +566,14 @@ def test_mdg_temporal_denoising_schedule_allows_arbitrary_steps() -> None:
 
     cfg.closed_loop_denoising_steps = 0
     with pytest.raises(ValueError, match="closed_loop_denoising_steps must be >= 1"):
+        MDG(cfg)
+
+
+def test_mdg_reuse_requires_one_step_denoising() -> None:
+    cfg = _small_model_config()
+    cfg.closed_loop_reuse_actions = True
+    cfg.closed_loop_denoising_steps = 3
+    with pytest.raises(ValueError, match="closed_loop_denoising_steps must be 1"):
         MDG(cfg)
 
 

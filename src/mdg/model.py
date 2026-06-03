@@ -131,6 +131,12 @@ class MDG(LightningModule):
                 f"got {self.closed_loop_denoising_schedule!r}."
             )
         if self.closed_loop_reuse_actions:
+            if self.closed_loop_denoising_steps != 1:
+                raise ValueError(
+                    "model_config.closed_loop_denoising_steps must be 1 when "
+                    "model_config.closed_loop_reuse_actions=true. Disable action reuse "
+                    "to run temporal/global multi-step denoising ablations."
+                )
             if len(self.closed_loop_reuse_alpha) != 4:
                 raise ValueError(
                     "model_config.closed_loop_reuse_alpha must contain four alpha values "
