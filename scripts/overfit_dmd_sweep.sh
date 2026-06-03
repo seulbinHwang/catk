@@ -23,8 +23,9 @@ FAKE_LR="${FAKE_LR:-1.0e-4}"; NA="${NA:-4}"; SS="${SS:-16}"
 MAX_EPOCHS="${MAX_EPOCHS:-180}"; VAL_EVERY="${VAL_EVERY:-10}"; NRCV="${NRCV:-16}"
 PER_CFG_TIMEOUT="${PER_CFG_TIMEOUT:-5400}"
 
-# config 형식: "LABEL GEN_LR ESTIMATOR_UPDATES [GRAD_CLIP]"
+# config 형식: "LABEL GEN_LR ESTIMATOR_UPDATES [GRAD_CLIP] [FAKE_LR]"
 #   cadence(critic:gen) = NA(=4) × ESTIMATOR_UPDATES : 1.  (updates 2→8:1, 4→16:1, 12→48:1)
+#   5번째 FAKE_LR(critic lr) 생략 시 env FAKE_LR(기본 1e-4) 사용.
 # 기본 grid (low lr × cadence, 극단 48:1 포함)
 if [ "$#" -eq 0 ]; then
   set -- \
@@ -39,12 +40,12 @@ echo "===== lr×clip sweep 시작 $(date) GPU=${CUDA_VISIBLE_DEVICES} (cadence $
 
 for cfg in "$@"; do
   set -- $cfg
-  LABEL="$1"; GLR="$2"; EU="$3"; GCLIP="${4:-10.0}"
+  LABEL="$1"; GLR="$2"; EU="$3"; GCLIP="${4:-10.0}"; CLR="${5:-$FAKE_LR}"
   RATIO=$(( NA * EU ))
   TASK="sweepC_${LABEL}_$(date +%m%d_%H%M%S)"
   LOG="artifacts/${TASK}.log"
-  echo ">>> [$LABEL] gen_lr=$GLR cadence=${RATIO}:1 (updates=$EU) grad_clip=$GCLIP  ($(date +%H:%M))" | tee -a "${RES}"
-  GEN_LR="$GLR" FAKE_LR="$FAKE_LR" ESTIMATOR_UPDATES="$EU" N_ANCHORS="$NA" SAMPLE_STEPS="$SS" \
+  echo ">>> [$LABEL] gen_lr=$GLR critic_lr=$CLR cadence=${RATIO}:1 (updates=$EU) grad_clip=$GCLIP  ($(date +%H:%M))" | tee -a "${RES}"
+  GEN_LR="$GLR" FAKE_LR="$CLR" ESTIMATOR_UPDATES="$EU" N_ANCHORS="$NA" SAMPLE_STEPS="$SS" \
     GRAD_CLIP="$GCLIP" MAX_EPOCHS="$MAX_EPOCHS" VAL_EVERY="$VAL_EVERY" N_ROLLOUT_CLOSED_VAL="$NRCV" \
     TASK="$TASK" timeout "${PER_CFG_TIMEOUT}" bash scripts/overfit_single_scene_dmd.sh >/dev/null 2>&1
   RID="$(grep -oE 'clsft-catk/runs/[a-z0-9]+' "$LOG" 2>/dev/null | tail -1 | sed 's#.*/##')"
@@ -52,7 +53,7 @@ for cfg in "$@"; do
   V="$(python tools/eval_rmm_trend.py "$RID" 2>/dev/null)"
   echo "    [$LABEL] run=$RID -> $V" | tee -a "${RES}"
   SCORE="$(printf '%s' "$V" | grep -oE 'score=[+-][0-9.]+' | sed 's/score=//')"
-  [ -n "$SCORE" ] && printf '%s\t%s\tgen_lr=%s cadence=%s:1 clip=%s run=%s -> %s\n' "$SCORE" "$LABEL" "$GLR" "$RATIO" "$GCLIP" "$RID" "$V" >> "${RANK}"
+  [ -n "$SCORE" ] && printf '%s\t%s\tgen_lr=%s critic_lr=%s cadence=%s:1 clip=%s run=%s -> %s\n' "$SCORE" "$LABEL" "$GLR" "$CLR" "$RATIO" "$GCLIP" "$RID" "$V" >> "${RANK}"
 done
 
 echo "===== sweep DONE $(date) — score 내림차순 랭킹 =====" | tee -a "${RES}"
