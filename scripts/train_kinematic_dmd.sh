@@ -45,11 +45,15 @@ FAKE_WARMUP="${FAKE_WARMUP:-200}"                        # fake-only warmup step
 N_ANCHORS="${N_ANCHORS:-4}"                             # GT-grounded time-anchor 수
 ANCHOR_STRIDE="${ANCHOR_STRIDE:-4}"                     # 4 coarse step = 2초 간격
 DMD_BETA="${DMD_BETA:-1.0}"                            # 1=vanilla, <1=diversity↑
-SAMPLE_STEPS="${SAMPLE_STEPS:-16}"                      # closed-loop ODE step
+SAMPLE_STEPS="${SAMPLE_STEPS:-16}"                      # 학습 closed-loop ODE step (기본 16)
+# full backprop: random_terminal_step 비활성 → rollout 이 16 ODE step 전체에 gradient
+# (true=full BPTT, false=마지막 ODE step 만 grad).  validation ODE 는 별도(=16) 유지.
+FULL_BACKPROP="${FULL_BACKPROP:-true}"
 N_ROLLOUTS="${N_ROLLOUTS:-1}"                          # G (variance reduction)
+if [ "${FULL_BACKPROP}" = "true" ]; then RT_ENABLED=false; else RT_ENABLED=true; fi
 
 # ── trainer / data (val 세팅은 pareto 정합; flow_dmd.yaml 기본) ──────────────
-TRAIN_B="${TRAIN_B:-16}"
+TRAIN_B="${TRAIN_B:-32}"
 VAL_B="${VAL_B:-16}"
 VAL_CHECK_INTERVAL="${VAL_CHECK_INTERVAL:-400}"
 MAX_EPOCHS="${MAX_EPOCHS:-16}"
@@ -79,7 +83,7 @@ fi
 echo "[kinematic-dmd] EXPERIMENT=${EXPERIMENT} ACTION=${ACTION}"
 echo "  GPU=${CUDA_VISIBLE_DEVICES} (devices=${N_DEVICES}, strategy=${STRATEGY})"
 echo "  GEN_LR=${GEN_LR} FAKE_LR=${FAKE_LR} scope=${UNFROZEN_RANGE} cadence(fake:gen)=${ESTIMATOR_UPDATES}:1 warmup=${FAKE_WARMUP}"
-echo "  anchor: n=${N_ANCHORS} stride=${ANCHOR_STRIDE}(2s) | dmd_beta=${DMD_BETA} sample_steps=${SAMPLE_STEPS} G=${N_ROLLOUTS}"
+echo "  anchor: n=${N_ANCHORS} stride=${ANCHOR_STRIDE}(2s) | dmd_beta=${DMD_BETA} train_ODE=${SAMPLE_STEPS}(full_backprop=${FULL_BACKPROP}, val_ODE=16) G=${N_ROLLOUTS}"
 echo "  TRAIN_B=${TRAIN_B} VAL_B=${VAL_B} val_check=${VAL_CHECK_INTERVAL} n_rollout_closed_val=${N_ROLLOUT_CLOSED_VAL}"
 echo "  wandb=${WANDB_ENTITY}/${WANDB_PROJECT}  ckpt=${CKPT_PATH}"
 echo "  STDOUT_LOG=$(pwd)/${LOG}"
@@ -111,6 +115,7 @@ torchrun --nproc_per_node="${N_DEVICES}" --master_port="${PORT}" -m src.run \
   model.model_config.self_forced.dmd_beta="${DMD_BETA}" \
   model.model_config.self_forced.n_rollouts="${N_ROLLOUTS}" \
   model.model_config.self_forced.sampling.sample_steps="${SAMPLE_STEPS}" \
+  model.model_config.self_forced.sampling.random_terminal_step.enabled="${RT_ENABLED}" \
   ${EXTRA_ARGS} \
   2>&1 | tee "${LOG}"
 
