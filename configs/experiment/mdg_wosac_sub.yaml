@@ -27,7 +27,7 @@ model:
     n_rollout_closed_val: 32
     rollout_chunk_size: 1
     replanning_interval: 10
-    closed_loop_denoising_steps: 5
+    closed_loop_denoising_steps: 1
     closed_loop_reuse_actions: true
     n_batch_sim_agents_metric: 0
     n_vis_batch: 0

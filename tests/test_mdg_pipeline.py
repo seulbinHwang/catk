@@ -506,7 +506,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert model_cfg.backbone.predictor_modes == 6
     assert model_cfg.n_rollout_closed_val == 32
     assert model_cfg.replanning_interval == 10
-    assert model_cfg.closed_loop_denoising_steps == 5
+    assert model_cfg.closed_loop_denoising_steps == 1
     assert model_cfg.closed_loop_denoising_schedule == "temporal"
     assert model_cfg.closed_loop_reuse_actions is True
     assert list(model_cfg.closed_loop_reuse_alpha) == [0.70, 0.60, 0.50, 0.01]
@@ -515,7 +515,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert model_cfg.sim_agents_submission.num_model_parameters == "12.99M"
     assert submission_cfg.model.model_config.n_rollout_closed_val == 32
     assert submission_cfg.model.model_config.replanning_interval == 10
-    assert submission_cfg.model.model_config.closed_loop_denoising_steps == 5
+    assert submission_cfg.model.model_config.closed_loop_denoising_steps == 1
     assert submission_cfg.model.model_config.closed_loop_reuse_actions is True
     assert submission_cfg.model.model_config.val_closed_loop is True
     assert submission_cfg.model.model_config.sim_agents_submission.is_active is True
