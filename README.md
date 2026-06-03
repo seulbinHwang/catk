@@ -1099,6 +1099,19 @@ RMM 기준으로 antithetic pair가 더 높았으므로 repository 기본값은 
 
 이 sweep에서는 RMM 기준 `validation_closed_seed=4` 가 가장 높았으므로 repository 기본값은 `model.model_config.validation_closed_seed=4` 로 둡니다. 이 변경은 checkpoint, model parameter, solver, denoising step, noise scale을 바꾸지 않고 closed-loop initial noise의 deterministic seed만 고정합니다.
 
+같은 checkpoint와 Fast-RMM 조건에서 `validation_closed_seed=4`, `antithetic_pairs=true`, `sample_steps=16`, `use_lqr=false`, `use_stop_motion=false` 를 고정하고 `noise_scale` 근방을 더 촘촘히 비교한 결과는 아래와 같습니다.
+
+| noise_scale | RMM | WOSAC-CPD | CES |
+|---:|---:|---:|---:|
+| 0.995 | 0.782161 | 0.198992 | 0.095206 |
+| 0.9975 | 0.782207 | 0.199774 | 0.095229 |
+| 1.0 | 0.782208 | 0.200665 | 0.095238 |
+| 1.0033 | 0.782214 | 0.201869 | 0.095355 |
+| 1.0066 | 0.782251 | 0.203052 | 0.095401 |
+| 1.01 | 0.782377 | 0.204144 | 0.095362 |
+
+이 fine sweep에서도 RMM 기준 `noise_scale=1.01` 이 가장 높았으므로 repository 기본값은 그대로 `model.model_config.validation_rollout_sampling.noise_scale=1.01` 입니다.
+
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 61 Waymo validation 제출
 
 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 61 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.
