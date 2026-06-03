@@ -12,6 +12,7 @@ pods.
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import os
 import shlex
 import subprocess
@@ -27,15 +28,12 @@ DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
 DEFAULT_ARTIFACT = "jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57"
 DEFAULT_EPOCH = 61
-DEFAULT_TASK_NAME = (
-    "flow_agents_7m_waymo_val_epoch061_x5f9g0ce_h100x6_hsb1_"
-    "sample16_euler_antithetic_noise1016"
-)
-DEFAULT_DESCRIPTION = (
+DEFAULT_NOISE_SCALE = "1.0"
+DEFAULT_ANTITHETIC_PAIRS = "true"
+DESCRIPTION_PREFIX = (
     "flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_"
-    "tailprefix_roundtrip05_lr6e-4_bs20_epoch061_true_1.016"
+    "tailprefix_roundtrip05_lr6e-4_bs20_epoch061"
 )
-DEFAULT_SESSION = "catk-flow-waymo-val-submission-epoch061-h100x6-hsb1"
 DEFAULT_VAL_BATCH_SIZE = 48
 DEFAULT_SMOKE_VAL_BATCH_SIZE = 8
 
@@ -48,6 +46,25 @@ def strip_template_indent(text: str) -> str:
     """Remove indentation introduced by nested Python string templates."""
 
     return textwrap.dedent(text).strip("\n") + "\n"
+
+
+def validate_noise_scale(value: str) -> str:
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(f"invalid noise scale: {value}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("noise scale must be positive")
+    return value
+
+
+def noise_tag(value: str) -> str:
+    parsed = Decimal(value)
+    return f"{int((parsed * Decimal(1000)).to_integral_value()):04d}"
+
+
+def pair_label(value: str) -> str:
+    return "antithetic" if value == "true" else "iid"
 
 
 def run_kubectl(args: list[str], *, capture: bool = False, dry_run: bool = False) -> str:
@@ -107,8 +124,8 @@ def render_remote_script(args: argparse.Namespace) -> str:
         "model.model_config.validation_closed_seed=4",
         "model.model_config.validation_rollout_sampling.sample_steps=16",
         "model.model_config.validation_rollout_sampling.sample_method=euler",
-        "model.model_config.validation_rollout_sampling.noise_scale=1.016",
-        "model.model_config.validation_rollout_sampling.antithetic_pairs=true",
+        f"model.model_config.validation_rollout_sampling.noise_scale={args.noise_scale}",
+        f"model.model_config.validation_rollout_sampling.antithetic_pairs={args.antithetic_pairs}",
         "model.model_config.decoder.flow_solver_method=euler",
         "model.model_config.decoder.use_lqr=false",
         "model.model_config.decoder.use_stop_motion=false",
@@ -116,7 +133,7 @@ def render_remote_script(args: argparse.Namespace) -> str:
         'model.model_config.sim_agents_submission.method_name="Flow Agents 7M"',
         'model.model_config.sim_agents_submission.authors=["SB H","KO O"]',
         "model.model_config.sim_agents_submission.affiliation=NLK",
-        f'model.model_config.sim_agents_submission.description="{DEFAULT_DESCRIPTION}"',
+        f'model.model_config.sim_agents_submission.description="{args.description}"',
         'model.model_config.sim_agents_submission.method_link="not available yet"',
         "model.model_config.sim_agents_submission.account_name=h.sb@naverlabs.com",
         f"waymo_submission.enabled={waymo_enabled}",
@@ -167,7 +184,7 @@ def render_remote_script(args: argparse.Namespace) -> str:
         "--expected-method-name \"Flow Agents 7M\" "
         "--expected-authors \"SB H,KO O\" "
         "--expected-affiliation NLK "
-        f"--expected-description {shq(DEFAULT_DESCRIPTION)} "
+        f"--expected-description {shq(args.description)} "
         "--expected-method-link \"not available yet\" "
         "--expected-account-name h.sb@naverlabs.com "
         "--expected-num-model-parameters 7M "
@@ -372,13 +389,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--artifact", default=DEFAULT_ARTIFACT)
     parser.add_argument("--epoch", type=int, default=DEFAULT_EPOCH)
-    parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
+    parser.add_argument("--task-name", default="")
+    parser.add_argument("--noise-scale", type=validate_noise_scale, default=DEFAULT_NOISE_SCALE)
+    parser.add_argument(
+        "--antithetic-pairs",
+        choices=["true", "false"],
+        default=DEFAULT_ANTITHETIC_PAIRS,
+    )
+    parser.add_argument("--description", default="")
     parser.add_argument(
         "--run-id",
         default=os.environ.get("CATK_RUN_ID", ""),
         help="Fixed Hydra run id. Defaults to a timestamp if omitted.",
     )
-    parser.add_argument("--session", default=DEFAULT_SESSION)
+    parser.add_argument("--session", default="")
     parser.add_argument("--val-batch-size", type=int, default=DEFAULT_VAL_BATCH_SIZE)
     parser.add_argument(
         "--smoke-val-batch-size",
@@ -412,6 +436,20 @@ def parse_args() -> argparse.Namespace:
 
         suffix = "smoke" if args.smoke_test else "full"
         args.run_id = dt.datetime.now().strftime(f"%Y%m%d_%H%M%S_{suffix}")
+    if not args.task_name:
+        args.task_name = (
+            "flow_agents_7m_waymo_val_epoch061_x5f9g0ce_h100x6_hsb1_"
+            f"sample16_euler_{pair_label(args.antithetic_pairs)}_noise{noise_tag(args.noise_scale)}"
+        )
+    if not args.description:
+        args.description = (
+            f"{DESCRIPTION_PREFIX}_{args.antithetic_pairs}_{args.noise_scale}"
+        )
+    if not args.session:
+        args.session = (
+            "catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-"
+            f"{pair_label(args.antithetic_pairs)}-noise{noise_tag(args.noise_scale)}"
+        )
     if not args.wandb_group:
         args.wandb_group = f"{args.task_name}_submission_export"
     if args.submit_validation and args.smoke_test:
