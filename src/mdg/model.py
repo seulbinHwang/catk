@@ -58,8 +58,6 @@ class MDG(LightningModule):
         self.lr_decay_factor = float(model_config.lr_decay_factor)
         self.denoising_loss_weight = float(model_config.denoising_loss_weight)
         self.aux_loss_weight = float(model_config.aux_loss_weight)
-        self.action_loss_weight = float(model_config.action_loss_weight)
-        self.full_state_loss_weight = float(getattr(model_config, "full_state_loss_weight", 0.0))
         self.kinematic_chunk_filter = bool(getattr(model_config, "kinematic_chunk_filter", True))
         self.kinematic_max_step_displacement_m = float(
             getattr(model_config, "kinematic_max_step_displacement_m", 5.0)
@@ -67,14 +65,14 @@ class MDG(LightningModule):
         self.n_rollout_closed_val = int(model_config.n_rollout_closed_val)
         self.rollout_chunk_size = int(model_config.rollout_chunk_size)
         self.replanning_interval = int(model_config.replanning_interval)
-        self.closed_loop_denoising_steps = int(getattr(model_config, "closed_loop_denoising_steps", 1))
+        self.closed_loop_denoising_steps = int(getattr(model_config, "closed_loop_denoising_steps", 5))
         self.closed_loop_denoising_schedule = str(
             getattr(model_config, "closed_loop_denoising_schedule", "temporal")
         ).lower()
-        self.closed_loop_reuse_actions = bool(getattr(model_config, "closed_loop_reuse_actions", True))
+        self.closed_loop_reuse_actions = bool(getattr(model_config, "closed_loop_reuse_actions", False))
         self.closed_loop_reuse_alpha = tuple(
             float(value)
-            for value in getattr(model_config, "closed_loop_reuse_alpha", (0.95, 0.90, 0.80, 0.01))
+            for value in getattr(model_config, "closed_loop_reuse_alpha", (0.70, 0.60, 0.50, 0.01))
         )
         self.validation_closed_seed = int(model_config.validation_closed_seed)
         self.val_closed_loop = bool(model_config.val_closed_loop)
@@ -131,12 +129,6 @@ class MDG(LightningModule):
                 f"got {self.closed_loop_denoising_schedule!r}."
             )
         if self.closed_loop_reuse_actions:
-            if self.closed_loop_denoising_steps != 1:
-                raise ValueError(
-                    "model_config.closed_loop_denoising_steps must be 1 when "
-                    "model_config.closed_loop_reuse_actions=true. Disable action reuse "
-                    "to run temporal/global multi-step denoising ablations."
-                )
             if len(self.closed_loop_reuse_alpha) != 4:
                 raise ValueError(
                     "model_config.closed_loop_reuse_alpha must contain four alpha values "
@@ -332,14 +324,16 @@ class MDG(LightningModule):
         return out
 
     def _alpha_schedule(self, device: torch.device, dtype: torch.dtype) -> Tensor:
-        return torch.linspace(0.99, 0.01, self.num_noise_levels, device=device, dtype=dtype)
+        noisy = torch.linspace(0.99, 0.01, self.num_noise_levels, device=device, dtype=dtype)
+        clean = torch.ones(1, device=device, dtype=dtype)
+        return torch.cat((clean, noisy), dim=0)
 
     def _alpha_from_mask_level(self, mask_level: Tensor, dtype: torch.dtype) -> Tensor:
         alpha_schedule = self._alpha_schedule(mask_level.device, dtype)
         if not torch.is_floating_point(mask_level):
             return alpha_schedule[mask_level]
 
-        max_index = self.num_noise_levels - 1
+        max_index = self.num_noise_levels
         level = mask_level.to(dtype=dtype).clamp(0.0, float(max_index))
         lower = torch.floor(level).long()
         upper = torch.ceil(level).long()
@@ -350,12 +344,15 @@ class MDG(LightningModule):
 
     def _mask_level_from_alpha(self, alpha: Tensor) -> Tensor:
         alpha_schedule = self._alpha_schedule(alpha.device, alpha.dtype)
-        alpha_max = alpha_schedule[0]
-        alpha_min = alpha_schedule[-1]
-        max_level = float(self.num_noise_levels - 1)
-        denom = (alpha_max - alpha_min).clamp_min(torch.finfo(alpha.dtype).eps)
-        level = (alpha_max - torch.clamp(alpha, min=alpha_min, max=alpha_max)) / denom * max_level
-        return level.clamp(0.0, max_level)
+        alpha_clean = alpha_schedule[0]
+        alpha_weak = alpha_schedule[1]
+        alpha_full = alpha_schedule[-1]
+        alpha = torch.clamp(alpha, min=alpha_full, max=alpha_clean)
+        clean_span = (alpha_clean - alpha_weak).clamp_min(torch.finfo(alpha.dtype).eps)
+        noisy_span = (alpha_weak - alpha_full).clamp_min(torch.finfo(alpha.dtype).eps)
+        clean_level = (alpha_clean - alpha) / clean_span
+        noisy_level = 1.0 + (alpha_weak - alpha) / noisy_span * float(self.num_noise_levels - 1)
+        return torch.where(alpha >= alpha_weak, clean_level, noisy_level).clamp(0.0, float(self.num_noise_levels))
 
     def _distributed_world_rank(self) -> tuple[int, int]:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -391,9 +388,9 @@ class MDG(LightningModule):
         bsz, num_agents = valid.shape
         action_steps = self.backbone.action_steps
         device = valid.device
-        max_level = self.num_noise_levels - 1
+        max_level = float(self.num_noise_levels)
         deltas = self._masking_deltas(bsz, device=device, batch_idx=batch_idx)
-        mask = torch.zeros((bsz, num_agents, action_steps), dtype=torch.long, device=device)
+        mask = torch.ones((bsz, num_agents, action_steps), dtype=torch.float32, device=device)
         for batch_index in range(bsz):
             delta = float(deltas[batch_index].item())
             if torch.rand((), device=device) < 0.5:
@@ -402,11 +399,11 @@ class MDG(LightningModule):
                     mask[batch_index, :, action_steps - full_count :] = max_level
                 remaining = action_steps - full_count
                 if remaining > 0:
-                    progressive_max = torch.linspace(0, max_level - 1, remaining, device=device).round().long()
-                    random_levels = torch.floor(
-                        torch.rand((num_agents, remaining), device=device)
-                        * (progressive_max.view(1, remaining) + 1).clamp_min(1)
-                    ).long()
+                    denom = float(max(remaining - 1, 1))
+                    progressive_max = 1.0 + 3.0 * torch.arange(remaining, device=device, dtype=torch.float32) / denom
+                    random_levels = 1.0 + torch.rand((num_agents, remaining), device=device) * (
+                        progressive_max.view(1, remaining) - 1.0
+                    )
                     random_levels = torch.cummax(random_levels, dim=1).values
                     mask[batch_index, :, :remaining] = random_levels
             else:
@@ -418,10 +415,10 @@ class MDG(LightningModule):
                     rest = perm[num_full:]
                 else:
                     rest = valid_indices
-                if rest.numel() > 0 and max_level > 0:
-                    low_levels = torch.randint(0, max_level, (int(rest.numel()),), device=device)
+                if rest.numel() > 0:
+                    low_levels = 1.0 + torch.rand((int(rest.numel()),), device=device) * 3.0
                     mask[batch_index, rest, :] = low_levels.view(-1, 1)
-            mask[batch_index, ~valid[batch_index], :] = 0
+            mask[batch_index, ~valid[batch_index], :] = 1.0
         return mask
 
     def _apply_noise(
@@ -440,19 +437,19 @@ class MDG(LightningModule):
         return torch.sqrt(alpha) * clean_action + torch.sqrt(1.0 - alpha) * noise
 
     def _closed_loop_mask_schedule(self, device: torch.device, action_steps: int | None = None) -> Tensor:
-        max_level = float(self.num_noise_levels - 1)
+        max_level = float(self.num_noise_levels)
         if self.closed_loop_denoising_schedule == "global":
             if self.closed_loop_denoising_steps == 1:
                 return torch.tensor([max_level], dtype=torch.float32, device=device)
             schedule = torch.linspace(
                 max_level,
-                0.0,
+                1.0,
                 self.closed_loop_denoising_steps,
                 device=device,
                 dtype=torch.float32,
             )
             schedule[0] = max_level
-            schedule[-1] = 0.0
+            schedule[-1] = 1.0
             return schedule
 
         if action_steps is None:
@@ -462,14 +459,14 @@ class MDG(LightningModule):
 
         schedule = torch.linspace(
             max_level,
-            0.0,
+            1.0,
             self.closed_loop_denoising_steps,
             device=device,
             dtype=torch.float32,
         )
         schedule[0] = max_level
         time_band = torch.div(
-            torch.arange(int(action_steps), device=device) * int(max_level),
+            torch.arange(int(action_steps), device=device) * int(self.num_noise_levels - 1),
             int(action_steps),
             rounding_mode="floor",
         ).to(dtype=torch.float32)
@@ -527,35 +524,6 @@ class MDG(LightningModule):
             batch["agent_valid"].unsqueeze(-1)
             & batch["agent_valid_mask"][:, :, self.num_historical_steps : self.num_historical_steps + self.num_future_steps]
         )
-
-    def _trajectory_state_loss(
-        self,
-        pred_pos: Tensor,
-        pred_heading: Tensor,
-        pred_speed: Tensor,
-        batch: Dict[str, Tensor],
-    ) -> Tensor:
-        future_valid = self._future_valid(batch)
-        target_pos = batch["agent_position"][:, :, self.num_historical_steps :, :2]
-        target_heading = batch["agent_heading"][:, :, self.num_historical_steps :]
-        target_speed = torch.linalg.norm(
-            batch["agent_velocity"][:, :, self.num_historical_steps :, :2],
-            dim=-1,
-        )
-        valid_pos = future_valid.unsqueeze(-1)
-        pred_pos = torch.where(valid_pos, pred_pos, torch.zeros_like(pred_pos))
-        target_pos = torch.where(valid_pos, target_pos, torch.zeros_like(target_pos))
-        pred_heading = torch.where(future_valid, pred_heading, torch.zeros_like(pred_heading))
-        target_heading = torch.where(future_valid, target_heading, torch.zeros_like(target_heading))
-        pred_speed = torch.where(future_valid, pred_speed, torch.zeros_like(pred_speed))
-        target_speed = torch.where(future_valid, target_speed, torch.zeros_like(target_speed))
-        pos_loss = F.mse_loss(pred_pos, target_pos, reduction="none").sum(dim=-1)
-        pred_heading_vec = torch.stack((torch.cos(pred_heading), torch.sin(pred_heading)), dim=-1)
-        target_heading_vec = torch.stack((torch.cos(target_heading), torch.sin(target_heading)), dim=-1)
-        heading_loss = F.mse_loss(pred_heading_vec, target_heading_vec, reduction="none").sum(dim=-1)
-        speed_loss = F.mse_loss(pred_speed, target_speed, reduction="none")
-        loss = pos_loss + heading_loss + speed_loss
-        return (loss * future_valid.to(dtype=loss.dtype)).sum() / future_valid.sum().clamp_min(1).to(dtype=loss.dtype)
 
     def _chunk_valid(self, batch: Dict[str, Tensor]) -> Tensor:
         future_valid = self._future_valid(batch)
@@ -647,7 +615,7 @@ class MDG(LightningModule):
         clean_chunk_state = torch.where(valid_action, clean_chunk_state, torch.zeros_like(clean_chunk_state))
         mask_level = self._sample_mask_levels(batch, batch_idx=batch_idx)
         noised_action = self._apply_noise(clean_action, mask_level)
-        pred_action, pred_pos, pred_heading, pred_speed, pred_chunk_state, scene, aux = self.backbone.denoise_actions(
+        _, _, _, _, pred_chunk_state, scene, aux = self.backbone.denoise_actions(
             batch,
             noised_action,
             mask_level,
@@ -656,30 +624,14 @@ class MDG(LightningModule):
         if aux is None:
             raise RuntimeError("Auxiliary predictor output is required during training.")
         state_loss = self._chunk_state_loss(pred_chunk_state, clean_chunk_state, batch, chunk_valid=chunk_valid)
-        if self.action_loss_weight > 0.0:
-            valid_action = chunk_valid.unsqueeze(-1)
-            pred_action = torch.where(valid_action, pred_action, torch.zeros_like(pred_action))
-            clean_action = torch.where(valid_action, clean_action, torch.zeros_like(clean_action))
-            action_loss = F.smooth_l1_loss(pred_action, clean_action, reduction="none").sum(dim=-1)
-            action_loss = (action_loss * chunk_valid.to(dtype=action_loss.dtype)).sum() / chunk_valid.sum().clamp_min(1).to(dtype=action_loss.dtype)
-        else:
-            action_loss = state_loss.new_zeros(())
-        if self.full_state_loss_weight > 0.0:
-            full_state_loss = self._trajectory_state_loss(pred_pos, pred_heading, pred_speed, batch)
-        else:
-            full_state_loss = state_loss.new_zeros(())
         aux_loss = self._auxiliary_loss(aux, batch)
         total = (
             self.denoising_loss_weight * state_loss
-            + self.action_loss_weight * action_loss
-            + self.full_state_loss_weight * full_state_loss
             + self.aux_loss_weight * aux_loss
         )
         return {
             "loss": total,
             "state_loss": state_loss.detach(),
-            "action_loss": action_loss.detach(),
-            "full_state_loss": full_state_loss.detach(),
             "aux_loss": aux_loss.detach(),
             "valid_chunk_ratio": chunk_valid.to(dtype=state_loss.dtype).mean().detach(),
             "kinematic_invalid_chunk_ratio": (
@@ -692,8 +644,6 @@ class MDG(LightningModule):
         out = self._training_forward(batch, batch_idx=batch_idx)
         self.log("train/loss", out["loss"], on_step=True, prog_bar=True, batch_size=1)
         self.log("train/state_loss", out["state_loss"], on_step=True, batch_size=1)
-        self.log("train/action_loss", out["action_loss"], on_step=True, batch_size=1)
-        self.log("train/full_state_loss", out["full_state_loss"], on_step=True, batch_size=1)
         self.log("train/aux_loss", out["aux_loss"], on_step=True, batch_size=1)
         self.log("train/valid_chunk_ratio", out["valid_chunk_ratio"], on_step=True, batch_size=1)
         self.log(

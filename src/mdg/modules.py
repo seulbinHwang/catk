@@ -813,7 +813,13 @@ class MDGDenoiser(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.mask_emb = nn.Embedding(num_noise_levels, hidden_dim)
+        self.num_noise_levels = int(num_noise_levels)
+        self.mask_mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.time_emb = nn.Embedding(action_steps, hidden_dim)
         self.blocks = nn.ModuleList(
             [
@@ -835,17 +841,9 @@ class MDGDenoiser(nn.Module):
         )
 
     def _mask_embedding(self, mask_level: Tensor) -> Tensor:
-        if not torch.is_floating_point(mask_level):
-            return self.mask_emb(mask_level)
-
-        max_index = self.mask_emb.num_embeddings - 1
-        level = mask_level.clamp(0.0, float(max_index))
-        lower = torch.floor(level).long()
-        upper = torch.ceil(level).long()
-        weight = (level - lower.to(dtype=level.dtype)).unsqueeze(-1)
-        lower_emb = self.mask_emb(lower)
-        upper_emb = self.mask_emb(upper)
-        return torch.lerp(lower_emb, upper_emb, weight.to(dtype=lower_emb.dtype))
+        level = mask_level.to(dtype=torch.float32).clamp(0.0, float(self.num_noise_levels))
+        ratio = (level / float(self.num_noise_levels)).unsqueeze(-1)
+        return self.mask_mlp(ratio)
 
     def forward(
         self,
@@ -862,7 +860,7 @@ class MDGDenoiser(nn.Module):
             query_valid = future_valid & scene.agent_valid[:, :, None]
         valid_f = query_valid.to(dtype=noised_state.dtype)
         x = self.state_mlp(noised_state)
-        x = x + self._mask_embedding(mask_level)
+        x = x + self._mask_embedding(mask_level).to(dtype=x.dtype)
         x = x + self.time_emb(time_idx).view(1, 1, action_steps, -1)
         x = x * valid_f.unsqueeze(-1)
         for block in self.blocks:
@@ -1033,5 +1031,10 @@ class MDGBackbone(nn.Module):
             dtype=batch["agent_position"].dtype,
             generator=generator,
         )
-        mask = torch.full(shape[:-1], self.num_noise_levels - 1, dtype=torch.long, device=noise.device)
+        mask = torch.full(
+            shape[:-1],
+            float(self.num_noise_levels),
+            dtype=noise.dtype,
+            device=noise.device,
+        )
         return noise, mask

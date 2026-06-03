@@ -6,17 +6,15 @@ model_config:
   lr_decay_step: 1045
   lr_decay_factor: 0.98
   denoising_loss_weight: 1.0
-  action_loss_weight: 0.0
-  full_state_loss_weight: 0.0
   aux_loss_weight: 5.0
   kinematic_chunk_filter: true
   kinematic_max_step_displacement_m: 5.0
   n_rollout_closed_val: 32
   rollout_chunk_size: 1
   replanning_interval: 10
-  closed_loop_denoising_steps: 1
+  closed_loop_denoising_steps: 5
   closed_loop_denoising_schedule: temporal
-  closed_loop_reuse_actions: true
+  closed_loop_reuse_actions: false
   closed_loop_reuse_alpha: [0.70, 0.60, 0.50, 0.01]
   validation_closed_seed: 0
   val_closed_loop: true
@@ -56,4 +54,4 @@ model_config:
     description: YOUR_DESCRIPTION
     method_link: YOUR_METHOD_LINK
     account_name: YOUR_ACCOUNT_NAME
-    num_model_parameters: "12.99M"
+    num_model_parameters: "13.05M"

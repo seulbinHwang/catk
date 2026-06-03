@@ -27,8 +27,8 @@ model:
     n_batch_sim_agents_metric: 10
     scorer_scene_num: 1680
     rollout_chunk_size: 1
-    closed_loop_denoising_steps: 1
-    closed_loop_reuse_actions: true
+    closed_loop_denoising_steps: 5
+    closed_loop_reuse_actions: false
     val_closed_loop: true
 
 callbacks:

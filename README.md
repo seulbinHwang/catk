@@ -9,8 +9,8 @@
 - 입력: WOMD agent history 1초(11 step), map polyline, traffic light.
 - 출력: WOSAC eval/submission에서 요구되는 current-valid sim agents 전체의 8초 미래 궤적 32개.
 - 학습 target: future trajectory를 acceleration / yaw-rate action으로 바꾼 continuous action tensor.
-- denoising: agent-time별 Gaussian mask, `K=5`, alpha schedule `0.99 -> 0.01`.
-- inference: full Gaussian noise에서 시작하며, validation/test/submission 기본값은 논문 WOSAC reported setting과 같은 1-step denoising이다.
+- denoising: agent-time별 Gaussian mask, clean sentinel `m=0`, noisy mask `m in [1,5]`, alpha anchors `alpha(0)=1.0`, `alpha(1..5)=0.99 -> 0.01`.
+- inference: full Gaussian noise에서 시작하며, validation/test/submission 기본값은 논문 Figure S2 형식의 5-step temporal-axis denoising과 `closed_loop_reuse_actions=false`다.
 - closed-loop: Waymax 없이 repo 내부 rollout으로 1Hz replanning을 수행한다. 매 1초 구간만 history에 반영하고 다시 MDG를 호출해 80 step을 채운다.
 - 평가/제출: 기존 Fast WOSAC metric, RMM, WOSAC submission archive 생성 코드를 재사용한다.
 
@@ -37,7 +37,7 @@
 | auxiliary modes | 6 |
 | relation Fourier bands | 4 |
 | auxiliary loss weight | 5 |
-| model parameters | 12.99M |
+| model parameters | 13.05M |
 | train anchors | `10,20,...,80` |
 | optimizer | AdamW |
 | learning rate | 0.00049497 |
@@ -58,7 +58,7 @@ Auxiliary predictor는 agent scene context에서 `[B,N,6,80,3]` trajectory modes
 
 training cache에는 드물게 valid로 표시됐지만 0.1초 사이 수십 m 이상 왕복하는 물리적으로 불가능한 future outlier가 있다. 이런 outlier는 auxiliary predictor보다 denoiser `state_loss` MSE에 크게 작용해 loss spike를 만들기 때문에, 기본 학습에서는 `kinematic_chunk_filter=true`, `kinematic_max_step_displacement_m=5.0`을 사용한다. 각 action chunk의 두 0.1초 transition 중 valid한 인접 step 이동량이 `5m`를 넘으면 해당 chunk를 invalid로 취급하고, `state_loss`, denoiser input/attention mask에서 제외한다. 이 기준은 논문에 수치로 명시된 hyperparameter가 아니라, invalid timestep을 학습에서 제외한다는 원칙을 WOMD cache의 물리적으로 불가능한 target에 적용한 학습 안정화 설정이다. testas에서 30,000개 training scenario, 240,000개 rolling-anchor view, 143,287,416개 raw chunk를 측정했을 때 `5m`는 chunk `0.00002323`만 제외했다. 84-scene Fast RMM proxy에서는 같은 checkpoint에서 64 train-step fine-tune 후 `4m=0.705497`, `5m=0.705741`, `6m=0.699130`, `10m=0.699138`로 `5m`가 가장 높았다. outlier-target forward proxy에서도 `5m`가 후보 중 state-loss mean/p95를 가장 낮췄다. 학습 로그에는 `train/valid_chunk_ratio`, `train/kinematic_invalid_chunk_ratio`가 기록된다.
 
-기본 모델 파라미터 수는 `12,986,176`개다. 모듈별로는 scene encoder `7,370,142`, denoiser `5,179,650`, auxiliary predictor `436,384`개다. encoder/denoiser/mixer depth와 attention head 수는 유지하고, `D=256`, `FFN=1024`로 폭을 키운 설정이다. 직전 `D=192`, `FFN=704` 설정의 `7,111,168`개 대비 `5,875,008`개 증가했다.
+기본 모델 파라미터 수는 `13,051,712`개다. 모듈별로는 scene encoder `7,370,142`, denoiser `5,245,186`, auxiliary predictor `436,384`개다. denoiser mask conditioning을 discrete embedding이 아니라 continuous scalar MLP로 바꾸면서 직전 `12,986,176`개 대비 `65,536`개 증가했다. encoder/denoiser/mixer depth와 attention head 수는 유지하고, `D=256`, `FFN=1024`로 폭을 키운 설정이다.
 
 learning rate는 기존 effective batch `32`에서 쓰던 `0.0002`를 기준으로, testas A100 7장 기본 effective batch `28 * 7 = 196`에 맞춰 sqrt scaling을 적용했다. 계산식은 `0.0002 * sqrt(196 / 32) = 0.00049497`다. LR schedule은 논문 설정인 global batch `32`, `20 epochs`, warmup `1000 steps`, decay interval `2000 steps`를 기준으로 전체 학습 진행률을 보존하도록 조정했다. 우리 설정은 global batch가 `196`이고 epoch이 `20 -> 64`로 `3.2`배 길어졌으므로 step scale은 `(64 / 20) * (32 / 196) = 0.522448...`이다. 따라서 warmup은 `1000 * 0.522448 ~= 522 steps`, decay interval은 `2000 * 0.522448 ~= 1045 steps`로 둔다. decay factor `0.98`은 유지한다.
 
@@ -298,8 +298,8 @@ torchrun \
 ```
 
 논문 설정은 L40S 8장 기준이고 precision은 bf16이다. V100은 bf16을 지원하지 않으므로 기본 학습/제출 config는 `trainer.precision=16-mixed`로 둔다. L40S/A100/H100처럼 bf16을 지원하는 GPU에서는 `trainer.precision=bf16-mixed`로 바꿔도 된다.
-V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다. 학습은 논문 설정처럼 SDC 포함 nearest 64 agents를 쓰고, 기본적으로 `data.train_anchor_steps=[10,20,30,40,50,60,70,80]` 중 한 anchor를 sample마다 뽑아 history/future/map/signal view를 만든다. 출력 tensor shape은 기존과 동일하게 current를 index 10에 맞추며, future suffix가 없는 tail anchor는 해당 future chunk를 invalid 처리해 loss와 denoiser attention에서 제외한다. validation/test/submission은 Fast WOSAC이 요구하는 `sim_agent_ids`가 누락되지 않도록 cache의 current-valid agents를 모두 유지하고 batch 안에서 agent 축을 동적 padding한다. 모델 구조, `n_rollout_closed_val=32`, `closed_loop_denoising_steps=1`은 WOSAC 제출 검증 기본값으로 유지해야 한다.
-학습 중 validation은 closed-loop 32 rollout과 1-step denoising을 포함한다. `mdg_pretrain` 기본값은 `trainer.check_val_every_n_epoch=16`, `trainer.limit_val_batches=0.1`, `data.val_batch_size=12`이며, `model.model_config.scorer_scene_num=1680`이 켜져 있으면 GPU 수와 validation batch size에 맞춰 Fast WOSAC scorer batch 수를 자동으로 맞춘다. A100 7장, per-GPU validation batch 12에서는 per-rank `n_batch_sim_agents_metric=20`으로 보정되어 총 1,680개 scenario가 scorer에 들어간다. fit 중에는 checkpoint 점수 계산 시간을 제한하기 위해 validation loop cap도 이 scorer batch 수로 줄인다. 전체 validation/submission은 `mdg_wosac_sub` 또는 별도 validate/test 실행에서 수행한다.
+V100에서 메모리가 부족하면 `data.train_batch_size`만 먼저 낮춘다. 학습은 논문 설정처럼 SDC 포함 nearest 64 agents를 쓰고, 기본적으로 `data.train_anchor_steps=[10,20,30,40,50,60,70,80]` 중 한 anchor를 sample마다 뽑아 history/future/map/signal view를 만든다. 출력 tensor shape은 기존과 동일하게 current를 index 10에 맞추며, future suffix가 없는 tail anchor는 해당 future chunk를 invalid 처리해 loss와 denoiser attention에서 제외한다. validation/test/submission은 Fast WOSAC이 요구하는 `sim_agent_ids`가 누락되지 않도록 cache의 current-valid agents를 모두 유지하고 batch 안에서 agent 축을 동적 padding한다. 모델 구조, `n_rollout_closed_val=32`, `closed_loop_denoising_steps=5`, `closed_loop_reuse_actions=false`가 기본 검증값이다.
+학습 중 validation은 closed-loop 32 rollout과 5-step temporal-axis denoising을 포함한다. `mdg_pretrain` 기본값은 `trainer.check_val_every_n_epoch=16`, `trainer.limit_val_batches=0.1`, `data.val_batch_size=12`이며, `model.model_config.scorer_scene_num=1680`이 켜져 있으면 GPU 수와 validation batch size에 맞춰 Fast WOSAC scorer batch 수를 자동으로 맞춘다. A100 7장, per-GPU validation batch 12에서는 per-rank `n_batch_sim_agents_metric=20`으로 보정되어 총 1,680개 scenario가 scorer에 들어간다. fit 중에는 checkpoint 점수 계산 시간을 제한하기 위해 validation loop cap도 이 scorer batch 수로 줄인다. 전체 validation/submission은 `mdg_wosac_sub` 또는 별도 validate/test 실행에서 수행한다.
 
 ### testas A100 7장 pretrain
 
@@ -349,13 +349,13 @@ bash scripts/start_mdg_pretrain_testas_a100x7_with_oom_retry.sh
 
 이 wrapper는 testas pod를 새로 만들거나 재시작하지 않는다. 각 attempt마다 testas 내부 tmux session `mdg-pretrain-a100x7-oom-retry`를 교체하고, 로그에서 `OutOfMemoryError`, `CUDA out of memory`, `torch.OutOfMemoryError` 등을 감지하면 세션을 멈춘 뒤 `train_batch_size -= OOM_STEP`로 다시 시작한다. retry 로그는 로컬 repo의 `logs/_mdg_testas_a100x7_oom_retry/<TASK_NAME>/attempt_*.log`와 testas 내부 `${PROJECT_ROOT}/logs/testas_mdg_pretrain_a100x7_oom_retry/`에 남는다.
 
-MDG의 multi-step closed-loop denoising은 GT future를 쓰지 않고 full Gaussian noise에서 시작해, 논문 Figure S2의 temporal-axis schedule처럼 가까운 horizon부터 낮은 noise level로 내려간다. WOSAC 기본값은 논문 leaderboard reported setting과 같은 `closed_loop_denoising_steps=1`, `closed_loop_denoising_schedule=temporal`이다. action horizon 40 step을 4개 시간 band로 나누면 5-step override의 mask pattern은 `[4,4,4,4] -> [3,4,4,4] -> [2,3,4,4] -> [1,2,3,4] -> [0,1,2,3]`가 된다. `closed_loop_denoising_steps=16`이나 `32`처럼 5보다 큰 값도 실행 가능하며, 이때는 discrete mask embedding과 alpha schedule을 연속 level로 선형 보간한다. 단, 이 multi-step ablation은 반드시 `closed_loop_reuse_actions=false`에서만 실행한다. 각 intermediate step은 모델의 clean action estimate를 다음 temporal mask로 다시 noising한 뒤 다음 denoising call에 넣는다.
+MDG의 multi-step closed-loop denoising은 GT future를 쓰지 않고 full Gaussian noise에서 시작해, 논문 Figure S2의 temporal-axis schedule처럼 가까운 horizon부터 낮은 noise level로 내려간다. 기본값은 `closed_loop_denoising_steps=5`, `closed_loop_denoising_schedule=temporal`, `closed_loop_reuse_actions=false`다. action horizon 40 step을 4개 시간 band로 나누면 5-step mask pattern은 `[5,5,5,5] -> [4,5,5,5] -> [3,4,5,5] -> [2,3,4,5] -> [1,2,3,4]`가 된다. `m=0`은 clean sentinel이라 training/inference noising mask로 쓰지 않고, final output은 마지막 denoiser call의 clean action estimate다. `closed_loop_denoising_steps=16`이나 `32`처럼 5보다 큰 값도 실행 가능하며, continuous scalar mask MLP와 alpha anchor interpolation으로 fractional mask level을 처리한다. 각 intermediate step은 모델의 clean action estimate를 다음 temporal mask로 다시 noising한 뒤 다음 denoising call에 넣는다.
 
-closed-loop result reuse는 기본으로 켜져 있다. 첫 replanning segment는 논문 Algorithm 2처럼 full noise에서 시작하고, 이후 segment는 직전 denoised action `[B,N,40,2]`를 `replanning_interval/action_chunk=5` chunk만큼 shift해 앞쪽 35 chunk를 재사용한다. 뒤쪽 5 chunk는 새 tail로 두고, `closed_loop_reuse_alpha=[0.70,0.60,0.50,0.01]`를 mask level로 변환해 near/mid/far/tail 구간에 shifted action reuse와 full-noise tail을 차등 noising한다. 이 재사용은 rollout sample별로 독립적으로 적용되며 sample을 평균하지 않는다. `mdg_wosac_pretrain_testas_a100x7_from_scratch_20260602_193947_d4347e6_bs34`의 `epoch_last.ckpt`와 최신 strict cache로 testas A100 7장에서 비교했을 때, 168-scene Fast RMM은 1-step/reuse `0.70344`, 3-step/reuse `0.66821`, 5-step/reuse `0.65543`이었다. 따라서 WOSAC 기본은 `closed_loop_denoising_steps=1`, `closed_loop_reuse_actions=true`로 둔다. 코드도 이 조합을 강제하므로 `closed_loop_reuse_actions=true`에서 `closed_loop_denoising_steps>1`을 설정하면 fail-fast 한다. temporal multi-step ablation은 명시적으로 `model.model_config.closed_loop_reuse_actions=false`와 `model.model_config.closed_loop_denoising_steps=5` 이상을 함께 override해서 실행한다.
+closed-loop result reuse는 선택 옵션이며 기본값은 꺼져 있다. 켜면 첫 replanning segment는 논문 Algorithm 2처럼 full noise에서 시작하고, 이후 segment는 직전 denoised action `[B,N,40,2]`를 `replanning_interval/action_chunk=5` chunk만큼 shift해 앞쪽 35 chunk를 재사용한다. 뒤쪽 5 chunk는 새 tail로 두고, `closed_loop_reuse_alpha=[0.70,0.60,0.50,0.01]`를 continuous mask level로 변환해 near/mid/far/tail 구간에 shifted action reuse와 full-noise tail을 차등 noising한다. 이 재사용은 rollout sample별로 독립적으로 적용되며 sample을 평균하지 않는다. Reuse는 기본 5-step temporal denoising과 분리된 ablation 옵션이므로 필요한 경우 `model.model_config.closed_loop_reuse_actions=true`로 명시한다.
 
 MDG dynamics는 논문이 참조한 VBD-style differentiable dynamics에 맞춰 action을 `[acceleration, yaw_rate]`로 두고, 0.1초 단위로 physical state `(x, y, heading, speed)`로 복원한다. GT action inverse는 VBD 원본 구현과 같은 방향으로 logged future velocity의 크기 `||v_xy||`를 speed로 사용한다. 즉 `a_t=(v_t-v_{t-1})/dt`, `yaw_rate_t=wrap(heading_t-heading_{t-1})/dt`를 계산한 뒤 `action_chunk=2` 구간 평균으로 `[N,40,2]` action tensor를 만든다. heading 방향 displacement projection은 heading과 이동방향이 어긋난 보행자/자전거 target을 왜곡할 수 있어 사용하지 않는다.
 
-forward dynamics도 deterministic VBD-style로 고정한다. action을 `[B,N,40,2]`에서 `[B,N,80,2]`로 펼친 뒤 speed는 `v_t=max(0, v_{t-1}+a_t*dt)`로 0 이상을 유지하고, `v_t<=0.1m/s`에서는 yaw-rate를 0으로 막아 제자리 회전 누적을 줄인다. 그 다음 `heading_t=wrap(heading_{t-1}+yaw_rate_t*dt)`, `pos_t=pos_{t-1}+v_t[cos heading_t, sin heading_t]dt`로 복원한다. VBD PyTorch `roll_out`에 들어 있는 작은 random noise는 학습 target을 흔들 수 있으므로 넣지 않는다. 이 구현은 `cumsum` 기반 batch 병렬 연산이라 Python timestep loop를 쓰지 않고, 출력 shape은 그대로 `full_pos=[B,N,80,2]`, `full_heading=[B,N,80]`, `full_speed=[B,N,80]`, `chunk_state=[B,N,40,5]`이다. denoising `state_loss`는 논문의 reduced action/state 구조에 맞춰 `pred_chunk_state=[B,N,40,5]`와 clean action을 같은 dynamics에 통과시킨 `clean_chunk_state=[B,N,40,5]` 사이의 MSE를 기본으로 쓴다. raw 80-step state loss는 `full_state_loss_weight=0.0` 기본값의 보조 옵션으로만 남긴다. dynamics round-trip 검증은 다음처럼 실행한다.
+forward dynamics도 deterministic VBD-style로 고정한다. action을 `[B,N,40,2]`에서 `[B,N,80,2]`로 펼친 뒤 speed는 `v_t=max(0, v_{t-1}+a_t*dt)`로 0 이상을 유지하고, `v_t<=0.1m/s`에서는 yaw-rate를 0으로 막아 제자리 회전 누적을 줄인다. 그 다음 `heading_t=wrap(heading_{t-1}+yaw_rate_t*dt)`, `pos_t=pos_{t-1}+v_t[cos heading_t, sin heading_t]dt`로 복원한다. VBD PyTorch `roll_out`에 들어 있는 작은 random noise는 학습 target을 흔들 수 있으므로 넣지 않는다. 이 구현은 `cumsum` 기반 batch 병렬 연산이라 Python timestep loop를 쓰지 않고, 출력 shape은 그대로 `full_pos=[B,N,80,2]`, `full_heading=[B,N,80]`, `full_speed=[B,N,80]`, `chunk_state=[B,N,40,5]`이다. denoising `state_loss`는 논문의 reduced action/state 구조에 맞춰 `pred_chunk_state=[B,N,40,5]`와 clean action을 같은 dynamics에 통과시킨 `clean_chunk_state=[B,N,40,5]` 사이의 MSE만 쓴다. 전체 학습 loss는 구조적으로 `state_loss + 5.0 * aux_loss`이며 action loss와 raw 80-step full-state loss는 사용하지 않는다. dynamics round-trip 검증은 다음처럼 실행한다.
 
 ```bash
 python scripts/check_mdg_dynamics_roundtrip.py \
@@ -375,7 +375,7 @@ testas A100 7장 튜닝 결과는 다음과 같다.
 
 | per-GPU train batch | global batch | 결과 |
 | ---: | ---: | --- |
-| 34 | 238 | 최신 12.99M 모델과 reuse/temporal validation 경로 기준 첫 train step 전 CUDA OOM |
+| 34 | 238 | 최신 13.05M 모델과 5-step temporal validation 경로 기준 첫 train step 전 CUDA OOM |
 | 28 | 196 | 7-GPU DDP 2 train batch 통과, 운영 기본값으로 선택 |
 | 2 | 14 | train + 32-rollout closed-loop validation smoke 통과 |
 
@@ -432,7 +432,8 @@ python -m src.run \
   ckpt_path=/path/to/model.ckpt \
   paths.cache_root=/workspace/womd_v1_3/MDG_cache \
   model.model_config.n_rollout_closed_val=32 \
-  model.model_config.closed_loop_denoising_steps=1 \
+  model.model_config.closed_loop_denoising_steps=5 \
+  model.model_config.closed_loop_reuse_actions=false \
   model.model_config.scorer_scene_num=1680
 ```
 
@@ -500,7 +501,7 @@ CATK_TF_INTRA_OP_THREADS=1 CATK_TF_INTER_OP_THREADS=1 python src/run.py action=v
   data.max_map_polylines=16 data.max_traffic_lights=4 \
   model.model_config.n_rollout_closed_val=32 \
   model.model_config.closed_loop_reuse_actions=false \
-  model.model_config.closed_loop_denoising_steps=2 \
+  model.model_config.closed_loop_denoising_steps=5 \
   model.model_config.rollout_chunk_size=4 \
   model.model_config.n_batch_sim_agents_metric=1 \
   model.model_config.backbone.hidden_dim=16 \
@@ -523,6 +524,6 @@ CATK_TF_INTRA_OP_THREADS=1 CATK_TF_INTER_OP_THREADS=1 python src/run.py action=v
 ## 주의사항
 
 - Waymax는 사용하지 않는다. closed-loop 효과는 제출 궤적 내부에서 1Hz replanning으로 근사한다.
-- validation/test/submission은 기본적으로 첫 segment는 full noise에서 시작하고, 이후 segment는 shifted action reuse를 적용한 뒤 논문 WOSAC reported setting과 같은 `closed_loop_denoising_steps=1`로 denoising한다. `closed_loop_reuse_actions=true`에서는 `closed_loop_denoising_steps=1`만 허용한다. temporal multi-step은 `closed_loop_reuse_actions=false` override에서만 실험할 수 있으며, 같은 replanning segment 안에서는 scene encoder를 한 번만 실행하고 auxiliary predictor는 호출하지 않는다.
+- validation/test/submission은 기본적으로 매 replanning segment를 full noise에서 시작하고 `closed_loop_denoising_steps=5`, `closed_loop_reuse_actions=false`로 temporal-axis denoising한다. shifted action reuse는 optional ablation이며, 같은 replanning segment 안에서는 scene encoder를 한 번만 실행하고 auxiliary predictor는 호출하지 않는다.
 - WOSAC 제출은 반드시 32 rollout이어야 한다. submission mode에서 다른 값이면 모델 초기화 시 실패한다.
 - evaluation/test DDP는 padding 없는 exact sampler를 사용한다. 제출 archive에서 scenario 중복이 생기지 않도록 하기 위함이다.
