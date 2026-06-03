@@ -75,7 +75,9 @@ model:
       #   byte-identical → OCSC 단일 cond_d 공유와 행동적 동치. real/fake 는 동일 x_t·
       #   conditioning 에서 head 가중치만 다르게 평가됨.
       unfrozen_range: velocity_head_only
-      # Generator EMA (Self-Forcing 표준). 0.0 이면 validation 이 online weight 사용.
+      # Generator EMA. use_ema_for_validation=false 면 validation 이 EMA 대신 online
+      # weight(self.encoder)로 평가 → EMA lag 없이 현재 학습 상태 반영.
+      use_ema_for_validation: false
       ema_weight: 0.99
       ema_start_step: 50
       gradient_clip_val: 10.0
@@ -93,8 +95,12 @@ model:
         sample_steps: 16
         sample_method: euler
         noise_scale: 1.0
+        # random_terminal_step 비활성 → rollout 이 backprop_last_k=None 경로로 가서
+        # 16 ODE step 전체에 gradient 가 흐름(full BPTT).  (enabled=true 면 return_terminal_clean
+        # 경로라 마지막 ODE step 만 grad.  min_executed_steps=sample_steps=16 이라 committed
+        # 궤적은 어차피 16-step full denoise 로 동일 — 즉 끄면 궤적 그대로, grad만 full.)
         random_terminal_step:
-          enabled: true
+          enabled: false
           scope: global_batch
           policy: paper_uniform
           min_executed_steps: 16

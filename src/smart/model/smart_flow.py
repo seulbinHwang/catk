@@ -436,6 +436,13 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 50
         )
+        # validation/test 에서 EMA generator 를 쓸지.  False 면 online weight(self.encoder)로
+        # 평가 → EMA lag 없이 현재 학습 상태를 그대로 반영.
+        self.self_forced_use_ema_for_validation = (
+            bool(getattr(self.self_forced_config, "use_ema_for_validation", True))
+            if self.self_forced_config is not None
+            else True
+        )
         self.self_forced_sampling = (
             getattr(self.self_forced_config, "sampling", self.validation_rollout_sampling)
             if self.self_forced_config is not None
@@ -1831,8 +1838,15 @@ class SMARTFlow(LightningModule):
         )
 
     def _get_eval_generator(self) -> SMARTFlowDecoder:
-        """validation/test에서 사용할 Generator를 반환합니다."""
-        if self._is_self_forced_generator_ema_ready():
+        """validation/test에서 사용할 Generator를 반환합니다.
+
+        ``use_ema_for_validation=False`` 면 EMA 를 쓰지 않고 online generator(self.encoder)
+        를 그대로 평가에 사용합니다 (EMA lag 없음).
+        """
+        if (
+            getattr(self, "self_forced_use_ema_for_validation", True)
+            and self._is_self_forced_generator_ema_ready()
+        ):
             return self.self_forced_generator_ema
         return self.encoder
 
@@ -1841,6 +1855,8 @@ class SMARTFlow(LightningModule):
         """Generator optimizer step 직후 EMA Generator를 갱신합니다."""
         if not self.self_forced_enabled or self.self_forced_generator_ema is None:
             return
+        if not getattr(self, "self_forced_use_ema_for_validation", True):
+            return  # EMA 미사용 — 갱신 skip (online weight 로만 평가).
         self.self_forced_generator_update_count.add_(1)
         if int(self.self_forced_generator_update_count.item()) < int(self.self_forced_ema_start_step):
             return
