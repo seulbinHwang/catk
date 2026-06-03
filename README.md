@@ -2730,6 +2730,7 @@ python scripts/launch_waymo_test_submission_h100x6_hsb1_static_pod.py \
 | post-process | `use_lqr=false`, `use_stop_motion=false` |
 | method name | `Flow Agents 7M` |
 | authors / affiliation | `SB H`, `KO O` / `NLK` |
+| description | `flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18_116_false_1.0` |
 | account | `h.sb@naverlabs.com` |
 | default test batch | per-rank `test_batch_size=48` |
 | tmux session | `catk-flow-waymo-test-submission-h100x6-hsb1` |

@@ -31,6 +31,10 @@ DEFAULT_TASK_NAME = (
     "flow_agents_7m_waymo_test_epoch116_mqfq3u39_h100x6_hsb1_"
     "sample16_euler_iid_noise1000"
 )
+DEFAULT_DESCRIPTION = (
+    "flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_"
+    "train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18_116_false_1.0"
+)
 DEFAULT_SESSION = "catk-flow-waymo-test-submission-h100x6-hsb1"
 DEFAULT_TEST_BATCH_SIZE = 48
 DEFAULT_SMOKE_TEST_BATCH_SIZE = 8
@@ -111,10 +115,7 @@ def render_remote_script(args: argparse.Namespace) -> str:
         'model.model_config.sim_agents_submission.method_name="Flow Agents 7M"',
         'model.model_config.sim_agents_submission.authors=["SB H","KO O"]',
         "model.model_config.sim_agents_submission.affiliation=NLK",
-        (
-            'model.model_config.sim_agents_submission.description='
-            '"Flow-based generative model for simulating realistic agents."'
-        ),
+        f'model.model_config.sim_agents_submission.description="{DEFAULT_DESCRIPTION}"',
         'model.model_config.sim_agents_submission.method_link="not available yet"',
         "model.model_config.sim_agents_submission.account_name=h.sb@naverlabs.com",
         f"waymo_submission.enabled={waymo_enabled}",
@@ -165,7 +166,7 @@ def render_remote_script(args: argparse.Namespace) -> str:
         "--expected-method-name \"Flow Agents 7M\" "
         "--expected-authors \"SB H,KO O\" "
         "--expected-affiliation NLK "
-        "--expected-description \"Flow-based generative model for simulating realistic agents.\" "
+        f"--expected-description {shq(DEFAULT_DESCRIPTION)} "
         "--expected-method-link \"not available yet\" "
         "--expected-account-name h.sb@naverlabs.com "
         "--expected-num-model-parameters 7M "
