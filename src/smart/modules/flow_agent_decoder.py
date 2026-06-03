@@ -674,20 +674,51 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     dtype=dtype,
                     generator=generator,
                 ) * scenario_sign
-            return noise_tape * noise_scale
+            return self._apply_rollout_noise_scale(
+                noise_tape=noise_tape,
+                sampling_scheme=sampling_scheme,
+                noise_scale=noise_scale,
+            )
 
         generator = None
         if sampling_seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(sampling_seed))
-        return torch.randn(
+        noise_tape = torch.randn(
             num_agent,
             tape_steps,
             self.flow_state_dim,
             device=device,
             dtype=dtype,
             generator=generator,
-        ) * noise_scale
+        )
+        return self._apply_rollout_noise_scale(
+            noise_tape=noise_tape,
+            sampling_scheme=sampling_scheme,
+            noise_scale=noise_scale,
+        )
+
+    def _apply_rollout_noise_scale(
+        self,
+        noise_tape: torch.Tensor,
+        sampling_scheme: DictConfig,
+        noise_scale: float,
+    ) -> torch.Tensor:
+        """Apply scalar and optional per-control-dim closed-loop noise scale."""
+        noise_tape = noise_tape * float(noise_scale)
+        control_dim_scale = getattr(sampling_scheme, "control_dim_noise_scale", None)
+        if control_dim_scale is None or not self.use_kinematic_control_flow:
+            return noise_tape
+        if self.flow_state_dim != 3:
+            return noise_tape
+        scale_values = [float(value) for value in control_dim_scale]
+        if len(scale_values) != self.flow_state_dim:
+            raise ValueError(
+                "validation_rollout_sampling.control_dim_noise_scale must have "
+                f"{self.flow_state_dim} values for control-space Flow, got {scale_values!r}."
+            )
+        scale_tensor = noise_tape.new_tensor(scale_values).view(1, 1, self.flow_state_dim)
+        return noise_tape * scale_tensor
 
     def _encode_context(
         self,
