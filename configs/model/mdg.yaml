@@ -1,9 +1,9 @@
 _target_: src.mdg.model.MDG
 model_config:
-  lr: 0.00054544
+  lr: 0.00049497
   weight_decay: 0.01
-  lr_warmup_steps: 430
-  lr_decay_step: 861
+  lr_warmup_steps: 522
+  lr_decay_step: 1045
   lr_decay_factor: 0.98
   denoising_loss_weight: 1.0
   action_loss_weight: 0.0
