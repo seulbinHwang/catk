@@ -40,10 +40,24 @@ def main() -> None:
     den = sum((x - mx) ** 2 for x in xs) or 1.0
     slope = num / den  # RMM per val-point
     cpd_d = (sum(cpds[-k:]) / k - sum(cpds[:k]) / k) if len(cpds) >= 2 * k else 0.0
-    verdict = "RISING" if d > 0.008 else ("PROMISING" if d > 0.004 else "FLAT")
+    rmin = min(rmms)
+    var = sum((y - my) ** 2 for y in rmms) / n
+    std = var ** 0.5
+    # 안정적 상승: 상승폭 충분 + 큰 크래시 없음(최저점이 시작보다 0.05 이상 낮지 않음).
+    stable = (rmin >= first - 0.05)
+    if d > 0.008 and stable:
+        verdict = "STABLE_RISING"
+    elif d > 0.008:
+        verdict = "RISING_UNSTABLE"
+    elif d > 0.004:
+        verdict = "PROMISING"
+    else:
+        verdict = "FLAT"
+    # 정렬용 score: 상승폭 − 불안정 페널티(시작 대비 최저점 하락분).
+    score = d - max(0.0, first - rmin)
     print(
         f"{verdict} d={d:+.4f} n={n} first={first:.4f} last={last:.4f} "
-        f"slope={slope:+.5f} cpd_d={cpd_d:+.4f}"
+        f"min={rmin:.4f} std={std:.4f} slope={slope:+.5f} cpd_d={cpd_d:+.4f} score={score:+.4f}"
     )
 
 

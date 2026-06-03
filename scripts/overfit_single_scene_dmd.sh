@@ -45,6 +45,7 @@ N_ANCHORS="${N_ANCHORS:-4}"
 # critic cadence: anchor 당 critic FM update 수.  실효 critic:gen = n_anchors×updates : 1.
 # (updates=1, n_anchors=4 → 4:1;  updates=3, n_anchors=4 → 12:1.)
 ESTIMATOR_UPDATES="${ESTIMATOR_UPDATES:-1}"
+GRAD_CLIP="${GRAD_CLIP:-10.0}"        # generator manual grad clip (불안정 시 낮춰 안정화)
 SAMPLE_STEPS="${SAMPLE_STEPS:-16}"
 MAX_EPOCHS="${MAX_EPOCHS:-400}"       # limit_train_batches=1 이라 = 학습 step 수
 VAL_EVERY="${VAL_EVERY:-10}"          # 10 step 마다 그 scene RMM
@@ -80,6 +81,7 @@ python -m src.run \
   model.model_config.self_forced.unfrozen_range="${UNFROZEN_RANGE}" \
   model.model_config.self_forced.estimator_lr="${FAKE_LR}" \
   model.model_config.self_forced.estimator_updates_per_step="${ESTIMATOR_UPDATES}" \
+  model.model_config.self_forced.gradient_clip_val="${GRAD_CLIP}" \
   model.model_config.self_forced.estimator_warmup_steps=0 \
   model.model_config.self_forced.n_anchors="${N_ANCHORS}" \
   model.model_config.self_forced.sampling.sample_steps="${SAMPLE_STEPS}" \
