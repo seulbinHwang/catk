@@ -37,6 +37,9 @@ model:
     #  val_check_interval=400 은 이미 동일; 아래 2개가 pareto 와 달랐어서 맞춤.)
     n_rollout_closed_val: 16
     n_batch_sim_agents_metric: 100000
+    # ★ pareto 정합 (이전에 빠뜨린 키).  WOSAC RMM 채점 worker.  model 기본 8(ThreadPool)은
+    #   GIL 경합으로 sync 보다 ~수십배 느림 → validation 폭증의 주범.  0=sync(pareto 동일, 빠름).
+    sim_agents_metric_workers: 0
     sim_agents_context_cache_size: 64
     n_vis_batch: 0
     n_vis_scenario: 0
