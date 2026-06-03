@@ -1063,6 +1063,18 @@ model.model_config.validation_rollout_sampling.antithetic_pairs=false
 
 RMM 기준으로 antithetic pair가 더 높았으므로 repository 기본값은 `antithetic_pairs=true` 로 둡니다.
 
+같은 checkpoint와 Fast-RMM 조건에서 `antithetic_pairs=true` 를 고정하고 `noise_scale` 만 바꿔 비교한 결과는 아래와 같습니다.
+
+| antithetic noise_scale | RMM | CPD | CES |
+|---:|---:|---:|---:|
+| 0.6 | 0.770086 | 0.102039 | 0.099064 |
+| 0.7 | 0.774481 | 0.121340 | 0.096547 |
+| 0.8 | 0.778329 | 0.143602 | 0.094837 |
+| 0.9 | 0.780525 | 0.169850 | 0.094274 |
+| 1.0 | 0.781846 | 0.201687 | 0.095312 |
+
+이 sweep에서는 RMM 기준 `noise_scale=1.0` 이 가장 높았으므로 repository 기본값은 `model.model_config.validation_rollout_sampling.noise_scale=1.0` 으로 유지합니다.
+
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 61 Waymo validation 제출
 
 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 61 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.
