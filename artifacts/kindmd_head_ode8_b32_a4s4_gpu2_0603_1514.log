@@ -3272,3 +3272,7 @@ Modules in eval mode: 698
 Validation DataLoader 0:  36%|███▌      | 99/275 [50:42<1:30:09,  0.03it/s][A
 Validation DataLoader 0:  36%|███▋      | 100/275 [51:09<1:29:30,  0.03it/s][A
 Validation DataLoader 0:  37%|███▋      | 101/275 [51:43<1:29:06,  0.03it/s][A
+Validation DataLoader 0:  37%|███▋      | 102/275 [52:07<1:28:24,  0.03it/s][A
+Validation DataLoader 0:  37%|███▋      | 103/275 [52:41<1:27:58,  0.03it/s][A
+Validation DataLoader 0:  38%|███▊      | 104/275 [53:16<1:27:35,  0.03it/s][A
+Validation DataLoader 0:  38%|███▊      | 105/275 [53:48<1:27:06,  0.03it/s][A
