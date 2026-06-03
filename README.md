@@ -237,7 +237,7 @@ python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-
 python scripts/launch_unimm_h100x3x2.py --smoke --smoke-batches 4 --train-batch-size 30 --replace
 ```
 
-2026-06-03 최신 `UniMM@807b82a` 기준으로 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 memory-balanced train sampler와 positive anchor tail tie-break를 켠 상태로 batch size를 다시 탐색했다. `train_batch_size=32`는 200-batch train-only smoke에서 CUDA OOM이 재현됐고, `train_batch_size=30`은 200-batch train-only smoke를 exit status 0으로 통과했다. 안정 기본값은 per-GPU `train_batch_size=30`이고 global batch size는 `30 x 6 = 180`이다. Train dataloader는 기본적으로 memory-balanced distributed batch sampler를 사용해 agent/map이 많은 dense scenario가 한 rank-local batch에 몰리는 것을 줄인다. 이 sampler가 이미 rank별 batch를 직접 나누므로 UniMM trainer는 `use_distributed_sampler=false`로 둔다.
+2026-06-03 최신 `UniMM@f64502e` 기준으로 `hsb-npc-training-3-1`, `hsb-npc-training-3-2`에서 memory-balanced train sampler와 positive anchor near-tie tail tie-break를 켠 상태로 batch size를 다시 탐색했다. `train_batch_size=32`는 200-batch train-only smoke에서 CUDA OOM이 재현됐고, `train_batch_size=30`은 200-batch train-only smoke를 exit status 0으로 통과했다. 안정 기본값은 per-GPU `train_batch_size=30`이고 global batch size는 `30 x 6 = 180`이다. Train dataloader는 기본적으로 memory-balanced distributed batch sampler를 사용해 agent/map이 많은 dense scenario가 한 rank-local batch에 몰리는 것을 줄인다. 이 sampler가 이미 rank별 batch를 직접 나누므로 UniMM trainer는 `use_distributed_sampler=false`로 둔다.
 
 H100 x3x2 validation은 per-GPU batch size 12, global batch size `12 x 6 = 72`로 실행한다. 학습 중 validation은 `check_val_every_n_epoch=16` 주기로 돌며, Fast WOSAC `sim_agents_2025` scorer는 `scorer_scene_num=1680` 기준으로 GPU 수와 validation batch size에 맞춰 batch 수를 계산한다. H100 x3x2 기본값에서는 `ceil(ceil(1680 / 6) / 12) = 24`이므로 `n_batch_sim_agents_metric=24`로 자동 조정된다.
 
@@ -271,6 +271,90 @@ MIN_BS=16 \
 ```
 
 이 래퍼는 첫 시도를 per-GPU `train_batch_size=30`으로 시작한다. 두 pod 중 하나라도 CUDA OOM marker를 로그에 남기면 양쪽 `unimm-h100x3x2` tmux 학습 세션을 종료하고, 같은 `TASK_NAME`의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size -= OOM_STEP`으로 재시작한다. 기본 `OOM_STEP=2`라서 `30 -> 28 -> 26 -> ...` 순서로 낮춘다. 기본적으로 각 attempt의 LR은 현재 batch size에 맞춰 `0.0005 * sqrt((batch_size * 6) / 32)`로 다시 계산한다. `LEARNING_RATE`를 직접 지정하면 모든 attempt에서 그 값을 고정 사용한다. `OOM_STEP=0`이면 batch size를 낮추지 않고 `MAX_SAME_BS_OOM_RETRIES` 횟수만큼 같은 batch size로 재시도한다.
+
+공유 pod에서 다른 사용자의 GPU 작업을 방해하지 않으려면 guarded launcher를 사용한다. 이 스크립트는 양쪽 pod의 GPU compute process, GPU memory, GPU utilization, 동일 tmux session 존재 여부를 먼저 확인하고, 하나라도 바쁘면 학습을 시작하지 않는다.
+
+상태 확인만 할 때:
+
+```bash
+bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh --status
+```
+
+파드가 idle일 때만 full pretrain 시작:
+
+```bash
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_guarded_$(date +%Y%m%d_%H%M%S) \
+SESSION=unimm-h100x3x2 \
+MASTER_PORT=29578 \
+INITIAL_BS=30 \
+OOM_STEP=2 \
+MIN_BS=16 \
+WANDB_MODE=online \
+  bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh
+```
+
+dry-run으로 실제 실행 명령만 확인:
+
+```bash
+DRY_RUN=1 bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh --dry-run
+```
+
+`--force`는 현재 GPU 사용자와 확인한 뒤에만 사용한다. 기본 idle 기준은 GPU memory `<=1024MiB`, utilization `<=10%`, compute process 없음이다. 필요하면 `IDLE_MAX_MEMORY_MIB`, `IDLE_MAX_UTIL_PCT`로 조정할 수 있다.
+
+이번 H100 x3x2 guarded full pretrain recipe는 다음 실험이다.
+
+| 항목 | 값 |
+| --- | --- |
+| 모델 | UniMM Anchor-Based-4s |
+| 브랜치 | `UniMM` |
+| 실행 action | `fit` |
+| 대상 pod | `hsb-npc-training-3-1`, `hsb-npc-training-3-2` |
+| GPU 구성 | 2 nodes x 3 H100 = 6 GPUs |
+| cache root | `/workspace/womd_v1_3/SMART_cache` |
+| anchor file | `src/unimm/anchors/unimm_anchors_8s_k2048.pkl` |
+| per-GPU train batch | 30 |
+| effective train batch | 30 x 6 = 180 |
+| OOM retry | `30 -> 28 -> 26 -> ...`, `OOM_STEP=2`, `MIN_BS=16` |
+| LR | `0.001185854123` 기본, 또는 retry wrapper의 sqrt scaling |
+| optimizer | AdamW |
+| weight decay | 0.0001 |
+| LR schedule | warmup 4 epoch + cosine annealing to epoch 64 |
+| epochs | 64 |
+| precision | `bf16-mixed` |
+| gradient clip | 0.5 |
+| validation 주기 | `check_val_every_n_epoch=16` |
+| val batch | per-GPU 12 |
+| Fast WOSAC scorer | `scorer_scene_num=1680`, H100 x3x2 기본 `n_batch_sim_agents_metric=24` |
+| closed-loop training | true |
+| prediction horizon | 40 steps = 4초 |
+| commit interval | 5 steps = 0.5초 |
+| positive matching | 5 steps = 0.5초 + near-tie tail tie-break |
+| inference temperature | 1.0 |
+| train sampler | memory-balanced distributed batch sampler |
+
+2026-06-03 23:35 KST에 guarded launcher와 H100 x3x2 파이프라인을 실제 pod/cache/GPU로 재검증했다. 검증 전후 `--status`에서 두 pod 모두 compute process 없음, GPU memory 4MiB, utilization 0%로 idle 상태였고, 검증용 tmux session은 종료 후 정리했다.
+
+```text
+fit smoke:
+  task_name=unimm_h100x3x2_script_pipeline_verify_20260603_233529
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=30, val_batch_size=2
+  trainer.max_epochs=1
+  trainer.limit_train_batches=2
+  trainer.limit_val_batches=1
+  trainer.check_val_every_n_epoch=1
+  model.model_config.n_rollout_closed_val=2
+  model.model_config.n_batch_sim_agents_metric=1
+  result=exit status 0
+
+checkpoint-sync test smoke:
+  task_name=unimm_h100x3x2_script_pipeline_verify_20260603_233529_test
+  ckpt_path=/mnt/nuplan/projects/catk/logs/unimm_h100x3x2_script_pipeline_verify_20260603_233529/runs/2026-06-03_23-35-35/checkpoints/epoch_last.ckpt
+  synced_ckpt_path=/tmp/unimm_h100x3x2_synced_ckpts/unimm_h100x3x2_script_pipeline_verify_20260603_233529_test_5fb8787bcf68/epoch_last.ckpt
+  trainer.limit_test_batches=1
+  model.model_config.n_rollout_closed_val=2
+  result=exit status 0
+```
 
 짧은 검증 실행은 아래처럼 batch/epoch limit을 걸어 사용한다.
 
