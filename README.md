@@ -1110,7 +1110,18 @@ RMM 기준으로 antithetic pair가 더 높았으므로 repository 기본값은 
 | 1.0066 | 0.782251 | 0.203052 | 0.095401 |
 | 1.01 | 0.782377 | 0.204144 | 0.095362 |
 
-이 fine sweep에서도 RMM 기준 `noise_scale=1.01` 이 가장 높았으므로 repository 기본값은 그대로 `model.model_config.validation_rollout_sampling.noise_scale=1.01` 입니다.
+추가로 같은 조건에서 `noise_scale=1.01` 위쪽 근방을 더 확인한 결과는 아래와 같습니다.
+
+| noise_scale | RMM | WOSAC-CPD | CES |
+|---:|---:|---:|---:|
+| 1.008 | 0.782219 | 0.203613 | 0.095458 |
+| 1.009 | 0.782094 | 0.204003 | 0.095422 |
+| 1.01 | 0.782194 | 0.204474 | 0.095495 |
+| 1.012 | 0.782332 | 0.204990 | 0.095516 |
+| 1.014 | 0.782185 | 0.205982 | 0.095599 |
+| 1.016 | 0.782407 | 0.206521 | 0.095705 |
+
+두 fine sweep을 종합하면 RMM 기준 `noise_scale=1.016` 이 가장 높았으므로 repository 기본값은 `model.model_config.validation_rollout_sampling.noise_scale=1.016` 입니다. `1.016` 은 기존 기본값 `1.01` 대비 CPD와 CES가 모두 소폭 커지지만, 최종 선택 기준은 RMM입니다.
 
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 61 Waymo validation 제출
 

@@ -62,7 +62,7 @@ model_config:
   validation_rollout_sampling:
     sample_steps: 16
     sample_method: euler
-    noise_scale: 1.01
+    noise_scale: 1.016
     antithetic_pairs: true
   self_forced:
     enabled: false
