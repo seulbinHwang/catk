@@ -982,11 +982,48 @@ class SMARTFlow(LightningModule):
                 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
         """
+        seed_rollout_idx, _ = self._get_closed_loop_antithetic_base_and_sign(rollout_idx)
         scenario_seeds = [
-            self._make_closed_loop_seed(scenario_id=scenario_id, rollout_idx=rollout_idx)
+            self._make_closed_loop_seed(scenario_id=scenario_id, rollout_idx=seed_rollout_idx)
             for scenario_id in scenario_ids
         ]
         return torch.tensor(scenario_seeds, dtype=torch.long, device=device)
+
+    def _use_closed_loop_antithetic_pairs(self) -> bool:
+        """validation closed-loop rollout에서 antithetic noise pair를 쓸지 반환합니다."""
+        return bool(getattr(self.validation_rollout_sampling, "antithetic_pairs", False))
+
+    def _get_closed_loop_antithetic_base_and_sign(self, rollout_idx: int) -> tuple[int, float]:
+        """rollout 번호를 antithetic pair용 base 번호와 noise 부호로 바꿉니다."""
+        rollout_idx = int(rollout_idx)
+        if not self._use_closed_loop_antithetic_pairs():
+            return rollout_idx, 1.0
+
+        n_rollout = int(self.n_rollout_closed_val)
+        if n_rollout % 2 != 0:
+            raise ValueError(
+                "validation_rollout_sampling.antithetic_pairs=true requires an even "
+                f"n_rollout_closed_val, got {n_rollout}."
+            )
+        pair_offset = n_rollout // 2
+        if rollout_idx < pair_offset:
+            return rollout_idx, 1.0
+        return rollout_idx - pair_offset, -1.0
+
+    def _get_closed_loop_scenario_noise_signs(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_idx: int,
+        device: torch.device,
+    ) -> Tensor:
+        """배치 안 각 시나리오용 closed-loop noise 부호를 만듭니다."""
+        _, noise_sign = self._get_closed_loop_antithetic_base_and_sign(rollout_idx)
+        return torch.full(
+            (len(scenario_ids),),
+            float(noise_sign),
+            dtype=torch.float32,
+            device=device,
+        )
 
     def _build_closed_loop_seed_table(
         self,
@@ -1019,6 +1056,27 @@ class SMARTFlow(LightningModule):
         if len(seed_rows) == 0:
             return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
         return torch.stack(seed_rows, dim=0)
+
+    def _build_closed_loop_noise_sign_table(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_indices: Sequence[int],
+        device: torch.device,
+    ) -> Tensor | None:
+        """여러 rollout의 scenario별 noise 부호를 한 번에 모읍니다."""
+        if not self._use_closed_loop_antithetic_pairs():
+            return None
+        sign_rows = [
+            self._get_closed_loop_scenario_noise_signs(
+                scenario_ids=scenario_ids,
+                rollout_idx=rollout_idx,
+                device=device,
+            )
+            for rollout_idx in rollout_indices
+        ]
+        if len(sign_rows) == 0:
+            return torch.zeros((0, len(scenario_ids)), dtype=torch.float32, device=device)
+        return torch.stack(sign_rows, dim=0)
 
     def _repeat_tensor_on_first_dim(self, tensor: Tensor, repeat_count: int) -> Tensor:
         """첫 번째 축을 rollout 수만큼 반복합니다.
@@ -1313,12 +1371,20 @@ class SMARTFlow(LightningModule):
                 rollout_idx=int(rollout_indices[0]),
                 device=scenario_device,
             )
+            scenario_sampling_signs = self._build_closed_loop_noise_sign_table(
+                scenario_ids=data["scenario_id"],
+                rollout_indices=rollout_indices,
+                device=scenario_device,
+            )
+            if scenario_sampling_signs is not None:
+                scenario_sampling_signs = scenario_sampling_signs.reshape(-1).contiguous()
             pred = rollout_encoder.rollout_from_cache(
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
                 map_feature=map_feature,
                 sampling_scheme=self.validation_rollout_sampling,
                 scenario_sampling_seeds=scenario_sampling_seeds,
+                scenario_sampling_signs=scenario_sampling_signs,
                 return_flow_2s_preview=return_flow_2s_preview,
             )
             flow_preview = None
@@ -1337,6 +1403,11 @@ class SMARTFlow(LightningModule):
         num_agent = int(tokenized_agent["batch"].shape[0])
         num_graphs = len(data["scenario_id"])
         scenario_seed_table = self._build_closed_loop_seed_table(
+            scenario_ids=data["scenario_id"],
+            rollout_indices=rollout_indices,
+            device=scenario_device,
+        )
+        scenario_sign_table = self._build_closed_loop_noise_sign_table(
             scenario_ids=data["scenario_id"],
             rollout_indices=rollout_indices,
             device=scenario_device,
@@ -1361,6 +1432,11 @@ class SMARTFlow(LightningModule):
             map_feature=expanded_map_feature,
             sampling_scheme=self.validation_rollout_sampling,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+            scenario_sampling_signs=(
+                scenario_sign_table.reshape(-1).contiguous()
+                if scenario_sign_table is not None
+                else None
+            ),
             return_flow_2s_preview=return_flow_2s_preview,
         )
         flow_preview = None

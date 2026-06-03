@@ -1033,6 +1033,36 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t fast-rmm-noise-scale-
 python scripts/launch_fast_rmm_noise_scale_sweep_a100x4x2_testa_testaa_static_pods.py --stop
 ```
 
+#### Flow closed-loop antithetic rollout noise
+
+Flow closed-loop validation/submission의 기본 Gaussian noise는 `model.model_config.validation_rollout_sampling.antithetic_pairs=true` 입니다. 이 설정은 32개 rollout noise를 모두 독립으로 뽑지 않고, 앞 16개 rollout noise를 뽑은 뒤 뒤 16개 rollout에는 같은 noise의 부호 반전값을 씁니다.
+
+개념적 shape은 아래와 같습니다.
+
+```text
+base_noise: [16, N_agent, 95, D]
+full_noise: [32, N_agent, 95, D]
+full_noise[0:16]  = base_noise
+full_noise[16:32] = -base_noise
+```
+
+control-space Flow에서는 `D=3` 입니다. 각 0.5초 closed-loop block은 기존과 동일하게 `full_noise[:, active_agents, k*5 : k*5 + 20, :]` 를 2초 initial noise로 잘라 씁니다. 따라서 checkpoint, model parameter, denoising step, solver는 바뀌지 않고 validation/submission sampling noise set만 더 균형 잡히게 됩니다.
+
+끄고 싶으면 아래처럼 override합니다.
+
+```bash
+model.model_config.validation_rollout_sampling.antithetic_pairs=false
+```
+
+`flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 의 W&B 마지막 artifact `epoch-last-x5f9g0ce:v60` 을 `hsb-npc-training-1` H100x6, `use_lqr=false`, `use_stop_motion=false`, `sample_steps=16`, `noise_scale=1.0`, `val_batch_size=56`, `scorer_scene_num=1680` 조건으로 Fast-RMM 비교한 결과는 아래와 같습니다.
+
+| noise 방식 | RMM | CPD | CES |
+|---|---:|---:|---:|
+| iid Gaussian | 0.781528 | 0.200296 | 0.096098 |
+| antithetic pair | 0.781846 | 0.201687 | 0.095312 |
+
+RMM 기준으로 antithetic pair가 더 높았으므로 repository 기본값은 `antithetic_pairs=true` 로 둡니다.
+
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 61 Waymo validation 제출
 
 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 61 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.

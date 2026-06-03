@@ -608,6 +608,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        scenario_sampling_signs: torch.Tensor | None = None,
         agent_batch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
@@ -621,6 +622,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
                 shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_signs: 시나리오별 noise 부호입니다.
+                shape은 ``[n_scenario]`` 입니다. ``None`` 이면 모두 ``+1`` 입니다.
             agent_batch: 각 agent가 어느 시나리오에 속하는지 나타냅니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -636,12 +639,31 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         if scenario_sampling_seeds is not None:
             if agent_batch is None:
                 raise ValueError("scenario별 잡음 테이프를 만들려면 agent_batch가 필요합니다.")
+            if (
+                scenario_sampling_signs is not None
+                and scenario_sampling_signs.shape != scenario_sampling_seeds.shape
+            ):
+                raise ValueError(
+                    "scenario_sampling_signs must match scenario_sampling_seeds shape, "
+                    f"got {tuple(scenario_sampling_signs.shape)} and "
+                    f"{tuple(scenario_sampling_seeds.shape)}."
+                )
             noise_tape = torch.empty((num_agent, tape_steps, self.flow_state_dim), device=device, dtype=dtype)
             scenario_seed_list = scenario_sampling_seeds.detach().cpu().tolist()
+            scenario_sign_list = (
+                scenario_sampling_signs.detach().cpu().tolist()
+                if scenario_sampling_signs is not None
+                else None
+            )
             for scenario_idx, scenario_seed in enumerate(scenario_seed_list):
                 scenario_mask = agent_batch == scenario_idx
                 if not bool(scenario_mask.any()):
                     continue
+                scenario_sign = (
+                    float(scenario_sign_list[scenario_idx])
+                    if scenario_sign_list is not None
+                    else 1.0
+                )
                 generator = torch.Generator(device=device)
                 generator.manual_seed(int(scenario_seed))
                 noise_tape[scenario_mask] = torch.randn(
@@ -651,7 +673,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     device=device,
                     dtype=dtype,
                     generator=generator,
-                )
+                ) * scenario_sign
             return noise_tape * noise_scale
 
         generator = None
@@ -1317,6 +1339,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        scenario_sampling_signs: torch.Tensor | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
@@ -1332,6 +1355,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme: 샘플링 설정입니다.
             sampling_seed: batch 전체를 하나의 seed로 만들 때 쓰는 고정 난수 seed입니다.
             scenario_sampling_seeds: 시나리오별 고정 seed입니다.
+                shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_signs: 시나리오별 noise 부호입니다.
                 shape은 ``[n_scenario]`` 입니다.
             self_forced_epoch: self-forced 학습 epoch입니다. ``None`` 이면 random terminal
                 denoising step을 쓰지 않는 평가/추론 경로로 봅니다.
@@ -1422,6 +1447,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            scenario_sampling_signs=scenario_sampling_signs,
             agent_batch=tokenized_agent["batch"],
         )
         # Derive scenario count from the always-present `batch` index instead of
@@ -1863,6 +1889,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        scenario_sampling_signs: torch.Tensor | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
     ) -> Dict[str, torch.Tensor]:
@@ -1875,6 +1902,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme: flow sampling 설정입니다.
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_signs: scenario별 noise 부호입니다. shape은 ``[n_scenario]`` 입니다.
             return_flow_2s_preview: preview 저장 여부입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 8초를 실행합니다.
 
@@ -1888,6 +1916,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            scenario_sampling_signs=scenario_sampling_signs,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
         )
@@ -1900,6 +1929,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
+        scenario_sampling_signs: torch.Tensor | None = None,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
@@ -1914,6 +1944,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme: flow sampling 설정입니다.
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_signs: scenario별 noise 부호입니다. shape은 ``[n_scenario]`` 입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. 기본 self-forced 학습은
                 ``flow_window_steps / 5`` 를 넘깁니다.
             self_forced_epoch: 현재 self-forced epoch입니다. ``None`` 이면 training
@@ -1931,6 +1962,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
+            scenario_sampling_signs=scenario_sampling_signs,
             return_flow_2s_preview=False,
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,
