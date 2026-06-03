@@ -134,7 +134,7 @@ def match_anchors_by_type(
     heading_weight: float = 1.0,
     row_chunk_size: int = 4096,
     tie_break_horizon_steps: int | None = None,
-    tie_break_weight: float = 0.0,
+    tie_break_tolerance: float = 0.0,
 ) -> tuple[Tensor, Tensor]:
     """Find the nearest anchor index for every row, separated by agent type.
 
@@ -160,7 +160,7 @@ def match_anchors_by_type(
     )
     valid_h = valid[:, :horizon_steps] if valid is not None else None
     target_h = target_local[:, :horizon_steps]
-    use_tie_break = tie_break_horizon_steps is not None and float(tie_break_weight) > 0.0
+    use_tie_break = tie_break_horizon_steps is not None and float(tie_break_tolerance) >= 0.0
     tie_break_horizon = int(tie_break_horizon_steps or horizon_steps)
     if use_tie_break:
         tie_break_horizon = min(tie_break_horizon, int(target_local.shape[1]), int(anchors_by_type.shape[2]))
@@ -199,8 +199,13 @@ def match_anchors_by_type(
                     valid=valid_tie[chunk_rows] if valid_tie is not None else None,
                     heading_weight=heading_weight,
                 )
-                dist = dist + float(tie_break_weight) * tie_dist
-            chunk_best, chunk_z = dist.min(dim=-1)
+                match_best = dist.min(dim=-1).values
+                eligible = dist <= match_best.unsqueeze(-1) + float(tie_break_tolerance)
+                tie_score = tie_dist.masked_fill(~eligible, float("inf"))
+                chunk_z = tie_score.argmin(dim=-1)
+                chunk_best = dist.gather(1, chunk_z.unsqueeze(-1)).squeeze(-1)
+            else:
+                chunk_best, chunk_z = dist.min(dim=-1)
             z[chunk_rows] = chunk_z
             best[chunk_rows] = chunk_best
 

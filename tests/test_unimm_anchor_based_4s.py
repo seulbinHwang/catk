@@ -187,7 +187,7 @@ def test_unimm_classification_loss_uses_positive_matching_horizon_only():
     assert loss.item() == 0.0
 
 
-def test_unimm_positive_matching_tie_break_uses_prediction_tail():
+def test_unimm_positive_matching_tie_break_uses_prediction_tail_only_for_near_ties():
     anchors = torch.zeros(3, 2, 40, 3)
     anchors[0, 0, 5:, 0] = 100.0
     anchors[0, 1, 5:, 0] = 1.0
@@ -212,11 +212,26 @@ def test_unimm_positive_matching_tie_break_uses_prediction_tail():
         horizon_steps=5,
         row_chunk_size=4,
         tie_break_horizon_steps=40,
-        tie_break_weight=1e-4,
+        tie_break_tolerance=1e-4,
     )
 
     assert z_no_tie.item() == 0
     assert z_tie.item() == 1
+
+    anchors[0, 1, :5, 0] = 0.1
+    z_not_close, err_not_close = match_anchors_by_type(
+        anchors,
+        agent_type,
+        target,
+        valid,
+        horizon_steps=5,
+        row_chunk_size=4,
+        tie_break_horizon_steps=40,
+        tie_break_tolerance=1e-4,
+    )
+
+    assert z_not_close.item() == 0
+    assert err_not_close.item() == 0.0
 
 
 def test_unimm_regression_loss_averages_valid_timesteps():

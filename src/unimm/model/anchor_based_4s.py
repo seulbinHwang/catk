@@ -120,8 +120,8 @@ class UniMMAnchorBased4s(LightningModule):
                 "positive_tie_break_horizon_steps",
                 None,
             ),
-            positive_tie_break_weight=float(
-                getattr(model_config, "positive_tie_break_weight", 0.0)
+            positive_tie_break_tolerance=float(
+                getattr(model_config, "positive_tie_break_tolerance", 0.0)
             ),
         )
         self.network = UniMMAnchorBasedNetwork(
@@ -304,6 +304,13 @@ class UniMMAnchorBased4s(LightningModule):
         )
         reg_loss = unimm_nll_loss(pred, batch.target_local, target_valid)
         total_loss = float(self.loss_weights.cls) * cls_loss + float(self.loss_weights.reg) * reg_loss
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(
+                "UniMM training loss became non-finite "
+                f"(loss={float(total_loss.detach().cpu())}, "
+                f"cls={float(cls_loss.detach().cpu())}, "
+                f"reg={float(reg_loss.detach().cpu())})."
+            )
         z_star_valid = target_valid[..., : self.spec.num_match_steps].any(dim=-1)
         reg_cls_ratio = reg_loss.detach() / cls_loss.detach().abs().clamp_min(1e-6)
         logs = {

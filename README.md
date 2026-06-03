@@ -602,7 +602,7 @@ python scripts/launch_unimm_h100x3x2.py \
 | map self-attention | 1 layer |
 | factorized attention | 2 layers |
 | distance `d(.,.)` | `mean(pos_sq + heading_weight * wrap_angle(heading_diff)^2)` |
-| positive `z*` tie-break | `d0.5 + 0.0001 * d4s`; 학습 positive matching에만 적용 |
+| positive `z*` tie-break | `d0.5`가 best와 `0.0001` 이내인 near-tie anchor들 안에서만 `d4s`로 선택; 학습 positive matching에만 적용 |
 | posterior threshold | category별 raw context `10,15,...,85` nearest-anchor 0.5초 error 95% quantile |
 | train context starts | raw step `10,15,...,85`; late context는 남은 valid future만 supervision |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |

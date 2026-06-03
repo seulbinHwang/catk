@@ -15,7 +15,7 @@ model_config:
   anchor_heading_weight: 1.0
   anchor_match_chunk_size: 4096
   positive_tie_break_horizon_steps: 40
-  positive_tie_break_weight: 0.0001
+  positive_tie_break_tolerance: 0.0001
 
   use_closed_loop_training: true
   inference_temperature: 1.0

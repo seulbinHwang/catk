@@ -33,10 +33,16 @@ def _unimm_per_step_nll(
     target_local: Tensor,
     target_valid: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    pos_dist = Laplace(pred["mean_pos"], pred["pos_scale"])
+    target_local = target_local.float()
+    mean_pos = pred["mean_pos"].float()
+    pos_scale = pred["pos_scale"].float().clamp_min(1.0e-6)
+    mean_head = pred["mean_head"].float()
+    head_concentration = pred["head_concentration"].float().clamp_min(1.0e-6)
+
+    pos_dist = Laplace(mean_pos, pos_scale)
     pos_nll = -pos_dist.log_prob(target_local[..., :2]).sum(dim=-1)
 
-    head_dist = VonMises(pred["mean_head"], pred["head_concentration"])
+    head_dist = VonMises(mean_head, head_concentration)
     head_nll = -head_dist.log_prob(target_local[..., 2])
 
     per_step = pos_nll + head_nll
