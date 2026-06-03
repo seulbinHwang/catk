@@ -39,11 +39,11 @@ model:
     # ── 빠른 모니터링 val (OCSC_clean 스타일) ──────────────────────────
     # limit_val_batches(=0.02, trainer) 가 val 길이를 지배하도록:
     #   - scorer_scene_num=null → n_batch_sim_agents_metric 자동 override(108) 끔.
-    #   - n_batch_sim_agents_metric=50 → _ensure_validation_limit_reaches_scorer_batches
-    #     의 bump target 을 낮춰 0.02(≈55 batch) 가 binding.  RMM 은 ~50 batch 채점.
+    #   - n_batch_sim_agents_metric=55 = 0.02 val batch 수(=int(2756×0.02)) → bump 없음
+    #     (resolved 55 >= 55) 이면서 0.02 val 의 55 batch(880 scenes) **전부** RMM 채점.
     # (pareto-full eval: scorer_scene_num=1728 + n_batch=100000 + limit 0.1 → val ~수십분.)
     scorer_scene_num: null
-    n_batch_sim_agents_metric: 50
+    n_batch_sim_agents_metric: 55
     # WOSAC RMM 채점 worker.  model 기본 8(ThreadPool)은 GIL 경합으로 sync 보다 느림.
     # 0=sync(빠름, pareto 동일).
     sim_agents_metric_workers: 0
