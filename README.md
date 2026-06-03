@@ -27,17 +27,17 @@
 | map polylines | 320 |
 | waypoints per polyline | 16 |
 | traffic lights | 16 |
-| hidden dim | 192 |
+| hidden dim | 256 |
 | modality encoder MLP-Mixer layers | 2 |
 | scene encoder layers | 6 |
 | denoiser blocks | 2 |
 | attention heads | 8 |
-| FFN dim | 704 |
+| FFN dim | 1024 |
 | dropout | 0.1 |
 | auxiliary modes | 6 |
 | relation Fourier bands | 4 |
 | auxiliary loss weight | 5 |
-| model parameters | 7.11M |
+| model parameters | 12.99M |
 | train anchors | `10,20,...,80` |
 | optimizer | AdamW |
 | learning rate | 0.00052915 |
@@ -58,7 +58,7 @@ Auxiliary predictor는 agent scene context에서 `[B,N,6,80,3]` trajectory modes
 
 training cache에는 드물게 valid로 표시됐지만 0.1초 사이 수십 m 이상 왕복하는 물리적으로 불가능한 future outlier가 있다. 이런 outlier는 auxiliary predictor보다 denoiser `state_loss` MSE에 크게 작용해 loss spike를 만들기 때문에, 기본 학습에서는 `kinematic_chunk_filter=true`, `kinematic_max_step_displacement_m=10.0`을 사용한다. 각 action chunk의 두 0.1초 transition 중 valid한 인접 step 이동량이 `10m`를 넘으면 해당 chunk를 invalid로 취급하고, `state_loss`, denoiser input/attention mask에서 제외한다. testas에서 epoch-15 checkpoint와 4,096개 deterministic training sample로 비교했을 때, 이 단일 displacement filter는 제거 비율 평균 `2.9e-6`로 정상 chunk를 거의 건드리지 않으면서 forward `state_loss` max를 `198.14 -> 62.33`으로 낮췄다. speed/acc/yaw-rate threshold를 추가한 후보는 더 많은 chunk를 버리고도 max spike 감소가 약해서 기본값에 넣지 않았다. 학습 로그에는 `train/valid_chunk_ratio`, `train/kinematic_invalid_chunk_ratio`가 기록된다.
 
-기본 모델 파라미터 수는 `7,111,168`개다. 모듈별로는 scene encoder `4,017,374`, denoiser `2,778,434`, auxiliary predictor `315,360`개다. encoder/denoiser/mixer depth와 attention head 수는 유지하고, `D=192`, `FFN=704`로 폭만 줄인 설정이다.
+기본 모델 파라미터 수는 `12,986,176`개다. 모듈별로는 scene encoder `7,370,142`, denoiser `5,179,650`, auxiliary predictor `436,384`개다. encoder/denoiser/mixer depth와 attention head 수는 유지하고, `D=256`, `FFN=1024`로 폭을 키운 설정이다. 직전 `D=192`, `FFN=704` 설정의 `7,111,168`개 대비 `5,875,008`개 증가했다.
 
 learning rate는 기존 effective batch `32`에서 쓰던 `0.0002`를 기준으로, testas A100 7장 기본 effective batch `32 * 7 = 224`에 맞춰 sqrt scaling을 적용했다. 계산식은 `0.0002 * sqrt(224 / 32) = 0.00052915`다. LR schedule은 논문 설정인 global batch `32`, `20 epochs`, warmup `1000 steps`, decay interval `2000 steps`를 기준으로 전체 학습 진행률을 보존하도록 조정했다. 우리 설정은 global batch가 7배 크고 epoch이 `20 -> 64`로 `3.2`배 길어졌으므로 step scale은 `(64 / 20) / 7 = 0.457142...`이다. 따라서 warmup은 `1000 * 0.457142 ~= 457 steps`, decay interval은 `2000 * 0.457142 ~= 914 steps`로 둔다. decay factor `0.98`은 유지한다.
 

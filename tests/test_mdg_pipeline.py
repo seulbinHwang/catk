@@ -493,7 +493,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert data_cfg.map_waypoints == 16
     assert data_cfg.max_traffic_lights == 16
 
-    assert model_cfg.backbone.hidden_dim == 192
+    assert model_cfg.backbone.hidden_dim == 256
     assert model_cfg.backbone.history_steps == 11
     assert model_cfg.backbone.future_steps == 80
     assert model_cfg.backbone.action_chunk == 2
@@ -502,7 +502,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert model_cfg.backbone.num_encoder_layers == 6
     assert model_cfg.backbone.num_denoiser_blocks == 2
     assert model_cfg.backbone.num_heads == 8
-    assert model_cfg.backbone.ffn_dim == 704
+    assert model_cfg.backbone.ffn_dim == 1024
     assert model_cfg.backbone.predictor_modes == 6
     assert model_cfg.n_rollout_closed_val == 32
     assert model_cfg.replanning_interval == 10
@@ -512,7 +512,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert list(model_cfg.closed_loop_reuse_alpha) == [0.95, 0.90, 0.80, 0.01]
     assert model_cfg.action_loss_weight == 0.0
     assert model_cfg.aux_loss_weight == 5.0
-    assert model_cfg.sim_agents_submission.num_model_parameters == "7.11M"
+    assert model_cfg.sim_agents_submission.num_model_parameters == "12.99M"
     assert submission_cfg.model.model_config.n_rollout_closed_val == 32
     assert submission_cfg.model.model_config.replanning_interval == 10
     assert submission_cfg.model.model_config.closed_loop_denoising_steps == 5
@@ -529,7 +529,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert submission_cfg.trainer.precision == "16-mixed"
 
     model = MDG(model_cfg)
-    assert sum(p.numel() for p in model.parameters()) == 7_111_168
+    assert sum(p.numel() for p in model.parameters()) == 12_986_176
 
 
 def test_mdg_temporal_denoising_schedule_allows_arbitrary_steps() -> None:

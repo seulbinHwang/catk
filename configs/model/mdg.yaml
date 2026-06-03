@@ -32,7 +32,7 @@ model_config:
   wosac_cpd_reference: null
   wosac_distribution_type_scale: [22.3461620418, 4.5793447978, 18.5374388830]
   backbone:
-    hidden_dim: 192
+    hidden_dim: 256
     history_steps: 11
     future_steps: 80
     action_chunk: 2
@@ -42,7 +42,7 @@ model_config:
     num_encoder_layers: 6
     num_denoiser_blocks: 2
     num_heads: 8
-    ffn_dim: 704
+    ffn_dim: 1024
     dropout: 0.1
     predictor_modes: 6
     num_relation_freq_bands: 4
@@ -56,4 +56,4 @@ model_config:
     description: YOUR_DESCRIPTION
     method_link: YOUR_METHOD_LINK
     account_name: YOUR_ACCOUNT_NAME
-    num_model_parameters: "7.11M"
+    num_model_parameters: "12.99M"
