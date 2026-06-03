@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Dict
 
 import torch
@@ -677,7 +676,6 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 ) * scenario_sign
             return self._apply_rollout_noise_scale(
                 noise_tape=noise_tape,
-                sampling_scheme=sampling_scheme,
                 noise_scale=noise_scale,
             )
 
@@ -695,60 +693,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         return self._apply_rollout_noise_scale(
             noise_tape=noise_tape,
-            sampling_scheme=sampling_scheme,
             noise_scale=noise_scale,
         )
 
     def _apply_rollout_noise_scale(
         self,
         noise_tape: torch.Tensor,
-        sampling_scheme: DictConfig,
         noise_scale: float,
     ) -> torch.Tensor:
-        """Apply scalar and optional per-control-dim closed-loop noise scale."""
-        noise_tape = self._apply_rollout_temporal_noise_smoothing(
-            noise_tape=noise_tape,
-            sampling_scheme=sampling_scheme,
-        )
-        noise_tape = noise_tape * float(noise_scale)
-        control_dim_scale = getattr(sampling_scheme, "control_dim_noise_scale", None)
-        if control_dim_scale is None or not self.use_kinematic_control_flow:
-            return noise_tape
-        if self.flow_state_dim != 3:
-            return noise_tape
-        scale_values = [float(value) for value in control_dim_scale]
-        if len(scale_values) != self.flow_state_dim:
-            raise ValueError(
-                "validation_rollout_sampling.control_dim_noise_scale must have "
-                f"{self.flow_state_dim} values for control-space Flow, got {scale_values!r}."
-            )
-        scale_tensor = noise_tape.new_tensor(scale_values).view(1, 1, self.flow_state_dim)
-        return noise_tape * scale_tensor
-
-    def _apply_rollout_temporal_noise_smoothing(
-        self,
-        noise_tape: torch.Tensor,
-        sampling_scheme: DictConfig,
-    ) -> torch.Tensor:
-        """Apply optional variance-preserving AR(1) smoothing over rollout noise time."""
-        rho = float(getattr(sampling_scheme, "temporal_noise_smoothing_rho", 0.0))
-        if rho == 0.0:
-            return noise_tape
-        if not self.use_kinematic_control_flow:
-            return noise_tape
-        if noise_tape.shape[1] <= 1:
-            return noise_tape
-        if not (0.0 <= rho < 1.0):
-            raise ValueError(
-                "validation_rollout_sampling.temporal_noise_smoothing_rho must be in "
-                f"[0, 1), got {rho}."
-            )
-        innovation_scale = math.sqrt(max(0.0, 1.0 - rho * rho))
-        smoothed = torch.empty_like(noise_tape)
-        smoothed[:, 0] = noise_tape[:, 0]
-        for step in range(1, noise_tape.shape[1]):
-            smoothed[:, step] = rho * smoothed[:, step - 1] + innovation_scale * noise_tape[:, step]
-        return smoothed
+        """Apply scalar closed-loop noise scale."""
+        return noise_tape * float(noise_scale)
 
     def _encode_context(
         self,

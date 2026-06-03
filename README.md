@@ -1099,43 +1099,6 @@ RMM 기준으로 antithetic pair가 더 높았으므로 repository 기본값은 
 
 이 sweep에서는 RMM 기준 `validation_closed_seed=4` 가 가장 높았으므로 repository 기본값은 `model.model_config.validation_closed_seed=4` 로 둡니다. 이 변경은 checkpoint, model parameter, solver, denoising step, noise scale을 바꾸지 않고 closed-loop initial noise의 deterministic seed만 고정합니다.
 
-control-space Flow에서는 closed-loop rollout initial noise에 dim별 scale도 줄 수 있습니다. 이 값은 `model.model_config.validation_rollout_sampling.control_dim_noise_scale=[longitudinal,lateral,yaw]` 로 설정하며, 기본값은 `[1.0,1.0,1.0]` 입니다. 이 옵션은 checkpoint, model parameter, solver, denoising step 수를 바꾸지 않고 control-space initial noise의 각 dim 분산만 조절합니다. control-space가 아닌 decoder 경로에서는 적용하지 않습니다.
-
-같은 checkpoint와 Fast-RMM 조건에서 `antithetic_pairs=true`, `noise_scale=1.0`, `use_lqr=false`, `use_stop_motion=false` 를 고정하고 dim별 scale만 바꿔 비교한 결과는 아래와 같습니다.
-
-| control_dim_noise_scale | RMM | CPD | CES |
-|---|---:|---:|---:|
-| `[1.0,1.0,1.0]` | 0.781846 | 0.201687 | 0.095312 |
-| `[1.0,0.9,0.85]` | 0.780382 | 0.190214 | 0.095070 |
-| `[1.0,0.8,0.75]` | 0.778132 | 0.184902 | 0.095357 |
-| `[1.0,0.8,0.85]` | 0.780271 | 0.189987 | 0.095225 |
-| `[1.0,0.9,0.75]` | 0.778183 | 0.184967 | 0.095237 |
-| `[1.0,0.85,0.8]` | 0.779160 | 0.187281 | 0.095170 |
-
-이 sweep에서는 lateral/yaw noise를 줄인 후보들이 모두 기존 `[1.0,1.0,1.0]` 보다 RMM이 낮았습니다. 따라서 repository 기본값은 `model.model_config.validation_rollout_sampling.control_dim_noise_scale=[1.0,1.0,1.0]` 으로 유지합니다.
-
-closed-loop rollout initial noise는 시간축으로 약하게 smoothing할 수도 있습니다. 이 값은 `model.model_config.validation_rollout_sampling.temporal_noise_smoothing_rho` 로 설정하며, 기본값은 `0.0` 입니다. `rho=0.0` 은 기존 iid Gaussian tape와 동일하고, `rho>0` 일 때만 control-space Flow noise tape의 시간축에 variance-preserving AR(1) smoothing을 적용합니다. control-space가 아닌 decoder 경로에서는 적용하지 않습니다.
-
-개념적 shape은 아래와 같습니다.
-
-```text
-raw_noise:      [N_agent, 95, 3]
-smoothed_noise: [N_agent, 95, 3]
-z_smooth[t] = rho * z_smooth[t-1] + sqrt(1-rho^2) * eps[t]
-```
-
-같은 checkpoint와 Fast-RMM 조건에서 `antithetic_pairs=true`, `noise_scale=1.0`, `use_lqr=false`, `use_stop_motion=false`, `sample_steps=16` 을 고정하고 temporal smoothing을 비교한 결과는 아래와 같습니다.
-
-| temporal_noise_smoothing_rho | control_dim_noise_scale | RMM | WOSAC-CPD | CES |
-|---:|---|---:|---:|---:|
-| 0.0 | `[1.0,1.0,1.0]` | 0.781846 | 0.201687 | 0.095312 |
-| 0.2 | `[1.0,1.0,1.0]` | 0.775682 | 0.284607 | 0.104305 |
-| 0.3 | `[1.0,1.0,1.0]` | 0.765973 | 0.347267 | 0.114724 |
-| 0.2 | `[1.0,0.8,0.8]` | 0.777677 | 0.259876 | 0.101118 |
-| 0.3 | `[1.0,0.8,0.8]` | 0.773523 | 0.314480 | 0.108705 |
-
-이 sweep에서는 temporal smoothing 후보들이 모두 기존 `rho=0.0`, `control_dim_noise_scale=[1.0,1.0,1.0]` 보다 RMM이 낮았습니다. 따라서 repository 기본값은 `model.model_config.validation_rollout_sampling.temporal_noise_smoothing_rho=0.0` 으로 유지합니다.
-
 #### hsb-npc-training/wo-pvc-2 H100x4+H100x2 epoch 61 Waymo validation 제출
 
 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 학습에서 고른 epoch 61 `epoch_last.ckpt`로 validation split 전체의 Waymo Sim Agents 제출물을 만들고, Waymo 사이트에 자동 업로드하려면 아래 wrapper를 씁니다. 이 wrapper도 기존 `hsb-npc-training` 4 H100 + `wo-pvc-2` 2 H100 pod 안의 tmux session만 만들며, pod를 새로 만들거나 재시작하지 않습니다.
