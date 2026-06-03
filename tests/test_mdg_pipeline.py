@@ -509,7 +509,7 @@ def test_mdg_waymo_paper_contract_defaults() -> None:
     assert model_cfg.closed_loop_denoising_steps == 5
     assert model_cfg.closed_loop_denoising_schedule == "temporal"
     assert model_cfg.closed_loop_reuse_actions is True
-    assert list(model_cfg.closed_loop_reuse_alpha) == [0.95, 0.90, 0.80, 0.01]
+    assert list(model_cfg.closed_loop_reuse_alpha) == [0.70, 0.60, 0.50, 0.01]
     assert model_cfg.action_loss_weight == 0.0
     assert model_cfg.aux_loss_weight == 5.0
     assert model_cfg.sim_agents_submission.num_model_parameters == "12.99M"
