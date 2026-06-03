@@ -23,6 +23,9 @@
 - `model.model_config.decoder.use_lqr=true` 를 켜면 vehicle / bicycle에만
   curvature-domain LQR + kinematic bicycle commit bridge를 적용합니다. 이 모드에서는 2초 FM
   미래를 preview로 보되, 실제 반영은 항상 다음 0.5초 / 5점만 실행합니다.
+- control-space Flow에서는 LQR가 raw control tensor를 직접 pose 미래로 오해하지 않도록,
+  `use_holonomic_model_only=true/false` 설정에 맞춰 2초 control output을 pose-space reference로
+  먼저 복원한 뒤 LQR reference로 사용합니다.
 - LQR bridge는 최근 실제 10Hz 6점 history로 현재 speed / yaw-rate / curvature를 잡고,
   차종별 속도, 가감속, yaw-rate, 횡가속, 최소 선회 반경 제한을 같이 씁니다.
 - wheelbase가 없는 WOMD multi-agent 특성을 고려해 steering angle 대신 **curvature를 제어 입력**
@@ -1479,6 +1482,9 @@ python scripts/launch_pre_bc_flow_control_v100x47_static_pods.py --stop
 - `model.model_config.decoder.use_lqr=true/false`로 vehicle / bicycle용 curvature-LQR commit
   bridge를 켜거나 끕니다. 기본값은 `false` 입니다.
 - `use_lqr=true`면 2초 미래를 바로 commit하지 않고, 다음 0.5초 commit window만 실제로 실행합니다.
+- control-space Flow에서는 `use_kinematic_control_flow=true` 와 함께 사용할 수 있으며,
+  LQR는 `use_holonomic_model_only` 설정을 따른 pose-space reference를 만든 뒤 vehicle / bicycle에만
+  적용됩니다.
 - `use_stop_motion`은 항상 false로 처리되므로 stop token 기반 0.5초 고정은 적용되지 않습니다.
 - `use_lqr=true`는 vehicle / bicycle 에만 적용됩니다. pedestrian 은 항상
   token / raw branch 를 유지합니다.
@@ -1524,6 +1530,15 @@ python scripts/launch_pre_bc_flow_control_v100x47_static_pods.py --stop
 # vehicle / bicycle export는 실행된 5점 chunk를 유지하고 pedestrian만 token chunk를 씁니다.
 ... model.model_config.decoder.use_lqr=true \
     model.model_config.decoder.closed_loop_rollout_mode=matched_token_chunk
+
+`flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 의 W&B 마지막 artifact `epoch-last-x5f9g0ce:v60` 을 `hsb-npc-training-1` H100x6, `use_stop_motion=false`, `sample_steps=16`, `antithetic_pairs=true`, `noise_scale=1.0`, `val_batch_size=56`, `scorer_scene_num=1680` 조건으로 Fast-RMM 비교한 결과는 아래와 같습니다.
+
+| use_lqr | RMM | CPD | CES |
+|---|---:|---:|---:|
+| false | 0.781846 | 0.201687 | 0.095312 |
+| true | 0.739973 | 0.132768 | 0.138147 |
+
+RMM 기준으로 `use_lqr=false`가 더 높았으므로 repository 기본값은 `model.model_config.decoder.use_lqr=false` 로 유지합니다.
 
 # training validation에서 Fast WOSAC scorer를 앞 20 batch에만 적용
 # scorer_scene_num 자동 덮어쓰기를 끈 경우에만 의미가 있습니다.

@@ -1723,6 +1723,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         exec_head_history=exec_head_history_act[lqr_mask_act],
                         exec_valid_history=exec_valid_history_act[lqr_mask_act],
                         agent_type=active_agent_type[lqr_mask_act],
+                        agent_length=active_agent_length[lqr_mask_act],
                     )
                     commit_pos_act[lqr_mask_act] = lqr_commit_pos_act
                     commit_head_act[lqr_mask_act] = lqr_commit_head_act

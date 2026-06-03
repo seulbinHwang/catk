@@ -910,21 +910,11 @@ class ContinuousCommitBridge:
         agent_type: torch.Tensor | None = None,
         agent_length: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.use_kinematic_control_flow:
-            if agent_type is None:
-                raise ValueError("agent_type is required when use_kinematic_control_flow=True.")
-            y_hat_norm = control_norm_to_pose_norm(
-                control_norm=y_hat_norm,
-                agent_type=agent_type,
-                agent_length=agent_length,
-                pos_scale_m=self.control_pos_scale_m,
-                vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
-                pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
-                cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
-                use_holonomic_model_only=self.use_holonomic_model_only,
-                vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
-                cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
-            )
+        y_hat_norm = self._flow_output_to_pose_norm(
+            y_hat_norm=y_hat_norm,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
         first_chunk = y_hat_norm[:, : self.commit_steps].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m
 
@@ -941,6 +931,30 @@ class ContinuousCommitBridge:
         next_pos = commit_pos[:, -1]
         next_head = commit_head[:, -1]
         return commit_pos, commit_head, next_pos, next_head
+
+    def _flow_output_to_pose_norm(
+        self,
+        y_hat_norm: torch.Tensor,
+        agent_type: torch.Tensor | None = None,
+        agent_length: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Closed-loop commit paths consume the common pose-space flow view."""
+        if not self.use_kinematic_control_flow:
+            return y_hat_norm
+        if agent_type is None:
+            raise ValueError("agent_type is required when use_kinematic_control_flow=True.")
+        return control_norm_to_pose_norm(
+            control_norm=y_hat_norm,
+            agent_type=agent_type,
+            agent_length=agent_length,
+            pos_scale_m=self.control_pos_scale_m,
+            vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            use_holonomic_model_only=self.use_holonomic_model_only,
+            vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
+        )
 
     def _build_full_future_from_flow(
         self,
@@ -1490,17 +1504,20 @@ class ContinuousCommitBridge:
         exec_head_history: torch.Tensor,
         exec_valid_history: torch.Tensor,
         agent_type: torch.Tensor,
+        agent_length: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """vehicle / bicycle의 다음 0.5초를 0.1초 receding-horizon LQR로 실행합니다.
 
         Args:
-            y_hat_norm: raw FM 2초 미래입니다. shape은 ``[n_agent, 20, 4]`` 입니다.
+            y_hat_norm: raw FM 2초 미래입니다. pose-space에서는 ``[n_agent, 20, 4]``,
+                control-space에서는 ``[n_agent, 20, 3]`` 입니다.
             current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 방향입니다. shape은 ``[n_agent]`` 입니다.
             exec_pos_history: 최근 실제 fine history 입니다. shape은 ``[n_agent, 6, 2]`` 입니다.
             exec_head_history: 최근 실제 fine heading 입니다. shape은 ``[n_agent, 6]`` 입니다.
             exec_valid_history: 최근 실제 fine valid 입니다. shape은 ``[n_agent, 6]`` 입니다.
             agent_type: 차종 번호입니다. shape은 ``[n_agent]`` 입니다.
+            agent_length: WOMD box length입니다. shape은 ``[n_agent]`` 입니다.
 
         Returns:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1514,8 +1531,13 @@ class ContinuousCommitBridge:
             empty_head = current_head.new_zeros((0, 5))
             return empty_pos, empty_head, current_pos.clone(), current_head.clone()
 
-        future_pos, future_head = self._build_full_future_from_flow(
+        y_hat_pose_norm = self._flow_output_to_pose_norm(
             y_hat_norm=y_hat_norm,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
+        future_pos, future_head = self._build_full_future_from_flow(
+            y_hat_norm=y_hat_pose_norm,
             current_pos=current_pos,
             current_head=current_head,
         )
