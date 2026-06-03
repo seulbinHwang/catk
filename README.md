@@ -1087,6 +1087,18 @@ RMM 기준으로 antithetic pair가 더 높았으므로 repository 기본값은 
 
 이 sweep에서는 RMM 기준 `noise_scale=1.01` 이 가장 높았으므로 repository 기본값은 `model.model_config.validation_rollout_sampling.noise_scale=1.01` 로 둡니다. `noise_scale=1.01` 은 기존 최고였던 `1.0` 대비 CPD는 높지만 CES도 소폭 높아지며, 최종 선택 기준은 RMM입니다.
 
+같은 checkpoint와 Fast-RMM 조건에서 `antithetic_pairs=true`, `noise_scale=1.01`, `sample_steps=16`, `use_lqr=false`, `use_stop_motion=false` 를 고정하고 `model.model_config.validation_closed_seed` 만 바꾼 seed-bank sweep 결과는 아래와 같습니다. 336 scene quick stage로 후보를 고른 뒤, 상위 후보와 기존 seed 0을 1680 scene full stage에서 다시 평가했습니다.
+
+| validation_closed_seed | RMM | WOSAC-CPD | CES |
+|---:|---:|---:|---:|
+| 4 | 0.782288 | 0.204221 | 0.095397 |
+| 97 | 0.782226 | 0.204136 | 0.095197 |
+| 53 | 0.782148 | 0.204055 | 0.095516 |
+| 0 | 0.781992 | 0.205177 | 0.095503 |
+| 7 | 0.781502 | 0.204455 | 0.095486 |
+
+이 sweep에서는 RMM 기준 `validation_closed_seed=4` 가 가장 높았으므로 repository 기본값은 `model.model_config.validation_closed_seed=4` 로 둡니다. 이 변경은 checkpoint, model parameter, solver, denoising step, noise scale을 바꾸지 않고 closed-loop initial noise의 deterministic seed만 고정합니다.
+
 control-space Flow에서는 closed-loop rollout initial noise에 dim별 scale도 줄 수 있습니다. 이 값은 `model.model_config.validation_rollout_sampling.control_dim_noise_scale=[longitudinal,lateral,yaw]` 로 설정하며, 기본값은 `[1.0,1.0,1.0]` 입니다. 이 옵션은 checkpoint, model parameter, solver, denoising step 수를 바꾸지 않고 control-space initial noise의 각 dim 분산만 조절합니다. control-space가 아닌 decoder 경로에서는 적용하지 않습니다.
 
 같은 checkpoint와 Fast-RMM 조건에서 `antithetic_pairs=true`, `noise_scale=1.0`, `use_lqr=false`, `use_stop_motion=false` 를 고정하고 dim별 scale만 바꿔 비교한 결과는 아래와 같습니다.
