@@ -210,6 +210,35 @@ bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_legacy_inputs_trainselectfa
 `smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_fresh_0601`이다.
 나머지 학습 recipe는 fresh wrapper와 같다.
 
+2026-06-01에 `SIGINT / KeyboardInterrupt`로 중단된 아래 run을 기존 checkpoint에서 그대로
+이어가려면 resume 전용 wrapper를 사용한다.
+
+```bash
+bash scripts/start_smart_ntp_a100x4x2_testa_pretrain_legacy_inputs_trainselectfalse_20260601_resume_oom_retry.sh
+```
+
+이 wrapper는 기본적으로 아래 값을 고정한다.
+
+| 항목 | 값 |
+|---|---|
+| task name | `smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_fresh_20260601` |
+| code ref | `main@4b65c615dbd0f33a626203352ae913ed7747c12d` |
+| cache | `/workspace/womd_v1_3/SMART_cache` |
+| start batch | `13` |
+| resume checkpoint | 해당 task 아래 최신 `epoch_last.ckpt` |
+| W&B run id | `1iapr5ed` |
+| train target selection | `data.train_use_eval_agent_selection=false` |
+
+`GIT_REF`를 `4b65c615`로 고정하는 이유는 이 checkpoint가 `decoder.num_freq_bands=88`
+모델에서 만들어졌기 때문이다. 현재 최신 `main`처럼 model shape이 달라진 코드로 resume하면
+checkpoint shape이 맞지 않을 수 있으므로, 이 중단 run을 이어갈 때는 이 wrapper를 사용한다.
+진행 로그 확인은 아래처럼 한다.
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- \
+  tmux attach -t catk-smart-ntp-a100x4x2-fresh-main-resume-20260601
+```
+
 이 fresh wrapper는 기본적으로 `CACHE_ROOT=/workspace/womd_v1_3/SMART_cache`,
 `INITIAL_BS=13`, `OOM_STEP=1`, `MIN_BS=8`, `VAL_BATCH_SIZE=12`,
 `TEST_BATCH_SIZE=12`, `data.train_use_eval_agent_selection=false`를 사용한다.
