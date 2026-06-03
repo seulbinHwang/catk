@@ -18,17 +18,18 @@ command -v conda >/dev/null 2>&1 && conda activate "${CATK_CONDA_ENV}" || true
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 cd "$(dirname "$0")/.." || exit 1
 
-# 고정(검증된) 세팅
-FAKE_LR="${FAKE_LR:-1.0e-4}"; EU="${EU:-1}"; NA="${NA:-4}"; SS="${SS:-16}"
+# 고정 세팅 (n_anchors=4 = trajectory 커버, critic lr·ODE 고정)
+FAKE_LR="${FAKE_LR:-1.0e-4}"; NA="${NA:-4}"; SS="${SS:-16}"
 MAX_EPOCHS="${MAX_EPOCHS:-180}"; VAL_EVERY="${VAL_EVERY:-10}"; NRCV="${NRCV:-16}"
-PER_CFG_TIMEOUT="${PER_CFG_TIMEOUT:-3000}"
+PER_CFG_TIMEOUT="${PER_CFG_TIMEOUT:-5400}"
 
-# config 미지정 시 기본 grid (gen lr × grad clip)
+# config 형식: "LABEL GEN_LR ESTIMATOR_UPDATES [GRAD_CLIP]"
+#   cadence(critic:gen) = NA(=4) × ESTIMATOR_UPDATES : 1.  (updates 2→8:1, 4→16:1, 12→48:1)
+# 기본 grid (low lr × cadence, 극단 48:1 포함)
 if [ "$#" -eq 0 ]; then
   set -- \
-    "g1e5_c10 1.0e-5 10.0" "g1e5_c1 1.0e-5 1.0" \
-    "g3e5_c10 3.0e-5 10.0" "g3e5_c1 3.0e-5 1.0" \
-    "g1e4_c10 1.0e-4 10.0" "g1e4_c1 1.0e-4 1.0"
+    "g3e5_u2 3.0e-5 2 10.0" "g3e5_u4 3.0e-5 4 10.0" "g3e5_u12 3.0e-5 12 10.0" \
+    "g1e5_u12 1.0e-5 12 10.0" "g5e5_u4 5.0e-5 4 10.0" "g5e5_u12 5.0e-5 12 10.0"
 fi
 
 RES="artifacts/sweep_results_gpu${CUDA_VISIBLE_DEVICES}.txt"
@@ -38,10 +39,11 @@ echo "===== lr×clip sweep 시작 $(date) GPU=${CUDA_VISIBLE_DEVICES} (cadence $
 
 for cfg in "$@"; do
   set -- $cfg
-  LABEL="$1"; GLR="$2"; GCLIP="$3"
-  TASK="sweepL_${LABEL}_$(date +%m%d_%H%M%S)"
+  LABEL="$1"; GLR="$2"; EU="$3"; GCLIP="${4:-10.0}"
+  RATIO=$(( NA * EU ))
+  TASK="sweepC_${LABEL}_$(date +%m%d_%H%M%S)"
   LOG="artifacts/${TASK}.log"
-  echo ">>> [$LABEL] gen_lr=$GLR grad_clip=$GCLIP  ($(date +%H:%M))" | tee -a "${RES}"
+  echo ">>> [$LABEL] gen_lr=$GLR cadence=${RATIO}:1 (updates=$EU) grad_clip=$GCLIP  ($(date +%H:%M))" | tee -a "${RES}"
   GEN_LR="$GLR" FAKE_LR="$FAKE_LR" ESTIMATOR_UPDATES="$EU" N_ANCHORS="$NA" SAMPLE_STEPS="$SS" \
     GRAD_CLIP="$GCLIP" MAX_EPOCHS="$MAX_EPOCHS" VAL_EVERY="$VAL_EVERY" N_ROLLOUT_CLOSED_VAL="$NRCV" \
     TASK="$TASK" timeout "${PER_CFG_TIMEOUT}" bash scripts/overfit_single_scene_dmd.sh >/dev/null 2>&1
@@ -50,7 +52,7 @@ for cfg in "$@"; do
   V="$(python tools/eval_rmm_trend.py "$RID" 2>/dev/null)"
   echo "    [$LABEL] run=$RID -> $V" | tee -a "${RES}"
   SCORE="$(printf '%s' "$V" | grep -oE 'score=[+-][0-9.]+' | sed 's/score=//')"
-  [ -n "$SCORE" ] && printf '%s\t%s\tgen_lr=%s clip=%s run=%s -> %s\n' "$SCORE" "$LABEL" "$GLR" "$GCLIP" "$RID" "$V" >> "${RANK}"
+  [ -n "$SCORE" ] && printf '%s\t%s\tgen_lr=%s cadence=%s:1 clip=%s run=%s -> %s\n' "$SCORE" "$LABEL" "$GLR" "$RATIO" "$GCLIP" "$RID" "$V" >> "${RANK}"
 done
 
 echo "===== sweep DONE $(date) — score 내림차순 랭킹 =====" | tee -a "${RES}"
