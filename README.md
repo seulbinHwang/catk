@@ -332,6 +332,22 @@ DRY_RUN=1 bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh --dry-run
 | inference temperature | 1.0 |
 | train sampler | memory-balanced distributed batch sampler |
 
+2026-06-04 00:28 KST에 최신 `UniMM@f3cd9fc` 기준 guarded launcher로 full pretrain을 실제 시작했다. 시작 전 두 pod 모두 compute process 없음, GPU memory 4MiB, utilization 0%로 idle 상태였다. launcher는 `/tmp/catk_unimm_launcher`에서 실행했고, 각 pod의 `/tmp/catk_unimm_h100x3x2` clean checkout을 `origin/UniMM@f3cd9fc`로 맞춘 뒤 `unimm-h100x3x2` tmux session을 생성했다.
+
+```text
+running full pretrain:
+  task_name=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_membal_temp1_20260604_002845
+  wandb_run_id=srjtmkii
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=30, val_batch_size=12
+  learning_rate=0.001185854123
+  inference_temperature=1.0
+  scorer_scene_num=1680
+  result=running
+```
+
+실행 검증은 단순 프로세스 확인이 아니라 실제 학습 step까지 확인했다. DDP 6개 rank가 모두 등록됐고, epoch 0에서 `288/2706` batch까지 OOM/Traceback/NaN 없이 진행됐다. 같은 시점 GPU memory는 rank-local H100별 약 `78~81GiB`, utilization은 `93~100%`였다. W&B summary 기준 `trainer/global_step=239`, `train/loss=4.4607`, `train/loss_cls=2.8750`, `train/loss_reg=1.5857`, `train/posterior_accept_rate=0.9077`로 finite loss와 posterior 통계가 정상 로깅됐다. epoch 0 진행 속도 기준 train-only는 약 40.6시간, 16 epoch마다 실행되는 validation/checkpoint overhead를 포함한 전체 예상 소요는 약 43~45시간이다.
+
 2026-06-03 23:35 KST에 guarded launcher와 H100 x3x2 파이프라인을 실제 pod/cache/GPU로 재검증했다. 검증 전후 `--status`에서 두 pod 모두 compute process 없음, GPU memory 4MiB, utilization 0%로 idle 상태였고, 검증용 tmux session은 종료 후 정리했다.
 
 ```text
