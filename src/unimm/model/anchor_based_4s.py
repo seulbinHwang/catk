@@ -148,6 +148,8 @@ class UniMMAnchorBased4s(LightningModule):
         self.use_closed_loop_training = bool(model_config.use_closed_loop_training)
         self.loss_weights = model_config.loss_weights
         self.inference_temperature = float(model_config.inference_temperature)
+        self.inference_top_k = int(getattr(model_config, "inference_top_k", 0) or 0)
+        self.inference_top_p = float(getattr(model_config, "inference_top_p", 1.0) or 1.0)
         self.validation_closed_seed = int(model_config.validation_closed_seed)
         self.n_batch_sim_agents_metric = int(model_config.n_batch_sim_agents_metric)
         self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
@@ -549,8 +551,37 @@ class UniMMAnchorBased4s(LightningModule):
     ) -> torch.Tensor:
         if self.inference_temperature <= 0:
             return logits.argmax(dim=-1)
-        probs = torch.softmax((logits / self.inference_temperature).float(), dim=-1)
-        return torch.multinomial(probs, num_samples=1, replacement=True, generator=generator).squeeze(-1)
+        scaled_logits = (logits / self.inference_temperature).float()
+        candidate_indices: torch.Tensor | None = None
+        if 0 < self.inference_top_k < scaled_logits.shape[-1]:
+            scaled_logits, candidate_indices = torch.topk(
+                scaled_logits,
+                k=self.inference_top_k,
+                dim=-1,
+            )
+        if 0.0 < self.inference_top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            remove_mask = sorted_probs.cumsum(dim=-1) > self.inference_top_p
+            remove_mask[..., 1:] = remove_mask[..., :-1].clone()
+            remove_mask[..., 0] = False
+            sorted_logits = sorted_logits.masked_fill(remove_mask, float("-inf"))
+            probs = torch.softmax(sorted_logits, dim=-1)
+            sampled = torch.multinomial(
+                probs,
+                num_samples=1,
+                replacement=True,
+                generator=generator,
+            ).squeeze(-1)
+            sampled = sorted_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+            if candidate_indices is not None:
+                return candidate_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+            return sampled
+        probs = torch.softmax(scaled_logits, dim=-1)
+        sampled = torch.multinomial(probs, num_samples=1, replacement=True, generator=generator).squeeze(-1)
+        if candidate_indices is not None:
+            return candidate_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+        return sampled
 
     def _predict_one_step(
         self,
