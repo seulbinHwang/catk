@@ -419,6 +419,40 @@ top-M mixture DDP smoke:
 
 이 smoke에서 6개 DDP rank가 모두 등록됐고, training 3 batch와 closed-loop validation 1 batch가 완료됐다. W&B offline summary에는 `val_open/loss=17.38987`, `val_open/loss_mixture=16.29450`, `val_open/loss_aux_ce=5.47683`, `val_open/aux_mixture_ratio=0.34602`, `val_closed/sim_agents_2025_mean/metametric=0.16552`가 finite로 기록됐다. 검증 종료 후 두 pod 모두 `unimm-topm-smoke` session 없이 GPU memory `4MiB`, utilization `0%`로 복귀했다.
 
+2026-06-04 21:47~21:52 KST에는 같은 commit `66eb5af`를 clean pull한 뒤 실제 H100 x3x2 pod와 실제 cache로 top-M objective를 다시 검증했다. 먼저 train+closed-loop validation 경로를 확인했고, 이후 운영 배치 크기인 per-GPU batch 30에서도 loss가 finite하게 내려가는지 확인했다.
+
+```text
+top-M train+validation smoke:
+  task_name=unimm_topm8_train5_val1_verify_20260604_214715
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=8, val_batch_size=2
+  trainer.limit_train_batches=5
+  trainer.limit_val_batches=1
+  model.model_config.n_rollout_closed_val=2
+  model.model_config.scorer_scene_num=12
+  result=exit status 0 on both pods
+  train/loss=14.57285, train/loss_mixture=13.52017, train/loss_aux_ce=5.26342
+  train/loss trend=down, train/loss_mixture trend=down
+  train/posterior_accept_rate=0.91106
+  val_open/loss=14.10991
+  val_closed/sim_agents_2025_mean/metametric=0.19329  # untrained tiny smoke, metric value is not a quality estimate
+
+top-M operating-batch loss smoke:
+  task_name=unimm_topm8_bs30_train3_loss_verify_20260604_215137
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=30, effective_train_batch_size=180
+  lr=0.001185854123
+  trainer.limit_train_batches=3
+  result=exit status 0 on both pods
+  train/loss trend=8->4->1 normalized sparkline, W&B: █▄▁
+  train/loss_mixture trend=8->4->1 normalized sparkline, W&B: █▄▁
+  train/loss=17.26965, train/loss_mixture=16.19053, train/loss_aux_ce=5.39556
+  train/aux_mixture_ratio=0.33325
+  train/posterior_accept_rate=0.89787
+```
+
+예전 hard `z*` run `unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_membal_temp1_20260604_002845`와 비교하면, objective가 달라져 loss 절댓값은 직접 비교하면 안 된다. 다만 예전 run도 초반 `train/loss`가 `8.99189 -> 7.73801 -> 6.91717`로 내려갔고 NaN 없이 진행됐으며, posterior accept rate는 `0.90479~0.92092` 범위였다. 새 top-M smoke도 `train/loss`와 `train/loss_mixture`가 내려가고 posterior accept rate가 `0.89787~0.91106`으로 같은 범위에 있어, 짧은 실제-cache/GPU 검증 기준으로는 학습 수렴을 막는 런타임/수치 오류가 보이지 않는다. `loss_aux_ce`는 보조항이라 batch별로 흔들릴 수 있지만 weight가 `0.2`이고 `aux_mixture_ratio`가 약 `0.33~0.39`로 주 loss를 압도하지 않았다.
+
 2026-06-03 23:46 KST에 최신 `UniMM@1dbe124` 기준으로 학습-추론 파이프라인을 코드 레벨과 실제 cache/GPU로 다시 감사했다. 검토 대상은 `src/unimm/model/anchor_based_4s.py`, `src/unimm/processor.py`, `src/unimm/anchors.py`, `src/unimm/losses.py`, `src/unimm/modules.py`, datamodule, memory-balanced sampler, H100 launcher였다.
 
 ```text
