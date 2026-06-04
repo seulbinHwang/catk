@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import pytest
 from omegaconf import OmegaConf
 from torch_geometric.data import HeteroData
 
@@ -78,6 +79,66 @@ def _make_data(num_agents: int = 3) -> HeteroData:
     data["agent"]["batch"] = torch.zeros(num_agents, dtype=torch.long)
     data["scenario_id"] = ["synthetic"]
     data["tfrecord_path"] = ["synthetic.tfrecords"]
+    return data
+
+
+def _make_two_scenario_data(order: tuple[str, str] = ("A", "B")) -> HeteroData:
+    agents_by_scenario = {
+        "A": [
+            {"type": 0, "y": 0.0, "speed": 0.30, "shape": [4.8, 2.0, 1.5]},
+            {"type": 1, "y": 1.0, "speed": 0.35, "shape": [1.0, 1.0, 1.7]},
+        ],
+        "B": [
+            {"type": 2, "y": 10.0, "speed": 0.40, "shape": [2.0, 1.0, 1.5]},
+            {"type": 0, "y": 11.0, "speed": 0.45, "shape": [4.8, 2.0, 1.5]},
+        ],
+    }
+    rows = [agent for scenario_id in order for agent in agents_by_scenario[scenario_id]]
+    n_agent = len(rows)
+
+    data = HeteroData()
+    data["map_save"]["traj_pos"] = torch.tensor(
+        [
+            [[0.0, 0.0], [2.5, 0.0], [5.0, 0.0]],
+            [[0.0, 10.0], [2.5, 10.0], [5.0, 10.0]],
+        ],
+        dtype=torch.float32,
+    )
+    data["map_save"]["traj_theta"] = torch.zeros(2)
+    data["pt_token"]["type"] = torch.zeros(2, dtype=torch.uint8)
+    data["pt_token"]["pl_type"] = torch.zeros(2, dtype=torch.uint8)
+    data["pt_token"]["light_type"] = torch.zeros(2, dtype=torch.uint8)
+    data["pt_token"]["num_nodes"] = 2
+    data["pt_token"]["batch"] = torch.arange(2, dtype=torch.long)
+
+    position = torch.zeros(n_agent, 91, 3)
+    heading = torch.zeros(n_agent, 91)
+    velocity = torch.zeros(n_agent, 91, 2)
+    agent_type = torch.zeros(n_agent, dtype=torch.uint8)
+    shape = torch.zeros(n_agent, 3)
+    batch = torch.zeros(n_agent, dtype=torch.long)
+    for agent_idx, row in enumerate(rows):
+        speed = float(row["speed"])
+        position[agent_idx, :, 0] = torch.arange(91, dtype=torch.float32) * speed
+        position[agent_idx, :, 1] = float(row["y"])
+        velocity[agent_idx, :, 0] = speed / 0.1
+        agent_type[agent_idx] = int(row["type"])
+        shape[agent_idx] = torch.tensor(row["shape"], dtype=torch.float32)
+        batch[agent_idx] = agent_idx // 2
+
+    data["agent"]["num_nodes"] = n_agent
+    data["agent"]["valid_mask"] = torch.ones(n_agent, 91, dtype=torch.bool)
+    data["agent"]["role"] = torch.zeros(n_agent, 3, dtype=torch.bool)
+    data["agent"]["role"][0, 0] = True
+    data["agent"]["id"] = torch.arange(n_agent, dtype=torch.long)
+    data["agent"]["type"] = agent_type
+    data["agent"]["position"] = position
+    data["agent"]["heading"] = heading
+    data["agent"]["velocity"] = velocity
+    data["agent"]["shape"] = shape
+    data["agent"]["batch"] = batch
+    data["scenario_id"] = list(order)
+    data["tfrecord_path"] = [f"{scenario_id}.tfrecords" for scenario_id in order]
     return data
 
 
@@ -568,6 +629,47 @@ def test_unimm_inference_samples_components_instead_of_argmax(tmp_path: Path):
     assert model._sample_component(logits, None).shape == (256,)
 
 
+def test_unimm_rejects_invalid_inference_sampling_config(tmp_path: Path):
+    anchor_path = tmp_path / "anchors.pkl"
+    with anchor_path.open("wb") as handle:
+        pickle.dump(_make_anchor_payload(), handle)
+
+    invalid_overrides = [
+        {"inference_top_k": -1},
+        {"inference_top_p": 0.0},
+        {"inference_top_p": -0.1},
+        {"inference_top_p": 1.1},
+        {"inference_top_p": float("nan")},
+    ]
+    for overrides in invalid_overrides:
+        with pytest.raises(ValueError):
+            UniMMAnchorBased4s(_make_model_cfg(anchor_path, **overrides))
+
+
+def test_unimm_top_k_and_top_p_sampling_remap_to_original_anchor_indices(tmp_path: Path):
+    anchor_path = tmp_path / "anchors.pkl"
+    with anchor_path.open("wb") as handle:
+        pickle.dump(_make_anchor_payload(num_anchors=5), handle)
+
+    top_k_model = UniMMAnchorBased4s(
+        _make_model_cfg(anchor_path, inference_top_k=2, inference_top_p=1.0)
+    ).eval()
+    logits = torch.tensor([[0.0, 1.0, 10.0, 9.0, 8.0]]).repeat(128, 1)
+    generator = torch.Generator(device=logits.device)
+    generator.manual_seed(0)
+
+    sampled = top_k_model._sample_component(logits, generator)
+
+    assert set(sampled.tolist()).issubset({2, 3})
+
+    top_p_model = UniMMAnchorBased4s(
+        _make_model_cfg(anchor_path, inference_top_k=3, inference_top_p=0.01)
+    ).eval()
+    sampled = top_p_model._sample_component(logits[:16], None)
+
+    assert torch.equal(sampled, torch.full((16,), 2, dtype=torch.long))
+
+
 def test_unimm_lr_schedule_starts_at_initial_lr_and_decays_to_zero(tmp_path: Path):
     anchor_path = tmp_path / "anchors.pkl"
     with anchor_path.open("wb") as handle:
@@ -664,3 +766,48 @@ def test_unimm_inference_rollout_commits_half_second_chunks(tmp_path: Path, monk
     assert calls["count"] == 16
     assert torch.allclose(pred_traj[..., 0], current_x.view(-1, 1) + expected_offsets)
     assert torch.allclose(pred_head[:, :5], torch.arange(1, 6).view(1, 5) * 0.01)
+
+
+def test_unimm_rollout_sampling_is_stable_when_scenario_batch_order_changes(
+    tmp_path: Path,
+    monkeypatch,
+):
+    anchor_path = tmp_path / "anchors.pkl"
+    with anchor_path.open("wb") as handle:
+        pickle.dump(_make_anchor_payload(num_anchors=4), handle)
+
+    model = UniMMAnchorBased4s(
+        _make_model_cfg(
+            anchor_path,
+            inference_temperature=1.0,
+            inference_top_k=0,
+            inference_top_p=1.0,
+        )
+    ).eval()
+
+    def fake_predict_one_step(tokenized_map, tokenized_agent, current_pos, current_head, generator):
+        del tokenized_map
+        logits = torch.zeros(current_pos.shape[0], 4, device=current_pos.device)
+        if isinstance(generator, dict):
+            z = model._sample_component_by_agent_batch(
+                logits=logits,
+                agent_batch=tokenized_agent["batch"],
+                generators_by_batch=generator,
+            )
+        else:
+            z = model._sample_component(logits, generator)
+        offsets = z.to(dtype=current_pos.dtype).add(1.0)
+        pred_pos = current_pos[:, None, :].repeat(1, 40, 1)
+        pred_pos[..., 0] += offsets.view(-1, 1)
+        pred_head = current_head[:, None].repeat(1, 40)
+        return pred_pos, pred_head, z
+
+    monkeypatch.setattr(model, "_predict_one_step", fake_predict_one_step)
+    data_ab = _make_two_scenario_data(("A", "B"))
+    data_ba = _make_two_scenario_data(("B", "A"))
+
+    pred_ab, _, _ = model._run_one_rollout(data_ab, rollout_idx=3)
+    pred_ba, _, _ = model._run_one_rollout(data_ba, rollout_idx=3)
+
+    assert torch.allclose(pred_ab[0:2], pred_ba[2:4])
+    assert torch.allclose(pred_ab[2:4], pred_ba[0:2])

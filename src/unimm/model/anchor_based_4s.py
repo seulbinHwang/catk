@@ -148,8 +148,17 @@ class UniMMAnchorBased4s(LightningModule):
         self.use_closed_loop_training = bool(model_config.use_closed_loop_training)
         self.loss_weights = model_config.loss_weights
         self.inference_temperature = float(model_config.inference_temperature)
-        self.inference_top_k = int(getattr(model_config, "inference_top_k", 0) or 0)
-        self.inference_top_p = float(getattr(model_config, "inference_top_p", 1.0) or 1.0)
+        self.inference_top_k = int(getattr(model_config, "inference_top_k", 0))
+        self.inference_top_p = float(getattr(model_config, "inference_top_p", 1.0))
+        if self.inference_top_k < 0:
+            raise ValueError(
+                f"inference_top_k must be non-negative, got {self.inference_top_k}."
+            )
+        if not (math.isfinite(self.inference_top_p) and 0.0 < self.inference_top_p <= 1.0):
+            raise ValueError(
+                "inference_top_p must be finite and in the interval (0, 1], "
+                f"got {self.inference_top_p}."
+            )
         self.validation_closed_seed = int(model_config.validation_closed_seed)
         self.n_batch_sim_agents_metric = int(model_config.n_batch_sim_agents_metric)
         self.scorer_scene_num = getattr(model_config, "scorer_scene_num", None)
@@ -544,6 +553,21 @@ class UniMMAnchorBased4s(LightningModule):
         digest = hashlib.blake2b(payload, digest_size=8).digest()
         return int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
 
+    def _make_closed_loop_generators(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_idx: int,
+        device: torch.device,
+    ) -> dict[int, torch.Generator]:
+        if len(scenario_ids) == 0:
+            scenario_ids = ("0",)
+        generators: dict[int, torch.Generator] = {}
+        for scenario_index, scenario_id in enumerate(scenario_ids):
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self._make_closed_loop_seed(str(scenario_id), rollout_idx))
+            generators[int(scenario_index)] = generator
+        return generators
+
     def _sample_component(
         self,
         logits: torch.Tensor,
@@ -583,18 +607,51 @@ class UniMMAnchorBased4s(LightningModule):
             return candidate_indices.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         return sampled
 
+    def _sample_component_by_agent_batch(
+        self,
+        logits: torch.Tensor,
+        agent_batch: torch.Tensor,
+        generators_by_batch: dict[int, torch.Generator],
+    ) -> torch.Tensor:
+        if agent_batch.shape != logits.shape[:-1]:
+            raise ValueError(
+                "agent_batch must match logits without the component dimension, "
+                f"got agent_batch={tuple(agent_batch.shape)} and logits={tuple(logits.shape)}."
+            )
+
+        sampled = torch.empty(logits.shape[:-1], dtype=torch.long, device=logits.device)
+        batch_ids = torch.unique(agent_batch.detach().cpu()).tolist()
+        for batch_id in batch_ids:
+            batch_id = int(batch_id)
+            generator = generators_by_batch.get(batch_id)
+            if generator is None:
+                raise ValueError(
+                    f"Missing scenario generator for agent batch index {batch_id}. "
+                    f"Available indices: {sorted(generators_by_batch)}."
+                )
+            mask = agent_batch == batch_id
+            sampled[mask] = self._sample_component(logits[mask], generator)
+        return sampled
+
     def _predict_one_step(
         self,
         tokenized_map: Dict[str, torch.Tensor],
         tokenized_agent: Dict[str, torch.Tensor],
         current_pos: torch.Tensor,
         current_head: torch.Tensor,
-        generator: torch.Generator | None,
+        generator: torch.Generator | dict[int, torch.Generator] | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         embedding_seq = self.network.encode(tokenized_map, tokenized_agent)
         embedding_now = embedding_seq[:, -1]
         logits = self.network.motion_decoder.scorer(embedding_now)
-        z = self._sample_component(logits, generator)
+        if isinstance(generator, dict):
+            z = self._sample_component_by_agent_batch(
+                logits=logits,
+                agent_batch=tokenized_agent["batch"],
+                generators_by_batch=generator,
+            )
+        else:
+            z = self._sample_component(logits, generator)
         selected_anchor = gather_anchors_by_type(
             self.anchors_by_type[:, :, : self.spec.num_prediction_steps],
             tokenized_agent["type"],
@@ -614,6 +671,7 @@ class UniMMAnchorBased4s(LightningModule):
         self,
         data,
         rollout_idx: int,
+        scenario_ids: Sequence[str] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokenized_map, tokenized_agent, current_pos, current_head, current_valid = (
             self.processor.build_rollout_seed(data)
@@ -627,9 +685,13 @@ class UniMMAnchorBased4s(LightningModule):
             (current_head.shape[0], self.spec.num_future_steps)
         )
 
-        first_scenario = str(data["scenario_id"][0]) if len(data["scenario_id"]) > 0 else "0"
-        generator = torch.Generator(device=current_pos.device)
-        generator.manual_seed(self._make_closed_loop_seed(first_scenario, rollout_idx))
+        if scenario_ids is None:
+            scenario_ids = data["scenario_id"]
+        generators = self._make_closed_loop_generators(
+            scenario_ids=scenario_ids,
+            rollout_idx=rollout_idx,
+            device=current_pos.device,
+        )
 
         for rollout_step in range(self.spec.num_future_steps // self.spec.num_commit_steps):
             pred_pos_4s, pred_head_4s, z = self._predict_one_step(
@@ -637,7 +699,7 @@ class UniMMAnchorBased4s(LightningModule):
                 tokenized_agent=tokenized_agent,
                 current_pos=current_pos,
                 current_head=current_head,
-                generator=generator,
+                generator=generators,
             )
             sl = slice(
                 rollout_step * self.spec.num_commit_steps,
@@ -683,13 +745,16 @@ class UniMMAnchorBased4s(LightningModule):
         data,
         scenario_ids: Sequence[str],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        del scenario_ids
         pred_traj_list = []
         pred_z_list = []
         pred_head_list = []
         for rollout_idx in range(self.n_rollout_closed_val):
             try:
-                pred_traj, pred_z, pred_head = self._run_one_rollout(data, rollout_idx)
+                pred_traj, pred_z, pred_head = self._run_one_rollout(
+                    data,
+                    rollout_idx,
+                    scenario_ids=scenario_ids,
+                )
             except RuntimeError as error:
                 if not self._is_cuda_out_of_memory(error):
                     raise
