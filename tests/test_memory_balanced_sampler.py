@@ -12,6 +12,7 @@ from src.smart.datamodules.memory_balanced_sampler import (
     MemoryBalancedDistributedBatchSampler,
     load_or_build_memory_metadata,
 )
+from src.smart.datamodules.scalable_datamodule import MultiDataModule
 
 
 def _fake_paths(n_samples: int) -> list[str]:
@@ -101,6 +102,27 @@ def test_memory_balanced_sampler_epoch_is_visible_to_lightning() -> None:
     _set_sampler_epoch(loader, 3)
 
     assert sampler.epoch == 3
+
+
+def test_multidatamodule_explicitly_forwards_train_epoch_to_memory_sampler() -> None:
+    agent_counts = [50, 45, 40, 35, 30, 25, 20, 15]
+    sampler = MemoryBalancedDistributedBatchSampler(
+        raw_paths=_fake_paths(len(agent_counts)),
+        batch_size=2,
+        num_replicas=2,
+        rank=0,
+        shuffle=True,
+        seed=7,
+        metadata_entries=_metadata_from_agent_counts(agent_counts),
+        weight_key="agent_count",
+        bucket_size_multiplier=4,
+    )
+    datamodule = MultiDataModule.__new__(MultiDataModule)
+    datamodule._train_batch_sampler = sampler
+
+    MultiDataModule.set_train_epoch(datamodule, 5)
+
+    assert sampler.epoch == 5
 
 
 def test_memory_metadata_cache_reads_agent_valid_and_map_counts(tmp_path) -> None:

@@ -88,6 +88,7 @@ class MultiDataModule(LightningDataModule):
         self.random_time_shift_config = random_time_shift_config
         self._train_dataset_raw_dir: Optional[str] = None
         self._train_dataset_road_group_size: Optional[int] = None
+        self._train_batch_sampler: Optional[MemoryBalancedDistributedBatchSampler] = None
 
         self.train_transform = build_train_agent_target_builder(
             train_max_num, train_use_eval_agent_selection
@@ -110,6 +111,7 @@ class MultiDataModule(LightningDataModule):
         self.train_dataset = None
         self._train_dataset_raw_dir = None
         self._train_dataset_road_group_size = None
+        self._train_batch_sampler = None
 
     def _build_train_dataset(self) -> None:
         """현재 설정된 train cache에서 학습 dataset을 만든다.
@@ -175,6 +177,7 @@ class MultiDataModule(LightningDataModule):
                 weight_key=self.train_memory_balance_weight_key,
                 bucket_size_multiplier=self.train_memory_balance_bucket_size_multiplier,
             )
+            self._train_batch_sampler = batch_sampler
             return DataLoader(
                 self.train_dataset,
                 batch_sampler=batch_sampler,
@@ -183,6 +186,7 @@ class MultiDataModule(LightningDataModule):
                 persistent_workers=self.persistent_workers,
             )
 
+        self._train_batch_sampler = None
         sampler = self._build_train_sampler(self.train_dataset)
         return DataLoader(
             self.train_dataset,
@@ -194,6 +198,13 @@ class MultiDataModule(LightningDataModule):
             persistent_workers=self.persistent_workers,
             drop_last=False,
         )
+
+    def set_train_epoch(self, epoch: int) -> None:
+        """Explicitly propagate the current training epoch to custom train samplers."""
+        batch_sampler = getattr(self, "_train_batch_sampler", None)
+        set_epoch = getattr(batch_sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(int(epoch))
 
     def _get_trainer_world_info(self) -> tuple[int, int]:
         trainer = getattr(self, "trainer", None)

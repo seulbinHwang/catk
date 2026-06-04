@@ -377,6 +377,11 @@ class SMART(LightningModule):
         # phase 시작 시 한 번씩 reset해서 train/val 상태가 섞이거나 epoch 간에
         # 무한 누적되지 않도록 한다.
         self.training_loss.reset()
+        trainer = getattr(self, "trainer", None)
+        datamodule = getattr(trainer, "datamodule", None)
+        set_train_epoch = getattr(datamodule, "set_train_epoch", None)
+        if callable(set_train_epoch):
+            set_train_epoch(self.current_epoch)
 
     def on_validation_start(self) -> None:
         self._apply_scorer_scene_num_overrides()
