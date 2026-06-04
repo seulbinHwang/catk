@@ -1057,7 +1057,7 @@ control-space Flow에서는 `D=3` 입니다. 각 0.5초 closed-loop block은 기
 model.model_config.validation_rollout_sampling.antithetic_pairs=false
 ```
 
-추가 실험 옵션으로 `model.model_config.validation_rollout_sampling.stratified_gaussian_noise=true` 를 켤 수 있습니다. 기본값은 `false` 입니다. 이 옵션은 `antithetic_pairs=true` 와 함께 쓸 때만 유효하며, 16개 base rollout이 각 coordinate에서 Gaussian quantile bin을 더 고르게 덮도록 만듭니다.
+추가 실험 옵션으로 `model.model_config.validation_rollout_sampling.stratified_gaussian_noise=true` 를 켤 수 있습니다. 기본값은 `false` 입니다. 이 옵션은 scenario별 deterministic seed를 넘기는 closed-loop validation/submission 경로 전용이며, `antithetic_pairs=true` 와 함께 쓸 때만 유효합니다. 켜면 16개 base rollout이 각 coordinate에서 Gaussian quantile bin을 더 고르게 덮도록 만듭니다.
 
 개념적 shape은 그대로 유지됩니다.
 

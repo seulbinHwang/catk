@@ -646,6 +646,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         if num_agent == 0:
             return torch.zeros((0, tape_steps, self.flow_state_dim), device=device, dtype=dtype)
+        if stratified_gaussian_noise and scenario_sampling_seeds is None:
+            raise ValueError(
+                "validation_rollout_sampling.stratified_gaussian_noise=true is supported "
+                "only for scenario-seeded closed-loop validation/submission rollout. "
+                "Pass scenario_sampling_seeds, scenario_sampling_strata, and "
+                "scenario_sampling_stratification_seeds."
+            )
 
         if scenario_sampling_seeds is not None:
             if agent_batch is None:
