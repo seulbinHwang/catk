@@ -2739,6 +2739,16 @@ python scripts/launch_waymo_val_submission_epoch061_h100x6_hsb1_static_pod.py \
 ```
 
 ```bash
+# stratified Gaussian + antithetic pair 설정으로 실제 validation leaderboard에 제출합니다.
+python scripts/launch_waymo_val_submission_epoch061_h100x6_hsb1_static_pod.py \
+  --antithetic-pairs true \
+  --stratified-gaussian-noise true \
+  --noise-scale 1.0 \
+  --submit-validation \
+  --replace
+```
+
+```bash
 # iid Gaussian noise, 즉 antithetic pair를 끈 설정으로 실제 validation leaderboard에 제출합니다.
 python scripts/launch_waymo_val_submission_epoch061_h100x6_hsb1_static_pod.py \
   --antithetic-pairs false \
@@ -2758,14 +2768,14 @@ python scripts/launch_waymo_val_submission_epoch061_h100x6_hsb1_static_pod.py \
 | action / experiment | `action=validate`, `experiment=sim_agents_sub_flow` |
 | rollout count | `model.model_config.n_rollout_closed_val=32` |
 | solver / denoising | Euler, `model.model_config.validation_rollout_sampling.sample_steps=16` |
-| inference noise | 기본 `antithetic_pairs=true`, `noise_scale=1.0`, `validation_closed_seed=4`; iid 제출은 `--antithetic-pairs false --noise-scale 1.0` |
+| inference noise | 기본 `antithetic_pairs=true`, `stratified_gaussian_noise=false`, `noise_scale=1.0`, `validation_closed_seed=4`; stratified 제출은 `--stratified-gaussian-noise true`, iid 제출은 `--antithetic-pairs false --noise-scale 1.0` |
 | post-process | `use_lqr=false`, `use_stop_motion=false` |
 | method name | `Flow Agents 7M` |
 | authors / affiliation | `SB H`, `KO O` / `NLK` |
-| description | 기본 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20_epoch061_true_1.0`; iid 제출은 `..._epoch061_false_1.0` |
+| description | 기본 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20_epoch061_true_stratified_false_1.0`; stratified 제출은 `..._epoch061_true_stratified_true_1.0`, iid 제출은 `..._epoch061_false_stratified_false_1.0` |
 | account | `h.sb@naverlabs.com` |
 | default validation batch | per-rank `val_batch_size=48` |
-| tmux session | 기본 `catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-antithetic-noise1000`; iid 제출은 `catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-iid-noise1000` |
+| tmux session | 기본 `catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-antithetic-iidgaussian-noise1000`; stratified 제출은 `catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-antithetic-stratified-noise1000`, iid 제출은 `catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-iid-iidgaussian-noise1000` |
 
 기존 `noise_scale=1.016` 설정을 재현해야 하면 동일 launcher에 `--noise-scale 1.016`을 추가합니다. 이 경우 task/session/description은 noise scale에 맞춰 자동으로 분리됩니다.
 

@@ -30,6 +30,7 @@ DEFAULT_ARTIFACT = "jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57"
 DEFAULT_EPOCH = 61
 DEFAULT_NOISE_SCALE = "1.0"
 DEFAULT_ANTITHETIC_PAIRS = "true"
+DEFAULT_STRATIFIED_GAUSSIAN_NOISE = "false"
 DESCRIPTION_PREFIX = (
     "flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_"
     "tailprefix_roundtrip05_lr6e-4_bs20_epoch061"
@@ -65,6 +66,10 @@ def noise_tag(value: str) -> str:
 
 def pair_label(value: str) -> str:
     return "antithetic" if value == "true" else "iid"
+
+
+def stratified_label(value: str) -> str:
+    return "stratified" if value == "true" else "iidgaussian"
 
 
 def run_kubectl(args: list[str], *, capture: bool = False, dry_run: bool = False) -> str:
@@ -126,6 +131,7 @@ def render_remote_script(args: argparse.Namespace) -> str:
         "model.model_config.validation_rollout_sampling.sample_method=euler",
         f"model.model_config.validation_rollout_sampling.noise_scale={args.noise_scale}",
         f"model.model_config.validation_rollout_sampling.antithetic_pairs={args.antithetic_pairs}",
+        f"model.model_config.validation_rollout_sampling.stratified_gaussian_noise={args.stratified_gaussian_noise}",
         "model.model_config.decoder.flow_solver_method=euler",
         "model.model_config.decoder.use_lqr=false",
         "model.model_config.decoder.use_stop_motion=false",
@@ -396,6 +402,15 @@ def parse_args() -> argparse.Namespace:
         choices=["true", "false"],
         default=DEFAULT_ANTITHETIC_PAIRS,
     )
+    parser.add_argument(
+        "--stratified-gaussian-noise",
+        choices=["true", "false"],
+        default=DEFAULT_STRATIFIED_GAUSSIAN_NOISE,
+        help=(
+            "Use coordinate-wise stratified Gaussian base noise in the scenario-seeded "
+            "closed-loop rollout path. Intended to be used with --antithetic-pairs true."
+        ),
+    )
     parser.add_argument("--description", default="")
     parser.add_argument(
         "--run-id",
@@ -439,16 +454,21 @@ def parse_args() -> argparse.Namespace:
     if not args.task_name:
         args.task_name = (
             "flow_agents_7m_waymo_val_epoch061_x5f9g0ce_h100x6_hsb1_"
-            f"sample16_euler_{pair_label(args.antithetic_pairs)}_noise{noise_tag(args.noise_scale)}"
+            f"sample16_euler_{pair_label(args.antithetic_pairs)}_"
+            f"{stratified_label(args.stratified_gaussian_noise)}_"
+            f"noise{noise_tag(args.noise_scale)}"
         )
     if not args.description:
         args.description = (
-            f"{DESCRIPTION_PREFIX}_{args.antithetic_pairs}_{args.noise_scale}"
+            f"{DESCRIPTION_PREFIX}_{args.antithetic_pairs}_"
+            f"stratified_{args.stratified_gaussian_noise}_{args.noise_scale}"
         )
     if not args.session:
         args.session = (
             "catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-"
-            f"{pair_label(args.antithetic_pairs)}-noise{noise_tag(args.noise_scale)}"
+            f"{pair_label(args.antithetic_pairs)}-"
+            f"{stratified_label(args.stratified_gaussian_noise)}-"
+            f"noise{noise_tag(args.noise_scale)}"
         )
     if not args.wandb_group:
         args.wandb_group = f"{args.task_name}_submission_export"
