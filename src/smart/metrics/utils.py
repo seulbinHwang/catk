@@ -28,6 +28,7 @@ SPATIAL_SMOOTHING_MODES = {
     SPATIAL_SMOOTHING_MODE_NORMALIZED,
 }
 SPATIAL_SMOOTHING_DISTANCE_CHUNK_SIZE = 512
+STATE_CONDITIONED_TARGET_CHUNK_SIZE = 256
 
 
 def _get_prob_targets_from_trajectory_index(
@@ -207,3 +208,45 @@ def get_euclidean_targets(
     target = target[:, 1:-1]  # [n_agent, 16, 3], x,y,yaw
     target_valid = target_valid[:, 1:-1]  # [n_agent, 16]
     return target, target_valid
+
+
+@torch.no_grad()
+def match_state_conditioned_trajectory_token_rows(
+    pred_pos: Tensor,  # [n_row, 2]
+    pred_head: Tensor,  # [n_row]
+    gt_pos_segment: Tensor,  # [n_row, 5, 2]
+    gt_head_segment: Tensor,  # [n_row, 5]
+    token_trajectory: Tensor,  # [n_token, 5, 3]
+    chunk_size: int = STATE_CONDITIONED_TARGET_CHUNK_SIZE,
+) -> Tensor:  # [n_row]
+    """Match full TrajTok trajectories from the current rollout state.
+
+    The fixed TrajTok ``gt_idx`` is built during tokenization from the
+    teacher-forced tokenized state. During rollout-style training, however, the
+    model state can drift. This matcher transforms the raw 0.5 s GT segment into
+    that current state frame and chooses the token whose full ``(x, y, yaw)``
+    trajectory is closest.
+    """
+    n_row = int(pred_pos.shape[0])
+    if n_row == 0:
+        return torch.empty(0, dtype=torch.long, device=pred_pos.device)
+
+    chunk_size = max(1, int(chunk_size))
+    target_chunks = []
+    token_pos = token_trajectory[:, :, :2]
+    token_head = token_trajectory[:, :, 2]
+    for start in range(0, n_row, chunk_size):
+        end = min(start + chunk_size, n_row)
+        gt_pos_local, gt_head_local = transform_to_local(
+            pos_global=gt_pos_segment[start:end],
+            head_global=gt_head_segment[start:end],
+            pos_now=pred_pos[start:end],
+            head_now=pred_head[start:end],
+        )
+        gt_head_local = wrap_angle(gt_head_local)
+
+        pos_delta = token_pos.unsqueeze(0) - gt_pos_local.unsqueeze(1)
+        head_delta = wrap_angle(token_head.unsqueeze(0) - gt_head_local.unsqueeze(1))
+        dist = torch.sqrt(pos_delta.square().sum(-1) + head_delta.square()).mean(-1)
+        target_chunks.append(dist.argmin(dim=-1))
+    return torch.cat(target_chunks, dim=0)

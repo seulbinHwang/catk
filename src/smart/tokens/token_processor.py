@@ -199,6 +199,16 @@ class TokenProcessor(torch.nn.Module):
             "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, n_step=18, 2]
             "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, n_step=18]
             "gt_valid_raw": valid[:, self.shift :: self.shift],  # [n_agent, n_step=18]
+            # raw 10 Hz segments for actions [(0->5), (5->10), ..., (85->90)]
+            "gt_pos_segment_raw": pos[:, 1:].reshape(
+                pos.shape[0], -1, self.shift, pos.shape[-1]
+            ),  # [n_agent, 18, 5, 2]
+            "gt_head_segment_raw": heading[:, 1:].reshape(
+                heading.shape[0], -1, self.shift
+            ),  # [n_agent, 18, 5]
+            "gt_valid_segment_raw": valid[:, 1:].reshape(
+                valid.shape[0], -1, self.shift
+            ),  # [n_agent, 18, 5]
         }
         # [n_token, 8]
         for k in ["veh", "ped", "cyc"]:

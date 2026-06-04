@@ -522,6 +522,9 @@ class SMARTAgentDecoder(nn.Module):
             "gt_pos_raw": tokenized_agent["gt_pos_raw"],  # [n_agent, 18, 2]
             "gt_head_raw": tokenized_agent["gt_head_raw"],  # [n_agent, 18]
             "gt_valid_raw": tokenized_agent["gt_valid_raw"],  # [n_agent, 18]
+            "gt_pos_segment_raw": tokenized_agent["gt_pos_segment_raw"][:, 2:],
+            "gt_head_segment_raw": tokenized_agent["gt_head_segment_raw"][:, 2:],
+            "gt_valid_segment_raw": tokenized_agent["gt_valid_segment_raw"][:, 2:],
             # or use the tokenized gt
             "gt_pos": tokenized_agent["gt_pos"],  # [n_agent, 18, 2]
             "gt_head": tokenized_agent["gt_heading"],  # [n_agent, 18]
@@ -860,6 +863,9 @@ class SMARTAgentDecoder(nn.Module):
             "gt_pos_raw": tokenized_agent["gt_pos_raw"],  # [n_agent, 18, 2]
             "gt_head_raw": tokenized_agent["gt_head_raw"],  # [n_agent, 18]
             "gt_valid_raw": tokenized_agent["gt_valid_raw"],  # [n_agent, 18]
+            "gt_pos_segment_raw": tokenized_agent["gt_pos_segment_raw"][:, 2:],
+            "gt_head_segment_raw": tokenized_agent["gt_head_segment_raw"][:, 2:],
+            "gt_valid_segment_raw": tokenized_agent["gt_valid_segment_raw"][:, 2:],
             # or use the tokenized gt
             "gt_pos": tokenized_agent["gt_pos"],  # [n_agent, 18, 2]
             "gt_head": tokenized_agent["gt_heading"],  # [n_agent, 18]

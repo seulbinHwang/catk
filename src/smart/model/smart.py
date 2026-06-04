@@ -468,6 +468,18 @@ class SMART(LightningModule):
                 tokenized_agent["gt_valid_raw"],
                 repeat_count,
             ),
+            "gt_pos_segment_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_pos_segment_raw"],
+                repeat_count,
+            ),
+            "gt_head_segment_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_head_segment_raw"],
+                repeat_count,
+            ),
+            "gt_valid_segment_raw": self._repeat_tensor_on_first_dim(
+                tokenized_agent["gt_valid_segment_raw"],
+                repeat_count,
+            ),
             "gt_z_raw": self._repeat_tensor_on_first_dim(
                 tokenized_agent["gt_z_raw"],
                 repeat_count,

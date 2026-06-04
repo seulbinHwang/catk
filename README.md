@@ -293,8 +293,36 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | agent selection | `data.train_use_eval_agent_selection=false` |
 | train sampler | `data.train_memory_balanced_batching=true` |
 | smoothing | `spatial_aware_smoothing=true`, `spatial_aware_smoothing_mode=paper`, full `[5, x/y/yaw]` trajectory distance |
+| rollout target | `state_conditioned_target=true`, rollout/self-generated state가 있는 training loss에서 현재 state 기준 full TrajTok trajectory target 재선택 |
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, top-48 rollout validation, every 16 epochs |
 | distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=false` |
+
+TrajTok state-conditioned target은 고정 `gt_idx`를 항상 그대로 쓰지 않고, rollout-style
+training에서 모델이 현재 서 있는 pose 기준으로 raw GT 0.5초 segment에 가장 가까운
+TrajTok token을 다시 고른다. 비교 대상은 endpoint만이 아니라 paper-submit token의
+전체 `[5, x/y/yaw]` trajectory다. Open-loop teacher-forced loss에서는 기존 recursive
+`gt_idx`가 같은 state에서 이미 계산된 target이므로 빠른 기존 경로를 유지한다. 따라서
+일반 pretrain 속도는 불필요하게 느려지지 않고, `training_rollout_sampling.num_k > 0`
+처럼 self-generated state가 loss에 들어올 때만 corrective target을 계산한다. 메모리
+peak를 낮추기 위해 target matching은 row chunk 단위로 수행하며 기본 chunk size는
+`state_conditioned_target_chunk_size=256`이다.
+
+2026-06-04에 `hsb-npc-training` H100 4장과 `wo-pvc-2` H100 2장에서 실제 WOMD cache와
+GPU로 state-conditioned target을 검증했다.
+
+| 검증 | 조건 | 결과 |
+|---|---|---|
+| teacher-forced parity | train cache 128 samples, 50,408 valid rows | 기존 recursive `gt_idx`와 mismatch `0`, 평균 full-trajectory distance `0.030144 -> 0.030144` |
+| rollout-like correction | 같은 rows에 현재 state lateral drift `0.5m` 적용 | target 변경 `50,300/50,408`, 평균 full-trajectory distance `0.504404 -> 0.186975` |
+| single H100 open-loop smoke | real train cache, 1 batch, `training_rollout_sampling.num_k=-1` | `Trainer.fit` 정상 종료, `train/loss=8.98406` |
+| single H100 rollout-target smoke | real train cache, 1 batch, `training_rollout_sampling.num_k=1` | 새 state-conditioned target loss 경로 정상 종료, `train/loss=8.95601` |
+| H100 4+2 DDP smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, 1 train batch | 6/6 ranks NCCL 초기화 및 backward 정상 종료, exit status `0` |
+| validation/rollout smoke | real validation cache, 1 batch, `n_rollout_closed_val=1`, `validation_rollout_sampling.num_k=1` | open-loop + closed-loop validation 경로 정상 종료, `run.py DONE` |
+
+이 검증은 target 선택 메커니즘이 rollout drift를 줄이는 방향으로 동작하고 학습/검증
+파이프라인에 side effect가 없음을 확인한 smoke/기능 검증이다. 최종 WOSAC RMM 향상
+여부는 이 target을 활성화한 rollout-style pretrain을 새로 학습한 checkpoint로 평가해야
+한다.
 
 TrajTok은 vehicle/pedestrian/cyclist type별 token classifier head를 따로 둔다. 어떤
 batch에 특정 type이 없거나 해당 type의 valid loss row가 없으면 DDP가 그 head를
