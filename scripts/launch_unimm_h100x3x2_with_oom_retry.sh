@@ -40,6 +40,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 BASE_LEARNING_RATE="${BASE_LEARNING_RATE:-0.0005}"
 BASE_GLOBAL_BATCH_SIZE="${BASE_GLOBAL_BATCH_SIZE:-32}"
+RESUME_LR_POLICY="${RESUME_LR_POLICY:-checkpoint}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-3}"
 WANDB_MODE="${WANDB_MODE:-online}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
@@ -75,6 +76,37 @@ log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
 remote_quote() { printf '%q' "$1"; }
 safe_task_name() { printf '%s\n' "${TASK_NAME//\//_}"; }
 
+checkpoint_base_learning_rate() {
+  local ckpt_path="$1"
+  local ckpt_q py py_q cmd
+  if [[ -z "$ckpt_path" || "$DRY_RUN" == "1" || "$RESUME_LR_POLICY" != "checkpoint" ]]; then
+    return 1
+  fi
+  ckpt_q="$(remote_quote "$ckpt_path")"
+  py="$(cat <<'PY'
+import sys
+import torch
+
+ckpt = sys.argv[1]
+data = torch.load(ckpt, map_location="cpu", weights_only=False)
+values = []
+for scheduler in data.get("lr_schedulers") or []:
+    values.extend(scheduler.get("base_lrs") or [])
+for optimizer in data.get("optimizer_states") or []:
+    for group in optimizer.get("param_groups") or []:
+        value = group.get("initial_lr", group.get("lr"))
+        if value is not None:
+            values.append(value)
+if not values:
+    raise SystemExit(1)
+print(f"{float(values[0]):.12f}")
+PY
+)"
+  py_q="$(remote_quote "$py")"
+  cmd="python -c ${py_q} ${ckpt_q}"
+  kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "$cmd" 2>/dev/null | tr -d '\r'
+}
+
 learning_rate_for_batch() {
   local bs="$1"
   if [[ -n "$LEARNING_RATE" ]]; then
@@ -93,6 +125,20 @@ base_global_batch = float(sys.argv[5])
 global_batch = batch_size * num_nodes * gpus_per_node
 print(f"{base_lr * math.sqrt(global_batch / base_global_batch):.12f}")
 PY
+}
+
+learning_rate_for_attempt() {
+  local bs="$1"
+  local ckpt_path="$2"
+  local ckpt_lr
+  if [[ -z "$LEARNING_RATE" ]]; then
+    ckpt_lr="$(checkpoint_base_learning_rate "$ckpt_path" || true)"
+    if [[ -n "$ckpt_lr" ]]; then
+      printf '%s\n' "$ckpt_lr"
+      return 0
+    fi
+  fi
+  learning_rate_for_batch "$bs"
 }
 
 remote_run_root() {
@@ -147,7 +193,7 @@ start_attempt() {
   local bs="$1"
   local ckpt_path="$2"
   local attempt_lr
-  attempt_lr="$(learning_rate_for_batch "$bs")"
+  attempt_lr="$(learning_rate_for_attempt "$bs" "$ckpt_path")"
   local -a cmd=(
     python3 scripts/launch_unimm_h100x3x2.py
     --namespace "$NAMESPACE"
@@ -193,6 +239,9 @@ start_attempt() {
 
   log "launcher command:"
   log "attempt learning_rate=${attempt_lr}"
+  if [[ -n "$ckpt_path" && -z "$LEARNING_RATE" && "$RESUME_LR_POLICY" == "checkpoint" ]]; then
+    log "resume LR policy=checkpoint; scheduler/optimizer progress is restored from ckpt_path."
+  fi
   printf '  %q' "${cmd[@]}"
   printf '\n'
   "${cmd[@]}"

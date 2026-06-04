@@ -270,7 +270,7 @@ MIN_BS=16 \
   bash scripts/launch_unimm_h100x3x2_with_oom_retry.sh
 ```
 
-이 래퍼는 첫 시도를 per-GPU `train_batch_size=30`으로 시작한다. 두 pod 중 하나라도 CUDA OOM marker를 로그에 남기면 양쪽 `unimm-h100x3x2` tmux 학습 세션을 종료하고, 같은 `TASK_NAME`의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size -= OOM_STEP`으로 재시작한다. 기본 `OOM_STEP=2`라서 `30 -> 28 -> 26 -> ...` 순서로 낮춘다. 기본적으로 각 attempt의 LR은 현재 batch size에 맞춰 `0.0005 * sqrt((batch_size * 6) / 32)`로 다시 계산한다. `LEARNING_RATE`를 직접 지정하면 모든 attempt에서 그 값을 고정 사용한다. `OOM_STEP=0`이면 batch size를 낮추지 않고 `MAX_SAME_BS_OOM_RETRIES` 횟수만큼 같은 batch size로 재시도한다.
+이 래퍼는 첫 시도를 per-GPU `train_batch_size=30`으로 시작한다. 두 pod 중 하나라도 CUDA OOM marker를 로그에 남기면 양쪽 `unimm-h100x3x2` tmux 학습 세션을 종료하고, 같은 `TASK_NAME`의 최신 `epoch_last.ckpt` 또는 `last.ckpt`를 찾아 `train_batch_size -= OOM_STEP`으로 재시작한다. 기본 `OOM_STEP=2`라서 `30 -> 28 -> 26 -> ...` 순서로 낮춘다. scratch attempt의 LR은 현재 batch size에 맞춰 `0.0005 * sqrt((batch_size * 6) / 32)`로 계산한다. resume attempt는 기본 `RESUME_LR_POLICY=checkpoint`라서 checkpoint에 저장된 optimizer/scheduler base LR을 읽어 launcher config에도 같은 값을 넘기고, 실제 scheduler epoch/step progress도 Lightning checkpoint state에서 이어간다. `LEARNING_RATE`를 직접 지정하면 모든 attempt에서 그 값을 고정 사용한다. `OOM_STEP=0`이면 batch size를 낮추지 않고 `MAX_SAME_BS_OOM_RETRIES` 횟수만큼 같은 batch size로 재시도한다.
 
 공유 pod에서 다른 사용자의 GPU 작업을 방해하지 않으려면 guarded launcher를 사용한다. 이 스크립트는 양쪽 pod의 GPU compute process, GPU memory, GPU utilization, 동일 tmux session 존재 여부를 먼저 확인하고, 하나라도 바쁘면 학습을 시작하지 않는다.
 
