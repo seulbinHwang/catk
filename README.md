@@ -278,10 +278,10 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | branch | `trajtok` |
 | pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
-| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs90_lr685e4_oom_retry_trajtok_hidden124_tokenmatchopt_trainselectfalse_20260603` |
-| remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_hidden124_20260602` |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs90_lr685e4_oom_retry_trajtok_hidden124_globalendpoint_topk16_trainselectfalse_20260604` |
+| remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_globalendpoint_20260604` |
 | experiment | `pre_bc_a100x4x2` |
-| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
+| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global endpoint contour token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
 | decoder | `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
 | model parameters | `8,247,013` total / trainable, 직접 SMART instantiate로 측정 |
 | train batch | `INITIAL_BS=15` per rank, effective global batch 90 |
@@ -294,7 +294,7 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | train sampler | `data.train_memory_balanced_batching=true` |
 | smoothing | `spatial_aware_smoothing=true`, 0.5초 endpoint box contour `[4 corners, x/y]` distance. Non-GT mass sums exactly to `label_smoothing`; no extra uniform smoothing or mode switch. |
 | rollout target | rollout/self-generated state가 있는 training loss에서는 항상 현재 state 기준 endpoint contour target 재선택 |
-| validation | open-loop + closed-loop, `scorer_scene_num=1680`, top-16 rollout validation, every 16 epochs |
+| validation | open-loop + closed-loop, `scorer_scene_num=1680`, `validation_rollout_sampling=(topk_prob, num_k=16, temp=1.0)`, every 16 epochs |
 | distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=false` |
 
 TrajTok agent target은 main/Thinklab과 같은 endpoint contour matching으로 맞춘다.
@@ -321,6 +321,7 @@ GPU로 endpoint contour target을 검증했다.
 | single H100 validation smoke | `hsb-npc-training`, real validation cache, 1 batch, `n_rollout_closed_val=1`, `validation_rollout_sampling.num_k=1` | open-loop + closed-loop fast WOSAC metric 경로 정상 종료, `run.py DONE` |
 | H100 4+2 DDP train smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, real train cache, 1 batch | manual 6-rank DDP, 6/6 ranks NCCL 초기화 및 backward 정상 종료, exit status `0` |
 | H100 4+2 DDP train+validation smoke | same pods, real train/validation cache, 1 train batch + 1 closed-loop validation batch, `validation_rollout_sampling.num_k=16` | train step, checkpoint callback, open-loop validation, closed-loop fast WOSAC metric 정상 종료, `run.py DONE` |
+| 20260604 H100 4+2 launch smoke | `smart_ntp_pretrain_h100x4_h100x2_globalbs90_lr685e4_oom_retry_trajtok_hidden124_globalendpoint_topk16_trainselectfalse_20260604_smoke`, `data.train_batch_size=15`, 6 ranks, `lr=6.85e-4` | `bs=15`에서 OOM 없이 1 train batch + top-16 closed-loop validation 1 batch 정상 종료, `run.py DONE` |
 
 2026-06-04에 spatial-aware smoothing도 endpoint contour 단일 구현으로 정리했다. 새
 smoothing target은 각 token의 0.5초 endpoint contour `[4, 2]`를 사용하며, 같은 batch
@@ -378,8 +379,9 @@ bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 
 장기 학습에서 OOM 자동 재시작까지 원하면 `START_ONLY` 없이 wrapper를 계속 실행해야 한다.
 로컬 shell을 점유하지 않으려면 아래처럼 로컬 tmux 안에서 wrapper를 foreground로 둔다.
-기본 task name은 `globalbs90`, `lr685e4`, `tokenmatchopt`를 포함하므로, 기존
-`globalbs102`/`globalbs108` run의 checkpoint를 이어 쓰지 않는 fresh start다.
+기본 task name은 `globalbs90`, `lr685e4`, `globalendpoint`, `topk16`을 포함하므로, 기존
+`globalbs90` 20260603 run이나 `globalbs102`/`globalbs108` run의 checkpoint를 이어 쓰지
+않는 fresh start다.
 `globalbs102` 시도에서는 `INITIAL_BS=17`이 epoch 0의 4524/4775 step 부근에서
 `wo-pvc-2` rank 5 CUDA OOM으로 실패했다. 따라서 현재 기본값은 `INITIAL_BS=15`이고,
 OOM이 발생하면 `bs=13`으로 낮춘 뒤 같은 task의 최신 `epoch_last.ckpt`로 재시작한다.
@@ -387,7 +389,7 @@ remote `PROJECT_ROOT`에 미커밋 변경이나 untracked 파일이 있으면 wr
 push --include-untracked`로 보존한 뒤 `origin/trajtok`을 checkout한다.
 
 ```bash
-tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-gbs90-wrapper
+tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs90-wrapper
 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 
 START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
@@ -396,8 +398,8 @@ START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_ret
 실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-tokenmatchopt-gbs90
-kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-tokenmatchopt-gbs90
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs90
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs90
 
 STOP=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 ```
@@ -408,11 +410,13 @@ deterministic nearest-token tokenization, agent selection, `num_freq_bands: 64`
 같은 모델/알고리즘 설정은 유지한다. 단, 학습 중 closed-loop validation은 WOSAC
 submission과 같은 후보 폭을 쓰도록 `validation_rollout_sampling.num_k: 16`을 명시한다. 그 외에는
 `semi_control_stable`의 x4x2 control-space pretrain recipe와 학습 실행 조건을 맞추기
-위해 아래 training/runtime 값만 명시한다.
+위해 아래 training/runtime 값을 명시한다. H100 4+2 wrapper는 이 config를 쓰되
+heterogeneous 6-rank launcher에서 `data.train_batch_size=15`, `model.model_config.lr=6.85e-4`를
+명시적으로 override한다.
 
-- `trainer.devices: 4`, `trainer.num_nodes: 2`
-- `data.train_batch_size: 16`, 즉 8개 rank 기준 effective global batch 128
-- `model.model_config.lr: 6e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
+- config 기본값: `trainer.devices: 4`, `trainer.num_nodes: 2`
+- H100 4+2 wrapper 실행값: 6 DDP ranks, `data.train_batch_size: 15`, effective global batch 90
+- H100 4+2 wrapper 실행값: `model.model_config.lr: 6.85e-4`, `lr_warmup_steps: 4`, `lr_min_ratio: 1e-2`
 - `model.model_config.scorer_scene_num: 1680`
 - `model.model_config.validation_rollout_sampling.num_k: 16`
 - `trainer.max_epochs: 64`, `check_val_every_n_epoch: 16`
