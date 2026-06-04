@@ -2809,6 +2809,81 @@ kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- \
 python scripts/launch_waymo_val_submission_epoch061_h100x6_hsb1_static_pod.py --stop
 ```
 
+#### hsb-npc-training-1 H100x6 epoch 116 Waymo validation 제출
+
+`flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18`
+학습에서 Fast-RMM 기준으로 고른 epoch 116 checkpoint를 사용해 validation split 전체의 Waymo Sim Agents 제출물을 만들 때는 아래 launcher를 씁니다.
+기본 추론 설정은 `sample_steps=16`, Euler solver, `use_stop_motion=false`, `use_lqr=false`, `antithetic_pairs=true`, `stratified_gaussian_noise=true`, `noise_scale=1.0`입니다.
+
+이 스크립트는 기본적으로 **validation leaderboard에 업로드하지 않습니다.** 먼저 validation split rollout, archive 생성, proto 검증만 수행합니다.
+실제 Waymo validation 제출을 하려면 `--submit-validation`을 명시합니다.
+
+```bash
+# 안전 smoke: validation split 앞 1 batch만 생성하고 tar.gz/proto 구조를 검증합니다.
+python scripts/launch_waymo_val_submission_epoch116_h100x6_hsb1_static_pod.py \
+  --smoke-test \
+  --replace
+```
+
+```bash
+# full validation archive 생성 + archive 검증. 업로드는 하지 않습니다.
+python scripts/launch_waymo_val_submission_epoch116_h100x6_hsb1_static_pod.py --replace
+```
+
+```bash
+# 실제 validation leaderboard 제출.
+python scripts/launch_waymo_val_submission_epoch116_h100x6_hsb1_static_pod.py \
+  --submit-validation \
+  --replace
+```
+
+```bash
+# validation rollout/archive 생성은 성공했지만 Waymo 업로드만 네트워크 문제로 실패한 경우,
+# 기존 archive를 재검증한 뒤 업로드만 다시 시도합니다. full validation은 다시 돌리지 않습니다.
+python scripts/launch_waymo_val_submission_epoch116_h100x6_hsb1_static_pod.py \
+  --upload-existing-archive /mnt/nuplan/projects/catk/logs/flow_agents_7m_waymo_val_epoch116_mqfq3u39_h100x6_hsb1_sample16_euler_antithetic_stratified_noise1000/runs/<run_id>/sim_agents_2025_submission.tar.gz \
+  --submit-validation \
+  --replace
+```
+
+기본 설정:
+
+| 항목 | 설정 |
+|---|---|
+| pod | `hsb-npc-training-1` 단일 H100x6 |
+| branch | `semi_control_stable` |
+| checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-mqfq3u39:v121` |
+| checkpoint epoch | 116 |
+| action / experiment | `action=validate`, `experiment=sim_agents_sub_flow` |
+| rollout count | `model.model_config.n_rollout_closed_val=32` |
+| solver / denoising | Euler, `model.model_config.validation_rollout_sampling.sample_steps=16` |
+| inference noise | `antithetic_pairs=true`, `stratified_gaussian_noise=true`, `noise_scale=1.0`, `validation_closed_seed=4` |
+| post-process | `use_lqr=false`, `use_stop_motion=false` |
+| method name | `Flow Agents 7M` |
+| authors / affiliation | `SB H`, `KO O` / `NLK` |
+| description | `flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18_116_true_stratified_true_1.0` |
+| account | `h.sb@naverlabs.com` |
+| default validation batch | per-rank `val_batch_size=48` |
+| tmux session | `catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-stratified-noise1000` |
+
+스크립트가 생성한 archive는 `scripts/verify_waymo_submission_archive.py`로 자동 검증합니다. 이 검증은 tar member 이름, shard proto parse,
+submission metadata, scenario id 중복, scenario당 32개 rollout, trajectory당 80 future step, NaN/Inf 부재를 확인합니다.
+full validation 실행에서는 launcher가 `${CACHE_ROOT}/validation`의 `.pkl` 개수를 직접 세고 archive의 scenario 수가 그 값과 정확히 같은지도 검증합니다.
+필요하면 `--expected-validation-scenarios 44097`처럼 수동 기대값을 지정해 같은 검증을 강제할 수 있습니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- \
+  tmux attach -t catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-stratified-noise1000
+```
+
+실험 코드만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_waymo_val_submission_epoch116_h100x6_hsb1_static_pod.py --stop
+```
+
 #### hsb-npc-training-1 H100x6 epoch 116 Waymo test 제출
 
 `flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18`
