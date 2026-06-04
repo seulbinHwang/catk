@@ -18,10 +18,10 @@ model_config:
   positive_tie_break_tolerance: 0.0001
 
   use_closed_loop_training: true
-  inference_temperature: 1.0
+  inference_temperature: 0.75
   # 0 disables truncation and samples from all 2048 anchors. Positive values
   # keep only the top-k scorer logits during closed-loop inference.
-  inference_top_k: 256
+  inference_top_k: 0
   # 1.0 disables nucleus truncation. Values in (0, 1) keep the smallest
   # high-probability anchor set whose cumulative probability reaches top-p.
   inference_top_p: 1.0

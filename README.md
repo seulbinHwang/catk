@@ -329,10 +329,12 @@ DRY_RUN=1 bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh --dry-run
 | prediction horizon | 40 steps = 4초 |
 | commit interval | 5 steps = 0.5초 |
 | positive matching | 5 steps = 0.5초 + near-tie tail tie-break |
-| inference temperature | 1.0 |
-| inference top-k | 256 |
+| inference temperature | 0.75 |
+| inference top-k | 0 |
 | inference top-p | 1.0 |
 | train sampler | memory-balanced distributed batch sampler |
+
+아래 2026-06-04 00:28 KST 실행 기록은 inference-only H100 x6 sweep 이전에 시작한 기존 run이라 `inference_temperature=1.0`, `inference_top_k=256`을 사용했다. 최신 기본 inference setting은 위 표와 아래 Inference-only Sampling Tuning 절의 `0.75 / top_k=0 / top_p=1.0`이다.
 
 2026-06-04 00:28 KST에 최신 `UniMM@f3cd9fc` 기준 guarded launcher로 full pretrain을 실제 시작했다. 시작 전 두 pod 모두 compute process 없음, GPU memory 4MiB, utilization 0%로 idle 상태였다. launcher는 `/tmp/catk_unimm_launcher`에서 실행했고, 각 pod의 `/tmp/catk_unimm_h100x3x2` clean checkout을 `origin/UniMM@f3cd9fc`로 맞춘 뒤 `unimm-h100x3x2` tmux session을 생성했다.
 
@@ -354,21 +356,21 @@ running full pretrain:
 
 ### Inference-only Sampling Tuning
 
-UniMM closed-loop inference는 매 0.5초마다 scorer logits에서 anchor component를 sampling한다. 기본값은 논문 의도와 같은 `inference_temperature=1.0`을 유지하되, 낮은 확률의 2048개 전체 anchor를 모두 sampling하지 않고 상위 scorer 후보만 남기는 `inference_top_k=256`을 사용한다. `inference_top_p=1.0`은 nucleus truncation을 끈 값이다.
+UniMM closed-loop inference는 매 0.5초마다 scorer logits에서 anchor component를 sampling한다. H100 x6 `scorer_scene_num=1680` 규모 검증 결과, 기본값은 `inference_temperature=0.75`, `inference_top_k=0`, `inference_top_p=1.0`이다. `inference_top_k=0`은 top-k truncation을 끄고 2048개 전체 anchor에서 확률 sampling한다는 뜻이다.
 
-2026-06-04에 `ssh user@10.60.188.83`의 RTX 5090에서 `unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_membal_temp1_20260604_002845`의 `Epoch_last.ckpt`를 사용해 inference-only 후보를 검증했다. checkpoint는 `/tmp/unimm_infer_tune_ckpts/epoch_last_20260604_010859.ckpt`, `epoch=25`, `global_step=75181`이었다. 검증 cache는 `/media/user/E/dataset/womd_v1_3/SMART_cache`다.
-
-주의: 아래 RMM은 full fit-time validation 점수가 아니다. 빠른 비교를 위해 단일 RTX 5090에서 validation 첫 128 scenes만 사용한 같은-subset 상대 비교다. W&B 학습 중 validation의 `val_closed/sim_agents_2025_mean/metametric`은 보통 `scorer_scene_num=1680` 규모라 절대값이 다를 수 있다.
-
-추가 확인: 5090 host cache와 H100 pod cache는 byte-level로 완전히 같지는 않다. H100 cache에는 control 관련 부가 필드가 있고 원본 map category 값 범위도 다르다. 다만 UniMM 입력 기준으로는 legacy category folding 이후의 `pt_token.type/pl_type`, map geometry, valid agent position, agent type/shape이 같은 scenario에서 일치했다. 따라서 아래 결과는 H100 full validation 절대 점수로 해석하지 말고, 같은 5090 subset 내 inference sampling 후보의 상대 비교로만 사용한다.
+2026-06-04에 `hsb-npc-training-1`의 6개 H100에서 `unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_membal_temp1_20260604_002845`의 `Epoch_last.ckpt`를 사용해 inference-only 후보를 검증했다. checkpoint는 `/tmp/unimm_infer_tune_ckpts/epoch_last_h100x3x2_20260604.ckpt`, `epoch=30`, `global_step=89676`이었고, 검증 cache는 `/workspace/womd_v1_3/SMART_cache`다. `scorer_scene_num=1680`, `world_size=6`, `val_batch_size=12`라 실제 scorer batch는 24개로 자동 조정되며, scorer에는 1728 scenarios가 들어간다.
 
 | 후보 | scenes | rollouts | RMM | Kinematic | Interactive | Map-based | minADE |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `temp=1.0, top_k=0, top_p=1.0` | 128 | 32 | 0.67938 | 0.35876 | 0.75601 | 0.76407 | 0.38629 |
-| `temp=1.0, top_k=256, top_p=1.0` | 128 | 32 | 0.68480 | 0.36004 | 0.76087 | 0.77256 | 0.38594 |
-| `temp=0.75, top_k=128, top_p=1.0` | 128 | 32 | 0.68010 | 0.35811 | 0.76102 | 0.76005 | 0.41049 |
+| `temp=1.0, top_k=0, top_p=1.0` | 1728 | 32 | 0.76953 | 0.46793 | 0.79907 | 0.90389 | 0.21799 |
+| `temp=1.0, top_k=256, top_p=1.0` | 1728 | 32 | 0.76968 | 0.46676 | 0.79989 | 0.90395 | 0.21935 |
+| `temp=0.75, top_k=0, top_p=1.0` | 1728 | 32 | **0.77004** | 0.46546 | 0.80092 | **0.90437** | 0.23674 |
+| `temp=0.5, top_k=0, top_p=1.0` | 1728 | 32 | 0.76728 | 0.45927 | 0.80012 | 0.90107 | 0.27323 |
+| `temp=0.75, top_k=256, top_p=1.0` | 1728 | 32 | 0.76930 | 0.46534 | 0.80065 | 0.90268 | 0.23727 |
+| `temp=0.75, top_k=512, top_p=1.0` | 1728 | 32 | 0.76998 | 0.46560 | **0.80120** | 0.90376 | 0.23634 |
+| `temp=0.75, top_k=128, top_p=1.0` | 1728 | 32 | 0.76945 | 0.46445 | 0.80085 | 0.90337 | 0.24018 |
 
-따라서 현재 기본 inference setting은 `inference_temperature=1.0`, `inference_top_k=256`, `inference_top_p=1.0`이다. 이 설정은 같은 128-scene subset에서 기존 전체-anchor sampling 대비 RMM `+0.00542`를 보였고, 특히 map-based metric이 `0.76407 -> 0.77256`으로 좋아졌다.
+따라서 현재 기본 inference setting은 `inference_temperature=0.75`, `inference_top_k=0`, `inference_top_p=1.0`이다. H100 x6 1728-scenario 기준으로 기존 `temp=1.0, top_k=256` 대비 RMM은 `+0.00036`, 기존 전체-anchor `temp=1.0, top_k=0` 대비 RMM은 `+0.00051` 높았다. 같은 `temp=0.75`에서 `top_k=128/256/512`는 모두 전체-anchor sampling보다 낮았으므로 top-k truncation은 기본값에서 끈다.
 
 2026-06-03 23:35 KST에 guarded launcher와 H100 x3x2 파이프라인을 실제 pod/cache/GPU로 재검증했다. 검증 전후 `--status`에서 두 pod 모두 compute process 없음, GPU memory 4MiB, utilization 0%로 idle 상태였고, 검증용 tmux session은 종료 후 정리했다.
 
@@ -705,14 +707,14 @@ explicit test:
 실전 full pretrain은 아래처럼 OOM retry wrapper로 시작한다. 처음부터 학습할 때는 `CKPT_PATH`를 지정하지 않는다. wrapper는 CUDA OOM 또는 재시도 가능한 종료가 발생했을 때만 같은 `TASK_NAME`의 최신 checkpoint를 찾아 resume한다.
 
 ```bash
-TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_temp1_$(date +%Y%m%d_%H%M%S) \
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_temp075_$(date +%Y%m%d_%H%M%S) \
 SESSION=unimm-h100x3x2 \
 MASTER_PORT=29578 \
 INITIAL_BS=30 \
 OOM_STEP=2 \
 MIN_BS=16 \
 WANDB_MODE=online \
-EXTRA_HYDRA_OVERRIDES="model.model_config.inference_temperature=1.0 model.model_config.scorer_scene_num=1680" \
+EXTRA_HYDRA_OVERRIDES="model.model_config.inference_temperature=0.75 model.model_config.inference_top_k=0 model.model_config.scorer_scene_num=1680" \
   bash scripts/launch_unimm_h100x3x2_with_oom_retry.sh
 ```
 
@@ -766,7 +768,7 @@ python scripts/launch_unimm_h100x3x2.py \
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 | heading concentration cap | `max_von_mises_concentration=100.0`; bf16/von Mises NLL의 과확신 NaN을 막는 수치 안정화 |
 | regression loss reduction | valid timestep NLL mean |
-| inference sampling | `temperature=1.0`, `top_k=256`, `top_p=1.0`; 0.5초마다 scorer 상위 256개 anchor 안에서 확률 sampling |
+| inference sampling | `temperature=0.75`, `top_k=0`, `top_p=1.0`; 0.5초마다 2048개 전체 anchor에서 확률 sampling |
 
 이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 180에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
 Loss 로그에서 `loss_reg`는 학습에 쓰는 per-valid-timestep NLL 평균이고, `reg_cls_ratio`는 scorer classification과 regression의 상대 스케일을 확인하기 위한 진단값이다. objective scale이 달라졌으므로 기존 trajectory-sum checkpoint에서 resume하지 말고 scratch pretrain을 사용한다.
