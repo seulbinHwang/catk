@@ -288,15 +288,14 @@ class TokenProcessor(torch.nn.Module):
 
             gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
             token_idx_chunks = []
-            token_contour_chunks = []
+            token_contour_local_chunks = []
             for start in range(0, n_agent, self.agent_token_match_chunk_size):
                 end = min(start + self.agent_token_match_chunk_size, n_agent)
-                token_world_gt = transform_to_global(
-                    pos_local=token_traj[start:end].flatten(1, 2),
-                    head_local=None,
+                token_world_gt = self._endpoint_contour_to_global(
+                    contour_local=token_traj[start:end],
                     pos_now=match_prev_pos[start:end],
                     head_now=match_prev_head[start:end],
-                )[0].view(end - start, token_traj.shape[1], 4, 2)
+                )
                 token_idx_chunk = torch.argmin(
                     torch.norm(
                         token_world_gt - gt_contour[start:end].unsqueeze(1),
@@ -305,15 +304,20 @@ class TokenProcessor(torch.nn.Module):
                     dim=-1,
                 )
                 token_idx_chunks.append(token_idx_chunk)
-                token_contour_chunks.append(
-                    token_world_gt[
+                token_contour_local_chunks.append(
+                    token_traj[start:end][
                         torch.arange(end - start, device=valid.device),
                         token_idx_chunk,
                     ]
                 )
             if token_idx_chunks:
                 token_idx_gt = torch.cat(token_idx_chunks, dim=0)
-                token_contour_gt = torch.cat(token_contour_chunks, dim=0)
+                token_contour_gt = transform_to_global(
+                    pos_local=torch.cat(token_contour_local_chunks, dim=0),
+                    head_local=None,
+                    pos_now=match_prev_pos,
+                    head_now=match_prev_head,
+                )[0]
             else:
                 token_idx_gt = torch.empty(0, dtype=torch.long, device=valid.device)
                 token_contour_gt = gt_contour.new_empty((0, 4, 2))
@@ -335,6 +339,31 @@ class TokenProcessor(torch.nn.Module):
             out_dict["tokenized_heading"].append(prev_head.masked_fill(_invalid_mask, 0))
         out_dict = {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
         return out_dict
+
+    @staticmethod
+    def _endpoint_contour_to_global(
+        contour_local: Tensor,
+        pos_now: Tensor,
+        head_now: Tensor,
+    ) -> Tensor:
+        cos, sin = head_now.cos(), head_now.sin()
+        while cos.dim() < contour_local.dim() - 1:
+            cos = cos.unsqueeze(-1)
+            sin = sin.unsqueeze(-1)
+        x = contour_local[..., 0]
+        y = contour_local[..., 1]
+        pos_x = pos_now[:, 0]
+        pos_y = pos_now[:, 1]
+        while pos_x.dim() < x.dim():
+            pos_x = pos_x.unsqueeze(-1)
+            pos_y = pos_y.unsqueeze(-1)
+        return torch.stack(
+            (
+                x * cos - y * sin + pos_x,
+                x * sin + y * cos + pos_y,
+            ),
+            dim=-1,
+        )
 
     @staticmethod
     def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:

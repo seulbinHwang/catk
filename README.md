@@ -1110,29 +1110,27 @@ train cache로 외삽 벡터화를 검증했다.
 | 단일 H100 microbenchmark | batch size 13, 464 agents | 외삽 함수 `29.14ms -> 0.73ms`, 전체 `TokenProcessor` `87.79ms -> 59.12ms` |
 | H100 4+2 DDP profile | train batch size 13, 6 ranks, 10 measured steps | step `770.82ms -> 674.37ms` (`1.14x`), `TokenProcessor` `153.27ms -> 70.17ms` (`2.18x`) |
 
-추가로 agent token matching은 loss와 decoder edge에 실제로 쓰이는 valid coarse step만
-nearest-token matching을 수행한다. invalid coarse step의 token id는 mask 밖 값이라
-학습 supervision에 쓰이지 않으므로 0으로 둔다. valid step의 `token_idx`,
-`tokenized_pos`, `tokenized_heading`은 기존 all-agent matching과 같고, matching chunk
-size는 H100 microbenchmark에서 가장 빠른 `384`를 기본값으로 사용한다.
+Agent token matching은 TrajTok 공식 구현과 같은 teacher-forced recurrence와 global
+endpoint contour matching을 유지한다. 각 coarse step마다 후보 token endpoint box contour를
+직전 token pose 기준 global frame으로 펼치고, raw GT endpoint contour와 corner-distance를
+비교해 nearest token을 고른다. 선택된 token endpoint로 다음 step의 기준 pose를 갱신하므로,
+`gt_*`와 `sampled_*` label은 teacher-forced tokenization 의미를 유지한다.
 
-2026-06-03에 같은 `hsb-npc-training` H100 4장 + `wo-pvc-2` H100 2장 환경에서 이
-추가 최적화를 검증했다.
+2026-06-04 최적화에서는 label 의미를 바꾸는 valid-only skip이나 local-frame inverse
+matching을 채택하지 않았다. 대신 후보 endpoint contour의 global 변환을 기존
+`flatten -> transform_to_global -> view` 경로 대신 직접 affine 식으로 계산하고, 선택된
+token 하나만 기존 `transform_to_global` 경로로 복원한다. 따라서 기존 global endpoint
+expansion reference와 `gt_idx/tokenized_pos/tokenized_heading` 출력이 같으면서, 큰 중간
+tensor materialization 비용을 줄인다.
+
+2026-06-04에 `hsb-npc-training` H100 4장 + `wo-pvc-2` H100 2장 환경에서 이 최적화를
+검증했다.
 
 | 검증 | 조건 | 결과 |
 |---|---|---|
-| GPU unit parity | 실제 TrajTok vocab, CUDA, 2,048 vehicle token subset | 기존 거리식과 `idx_mismatch=0`, endpoint max abs `0.0` |
-| real-cache parity | train cache batch size 13, random scene scale/time shift 적용 | valid supervision `token_idx` mismatch `0`, `tokenized_pos/heading` max abs `0.0` |
-| H100 chunk sweep | 8 real train batches, TokenProcessor-only CUDA timing | chunk `256: 46.50ms`, `384: 45.22ms`, `512: 45.27ms`; `384` 선택 |
-| H100 4+2 DDP profile | train batch size 13, 6 ranks, 15 measured steps, validation off | step `659.91ms -> 646.80ms` (`1.020x`), `TokenProcessor` `72.35ms -> 61.74ms` (`1.172x`) |
-
-Agent token matching은 TrajTok 공식 구현과 같은 teacher-forced recurrence를 유지한다.
-각 coarse step마다 GT endpoint box contour를 직전 token 상태 기준 local frame으로 변환하고,
-같은 local frame의 token endpoint contour와 corner-distance를 비교해 nearest token을 고른다.
-선택된 token endpoint를 다시 global pose로 변환해 다음 step의 기준 pose를 갱신하므로,
-`gt_*`와 `sampled_*` label은 teacher-forced tokenization 의미를 유지한다. 큰 batch에서
-peak tensor가 튀지 않도록 agent 축만 chunk 단위로 나눠 처리하지만, chunk 안의 거리식과
-argmin/update 규칙은 같다.
+| real-cache parity | train 32개 + validation 16개 cache, valid token 18,680개 | `valid_mask/token_idx/tokenized_pos/tokenized_heading` exact match, `idx_mismatch=0`, `max_pos=0.0`, `max_head=0.0` |
+| H100 4+2 DDP profile | train batch size 15, 6 ranks, warmup 10 + measured 30, validation off | step `774.89ms -> 726.16ms` (`1.067x`), `TokenProcessor` `125.91ms -> 79.29ms` (`1.588x`) |
+| H100 4+2 DDP smoke | train 1 batch + validation 1 batch | open-loop validation, closed-loop Fast WOSAC, CPD/CES logging 모두 정상 종료, `run.py DONE` |
 
 DDP validation/test에서는 각 rank가 validation/test sample을 복제 없이 정확히 한
 번씩 나눠 처리한다. 일반 distributed sampler처럼 dataset 길이를 world size에 맞추기
