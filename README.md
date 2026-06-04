@@ -278,16 +278,16 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | branch | `trajtok` |
 | pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
-| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs90_lr685e4_oom_retry_trajtok_hidden124_globalendpoint_topk16_trainselectfalse_20260604` |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs120_lr612e4_oom_retry_trajtok_hidden124_globalendpoint_topk16_trainselectfalse_20260604` |
 | remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_globalendpoint_20260604` |
 | experiment | `pre_bc_a100x4x2` |
 | model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global endpoint contour token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
 | decoder | `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
 | model parameters | `8,247,013` total / trainable, 직접 SMART instantiate로 측정 |
-| train batch | `INITIAL_BS=15` per rank, effective global batch 90 |
-| OOM retry | `MIN_BS=13`, `OOM_STEP=2`, latest task checkpoint resume (`15 -> 13`) |
+| train batch | `INITIAL_BS=20` per rank, effective global batch 120 |
+| OOM retry | `MIN_BS=14`, `OOM_STEP=2`, latest task checkpoint resume (`20 -> 18 -> 16 -> 14`); retry attempt마다 LR도 현재 global batch 기준으로 재계산 |
 | validation/test batch | `VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12` |
-| optimizer schedule | `lr=6.85e-4`, `lr_warmup_steps=4`, `lr_min_ratio=1e-2`; LR follows sqrt scaling from the paper 48-batch `5e-4` recipe to effective batch 90 |
+| optimizer schedule | `lr=6.123724e-4`, `lr_warmup_steps=4`, `lr_min_ratio=1e-2`; LR follows sqrt scaling from total batch 80의 `5e-4` 기준 to effective batch 120 |
 | precision / grad accumulation | `bf16-mixed`, `accumulate_grad_batches=1` |
 | train augmentation | `random_scene_scale_config: null`, `random_time_shift_config: null` |
 | agent selection | `data.train_use_eval_agent_selection=false` |
@@ -322,6 +322,9 @@ GPU로 endpoint contour target을 검증했다.
 | H100 4+2 DDP train smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, real train cache, 1 batch | manual 6-rank DDP, 6/6 ranks NCCL 초기화 및 backward 정상 종료, exit status `0` |
 | H100 4+2 DDP train+validation smoke | same pods, real train/validation cache, 1 train batch + 1 closed-loop validation batch, `validation_rollout_sampling.num_k=16` | train step, checkpoint callback, open-loop validation, closed-loop fast WOSAC metric 정상 종료, `run.py DONE` |
 | 20260604 H100 4+2 launch smoke | `smart_ntp_pretrain_h100x4_h100x2_globalbs90_lr685e4_oom_retry_trajtok_hidden124_globalendpoint_topk16_trainselectfalse_20260604_smoke`, `data.train_batch_size=15`, 6 ranks, `lr=6.85e-4` | `bs=15`에서 OOM 없이 1 train batch + top-16 closed-loop validation 1 batch 정상 종료, `run.py DONE` |
+| 20260604 batch-size probe | `trajtok_h100x4_h100x2_bs_probe_20b_20260604`, 20 train batches, validation off | `bs=24`는 `wo-pvc-2` rank 5 CUDA OOM, `bs=22`는 `hsb-npc-training` rank 3 CUDA OOM, `bs=20`은 20/20 train batches 정상 종료 |
+| 20260604 bs20 stability probe | `trajtok_h100x4_h100x2_bs20_probe_100b_20260604`, `data.train_batch_size=20`, 6 ranks, validation off | 100/100 train batches 정상 종료, OOM marker 없음, `run.py DONE` |
+| 20260604 globalbs120 script smoke | `trajtok_h100x4_h100x2_globalbs120_lr612e4_script_smoke_20260604`, `data.train_batch_size=20`, 6 ranks, `lr=0.00061237244` | wrapper auto LR 계산, 1 train batch + 1 validation batch 정상 종료, open-loop/closed-loop Fast WOSAC/CPD/CES logging 확인, `run.py DONE` |
 
 2026-06-04에 spatial-aware smoothing도 endpoint contour 단일 구현으로 정리했다. 새
 smoothing target은 각 token의 0.5초 endpoint contour `[4, 2]`를 사용하며, 같은 batch
@@ -379,17 +382,20 @@ bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 
 장기 학습에서 OOM 자동 재시작까지 원하면 `START_ONLY` 없이 wrapper를 계속 실행해야 한다.
 로컬 shell을 점유하지 않으려면 아래처럼 로컬 tmux 안에서 wrapper를 foreground로 둔다.
-기본 task name은 `globalbs90`, `lr685e4`, `globalendpoint`, `topk16`을 포함하므로, 기존
-`globalbs90` 20260603 run이나 `globalbs102`/`globalbs108` run의 checkpoint를 이어 쓰지
-않는 fresh start다.
-`globalbs102` 시도에서는 `INITIAL_BS=17`이 epoch 0의 4524/4775 step 부근에서
-`wo-pvc-2` rank 5 CUDA OOM으로 실패했다. 따라서 현재 기본값은 `INITIAL_BS=15`이고,
-OOM이 발생하면 `bs=13`으로 낮춘 뒤 같은 task의 최신 `epoch_last.ckpt`로 재시작한다.
+기본 task name은 `globalbs120`, `lr612e4`, `globalendpoint`, `topk16`을 포함하므로, 기존
+`globalbs90`/`globalbs102`/`globalbs108` run의 checkpoint를 이어 쓰지 않는 fresh start다.
+2026-06-04 probe 기준 `INITIAL_BS=24`와 `22`는 H100 80GB에서 CUDA OOM이 발생했고,
+`INITIAL_BS=20`은 100 train batches를 OOM 없이 통과했다. 따라서 현재 기본값은
+`INITIAL_BS=20`이다. LR은 `LEARNING_RATE=auto` 기본값에서
+`BASE_LEARNING_RATE=5e-4`, `BASE_TOTAL_BATCH_SIZE=80` 기준 sqrt scaling으로 계산한다.
+즉 6 ranks에서 `bs=20`이면 effective global batch 120이고 LR은 `6.123724e-4`이다.
+OOM retry로 batch가 낮아지는 경우에도 해당 attempt의 effective global batch에 맞춰 LR을
+다시 계산한다.
 remote `PROJECT_ROOT`에 미커밋 변경이나 untracked 파일이 있으면 wrapper가 먼저 `git stash
 push --include-untracked`로 보존한 뒤 `origin/trajtok`을 checkout한다.
 
 ```bash
-tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs90-wrapper
+tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs120-wrapper
 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 
 START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
@@ -398,8 +404,8 @@ START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_ret
 실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs90
-kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs90
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs120-lr612e4
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs120-lr612e4
 
 STOP=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 ```

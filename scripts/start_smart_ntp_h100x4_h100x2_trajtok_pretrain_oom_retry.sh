@@ -20,16 +20,19 @@ PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_globalen
 REPO_URL="${REPO_URL:-https://github.com/seulbinHwang/catk.git}"
 BRANCH="${BRANCH:-trajtok}"
 GIT_REF="${GIT_REF:-}"
-TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_h100x4_h100x2_globalbs90_lr685e4_oom_retry_trajtok_hidden124_globalendpoint_topk16_trainselectfalse_20260604}"
-SESSION="${SESSION:-catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs90}"
+TASK_NAME="${TASK_NAME:-smart_ntp_pretrain_h100x4_h100x2_globalbs120_lr612e4_oom_retry_trajtok_hidden124_globalendpoint_topk16_trainselectfalse_20260604}"
+SESSION="${SESSION:-catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs120-lr612e4}"
 EXPERIMENT="${EXPERIMENT:-pre_bc_a100x4x2}"
 REMOTE_LOG_DIR="${REMOTE_LOG_DIR:-/mnt/nuplan/projects/catk/logs}"
 CACHE_ROOT="${CACHE_ROOT:-}"
 POD_CACHE_ROOTS="${POD_CACHE_ROOTS:-}"
 MASTER_PORT="${MASTER_PORT:-29567}"
-INITIAL_BS="${INITIAL_BS:-15}"
+INITIAL_BS="${INITIAL_BS:-20}"
 OOM_STEP="${OOM_STEP:-2}"
-MIN_BS="${MIN_BS:-13}"
+MIN_BS="${MIN_BS:-14}"
+TOTAL_GPU_COUNT="${TOTAL_GPU_COUNT:-6}"
+BASE_TOTAL_BATCH_SIZE="${BASE_TOTAL_BATCH_SIZE:-80}"
+BASE_LEARNING_RATE="${BASE_LEARNING_RATE:-5e-4}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 MAX_NON_OOM_RETRIES="${MAX_NON_OOM_RETRIES:-2}"
 RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-134,143}"
@@ -38,7 +41,7 @@ TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-12}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
 LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-}"
 MAX_EPOCHS="${MAX_EPOCHS:-}"
-LEARNING_RATE="${LEARNING_RATE:-6.85e-4}"
+LEARNING_RATE="${LEARNING_RATE:-auto}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
 STOP="${STOP:-0}"
@@ -62,6 +65,14 @@ if (( INITIAL_BS < 1 || OOM_STEP < 1 || MIN_BS < 1 )); then
 fi
 if (( INITIAL_BS < MIN_BS )); then
   echo "ERROR: INITIAL_BS=${INITIAL_BS} is below MIN_BS=${MIN_BS}." >&2
+  exit 2
+fi
+if ! [[ "$TOTAL_GPU_COUNT" =~ ^[0-9]+$ && "$BASE_TOTAL_BATCH_SIZE" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: TOTAL_GPU_COUNT and BASE_TOTAL_BATCH_SIZE must be integers." >&2
+  exit 2
+fi
+if (( TOTAL_GPU_COUNT < 1 || BASE_TOTAL_BATCH_SIZE < 1 )); then
+  echo "ERROR: TOTAL_GPU_COUNT and BASE_TOTAL_BATCH_SIZE must be >= 1." >&2
   exit 2
 fi
 
@@ -139,6 +150,25 @@ remote_run_root() {
   printf '%s/tmux_smart_ntp_h100x4_h100x2/%s' "${REMOTE_LOG_DIR%/}" "$(safe_task_name)"
 }
 
+resolve_learning_rate() {
+  local bs="$1"
+  if [[ -n "$LEARNING_RATE" && "$LEARNING_RATE" != "auto" ]]; then
+    printf '%s\n' "$LEARNING_RATE"
+    return 0
+  fi
+  "$PYTHON_BIN" - "$BASE_LEARNING_RATE" "$BASE_TOTAL_BATCH_SIZE" "$TOTAL_GPU_COUNT" "$bs" <<'PY'
+import math
+import sys
+
+base_lr = float(sys.argv[1])
+base_total_batch = int(sys.argv[2])
+total_gpu_count = int(sys.argv[3])
+per_rank_batch = int(sys.argv[4])
+total_batch = total_gpu_count * per_rank_batch
+print(f"{base_lr * math.sqrt(total_batch / base_total_batch):.8g}")
+PY
+}
+
 remote_tmux_log_for_pod() {
   local pod="$1"
   printf '%s/%s.tmux.log' "$(remote_run_root)" "$pod"
@@ -194,6 +224,11 @@ stop_attempt_sessions() {
 start_attempt() {
   local bs="$1"
   local ckpt_path="$2"
+  local attempt_lr
+  local attempt_global_bs
+  attempt_global_bs=$((bs * TOTAL_GPU_COUNT))
+  attempt_lr="$(resolve_learning_rate "$bs")"
+  log "  effective global batch=${attempt_global_bs}, lr=${attempt_lr} (sqrt scaling from batch ${BASE_TOTAL_BATCH_SIZE}, lr ${BASE_LEARNING_RATE})"
   local -a cmd=(
     "$PYTHON_BIN" scripts/launch_smart_ntp_h100x4_h100x2.py
     --namespace "$NAMESPACE"
@@ -239,9 +274,7 @@ start_attempt() {
   if [[ -n "$MAX_EPOCHS" ]]; then
     cmd+=(--max-epochs "$MAX_EPOCHS")
   fi
-  if [[ -n "$LEARNING_RATE" ]]; then
-    cmd+=(--learning-rate "$LEARNING_RATE")
-  fi
+  cmd+=(--learning-rate "$attempt_lr")
   if [[ -n "$EXTRA_HYDRA_OVERRIDES" ]]; then
     cmd+=(--extra-hydra-overrides "$EXTRA_HYDRA_OVERRIDES")
   fi
