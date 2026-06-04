@@ -21,6 +21,8 @@ data:
   test_batch_size: 4
   num_workers: 8
   train_max_agents: 64
+  train_memory_balanced_batching: true
+  train_memory_balanced_batches: true
 
 model:
   model_config:

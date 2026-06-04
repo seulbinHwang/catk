@@ -34,7 +34,7 @@ main() {
   local scorer_scene_num="${SCORER_SCENE_NUM:-1680}"
   local checkpoint_monitor="${CHECKPOINT_MONITOR:-val_closed/sim_agents_2025/realism_meta_metric}"
   local checkpoint_mode="${CHECKPOINT_MODE:-max}"
-  local memory_balanced_batching="${TRAIN_MEMORY_BALANCED_BATCHING:-true}"
+  local memory_balanced_batching="${TRAIN_MEMORY_BALANCED_BATCHES:-${TRAIN_MEMORY_BALANCED_BATCHING:-true}}"
   local memory_metadata_num_workers="${TRAIN_MEMORY_BALANCE_METADATA_NUM_WORKERS:-32}"
   local memory_build_on_missing="${TRAIN_MEMORY_BALANCE_BUILD_ON_MISSING:-true}"
 
@@ -49,6 +49,7 @@ main() {
     callbacks.model_checkpoint.monitor="$checkpoint_monitor"
     callbacks.model_checkpoint.mode="$checkpoint_mode"
     data.train_memory_balanced_batching="$memory_balanced_batching"
+    data.train_memory_balanced_batches="$memory_balanced_batching"
     data.train_memory_balance_metadata_num_workers="$memory_metadata_num_workers"
     data.train_memory_balance_build_on_missing="$memory_build_on_missing"
   )
