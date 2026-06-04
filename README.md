@@ -2749,6 +2749,18 @@ python scripts/launch_waymo_val_submission_epoch061_h100x6_hsb1_static_pod.py \
 ```
 
 ```bash
+# validation rollout/archive 생성은 성공했지만 Waymo 업로드만 네트워크 문제로 실패한 경우,
+# 기존 archive를 재검증한 뒤 업로드만 다시 시도합니다. full validation은 다시 돌리지 않습니다.
+python scripts/launch_waymo_val_submission_epoch061_h100x6_hsb1_static_pod.py \
+  --upload-existing-archive /mnt/nuplan/projects/catk/logs/flow_agents_7m_waymo_val_epoch061_x5f9g0ce_h100x6_hsb1_sample16_euler_antithetic_stratified_noise1000/runs/20260604_220315_full/sim_agents_2025_submission.tar.gz \
+  --antithetic-pairs true \
+  --stratified-gaussian-noise true \
+  --noise-scale 1.0 \
+  --submit-validation \
+  --replace
+```
+
+```bash
 # iid Gaussian noise, 즉 antithetic pair를 끈 설정으로 실제 validation leaderboard에 제출합니다.
 python scripts/launch_waymo_val_submission_epoch061_h100x6_hsb1_static_pod.py \
   --antithetic-pairs false \
@@ -2788,7 +2800,7 @@ tmux 확인:
 
 ```bash
 kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- \
-  tmux attach -t catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-antithetic-noise1000
+  tmux attach -t catk-flow-waymo-val-submission-epoch061-h100x6-hsb1-antithetic-iidgaussian-noise1000
 ```
 
 실험 코드만 멈추고 pod는 그대로 두려면:

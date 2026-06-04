@@ -49,6 +49,8 @@ _SYSTEM_CHROMIUM_CANDIDATES = (
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
 )
+_WAYMO_HTTP_UPLOAD_MAX_ATTEMPTS = 3
+_WAYMO_HTTP_UPLOAD_RETRY_SLEEP_SECONDS = 20.0
 
 
 def _playwright_install_hint(prefix: str) -> str:
@@ -62,6 +64,14 @@ def _playwright_install_hint(prefix: str) -> str:
         "If `pip install` already succeeded, check that `python -m pip --version` "
         "and `pip --version` point to the same environment."
     )
+
+
+def _summarize_request_exception(exc: requests.RequestException) -> str:
+    """Keep retry logs readable without printing signed upload query strings."""
+
+    text = str(exc)
+    text = re.sub(r"(https?://[^?\\s]+)\\?[^\\s)]+", r"\\1?<redacted>", text)
+    return f"{exc.__class__.__name__}: {text}"
 
 
 @dataclass(frozen=True)
@@ -757,50 +767,83 @@ class _WaymoSubmissionUploader:
             )
 
         archive_size = self.runtime.archive_path.stat().st_size
-        upload_metadata_response = session.get(
-            "https://waymo.com/open/api/createUploadUrl.json",
-            params={
-                "challenge": _SIM_AGENTS_CHALLENGE_NAME,
-                "submissionType": self.runtime.evaluation_set.upper(),
-                "filename": self.runtime.archive_path.name,
-                "contentLength": str(archive_size),
-            },
-            headers={"Referer": self.runtime.challenge_url},
-            timeout=self._requests_timeout_seconds(),
-        )
-        self._raise_for_status(upload_metadata_response, "prepare the Waymo upload")
-        upload_metadata = upload_metadata_response.json()
-        if not bool(upload_metadata.get("success")):
-            raise RuntimeError(
-                "Waymo did not accept the upload preparation request: "
-                f"{upload_metadata!r}"
-            )
+        for attempt in range(1, _WAYMO_HTTP_UPLOAD_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                time.sleep(_WAYMO_HTTP_UPLOAD_RETRY_SLEEP_SECONDS)
 
-        upload_url = upload_metadata.get("uploadUrl")
-        if isinstance(upload_url, list):
-            upload_url = upload_url[0] if upload_url else None
-        if not upload_url:
-            raise RuntimeError(
-                "Waymo upload preparation response did not include an upload URL."
+            log.info(
+                "Preparing Waymo upload URL for %s (%d bytes), attempt %d/%d.",
+                self.runtime.archive_path,
+                archive_size,
+                attempt,
+                _WAYMO_HTTP_UPLOAD_MAX_ATTEMPTS,
             )
-
-        content_type = upload_metadata.get("contentType")
-        if not content_type:
-            raise RuntimeError(
-                "Waymo upload preparation response did not include a content type."
-            )
-
-        with self.runtime.archive_path.open("rb") as archive_file:
-            upload_response = requests.put(
-                str(upload_url),
-                data=archive_file,
-                headers={
-                    "Content-Type": str(content_type),
-                    "Content-Length": str(archive_size),
+            upload_metadata_response = session.get(
+                "https://waymo.com/open/api/createUploadUrl.json",
+                params={
+                    "challenge": _SIM_AGENTS_CHALLENGE_NAME,
+                    "submissionType": self.runtime.evaluation_set.upper(),
+                    "filename": self.runtime.archive_path.name,
+                    "contentLength": str(archive_size),
                 },
-                timeout=(self._requests_timeout_seconds(), None),
+                headers={"Referer": self.runtime.challenge_url},
+                timeout=self._requests_timeout_seconds(),
             )
-        self._raise_for_status(upload_response, "upload the Waymo submission archive")
+            self._raise_for_status(upload_metadata_response, "prepare the Waymo upload")
+            upload_metadata = upload_metadata_response.json()
+            if not bool(upload_metadata.get("success")):
+                raise RuntimeError(
+                    "Waymo did not accept the upload preparation request: "
+                    f"{upload_metadata!r}"
+                )
+
+            upload_url = upload_metadata.get("uploadUrl")
+            if isinstance(upload_url, list):
+                upload_url = upload_url[0] if upload_url else None
+            if not upload_url:
+                raise RuntimeError(
+                    "Waymo upload preparation response did not include an upload URL."
+                )
+
+            content_type = upload_metadata.get("contentType")
+            if not content_type:
+                raise RuntimeError(
+                    "Waymo upload preparation response did not include a content type."
+                )
+
+            try:
+                log.info(
+                    "Uploading Waymo submission archive, attempt %d/%d.",
+                    attempt,
+                    _WAYMO_HTTP_UPLOAD_MAX_ATTEMPTS,
+                )
+                with self.runtime.archive_path.open("rb") as archive_file:
+                    upload_response = requests.put(
+                        str(upload_url),
+                        data=archive_file,
+                        headers={
+                            "Content-Type": str(content_type),
+                            "Content-Length": str(archive_size),
+                        },
+                        timeout=(self._requests_timeout_seconds(), None),
+                    )
+                self._raise_for_status(upload_response, "upload the Waymo submission archive")
+                log.info(
+                    "Uploaded Waymo submission archive on attempt %d/%d.",
+                    attempt,
+                    _WAYMO_HTTP_UPLOAD_MAX_ATTEMPTS,
+                )
+                break
+            except requests.RequestException as exc:
+                if attempt >= _WAYMO_HTTP_UPLOAD_MAX_ATTEMPTS:
+                    raise
+                log.warning(
+                    "Waymo archive upload attempt %d/%d failed (%s). "
+                    "Retrying with a fresh upload URL.",
+                    attempt,
+                    _WAYMO_HTTP_UPLOAD_MAX_ATTEMPTS,
+                    _summarize_request_exception(exc),
+                )
 
         submissions_response = session.get(
             self.runtime.submissions_url,

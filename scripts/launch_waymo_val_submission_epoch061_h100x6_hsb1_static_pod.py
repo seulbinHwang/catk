@@ -292,11 +292,150 @@ def render_remote_script(args: argparse.Namespace) -> str:
     )
 
 
+def render_upload_existing_remote_script(args: argparse.Namespace) -> str:
+    submit_validate = "true" if (args.submit_validation or args.verify_waymo_ui) else "false"
+    waymo_enabled = "true" if (args.submit_validation or args.verify_waymo_ui) else "false"
+    waymo_dry_run = "true" if args.verify_waymo_ui and not args.submit_validation else "false"
+    expected_validation_scenarios = (
+        ""
+        if args.expected_validation_scenarios is None
+        else str(int(args.expected_validation_scenarios))
+    )
+    verify_command = (
+        "python scripts/verify_waymo_submission_archive.py "
+        "--archive \"$ARCHIVE_PATH\" "
+        "--expected-rollouts-per-scenario 32 "
+        "--expected-steps-per-trajectory 80 "
+        "--expected-method-name \"Flow Agents 7M\" "
+        "--expected-authors \"SB H,KO O\" "
+        "--expected-affiliation NLK "
+        f"--expected-description {shq(args.description)} "
+        "--expected-method-link \"not available yet\" "
+        "--expected-account-name h.sb@naverlabs.com "
+        "--expected-num-model-parameters 7M "
+        "--require-closed-loop-ack"
+    )
+    script = strip_template_indent(
+        f"""\
+        #!/usr/bin/env bash
+        set -Eeuo pipefail
+
+        export TERM="${{TERM:-xterm-256color}}"
+        export HYDRA_FULL_ERROR=1
+        export TF_CPP_MIN_LOG_LEVEL=2
+        export PYTHONUNBUFFERED=1
+        export CATK_REMOTE_PYTHON="${{CATK_REMOTE_PYTHON:-/mnt/nuplan/miniforge/envs/catk/bin/python}}"
+
+        PROJECT_ROOT={shq(args.project_root)}
+        CACHE_ROOT={shq(args.cache_root)}
+        LOG_DIR={shq(args.log_dir)}
+        TASK_NAME={shq(args.task_name)}
+        RUN_ID={shq(args.run_id)}
+        RUN_DIR="${{LOG_DIR%/}}/${{TASK_NAME}}/runs/${{RUN_ID}}"
+        ARCHIVE_PATH={shq(args.upload_existing_archive)}
+        EXPECTED_VALIDATION_SCENARIOS={shq(expected_validation_scenarios)}
+
+        cd "$PROJECT_ROOT"
+        mkdir -p "$RUN_DIR"
+
+        echo "[$(date '+%F %T')] start Waymo validation upload-only flow"
+        echo "  branch=$(git rev-parse --abbrev-ref HEAD) commit=$(git rev-parse --short HEAD)"
+        echo "  archive=$ARCHIVE_PATH"
+        echo "  submit_validate={submit_validate} submit_test=false waymo_enabled={waymo_enabled} waymo_dry_run={waymo_dry_run}"
+
+        test -f "$ARCHIVE_PATH"
+        if [[ -z "$EXPECTED_VALIDATION_SCENARIOS" ]]; then
+          EXPECTED_VALIDATION_SCENARIOS=$(find "$CACHE_ROOT/validation" -type f -name '*.pkl' | wc -l | tr -d ' ')
+          echo "  auto expected_validation_scenarios=$EXPECTED_VALIDATION_SCENARIOS"
+        fi
+
+        echo "[$(date '+%F %T')] verifying existing archive"
+        {verify_command} --expected-scenarios "$EXPECTED_VALIDATION_SCENARIOS"
+
+        if [[ "{waymo_enabled}" != "true" ]]; then
+          echo "[$(date '+%F %T')] DONE verified existing archive without upload"
+          exit 0
+        fi
+
+        export CATK_WAYMO_ARCHIVE_PATH="$ARCHIVE_PATH"
+        export CATK_WAYMO_OUTPUT_DIR="$RUN_DIR"
+        export CATK_WAYMO_EVALUATION_SET=validation
+        export CATK_WAYMO_DRY_RUN={waymo_dry_run}
+        export CATK_WAYMO_SUBMIT_VALIDATE={submit_validate}
+        export CATK_WAYMO_DESCRIPTION={shq(args.description)}
+        export CATK_WAYMO_UPLOAD_TIMEOUT_MS={int(args.upload_timeout_ms)}
+        export CATK_WAYMO_STORAGE_STATE_PATH={shq(args.storage_state_path)}
+
+        echo "[$(date '+%F %T')] uploading existing archive to Waymo validation"
+        "$CATK_REMOTE_PYTHON" - <<'PY'
+        import os
+        from omegaconf import OmegaConf
+        from src.utils.waymo_submission import maybe_submit_waymo_submission
+
+        storage_state_path = os.environ.get("CATK_WAYMO_STORAGE_STATE_PATH", "")
+        cfg = OmegaConf.create(
+            {{
+                "action": "validate",
+                "paths": {{
+                    "root_dir": os.getcwd(),
+                    "output_dir": os.environ["CATK_WAYMO_OUTPUT_DIR"],
+                }},
+                "model": {{
+                    "model_config": {{
+                        "sim_agents_submission": {{
+                            "method_name": "Flow Agents 7M",
+                            "authors": ["SB H", "KO O"],
+                            "affiliation": "NLK",
+                            "description": os.environ["CATK_WAYMO_DESCRIPTION"],
+                            "method_link": "not available yet",
+                            "account_name": "h.sb@naverlabs.com",
+                        }}
+                    }}
+                }},
+                "waymo_submission": {{
+                    "enabled": True,
+                    "dry_run": os.environ["CATK_WAYMO_DRY_RUN"].lower() == "true",
+                    "submit_validate": os.environ["CATK_WAYMO_SUBMIT_VALIDATE"].lower() == "true",
+                    "submit_test": False,
+                    "evaluation_set": os.environ["CATK_WAYMO_EVALUATION_SET"],
+                    "challenge_url": "https://waymo.com/open/challenges/2025/sim-agents/",
+                    "submissions_url": "https://waymo.com/open/challenges/submissions/",
+                    "storage_state_path": storage_state_path or "secrets/waymo/waymo_storage_state.json",
+                    "archive_path": os.environ["CATK_WAYMO_ARCHIVE_PATH"],
+                    "browser_name": "chromium",
+                    "browser_channel": None,
+                    "browser_executable_path": None,
+                    "headless": True,
+                    "chromium_sandbox": False,
+                    "navigation_timeout_ms": 120000,
+                    "upload_timeout_ms": int(os.environ["CATK_WAYMO_UPLOAD_TIMEOUT_MS"]),
+                    "post_submit_wait_ms": 5000,
+                    "poll_submission_status": False,
+                    "poll_timeout_seconds": 0,
+                    "poll_interval_seconds": 60,
+                    "save_debug_artifacts": True,
+                }},
+            }}
+        )
+        result = maybe_submit_waymo_submission(cfg)
+        print(f"Waymo upload result: {{result}}")
+        PY
+
+        echo "[$(date '+%F %T')] DONE upload-only archive=$ARCHIVE_PATH"
+        """
+    )
+    return script
+
+
 def render_start_command(args: argparse.Namespace) -> str:
     run_root = f"{args.log_dir.rstrip('/')}/{args.task_name}/launcher"
     run_file = f"{run_root}/{args.run_id}_run.sh"
     log_file = f"{run_root}/{args.run_id}.tmux.log"
-    remote_script = render_remote_script(args)
+    remote_script = (
+        render_upload_existing_remote_script(args)
+        if args.upload_existing_archive
+        else render_remote_script(args)
+    )
     remote_script_marker = "__CATK_REMOTE_SCRIPT_CONTENT__"
     pull_block = ""
     if not args.no_pull:
@@ -429,6 +568,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-group", default="")
     parser.add_argument("--storage-state-path", default="")
     parser.add_argument("--upload-timeout-ms", type=int, default=7200000)
+    parser.add_argument(
+        "--upload-existing-archive",
+        default="",
+        help=(
+            "Skip validation generation and upload an already generated "
+            "sim_agents_2025_submission.tar.gz after verifying it."
+        ),
+    )
     parser.add_argument("--extra-hydra-overrides", nargs="*", default=[])
     parser.add_argument("--submit-validation", action="store_true")
     parser.add_argument(
@@ -449,7 +596,7 @@ def parse_args() -> argparse.Namespace:
     if not args.run_id:
         import datetime as dt
 
-        suffix = "smoke" if args.smoke_test else "full"
+        suffix = "smoke" if args.smoke_test else ("upload" if args.upload_existing_archive else "full")
         args.run_id = dt.datetime.now().strftime(f"%Y%m%d_%H%M%S_{suffix}")
     if not args.task_name:
         args.task_name = (
@@ -476,6 +623,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--submit-validation is not allowed together with --smoke-test")
     if args.submit_validation and args.verify_waymo_ui:
         parser.error("--submit-validation and --verify-waymo-ui are mutually exclusive")
+    if args.upload_existing_archive and args.smoke_test:
+        parser.error("--upload-existing-archive is not allowed together with --smoke-test")
     if args.val_batch_size < 1 or args.smoke_val_batch_size < 1:
         parser.error("batch sizes must be positive")
     return args
