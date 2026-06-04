@@ -23,7 +23,7 @@ from .utils import (
     get_euclidean_targets,
     get_prob_targets,
     get_prob_targets_from_index,
-    match_current_state_trajectory_token_rows,
+    match_current_state_endpoint_token_rows,
 )
 from src.smart.utils import merge_by_type, split_by_type
 
@@ -72,7 +72,6 @@ class CrossEntropy(Metric):
         # ! for tokenization
         token_agent_shape: Tensor,  # [n_agent, 2]
         token_traj: Tensor,  # [n_agent, n_token, 4, 2]
-        token_trajectory: Optional[Tensor | dict[str, Tensor]] = None,
         token_contour_trajectory: Optional[Tensor | dict[str, Tensor]] = None,
         gt_pos_segment_raw: Optional[Tensor] = None,  # [n_agent, 16, 5, 2]
         gt_head_segment_raw: Optional[Tensor] = None,  # [n_agent, 16, 5]
@@ -96,7 +95,7 @@ class CrossEntropy(Metric):
         use_current_state_target = (
             pred_idx is not None
             and not self.rollout_as_gt
-            and token_trajectory is not None
+            and token_traj is not None
             and (not self.spatial_aware_smoothing or token_contour_trajectory is not None)
             and gt_pos_segment_raw is not None
             and gt_head_segment_raw is not None
@@ -112,8 +111,8 @@ class CrossEntropy(Metric):
                 gt_pos_segment_raw=gt_pos_segment_raw,
                 gt_head_segment_raw=gt_head_segment_raw,
                 gt_valid_segment_raw=gt_valid_segment_raw,
+                token_agent_shape=token_agent_shape,
                 token_traj=token_traj,
-                token_trajectory=token_trajectory,
                 token_contour_trajectory=token_contour_trajectory,
                 train_mask=train_mask,
                 type_mask=type_mask,
@@ -127,7 +126,6 @@ class CrossEntropy(Metric):
                 gt_idx=gt_idx,
                 gt_valid_mask=gt_valid_mask,
                 token_traj=token_traj,
-                token_trajectory=token_trajectory,
                 token_contour_trajectory=token_contour_trajectory,
                 train_mask=train_mask,
                 type_mask=type_mask,
@@ -171,11 +169,6 @@ class CrossEntropy(Metric):
             for agent_type, mask in type_mask.items():
                 if not bool(mask.any()) or agent_type not in next_token_logits:
                     continue
-                token_trajectory_type = (
-                    token_trajectory.get(agent_type)
-                    if isinstance(token_trajectory, dict)
-                    else None
-                )
                 token_contour_trajectory_type = (
                     token_contour_trajectory.get(agent_type)
                     if isinstance(token_contour_trajectory, dict)
@@ -194,6 +187,7 @@ class CrossEntropy(Metric):
                         target=target_by_type[agent_type],
                         token_agent_shape=token_agent_shape_by_type[agent_type],
                         token_traj=token_traj[agent_type],
+                        token_contour_trajectory=token_contour_trajectory_type,
                         label_smoothing=self.label_smoothing,
                         spatial_aware_smoothing=self.spatial_aware_smoothing,
                     )
@@ -222,6 +216,11 @@ class CrossEntropy(Metric):
                     target=euclidean_target,
                     token_agent_shape=token_agent_shape,
                     token_traj=token_traj,
+                    token_contour_trajectory=(
+                        token_contour_trajectory
+                        if isinstance(token_contour_trajectory, Tensor)
+                        else None
+                    ),
                     label_smoothing=self.label_smoothing,
                     spatial_aware_smoothing=self.spatial_aware_smoothing,
                 )
@@ -249,13 +248,13 @@ class CrossEntropy(Metric):
         gt_pos_segment_raw: Tensor,
         gt_head_segment_raw: Tensor,
         gt_valid_segment_raw: Tensor,
+        token_agent_shape: Tensor,
         token_traj: Tensor | dict[str, Tensor],
-        token_trajectory: Tensor | dict[str, Tensor],
         token_contour_trajectory: Optional[Tensor | dict[str, Tensor]],
         train_mask: Optional[Tensor],
         type_mask: Optional[dict[str, Tensor]],
     ) -> None:
-        target_valid = gt_valid_segment_raw.all(dim=-1)
+        target_valid = gt_valid_segment_raw[..., -1]
         loss_weighting_mask = next_token_valid & target_valid
         if self.training and train_mask is not None:
             loss_weighting_mask &= train_mask.unsqueeze(1)
@@ -271,10 +270,10 @@ class CrossEntropy(Metric):
         if isinstance(next_token_logits, dict):
             if type_mask is None:
                 raise ValueError("type_mask is required for type-specific token logits.")
-            if not isinstance(token_traj, dict) or not isinstance(token_trajectory, dict):
+            if not isinstance(token_traj, dict):
                 raise ValueError(
                     "state-conditioned type-specific logits require type-specific "
-                    "token_traj and token_trajectory."
+                    "token_traj."
                 )
             if self.spatial_aware_smoothing and not isinstance(token_contour_trajectory, dict):
                 raise ValueError(
@@ -297,37 +296,41 @@ class CrossEntropy(Metric):
                 logits_valid = logits_type.reshape(-1, logits_type.shape[-1])[flat_valid]
                 pred_pos_valid = pred_pos_now[mask].reshape(-1, 2)[flat_valid]
                 pred_head_valid = pred_head_now[mask].reshape(-1)[flat_valid]
-                gt_pos_segment_valid = gt_pos_segment_raw[mask].reshape(
+                gt_pos_next_valid = gt_pos_segment_raw[mask].reshape(
                     -1, *gt_pos_segment_raw.shape[2:]
-                )[flat_valid]
-                gt_head_segment_valid = gt_head_segment_raw[mask].reshape(
+                )[flat_valid, -1]
+                gt_head_next_valid = gt_head_segment_raw[mask].reshape(
                     -1, gt_head_segment_raw.shape[-1]
-                )[flat_valid]
-                token_trajectory_type = token_trajectory[agent_type]
+                )[flat_valid, -1]
+                token_agent_shape_valid = (
+                    token_agent_shape[mask]
+                    .unsqueeze(1)
+                    .expand(-1, type_valid_mask.shape[1], -1)
+                    .reshape(-1, 2)[flat_valid]
+                )
                 token_contour_trajectory_type = (
                     token_contour_trajectory[agent_type]
                     if isinstance(token_contour_trajectory, dict)
                     else None
                 )
-                gt_idx_valid = match_current_state_trajectory_token_rows(
-                    pred_pos=pred_pos_valid,
-                    pred_head=pred_head_valid,
-                    gt_pos_segment=gt_pos_segment_valid,
-                    gt_head_segment=gt_head_segment_valid,
-                    token_trajectory=token_trajectory_type,
-                    chunk_size=self.current_state_target_chunk_size,
-                )
                 token_traj_rows = self._select_token_traj_rows(
                     token_traj=token_traj[agent_type],
                     valid_mask=type_valid_mask,
                     flat_valid=flat_valid,
-                    token_trajectory=token_trajectory_type,
+                )
+                gt_idx_valid = match_current_state_endpoint_token_rows(
+                    pred_pos=pred_pos_valid,
+                    pred_head=pred_head_valid,
+                    gt_pos_next=gt_pos_next_valid,
+                    gt_head_next=gt_head_next_valid,
+                    token_agent_shape=token_agent_shape_valid,
+                    token_traj=token_traj_rows,
+                    chunk_size=self.current_state_target_chunk_size,
                 )
                 loss_type = self._direct_gt_idx_loss_for_rows(
                     logits=logits_valid,
                     gt_idx=gt_idx_valid,
                     token_traj=token_traj_rows,
-                    token_trajectory=token_trajectory_type,
                     token_contour_trajectory=token_contour_trajectory_type,
                 )
                 loss_sum = loss_type if loss_sum is None else loss_sum + loss_type
@@ -336,8 +339,6 @@ class CrossEntropy(Metric):
                 self.count += valid_count.to(dtype=self.count.dtype)
                 return
         else:
-            if isinstance(token_trajectory, dict):
-                raise ValueError("single token logits require tensor token_trajectory.")
             if self.spatial_aware_smoothing and not isinstance(token_contour_trajectory, Tensor):
                 raise ValueError(
                     "spatial-aware state-conditioned loss requires tensor "
@@ -347,29 +348,30 @@ class CrossEntropy(Metric):
             logits_valid = next_token_logits.reshape(-1, next_token_logits.shape[-1])[
                 flat_valid
             ]
-            gt_idx_valid = match_current_state_trajectory_token_rows(
-                pred_pos=pred_pos_now.reshape(-1, 2)[flat_valid],
-                pred_head=pred_head_now.reshape(-1)[flat_valid],
-                gt_pos_segment=gt_pos_segment_raw.reshape(
-                    -1, *gt_pos_segment_raw.shape[2:]
-                )[flat_valid],
-                gt_head_segment=gt_head_segment_raw.reshape(
-                    -1, gt_head_segment_raw.shape[-1]
-                )[flat_valid],
-                token_trajectory=token_trajectory,
-                chunk_size=self.current_state_target_chunk_size,
-            )
             token_traj_rows = self._select_token_traj_rows(
                 token_traj=token_traj,
                 valid_mask=loss_weighting_mask,
                 flat_valid=flat_valid,
-                token_trajectory=token_trajectory,
+            )
+            gt_idx_valid = match_current_state_endpoint_token_rows(
+                pred_pos=pred_pos_now.reshape(-1, 2)[flat_valid],
+                pred_head=pred_head_now.reshape(-1)[flat_valid],
+                gt_pos_next=gt_pos_segment_raw.reshape(
+                    -1, *gt_pos_segment_raw.shape[2:]
+                )[flat_valid, -1],
+                gt_head_next=gt_head_segment_raw.reshape(
+                    -1, gt_head_segment_raw.shape[-1]
+                )[flat_valid, -1],
+                token_agent_shape=token_agent_shape.unsqueeze(1)
+                .expand(-1, loss_weighting_mask.shape[1], -1)
+                .reshape(-1, 2)[flat_valid],
+                token_traj=token_traj_rows,
+                chunk_size=self.current_state_target_chunk_size,
             )
             loss_sum = self._direct_gt_idx_loss_for_rows(
                 logits=logits_valid,
                 gt_idx=gt_idx_valid,
                 token_traj=token_traj_rows,
-                token_trajectory=token_trajectory,
                 token_contour_trajectory=(
                     token_contour_trajectory
                     if isinstance(token_contour_trajectory, Tensor)
@@ -387,7 +389,6 @@ class CrossEntropy(Metric):
         gt_idx: Tensor,
         gt_valid_mask: Tensor,
         token_traj: Tensor | dict[str, Tensor],
-        token_trajectory: Optional[Tensor | dict[str, Tensor]],
         token_contour_trajectory: Optional[Tensor | dict[str, Tensor]],
         train_mask: Optional[Tensor],
         type_mask: Optional[dict[str, Tensor]],
@@ -422,29 +423,17 @@ class CrossEntropy(Metric):
                 flat_valid = type_valid_mask.reshape(-1)
                 logits_valid = logits_type.reshape(-1, logits_type.shape[-1])[flat_valid]
                 gt_idx_valid = gt_idx_type.reshape(-1)[flat_valid]
-                token_trajectory_type = (
-                    token_trajectory.get(agent_type)
-                    if isinstance(token_trajectory, dict)
-                    else None
-                )
                 token_contour_trajectory_type = (
                     token_contour_trajectory.get(agent_type)
                     if isinstance(token_contour_trajectory, dict)
                     else None
                 )
                 token_traj_type = token_traj[agent_type]
-                token_traj_rows = self._select_token_traj_rows(
-                    token_traj=token_traj_type,
-                    valid_mask=type_valid_mask,
-                    flat_valid=flat_valid,
-                    token_trajectory=token_trajectory_type,
-                )
 
                 loss_type = self._direct_gt_idx_loss_for_rows(
                     logits=logits_valid,
                     gt_idx=gt_idx_valid,
-                    token_traj=token_traj_rows,
-                    token_trajectory=token_trajectory_type,
+                    token_traj=token_traj_type,
                     token_contour_trajectory=token_contour_trajectory_type,
                 )
                 loss_sum = loss_type if loss_sum is None else loss_sum + loss_type
@@ -458,20 +447,10 @@ class CrossEntropy(Metric):
                 flat_valid
             ]
             gt_idx_valid = gt_idx.reshape(-1)[flat_valid]
-            token_trajectory_tensor = (
-                token_trajectory if isinstance(token_trajectory, Tensor) else None
-            )
-            token_traj_rows = self._select_token_traj_rows(
-                token_traj=token_traj,
-                valid_mask=loss_weighting_mask,
-                flat_valid=flat_valid,
-                token_trajectory=token_trajectory_tensor,
-            )
             loss_sum = self._direct_gt_idx_loss_for_rows(
                 logits=logits_valid,
                 gt_idx=gt_idx_valid,
-                token_traj=token_traj_rows,
-                token_trajectory=token_trajectory_tensor,
+                token_traj=token_traj,
                 token_contour_trajectory=(
                     token_contour_trajectory
                     if isinstance(token_contour_trajectory, Tensor)
@@ -487,11 +466,7 @@ class CrossEntropy(Metric):
         token_traj: Tensor,
         valid_mask: Tensor,
         flat_valid: Tensor,
-        token_trajectory: Optional[Tensor],
     ) -> Tensor:
-        if token_trajectory is not None:
-            return token_traj
-
         n_step = valid_mask.shape[1]
         return (
             token_traj[:, None, :, :, :]
@@ -504,7 +479,6 @@ class CrossEntropy(Metric):
         logits: Tensor,
         gt_idx: Tensor,
         token_traj: Tensor,
-        token_trajectory: Optional[Tensor],
         token_contour_trajectory: Optional[Tensor],
     ) -> Tensor:
         if self.spatial_aware_smoothing:

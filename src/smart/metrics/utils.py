@@ -44,11 +44,16 @@ def _assign_spatial_aware_prob_target(
 
 def _get_prob_targets_from_contour_index(
     gt_idx: Tensor,
-    token_contour_trajectory: Tensor,  # [n_token, 5, 4, 2] or [n_token, 6, 4, 2]
+    token_contour_trajectory: Tensor,  # [n_token, 4, 2]
     label_smoothing: float,
 ) -> Tensor:
-    if token_contour_trajectory.shape[1] == 6:
-        token_contour_trajectory = token_contour_trajectory[:, 1:]
+    if token_contour_trajectory.dim() == 4:
+        token_contour_trajectory = token_contour_trajectory[:, -1]
+    if token_contour_trajectory.dim() != 3:
+        raise ValueError(
+            "token_contour_trajectory must have shape [n_token, 4, 2] "
+            "or [n_token, n_step, 4, 2]."
+        )
     n_token = token_contour_trajectory.shape[0]
     prob_target = token_contour_trajectory.new_zeros(*gt_idx.shape, n_token)
     flat_gt_idx = gt_idx.reshape(-1)
@@ -76,9 +81,9 @@ def _get_prob_targets_from_contour_index(
         chunk_gt_idx = unique_gt_idx[start:end]
         gt_chunk = token_contour_trajectory[chunk_gt_idx]
         dists = torch.norm(
-            gt_chunk[:, None, :, :, :] - token_contour_trajectory[None, :, :, :, :],
+            gt_chunk[:, None, :, :] - token_contour_trajectory[None, :, :, :],
             dim=-1,
-        ).mean(dim=(-1, -2))
+        ).sum(dim=-1)
         _assign_spatial_aware_prob_target(
             flat_prob_target=unique_prob_target,
             start=start,
@@ -95,7 +100,7 @@ def _get_prob_targets_from_contour_index(
 def get_prob_targets_from_index(
     gt_idx: Tensor,  # [n_agent, n_step]
     token_traj: Tensor,  # [n_agent, n_token, 4, 2]
-    token_contour_trajectory: Optional[Tensor] = None,  # [n_token, 5, 4, 2]
+    token_contour_trajectory: Optional[Tensor] = None,  # [n_token, 4, 2]
     label_smoothing: float = 0.0,
     spatial_aware_smoothing: bool = False,
 ) -> Tensor:  # [n_agent, n_step, n_token] prob
@@ -127,7 +132,7 @@ def get_prob_targets_from_index(
     if token_contour_trajectory is None:
         raise ValueError(
             "spatial-aware smoothing requires token_contour_trajectory "
-            "with shape [n_token, 5, 4, 2] or [n_token, 6, 4, 2]."
+            "with shape [n_token, 4, 2]."
         )
 
     return _get_prob_targets_from_contour_index(
@@ -142,6 +147,7 @@ def get_prob_targets(
     target: Tensor,  # [n_agent, n_step, 3] x,y,yaw in local coord
     token_agent_shape: Tensor,  # [n_agent, 2]
     token_traj: Tensor,  # [n_agent, n_token, 4, 2]
+    token_contour_trajectory: Optional[Tensor] = None,  # [n_token, 4, 2]
     label_smoothing: float = 0.0,
     spatial_aware_smoothing: bool = False,
 ) -> Tensor:  # [n_agent, n_step, n_token] prob
@@ -162,6 +168,7 @@ def get_prob_targets(
     return get_prob_targets_from_index(
         gt_idx=target_token_index,
         token_traj=token_traj,
+        token_contour_trajectory=token_contour_trajectory,
         label_smoothing=label_smoothing,
         spatial_aware_smoothing=spatial_aware_smoothing,
     )
@@ -206,21 +213,22 @@ def get_euclidean_targets(
 
 
 @torch.no_grad()
-def match_current_state_trajectory_token_rows(
+def match_current_state_endpoint_token_rows(
     pred_pos: Tensor,  # [n_row, 2]
     pred_head: Tensor,  # [n_row]
-    gt_pos_segment: Tensor,  # [n_row, 5, 2]
-    gt_head_segment: Tensor,  # [n_row, 5]
-    token_trajectory: Tensor,  # [n_token, 5, 3]
+    gt_pos_next: Tensor,  # [n_row, 2]
+    gt_head_next: Tensor,  # [n_row]
+    token_agent_shape: Tensor,  # [n_row, 2]
+    token_traj: Tensor,  # [n_token, 4, 2] or [n_row, n_token, 4, 2]
     chunk_size: int = CURRENT_STATE_TARGET_CHUNK_SIZE,
 ) -> Tensor:  # [n_row]
-    """Match full TrajTok trajectories from the current rollout state.
+    """Match endpoint contours from the current rollout state.
 
     The fixed TrajTok ``gt_idx`` is built during tokenization from the
     teacher-forced tokenized state. During rollout-style training, however, the
-    model state can drift. This matcher transforms the raw 0.5 s GT segment into
-    that current state frame and chooses the token whose full ``(x, y, yaw)``
-    trajectory is closest.
+    model state can drift. This matcher transforms the raw 0.5 s endpoint
+    contour into that current state frame and chooses the closest token endpoint
+    contour, matching the main/Thinklab rolling target convention.
     """
     n_row = int(pred_pos.shape[0])
     if n_row == 0:
@@ -228,20 +236,24 @@ def match_current_state_trajectory_token_rows(
 
     chunk_size = max(1, int(chunk_size))
     target_chunks = []
-    token_pos = token_trajectory[:, :, :2]
-    token_head = token_trajectory[:, :, 2]
+    use_row_token_bank = token_traj.dim() == 4
     for start in range(0, n_row, chunk_size):
         end = min(start + chunk_size, n_row)
-        gt_pos_local, gt_head_local = transform_to_local(
-            pos_global=gt_pos_segment[start:end],
-            head_global=gt_head_segment[start:end],
+        gt_contour = cal_polygon_contour(
+            gt_pos_next[start:end],
+            gt_head_next[start:end],
+            token_agent_shape[start:end],
+        )
+        gt_contour_local, _ = transform_to_local(
+            pos_global=gt_contour,
+            head_global=None,
             pos_now=pred_pos[start:end],
             head_now=pred_head[start:end],
         )
-        gt_head_local = wrap_angle(gt_head_local)
-
-        pos_delta = token_pos.unsqueeze(0) - gt_pos_local.unsqueeze(1)
-        head_delta = wrap_angle(token_head.unsqueeze(0) - gt_head_local.unsqueeze(1))
-        dist = torch.sqrt(pos_delta.square().sum(-1) + head_delta.square()).mean(-1)
+        token_chunk = token_traj[start:end] if use_row_token_bank else token_traj
+        dist = torch.norm(
+            token_chunk - gt_contour_local.unsqueeze(1),
+            dim=-1,
+        ).sum(dim=-1)
         target_chunks.append(dist.argmin(dim=-1))
     return torch.cat(target_chunks, dim=0)
