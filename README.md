@@ -2845,6 +2845,13 @@ python scripts/launch_waymo_val_submission_epoch116_antithetic_noise1016_h100x6_
 ```
 
 ```bash
+# antithetic pair + iid Gaussian + noise_scale=1.0 설정으로 실제 validation leaderboard에 제출합니다.
+python scripts/launch_waymo_val_submission_epoch116_antithetic_noise1000_h100x6_hsb1_static_pod.py \
+  --submit-validation \
+  --replace
+```
+
+```bash
 # validation rollout/archive 생성은 성공했지만 Waymo 업로드만 네트워크 문제로 실패한 경우,
 # 기존 archive를 재검증한 뒤 업로드만 다시 시도합니다. full validation은 다시 돌리지 않습니다.
 python scripts/launch_waymo_val_submission_epoch116_h100x6_hsb1_static_pod.py \
@@ -2861,6 +2868,14 @@ python scripts/launch_waymo_val_submission_epoch116_antithetic_noise1016_h100x6_
   --replace
 ```
 
+```bash
+# antithetic pair + iid Gaussian + noise_scale=1.0 archive는 이 명령으로 업로드만 재시도합니다.
+python scripts/launch_waymo_val_submission_epoch116_antithetic_noise1000_h100x6_hsb1_static_pod.py \
+  --upload-existing-archive /mnt/nuplan/projects/catk/logs/flow_agents_7m_waymo_val_epoch116_mqfq3u39_h100x6_hsb1_sample16_euler_antithetic_iidgaussian_noise1000/runs/<run_id>/sim_agents_2025_submission.tar.gz \
+  --submit-validation \
+  --replace
+```
+
 기본 설정:
 
 | 항목 | 설정 |
@@ -2872,14 +2887,14 @@ python scripts/launch_waymo_val_submission_epoch116_antithetic_noise1016_h100x6_
 | action / experiment | `action=validate`, `experiment=sim_agents_sub_flow` |
 | rollout count | `model.model_config.n_rollout_closed_val=32` |
 | solver / denoising | Euler, `model.model_config.validation_rollout_sampling.sample_steps=16` |
-| inference noise | 기본 wrapper는 `antithetic_pairs=true`, `stratified_gaussian_noise=true`, `noise_scale=1.0`, `validation_closed_seed=4`; `launch_waymo_val_submission_epoch116_antithetic_noise1016_h100x6_hsb1_static_pod.py`는 `antithetic_pairs=true`, `stratified_gaussian_noise=false`, `noise_scale=1.016` |
+| inference noise | 기본 wrapper는 `antithetic_pairs=true`, `stratified_gaussian_noise=true`, `noise_scale=1.0`, `validation_closed_seed=4`; `launch_waymo_val_submission_epoch116_antithetic_noise1016_h100x6_hsb1_static_pod.py`는 `antithetic_pairs=true`, `stratified_gaussian_noise=false`, `noise_scale=1.016`; `launch_waymo_val_submission_epoch116_antithetic_noise1000_h100x6_hsb1_static_pod.py`는 `antithetic_pairs=true`, `stratified_gaussian_noise=false`, `noise_scale=1.0` |
 | post-process | `use_lqr=false`, `use_stop_motion=false` |
 | method name | `Flow Agents 7M` |
 | authors / affiliation | `SB H`, `KO O` / `NLK` |
-| description | 기본 wrapper는 `flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18_116_true_stratified_true_1.0`; noise 1.016 wrapper는 `..._116_true_stratified_false_1.016` |
+| description | 기본 wrapper는 `flow_control_space_pretrain_h100x6_hsb1_prefix_default_noslip_train_plus_validation_tailprefix_roundtrip05_lr6e-4_bs18_116_true_stratified_true_1.0`; noise 1.016 wrapper는 `..._116_true_stratified_false_1.016`; noise 1.0 iid wrapper는 `..._116_true_stratified_false_1.0` |
 | account | `h.sb@naverlabs.com` |
 | default validation batch | per-rank `val_batch_size=48` |
-| tmux session | 기본 wrapper는 `catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-stratified-noise1000`; noise 1.016 wrapper는 `catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-iidgaussian-noise1016` |
+| tmux session | 기본 wrapper는 `catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-stratified-noise1000`; noise 1.016 wrapper는 `catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-iidgaussian-noise1016`; noise 1.0 iid wrapper는 `catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-iidgaussian-noise1000` |
 
 스크립트가 생성한 archive는 `scripts/verify_waymo_submission_archive.py`로 자동 검증합니다. 이 검증은 tar member 이름, shard proto parse,
 submission metadata, scenario id 중복, scenario당 32개 rollout, trajectory당 80 future step, NaN/Inf 부재를 확인합니다.
@@ -2893,10 +2908,16 @@ kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- \
   tmux attach -t catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-stratified-noise1000
 ```
 
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- \
+  tmux attach -t catk-flow-waymo-val-submission-epoch116-h100x6-hsb1-antithetic-iidgaussian-noise1000
+```
+
 실험 코드만 멈추고 pod는 그대로 두려면:
 
 ```bash
 python scripts/launch_waymo_val_submission_epoch116_h100x6_hsb1_static_pod.py --stop
+python scripts/launch_waymo_val_submission_epoch116_antithetic_noise1000_h100x6_hsb1_static_pod.py --stop
 ```
 
 #### hsb-npc-training-1 H100x6 epoch 116 Waymo test 제출
