@@ -64,6 +64,7 @@ model_config:
     sample_method: euler
     noise_scale: 1.016
     antithetic_pairs: true
+    stratified_gaussian_noise: false
   self_forced:
     enabled: false
     start_epoch: 0

@@ -609,6 +609,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         scenario_sampling_signs: torch.Tensor | None = None,
+        scenario_sampling_strata: torch.Tensor | None = None,
+        scenario_sampling_stratification_seeds: torch.Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         agent_batch: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """closed-loop 전체에서 재사용할 긴 잡음 테이프를 한 번만 만듭니다.
@@ -624,6 +627,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_scenario]`` 입니다.
             scenario_sampling_signs: 시나리오별 noise 부호입니다.
                 shape은 ``[n_scenario]`` 입니다. ``None`` 이면 모두 ``+1`` 입니다.
+            scenario_sampling_strata: stratified Gaussian noise에서 각 scenario-row가
+                담당할 rollout quantile bin offset입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_stratification_seeds: quantile bin 순서를 coordinate별로
+                섞을 때 쓰는 scenario seed입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_num_strata: stratified Gaussian noise의 bin 개수입니다.
             agent_batch: 각 agent가 어느 시나리오에 속하는지 나타냅니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -633,6 +641,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_agent, tape_steps, flow_state_dim]`` 입니다.
         """
         noise_scale = float(getattr(sampling_scheme, "noise_scale", 1.0))
+        stratified_gaussian_noise = bool(
+            getattr(sampling_scheme, "stratified_gaussian_noise", False)
+        )
         if num_agent == 0:
             return torch.zeros((0, tape_steps, self.flow_state_dim), device=device, dtype=dtype)
 
@@ -648,11 +659,50 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     f"got {tuple(scenario_sampling_signs.shape)} and "
                     f"{tuple(scenario_sampling_seeds.shape)}."
                 )
+            if stratified_gaussian_noise:
+                if scenario_sampling_strata is None:
+                    raise ValueError(
+                        "validation_rollout_sampling.stratified_gaussian_noise=true "
+                        "requires scenario_sampling_strata."
+                    )
+                if scenario_sampling_stratification_seeds is None:
+                    raise ValueError(
+                        "validation_rollout_sampling.stratified_gaussian_noise=true "
+                        "requires scenario_sampling_stratification_seeds."
+                    )
+                if scenario_sampling_num_strata is None or int(scenario_sampling_num_strata) <= 0:
+                    raise ValueError(
+                        "validation_rollout_sampling.stratified_gaussian_noise=true "
+                        "requires a positive scenario_sampling_num_strata."
+                    )
+                if scenario_sampling_strata.shape != scenario_sampling_seeds.shape:
+                    raise ValueError(
+                        "scenario_sampling_strata must match scenario_sampling_seeds shape, "
+                        f"got {tuple(scenario_sampling_strata.shape)} and "
+                        f"{tuple(scenario_sampling_seeds.shape)}."
+                    )
+                if scenario_sampling_stratification_seeds.shape != scenario_sampling_seeds.shape:
+                    raise ValueError(
+                        "scenario_sampling_stratification_seeds must match "
+                        "scenario_sampling_seeds shape, got "
+                        f"{tuple(scenario_sampling_stratification_seeds.shape)} and "
+                        f"{tuple(scenario_sampling_seeds.shape)}."
+                    )
             noise_tape = torch.empty((num_agent, tape_steps, self.flow_state_dim), device=device, dtype=dtype)
             scenario_seed_list = scenario_sampling_seeds.detach().cpu().tolist()
             scenario_sign_list = (
                 scenario_sampling_signs.detach().cpu().tolist()
                 if scenario_sampling_signs is not None
+                else None
+            )
+            scenario_strata_list = (
+                scenario_sampling_strata.detach().cpu().tolist()
+                if scenario_sampling_strata is not None
+                else None
+            )
+            scenario_stratification_seed_list = (
+                scenario_sampling_stratification_seeds.detach().cpu().tolist()
+                if scenario_sampling_stratification_seeds is not None
                 else None
             )
             for scenario_idx, scenario_seed in enumerate(scenario_seed_list):
@@ -666,14 +716,32 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 )
                 generator = torch.Generator(device=device)
                 generator.manual_seed(int(scenario_seed))
-                noise_tape[scenario_mask] = torch.randn(
-                    int(scenario_mask.sum().item()),
-                    tape_steps,
-                    self.flow_state_dim,
-                    device=device,
-                    dtype=dtype,
-                    generator=generator,
-                ) * scenario_sign
+                num_scenario_agents = int(scenario_mask.sum().item())
+                if stratified_gaussian_noise:
+                    stratification_generator = torch.Generator(device=device)
+                    stratification_generator.manual_seed(
+                        int(scenario_stratification_seed_list[scenario_idx])
+                    )
+                    scenario_noise = self._build_stratified_standard_normal_noise(
+                        num_agent=num_scenario_agents,
+                        tape_steps=tape_steps,
+                        device=device,
+                        dtype=dtype,
+                        sample_generator=generator,
+                        stratification_generator=stratification_generator,
+                        stratum=int(scenario_strata_list[scenario_idx]),
+                        num_strata=int(scenario_sampling_num_strata),
+                    )
+                else:
+                    scenario_noise = torch.randn(
+                        num_scenario_agents,
+                        tape_steps,
+                        self.flow_state_dim,
+                        device=device,
+                        dtype=dtype,
+                        generator=generator,
+                    )
+                noise_tape[scenario_mask] = scenario_noise * scenario_sign
             return self._apply_rollout_noise_scale(
                 noise_tape=noise_tape,
                 noise_scale=noise_scale,
@@ -695,6 +763,46 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             noise_tape=noise_tape,
             noise_scale=noise_scale,
         )
+
+    def _build_stratified_standard_normal_noise(
+        self,
+        *,
+        num_agent: int,
+        tape_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        sample_generator: torch.Generator,
+        stratification_generator: torch.Generator,
+        stratum: int,
+        num_strata: int,
+    ) -> torch.Tensor:
+        """Build a stratified N(0, 1) noise block for one scenario-rollout row."""
+        if stratum < 0 or stratum >= num_strata:
+            raise ValueError(
+                f"stratum must be in [0, {num_strata}), got {stratum}."
+            )
+        shape = (int(num_agent), int(tape_steps), int(self.flow_state_dim))
+        if num_agent == 0:
+            return torch.zeros(shape, device=device, dtype=dtype)
+
+        bin_offset = torch.randint(
+            low=0,
+            high=int(num_strata),
+            size=shape,
+            device=device,
+            generator=stratification_generator,
+        )
+        bin_index = torch.remainder(bin_offset + int(stratum), int(num_strata))
+        jitter = torch.rand(
+            shape,
+            device=device,
+            dtype=torch.float32,
+            generator=sample_generator,
+        )
+        uniform = (bin_index.to(torch.float32) + jitter) / float(num_strata)
+        uniform = uniform.clamp_(min=1e-6, max=1.0 - 1e-6)
+        normal = torch.erfinv(uniform.mul(2.0).sub(1.0)).mul_(2.0 ** 0.5)
+        return normal.to(dtype=dtype)
 
     def _apply_rollout_noise_scale(
         self,
@@ -1355,6 +1463,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         scenario_sampling_signs: torch.Tensor | None = None,
+        scenario_sampling_strata: torch.Tensor | None = None,
+        scenario_sampling_stratification_seeds: torch.Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
@@ -1373,6 +1484,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 shape은 ``[n_scenario]`` 입니다.
             scenario_sampling_signs: 시나리오별 noise 부호입니다.
                 shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_strata: stratified Gaussian noise에서 각 scenario-row가
+                담당할 quantile bin offset입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_stratification_seeds: coordinate별 quantile bin 순서를
+                고정적으로 섞을 때 쓰는 seed입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_num_strata: stratified Gaussian noise의 bin 수입니다.
             self_forced_epoch: self-forced 학습 epoch입니다. ``None`` 이면 random terminal
                 denoising step을 쓰지 않는 평가/추론 경로로 봅니다.
 
@@ -1463,6 +1579,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             scenario_sampling_signs=scenario_sampling_signs,
+            scenario_sampling_strata=scenario_sampling_strata,
+            scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+            scenario_sampling_num_strata=scenario_sampling_num_strata,
             agent_batch=tokenized_agent["batch"],
         )
         # Derive scenario count from the always-present `batch` index instead of
@@ -1906,6 +2025,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         scenario_sampling_signs: torch.Tensor | None = None,
+        scenario_sampling_strata: torch.Tensor | None = None,
+        scenario_sampling_stratification_seeds: torch.Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
     ) -> Dict[str, torch.Tensor]:
@@ -1919,6 +2041,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             scenario_sampling_signs: scenario별 noise 부호입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_strata: stratified Gaussian noise의 scenario별 bin offset입니다.
+            scenario_sampling_stratification_seeds: stratified Gaussian noise의 scenario별
+                coordinate permutation seed입니다.
+            scenario_sampling_num_strata: stratified Gaussian noise의 bin 수입니다.
             return_flow_2s_preview: preview 저장 여부입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. ``None`` 이면 전체 8초를 실행합니다.
 
@@ -1933,6 +2059,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             scenario_sampling_signs=scenario_sampling_signs,
+            scenario_sampling_strata=scenario_sampling_strata,
+            scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+            scenario_sampling_num_strata=scenario_sampling_num_strata,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
         )
@@ -1946,6 +2075,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_seed: int | None = None,
         scenario_sampling_seeds: torch.Tensor | None = None,
         scenario_sampling_signs: torch.Tensor | None = None,
+        scenario_sampling_strata: torch.Tensor | None = None,
+        scenario_sampling_stratification_seeds: torch.Tensor | None = None,
+        scenario_sampling_num_strata: int | None = None,
         rollout_steps_2hz: int | None = None,
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
@@ -1961,6 +2093,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed: batch 공통 seed입니다.
             scenario_sampling_seeds: scenario별 seed입니다. shape은 ``[n_scenario]`` 입니다.
             scenario_sampling_signs: scenario별 noise 부호입니다. shape은 ``[n_scenario]`` 입니다.
+            scenario_sampling_strata: stratified Gaussian noise의 scenario별 bin offset입니다.
+            scenario_sampling_stratification_seeds: stratified Gaussian noise의 scenario별
+                coordinate permutation seed입니다.
+            scenario_sampling_num_strata: stratified Gaussian noise의 bin 수입니다.
             rollout_steps_2hz: 실행할 0.5초 block 수입니다. 기본 self-forced 학습은
                 ``flow_window_steps / 5`` 를 넘깁니다.
             self_forced_epoch: 현재 self-forced epoch입니다. ``None`` 이면 training
@@ -1979,6 +2115,9 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_seed=sampling_seed,
             scenario_sampling_seeds=scenario_sampling_seeds,
             scenario_sampling_signs=scenario_sampling_signs,
+            scenario_sampling_strata=scenario_sampling_strata,
+            scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+            scenario_sampling_num_strata=scenario_sampling_num_strata,
             return_flow_2s_preview=False,
             rollout_steps_2hz=rollout_steps_2hz,
             self_forced_epoch=self_forced_epoch,

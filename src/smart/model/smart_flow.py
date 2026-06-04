@@ -993,6 +993,29 @@ class SMARTFlow(LightningModule):
         """validation closed-loop rollout에서 antithetic noise pair를 쓸지 반환합니다."""
         return bool(getattr(self.validation_rollout_sampling, "antithetic_pairs", False))
 
+    def _use_closed_loop_stratified_gaussian_noise(self) -> bool:
+        """validation closed-loop rollout에서 stratified Gaussian noise를 쓸지 반환합니다."""
+        return bool(
+            getattr(self.validation_rollout_sampling, "stratified_gaussian_noise", False)
+        )
+
+    def _closed_loop_stratified_noise_num_strata(self) -> int:
+        """stratified Gaussian base rollout bin 개수를 반환합니다."""
+        if not self._use_closed_loop_stratified_gaussian_noise():
+            return 0
+        n_rollout = int(self.n_rollout_closed_val)
+        if not self._use_closed_loop_antithetic_pairs():
+            raise ValueError(
+                "validation_rollout_sampling.stratified_gaussian_noise=true requires "
+                "validation_rollout_sampling.antithetic_pairs=true."
+            )
+        if n_rollout % 2 != 0:
+            raise ValueError(
+                "validation_rollout_sampling.stratified_gaussian_noise=true requires an "
+                f"even n_rollout_closed_val, got {n_rollout}."
+            )
+        return n_rollout // 2
+
     def _get_closed_loop_antithetic_base_and_sign(self, rollout_idx: int) -> tuple[int, float]:
         """rollout 번호를 antithetic pair용 base 번호와 noise 부호로 바꿉니다."""
         rollout_idx = int(rollout_idx)
@@ -1024,6 +1047,28 @@ class SMARTFlow(LightningModule):
             dtype=torch.float32,
             device=device,
         )
+
+    def _make_closed_loop_stratification_seed(self, scenario_id: str) -> int:
+        """scenario별 stratified noise bin permutation seed를 만듭니다."""
+        seed_payload = (
+            f"{self.validation_closed_seed}:{scenario_id}:stratified_gaussian_noise".encode(
+                "utf-8"
+            )
+        )
+        digest = hashlib.blake2b(seed_payload, digest_size=8).digest()
+        return int.from_bytes(digest, byteorder="little", signed=False) & 0x7FFF_FFFF_FFFF_FFFF
+
+    def _get_closed_loop_scenario_stratification_seeds(
+        self,
+        scenario_ids: Sequence[str],
+        device: torch.device,
+    ) -> Tensor:
+        """배치 안 각 시나리오용 stratified noise permutation seed를 만듭니다."""
+        scenario_seeds = [
+            self._make_closed_loop_stratification_seed(scenario_id=scenario_id)
+            for scenario_id in scenario_ids
+        ]
+        return torch.tensor(scenario_seeds, dtype=torch.long, device=device)
 
     def _build_closed_loop_seed_table(
         self,
@@ -1077,6 +1122,53 @@ class SMARTFlow(LightningModule):
         if len(sign_rows) == 0:
             return torch.zeros((0, len(scenario_ids)), dtype=torch.float32, device=device)
         return torch.stack(sign_rows, dim=0)
+
+    def _build_closed_loop_noise_strata_table(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_indices: Sequence[int],
+        device: torch.device,
+    ) -> Tensor | None:
+        """여러 rollout의 scenario별 stratified noise bin offset을 모읍니다."""
+        num_strata = self._closed_loop_stratified_noise_num_strata()
+        if num_strata <= 0:
+            return None
+        stratum_rows = []
+        for rollout_idx in rollout_indices:
+            base_idx, _ = self._get_closed_loop_antithetic_base_and_sign(int(rollout_idx))
+            if base_idx < 0 or base_idx >= num_strata:
+                raise ValueError(
+                    f"stratified Gaussian base rollout index must be in [0, {num_strata}), "
+                    f"got {base_idx} for rollout_idx={rollout_idx}."
+                )
+            stratum_rows.append(
+                torch.full(
+                    (len(scenario_ids),),
+                    int(base_idx),
+                    dtype=torch.long,
+                    device=device,
+                )
+            )
+        if len(stratum_rows) == 0:
+            return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
+        return torch.stack(stratum_rows, dim=0)
+
+    def _build_closed_loop_stratification_seed_table(
+        self,
+        scenario_ids: Sequence[str],
+        rollout_indices: Sequence[int],
+        device: torch.device,
+    ) -> Tensor | None:
+        """여러 rollout의 scenario별 stratified noise permutation seed를 모읍니다."""
+        if not self._use_closed_loop_stratified_gaussian_noise():
+            return None
+        scenario_seed_row = self._get_closed_loop_scenario_stratification_seeds(
+            scenario_ids=scenario_ids,
+            device=device,
+        )
+        if len(rollout_indices) == 0:
+            return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
+        return scenario_seed_row.unsqueeze(0).repeat(len(rollout_indices), 1)
 
     def _repeat_tensor_on_first_dim(self, tensor: Tensor, repeat_count: int) -> Tensor:
         """첫 번째 축을 rollout 수만큼 반복합니다.
@@ -1378,6 +1470,24 @@ class SMARTFlow(LightningModule):
             )
             if scenario_sampling_signs is not None:
                 scenario_sampling_signs = scenario_sampling_signs.reshape(-1).contiguous()
+            scenario_sampling_strata = self._build_closed_loop_noise_strata_table(
+                scenario_ids=data["scenario_id"],
+                rollout_indices=rollout_indices,
+                device=scenario_device,
+            )
+            if scenario_sampling_strata is not None:
+                scenario_sampling_strata = scenario_sampling_strata.reshape(-1).contiguous()
+            scenario_sampling_stratification_seeds = (
+                self._build_closed_loop_stratification_seed_table(
+                    scenario_ids=data["scenario_id"],
+                    rollout_indices=rollout_indices,
+                    device=scenario_device,
+                )
+            )
+            if scenario_sampling_stratification_seeds is not None:
+                scenario_sampling_stratification_seeds = (
+                    scenario_sampling_stratification_seeds.reshape(-1).contiguous()
+                )
             pred = rollout_encoder.rollout_from_cache(
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
@@ -1385,6 +1495,9 @@ class SMARTFlow(LightningModule):
                 sampling_scheme=self.validation_rollout_sampling,
                 scenario_sampling_seeds=scenario_sampling_seeds,
                 scenario_sampling_signs=scenario_sampling_signs,
+                scenario_sampling_strata=scenario_sampling_strata,
+                scenario_sampling_stratification_seeds=scenario_sampling_stratification_seeds,
+                scenario_sampling_num_strata=self._closed_loop_stratified_noise_num_strata(),
                 return_flow_2s_preview=return_flow_2s_preview,
             )
             flow_preview = None
@@ -1408,6 +1521,16 @@ class SMARTFlow(LightningModule):
             device=scenario_device,
         )
         scenario_sign_table = self._build_closed_loop_noise_sign_table(
+            scenario_ids=data["scenario_id"],
+            rollout_indices=rollout_indices,
+            device=scenario_device,
+        )
+        scenario_strata_table = self._build_closed_loop_noise_strata_table(
+            scenario_ids=data["scenario_id"],
+            rollout_indices=rollout_indices,
+            device=scenario_device,
+        )
+        scenario_stratification_seed_table = self._build_closed_loop_stratification_seed_table(
             scenario_ids=data["scenario_id"],
             rollout_indices=rollout_indices,
             device=scenario_device,
@@ -1437,6 +1560,17 @@ class SMARTFlow(LightningModule):
                 if scenario_sign_table is not None
                 else None
             ),
+            scenario_sampling_strata=(
+                scenario_strata_table.reshape(-1).contiguous()
+                if scenario_strata_table is not None
+                else None
+            ),
+            scenario_sampling_stratification_seeds=(
+                scenario_stratification_seed_table.reshape(-1).contiguous()
+                if scenario_stratification_seed_table is not None
+                else None
+            ),
+            scenario_sampling_num_strata=self._closed_loop_stratified_noise_num_strata(),
             return_flow_2s_preview=return_flow_2s_preview,
         )
         flow_preview = None

@@ -1057,14 +1057,36 @@ control-space Flow에서는 `D=3` 입니다. 각 0.5초 closed-loop block은 기
 model.model_config.validation_rollout_sampling.antithetic_pairs=false
 ```
 
+추가 실험 옵션으로 `model.model_config.validation_rollout_sampling.stratified_gaussian_noise=true` 를 켤 수 있습니다. 기본값은 `false` 입니다. 이 옵션은 `antithetic_pairs=true` 와 함께 쓸 때만 유효하며, 16개 base rollout이 각 coordinate에서 Gaussian quantile bin을 더 고르게 덮도록 만듭니다.
+
+개념적 shape은 그대로 유지됩니다.
+
+```text
+U_base: [16, N_agent, 95, D]  # 0~1 quantile 구간을 나눠 만든 uniform 값
+Z_base: [16, N_agent, 95, D]  # inverse normal CDF(Phi^-1) 적용 후 Gaussian noise
+Z_full: [32, N_agent, 95, D]
+Z_full[0:16]  = Z_base
+Z_full[16:32] = -Z_base
+```
+
+실제 구현은 rollout chunk 크기가 바뀌어도 같은 의미를 유지하도록, rollout index별 stratum과 scenario별 permutation seed를 decoder에 넘깁니다. 따라서 OOM fallback 때문에 32 rollout을 `16+16`, `8+8+...`처럼 나눠 실행해도 같은 scenario/rollout 조합은 같은 stratified noise를 받습니다.
+
+Fast-RMM에서 직접 켜려면 아래 override를 추가합니다.
+
+```bash
+model.model_config.validation_rollout_sampling.stratified_gaussian_noise=true
+```
+
 `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` 의 W&B 마지막 artifact `epoch-last-x5f9g0ce:v60` 을 `hsb-npc-training-1` H100x6, `use_lqr=false`, `use_stop_motion=false`, `sample_steps=16`, `noise_scale=1.0`, `val_batch_size=56`, `scorer_scene_num=1680` 조건으로 Fast-RMM 비교한 결과는 아래와 같습니다.
 
 | noise 방식 | RMM | CPD | CES |
 |---|---:|---:|---:|
 | iid Gaussian | 0.781528 | 0.200296 | 0.096098 |
 | antithetic pair | 0.781846 | 0.201687 | 0.095312 |
+| stratified Gaussian + antithetic pair | 0.781294 | 0.198843 | 0.095803 |
 
 RMM 기준으로 antithetic pair가 더 높았으므로 repository 기본값은 `antithetic_pairs=true` 로 둡니다.
+`stratified_gaussian_noise=true` 는 같은 조건의 H100x6 1680-scene Fast-RMM에서 RMM이 낮았으므로 기본값은 `false` 로 유지합니다.
 
 같은 checkpoint와 Fast-RMM 조건에서 `antithetic_pairs=true` 를 고정하고 `noise_scale` 만 바꿔 비교한 결과는 아래와 같습니다.
 
