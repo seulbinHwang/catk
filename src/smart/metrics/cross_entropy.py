@@ -19,11 +19,11 @@ from torch.nn.functional import cross_entropy
 from torchmetrics.metric import Metric
 
 from .utils import (
-    STATE_CONDITIONED_TARGET_CHUNK_SIZE,
+    CURRENT_STATE_TARGET_CHUNK_SIZE,
     get_euclidean_targets,
     get_prob_targets,
     get_prob_targets_from_index,
-    match_state_conditioned_trajectory_token_rows,
+    match_current_state_trajectory_token_rows,
 )
 from src.smart.utils import merge_by_type, split_by_type
 
@@ -41,8 +41,6 @@ class CrossEntropy(Metric):
         label_smoothing: float,
         rollout_as_gt: bool,
         spatial_aware_smoothing: bool = False,
-        state_conditioned_target: bool = False,
-        state_conditioned_target_chunk_size: int = STATE_CONDITIONED_TARGET_CHUNK_SIZE,
     ) -> None:
         super().__init__()
         self.use_gt_raw = use_gt_raw
@@ -50,8 +48,7 @@ class CrossEntropy(Metric):
         self.label_smoothing = label_smoothing
         self.rollout_as_gt = rollout_as_gt
         self.spatial_aware_smoothing = spatial_aware_smoothing
-        self.state_conditioned_target = state_conditioned_target
-        self.state_conditioned_target_chunk_size = int(state_conditioned_target_chunk_size)
+        self.current_state_target_chunk_size = CURRENT_STATE_TARGET_CHUNK_SIZE
         self.add_state("loss_sum", default=tensor(0.0), dist_reduce_fx="sum")
         self.add_state("count", default=tensor(0.0), dist_reduce_fx="sum")
 
@@ -96,9 +93,8 @@ class CrossEntropy(Metric):
             and pred_idx is None
             and not self.rollout_as_gt
         )
-        use_state_conditioned_target = (
-            self.state_conditioned_target
-            and pred_idx is not None
+        use_current_state_target = (
+            pred_idx is not None
             and not self.rollout_as_gt
             and token_trajectory is not None
             and (not self.spatial_aware_smoothing or token_contour_trajectory is not None)
@@ -107,8 +103,8 @@ class CrossEntropy(Metric):
             and gt_valid_segment_raw is not None
         )
 
-        if use_state_conditioned_target:
-            self._update_state_conditioned_target_loss(
+        if use_current_state_target:
+            self._update_current_state_target_loss(
                 next_token_logits=next_token_logits,
                 next_token_valid=next_token_valid,
                 pred_pos=pred_pos,
@@ -244,7 +240,7 @@ class CrossEntropy(Metric):
         self.loss_sum += (loss * loss_weighting_mask).sum()
         self.count += (loss_weighting_mask > 0).sum()
 
-    def _update_state_conditioned_target_loss(
+    def _update_current_state_target_loss(
         self,
         next_token_logits: Tensor | dict[str, Tensor],
         next_token_valid: Tensor,
@@ -313,13 +309,13 @@ class CrossEntropy(Metric):
                     if isinstance(token_contour_trajectory, dict)
                     else None
                 )
-                gt_idx_valid = match_state_conditioned_trajectory_token_rows(
+                gt_idx_valid = match_current_state_trajectory_token_rows(
                     pred_pos=pred_pos_valid,
                     pred_head=pred_head_valid,
                     gt_pos_segment=gt_pos_segment_valid,
                     gt_head_segment=gt_head_segment_valid,
                     token_trajectory=token_trajectory_type,
-                    chunk_size=self.state_conditioned_target_chunk_size,
+                    chunk_size=self.current_state_target_chunk_size,
                 )
                 token_traj_rows = self._select_token_traj_rows(
                     token_traj=token_traj[agent_type],
@@ -351,7 +347,7 @@ class CrossEntropy(Metric):
             logits_valid = next_token_logits.reshape(-1, next_token_logits.shape[-1])[
                 flat_valid
             ]
-            gt_idx_valid = match_state_conditioned_trajectory_token_rows(
+            gt_idx_valid = match_current_state_trajectory_token_rows(
                 pred_pos=pred_pos_now.reshape(-1, 2)[flat_valid],
                 pred_head=pred_head_now.reshape(-1)[flat_valid],
                 gt_pos_segment=gt_pos_segment_raw.reshape(
@@ -361,7 +357,7 @@ class CrossEntropy(Metric):
                     -1, gt_head_segment_raw.shape[-1]
                 )[flat_valid],
                 token_trajectory=token_trajectory,
-                chunk_size=self.state_conditioned_target_chunk_size,
+                chunk_size=self.current_state_target_chunk_size,
             )
             token_traj_rows = self._select_token_traj_rows(
                 token_traj=token_traj,

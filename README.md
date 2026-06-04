@@ -293,19 +293,19 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | agent selection | `data.train_use_eval_agent_selection=false` |
 | train sampler | `data.train_memory_balanced_batching=true` |
 | smoothing | `spatial_aware_smoothing=true`, full `[5, 4 corners, x/y]` contour trajectory distance. Non-GT mass sums exactly to `label_smoothing`; no extra uniform smoothing or mode switch. |
-| rollout target | `state_conditioned_target=true`, rollout/self-generated state가 있는 training loss에서 현재 state 기준 full TrajTok trajectory target 재선택 |
+| rollout target | rollout/self-generated state가 있는 training loss에서는 항상 현재 state 기준 full TrajTok trajectory target 재선택 |
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, top-48 rollout validation, every 16 epochs |
 | distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=false` |
 
-TrajTok state-conditioned target은 고정 `gt_idx`를 항상 그대로 쓰지 않고, rollout-style
+TrajTok rollout-target loss는 고정 `gt_idx`를 항상 그대로 쓰지 않고, rollout-style
 training에서 모델이 현재 서 있는 pose 기준으로 raw GT 0.5초 segment에 가장 가까운
 TrajTok token을 다시 고른다. 비교 대상은 endpoint만이 아니라 paper-submit token의
 전체 `[5, x/y/yaw]` trajectory다. Open-loop teacher-forced loss에서는 기존 recursive
 `gt_idx`가 같은 state에서 이미 계산된 target이므로 빠른 기존 경로를 유지한다. 따라서
-일반 pretrain 속도는 불필요하게 느려지지 않고, `training_rollout_sampling.num_k > 0`
-처럼 self-generated state가 loss에 들어올 때만 corrective target을 계산한다. 메모리
-peak를 낮추기 위해 target matching은 row chunk 단위로 수행하며 기본 chunk size는
-`state_conditioned_target_chunk_size=256`이다.
+일반 pretrain 속도는 불필요하게 느려지지 않고, self-generated state가 loss에 들어올
+때만 corrective target을 계산한다. 이 동작은 별도 config로 끄거나 켜지 않으며,
+rollout-style training loss에서 항상 적용된다. 메모리 peak를 낮추기 위해 target
+matching은 row chunk 단위로 수행하며 내부 기본 chunk size는 256이다.
 
 2026-06-04에 `hsb-npc-training` H100 4장과 `wo-pvc-2` H100 2장에서 실제 WOMD cache와
 GPU로 state-conditioned target을 검증했다.

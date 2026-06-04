@@ -19,7 +19,7 @@ from torch import Tensor
 from src.smart.utils import cal_polygon_contour, transform_to_local, wrap_angle
 
 SPATIAL_SMOOTHING_CONTOUR_DISTANCE_CHUNK_SIZE = 128
-STATE_CONDITIONED_TARGET_CHUNK_SIZE = 256
+CURRENT_STATE_TARGET_CHUNK_SIZE = 256
 
 
 def _assign_spatial_aware_prob_target(
@@ -206,13 +206,13 @@ def get_euclidean_targets(
 
 
 @torch.no_grad()
-def match_state_conditioned_trajectory_token_rows(
+def match_current_state_trajectory_token_rows(
     pred_pos: Tensor,  # [n_row, 2]
     pred_head: Tensor,  # [n_row]
     gt_pos_segment: Tensor,  # [n_row, 5, 2]
     gt_head_segment: Tensor,  # [n_row, 5]
     token_trajectory: Tensor,  # [n_token, 5, 3]
-    chunk_size: int = STATE_CONDITIONED_TARGET_CHUNK_SIZE,
+    chunk_size: int = CURRENT_STATE_TARGET_CHUNK_SIZE,
 ) -> Tensor:  # [n_row]
     """Match full TrajTok trajectories from the current rollout state.
 
