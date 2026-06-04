@@ -166,46 +166,47 @@ def test_cross_entropy_none_train_mask_matches_all_true_mask() -> None:
     torch.testing.assert_close(none_mask_metric.count, all_true_metric.count)
 
 
-def test_thinklab_spatial_aware_smoothing_matches_official_double_normalization() -> None:
+def test_spatial_aware_smoothing_uses_full_contour_distance_distribution() -> None:
     token_traj = torch.zeros(1, 3, 4, 2)
-    token_traj[:, 1, :, 0] = 1.0
-    token_traj[:, 2, :, 0] = 10.0
+    token_contour_trajectory = torch.zeros(3, 5, 4, 2)
+    token_contour_trajectory[1, :, :, 0] = 1.0
+    token_contour_trajectory[2, :, :, 0] = 10.0
 
     prob_target = get_prob_targets_from_index(
         gt_idx=torch.tensor([[0]]),
         token_traj=token_traj,
+        token_contour_trajectory=token_contour_trajectory,
         label_smoothing=0.2,
         spatial_aware_smoothing=True,
     )
 
-    torch.testing.assert_close(prob_target[0, 0, 0], torch.tensor(0.8))
-    assert prob_target[0, 0, 1] > prob_target[0, 0, 2]
     inv_sq_dist = torch.tensor(
-        [
-            0.0,
-            1.0 / ((1.0 + 1.0e-4) ** 2),
-            1.0 / ((10.0 + 1.0e-4) ** 2),
-        ]
+        [0.0, 1.0 / (1.0**2 + 1.0e-4), 1.0 / (10.0**2 + 1.0e-4)]
     )
-    normalizer = inv_sq_dist[1:].sum()
-    expected_neighbor_mass = 0.2 / normalizer
-    torch.testing.assert_close(prob_target[0, 0, 1:].sum(), expected_neighbor_mass)
-    assert prob_target.sum() < torch.tensor(1.0)
-
-
-def test_normalized_spatial_aware_smoothing_keeps_legacy_mass() -> None:
-    token_traj = torch.zeros(1, 3, 4, 2)
-    token_traj[:, 1, :, 0] = 1.0
-    token_traj[:, 2, :, 0] = 10.0
-
-    prob_target = get_prob_targets_from_index(
-        gt_idx=torch.tensor([[0]]),
-        token_traj=token_traj,
-        label_smoothing=0.2,
-        spatial_aware_smoothing=True,
-        spatial_aware_smoothing_mode="normalized",
-    )
+    expected_neighbors = 0.2 * inv_sq_dist / inv_sq_dist.sum()
 
     torch.testing.assert_close(prob_target.sum(dim=-1), torch.ones(1, 1))
     torch.testing.assert_close(prob_target[0, 0, 0], torch.tensor(0.8))
+    torch.testing.assert_close(prob_target[0, 0, 1:], expected_neighbors[1:])
     assert prob_target[0, 0, 1] > prob_target[0, 0, 2]
+
+
+def test_spatial_aware_smoothing_reuses_unique_gt_targets_consistently() -> None:
+    token_traj = torch.zeros(1, 3, 4, 2)
+    token_contour_trajectory = torch.zeros(3, 5, 4, 2)
+    token_contour_trajectory[1, :, :, 0] = 1.0
+    token_contour_trajectory[2, :, :, 0] = 10.0
+
+    prob_target = get_prob_targets_from_index(
+        gt_idx=torch.tensor([[0, 1], [0, 1]]),
+        token_traj=token_traj,
+        token_contour_trajectory=token_contour_trajectory,
+        label_smoothing=0.2,
+        spatial_aware_smoothing=True,
+    )
+
+    torch.testing.assert_close(prob_target.sum(dim=-1), torch.ones(2, 2))
+    torch.testing.assert_close(prob_target[0, 0], prob_target[1, 0])
+    torch.testing.assert_close(prob_target[0, 1], prob_target[1, 1])
+    torch.testing.assert_close(prob_target[0, 0, 0], torch.tensor(0.8))
+    torch.testing.assert_close(prob_target[0, 1, 1], torch.tensor(0.8))

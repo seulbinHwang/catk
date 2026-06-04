@@ -69,7 +69,6 @@ model_config:
     gt_thresh_scale_length: -1.0  # {"veh": 4.8, "cyc": 2.0, "ped": 1.0}
     label_smoothing: 0.1
     spatial_aware_smoothing: true
-    spatial_aware_smoothing_mode: paper  # {paper, thinklab, normalized}
     state_conditioned_target: true
     state_conditioned_target_chunk_size: 256
     rollout_as_gt: false

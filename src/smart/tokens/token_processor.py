@@ -112,6 +112,11 @@ class TokenProcessor(torch.nn.Module):
             v = torch.tensor(v, dtype=torch.float32)
             # [n_token, 6, 4, 2], countour, 10 hz
             self.register_buffer(f"agent_token_all_{k}", v, persistent=False)
+            self.register_buffer(
+                f"agent_token_contour_trajectory_{k}",
+                v[:, 1:].contiguous(),
+                persistent=False,
+            )
         for k, v in agent_token_data["traj"].items():
             v = torch.tensor(v[:, 1:], dtype=torch.float32)
             # [n_token, 5, 3], x/y/yaw trajectory over the 0.5s action interval
@@ -165,6 +170,7 @@ class TokenProcessor(torch.nn.Module):
             token_traj_all,
             token_traj,
             token_trajectory,
+            token_contour_trajectory,
             agent_type_masks,
         ) = self._get_agent_shape_and_token_traj(data["agent"]["type"])
 
@@ -195,6 +201,7 @@ class TokenProcessor(torch.nn.Module):
             "token_heading": self.token_heading.to(pos.device),
             "token_traj": token_traj,  # type -> [n_agent_type, n_token_type, 4, 2]
             "token_trajectory": token_trajectory,  # type -> [n_token_type, 5, 3]
+            "token_contour_trajectory": token_contour_trajectory,  # type -> [n_token_type, 5, 4, 2]
             # for step {5, 10, ..., 90}
             "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, n_step=18, 2]
             "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, n_step=18]
@@ -440,12 +447,14 @@ class TokenProcessor(torch.nn.Module):
         Dict[str, Tensor],
         Dict[str, Tensor],
         Dict[str, Tensor],
+        Dict[str, Tensor],
     ]:
         """
         agent_shape: [n_agent, 2]
         token_traj_all: [n_agent, n_token, 6, 4, 2]
         token_traj: [n_agent, n_token, 4, 2]
         token_trajectory: [n_token, 5, 3]
+        token_contour_trajectory: [n_token, 5, 4, 2]
         """
         agent_type_masks = build_agent_type_masks(agent_type)
         agent_shape = self.agent_shape_by_type.new_zeros((len(agent_type), 2))
@@ -456,6 +465,7 @@ class TokenProcessor(torch.nn.Module):
         token_traj_all = {}
         token_traj = {}
         token_trajectory = {}
+        token_contour_trajectory = {}
         for k, mask in agent_type_masks.items():
             n_agent_type = int(mask.sum().item())
             token_bank = getattr(self, f"agent_token_all_{k}")
@@ -466,4 +476,15 @@ class TokenProcessor(torch.nn.Module):
                 n_agent_type, -1, -1, -1
             )
             token_trajectory[k] = getattr(self, f"agent_token_trajectory_{k}")
-        return agent_shape, token_traj_all, token_traj, token_trajectory, agent_type_masks
+            token_contour_trajectory[k] = getattr(
+                self,
+                f"agent_token_contour_trajectory_{k}",
+            )
+        return (
+            agent_shape,
+            token_traj_all,
+            token_traj,
+            token_trajectory,
+            token_contour_trajectory,
+            agent_type_masks,
+        )

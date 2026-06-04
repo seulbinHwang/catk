@@ -38,7 +38,7 @@
 2025년 1월
 - **WOSAC 최고 수준 성능**: CAT-K는 [WOSAC 리더보드](https://waymo.com/open/challenges/2024/sim-agents/) 1위를 달성했다. agent token vocabulary 문제를 해결한 뒤 fine-tuned model은 **0.7702** RMM을 달성했다. 리더보드에는 공개하지 않았지만 BC로 32 epoch만 학습한 재현 SMART-tiny-7M도 **0.7671** RMM을 달성했고, 이는 당시 2위 방법과 비슷한 수준이다. 재현 절차도 비교적 단순하다.
 
-- **TrajTok paper-submit agent vocabulary and supervision**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Token matching은 마지막 contour만 보지 않고 논문 Sec. 2.1의 token 정의에 맞춰 0.5초 구간 전체 `[5, x/y/yaw]` trajectory 평균 error로 GT token을 고른다. Spatial-aware label smoothing도 논문 Eq. (9)-(10)에 맞춰 선택된 token trajectory와 모든 후보 token trajectory 간 평균 error 기반으로 확률을 배분하며, 기본 mode는 `spatial_aware_smoothing_mode: paper`다. 기존 Thinklab public-code식 extra normalization은 `spatial_aware_smoothing_mode: thinklab` ablation으로만 남긴다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. 현재 pretrain train dataset의 on-the-fly augmentation은 `random_scene_scale_config: null`, `random_time_shift_config: null`로 꺼져 있으며, validation/test/submission cache나 원본 pickle도 바꾸지 않는다.
+- **TrajTok paper-submit agent vocabulary and supervision**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Token matching은 마지막 contour만 보지 않고 논문 Sec. 2.1의 token 정의에 맞춰 0.5초 구간 전체 `[5, x/y/yaw]` trajectory 평균 error로 GT token을 고른다. Spatial-aware label smoothing은 하나의 최종 구현만 사용한다. 정답 token의 0.5초 contour sequence `[5, 4 corners, x/y]`와 모든 후보 token의 contour sequence 평균 corner distance를 계산하고, non-GT smoothing mass를 `1 / (distance^2 + epsilon)` 비율로 정확히 나눈다. 추가 uniform label smoothing이나 extra normalization은 적용하지 않는다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. 현재 pretrain train dataset의 on-the-fly augmentation은 `random_scene_scale_config: null`, `random_time_shift_config: null`로 꺼져 있으며, validation/test/submission cache나 원본 pickle도 바꾸지 않는다.
 - **TrajTok decoder capacity**: 기본 SMART decoder는 `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6`를 사용한다. Paper-submit vocab `veh=8037`, `ped=2998`, `cyc=2798` 기준으로 Hydra config를 compose한 뒤 SMART 모델을 직접 instantiate해서 측정한 전체 model parameter 수는 `8,247,013`개다. 모든 parameter가 trainable이며 non-trainable parameter는 0개다.
 
 ## 설치
@@ -292,7 +292,7 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | train augmentation | `random_scene_scale_config: null`, `random_time_shift_config: null` |
 | agent selection | `data.train_use_eval_agent_selection=false` |
 | train sampler | `data.train_memory_balanced_batching=true` |
-| smoothing | `spatial_aware_smoothing=true`, `spatial_aware_smoothing_mode=paper`, full `[5, x/y/yaw]` trajectory distance |
+| smoothing | `spatial_aware_smoothing=true`, full `[5, 4 corners, x/y]` contour trajectory distance. Non-GT mass sums exactly to `label_smoothing`; no extra uniform smoothing or mode switch. |
 | rollout target | `state_conditioned_target=true`, rollout/self-generated state가 있는 training loss에서 현재 state 기준 full TrajTok trajectory target 재선택 |
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, top-48 rollout validation, every 16 epochs |
 | distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=false` |
@@ -318,6 +318,23 @@ GPU로 state-conditioned target을 검증했다.
 | single H100 rollout-target smoke | real train cache, 1 batch, `training_rollout_sampling.num_k=1` | 새 state-conditioned target loss 경로 정상 종료, `train/loss=8.95601` |
 | H100 4+2 DDP smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, 1 train batch | 6/6 ranks NCCL 초기화 및 backward 정상 종료, exit status `0` |
 | validation/rollout smoke | real validation cache, 1 batch, `n_rollout_closed_val=1`, `validation_rollout_sampling.num_k=1` | open-loop + closed-loop validation 경로 정상 종료, `run.py DONE` |
+
+2026-06-04에 spatial-aware smoothing을 단일 구현으로 정리한 뒤 같은 파드에서 다시
+검증했다. 새 smoothing target은 각 token의 0.5초 contour sequence `[5, 4, 2]`를
+사용하며, 같은 batch 안에서 중복 등장한 GT token은 unique token id 단위로 한 번만
+거리 분포를 계산한다.
+
+| 검증 | 조건 | 결과 |
+|---|---|---|
+| local unit/compile | `tests/test_train_agent_selection_target_builder.py`, compileall | 9 tests pass, syntax/import 정상 |
+| real vocab target distribution | `hsb-npc-training`, `wo-pvc-2`, H100, `trajtok_vocab.pkl` | `veh/ped/cyc` 모두 target 합 `1.0`, GT 확률 `0.9`, non-GT mass `0.1`, 가까운 contour token 확률이 먼 token보다 큼 |
+| single H100 train smoke | `hsb-npc-training`, real train cache, 1 batch | forward/backward/optimizer step 정상 종료, `train/loss=8.92886` |
+| single H100 validation smoke | `hsb-npc-training`, real validation cache, 1 batch, `n_rollout_closed_val=1`, `validation_rollout_sampling.num_k=1` | open-loop + closed-loop fast WOSAC metric 경로 정상 종료, `run.py DONE` |
+| H100 4+2 DDP train smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, real train cache, 1 batch | 6/6 ranks NCCL 초기화 및 backward 정상 종료, exit status `0` |
+
+이 검증은 target 생성 수식과 학습 파이프라인 안정성 검증이다. WOSAC RMM 상승 여부는
+이 target으로 새로 학습한 checkpoint의 closed-loop fast-RMM/제출 평가로 최종 판정해야
+한다.
 
 이 검증은 target 선택 메커니즘이 rollout drift를 줄이는 방향으로 동작하고 학습/검증
 파이프라인에 side effect가 없음을 확인한 smoke/기능 검증이다. 최종 WOSAC RMM 향상
