@@ -3,7 +3,6 @@ from __future__ import annotations
 import torch
 from torch_geometric.data import HeteroData
 
-from src.smart.tokens.agent_token_matching import build_agent_type_masks
 from src.smart.tokens.token_processor import TokenProcessor
 from src.smart.utils import cal_polygon_contour, merge_by_type, transform_to_global, wrap_angle
 
@@ -121,7 +120,7 @@ def _reference_match_agent_token_loop(
 
 
 def _reference_tokenize_agent(processor: TokenProcessor, data: HeteroData) -> dict[str, torch.Tensor]:
-    agent_shape, _, token_traj = processor._get_agent_shape_and_token_traj(
+    agent_shape, _, token_traj, _, type_mask = processor._get_agent_shape_and_token_traj(
         data["agent"]["type"]
     )
     valid = data["agent"]["valid_mask"].clone()
@@ -137,7 +136,6 @@ def _reference_tokenize_agent(processor: TokenProcessor, data: HeteroData) -> di
         vel,
     )
     out_by_type = {}
-    type_mask = build_agent_type_masks(data["agent"]["type"])
     for agent_type, mask in type_mask.items():
         out_by_type[agent_type] = _reference_match_agent_token_loop(
             processor,

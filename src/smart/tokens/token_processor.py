@@ -270,7 +270,6 @@ class TokenProcessor(torch.nn.Module):
             "sampled_heading": [n_agent, n_step_token]
         """
         n_agent, n_step = valid.shape
-        range_a = torch.arange(n_agent, device=valid.device)
         prev_pos, prev_head = pos[:, 0], heading[:, 0]  # [n_agent, 2], [n_agent]
 
         out_dict = {
@@ -288,22 +287,40 @@ class TokenProcessor(torch.nn.Module):
             match_prev_pos, match_prev_head = prev_pos, prev_head
 
             gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
-            gt_contour_local, _ = transform_to_local(
-                pos_global=gt_contour,
-                head_global=None,
-                pos_now=match_prev_pos,
-                head_now=match_prev_head,
-            )
-            token_idx_gt = torch.argmin(
-                torch.norm(token_traj - gt_contour_local.unsqueeze(1), dim=-1).sum(-1),
-                dim=-1,
-            )
-            token_contour_gt_local = token_traj[range_a, token_idx_gt]
-            token_pos_gt, token_head_gt = self._token_pose_from_local_contour(
-                token_contour_local=token_contour_gt_local,
-                ref_pos=match_prev_pos,
-                ref_head=match_prev_head,
-            )
+            token_idx_chunks = []
+            token_contour_chunks = []
+            for start in range(0, n_agent, self.agent_token_match_chunk_size):
+                end = min(start + self.agent_token_match_chunk_size, n_agent)
+                token_world_gt = transform_to_global(
+                    pos_local=token_traj[start:end].flatten(1, 2),
+                    head_local=None,
+                    pos_now=match_prev_pos[start:end],
+                    head_now=match_prev_head[start:end],
+                )[0].view(end - start, token_traj.shape[1], 4, 2)
+                token_idx_chunk = torch.argmin(
+                    torch.norm(
+                        token_world_gt - gt_contour[start:end].unsqueeze(1),
+                        dim=-1,
+                    ).sum(-1),
+                    dim=-1,
+                )
+                token_idx_chunks.append(token_idx_chunk)
+                token_contour_chunks.append(
+                    token_world_gt[
+                        torch.arange(end - start, device=valid.device),
+                        token_idx_chunk,
+                    ]
+                )
+            if token_idx_chunks:
+                token_idx_gt = torch.cat(token_idx_chunks, dim=0)
+                token_contour_gt = torch.cat(token_contour_chunks, dim=0)
+            else:
+                token_idx_gt = torch.empty(0, dtype=torch.long, device=valid.device)
+                token_contour_gt = gt_contour.new_empty((0, 4, 2))
+
+            token_pos_gt = token_contour_gt.mean(1)
+            token_dxy_gt = token_contour_gt[:, 0] - token_contour_gt[:, 3]
+            token_head_gt = torch.arctan2(token_dxy_gt[:, 1], token_dxy_gt[:, 0])
 
             # update prev_pos, prev_head
             prev_head = heading[:, i].clone()
@@ -318,26 +335,6 @@ class TokenProcessor(torch.nn.Module):
             out_dict["tokenized_heading"].append(prev_head.masked_fill(_invalid_mask, 0))
         out_dict = {k: torch.stack(v, dim=1) for k, v in out_dict.items()}
         return out_dict
-
-    def _token_pose_from_local_contour(
-        self,
-        token_contour_local: Tensor,
-        ref_pos: Tensor,
-        ref_head: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
-        token_center_local = token_contour_local.mean(dim=1)
-        token_center_global, _ = transform_to_global(
-            pos_local=token_center_local.unsqueeze(1),
-            head_local=None,
-            pos_now=ref_pos,
-            head_now=ref_head,
-        )
-        token_dxy_local = token_contour_local[:, 0] - token_contour_local[:, 3]
-        token_head_local = torch.arctan2(
-            token_dxy_local[:, 1],
-            token_dxy_local[:, 0],
-        )
-        return token_center_global.squeeze(1), wrap_angle(ref_head + token_head_local)
 
     @staticmethod
     def _clean_heading(valid: Tensor, heading: Tensor) -> Tensor:
