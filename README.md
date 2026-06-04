@@ -335,6 +335,27 @@ DRY_RUN=1 bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh --dry-run
 | inference top-p | 1.0 |
 | train sampler | memory-balanced distributed batch sampler |
 
+2026-06-04 21:57 KST에는 최신 `UniMM@a39fcdf` 기준으로 top-M mixture objective full pretrain을 새로 시작했다. 시작 전 `hsb-npc-training-3-1`, `hsb-npc-training-3-2` 모두 UniMM 학습 process가 없었고, GPU memory는 4MiB, utilization은 0%로 idle 상태였다. 두 pod의 `/tmp/catk_unimm_h100x3x2` checkout은 `origin/UniMM@a39fcdf`로 맞춘 뒤 `unimm-h100x3x2` tmux session에서 DDP 6-rank 학습을 시작했다.
+
+```text
+running full pretrain:
+  task_name=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_topm8_membal_temp1_20260604_215533
+  wandb_run_id=t2w2q5e1
+  wandb_url=https://wandb.ai/jksg01019-naver-labs/SMART-FLOW/runs/t2w2q5e1
+  commit=a39fcdf
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=30, val_batch_size=12
+  learning_rate=0.001185854123
+  inference_temperature=1.0
+  inference_top_k=0
+  inference_top_p=1.0
+  scorer_scene_num=1680
+  n_batch_sim_agents_metric=24
+  result=running
+```
+
+실행 검증은 launcher 성공 여부만 보지 않고 실제 학습 batch까지 확인했다. DDP 6개 rank가 모두 등록됐고, epoch 0에서 `220` step 이상 OOM/Traceback/NaN 없이 진행됐으며, 같은 시점 GPU memory는 rank-local H100별 약 `76~81GiB`, utilization은 `93~100%`였다. 로그에는 `scorer_scene_num=1680`이 H100 x3x2의 world size와 val batch에 맞춰 `n_batch_sim_agents_metric=24`로 조정됐고, trainable parameter 수는 `7.1M`으로 출력됐다. W&B 기준 `trainer/global_step=19 -> 219` 사이 `train/loss=7.08834 -> 1.86461`, `train/loss_mixture=6.48800 -> 1.54931`, `train/loss_aux_ce=3.00168 -> 1.57647`로 finite하게 감소했다. warm-up 이후 속도는 약 `0.81s/batch`이며, 64 epoch train-only 예상 소요는 약 39~45시간이다. 16 epoch마다 실행되는 closed-loop validation/checkpoint overhead를 포함한 전체 예상 소요는 약 43~52시간이다.
+
 아래 2026-06-04 00:28 KST 실행 기록은 top-M mixture 학습 변경 이전에 시작한 기존 run이라 hard `z*` 기반 loss와 `inference_top_k=256`을 사용했다. 최신 기본 inference setting은 위 표의 `temperature=1.0 / top_k=0 / top_p=1.0`이다.
 
 2026-06-04 00:28 KST에 최신 `UniMM@f3cd9fc` 기준 guarded launcher로 full pretrain을 실제 시작했다. 시작 전 두 pod 모두 compute process 없음, GPU memory 4MiB, utilization 0%로 idle 상태였다. launcher는 `/tmp/catk_unimm_launcher`에서 실행했고, 각 pod의 `/tmp/catk_unimm_h100x3x2` clean checkout을 `origin/UniMM@f3cd9fc`로 맞춘 뒤 `unimm-h100x3x2` tmux session을 생성했다.
