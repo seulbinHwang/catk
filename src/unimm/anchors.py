@@ -142,6 +142,44 @@ def match_anchors_by_type(
     ``[N_agent * N_context, H, 3]``.
     """
 
+    z, best = match_top_m_anchors_by_type(
+        anchors_by_type=anchors_by_type,
+        agent_type=agent_type,
+        target_local=target_local,
+        valid=valid,
+        horizon_steps=horizon_steps,
+        top_m=1,
+        heading_weight=heading_weight,
+        row_chunk_size=row_chunk_size,
+        tie_break_horizon_steps=tie_break_horizon_steps,
+        tie_break_tolerance=tie_break_tolerance,
+    )
+    return z.squeeze(-1), best.squeeze(-1)
+
+
+def match_top_m_anchors_by_type(
+    anchors_by_type: Tensor,
+    agent_type: Tensor,
+    target_local: Tensor,
+    valid: Tensor | None,
+    horizon_steps: int,
+    top_m: int,
+    heading_weight: float = 1.0,
+    row_chunk_size: int = 4096,
+    tie_break_horizon_steps: int | None = None,
+    tie_break_tolerance: float = 0.0,
+) -> tuple[Tensor, Tensor]:
+    """Find the top-M nearest anchor candidates for every row.
+
+    Candidate ranking is based on the UniMM positive matching horizon
+    (``horizon_steps``). When the existing near-tie tail tie-break is enabled,
+    the first candidate follows the same near-tie rule as
+    :func:`match_anchors_by_type`; the rest of the candidate set remains the
+    nearest anchors under the positive matching horizon. This keeps
+    ``Tz*=0.5s`` as the primary criterion while avoiding unstable arbitrary
+    first-candidate choices among nearly identical 0.5s anchors.
+    """
+
     if target_local.ndim != 3 or target_local.shape[-1] != 3:
         raise ValueError(f"target_local must be [N, H, 3], got {tuple(target_local.shape)}")
     if agent_type.shape != (target_local.shape[0],):
@@ -149,11 +187,17 @@ def match_anchors_by_type(
             "agent_type must have one value per target row, "
             f"got {tuple(agent_type.shape)} and {tuple(target_local.shape)}"
         )
+    top_m = int(top_m)
+    if top_m <= 0:
+        raise ValueError(f"top_m must be positive, got {top_m}")
 
     device = target_local.device
-    z = torch.zeros(target_local.shape[0], dtype=torch.long, device=device)
+    num_rows = target_local.shape[0]
+    num_anchors = int(anchors_by_type.shape[1])
+    top_m = min(top_m, num_anchors)
+    z = torch.zeros((num_rows, top_m), dtype=torch.long, device=device)
     best = torch.full(
-        (target_local.shape[0],),
+        (num_rows, top_m),
         float("inf"),
         dtype=target_local.dtype,
         device=device,
@@ -192,6 +236,14 @@ def match_anchors_by_type(
                 valid=valid_h[chunk_rows] if valid_h is not None else None,
                 heading_weight=heading_weight,
             )
+            topk_count = min(num_anchors, top_m + 1)
+            primary_best, primary_z = torch.topk(
+                dist,
+                k=topk_count,
+                dim=-1,
+                largest=False,
+                sorted=True,
+            )
             if use_tie_break and tie_anchors is not None and target_tie is not None:
                 tie_dist = anchor_distance(
                     anchors=tie_anchors,
@@ -202,10 +254,24 @@ def match_anchors_by_type(
                 match_best = dist.min(dim=-1).values
                 eligible = dist <= match_best.unsqueeze(-1) + float(tie_break_tolerance)
                 tie_score = tie_dist.masked_fill(~eligible, float("inf"))
-                chunk_z = tie_score.argmin(dim=-1)
-                chunk_best = dist.gather(1, chunk_z.unsqueeze(-1)).squeeze(-1)
+                first_z = tie_score.argmin(dim=-1)
+                if top_m == 1:
+                    chunk_z = first_z.unsqueeze(-1)
+                else:
+                    duplicate = primary_z == first_z.unsqueeze(-1)
+                    primary_best_for_next = primary_best.masked_fill(duplicate, float("inf"))
+                    _, next_order = torch.topk(
+                        primary_best_for_next,
+                        k=top_m - 1,
+                        dim=-1,
+                        largest=False,
+                        sorted=True,
+                    )
+                    next_z = primary_z.gather(1, next_order)
+                    chunk_z = torch.cat([first_z.unsqueeze(-1), next_z], dim=-1)
             else:
-                chunk_best, chunk_z = dist.min(dim=-1)
+                chunk_z = primary_z[:, :top_m]
+            chunk_best = dist.gather(1, chunk_z)
             z[chunk_rows] = chunk_z
             best[chunk_rows] = chunk_best
 
@@ -215,10 +281,12 @@ def match_anchors_by_type(
 def gather_anchors_by_type(anchors_by_type: Tensor, agent_type: Tensor, z: Tensor) -> Tensor:
     """Gather category-specific anchors for each agent row."""
 
-    return anchors_by_type[
-        agent_type.long().clamp(0, NUM_AGENT_TYPES - 1),
-        z.long(),
-    ]
+    z = z.long()
+    agent_type = agent_type.long().clamp(0, NUM_AGENT_TYPES - 1)
+    if agent_type.shape != z.shape:
+        view_shape = agent_type.shape + (1,) * (z.dim() - agent_type.dim())
+        agent_type = agent_type.view(view_shape).expand_as(z)
+    return anchors_by_type[agent_type, z]
 
 
 def execute_local_anchor(

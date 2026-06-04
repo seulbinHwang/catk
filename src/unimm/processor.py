@@ -18,6 +18,7 @@ from .anchors import (
     gather_anchors_by_type,
     make_local_future,
     match_anchors_by_type,
+    match_top_m_anchors_by_type,
 )
 
 
@@ -30,6 +31,8 @@ class UniMMTrainingBatch:
     target_valid: Tensor
     z_star: Tensor
     z_star_error: Tensor
+    z_candidates: Tensor
+    z_candidate_error: Tensor
     posterior_stats: Dict[str, Tensor]
 
 
@@ -47,6 +50,7 @@ class UniMMProcessor(nn.Module):
         anchor_match_chunk_size: int = 4096,
         positive_tie_break_horizon_steps: int | None = None,
         positive_tie_break_tolerance: float = 0.0,
+        positive_top_m: int = 8,
     ) -> None:
         super().__init__()
         self.spec = AnchorSpec(
@@ -62,6 +66,9 @@ class UniMMProcessor(nn.Module):
             None if positive_tie_break_horizon_steps is None else int(positive_tie_break_horizon_steps)
         )
         self.positive_tie_break_tolerance = float(positive_tie_break_tolerance)
+        self.positive_top_m = int(positive_top_m)
+        if self.positive_top_m <= 0:
+            raise ValueError(f"positive_top_m must be positive, got {self.positive_top_m}")
         if self.first_context_step % self.spec.num_commit_steps != 0:
             raise ValueError("first_context_step must align to commit_steps")
         if self.last_train_context_step % self.spec.num_commit_steps != 0:
@@ -482,17 +489,21 @@ class UniMMProcessor(nn.Module):
         )
         n_agent, n_context = target_valid.shape[:2]
         row_agent_type = data["agent"]["type"].long().unsqueeze(1).expand(-1, n_context).reshape(-1)
-        z_star, z_star_error = match_anchors_by_type(
+        z_candidates, z_candidate_error = match_top_m_anchors_by_type(
             anchors_by_type=anchors_by_type,
             agent_type=row_agent_type,
             target_local=target_local.reshape(n_agent * n_context, self.spec.num_prediction_steps, 3),
             valid=target_valid.reshape(n_agent * n_context, self.spec.num_prediction_steps),
             horizon_steps=self.spec.num_match_steps,
+            top_m=self.positive_top_m,
             heading_weight=self.anchor_heading_weight,
             row_chunk_size=self.anchor_match_chunk_size,
             tie_break_horizon_steps=self.positive_tie_break_horizon_steps,
             tie_break_tolerance=self.positive_tie_break_tolerance,
         )
+        z_star = z_candidates[:, 0]
+        z_star_error = z_candidate_error[:, 0]
+        n_candidate = z_candidates.shape[-1]
         return UniMMTrainingBatch(
             tokenized_map=tokenized_map,
             tokenized_agent=self._base_agent_dict(
@@ -509,6 +520,8 @@ class UniMMProcessor(nn.Module):
             target_valid=target_valid,
             z_star=z_star.view(n_agent, n_context),
             z_star_error=z_star_error.view(n_agent, n_context),
+            z_candidates=z_candidates.view(n_agent, n_context, n_candidate),
+            z_candidate_error=z_candidate_error.view(n_agent, n_context, n_candidate),
             posterior_stats=posterior_stats,
         )
 

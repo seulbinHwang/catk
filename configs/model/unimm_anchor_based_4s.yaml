@@ -16,9 +16,10 @@ model_config:
   anchor_match_chunk_size: 4096
   positive_tie_break_horizon_steps: 40
   positive_tie_break_tolerance: 0.0001
+  positive_top_m: 8
 
   use_closed_loop_training: true
-  inference_temperature: 0.75
+  inference_temperature: 1.0
   # 0 disables truncation and samples from all 2048 anchors. Positive values
   # keep only the top-k scorer logits during closed-loop inference.
   inference_top_k: 0
@@ -43,8 +44,8 @@ model_config:
   delete_local_videos_after_wandb_upload: true
 
   loss_weights:
-    cls: 1.0
-    reg: 1.0
+    mixture: 1.0
+    aux_ce: 0.2
 
   decoder:
     # K=2048일 때 전체 모델이 약 7.1M parameters가 되도록 맞춘 값입니다.

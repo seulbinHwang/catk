@@ -16,8 +16,12 @@ from scripts.build_unimm_anchors import (
     minibatch_kmeans,
     nearest_anchor_assignment,
 )
-from src.unimm.losses import unimm_classification_loss, unimm_nll_loss
-from src.unimm.anchors import match_anchors_by_type
+from src.unimm.losses import (
+    unimm_candidate_set_ce_loss,
+    unimm_nll_loss,
+    unimm_top_m_mixture_nll_loss,
+)
+from src.unimm.anchors import match_anchors_by_type, match_top_m_anchors_by_type
 from src.unimm.model.anchor_based_4s import UniMMAnchorBased4s
 from src.unimm.modules import UniMMMotionDecoder
 from src.unimm.processor import UniMMProcessor
@@ -157,8 +161,11 @@ def _make_model_cfg(anchor_path: Path, **overrides):
         "last_train_context_step": 85,
         "anchor_heading_weight": 1.0,
         "anchor_match_chunk_size": 16,
+        "positive_top_m": 8,
         "use_closed_loop_training": True,
         "inference_temperature": 1.0,
+        "inference_top_k": 0,
+        "inference_top_p": 1.0,
         "validation_closed_seed": 0,
         "val_open_loop": False,
         "val_closed_loop": False,
@@ -167,7 +174,7 @@ def _make_model_cfg(anchor_path: Path, **overrides):
         "n_vis_batch": 0,
         "n_vis_scenario": 0,
         "n_vis_rollout": 0,
-        "loss_weights": {"cls": 1.0, "reg": 1.0},
+        "loss_weights": {"mixture": 1.0, "aux_ce": 0.2},
         "decoder": {
             "hidden_dim": 32,
             "num_freq_bands": 8,
@@ -217,6 +224,10 @@ def test_unimm_processor_builds_closed_loop_training_batch():
     assert batch.target_local.shape == (3, 16, 40, 3)
     assert batch.target_valid.shape == (3, 16, 40)
     assert batch.z_star.shape == (3, 16)
+    assert batch.z_candidates.shape == (3, 16, 8)
+    assert batch.z_candidate_error.shape == (3, 16, 8)
+    assert torch.equal(batch.z_star, batch.z_candidates[..., 0])
+    assert torch.allclose(batch.z_star_error, batch.z_candidate_error[..., 0])
     assert batch.tokenized_agent["state_pos"].shape == (3, 17, 2)
     assert batch.tokenized_agent["tracklet_pos"].shape == (3, 17, 5, 2)
     assert batch.tokenized_agent["tracklet_head"].shape == (3, 17, 5)
@@ -234,20 +245,49 @@ def test_unimm_processor_builds_closed_loop_training_batch():
     )
 
 
-def test_unimm_classification_loss_uses_positive_matching_horizon_only():
+def test_unimm_candidate_set_ce_uses_positive_matching_horizon_only():
     logits = torch.tensor(
         [
-            [[4.0, -4.0], [-4.0, 4.0]],
+            [[4.0, -4.0, 0.0], [-4.0, 4.0, 0.0]],
         ],
         dtype=torch.float32,
     )
-    z_star = torch.tensor([[0, 0]], dtype=torch.long)
+    z_candidates = torch.tensor([[[0, 2], [0, 2]]], dtype=torch.long)
     valid = torch.zeros(1, 2, 40, dtype=torch.bool)
     valid[:, :, 5:] = True
 
-    loss = unimm_classification_loss(logits, z_star, valid, match_steps=5)
+    loss = unimm_candidate_set_ce_loss(logits, z_candidates, valid, match_steps=5)
 
     assert loss.item() == 0.0
+
+
+def test_unimm_top_m_mixture_loss_rewards_multiple_candidate_anchors():
+    logits = torch.tensor([[[0.0, 0.0]]], dtype=torch.float32)
+    z_candidates = torch.tensor([[[0, 1]]], dtype=torch.long)
+    target_local = torch.zeros(1, 1, 5, 3)
+    target_valid = torch.ones(1, 1, 5, dtype=torch.bool)
+    pred = {
+        "mean_pos": torch.zeros(1, 1, 2, 5, 2),
+        "pos_scale": torch.ones(1, 1, 2, 5, 2),
+        "mean_head": torch.zeros(1, 1, 2, 5),
+        "head_concentration": torch.ones(1, 1, 2, 5),
+    }
+
+    mixture_loss, candidate_nll = unimm_top_m_mixture_nll_loss(
+        pred,
+        logits,
+        z_candidates,
+        target_local,
+        target_valid,
+    )
+    single_loss = unimm_nll_loss(
+        {key: value[:, :, 0] for key, value in pred.items()},
+        target_local,
+        target_valid,
+    )
+
+    assert candidate_nll.shape == (1, 1, 2)
+    assert torch.allclose(mixture_loss, single_loss, atol=1e-5)
 
 
 def test_unimm_positive_matching_tie_break_uses_prediction_tail_only_for_near_ties():
@@ -295,6 +335,35 @@ def test_unimm_positive_matching_tie_break_uses_prediction_tail_only_for_near_ti
 
     assert z_not_close.item() == 0
     assert err_not_close.item() == 0.0
+
+
+def test_unimm_top_m_matching_keeps_near_tie_first_candidate_stable():
+    anchors = torch.zeros(3, 4, 40, 3)
+    anchors[0, 0, 5:, 0] = 100.0
+    anchors[0, 1, 5:, 0] = 1.0
+    anchors[0, 2, :5, 0] = 0.2
+    anchors[0, 3, :5, 0] = 0.3
+    target = torch.zeros(1, 40, 3)
+    target[:, 5:, 0] = 1.0
+    valid = torch.ones(1, 40, dtype=torch.bool)
+    agent_type = torch.zeros(1, dtype=torch.long)
+
+    z_top, err_top = match_top_m_anchors_by_type(
+        anchors,
+        agent_type,
+        target,
+        valid,
+        horizon_steps=5,
+        top_m=3,
+        row_chunk_size=4,
+        tie_break_horizon_steps=40,
+        tie_break_tolerance=1e-4,
+    )
+
+    assert z_top.shape == (1, 3)
+    assert err_top.shape == (1, 3)
+    assert z_top[0, 0].item() == 1
+    assert set(z_top[0].tolist()).issubset({0, 1, 2, 3})
 
 
 def test_unimm_regression_loss_averages_valid_timesteps():
@@ -358,6 +427,28 @@ def test_unimm_motion_decoder_caps_heading_concentration():
 
     assert torch.isfinite(pred["head_concentration"]).all()
     assert pred["head_concentration"].max().item() == 100.0
+
+
+def test_unimm_motion_decoder_decodes_top_m_candidate_dimension():
+    decoder = UniMMMotionDecoder(
+        hidden_dim=8,
+        num_anchors=4,
+        num_prediction_steps=3,
+        min_laplace_scale=0.05,
+        min_von_mises_concentration=0.001,
+        max_von_mises_concentration=100.0,
+    )
+
+    pred = decoder(
+        agent_embedding=torch.zeros(2, 3, 8),
+        selected_anchor=torch.zeros(2, 3, 5, 3, 3),
+    )
+
+    assert pred["mean_pos"].shape == (2, 3, 5, 3, 2)
+    assert pred["mean_head"].shape == (2, 3, 5, 3)
+    assert pred["pos_scale"].shape == (2, 3, 5, 3, 2)
+    assert pred["head_concentration"].shape == (2, 3, 5, 3)
+    assert pred["logits"].shape == (2, 3, 4)
 
 
 def test_unimm_minibatch_kmeans_builds_valid_anchor_bank():
@@ -499,8 +590,11 @@ def test_unimm_lightning_training_step_runs(tmp_path: Path):
             "last_train_context_step": 85,
             "anchor_heading_weight": 1.0,
             "anchor_match_chunk_size": 16,
+            "positive_top_m": 8,
             "use_closed_loop_training": True,
             "inference_temperature": 1.0,
+            "inference_top_k": 0,
+            "inference_top_p": 1.0,
             "validation_closed_seed": 0,
             "val_open_loop": False,
             "val_closed_loop": False,
@@ -509,7 +603,7 @@ def test_unimm_lightning_training_step_runs(tmp_path: Path):
             "n_vis_batch": 0,
             "n_vis_scenario": 0,
             "n_vis_rollout": 0,
-            "loss_weights": {"cls": 1.0, "reg": 1.0},
+            "loss_weights": {"mixture": 1.0, "aux_ce": 0.2},
             "decoder": {
                 "hidden_dim": 32,
                 "num_freq_bands": 8,
@@ -567,8 +661,11 @@ def test_unimm_rollout_shapes(tmp_path: Path):
             "last_train_context_step": 85,
             "anchor_heading_weight": 1.0,
             "anchor_match_chunk_size": 16,
+            "positive_top_m": 8,
             "use_closed_loop_training": True,
             "inference_temperature": 1.0,
+            "inference_top_k": 0,
+            "inference_top_p": 1.0,
             "validation_closed_seed": 0,
             "val_open_loop": False,
             "val_closed_loop": False,
@@ -577,7 +674,7 @@ def test_unimm_rollout_shapes(tmp_path: Path):
             "n_vis_batch": 0,
             "n_vis_scenario": 0,
             "n_vis_rollout": 0,
-            "loss_weights": {"cls": 1.0, "reg": 1.0},
+            "loss_weights": {"mixture": 1.0, "aux_ce": 0.2},
             "decoder": {
                 "hidden_dim": 32,
                 "num_freq_bands": 8,

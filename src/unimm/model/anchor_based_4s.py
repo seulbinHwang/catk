@@ -30,7 +30,7 @@ from src.unimm.anchors import (
     gather_anchors_by_type,
     load_anchor_file,
 )
-from src.unimm.losses import unimm_classification_loss, unimm_nll_loss
+from src.unimm.losses import unimm_candidate_set_ce_loss, unimm_top_m_mixture_nll_loss
 from src.unimm.modules import UniMMAnchorBasedNetwork
 from src.unimm.processor import UniMMProcessor
 
@@ -123,6 +123,7 @@ class UniMMAnchorBased4s(LightningModule):
             positive_tie_break_tolerance=float(
                 getattr(model_config, "positive_tie_break_tolerance", 0.0)
             ),
+            positive_top_m=int(getattr(model_config, "positive_top_m", 8)),
         )
         self.network = UniMMAnchorBasedNetwork(
             hidden_dim=int(model_config.decoder.hidden_dim),
@@ -147,6 +148,8 @@ class UniMMAnchorBased4s(LightningModule):
 
         self.use_closed_loop_training = bool(model_config.use_closed_loop_training)
         self.loss_weights = model_config.loss_weights
+        self.mixture_loss_weight = float(getattr(self.loss_weights, "mixture", 1.0))
+        self.aux_ce_loss_weight = float(getattr(self.loss_weights, "aux_ce", 0.2))
         self.inference_temperature = float(model_config.inference_temperature)
         self.inference_top_k = int(getattr(model_config, "inference_top_k", 0))
         self.inference_top_p = float(getattr(model_config, "inference_top_p", 1.0))
@@ -273,19 +276,19 @@ class UniMMAnchorBased4s(LightningModule):
         embedding_seq = self.network.encode(tokenized_map, tokenized_agent)
         return embedding_seq[:, context_indices]
 
-    def _selected_prediction_anchors(
+    def _candidate_prediction_anchors(
         self,
         agent_type: torch.Tensor,
-        z: torch.Tensor,
+        z_candidates: torch.Tensor,
     ) -> torch.Tensor:
-        n_agent, n_context = z.shape
-        row_type = agent_type.unsqueeze(1).expand(-1, n_context).reshape(-1)
+        n_agent, n_context, n_candidate = z_candidates.shape
+        row_type = agent_type[:, None, None].expand(-1, n_context, n_candidate)
         selected = gather_anchors_by_type(
             self.anchors_by_type[:, :, : self.spec.num_prediction_steps],
             row_type,
-            z.reshape(-1),
+            z_candidates,
         )
-        return selected.view(n_agent, n_context, self.spec.num_prediction_steps, 3)
+        return selected.view(n_agent, n_context, n_candidate, self.spec.num_prediction_steps, 3)
 
     def _forward_loss(self, data, use_closed_loop: bool) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         batch = self.processor.build_training_batch(
@@ -299,42 +302,56 @@ class UniMMAnchorBased4s(LightningModule):
             batch.tokenized_agent,
             batch.context_indices,
         )
-        selected_anchor = self._selected_prediction_anchors(
+        candidate_anchor = self._candidate_prediction_anchors(
             batch.tokenized_agent["type"],
-            batch.z_star,
+            batch.z_candidates,
         )
-        pred = self.network.motion_decoder(context_embedding, selected_anchor)
+        pred = self.network.motion_decoder(context_embedding, candidate_anchor)
 
         train_mask = data["agent"]["train_mask"] if "train_mask" in data["agent"] else None
         target_valid = batch.target_valid
         if train_mask is not None:
             target_valid = target_valid & train_mask[:, None, None]
 
-        cls_loss = unimm_classification_loss(
+        mixture_loss, candidate_nll = unimm_top_m_mixture_nll_loss(
+            pred,
             pred["logits"],
-            batch.z_star,
+            batch.z_candidates,
+            batch.target_local,
+            target_valid,
+        )
+        aux_ce_loss = unimm_candidate_set_ce_loss(
+            pred["logits"],
+            batch.z_candidates,
             target_valid,
             match_steps=self.spec.num_match_steps,
         )
-        reg_loss = unimm_nll_loss(pred, batch.target_local, target_valid)
-        total_loss = float(self.loss_weights.cls) * cls_loss + float(self.loss_weights.reg) * reg_loss
+        total_loss = self.mixture_loss_weight * mixture_loss + self.aux_ce_loss_weight * aux_ce_loss
         if not torch.isfinite(total_loss):
             raise RuntimeError(
                 "UniMM training loss became non-finite "
                 f"(loss={float(total_loss.detach().cpu())}, "
-                f"cls={float(cls_loss.detach().cpu())}, "
-                f"reg={float(reg_loss.detach().cpu())})."
+                f"mixture={float(mixture_loss.detach().cpu())}, "
+                f"aux_ce={float(aux_ce_loss.detach().cpu())})."
             )
         z_star_valid = target_valid[..., : self.spec.num_match_steps].any(dim=-1)
-        reg_cls_ratio = reg_loss.detach() / cls_loss.detach().abs().clamp_min(1e-6)
+        aux_mixture_ratio = aux_ce_loss.detach() / mixture_loss.detach().abs().clamp_min(1e-6)
+        candidate_error_valid = batch.z_candidate_error[z_star_valid]
+        candidate_nll_valid = candidate_nll[z_star_valid]
         logs = {
             "loss": total_loss,
-            "loss_cls": cls_loss.detach(),
-            "loss_reg": reg_loss.detach(),
-            "reg_cls_ratio": reg_cls_ratio,
+            "loss_mixture": mixture_loss.detach(),
+            "loss_aux_ce": aux_ce_loss.detach(),
+            "aux_mixture_ratio": aux_mixture_ratio,
             "z_star_error": batch.z_star_error[z_star_valid].mean().detach()
             if bool(z_star_valid.any())
             else batch.z_star_error.sum().detach() * 0.0,
+            "top_m_error": candidate_error_valid.mean().detach()
+            if bool(z_star_valid.any())
+            else batch.z_candidate_error.sum().detach() * 0.0,
+            "top_m_nll": candidate_nll_valid.mean().detach()
+            if bool(z_star_valid.any())
+            else candidate_nll.sum().detach() * 0.0,
         }
         posterior_stats = batch.posterior_stats
         for stat_key in (
@@ -373,22 +390,22 @@ class UniMMAnchorBased4s(LightningModule):
             loss, logs = self._forward_loss(data, use_closed_loop=False)
             self.log("val_open/loss", loss, on_epoch=True, sync_dist=True, batch_size=1)
             self.log(
-                "val_open/loss_cls",
-                logs["loss_cls"],
+                "val_open/loss_mixture",
+                logs["loss_mixture"],
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=1,
             )
             self.log(
-                "val_open/loss_reg",
-                logs["loss_reg"],
+                "val_open/loss_aux_ce",
+                logs["loss_aux_ce"],
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=1,
             )
             self.log(
-                "val_open/reg_cls_ratio",
-                logs["reg_cls_ratio"],
+                "val_open/aux_mixture_ratio",
+                logs["aux_mixture_ratio"],
                 on_epoch=True,
                 sync_dist=True,
                 batch_size=1,

@@ -544,8 +544,10 @@ class UniMMMotionDecoder(nn.Module):
 
     def decode_selected(self, agent_embedding: Tensor, selected_anchor: Tensor) -> Dict[str, Tensor]:
         anchor_feat = self.anchor_encoder(selected_anchor.flatten(-2, -1))
+        if anchor_feat.dim() == agent_embedding.dim() + 1:
+            agent_embedding = agent_embedding.unsqueeze(-2).expand(*anchor_feat.shape[:-1], -1)
         raw = self.regressor(torch.cat([agent_embedding, anchor_feat], dim=-1))
-        raw = raw.view(*agent_embedding.shape[:-1], self.num_prediction_steps, 6)
+        raw = raw.view(*anchor_feat.shape[:-1], self.num_prediction_steps, 6)
 
         mean_pos = selected_anchor[..., :2] + raw[..., :2]
         mean_head = wrap_angle(selected_anchor[..., 2] + raw[..., 2])
