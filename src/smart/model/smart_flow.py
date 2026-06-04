@@ -59,6 +59,7 @@ from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
 from src.smart.utils.flow_horizon import format_flow_horizon_tag
+from src.smart.utils.rollout import transform_to_global
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
 
@@ -195,6 +196,11 @@ class SMARTFlow(LightningModule):
         )
         self.validation_open_seed = int(model_config.validation_open_seed)
         self.validation_closed_seed = int(model_config.validation_closed_seed)
+        self.validation_fixed_flow_noise = bool(
+            getattr(model_config, "validation_fixed_flow_noise", True)
+        )
+        self._validation_open_noise_cache: dict[tuple[Any, ...], Tensor] = {}
+        self._validation_closed_noise_cache: dict[tuple[Any, ...], Tensor] = {}
         self.n_vis_batch = model_config.n_vis_batch
         self.n_vis_scenario = model_config.n_vis_scenario
         self.n_vis_rollout = model_config.n_vis_rollout
@@ -350,6 +356,35 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
+        self.self_forced_adam_beta1 = (
+            float(getattr(self.self_forced_config, "adam_beta1", 0.9))
+            if self.self_forced_config is not None
+            else 0.9
+        )
+        self.self_forced_adam_beta2 = (
+            float(getattr(self.self_forced_config, "adam_beta2", 0.999))
+            if self.self_forced_config is not None
+            else 0.999
+        )
+        self.self_forced_adam_eps = (
+            float(getattr(self.self_forced_config, "adam_eps", 1.0e-8))
+            if self.self_forced_config is not None
+            else 1.0e-8
+        )
+        if not (0.0 <= self.self_forced_adam_beta1 < 1.0):
+            raise ValueError(
+                "self_forced.adam_beta1 must be in [0, 1), "
+                f"got {self.self_forced_adam_beta1}."
+            )
+        if not (0.0 <= self.self_forced_adam_beta2 < 1.0):
+            raise ValueError(
+                "self_forced.adam_beta2 must be in [0, 1), "
+                f"got {self.self_forced_adam_beta2}."
+            )
+        if not (self.self_forced_adam_eps > 0.0):
+            raise ValueError(
+                f"self_forced.adam_eps must be > 0, got {self.self_forced_adam_eps}."
+            )
         # OCSC dmd_n_rollouts 정합 — 같은 anchor 0 에서 N rollout 으로 DMD direction variance↓.
         # 구현은 batch-replicate: scenario 를 N 장 복제해 단일 rollout 한 번에 N noise tape 처리.
         # walltime ≈ 1× (sequential 대비), VRAM 은 ~N 배.  critic / DMD direction 도 같은 packed
@@ -1139,6 +1174,102 @@ class SMARTFlow(LightningModule):
             return torch.zeros((0, len(scenario_ids)), dtype=torch.long, device=device)
         return torch.stack(seed_rows, dim=0)
 
+    def _validation_noise_device_key(self, device: torch.device) -> str:
+        if device.type == "cuda" and device.index is None and torch.cuda.is_available():
+            return f"cuda:{torch.cuda.current_device()}"
+        return str(device)
+
+    def _validation_noise_scale(self) -> float:
+        return float(getattr(self.validation_rollout_sampling, "noise_scale", 1.0))
+
+    def _get_validation_open_x_init_norm(
+        self,
+        batch_idx: int,
+        num_valid_anchor: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        flow_state_dim: int,
+    ) -> Tensor | None:
+        if not self.validation_fixed_flow_noise or num_valid_anchor <= 0:
+            return None
+        seed = self._get_validation_open_seed(batch_idx)
+        noise_scale = self._validation_noise_scale()
+        key = (
+            "open",
+            int(seed),
+            int(num_valid_anchor),
+            int(self.flow_window_steps),
+            int(flow_state_dim),
+            self._validation_noise_device_key(device),
+            str(dtype),
+            float(noise_scale),
+        )
+        cached = self._validation_open_noise_cache.get(key)
+        if cached is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed))
+            cached = torch.randn(
+                int(num_valid_anchor),
+                int(self.flow_window_steps),
+                int(flow_state_dim),
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            ) * noise_scale
+            self._validation_open_noise_cache[key] = cached.detach()
+        return cached
+
+    def _get_validation_closed_rollout_noise_tape(
+        self,
+        rollout_encoder: SMARTFlowDecoder,
+        tokenized_agent: Dict[str, Tensor],
+        rollout_cache: Dict[str, object],
+        scenario_sampling_seeds: Tensor,
+    ) -> Tensor | None:
+        if not self.validation_fixed_flow_noise:
+            return None
+        agent_encoder = rollout_encoder.agent_encoder
+        n_agent = int(rollout_cache["n_agent"])
+        n_step_future_2hz = int(rollout_cache["n_step_future_2hz"])
+        n_step_future_10hz = n_step_future_2hz * int(agent_encoder.shift)
+        tape_steps = n_step_future_10hz + int(self.flow_window_steps) - int(agent_encoder.shift)
+        feat_a_now = rollout_cache["feat_a_now"]
+        if not torch.is_tensor(feat_a_now):
+            raise TypeError("rollout_cache['feat_a_now'] must be a tensor.")
+        device = feat_a_now.device
+        dtype = feat_a_now.dtype
+        agent_batch = tokenized_agent["batch"]
+        seed_tuple = tuple(int(seed) for seed in scenario_sampling_seeds.detach().cpu().tolist())
+        scenario_counts = tuple(
+            int((agent_batch == scenario_idx).sum().item())
+            for scenario_idx in range(len(seed_tuple))
+        )
+        noise_scale = self._validation_noise_scale()
+        key = (
+            "closed",
+            seed_tuple,
+            scenario_counts,
+            int(n_agent),
+            int(tape_steps),
+            int(agent_encoder.flow_state_dim),
+            self._validation_noise_device_key(device),
+            str(dtype),
+            float(noise_scale),
+        )
+        cached = self._validation_closed_noise_cache.get(key)
+        if cached is None:
+            cached = agent_encoder._build_rollout_noise_tape(
+                num_agent=n_agent,
+                tape_steps=tape_steps,
+                device=device,
+                dtype=dtype,
+                sampling_scheme=self.validation_rollout_sampling,
+                scenario_sampling_seeds=scenario_sampling_seeds,
+                agent_batch=agent_batch,
+            )
+            self._validation_closed_noise_cache[key] = cached.detach()
+        return cached
+
     def _repeat_tensor_on_first_dim(self, tensor: Tensor, repeat_count: int) -> Tensor:
         """첫 번째 축을 rollout 수만큼 반복합니다.
 
@@ -1432,6 +1563,12 @@ class SMARTFlow(LightningModule):
                 rollout_idx=int(rollout_indices[0]),
                 device=scenario_device,
             )
+            rollout_noise_tape = self._get_validation_closed_rollout_noise_tape(
+                rollout_encoder=rollout_encoder,
+                tokenized_agent=tokenized_agent,
+                rollout_cache=rollout_cache,
+                scenario_sampling_seeds=scenario_sampling_seeds,
+            )
             pred = rollout_encoder.rollout_from_cache(
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
@@ -1439,6 +1576,7 @@ class SMARTFlow(LightningModule):
                 sampling_scheme=self.validation_rollout_sampling,
                 scenario_sampling_seeds=scenario_sampling_seeds,
                 return_flow_2s_preview=return_flow_2s_preview,
+                rollout_noise_tape=rollout_noise_tape,
             )
             flow_preview = None
             if return_flow_2s_preview:
@@ -1474,6 +1612,12 @@ class SMARTFlow(LightningModule):
             rollout_cache=rollout_cache,
             repeat_count=chunk_size,
         )
+        rollout_noise_tape = self._get_validation_closed_rollout_noise_tape(
+            rollout_encoder=rollout_encoder,
+            tokenized_agent=expanded_tokenized_agent,
+            rollout_cache=expanded_rollout_cache,
+            scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
+        )
         pred = rollout_encoder.rollout_from_cache(
             rollout_cache=expanded_rollout_cache,
             tokenized_agent=expanded_tokenized_agent,
@@ -1481,6 +1625,7 @@ class SMARTFlow(LightningModule):
             sampling_scheme=self.validation_rollout_sampling,
             scenario_sampling_seeds=scenario_seed_table.reshape(-1).contiguous(),
             return_flow_2s_preview=return_flow_2s_preview,
+            rollout_noise_tape=rollout_noise_tape,
         )
         flow_preview = None
         if return_flow_2s_preview:
@@ -2711,7 +2856,7 @@ class SMARTFlow(LightningModule):
         anchor_mask: Tensor,
         anchor_idx: int = 0,
         committed_path_pose_norm: Tensor | None = None,  # legacy; unused after OCSC port
-    ) -> Tensor:
+    ) -> tuple[Tensor, Dict[str, Tensor]]:
         """설정에 따라 DMD-style 또는 SiD-style generator loss를 계산합니다.
 
         Args:
@@ -2799,8 +2944,22 @@ class SMARTFlow(LightningModule):
                 normalizer = pred_x0_real.abs().mean(dim=(-2, -1), keepdim=True).clamp_min(1e-7)
                 g_n = g_dmd / normalizer
             else:
+                normalizer = torch.ones(
+                    x_gen_d.shape[0],
+                    1,
+                    1,
+                    device=x_gen_d.device,
+                    dtype=x_gen_d.dtype,
+                )
                 g_n = g_dmd
             g_n = torch.nan_to_num(g_n, nan=0.0, posinf=0.0, neginf=0.0)
+            dmd_diagnostics = {
+                "score_diff_norm": (pred_x0_real - pred_x0_fake).abs().mean().detach(),
+                "v_real_norm": pred_x0_real.abs().mean().detach(),
+                "v_fake_norm": pred_x0_fake.abs().mean().detach(),
+                "normalizer_mean": normalizer.mean().detach(),
+                "direction_abs_mean": g_n.abs().mean().detach(),
+            }
 
         target = (x_gen - g_n.to(dtype=x_gen.dtype)).detach()
         self._set_self_forced_backward_context(
@@ -2808,7 +2967,7 @@ class SMARTFlow(LightningModule):
             dmd_direction=g_n,
             target_path_norm=target,
         )
-        return 0.5 * F.mse_loss(x_gen, target, reduction="mean")
+        return 0.5 * F.mse_loss(x_gen, target, reduction="mean"), dmd_diagnostics
 
     def _dmd_effective_beta(self) -> float:
         """현재 step 의 effective DMD β (OCSC β annealing 정합).
@@ -3031,6 +3190,7 @@ class SMARTFlow(LightningModule):
         rollout_results = []  # (rollout dict, committed_path_norm, anchor_mask, has_committed_local)
         per_rollout_gen_est_losses = []
         per_rollout_sf_losses = []
+        per_rollout_dmd_diagnostics = []
         per_rollout_total_losses = []
         any_committed_global = False
         last_anchor_loss_val: Tensor | None = None
@@ -3100,7 +3260,7 @@ class SMARTFlow(LightningModule):
 
                 # DMD/SiD direction backward — grad accumulate / n_anchors.
                 if has_committed_local:
-                    sf_loss_i = self._compute_self_forced_distribution_matching_loss(
+                    sf_loss_i, dmd_diag_i = self._compute_self_forced_distribution_matching_loss(
                         tokenized_map=tokenized_map_eval,
                         tokenized_agent=tokenized_agent_eval,
                         committed_path_norm=committed_path_norm,
@@ -3108,6 +3268,7 @@ class SMARTFlow(LightningModule):
                         anchor_mask=anchor_mask,
                         anchor_idx=token_anchor_idx,
                     )
+                    per_rollout_dmd_diagnostics.append(dmd_diag_i)
                 else:
                     sf_loss_i = self._build_trainable_connected_zero_loss(self.encoder)
                 anchor_loss_i = (
@@ -3214,6 +3375,29 @@ class SMARTFlow(LightningModule):
             if any(v is not None for v in per_rollout_gen_est_losses)
             else torch.zeros((), device=self.device, dtype=torch.float32)
         )
+        dmd_diagnostics: Dict[str, Tensor] = {}
+        if per_rollout_dmd_diagnostics:
+            for name in per_rollout_dmd_diagnostics[0]:
+                dmd_diagnostics[name] = torch.stack(
+                    [diag[name].detach().float() for diag in per_rollout_dmd_diagnostics]
+                ).mean()
+            dmd_diagnostics["n_valid_anchors"] = torch.tensor(
+                float(len(per_rollout_dmd_diagnostics)),
+                device=self.device,
+                dtype=torch.float32,
+            )
+        else:
+            for name in (
+                "score_diff_norm",
+                "v_real_norm",
+                "v_fake_norm",
+                "normalizer_mean",
+                "direction_abs_mean",
+            ):
+                dmd_diagnostics[name] = torch.zeros((), device=self.device, dtype=torch.float32)
+            dmd_diagnostics["n_valid_anchors"] = torch.zeros(
+                (), device=self.device, dtype=torch.float32
+            )
         anchor_loss = (
             last_anchor_loss_val
             if last_anchor_loss_val is not None
@@ -3233,8 +3417,20 @@ class SMARTFlow(LightningModule):
             self.log("train/loss_fm", fm_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/dmd/gen_loss", sf_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/dmd/fake_loss", gen_estimator_loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        for name, value in dmd_diagnostics.items():
+            self.log(
+                f"train/dmd/{name}",
+                value,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
         if self.self_forced_distribution_matching_objective == "dmd":
             self.log("train/sf_dmd_beta", float(self.self_forced_dmd_beta), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/dmd/beta", float(self.self_forced_dmd_beta), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
@@ -3302,6 +3498,599 @@ class SMARTFlow(LightningModule):
         if not bool(getattr(ft, "enabled", False)):
             return False
         return str(getattr(ft, "mode", "none")).lower() == "ocsc_ft"
+
+    def _is_road_ft_enabled(self) -> bool:
+        """RoaD (Rollouts as Demonstrations) fine-tune mode 활성 여부."""
+        ft = getattr(self, "finetune_config", None)
+        if ft is None:
+            return False
+        if not bool(getattr(ft, "enabled", False)):
+            return False
+        return str(getattr(ft, "mode", "none")).lower() == "road_ft"
+
+    def _run_flow_road_ft_step(self, data, batch_idx) -> Tensor:
+        """RoaD Sample-K closed-loop SFT step.
+
+        RoaD는 policy가 만든 expert-guided closed-loop rollout 자체를
+        demonstration으로 취급한다. 여기서는 매 2Hz rollout step마다 K개 2초
+        flow sample을 뽑고, GT future와 Eq.6-style weighted distance가 가장 작은
+        sample을 선택해 commit한다. 선택된 sample은 현재 closed-loop state에서의
+        clean flow target으로 다시 FM/BC loss를 건다. 기본 scope에서는 state
+        collection과 candidate selection이 no-grad이고 flow_decoder만 gradient를
+        갖는다. train_except_map_encoder scope에서는 map_encoder만 frozen으로 두고
+        condition hidden graph를 보존해 pretraining-style context까지 학습한다.
+        """
+        ft = self.finetune_config
+        sample_k = max(1, int(getattr(ft, "road_sample_k", 64)))
+        rollout_count = max(1, int(getattr(ft, "road_n_rollouts", 1)))
+        pred_max_steps = max(1, int(getattr(ft, "road_pred_max_steps", 16)))
+        temperature = float(getattr(ft, "road_temperature", 0.8))
+        pos_w = float(getattr(ft, "road_position_weight", 1.0))
+        head_w = float(getattr(ft, "road_heading_weight", 0.1))
+        comparison_horizon = max(1, int(getattr(ft, "road_comparison_horizon", self.flow_window_steps)))
+        strict_active = bool(getattr(ft, "road_strict_active_mask", True))
+        train_condition = bool(getattr(ft, "train_except_map_encoder", False)) or str(
+            getattr(ft, "flow_ft_target", "default")
+        ).lower() == "except_map_encoder"
+
+        tokenized_map, tokenized_agent = self._build_eval_tokenized_inputs(data)
+        agent_enc = self.encoder.agent_encoder
+        sampling_scheme = self.validation_rollout_sampling
+        flow_sample_steps = int(getattr(sampling_scheme, "sample_steps", agent_enc.flow_ode.solver_steps))
+        flow_sample_method = getattr(sampling_scheme, "sample_method", agent_enc.flow_ode.solver_method)
+        sample_window_steps = int(self.flow_window_steps)
+        shift = int(agent_enc.shift)
+
+        try:
+            gt_pos_full = data["agent"]["position"][..., :2]
+            gt_head_full = data["agent"]["heading"]
+            gt_valid_full = data["agent"]["valid_mask"]
+        except Exception:
+            return self._build_trainable_connected_zero_loss(self.encoder)
+
+        hidden_chunks: list[Tensor] = []
+        clean_chunks: list[Tensor] = []
+        loss_mask_chunks: list[Tensor] = []
+        selected_distances: list[Tensor] = []
+
+        def _velocity_head_grad_probe() -> dict[str, bool]:
+            velocity_head = getattr(agent_enc.flow_decoder, "velocity_head", None)
+            if velocity_head is None:
+                return {
+                    "param": False,
+                    "param_inference": False,
+                    "module": False,
+                    "functional": False,
+                }
+            first_param = next(velocity_head.parameters(), None)
+            head_net = getattr(velocity_head, "net", None)
+            first_linear = head_net[0] if head_net is not None and len(head_net) > 0 else None
+            if first_param is None or first_linear is None:
+                return {
+                    "param": False,
+                    "param_inference": False,
+                    "module": False,
+                    "functional": False,
+                }
+            in_features = int(getattr(first_linear, "in_features", 0))
+            probe_input = torch.zeros(
+                (1, 1, in_features),
+                device=first_param.device,
+                dtype=first_param.dtype,
+            )
+            with torch.inference_mode(False), torch.set_grad_enabled(True):
+                module_out = velocity_head(probe_input)
+                functional_out = F.linear(probe_input, first_linear.weight, first_linear.bias)
+            return {
+                "param": bool(first_param.requires_grad),
+                "param_inference": bool(getattr(first_param, "is_inference", lambda: False)()),
+                "module": bool(module_out.requires_grad),
+                "functional": bool(functional_out.requires_grad),
+            }
+
+        head_probe_before_collection = _velocity_head_grad_probe()
+
+        collection_context = nullcontext() if train_condition else torch.no_grad()
+        with collection_context:
+            map_context = torch.no_grad() if train_condition else nullcontext()
+            with map_context:
+                map_feature = self.encoder.encode_map(tokenized_map)
+            base_cache = agent_enc.prepare_inference_cache(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+            )
+
+            for rollout_idx in range(rollout_count):
+                state = agent_enc._clone_rollout_cache(base_cache)
+                n_agent = int(state["n_agent"])
+                total_step_future_2hz = int(state["n_step_future_2hz"])
+                n_step_future_2hz = min(pred_max_steps, total_step_future_2hz)
+                max_context_steps = int(state["max_context_steps"])
+
+                pos_window = state["pos_window"]
+                head_window = state["head_window"]
+                head_vector_window = state["head_vector_window"]
+                valid_window = state["valid_window"]
+                pred_idx_window = state["pred_idx_window"]
+                exec_pos_history_10hz = state["exec_pos_history_10hz"]
+                exec_head_history_10hz = state["exec_head_history_10hz"]
+                exec_valid_history_10hz = state["exec_valid_history_10hz"]
+                exec_pos_pair_10hz = state["exec_pos_pair_10hz"]
+                exec_head_pair_10hz = state["exec_head_pair_10hz"]
+                exec_valid_pair_10hz = state["exec_valid_pair_10hz"]
+                feat_a = state["feat_a"]
+                agent_token_emb = state["agent_token_emb"]
+                agent_token_emb_veh = state["agent_token_emb_veh"]
+                agent_token_emb_ped = state["agent_token_emb_ped"]
+                agent_token_emb_cyc = state["agent_token_emb_cyc"]
+                veh_mask = state["veh_mask"]
+                ped_mask = state["ped_mask"]
+                cyc_mask = state["cyc_mask"]
+                categorical_embs = state["categorical_embs"]
+                feat_a_now = state["feat_a_now"]
+                feat_a_t_dict = state["feat_a_t_dict"]
+
+                for t in range(n_step_future_2hz):
+                    n_step = pos_window.shape[1]
+                    if t == 0:
+                        current_hidden = feat_a_now
+                    else:
+                        inference_mask = valid_window.clone()
+                        inference_mask[:, :-1] = False
+                        edge_index_t, r_t = agent_enc.build_temporal_edge(
+                            pos_a=pos_window,
+                            head_a=head_window,
+                            head_vector_a=head_vector_window,
+                            mask=valid_window,
+                            inference_mask=inference_mask,
+                        )
+                        edge_index_t_current = torch.stack(
+                            [
+                                edge_index_t[0],
+                                (edge_index_t[1] + 1) // n_step - 1,
+                            ],
+                            dim=0,
+                        )
+                        edge_index_pl2a, r_pl2a = agent_enc.build_map2agent_edge(
+                            pos_pl=map_feature["position"],
+                            orient_pl=map_feature["orientation"],
+                            pos_a=pos_window[:, -1:],
+                            head_a=head_window[:, -1:],
+                            head_vector_a=head_vector_window[:, -1:],
+                            mask=inference_mask[:, -1:],
+                            batch_s=tokenized_agent["batch"],
+                            batch_pl=map_feature["batch"],
+                            light_type=map_feature.get("light_type"),
+                        )
+                        edge_index_a2a, r_a2a = agent_enc.build_interaction_edge(
+                            pos_a=pos_window[:, -1:],
+                            head_a=head_window[:, -1:],
+                            head_vector_a=head_vector_window[:, -1:],
+                            batch_s=tokenized_agent["batch"],
+                            mask=inference_mask[:, -1:],
+                        )
+
+                        for layer_idx in range(agent_enc.num_layers):
+                            temporal_feat = feat_a if layer_idx == 0 else feat_a_t_dict[layer_idx]
+                            current_hidden = agent_enc.t_attn_layers[layer_idx](
+                                (temporal_feat.flatten(0, 1), temporal_feat[:, -1]),
+                                r_t,
+                                edge_index_t_current,
+                            )
+                            current_hidden = agent_enc.pt2a_attn_layers[layer_idx](
+                                (map_feature["pt_token"], current_hidden),
+                                r_pl2a,
+                                edge_index_pl2a,
+                            )
+                            current_hidden = agent_enc.a2a_attn_layers[layer_idx](
+                                current_hidden,
+                                r_a2a,
+                                edge_index_a2a,
+                            )
+                            if layer_idx + 1 < agent_enc.num_layers:
+                                feat_a_t_dict[layer_idx + 1] = torch.cat(
+                                    [feat_a_t_dict[layer_idx + 1], current_hidden.detach().unsqueeze(1)],
+                                    dim=1,
+                                )
+
+                    active_mask = valid_window[:, -1]
+                    gt_start = int(agent_enc.num_historical_steps) + t * shift
+                    if gt_start >= int(gt_pos_full.shape[1]):
+                        break
+                    gt_end = min(gt_start + comparison_horizon, int(gt_pos_full.shape[1]))
+                    horizon = int(gt_end - gt_start)
+                    if horizon <= 0:
+                        break
+                    raw_step_for_loss = max(gt_start - 1, 0)
+                    future_loss_mask_full = self.token_processor._build_anchor_future_loss_mask(
+                        valid=gt_valid_full,
+                        raw_step=raw_step_for_loss,
+                    )
+                    gt_valid_h = gt_valid_full[:, gt_start:gt_end]
+                    road_mask = active_mask & future_loss_mask_full.any(dim=1)
+                    if strict_active:
+                        road_mask = road_mask & gt_valid_h.all(dim=1)
+
+                    next_pos = pos_window[:, -1].clone()
+                    next_head = head_window[:, -1].clone()
+                    next_token_idx = pred_idx_window[:, -1].clone()
+                    next_valid = active_mask.clone()
+
+                    if active_mask.any():
+                        active_hidden = current_hidden[active_mask]
+                        sample_hidden = active_hidden.detach()
+                        current_pos_act = pos_window[active_mask, -1]
+                        current_head_act = head_window[active_mask, -1]
+                        active_agent_type = tokenized_agent["type"][active_mask]
+                        active_agent_length = tokenized_agent["shape"][active_mask, 0]
+                        active_token_agent_shape = tokenized_agent["token_agent_shape"][active_mask]
+                        active_to_road = road_mask[active_mask]
+                        n_active = int(sample_hidden.shape[0])
+
+                        repeated_hidden = (
+                            sample_hidden.unsqueeze(0)
+                            .expand(sample_k, n_active, sample_hidden.shape[-1])
+                            .reshape(sample_k * n_active, sample_hidden.shape[-1])
+                            .contiguous()
+                        )
+                        with torch.no_grad():
+                            x_init_norm = torch.randn(
+                                sample_k * n_active,
+                                sample_window_steps,
+                                agent_enc.flow_state_dim,
+                                device=sample_hidden.device,
+                                dtype=sample_hidden.dtype,
+                            ) * float(temperature)
+                            y_hat_flat = agent_enc.flow_ode.generate(
+                                x_init=x_init_norm,
+                                model_fn=lambda x_t, tau: agent_enc.flow_decoder(repeated_hidden, x_t, tau),
+                                steps=flow_sample_steps,
+                                method=flow_sample_method,
+                            )
+                            y_hat = y_hat_flat.reshape(sample_k, n_active, sample_window_steps, agent_enc.flow_state_dim)
+
+                            repeated_agent_type = (
+                                active_agent_type.unsqueeze(0)
+                                .expand(sample_k, n_active)
+                                .reshape(sample_k * n_active)
+                                .contiguous()
+                            )
+                            repeated_agent_length = (
+                                active_agent_length.unsqueeze(0)
+                                .expand(sample_k, n_active)
+                                .reshape(sample_k * n_active)
+                                .contiguous()
+                            )
+                            pose_norm_flat = agent_enc._to_pose_metric_norm(
+                                y_hat_flat,
+                                repeated_agent_type,
+                                repeated_agent_length,
+                            )
+                            pred_pos_local = pose_norm_flat[..., :2] * 20.0
+                            pred_head_local = torch.atan2(pose_norm_flat[..., 3], pose_norm_flat[..., 2])
+                            repeated_current_pos = (
+                                current_pos_act.unsqueeze(0)
+                                .expand(sample_k, n_active, 2)
+                                .reshape(sample_k * n_active, 2)
+                                .contiguous()
+                            )
+                            repeated_current_head = (
+                                current_head_act.unsqueeze(0)
+                                .expand(sample_k, n_active)
+                                .reshape(sample_k * n_active)
+                                .contiguous()
+                            )
+                            pred_pos_global, pred_head_global = transform_to_global(
+                                pos_local=pred_pos_local,
+                                head_local=pred_head_local,
+                                pos_now=repeated_current_pos,
+                                head_now=repeated_current_head,
+                            )
+                            pred_pos_global = pred_pos_global.reshape(sample_k, n_active, sample_window_steps, 2)
+                            pred_head_global = pred_head_global.reshape(sample_k, n_active, sample_window_steps)
+
+                            selected_idx = torch.zeros(n_active, device=sample_hidden.device, dtype=torch.long)
+                            selected_scores_for_loss = None
+                            selected_clean_for_loss = None
+                            selected_pos_for_loss = None
+                            selected_head_for_loss = None
+                            if active_to_road.any():
+                                road_active_idx = active_to_road.nonzero(as_tuple=False).flatten()
+                                n_road = int(road_active_idx.shape[0])
+                                gt_pos = gt_pos_full[road_mask, gt_start:gt_end, :2]
+                                gt_head = gt_head_full[road_mask, gt_start:gt_end]
+                                gt_valid = gt_valid_full[road_mask, gt_start:gt_end].to(dtype=torch.float32)
+                                denom = gt_valid.sum(dim=1).clamp(min=1.0).unsqueeze(0)
+                                pos_sq = (
+                                    (
+                                        pred_pos_global[:, road_active_idx, :horizon].float()
+                                        - gt_pos.unsqueeze(0).float()
+                                    )
+                                    .square()
+                                    .sum(dim=-1)
+                                    * gt_valid.unsqueeze(0).float()
+                                ).sum(dim=-1) / denom
+                                pred_head_h = pred_head_global[:, road_active_idx, :horizon].float()
+                                gt_head_h = gt_head.unsqueeze(0).float()
+                                head_sq = (
+                                    (pred_head_h.cos() - gt_head_h.cos()).square()
+                                    + (pred_head_h.sin() - gt_head_h.sin()).square()
+                                )
+                                head_sq = (head_sq * gt_valid.unsqueeze(0).float()).sum(dim=-1) / denom
+                                scores = pos_w * pos_sq + head_w * head_sq
+                                best_idx_road = scores.argmin(dim=0)
+                                road_agent_idx = torch.arange(n_road, device=best_idx_road.device)
+                                selected_idx[road_active_idx] = best_idx_road
+                                selected_scores_for_loss = scores[best_idx_road, road_agent_idx].detach()
+                                selected_clean_for_loss = y_hat[best_idx_road, road_active_idx].detach()
+                                selected_pos_for_loss = pred_pos_global[
+                                    best_idx_road,
+                                    road_active_idx,
+                                ].detach()
+                                selected_head_for_loss = pred_head_global[
+                                    best_idx_road,
+                                    road_active_idx,
+                                ].detach()
+
+                            agent_idx = torch.arange(n_active, device=selected_idx.device)
+                            selected_clean = y_hat[selected_idx, agent_idx].detach()
+
+                        if active_to_road.any():
+                            loss_hidden = (
+                                active_hidden[active_to_road]
+                                if train_condition
+                                else active_hidden[active_to_road].detach()
+                            )
+                            selected_future_loss_mask = future_loss_mask_full[road_mask]
+                            road_agent_type = active_agent_type[active_to_road]
+                            road_agent_length = active_agent_length[active_to_road]
+                            current_pos_road = current_pos_act[active_to_road]
+                            current_head_road = current_head_act[active_to_road]
+                            with torch.no_grad():
+                                pseudo_pos = torch.cat(
+                                    [
+                                        current_pos_road.detach().unsqueeze(1),
+                                        selected_pos_for_loss,
+                                    ],
+                                    dim=1,
+                                )
+                                pseudo_head = torch.cat(
+                                    [
+                                        current_head_road.detach().unsqueeze(1),
+                                        selected_head_for_loss,
+                                    ],
+                                    dim=1,
+                                )
+                                pseudo_anchor_mask = torch.ones(
+                                    pseudo_pos.shape[0],
+                                    device=pseudo_pos.device,
+                                    dtype=torch.bool,
+                                )
+                                if self.use_kinematic_control_flow:
+                                    road_clean_target, round_trip_error_m = self.token_processor._build_anchor_clean_norm(
+                                        pos=pseudo_pos,
+                                        heading=pseudo_head,
+                                        current_pos=pseudo_pos[:, 0],
+                                        current_head=pseudo_head[:, 0],
+                                        agent_type=road_agent_type,
+                                        agent_length=road_agent_length,
+                                        anchor_mask=pseudo_anchor_mask,
+                                        raw_step=0,
+                                        future_loss_mask=selected_future_loss_mask,
+                                        return_round_trip_error=True,
+                                    )
+                                    keep_mask = self.token_processor._build_control_round_trip_keep_mask(
+                                        round_trip_error_m=round_trip_error_m,
+                                        future_loss_mask=selected_future_loss_mask,
+                                    )
+                                else:
+                                    road_clean_target = self.token_processor._build_anchor_clean_norm(
+                                        pos=pseudo_pos,
+                                        heading=pseudo_head,
+                                        current_pos=pseudo_pos[:, 0],
+                                        current_head=pseudo_head[:, 0],
+                                        agent_type=road_agent_type,
+                                        agent_length=road_agent_length,
+                                        anchor_mask=pseudo_anchor_mask,
+                                        raw_step=0,
+                                        future_loss_mask=selected_future_loss_mask,
+                                    )
+                                    keep_mask = selected_future_loss_mask.any(dim=1)
+
+                            if keep_mask.any():
+                                hidden_chunks.append(loss_hidden[keep_mask])
+                                clean_chunks.append(road_clean_target[keep_mask].detach())
+                                loss_mask_chunks.append(selected_future_loss_mask[keep_mask].detach())
+                                selected_distances.append(selected_scores_for_loss[keep_mask].detach())
+
+                        with torch.no_grad():
+                            raw_commit_pos_act, raw_commit_head_act, _, _ = agent_enc.commit_bridge.commit(
+                                y_hat_norm=selected_clean,
+                                current_pos=current_pos_act,
+                                current_head=current_head_act,
+                                agent_type=active_agent_type,
+                                agent_length=active_agent_length,
+                            )
+                            next_pos_act = raw_commit_pos_act[:, -1].clone()
+                            next_head_act = raw_commit_head_act[:, -1].clone()
+                            next_token_idx_act = agent_enc.commit_bridge.retokenize(
+                                current_pos=current_pos_act,
+                                current_head=current_head_act,
+                                commit_pos=raw_commit_pos_act,
+                                commit_head=raw_commit_head_act,
+                                agent_type=active_agent_type,
+                                token_agent_shape=active_token_agent_shape,
+                                token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
+                                token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
+                                token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
+                            )
+                        next_pos[active_mask] = next_pos_act
+                        next_head[active_mask] = next_head_act
+                        next_token_idx[active_mask] = next_token_idx_act
+
+                        exec_pos_history_act = torch.cat([current_pos_act.unsqueeze(1), raw_commit_pos_act], dim=1)
+                        exec_head_history_act = torch.cat([current_head_act.unsqueeze(1), raw_commit_head_act], dim=1)
+                        exec_valid_history_act = torch.ones_like(exec_head_history_act, dtype=torch.bool)
+                        exec_pos_history_10hz[active_mask] = exec_pos_history_act
+                        exec_head_history_10hz[active_mask] = exec_head_history_act
+                        exec_valid_history_10hz[active_mask] = exec_valid_history_act
+                        exec_pos_pair_10hz[active_mask] = exec_pos_history_act[:, -2:]
+                        exec_head_pair_10hz[active_mask] = exec_head_history_act[:, -2:]
+                        exec_valid_pair_10hz[active_mask] = exec_valid_history_act[:, -2:]
+
+                    pred_idx_window = torch.cat([pred_idx_window, next_token_idx.unsqueeze(1)], dim=1)
+                    valid_window = torch.cat([valid_window, next_valid.unsqueeze(1)], dim=1)
+                    pos_window = torch.cat([pos_window, next_pos.unsqueeze(1)], dim=1)
+                    head_window = torch.cat([head_window, next_head.unsqueeze(1)], dim=1)
+                    head_vector_next = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+                    head_vector_window = torch.cat([head_vector_window, head_vector_next.unsqueeze(1)], dim=1)
+
+                    agent_token_emb_next = torch.zeros_like(agent_token_emb[:, 0])
+                    agent_token_emb_next[veh_mask] = agent_token_emb_veh[next_token_idx[veh_mask]]
+                    agent_token_emb_next[ped_mask] = agent_token_emb_ped[next_token_idx[ped_mask]]
+                    agent_token_emb_next[cyc_mask] = agent_token_emb_cyc[next_token_idx[cyc_mask]]
+                    agent_token_emb = torch.cat([agent_token_emb, agent_token_emb_next.unsqueeze(1)], dim=1)
+
+                    motion_vector_a = pos_window[:, -1] - pos_window[:, -2]
+                    motion_valid_a = valid_window[:, -1] & valid_window[:, -2]
+                    motion_vector_a = motion_vector_a.masked_fill(~motion_valid_a.unsqueeze(-1), 0.0)
+                    x_a = agent_enc._build_motion_feature_from_vector(
+                        motion_vector_a=motion_vector_a,
+                        head_vector_a=head_vector_window[:, -1],
+                        motion_valid_a=motion_valid_a,
+                    )
+                    x_a = agent_enc.x_a_emb(continuous_inputs=x_a, categorical_embs=categorical_embs)
+                    feat_a_next = agent_enc.fusion_emb(
+                        torch.cat([agent_token_emb_next, x_a], dim=-1).unsqueeze(1)
+                    )
+                    feat_a = torch.cat([feat_a, feat_a_next], dim=1)
+
+                    if pos_window.shape[1] > max_context_steps:
+                        pos_window = pos_window[:, -max_context_steps:]
+                        head_window = head_window[:, -max_context_steps:]
+                        head_vector_window = head_vector_window[:, -max_context_steps:]
+                        valid_window = valid_window[:, -max_context_steps:]
+                        pred_idx_window = pred_idx_window[:, -max_context_steps:]
+                        agent_token_emb = agent_token_emb[:, -max_context_steps:]
+                        feat_a = feat_a[:, -max_context_steps:]
+                        for key in feat_a_t_dict:
+                            feat_a_t_dict[key] = feat_a_t_dict[key][:, -max_context_steps:]
+
+        if not clean_chunks:
+            total_loss = self._build_trainable_connected_zero_loss(agent_enc.flow_decoder)
+            n_targets = 0
+            mean_selected_distance = total_loss.detach()
+            pred_requires_grad = total_loss.detach() * 0.0
+            loss_requires_grad = total_loss.detach() * 0.0
+        else:
+            if train_condition:
+                road_hidden = torch.cat(hidden_chunks, dim=0)
+            else:
+                road_hidden = torch.cat(hidden_chunks, dim=0).detach().clone()
+            road_clean = torch.cat(clean_chunks, dim=0).detach().clone()
+            road_loss_mask = torch.cat(loss_mask_chunks, dim=0).detach().clone()
+            head_probe_after_collection = _velocity_head_grad_probe()
+            with torch.inference_mode(False), torch.set_grad_enabled(True):
+                flow_sample = agent_enc.flow_ode.sample(road_clean, target_type="velocity")
+                pred_velocity = agent_enc.flow_decoder(
+                    road_hidden,
+                    flow_sample.x_t,
+                    flow_sample.tau,
+                    future_valid_mask=road_loss_mask,
+                )
+                total_loss = flow_matching_loss(
+                    pred_velocity,
+                    flow_sample.target,
+                    valid_mask=road_loss_mask,
+                )
+                if not total_loss.requires_grad:
+                    n_trainable = sum(
+                        int(param.numel())
+                        for param in agent_enc.flow_decoder.parameters()
+                        if param.requires_grad
+                    )
+                    velocity_head = getattr(agent_enc.flow_decoder, "velocity_head", None)
+                    head_param_requires_grad = False
+                    manual_head_requires_grad = False
+                    if velocity_head is not None:
+                        first_head_param = next(velocity_head.parameters(), None)
+                        head_param_requires_grad = bool(
+                            first_head_param is not None and first_head_param.requires_grad
+                        )
+                        head_net = getattr(velocity_head, "net", None)
+                        first_linear = head_net[0] if head_net is not None and len(head_net) > 0 else None
+                        in_features = int(getattr(first_linear, "in_features", road_hidden.shape[-1]))
+                        manual_token = torch.zeros(
+                            (1, 1, in_features),
+                            device=road_hidden.device,
+                            dtype=road_hidden.dtype,
+                        )
+                        manual_head_requires_grad = bool(velocity_head(manual_token).requires_grad)
+                    raise RuntimeError(
+                        "road_ft loss is not connected to trainable flow_decoder parameters "
+                        f"(trainable_params={n_trainable:,}, "
+                        f"grad_enabled={torch.is_grad_enabled()}, "
+                        f"inference_mode={torch.is_inference_mode_enabled()}, "
+                        f"head_probe_before={head_probe_before_collection}, "
+                        f"head_probe_after={head_probe_after_collection}, "
+                        f"head_param_requires_grad={head_param_requires_grad}, "
+                        f"manual_head_requires_grad={manual_head_requires_grad}, "
+                        f"pred_requires_grad={pred_velocity.requires_grad})."
+                    )
+                pred_requires_grad = torch.tensor(
+                    float(pred_velocity.requires_grad),
+                    device=total_loss.device,
+                    dtype=total_loss.dtype,
+                )
+                loss_requires_grad = torch.tensor(
+                    float(total_loss.requires_grad),
+                    device=total_loss.device,
+                    dtype=total_loss.dtype,
+                )
+            n_targets = int(road_clean.shape[0])
+            mean_selected_distance = torch.cat(selected_distances, dim=0).float().mean()
+
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(
+                "Non-finite road_ft loss: "
+                f"{self._summarize_nonfinite_tensor(total_loss)}"
+            )
+
+        self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/road_ft/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log(
+            "train/road_ft/n_targets",
+            float(n_targets),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/road_ft/selected_distance",
+            mean_selected_distance.detach(),
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/road_ft/pred_requires_grad",
+            pred_requires_grad.detach(),
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+            batch_size=1,
+        )
+        self.log(
+            "train/road_ft/loss_requires_grad",
+            loss_requires_grad.detach(),
+            on_step=True,
+            on_epoch=False,
+            sync_dist=True,
+            batch_size=1,
+        )
+        return total_loss
 
     # ──────────────────────────────────────────────────────────────────────
     # OCSC (Open-Closed Self-Consistency) finetune mode — single anchor (0)
@@ -3944,6 +4733,8 @@ class SMARTFlow(LightningModule):
         """
         if self._is_ocsc_ft_enabled():
             return self._run_flow_ocsc_ft_step(data=data, batch_idx=batch_idx)
+        if self._is_road_ft_enabled():
+            return self._run_flow_road_ft_step(data=data, batch_idx=batch_idx)
         if self.self_forced_enabled:
             if self._is_self_forced_active():
                 return self._training_step_self_forced(data=data, batch_idx=batch_idx)
@@ -3998,7 +4789,7 @@ open_metric_dict:
         """DDP 전체에 target이 없는 automatic optimization step의 업데이트를 막습니다."""
         if not bool(getattr(self, "automatic_optimization", True)):
             return
-        if self._is_ocsc_ft_enabled():
+        if self._is_ocsc_ft_enabled() or self._is_road_ft_enabled():
             return
         has_open_loop_targets_global = bool(self._automatic_open_loop_has_target_since_step)
         has_open_loop_target_pending = getattr(
@@ -4044,11 +4835,19 @@ open_metric_dict:
                 anchor_mask_key="flow_eval_mask",
             )
             open_sample_count = int(denoise_pred["flow_clean_norm"].shape[0])
+            open_x_init_norm = self._get_validation_open_x_init_norm(
+                batch_idx=batch_idx,
+                num_valid_anchor=open_sample_count,
+                device=denoise_pred["anchor_hidden"].device,
+                dtype=denoise_pred["anchor_hidden"].dtype,
+                flow_state_dim=int(eval_generator.agent_encoder.flow_state_dim),
+            )
             open_pred_clean_norm = eval_generator.sample_open_loop_future(
                 anchor_hidden=denoise_pred["anchor_hidden"],
                 anchor_mask=denoise_pred["anchor_mask"],
                 sampling_scheme=self.validation_rollout_sampling,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
+                x_init_norm=open_x_init_norm,
             )
             open_pred_metric_norm = eval_generator.flow_norm_to_pose_metric_norm(
                 value=open_pred_clean_norm,
@@ -4216,6 +5015,8 @@ open_metric_dict:
             generator_optimizer = torch.optim.AdamW(
                 generator_params,
                 lr=self.lr,
+                betas=(self.self_forced_adam_beta1, self.self_forced_adam_beta2),
+                eps=self.self_forced_adam_eps,
                 weight_decay=self.weight_decay,
             )
             if self.self_forced_generated_estimator is None:
@@ -4228,6 +5029,8 @@ open_metric_dict:
             generated_estimator_optimizer = torch.optim.AdamW(
                 estimator_params,
                 lr=self.self_forced_estimator_lr,
+                betas=(self.self_forced_adam_beta1, self.self_forced_adam_beta2),
+                eps=self.self_forced_adam_eps,
                 weight_decay=self.weight_decay,
             )
             return [generator_optimizer, generated_estimator_optimizer]

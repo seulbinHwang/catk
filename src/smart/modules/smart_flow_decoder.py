@@ -243,6 +243,7 @@ class SMARTFlowDecoder(nn.Module):
         return_flow_2s_preview: bool = False,
         return_committed_control: bool = False,
         rollout_steps_2hz: int | None = None,
+        rollout_noise_tape: Tensor | None = None,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
@@ -254,6 +255,7 @@ class SMARTFlowDecoder(nn.Module):
             return_flow_2s_preview=return_flow_2s_preview,
             return_committed_control=return_committed_control,
             rollout_steps_2hz=rollout_steps_2hz,
+            rollout_noise_tape=rollout_noise_tape,
         )
 
     def training_rollout_from_cache(
@@ -269,6 +271,7 @@ class SMARTFlowDecoder(nn.Module):
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
         return_committed_control: bool = False,
+        rollout_noise_tape: Tensor | None = None,
     ) -> Dict[str, Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -297,6 +300,7 @@ class SMARTFlowDecoder(nn.Module):
             detach_block_transition=detach_block_transition,
             use_stop_motion=False,
             return_committed_control=return_committed_control,
+            rollout_noise_tape=rollout_noise_tape,
         )
 
     def path_flow_velocity_for_anchor0(
@@ -344,6 +348,7 @@ class SMARTFlowDecoder(nn.Module):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        x_init_norm: Tensor | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -365,6 +370,7 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            x_init_norm=x_init_norm,
         )
 
     def flow_norm_to_pose_metric_norm(

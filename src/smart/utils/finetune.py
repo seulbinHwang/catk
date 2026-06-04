@@ -65,6 +65,8 @@ class FinetuneConfig:
     mode: str = "ocsc_ft"
     # ── 공통 학습 토글 ─────────────────────────────────────────────────────────
     gradient_clip_val: float = 0.0
+    train_except_map_encoder: bool = False
+    train_full_flow_decoder_only: bool = False
     # ── BPTT 토글 (OCSC 에서 ODE solver / closed-loop rollout 제어) ────────────
     flow_velocity_head_only: bool = True
     # 학습 대상 module 선택 (flow_velocity_head_only 보다 우선 적용).
@@ -252,6 +254,8 @@ def parse_finetune_config(finetune: Any) -> FinetuneConfig:
         enabled=bool(_read_config_value(finetune, "enabled", True)),
         mode=str(_read_config_value(finetune, "mode", "ocsc_ft")),
         gradient_clip_val=float(_read_config_value(finetune, "gradient_clip_val", 0.0)),
+        train_except_map_encoder=bool(_read_config_value(finetune, "train_except_map_encoder", False)),
+        train_full_flow_decoder_only=bool(_read_config_value(finetune, "train_full_flow_decoder_only", False)),
         flow_velocity_head_only=bool(_read_config_value(finetune, "flow_velocity_head_only", True)),
         flow_ft_target=str(_read_config_value(finetune, "flow_ft_target", "default")),
         bptt_use_adjoint=bool(_read_config_value(finetune, "bptt_use_adjoint", False)),
@@ -404,6 +408,21 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
         )
 
     # ── OCSC / RoaD: 전체 모델 freeze 후 flow_decoder 만 unfreeze ────────────
+    _target = str(getattr(config, "flow_ft_target", "default")).lower()
+    if bool(config.train_except_map_encoder) or _target == "except_map_encoder":
+        _set_requires_grad(model, True)
+        _set_requires_grad(getattr(model, "map_encoder", None), False)
+        if residual_head is not None:
+            for p in residual_head.parameters():
+                p.data.zero_()
+            _set_requires_grad(residual_head, False)
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        log.info(
+            "Finetuning mode: all non-map parameters trainable "
+            f"({n_trainable:,} params); map_encoder frozen."
+        )
+        return config
+
     _set_requires_grad(model, False)
     try:
         flow_decoder = model.agent_encoder.flow_decoder
@@ -415,7 +434,8 @@ def set_model_for_finetuning(model: torch.nn.Module, finetune: Any) -> FinetuneC
 
     # ── flow_ft_target 우선 적용 ────────────────────────────────────────────
     # "default" 면 기존 flow_velocity_head_only 분기로 fallback.
-    _target = str(getattr(config, "flow_ft_target", "default")).lower()
+    if bool(config.train_full_flow_decoder_only) and _target == "default":
+        _target = "full"
     if _target == "step_refiner_and_velocity_head":
         try:
             velocity_head = flow_decoder.velocity_head

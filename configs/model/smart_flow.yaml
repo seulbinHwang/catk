@@ -33,6 +33,7 @@ model_config:
   val_closed_loop: true
   validation_open_seed: 0
   validation_closed_seed: 0
+  validation_fixed_flow_noise: true
   token_processor:
     map_token_file: "map_traj_token5.pkl"
     agent_token_file: "agent_vocab_555_s2.pkl"
@@ -80,6 +81,10 @@ model_config:
     # Stop-motion gate는 전 경로에서 사용하지 않습니다. 값은 false로 고정합니다.
     use_stop_motion: false
     estimator_updates_per_step: 5
+    # AdamW settings for both generator and generated-estimator optimizers.
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
     estimator_warmup_epochs: 1
     initialize_aux_from_generator_on_fit_start: true
     unfrozen_range: except_map_encoder
@@ -189,3 +194,17 @@ model_config:
     ocsc_strict_active_mask: true       # loss horizon 전체 valid agent 만 OCSC 학습
     ocsc_position_weight: 1.0           # pos L2 weight
     ocsc_heading_weight: 0.01           # heading (cos/sin) L2 weight
+    # ── RoaD (Rollouts as Demonstrations) CL-SFT mode ─────────────────────
+    # mode="road_ft" 이고 enabled=true 이면 Sample-K expert-guided rollout 으로
+    # 선택한 policy sample 을 demonstration target 으로 flow-matching BC 합니다.
+    flow_velocity_head_only: true       # road_ft/ocsc_ft scope handler 기준 이름
+    road_sample_k: 64                   # K — candidate trajectory samples per CL step
+    road_n_rollouts: 1                  # RoaD rollout count per scenario
+    road_pred_max_steps: 16             # 2Hz closed-loop steps, 16 = 8s WOSAC horizon
+    road_temperature: 0.8               # candidate noise scale
+    road_position_weight: 1.0           # Eq.6 position distance weight
+    road_heading_weight: 0.1            # Eq.6 heading distance weight
+    road_comparison_horizon: 20         # fine 10Hz steps, 20 = 2s
+    road_strict_active_mask: true       # require valid GT over comparison horizon
+    road_eval_hard_rmm: false
+    road_eval_hard_rmm_interval: 10

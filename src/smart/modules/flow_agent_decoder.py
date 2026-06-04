@@ -514,6 +514,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        x_init_norm: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -532,19 +533,33 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         if anchor_hidden_valid.numel() == 0:
             return anchor_hidden_valid.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
 
-        generator = None
-        if sampling_seed is not None:
-            generator = torch.Generator(device=anchor_hidden_valid.device)
-            generator.manual_seed(int(sampling_seed))
-
-        x_init_norm = torch.randn(
+        expected_shape = (
             anchor_hidden_valid.shape[0],
             self.flow_window_steps,
             self.flow_state_dim,
-            device=anchor_hidden_valid.device,
-            dtype=anchor_hidden_valid.dtype,
-            generator=generator,
-        ) * getattr(sampling_scheme, "noise_scale", 1.0)
+        )
+        if x_init_norm is None:
+            generator = None
+            if sampling_seed is not None:
+                generator = torch.Generator(device=anchor_hidden_valid.device)
+                generator.manual_seed(int(sampling_seed))
+
+            x_init_norm = torch.randn(
+                *expected_shape,
+                device=anchor_hidden_valid.device,
+                dtype=anchor_hidden_valid.dtype,
+                generator=generator,
+            ) * getattr(sampling_scheme, "noise_scale", 1.0)
+        elif tuple(x_init_norm.shape) != expected_shape:
+            raise ValueError(
+                "x_init_norm shape must match packed open-loop anchors: "
+                f"expected {expected_shape}, got {tuple(x_init_norm.shape)}."
+            )
+        else:
+            x_init_norm = x_init_norm.to(
+                device=anchor_hidden_valid.device,
+                dtype=anchor_hidden_valid.dtype,
+            )
         flow_sample_steps = getattr(
             sampling_scheme,
             "sample_steps",
@@ -573,6 +588,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        x_init_norm: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
@@ -596,6 +612,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            x_init_norm=x_init_norm,
         )
 
 
@@ -1323,6 +1340,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
+        rollout_noise_tape: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -1426,16 +1444,26 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 device=pos_window.device,
             )
         sample_window_steps = self.flow_window_steps
-        rollout_noise_tape = self._build_rollout_noise_tape(
-            num_agent=n_agent,
-            tape_steps=n_step_future_10hz + sample_window_steps - self.shift,
-            device=feat_a_now.device,
-            dtype=feat_a_now.dtype,
-            sampling_scheme=sampling_scheme,
-            sampling_seed=sampling_seed,
-            scenario_sampling_seeds=scenario_sampling_seeds,
-            agent_batch=tokenized_agent["batch"],
-        )
+        tape_steps = n_step_future_10hz + sample_window_steps - self.shift
+        if rollout_noise_tape is None:
+            rollout_noise_tape = self._build_rollout_noise_tape(
+                num_agent=n_agent,
+                tape_steps=tape_steps,
+                device=feat_a_now.device,
+                dtype=feat_a_now.dtype,
+                sampling_scheme=sampling_scheme,
+                sampling_seed=sampling_seed,
+                scenario_sampling_seeds=scenario_sampling_seeds,
+                agent_batch=tokenized_agent["batch"],
+            )
+        elif tuple(rollout_noise_tape.shape) != (n_agent, tape_steps, self.flow_state_dim):
+            raise ValueError(
+                "rollout_noise_tape shape must match rollout cache: "
+                f"expected {(n_agent, tape_steps, self.flow_state_dim)}, "
+                f"got {tuple(rollout_noise_tape.shape)}."
+            )
+        else:
+            rollout_noise_tape = rollout_noise_tape.to(device=feat_a_now.device, dtype=feat_a_now.dtype)
         terminal_steps_by_scenario = None
         terminal_s_by_scenario = None
         random_terminal_cfg = getattr(sampling_scheme, "random_terminal_step", None)
@@ -1894,6 +1922,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         return_flow_2s_preview: bool = False,
         return_committed_control: bool = False,
         rollout_steps_2hz: int | None = None,
+        rollout_noise_tape: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """평가와 제출에서 no-gradient closed-loop rollout을 실행합니다.
 
@@ -1920,6 +1949,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             return_flow_2s_preview=return_flow_2s_preview,
             return_committed_control=return_committed_control,
             rollout_steps_2hz=rollout_steps_2hz,
+            rollout_noise_tape=rollout_noise_tape,
         )
 
     def training_rollout_from_cache(
@@ -1935,6 +1965,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
         return_committed_control: bool = False,
+        rollout_noise_tape: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -1968,6 +1999,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
             use_stop_motion=use_stop_motion,
+            rollout_noise_tape=rollout_noise_tape,
         )
 
     def path_flow_velocity_for_anchor0(

@@ -1,0 +1,75 @@
+# @package _global_
+
+# RoaD (Rollouts as Demonstrations) fine-tuning experiment.
+# finetune.mode=road_ft + enabled=true makes training_step run Sample-K
+# expert-guided closed-loop SFT:
+#   K policy samples per closed-loop step -> choose closest to GT continuation
+#   -> commit selected sample -> train flow decoder with FM/BC on selected samples.
+
+defaults:
+  - override /model: smart_flow
+  - override /trainer: ddp
+
+action: finetune
+ckpt_path: null
+
+model:
+  model_config:
+    lr: 1.0e-6
+    weight_decay: 1.0e-4
+    lr_warmup_steps: 0
+    lr_total_steps: ${trainer.max_epochs}
+    lr_min_ratio: 1.0
+    n_rollout_closed_val: 16
+    n_batch_sim_agents_metric: 100000
+    sim_agents_metric_workers: 8
+    n_vis_batch: 0
+    n_vis_scenario: 0
+    n_vis_rollout: 0
+    self_forced:
+      enabled: false
+    finetune:
+      enabled: true
+      mode: road_ft
+      flow_velocity_head_only: true
+      flow_ft_target: velocity_head
+      road_sample_k: 64
+      road_n_rollouts: 1
+      road_pred_max_steps: 16
+      road_temperature: 0.8
+      road_position_weight: 1.0
+      road_heading_weight: 0.1
+      road_comparison_horizon: 20
+      road_strict_active_mask: true
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  val_check_interval: 200
+  check_val_every_n_epoch: null
+  max_epochs: 16
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  sync_batchnorm: false
+  num_sanity_val_steps: 0
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+    save_last: true
+    save_top_k: 1
+
+data:
+  train_batch_size: 8
+  val_batch_size: 16
+  test_batch_size: 16
+  num_workers: 4
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
+  train_epoch_sample_fraction: 0.5
+
+logger:
+  wandb:
+    project: clsft-catk
+    entity: se99an
