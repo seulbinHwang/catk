@@ -27,7 +27,7 @@ DEFAULT_CACHE_ROOT_BY_POD = {
     "testaa": "/workspace/womd_v1_3/SMART_cache",
 }
 STRICT_A100_EXPERIMENT = "pre_bc_a100x4x2"
-MAX_A100_TRAIN_BATCH_SIZE = 24
+MAX_A100_TRAIN_BATCH_SIZE = int(os.environ.get("A100_MAX_TRAIN_BATCH_SIZE", "24"))
 STRICT_ACCUMULATE_GRAD_BATCHES = "1"
 
 
@@ -202,6 +202,7 @@ def render_env_file(
             "CATK_SUBMISSION_SHARD_STREAM_PORT",
             "",
         ),
+        "A100_MAX_TRAIN_BATCH_SIZE": os.environ.get("A100_MAX_TRAIN_BATCH_SIZE", ""),
     }
     for name, value in optional_env.items():
         if value not in (None, ""):

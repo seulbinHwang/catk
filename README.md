@@ -297,6 +297,76 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, `validation_rollout_sampling=(topk_prob, num_k=12, temp=1.0)`, every 16 epochs |
 | distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=false` |
 
+#### TrajTok testas A100x7 OOM-retry pretrain
+
+`trajtok` 브랜치의 TrajTok recipe를 단일 `testas` pod의 A100 7장에서 실행하려면
+아래 wrapper를 사용한다. 이 wrapper는 기존 A100 OOM-retry launcher를 재사용하되,
+`testas`의 7개 local rank에 맞춰 batch/LR/sampler 설정을 고정한다.
+
+```bash
+bash scripts/start_smart_ntp_testas_a100x7_trajtok_pretrain_oom_retry.sh
+```
+
+기본값 기준 실행되는 실험은 아래와 같다.
+
+| 항목 | 값 |
+|---|---|
+| branch | `trajtok` |
+| pod / GPU | `testas`, A100 80GB 7장 |
+| total DDP ranks | 7 |
+| task name | `trajtok_pretrain_testas_a100x7_gbs126_lr595e4_oom_retry_20260605` |
+| remote project root | `/tmp/catk_smart_ntp_testas_a100x7_trajtok_20260605` |
+| experiment | `pre_bc_a100x4x2` |
+| cache root | `/workspace/womd_v1_3/SMART_cache` |
+| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, full 0.5초 future contour token matching, spatial-aware smoothing |
+| decoder | `hidden_dim=128`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
+| train batch | `INITIAL_BS=18` per rank, effective global batch 126 |
+| OOM retry | `MIN_BS=14`, `OOM_STEP=2`, latest task checkpoint resume (`18 -> 16 -> 14`); retry attempt마다 LR도 현재 global batch 기준으로 재계산 |
+| validation/test batch | `VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12` |
+| optimizer schedule | `LEARNING_RATE=auto`; `BASE_LEARNING_RATE=6e-4`, `BASE_TOTAL_BATCH_SIZE=128` 기준 sqrt scaling. `bs=18`, 7 ranks에서는 `lr=5.9529404e-4` |
+| precision / grad accumulation | `bf16-mixed`, `accumulate_grad_batches=1` |
+| agent selection | `data.train_use_eval_agent_selection=false` |
+| train sampler | `data.train_memory_balanced_batching=true` |
+| validation | open-loop + closed-loop, `scorer_scene_num=1680`, `validation_rollout_sampling=(topk_prob, num_k=12, temp=1.0)`, every 16 epochs |
+| distributed strategy | DDP, `find_unused_parameters=false` |
+
+2026-06-05에 `testas` A100 7장에서 실제 SMART cache로 train batch size를 다시 탐색했다.
+`bs=34/30/26/24/22/21`은 5-200 train-batch probe 중 CUDA OOM이 발생했고,
+`bs=18`은 200/200 train batches를 OOM 없이 완료했다. 따라서 testas A100x7의
+보수적 시작값은 `INITIAL_BS=18`이다.
+
+| per-GPU batch | effective global batch | LR | probe 결과 |
+|---:|---:|---:|---|
+| 34 | 238 | `8.1815341e-4` | 5-batch probe 중 CUDA OOM |
+| 30 | 210 | `7.6852131e-4` | 5-batch probe 중 CUDA OOM |
+| 26 | 182 | `7.1545440e-4` | 5-batch probe 중 CUDA OOM |
+| 24 | 168 | `6.8738635e-4` | 20-batch probe 중 CUDA OOM |
+| 22 | 154 | `6.5812233e-4` | 20-batch probe 중 CUDA OOM |
+| 21 | 147 | `6.4299106e-4` | 50-batch probe 중 CUDA OOM |
+| 20 | 140 | `6.2749502e-4` | 50-batch probe 통과 후 200-batch probe 59/200에서 CUDA OOM |
+| 18 | 126 | `5.9529404e-4` | 200/200 train batches 정상 종료 |
+
+같은 testas A100x7 경로에서 `bs=18`, 1 train batch + 1 validation batch smoke도 확인했다.
+`trainer.check_val_every_n_epoch=1`, `scorer_scene_num=84`, `validation_rollout_sampling.num_k=1`
+축소 조건에서 train step, open-loop validation, closed-loop Fast WOSAC/CPD/CES logging이
+정상 종료했고 `run.py DONE`, exit status `0`을 확인했다.
+
+smoke test나 batch 조정은 환경 변수로만 바꾼다.
+
+```bash
+LIMIT_TRAIN_BATCHES=1 LIMIT_VAL_BATCHES=1 MAX_EPOCHS=1 \
+TASK_NAME=trajtok_pretrain_testas_a100x7_smoke \
+SESSION=catk-smart-ntp-testas-a100x7-trajtok-smoke \
+bash scripts/start_smart_ntp_testas_a100x7_trajtok_pretrain_oom_retry.sh
+```
+
+실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- tmux attach -t catk-smart-ntp-testas-a100x7-trajtok
+STOP=1 bash scripts/start_smart_ntp_testas_a100x7_trajtok_pretrain_oom_retry.sh
+```
+
 TrajTok agent target은 논문 의도에 맞춰 마지막 endpoint 하나가 아니라 현재 시점을 제외한
 0.5초 미래 5-frame box contour 전체로 고른다. 각 coarse step에서 raw GT 미래 segment를
 직전 tokenized pose 기준 local frame으로 변환하고, vocab token의 `[5, 4, 2]` future
@@ -507,8 +577,10 @@ build 중 pod가 죽어 `.lock` 파일만 남은 경우에는 lock heartbeat가 
 
 이 launcher와 내부 실행 스크립트는 `pre_bc_a100x4x2` fit 실행에서
 `trainer.accumulate_grad_batches=1`을 강제하고, `data.train_batch_size`는 A100 80GB에서
-검증할 수 있는 범위인 `24` 이하의 양의 정수만 허용한다. `--accumulate-grad-batches 2`처럼
-gradient accumulation을 켜는 override는 학습을 시작하기 전에 실패한다.
+기본 `A100_MAX_TRAIN_BATCH_SIZE=24` 이하의 양의 정수만 허용한다. testas A100x7처럼
+별도 probe로 더 큰 범위를 검증한 preset은 이 값을 환경 변수로 높여 사용한다.
+`--accumulate-grad-batches 2`처럼 gradient accumulation을 켜는 override는 학습을
+시작하기 전에 실패한다.
 
 `main@f5020bc`, `testa/testaa`, A100 4장 x 2 pod, validation off,
 `CATK_ATTENTION_GRAPH_FP32=1`, `data.train_use_eval_agent_selection=false` 조건에서

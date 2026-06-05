@@ -34,6 +34,9 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 INITIAL_BS="${INITIAL_BS:-16}"
 OOM_STEP="${OOM_STEP:-1}"
 MIN_BS="${MIN_BS:-8}"
+TOTAL_GPU_COUNT="${TOTAL_GPU_COUNT:-}"
+BASE_TOTAL_BATCH_SIZE="${BASE_TOTAL_BATCH_SIZE:-128}"
+BASE_LEARNING_RATE="${BASE_LEARNING_RATE:-6e-4}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 MAX_NON_OOM_RETRIES="${MAX_NON_OOM_RETRIES:-2}"
 RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-134,143}"
@@ -45,6 +48,9 @@ MAX_EPOCHS="${MAX_EPOCHS:-}"
 LEARNING_RATE="${LEARNING_RATE:-}"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 DRY_RUN="${DRY_RUN:-0}"
+STOP="${STOP:-0}"
+START_ONLY="${START_ONLY:-0}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 read -r -a POD_ARRAY <<< "$PODS"
 if (( ${#POD_ARRAY[@]} < 1 )); then
@@ -63,6 +69,17 @@ if (( INITIAL_BS < 1 || OOM_STEP < 1 || MIN_BS < 1 )); then
 fi
 if (( INITIAL_BS < MIN_BS )); then
   echo "ERROR: INITIAL_BS=${INITIAL_BS} is below MIN_BS=${MIN_BS}." >&2
+  exit 2
+fi
+if [[ -z "$TOTAL_GPU_COUNT" ]]; then
+  TOTAL_GPU_COUNT=$(( ${#POD_ARRAY[@]} * NPROC_PER_NODE ))
+fi
+if ! [[ "$TOTAL_GPU_COUNT" =~ ^[0-9]+$ && "$BASE_TOTAL_BATCH_SIZE" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: TOTAL_GPU_COUNT and BASE_TOTAL_BATCH_SIZE must be integers." >&2
+  exit 2
+fi
+if (( TOTAL_GPU_COUNT < 1 || BASE_TOTAL_BATCH_SIZE < 1 )); then
+  echo "ERROR: TOTAL_GPU_COUNT and BASE_TOTAL_BATCH_SIZE must be >= 1." >&2
   exit 2
 fi
 
@@ -131,6 +148,28 @@ remote_master_tmux_log() {
   remote_tmux_log_for_pod "$MASTER_POD"
 }
 
+resolve_learning_rate() {
+  local bs="$1"
+  if [[ -z "$LEARNING_RATE" ]]; then
+    return 0
+  fi
+  if [[ "$LEARNING_RATE" != "auto" ]]; then
+    printf '%s\n' "$LEARNING_RATE"
+    return 0
+  fi
+  "$PYTHON_BIN" - "$BASE_LEARNING_RATE" "$BASE_TOTAL_BATCH_SIZE" "$TOTAL_GPU_COUNT" "$bs" <<'PY'
+import math
+import sys
+
+base_lr = float(sys.argv[1])
+base_total_batch = int(sys.argv[2])
+total_gpu_count = int(sys.argv[3])
+per_rank_batch = int(sys.argv[4])
+total_batch = total_gpu_count * per_rank_batch
+print(f"{base_lr * math.sqrt(total_batch / base_total_batch):.8g}")
+PY
+}
+
 is_retryable_non_oom_exit() {
   local status="$1"
   local code
@@ -155,7 +194,7 @@ find_latest_epoch_last_ckpt() {
 
 stop_attempt_sessions() {
   local -a cmd=(
-    python scripts/launch_smart_ntp_a100x4x2_testa.py
+    "$PYTHON_BIN" scripts/launch_smart_ntp_a100x4x2_testa.py
     --namespace "$NAMESPACE"
     --pods "${POD_ARRAY[@]}"
     --container "$CONTAINER"
@@ -180,8 +219,15 @@ start_attempt() {
   local ckpt_path="$2"
   local val_bs="$VAL_BATCH_SIZE"
   local test_bs="$TEST_BATCH_SIZE"
+  local attempt_lr
+  attempt_lr="$(resolve_learning_rate "$bs")"
+  if [[ -n "$attempt_lr" ]]; then
+    log "  effective global batch=$((bs * TOTAL_GPU_COUNT)), lr=${attempt_lr} (sqrt scaling from batch ${BASE_TOTAL_BATCH_SIZE}, lr ${BASE_LEARNING_RATE})"
+  else
+    log "  effective global batch=$((bs * TOTAL_GPU_COUNT)), lr=config-default"
+  fi
   local -a cmd=(
-    python scripts/launch_smart_ntp_a100x4x2_testa.py
+    "$PYTHON_BIN" scripts/launch_smart_ntp_a100x4x2_testa.py
     --namespace "$NAMESPACE"
     --pods "${POD_ARRAY[@]}"
     --container "$CONTAINER"
@@ -226,8 +272,8 @@ start_attempt() {
   if [[ -n "$MAX_EPOCHS" ]]; then
     cmd+=(--max-epochs "$MAX_EPOCHS")
   fi
-  if [[ -n "$LEARNING_RATE" ]]; then
-    cmd+=(--learning-rate "$LEARNING_RATE")
+  if [[ -n "$attempt_lr" ]]; then
+    cmd+=(--learning-rate "$attempt_lr")
   fi
   if [[ -n "$EXTRA_HYDRA_OVERRIDES" ]]; then
     cmd+=(--extra-hydra-overrides "$EXTRA_HYDRA_OVERRIDES")
@@ -308,6 +354,12 @@ bs="$INITIAL_BS"
 attempt=0
 non_oom_retry_count=0
 
+if [[ "$STOP" == "1" ]]; then
+  stop_attempt_sessions
+  log "STOP=1 requested; stopped matching tmux sessions and task processes."
+  exit 0
+fi
+
 prepare_project_root
 
 while (( bs >= MIN_BS )); do
@@ -326,6 +378,10 @@ while (( bs >= MIN_BS )); do
   if ! start_attempt "$bs" "$latest_ckpt"; then
     log "launcher failed before torchrun completed."
     exit 1
+  fi
+  if [[ "$START_ONLY" == "1" ]]; then
+    log "START_ONLY=1 requested; leaving remote tmux session running."
+    exit 0
   fi
   if [[ "$DRY_RUN" == "1" ]]; then
     log "dry-run completed after rendering the first attempt."

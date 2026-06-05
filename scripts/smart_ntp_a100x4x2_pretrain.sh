@@ -85,7 +85,11 @@ validate_strict_a100_pretrain_overrides() {
     return 0
   fi
 
-  local max_train_batch_size=24
+  local max_train_batch_size="${A100_MAX_TRAIN_BATCH_SIZE:-24}"
+  if ! [[ "$max_train_batch_size" =~ ^[0-9]+$ ]] || (( max_train_batch_size < 1 )); then
+    log "ERROR: A100_MAX_TRAIN_BATCH_SIZE must be a positive integer; got ${max_train_batch_size}."
+    exit 2
+  fi
   if [[ -n "${TRAIN_BATCH_SIZE:-}" ]]; then
     if ! [[ "$TRAIN_BATCH_SIZE" =~ ^[0-9]+$ ]] || (( TRAIN_BATCH_SIZE < 1 || TRAIN_BATCH_SIZE > max_train_batch_size )); then
       log "ERROR: pre_bc_a100x4x2 must use train_batch_size in [1, ${max_train_batch_size}]; got TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}."
