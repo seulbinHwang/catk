@@ -17,6 +17,7 @@ def _make_minimal_model() -> SMARTFlow:
         "yaw_ade": "yaw_ADE2s",
         "yaw_fde": "yaw_FDE2s",
     }
+    model._automatic_open_loop_has_target_pending = []
     model._build_open_loop_metric_dict = lambda **_: {
         "ADE2s": torch.zeros(()),
         "FDE2s": torch.zeros(()),
@@ -97,6 +98,7 @@ def test_empty_local_target_keeps_grad_when_another_rank_has_target() -> None:
     model._automatic_open_loop_has_target_since_step = False
     model._skip_next_automatic_optimizer_step = False
     model._sync_distributed_bool_any = lambda value, *, device=None: True  # type: ignore[method-assign]
+    model._automatic_open_loop_has_target_pending = [(torch.tensor(1, dtype=torch.long), None)]
 
     loss = model._build_trainable_connected_zero_loss(model.encoder)
     loss.backward()

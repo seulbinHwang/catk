@@ -137,6 +137,60 @@ def mdg_state_loss(
     )
 
 
+def auxiliary_best_mode_trajectory_loss(
+    pred_local: torch.Tensor,
+    target_local: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Best-mode 20-step auxiliary trajectory loss.
+
+    Mode selection uses local xy L2 only. The selected mode receives Smooth L1
+    supervision over local x, local y, and wrapped heading delta.
+    """
+    if pred_local.ndim != 4 or pred_local.shape[-1] != 3:
+        raise ValueError(
+            "pred_local must have shape [n_anchor, n_mode, n_future, 3], "
+            f"got {tuple(pred_local.shape)}."
+        )
+    if target_local.ndim != 3 or target_local.shape[-1] != 3:
+        raise ValueError(
+            "target_local must have shape [n_anchor, n_future, 3], "
+            f"got {tuple(target_local.shape)}."
+        )
+    if tuple(pred_local.shape[:1] + pred_local.shape[2:3]) != tuple(target_local.shape[:2]):
+        raise ValueError(
+            "pred_local and target_local anchor/future dimensions must match: "
+            f"pred={tuple(pred_local.shape)}, target={tuple(target_local.shape)}."
+        )
+    mask = _validate_future_mask(value=target_local, valid_mask=valid_mask)
+    if mask is None:
+        raise ValueError("valid_mask is required for auxiliary trajectory loss.")
+    if pred_local.numel() == 0:
+        return pred_local.sum() * 0.0
+
+    mask_float = mask.to(dtype=pred_local.dtype)
+    valid_count = mask_float.sum(dim=-1).clamp_min(1.0)
+    row_valid = mask.any(dim=-1).to(dtype=pred_local.dtype)
+    xy_error_sq = (pred_local[..., :2] - target_local[:, None, :, :2]).square().sum(dim=-1)
+    mode_distance = (xy_error_sq * mask_float[:, None, :]).sum(dim=-1)
+    mode_distance = mode_distance / valid_count[:, None]
+    best_mode = mode_distance.argmin(dim=1)
+
+    row_index = torch.arange(pred_local.shape[0], device=pred_local.device)
+    selected = pred_local[row_index, best_mode]
+    error = selected - target_local
+    error = error.clone()
+    error[..., 2] = wrap_angle(error[..., 2])
+    smooth_l1 = F.smooth_l1_loss(
+        error,
+        torch.zeros_like(error),
+        reduction="none",
+    ).sum(dim=-1)
+
+    per_row_loss = (smooth_l1 * mask_float).sum(dim=-1) / valid_count
+    return (per_row_loss * row_valid).sum() / row_valid.sum().clamp_min(1.0)
+
+
 def ade_future(
     pred_clean_norm: torch.Tensor,
     target_clean_norm: torch.Tensor,

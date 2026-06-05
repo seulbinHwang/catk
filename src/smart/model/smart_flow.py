@@ -25,6 +25,7 @@ from src.smart.metrics import (
 from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_future,
+    auxiliary_best_mode_trajectory_loss,
     fde_future,
     mdg_state_loss,
     yaw_ade_future,
@@ -125,6 +126,59 @@ class SMARTFlow(LightningModule):
             **decoder_config,
             n_token_agent=self.token_processor.n_token_agent,
         )
+        aux_trajectory_config = getattr(model_config, "aux_trajectory", None)
+        self.aux_trajectory_enabled = (
+            bool(getattr(aux_trajectory_config, "enabled", True))
+            if aux_trajectory_config is not None
+            else True
+        )
+        self.aux_trajectory_weight = (
+            float(getattr(aux_trajectory_config, "weight", 5.0))
+            if aux_trajectory_config is not None
+            else 5.0
+        )
+        self.aux_trajectory_num_modes = (
+            int(getattr(aux_trajectory_config, "num_modes", 6))
+            if aux_trajectory_config is not None
+            else 6
+        )
+        self.aux_trajectory_steps = (
+            int(getattr(aux_trajectory_config, "num_steps", self.flow_window_steps))
+            if aux_trajectory_config is not None
+            else self.flow_window_steps
+        )
+        self.aux_trajectory_dim = (
+            int(getattr(aux_trajectory_config, "output_dim", 3))
+            if aux_trajectory_config is not None
+            else 3
+        )
+        if self.aux_trajectory_enabled:
+            if self.aux_trajectory_steps != self.flow_window_steps:
+                raise ValueError(
+                    "semi_mdg auxiliary trajectory length must match flow_window_steps, "
+                    f"got aux={self.aux_trajectory_steps}, flow={self.flow_window_steps}."
+                )
+            if self.aux_trajectory_dim != 3:
+                raise ValueError(
+                    "semi_mdg auxiliary trajectory output_dim must be 3 "
+                    "[local_x, local_y, delta_heading]."
+                )
+            if self.aux_trajectory_num_modes <= 0:
+                raise ValueError("aux_trajectory.num_modes must be positive.")
+            hidden_dim = int(model_config.decoder.hidden_dim)
+            self.aux_trajectory_head = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(
+                    hidden_dim,
+                    self.aux_trajectory_num_modes
+                    * self.aux_trajectory_steps
+                    * self.aux_trajectory_dim,
+                ),
+            )
+        else:
+            self.aux_trajectory_head = None
         if self.flow_window_steps != int(self.token_processor.flow_window_steps):
             raise ValueError(
                 "decoder.flow_window_steps and token_processor.flow_window_steps must match, "
@@ -197,6 +251,7 @@ class SMARTFlow(LightningModule):
         self._train_open_epoch_log_names = (
             "train/loss",
             "train/loss_mdg",
+            "train/loss_aux",
             f"train/{self.train_open_metric_names['ade']}",
             f"train/{self.train_open_metric_names['fde']}",
             f"train/{self.train_open_metric_names['yaw_ade']}",
@@ -706,6 +761,66 @@ class SMARTFlow(LightningModule):
         return zero_loss
 
     @staticmethod
+    def _build_aux_trajectory_target(flow_clean_metric_norm: Tensor) -> Tensor:
+        """20-step pose metric target을 local meter + radian heading target으로 바꿉니다."""
+        if flow_clean_metric_norm.ndim != 3 or flow_clean_metric_norm.shape[-1] != 4:
+            raise ValueError(
+                "flow_clean_metric_norm must have shape [n_anchor, n_future, 4], "
+                f"got {tuple(flow_clean_metric_norm.shape)}."
+            )
+        xy_meter = flow_clean_metric_norm[..., :2] * 20.0
+        delta_heading = torch.atan2(
+            flow_clean_metric_norm[..., 3],
+            flow_clean_metric_norm[..., 2],
+        )
+        return torch.cat([xy_meter, delta_heading.unsqueeze(-1)], dim=-1)
+
+    def _aux_trajectory_loss(
+        self,
+        pred_dict: Dict[str, Tensor],
+    ) -> tuple[Tensor, bool]:
+        """Anchor context에서 바로 20-step best-mode auxiliary loss를 계산합니다."""
+        if not self.aux_trajectory_enabled:
+            return pred_dict["flow_clean_norm"].new_zeros(()), False
+        if self.aux_trajectory_head is None:
+            raise RuntimeError("aux_trajectory is enabled but aux_trajectory_head is missing.")
+        anchor_hidden = pred_dict.get("anchor_hidden_valid")
+        metric_target = pred_dict.get("flow_clean_metric_norm")
+        valid_mask = pred_dict.get("flow_loss_mask")
+        has_targets = (
+            isinstance(anchor_hidden, Tensor)
+            and isinstance(metric_target, Tensor)
+            and isinstance(valid_mask, Tensor)
+            and anchor_hidden.numel() > 0
+        )
+        if not has_targets:
+            return self._build_trainable_connected_zero_loss(self.aux_trajectory_head), False
+
+        target_local = self._build_aux_trajectory_target(
+            metric_target.to(device=anchor_hidden.device, dtype=anchor_hidden.dtype)
+        )
+        valid_mask = valid_mask.to(device=anchor_hidden.device, dtype=torch.bool)
+        if tuple(anchor_hidden.shape[:1]) != tuple(target_local.shape[:1]):
+            raise ValueError(
+                "anchor_hidden_valid and auxiliary target row count must match: "
+                f"hidden={tuple(anchor_hidden.shape)}, target={tuple(target_local.shape)}."
+            )
+
+        pred_local = self.aux_trajectory_head(anchor_hidden)
+        pred_local = pred_local.view(
+            anchor_hidden.shape[0],
+            self.aux_trajectory_num_modes,
+            self.aux_trajectory_steps,
+            self.aux_trajectory_dim,
+        )
+        loss = auxiliary_best_mode_trajectory_loss(
+            pred_local=pred_local,
+            target_local=target_local,
+            valid_mask=valid_mask,
+        )
+        return loss, True
+
+    @staticmethod
     def _first_parameter_device(module: nn.Module) -> torch.device:
         """module 안 첫 parameter device를 반환합니다."""
         for param in module.parameters():
@@ -774,6 +889,7 @@ class SMARTFlow(LightningModule):
         *,
         total_loss: Tensor,
         mdg_loss: Tensor,
+        aux_loss: Tensor,
         open_metric_dict: Dict[str, Tensor],
         sample_count: int,
     ) -> None:
@@ -789,6 +905,7 @@ class SMARTFlow(LightningModule):
         values = [
             total_loss.detach(),
             mdg_loss.detach(),
+            aux_loss.detach(),
             open_metric_dict[self.open_metric_names["ade"]].detach(),
             open_metric_dict[self.open_metric_names["fde"]].detach(),
             open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
@@ -2710,10 +2827,12 @@ class SMARTFlow(LightningModule):
             pred,
             zero_loss_module=self.encoder,
         )
-        total_loss = mdg_loss
+        aux_loss, _ = self._aux_trajectory_loss(pred)
+        total_loss = mdg_loss + self.aux_trajectory_weight * aux_loss
         self._accumulate_open_loop_train_epoch_metrics(
             total_loss=total_loss,
             mdg_loss=mdg_loss,
+            aux_loss=aux_loss,
             open_metric_dict=open_metric_dict,
             sample_count=sample_count,
         )
@@ -2995,9 +3114,12 @@ open_metric_dict:
             pred,
             zero_loss_module=self,
         )
-        total_loss = mdg_loss
+        aux_loss, _ = self._aux_trajectory_loss(pred)
+        total_loss = mdg_loss + self.aux_trajectory_weight * aux_loss
         if not torch.isfinite(mdg_loss):
             raise RuntimeError(f"Non-finite mdg_loss detected: {self._summarize_nonfinite_tensor(mdg_loss)}")
+        if not torch.isfinite(aux_loss):
+            raise RuntimeError(f"Non-finite aux_loss detected: {self._summarize_nonfinite_tensor(aux_loss)}")
         if not torch.isfinite(total_loss):
             raise RuntimeError(
                 "Non-finite total_loss detected: "
@@ -3007,6 +3129,7 @@ open_metric_dict:
         self._accumulate_open_loop_train_epoch_metrics(
             total_loss=total_loss,
             mdg_loss=mdg_loss,
+            aux_loss=aux_loss,
             open_metric_dict=open_metric_dict,
             sample_count=sample_count,
         )

@@ -86,6 +86,34 @@ def _is_self_forced_auxiliary_key(key: str) -> bool:
     )
 
 
+def _is_eval_optional_auxiliary_key(key: str) -> bool:
+    return key.startswith("aux_trajectory_head.") or ".aux_trajectory_head." in key
+
+
+def _validate_eval_loaded_keys(
+    missing_keys: Sequence[str],
+    unexpected_keys: Sequence[str],
+) -> None:
+    non_optional_missing = [
+        key for key in missing_keys if not _is_eval_optional_auxiliary_key(str(key))
+    ]
+    if non_optional_missing:
+        raise RuntimeError(
+            "Evaluation checkpoint is missing non-optional key(s): "
+            f"{_format_key_list(non_optional_missing)}"
+        )
+    if unexpected_keys:
+        raise RuntimeError(
+            "Evaluation checkpoint contains unexpected key(s): "
+            f"{_format_key_list(list(unexpected_keys))}"
+        )
+    if missing_keys:
+        log.warning(
+            "Ignoring evaluation-only missing auxiliary checkpoint key(s): "
+            f"{_format_key_list(list(missing_keys))}"
+        )
+
+
 def _validate_finetune_loaded_trainable_params(
     model: LightningModule,
     missing_keys: Sequence[str],
@@ -355,12 +383,30 @@ def run(cfg: DictConfig) -> None:
         )
     elif cfg.action == "validate":
         log.info("Starting validating!")
+        validate_ckpt_path = cfg.get("ckpt_path")
+        if validate_ckpt_path:
+            checkpoint = _load_lightning_checkpoint(str(validate_ckpt_path))
+            load_result = model.load_state_dict(checkpoint["state_dict"], strict=False)
+            _validate_eval_loaded_keys(
+                missing_keys=load_result.missing_keys,
+                unexpected_keys=load_result.unexpected_keys,
+            )
+            validate_ckpt_path = None
         trainer.validate(
-            model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path")
+            model=model, datamodule=datamodule, ckpt_path=validate_ckpt_path
         )
     elif cfg.action == "test":
         log.info("Starting testing!")
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
+        test_ckpt_path = cfg.get("ckpt_path")
+        if test_ckpt_path:
+            checkpoint = _load_lightning_checkpoint(str(test_ckpt_path))
+            load_result = model.load_state_dict(checkpoint["state_dict"], strict=False)
+            _validate_eval_loaded_keys(
+                missing_keys=load_result.missing_keys,
+                unexpected_keys=load_result.unexpected_keys,
+            )
+            test_ckpt_path = None
+        trainer.test(model=model, datamodule=datamodule, ckpt_path=test_ckpt_path)
 
 
 @hydra.main(config_path="../configs/", config_name="run.yaml", version_base=None)

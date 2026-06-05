@@ -1219,6 +1219,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 "mdg_mask_level": empty_mask,
                 "ctx_hidden_pack": ctx_hidden_pack,
                 "anchor_hidden": anchor_hidden,
+                "anchor_hidden_valid": anchor_hidden_valid,
                 "anchor_mask": anchor_mask,
             }
             if flow_agent_type is not None:
@@ -1293,6 +1294,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             "mdg_mask_level": mask_level,
             "ctx_hidden_pack": ctx_hidden_pack,
             "anchor_hidden": anchor_hidden,
+            "anchor_hidden_valid": anchor_hidden_valid,
             "anchor_mask": anchor_mask,
         }
         if flow_agent_type is not None:

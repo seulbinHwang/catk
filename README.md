@@ -20,6 +20,7 @@ SMART cache scene
 -> context-conditioned denoiser가 clean control 예측
 -> 예측 control을 5D state로 복원
 -> valid future step에 대해서만 state MSE
+-> 같은 anchor context에서 20-step best-mode auxiliary trajectory loss
 ```
 
 기본 tensor 의미는 다음입니다.
@@ -33,7 +34,33 @@ SMART cache scene
 | control dim | `[delta_s, delta_n, delta_yaw]` |
 | MDG state dim | `[x/20, y/20, cos(yaw), sin(yaw), speed/10]` |
 | noise level | 1..5, alpha `[0.99, 0.745, 0.5, 0.255, 0.01]` |
+| auxiliary prediction | 6 modes x 20 step x `[local_x, local_y, delta_yaw]` |
+| auxiliary loss weight | 5.0 |
 | inference default | `sample_steps=1`, `action_reuse=true` |
+
+## Auxiliary Trajectory Loss
+
+`semi_mdg`는 MDG 논문의 scene-context regularization 의도를 2초 horizon에 맞춰 적용합니다. 보조 head는 denoiser 출력 뒤가 아니라, noise를 넣기 전 anchor별 context vector에서 바로 20-step future pose를 예측합니다.
+
+```text
+anchor context [P, 128]
+-> auxiliary head
+-> [P, 6, 20, 3]
+```
+
+보조 target은 anchor 현재 위치/방향 기준 local pose입니다.
+
+```text
+[local_x_m, local_y_m, delta_heading_rad]
+```
+
+6개 mode 중 best mode는 20-step valid prefix의 local xy L2로만 고릅니다. 선택된 mode에는 local x, local y, wrapped delta heading 전체에 Smooth L1 loss를 적용하고, 유효 future step 수로 평균냅니다. 최종 pretrain loss는 다음입니다.
+
+```text
+train/loss = train/loss_mdg + 5.0 * train/loss_aux
+```
+
+이 auxiliary head는 학습 전용입니다. open-loop/closed-loop validation, WOSAC metric, submission rollout에는 사용하지 않습니다.
 
 ## Control Dynamics
 
@@ -245,6 +272,7 @@ batch-size safety check:
 | warmup | 4 epoch |
 | validation 주기 | 16 epoch |
 | validation rollout | 32 |
+| auxiliary prediction | 6 modes x 20 step x 3, weight 5.0 |
 | `validation_rollout_sampling.sample_steps` | 1 |
 | `validation_rollout_sampling.action_reuse` | true |
 | `decoder.closed_loop_rollout_mode` | `raw_mdg` |
@@ -282,12 +310,43 @@ action reuse는 이전 2초 predicted control을 0.5초 앞으로 shift한 뒤, 
 4. validation open-loop + closed-loop smoke exit 0
 5. action_reuse=true closed-loop smoke exit 0
 6. pred_traj_10hz / pred_head_10hz shape 유지
-7. train/loss, train/loss_mdg가 NaN 없이 감소
+7. train/loss, train/loss_mdg, train/loss_aux가 NaN 없이 감소
 ```
 
 이 브랜치의 목표는 Flow Matching과 fine tuning을 섞지 않고, 2초 control-state MDG pretrain 단일 방법론을 빠르고 안정적으로 검증하는 것입니다.
 
 ## 최근 검증 기록
+
+2026-06-05 KST에 `testas` A100 80GB x7과 실제 SMART cache로 20-step auxiliary trajectory loss 적용 후 검증했습니다.
+
+```text
+unit tests:
+  command: pytest tests/test_aux_trajectory_loss.py tests/test_open_loop_empty_target_loss.py -q
+  result: 8 passed
+
+train-only smoke:
+  task_name: semi_mdg_aux_train_smoke_20260605
+  train_batch_size: 2 per GPU
+  global_batch_size: 14
+  limit_train_batches: 2
+  result: exit status 0
+  train/loss: 11.85204
+  train/loss_mdg: 0.06043
+  train/loss_aux: 2.35832
+
+train + open/closed-loop validation smoke:
+  task_name: semi_mdg_aux_val_smoke_20260605
+  train_batch_size: 1 per GPU
+  val_batch_size: 1 per GPU
+  n_rollout_closed_val: 2
+  scorer_scene_num: 7
+  result: exit status 0
+  train/loss: 34.40209
+  train/loss_mdg: 0.24735
+  train/loss_aux: 6.83095
+  val_closed/sim_agents_2025/realism_meta_metric: 0.58544
+  val_closed/sim_agents_2025/scenario_counter: 7
+```
 
 2026-06-04 KST에 Flow ODE solver 잔여 config 제거와 path-flow velocity API guard를 적용한 뒤, 같은 H100x3x2 pod와 실제 SMART cache로 다시 검증했습니다.
 

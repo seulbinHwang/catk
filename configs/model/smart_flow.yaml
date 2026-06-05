@@ -61,6 +61,12 @@ model_config:
     action_reuse: true
     action_reuse_alpha: [0.70, 0.60, 0.50, 0.01]
     antithetic_pairs: true
+  aux_trajectory:
+    enabled: true
+    weight: 5.0
+    num_modes: 6
+    num_steps: 20
+    output_dim: 3
   decoder:
     hidden_dim: 128
     num_freq_bands: 64
