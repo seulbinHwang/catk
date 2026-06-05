@@ -58,6 +58,45 @@ def _validate_control_agent_type(control: Tensor, agent_type: Tensor) -> None:
     _validate_agent_type(agent_type)
 
 
+def project_control_norm_to_kinematic_manifold(
+    control_norm: Tensor,
+    agent_type: Tensor,
+    *,
+    use_holonomic_model_only: bool = False,
+) -> Tensor:
+    """정규화 control을 agent별 feasible manifold 위로 사영합니다.
+
+    pedestrian은 holonomic control을 그대로 쓰고, vehicle/cyclist는 normalized
+    lateral control(``delta_n``) 채널을 0으로 둡니다.
+    """
+    if control_norm.ndim < 2:
+        raise ValueError(
+            "control_norm must have shape [N, ..., 3], "
+            f"got {tuple(control_norm.shape)}."
+        )
+    if control_norm.shape[-1] != CONTROL_FLOW_DIM:
+        raise ValueError(
+            "control_norm must have last dimension CONTROL_FLOW_DIM=3, "
+            f"got {tuple(control_norm.shape)}."
+        )
+    _validate_control_agent_type(control_norm, agent_type)
+    if use_holonomic_model_only or control_norm.numel() == 0:
+        return control_norm
+
+    agent_type_device = agent_type.to(device=control_norm.device)
+    pedestrian_mask = agent_type_device == PEDESTRIAN_TYPE_ID
+    mask_shape = (agent_type_device.shape[0],) + (1,) * (control_norm.ndim - 2)
+    pedestrian_mask = pedestrian_mask.view(mask_shape)
+
+    projected = control_norm.clone()
+    projected[..., 1] = torch.where(
+        pedestrian_mask,
+        projected[..., 1],
+        torch.zeros_like(projected[..., 1]),
+    )
+    return projected
+
+
 def validate_control_yaw_scale_config(
     *,
     vehicle_yaw_scale_rad: float | None,

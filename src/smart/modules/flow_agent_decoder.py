@@ -18,6 +18,7 @@ from src.smart.modules.kinematic_control import (
     CONTROL_FLOW_DIM,
     POSE_FLOW_DIM,
     control_norm_to_pose_norm,
+    project_control_norm_to_kinematic_manifold,
     validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
 )
@@ -1664,6 +1665,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 current_head_act = head_window[active_mask, -1]
                 active_agent_type = tokenized_agent["type"][active_mask]
                 active_agent_length = tokenized_agent["shape"][active_mask, 0]
+                if self.use_kinematic_control_flow:
+                    y_hat_norm = project_control_norm_to_kinematic_manifold(
+                        y_hat_norm,
+                        agent_type=active_agent_type,
+                        use_holonomic_model_only=self.use_holonomic_model_only,
+                    )
                 if return_flow_2s_preview:
                     y_hat_metric_norm = self._to_pose_metric_norm(
                         y_hat_norm,

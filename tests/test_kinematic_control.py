@@ -14,6 +14,7 @@ from src.smart.modules.kinematic_control import (
     control_norm_to_pose_norm,
     decode_control_sequence,
     denormalize_control,
+    project_control_norm_to_kinematic_manifold,
     safe_sinc,
 )
 
@@ -102,6 +103,50 @@ def test_vehicle_rolling_control_uses_no_lateral_channel() -> None:
     control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
 
     assert torch.allclose(control[..., 1], torch.zeros_like(control[..., 1]))
+
+
+def test_project_control_norm_to_kinematic_manifold_masks_nonholonomic_lateral() -> None:
+    control_norm = torch.tensor(
+        [
+            [[1.0, 0.7, 0.1], [2.0, -0.4, 0.2]],
+            [[1.0, -0.2, 0.3], [2.0, 0.5, 0.4]],
+            [[1.0, 0.9, 0.5], [2.0, -0.8, 0.6]],
+        ]
+    )
+    agent_type = torch.tensor([VEHICLE_TYPE_ID, PEDESTRIAN_TYPE_ID, CYCLIST_TYPE_ID])
+
+    projected = project_control_norm_to_kinematic_manifold(control_norm, agent_type=agent_type)
+
+    torch.testing.assert_close(projected[0, :, 1], torch.zeros_like(projected[0, :, 1]))
+    torch.testing.assert_close(projected[1, :, 1], control_norm[1, :, 1])
+    torch.testing.assert_close(projected[2, :, 1], torch.zeros_like(projected[2, :, 1]))
+    torch.testing.assert_close(projected[..., [0, 2]], control_norm[..., [0, 2]])
+
+
+def test_project_control_norm_to_kinematic_manifold_holonomic_only_keeps_lateral() -> None:
+    control_norm = torch.randn(3, 4, 3)
+    agent_type = torch.tensor([VEHICLE_TYPE_ID, PEDESTRIAN_TYPE_ID, CYCLIST_TYPE_ID])
+
+    projected = project_control_norm_to_kinematic_manifold(
+        control_norm,
+        agent_type=agent_type,
+        use_holonomic_model_only=True,
+    )
+
+    torch.testing.assert_close(projected, control_norm)
+
+
+def test_project_control_norm_to_kinematic_manifold_blocks_nonholonomic_lateral_grad() -> None:
+    control_norm = torch.randn(3, 2, 3, requires_grad=True)
+    agent_type = torch.tensor([VEHICLE_TYPE_ID, PEDESTRIAN_TYPE_ID, CYCLIST_TYPE_ID])
+
+    projected = project_control_norm_to_kinematic_manifold(control_norm, agent_type=agent_type)
+    projected.sum().backward()
+
+    assert control_norm.grad is not None
+    torch.testing.assert_close(control_norm.grad[0, :, 1], torch.zeros_like(control_norm.grad[0, :, 1]))
+    torch.testing.assert_close(control_norm.grad[1, :, 1], torch.ones_like(control_norm.grad[1, :, 1]))
+    torch.testing.assert_close(control_norm.grad[2, :, 1], torch.zeros_like(control_norm.grad[2, :, 1]))
 
 
 def test_vehicle_no_slip_point_ratio_zero_preserves_box_center_rule() -> None:
