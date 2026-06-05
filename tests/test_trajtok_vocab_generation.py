@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import numpy as np
 
 from src.smart.tokens.trajtok import TrajTok
@@ -33,3 +36,37 @@ def test_trajtok_interpolation_preserves_endpoint_heading() -> None:
         assert abs(wrap_angle(curve[-1, 2] - theta)) < 1e-12
         assert np.isfinite(curve).all()
 
+
+def test_trajtok_sparse_filtered_source_uses_raw_non_empty_grid() -> None:
+    generator = object.__new__(TrajTok)
+    generator.shift = 5
+    generator.agent_classes = ["veh"]
+    generator.flip_trajs = False
+    generator.x_max = {"veh": 3.0}
+    generator.x_min = {"veh": 0.0}
+    generator.y_max = {"veh": 1.0}
+    generator.y_min = {"veh": 0.0}
+    generator.x_binnum = {"veh": 3}
+    generator.y_binnum = {"veh": 1}
+    generator.valid_count_threshold = {"veh": 1}
+    generator.filter_range = {"veh": 1}
+    generator.filter_threshold_add = {"veh": 0}
+    generator.filter_threshold_remove = {"veh": 2}
+    generator.max_traj_nums = None
+
+    traj = np.zeros((1, 5, 3), dtype=np.float64)
+    traj[0, :, 0] = np.linspace(0.02, 0.10, 5)
+    traj[0, :, 1] = 0.1
+    traj[0, :, 2] = 0.25
+    generator.traj_data = {"veh": traj}
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        generator.output_path = Path(tmp_dir) / "vocab.pkl"
+        generator.get_trajtok_vocab()
+
+    out_traj = generator.vocab["traj"]["veh"]
+    out_token_all = generator.vocab["token_all"]["veh"]
+    assert out_traj.shape == (1, 6, 3)
+    assert out_token_all.shape == (1, 6, 4, 2)
+    assert np.isfinite(out_traj).all()
+    assert abs(wrap_angle(out_traj[0, -1, 2] - 0.25)) < 1e-12

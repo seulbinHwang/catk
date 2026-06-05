@@ -295,6 +295,13 @@ class TrajTok:
                     heading_concentration_in_bin[x][y] = heading_concentration
 
             nearest_source_pos = np.argwhere(grid_mask & grid_mask_filtered)
+            if len(nearest_source_pos) == 0:
+                # Sparse smoke/regression vocab builds can remove every non-empty
+                # source grid while still adding expansion grids. Use the raw
+                # non-empty grids as interpolation sources in that degenerate
+                # case; full-data builds are unchanged when filtered sources
+                # exist.
+                nearest_source_pos = np.argwhere(grid_mask)
             token_trajs = []
             token_heading_concentrations = []
             token_source_counts = {
