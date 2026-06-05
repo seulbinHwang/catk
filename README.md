@@ -39,7 +39,7 @@
 - **WOSAC 최고 수준 성능**: CAT-K는 [WOSAC 리더보드](https://waymo.com/open/challenges/2024/sim-agents/) 1위를 달성했다. agent token vocabulary 문제를 해결한 뒤 fine-tuned model은 **0.7702** RMM을 달성했다. 리더보드에는 공개하지 않았지만 BC로 32 epoch만 학습한 재현 SMART-tiny-7M도 **0.7671** RMM을 달성했고, 이는 당시 2위 방법과 비슷한 수준이다. 재현 절차도 비교적 단순하다.
 
 - **TrajTok paper-submit agent vocabulary and supervision**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Grid 안 대표 trajectory는 `x/y`는 일반 평균, heading은 sin/cos circular mean으로 만든다. Non-empty grid는 wrapped heading jump가 작으면 이 대표 trajectory를 그대로 쓰고, jump가 큰 non-empty grid와 expansion empty grid만 circular endpoint heading을 반영한 Hermite 보간 trajectory를 쓴다. Sparse subset vocab smoke처럼 filtering 뒤 interpolation source가 비는 예외 상황에서는 제거된 raw non-empty grid를 source로 사용해 전처리 생성을 계속한다. 정상 full-data 생성처럼 filtered non-empty source가 있으면 이 fallback은 동작하지 않는다. Token matching은 마지막 endpoint만 보지 않고, 현재 시점을 제외한 0.5초 미래 5개 frame의 box contour `[5, 4 corners, x/y]` 전체 평균 거리로 GT token을 고른다. Rolling recurrence는 유지하므로 선택된 token의 마지막 pose가 다음 0.5초 구간의 기준 pose가 된다. Spatial-aware label smoothing도 하나의 최종 구현만 사용한다. 정답 token과 모든 후보 token의 미래 5-frame contour distance를 계산하고, non-GT smoothing mass를 `1 / (distance^2 + epsilon)` 비율로 정확히 나눈다. 추가 uniform label smoothing이나 extra normalization은 적용하지 않는다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. 현재 pretrain train dataset의 on-the-fly augmentation은 `random_scene_scale_config: null`, `random_time_shift_config: null`로 꺼져 있으며, validation/test/submission cache나 원본 pickle도 바꾸지 않는다.
-- **TrajTok decoder capacity**: 기본 SMART decoder는 `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6`를 사용한다. Paper-submit vocab `veh=8037`, `ped=2998`, `cyc=2798` 기준으로 Hydra config를 compose한 뒤 SMART 모델을 직접 instantiate해서 측정한 전체 model parameter 수는 `8,247,013`개다. 모든 parameter가 trainable이며 non-trainable parameter는 0개다.
+- **TrajTok decoder capacity**: 기본 SMART decoder는 `hidden_dim=128`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6`를 사용한다. Paper-submit vocab `veh=8037`, `ped=2998`, `cyc=2798` 기준으로 Hydra config를 compose한 뒤 SMART 모델을 직접 instantiate해서 측정한 전체 model parameter 수는 `8,580,025`개다. 모든 parameter가 trainable이며 non-trainable parameter는 0개다.
 
 ## 설치
 
@@ -278,12 +278,12 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | branch | `trajtok` |
 | pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
-| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_lr581e4_oom_retry_trajtok_hidden124_fulltraj_topk12_trainselectfalse_20260605` |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_lr581e4_oom_retry_trajtok_hidden128_fulltraj_topk12_trainselectfalse_20260605` |
 | remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_fulltraj_20260605` |
 | experiment | `pre_bc_a100x4x2` |
 | model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, full 0.5초 future contour token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
-| decoder | `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
-| model parameters | `8,247,013` total / trainable, 직접 SMART instantiate로 측정 |
+| decoder | `hidden_dim=128`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
+| model parameters | `8,580,025` total / trainable, 직접 SMART instantiate로 측정 |
 | train batch | `INITIAL_BS=18` per rank, effective global batch 108 |
 | OOM retry | `MIN_BS=14`, `OOM_STEP=2`, latest task checkpoint resume (`18 -> 16 -> 14`); retry attempt마다 LR도 현재 global batch 기준으로 재계산 |
 | validation/test batch | `VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12` |
