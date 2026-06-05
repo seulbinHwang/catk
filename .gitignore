@@ -20,3 +20,6 @@ overleaf/
 
 # run logs / 실행 산출물 (커밋 대상 아님)
 artifacts/
+
+# Claude Code local artifacts
+.claude/
