@@ -335,6 +335,29 @@ DRY_RUN=1 bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh --dry-run
 | inference top-p | 1.0 |
 | train sampler | memory-balanced distributed batch sampler |
 
+2026-06-05 20:38 KST에는 최신 `UniMM@39901e4` 기준으로 front-weighted mixture + soft anchor CE full pretrain을 새로 시작했다. 시작 전 `hsb-npc-training-3-1`, `hsb-npc-training-3-2` 모두 GPU compute process가 없었고, GPU memory는 4MiB, utilization은 0%였다. batch 탐색에서는 per-GPU `30`과 `28`이 모두 120-batch smoke를 통과했지만, 이전 full pretrain에서 `30`은 긴 epoch 진행 중 OOM 이력이 있었으므로 이번 full run은 보수적인 per-GPU `28`로 시작했다.
+
+```text
+running full pretrain:
+  task_name=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs168_frontsoft_membal_temp1_20260605_203818
+  wandb_run_id=lv5gdaqw
+  wandb_url=https://wandb.ai/jksg01019-naver-labs/SMART-FLOW/runs/lv5gdaqw
+  commit=39901e4
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=28, val_batch_size=12
+  effective_train_batch_size=168
+  learning_rate=0.001145643924
+  lr_scaling=0.0005 * sqrt(168 / 32)
+  inference_temperature=1.0
+  inference_top_k=0
+  inference_top_p=1.0
+  scorer_scene_num=1680
+  n_batch_sim_agents_metric=24
+  result=running
+```
+
+실행 검증은 실제 H100 x3x2 DDP 학습 step까지 확인했다. 양쪽 pod가 `origin/UniMM@39901e4`로 clean reset됐고, DDP 6개 rank가 모두 등록됐으며, epoch 0에서 `199` optimizer step 이상 OOM/Traceback/NaN 없이 진행됐다. W&B 기준 `trainer/global_step=59 -> 199` 사이 `train/loss=6.48830 -> 2.93470`, `train/loss_mixture=5.38834 -> 2.02009`로 finite하게 감소했다. 같은 구간의 posterior accept rate는 `0.89666~0.93203` 범위였다. GPU memory는 rank-local H100별 대략 `72~79GiB` 범위에서 동작했다. epoch 0의 warm-up 이후 처리 속도는 약 `1.08~1.13 batch/s`이며, 64 epoch train-only 예상 소요는 약 47.7시간이다. 16 epoch마다 실행되는 closed-loop validation/checkpoint overhead를 포함한 전체 예상 소요는 약 52.5~59.7시간이다.
+
 2026-06-04 21:57 KST에는 최신 `UniMM@a39fcdf` 기준으로 top-M mixture objective full pretrain을 새로 시작했다. 시작 전 `hsb-npc-training-3-1`, `hsb-npc-training-3-2` 모두 UniMM 학습 process가 없었고, GPU memory는 4MiB, utilization은 0%로 idle 상태였다. 두 pod의 `/tmp/catk_unimm_h100x3x2` checkout은 `origin/UniMM@a39fcdf`로 맞춘 뒤 `unimm-h100x3x2` tmux session에서 DDP 6-rank 학습을 시작했다.
 
 ```text
