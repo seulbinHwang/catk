@@ -61,6 +61,7 @@ model:
       ocsc_use_pretrained_ref: true
       ocsc_anchor_idx: 0
       ocsc_match_space: pose
+      ocsc_match_frame: local      # local=anchor-0 정규화 / global=raw world meter L2 (pose만)
       ocsc_loss_window_steps: -1
       ocsc_loss_temporal_stride: -1
       ocsc_strict_active_mask: true

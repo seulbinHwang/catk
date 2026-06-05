@@ -4131,12 +4131,34 @@ class SMARTFlow(LightningModule):
         current_pos: Tensor,        # [n_active, 2]
         current_head: Tensor,       # [n_active]
         pos_scale_m: float = 20.0,
+        frame: str = "local",
     ) -> Tensor:
-        """closed-loop rollout 의 global pose 를 anchor-0 local pose-norm 4-dim 으로 변환.
+        """closed-loop rollout 의 global pose 를 4-dim pose 텐서로 변환.
+
+        frame="local" (기본): anchor-0 local pose-norm ``[x_local/20, y_local/20, cos(Δh), sin(Δh)]``.
+        frame="global": transform_to_local 없이 raw world 좌표 ``[x_global, y_global, cos(h), sin(h)]``
+            — 정규화 없는 raw meter. (current_pos/current_head 는 무시.)
+            position L2 는 강체변환 불변이라 local 과 수치 동일하므로, 의미 있는 차이는
+            /20 정규화 제거(raw meter scale)와 절대 heading cos/sin 에서 온다.
 
         Returns:
-            Tensor ``[n_active, T, 4]`` = ``[x/20, y/20, cos, sin]``.
+            Tensor ``[n_active, T, 4]``.
         """
+        frame = str(frame).lower()
+        if frame == "global":
+            return torch.stack(
+                [
+                    pred_pos_global[..., 0],
+                    pred_pos_global[..., 1],
+                    pred_head_global.cos(),
+                    pred_head_global.sin(),
+                ],
+                dim=-1,
+            )
+        if frame != "local":
+            raise ValueError(
+                f"Unsupported OCSC match_frame={frame!r}; expected local or global."
+            )
         from src.smart.utils.rollout import transform_to_local
         pos_local, head_local = transform_to_local(
             pos_global=pred_pos_global,
@@ -4161,6 +4183,7 @@ class SMARTFlow(LightningModule):
         current_pos: Tensor,
         current_head: Tensor,
         window_steps_10hz: int,
+        match_frame: str = "local",
     ) -> tuple[Tensor, Tensor] | None:
         """GT (raw 10Hz) future pose 를 anchor-0 local pose-norm 4-dim 으로.
 
@@ -4190,6 +4213,7 @@ class SMARTFlow(LightningModule):
             pred_head_global=gt_head,
             current_pos=current_pos,
             current_head=current_head,
+            frame=match_frame,
         )
         return gt_norm, gt_valid
 
@@ -4448,6 +4472,7 @@ class SMARTFlow(LightningModule):
         window_steps_10hz: int,
         rollout_steps_2hz: int,
         match_space: str = "pose",
+        match_frame: str = "local",
     ) -> Tensor:
         """OCSC closed-loop rollouts를 rollout 축으로 묶어 한 번에 실행합니다."""
         agent_enc = self.encoder.agent_encoder
@@ -4530,6 +4555,7 @@ class SMARTFlow(LightningModule):
             pred_head_global=head_flat,
             current_pos=pos_flat,
             current_head=head_now_flat,
+            frame=match_frame,
         )
         return cl_norm_flat.reshape(rollout_count, n_active, window_steps_10hz, 4)
 
@@ -4553,6 +4579,11 @@ class SMARTFlow(LightningModule):
                 raise ValueError("ocsc_match_space=control requires use_kinematic_control_flow=True.")
             if use_gt_target:
                 raise ValueError("ocsc_match_space=control currently supports OL-ref targets only.")
+        match_frame = str(getattr(ft, "ocsc_match_frame", "local")).lower()
+        if match_frame not in {"local", "global"}:
+            raise ValueError(f"Unsupported ocsc_match_frame={match_frame!r}; expected local or global.")
+        if match_frame == "global" and match_space != "pose":
+            raise ValueError("ocsc_match_frame=global is only supported with ocsc_match_space=pose.")
         pos_w = float(getattr(ft, "ocsc_position_weight", 1.0))
         head_w = float(getattr(ft, "ocsc_heading_weight", 0.01))
         loss_window_raw = int(getattr(ft, "ocsc_loss_window_steps", -1))
@@ -4623,6 +4654,7 @@ class SMARTFlow(LightningModule):
                 current_pos=current_pos_active,
                 current_head=current_head_active,
                 window_steps_10hz=loss_window_steps_10hz,
+                match_frame=match_frame,
             )
             if gt_target is None:
                 return self._build_trainable_connected_zero_loss(self.encoder)
@@ -4662,6 +4694,7 @@ class SMARTFlow(LightningModule):
             window_steps_10hz=win_10hz,
             rollout_steps_2hz=rollout_steps_2hz,
             match_space=match_space,
+            match_frame=match_frame,
         )  # pose: [G, n_active, T, 4], control: [G, n_active, T, 3]
 
         # 5b. Temporal loss sampling.  Default(-1) preserves the historical 2 Hz
