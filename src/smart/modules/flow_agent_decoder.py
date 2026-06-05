@@ -823,6 +823,13 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         agent_length: torch.Tensor | None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
+        """Run MDG denoising and return the final clean control estimate.
+
+        Algorithm 2's final transition is ``m_0 = 0`` and ``alpha(m_0) = 1``.
+        Therefore the last clean estimate is already ``z_0``; do not make an
+        extra denoiser call with mask level 0, which is not part of the trained
+        denoising input distribution.
+        """
         current = initial_control_norm
         for step_idx, mask_level in enumerate(mask_schedule):
             expanded_mask = mask_level.view(1, -1).expand(current.shape[0], -1)

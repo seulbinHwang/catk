@@ -261,6 +261,8 @@ sample_steps=1
 action_reuse=false
 ```
 
+`sample_steps > 1`로 MDG multi-step denoising을 실험할 때도 denoiser 호출 mask는 학습된 noise level만 사용합니다. 예를 들어 5-step은 `[5, 4, 3, 2, 1]` 순서로 denoiser를 호출하고, Algorithm 2의 마지막 clean transition은 `m0=0`, `alpha(m0)=1`인 identity로 처리합니다. 따라서 마지막에 별도 `m=0` denoiser 호출을 추가하지 않고, 마지막 clean estimate를 그대로 최종 control로 사용합니다.
+
 action reuse ablation이 필요할 때만 다음처럼 켭니다.
 
 ```bash

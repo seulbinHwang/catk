@@ -199,6 +199,50 @@ def test_mdg_mask_sampler_marks_invalid_future_steps_clean_zero() -> None:
     assert bool((mask_level[future_valid_mask] <= decoder.mdg_num_noise_levels).all().item())
 
 
+def test_mdg_multistep_final_clean_transition_uses_last_clean_estimate() -> None:
+    decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
+    decoder.flow_window_steps = 3
+    decoder.flow_state_dim = 3
+    decoder.mdg_num_noise_levels = 5
+    decoder._to_mdg_state_norm = lambda current, agent_type, agent_length: current.new_zeros(
+        current.shape[:-1] + (5,)
+    )
+
+    captured_masks = []
+
+    def _fake_denoiser(anchor_hidden, noisy_state, mask_level, future_valid_mask=None):
+        del future_valid_mask
+        captured_masks.append(mask_level.detach().clone())
+        return noisy_state.new_full(
+            (anchor_hidden.shape[0], noisy_state.shape[1], decoder.flow_state_dim),
+            float(len(captured_masks)),
+        )
+
+    decoder.flow_decoder = _fake_denoiser
+    hidden = torch.zeros((2, 4), dtype=torch.float32)
+    initial = torch.zeros((2, 3, 3), dtype=torch.float32)
+    schedule = torch.tensor(
+        [
+            [5.0, 5.0, 5.0],
+            [3.0, 3.0, 3.0],
+            [1.0, 1.0, 1.0],
+        ]
+    )
+
+    out = decoder._mdg_denoise_control(
+        anchor_hidden=hidden,
+        initial_control_norm=initial,
+        mask_schedule=schedule,
+        agent_type=torch.zeros(2, dtype=torch.long),
+        agent_length=None,
+    )
+
+    assert len(captured_masks) == schedule.shape[0]
+    for actual, expected in zip(captured_masks, schedule, strict=True):
+        torch.testing.assert_close(actual, expected.view(1, -1).expand(2, -1))
+    torch.testing.assert_close(out, torch.full_like(out, float(schedule.shape[0])))
+
+
 def test_agent_anchor_context_keeps_raw_metric_target() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     decoder._encode_context = lambda **kwargs: torch.zeros((1, 2, 1))
