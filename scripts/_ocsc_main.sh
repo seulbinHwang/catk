@@ -148,6 +148,9 @@ VALIDATION_FIXED_FLOW_NOISE="${VALIDATION_FIXED_FLOW_NOISE:-true}"
 VALIDATION_SAMPLE_STEPS="${VALIDATION_SAMPLE_STEPS:-16}"
 VALIDATION_SAMPLE_METHOD="${VALIDATION_SAMPLE_METHOD:-euler}"
 VALIDATION_NOISE_SCALE="${VALIDATION_NOISE_SCALE:-1.0}"
+OCSC_TRAIN_SAMPLE_STEPS="${OCSC_TRAIN_SAMPLE_STEPS:-${TRAIN_SAMPLE_STEPS:-${VALIDATION_SAMPLE_STEPS}}}"
+OCSC_TRAIN_SAMPLE_METHOD="${OCSC_TRAIN_SAMPLE_METHOD:-${TRAIN_SAMPLE_METHOD:-${VALIDATION_SAMPLE_METHOD}}}"
+OCSC_TRAIN_NOISE_SCALE="${OCSC_TRAIN_NOISE_SCALE:-${TRAIN_NOISE_SCALE:-${VALIDATION_NOISE_SCALE}}}"
 
 # Flow/control sync knobs.  Defaults mirror configs/model/smart_flow.yaml.
 USE_KINEMATIC_CONTROL_FLOW="${USE_KINEMATIC_CONTROL_FLOW:-true}"
@@ -335,6 +338,9 @@ set -- \
   model.model_config.validation_rollout_sampling.sample_steps="${VALIDATION_SAMPLE_STEPS}" \
   model.model_config.validation_rollout_sampling.sample_method="${VALIDATION_SAMPLE_METHOD}" \
   model.model_config.validation_rollout_sampling.noise_scale="${VALIDATION_NOISE_SCALE}" \
+  ++model.model_config.finetune.ocsc_train_rollout_sampling.sample_steps="${OCSC_TRAIN_SAMPLE_STEPS}" \
+  ++model.model_config.finetune.ocsc_train_rollout_sampling.sample_method="${OCSC_TRAIN_SAMPLE_METHOD}" \
+  ++model.model_config.finetune.ocsc_train_rollout_sampling.noise_scale="${OCSC_TRAIN_NOISE_SCALE}" \
   model.model_config.token_processor.use_kinematic_control_flow="${USE_KINEMATIC_CONTROL_FLOW}" \
   model.model_config.token_processor.use_holonomic_model_only="${USE_HOLONOMIC_MODEL_ONLY}" \
   model.model_config.token_processor.use_rolling_supervision="${USE_ROLLING_SUPERVISION}" \
@@ -441,7 +447,8 @@ echo "  cache=${CACHE_ROOT}"
 echo "  trainer: max_epochs=${MAX_EPOCHS} precision=${PRECISION} strategy=${TRAINER_STRATEGY} grad_clip=${GRADIENT_CLIP_VAL}"
 echo "  data: train_B=${TRAIN_B} val_B=${VAL_B} workers=${NUM_WORKERS} shuffle=${DATA_SHUFFLE} sample_fraction=${TRAIN_EPOCH_SAMPLE_FRACTION}"
 echo "  opt: lr=${LR} wd=${WEIGHT_DECAY} warmup=${LR_WARMUP_STEPS} total=${LR_TOTAL_STEPS} min_ratio=${LR_MIN_RATIO}"
-echo "  val: scorer_scene_num=${SCORER_SCENE_NUM} n_rollout_closed_val=${N_ROLLOUT_CLOSED_VAL} sample=${VALIDATION_SAMPLE_METHOD}/${VALIDATION_SAMPLE_STEPS} noise=${VALIDATION_NOISE_SCALE}"
+echo "  sample: train=${OCSC_TRAIN_SAMPLE_METHOD}/${OCSC_TRAIN_SAMPLE_STEPS} noise=${OCSC_TRAIN_NOISE_SCALE} | val=${VALIDATION_SAMPLE_METHOD}/${VALIDATION_SAMPLE_STEPS} noise=${VALIDATION_NOISE_SCALE}"
+echo "  val: scorer_scene_num=${SCORER_SCENE_NUM} n_rollout_closed_val=${N_ROLLOUT_CLOSED_VAL}"
 echo "  ocsc: G=${OCSC_N_ROLLOUTS} M=${OCSC_N_OL_ROLLOUTS} gt=${OCSC_GT_TARGET} nearest=${OCSC_OL_NEAREST_MATCH} space=${OCSC_MATCH_SPACE} frame=${OCSC_MATCH_FRAME} stride=${OCSC_LOSS_TEMPORAL_STRIDE}"
 echo "  scope: ${SCOPE} flow_ft_target=${FLOW_FT_TARGET} except_map=${OCSC_EXCEPT_MAP_ENCODER} velocity_head=${OCSC_VELOCITY_HEAD_ONLY} full_flow=${OCSC_FULL_FLOW_DECODER}"
 echo "  wandb=${WANDB_ENTITY}/${WANDB_PROJECT} log=${LOG}"

@@ -4642,7 +4642,9 @@ class SMARTFlow(LightningModule):
             else None
         )
 
-        sampling_scheme = self.validation_rollout_sampling
+        sampling_scheme = getattr(ft, "ocsc_train_rollout_sampling", None)
+        if sampling_scheme is None:
+            sampling_scheme = self.validation_rollout_sampling
 
         # 4. M open-loop targets (no_grad, ref_flow_decoder swap)
         target_stack: Tensor
