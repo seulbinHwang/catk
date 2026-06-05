@@ -11,9 +11,9 @@ NAMESPACE="${NAMESPACE:-p-pnc}"
 CONTAINER="${CONTAINER:-main}"
 PODS="${PODS:-hsb-npc-training-3-1 hsb-npc-training-3-2}"
 SESSION="${SESSION:-unimm-h100x3x2}"
-TASK_NAME="${TASK_NAME:-unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_guarded_$(date +%Y%m%d_%H%M%S)}"
+TASK_NAME="${TASK_NAME:-unimm_anchor_based_4s_h100x3x2_pretrain_globalbs168_guarded_$(date +%Y%m%d_%H%M%S)}"
 MASTER_PORT="${MASTER_PORT:-29578}"
-INITIAL_BS="${INITIAL_BS:-30}"
+INITIAL_BS="${INITIAL_BS:-28}"
 OOM_STEP="${OOM_STEP:-2}"
 MIN_BS="${MIN_BS:-16}"
 WANDB_MODE="${WANDB_MODE:-online}"
@@ -23,7 +23,7 @@ FORCE="${FORCE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 STATUS_ONLY=0
 
-DEFAULT_EXTRA_OVERRIDES="model.model_config.inference_temperature=1.0 model.model_config.scorer_scene_num=1680"
+DEFAULT_EXTRA_OVERRIDES="model.model_config.inference_temperature=1.0 model.model_config.inference_top_k=0 model.model_config.inference_top_p=1.0 model.model_config.scorer_scene_num=1680"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-$DEFAULT_EXTRA_OVERRIDES}"
 
 usage() {
@@ -36,8 +36,8 @@ Environment overrides:
   IDLE_MAX_MEMORY_MIB, IDLE_MAX_UTIL_PCT, EXTRA_HYDRA_OVERRIDES
 
 Default experiment:
-  UniMM Anchor-Based-4s, 2 nodes x 3 H100, per-GPU train batch 30,
-  OOM retry step 2, inference_temperature=1.0, scorer_scene_num=1680.
+  UniMM Anchor-Based-4s, 2 nodes x 3 H100, per-GPU train batch 28,
+  OOM retry step 2, inference_temperature=1.0, top_k=0, scorer_scene_num=1680.
 USAGE
 }
 
