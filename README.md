@@ -35,6 +35,7 @@ SMART cache scene
 | MDG state dim | `[x/20, y/20, cos(yaw), sin(yaw), speed/10]` |
 | noise level | 1..5, alpha `[0.99, 0.745, 0.5, 0.255, 0.01]` |
 | auxiliary prediction | 6 modes x 20 step x `[local_x, local_y, delta_yaw]` |
+| auxiliary head | `128 -> 896 -> 360`, 438,760 params |
 | auxiliary loss weight | 5.0 |
 | inference default | `sample_steps=1`, `action_reuse=true` |
 
@@ -54,9 +55,11 @@ DDP 학습에서는 rank별 local batch가 아니라 가능하면 전체 active 
 
 ```text
 anchor context [P, 128]
--> auxiliary head
+-> auxiliary head [128 -> 896 -> 360]
 -> [P, 6, 20, 3]
 ```
+
+보조 예측 길이, target, best-mode loss 정의는 그대로 유지하고 MLP 중간 폭만 896으로 둡니다. 이 head의 파라미터 수는 438,760개이며, 20-step 고정 조건 안에서 MDG 논문 Waymo 설정의 auxiliary predictor 규모에 가깝게 맞추기 위한 설정입니다.
 
 보조 target은 anchor 현재 위치/방향 기준 local pose입니다.
 
@@ -333,6 +336,38 @@ action reuse는 이전 2초 predicted control을 0.5초 앞으로 shift한 뒤, 
 이 브랜치의 목표는 Flow Matching과 fine tuning을 섞지 않고, 2초 control-state MDG pretrain 단일 방법론을 빠르고 안정적으로 검증하는 것입니다.
 
 ## 최근 검증 기록
+
+2026-06-05 KST에 `testas` A100 80GB x7과 실제 SMART cache로 auxiliary trajectory head를 `128 -> 896 -> 360`으로 확대한 뒤 검증했습니다.
+
+```text
+auxiliary head parameter check:
+  aux_trajectory.hidden_dim: 896
+  aux_head_params: 438,760
+  aux_head_output_shape: [2, 360]
+  model summary total params: 7.5M
+
+unit / regression tests:
+  command: PYTHONPATH=/mnt/nuplan/projects/catk pytest tests/test_aux_trajectory_loss.py tests/test_open_loop_empty_target_loss.py -q
+  result: 9 passed
+
+pipeline compatibility tests:
+  command: PYTHONPATH=/mnt/nuplan/projects/catk pytest tests/test_control_metric_conversion.py tests/test_aux_trajectory_loss.py tests/test_open_loop_empty_target_loss.py tests/test_mask_aware_prefix_valid_decoder.py -q
+  result: 23 passed
+
+train + open/closed-loop validation smoke:
+  task_name: semi_mdg_aux896_train_val_smoke_20260605
+  train_batch_size: 1 per GPU
+  val_batch_size: 1 per GPU
+  n_rollout_closed_val: 2
+  scorer_scene_num: 7
+  result: exit status 0
+  train/loss: 34.44249
+  train/loss_mdg: 0.24784
+  train/loss_aux: 6.83893
+  val_open/ADE2s: 4.28147
+  val_closed/sim_agents_2025/realism_meta_metric: 0.56220
+  val_closed/sim_agents_2025/scenario_counter: 7
+```
 
 2026-06-05 KST에 `testas` A100 80GB x7과 실제 SMART cache로 batch-stratified MDG mask sampling 적용 후 다시 검증했습니다. 이 재검증에서 일부 DDP rank의 active scene-anchor pair가 0개인 경우에도 모든 rank가 동일한 collective 경로를 지나도록 보강했습니다.
 

@@ -67,6 +67,7 @@ model_config:
     num_modes: 6
     num_steps: 20
     output_dim: 3
+    hidden_dim: 896
   decoder:
     hidden_dim: 128
     num_freq_bands: 64

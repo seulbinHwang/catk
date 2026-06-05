@@ -54,6 +54,7 @@ model:
       num_modes: 6
       num_steps: 20
       output_dim: 3
+      hidden_dim: 896
     token_processor:
       use_kinematic_control_flow: true
       use_rolling_supervision: true

@@ -5,6 +5,21 @@ import math
 import torch
 
 from src.smart.metrics.flow_metrics import auxiliary_best_mode_trajectory_loss
+from src.smart.model.smart_flow import _build_aux_trajectory_head
+
+
+def test_auxiliary_trajectory_head_uses_paper_scale_width() -> None:
+    head = _build_aux_trajectory_head(
+        input_dim=128,
+        hidden_dim=896,
+        num_modes=6,
+        num_steps=20,
+        output_dim=3,
+    )
+
+    assert sum(parameter.numel() for parameter in head.parameters()) == 438_760
+    output = head(torch.zeros((2, 128), dtype=torch.float32))
+    assert output.shape == (2, 6 * 20 * 3)
 
 
 def test_auxiliary_best_mode_selects_by_xy_only_and_wraps_heading() -> None:

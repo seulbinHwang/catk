@@ -100,6 +100,32 @@ def _build_decoder_config_from_token_processor(decoder_config: Any, token_proces
     return synced_config
 
 
+def _build_aux_trajectory_head(
+    *,
+    input_dim: int,
+    hidden_dim: int,
+    num_modes: int,
+    num_steps: int,
+    output_dim: int,
+) -> nn.Module:
+    if input_dim <= 0:
+        raise ValueError("aux_trajectory input_dim must be positive.")
+    if hidden_dim <= 0:
+        raise ValueError("aux_trajectory.hidden_dim must be positive.")
+    if num_modes <= 0:
+        raise ValueError("aux_trajectory.num_modes must be positive.")
+    if num_steps <= 0:
+        raise ValueError("aux_trajectory.num_steps must be positive.")
+    if output_dim <= 0:
+        raise ValueError("aux_trajectory.output_dim must be positive.")
+    return nn.Sequential(
+        nn.LayerNorm(input_dim),
+        nn.Linear(input_dim, hidden_dim),
+        nn.GELU(),
+        nn.Linear(hidden_dim, num_modes * num_steps * output_dim),
+    )
+
+
 class SMARTFlow(LightningModule):
 
     def __init__(self, model_config) -> None:
@@ -152,6 +178,11 @@ class SMARTFlow(LightningModule):
             if aux_trajectory_config is not None
             else 3
         )
+        self.aux_trajectory_hidden_dim = (
+            int(getattr(aux_trajectory_config, "hidden_dim", int(model_config.decoder.hidden_dim)))
+            if aux_trajectory_config is not None
+            else int(model_config.decoder.hidden_dim)
+        )
         if self.aux_trajectory_enabled:
             if self.aux_trajectory_steps != self.flow_window_steps:
                 raise ValueError(
@@ -163,19 +194,13 @@ class SMARTFlow(LightningModule):
                     "semi_mdg auxiliary trajectory output_dim must be 3 "
                     "[local_x, local_y, delta_heading]."
                 )
-            if self.aux_trajectory_num_modes <= 0:
-                raise ValueError("aux_trajectory.num_modes must be positive.")
             hidden_dim = int(model_config.decoder.hidden_dim)
-            self.aux_trajectory_head = nn.Sequential(
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(
-                    hidden_dim,
-                    self.aux_trajectory_num_modes
-                    * self.aux_trajectory_steps
-                    * self.aux_trajectory_dim,
-                ),
+            self.aux_trajectory_head = _build_aux_trajectory_head(
+                input_dim=hidden_dim,
+                hidden_dim=self.aux_trajectory_hidden_dim,
+                num_modes=self.aux_trajectory_num_modes,
+                num_steps=self.aux_trajectory_steps,
+                output_dim=self.aux_trajectory_dim,
             )
         else:
             self.aux_trajectory_head = None
