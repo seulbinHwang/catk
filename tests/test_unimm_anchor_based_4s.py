@@ -17,8 +17,8 @@ from scripts.build_unimm_anchors import (
     nearest_anchor_assignment,
 )
 from src.unimm.losses import (
-    unimm_candidate_set_ce_loss,
     unimm_nll_loss,
+    unimm_soft_anchor_ce_loss,
     unimm_top_m_mixture_nll_loss,
 )
 from src.unimm.anchors import match_anchors_by_type, match_top_m_anchors_by_type
@@ -162,6 +162,9 @@ def _make_model_cfg(anchor_path: Path, **overrides):
         "anchor_heading_weight": 1.0,
         "anchor_match_chunk_size": 16,
         "positive_top_m": 8,
+        "front_loss_steps": 5,
+        "front_loss_weight": 4.0,
+        "soft_anchor_min_temperature": 1e-4,
         "use_closed_loop_training": True,
         "inference_temperature": 1.0,
         "inference_top_k": 0,
@@ -245,7 +248,7 @@ def test_unimm_processor_builds_closed_loop_training_batch():
     )
 
 
-def test_unimm_candidate_set_ce_uses_positive_matching_horizon_only():
+def test_unimm_soft_anchor_ce_uses_positive_matching_horizon_only():
     logits = torch.tensor(
         [
             [[4.0, -4.0, 0.0], [-4.0, 4.0, 0.0]],
@@ -253,12 +256,20 @@ def test_unimm_candidate_set_ce_uses_positive_matching_horizon_only():
         dtype=torch.float32,
     )
     z_candidates = torch.tensor([[[0, 2], [0, 2]]], dtype=torch.long)
+    candidate_error = torch.tensor([[[0.0, 0.1], [0.0, 0.1]]], dtype=torch.float32)
     valid = torch.zeros(1, 2, 40, dtype=torch.bool)
     valid[:, :, 5:] = True
 
-    loss = unimm_candidate_set_ce_loss(logits, z_candidates, valid, match_steps=5)
+    loss, stats = unimm_soft_anchor_ce_loss(
+        logits,
+        z_candidates,
+        candidate_error,
+        valid,
+        match_steps=5,
+    )
 
     assert loss.item() == 0.0
+    assert stats["soft_anchor_entropy"].item() == 0.0
 
 
 def test_unimm_top_m_mixture_loss_rewards_multiple_candidate_anchors():
@@ -288,6 +299,70 @@ def test_unimm_top_m_mixture_loss_rewards_multiple_candidate_anchors():
 
     assert candidate_nll.shape == (1, 1, 2)
     assert torch.allclose(mixture_loss, single_loss, atol=1e-5)
+
+
+def test_unimm_top_m_mixture_front_weight_preserves_scale_but_prioritizes_commit_prefix():
+    logits = torch.tensor([[[0.0, 0.0]]], dtype=torch.float32)
+    z_candidates = torch.tensor([[[0, 1]]], dtype=torch.long)
+    target_local = torch.zeros(1, 1, 40, 3)
+    target_valid = torch.ones(1, 1, 40, dtype=torch.bool)
+    pred = {
+        "mean_pos": torch.zeros(1, 1, 2, 40, 2),
+        "pos_scale": torch.ones(1, 1, 2, 40, 2),
+        "mean_head": torch.zeros(1, 1, 2, 40),
+        "head_concentration": torch.ones(1, 1, 2, 40),
+    }
+    pred["mean_pos"][..., 0, 5:, 0] = 0.35
+    pred["mean_pos"][..., 1, :5, 0] = 1.0
+
+    _, weighted_nll = unimm_top_m_mixture_nll_loss(
+        pred,
+        logits,
+        z_candidates,
+        target_local,
+        target_valid,
+        front_weight_steps=5,
+        front_weight=4.0,
+    )
+    _, unweighted_nll = unimm_top_m_mixture_nll_loss(
+        pred,
+        logits,
+        z_candidates,
+        target_local,
+        target_valid,
+        front_weight_steps=5,
+        front_weight=1.0,
+    )
+
+    assert weighted_nll[0, 0, 0] < weighted_nll[0, 0, 1]
+    assert unweighted_nll[0, 0, 0] > unweighted_nll[0, 0, 1]
+
+
+def test_unimm_soft_anchor_ce_builds_distance_based_targets():
+    logits_match_soft = torch.tensor([[[2.0, 1.0, -4.0]]], dtype=torch.float32)
+    logits_hard = torch.tensor([[[4.0, -4.0, -4.0]]], dtype=torch.float32)
+    z_candidates = torch.tensor([[[0, 1, 2]]], dtype=torch.long)
+    valid = torch.ones(1, 1, 5, dtype=torch.bool)
+    candidate_error = torch.tensor([[[0.0, 0.2, 10.0]]], dtype=torch.float32)
+
+    soft_loss, stats = unimm_soft_anchor_ce_loss(
+        logits_match_soft,
+        z_candidates,
+        candidate_error,
+        valid,
+        match_steps=5,
+    )
+    hard_loss, _ = unimm_soft_anchor_ce_loss(
+        logits_hard,
+        z_candidates,
+        candidate_error,
+        valid,
+        match_steps=5,
+    )
+
+    assert soft_loss < hard_loss
+    assert 0.0 < stats["soft_anchor_entropy"].item() < math.log(3.0)
+    assert 0.6 < stats["soft_anchor_top1_prob"].item() < 0.7
 
 
 def test_unimm_positive_matching_tie_break_uses_prediction_tail_only_for_near_ties():
@@ -591,6 +666,9 @@ def test_unimm_lightning_training_step_runs(tmp_path: Path):
             "anchor_heading_weight": 1.0,
             "anchor_match_chunk_size": 16,
             "positive_top_m": 8,
+            "front_loss_steps": 5,
+            "front_loss_weight": 4.0,
+            "soft_anchor_min_temperature": 1e-4,
             "use_closed_loop_training": True,
             "inference_temperature": 1.0,
             "inference_top_k": 0,
@@ -635,6 +713,8 @@ def test_unimm_lightning_training_step_runs(tmp_path: Path):
     model = UniMMAnchorBased4s(cfg)
     loss, logs = model._forward_loss(_make_data(), use_closed_loop=True)
     assert torch.isfinite(loss)
+    assert "soft_anchor_entropy" in logs
+    assert "soft_anchor_temperature" in logs
     assert "posterior_accept_rate" in logs
     assert "posterior_error_p95" in logs
     assert "posterior_accept_rate_veh" in logs
@@ -662,6 +742,9 @@ def test_unimm_rollout_shapes(tmp_path: Path):
             "anchor_heading_weight": 1.0,
             "anchor_match_chunk_size": 16,
             "positive_top_m": 8,
+            "front_loss_steps": 5,
+            "front_loss_weight": 4.0,
+            "soft_anchor_min_temperature": 1e-4,
             "use_closed_loop_training": True,
             "inference_temperature": 1.0,
             "inference_top_k": 0,

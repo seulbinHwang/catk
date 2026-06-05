@@ -30,7 +30,7 @@ from src.unimm.anchors import (
     gather_anchors_by_type,
     load_anchor_file,
 )
-from src.unimm.losses import unimm_candidate_set_ce_loss, unimm_top_m_mixture_nll_loss
+from src.unimm.losses import unimm_soft_anchor_ce_loss, unimm_top_m_mixture_nll_loss
 from src.unimm.modules import UniMMAnchorBasedNetwork
 from src.unimm.processor import UniMMProcessor
 
@@ -150,6 +150,25 @@ class UniMMAnchorBased4s(LightningModule):
         self.loss_weights = model_config.loss_weights
         self.mixture_loss_weight = float(getattr(self.loss_weights, "mixture", 1.0))
         self.aux_ce_loss_weight = float(getattr(self.loss_weights, "aux_ce", 0.2))
+        self.front_loss_steps = int(getattr(model_config, "front_loss_steps", self.spec.num_commit_steps))
+        self.front_loss_weight = float(getattr(model_config, "front_loss_weight", 4.0))
+        if self.front_loss_steps <= 0:
+            raise ValueError(f"front_loss_steps must be positive, got {self.front_loss_steps}.")
+        if self.front_loss_steps > self.spec.num_prediction_steps:
+            raise ValueError(
+                "front_loss_steps cannot exceed prediction_horizon_steps, "
+                f"got {self.front_loss_steps} and {self.spec.num_prediction_steps}."
+            )
+        if self.front_loss_weight <= 0.0:
+            raise ValueError(f"front_loss_weight must be positive, got {self.front_loss_weight}.")
+        self.soft_anchor_min_temperature = float(
+            getattr(model_config, "soft_anchor_min_temperature", 1.0e-4)
+        )
+        if self.soft_anchor_min_temperature <= 0.0:
+            raise ValueError(
+                "soft_anchor_min_temperature must be positive, "
+                f"got {self.soft_anchor_min_temperature}."
+            )
         self.inference_temperature = float(model_config.inference_temperature)
         self.inference_top_k = int(getattr(model_config, "inference_top_k", 0))
         self.inference_top_p = float(getattr(model_config, "inference_top_p", 1.0))
@@ -319,12 +338,17 @@ class UniMMAnchorBased4s(LightningModule):
             batch.z_candidates,
             batch.target_local,
             target_valid,
+            front_weight_steps=self.front_loss_steps,
+            front_weight=self.front_loss_weight,
         )
-        aux_ce_loss = unimm_candidate_set_ce_loss(
+        aux_ce_loss, aux_ce_stats = unimm_soft_anchor_ce_loss(
             pred["logits"],
             batch.z_candidates,
+            batch.z_candidate_error,
             target_valid,
+            agent_type=batch.tokenized_agent["type"],
             match_steps=self.spec.num_match_steps,
+            min_temperature=self.soft_anchor_min_temperature,
         )
         total_loss = self.mixture_loss_weight * mixture_loss + self.aux_ce_loss_weight * aux_ce_loss
         if not torch.isfinite(total_loss):
@@ -343,6 +367,9 @@ class UniMMAnchorBased4s(LightningModule):
             "loss_mixture": mixture_loss.detach(),
             "loss_aux_ce": aux_ce_loss.detach(),
             "aux_mixture_ratio": aux_mixture_ratio,
+            "soft_anchor_entropy": aux_ce_stats["soft_anchor_entropy"].detach(),
+            "soft_anchor_top1_prob": aux_ce_stats["soft_anchor_top1_prob"].detach(),
+            "soft_anchor_temperature": aux_ce_stats["soft_anchor_temperature"].detach(),
             "z_star_error": batch.z_star_error[z_star_valid].mean().detach()
             if bool(z_star_valid.any())
             else batch.z_star_error.sum().detach() * 0.0,

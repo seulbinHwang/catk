@@ -33,7 +33,7 @@
 | 모델 크기 | K=2048 기준 약 7.1M parameters |
 
 논문에서 명시한 핵심은 `2048 anchors + continuous regression + Tpred=4s + closed-loop samples + approximate posterior policy + Tpost=Tz*=0.5s`다. 현재 구현도 이 조합만 대상으로 한다.
-학습 objective는 hard `z*` 하나에 대한 CE/regression이 아니라, GT와 가까운 top-M anchor 후보의 `scorer probability x trajectory likelihood`를 합산하는 mixture NLL이다. Auxiliary CE는 후보 set 전체에 확률 mass를 주도록 돕는 작은 보조항으로만 사용한다.
+학습 objective는 hard `z*` 하나에 대한 CE/regression이 아니라, GT와 가까운 top-M anchor 후보의 `scorer probability x trajectory likelihood`를 합산하는 mixture NLL이다. 최신 기본 loss는 closed-loop에서 실제 commit되는 앞 0.5초의 trajectory NLL weight를 4.0으로 높이고, auxiliary CE는 후보 set hard mass가 아니라 앞 0.5초 anchor 거리 기반 soft label CE로 계산한다.
 학습 context는 1초 history 끝인 raw step 10부터 8초 rollout 마지막 decision point인 raw step 85까지 `tau=0.5s` 간격으로 만든다. `Tpred=4s` 전체 GT가 남지 않는 late context는 `[40, 3]` target shape을 유지하되 남은 valid future만 supervision에 쓰고 나머지 timestep은 invalid mask로 제외한다.
 
 ## 코드 구조
@@ -43,7 +43,7 @@
 | `src/unimm/anchors.py` | anchor bank 로딩, category별 gather/matching, local/global 변환 |
 | `src/unimm/processor.py` | 기존 WOMD cache를 UniMM 학습/rollout 입력으로 변환 |
 | `src/unimm/modules.py` | continuous map encoder, factorized agent encoder, anchor-based decoder |
-| `src/unimm/losses.py` | top-M mixture NLL, candidate-set auxiliary CE, Laplace/von Mises NLL |
+| `src/unimm/losses.py` | front-weighted top-M mixture NLL, soft anchor auxiliary CE, Laplace/von Mises NLL |
 | `src/unimm/model/anchor_based_4s.py` | Lightning 학습, validation, closed-loop rollout, submission |
 | `scripts/build_unimm_anchors.py` | training cache에서 category별 8초 anchor 생성 |
 | `configs/model/unimm_anchor_based_4s.yaml` | 모델/하이퍼파라미터 |
@@ -329,7 +329,7 @@ DRY_RUN=1 bash scripts/start_unimm_h100x3x2_pretrain_if_idle.sh --dry-run
 | prediction horizon | 40 steps = 4초 |
 | commit interval | 5 steps = 0.5초 |
 | positive candidates | top-M=8, 5 steps = 0.5초 matching + near-tie tail tie-break |
-| loss | top-M mixture NLL weight 1.0 + candidate-set auxiliary CE weight 0.2 |
+| loss | front-weighted top-M mixture NLL weight 1.0 + soft anchor CE weight 0.2 |
 | inference temperature | 1.0 |
 | inference top-k | 0 |
 | inference top-p | 1.0 |
@@ -473,6 +473,33 @@ top-M operating-batch loss smoke:
 ```
 
 예전 hard `z*` run `unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_tiebreak_membal_temp1_20260604_002845`와 비교하면, objective가 달라져 loss 절댓값은 직접 비교하면 안 된다. 다만 예전 run도 초반 `train/loss`가 `8.99189 -> 7.73801 -> 6.91717`로 내려갔고 NaN 없이 진행됐으며, posterior accept rate는 `0.90479~0.92092` 범위였다. 새 top-M smoke도 `train/loss`와 `train/loss_mixture`가 내려가고 posterior accept rate가 `0.89787~0.91106`으로 같은 범위에 있어, 짧은 실제-cache/GPU 검증 기준으로는 학습 수렴을 막는 런타임/수치 오류가 보이지 않는다. `loss_aux_ce`는 보조항이라 batch별로 흔들릴 수 있지만 weight가 `0.2`이고 `aux_mixture_ratio`가 약 `0.33~0.39`로 주 loss를 압도하지 않았다.
+
+2026-06-05 20:13 KST에는 front-weighted mixture + soft anchor CE 변경을 같은 H100 x3x2 pod와 실제 cache로 검증했다. 먼저 양쪽 pod에서 `src/unimm` compile, 손실 함수 수치 검사, synthetic `_forward_loss`, synthetic closed-loop rollout shape 검사를 통과했고, 이후 실제 `/workspace/womd_v1_3/SMART_cache`를 읽는 2-node DDP smoke를 실행했다.
+
+```text
+front-weighted soft-anchor DDP smoke:
+  task_name=unimm_frontsoft_realcache_ddp_smoke_20260605_201331
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=2, val_batch_size=1
+  trainer.max_epochs=1
+  trainer.limit_train_batches=2
+  trainer.limit_val_batches=1
+  trainer.check_val_every_n_epoch=1
+  front_loss_steps=5
+  front_loss_weight=4.0
+  soft_anchor_min_temperature=0.0001
+  model.model_config.n_rollout_closed_val=2
+  model.model_config.n_batch_sim_agents_metric=1
+  model.model_config.scorer_scene_num=0
+  result=exit status 0 on both pods
+  val_open/loss=22.79269
+  val_open/loss_mixture=21.16893
+  val_open/loss_aux_ce=8.11882
+  val_open/aux_mixture_ratio=0.41488
+  val_closed/sim_agents_2025_mean/metametric=0.20735  # untrained tiny smoke, metric value is not a quality estimate
+```
+
+이 smoke에서 6개 DDP rank가 모두 등록됐고, training 2 batch와 closed-loop validation 1 batch가 완료됐다. 로그에는 `front_loss_steps=5`, `front_loss_weight=4.0`, `soft_anchor_min_temperature=0.0001`, trainable parameter `7.1M`이 실제 config로 출력됐다. W&B offline summary에 open-loop loss와 closed-loop WOSAC metric이 finite하게 남았으므로, 짧은 실제-cache/GPU 검증 기준으로는 새 objective가 학습, 추론, 평가 경로와 호환되는 것을 확인했다.
 
 2026-06-03 23:46 KST에 최신 `UniMM@1dbe124` 기준으로 학습-추론 파이프라인을 코드 레벨과 실제 cache/GPU로 다시 감사했다. 검토 대상은 `src/unimm/model/anchor_based_4s.py`, `src/unimm/processor.py`, `src/unimm/anchors.py`, `src/unimm/losses.py`, `src/unimm/modules.py`, datamodule, memory-balanced sampler, H100 launcher였다.
 
@@ -785,7 +812,7 @@ explicit test:
 실전 full pretrain은 아래처럼 OOM retry wrapper로 시작한다. 처음부터 학습할 때는 `CKPT_PATH`를 지정하지 않는다. wrapper는 CUDA OOM 또는 재시도 가능한 종료가 발생했을 때만 같은 `TASK_NAME`의 최신 checkpoint를 찾아 resume한다.
 
 ```bash
-TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_topm8_temp1_$(date +%Y%m%d_%H%M%S) \
+TASK_NAME=unimm_anchor_based_4s_h100x3x2_pretrain_globalbs180_frontsoft_temp1_$(date +%Y%m%d_%H%M%S) \
 SESSION=unimm-h100x3x2 \
 MASTER_PORT=29578 \
 INITIAL_BS=30 \
@@ -845,13 +872,15 @@ python scripts/launch_unimm_h100x3x2.py \
 | train context starts | raw step `10,15,...,85`; late context는 남은 valid future만 supervision |
 | output distribution | position Laplace, heading von Mises, timestep/coordinate independent |
 | heading concentration cap | `max_von_mises_concentration=100.0`; bf16/von Mises NLL의 과확신 NaN을 막는 수치 안정화 |
-| training objective | top-M mixture NLL over candidate anchors + candidate-set auxiliary CE |
-| trajectory NLL reduction | candidate별 valid timestep NLL mean |
+| training objective | front-weighted top-M mixture NLL over candidate anchors + soft anchor auxiliary CE |
+| trajectory NLL reduction | candidate별 normalized weighted valid timestep NLL mean. 앞 5 step weight 4.0, 뒤 35 step weight 1.0 |
+| soft anchor CE | top-M=8 후보 안에서 앞 0.5초 distance 기반 soft label. 후보 밖 target mass는 0 |
+| soft anchor temperature | batch 안 agent type별 median top2 distance gap / log(2), 최소 `1e-4` |
 | loss weights | `mixture=1.0`, `aux_ce=0.2` |
 | inference sampling | `temperature=1.0`, `top_k=0`, `top_p=1.0`; 0.5초마다 2048개 전체 anchor에서 확률 sampling |
 
 이 값들은 논문이 공개한 `K=2048`, `Tpred=4s`, `tau=Tpost=Tz*=0.5s`, AdamW, weight decay와 충돌하지 않는 선에서 재현 가능성과 기존 codebase 적합성을 우선해 선택한 값이다. 현재 학습 recipe는 64 epochs이며, LR은 H100 x3x2 effective batch size 180에 맞춰 sqrt scaling을 적용한다. Scheduler는 4 epoch linear warmup 뒤 epoch index 64에서 multiplier 0.0이 되도록 계산한다. 학습 중 validation은 비용을 줄이기 위해 16 epoch마다 실행하고, `scorer_scene_num=1680`으로 world size와 validation batch size가 바뀌어도 scorer 대상 scene 수가 같은 규모가 되도록 맞춘다.
-Loss 로그에서 `loss_mixture`는 top-M 후보들의 scorer probability와 trajectory likelihood를 합친 주 loss이고, `loss_aux_ce`는 후보 set 전체에 scorer 확률 mass를 주는 보조 loss다. `top_m_error`와 `top_m_nll`은 후보 set 품질과 decoder 보정 품질을 확인하기 위한 진단값이다. objective가 바뀌었으므로 기존 hard `z*` checkpoint에서 resume하지 말고 scratch pretrain을 사용한다.
+Loss 로그에서 `loss_mixture`는 top-M 후보들의 scorer probability와 front-weighted trajectory likelihood를 합친 주 loss이고, `loss_aux_ce`는 앞 0.5초 anchor 거리 기반 soft anchor CE다. `soft_anchor_entropy`, `soft_anchor_top1_prob`, `soft_anchor_temperature`는 soft label이 hard one-hot으로 붕괴하거나 과하게 퍼지지 않는지 확인하기 위한 진단값이다. `top_m_error`와 `top_m_nll`은 후보 set 품질과 decoder 보정 품질을 확인하기 위한 진단값이다. objective가 바뀌었으므로 기존 hard `z*` 또는 candidate-set CE checkpoint에서 resume하지 말고 scratch pretrain을 사용한다.
 closed-loop posterior 품질 진단을 위해 학습 중 `train/posterior_accept_rate`, `train/posterior_error_mean`, `train/posterior_error_p50`, `train/posterior_error_p90`, `train/posterior_error_p95`, `train/posterior_error_over_threshold`, type별 accept rate, context-step별 accept rate를 로깅한다.
 
 ## 빠른 검증

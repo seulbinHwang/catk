@@ -17,6 +17,9 @@ model_config:
   positive_tie_break_horizon_steps: 40
   positive_tie_break_tolerance: 0.0001
   positive_top_m: 8
+  front_loss_steps: 5
+  front_loss_weight: 4.0
+  soft_anchor_min_temperature: 0.0001
 
   use_closed_loop_training: true
   inference_temperature: 1.0
