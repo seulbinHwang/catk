@@ -164,15 +164,35 @@ class TrajTok:
 
         return polygon_contour
 
-    def get_nearest_traj(self, x, y, grid_mask, trajs_in_bin):
-        valid_pos = np.argwhere(grid_mask)
+    @staticmethod
+    def _mean_traj_with_circular_heading(trajs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        trajs = np.asarray(trajs)
+        if trajs.ndim != 3 or trajs.shape[-1] != 3:
+            raise ValueError(f"Expected trajs with shape [n, step, 3], got {trajs.shape}")
+
+        token_traj = np.empty(trajs.shape[1:], dtype=trajs.dtype)
+        token_traj[:, :2] = trajs[:, :, :2].mean(axis=0)
+        sin_mean = np.sin(trajs[:, :, 2]).mean(axis=0)
+        cos_mean = np.cos(trajs[:, :, 2]).mean(axis=0)
+        token_traj[:, 2] = np.arctan2(sin_mean, cos_mean)
+        heading_concentration = np.sqrt(sin_mean * sin_mean + cos_mean * cos_mean)
+        return token_traj, heading_concentration
+
+    def get_nearest_grid(self, x, y, valid_pos):
+        if len(valid_pos) == 0:
+            raise ValueError("Cannot find a nearest trajectory without any valid grid cells.")
         distances = np.abs(valid_pos[:, 0] - x) + np.abs(valid_pos[:, 1] - y)
         nearest_idx = np.argmin(distances)
-        nearest_x, nearest_y = valid_pos[nearest_idx]
-        nearest_traj = np.array(trajs_in_bin[nearest_x][nearest_y]).mean(axis=0)
+        return valid_pos[nearest_idx]
+
+    def get_nearest_traj(self, x, y, valid_pos, mean_trajs_in_bin):
+        nearest_x, nearest_y = self.get_nearest_grid(x, y, valid_pos)
+        nearest_traj = mean_trajs_in_bin[nearest_x][nearest_y]
+        if nearest_traj is None:
+            raise RuntimeError(f"Nearest valid grid ({nearest_x}, {nearest_y}) has no representative trajectory.")
         return nearest_traj
 
-    def interpolate_curve(self, x, y, theta, weight_factor0=0, weight_factor1=0, num_points=6):
+    def interpolate_curve(self, x, y, theta, weight_factor0=1, weight_factor1=1, num_points=6):
 
         p0 = np.array([0, 0])
         p1 = np.array([x, y])
@@ -188,6 +208,10 @@ class TrajTok:
         xys = spline(t_curve)
         headings = np.arctan2(derivatives[:, 1], derivatives[:, 0])
         curve_points = np.concatenate([xys, headings[:, None]], axis=-1)
+        curve_points[0] = np.array([0.0, 0.0, 0.0])
+        curve_points[-1, :2] = p1
+        curve_points[:, 2] = wrap_angle(curve_points[:, 2])
+        curve_points[-1, 2] = wrap_angle(theta)
 
         return curve_points
 
@@ -200,6 +224,7 @@ class TrajTok:
         self.vocab['grid_mask'] = {}
         self.vocab['grid_mask_filtered'] = {}
         self.vocab['raw_ep'] = {}
+        self.vocab['heading_concentration'] = {}
 
         for agent_class in self.agent_classes:
 
@@ -257,7 +282,26 @@ class TrajTok:
                         grid_mask_filtered[x,y] = False
                     if not grid_mask[x,y] and neighbors.sum() > filter_threshold_add:
                         grid_mask_filtered[x,y] = True
+            mean_traj_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
+            heading_concentration_in_bin = [[None for _ in range(y_binnum)] for _ in range(x_binnum)]
+            for x in range(x_binnum):
+                for y in range(y_binnum):
+                    if not grid_mask[x, y]:
+                        continue
+                    mean_traj, heading_concentration = self._mean_traj_with_circular_heading(
+                        np.asarray(traj_in_bin[x][y])
+                    )
+                    mean_traj_in_bin[x][y] = mean_traj
+                    heading_concentration_in_bin[x][y] = heading_concentration
+
+            nearest_source_pos = np.argwhere(grid_mask & grid_mask_filtered)
             token_trajs = []
+            token_heading_concentrations = []
+            token_source_counts = {
+                "non_empty_mean": 0,
+                "non_empty_interpolated": 0,
+                "empty_interpolated": 0,
+            }
             for x in range(x_binnum):
                 for y in range(y_binnum):
                     if not grid_mask_filtered[x,y]:
@@ -267,19 +311,30 @@ class TrajTok:
                     grid_end_y = y * (y_max - y_min) / y_binnum + y_min
 
                     if grid_mask[x,y]:
-                        token_traj = np.array(traj_in_bin[x][y]).mean(axis=0)
+                        token_traj = mean_traj_in_bin[x][y].copy()
+                        heading_concentration = heading_concentration_in_bin[x][y]
                         token_traj[-1,0] = grid_end_x
                         token_traj[-1,1] = grid_end_y
                         yaws = token_traj[:,-1]
-                        if np.abs((yaws[1:] - yaws[:-1])).max() > 10 * np.pi/180:
-                            nearest_traj = self.get_nearest_traj(x, y, grid_mask & grid_mask_filtered, traj_in_bin)
+                        if np.abs(wrap_angle(yaws[1:] - yaws[:-1])).max() > 10 * np.pi/180:
+                            nearest_x, nearest_y = self.get_nearest_grid(x, y, nearest_source_pos)
+                            nearest_traj = mean_traj_in_bin[nearest_x][nearest_y]
                             token_traj = self.interpolate_curve(grid_end_x, grid_end_y, nearest_traj[-1,2])
+                            heading_concentration = heading_concentration_in_bin[nearest_x][nearest_y]
+                            token_source_counts["non_empty_interpolated"] += 1
+                        else:
+                            token_source_counts["non_empty_mean"] += 1
                     else:
-                        nearest_traj = self.get_nearest_traj(x, y, grid_mask & grid_mask_filtered, traj_in_bin)
+                        nearest_x, nearest_y = self.get_nearest_grid(x, y, nearest_source_pos)
+                        nearest_traj = mean_traj_in_bin[nearest_x][nearest_y]
                         token_traj = self.interpolate_curve(grid_end_x, grid_end_y, nearest_traj[-1,2])
+                        heading_concentration = heading_concentration_in_bin[nearest_x][nearest_y]
+                        token_source_counts["empty_interpolated"] += 1
                     token_trajs.append(token_traj)
+                    token_heading_concentrations.append(heading_concentration)
 
             token_trajs = np.stack(token_trajs) # [n_token, shift+1, 3]
+            token_heading_concentrations = np.stack(token_heading_concentrations)
             if agent_class == "veh":
                 width_length = np.array([2.0, 4.8])
             elif agent_class == "ped":
@@ -295,6 +350,14 @@ class TrajTok:
             self.vocab['token_all'][agent_class] = token_countour
             self.vocab['grid_mask'][agent_class] = grid_mask
             self.vocab['grid_mask_filtered'][agent_class] = grid_mask_filtered
+            self.vocab['heading_concentration'][agent_class] = token_heading_concentrations
+            print(
+                agent_class,
+                "source_counts",
+                token_source_counts,
+                "endpoint_heading_concentration_mean",
+                float(np.nanmean(token_heading_concentrations[:, -1])),
+            )
             print(agent_class, token_countour.shape)
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -38,7 +38,7 @@
 2025년 1월
 - **WOSAC 최고 수준 성능**: CAT-K는 [WOSAC 리더보드](https://waymo.com/open/challenges/2024/sim-agents/) 1위를 달성했다. agent token vocabulary 문제를 해결한 뒤 fine-tuned model은 **0.7702** RMM을 달성했다. 리더보드에는 공개하지 않았지만 BC로 32 epoch만 학습한 재현 SMART-tiny-7M도 **0.7671** RMM을 달성했고, 이는 당시 2위 방법과 비슷한 수준이다. 재현 절차도 비교적 단순하다.
 
-- **TrajTok paper-submit agent vocabulary and supervision**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Token matching은 main/Thinklab public code와 같은 endpoint contour 방식이다. Rolling recurrence는 유지하되, 각 0.5초 구간마다 token endpoint box contour `[4 corners, x/y]`를 직전 token pose 기준 global frame으로 펼친 뒤 raw GT endpoint contour와 비교해 GT token을 고른다. Spatial-aware label smoothing도 하나의 최종 구현만 사용한다. 정답 token의 endpoint contour와 모든 후보 token의 endpoint contour corner distance를 계산하고, non-GT smoothing mass를 `1 / (distance^2 + epsilon)` 비율로 정확히 나눈다. 추가 uniform label smoothing이나 extra normalization은 적용하지 않는다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. 현재 pretrain train dataset의 on-the-fly augmentation은 `random_scene_scale_config: null`, `random_time_shift_config: null`로 꺼져 있으며, validation/test/submission cache나 원본 pickle도 바꾸지 않는다.
+- **TrajTok paper-submit agent vocabulary and supervision**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Grid 안 대표 trajectory는 `x/y`는 일반 평균, heading은 sin/cos circular mean으로 만든다. Non-empty grid는 wrapped heading jump가 작으면 이 대표 trajectory를 그대로 쓰고, jump가 큰 non-empty grid와 expansion empty grid만 circular endpoint heading을 반영한 Hermite 보간 trajectory를 쓴다. Token matching은 main/Thinklab public code와 같은 endpoint contour 방식이다. Rolling recurrence는 유지하되, 각 0.5초 구간마다 token endpoint box contour `[4 corners, x/y]`를 직전 token pose 기준 global frame으로 펼친 뒤 raw GT endpoint contour와 비교해 GT token을 고른다. Spatial-aware label smoothing도 하나의 최종 구현만 사용한다. 정답 token의 endpoint contour와 모든 후보 token의 endpoint contour corner distance를 계산하고, non-GT smoothing mass를 `1 / (distance^2 + epsilon)` 비율로 정확히 나눈다. 추가 uniform label smoothing이나 extra normalization은 적용하지 않는다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. 현재 pretrain train dataset의 on-the-fly augmentation은 `random_scene_scale_config: null`, `random_time_shift_config: null`로 꺼져 있으며, validation/test/submission cache나 원본 pickle도 바꾸지 않는다.
 - **TrajTok decoder capacity**: 기본 SMART decoder는 `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6`를 사용한다. Paper-submit vocab `veh=8037`, `ped=2998`, `cyc=2798` 기준으로 Hydra config를 compose한 뒤 SMART 모델을 직접 instantiate해서 측정한 전체 model parameter 수는 `8,247,013`개다. 모든 parameter가 trainable이며 non-trainable parameter는 0개다.
 
 ## 설치
@@ -327,6 +327,11 @@ GPU로 endpoint contour target을 검증했다.
 | 20260605 bs20 full-launch check | `smart_ntp_pretrain_h100x4_h100x2_globalbs120_lr612e4_...`, `data.train_batch_size=20`, 6 ranks | 장기 run에서 epoch 0 step 102 부근 `hsb-npc-training` rank 2 CUDA OOM 발생. 최종 기본값에서 제외 |
 | 20260605 bs18 stability check | same wrapper fallback, `data.train_batch_size=18`, 6 ranks, `lr=0.0005809475` | epoch 0 step 217까지 OOM/RuntimeError 없이 진행, `bs=20` 실패 지점인 102 step을 통과. 현재 안정 시작값으로 채택 |
 | 20260604 globalbs120 script smoke | `trajtok_h100x4_h100x2_globalbs120_lr612e4_script_smoke_20260604`, `data.train_batch_size=20`, 6 ranks, `lr=0.00061237244` | wrapper auto LR 계산, 1 train batch + 1 validation batch 정상 종료, open-loop/closed-loop Fast WOSAC/CPD/CES logging 확인, `run.py DONE` |
+| 20260605 circular vocab unit | `hsb-npc-training`, `wo-pvc-2`, direct Python test | circular heading mean이 `179/-179deg` 평균을 `0deg`로 무너뜨리지 않음, Hermite 보간 endpoint heading 보존 |
+| 20260605 circular vocab generation | `hsb-npc-training`, `/tmp/trajtok_paper_50k_traj_data.pkl` | 새 vocab 생성 성공, `veh=8037`, `ped=2998`, `cyc=2798`, shape `[N,6,3]`, `[N,6,4,2]`, `[N,4,2]` 정상 |
+| 20260605 old/new vocab delta | old calibrated 50k vocab vs circular vocab | changed token `veh=5763/8037`, `ped=2500/2998`, `cyc=2010/2798`; endpoint heading mean diff `13.38/9.67/7.26deg` |
+| 20260605 circular vocab H100 4+2 fit smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, real train cache, 1 train batch | 새 vocab load, forward/backward/optimizer step 정상 종료, `run.py DONE` |
+| 20260605 circular vocab H100 4+2 validation smoke | same pods, latest compatible checkpoint, real validation cache, 1 validation batch | 새 vocab load, open-loop + closed-loop Fast WOSAC metric 정상 종료, `run.py DONE` |
 
 2026-06-04에 spatial-aware smoothing도 endpoint contour 단일 구현으로 정리했다. 새
 smoothing target은 각 token의 0.5초 endpoint contour `[4, 2]`를 사용하며, 같은 batch
@@ -371,7 +376,14 @@ python -m src.smart.tokens.trajtok \
 생성기는 arXiv:2506.21618 Table 1 grid와 Table 3 submit vocab size를 맞추도록
 class별 filtering threshold를 사용한다. 실 cache 기준 생성 결과는 `veh=8037`,
 `ped=2998`, `cyc=2798`이며, 논문 submit size `8040/3001/2798`에서 vehicle/ped는
-각각 3개 차이, cyclist는 exact다.
+각각 3개 차이, cyclist는 exact다. Grid 안 representative trajectory의 heading은
+일반 평균이 아니라 sin/cos circular mean으로 계산한다. Non-empty grid는 wrapped yaw
+jump가 `10deg` 이하이면 이 representative를 그대로 사용하고, jump가 큰 non-empty
+grid와 expansion으로 추가된 empty grid만 가까운 valid grid의 circular endpoint heading을
+사용해 Hermite curve로 보간한다. 보간 curve의 시작/끝 tangent는 endpoint 거리 기준
+크기를 사용하며 마지막 heading은 source grid의 circular endpoint heading으로 고정한다.
+따라서 새 vocab 파일은 기존 checkpoint와 tensor shape은 호환되지만 token geometry가
+바뀌므로, 최종 RMM 비교는 이 vocab으로 새로 pretrain한 checkpoint에서 판단해야 한다.
 
 smoke test나 batch 조정은 환경 변수로만 바꾼다.
 
