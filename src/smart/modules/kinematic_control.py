@@ -16,13 +16,16 @@ MDG_STATE_POS_SCALE_M = 20.0
 MDG_STATE_SPEED_SCALE_MPS = 10.0
 
 # repo의 agent encoder와 dataset 전처리가 공유하는 정수 매핑입니다.
-# semi_mdg control-space는 모든 agent type을 같은 non-holonomic 복원식으로 처리합니다.
+# semi_mdg control-space는 모든 agent type을 non-holonomic action으로 처리합니다.
+# Pedestrian은 lateral channel을 쓰지 않고, 위치 변화에서 얻은 보행 진행방향으로
+# 먼저 회전한 뒤 전진하는 target/rollout 식을 사용합니다.
 # 매핑이 흔들리면 agent별 yaw scale/no-slip ratio가 조용히 잘못 적용되므로 이 상수와
 # _validate_agent_type() 한 곳을 같이 고치도록 의도적으로 노출합니다.
 VEHICLE_TYPE_ID = 0
 PEDESTRIAN_TYPE_ID = 1
 CYCLIST_TYPE_ID = 2
 _VALID_AGENT_TYPE_IDS = (VEHICLE_TYPE_ID, PEDESTRIAN_TYPE_ID, CYCLIST_TYPE_ID)
+PEDESTRIAN_WALK_HEADING_EPS_M = 0.02
 
 
 def _validate_agent_type(agent_type: Tensor) -> None:
@@ -240,6 +243,31 @@ def _resolve_no_slip_point_offset(
     return offset
 
 
+def _pedestrian_turn_then_walk_step(
+    target_pos: Tensor,
+    source_pos: Tensor,
+    source_head: Tensor,
+    *,
+    eps_m: float = PEDESTRIAN_WALK_HEADING_EPS_M,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Build a pedestrian non-holonomic step from displacement direction.
+
+    Pedestrian control remains ``[delta_s, 0, delta_yaw]``. The heading target is
+    the walking direction inferred from position change; near-zero moves keep the
+    previous heading to avoid unstable atan2 directions.
+    """
+    delta_vec = target_pos - source_pos
+    step_distance = torch.linalg.vector_norm(delta_vec, dim=-1)
+    moving = step_distance >= float(eps_m)
+    walk_head = torch.atan2(delta_vec[..., 1], delta_vec[..., 0])
+    next_head = torch.where(moving, walk_head, source_head)
+    delta_head = wrap_angle(next_head - source_head)
+    delta_s = torch.where(moving, step_distance, torch.zeros_like(step_distance))
+    next_heading_vec = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+    next_pos = source_pos + delta_s.unsqueeze(-1) * next_heading_vec
+    return delta_s, delta_head, next_pos, next_head
+
+
 def normalize_control(
     control: Tensor,
     agent_type: Tensor,
@@ -383,6 +411,13 @@ def _decode_control_components(
     )
 
     pos = roll_pos.unsqueeze(1) + delta_pos_nonhol.cumsum(dim=1)
+    pedestrian_mask = agent_type.to(device=device) == PEDESTRIAN_TYPE_ID
+    pedestrian_delta_pos = delta_s.unsqueeze(-1) * torch.stack(
+        [head.cos(), head.sin()],
+        dim=-1,
+    )
+    pedestrian_pos = roll_pos.unsqueeze(1) + pedestrian_delta_pos.cumsum(dim=1)
+    pos = torch.where(pedestrian_mask.view(num_agent, 1, 1), pedestrian_pos, pos)
     return pos, head
 
 
@@ -668,6 +703,7 @@ def build_rolling_control_target(
         else:
             source_pos = future_pos[:, step_idx - 1]
             source_head = future_head[:, step_idx - 1]
+        pedestrian_mask = agent_type == PEDESTRIAN_TYPE_ID
         delta_head = wrap_angle(target_head - source_head)
         delta_vec = target_pos - source_pos
 
@@ -688,6 +724,18 @@ def build_rolling_control_target(
         nonhol_delta_s = nonhol_proj / safe_sinc(0.5 * delta_head)
 
         delta_s = nonhol_delta_s
+        (
+            pedestrian_delta_s,
+            pedestrian_delta_head,
+            pedestrian_next_pos,
+            _,
+        ) = _pedestrian_turn_then_walk_step(
+            target_pos=target_pos,
+            source_pos=source_pos,
+            source_head=source_head,
+        )
+        delta_s = torch.where(pedestrian_mask, pedestrian_delta_s, delta_s)
+        delta_head = torch.where(pedestrian_mask, pedestrian_delta_head, delta_head)
         delta_n = torch.zeros_like(delta_s)
         step_control = torch.stack([delta_s, delta_n, delta_head], dim=-1)
         control_steps.append(step_control)
@@ -697,6 +745,11 @@ def build_rolling_control_target(
                 roll_pos
                 + nonhol_proj.unsqueeze(-1) * h_mid
                 + no_slip_offset.unsqueeze(-1) * (target_heading_vec - source_heading_vec)
+            )
+            nonhol_next_pos = torch.where(
+                pedestrian_mask.unsqueeze(-1),
+                pedestrian_next_pos,
+                nonhol_next_pos,
             )
             roll_pos = nonhol_next_pos
             roll_head = wrap_angle(roll_head + delta_head)
@@ -836,6 +889,7 @@ def build_rolling_control_target_with_round_trip_error(
         target_head = future_head[:, step_idx]
         source_pos = roll_pos
         source_head = roll_head
+        pedestrian_mask = agent_type == PEDESTRIAN_TYPE_ID
         delta_head = wrap_angle(target_head - source_head)
         delta_vec = target_pos - source_pos
 
@@ -853,6 +907,18 @@ def build_rolling_control_target_with_round_trip_error(
         nonhol_delta_s = nonhol_proj / safe_sinc(0.5 * delta_head)
 
         delta_s = nonhol_delta_s
+        (
+            pedestrian_delta_s,
+            pedestrian_delta_head,
+            pedestrian_next_pos,
+            _,
+        ) = _pedestrian_turn_then_walk_step(
+            target_pos=target_pos,
+            source_pos=source_pos,
+            source_head=source_head,
+        )
+        delta_s = torch.where(pedestrian_mask, pedestrian_delta_s, delta_s)
+        delta_head = torch.where(pedestrian_mask, pedestrian_delta_head, delta_head)
         delta_n = torch.zeros_like(delta_s)
         control_steps.append(torch.stack([delta_s, delta_n, delta_head], dim=-1))
 
@@ -860,6 +926,11 @@ def build_rolling_control_target_with_round_trip_error(
             roll_pos
             + nonhol_proj.unsqueeze(-1) * h_mid
             + no_slip_offset.unsqueeze(-1) * (target_heading_vec - source_heading_vec)
+        )
+        nonhol_next_pos = torch.where(
+            pedestrian_mask.unsqueeze(-1),
+            pedestrian_next_pos,
+            nonhol_next_pos,
         )
         roll_pos = nonhol_next_pos
         roll_head = wrap_angle(roll_head + delta_head)

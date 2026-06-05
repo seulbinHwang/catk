@@ -54,12 +54,12 @@ def _reference_round_trip_error(
     return torch.linalg.vector_norm(decoded_pos - future_pos, dim=-1)
 
 
-def test_pedestrian_rolling_control_uses_nonholonomic_projection() -> None:
+def test_pedestrian_rolling_control_uses_walk_direction_nonholonomic_target() -> None:
     current_pos = torch.tensor([[0.0, 0.0]])
     current_head = torch.tensor([0.0])
     future_pos = torch.tensor([[[1.0, 1.0], [2.0, 1.0]]])
     future_head = torch.tensor([[0.2, 0.2]])
-    agent_type = torch.tensor([1])
+    agent_type = torch.tensor([PEDESTRIAN_TYPE_ID])
 
     control_norm = build_rolling_control_target(
         future_pos=future_pos,
@@ -82,8 +82,10 @@ def test_pedestrian_rolling_control_uses_nonholonomic_projection() -> None:
     control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
 
     torch.testing.assert_close(control[..., 1], torch.zeros_like(control[..., 1]))
-    assert not torch.allclose(decoded_pos, future_pos, atol=1.0e-3, rtol=1.0e-3)
-    torch.testing.assert_close(decoded_head, future_head, atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(decoded_pos, future_pos, atol=1.0e-5, rtol=1.0e-5)
+    expected_head = torch.tensor([[math.pi / 4.0, 0.0]])
+    torch.testing.assert_close(decoded_head, expected_head, atol=1.0e-5, rtol=1.0e-5)
+    assert not torch.allclose(decoded_head, future_head, atol=1.0e-3, rtol=1.0e-3)
 
 
 def test_vehicle_rolling_control_uses_no_lateral_channel() -> None:
@@ -448,7 +450,7 @@ def test_round_trip_error_reports_vehicle_lateral_teleport() -> None:
     torch.testing.assert_close(round_trip_error_m, torch.tensor([[6.0]]), atol=1.0e-5, rtol=1.0e-5)
 
 
-def test_round_trip_error_reports_pedestrian_lateral_motion() -> None:
+def test_round_trip_error_accepts_pedestrian_lateral_motion_as_turn_then_walk() -> None:
     current_pos = torch.tensor([[0.0, 0.0]])
     current_head = torch.tensor([0.0])
     future_pos = torch.tensor([[[0.0, 6.0]]])
@@ -464,7 +466,36 @@ def test_round_trip_error_reports_pedestrian_lateral_motion() -> None:
         **CONTROL_YAW_SCALE_KWARGS,
     )
 
-    torch.testing.assert_close(round_trip_error_m, torch.tensor([[6.0]]), atol=1.0e-5, rtol=1.0e-5)
+    torch.testing.assert_close(round_trip_error_m, torch.zeros_like(round_trip_error_m), atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_pedestrian_near_stationary_step_keeps_previous_heading() -> None:
+    current_pos = torch.tensor([[0.0, 0.0]])
+    current_head = torch.tensor([0.7])
+    future_pos = torch.tensor([[[0.01, 0.0], [1.01, 0.0]]])
+    future_head = torch.zeros((1, 2))
+    agent_type = torch.tensor([PEDESTRIAN_TYPE_ID])
+
+    control_norm = build_rolling_control_target(
+        future_pos=future_pos,
+        future_head=future_head,
+        current_pos=current_pos,
+        current_head=current_head,
+        agent_type=agent_type,
+        **CONTROL_YAW_SCALE_KWARGS,
+    )
+    control = denormalize_control(control_norm, agent_type=agent_type, **CONTROL_YAW_SCALE_KWARGS)
+    decoded_pos, decoded_head = decode_control_sequence(
+        control=control,
+        agent_type=agent_type,
+        current_pos=current_pos,
+        current_head=current_head,
+    )
+
+    torch.testing.assert_close(control[:, 0, 0], torch.zeros(1), atol=1.0e-6, rtol=1.0e-6)
+    torch.testing.assert_close(control[:, 0, 2], torch.zeros(1), atol=1.0e-6, rtol=1.0e-6)
+    torch.testing.assert_close(decoded_head[:, 0], current_head, atol=1.0e-6, rtol=1.0e-6)
+    torch.testing.assert_close(decoded_pos[:, 0], current_pos, atol=1.0e-6, rtol=1.0e-6)
 
 
 def test_fused_round_trip_error_matches_separate_decode_reference() -> None:

@@ -74,7 +74,7 @@ train/loss = train/loss_mdg + 5.0 * train/loss_aux
 
 ## Control Dynamics
 
-이 브랜치에서는 **사람, 자전거, 자동차를 모두 같은 non-holonomic control-state dynamics로 처리**합니다. 보행자도 별도 holonomic 예외 경로를 쓰지 않습니다.
+이 브랜치에서는 **사람, 자전거, 자동차를 모두 non-holonomic control-state dynamics로 처리**합니다. 보행자도 별도 holonomic 예외 경로를 쓰지 않습니다.
 
 제어값은 여전히 3차원입니다.
 
@@ -82,11 +82,18 @@ train/loss = train/loss_mdg + 5.0 * train/loss_aux
 [delta_s, delta_n, delta_yaw]
 ```
 
-하지만 semi_mdg 기본 학습/추론에서는 모든 agent type에 대해 `delta_n=0`인 non-holonomic 경로만 의미 있게 사용합니다. 즉 lateral 이동을 한 step에서 순간이동처럼 직접 맞추는 대신, `delta_s`와 `delta_yaw`가 만드는 곡선 진행으로 상태를 복원합니다. 이 제약으로 복원할 수 없는 lateral GT motion은 round-trip error로 잡히며, `control_round_trip_max_position_error_m` 필터 대상이 됩니다.
+하지만 semi_mdg 기본 학습/추론에서는 모든 agent type에 대해 `delta_n=0`인 non-holonomic 경로만 의미 있게 사용합니다. vehicle/cyclist는 기존 no-slip midpoint arc 식을 유지하고, pedestrian은 raw heading 대신 위치 변화에서 얻은 보행 진행방향으로 먼저 회전한 뒤 전진합니다. 따라서 보행자 lateral GT motion은 `delta_n` 직접 이동으로 맞추지 않고, `delta_yaw`로 진행방향을 돌린 후 `delta_s`로 흡수합니다. 이 방식은 보행자를 holonomic으로 만들지 않으면서 보행자 position round-trip error를 크게 줄이기 위한 target 생성 방식입니다.
 
 `use_holonomic_model_only` 옵션은 더 이상 노출하지 않습니다. 호환성 때문에 일부 함수 인자로 남아 있더라도 `true`가 들어오면 즉시 에러를 내서 잘못된 실험이 조용히 학습되지 않게 막습니다.
 
 출력은 기존 평가 경로와 동일하게 raw 10Hz position/heading rollout으로 변환됩니다.
+
+2026-06-05 기준 testas A100x7 검증:
+
+- `tests/test_kinematic_control.py`: 21 passed
+- control metric / prefix-valid loss / type-aware yaw scale 관련 테스트: 23 passed
+- SMART cache training 512 scene 샘플에서 pedestrian action->state round-trip position error가 mean `0.03298m -> 0.00197m`, p95 `0.11366m -> 0.01457m`, max `1.47296m -> 0.02000m`로 감소
+- real cache 기반 7-GPU smoke: 1 train batch + open-loop validation + closed-loop Fast WOSAC validation 정상 종료
 
 ## 데이터
 
