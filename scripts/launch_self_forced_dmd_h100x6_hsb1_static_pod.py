@@ -34,7 +34,7 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 DEFAULT_TASK_NAME = (
     "flow_self_forced_dmd_h100x6_hsb1_epoch116_activecontrol_"
-    "sample16_backprop8_lr1e-6_bs21_oomretry"
+    "sample16_backprop8_lr1e-6_bs18_oomretry"
 )
 DEFAULT_SESSION = "catk-self-forced-dmd-h100x6-hsb1"
 
@@ -362,7 +362,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3,4,5")
     parser.add_argument("--nproc-per-node", type=int, default=6)
-    parser.add_argument("--initial-bs", type=int, default=21)
+    parser.add_argument("--initial-bs", type=int, default=18)
     parser.add_argument("--oom-step", type=int, default=1)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--val-batch-size", default="16")

@@ -104,9 +104,9 @@ callbacks:
 
 data:
   # Measured on hsb-npc-training-1 H100x6 for active-control DMD self forcing:
-  # bs22+ OOMs on the first train batch, while bs21 passes the train smoke.
-  # Keep the launcher OOM fallback enabled because bs21 has a thin memory margin.
-  train_batch_size: 21
+  # bs19+ OOMs on the first full-run train batch, while bs18 proceeds.
+  # Keep the launcher OOM fallback enabled for rare later-batch memory spikes.
+  train_batch_size: 18
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
