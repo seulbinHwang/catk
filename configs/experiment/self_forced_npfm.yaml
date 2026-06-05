@@ -24,11 +24,12 @@ model:
       weight: 1.0
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
+      detach_block_transition: true
       # Training self-rollout 전용입니다. Inference/validation stop-motion은
       # model_config.decoder.use_stop_motion으로 별도 제어합니다.
       use_stop_motion: false
       estimator_updates_per_step: 5
-      estimator_warmup_epochs: 1
+      estimator_warmup_epochs: 0
       # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
       # Resume from a self-forced checkpoint preserves restored aux states.
       initialize_aux_from_generator_on_fit_start: true
@@ -39,6 +40,7 @@ model:
         sample_steps: 16
         sample_method: euler
         noise_scale: 1.0
+        backprop_last_k: 8
         random_terminal_step:
           enabled: true
           scope: global_batch

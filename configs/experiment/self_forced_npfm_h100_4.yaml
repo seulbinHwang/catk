@@ -59,7 +59,7 @@ model:
       use_anchor_flow_matching_loss: false
       detach_block_transition: true
       estimator_updates_per_step: 5
-      estimator_warmup_epochs: 1
+      estimator_warmup_epochs: 0
       # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
       # Resume from a self-forced checkpoint preserves restored aux states.
       initialize_aux_from_generator_on_fit_start: true
@@ -71,7 +71,7 @@ model:
         sample_method: euler
         noise_scale: 1.0
         # policy=all이면 마지막 K denoising step에만 gradient를 남깁니다.
-        backprop_last_k: 16
+        backprop_last_k: 8
         random_terminal_step:
           enabled: true
           scope: global_batch
