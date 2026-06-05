@@ -2099,9 +2099,9 @@ python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py --replace
 ```bash
 python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py \
   --replace \
-  --task-name flow_self_forced_dmd_h100x6_hsb1_smoke_bs36 \
+  --task-name flow_self_forced_dmd_h100x6_hsb1_smoke_bs21 \
   --session catk-self-forced-dmd-h100x6-hsb1-smoke \
-  --initial-bs 36 \
+  --initial-bs 21 \
   --max-epochs 1 \
   --limit-train-batches 2 \
   --limit-val-batches 0
@@ -2114,7 +2114,7 @@ python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py \
 | pod | `hsb-npc-training-1` 단일 H100x6 |
 | branch | `semi_control_stable` |
 | experiment | `self_forced_npfm_h100_6` |
-| default task | `flow_self_forced_dmd_h100x6_hsb1_epoch116_activecontrol_sample16_backprop8_lr1e-6_bs36_oomretry` |
+| default task | `flow_self_forced_dmd_h100x6_hsb1_epoch116_activecontrol_sample16_backprop8_lr1e-6_bs21_oomretry` |
 | pretrained checkpoint | `jksg01019-naver-labs/SMART-FLOW/epoch-last-mqfq3u39:v121` |
 | checkpoint 의미 | train+validation pretrain run의 epoch 116 Generator |
 | action | 첫 시도 `finetune`, OOM 후 재시도는 최신 self-forced `epoch_last.ckpt` 기준 `fit` |
@@ -2137,9 +2137,11 @@ python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py \
 | train data fraction | `data.train_epoch_sample_fraction=0.5` |
 | validation | `check_val_every_n_epoch=2`, `limit_val_batches=0.1` |
 | epochs | `12` |
-| initial train batch | per-rank `36` |
-| OOM fallback | `36 -> 35 -> ...`, latest self-forced checkpoint resume |
+| initial train batch | per-rank `21`, effective global batch `126` |
+| OOM fallback | `21 -> 20 -> ...`, latest self-forced checkpoint resume |
 | tmux session | `catk-self-forced-dmd-h100x6-hsb1` |
+
+2026-06-05 H100x6 probe 기준으로 `bs22` 이상은 첫 train batch에서 CUDA OOM이 났고, `bs21`은 active-control DMD train smoke 2 batch를 통과했습니다. `bs21`의 worst-rank peak가 약 `79.8GB / 81.6GB`로 여유가 얇기 때문에 full run에서는 OOM retry를 유지합니다. 이후 더 긴 batch에서 OOM이 발생하면 launcher가 최신 self-forced checkpoint를 기준으로 `bs20`부터 자동 재개합니다.
 
 tmux 확인:
 

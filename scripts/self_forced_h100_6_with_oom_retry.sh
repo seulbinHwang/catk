@@ -12,7 +12,7 @@
 #                  ckpt you would have passed to the bare `ckpt_path=` argument).
 #
 # Optional knobs (env vars; sensible defaults shown):
-#   INITIAL_BS=36        Initial `data.train_batch_size`.
+#   INITIAL_BS=21        Initial `data.train_batch_size`.
 #   OOM_STEP=1           Decrement applied to `data.train_batch_size` per OOM.
 #   MIN_BS=2             Stop trying when `bs` would fall below this value.
 #   TASK_NAME=flow_semi_continuous_self_forced_h1006
@@ -56,7 +56,7 @@ EXPERIMENT="${EXPERIMENT:-self_forced_npfm_h100_6}"
 TASK_NAME="${TASK_NAME:-flow_semi_continuous_self_forced_h1006}"
 CACHE_ROOT="${CACHE_ROOT:-/mnt/nuplan/womd_v1_3/SMART_cache}"
 CATK_LOG_DIR="${CATK_LOG_DIR:-${REPO_ROOT}/logs}"
-INITIAL_BS="${INITIAL_BS:-36}"
+INITIAL_BS="${INITIAL_BS:-21}"
 OOM_STEP="${OOM_STEP:-1}"
 MIN_BS="${MIN_BS:-2}"
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"

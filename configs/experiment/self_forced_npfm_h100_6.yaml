@@ -103,9 +103,10 @@ callbacks:
     mode: max
 
 data:
-  # Conservative per-GPU batch for self-forced random terminal denoising.
-  # Increase only after a fresh memory probe on the target H100 box.
-  train_batch_size: 36
+  # Measured on hsb-npc-training-1 H100x6 for active-control DMD self forcing:
+  # bs22+ OOMs on the first train batch, while bs21 passes the train smoke.
+  # Keep the launcher OOM fallback enabled because bs21 has a thin memory margin.
+  train_batch_size: 21
   val_batch_size: 16
   test_batch_size: 16
   num_workers: 4
