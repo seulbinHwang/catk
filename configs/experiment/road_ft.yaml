@@ -21,7 +21,11 @@ model:
     lr_total_steps: ${trainer.max_epochs}
     lr_min_ratio: 1.0
     n_rollout_closed_val: 16
-    n_batch_sim_agents_metric: 100000
+    # Request about 880 global validation scenes for fast fit-time RMM.
+    # With 2 GPUs and val_batch_size=16 this becomes 28 per-rank batches
+    # and 896 effective scenes because scoring is batch-granular.
+    scorer_scene_num: 880
+    n_batch_sim_agents_metric: 28
     sim_agents_metric_workers: 8
     n_vis_batch: 0
     n_vis_scenario: 0
@@ -50,6 +54,7 @@ trainer:
   max_epochs: 16
   precision: bf16-mixed
   gradient_clip_val: 1.0
+  log_every_n_steps: 1
   sync_batchnorm: false
   num_sanity_val_steps: 0
 
