@@ -501,6 +501,58 @@ front-weighted soft-anchor DDP smoke:
 
 이 smoke에서 6개 DDP rank가 모두 등록됐고, training 2 batch와 closed-loop validation 1 batch가 완료됐다. 로그에는 `front_loss_steps=5`, `front_loss_weight=4.0`, `soft_anchor_min_temperature=0.0001`, trainable parameter `7.1M`이 실제 config로 출력됐다. W&B offline summary에 open-loop loss와 closed-loop WOSAC metric이 finite하게 남았으므로, 짧은 실제-cache/GPU 검증 기준으로는 새 objective가 학습, 추론, 평가 경로와 호환되는 것을 확인했다.
 
+2026-06-05 20:21~20:25 KST에는 같은 `UniMM@67a1d6c`를 양쪽 pod에서 clean pull한 뒤 전처리, 학습, 추론, 평가 경로를 다시 검증했다. Direct QA는 Lightning trainer 없이 실제 train/validation cache batch를 직접 로드해 processor output, 새 loss, backward gradient, closed-loop rollout을 확인했다.
+
+```text
+direct cache/GPU QA:
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  commit=67a1d6c
+  cache_root=/workspace/womd_v1_3/SMART_cache
+  target_local_shape=[26, 16, 40, 3]
+  target_valid_shape=[26, 16, 40]
+  z_candidates_shape=[26, 16, 8]
+  pred_traj_shape=[24, 2, 80, 2]
+  checks=finite loss, finite soft-anchor stats, finite backward gradients, finite closed-loop rollout
+  result=UNIMM_DIRECT_QA_OK on both pods
+```
+
+이어서 Hydra/Lightning/DDP 경로를 그대로 쓰는 end-to-end smoke를 실행했다.
+
+```text
+fit + validation smoke:
+  task_name=unimm_frontsoft_pipeline_fit_verify_20260605_202139
+  pods=hsb-npc-training-3-1, hsb-npc-training-3-2
+  world_size=6, train_batch_size=2, val_batch_size=1
+  trainer.max_epochs=1
+  trainer.limit_train_batches=2
+  trainer.limit_val_batches=1
+  trainer.check_val_every_n_epoch=1
+  result=exit status 0 on both pods
+  checkpoint=/mnt/nuplan/projects/catk/logs/unimm_frontsoft_pipeline_fit_verify_20260605_202139/runs/2026-06-05_20-21-45/checkpoints/epoch_last.ckpt
+  val_open/loss=22.79052
+  val_open/loss_mixture=21.16656
+  val_open/loss_aux_ce=8.11976
+  val_closed/sim_agents_2025_mean/metametric=0.17278
+
+explicit validate smoke:
+  task_name=unimm_frontsoft_pipeline_validate_verify_20260605_202314
+  ckpt_path=synced to /tmp/unimm_h100x3x2_synced_ckpts on both pods
+  trainer.limit_val_batches=1
+  result=exit status 0 on both pods
+  val_open/loss=22.79138
+  val_open/loss_mixture=21.16747
+  val_open/loss_aux_ce=8.11958
+  val_closed/sim_agents_2025_mean/metametric=0.17286
+
+explicit test smoke:
+  task_name=unimm_frontsoft_pipeline_test_verify_20260605_202420
+  ckpt_path=synced to /tmp/unimm_h100x3x2_synced_ckpts on both pods
+  trainer.limit_test_batches=1
+  result=exit status 0 on both pods
+```
+
+이 재검증에서 checkpoint sync, checkpoint load, validation closed-loop WOSAC metric, test closed-loop inference가 모두 통과했다. 종료 후 검증용 tmux session은 정리했고 양쪽 pod는 GPU memory `4MiB`, utilization `0%`로 복귀했다.
+
 2026-06-03 23:46 KST에 최신 `UniMM@1dbe124` 기준으로 학습-추론 파이프라인을 코드 레벨과 실제 cache/GPU로 다시 감사했다. 검토 대상은 `src/unimm/model/anchor_based_4s.py`, `src/unimm/processor.py`, `src/unimm/anchors.py`, `src/unimm/losses.py`, `src/unimm/modules.py`, datamodule, memory-balanced sampler, H100 launcher였다.
 
 ```text
