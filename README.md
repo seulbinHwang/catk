@@ -33,7 +33,7 @@ SMART cache scene
 | control dim | `[delta_s, delta_n, delta_yaw]` |
 | MDG state dim | `[x/20, y/20, cos(yaw), sin(yaw), speed/10]` |
 | noise level | 1..5, alpha `[0.99, 0.745, 0.5, 0.255, 0.01]` |
-| inference default | `sample_steps=1`, `action_reuse=false` |
+| inference default | `sample_steps=1`, `action_reuse=true` |
 
 ## Control Dynamics
 
@@ -141,7 +141,7 @@ max_epochs: 64
 precision: bf16-mixed
 validation: check_val_every_n_epoch=16, limit_val_batches=0.1
 closed-loop validation: n_rollout_closed_val=32, scorer_scene_num=1680
-validation sampling: sample_steps=1, action_reuse=false, antithetic_pairs=true
+validation sampling: sample_steps=1, action_reuse=true, antithetic_pairs=true
 optimizer LR: 0.00068313
 OOM retry: train_batch_size를 2씩 낮추고 latest epoch_last.ckpt에서 재시작
 ```
@@ -246,7 +246,7 @@ batch-size safety check:
 | validation 주기 | 16 epoch |
 | validation rollout | 32 |
 | `validation_rollout_sampling.sample_steps` | 1 |
-| `validation_rollout_sampling.action_reuse` | false |
+| `validation_rollout_sampling.action_reuse` | true |
 | `decoder.closed_loop_rollout_mode` | `raw_mdg` |
 | `decoder.use_lqr` | false |
 | DDP `find_unused_parameters` | true |
@@ -258,18 +258,18 @@ batch-size safety check:
 
 ```text
 sample_steps=1
-action_reuse=false
+action_reuse=true
 ```
 
 `sample_steps > 1`로 MDG multi-step denoising을 실험할 때도 denoiser 호출 mask는 학습된 noise level만 사용합니다. 예를 들어 5-step은 `[5, 4, 3, 2, 1]` 순서로 denoiser를 호출하고, Algorithm 2의 마지막 clean transition은 `m0=0`, `alpha(m0)=1`인 identity로 처리합니다. 따라서 마지막에 별도 `m=0` denoiser 호출을 추가하지 않고, 마지막 clean estimate를 그대로 최종 control로 사용합니다.
 
-action reuse ablation이 필요할 때만 다음처럼 켭니다.
+action reuse는 기본으로 켜져 있습니다. 끄는 ablation이 필요할 때만 다음처럼 override합니다.
 
 ```bash
-model.model_config.validation_rollout_sampling.action_reuse=true
+model.model_config.validation_rollout_sampling.action_reuse=false
 ```
 
-action reuse는 이전 2초 predicted control을 0.5초 앞으로 shift한 뒤, 새 noise와 섞어 다음 block의 초기 action으로 사용합니다. 기본값은 false입니다.
+action reuse는 이전 2초 predicted control을 0.5초 앞으로 shift한 뒤, 새 noise와 섞어 다음 block의 초기 action으로 사용합니다. 기본값은 true입니다.
 
 ## 검증 기준
 

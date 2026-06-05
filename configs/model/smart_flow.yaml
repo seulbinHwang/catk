@@ -58,7 +58,7 @@ model_config:
   validation_rollout_sampling:
     sample_steps: 1
     noise_scale: 1.0
-    action_reuse: false
+    action_reuse: true
     action_reuse_alpha: [0.70, 0.60, 0.50, 0.01]
     antithetic_pairs: true
   decoder:
