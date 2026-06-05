@@ -140,7 +140,9 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
     decoder.control_vehicle_no_slip_point_ratio = 0.0
     decoder.control_cyclist_no_slip_point_ratio = 0.0
     decoder.flow_ode = _DummyFlowODE()
-    decoder.flow_decoder = lambda hidden, x_t, tau, future_valid_mask=None: x_t
+    decoder.flow_decoder = lambda hidden, x_t, tau, future_valid_mask=None: x_t.new_zeros(
+        (x_t.shape[0], x_t.shape[1], decoder.flow_state_dim)
+    )
     decoder.build_anchor_context = lambda **kwargs: {
         "ctx_hidden_pack": torch.zeros((1, 2, 1)),
         "anchor_hidden": torch.zeros((1, 1, 1)),
@@ -162,6 +164,39 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
     )
 
     torch.testing.assert_close(out["flow_clean_metric_norm"], raw_metric_target)
+
+
+def test_mdg_mask_sampler_marks_invalid_future_steps_clean_zero() -> None:
+    decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
+    decoder.flow_window_steps = 4
+    decoder.mdg_num_noise_levels = 5
+
+    torch.manual_seed(7)
+    tokenized_agent = {
+        "batch": torch.zeros(2, dtype=torch.long),
+        "num_graphs": 1,
+    }
+    anchor_mask = torch.tensor([[True], [True]])
+    future_valid_mask = torch.tensor(
+        [
+            [True, False, True, False],
+            [False, True, True, False],
+        ]
+    )
+
+    mask_level = decoder._sample_mdg_train_mask_levels(
+        tokenized_agent=tokenized_agent,
+        anchor_mask=anchor_mask,
+        future_valid_mask=future_valid_mask,
+    )
+
+    assert tuple(mask_level.shape) == tuple(future_valid_mask.shape)
+    torch.testing.assert_close(
+        mask_level[~future_valid_mask],
+        torch.zeros_like(mask_level[~future_valid_mask]),
+    )
+    assert bool((mask_level[future_valid_mask] >= 1.0).all().item())
+    assert bool((mask_level[future_valid_mask] <= decoder.mdg_num_noise_levels).all().item())
 
 
 def test_agent_anchor_context_keeps_raw_metric_target() -> None:

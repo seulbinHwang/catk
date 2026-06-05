@@ -154,8 +154,8 @@ def build_anchor0_normalized_committed_control(
         vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
         pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
         cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
-        use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic control
-            projection을 씁니다.
+        use_holonomic_model_only: semi_mdg에서는 지원하지 않는 이전 ablation 인자입니다.
+            ``True`` 를 넘기면 에러가 발생합니다.
         use_rolling_supervision: ``True`` 이면 decoder-consistent rolling projection을
             사용하고, ``False`` 이면 raw pose pair inverse를 사용합니다.
         vehicle_no_slip_point_ratio: vehicle box length에 곱하는 no-slip point offset 비율입니다.

@@ -32,9 +32,11 @@ class SMARTFlowDecoder(nn.Module):
         flow_dim: int,
         flow_num_chunk_heads: int,
         flow_num_chunk_layers: int,
-        flow_solver_steps: int,
-        flow_solver_method: str,
-        flow_solver_eps: float,
+        flow_solver_steps: int | None = None,
+        flow_solver_method: str | None = None,
+        flow_solver_eps: float | None = None,
+        mdg_num_noise_levels: int = 5,
+        mdg_state_speed_scale_mps: float = 10.0,
         closed_loop_rollout_mode: str = "raw_fm",
         flow_window_steps: int = 20,
         use_kinematic_control_flow: bool = False,
@@ -86,9 +88,8 @@ class SMARTFlowDecoder(nn.Module):
             flow_dim=flow_dim,
             flow_num_chunk_heads=flow_num_chunk_heads,
             flow_num_chunk_layers=flow_num_chunk_layers,
-            flow_solver_steps=flow_solver_steps,
-            flow_solver_method=flow_solver_method,
-            flow_solver_eps=flow_solver_eps,
+            mdg_num_noise_levels=mdg_num_noise_levels,
+            mdg_state_speed_scale_mps=mdg_state_speed_scale_mps,
             closed_loop_rollout_mode=closed_loop_rollout_mode,
             use_lqr=use_lqr,
             use_stop_motion=False,
@@ -307,7 +308,7 @@ class SMARTFlowDecoder(nn.Module):
         tau: Tensor,
         anchor_mask: Tensor,
     ) -> Dict[str, Tensor]:
-        """첫 flow anchor의 noisy N초 path에 대한 velocity와 clean estimate를 계산합니다.
+        """semi_mdg에서 제거된 Flow Matching velocity API입니다.
 
         Args:
             tokenized_agent: 평가 모드 기준 agent token 사전입니다.
@@ -319,12 +320,10 @@ class SMARTFlowDecoder(nn.Module):
         Returns:
             Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
         """
-        return self.agent_encoder.path_flow_velocity_for_anchor0(
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
-            path_noisy_norm=path_noisy_norm,
-            tau=tau,
-            anchor_mask=anchor_mask,
+        raise RuntimeError(
+            "semi_mdg removes Flow Matching velocity prediction. "
+            "Use MDG control-state denoising through sample_open_loop_future() "
+            "or rollout_from_cache() instead."
         )
 
 
@@ -335,6 +334,8 @@ class SMARTFlowDecoder(nn.Module):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        agent_type: Tensor | None = None,
+        agent_length: Tensor | None = None,
     ) -> Tensor:
         """고정된 문맥에서 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -356,6 +357,8 @@ class SMARTFlowDecoder(nn.Module):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            agent_type=agent_type,
+            agent_length=agent_length,
         )
 
     def flow_norm_to_pose_metric_norm(

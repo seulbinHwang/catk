@@ -417,18 +417,20 @@ class NormalizedNoisyFutureEncoder(nn.Module):
         flow_dim: int,
         num_chunks: int = 4,
         chunk_size: int = 5,
-        flow_state_dim: int = 4,
+        input_state_dim: int = 4,
+        num_noise_levels: int = 5,
     ) -> None:
         super().__init__()
         self.flow_dim = flow_dim
         self.num_chunks = num_chunks
         self.chunk_size = chunk_size
         self.num_steps = num_chunks * chunk_size
-        self.flow_state_dim = int(flow_state_dim)
+        self.input_state_dim = int(input_state_dim)
+        self.num_noise_levels = int(num_noise_levels)
 
-        self.step_proj = nn.Linear(self.flow_state_dim, flow_dim)
+        self.step_proj = nn.Linear(self.input_state_dim, flow_dim)
         self.step_embed = nn.Embedding(self.num_steps, flow_dim)
-        self.tau_mlp = nn.Sequential(
+        self.noise_mlp = nn.Sequential(
             nn.Linear(1, flow_dim),
             nn.SiLU(),
             nn.Linear(flow_dim, flow_dim),
@@ -442,7 +444,7 @@ class NormalizedNoisyFutureEncoder(nn.Module):
     def forward(
         self,
         x_t_norm: torch.Tensor,
-        tau: torch.Tensor,
+        noise_level: torch.Tensor,
         future_valid_mask: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
@@ -457,17 +459,28 @@ class NormalizedNoisyFutureEncoder(nn.Module):
                 "NormalizedNoisyFutureEncoder expected "
                 f"{self.num_steps} future steps, got {x_t_norm.shape[1]}."
             )
-        if x_t_norm.shape[-1] != self.flow_state_dim:
+        if x_t_norm.shape[-1] != self.input_state_dim:
             raise ValueError(
                 "NormalizedNoisyFutureEncoder expected last dim "
-                f"{self.flow_state_dim}, got {x_t_norm.shape[-1]}."
+                f"{self.input_state_dim}, got {x_t_norm.shape[-1]}."
             )
 
-        tau_emb = self.tau_mlp(tau.unsqueeze(-1))
+        if noise_level.ndim == 1:
+            noise_level = noise_level[:, None].expand(-1, self.num_steps)
+        if tuple(noise_level.shape) != tuple(x_t_norm.shape[:2]):
+            raise ValueError(
+                "noise_level must have shape [B] or [B, T], "
+                f"got {tuple(noise_level.shape)} for x_t_norm {tuple(x_t_norm.shape)}."
+            )
+        noise_ratio = (
+            noise_level.to(device=x_t_norm.device, dtype=x_t_norm.dtype)
+            / float(max(1, self.num_noise_levels))
+        ).clamp(0.0, 1.0)
+        noise_step_emb = self.noise_mlp(noise_ratio.unsqueeze(-1))
         step_tokens = self.step_proj(x_t_norm)
         step_ids = torch.arange(self.num_steps, device=x_t_norm.device)
         step_tokens = step_tokens + self.step_embed(step_ids).unsqueeze(0)
-        step_tokens = step_tokens + tau_emb.unsqueeze(1)
+        step_tokens = step_tokens + noise_step_emb
 
         if future_valid_mask is not None:
             if tuple(future_valid_mask.shape) != tuple(x_t_norm.shape[:2]):
@@ -484,8 +497,14 @@ class NormalizedNoisyFutureEncoder(nn.Module):
             self.flow_dim,
         )
         if future_valid_mask is None:
+            noise_emb = noise_step_emb.view(
+                batch_size,
+                self.num_chunks,
+                self.chunk_size,
+                self.flow_dim,
+            ).mean(dim=2).mean(dim=1)
             chunk_tokens = self.chunk_pool(step_tokens.mean(dim=2))
-            return step_tokens, chunk_tokens, tau_emb, None, None
+            return step_tokens, chunk_tokens, noise_emb, None, None
 
         step_valid_mask = future_valid_mask.view(batch_size, self.num_chunks, self.chunk_size)
         step_valid_float = step_valid_mask.to(dtype=step_tokens.dtype).unsqueeze(-1)
@@ -493,9 +512,18 @@ class NormalizedNoisyFutureEncoder(nn.Module):
 
         valid_count = step_valid_float.sum(dim=2).clamp_min(1.0)
         chunk_tokens = self.chunk_pool(step_tokens.sum(dim=2) / valid_count)
+        noise_emb = noise_step_emb.view(
+            batch_size,
+            self.num_chunks,
+            self.chunk_size,
+            self.flow_dim,
+        )
+        noise_emb = (noise_emb * step_valid_float).sum(dim=2) / valid_count
+        chunk_valid_count = step_valid_mask.any(dim=2).to(dtype=step_tokens.dtype).sum(dim=1).clamp_min(1.0)
+        noise_emb = noise_emb.sum(dim=1) / chunk_valid_count.unsqueeze(-1)
         chunk_valid_mask = step_valid_mask.any(dim=2)
         chunk_tokens = chunk_tokens * chunk_valid_mask.to(dtype=chunk_tokens.dtype).unsqueeze(-1)
-        return step_tokens, chunk_tokens, tau_emb, future_valid_mask, chunk_valid_mask
+        return step_tokens, chunk_tokens, noise_emb, future_valid_mask, chunk_valid_mask
 
 
 class HalfSecondChunkMixerBlock(nn.Module):
@@ -671,7 +699,10 @@ class HierarchicalFlowDecoder(nn.Module):
         num_chunk_heads: int = 4,
         num_chunk_layers: int = 2,
         chunk_size: int = 5,
-        flow_state_dim: int = 4,
+        input_state_dim: int = 4,
+        output_dim: int | None = None,
+        num_noise_levels: int = 5,
+        flow_state_dim: int | None = None,
     ) -> None:
         super().__init__()
         if int(num_future_steps) <= 0:
@@ -683,14 +714,23 @@ class HierarchicalFlowDecoder(nn.Module):
                 "num_future_steps must be divisible by chunk_size, "
                 f"got {num_future_steps} and {chunk_size}."
             )
+        if flow_state_dim is not None:
+            if int(input_state_dim) != 4 and int(input_state_dim) != int(flow_state_dim):
+                raise ValueError(
+                    "input_state_dim and flow_state_dim are aliases for the decoder input "
+                    f"dimension, got {input_state_dim} and {flow_state_dim}."
+                )
+            input_state_dim = int(flow_state_dim)
         num_chunks = int(num_future_steps) // int(chunk_size)
         self.context_projector = AnchorContextProjector(context_dim, flow_dim)
-        self.flow_state_dim = int(flow_state_dim)
+        self.input_state_dim = int(input_state_dim)
+        self.output_dim = int(output_dim if output_dim is not None else input_state_dim)
         self.noisy_future_encoder = NormalizedNoisyFutureEncoder(
             flow_dim=flow_dim,
             num_chunks=num_chunks,
             chunk_size=int(chunk_size),
-            flow_state_dim=self.flow_state_dim,
+            input_state_dim=self.input_state_dim,
+            num_noise_levels=int(num_noise_levels),
         )
         self.chunk_mixers = nn.ModuleList(
             [
@@ -702,7 +742,7 @@ class HierarchicalFlowDecoder(nn.Module):
             flow_dim=flow_dim,
             num_heads=num_chunk_heads,
         )
-        self.velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.flow_state_dim)
+        self.velocity_head = FlowVelocityHead(flow_dim=flow_dim, flow_state_dim=self.output_dim)
 
     def _run_chunk_mixer(
         self,
@@ -737,7 +777,7 @@ class HierarchicalFlowDecoder(nn.Module):
         self,
         anchor_hidden: torch.Tensor,
         x_t_norm: torch.Tensor,
-        tau: torch.Tensor,
+        noise_level: torch.Tensor,
         future_valid_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
@@ -759,12 +799,12 @@ class HierarchicalFlowDecoder(nn.Module):
         (
             step_tokens,
             chunk_tokens,
-            tau_emb,
+            noise_emb,
             step_valid_mask,
             chunk_valid_mask,
         ) = self.noisy_future_encoder(
             x_t_norm=x_t_norm,
-            tau=tau,
+            noise_level=noise_level,
             future_valid_mask=future_valid_mask,
         )
         """
@@ -785,7 +825,7 @@ class HierarchicalFlowDecoder(nn.Module):
                 block=block,
                 chunk_tokens=chunk_tokens,
                 context=context,
-                tau_emb=tau_emb,
+                tau_emb=noise_emb,
                 chunk_valid_mask=chunk_valid_mask,
             )
         """
@@ -847,7 +887,12 @@ class ContinuousCommitBridge:
         # for config/checkpoint compatibility.
         self.use_stop_motion = False
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
-        self.use_holonomic_model_only = bool(use_holonomic_model_only)
+        if bool(use_holonomic_model_only):
+            raise ValueError(
+                "semi_mdg supports only all-agent non-holonomic control dynamics. "
+                "Remove use_holonomic_model_only or set it to false."
+            )
+        self.use_holonomic_model_only = False
         self.control_pos_scale_m = float(control_pos_scale_m)
         (
             self.control_vehicle_no_slip_point_ratio,

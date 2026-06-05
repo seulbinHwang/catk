@@ -124,6 +124,19 @@ def flow_matching_loss(
     return (squared_error * mask_float.unsqueeze(-1)).sum() / denom
 
 
+def mdg_state_loss(
+    pred_state_norm: torch.Tensor,
+    clean_state_norm: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MDG control-state loss over valid 10Hz future steps."""
+    return flow_matching_loss(
+        flow_pred_norm=pred_state_norm,
+        flow_target_norm=clean_state_norm,
+        valid_mask=valid_mask,
+    )
+
+
 def ade_future(
     pred_clean_norm: torch.Tensor,
     target_clean_norm: torch.Tensor,

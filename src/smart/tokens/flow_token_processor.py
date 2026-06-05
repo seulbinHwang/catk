@@ -46,6 +46,11 @@ class FlowTokenProcessor(TokenProcessor):
         control_cyclist_no_slip_point_ratio: float = DEFAULT_CONTROL_CYCLIST_NO_SLIP_POINT_RATIO,
         control_round_trip_max_position_error_m: float = DEFAULT_CONTROL_ROUND_TRIP_MAX_POSITION_ERROR_M,
     ) -> None:
+        if bool(use_holonomic_model_only):
+            raise ValueError(
+                "semi_mdg supports only all-agent non-holonomic control dynamics. "
+                "Remove use_holonomic_model_only or set it to false."
+            )
         super().__init__(
             map_token_file=map_token_file,
             agent_token_file=agent_token_file,
@@ -56,7 +61,7 @@ class FlowTokenProcessor(TokenProcessor):
         )
         self.use_prefix_valid_future_loss_mask = bool(use_prefix_valid_future_loss_mask)
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
-        self.use_holonomic_model_only = bool(use_holonomic_model_only)
+        self.use_holonomic_model_only = False
         self.use_rolling_supervision = bool(use_rolling_supervision)
         self.control_pos_scale_m = float(control_pos_scale_m)
         self.control_vehicle_yaw_scale_rad = control_vehicle_yaw_scale_rad

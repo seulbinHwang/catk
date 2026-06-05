@@ -1,0 +1,70 @@
+# @package _global_
+
+defaults:
+  - override /model: smart_flow
+  - _self_
+
+task_name: semi_mdg_pretrain_h100x3x2
+ckpt_path: null
+
+trainer:
+  limit_train_batches: 1.0
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 16
+  max_epochs: 64
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  use_distributed_sampler: false
+  sync_batchnorm: false
+  strategy:
+    find_unused_parameters: true
+
+callbacks:
+  model_checkpoint:
+    monitor: val_closed/sim_agents_2025/realism_meta_metric
+    mode: max
+
+data:
+  train_batch_size: 20
+  val_batch_size: 12
+  test_batch_size: 12
+  num_workers: 4
+  prefetch_factor: 1
+  train_use_eval_agent_selection: true
+  train_memory_balanced_batches: true
+
+model:
+  model_config:
+    lr: 0.00068313
+    lr_warmup_steps: 4
+    lr_min_ratio: 0.01
+    n_rollout_closed_val: 32
+    val_open_loop: true
+    val_closed_loop: true
+    scorer_scene_num: 1680
+    validation_rollout_sampling:
+      sample_steps: 1
+      noise_scale: 1.0
+      action_reuse: false
+      action_reuse_alpha: [0.70, 0.60, 0.50, 0.01]
+      antithetic_pairs: true
+    token_processor:
+      use_kinematic_control_flow: true
+      use_rolling_supervision: true
+      use_prefix_valid_future_loss_mask: true
+      control_pos_scale_m: 1.0
+      control_vehicle_yaw_scale_rad: 0.025
+      control_pedestrian_yaw_scale_rad: 0.20
+      control_cyclist_yaw_scale_rad: 0.06
+      control_vehicle_no_slip_point_ratio: 0.2289518863
+      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_round_trip_max_position_error_m: 0.5
+    decoder:
+      closed_loop_rollout_mode: raw_mdg
+      mdg_num_noise_levels: 5
+      mdg_state_speed_scale_mps: 10.0
+      use_lqr: false
+      use_stop_motion: false
+    sim_agents_submission:
+      method_name: "SMART-control-state-MDG"
+      description: "2s control-state MDG pretraining with 0.5s closed-loop commit."

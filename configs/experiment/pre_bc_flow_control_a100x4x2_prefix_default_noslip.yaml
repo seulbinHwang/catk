@@ -17,7 +17,6 @@ model:
   model_config:
     token_processor:
       use_kinematic_control_flow: true
-      use_holonomic_model_only: false
       use_rolling_supervision: true
       use_prefix_valid_future_loss_mask: true
       control_vehicle_no_slip_point_ratio: 0.2289518863

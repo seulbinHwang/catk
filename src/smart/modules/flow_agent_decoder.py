@@ -10,13 +10,15 @@ from src.smart.layers.fourier_embedding import FourierEmbedding
 from src.smart.modules.agent_encoder import SMARTAgentEncoder
 from src.smart.modules.flow_local_decoder import (
     ContinuousCommitBridge,
-    FlowODE,
     HierarchicalFlowDecoder,
     LQRCommitBridgeConfig,
 )
 from src.smart.modules.kinematic_control import (
     CONTROL_FLOW_DIM,
+    MDG_STATE_DIM,
+    MDG_STATE_SPEED_SCALE_MPS,
     POSE_FLOW_DIM,
+    control_norm_to_mdg_state_norm,
     control_norm_to_pose_norm,
     validate_control_no_slip_ratio_config,
     validate_control_yaw_scale_config,
@@ -55,9 +57,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_dim: int,
         flow_num_chunk_heads: int,
         flow_num_chunk_layers: int,
-        flow_solver_steps: int,
-        flow_solver_method: str,
-        flow_solver_eps: float,
+        flow_solver_steps: int | None = None,
+        flow_solver_method: str | None = None,
+        flow_solver_eps: float | None = None,
+        mdg_num_noise_levels: int = 5,
+        mdg_state_speed_scale_mps: float = MDG_STATE_SPEED_SCALE_MPS,
         use_kinematic_control_flow: bool = False,
         use_holonomic_model_only: bool = False,
         use_rolling_supervision: bool = True,
@@ -94,7 +98,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_future_steps=num_future_steps,
         )
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
-        self.use_holonomic_model_only = bool(use_holonomic_model_only)
+        if bool(use_holonomic_model_only):
+            raise ValueError(
+                "semi_mdg supports only all-agent non-holonomic control dynamics. "
+                "Remove use_holonomic_model_only or set it to false."
+            )
+        self.use_holonomic_model_only = False
         self.use_rolling_supervision = bool(use_rolling_supervision)
         self.detach_train_metric_clean = bool(detach_train_metric_clean)
         self.control_pos_scale_m = float(control_pos_scale_m)
@@ -119,6 +128,17 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
             )
         self.flow_state_dim = CONTROL_FLOW_DIM if self.use_kinematic_control_flow else POSE_FLOW_DIM
+        if not self.use_kinematic_control_flow:
+            raise ValueError("semi_mdg requires control-space targets: use_kinematic_control_flow=true.")
+        self.mdg_num_noise_levels = int(mdg_num_noise_levels)
+        if self.mdg_num_noise_levels <= 0:
+            raise ValueError(f"mdg_num_noise_levels must be positive, got {self.mdg_num_noise_levels}.")
+        self.mdg_state_speed_scale_mps = float(mdg_state_speed_scale_mps)
+        if self.mdg_state_speed_scale_mps <= 0.0:
+            raise ValueError(
+                "mdg_state_speed_scale_mps must be positive, "
+                f"got {self.mdg_state_speed_scale_mps}."
+            )
         self.r_a2a_emb = FourierEmbedding(
             input_dim=3,
             hidden_dim=hidden_dim,
@@ -131,20 +151,20 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             num_chunk_heads=flow_num_chunk_heads,
             num_chunk_layers=flow_num_chunk_layers,
             chunk_size=self.shift,
-            flow_state_dim=self.flow_state_dim,
+            input_state_dim=MDG_STATE_DIM,
+            output_dim=CONTROL_FLOW_DIM,
+            num_noise_levels=self.mdg_num_noise_levels,
         )
-        self.flow_ode = FlowODE(
-            eps=flow_solver_eps,
-            solver_steps=flow_solver_steps,
-            solver_method=flow_solver_method,
-        )
-        if closed_loop_rollout_mode not in {"raw_fm", "matched_token_chunk"}:
+        del flow_solver_steps, flow_solver_method, flow_solver_eps
+        if closed_loop_rollout_mode != "raw_mdg":
             raise ValueError(
-                "closed_loop_rollout_mode must be one of {'raw_fm', 'matched_token_chunk'}, "
+                "closed_loop_rollout_mode must be 'raw_mdg'. "
                 f"got {closed_loop_rollout_mode!r}."
             )
-        self.closed_loop_rollout_mode = closed_loop_rollout_mode
+        self.closed_loop_rollout_mode = "raw_mdg"
         self.use_lqr = bool(use_lqr)
+        if self.use_lqr:
+            raise ValueError("semi_mdg removes the LQR bridge; set decoder.use_lqr=false.")
         # Stop-motion gating is intentionally disabled for every experiment in
         # this branch. Keep the constructor argument for checkpoint/config
         # compatibility, but never let a Hydra override re-enable it.
@@ -494,6 +514,333 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             cyclist_no_slip_point_ratio=getattr(self, "control_cyclist_no_slip_point_ratio", 0.0),
         )
 
+    def _to_mdg_state_norm(
+        self,
+        control_norm: torch.Tensor,
+        agent_type: torch.Tensor,
+        agent_length: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Convert normalized 3D control to MDG's 5D state representation."""
+        return control_norm_to_mdg_state_norm(
+            control_norm=control_norm,
+            agent_type=agent_type.to(device=control_norm.device),
+            agent_length=(
+                agent_length.to(device=control_norm.device, dtype=control_norm.dtype)
+                if agent_length is not None
+                else None
+            ),
+            pos_scale_m=self.control_pos_scale_m,
+            vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=self.control_cyclist_yaw_scale_rad,
+            state_speed_scale_mps=getattr(self, "mdg_state_speed_scale_mps", MDG_STATE_SPEED_SCALE_MPS),
+            use_holonomic_model_only=self.use_holonomic_model_only,
+            vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
+        )
+
+    def _mdg_alpha_schedule(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        noisy = torch.linspace(
+            0.99,
+            0.01,
+            int(getattr(self, "mdg_num_noise_levels", 5)),
+            device=device,
+            dtype=dtype,
+        )
+        return torch.cat([torch.ones(1, device=device, dtype=dtype), noisy], dim=0)
+
+    def _mdg_alpha_from_mask_level(self, mask_level: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        schedule = self._mdg_alpha_schedule(mask_level.device, dtype)
+        max_level = float(getattr(self, "mdg_num_noise_levels", 5))
+        level = mask_level.to(dtype=dtype).clamp(0.0, max_level)
+        lower = torch.floor(level).long()
+        upper = torch.ceil(level).long()
+        weight = level - lower.to(dtype=dtype)
+        return torch.lerp(schedule[lower], schedule[upper], weight)
+
+    def _mdg_mask_level_from_alpha(self, alpha: torch.Tensor) -> torch.Tensor:
+        schedule = self._mdg_alpha_schedule(alpha.device, alpha.dtype)
+        alpha = alpha.clamp(min=float(schedule[-1].item()), max=1.0)
+        clean_span = (schedule[0] - schedule[1]).clamp_min(torch.finfo(alpha.dtype).eps)
+        noisy_span = (schedule[1] - schedule[-1]).clamp_min(torch.finfo(alpha.dtype).eps)
+        clean_level = (schedule[0] - alpha) / clean_span
+        max_level = float(getattr(self, "mdg_num_noise_levels", 5))
+        noisy_level = 1.0 + (schedule[1] - alpha) / noisy_span * (max_level - 1.0)
+        return torch.where(alpha >= schedule[1], clean_level, noisy_level).clamp(
+            0.0,
+            max_level,
+        )
+
+    def _mdg_apply_noise(
+        self,
+        clean_control_norm: torch.Tensor,
+        mask_level: torch.Tensor,
+        noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if noise is None:
+            noise = torch.randn_like(clean_control_norm)
+        alpha = self._mdg_alpha_from_mask_level(mask_level, clean_control_norm.dtype).unsqueeze(-1)
+        return torch.sqrt(alpha) * clean_control_norm + torch.sqrt(1.0 - alpha) * noise
+
+    def _pack_anchor_values(
+        self,
+        values: torch.Tensor,
+        anchor_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if values.shape[:2] != anchor_mask.shape:
+            raise ValueError(
+                "values first two dimensions must match anchor_mask: "
+                f"got {tuple(values.shape[:2])} and {tuple(anchor_mask.shape)}."
+            )
+        if not bool(anchor_mask.any()):
+            return values.new_zeros((0,) + tuple(values.shape[2:]))
+        permute_order = (1, 0) + tuple(range(2, values.ndim))
+        return values.permute(permute_order)[anchor_mask.t()].contiguous()
+
+    def _sample_mdg_train_mask_levels(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        anchor_mask: torch.Tensor,
+        future_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample MDG time/agent noise levels and pack them in anchor-major order."""
+        n_agent, n_anchor = anchor_mask.shape
+        n_step = self.flow_window_steps
+        device = anchor_mask.device
+        dtype = (
+            future_valid_mask.dtype
+            if torch.is_floating_point(future_valid_mask)
+            else torch.float32
+        )
+        full = torch.ones((n_agent, n_anchor, n_step), device=device, dtype=dtype)
+        batch_value = tokenized_agent.get("batch")
+        if batch_value is None:
+            batch = torch.zeros(n_agent, device=device, dtype=torch.long)
+        else:
+            batch = batch_value.to(device=device)
+        num_graphs = int(
+            tokenized_agent.get(
+                "num_graphs",
+                int(batch.max().item()) + 1 if batch.numel() else 0,
+            )
+        )
+        if num_graphs <= 0 or n_agent <= 0 or n_anchor <= 0:
+            packed = self._pack_anchor_values(full, anchor_mask)
+            return torch.where(
+                future_valid_mask.to(device=device, dtype=torch.bool),
+                packed,
+                torch.zeros_like(packed),
+            )
+        max_level = float(getattr(self, "mdg_num_noise_levels", 5))
+
+        safe_batch = batch.clamp(min=0, max=num_graphs - 1)
+        anchor_idx = torch.arange(n_anchor, device=device)
+        pair_id = safe_batch[:, None] * n_anchor + anchor_idx.view(1, n_anchor)
+        n_pair = num_graphs * n_anchor
+        valid_agent_anchor = anchor_mask.to(device=device, dtype=torch.bool)
+        valid_pair_counts = torch.zeros(n_pair, device=device, dtype=torch.long)
+        valid_pair_counts.scatter_add_(
+            0,
+            pair_id.reshape(-1),
+            valid_agent_anchor.reshape(-1).to(dtype=torch.long),
+        )
+        active_pair = valid_pair_counts > 0
+
+        delta = torch.rand(n_pair, device=device, dtype=dtype)
+        temporal_pair = (torch.rand(n_pair, device=device) < 0.5) & active_pair
+        agent_pair = (~temporal_pair) & active_pair
+        rounded_step_count = torch.floor(delta * float(n_step) + 0.5).to(
+            dtype=torch.long
+        )
+
+        time_idx = torch.arange(n_step, device=device)
+        pair_remaining = (n_step - rounded_step_count).clamp(min=0, max=n_step)
+        pair_remaining_2d = pair_remaining[pair_id]
+        temporal_agent_anchor = temporal_pair[pair_id] & valid_agent_anchor
+        temporal_prefix = time_idx.view(1, 1, n_step) < pair_remaining_2d.unsqueeze(-1)
+        temporal_mask = temporal_agent_anchor.unsqueeze(-1)
+
+        denom = (pair_remaining.to(dtype=dtype) - 1.0).clamp_min(1.0)
+        progressive_max = (
+            1.0
+            + 3.0 * time_idx.to(dtype=dtype).view(1, n_step) / denom.view(-1, 1)
+        )
+        progressive_max = progressive_max.clamp(max=4.0)
+        random_levels = 1.0 + torch.rand(
+            (n_agent, n_anchor, n_step),
+            device=device,
+            dtype=dtype,
+        ) * (progressive_max[pair_id] - 1.0)
+        random_levels = torch.cummax(random_levels, dim=-1).values
+        full = torch.where(
+            temporal_mask & temporal_prefix,
+            random_levels,
+            full,
+        )
+        full = torch.where(
+            temporal_mask & ~temporal_prefix,
+            torch.full_like(full, max_level),
+            full,
+        )
+
+        agent_agent_anchor = agent_pair[pair_id] & valid_agent_anchor
+        if bool(agent_agent_anchor.any()):
+            num_full_agents = torch.floor(
+                delta * valid_pair_counts.to(dtype=dtype) + 0.5
+            ).to(dtype=torch.long)
+            random_score = torch.rand((n_agent, n_anchor), device=device, dtype=dtype)
+            valid_flat = agent_agent_anchor.reshape(-1)
+            flat_pair = pair_id.reshape(-1)[valid_flat]
+            flat_score = random_score.reshape(-1)[valid_flat]
+            if flat_score.numel() > 0:
+                score_order = torch.argsort(flat_score, stable=True)
+                pair_order = score_order[
+                    torch.argsort(flat_pair[score_order], stable=True)
+                ]
+                sorted_pair = flat_pair[pair_order]
+                new_group = torch.ones_like(sorted_pair, dtype=torch.bool)
+                new_group[1:] = sorted_pair[1:] != sorted_pair[:-1]
+                start_positions = torch.arange(sorted_pair.numel(), device=device)[
+                    new_group
+                ]
+                group_lengths = torch.diff(
+                    torch.cat(
+                        [
+                            start_positions,
+                            sorted_pair.new_tensor([sorted_pair.numel()]),
+                        ]
+                    )
+                )
+                group_start = torch.repeat_interleave(start_positions, group_lengths)
+                rank_sorted = (
+                    torch.arange(sorted_pair.numel(), device=device) - group_start
+                )
+                selected_sorted = rank_sorted < num_full_agents[sorted_pair]
+                selected_flat = torch.zeros_like(valid_flat, dtype=torch.bool)
+                selected_valid_order = torch.zeros_like(flat_score, dtype=torch.bool)
+                selected_valid_order[pair_order] = selected_sorted
+                selected_flat[valid_flat] = selected_valid_order
+                selected = selected_flat.view(n_agent, n_anchor)
+            else:
+                selected = torch.zeros(
+                    (n_agent, n_anchor),
+                    device=device,
+                    dtype=torch.bool,
+                )
+
+            low = (
+                1.0
+                + torch.rand((n_agent, n_anchor), device=device, dtype=dtype) * 3.0
+            )
+            agent_values = torch.where(
+                selected,
+                torch.full_like(low, max_level),
+                low,
+            ).unsqueeze(-1)
+            full = torch.where(agent_agent_anchor.unsqueeze(-1), agent_values, full)
+
+        packed = self._pack_anchor_values(full, anchor_mask)
+        if tuple(packed.shape) != tuple(future_valid_mask.shape):
+            raise ValueError(
+                "Packed MDG mask shape must match future_valid_mask: "
+                f"got {tuple(packed.shape)} and {tuple(future_valid_mask.shape)}."
+            )
+        return torch.where(
+            future_valid_mask.to(device=device, dtype=torch.bool),
+            packed,
+            torch.zeros_like(packed),
+        )
+
+    def _mdg_closed_loop_mask_schedule(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        sample_steps: int,
+    ) -> torch.Tensor:
+        sample_steps = int(sample_steps)
+        if sample_steps <= 0:
+            raise ValueError(f"sample_steps must be positive, got {sample_steps}.")
+        if sample_steps == 1:
+            max_level = float(getattr(self, "mdg_num_noise_levels", 5))
+            return torch.full(
+                (1, self.flow_window_steps),
+                max_level,
+                device=device,
+                dtype=dtype,
+            )
+        schedule = []
+        max_level = float(getattr(self, "mdg_num_noise_levels", 5))
+        time_band = torch.div(
+            torch.arange(self.flow_window_steps, device=device) * int(max_level - 1.0),
+            self.flow_window_steps,
+            rounding_mode="floor",
+        ).to(dtype=dtype)
+        base = torch.linspace(
+            max_level,
+            1.0,
+            sample_steps,
+            device=device,
+            dtype=dtype,
+        )
+        base[0] = max_level
+        base[-1] = 1.0
+        for value in base:
+            schedule.append(torch.clamp(value + time_band, max=max_level))
+        return torch.stack(schedule, dim=0)
+
+    def _mdg_shift_reuse_action(self, previous_action: torch.Tensor) -> torch.Tensor:
+        shifted = torch.zeros_like(previous_action)
+        shift = int(self.shift)
+        if previous_action.shape[1] > shift:
+            shifted[:, : previous_action.shape[1] - shift] = previous_action[:, shift:]
+        return shifted
+
+    def _mdg_reuse_mask_template(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        sampling_scheme: DictConfig,
+    ) -> torch.Tensor:
+        alpha_values = getattr(sampling_scheme, "action_reuse_alpha", (0.70, 0.60, 0.50, 0.01))
+        if len(alpha_values) != 4:
+            raise ValueError("action_reuse_alpha must contain four values.")
+        alpha = torch.tensor(alpha_values, device=device, dtype=dtype)
+        mask_values = self._mdg_mask_level_from_alpha(alpha)
+        template = torch.empty(self.flow_window_steps, device=device, dtype=dtype)
+        chunk = self.shift
+        template[:chunk] = mask_values[0]
+        template[chunk : 2 * chunk] = mask_values[1]
+        template[2 * chunk : 3 * chunk] = mask_values[2]
+        template[3 * chunk :] = mask_values[3]
+        return template
+
+    def _mdg_denoise_control(
+        self,
+        anchor_hidden: torch.Tensor,
+        initial_control_norm: torch.Tensor,
+        mask_schedule: torch.Tensor,
+        agent_type: torch.Tensor,
+        agent_length: torch.Tensor | None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        current = initial_control_norm
+        for step_idx, mask_level in enumerate(mask_schedule):
+            expanded_mask = mask_level.view(1, -1).expand(current.shape[0], -1)
+            noisy_state = self._to_mdg_state_norm(current, agent_type, agent_length)
+            pred_control = self.flow_decoder(anchor_hidden, noisy_state, expanded_mask)
+            if step_idx + 1 < mask_schedule.shape[0]:
+                next_mask = mask_schedule[step_idx + 1].view(1, -1).expand_as(expanded_mask)
+                noise = torch.randn(
+                    pred_control.shape,
+                    device=pred_control.device,
+                    dtype=pred_control.dtype,
+                    generator=generator,
+                )
+                current = self._mdg_apply_noise(pred_control, next_mask, noise=noise)
+            else:
+                current = pred_control
+        return current
+
     def flow_norm_to_pose_metric_norm(
         self,
         value: torch.Tensor,
@@ -514,6 +861,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        agent_type: torch.Tensor | None = None,
+        agent_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -531,6 +880,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         """
         if anchor_hidden_valid.numel() == 0:
             return anchor_hidden_valid.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
+        if agent_type is None:
+            raise ValueError("agent_type is required for MDG open-loop sampling.")
 
         generator = None
         if sampling_seed is not None:
@@ -545,25 +896,19 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             dtype=anchor_hidden_valid.dtype,
             generator=generator,
         ) * getattr(sampling_scheme, "noise_scale", 1.0)
-        flow_sample_steps = getattr(
-            sampling_scheme,
-            "sample_steps",
-            self.flow_ode.solver_steps,
+        mdg_sample_steps = int(getattr(sampling_scheme, "sample_steps", 1))
+        mask_schedule = self._mdg_closed_loop_mask_schedule(
+            device=x_init_norm.device,
+            dtype=x_init_norm.dtype,
+            sample_steps=mdg_sample_steps,
         )
-        flow_sample_method = getattr(
-            sampling_scheme,
-            "sample_method",
-            self.flow_ode.solver_method,
-        )
-        if backprop_last_k is None:
-            backprop_last_k = getattr(sampling_scheme, "backprop_last_k", None)
-
-        return self.flow_ode.generate(
-            x_init=x_init_norm,
-            model_fn=lambda x_t, tau: self.flow_decoder(anchor_hidden_valid, x_t, tau),
-            steps=flow_sample_steps,
-            method=flow_sample_method,
-            backprop_last_k=backprop_last_k,
+        return self._mdg_denoise_control(
+            anchor_hidden=anchor_hidden_valid,
+            initial_control_norm=x_init_norm,
+            mask_schedule=mask_schedule,
+            agent_type=agent_type,
+            agent_length=agent_length,
+            generator=generator,
         )
 
     def sample_open_loop_future(
@@ -573,6 +918,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         sampling_scheme: DictConfig,
         sampling_seed: int | None = None,
         backprop_last_k: int | None = None,
+        agent_type: torch.Tensor | None = None,
+        agent_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
@@ -596,6 +943,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             sampling_scheme=sampling_scheme,
             sampling_seed=sampling_seed,
             backprop_last_k=backprop_last_k,
+            agent_type=agent_type,
+            agent_length=agent_length,
         )
 
 
@@ -851,11 +1200,16 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         if flow_clean_norm.numel() == 0:
             empty = flow_clean_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
+            empty_state = flow_clean_norm.new_zeros((0, self.flow_window_steps, MDG_STATE_DIM))
+            empty_mask = flow_clean_norm.new_zeros((0, self.flow_window_steps))
             output = {
                 "flow_pred_norm": empty,
                 "flow_target_norm": empty,
                 "flow_pred_clean_norm": empty,
                 "flow_clean_norm": empty,
+                "mdg_pred_state_norm": empty_state,
+                "mdg_clean_state_norm": empty_state,
+                "mdg_mask_level": empty_mask,
                 "ctx_hidden_pack": ctx_hidden_pack,
                 "anchor_hidden": anchor_hidden,
                 "anchor_mask": anchor_mask,
@@ -880,35 +1234,56 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 output["flow_loss_mask"] = flow_loss_mask
             return output
 
-        flow_sample = self.flow_ode.sample(flow_clean_norm, target_type="velocity")
-        flow_pred_norm = self.flow_decoder(
+        if flow_agent_type is None:
+            raise ValueError("flow_agent_type is required for MDG control-state training.")
+        mask_level = self._sample_mdg_train_mask_levels(
+            tokenized_agent=tokenized_agent,
+            anchor_mask=anchor_mask,
+            future_valid_mask=(
+                flow_loss_mask
+                if flow_loss_mask is not None
+                else torch.ones(
+                    flow_clean_norm.shape[:2],
+                    device=flow_clean_norm.device,
+                    dtype=torch.bool,
+                )
+            ),
+        )
+        noisy_control_norm = self._mdg_apply_noise(flow_clean_norm, mask_level)
+        noisy_state_norm = self._to_mdg_state_norm(
+            noisy_control_norm,
+            flow_agent_type,
+            flow_agent_length,
+        )
+        flow_pred_clean_norm = self.flow_decoder(
             anchor_hidden_valid,
-            flow_sample.x_t,
-            flow_sample.tau,
+            noisy_state_norm,
+            mask_level,
             future_valid_mask=flow_loss_mask,
         )
-        if (
-            bool(getattr(self, "detach_train_metric_clean", False))
-            and self.training
-            and torch.is_grad_enabled()
-        ):
-            with torch.no_grad():
-                flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
-                    flow_sample.x_t.detach(),
-                    flow_pred_norm.detach(),
-                    flow_sample.tau.detach(),
-                )
-        else:
-            flow_pred_clean_norm = self.flow_ode.predict_clean_from_velocity(
-                flow_sample.x_t,
-                flow_pred_norm,
-                flow_sample.tau,
+        if flow_pred_clean_norm.shape[-1] != CONTROL_FLOW_DIM:
+            raise ValueError(
+                "semi_mdg flow decoder must predict normalized 3D control, "
+                f"got last dim {flow_pred_clean_norm.shape[-1]}."
             )
+        mdg_pred_state_norm = self._to_mdg_state_norm(
+            flow_pred_clean_norm,
+            flow_agent_type,
+            flow_agent_length,
+        )
+        mdg_clean_state_norm = self._to_mdg_state_norm(
+            flow_clean_norm,
+            flow_agent_type,
+            flow_agent_length,
+        )
         output = {
-            "flow_pred_norm": flow_pred_norm,
-            "flow_target_norm": flow_sample.target,
+            "flow_pred_norm": mdg_pred_state_norm,
+            "flow_target_norm": mdg_clean_state_norm,
             "flow_pred_clean_norm": flow_pred_clean_norm,
             "flow_clean_norm": flow_clean_norm,
+            "mdg_pred_state_norm": mdg_pred_state_norm,
+            "mdg_clean_state_norm": mdg_clean_state_norm,
+            "mdg_mask_level": mask_level,
             "ctx_hidden_pack": ctx_hidden_pack,
             "anchor_hidden": anchor_hidden,
             "anchor_mask": anchor_mask,
@@ -1429,6 +1804,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         coarse_head_list = [head_window[:, i].clone() for i in range(head_window.shape[1])]
         coarse_valid_list = [valid_window[:, i].clone() for i in range(valid_window.shape[1])]
         coarse_idx_list = [pred_idx_window[:, i].clone() for i in range(pred_idx_window.shape[1])]
+        previous_pred_action = None
 
         pred_traj_10hz = torch.zeros(
             (n_agent, n_step_future_10hz, 2),
@@ -1621,40 +1997,61 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     active_mask,
                     noise_start : noise_start + sample_window_steps,
                 ].contiguous()
-                flow_sample_steps = int(getattr(
+                mdg_sample_steps = int(getattr(
                     sampling_scheme,
                     "sample_steps",
-                    self.flow_ode.solver_steps,
+                    1,
                 ))
-                flow_sample_method = getattr(
-                    sampling_scheme,
-                    "sample_method",
-                    self.flow_ode.solver_method,
+                if mdg_sample_steps <= 0:
+                    raise ValueError(f"sample_steps must be positive, got {mdg_sample_steps}.")
+                mask_schedule = self._mdg_closed_loop_mask_schedule(
+                    device=x_init_norm.device,
+                    dtype=x_init_norm.dtype,
+                    sample_steps=mdg_sample_steps,
                 )
-                if terminal_step_by_agent is None:
-                    flow_sample_backprop_last_k = self._resolve_training_backprop_last_k(
-                        sampling_scheme=sampling_scheme,
-                    )
-                    y_hat_norm = self.flow_ode.generate(
-                        x_init=x_init_norm,
-                        model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
-                        steps=flow_sample_steps,
-                        method=flow_sample_method,
-                        backprop_last_k=flow_sample_backprop_last_k,
-                    )
-                else:
-                    y_hat_norm = self.flow_ode.generate(
-                        x_init=x_init_norm,
-                        model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
-                        steps=flow_sample_steps,
-                        method=flow_sample_method,
-                        terminal_step=terminal_step_for_rollout,
-                        return_terminal_clean=True,
-                    )
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
                 active_agent_type = tokenized_agent["type"][active_mask]
                 active_agent_length = tokenized_agent["shape"][active_mask, 0]
+                if bool(getattr(sampling_scheme, "action_reuse", False)) and previous_pred_action is not None:
+                    shifted_reuse = self._mdg_shift_reuse_action(previous_pred_action)[active_mask]
+                    reuse_template = self._mdg_reuse_mask_template(
+                        device=x_init_norm.device,
+                        dtype=x_init_norm.dtype,
+                        sampling_scheme=sampling_scheme,
+                    )
+                    reuse_mask = reuse_template.view(1, -1).expand_as(mask_schedule)
+                    mask_schedule = torch.minimum(mask_schedule, reuse_mask)
+                    x_init_norm = self._mdg_apply_noise(
+                        shifted_reuse,
+                        reuse_template.view(1, -1).expand(shifted_reuse.shape[0], -1),
+                        noise=x_init_norm,
+                    )
+                if terminal_step_by_agent is None:
+                    y_hat_norm = self._mdg_denoise_control(
+                        anchor_hidden=active_hidden,
+                        initial_control_norm=x_init_norm,
+                        mask_schedule=mask_schedule,
+                        agent_type=active_agent_type,
+                        agent_length=active_agent_length,
+                    )
+                else:
+                    with torch.no_grad():
+                        y_hat_norm = self._mdg_denoise_control(
+                            anchor_hidden=active_hidden,
+                            initial_control_norm=x_init_norm,
+                            mask_schedule=mask_schedule,
+                            agent_type=active_agent_type,
+                            agent_length=active_agent_length,
+                        )
+                    y_hat_norm = y_hat_norm.detach()
+                if previous_pred_action is None:
+                    previous_pred_action = torch.zeros(
+                        (n_agent, self.flow_window_steps, self.flow_state_dim),
+                        device=y_hat_norm.device,
+                        dtype=y_hat_norm.dtype,
+                    )
+                previous_pred_action[active_mask] = y_hat_norm.detach()
                 if return_flow_2s_preview:
                     y_hat_metric_norm = self._to_pose_metric_norm(
                         y_hat_norm,
@@ -1756,31 +2153,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
                     token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
                 )
-                commit_pos_export_act = commit_pos_act.clone()
-                commit_head_export_act = commit_head_act.clone()
-                if self.closed_loop_rollout_mode == "matched_token_chunk":
-                    restore_mask_act = ~stop_mask_act
-                    if self.use_lqr:
-                        restore_mask_act = restore_mask_act & (~((active_agent_type == 0) | (active_agent_type == 2)))
-                    if restore_mask_act.any():
-                        (
-                            restored_commit_pos_act,
-                            restored_commit_head_act,
-                            _,
-                            _,
-                        ) = self.commit_bridge.restore_token_chunk(
-                            current_pos=current_pos_act[restore_mask_act],
-                            current_head=current_head_act[restore_mask_act],
-                            next_token_idx=next_token_idx_act[restore_mask_act],
-                            agent_type=active_agent_type[restore_mask_act],
-                            token_bank_all_veh=tokenized_agent["token_bank_all_veh"],
-                            token_bank_all_ped=tokenized_agent["token_bank_all_ped"],
-                            token_bank_all_cyc=tokenized_agent["token_bank_all_cyc"],
-                        )
-                        commit_pos_export_act[restore_mask_act] = restored_commit_pos_act
-                        commit_head_export_act[restore_mask_act] = restored_commit_head_act
-                commit_traj_step[active_mask] = commit_pos_export_act
-                commit_head_step[active_mask] = commit_head_export_act
+                commit_traj_step[active_mask] = commit_pos_act
+                commit_head_step[active_mask] = commit_head_act
                 next_pos[active_mask] = next_pos_act
                 next_head[active_mask] = next_head_act
                 next_token_idx[active_mask] = next_token_idx_act
@@ -1994,7 +2368,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         tau: torch.Tensor,
         anchor_mask: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """첫 flow anchor의 noisy path에 대한 flow velocity를 예측합니다.
+        """semi_mdg에서 제거된 Flow Matching velocity API입니다.
 
         Args:
             tokenized_agent: 평가 모드 기준 토큰 사전입니다.
@@ -2009,39 +2383,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             Dict[str, torch.Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다. 두 텐서 shape은
             ``[n_valid_agent, flow_window_steps, flow_state_dim]`` 입니다.
         """
-        if path_noisy_norm.numel() == 0:
-            empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
-            return {"velocity": empty, "clean": empty}
-        if path_noisy_norm.shape[1:] != (self.flow_window_steps, self.flow_state_dim):
-            raise ValueError(
-                "path_noisy_norm must have shape [n_valid_agent, flow_window_steps, flow_state_dim], "
-                f"got {tuple(path_noisy_norm.shape)}."
-            )
-        if int(anchor_mask.sum().item()) != int(path_noisy_norm.shape[0]):
-            raise ValueError(
-                "anchor_mask true count must match path_noisy_norm first dim, "
-                f"got {int(anchor_mask.sum().item())} and {path_noisy_norm.shape[0]}."
-            )
-
-        ctx_hidden_pack = self._encode_context(
-            agent_token_index=tokenized_agent["ctx_sampled_idx"],
-            pos_a=tokenized_agent["ctx_sampled_pos"],
-            head_a=tokenized_agent["ctx_sampled_heading"],
-            mask=tokenized_agent["ctx_valid"],
-            tokenized_agent=tokenized_agent,
-            map_feature=map_feature,
+        del tokenized_agent, map_feature, path_noisy_norm, tau, anchor_mask
+        raise RuntimeError(
+            "semi_mdg removes Flow Matching velocity prediction. "
+            "Use MDG control-state denoising through sample_open_loop_future() "
+            "or rollout_from_cache() instead."
         )
-        if ctx_hidden_pack.shape[1] < 2:
-            raise ValueError(
-                "path_flow_velocity_for_anchor0 requires at least one leading context "
-                "token and one anchor token."
-            )
-        anchor_hidden = ctx_hidden_pack[:, 1:2, :]
-        single_anchor_mask = anchor_mask.bool().view(-1, 1)
-        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
-        velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
-        clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
-        return {"velocity": velocity, "clean": clean}
 
     @torch.no_grad()
     def inference(

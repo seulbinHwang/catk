@@ -37,16 +37,12 @@ model_config:
     # false: full-window 미래가 모두 유효한 anchor만 학습합니다.
     # true: 18-token / 16-anchor pretrain에서 tail anchor의 유효 prefix만 loss를 줍니다.
     use_prefix_valid_future_loss_mask: true
-    # false이면 기존 pose-space Flow Matching을 그대로 사용합니다.
-    # true이면 GT pose에서 control label을 on-the-fly로 만들고,
-    # Flow Matching은 [delta_s, delta_n, delta_yaw] 제어공간에서 학습합니다.
+    # semi_mdg는 GT pose에서 control label을 on-the-fly로 만들고,
+    # MDG denoising은 [delta_s, delta_n, delta_yaw] 제어공간에서 학습합니다.
     use_kinematic_control_flow: true
-    # false: vehicle/cyclist는 non-holonomic, pedestrian은 holonomic.
-    # true: vehicle/cyclist까지 pedestrian과 같은 holonomic model을 적용합니다.
-    use_holonomic_model_only: false
+    # semi_mdg는 vehicle/pedestrian/cyclist 모두 같은 non-holonomic dynamics를 사용합니다.
     # true: decoder-consistent rolling supervision으로 GT control label을 만듭니다.
     # false: 각 step의 raw GT pose pair만으로 inverse control label을 만듭니다.
-    # use_holonomic_model_only=true일 때는 두 방식이 같은 target을 만듭니다.
     use_rolling_supervision: true
     control_pos_scale_m: 1.0
     # vehicle/cyclist의 non-holonomic no-slip point를 box center 뒤쪽으로
@@ -60,44 +56,11 @@ model_config:
     # control-space 학습에서 GT -> control -> pose 복원 위치 오차가 이 값보다 큰 anchor는 학습에서 제외합니다.
     control_round_trip_max_position_error_m: 0.5
   validation_rollout_sampling:
-    sample_steps: 16
-    sample_method: euler
-    noise_scale: 1.016
+    sample_steps: 1
+    noise_scale: 1.0
+    action_reuse: false
+    action_reuse_alpha: [0.70, 0.60, 0.50, 0.01]
     antithetic_pairs: true
-  self_forced:
-    enabled: false
-    start_epoch: 0
-    weight: 1.0
-    path_step_size: 0.05
-    anchor_weight: 0.05
-    use_anchor_flow_matching_loss: false
-    distribution_matching_objective: dmd
-    sid_alpha: 1.0
-    sid_normalizer_eps: 1.0e-3
-    detach_block_transition: false
-    # Stop-motion gate는 전 경로에서 사용하지 않습니다. 값은 false로 고정합니다.
-    use_stop_motion: false
-    estimator_updates_per_step: 5
-    estimator_warmup_epochs: 1
-    initialize_aux_from_generator_on_fit_start: true
-    unfrozen_range: except_map_encoder
-    ema_weight: 0.99
-    ema_start_step: 50
-    # Manual gradient clip used inside self-forced training_step / estimator
-    # update. Lightning's `Trainer(gradient_clip_val=...)` cannot be used
-    # because manual optimization is on; the model reads this value and
-    # applies clip_gradients() itself.
-    gradient_clip_val: 1.0
-    sampling:
-      sample_steps: 16
-      sample_method: euler
-      noise_scale: 1.0
-      random_terminal_step:
-        enabled: true
-        scope: global_batch
-        # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
-        policy: paper_uniform
-        min_executed_steps: 16
   decoder:
     hidden_dim: 128
     num_freq_bands: 64
@@ -117,16 +80,14 @@ model_config:
     flow_dim: 96
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
-    flow_solver_steps: 32
-    flow_solver_method: euler
-    flow_solver_eps: 1.0e-3
+    mdg_num_noise_levels: 5
+    mdg_state_speed_scale_mps: 10.0
     # Training-only metric memory control. It does not change loss/target/model
     # capacity and only detaches train metric clean reconstruction graphs.
     detach_train_metric_clean: false
     # 아래 control-space 공유 설정은 token_processor 값을 단일 기준으로 사용합니다.
     # decoder 쪽만 다른 값으로 override하면 SMARTFlow 초기화 단계에서 에러를 냅니다.
     use_kinematic_control_flow: ${model.model_config.token_processor.use_kinematic_control_flow}
-    use_holonomic_model_only: ${model.model_config.token_processor.use_holonomic_model_only}
     use_rolling_supervision: ${model.model_config.token_processor.use_rolling_supervision}
     control_pos_scale_m: ${model.model_config.token_processor.control_pos_scale_m}
     control_vehicle_no_slip_point_ratio: ${model.model_config.token_processor.control_vehicle_no_slip_point_ratio}
@@ -134,33 +95,15 @@ model_config:
     control_vehicle_yaw_scale_rad: ${model.model_config.token_processor.control_vehicle_yaw_scale_rad}
     control_pedestrian_yaw_scale_rad: ${model.model_config.token_processor.control_pedestrian_yaw_scale_rad}
     control_cyclist_yaw_scale_rad: ${model.model_config.token_processor.control_cyclist_yaw_scale_rad}
-    closed_loop_rollout_mode: raw_fm # raw_fm | matched_token_chunk
+    closed_loop_rollout_mode: raw_mdg
     use_lqr: false
     use_stop_motion: false
-    lqr_commit:
-      dt: 0.1
-      history_steps: 6
-      horizon_steps: 10
-      velocity_smooth_lambda: 1.0e-4
-      curvature_smooth_lambda: 1.0e-2
-      curvature_init_reg: 1.0e-10
-      stop_speed_mps: 0.2
-      stop_speed_kp: 0.5
-      longitudinal_q: 10.0
-      longitudinal_r: 0.
-      lateral_q_lat: 1.0
-      lateral_q_head: 10.0
-      lateral_q_kappa: 0.
-      lateral_r: 0.
-      accel_tau_s: 0.
-      curvature_tau_s: 0.
-      min_speed_for_curvature_clip_mps: 0.5
   sim_agents_submission:
     is_active: false
-    method_name: "SMART-flow-7M"
+    method_name: "SMART-control-state-MDG"
     authors: [Seulbin Hwang, Kiyoung Om]
     affiliation: NaverLabs
-    description: Flow-based generative model for simulating realistic agents.
+    description: 2s control-state MDG pretraining with 0.5s closed-loop commit.
     method_link: "not available yet"
     account_name: "h.sb@naverlabs.com"
   finetune:

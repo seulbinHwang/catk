@@ -35,7 +35,6 @@ model:
       # the current anchor without rounding down to 5-step chunks.
       use_prefix_valid_future_loss_mask: true
       use_kinematic_control_flow: true
-      use_holonomic_model_only: false
       use_rolling_supervision: true
       control_pos_scale_m: 1.0
       control_vehicle_yaw_scale_rad: 0.025

@@ -26,7 +26,7 @@ from src.smart.metrics.flow_metrics import (
     WeightedMeanMetric,
     ade_future,
     fde_future,
-    flow_matching_loss,
+    mdg_state_loss,
     yaw_ade_future,
     yaw_fde_future,
 )
@@ -54,7 +54,6 @@ from src.smart.modules.self_forced_trainable_range import (
 )
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
-from src.smart.utils.finetune import set_model_for_finetuning
 from src.smart.utils.flow_horizon import format_flow_horizon_tag
 from src.utils.vis_waymo import VisWaymo
 from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_rollouts
@@ -62,7 +61,6 @@ from src.utils.sim_agents_utils import get_scenario_id_int_tensor, get_scenario_
 
 _TOKEN_PROCESSOR_DECODER_SHARED_KEYS = (
     "use_kinematic_control_flow",
-    "use_holonomic_model_only",
     "use_rolling_supervision",
     "control_pos_scale_m",
     "control_vehicle_no_slip_point_ratio",
@@ -132,7 +130,8 @@ class SMARTFlow(LightningModule):
                 "decoder.flow_window_steps and token_processor.flow_window_steps must match, "
                 f"got {self.flow_window_steps} and {int(self.token_processor.flow_window_steps)}."
             )
-        set_model_for_finetuning(self.encoder, model_config.finetune)
+        if bool(getattr(model_config.finetune, "enabled", False)):
+            raise ValueError("semi_mdg removes fine-tuning paths; run action=fit with finetune.enabled=false.")
 
         self.minADE = minADE()
         self.minADE_predict = minADE()
@@ -197,7 +196,7 @@ class SMARTFlow(LightningModule):
         }
         self._train_open_epoch_log_names = (
             "train/loss",
-            "train/loss_fm",
+            "train/loss_mdg",
             f"train/{self.train_open_metric_names['ade']}",
             f"train/{self.train_open_metric_names['fde']}",
             f"train/{self.train_open_metric_names['yaw_ade']}",
@@ -220,10 +219,9 @@ class SMARTFlow(LightningModule):
         self.validation_rollout_sampling = model_config.validation_rollout_sampling
 
         self.self_forced_config = getattr(model_config, "self_forced", None)
-        self.self_forced_enabled = bool(
-            self.self_forced_config is not None
-            and getattr(self.self_forced_config, "enabled", False)
-        )
+        if self.self_forced_config is not None and bool(getattr(self.self_forced_config, "enabled", False)):
+            raise ValueError("semi_mdg removes self-forced/fine-tuning paths; set self_forced.enabled=false.")
+        self.self_forced_enabled = False
         self.self_forced_start_epoch = (
             int(getattr(self.self_forced_config, "start_epoch", 0))
             if self.self_forced_config is not None
@@ -775,7 +773,7 @@ class SMARTFlow(LightningModule):
         self,
         *,
         total_loss: Tensor,
-        fm_loss: Tensor,
+        mdg_loss: Tensor,
         open_metric_dict: Dict[str, Tensor],
         sample_count: int,
     ) -> None:
@@ -790,7 +788,7 @@ class SMARTFlow(LightningModule):
             return
         values = [
             total_loss.detach(),
-            fm_loss.detach(),
+            mdg_loss.detach(),
             open_metric_dict[self.open_metric_names["ade"]].detach(),
             open_metric_dict[self.open_metric_names["fde"]].detach(),
             open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
@@ -871,15 +869,15 @@ class SMARTFlow(LightningModule):
 
         Returns:
             tuple[Tensor, Dict[str, Tensor], int, bool]:
-                flow matching loss, meter/degree 단위 지표 사전,
+                MDG state loss, meter/degree 단위 지표 사전,
                 유효 anchor 개수, 그리고 loss에 실제 target이 있는지 여부입니다.
         """
         loss_mask = pred_dict.get("flow_loss_mask")
         has_loss_targets = self._has_open_loop_loss_targets(pred_dict)
         if has_loss_targets:
-            loss = flow_matching_loss(
-                pred_dict["flow_pred_norm"],
-                pred_dict["flow_target_norm"],
+            loss = mdg_state_loss(
+                pred_dict["mdg_pred_state_norm"],
+                pred_dict["mdg_clean_state_norm"],
                 valid_mask=loss_mask,
             )
         else:
@@ -2708,14 +2706,14 @@ class SMARTFlow(LightningModule):
             tokenized_agent,
             anchor_mask_key="flow_train_mask",
         )
-        fm_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
+        mdg_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
             pred,
             zero_loss_module=self.encoder,
         )
-        total_loss = fm_loss
+        total_loss = mdg_loss
         self._accumulate_open_loop_train_epoch_metrics(
             total_loss=total_loss,
-            fm_loss=fm_loss,
+            mdg_loss=mdg_loss,
             open_metric_dict=open_metric_dict,
             sample_count=sample_count,
         )
@@ -2993,13 +2991,13 @@ fm_loss:
 open_metric_dict: 
     Dict[str, Tensor]
         """
-        fm_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
+        mdg_loss, open_metric_dict, sample_count, has_open_loop_targets = self._open_loop_denoise_metrics(
             pred,
             zero_loss_module=self,
         )
-        total_loss = fm_loss
-        if not torch.isfinite(fm_loss):
-            raise RuntimeError(f"Non-finite fm_loss detected: {self._summarize_nonfinite_tensor(fm_loss)}")
+        total_loss = mdg_loss
+        if not torch.isfinite(mdg_loss):
+            raise RuntimeError(f"Non-finite mdg_loss detected: {self._summarize_nonfinite_tensor(mdg_loss)}")
         if not torch.isfinite(total_loss):
             raise RuntimeError(
                 "Non-finite total_loss detected: "
@@ -3008,7 +3006,7 @@ open_metric_dict:
 
         self._accumulate_open_loop_train_epoch_metrics(
             total_loss=total_loss,
-            fm_loss=fm_loss,
+            mdg_loss=mdg_loss,
             open_metric_dict=open_metric_dict,
             sample_count=sample_count,
         )
@@ -3063,6 +3061,8 @@ open_metric_dict:
                 anchor_mask=denoise_pred["anchor_mask"],
                 sampling_scheme=self.validation_rollout_sampling,
                 sampling_seed=self._get_validation_open_seed(batch_idx),
+                agent_type=denoise_pred.get("flow_metric_agent_type"),
+                agent_length=denoise_pred.get("flow_metric_agent_length"),
             )
             open_pred_metric_norm = eval_generator.flow_norm_to_pose_metric_norm(
                 value=open_pred_clean_norm,
