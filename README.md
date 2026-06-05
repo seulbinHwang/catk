@@ -2059,7 +2059,7 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 ### 5.11 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
-- H100 preset은 Generator lr `4e-6`, generated estimator optimizer lr `8e-7` (`4e-6 / 5`), `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `path_step_size=0.05`, `unfrozen_range=except_map_encoder`, sampling = Euler 32-step / `noise_scale=1.0` / random terminal denoising step을 기본으로 둡니다.
+- H100 preset은 Generator lr `4e-6`, generated estimator optimizer lr `8e-7` (`4e-6 / 5`), `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=except_map_encoder`, sampling = Euler 32-step / `noise_scale=1.0` / random terminal denoising step을 기본으로 둡니다.
 - Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=1.0e-3`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다.
 - Generator EMA 기본값은 `ema_weight=0.99`, `ema_start_step=50` 입니다. EMA는 online Generator update 직후에만 갱신되고, generated estimator에는 적용하지 않습니다.
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=1` 입니다. self-forcing 시작 후 첫 1 epoch 동안은 현재 Generator의 self-rollout으로 generated estimator만 먼저 학습하고, Generator update와 EMA update는 건너뜁니다.
@@ -3274,11 +3274,11 @@ K commit block 수 = flow_window_steps / 5
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 DDP 전체 rank가 random terminal step `s` 를 하나 공유하고, 모든 rank의 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
 - stop-motion gate는 self-forced 학습 rollout과 validation / test / submission inference 모두에서 사용하지 않습니다. `decoder.use_stop_motion` 과 `self_forced.use_stop_motion` 은 호환용 config 키로만 남아 있고 실제 동작은 false로 고정됩니다.
 - random terminal step `s` 는 self-rollout 의 실행 길이와 commit 지점만 정합니다. Generated estimator `F_psi` 학습과 generator direction 계산에서 쓰는 flow noising `tau` 는 rollout 의 `s` 와 독립적으로 전체 tau 구간에서 새로 샘플링합니다.
-- generator direction은 raw score/path 이동량을 그대로 쓰지 않고,
-- 같은 noisy path에서 `F_rho` 와 `F_psi` 가 각각 추정한 clean path 차이를 사용합니다.
-- `teacher clean path - generated clean path` 를
-- agent별 `현재 closed-loop path` 와 `teacher clean path` 사이의 평균 거리로 정규화한 뒤,
-- `path_step_size` 를 곱해 target path를 만듭니다.
+- generator direction은 raw score/path 이동량을 그대로 쓰지 않고, 같은 noisy path에서 `F_rho` 와 `F_psi` 가 각각 추정한 clean path 차이를 사용합니다.
+- DMD 방향은 `teacher clean path - generated clean path` 를 agent별 `현재 closed-loop path` 와 `teacher clean path` 사이의 평균 거리로 정규화해서 만듭니다.
+- control-space self-forcing에서 `use_holonomic_model_only=false`이면 active-control DMD를 사용합니다. pedestrian은 `[delta_s, delta_n, delta_theta]` 3축을 모두 쓰고, vehicle/cyclist는 실제 non-holonomic decode에 직접 쓰이는 `[delta_s, delta_theta]`만 씁니다. 즉 vehicle/cyclist lateral `delta_n`에는 DMD 방향과 DMD loss gradient를 주지 않습니다.
+- DMD 정규화 분모도 같은 active 축만 사용합니다. vehicle/cyclist lateral 오차가 DMD 방향 크기를 키우거나 줄이지 않게 하기 위한 규칙입니다.
+- DMD target은 `committed_path_norm + path_delta`를 detached target으로 둡니다. 이전의 `path_step_size=0.05` 계수는 DMD 이론상 path 이동량이 아니라 surrogate gradient를 임의로 줄이는 값이라 제거했습니다. 실제 generator update 크기는 optimizer learning rate와 parameter Jacobian이 정합니다.
 - Clean-DMD guidance의 기본 noising 구간은 `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 입니다.
 - 정규화 분모는 `clean_dmd_normalizer_eps=1.0e-3` 으로 최소값을 둬서 target path가 과하게 튀는 상황을 줄입니다.
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.use_anchor_flow_matching_loss=false` 로 두면 `anchor_weight` 값과 무관하게 self-forced active step에서 training-mode open-loop forward와 FM loss 계산 자체를 생략합니다. `true` 일 때만 `model.model_config.self_forced.anchor_weight` 로 total loss 반영 강도를 제어합니다. anchor FM 을 끈 상태에서 어떤 rank 의 committed self-rollout 까지 비어있는 (모든 agent 가 invalid anchor0) 드문 경우에는, encoder 파라미터 합에 0 을 곱한 zero-loss 로 backward 만 한 번 돌려 DDP all-reduce 참여를 보장하고 optimizer step 은 건너뜁니다. 이 가드가 없으면 그 rank 만 backward 를 호출하지 않아 다른 rank 의 NCCL all-reduce 가 NCCL_TIMEOUT 까지 hang 합니다.
@@ -3366,16 +3366,16 @@ fine-tuning 에 쓰는 rollout 과 inference 에 쓰는 rollout 은 기본 commi
 
 ### Self-forced SiD-lite Update
 
-- `model.model_config.self_forced.distribution_matching_objective=dmd` 는 기존 방식입니다.
-  frozen teacher / generated estimator 차이로 방향을 만들고,
-  `committed_path_norm + path_step_size * path_delta` 를 detached target으로 둔 뒤 MSE를 겁니다.
+- `model.model_config.self_forced.distribution_matching_objective=dmd` 는 active-control Clean-DMD 방식입니다.
+  frozen teacher / generated estimator 차이로 방향을 만들고, `committed_path_norm + path_delta` 를 detached target으로 둡니다.
+  loss는 agent별 active 축 평균에 `0.5`를 곱해 계산합니다. 그래서 surrogate gradient가 active 축에서 `-path_delta` 방향이 되고, vehicle/cyclist lateral 축은 non-holonomic 실행 결과에 직접 쓰이지 않으므로 제외됩니다.
 - `model.model_config.self_forced.distribution_matching_objective=sid` 는 SiD-lite 방식입니다.
   closed-loop self-rollout, frozen teacher, generated estimator, estimator update, EMA 구조는 그대로 두고,
   generator update만 `X`, `R`, `F` 관계식으로 계산합니다.
 - SiD-lite에서 `X` 는 Generator가 실제로 실행한 path,
   `R` 은 frozen teacher의 clean path 예측,
   `F` 는 generated estimator의 clean path 예측입니다.
-- SiD-lite loss는 `path_step_size` 를 사용하지 않습니다.
+- SiD-lite loss도 `path_step_size` 를 사용하지 않습니다.
   `sid_alpha` 기본값은 `1.0`, `sid_normalizer_eps` 기본값은 `1.0e-3` 입니다.
 - 바로 실행하려면 아래 preset을 사용할 수 있습니다.
 

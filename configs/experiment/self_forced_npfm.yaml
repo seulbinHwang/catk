@@ -22,7 +22,6 @@ model:
       enabled: true
       start_epoch: 0
       weight: 1.0
-      path_step_size: 0.05
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
       # Training self-rollout 전용입니다. Inference/validation stop-motion은

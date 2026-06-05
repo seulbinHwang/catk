@@ -34,9 +34,12 @@ from src.smart.modules.self_forced_path_flow import (
     build_anchor0_normalized_committed_control,
     build_anchor0_normalized_committed_path,
     get_anchor0_valid_mask,
-    masked_mean_square_loss,
 )
-from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
+from src.smart.modules.self_forced_dmd_guidance import (
+    active_control_dmd_surrogate_loss,
+    build_active_control_mask,
+    build_clean_dmd_direction,
+)
 from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
 from src.smart.modules.self_forced_update_separation import (
     assert_no_module_gradients,
@@ -233,11 +236,6 @@ class SMARTFlow(LightningModule):
             float(getattr(self.self_forced_config, "weight", 1.0))
             if self.self_forced_config is not None
             else 0.0
-        )
-        self.self_forced_path_step_size = (
-            float(getattr(self.self_forced_config, "path_step_size", 0.05))
-            if self.self_forced_config is not None
-            else 0.05
         )
         self.self_forced_direction_normalizer_eps = (
             float(getattr(self.self_forced_config, "clean_dmd_normalizer_eps", 1.0e-3))
@@ -2541,6 +2539,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        active_control_mask: Tensor | None = None,
     ) -> Tensor:
         """clean-DMD 방향을 고정된 평가자 출력으로 계산합니다.
 
@@ -2552,6 +2551,8 @@ class SMARTFlow(LightningModule):
                 control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
             anchor_mask: 첫 anchor 기준으로 유효한 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
+            active_control_mask: DMD에 사용할 active 축 mask입니다. shape은
+                ``[n_valid_agent, 1, flow_dim]`` 입니다.
 
         Returns:
             Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
@@ -2596,11 +2597,38 @@ class SMARTFlow(LightningModule):
                 committed_path_norm=clean_for_guidance,
                 target_clean_norm=target_pred["clean"],
                 generated_clean_norm=generated_pred["clean"],
+                active_mask=active_control_mask,
                 normalizer_eps=self.self_forced_direction_normalizer_eps,
             )
 
         self._assert_self_forced_generator_update_isolated()
         return path_delta.to(dtype=committed_path_norm.dtype).detach()
+
+    def _build_self_forced_active_control_mask(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        committed_path_norm: Tensor,
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """self-forced DMD가 실행 가능한 control 축에만 작동하도록 mask를 만듭니다."""
+        if anchor_mask.ndim != 1:
+            raise ValueError(f"anchor_mask must have shape [n_agent], got {tuple(anchor_mask.shape)}.")
+        if "type" not in tokenized_agent:
+            raise KeyError("tokenized_agent must contain type for self-forced active-control DMD.")
+        agent_type = tokenized_agent["type"][anchor_mask].to(device=committed_path_norm.device)
+        if agent_type.shape[0] != committed_path_norm.shape[0]:
+            raise ValueError(
+                "anchor_mask selected agent count must match committed_path_norm batch: "
+                f"got {agent_type.shape[0]} and {committed_path_norm.shape[0]}."
+            )
+        return build_active_control_mask(
+            agent_type=agent_type,
+            flow_dim=int(committed_path_norm.shape[-1]),
+            device=committed_path_norm.device,
+            dtype=committed_path_norm.dtype,
+            use_kinematic_control_flow=bool(self.use_kinematic_control_flow),
+            use_holonomic_model_only=bool(self.encoder.agent_encoder.use_holonomic_model_only),
+        )
 
 
     def _sample_self_forced_guidance_flow_state(self, clean_path_norm: Tensor):
@@ -2750,19 +2778,30 @@ class SMARTFlow(LightningModule):
                 anchor_mask=anchor_mask,
             )
 
+        active_control_mask = self._build_self_forced_active_control_mask(
+            tokenized_agent=tokenized_agent,
+            committed_path_norm=committed_path_norm,
+            anchor_mask=anchor_mask,
+        )
         path_delta = self._compute_self_forced_direction(
             tokenized_map=tokenized_map,
             tokenized_agent=tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            active_control_mask=active_control_mask,
         )
-        target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
+        sf_loss, target_path_norm = active_control_dmd_surrogate_loss(
+            committed_path_norm=committed_path_norm,
+            dmd_direction=path_delta,
+            active_mask=active_control_mask,
+        )
         self._set_self_forced_backward_context(
             committed_path_norm=committed_path_norm,
             path_delta=path_delta,
             target_path_norm=target_path_norm,
+            active_control_mask=active_control_mask,
         )
-        return masked_mean_square_loss(committed_path_norm, target_path_norm)
+        return sf_loss
 
     def on_fit_start(self) -> None:
         """학습 시작 전에 빠른 closed-loop validation 모드를 켭니다.

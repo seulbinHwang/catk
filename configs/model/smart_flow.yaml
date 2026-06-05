@@ -69,7 +69,6 @@ model_config:
     enabled: false
     start_epoch: 0
     weight: 1.0
-    path_step_size: 0.05
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
     distribution_matching_objective: dmd
