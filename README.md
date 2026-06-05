@@ -38,6 +38,16 @@ SMART cache scene
 | auxiliary loss weight | 5.0 |
 | inference default | `sample_steps=1`, `action_reuse=true` |
 
+## MDG Mask Sampling
+
+학습 noise corruption은 MDG 논문 설명에 맞춰 batch 안의 masking rate가 낮은 값부터 높은 값까지 균등하게 들어가도록 만듭니다. 각 active scene-anchor pair는 한 training update 안에서 stratified rate를 하나 받습니다.
+
+```text
+r = [0, 1 / (B - 1), 2 / (B - 1), ..., 1]
+```
+
+DDP 학습에서는 rank별 local batch가 아니라 가능하면 전체 active scene-anchor 수를 모아 global batch 기준 rate grid를 만들고, 각 rank가 자기 slice를 받습니다. time-axis masking과 agent-axis masking도 active scene-anchor 안에서 거의 1:1이 되도록 배치합니다. Gaussian noising 수식, alpha schedule, time-axis/agent-axis mask 구조는 그대로 유지합니다.
+
 ## Auxiliary Trajectory Loss
 
 `semi_mdg`는 MDG 논문의 scene-context regularization 의도를 2초 horizon에 맞춰 적용합니다. 보조 head는 denoiser 출력 뒤가 아니라, noise를 넣기 전 anchor별 context vector에서 바로 20-step future pose를 예측합니다.
@@ -316,6 +326,46 @@ action reuse는 이전 2초 predicted control을 0.5초 앞으로 shift한 뒤, 
 이 브랜치의 목표는 Flow Matching과 fine tuning을 섞지 않고, 2초 control-state MDG pretrain 단일 방법론을 빠르고 안정적으로 검증하는 것입니다.
 
 ## 최근 검증 기록
+
+2026-06-05 KST에 `testas` A100 80GB x7과 실제 SMART cache로 batch-stratified MDG mask sampling 적용 후 검증했습니다.
+
+```text
+unit tests:
+  command: PYTHONPATH=/mnt/nuplan/projects/catk pytest tests/test_control_metric_conversion.py -q
+  result: 10 passed
+
+related regression tests:
+  command: PYTHONPATH=/mnt/nuplan/projects/catk pytest tests/test_aux_trajectory_loss.py tests/test_open_loop_empty_target_loss.py tests/test_mask_aware_prefix_valid_decoder.py -q
+  result: 11 passed
+
+DDP mask-plan contract:
+  command: torchrun --standalone --nnodes=1 --nproc_per_node=7 /tmp/test_mdg_stratified_mask_ddp.py
+  result: global delta grid matched linspace(0, 1) across 35 active scene-anchor samples
+  time-axis / agent-axis counts: 19 / 16
+
+train-only smoke:
+  task_name: semi_mdg_strat_mask_train_smoke_20260605
+  train_batch_size: 1 per GPU
+  global_batch_size: 7
+  limit_train_batches: 2
+  result: exit status 0
+  train/loss: 19.74088
+  train/loss_mdg: 0.13754
+  train/loss_aux: 3.92067
+
+train + open/closed-loop validation smoke:
+  task_name: semi_mdg_strat_mask_val_smoke_20260605
+  train_batch_size: 1 per GPU
+  val_batch_size: 1 per GPU
+  n_rollout_closed_val: 2
+  scorer_scene_num: 7
+  result: exit status 0
+  train/loss: 34.40487
+  train/loss_mdg: 0.24783
+  train/loss_aux: 6.83141
+  val_closed/sim_agents_2025/realism_meta_metric: 0.58525
+  val_closed/sim_agents_2025/scenario_counter: 7
+```
 
 2026-06-05 KST에 `testas` A100 80GB x7과 실제 SMART cache로 20-step auxiliary trajectory loss 적용 후 검증했습니다.
 

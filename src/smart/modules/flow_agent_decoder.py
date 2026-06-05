@@ -597,6 +597,63 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         permute_order = (1, 0) + tuple(range(2, values.ndim))
         return values.permute(permute_order)[anchor_mask.t()].contiguous()
 
+    @staticmethod
+    def _distributed_rank_and_size() -> tuple[int, int]:
+        distributed = getattr(torch, "distributed", None)
+        if (
+            distributed is None
+            or not distributed.is_available()
+            or not distributed.is_initialized()
+        ):
+            return 0, 1
+        return int(distributed.get_rank()), int(distributed.get_world_size())
+
+    @staticmethod
+    def _distributed_active_counts(local_count: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rank, world_size = SMARTFlowAgentDecoder._distributed_rank_and_size()
+        if world_size <= 1:
+            return local_count, local_count.new_zeros(())
+        distributed = torch.distributed
+        counts = [torch.zeros_like(local_count) for _ in range(world_size)]
+        distributed.all_gather(counts, local_count)
+        count_tensor = torch.stack(counts)
+        global_count = count_tensor.sum()
+        offset = count_tensor[:rank].sum()
+        return global_count, offset
+
+    def _sample_mdg_training_mask_plan(
+        self,
+        active_pair: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return batch-stratified masking rates and balanced masking axes."""
+        device = active_pair.device
+        n_pair = int(active_pair.numel())
+        delta = torch.zeros(n_pair, device=device, dtype=dtype)
+        temporal_pair = torch.zeros(n_pair, device=device, dtype=torch.bool)
+        active_count_tensor = active_pair.to(dtype=torch.long).sum()
+        active_count = int(active_count_tensor.item())
+        if active_count <= 0:
+            return delta, temporal_pair
+
+        global_count, global_offset = self._distributed_active_counts(active_count_tensor)
+        active_indices = active_pair.nonzero(as_tuple=False).flatten()
+        if int(global_count.item()) <= 1:
+            rates = torch.full((active_count,), 0.5, device=device, dtype=dtype)
+        else:
+            global_indices = (
+                global_offset.to(device=device)
+                + torch.arange(active_count, device=device, dtype=global_offset.dtype)
+            )
+            rates = global_indices.to(dtype=dtype) / (global_count.to(dtype=dtype) - 1.0)
+            rates = rates[torch.randperm(active_count, device=device)]
+        delta[active_indices] = rates
+
+        balanced_axis = (torch.arange(active_count, device=device) % 2) == 0
+        balanced_axis = balanced_axis[torch.randperm(active_count, device=device)]
+        temporal_pair[active_indices] = balanced_axis
+        return delta, temporal_pair
+
     def _sample_mdg_train_mask_levels(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -646,8 +703,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         active_pair = valid_pair_counts > 0
 
-        delta = torch.rand(n_pair, device=device, dtype=dtype)
-        temporal_pair = (torch.rand(n_pair, device=device) < 0.5) & active_pair
+        delta, temporal_pair = self._sample_mdg_training_mask_plan(
+            active_pair=active_pair,
+            dtype=dtype,
+        )
         agent_pair = (~temporal_pair) & active_pair
         rounded_step_count = torch.floor(delta * float(n_step) + 0.5).to(
             dtype=torch.long

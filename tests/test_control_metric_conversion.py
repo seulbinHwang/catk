@@ -199,6 +199,45 @@ def test_mdg_mask_sampler_marks_invalid_future_steps_clean_zero() -> None:
     assert bool((mask_level[future_valid_mask] <= decoder.mdg_num_noise_levels).all().item())
 
 
+def test_mdg_mask_plan_stratifies_rates_and_balances_axes() -> None:
+    decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
+    active_pair = torch.ones(20, dtype=torch.bool)
+
+    torch.manual_seed(17)
+    delta, temporal_pair = decoder._sample_mdg_training_mask_plan(
+        active_pair=active_pair,
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(
+        torch.sort(delta).values,
+        torch.linspace(0.0, 1.0, 20),
+    )
+    assert abs(int(temporal_pair.sum().item()) - 10) <= 1
+
+
+def test_mdg_mask_plan_ignores_inactive_pairs() -> None:
+    decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
+    active_pair = torch.tensor([True, False, True, False, True])
+
+    torch.manual_seed(23)
+    delta, temporal_pair = decoder._sample_mdg_training_mask_plan(
+        active_pair=active_pair,
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(
+        torch.sort(delta[active_pair]).values,
+        torch.linspace(0.0, 1.0, 3),
+    )
+    torch.testing.assert_close(
+        delta[~active_pair],
+        torch.zeros_like(delta[~active_pair]),
+    )
+    assert not bool(temporal_pair[~active_pair].any().item())
+    assert abs(int(temporal_pair[active_pair].sum().item()) - 2) <= 1
+
+
 def test_mdg_multistep_final_clean_transition_uses_last_clean_estimate() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     decoder.flow_window_steps = 3
