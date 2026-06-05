@@ -252,6 +252,59 @@ def build_anchor0_normalized_committed_path(
     )
 
 
+def build_anchor_k_normalized_committed_control(
+    pred_control_10hz: Tensor,
+    flow_window_steps: int,
+    anchor_idx: int = 0,
+    anchor_stride_2hz: int = 1,
+    shift: int = 5,
+    rollout_is_anchor_grounded: bool = False,
+) -> Tensor:
+    """closed-loop rollout이 실제 선택한 raw control window를 돌려줍니다.
+
+    control-space self-forcing에서는 kinematic commit을 state transition으로만 사용하고,
+    fake/teacher score가 보는 generated sample은 pose에서 역산한 canonical control이
+    아니라 generator가 commit 직전에 낸 native control이어야 합니다. 이 helper는
+    ``training_rollout_from_cache(return_committed_control=True)`` 가 저장한
+    ``pred_control_10hz`` 에서 anchor window만 자릅니다.
+
+    Args:
+        pred_control_10hz: closed-loop가 각 10Hz step에서 commit에 사용한 normalized
+            control입니다. shape은 ``[n_agent, T_rollout, 3]`` 입니다.
+        flow_window_steps: score model이 보는 flow window 길이입니다.
+        anchor_idx: 사용할 anchor index입니다.
+        anchor_stride_2hz: anchor index 간 2Hz stride입니다.
+        shift: 0.5초 commit block의 10Hz step 수입니다.
+        rollout_is_anchor_grounded: ``True`` 이면 rollout이 이미 해당 anchor 현재 상태에서
+            시작했다고 보고 window 0부터 자릅니다.
+
+    Returns:
+        Tensor: raw normalized control window, shape ``[n_agent, flow_window_steps, 3]``.
+    """
+    if anchor_idx < 0:
+        raise ValueError(f"anchor_idx must be non-negative, got {anchor_idx}.")
+    if anchor_stride_2hz < 1:
+        raise ValueError(f"anchor_stride_2hz must be >= 1, got {anchor_stride_2hz}.")
+    if pred_control_10hz.ndim != 3 or pred_control_10hz.shape[-1] != CONTROL_FLOW_DIM:
+        raise ValueError(
+            "pred_control_10hz must have shape [n_agent, T, 3], "
+            f"got {tuple(pred_control_10hz.shape)}."
+        )
+    if rollout_is_anchor_grounded:
+        start_10hz = 0
+    else:
+        start_10hz = int(anchor_idx) * int(anchor_stride_2hz) * int(shift)
+    end_10hz = start_10hz + int(flow_window_steps)
+    if pred_control_10hz.shape[1] < end_10hz:
+        raise ValueError(
+            "Committed control rollout shorter than anchor window: "
+            f"need {end_10hz} 10Hz steps for anchor_idx={anchor_idx} "
+            f"(stride_2hz={anchor_stride_2hz}, shift={shift}, window={flow_window_steps}, "
+            f"anchor_grounded={rollout_is_anchor_grounded}), got {pred_control_10hz.shape[1]}."
+        )
+    return pred_control_10hz[:, start_10hz:end_10hz]
+
+
 def build_anchor0_normalized_committed_control(
     committed_path_norm: Tensor,
     tokenized_agent: Dict[str, Tensor],

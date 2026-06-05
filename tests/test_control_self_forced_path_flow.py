@@ -7,6 +7,7 @@ from src.smart.modules.kinematic_control import (
     denormalize_control,
 )
 from src.smart.modules.self_forced_path_flow import build_anchor0_normalized_committed_control
+from src.smart.modules.self_forced_path_flow import build_anchor_k_normalized_committed_control
 
 
 CONTROL_YAW_SCALE_KWARGS = {
@@ -77,3 +78,60 @@ def test_control_self_forced_projection_keeps_generator_gradient_path() -> None:
     assert future_head.grad is not None
     assert torch.isfinite(future_x.grad).all()
     assert torch.isfinite(future_head.grad).all()
+
+
+def test_raw_committed_control_pack_uses_rollout_action_window() -> None:
+    pred_control_10hz = torch.arange(2 * 30 * 3, dtype=torch.float32).reshape(2, 30, 3)
+
+    packed = build_anchor_k_normalized_committed_control(
+        pred_control_10hz=pred_control_10hz,
+        flow_window_steps=10,
+        anchor_idx=2,
+        anchor_stride_2hz=2,
+        shift=5,
+        rollout_is_anchor_grounded=False,
+    )
+
+    torch.testing.assert_close(packed, pred_control_10hz[:, 20:30])
+
+
+def test_raw_committed_control_pack_anchor_grounded_starts_at_zero() -> None:
+    pred_control_10hz = torch.arange(1 * 12 * 3, dtype=torch.float32).reshape(1, 12, 3)
+
+    packed = build_anchor_k_normalized_committed_control(
+        pred_control_10hz=pred_control_10hz,
+        flow_window_steps=8,
+        anchor_idx=4,
+        anchor_stride_2hz=3,
+        shift=5,
+        rollout_is_anchor_grounded=True,
+    )
+
+    torch.testing.assert_close(packed, pred_control_10hz[:, :8])
+
+
+def test_raw_committed_control_pack_keeps_generator_gradient_path() -> None:
+    pred_control_10hz = torch.randn(2, 12, 3, requires_grad=True)
+
+    packed = build_anchor_k_normalized_committed_control(
+        pred_control_10hz=pred_control_10hz,
+        flow_window_steps=5,
+        anchor_idx=1,
+        anchor_stride_2hz=1,
+        shift=5,
+        rollout_is_anchor_grounded=False,
+    )
+    loss = packed.square().sum()
+    loss.backward()
+
+    assert pred_control_10hz.grad is not None
+    assert torch.isfinite(pred_control_10hz.grad).all()
+    torch.testing.assert_close(
+        pred_control_10hz.grad[:, :5],
+        torch.zeros_like(pred_control_10hz.grad[:, :5]),
+    )
+    assert bool((pred_control_10hz.grad[:, 5:10].abs() > 0.0).any())
+    torch.testing.assert_close(
+        pred_control_10hz.grad[:, 10:],
+        torch.zeros_like(pred_control_10hz.grad[:, 10:]),
+    )

@@ -33,7 +33,6 @@ from src.smart.metrics.flow_metrics import (
     yaw_fde_future,
 )
 from src.smart.modules.self_forced_path_flow import (
-    build_anchor0_normalized_committed_control,
     build_anchor0_normalized_committed_path,
     get_anchor0_valid_mask,
     masked_mean_square_loss,
@@ -2671,6 +2670,7 @@ class SMARTFlow(LightningModule):
                 self_forced_epoch=int(self.current_epoch),
                 detach_block_transition=self.self_forced_detach_block_transition,
                 use_stop_motion=self.self_forced_use_stop_motion,
+                return_committed_control=bool(self.use_kinematic_control_flow),
             )
         finally:
             self._restore_module_training_modes(encoder_modes)
@@ -2692,12 +2692,14 @@ class SMARTFlow(LightningModule):
 
         Returns:
             packed_path_norm: downstream default — use_kinematic_control_flow=True 면
-                control-space 3-dim, 아니면 pose-space 4-dim.  DMD/SiD critic / estimator 가 사용.
+                rollout이 실제 선택한 raw control-space 3-dim, 아니면 pose-space 4-dim.
+                DMD/SiD critic / estimator 가 사용.
             packed_path_pose_norm: 항상 pose-space 4-dim ``[x/20, y/20, cos, sin]``.
                 metric / diagnostics 에서 pose-space 값이 필요할 때 사용합니다.
             anchor_mask: anchor 별 agent mask.
         """
         from src.smart.modules.self_forced_path_flow import (
+            build_anchor_k_normalized_committed_control,
             build_anchor_k_normalized_committed_path,
             get_anchor_k_valid_mask,
         )
@@ -2714,19 +2716,20 @@ class SMARTFlow(LightningModule):
         )
         packed_path_pose_norm = committed_path_norm_full[anchor_mask]
         if self.use_kinematic_control_flow:
-            packed_path_norm = build_anchor0_normalized_committed_control(
-                committed_path_norm=packed_path_pose_norm,
-                tokenized_agent=tokenized_agent,
-                anchor_mask=anchor_mask,
-                pos_scale_m=self.encoder.agent_encoder.control_pos_scale_m,
-                vehicle_yaw_scale_rad=self.encoder.agent_encoder.control_vehicle_yaw_scale_rad,
-                pedestrian_yaw_scale_rad=self.encoder.agent_encoder.control_pedestrian_yaw_scale_rad,
-                cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
-                use_holonomic_model_only=self.encoder.agent_encoder.use_holonomic_model_only,
-                use_rolling_supervision=self.encoder.agent_encoder.use_rolling_supervision,
-                vehicle_no_slip_point_ratio=self.encoder.agent_encoder.control_vehicle_no_slip_point_ratio,
-                cyclist_no_slip_point_ratio=self.encoder.agent_encoder.control_cyclist_no_slip_point_ratio,
+            if "pred_control_10hz" not in rollout:
+                raise KeyError(
+                    "control-space self-forced rollout must contain pred_control_10hz. "
+                    "Call training_rollout_from_cache(return_committed_control=True)."
+                )
+            committed_control_norm_full = build_anchor_k_normalized_committed_control(
+                pred_control_10hz=rollout["pred_control_10hz"],
+                flow_window_steps=self.flow_window_steps,
+                anchor_idx=int(anchor_idx),
+                anchor_stride_2hz=int(self.self_forced_anchor_stride),
+                shift=int(self.encoder.agent_encoder.shift),
+                rollout_is_anchor_grounded=bool(anchor_grounded),
             )
+            packed_path_norm = committed_control_norm_full[anchor_mask]
         else:
             packed_path_norm = packed_path_pose_norm
         return packed_path_norm, packed_path_pose_norm, anchor_mask
