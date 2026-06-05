@@ -18,7 +18,7 @@ model:
       num_freq_bands: 64
     validation_rollout_sampling:
       criterium: topk_prob
-      num_k: 64 # for k most likely
+      num_k: 12 # for k most likely
       temp: 1.0
 
 ckpt_path: YOUR_MODEL.ckpt

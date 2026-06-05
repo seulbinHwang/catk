@@ -4,7 +4,7 @@
 #
 # This config intentionally keeps the SMART model, deterministic nearest-token
 # tokenization, and loss from `pre_bc`. The fit-time closed-loop validation
-# sampling is aligned with WOSAC submission by using top-16 candidates. The
+# sampling is aligned with WOSAC submission by using top-12 candidates. The
 # remaining training/runtime recipe is aligned with
 # the x4x2 flow-control pretrain recipe used on semi_control_stable:
 #   * 2 nodes
@@ -30,7 +30,7 @@ model:
     n_vis_rollout: 0
     validation_rollout_sampling:
       criterium: topk_prob
-      num_k: 16
+      num_k: 12
       temp: 1.0
 
 trainer:
