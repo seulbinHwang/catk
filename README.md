@@ -278,8 +278,8 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | branch | `trajtok` |
 | pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
-| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_lr581e4_oom_retry_trajtok_hidden128_fulltraj_topk12_trainselectfalse_20260605` |
-| remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_fulltraj_20260605` |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_lr581e4_oom_retry_trajtok_hidden128_renewedvocab_fulltraj_topk12_trainselectfalse_20260605` |
+| remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_renewedvocab_fulltraj_20260605` |
 | experiment | `pre_bc_a100x4x2` |
 | model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, full 0.5초 future contour token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
 | decoder | `hidden_dim=128`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
@@ -323,6 +323,7 @@ GPU로 full 0.5초 future contour target을 검증했다.
 | H100 4+2 DDP train smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, real train cache, 1 batch | manual 6-rank DDP, 6/6 ranks NCCL 초기화 및 backward 정상 종료, exit status `0` |
 | H100 4+2 DDP train+validation smoke | same pods, real train/validation cache, 1 train batch + 1 closed-loop validation batch, `validation_rollout_sampling.num_k=16` | train step, checkpoint callback, open-loop validation, closed-loop fast WOSAC metric 정상 종료, `run.py DONE` |
 | 20260605 d6+fulltraj H100 4+2 DDP smoke | `trajtok_verify_d6_fulltraj_ddp_smoke_20260605`, 6 ranks, 1 train batch + 1 closed-loop validation batch, `validation_rollout_sampling=(topk_prob, num_k=12, temp=1.0)` | train step, open-loop loss, top-12 closed-loop fast WOSAC logging 정상 종료, `val_open/loss=8.94262`, `run.py DONE`, exit status `0` |
+| 20260605 hidden128 renewed-vocab H100 4+2 smoke | `trajtok_hidden128_renewedvocab_bs18_train_val_smoke_20260605`, 6 ranks, `data.train_batch_size=18`, effective global batch 108, `lr=0.0005809475`, 1 train batch + 1 closed-loop validation batch | 최신 `origin/trajtok` commit `fe98972`, 새 `trajtok_vocab.pkl`, `hidden_dim=128`으로 train/open-loop/closed-loop fast WOSAC 경로 정상 종료, `val_open/loss=8.71990`, `val_open/acc=0.53587`, `run.py DONE`, exit status `0` |
 | 20260604 H100 4+2 launch smoke | `smart_ntp_pretrain_h100x4_h100x2_globalbs90_lr685e4_oom_retry_trajtok_hidden124_globalendpoint_topk16_trainselectfalse_20260604_smoke`, `data.train_batch_size=15`, 6 ranks, `lr=6.85e-4` | `bs=15`에서 OOM 없이 1 train batch + top-16 closed-loop validation 1 batch 정상 종료, `run.py DONE` |
 | 20260604 batch-size probe | `trajtok_h100x4_h100x2_bs_probe_20b_20260604`, 20 train batches, validation off | `bs=24`는 `wo-pvc-2` rank 5 CUDA OOM, `bs=22`는 `hsb-npc-training` rank 3 CUDA OOM, `bs=20`은 20/20 train batches 정상 종료 |
 | 20260604 bs20 stability probe | `trajtok_h100x4_h100x2_bs20_probe_100b_20260604`, `data.train_batch_size=20`, 6 ranks, validation off | 100/100 train batches 정상 종료, OOM marker 없음, `run.py DONE` |
@@ -400,7 +401,7 @@ bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 
 장기 학습에서 OOM 자동 재시작까지 원하면 `START_ONLY` 없이 wrapper를 계속 실행해야 한다.
 로컬 shell을 점유하지 않으려면 아래처럼 로컬 tmux 안에서 wrapper를 foreground로 둔다.
-기본 task name은 `globalbs108`, `lr581e4`, `fulltraj`, `topk12`를 포함하므로, 기존
+기본 task name은 `globalbs108`, `lr581e4`, `hidden128`, `renewedvocab`, `fulltraj`, `topk12`를 포함하므로, 기존
 `globalbs90`/`globalbs102`/`globalbs120` run의 checkpoint를 이어 쓰지 않는 fresh start다.
 2026-06-04 probe 기준 `INITIAL_BS=24`와 `22`는 H100 80GB에서 CUDA OOM이 발생했고,
 `INITIAL_BS=20`은 100 train batches smoke는 통과했지만 장기 run의 epoch 0 step 102 부근에서
@@ -415,7 +416,7 @@ remote `PROJECT_ROOT`에 미커밋 변경이나 untracked 파일이 있으면 wr
 push --include-untracked`로 보존한 뒤 `origin/trajtok`을 checkout한다.
 
 ```bash
-tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-fulltraj-gbs108-wrapper
+tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-renewedvocab-fulltraj-gbs108-wrapper
 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 
 START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
@@ -424,8 +425,8 @@ START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_ret
 실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-fulltraj-gbs108-lr581e4
-kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-fulltraj-gbs108-lr581e4
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-renewedvocab-fulltraj-gbs108-lr581e4
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-renewedvocab-fulltraj-gbs108-lr581e4
 
 STOP=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 ```
