@@ -633,10 +633,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         temporal_pair = torch.zeros(n_pair, device=device, dtype=torch.bool)
         active_count_tensor = active_pair.to(dtype=torch.long).sum()
         active_count = int(active_count_tensor.item())
+        global_count, global_offset = self._distributed_active_counts(active_count_tensor)
         if active_count <= 0:
             return delta, temporal_pair
 
-        global_count, global_offset = self._distributed_active_counts(active_count_tensor)
         active_indices = active_pair.nonzero(as_tuple=False).flatten()
         if int(global_count.item()) <= 1:
             rates = torch.full((active_count,), 0.5, device=device, dtype=dtype)

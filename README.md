@@ -327,43 +327,45 @@ action reuse는 이전 2초 predicted control을 0.5초 앞으로 shift한 뒤, 
 
 ## 최근 검증 기록
 
-2026-06-05 KST에 `testas` A100 80GB x7과 실제 SMART cache로 batch-stratified MDG mask sampling 적용 후 검증했습니다.
+2026-06-05 KST에 `testas` A100 80GB x7과 실제 SMART cache로 batch-stratified MDG mask sampling 적용 후 다시 검증했습니다. 이 재검증에서 일부 DDP rank의 active scene-anchor pair가 0개인 경우에도 모든 rank가 동일한 collective 경로를 지나도록 보강했습니다.
 
 ```text
-unit tests:
-  command: PYTHONPATH=/mnt/nuplan/projects/catk pytest tests/test_control_metric_conversion.py -q
-  result: 10 passed
+unit / regression tests:
+  command: PYTHONPATH=/mnt/nuplan/projects/catk pytest tests/test_control_metric_conversion.py tests/test_aux_trajectory_loss.py tests/test_open_loop_empty_target_loss.py tests/test_mask_aware_prefix_valid_decoder.py -q
+  result: 22 passed
 
-related regression tests:
-  command: PYTHONPATH=/mnt/nuplan/projects/catk pytest tests/test_aux_trajectory_loss.py tests/test_open_loop_empty_target_loss.py tests/test_mask_aware_prefix_valid_decoder.py -q
-  result: 11 passed
+preprocessing / sampler compatibility tests:
+  command: PYTHONPATH=/mnt/nuplan/projects/catk pytest tests/test_prefix_valid_future_loss_mask.py tests/test_memory_balanced_batch_sampler.py -q
+  result: 14 passed
 
-DDP mask-plan contract:
-  command: torchrun --standalone --nnodes=1 --nproc_per_node=7 /tmp/test_mdg_stratified_mask_ddp.py
-  result: global delta grid matched linspace(0, 1) across 35 active scene-anchor samples
-  time-axis / agent-axis counts: 19 / 16
+DDP mask-plan zero-active-rank contract:
+  command: torchrun --standalone --nnodes=1 --nproc_per_node=7 /tmp/test_mdg_stratified_mask_ddp_zero.py
+  result: no collective deadlock with ranks 0 and 3 holding zero active pairs
+  global delta grid matched linspace(0, 1) across 23 active scene-anchor samples
+  time-axis / agent-axis counts: 13 / 10
 
 train-only smoke:
-  task_name: semi_mdg_strat_mask_train_smoke_20260605
+  task_name: semi_mdg_aux_strat_mask_train_smoke_20260605
   train_batch_size: 1 per GPU
   global_batch_size: 7
   limit_train_batches: 2
   result: exit status 0
-  train/loss: 19.74088
-  train/loss_mdg: 0.13754
-  train/loss_aux: 3.92067
+  train/loss: 19.74106
+  train/loss_mdg: 0.13753
+  train/loss_aux: 3.92071
 
 train + open/closed-loop validation smoke:
-  task_name: semi_mdg_strat_mask_val_smoke_20260605
+  task_name: semi_mdg_aux_strat_mask_val_smoke_20260605
   train_batch_size: 1 per GPU
   val_batch_size: 1 per GPU
   n_rollout_closed_val: 2
   scorer_scene_num: 7
   result: exit status 0
-  train/loss: 34.40487
-  train/loss_mdg: 0.24783
-  train/loss_aux: 6.83141
-  val_closed/sim_agents_2025/realism_meta_metric: 0.58525
+  train/loss: 34.40338
+  train/loss_mdg: 0.24784
+  train/loss_aux: 6.83111
+  val_open/ADE2s: 4.33034
+  val_closed/sim_agents_2025/realism_meta_metric: 0.58547
   val_closed/sim_agents_2025/scenario_counter: 7
 ```
 

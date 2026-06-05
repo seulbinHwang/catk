@@ -238,6 +238,19 @@ def test_mdg_mask_plan_ignores_inactive_pairs() -> None:
     assert abs(int(temporal_pair[active_pair].sum().item()) - 2) <= 1
 
 
+def test_mdg_mask_plan_handles_empty_active_pairs() -> None:
+    decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
+    active_pair = torch.zeros(5, dtype=torch.bool)
+
+    delta, temporal_pair = decoder._sample_mdg_training_mask_plan(
+        active_pair=active_pair,
+        dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(delta, torch.zeros_like(delta))
+    assert not bool(temporal_pair.any().item())
+
+
 def test_mdg_multistep_final_clean_transition_uses_last_clean_estimate() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     decoder.flow_window_steps = 3
