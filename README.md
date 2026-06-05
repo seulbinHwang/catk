@@ -2133,9 +2133,11 @@ python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py \
 | self-forced sample steps | Euler `sample_steps=16` |
 | self-forced backprop | `backprop_last_k=8` |
 | random terminal policy | `all` |
+| train metric clean | `decoder.detach_train_metric_clean=true` |
 | validation rollout sampling | Euler `sample_steps=16`, `antithetic_pairs=true`, `stratified_gaussian_noise=false`, `noise_scale=1.0` |
+| validation mode | `val_closed_loop=true`, `val_open_loop=false` |
 | train data fraction | `data.train_epoch_sample_fraction=0.5` |
-| validation | `check_val_every_n_epoch=2`, `limit_val_batches=0.1` |
+| validation cadence | `check_val_every_n_epoch=1`, `limit_val_batches=0.1` |
 | epochs | `12` |
 | initial train batch | per-rank `18`, effective global batch `108` |
 | OOM fallback | `18 -> 17 -> ...`, latest self-forced checkpoint resume |

@@ -36,6 +36,7 @@ action: finetune
 model:
   model_config:
     lr: 1e-6
+    val_open_loop: false
     n_rollout_closed_val: 32
     sim_agents_context_cache_size: 64
     n_vis_batch: 0
@@ -72,6 +73,8 @@ model:
           # all: 항상 sample_steps 전체를 실행하고 sampling.backprop_last_k step만 역전파합니다.
           policy: all
           min_executed_steps: 16
+    decoder:
+      detach_train_metric_clean: true
 
 ckpt_path: null
 
@@ -79,7 +82,7 @@ trainer:
   devices: 6
   limit_train_batches: 1.0
   limit_val_batches: 0.1
-  check_val_every_n_epoch: 2
+  check_val_every_n_epoch: 1
   max_epochs: 12
   precision: bf16-mixed
   # Lightning rejects auto gradient clipping under manual optimization.

@@ -370,7 +370,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="0.1")
     parser.add_argument("--max-epochs", default="12")
-    parser.add_argument("--check-val-every-n-epoch", default="2")
+    parser.add_argument("--check-val-every-n-epoch", default="1")
     parser.add_argument("--learning-rate", default="1.0e-6")
     parser.add_argument("--train-epoch-sample-fraction", default="0.5")
     parser.add_argument("--random-terminal-scope", default="global_batch")
