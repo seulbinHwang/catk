@@ -2086,6 +2086,74 @@ torchrun \
   ckpt_path=/path/to/2s_pretrain_epoch_last.ckpt
 ```
 
+#### hsb-npc-training-1 H100x6 DMD self-forcing launcher
+
+`hsb-npc-training-1` 단일 H100x6 pod에서 epoch 116 pretrained Generator를 시작점으로 DMD-style self-forced fine-tuning을 돌릴 때는 아래 launcher를 씁니다. pod를 새로 만들거나 재시작하지 않고, 기존 pod 안에 tmux session과 OOM retry 학습 프로세스만 만듭니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py --replace
+```
+
+먼저 짧은 smoke/probe만 확인하려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py \
+  --replace \
+  --task-name flow_self_forced_dmd_h100x6_hsb1_smoke_bs36 \
+  --session catk-self-forced-dmd-h100x6-hsb1-smoke \
+  --initial-bs 36 \
+  --max-epochs 1 \
+  --limit-train-batches 2 \
+  --limit-val-batches 0
+```
+
+기본 launcher 설정:
+
+| 항목 | 값 |
+|---|---|
+| pod | `hsb-npc-training-1` 단일 H100x6 |
+| branch | `semi_control_stable` |
+| experiment | `self_forced_npfm_h100_6` |
+| default task | `flow_self_forced_dmd_h100x6_hsb1_epoch116_activecontrol_sample16_backprop8_lr1e-6_bs36_oomretry` |
+| pretrained checkpoint | `jksg01019-naver-labs/SMART-FLOW/epoch-last-mqfq3u39:v121` |
+| checkpoint 의미 | train+validation pretrain run의 epoch 116 Generator |
+| action | 첫 시도 `finetune`, OOM 후 재시도는 최신 self-forced `epoch_last.ckpt` 기준 `fit` |
+| DMD objective | `model.model_config.self_forced.distribution_matching_objective=dmd` |
+| control mode | `use_kinematic_control_flow=true`, `use_holonomic_model_only=false` |
+| DMD active axes | pedestrian `[delta_s, delta_n, delta_theta]`, vehicle/cyclist `[delta_s, delta_theta]` |
+| no-slip point | vehicle `0.2289518863`, cyclist `0.0495847873` |
+| round-trip filter | `control_round_trip_max_position_error_m=0.5` |
+| prefix valid mask | `use_prefix_valid_future_loss_mask=true` |
+| rolling supervision | `use_rolling_supervision=true` |
+| lr | `1.0e-6` |
+| generated estimator lr | `1.0e-6 / estimator_updates_per_step = 2.0e-7` |
+| estimator updates | `5` per train step |
+| estimator warmup | `0` epoch |
+| detach block transition | `true` |
+| self-forced sample steps | Euler `sample_steps=16` |
+| self-forced backprop | `backprop_last_k=8` |
+| random terminal policy | `all` |
+| validation rollout sampling | Euler `sample_steps=16`, `antithetic_pairs=true`, `stratified_gaussian_noise=false`, `noise_scale=1.0` |
+| train data fraction | `data.train_epoch_sample_fraction=0.5` |
+| validation | `check_val_every_n_epoch=2`, `limit_val_batches=0.1` |
+| epochs | `12` |
+| initial train batch | per-rank `36` |
+| OOM fallback | `36 -> 35 -> ...`, latest self-forced checkpoint resume |
+| tmux session | `catk-self-forced-dmd-h100x6-hsb1` |
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- \
+  tmux attach -t catk-self-forced-dmd-h100x6-hsb1
+```
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py --stop
+```
+
 중단된 self-forced run을 이어서 학습할 때만 `action=fit ckpt_path=/path/to/self_forced_run/last.ckpt` 를 사용하세요. 이 경우에는 Lightning이 optimizer, epoch, global step까지 함께 복원합니다. checkpoint 안에 `self_forced_target_teacher`, `self_forced_generated_estimator`, `self_forced_generator_ema` state가 있으면, fit 시작 hook은 보조 모델과 EMA를 현재 Generator weight로 다시 덮어쓰지 않고 checkpoint의 `F_rho` / `F_psi` / EMA 상태를 보존합니다.
 
 보호 장치도 있습니다. self-forced가 켜진 상태에서 `action=finetune` 에 self-forced checkpoint를 넣으면 실행이 중단됩니다. 반대로 `action=fit` 에 self-forced 보조 state가 없는 pretrained checkpoint를 넣어도 중단됩니다. 즉, pretrained Generator에서 처음 시작할 때는 `action=finetune`, self-forced run을 이어갈 때는 `action=fit` 으로 분리해야 합니다.
