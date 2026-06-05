@@ -456,6 +456,10 @@ class SMART(LightningModule):
                 agent_type: self._repeat_tensor_on_first_dim(value, repeat_count)
                 for agent_type, value in tokenized_agent["token_traj"].items()
             },
+            "token_traj_future": {
+                agent_type: self._repeat_tensor_on_first_dim(value, repeat_count)
+                for agent_type, value in tokenized_agent["token_traj_future"].items()
+            },
             "token_contour_trajectory": tokenized_agent["token_contour_trajectory"],
             "trajectory_token_veh": tokenized_agent["trajectory_token_veh"],
             "trajectory_token_ped": tokenized_agent["trajectory_token_ped"],
@@ -667,7 +671,7 @@ class SMART(LightningModule):
         loss = self.training_loss(
             **pred,
             token_agent_shape=tokenized_agent["token_agent_shape"],  # [n_agent, 2]
-            token_traj=tokenized_agent["token_traj"],  # [n_agent, n_token, 4, 2]
+            token_traj=tokenized_agent["token_traj_future"],  # [n_agent, n_token, 5, 4, 2]
             token_contour_trajectory=tokenized_agent["token_contour_trajectory"],
             train_mask=train_mask,  # [n_agent]
             current_epoch=self.current_epoch,
@@ -688,7 +692,7 @@ class SMART(LightningModule):
             loss = self.training_loss(
                 **pred,
                 token_agent_shape=tokenized_agent["token_agent_shape"],  # [n_agent, 2]
-                token_traj=tokenized_agent["token_traj"],  # [n_agent, n_token, 4, 2]
+                token_traj=tokenized_agent["token_traj_future"],  # [n_agent, n_token, 5, 4, 2]
                 token_contour_trajectory=tokenized_agent["token_contour_trajectory"],
             )
 

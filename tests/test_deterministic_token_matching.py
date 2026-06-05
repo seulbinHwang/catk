@@ -4,7 +4,13 @@ import torch
 from torch_geometric.data import HeteroData
 
 from src.smart.tokens.token_processor import TokenProcessor
-from src.smart.utils import cal_polygon_contour, merge_by_type, transform_to_global, wrap_angle
+from src.smart.utils import (
+    cal_polygon_contour,
+    merge_by_type,
+    transform_to_global,
+    transform_to_local,
+    wrap_angle,
+)
 
 
 def _make_processor() -> TokenProcessor:
@@ -68,7 +74,7 @@ def _reference_match_agent_token_loop(
     pos: torch.Tensor,
     heading: torch.Tensor,
     agent_shape: torch.Tensor,
-    token_traj: torch.Tensor,
+    token_traj_future: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     n_agent, n_step = valid.shape
     range_a = torch.arange(n_agent, device=valid.device)
@@ -85,23 +91,40 @@ def _reference_match_agent_token_loop(
     }
 
     for i in range(processor.shift, n_step, processor.shift):
-        valid_mask = valid[:, i - processor.shift] & valid[:, i]
+        valid_mask = valid[:, i - processor.shift : i + 1].all(dim=-1)
         invalid_mask = ~valid_mask
         out_dict["valid_mask"].append(valid_mask)
 
-        gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
-        gt_contour = gt_contour.unsqueeze(1)
-        token_world_gt = transform_to_global(
-            pos_local=token_traj.flatten(1, 2),
-            head_local=None,
-            pos_now=prev_pos,
-            head_now=prev_head,
-        )[0].view(*token_traj.shape)
-        token_idx_gt = torch.argmin(
-            torch.norm(token_world_gt - gt_contour, dim=-1).sum(-1),
-            dim=-1,
-        )
-        token_contour_gt = token_world_gt[range_a, token_idx_gt]
+        token_idx_gt = torch.zeros(n_agent, dtype=torch.long, device=valid.device)
+        token_contour_gt = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
+        valid_agent_idx = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+        if valid_agent_idx.numel() > 0:
+            gt_contour = cal_polygon_contour(
+                pos[:, i - processor.shift + 1 : i + 1],
+                heading[:, i - processor.shift + 1 : i + 1],
+                agent_shape[:, None, :],
+            )
+            gt_contour_local, _ = transform_to_local(
+                pos_global=gt_contour[valid_agent_idx].flatten(1, 2),
+                head_global=None,
+                pos_now=prev_pos[valid_agent_idx],
+                head_now=prev_head[valid_agent_idx],
+            )
+            gt_contour_local = gt_contour_local.view(-1, processor.shift, 4, 2)
+            token_idx_valid = torch.argmin(
+                torch.norm(
+                    token_traj_future.unsqueeze(0) - gt_contour_local.unsqueeze(1),
+                    dim=-1,
+                ).mean(dim=(-1, -2)),
+                dim=-1,
+            )
+            token_idx_gt[valid_agent_idx] = token_idx_valid
+            token_contour_gt[valid_agent_idx] = transform_to_global(
+                pos_local=token_traj_future[token_idx_valid, -1],
+                head_local=None,
+                pos_now=prev_pos[valid_agent_idx],
+                head_now=prev_head[valid_agent_idx],
+            )[0]
 
         prev_head = heading[:, i].clone()
         dxy = token_contour_gt[:, 0] - token_contour_gt[:, 3]
@@ -120,7 +143,7 @@ def _reference_match_agent_token_loop(
 
 
 def _reference_tokenize_agent(processor: TokenProcessor, data: HeteroData) -> dict[str, torch.Tensor]:
-    agent_shape, _, token_traj, _, type_mask = processor._get_agent_shape_and_token_traj(
+    agent_shape, _, _, _, token_contour_trajectory, type_mask = processor._get_agent_shape_and_token_traj(
         data["agent"]["type"]
     )
     valid = data["agent"]["valid_mask"].clone()
@@ -143,7 +166,7 @@ def _reference_tokenize_agent(processor: TokenProcessor, data: HeteroData) -> di
             pos=pos[mask],
             heading=heading[mask],
             agent_shape=agent_shape[mask],
-            token_traj=token_traj[agent_type],
+            token_traj_future=token_contour_trajectory[agent_type],
         )
     return {
         key: merge_by_type(
@@ -154,7 +177,7 @@ def _reference_tokenize_agent(processor: TokenProcessor, data: HeteroData) -> di
     }
 
 
-def test_agent_token_matching_matches_official_global_expansion_loop() -> None:
+def test_agent_token_matching_matches_full_trajectory_reference_loop() -> None:
     processor = _make_processor()
     data = _make_agent_data()
 

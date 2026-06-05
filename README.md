@@ -38,7 +38,7 @@
 2025년 1월
 - **WOSAC 최고 수준 성능**: CAT-K는 [WOSAC 리더보드](https://waymo.com/open/challenges/2024/sim-agents/) 1위를 달성했다. agent token vocabulary 문제를 해결한 뒤 fine-tuned model은 **0.7702** RMM을 달성했다. 리더보드에는 공개하지 않았지만 BC로 32 epoch만 학습한 재현 SMART-tiny-7M도 **0.7671** RMM을 달성했고, 이는 당시 2위 방법과 비슷한 수준이다. 재현 절차도 비교적 단순하다.
 
-- **TrajTok paper-submit agent vocabulary and supervision**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Grid 안 대표 trajectory는 `x/y`는 일반 평균, heading은 sin/cos circular mean으로 만든다. Non-empty grid는 wrapped heading jump가 작으면 이 대표 trajectory를 그대로 쓰고, jump가 큰 non-empty grid와 expansion empty grid만 circular endpoint heading을 반영한 Hermite 보간 trajectory를 쓴다. Token matching은 main/Thinklab public code와 같은 endpoint contour 방식이다. Rolling recurrence는 유지하되, 각 0.5초 구간마다 token endpoint box contour `[4 corners, x/y]`를 직전 token pose 기준 global frame으로 펼친 뒤 raw GT endpoint contour와 비교해 GT token을 고른다. Spatial-aware label smoothing도 하나의 최종 구현만 사용한다. 정답 token의 endpoint contour와 모든 후보 token의 endpoint contour corner distance를 계산하고, non-GT smoothing mass를 `1 / (distance^2 + epsilon)` 비율로 정확히 나눈다. 추가 uniform label smoothing이나 extra normalization은 적용하지 않는다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. 현재 pretrain train dataset의 on-the-fly augmentation은 `random_scene_scale_config: null`, `random_time_shift_config: null`로 꺼져 있으며, validation/test/submission cache나 원본 pickle도 바꾸지 않는다.
+- **TrajTok paper-submit agent vocabulary and supervision**: agent token vocabulary는 [TrajTok](https://github.com/seulbinHwang/TrajTok)의 grid/expansion 기반 생성 방식으로 교체했다. [TrajTok 생성기](src/smart/tokens/trajtok.py)는 로그 궤적을 agent local frame으로 정규화하고 좌우 반전을 추가한 뒤, endpoint grid count, 주변 grid 기반 expansion/filtering, 빈 grid 보간을 거쳐 type별 vocabulary를 만든다. 현재 [trajtok_vocab.pkl](src/smart/tokens/trajtok_vocab.pkl)은 arXiv:2506.21618 Table 1의 submit grid를 사용한다. Vehicle grid는 `x=[-5, 20]`, `x_interval=0.1`, `y=[-1.5, 4.5]`, `y_interval=0.05`이고, 생성된 vocab size는 `veh=8037`, `ped=2998`, `cyc=2798`이다. 논문 Table 3의 submit/best size `8040/3001/2798`과 vehicle/ped는 3개 차이, cyclist는 exact다. Grid 안 대표 trajectory는 `x/y`는 일반 평균, heading은 sin/cos circular mean으로 만든다. Non-empty grid는 wrapped heading jump가 작으면 이 대표 trajectory를 그대로 쓰고, jump가 큰 non-empty grid와 expansion empty grid만 circular endpoint heading을 반영한 Hermite 보간 trajectory를 쓴다. Token matching은 마지막 endpoint만 보지 않고, 현재 시점을 제외한 0.5초 미래 5개 frame의 box contour `[5, 4 corners, x/y]` 전체 평균 거리로 GT token을 고른다. Rolling recurrence는 유지하므로 선택된 token의 마지막 pose가 다음 0.5초 구간의 기준 pose가 된다. Spatial-aware label smoothing도 하나의 최종 구현만 사용한다. 정답 token과 모든 후보 token의 미래 5-frame contour distance를 계산하고, non-GT smoothing mass를 `1 / (distance^2 + epsilon)` 비율로 정확히 나눈다. 추가 uniform label smoothing이나 extra normalization은 적용하지 않는다. 전처리 cache 생성 시 heading은 `np.unwrap`으로 연속 보간하되, tokenization 단계에서는 TrajTok 공식 구현과 같이 `wrap_angle`을 먼저 적용한 뒤 heading cleaning을 수행한다. 현재 pretrain train dataset의 on-the-fly augmentation은 `random_scene_scale_config: null`, `random_time_shift_config: null`로 꺼져 있으며, validation/test/submission cache나 원본 pickle도 바꾸지 않는다.
 - **TrajTok decoder capacity**: 기본 SMART decoder는 `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6`를 사용한다. Paper-submit vocab `veh=8037`, `ped=2998`, `cyc=2798` 기준으로 Hydra config를 compose한 뒤 SMART 모델을 직접 instantiate해서 측정한 전체 model parameter 수는 `8,247,013`개다. 모든 parameter가 trainable이며 non-trainable parameter는 0개다.
 
 ## 설치
@@ -278,10 +278,10 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | branch | `trajtok` |
 | pod / GPU | `hsb-npc-training` H100 4GPU + `wo-pvc-2` H100 2GPU |
 | total DDP ranks | 6 (`hsb-npc-training`: rank 0-3, `wo-pvc-2`: rank 4-5) |
-| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_lr581e4_oom_retry_trajtok_hidden124_globalendpoint_topk12_trainselectfalse_20260605` |
-| remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_globalendpoint_20260605` |
+| task name | `smart_ntp_pretrain_h100x4_h100x2_globalbs108_lr581e4_oom_retry_trajtok_hidden124_fulltraj_topk12_trainselectfalse_20260605` |
+| remote project root | `/tmp/catk_smart_ntp_h100x4_h100x2_trajtok_fulltraj_20260605` |
 | experiment | `pre_bc_a100x4x2` |
-| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, official global endpoint contour token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
+| model/tokenizer | Paper-submit TrajTok vocab `trajtok_vocab.pkl` (`veh=8037`, `ped=2998`, `cyc=2798`), type-specific agent heads, full 0.5초 future contour token matching, direct CE valid-row filtering, missing type head zero-gradient touch |
 | decoder | `hidden_dim=124`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
 | model parameters | `8,247,013` total / trainable, 직접 SMART instantiate로 측정 |
 | train batch | `INITIAL_BS=18` per rank, effective global batch 108 |
@@ -292,31 +292,32 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | train augmentation | `random_scene_scale_config: null`, `random_time_shift_config: null` |
 | agent selection | `data.train_use_eval_agent_selection=false` |
 | train sampler | `data.train_memory_balanced_batching=true` |
-| smoothing | `spatial_aware_smoothing=true`, 0.5초 endpoint box contour `[4 corners, x/y]` distance. Non-GT mass sums exactly to `label_smoothing`; no extra uniform smoothing or mode switch. |
-| rollout target | rollout/self-generated state가 있는 training loss에서는 항상 현재 state 기준 endpoint contour target 재선택 |
+| smoothing | `spatial_aware_smoothing=true`, 0.5초 미래 5-frame box contour `[5, 4 corners, x/y]` distance. Non-GT mass sums exactly to `label_smoothing`; no extra uniform smoothing or mode switch. |
+| rollout target | rollout/self-generated state가 있는 training loss에서는 항상 현재 state 기준 full 5-frame contour target 재선택 |
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, `validation_rollout_sampling=(topk_prob, num_k=12, temp=1.0)`, every 16 epochs |
 | distributed strategy | `HeterogeneousDDPStrategy` + `HeterogeneousTorchElasticEnvironment`, `find_unused_parameters=false` |
 
-TrajTok agent target은 main/Thinklab과 같은 endpoint contour matching으로 맞춘다.
-각 0.5초 coarse step에서 vocab token의 endpoint box contour를 직전 tokenized pose 기준
-global frame으로 펼치고, raw GT endpoint box contour와 가장 가까운 token을
-고른다. rolling matching은 유지되므로 선택된 token endpoint가 다음 step의 기준 pose가
-된다. Open-loop teacher-forced loss에서는 이 recursive `gt_idx`가 같은 state에서 이미
-계산된 target이므로 빠른 기존 경로를 유지한다. Rollout-style training에서 현재 state가
-따로 주어지는 경우에도 같은 endpoint contour 기준으로 target을 다시 고른다. 메모리
-peak를 낮추기 위해 tokenization matching은 agent chunk 단위로 수행하며 내부 기본 chunk
-size는 384이다. Rollout-style loss target matching은 row chunk 단위로 수행하며 내부 기본
-chunk size는 256이다.
+TrajTok agent target은 논문 의도에 맞춰 마지막 endpoint 하나가 아니라 현재 시점을 제외한
+0.5초 미래 5-frame box contour 전체로 고른다. 각 coarse step에서 raw GT 미래 segment를
+직전 tokenized pose 기준 local frame으로 변환하고, vocab token의 `[5, 4, 2]` future
+contour와 평균 corner distance를 비교해 가장 가까운 token을 선택한다. rolling matching은
+유지되므로 선택된 token의 마지막 pose가 다음 step의 기준 pose가 된다. Open-loop
+teacher-forced loss에서는 이 recursive `gt_idx`가 같은 state에서 이미 계산된 target이므로
+빠른 기존 경로를 유지한다. Rollout-style training에서 현재 state가 따로 주어지는 경우에도
+같은 full 5-frame contour 기준으로 target을 다시 고른다. 메모리 peak를 낮추기 위해
+tokenization matching과 rollout-style loss target matching은 token 후보를 block 단위로
+비교한다.
 
-2026-06-04에 `hsb-npc-training` H100 4장과 `wo-pvc-2` H100 2장에서 실제 WOMD cache와
-GPU로 endpoint contour target을 검증했다.
+2026-06-05에 `hsb-npc-training` H100 4장과 `wo-pvc-2` H100 2장에서 실제 WOMD cache와
+GPU로 full 0.5초 future contour target을 검증했다.
 
 | 검증 | 조건 | 결과 |
 |---|---|---|
-| endpoint target parity | train cache 256 samples, 114,790 valid rows | tokenizer `gt_idx`와 독립 endpoint-contour rolling 재계산 mismatch `0`, `valid_mask` mismatch `0` |
-| official global endpoint parity | train cache 8 samples + validation cache 4 samples, 5,393 valid rows | main/Thinklab 방식 global endpoint expansion 참조 구현과 `gt_idx/valid_mask/gt_pos/gt_heading` mismatch `0` |
-| semantic difference from old full target | same rows | 기존 full `[5, x/y/yaw]` target 대비 mismatch `32,451/114,790 = 28.27%` |
-| endpoint smoothing smoke | `hsb-npc-training`, `wo-pvc-2`, H100, `trajtok_vocab.pkl` | target 합 `1.0`, GT 확률 `0.8/0.9` 설정값 일치, 가까운 endpoint contour token 확률이 먼 token보다 큼 |
+| full trajectory unit parity | direct test function on `hsb-npc-training` | optimized block matcher와 독립 full `[5, 4, 2]` trajectory reference가 `valid_mask/gt_idx/gt_pos/gt_heading` 일치 |
+| real cache target shape | train cache 2 samples + validation cache 2 samples | `token_traj_future` shape `[N_type, V_type, 5, 4, 2]`, `token_contour_trajectory` shape `[V_type, 5, 4, 2]` 정상 |
+| full-valid mask check | same real cache rows | `valid_mask == gt_valid_segment_raw.all(dim=-1)`, 중간 frame invalid 구간은 loss target에서 제외 |
+| endpoint baseline difference | train valid 3,546 rows + validation valid 1,847 rows | full-trajectory target이 endpoint-only reference와 train `1,361/3,546`, val `789/1,847`개 다름. 즉 마지막 frame만 보는 경로가 제거됨 |
+| full trajectory smoothing smoke | `hsb-npc-training`, H100, `trajtok_vocab.pkl` | target 합 `1.0`, GT 확률 `0.9`, non-GT mass `0.1`, 가까운 5-frame contour token 확률이 먼 token보다 큼 |
 | single H100 train smoke | `hsb-npc-training`, real train cache, 1 batch, `training_rollout_sampling.num_k=-1` | forward/backward/optimizer step 정상 종료, `train/loss=8.83984` |
 | single H100 validation smoke | `hsb-npc-training`, real validation cache, 1 batch, `n_rollout_closed_val=1`, `validation_rollout_sampling.num_k=1` | open-loop + closed-loop fast WOSAC metric 경로 정상 종료, `run.py DONE` |
 | H100 4+2 DDP train smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, real train cache, 1 batch | manual 6-rank DDP, 6/6 ranks NCCL 초기화 및 backward 정상 종료, exit status `0` |
@@ -333,9 +334,10 @@ GPU로 endpoint contour target을 검증했다.
 | 20260605 circular vocab H100 4+2 fit smoke | `hsb-npc-training` 4 ranks + `wo-pvc-2` 2 ranks, real train cache, 1 train batch | 새 vocab load, forward/backward/optimizer step 정상 종료, `run.py DONE` |
 | 20260605 circular vocab H100 4+2 validation smoke | same pods, latest compatible checkpoint, real validation cache, 1 validation batch | 새 vocab load, open-loop + closed-loop Fast WOSAC metric 정상 종료, `run.py DONE` |
 
-2026-06-04에 spatial-aware smoothing도 endpoint contour 단일 구현으로 정리했다. 새
-smoothing target은 각 token의 0.5초 endpoint contour `[4, 2]`를 사용하며, 같은 batch
-안에서 중복 등장한 GT token은 unique token id 단위로 한 번만 거리 분포를 계산한다.
+2026-06-05에 spatial-aware smoothing도 full 0.5초 trajectory contour 단일 구현으로
+정리했다. 새 smoothing target은 각 token의 미래 5-frame contour `[5, 4, 2]`를 사용하며,
+같은 batch 안에서 중복 등장한 GT token은 unique token id 단위로 한 번만 거리 분포를
+계산한다.
 
 | 검증 | 조건 | 결과 |
 |---|---|---|
@@ -396,7 +398,7 @@ bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 
 장기 학습에서 OOM 자동 재시작까지 원하면 `START_ONLY` 없이 wrapper를 계속 실행해야 한다.
 로컬 shell을 점유하지 않으려면 아래처럼 로컬 tmux 안에서 wrapper를 foreground로 둔다.
-기본 task name은 `globalbs108`, `lr581e4`, `globalendpoint`, `topk12`를 포함하므로, 기존
+기본 task name은 `globalbs108`, `lr581e4`, `fulltraj`, `topk12`를 포함하므로, 기존
 `globalbs90`/`globalbs102`/`globalbs120` run의 checkpoint를 이어 쓰지 않는 fresh start다.
 2026-06-04 probe 기준 `INITIAL_BS=24`와 `22`는 H100 80GB에서 CUDA OOM이 발생했고,
 `INITIAL_BS=20`은 100 train batches smoke는 통과했지만 장기 run의 epoch 0 step 102 부근에서
@@ -411,7 +413,7 @@ remote `PROJECT_ROOT`에 미커밋 변경이나 untracked 파일이 있으면 wr
 push --include-untracked`로 보존한 뒤 `origin/trajtok`을 checkout한다.
 
 ```bash
-tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs108-wrapper
+tmux new -s catk-smart-ntp-h100x4-h100x2-trajtok-fulltraj-gbs108-wrapper
 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 
 START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
@@ -420,8 +422,8 @@ START_ONLY=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_ret
 실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
 
 ```bash
-kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs108-lr581e4
-kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-globalendpoint-gbs108-lr581e4
+kubectl exec -it -n p-pnc hsb-npc-training -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-fulltraj-gbs108-lr581e4
+kubectl exec -it -n p-pnc wo-pvc-2 -c main -- tmux attach -t catk-smart-ntp-h100x4-h100x2-trajtok-fulltraj-gbs108-lr581e4
 
 STOP=1 bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 ```
@@ -1133,27 +1135,26 @@ train cache로 외삽 벡터화를 검증했다.
 | 단일 H100 microbenchmark | batch size 13, 464 agents | 외삽 함수 `29.14ms -> 0.73ms`, 전체 `TokenProcessor` `87.79ms -> 59.12ms` |
 | H100 4+2 DDP profile | train batch size 13, 6 ranks, 10 measured steps | step `770.82ms -> 674.37ms` (`1.14x`), `TokenProcessor` `153.27ms -> 70.17ms` (`2.18x`) |
 
-Agent token matching은 TrajTok 공식 구현과 같은 teacher-forced recurrence와 global
-endpoint contour matching을 유지한다. 각 coarse step마다 후보 token endpoint box contour를
-직전 token pose 기준 global frame으로 펼치고, raw GT endpoint contour와 corner-distance를
-비교해 nearest token을 고른다. 선택된 token endpoint로 다음 step의 기준 pose를 갱신하므로,
-`gt_*`와 `sampled_*` label은 teacher-forced tokenization 의미를 유지한다.
+Agent token matching은 TrajTok의 teacher-forced recurrence를 유지하되, 정답 선택 기준은
+full 0.5초 future contour로 둔다. 각 coarse step마다 raw GT 5-frame contour를 직전
+token pose 기준 local frame으로 변환하고, vocab token의 `[5, 4, 2]` future contour와
+corner-distance 평균을 비교해 nearest token을 고른다. 선택된 token의 마지막 pose로 다음
+step의 기준 pose를 갱신하므로, `gt_*`와 `sampled_*` label은 teacher-forced tokenization
+의미를 유지한다.
 
-2026-06-04 최적화에서는 label 의미를 바꾸는 valid-only skip이나 local-frame inverse
-matching을 채택하지 않았다. 대신 후보 endpoint contour의 global 변환을 기존
-`flatten -> transform_to_global -> view` 경로 대신 직접 affine 식으로 계산하고, 선택된
-token 하나만 기존 `transform_to_global` 경로로 복원한다. 따라서 기존 global endpoint
-expansion reference와 `gt_idx/tokenized_pos/tokenized_heading` 출력이 같으면서, 큰 중간
-tensor materialization 비용을 줄인다.
+2026-06-05 최적화에서는 label 의미를 바꾸는 endpoint fallback을 쓰지 않는다. 대신 후보
+token 전체를 한 번에 큰 tensor로 펼치지 않고 token block 단위로 거리와 argmin만 누적한다.
+따라서 full 5-frame contour matching 의미를 유지하면서 token matching과 smoothing의
+중간 tensor materialization 비용을 줄인다.
 
-2026-06-04에 `hsb-npc-training` H100 4장 + `wo-pvc-2` H100 2장 환경에서 이 최적화를
+2026-06-05에 `hsb-npc-training` H100 4장 + `wo-pvc-2` H100 2장 환경에서 이 변경을
 검증했다.
 
 | 검증 | 조건 | 결과 |
 |---|---|---|
-| real-cache parity | train 32개 + validation 16개 cache, valid token 18,680개 | `valid_mask/token_idx/tokenized_pos/tokenized_heading` exact match, `idx_mismatch=0`, `max_pos=0.0`, `max_head=0.0` |
-| H100 4+2 DDP profile | train batch size 15, 6 ranks, warmup 10 + measured 30, validation off | step `774.89ms -> 726.16ms` (`1.067x`), `TokenProcessor` `125.91ms -> 79.29ms` (`1.588x`) |
-| H100 4+2 DDP smoke | train 1 batch + validation 1 batch | open-loop validation, closed-loop Fast WOSAC, CPD/CES logging 모두 정상 종료, `run.py DONE` |
+| direct unit parity | tokenizer matcher, smoothing target builder | full trajectory optimized matcher와 독립 reference 일치, smoothing target 합/GT 확률 정상 |
+| real-cache functional check | train 2개 + validation 2개 cache | full-valid mask, type별 future contour shape, endpoint-only reference와의 semantic difference 확인 |
+| H100 4+2 DDP smoke | train 1 batch + validation 1 batch | open-loop validation, closed-loop Fast WOSAC logging 모두 정상 종료, `run.py DONE` |
 
 DDP validation/test에서는 각 rank가 validation/test sample을 복제 없이 정확히 한
 번씩 나눠 처리한다. 일반 distributed sampler처럼 dataset 길이를 world size에 맞추기

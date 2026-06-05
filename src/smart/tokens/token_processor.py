@@ -30,6 +30,7 @@ from src.smart.utils import (
 
 
 DEFAULT_AGENT_TOKEN_MATCH_CHUNK_SIZE = 384
+DEFAULT_AGENT_TOKEN_BLOCK_SIZE = 1024
 
 
 def _clean_heading_dense_impl(valid: Tensor, heading: Tensor) -> Tensor:
@@ -115,7 +116,7 @@ class TokenProcessor(torch.nn.Module):
             self.register_buffer(f"agent_token_all_{k}", v, persistent=False)
             self.register_buffer(
                 f"agent_token_contour_trajectory_{k}",
-                v[:, -1].contiguous(),
+                v[:, 1:].contiguous(),
                 persistent=False,
             )
 
@@ -166,6 +167,7 @@ class TokenProcessor(torch.nn.Module):
             agent_shape,
             token_traj_all,
             token_traj,
+            token_traj_future,
             token_contour_trajectory,
             agent_type_masks,
         ) = self._get_agent_shape_and_token_traj(data["agent"]["type"])
@@ -196,7 +198,8 @@ class TokenProcessor(torch.nn.Module):
             "token_traj_all": token_traj_all,  # type -> [n_agent_type, n_token_type, 6, 4, 2]
             "token_heading": self.token_heading.to(pos.device),
             "token_traj": token_traj,  # type -> [n_agent_type, n_token_type, 4, 2]
-            "token_contour_trajectory": token_contour_trajectory,  # type -> [n_token_type, 4, 2]
+            "token_traj_future": token_traj_future,  # type -> [n_agent_type, n_token_type, 5, 4, 2]
+            "token_contour_trajectory": token_contour_trajectory,  # type -> [n_token_type, 5, 4, 2]
             # for step {5, 10, ..., 90}
             "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, n_step=18, 2]
             "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, n_step=18]
@@ -230,7 +233,7 @@ class TokenProcessor(torch.nn.Module):
                 pos=pos[type_mask],
                 heading=heading[type_mask],
                 agent_shape=agent_shape[type_mask],
-                token_traj=token_traj[agent_type],
+                token_traj_future=token_contour_trajectory[agent_type],
             )
 
         for key in ("valid_mask", "token_idx", "tokenized_pos", "tokenized_heading"):
@@ -252,7 +255,7 @@ class TokenProcessor(torch.nn.Module):
         pos: Tensor,  # [n_agent, n_step, 2]
         heading: Tensor,  # [n_agent, n_step]
         agent_shape: Tensor,  # [n_agent, 2]
-        token_traj: Tensor,  # [n_agent, n_token, 4, 2]
+        token_traj_future: Tensor,  # [n_token, 5, 4, 2]
     ) -> Dict[str, Tensor]:
         """n_step_token=n_step//5
         n_step_token=18 for train with BC.
@@ -280,51 +283,46 @@ class TokenProcessor(torch.nn.Module):
         }
 
         for i in range(self.shift, n_step, self.shift):  # [5, 10, 15, ..., 90]
-            _valid_mask = valid[:, i - self.shift] & valid[:, i]  # [n_agent]
+            _valid_mask = valid[:, i - self.shift : i + 1].all(dim=-1)  # [n_agent]
             _invalid_mask = ~_valid_mask
             out_dict["valid_mask"].append(_valid_mask)
 
             match_prev_pos, match_prev_head = prev_pos, prev_head
 
-            gt_contour = cal_polygon_contour(pos[:, i], heading[:, i], agent_shape)
-            token_idx_chunks = []
-            token_contour_local_chunks = []
-            for start in range(0, n_agent, self.agent_token_match_chunk_size):
-                end = min(start + self.agent_token_match_chunk_size, n_agent)
-                token_world_gt = self._endpoint_contour_to_global(
-                    contour_local=token_traj[start:end],
-                    pos_now=match_prev_pos[start:end],
-                    head_now=match_prev_head[start:end],
+            token_idx_gt = torch.zeros(n_agent, dtype=torch.long, device=valid.device)
+            token_pos_gt = pos[:, i].clone()
+            token_head_gt = heading[:, i].clone()
+            valid_agent_idx = _valid_mask.nonzero(as_tuple=False).squeeze(-1)
+            if valid_agent_idx.numel() > 0:
+                gt_contour = cal_polygon_contour(
+                    pos[:, i - self.shift + 1 : i + 1],
+                    heading[:, i - self.shift + 1 : i + 1],
+                    agent_shape[:, None, :],
                 )
-                token_idx_chunk = torch.argmin(
-                    torch.norm(
-                        token_world_gt - gt_contour[start:end].unsqueeze(1),
-                        dim=-1,
-                    ).sum(-1),
-                    dim=-1,
+                gt_contour_valid = gt_contour[valid_agent_idx]
+                gt_contour_local, _ = transform_to_local(
+                    pos_global=gt_contour_valid.flatten(1, 2),
+                    head_global=None,
+                    pos_now=match_prev_pos[valid_agent_idx],
+                    head_now=match_prev_head[valid_agent_idx],
                 )
-                token_idx_chunks.append(token_idx_chunk)
-                token_contour_local_chunks.append(
-                    token_traj[start:end][
-                        torch.arange(end - start, device=valid.device),
-                        token_idx_chunk,
-                    ]
+                gt_contour_local = gt_contour_local.view(-1, self.shift, 4, 2)
+                token_idx_valid = self._match_full_trajectory_token_index(
+                    gt_contour_local=gt_contour_local,
+                    token_traj_future=token_traj_future,
                 )
-            if token_idx_chunks:
-                token_idx_gt = torch.cat(token_idx_chunks, dim=0)
-                token_contour_gt = transform_to_global(
-                    pos_local=torch.cat(token_contour_local_chunks, dim=0),
-                    head_local=None,
-                    pos_now=match_prev_pos,
-                    head_now=match_prev_head,
-                )[0]
-            else:
-                token_idx_gt = torch.empty(0, dtype=torch.long, device=valid.device)
-                token_contour_gt = gt_contour.new_empty((0, 4, 2))
-
-            token_pos_gt = token_contour_gt.mean(1)
-            token_dxy_gt = token_contour_gt[:, 0] - token_contour_gt[:, 3]
-            token_head_gt = torch.arctan2(token_dxy_gt[:, 1], token_dxy_gt[:, 0])
+                token_idx_gt[valid_agent_idx] = token_idx_valid
+                token_endpoint_gt = self._contour_to_global(
+                    contour_local=token_traj_future[token_idx_valid, -1],
+                    pos_now=match_prev_pos[valid_agent_idx],
+                    head_now=match_prev_head[valid_agent_idx],
+                )
+                token_pos_gt[valid_agent_idx] = token_endpoint_gt.mean(1)
+                token_dxy_gt = token_endpoint_gt[:, 0] - token_endpoint_gt[:, 3]
+                token_head_gt[valid_agent_idx] = torch.arctan2(
+                    token_dxy_gt[:, 1],
+                    token_dxy_gt[:, 0],
+                )
 
             # update prev_pos, prev_head
             prev_head = heading[:, i].clone()
@@ -341,7 +339,29 @@ class TokenProcessor(torch.nn.Module):
         return out_dict
 
     @staticmethod
-    def _endpoint_contour_to_global(
+    def _match_full_trajectory_token_index(
+        gt_contour_local: Tensor,  # [n_row, 5, 4, 2]
+        token_traj_future: Tensor,  # [n_token, 5, 4, 2]
+    ) -> Tensor:
+        n_row = gt_contour_local.shape[0]
+        n_token = token_traj_future.shape[0]
+        best_dist = gt_contour_local.new_full((n_row,), float("inf"))
+        best_idx = torch.zeros(n_row, dtype=torch.long, device=gt_contour_local.device)
+        for start in range(0, n_token, DEFAULT_AGENT_TOKEN_BLOCK_SIZE):
+            end = min(start + DEFAULT_AGENT_TOKEN_BLOCK_SIZE, n_token)
+            dist = torch.norm(
+                token_traj_future[start:end].unsqueeze(0)
+                - gt_contour_local.unsqueeze(1),
+                dim=-1,
+            ).mean(dim=(-1, -2))
+            chunk_dist, chunk_idx = dist.min(dim=-1)
+            update_mask = chunk_dist < best_dist
+            best_dist = torch.where(update_mask, chunk_dist, best_dist)
+            best_idx = torch.where(update_mask, chunk_idx + start, best_idx)
+        return best_idx
+
+    @staticmethod
+    def _contour_to_global(
         contour_local: Tensor,
         pos_now: Tensor,
         head_now: Tensor,
@@ -428,12 +448,14 @@ class TokenProcessor(torch.nn.Module):
         Dict[str, Tensor],
         Dict[str, Tensor],
         Dict[str, Tensor],
+        Dict[str, Tensor],
     ]:
         """
         agent_shape: [n_agent, 2]
         token_traj_all: [n_agent, n_token, 6, 4, 2]
         token_traj: [n_agent, n_token, 4, 2]
-        token_contour_trajectory: [n_token, 4, 2]
+        token_traj_future: [n_agent, n_token, 5, 4, 2]
+        token_contour_trajectory: [n_token, 5, 4, 2]
         """
         agent_type_masks = build_agent_type_masks(agent_type)
         agent_shape = self.agent_shape_by_type.new_zeros((len(agent_type), 2))
@@ -443,6 +465,7 @@ class TokenProcessor(torch.nn.Module):
         ]
         token_traj_all = {}
         token_traj = {}
+        token_traj_future = {}
         token_contour_trajectory = {}
         for k, mask in agent_type_masks.items():
             n_agent_type = int(mask.sum().item())
@@ -453,6 +476,9 @@ class TokenProcessor(torch.nn.Module):
             token_traj[k] = token_bank[:, -1].unsqueeze(0).expand(
                 n_agent_type, -1, -1, -1
             )
+            token_traj_future[k] = token_bank[:, 1:].unsqueeze(0).expand(
+                n_agent_type, -1, -1, -1, -1
+            )
             token_contour_trajectory[k] = getattr(
                 self,
                 f"agent_token_contour_trajectory_{k}",
@@ -461,6 +487,7 @@ class TokenProcessor(torch.nn.Module):
             agent_shape,
             token_traj_all,
             token_traj,
+            token_traj_future,
             token_contour_trajectory,
             agent_type_masks,
         )

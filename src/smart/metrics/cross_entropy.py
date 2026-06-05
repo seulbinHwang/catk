@@ -23,7 +23,7 @@ from .utils import (
     get_euclidean_targets,
     get_prob_targets,
     get_prob_targets_from_index,
-    match_current_state_endpoint_token_rows,
+    match_current_state_trajectory_token_rows,
 )
 from src.smart.utils import merge_by_type, split_by_type
 
@@ -254,7 +254,7 @@ class CrossEntropy(Metric):
         train_mask: Optional[Tensor],
         type_mask: Optional[dict[str, Tensor]],
     ) -> None:
-        target_valid = gt_valid_segment_raw[..., -1]
+        target_valid = gt_valid_segment_raw.all(dim=-1)
         loss_weighting_mask = next_token_valid & target_valid
         if self.training and train_mask is not None:
             loss_weighting_mask &= train_mask.unsqueeze(1)
@@ -296,12 +296,12 @@ class CrossEntropy(Metric):
                 logits_valid = logits_type.reshape(-1, logits_type.shape[-1])[flat_valid]
                 pred_pos_valid = pred_pos_now[mask].reshape(-1, 2)[flat_valid]
                 pred_head_valid = pred_head_now[mask].reshape(-1)[flat_valid]
-                gt_pos_next_valid = gt_pos_segment_raw[mask].reshape(
+                gt_pos_segment_valid = gt_pos_segment_raw[mask].reshape(
                     -1, *gt_pos_segment_raw.shape[2:]
-                )[flat_valid, -1]
-                gt_head_next_valid = gt_head_segment_raw[mask].reshape(
+                )[flat_valid]
+                gt_head_segment_valid = gt_head_segment_raw[mask].reshape(
                     -1, gt_head_segment_raw.shape[-1]
-                )[flat_valid, -1]
+                )[flat_valid]
                 token_agent_shape_valid = (
                     token_agent_shape[mask]
                     .unsqueeze(1)
@@ -313,24 +313,26 @@ class CrossEntropy(Metric):
                     if isinstance(token_contour_trajectory, dict)
                     else None
                 )
-                token_traj_rows = self._select_token_traj_rows(
-                    token_traj=token_traj[agent_type],
-                    valid_mask=type_valid_mask,
-                    flat_valid=flat_valid,
-                )
-                gt_idx_valid = match_current_state_endpoint_token_rows(
+                token_traj_match = token_contour_trajectory_type
+                if token_traj_match is None:
+                    token_traj_match = self._select_token_traj_rows(
+                        token_traj=token_traj[agent_type],
+                        valid_mask=type_valid_mask,
+                        flat_valid=flat_valid,
+                    )
+                gt_idx_valid = match_current_state_trajectory_token_rows(
                     pred_pos=pred_pos_valid,
                     pred_head=pred_head_valid,
-                    gt_pos_next=gt_pos_next_valid,
-                    gt_head_next=gt_head_next_valid,
+                    gt_pos_segment=gt_pos_segment_valid,
+                    gt_head_segment=gt_head_segment_valid,
                     token_agent_shape=token_agent_shape_valid,
-                    token_traj=token_traj_rows,
+                    token_traj=token_traj_match,
                     chunk_size=self.current_state_target_chunk_size,
                 )
                 loss_type = self._direct_gt_idx_loss_for_rows(
                     logits=logits_valid,
                     gt_idx=gt_idx_valid,
-                    token_traj=token_traj_rows,
+                    token_traj=token_traj_match,
                     token_contour_trajectory=token_contour_trajectory_type,
                 )
                 loss_sum = loss_type if loss_sum is None else loss_sum + loss_type
@@ -353,15 +355,15 @@ class CrossEntropy(Metric):
                 valid_mask=loss_weighting_mask,
                 flat_valid=flat_valid,
             )
-            gt_idx_valid = match_current_state_endpoint_token_rows(
+            gt_idx_valid = match_current_state_trajectory_token_rows(
                 pred_pos=pred_pos_now.reshape(-1, 2)[flat_valid],
                 pred_head=pred_head_now.reshape(-1)[flat_valid],
-                gt_pos_next=gt_pos_segment_raw.reshape(
+                gt_pos_segment=gt_pos_segment_raw.reshape(
                     -1, *gt_pos_segment_raw.shape[2:]
-                )[flat_valid, -1],
-                gt_head_next=gt_head_segment_raw.reshape(
+                )[flat_valid],
+                gt_head_segment=gt_head_segment_raw.reshape(
                     -1, gt_head_segment_raw.shape[-1]
-                )[flat_valid, -1],
+                )[flat_valid],
                 token_agent_shape=token_agent_shape.unsqueeze(1)
                 .expand(-1, loss_weighting_mask.shape[1], -1)
                 .reshape(-1, 2)[flat_valid],
@@ -469,8 +471,8 @@ class CrossEntropy(Metric):
     ) -> Tensor:
         n_step = valid_mask.shape[1]
         return (
-            token_traj[:, None, :, :, :]
-            .expand(-1, n_step, -1, -1, -1)
+            token_traj[:, None]
+            .expand(-1, n_step, *token_traj.shape[1:])
             .reshape(-1, *token_traj.shape[1:])[flat_valid]
         )
 

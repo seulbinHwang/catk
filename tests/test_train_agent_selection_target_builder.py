@@ -166,11 +166,11 @@ def test_cross_entropy_none_train_mask_matches_all_true_mask() -> None:
     torch.testing.assert_close(none_mask_metric.count, all_true_metric.count)
 
 
-def test_spatial_aware_smoothing_uses_endpoint_contour_distance_distribution() -> None:
-    token_traj = torch.zeros(1, 3, 4, 2)
-    token_contour_trajectory = torch.zeros(3, 4, 2)
-    token_contour_trajectory[1, :, 0] = 1.0
-    token_contour_trajectory[2, :, 0] = 10.0
+def test_spatial_aware_smoothing_uses_full_contour_trajectory_distance_distribution() -> None:
+    token_traj = torch.zeros(1, 3, 5, 4, 2)
+    token_contour_trajectory = torch.zeros(3, 5, 4, 2)
+    token_contour_trajectory[1, :, :, 0] = 1.0
+    token_contour_trajectory[2, :, :, 0] = 10.0
 
     prob_target = get_prob_targets_from_index(
         gt_idx=torch.tensor([[0]]),
@@ -181,7 +181,7 @@ def test_spatial_aware_smoothing_uses_endpoint_contour_distance_distribution() -
     )
 
     inv_sq_dist = torch.tensor(
-        [0.0, 1.0 / (4.0**2 + 1.0e-4), 1.0 / (40.0**2 + 1.0e-4)]
+        [0.0, 1.0 / (1.0**2 + 1.0e-4), 1.0 / (10.0**2 + 1.0e-4)]
     )
     expected_neighbors = 0.2 * inv_sq_dist / inv_sq_dist.sum()
 
@@ -192,10 +192,10 @@ def test_spatial_aware_smoothing_uses_endpoint_contour_distance_distribution() -
 
 
 def test_spatial_aware_smoothing_reuses_unique_gt_targets_consistently() -> None:
-    token_traj = torch.zeros(1, 3, 4, 2)
-    token_contour_trajectory = torch.zeros(3, 4, 2)
-    token_contour_trajectory[1, :, 0] = 1.0
-    token_contour_trajectory[2, :, 0] = 10.0
+    token_traj = torch.zeros(1, 3, 5, 4, 2)
+    token_contour_trajectory = torch.zeros(3, 5, 4, 2)
+    token_contour_trajectory[1, :, :, 0] = 1.0
+    token_contour_trajectory[2, :, :, 0] = 10.0
 
     prob_target = get_prob_targets_from_index(
         gt_idx=torch.tensor([[0, 1], [0, 1]]),
