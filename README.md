@@ -497,7 +497,7 @@ python scripts/launch_finetune_flow_prefix_valid_a100x4x2_fw30_static_pods.py --
 
 CUDA OOM이 발생하면 전체 multi-node job을 정리한 뒤 최신 `epoch_last.ckpt`를 rank 0에서 확정하고 peer pod로 동기화한 다음 `train_batch_size`를 `2`씩 낮춰 재개합니다. 기본 fallback은 `26 -> 24 -> 22 -> ... -> 2`입니다.
 
-tmux 확인:
+기본 epoch116 launcher tmux 확인:
 
 ```bash
 kubectl exec -it -n p-pnc testa -c main -- tmux attach -t catk-prefix-valid-a100x4x2-fw30
@@ -2142,6 +2142,46 @@ python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py \
 | initial train batch | per-rank `18`, effective global batch `108` |
 | OOM fallback | `18 -> 17 -> ...`, latest self-forced checkpoint resume |
 | tmux session | `catk-self-forced-dmd-h100x6-hsb1` |
+
+#### hsb-npc-training-1 H100x6 epoch061 DMD self-forcing launcher
+
+`flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20`
+pretrain run의 epoch061 Generator checkpoint를 시작점으로 DMD-style self-forced fine-tuning을 돌릴 때는 아래 wrapper를 씁니다.
+내부적으로 위 공용 H100x6 launcher를 호출하되, checkpoint artifact와 task/session 이름만 epoch061 전용값으로 고정합니다.
+
+```bash
+python scripts/launch_self_forced_dmd_epoch061_h100x6_hsb1_static_pod.py --replace
+```
+
+| 항목 | 값 |
+|---|---|
+| pod | `hsb-npc-training-1` 단일 H100x6 |
+| branch | `semi_control_stable` |
+| experiment | `self_forced_npfm_h100_6` |
+| task | `flow_self_forced_dmd_h100x6_hsb1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs18_frac025_ep16_oomretry` |
+| pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| checkpoint 의미 | `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` epoch061, artifact metadata epoch 62 / global step 278192 |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x6_hsb1_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| action | 첫 시도 `finetune`, OOM 후 재시도는 최신 self-forced `epoch_last.ckpt` 기준 `fit` |
+| DMD objective | active-control DMD, vehicle/cyclist lateral DMD axis disabled |
+| control mode | `use_kinematic_control_flow=true`, `use_holonomic_model_only=false` |
+| sample steps / solver | Euler `sample_steps=16` |
+| backprop | `backprop_last_k=8`, `detach_block_transition=true` |
+| validation | `val_closed_loop=true`, `val_open_loop=false`, `check_val_every_n_epoch=1`, `limit_val_batches=0.1` |
+| train metric path | `decoder.detach_train_metric_clean=true` |
+| train data fraction | `data.train_epoch_sample_fraction=0.25` |
+| epochs | `16` |
+| lr | Generator `1.0e-6`, generated estimator `2.0e-7` |
+| initial train batch | per-rank `18`, effective global batch `108` |
+| OOM fallback | `18 -> 17 -> ...`, latest self-forced checkpoint resume |
+| tmux session | `catk-self-forced-dmd-epoch061-h100x6-hsb1` |
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-1 -c main -- \
+  tmux attach -t catk-self-forced-dmd-epoch061-h100x6-hsb1
+```
 
 2026-06-05 H100x6 full-run probe 기준으로 `bs19` 이상은 첫 train batch 안의 generated-estimator attention 경로에서 CUDA OOM이 났고, `bs18`은 active-control DMD train step을 정상 진행했습니다. full run에서는 rare later-batch memory spike에 대비해 OOM retry를 유지합니다. 이후 더 긴 batch에서 OOM이 발생하면 launcher가 최신 self-forced checkpoint를 기준으로 `bs17`부터 자동 재개합니다.
 
