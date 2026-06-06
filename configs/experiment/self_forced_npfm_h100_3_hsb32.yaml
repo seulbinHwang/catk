@@ -1,0 +1,8 @@
+# @package _global_
+
+# Same H100x3 single-pod DMD self-forcing recipe as hsb31, with a separate
+# Hydra experiment name for the hsb-npc-training-3-2 launcher.
+
+defaults:
+  - self_forced_npfm_h100_3_hsb31
+  - _self_

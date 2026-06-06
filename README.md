@@ -2618,6 +2618,41 @@ kubectl exec -it -n p-pnc hsb-npc-training-3-1 -c main -- \
 python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py --stop
 ```
 
+#### hsb-npc-training-3-2 H100x3 single-pod DMD self-forcing fine-tuning
+
+`hsb-npc-training-3-2`에서 같은 H100x3 self-forced DMD recipe를 돌릴 때는
+아래 launcher를 씁니다. 학습 설정은 `hsb-npc-training-3-1` launcher와 같고,
+pod / clean checkout / task name / tmux session / checkpoint cache path만 `hsb32`
+전용으로 분리됩니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3_hsb32_static_pod.py --replace
+```
+
+기본 차이:
+
+| 항목 | 값 |
+|---|---|
+| pod | `hsb-npc-training-3-2` 3 H100 |
+| pod checkout | `/tmp/catk_self_forced_dmd_h100x3_hsb32` |
+| experiment | `self_forced_npfm_h100_3_hsb32` |
+| default task | `flow_self_forced_dmd_h100x3_hsb32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs160_frac025_ep16_middle` |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_hsb32_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| tmux session | `catk-self-forced-dmd-h100x3-hsb32` |
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-3-2 -c main -- \
+  tmux attach -t catk-self-forced-dmd-h100x3-hsb32
+```
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3_hsb32_static_pod.py --stop
+```
+
 같은 단일 A100x4 recipe를 `testaa` pod에서 별도 task/session으로 돌리려면 아래 wrapper를
 사용합니다. 학습 설정은 위 `testa` launcher와 같고, 기본 pod / task name / tmux session /
 pretrain checkpoint cache 경로만 `testaa` 전용으로 분리됩니다.
