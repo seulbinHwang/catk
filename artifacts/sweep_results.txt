@@ -1,0 +1,4 @@
+===== DMD overfit sweep 시작 Wed Jun  3 06:56:15 PM KST 2026 (GPU=3) =====
+>>> [c4x1_g1e4_f1e4_ode16] gen_lr=1.0e-4 fake_lr=1.0e-4 cadence=4x1:1 ode=16  (18:56)
+    [c4x1_g1e4_f1e4_ode16] run=2026  -> 
+>>> [c1x3_g1e4_f1e4_ode16] gen_lr=1.0e-4 fake_lr=1.0e-4 cadence=1x3:1 ode=16  (19:36)

@@ -1,0 +1,1312 @@
+[[36m2026-06-05 14:22:42,773[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Printing config tree with Rich! <cfg.extras.print_config=True>[0m
+[[36m2026-06-05 14:22:42,774[0m][[34msrc.utils.rich_utils[0m][[33mWARNING[0m] - [rank: 0] Field 'extras' not found in config. Skipping 'extras' config printing...[0m
+CONFIG
+├── data
+│   └── _target_: src.smart.datamodules.MultiDataModule                         
+│       train_batch_size: 32                                                    
+│       val_batch_size: 32                                                      
+│       test_batch_size: 16                                                     
+│       num_workers: 2                                                          
+│       prefetch_factor: 1                                                      
+│       shuffle: false                                                          
+│       pin_memory: true                                                        
+│       persistent_workers: true                                                
+│       eval_num_workers: null                                                  
+│       eval_prefetch_factor: null                                              
+│       eval_pin_memory: null                                                   
+│       eval_persistent_workers: null                                           
+│       eval_multiprocessing_context: null                                      
+│       train_raw_dir: /home2/pnc2/repos_python/datasets/catk_cache/validation  
+│       val_raw_dir: /home2/pnc2/repos_python/datasets/catk_cache/validation    
+│       val_tfrecords_splitted: /home2/pnc2/repos_python/datasets/catk_cache/val
+│       test_raw_dir: /home2/pnc2/repos_python/datasets/catk_cache/testing      
+│       train_max_num: 32                                                       
+│       train_use_eval_agent_selection: true                                    
+│       train_epoch_sample_fraction: 1.0                                        
+│       train_memory_balanced_batches: false                                    
+│       train_memory_balance_metadata_cache: null                               
+│       train_memory_balance_metadata_num_workers: 8                            
+│       train_memory_balance_build_on_missing: true                             
+│       train_memory_balance_agent_weight: 1.0                                  
+│       train_memory_balance_current_valid_agent_weight: 1.0                    
+│       train_memory_balance_valid_agent_step_weight: 0.0                       
+│       train_memory_balance_map_weight: 0.02                                   
+│       train_memory_balance_seed: 0                                            
+│                                                                               
+├── model
+│   └── _target_: src.smart.model.smart_flow.SMARTFlow                          
+│       model_config:                                                           
+│         lr: 1.0e-07                                                           
+│         weight_decay: 0.0001                                                  
+│         lr_warmup_steps: 0                                                    
+│         lr_total_steps: 375                                                   
+│         lr_min_ratio: 1.0                                                     
+│         n_rollout_closed_val: 16                                              
+│         wosac_cpd_reference: null                                             
+│         wosac_distribution_type_scale:                                        
+│         - 22.3461620418                                                       
+│         - 4.5793447978                                                        
+│         - 18.537438883                                                        
+│         n_batch_sim_agents_metric: 1                                          
+│         scorer_scene_num: null                                                
+│         sim_agents_metric_workers: 8                                          
+│         n_vis_batch: 0                                                        
+│         n_vis_scenario: 0                                                     
+│         n_vis_rollout: 0                                                      
+│         vis_ghost_gt: false                                                   
+│         vis_flow_preview: true                                                
+│         delete_local_videos_after_wandb_upload: false                         
+│         val_open_loop: true                                                   
+│         val_closed_loop: true                                                 
+│         validation_open_seed: 0                                               
+│         validation_closed_seed: 0                                             
+│         validation_fixed_flow_noise: true                                     
+│         token_processor:                                                      
+│           map_token_file: map_traj_token5.pkl                                 
+│           agent_token_file: agent_vocab_555_s2.pkl                            
+│           flow_window_steps: 20                                               
+│           use_prefix_valid_future_loss_mask: true                             
+│           use_kinematic_control_flow: true                                    
+│           use_holonomic_model_only: false                                     
+│           use_rolling_supervision: true                                       
+│           control_pos_scale_m: 1.0                                            
+│           control_vehicle_no_slip_point_ratio: 0.2289518863                   
+│           control_cyclist_no_slip_point_ratio: 0.0495847873                   
+│           control_vehicle_yaw_scale_rad: 0.025                                
+│           control_pedestrian_yaw_scale_rad: 0.2                               
+│           control_cyclist_yaw_scale_rad: 0.06                                 
+│           control_round_trip_max_position_error_m: 0.5                        
+│         validation_rollout_sampling:                                          
+│           sample_steps: 16                                                    
+│           sample_method: euler                                                
+│           noise_scale: 1.0                                                    
+│         self_forced:                                                          
+│           enabled: false                                                      
+│           start_epoch: 0                                                      
+│           weight: 1.0                                                         
+│           path_step_size: 0.05                                                
+│           anchor_weight: 0.05                                                 
+│           use_anchor_flow_matching_loss: false                                
+│           distribution_matching_objective: dmd                                
+│           sid_alpha: 1.0                                                      
+│           sid_normalizer_eps: 0.001                                           
+│           detach_block_transition: false                                      
+│           use_stop_motion: false                                              
+│           estimator_updates_per_step: 5                                       
+│           adam_beta1: 0.9                                                     
+│           adam_beta2: 0.999                                                   
+│           adam_eps: 1.0e-08                                                   
+│           estimator_warmup_epochs: 1                                          
+│           initialize_aux_from_generator_on_fit_start: true                    
+│           unfrozen_range: except_map_encoder                                  
+│           ema_weight: 0.99                                                    
+│           ema_start_step: 50                                                  
+│           gradient_clip_val: 1.0                                              
+│           sampling:                                                           
+│             sample_steps: 16                                                  
+│             sample_method: euler                                              
+│             noise_scale: 1.0                                                  
+│             random_terminal_step:                                             
+│               enabled: true                                                   
+│               scope: global_batch                                             
+│               policy: paper_uniform                                           
+│               min_executed_steps: 16                                          
+│         decoder:                                                              
+│           hidden_dim: 128                                                     
+│           num_freq_bands: 64                                                  
+│           num_heads: 8                                                        
+│           head_dim: 15                                                        
+│           dropout: 0.1                                                        
+│           hist_drop_prob: 0.1                                                 
+│           num_map_layers: 3                                                   
+│           num_agent_layers: 6                                                 
+│           pl2pl_radius: 10                                                    
+│           pl2a_radius: 30                                                     
+│           a2a_radius: 60                                                      
+│           time_span: 30                                                       
+│           num_historical_steps: 11                                            
+│           num_future_steps: 80                                                
+│           flow_window_steps: 20                                               
+│           flow_dim: 96                                                        
+│           flow_num_chunk_heads: 4                                             
+│           flow_num_chunk_layers: 2                                            
+│           flow_solver_steps: 32                                               
+│           flow_solver_method: euler                                           
+│           flow_solver_eps: 0.001                                              
+│           detach_train_metric_clean: false                                    
+│           use_kinematic_control_flow: true                                    
+│           use_holonomic_model_only: false                                     
+│           use_rolling_supervision: true                                       
+│           control_pos_scale_m: 1.0                                            
+│           control_vehicle_no_slip_point_ratio: 0.2289518863                   
+│           control_cyclist_no_slip_point_ratio: 0.0495847873                   
+│           control_vehicle_yaw_scale_rad: 0.025                                
+│           control_pedestrian_yaw_scale_rad: 0.2                               
+│           control_cyclist_yaw_scale_rad: 0.06                                 
+│           closed_loop_rollout_mode: raw_fm                                    
+│           use_lqr: false                                                      
+│           use_stop_motion: false                                              
+│           lqr_commit:                                                         
+│             dt: 0.1                                                           
+│             history_steps: 6                                                  
+│             horizon_steps: 10                                                 
+│             velocity_smooth_lambda: 0.0001                                    
+│             curvature_smooth_lambda: 0.01                                     
+│             curvature_init_reg: 1.0e-10                                       
+│             stop_speed_mps: 0.2                                               
+│             stop_speed_kp: 0.5                                                
+│             longitudinal_q: 10.0                                              
+│             longitudinal_r: 0.0                                               
+│             lateral_q_lat: 1.0                                                
+│             lateral_q_head: 10.0                                              
+│             lateral_q_kappa: 0.0                                              
+│             lateral_r: 0.0                                                    
+│             accel_tau_s: 0.0                                                  
+│             curvature_tau_s: 0.0                                              
+│             min_speed_for_curvature_clip_mps: 0.5                             
+│         sim_agents_submission:                                                
+│           is_active: false                                                    
+│           method_name: SMART-flow-7M                                          
+│           authors:                                                            
+│           - Seulbin Hwang                                                     
+│           - Kiyoung Om                                                        
+│           affiliation: NaverLabs                                              
+│           description: Flow-based generative model for simulating realistic ag
+│           method_link: not available yet                                      
+│           account_name: h.sb@naverlabs.com                                    
+│         finetune:                                                             
+│           enabled: true                                                       
+│           train_except_map_encoder: true                                      
+│           train_full_flow_decoder_only: false                                 
+│           mode: ocsc_ft                                                       
+│           velocity_head_only: false                                           
+│           ocsc_n_rollouts: 4                                                  
+│           ocsc_n_ol_rollouts: -1                                              
+│           ocsc_ol_nearest_match: true                                         
+│           ocsc_loss_type: l2                                                  
+│           ocsc_gt_target: true                                                
+│           ocsc_use_pretrained_ref: true                                       
+│           ocsc_anchor_idx: 0                                                  
+│           ocsc_match_space: pose                                              
+│           ocsc_match_frame: global                                            
+│           ocsc_loss_window_steps: -1                                          
+│           ocsc_loss_temporal_stride: -1                                       
+│           ocsc_strict_active_mask: true                                       
+│           ocsc_position_weight: 1.0                                           
+│           ocsc_heading_weight: 0.01                                           
+│           flow_velocity_head_only: true                                       
+│           road_sample_k: 64                                                   
+│           road_n_rollouts: 1                                                  
+│           road_pred_max_steps: 16                                             
+│           road_temperature: 0.8                                               
+│           road_position_weight: 1.0                                           
+│           road_heading_weight: 0.1                                            
+│           road_comparison_horizon: 20                                         
+│           road_strict_active_mask: true                                       
+│           road_eval_hard_rmm: false                                           
+│           road_eval_hard_rmm_interval: 10                                     
+│                                                                               
+├── callbacks
+│   └── model_summary:                                                          
+│         _target_: lightning.pytorch.callbacks.RichModelSummary                
+│         max_depth: -1                                                         
+│       learning_rate_monitor:                                                  
+│         _target_: lightning.pytorch.callbacks.LearningRateMonitor             
+│         logging_interval: epoch                                               
+│       wandb_runtime_metrics:                                                  
+│         _target_: src.utils.wandb_runtime_callback.WandbRuntimeMetricsCallback
+│         log_every_n_steps: 20                                                 
+│       rmm_floor:                                                              
+│         _target_: src.utils.rmm_floor_callback.RmmFloorStop                   
+│         monitor: val_closed/sim_agents_2025/realism_meta_metric               
+│         floor: 0.7                                                            
+│                                                                               
+├── logger
+│   └── wandb:                                                                  
+│         _target_: lightning.pytorch.loggers.wandb.WandbLogger                 
+│         name: ocsc_tv16_lr1e-7_G4_global_gttrue_except_map_encoder_b32_0605_14
+│         save_dir: /home2/pnc2/repos_python/kinematic_flow/logs/ocsc_tv16_lr1e-
+│         offline: false                                                        
+│         id: null                                                              
+│         anonymous: null                                                       
+│         project: clsft-catk                                                   
+│         log_model: false                                                      
+│         prefix: ''                                                            
+│         entity: se99an                                                        
+│         group: ''                                                             
+│         tags: []                                                              
+│         job_type: ''                                                          
+│         resume: allow                                                         
+│                                                                               
+├── trainer
+│   └── _target_: lightning.pytorch.trainer.Trainer                             
+│       default_root_dir: /home2/pnc2/repos_python/kinematic_flow/logs/ocsc_tv16
+│       limit_train_batches: 1                                                  
+│       limit_val_batches: 1                                                    
+│       limit_test_batches: 1.0                                                 
+│       max_epochs: 375                                                         
+│       accelerator: gpu                                                        
+│       devices: 1                                                              
+│       precision: 32-true                                                      
+│       check_val_every_n_epoch: 10                                             
+│       deterministic: false                                                    
+│       gradient_clip_val: 1.0                                                  
+│       num_sanity_val_steps: 0                                                 
+│       accumulate_grad_batches: 1                                              
+│       log_every_n_steps: 20                                                   
+│       strategy: auto                                                          
+│       num_nodes: 1                                                            
+│       sync_batchnorm: false                                                   
+│       val_check_interval: null                                                
+│                                                                               
+├── paths
+│   └── root_dir: /home2/pnc2/repos_python/kinematic_flow                       
+│       log_dir: /home2/pnc2/repos_python/kinematic_flow/logs/                  
+│       output_dir: /home2/pnc2/repos_python/kinematic_flow/logs/ocsc_tv16_lr1e-
+│       cache_root: /home2/pnc2/repos_python/datasets/catk_cache                
+│                                                                               
+├── action
+│   └── finetune                                                                
+├── task_name
+│   └── ocsc_tv16_lr1e-7_G4_global_gttrue_except_map_encoder_b32_0605_142238    
+├── ckpt_path
+│   └── logs/pretrained/pretrained.ckpt                                         
+├── train_log_dir
+│   └── None                                                                    
+├── submission
+│   └── description: null                                                       
+│                                                                               
+├── seed
+│   └── 817                                                                     
+└── waymo_submission
+    └── enabled: false                                                          
+        submit_validate: true                                                   
+        submit_test: false                                                      
+        evaluation_set: null                                                    
+        challenge_url: https://waymo.com/open/challenges/2025/sim-agents/       
+        submissions_url: https://waymo.com/open/challenges/submissions/         
+        storage_state_path: /home2/pnc2/repos_python/kinematic_flow/secrets/waym
+        archive_path: null                                                      
+        browser_name: chromium                                                  
+        browser_channel: null                                                   
+        browser_executable_path: null                                           
+        headless: true                                                          
+        chromium_sandbox: false                                                 
+        navigation_timeout_ms: 120000                                           
+        upload_timeout_ms: 120000                                               
+        post_submit_wait_ms: 5000                                               
+        poll_submission_status: false                                           
+        poll_timeout_seconds: 0                                                 
+        poll_interval_seconds: 60                                               
+        save_debug_artifacts: true                                              
+                                                                                
+Seed set to 817
+[[36m2026-06-05 14:22:45,650[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating datamodule <src.smart.datamodules.MultiDataModule>[0m
+[[36m2026-06-05 14:23:02,113[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating model <src.smart.model.smart_flow.SMARTFlow>[0m
+[[36m2026-06-05 14:23:04,521[0m][[34msrc.smart.utils.finetune[0m][[32mINFO[0m] - [rank: 0] Finetuning mode: all non-map parameters trainable (6,126,323 params); map_encoder frozen.[0m
+[[36m2026-06-05 14:23:04,535[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating callbacks...[0m
+[[36m2026-06-05 14:23:04,535[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.RichModelSummary>[0m
+[[36m2026-06-05 14:23:04,536[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <lightning.pytorch.callbacks.LearningRateMonitor>[0m
+[[36m2026-06-05 14:23:04,537[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <src.utils.wandb_runtime_callback.WandbRuntimeMetricsCallback>[0m
+[[36m2026-06-05 14:23:04,537[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating callback <src.utils.rmm_floor_callback.RmmFloorStop>[0m
+[[36m2026-06-05 14:23:04,538[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating loggers...[0m
+[[36m2026-06-05 14:23:04,538[0m][[34msrc.utils.instantiators[0m][[32mINFO[0m] - [rank: 0] Instantiating logger <lightning.pytorch.loggers.wandb.WandbLogger>[0m
+[[36m2026-06-05 14:23:04,541[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Instantiating trainer <lightning.pytorch.trainer.Trainer>[0m
+Trainer already configured with model summary callbacks: [<class 'lightning.pytorch.callbacks.rich_model_summary.RichModelSummary'>]. Skipping setting a default `ModelSummary` callback.
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+`Trainer(limit_train_batches=1)` was configured so 1 batch per epoch will be used.
+`Trainer(limit_val_batches=1)` was configured so 1 batch will be used.
+`Trainer(limit_test_batches=1.0)` was configured so 100% of the batches will be used..
+[[36m2026-06-05 14:23:04,554[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Logging hyperparameters![0m
+wandb: WARNING The anonymous setting has no effect and will be removed in a future version.
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home2/pnc2/.netrc.
+wandb: Currently logged in as: se99an to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run rf3ek34o
+wandb: Tracking run with wandb version 0.25.1
+wandb: Run data is saved locally in /home2/pnc2/repos_python/kinematic_flow/logs/ocsc_tv16_lr1e-7_G4_global_gttrue_except_map_encoder_b32_0605_142238/runs/2026-06-05_14-22-42/wandb/run-20260605_142305-rf3ek34o
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run ocsc_tv16_lr1e-7_G4_global_gttrue_except_map_encoder_b32_0605_142238
+wandb: ⭐️ View project at https://wandb.ai/se99an/clsft-catk
+wandb: 🚀 View run at https://wandb.ai/se99an/clsft-catk/runs/rf3ek34o
+[[36m2026-06-05 14:23:10,602[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Resuming from ckpt: cfg.ckpt_path=logs/pretrained/pretrained.ckpt[0m
+/home2/pnc2/repos_python/kinematic_flow/src/run.py:64: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  checkpoint = torch.load(ckpt_path, map_location="cpu")
+[[36m2026-06-05 14:23:10,772[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Starting finetuning![0m
+[[36m2026-06-05 14:23:10,791[0m][[34m__main__[0m][[33mWARNING[0m] - [rank: 0] Ignoring non-trainable missing checkpoint key(s) during finetune load: ref_flow_decoder.context_projector.net.0.weight, ref_flow_decoder.context_projector.net.0.bias, ref_flow_decoder.context_projector.net.1.weight, ref_flow_decoder.context_projector.net.1.bias, ref_flow_decoder.context_projector.net.3.weight, ref_flow_decoder.context_projector.net.3.bias, ref_flow_decoder.noisy_future_encoder.step_proj.weight, ref_flow_decoder.noisy_future_encoder.step_proj.bias, ref_flow_decoder.noisy_future_encoder.step_embed.weight, ref_flow_decoder.noisy_future_encoder.tau_mlp.0.weight, ref_flow_decoder.noisy_future_encoder.tau_mlp.0.bias, ref_flow_decoder.noisy_future_encoder.tau_mlp.2.weight, ref_flow_decoder.noisy_future_encoder.tau_mlp.2.bias, ref_flow_decoder.noisy_future_encoder.chunk_pool.0.weight, ref_flow_decoder.noisy_future_encoder.chunk_pool.0.bias, ref_flow_decoder.noisy_future_encoder.chunk_pool.2.weight, ref_flow_decoder.noisy_future_encoder.chunk_pool.2.bias, ref_flow_decoder.chunk_mixers.0.attn_norm.weight, ref_flow_decoder.chunk_mixers.0.attn_norm.bias, ref_flow_decoder.chunk_mixers.0.attn.in_proj_weight, ... (+49 more)[0m
+[[36m2026-06-05 14:23:12,487[0m][[34msrc.smart.datasets.scalable_dataset[0m][[32mINFO[0m] - [rank: 0] Length of /home2/pnc2/repos_python/datasets/catk_cache/validation dataset is 44097[0m
+[[36m2026-06-05 14:23:13,088[0m][[34msrc.smart.datasets.scalable_dataset[0m][[32mINFO[0m] - [rank: 0] Length of /home2/pnc2/repos_python/datasets/catk_cache/validation dataset is 44097[0m
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [2]
+┏━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━┳━┳━┓
+┃ ┃ Name                                                                 ┃ ┃ ┃ ┃
+┡━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━╇━╇━┩
+│ │ token_processor                                                      │ │ │ │
+│ │ encoder                                                              │ │ │ │
+│ │ encoder.map_encoder                                                  │ │ │ │
+│ │ encoder.map_encoder.type_pt_emb                                      │ │ │ │
+│ │ encoder.map_encoder.polygon_type_emb                                 │ │ │ │
+│ │ encoder.map_encoder.light_pl_emb                                     │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb                                      │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.freqs                                │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps                                 │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.0                               │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.0.0                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.0.1                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.0.2                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.0.3                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.1                               │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.1.0                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.1.1                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.1.2                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.1.3                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.2                               │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.2.0                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.2.1                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.2.2                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.mlps.2.3                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.to_out                               │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.to_out.0                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.to_out.1                             │ │ │ │
+│ │ encoder.map_encoder.r_pt2pt_emb.to_out.2                             │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers                                     │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0                                   │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.aggr_module                       │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.to_q                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.to_k                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.to_v                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.to_k_r                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.to_v_r                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.to_s                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.to_g                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.to_out                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.attn_drop                         │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.ff_mlp                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.ff_mlp.0                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.ff_mlp.1                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.ff_mlp.2                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.ff_mlp.3                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.attn_prenorm_x_src                │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.attn_prenorm_r                    │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.attn_postnorm                     │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.ff_prenorm                        │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.0.ff_postnorm                       │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1                                   │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.aggr_module                       │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.to_q                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.to_k                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.to_v                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.to_k_r                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.to_v_r                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.to_s                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.to_g                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.to_out                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.attn_drop                         │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.ff_mlp                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.ff_mlp.0                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.ff_mlp.1                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.ff_mlp.2                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.ff_mlp.3                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.attn_prenorm_x_src                │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.attn_prenorm_r                    │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.attn_postnorm                     │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.ff_prenorm                        │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.1.ff_postnorm                       │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2                                   │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.aggr_module                       │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.to_q                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.to_k                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.to_v                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.to_k_r                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.to_v_r                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.to_s                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.to_g                              │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.to_out                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.attn_drop                         │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.ff_mlp                            │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.ff_mlp.0                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.ff_mlp.1                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.ff_mlp.2                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.ff_mlp.3                          │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.attn_prenorm_x_src                │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.attn_prenorm_r                    │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.attn_postnorm                     │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.ff_prenorm                        │ │ │ │
+│ │ encoder.map_encoder.pt2pt_layers.2.ff_postnorm                       │ │ │ │
+│ │ encoder.map_encoder.token_emb                                        │ │ │ │
+│ │ encoder.map_encoder.token_emb.mlp                                    │ │ │ │
+│ │ encoder.map_encoder.token_emb.mlp.0                                  │ │ │ │
+│ │ encoder.map_encoder.token_emb.mlp.1                                  │ │ │ │
+│ │ encoder.map_encoder.token_emb.mlp.2                                  │ │ │ │
+│ │ encoder.map_encoder.token_emb.mlp.3                                  │ │ │ │
+│ │ encoder.map_encoder.token_emb.mlp.4                                  │ │ │ │
+│ │ encoder.map_encoder.token_emb.mlp.5                                  │ │ │ │
+│ │ encoder.map_encoder.token_emb.mlp.6                                  │ │ │ │
+│ │ encoder.agent_encoder                                                │ │ │ │
+│ │ encoder.agent_encoder.type_a_emb                                     │ │ │ │
+│ │ encoder.agent_encoder.shape_emb                                      │ │ │ │
+│ │ encoder.agent_encoder.shape_emb.mlp                                  │ │ │ │
+│ │ encoder.agent_encoder.shape_emb.mlp.0                                │ │ │ │
+│ │ encoder.agent_encoder.shape_emb.mlp.1                                │ │ │ │
+│ │ encoder.agent_encoder.shape_emb.mlp.2                                │ │ │ │
+│ │ encoder.agent_encoder.shape_emb.mlp.3                                │ │ │ │
+│ │ encoder.agent_encoder.light_pl2a_emb                                 │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb                                        │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.freqs                                  │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps                                   │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.0                                 │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.0.0                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.0.1                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.0.2                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.0.3                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.1                                 │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.1.0                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.1.1                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.1.2                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.1.3                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.2                                 │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.2.0                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.2.1                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.2.2                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.mlps.2.3                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.to_out                                 │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.to_out.0                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.to_out.1                               │ │ │ │
+│ │ encoder.agent_encoder.x_a_emb.to_out.2                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb                                        │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.freqs                                  │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps                                   │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.0                                 │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.0.0                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.0.1                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.0.2                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.0.3                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.1                                 │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.1.0                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.1.1                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.1.2                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.1.3                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.2                                 │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.2.0                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.2.1                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.2.2                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.2.3                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.3                                 │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.3.0                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.3.1                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.3.2                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.mlps.3.3                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.to_out                                 │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.to_out.0                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.to_out.1                               │ │ │ │
+│ │ encoder.agent_encoder.r_t_emb.to_out.2                               │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb                                     │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.freqs                               │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps                                │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.0                              │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.0.0                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.0.1                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.0.2                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.0.3                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.1                              │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.1.0                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.1.1                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.1.2                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.1.3                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.2                              │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.2.0                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.2.1                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.2.2                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.mlps.2.3                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.to_out                              │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.to_out.0                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.to_out.1                            │ │ │ │
+│ │ encoder.agent_encoder.r_pt2a_emb.to_out.2                            │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb                            │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.freqs                      │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.mlps                       │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.mlps.0                     │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.mlps.0.0                   │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.mlps.0.1                   │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.mlps.0.2                   │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.mlps.0.3                   │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.to_out                     │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.to_out.0                   │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.to_out.1                   │ │ │ │
+│ │ encoder.agent_encoder.light_time_pl2a_emb.to_out.2                   │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb                                      │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.freqs                                │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps                                 │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.0                               │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.0.0                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.0.1                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.0.2                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.0.3                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.1                               │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.1.0                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.1.1                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.1.2                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.1.3                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.2                               │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.2.0                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.2.1                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.2.2                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.mlps.2.3                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.to_out                               │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.to_out.0                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.to_out.1                             │ │ │ │
+│ │ encoder.agent_encoder.r_a2a_emb.to_out.2                             │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh                                  │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh.mlp                              │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh.mlp.0                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh.mlp.1                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh.mlp.2                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh.mlp.3                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh.mlp.4                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh.mlp.5                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_veh.mlp.6                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped                                  │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped.mlp                              │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped.mlp.0                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped.mlp.1                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped.mlp.2                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped.mlp.3                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped.mlp.4                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped.mlp.5                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_ped.mlp.6                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc                                  │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc.mlp                              │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc.mlp.0                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc.mlp.1                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc.mlp.2                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc.mlp.3                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc.mlp.4                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc.mlp.5                            │ │ │ │
+│ │ encoder.agent_encoder.token_emb_cyc.mlp.6                            │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb                                     │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb.mlp                                 │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb.mlp.0                               │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb.mlp.1                               │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb.mlp.2                               │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb.mlp.3                               │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb.mlp.4                               │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb.mlp.5                               │ │ │ │
+│ │ encoder.agent_encoder.fusion_emb.mlp.6                               │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers                                  │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0                                │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.aggr_module                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.to_q                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.to_k                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.to_v                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.to_k_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.to_v_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.to_s                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.to_g                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.to_out                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.attn_drop                      │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.ff_mlp                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.ff_mlp.0                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.ff_mlp.1                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.ff_mlp.2                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.ff_mlp.3                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.attn_prenorm_x_src             │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.attn_prenorm_r                 │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.attn_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.ff_prenorm                     │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.0.ff_postnorm                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1                                │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.aggr_module                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.to_q                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.to_k                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.to_v                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.to_k_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.to_v_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.to_s                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.to_g                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.to_out                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.attn_drop                      │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.ff_mlp                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.ff_mlp.0                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.ff_mlp.1                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.ff_mlp.2                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.ff_mlp.3                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.attn_prenorm_x_src             │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.attn_prenorm_r                 │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.attn_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.ff_prenorm                     │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.1.ff_postnorm                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2                                │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.aggr_module                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.to_q                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.to_k                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.to_v                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.to_k_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.to_v_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.to_s                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.to_g                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.to_out                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.attn_drop                      │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.ff_mlp                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.ff_mlp.0                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.ff_mlp.1                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.ff_mlp.2                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.ff_mlp.3                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.attn_prenorm_x_src             │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.attn_prenorm_r                 │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.attn_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.ff_prenorm                     │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.2.ff_postnorm                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3                                │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.aggr_module                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.to_q                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.to_k                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.to_v                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.to_k_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.to_v_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.to_s                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.to_g                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.to_out                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.attn_drop                      │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.ff_mlp                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.ff_mlp.0                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.ff_mlp.1                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.ff_mlp.2                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.ff_mlp.3                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.attn_prenorm_x_src             │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.attn_prenorm_r                 │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.attn_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.ff_prenorm                     │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.3.ff_postnorm                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4                                │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.aggr_module                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.to_q                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.to_k                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.to_v                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.to_k_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.to_v_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.to_s                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.to_g                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.to_out                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.attn_drop                      │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.ff_mlp                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.ff_mlp.0                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.ff_mlp.1                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.ff_mlp.2                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.ff_mlp.3                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.attn_prenorm_x_src             │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.attn_prenorm_r                 │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.attn_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.ff_prenorm                     │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.4.ff_postnorm                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5                                │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.aggr_module                    │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.to_q                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.to_k                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.to_v                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.to_k_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.to_v_r                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.to_s                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.to_g                           │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.to_out                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.attn_drop                      │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.ff_mlp                         │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.ff_mlp.0                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.ff_mlp.1                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.ff_mlp.2                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.ff_mlp.3                       │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.attn_prenorm_x_src             │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.attn_prenorm_r                 │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.attn_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.ff_prenorm                     │ │ │ │
+│ │ encoder.agent_encoder.t_attn_layers.5.ff_postnorm                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers                               │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0                             │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.aggr_module                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.to_q                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.to_k                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.to_v                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.to_k_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.to_v_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.to_s                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.to_g                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.to_out                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.attn_drop                   │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.ff_mlp                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.ff_mlp.0                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.ff_mlp.1                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.ff_mlp.2                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.ff_mlp.3                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.attn_prenorm_x_src          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.attn_prenorm_x_dst          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.attn_prenorm_r              │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.attn_postnorm               │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.ff_prenorm                  │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.0.ff_postnorm                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1                             │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.aggr_module                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.to_q                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.to_k                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.to_v                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.to_k_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.to_v_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.to_s                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.to_g                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.to_out                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.attn_drop                   │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.ff_mlp                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.ff_mlp.0                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.ff_mlp.1                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.ff_mlp.2                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.ff_mlp.3                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.attn_prenorm_x_src          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.attn_prenorm_x_dst          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.attn_prenorm_r              │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.attn_postnorm               │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.ff_prenorm                  │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.1.ff_postnorm                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2                             │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.aggr_module                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.to_q                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.to_k                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.to_v                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.to_k_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.to_v_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.to_s                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.to_g                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.to_out                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.attn_drop                   │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.ff_mlp                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.ff_mlp.0                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.ff_mlp.1                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.ff_mlp.2                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.ff_mlp.3                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.attn_prenorm_x_src          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.attn_prenorm_x_dst          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.attn_prenorm_r              │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.attn_postnorm               │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.ff_prenorm                  │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.2.ff_postnorm                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3                             │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.aggr_module                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.to_q                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.to_k                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.to_v                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.to_k_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.to_v_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.to_s                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.to_g                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.to_out                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.attn_drop                   │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.ff_mlp                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.ff_mlp.0                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.ff_mlp.1                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.ff_mlp.2                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.ff_mlp.3                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.attn_prenorm_x_src          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.attn_prenorm_x_dst          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.attn_prenorm_r              │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.attn_postnorm               │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.ff_prenorm                  │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.3.ff_postnorm                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4                             │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.aggr_module                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.to_q                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.to_k                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.to_v                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.to_k_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.to_v_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.to_s                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.to_g                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.to_out                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.attn_drop                   │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.ff_mlp                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.ff_mlp.0                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.ff_mlp.1                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.ff_mlp.2                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.ff_mlp.3                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.attn_prenorm_x_src          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.attn_prenorm_x_dst          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.attn_prenorm_r              │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.attn_postnorm               │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.ff_prenorm                  │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.4.ff_postnorm                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5                             │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.aggr_module                 │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.to_q                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.to_k                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.to_v                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.to_k_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.to_v_r                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.to_s                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.to_g                        │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.to_out                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.attn_drop                   │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.ff_mlp                      │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.ff_mlp.0                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.ff_mlp.1                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.ff_mlp.2                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.ff_mlp.3                    │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.attn_prenorm_x_src          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.attn_prenorm_x_dst          │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.attn_prenorm_r              │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.attn_postnorm               │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.ff_prenorm                  │ │ │ │
+│ │ encoder.agent_encoder.pt2a_attn_layers.5.ff_postnorm                 │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers                                │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0                              │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.aggr_module                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.to_q                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.to_k                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.to_v                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.to_k_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.to_v_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.to_s                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.to_g                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.to_out                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.attn_drop                    │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.ff_mlp                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.ff_mlp.0                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.ff_mlp.1                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.ff_mlp.2                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.ff_mlp.3                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.attn_prenorm_x_src           │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.attn_prenorm_r               │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.attn_postnorm                │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.ff_prenorm                   │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.0.ff_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1                              │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.aggr_module                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.to_q                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.to_k                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.to_v                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.to_k_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.to_v_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.to_s                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.to_g                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.to_out                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.attn_drop                    │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.ff_mlp                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.ff_mlp.0                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.ff_mlp.1                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.ff_mlp.2                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.ff_mlp.3                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.attn_prenorm_x_src           │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.attn_prenorm_r               │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.attn_postnorm                │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.ff_prenorm                   │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.1.ff_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2                              │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.aggr_module                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.to_q                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.to_k                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.to_v                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.to_k_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.to_v_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.to_s                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.to_g                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.to_out                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.attn_drop                    │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.ff_mlp                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.ff_mlp.0                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.ff_mlp.1                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.ff_mlp.2                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.ff_mlp.3                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.attn_prenorm_x_src           │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.attn_prenorm_r               │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.attn_postnorm                │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.ff_prenorm                   │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.2.ff_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3                              │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.aggr_module                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.to_q                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.to_k                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.to_v                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.to_k_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.to_v_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.to_s                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.to_g                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.to_out                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.attn_drop                    │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.ff_mlp                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.ff_mlp.0                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.ff_mlp.1                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.ff_mlp.2                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.ff_mlp.3                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.attn_prenorm_x_src           │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.attn_prenorm_r               │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.attn_postnorm                │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.ff_prenorm                   │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.3.ff_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4                              │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.aggr_module                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.to_q                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.to_k                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.to_v                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.to_k_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.to_v_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.to_s                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.to_g                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.to_out                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.attn_drop                    │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.ff_mlp                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.ff_mlp.0                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.ff_mlp.1                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.ff_mlp.2                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.ff_mlp.3                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.attn_prenorm_x_src           │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.attn_prenorm_r               │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.attn_postnorm                │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.ff_prenorm                   │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.4.ff_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5                              │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.aggr_module                  │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.to_q                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.to_k                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.to_v                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.to_k_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.to_v_r                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.to_s                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.to_g                         │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.to_out                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.attn_drop                    │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.ff_mlp                       │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.ff_mlp.0                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.ff_mlp.1                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.ff_mlp.2                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.ff_mlp.3                     │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.attn_prenorm_x_src           │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.attn_prenorm_r               │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.attn_postnorm                │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.ff_prenorm                   │ │ │ │
+│ │ encoder.agent_encoder.a2a_attn_layers.5.ff_postnorm                  │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder                                   │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.context_projector                 │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.context_projector.net             │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.context_projector.net.0           │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.context_projector.net.1           │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.context_projector.net.2           │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.context_projector.net.3           │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder              │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.step_proj    │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.step_embed   │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.tau_mlp      │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.tau_mlp.0    │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.tau_mlp.1    │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.tau_mlp.2    │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.chunk_pool   │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.chunk_pool.0 │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.chunk_pool.1 │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.noisy_future_encoder.chunk_pool.2 │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers                      │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0                    │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.attn_norm          │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.attn               │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.attn.out_proj      │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.cond_mlp           │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.cond_mlp.0         │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.cond_mlp.1         │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.cond_mlp.2         │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.mlp_norm           │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.mlp                │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.mlp.0              │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.mlp.1              │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.0.mlp.2              │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1                    │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.attn_norm          │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.attn               │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.attn.out_proj      │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.cond_mlp           │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.cond_mlp.0         │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.cond_mlp.1         │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.cond_mlp.2         │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.mlp_norm           │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.mlp                │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.mlp.0              │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.mlp.1              │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.chunk_mixers.1.mlp.2              │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner                      │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.context_proj         │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.pre_proj             │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.attn_norm            │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.attn                 │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.attn.out_proj        │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.mlp_norm             │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.mlp                  │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.mlp.0                │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.mlp.1                │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.step_refiner.mlp.2                │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.velocity_head                     │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.velocity_head.net                 │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.velocity_head.net.0               │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.velocity_head.net.1               │ │ │ │
+│ │ encoder.agent_encoder.flow_decoder.velocity_head.net.2               │ │ │ │
+│ │ ref_flow_decoder                                                     │ │ │ │
+│ │ ref_flow_decoder.context_projector                                   │ │ │ │
+│ │ ref_flow_decoder.context_projector.net                               │ │ │ │
+│ │ ref_flow_decoder.context_projector.net.0                             │ │ │ │
+│ │ ref_flow_decoder.context_projector.net.1                             │ │ │ │
+│ │ ref_flow_decoder.context_projector.net.2                             │ │ │ │
+│ │ ref_flow_decoder.context_projector.net.3                             │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder                                │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.step_proj                      │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.step_embed                     │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.tau_mlp                        │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.tau_mlp.0                      │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.tau_mlp.1                      │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.tau_mlp.2                      │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.chunk_pool                     │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.chunk_pool.0                   │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.chunk_pool.1                   │ │ │ │
+│ │ ref_flow_decoder.noisy_future_encoder.chunk_pool.2                   │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers                                        │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0                                      │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.attn_norm                            │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.attn                                 │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.attn.out_proj                        │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.cond_mlp                             │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.cond_mlp.0                           │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.cond_mlp.1                           │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.cond_mlp.2                           │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.mlp_norm                             │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.mlp                                  │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.mlp.0                                │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.mlp.1                                │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.0.mlp.2                                │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1                                      │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.attn_norm                            │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.attn                                 │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.attn.out_proj                        │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.cond_mlp                             │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.cond_mlp.0                           │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.cond_mlp.1                           │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.cond_mlp.2                           │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.mlp_norm                             │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.mlp                                  │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.mlp.0                                │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.mlp.1                                │ │ │ │
+│ │ ref_flow_decoder.chunk_mixers.1.mlp.2                                │ │ │ │
+│ │ ref_flow_decoder.step_refiner                                        │ │ │ │
+│ │ ref_flow_decoder.step_refiner.context_proj                           │ │ │ │
+│ │ ref_flow_decoder.step_refiner.pre_proj                               │ │ │ │
+│ │ ref_flow_decoder.step_refiner.attn_norm                              │ │ │ │
+│ │ ref_flow_decoder.step_refiner.attn                                   │ │ │ │
+│ │ ref_flow_decoder.step_refiner.attn.out_proj                          │ │ │ │
+│ │ ref_flow_decoder.step_refiner.mlp_norm                               │ │ │ │
+│ │ ref_flow_decoder.step_refiner.mlp                                    │ │ │ │
+│ │ ref_flow_decoder.step_refiner.mlp.0                                  │ │ │ │
+│ │ ref_flow_decoder.step_refiner.mlp.1                                  │ │ │ │
+│ │ ref_flow_decoder.step_refiner.mlp.2                                  │ │ │ │
+│ │ ref_flow_decoder.velocity_head                                       │ │ │ │
+│ │ ref_flow_decoder.velocity_head.net                                   │ │ │ │
+│ │ ref_flow_decoder.velocity_head.net.0                                 │ │ │ │
+│ │ ref_flow_decoder.velocity_head.net.1                                 │ │ │ │
+│ │ ref_flow_decoder.velocity_head.net.2                                 │ │ │ │
+│ │ minADE                                                               │ │ │ │
+│ │ minADE_predict                                                       │ │ │ │
+│ │ sim_agents_metrics                                                   │ │ │ │
+│ │ sim_agents_submission                                                │ │ │ │
+│ │ wosac_distribution_metrics                                           │ │ │ │
+│ │ test_wosac_distribution_metrics                                      │ │ │ │
+│ │ val_open_epoch_metrics                                               │ │ │ │
+│ │ val_open_epoch_metrics.ADE2s                                         │ │ │ │
+│ │ val_open_epoch_metrics.FDE2s                                         │ │ │ │
+│ │ val_open_epoch_metrics.yaw_ADE2s                                     │ │ │ │
+│ │ val_open_epoch_metrics.yaw_FDE2s                                     │ │ │ │
+└─┴──────────────────────────────────────────────────────────────────────┴─┴─┴─┘
+Trainable params: 6.1 M                                                         
+Non-trainable params: 1.5 M                                                     
+Total params: 7.6 M                                                             
+Total estimated model params size (MB): 30                                      
+Modules in train mode: 771                                                      
+Modules in eval mode: 0                                                         
+/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py:298: The number of training batches (1) is smaller than the logging interval Trainer(log_every_n_steps=20). Set a lower value for log_every_n_steps if you want to see logs for the training epoch.
+Training: |          | 0/? [00:00<?, ?it/s]Training:   0%|          | 0/1 [00:00<?, ?it/s]Epoch 0:   0%|          | 0/1 [00:00<?, ?it/s] [[36m2026-06-05 14:27:06,734[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Closing wandb![0m
+wandb: updating run metadata
+wandb: uploading summary, console lines 790-790
+wandb: 
+wandb: Run history:
+wandb:                         lr-AdamW ▁
+wandb:    train_setup/global_batch_size ▁
+wandb: train_setup/n_rollout_closed_val ▁
+wandb:          train_setup/num_workers ▁
+wandb:       train_setup/val_batch_size ▁
+wandb:              trainer/global_step ▁▁
+wandb: 
+wandb: Run summary:
+wandb:                         lr-AdamW 0.0
+wandb:    train_setup/global_batch_size 32
+wandb: train_setup/n_rollout_closed_val 16
+wandb:          train_setup/num_workers 2
+wandb:       train_setup/val_batch_size 32
+wandb:              trainer/global_step 0
+wandb: 
+wandb: 🚀 View run ocsc_tv16_lr1e-7_G4_global_gttrue_except_map_encoder_b32_0605_142238 at: https://wandb.ai/se99an/clsft-catk/runs/rf3ek34o
+wandb: ⭐️ View project at: https://wandb.ai/se99an/clsft-catk
+wandb: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./logs/ocsc_tv16_lr1e-7_G4_global_gttrue_except_map_encoder_b32_0605_142238/runs/2026-06-05_14-22-42/wandb/run-20260605_142305-rf3ek34o/logs
+Error executing job with overrides: ['experiment=ocsc_ft', 'action=finetune', 'ckpt_path=logs/pretrained/pretrained.ckpt', 'task_name=ocsc_tv16_lr1e-7_G4_global_gttrue_except_map_encoder_b32_0605_142238', 'paths.cache_root=/home2/pnc2/repos_python/datasets/catk_cache', 'data.train_raw_dir=/home2/pnc2/repos_python/datasets/catk_cache/validation', 'data.val_raw_dir=/home2/pnc2/repos_python/datasets/catk_cache/validation', 'data.val_tfrecords_splitted=/home2/pnc2/repos_python/datasets/catk_cache/validation_tfrecords_splitted', 'data.train_batch_size=32', 'data.val_batch_size=32', 'data.num_workers=2', 'data.shuffle=false', 'data.train_epoch_sample_fraction=1.0', 'trainer.devices=1', 'trainer.strategy=auto', 'trainer.precision=32-true', 'trainer.limit_train_batches=1', 'trainer.limit_val_batches=1', 'trainer.val_check_interval=null', 'trainer.check_val_every_n_epoch=10', 'trainer.max_epochs=375', 'model.model_config.lr=1e-7', 'model.model_config.n_rollout_closed_val=16', 'model.model_config.scorer_scene_num=null', 'model.model_config.n_batch_sim_agents_metric=1', 'model.model_config.finetune.enabled=true', 'model.model_config.finetune.mode=ocsc_ft', 'model.model_config.finetune.velocity_head_only=false', 'model.model_config.finetune.train_except_map_encoder=true', 'model.model_config.finetune.train_full_flow_decoder_only=false', 'model.model_config.finetune.ocsc_n_rollouts=4', 'model.model_config.finetune.ocsc_gt_target=true', 'model.model_config.finetune.ocsc_match_space=pose', 'model.model_config.finetune.ocsc_match_frame=global', 'model.model_config.finetune.ocsc_loss_window_steps=-1', 'model.model_config.finetune.ocsc_position_weight=1.0', 'model.model_config.finetune.ocsc_heading_weight=0.01', 'logger.wandb.entity=se99an', 'logger.wandb.project=clsft-catk', 'logger.wandb.log_model=false', '~callbacks.model_checkpoint', '~callbacks.epoch_last_checkpoint', '+callbacks.rmm_floor._target_=src.utils.rmm_floor_callback.RmmFloorStop', '+callbacks.rmm_floor.monitor=val_closed/sim_agents_2025/realism_meta_metric', '+callbacks.rmm_floor.floor=0.700']
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 374, in <module>
+    main()
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/main.py", line 94, in decorated_main
+    _run_hydra(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+    _run_app(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+    run_and_report(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 223, in run_and_report
+    raise ex
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+    return func()
+           ^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+    lambda: hydra.run(
+            ^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/hydra.py", line 132, in run
+    _ = ret.return_value
+        ^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/core/utils.py", line 260, in return_value
+    raise self._return_value
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/core/utils.py", line 186, in run_job
+    ret.return_value = task_function(task_cfg)
+                       ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 364, in main
+    run(cfg)  # train/val/test the model
+    ^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 341, in run
+    trainer.fit(model=model, datamodule=datamodule)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 538, in fit
+    call._call_and_handle_interrupt(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 47, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 574, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 981, in _run
+    results = self._run_stage()
+              ^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1025, in _run_stage
+    self.fit_loop.run()
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 205, in run
+    self.advance()
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 363, in advance
+    self.epoch_loop.run(self._data_fetcher)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 140, in run
+    self.advance(data_fetcher)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 250, in advance
+    batch_output = self.automatic_optimization.run(trainer.optimizers[0], batch_idx, kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/optimization/automatic.py", line 190, in run
+    self._optimizer_step(batch_idx, closure)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/optimization/automatic.py", line 268, in _optimizer_step
+    call._call_lightning_module_hook(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 167, in _call_lightning_module_hook
+    output = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/core/module.py", line 1306, in optimizer_step
+    optimizer.step(closure=optimizer_closure)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/core/optimizer.py", line 153, in step
+    step_output = self._strategy.optimizer_step(self._optimizer, closure, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 238, in optimizer_step
+    return self.precision_plugin.optimizer_step(optimizer, model=model, closure=closure, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/plugins/precision/precision.py", line 122, in optimizer_step
+    return optimizer.step(closure=closure, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/optim/lr_scheduler.py", line 130, in wrapper
+    return func.__get__(opt, opt.__class__)(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/optim/optimizer.py", line 484, in wrapper
+    out = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/optim/optimizer.py", line 89, in _use_grad
+    ret = func(self, *args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/optim/adamw.py", line 204, in step
+    loss = closure()
+           ^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/plugins/precision/precision.py", line 108, in _wrap_closure
+    closure_result = closure()
+                     ^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/optimization/automatic.py", line 144, in __call__
+    self._result = self.closure(*args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/optimization/automatic.py", line 129, in closure
+    step_output = self._step_fn()
+                  ^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/optimization/automatic.py", line 317, in _training_step
+    training_step_output = call._call_strategy_hook(trainer, "training_step", *kwargs.values())
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 319, in _call_strategy_hook
+    output = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 390, in training_step
+    return self.lightning_module.training_step(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/model/smart_flow.py", line 4771, in training_step
+    return self._run_flow_ocsc_ft_step(data=data, batch_idx=batch_idx)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/model/smart_flow.py", line 4684, in _run_flow_ocsc_ft_step
+    cl_stack = self._ocsc_run_closed_loop_rollouts_batched(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/model/smart_flow.py", line 4509, in _ocsc_run_closed_loop_rollouts_batched
+    rollout = agent_enc.training_rollout_from_cache(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/modules/flow_agent_decoder.py", line 1996, in training_rollout_from_cache
+    return self._rollout_from_cache_impl(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/modules/flow_agent_decoder.py", line 1648, in _rollout_from_cache_impl
+    y_hat_norm = self.flow_ode.generate(
+                 ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/modules/flow_local_decoder.py", line 349, in generate
+    x_t = self._integrate_one_step(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/modules/flow_local_decoder.py", line 395, in _integrate_one_step
+    v = model_fn(x_t, tau)
+        ^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/modules/flow_agent_decoder.py", line 1650, in <lambda>
+    model_fn=lambda x_t, tau: self.flow_decoder(active_hidden, x_t, tau),
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/modules/flow_local_decoder.py", line 805, in forward
+    step_tokens = self._run_step_refiner(
+                  ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/modules/flow_local_decoder.py", line 729, in _run_step_refiner
+    return self.step_refiner(
+           ^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/repos_python/kinematic_flow/src/smart/modules/flow_local_decoder.py", line 629, in forward
+    attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 1275, in forward
+    attn_output, attn_output_weights = F.multi_head_attention_forward(
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/functional.py", line 5420, in multi_head_attention_forward
+    q, k, v = _in_projection_packed(query, key, value, in_proj_weight, in_proj_bias)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/functional.py", line 4920, in _in_projection_packed
+    proj = linear(q, w, b)
+           ^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 88.00 MiB. GPU 0 has a total capacity of 79.25 GiB of which 24.25 MiB is free. Process 2794071 has 47.16 GiB memory in use. Including non-PyTorch memory, this process has 32.05 GiB memory in use. Of the allocated memory 31.47 GiB is allocated by PyTorch, and 94.47 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

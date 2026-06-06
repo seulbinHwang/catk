@@ -1,0 +1,8 @@
+[2026-06-04T17:11:32+09:00] watchdog start: current task=road_ft_main_prealign_lr1e5_b32_v16_val200_lval002_nofixednoise_2gpu_ddpunused; fallback chain: 32 16 8 4
+[2026-06-04T17:11:32+09:00] watchdog start: current task=road_ft_main_prealign_lr1e5_b32_v16_val200_lval002_nofixednoise_2gpu_ddpunused; fallback chain: 32 16 8 4
+[2026-06-04T17:24:28+09:00] watchdog start: current task=road_ft_main_prealign_lr1e5_b32_v16_val200_lval002_nbatch27_nofixednoise_2gpu_ddpunused; fallback chain: 32 16 8 4
+[2026-06-04T17:24:28+09:00] watchdog start: current task=road_ft_main_prealign_lr1e5_b32_v16_val200_lval002_nbatch27_nofixednoise_2gpu_ddpunused; fallback chain: 32 16 8 4
+[2026-06-04T17:40:21+09:00] watchdog start: current task=road_ft_main_prealign_lr1e5_b32_v16_val200_lval002_nbatch27_nofixednoise_2gpu_ddpunused; fallback chain: 32 16 8 4
+[2026-06-04T17:40:21+09:00] watchdog start: current task=road_ft_main_prealign_lr1e5_b32_v16_val200_lval002_nbatch27_nofixednoise_2gpu_ddpunused; fallback chain: 32 16 8 4
+[2026-06-04T17:44:24+09:00] watchdog start: current task=road_ft_main_prealign_lr1e5_b32_v16_val200_lval002_nbatch27_nofixednoise_2gpu_ddpunused; fallback chain: 32 16 8 4
+[2026-06-04T17:44:24+09:00] watchdog start: current task=road_ft_main_prealign_lr1e5_b32_v16_val200_lval002_nbatch27_nofixednoise_2gpu_ddpunused; fallback chain: 32 16 8 4

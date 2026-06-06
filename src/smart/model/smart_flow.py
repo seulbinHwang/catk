@@ -303,9 +303,26 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
-        self.self_forced_estimator_lr = self.lr / float(
-            self.self_forced_estimator_updates_per_step
+        # fake(critic):generator 업데이트 cadence N:1.  매 batch fake 1회,
+        # generator 는 N batch 마다 1회(서로 다른 batch 들에서) — 같은 시나리오를
+        # 여러 번 돌리지 않는다.  N=1 이면 매 batch generator 도 업데이트(기존 동작).
+        self.self_forced_cadence = (
+            max(1, int(getattr(self.self_forced_config, "cadence", 1)))
+            if self.self_forced_config is not None
+            else 1
         )
+        # estimator(fake) lr 은 명시값 우선.  미지정/<=0 이면 기존처럼 lr/updates_per_step.
+        _explicit_estimator_lr = (
+            getattr(self.self_forced_config, "estimator_lr", None)
+            if self.self_forced_config is not None
+            else None
+        )
+        if _explicit_estimator_lr is not None and float(_explicit_estimator_lr) > 0.0:
+            self.self_forced_estimator_lr = float(_explicit_estimator_lr)
+        else:
+            self.self_forced_estimator_lr = self.lr / float(
+                self.self_forced_estimator_updates_per_step
+            )
         self.self_forced_estimator_warmup_epochs = (
             resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
         )
@@ -331,6 +348,12 @@ class SMARTFlow(LightningModule):
             max(0, int(getattr(self.self_forced_config, "ema_start_step", 50)))
             if self.self_forced_config is not None
             else 50
+        )
+        # use_ema=false 면 EMA generator 를 갱신/사용하지 않고 online generator 로 eval.
+        self.self_forced_use_ema = (
+            bool(getattr(self.self_forced_config, "use_ema", True))
+            if self.self_forced_config is not None
+            else True
         )
         self.self_forced_sampling = (
             getattr(self.self_forced_config, "sampling", self.validation_rollout_sampling)
@@ -1719,6 +1742,8 @@ class SMARTFlow(LightningModule):
         """Generator optimizer step 직후 EMA Generator를 갱신합니다."""
         if not self.self_forced_enabled or self.self_forced_generator_ema is None:
             return
+        if not self.self_forced_use_ema:
+            return  # EMA off — online generator 로만 eval
         self.self_forced_generator_update_count.add_(1)
         if int(self.self_forced_generator_update_count.item()) < int(self.self_forced_ema_start_step):
             return
@@ -2697,7 +2722,14 @@ class SMARTFlow(LightningModule):
             )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
-        if self._is_self_forced_estimator_warmup_active():
+        warmup_active = self._is_self_forced_estimator_warmup_active()
+        # cadence N:1 — fake 는 매 batch, generator 는 N batch 마다 1회만 (서로 다른 batch).
+        # generator step 이 아닌 batch 는 generator grad 가 불필요(estimator 는 detached
+        # committed_path 만 사용)하므로 rollout 을 no_grad 로 돌려 메모리/연산을 아낀다.
+        is_generator_step = (not warmup_active) and (
+            (int(batch_idx) + 1) % self.self_forced_cadence == 0
+        )
+        if warmup_active or not is_generator_step:
             with torch.no_grad():
                 rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
         else:
@@ -2774,8 +2806,17 @@ class SMARTFlow(LightningModule):
             anchor_mask=anchor_mask,
             has_committed_path_global=has_committed_path_global,
         )
-        if self._is_self_forced_estimator_warmup_active():
+        if warmup_active:
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
+        if not is_generator_step:
+            # fake-only batch: estimator 만 업데이트하고 generator 는 건드리지 않는다.
+            self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train/sf_is_generator_step", 0.0, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+            return (
+                gen_estimator_loss
+                if torch.is_tensor(gen_estimator_loss)
+                else committed_path_norm.new_zeros(()).detach()
+            )
         if has_committed_path_local:
             sf_loss = self._compute_self_forced_distribution_matching_loss(
                 tokenized_map=tokenized_map_eval,
@@ -2827,6 +2868,7 @@ class SMARTFlow(LightningModule):
         if fm_loss is not None:
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_npfm_loss", sf_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_is_generator_step", 1.0, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
         self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)

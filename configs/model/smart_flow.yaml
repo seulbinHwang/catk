@@ -77,11 +77,18 @@ model_config:
     # Stop-motion gate는 전 경로에서 사용하지 않습니다. 값은 false로 고정합니다.
     use_stop_motion: false
     estimator_updates_per_step: 5
+    # fake(critic):generator 업데이트 cadence N:1. fake 는 매 batch 1회, generator 는
+    # N batch 마다 1회(서로 다른 batch). N=1 이면 매 batch generator 도 업데이트.
+    cadence: 1
+    # estimator(fake) lr 명시값. null/<=0 이면 lr/estimator_updates_per_step 로 자동.
+    estimator_lr: null
     estimator_warmup_epochs: 1
     initialize_aux_from_generator_on_fit_start: true
     unfrozen_range: except_map_encoder
     ema_weight: 0.99
     ema_start_step: 50
+    # use_ema=false 면 EMA generator 미사용(online generator 로 eval).
+    use_ema: true
     # Manual gradient clip used inside self-forced training_step / estimator
     # update. Lightning's `Trainer(gradient_clip_val=...)` cannot be used
     # because manual optimization is on; the model reads this value and

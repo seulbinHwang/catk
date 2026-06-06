@@ -1,0 +1,2 @@
+===== lr×clip sweep 시작 Thu Jun  4 09:29:42 AM KST 2026 GPU=3 (cadence 4x:1, critic 1.0e-4, ode 16) =====
+>>> [em_g3e6] gen_lr=3.0e-6 critic_lr=1.0e-4 cadence=16:1 (updates=4) grad_clip=10.0  (09:29)

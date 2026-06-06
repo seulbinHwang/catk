@@ -1,0 +1,9 @@
+[dmd_run] scene=1000a444aa94927d
+[dmd_run] MODE=overfit ACTION=finetune GPU=3
+  GEN_LR=1e-6  CRITIC_LR=1e-5  scope=except_map_encoder
+  anchor: n=4 stride=4  cadence(critic:gen)=12:1 (updates=3)
+  dmd_beta=1  G(n_rollouts)=4  ODE=16(full_bp=true)  noise=1.0  clip=10.0  warmup=0
+  ckpt=logs/pretrained/pretrained.ckpt  wandb=se99an/clsft-catk
+  STDOUT_LOG=/home2/pnc2/repos_python/kinematic_flow/artifacts/dmd_overfit_1000a444aa94927d_velhead_g1e-5_c1e-5_a4u3_gpu3_0604_110649.log
+[dmd_run] done. log=artifacts/dmd_overfit_1000a444aa94927d_velhead_g1e-5_c1e-5_a4u3_gpu3_0604_110649.log
+[dmd_run] 추세 평가:  conda run -n catk python tools/eval_rmm_trend.py $(grep -oE 'clsft-catk/runs/[a-z0-9]+' artifacts/dmd_overfit_1000a444aa94927d_velhead_g1e-5_c1e-5_a4u3_gpu3_0604_110649.log | tail -1 | sed 's#.*/##')
