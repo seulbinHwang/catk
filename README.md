@@ -2315,7 +2315,7 @@ scripts/launch_self_forced_a100x4x2_static_pods.py
 - `model.model_config.lr=1.0e-6`
 - `model.model_config.self_forced.estimator_warmup_epochs=1`
 - `model.model_config.self_forced.use_stop_motion=false`
-- `data.train_batch_size=22`, OOM 시 launcher가 모든 pod의 attempt status를 모아 `22 -> 20 -> 18 -> ...` 순서로 함께 낮춤
+- `data.train_batch_size=160`, OOM 시 launcher가 모든 pod의 attempt status를 모아 `160 -> 144 -> 128 -> ...` 순서로 함께 낮춤
 - `data.val_batch_size=8`, `model.model_config.scorer_scene_num=1680`
 
 pretrained checkpoint는 W&B artifact에서 자동으로 내려받습니다.
@@ -2367,8 +2367,9 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py --replace
 ```bash
 python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
   --replace \
-  --task-name flow_self_forced_dmd_a100x4x2_testa_smoke_bs18 \
+  --task-name flow_self_forced_dmd_a100x4x2_testa_smoke_bs160 \
   --session catk-self-forced-dmd-a100x4x2-testa-smoke \
+  --initial-bs 160 \
   --max-epochs 1 \
   --limit-train-batches 2 \
   --limit-val-batches 0
@@ -2381,7 +2382,7 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
 | pods | `testa` 4 A100 + `testaa` 4 A100 |
 | branch | `semi_control_stable` |
 | experiment | `self_forced_npfm_a100x4x2` |
-| default task | `flow_self_forced_dmd_a100x4x2_testa_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs18_frac010_ep16_oomretry` |
+| default task | `flow_self_forced_dmd_a100x4x2_testa_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs160_frac010_ep16_middle_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | checkpoint 의미 | `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` epoch 61 Generator, artifact metadata epoch 62 / global step 278192, 원 파일명 `epoch_last.ckpt` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_a100x4x2_testa_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
@@ -2408,11 +2409,19 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
 | train data fraction | `data.train_epoch_sample_fraction=0.1` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1` |
 | epochs | `16` |
-| initial train batch | per-rank `18`, effective global batch `144` |
-| OOM fallback | `18 -> 17 -> ...`, latest self-forced checkpoint resume |
+| initial train batch | per-rank `160`, effective global batch `1280` |
+| OOM fallback | `160 -> 144 -> 128 -> ... -> 64`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-a100x4x2-testa` |
+
+2026-06-06 A100x4x2 `unfrozen_range=middle` probe 결과, `bs32` 20 train step,
+`bs128` 20 train step, `bs160` 8 train step이 모두 CUDA OOM 없이 종료되었습니다.
+관측된 W&B peak reserved는 각각 약 `24.1%`, `74.8%`, `83.8%`였습니다.
+`bs160`은 A100 80GB 기준 아직 headroom이 남아 있고, `unfrozen_range=middle`에서
+학습 파라미터 범위가 줄어든 현재 기본 설정에 맞으므로 DMD A100x4x2 wrapper의
+기본 시작 batch로 사용합니다. rare heavy batch에서 OOM이 나면 launcher가 최신
+self-forced checkpoint에서 batch를 16씩 낮춰 재개합니다.
 
 tmux 확인:
 
