@@ -383,7 +383,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3")
     parser.add_argument("--nproc-per-node", type=int, default=4)
     parser.add_argument("--initial-bs", type=int, default=160)
-    parser.add_argument("--oom-step", type=int, default=8)
+    parser.add_argument("--oom-step", type=int, default=16)
     parser.add_argument("--min-bs", type=int, default=64)
     parser.add_argument("--val-batch-size", default="8")
     parser.add_argument("--test-batch-size", default="8")

@@ -2498,7 +2498,7 @@ python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py \
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, every 2 epochs |
 | epochs | `16` |
 | initial train batch | per-rank `160`, effective global batch `640` |
-| OOM fallback | `160 -> 152 -> 144 -> ... -> 64`, latest self-forced checkpoint resume |
+| OOM fallback | `160 -> 144 -> 128 -> ... -> 64`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-a100x4-testa` |
