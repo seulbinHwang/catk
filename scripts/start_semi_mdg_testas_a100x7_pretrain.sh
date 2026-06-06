@@ -18,11 +18,17 @@ BASE_LR="${BASE_LR:-0.0006}"
 WANDB_MODE="${WANDB_MODE:-online}"
 SESSION="${SESSION:-catk-semi-mdg-testas-a100x7}"
 BRANCH="${BRANCH:-semi_mdg}"
+TRAIN_SIDECAR_DIR="${TRAIN_SIDECAR_DIR:-}"
 
 SHORT_SHA="$(git rev-parse --short HEAD)"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 LR_TAG="$(awk -v base="$BASE_LR" -v bs="$INITIAL_BS" -v ref="$BASE_GLOBAL_BATCH_SIZE" 'BEGIN { lr = base * sqrt((bs * 7) / ref); printf "lr%.0fe-8", lr * 1e8 }')"
 TASK_NAME="${TASK_NAME:-semi_mdg_pretrain_testas_a100x7_from_scratch_${STAMP}_${SHORT_SHA}_bs${INITIAL_BS}_${LR_TAG}}"
+
+EXTRA_ARGS=()
+if [[ -n "$TRAIN_SIDECAR_DIR" ]]; then
+  EXTRA_ARGS+=(--train-sidecar-dir "$TRAIN_SIDECAR_DIR")
+fi
 
 python scripts/launch_mdg_testas_a100x7.py \
   --replace \
@@ -36,4 +42,5 @@ python scripts/launch_mdg_testas_a100x7.py \
   --auto-sqrt-lr \
   --base-lr "$BASE_LR" \
   --base-global-batch-size "$BASE_GLOBAL_BATCH_SIZE" \
+  "${EXTRA_ARGS[@]}" \
   "$@"

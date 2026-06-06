@@ -95,19 +95,22 @@ class TokenProcessor(torch.nn.Module):
         traj_pos = data["map_save"]["traj_pos"]  # [n_pl, 3, 2]
         traj_theta = data["map_save"]["traj_theta"]  # [n_pl]
 
-        traj_pos_local, _ = transform_to_local(
-            pos_global=traj_pos,  # [n_pl, 3, 2]
-            head_global=None,  # [n_pl, 1]
-            pos_now=traj_pos[:, 0],  # [n_pl, 2]
-            head_now=traj_theta,  # [n_pl]
-        )
-        # [1, n_token, 3, 2] - [n_pl, 1, 3, 2]
-        dist = torch.sum(
-            (self.map_token_sample_pt - traj_pos_local.unsqueeze(1)) ** 2,
-            dim=(-2, -1),
-        )  # [n_pl, n_token]
+        if "semi_mdg_sidecar_map_token" in data["pt_token"]:
+            token_idx = data["pt_token"]["semi_mdg_sidecar_map_token"].long()
+        else:
+            traj_pos_local, _ = transform_to_local(
+                pos_global=traj_pos,  # [n_pl, 3, 2]
+                head_global=None,  # [n_pl, 1]
+                pos_now=traj_pos[:, 0],  # [n_pl, 2]
+                head_now=traj_theta,  # [n_pl]
+            )
+            # [1, n_token, 3, 2] - [n_pl, 1, 3, 2]
+            dist = torch.sum(
+                (self.map_token_sample_pt - traj_pos_local.unsqueeze(1)) ** 2,
+                dim=(-2, -1),
+            )  # [n_pl, n_token]
 
-        token_idx = torch.argmin(dist, dim=-1)
+            token_idx = torch.argmin(dist, dim=-1)
 
         tokenized_map = {
             "position": traj_pos[:, 0].contiguous(),  # [n_pl, 2]

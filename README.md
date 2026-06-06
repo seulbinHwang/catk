@@ -108,6 +108,50 @@ CACHE_ROOT=/workspace/womd_v1_3/SMART_cache
 
 학습에는 `training/*.pkl`과 `validation/*.pkl`이 필요하고, closed-loop WOSAC validation에는 validation TFRecord split도 필요합니다.
 
+### Semi-MDG token/flow sidecar
+
+학습 속도 병목인 deterministic token/flow target은 sidecar로 미리 계산할 수 있습니다. 이 sidecar는 학습 전용입니다. validation, closed-loop rollout, WOSAC metric, submission 경로는 기존 cache를 그대로 사용합니다.
+
+생성되는 sidecar는 기존 cache를 수정하지 않고 별도 폴더에 저장됩니다.
+
+```text
+${CACHE_ROOT}/semi_mdg_sidecar/training/*.pkl
+```
+
+testas A100 x7 pod 안에서 전체 training split을 7개 shard로 나누어 생성하려면:
+
+```bash
+cd /mnt/nuplan/projects/catk
+CACHE_ROOT=/workspace/womd_v1_3/SMART_cache \
+SIDECAR_ROOT=/workspace/womd_v1_3/SMART_cache/semi_mdg_sidecar \
+bash scripts/precompute_semi_mdg_sidecar_a100x7.sh
+```
+
+작은 smoke는 `LIMIT`으로 줄일 수 있습니다.
+
+```bash
+LIMIT=128 bash scripts/precompute_semi_mdg_sidecar_a100x7.sh
+```
+
+sidecar를 사용해 학습하려면 `data.train_sidecar_dir`를 지정합니다. testas launcher에서는 `TRAIN_SIDECAR_DIR` 환경변수를 쓰면 됩니다.
+
+```bash
+TRAIN_SIDECAR_DIR=/workspace/womd_v1_3/SMART_cache/semi_mdg_sidecar/training \
+bash scripts/start_semi_mdg_testas_a100x7_pretrain.sh
+```
+
+sidecar가 켜졌는데 특정 scenario의 sidecar file이 없으면 학습은 즉시 실패합니다. 조용히 기존 on-the-fly path로 fallback하지 않습니다. 이는 sidecar target과 on-the-fly target이 섞이는 실험을 막기 위한 fail-fast 정책입니다.
+
+2026-06-06 testas 검증:
+
+| check | result |
+| --- | --- |
+| sidecar format | `semi_mdg_token_flow_sidecar_v1` |
+| batch 20 equality | map token, context token, flow target, loss mask, agent type/length all matched |
+| token/flow target time | on-the-fly `51.47ms` -> sidecar `0.54ms` |
+| 1-GPU train smoke | 2 train batches passed |
+| 7-GPU DDP smoke | 1 train batch passed |
+
 ## H100 x3x2 학습
 
 대상 pod:

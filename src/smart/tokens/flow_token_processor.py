@@ -24,6 +24,18 @@ from src.smart.utils import transform_to_local, validate_flow_window_steps
 
 FLOW_CONTEXT_TOKEN_COUNT = 18
 FLOW_TRAIN_ANCHOR_COUNT = 16
+SIDECAR_PREFIX = "semi_mdg_sidecar_"
+SIDECAR_AGENT_KEYS = (
+    "ctx_token",
+    "ctx_pos",
+    "ctx_heading",
+    "ctx_valid",
+    "token_agent_shape",
+    "flow_mask",
+    "flow_clean_norm_dense",
+    "flow_clean_metric_norm_dense",
+    "flow_loss_mask_dense",
+)
 
 
 class FlowTokenProcessor(TokenProcessor):
@@ -105,6 +117,10 @@ class FlowTokenProcessor(TokenProcessor):
                 지도 토큰 사전과 에이전트 토큰 사전입니다.
         """
         tokenized_map = self.tokenize_map(data)
+        if self.training and self._has_train_sidecar(data):
+            tokenized_agent = self._tokenize_agent_train_from_sidecar(data=data)
+            return tokenized_map, tokenized_agent
+
         tokenized_agent, processed_agent = self.tokenize_agent(
             data,
             return_preprocessed=True,
@@ -115,6 +131,106 @@ class FlowTokenProcessor(TokenProcessor):
             processed_agent=processed_agent,
         )
         return tokenized_map, tokenized_agent
+
+    def _has_train_sidecar(self, data: HeteroData) -> bool:
+        agent_store = data["agent"]
+        return all(f"{SIDECAR_PREFIX}{key}" in agent_store for key in SIDECAR_AGENT_KEYS)
+
+    @staticmethod
+    def _pack_anchor_dense(values: Tensor, anchor_mask: Tensor) -> Tensor:
+        """Dense ``[agent, anchor, ...]`` sidecar를 기존 anchor-major 순서로 펼칩니다."""
+        if values.shape[:2] != anchor_mask.shape:
+            raise ValueError(
+                "Sidecar dense field must start with [num_agent, num_anchor]: "
+                f"values={tuple(values.shape)}, anchor_mask={tuple(anchor_mask.shape)}."
+            )
+        permute_dims = (1, 0, *range(2, values.ndim))
+        return values.permute(permute_dims)[anchor_mask.t()].contiguous()
+
+    @staticmethod
+    def _pack_anchor_vector(values: Tensor, anchor_mask: Tensor) -> Tensor:
+        if values.ndim != 1:
+            raise ValueError(f"Expected 1D vector for anchor packing, got {tuple(values.shape)}.")
+        dense = values[:, None].expand(-1, anchor_mask.shape[1])
+        return dense.t()[anchor_mask.t()].contiguous()
+
+    def _tokenize_agent_train_from_sidecar(self, data: HeteroData) -> Dict[str, Tensor]:
+        """사전 계산한 deterministic semi_mdg token/flow target을 학습 tensor로 복원합니다."""
+        agent_store = data["agent"]
+        agent_type = agent_store["type"]
+        agent_shape = agent_store["shape"]
+        flow_train_mask = agent_store[f"{SIDECAR_PREFIX}flow_mask"].bool()
+        expected_anchor_count = FLOW_TRAIN_ANCHOR_COUNT
+        expected_window_steps = self.flow_window_steps
+        if flow_train_mask.ndim != 2 or flow_train_mask.shape[1] != expected_anchor_count:
+            raise ValueError(
+                "semi_mdg sidecar flow_mask must have shape [num_agent, 16], "
+                f"got {tuple(flow_train_mask.shape)}."
+            )
+
+        flow_clean_norm_dense = agent_store[f"{SIDECAR_PREFIX}flow_clean_norm_dense"]
+        flow_clean_metric_norm_dense = agent_store[f"{SIDECAR_PREFIX}flow_clean_metric_norm_dense"]
+        flow_loss_mask_dense = agent_store[f"{SIDECAR_PREFIX}flow_loss_mask_dense"].bool()
+        if flow_clean_norm_dense.shape[2] != expected_window_steps:
+            raise ValueError(
+                "semi_mdg sidecar flow_clean_norm_dense uses an unexpected horizon: "
+                f"expected={expected_window_steps}, actual={flow_clean_norm_dense.shape[2]}."
+            )
+        if flow_clean_metric_norm_dense.shape[2] != expected_window_steps:
+            raise ValueError(
+                "semi_mdg sidecar flow_clean_metric_norm_dense uses an unexpected horizon: "
+                f"expected={expected_window_steps}, actual={flow_clean_metric_norm_dense.shape[2]}."
+            )
+        if flow_loss_mask_dense.shape != flow_train_mask.shape + (expected_window_steps,):
+            raise ValueError(
+                "semi_mdg sidecar flow_loss_mask_dense must have shape [num_agent, 16, flow_window_steps], "
+                f"got {tuple(flow_loss_mask_dense.shape)}."
+            )
+
+        tokenized_agent = {
+            "num_graphs": data.num_graphs,
+            "type": agent_type,
+            "shape": agent_shape,
+            "ego_mask": agent_store["role"][:, 0],
+            "token_agent_shape": agent_store[f"{SIDECAR_PREFIX}token_agent_shape"],
+            "batch": agent_store["batch"],
+            "ctx_sampled_idx": agent_store[f"{SIDECAR_PREFIX}ctx_token"].long(),
+            "ctx_sampled_pos": agent_store[f"{SIDECAR_PREFIX}ctx_pos"],
+            "ctx_sampled_heading": agent_store[f"{SIDECAR_PREFIX}ctx_heading"],
+            "ctx_valid": agent_store[f"{SIDECAR_PREFIX}ctx_valid"].bool(),
+            "flow_train_mask": flow_train_mask,
+            "flow_train_clean_norm": self._pack_anchor_dense(
+                values=flow_clean_norm_dense,
+                anchor_mask=flow_train_mask,
+            ),
+            "flow_train_clean_metric_norm": self._pack_anchor_dense(
+                values=flow_clean_metric_norm_dense,
+                anchor_mask=flow_train_mask,
+            ),
+            "flow_train_loss_mask": self._pack_anchor_dense(
+                values=flow_loss_mask_dense,
+                anchor_mask=flow_train_mask,
+            ).bool(),
+            "flow_train_agent_type": self._pack_anchor_vector(
+                values=agent_type,
+                anchor_mask=flow_train_mask,
+            ),
+            "flow_train_agent_length": self._pack_anchor_vector(
+                values=agent_shape[:, 0],
+                anchor_mask=flow_train_mask,
+            ),
+        }
+        for k in ["veh", "ped", "cyc"]:
+            tokenized_agent[f"trajectory_token_{k}"] = getattr(
+                self, f"agent_token_all_{k}"
+            ).flatten(1, 3)
+            tokenized_agent[f"token_bank_all_{k}"] = getattr(self, f"agent_token_all_{k}")
+
+        self._assert_flow_train_anchor_context_valid(
+            flow_train_mask=flow_train_mask,
+            ctx_valid=tokenized_agent["ctx_valid"],
+        )
+        return tokenized_agent
 
     def _build_flow_targets(
         self,

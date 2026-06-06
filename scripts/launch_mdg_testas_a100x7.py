@@ -65,6 +65,15 @@ def default_task_name() -> str:
 
 def render_remote_run_script(args: argparse.Namespace, run_root: str) -> str:
     extra_overrides = args.extra_hydra_overrides.strip()
+    if args.train_sidecar_dir:
+        extra_overrides = " ".join(
+            part
+            for part in [
+                extra_overrides,
+                f"data.train_sidecar_dir={args.train_sidecar_dir}",
+            ]
+            if part
+        )
     if args.wandb_mode == "offline":
         extra_overrides = " ".join(
             part
@@ -208,6 +217,7 @@ log "semi_mdg testas A100x7 pretrain launcher"
 log "task_name={args.task_name}"
 log "experiment={args.experiment}"
 log "cache_root={args.cache_root}"
+log "train_sidecar_dir={args.train_sidecar_dir or '<disabled>'}"
 log "nproc_per_node={args.nproc_per_node}"
 log "initial_bs={args.initial_bs} oom_step={args.oom_step} min_bs={args.min_bs}"
 log "val_batch_size={args.val_batch_size} max_epochs={args.max_epochs}"
@@ -386,6 +396,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project-root", default=DEFAULT_PROJECT_ROOT)
     parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or current_branch())
     parser.add_argument("--cache-root", default=DEFAULT_CACHE_ROOT)
+    parser.add_argument(
+        "--train-sidecar-dir",
+        default="",
+        help="Optional Semi-MDG training sidecar directory. Missing sidecars fail fast.",
+    )
     parser.add_argument("--remote-log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=default_task_name())

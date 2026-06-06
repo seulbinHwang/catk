@@ -67,6 +67,7 @@ class MultiDataModule(LightningDataModule):
         pin_memory: bool,
         persistent_workers: bool,
         train_max_num: int,
+        train_sidecar_dir: Optional[str] = None,
         train_use_eval_agent_selection: bool = False,
         train_epoch_sample_fraction: float = 1.0,
         train_memory_balanced_batches: bool = False,
@@ -115,6 +116,7 @@ class MultiDataModule(LightningDataModule):
         self.val_raw_dir = val_raw_dir
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
+        self.train_sidecar_dir = train_sidecar_dir
 
         self.train_transform = build_train_agent_target_builder(
             train_max_num=train_max_num,
@@ -135,7 +137,11 @@ class MultiDataModule(LightningDataModule):
         """
         if train_raw_dir is not None:
             self.train_raw_dir = str(train_raw_dir)
-        self.train_dataset = MultiDataset(self.train_raw_dir, self.train_transform)
+        self.train_dataset = MultiDataset(
+            self.train_raw_dir,
+            self.train_transform,
+            sidecar_dir=self.train_sidecar_dir,
+        )
 
     def setup(self, stage: Optional[str] = None) -> None:
         if stage == "fit" or stage is None:
