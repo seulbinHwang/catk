@@ -16,7 +16,7 @@
 #   * Generator lr: 1e-6
 #   * self_forced.estimator_warmup_epochs=1
 #   * self_forced.use_stop_motion=false for the training self-rollout
-#   * data.train_batch_size=160
+#   * data.train_batch_size=20
 # ============================================================================
 
 defaults:
@@ -37,7 +37,7 @@ model:
       estimator_warmup_epochs: 1
 
 data:
-  train_batch_size: 160
+  train_batch_size: 20
   val_batch_size: 8
   test_batch_size: 8
   num_workers: 4
