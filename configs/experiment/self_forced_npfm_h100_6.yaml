@@ -116,3 +116,4 @@ data:
   prefetch_factor: 1
   train_use_eval_agent_selection: true
   train_epoch_sample_fraction: 0.25
+  train_memory_balanced_batches: true

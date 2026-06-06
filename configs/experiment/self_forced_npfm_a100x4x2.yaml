@@ -42,3 +42,4 @@ data:
   test_batch_size: 8
   num_workers: 4
   prefetch_factor: 1
+  train_memory_balanced_batches: true
