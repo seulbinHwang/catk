@@ -804,6 +804,30 @@ epoch 58 checkpoint를 다시 제출하려면 아래 preset을 그대로 쓴다.
 bash scripts/start_smart_ntp_a100x4x2_testa_waymo_val_submission_epoch058.sh
 ```
 
+`smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_fresh_20260601`
+학습의 마지막 checkpoint, 즉 user-facing epoch 64 / zero-based epoch 63의
+`epoch_last.ckpt`로 validation leaderboard 제출물을 만들고 자동 업로드하려면 아래 preset을
+쓴다.
+
+```bash
+bash scripts/start_smart_ntp_a100x4x2_testa_waymo_val_submission_epoch064.sh
+```
+
+이 preset의 기본값은 아래와 같다.
+
+| 항목 | 값 |
+|---|---|
+| checkpoint | `/mnt/nuplan/projects/catk/logs/smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_fresh_20260601/runs/2026-06-05_08-20-25/checkpoints/epoch_last.ckpt` |
+| task name | `smart_ntp_waymo_val_epoch064_a100x4x2_main_original_legacy_inputs_trainselectfalse` |
+| method_name | `SMART_7M` |
+| description | `smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_fresh_20260601` |
+| split | validation only |
+| upload | `waymo_submission.enabled=true`, `submit_validate=true`, `submit_test=false` |
+| storage state 기본 경로 | `/tmp/catk_smart_ntp_a100x4x2_legacy_inputs_oom_retry_main/secrets/waymo/waymo_storage_state.json` |
+
+다른 checkpoint나 metadata를 쓰고 싶으면 `CKPT_PATH`, `METHOD_NAME`,
+`SUBMISSION_DESCRIPTION`, `TASK_NAME`, `WAYMO_STORAGE_STATE_PATH` 환경변수로 덮어쓴다.
+
 기본값은 아래와 같다.
 
 ```text

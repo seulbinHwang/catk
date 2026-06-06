@@ -25,6 +25,11 @@ POLL_SUBMISSION_STATUS="${POLL_SUBMISSION_STATUS:-false}"
 WAYMO_UPLOAD_TIMEOUT_MS="${WAYMO_UPLOAD_TIMEOUT_MS:-7200000}"
 GIT_REF="${GIT_REF:-origin/main}"
 NO_PULL="${NO_PULL:-false}"
+METHOD_NAME="${METHOD_NAME:-}"
+SUBMISSION_DESCRIPTION="${SUBMISSION_DESCRIPTION:-}"
+SUBMISSION_ACCOUNT_NAME="${SUBMISSION_ACCOUNT_NAME:-}"
+SUBMISSION_AUTHORS="${SUBMISSION_AUTHORS:-}"
+SUBMISSION_AFFILIATION="${SUBMISSION_AFFILIATION:-}"
 
 if [[ -z "${CKPT_PATH}" ]]; then
   echo "ERROR: CKPT_PATH is required." >&2
@@ -53,6 +58,22 @@ extra_overrides=(
 
 if [[ -n "${WAYMO_STORAGE_STATE_PATH:-}" ]]; then
   extra_overrides+=("waymo_submission.storage_state_path=${WAYMO_STORAGE_STATE_PATH}")
+fi
+if [[ -n "${METHOD_NAME}" ]]; then
+  extra_overrides+=("model.model_config.sim_agents_submission.method_name=${METHOD_NAME}")
+fi
+if [[ -n "${SUBMISSION_DESCRIPTION}" ]]; then
+  extra_overrides+=("model.model_config.sim_agents_submission.description=${SUBMISSION_DESCRIPTION}")
+  extra_overrides+=("submission.description=${SUBMISSION_DESCRIPTION}")
+fi
+if [[ -n "${SUBMISSION_ACCOUNT_NAME}" ]]; then
+  extra_overrides+=("model.model_config.sim_agents_submission.account_name=${SUBMISSION_ACCOUNT_NAME}")
+fi
+if [[ -n "${SUBMISSION_AUTHORS}" ]]; then
+  extra_overrides+=("model.model_config.sim_agents_submission.authors=${SUBMISSION_AUTHORS}")
+fi
+if [[ -n "${SUBMISSION_AFFILIATION}" ]]; then
+  extra_overrides+=("model.model_config.sim_agents_submission.affiliation=${SUBMISSION_AFFILIATION}")
 fi
 
 printf -v extra_hydra_string '%q ' "${extra_overrides[@]}"
