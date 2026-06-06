@@ -199,6 +199,75 @@ find_latest_epoch_last_ckpt() {
   kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "$cmd" 2>/dev/null | tr -d '\r'
 }
 
+remote_file_sha256() {
+  local pod="$1"
+  local path="$2"
+  local path_q cmd
+  path_q="$(remote_quote "$path")"
+  cmd="if [[ -f ${path_q} ]]; then sha256sum ${path_q} | awk '{print \$1}'; fi"
+  kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "$cmd" 2>/dev/null | tr -d '\r'
+}
+
+remote_file_size() {
+  local pod="$1"
+  local path="$2"
+  local path_q cmd
+  path_q="$(remote_quote "$path")"
+  cmd="if [[ -f ${path_q} ]]; then stat -c %s ${path_q}; fi"
+  kubectl exec -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "$cmd" 2>/dev/null | tr -d '\r'
+}
+
+sync_checkpoint_to_peer_pods() {
+  local ckpt_path="$1"
+  local pod master_sha master_size peer_sha peer_size
+  local ckpt_q ckpt_dir ckpt_dir_q tmp_path tmp_q install_cmd
+
+  if [[ -z "$ckpt_path" || "$DRY_RUN" == "1" ]]; then
+    return 0
+  fi
+
+  master_size="$(remote_file_size "$MASTER_POD" "$ckpt_path")"
+  master_sha="$(remote_file_sha256 "$MASTER_POD" "$ckpt_path")"
+  if [[ -z "$master_size" || -z "$master_sha" ]]; then
+    log "ERROR: resume checkpoint is not readable on master pod ${MASTER_POD}: ${ckpt_path}"
+    return 1
+  fi
+
+  for pod in "${POD_ARRAY[@]}"; do
+    if [[ "$pod" == "$MASTER_POD" ]]; then
+      continue
+    fi
+
+    peer_size="$(remote_file_size "$pod" "$ckpt_path")"
+    peer_sha="$(remote_file_sha256 "$pod" "$ckpt_path")"
+    if [[ "$peer_size" == "$master_size" && "$peer_sha" == "$master_sha" ]]; then
+      log "resume checkpoint already synced on ${pod}: ${ckpt_path} (${master_size} bytes)"
+      continue
+    fi
+
+    log "syncing resume checkpoint ${MASTER_POD} -> ${pod}: ${ckpt_path} (${master_size} bytes)"
+    ckpt_q="$(remote_quote "$ckpt_path")"
+    ckpt_dir="$(dirname "$ckpt_path")"
+    ckpt_dir_q="$(remote_quote "$ckpt_dir")"
+    tmp_path="${ckpt_path}.tmp.$$"
+    tmp_q="$(remote_quote "$tmp_path")"
+    install_cmd="set -Eeuo pipefail; mkdir -p ${ckpt_dir_q}; cat > ${tmp_q}; mv ${tmp_q} ${ckpt_q}"
+    if ! kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "cat ${ckpt_q}" \
+      | kubectl exec -i -n "$NAMESPACE" "$pod" -c "$CONTAINER" -- bash -lc "$install_cmd"; then
+      log "ERROR: failed to sync checkpoint to ${pod}: ${ckpt_path}"
+      return 1
+    fi
+
+    peer_size="$(remote_file_size "$pod" "$ckpt_path")"
+    peer_sha="$(remote_file_sha256 "$pod" "$ckpt_path")"
+    if [[ "$peer_size" != "$master_size" || "$peer_sha" != "$master_sha" ]]; then
+      log "ERROR: synced checkpoint verification failed on ${pod}: size=${peer_size}/${master_size}, sha=${peer_sha}/${master_sha}"
+      return 1
+    fi
+    log "synced resume checkpoint on ${pod}: ${ckpt_path}"
+  done
+}
+
 stop_attempt_sessions() {
   local -a cmd=(
     "$PYTHON_BIN" scripts/launch_smart_ntp_h100x4_h100x2.py
@@ -391,6 +460,7 @@ while (( bs >= MIN_BS )); do
 
   if [[ -n "$latest_ckpt" ]]; then
     log "Attempt #${attempt}: bs=${bs}, resume ckpt=${latest_ckpt}"
+    sync_checkpoint_to_peer_pods "$latest_ckpt"
   else
     log "Attempt #${attempt}: bs=${bs}, fresh fit (no checkpoint found yet)"
   fi

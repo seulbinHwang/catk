@@ -269,7 +269,10 @@ bash scripts/start_smart_ntp_h100x4_h100x2_trajtok_pretrain_oom_retry.sh
 pod별 GPU 수가 다른 경우에도 각 local rank를 명시적으로 배정한다. 실행 전 두 pod의
 `PROJECT_ROOT`를 `origin/trajtok`으로 맞춘 뒤 tmux session을 시작한다. CUDA OOM marker가
 pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `epoch_last.ckpt` 또는
-`last.ckpt`를 찾아 `data.train_batch_size`를 `OOM_STEP`만큼 낮춰 재시작한다.
+`last.ckpt`를 찾아 peer pod의 같은 절대 경로로 sha256 검증까지 동기화한 뒤
+`data.train_batch_size`를 `OOM_STEP`만큼 낮춰 재시작한다. 이 동기화는
+`hsb-npc-training`에 저장된 rank0 checkpoint가 `wo-pvc-2`의 `/mnt/nuplan`에 바로
+보이지 않는 경우에도 resume attempt가 DDP join 전에 실패하지 않도록 보장한다.
 
 기본값 기준 실행되는 실험은 아래와 같다.
 
@@ -285,7 +288,7 @@ pod log에서 발견되면 모든 rank를 중단하고, 같은 task의 최신 `e
 | decoder | `hidden_dim=128`, `num_heads=8`, `head_dim=16`, `num_map_layers=3`, `num_agent_layers=6` |
 | model parameters | `8,580,025` total / trainable, 직접 SMART instantiate로 측정 |
 | train batch | `INITIAL_BS=18` per rank, effective global batch 108 |
-| OOM retry | `MIN_BS=14`, `OOM_STEP=2`, latest task checkpoint resume (`18 -> 16 -> 14`); retry attempt마다 LR도 현재 global batch 기준으로 재계산 |
+| OOM retry | `MIN_BS=14`, `OOM_STEP=2`, latest task checkpoint sync+resume (`18 -> 16 -> 14`); retry attempt마다 LR도 현재 global batch 기준으로 재계산 |
 | validation/test batch | `VAL_BATCH_SIZE=12`, `TEST_BATCH_SIZE=12` |
 | optimizer schedule | `lr=5.809475e-4`, `lr_warmup_steps=4`, `lr_min_ratio=1e-2`; LR follows sqrt scaling from total batch 80의 `5e-4` 기준 to effective batch 108 |
 | precision / grad accumulation | `bf16-mixed`, `accumulate_grad_batches=1` |
