@@ -79,7 +79,8 @@ def export_line(name: str, value: object) -> str:
 
 def run_root(args: argparse.Namespace) -> str:
     safe_task = args.task_name.replace("/", "_")
-    return f"{args.log_dir.rstrip('/')}/tmux_self_forced_dmd_a100x4_testa/{safe_task}"
+    safe_pod = args.pod.replace("/", "_")
+    return f"{args.log_dir.rstrip('/')}/tmux_self_forced_dmd_a100x4_{safe_pod}/{safe_task}"
 
 
 def render_env(args: argparse.Namespace) -> str:
@@ -130,7 +131,7 @@ def render_env(args: argparse.Namespace) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_worker_script(project_root: str, env_file: str) -> str:
+def render_worker_script(project_root: str, env_file: str, pod_label: str) -> str:
     return f"""#!/usr/bin/env bash
 set +e
 export TERM="${{TERM:-xterm-256color}}"
@@ -153,17 +154,17 @@ set -a
 source {shq(env_file)}
 set +a
 
-echo "[self-forced-dmd-a100x4-testa] pod=$(hostname) task=${{TASK_NAME}}"
-echo "[self-forced-dmd-a100x4-testa] started at $(date '+%F %T')"
-echo "[self-forced-dmd-a100x4-testa] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}} min_bs=${{MIN_BS}}"
-echo "[self-forced-dmd-a100x4-testa] lr=${{CATK_LR}} fraction=${{TRAIN_EPOCH_SAMPLE_FRACTION}} memory_balanced=${{TRAIN_MEMORY_BALANCED_BATCHES}} sample_steps=16 backprop_last_k=${{BACKPROP_LAST_K}}"
-echo "[self-forced-dmd-a100x4-testa] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
-echo "[self-forced-dmd-a100x4-testa] pretrain_ckpt=${{PRETRAIN_CKPT}}"
+echo "[self-forced-dmd-a100x4-{pod_label}] pod=$(hostname) task=${{TASK_NAME}}"
+echo "[self-forced-dmd-a100x4-{pod_label}] started at $(date '+%F %T')"
+echo "[self-forced-dmd-a100x4-{pod_label}] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}} min_bs=${{MIN_BS}}"
+echo "[self-forced-dmd-a100x4-{pod_label}] lr=${{CATK_LR}} fraction=${{TRAIN_EPOCH_SAMPLE_FRACTION}} memory_balanced=${{TRAIN_MEMORY_BALANCED_BATCHES}} sample_steps=16 backprop_last_k=${{BACKPROP_LAST_K}}"
+echo "[self-forced-dmd-a100x4-{pod_label}] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
+echo "[self-forced-dmd-a100x4-{pod_label}] pretrain_ckpt=${{PRETRAIN_CKPT}}"
 echo
 
 ensure_pretrain_checkpoint() {{
   if [[ -f "$PRETRAIN_CKPT" ]]; then
-    echo "[self-forced-dmd-a100x4-testa] using cached pretrain checkpoint: $PRETRAIN_CKPT"
+    echo "[self-forced-dmd-a100x4-{pod_label}] using cached pretrain checkpoint: $PRETRAIN_CKPT"
     return 0
   fi
 
@@ -171,7 +172,7 @@ ensure_pretrain_checkpoint() {{
   lock_dir="${{PRETRAIN_CKPT}}.download.lock"
 
   if mkdir "$lock_dir" 2>/dev/null; then
-    echo "[self-forced-dmd-a100x4-testa] downloading W&B artifact: $WANDB_PRETRAIN_ARTIFACT"
+    echo "[self-forced-dmd-a100x4-{pod_label}] downloading W&B artifact: $WANDB_PRETRAIN_ARTIFACT"
     python - <<'PY'
 import glob
 import os
@@ -220,14 +221,14 @@ PY
       return "$status"
     fi
   else
-    echo "[self-forced-dmd-a100x4-testa] waiting for checkpoint download lock: $lock_dir"
+    echo "[self-forced-dmd-a100x4-{pod_label}] waiting for checkpoint download lock: $lock_dir"
     for _ in $(seq 1 180); do
       if [[ -f "$PRETRAIN_CKPT" ]]; then
         return 0
       fi
       sleep 10
     done
-    echo "[self-forced-dmd-a100x4-testa] timed out waiting for $PRETRAIN_CKPT" >&2
+    echo "[self-forced-dmd-a100x4-{pod_label}] timed out waiting for $PRETRAIN_CKPT" >&2
     return 4
   fi
 
@@ -237,7 +238,7 @@ PY
 ensure_pretrain_checkpoint
 status=$?
 if (( status != 0 )); then
-  echo "[self-forced-dmd-a100x4-testa] checkpoint preparation failed with status $status"
+  echo "[self-forced-dmd-a100x4-{pod_label}] checkpoint preparation failed with status $status"
   exec bash
 fi
 
@@ -245,8 +246,8 @@ bash scripts/self_forced_a100_4_with_oom_retry.sh
 status=$?
 
 echo
-echo "[self-forced-dmd-a100x4-testa] exited with status $status at $(date '+%F %T')"
-echo "[self-forced-dmd-a100x4-testa] leaving shell open for inspection"
+echo "[self-forced-dmd-a100x4-{pod_label}] exited with status $status at $(date '+%F %T')"
+echo "[self-forced-dmd-a100x4-{pod_label}] leaving shell open for inspection"
 exec bash
 """
 
@@ -322,7 +323,7 @@ cat > {shq(env_file)} <<'CATK_ENV'
 {render_env(args).rstrip()}
 CATK_ENV
 cat > {shq(worker_file)} <<'CATK_WORKER'
-{render_worker_script(args.project_root, env_file).rstrip()}
+{render_worker_script(args.project_root, env_file, args.pod).rstrip()}
 CATK_WORKER
 chmod +x {shq(worker_file)}
 : > {shq(tmux_log)}

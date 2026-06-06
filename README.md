@@ -2525,6 +2525,27 @@ kubectl exec -it -n p-pnc testa -c main -- \
 python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py --stop
 ```
 
+같은 단일 A100x4 recipe를 `testaa` pod에서 별도 task/session으로 돌리려면 아래 wrapper를
+사용합니다. 학습 설정은 위 `testa` launcher와 같고, 기본 pod / task name / tmux session /
+pretrain checkpoint cache 경로만 `testaa` 전용으로 분리됩니다.
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4_testaa_static_pod.py --replace
+```
+
+`testaa` tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testaa -c main -- \
+  tmux attach -t catk-self-forced-dmd-a100x4-testaa
+```
+
+`testaa` 학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4_testaa_static_pod.py --stop
+```
+
 `cache_frozen_map_features=true` 는 self-forced DMD train step 안에서 frozen map encoder의 출력을
 재사용합니다. 기본 `unfrozen_range=middle` 에서는 map encoder가 학습되지 않으므로,
 generated estimator를 한 step 안에서 여러 번 업데이트할 때 같은 map을 반복 인코딩하지 않아도 됩니다.
