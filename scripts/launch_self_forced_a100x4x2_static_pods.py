@@ -1078,6 +1078,18 @@ git pull --ff-only origin {shq(args.branch)}
 if tmux has-session -t {shq(args.session)} 2>/dev/null; then
   tmux kill-session -t {shq(args.session)}
 fi
+TASK_NAME_TO_STOP={shq(args.task_name)}
+mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+if (( ${{#pids[@]}} > 0 )); then
+  echo "[launcher] terminating stale task processes for $TASK_NAME_TO_STOP before replace: ${{pids[*]}}"
+  kill -TERM "${{pids[@]}}" 2>/dev/null || true
+  sleep 10
+  mapfile -t pids < <(pgrep -f "task_name=${{TASK_NAME_TO_STOP}}" 2>/dev/null || true)
+  if (( ${{#pids[@]}} > 0 )); then
+    echo "[launcher] force killing stale task processes for $TASK_NAME_TO_STOP before replace: ${{pids[*]}}"
+    kill -KILL "${{pids[@]}}" 2>/dev/null || true
+  fi
+fi
 """
     else:
         replace_block = f"""
