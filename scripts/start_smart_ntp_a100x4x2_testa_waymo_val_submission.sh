@@ -64,7 +64,6 @@ if [[ -n "${METHOD_NAME}" ]]; then
 fi
 if [[ -n "${SUBMISSION_DESCRIPTION}" ]]; then
   extra_overrides+=("model.model_config.sim_agents_submission.description=${SUBMISSION_DESCRIPTION}")
-  extra_overrides+=("submission.description=${SUBMISSION_DESCRIPTION}")
 fi
 if [[ -n "${SUBMISSION_ACCOUNT_NAME}" ]]; then
   extra_overrides+=("model.model_config.sim_agents_submission.account_name=${SUBMISSION_ACCOUNT_NAME}")
