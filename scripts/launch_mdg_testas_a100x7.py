@@ -185,7 +185,10 @@ export LOG_DIR={shq(args.remote_log_dir)}
 export VAL_BATCH_SIZE={shq(args.val_batch_size)}
 export MAX_EPOCHS={shq(args.max_epochs)}
 export CATK_HYDRA_OVERRIDES={shq(extra_overrides)}
-if [[ -n {shq(args.learning_rate)} ]]; then
+export CATK_AUTO_SQRT_LR={"1" if args.auto_sqrt_lr else "0"}
+export CATK_BASE_LR={shq(args.base_lr)}
+export CATK_BASE_GLOBAL_BATCH_SIZE={shq(args.base_global_batch_size)}
+if [[ "$CATK_AUTO_SQRT_LR" != "1" && -n {shq(args.learning_rate)} ]]; then
   export CATK_LR={shq(args.learning_rate)}
 fi
 if [[ -n {shq(args.limit_train_batches)} ]]; then
@@ -208,10 +211,17 @@ log "cache_root={args.cache_root}"
 log "nproc_per_node={args.nproc_per_node}"
 log "initial_bs={args.initial_bs} oom_step={args.oom_step} min_bs={args.min_bs}"
 log "val_batch_size={args.val_batch_size} max_epochs={args.max_epochs}"
+if [[ "$CATK_AUTO_SQRT_LR" == "1" ]]; then
+  log "auto sqrt lr enabled: base_lr={args.base_lr}, base_global_batch_size={args.base_global_batch_size}"
+fi
 
 while (( bs >= {args.min_bs} )); do
   attempt=$(( attempt + 1 ))
   export TRAIN_BATCH_SIZE="$bs"
+  if [[ "$CATK_AUTO_SQRT_LR" == "1" ]]; then
+    export CATK_LR="$(awk -v base="$CATK_BASE_LR" -v bs="$bs" -v nproc="$NPROC_PER_NODE" -v ref="$CATK_BASE_GLOBAL_BATCH_SIZE" 'BEGIN {{ printf "%.8g", base * sqrt((bs * nproc) / ref) }}')"
+    log "attempt #$attempt: auto sqrt lr=$CATK_LR, global_batch=$(( bs * NPROC_PER_NODE ))"
+  fi
   latest_ckpt="$(find_latest_epoch_last_ckpt)"
   unset CATK_CKPT_PATH
   if [[ -n "$latest_ckpt" ]]; then
@@ -387,6 +397,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-batch-size", default="12")
     parser.add_argument("--max-epochs", default="64")
     parser.add_argument("--learning-rate", default="")
+    parser.add_argument(
+        "--auto-sqrt-lr",
+        action="store_true",
+        help=(
+            "Recompute CATK_LR for each OOM retry attempt as "
+            "base_lr * sqrt((train_batch_size * nproc_per_node) / base_global_batch_size)."
+        ),
+    )
+    parser.add_argument("--base-lr", default="0.0006")
+    parser.add_argument("--base-global-batch-size", default="108")
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--extra-hydra-overrides", default="")
@@ -404,6 +424,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--initial-bs and --min-bs must be >= 1")
     if args.oom_step < 1:
         parser.error("--oom-step must be >= 1")
+    if args.auto_sqrt_lr and args.learning_rate:
+        parser.error("--auto-sqrt-lr and --learning-rate are mutually exclusive")
     return args
 
 

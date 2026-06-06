@@ -163,12 +163,12 @@ python scripts/launch_mdg_h100x3x2_static_pods.py \
 
 ## Testas A100 x7 학습
 
-`testas` 단일 pod에 붙은 A100 80GB 7장을 모두 사용하려면 아래 launcher를 씁니다.
+`testas` 단일 pod에 붙은 A100 80GB 7장을 모두 사용하려면 아래 스크립트를 씁니다.
+스크립트는 기존 `testas` pod를 재시작하지 않고, pod 안의 repo를 `semi_mdg`
+최신 브랜치로 동기화한 뒤 tmux 세션에서 7-GPU DDP 학습을 시작합니다.
 
 ```bash
-python scripts/launch_mdg_testas_a100x7.py \
-  --replace \
-  --task-name semi_mdg_pretrain_testas_a100x7_$(date +%Y%m%d_%H%M%S)
+bash scripts/start_semi_mdg_testas_a100x7_pretrain.sh
 ```
 
 기본 실행 조건은 다음입니다.
@@ -180,6 +180,8 @@ experiment: mdg_pretrain_h100x3x2
 session: catk-semi-mdg-testas-a100x7
 nproc_per_node: 7
 initial_bs: 20 per GPU
+min_bs: 16 per GPU
+oom_step: 2
 effective batch: 140
 val_batch_size: 12 per GPU
 train_memory_balanced_batches: true
@@ -191,23 +193,21 @@ closed-loop validation: n_rollout_closed_val=32, scorer_scene_num=1680
 validation sampling: sample_steps=1, action_reuse=true, antithetic_pairs=true
 optimizer LR: 0.00068313
 OOM retry: train_batch_size를 2씩 낮추고 latest epoch_last.ckpt에서 재시작
+LR retry policy: retry된 train_batch_size 기준으로 sqrt scaling LR 재계산
 ```
 
 Testas 기본 LR은 flow-control baseline의 global batch `108`, LR `6e-4`를
 기준으로 global batch `140`에 sqrt scaling을 적용한 값입니다:
 `6e-4 * sqrt(140 / 108) = 0.00068313`.
 
-`31dd89a` 이후 testas A100x7에서 memory-balanced batching을 켠 뒤 확인한
-결과, per-GPU `30/28/26/24`는 실제 train batch에서 CUDA OOM이 났고
-per-GPU `22`는 2-batch smoke를 통과했지만 peak reserved memory가 약
-`97.37%`로 장기 학습에는 타이트했습니다. 기본값은 8-batch train smoke와
-1680-scene closed-loop validation smoke를 통과한 보수적 안전값
-per-GPU `20`입니다.
+OOM retry가 batch를 낮추면 LR도 같은 규칙으로 다시 계산합니다. 예를 들어
+per-GPU batch가 `18`로 내려가면 global batch는 `126`이고 LR은
+`6e-4 * sqrt(126 / 108) = 0.00064807`입니다.
 
 학습 중지:
 
 ```bash
-python scripts/launch_mdg_testas_a100x7.py \
+bash scripts/start_semi_mdg_testas_a100x7_pretrain.sh \
   --stop \
   --task-name <task_name>
 ```
@@ -215,11 +215,12 @@ python scripts/launch_mdg_testas_a100x7.py \
 짧은 train-only smoke:
 
 ```bash
-python scripts/launch_mdg_testas_a100x7.py \
+bash scripts/start_semi_mdg_testas_a100x7_pretrain.sh \
   --replace \
   --task-name semi_mdg_testas_train_smoke \
   --wandb-mode offline \
-  --initial-bs 16 \
+  --initial-bs 20 \
+  --min-bs 20 \
   --max-epochs 1 \
   --limit-train-batches 2 \
   --limit-val-batches 0 \
@@ -229,16 +230,17 @@ python scripts/launch_mdg_testas_a100x7.py \
 짧은 train + open/closed-loop validation smoke:
 
 ```bash
-python scripts/launch_mdg_testas_a100x7.py \
+bash scripts/start_semi_mdg_testas_a100x7_pretrain.sh \
   --replace \
   --task-name semi_mdg_testas_val_smoke \
   --wandb-mode offline \
-  --initial-bs 2 \
-  --val-batch-size 2 \
+  --initial-bs 20 \
+  --min-bs 20 \
+  --val-batch-size 12 \
   --max-epochs 1 \
   --limit-train-batches 1 \
   --limit-val-batches 1 \
-  --extra-hydra-overrides 'trainer.check_val_every_n_epoch=1 model.model_config.n_rollout_closed_val=2 model.model_config.scorer_scene_num=14 logger.wandb.log_model=false'
+  --extra-hydra-overrides 'trainer.check_val_every_n_epoch=1 model.model_config.n_rollout_closed_val=32 model.model_config.scorer_scene_num=84 logger.wandb.log_model=false'
 ```
 
 원격 로그는 다음 위치에 저장됩니다.
@@ -248,34 +250,21 @@ python scripts/launch_mdg_testas_a100x7.py \
 /mnt/nuplan/projects/catk/logs/<task_name>/runs/<run_id>/
 ```
 
-2026-06-04 KST에 `testas` A100 80GB x7과 실제 SMART cache로 검증한 결과:
+2026-06-06 KST에 `semi_mdg@a42c79f`, `testas` A100 80GB x7, 실제
+SMART cache로 최신 학습/추론/평가 경로를 다시 검증했습니다.
 
-```text
-train-only smoke:
-  task_name: semi_mdg_testas_a100x7_smoke_20260604_122557
-  train_batch_size: 4 per GPU
-  global_batch_size: 28
-  limit_train_batches: 2
-  result: exit status 0
-  final train/loss_mdg: 0.15257
-  peak reserved memory: 26.92%
+| check | result |
+| --- | --- |
+| per-GPU bs24, 3 train batches | CUDA OOM on first train step |
+| per-GPU bs22, 5 train batches | CUDA OOM on first train step |
+| per-GPU bs21, 20 train batches | passed, global batch 147, peak reserved memory 95.90% |
+| per-GPU bs20, 20 train batches | passed, global batch 140, peak reserved memory 91.16% |
+| per-GPU bs20, train + validation smoke | passed, val batch 12, 32 rollouts, 84 Fast WOSAC scenes |
 
-train + open/closed-loop validation smoke:
-  task_name: semi_mdg_testas_a100x7_val_smoke_20260604_122701
-  train_batch_size: 2 per GPU
-  val_batch_size: 2 per GPU
-  n_rollout_closed_val: 2
-  scorer_scene_num: 14
-  result: exit status 0
-  val_closed/sim_agents_2025/realism_meta_metric: 0.56800
-  val_closed/sim_agents_2025/scenario_counter: 14
-
-batch-size safety check:
-  bs20: 20-batch train smoke hit CUDA OOM
-  bs18: 20-batch train smoke passed, but peak reserved memory was 97.90%
-  bs16: 20-batch train smoke passed with peak reserved memory 85.74%
-  decision: use bs16 as the default long-run start batch for testas
-```
+`bs21` is the largest value observed to finish a short train-only smoke, but its
+memory headroom is too small for long pretraining. The default long-run start
+batch is therefore the conservative stable value `bs20`; OOM retry remains
+enabled and will lower the batch by `2` if a later batch exceeds memory.
 
 ## 주요 설정
 
