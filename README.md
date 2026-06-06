@@ -330,37 +330,31 @@ bash scripts/start_smart_ntp_testas_a100x7_trajtok_pretrain_oom_retry.sh
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, `validation_rollout_sampling=(topk_prob, num_k=12, temp=1.0)`, every 16 epochs |
 | distributed strategy | DDP, `find_unused_parameters=false` |
 
-2026-06-05에 `testas` A100 7장에서 최신 `origin/trajtok@0ce9976`와 실제
-`/workspace/womd_v1_3/SMART_cache`로 train batch size를 다시 탐색했다.
-`bs=64/48/36/28/24/22`는 30-batch 이내에서 CUDA OOM이 발생했고, `bs=20`은
-30-batch smoke는 통과했지만 200-batch stability probe에서 CUDA OOM이 발생했다.
+2026-06-05에 `testas` A100 7장에서 실제 SMART cache로 train batch size를 다시 탐색했다.
+`bs=34/30/26/24/22/21`은 5-200 train-batch probe 중 CUDA OOM이 발생했고,
 `bs=18`은 200/200 train batches를 OOM 없이 완료했다. 따라서 testas A100x7의
 보수적 시작값은 `INITIAL_BS=18`이다.
 
 | per-GPU batch | effective global batch | LR | probe 결과 |
 |---:|---:|---:|---|
-| 64 | 448 | `1.1224972e-3` | 30-batch probe 중 CUDA OOM |
-| 48 | 336 | `9.7211110e-4` | 30-batch probe 중 CUDA OOM |
-| 36 | 252 | `8.4187291e-4` | 30-batch probe 중 CUDA OOM |
-| 28 | 196 | `7.4246212e-4` | 30-batch probe 중 CUDA OOM |
+| 34 | 238 | `8.1815341e-4` | 5-batch probe 중 CUDA OOM |
+| 30 | 210 | `7.6852131e-4` | 5-batch probe 중 CUDA OOM |
+| 26 | 182 | `7.1545440e-4` | 5-batch probe 중 CUDA OOM |
 | 24 | 168 | `6.8738635e-4` | 20-batch probe 중 CUDA OOM |
 | 22 | 154 | `6.5812233e-4` | 20-batch probe 중 CUDA OOM |
-| 20 | 140 | `6.2749502e-4` | 30-batch smoke 통과 후 200-batch probe 중 CUDA OOM |
+| 21 | 147 | `6.4299106e-4` | 50-batch probe 중 CUDA OOM |
+| 20 | 140 | `6.2749502e-4` | 50-batch probe 통과 후 200-batch probe 59/200에서 CUDA OOM |
 | 18 | 126 | `5.9529404e-4` | 200/200 train batches 정상 종료 |
 
 같은 testas A100x7 경로에서 `bs=18`, 1 train batch + 1 validation batch smoke도 확인했다.
-`trainer.check_val_every_n_epoch=1`, `model.model_config.scorer_scene_num=84`,
-`model.model_config.n_rollout_closed_val=1`,
-`model.model_config.validation_rollout_sampling.num_k=1` 축소 조건에서 train step,
-open-loop validation, closed-loop Fast WOSAC metric logging이 정상 종료했고
-`val_open/loss`, `val_open/acc`, `val_closed/sim_agents_2025/*`, `run.py DONE`,
-exit status `0`을 확인했다.
+`trainer.check_val_every_n_epoch=1`, `scorer_scene_num=84`, `validation_rollout_sampling.num_k=1`
+축소 조건에서 train step, open-loop validation, closed-loop Fast WOSAC/CPD/CES logging이
+정상 종료했고 `run.py DONE`, exit status `0`을 확인했다.
 
 smoke test나 batch 조정은 환경 변수로만 바꾼다.
 
 ```bash
 LIMIT_TRAIN_BATCHES=1 LIMIT_VAL_BATCHES=1 MAX_EPOCHS=1 \
-EXTRA_HYDRA_OVERRIDES='trainer.check_val_every_n_epoch=1 model.model_config.scorer_scene_num=84 model.model_config.n_rollout_closed_val=1 model.model_config.validation_rollout_sampling.num_k=1' \
 TASK_NAME=trajtok_pretrain_testas_a100x7_smoke \
 SESSION=catk-smart-ntp-testas-a100x7-trajtok-smoke \
 bash scripts/start_smart_ntp_testas_a100x7_trajtok_pretrain_oom_retry.sh
