@@ -4,6 +4,7 @@
 # Defaults are the latest conservative testas probe result:
 #   per-GPU train batch 20, global batch 140, sqrt-scaled LR 0.00068313.
 # OOM retry lowers train batch by 2 and recomputes LR from the same sqrt rule.
+# The testas default also enables the precomputed semi_mdg token/flow sidecar.
 
 set -Eeuo pipefail
 
@@ -18,7 +19,7 @@ BASE_LR="${BASE_LR:-0.0006}"
 WANDB_MODE="${WANDB_MODE:-online}"
 SESSION="${SESSION:-catk-semi-mdg-testas-a100x7}"
 BRANCH="${BRANCH:-semi_mdg}"
-TRAIN_SIDECAR_DIR="${TRAIN_SIDECAR_DIR:-}"
+TRAIN_SIDECAR_DIR="${TRAIN_SIDECAR_DIR:-/workspace/womd_v1_3/SMART_cache/semi_mdg_sidecar/training}"
 
 SHORT_SHA="$(git rev-parse --short HEAD)"
 STAMP="$(date +%Y%m%d_%H%M%S)"

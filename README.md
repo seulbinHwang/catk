@@ -133,7 +133,7 @@ bash scripts/precompute_semi_mdg_sidecar_a100x7.sh
 LIMIT=128 bash scripts/precompute_semi_mdg_sidecar_a100x7.sh
 ```
 
-sidecar를 사용해 학습하려면 `data.train_sidecar_dir`를 지정합니다. testas launcher에서는 `TRAIN_SIDECAR_DIR` 환경변수를 쓰면 됩니다.
+testas launcher는 기본적으로 이 sidecar를 사용합니다. 다른 위치를 쓰는 경우에만 `TRAIN_SIDECAR_DIR`를 바꾸면 됩니다.
 
 ```bash
 TRAIN_SIDECAR_DIR=/workspace/womd_v1_3/SMART_cache/semi_mdg_sidecar/training \
@@ -220,6 +220,7 @@ bash scripts/start_semi_mdg_testas_a100x7_pretrain.sh
 ```text
 pod: testas
 cache_root: /workspace/womd_v1_3/SMART_cache
+train_sidecar_dir: /workspace/womd_v1_3/SMART_cache/semi_mdg_sidecar/training
 experiment: mdg_pretrain_h100x3x2
 session: catk-semi-mdg-testas-a100x7
 nproc_per_node: 7
@@ -294,21 +295,22 @@ bash scripts/start_semi_mdg_testas_a100x7_pretrain.sh \
 /mnt/nuplan/projects/catk/logs/<task_name>/runs/<run_id>/
 ```
 
-2026-06-06 KST에 `semi_mdg@a42c79f`, `testas` A100 80GB x7, 실제
-SMART cache로 최신 학습/추론/평가 경로를 다시 검증했습니다.
+2026-06-06 KST에 `semi_mdg@6f9ecb7`, `testas` A100 80GB x7, 실제
+SMART cache와 precomputed semi_mdg sidecar로 최신 학습/추론/평가 경로를
+다시 검증했습니다.
 
 | check | result |
 | --- | --- |
-| per-GPU bs24, 3 train batches | CUDA OOM on first train step |
-| per-GPU bs22, 5 train batches | CUDA OOM on first train step |
-| per-GPU bs21, 20 train batches | passed, global batch 147, peak reserved memory 95.90% |
+| per-GPU bs28, 5 train batches | CUDA OOM on first train step |
+| per-GPU bs24, 5 train batches | CUDA OOM after first train step |
+| per-GPU bs22, 10 train batches | CUDA OOM on first train step |
 | per-GPU bs20, 20 train batches | passed, global batch 140, peak reserved memory 91.16% |
-| per-GPU bs20, train + validation smoke | passed, val batch 12, 32 rollouts, 84 Fast WOSAC scenes |
+| per-GPU bs20, train + validation smoke | passed, val batch 12, 32 rollouts, 84 Fast WOSAC scenes, closed-loop metrics logged |
 
-`bs21` is the largest value observed to finish a short train-only smoke, but its
-memory headroom is too small for long pretraining. The default long-run start
-batch is therefore the conservative stable value `bs20`; OOM retry remains
-enabled and will lower the batch by `2` if a later batch exceeds memory.
+`bs22` 이상은 최신 code + sidecar path에서도 OOM이므로, default long-run
+start batch는 보수 안정값 `bs20`입니다. OOM retry는 계속 켜져 있으며, 이후
+더 큰 scene batch에서 memory spike가 나면 batch를 `2`씩 낮추고 해당 batch에
+맞춰 LR도 다시 sqrt scaling합니다.
 
 ## 주요 설정
 
