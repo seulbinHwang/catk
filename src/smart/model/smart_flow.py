@@ -51,6 +51,7 @@ from src.smart.modules.self_forced_update_separation import (
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
     resolve_self_forced_estimator_warmup_epochs,
+    should_run_self_forced_validation_after_epoch,
 )
 from src.smart.modules.self_forced_trainable_range import (
     apply_self_forced_unfrozen_range,
@@ -344,6 +345,8 @@ class SMARTFlow(LightningModule):
         self._self_forced_aux_loaded_from_checkpoint = False
         self._self_forced_generator_ema_loaded_from_checkpoint = False
         self._self_forced_backward_context: Dict[str, Tensor] | None = None
+        self._self_forced_original_check_val_every_n_epoch: int | None = None
+        self._self_forced_validation_schedule_captured = False
         self._automatic_open_loop_has_target_since_step = False
         self._automatic_open_loop_has_target_pending: list[tuple[Tensor, Any | None]] = []
         self._skip_next_automatic_optimizer_step = False
@@ -582,6 +585,63 @@ class SMARTFlow(LightningModule):
 
         self._fit_time_original_limit_val_batches = None
         self._fit_time_checkpoint_only_validation_enabled = False
+
+    def _capture_self_forced_validation_interval(self) -> None:
+        """self-forced warmup이 trainer validation 주기를 바꾸기 전 원래 값을 저장합니다."""
+        if self.trainer is None:
+            return
+        if self._self_forced_validation_schedule_captured:
+            return
+        self._self_forced_original_check_val_every_n_epoch = self.trainer.check_val_every_n_epoch
+        self._self_forced_validation_schedule_captured = True
+
+    def _restore_self_forced_validation_interval(self) -> None:
+        """fit 종료 시 trainer의 epoch validation 주기를 원래 값으로 복원합니다."""
+        if self.trainer is not None and self._self_forced_validation_schedule_captured:
+            self.trainer.check_val_every_n_epoch = (
+                self._self_forced_original_check_val_every_n_epoch
+            )
+        self._self_forced_original_check_val_every_n_epoch = None
+        self._self_forced_validation_schedule_captured = False
+
+    def _self_forced_skip_validation_interval_for_current_epoch(self) -> int:
+        """현재 epoch 끝 validation이 실행되지 않게 하는 임시 interval을 반환합니다."""
+        return int(self.current_epoch) + 2
+
+    def _apply_self_forced_validation_schedule_for_current_epoch(self) -> None:
+        """estimator warmup 이후부터 validation 주기를 다시 세도록 trainer 값을 조정합니다."""
+        if self.trainer is None:
+            return
+        if not self.self_forced_enabled:
+            return
+        if int(self.self_forced_estimator_warmup_epochs) <= 0:
+            return
+
+        self._capture_self_forced_validation_interval()
+        original_interval = self._self_forced_original_check_val_every_n_epoch
+        if original_interval is None:
+            return
+        check_interval = int(original_interval)
+        if check_interval <= 0:
+            return
+
+        current_epoch = int(self.current_epoch)
+        if current_epoch < int(self.self_forced_start_epoch):
+            self.trainer.check_val_every_n_epoch = check_interval
+            return
+
+        should_validate = should_run_self_forced_validation_after_epoch(
+            current_epoch=current_epoch,
+            self_forced_start_epoch=int(self.self_forced_start_epoch),
+            estimator_warmup_epochs=int(self.self_forced_estimator_warmup_epochs),
+            check_val_every_n_epoch=check_interval,
+        )
+        if should_validate:
+            self.trainer.check_val_every_n_epoch = 1
+        else:
+            self.trainer.check_val_every_n_epoch = (
+                self._self_forced_skip_validation_interval_for_current_epoch()
+            )
 
     def _should_compute_closed_loop_minade(self) -> bool:
         """현재 validation에서 closed-loop minADE를 계산할지 판단합니다.
@@ -2882,6 +2942,7 @@ class SMARTFlow(LightningModule):
             None
         """
         self._restore_fit_time_validation_batch_limit()
+        self._restore_self_forced_validation_interval()
 
     @staticmethod
     def _summarize_nonfinite_tensor(tensor: Tensor) -> str:
@@ -3470,6 +3531,7 @@ open_metric_dict:
         """새 epoch의 open-loop train metric accumulator를 초기화합니다."""
         self._reset_open_loop_train_epoch_metrics()
         self._automatic_open_loop_has_target_pending.clear()
+        self._apply_self_forced_validation_schedule_for_current_epoch()
 
     def on_train_epoch_end(self) -> None:
         """self-forced manual optimization에서 scheduler가 있으면 epoch마다 한 번 진행합니다.

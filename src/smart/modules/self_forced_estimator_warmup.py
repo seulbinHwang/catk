@@ -83,3 +83,54 @@ def is_self_forced_estimator_warmup_epoch(
     if warmup_epochs <= 0:
         return False
     return start_epoch <= current_epoch < start_epoch + warmup_epochs
+
+
+def should_run_self_forced_validation_after_epoch(
+    *,
+    current_epoch: int,
+    self_forced_start_epoch: int,
+    estimator_warmup_epochs: int,
+    check_val_every_n_epoch: int,
+) -> bool:
+    """self-forced 학습 중 현재 epoch 끝 validation 실행 여부를 판단합니다.
+
+    Args:
+        current_epoch: 현재 학습 epoch입니다.
+        self_forced_start_epoch: self-forcing을 시작할 epoch입니다.
+        estimator_warmup_epochs: generated estimator만 학습할 epoch 수입니다.
+        check_val_every_n_epoch: generator 학습 구간에서 적용할 validation 주기입니다.
+
+    Returns:
+        bool: 현재 epoch 끝에 validation을 실행해야 하면 ``True`` 입니다.
+
+    설명:
+        estimator warmup 구간에서는 epoch 끝 validation을 실행하지 않습니다.
+        warmup이 끝나고 generator 업데이트가 다시 시작되는 epoch부터
+        ``check_val_every_n_epoch`` 주기를 새로 셉니다. self-forcing 시작 전
+        epoch에서는 Lightning의 기존 epoch 기준 주기를 그대로 따릅니다.
+    """
+    current_epoch = int(current_epoch)
+    start_epoch = int(self_forced_start_epoch)
+    warmup_epochs = int(estimator_warmup_epochs)
+    check_interval = int(check_val_every_n_epoch)
+    if warmup_epochs < 0:
+        raise ValueError(
+            "self_forced.estimator_warmup_epochs must be non-negative, "
+            f"got {warmup_epochs}."
+        )
+    if check_interval <= 0:
+        raise ValueError(
+            "trainer.check_val_every_n_epoch must be positive, "
+            f"got {check_interval}."
+        )
+    if warmup_epochs <= 0:
+        return (current_epoch + 1) % check_interval == 0
+
+    dmd_start_epoch = start_epoch + warmup_epochs
+    if current_epoch < start_epoch:
+        return (current_epoch + 1) % check_interval == 0
+    if current_epoch < dmd_start_epoch:
+        return False
+
+    generator_epoch_count = current_epoch - dmd_start_epoch + 1
+    return generator_epoch_count % check_interval == 0

@@ -1538,6 +1538,10 @@ python scripts/launch_pre_bc_flow_control_v100x47_static_pods.py --stop
 ### 5.2 Validation 주기와 val_open / val_closed 바꾸기
 
 - 학습 중 validation은 `trainer.check_val_every_n_epoch` 마다 실행됩니다.
+- self-forced fine-tuning에서 `model.model_config.self_forced.estimator_warmup_epochs>0`
+  이면 warmup epoch 끝에는 validation을 실행하지 않습니다. 이때
+  `trainer.check_val_every_n_epoch` 주기는 warmup이 끝나고 Generator까지 함께
+  학습하는 첫 epoch부터 다시 계산됩니다.
 - `model.model_config.val_open_loop=true/false`로 open-loop validation on/off를 바꿉니다.
 - `model.model_config.val_closed_loop=true/false`로 closed-loop validation on/off를 바꿉니다.
 - validation 양 자체는 `trainer.limit_val_batches`로 줄이거나 늘릴 수 있습니다.
@@ -2818,6 +2822,11 @@ model:
 - 따라서 online Generator warmup skip 없이, 첫 train step부터 generated estimator 업데이트와 Generator 업데이트를 수행합니다.
 - `estimator_warmup_epochs>0` 으로 override하면 해당 기간에는 online Generator를 업데이트하지 않고, 현재 Generator가 만든 self-rollout으로 generated estimator만 먼저 학습합니다.
 - warmup 중 self-rollout은 `torch.no_grad()`로 생성하고, Generator optimizer step과 EMA update는 실행하지 않습니다.
+- warmup epoch 끝에는 validation을 건너뜁니다. 예를 들어
+  `estimator_warmup_epochs=1`, `trainer.check_val_every_n_epoch=2` 이면 epoch 0은
+  generated estimator warmup만 수행하고 validation 없이 끝납니다. epoch 1부터
+  Generator 학습이 시작되며, validation은 generator 학습 epoch 기준 두 번째인
+  epoch 2 끝에서 처음 실행됩니다.
 
 예시:
 

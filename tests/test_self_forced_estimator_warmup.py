@@ -5,6 +5,7 @@ import pytest
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
     resolve_self_forced_estimator_warmup_epochs,
+    should_run_self_forced_validation_after_epoch,
 )
 
 
@@ -54,4 +55,76 @@ def test_is_self_forced_estimator_warmup_epoch_can_be_disabled() -> None:
         current_epoch=0,
         self_forced_start_epoch=0,
         estimator_warmup_epochs=0,
+    )
+
+
+def test_self_forced_validation_skips_warmup_epoch() -> None:
+    assert not should_run_self_forced_validation_after_epoch(
+        current_epoch=0,
+        self_forced_start_epoch=0,
+        estimator_warmup_epochs=1,
+        check_val_every_n_epoch=1,
+    )
+    assert should_run_self_forced_validation_after_epoch(
+        current_epoch=1,
+        self_forced_start_epoch=0,
+        estimator_warmup_epochs=1,
+        check_val_every_n_epoch=1,
+    )
+
+
+def test_self_forced_validation_restarts_cadence_after_warmup() -> None:
+    assert not should_run_self_forced_validation_after_epoch(
+        current_epoch=1,
+        self_forced_start_epoch=0,
+        estimator_warmup_epochs=1,
+        check_val_every_n_epoch=2,
+    )
+    assert should_run_self_forced_validation_after_epoch(
+        current_epoch=2,
+        self_forced_start_epoch=0,
+        estimator_warmup_epochs=1,
+        check_val_every_n_epoch=2,
+    )
+
+
+def test_self_forced_validation_keeps_pre_start_epoch_schedule() -> None:
+    assert should_run_self_forced_validation_after_epoch(
+        current_epoch=1,
+        self_forced_start_epoch=2,
+        estimator_warmup_epochs=1,
+        check_val_every_n_epoch=2,
+    )
+    assert not should_run_self_forced_validation_after_epoch(
+        current_epoch=2,
+        self_forced_start_epoch=2,
+        estimator_warmup_epochs=1,
+        check_val_every_n_epoch=2,
+    )
+    assert not should_run_self_forced_validation_after_epoch(
+        current_epoch=3,
+        self_forced_start_epoch=2,
+        estimator_warmup_epochs=1,
+        check_val_every_n_epoch=2,
+    )
+    assert should_run_self_forced_validation_after_epoch(
+        current_epoch=4,
+        self_forced_start_epoch=2,
+        estimator_warmup_epochs=1,
+        check_val_every_n_epoch=2,
+    )
+
+
+def test_self_forced_validation_uses_default_schedule_without_warmup() -> None:
+    assert not should_run_self_forced_validation_after_epoch(
+        current_epoch=0,
+        self_forced_start_epoch=0,
+        estimator_warmup_epochs=0,
+        check_val_every_n_epoch=2,
+    )
+    assert should_run_self_forced_validation_after_epoch(
+        current_epoch=1,
+        self_forced_start_epoch=0,
+        estimator_warmup_epochs=0,
+        check_val_every_n_epoch=2,
     )
