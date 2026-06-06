@@ -2444,6 +2444,87 @@ kubectl exec -it -n p-pnc testaa -c main -- \
 python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py --stop
 ```
 
+#### testa A100x4 single-pod DMD self-forcing fine-tuning
+
+`testa` 단일 A100 4GPU pod에서 같은 epoch 61 pretrained Generator checkpoint로
+DMD-style self-forced fine-tuning을 돌릴 때는 아래 launcher를 씁니다. 이 launcher는
+pod를 만들거나 지우거나 재시작하지 않고, `testa` 안에 tmux session과
+`torchrun --standalone --nproc_per_node=4`만 시작합니다.
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py --replace
+```
+
+짧은 smoke/probe만 확인하려면:
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py \
+  --replace \
+  --task-name flow_self_forced_dmd_a100x4_testa_smoke_bs160 \
+  --session catk-self-forced-dmd-a100x4-testa-smoke \
+  --initial-bs 160 \
+  --max-epochs 1 \
+  --limit-train-batches 20 \
+  --limit-val-batches 0
+```
+
+기본 실험 설정:
+
+| 항목 | 값 |
+|---|---|
+| pod | `testa` 4 A100 |
+| branch | `semi_control_stable` |
+| experiment | `self_forced_npfm_a100x4_testa` |
+| default task | `flow_self_forced_dmd_a100x4_testa_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs160_frac025_ep16_middle_oomretry` |
+| pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| checkpoint 의미 | `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` epoch 61 Generator, artifact metadata epoch 62 / global step 278192 |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_a100x4_testa_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| action | 첫 시도 `finetune`, OOM 후 재시도는 최신 self-forced `epoch_last.ckpt` 기준 `fit` |
+| DDP shape | `trainer.num_nodes=1`, `trainer.devices=4`, 총 4 ranks |
+| precision | `bf16-mixed` |
+| DMD objective | active-control DMD |
+| DMD active axes | pedestrian `[delta_s, delta_n, delta_theta]`, vehicle/cyclist `[delta_s, delta_theta]` |
+| lr | Generator `1.0e-6`, generated estimator `1.0e-6` |
+| estimator updates | `5` per train step |
+| estimator warmup | `1` epoch |
+| trainable range | `unfrozen_range=middle` |
+| detach block transition | `true` |
+| self-forced sample steps | Euler `sample_steps=16` |
+| self-forced backprop | `backprop_last_k=8` |
+| random terminal policy | `all` |
+| stop-motion | self-forced training rollout `false`, validation/inference decoder `false` |
+| train data fraction | `data.train_epoch_sample_fraction=0.25` |
+| train batch construction | `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false` |
+| validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, every 2 epochs |
+| epochs | `16` |
+| initial train batch | per-rank `160`, effective global batch `640` |
+| OOM fallback | `160 -> 152 -> 144 -> ... -> 64`, latest self-forced checkpoint resume |
+| val/test batch | per-rank `8` |
+| scorer scenes | `1680` |
+| tmux session | `catk-self-forced-dmd-a100x4-testa` |
+
+2026-06-06 `testa` A100x4 `unfrozen_range=middle`, `train_memory_balanced_batches=true`
+probe 기준으로 per-rank `bs160`은 20-step smoke를 CUDA OOM 없이 통과했고, full-epoch
+probe도 사용자 요청으로 중단하기 전 `32/191` train step까지 OOM 없이 진행했습니다. 해당 partial
+probe에서 최대 관측 GPU memory는 약 `74.5 GiB / 80 GiB`였습니다. 아직 full epoch 전체를
+끝까지 돈 값은 아니므로, 이 값은 “현재까지 확인한 최대 시작 batch”이고 rare heavy batch에
+대비해 OOM fallback을 함께 둡니다. memory-balanced sampler는 rank별 batch를 직접 나누므로
+Lightning의 자동 distributed sampler는 꺼 둡니다. 이 조합이 빠지면 Lightning이 batch sampler를
+다시 감싸려 하면서 실행 전 오류가 납니다.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc testa -c main -- \
+  tmux attach -t catk-self-forced-dmd-a100x4-testa
+```
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py --stop
+```
+
 `cache_frozen_map_features=true` 는 self-forced DMD train step 안에서 frozen map encoder의 출력을
 재사용합니다. 기본 `unfrozen_range=middle` 에서는 map encoder가 학습되지 않으므로,
 generated estimator를 한 step 안에서 여러 번 업데이트할 때 같은 map을 반복 인코딩하지 않아도 됩니다.

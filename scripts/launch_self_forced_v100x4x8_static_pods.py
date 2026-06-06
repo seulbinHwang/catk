@@ -114,6 +114,7 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
         "MAX_EPOCHS": args.max_epochs,
         "TRAIN_EPOCH_SAMPLE_FRACTION": args.train_epoch_sample_fraction,
+        "TRAIN_MEMORY_BALANCED_BATCHES": args.train_memory_balanced_batches,
         "CATK_EXTRA_OVERRIDES": args.extra_hydra_overrides,
     }
     for name, value in optional.items():
@@ -983,6 +984,9 @@ while (( bs >= MIN_BS )); do
   if [[ -n "${{TRAIN_EPOCH_SAMPLE_FRACTION:-}}" ]]; then
     torchrun_args+=(data.train_epoch_sample_fraction="$TRAIN_EPOCH_SAMPLE_FRACTION")
   fi
+  if [[ -n "${{TRAIN_MEMORY_BALANCED_BATCHES:-}}" ]]; then
+    torchrun_args+=(data.train_memory_balanced_batches="$TRAIN_MEMORY_BALANCED_BATCHES")
+  fi
   torchrun_args+=("${{extra_overrides[@]}}")
 
   echo
@@ -1226,6 +1230,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--max-epochs", default="12")
     parser.add_argument("--train-epoch-sample-fraction", default="")
+    parser.add_argument("--train-memory-balanced-batches", default="true")
     parser.add_argument("--extra-hydra-overrides", default="trainer.check_val_every_n_epoch=2")
     parser.add_argument("--monitor-interval", type=int, default=30)
     parser.add_argument("--no-monitor-pane", action="store_true")

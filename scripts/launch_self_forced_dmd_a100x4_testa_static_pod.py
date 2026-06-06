@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Launch DMD-style self-forced Flow fine-tuning on hsb-npc-training-1 H100x6.
+"""Launch DMD-style self-forced Flow fine-tuning on the `testa` A100x4 pod.
 
 The launcher never creates, deletes, or restarts pods. It only starts/stops a
-tmux session inside the existing pod, prepares the requested pretrained
-Generator checkpoint, and runs the H100x6 OOM-retry training script.
+tmux session inside the existing pod, prepares the pretrained Generator
+checkpoint, and runs the A100x4 OOM-retry training wrapper.
 """
 
 from __future__ import annotations
@@ -14,29 +14,44 @@ import subprocess
 
 
 DEFAULT_NAMESPACE = "p-pnc"
-DEFAULT_POD = "hsb-npc-training-1"
+DEFAULT_POD = "testa"
 DEFAULT_CONTAINER = "main"
 DEFAULT_PROJECT_ROOT = "/mnt/nuplan/projects/catk"
 DEFAULT_BRANCH = "semi_control_stable"
 DEFAULT_CACHE_ROOT = "/workspace/womd_v1_3/SMART_cache"
 DEFAULT_LOG_DIR = "/mnt/nuplan/projects/catk/logs"
-DEFAULT_EXPERIMENT = "self_forced_npfm_h100_6"
+DEFAULT_EXPERIMENT = "self_forced_npfm_a100x4_testa"
 DEFAULT_WANDB_PRETRAIN_ARTIFACT = (
-    "jksg01019-naver-labs/SMART-FLOW/epoch-last-mqfq3u39:v121"
+    "jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57"
 )
 DEFAULT_PRETRAIN_CKPT = (
-    "/workspace/flow_self_forced_dmd_h100x6_hsb1_pretrain_epoch116_mqfq3u39/"
-    "v121/epoch_last.ckpt"
+    "/workspace/flow_self_forced_dmd_a100x4_testa_pretrain_epoch061_x5f9g0ce/"
+    "v57/epoch_061.ckpt"
 )
 DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
-    "/workspace/flow_self_forced_dmd_h100x6_hsb1_pretrain_epoch116_mqfq3u39/"
-    "v121/artifact"
+    "/workspace/flow_self_forced_dmd_a100x4_testa_pretrain_epoch061_x5f9g0ce/"
+    "v57/artifact"
 )
 DEFAULT_TASK_NAME = (
-    "flow_self_forced_dmd_h100x6_hsb1_epoch116_activecontrol_"
-    "sample16_backprop8_lr1e-6_bs18_frac025_oomretry"
+    "flow_self_forced_dmd_a100x4_testa_epoch061_x5f9g0ce_activecontrol_"
+    "sample16_backprop8_lr1e-6_bs160_frac025_ep16_middle_oomretry"
 )
-DEFAULT_SESSION = "catk-self-forced-dmd-h100x6-hsb1"
+DEFAULT_SESSION = "catk-self-forced-dmd-a100x4-testa"
+
+DEFAULT_EXTRA_OVERRIDES = " ".join(
+    [
+        "model.model_config.val_open_loop=false",
+        "model.model_config.decoder.detach_train_metric_clean=true",
+        "model.model_config.self_forced.distribution_matching_objective=dmd",
+        "model.model_config.self_forced.clean_dmd_normalizer_eps=0.05",
+        "model.model_config.self_forced.clean_dmd_tau_low=0.02",
+        "model.model_config.self_forced.clean_dmd_tau_high=0.98",
+        "model.model_config.self_forced.sampling.random_terminal_step.scope=global_batch",
+        "model.model_config.self_forced.sampling.random_terminal_step.policy=all",
+        "model.model_config.self_forced.sampling.random_terminal_step.min_executed_steps=16",
+        "model.model_config.self_forced.sampling.backprop_last_k=8",
+    ]
+)
 
 
 def shq(value: object) -> str:
@@ -64,10 +79,13 @@ def export_line(name: str, value: object) -> str:
 
 def run_root(args: argparse.Namespace) -> str:
     safe_task = args.task_name.replace("/", "_")
-    return f"{args.log_dir.rstrip('/')}/tmux_self_forced_dmd_h100x6_hsb1/{safe_task}"
+    return f"{args.log_dir.rstrip('/')}/tmux_self_forced_dmd_a100x4_testa/{safe_task}"
 
 
 def render_env(args: argparse.Namespace) -> str:
+    extra = " ".join(
+        part for part in (DEFAULT_EXTRA_OVERRIDES, args.extra_hydra_overrides) if part
+    )
     lines = [
         export_line("PRETRAIN_CKPT", args.pretrain_ckpt),
         export_line("WANDB_PRETRAIN_ARTIFACT", args.wandb_pretrain_artifact),
@@ -92,6 +110,11 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("RANDOM_TERMINAL_SCOPE", args.random_terminal_scope),
         export_line("RANDOM_TERMINAL_POLICY", args.random_terminal_policy),
         export_line("BACKPROP_LAST_K", args.backprop_last_k),
+        export_line("ESTIMATOR_WARMUP_EPOCHS", args.estimator_warmup_epochs),
+        export_line("SELF_FORCED_USE_STOP_MOTION", args.self_forced_use_stop_motion),
+        export_line("DECODER_USE_STOP_MOTION", args.decoder_use_stop_motion),
+        export_line("UNFROZEN_RANGE", args.unfrozen_range),
+        export_line("CATK_EXTRA_OVERRIDES", extra),
     ]
     optional = {
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
@@ -100,7 +123,6 @@ def render_env(args: argparse.Namespace) -> str:
         "CLEAN_DMD_NORMALIZER_EPS": args.clean_dmd_normalizer_eps,
         "CLEAN_DMD_TAU_LOW": args.clean_dmd_tau_low,
         "CLEAN_DMD_TAU_HIGH": args.clean_dmd_tau_high,
-        "CATK_EXTRA_OVERRIDES": args.extra_hydra_overrides,
     }
     for name, value in optional.items():
         if value not in (None, ""):
@@ -131,18 +153,17 @@ set -a
 source {shq(env_file)}
 set +a
 
-echo "[self-forced-dmd-h100x6-hsb1] pod=$(hostname) task=${{TASK_NAME}}"
-echo "[self-forced-dmd-h100x6-hsb1] started at $(date '+%F %T')"
-echo "[self-forced-dmd-h100x6-hsb1] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}}"
-echo "[self-forced-dmd-h100x6-hsb1] lr=${{CATK_LR}} sample_steps=16 backprop_last_k=${{BACKPROP_LAST_K}} policy=${{RANDOM_TERMINAL_POLICY}}"
-echo "[self-forced-dmd-h100x6-hsb1] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
-echo "[self-forced-dmd-h100x6-hsb1] pretrain_ckpt=${{PRETRAIN_CKPT}}"
-echo "[self-forced-dmd-h100x6-hsb1] attach survives after exit; press Ctrl-b d to detach"
+echo "[self-forced-dmd-a100x4-testa] pod=$(hostname) task=${{TASK_NAME}}"
+echo "[self-forced-dmd-a100x4-testa] started at $(date '+%F %T')"
+echo "[self-forced-dmd-a100x4-testa] experiment=${{EXPERIMENT}} initial_bs=${{INITIAL_BS}} oom_step=${{OOM_STEP}} min_bs=${{MIN_BS}}"
+echo "[self-forced-dmd-a100x4-testa] lr=${{CATK_LR}} fraction=${{TRAIN_EPOCH_SAMPLE_FRACTION}} memory_balanced=${{TRAIN_MEMORY_BALANCED_BATCHES}} sample_steps=16 backprop_last_k=${{BACKPROP_LAST_K}}"
+echo "[self-forced-dmd-a100x4-testa] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
+echo "[self-forced-dmd-a100x4-testa] pretrain_ckpt=${{PRETRAIN_CKPT}}"
 echo
 
 ensure_pretrain_checkpoint() {{
   if [[ -f "$PRETRAIN_CKPT" ]]; then
-    echo "[self-forced-dmd-h100x6-hsb1] using cached pretrain checkpoint: $PRETRAIN_CKPT"
+    echo "[self-forced-dmd-a100x4-testa] using cached pretrain checkpoint: $PRETRAIN_CKPT"
     return 0
   fi
 
@@ -150,7 +171,7 @@ ensure_pretrain_checkpoint() {{
   lock_dir="${{PRETRAIN_CKPT}}.download.lock"
 
   if mkdir "$lock_dir" 2>/dev/null; then
-    echo "[self-forced-dmd-h100x6-hsb1] downloading W&B artifact: $WANDB_PRETRAIN_ARTIFACT"
+    echo "[self-forced-dmd-a100x4-testa] downloading W&B artifact: $WANDB_PRETRAIN_ARTIFACT"
     python - <<'PY'
 import glob
 import os
@@ -179,6 +200,7 @@ candidates = []
 preferred = Path(artifact_dir) / "epoch_last.ckpt"
 if preferred.is_file():
     candidates.append(preferred.as_posix())
+candidates.extend(glob.glob(str(Path(artifact_dir) / "**" / "epoch_061.ckpt"), recursive=True))
 candidates.extend(glob.glob(str(Path(artifact_dir) / "**" / "epoch_last.ckpt"), recursive=True))
 candidates.extend(glob.glob(str(Path(artifact_dir) / "**" / "*.ckpt"), recursive=True))
 candidates = list(dict.fromkeys(candidates))
@@ -195,19 +217,17 @@ PY
     status=$?
     rm -rf "$lock_dir"
     if (( status != 0 )); then
-      echo "[self-forced-dmd-h100x6-hsb1] W&B artifact download failed with status $status" >&2
       return "$status"
     fi
   else
-    echo "[self-forced-dmd-h100x6-hsb1] waiting for checkpoint download lock: $lock_dir"
+    echo "[self-forced-dmd-a100x4-testa] waiting for checkpoint download lock: $lock_dir"
     for _ in $(seq 1 180); do
       if [[ -f "$PRETRAIN_CKPT" ]]; then
-        echo "[self-forced-dmd-h100x6-hsb1] checkpoint appeared: $PRETRAIN_CKPT"
         return 0
       fi
       sleep 10
     done
-    echo "[self-forced-dmd-h100x6-hsb1] timed out waiting for $PRETRAIN_CKPT" >&2
+    echo "[self-forced-dmd-a100x4-testa] timed out waiting for $PRETRAIN_CKPT" >&2
     return 4
   fi
 
@@ -217,17 +237,16 @@ PY
 ensure_pretrain_checkpoint
 status=$?
 if (( status != 0 )); then
-  echo "[self-forced-dmd-h100x6-hsb1] checkpoint preparation failed with status $status"
-  echo "[self-forced-dmd-h100x6-hsb1] leaving shell open for inspection"
+  echo "[self-forced-dmd-a100x4-testa] checkpoint preparation failed with status $status"
   exec bash
 fi
 
-bash scripts/self_forced_h100_6_with_oom_retry.sh
+bash scripts/self_forced_a100_4_with_oom_retry.sh
 status=$?
 
 echo
-echo "[self-forced-dmd-h100x6-hsb1] exited with status $status at $(date '+%F %T')"
-echo "[self-forced-dmd-h100x6-hsb1] leaving shell open for inspection"
+echo "[self-forced-dmd-a100x4-testa] exited with status $status at $(date '+%F %T')"
+echo "[self-forced-dmd-a100x4-testa] leaving shell open for inspection"
 exec bash
 """
 
@@ -344,7 +363,7 @@ def exec_in_pod(args: argparse.Namespace, script: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch DMD self-forced H100x6 training on hsb-npc-training-1.",
+        description="Launch DMD self-forced A100x4 single-pod training on testa.",
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--pod", default=DEFAULT_POD)
@@ -361,23 +380,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
-    parser.add_argument("--cuda-visible-devices", default="0,1,2,3,4,5")
-    parser.add_argument("--nproc-per-node", type=int, default=6)
-    parser.add_argument("--initial-bs", type=int, default=18)
-    parser.add_argument("--oom-step", type=int, default=1)
-    parser.add_argument("--min-bs", type=int, default=2)
-    parser.add_argument("--val-batch-size", default="16")
-    parser.add_argument("--test-batch-size", default="16")
+    parser.add_argument("--cuda-visible-devices", default="0,1,2,3")
+    parser.add_argument("--nproc-per-node", type=int, default=4)
+    parser.add_argument("--initial-bs", type=int, default=160)
+    parser.add_argument("--oom-step", type=int, default=8)
+    parser.add_argument("--min-bs", type=int, default=64)
+    parser.add_argument("--val-batch-size", default="8")
+    parser.add_argument("--test-batch-size", default="8")
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="0.1")
     parser.add_argument("--max-epochs", default="16")
-    parser.add_argument("--check-val-every-n-epoch", default="1")
+    parser.add_argument("--check-val-every-n-epoch", default="2")
     parser.add_argument("--learning-rate", default="1.0e-6")
     parser.add_argument("--train-epoch-sample-fraction", default="0.25")
     parser.add_argument("--train-memory-balanced-batches", default="true")
     parser.add_argument("--random-terminal-scope", default="global_batch")
     parser.add_argument("--random-terminal-policy", default="all")
     parser.add_argument("--backprop-last-k", default="8")
+    parser.add_argument("--estimator-warmup-epochs", default="1")
+    parser.add_argument("--self-forced-use-stop-motion", default="false")
+    parser.add_argument("--decoder-use-stop-motion", default="false")
+    parser.add_argument("--unfrozen-range", default="middle")
     parser.add_argument("--ema-weight", default="")
     parser.add_argument("--ema-start-step", default="")
     parser.add_argument("--clean-dmd-normalizer-eps", default="")
@@ -393,8 +416,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.stop:
         return args
-    if args.nproc_per_node != 6:
-        parser.error("--nproc-per-node must be 6 for the H100x6 preset")
+    if args.nproc_per_node != 4:
+        parser.error("--nproc-per-node must be 4 for the A100x4 testa preset")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
     if args.oom_step < 1:
@@ -407,12 +430,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--random-terminal-policy must be empty, 'all', or 'paper_uniform'")
     if args.monitor_interval < 1:
         parser.error("--monitor-interval must be >= 1")
-    if not args.pretrain_ckpt:
-        parser.error("--pretrain-ckpt must not be empty unless --stop is set")
-    if not args.wandb_pretrain_artifact:
-        parser.error("--wandb-pretrain-artifact must not be empty unless --stop is set")
-    if not args.pretrain_download_dir:
-        parser.error("--pretrain-download-dir must not be empty unless --stop is set")
     return args
 
 

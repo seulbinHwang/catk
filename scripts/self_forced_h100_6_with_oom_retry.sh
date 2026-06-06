@@ -28,6 +28,7 @@
 #   CHECK_VAL_EVERY_N_EPOCH=       Optional `trainer.check_val_every_n_epoch`.
 #   CATK_LR=                       Optional Generator lr override.
 #   TRAIN_EPOCH_SAMPLE_FRACTION=   Optional train dataset fraction override.
+#   TRAIN_MEMORY_BALANCED_BATCHES= Optional train memory-balanced batching override.
 #   RANDOM_TERMINAL_SCOPE=         Optional override: global_batch.
 #   RANDOM_TERMINAL_POLICY=        Optional override: all.
 #   BACKPROP_LAST_K=               Optional `self_forced.sampling.backprop_last_k`.
@@ -87,6 +88,9 @@ if [[ -n "${CHECK_VAL_EVERY_N_EPOCH:-}" ]]; then
 fi
 if [[ -n "${TRAIN_EPOCH_SAMPLE_FRACTION:-}" ]]; then
   EXTRA_OVERRIDES+=("data.train_epoch_sample_fraction=${TRAIN_EPOCH_SAMPLE_FRACTION}")
+fi
+if [[ -n "${TRAIN_MEMORY_BALANCED_BATCHES:-}" ]]; then
+  EXTRA_OVERRIDES+=("data.train_memory_balanced_batches=${TRAIN_MEMORY_BALANCED_BATCHES}")
 fi
 if [[ -n "${RANDOM_TERMINAL_SCOPE:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.sampling.random_terminal_step.scope=${RANDOM_TERMINAL_SCOPE}")

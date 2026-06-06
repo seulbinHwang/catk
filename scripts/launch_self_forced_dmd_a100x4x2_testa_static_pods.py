@@ -94,6 +94,8 @@ def main() -> int:
         "false",
         "--train-epoch-sample-fraction",
         "0.25",
+        "--train-memory-balanced-batches",
+        "true",
         "--max-epochs",
         "16",
         "--limit-val-batches",

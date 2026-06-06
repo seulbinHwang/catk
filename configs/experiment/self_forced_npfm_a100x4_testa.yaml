@@ -1,0 +1,43 @@
+# @package _global_
+
+# A100x4 single-pod DMD self-forcing preset for `testa`.
+#
+# This intentionally reuses the H100x4 self-forced recipe and only changes the
+# hardware/runtime defaults that differ on A100:
+#   - one pod / four ranks
+#   - conservative A100 memory defaults
+#   - validation/test batch kept small
+
+defaults:
+  - self_forced_npfm_h100_4
+  - _self_
+
+trainer:
+  num_nodes: 1
+  devices: 4
+  precision: bf16-mixed
+  use_distributed_sampler: false
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 2
+  max_epochs: 16
+
+model:
+  model_config:
+    lr: 1e-6
+    scorer_scene_num: 1680
+    self_forced:
+      estimator_warmup_epochs: 1
+      use_stop_motion: false
+    decoder:
+      use_stop_motion: false
+
+data:
+  # A100 80GB single-pod default. The launcher still wraps this with OOM
+  # fallback, but this is the measured conservative starting point.
+  train_batch_size: 160
+  val_batch_size: 8
+  test_batch_size: 8
+  num_workers: 4
+  prefetch_factor: 1
+  train_epoch_sample_fraction: 0.25
+  train_memory_balanced_batches: true

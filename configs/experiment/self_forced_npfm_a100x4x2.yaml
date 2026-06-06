@@ -27,6 +27,7 @@ trainer:
   num_nodes: 2
   devices: 4
   precision: bf16-mixed
+  use_distributed_sampler: false
 
 model:
   model_config:

@@ -35,6 +35,8 @@
 #   LIMIT_VAL_BATCHES=           Optional Trainer limit_val_batches override.
 #   MAX_EPOCHS=                  Optional Trainer max_epochs override.
 #   CHECK_VAL_EVERY_N_EPOCH=     Optional Trainer check_val_every_n_epoch override.
+#   TRAIN_EPOCH_SAMPLE_FRACTION= Optional train dataset fraction override.
+#   TRAIN_MEMORY_BALANCED_BATCHES=Optional train memory-balanced batching override.
 #   RANDOM_TERMINAL_SCOPE=         Optional override: global_batch.
 #   RANDOM_TERMINAL_POLICY=        Optional override: paper_uniform.
 #   BACKPROP_LAST_K=              Optional policy=all gradient-step override.
@@ -89,6 +91,12 @@ if [[ -n "${MAX_EPOCHS:-}" ]]; then
 fi
 if [[ -n "${CHECK_VAL_EVERY_N_EPOCH:-}" ]]; then
   EXTRA_OVERRIDES+=("trainer.check_val_every_n_epoch=${CHECK_VAL_EVERY_N_EPOCH}")
+fi
+if [[ -n "${TRAIN_EPOCH_SAMPLE_FRACTION:-}" ]]; then
+  EXTRA_OVERRIDES+=("data.train_epoch_sample_fraction=${TRAIN_EPOCH_SAMPLE_FRACTION}")
+fi
+if [[ -n "${TRAIN_MEMORY_BALANCED_BATCHES:-}" ]]; then
+  EXTRA_OVERRIDES+=("data.train_memory_balanced_batches=${TRAIN_MEMORY_BALANCED_BATCHES}")
 fi
 if [[ -n "${CATK_LR:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.lr=${CATK_LR}")
