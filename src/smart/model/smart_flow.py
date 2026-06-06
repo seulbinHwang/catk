@@ -303,9 +303,21 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
-        self.self_forced_estimator_lr = self.lr / float(
-            self.self_forced_estimator_updates_per_step
+        # critic(generated estimator) LR.  config에 estimator_lr이 양수로 명시되어 있으면
+        # 그 절대값을 그대로 사용 (generator LR 과 동일하게 두고 싶을 때 유용).  값이 없거나
+        # ``null`` / ``<= 0`` 이면 기존 비례 관계 ``lr / estimator_updates_per_step`` 을 그대로
+        # 적용 — Self-Forcing 의 dfake_gen_update_ratio 관습과 일관.
+        _estimator_lr_override = (
+            getattr(self.self_forced_config, "estimator_lr", None)
+            if self.self_forced_config is not None
+            else None
         )
+        if _estimator_lr_override is not None and float(_estimator_lr_override) > 0.0:
+            self.self_forced_estimator_lr = float(_estimator_lr_override)
+        else:
+            self.self_forced_estimator_lr = self.lr / float(
+                self.self_forced_estimator_updates_per_step
+            )
         self.self_forced_estimator_warmup_epochs = (
             resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
         )
