@@ -3821,9 +3821,22 @@ class SMARTFlow(LightningModule):
                                 )
                                 head_sq = (head_sq * gt_valid.unsqueeze(0).float()).sum(dim=-1) / denom
                                 scores = pos_w * pos_sq + head_w * head_sq
-                                best_idx_road = scores.argmin(dim=0)
-                                road_agent_idx = torch.arange(n_road, device=best_idx_road.device)
-                                selected_idx[road_active_idx] = best_idx_road
+                                road_agent_idx = torch.arange(n_road, device=scores.device)
+                                if bool(getattr(ft, "road_scene_joint_selection", False)):
+                                    road_scene = tokenized_agent["batch"][road_mask]
+                                    uniq_scene, scene_inv = torch.unique(road_scene, return_inverse=True)
+                                    n_scene = int(uniq_scene.shape[0])
+                                    scene_scores = torch.zeros(sample_k, n_scene, device=scores.device, dtype=scores.dtype)
+                                    scene_scores.index_add_(1, scene_inv, scores)
+                                    best_k_scene = scene_scores.argmin(dim=0)
+                                    best_idx_road = best_k_scene[scene_inv]
+                                    n_batch_scene = int(tokenized_agent["batch"].max().item()) + 1
+                                    scene_best_k_full = torch.zeros(n_batch_scene, device=scores.device, dtype=torch.long)
+                                    scene_best_k_full[uniq_scene] = best_k_scene
+                                    selected_idx = scene_best_k_full[tokenized_agent["batch"][active_mask]]
+                                else:
+                                    best_idx_road = scores.argmin(dim=0)
+                                    selected_idx[road_active_idx] = best_idx_road
                                 selected_scores_for_loss = scores[best_idx_road, road_agent_idx].detach()
                                 selected_clean_for_loss = y_hat[best_idx_road, road_active_idx].detach()
                                 selected_pos_for_loss = pred_pos_global[
@@ -3899,6 +3912,21 @@ class SMARTFlow(LightningModule):
                                         future_loss_mask=selected_future_loss_mask,
                                     )
                                     keep_mask = selected_future_loss_mask.any(dim=1)
+
+                                # RoaD-faithful: train on the model's own selected clean
+                                # control sample directly (no IK re-encode, no round-trip
+                                # drop). Zero the non-holonomic delta_n channel exactly like
+                                # pretraining build_rolling_control_target (delta_n is a dead
+                                # control DoF for vehicle/cyclist).
+                                road_clean_target = selected_clean_for_loss.clone()
+                                if self.use_kinematic_control_flow and not bool(
+                                    getattr(agent_enc, "use_holonomic_model_only", False)
+                                ):
+                                    from src.smart.modules.kinematic_control import PEDESTRIAN_TYPE_ID
+                                    _nonhol_mask = road_agent_type.to(road_clean_target.device) != PEDESTRIAN_TYPE_ID
+                                    if bool(_nonhol_mask.any().item()):
+                                        road_clean_target[_nonhol_mask, :, 1] = 0.0
+                                keep_mask = selected_future_loss_mask.any(dim=1)
 
                             if keep_mask.any():
                                 hidden_chunks.append(loss_hidden[keep_mask])
