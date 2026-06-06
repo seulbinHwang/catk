@@ -2398,6 +2398,7 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
 | lr | Generator `1.0e-6`, generated estimator `2.0e-7` |
 | estimator updates | `5` per train step |
 | estimator warmup | `1` epoch |
+| frozen map feature cache | `model.model_config.self_forced.cache_frozen_map_features=true` |
 | detach block transition | `true` |
 | self-forced sample steps | Euler `sample_steps=16` |
 | self-forced backprop | `backprop_last_k=8` |
@@ -2427,6 +2428,30 @@ kubectl exec -it -n p-pnc testaa -c main -- \
 ```bash
 python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py --stop
 ```
+
+`cache_frozen_map_features=true` 는 self-forced DMD train step 안에서 frozen map encoder의 출력을
+재사용합니다. 기본 `unfrozen_range=except_map_encoder` 에서는 map encoder가 학습되지 않으므로,
+generated estimator를 한 step 안에서 여러 번 업데이트할 때 같은 map을 반복 인코딩하지 않아도 됩니다.
+이 최적화는 decoder의 map encoder parameter가 실제로 frozen일 때만 켜지고, map encoder를 학습하도록
+설정을 바꾸면 자동으로 기존처럼 매번 인코딩합니다. 문제가 의심되면 아래 override로 즉시 끌 수 있습니다.
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
+  --replace \
+  --extra-hydra-overrides 'model.model_config.self_forced.cache_frozen_map_features=false'
+```
+
+2026-06-06 `testa + testaa` A100x4x2 짧은 probe 결과:
+
+| 조건 | 설정 | 결과 |
+|---|---|---:|
+| 기존 경로 | `cache_frozen_map_features=false`, bs18, train 12 batch, validation off | `2:27` |
+| cached 경로 | `cache_frozen_map_features=true`, bs18, train 12 batch, validation off | `2:22` |
+
+두 probe 모두 `Trainer.fit stopped: max_epochs=1 reached` 까지 정상 종료했습니다. 짧은 측정 기준으로
+전체 step time은 약 `3~5%` 개선됐고, train epoch loss는 같은 스케일을 유지했습니다. 이 최적화는 frozen
+map encoder의 dropout sample을 한 step 안에서 재사용하므로 bitwise 동일성을 목표로 하지는 않습니다.
+수식 구조, 학습 파라미터, edge set, loss target은 바꾸지 않습니다.
 
 #### 1-node x 4 H100 wo-pvc-800 self-forced 실행
 

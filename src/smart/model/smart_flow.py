@@ -302,6 +302,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
+        self.self_forced_cache_frozen_map_features = (
+            bool(getattr(self.self_forced_config, "cache_frozen_map_features", True))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_estimator_lr = self.lr / float(
             self.self_forced_estimator_updates_per_step
         )
@@ -2317,6 +2322,25 @@ class SMARTFlow(LightningModule):
             target_type="velocity",
         )
 
+    def _can_cache_self_forced_map_feature(self, decoder: SMARTFlowDecoder) -> bool:
+        """self-forced step 안에서 decoder map feature를 재사용해도 되는지 확인합니다."""
+        if not self.self_forced_cache_frozen_map_features:
+            return False
+        map_encoder = getattr(decoder, "map_encoder", None)
+        if map_encoder is None:
+            return False
+        return not any(parameter.requires_grad for parameter in map_encoder.parameters())
+
+    def _encode_self_forced_map_feature(
+        self,
+        decoder: SMARTFlowDecoder,
+        tokenized_map: Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        """frozen map encoder 출력을 self-forced step cache용으로 만듭니다."""
+        with torch.no_grad():
+            map_feature = decoder.encode_map(tokenized_map)
+        return detach_tensor_tree(map_feature)
+
     def _predict_path_flow_clean_estimate(
         self,
         decoder: SMARTFlowDecoder,
@@ -2325,6 +2349,7 @@ class SMARTFlow(LightningModule):
         noisy_path_norm: Tensor,
         tau: Tensor,
         anchor_mask: Tensor,
+        map_feature: Dict[str, Tensor] | None = None,
     ) -> Dict[str, Tensor]:
         """주어진 decoder가 noisy N초 path를 어떻게 clean path로 보는지 계산합니다.
 
@@ -2335,11 +2360,14 @@ class SMARTFlow(LightningModule):
             noisy_path_norm: noisy path입니다. shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
             tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+            map_feature: 이미 계산한 지도 특징입니다. 값이 있으면 ``tokenized_map`` 으로
+                다시 map encoder를 호출하지 않습니다.
 
         Returns:
             Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
         """
-        map_feature = decoder.encode_map(tokenized_map)
+        if map_feature is None:
+            map_feature = decoder.encode_map(tokenized_map)
         return decoder.path_flow_velocity_for_anchor0(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
@@ -2499,6 +2527,14 @@ class SMARTFlow(LightningModule):
         self.self_forced_generated_estimator.train()
         try:
             with module_gradients_disabled(self.encoder, self.self_forced_target_teacher):
+                estimator_map_feature = None
+                if has_committed_path_local and self._can_cache_self_forced_map_feature(
+                    self.self_forced_generated_estimator,
+                ):
+                    estimator_map_feature = self._encode_self_forced_map_feature(
+                        decoder=self.self_forced_generated_estimator,
+                        tokenized_map=estimator_tokenized_map,
+                    )
                 for _ in range(self.self_forced_estimator_updates_per_step):
                     optimizer.zero_grad(set_to_none=True)
                     self._prepare_self_forced_estimator_backward_boundary()
@@ -2518,6 +2554,7 @@ class SMARTFlow(LightningModule):
                             noisy_path_norm=noisy_path_norm,
                             tau=tau,
                             anchor_mask=estimator_anchor_mask,
+                            map_feature=estimator_map_feature,
                         )
                         last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
                     else:

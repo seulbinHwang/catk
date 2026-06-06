@@ -80,6 +80,9 @@ model_config:
     use_stop_motion: false
     estimator_updates_per_step: 5
     estimator_warmup_epochs: 0
+    # Reuse the frozen map encoder output inside a self-forced train step.
+    # This is enabled only when the decoder map encoder is actually frozen.
+    cache_frozen_map_features: true
     initialize_aux_from_generator_on_fit_start: true
     unfrozen_range: except_map_encoder
     ema_weight: 0.99
