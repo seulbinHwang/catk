@@ -7,8 +7,7 @@
 # Differences vs. the 6xH100 preset:
 #   * `trainer.devices=4` is pinned so the preset encodes the H100x4 intent.
 #   * The core self-forced LR/sampling/loss knobs match the 6xH100 preset:
-#     generator lr 4e-6, generated-estimator optimizer lr 8e-7
-#     (= lr / estimator_updates_per_step),
+#     generator lr 1e-6, generated-estimator optimizer lr 1e-6,
 #     anchor FM off and random terminal denoising enabled.
 #   * Bounded Clean-DMD guidance defaults are pinned here for the 4xH100
 #     experiment: clean_dmd_normalizer_eps=0.05, clean_dmd_tau_low=0.02,

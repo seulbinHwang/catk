@@ -2059,13 +2059,13 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 ### 5.11 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
-- H100 preset은 Generator lr `1e-6`, generated estimator optimizer lr `2e-7` (`1e-6 / 5`), `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=except_map_encoder`, `detach_block_transition=true`, sampling = Euler `sample_steps=16` / `backprop_last_k=8` / `noise_scale=1.0` 을 기본으로 둡니다.
+- H100 preset은 Generator lr `1e-6`, generated estimator optimizer lr `1e-6`, `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=except_map_encoder`, `detach_block_transition=true`, sampling = Euler `sample_steps=16` / `backprop_last_k=8` / `noise_scale=1.0` 을 기본으로 둡니다.
 - Bounded Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=0.05`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다. `clean_dmd_normalizer_eps` 는 active RMS stable scale의 최소값입니다.
 - Generator EMA 기본값은 `ema_weight=0.99`, `ema_start_step=50` 입니다. EMA는 online Generator update 직후에만 갱신되고, generated estimator에는 적용하지 않습니다.
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=0` 입니다. self-forcing 시작 직후부터 generated estimator 업데이트와 Generator 업데이트를 같은 train step 안에서 수행합니다.
 - 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
 - self-forced preset은 각 epoch마다 train dataset의 10%만 새로 랜덤 샘플링해 학습합니다. 비율은 `data.train_epoch_sample_fraction` 으로 바꾸며, `1.0` 으로 두면 전체 train dataset을 사용합니다.
-- self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 LR scheduler를 쓰지 않습니다. Generator lr은 `model.model_config.lr` 로 설정하고, generated estimator optimizer lr은 별도 config 없이 `model.model_config.lr / model.model_config.self_forced.estimator_updates_per_step` 으로 계산합니다. 따라서 self-forced preset에는 `lr_warmup_steps` / `lr_min_ratio` override를 두지 않습니다.
+- self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 LR scheduler를 쓰지 않습니다. 두 optimizer 모두 같은 `model.model_config.lr` 을 사용합니다. 따라서 self-forced preset에는 `lr_warmup_steps` / `lr_min_ratio` override를 두지 않습니다.
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
 - 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/epoch 를 resume하지 않고 pretrained weight만 로드합니다.
 - 전제: `ckpt_path` 에는 같은 `flow_window_steps` 로 pretrain 된 Generator checkpoint 를 넣습니다. 모델 default 는 `flow_window_steps=20` (2초) 이고, ckpt 가 2초 horizon 으로 pretrain 된 경우 override 하지 않는 편이 안전합니다.
@@ -2126,7 +2126,7 @@ python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py \
 | prefix valid mask | `use_prefix_valid_future_loss_mask=true` |
 | rolling supervision | `use_rolling_supervision=true` |
 | lr | `1.0e-6` |
-| generated estimator lr | `1.0e-6 / estimator_updates_per_step = 2.0e-7` |
+| generated estimator lr | `1.0e-6` |
 | estimator updates | `5` per train step |
 | estimator warmup | `0` epoch |
 | detach block transition | `true` |
@@ -2171,7 +2171,7 @@ python scripts/launch_self_forced_dmd_epoch061_h100x6_hsb1_static_pod.py --repla
 | train metric path | `decoder.detach_train_metric_clean=true` |
 | train data fraction | `data.train_epoch_sample_fraction=0.1` |
 | epochs | `16` |
-| lr | Generator `1.0e-6`, generated estimator `2.0e-7` |
+| lr | Generator `1.0e-6`, generated estimator `1.0e-6` |
 | initial train batch | per-rank `18`, effective global batch `108` |
 | OOM fallback | `18 -> 17 -> ...`, latest self-forced checkpoint resume |
 | tmux session | `catk-self-forced-dmd-epoch061-h100x6-hsb1` |
@@ -2395,7 +2395,7 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
 | round-trip filter | `control_round_trip_max_position_error_m=0.5` |
 | prefix valid mask | `use_prefix_valid_future_loss_mask=true` |
 | rolling supervision | `use_rolling_supervision=true` |
-| lr | Generator `1.0e-6`, generated estimator `2.0e-7` |
+| lr | Generator `1.0e-6`, generated estimator `1.0e-6` |
 | estimator updates | `5` per train step |
 | estimator warmup | `1` epoch |
 | frozen map feature cache | `model.model_config.self_forced.cache_frozen_map_features=true` |

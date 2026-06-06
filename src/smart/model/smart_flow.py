@@ -307,9 +307,6 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
-        self.self_forced_estimator_lr = self.lr / float(
-            self.self_forced_estimator_updates_per_step
-        )
         self.self_forced_estimator_warmup_epochs = (
             resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
         )
@@ -3461,7 +3458,7 @@ open_metric_dict:
                 raise RuntimeError("No trainable generated-estimator parameters found.")
             generated_estimator_optimizer = torch.optim.AdamW(
                 estimator_params,
-                lr=self.self_forced_estimator_lr,
+                lr=self.lr,
             )
             return [generator_optimizer, generated_estimator_optimizer]
 
