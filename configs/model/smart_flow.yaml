@@ -72,6 +72,7 @@ model_config:
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
     distribution_matching_objective: dmd
+    clean_dmd_normalizer_eps: 0.05
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
     detach_block_transition: true

@@ -41,7 +41,7 @@
 #   UNFROZEN_RANGE=               Optional trainable Generator range override.
 #   EMA_WEIGHT=                    Optional Generator EMA decay override.
 #   EMA_START_STEP=                Optional Generator EMA start update override.
-#   CLEAN_DMD_NORMALIZER_EPS=      Optional Clean-DMD normalizer epsilon override.
+#   CLEAN_DMD_NORMALIZER_EPS=      Optional Clean-DMD stable scale floor override.
 #   CLEAN_DMD_TAU_LOW=             Optional Clean-DMD guidance tau lower bound.
 #   CLEAN_DMD_TAU_HIGH=            Optional Clean-DMD guidance tau upper bound.
 #   CATK_EXTRA_OVERRIDES=          Optional whitespace-separated Hydra overrides.

@@ -39,6 +39,7 @@ from src.smart.modules.self_forced_dmd_guidance import (
     active_control_dmd_surrogate_loss,
     build_active_control_mask,
     build_clean_dmd_direction,
+    compute_self_forced_dmd_injection_scale,
 )
 from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
 from src.smart.modules.self_forced_update_separation import (
@@ -238,9 +239,9 @@ class SMARTFlow(LightningModule):
             else 0.0
         )
         self.self_forced_direction_normalizer_eps = (
-            float(getattr(self.self_forced_config, "clean_dmd_normalizer_eps", 1.0e-3))
+            float(getattr(self.self_forced_config, "clean_dmd_normalizer_eps", 0.05))
             if self.self_forced_config is not None
-            else 1.0e-3
+            else 0.05
         )
         self.self_forced_distribution_matching_objective = (
             str(getattr(self.self_forced_config, "distribution_matching_objective", "dmd")).lower()
@@ -262,11 +263,11 @@ class SMARTFlow(LightningModule):
                 getattr(
                     self.self_forced_config,
                     "sid_normalizer_eps",
-                    self.self_forced_direction_normalizer_eps,
+                    1.0e-3,
                 )
             )
             if self.self_forced_config is not None
-            else self.self_forced_direction_normalizer_eps
+            else 1.0e-3
         )
         self.self_forced_detach_block_transition = (
             bool(getattr(self.self_forced_config, "detach_block_transition", False))
@@ -2796,16 +2797,23 @@ class SMARTFlow(LightningModule):
             anchor_mask=anchor_mask,
             active_control_mask=active_control_mask,
         )
+        dmd_start_epoch = int(self.self_forced_start_epoch) + int(self.self_forced_estimator_warmup_epochs)
+        dmd_injection_scale = compute_self_forced_dmd_injection_scale(
+            current_epoch=int(self.current_epoch),
+            dmd_start_epoch=dmd_start_epoch,
+        )
         sf_loss, target_path_norm = active_control_dmd_surrogate_loss(
             committed_path_norm=committed_path_norm,
             dmd_direction=path_delta,
             active_mask=active_control_mask,
+            dmd_injection_scale=dmd_injection_scale,
         )
         self._set_self_forced_backward_context(
             committed_path_norm=committed_path_norm,
             path_delta=path_delta,
             target_path_norm=target_path_norm,
             active_control_mask=active_control_mask,
+            dmd_injection_scale=committed_path_norm.new_tensor(dmd_injection_scale),
         )
         return sf_loss
 

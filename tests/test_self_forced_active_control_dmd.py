@@ -11,6 +11,7 @@ from src.smart.modules.self_forced_dmd_guidance import (
     active_control_dmd_surrogate_loss,
     build_active_control_mask,
     build_clean_dmd_direction,
+    compute_self_forced_dmd_injection_scale,
 )
 
 
@@ -51,24 +52,37 @@ def test_active_control_mask_keeps_all_axes_for_holonomic_only_mode() -> None:
     torch.testing.assert_close(mask, torch.ones((3, 1, 3)))
 
 
-def test_active_control_dmd_normalizer_ignores_nonholonomic_lateral_axis() -> None:
+def _active_rms(value: torch.Tensor, active_mask: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
+    active = active_mask.to(dtype=value.dtype).expand_as(value)
+    denom = active.flatten(1).sum(dim=1, keepdim=True).clamp_min(1.0) + eps
+    return ((value.square() * active).flatten(1).sum(dim=1, keepdim=True) / denom).sqrt()
+
+
+def test_active_control_dmd_ignores_nonholonomic_lateral_axis_and_caps_step() -> None:
     committed = torch.tensor(
         [
             [
-                [1.0, 100.0, 3.0],
-                [1.0, 100.0, 3.0],
+                [0.0, 100.0, 0.0],
+                [0.0, 100.0, 0.0],
             ]
         ]
     )
     target_clean = torch.tensor(
         [
             [
-                [2.0, 5.0, 4.0],
-                [2.0, 5.0, 4.0],
+                [0.01, 5.0, 0.01],
+                [0.01, 5.0, 0.01],
             ]
         ]
     )
-    generated_clean = torch.zeros_like(target_clean)
+    generated_clean = torch.tensor(
+        [
+            [
+                [-0.99, -5.0, -0.99],
+                [-0.99, -5.0, -0.99],
+            ]
+        ]
+    )
     active_mask = torch.tensor([[[1.0, 0.0, 1.0]]])
 
     direction = build_clean_dmd_direction(
@@ -76,18 +90,50 @@ def test_active_control_dmd_normalizer_ignores_nonholonomic_lateral_axis() -> No
         target_clean_norm=target_clean,
         generated_clean_norm=generated_clean,
         active_mask=active_mask,
-        normalizer_eps=1.0e-3,
+        normalizer_eps=0.05,
     )
 
-    expected = torch.tensor(
-        [
+    generator_teacher_rms = _active_rms(committed - target_clean, active_mask)
+    direction_rms = _active_rms(direction, active_mask)
+    torch.testing.assert_close(direction[:, :, 1], torch.zeros_like(direction[:, :, 1]))
+    assert torch.all(direction_rms <= generator_teacher_rms + 1.0e-6)
+    torch.testing.assert_close(
+        direction,
+        torch.tensor(
             [
-                [2.0, 0.0, 4.0],
-                [2.0, 0.0, 4.0],
+                [
+                    [0.01, 0.0, 0.01],
+                    [0.01, 0.0, 0.01],
+                ]
             ]
-        ]
+        ),
+        atol=2.0e-6,
+        rtol=2.0e-6,
     )
-    torch.testing.assert_close(direction, expected)
+
+
+def test_active_control_dmd_drops_agent_when_direction_is_against_teacher() -> None:
+    committed = torch.ones((1, 2, 3))
+    target_clean = torch.zeros_like(committed)
+    generated_clean = -torch.ones_like(committed)
+    active_mask = torch.ones((1, 1, 3))
+
+    direction = build_clean_dmd_direction(
+        committed_path_norm=committed,
+        target_clean_norm=target_clean,
+        generated_clean_norm=generated_clean,
+        active_mask=active_mask,
+        normalizer_eps=0.05,
+    )
+
+    torch.testing.assert_close(direction, torch.zeros_like(direction))
+
+
+def test_self_forced_dmd_injection_scale_ramps_for_two_epochs() -> None:
+    assert compute_self_forced_dmd_injection_scale(current_epoch=0, dmd_start_epoch=0) == 0.25
+    assert compute_self_forced_dmd_injection_scale(current_epoch=1, dmd_start_epoch=0) == 0.625
+    assert compute_self_forced_dmd_injection_scale(current_epoch=2, dmd_start_epoch=0) == 1.0
+    assert compute_self_forced_dmd_injection_scale(current_epoch=5, dmd_start_epoch=5) == 0.25
 
 
 def test_active_control_dmd_loss_has_no_vehicle_lateral_gradient() -> None:
@@ -104,17 +150,19 @@ def test_active_control_dmd_loss_has_no_vehicle_lateral_gradient() -> None:
         committed_path_norm=committed,
         dmd_direction=dmd_direction,
         active_mask=active_mask,
+        dmd_injection_scale=0.25,
     )
     loss.backward()
 
     assert target.requires_grad is False
+    torch.testing.assert_close(target, torch.full_like(target, 0.25))
     torch.testing.assert_close(committed.grad[0, 0, 1], torch.tensor(0.0))
     torch.testing.assert_close(
         committed.grad,
         torch.tensor(
             [
-                [[-0.25, 0.0, -0.25]],
-                [[-1.0 / 6.0, -1.0 / 6.0, -1.0 / 6.0]],
+                [[-0.0625, 0.0, -0.0625]],
+                [[-1.0 / 24.0, -1.0 / 24.0, -1.0 / 24.0]],
             ]
         ),
     )

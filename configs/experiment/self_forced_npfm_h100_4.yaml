@@ -10,8 +10,8 @@
 #     generator lr 4e-6, generated-estimator optimizer lr 8e-7
 #     (= lr / estimator_updates_per_step),
 #     anchor FM off and random terminal denoising enabled.
-#   * Clean-DMD guidance defaults are pinned here for the 4xH100 experiment:
-#     clean_dmd_normalizer_eps=1e-3, clean_dmd_tau_low=0.02,
+#   * Bounded Clean-DMD guidance defaults are pinned here for the 4xH100
+#     experiment: clean_dmd_normalizer_eps=0.05, clean_dmd_tau_low=0.02,
 #     clean_dmd_tau_high=0.98.
 #   * `max_epochs / check_val_every_n_epoch / limit_val_batches` unchanged,
 #     so the training budget in "epochs over the dataset" matches the 6xH100
@@ -52,7 +52,7 @@ model:
       enabled: true
       start_epoch: 0
       weight: 1.0
-      clean_dmd_normalizer_eps: 1.0e-3
+      clean_dmd_normalizer_eps: 0.05
       clean_dmd_tau_low: 0.02
       clean_dmd_tau_high: 0.98
       anchor_weight: 0.1
