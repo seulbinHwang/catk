@@ -2529,6 +2529,95 @@ kubectl exec -it -n p-pnc testa -c main -- \
 python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py --stop
 ```
 
+#### hsb-npc-training-3-1 H100x3 single-pod DMD self-forcing fine-tuning
+
+`hsb-npc-training-3-1` 단일 H100 3GPU pod에서 epoch 61 pretrained Generator checkpoint로
+DMD-style self-forced fine-tuning을 돌릴 때는 아래 launcher를 씁니다. 이 launcher는
+pod를 만들거나 지우거나 재시작하지 않고, pod 안의 `/tmp/catk_self_forced_dmd_h100x3_hsb31`
+클린 체크아웃과 tmux session만 사용합니다. 따라서 pod의 기존 `/mnt/nuplan/projects/catk`
+작업트리를 건드리지 않습니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py --replace
+```
+
+짧은 training + validation smoke만 확인하려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
+  --replace \
+  --task-name flow_self_forced_dmd_h100x3_hsb31_smoke_bs160 \
+  --session catk-self-forced-dmd-h100x3-hsb31-smoke \
+  --max-epochs 1 \
+  --check-val-every-n-epoch 1 \
+  --limit-train-batches 2 \
+  --limit-val-batches 1
+```
+
+기본 실험 설정:
+
+| 항목 | 값 |
+|---|---|
+| pod | `hsb-npc-training-3-1` 3 H100 |
+| branch | `semi_control_stable` |
+| pod checkout | `/tmp/catk_self_forced_dmd_h100x3_hsb31` |
+| experiment | `self_forced_npfm_h100_3_hsb31` |
+| default task | `flow_self_forced_dmd_h100x3_hsb31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs160_frac025_ep16_middle` |
+| pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| checkpoint 의미 | `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` epoch 61 Generator, artifact metadata epoch 62 / global step 278192 |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_hsb31_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| action | 첫 시도 `finetune`, OOM 후 재시도는 최신 self-forced `epoch_last.ckpt` 기준 `fit` |
+| DDP shape | `trainer.num_nodes=1`, `trainer.devices=3`, 총 3 ranks |
+| precision | `bf16-mixed` |
+| DMD objective | active-control DMD |
+| DMD active axes | pedestrian `[delta_s, delta_n, delta_theta]`, vehicle/cyclist `[delta_s, delta_theta]` |
+| lr | Generator `1.0e-6`, generated estimator `1.0e-6` |
+| estimator updates | `5` per train step |
+| estimator warmup | `1` epoch |
+| trainable range | `unfrozen_range=middle` |
+| detach block transition | `true` |
+| self-forced sample steps | Euler `sample_steps=16` |
+| self-forced backprop | `backprop_last_k=8` |
+| random terminal policy | `all` |
+| stop-motion | self-forced training rollout `false`, validation/inference decoder `false` |
+| train data fraction | `data.train_epoch_sample_fraction=0.25` |
+| train batch construction | `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false` |
+| validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, every 2 epochs |
+| epochs | `16` |
+| initial train batch | per-rank `160`, effective global batch `480` |
+| OOM fallback | 기본값은 `160` 고정. batch fallback probe가 필요할 때만 `--min-bs`를 명시적으로 낮춥니다. |
+| val/test batch | per-rank `8` |
+| scorer scenes | `1680` |
+| tmux session | `catk-self-forced-dmd-h100x3-hsb31` |
+
+2026-06-06 `hsb-npc-training-3-1` H100x3 검증 결과:
+
+| 검증 | 설정 | 결과 |
+|---|---|---|
+| train smoke | `bs160`, 3 ranks, `limit_train_batches=2`, `max_epochs=1` | 성공, `train/loss_epoch=0.07317`, `time/train_epoch_minutes=0.63746`, `worst_peak_reserved_pct_epoch_max=83.45095` |
+| validate smoke | 위 smoke의 `epoch_last.ckpt`, `action=validate`, `scorer_scene_num=24`, `limit_val_batches=1` | 성공, `val_closed/sim_agents_2025/realism_meta_metric=0.769756`, `scenario_counter=24` |
+| cache / DDP | `/workspace/womd_v1_3/SMART_cache`, `torchrun --standalone --nproc_per_node=3` | 실제 cache와 3 H100 rank에서 train 및 closed-loop validation 경로 모두 통과 |
+
+위 smoke 기준 첫 train batch에는 dataloader/DDP warmup이 포함되어 28초, 두 번째
+train batch는 약 9초였습니다. full run의 epoch당 step 수는 effective global batch
+`480`과 `train_epoch_sample_fraction=0.25` 기준 약 255 step 수준으로 잡히므로, 초기
+추정은 train-only epoch당 대략 `35~45분`, validation epoch은 추가 시간이 붙습니다.
+실제 full run 시작 후에는 첫 1~2 epoch의 `time/train_epoch_minutes`를 기준으로 다시
+보정하세요.
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc hsb-npc-training-3-1 -c main -- \
+  tmux attach -t catk-self-forced-dmd-h100x3-hsb31
+```
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py --stop
+```
+
 같은 단일 A100x4 recipe를 `testaa` pod에서 별도 task/session으로 돌리려면 아래 wrapper를
 사용합니다. 학습 설정은 위 `testa` launcher와 같고, 기본 pod / task name / tmux session /
 pretrain checkpoint cache 경로만 `testaa` 전용으로 분리됩니다.

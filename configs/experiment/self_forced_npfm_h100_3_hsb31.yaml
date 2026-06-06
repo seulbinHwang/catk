@@ -1,0 +1,56 @@
+# @package _global_
+
+# H100x3 single-pod DMD self-forcing preset for `hsb-npc-training-3-1`.
+#
+# This is the single-pod sibling of the epoch-061 A100x4 `testa` recipe:
+#   - one pod / three ranks
+#   - same DMD self-forced objective and epoch-061 Generator starting point
+#   - fixed initial per-rank train batch 160 through the launcher
+
+defaults:
+  - self_forced_npfm_h100_4
+  - _self_
+
+trainer:
+  num_nodes: 1
+  devices: 3
+  precision: bf16-mixed
+  use_distributed_sampler: false
+  limit_val_batches: 0.1
+  check_val_every_n_epoch: 2
+  max_epochs: 16
+  gradient_clip_val: null
+  sync_batchnorm: false
+  strategy:
+    find_unused_parameters: true
+
+model:
+  model_config:
+    lr: 1e-6
+    val_open_loop: false
+    scorer_scene_num: 1680
+    self_forced:
+      distribution_matching_objective: dmd
+      estimator_warmup_epochs: 1
+      use_stop_motion: false
+      clean_dmd_normalizer_eps: 0.05
+      clean_dmd_tau_low: 0.02
+      clean_dmd_tau_high: 0.98
+      sampling:
+        random_terminal_step:
+          scope: global_batch
+          policy: all
+          min_executed_steps: 16
+        backprop_last_k: 8
+    decoder:
+      detach_train_metric_clean: true
+      use_stop_motion: false
+
+data:
+  train_batch_size: 160
+  val_batch_size: 8
+  test_batch_size: 8
+  num_workers: 4
+  prefetch_factor: 1
+  train_epoch_sample_fraction: 0.25
+  train_memory_balanced_batches: true
