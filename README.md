@@ -823,10 +823,13 @@ bash scripts/start_smart_ntp_a100x4x2_testa_waymo_val_submission_epoch064.sh
 | description | `smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_fresh_20260601` |
 | split | validation only |
 | upload | `waymo_submission.enabled=true`, `submit_validate=true`, `submit_test=false` |
+| checkpoint 호환 override | `model.model_config.decoder.num_freq_bands=88` |
 | storage state 기본 경로 | `/tmp/catk_smart_ntp_a100x4x2_legacy_inputs_oom_retry_main/secrets/waymo/waymo_storage_state.json` |
 
 다른 checkpoint나 metadata를 쓰고 싶으면 `CKPT_PATH`, `METHOD_NAME`,
 `SUBMISSION_DESCRIPTION`, `TASK_NAME`, `WAYMO_STORAGE_STATE_PATH` 환경변수로 덮어쓴다.
+단, 이 epoch 64 checkpoint는 `num_freq_bands=88`로 학습된 모델이므로 해당 override를
+빼면 checkpoint shape mismatch로 로드에 실패한다.
 
 기본값은 아래와 같다.
 

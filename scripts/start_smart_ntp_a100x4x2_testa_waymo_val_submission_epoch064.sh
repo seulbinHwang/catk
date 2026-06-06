@@ -14,5 +14,6 @@ export PROJECT_ROOT="${PROJECT_ROOT:-/tmp/catk_smart_ntp_a100x4x2_latest_main_fr
 export METHOD_NAME="${METHOD_NAME:-SMART_7M}"
 export SUBMISSION_DESCRIPTION="${SUBMISSION_DESCRIPTION:-smart_ntp_pretrain_a100x4x2_bs13_oom_retry_main_original_legacy_inputs_trainselectfalse_fresh_20260601}"
 export WAYMO_STORAGE_STATE_PATH="${WAYMO_STORAGE_STATE_PATH:-/tmp/catk_smart_ntp_a100x4x2_legacy_inputs_oom_retry_main/secrets/waymo/waymo_storage_state.json}"
+export EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-model.model_config.decoder.num_freq_bands=88}"
 
 exec bash scripts/start_smart_ntp_a100x4x2_testa_waymo_val_submission.sh "$@"
