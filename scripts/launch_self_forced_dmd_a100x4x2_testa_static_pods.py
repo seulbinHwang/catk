@@ -66,7 +66,7 @@ def main() -> int:
         "--task-name",
         (
             "flow_self_forced_dmd_a100x4x2_testa_epoch061_x5f9g0ce_activecontrol_"
-            "sample16_backprop8_lr1e-6_bs20_frac010_ep16_middle_oomretry"
+            "sample16_backprop8_lr1e-6_bs20_frac025_ep16_middle_oomretry"
         ),
         "--session",
         "catk-self-forced-dmd-a100x4x2-testa",
@@ -93,7 +93,7 @@ def main() -> int:
         "--decoder-use-stop-motion",
         "false",
         "--train-epoch-sample-fraction",
-        "0.1",
+        "0.25",
         "--max-epochs",
         "16",
         "--limit-val-batches",

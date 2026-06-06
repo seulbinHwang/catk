@@ -34,7 +34,7 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 DEFAULT_TASK_NAME = (
     "flow_self_forced_dmd_h100x6_hsb1_epoch116_activecontrol_"
-    "sample16_backprop8_lr1e-6_bs18_oomretry"
+    "sample16_backprop8_lr1e-6_bs18_frac025_oomretry"
 )
 DEFAULT_SESSION = "catk-self-forced-dmd-h100x6-hsb1"
 
@@ -372,7 +372,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", default="16")
     parser.add_argument("--check-val-every-n-epoch", default="1")
     parser.add_argument("--learning-rate", default="1.0e-6")
-    parser.add_argument("--train-epoch-sample-fraction", default="0.1")
+    parser.add_argument("--train-epoch-sample-fraction", default="0.25")
     parser.add_argument("--random-terminal-scope", default="global_batch")
     parser.add_argument("--random-terminal-policy", default="all")
     parser.add_argument("--backprop-last-k", default="8")

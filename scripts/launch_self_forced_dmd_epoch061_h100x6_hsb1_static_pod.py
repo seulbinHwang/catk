@@ -28,7 +28,7 @@ DEFAULT_ARGS = [
     "--task-name",
     (
         "flow_self_forced_dmd_h100x6_hsb1_epoch061_x5f9g0ce_activecontrol_"
-        "sample16_backprop8_lr1e-6_bs18_frac010_ep16_oomretry"
+        "sample16_backprop8_lr1e-6_bs18_frac025_ep16_oomretry"
     ),
     "--session",
     "catk-self-forced-dmd-epoch061-h100x6-hsb1",
