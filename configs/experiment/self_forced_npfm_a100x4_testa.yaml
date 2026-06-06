@@ -34,7 +34,7 @@ model:
 data:
   # A100 80GB single-pod default. The launcher still wraps this with OOM
   # fallback, but this is the measured conservative starting point.
-  train_batch_size: 160
+  train_batch_size: 144
   val_batch_size: 8
   test_batch_size: 8
   num_workers: 4

@@ -20,7 +20,7 @@ DEFAULT_TESTAA_ARGS = [
     "--task-name",
     (
         "flow_self_forced_dmd_a100x4_testaa_epoch061_x5f9g0ce_activecontrol_"
-        "sample16_backprop8_lr1e-6_bs160_frac025_ep16_middle_oomretry"
+        "sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle_oomretry"
     ),
     "--session",
     "catk-self-forced-dmd-a100x4-testaa",
