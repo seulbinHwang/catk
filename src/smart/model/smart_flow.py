@@ -836,6 +836,12 @@ class SMARTFlow(LightningModule):
 
     def _log_open_loop_train_epoch_metrics(self) -> None:
         """W&B에는 step별 global sync 없이 epoch 말 train metric만 정확히 남깁니다."""
+        if self.self_forced_enabled and self.current_epoch >= self.self_forced_start_epoch:
+            # Self-forced epochs do not use the open-loop pretrain metric
+            # accumulator for optimization. Avoid an extra epoch-boundary DDP
+            # collective here; Lightning handles the self-forced train logs.
+            self._reset_open_loop_train_epoch_metrics()
+            return
         metrics = self._compute_and_reset_open_loop_train_epoch_metrics()
         if not metrics or not self.trainer.is_global_zero:
             return
