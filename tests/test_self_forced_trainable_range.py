@@ -43,7 +43,7 @@ def _trainable_count(model: nn.Module) -> int:
 
 
 def test_resolve_self_forced_unfrozen_range_uses_default() -> None:
-    assert resolve_self_forced_unfrozen_range(None) == "except_map_encoder"
+    assert resolve_self_forced_unfrozen_range(None) == "middle"
 
 
 def test_except_map_encoder_freezes_only_map_encoder() -> None:

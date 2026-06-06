@@ -2059,7 +2059,7 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 ### 5.11 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
-- H100 preset은 Generator lr `1e-6`, generated estimator optimizer lr `1e-6`, `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=except_map_encoder`, `detach_block_transition=true`, sampling = Euler `sample_steps=16` / `backprop_last_k=8` / `noise_scale=1.0` 을 기본으로 둡니다.
+- H100 preset은 Generator lr `1e-6`, generated estimator optimizer lr `1e-6`, `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=middle`, `detach_block_transition=true`, sampling = Euler `sample_steps=16` / `backprop_last_k=8` / `noise_scale=1.0` 을 기본으로 둡니다.
 - Bounded Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=0.05`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다. `clean_dmd_normalizer_eps` 는 active RMS stable scale의 최소값입니다.
 - Generator EMA 기본값은 `ema_weight=0.99`, `ema_start_step=50` 입니다. EMA는 online Generator update 직후에만 갱신되고, generated estimator에는 적용하지 않습니다.
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=0` 입니다. self-forcing 시작 직후부터 generated estimator 업데이트와 Generator 업데이트를 같은 train step 안에서 수행합니다.
@@ -2430,7 +2430,7 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py --stop
 ```
 
 `cache_frozen_map_features=true` 는 self-forced DMD train step 안에서 frozen map encoder의 출력을
-재사용합니다. 기본 `unfrozen_range=except_map_encoder` 에서는 map encoder가 학습되지 않으므로,
+재사용합니다. 기본 `unfrozen_range=middle` 에서는 map encoder가 학습되지 않으므로,
 generated estimator를 한 step 안에서 여러 번 업데이트할 때 같은 map을 반복 인코딩하지 않아도 됩니다.
 이 최적화는 decoder의 map encoder parameter가 실제로 frozen일 때만 켜지고, map encoder를 학습하도록
 설정을 바꾸면 자동으로 기존처럼 매번 인코딩합니다. 문제가 의심되면 아래 override로 즉시 끌 수 있습니다.
@@ -2668,7 +2668,7 @@ bash scripts/self_forced_h100_6_with_oom_retry.sh
 
 각 시도의 로그는 `logs/_self_forced_oom_retry/<TASK_NAME>/attempt_NNN_bsBB.log` 로 분리 저장되어, 어느 시도에서 OOM 이 났는지 / 어디서 다음 시도가 이어 받았는지 사후 추적 가능합니다.
 
-self-forced fine-tuning에서 학습할 파라미터 범위는 `unfrozen_range` 로 정합니다. 기본값 `except_map_encoder` 는 map encoder만 고정하고 나머지 Generator / generated estimator 파라미터를 학습 대상으로 둡니다. 더 보수적으로 보려면 마지막 궤적 생성부만 여는 `full_flow_decoder` 를 먼저 시도하세요.
+self-forced fine-tuning에서 학습할 파라미터 범위는 `unfrozen_range` 로 정합니다. 기본값 `middle` 은 map encoder와 대부분의 agent 문맥부를 고정하고, 마지막 agent 문맥 블록과 flow decoder만 학습 대상으로 둡니다. 더 넓게 학습하려면 map encoder만 고정하는 `except_map_encoder` 를 명시하고, 더 보수적으로 보려면 마지막 궤적 생성부만 여는 `full_flow_decoder` 를 시도하세요.
 
 ```bash
 ... model.model_config.self_forced.unfrozen_range=full_flow_decoder
@@ -3499,7 +3499,7 @@ K commit block 수 = flow_window_steps / 5
 - Clean-DMD guidance의 기본 noising 구간은 `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 입니다.
 - active RMS stable scale은 `clean_dmd_normalizer_eps=0.05` 로 최소값을 둬서 pretrained 근처에서 target path가 과하게 튀는 상황을 줄입니다.
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.use_anchor_flow_matching_loss=false` 로 두면 `anchor_weight` 값과 무관하게 self-forced active step에서 training-mode open-loop forward와 FM loss 계산 자체를 생략합니다. `true` 일 때만 `model.model_config.self_forced.anchor_weight` 로 total loss 반영 강도를 제어합니다. anchor FM 을 끈 상태에서 어떤 rank 의 committed self-rollout 까지 비어있는 (모든 agent 가 invalid anchor0) 드문 경우에는, encoder 파라미터 합에 0 을 곱한 zero-loss 로 backward 만 한 번 돌려 DDP all-reduce 참여를 보장하고 optimizer step 은 건너뜁니다. 이 가드가 없으면 그 rank 만 backward 를 호출하지 않아 다른 rank 의 NCCL all-reduce 가 NCCL_TIMEOUT 까지 hang 합니다.
-- 선택적 trainable range. `model.model_config.self_forced.unfrozen_range=except_map_encoder` 가 기본값이며, map encoder만 고정하고 나머지 Generator / generated estimator 파라미터는 학습합니다. `middle` 은 마지막 agent 문맥 블록과 flow decoder만 열고, `full_flow_decoder` 는 마지막 궤적 생성부만 엽니다.
+- 선택적 trainable range. `model.model_config.self_forced.unfrozen_range=middle` 이 기본값이며, map encoder와 대부분의 agent 문맥부는 고정하고 마지막 agent 문맥 블록과 flow decoder만 학습합니다. `except_map_encoder` 는 map encoder만 고정하고 나머지 Generator / generated estimator 파라미터를 열며, `full_flow_decoder` 는 마지막 궤적 생성부만 엽니다.
 - epoch별 train subset sampling. self-forced preset은 `data.train_epoch_sample_fraction=0.1` 를 기본으로 두어 매 epoch 전체 train dataset의 10%만 새로 랜덤 샘플링해 학습합니다. DDP에서는 모든 rank가 같은 전역 subset을 공유한 뒤 rank별로 나눠 받습니다. `1.0` 으로 override하면 기존처럼 전체 train dataset을 씁니다.
 - Generator EMA는 Generator에만 적용합니다. `F_psi` 는 현재 online Generator가 만든 분포를 따라가야 하므로 EMA를 두지 않고, `F_rho` 는 pretrained 기준점이라 계속 frozen 상태로 둡니다.
 - bf16-mixed 안전 backward boundary. self-forced 경로의 forward 와 loss 계산은 mixed precision 으로 유지하되, `manual_backward` 호출 순간만 autocast 를 끄고 scalar loss 를 fp32 로 넘깁니다. 이는 manual optimization 에서 반복 backward 를 수행할 때 PyTorch autocast promote 규칙이 backward graph 의 dtype 을 다시 분류하다가 실패하는 문제를 피하기 위한 경계입니다.
@@ -3623,14 +3623,14 @@ H100 preset은 `experiment=self_forced_npfm_sid_h100_4` 또는
 
 ### Self-forced Trainable Range
 
-- `model.model_config.self_forced.unfrozen_range=except_map_encoder` 가 기본값입니다.
-  기존 self-forcing의 `freeze_map_encoder=true` 와 같은 의도이며, map encoder만 고정하고 나머지 generator / generated estimator는 학습할 수 있게 둡니다.
+- `model.model_config.self_forced.unfrozen_range=middle` 이 기본값입니다.
+  map encoder와 대부분의 agent 문맥부는 고정하고, 마지막 agent 문맥 블록과 flow decoder만 학습할 수 있게 둡니다.
 - `unfrozen_range=middle` 은 map encoder와 대부분의 agent 문맥부를 고정하고,
   `agent_encoder.flow_decoder` 와 마지막 temporal / map-to-agent / agent-to-agent 문맥 블록만 엽니다.
   즉 `except_map_encoder` 보다 더 보수적이고, `full_flow_decoder` 보다는 덜 보수적인 중간 설정입니다.
 - `unfrozen_range=full_flow_decoder` 는 마지막 궤적 생성부만 학습 가능하게 두는 설정입니다.
   지도/장면/상호작용 해석부는 pretrained 상태로 보존하고, 자기 rollout 분포 차이는 마지막 궤적 생성부가 흡수하게 합니다.
-- self-forcing용 기존 `freeze_map_encoder` 설정은 제거했습니다. 같은 동작이 필요하면 `unfrozen_range=except_map_encoder` 를 사용합니다.
+- self-forcing용 기존 `freeze_map_encoder` 설정은 제거했습니다. map encoder만 고정하고 나머지를 전부 학습하는 기존 동작이 필요하면 `unfrozen_range=except_map_encoder` 를 사용합니다.
 
 예시:
 

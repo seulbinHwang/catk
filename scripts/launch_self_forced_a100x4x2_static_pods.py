@@ -1223,7 +1223,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-batch-size", type=int, default=8)
     parser.add_argument("--precision", default="bf16-mixed")
     parser.add_argument("--scorer-scene-num", type=int, default=1680)
-    parser.add_argument("--unfrozen-range", default="except_map_encoder")
+    parser.add_argument("--unfrozen-range", default="middle")
     parser.add_argument("--estimator-warmup-epochs", type=int, default=1)
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="")

@@ -84,7 +84,7 @@ model_config:
     # This is enabled only when the decoder map encoder is actually frozen.
     cache_frozen_map_features: true
     initialize_aux_from_generator_on_fit_start: true
-    unfrozen_range: except_map_encoder
+    unfrozen_range: middle
     ema_weight: 0.99
     ema_start_step: 50
     # Manual gradient clip used inside self-forced training_step / estimator

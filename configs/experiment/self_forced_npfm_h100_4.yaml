@@ -62,7 +62,7 @@ model:
       # Fresh finetune syncs F_rho/F_psi from the pretrained Generator.
       # Resume from a self-forced checkpoint preserves restored aux states.
       initialize_aux_from_generator_on_fit_start: true
-      unfrozen_range: except_map_encoder
+      unfrozen_range: middle
       ema_weight: 0.99
       ema_start_step: 50
       sampling:
