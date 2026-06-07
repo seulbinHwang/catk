@@ -3378,6 +3378,12 @@ class SMARTFlow(LightningModule):
         """
         self._configure_fast_wosac_validation_scope()
         self._apply_fit_time_validation_batch_limit()
+        if (
+            self.self_forced_enabled
+            and self.self_forced_use_distribution_matching_loss
+            and int(self.self_forced_estimator_warmup_epochs) > 0
+        ):
+            self._capture_self_forced_validation_interval()
         self._sync_self_forced_auxiliary_models()
         self._load_self_forced_generated_estimator_bank()
         self._prepare_self_forced_generator_ema()
