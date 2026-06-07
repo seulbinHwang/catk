@@ -2077,13 +2077,13 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 #### Pose-projected DMD guidance
 
 `use_kinematic_control_flow=true`, `use_holonomic_model_only=false`, `use_rolling_supervision=true`
-조건의 self-forced DMD fine-tuning에서는 기본적으로 pose-projected DMD guidance를 사용합니다.
+조건의 self-forced DMD fine-tuning에서는 기본적으로 direct control-space DMD guidance를 사용합니다.
 
 ```yaml
 model:
   model_config:
     self_forced:
-      project_dmd_to_pose_space: true
+      project_dmd_to_pose_space: false
       dmd_use_stable_scale_filter: true
       dmd_stable_scale_scope: type
       dmd_use_teacher_alignment_filter: false
@@ -2091,8 +2091,9 @@ model:
       dmd_use_injection_ramp: false
 ```
 
-핵심은 DMD 방향을 3축 control 값에서 바로 판단하지 않고, 실제 closed-loop metric이 보는
-pose-space에서 먼저 판단한 뒤 최종 target만 다시 rolling control-space로 되돌리는 것입니다.
+기본값에서는 DMD 방향과 안정화 필터를 3축 control 값에서 바로 계산합니다. pose-projected DMD를
+켜면 실제 closed-loop metric이 보는 pose-space에서 먼저 판단한 뒤 최종 target만 다시 rolling
+control-space로 되돌립니다.
 
 ```text
 현재 generator control
@@ -2110,7 +2111,7 @@ pose-space에서 먼저 판단한 뒤 최종 target만 다시 rolling control-sp
 d_C = \operatorname{DMD}(C_G,\hat{C}_T,\hat{C}_E)
 ```
 
-였다면, 현재 기본 방식은
+였다면, pose-projected 방식은
 
 ```math
 \begin{aligned}
@@ -2131,15 +2132,16 @@ active-control loss를 바꾸지 않습니다. vehicle/cyclist의 lateral contro
 계속 제외됩니다. 즉 DMD 판단 공간만 closed-loop 평가 공간과 맞추고, 모델 학습 target은 기존
 control-space recipe를 유지합니다.
 
-기존 control-space DMD로 되돌려 비교하려면 아래 override를 사용합니다.
+pose-projected DMD로 비교하려면 아래 override를 사용합니다.
 
 ```bash
-model.model_config.self_forced.project_dmd_to_pose_space=false
+model.model_config.self_forced.project_dmd_to_pose_space=true
 ```
 
-학습 로그에서는 `train/sf_pose_projected_dmd=1` 이면 pose-projected DMD가 실제로 활성화된
-상태입니다. `use_kinematic_control_flow=false` 이거나 flow state가 pose-space인 경우에는 이 옵션을
-켜도 자동으로 legacy 경로와 같은 pose-space DMD 판단이 됩니다.
+학습 로그에서는 기본 control-space 경로가 `train/sf_pose_projected_dmd=0`, pose-projected DMD가
+실제로 활성화된 상태가 `train/sf_pose_projected_dmd=1` 로 기록됩니다. `use_kinematic_control_flow=false`
+이거나 flow state가 pose-space인 경우에는 이 옵션을 켜도 자동으로 legacy 경로와 같은 pose-space
+DMD 판단이 됩니다.
 
 Clean-DMD 방향 안정화 필터는 pose-projected 경로와 direct control-space 경로에 동일하게 적용됩니다.
 
@@ -2152,9 +2154,9 @@ Clean-DMD 방향 안정화 필터는 pose-projected 경로와 direct control-spa
 | `dmd_use_injection_ramp` | `false` | `true`이면 DMD target 주입량을 warmup 종료 후 첫 generator-DMD epoch부터 \(\lambda_e=0.25+0.75\min(1,\frac{\max(0,e-e_0)}{2})\) 로 2 epoch 동안 키웁니다. `false`이면 항상 \(\lambda=1\) 입니다. |
 
 여기서 \(R\) 은 teacher-estimator clean 추정 차이, \(G\) 는 현재 generator와 teacher의 차이입니다.
-`project_dmd_to_pose_space=true` 일 때는 위 값들이 pose-space에서 계산되고,
-`false` 일 때는 control-space에서 계산됩니다. vehicle/cyclist lateral 축 제외는 별도의 active-control
-mask 규칙이라 위 세 필터와 무관하게 기존처럼 최종 control loss 단계에서 유지됩니다.
+기본값인 `project_dmd_to_pose_space=false` 에서는 위 값들이 control-space에서 계산되고,
+`true` 로 override하면 pose-space에서 계산됩니다. vehicle/cyclist lateral 축 제외는 별도의
+active-control mask 규칙이라 위 세 필터와 무관하게 기존처럼 최종 control loss 단계에서 유지됩니다.
 
 #### Generated estimator warmup bank
 

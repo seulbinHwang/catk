@@ -259,9 +259,9 @@ class SMARTFlow(LightningModule):
                 f"got {self.self_forced_distribution_matching_objective}."
             )
         self.self_forced_project_dmd_to_pose_space = (
-            bool(getattr(self.self_forced_config, "project_dmd_to_pose_space", True))
+            bool(getattr(self.self_forced_config, "project_dmd_to_pose_space", False))
             if self.self_forced_config is not None
-            else True
+            else False
         )
         self.self_forced_dmd_use_stable_scale_filter = (
             bool(getattr(self.self_forced_config, "dmd_use_stable_scale_filter", True))

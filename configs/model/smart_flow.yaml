@@ -75,9 +75,9 @@ model_config:
     # use_anchor_flow_matching_loss=true일 때의 anchor FM loss만 self-forced optimizer로 학습합니다.
     use_distribution_matching_loss: true
     distribution_matching_objective: dmd
-    # DMD guidance 방향은 closed-loop metric이 보는 pose-space에서 판단하고,
-    # 최종 target은 다시 rolling control-space로 되돌립니다.
-    project_dmd_to_pose_space: true
+    # 기본 DMD guidance는 self-forced objective와 같은 control-space에서 판단합니다.
+    # true로 override하면 pose-space에서 direction/filter를 계산한 뒤 control-space target으로 되돌립니다.
+    project_dmd_to_pose_space: false
     # Clean-DMD direction filters. These apply identically to pose-projected
     # and direct control-space DMD paths.
     dmd_use_stable_scale_filter: true
