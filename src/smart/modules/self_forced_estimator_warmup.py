@@ -85,6 +85,27 @@ def is_self_forced_estimator_warmup_epoch(
     return start_epoch <= current_epoch < start_epoch + warmup_epochs
 
 
+def should_compute_anchor_flow_matching_loss(
+    *,
+    use_anchor_flow_matching_loss: bool,
+    is_estimator_warmup_active: bool,
+) -> bool:
+    """self-forced step에서 anchor flow-matching loss를 계산할지 판단합니다.
+
+    Args:
+        use_anchor_flow_matching_loss: anchor flow-matching 보조 loss 사용 여부입니다.
+        is_estimator_warmup_active: 현재 epoch가 generated estimator warmup 구간인지입니다.
+
+    Returns:
+        bool: anchor flow-matching forward/loss를 계산해야 하면 ``True`` 입니다.
+
+    설명:
+        generated estimator warmup 구간에서는 Generator를 업데이트하지 않으므로,
+        anchor flow-matching loss도 계산하지 않습니다.
+    """
+    return bool(use_anchor_flow_matching_loss) and not bool(is_estimator_warmup_active)
+
+
 def should_run_self_forced_validation_after_epoch(
     *,
     current_epoch: int,

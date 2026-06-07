@@ -5,6 +5,7 @@ import pytest
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
     resolve_self_forced_estimator_warmup_epochs,
+    should_compute_anchor_flow_matching_loss,
     should_run_self_forced_validation_after_epoch,
 )
 
@@ -55,6 +56,27 @@ def test_is_self_forced_estimator_warmup_epoch_can_be_disabled() -> None:
         current_epoch=0,
         self_forced_start_epoch=0,
         estimator_warmup_epochs=0,
+    )
+
+
+def test_anchor_flow_matching_loss_is_skipped_during_estimator_warmup() -> None:
+    assert not should_compute_anchor_flow_matching_loss(
+        use_anchor_flow_matching_loss=True,
+        is_estimator_warmup_active=True,
+    )
+
+
+def test_anchor_flow_matching_loss_runs_after_estimator_warmup() -> None:
+    assert should_compute_anchor_flow_matching_loss(
+        use_anchor_flow_matching_loss=True,
+        is_estimator_warmup_active=False,
+    )
+
+
+def test_anchor_flow_matching_loss_respects_disabled_config() -> None:
+    assert not should_compute_anchor_flow_matching_loss(
+        use_anchor_flow_matching_loss=False,
+        is_estimator_warmup_active=False,
     )
 
 

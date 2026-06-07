@@ -53,6 +53,7 @@ from src.smart.modules.self_forced_update_separation import (
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
     resolve_self_forced_estimator_warmup_epochs,
+    should_compute_anchor_flow_matching_loss,
     should_run_self_forced_validation_after_epoch,
 )
 from src.smart.modules.self_forced_trainable_range import (
@@ -3586,7 +3587,11 @@ class SMARTFlow(LightningModule):
         fm_loss = None
         open_metric_dict = None
         has_anchor_fm_targets = False
-        if self.self_forced_use_anchor_fm_loss:
+        is_estimator_warmup_active = self._is_self_forced_estimator_warmup_active()
+        if should_compute_anchor_flow_matching_loss(
+            use_anchor_flow_matching_loss=self.self_forced_use_anchor_fm_loss,
+            is_estimator_warmup_active=is_estimator_warmup_active,
+        ):
             tokenized_map_train, tokenized_agent_train = self.token_processor(data)
             pred = self.encoder(
                 tokenized_map_train,
@@ -3606,7 +3611,7 @@ class SMARTFlow(LightningModule):
             )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
-        if self._is_self_forced_estimator_warmup_active():
+        if is_estimator_warmup_active:
             with torch.no_grad():
                 rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
         else:
@@ -3628,7 +3633,7 @@ class SMARTFlow(LightningModule):
             )
 
         if not has_committed_path_global:
-            if self._is_self_forced_estimator_warmup_active():
+            if is_estimator_warmup_active:
                 return self._finish_self_forced_estimator_warmup_step(None)
             if fm_loss is None or not has_anchor_fm_targets_global:
                 zero_loss = (
@@ -3691,7 +3696,7 @@ class SMARTFlow(LightningModule):
             anchor_mask=anchor_mask,
             has_committed_path_global=has_committed_path_global,
         )
-        if self._is_self_forced_estimator_warmup_active():
+        if is_estimator_warmup_active:
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
         if has_committed_path_local:
             sf_loss = self._compute_self_forced_distribution_matching_loss(
