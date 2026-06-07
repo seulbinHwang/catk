@@ -72,12 +72,16 @@ model_config:
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
     distribution_matching_objective: dmd
+    # DMD guidance 방향은 closed-loop metric이 보는 pose-space에서 판단하고,
+    # 최종 target은 다시 rolling control-space로 되돌립니다.
+    project_dmd_to_pose_space: true
     clean_dmd_normalizer_eps: 0.05
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
     detach_block_transition: true
     # Stop-motion gate는 전 경로에서 사용하지 않습니다. 값은 false로 고정합니다.
     use_stop_motion: false
+    generated_estimator_lr: ${model.model_config.lr}
     estimator_updates_per_step: 5
     estimator_warmup_epochs: 0
     # Reuse the frozen map encoder output inside a self-forced train step.

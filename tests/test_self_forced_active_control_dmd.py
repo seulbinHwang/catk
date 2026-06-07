@@ -12,6 +12,7 @@ from src.smart.modules.self_forced_dmd_guidance import (
     build_active_control_mask,
     build_clean_dmd_direction,
     compute_self_forced_dmd_injection_scale,
+    normalize_pose_heading_vector,
 )
 
 
@@ -134,6 +135,28 @@ def test_self_forced_dmd_injection_scale_ramps_for_two_epochs() -> None:
     assert compute_self_forced_dmd_injection_scale(current_epoch=1, dmd_start_epoch=0) == 0.625
     assert compute_self_forced_dmd_injection_scale(current_epoch=2, dmd_start_epoch=0) == 1.0
     assert compute_self_forced_dmd_injection_scale(current_epoch=5, dmd_start_epoch=5) == 0.25
+
+
+def test_pose_projected_dmd_heading_vector_is_renormalized() -> None:
+    pose = torch.tensor(
+        [
+            [
+                [0.1, 0.2, 3.0, 4.0],
+                [0.2, 0.3, 0.0, 2.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    normalized = normalize_pose_heading_vector(pose)
+
+    torch.testing.assert_close(normalized[..., :2], pose[..., :2])
+    torch.testing.assert_close(
+        normalized[..., 2:].norm(dim=-1),
+        torch.ones((1, 2)),
+        atol=1.0e-6,
+        rtol=1.0e-6,
+    )
 
 
 def test_active_control_dmd_loss_has_no_vehicle_lateral_gradient() -> None:

@@ -40,6 +40,7 @@ from src.smart.modules.self_forced_dmd_guidance import (
     build_active_control_mask,
     build_clean_dmd_direction,
     compute_self_forced_dmd_injection_scale,
+    normalize_pose_heading_vector,
 )
 from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
 from src.smart.modules.self_forced_update_separation import (
@@ -254,6 +255,11 @@ class SMARTFlow(LightningModule):
                 "self_forced.distribution_matching_objective must be 'dmd' or 'sid', "
                 f"got {self.self_forced_distribution_matching_objective}."
             )
+        self.self_forced_project_dmd_to_pose_space = (
+            bool(getattr(self.self_forced_config, "project_dmd_to_pose_space", True))
+            if self.self_forced_config is not None
+            else True
+        )
         self.self_forced_sid_alpha = (
             float(getattr(self.self_forced_config, "sid_alpha", 1.0))
             if self.self_forced_config is not None
@@ -302,6 +308,11 @@ class SMARTFlow(LightningModule):
             max(1, int(getattr(self.self_forced_config, "estimator_updates_per_step", 1)))
             if self.self_forced_config is not None
             else 1
+        )
+        self.self_forced_generated_estimator_lr = (
+            float(getattr(self.self_forced_config, "generated_estimator_lr", self.lr))
+            if self.self_forced_config is not None
+            else self.lr
         )
         self.self_forced_cache_frozen_map_features = (
             bool(getattr(self.self_forced_config, "cache_frozen_map_features", True))
@@ -2641,6 +2652,7 @@ class SMARTFlow(LightningModule):
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
         active_control_mask: Tensor | None = None,
+        dmd_injection_scale: float | Tensor = 1.0,
     ) -> Tensor:
         """clean-DMD 방향을 고정된 평가자 출력으로 계산합니다.
 
@@ -2654,6 +2666,8 @@ class SMARTFlow(LightningModule):
                 shape은 ``[n_agent]`` 입니다.
             active_control_mask: DMD에 사용할 active 축 mask입니다. shape은
                 ``[n_valid_agent, 1, flow_dim]`` 입니다.
+            dmd_injection_scale: detached target에 주입할 DMD 방향 계수입니다. pose-projected
+                DMD에서는 pose target을 만든 뒤 control target으로 되돌리는 데 사용합니다.
 
         Returns:
             Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
@@ -2694,16 +2708,160 @@ class SMARTFlow(LightningModule):
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
             )
-            path_delta = build_clean_dmd_direction(
-                committed_path_norm=clean_for_guidance,
-                target_clean_norm=target_pred["clean"],
-                generated_clean_norm=generated_pred["clean"],
-                active_mask=active_control_mask,
-                normalizer_eps=self.self_forced_direction_normalizer_eps,
-            )
+            if self._should_project_self_forced_dmd_to_pose_space(committed_path_norm):
+                path_delta = self._compute_pose_projected_self_forced_control_delta(
+                    tokenized_agent=tokenized_agent,
+                    committed_control_norm=clean_for_guidance,
+                    target_clean_control_norm=target_pred["clean"],
+                    generated_clean_control_norm=generated_pred["clean"],
+                    anchor_mask=anchor_mask,
+                    dmd_injection_scale=dmd_injection_scale,
+                )
+            else:
+                path_delta = build_clean_dmd_direction(
+                    committed_path_norm=clean_for_guidance,
+                    target_clean_norm=target_pred["clean"],
+                    generated_clean_norm=generated_pred["clean"],
+                    active_mask=active_control_mask,
+                    normalizer_eps=self.self_forced_direction_normalizer_eps,
+                )
 
         self._assert_self_forced_generator_update_isolated()
         return path_delta.to(dtype=committed_path_norm.dtype).detach()
+
+    def _should_project_self_forced_dmd_to_pose_space(self, committed_path_norm: Tensor) -> bool:
+        """현재 self-forced DMD를 pose-space에서 판단해야 하는지 확인합니다."""
+        return (
+            bool(self.self_forced_project_dmd_to_pose_space)
+            and bool(self.use_kinematic_control_flow)
+            and committed_path_norm.ndim == 3
+            and int(committed_path_norm.shape[-1]) == 3
+        )
+
+    def _get_anchor0_agent_type_and_length(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[Tensor, Tensor | None]:
+        """첫 anchor에 남은 agent의 type/length metadata를 가져옵니다."""
+        if anchor_mask.ndim != 1:
+            raise ValueError(f"anchor_mask must have shape [n_agent], got {tuple(anchor_mask.shape)}.")
+        if "type" not in tokenized_agent:
+            raise KeyError("tokenized_agent must contain type for self-forced control metadata.")
+        agent_type = tokenized_agent["type"][anchor_mask].to(device=device)
+        agent_length = (
+            tokenized_agent["shape"][anchor_mask, 0].to(device=device, dtype=dtype)
+            if "shape" in tokenized_agent
+            else None
+        )
+        return agent_type, agent_length
+
+    def _control_norm_to_self_forced_pose_norm(
+        self,
+        control_norm: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """self-forced control state를 closed-loop metric과 같은 pose-space 표현으로 복원합니다."""
+        agent_type, agent_length = self._get_anchor0_agent_type_and_length(
+            tokenized_agent,
+            anchor_mask,
+            device=control_norm.device,
+            dtype=control_norm.dtype,
+        )
+        if agent_type.shape[0] != control_norm.shape[0]:
+            raise ValueError(
+                "anchor_mask selected agent count must match control batch: "
+                f"got {agent_type.shape[0]} and {control_norm.shape[0]}."
+            )
+        return self.encoder.flow_norm_to_pose_metric_norm(
+            value=control_norm,
+            agent_type=agent_type,
+            agent_length=agent_length,
+        )
+
+    def _pose_norm_to_self_forced_control_norm(
+        self,
+        pose_norm: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+    ) -> Tensor:
+        """pose-space DMD target을 기존 rolling control target으로 되돌립니다."""
+        return build_anchor0_normalized_committed_control(
+            committed_path_norm=pose_norm,
+            tokenized_agent=tokenized_agent,
+            anchor_mask=anchor_mask,
+            pos_scale_m=self.encoder.agent_encoder.control_pos_scale_m,
+            vehicle_yaw_scale_rad=self.encoder.agent_encoder.control_vehicle_yaw_scale_rad,
+            pedestrian_yaw_scale_rad=self.encoder.agent_encoder.control_pedestrian_yaw_scale_rad,
+            cyclist_yaw_scale_rad=self.encoder.agent_encoder.control_cyclist_yaw_scale_rad,
+            use_holonomic_model_only=self.encoder.agent_encoder.use_holonomic_model_only,
+            use_rolling_supervision=self.encoder.agent_encoder.use_rolling_supervision,
+            vehicle_no_slip_point_ratio=self.encoder.agent_encoder.control_vehicle_no_slip_point_ratio,
+            cyclist_no_slip_point_ratio=self.encoder.agent_encoder.control_cyclist_no_slip_point_ratio,
+        )
+
+    def _compute_pose_projected_self_forced_control_delta(
+        self,
+        *,
+        tokenized_agent: Dict[str, Tensor],
+        committed_control_norm: Tensor,
+        target_clean_control_norm: Tensor,
+        generated_clean_control_norm: Tensor,
+        anchor_mask: Tensor,
+        dmd_injection_scale: float | Tensor,
+    ) -> Tensor:
+        """pose-space에서 DMD target을 만들고 rolling control delta로 되돌립니다."""
+        committed_pose_norm = self._control_norm_to_self_forced_pose_norm(
+            committed_control_norm,
+            tokenized_agent,
+            anchor_mask,
+        )
+        target_pose_norm = self._control_norm_to_self_forced_pose_norm(
+            target_clean_control_norm,
+            tokenized_agent,
+            anchor_mask,
+        )
+        generated_pose_norm = self._control_norm_to_self_forced_pose_norm(
+            generated_clean_control_norm,
+            tokenized_agent,
+            anchor_mask,
+        )
+        pose_delta = build_clean_dmd_direction(
+            committed_path_norm=committed_pose_norm,
+            target_clean_norm=target_pose_norm,
+            generated_clean_norm=generated_pose_norm,
+            active_mask=None,
+            normalizer_eps=self.self_forced_direction_normalizer_eps,
+        )
+        if isinstance(dmd_injection_scale, Tensor):
+            injection_scale = dmd_injection_scale.to(
+                device=pose_delta.device,
+                dtype=pose_delta.dtype,
+            )
+        else:
+            injection_scale = torch.as_tensor(
+                float(dmd_injection_scale),
+                device=pose_delta.device,
+                dtype=pose_delta.dtype,
+            )
+        pose_target_norm = normalize_pose_heading_vector(
+            committed_pose_norm + pose_delta * injection_scale,
+        )
+        control_target_norm = self._pose_norm_to_self_forced_control_norm(
+            pose_target_norm,
+            tokenized_agent,
+            anchor_mask,
+        )
+        if tuple(control_target_norm.shape) != tuple(committed_control_norm.shape):
+            raise ValueError(
+                "pose-projected DMD control target shape must match committed control shape: "
+                f"target={tuple(control_target_norm.shape)}, committed={tuple(committed_control_norm.shape)}."
+            )
+        return control_target_norm - committed_control_norm
 
     def _build_self_forced_active_control_mask(
         self,
@@ -2884,23 +3042,26 @@ class SMARTFlow(LightningModule):
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
+        dmd_start_epoch = int(self.self_forced_start_epoch) + int(self.self_forced_estimator_warmup_epochs)
+        dmd_injection_scale = compute_self_forced_dmd_injection_scale(
+            current_epoch=int(self.current_epoch),
+            dmd_start_epoch=dmd_start_epoch,
+        )
+        pose_projected_dmd = self._should_project_self_forced_dmd_to_pose_space(committed_path_norm)
         path_delta = self._compute_self_forced_direction(
             tokenized_map=tokenized_map,
             tokenized_agent=tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
             active_control_mask=active_control_mask,
+            dmd_injection_scale=dmd_injection_scale,
         )
-        dmd_start_epoch = int(self.self_forced_start_epoch) + int(self.self_forced_estimator_warmup_epochs)
-        dmd_injection_scale = compute_self_forced_dmd_injection_scale(
-            current_epoch=int(self.current_epoch),
-            dmd_start_epoch=dmd_start_epoch,
-        )
+        surrogate_injection_scale = 1.0 if pose_projected_dmd else dmd_injection_scale
         sf_loss, target_path_norm = active_control_dmd_surrogate_loss(
             committed_path_norm=committed_path_norm,
             dmd_direction=path_delta,
             active_mask=active_control_mask,
-            dmd_injection_scale=dmd_injection_scale,
+            dmd_injection_scale=surrogate_injection_scale,
         )
         self._set_self_forced_backward_context(
             committed_path_norm=committed_path_norm,
@@ -2908,6 +3069,7 @@ class SMARTFlow(LightningModule):
             target_path_norm=target_path_norm,
             active_control_mask=active_control_mask,
             dmd_injection_scale=committed_path_norm.new_tensor(dmd_injection_scale),
+            pose_projected_dmd=committed_path_norm.new_tensor(float(pose_projected_dmd)),
         )
         return sf_loss
 
@@ -3107,6 +3269,14 @@ class SMARTFlow(LightningModule):
                     )
                 self.log("train/sf_anchor_fm_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
                 self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+                self.log(
+                    "train/sf_pose_projected_dmd",
+                    float(self.self_forced_project_dmd_to_pose_space and self.use_kinematic_control_flow),
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
                 return zero_loss.detach()
             generator_optimizer = self.optimizers()[0]
             self.toggle_optimizer(generator_optimizer)
@@ -3189,6 +3359,14 @@ class SMARTFlow(LightningModule):
         self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log(
+            "train/sf_pose_projected_dmd",
+            float(self._should_project_self_forced_dmd_to_pose_space(committed_path_norm)),
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=1,
+        )
         if "sf_terminal_s_by_scenario" in rollout:
             self.log(
                 "train/sf_terminal_s_mean",
@@ -3519,7 +3697,7 @@ open_metric_dict:
                 raise RuntimeError("No trainable generated-estimator parameters found.")
             generated_estimator_optimizer = torch.optim.AdamW(
                 estimator_params,
-                lr=self.lr,
+                lr=self.self_forced_generated_estimator_lr,
             )
             return [generator_optimizer, generated_estimator_optimizer]
 

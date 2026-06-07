@@ -2074,6 +2074,68 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 - 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/epoch 를 resume하지 않고 pretrained weight만 로드합니다.
 - 전제: `ckpt_path` 에는 같은 `flow_window_steps` 로 pretrain 된 Generator checkpoint 를 넣습니다. 모델 default 는 `flow_window_steps=20` (2초) 이고, ckpt 가 2초 horizon 으로 pretrain 된 경우 override 하지 않는 편이 안전합니다.
 
+#### Pose-projected DMD guidance
+
+`use_kinematic_control_flow=true`, `use_holonomic_model_only=false`, `use_rolling_supervision=true`
+조건의 self-forced DMD fine-tuning에서는 기본적으로 pose-projected DMD guidance를 사용합니다.
+
+```yaml
+model:
+  model_config:
+    self_forced:
+      project_dmd_to_pose_space: true
+```
+
+핵심은 DMD 방향을 3축 control 값에서 바로 판단하지 않고, 실제 closed-loop metric이 보는
+pose-space에서 먼저 판단한 뒤 최종 target만 다시 rolling control-space로 되돌리는 것입니다.
+
+```text
+현재 generator control
+-> pose로 복원
+-> teacher / generated estimator clean control도 pose로 복원
+-> pose-space에서 Clean-DMD 안정화 방향 계산
+-> heading cos/sin 재정규화
+-> rolling control target으로 역변환
+-> 기존 active-control loss로 Generator 학습
+```
+
+수식으로는 기존 방식이
+
+```math
+d_C = \operatorname{DMD}(C_G,\hat{C}_T,\hat{C}_E)
+```
+
+였다면, 현재 기본 방식은
+
+```math
+\begin{aligned}
+P_C &= D(C_G),\\
+P_T &= D(\hat{C}_T),\\
+P_E &= D(\hat{C}_E),\\
+d_P &= \operatorname{DMD}(P_C,P_T,P_E),\\
+P^* &= \operatorname{NormalizeHeading}(P_C + \lambda d_P),\\
+C^* &= R(P^*)
+\end{aligned}
+```
+
+입니다. 여기서 `D`는 normalized rolling control을 pose metric 표현으로 복원하는 변환이고,
+`R`은 pose target을 다시 rolling control target으로 바꾸는 변환입니다.
+
+이 옵션은 generated estimator 학습 공간, Generator 출력 차원, pretrain target 정의, non-holonomic
+active-control loss를 바꾸지 않습니다. vehicle/cyclist의 lateral control 축은 최종 control loss에서
+계속 제외됩니다. 즉 DMD 판단 공간만 closed-loop 평가 공간과 맞추고, 모델 학습 target은 기존
+control-space recipe를 유지합니다.
+
+기존 control-space DMD로 되돌려 비교하려면 아래 override를 사용합니다.
+
+```bash
+model.model_config.self_forced.project_dmd_to_pose_space=false
+```
+
+학습 로그에서는 `train/sf_pose_projected_dmd=1` 이면 pose-projected DMD가 실제로 활성화된
+상태입니다. `use_kinematic_control_flow=false` 이거나 flow state가 pose-space인 경우에는 이 옵션을
+켜도 자동으로 legacy 경로와 같은 pose-space DMD 판단이 됩니다.
+
 실행 예시:
 
 ```bash

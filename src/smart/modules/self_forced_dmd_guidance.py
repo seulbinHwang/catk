@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-from src.smart.modules.kinematic_control import CONTROL_FLOW_DIM, PEDESTRIAN_TYPE_ID
+from src.smart.modules.kinematic_control import CONTROL_FLOW_DIM, PEDESTRIAN_TYPE_ID, POSE_FLOW_DIM
 
 
 def build_active_control_mask(
@@ -110,6 +110,25 @@ def active_control_dmd_surrogate_loss(
     denom = active.flatten(1).sum(dim=1).clamp_min(float(eps))
     per_agent_loss = (diff_square * active).flatten(1).sum(dim=1) / denom
     return 0.5 * per_agent_loss.mean(), target_path_norm
+
+
+def normalize_pose_heading_vector(pose_norm: Tensor, eps: float = 1.0e-6) -> Tensor:
+    """pose-space target의 heading 벡터를 단위 길이로 되돌립니다.
+
+    Args:
+        pose_norm: ``[N, T, 4]`` pose-space tensor입니다. 마지막 차원은
+            ``[x / scale, y / scale, cos(yaw), sin(yaw)]`` 입니다.
+        eps: heading norm 분모 안정화 값입니다.
+
+    Returns:
+        Tensor: 위치는 유지하고 heading ``cos/sin`` 벡터만 정규화한 tensor입니다.
+    """
+    if pose_norm.ndim != 3 or pose_norm.shape[-1] != POSE_FLOW_DIM:
+        raise ValueError(f"pose_norm must have shape [N, T, 4], got {tuple(pose_norm.shape)}.")
+    heading = pose_norm[..., 2:4]
+    heading_norm = heading.float().norm(dim=-1, keepdim=True).clamp_min(float(eps))
+    normalized_heading = (heading.float() / heading_norm).to(dtype=pose_norm.dtype)
+    return torch.cat([pose_norm[..., :2], normalized_heading], dim=-1)
 
 
 def compute_self_forced_dmd_injection_scale(
