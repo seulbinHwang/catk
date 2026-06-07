@@ -336,6 +336,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else True
         )
+        self.self_forced_use_distribution_matching_loss = (
+            bool(getattr(self.self_forced_config, "use_distribution_matching_loss", True))
+            if self.self_forced_config is not None
+            else True
+        )
         self.self_forced_estimator_updates_per_step = (
             max(1, int(getattr(self.self_forced_config, "estimator_updates_per_step", 1)))
             if self.self_forced_config is not None
@@ -656,6 +661,8 @@ class SMARTFlow(LightningModule):
         if self.trainer is None:
             return
         if not self.self_forced_enabled:
+            return
+        if not self.self_forced_use_distribution_matching_loss:
             return
         if int(self.self_forced_estimator_warmup_epochs) <= 0:
             return
@@ -1896,6 +1903,8 @@ class SMARTFlow(LightningModule):
 
     def _is_self_forced_estimator_warmup_active(self) -> bool:
         """현재 epoch에서 generated estimator만 먼저 적응시킬지 판단합니다."""
+        if not self.self_forced_use_distribution_matching_loss:
+            return False
         return is_self_forced_estimator_warmup_epoch(
             current_epoch=int(self.current_epoch),
             self_forced_start_epoch=int(self.self_forced_start_epoch),
@@ -3267,6 +3276,95 @@ class SMARTFlow(LightningModule):
 
         return total_loss.detach()
 
+    def _training_step_self_forced_anchor_only(
+        self,
+        *,
+        fm_loss: Tensor | None,
+        open_metric_dict: Dict[str, Tensor] | None,
+        has_anchor_fm_targets: bool,
+    ) -> Tensor:
+        """self-forced 보조 objective를 끄고 anchor FM loss만으로 Generator를 업데이트합니다."""
+        if fm_loss is None:
+            anchor_loss = self._build_trainable_connected_zero_loss(self.encoder)
+            has_anchor_fm_targets_global = False
+        else:
+            anchor_loss = fm_loss
+            has_anchor_fm_targets_global = self._sync_distributed_bool_any(
+                has_anchor_fm_targets,
+                device=fm_loss.device,
+            )
+        total_loss = self.self_forced_anchor_weight * anchor_loss
+        should_step = bool(
+            fm_loss is not None
+            and has_anchor_fm_targets_global
+            and float(self.self_forced_anchor_weight) != 0.0
+        )
+
+        generator_optimizer = self.optimizers()[0]
+        self.toggle_optimizer(generator_optimizer)
+        try:
+            generator_optimizer.zero_grad(set_to_none=True)
+            self._prepare_self_forced_generator_backward_boundary()
+            self._manual_backward_without_autocast(total_loss)
+            self._assert_self_forced_generator_update_isolated()
+            if should_step:
+                self._clip_and_step_with_optional_scaler(
+                    generator_optimizer,
+                    gradient_clip_val=self.self_forced_gradient_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+                self._update_self_forced_generator_ema_after_step()
+        finally:
+            self._clear_self_forced_generator_gradients()
+            self._clear_self_forced_backward_context()
+            self.untoggle_optimizer(generator_optimizer)
+
+        zero_metric = total_loss.detach().new_zeros(())
+        self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
+        if fm_loss is not None:
+            self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_npfm_loss", zero_metric, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_generated_estimator_loss", zero_metric, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_distribution_matching_enabled", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_pose_projected_dmd", 0.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        if open_metric_dict is not None:
+            self.log(
+                f"train/{self.train_open_metric_names['ade']}",
+                open_metric_dict[self.open_metric_names["ade"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['fde']}",
+                open_metric_dict[self.open_metric_names["fde"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['yaw_ade']}",
+                open_metric_dict[self.open_metric_names["yaw_ade"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            self.log(
+                f"train/{self.train_open_metric_names['yaw_fde']}",
+                open_metric_dict[self.open_metric_names["yaw_fde"]].detach(),
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+        return total_loss.detach()
+
     def _training_step_self_forced(self, data, batch_idx):
         """PDF Step 3~10에 해당하는 self-forced NPFM 학습 step입니다.
 
@@ -3290,6 +3388,13 @@ class SMARTFlow(LightningModule):
             fm_loss, open_metric_dict, _, has_anchor_fm_targets = self._open_loop_denoise_metrics(
                 pred,
                 zero_loss_module=self.encoder,
+            )
+
+        if not self.self_forced_use_distribution_matching_loss:
+            return self._training_step_self_forced_anchor_only(
+                fm_loss=fm_loss,
+                open_metric_dict=open_metric_dict,
+                has_anchor_fm_targets=has_anchor_fm_targets,
             )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
@@ -3435,6 +3540,7 @@ class SMARTFlow(LightningModule):
         self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_distribution_matching_enabled", 1.0, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log(
             "train/sf_pose_projected_dmd",
             float(self._should_project_self_forced_dmd_to_pose_space(committed_path_norm)),

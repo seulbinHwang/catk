@@ -71,6 +71,9 @@ model_config:
     weight: 1.0
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
+    # false이면 self-rollout, generated-estimator update, DMD/SID loss, estimator warmup을 모두 생략하고
+    # use_anchor_flow_matching_loss=true일 때의 anchor FM loss만 self-forced optimizer로 학습합니다.
+    use_distribution_matching_loss: true
     distribution_matching_objective: dmd
     # DMD guidance 방향은 closed-loop metric이 보는 pose-space에서 판단하고,
     # 최종 target은 다시 rolling control-space로 되돌립니다.

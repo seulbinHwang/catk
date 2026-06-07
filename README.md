@@ -3068,6 +3068,7 @@ model:
 - `model.model_config.self_forced.estimator_warmup_epochs=0` 이 기본값입니다.
 - 따라서 online Generator warmup skip 없이, 첫 train step부터 generated estimator 업데이트와 Generator 업데이트를 수행합니다.
 - `estimator_warmup_epochs>0` 으로 override하면 해당 기간에는 online Generator를 업데이트하지 않고, 현재 Generator가 만든 self-rollout으로 generated estimator만 먼저 학습합니다.
+- `model.model_config.self_forced.use_distribution_matching_loss=false` 이면 self-rollout / generated estimator 업데이트 / DMD·SiD loss / estimator warmup을 모두 생략하므로, `estimator_warmup_epochs` 값이 있어도 warmup으로 들어가지 않습니다.
 - warmup 중 self-rollout은 `torch.no_grad()`로 생성하고, Generator optimizer step과 EMA update는 실행하지 않습니다.
 - warmup epoch 끝에는 validation을 건너뜁니다. 예를 들어
   `estimator_warmup_epochs=1`, `trainer.check_val_every_n_epoch=2` 이면 epoch 0은
@@ -3871,7 +3872,8 @@ K commit block 수 = flow_window_steps / 5
 - DMD target은 `committed_path_norm + eta * path_delta`를 detached target으로 둡니다. 여기서 `path_delta` 는 teacher-aligned bounded DMD 방향이고, `eta` 는 DMD 시작 후 2 epoch ramp 계수입니다.
 - Clean-DMD guidance의 기본 noising 구간은 `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 입니다.
 - stable scale은 `clean_dmd_normalizer_eps=0.05` 로 최소값을 둬서 pretrained 근처에서 target path가 과하게 튀는 상황을 줄입니다.
-- 약한 open-loop flow-matching anchor. `model.model_config.self_forced.use_anchor_flow_matching_loss=false` 로 두면 `anchor_weight` 값과 무관하게 self-forced active step에서 training-mode open-loop forward와 FM loss 계산 자체를 생략합니다. `true` 일 때만 `model.model_config.self_forced.anchor_weight` 로 total loss 반영 강도를 제어합니다. anchor FM 을 끈 상태에서 어떤 rank 의 committed self-rollout 까지 비어있는 (모든 agent 가 invalid anchor0) 드문 경우에는, encoder 파라미터 합에 0 을 곱한 zero-loss 로 backward 만 한 번 돌려 DDP all-reduce 참여를 보장하고 optimizer step 은 건너뜁니다. 이 가드가 없으면 그 rank 만 backward 를 호출하지 않아 다른 rank 의 NCCL all-reduce 가 NCCL_TIMEOUT 까지 hang 합니다.
+- 약한 open-loop flow-matching anchor. `model.model_config.self_forced.use_anchor_flow_matching_loss=false` 로 두면 `anchor_weight` 값과 무관하게 self-forced active step에서 training-mode open-loop forward와 FM loss 계산 자체를 생략합니다. `true` 일 때만 `model.model_config.self_forced.anchor_weight` 로 total loss 반영 강도를 제어합니다. anchor FM 을 켠 경우에도 `unfrozen_range` 로 열린 online Generator 파라미터만 학습합니다. anchor FM 을 끈 상태에서 어떤 rank 의 committed self-rollout 까지 비어있는 (모든 agent 가 invalid anchor0) 드문 경우에는, encoder 파라미터 합에 0 을 곱한 zero-loss 로 backward 만 한 번 돌려 DDP all-reduce 참여를 보장하고 optimizer step 은 건너뜁니다. 이 가드가 없으면 그 rank 만 backward 를 호출하지 않아 다른 rank 의 NCCL all-reduce 가 NCCL_TIMEOUT 까지 hang 합니다.
+- Anchor-only self-forced mode. `model.model_config.self_forced.enabled=true`, `use_anchor_flow_matching_loss=true`, `use_distribution_matching_loss=false` 로 두면 self-forced optimizer와 `unfrozen_range` 는 유지하되 self-rollout, generated estimator 업데이트, DMD/SiD `sf_loss`, estimator warmup을 모두 건너뛰고 anchor FM loss만 학습합니다. 이때 `train/sf_npfm_loss` 와 `train/sf_generated_estimator_loss` 는 0으로 기록됩니다.
 - 선택적 trainable range. `model.model_config.self_forced.unfrozen_range=middle` 이 기본값이며, map encoder와 대부분의 agent 문맥부는 고정하고 마지막 agent 문맥 블록과 flow decoder만 학습합니다. `except_map_encoder` 는 map encoder만 고정하고 나머지 Generator / generated estimator 파라미터를 열며, `full_flow_decoder` 는 마지막 궤적 생성부만 엽니다.
 - epoch별 train subset sampling. self-forced preset은 `data.train_epoch_sample_fraction=0.25` 를 기본으로 두어 매 epoch 전체 train dataset의 25%만 새로 랜덤 샘플링해 학습합니다. DDP에서는 모든 rank가 같은 전역 subset을 공유한 뒤 rank별로 나눠 받습니다. `1.0` 으로 override하면 기존처럼 전체 train dataset을 씁니다.
 - Generator EMA는 Generator에만 적용합니다. `F_psi` 는 현재 online Generator가 만든 분포를 따라가야 하므로 EMA를 두지 않고, `F_rho` 는 pretrained 기준점이라 계속 frozen 상태로 둡니다.
@@ -3899,6 +3901,7 @@ model:
   model_config:
     self_forced:
       use_anchor_flow_matching_loss: false
+      use_distribution_matching_loss: true
       use_stop_motion: false
       sampling:
         sample_steps: 16
