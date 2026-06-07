@@ -1,0 +1,145 @@
+I0606 20:39:21.956000 140162938197824 torch/distributed/run.py:881] 
+I0606 20:39:21.956000 140162938197824 torch/distributed/run.py:881] **************************************
+I0606 20:39:21.956000 140162938197824 torch/distributed/run.py:881] Rendezvous info:
+I0606 20:39:21.956000 140162938197824 torch/distributed/run.py:881] --rdzv-backend=c10d --rdzv-endpoint=localhost:0 --rdzv-id=465812c7-48be-4e1c-a2be-128e9a206718
+I0606 20:39:21.956000 140162938197824 torch/distributed/run.py:881] **************************************
+I0606 20:39:21.956000 140162938197824 torch/distributed/run.py:881] 
+W0606 20:39:21.958000 140162938197824 torch/distributed/run.py:779] 
+W0606 20:39:21.958000 140162938197824 torch/distributed/run.py:779] *****************************************
+W0606 20:39:21.958000 140162938197824 torch/distributed/run.py:779] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0606 20:39:21.958000 140162938197824 torch/distributed/run.py:779] *****************************************
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189] Starting elastic_operator with launch configs:
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   entrypoint       : src.run
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   min_nodes        : 1
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   max_nodes        : 1
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   nproc_per_node   : 2
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   run_id           : 465812c7-48be-4e1c-a2be-128e9a206718
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   rdzv_backend     : c10d
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   rdzv_endpoint    : localhost:0
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   rdzv_configs     : {'timeout': 900}
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   max_restarts     : 0
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   monitor_interval : 0.1
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   log_dir          : /tmp/torchelastic_n69qis8g
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189]   metrics_cfg      : {}
+I0606 20:39:21.959000 140162938197824 torch/distributed/launcher/api.py:189] 
+[W606 20:39:21.680351668 socket.cpp:461] [c10d] The server socket cannot be initialized on [::]:0 (errno: 97 - Address family not supported by protocol).
+[W606 20:39:21.683423725 socket.cpp:697] [c10d] The client socket cannot be initialized to connect to [localhost]:45577 (errno: 97 - Address family not supported by protocol).
+I0606 20:39:21.968000 140162938197824 torch/distributed/elastic/agent/server/api.py:825] [default] starting workers for entrypoint: python3.11
+I0606 20:39:21.968000 140162938197824 torch/distributed/elastic/agent/server/api.py:646] [default] Rendezvous'ing worker group
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512] [default] Rendezvous complete for workers. Result:
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   restart_count=0
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   master_addr=ad-labs-intern-3
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   master_port=48503
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   group_rank=0
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   group_world_size=1
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   local_ranks=[0, 1]
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   role_ranks=[0, 1]
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   global_ranks=[0, 1]
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   role_world_sizes=[2, 2]
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512]   global_world_sizes=[2, 2]
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:512] 
+I0606 20:39:22.174000 140162938197824 torch/distributed/elastic/agent/server/api.py:654] [default] Starting worker group
+I0606 20:39:22.175000 140162938197824 torch/distributed/elastic/agent/server/local_elastic_agent.py:185] Environment variable 'TORCHELASTIC_ENABLE_FILE_TIMER' not found. Do not start FileTimerServer.
+I0606 20:39:22.175000 140162938197824 torch/distributed/elastic/agent/server/local_elastic_agent.py:217] Environment variable 'TORCHELASTIC_HEALTH_CHECK_PORT' not found. Do not start health check.
+Traceback (most recent call last):
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/config_loader_impl.py", line 390, in _apply_overrides_to_config
+    OmegaConf.update(cfg, key, value, merge=True)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/omegaconf.py", line 741, in update
+    root.__setattr__(last_key, value)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/dictconfig.py", line 337, in __setattr__
+    raise e
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/dictconfig.py", line 334, in __setattr__
+    self.__set_impl(key, value)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/dictconfig.py", line 318, in __set_impl
+    self._set_item_impl(key, value)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/basecontainer.py", line 549, in _set_item_impl
+    self._validate_set(key, value)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/dictconfig.py", line 180, in _validate_set
+    target = self._get_node(key) if key is not None else self
+             ^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/dictconfig.py", line 475, in _get_node
+    self._validate_get(key)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/dictconfig.py", line 164, in _validate_get
+    self._format_and_raise(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/base.py", line 231, in _format_and_raise
+    format_and_raise(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/_utils.py", line 899, in format_and_raise
+    _raise(ex, cause)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/omegaconf/_utils.py", line 797, in _raise
+    raise ex.with_traceback(sys.exc_info()[2])  # set env var OC_CAUSE=1 for full trace
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+omegaconf.errors.ConfigAttributeError: Key 'val_check_interval' is not in struct
+    full_key: trainer.val_check_interval
+    object_type=dict
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 388, in <module>
+    main()
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/main.py", line 94, in decorated_main
+    _run_hydra(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+    _run_app(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+    run_and_report(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 223, in run_and_report
+    raise ex
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+    return func()
+           ^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+    lambda: hydra.run(
+            ^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/hydra.py", line 105, in run
+    cfg = self.compose_config(
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/hydra.py", line 594, in compose_config
+    cfg = self.config_loader.load_configuration(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/config_loader_impl.py", line 142, in load_configuration
+    return self._load_configuration_impl(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/config_loader_impl.py", line 276, in _load_configuration_impl
+    ConfigLoaderImpl._apply_overrides_to_config(config_overrides, cfg)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/config_loader_impl.py", line 392, in _apply_overrides_to_config
+    raise ConfigCompositionException(
+hydra.errors.ConfigCompositionException: Could not override 'trainer.val_check_interval'.
+To append to your config use +trainer.val_check_interval=1000
+W0606 20:39:42.110000 140162938197824 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 3691495 closing signal SIGTERM
+E0606 20:39:44.978000 140162938197824 torch/distributed/elastic/multiprocessing/api.py:833] failed (exitcode: 1) local_rank: 1 (pid: 3691496) of binary: /home2/pnc2/miniforge3/envs/catk/bin/python3.11
+I0606 20:39:44.985000 140162938197824 torch/distributed/elastic/multiprocessing/errors/__init__.py:361] ('local_rank %s FAILED with no error file. Decorate your entrypoint fn with @record for traceback info. See: https://pytorch.org/docs/stable/elastic/errors.html', 1)
+Traceback (most recent call last):
+  File "/home2/pnc2/miniforge3/envs/catk/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 348, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/distributed/run.py", line 901, in main
+    run(args)
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/distributed/run.py", line 892, in run
+    elastic_launch(
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 133, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 264, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+src.run FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-06-06_20:39:42
+  host      : ad-labs-intern-3
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 3691496)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

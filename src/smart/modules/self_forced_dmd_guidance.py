@@ -9,6 +9,8 @@ def build_clean_dmd_direction(
     target_clean_norm: Tensor,
     generated_clean_norm: Tensor,
     normalizer_eps: float = 1.0e-3,
+    channel_mask: Tensor | None = None,
+    per_channel_normalizer: bool = True,
 ) -> Tensor:
     """teacher와 generated estimator의 clean path 차이로 DMD 방향을 만듭니다.
 
@@ -54,7 +56,14 @@ def build_clean_dmd_direction(
     generated_clean = generated_clean_norm.float()
 
     clean_dmd_direction = target_clean - generated_clean
-    reduce_dims = tuple(range(1, committed.dim()))
+    # per_channel_normalizer=True: 시간축만 평균하고 채널축은 남겨, 스케일이 제각각인
+    # control 채널(delta_s ÷1m, delta_yaw ÷0.025rad 등)을 각자 자기 거리로 정규화해
+    # heading 채널이 단일 스칼라 normalizer를 지배하던 문제를 없앤다.
+    # False면 기존처럼 (T,C) 전체 평균 단일 스칼라.
+    if per_channel_normalizer:
+        reduce_dims = tuple(range(1, committed.dim() - 1))  # 시간축만 (채널 유지)
+    else:
+        reduce_dims = tuple(range(1, committed.dim()))
     agent_distance = (committed - target_clean).abs().mean(
         dim=reduce_dims,
         keepdim=True,
@@ -62,6 +71,12 @@ def build_clean_dmd_direction(
     normalizer = agent_distance.clamp_min(float(normalizer_eps))
 
     normalized_direction = clean_dmd_direction / normalizer
+    if channel_mask is not None:
+        # 죽은 채널(예: non-holonomic delta_n) 제외 — direction을 0으로.
+        normalized_direction = normalized_direction * channel_mask.to(
+            device=normalized_direction.device,
+            dtype=normalized_direction.dtype,
+        )
     normalized_direction = torch.nan_to_num(
         normalized_direction,
         nan=0.0,

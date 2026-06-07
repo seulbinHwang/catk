@@ -85,10 +85,16 @@ set -- \
   seed="${SEED}" \
   paths.cache_root="${CACHE_ROOT}" \
   trainer.devices="${NPROC_PER_NODE}" \
+  "~trainer.strategy" \
+  "+trainer.strategy._target_=lightning.pytorch.strategies.DDPStrategy" \
+  "+trainer.strategy.find_unused_parameters=true" \
+  "+trainer.strategy.gradient_as_bucket_view=true" \
+  "+trainer.strategy.timeout._target_=datetime.timedelta" \
+  "+trainer.strategy.timeout.seconds=14400" \
   trainer.precision="${PRECISION}" \
   trainer.max_epochs="${MAX_EPOCHS}" \
-  trainer.val_check_interval="${VAL_CHECK_INTERVAL}" \
-  trainer.check_val_every_n_epoch=null \
+  ++trainer.val_check_interval="${VAL_CHECK_INTERVAL}" \
+  trainer.check_val_every_n_epoch=1 \
   trainer.limit_val_batches="${LIMIT_VAL_BATCHES}" \
   data.train_batch_size="${TRAIN_B}" \
   data.val_batch_size="${VAL_B}" \

@@ -2407,15 +2407,79 @@ class SMARTFlow(LightningModule):
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
             )
+            # 비보행자 delta_n(control ch1)은 trajectory에 영향 없는 죽은 채널이므로
+            # DMD direction 에서 제외(0)한다.  control-space(3d)에서만 적용.
+            channel_mask = self._build_self_forced_direction_channel_mask(
+                reference=clean_for_guidance,
+                tokenized_agent=tokenized_agent,
+                anchor_mask=anchor_mask,
+            )
             path_delta = build_clean_dmd_direction(
                 committed_path_norm=clean_for_guidance,
                 target_clean_norm=target_pred["clean"],
                 generated_clean_norm=generated_pred["clean"],
                 normalizer_eps=self.self_forced_direction_normalizer_eps,
+                channel_mask=channel_mask,
+                per_channel_normalizer=True,
+            )
+            self._log_self_forced_direction_diagnostics(
+                committed=clean_for_guidance,
+                target_clean=target_pred["clean"],
+                generated_clean=generated_pred["clean"],
+                path_delta=path_delta,
             )
 
         self._assert_self_forced_generator_update_isolated()
         return path_delta.to(dtype=committed_path_norm.dtype).detach()
+
+    def _build_self_forced_direction_channel_mask(
+        self,
+        reference: Tensor,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+    ) -> Tensor | None:
+        """control-space DMD direction 에서 비보행자 delta_n(ch1)을 0으로 만드는 mask.
+
+        Returns:
+            ``[n_valid, 1, C]`` mask 또는 (pose-space 등) None.
+        """
+        if not self.use_kinematic_control_flow or reference.numel() == 0:
+            return None
+        if reference.shape[-1] < 2 or "type" not in tokenized_agent:
+            return None
+        from src.smart.modules.kinematic_control import PEDESTRIAN_TYPE_ID
+
+        agent_type = tokenized_agent["type"][anchor_mask].to(device=reference.device)
+        if int(agent_type.shape[0]) != int(reference.shape[0]):
+            return None
+        if bool(self.encoder.agent_encoder.use_holonomic_model_only):
+            is_holo = torch.ones_like(agent_type, dtype=torch.bool)
+        else:
+            is_holo = agent_type == PEDESTRIAN_TYPE_ID
+        mask = reference.new_ones((reference.shape[0], 1, reference.shape[-1]))
+        mask[..., 1] = is_holo.to(mask.dtype).view(-1, 1)  # delta_n: holonomic 만 1
+        return mask
+
+    @torch.no_grad()
+    def _log_self_forced_direction_diagnostics(
+        self,
+        committed: Tensor,
+        target_clean: Tensor,
+        generated_clean: Tensor,
+        path_delta: Tensor,
+    ) -> None:
+        """채널별 DMD direction 크기와 teacher-fake clean 격차를 로깅(진단용)."""
+        if path_delta.numel() == 0:
+            return
+        c = int(path_delta.shape[-1])
+        names = ["ds", "dn", "dyaw"] if c == 3 else ["x", "y", "cos", "sin"]
+        dir_mag = path_delta.float().abs().mean(dim=tuple(range(path_delta.dim() - 1)))
+        tf_gap = (target_clean.float() - generated_clean.float()).abs().mean(
+            dim=tuple(range(target_clean.dim() - 1))
+        )
+        for i, nm in enumerate(names):
+            self.log(f"train/sf_dir_{nm}", dir_mag[i], on_step=True, on_epoch=False, batch_size=1)
+            self.log(f"train/sf_tfgap_{nm}", tf_gap[i], on_step=True, on_epoch=False, batch_size=1)
 
 
     def _sample_self_forced_guidance_flow_state(self, clean_path_norm: Tensor):

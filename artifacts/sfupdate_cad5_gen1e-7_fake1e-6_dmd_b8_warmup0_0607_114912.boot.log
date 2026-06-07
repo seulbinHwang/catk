@@ -1,0 +1,8 @@
+============================================================
+[sf-update] task=sfupdate_cad5_gen1e-7_fake1e-6_dmd_b8_warmup0_0607_114912
+  GPU=2,3 nproc=2  ckpt=logs/pretrained/pretrained.ckpt
+  cadence(fake:gen)=5:1  est_updates/batch=1  gen_lr=1e-7 fake_lr=1e-6
+  objective=dmd use_ema=false warmup_epochs=0
+  train_B=8 val_B=16 scorer_scene=440 val_check=1000 precision=bf16-mixed
+  log=artifacts/sfupdate_cad5_gen1e-7_fake1e-6_dmd_b8_warmup0_0607_114912.log
+============================================================
