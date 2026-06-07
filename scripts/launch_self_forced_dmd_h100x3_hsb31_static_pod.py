@@ -378,7 +378,7 @@ def exec_in_pod(args: argparse.Namespace, script: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch DMD self-forced H100x3 single-pod training on hsb-npc-training-3-1.",
+        description=f"Launch DMD self-forced H100x3 single-pod training on {DEFAULT_POD}.",
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--pod", default=DEFAULT_POD)
@@ -433,7 +433,7 @@ def parse_args() -> argparse.Namespace:
     if args.stop:
         return args
     if args.nproc_per_node != 3:
-        parser.error("--nproc-per-node must be 3 for the H100x3 hsb-npc-training-3-1 preset")
+        parser.error(f"--nproc-per-node must be 3 for the H100x3 {args.pod} preset")
     if args.initial_bs != 144:
         parser.error("--initial-bs is fixed at 144 for this requested recipe")
     if args.min_bs > args.initial_bs:
