@@ -2835,6 +2835,45 @@ python scripts/launch_self_forced_dmd_h100x3_hsb3n1_static_pod.py --stop
 python scripts/launch_self_forced_dmd_h100x3_hsb3n2_static_pod.py --stop
 ```
 
+#### wo-pvc-3-1 / wo-pvc-3-2 H100x3 self-forced launchers
+
+`wo-pvc-3-1`, `wo-pvc-3-2` pod에서도 같은 H100x3 self-forced DMD recipe를
+돌릴 수 있습니다. 기존 `hsb3n1/hsb3n2` launcher와 동작은 같고, pod / clean
+checkout / task name / tmux session / checkpoint cache path만 별도로 분리됩니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3_wopvc31_static_pod.py --replace
+python scripts/launch_self_forced_dmd_h100x3_wopvc32_static_pod.py --replace
+```
+
+기본 차이:
+
+| 항목 | `wo-pvc-3-1` | `wo-pvc-3-2` |
+|---|---|---|
+| script | `scripts/launch_self_forced_dmd_h100x3_wopvc31_static_pod.py` | `scripts/launch_self_forced_dmd_h100x3_wopvc32_static_pod.py` |
+| pod checkout | `/tmp/catk_self_forced_dmd_h100x3_wopvc31` | `/tmp/catk_self_forced_dmd_h100x3_wopvc32` |
+| experiment | `self_forced_npfm_h100_3_wopvc31` | `self_forced_npfm_h100_3_wopvc32` |
+| default task | `flow_self_forced_dmd_h100x3_wopvc31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_wopvc32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle` |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_wopvc31_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` | `/workspace/flow_self_forced_dmd_h100x3_wopvc32_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| tmux session | `catk-self-forced-dmd-h100x3-wopvc31` | `catk-self-forced-dmd-h100x3-wopvc32` |
+
+tmux 확인:
+
+```bash
+kubectl exec -it -n p-pnc wo-pvc-3-1 -c main -- \
+  tmux attach -t catk-self-forced-dmd-h100x3-wopvc31
+
+kubectl exec -it -n p-pnc wo-pvc-3-2 -c main -- \
+  tmux attach -t catk-self-forced-dmd-h100x3-wopvc32
+```
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3_wopvc31_static_pod.py --stop
+python scripts/launch_self_forced_dmd_h100x3_wopvc32_static_pod.py --stop
+```
+
 같은 단일 A100x4 recipe를 `testaa` pod에서 별도 task/session으로 돌리려면 아래 wrapper를
 사용합니다. 학습 설정은 위 `testa` launcher와 같고, 기본 pod / task name / tmux session /
 pretrain checkpoint cache 경로만 `testaa` 전용으로 분리됩니다.
