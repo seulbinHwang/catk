@@ -78,6 +78,9 @@ model_config:
     # Clean-DMD direction filters. These apply identically to pose-projected
     # and direct control-space DMD paths.
     dmd_use_stable_scale_filter: true
+    # Stable scale sharing scope: agent, type, or scene.
+    # type means agents with the same type in the same scene share one scale.
+    dmd_stable_scale_scope: type
     dmd_use_teacher_alignment_filter: false
     dmd_use_trust_region_filter: false
     clean_dmd_normalizer_eps: 0.05

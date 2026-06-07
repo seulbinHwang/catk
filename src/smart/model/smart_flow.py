@@ -58,6 +58,7 @@ from src.smart.modules.self_forced_trainable_range import (
     apply_self_forced_unfrozen_range,
     resolve_self_forced_unfrozen_range,
 )
+from src.smart.modules.kinematic_control import CYCLIST_TYPE_ID
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
 from src.smart.tokens.flow_token_processor import FlowTokenProcessor
 from src.smart.utils.finetune import set_model_for_finetuning
@@ -265,6 +266,17 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else True
         )
+        self.self_forced_dmd_stable_scale_scope = (
+            str(getattr(self.self_forced_config, "dmd_stable_scale_scope", "type")).lower()
+            if self.self_forced_config is not None
+            else "type"
+        )
+        if self.self_forced_dmd_stable_scale_scope not in {"agent", "type", "scene"}:
+            raise ValueError(
+                "self_forced.dmd_stable_scale_scope must be one of "
+                "'agent', 'type', or 'scene', "
+                f"got {self.self_forced_dmd_stable_scale_scope!r}."
+            )
         self.self_forced_dmd_use_teacher_alignment_filter = (
             bool(getattr(self.self_forced_config, "dmd_use_teacher_alignment_filter", False))
             if self.self_forced_config is not None
@@ -2696,6 +2708,11 @@ class SMARTFlow(LightningModule):
         if self.self_forced_target_teacher is None or self.self_forced_generated_estimator is None:
             raise RuntimeError("self-forced auxiliary models are not initialized.")
 
+        stable_scale_group_index = self._build_self_forced_dmd_stable_scale_group_index(
+            tokenized_agent=tokenized_agent,
+            anchor_mask=anchor_mask,
+            device=committed_path_norm.device,
+        )
         self.self_forced_target_teacher.eval()
         self.self_forced_generated_estimator.eval()
         self._clear_self_forced_auxiliary_gradients()
@@ -2730,6 +2747,7 @@ class SMARTFlow(LightningModule):
                     target_clean_control_norm=target_pred["clean"],
                     generated_clean_control_norm=generated_pred["clean"],
                     anchor_mask=anchor_mask,
+                    stable_scale_group_index=stable_scale_group_index,
                     dmd_injection_scale=dmd_injection_scale,
                 )
             else:
@@ -2738,6 +2756,7 @@ class SMARTFlow(LightningModule):
                     target_clean_norm=target_pred["clean"],
                     generated_clean_norm=generated_pred["clean"],
                     active_mask=active_control_mask,
+                    stable_scale_group_index=stable_scale_group_index,
                     normalizer_eps=self.self_forced_direction_normalizer_eps,
                     use_stable_scale_filter=self.self_forced_dmd_use_stable_scale_filter,
                     use_teacher_alignment_filter=self.self_forced_dmd_use_teacher_alignment_filter,
@@ -2776,6 +2795,34 @@ class SMARTFlow(LightningModule):
             else None
         )
         return agent_type, agent_length
+
+    def _build_self_forced_dmd_stable_scale_group_index(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor,
+        *,
+        device: torch.device,
+    ) -> Tensor | None:
+        """config에 따라 DMD stable scale을 공유할 agent group id를 만듭니다."""
+        scope = str(self.self_forced_dmd_stable_scale_scope)
+        if scope == "agent":
+            return None
+        if anchor_mask.ndim != 1:
+            raise ValueError(f"anchor_mask must have shape [n_agent], got {tuple(anchor_mask.shape)}.")
+        if "batch" not in tokenized_agent:
+            raise KeyError("tokenized_agent must contain batch for grouped DMD stable scale.")
+        selected_batch = tokenized_agent["batch"][anchor_mask].to(device=device, dtype=torch.long)
+        if scope == "scene":
+            return selected_batch
+        if scope == "type":
+            if "type" not in tokenized_agent:
+                raise KeyError("tokenized_agent must contain type for type-grouped DMD stable scale.")
+            selected_type = tokenized_agent["type"][anchor_mask].to(device=device, dtype=torch.long)
+            return selected_batch * int(CYCLIST_TYPE_ID + 1) + selected_type
+        raise ValueError(
+            "self_forced.dmd_stable_scale_scope must be one of 'agent', 'type', or 'scene', "
+            f"got {scope!r}."
+        )
 
     def _control_norm_to_self_forced_pose_norm(
         self,
@@ -2830,6 +2877,7 @@ class SMARTFlow(LightningModule):
         target_clean_control_norm: Tensor,
         generated_clean_control_norm: Tensor,
         anchor_mask: Tensor,
+        stable_scale_group_index: Tensor | None,
         dmd_injection_scale: float | Tensor,
     ) -> Tensor:
         """pose-space에서 DMD target을 만들고 rolling control delta로 되돌립니다."""
@@ -2853,6 +2901,7 @@ class SMARTFlow(LightningModule):
             target_clean_norm=target_pose_norm,
             generated_clean_norm=generated_pose_norm,
             active_mask=None,
+            stable_scale_group_index=stable_scale_group_index,
             normalizer_eps=self.self_forced_direction_normalizer_eps,
             use_stable_scale_filter=self.self_forced_dmd_use_stable_scale_filter,
             use_teacher_alignment_filter=self.self_forced_dmd_use_teacher_alignment_filter,

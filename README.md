@@ -2064,7 +2064,7 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
 - H100 preset은 Generator lr `1e-6`, generated estimator optimizer lr `1e-6`, `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=middle`, `detach_block_transition=true`, sampling = Euler `sample_steps=16` / `backprop_last_k=8` / `noise_scale=1.0` 을 기본으로 둡니다.
-- Bounded Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=0.05`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다. `clean_dmd_normalizer_eps` 는 active RMS stable scale의 최소값입니다.
+- Bounded Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=0.05`, `dmd_stable_scale_scope=type`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다. `clean_dmd_normalizer_eps` 는 stable scale의 최소값입니다.
 - Generator EMA 기본값은 `ema_weight=0.99`, `ema_start_step=50` 입니다. EMA는 online Generator update 직후에만 갱신되고, generated estimator에는 적용하지 않습니다.
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=0` 입니다. self-forcing 시작 직후부터 generated estimator 업데이트와 Generator 업데이트를 같은 train step 안에서 수행합니다.
 - 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
@@ -2085,6 +2085,7 @@ model:
     self_forced:
       project_dmd_to_pose_space: true
       dmd_use_stable_scale_filter: true
+      dmd_stable_scale_scope: type
       dmd_use_teacher_alignment_filter: false
       dmd_use_trust_region_filter: false
 ```
@@ -2143,7 +2144,8 @@ Clean-DMD 방향 안정화 필터는 pose-projected 경로와 direct control-spa
 
 | config | 기본값 | 의미 |
 |---|---:|---|
-| `dmd_use_stable_scale_filter` | `true` | \(S=\max(\mathrm{rms}(R),\mathrm{rms}(G),\epsilon)\) 로 나눈 \(D_0=R/S\) 방향을 사용합니다. |
+| `dmd_use_stable_scale_filter` | `true` | \(S=\max(\mathrm{mean}(|G|),\epsilon)\) 로 나눈 \(D_0=R/S\) 방향을 사용합니다. 평균 범위는 `dmd_stable_scale_scope`가 정합니다. |
+| `dmd_stable_scale_scope` | `type` | `agent`는 agent별, `type`은 같은 scene 안 같은 agent type별, `scene`은 같은 scene 전체 agent별로 stable scale을 공유합니다. |
 | `dmd_use_teacher_alignment_filter` | `false` | \(a=\mathbf{1}[\langle P_T-P_X,R\rangle>0]\) gate를 적용해 teacher 방향과 정렬된 agent만 남깁니다. |
 | `dmd_use_trust_region_filter` | `false` | \(D=D_1\min(1,\mathrm{rms}(G)/(\mathrm{rms}(D_1)+\epsilon))\) 로 DMD 방향 크기를 teacher 거리 이하로 제한합니다. |
 
@@ -3818,7 +3820,7 @@ K commit block 수 = flow_window_steps / 5
 - stop-motion gate는 self-forced 학습 rollout과 validation / test / submission inference 모두에서 사용하지 않습니다. `decoder.use_stop_motion` 과 `self_forced.use_stop_motion` 은 호환용 config 키로만 남아 있고 실제 동작은 false로 고정됩니다.
 - random terminal step `s` 는 self-rollout 의 실행 길이와 commit 지점만 정합니다. Generated estimator `F_psi` 학습과 generator direction 계산에서 쓰는 flow noising `tau` 는 rollout 의 `s` 와 독립적으로 전체 tau 구간에서 새로 샘플링합니다.
 - generator direction은 raw score/path 이동량을 그대로 쓰지 않고, 같은 noisy path에서 `F_rho` 와 `F_psi` 가 각각 추정한 clean path 차이를 사용합니다.
-- DMD 방향은 active 축의 `teacher clean path - generated clean path` 를 agent별 RMS stable scale `max(rms(R-F), rms(X-R), 0.05)` 로 정규화해서 만듭니다.
+- DMD 방향은 active 축의 `teacher clean path - generated clean path` 를 stable scale `max(mean(abs(X-R)), 0.05)` 로 정규화해서 만듭니다. 기본 scope는 `type`이라 같은 scene 안의 같은 agent type은 하나의 scale을 공유합니다.
 - agent별 teacher 방향 정렬 gate가 `sum((R-X) * (R-F)) <= 0` 인 DMD 방향을 버립니다.
 - agent별 trust-region은 고정 반경을 쓰지 않고 현재 Generator와 teacher 사이의 active RMS 거리 `rms(X-R)` 를 그대로 사용합니다. 따라서 최종 DMD 방향의 active RMS는 항상 `rms(X-R)` 이하입니다.
 - DMD target은 self-forced DMD update가 시작된 뒤 2 epoch 동안 `0.25 -> 0.625 -> 1.0` 계수로 완만하게 주입합니다.
@@ -3826,7 +3828,7 @@ K commit block 수 = flow_window_steps / 5
 - DMD 정규화 분모도 같은 active 축만 사용합니다. vehicle/cyclist lateral 오차가 DMD 방향 크기를 키우거나 줄이지 않게 하기 위한 규칙입니다.
 - DMD target은 `committed_path_norm + eta * path_delta`를 detached target으로 둡니다. 여기서 `path_delta` 는 teacher-aligned bounded DMD 방향이고, `eta` 는 DMD 시작 후 2 epoch ramp 계수입니다.
 - Clean-DMD guidance의 기본 noising 구간은 `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 입니다.
-- active RMS stable scale은 `clean_dmd_normalizer_eps=0.05` 로 최소값을 둬서 pretrained 근처에서 target path가 과하게 튀는 상황을 줄입니다.
+- stable scale은 `clean_dmd_normalizer_eps=0.05` 로 최소값을 둬서 pretrained 근처에서 target path가 과하게 튀는 상황을 줄입니다.
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.use_anchor_flow_matching_loss=false` 로 두면 `anchor_weight` 값과 무관하게 self-forced active step에서 training-mode open-loop forward와 FM loss 계산 자체를 생략합니다. `true` 일 때만 `model.model_config.self_forced.anchor_weight` 로 total loss 반영 강도를 제어합니다. anchor FM 을 끈 상태에서 어떤 rank 의 committed self-rollout 까지 비어있는 (모든 agent 가 invalid anchor0) 드문 경우에는, encoder 파라미터 합에 0 을 곱한 zero-loss 로 backward 만 한 번 돌려 DDP all-reduce 참여를 보장하고 optimizer step 은 건너뜁니다. 이 가드가 없으면 그 rank 만 backward 를 호출하지 않아 다른 rank 의 NCCL all-reduce 가 NCCL_TIMEOUT 까지 hang 합니다.
 - 선택적 trainable range. `model.model_config.self_forced.unfrozen_range=middle` 이 기본값이며, map encoder와 대부분의 agent 문맥부는 고정하고 마지막 agent 문맥 블록과 flow decoder만 학습합니다. `except_map_encoder` 는 map encoder만 고정하고 나머지 Generator / generated estimator 파라미터를 열며, `full_flow_decoder` 는 마지막 궤적 생성부만 엽니다.
 - epoch별 train subset sampling. self-forced preset은 `data.train_epoch_sample_fraction=0.25` 를 기본으로 두어 매 epoch 전체 train dataset의 25%만 새로 랜덤 샘플링해 학습합니다. DDP에서는 모든 rank가 같은 전역 subset을 공유한 뒤 rank별로 나눠 받습니다. `1.0` 으로 override하면 기존처럼 전체 train dataset을 씁니다.

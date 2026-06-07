@@ -146,6 +146,7 @@ def build_clean_dmd_direction(
     target_clean_norm: Tensor,
     generated_clean_norm: Tensor,
     active_mask: Tensor | None = None,
+    stable_scale_group_index: Tensor | None = None,
     normalizer_eps: float = 0.05,
     use_stable_scale_filter: bool = True,
     use_teacher_alignment_filter: bool = False,
@@ -162,9 +163,12 @@ def build_clean_dmd_direction(
             shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
         active_mask: 선택적 active 축 mask입니다. shape은 ``[n_valid_agent, 1, C]``
             처럼 ``committed_path_norm`` 에 broadcast 가능해야 합니다.
-        normalizer_eps: agent별 absolute-mean stable scale의 최소값입니다.
+        stable_scale_group_index: stable scale을 공유할 non-negative group id입니다.
+            ``None``이면 agent별로 ``mean(abs(G))`` 를 계산합니다. shape은
+            ``[n_valid_agent]`` 입니다.
+        normalizer_eps: absolute-mean stable scale의 최소값입니다.
         use_stable_scale_filter: True이면 teacher-estimator 차이를
-            ``max(mean(abs(G)), eps)`` 로 나눕니다.
+            group별 ``max(mean(abs(G)), eps)`` 로 나눕니다.
         use_teacher_alignment_filter: True이면 teacher 방향과 정렬된 agent만 남깁니다.
         use_trust_region_filter: True이면 DMD RMS가 Generator-teacher RMS보다
             커지지 않도록 agent별로 제한합니다.
@@ -228,15 +232,37 @@ def build_clean_dmd_direction(
         teacher_estimator_delta = teacher_estimator_delta * active
         generator_teacher_delta = generator_teacher_delta * active
 
-    generator_teacher_abs_mean = (
-        generator_teacher_delta.abs().sum(dim=reduce_dims, keepdim=True) / active_count
-    )
-    min_scale = torch.as_tensor(
-        float(normalizer_eps),
-        device=committed.device,
-        dtype=committed.dtype,
-    )
     if use_stable_scale_filter:
+        per_agent_abs_sum = generator_teacher_delta.abs().sum(dim=reduce_dims, keepdim=False)
+        per_agent_active_count = active_count.reshape(-1)
+        if stable_scale_group_index is None:
+            generator_teacher_abs_mean = per_agent_abs_sum / per_agent_active_count
+        else:
+            group_index = stable_scale_group_index.to(device=committed.device, dtype=torch.long)
+            if group_index.ndim != 1 or group_index.shape[0] != committed.shape[0]:
+                raise ValueError(
+                    "stable_scale_group_index must have shape [n_valid_agent], "
+                    f"got {tuple(group_index.shape)} for path shape {expected_shape}."
+                )
+            if group_index.numel() == 0:
+                generator_teacher_abs_mean = per_agent_abs_sum / per_agent_active_count
+            else:
+                num_group = int(group_index.max().item()) + 1
+                group_abs_sum = torch.zeros(num_group, device=committed.device, dtype=committed.dtype)
+                group_count = torch.zeros(num_group, device=committed.device, dtype=committed.dtype)
+                group_abs_sum.scatter_add_(0, group_index, per_agent_abs_sum)
+                group_count.scatter_add_(0, group_index, per_agent_active_count)
+                generator_teacher_abs_mean = (
+                    group_abs_sum[group_index] / group_count[group_index].clamp_min(1.0)
+                )
+        generator_teacher_abs_mean = generator_teacher_abs_mean.reshape(
+            (committed.shape[0],) + (1,) * (committed.dim() - 1)
+        )
+        min_scale = torch.as_tensor(
+            float(normalizer_eps),
+            device=committed.device,
+            dtype=committed.dtype,
+        )
         stable_scale = torch.maximum(
             generator_teacher_abs_mean,
             min_scale,
