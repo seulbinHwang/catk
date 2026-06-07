@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Any, Dict, Sequence
@@ -359,6 +360,48 @@ class SMARTFlow(LightningModule):
         self.self_forced_estimator_warmup_epochs = (
             resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
         )
+        self.self_forced_generated_estimator_init_path = (
+            str(getattr(self.self_forced_config, "generated_estimator_init_path", "") or "")
+            if self.self_forced_config is not None
+            else ""
+        )
+        self.self_forced_generated_estimator_init_strict = (
+            bool(getattr(self.self_forced_config, "generated_estimator_init_strict", True))
+            if self.self_forced_config is not None
+            else True
+        )
+        self.self_forced_generated_estimator_skip_warmup_on_load = (
+            bool(getattr(self.self_forced_config, "generated_estimator_skip_warmup_on_load", True))
+            if self.self_forced_config is not None
+            else True
+        )
+        self.self_forced_generated_estimator_bank_snapshot_path = (
+            str(getattr(self.self_forced_config, "generated_estimator_bank_snapshot_path", "") or "")
+            if self.self_forced_config is not None
+            else ""
+        )
+        self.self_forced_generated_estimator_bank_target_warmup_epochs = (
+            int(getattr(self.self_forced_config, "generated_estimator_bank_target_warmup_epochs", 0) or 0)
+            if self.self_forced_config is not None
+            else 0
+        )
+        self.self_forced_generated_estimator_bank_loaded_warmup_epochs = (
+            int(getattr(self.self_forced_config, "generated_estimator_bank_loaded_warmup_epochs", 0) or 0)
+            if self.self_forced_config is not None
+            else 0
+        )
+        self.self_forced_generated_estimator_bank_upload_artifact = (
+            str(getattr(self.self_forced_config, "generated_estimator_bank_upload_artifact", "") or "")
+            if self.self_forced_config is not None
+            else ""
+        )
+        self.self_forced_generated_estimator_bank_upload_on_warmup_end = (
+            bool(getattr(self.self_forced_config, "generated_estimator_bank_upload_on_warmup_end", False))
+            if self.self_forced_config is not None
+            else False
+        )
+        self._self_forced_generated_estimator_bank_loaded = False
+        self._self_forced_generated_estimator_bank_snapshot_saved = False
         self.self_forced_initialize_aux_on_fit_start = (
             bool(getattr(self.self_forced_config, "initialize_aux_from_generator_on_fit_start", True))
             if self.self_forced_config is not None
@@ -2126,6 +2169,170 @@ class SMARTFlow(LightningModule):
         self.self_forced_generated_estimator.load_state_dict(encoder_state)
         self._set_self_forced_auxiliary_modes()
 
+    @staticmethod
+    def _extract_self_forced_generated_estimator_state_dict(
+        checkpoint: object,
+    ) -> Dict[str, Tensor]:
+        """generated estimator state만 다양한 checkpoint 포맷에서 꺼냅니다."""
+        if not isinstance(checkpoint, dict):
+            raise TypeError(
+                "generated-estimator checkpoint must be a dict saved by torch.save()."
+            )
+        raw_state = checkpoint.get("state_dict", checkpoint)
+        if not isinstance(raw_state, dict):
+            raise TypeError("generated-estimator checkpoint state_dict must be a dict.")
+
+        prefix = "self_forced_generated_estimator."
+        if any(isinstance(key, str) and key.startswith(prefix) for key in raw_state.keys()):
+            return {
+                key[len(prefix) :]: value
+                for key, value in raw_state.items()
+                if isinstance(key, str) and key.startswith(prefix)
+            }
+
+        return {
+            key: value
+            for key, value in raw_state.items()
+            if isinstance(key, str) and torch.is_tensor(value)
+        }
+
+    def _load_self_forced_generated_estimator_bank(self) -> None:
+        """W&B bank 등에서 받은 generated estimator state를 보조 모델에 주입합니다."""
+        if not self.self_forced_enabled:
+            return
+        if self.self_forced_generated_estimator is None:
+            return
+        if not self.self_forced_generated_estimator_init_path:
+            return
+
+        init_path = Path(self.self_forced_generated_estimator_init_path)
+        if not init_path.is_file():
+            raise FileNotFoundError(
+                "self_forced.generated_estimator_init_path does not exist: "
+                f"{init_path}"
+            )
+
+        checkpoint = torch.load(init_path, map_location="cpu", weights_only=False)
+        state_dict = self._extract_self_forced_generated_estimator_state_dict(checkpoint)
+        incompatible = self.self_forced_generated_estimator.load_state_dict(
+            state_dict,
+            strict=bool(self.self_forced_generated_estimator_init_strict),
+        )
+        if not self.self_forced_generated_estimator_init_strict:
+            missing = getattr(incompatible, "missing_keys", [])
+            unexpected = getattr(incompatible, "unexpected_keys", [])
+            if missing or unexpected:
+                print(
+                    "[self-forced-estimator-bank] non-strict load "
+                    f"missing={missing} unexpected={unexpected}"
+                )
+        self._self_forced_generated_estimator_bank_loaded = True
+        if self.self_forced_generated_estimator_skip_warmup_on_load:
+            self.self_forced_estimator_warmup_epochs = 0
+        self._set_self_forced_auxiliary_modes()
+        print(
+            "[self-forced-estimator-bank] loaded generated estimator from "
+            f"{init_path}; skip_warmup={self.self_forced_generated_estimator_skip_warmup_on_load}"
+        )
+
+    def _build_self_forced_generated_estimator_bank_metadata(self) -> Dict[str, Any]:
+        """저장/업로드할 generated estimator bank metadata를 구성합니다."""
+        target_warmup_epochs = int(
+            self.self_forced_generated_estimator_bank_target_warmup_epochs
+            or self.self_forced_estimator_warmup_epochs
+        )
+        return {
+            "format_version": 1,
+            "state_dict_kind": "self_forced_generated_estimator",
+            "state_dict_prefix": "",
+            "source_epoch": int(self.current_epoch),
+            "global_step": int(getattr(self, "global_step", 0)),
+            "self_forced_start_epoch": int(self.self_forced_start_epoch),
+            "estimator_warmup_epochs": target_warmup_epochs,
+            "remaining_warmup_epochs": int(self.self_forced_estimator_warmup_epochs),
+            "loaded_warmup_epochs": int(self.self_forced_generated_estimator_bank_loaded_warmup_epochs),
+            "lr": float(self.lr),
+            "generated_estimator_lr": float(self.self_forced_generated_estimator_lr),
+            "unfrozen_range": str(self.self_forced_unfrozen_range),
+            "control_flow": bool(self.use_kinematic_control_flow),
+            "flow_window_steps": int(self.flow_window_steps),
+        }
+
+    def _save_self_forced_generated_estimator_bank_snapshot(self) -> Path | None:
+        """warmup 종료 시점의 generated estimator만 별도 파일로 저장합니다."""
+        if not self.self_forced_enabled:
+            return None
+        if self.self_forced_generated_estimator is None:
+            return None
+        if self._self_forced_generated_estimator_bank_snapshot_saved:
+            return None
+        if not self.self_forced_generated_estimator_bank_snapshot_path:
+            return None
+        if self.trainer is not None and not self.trainer.is_global_zero:
+            return None
+
+        snapshot_path = Path(self.self_forced_generated_estimator_bank_snapshot_path)
+        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "state_dict": {
+                key: value.detach().cpu()
+                for key, value in self.self_forced_generated_estimator.state_dict().items()
+            },
+            "metadata": self._build_self_forced_generated_estimator_bank_metadata(),
+        }
+        torch.save(payload, snapshot_path)
+        metadata_path = snapshot_path.with_suffix(snapshot_path.suffix + ".metadata.json")
+        metadata_path.write_text(
+            json.dumps(payload["metadata"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self._self_forced_generated_estimator_bank_snapshot_saved = True
+        print(f"[self-forced-estimator-bank] saved snapshot: {snapshot_path}")
+        return snapshot_path
+
+    def _upload_self_forced_generated_estimator_bank_snapshot(self, snapshot_path: Path) -> None:
+        """현재 W&B run에 generated estimator bank artifact를 업로드합니다."""
+        if not self.self_forced_generated_estimator_bank_upload_on_warmup_end:
+            return
+        artifact_name = self.self_forced_generated_estimator_bank_upload_artifact
+        if not artifact_name:
+            return
+        logger = getattr(self, "logger", None)
+        experiment = getattr(logger, "experiment", None)
+        if experiment is None or not hasattr(experiment, "log_artifact"):
+            print(
+                "[self-forced-estimator-bank] skip artifact upload: "
+                "current logger does not expose W&B log_artifact()."
+            )
+            return
+
+        try:
+            import wandb
+        except Exception as exc:  # pragma: no cover - depends on runtime env.
+            print(f"[self-forced-estimator-bank] skip artifact upload: {exc}")
+            return
+
+        metadata = self._build_self_forced_generated_estimator_bank_metadata()
+        artifact = wandb.Artifact(
+            name=artifact_name,
+            type="generated_estimator_bank",
+            metadata=metadata,
+        )
+        artifact.add_file(snapshot_path.as_posix(), name=snapshot_path.name)
+        metadata_path = snapshot_path.with_suffix(snapshot_path.suffix + ".metadata.json")
+        if metadata_path.is_file():
+            artifact.add_file(metadata_path.as_posix(), name=metadata_path.name)
+        aliases = [
+            "latest",
+            f"warmup{int(metadata['estimator_warmup_epochs'])}",
+            f"lr{float(metadata['generated_estimator_lr']):.0e}",
+        ]
+        experiment.log_artifact(artifact, aliases=aliases)
+        print(
+            "[self-forced-estimator-bank] logged W&B artifact "
+            f"{artifact_name} aliases={aliases}"
+        )
+
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """self-forced resume 여부를 기록합니다.
 
@@ -3171,6 +3378,7 @@ class SMARTFlow(LightningModule):
         self._configure_fast_wosac_validation_scope()
         self._apply_fit_time_validation_batch_limit()
         self._sync_self_forced_auxiliary_models()
+        self._load_self_forced_generated_estimator_bank()
         self._prepare_self_forced_generator_ema()
 
     def on_validation_start(self) -> None:
@@ -3902,6 +4110,14 @@ open_metric_dict:
         self._log_open_loop_train_epoch_metrics()
         if not self.self_forced_enabled:
             return
+        if (
+            int(self.self_forced_estimator_warmup_epochs) > 0
+            and int(self.current_epoch)
+            == int(self.self_forced_start_epoch) + int(self.self_forced_estimator_warmup_epochs) - 1
+        ):
+            snapshot_path = self._save_self_forced_generated_estimator_bank_snapshot()
+            if snapshot_path is not None:
+                self._upload_self_forced_generated_estimator_bank_snapshot(snapshot_path)
         schedulers = self.lr_schedulers()
         if schedulers is None:
             return

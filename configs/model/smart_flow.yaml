@@ -96,6 +96,20 @@ model_config:
     generated_estimator_lr: ${model.model_config.lr}
     estimator_updates_per_step: 5
     estimator_warmup_epochs: 0
+    # Optional generated-estimator warmup bank.
+    # When generated_estimator_init_path points to a bank entry, only the
+    # generated estimator is loaded from that file. Generator, teacher,
+    # optimizer, epoch, and global step still come from ckpt_path/action.
+    generated_estimator_init_path: ""
+    generated_estimator_init_strict: true
+    generated_estimator_skip_warmup_on_load: true
+    # When warmup must actually run, rank 0 can save the warmup-complete
+    # generated estimator here. Launch scripts may upload it to a W&B bank.
+    generated_estimator_bank_snapshot_path: ""
+    generated_estimator_bank_target_warmup_epochs: 0
+    generated_estimator_bank_loaded_warmup_epochs: 0
+    generated_estimator_bank_upload_artifact: ""
+    generated_estimator_bank_upload_on_warmup_end: false
     # Reuse the frozen map encoder output inside a self-forced train step.
     # This is enabled only when the decoder map encoder is actually frozen.
     cache_frozen_map_features: true

@@ -2156,6 +2156,63 @@ Clean-DMD 방향 안정화 필터는 pose-projected 경로와 direct control-spa
 `false` 일 때는 control-space에서 계산됩니다. vehicle/cyclist lateral 축 제외는 별도의 active-control
 mask 규칙이라 위 세 필터와 무관하게 기존처럼 최종 control loss 단계에서 유지됩니다.
 
+#### Generated estimator warmup bank
+
+같은 pretrained Generator checkpoint와 같은 generated-estimator LR을 쓰는 self-forced DMD 실험에서는
+estimator warmup만 반복해서 다시 돌릴 필요가 없습니다. `scripts/self_forced_h100_4_with_oom_retry.sh`
+계열 launcher는 W&B artifact에 저장된 generated estimator state를 먼저 찾고, `(estimator_warmup_epochs, lr)`
+조합이 정확히 일치하면 warmup을 건너뜁니다. 정확히 같은 entry가 없으면, 요청한 warmup보다 작으면서
+가장 가까운 entry를 불러와 남은 warmup epoch만 이어서 수행합니다.
+
+현재 epoch 61 pretrain artifact `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` 기준으로
+아래 generated-estimator bank를 만들어 두었습니다.
+
+```text
+jksg01019-naver-labs/SMART-FLOW/generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest
+```
+
+| entry | lr | source checkpoint | 포함 내용 |
+|---:|---:|---|---|
+| warmup 1 | `1e-6` | warmup 1 epoch 종료 시점 | `self_forced_generated_estimator` state only |
+| warmup 2 | `1e-6` | warmup 2 epoch 종료 시점 | `self_forced_generated_estimator` state only |
+| warmup 4 | `1e-6` | warmup 4 epoch 종료 시점 | `self_forced_generated_estimator` state only |
+
+사용 예시는 다음과 같습니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
+  --replace \
+  --use-estimator-warmup-bank \
+  --estimator-warmup-epochs 2 \
+  --max-epochs 4 \
+  --task-name flow_self_forced_dmd_h100x3_hsb31_warmup2_bank
+```
+
+bank hit가 나면 실행 스크립트는 다음을 자동으로 적용합니다.
+
+```text
+1. W&B artifact에서 요청 warmup 이하 중 가장 큰 lr=1e-6 entry 다운로드
+2. model.model_config.self_forced.generated_estimator_init_path=<downloaded .pt>
+3. model.model_config.self_forced.estimator_warmup_epochs=<요청 warmup - 로드한 warmup>
+4. exact hit이면 generated_estimator_skip_warmup_on_load=true
+5. lower hit이면 남은 warmup 종료 시 target warmup entry를 다시 bank에 업로드
+6. 기본적으로 max_epochs에서 이미 로드한 warmup epoch 수를 빼서 Generator+DMD 학습 epoch 수를 유지
+```
+
+예를 들어 `--estimator-warmup-epochs 2 --max-epochs 4` 에서 bank hit가 나면 실제 trainer는
+`max_epochs=2` 로 실행됩니다. warmup 이후 Generator+DMD 공동 학습 2 epoch을 유지하기 위한 처리입니다.
+또 `--estimator-warmup-epochs 6 --max-epochs 8` 을 요청했는데 bank에 warmup 4만 있으면,
+warmup 4 estimator를 로드하고 trainer는 `estimator_warmup_epochs=2`, `max_epochs=4` 로 실행됩니다.
+즉 남은 warmup 2 epoch과 Generator+DMD 공동 학습 2 epoch만 수행합니다. 이 보정을 끄려면
+`--no-estimator-warmup-bank-adjust-max-epochs` 를 추가합니다.
+
+bank miss가 나면 기존처럼 처음부터 warmup을 수행합니다. lower hit 또는 miss인 경우 warmup 종료 시
+generated estimator snapshot을 저장하고, 학습이 정상 종료되면 같은 artifact name으로 target warmup entry를
+자동 upsert합니다. W&B 조회, 다운로드, 업로드는 실행 시작 전 또는 warmup 종료 시점에만 수행되므로
+train step 내부 속도에는 영향을 주지 않습니다.
+여러 실험이 비슷한 시점에 같은 bank로 upsert할 수 있으므로, helper는 업로드 후 latest manifest를 다시 확인하고
+방금 추가한 entry가 빠졌으면 latest bank를 다시 받아 merge 후 재업로드합니다.
+
 실행 예시:
 
 ```bash

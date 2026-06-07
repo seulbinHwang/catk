@@ -46,6 +46,19 @@
 #   CLEAN_DMD_NORMALIZER_EPS=      Optional Clean-DMD stable scale floor override.
 #   CLEAN_DMD_TAU_LOW=             Optional Clean-DMD guidance tau lower bound.
 #   CLEAN_DMD_TAU_HIGH=            Optional Clean-DMD guidance tau upper bound.
+#   ESTIMATOR_WARMUP_BANK_ENABLED=false
+#                                  true이면 fresh finetune 시작 전에 W&B
+#                                  generated-estimator bank에서
+#                                  (warmup_epochs, lr) entry를 찾아 warmup을
+#                                  건너뜁니다.
+#   ESTIMATOR_WARMUP_BANK_ARTIFACT=
+#                                  W&B bank artifact name/ref. 예:
+#                                  generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest
+#   ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME=
+#                                  warmup을 새로 돌린 뒤 upsert할 artifact name.
+#   ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS=true
+#                                  bank hit 시 max_epochs에서 warmup epoch 수를
+#                                  빼서 DMD 학습 epoch budget을 유지합니다.
 #   CATK_EXTRA_OVERRIDES=          Optional whitespace-separated Hydra overrides.
 #
 # Usage example:
@@ -72,6 +85,140 @@ MIN_BS="${MIN_BS:-2}"
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:?must set PRETRAIN_CKPT to the 2s-horizon pretrained Generator ckpt}"
+ESTIMATOR_WARMUP_BANK_ENABLED="${ESTIMATOR_WARMUP_BANK_ENABLED:-false}"
+ESTIMATOR_WARMUP_BANK_ARTIFACT="${ESTIMATOR_WARMUP_BANK_ARTIFACT:-}"
+ESTIMATOR_WARMUP_BANK_ENTITY="${ESTIMATOR_WARMUP_BANK_ENTITY:-${WANDB_ENTITY:-jksg01019-naver-labs}}"
+ESTIMATOR_WARMUP_BANK_PROJECT="${ESTIMATOR_WARMUP_BANK_PROJECT:-${WANDB_PROJECT:-SMART-FLOW}}"
+ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS="${ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS:-true}"
+ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME:-}"
+ESTIMATOR_WARMUP_BANK_INIT_PATH=""
+ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH=""
+ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP="${ESTIMATOR_WARMUP_EPOCHS:-}"
+ESTIMATOR_WARMUP_BANK_LOADED_WARMUP=0
+ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="${ESTIMATOR_WARMUP_EPOCHS:-0}"
+
+if [[ -z "$ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME" && -n "$ESTIMATOR_WARMUP_BANK_ARTIFACT" ]]; then
+  ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="${ESTIMATOR_WARMUP_BANK_ARTIFACT##*/}"
+  ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME%%:*}"
+fi
+
+has_latest_self_forced_ckpt() {
+  ls -t "${CATK_LOG_DIR}/${TASK_NAME}/runs"/*/checkpoints/epoch_last.ckpt >/dev/null 2>&1
+}
+
+apply_estimator_warmup_bank_progress() {
+  local loaded_warmup="$1"
+  local remaining_warmup="$2"
+  local context="$3"
+
+  ESTIMATOR_WARMUP_BANK_LOADED_WARMUP="$loaded_warmup"
+  ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="$remaining_warmup"
+  if [[ "$ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS" == "true" && "${MAX_EPOCHS:-}" =~ ^[0-9]+$ ]]; then
+    local adjusted_epochs=$(( MAX_EPOCHS - ESTIMATOR_WARMUP_BANK_LOADED_WARMUP ))
+    if (( adjusted_epochs < 1 )); then
+      adjusted_epochs=1
+    fi
+    log "Adjusting MAX_EPOCHS ${MAX_EPOCHS} -> ${adjusted_epochs} after estimator-bank ${context}."
+    MAX_EPOCHS="$adjusted_epochs"
+  fi
+  ESTIMATOR_WARMUP_EPOCHS="$ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP"
+}
+
+raise_max_epochs_to_checkpoint_floor() {
+  local ckpt_path="$1"
+  if [[ -z "${MAX_EPOCHS:-}" || ! "${MAX_EPOCHS:-}" =~ ^[0-9]+$ || ! -f "$ckpt_path" ]]; then
+    return 0
+  fi
+  local checkpoint_floor
+  checkpoint_floor="$(
+    python - "$ckpt_path" <<'PY' 2>/dev/null
+import sys
+import torch
+
+checkpoint = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+epoch = checkpoint.get("epoch") if isinstance(checkpoint, dict) else None
+if epoch is not None:
+    print(int(epoch) + 1)
+PY
+  )"
+  if [[ "$checkpoint_floor" =~ ^[0-9]+$ && "$MAX_EPOCHS" -lt "$checkpoint_floor" ]]; then
+    log "Raising MAX_EPOCHS ${MAX_EPOCHS} -> ${checkpoint_floor} so resume checkpoint epoch is not past the trainer budget."
+    MAX_EPOCHS="$checkpoint_floor"
+  fi
+}
+
+maybe_prepare_estimator_warmup_bank() {
+  if [[ "$ESTIMATOR_WARMUP_BANK_ENABLED" != "true" ]]; then
+    return 0
+  fi
+  if [[ -z "$ESTIMATOR_WARMUP_BANK_ARTIFACT" ]]; then
+    log "Estimator warmup bank enabled but ESTIMATOR_WARMUP_BANK_ARTIFACT is empty; running warmup normally."
+    return 0
+  fi
+  if [[ -z "${ESTIMATOR_WARMUP_EPOCHS:-}" || "${ESTIMATOR_WARMUP_EPOCHS}" == "0" ]]; then
+    return 0
+  fi
+  if [[ -z "${CATK_LR:-}" ]]; then
+    log "Estimator warmup bank enabled but CATK_LR is empty; running warmup normally."
+    return 0
+  fi
+  local bank_root="${CATK_LOG_DIR}/_self_forced_estimator_bank/${TASK_NAME}"
+  mkdir -p "$bank_root"
+  local requested_warmup="${ESTIMATOR_WARMUP_EPOCHS}"
+  local resolved_env="${bank_root}/resolved_warmup_${requested_warmup}_lr_${CATK_LR}.env"
+  local latest_existing_ckpt=""
+  latest_existing_ckpt="$(ls -t "${CATK_LOG_DIR}/${TASK_NAME}/runs"/*/checkpoints/epoch_last.ckpt 2>/dev/null | head -1 || true)"
+  if [[ -n "$latest_existing_ckpt" ]]; then
+    ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="${bank_root}/snapshot_warmup_${requested_warmup}_lr_${CATK_LR}_generated_estimator.pt"
+    if [[ -f "$resolved_env" ]]; then
+      # shellcheck disable=SC1090
+      source "$resolved_env"
+      apply_estimator_warmup_bank_progress \
+        "${ESTIMATOR_WARMUP_BANK_RESOLVED_WARMUP:-0}" \
+        "${ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP:-0}" \
+        "resume"
+      if [[ "${ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP:-0}" == "0" ]]; then
+        ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH=""
+      fi
+      log "Existing self-forced checkpoint found; restoring estimator-bank resume state: loaded_warmup=${ESTIMATOR_WARMUP_BANK_LOADED_WARMUP} remaining_warmup=${ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP}."
+    else
+      ESTIMATOR_WARMUP_BANK_LOADED_WARMUP=0
+      ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="$requested_warmup"
+      log "Existing self-forced checkpoint found; no estimator-bank resolve state for this task, so resume keeps requested_warmup=${requested_warmup}."
+    fi
+    raise_max_epochs_to_checkpoint_floor "$latest_existing_ckpt"
+    return 0
+  fi
+
+  ESTIMATOR_WARMUP_BANK_INIT_PATH="${bank_root}/resolved_for_warmup_${requested_warmup}_lr_${CATK_LR}_generated_estimator.pt"
+  ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="${bank_root}/snapshot_warmup_${requested_warmup}_lr_${CATK_LR}_generated_estimator.pt"
+
+  log "Checking estimator warmup bank: artifact=${ESTIMATOR_WARMUP_BANK_ARTIFACT} requested_warmup=${requested_warmup} lr=${CATK_LR}"
+  if python scripts/self_forced_estimator_bank.py resolve \
+      --artifact "$ESTIMATOR_WARMUP_BANK_ARTIFACT" \
+      --warmup-epochs "$requested_warmup" \
+      --lr "$CATK_LR" \
+      --output "$ESTIMATOR_WARMUP_BANK_INIT_PATH" \
+      --env-output "$resolved_env" \
+      --entity "$ESTIMATOR_WARMUP_BANK_ENTITY" \
+      --project "$ESTIMATOR_WARMUP_BANK_PROJECT"; then
+    # shellcheck disable=SC1090
+    source "$resolved_env"
+    local loaded_warmup="${ESTIMATOR_WARMUP_BANK_RESOLVED_WARMUP:-0}"
+    local remaining_warmup="${ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP:-0}"
+    log "Estimator bank hit: loaded_warmup=${loaded_warmup} requested_warmup=${requested_warmup} remaining_warmup=${remaining_warmup}"
+    apply_estimator_warmup_bank_progress "$loaded_warmup" "$remaining_warmup" "hit"
+  else
+    log "Estimator bank miss; warmup will run and snapshot will be saved to $ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH"
+    ESTIMATOR_WARMUP_BANK_LOADED_WARMUP=0
+    ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="$requested_warmup"
+  fi
+}
+
+timestamp() { date '+%F %T %Z'; }
+log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
+
+maybe_prepare_estimator_warmup_bank
 
 EXTRA_OVERRIDES=()
 if [[ -n "${VAL_BATCH_SIZE:-}" ]]; then
@@ -103,6 +250,22 @@ if [[ -n "${CATK_LR:-}" ]]; then
 fi
 if [[ -n "${ESTIMATOR_WARMUP_EPOCHS:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}")
+fi
+if [[ -n "${ESTIMATOR_WARMUP_BANK_INIT_PATH:-}" && -f "$ESTIMATOR_WARMUP_BANK_INIT_PATH" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_init_path=${ESTIMATOR_WARMUP_BANK_INIT_PATH}")
+  if [[ "${ESTIMATOR_WARMUP_EPOCHS:-0}" == "0" ]]; then
+    EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_skip_warmup_on_load=true")
+  else
+    EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_skip_warmup_on_load=false")
+    EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_bank_snapshot_path=${ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH}")
+  fi
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_init_strict=true")
+elif [[ -n "${ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH:-}" && "$ESTIMATOR_WARMUP_BANK_ENABLED" == "true" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_bank_snapshot_path=${ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH}")
+fi
+if [[ -n "${ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP:-}" && "$ESTIMATOR_WARMUP_BANK_ENABLED" == "true" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_bank_target_warmup_epochs=${ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP}")
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_bank_loaded_warmup_epochs=${ESTIMATOR_WARMUP_BANK_LOADED_WARMUP}")
 fi
 if [[ -n "${SELF_FORCED_USE_STOP_MOTION:-}" ]]; then
   EXTRA_OVERRIDES+=("model.model_config.self_forced.use_stop_motion=${SELF_FORCED_USE_STOP_MOTION}")
@@ -151,9 +314,6 @@ LOG_DIR="${CATK_LOG_DIR}/_self_forced_oom_retry/${TASK_NAME}"
 mkdir -p "$LOG_DIR"
 
 OOM_REGEX='OutOfMemoryError|CUDA out of memory|c10::OutOfMemoryError|cuda runtime error.*out of memory|torch\.OutOfMemoryError|CUDA_ERROR_OUT_OF_MEMORY'
-
-timestamp() { date '+%F %T %Z'; }
-log() { printf '[%s] %s\n' "$(timestamp)" "$*"; }
 
 find_latest_self_forced_ckpt() {
   # Latest `epoch_last.ckpt` under any run directory for this task.
@@ -205,6 +365,22 @@ while (( bs >= MIN_BS )); do
 
   if (( exit_code == 0 )); then
     log "Training completed successfully (attempt #${attempt}, bs=${bs})."
+    if [[ "$ESTIMATOR_WARMUP_BANK_ENABLED" == "true" \
+        && -n "${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME:-}" \
+        && -n "${ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH:-}" \
+        && -f "$ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH" \
+        && -n "${ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP:-}" \
+        && -n "${CATK_LR:-}" ]]; then
+      log "Uploading generated-estimator warmup snapshot to W&B bank: ${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME}"
+      python scripts/self_forced_estimator_bank.py upsert \
+        --artifact-name "$ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME" \
+        --entry "${ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP}:${CATK_LR}:${ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH}" \
+        --entity "$ESTIMATOR_WARMUP_BANK_ENTITY" \
+        --project "$ESTIMATOR_WARMUP_BANK_PROJECT" \
+        --run-name "${TASK_NAME}_generated_estimator_bank" \
+        --alias latest \
+        --alias "pretrain_x5f9g0ce_v57" || true
+    fi
     exit 0
   fi
 
