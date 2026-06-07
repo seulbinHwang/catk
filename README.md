@@ -2084,6 +2084,9 @@ model:
   model_config:
     self_forced:
       project_dmd_to_pose_space: true
+      dmd_use_stable_scale_filter: true
+      dmd_use_teacher_alignment_filter: false
+      dmd_use_trust_region_filter: false
 ```
 
 핵심은 DMD 방향을 3축 control 값에서 바로 판단하지 않고, 실제 closed-loop metric이 보는
@@ -2135,6 +2138,19 @@ model.model_config.self_forced.project_dmd_to_pose_space=false
 학습 로그에서는 `train/sf_pose_projected_dmd=1` 이면 pose-projected DMD가 실제로 활성화된
 상태입니다. `use_kinematic_control_flow=false` 이거나 flow state가 pose-space인 경우에는 이 옵션을
 켜도 자동으로 legacy 경로와 같은 pose-space DMD 판단이 됩니다.
+
+Clean-DMD 방향 안정화 필터는 pose-projected 경로와 direct control-space 경로에 동일하게 적용됩니다.
+
+| config | 기본값 | 의미 |
+|---|---:|---|
+| `dmd_use_stable_scale_filter` | `true` | \(S=\max(\mathrm{rms}(R),\mathrm{rms}(G),\epsilon)\) 로 나눈 \(D_0=R/S\) 방향을 사용합니다. |
+| `dmd_use_teacher_alignment_filter` | `false` | \(a=\mathbf{1}[\langle P_T-P_X,R\rangle>0]\) gate를 적용해 teacher 방향과 정렬된 agent만 남깁니다. |
+| `dmd_use_trust_region_filter` | `false` | \(D=D_1\min(1,\mathrm{rms}(G)/(\mathrm{rms}(D_1)+\epsilon))\) 로 DMD 방향 크기를 teacher 거리 이하로 제한합니다. |
+
+여기서 \(R\) 은 teacher-estimator clean 추정 차이, \(G\) 는 현재 generator와 teacher의 차이입니다.
+`project_dmd_to_pose_space=true` 일 때는 위 값들이 pose-space에서 계산되고,
+`false` 일 때는 control-space에서 계산됩니다. vehicle/cyclist lateral 축 제외는 별도의 active-control
+mask 규칙이라 위 세 필터와 무관하게 기존처럼 최종 control loss 단계에서 유지됩니다.
 
 실행 예시:
 

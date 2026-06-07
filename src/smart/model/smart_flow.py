@@ -260,6 +260,21 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else True
         )
+        self.self_forced_dmd_use_stable_scale_filter = (
+            bool(getattr(self.self_forced_config, "dmd_use_stable_scale_filter", True))
+            if self.self_forced_config is not None
+            else True
+        )
+        self.self_forced_dmd_use_teacher_alignment_filter = (
+            bool(getattr(self.self_forced_config, "dmd_use_teacher_alignment_filter", False))
+            if self.self_forced_config is not None
+            else False
+        )
+        self.self_forced_dmd_use_trust_region_filter = (
+            bool(getattr(self.self_forced_config, "dmd_use_trust_region_filter", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_sid_alpha = (
             float(getattr(self.self_forced_config, "sid_alpha", 1.0))
             if self.self_forced_config is not None
@@ -2724,6 +2739,9 @@ class SMARTFlow(LightningModule):
                     generated_clean_norm=generated_pred["clean"],
                     active_mask=active_control_mask,
                     normalizer_eps=self.self_forced_direction_normalizer_eps,
+                    use_stable_scale_filter=self.self_forced_dmd_use_stable_scale_filter,
+                    use_teacher_alignment_filter=self.self_forced_dmd_use_teacher_alignment_filter,
+                    use_trust_region_filter=self.self_forced_dmd_use_trust_region_filter,
                 )
 
         self._assert_self_forced_generator_update_isolated()
@@ -2836,6 +2854,9 @@ class SMARTFlow(LightningModule):
             generated_clean_norm=generated_pose_norm,
             active_mask=None,
             normalizer_eps=self.self_forced_direction_normalizer_eps,
+            use_stable_scale_filter=self.self_forced_dmd_use_stable_scale_filter,
+            use_teacher_alignment_filter=self.self_forced_dmd_use_teacher_alignment_filter,
+            use_trust_region_filter=self.self_forced_dmd_use_trust_region_filter,
         )
         if isinstance(dmd_injection_scale, Tensor):
             injection_scale = dmd_injection_scale.to(

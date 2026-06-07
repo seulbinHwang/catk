@@ -147,8 +147,11 @@ def build_clean_dmd_direction(
     generated_clean_norm: Tensor,
     active_mask: Tensor | None = None,
     normalizer_eps: float = 0.05,
+    use_stable_scale_filter: bool = True,
+    use_teacher_alignment_filter: bool = False,
+    use_trust_region_filter: bool = False,
 ) -> Tensor:
-    """teacher-aligned bounded DMD 방향을 active 축에서만 만듭니다.
+    """configurable clean-DMD 방향을 active 축에서만 만듭니다.
 
     Args:
         committed_path_norm: Generator가 closed-loop로 실제 실행한 path입니다.
@@ -160,16 +163,19 @@ def build_clean_dmd_direction(
         active_mask: 선택적 active 축 mask입니다. shape은 ``[n_valid_agent, 1, C]``
             처럼 ``committed_path_norm`` 에 broadcast 가능해야 합니다.
         normalizer_eps: agent별 RMS stable scale의 최소값입니다.
+        use_stable_scale_filter: True이면 teacher-estimator 차이를
+            ``max(rms(R), rms(G), eps)`` 로 나눕니다.
+        use_teacher_alignment_filter: True이면 teacher 방향과 정렬된 agent만 남깁니다.
+        use_trust_region_filter: True이면 DMD RMS가 Generator-teacher RMS보다
+            커지지 않도록 agent별로 제한합니다.
 
     Returns:
         Tensor: 현재 committed path에 더할 bounded DMD 방향입니다.
         shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
 
     설명:
-        이 함수는 raw velocity 차이나 시간/노이즈 계수가 섞인 값을 그대로 쓰지 않습니다.
-        active 축의 ``target_clean_norm - generated_clean_norm`` 방향을 RMS stable scale로
-        나눈 뒤, teacher 방향과 정렬된 agent만 남기고, agent별 DMD RMS가 현재
-        Generator-teacher active RMS 거리보다 커지지 않게 제한합니다. control-space
+        이 함수는 teacher-estimator clean 추정 차이 ``R`` 을 기본 DMD 방향으로 둡니다.
+        세 안정화 필터는 config로 독립적으로 켜고 끌 수 있습니다. control-space
         non-holonomic DMD에서는 vehicle/cyclist의 lateral 축을 active mask로 제거합니다.
     """
     expected_shape = tuple(committed_path_norm.shape)
@@ -235,37 +241,42 @@ def build_clean_dmd_direction(
         device=committed.device,
         dtype=committed.dtype,
     )
-    stable_scale = torch.maximum(
-        torch.maximum(teacher_estimator_rms, generator_teacher_rms),
-        min_scale,
-    )
+    if use_stable_scale_filter:
+        stable_scale = torch.maximum(
+            torch.maximum(teacher_estimator_rms, generator_teacher_rms),
+            min_scale,
+        )
+        direction = teacher_estimator_delta / stable_scale
+    else:
+        direction = teacher_estimator_delta
 
-    normalized_direction = teacher_estimator_delta / stable_scale
+    if use_teacher_alignment_filter:
+        teacher_direction = target_clean - committed
+        if active is not None:
+            teacher_direction = teacher_direction * active
+        alignment = (teacher_direction * teacher_estimator_delta).sum(
+            dim=reduce_dims,
+            keepdim=True,
+        )
+        aligned_gate = (alignment > 0.0).to(dtype=direction.dtype)
+        direction = direction * aligned_gate
 
-    teacher_direction = target_clean - committed
+    if use_trust_region_filter:
+        direction_rms = (
+            direction.square().sum(dim=reduce_dims, keepdim=True) / scale_denom
+        ).sqrt()
+        trust_scale = torch.minimum(
+            torch.ones_like(direction_rms),
+            generator_teacher_rms / (direction_rms + rms_eps),
+        )
+        direction = direction * trust_scale
+
     if active is not None:
-        teacher_direction = teacher_direction * active
-    alignment = (teacher_direction * teacher_estimator_delta).sum(
-        dim=reduce_dims,
-        keepdim=True,
-    )
-    aligned_gate = (alignment > 0.0).to(dtype=normalized_direction.dtype)
-    normalized_direction = normalized_direction * aligned_gate
-
-    capped_direction_rms = (
-        normalized_direction.square().sum(dim=reduce_dims, keepdim=True) / scale_denom
-    ).sqrt()
-    trust_scale = torch.minimum(
-        torch.ones_like(capped_direction_rms),
-        generator_teacher_rms / (capped_direction_rms + rms_eps),
-    )
-    capped_direction = normalized_direction * trust_scale
-    if active is not None:
-        capped_direction = capped_direction * active
-    capped_direction = torch.nan_to_num(
-        capped_direction,
+        direction = direction * active
+    direction = torch.nan_to_num(
+        direction,
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
     )
-    return capped_direction.to(dtype=committed_path_norm.dtype)
+    return direction.to(dtype=committed_path_norm.dtype)

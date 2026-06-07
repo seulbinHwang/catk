@@ -92,6 +92,9 @@ def test_active_control_dmd_ignores_nonholonomic_lateral_axis_and_caps_step() ->
         generated_clean_norm=generated_clean,
         active_mask=active_mask,
         normalizer_eps=0.05,
+        use_stable_scale_filter=True,
+        use_teacher_alignment_filter=True,
+        use_trust_region_filter=True,
     )
 
     generator_teacher_rms = _active_rms(committed - target_clean, active_mask)
@@ -125,9 +128,55 @@ def test_active_control_dmd_drops_agent_when_direction_is_against_teacher() -> N
         generated_clean_norm=generated_clean,
         active_mask=active_mask,
         normalizer_eps=0.05,
+        use_stable_scale_filter=True,
+        use_teacher_alignment_filter=True,
+        use_trust_region_filter=False,
     )
 
     torch.testing.assert_close(direction, torch.zeros_like(direction))
+
+
+def test_active_control_dmd_filters_are_independently_configurable() -> None:
+    committed = torch.ones((1, 2, 3))
+    target_clean = torch.zeros_like(committed)
+    generated_clean = -torch.ones_like(committed)
+    active_mask = torch.ones((1, 1, 3))
+
+    raw_direction = build_clean_dmd_direction(
+        committed_path_norm=committed,
+        target_clean_norm=target_clean,
+        generated_clean_norm=generated_clean,
+        active_mask=active_mask,
+        normalizer_eps=0.05,
+        use_stable_scale_filter=False,
+        use_teacher_alignment_filter=False,
+        use_trust_region_filter=False,
+    )
+    torch.testing.assert_close(raw_direction, torch.ones_like(raw_direction))
+
+    normalized_direction = build_clean_dmd_direction(
+        committed_path_norm=committed,
+        target_clean_norm=target_clean,
+        generated_clean_norm=generated_clean,
+        active_mask=active_mask,
+        normalizer_eps=0.05,
+        use_stable_scale_filter=True,
+        use_teacher_alignment_filter=False,
+        use_trust_region_filter=False,
+    )
+    torch.testing.assert_close(normalized_direction, torch.ones_like(normalized_direction))
+
+    aligned_direction = build_clean_dmd_direction(
+        committed_path_norm=committed,
+        target_clean_norm=target_clean,
+        generated_clean_norm=generated_clean,
+        active_mask=active_mask,
+        normalizer_eps=0.05,
+        use_stable_scale_filter=True,
+        use_teacher_alignment_filter=True,
+        use_trust_region_filter=False,
+    )
+    torch.testing.assert_close(aligned_direction, torch.zeros_like(aligned_direction))
 
 
 def test_self_forced_dmd_injection_scale_ramps_for_two_epochs() -> None:

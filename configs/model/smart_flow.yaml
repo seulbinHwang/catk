@@ -75,6 +75,11 @@ model_config:
     # DMD guidance 방향은 closed-loop metric이 보는 pose-space에서 판단하고,
     # 최종 target은 다시 rolling control-space로 되돌립니다.
     project_dmd_to_pose_space: true
+    # Clean-DMD direction filters. These apply identically to pose-projected
+    # and direct control-space DMD paths.
+    dmd_use_stable_scale_filter: true
+    dmd_use_teacher_alignment_filter: false
+    dmd_use_trust_region_filter: false
     clean_dmd_normalizer_eps: 0.05
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
