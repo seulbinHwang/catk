@@ -268,10 +268,17 @@ def test_active_control_dmd_stable_scale_can_share_by_group() -> None:
 
 
 def test_self_forced_dmd_injection_scale_ramps_for_two_epochs() -> None:
-    assert compute_self_forced_dmd_injection_scale(current_epoch=0, dmd_start_epoch=0) == 0.25
-    assert compute_self_forced_dmd_injection_scale(current_epoch=1, dmd_start_epoch=0) == 0.625
-    assert compute_self_forced_dmd_injection_scale(current_epoch=2, dmd_start_epoch=0) == 1.0
-    assert compute_self_forced_dmd_injection_scale(current_epoch=5, dmd_start_epoch=5) == 0.25
+    assert compute_self_forced_dmd_injection_scale(current_epoch=0, dmd_start_epoch=0, use_ramp=True) == 0.25
+    assert compute_self_forced_dmd_injection_scale(current_epoch=1, dmd_start_epoch=0, use_ramp=True) == 0.625
+    assert compute_self_forced_dmd_injection_scale(current_epoch=2, dmd_start_epoch=0, use_ramp=True) == 1.0
+    assert compute_self_forced_dmd_injection_scale(current_epoch=5, dmd_start_epoch=5, use_ramp=True) == 0.25
+    assert compute_self_forced_dmd_injection_scale(current_epoch=6, dmd_start_epoch=5, use_ramp=True) == 0.625
+
+
+def test_self_forced_dmd_injection_scale_defaults_to_full_strength_without_ramp() -> None:
+    assert compute_self_forced_dmd_injection_scale(current_epoch=0, dmd_start_epoch=0) == 1.0
+    assert compute_self_forced_dmd_injection_scale(current_epoch=1, dmd_start_epoch=0) == 1.0
+    assert compute_self_forced_dmd_injection_scale(current_epoch=5, dmd_start_epoch=5) == 1.0
 
 
 def test_pose_projected_dmd_heading_vector_is_renormalized() -> None:

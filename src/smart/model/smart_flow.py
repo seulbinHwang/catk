@@ -287,6 +287,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
+        self.self_forced_dmd_use_injection_ramp = (
+            bool(getattr(self.self_forced_config, "dmd_use_injection_ramp", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_sid_alpha = (
             float(getattr(self.self_forced_config, "sid_alpha", 1.0))
             if self.self_forced_config is not None
@@ -3116,6 +3121,7 @@ class SMARTFlow(LightningModule):
         dmd_injection_scale = compute_self_forced_dmd_injection_scale(
             current_epoch=int(self.current_epoch),
             dmd_start_epoch=dmd_start_epoch,
+            use_ramp=self.self_forced_dmd_use_injection_ramp,
         )
         pose_projected_dmd = self._should_project_self_forced_dmd_to_pose_space(committed_path_norm)
         path_delta = self._compute_self_forced_direction(

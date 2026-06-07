@@ -83,6 +83,7 @@ model_config:
     dmd_stable_scale_scope: type
     dmd_use_teacher_alignment_filter: false
     dmd_use_trust_region_filter: false
+    dmd_use_injection_ramp: false
     clean_dmd_normalizer_eps: 0.05
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3

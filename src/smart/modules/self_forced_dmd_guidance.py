@@ -135,8 +135,11 @@ def compute_self_forced_dmd_injection_scale(
     *,
     current_epoch: int,
     dmd_start_epoch: int,
+    use_ramp: bool = False,
 ) -> float:
     """self-forced DMD 시작 후 2 epoch 동안 target 주입량을 완만히 키웁니다."""
+    if not bool(use_ramp):
+        return 1.0
     elapsed_epoch = max(0, int(current_epoch) - int(dmd_start_epoch))
     return 0.25 + 0.75 * min(1.0, float(elapsed_epoch) / 2.0)
 
