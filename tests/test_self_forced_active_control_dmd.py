@@ -179,6 +179,26 @@ def test_active_control_dmd_filters_are_independently_configurable() -> None:
     torch.testing.assert_close(aligned_direction, torch.zeros_like(aligned_direction))
 
 
+def test_active_control_dmd_stable_scale_ignores_teacher_estimator_rms() -> None:
+    committed = torch.zeros((1, 2, 3))
+    target_clean = torch.zeros_like(committed)
+    generated_clean = -torch.ones_like(committed)
+    active_mask = torch.ones((1, 1, 3))
+
+    direction = build_clean_dmd_direction(
+        committed_path_norm=committed,
+        target_clean_norm=target_clean,
+        generated_clean_norm=generated_clean,
+        active_mask=active_mask,
+        normalizer_eps=0.05,
+        use_stable_scale_filter=True,
+        use_teacher_alignment_filter=False,
+        use_trust_region_filter=False,
+    )
+
+    torch.testing.assert_close(direction, torch.full_like(direction, 20.0))
+
+
 def test_self_forced_dmd_injection_scale_ramps_for_two_epochs() -> None:
     assert compute_self_forced_dmd_injection_scale(current_epoch=0, dmd_start_epoch=0) == 0.25
     assert compute_self_forced_dmd_injection_scale(current_epoch=1, dmd_start_epoch=0) == 0.625

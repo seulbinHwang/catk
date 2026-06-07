@@ -164,7 +164,7 @@ def build_clean_dmd_direction(
             처럼 ``committed_path_norm`` 에 broadcast 가능해야 합니다.
         normalizer_eps: agent별 RMS stable scale의 최소값입니다.
         use_stable_scale_filter: True이면 teacher-estimator 차이를
-            ``max(rms(R), rms(G), eps)`` 로 나눕니다.
+            ``max(rms(G), eps)`` 로 나눕니다.
         use_teacher_alignment_filter: True이면 teacher 방향과 정렬된 agent만 남깁니다.
         use_trust_region_filter: True이면 DMD RMS가 Generator-teacher RMS보다
             커지지 않도록 agent별로 제한합니다.
@@ -230,9 +230,6 @@ def build_clean_dmd_direction(
 
     rms_eps = 1.0e-6
     scale_denom = active_count + rms_eps
-    teacher_estimator_rms = (
-        teacher_estimator_delta.square().sum(dim=reduce_dims, keepdim=True) / scale_denom
-    ).sqrt()
     generator_teacher_rms = (
         generator_teacher_delta.square().sum(dim=reduce_dims, keepdim=True) / scale_denom
     ).sqrt()
@@ -243,7 +240,7 @@ def build_clean_dmd_direction(
     )
     if use_stable_scale_filter:
         stable_scale = torch.maximum(
-            torch.maximum(teacher_estimator_rms, generator_teacher_rms),
+            generator_teacher_rms,
             min_scale,
         )
         direction = teacher_estimator_delta / stable_scale
