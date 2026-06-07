@@ -239,6 +239,12 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 0.05
         )
+        # normalize_direction=False 면 거리-나눗셈 제거(raw teacher-fake, 수렴형 DMD).
+        self.self_forced_normalize_direction = (
+            bool(getattr(self.self_forced_config, "normalize_direction", True))
+            if self.self_forced_config is not None
+            else True
+        )
         self.self_forced_direction_normalizer_eps = (
             float(getattr(self.self_forced_config, "clean_dmd_normalizer_eps", 1.0e-3))
             if self.self_forced_config is not None
@@ -2421,6 +2427,7 @@ class SMARTFlow(LightningModule):
                 normalizer_eps=self.self_forced_direction_normalizer_eps,
                 channel_mask=channel_mask,
                 per_channel_normalizer=True,
+                normalize_direction=self.self_forced_normalize_direction,
             )
             self._log_self_forced_direction_diagnostics(
                 committed=clean_for_guidance,

@@ -3244,4 +3244,346 @@ Modules in eval mode: 698
 Validation DataLoader 0:  21%|██▏       | 3/14 [01:05<03:59,  0.05it/s][A
 Validation DataLoader 0:  29%|██▊       | 4/14 [01:26<03:35,  0.05it/s][A
 Validation DataLoader 0:  36%|███▌      | 5/14 [01:52<03:23,  0.04it/s][A
-Validation DataLoader 0:  43%|████▎     | 6/14 [02:13<02:58,  0.04it/s][A
+Validation DataLoader 0:  43%|████▎     | 6/14 [02:13<02:58,  0.04it/s][A[rank: 0] Received SIGTERM: 15
+[rank: 1] Received SIGTERM: 15
+W0607 14:13:27.708000 139856824121152 torch/distributed/elastic/agent/server/api.py:688] Received 15 death signal, shutting down workers
+W0607 14:13:27.715000 139856824121152 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 1795470 closing signal SIGTERM
+[rank: 0] Received SIGTERM: 15
+W0607 14:13:27.719000 139856824121152 torch/distributed/elastic/multiprocessing/api.py:858] Sending process 1795471 closing signal SIGTERM
+[rank: 1] Received SIGTERM: 15
+[[36m2026-06-07 14:13:27,867[0m][[34m__main__[0m][[32mINFO[0m] - [rank: 0] Closing wandb![0m
+Error executing job with overrides: ['experiment=self_forced_npfm', 'action=finetune', 'task_name=sfupdate_cad5_gen1e-7_fake1e-6_dmd_b8_warmup0_0607_114912', 'ckpt_path=logs/pretrained/pretrained.ckpt', 'seed=817', 'paths.cache_root=/home2/pnc2/repos_python/datasets/catk_cache', 'trainer.devices=2', '~trainer.strategy', '+trainer.strategy._target_=lightning.pytorch.strategies.DDPStrategy', '+trainer.strategy.find_unused_parameters=true', '+trainer.strategy.gradient_as_bucket_view=true', '+trainer.strategy.timeout._target_=datetime.timedelta', '+trainer.strategy.timeout.seconds=14400', 'trainer.precision=bf16-mixed', 'trainer.max_epochs=16', '++trainer.val_check_interval=1000', 'trainer.check_val_every_n_epoch=1', 'trainer.limit_val_batches=1', 'data.train_batch_size=8', 'data.val_batch_size=16', 'data.num_workers=4', 'data.shuffle=false', 'model.model_config.lr=1e-7', 'model.model_config.scorer_scene_num=440', 'model.model_config.n_rollout_closed_val=32', 'model.model_config.self_forced.distribution_matching_objective=dmd', 'model.model_config.self_forced.cadence=5', 'model.model_config.self_forced.estimator_updates_per_step=1', 'model.model_config.self_forced.estimator_lr=1e-6', 'model.model_config.self_forced.use_ema=false', 'model.model_config.self_forced.estimator_warmup_epochs=0', 'logger.wandb.entity=se99an', 'logger.wandb.project=clsft-catk', '~callbacks.model_checkpoint', '~callbacks.epoch_last_checkpoint']
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 46, in _call_and_handle_interrupt
+[rank1]:     return trainer.strategy.launcher.launch(trainer_fn, *args, trainer=trainer, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/launchers/subprocess_script.py", line 105, in launch
+[rank1]:     return function(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 574, in _fit_impl
+[rank1]:     self._run(model, ckpt_path=ckpt_path)
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 981, in _run
+[rank1]:     results = self._run_stage()
+[rank1]:               ^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1025, in _run_stage
+[rank1]:     self.fit_loop.run()
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 205, in run
+[rank1]:     self.advance()
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 363, in advance
+[rank1]:     self.epoch_loop.run(self._data_fetcher)
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 141, in run
+[rank1]:     self.on_advance_end(data_fetcher)
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 295, in on_advance_end
+[rank1]:     self.val_loop.run()
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/utilities.py", line 178, in _decorator
+[rank1]:     return loop_run(self, *args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/evaluation_loop.py", line 135, in run
+[rank1]:     self._evaluation_step(batch, batch_idx, dataloader_idx, dataloader_iter)
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/evaluation_loop.py", line 396, in _evaluation_step
+[rank1]:     output = call._call_strategy_hook(trainer, hook_name, *step_args)
+[rank1]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 319, in _call_strategy_hook
+[rank1]:     output = fn(*args, **kwargs)
+[rank1]:              ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 410, in validation_step
+[rank1]:     return self._forward_redirection(self.model, self.lightning_module, "validation_step", *args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 640, in __call__
+[rank1]:     wrapper_output = wrapper_module(*args, **kwargs)
+[rank1]:                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1636, in forward
+[rank1]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank1]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1454, in _run_ddp_forward
+[rank1]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 633, in wrapped_forward
+[rank1]:     out = method(*_args, **_kwargs)
+[rank1]:           ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/model/smart_flow.py", line 3061, in validation_step
+[rank1]:     )
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/wosac_distribution_metrics.py", line 817, in update_wosac_distribution_metric_from_model
+[rank1]:     update_wosac_distribution_metric_from_batch(
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/wosac_distribution_metrics.py", line 738, in update_wosac_distribution_metric_from_batch
+[rank1]:     metric.update(
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torchmetrics/metric.py", line 493, in wrapped_func
+[rank1]:     raise err
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torchmetrics/metric.py", line 483, in wrapped_func
+[rank1]:     update(*args, **kwargs)
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/wosac_distribution_metrics.py", line 432, in update
+[rank1]:     pair_sq_by_type, pair_count = _compute_pair_square_summaries(
+[rank1]:                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/wosac_distribution_metrics.py", line 196, in _compute_pair_square_summaries
+[rank1]:     pair_sq_by_type[pair_index] = _sum_square_by_type(
+[rank1]:                                   ^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/wosac_distribution_metrics.py", line 122, in _sum_square_by_type
+[rank1]:     sums.append(weighted_square[type_mask].sum(dtype=torch.float64))
+[rank1]:                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/utils/data/_utils/signal_handling.py", line 67, in handler
+[rank1]:     _error_if_any_worker_fails()
+[rank1]: RuntimeError: DataLoader worker (pid 1802069) is killed by signal: Terminated. 
+
+[rank1]: During handling of the above exception, another exception occurred:
+
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank1]:   File "<frozen runpy>", line 88, in _run_code
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 388, in <module>
+[rank1]:     main()
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/main.py", line 94, in decorated_main
+[rank1]:     _run_hydra(
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+[rank1]:     _run_app(
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+[rank1]:     run_and_report(
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 223, in run_and_report
+[rank1]:     raise ex
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+[rank1]:     return func()
+[rank1]:            ^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+[rank1]:     lambda: hydra.run(
+[rank1]:             ^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/hydra.py", line 132, in run
+[rank1]:     _ = ret.return_value
+[rank1]:         ^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/core/utils.py", line 260, in return_value
+[rank1]:     raise self._return_value
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/core/utils.py", line 186, in run_job
+[rank1]:     ret.return_value = task_function(task_cfg)
+[rank1]:                        ^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 378, in main
+[rank1]:     run(cfg)  # train/val/test the model
+[rank1]:     ^^^^^^^^
+[rank1]:   File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 336, in run
+[rank1]:     trainer.fit(model=model, datamodule=datamodule)
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 538, in fit
+[rank1]:     call._call_and_handle_interrupt(
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 68, in _call_and_handle_interrupt
+[rank1]:     trainer._teardown()
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1004, in _teardown
+[rank1]:     self.strategy.teardown()
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/ddp.py", line 419, in teardown
+[rank1]:     super().teardown()
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/parallel.py", line 133, in teardown
+[rank1]:     super().teardown()
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 531, in teardown
+[rank1]:     _optimizers_to_device(self.optimizers, torch.device("cpu"))
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/fabric/utilities/optimizer.py", line 28, in _optimizers_to_device
+[rank1]:     _optimizer_to_device(opt, device)
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/fabric/utilities/optimizer.py", line 42, in _optimizer_to_device
+[rank1]:     v[key] = move_data_to_device(val, device)
+[rank1]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/fabric/utilities/apply_func.py", line 110, in move_data_to_device
+[rank1]:     return apply_to_collection(batch, dtype=_TransferableDataType, function=batch_to)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning_utilities/core/apply_func.py", line 70, in apply_to_collection
+[rank1]:     return function(data, *args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/fabric/utilities/apply_func.py", line 104, in batch_to
+[rank1]:     data_output = data.to(device, **kwargs)
+[rank1]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/utils/data/_utils/signal_handling.py", line 67, in handler
+[rank1]:     _error_if_any_worker_fails()
+[rank1]: RuntimeError: DataLoader worker (pid 1895711) is killed by signal: Terminated. 
+wandb: updating run metadata
+wandb: uploading output.log; uploading wandb-summary.json; uploading config.yaml
+wandb: uploading summary, console lines 2830-2830
+wandb: 
+wandb: Run history:
+wandb:  System/GPU Memory Allocated (%) ▃▇▂▅▃▃▅▅▂▅▂▁▂▇▄▂▂▃▄▇▅▄▄▁▃▄▂▂▃▂▂▃▄▃▃▃▂█▃▂
+wandb:                            epoch ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                         lr-AdamW ▁
+wandb:                       lr-AdamW-1 ▁
+wandb:          time/validation_minutes █▁▁
+wandb:         train/epoch_progress_pct ▁▁▁▁▂▂▂▃▃▃▃▃▃▃▃▄▄▄▄▄▅▅▅▅▅▅▆▆▆▆▇▇▇▇▇▇▇███
+wandb:                  train/loss_step ▁▁▁▁▁▁▁▁▁▁█▂▂▂▂▂▃▂▂▁▂▂▁▂▂▃▁▂▂▂▁▃▂▃▂▂▂▂▂▂
+wandb:       train/sf_is_generator_step ▁▁▁▁▁██▁▁▁▁██▁█▁▁▁██▁▁▁█▁▁▁██▁▁▁▁▁▁▁█▁▁▁
+wandb:    train_setup/global_batch_size ▁
+wandb: train_setup/n_rollout_closed_val ▁
+wandb:                              +36 ...
+wandb: 
+wandb: Run summary:
+wandb:  System/GPU Memory Allocated (%) 0.32501
+wandb:                            epoch 0
+wandb:                         lr-AdamW 0.0
+wandb:                       lr-AdamW-1 0.0
+wandb:          time/validation_minutes 5.30105
+wandb:         train/epoch_progress_pct 26.28294
+wandb:                  train/loss_step 0.00237
+wandb:       train/sf_is_generator_step 1
+wandb:    train_setup/global_batch_size 16
+wandb: train_setup/n_rollout_closed_val 32
+wandb:                              +36 ...
+wandb: 
+wandb: 🚀 View run sfupdate_cad5_gen1e-7_fake1e-6_dmd_b8_warmup0_0607_114912 at: https://wandb.ai/se99an/clsft-catk/runs/pb8ftqsm
+wandb: ⭐️ View project at: https://wandb.ai/se99an/clsft-catk
+wandb: Synced 5 W&B file(s), 0 media file(s), 6 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./logs/sfupdate_cad5_gen1e-7_fake1e-6_dmd_b8_warmup0_0607_114912/runs/2026-06-07_11-49-35/wandb/run-20260607_114944-pb8ftqsm/logs
+Error executing job with overrides: ['experiment=self_forced_npfm', 'action=finetune', 'task_name=sfupdate_cad5_gen1e-7_fake1e-6_dmd_b8_warmup0_0607_114912', 'ckpt_path=logs/pretrained/pretrained.ckpt', 'seed=817', 'paths.cache_root=/home2/pnc2/repos_python/datasets/catk_cache', 'trainer.devices=2', '~trainer.strategy', '+trainer.strategy._target_=lightning.pytorch.strategies.DDPStrategy', '+trainer.strategy.find_unused_parameters=true', '+trainer.strategy.gradient_as_bucket_view=true', '+trainer.strategy.timeout._target_=datetime.timedelta', '+trainer.strategy.timeout.seconds=14400', 'trainer.precision=bf16-mixed', 'trainer.max_epochs=16', '++trainer.val_check_interval=1000', 'trainer.check_val_every_n_epoch=1', 'trainer.limit_val_batches=1', 'data.train_batch_size=8', 'data.val_batch_size=16', 'data.num_workers=4', 'data.shuffle=false', 'model.model_config.lr=1e-7', 'model.model_config.scorer_scene_num=440', 'model.model_config.n_rollout_closed_val=32', 'model.model_config.self_forced.distribution_matching_objective=dmd', 'model.model_config.self_forced.cadence=5', 'model.model_config.self_forced.estimator_updates_per_step=1', 'model.model_config.self_forced.estimator_lr=1e-6', 'model.model_config.self_forced.use_ema=false', 'model.model_config.self_forced.estimator_warmup_epochs=0', 'logger.wandb.entity=se99an', 'logger.wandb.project=clsft-catk', '~callbacks.model_checkpoint', '~callbacks.epoch_last_checkpoint']
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 46, in _call_and_handle_interrupt
+[rank0]:     return trainer.strategy.launcher.launch(trainer_fn, *args, trainer=trainer, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/launchers/subprocess_script.py", line 105, in launch
+[rank0]:     return function(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 574, in _fit_impl
+[rank0]:     self._run(model, ckpt_path=ckpt_path)
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 981, in _run
+[rank0]:     results = self._run_stage()
+[rank0]:               ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1025, in _run_stage
+[rank0]:     self.fit_loop.run()
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 205, in run
+[rank0]:     self.advance()
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/fit_loop.py", line 363, in advance
+[rank0]:     self.epoch_loop.run(self._data_fetcher)
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 141, in run
+[rank0]:     self.on_advance_end(data_fetcher)
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/training_epoch_loop.py", line 295, in on_advance_end
+[rank0]:     self.val_loop.run()
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/utilities.py", line 178, in _decorator
+[rank0]:     return loop_run(self, *args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/evaluation_loop.py", line 135, in run
+[rank0]:     self._evaluation_step(batch, batch_idx, dataloader_idx, dataloader_iter)
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/loops/evaluation_loop.py", line 396, in _evaluation_step
+[rank0]:     output = call._call_strategy_hook(trainer, hook_name, *step_args)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 319, in _call_strategy_hook
+[rank0]:     output = fn(*args, **kwargs)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 410, in validation_step
+[rank0]:     return self._forward_redirection(self.model, self.lightning_module, "validation_step", *args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 640, in __call__
+[rank0]:     wrapper_output = wrapper_module(*args, **kwargs)
+[rank0]:                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1636, in forward
+[rank0]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank0]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1454, in _run_ddp_forward
+[rank0]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1553, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1562, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 633, in wrapped_forward
+[rank0]:     out = method(*_args, **_kwargs)
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/model/smart_flow.py", line 3079, in validation_step
+[rank0]:     tokenized_map, tokenized_agent = self.token_processor(data)
+[rank0]:                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/model/smart_flow.py", line 1580, in _update_closed_loop_metric_states
+[rank0]:     self.sim_agents_metrics.update_from_prediction_tensors(
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/sim_agents_metrics.py", line 682, in update_from_prediction_tensors
+[rank0]:     scenario_metrics = _compute_scenario_metrics_from_arrays(
+[rank0]:                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/sim_agents_metrics.py", line 424, in _compute_scenario_metrics_from_arrays
+[rank0]:     return _compute_scenario_metrics_from_fast_bundle(
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/sim_agents_metrics.py", line 404, in _compute_scenario_metrics_from_fast_bundle
+[rank0]:     fast_result = fast_sim_agents_metrics.compute_scenario_metrics_for_bundle(
+[rank0]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+[rank0]:     return func(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/wosac_fast_eval_tool/fast_sim_agents_metrics/metrics.py", line 85, in compute_scenario_metrics_for_bundle
+[rank0]:     linear_accel_log_likelihood = estimators.log_likelihood_estimate_timeseries(
+[rank0]:                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/wosac_fast_eval_tool/fast_sim_agents_metrics/estimators.py", line 48, in log_likelihood_estimate_timeseries
+[rank0]:     log_likelihood = histogram_estimate(
+[rank0]:                      ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/smart/metrics/wosac_fast_eval_tool/fast_sim_agents_metrics/estimators.py", line 146, in histogram_estimate
+[rank0]:     log_counts[i] = torch.histc(log_values_flat[i], bins=config.num_bins, min=config.min_val, max=config.max_val)
+[rank0]:                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/utils/data/_utils/signal_handling.py", line 67, in handler
+[rank0]:     _error_if_any_worker_fails()
+[rank0]: RuntimeError: DataLoader worker (pid 1802070) is killed by signal: Terminated. 
+
+[rank0]: During handling of the above exception, another exception occurred:
+
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank0]:   File "<frozen runpy>", line 88, in _run_code
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 388, in <module>
+[rank0]:     main()
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/main.py", line 94, in decorated_main
+[rank0]:     _run_hydra(
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 394, in _run_hydra
+[rank0]:     _run_app(
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 457, in _run_app
+[rank0]:     run_and_report(
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 223, in run_and_report
+[rank0]:     raise ex
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 220, in run_and_report
+[rank0]:     return func()
+[rank0]:            ^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/utils.py", line 458, in <lambda>
+[rank0]:     lambda: hydra.run(
+[rank0]:             ^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/_internal/hydra.py", line 132, in run
+[rank0]:     _ = ret.return_value
+[rank0]:         ^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/core/utils.py", line 260, in return_value
+[rank0]:     raise self._return_value
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/hydra/core/utils.py", line 186, in run_job
+[rank0]:     ret.return_value = task_function(task_cfg)
+[rank0]:                        ^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 378, in main
+[rank0]:     run(cfg)  # train/val/test the model
+[rank0]:     ^^^^^^^^
+[rank0]:   File "/home2/pnc2/repos_python/kinematic_flow/src/run.py", line 336, in run
+[rank0]:     trainer.fit(model=model, datamodule=datamodule)
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 538, in fit
+[rank0]:     call._call_and_handle_interrupt(
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/call.py", line 68, in _call_and_handle_interrupt
+[rank0]:     trainer._teardown()
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/trainer/trainer.py", line 1004, in _teardown
+[rank0]:     self.strategy.teardown()
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/ddp.py", line 419, in teardown
+[rank0]:     super().teardown()
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/parallel.py", line 133, in teardown
+[rank0]:     super().teardown()
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/pytorch/strategies/strategy.py", line 531, in teardown
+[rank0]:     _optimizers_to_device(self.optimizers, torch.device("cpu"))
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/fabric/utilities/optimizer.py", line 28, in _optimizers_to_device
+[rank0]:     _optimizer_to_device(opt, device)
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/fabric/utilities/optimizer.py", line 42, in _optimizer_to_device
+[rank0]:     v[key] = move_data_to_device(val, device)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/fabric/utilities/apply_func.py", line 110, in move_data_to_device
+[rank0]:     return apply_to_collection(batch, dtype=_TransferableDataType, function=batch_to)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning_utilities/core/apply_func.py", line 70, in apply_to_collection
+[rank0]:     return function(data, *args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/lightning/fabric/utilities/apply_func.py", line 104, in batch_to
+[rank0]:     data_output = data.to(device, **kwargs)
+[rank0]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home2/pnc2/miniforge3/envs/catk/lib/python3.11/site-packages/torch/utils/data/_utils/signal_handling.py", line 67, in handler
+[rank0]:     _error_if_any_worker_fails()
+[rank0]: RuntimeError: DataLoader worker (pid 1895699) is killed by signal: Terminated. 

@@ -49,6 +49,8 @@ GEN_LR="${GEN_LR:-1e-7}"
 FAKE_LR="${FAKE_LR:-1e-7}"
 USE_EMA="${USE_EMA:-false}"
 DM_OBJECTIVE="${DM_OBJECTIVE:-dmd}"
+PATH_STEP_SIZE="${PATH_STEP_SIZE:-0.05}"   # DMD direction step (normalize off 면 raw gap 계수)
+NORMALIZE_DIRECTION="${NORMALIZE_DIRECTION:-true}"  # false=거리-나눗셈 제거(raw, 수렴형)
 ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-1}"
 
 # data / trainer
@@ -61,6 +63,7 @@ MAX_EPOCHS="${MAX_EPOCHS:-16}"
 PRECISION="${PRECISION:-bf16-mixed}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-32}"
+SIM_AGENTS_METRIC_WORKERS="${SIM_AGENTS_METRIC_WORKERS:-8}"   # 0=직렬(느림). 병렬로 val scorer 단축.
 DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 
 # wandb
@@ -104,6 +107,9 @@ set -- \
   model.model_config.scorer_scene_num="${SCORER_SCENE_NUM}" \
   model.model_config.n_rollout_closed_val="${N_ROLLOUT_CLOSED_VAL}" \
   model.model_config.self_forced.distribution_matching_objective="${DM_OBJECTIVE}" \
+  model.model_config.self_forced.path_step_size="${PATH_STEP_SIZE}" \
+  model.model_config.self_forced.normalize_direction="${NORMALIZE_DIRECTION}" \
+  model.model_config.sim_agents_metric_workers="${SIM_AGENTS_METRIC_WORKERS}" \
   model.model_config.self_forced.cadence="${CADENCE}" \
   model.model_config.self_forced.estimator_updates_per_step="${ESTIMATOR_UPDATES_PER_STEP}" \
   model.model_config.self_forced.estimator_lr="${FAKE_LR}" \

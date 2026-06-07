@@ -68,6 +68,9 @@ model_config:
     start_epoch: 0
     weight: 1.0
     path_step_size: 0.05
+    # normalize_direction=false 면 DMD direction 의 거리-나눗셈 제거(raw teacher-fake,
+    # 수렴형). path_step_size 가 고정 계수 역할(raw gap 작아 더 큰 값 필요).
+    normalize_direction: true
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
     distribution_matching_objective: dmd
