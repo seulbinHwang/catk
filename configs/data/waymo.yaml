@@ -12,6 +12,8 @@ val_tfrecords_splitted: ${paths.cache_root}/validation_tfrecords_splitted
 test_raw_dir: ${paths.cache_root}/testing
 train_max_num: 32
 train_use_eval_agent_selection: false
+train_agent_token_sidecar_dir: null
+train_agent_token_sidecar_required: false
 road_num_rollouts_per_scenario: 1
 train_memory_balanced_batching: true
 train_memory_balance_metadata_path: null

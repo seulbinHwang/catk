@@ -34,12 +34,18 @@ export LEARNING_RATE="${LEARNING_RATE:-auto}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-12}"
 export TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-12}"
 export A100_MAX_TRAIN_BATCH_SIZE="${A100_MAX_TRAIN_BATCH_SIZE:-64}"
+export TRAJTOK_AGENT_SIDECAR_DIR="${TRAJTOK_AGENT_SIDECAR_DIR:-${CACHE_ROOT}/trajtok_agent_token_sidecar/training}"
+export TRAJTOK_AGENT_SIDECAR_REQUIRED="${TRAJTOK_AGENT_SIDECAR_REQUIRED:-true}"
 
 TRAJTOK_OVERRIDES=(
   "trainer.precision=bf16-mixed"
   "trainer.strategy.find_unused_parameters=false"
   "data.train_use_eval_agent_selection=false"
   "data.train_memory_balanced_batching=true"
+  "data.train_agent_token_sidecar_dir=${TRAJTOK_AGENT_SIDECAR_DIR}"
+  "data.train_agent_token_sidecar_required=${TRAJTOK_AGENT_SIDECAR_REQUIRED}"
+  "model.model_config.token_processor.agent_sidecar_dir=${TRAJTOK_AGENT_SIDECAR_DIR}"
+  "model.model_config.token_processor.agent_sidecar_required=${TRAJTOK_AGENT_SIDECAR_REQUIRED}"
   "logger.wandb.group=smart_ntp_pretrain_trajtok_testas_a100x7"
   "logger.wandb.job_type=pretrain_trajtok_testas_a100x7"
 )

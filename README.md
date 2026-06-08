@@ -330,8 +330,52 @@ bash scripts/start_smart_ntp_testas_a100x7_trajtok_pretrain_oom_retry.sh
 | precision / grad accumulation | `bf16-mixed`, `accumulate_grad_batches=1` |
 | agent selection | `data.train_use_eval_agent_selection=false` |
 | train sampler | `data.train_memory_balanced_batching=true` |
+| TrajTok agent sidecar | `${CACHE_ROOT}/trajtok_agent_token_sidecar/training`, `required=true` |
 | validation | open-loop + closed-loop, `scorer_scene_num=1680`, `validation_rollout_sampling=(topk_prob, num_k=12, temp=1.0)`, every 16 epochs |
 | distributed strategy | DDP, `find_unused_parameters=false` |
+
+#### TrajTok deterministic agent target sidecar
+
+`trajtok` train target은 cache와 `trajtok_vocab.pkl`이 같으면 deterministic이다. 학습 중 매
+batch마다 반복하던 full 0.5초 contour token matching을 줄이기 위해, 기존 `.pkl` cache는
+그대로 두고 agent target만 sidecar로 미리 저장한다. Sidecar는 training에만 사용하며,
+validation/test/submission의 rollout 동작은 바꾸지 않는다.
+
+생성 명령은 cache가 있는 학습 pod 안에서 실행한다.
+
+```bash
+cd /path/to/catk
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 torchrun --standalone --nproc_per_node=7 \
+  scripts/build_trajtok_agent_token_sidecar.py \
+  --cache-root /workspace/womd_v1_3/SMART_cache \
+  --split training \
+  --batch-size 128 \
+  --num-workers 2
+```
+
+생성 결과는 기본적으로 아래에 저장된다.
+
+```text
+/workspace/womd_v1_3/SMART_cache/trajtok_agent_token_sidecar/training
+```
+
+`metadata.json`에는 sidecar version, `trajtok_vocab.pkl` SHA256, target builder 설정,
+저장된 tensor field 목록이 들어간다. 학습 시작 시 model tokenizer가 현재 vocab hash와
+metadata hash를 비교하고, dataloader가 scenario별 sidecar를 agent tensor에 붙인다.
+testas wrapper는 기본값으로 `required=true`를 사용하므로 sidecar가 없거나 vocab hash가
+다르면 조용히 online matching으로 돌아가지 않고 바로 실패한다.
+
+2026-06-08 testas A100x7 실제 SMART cache 검증값:
+
+| 검증 | 결과 |
+|---|---|
+| 생성 규모 | training `.pkl` `486995`개와 sidecar `.pt` `486995`개 일치 |
+| 생성 시간 | 7 GPU torchrun, `batch_size=128`, `num_workers=2/rank`에서 약 `360s` |
+| sidecar 용량 | `32G` |
+| 동일성 | online target vs sidecar target을 `atol=0`, `rtol=0`으로 비교 통과 |
+| token target 시간 | agent target path 평균 `127.05ms -> 1.31ms` per batch |
+| DDP smoke | testas 7-rank, sidecar required, 1 train batch 정상 종료 |
+| train-only probe | testas 7-rank, `bs=18`, 120 train batches 정상 종료, 약 `0.41 it/s` |
 
 2026-06-05에 `testas` A100 7장에서 실제 SMART cache로 train batch size를 다시 탐색했다.
 `bs=34/30/26/24/22/21`은 5-200 train-batch probe 중 CUDA OOM이 발생했고,
@@ -403,6 +447,7 @@ wrapper는 W&B에서 같은 display name의 run들을 찾고, `epoch-last-*` mod
 | testas sqrt-scaled base LR | `0.0006274950` |
 | source checkpoint current LR | `0.0001495940` |
 | patched resume current LR | `0.0001615800` |
+| TrajTok agent sidecar | `${CACHE_ROOT}/trajtok_agent_token_sidecar/training`, `required=true` |
 
 즉 epoch 44에서 이미 감소한 LR schedule 위치는 유지하고, batch size 변경분만 반영한다.
 이 patch는 `scripts/patch_checkpoint_lr.py`가 optimizer param group과 scheduler

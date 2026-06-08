@@ -11,9 +11,12 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+import hashlib
+import json
 import os
 import pickle
-from typing import Dict, Tuple
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -31,6 +34,19 @@ from src.smart.utils import (
 
 DEFAULT_AGENT_TOKEN_MATCH_CHUNK_SIZE = 384
 DEFAULT_AGENT_TOKEN_BLOCK_SIZE = 1024
+AGENT_TOKEN_SIDECAR_VERSION = "trajtok_agent_token_sidecar_v1"
+AGENT_TOKEN_SIDECAR_FIELDS = (
+    "gt_pos_raw",
+    "gt_head_raw",
+    "gt_valid_raw",
+    "gt_pos_segment_raw",
+    "gt_head_segment_raw",
+    "gt_valid_segment_raw",
+    "valid_mask",
+    "token_idx",
+    "tokenized_pos",
+    "tokenized_heading",
+)
 
 
 def _clean_heading_dense_impl(valid: Tensor, heading: Tensor) -> Tensor:
@@ -53,12 +69,21 @@ class TokenProcessor(torch.nn.Module):
         self,
         map_token_file: str,
         agent_token_file: str,
+        agent_sidecar_dir: Optional[str] = None,
+        agent_sidecar_required: bool = False,
+        agent_sidecar_version: str = AGENT_TOKEN_SIDECAR_VERSION,
     ) -> None:
         super(TokenProcessor, self).__init__()
         self.shift = 5
 
         module_dir = os.path.dirname(__file__)
-        self.init_agent_token(os.path.join(module_dir, agent_token_file))
+        agent_token_path = os.path.join(module_dir, agent_token_file)
+        self.agent_token_sha256 = self._sha256_file(agent_token_path)
+        self.agent_sidecar_dir = agent_sidecar_dir
+        self.agent_sidecar_required = bool(agent_sidecar_required)
+        self.agent_sidecar_version = agent_sidecar_version
+        self.agent_sidecar_enabled = self._validate_agent_sidecar_metadata()
+        self.init_agent_token(agent_token_path)
         self.init_map_token(os.path.join(module_dir, map_token_file))
         self.agent_token_match_chunk_size = DEFAULT_AGENT_TOKEN_MATCH_CHUNK_SIZE
         self.n_token_agent = {
@@ -172,6 +197,36 @@ class TokenProcessor(torch.nn.Module):
             agent_type_masks,
         ) = self._get_agent_shape_and_token_traj(data["agent"]["type"])
 
+        # ! prepare output dict
+        tokenized_agent = {
+            "num_graphs": data.num_graphs,
+            "type": data["agent"]["type"],
+            "type_mask": agent_type_masks,
+            "shape": data["agent"]["shape"],
+            "ego_mask": data["agent"]["role"][:, 0],  # [n_agent]
+            "role_mask": data["agent"]["role"].any(-1),  # [n_agent]
+            "token_agent_shape": agent_shape,  # [n_agent, 2]
+            "batch": data["agent"]["batch"],
+            "token_traj_all": token_traj_all,  # type -> [n_agent_type, n_token_type, 6, 4, 2]
+            "token_heading": self.token_heading.to(agent_shape.device),
+            "token_traj": token_traj,  # type -> [n_agent_type, n_token_type, 4, 2]
+            "token_traj_future": token_traj_future,  # type -> [n_agent_type, n_token_type, 5, 4, 2]
+            "token_contour_trajectory": token_contour_trajectory,  # type -> [n_token_type, 5, 4, 2]
+        }
+        # [n_token, 8]
+        for k in ["veh", "ped", "cyc"]:
+            tokenized_agent[f"trajectory_token_{k}"] = getattr(
+                self, f"agent_token_all_{k}"
+            )[:, -1].flatten(1, 2)
+
+        # ! match token for each agent
+        if not self.training:
+            # [n_agent]
+            tokenized_agent["gt_z_raw"] = data["agent"]["position"][:, 10, 2]
+
+        if self._maybe_load_agent_sidecar(data, tokenized_agent):
+            return tokenized_agent
+
         # ! get raw trajectory data
         valid = data["agent"]["valid_mask"].clone()  # [n_agent, n_step]
         heading = wrap_angle(data["agent"]["heading"].clone())  # [n_agent, n_step]
@@ -185,46 +240,24 @@ class TokenProcessor(torch.nn.Module):
             valid, pos, heading, vel
         )
 
-        # ! prepare output dict
-        tokenized_agent = {
-            "num_graphs": data.num_graphs,
-            "type": data["agent"]["type"],
-            "type_mask": agent_type_masks,
-            "shape": data["agent"]["shape"],
-            "ego_mask": data["agent"]["role"][:, 0],  # [n_agent]
-            "role_mask": data["agent"]["role"].any(-1),  # [n_agent]
-            "token_agent_shape": agent_shape,  # [n_agent, 2]
-            "batch": data["agent"]["batch"],
-            "token_traj_all": token_traj_all,  # type -> [n_agent_type, n_token_type, 6, 4, 2]
-            "token_heading": self.token_heading.to(pos.device),
-            "token_traj": token_traj,  # type -> [n_agent_type, n_token_type, 4, 2]
-            "token_traj_future": token_traj_future,  # type -> [n_agent_type, n_token_type, 5, 4, 2]
-            "token_contour_trajectory": token_contour_trajectory,  # type -> [n_token_type, 5, 4, 2]
-            # for step {5, 10, ..., 90}
-            "gt_pos_raw": pos[:, self.shift :: self.shift],  # [n_agent, n_step=18, 2]
-            "gt_head_raw": heading[:, self.shift :: self.shift],  # [n_agent, n_step=18]
-            "gt_valid_raw": valid[:, self.shift :: self.shift],  # [n_agent, n_step=18]
-            # raw 10 Hz segments for actions [(0->5), (5->10), ..., (85->90)]
-            "gt_pos_segment_raw": pos[:, 1:].reshape(
-                pos.shape[0], -1, self.shift, pos.shape[-1]
-            ),  # [n_agent, 18, 5, 2]
-            "gt_head_segment_raw": heading[:, 1:].reshape(
-                heading.shape[0], -1, self.shift
-            ),  # [n_agent, 18, 5]
-            "gt_valid_segment_raw": valid[:, 1:].reshape(
-                valid.shape[0], -1, self.shift
-            ),  # [n_agent, 18, 5]
-        }
-        # [n_token, 8]
-        for k in ["veh", "ped", "cyc"]:
-            tokenized_agent[f"trajectory_token_{k}"] = getattr(
-                self, f"agent_token_all_{k}"
-            )[:, -1].flatten(1, 2)
-
-        # ! match token for each agent
-        if not self.training:
-            # [n_agent]
-            tokenized_agent["gt_z_raw"] = data["agent"]["position"][:, 10, 2]
+        tokenized_agent.update(
+            {
+                # for step {5, 10, ..., 90}
+                "gt_pos_raw": pos[:, self.shift :: self.shift],
+                "gt_head_raw": heading[:, self.shift :: self.shift],
+                "gt_valid_raw": valid[:, self.shift :: self.shift],
+                # raw 10 Hz segments for actions [(0->5), (5->10), ..., (85->90)]
+                "gt_pos_segment_raw": pos[:, 1:].reshape(
+                    pos.shape[0], -1, self.shift, pos.shape[-1]
+                ),
+                "gt_head_segment_raw": heading[:, 1:].reshape(
+                    heading.shape[0], -1, self.shift
+                ),
+                "gt_valid_segment_raw": valid[:, 1:].reshape(
+                    valid.shape[0], -1, self.shift
+                ),
+            }
+        )
 
         token_dict_by_type = {}
         for agent_type, type_mask in tokenized_agent["type_mask"].items():
@@ -241,13 +274,90 @@ class TokenProcessor(torch.nn.Module):
                 {agent_type: data[key] for agent_type, data in token_dict_by_type.items()},
                 tokenized_agent["type_mask"],
             )
+        self._set_agent_target_aliases(tokenized_agent)
+        return tokenized_agent
+
+    def _set_agent_target_aliases(self, tokenized_agent: Dict[str, Tensor]) -> None:
         tokenized_agent["gt_idx"] = tokenized_agent["token_idx"]
         tokenized_agent["gt_pos"] = tokenized_agent["tokenized_pos"]
         tokenized_agent["gt_heading"] = tokenized_agent["tokenized_heading"]
         tokenized_agent["sampled_idx"] = tokenized_agent["token_idx"]
         tokenized_agent["sampled_pos"] = tokenized_agent["tokenized_pos"]
         tokenized_agent["sampled_heading"] = tokenized_agent["tokenized_heading"]
-        return tokenized_agent
+
+    def _maybe_load_agent_sidecar(
+        self,
+        data: HeteroData,
+        tokenized_agent: Dict[str, Tensor],
+    ) -> bool:
+        if not (self.training and self.agent_sidecar_enabled):
+            return False
+
+        agent_store = data["agent"]
+        missing = [
+            field
+            for field in AGENT_TOKEN_SIDECAR_FIELDS
+            if f"token_sidecar_{field}" not in agent_store
+        ]
+        if missing:
+            if self.agent_sidecar_required:
+                raise RuntimeError(
+                    "Agent token sidecar is enabled but the batch is missing "
+                    f"sidecar fields: {missing}."
+                )
+            return False
+
+        n_agent = data["agent"]["type"].shape[0]
+        for field in AGENT_TOKEN_SIDECAR_FIELDS:
+            value = agent_store[f"token_sidecar_{field}"]
+            if value.shape[0] != n_agent:
+                raise RuntimeError(
+                    f"Agent token sidecar field {field!r} has first dimension "
+                    f"{value.shape[0]}, expected {n_agent}."
+                )
+            tokenized_agent[field] = value
+        self._set_agent_target_aliases(tokenized_agent)
+        return True
+
+    def _validate_agent_sidecar_metadata(self) -> bool:
+        if not self.agent_sidecar_dir:
+            return False
+        metadata_path = Path(self.agent_sidecar_dir) / "metadata.json"
+        if not metadata_path.exists():
+            if self.agent_sidecar_required:
+                raise FileNotFoundError(
+                    f"Agent token sidecar metadata not found: {metadata_path}"
+                )
+            return False
+        with metadata_path.open("r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        problems = []
+        if metadata.get("version") != self.agent_sidecar_version:
+            problems.append(
+                f"version={metadata.get('version')!r}, expected {self.agent_sidecar_version!r}"
+            )
+        if metadata.get("agent_token_sha256") != self.agent_token_sha256:
+            problems.append(
+                "agent_token_sha256 mismatch "
+                f"({metadata.get('agent_token_sha256')!r} != {self.agent_token_sha256!r})"
+            )
+        if problems:
+            message = (
+                f"Agent token sidecar metadata mismatch in {metadata_path}: "
+                + "; ".join(problems)
+            )
+            if self.agent_sidecar_required:
+                raise RuntimeError(message)
+            return False
+        return True
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
 
     def _match_agent_token(
         self,

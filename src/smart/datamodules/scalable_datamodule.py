@@ -27,11 +27,18 @@ from .target_builder import WaymoTargetBuilderTrain, WaymoTargetBuilderVal
 
 
 def build_train_agent_target_builder(
-    train_max_num: int, train_use_eval_agent_selection: bool
+    train_max_num: int,
+    train_use_eval_agent_selection: bool,
+    train_agent_token_sidecar_dir: Optional[str],
+    train_agent_token_sidecar_required: bool,
 ) -> BaseTransform:
     if train_use_eval_agent_selection:
         return WaymoTargetBuilderVal()
-    return WaymoTargetBuilderTrain(train_max_num)
+    return WaymoTargetBuilderTrain(
+        train_max_num,
+        agent_token_sidecar_dir=train_agent_token_sidecar_dir,
+        agent_token_sidecar_required=train_agent_token_sidecar_required,
+    )
 
 
 class MultiDataModule(LightningDataModule):
@@ -50,6 +57,8 @@ class MultiDataModule(LightningDataModule):
         persistent_workers: bool,
         train_max_num: int,
         train_use_eval_agent_selection: bool = False,
+        train_agent_token_sidecar_dir: Optional[str] = None,
+        train_agent_token_sidecar_required: bool = False,
         road_num_rollouts_per_scenario: int = 1,
         train_memory_balanced_batching: bool = True,
         train_memory_balance_metadata_path: Optional[str] = None,
@@ -73,6 +82,8 @@ class MultiDataModule(LightningDataModule):
         self.test_raw_dir = test_raw_dir
         self.val_tfrecords_splitted = val_tfrecords_splitted
         self.train_use_eval_agent_selection = train_use_eval_agent_selection
+        self.train_agent_token_sidecar_dir = train_agent_token_sidecar_dir
+        self.train_agent_token_sidecar_required = bool(train_agent_token_sidecar_required)
         self.road_num_rollouts_per_scenario = road_num_rollouts_per_scenario
         self.train_memory_balanced_batching = train_memory_balanced_batching
         self.train_memory_balance_metadata_path = train_memory_balance_metadata_path
@@ -91,7 +102,10 @@ class MultiDataModule(LightningDataModule):
         self._train_batch_sampler: Optional[MemoryBalancedDistributedBatchSampler] = None
 
         self.train_transform = build_train_agent_target_builder(
-            train_max_num, train_use_eval_agent_selection
+            train_max_num,
+            train_use_eval_agent_selection,
+            train_agent_token_sidecar_dir,
+            self.train_agent_token_sidecar_required,
         )
         self.val_transform = WaymoTargetBuilderVal()
         self.test_transform = WaymoTargetBuilderVal()
