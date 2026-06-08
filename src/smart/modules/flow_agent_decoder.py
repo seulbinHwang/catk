@@ -100,7 +100,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self.use_kinematic_control_flow = bool(use_kinematic_control_flow)
         if bool(use_holonomic_model_only):
             raise ValueError(
-                "semi_mdg supports only all-agent non-holonomic control dynamics. "
+                "semi_mdg supports only MDG-style acceleration/yaw-rate dynamics. "
                 "Remove use_holonomic_model_only or set it to false."
             )
         self.use_holonomic_model_only = False
@@ -339,6 +339,28 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             torch.cat([exec_valid_pair[:, :1].expand(-1, pad_len), exec_valid_pair], dim=1),
         )
 
+    @staticmethod
+    def _estimate_current_speed_from_history(
+        pos_history: torch.Tensor,
+        valid_history: torch.Tensor,
+        *,
+        dt: float = 0.1,
+    ) -> torch.Tensor:
+        if pos_history.ndim != 3 or pos_history.shape[-1] != 2:
+            raise ValueError(f"pos_history must have shape [N, H, 2], got {tuple(pos_history.shape)}.")
+        if tuple(valid_history.shape) != tuple(pos_history.shape[:2]):
+            raise ValueError(
+                "valid_history must match pos_history first two dims, "
+                f"got {tuple(valid_history.shape)} and {tuple(pos_history.shape)}."
+            )
+        if dt <= 0.0:
+            raise ValueError(f"dt must be positive, got {dt}.")
+        if pos_history.shape[1] < 2:
+            return pos_history.new_zeros((pos_history.shape[0],))
+        pair_valid = valid_history[:, -2:].bool().all(dim=1)
+        speed = torch.linalg.vector_norm(pos_history[:, -1] - pos_history[:, -2], dim=-1) / float(dt)
+        return torch.where(pair_valid, speed, torch.zeros_like(speed))
+
     def _build_initial_exec_state_pair(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -436,6 +458,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_clean_norm: torch.Tensor,
         flow_agent_type: torch.Tensor | None = None,
         flow_agent_length: torch.Tensor | None = None,
+        flow_current_speed: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
         flow_clean_metric_norm: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
@@ -478,6 +501,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             output["flow_metric_agent_type"] = flow_agent_type
         if flow_agent_length is not None:
             output["flow_metric_agent_length"] = flow_agent_length
+        if flow_current_speed is not None:
+            output["flow_metric_current_speed"] = flow_current_speed
         if flow_loss_mask is not None:
             output["flow_loss_mask"] = flow_loss_mask
         if flow_clean_metric_norm is not None:
@@ -489,6 +514,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         value: torch.Tensor,
         agent_type: torch.Tensor | None,
         agent_length: torch.Tensor | None = None,
+        current_speed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if not self.use_kinematic_control_flow or value.shape[-1] != CONTROL_FLOW_DIM:
             return value
@@ -505,6 +531,11 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 if agent_length is not None
                 else None
             ),
+            current_speed=(
+                current_speed.to(device=value.device, dtype=value.dtype)
+                if current_speed is not None
+                else None
+            ),
             pos_scale_m=self.control_pos_scale_m,
             vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
             pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
@@ -519,14 +550,20 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         control_norm: torch.Tensor,
         agent_type: torch.Tensor,
         agent_length: torch.Tensor | None = None,
+        current_speed: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Convert normalized 3D control to MDG's 5D state representation."""
+        """Convert normalized 2D control to MDG's 5D state representation."""
         return control_norm_to_mdg_state_norm(
             control_norm=control_norm,
             agent_type=agent_type.to(device=control_norm.device),
             agent_length=(
                 agent_length.to(device=control_norm.device, dtype=control_norm.dtype)
                 if agent_length is not None
+                else None
+            ),
+            current_speed=(
+                current_speed.to(device=control_norm.device, dtype=control_norm.dtype)
+                if current_speed is not None
                 else None
             ),
             pos_scale_m=self.control_pos_scale_m,
@@ -880,6 +917,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         mask_schedule: torch.Tensor,
         agent_type: torch.Tensor,
         agent_length: torch.Tensor | None,
+        current_speed: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         """Run MDG denoising and return the final clean control estimate.
@@ -892,7 +930,12 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         current = initial_control_norm
         for step_idx, mask_level in enumerate(mask_schedule):
             expanded_mask = mask_level.view(1, -1).expand(current.shape[0], -1)
-            noisy_state = self._to_mdg_state_norm(current, agent_type, agent_length)
+            noisy_state = self._to_mdg_state_norm(
+                current,
+                agent_type,
+                agent_length,
+                current_speed,
+            )
             pred_control = self.flow_decoder(anchor_hidden, noisy_state, expanded_mask)
             if step_idx + 1 < mask_schedule.shape[0]:
                 next_mask = mask_schedule[step_idx + 1].view(1, -1).expand_as(expanded_mask)
@@ -912,12 +955,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         value: torch.Tensor,
         agent_type: torch.Tensor | None,
         agent_length: torch.Tensor | None = None,
+        current_speed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Metric/시각화 경로가 쓰는 pose-space flow 표현으로 변환합니다."""
         return self._to_pose_metric_norm(
             value=value,
             agent_type=agent_type,
             agent_length=agent_length,
+            current_speed=current_speed,
         )
 
 
@@ -929,6 +974,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         backprop_last_k: int | None = None,
         agent_type: torch.Tensor | None = None,
         agent_length: torch.Tensor | None = None,
+        current_speed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """유효 anchor 문맥만 받아 실제 생성 경로로 2초 미래를 만듭니다.
 
@@ -942,7 +988,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         Returns:
             torch.Tensor: 생성된 정규화 2초 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                shape은 ``[n_valid_anchor, 20, 2]`` 입니다.
         """
         if anchor_hidden_valid.numel() == 0:
             return anchor_hidden_valid.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
@@ -974,6 +1020,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             mask_schedule=mask_schedule,
             agent_type=agent_type,
             agent_length=agent_length,
+            current_speed=current_speed,
             generator=generator,
         )
 
@@ -986,6 +1033,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         backprop_last_k: int | None = None,
         agent_type: torch.Tensor | None = None,
         agent_length: torch.Tensor | None = None,
+        current_speed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """모든 anchor 문맥에서 유효한 것만 골라 실제 생성 경로를 수행합니다.
 
@@ -1001,7 +1049,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         Returns:
             torch.Tensor: 생성된 정규화 2초 미래입니다.
-                shape은 ``[n_valid_anchor, 20, 4]`` 입니다.
+                shape은 ``[n_valid_anchor, 20, 2]`` 입니다.
         """
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
         return self._sample_open_loop_future_from_hidden(
@@ -1011,6 +1059,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             backprop_last_k=backprop_last_k,
             agent_type=agent_type,
             agent_length=agent_length,
+            current_speed=current_speed,
         )
 
 
@@ -1209,6 +1258,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         flow_clean_norm: torch.Tensor,
         flow_agent_type: torch.Tensor | None = None,
         flow_agent_length: torch.Tensor | None = None,
+        flow_current_speed: torch.Tensor | None = None,
         flow_loss_mask: torch.Tensor | None = None,
         flow_clean_metric_norm: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
@@ -1219,7 +1269,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             map_feature: map encoder가 만든 지도 특징 사전입니다.
             anchor_mask: 사용할 anchor 표시입니다. shape은 ``[n_agent, n_anchor]`` 입니다.
             flow_clean_norm: 정답 미래입니다.
-                shape은 ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
+                control-space에서는 shape이 ``[n_valid_anchor, flow_window_steps, 2]`` 입니다.
             flow_loss_mask: loss에 포함할 미래 step입니다.
                 shape은 ``[n_valid_anchor, flow_window_steps]`` 입니다.
                 값이 없으면 전체 step을 사용합니다.
@@ -1257,6 +1307,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             flow_clean_norm=flow_clean_norm,
             flow_agent_type=flow_agent_type,
             flow_agent_length=flow_agent_length,
+            flow_current_speed=flow_current_speed,
             flow_loss_mask=flow_loss_mask,
             flow_clean_metric_norm=flow_clean_metric_norm,
         )
@@ -1265,14 +1316,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask)
 
         if flow_clean_norm.numel() == 0:
-            empty = flow_clean_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
+            empty_control = flow_clean_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
             empty_state = flow_clean_norm.new_zeros((0, self.flow_window_steps, MDG_STATE_DIM))
             empty_mask = flow_clean_norm.new_zeros((0, self.flow_window_steps))
             output = {
-                "flow_pred_norm": empty,
-                "flow_target_norm": empty,
-                "flow_pred_clean_norm": empty,
-                "flow_clean_norm": empty,
+                "flow_pred_norm": empty_state,
+                "flow_target_norm": empty_state,
+                "flow_pred_clean_norm": empty_control,
+                "flow_clean_norm": empty_control,
                 "mdg_pred_state_norm": empty_state,
                 "mdg_clean_state_norm": empty_state,
                 "mdg_mask_level": empty_mask,
@@ -1286,14 +1337,20 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 if flow_agent_length is not None:
                     output["flow_metric_agent_length"] = flow_agent_length
                 output["flow_pred_clean_metric_norm"] = self._to_pose_metric_norm(
-                    empty,
+                    empty_control,
                     flow_agent_type,
                     flow_agent_length,
+                    flow_current_speed,
                 )
                 output["flow_clean_metric_norm"] = (
                     flow_clean_metric_norm
                     if flow_clean_metric_norm is not None
-                    else self._to_pose_metric_norm(empty, flow_agent_type, flow_agent_length)
+                    else self._to_pose_metric_norm(
+                        empty_control,
+                        flow_agent_type,
+                        flow_agent_length,
+                        flow_current_speed,
+                    )
                 )
             elif flow_clean_metric_norm is not None:
                 output["flow_clean_metric_norm"] = flow_clean_metric_norm
@@ -1303,6 +1360,8 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
 
         if flow_agent_type is None:
             raise ValueError("flow_agent_type is required for MDG control-state training.")
+        if flow_current_speed is None:
+            raise ValueError("flow_current_speed is required for MDG acceleration/yaw-rate training.")
         mask_level = self._sample_mdg_train_mask_levels(
             tokenized_agent=tokenized_agent,
             anchor_mask=anchor_mask,
@@ -1321,6 +1380,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             noisy_control_norm,
             flow_agent_type,
             flow_agent_length,
+            flow_current_speed,
         )
         flow_pred_clean_norm = self.flow_decoder(
             anchor_hidden_valid,
@@ -1330,18 +1390,20 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         )
         if flow_pred_clean_norm.shape[-1] != CONTROL_FLOW_DIM:
             raise ValueError(
-                "semi_mdg flow decoder must predict normalized 3D control, "
+                "semi_mdg flow decoder must predict normalized 2D control, "
                 f"got last dim {flow_pred_clean_norm.shape[-1]}."
             )
         mdg_pred_state_norm = self._to_mdg_state_norm(
             flow_pred_clean_norm,
             flow_agent_type,
             flow_agent_length,
+            flow_current_speed,
         )
         mdg_clean_state_norm = self._to_mdg_state_norm(
             flow_clean_norm,
             flow_agent_type,
             flow_agent_length,
+            flow_current_speed,
         )
         output = {
             "flow_pred_norm": mdg_pred_state_norm,
@@ -1364,6 +1426,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 flow_pred_clean_norm,
                 flow_agent_type,
                 flow_agent_length,
+                flow_current_speed,
             )
             output["flow_clean_metric_norm"] = (
                 flow_clean_metric_norm
@@ -1372,6 +1435,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     flow_clean_norm,
                     flow_agent_type,
                     flow_agent_length,
+                    flow_current_speed,
                 )
             )
         elif flow_clean_metric_norm is not None:
@@ -2079,6 +2143,10 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                 )
                 current_pos_act = pos_window[active_mask, -1]
                 current_head_act = head_window[active_mask, -1]
+                current_speed_act = self._estimate_current_speed_from_history(
+                    pos_history=exec_pos_history_10hz[active_mask],
+                    valid_history=exec_valid_history_10hz[active_mask],
+                )
                 active_agent_type = tokenized_agent["type"][active_mask]
                 active_agent_length = tokenized_agent["shape"][active_mask, 0]
                 if bool(getattr(sampling_scheme, "action_reuse", False)) and previous_pred_action is not None:
@@ -2102,6 +2170,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         mask_schedule=mask_schedule,
                         agent_type=active_agent_type,
                         agent_length=active_agent_length,
+                        current_speed=current_speed_act,
                     )
                 else:
                     with torch.no_grad():
@@ -2111,6 +2180,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                             mask_schedule=mask_schedule,
                             agent_type=active_agent_type,
                             agent_length=active_agent_length,
+                            current_speed=current_speed_act,
                         )
                     y_hat_norm = y_hat_norm.detach()
                 if previous_pred_action is None:
@@ -2125,6 +2195,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                         y_hat_norm,
                         active_agent_type,
                         active_agent_length,
+                        current_speed_act,
                     )
                     preview_pos_local = y_hat_metric_norm[..., :2] * 20.0
                     preview_pos_global, _ = transform_to_global(
@@ -2146,6 +2217,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
                     current_head=current_head_act,
                     agent_type=active_agent_type,
                     agent_length=active_agent_length,
+                    current_speed=current_speed_act,
                 )
                 exec_pos_history_act = exec_pos_history_10hz[active_mask].clone()
                 exec_head_history_act = exec_head_history_10hz[active_mask].clone()
@@ -2443,7 +2515,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             map_feature: 이 decoder가 직접 만든 지도 특징입니다.
             path_noisy_norm: noisy N초 flow state입니다.
                 pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 2]`` 입니다.
             tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent 마스크입니다. shape은 ``[n_agent]`` 입니다.
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from torch_geometric.data import HeteroData
 
 from src.smart.modules.flow_agent_decoder import SMARTFlowAgentDecoder
 from src.smart.modules.smart_flow_decoder import SMARTFlowDecoder
@@ -9,13 +10,13 @@ from src.smart.modules.kinematic_control import (
     VEHICLE_TYPE_ID,
     control_norm_to_pose_norm,
 )
-from src.smart.tokens.flow_token_processor import FlowTokenProcessor
+from src.smart.tokens.flow_token_processor import FlowTokenProcessor, SIDECAR_PREFIX
 
 
 CONTROL_YAW_SCALE_KWARGS = {
-    "control_vehicle_yaw_scale_rad": 0.025,
-    "control_pedestrian_yaw_scale_rad": 0.20,
-    "control_cyclist_yaw_scale_rad": 0.06,
+    "control_vehicle_yaw_scale_rad": 0.5,
+    "control_pedestrian_yaw_scale_rad": 0.5,
+    "control_cyclist_yaw_scale_rad": 0.5,
 }
 
 
@@ -23,7 +24,7 @@ def test_control_metric_conversion_requires_agent_type() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     decoder.use_kinematic_control_flow = True
 
-    control_norm = torch.zeros((2, 5, 3), dtype=torch.float32)
+    control_norm = torch.zeros((2, 5, 2), dtype=torch.float32)
 
     with pytest.raises(ValueError, match="agent_type is required"):
         decoder.flow_norm_to_pose_metric_norm(value=control_norm, agent_type=None)
@@ -43,7 +44,7 @@ def test_pose_metric_conversion_allows_pose_space_without_agent_type() -> None:
 def _make_control_processor() -> FlowTokenProcessor:
     processor = FlowTokenProcessor.__new__(FlowTokenProcessor)
     processor.flow_window_steps = 2
-    processor.flow_target_dim = 3
+    processor.flow_target_dim = 2
     processor.use_kinematic_control_flow = True
     processor.use_holonomic_model_only = False
     processor.use_rolling_supervision = True
@@ -56,12 +57,52 @@ def _make_control_processor() -> FlowTokenProcessor:
     return processor
 
 
+def _make_sidecar_shape_processor() -> FlowTokenProcessor:
+    processor = FlowTokenProcessor.__new__(FlowTokenProcessor)
+    processor.flow_window_steps = 20
+    processor.flow_target_dim = 2
+    return processor
+
+
+def _make_minimal_sidecar_data(
+    *,
+    flow_clean_shape: tuple[int, ...] = (1, 16, 20, 2),
+    flow_metric_shape: tuple[int, ...] = (1, 16, 20, 4),
+) -> HeteroData:
+    data = HeteroData()
+    data["agent"]["type"] = torch.tensor([VEHICLE_TYPE_ID], dtype=torch.long)
+    data["agent"]["shape"] = torch.tensor([[4.5, 1.8, 1.6]], dtype=torch.float32)
+    data["agent"][f"{SIDECAR_PREFIX}flow_mask"] = torch.ones((1, 16), dtype=torch.bool)
+    data["agent"][f"{SIDECAR_PREFIX}flow_clean_norm_dense"] = torch.zeros(flow_clean_shape)
+    data["agent"][f"{SIDECAR_PREFIX}flow_clean_metric_norm_dense"] = torch.zeros(flow_metric_shape)
+    data["agent"][f"{SIDECAR_PREFIX}flow_loss_mask_dense"] = torch.ones((1, 16, 20), dtype=torch.bool)
+    data["agent"][f"{SIDECAR_PREFIX}flow_current_speed_dense"] = torch.zeros((1, 16))
+    return data
+
+
+def test_sidecar_rejects_wrong_control_target_dimension() -> None:
+    processor = _make_sidecar_shape_processor()
+    data = _make_minimal_sidecar_data(flow_clean_shape=(1, 16, 20, 3))
+
+    with pytest.raises(ValueError, match="flow_clean_norm_dense"):
+        processor._tokenize_agent_train_from_sidecar(data)
+
+
+def test_sidecar_rejects_wrong_metric_target_dimension() -> None:
+    processor = _make_sidecar_shape_processor()
+    data = _make_minimal_sidecar_data(flow_metric_shape=(1, 16, 20, 5))
+
+    with pytest.raises(ValueError, match="flow_clean_metric_norm_dense"):
+        processor._tokenize_agent_train_from_sidecar(data)
+
+
 def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
     processor = _make_control_processor()
     pos = torch.zeros((1, 3, 2), dtype=torch.float32)
     pos[0, 1] = torch.tensor([0.0, 1.0])
     pos[0, 2] = torch.tensor([0.0, 2.0])
     heading = torch.zeros((1, 3), dtype=torch.float32)
+    velocity = torch.zeros((1, 3, 2), dtype=torch.float32)
     current_pos = pos[:, 0]
     current_head = heading[:, 0]
     agent_type = torch.tensor([VEHICLE_TYPE_ID])
@@ -71,6 +112,7 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
     control_target = processor._build_anchor_clean_norm(
         pos=pos,
         heading=heading,
+        velocity=velocity,
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
@@ -91,6 +133,7 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
     raw_metric_target = processor._build_anchor_clean_norm(
         pos=pos,
         heading=heading,
+        velocity=velocity,
         current_pos=current_pos,
         current_head=current_head,
         agent_type=agent_type,
@@ -100,7 +143,7 @@ def test_control_metric_target_keeps_raw_gt_not_projection() -> None:
         force_pose_space=True,
     )
 
-    assert tuple(control_target.shape) == (1, 2, 3)
+    assert tuple(control_target.shape) == (1, 2, 2)
     assert tuple(raw_metric_target.shape) == (1, 2, 4)
     torch.testing.assert_close(raw_metric_target[0, :, 1], torch.tensor([1.0 / 20.0, 2.0 / 20.0]))
     torch.testing.assert_close(projection_target[0, :, 1], torch.zeros(2))
@@ -132,7 +175,7 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
     decoder.use_holonomic_model_only = False
     decoder.use_rolling_supervision = True
     decoder.flow_window_steps = 2
-    decoder.flow_state_dim = 3
+    decoder.flow_state_dim = 2
     decoder.control_pos_scale_m = 1.0
     decoder.control_vehicle_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_vehicle_yaw_scale_rad"]
     decoder.control_pedestrian_yaw_scale_rad = CONTROL_YAW_SCALE_KWARGS["control_pedestrian_yaw_scale_rad"]
@@ -149,8 +192,9 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
     }
     decoder._pack_anchor_hidden = lambda anchor_hidden, anchor_mask: torch.zeros((1, 1))
 
-    flow_clean_norm = torch.zeros((1, 2, 3), dtype=torch.float32)
+    flow_clean_norm = torch.zeros((1, 2, 2), dtype=torch.float32)
     agent_type = torch.tensor([VEHICLE_TYPE_ID])
+    current_speed = torch.tensor([0.0], dtype=torch.float32)
     raw_metric_target = torch.zeros((1, 2, 4), dtype=torch.float32)
     raw_metric_target[0, :, 1] = torch.tensor([1.0 / 20.0, 2.0 / 20.0])
 
@@ -160,6 +204,7 @@ def test_decoder_uses_raw_metric_target_when_provided() -> None:
         anchor_mask=torch.tensor([[True]]),
         flow_clean_norm=flow_clean_norm,
         flow_agent_type=agent_type,
+        flow_current_speed=current_speed,
         flow_clean_metric_norm=raw_metric_target,
     )
 
@@ -254,9 +299,9 @@ def test_mdg_mask_plan_handles_empty_active_pairs() -> None:
 def test_mdg_multistep_final_clean_transition_uses_last_clean_estimate() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     decoder.flow_window_steps = 3
-    decoder.flow_state_dim = 3
+    decoder.flow_state_dim = 2
     decoder.mdg_num_noise_levels = 5
-    decoder._to_mdg_state_norm = lambda current, agent_type, agent_length: current.new_zeros(
+    decoder._to_mdg_state_norm = lambda current, agent_type, agent_length, current_speed=None: current.new_zeros(
         current.shape[:-1] + (5,)
     )
 
@@ -272,7 +317,7 @@ def test_mdg_multistep_final_clean_transition_uses_last_clean_estimate() -> None
 
     decoder.flow_decoder = _fake_denoiser
     hidden = torch.zeros((2, 4), dtype=torch.float32)
-    initial = torch.zeros((2, 3, 3), dtype=torch.float32)
+    initial = torch.zeros((2, 3, 2), dtype=torch.float32)
     schedule = torch.tensor(
         [
             [5.0, 5.0, 5.0],
@@ -299,7 +344,7 @@ def test_agent_anchor_context_keeps_raw_metric_target() -> None:
     decoder = SMARTFlowAgentDecoder.__new__(SMARTFlowAgentDecoder)
     decoder._encode_context = lambda **kwargs: torch.zeros((1, 2, 1))
 
-    flow_clean_norm = torch.zeros((1, 2, 3), dtype=torch.float32)
+    flow_clean_norm = torch.zeros((1, 2, 2), dtype=torch.float32)
     raw_metric_target = torch.zeros((1, 2, 4), dtype=torch.float32)
     raw_metric_target[0, :, 1] = torch.tensor([1.0 / 20.0, 2.0 / 20.0])
     tokenized_agent = {
@@ -329,7 +374,7 @@ def test_smart_flow_anchor_context_passes_raw_metric_target() -> None:
     decoder = SMARTFlowDecoder.__new__(SMARTFlowDecoder)
     decoder.agent_encoder = _DummyAgentEncoder()
 
-    flow_clean_norm = torch.zeros((1, 2, 3), dtype=torch.float32)
+    flow_clean_norm = torch.zeros((1, 2, 2), dtype=torch.float32)
     raw_metric_target = torch.zeros((1, 2, 4), dtype=torch.float32)
     raw_metric_target[0, :, 1] = torch.tensor([1.0 / 20.0, 2.0 / 20.0])
     tokenized_agent = {
@@ -338,6 +383,7 @@ def test_smart_flow_anchor_context_passes_raw_metric_target() -> None:
         "flow_eval_clean_metric_norm": raw_metric_target,
         "flow_eval_agent_type": torch.tensor([VEHICLE_TYPE_ID]),
         "flow_eval_agent_length": torch.tensor([4.0]),
+        "flow_eval_current_speed": torch.tensor([0.0]),
     }
 
     out = decoder.build_anchor_context_from_map_feature(

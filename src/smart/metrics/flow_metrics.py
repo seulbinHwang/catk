@@ -129,12 +129,24 @@ def mdg_state_loss(
     clean_state_norm: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """MDG control-state loss over valid 10Hz future steps."""
-    return flow_matching_loss(
-        flow_pred_norm=pred_state_norm,
-        flow_target_norm=clean_state_norm,
-        valid_mask=valid_mask,
-    )
+    """MDG control-state loss over valid 10Hz future steps.
+
+    Unlike pose-space flow matching, MDG sums the 5D state error per step and
+    averages over valid steps; it does not divide by the state dimension.
+    """
+    if pred_state_norm.numel() == 0:
+        return pred_state_norm.sum() * 0.0
+    squared_step_error = (pred_state_norm - clean_state_norm).square().sum(dim=-1)
+    if valid_mask is None:
+        return squared_step_error.mean()
+
+    mask = _validate_future_mask(value=pred_state_norm, valid_mask=valid_mask)
+    if mask is None:
+        return squared_step_error.mean()
+    if not bool(mask.any().item()):
+        return pred_state_norm.sum() * 0.0
+    mask_float = mask.to(dtype=squared_step_error.dtype)
+    return (squared_step_error * mask_float).sum() / mask_float.sum().clamp_min(1.0)
 
 
 def auxiliary_best_mode_trajectory_loss(

@@ -8,7 +8,7 @@ cd "$ROOT_DIR"
 
 CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
 SPLIT="${SPLIT:-training}"
-SIDECAR_ROOT="${SIDECAR_ROOT:-${CACHE_ROOT}/semi_mdg_sidecar}"
+SIDECAR_ROOT="${SIDECAR_ROOT:-${CACHE_ROOT}/semi_mdg_sidecar_v2_accel_yawrate}"
 OUTPUT_DIR="${OUTPUT_DIR:-${SIDECAR_ROOT}/${SPLIT}}"
 EXPERIMENT="${EXPERIMENT:-mdg_pretrain_h100x3x2}"
 NUM_SHARDS="${NUM_SHARDS:-}"

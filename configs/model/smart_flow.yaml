@@ -37,23 +37,21 @@ model_config:
     # false: full-window 미래가 모두 유효한 anchor만 학습합니다.
     # true: 18-token / 16-anchor pretrain에서 tail anchor의 유효 prefix만 loss를 줍니다.
     use_prefix_valid_future_loss_mask: true
-    # semi_mdg는 GT pose에서 control label을 on-the-fly로 만들고,
-    # MDG denoising은 [delta_s, delta_n, delta_yaw] 제어공간에서 학습합니다.
+    # semi_mdg는 GT pose/heading/velocity에서 control label을 on-the-fly로 만들고,
+    # MDG denoising은 10Hz [acceleration, yaw_rate] 제어공간에서 학습합니다.
     use_kinematic_control_flow: true
-    # semi_mdg는 vehicle/pedestrian/cyclist 모두 같은 non-holonomic dynamics를 사용합니다.
-    # true: decoder-consistent rolling supervision으로 GT control label을 만듭니다.
-    # false: 각 step의 raw GT pose pair만으로 inverse control label을 만듭니다.
+    # 이 값은 이전 control 호환 config입니다. MDG-style 2D dynamics에서는 chunk/rolling
+    # inverse가 없고 0.1초 step별 acceleration/yaw_rate target을 바로 만듭니다.
     use_rolling_supervision: true
     control_pos_scale_m: 1.0
-    # vehicle/cyclist의 non-holonomic no-slip point를 box center 뒤쪽으로
-    # box length * 이 비율만큼 옮깁니다. 값은 전체 SMART cache training split에서 추정했습니다.
-    control_vehicle_no_slip_point_ratio: 0.2289518863
-    control_cyclist_no_slip_point_ratio: 0.0495847873
-    # control-space yaw normalization is agent type-aware and config-managed.
-    control_vehicle_yaw_scale_rad: 0.025
-    control_pedestrian_yaw_scale_rad: 0.20
-    control_cyclist_yaw_scale_rad: 0.06
-    # control-space 학습에서 GT -> control -> pose 복원 위치 오차가 이 값보다 큰 anchor는 학습에서 제외합니다.
+    # No-slip point offsets are not used by MDG-style acceleration/yaw-rate dynamics.
+    control_vehicle_no_slip_point_ratio: 0.0
+    control_cyclist_no_slip_point_ratio: 0.0
+    # Kept under old key names for config/checkpoint compatibility; values are yaw-rate stds.
+    control_vehicle_yaw_scale_rad: 0.5
+    control_pedestrian_yaw_scale_rad: 0.5
+    control_cyclist_yaw_scale_rad: 0.5
+    # Legacy diagnostic threshold; MDG-style training no longer drops anchors by round-trip error.
     control_round_trip_max_position_error_m: 0.5
   validation_rollout_sampling:
     sample_steps: 1
@@ -88,7 +86,7 @@ model_config:
     flow_num_chunk_heads: 4
     flow_num_chunk_layers: 2
     mdg_num_noise_levels: 5
-    mdg_state_speed_scale_mps: 10.0
+    mdg_state_speed_scale_mps: 1.0
     # Training-only metric memory control. It does not change loss/target/model
     # capacity and only detaches train metric clean reconstruction graphs.
     detach_train_metric_clean: false

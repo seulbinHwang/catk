@@ -10,9 +10,9 @@ from src.smart.modules.self_forced_path_flow import build_anchor0_normalized_com
 
 
 CONTROL_YAW_SCALE_KWARGS = {
-    "vehicle_yaw_scale_rad": 0.025,
-    "pedestrian_yaw_scale_rad": 0.20,
-    "cyclist_yaw_scale_rad": 0.06,
+    "vehicle_yaw_scale_rad": 0.5,
+    "pedestrian_yaw_scale_rad": 0.5,
+    "cyclist_yaw_scale_rad": 0.5,
 }
 
 
@@ -43,8 +43,8 @@ def test_control_self_forced_projection_returns_control_state() -> None:
         **CONTROL_YAW_SCALE_KWARGS,
     )
 
-    assert tuple(control_norm.shape) == (1, 2, 3)
-    torch.testing.assert_close(control[..., 1], torch.zeros_like(control[..., 1]))
+    assert tuple(control_norm.shape) == (1, 2, 2)
+    torch.testing.assert_close(control[..., 1], torch.tensor([[0.0, 2.0]], dtype=torch.float32), atol=1.0e-5, rtol=1.0e-5)
 
 
 def test_control_self_forced_projection_keeps_generator_gradient_path() -> None:

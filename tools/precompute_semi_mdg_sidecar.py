@@ -31,7 +31,7 @@ from src.smart.tokens.flow_token_processor import (  # noqa: E402
 )
 
 
-SIDECAR_VERSION = "semi_mdg_token_flow_sidecar_v1"
+SIDECAR_VERSION = "semi_mdg_token_flow_sidecar_v2_accel_yawrate"
 
 
 def list_cache_files(cache_dir: Path, limit: int | None) -> list[Path]:
@@ -78,6 +78,7 @@ def build_sidecar(
     clean_norm = tokenized_agent["flow_train_clean_norm"]
     clean_metric_norm = tokenized_agent["flow_train_clean_metric_norm"]
     loss_mask = tokenized_agent["flow_train_loss_mask"].bool()
+    current_speed = tokenized_agent["flow_train_current_speed"]
     clean_norm_dense = unpack_anchor_dense(
         packed=clean_norm,
         anchor_mask=flow_mask,
@@ -93,6 +94,11 @@ def build_sidecar(
         anchor_mask=flow_mask,
         shape=(num_agent, num_anchor, flow_window_steps),
     ).bool()
+    current_speed_dense = unpack_anchor_dense(
+        packed=current_speed,
+        anchor_mask=flow_mask,
+        shape=(num_agent, num_anchor),
+    )
 
     return {
         "version": SIDECAR_VERSION,
@@ -108,6 +114,7 @@ def build_sidecar(
             "flow_clean_norm_dense": cpu_tensor(clean_norm_dense).float(),
             "flow_clean_metric_norm_dense": cpu_tensor(clean_metric_norm_dense).float(),
             "flow_loss_mask_dense": cpu_tensor(loss_mask_dense).bool(),
+            "flow_current_speed_dense": cpu_tensor(current_speed_dense).float(),
         },
         "pt_token": {
             "map_token": cpu_tensor(tokenized_map["token_idx"]).long(),

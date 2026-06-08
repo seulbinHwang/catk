@@ -1002,8 +1002,10 @@ class SMARTFlow(LightningModule):
 
         Args:
             pred_dict: flow decoder가 낸 출력 사전입니다.
-                ``flow_pred_norm`` 과 ``flow_target_norm`` 의 shape은
-                ``[n_valid_anchor, flow_window_steps, 4]`` 입니다.
+                ``mdg_pred_state_norm`` 과 ``mdg_clean_state_norm`` 의 shape은
+                ``[n_valid_anchor, flow_window_steps, 5]`` 입니다.
+                ``flow_pred_clean_norm`` 과 ``flow_clean_norm`` 은 정규화된 2D
+                control이고, metric용 clean tensor는 pose-space 4D입니다.
                 ``flow_loss_mask`` 가 있으면 shape은
                 ``[n_valid_anchor, flow_window_steps]`` 입니다.
             zero_loss_module: 유효 target이 없을 때 0 loss를 연결할 trainable
@@ -2414,7 +2416,7 @@ class SMARTFlow(LightningModule):
         Returns:
             tuple[Tensor, Tensor]: packed flow state와 agent mask입니다.
                 pose-space shape은 ``[n_valid_agent, F_win, 4]`` 이고,
-                control-space shape은 ``[n_valid_agent, F_win, 3]`` 이며,
+                control-space shape은 ``[n_valid_agent, F_win, 2]`` 이며,
                 mask shape은 ``[n_agent]`` 입니다.
 
         Notes:
@@ -2462,7 +2464,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 N초 self-forced flow state입니다.
                 pose-space에서는 ``[n_valid_agent, F_win, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, F_win, 3]`` 입니다.
+                control-space에서는 ``[n_valid_agent, F_win, 2]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
             has_committed_path_global: DDP 전체 rank 기준으로 self-forced path가 하나라도
@@ -2555,7 +2557,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent: agent token 사전입니다.
             committed_path_norm: Generator가 closed-loop로 실제 실행한 self-forced flow state입니다.
                 pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 2]`` 입니다.
             anchor_mask: 첫 anchor 기준으로 유효한 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -2615,7 +2617,7 @@ class SMARTFlow(LightningModule):
         Args:
             clean_path_norm: Generator가 만든 clean flow state입니다.
                 pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 2]`` 입니다.
 
         Returns:
             object: ``x_t`` 와 ``tau`` 를 가진 flow sample입니다.
@@ -2647,7 +2649,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 self-forced flow state입니다.
                 pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 2]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -2701,7 +2703,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 self-forced flow state ``X`` 입니다.
                 pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 2]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -2741,7 +2743,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 self-forced flow state입니다.
                 pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
+                control-space에서는 ``[n_valid_agent, flow_window_steps, 2]`` 입니다.
             anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
                 shape은 ``[n_agent]`` 입니다.
 
@@ -3117,12 +3119,13 @@ class SMARTFlow(LightningModule):
             return self._training_step_manual_open_loop(data=data, batch_idx=batch_idx)
         tokenized_map, tokenized_agent = self.token_processor(data)
         """ pred
-flow_pred_norm [n_valid_anchor, 20, 4]
-flow_target_norm [n_valid_anchor, 20, 4]
-    -> flow_pred_norm / flow_target_norm 을 비교해 FM loss 계산
-flow_pred_clean_norm [n_valid_anchor, 20, 4] -> 속도 예측을 clean trajectory 공간으로 복원한 값
-flow_clean_norm [n_valid_anchor, 20, 4]
-    -> 정답 궤적 (flow_pred_clean_norm / flow_clean_norm 릴 비교해서 ADE/FDE/yaw error 계산)
+mdg_pred_state_norm [n_valid_anchor, 20, 5]
+mdg_clean_state_norm [n_valid_anchor, 20, 5]
+    -> MDG state끼리 비교해 state loss 계산
+flow_pred_clean_norm [n_valid_anchor, 20, 2] -> 예측한 정규화 2D control
+flow_clean_norm [n_valid_anchor, 20, 2] -> 정답 정규화 2D control
+flow_pred_clean_metric_norm / flow_clean_metric_norm [n_valid_anchor, 20, 4]
+    -> pose-space metric 계산에 사용
         """
         pred = self.encoder(
             tokenized_map,
@@ -3211,11 +3214,13 @@ open_metric_dict:
                 sampling_seed=self._get_validation_open_seed(batch_idx),
                 agent_type=denoise_pred.get("flow_metric_agent_type"),
                 agent_length=denoise_pred.get("flow_metric_agent_length"),
+                current_speed=denoise_pred.get("flow_metric_current_speed"),
             )
             open_pred_metric_norm = eval_generator.flow_norm_to_pose_metric_norm(
                 value=open_pred_clean_norm,
                 agent_type=denoise_pred.get("flow_metric_agent_type"),
                 agent_length=denoise_pred.get("flow_metric_agent_length"),
+                current_speed=denoise_pred.get("flow_metric_current_speed"),
             )
             open_target_metric_norm = denoise_pred.get(
                 "flow_clean_metric_norm",

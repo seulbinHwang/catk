@@ -90,7 +90,7 @@ class MultiDataset(Dataset):
 
     @staticmethod
     def _attach_sidecar(data: dict, sidecar: dict) -> None:
-        if sidecar.get("version") != "semi_mdg_token_flow_sidecar_v1":
+        if sidecar.get("version") != "semi_mdg_token_flow_sidecar_v2_accel_yawrate":
             raise ValueError(
                 "Unsupported Semi-MDG sidecar version: "
                 f"{sidecar.get('version')!r}."

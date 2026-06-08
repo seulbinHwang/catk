@@ -13,7 +13,14 @@ from tools.analyze_control_round_trip_error import (
 )
 
 
-def _write_cache(path, *, position: torch.Tensor, heading: torch.Tensor, valid: torch.Tensor) -> None:
+def _write_cache(
+    path,
+    *,
+    position: torch.Tensor,
+    heading: torch.Tensor,
+    valid: torch.Tensor,
+    velocity: torch.Tensor | None = None,
+) -> None:
     num_agent = position.shape[0]
     agent = {
         "position": position,
@@ -22,6 +29,8 @@ def _write_cache(path, *, position: torch.Tensor, heading: torch.Tensor, valid: 
         "type": torch.full((num_agent,), VEHICLE_TYPE_ID, dtype=torch.uint8),
         "shape": torch.tensor([[4.5, 2.0, 1.5]] * num_agent, dtype=torch.float32),
     }
+    if velocity is not None:
+        agent["velocity"] = velocity
     with path.open("wb") as handle:
         pickle.dump({"agent": agent}, handle)
 
@@ -51,9 +60,11 @@ def test_analyze_cache_file_reports_known_vehicle_round_trip_error(tmp_path) -> 
     position[0, 10, :2] = torch.tensor([0.0, 0.0])
     for offset in range(1, 21):
         position[0, 10 + offset, :2] = torch.tensor([float(offset), 6.0])
+    velocity = torch.zeros((1, 91, 2), dtype=torch.float32)
+    velocity[0, 11:31, 0] = 10.0
 
     path = tmp_path / "lateral_jump.pkl"
-    _write_cache(path, position=position, heading=heading, valid=valid)
+    _write_cache(path, position=position, heading=heading, valid=valid, velocity=velocity)
 
     cfg = AnalysisConfig(flow_window_steps=20, raw_start=10, raw_end=10, hist_max_error_m=10.0, hist_bins=10_000)
     stats = analyze_cache_file(path, cfg, thresholds=np.array([2.0, 5.0, 10.0]))
@@ -69,9 +80,10 @@ def test_analyze_cache_file_zero_for_decoder_consistent_trajectory(tmp_path) -> 
     agent_length = torch.tensor([4.5], dtype=torch.float32)
     current_pos = torch.tensor([[1.0, -1.0]], dtype=torch.float32)
     current_head = torch.tensor([0.25], dtype=torch.float32)
-    control = torch.zeros((1, 20, 3), dtype=torch.float32)
+    current_speed = torch.tensor([1.0], dtype=torch.float32)
+    control = torch.zeros((1, 20, 2), dtype=torch.float32)
     control[..., 0] = 0.7
-    control[..., 2] = 0.04
+    control[..., 1] = 0.04
     cfg = AnalysisConfig(flow_window_steps=20, raw_start=10, raw_end=10)
     future_pos, future_head = decode_control_sequence(
         control=control,
@@ -79,21 +91,28 @@ def test_analyze_cache_file_zero_for_decoder_consistent_trajectory(tmp_path) -> 
         agent_length=agent_length,
         current_pos=current_pos,
         current_head=current_head,
+        current_speed=current_speed,
         vehicle_no_slip_point_ratio=cfg.control_vehicle_no_slip_point_ratio,
         cyclist_no_slip_point_ratio=cfg.control_cyclist_no_slip_point_ratio,
     )
+    speed = current_speed.unsqueeze(1) + torch.cumsum(control[..., 0] * 0.1, dim=1)
+    velocity_future = torch.stack([future_head.cos(), future_head.sin()], dim=-1) * speed.unsqueeze(-1)
 
     position = torch.zeros((1, 91, 3), dtype=torch.float32)
     heading = torch.zeros((1, 91), dtype=torch.float32)
+    velocity = torch.zeros((1, 91, 2), dtype=torch.float32)
     valid = torch.zeros((1, 91), dtype=torch.bool)
     valid[:, :31] = True
     position[0, 10, :2] = current_pos[0]
     heading[0, 10] = current_head[0]
+    velocity[0, 10, 0] = current_speed[0] * current_head[0].cos()
+    velocity[0, 10, 1] = current_speed[0] * current_head[0].sin()
     position[0, 11:31, :2] = future_pos[0]
     heading[0, 11:31] = future_head[0]
+    velocity[0, 11:31] = velocity_future[0]
 
     path = tmp_path / "consistent.pkl"
-    _write_cache(path, position=position, heading=heading, valid=valid)
+    _write_cache(path, position=position, heading=heading, valid=valid, velocity=velocity)
 
     stats = analyze_cache_file(path, cfg, thresholds=np.array([0.001, 0.01]))
 

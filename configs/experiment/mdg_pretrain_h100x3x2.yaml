@@ -60,16 +60,16 @@ model:
       use_rolling_supervision: true
       use_prefix_valid_future_loss_mask: true
       control_pos_scale_m: 1.0
-      control_vehicle_yaw_scale_rad: 0.025
-      control_pedestrian_yaw_scale_rad: 0.20
-      control_cyclist_yaw_scale_rad: 0.06
-      control_vehicle_no_slip_point_ratio: 0.2289518863
-      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_vehicle_yaw_scale_rad: 0.5
+      control_pedestrian_yaw_scale_rad: 0.5
+      control_cyclist_yaw_scale_rad: 0.5
+      control_vehicle_no_slip_point_ratio: 0.0
+      control_cyclist_no_slip_point_ratio: 0.0
       control_round_trip_max_position_error_m: 0.5
     decoder:
       closed_loop_rollout_mode: raw_mdg
       mdg_num_noise_levels: 5
-      mdg_state_speed_scale_mps: 10.0
+      mdg_state_speed_scale_mps: 1.0
       use_lqr: false
       use_stop_motion: false
     sim_agents_submission:

@@ -218,6 +218,7 @@ class TokenProcessor(torch.nn.Module):
                 "valid": valid,
                 "pos": pos,
                 "heading": heading,
+                "velocity": vel,
             }
         return tokenized_agent
 

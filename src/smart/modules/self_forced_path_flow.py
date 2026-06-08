@@ -164,7 +164,7 @@ def build_anchor0_normalized_committed_control(
 
     Returns:
         Tensor: 정규화된 rolling control path입니다.
-            shape은 ``[n_valid_agent, T, 3]`` 입니다.
+            shape은 ``[n_valid_agent, T, 2]`` 입니다.
     """
     if committed_path_norm.ndim != 3 or committed_path_norm.shape[-1] != POSE_FLOW_DIM:
         raise ValueError(
@@ -202,6 +202,18 @@ def build_anchor0_normalized_committed_control(
     future_head = torch.atan2(committed_path_norm[..., 3], committed_path_norm[..., 2])
     current_pos = future_pos.new_zeros((future_pos.shape[0], 2))
     current_head = future_head.new_zeros((future_head.shape[0],))
+    current_speed = None
+    history_keys = [
+        "rollout_init_fine_pos_history",
+        "rollout_init_fine_valid_history",
+    ]
+    if all(key in tokenized_agent for key in history_keys):
+        pos_history = tokenized_agent[history_keys[0]][anchor_mask].to(device=committed_path_norm.device)
+        valid_history = tokenized_agent[history_keys[1]][anchor_mask].to(device=committed_path_norm.device)
+        if pos_history.shape[1] >= 2:
+            pair_valid = valid_history[:, -2:].bool().all(dim=1)
+            speed = torch.linalg.vector_norm(pos_history[:, -1] - pos_history[:, -2], dim=-1) / 0.1
+            current_speed = torch.where(pair_valid, speed, torch.zeros_like(speed))
     return build_rolling_control_target(
         future_pos=future_pos,
         future_head=future_head,
@@ -209,6 +221,7 @@ def build_anchor0_normalized_committed_control(
         current_head=current_head,
         agent_type=agent_type,
         agent_length=agent_length,
+        current_speed=current_speed,
         pos_scale_m=pos_scale_m,
         vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
         pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,

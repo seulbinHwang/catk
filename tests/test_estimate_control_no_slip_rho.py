@@ -8,7 +8,6 @@ import torch
 from src.smart.modules.kinematic_control import (
     CYCLIST_TYPE_ID,
     VEHICLE_TYPE_ID,
-    decode_control_sequence,
 )
 from tools.estimate_control_no_slip_rho import (
     EstimatorConfig,
@@ -31,19 +30,26 @@ def _synthetic_agent_record(
     current_pos = torch.zeros((num_agent, 2), dtype=torch.float32)
     current_head = torch.linspace(-0.6, 0.6, num_agent, dtype=torch.float32)
 
-    control = torch.zeros((num_agent, step_count, 3), dtype=torch.float32)
-    control[..., 0] = torch.linspace(0.55, 0.80, num_agent).unsqueeze(1)
-    control[..., 2] = torch.linspace(0.04, 0.08, num_agent).unsqueeze(1)
-
-    pos_future, head_future = decode_control_sequence(
-        control=control,
-        agent_type=agent_type_tensor,
-        agent_length=length,
-        current_pos=current_pos,
-        current_head=current_head,
-        vehicle_no_slip_point_ratio=rho,
-        cyclist_no_slip_point_ratio=rho,
-    )
+    delta_s = torch.linspace(0.55, 0.80, num_agent).unsqueeze(1).expand(-1, step_count)
+    delta_head = torch.linspace(0.04, 0.08, num_agent).unsqueeze(1).expand(-1, step_count)
+    head_future = torch.zeros((num_agent, step_count), dtype=torch.float32)
+    pos_future = torch.zeros((num_agent, step_count, 2), dtype=torch.float32)
+    roll_pos = current_pos.clone()
+    roll_head = current_head.clone()
+    offset = float(rho) * length
+    for step_idx in range(step_count):
+        prev_head = roll_head
+        next_head = torch.atan2((roll_head + delta_head[:, step_idx]).sin(), (roll_head + delta_head[:, step_idx]).cos())
+        mid_head = prev_head + 0.5 * delta_head[:, step_idx]
+        half_delta = 0.5 * delta_head[:, step_idx]
+        arc = delta_s[:, step_idx] * torch.sin(half_delta) / half_delta
+        prev_vec = torch.stack([prev_head.cos(), prev_head.sin()], dim=-1)
+        next_vec = torch.stack([next_head.cos(), next_head.sin()], dim=-1)
+        delta_pos = torch.stack([arc * mid_head.cos(), arc * mid_head.sin()], dim=-1)
+        roll_pos = roll_pos + delta_pos + offset.unsqueeze(-1) * (next_vec - prev_vec)
+        roll_head = next_head
+        pos_future[:, step_idx] = roll_pos
+        head_future[:, step_idx] = roll_head
 
     position = torch.zeros((num_agent, step_count + 1, 3), dtype=torch.float32)
     position[:, 1:, :2] = pos_future

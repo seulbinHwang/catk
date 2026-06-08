@@ -19,6 +19,6 @@ model:
       use_kinematic_control_flow: true
       use_rolling_supervision: true
       use_prefix_valid_future_loss_mask: true
-      control_vehicle_no_slip_point_ratio: 0.2289518863
-      control_cyclist_no_slip_point_ratio: 0.0495847873
+      control_vehicle_no_slip_point_ratio: 0.0
+      control_cyclist_no_slip_point_ratio: 0.0
       control_round_trip_max_position_error_m: 0.5

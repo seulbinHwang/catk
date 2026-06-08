@@ -57,9 +57,9 @@ def test_flow_token_processor_no_longer_exposes_topk_sampling_config() -> None:
         agent_token_file="agent_vocab_555_s2.pkl",
         flow_window_steps=20,
         use_kinematic_control_flow=True,
-        control_vehicle_yaw_scale_rad=0.025,
-        control_pedestrian_yaw_scale_rad=0.20,
-        control_cyclist_yaw_scale_rad=0.06,
+        control_vehicle_yaw_scale_rad=0.5,
+        control_pedestrian_yaw_scale_rad=0.5,
+        control_cyclist_yaw_scale_rad=0.5,
     )
 
     assert not hasattr(processor, "map_token_sampling")
@@ -72,9 +72,9 @@ def test_train_sampled_agent_token_matches_gt_token() -> None:
         agent_token_file="agent_vocab_555_s2.pkl",
         flow_window_steps=20,
         use_kinematic_control_flow=True,
-        control_vehicle_yaw_scale_rad=0.025,
-        control_pedestrian_yaw_scale_rad=0.20,
-        control_cyclist_yaw_scale_rad=0.06,
+        control_vehicle_yaw_scale_rad=0.5,
+        control_pedestrian_yaw_scale_rad=0.5,
+        control_cyclist_yaw_scale_rad=0.5,
     )
     processor.train()
 
@@ -162,9 +162,9 @@ def test_batched_agent_token_matching_matches_reference_loop() -> None:
         agent_token_file="agent_vocab_555_s2.pkl",
         flow_window_steps=20,
         use_kinematic_control_flow=True,
-        control_vehicle_yaw_scale_rad=0.025,
-        control_pedestrian_yaw_scale_rad=0.20,
-        control_cyclist_yaw_scale_rad=0.06,
+        control_vehicle_yaw_scale_rad=0.5,
+        control_pedestrian_yaw_scale_rad=0.5,
+        control_cyclist_yaw_scale_rad=0.5,
     )
 
     n_agent = 11

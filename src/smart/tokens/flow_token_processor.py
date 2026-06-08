@@ -35,6 +35,7 @@ SIDECAR_AGENT_KEYS = (
     "flow_clean_norm_dense",
     "flow_clean_metric_norm_dense",
     "flow_loss_mask_dense",
+    "flow_current_speed_dense",
 )
 
 
@@ -60,7 +61,7 @@ class FlowTokenProcessor(TokenProcessor):
     ) -> None:
         if bool(use_holonomic_model_only):
             raise ValueError(
-                "semi_mdg supports only all-agent non-holonomic control dynamics. "
+                "semi_mdg supports only MDG-style acceleration/yaw-rate dynamics. "
                 "Remove use_holonomic_model_only or set it to false."
             )
         super().__init__(
@@ -171,20 +172,30 @@ class FlowTokenProcessor(TokenProcessor):
         flow_clean_norm_dense = agent_store[f"{SIDECAR_PREFIX}flow_clean_norm_dense"]
         flow_clean_metric_norm_dense = agent_store[f"{SIDECAR_PREFIX}flow_clean_metric_norm_dense"]
         flow_loss_mask_dense = agent_store[f"{SIDECAR_PREFIX}flow_loss_mask_dense"].bool()
-        if flow_clean_norm_dense.shape[2] != expected_window_steps:
+        flow_current_speed_dense = agent_store[f"{SIDECAR_PREFIX}flow_current_speed_dense"]
+        expected_control_shape = flow_train_mask.shape + (expected_window_steps, self.flow_target_dim)
+        if flow_clean_norm_dense.shape != expected_control_shape:
             raise ValueError(
-                "semi_mdg sidecar flow_clean_norm_dense uses an unexpected horizon: "
-                f"expected={expected_window_steps}, actual={flow_clean_norm_dense.shape[2]}."
+                "semi_mdg sidecar flow_clean_norm_dense must have shape "
+                "[num_agent, 16, flow_window_steps, flow_target_dim], "
+                f"expected={tuple(expected_control_shape)}, got {tuple(flow_clean_norm_dense.shape)}."
             )
-        if flow_clean_metric_norm_dense.shape[2] != expected_window_steps:
+        expected_metric_shape = flow_train_mask.shape + (expected_window_steps, POSE_FLOW_DIM)
+        if flow_clean_metric_norm_dense.shape != expected_metric_shape:
             raise ValueError(
-                "semi_mdg sidecar flow_clean_metric_norm_dense uses an unexpected horizon: "
-                f"expected={expected_window_steps}, actual={flow_clean_metric_norm_dense.shape[2]}."
+                "semi_mdg sidecar flow_clean_metric_norm_dense must have shape "
+                "[num_agent, 16, flow_window_steps, 4], "
+                f"expected={tuple(expected_metric_shape)}, got {tuple(flow_clean_metric_norm_dense.shape)}."
             )
         if flow_loss_mask_dense.shape != flow_train_mask.shape + (expected_window_steps,):
             raise ValueError(
                 "semi_mdg sidecar flow_loss_mask_dense must have shape [num_agent, 16, flow_window_steps], "
                 f"got {tuple(flow_loss_mask_dense.shape)}."
+            )
+        if flow_current_speed_dense.shape != flow_train_mask.shape:
+            raise ValueError(
+                "semi_mdg sidecar flow_current_speed_dense must have shape [num_agent, 16], "
+                f"got {tuple(flow_current_speed_dense.shape)}."
             )
 
         tokenized_agent = {
@@ -219,6 +230,10 @@ class FlowTokenProcessor(TokenProcessor):
                 values=agent_shape[:, 0],
                 anchor_mask=flow_train_mask,
             ),
+            "flow_train_current_speed": self._pack_anchor_dense(
+                values=flow_current_speed_dense.unsqueeze(-1),
+                anchor_mask=flow_train_mask,
+            ).squeeze(-1),
         }
         for k in ["veh", "ped", "cyc"]:
             tokenized_agent[f"trajectory_token_{k}"] = getattr(
@@ -252,6 +267,7 @@ class FlowTokenProcessor(TokenProcessor):
         valid = processed_agent["valid"]
         pos = processed_agent["pos"]
         heading = processed_agent["heading"]
+        velocity = processed_agent["velocity"]
 
         ctx_sampled_idx = tokenized_agent["sampled_idx"][:, :FLOW_CONTEXT_TOKEN_COUNT].contiguous()
         ctx_sampled_pos = tokenized_agent["sampled_pos"][:, :FLOW_CONTEXT_TOKEN_COUNT].contiguous()
@@ -287,6 +303,7 @@ class FlowTokenProcessor(TokenProcessor):
                     tokenized_agent=tokenized_agent,
                     pos=pos,
                     heading=heading,
+                    velocity=velocity,
                     valid=valid,
                     train_mask=train_mask,
                     ctx_valid=ctx_valid,
@@ -327,6 +344,7 @@ class FlowTokenProcessor(TokenProcessor):
                 flow_clean_result = self._build_anchor_clean_norm(
                     pos=pos,
                     heading=heading,
+                    velocity=velocity,
                     current_pos=current_pos,
                     current_head=current_head,
                     agent_type=tokenized_agent["type"],
@@ -361,6 +379,7 @@ class FlowTokenProcessor(TokenProcessor):
                     self._build_anchor_clean_norm(
                         pos=pos,
                         heading=heading,
+                        velocity=velocity,
                         current_pos=current_pos,
                         current_head=current_head,
                         agent_type=tokenized_agent["type"],
@@ -430,6 +449,7 @@ class FlowTokenProcessor(TokenProcessor):
         flow_eval_metric_chunks: List[Tensor] = []
         flow_eval_agent_type_chunks: List[Tensor] = []
         flow_eval_agent_length_chunks: List[Tensor] = []
+        flow_eval_current_speed_chunks: List[Tensor] = []
         for anchor_offset, raw_step in enumerate(raw_current_steps):
             current_valid = valid[:, raw_step]
             future_valid = self._build_anchor_future_valid(valid=valid, raw_step=raw_step)
@@ -440,9 +460,13 @@ class FlowTokenProcessor(TokenProcessor):
 
             flow_eval_agent_type_chunks.append(tokenized_agent["type"][anchor_mask])
             flow_eval_agent_length_chunks.append(tokenized_agent["shape"][anchor_mask, 0])
+            flow_eval_current_speed_chunks.append(
+                torch.linalg.vector_norm(velocity[anchor_mask, raw_step, :2], dim=-1)
+            )
             flow_eval_clean_norm = self._build_anchor_clean_norm(
                 pos=pos,
                 heading=heading,
+                velocity=velocity,
                 current_pos=pos[:, raw_step],
                 current_head=heading[:, raw_step],
                 agent_type=tokenized_agent["type"],
@@ -455,6 +479,7 @@ class FlowTokenProcessor(TokenProcessor):
                 self._build_anchor_clean_norm(
                     pos=pos,
                     heading=heading,
+                    velocity=velocity,
                     current_pos=pos[:, raw_step],
                     current_head=heading[:, raw_step],
                     agent_type=tokenized_agent["type"],
@@ -491,6 +516,11 @@ class FlowTokenProcessor(TokenProcessor):
                     dtype=dtype,
                     device=device,
                 ),
+                "flow_eval_current_speed": self._concat_vector_chunks(
+                    chunks=flow_eval_current_speed_chunks,
+                    dtype=dtype,
+                    device=device,
+                ),
             }
         )
         return tokenized_agent
@@ -500,6 +530,7 @@ class FlowTokenProcessor(TokenProcessor):
         tokenized_agent: Dict[str, Tensor],
         pos: Tensor,
         heading: Tensor,
+        velocity: Tensor,
         valid: Tensor,
         train_mask: Tensor,
         ctx_valid: Tensor,
@@ -520,8 +551,10 @@ class FlowTokenProcessor(TokenProcessor):
         candidate_agent_indices: List[Tensor] = []
         candidate_current_pos: List[Tensor] = []
         candidate_current_head: List[Tensor] = []
+        candidate_current_speed: List[Tensor] = []
         candidate_future_pos: List[Tensor] = []
         candidate_future_head: List[Tensor] = []
+        candidate_future_velocity: List[Tensor] = []
         candidate_future_loss_mask: List[Tensor] = []
 
         for anchor_offset, raw_step in enumerate(raw_current_steps):
@@ -534,10 +567,15 @@ class FlowTokenProcessor(TokenProcessor):
             selected_agent_index = train_anchor_mask.nonzero(as_tuple=False).flatten()
             selected_current_pos = pos[selected_agent_index, raw_step]
             selected_current_head = heading[selected_agent_index, raw_step]
+            selected_current_speed = torch.linalg.vector_norm(
+                velocity[selected_agent_index, raw_step, :2],
+                dim=-1,
+            )
             selected_future_loss_mask = future_loss_mask[selected_agent_index]
-            future_pos, future_head = self._build_selected_anchor_future_window(
+            future_pos, future_head, future_velocity = self._build_selected_anchor_future_window(
                 pos=pos,
                 heading=heading,
+                velocity=velocity,
                 selected_agent_index=selected_agent_index,
                 selected_current_pos=selected_current_pos,
                 selected_current_head=selected_current_head,
@@ -556,8 +594,10 @@ class FlowTokenProcessor(TokenProcessor):
             candidate_agent_indices.append(selected_agent_index)
             candidate_current_pos.append(selected_current_pos)
             candidate_current_head.append(selected_current_head)
+            candidate_current_speed.append(selected_current_speed)
             candidate_future_pos.append(future_pos)
             candidate_future_head.append(future_head)
+            candidate_future_velocity.append(future_velocity)
             candidate_future_loss_mask.append(selected_future_loss_mask)
 
         if len(candidate_agent_indices) == 0:
@@ -589,6 +629,7 @@ class FlowTokenProcessor(TokenProcessor):
                         dtype=tokenized_agent["type"].dtype,
                     ),
                     "flow_train_agent_length": torch.zeros((0,), device=device, dtype=dtype),
+                    "flow_train_current_speed": torch.zeros((0,), device=device, dtype=dtype),
                 }
             )
             return tokenized_agent
@@ -597,19 +638,23 @@ class FlowTokenProcessor(TokenProcessor):
         agent_indices = torch.cat(candidate_agent_indices, dim=0)
         current_pos = torch.cat(candidate_current_pos, dim=0)
         current_head = torch.cat(candidate_current_head, dim=0)
+        current_speed = torch.cat(candidate_current_speed, dim=0)
         future_pos = torch.cat(candidate_future_pos, dim=0)
         future_head = torch.cat(candidate_future_head, dim=0)
+        future_velocity = torch.cat(candidate_future_velocity, dim=0)
         future_loss_mask = torch.cat(candidate_future_loss_mask, dim=0)
         agent_type = tokenized_agent["type"][agent_indices]
         agent_length = tokenized_agent["shape"][agent_indices, 0]
 
-        flow_train_clean_norm, round_trip_error_m = build_rolling_control_target_with_round_trip_error(
+        flow_train_clean_norm = build_rolling_control_target(
             future_pos=future_pos,
             future_head=future_head,
             current_pos=current_pos,
             current_head=current_head,
             agent_type=agent_type,
             agent_length=agent_length,
+            current_speed=current_speed,
+            future_velocity=future_velocity,
             pos_scale_m=self.control_pos_scale_m,
             vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
             pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
@@ -619,10 +664,7 @@ class FlowTokenProcessor(TokenProcessor):
             vehicle_no_slip_point_ratio=self.control_vehicle_no_slip_point_ratio,
             cyclist_no_slip_point_ratio=self.control_cyclist_no_slip_point_ratio,
         )
-        keep_mask = self._build_control_round_trip_keep_mask(
-            round_trip_error_m=round_trip_error_m,
-            future_loss_mask=future_loss_mask,
-        )
+        keep_mask = torch.ones((flow_train_clean_norm.shape[0],), device=device, dtype=torch.bool)
 
         kept_agent_indices = agent_indices[keep_mask]
         kept_anchor_offsets = anchor_offsets[keep_mask]
@@ -636,6 +678,7 @@ class FlowTokenProcessor(TokenProcessor):
         future_loss_mask = future_loss_mask[keep_mask]
         current_pos = current_pos[keep_mask]
         current_head = current_head[keep_mask]
+        current_speed = current_speed[keep_mask]
         future_pos = future_pos[keep_mask]
         future_head = future_head[keep_mask]
         agent_type = agent_type[keep_mask]
@@ -655,6 +698,7 @@ class FlowTokenProcessor(TokenProcessor):
                 "flow_train_loss_mask": future_loss_mask,
                 "flow_train_agent_type": agent_type,
                 "flow_train_agent_length": agent_length,
+                "flow_train_current_speed": current_speed,
             }
         )
         return tokenized_agent
@@ -663,12 +707,13 @@ class FlowTokenProcessor(TokenProcessor):
         self,
         pos: Tensor,
         heading: Tensor,
+        velocity: Tensor,
         selected_agent_index: Tensor,
         selected_current_pos: Tensor,
         selected_current_head: Tensor,
         raw_step: int,
         future_loss_mask: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """선택된 anchor-agent row의 valid prefix 미래 window를 만듭니다."""
         num_selected = selected_agent_index.shape[0]
         expected_shape = (num_selected, self.flow_window_steps)
@@ -685,12 +730,18 @@ class FlowTokenProcessor(TokenProcessor):
         future_start = raw_step + 1
         future_pos = selected_current_pos.unsqueeze(1).expand(-1, self.flow_window_steps, -1).clone()
         future_head = selected_current_head.unsqueeze(1).expand(-1, self.flow_window_steps).clone()
+        future_velocity = velocity[selected_agent_index, raw_step].unsqueeze(1).expand(
+            -1,
+            self.flow_window_steps,
+            -1,
+        ).clone()
 
         available_len = min(self.flow_window_steps, max(0, pos.shape[1] - future_start))
         if available_len > 0:
             step_slice = slice(future_start, future_start + available_len)
             future_pos[:, :available_len] = pos[selected_agent_index, step_slice]
             future_head[:, :available_len] = heading[selected_agent_index, step_slice]
+            future_velocity[:, :available_len] = velocity[selected_agent_index, step_slice]
 
         last_valid_index = valid_step_count - 1
         last_valid_pos = future_pos.gather(
@@ -700,6 +751,10 @@ class FlowTokenProcessor(TokenProcessor):
         last_valid_head = future_head.gather(
             dim=1,
             index=last_valid_index.view(-1, 1),
+        ).squeeze(1)
+        last_valid_velocity = future_velocity.gather(
+            dim=1,
+            index=last_valid_index.view(-1, 1, 1).expand(-1, 1, future_velocity.shape[-1]),
         ).squeeze(1)
         invalid_future_mask = ~future_loss_mask
         future_pos = torch.where(
@@ -712,7 +767,12 @@ class FlowTokenProcessor(TokenProcessor):
             last_valid_head.unsqueeze(1),
             future_head,
         )
-        return future_pos, future_head
+        future_velocity = torch.where(
+            invalid_future_mask.unsqueeze(-1),
+            last_valid_velocity.unsqueeze(1),
+            future_velocity,
+        )
+        return future_pos, future_head, future_velocity
 
     def _build_pose_space_target_from_future_window(
         self,
@@ -881,6 +941,7 @@ class FlowTokenProcessor(TokenProcessor):
         self,
         pos: Tensor,
         heading: Tensor,
+        velocity: Tensor,
         current_pos: Tensor,
         current_head: Tensor,
         agent_type: Tensor,
@@ -896,6 +957,7 @@ class FlowTokenProcessor(TokenProcessor):
         Args:
             pos: 전처리된 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
             heading: 전처리된 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            velocity: 전처리된 속도입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
             current_pos: 현재 coarse anchor 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 coarse anchor 방향입니다. shape은 ``[n_agent]`` 입니다.
             agent_type: agent 종류입니다. shape은 ``[n_agent]`` 입니다.
@@ -914,7 +976,7 @@ class FlowTokenProcessor(TokenProcessor):
             Tensor | Tuple[Tensor, Tensor]:
                 정규화된 미래 목표입니다.
                 pose-space에서는 ``[n_valid_anchor, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_anchor, flow_window_steps, 3]`` 입니다.
+                control-space에서는 ``[n_valid_anchor, flow_window_steps, 2]`` 입니다.
                 ``return_round_trip_error=True`` 이면 두 번째 값으로 meter 단위 복원 오차
                 ``[n_valid_anchor, flow_window_steps]`` 를 함께 돌려줍니다.
         """
@@ -930,6 +992,7 @@ class FlowTokenProcessor(TokenProcessor):
 
         selected_current_pos = current_pos[anchor_mask]
         selected_current_head = current_head[anchor_mask]
+        selected_current_speed = torch.linalg.vector_norm(velocity[anchor_mask, raw_step, :2], dim=-1)
         selected_agent_type = agent_type[anchor_mask]
         selected_agent_length = agent_length[anchor_mask] if agent_length is not None else None
         future_start = raw_step + 1
@@ -946,6 +1009,8 @@ class FlowTokenProcessor(TokenProcessor):
             future_pos = pos[anchor_mask, future_start:future_end]
             # future_head: [n_valid_anchor, flow_window_steps]
             future_head = heading[anchor_mask, future_start:future_end]
+            # future_velocity: [n_valid_anchor, flow_window_steps, 2]
+            future_velocity = velocity[anchor_mask, future_start:future_end]
         else:
             expected_shape = (num_valid_anchor, self.flow_window_steps)
             if tuple(future_loss_mask.shape) != expected_shape:
@@ -962,11 +1027,21 @@ class FlowTokenProcessor(TokenProcessor):
             future_pos = selected_current_pos.unsqueeze(1).expand(-1, self.flow_window_steps, -1).clone()
             # future_head: [n_valid_anchor, flow_window_steps]
             future_head = selected_current_head.unsqueeze(1).expand(-1, self.flow_window_steps).clone()
+            # future_velocity: [n_valid_anchor, flow_window_steps, 2]
+            future_velocity = velocity[anchor_mask, raw_step].unsqueeze(1).expand(
+                -1,
+                self.flow_window_steps,
+                -1,
+            ).clone()
 
             available_len = min(self.flow_window_steps, max(0, pos.shape[1] - future_start))
             if available_len > 0:
                 future_pos[:, :available_len] = pos[anchor_mask, future_start : future_start + available_len]
                 future_head[:, :available_len] = heading[anchor_mask, future_start : future_start + available_len]
+                future_velocity[:, :available_len] = velocity[
+                    anchor_mask,
+                    future_start : future_start + available_len,
+                ]
 
             last_valid_index = valid_step_count - 1
             # last_valid_pos: [n_valid_anchor, 2]
@@ -979,6 +1054,11 @@ class FlowTokenProcessor(TokenProcessor):
                 dim=1,
                 index=last_valid_index.view(-1, 1),
             ).squeeze(1)
+            # last_valid_velocity: [n_valid_anchor, 2]
+            last_valid_velocity = future_velocity.gather(
+                dim=1,
+                index=last_valid_index.view(-1, 1, 1).expand(-1, 1, future_velocity.shape[-1]),
+            ).squeeze(1)
             invalid_future_mask = ~future_loss_mask
             future_pos = torch.where(
                 invalid_future_mask.unsqueeze(-1),
@@ -990,6 +1070,11 @@ class FlowTokenProcessor(TokenProcessor):
                 last_valid_head.unsqueeze(1),
                 future_head,
             )
+            future_velocity = torch.where(
+                invalid_future_mask.unsqueeze(-1),
+                last_valid_velocity.unsqueeze(1),
+                future_velocity,
+            )
 
         if self.use_kinematic_control_flow and not force_pose_space:
             if return_round_trip_error:
@@ -1000,6 +1085,8 @@ class FlowTokenProcessor(TokenProcessor):
                     current_head=selected_current_head,
                     agent_type=selected_agent_type,
                     agent_length=selected_agent_length,
+                    current_speed=selected_current_speed,
+                    future_velocity=future_velocity,
                     pos_scale_m=self.control_pos_scale_m,
                     vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
                     pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
@@ -1016,6 +1103,8 @@ class FlowTokenProcessor(TokenProcessor):
                 current_head=selected_current_head,
                 agent_type=selected_agent_type,
                 agent_length=selected_agent_length,
+                current_speed=selected_current_speed,
+                future_velocity=future_velocity,
                 pos_scale_m=self.control_pos_scale_m,
                 vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
                 pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,

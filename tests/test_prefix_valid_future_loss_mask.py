@@ -36,16 +36,16 @@ def _build_target_processor(use_prefix_valid_future_loss_mask: bool) -> FlowToke
 
 def _build_kinematic_target_processor(use_prefix_valid_future_loss_mask: bool) -> FlowTokenProcessor:
     processor = _build_target_processor(use_prefix_valid_future_loss_mask)
-    processor.flow_target_dim = 3
+    processor.flow_target_dim = 2
     processor.use_kinematic_control_flow = True
     processor.use_holonomic_model_only = False
     processor.use_rolling_supervision = True
     processor.control_pos_scale_m = 1.0
-    processor.control_vehicle_yaw_scale_rad = 0.025
-    processor.control_pedestrian_yaw_scale_rad = 0.20
-    processor.control_cyclist_yaw_scale_rad = 0.06
-    processor.control_vehicle_no_slip_point_ratio = 0.2289518863
-    processor.control_cyclist_no_slip_point_ratio = 0.0495847873
+    processor.control_vehicle_yaw_scale_rad = 0.5
+    processor.control_pedestrian_yaw_scale_rad = 0.5
+    processor.control_cyclist_yaw_scale_rad = 0.5
+    processor.control_vehicle_no_slip_point_ratio = 0.0
+    processor.control_cyclist_no_slip_point_ratio = 0.0
     processor.control_round_trip_max_position_error_m = 0.5
     return processor
 
@@ -107,11 +107,13 @@ def _build_multi_agent_processed_agent() -> dict[str, torch.Tensor]:
     pos[3, :, 0] = raw_step * 0.2
     pos[3, :, 1] = torch.where(raw_step >= 71, torch.tensor(4.0), torch.zeros_like(raw_step))
     heading[3] = 0.0
+    velocity = torch.zeros_like(pos)
+    velocity[:, 1:] = (pos[:, 1:] - pos[:, :-1]) / 0.1
 
     valid[1, 82:] = False
     valid[2, 76:] = False
     valid[3, 72:] = False
-    return {"valid": valid, "pos": pos, "heading": heading}
+    return {"valid": valid, "pos": pos, "heading": heading, "velocity": velocity}
 
 
 def _build_flow_targets_anchor_loop_reference(
@@ -123,6 +125,7 @@ def _build_flow_targets_anchor_loop_reference(
     valid = processed_agent["valid"]
     pos = processed_agent["pos"]
     heading = processed_agent["heading"]
+    velocity = processed_agent["velocity"]
     ctx_valid = tokenized_agent["valid_mask"][:, :18].contiguous()
     num_agent = pos.shape[0]
     num_anchor = 16
@@ -138,6 +141,7 @@ def _build_flow_targets_anchor_loop_reference(
     flow_train_loss_mask_chunks = []
     flow_train_agent_type_chunks = []
     flow_train_agent_length_chunks = []
+    flow_train_current_speed_chunks = []
 
     for anchor_offset, raw_step in enumerate(raw_current_steps):
         future_loss_mask = processor._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
@@ -146,9 +150,10 @@ def _build_flow_targets_anchor_loop_reference(
             continue
 
         selected_future_loss_mask = future_loss_mask[train_anchor_mask]
-        flow_train_clean_norm, round_trip_error_m = processor._build_anchor_clean_norm(
+        flow_train_clean_norm = processor._build_anchor_clean_norm(
             pos=pos,
             heading=heading,
+            velocity=velocity,
             current_pos=pos[:, raw_step],
             current_head=heading[:, raw_step],
             agent_type=tokenized_agent["type"],
@@ -156,20 +161,7 @@ def _build_flow_targets_anchor_loop_reference(
             anchor_mask=train_anchor_mask,
             raw_step=raw_step,
             future_loss_mask=selected_future_loss_mask,
-            return_round_trip_error=True,
         )
-        keep_mask = processor._build_control_round_trip_keep_mask(
-            round_trip_error_m=round_trip_error_m,
-            future_loss_mask=selected_future_loss_mask,
-        )
-        if not bool(keep_mask.all().item()):
-            selected_agent_index = train_anchor_mask.nonzero(as_tuple=False).flatten()
-            kept_agent_index = selected_agent_index[keep_mask]
-            filtered_train_anchor_mask = torch.zeros_like(train_anchor_mask)
-            filtered_train_anchor_mask[kept_agent_index] = True
-            train_anchor_mask = filtered_train_anchor_mask
-            flow_train_clean_norm = flow_train_clean_norm[keep_mask]
-            selected_future_loss_mask = selected_future_loss_mask[keep_mask]
 
         flow_train_mask[:, anchor_offset] = train_anchor_mask
         if not bool(train_anchor_mask.any().item()):
@@ -178,6 +170,7 @@ def _build_flow_targets_anchor_loop_reference(
         flow_train_metric_norm = processor._build_anchor_clean_norm(
             pos=pos,
             heading=heading,
+            velocity=velocity,
             current_pos=pos[:, raw_step],
             current_head=heading[:, raw_step],
             agent_type=tokenized_agent["type"],
@@ -192,6 +185,9 @@ def _build_flow_targets_anchor_loop_reference(
         flow_train_loss_mask_chunks.append(selected_future_loss_mask)
         flow_train_agent_type_chunks.append(tokenized_agent["type"][train_anchor_mask])
         flow_train_agent_length_chunks.append(tokenized_agent["shape"][train_anchor_mask, 0])
+        flow_train_current_speed_chunks.append(
+            torch.linalg.vector_norm(velocity[train_anchor_mask, raw_step, :2], dim=-1)
+        )
 
     processor._assert_flow_train_anchor_context_valid(
         flow_train_mask=flow_train_mask,
@@ -224,6 +220,11 @@ def _build_flow_targets_anchor_loop_reference(
             dtype=pos.dtype,
             device=pos.device,
         ),
+        "flow_train_current_speed": processor._concat_vector_chunks(
+            chunks=flow_train_current_speed_chunks,
+            dtype=pos.dtype,
+            device=pos.device,
+        ),
     }
 
 
@@ -231,10 +232,13 @@ def _build_processed_agent_for_full_womd_horizon() -> dict[str, torch.Tensor]:
     raw_step = torch.arange(91, dtype=torch.float32)
     pos = torch.zeros((1, 91, 2), dtype=torch.float32)
     pos[0, :, 0] = raw_step
+    velocity = torch.zeros_like(pos)
+    velocity[:, 1:, 0] = 10.0
     return {
         "valid": torch.ones((1, 91), dtype=torch.bool),
         "pos": pos,
         "heading": torch.zeros((1, 91), dtype=torch.float32),
+        "velocity": velocity,
     }
 
 
@@ -377,6 +381,7 @@ def test_batched_kinematic_flow_targets_match_anchor_loop_reference() -> None:
     assert torch.equal(actual["flow_train_loss_mask"], expected["flow_train_loss_mask"])
     assert torch.equal(actual["flow_train_agent_type"], expected["flow_train_agent_type"])
     torch.testing.assert_close(actual["flow_train_agent_length"], expected["flow_train_agent_length"])
+    torch.testing.assert_close(actual["flow_train_current_speed"], expected["flow_train_current_speed"])
     torch.testing.assert_close(actual["flow_train_clean_norm"], expected["flow_train_clean_norm"])
     torch.testing.assert_close(
         actual["flow_train_clean_metric_norm"],

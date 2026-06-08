@@ -4,10 +4,10 @@
 #
 # This intentionally inherits the full 4x H100 pretrain recipe and changes only
 # the Flow Matching target space. With the flag below:
-#   * token processor builds GT labels on the fly as [delta_s, delta_n, delta_yaw].
-#   * decoder flow state dimension switches from pose-space 4D to control-space 3D.
+#   * token processor builds GT labels on the fly as [acceleration, yaw_rate].
+#   * decoder flow state dimension switches from pose-space 4D to control-space 2D.
 #   * metric/rollout paths restore predictions back to pose-space internally.
-#   * training masks GT anchors whose control round-trip position error is too large.
+#   * MDG-style training keeps all valid GT anchors without round-trip filtering.
 
 defaults:
   - pre_bc_flow_4_h100
@@ -19,7 +19,7 @@ model:
       use_kinematic_control_flow: true
       use_rolling_supervision: true
       control_pos_scale_m: 1.0
-      control_vehicle_yaw_scale_rad: 0.025
-      control_pedestrian_yaw_scale_rad: 0.20
-      control_cyclist_yaw_scale_rad: 0.06
+      control_vehicle_yaw_scale_rad: 0.5
+      control_pedestrian_yaw_scale_rad: 0.5
+      control_cyclist_yaw_scale_rad: 0.5
       control_round_trip_max_position_error_m: 0.5

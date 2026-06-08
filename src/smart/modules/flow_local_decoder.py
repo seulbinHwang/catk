@@ -954,11 +954,13 @@ class ContinuousCommitBridge:
         current_head: torch.Tensor,
         agent_type: torch.Tensor | None = None,
         agent_length: torch.Tensor | None = None,
+        current_speed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         y_hat_norm = self._flow_output_to_pose_norm(
             y_hat_norm=y_hat_norm,
             agent_type=agent_type,
             agent_length=agent_length,
+            current_speed=current_speed,
         )
         first_chunk = y_hat_norm[:, : self.commit_steps].clone()
         first_chunk[..., :2] = first_chunk[..., :2] * self.pos_scale_m
@@ -982,6 +984,7 @@ class ContinuousCommitBridge:
         y_hat_norm: torch.Tensor,
         agent_type: torch.Tensor | None = None,
         agent_length: torch.Tensor | None = None,
+        current_speed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Closed-loop commit paths consume the common pose-space flow view."""
         if not self.use_kinematic_control_flow:
@@ -992,6 +995,7 @@ class ContinuousCommitBridge:
             control_norm=y_hat_norm,
             agent_type=agent_type,
             agent_length=agent_length,
+            current_speed=current_speed,
             pos_scale_m=self.control_pos_scale_m,
             vehicle_yaw_scale_rad=self.control_vehicle_yaw_scale_rad,
             pedestrian_yaw_scale_rad=self.control_pedestrian_yaw_scale_rad,
@@ -1555,7 +1559,7 @@ class ContinuousCommitBridge:
 
         Args:
             y_hat_norm: raw FM 2초 미래입니다. pose-space에서는 ``[n_agent, 20, 4]``,
-                control-space에서는 ``[n_agent, 20, 3]`` 입니다.
+                control-space에서는 ``[n_agent, 20, 2]`` 입니다.
             current_pos: 현재 중심점입니다. shape은 ``[n_agent, 2]`` 입니다.
             current_head: 현재 방향입니다. shape은 ``[n_agent]`` 입니다.
             exec_pos_history: 최근 실제 fine history 입니다. shape은 ``[n_agent, 6, 2]`` 입니다.
