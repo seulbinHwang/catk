@@ -37,6 +37,12 @@ DEFAULT_TASK_NAME = (
     "sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle_oomretry"
 )
 DEFAULT_SESSION = "catk-self-forced-dmd-a100x4-testa"
+DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT = (
+    "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest"
+)
+DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME = (
+    "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6"
+)
 
 DEFAULT_EXTRA_OVERRIDES = " ".join(
     [
@@ -112,6 +118,12 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("RANDOM_TERMINAL_POLICY", args.random_terminal_policy),
         export_line("BACKPROP_LAST_K", args.backprop_last_k),
         export_line("ESTIMATOR_WARMUP_EPOCHS", args.estimator_warmup_epochs),
+        export_line("ESTIMATOR_WARMUP_BANK_ENABLED", str(args.use_estimator_warmup_bank).lower()),
+        export_line("ESTIMATOR_WARMUP_BANK_ARTIFACT", args.estimator_warmup_bank_artifact),
+        export_line("ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME", args.estimator_warmup_bank_artifact_name),
+        export_line("ESTIMATOR_WARMUP_BANK_ENTITY", args.estimator_warmup_bank_entity),
+        export_line("ESTIMATOR_WARMUP_BANK_PROJECT", args.estimator_warmup_bank_project),
+        export_line("ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS", str(args.estimator_warmup_bank_adjust_max_epochs).lower()),
         export_line("SELF_FORCED_USE_STOP_MOTION", args.self_forced_use_stop_motion),
         export_line("DECODER_USE_STOP_MOTION", args.decoder_use_stop_motion),
         export_line("UNFROZEN_RANGE", args.unfrozen_range),
@@ -399,6 +411,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-terminal-policy", default="all")
     parser.add_argument("--backprop-last-k", default="8")
     parser.add_argument("--estimator-warmup-epochs", default="1")
+    parser.add_argument(
+        "--use-estimator-warmup-bank",
+        dest="use_estimator_warmup_bank",
+        action="store_true",
+        help="Enable the shared generated-estimator warmup W&B bank. This is the default.",
+    )
+    parser.add_argument(
+        "--no-estimator-warmup-bank",
+        dest="use_estimator_warmup_bank",
+        action="store_false",
+        help="Disable the shared generated-estimator warmup W&B bank for this run.",
+    )
+    parser.add_argument(
+        "--estimator-warmup-bank-artifact",
+        default=DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT,
+    )
+    parser.add_argument(
+        "--estimator-warmup-bank-artifact-name",
+        default=DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME,
+    )
+    parser.add_argument("--estimator-warmup-bank-entity", default="jksg01019-naver-labs")
+    parser.add_argument("--estimator-warmup-bank-project", default="SMART-FLOW")
+    parser.add_argument(
+        "--no-estimator-warmup-bank-adjust-max-epochs",
+        dest="estimator_warmup_bank_adjust_max_epochs",
+        action="store_false",
+    )
+    parser.set_defaults(estimator_warmup_bank_adjust_max_epochs=True)
+    parser.set_defaults(use_estimator_warmup_bank=True)
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="false")
     parser.add_argument("--unfrozen-range", default="middle")
@@ -447,6 +488,8 @@ def main() -> None:
     print(f"[launcher] artifact:  {args.wandb_pretrain_artifact}")
     print(f"[launcher] ckpt path: {args.pretrain_ckpt}")
     print(f"[launcher] bs fallback: {args.initial_bs}->{args.min_bs} step {args.oom_step}")
+    if args.use_estimator_warmup_bank:
+        print(f"[launcher] estimator bank: {args.estimator_warmup_bank_artifact}")
 
     exec_in_pod(args, render_start_command(args))
 

@@ -46,15 +46,15 @@
 #   CLEAN_DMD_NORMALIZER_EPS=      Optional Clean-DMD stable scale floor override.
 #   CLEAN_DMD_TAU_LOW=             Optional Clean-DMD guidance tau lower bound.
 #   CLEAN_DMD_TAU_HIGH=            Optional Clean-DMD guidance tau upper bound.
-#   ESTIMATOR_WARMUP_BANK_ENABLED=false
+#   ESTIMATOR_WARMUP_BANK_ENABLED=true
 #                                  true이면 fresh finetune 시작 전에 W&B
 #                                  generated-estimator bank에서
 #                                  (warmup_epochs, lr) entry를 찾아 warmup을
 #                                  건너뜁니다.
-#   ESTIMATOR_WARMUP_BANK_ARTIFACT=
+#   ESTIMATOR_WARMUP_BANK_ARTIFACT=generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest
 #                                  W&B bank artifact name/ref. 예:
 #                                  generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest
-#   ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME=
+#   ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME=generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6
 #                                  warmup을 새로 돌린 뒤 upsert할 artifact name.
 #   ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS=true
 #                                  bank hit 시 max_epochs에서 warmup epoch 수를
@@ -85,12 +85,14 @@ MIN_BS="${MIN_BS:-2}"
 CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-4}"
 PRETRAIN_CKPT="${PRETRAIN_CKPT:?must set PRETRAIN_CKPT to the 2s-horizon pretrained Generator ckpt}"
-ESTIMATOR_WARMUP_BANK_ENABLED="${ESTIMATOR_WARMUP_BANK_ENABLED:-false}"
-ESTIMATOR_WARMUP_BANK_ARTIFACT="${ESTIMATOR_WARMUP_BANK_ARTIFACT:-}"
+DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6"
+DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT="${DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME}:latest"
+ESTIMATOR_WARMUP_BANK_ENABLED="${ESTIMATOR_WARMUP_BANK_ENABLED:-true}"
+ESTIMATOR_WARMUP_BANK_ARTIFACT="${ESTIMATOR_WARMUP_BANK_ARTIFACT:-$DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT}"
 ESTIMATOR_WARMUP_BANK_ENTITY="${ESTIMATOR_WARMUP_BANK_ENTITY:-${WANDB_ENTITY:-jksg01019-naver-labs}}"
 ESTIMATOR_WARMUP_BANK_PROJECT="${ESTIMATOR_WARMUP_BANK_PROJECT:-${WANDB_PROJECT:-SMART-FLOW}}"
 ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS="${ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS:-true}"
-ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME:-}"
+ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME:-$DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME}"
 ESTIMATOR_WARMUP_BANK_INIT_PATH=""
 ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH=""
 ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP="${ESTIMATOR_WARMUP_EPOCHS:-}"

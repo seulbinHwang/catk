@@ -39,6 +39,12 @@ DEFAULT_TASK_NAME = (
     "use_stop_motion_false_estimator_warmup_1_lr1e-6_bs22"
 )
 DEFAULT_SESSION = "catk-sf-a100x4x2-stopfalse-warmup1"
+DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT = (
+    "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest"
+)
+DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME = (
+    "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6"
+)
 
 
 def shq(value: object) -> str:
@@ -96,6 +102,12 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
         export_line("SCORER_SCENE_NUM", args.scorer_scene_num),
         export_line("UNFROZEN_RANGE", args.unfrozen_range),
         export_line("ESTIMATOR_WARMUP_EPOCHS", args.estimator_warmup_epochs),
+        export_line("ESTIMATOR_WARMUP_BANK_ENABLED", str(args.use_estimator_warmup_bank).lower()),
+        export_line("ESTIMATOR_WARMUP_BANK_ARTIFACT", args.estimator_warmup_bank_artifact),
+        export_line("ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME", args.estimator_warmup_bank_artifact_name),
+        export_line("ESTIMATOR_WARMUP_BANK_ENTITY", args.estimator_warmup_bank_entity),
+        export_line("ESTIMATOR_WARMUP_BANK_PROJECT", args.estimator_warmup_bank_project),
+        export_line("ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS", str(args.estimator_warmup_bank_adjust_max_epochs).lower()),
         export_line("SELF_FORCED_USE_STOP_MOTION", args.self_forced_use_stop_motion),
         export_line("LOG_DIR", args.log_dir),
         export_line("RUN_ROOT", run_root(args)),
@@ -143,6 +155,12 @@ set +a
 
 cd "$PROJECT_ROOT"
 mkdir -p "$RUN_ROOT" "$RETRY_STATE_DIR"
+
+ESTIMATOR_WARMUP_BANK_INIT_PATH=""
+ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH=""
+ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP="${{ESTIMATOR_WARMUP_EPOCHS:-}}"
+ESTIMATOR_WARMUP_BANK_LOADED_WARMUP=0
+ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="${{ESTIMATOR_WARMUP_EPOCHS:-0}}"
 
 echo "[self-forced-a100x4x2] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
 echo "[self-forced-a100x4x2] started at $(date '+%F %T')"
@@ -757,6 +775,76 @@ find_latest_self_forced_ckpt() {{
   }} | head -1
 }}
 
+apply_estimator_warmup_bank_progress() {{
+  local loaded_warmup="$1"
+  local remaining_warmup="$2"
+  local context="$3"
+
+  ESTIMATOR_WARMUP_BANK_LOADED_WARMUP="$loaded_warmup"
+  ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="$remaining_warmup"
+  if [[ "$ESTIMATOR_WARMUP_BANK_ADJUST_MAX_EPOCHS" == "true" && "${{MAX_EPOCHS:-}}" =~ ^[0-9]+$ ]]; then
+    local adjusted_epochs=$(( MAX_EPOCHS - ESTIMATOR_WARMUP_BANK_LOADED_WARMUP ))
+    if (( adjusted_epochs < 1 )); then
+      adjusted_epochs=1
+    fi
+    echo "[self-forced-a100x4x2] adjusting MAX_EPOCHS ${{MAX_EPOCHS}} -> ${{adjusted_epochs}} after estimator-bank $context"
+    MAX_EPOCHS="$adjusted_epochs"
+  fi
+  ESTIMATOR_WARMUP_EPOCHS="$ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP"
+}}
+
+maybe_prepare_estimator_warmup_bank() {{
+  if [[ "${{ESTIMATOR_WARMUP_BANK_ENABLED:-false}}" != "true" ]]; then
+    return 0
+  fi
+  if [[ -z "${{ESTIMATOR_WARMUP_BANK_ARTIFACT:-}}" ]]; then
+    echo "[self-forced-a100x4x2] estimator warmup bank enabled but artifact is empty; running warmup normally"
+    return 0
+  fi
+  if [[ -z "${{ESTIMATOR_WARMUP_EPOCHS:-}}" || "${{ESTIMATOR_WARMUP_EPOCHS}}" == "0" ]]; then
+    return 0
+  fi
+  if [[ -z "${{CATK_LR:-}}" ]]; then
+    echo "[self-forced-a100x4x2] estimator warmup bank enabled but CATK_LR is empty; running warmup normally"
+    return 0
+  fi
+  if [[ -n "$(find_latest_self_forced_ckpt)" ]]; then
+    echo "[self-forced-a100x4x2] existing self-forced checkpoint found; keeping resume path and skipping estimator-bank resolve"
+    return 0
+  fi
+
+  local bank_root="$RUN_ROOT/estimator_bank/$(hostname)"
+  mkdir -p "$bank_root"
+  local requested_warmup="${{ESTIMATOR_WARMUP_EPOCHS}}"
+  local resolved_env="$bank_root/resolved_warmup_${{requested_warmup}}_lr_${{CATK_LR}}.env"
+  ESTIMATOR_WARMUP_BANK_INIT_PATH="$bank_root/resolved_for_warmup_${{requested_warmup}}_lr_${{CATK_LR}}_generated_estimator.pt"
+  ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="$bank_root/snapshot_warmup_${{requested_warmup}}_lr_${{CATK_LR}}_generated_estimator.pt"
+
+  echo "[self-forced-a100x4x2] checking estimator warmup bank: artifact=${{ESTIMATOR_WARMUP_BANK_ARTIFACT}} requested_warmup=${{requested_warmup}} lr=${{CATK_LR}}"
+  if python scripts/self_forced_estimator_bank.py resolve \
+      --artifact "$ESTIMATOR_WARMUP_BANK_ARTIFACT" \
+      --warmup-epochs "$requested_warmup" \
+      --lr "$CATK_LR" \
+      --output "$ESTIMATOR_WARMUP_BANK_INIT_PATH" \
+      --env-output "$resolved_env" \
+      --entity "$ESTIMATOR_WARMUP_BANK_ENTITY" \
+      --project "$ESTIMATOR_WARMUP_BANK_PROJECT"; then
+    # shellcheck disable=SC1090
+    source "$resolved_env"
+    local loaded_warmup="${{ESTIMATOR_WARMUP_BANK_RESOLVED_WARMUP:-0}}"
+    local remaining_warmup="${{ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP:-0}}"
+    echo "[self-forced-a100x4x2] estimator bank hit: loaded_warmup=${{loaded_warmup}} requested_warmup=${{requested_warmup}} remaining_warmup=${{remaining_warmup}}"
+    apply_estimator_warmup_bank_progress "$loaded_warmup" "$remaining_warmup" "hit"
+    if [[ "$remaining_warmup" == "0" ]]; then
+      ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH=""
+    fi
+  else
+    echo "[self-forced-a100x4x2] estimator bank miss; warmup will run and snapshot will be saved to $ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH"
+    ESTIMATOR_WARMUP_BANK_LOADED_WARMUP=0
+    ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="$requested_warmup"
+  fi
+}}
+
 write_attempt_status() {{
   local status="$1"
   local oom="$2"
@@ -929,6 +1017,9 @@ while (( bs >= MIN_BS )); do
     echo "[self-forced-a100x4x2] refusing to start $attempt_tag because checkpoint/action plan is not synchronized" >&2
     exit 1
   fi
+  if (( attempt == 1 )) && [[ "$action" == "finetune" ]]; then
+    maybe_prepare_estimator_warmup_bank || exit $?
+  fi
 
   extra_overrides=()
   if [[ -n "${{CATK_EXTRA_OVERRIDES:-}}" ]]; then
@@ -981,6 +1072,21 @@ while (( bs >= MIN_BS )); do
   if [[ -n "${{TRAIN_MEMORY_BALANCED_BATCHES:-}}" ]]; then
     torchrun_args+=(data.train_memory_balanced_batches="$TRAIN_MEMORY_BALANCED_BATCHES")
   fi
+  if [[ "$action" == "finetune" && -n "${{ESTIMATOR_WARMUP_BANK_INIT_PATH:-}}" && -f "$ESTIMATOR_WARMUP_BANK_INIT_PATH" ]]; then
+    torchrun_args+=(model.model_config.self_forced.generated_estimator_init_path="$ESTIMATOR_WARMUP_BANK_INIT_PATH")
+    if [[ "${{ESTIMATOR_WARMUP_EPOCHS:-0}}" == "0" ]]; then
+      torchrun_args+=(model.model_config.self_forced.generated_estimator_skip_warmup_on_load=true)
+    else
+      torchrun_args+=(model.model_config.self_forced.generated_estimator_skip_warmup_on_load=false)
+    fi
+  fi
+  if [[ -n "${{ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH:-}}" && "${{ESTIMATOR_WARMUP_BANK_ENABLED:-false}}" == "true" ]]; then
+    torchrun_args+=(model.model_config.self_forced.generated_estimator_bank_snapshot_path="$ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH")
+  fi
+  if [[ -n "${{ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP:-}}" && "${{ESTIMATOR_WARMUP_BANK_ENABLED:-false}}" == "true" ]]; then
+    torchrun_args+=(model.model_config.self_forced.generated_estimator_bank_target_warmup_epochs="$ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP")
+    torchrun_args+=(model.model_config.self_forced.generated_estimator_bank_loaded_warmup_epochs="$ESTIMATOR_WARMUP_BANK_LOADED_WARMUP")
+  fi
   torchrun_args+=("${{extra_overrides[@]}}")
 
   echo
@@ -1007,6 +1113,20 @@ while (( bs >= MIN_BS )); do
 
   if ! global_attempt_has_failure; then
     echo "[self-forced-a100x4x2] training completed successfully at bs=$bs"
+    if (( NODE_RANK == 0 )) \
+        && [[ "${{ESTIMATOR_WARMUP_BANK_ENABLED:-false}}" == "true" ]] \
+        && [[ -n "${{ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME:-}}" ]] \
+        && [[ -n "${{ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH:-}}" ]] \
+        && [[ -f "$ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH" ]] \
+        && [[ -n "${{ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP:-}}" ]]; then
+      echo "[self-forced-a100x4x2] uploading generated-estimator warmup snapshot to W&B bank: $ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME"
+      python scripts/self_forced_estimator_bank.py upsert \
+        --artifact-name "$ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME" \
+        --entry "${{ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP}}:${{CATK_LR}}:${{ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH}}" \
+        --entity "$ESTIMATOR_WARMUP_BANK_ENTITY" \
+        --project "$ESTIMATOR_WARMUP_BANK_PROJECT" \
+        --run-name "${{TASK_NAME}}_generated_estimator_bank"
+    fi
     exit 0
   fi
 
@@ -1229,6 +1349,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scorer-scene-num", type=int, default=1680)
     parser.add_argument("--unfrozen-range", default="middle")
     parser.add_argument("--estimator-warmup-epochs", type=int, default=1)
+    parser.add_argument(
+        "--use-estimator-warmup-bank",
+        dest="use_estimator_warmup_bank",
+        action="store_true",
+        help="Enable the shared generated-estimator warmup W&B bank. This is the default.",
+    )
+    parser.add_argument(
+        "--no-estimator-warmup-bank",
+        dest="use_estimator_warmup_bank",
+        action="store_false",
+        help="Disable the shared generated-estimator warmup W&B bank for this run.",
+    )
+    parser.add_argument(
+        "--estimator-warmup-bank-artifact",
+        default=DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT,
+    )
+    parser.add_argument(
+        "--estimator-warmup-bank-artifact-name",
+        default=DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME,
+    )
+    parser.add_argument("--estimator-warmup-bank-entity", default="jksg01019-naver-labs")
+    parser.add_argument("--estimator-warmup-bank-project", default="SMART-FLOW")
+    parser.add_argument(
+        "--no-estimator-warmup-bank-adjust-max-epochs",
+        dest="estimator_warmup_bank_adjust_max_epochs",
+        action="store_false",
+    )
+    parser.set_defaults(estimator_warmup_bank_adjust_max_epochs=True)
+    parser.set_defaults(use_estimator_warmup_bank=True)
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="")
     parser.add_argument("--learning-rate", default="1.0e-6")

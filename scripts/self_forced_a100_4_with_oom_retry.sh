@@ -17,5 +17,8 @@ export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-8}"
 export TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-8}"
 export TRAIN_EPOCH_SAMPLE_FRACTION="${TRAIN_EPOCH_SAMPLE_FRACTION:-0.25}"
 export TRAIN_MEMORY_BALANCED_BATCHES="${TRAIN_MEMORY_BALANCED_BATCHES:-true}"
+export ESTIMATOR_WARMUP_BANK_ENABLED="${ESTIMATOR_WARMUP_BANK_ENABLED:-true}"
+export ESTIMATOR_WARMUP_BANK_ARTIFACT="${ESTIMATOR_WARMUP_BANK_ARTIFACT:-generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest}"
+export ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME:-generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6}"
 
 exec bash scripts/self_forced_h100_4_with_oom_retry.sh "$@"

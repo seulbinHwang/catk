@@ -2161,10 +2161,11 @@ active-control mask 규칙이라 위 세 필터와 무관하게 기존처럼 최
 #### Generated estimator warmup bank
 
 같은 pretrained Generator checkpoint와 같은 generated-estimator LR을 쓰는 self-forced DMD 실험에서는
-estimator warmup만 반복해서 다시 돌릴 필요가 없습니다. `scripts/self_forced_h100_4_with_oom_retry.sh`
-계열 launcher는 W&B artifact에 저장된 generated estimator state를 먼저 찾고, `(estimator_warmup_epochs, lr)`
-조합이 정확히 일치하면 warmup을 건너뜁니다. 정확히 같은 entry가 없으면, 요청한 warmup보다 작으면서
-가장 가까운 entry를 불러와 남은 warmup epoch만 이어서 수행합니다.
+estimator warmup만 반복해서 다시 돌릴 필요가 없습니다. H100x3/H100x4/A100x4/A100x4x2 self-forced
+launcher는 기본적으로 W&B generated-estimator bank를 켭니다. 실행 시작 시
+`(estimator_warmup_epochs, lr)` 조합을 먼저 찾고, 정확히 일치하면 warmup을
+건너뜁니다. 정확히 같은 entry가 없으면, 요청한 warmup보다 작으면서 가장 가까운 entry를 불러와
+남은 warmup epoch만 이어서 수행합니다.
 
 현재 epoch 61 pretrain artifact `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` 기준으로
 아래 generated-estimator bank를 만들어 두었습니다.
@@ -2179,16 +2180,26 @@ jksg01019-naver-labs/SMART-FLOW/generated-estimator-warmup-bank-pretrain-x5f9g0c
 | warmup 2 | `1e-6` | warmup 2 epoch 종료 시점 | `self_forced_generated_estimator` state only |
 | warmup 4 | `1e-6` | warmup 4 epoch 종료 시점 | `self_forced_generated_estimator` state only |
 
-사용 예시는 다음과 같습니다.
+기본 bank 설정은 self-forced launcher 전반에서 공통입니다.
+
+```bash
+ESTIMATOR_WARMUP_BANK_ENABLED=true
+ESTIMATOR_WARMUP_BANK_ARTIFACT=generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest
+ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME=generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6
+```
+
+따라서 보통은 별도 옵션 없이 실행하면 됩니다.
 
 ```bash
 python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
   --replace \
-  --use-estimator-warmup-bank \
   --estimator-warmup-epochs 2 \
   --max-epochs 4 \
   --task-name flow_self_forced_dmd_h100x3_hsb31_warmup2_bank
 ```
+
+임시로 bank를 쓰지 않으려면 launcher에서는 `--no-estimator-warmup-bank`를, shell wrapper 직접 실행에서는
+`ESTIMATOR_WARMUP_BANK_ENABLED=false`를 넘깁니다.
 
 bank hit가 나면 실행 스크립트는 다음을 자동으로 적용합니다.
 

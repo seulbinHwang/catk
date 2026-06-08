@@ -29,5 +29,8 @@ export UNFROZEN_RANGE="${UNFROZEN_RANGE:-middle}"
 export RANDOM_TERMINAL_SCOPE="${RANDOM_TERMINAL_SCOPE:-global_batch}"
 export RANDOM_TERMINAL_POLICY="${RANDOM_TERMINAL_POLICY:-all}"
 export BACKPROP_LAST_K="${BACKPROP_LAST_K:-8}"
+export ESTIMATOR_WARMUP_BANK_ENABLED="${ESTIMATOR_WARMUP_BANK_ENABLED:-true}"
+export ESTIMATOR_WARMUP_BANK_ARTIFACT="${ESTIMATOR_WARMUP_BANK_ARTIFACT:-generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest}"
+export ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME:-generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6}"
 
 exec bash scripts/self_forced_h100_4_with_oom_retry.sh "$@"

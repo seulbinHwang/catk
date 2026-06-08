@@ -420,7 +420,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-terminal-policy", default="all")
     parser.add_argument("--backprop-last-k", default="8")
     parser.add_argument("--estimator-warmup-epochs", default="1")
-    parser.add_argument("--use-estimator-warmup-bank", action="store_true")
+    parser.add_argument(
+        "--use-estimator-warmup-bank",
+        dest="use_estimator_warmup_bank",
+        action="store_true",
+        help="Enable the shared generated-estimator warmup W&B bank. This is the default.",
+    )
+    parser.add_argument(
+        "--no-estimator-warmup-bank",
+        dest="use_estimator_warmup_bank",
+        action="store_false",
+        help="Disable the shared generated-estimator warmup W&B bank for this run.",
+    )
     parser.add_argument(
         "--estimator-warmup-bank-artifact",
         default="generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest",
@@ -437,6 +448,7 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
     )
     parser.set_defaults(estimator_warmup_bank_adjust_max_epochs=True)
+    parser.set_defaults(use_estimator_warmup_bank=True)
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="false")
     parser.add_argument("--unfrozen-range", default="middle")
