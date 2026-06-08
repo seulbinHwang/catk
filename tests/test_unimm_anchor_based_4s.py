@@ -810,27 +810,29 @@ def test_unimm_inference_samples_components_instead_of_argmax(tmp_path: Path):
     assert model._sample_component(logits, None).shape == (256,)
 
 
-def test_unimm_full_top_k_skips_topk_kernel(tmp_path: Path, monkeypatch):
+def test_unimm_default_top_k_2048_skips_topk_kernel(tmp_path: Path, monkeypatch):
     anchor_path = tmp_path / "anchors.pkl"
     with anchor_path.open("wb") as handle:
-        pickle.dump(_make_anchor_payload(num_anchors=8), handle)
+        pickle.dump(_make_anchor_payload(num_anchors=2048), handle)
 
     model = UniMMAnchorBased4s(
-        _make_model_cfg(anchor_path, inference_top_k=8, inference_top_p=1.0)
+        _make_model_cfg(anchor_path, inference_top_k=2048, inference_top_p=1.0)
     ).eval()
+    assert model.spec.num_anchors == 2048
+    assert model.inference_top_k == model.spec.num_anchors
 
     def fail_topk(*args, **kwargs):
         raise AssertionError("full-anchor top-k should not call torch.topk")
 
     monkeypatch.setattr(torch, "topk", fail_topk)
 
-    logits = torch.zeros(32, 8)
+    logits = torch.zeros(32, 2048)
     generator = torch.Generator(device=logits.device)
     generator.manual_seed(0)
     sampled = model._sample_component(logits, generator)
 
     assert sampled.shape == (32,)
-    assert sampled.max().item() < 8
+    assert sampled.max().item() < 2048
 
 
 def test_unimm_rejects_invalid_inference_sampling_config(tmp_path: Path):
