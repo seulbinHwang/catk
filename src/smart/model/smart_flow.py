@@ -1826,7 +1826,49 @@ class SMARTFlow(LightningModule):
         encoder_state = self.encoder.state_dict()
         self.self_forced_target_teacher.load_state_dict(encoder_state)
         self.self_forced_generated_estimator.load_state_dict(encoder_state)
+        self._maybe_override_generated_estimator_from_ckpt()
         self._set_self_forced_auxiliary_modes()
+
+    def _maybe_override_generated_estimator_from_ckpt(self) -> None:
+        """warmup된 fake critic ckpt로 generated estimator(F_psi) 초기값을 덮어씁니다.
+
+        ``self_forced.estimator_init_ckpt`` 가 지정되면, 그 Lightning checkpoint 안의
+        ``self_forced_generated_estimator.*`` (없으면 ``encoder.*``) weight를 추출해
+        generated estimator 에만 로드합니다. teacher/generator 는 건드리지 않으므로,
+        generator 는 pretrained 에서 시작하되 fake critic 만 warmup 상태로 출발합니다.
+        """
+        if self.self_forced_generated_estimator is None or self.self_forced_config is None:
+            return
+        ckpt_path = getattr(self.self_forced_config, "estimator_init_ckpt", None)
+        if not ckpt_path:
+            return
+        if not Path(ckpt_path).is_file():
+            raise FileNotFoundError(
+                f"self_forced.estimator_init_ckpt not found: {ckpt_path}"
+            )
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        full_sd = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+        prefix = "self_forced_generated_estimator."
+        est_sd = {k[len(prefix):]: v for k, v in full_sd.items() if k.startswith(prefix)}
+        if not est_sd:
+            enc_prefix = "encoder."
+            est_sd = {
+                k[len(enc_prefix):]: v
+                for k, v in full_sd.items()
+                if k.startswith(enc_prefix)
+            }
+        if not est_sd:
+            raise RuntimeError(
+                f"estimator_init_ckpt has no generated_estimator/encoder weights: {ckpt_path}"
+            )
+        missing, unexpected = self.self_forced_generated_estimator.load_state_dict(
+            est_sd, strict=False
+        )
+        print(
+            f"[self_forced] generated_estimator(F_psi) overridden from {ckpt_path} "
+            f"(loaded={len(est_sd)}, missing={len(missing)}, unexpected={len(unexpected)})",
+            flush=True,
+        )
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         """self-forced resume 여부를 기록합니다.

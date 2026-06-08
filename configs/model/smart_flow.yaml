@@ -85,6 +85,9 @@ model_config:
     cadence: 1
     # estimator(fake) lr 명시값. null/<=0 이면 lr/estimator_updates_per_step 로 자동.
     estimator_lr: null
+    # warmup된 fake critic(F_psi) 초기값 ckpt 경로. null 이면 generator(pretrained)
+    # 복사본으로 시작. 지정하면 그 ckpt 의 self_forced_generated_estimator.* 만 로드.
+    estimator_init_ckpt: null
     estimator_warmup_epochs: 1
     initialize_aux_from_generator_on_fit_start: true
     unfrozen_range: except_map_encoder

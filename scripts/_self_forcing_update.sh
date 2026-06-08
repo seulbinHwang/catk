@@ -45,6 +45,7 @@ MASTER_PORT="${MASTER_PORT:-$(get_free_port)}"
 # self-forcing cadence / lr / ema / objective
 CADENCE="${CADENCE:-5}"                         # fake:gen = N:1
 ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-1}"   # fake updates per batch (1 = distinct batches)
+ESTIMATOR_INIT_CKPT="${ESTIMATOR_INIT_CKPT:-}"   # warmup된 fake critic ckpt(F_psi override). 빈값=generator 복사본
 GEN_LR="${GEN_LR:-1e-7}"
 FAKE_LR="${FAKE_LR:-1e-7}"
 USE_EMA="${USE_EMA:-false}"
@@ -120,10 +121,16 @@ set -- \
   "~callbacks.model_checkpoint" \
   "~callbacks.epoch_last_checkpoint"
 
+# warmup된 fake critic override (빈값이면 생략 → config null 유지)
+if [ -n "${ESTIMATOR_INIT_CKPT}" ]; then
+  set -- "$@" model.model_config.self_forced.estimator_init_ckpt="${ESTIMATOR_INIT_CKPT}"
+fi
+
 echo "============================================================"
 echo "[sf-update] task=${TASK}"
 echo "  GPU=${CUDA_VISIBLE_DEVICES} nproc=${NPROC_PER_NODE}  ckpt=${CKPT_PATH}"
 echo "  cadence(fake:gen)=${CADENCE}:1  est_updates/batch=${ESTIMATOR_UPDATES_PER_STEP}  gen_lr=${GEN_LR} fake_lr=${FAKE_LR}"
+echo "  estimator_init_ckpt=${ESTIMATOR_INIT_CKPT:-<none>}"
 echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "  train_B=${TRAIN_B} val_B=${VAL_B} scorer_scene=${SCORER_SCENE_NUM} val_check=${VAL_CHECK_INTERVAL} precision=${PRECISION}"
 echo "  log=${LOG}"
