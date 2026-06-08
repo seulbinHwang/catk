@@ -193,6 +193,7 @@ export TASK_NAME={shq(args.task_name)}
 export LOG_DIR={shq(args.remote_log_dir)}
 export VAL_BATCH_SIZE={shq(args.val_batch_size)}
 export MAX_EPOCHS={shq(args.max_epochs)}
+export INITIAL_RESUME_CKPT_PATH={shq(args.resume_ckpt_path)}
 export CATK_HYDRA_OVERRIDES={shq(extra_overrides)}
 export CATK_AUTO_SQRT_LR={"1" if args.auto_sqrt_lr else "0"}
 export CATK_BASE_LR={shq(args.base_lr)}
@@ -221,6 +222,13 @@ log "train_sidecar_dir={args.train_sidecar_dir or '<disabled>'}"
 log "nproc_per_node={args.nproc_per_node}"
 log "initial_bs={args.initial_bs} oom_step={args.oom_step} min_bs={args.min_bs}"
 log "val_batch_size={args.val_batch_size} max_epochs={args.max_epochs}"
+if [[ -n "$INITIAL_RESUME_CKPT_PATH" ]]; then
+  if [[ ! -f "$INITIAL_RESUME_CKPT_PATH" ]]; then
+    log "ERROR: resume checkpoint does not exist: $INITIAL_RESUME_CKPT_PATH"
+    exit 2
+  fi
+  log "initial_resume_ckpt=$INITIAL_RESUME_CKPT_PATH"
+fi
 if [[ "$CATK_AUTO_SQRT_LR" == "1" ]]; then
   log "auto sqrt lr enabled: base_lr={args.base_lr}, base_global_batch_size={args.base_global_batch_size}"
 fi
@@ -237,6 +245,9 @@ while (( bs >= {args.min_bs} )); do
   if [[ -n "$latest_ckpt" ]]; then
     export CATK_CKPT_PATH="$latest_ckpt"
     log "attempt #$attempt: bs=$bs, resume ckpt=$latest_ckpt"
+  elif [[ -n "$INITIAL_RESUME_CKPT_PATH" ]]; then
+    export CATK_CKPT_PATH="$INITIAL_RESUME_CKPT_PATH"
+    log "attempt #$attempt: bs=$bs, resume initial ckpt=$INITIAL_RESUME_CKPT_PATH"
   else
     log "attempt #$attempt: bs=$bs, fresh fit"
   fi
@@ -313,6 +324,15 @@ tmux split-window -v -l 12 -t {shq(args.session)} {shq(monitor_file)}
 tmux select-pane -t {shq(args.session)}
 """
 
+    if args.checkout_ref:
+        checkout_block = f"""git checkout --detach {shq(args.checkout_ref)}
+git reset --hard {shq(args.checkout_ref)}
+"""
+    else:
+        checkout_block = f"""git checkout -B {shq(args.branch)} {shq("origin/" + args.branch)}
+git reset --hard {shq("origin/" + args.branch)}
+"""
+
     return f"""set -Eeuo pipefail
 if [ ! -d {shq(args.project_root)}/.git ]; then
   echo "[launcher] PROJECT_ROOT is not a git checkout: {args.project_root}" >&2
@@ -324,8 +344,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
   git stash push -u -m {shq("auto-stash before semi_mdg testas launch " + args.task_name)} || true
 fi
 git fetch origin {shq("+refs/heads/" + args.branch + ":refs/remotes/origin/" + args.branch)}
-git checkout -B {shq(args.branch)} {shq("origin/" + args.branch)}
-git reset --hard {shq("origin/" + args.branch)}
+{checkout_block.rstrip()}
 {replace_block}
 mkdir -p {shq(run_root)}
 cat > {shq(run_file)} <<'CATK_RUN'
@@ -395,6 +414,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--container", default=DEFAULT_CONTAINER)
     parser.add_argument("--project-root", default=DEFAULT_PROJECT_ROOT)
     parser.add_argument("--branch", default=os.environ.get("CATK_BRANCH") or current_branch())
+    parser.add_argument(
+        "--checkout-ref",
+        default="",
+        help=(
+            "Optional git commit/tag/ref to checkout after fetching --branch. "
+            "Use this for full checkpoint resumes whose model architecture "
+            "must match an older commit."
+        ),
+    )
     parser.add_argument("--cache-root", default=DEFAULT_CACHE_ROOT)
     parser.add_argument(
         "--train-sidecar-dir",
@@ -424,6 +452,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-global-batch-size", default="108")
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
+    parser.add_argument(
+        "--resume-ckpt-path",
+        default="",
+        help=(
+            "Optional checkpoint path already present inside the pod. The first "
+            "attempt resumes from it when this task has no local epoch_last.ckpt; "
+            "subsequent OOM retries prefer the new task's latest epoch_last.ckpt."
+        ),
+    )
     parser.add_argument("--extra-hydra-overrides", default="")
     parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
     parser.add_argument("--master-port", default="29541")
@@ -451,10 +488,14 @@ def main() -> None:
         return
     print(f"[launcher] pod:       {args.pod}")
     print(f"[launcher] branch:    {args.branch}")
+    if args.checkout_ref:
+        print(f"[launcher] checkout:  {args.checkout_ref}")
     print(f"[launcher] task_name: {args.task_name}")
     print(f"[launcher] session:   {args.session}")
     print(f"[launcher] cache:     {args.cache_root}")
     print(f"[launcher] bs:        {args.initial_bs} -> min {args.min_bs} step {args.oom_step}")
+    if args.resume_ckpt_path:
+        print(f"[launcher] resume:   {args.resume_ckpt_path}")
     exec_in_pod(args, render_remote_start_command(args))
     print(
         "\nAttach:\n"

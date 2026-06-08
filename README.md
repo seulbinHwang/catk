@@ -250,6 +250,62 @@ bash scripts/start_semi_mdg_testas_a100x7_pretrain.sh \
   --task-name <task_name>
 ```
 
+### Testas A100 x7 resume
+
+중단된 `semi_mdg` pretrain을 full Lightning checkpoint에서 이어서 학습할 때는
+아래 wrapper를 씁니다. checkpoint는 먼저 `testas` pod 안에 있어야 합니다.
+`semi_mdg_pretrain_testas_a100x7_from_scratch_20260606_770e3fb_bs20_lr683e_sidecar`
+run의 checkpoint는 `770e3fb` 아키텍처에서 만들어졌으므로, wrapper 기본값은
+해당 commit과 기존 v1 sidecar를 명시적으로 사용합니다.
+
+```bash
+RESUME_CKPT_PATH=/workspace/checkpoints/semi_mdg_resume/qplbq444_epoch_last_v45.ckpt \
+CHECKOUT_REF=770e3fb \
+TRAIN_SIDECAR_DIR=/workspace/womd_v1_3/SMART_cache/semi_mdg_sidecar/training \
+TASK_NAME=semi_mdg_resume_testas_a100x7_from_qplbq444_epoch44_$(date +%Y%m%d_%H%M%S) \
+bash scripts/start_semi_mdg_testas_a100x7_resume.sh
+```
+
+기본 resume 조건은 from-scratch testas launcher와 같습니다.
+
+```text
+pod: testas
+nproc_per_node: 7
+initial_bs: 20 per GPU
+min_bs: 16 per GPU
+oom_step: 2
+base_global_batch_size: 108
+base_lr: 0.0006
+checkout_ref: 770e3fb
+train_sidecar_dir: /workspace/womd_v1_3/SMART_cache/semi_mdg_sidecar/training
+```
+
+첫 attempt는 `RESUME_CKPT_PATH`에서 이어가고, 이후 OOM retry가 발생하면 새
+task log 안에 저장된 최신 `epoch_last.ckpt`를 우선 사용합니다. 이 정책은
+optimizer/scheduler state를 보존하면서 batch retry만 수행하기 위한 것입니다.
+OOM retry 때는 retry된 per-GPU batch 기준으로 sqrt scaling LR override도 다시
+계산합니다.
+단, full Lightning resume에서는 checkpoint 안의 optimizer/scheduler state가
+복원되므로 실제 optimizer LR은 checkpoint epoch에 맞춰 이어집니다. 예를 들어
+`qplbq444_epoch_last_v45.ckpt`는 `epoch=44`, `global_step=173970`에서
+복원되고, 실제 `lr-AdamW`는 checkpoint scheduler 기준 약 `1.5e-4`입니다.
+
+2026-06-08 testas A100 x7에서 확인한 resume batch probe:
+
+| per-GPU batch | global batch | result |
+|---:|---:|---|
+| 24 | 168 | first forward에서 CUDA OOM |
+| 22 | 154 | 100-batch probe 중 CUDA OOM |
+| 20 | 140 | 200-batch probe 통과, `worst_peak_reserved_pct=95.37%` |
+
+따라서 이 checkpoint를 이어갈 때 보수적인 최대 기본값은 per-GPU `20`입니다.
+
+주의: 최신 `semi_mdg` HEAD가 checkpoint의 모델 출력 차원을 바꾼 경우에는 full
+resume가 불가능합니다. 실제로 `770e3fb` checkpoint를 최신 `00b712b` 모델에
+로드하면 decoder head shape mismatch가 발생합니다. 이런 경우는 새 코드로
+weight-only finetune을 하는 문제가 아니라, 원래 run을 이어가는 resume 문제이므로
+checkpoint를 만든 commit을 `CHECKOUT_REF`로 고정해야 합니다.
+
 짧은 train-only smoke:
 
 ```bash
