@@ -167,7 +167,7 @@ def _make_model_cfg(anchor_path: Path, **overrides):
         "soft_anchor_min_temperature": 1e-4,
         "use_closed_loop_training": True,
         "inference_temperature": 1.0,
-        "inference_top_k": 0,
+        "inference_top_k": 2048,
         "inference_top_p": 1.0,
         "validation_closed_seed": 0,
         "val_open_loop": False,
@@ -671,7 +671,7 @@ def test_unimm_lightning_training_step_runs(tmp_path: Path):
             "soft_anchor_min_temperature": 1e-4,
             "use_closed_loop_training": True,
             "inference_temperature": 1.0,
-            "inference_top_k": 0,
+            "inference_top_k": 2048,
             "inference_top_p": 1.0,
             "validation_closed_seed": 0,
             "val_open_loop": False,
@@ -747,7 +747,7 @@ def test_unimm_rollout_shapes(tmp_path: Path):
             "soft_anchor_min_temperature": 1e-4,
             "use_closed_loop_training": True,
             "inference_temperature": 1.0,
-            "inference_top_k": 0,
+            "inference_top_k": 2048,
             "inference_top_p": 1.0,
             "validation_closed_seed": 0,
             "val_open_loop": False,
@@ -799,6 +799,7 @@ def test_unimm_inference_samples_components_instead_of_argmax(tmp_path: Path):
         pickle.dump(_make_anchor_payload(num_anchors=2), handle)
 
     model = UniMMAnchorBased4s(_make_model_cfg(anchor_path)).eval()
+    assert model.inference_top_k == 2048
     logits = torch.zeros(256, 2)
     generator = torch.Generator(device=logits.device)
     generator.manual_seed(0)
@@ -807,6 +808,29 @@ def test_unimm_inference_samples_components_instead_of_argmax(tmp_path: Path):
 
     assert sampled.max().item() == 1
     assert model._sample_component(logits, None).shape == (256,)
+
+
+def test_unimm_full_top_k_skips_topk_kernel(tmp_path: Path, monkeypatch):
+    anchor_path = tmp_path / "anchors.pkl"
+    with anchor_path.open("wb") as handle:
+        pickle.dump(_make_anchor_payload(num_anchors=8), handle)
+
+    model = UniMMAnchorBased4s(
+        _make_model_cfg(anchor_path, inference_top_k=8, inference_top_p=1.0)
+    ).eval()
+
+    def fail_topk(*args, **kwargs):
+        raise AssertionError("full-anchor top-k should not call torch.topk")
+
+    monkeypatch.setattr(torch, "topk", fail_topk)
+
+    logits = torch.zeros(32, 8)
+    generator = torch.Generator(device=logits.device)
+    generator.manual_seed(0)
+    sampled = model._sample_component(logits, generator)
+
+    assert sampled.shape == (32,)
+    assert sampled.max().item() < 8
 
 
 def test_unimm_rejects_invalid_inference_sampling_config(tmp_path: Path):
@@ -960,7 +984,7 @@ def test_unimm_rollout_sampling_is_stable_when_scenario_batch_order_changes(
         _make_model_cfg(
             anchor_path,
             inference_temperature=1.0,
-            inference_top_k=0,
+            inference_top_k=2048,
             inference_top_p=1.0,
         )
     ).eval()

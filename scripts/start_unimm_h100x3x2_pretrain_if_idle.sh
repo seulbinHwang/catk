@@ -23,7 +23,7 @@ FORCE="${FORCE:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 STATUS_ONLY=0
 
-DEFAULT_EXTRA_OVERRIDES="model.model_config.inference_temperature=1.0 model.model_config.inference_top_k=0 model.model_config.inference_top_p=1.0 model.model_config.scorer_scene_num=1680"
+DEFAULT_EXTRA_OVERRIDES="model.model_config.inference_temperature=1.0 model.model_config.inference_top_k=2048 model.model_config.inference_top_p=1.0 model.model_config.scorer_scene_num=1680"
 EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-$DEFAULT_EXTRA_OVERRIDES}"
 
 usage() {
@@ -37,7 +37,7 @@ Environment overrides:
 
 Default experiment:
   UniMM Anchor-Based-4s, 2 nodes x 3 H100, per-GPU train batch 28,
-  OOM retry step 2, inference_temperature=1.0, top_k=0, scorer_scene_num=1680.
+  OOM retry step 2, inference_temperature=1.0, top_k=2048, scorer_scene_num=1680.
 USAGE
 }
 

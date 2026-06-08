@@ -170,7 +170,7 @@ class UniMMAnchorBased4s(LightningModule):
                 f"got {self.soft_anchor_min_temperature}."
             )
         self.inference_temperature = float(model_config.inference_temperature)
-        self.inference_top_k = int(getattr(model_config, "inference_top_k", 0))
+        self.inference_top_k = int(getattr(model_config, "inference_top_k", 2048))
         self.inference_top_p = float(getattr(model_config, "inference_top_p", 1.0))
         if self.inference_top_k < 0:
             raise ValueError(
