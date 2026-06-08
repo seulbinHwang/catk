@@ -2688,7 +2688,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py --replace
 ```bash
 python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
   --replace \
-  --task-name flow_self_forced_dmd_h100x3_hsb31_smoke_bs128 \
+  --task-name flow_self_forced_dmd_h100x3_hsb31_smoke_bs144 \
   --session catk-self-forced-dmd-h100x3-hsb31-smoke \
   --max-epochs 1 \
   --check-val-every-n-epoch 1 \
@@ -2704,7 +2704,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
 | branch | `semi_control_stable` |
 | pod checkout | `/tmp/catk_self_forced_dmd_h100x3_hsb31` |
 | experiment | `self_forced_npfm_h100_3_hsb31` |
-| default task | `flow_self_forced_dmd_h100x3_hsb31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` |
+| default task | `flow_self_forced_dmd_h100x3_hsb31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | checkpoint 의미 | `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` epoch 61 Generator, artifact metadata epoch 62 / global step 278192 |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_hsb31_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
@@ -2738,7 +2738,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
 |---|---|---|
 | historical train smoke | `bs160`, 3 ranks, `limit_train_batches=2`, `max_epochs=1` | 성공, `train/loss_epoch=0.07317`, `time/train_epoch_minutes=0.63746`, `worst_peak_reserved_pct_epoch_max=83.45095` |
 | validate smoke | 위 smoke의 `epoch_last.ckpt`, `action=validate`, `scorer_scene_num=24`, `limit_val_batches=1` | 성공, `val_closed/sim_agents_2025/realism_meta_metric=0.769756`, `scenario_counter=24` |
-| current default | `bs128`, 3 ranks | 이전 `bs160` smoke보다 낮은 보수 시작 batch. OOM 시 `16`씩 낮춰 최신 self-forced checkpoint로 resume |
+| current default | `bs144`, 3 ranks | 이전 `bs160` smoke보다 낮은 보수 시작 batch. OOM 시 `16`씩 낮춰 최신 self-forced checkpoint로 resume |
 
 위 historical smoke 기준 첫 train batch에는 dataloader/DDP warmup이 포함되어 28초, 두 번째
 train batch는 약 9초였습니다. current default full run의 epoch당 step 수는 effective global batch
@@ -2778,7 +2778,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb32_static_pod.py --replace
 | pod | `hsb-npc-training-3-2` 3 H100 |
 | pod checkout | `/tmp/catk_self_forced_dmd_h100x3_hsb32` |
 | experiment | `self_forced_npfm_h100_3_hsb32` |
-| default task | `flow_self_forced_dmd_h100x3_hsb32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` |
+| default task | `flow_self_forced_dmd_h100x3_hsb32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_hsb32_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | tmux session | `catk-self-forced-dmd-h100x3-hsb32` |
 
@@ -2814,7 +2814,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb3n2_static_pod.py --replace
 | script | `scripts/launch_self_forced_dmd_h100x3_hsb3n1_static_pod.py` | `scripts/launch_self_forced_dmd_h100x3_hsb3n2_static_pod.py` |
 | pod checkout | `/tmp/catk_self_forced_dmd_h100x3_hsb3n1` | `/tmp/catk_self_forced_dmd_h100x3_hsb3n2` |
 | experiment | `self_forced_npfm_h100_3_hsb3n1` | `self_forced_npfm_h100_3_hsb3n2` |
-| default task | `flow_self_forced_dmd_h100x3_hsb3n1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_hsb3n2_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` |
+| default task | `flow_self_forced_dmd_h100x3_hsb3n1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_hsb3n2_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_hsb3n1_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` | `/workspace/flow_self_forced_dmd_h100x3_hsb3n2_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | tmux session | `catk-self-forced-dmd-h100x3-hsb3n1` | `catk-self-forced-dmd-h100x3-hsb3n2` |
 
@@ -2853,7 +2853,7 @@ python scripts/launch_self_forced_dmd_h100x3_wopvc32_static_pod.py --replace
 | script | `scripts/launch_self_forced_dmd_h100x3_wopvc31_static_pod.py` | `scripts/launch_self_forced_dmd_h100x3_wopvc32_static_pod.py` |
 | pod checkout | `/tmp/catk_self_forced_dmd_h100x3_wopvc31` | `/tmp/catk_self_forced_dmd_h100x3_wopvc32` |
 | experiment | `self_forced_npfm_h100_3_wopvc31` | `self_forced_npfm_h100_3_wopvc32` |
-| default task | `flow_self_forced_dmd_h100x3_wopvc31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_wopvc32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` |
+| default task | `flow_self_forced_dmd_h100x3_wopvc31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_wopvc32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_wopvc31_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` | `/workspace/flow_self_forced_dmd_h100x3_wopvc32_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | tmux session | `catk-self-forced-dmd-h100x3-wopvc31` | `catk-self-forced-dmd-h100x3-wopvc32` |
 
