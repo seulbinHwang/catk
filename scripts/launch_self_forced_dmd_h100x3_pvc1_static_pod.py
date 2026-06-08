@@ -23,7 +23,7 @@ base.DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 base.DEFAULT_TASK_NAME = (
     "flow_self_forced_dmd_h100x3_pvc1_epoch061_x5f9g0ce_activecontrol_"
-    "sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle"
+    "sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle"
 )
 base.DEFAULT_SESSION = "catk-self-forced-dmd-h100x3-pvc1"
 
