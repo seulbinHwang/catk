@@ -370,6 +370,61 @@ kubectl exec -it -n p-pnc testas -c main -- tmux attach -t catk-smart-ntp-testas
 STOP=1 bash scripts/start_smart_ntp_testas_a100x7_trajtok_pretrain_oom_retry.sh
 ```
 
+#### TrajTok H100x4+H100x2 W&B checkpoint를 testas A100x7에서 재개
+
+2026-06-05 H100x4+H100x2 TrajTok run이 중단된 경우, W&B에 올라간 최신
+`epoch_last.ckpt` artifact를 받아 `testas` A100 7장에서 이어서 학습한다.
+
+```bash
+bash scripts/start_smart_ntp_testas_a100x7_trajtok_resume_h100x4x2_20260605.sh
+```
+
+기본 source run은 아래와 같다.
+
+```text
+smart_ntp_pretrain_h100x4_h100x2_globalbs108_lr581e4_oom_retry_trajtok_hidden128_renewedvocab_fulltraj_topk12_trainselectfalse_20260605
+```
+
+wrapper는 W&B에서 같은 display name의 run들을 찾고, `epoch-last-*` model artifact 중
+`latest` / `epoch_last` alias가 붙은 최신 artifact를 내려받는다. 2026-06-08 검증 기준
+재개 checkpoint는 `epoch-last-9w2lobrp:v31`이고, W&B artifact metadata는
+`epoch=44`, `global_step=215893`이다. Lightning checkpoint 내부 상태는
+`epoch=43`, scheduler `last_epoch=44`, `global_step=215893`로 복원된다.
+
+재개 시 LR은 단순히 새 값으로 리셋하지 않는다. checkpoint에 저장된 scheduler decay
+비율을 유지하면서 base LR만 testas global batch에 맞춰 sqrt scaling한다.
+
+| 항목 | 값 |
+|---|---:|
+| source global batch | `108` |
+| source base LR | `0.0005809475` |
+| testas per-GPU batch | `18` |
+| testas global batch | `126` |
+| testas sqrt-scaled base LR | `0.0006274950` |
+| source checkpoint current LR | `0.0001495940` |
+| patched resume current LR | `0.0001615800` |
+
+즉 epoch 44에서 이미 감소한 LR schedule 위치는 유지하고, batch size 변경분만 반영한다.
+이 patch는 `scripts/patch_checkpoint_lr.py`가 optimizer param group과 scheduler
+`base_lrs`, `_last_lr`를 함께 갱신한다.
+
+2026-06-08에 `testas` A100 7장에서 실제 checkpoint와 실제 SMART cache로 검증했다.
+
+| 검증 | 설정 | 결과 |
+|---|---|---|
+| W&B artifact download | `epoch-last-9w2lobrp:v31` | `epoch_last.ckpt` 99MiB 다운로드 성공 |
+| LR schedule patch | `bs=18`, global batch 126 | scheduler `last_epoch=44` 유지, current LR `0.0001615800`으로 patch |
+| resume smoke | `bs=18`, 1 train batch + 1 closed-loop validation batch, `num_k=1`, `scorer_scene_num=84` | checkpoint restore, epoch 44 train step, open/closed-loop validation 경로 정상 종료 |
+| batch probe | `bs=20`, 200 train batches, validation off | 66/200 이후 CUDA OOM. 직전 GPU memory는 최대 약 79.7GiB로 보수 안정 세팅에서 제외 |
+| final batch | `bs=18` | 이전 200-batch 안정 probe와 이번 smoke를 기준으로 testas A100x7 재개 기본값 |
+
+실행 중 tmux 확인과 중단은 아래 명령을 사용한다.
+
+```bash
+kubectl exec -it -n p-pnc testas -c main -- tmux attach -t catk-smart-ntp-testas-a100x7-trajtok-resume-h100x4x2
+STOP=1 bash scripts/start_smart_ntp_testas_a100x7_trajtok_resume_h100x4x2_20260605.sh
+```
+
 TrajTok agent target은 논문 의도에 맞춰 마지막 endpoint 하나가 아니라 현재 시점을 제외한
 0.5초 미래 5-frame box contour 전체로 고른다. 각 coarse step에서 raw GT 미래 segment를
 직전 tokenized pose 기준 local frame으로 변환하고, vocab token의 `[5, 4, 2]` future

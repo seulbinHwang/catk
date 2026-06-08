@@ -40,6 +40,9 @@ BASE_LEARNING_RATE="${BASE_LEARNING_RATE:-6e-4}"
 POLL_INTERVAL="${POLL_INTERVAL:-30}"
 MAX_NON_OOM_RETRIES="${MAX_NON_OOM_RETRIES:-2}"
 RETRY_NON_OOM_EXIT_CODES="${RETRY_NON_OOM_EXIT_CODES:-134,143}"
+BOOTSTRAP_CKPT_PATH="${BOOTSTRAP_CKPT_PATH:-}"
+PATCH_RESUME_CKPT_LR="${PATCH_RESUME_CKPT_LR:-false}"
+PATCH_CHECKPOINT_LR_SCRIPT="${PATCH_CHECKPOINT_LR_SCRIPT:-scripts/patch_checkpoint_lr.py}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-12}"
 TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-12}"
 LIMIT_TRAIN_BATCHES="${LIMIT_TRAIN_BATCHES:-}"
@@ -288,6 +291,32 @@ start_attempt() {
   "${cmd[@]}"
 }
 
+patch_resume_checkpoint_lr_if_requested() {
+  local ckpt_path="$1"
+  local bs="$2"
+  local attempt_lr patched_dir patched_path ckpt_path_q patched_path_q script_q
+  if [[ -z "$ckpt_path" || "$PATCH_RESUME_CKPT_LR" != "true" ]]; then
+    printf '%s\n' "$ckpt_path"
+    return 0
+  fi
+  attempt_lr="$(resolve_learning_rate "$bs")"
+  if [[ -z "$attempt_lr" ]]; then
+    printf '%s\n' "$ckpt_path"
+    return 0
+  fi
+  patched_dir="$(remote_run_root)/resume_patched"
+  patched_path="${patched_dir}/bs${bs}_$(basename "$ckpt_path")"
+  ckpt_path_q="$(remote_quote "$ckpt_path")"
+  patched_path_q="$(remote_quote "$patched_path")"
+  script_q="$(remote_quote "$PATCH_CHECKPOINT_LR_SCRIPT")"
+  kubectl exec -n "$NAMESPACE" "$MASTER_POD" -c "$CONTAINER" -- bash -lc "
+set -Eeuo pipefail
+mkdir -p $(remote_quote "$patched_dir")
+python ${script_q} --input ${ckpt_path_q} --output ${patched_path_q} --base-lr $(remote_quote "$attempt_lr")
+" >&2
+  printf '%s\n' "$patched_path"
+}
+
 find_remote_oom_pod() {
   local pod remote_log remote_log_q oom_regex_q cmd
   oom_regex_q="$(remote_quote "$OOM_REGEX")"
@@ -366,8 +395,13 @@ while (( bs >= MIN_BS )); do
   attempt=$(( attempt + 1 ))
   attempt_log="${LOCAL_RETRY_LOG_DIR}/attempt_$(printf '%03d' "$attempt")_bs${bs}.log"
   latest_ckpt="$(find_latest_epoch_last_ckpt)"
+  if [[ -z "$latest_ckpt" && -n "$BOOTSTRAP_CKPT_PATH" ]]; then
+    latest_ckpt="$BOOTSTRAP_CKPT_PATH"
+    log "Attempt #${attempt}: using bootstrap resume checkpoint=${latest_ckpt}"
+  fi
 
   if [[ -n "$latest_ckpt" ]]; then
+    latest_ckpt="$(patch_resume_checkpoint_lr_if_requested "$latest_ckpt" "$bs")"
     log "Attempt #${attempt}: bs=${bs}, resume ckpt=${latest_ckpt}"
   else
     log "Attempt #${attempt}: bs=${bs}, fresh fit (no epoch_last.ckpt found yet)"
