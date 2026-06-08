@@ -53,6 +53,14 @@ DM_OBJECTIVE="${DM_OBJECTIVE:-dmd}"
 PATH_STEP_SIZE="${PATH_STEP_SIZE:-0.05}"   # DMD direction step (normalize off 면 raw gap 계수)
 NORMALIZE_DIRECTION="${NORMALIZE_DIRECTION:-true}"  # false=거리-나눗셈 제거(raw, 수렴형)
 ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-1}"
+# 반복 warmup/joint zone 스케줄(step 기준). 둘 다 양수면 warmup zone(critic만)과
+# joint zone(기존 cadence DMD)을 step 기준으로 번갈아 무한 반복. 0/0 이면 비활성.
+WARMUP_ZONE_STEPS="${WARMUP_ZONE_STEPS:-0}"
+JOINT_ZONE_STEPS="${JOINT_ZONE_STEPS:-0}"
+# FM regularization: DMD loss 에 open-loop flow-matching loss 를 anchor_weight 로 더해
+# generator 가 teacher 의 open-loop FM 에서 drift 하는 것을 억제한다. false=기존(off).
+USE_ANCHOR_FM_LOSS="${USE_ANCHOR_FM_LOSS:-false}"
+ANCHOR_WEIGHT="${ANCHOR_WEIGHT:-0.05}"
 
 # data / trainer
 TRAIN_B="${TRAIN_B:-8}"
@@ -110,12 +118,16 @@ set -- \
   model.model_config.self_forced.distribution_matching_objective="${DM_OBJECTIVE}" \
   model.model_config.self_forced.path_step_size="${PATH_STEP_SIZE}" \
   model.model_config.self_forced.normalize_direction="${NORMALIZE_DIRECTION}" \
+  model.model_config.self_forced.use_anchor_flow_matching_loss="${USE_ANCHOR_FM_LOSS}" \
+  model.model_config.self_forced.anchor_weight="${ANCHOR_WEIGHT}" \
   model.model_config.sim_agents_metric_workers="${SIM_AGENTS_METRIC_WORKERS}" \
   model.model_config.self_forced.cadence="${CADENCE}" \
   model.model_config.self_forced.estimator_updates_per_step="${ESTIMATOR_UPDATES_PER_STEP}" \
   model.model_config.self_forced.estimator_lr="${FAKE_LR}" \
   model.model_config.self_forced.use_ema="${USE_EMA}" \
   model.model_config.self_forced.estimator_warmup_epochs="${ESTIMATOR_WARMUP_EPOCHS}" \
+  model.model_config.self_forced.warmup_zone_steps="${WARMUP_ZONE_STEPS}" \
+  model.model_config.self_forced.joint_zone_steps="${JOINT_ZONE_STEPS}" \
   logger.wandb.entity="${WANDB_ENTITY}" \
   logger.wandb.project="${WANDB_PROJECT}" \
   "~callbacks.model_checkpoint" \
@@ -132,6 +144,8 @@ echo "  GPU=${CUDA_VISIBLE_DEVICES} nproc=${NPROC_PER_NODE}  ckpt=${CKPT_PATH}"
 echo "  cadence(fake:gen)=${CADENCE}:1  est_updates/batch=${ESTIMATOR_UPDATES_PER_STEP}  gen_lr=${GEN_LR} fake_lr=${FAKE_LR}"
 echo "  estimator_init_ckpt=${ESTIMATOR_INIT_CKPT:-<none>}"
 echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
+echo "  anchor_fm_loss=${USE_ANCHOR_FM_LOSS} anchor_weight=${ANCHOR_WEIGHT}"
+echo "  zone_schedule(warmup:joint steps)=${WARMUP_ZONE_STEPS}:${JOINT_ZONE_STEPS} (0:0=off)"
 echo "  train_B=${TRAIN_B} val_B=${VAL_B} scorer_scene=${SCORER_SCENE_NUM} val_check=${VAL_CHECK_INTERVAL} precision=${PRECISION}"
 echo "  log=${LOG}"
 echo "============================================================"

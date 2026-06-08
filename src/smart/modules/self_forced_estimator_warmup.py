@@ -56,6 +56,61 @@ def resolve_self_forced_estimator_warmup_epochs(config: object | None) -> int:
     return warmup_epochs
 
 
+def resolve_self_forced_zone_steps(config: object | None) -> tuple[int, int]:
+    """반복 warmup/joint zone 스케줄의 step 길이를 확정합니다.
+
+    Args:
+        config: ``model.model_config.self_forced`` 설정입니다.
+
+    Returns:
+        tuple[int, int]: ``(warmup_zone_steps, joint_zone_steps)`` 입니다.
+        둘 중 하나라도 0 이하이면 zone 스케줄은 비활성(기존 epoch 기반 warmup 사용)입니다.
+
+    설명:
+        warmup zone 에서는 generator update 를 건너뛰고 fake(critic) 만 학습하고,
+        joint zone 에서는 기존 cadence 기반 self-forcing(fake + generator)을 실행합니다.
+        ``step % (W + J) < W`` 면 warmup zone 입니다. 두 zone 을 step 기준으로 무한 반복합니다.
+    """
+    warmup_zone_steps = int(_get_config_value(config, "warmup_zone_steps", 0))
+    joint_zone_steps = int(_get_config_value(config, "joint_zone_steps", 0))
+    if warmup_zone_steps < 0 or joint_zone_steps < 0:
+        raise ValueError(
+            "self_forced.warmup_zone_steps / joint_zone_steps must be non-negative, "
+            f"got warmup={warmup_zone_steps}, joint={joint_zone_steps}."
+        )
+    return warmup_zone_steps, joint_zone_steps
+
+
+def is_self_forced_warmup_zone_step(
+    *,
+    step: int,
+    warmup_zone_steps: int,
+    joint_zone_steps: int,
+) -> bool:
+    """반복 zone 스케줄에서 현재 step 이 warmup zone 인지 판단합니다.
+
+    Args:
+        step: self-forced 학습 step(배치) 인덱스(0-based)입니다.
+        warmup_zone_steps: 한 cycle 의 warmup zone step 수입니다.
+        joint_zone_steps: 한 cycle 의 joint(동시 튜닝) zone step 수입니다.
+
+    Returns:
+        bool: 현재 step 이 warmup zone 이면 ``True`` 입니다.
+        ``warmup_zone_steps`` 또는 ``joint_zone_steps`` 가 0 이하이면 항상 ``False`` 입니다.
+
+    설명:
+        cycle 길이는 ``warmup_zone_steps + joint_zone_steps`` 이고,
+        ``step % cycle < warmup_zone_steps`` 면 warmup zone 입니다. 즉 각 cycle 의
+        앞부분이 warmup, 뒷부분이 joint 입니다.
+    """
+    warmup = int(warmup_zone_steps)
+    joint = int(joint_zone_steps)
+    if warmup <= 0 or joint <= 0:
+        return False
+    cycle = warmup + joint
+    return (int(step) % cycle) < warmup
+
+
 def is_self_forced_estimator_warmup_epoch(
     *,
     current_epoch: int,

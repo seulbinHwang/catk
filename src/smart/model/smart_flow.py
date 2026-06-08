@@ -46,7 +46,9 @@ from src.smart.modules.self_forced_update_separation import (
 )
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
+    is_self_forced_warmup_zone_step,
     resolve_self_forced_estimator_warmup_epochs,
+    resolve_self_forced_zone_steps,
 )
 from src.smart.modules.self_forced_trainable_range import (
     apply_self_forced_unfrozen_range,
@@ -332,6 +334,13 @@ class SMARTFlow(LightningModule):
         self.self_forced_estimator_warmup_epochs = (
             resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
         )
+        # 반복 warmup/joint zone 스케줄(step 기준). 둘 다 0 이면 비활성(epoch 기반 warmup).
+        (
+            self.self_forced_warmup_zone_steps,
+            self.self_forced_joint_zone_steps,
+        ) = resolve_self_forced_zone_steps(self.self_forced_config)
+        # self-forced training step(배치) 카운터. zone 스케줄 판정에 사용합니다.
+        self._sf_zone_step = 0
         self.self_forced_initialize_aux_on_fit_start = (
             bool(getattr(self.self_forced_config, "initialize_aux_from_generator_on_fit_start", True))
             if self.self_forced_config is not None
@@ -1604,7 +1613,18 @@ class SMARTFlow(LightningModule):
         return scenario_rollouts
 
     def _is_self_forced_estimator_warmup_active(self) -> bool:
-        """현재 epoch에서 generated estimator만 먼저 적응시킬지 판단합니다."""
+        """현재 step/epoch에서 generated estimator만 먼저 적응시킬지 판단합니다.
+
+        warmup_zone_steps 와 joint_zone_steps 가 모두 양수면 step 기준 반복 zone
+        스케줄(warmup→joint→warmup→…)을 사용하고, 아니면 기존 epoch 기반 warmup 으로
+        폴백합니다.
+        """
+        if self.self_forced_warmup_zone_steps > 0 and self.self_forced_joint_zone_steps > 0:
+            return is_self_forced_warmup_zone_step(
+                step=int(self._sf_zone_step),
+                warmup_zone_steps=int(self.self_forced_warmup_zone_steps),
+                joint_zone_steps=int(self.self_forced_joint_zone_steps),
+            )
         return is_self_forced_estimator_warmup_epoch(
             current_epoch=int(self.current_epoch),
             self_forced_start_epoch=int(self.self_forced_start_epoch),
@@ -2819,6 +2839,10 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: logging용 detached 총 loss입니다.
         """
+        # 반복 warmup/joint zone 스케줄용 step 카운터. 한 batch 내 모든 warmup 판정이
+        # 같은 값을 보도록 맨 위에서 1회만 증가시킵니다.
+        self._sf_zone_step = int(self._sf_zone_step) + 1
+
         fm_loss = None
         open_metric_dict = None
         has_anchor_fm_targets = False
@@ -2836,6 +2860,16 @@ class SMARTFlow(LightningModule):
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
         warmup_active = self._is_self_forced_estimator_warmup_active()
+        if self.self_forced_warmup_zone_steps > 0 and self.self_forced_joint_zone_steps > 0:
+            # 반복 zone 스케줄이 켜졌을 때만 zone 상태를 기록합니다(1=warmup, 0=joint).
+            self.log(
+                "train/sf_zone/warmup_active",
+                torch.tensor(1.0 if warmup_active else 0.0, device=self.device),
+                on_step=True,
+                on_epoch=False,
+                sync_dist=False,
+                batch_size=1,
+            )
         # cadence N:1 — fake 는 매 batch, generator 는 N batch 마다 1회만 (서로 다른 batch).
         # generator step 이 아닌 batch 는 generator grad 가 불필요(estimator 는 detached
         # committed_path 만 사용)하므로 rollout 을 no_grad 로 돌려 메모리/연산을 아낀다.

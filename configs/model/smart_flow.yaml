@@ -89,6 +89,11 @@ model_config:
     # 복사본으로 시작. 지정하면 그 ckpt 의 self_forced_generated_estimator.* 만 로드.
     estimator_init_ckpt: null
     estimator_warmup_epochs: 1
+    # 반복 warmup/joint zone 스케줄(step 기준). 둘 다 양수이면 step % (W+J) < W 인
+    # 구간은 warmup zone(generator 동결, fake critic 만 학습), 나머지는 joint zone(기존
+    # cadence DMD)으로 무한 반복합니다. 둘 중 하나라도 0 이면 비활성(epoch 기반 warmup 사용).
+    warmup_zone_steps: 0
+    joint_zone_steps: 0
     initialize_aux_from_generator_on_fit_start: true
     unfrozen_range: except_map_encoder
     ema_weight: 0.99
