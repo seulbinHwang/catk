@@ -10,7 +10,7 @@ set -uo pipefail
 export EXPERIMENT="${EXPERIMENT:-self_forced_npfm_h100_3_hsb31}"
 export TASK_NAME="${TASK_NAME:-flow_self_forced_dmd_h100x3_hsb31}"
 export CACHE_ROOT="${CACHE_ROOT:-/workspace/womd_v1_3/SMART_cache}"
-export INITIAL_BS="${INITIAL_BS:-144}"
+export INITIAL_BS="${INITIAL_BS:-128}"
 export OOM_STEP="${OOM_STEP:-16}"
 export MIN_BS="${MIN_BS:-16}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2}"
