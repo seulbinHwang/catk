@@ -111,6 +111,32 @@ class FlowTokenProcessor(TokenProcessor):
         )
         return tokenized_map, tokenized_agent
 
+    def _build_self_forced_rollout_fine_inputs(
+        self,
+        *,
+        pos: Tensor,
+        heading: Tensor,
+        valid: Tensor,
+        raw_current_steps: List[int],
+    ) -> Dict[str, Tensor]:
+        """anchor별 closed-loop 시작 fine 상태를 batch-friendly 형태로 만듭니다."""
+        device = pos.device
+        n_step = int(pos.shape[1])
+        current_steps = torch.as_tensor(raw_current_steps, device=device, dtype=torch.long)
+        pair_offsets = torch.as_tensor([-1, 0], device=device, dtype=torch.long)
+        pair_index = (current_steps[:, None] + pair_offsets[None, :]).clamp(0, n_step - 1)
+        history_offsets = torch.arange(-self.shift, 1, device=device, dtype=torch.long)
+        history_index = (current_steps[:, None] + history_offsets[None, :]).clamp(0, n_step - 1)
+
+        return {
+            "self_forced_rollout_init_fine_pos_pair": pos[:, pair_index].contiguous(),
+            "self_forced_rollout_init_fine_head_pair": heading[:, pair_index].contiguous(),
+            "self_forced_rollout_init_fine_valid_pair": valid[:, pair_index].contiguous(),
+            "self_forced_rollout_init_fine_pos_history": pos[:, history_index].contiguous(),
+            "self_forced_rollout_init_fine_head_history": heading[:, history_index].contiguous(),
+            "self_forced_rollout_init_fine_valid_history": valid[:, history_index].contiguous(),
+        }
+
     def _build_flow_targets(
         self,
         data: HeteroData,
@@ -305,15 +331,27 @@ class FlowTokenProcessor(TokenProcessor):
             return tokenized_agent
 
         flow_eval_mask = torch.zeros(num_agent, num_anchor, device=device, dtype=torch.bool)
+        self_forced_rollout_anchor_mask = torch.zeros(
+            num_agent,
+            num_anchor,
+            device=device,
+            dtype=torch.bool,
+        )
         flow_eval_chunks: List[Tensor] = []
         flow_eval_metric_chunks: List[Tensor] = []
         flow_eval_agent_type_chunks: List[Tensor] = []
         flow_eval_agent_length_chunks: List[Tensor] = []
         for anchor_offset, raw_step in enumerate(raw_current_steps):
             current_valid = valid[:, raw_step]
-            future_valid = self._build_anchor_future_valid(valid=valid, raw_step=raw_step)
+            future_loss_mask = self._build_anchor_future_loss_mask(valid=valid, raw_step=raw_step)
+            future_valid = future_loss_mask.all(dim=1)
             anchor_mask = current_valid & future_valid
             flow_eval_mask[:, anchor_offset] = anchor_mask
+            self_forced_rollout_anchor_mask[:, anchor_offset] = (
+                current_valid
+                & future_loss_mask.any(dim=1)
+                & train_mask
+            )
             if not anchor_mask.any():
                 continue
 
@@ -369,6 +407,13 @@ class FlowTokenProcessor(TokenProcessor):
                     chunks=flow_eval_agent_length_chunks,
                     dtype=dtype,
                     device=device,
+                ),
+                "self_forced_rollout_anchor_mask": self_forced_rollout_anchor_mask,
+                **self._build_self_forced_rollout_fine_inputs(
+                    pos=pos,
+                    heading=heading,
+                    valid=valid,
+                    raw_current_steps=raw_current_steps,
                 ),
             }
         )

@@ -277,6 +277,32 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
+        raw_self_forced_rollout_anchor_stride = (
+            getattr(self.self_forced_config, "rollout_anchor_stride", 4)
+            if self.self_forced_config is not None
+            else 4
+        )
+        try:
+            rollout_anchor_stride_float = float(raw_self_forced_rollout_anchor_stride)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "self_forced.rollout_anchor_stride must be a positive integer, "
+                f"got {raw_self_forced_rollout_anchor_stride!r}."
+            ) from exc
+        if (
+            isinstance(raw_self_forced_rollout_anchor_stride, bool)
+            or not rollout_anchor_stride_float.is_integer()
+        ):
+            raise ValueError(
+                "self_forced.rollout_anchor_stride must be a positive integer, "
+                f"got {raw_self_forced_rollout_anchor_stride!r}."
+            )
+        self.self_forced_rollout_anchor_stride = int(rollout_anchor_stride_float)
+        if self.self_forced_rollout_anchor_stride < 1:
+            raise ValueError(
+                "self_forced.rollout_anchor_stride must be a positive integer, "
+                f"got {self.self_forced_rollout_anchor_stride!r}."
+            )
         self.self_forced_dmd_use_stable_scale_filter = (
             bool(getattr(self.self_forced_config, "dmd_use_stable_scale_filter", True))
             if self.self_forced_config is not None
@@ -1491,6 +1517,145 @@ class SMARTFlow(LightningModule):
 
         return runtime_tokenized_agent
 
+    def _flatten_anchor_major_tensor(self, tensor: Tensor) -> Tensor:
+        """``[agent, anchor, ...]`` 텐서를 ``[anchor * agent, ...]`` 순서로 폅니다."""
+        if tensor.dim() < 2:
+            raise ValueError(f"anchor tensor must have at least 2 dims, got {tuple(tensor.shape)}.")
+        return tensor.transpose(0, 1).flatten(0, 1).contiguous()
+
+    def _build_anchor_shifted_window(
+        self,
+        tensor: Tensor,
+        *,
+        anchor_offsets: Tensor,
+        window_steps: int,
+    ) -> Tensor:
+        """각 anchor가 자기 기준의 초기 context window를 갖도록 시간축을 잘라 폅니다."""
+        if tensor.dim() < 2:
+            raise ValueError(f"time-window tensor must have shape [n_agent, n_step, ...], got {tuple(tensor.shape)}.")
+        if int(tensor.shape[1]) <= 0:
+            raise ValueError("time-window tensor must contain at least one step.")
+        step_offsets = torch.arange(window_steps, device=tensor.device, dtype=torch.long)
+        index = (anchor_offsets[:, None] + step_offsets[None, :]).clamp(0, int(tensor.shape[1]) - 1)
+        return self._flatten_anchor_major_tensor(tensor[:, index])
+
+    def _build_multi_anchor_self_forced_tokenized_agent(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+    ) -> tuple[Dict[str, Tensor], Tensor]:
+        """self-forcing rollout을 모든 유효 anchor에서 병렬로 돌릴 agent token을 만듭니다."""
+        anchor_mask_2d = tokenized_agent.get("self_forced_rollout_anchor_mask")
+        if anchor_mask_2d is None:
+            anchor_mask_2d = get_anchor0_valid_mask(tokenized_agent).view(-1, 1)
+        if anchor_mask_2d.dim() != 2 or anchor_mask_2d.shape[1] == 0:
+            raise ValueError(
+                "self-forced anchor mask must have shape [n_agent, n_anchor], "
+                f"got {tuple(anchor_mask_2d.shape)}."
+            )
+
+        source_num_anchor = int(anchor_mask_2d.shape[1])
+        anchor_offsets = torch.arange(
+            0,
+            source_num_anchor,
+            self.self_forced_rollout_anchor_stride,
+            device=anchor_mask_2d.device,
+            dtype=torch.long,
+        )
+        anchor_mask_2d = anchor_mask_2d.index_select(1, anchor_offsets)
+        num_anchor = int(anchor_mask_2d.shape[1])
+        num_graphs = int(tokenized_agent["num_graphs"])
+        if num_anchor == 1:
+            runtime_tokenized_agent = dict(tokenized_agent)
+            runtime_tokenized_agent["_self_forced_anchor_repeat_count"] = 1
+            runtime_tokenized_agent["_self_forced_base_num_graphs"] = num_graphs
+            return runtime_tokenized_agent, anchor_mask_2d[:, 0].bool()
+
+        repeated_agent_keys = [
+            "type",
+            "shape",
+            "token_agent_shape",
+            "ego_mask",
+            "gt_z_raw",
+        ]
+        runtime_tokenized_agent: Dict[str, Tensor] = {
+            "batch": self._expand_batch_index_for_rollouts(
+                tokenized_agent["batch"],
+                repeat_count=num_anchor,
+                num_graphs=num_graphs,
+            ),
+            "num_graphs": num_graphs * num_anchor,
+            "trajectory_token_veh": tokenized_agent["trajectory_token_veh"],
+            "trajectory_token_ped": tokenized_agent["trajectory_token_ped"],
+            "trajectory_token_cyc": tokenized_agent["trajectory_token_cyc"],
+            "token_bank_all_veh": tokenized_agent["token_bank_all_veh"],
+            "token_bank_all_ped": tokenized_agent["token_bank_all_ped"],
+            "token_bank_all_cyc": tokenized_agent["token_bank_all_cyc"],
+            "_self_forced_anchor_repeat_count": num_anchor,
+            "_self_forced_base_num_graphs": num_graphs,
+        }
+        for key in repeated_agent_keys:
+            if key in tokenized_agent:
+                runtime_tokenized_agent[key] = self._repeat_tensor_on_first_dim(
+                    tokenized_agent[key],
+                    num_anchor,
+                )
+
+        for key in [
+            "gt_idx",
+            "gt_pos",
+            "gt_heading",
+            "valid_mask",
+            "sampled_idx",
+            "sampled_pos",
+            "sampled_heading",
+            "gt_pos_raw",
+            "gt_head_raw",
+            "gt_valid_raw",
+            "ctx_sampled_idx",
+            "ctx_sampled_pos",
+            "ctx_sampled_heading",
+            "ctx_valid",
+        ]:
+            if key in tokenized_agent:
+                runtime_tokenized_agent[key] = self._build_anchor_shifted_window(
+                    tokenized_agent[key],
+                    anchor_offsets=anchor_offsets,
+                    window_steps=2,
+                )
+
+        fine_key_map = {
+            "self_forced_rollout_init_fine_pos_pair": "rollout_init_fine_pos_pair",
+            "self_forced_rollout_init_fine_head_pair": "rollout_init_fine_head_pair",
+            "self_forced_rollout_init_fine_valid_pair": "rollout_init_fine_valid_pair",
+            "self_forced_rollout_init_fine_pos_history": "rollout_init_fine_pos_history",
+            "self_forced_rollout_init_fine_head_history": "rollout_init_fine_head_history",
+            "self_forced_rollout_init_fine_valid_history": "rollout_init_fine_valid_history",
+        }
+        for source_key, target_key in fine_key_map.items():
+            if source_key not in tokenized_agent:
+                continue
+            runtime_tokenized_agent[target_key] = self._flatten_anchor_major_tensor(
+                tokenized_agent[source_key].index_select(1, anchor_offsets),
+            )
+
+        return runtime_tokenized_agent, self._flatten_anchor_major_tensor(anchor_mask_2d).bool()
+
+    def _expand_self_forced_map_feature_for_tokenized_agent(
+        self,
+        map_feature: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        """anchor-expanded agent batch와 같은 graph id 공간으로 map feature를 확장합니다."""
+        repeat_count = int(tokenized_agent.get("_self_forced_anchor_repeat_count", 1))
+        if repeat_count == 1:
+            return map_feature
+        base_num_graphs = int(tokenized_agent.get("_self_forced_base_num_graphs", tokenized_agent["num_graphs"]))
+        return self._build_parallel_rollout_map_feature(
+            map_feature=map_feature,
+            repeat_count=repeat_count,
+            num_graphs=base_num_graphs,
+        )
+
     def _build_parallel_rollout_cache(
         self,
         rollout_cache: Dict[str, object],
@@ -2666,10 +2831,16 @@ class SMARTFlow(LightningModule):
         self,
         decoder: SMARTFlowDecoder,
         tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor] | None = None,
     ) -> Dict[str, Tensor]:
         """frozen map encoder 출력을 self-forced step cache용으로 만듭니다."""
         with torch.no_grad():
             map_feature = decoder.encode_map(tokenized_map)
+        if tokenized_agent is not None:
+            map_feature = self._expand_self_forced_map_feature_for_tokenized_agent(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+            )
         return detach_tensor_tree(map_feature)
 
     def _predict_path_flow_clean_estimate(
@@ -2699,6 +2870,10 @@ class SMARTFlow(LightningModule):
         """
         if map_feature is None:
             map_feature = decoder.encode_map(tokenized_map)
+            map_feature = self._expand_self_forced_map_feature_for_tokenized_agent(
+                map_feature=map_feature,
+                tokenized_agent=tokenized_agent,
+            )
         return decoder.path_flow_velocity_for_anchor0(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
@@ -2729,7 +2904,7 @@ class SMARTFlow(LightningModule):
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
-    ) -> Dict[str, Tensor]:
+    ) -> tuple[Dict[str, Tensor], Dict[str, Tensor], Tensor]:
         """실제 inference와 같은 규칙으로 N초 committed self-rollout을 만듭니다.
 
         Args:
@@ -2737,17 +2912,27 @@ class SMARTFlow(LightningModule):
             tokenized_agent: 평가 모드 agent token 사전입니다.
 
         Returns:
-            Dict[str, Tensor]: closed-loop rollout 결과입니다. ``pred_traj_10hz`` 와
-            ``pred_head_10hz`` 는 실제로 commit된 N초 rollout입니다. random-s 학습이 켜져
-            있으면 DDP 전체 rank가 공유한 ``s`` 와 tau 구간도 함께 들어갑니다.
+            tuple[Dict[str, Tensor], Dict[str, Tensor], Tensor]:
+                closed-loop rollout 결과, anchor-expanded agent token, 그리고 self-forced
+                loss에 쓸 anchor-expanded mask입니다.
         """
+        rollout_tokenized_agent, anchor_mask = self._build_multi_anchor_self_forced_tokenized_agent(
+            tokenized_agent,
+        )
         encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
         try:
             map_feature = self.encoder.encode_map(tokenized_map)
-            rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
-            return self.encoder.training_rollout_from_cache(
+            map_feature = self._expand_self_forced_map_feature_for_tokenized_agent(
+                map_feature=map_feature,
+                tokenized_agent=rollout_tokenized_agent,
+            )
+            rollout_cache = self.encoder.prepare_training_rollout_cache(
+                rollout_tokenized_agent,
+                map_feature,
+            )
+            rollout = self.encoder.training_rollout_from_cache(
                 rollout_cache=rollout_cache,
-                tokenized_agent=tokenized_agent,
+                tokenized_agent=rollout_tokenized_agent,
                 map_feature=map_feature,
                 sampling_scheme=self.self_forced_sampling,
                 rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
@@ -2755,6 +2940,7 @@ class SMARTFlow(LightningModule):
                 detach_block_transition=self.self_forced_detach_block_transition,
                 use_stop_motion=self.self_forced_use_stop_motion,
             )
+            return rollout, rollout_tokenized_agent, anchor_mask
         finally:
             self._restore_module_training_modes(encoder_modes)
 
@@ -2762,8 +2948,9 @@ class SMARTFlow(LightningModule):
         self,
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
+        anchor_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """committed rollout을 첫 anchor 기준 packed N초 flow state로 변환합니다.
+        """committed rollout을 anchor-expanded packed N초 flow state로 변환합니다.
 
         Args:
             rollout: ``_run_self_forced_rollout`` 의 출력입니다.
@@ -2773,14 +2960,16 @@ class SMARTFlow(LightningModule):
             tuple[Tensor, Tensor]: packed flow state와 agent mask입니다.
                 pose-space shape은 ``[n_valid_agent, F_win, 4]`` 이고,
                 control-space shape은 ``[n_valid_agent, F_win, 3]`` 이며,
-                mask shape은 ``[n_agent]`` 입니다.
+                mask shape은 ``[n_anchor * n_agent]`` 입니다.
 
         Notes:
             random terminal N은 self-rollout을 어디에서 끊을지만 정합니다.
             이후 generated estimator 학습과 generator update의 noising tau는
             여기서 전달하지 않습니다.
         """
-        anchor_mask = get_anchor0_valid_mask(tokenized_agent)
+        if anchor_mask is None:
+            anchor_mask = get_anchor0_valid_mask(tokenized_agent)
+        anchor_mask = anchor_mask.bool()
         committed_path_norm = build_anchor0_normalized_committed_path(
             pred_traj_10hz=rollout["pred_traj_10hz"],
             pred_head_10hz=rollout["pred_head_10hz"],
@@ -2865,6 +3054,7 @@ class SMARTFlow(LightningModule):
                     estimator_map_feature = self._encode_self_forced_map_feature(
                         decoder=self.self_forced_generated_estimator,
                         tokenized_map=estimator_tokenized_map,
+                        tokenized_agent=estimator_tokenized_agent,
                     )
                 for _ in range(self.self_forced_estimator_updates_per_step):
                     optimizer.zero_grad(set_to_none=True)
@@ -3635,12 +3825,19 @@ class SMARTFlow(LightningModule):
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
         if is_estimator_warmup_active:
             with torch.no_grad():
-                rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+                rollout, self_forced_tokenized_agent, anchor_mask = self._run_self_forced_rollout(
+                    tokenized_map_eval,
+                    tokenized_agent_eval,
+                )
         else:
-            rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+            rollout, self_forced_tokenized_agent, anchor_mask = self._run_self_forced_rollout(
+                tokenized_map_eval,
+                tokenized_agent_eval,
+            )
         committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
             rollout=rollout,
-            tokenized_agent=tokenized_agent_eval,
+            tokenized_agent=self_forced_tokenized_agent,
+            anchor_mask=anchor_mask,
         )
         has_committed_path_local = committed_path_norm.numel() > 0
         has_committed_path_global = self._sync_distributed_bool_any(
@@ -3713,7 +3910,7 @@ class SMARTFlow(LightningModule):
 
         gen_estimator_loss = self._update_generated_path_flow_estimator(
             tokenized_map=tokenized_map_eval,
-            tokenized_agent=tokenized_agent_eval,
+            tokenized_agent=self_forced_tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
             has_committed_path_global=has_committed_path_global,
@@ -3723,7 +3920,7 @@ class SMARTFlow(LightningModule):
         if has_committed_path_local:
             sf_loss = self._compute_self_forced_distribution_matching_loss(
                 tokenized_map=tokenized_map_eval,
-                tokenized_agent=tokenized_agent_eval,
+                tokenized_agent=self_forced_tokenized_agent,
                 committed_path_norm=committed_path_norm,
                 anchor_mask=anchor_mask,
             )

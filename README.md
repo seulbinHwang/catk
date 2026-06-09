@@ -2069,6 +2069,7 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=0` 입니다. self-forcing 시작 직후부터 generated estimator 업데이트와 Generator 업데이트를 같은 train step 안에서 수행합니다.
 - 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
 - self-forced preset은 각 epoch마다 train dataset의 25%만 새로 랜덤 샘플링해 학습합니다. 비율은 `data.train_epoch_sample_fraction` 으로 바꾸며, `1.0` 으로 두면 전체 train dataset을 사용합니다.
+- self-forcing DMD/SID 본체는 scene 안의 rollout anchor를 `model.model_config.self_forced.rollout_anchor_stride` 간격으로 사용합니다. 기본값 `4` 는 사람 기준 `1, 5, 9, 13`번째 anchor, 코드 기준 offset `0, 4, 8, 12`를 쓰며, `1` 로 두면 16개 anchor를 모두 사용합니다.
 - self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 LR scheduler를 쓰지 않습니다. Generator는 `model.model_config.lr`, generated estimator는 `model.model_config.self_forced.generated_estimator_lr` 를 사용합니다. 기본값은 `${model.model_config.lr}` 이므로 override하지 않으면 기존처럼 두 optimizer의 LR이 같습니다. 따라서 self-forced preset에는 `lr_warmup_steps` / `lr_min_ratio` override를 두지 않습니다.
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
 - 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/epoch 를 resume하지 않고 pretrained weight만 로드합니다.

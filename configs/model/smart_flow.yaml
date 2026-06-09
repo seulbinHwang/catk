@@ -79,6 +79,9 @@ model_config:
     # 기본 DMD guidance는 self-forced objective와 같은 control-space에서 판단합니다.
     # true로 override하면 pose-space에서 direction/filter를 계산한 뒤 control-space target으로 되돌립니다.
     project_dmd_to_pose_space: false
+    # Self-forcing 본체에서 사용할 rollout anchor 간격입니다.
+    # 4이면 0,4,8,12번째 anchor를 쓰고, 1이면 16개 anchor를 모두 씁니다.
+    rollout_anchor_stride: 4
     # Clean-DMD direction filters. These apply identically to pose-projected
     # and direct control-space DMD paths.
     dmd_use_stable_scale_filter: true
