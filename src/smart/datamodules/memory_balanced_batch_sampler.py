@@ -16,6 +16,11 @@ from typing import Iterable, Iterator, Sequence
 import torch
 from torch.utils.data import Sampler
 
+from .random_fraction_distributed_sampler import (
+    fraction_epoch_partition_indices,
+    validate_fraction_cycle_length,
+)
+
 
 METADATA_VERSION = 1
 DEFAULT_LOCK_STALE_SEC = 30.0
@@ -430,6 +435,7 @@ class MemoryBalancedDistributedBatchSampler(Sampler[list[int]]):
         shuffle: bool,
         seed: int = 0,
         fraction: float = 1.0,
+        shuffle_fraction_each_epoch: bool = True,
     ) -> None:
         if batch_size < 1:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
@@ -451,10 +457,19 @@ class MemoryBalancedDistributedBatchSampler(Sampler[list[int]]):
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.fraction = float(fraction)
+        self.shuffle_fraction_each_epoch = bool(shuffle_fraction_each_epoch)
+        self.cycle_length = (
+            None
+            if self.shuffle_fraction_each_epoch
+            else validate_fraction_cycle_length(self.fraction)
+        )
         self.epoch = 0
 
         self.dataset_size = int(self.sample_weight.numel())
-        self.subset_size = max(1, int(math.floor(self.dataset_size * self.fraction)))
+        if self.shuffle_fraction_each_epoch:
+            self.subset_size = max(1, int(math.floor(self.dataset_size * self.fraction)))
+        else:
+            self.subset_size = max(1, int(math.ceil(self.dataset_size / self.cycle_length)))
         self.global_batch_size = self.batch_size * self.num_replicas
         self.num_global_batches = int(math.ceil(self.subset_size / self.global_batch_size))
         self.total_size = self.num_global_batches * self.global_batch_size
@@ -470,11 +485,19 @@ class MemoryBalancedDistributedBatchSampler(Sampler[list[int]]):
         self.epoch = int(epoch)
 
     def _selected_indices(self, generator: torch.Generator) -> torch.Tensor:
-        if self.shuffle:
+        if not self.shuffle_fraction_each_epoch:
+            indices = fraction_epoch_partition_indices(
+                dataset_size=self.dataset_size,
+                fraction=self.fraction,
+                epoch=self.epoch,
+                seed=self.seed,
+            )
+        elif self.shuffle:
             indices = torch.randperm(self.dataset_size, generator=generator)
         else:
             indices = torch.arange(self.dataset_size)
-        indices = indices[: self.subset_size]
+        if self.shuffle_fraction_each_epoch:
+            indices = indices[: self.subset_size]
         if indices.numel() < self.total_size:
             pad_count = self.total_size - int(indices.numel())
             pad_source = indices[

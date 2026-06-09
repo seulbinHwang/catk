@@ -69,6 +69,7 @@ class MultiDataModule(LightningDataModule):
         train_max_num: int,
         train_use_eval_agent_selection: bool = False,
         train_epoch_sample_fraction: float = 1.0,
+        train_epoch_sample_fraction_shuffle_flag: bool = True,
         train_memory_balanced_batches: bool = False,
         train_memory_balance_metadata_cache: Optional[str] = None,
         train_memory_balance_metadata_num_workers: int = 8,
@@ -89,6 +90,9 @@ class MultiDataModule(LightningDataModule):
         self.val_batch_size = val_batch_size
         self.test_batch_size = test_batch_size
         self.train_epoch_sample_fraction = float(train_epoch_sample_fraction)
+        self.train_epoch_sample_fraction_shuffle_flag = bool(
+            train_epoch_sample_fraction_shuffle_flag
+        )
         self.train_memory_balanced_batches = bool(train_memory_balanced_batches)
         self.train_memory_balance_metadata_cache = train_memory_balance_metadata_cache
         self.train_memory_balance_metadata_num_workers = int(
@@ -173,6 +177,7 @@ class MultiDataModule(LightningDataModule):
             fraction=self.train_epoch_sample_fraction,
             num_replicas=world_size,
             rank=global_rank,
+            shuffle_fraction_each_epoch=self.train_epoch_sample_fraction_shuffle_flag,
         )
 
     def _build_memory_balanced_batch_sampler(self):
@@ -198,6 +203,7 @@ class MultiDataModule(LightningDataModule):
             shuffle=self.shuffle,
             seed=self.train_memory_balance_seed,
             fraction=self.train_epoch_sample_fraction,
+            shuffle_fraction_each_epoch=self.train_epoch_sample_fraction_shuffle_flag,
         )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
