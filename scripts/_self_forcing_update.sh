@@ -50,8 +50,14 @@ GEN_LR="${GEN_LR:-1e-7}"
 FAKE_LR="${FAKE_LR:-1e-7}"
 USE_EMA="${USE_EMA:-false}"
 DM_OBJECTIVE="${DM_OBJECTIVE:-dmd}"
-PATH_STEP_SIZE="${PATH_STEP_SIZE:-0.05}"   # DMD direction step (normalize off 면 raw gap 계수)
+# normalize on(기본): direction 이 normalizer 로 O(1) 스케일 → step≈1.0 이 원본 DMD 정합.
+# normalize off(raw) 로 쓸 땐 raw gap 이 작아 2.0 같은 큰 값 필요.
+PATH_STEP_SIZE="${PATH_STEP_SIZE:-1.0}"   # DMD direction step (normalize on 이면 ≈1.0)
 NORMALIZE_DIRECTION="${NORMALIZE_DIRECTION:-true}"  # false=거리-나눗셈 제거(raw, 수렴형)
+# normalizer 모드. false(기본)=시간+채널 전체 평균(agent당 스칼라, 원본 DMD 정합, 분모
+# 안정). 죽은 채널(non-holonomic delta_n)은 direction/normalizer 양쪽에서 masking 제외.
+# true=시간축만 평균(채널별 분모) — 분모 불안정 → push 폭발하던 기존 방식.
+PER_CHANNEL_NORMALIZER="${PER_CHANNEL_NORMALIZER:-false}"
 ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-1}"
 # 반복 warmup/joint zone 스케줄(step 기준). 둘 다 양수면 warmup zone(critic만)과
 # joint zone(기존 cadence DMD)을 step 기준으로 번갈아 무한 반복. 0/0 이면 비활성.
@@ -121,6 +127,7 @@ set -- \
   model.model_config.self_forced.distribution_matching_objective="${DM_OBJECTIVE}" \
   model.model_config.self_forced.path_step_size="${PATH_STEP_SIZE}" \
   model.model_config.self_forced.normalize_direction="${NORMALIZE_DIRECTION}" \
+  model.model_config.self_forced.clean_dmd_per_channel_normalizer="${PER_CHANNEL_NORMALIZER}" \
   model.model_config.self_forced.use_anchor_flow_matching_loss="${USE_ANCHOR_FM_LOSS}" \
   model.model_config.self_forced.anchor_weight="${ANCHOR_WEIGHT}" \
   model.model_config.sim_agents_metric_workers="${SIM_AGENTS_METRIC_WORKERS}" \
@@ -152,6 +159,7 @@ echo "  GPU=${CUDA_VISIBLE_DEVICES} nproc=${NPROC_PER_NODE}  ckpt=${CKPT_PATH}"
 echo "  cadence(fake:gen)=${CADENCE}:1  est_updates/batch=${ESTIMATOR_UPDATES_PER_STEP}  gen_lr=${GEN_LR} fake_lr=${FAKE_LR}"
 echo "  estimator_init_ckpt=${ESTIMATOR_INIT_CKPT:-<none>}"
 echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
+echo "  normalize_dir=${NORMALIZE_DIRECTION} per_channel_norm=${PER_CHANNEL_NORMALIZER} path_step=${PATH_STEP_SIZE}"
 echo "  anchor_fm_loss=${USE_ANCHOR_FM_LOSS} anchor_weight=${ANCHOR_WEIGHT}"
 echo "  zone_schedule(warmup:joint steps)=${WARMUP_ZONE_STEPS}:${JOINT_ZONE_STEPS} (0:0=off)"
 echo "  unfrozen_range=${UNFROZEN_RANGE:-<config default>}"
