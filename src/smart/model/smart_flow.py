@@ -248,6 +248,20 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 0.05
         )
+        self.self_forced_dmd_beta = (
+            float(getattr(self.self_forced_config, "beta", 1.0))
+            if self.self_forced_config is not None
+            else 1.0
+        )
+        if (
+            not math.isfinite(self.self_forced_dmd_beta)
+            or self.self_forced_dmd_beta <= 0.0
+            or self.self_forced_dmd_beta > 1.0
+        ):
+            raise ValueError(
+                "self_forced.beta must be finite and in the interval (0, 1], "
+                f"got {self.self_forced_dmd_beta!r}."
+            )
         self.self_forced_distribution_matching_objective = (
             str(getattr(self.self_forced_config, "distribution_matching_objective", "dmd")).lower()
             if self.self_forced_config is not None
@@ -2980,6 +2994,7 @@ class SMARTFlow(LightningModule):
                     active_mask=active_control_mask,
                     stable_scale_group_index=stable_scale_group_index,
                     normalizer_eps=self.self_forced_direction_normalizer_eps,
+                    beta=self.self_forced_dmd_beta,
                     use_stable_scale_filter=self.self_forced_dmd_use_stable_scale_filter,
                     use_teacher_alignment_filter=self.self_forced_dmd_use_teacher_alignment_filter,
                     use_trust_region_filter=self.self_forced_dmd_use_trust_region_filter,
@@ -3125,6 +3140,7 @@ class SMARTFlow(LightningModule):
             active_mask=None,
             stable_scale_group_index=stable_scale_group_index,
             normalizer_eps=self.self_forced_direction_normalizer_eps,
+            beta=self.self_forced_dmd_beta,
             use_stable_scale_filter=self.self_forced_dmd_use_stable_scale_filter,
             use_teacher_alignment_filter=self.self_forced_dmd_use_teacher_alignment_filter,
             use_trust_region_filter=self.self_forced_dmd_use_trust_region_filter,

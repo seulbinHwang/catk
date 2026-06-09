@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -151,6 +153,7 @@ def build_clean_dmd_direction(
     active_mask: Tensor | None = None,
     stable_scale_group_index: Tensor | None = None,
     normalizer_eps: float = 0.05,
+    beta: float = 1.0,
     use_stable_scale_filter: bool = True,
     use_teacher_alignment_filter: bool = False,
     use_trust_region_filter: bool = False,
@@ -170,6 +173,8 @@ def build_clean_dmd_direction(
             ``None``이면 agent별로 ``mean(abs(G))`` 를 계산합니다. shape은
             ``[n_valid_agent]`` 입니다.
         normalizer_eps: absolute-mean stable scale의 최소값입니다.
+        beta: teacher score 방향 tempering 계수입니다. ``1.0`` 이면 기존 DMD,
+            ``0 < beta < 1`` 이면 teacher 방향만 약하게 만든 tempered-DMD입니다.
         use_stable_scale_filter: True이면 teacher-estimator 차이를
             group별 ``max(mean(abs(G)), eps)`` 로 나눕니다.
         use_teacher_alignment_filter: True이면 teacher 방향과 정렬된 agent만 남깁니다.
@@ -181,10 +186,19 @@ def build_clean_dmd_direction(
         shape은 ``[n_valid_agent, flow_window_steps, 4]`` 입니다.
 
     설명:
-        이 함수는 teacher-estimator clean 추정 차이 ``R`` 을 기본 DMD 방향으로 둡니다.
+        이 함수는 ``beta=1`` 에서 teacher-estimator clean 추정 차이 ``R`` 을
+        기본 DMD 방향으로 둡니다. ``beta<1`` 에서는 noisy/committed state 기준
+        teacher score 방향만 tempering해 ``beta * (T - X) - (G - X)`` 를 씁니다.
         세 안정화 필터는 config로 독립적으로 켜고 끌 수 있습니다. control-space
         non-holonomic DMD에서는 vehicle/cyclist의 lateral 축을 active mask로 제거합니다.
     """
+    beta_value = float(beta)
+    if not math.isfinite(beta_value) or beta_value <= 0.0 or beta_value > 1.0:
+        raise ValueError(
+            "self-forced DMD beta must be finite and in the interval (0, 1], "
+            f"got {beta!r}."
+        )
+
     expected_shape = tuple(committed_path_norm.shape)
     if tuple(target_clean_norm.shape) != expected_shape:
         raise ValueError(
@@ -229,7 +243,13 @@ def build_clean_dmd_direction(
             ) from exc
         active_count = active.sum(dim=reduce_dims, keepdim=True).clamp_min(1.0)
 
-    teacher_estimator_delta = target_clean - generated_clean
+    if beta_value == 1.0:
+        teacher_estimator_delta = target_clean - generated_clean
+    else:
+        teacher_estimator_delta = (
+            beta_value * (target_clean - committed)
+            - (generated_clean - committed)
+        )
     generator_teacher_delta = committed - target_clean
     if active is not None:
         teacher_estimator_delta = teacher_estimator_delta * active

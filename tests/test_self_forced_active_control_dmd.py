@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from src.smart.modules.kinematic_control import (
@@ -177,6 +178,40 @@ def test_active_control_dmd_filters_are_independently_configurable() -> None:
         use_trust_region_filter=False,
     )
     torch.testing.assert_close(aligned_direction, torch.zeros_like(aligned_direction))
+
+
+def test_active_control_dmd_beta_tempers_teacher_score_direction_only() -> None:
+    committed = torch.tensor([[[10.0, 0.0, 0.0]]])
+    target_clean = torch.tensor([[[12.0, 0.0, 0.0]]])
+    generated_clean = torch.tensor([[[9.0, 0.0, 0.0]]])
+
+    direction = build_clean_dmd_direction(
+        committed_path_norm=committed,
+        target_clean_norm=target_clean,
+        generated_clean_norm=generated_clean,
+        active_mask=None,
+        normalizer_eps=0.05,
+        beta=0.5,
+        use_stable_scale_filter=False,
+        use_teacher_alignment_filter=False,
+        use_trust_region_filter=False,
+    )
+
+    torch.testing.assert_close(direction, torch.tensor([[[2.0, 0.0, 0.0]]]))
+
+
+def test_active_control_dmd_rejects_invalid_beta() -> None:
+    committed = torch.zeros((1, 1, 3))
+    target_clean = torch.zeros_like(committed)
+    generated_clean = torch.zeros_like(committed)
+
+    with pytest.raises(ValueError, match="beta"):
+        build_clean_dmd_direction(
+            committed_path_norm=committed,
+            target_clean_norm=target_clean,
+            generated_clean_norm=generated_clean,
+            beta=0.0,
+        )
 
 
 def test_active_control_dmd_stable_scale_ignores_teacher_estimator_rms() -> None:
