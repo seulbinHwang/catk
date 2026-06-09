@@ -2069,7 +2069,7 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=0` 입니다. self-forcing 시작 직후부터 generated estimator 업데이트와 Generator 업데이트를 같은 train step 안에서 수행합니다.
 - 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
 - self-forced preset은 각 epoch마다 train dataset의 25%만 새로 랜덤 샘플링해 학습합니다. 비율은 `data.train_epoch_sample_fraction` 으로 바꾸며, `1.0` 으로 두면 전체 train dataset을 사용합니다.
-- self-forcing DMD/SID 본체는 scene 안의 rollout anchor를 `model.model_config.self_forced.rollout_anchor_stride` 간격으로 사용합니다. 기본값 `4` 는 사람 기준 `1, 5, 9, 13`번째 anchor, 코드 기준 offset `0, 4, 8, 12`를 쓰며, `1` 로 두면 16개 anchor를 모두 사용합니다.
+- self-forcing DMD/SID 본체는 scene 안의 rollout anchor를 `model.model_config.self_forced.rollout_anchor_stride` 간격으로 사용합니다. 기본값 `2` 는 사람 기준 `1, 3, 5, 7, 9, 11, 13, 15`번째 anchor, 코드 기준 offset `0, 2, 4, 6, 8, 10, 12, 14`를 쓰며, `1` 로 두면 16개 anchor를 모두 사용합니다.
 - self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 LR scheduler를 쓰지 않습니다. Generator는 `model.model_config.lr`, generated estimator는 `model.model_config.self_forced.generated_estimator_lr` 를 사용합니다. 기본값은 `${model.model_config.lr}` 이므로 override하지 않으면 기존처럼 두 optimizer의 LR이 같습니다. 따라서 self-forced preset에는 `lr_warmup_steps` / `lr_min_ratio` override를 두지 않습니다.
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
 - 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/epoch 를 resume하지 않고 pretrained weight만 로드합니다.
@@ -2605,6 +2605,70 @@ kubectl exec -it -n p-pnc testaa -c main -- \
 
 ```bash
 python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py --stop
+```
+
+#### testa/testaa A100x4x2 multi-anchor DMD self-forcing
+
+`semi_control_sf_anchor` 브랜치의 multi-anchor self-forcing 구현을 A100 4GPU pod
+2개(`testa`, `testaa`)에서 돌릴 때는 아래 wrapper를 사용합니다. 이 wrapper는
+기존 A100x4x2 static pod launcher를 그대로 쓰되, `rollout_anchor_stride=2`와
+per-rank `data.train_batch_size=24`를 기본으로 둡니다.
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py --replace
+```
+
+짧은 multi-node smoke/probe만 확인하려면:
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py \
+  --replace \
+  --task-name flow_self_forced_dmd_a100x4x2_testa_sfanchor_stride2_smoke_bs24 \
+  --session catk-self-forced-dmd-a100x4x2-testa-sfanchor-smoke \
+  --initial-bs 24 \
+  --max-epochs 1 \
+  --limit-train-batches 2 \
+  --limit-val-batches 0
+```
+
+기본 실험 설정:
+
+| 항목 | 값 |
+|---|---|
+| pods | `testa` 4 A100 + `testaa` 4 A100 |
+| branch | `semi_control_sf_anchor` |
+| experiment | `self_forced_npfm_a100x4x2` |
+| default task | `flow_self_forced_dmd_a100x4x2_testa_sfanchor_stride2_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs24_frac025_ep16_middle_oomretry` |
+| pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_a100x4x2_testa_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=2`, 즉 anchor offset `0,2,4,6,8,10,12,14` |
+| DDP shape | `trainer.num_nodes=2`, `trainer.devices=4`, 총 8 ranks |
+| precision | `bf16-mixed` |
+| lr | Generator `1.0e-6`, generated estimator `1.0e-6` |
+| estimator warmup | `1` epoch, W&B generated-estimator warmup bank 사용 |
+| DMD objective | `model.model_config.self_forced.distribution_matching_objective=dmd` |
+| detach block transition | `false` |
+| self-forced sample steps | Euler `sample_steps=16` |
+| self-forced backprop | `backprop_last_k=8` |
+| random terminal policy | `all` |
+| train data fraction | `data.train_epoch_sample_fraction=0.25` |
+| validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1` |
+| epochs | `16` |
+| initial train batch | per-rank `24`, effective global scene batch `192` |
+| OOM fallback | `24 -> 23 -> 22 -> ... -> 4`, latest self-forced checkpoint resume |
+| val/test batch | per-rank `8` |
+| scorer scenes | `1680` |
+| tmux session | `catk-self-forced-dmd-a100x4x2-testa-sfanchor-stride2` |
+
+`rollout_anchor_stride=2`에서는 scene마다 8개 anchor를 self-forcing 본체에 쓰므로,
+per-rank `bs24`의 anchor-rollout 수는 기존 첫-anchor 방식의 `bs192`와 같은 규모입니다.
+`rollout_anchor_stride=1`로 override하면 16개 anchor 전체를 사용하므로, 같은 메모리
+한계를 유지하려면 batch를 추가로 낮춰야 합니다.
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py --stop
 ```
 
 #### testa A100x4 single-pod DMD self-forcing fine-tuning

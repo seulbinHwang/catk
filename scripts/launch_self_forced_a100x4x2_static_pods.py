@@ -779,11 +779,11 @@ find_latest_self_forced_ckpt() {{
 
 strip_shell_quotes() {{
   local value="$1"
-  value="${{value%\"}}"
-  value="${{value#\"}}"
+  value="${{value%\\\"}}"
+  value="${{value#\\\"}}"
   value="${{value%\'}}"
   value="${{value#\'}}"
-  printf '%s\n' "$value"
+  printf '%s\\n' "$value"
 }}
 
 resolve_generated_estimator_lr_config() {{
@@ -1229,7 +1229,7 @@ mkdir -p {shq(root + '/retry_state')}
     if args.pull:
         pull_block = f"""
 git config --global --add safe.directory {shq(args.project_root)} || true
-git fetch origin {shq(args.branch + ':refs/remotes/origin/' + args.branch)}
+git fetch origin {shq('+' + args.branch + ':refs/remotes/origin/' + args.branch)}
 if git show-ref --verify --quiet {shq('refs/heads/' + args.branch)}; then
   git checkout {shq(args.branch)}
 else
