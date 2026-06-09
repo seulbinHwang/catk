@@ -58,6 +58,12 @@ NORMALIZE_DIRECTION="${NORMALIZE_DIRECTION:-true}"  # false=거리-나눗셈 제
 # 안정). 죽은 채널(non-holonomic delta_n)은 direction/normalizer 양쪽에서 masking 제외.
 # true=시간축만 평균(채널별 분모) — 분모 불안정 → push 폭발하던 기존 방식.
 PER_CHANNEL_NORMALIZER="${PER_CHANNEL_NORMALIZER:-false}"
+# gradient 경로 정책.
+#   all(기본)=random terminal 미생성 → 블록 간 detach 제거(전 horizon grad) + backprop_last_k
+#     경로. BACKPROP_LAST_K=16=sample_steps 면 16 ODE step 전부 grad. (full-gradient)
+#   paper_uniform=원본식 truncation(블록 detach + 마지막 1개 ODE step만 grad, τ≈1 고정).
+TERMINAL_POLICY="${TERMINAL_POLICY:-all}"
+BACKPROP_LAST_K="${BACKPROP_LAST_K:-16}"   # policy=all 일 때 grad 남길 마지막 ODE step 수
 ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-1}"
 # 반복 warmup/joint zone 스케줄(step 기준). 둘 다 양수면 warmup zone(critic만)과
 # joint zone(기존 cadence DMD)을 step 기준으로 번갈아 무한 반복. 0/0 이면 비활성.
@@ -128,6 +134,8 @@ set -- \
   model.model_config.self_forced.path_step_size="${PATH_STEP_SIZE}" \
   model.model_config.self_forced.normalize_direction="${NORMALIZE_DIRECTION}" \
   model.model_config.self_forced.clean_dmd_per_channel_normalizer="${PER_CHANNEL_NORMALIZER}" \
+  model.model_config.self_forced.sampling.random_terminal_step.policy="${TERMINAL_POLICY}" \
+  model.model_config.self_forced.sampling.backprop_last_k="${BACKPROP_LAST_K}" \
   model.model_config.self_forced.use_anchor_flow_matching_loss="${USE_ANCHOR_FM_LOSS}" \
   model.model_config.self_forced.anchor_weight="${ANCHOR_WEIGHT}" \
   model.model_config.sim_agents_metric_workers="${SIM_AGENTS_METRIC_WORKERS}" \
@@ -160,6 +168,7 @@ echo "  cadence(fake:gen)=${CADENCE}:1  est_updates/batch=${ESTIMATOR_UPDATES_PE
 echo "  estimator_init_ckpt=${ESTIMATOR_INIT_CKPT:-<none>}"
 echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "  normalize_dir=${NORMALIZE_DIRECTION} per_channel_norm=${PER_CHANNEL_NORMALIZER} path_step=${PATH_STEP_SIZE}"
+echo "  grad_policy=${TERMINAL_POLICY} backprop_last_k=${BACKPROP_LAST_K} (all+16=full-gradient: 블록 detach 없음 + 16 ODE step 전부)"
 echo "  anchor_fm_loss=${USE_ANCHOR_FM_LOSS} anchor_weight=${ANCHOR_WEIGHT}"
 echo "  zone_schedule(warmup:joint steps)=${WARMUP_ZONE_STEPS}:${JOINT_ZONE_STEPS} (0:0=off)"
 echo "  unfrozen_range=${UNFROZEN_RANGE:-<config default>}"
