@@ -2064,7 +2064,7 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
 - H100 preset은 Generator lr `1e-6`, generated estimator optimizer lr `model.model_config.self_forced.generated_estimator_lr=${model.model_config.lr}` (기본 `1e-6`), `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=middle`, `detach_block_transition=false`, sampling = Euler `sample_steps=16` / `backprop_last_k=8` / `noise_scale=1.0` 을 기본으로 둡니다.
-- Bounded Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=0.05`, `dmd_stable_scale_scope=type`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다. `clean_dmd_normalizer_eps` 는 stable scale의 최소값입니다.
+- Bounded Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=0.05`, `dmd_stable_scale_scope=agent`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다. `clean_dmd_normalizer_eps` 는 stable scale의 최소값입니다.
 - Generator EMA 기본값은 `ema_weight=0.99`, `ema_start_step=50` 입니다. EMA는 online Generator update 직후에만 갱신되고, generated estimator에는 적용하지 않습니다.
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=0` 입니다. self-forcing 시작 직후부터 generated estimator 업데이트와 Generator 업데이트를 같은 train step 안에서 수행합니다.
 - 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
@@ -2085,7 +2085,7 @@ model:
     self_forced:
       project_dmd_to_pose_space: false
       dmd_use_stable_scale_filter: true
-      dmd_stable_scale_scope: type
+      dmd_stable_scale_scope: agent
       dmd_use_teacher_alignment_filter: false
       dmd_use_trust_region_filter: false
       dmd_use_injection_ramp: false
@@ -2148,7 +2148,7 @@ Clean-DMD 방향 안정화 필터는 pose-projected 경로와 direct control-spa
 | config | 기본값 | 의미 |
 |---|---:|---|
 | `dmd_use_stable_scale_filter` | `true` | \(S=\max(\mathrm{mean}(|G|),\epsilon)\) 로 나눈 \(D_0=R/S\) 방향을 사용합니다. 평균 범위는 `dmd_stable_scale_scope`가 정합니다. |
-| `dmd_stable_scale_scope` | `type` | `agent`는 agent별, `type`은 같은 scene 안 같은 agent type별, `scene`은 같은 scene 전체 agent별로 stable scale을 공유합니다. |
+| `dmd_stable_scale_scope` | `agent` | `agent`는 agent별, `type`은 같은 scene 안 같은 agent type별, `scene`은 같은 scene 전체 agent별로 stable scale을 공유합니다. |
 | `dmd_use_teacher_alignment_filter` | `false` | \(a=\mathbf{1}[\langle P_T-P_X,R\rangle>0]\) gate를 적용해 teacher 방향과 정렬된 agent만 남깁니다. |
 | `dmd_use_trust_region_filter` | `false` | \(D=D_1\min(1,\mathrm{rms}(G)/(\mathrm{rms}(D_1)+\epsilon))\) 로 DMD 방향 크기를 teacher 거리 이하로 제한합니다. |
 | `dmd_use_injection_ramp` | `false` | `true`이면 DMD target 주입량을 warmup 종료 후 첫 generator-DMD epoch부터 \(\lambda_e=0.25+0.75\min(1,\frac{\max(0,e-e_0)}{2})\) 로 2 epoch 동안 키웁니다. `false`이면 항상 \(\lambda=1\) 입니다. |
@@ -3990,8 +3990,8 @@ K commit block 수 = flow_window_steps / 5
 - 약한 open-loop flow-matching anchor. `model.model_config.self_forced.use_anchor_flow_matching_loss=false` 로 두면 `anchor_weight` 값과 무관하게 self-forced active step에서 training-mode open-loop forward와 FM loss 계산 자체를 생략합니다. `true` 일 때만 `model.model_config.self_forced.anchor_weight` 로 total loss 반영 강도를 제어합니다. anchor FM 을 켠 경우에도 `unfrozen_range` 로 열린 online Generator 파라미터만 학습합니다. anchor FM 을 끈 상태에서 어떤 rank 의 committed self-rollout 까지 비어있는 (모든 agent 가 invalid anchor0) 드문 경우에는, encoder 파라미터 합에 0 을 곱한 zero-loss 로 backward 만 한 번 돌려 DDP all-reduce 참여를 보장하고 optimizer step 은 건너뜁니다. 이 가드가 없으면 그 rank 만 backward 를 호출하지 않아 다른 rank 의 NCCL all-reduce 가 NCCL_TIMEOUT 까지 hang 합니다.
 - Anchor-only self-forced mode. `model.model_config.self_forced.enabled=true`, `use_anchor_flow_matching_loss=true`, `use_distribution_matching_loss=false` 로 두면 self-forced optimizer와 `unfrozen_range` 는 유지하되 self-rollout, generated estimator 업데이트, DMD/SiD `sf_loss`, estimator warmup을 모두 건너뛰고 anchor FM loss만 학습합니다. 이때 `train/sf_npfm_loss` 와 `train/sf_generated_estimator_loss` 는 0으로 기록됩니다.
 - 선택적 trainable range. `model.model_config.self_forced.unfrozen_range=middle` 이 기본값이며, map encoder와 대부분의 agent 문맥부는 고정하고 마지막 agent 문맥 블록과 flow decoder만 학습합니다. `except_map_encoder` 는 map encoder만 고정하고 나머지 Generator / generated estimator 파라미터를 열며, `full_flow_decoder` 는 마지막 궤적 생성부만 엽니다.
-- epoch별 train subset sampling. self-forced preset은 `data.train_epoch_sample_fraction=0.25` 를 기본으로 두어 매 epoch 전체 train dataset의 25%만 학습합니다. `data.train_epoch_sample_fraction_shuffle_flag=true` 가 기본값이며, 이때는 기존처럼 매 epoch마다 전체 train dataset에서 해당 비율을 새로 랜덤 샘플링합니다. DDP에서는 모든 rank가 같은 전역 subset을 공유한 뒤 rank별로 나눠 받습니다. `1.0` 으로 override하면 기존처럼 전체 train dataset을 씁니다.
-- 순차 partition train subset sampling. `data.train_epoch_sample_fraction_shuffle_flag=false` 로 두면 `1 / train_epoch_sample_fraction` 이 자연수인지 확인한 뒤, train dataset을 cycle마다 새로 랜덤 셔플하고 fraction 단위 partition으로 나눠 epoch 순서대로 하나씩 사용합니다. 예를 들어 `train_epoch_sample_fraction=0.25` 에서는 4 epoch cycle을 만들고, epoch 0~3 동안 전체 train dataset을 partition 중복 없이 한 번 덮은 뒤 epoch 4에서 다시 새 셔플 cycle을 시작합니다. 일반 sampler 경로와 `data.train_memory_balanced_batches=true` 경로 모두 같은 subset partition을 먼저 고른 뒤, memory-balanced 경로는 그 subset 안에서 기존 batch balancing을 적용합니다. Dataset 크기가 cycle length로 정확히 나뉘지 않으면 partition 크기는 최대 1개 sample 차이까지 날 수 있으며, DDP/batch padding은 기존 sampler와 동일하게 처리됩니다.
+- 순차 partition train subset sampling. self-forced preset은 `data.train_epoch_sample_fraction=0.25` 를 기본으로 두어 매 epoch 전체 train dataset의 25%만 학습합니다. `data.train_epoch_sample_fraction_shuffle_flag=false` 가 기본값이며, 이때는 `1 / train_epoch_sample_fraction` 이 자연수인지 확인한 뒤 train dataset을 cycle마다 새로 랜덤 셔플하고 fraction 단위 partition으로 나눠 epoch 순서대로 하나씩 사용합니다. 예를 들어 `train_epoch_sample_fraction=0.25` 에서는 4 epoch cycle을 만들고, epoch 0~3 동안 전체 train dataset을 partition 중복 없이 한 번 덮은 뒤 epoch 4에서 다시 새 셔플 cycle을 시작합니다. 일반 sampler 경로와 `data.train_memory_balanced_batches=true` 경로 모두 같은 subset partition을 먼저 고른 뒤, memory-balanced 경로는 그 subset 안에서 기존 batch balancing을 적용합니다. Dataset 크기가 cycle length로 정확히 나뉘지 않으면 partition 크기는 최대 1개 sample 차이까지 날 수 있으며, DDP/batch padding은 기존 sampler와 동일하게 처리됩니다.
+- epoch별 random train subset sampling. 예전처럼 매 epoch마다 전체 train dataset에서 해당 비율을 새로 랜덤 샘플링하려면 `data.train_epoch_sample_fraction_shuffle_flag=true` 로 override합니다. DDP에서는 모든 rank가 같은 전역 subset을 공유한 뒤 rank별로 나눠 받습니다. `train_epoch_sample_fraction=1.0` 으로 override하면 전체 train dataset을 씁니다.
 - Generator EMA는 Generator에만 적용합니다. `F_psi` 는 현재 online Generator가 만든 분포를 따라가야 하므로 EMA를 두지 않고, `F_rho` 는 pretrained 기준점이라 계속 frozen 상태로 둡니다.
 - bf16-mixed 안전 backward boundary. self-forced 경로의 forward 와 loss 계산은 mixed precision 으로 유지하되, `manual_backward` 호출 순간만 autocast 를 끄고 scalar loss 를 fp32 로 넘깁니다. 이는 manual optimization 에서 반복 backward 를 수행할 때 PyTorch autocast promote 규칙이 backward graph 의 dtype 을 다시 분류하다가 실패하는 문제를 피하기 위한 경계입니다.
 - autograd-safe temporal edge remap. training rollout 에서는 temporal relation embedding 계산에 쓴 원본 `edge_index_t` 를 in-place 수정하지 않고, current-agent attention 용 remapped edge index 를 새 tensor 로 만들어 사용합니다.
@@ -4033,15 +4033,15 @@ model:
       ema_start_step: 50
 data:
   train_epoch_sample_fraction: 0.25
-  train_epoch_sample_fraction_shuffle_flag: true
+  train_epoch_sample_fraction_shuffle_flag: false
 ```
 
-순차 partition 모드를 쓰려면 아래처럼 override합니다.
+기존 epoch별 random subset 모드로 되돌리려면 아래처럼 override합니다.
 
 ```bash
 python -m src.run experiment=self_forced_npfm action=finetune \
   data.train_epoch_sample_fraction=0.25 \
-  data.train_epoch_sample_fraction_shuffle_flag=false
+  data.train_epoch_sample_fraction_shuffle_flag=true
 ```
 
 최종 inference 모델은 fine-tuning 된 Generator의 EMA copy입니다. EMA가 아직 준비되지 않은 early checkpoint나 old checkpoint에서는 online Generator로 fallback합니다. `F_rho` 와 `F_psi` 는 학습 시점 보조 모델이며 submission export 에는 사용하지 않습니다.

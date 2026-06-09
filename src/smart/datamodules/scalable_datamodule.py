@@ -69,7 +69,7 @@ class MultiDataModule(LightningDataModule):
         train_max_num: int,
         train_use_eval_agent_selection: bool = False,
         train_epoch_sample_fraction: float = 1.0,
-        train_epoch_sample_fraction_shuffle_flag: bool = True,
+        train_epoch_sample_fraction_shuffle_flag: bool = False,
         train_memory_balanced_batches: bool = False,
         train_memory_balance_metadata_cache: Optional[str] = None,
         train_memory_balance_metadata_num_workers: int = 8,

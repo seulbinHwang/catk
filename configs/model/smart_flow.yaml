@@ -83,8 +83,8 @@ model_config:
     # and direct control-space DMD paths.
     dmd_use_stable_scale_filter: true
     # Stable scale sharing scope: agent, type, or scene.
-    # type means agents with the same type in the same scene share one scale.
-    dmd_stable_scale_scope: type
+    # agent means each agent keeps its own stable scale.
+    dmd_stable_scale_scope: agent
     dmd_use_teacher_alignment_filter: false
     dmd_use_trust_region_filter: false
     dmd_use_injection_ramp: false

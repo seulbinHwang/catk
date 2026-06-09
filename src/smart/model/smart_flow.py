@@ -283,9 +283,9 @@ class SMARTFlow(LightningModule):
             else True
         )
         self.self_forced_dmd_stable_scale_scope = (
-            str(getattr(self.self_forced_config, "dmd_stable_scale_scope", "type")).lower()
+            str(getattr(self.self_forced_config, "dmd_stable_scale_scope", "agent")).lower()
             if self.self_forced_config is not None
-            else "type"
+            else "agent"
         )
         if self.self_forced_dmd_stable_scale_scope not in {"agent", "type", "scene"}:
             raise ValueError(
