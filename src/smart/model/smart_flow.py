@@ -806,8 +806,68 @@ class SMARTFlow(LightningModule):
         sync_device = device if device is not None else self._first_parameter_device(self)
         flag = torch.tensor(int(bool(value)), device=sync_device, dtype=torch.long)
         if self._distributed_available_and_initialized():
+            self._sf_ctrace("sync_bool_any")
             torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
         return bool(flag.item())
+
+    def log(self, name, *args, **kwargs):  # type: ignore[override]
+        """[DIAG] SF_CTRACE 켜지면 sync_dist+on_epoch 로그 키를 rank별로 찍는다 (desync 키 특정용)."""
+        import os
+        if os.environ.get("SF_CTRACE") and kwargs.get("sync_dist") and kwargs.get("on_epoch"):
+            import sys
+            try:
+                _r = self.global_rank
+            except Exception:
+                _r = -1
+            print(f"[LOGKEY r{_r}] {name}", file=sys.stderr, flush=True)
+        return super().log(name, *args, **kwargs)
+
+    def _sf_ctrace(self, tag: str) -> None:
+        """[DIAG] env SF_CTRACE 켜졌을 때만 collective 발행을 rank별 전역 순번/실제 호출부 line과 함께 stderr 로 찍는다."""
+        import os
+        if not os.environ.get("SF_CTRACE"):
+            return
+        import sys, traceback
+        # limit=3: [실제 호출부, _sf_ctrace 를 부른 메서드, _sf_ctrace] → [0]=실제 호출부
+        stack = traceback.extract_stack(limit=3)
+        site = stack[0]
+        self._sf_ctrace_n = getattr(self, "_sf_ctrace_n", 0) + 1
+        print(
+            f"[CTRACE r{self.global_rank}] #{self._sf_ctrace_n} {tag} "
+            f"@{site.name}:L{site.lineno} batch={getattr(self, '_sf_ctrace_batch', '?')}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _epoch_boundary_trace(self, tag: str, **fields: Any) -> None:
+        """Emit low-level rank breadcrumbs around epoch-boundary code paths."""
+        import os
+        if not os.environ.get("CATK_EPOCH_BOUNDARY_DEBUG"):
+            return
+        import sys
+        import time
+
+        parts = [
+            f"rank={getattr(self, 'global_rank', '?')}",
+            f"epoch={getattr(self, 'current_epoch', '?')}",
+            f"global_step={getattr(self, 'global_step', '?')}",
+            f"batch={getattr(self, '_sf_ctrace_batch', '?')}",
+            f"t={time.strftime('%H:%M:%S')}",
+        ]
+        for key, value in fields.items():
+            parts.append(f"{key}={value}")
+        device = getattr(self, "device", None)
+        if (
+            torch.cuda.is_available()
+            and device is not None
+            and getattr(device, "type", None) == "cuda"
+        ):
+            try:
+                parts.append(f"cuda_alloc_mb={torch.cuda.memory_allocated(device) // (1024 * 1024)}")
+                parts.append(f"cuda_reserved_mb={torch.cuda.memory_reserved(device) // (1024 * 1024)}")
+            except RuntimeError:
+                pass
+        print(f"[EBOUND] {tag} " + " ".join(parts), file=sys.stderr, flush=True)
 
     def _start_distributed_bool_any(
         self,
@@ -819,6 +879,7 @@ class SMARTFlow(LightningModule):
         sync_device = device if device is not None else self._first_parameter_device(self)
         flag = torch.tensor(int(bool(value)), device=sync_device, dtype=torch.long)
         if self._distributed_available_and_initialized():
+            self._sf_ctrace("start_bool_any(async)")
             work = torch.distributed.all_reduce(
                 flag,
                 op=torch.distributed.ReduceOp.MAX,
@@ -888,6 +949,7 @@ class SMARTFlow(LightningModule):
         )
         self._reset_open_loop_train_epoch_metrics()
         if self._distributed_available_and_initialized():
+            self._sf_ctrace("epoch_metric_allreduce(12)")
             torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
 
         n_metric = len(self._train_open_epoch_log_names)
@@ -1987,6 +2049,7 @@ class SMARTFlow(LightningModule):
             ``_clip_and_step_with_optional_scaler`` 를 통해 unscale → clip → step → update
             순서를 지킵니다.
         """
+        self._sf_ctrace("manual_backward(DDP grad allreduce)")
         with torch.autocast(device_type=loss.device.type, enabled=False):
             self.manual_backward(loss.float())
 
@@ -2754,14 +2817,18 @@ class SMARTFlow(LightningModule):
         Returns:
             None
         """
+        self._epoch_boundary_trace("on_fit_start:enter")
         self._configure_fast_wosac_validation_scope()
         self._apply_fit_time_validation_batch_limit()
         self._sync_self_forced_auxiliary_models()
         self._prepare_self_forced_generator_ema()
+        self._epoch_boundary_trace("on_fit_start:exit")
 
     def on_validation_start(self) -> None:
         """validation 시작 직전에 scorer batch 수 자동 조정을 다시 시도합니다."""
+        self._epoch_boundary_trace("on_validation_start:enter")
         self._configure_fast_wosac_validation_scope()
+        self._epoch_boundary_trace("on_validation_start:exit")
 
     def setup(self, stage: str) -> None:
         """validation dataloader cap이 scorer scene 수보다 작지 않도록 미리 맞춥니다."""
@@ -2774,7 +2841,9 @@ class SMARTFlow(LightningModule):
         Returns:
             None
         """
+        self._epoch_boundary_trace("on_fit_end:enter")
         self._restore_fit_time_validation_batch_limit()
+        self._epoch_boundary_trace("on_fit_end:exit")
 
     @staticmethod
     def _summarize_nonfinite_tensor(tensor: Tensor) -> str:
@@ -2874,6 +2943,7 @@ class SMARTFlow(LightningModule):
         # 반복 warmup/joint zone 스케줄용 step 카운터. 한 batch 내 모든 warmup 판정이
         # 같은 값을 보도록 맨 위에서 1회만 증가시킵니다.
         self._sf_zone_step = int(self._sf_zone_step) + 1
+        self._epoch_boundary_trace("sf_step:enter", batch_idx=int(batch_idx))
 
         fm_loss = None
         open_metric_dict = None
@@ -2908,19 +2978,37 @@ class SMARTFlow(LightningModule):
         is_generator_step = (not warmup_active) and (
             (int(batch_idx) + 1) % self.self_forced_cadence == 0
         )
+        self._epoch_boundary_trace(
+            "sf_step:cadence",
+            batch_idx=int(batch_idx),
+            warmup=int(bool(warmup_active)),
+            generator_step=int(bool(is_generator_step)),
+            cadence=int(self.self_forced_cadence),
+        )
+        self._epoch_boundary_trace("sf_rollout:start", generator_step=int(bool(is_generator_step)))
         if warmup_active or not is_generator_step:
             with torch.no_grad():
                 rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
         else:
             rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+        self._epoch_boundary_trace("sf_rollout:end", generator_step=int(bool(is_generator_step)))
         committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
             rollout=rollout,
             tokenized_agent=tokenized_agent_eval,
         )
         has_committed_path_local = committed_path_norm.numel() > 0
+        self._epoch_boundary_trace(
+            "sf_committed:local",
+            numel=int(committed_path_norm.numel()),
+            has_local=int(bool(has_committed_path_local)),
+        )
         has_committed_path_global = self._sync_distributed_bool_any(
             has_committed_path_local,
             device=committed_path_norm.device,
+        )
+        self._epoch_boundary_trace(
+            "sf_committed:global",
+            has_global=int(bool(has_committed_path_global)),
         )
         has_anchor_fm_targets_global = False
         if fm_loss is not None:
@@ -2978,6 +3066,7 @@ class SMARTFlow(LightningModule):
             self.log("train/loss_fm", fm_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
             return fm_loss.detach()
 
+        self._epoch_boundary_trace("sf_estimator_update:start")
         gen_estimator_loss = self._update_generated_path_flow_estimator(
             tokenized_map=tokenized_map_eval,
             tokenized_agent=tokenized_agent_eval,
@@ -2985,10 +3074,12 @@ class SMARTFlow(LightningModule):
             anchor_mask=anchor_mask,
             has_committed_path_global=has_committed_path_global,
         )
+        self._epoch_boundary_trace("sf_estimator_update:end")
         if warmup_active:
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
         if not is_generator_step:
             # fake-only batch: estimator 만 업데이트하고 generator 는 건드리지 않는다.
+            self._epoch_boundary_trace("sf_step:fake_only_return")
             self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
             self.log("train/sf_is_generator_step", 0.0, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
             return (
@@ -2996,6 +3087,7 @@ class SMARTFlow(LightningModule):
                 if torch.is_tensor(gen_estimator_loss)
                 else committed_path_norm.new_zeros(()).detach()
             )
+        self._epoch_boundary_trace("sf_generator_loss:start")
         if has_committed_path_local:
             sf_loss = self._compute_self_forced_distribution_matching_loss(
                 tokenized_map=tokenized_map_eval,
@@ -3014,6 +3106,7 @@ class SMARTFlow(LightningModule):
             self.self_forced_weight * sf_loss
             + self.self_forced_anchor_weight * anchor_loss
         )
+        self._epoch_boundary_trace("sf_generator_loss:end")
         if not torch.isfinite(total_loss):
             context = self._format_self_forced_backward_context()
             self._clear_self_forced_backward_context()
@@ -3025,6 +3118,7 @@ class SMARTFlow(LightningModule):
 
         generator_optimizer = self.optimizers()[0]
         try:
+            self._epoch_boundary_trace("sf_generator_backward:start")
             self.toggle_optimizer(generator_optimizer)
             try:
                 generator_optimizer.zero_grad(set_to_none=True)
@@ -3042,6 +3136,7 @@ class SMARTFlow(LightningModule):
                 self.untoggle_optimizer(generator_optimizer)
         finally:
             self._clear_self_forced_backward_context()
+        self._epoch_boundary_trace("sf_generator_backward:end")
 
         self.log("train/loss", total_loss.detach(), on_step=True, on_epoch=True, sync_dist=True, batch_size=1)
         if fm_loss is not None:
@@ -3114,10 +3209,16 @@ class SMARTFlow(LightningModule):
         Returns:
             Tensor: 최종 학습 loss입니다.
         """
+        self._sf_ctrace_batch = int(batch_idx)
+        self._epoch_boundary_trace("training_step:enter", batch_idx=int(batch_idx))
         if self.self_forced_enabled:
             if self._is_self_forced_active():
-                return self._training_step_self_forced(data=data, batch_idx=batch_idx)
-            return self._training_step_manual_open_loop(data=data, batch_idx=batch_idx)
+                result = self._training_step_self_forced(data=data, batch_idx=batch_idx)
+                self._epoch_boundary_trace("training_step:exit", path="self_forced")
+                return result
+            result = self._training_step_manual_open_loop(data=data, batch_idx=batch_idx)
+            self._epoch_boundary_trace("training_step:exit", path="manual_open_loop")
+            return result
         tokenized_map, tokenized_agent = self.token_processor(data)
         """ pred
 flow_pred_norm [n_valid_anchor, 20, 4]
@@ -3162,6 +3263,7 @@ open_metric_dict:
             device=total_loss.device,
         )
         self._automatic_open_loop_has_target_pending.append(has_open_loop_targets_pending)
+        self._epoch_boundary_trace("training_step:exit", path="automatic_open_loop")
         return total_loss
 
     def on_before_optimizer_step(self, optimizer) -> None:
@@ -3290,29 +3392,45 @@ open_metric_dict:
                                 self._cleanup_local_video(video_path)
 
     def on_validation_epoch_end(self):
+        self._epoch_boundary_trace("on_validation_epoch_end:enter")
+        self._epoch_boundary_trace("wosac_distribution:log_reset:start")
         log_and_reset_wosac_distribution_metric(
             model=self,
             metric=self.wosac_distribution_metrics,
         )
+        self._epoch_boundary_trace("wosac_distribution:log_reset:end")
         if self.val_open_loop:
+            self._epoch_boundary_trace("val_open_metrics:compute_reset:start")
             epoch_open_metrics = self._compute_and_reset_validation_metrics(
                 prefix="val_open",
                 metric_store=self.val_open_epoch_metrics,
             )
+            self._epoch_boundary_trace("val_open_metrics:compute_reset:end")
             for metric_name, metric_value in epoch_open_metrics.items():
+                self._epoch_boundary_trace("val_open_metrics:log:start", metric=metric_name)
                 self.log(metric_name, metric_value, on_step=False, on_epoch=True, sync_dist=True)
+                self._epoch_boundary_trace("val_open_metrics:log:end", metric=metric_name)
 
         if self.val_closed_loop:
             if not self.sim_agents_submission.is_active:
+                self._epoch_boundary_trace("sim_agents:drain:start")
                 self.sim_agents_metrics._drain_completed_futures(wait=True, drain_all=True)
+                self._epoch_boundary_trace("sim_agents:drain:end")
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    self._epoch_boundary_trace("sim_agents:get_state_tensor:start")
                     reduced_metric_state = self.sim_agents_metrics.get_state_tensor(device=self.device)
+                    self._epoch_boundary_trace("sim_agents:get_state_tensor:end")
+                    self._epoch_boundary_trace("sim_agents:all_reduce:start")
                     torch.distributed.all_reduce(reduced_metric_state)
+                    self._epoch_boundary_trace("sim_agents:all_reduce:end")
+                    self._epoch_boundary_trace("sim_agents:compute_from_state:start")
                     epoch_sim_agents_metrics = self.sim_agents_metrics.compute_from_state_tensor(
                         reduced_metric_state
                     )
+                    self._epoch_boundary_trace("sim_agents:compute_from_state:end")
                     minade_value: Tensor | None = None
                     if self._should_compute_closed_loop_minade():
+                        self._epoch_boundary_trace("minade:all_reduce:start")
                         reduced_minade_state = torch.stack(
                             [
                                 self.minADE.sum.detach().to(device=self.device),
@@ -3321,8 +3439,11 @@ open_metric_dict:
                         )
                         torch.distributed.all_reduce(reduced_minade_state)
                         minade_value = reduced_minade_state[0] / reduced_minade_state[1].clamp_min(1e-6)
+                        self._epoch_boundary_trace("minade:all_reduce:end")
                 else:
+                    self._epoch_boundary_trace("sim_agents:compute_local:start")
                     epoch_sim_agents_metrics = self.sim_agents_metrics.compute()
+                    self._epoch_boundary_trace("sim_agents:compute_local:end")
                     minade_value = None
                     if self._should_compute_closed_loop_minade():
                         minade_value = self.minADE.compute()
@@ -3334,6 +3455,7 @@ open_metric_dict:
                 closed_loop_metric = epoch_sim_agents_metrics[self.closed_loop_metric_name]
                 if self.global_rank == 0 and minade_value is not None:
                     epoch_sim_agents_metrics[self.val_closed_minade_name] = minade_value
+                self._epoch_boundary_trace("closed_loop_metric:self_log:start")
                 self.log(
                     self.closed_loop_metric_name,
                     closed_loop_metric,
@@ -3341,16 +3463,24 @@ open_metric_dict:
                     on_epoch=True,
                     sync_dist=False,
                 )
+                self._epoch_boundary_trace("closed_loop_metric:self_log:end")
                 if self.global_rank == 0 and self.logger is not None:
                     epoch_sim_agents_metrics["epoch"] = (
                         self.log_epoch if self.log_epoch >= 0 else self.current_epoch
                     )
+                    self._epoch_boundary_trace("closed_loop_metric:logger_log:start")
                     self.logger.log_metrics(epoch_sim_agents_metrics)
+                    self._epoch_boundary_trace("closed_loop_metric:logger_log:end")
+                self._epoch_boundary_trace("sim_agents:reset:start")
                 self.sim_agents_metrics.reset()
                 self.minADE.reset()
                 self.minADE_predict.reset()
+                self._epoch_boundary_trace("sim_agents:reset:end")
             if self.sim_agents_submission.is_active:
+                self._epoch_boundary_trace("sim_agents_submission:save:start")
                 self.sim_agents_submission.save_sub_file()
+                self._epoch_boundary_trace("sim_agents_submission:save:end")
+        self._epoch_boundary_trace("on_validation_epoch_end:exit")
 
     def configure_optimizers(self):
         def lr_lambda(_current_step):
@@ -3403,8 +3533,10 @@ open_metric_dict:
 
     def on_train_epoch_start(self) -> None:
         """새 epoch의 open-loop train metric accumulator를 초기화합니다."""
+        self._epoch_boundary_trace("on_train_epoch_start:enter")
         self._reset_open_loop_train_epoch_metrics()
         self._automatic_open_loop_has_target_pending.clear()
+        self._epoch_boundary_trace("on_train_epoch_start:exit")
 
     def on_train_epoch_end(self) -> None:
         """self-forced manual optimization에서 scheduler가 있으면 epoch마다 한 번 진행합니다.
@@ -3412,19 +3544,37 @@ open_metric_dict:
         Returns:
             None
         """
-        self._log_open_loop_train_epoch_metrics()
+        self._epoch_boundary_trace("on_train_epoch_end:enter")
+        skip_open_loop_epoch_metrics = (
+            self.self_forced_enabled
+            and self._is_self_forced_active()
+            and not self.self_forced_use_anchor_fm_loss
+        )
+        if skip_open_loop_epoch_metrics:
+            self._epoch_boundary_trace("train_epoch_metrics:skip", reason="self_forced_anchor_off")
+            self._reset_open_loop_train_epoch_metrics()
+        else:
+            self._epoch_boundary_trace("train_epoch_metrics:log:start")
+            self._log_open_loop_train_epoch_metrics()
+            self._epoch_boundary_trace("train_epoch_metrics:log:end")
         if not self.self_forced_enabled:
+            self._epoch_boundary_trace("on_train_epoch_end:exit", reason="not_self_forced")
             return
         schedulers = self.lr_schedulers()
         if schedulers is None:
+            self._epoch_boundary_trace("on_train_epoch_end:exit", reason="no_scheduler")
             return
         if isinstance(schedulers, (list, tuple)):
             if len(schedulers) == 0:
+                self._epoch_boundary_trace("on_train_epoch_end:exit", reason="empty_scheduler")
                 return
             scheduler = schedulers[0]
         else:
             scheduler = schedulers
+        self._epoch_boundary_trace("scheduler:step:start")
         scheduler.step()
+        self._epoch_boundary_trace("scheduler:step:end")
+        self._epoch_boundary_trace("on_train_epoch_end:exit")
 
     def test_step(self, data, batch_idx):
         eval_generator = self._get_eval_generator()

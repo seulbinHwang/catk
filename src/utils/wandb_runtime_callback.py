@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 import time
 from typing import List
 
@@ -23,6 +25,21 @@ class WandbRuntimeMetricsCallback(Callback):
         self._validation_start_time: float | None = None
 
     @staticmethod
+    def _debug_trace(tag: str, trainer: Trainer, pl_module: LightningModule, **fields: object) -> None:
+        if not os.environ.get("CATK_EPOCH_BOUNDARY_DEBUG"):
+            return
+        parts = [
+            f"rank={getattr(pl_module, 'global_rank', '?')}",
+            f"epoch={getattr(pl_module, 'current_epoch', '?')}",
+            f"global_step={getattr(pl_module, 'global_step', '?')}",
+            f"logger_count={len(getattr(trainer, 'loggers', []) or [])}",
+            f"t={time.strftime('%H:%M:%S')}",
+        ]
+        for key, value in fields.items():
+            parts.append(f"{key}={value}")
+        print(f"[EBOUND_CALLBACK] {tag} " + " ".join(parts), file=sys.stderr, flush=True)
+
+    @staticmethod
     def _get_cuda_device(pl_module: LightningModule) -> torch.device | None:
         device = pl_module.device
         if not torch.cuda.is_available() or device.type != "cuda":
@@ -33,7 +50,11 @@ class WandbRuntimeMetricsCallback(Callback):
     def _reduce_max(value: float, device: torch.device) -> float:
         reduced = torch.tensor(value, device=device, dtype=torch.float32)
         if dist.is_available() and dist.is_initialized():
+            if os.environ.get("CATK_EPOCH_BOUNDARY_DEBUG"):
+                print("[EBOUND_CALLBACK] reduce_max:all_reduce:start", file=sys.stderr, flush=True)
             dist.all_reduce(reduced, op=dist.ReduceOp.MAX)
+            if os.environ.get("CATK_EPOCH_BOUNDARY_DEBUG"):
+                print("[EBOUND_CALLBACK] reduce_max:all_reduce:end", file=sys.stderr, flush=True)
         return float(reduced.item())
 
     @staticmethod
@@ -110,12 +131,13 @@ class WandbRuntimeMetricsCallback(Callback):
         self._validation_start_time = None
 
     def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
-        del trainer
+        self._debug_trace("on_train_epoch_start:enter", trainer, pl_module)
         if pl_module.global_rank == 0:
             self._epoch_values = []
             self._epoch_train_start_time = time.monotonic()
             self._epoch_validation_sec = 0.0
             self._validation_start_time = None
+        self._debug_trace("on_train_epoch_start:exit", trainer, pl_module)
 
     def on_train_batch_start(
         self,
@@ -124,13 +146,16 @@ class WandbRuntimeMetricsCallback(Callback):
         batch,
         batch_idx: int,
     ) -> None:
-        del trainer, batch, batch_idx
+        del batch
+        self._debug_trace("on_train_batch_start:enter", trainer, pl_module, batch_idx=batch_idx)
 
         device = self._get_cuda_device(pl_module)
         if device is None:
+            self._debug_trace("on_train_batch_start:exit", trainer, pl_module, batch_idx=batch_idx, reason="no_cuda")
             return
 
         torch.cuda.reset_peak_memory_stats(device)
+        self._debug_trace("on_train_batch_start:exit", trainer, pl_module, batch_idx=batch_idx)
 
     def on_train_batch_end(
         self,
@@ -141,12 +166,15 @@ class WandbRuntimeMetricsCallback(Callback):
         batch_idx: int,
     ) -> None:
         del outputs, batch
+        self._debug_trace("on_train_batch_end:enter", trainer, pl_module, batch_idx=batch_idx)
 
         if not trainer.loggers:
+            self._debug_trace("on_train_batch_end:exit", trainer, pl_module, batch_idx=batch_idx, reason="no_logger")
             return
 
         device = self._get_cuda_device(pl_module)
         if device is None:
+            self._debug_trace("on_train_batch_end:exit", trainer, pl_module, batch_idx=batch_idx, reason="no_cuda")
             return
 
         total_memory = torch.cuda.get_device_properties(device).total_memory
@@ -158,6 +186,7 @@ class WandbRuntimeMetricsCallback(Callback):
         worst_peak_reserved_pct = self._reduce_max(local_peak_reserved_pct, device)
 
         if pl_module.global_rank != 0:
+            self._debug_trace("on_train_batch_end:exit", trainer, pl_module, batch_idx=batch_idx, reason="nonzero_rank")
             return
 
         self._epoch_values.append(worst_peak_reserved_pct)
@@ -167,6 +196,7 @@ class WandbRuntimeMetricsCallback(Callback):
 
         log_step = self._lightning_log_step(trainer)
         if (log_step + 1) % self.log_every_n_steps == 0:
+            self._debug_trace("on_train_batch_end:logger:start", trainer, pl_module, batch_idx=batch_idx)
             self._log_metrics(
                 trainer,
                 {
@@ -179,24 +209,31 @@ class WandbRuntimeMetricsCallback(Callback):
                 },
                 step=log_step,
             )
+            self._debug_trace("on_train_batch_end:logger:end", trainer, pl_module, batch_idx=batch_idx)
+        self._debug_trace("on_train_batch_end:exit", trainer, pl_module, batch_idx=batch_idx)
 
     def on_validation_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
-        del pl_module
+        self._debug_trace("on_validation_start:enter", trainer, pl_module)
         if self._fit_start_time is None or trainer.sanity_checking or trainer.global_rank != 0:
+            self._debug_trace("on_validation_start:exit", trainer, pl_module, reason="skip")
             return
         self._validation_start_time = time.monotonic()
+        self._debug_trace("on_validation_start:exit", trainer, pl_module)
 
     def on_validation_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
-        del pl_module
+        self._debug_trace("on_validation_end:enter", trainer, pl_module)
         if self._validation_start_time is None or self._fit_start_time is None:
+            self._debug_trace("on_validation_end:exit", trainer, pl_module, reason="no_start")
             return
         if trainer.sanity_checking or trainer.global_rank != 0 or not trainer.loggers:
             self._validation_start_time = None
+            self._debug_trace("on_validation_end:exit", trainer, pl_module, reason="skip")
             return
 
         validation_minutes = (time.monotonic() - self._validation_start_time) / 60.0
         self._validation_start_time = None
         self._epoch_validation_sec += validation_minutes * 60.0
+        self._debug_trace("on_validation_end:logger:start", trainer, pl_module)
         self._log_metrics(
             trainer,
             {
@@ -204,9 +241,13 @@ class WandbRuntimeMetricsCallback(Callback):
             },
             step=self._lightning_log_step(trainer),
         )
+        self._debug_trace("on_validation_end:logger:end", trainer, pl_module)
+        self._debug_trace("on_validation_end:exit", trainer, pl_module)
 
     def on_train_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        self._debug_trace("on_train_epoch_end:enter", trainer, pl_module)
         if pl_module.global_rank != 0 or not trainer.loggers:
+            self._debug_trace("on_train_epoch_end:exit", trainer, pl_module, reason="skip")
             return
 
         epoch_metrics: dict[str, float] = {
@@ -223,14 +264,17 @@ class WandbRuntimeMetricsCallback(Callback):
             values = torch.tensor(self._epoch_values, dtype=torch.float32)
             epoch_metrics["worst_peak_reserved_pct_epoch_max"] = float(values.max().item())
 
+        self._debug_trace("on_train_epoch_end:logger:start", trainer, pl_module)
         self._log_metrics(
             trainer,
             epoch_metrics,
             step=self._lightning_log_step(trainer, epoch_end=True),
         )
+        self._debug_trace("on_train_epoch_end:logger:end", trainer, pl_module)
 
         wandb_logger = self._get_wandb_logger(trainer)
         if wandb_logger is None or trainer.max_epochs is None or trainer.max_epochs <= 0:
+            self._debug_trace("on_train_epoch_end:exit", trainer, pl_module, reason="no_wandb_plot")
             return
 
         elapsed_training_hours = self._runtime_seconds() / 3600.0
@@ -238,6 +282,7 @@ class WandbRuntimeMetricsCallback(Callback):
         self._progress_points.append([elapsed_training_hours, epoch_progress_pct])
         elapsed_hours = [point[0] for point in self._progress_points]
         epoch_progress = [point[1] for point in self._progress_points]
+        self._debug_trace("on_train_epoch_end:wandb_plot:start", trainer, pl_module)
         wandb_logger.experiment.log(
             {
                 "training_progress_vs_runtime": wandb.plot.line_series(
@@ -250,3 +295,5 @@ class WandbRuntimeMetricsCallback(Callback):
                 )
             }
         )
+        self._debug_trace("on_train_epoch_end:wandb_plot:end", trainer, pl_module)
+        self._debug_trace("on_train_epoch_end:exit", trainer, pl_module)
