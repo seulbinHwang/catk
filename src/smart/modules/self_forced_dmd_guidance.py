@@ -10,7 +10,7 @@ def build_clean_dmd_direction(
     generated_clean_norm: Tensor,
     normalizer_eps: float = 1.0e-3,
     channel_mask: Tensor | None = None,
-    per_channel_normalizer: bool = True,
+    per_channel_normalizer: bool = False,
     normalize_direction: bool = True,
 ) -> Tensor:
     """teacher와 generated estimator의 clean path 차이로 DMD 방향을 만듭니다.
@@ -56,32 +56,45 @@ def build_clean_dmd_direction(
     target_clean = target_clean_norm.float()
     generated_clean = generated_clean_norm.float()
 
+    # 죽은 채널(예: non-holonomic delta_n) mask 를 미리 준비한다.  이 mask 는 direction
+    # 과 normalizer 양쪽에 모두 적용해, 죽은 채널을 "아예 없는 tensor"처럼 다룬다.
+    mask = (
+        channel_mask.to(device=committed.device, dtype=committed.dtype)
+        if channel_mask is not None
+        else None
+    )
+
     clean_dmd_direction = target_clean - generated_clean
-    # normalize_direction=False (권장): 거리-나눗셈 제거. dir = raw (teacher - fake).
-    # 표준 DMD/VSD 형태로, generator가 teacher 분포에 가까워지면 (teacher-fake)→0 이라
-    # push 가 자연히 사라져 수렴한다.  거리(committed-teacher)로 나누면 가까워질수록
-    # 분모↓ → push↑ (clamp 에서 폭발)로 수렴이 깨져 발산하던 문제를 없앤다.
-    # path_step_size 가 고정 계수 역할(raw gap 이 작으므로 더 큰 값 필요).
+    # 죽은 채널을 direction 단계에서 먼저 0으로 만들어, 아래 정규화 분모(평균)에도
+    # 끼지 않게 한다.
+    if mask is not None:
+        clean_dmd_direction = clean_dmd_direction * mask
+
+    # 원본 Self-Forcing(DMD) 정합: normalizer = |x0 - real|.mean(dim=[1..]) 처럼
+    # 시간+채널 전체를 평균해 agent 당 단일 스칼라를 쓴다(per_channel_normalizer=False).
+    # 시간축만 평균(per_channel=True)하던 기존 방식은 분모가 채널별로 쪼개져 작아지기
+    # 쉬워 push 가 폭발(발산)했다.  full 평균은 분모를 안정화한다.
     if normalize_direction:
-        # per_channel_normalizer=True: 시간축만 평균하고 채널축은 남겨 채널 스케일 균형.
+        abs_gap = (committed - target_clean).abs()
+        if mask is not None:
+            # 죽은 채널의 gap 은 분자/분모 모두에서 제외(masked mean).
+            abs_gap = abs_gap * mask
         if per_channel_normalizer:
             reduce_dims = tuple(range(1, committed.dim() - 1))  # 시간축만 (채널 유지)
         else:
-            reduce_dims = tuple(range(1, committed.dim()))
-        agent_distance = (committed - target_clean).abs().mean(
-            dim=reduce_dims,
-            keepdim=True,
-        )
+            reduce_dims = tuple(range(1, committed.dim()))  # 시간+채널 (agent 스칼라)
+        if mask is not None:
+            valid_count = mask.expand_as(abs_gap).sum(dim=reduce_dims, keepdim=True)
+            agent_distance = abs_gap.sum(dim=reduce_dims, keepdim=True) / valid_count.clamp_min(1.0)
+        else:
+            agent_distance = abs_gap.mean(dim=reduce_dims, keepdim=True)
         normalizer = agent_distance.clamp_min(float(normalizer_eps))
         normalized_direction = clean_dmd_direction / normalizer
     else:
         normalized_direction = clean_dmd_direction
-    if channel_mask is not None:
-        # 죽은 채널(예: non-holonomic delta_n) 제외 — direction을 0으로.
-        normalized_direction = normalized_direction * channel_mask.to(
-            device=normalized_direction.device,
-            dtype=normalized_direction.dtype,
-        )
+    if mask is not None:
+        # 나눗셈 후 부동소수 잔차까지 죽은 채널을 확실히 0으로 고정.
+        normalized_direction = normalized_direction * mask
     normalized_direction = torch.nan_to_num(
         normalized_direction,
         nan=0.0,

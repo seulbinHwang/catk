@@ -252,6 +252,14 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1.0e-3
         )
+        # per_channel_normalizer=False(기본): 시간+채널 전체를 평균해 agent 당 단일
+        # 스칼라 분모를 쓴다(원본 DMD mean(dim=[1..]) 정합, 분모 안정화).  True 면
+        # 시간축만 평균해 채널별 분모를 쓰던 기존(불안정) 방식.
+        self.self_forced_per_channel_normalizer = (
+            bool(getattr(self.self_forced_config, "clean_dmd_per_channel_normalizer", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_distribution_matching_objective = (
             str(getattr(self.self_forced_config, "distribution_matching_objective", "dmd")).lower()
             if self.self_forced_config is not None
@@ -2488,7 +2496,7 @@ class SMARTFlow(LightningModule):
                 generated_clean_norm=generated_pred["clean"],
                 normalizer_eps=self.self_forced_direction_normalizer_eps,
                 channel_mask=channel_mask,
-                per_channel_normalizer=True,
+                per_channel_normalizer=self.self_forced_per_channel_normalizer,
                 normalize_direction=self.self_forced_normalize_direction,
             )
             self._log_self_forced_direction_diagnostics(

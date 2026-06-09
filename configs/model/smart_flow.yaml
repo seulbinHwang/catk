@@ -71,6 +71,11 @@ model_config:
     # normalize_direction=false 면 DMD direction 의 거리-나눗셈 제거(raw teacher-fake,
     # 수렴형). path_step_size 가 고정 계수 역할(raw gap 작아 더 큰 값 필요).
     normalize_direction: true
+    # clean_dmd_per_channel_normalizer=false(기본): normalizer 를 시간+채널 전체 평균
+    # (agent 당 단일 스칼라)으로 — 원본 Self-Forcing(DMD) mean(dim=[1..]) 정합.  죽은
+    # 채널(non-holonomic delta_n)은 direction/normalizer 양쪽에서 masking 으로 제외한다.
+    # true 면 시간축만 평균(채널별 분모)하던 기존(분모 불안정 → push 폭발) 방식.
+    clean_dmd_per_channel_normalizer: false
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
     distribution_matching_objective: dmd
