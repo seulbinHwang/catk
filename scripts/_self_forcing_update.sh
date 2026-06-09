@@ -37,7 +37,7 @@ SEED="${SEED:-817}"
 CACHE_ROOT="${CACHE_ROOT:-/home2/pnc2/repos_python/datasets/catk_cache}"
 CKPT_PATH="${CKPT_PATH:-logs/pretrained/pretrained.ckpt}"
 
-GPU="${GPU:-2,3}"
+GPU="${GPU:-2}"
 export CUDA_VISIBLE_DEVICES="${GPU}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-$(printf %s "${GPU}" | awk -F, '{print NF}')}"
 MASTER_PORT="${MASTER_PORT:-$(get_free_port)}"
@@ -46,8 +46,8 @@ MASTER_PORT="${MASTER_PORT:-$(get_free_port)}"
 CADENCE="${CADENCE:-5}"                         # fake:gen = N:1
 ESTIMATOR_UPDATES_PER_STEP="${ESTIMATOR_UPDATES_PER_STEP:-1}"   # fake updates per batch (1 = distinct batches)
 ESTIMATOR_INIT_CKPT="${ESTIMATOR_INIT_CKPT:-}"   # warmup된 fake critic ckpt(F_psi override). 빈값=generator 복사본
-GEN_LR="${GEN_LR:-1e-7}"
-FAKE_LR="${FAKE_LR:-1e-7}"
+GEN_LR="${GEN_LR:-2e-6}"
+FAKE_LR="${FAKE_LR:-4e-7}"
 USE_EMA="${USE_EMA:-false}"
 DM_OBJECTIVE="${DM_OBJECTIVE:-dmd}"
 # normalize on(기본): direction 이 normalizer 로 O(1) 스케일 → step≈1.0 이 원본 DMD 정합.
@@ -80,7 +80,7 @@ LIMIT_VAL_BATCHES="${LIMIT_VAL_BATCHES:-1}"      # scorer_scene_num 가 자동 �
 MAX_EPOCHS="${MAX_EPOCHS:-16}"
 PRECISION="${PRECISION:-32-true}"   # fp32
 NUM_WORKERS="${NUM_WORKERS:-4}"
-N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-32}"
+N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-16}"
 SIM_AGENTS_METRIC_WORKERS="${SIM_AGENTS_METRIC_WORKERS:-8}"   # 0=직렬(느림). 병렬로 val scorer 단축.
 DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
 
