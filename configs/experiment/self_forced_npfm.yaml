@@ -40,11 +40,12 @@ model:
         sample_steps: 16
         sample_method: euler
         noise_scale: 1.0
+        # policy=all + backprop_last_k=16: 블록 detach 제거(전 horizon grad) + 16 ODE step 전부 grad.
+        backprop_last_k: 16
         random_terminal_step:
           enabled: true
           scope: global_batch
-          # paper_uniform: 실행 denoising step K를 min_executed_steps..sample_steps 범위에서 균등 샘플링합니다.
-          policy: paper_uniform
+          policy: all
           min_executed_steps: 16
 
 ckpt_path: null
