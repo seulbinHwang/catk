@@ -57,6 +57,9 @@ ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-1}"
 # joint zone(기존 cadence DMD)을 step 기준으로 번갈아 무한 반복. 0/0 이면 비활성.
 WARMUP_ZONE_STEPS="${WARMUP_ZONE_STEPS:-0}"
 JOINT_ZONE_STEPS="${JOINT_ZONE_STEPS:-0}"
+# 학습할 파라미터 범위. except_map_encoder(기본) | middle(flow decoder + 마지막 agent
+# 문맥 블록만) | full_flow_decoder(flow decoder만). 빈값이면 config 기본값 유지.
+UNFROZEN_RANGE="${UNFROZEN_RANGE:-}"
 # FM regularization: DMD loss 에 open-loop flow-matching loss 를 anchor_weight 로 더해
 # generator 가 teacher 의 open-loop FM 에서 drift 하는 것을 억제한다. false=기존(off).
 USE_ANCHOR_FM_LOSS="${USE_ANCHOR_FM_LOSS:-false}"
@@ -138,6 +141,11 @@ if [ -n "${ESTIMATOR_INIT_CKPT}" ]; then
   set -- "$@" model.model_config.self_forced.estimator_init_ckpt="${ESTIMATOR_INIT_CKPT}"
 fi
 
+# 학습 파라미터 범위 override (빈값이면 생략 → config 기본값 유지)
+if [ -n "${UNFROZEN_RANGE}" ]; then
+  set -- "$@" model.model_config.self_forced.unfrozen_range="${UNFROZEN_RANGE}"
+fi
+
 echo "============================================================"
 echo "[sf-update] task=${TASK}"
 echo "  GPU=${CUDA_VISIBLE_DEVICES} nproc=${NPROC_PER_NODE}  ckpt=${CKPT_PATH}"
@@ -146,6 +154,7 @@ echo "  estimator_init_ckpt=${ESTIMATOR_INIT_CKPT:-<none>}"
 echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "  anchor_fm_loss=${USE_ANCHOR_FM_LOSS} anchor_weight=${ANCHOR_WEIGHT}"
 echo "  zone_schedule(warmup:joint steps)=${WARMUP_ZONE_STEPS}:${JOINT_ZONE_STEPS} (0:0=off)"
+echo "  unfrozen_range=${UNFROZEN_RANGE:-<config default>}"
 echo "  train_B=${TRAIN_B} val_B=${VAL_B} scorer_scene=${SCORER_SCENE_NUM} val_check=${VAL_CHECK_INTERVAL} precision=${PRECISION}"
 echo "  log=${LOG}"
 echo "============================================================"
