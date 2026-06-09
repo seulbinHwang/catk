@@ -225,7 +225,11 @@ start_attempt() {
   local attempt_lr
   attempt_lr="$(resolve_learning_rate "$bs")"
   if [[ -n "$attempt_lr" ]]; then
-    log "  effective global batch=$((bs * TOTAL_GPU_COUNT)), lr=${attempt_lr} (sqrt scaling from batch ${BASE_TOTAL_BATCH_SIZE}, lr ${BASE_LEARNING_RATE})"
+    if [[ "$LEARNING_RATE" == "auto" ]]; then
+      log "  effective global batch=$((bs * TOTAL_GPU_COUNT)), lr=${attempt_lr} (sqrt scaling from batch ${BASE_TOTAL_BATCH_SIZE}, lr ${BASE_LEARNING_RATE})"
+    else
+      log "  effective global batch=$((bs * TOTAL_GPU_COUNT)), lr=${attempt_lr} (fixed override; checkpoint scheduler state is preserved when PATCH_RESUME_CKPT_LR=false)"
+    fi
   else
     log "  effective global batch=$((bs * TOTAL_GPU_COUNT)), lr=config-default"
   fi

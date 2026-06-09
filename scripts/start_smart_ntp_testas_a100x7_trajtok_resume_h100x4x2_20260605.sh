@@ -2,9 +2,9 @@
 # Resume the interrupted 20260605 H100x4+H100x2 TrajTok run on testas A100x7.
 #
 # The bootstrap checkpoint is downloaded from the latest W&B epoch_last artifact,
-# copied into the testas pod, patched to the A100x7 sqrt-scaled LR, and then
-# passed to the standard OOM-retry launcher. Subsequent retries resume from the
-# latest task-local epoch_last.ckpt.
+# copied into the testas pod, and passed to the standard OOM-retry launcher.
+# By default this preserves the source run optimizer/scheduler state exactly so
+# the resumed learning-rate curve does not jump at the resume boundary.
 set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,10 +14,11 @@ SOURCE_TASK_NAME="${SOURCE_TASK_NAME:-smart_ntp_pretrain_h100x4_h100x2_globalbs1
 NAMESPACE="${NAMESPACE:-p-pnc}"
 CONTAINER="${CONTAINER:-main}"
 POD="${POD:-testas}"
-INITIAL_BS="${INITIAL_BS:-18}"
+INITIAL_BS="${INITIAL_BS:-16}"
 TOTAL_GPU_COUNT="${TOTAL_GPU_COUNT:-7}"
 BASE_TOTAL_BATCH_SIZE="${BASE_TOTAL_BATCH_SIZE:-108}"
 BASE_LEARNING_RATE="${BASE_LEARNING_RATE:-0.0005809475}"
+PRESERVE_SOURCE_LR_SCHEDULE="${PRESERVE_SOURCE_LR_SCHEDULE:-true}"
 CKPT_LOCAL_ROOT="${CKPT_LOCAL_ROOT:-${REPO_ROOT}/logs/_wandb_epoch_last/${SOURCE_TASK_NAME}}"
 REMOTE_CKPT_DIR="${REMOTE_CKPT_DIR:-/mnt/nuplan/projects/catk/checkpoints/trajtok_resume_h100x4x2_20260605}"
 REMOTE_SOURCE_CKPT_PATH="${REMOTE_SOURCE_CKPT_PATH:-${REMOTE_CKPT_DIR}/epoch_last_from_wandb.ckpt}"
@@ -36,7 +37,9 @@ print(f"{base_lr * math.sqrt((total_gpu_count * per_rank_batch) / base_total_bat
 PY
 }
 
-if [[ -n "${LEARNING_RATE:-}" && "$LEARNING_RATE" != "auto" ]]; then
+if [[ "$PRESERVE_SOURCE_LR_SCHEDULE" == "true" ]]; then
+  PATCHED_BASE_LR="$BASE_LEARNING_RATE"
+elif [[ -n "${LEARNING_RATE:-}" && "$LEARNING_RATE" != "auto" ]]; then
   PATCHED_BASE_LR="$LEARNING_RATE"
 else
   PATCHED_BASE_LR="$(resolve_learning_rate)"
@@ -63,8 +66,12 @@ fi
 
 kubectl exec -n "$NAMESPACE" "$POD" -c "$CONTAINER" -- mkdir -p "$REMOTE_CKPT_DIR"
 kubectl cp -n "$NAMESPACE" -c "$CONTAINER" "$SOURCE_CKPT_PATH" "${POD}:${REMOTE_SOURCE_CKPT_PATH}"
-kubectl cp -n "$NAMESPACE" -c "$CONTAINER" "scripts/patch_checkpoint_lr.py" "${POD}:${REMOTE_CKPT_DIR}/patch_checkpoint_lr.py"
-kubectl exec -n "$NAMESPACE" "$POD" -c "$CONTAINER" -- bash -lc "
+if [[ "$PRESERVE_SOURCE_LR_SCHEDULE" == "true" ]]; then
+  REMOTE_CKPT_PATH="$REMOTE_SOURCE_CKPT_PATH"
+  echo "PRESERVE_SOURCE_LR_SCHEDULE=true: using checkpoint optimizer/scheduler LR state without patching."
+else
+  kubectl cp -n "$NAMESPACE" -c "$CONTAINER" "scripts/patch_checkpoint_lr.py" "${POD}:${REMOTE_CKPT_DIR}/patch_checkpoint_lr.py"
+  kubectl exec -n "$NAMESPACE" "$POD" -c "$CONTAINER" -- bash -lc "
 set -Eeuo pipefail
 source /mnt/nuplan/miniforge/etc/profile.d/conda.sh 2>/dev/null || true
 conda activate catk 2>/dev/null || true
@@ -73,6 +80,7 @@ python $(printf '%q' "${REMOTE_CKPT_DIR}/patch_checkpoint_lr.py") \
   --output $(printf '%q' "$REMOTE_CKPT_PATH") \
   --base-lr $(printf '%q' "$PATCHED_BASE_LR")
 "
+fi
 kubectl exec -n "$NAMESPACE" "$POD" -c "$CONTAINER" -- ls -lh "$REMOTE_CKPT_PATH"
 
 export PODS="${PODS:-testas}"
@@ -89,11 +97,16 @@ export MIN_BS="${MIN_BS:-14}"
 export TOTAL_GPU_COUNT
 export BASE_TOTAL_BATCH_SIZE
 export BASE_LEARNING_RATE
-export LEARNING_RATE="${LEARNING_RATE:-auto}"
+if [[ "$PRESERVE_SOURCE_LR_SCHEDULE" == "true" ]]; then
+  export LEARNING_RATE="${LEARNING_RATE:-$BASE_LEARNING_RATE}"
+  export PATCH_RESUME_CKPT_LR="${PATCH_RESUME_CKPT_LR:-false}"
+else
+  export LEARNING_RATE="${LEARNING_RATE:-auto}"
+  export PATCH_RESUME_CKPT_LR="${PATCH_RESUME_CKPT_LR:-true}"
+fi
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-12}"
 export TEST_BATCH_SIZE="${TEST_BATCH_SIZE:-12}"
 export BOOTSTRAP_CKPT_PATH="$REMOTE_CKPT_PATH"
-export PATCH_RESUME_CKPT_LR="${PATCH_RESUME_CKPT_LR:-true}"
 export PATCH_CHECKPOINT_LR_SCRIPT="${PATCH_CHECKPOINT_LR_SCRIPT:-${REMOTE_CKPT_DIR}/patch_checkpoint_lr.py}"
 export EXTRA_HYDRA_OVERRIDES="${EXTRA_HYDRA_OVERRIDES:-}"
 
