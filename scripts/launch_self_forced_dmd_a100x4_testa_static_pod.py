@@ -107,6 +107,7 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("CUDA_VISIBLE_DEVICES", args.cuda_visible_devices),
         export_line("NPROC_PER_NODE", args.nproc_per_node),
         export_line("CATK_LR", args.learning_rate),
+        export_line("CATK_GENERATED_ESTIMATOR_LR", args.generated_estimator_learning_rate),
         export_line("VAL_BATCH_SIZE", args.val_batch_size),
         export_line("TEST_BATCH_SIZE", args.test_batch_size),
         export_line("MAX_EPOCHS", args.max_epochs),
@@ -405,6 +406,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", default="16")
     parser.add_argument("--check-val-every-n-epoch", default="2")
     parser.add_argument("--learning-rate", default="1.0e-6")
+    parser.add_argument(
+        "--generated-estimator-learning-rate",
+        default="",
+        help="Generated-estimator optimizer lr. Defaults to --learning-rate via model config.",
+    )
     parser.add_argument("--train-epoch-sample-fraction", default="0.25")
     parser.add_argument("--train-memory-balanced-batches", default="true")
     parser.add_argument("--random-terminal-scope", default="global_batch")

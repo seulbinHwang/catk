@@ -77,6 +77,7 @@ def render_env(args: argparse.Namespace) -> str:
         export_line("CUDA_VISIBLE_DEVICES", args.cuda_visible_devices),
         export_line("NPROC_PER_NODE", args.nproc_per_node),
         export_line("CATK_LR", args.learning_rate),
+        export_line("CATK_GENERATED_ESTIMATOR_LR", args.generated_estimator_learning_rate),
         export_line("ESTIMATOR_WARMUP_EPOCHS", args.estimator_warmup_epochs),
         export_line("SELF_FORCED_USE_STOP_MOTION", args.self_forced_use_stop_motion),
     ]
@@ -371,6 +372,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-epochs", default="10")
     parser.add_argument("--check-val-every-n-epoch", default="2")
     parser.add_argument("--learning-rate", default="1.0e-6")
+    parser.add_argument(
+        "--generated-estimator-learning-rate",
+        default="",
+        help="Generated-estimator optimizer lr. Defaults to --learning-rate via model config.",
+    )
     parser.add_argument("--estimator-warmup-epochs", default="1")
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="")

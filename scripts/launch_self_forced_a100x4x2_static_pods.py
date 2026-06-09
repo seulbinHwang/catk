@@ -115,6 +115,7 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
     ]
     optional = {
         "CATK_LR": args.learning_rate,
+        "CATK_GENERATED_ESTIMATOR_LR": args.generated_estimator_learning_rate,
         "DECODER_USE_STOP_MOTION": args.decoder_use_stop_motion,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
@@ -161,6 +162,7 @@ ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH=""
 ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP="${{ESTIMATOR_WARMUP_EPOCHS:-}}"
 ESTIMATOR_WARMUP_BANK_LOADED_WARMUP=0
 ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="${{ESTIMATOR_WARMUP_EPOCHS:-0}}"
+ESTIMATOR_WARMUP_BANK_LR=""
 
 echo "[self-forced-a100x4x2] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
 echo "[self-forced-a100x4x2] started at $(date '+%F %T')"
@@ -775,6 +777,41 @@ find_latest_self_forced_ckpt() {{
   }} | head -1
 }}
 
+strip_shell_quotes() {{
+  local value="$1"
+  value="${{value%\"}}"
+  value="${{value#\"}}"
+  value="${{value%\'}}"
+  value="${{value#\'}}"
+  printf '%s\n' "$value"
+}}
+
+resolve_generated_estimator_lr_config() {{
+  if [[ -n "${{CATK_GENERATED_ESTIMATOR_LR:-}}" ]]; then
+    strip_shell_quotes "$CATK_GENERATED_ESTIMATOR_LR"
+    return 0
+  fi
+
+  local value=""
+  local token
+  if [[ -n "${{CATK_EXTRA_OVERRIDES:-}}" ]]; then
+    for token in $CATK_EXTRA_OVERRIDES; do
+      case "$token" in
+        model.model_config.self_forced.generated_estimator_lr=*|+model.model_config.self_forced.generated_estimator_lr=*)
+          value="${{token#*=}}"
+          ;;
+      esac
+    done
+  fi
+
+  if [[ -n "$value" ]]; then
+    strip_shell_quotes "$value"
+    return 0
+  fi
+
+  strip_shell_quotes "${{CATK_LR:-}}"
+}}
+
 apply_estimator_warmup_bank_progress() {{
   local loaded_warmup="$1"
   local remaining_warmup="$2"
@@ -804,8 +841,9 @@ maybe_prepare_estimator_warmup_bank() {{
   if [[ -z "${{ESTIMATOR_WARMUP_EPOCHS:-}}" || "${{ESTIMATOR_WARMUP_EPOCHS}}" == "0" ]]; then
     return 0
   fi
-  if [[ -z "${{CATK_LR:-}}" ]]; then
-    echo "[self-forced-a100x4x2] estimator warmup bank enabled but CATK_LR is empty; running warmup normally"
+  ESTIMATOR_WARMUP_BANK_LR="$(resolve_generated_estimator_lr_config)"
+  if [[ -z "${{ESTIMATOR_WARMUP_BANK_LR:-}}" ]]; then
+    echo "[self-forced-a100x4x2] estimator warmup bank enabled but generated estimator lr is empty; running warmup normally"
     return 0
   fi
   if [[ -n "$(find_latest_self_forced_ckpt)" ]]; then
@@ -816,15 +854,15 @@ maybe_prepare_estimator_warmup_bank() {{
   local bank_root="$RUN_ROOT/estimator_bank/$(hostname)"
   mkdir -p "$bank_root"
   local requested_warmup="${{ESTIMATOR_WARMUP_EPOCHS}}"
-  local resolved_env="$bank_root/resolved_warmup_${{requested_warmup}}_lr_${{CATK_LR}}.env"
-  ESTIMATOR_WARMUP_BANK_INIT_PATH="$bank_root/resolved_for_warmup_${{requested_warmup}}_lr_${{CATK_LR}}_generated_estimator.pt"
-  ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="$bank_root/snapshot_warmup_${{requested_warmup}}_lr_${{CATK_LR}}_generated_estimator.pt"
+  local resolved_env="$bank_root/resolved_warmup_${{requested_warmup}}_lr_${{ESTIMATOR_WARMUP_BANK_LR}}.env"
+  ESTIMATOR_WARMUP_BANK_INIT_PATH="$bank_root/resolved_for_warmup_${{requested_warmup}}_lr_${{ESTIMATOR_WARMUP_BANK_LR}}_generated_estimator.pt"
+  ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="$bank_root/snapshot_warmup_${{requested_warmup}}_lr_${{ESTIMATOR_WARMUP_BANK_LR}}_generated_estimator.pt"
 
-  echo "[self-forced-a100x4x2] checking estimator warmup bank: artifact=${{ESTIMATOR_WARMUP_BANK_ARTIFACT}} requested_warmup=${{requested_warmup}} lr=${{CATK_LR}}"
+  echo "[self-forced-a100x4x2] checking estimator warmup bank: artifact=${{ESTIMATOR_WARMUP_BANK_ARTIFACT}} requested_warmup=${{requested_warmup}} generated_estimator_lr=${{ESTIMATOR_WARMUP_BANK_LR}}"
   if python scripts/self_forced_estimator_bank.py resolve \
       --artifact "$ESTIMATOR_WARMUP_BANK_ARTIFACT" \
       --warmup-epochs "$requested_warmup" \
-      --lr "$CATK_LR" \
+      --lr "$ESTIMATOR_WARMUP_BANK_LR" \
       --output "$ESTIMATOR_WARMUP_BANK_INIT_PATH" \
       --env-output "$resolved_env" \
       --entity "$ESTIMATOR_WARMUP_BANK_ENTITY" \
@@ -1088,6 +1126,9 @@ while (( bs >= MIN_BS )); do
     torchrun_args+=(model.model_config.self_forced.generated_estimator_bank_loaded_warmup_epochs="$ESTIMATOR_WARMUP_BANK_LOADED_WARMUP")
   fi
   torchrun_args+=("${{extra_overrides[@]}}")
+  if [[ -n "${{CATK_GENERATED_ESTIMATOR_LR:-}}" ]]; then
+    torchrun_args+=(model.model_config.self_forced.generated_estimator_lr="$(strip_shell_quotes "$CATK_GENERATED_ESTIMATOR_LR")")
+  fi
 
   echo
   echo "[self-forced-a100x4x2] $attempt_tag action=$action ckpt=$ckpt_path"
@@ -1118,11 +1159,12 @@ while (( bs >= MIN_BS )); do
         && [[ -n "${{ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME:-}}" ]] \
         && [[ -n "${{ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH:-}}" ]] \
         && [[ -f "$ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH" ]] \
-        && [[ -n "${{ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP:-}}" ]]; then
-      echo "[self-forced-a100x4x2] uploading generated-estimator warmup snapshot to W&B bank: $ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME"
+        && [[ -n "${{ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP:-}}" ]] \
+        && [[ -n "${{ESTIMATOR_WARMUP_BANK_LR:-}}" ]]; then
+      echo "[self-forced-a100x4x2] uploading generated-estimator warmup snapshot to W&B bank: $ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME generated_estimator_lr=$ESTIMATOR_WARMUP_BANK_LR"
       python scripts/self_forced_estimator_bank.py upsert \
         --artifact-name "$ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME" \
-        --entry "${{ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP}}:${{CATK_LR}}:${{ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH}}" \
+        --entry "${{ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP}}:${{ESTIMATOR_WARMUP_BANK_LR}}:${{ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH}}" \
         --entity "$ESTIMATOR_WARMUP_BANK_ENTITY" \
         --project "$ESTIMATOR_WARMUP_BANK_PROJECT" \
         --run-name "${{TASK_NAME}}_generated_estimator_bank"
@@ -1381,6 +1423,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="")
     parser.add_argument("--learning-rate", default="1.0e-6")
+    parser.add_argument(
+        "--generated-estimator-learning-rate",
+        default="",
+        help="Generated-estimator optimizer lr. Defaults to --learning-rate via model config.",
+    )
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--max-epochs", default="")

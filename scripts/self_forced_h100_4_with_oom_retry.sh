@@ -28,6 +28,9 @@
 #   NPROC_PER_NODE=4
 #   EXPERIMENT=self_forced_npfm_h100_4
 #   CATK_LR=                     Optional Generator learning-rate override.
+#   CATK_GENERATED_ESTIMATOR_LR= Optional generated-estimator learning-rate
+#                                override. Defaults to CATK_EXTRA_OVERRIDES
+#                                generated_estimator_lr, then CATK_LR.
 #   ESTIMATOR_WARMUP_EPOCHS=     Optional self-forced warmup override.
 #   SELF_FORCED_USE_STOP_MOTION= Optional training rollout stop-motion gate.
 #   DECODER_USE_STOP_MOTION=     Optional validation/test inference gate.
@@ -49,8 +52,8 @@
 #   ESTIMATOR_WARMUP_BANK_ENABLED=true
 #                                  true이면 fresh finetune 시작 전에 W&B
 #                                  generated-estimator bank에서
-#                                  (warmup_epochs, lr) entry를 찾아 warmup을
-#                                  건너뜁니다.
+#                                  (warmup_epochs, generated_estimator_lr)
+#                                  entry를 찾아 warmup을 건너뜁니다.
 #   ESTIMATOR_WARMUP_BANK_ARTIFACT=generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest
 #                                  W&B bank artifact name/ref. 예:
 #                                  generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr1e-6:latest
@@ -98,6 +101,7 @@ ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH=""
 ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP="${ESTIMATOR_WARMUP_EPOCHS:-}"
 ESTIMATOR_WARMUP_BANK_LOADED_WARMUP=0
 ESTIMATOR_WARMUP_BANK_REMAINING_WARMUP="${ESTIMATOR_WARMUP_EPOCHS:-0}"
+ESTIMATOR_WARMUP_BANK_LR=""
 
 if [[ -z "$ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME" && -n "$ESTIMATOR_WARMUP_BANK_ARTIFACT" ]]; then
   ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME="${ESTIMATOR_WARMUP_BANK_ARTIFACT##*/}"
@@ -106,6 +110,41 @@ fi
 
 has_latest_self_forced_ckpt() {
   ls -t "${CATK_LOG_DIR}/${TASK_NAME}/runs"/*/checkpoints/epoch_last.ckpt >/dev/null 2>&1
+}
+
+strip_shell_quotes() {
+  local value="$1"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  printf '%s\n' "$value"
+}
+
+resolve_generated_estimator_lr_config() {
+  if [[ -n "${CATK_GENERATED_ESTIMATOR_LR:-}" ]]; then
+    strip_shell_quotes "$CATK_GENERATED_ESTIMATOR_LR"
+    return 0
+  fi
+
+  local value=""
+  local token
+  if [[ -n "${CATK_EXTRA_OVERRIDES:-}" ]]; then
+    for token in $CATK_EXTRA_OVERRIDES; do
+      case "$token" in
+        model.model_config.self_forced.generated_estimator_lr=*|+model.model_config.self_forced.generated_estimator_lr=*)
+          value="${token#*=}"
+          ;;
+      esac
+    done
+  fi
+
+  if [[ -n "$value" ]]; then
+    strip_shell_quotes "$value"
+    return 0
+  fi
+
+  strip_shell_quotes "${CATK_LR:-}"
 }
 
 apply_estimator_warmup_bank_progress() {
@@ -160,18 +199,19 @@ maybe_prepare_estimator_warmup_bank() {
   if [[ -z "${ESTIMATOR_WARMUP_EPOCHS:-}" || "${ESTIMATOR_WARMUP_EPOCHS}" == "0" ]]; then
     return 0
   fi
-  if [[ -z "${CATK_LR:-}" ]]; then
-    log "Estimator warmup bank enabled but CATK_LR is empty; running warmup normally."
+  ESTIMATOR_WARMUP_BANK_LR="$(resolve_generated_estimator_lr_config)"
+  if [[ -z "${ESTIMATOR_WARMUP_BANK_LR:-}" ]]; then
+    log "Estimator warmup bank enabled but generated estimator lr is empty; running warmup normally."
     return 0
   fi
   local bank_root="${CATK_LOG_DIR}/_self_forced_estimator_bank/${TASK_NAME}"
   mkdir -p "$bank_root"
   local requested_warmup="${ESTIMATOR_WARMUP_EPOCHS}"
-  local resolved_env="${bank_root}/resolved_warmup_${requested_warmup}_lr_${CATK_LR}.env"
+  local resolved_env="${bank_root}/resolved_warmup_${requested_warmup}_lr_${ESTIMATOR_WARMUP_BANK_LR}.env"
   local latest_existing_ckpt=""
   latest_existing_ckpt="$(ls -t "${CATK_LOG_DIR}/${TASK_NAME}/runs"/*/checkpoints/epoch_last.ckpt 2>/dev/null | head -1 || true)"
   if [[ -n "$latest_existing_ckpt" ]]; then
-    ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="${bank_root}/snapshot_warmup_${requested_warmup}_lr_${CATK_LR}_generated_estimator.pt"
+    ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="${bank_root}/snapshot_warmup_${requested_warmup}_lr_${ESTIMATOR_WARMUP_BANK_LR}_generated_estimator.pt"
     if [[ -f "$resolved_env" ]]; then
       # shellcheck disable=SC1090
       source "$resolved_env"
@@ -192,14 +232,14 @@ maybe_prepare_estimator_warmup_bank() {
     return 0
   fi
 
-  ESTIMATOR_WARMUP_BANK_INIT_PATH="${bank_root}/resolved_for_warmup_${requested_warmup}_lr_${CATK_LR}_generated_estimator.pt"
-  ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="${bank_root}/snapshot_warmup_${requested_warmup}_lr_${CATK_LR}_generated_estimator.pt"
+  ESTIMATOR_WARMUP_BANK_INIT_PATH="${bank_root}/resolved_for_warmup_${requested_warmup}_lr_${ESTIMATOR_WARMUP_BANK_LR}_generated_estimator.pt"
+  ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH="${bank_root}/snapshot_warmup_${requested_warmup}_lr_${ESTIMATOR_WARMUP_BANK_LR}_generated_estimator.pt"
 
-  log "Checking estimator warmup bank: artifact=${ESTIMATOR_WARMUP_BANK_ARTIFACT} requested_warmup=${requested_warmup} lr=${CATK_LR}"
+  log "Checking estimator warmup bank: artifact=${ESTIMATOR_WARMUP_BANK_ARTIFACT} requested_warmup=${requested_warmup} generated_estimator_lr=${ESTIMATOR_WARMUP_BANK_LR}"
   if python scripts/self_forced_estimator_bank.py resolve \
       --artifact "$ESTIMATOR_WARMUP_BANK_ARTIFACT" \
       --warmup-epochs "$requested_warmup" \
-      --lr "$CATK_LR" \
+      --lr "$ESTIMATOR_WARMUP_BANK_LR" \
       --output "$ESTIMATOR_WARMUP_BANK_INIT_PATH" \
       --env-output "$resolved_env" \
       --entity "$ESTIMATOR_WARMUP_BANK_ENTITY" \
@@ -306,6 +346,9 @@ if [[ -n "${CATK_EXTRA_OVERRIDES:-}" ]]; then
   read -r -a EXTRA_FROM_ENV <<< "$CATK_EXTRA_OVERRIDES"
   EXTRA_OVERRIDES+=("${EXTRA_FROM_ENV[@]}")
 fi
+if [[ -n "${CATK_GENERATED_ESTIMATOR_LR:-}" ]]; then
+  EXTRA_OVERRIDES+=("model.model_config.self_forced.generated_estimator_lr=$(strip_shell_quotes "$CATK_GENERATED_ESTIMATOR_LR")")
+fi
 
 if [[ ! -f "$PRETRAIN_CKPT" ]]; then
   echo "ERROR: PRETRAIN_CKPT does not exist: $PRETRAIN_CKPT" >&2
@@ -372,11 +415,11 @@ while (( bs >= MIN_BS )); do
         && -n "${ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH:-}" \
         && -f "$ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH" \
         && -n "${ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP:-}" \
-        && -n "${CATK_LR:-}" ]]; then
-      log "Uploading generated-estimator warmup snapshot to W&B bank: ${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME}"
+        && -n "${ESTIMATOR_WARMUP_BANK_LR:-}" ]]; then
+      log "Uploading generated-estimator warmup snapshot to W&B bank: ${ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME} generated_estimator_lr=${ESTIMATOR_WARMUP_BANK_LR}"
       python scripts/self_forced_estimator_bank.py upsert \
         --artifact-name "$ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME" \
-        --entry "${ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP}:${CATK_LR}:${ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH}" \
+        --entry "${ESTIMATOR_WARMUP_BANK_ORIGINAL_WARMUP}:${ESTIMATOR_WARMUP_BANK_LR}:${ESTIMATOR_WARMUP_BANK_SNAPSHOT_PATH}" \
         --entity "$ESTIMATOR_WARMUP_BANK_ENTITY" \
         --project "$ESTIMATOR_WARMUP_BANK_PROJECT" \
         --run-name "${TASK_NAME}_generated_estimator_bank" \
