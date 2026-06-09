@@ -34,7 +34,7 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 DEFAULT_TASK_NAME = (
     "flow_self_forced_dmd_a100x4_testa_epoch061_x5f9g0ce_activecontrol_"
-    "sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle_oomretry"
+    "sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle_oomretry"
 )
 DEFAULT_SESSION = "catk-self-forced-dmd-a100x4-testa"
 DEFAULT_ESTIMATOR_WARMUP_BANK_ARTIFACT = (
@@ -395,7 +395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3")
     parser.add_argument("--nproc-per-node", type=int, default=4)
-    parser.add_argument("--initial-bs", type=int, default=144)
+    parser.add_argument("--initial-bs", type=int, default=96)
     parser.add_argument("--oom-step", type=int, default=16)
     parser.add_argument("--min-bs", type=int, default=64)
     parser.add_argument("--val-batch-size", default="8")

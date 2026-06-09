@@ -5,7 +5,7 @@
 # This is the single-pod sibling of the epoch-061 A100x4 `testa` recipe:
 #   - one pod / three ranks
 #   - same DMD self-forced objective and epoch-061 Generator starting point
-#   - initial per-rank train batch 128 through the launcher
+#   - initial per-rank train batch 96 through the launcher
 
 defaults:
   - self_forced_npfm_h100_4
@@ -47,7 +47,7 @@ model:
       use_stop_motion: false
 
 data:
-  train_batch_size: 128
+  train_batch_size: 96
   val_batch_size: 8
   test_batch_size: 8
   num_workers: 4

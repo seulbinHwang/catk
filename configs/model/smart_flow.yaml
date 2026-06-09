@@ -91,7 +91,7 @@ model_config:
     clean_dmd_normalizer_eps: 0.05
     sid_alpha: 1.0
     sid_normalizer_eps: 1.0e-3
-    detach_block_transition: true
+    detach_block_transition: false
     # Stop-motion gate는 전 경로에서 사용하지 않습니다. 값은 false로 고정합니다.
     use_stop_motion: false
     generated_estimator_lr: ${model.model_config.lr}

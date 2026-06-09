@@ -2063,7 +2063,7 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 ### 5.11 6x H100에서 Self-Forced NPFM fine-tuning
 
 - preset 파일: `configs/experiment/self_forced_npfm_h100_6.yaml`
-- H100 preset은 Generator lr `1e-6`, generated estimator optimizer lr `1e-6`, `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=middle`, `detach_block_transition=true`, sampling = Euler `sample_steps=16` / `backprop_last_k=8` / `noise_scale=1.0` 을 기본으로 둡니다.
+- H100 preset은 Generator lr `1e-6`, generated estimator optimizer lr `1e-6`, `weight=1.0`, `anchor_weight=0.1`, `use_anchor_flow_matching_loss=false`, `estimator_updates_per_step=5`, `unfrozen_range=middle`, `detach_block_transition=false`, sampling = Euler `sample_steps=16` / `backprop_last_k=8` / `noise_scale=1.0` 을 기본으로 둡니다.
 - Bounded Clean-DMD guidance 기본값 `clean_dmd_normalizer_eps=0.05`, `dmd_stable_scale_scope=type`, `clean_dmd_tau_low=0.02`, `clean_dmd_tau_high=0.98` 을 함께 둡니다. `clean_dmd_normalizer_eps` 는 stable scale의 최소값입니다.
 - Generator EMA 기본값은 `ema_weight=0.99`, `ema_start_step=50` 입니다. EMA는 online Generator update 직후에만 갱신되고, generated estimator에는 적용하지 않습니다.
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=0` 입니다. self-forcing 시작 직후부터 generated estimator 업데이트와 Generator 업데이트를 같은 train step 안에서 수행합니다.
@@ -2285,7 +2285,7 @@ python scripts/launch_self_forced_dmd_h100x6_hsb1_static_pod.py \
 | generated estimator lr | `1.0e-6` |
 | estimator updates | `5` per train step |
 | estimator warmup | `0` epoch |
-| detach block transition | `true` |
+| detach block transition | `false` |
 | self-forced sample steps | Euler `sample_steps=16` |
 | self-forced backprop | `backprop_last_k=8` |
 | random terminal policy | `all` |
@@ -2322,7 +2322,7 @@ python scripts/launch_self_forced_dmd_epoch061_h100x6_hsb1_static_pod.py --repla
 | DMD objective | active-control DMD, vehicle/cyclist lateral DMD axis disabled |
 | control mode | `use_kinematic_control_flow=true`, `use_holonomic_model_only=false` |
 | sample steps / solver | Euler `sample_steps=16` |
-| backprop | `backprop_last_k=8`, `detach_block_transition=true` |
+| backprop | `backprop_last_k=8`, `detach_block_transition=false` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `check_val_every_n_epoch=1`, `limit_val_batches=0.1` |
 | train metric path | `decoder.detach_train_metric_clean=true` |
 | train data fraction | `data.train_epoch_sample_fraction=0.25` |
@@ -2523,9 +2523,9 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py --replace
 ```bash
 python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
   --replace \
-  --task-name flow_self_forced_dmd_a100x4x2_testa_smoke_bs20 \
+  --task-name flow_self_forced_dmd_a100x4x2_testa_smoke_bs96 \
   --session catk-self-forced-dmd-a100x4x2-testa-smoke \
-  --initial-bs 20 \
+  --initial-bs 96 \
   --max-epochs 1 \
   --limit-train-batches 2 \
   --limit-val-batches 0
@@ -2538,7 +2538,7 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
 | pods | `testa` 4 A100 + `testaa` 4 A100 |
 | branch | `semi_control_stable` |
 | experiment | `self_forced_npfm_a100x4x2` |
-| default task | `flow_self_forced_dmd_a100x4x2_testa_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs20_frac025_ep16_middle_oomretry` |
+| default task | `flow_self_forced_dmd_a100x4x2_testa_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | checkpoint 의미 | `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` epoch 61 Generator, artifact metadata epoch 62 / global step 278192, 원 파일명 `epoch_last.ckpt` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_a100x4x2_testa_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
@@ -2556,7 +2556,7 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
 | estimator updates | `5` per train step |
 | estimator warmup | `1` epoch |
 | frozen map feature cache | `model.model_config.self_forced.cache_frozen_map_features=true` |
-| detach block transition | `true` |
+| detach block transition | `false` |
 | self-forced sample steps | Euler `sample_steps=16` |
 | self-forced backprop | `backprop_last_k=8` |
 | random terminal policy | `all` |
@@ -2565,8 +2565,8 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
 | train data fraction | `data.train_epoch_sample_fraction=0.25` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1` |
 | epochs | `16` |
-| initial train batch | per-rank `20`, effective global batch `160` |
-| OOM fallback | `20 -> 19 -> 18 -> ... -> 12`, latest self-forced checkpoint resume |
+| initial train batch | per-rank `96`, effective global batch `768` |
+| OOM fallback | `96 -> 95 -> 94 -> ... -> 12`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-a100x4x2-testa` |
@@ -2574,14 +2574,14 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py \
 2026-06-06 A100x4x2 `unfrozen_range=middle` probe 결과, `bs32` 20 train step,
 `bs128` 20 train step, `bs160` 8 train step이 모두 CUDA OOM 없이 종료되었습니다.
 관측된 W&B peak reserved는 각각 약 `24.1%`, `74.8%`, `83.8%`였습니다. 다만
-기본 launcher는 더 보수적인 비교 실험을 위해 per-rank `bs20`에서 시작합니다.
+기본 launcher는 listed A100x4x2 self-forcing pod 기본값과 맞춰 per-rank `bs96`에서 시작합니다.
 rare heavy batch에서 OOM이 나면 launcher가 최신 self-forced checkpoint에서
 batch를 1씩 낮춰 재개합니다.
 
 시간 감각은 다음처럼 보면 됩니다. 기본 `train_epoch_sample_fraction=0.25`에서
-`bs20`은 epoch당 약 `761` train step입니다. 이전 `bs18`,
+`bs96`은 epoch당 약 `159` train step입니다. 이전 `bs18`,
 `train_epoch_sample_fraction=0.25` 측정에서 train-only는 epoch당 약 `142~143분`
-수준이었고, `bs20`은 global batch가 조금 더 커서 이보다 약간 짧게 걸릴 가능성이
+수준이었고, `bs96`은 global batch가 더 커서 이보다 짧게 걸릴 가능성이
 큽니다. 반면 `bs160`, fraction `0.1`은 실측 기준 train-only epoch당 약 `13분`,
 16 epoch 약 `3.5시간`이었습니다.
 
@@ -2616,9 +2616,9 @@ python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py --replace
 ```bash
 python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py \
   --replace \
-  --task-name flow_self_forced_dmd_a100x4_testa_smoke_bs144 \
+  --task-name flow_self_forced_dmd_a100x4_testa_smoke_bs96 \
   --session catk-self-forced-dmd-a100x4-testa-smoke \
-  --initial-bs 144 \
+  --initial-bs 96 \
   --max-epochs 1 \
   --limit-train-batches 20 \
   --limit-val-batches 0
@@ -2631,7 +2631,7 @@ python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py \
 | pod | `testa` 4 A100 |
 | branch | `semi_control_stable` |
 | experiment | `self_forced_npfm_a100x4_testa` |
-| default task | `flow_self_forced_dmd_a100x4_testa_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs144_frac025_ep16_middle_oomretry` |
+| default task | `flow_self_forced_dmd_a100x4_testa_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | checkpoint 의미 | `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` epoch 61 Generator, artifact metadata epoch 62 / global step 278192 |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_a100x4_testa_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
@@ -2644,7 +2644,7 @@ python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py \
 | estimator updates | `5` per train step |
 | estimator warmup | `1` epoch |
 | trainable range | `unfrozen_range=middle` |
-| detach block transition | `true` |
+| detach block transition | `false` |
 | self-forced sample steps | Euler `sample_steps=16` |
 | self-forced backprop | `backprop_last_k=8` |
 | random terminal policy | `all` |
@@ -2653,8 +2653,8 @@ python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py \
 | train batch construction | `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, every 2 epochs |
 | epochs | `16` |
-| initial train batch | per-rank `144`, effective global batch `576` |
-| OOM fallback | `144 -> 128 -> ... -> 64`, latest self-forced checkpoint resume |
+| initial train batch | per-rank `96`, effective global batch `384` |
+| OOM fallback | `96 -> 80 -> 64`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-a100x4-testa` |
@@ -2664,7 +2664,7 @@ python scripts/launch_self_forced_dmd_a100x4_testa_static_pod.py \
 `bs160`이 20-step smoke를 CUDA OOM 없이 통과했고, full-epoch probe도 사용자 요청으로
 중단하기 전 `32/191` train step까지 OOM 없이 진행했습니다. 해당 partial probe에서 최대 관측
 GPU memory는 약 `74.5 GiB / 80 GiB`였습니다. full epoch 전체를 끝까지 돈 값은 아니므로,
-rare heavy batch에 대비해 시작 batch를 `144`로 낮추고 OOM fallback을 함께 둡니다.
+rare heavy batch에 대비해 시작 batch를 `96`으로 두고 OOM fallback을 함께 둡니다.
 memory-balanced sampler는 rank별 batch를 직접 나누므로
 Lightning의 자동 distributed sampler는 꺼 둡니다. 이 조합이 빠지면 Lightning이 batch sampler를
 다시 감싸려 하면서 실행 전 오류가 납니다.
@@ -2699,7 +2699,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py --replace
 ```bash
 python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
   --replace \
-  --task-name flow_self_forced_dmd_h100x3_hsb31_smoke_bs128 \
+  --task-name flow_self_forced_dmd_h100x3_hsb31_smoke_bs96 \
   --session catk-self-forced-dmd-h100x3-hsb31-smoke \
   --max-epochs 1 \
   --check-val-every-n-epoch 1 \
@@ -2715,7 +2715,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
 | branch | `semi_control_stable` |
 | pod checkout | `/tmp/catk_self_forced_dmd_h100x3_hsb31` |
 | experiment | `self_forced_npfm_h100_3_hsb31` |
-| default task | `flow_self_forced_dmd_h100x3_hsb31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` |
+| default task | `flow_self_forced_dmd_h100x3_hsb31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | checkpoint 의미 | `flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20` epoch 61 Generator, artifact metadata epoch 62 / global step 278192 |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_hsb31_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
@@ -2728,7 +2728,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
 | estimator updates | `5` per train step |
 | estimator warmup | `1` epoch |
 | trainable range | `unfrozen_range=middle` |
-| detach block transition | `true` |
+| detach block transition | `false` |
 | self-forced sample steps | Euler `sample_steps=16` |
 | self-forced backprop | `backprop_last_k=8` |
 | random terminal policy | `all` |
@@ -2737,8 +2737,8 @@ python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
 | train batch construction | `data.train_memory_balanced_batches=true`, `trainer.use_distributed_sampler=false` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, every 2 epochs |
 | epochs | `16` |
-| initial train batch | per-rank `128`, effective global batch `384` |
-| OOM fallback | 기본값은 `128 -> 112 -> ... -> 16`, latest self-forced checkpoint resume |
+| initial train batch | per-rank `96`, effective global batch `288` |
+| OOM fallback | 기본값은 `96 -> 80 -> ... -> 16`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-h100x3-hsb31` |
@@ -2749,11 +2749,11 @@ python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
 |---|---|---|
 | historical train smoke | `bs160`, 3 ranks, `limit_train_batches=2`, `max_epochs=1` | 성공, `train/loss_epoch=0.07317`, `time/train_epoch_minutes=0.63746`, `worst_peak_reserved_pct_epoch_max=83.45095` |
 | validate smoke | 위 smoke의 `epoch_last.ckpt`, `action=validate`, `scorer_scene_num=24`, `limit_val_batches=1` | 성공, `val_closed/sim_agents_2025/realism_meta_metric=0.769756`, `scenario_counter=24` |
-| current default | `bs128`, 3 ranks | 이전 `bs160` smoke보다 낮은 보수 시작 batch. OOM 시 `16`씩 낮춰 최신 self-forced checkpoint로 resume |
+| current default | `bs96`, 3 ranks | 이전 `bs160` smoke보다 낮은 보수 시작 batch. OOM 시 `16`씩 낮춰 최신 self-forced checkpoint로 resume |
 
 위 historical smoke 기준 첫 train batch에는 dataloader/DDP warmup이 포함되어 28초, 두 번째
 train batch는 약 9초였습니다. current default full run의 epoch당 step 수는 effective global batch
-`384`와 `train_epoch_sample_fraction=0.25` 기준 약 317 step 수준으로 잡히므로, 초기
+`288`과 `train_epoch_sample_fraction=0.25` 기준 약 423 step 수준으로 잡히므로, 초기
 추정은 train-only epoch당 대략 `45~55분`, validation epoch은 추가 시간이 붙습니다.
 실제 full run 시작 후에는 첫 1~2 epoch의 `time/train_epoch_minutes`를 기준으로 다시
 보정하세요.
@@ -2789,7 +2789,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb32_static_pod.py --replace
 | pod | `hsb-npc-training-3-2` 3 H100 |
 | pod checkout | `/tmp/catk_self_forced_dmd_h100x3_hsb32` |
 | experiment | `self_forced_npfm_h100_3_hsb32` |
-| default task | `flow_self_forced_dmd_h100x3_hsb32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` |
+| default task | `flow_self_forced_dmd_h100x3_hsb32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_hsb32_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | tmux session | `catk-self-forced-dmd-h100x3-hsb32` |
 
@@ -2825,7 +2825,7 @@ python scripts/launch_self_forced_dmd_h100x3_hsb3n2_static_pod.py --replace
 | script | `scripts/launch_self_forced_dmd_h100x3_hsb3n1_static_pod.py` | `scripts/launch_self_forced_dmd_h100x3_hsb3n2_static_pod.py` |
 | pod checkout | `/tmp/catk_self_forced_dmd_h100x3_hsb3n1` | `/tmp/catk_self_forced_dmd_h100x3_hsb3n2` |
 | experiment | `self_forced_npfm_h100_3_hsb3n1` | `self_forced_npfm_h100_3_hsb3n2` |
-| default task | `flow_self_forced_dmd_h100x3_hsb3n1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_hsb3n2_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` |
+| default task | `flow_self_forced_dmd_h100x3_hsb3n1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_hsb3n2_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_hsb3n1_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` | `/workspace/flow_self_forced_dmd_h100x3_hsb3n2_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | tmux session | `catk-self-forced-dmd-h100x3-hsb3n1` | `catk-self-forced-dmd-h100x3-hsb3n2` |
 
@@ -2864,7 +2864,7 @@ python scripts/launch_self_forced_dmd_h100x3_wopvc32_static_pod.py --replace
 | script | `scripts/launch_self_forced_dmd_h100x3_wopvc31_static_pod.py` | `scripts/launch_self_forced_dmd_h100x3_wopvc32_static_pod.py` |
 | pod checkout | `/tmp/catk_self_forced_dmd_h100x3_wopvc31` | `/tmp/catk_self_forced_dmd_h100x3_wopvc32` |
 | experiment | `self_forced_npfm_h100_3_wopvc31` | `self_forced_npfm_h100_3_wopvc32` |
-| default task | `flow_self_forced_dmd_h100x3_wopvc31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_wopvc32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle` |
+| default task | `flow_self_forced_dmd_h100x3_wopvc31_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle` | `flow_self_forced_dmd_h100x3_wopvc32_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3_wopvc31_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` | `/workspace/flow_self_forced_dmd_h100x3_wopvc32_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | tmux session | `catk-self-forced-dmd-h100x3-wopvc31` | `catk-self-forced-dmd-h100x3-wopvc32` |
 

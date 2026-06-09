@@ -25,7 +25,7 @@ model:
       clean_dmd_normalizer_eps: 0.05
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
-      detach_block_transition: true
+      detach_block_transition: false
       # Training self-rollout 전용입니다. Inference/validation stop-motion은
       # model_config.decoder.use_stop_motion으로 별도 제어합니다.
       use_stop_motion: false

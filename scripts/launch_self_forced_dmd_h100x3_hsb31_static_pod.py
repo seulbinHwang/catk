@@ -35,7 +35,7 @@ DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
 )
 DEFAULT_TASK_NAME = (
     "flow_self_forced_dmd_h100x3_hsb31_epoch061_x5f9g0ce_activecontrol_"
-    "sample16_backprop8_lr1e-6_bs128_frac025_ep16_middle"
+    "sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle"
 )
 DEFAULT_SESSION = "catk-self-forced-dmd-h100x3-hsb31"
 
@@ -404,7 +404,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session", default=DEFAULT_SESSION)
     parser.add_argument("--cuda-visible-devices", default="0,1,2")
     parser.add_argument("--nproc-per-node", type=int, default=3)
-    parser.add_argument("--initial-bs", type=int, default=128)
+    parser.add_argument("--initial-bs", type=int, default=96)
     parser.add_argument("--oom-step", type=int, default=16)
     parser.add_argument("--min-bs", type=int, default=16)
     parser.add_argument("--val-batch-size", default="8")
@@ -469,8 +469,8 @@ def parse_args() -> argparse.Namespace:
         return args
     if args.nproc_per_node != 3:
         parser.error(f"--nproc-per-node must be 3 for the H100x3 {args.pod} preset")
-    if args.initial_bs != 128:
-        parser.error("--initial-bs is fixed at 128 for this requested recipe")
+    if args.initial_bs != 96:
+        parser.error("--initial-bs is fixed at 96 for this requested recipe")
     if args.min_bs > args.initial_bs:
         parser.error("--min-bs must be <= --initial-bs")
     if args.oom_step < 1:

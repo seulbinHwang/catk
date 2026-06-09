@@ -66,12 +66,12 @@ def main() -> int:
         "--task-name",
         (
             "flow_self_forced_dmd_a100x4x2_testa_epoch061_x5f9g0ce_activecontrol_"
-            "sample16_backprop8_lr1e-6_bs20_frac025_ep16_middle_oomretry"
+            "sample16_backprop8_lr1e-6_bs96_frac025_ep16_middle_oomretry"
         ),
         "--session",
         "catk-self-forced-dmd-a100x4x2-testa",
         "--initial-bs",
-        "20",
+        "96",
         "--oom-step",
         "1",
         "--min-bs",

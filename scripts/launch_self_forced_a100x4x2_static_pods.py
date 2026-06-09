@@ -1340,7 +1340,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--nproc-per-node", type=int, default=4)
-    parser.add_argument("--initial-bs", type=int, default=22)
+    parser.add_argument("--initial-bs", type=int, default=96)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--val-batch-size", type=int, default=8)
