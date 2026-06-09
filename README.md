@@ -2196,6 +2196,13 @@ ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME=generated-estimator-warmup-bank-pretrain-x5f
 ```
 
 따라서 보통은 별도 옵션 없이 실행하면 됩니다.
+특정 generated-estimator LR 전용 bank가 있으면 launcher에서 해당 artifact를 명시할 수 있습니다.
+예를 들어 `lr=5e-5` self-forced 실험은 아래 bank를 직접 조회하도록 설정할 수 있습니다.
+
+```bash
+ESTIMATOR_WARMUP_BANK_ARTIFACT=generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr5e-5:latest
+ESTIMATOR_WARMUP_BANK_ARTIFACT_NAME=generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr5e-5
+```
 
 ```bash
 python scripts/launch_self_forced_dmd_h100x3_hsb31_static_pod.py \
@@ -2612,7 +2619,9 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_static_pods.py --stop
 `semi_control_sf_anchor` 브랜치의 multi-anchor self-forcing 구현을 A100 4GPU pod
 2개(`testa`, `testaa`)에서 돌릴 때는 아래 wrapper를 사용합니다. 이 wrapper는
 기존 A100x4x2 static pod launcher를 그대로 쓰되, `rollout_anchor_stride=2`와
-per-rank `data.train_batch_size=24`를 기본으로 둡니다.
+per-rank `data.train_batch_size=18` 시작값을 기본으로 둡니다. CUDA OOM이 발생하면
+latest self-forced checkpoint 기준으로 `18 -> 16 -> 14 -> 12` 순서로 낮춰
+재개합니다.
 
 ```bash
 python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py --replace
@@ -2623,9 +2632,9 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py --
 ```bash
 python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py \
   --replace \
-  --task-name flow_self_forced_dmd_a100x4x2_testa_sfanchor_stride2_smoke_bs24 \
+  --task-name flow_self_forced_dmd_a100x4x2_testa_sfanchor_stride2_smoke_bs18 \
   --session catk-self-forced-dmd-a100x4x2-testa-sfanchor-smoke \
-  --initial-bs 24 \
+  --initial-bs 18 \
   --max-epochs 1 \
   --limit-train-batches 2 \
   --limit-val-batches 0
@@ -2638,14 +2647,14 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py \
 | pods | `testa` 4 A100 + `testaa` 4 A100 |
 | branch | `semi_control_sf_anchor` |
 | experiment | `self_forced_npfm_a100x4x2` |
-| default task | `flow_self_forced_dmd_a100x4x2_testa_sfanchor_stride2_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr1e-6_bs24_frac025_ep16_middle_oomretry` |
+| default task | `flow_self_forced_dmd_a100x4x2_testa_sfanchor_stride2_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs18to12_frac025_ep8_warm2_middle_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_a100x4x2_testa_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=2`, 즉 anchor offset `0,2,4,6,8,10,12,14` |
 | DDP shape | `trainer.num_nodes=2`, `trainer.devices=4`, 총 8 ranks |
 | precision | `bf16-mixed` |
-| lr | Generator `1.0e-6`, generated estimator `1.0e-6` |
-| estimator warmup | `1` epoch, W&B generated-estimator warmup bank 사용 |
+| lr | Generator `5.0e-5`, generated estimator `5.0e-5` |
+| estimator warmup | 요청값 `2` epoch, W&B generated-estimator warmup bank `generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr5e-5:latest` 사용. 정확한 bank hit이면 warmup은 다운로드로 대체되고 실제 generator+DMD 학습 예산은 8 epoch로 조정됩니다. |
 | DMD objective | `model.model_config.self_forced.distribution_matching_objective=dmd` |
 | detach block transition | `false` |
 | self-forced sample steps | Euler `sample_steps=16` |
@@ -2653,15 +2662,15 @@ python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py \
 | random terminal policy | `all` |
 | train data fraction | `data.train_epoch_sample_fraction=0.25` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1` |
-| epochs | `16` |
-| initial train batch | per-rank `24`, effective global scene batch `192` |
-| OOM fallback | `24 -> 23 -> 22 -> ... -> 4`, latest self-forced checkpoint resume |
+| epochs | `MAX_EPOCHS=10`; warmup bank에서 2 epoch exact hit 시 실제 `trainer.max_epochs=8`, miss 시 warmup 2 + generator/DMD 8 |
+| initial train batch | per-rank `18`, effective global scene batch `144` |
+| OOM fallback | `18 -> 16 -> 14 -> 12`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
-| tmux session | `catk-self-forced-dmd-a100x4x2-testa-sfanchor-stride2` |
+| tmux session | `catk-self-forced-dmd-a100x4x2-testa-sfanchor-stride2-lr5e5` |
 
 `rollout_anchor_stride=2`에서는 scene마다 8개 anchor를 self-forcing 본체에 쓰므로,
-per-rank `bs24`의 anchor-rollout 수는 기존 첫-anchor 방식의 `bs192`와 같은 규모입니다.
+per-rank `bs18`의 anchor-rollout 수는 기존 첫-anchor 방식의 `bs144`와 같은 규모입니다.
 `rollout_anchor_stride=1`로 override하면 16개 anchor 전체를 사용하므로, 같은 메모리
 한계를 유지하려면 batch를 추가로 낮춰야 합니다.
 
