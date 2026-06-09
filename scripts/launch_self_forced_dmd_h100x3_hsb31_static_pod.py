@@ -475,8 +475,8 @@ def parse_args() -> argparse.Namespace:
         return args
     if args.nproc_per_node != 3:
         parser.error(f"--nproc-per-node must be 3 for the H100x3 {args.pod} preset")
-    if args.initial_bs != 96:
-        parser.error("--initial-bs is fixed at 96 for this requested recipe")
+    if args.initial_bs not in {48, 96}:
+        parser.error("--initial-bs must be 48 or 96 for this requested recipe")
     if args.min_bs > args.initial_bs:
         parser.error("--min-bs must be <= --initial-bs")
     if args.oom_step < 1:
