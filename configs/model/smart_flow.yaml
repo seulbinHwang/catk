@@ -76,6 +76,13 @@ model_config:
     # 채널(non-holonomic delta_n)은 direction/normalizer 양쪽에서 masking 으로 제외한다.
     # true 면 시간축만 평균(채널별 분모)하던 기존(분모 불안정 → push 폭발) 방식.
     clean_dmd_per_channel_normalizer: false
+    # DMD optimizer 정합(원본 Self-Forcing): gen/critic 둘 다 Adam betas=(beta1,beta2),
+    # weight_decay 적용.  beta1=0.0(momentum 제거)은 critic↔generator non-stationary
+    # 동역학의 관성 진동을 막고, weight_decay=0.0 은 pretrain 가중치 침식을 막는다.
+    # (AdamW 기본 betas=(0.9,0.999)/wd=0.01 은 self-forced 분기에서 쓰지 않는다.)
+    optimizer_beta1: 0.0
+    optimizer_beta2: 0.999
+    weight_decay: 0.0
     anchor_weight: 0.05
     use_anchor_flow_matching_loss: false
     distribution_matching_objective: dmd

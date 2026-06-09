@@ -260,6 +260,24 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
+        # DMD optimizer 정합: 원본 Self-Forcing 은 gen/critic 둘 다 Adam betas=(0.0,0.999),
+        # weight_decay 없음.  beta1=0(momentum 제거)은 critic↔generator non-stationary
+        # 동역학에서 관성 진동을 막고, weight_decay=0 은 pretrain 가중치 침식을 막는다.
+        self.self_forced_adam_beta1 = (
+            float(getattr(self.self_forced_config, "optimizer_beta1", 0.0))
+            if self.self_forced_config is not None
+            else 0.0
+        )
+        self.self_forced_adam_beta2 = (
+            float(getattr(self.self_forced_config, "optimizer_beta2", 0.999))
+            if self.self_forced_config is not None
+            else 0.999
+        )
+        self.self_forced_weight_decay = (
+            float(getattr(self.self_forced_config, "weight_decay", 0.0))
+            if self.self_forced_config is not None
+            else 0.0
+        )
         self.self_forced_distribution_matching_objective = (
             str(getattr(self.self_forced_config, "distribution_matching_objective", "dmd")).lower()
             if self.self_forced_config is not None
@@ -2390,9 +2408,15 @@ class SMARTFlow(LightningModule):
                     self._prepare_self_forced_estimator_backward_boundary()
                     if has_committed_path_local:
                         with torch.no_grad():
+                            # 원본 정합: critic 은 DMD guidance 가 score 를 읽는 것과
+                            # 동일한 tau 분포 [tau_low, tau_high] 에서 학습한다.  전 구간
+                            # [~0,1] 에서 학습하면 DMD 가 안 읽는 극단(거의 노이즈/거의
+                            # clean)에 용량을 쓰고 정작 읽는 밴드에서 덜 fit 된다.
                             flow_sample = self.self_forced_generated_estimator.agent_encoder.flow_ode.sample(
                                 clean_path,
                                 target_type="velocity",
+                                tau_low=self.self_forced_guidance_tau_low,
+                                tau_high=self.self_forced_guidance_tau_high,
                             )
                         noisy_path_norm = flow_sample.x_t.detach()
                         tau = flow_sample.tau.detach()
@@ -3348,7 +3372,16 @@ open_metric_dict:
             generator_params = [param for param in self.encoder.parameters() if param.requires_grad]
             if not generator_params:
                 raise RuntimeError("No trainable generator parameters found for self-forced optimization.")
-            generator_optimizer = torch.optim.AdamW(generator_params, lr=self.lr)
+            # 원본 Self-Forcing(DMD) 정합: gen/critic 둘 다 Adam betas=(0.0,0.999),
+            # weight_decay=0.  AdamW 기본(betas=(0.9,0.999), wd=0.01)은 momentum 진동과
+            # pretrain 침식을 유발하므로 self-forced 분기에서는 쓰지 않는다.
+            self_forced_betas = (self.self_forced_adam_beta1, self.self_forced_adam_beta2)
+            generator_optimizer = torch.optim.Adam(
+                generator_params,
+                lr=self.lr,
+                betas=self_forced_betas,
+                weight_decay=self.self_forced_weight_decay,
+            )
             if self.self_forced_generated_estimator is None:
                 raise RuntimeError("self_forced_generated_estimator is not initialized.")
             estimator_params = [
@@ -3356,9 +3389,11 @@ open_metric_dict:
             ]
             if not estimator_params:
                 raise RuntimeError("No trainable generated-estimator parameters found.")
-            generated_estimator_optimizer = torch.optim.AdamW(
+            generated_estimator_optimizer = torch.optim.Adam(
                 estimator_params,
                 lr=self.self_forced_estimator_lr,
+                betas=self_forced_betas,
+                weight_decay=self.self_forced_weight_decay,
             )
             return [generator_optimizer, generated_estimator_optimizer]
 
