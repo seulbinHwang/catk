@@ -58,13 +58,17 @@ NORMALIZE_DIRECTION="${NORMALIZE_DIRECTION:-true}"  # false=거리-나눗셈 제
 # 안정). 죽은 채널(non-holonomic delta_n)은 direction/normalizer 양쪽에서 masking 제외.
 # true=시간축만 평균(채널별 분모) — 분모 불안정 → push 폭발하던 기존 방식.
 PER_CHANNEL_NORMALIZER="${PER_CHANNEL_NORMALIZER:-false}"
+# DMD direction normalizer 분모 하한(eps). normalizer=|committed-teacher| 평균이 이 값보다
+# 작으면 floor. 기본 0.05 는 수렴 구간 push 증폭(분모 0 근처 폭발)을 강하게 억제. 1e-3 으로
+# 낮추면 원본 정합. config 키: self_forced.clean_dmd_normalizer_eps.
+NORMALIZER_EPS="${NORMALIZER_EPS:-0.05}"
 # gradient 경로 정책.
 #   all(기본)=random terminal 미생성 → 블록 간 detach 제거(전 horizon grad) + backprop_last_k
 #     경로. BACKPROP_LAST_K=16=sample_steps 면 16 ODE step 전부 grad. (full-gradient)
 #   paper_uniform=원본식 truncation(블록 detach + 마지막 1개 ODE step만 grad, τ≈1 고정).
 TERMINAL_POLICY="${TERMINAL_POLICY:-all}"
 BACKPROP_LAST_K="${BACKPROP_LAST_K:-16}"   # policy=all 일 때 grad 남길 마지막 ODE step 수
-ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-1}"
+ESTIMATOR_WARMUP_EPOCHS="${ESTIMATOR_WARMUP_EPOCHS:-0}"
 # 반복 warmup/joint zone 스케줄(step 기준). 둘 다 양수면 warmup zone(critic만)과
 # joint zone(기존 cadence DMD)을 step 기준으로 번갈아 무한 반복. 0/0 이면 비활성.
 WARMUP_ZONE_STEPS="${WARMUP_ZONE_STEPS:-0}"
@@ -89,6 +93,8 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 N_ROLLOUT_CLOSED_VAL="${N_ROLLOUT_CLOSED_VAL:-16}"
 SIM_AGENTS_METRIC_WORKERS="${SIM_AGENTS_METRIC_WORKERS:-8}"   # 0=직렬(느림). 병렬로 val scorer 단축.
 DATA_SHUFFLE="${DATA_SHUFFLE:-false}"
+# checkpoint 저장 여부. true(기본)=best(RMM 최대)+last 저장. false=콜백 제거(빠른 실험).
+SAVE_CKPT="${SAVE_CKPT:-true}"
 
 # wandb
 WANDB_ENTITY="${WANDB_ENTITY:-se99an}"
@@ -134,6 +140,7 @@ set -- \
   model.model_config.self_forced.path_step_size="${PATH_STEP_SIZE}" \
   model.model_config.self_forced.normalize_direction="${NORMALIZE_DIRECTION}" \
   model.model_config.self_forced.clean_dmd_per_channel_normalizer="${PER_CHANNEL_NORMALIZER}" \
+  model.model_config.self_forced.clean_dmd_normalizer_eps="${NORMALIZER_EPS}" \
   model.model_config.self_forced.sampling.random_terminal_step.policy="${TERMINAL_POLICY}" \
   model.model_config.self_forced.sampling.backprop_last_k="${BACKPROP_LAST_K}" \
   model.model_config.self_forced.use_anchor_flow_matching_loss="${USE_ANCHOR_FM_LOSS}" \
@@ -147,9 +154,7 @@ set -- \
   model.model_config.self_forced.warmup_zone_steps="${WARMUP_ZONE_STEPS}" \
   model.model_config.self_forced.joint_zone_steps="${JOINT_ZONE_STEPS}" \
   logger.wandb.entity="${WANDB_ENTITY}" \
-  logger.wandb.project="${WANDB_PROJECT}" \
-  "~callbacks.model_checkpoint" \
-  "~callbacks.epoch_last_checkpoint"
+  logger.wandb.project="${WANDB_PROJECT}"
 
 # warmup된 fake critic override (빈값이면 생략 → config null 유지)
 if [ -n "${ESTIMATOR_INIT_CKPT}" ]; then
@@ -161,18 +166,26 @@ if [ -n "${UNFROZEN_RANGE}" ]; then
   set -- "$@" model.model_config.self_forced.unfrozen_range="${UNFROZEN_RANGE}"
 fi
 
+# checkpoint 저장. SAVE_CKPT=true(기본): model_checkpoint(best, monitor=RMM/mode=max,
+# save_top_k=1 + save_last 링크) + epoch_last_checkpoint(epoch_last.ckpt) 유지 → best+last.
+# false: 두 콜백 제거(빠른 실험용, 디스크 미사용).
+if ! is_true "${SAVE_CKPT}"; then
+  set -- "$@" "~callbacks.model_checkpoint" "~callbacks.epoch_last_checkpoint"
+fi
+
 echo "============================================================"
 echo "[sf-update] task=${TASK}"
 echo "  GPU=${CUDA_VISIBLE_DEVICES} nproc=${NPROC_PER_NODE}  ckpt=${CKPT_PATH}"
 echo "  cadence(fake:gen)=${CADENCE}:1  est_updates/batch=${ESTIMATOR_UPDATES_PER_STEP}  gen_lr=${GEN_LR} fake_lr=${FAKE_LR}"
 echo "  estimator_init_ckpt=${ESTIMATOR_INIT_CKPT:-<none>}"
 echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
-echo "  normalize_dir=${NORMALIZE_DIRECTION} per_channel_norm=${PER_CHANNEL_NORMALIZER} path_step=${PATH_STEP_SIZE}"
+echo "  normalize_dir=${NORMALIZE_DIRECTION} per_channel_norm=${PER_CHANNEL_NORMALIZER} path_step=${PATH_STEP_SIZE} normalizer_eps=${NORMALIZER_EPS}"
 echo "  grad_policy=${TERMINAL_POLICY} backprop_last_k=${BACKPROP_LAST_K} (all+16=full-gradient: 블록 detach 없음 + 16 ODE step 전부)"
 echo "  anchor_fm_loss=${USE_ANCHOR_FM_LOSS} anchor_weight=${ANCHOR_WEIGHT}"
 echo "  zone_schedule(warmup:joint steps)=${WARMUP_ZONE_STEPS}:${JOINT_ZONE_STEPS} (0:0=off)"
 echo "  unfrozen_range=${UNFROZEN_RANGE:-<config default>}"
 echo "  train_B=${TRAIN_B} val_B=${VAL_B} scorer_scene=${SCORER_SCENE_NUM} val_check=${VAL_CHECK_INTERVAL} precision=${PRECISION}"
+echo "  save_ckpt=${SAVE_CKPT} (true=best+last, false=none)"
 echo "  log=${LOG}"
 echo "============================================================"
 

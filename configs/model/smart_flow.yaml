@@ -76,6 +76,10 @@ model_config:
     # 채널(non-holonomic delta_n)은 direction/normalizer 양쪽에서 masking 으로 제외한다.
     # true 면 시간축만 평균(채널별 분모)하던 기존(분모 불안정 → push 폭발) 방식.
     clean_dmd_per_channel_normalizer: false
+    # DMD direction normalizer 분모 하한(eps). normalizer=|committed-teacher| 평균이 이
+    # 값보다 작으면 floor 로 고정. 기본 0.05 는 수렴 구간 push 증폭(분모 0 근처 폭발)을
+    # 강하게 억제한다. 1e-3 으로 낮추면 원본 Self-Forcing(DMD) 정합.
+    clean_dmd_normalizer_eps: 0.05
     # DMD optimizer 정합(원본 Self-Forcing): gen/critic 둘 다 Adam betas=(beta1,beta2),
     # weight_decay 적용.  beta1=0.0(momentum 제거)은 critic↔generator non-stationary
     # 동역학의 관성 진동을 막고, weight_decay=0.0 은 pretrain 가중치 침식을 막는다.
