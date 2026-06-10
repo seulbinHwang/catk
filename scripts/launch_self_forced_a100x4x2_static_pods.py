@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch self-forced static multi-node training on existing 2-pod jobs.
+"""Launch self-forced static training on existing static pod jobs.
 
 This launcher never creates, deletes, or restarts pods. It only uses
 ``kubectl exec`` to start or stop a tmux session inside already-running pods.
@@ -1351,7 +1351,7 @@ def exec_in_pod(args: argparse.Namespace, pod: str, script: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch self-forced 2-pod static multi-node training.",
+        description="Launch self-forced static single- or multi-node training.",
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--pods", nargs="+", default=DEFAULT_PODS)
@@ -1448,8 +1448,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.stop:
         return args
-    if len(args.pods) != 2:
-        parser.error("--pods must contain exactly two pods for the A100x4x2 preset")
+    if len(args.pods) < 1:
+        parser.error("--pods must contain at least one pod")
     if args.nproc_per_node < 1:
         parser.error("--nproc-per-node must be >= 1")
     if args.initial_bs < 1:
