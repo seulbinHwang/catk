@@ -4055,13 +4055,19 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf3_static_pod.py \
   --closed-loop-sf-local-max-step 4 \
   --dmd-use-stable-scale-filter \
   --dmd-stable-scale-scope agent \
-  --initial-bs 12 --oom-step 2 --min-bs 2 \
+  --initial-bs 72 --oom-step 2 --min-bs 2 \
   --replace
 ```
 
 `estimator_warmup_epochs=0`, `max_epochs=5`, `closed_loop_sf_global_max_step=1` 로 실행하면
 t=0 self-forcing generator 학습 5 epoch 뒤 closed-loop stage 1 generator 학습 5 epoch이 추가되어
 trainer는 총 10 epoch으로 확장됩니다.
+
+fm-sf-3 H100 8GPU 기준 기본 시작 batch는 per-rank `72`입니다. CUDA OOM이 발생하면 launcher가 같은
+`task_name`의 최신 `epoch_last.ckpt`, `last.ckpt`, 또는 `epoch_*.ckpt`를 찾아 `ckpt_path`로 넘기고,
+`72 -> 70 -> 68 -> ... -> 2` 순서로 batch를 `2`씩 낮춰 재개합니다. `bs=80`은 짧은 probe는 통과했지만
+full-epoch 초반 peak가 약 `72.7GB / 81.6GB`까지 올라 안정권으로 보지 않았고, `bs=72`는 full-epoch
+검증에서 약 `67.8GB / 81.6GB` 수준의 관측 peak로 더 보수적인 기본값입니다.
 
 기존 epoch별 random subset 모드로 되돌리려면 아래처럼 override합니다.
 

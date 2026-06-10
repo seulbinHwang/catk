@@ -199,8 +199,22 @@ append_extra_overrides() {
   fi
 }
 
+find_latest_resume_checkpoint() {
+  local search_root="${PROJECT_ROOT}/logs/${TASK_NAME}/runs"
+  if [[ ! -d "${search_root}" ]]; then
+    return 0
+  fi
+  find "${search_root}" -type f \
+    \( -name 'epoch_last.ckpt' -o -name 'last.ckpt' -o -name 'epoch_*.ckpt' \) \
+    -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr \
+    | head -n 1 \
+    | cut -d' ' -f2-
+}
+
 build_overrides() {
   local current_bs="$1"
+  local resume_ckpt="${2:-}"
   HYDRA_OVERRIDES=(
     "experiment=${EXPERIMENT}"
     "action=${ACTION}"
@@ -250,7 +264,9 @@ build_overrides() {
   else
     HYDRA_OVERRIDES+=("data.prefetch_factor=${PREFETCH_FACTOR}")
   fi
-  if [[ "${ACTION}" != "fit" && -n "${PRETRAIN_CKPT}" ]]; then
+  if [[ -n "${resume_ckpt}" ]]; then
+    HYDRA_OVERRIDES+=("ckpt_path=${resume_ckpt}")
+  elif [[ "${ACTION}" != "fit" && -n "${PRETRAIN_CKPT}" ]]; then
     HYDRA_OVERRIDES+=("ckpt_path=${PRETRAIN_CKPT}")
   fi
   if [[ -n "${GENERATED_ESTIMATOR_INIT_PATH}" ]]; then
@@ -261,9 +277,13 @@ build_overrides() {
 
 run_attempt() {
   local current_bs="$1"
+  local resume_ckpt="${2:-}"
   ATTEMPT_LOG="${RUN_ROOT}/${TASK_NAME}.bs${current_bs}.torchrun.log"
-  build_overrides "${current_bs}"
+  build_overrides "${current_bs}" "${resume_ckpt}"
   echo "[launcher] starting attempt batch_size=${current_bs}; log=${ATTEMPT_LOG}"
+  if [[ -n "${resume_ckpt}" ]]; then
+    echo "[launcher] resuming from checkpoint: ${resume_ckpt}"
+  fi
   printf '[launcher] hydra overrides:'
   printf ' %q' "${HYDRA_OVERRIDES[@]}"
   printf '\n'
@@ -280,8 +300,9 @@ run_attempt() {
 ensure_pretrain_checkpoint || exit 2
 
 bs="${INITIAL_BS}"
+resume_ckpt=""
 while true; do
-  run_attempt "${bs}"
+  run_attempt "${bs}" "${resume_ckpt}"
   status="$?"
   if [[ "${status}" == "0" ]]; then
     echo "[launcher] training finished successfully at batch_size=${bs}"
@@ -289,7 +310,12 @@ while true; do
   fi
   if grep -Eqi 'OutOfMemory|CUDA out of memory' "${ATTEMPT_LOG}" && (( bs - OOM_STEP >= MIN_BS )); then
     next_bs=$((bs - OOM_STEP))
-    echo "[launcher] OOM detected at batch_size=${bs}; retrying with batch_size=${next_bs}"
+    resume_ckpt="$(find_latest_resume_checkpoint || true)"
+    if [[ -n "${resume_ckpt}" ]]; then
+      echo "[launcher] OOM detected at batch_size=${bs}; retrying with batch_size=${next_bs} from ${resume_ckpt}"
+    else
+      echo "[launcher] OOM detected at batch_size=${bs}; retrying with batch_size=${next_bs} from original checkpoint"
+    fi
     bs="${next_bs}"
     continue
   fi
@@ -460,7 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cuda-visible-devices", default="0,1,2,3,4,5,6,7")
     parser.add_argument("--nproc-per-node", type=int, default=8)
     parser.add_argument("--master-port", type=int, default=29680)
-    parser.add_argument("--initial-bs", type=int, default=12)
+    parser.add_argument("--initial-bs", type=int, default=72)
     parser.add_argument("--oom-step", type=int, default=2)
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--learning-rate", default="5e-5")
