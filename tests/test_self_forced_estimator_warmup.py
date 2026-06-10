@@ -5,6 +5,7 @@ import pytest
 from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
     resolve_self_forced_estimator_warmup_epochs,
+    resolve_self_forced_requested_estimator_warmup_epochs,
     should_compute_anchor_flow_matching_loss,
     should_run_self_forced_validation_after_epoch,
 )
@@ -31,6 +32,18 @@ def test_resolve_self_forced_estimator_warmup_epochs_rejects_negative_value() ->
         resolve_self_forced_estimator_warmup_epochs(
             {"estimator_warmup_epochs": -1}
         )
+
+
+def test_requested_estimator_warmup_epochs_uses_bank_target_when_warmup_was_loaded() -> None:
+    assert (
+        resolve_self_forced_requested_estimator_warmup_epochs(
+            {
+                "estimator_warmup_epochs": 0,
+                "generated_estimator_bank_target_warmup_epochs": 2,
+            }
+        )
+        == 2
+    )
 
 
 def test_is_self_forced_estimator_warmup_epoch_respects_start_epoch() -> None:

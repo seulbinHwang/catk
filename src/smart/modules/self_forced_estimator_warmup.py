@@ -56,6 +56,30 @@ def resolve_self_forced_estimator_warmup_epochs(config: object | None) -> int:
     return warmup_epochs
 
 
+def resolve_self_forced_requested_estimator_warmup_epochs(config: object | None) -> int:
+    """W&B bank 조정 전 사용자가 요청한 generated-estimator warmup epoch 수입니다.
+
+    ``estimator_warmup_epochs`` 는 warmup bank exact hit 후 남은 warmup 수로 0이 될 수
+    있습니다. closed-loop 추가 stage warmup은 남은 수가 아니라 원래 요청한 target
+    warmup 수를 반복해야 하므로, bank target 값이 있으면 그 값을 우선 반영합니다.
+    """
+    remaining_warmup_epochs = resolve_self_forced_estimator_warmup_epochs(config)
+    target_warmup_epochs = int(
+        _get_config_value(
+            config=config,
+            key="generated_estimator_bank_target_warmup_epochs",
+            default=0,
+        )
+        or 0
+    )
+    if target_warmup_epochs < 0:
+        raise ValueError(
+            "self_forced.generated_estimator_bank_target_warmup_epochs must be non-negative, "
+            f"got {target_warmup_epochs}."
+        )
+    return max(int(remaining_warmup_epochs), int(target_warmup_epochs))
+
+
 def is_self_forced_estimator_warmup_epoch(
     *,
     current_epoch: int,

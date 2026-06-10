@@ -232,6 +232,19 @@ class SMARTFlowDecoder(nn.Module):
             map_feature=map_feature,
         )
 
+    def prepare_training_rollout_cache_from_state(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        initial_state: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Prefix closed-loop rollout state를 현재 decoder weight로 다시 인코딩합니다."""
+        return self.agent_encoder.prepare_training_rollout_cache_from_state(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            initial_state=initial_state,
+        )
+
     def rollout_from_cache(
         self,
         rollout_cache: Dict[str, object],
@@ -246,6 +259,7 @@ class SMARTFlowDecoder(nn.Module):
         scenario_sampling_num_strata: int | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
+        return_final_cache: bool = False,
     ) -> Dict[str, Tensor]:
         return self.agent_encoder.rollout_from_cache(
             rollout_cache=rollout_cache,
@@ -260,6 +274,7 @@ class SMARTFlowDecoder(nn.Module):
             scenario_sampling_num_strata=scenario_sampling_num_strata,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
+            return_final_cache=return_final_cache,
         )
 
     def training_rollout_from_cache(
@@ -278,6 +293,7 @@ class SMARTFlowDecoder(nn.Module):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
+        return_final_cache: bool = False,
     ) -> Dict[str, Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -309,6 +325,7 @@ class SMARTFlowDecoder(nn.Module):
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
             use_stop_motion=False,
+            return_final_cache=return_final_cache,
         )
 
     def path_flow_velocity_for_anchor0(

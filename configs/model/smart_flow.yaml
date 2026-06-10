@@ -82,6 +82,12 @@ model_config:
     # Self-forcing 본체에서 사용할 rollout anchor 간격입니다.
     # 2이면 0,2,4,6,8,10,12,14번째 anchor를 쓰고, 1이면 16개 anchor를 모두 씁니다.
     rollout_anchor_stride: 2
+    # Closed-loop self-forcing curriculum.
+    # global_max_step은 초기 self-forcing stage 뒤 추가 closed-loop stage 개수입니다.
+    # local_max_step은 stage offset 폭이자 각 batch의 local pre-roll 샘플 상한입니다.
+    closed_loop_sf_global_max_step: 1
+    closed_loop_sf_local_max_step: 4
+    update_open_loop_teacher_when_roll: false
     # Clean-DMD direction filters. These apply identically to pose-projected
     # and direct control-space DMD paths.
     dmd_use_stable_scale_filter: true
