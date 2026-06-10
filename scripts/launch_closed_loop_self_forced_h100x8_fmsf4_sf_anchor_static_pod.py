@@ -39,9 +39,21 @@ DEFAULT_EXTRA_OVERRIDES = " ".join(
 def split_wrapper_args(argv: list[str]) -> tuple[list[str], str]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--extra-hydra-overrides", default="")
+    parser.add_argument("--closed-loop-see-all", action=argparse.BooleanOptionalAction, default=None)
     known, remaining = parser.parse_known_args(argv)
+    wrapper_overrides = []
+    if known.closed_loop_see_all is not None:
+        wrapper_overrides.append(
+            f"model.model_config.self_forced.closed_loop_see_all={str(known.closed_loop_see_all).lower()}"
+        )
     extra_overrides = " ".join(
-        part for part in (DEFAULT_EXTRA_OVERRIDES, known.extra_hydra_overrides) if part
+        part
+        for part in (
+            DEFAULT_EXTRA_OVERRIDES,
+            " ".join(wrapper_overrides),
+            known.extra_hydra_overrides,
+        )
+        if part
     )
     return remaining, extra_overrides
 

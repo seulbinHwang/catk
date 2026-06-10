@@ -2871,6 +2871,7 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
   --replace \
   --task-name flow_closed_loop_sf_h100x8_fmsf4_smoke \
   --session catk-closed-loop-sf-h100x8-fmsf4-smoke \
+  --closed-loop-see-all \
   --max-epochs 3 \
   --check-val-every-n-epoch 999 \
   --limit-train-batches 1 \
@@ -2886,21 +2887,22 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
 | experiment | `self_forced_npfm_h100_6` |
 | DDP shape | `trainer.num_nodes=1`, `trainer.devices=8`, 총 8 ranks |
 | rollout anchors | `rollout_anchor_stride=1`, 즉 scene당 16개 anchor lane 전체 |
-| closed-loop curriculum | `closed_loop_sf_global_max_step=2`, `closed_loop_sf_local_max_step=4` |
-| stage 시간 의미 | stage `s`에서 각 anchor lane은 자기 anchor 시점 기준 `(s - 1) * 4 + M`개 0.5초 block을 EMA로 pre-roll. `M`은 batch마다 `1..4`에서 rank 0이 샘플해 모든 rank가 공유 |
+| closed-loop curriculum | `closed_loop_sf_global_max_step=3`, `closed_loop_sf_local_max_step=4` |
+| see-all prefix 옵션 | 기본 `closed_loop_see_all=false`. `--closed-loop-see-all`을 주면 stage `s`에서 각 anchor lane별 prefix 길이를 `0..s*4` block 전체 구간에서 샘플 |
+| stage 시간 의미 | 기본 모드는 stage `s`에서 각 anchor lane이 자기 anchor 시점 기준 `(s - 1) * 4 + M`개 0.5초 block을 EMA로 pre-roll. `M`은 batch마다 `1..4`에서 rank 0이 샘플해 모든 rank가 공유 |
 | teacher update | `update_open_loop_teacher_when_roll=false`, frozen pretrained teacher 유지 |
 | stage boundary | stage 시작 시 EMA Generator를 online Generator로 복사하고 Generator optimizer state reset |
 | pretrain | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | local checkpoint path | `/workspace/flow_closed_loop_self_forced_h100x8_fmsf4_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | lr | Generator `5.0e-5`, generated estimator `5.0e-5` |
-| estimator warmup | 초기 `2` epoch. W&B exact hit이면 초기 warmup은 skip되지만 추가 closed-loop stage warmup은 요청값 `2` epoch 반복 |
+| estimator warmup | `0` epoch. W&B warmup bank 조회 없이 pretrained generator에서 초기화한 generated estimator로 바로 시작 |
 | DMD objective | `distribution_matching_objective=dmd`, active-control path |
 | DMD space / stable scale | `project_dmd_to_pose_space=false`, `dmd_use_stable_scale_filter=true`, `dmd_stable_scale_scope=agent` |
 | detach block transition | `false` |
 | self-forced sampling | Euler `sample_steps=16`, `backprop_last_k=8`, random terminal `policy=all` |
 | train subset | `train_epoch_sample_fraction=0.25`, sequential partition mode |
 | validation | `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
-| base max epochs | wrapper 기본 `8`; closed-loop schedule가 초기 generator epoch 수를 기준으로 추가 stage만큼 확장 |
+| base max epochs | wrapper 기본 `2`; closed-loop schedule가 초기 generator epoch 수를 기준으로 추가 stage만큼 확장 |
 | initial train batch | per-rank `6`, OOM fallback `6 -> 4 -> 2` |
 | val/test batch | per-rank `8` |
 | tmux session | `catk-closed-loop-sf-h100x8-fmsf4-sfanchor-stride1` |
@@ -4293,7 +4295,7 @@ K commit block 수 = flow_window_steps / 5
 - self-forced checkpoint resume 에서는 checkpoint에 저장된 `F_rho` / `F_psi` / Generator EMA state를 그대로 보존합니다. 즉, resume 직후 fit 시작 hook이 두 보조 모델이나 EMA를 현재 Generator weight로 다시 덮어쓰지 않습니다.
 - guidance 방향을 계산할 때는 `F_rho` 와 비교용 `F_psi` 를 항상 eval mode로 둡니다. 그래서 dropout/history drop 같은 train-mode 랜덤성이 기준 방향에 섞이지 않습니다. `F_psi` 는 detached generated path에 fit되는 online update 구간에서만 train mode로 전환됩니다.
 - committed self-rollout 을 만들 때는 현재 Generator를 eval mode로 잠깐 전환하되 autograd는 유지합니다. 따라서 dropout/history drop 없이 실제 inference 조건의 trajectory를 만들고, 그 trajectory를 통해 `sf_loss` gradient는 그대로 Generator로 흐릅니다.
-- Multi-anchor closed-loop self-forcing curriculum. `closed_loop_sf_global_max_step=A` 가 1 이상이면 초기 multi-anchor self-forcing stage 뒤에 closed-loop stage를 A개 추가합니다. 각 추가 stage는 요청된 `estimator_warmup_epochs` 만큼 generated-estimator warmup을 반복한 뒤, 초기 stage와 같은 수의 generator epoch을 학습합니다. `closed_loop_sf_local_max_step=N` 은 stage offset 폭이자 mini-batch별 local pre-roll 상한입니다. 각 valid rollout anchor lane은 자기 anchor 시점을 기준으로 stage `s`에서 `(s - 1) * N + M` 개 0.5초 block을 EMA Generator로 한 번에 no-grad pre-roll합니다. 여기서 `M`은 rank 0이 `[1, N]`에서 샘플해 모든 DDP rank가 공유합니다. 즉 stage 2는 각 anchor의 원래 시점에서 `N * 0.5초` 뒤 상태를 기준으로 다시 local pre-roll을 붙여 학습하며, 16개 anchor lane은 하나의 anchor-expanded batch로 병렬 처리됩니다. horizon이 부족해 prefix 끝 state가 invalid가 된 anchor lane은 self-forced loss에서 제외됩니다. stage 시작 시 EMA Generator weight를 online Generator로 복사하고 Generator optimizer state를 reset합니다. `update_open_loop_teacher_when_roll=false` 기본값에서는 `F_rho` teacher를 pretrained 기준점으로 고정합니다.
+- Multi-anchor closed-loop self-forcing curriculum. `closed_loop_sf_global_max_step=A` 가 1 이상이면 초기 multi-anchor self-forcing stage 뒤에 closed-loop stage를 A개 추가합니다. 각 추가 stage는 요청된 `estimator_warmup_epochs` 만큼 generated-estimator warmup을 반복한 뒤, 초기 stage와 같은 수의 generator epoch을 학습합니다. `closed_loop_sf_local_max_step=N` 은 0.5초 block 기준 stage 폭입니다. 기본 `closed_loop_see_all=false` 에서는 각 valid rollout anchor lane이 자기 anchor 시점을 기준으로 stage `s`에서 `(s - 1) * N + M` 개 block을 EMA Generator로 한 번에 no-grad pre-roll합니다. 여기서 `M`은 rank 0이 `[1, N]`에서 샘플해 모든 DDP rank가 공유합니다. `closed_loop_see_all=true` 에서는 stage `s`마다 각 anchor lane의 자기 anchor 시점 기준 `K∈[0, s*N]` 를 샘플하므로, stage 2는 0초부터 `2N*0.5초`까지 누적 구간 전체에서 시작 상태를 볼 수 있습니다. 두 모드 모두 16개 anchor lane은 하나의 anchor-expanded batch로 병렬 처리되고, prefix rollout도 불필요한 Python loop 없이 한 번의 EMA decoder rollout으로 수행됩니다. horizon이 부족해 prefix 끝 state가 invalid가 된 anchor lane은 self-forced loss에서 제외됩니다. stage 시작 시 EMA Generator weight를 online Generator로 복사하고 Generator optimizer state를 reset합니다. `update_open_loop_teacher_when_roll=false` 기본값에서는 `F_rho` teacher를 pretrained 기준점으로 고정합니다.
 - control-space Flow Matching에서는 committed pose rollout을 그대로 `F_psi` / `F_rho` 입력으로 쓰지 않습니다. 실제 실행된 pose trajectory를 첫 anchor 기준 rolling control sequence로 다시 투영한 뒤 generated estimator, teacher, DMD/SiD loss를 모두 3차원 control flow state 위에서 계산합니다. 따라서 rollout은 metric/실행용 pose로 굴러가되, self-forced 분포맞춤 objective는 control-space와 섞이지 않습니다.
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 DDP 전체 rank가 random terminal step `s` 를 하나 공유하고, 모든 rank의 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
 - stop-motion gate는 self-forced 학습 rollout과 validation / test / submission inference 모두에서 사용하지 않습니다. `decoder.use_stop_motion` 과 `self_forced.use_stop_motion` 은 호환용 config 키로만 남아 있고 실제 동작은 false로 고정됩니다.

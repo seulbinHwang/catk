@@ -27,6 +27,7 @@ def _make_closed_loop_model() -> SMARTFlow:
     model._self_forced_requested_estimator_warmup_epochs = 2
     model.closed_loop_sf_global_max_step = 2
     model.closed_loop_sf_local_max_step = 4
+    model.closed_loop_see_all = False
     model._closed_loop_sf_base_generator_epochs = 4
     model._closed_loop_sf_stage_warmup_epochs = 2
     model.self_forced_use_distribution_matching_loss = True
@@ -74,6 +75,46 @@ def test_closed_loop_stage_offsets_advance_by_local_max_step() -> None:
     for epoch, counts in expected.items():
         _set_current_epoch(model, epoch)
         assert model._sample_closed_loop_sf_prefix_step_counts(device=device) == counts
+
+
+def test_closed_loop_see_all_samples_from_zero_to_current_stage_window(monkeypatch) -> None:
+    model = _make_closed_loop_model()
+    model.closed_loop_see_all = True
+    model.closed_loop_sf_global_max_step = 3
+    device = torch.device("cpu")
+    requested_ranges: list[tuple[int, int]] = []
+
+    def fake_randint(*, low, high, size, device, dtype):
+        requested_ranges.append((low, high))
+        return torch.tensor([high - 1], device=device, dtype=dtype)
+
+    monkeypatch.setattr(torch, "randint", fake_randint)
+
+    expected = {
+        6: (0, 4, 4),
+        12: (0, 8, 8),
+        18: (0, 12, 12),
+    }
+    for epoch, counts in expected.items():
+        _set_current_epoch(model, epoch)
+        assert model._sample_closed_loop_sf_prefix_step_counts(device=device) == counts
+
+    assert requested_ranges == [(0, 5), (0, 9), (0, 13)]
+
+
+def test_closed_loop_see_all_allows_zero_second_prefix(monkeypatch) -> None:
+    model = _make_closed_loop_model()
+    model.closed_loop_see_all = True
+    device = torch.device("cpu")
+
+    def fake_randint(*, low, high, size, device, dtype):
+        assert low == 0
+        return torch.tensor([0], device=device, dtype=dtype)
+
+    monkeypatch.setattr(torch, "randint", fake_randint)
+    _set_current_epoch(model, 6)
+
+    assert model._sample_closed_loop_sf_prefix_step_counts(device=device) == (0, 0, 0)
 
 
 def test_closed_loop_self_forced_stage_warmup_repeats_after_bank_skipped_initial_warmup() -> None:
