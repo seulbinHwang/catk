@@ -54,7 +54,6 @@ from src.smart.modules.self_forced_estimator_warmup import (
     is_self_forced_estimator_warmup_epoch,
     resolve_self_forced_estimator_warmup_epochs,
     should_compute_anchor_flow_matching_loss,
-    should_run_self_forced_validation_after_epoch,
 )
 from src.smart.modules.self_forced_trainable_range import (
     apply_self_forced_unfrozen_range,
@@ -362,6 +361,31 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else 1
         )
+        self.closed_loop_sf_global_max_step = (
+            int(getattr(self.self_forced_config, "closed_loop_sf_global_max_step", 1))
+            if self.self_forced_config is not None
+            else 1
+        )
+        if self.closed_loop_sf_global_max_step < 0:
+            raise ValueError(
+                "self_forced.closed_loop_sf_global_max_step must be non-negative, "
+                f"got {self.closed_loop_sf_global_max_step}."
+            )
+        self.closed_loop_sf_local_max_step = (
+            int(getattr(self.self_forced_config, "closed_loop_sf_local_max_step", 4))
+            if self.self_forced_config is not None
+            else 4
+        )
+        if self.closed_loop_sf_local_max_step < 1:
+            raise ValueError(
+                "self_forced.closed_loop_sf_local_max_step must be positive, "
+                f"got {self.closed_loop_sf_local_max_step}."
+            )
+        self.update_open_loop_teacher_when_roll = (
+            bool(getattr(self.self_forced_config, "update_open_loop_teacher_when_roll", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.self_forced_generated_estimator_lr = (
             float(getattr(self.self_forced_config, "generated_estimator_lr", self.lr))
             if self.self_forced_config is not None
@@ -372,8 +396,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
-        self.self_forced_estimator_warmup_epochs = (
+        self._self_forced_requested_estimator_warmup_epochs = (
             resolve_self_forced_estimator_warmup_epochs(self.self_forced_config)
+        )
+        self.self_forced_estimator_warmup_epochs = (
+            self._self_forced_requested_estimator_warmup_epochs
         )
         self.self_forced_generated_estimator_init_path = (
             str(getattr(self.self_forced_config, "generated_estimator_init_path", "") or "")
@@ -453,6 +480,12 @@ class SMARTFlow(LightningModule):
         self._self_forced_backward_context: Dict[str, Tensor] | None = None
         self._self_forced_original_check_val_every_n_epoch: int | None = None
         self._self_forced_validation_schedule_captured = False
+        self._closed_loop_sf_base_generator_epochs: int | None = None
+        self._closed_loop_sf_stage_warmup_epochs: int = (
+            int(self._self_forced_requested_estimator_warmup_epochs)
+        )
+        self._closed_loop_sf_last_prepared_stage: int = 0
+        self._closed_loop_sf_schedule_configured = False
         self._automatic_open_loop_has_target_since_step = False
         self._automatic_open_loop_has_target_pending: list[tuple[Tensor, Any | None]] = []
         self._skip_next_automatic_optimizer_step = False
@@ -722,7 +755,11 @@ class SMARTFlow(LightningModule):
             return
         if not self.self_forced_use_distribution_matching_loss:
             return
-        if int(self.self_forced_estimator_warmup_epochs) <= 0:
+        has_closed_loop_stage_warmup = (
+            int(self.closed_loop_sf_global_max_step) > 0
+            and int(self._get_closed_loop_sf_stage_warmup_epochs()) > 0
+        )
+        if int(self.self_forced_estimator_warmup_epochs) <= 0 and not has_closed_loop_stage_warmup:
             return
 
         self._capture_self_forced_validation_interval()
@@ -738,12 +775,16 @@ class SMARTFlow(LightningModule):
             self.trainer.check_val_every_n_epoch = check_interval
             return
 
-        should_validate = should_run_self_forced_validation_after_epoch(
-            current_epoch=current_epoch,
-            self_forced_start_epoch=int(self.self_forced_start_epoch),
-            estimator_warmup_epochs=int(self.self_forced_estimator_warmup_epochs),
-            check_val_every_n_epoch=check_interval,
-        )
+        if self._is_self_forced_estimator_warmup_active():
+            should_validate = False
+        else:
+            generator_epoch_count = (
+                self._get_self_forced_completed_generator_epoch_count_for_current_epoch()
+            )
+            should_validate = (
+                int(generator_epoch_count) > 0
+                and int(generator_epoch_count) % check_interval == 0
+            )
         if should_validate:
             self.trainer.check_val_every_n_epoch = 1
         else:
@@ -913,6 +954,19 @@ class SMARTFlow(LightningModule):
         if self._distributed_available_and_initialized():
             torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
         return bool(flag.item())
+
+    def _sync_distributed_int_from_rank0(
+        self,
+        value: int,
+        *,
+        device: torch.device | None = None,
+    ) -> int:
+        """rank 0에서 정한 정수 값을 DDP 전체 rank에 broadcast합니다."""
+        sync_device = device if device is not None else self._first_parameter_device(self)
+        synced = torch.tensor([int(value)], device=sync_device, dtype=torch.long)
+        if self._distributed_available_and_initialized():
+            torch.distributed.broadcast(synced, src=0)
+        return int(synced.item())
 
     def _start_distributed_bool_any(
         self,
@@ -1963,11 +2017,13 @@ class SMARTFlow(LightningModule):
         """현재 epoch에서 generated estimator만 먼저 적응시킬지 판단합니다."""
         if not self.self_forced_use_distribution_matching_loss:
             return False
-        return is_self_forced_estimator_warmup_epoch(
+        if is_self_forced_estimator_warmup_epoch(
             current_epoch=int(self.current_epoch),
             self_forced_start_epoch=int(self.self_forced_start_epoch),
             estimator_warmup_epochs=int(self.self_forced_estimator_warmup_epochs),
-        )
+        ):
+            return True
+        return self._is_closed_loop_sf_stage_warmup_active()
 
     def _finish_self_forced_estimator_warmup_step(
         self,
@@ -2127,6 +2183,230 @@ class SMARTFlow(LightningModule):
             else:
                 ema_value.copy_(online_value.to(dtype=ema_value.dtype))
         self.self_forced_generator_ema.eval()
+
+    def _ensure_self_forced_generator_ema_ready(self) -> None:
+        """Closed-loop stage 전환 전에 EMA Generator를 사용할 수 있게 보장합니다."""
+        if self.self_forced_generator_ema is None:
+            raise RuntimeError("self_forced_generator_ema is not initialized.")
+        if self._is_self_forced_generator_ema_ready():
+            return
+        self._copy_online_generator_to_ema()
+        self.self_forced_generator_ema_ready.fill_(True)
+
+    def _copy_self_forced_ema_to_online_generator(self) -> None:
+        """다음 closed-loop stage를 evaluation policy인 EMA weight에서 시작합니다."""
+        if self.self_forced_generator_ema is None:
+            raise RuntimeError("self_forced_generator_ema is not initialized.")
+        self.encoder.load_state_dict(self.self_forced_generator_ema.state_dict())
+        self._apply_self_forced_unfrozen_range()
+
+    def _reset_self_forced_generator_optimizer_state(self) -> None:
+        """EMA 복사 뒤 stale AdamW momentum이 첫 업데이트를 왜곡하지 않도록 비웁니다."""
+        optimizers = self.optimizers()
+        generator_optimizer = optimizers[0] if isinstance(optimizers, (list, tuple)) else optimizers
+        raw_optimizer = getattr(generator_optimizer, "optimizer", generator_optimizer)
+        if hasattr(raw_optimizer, "state"):
+            raw_optimizer.state.clear()
+        if hasattr(generator_optimizer, "zero_grad"):
+            generator_optimizer.zero_grad(set_to_none=True)
+
+    def _copy_online_generator_to_self_forced_teacher(self) -> None:
+        """옵션이 켜진 경우 stage 시작 teacher도 EMA로 초기화된 online weight에 맞춥니다."""
+        if self.self_forced_target_teacher is None:
+            raise RuntimeError("self_forced_target_teacher is not initialized.")
+        self.self_forced_target_teacher.load_state_dict(self.encoder.state_dict())
+        self.self_forced_target_teacher.requires_grad_(False)
+        self.self_forced_target_teacher.eval()
+
+    def _get_self_forced_generator_epoch_index(self) -> int:
+        """Estimator warmup을 제외한 generator self-forced epoch 번호를 반환합니다."""
+        return (
+            int(self.current_epoch)
+            - int(self.self_forced_start_epoch)
+            - int(self.self_forced_estimator_warmup_epochs)
+        )
+
+    def _get_closed_loop_sf_stage_warmup_epochs(self) -> int:
+        """Closed-loop 추가 stage마다 반복할 generated-estimator warmup epoch 수입니다."""
+        return max(
+            0,
+            int(
+                getattr(
+                    self,
+                    "_closed_loop_sf_stage_warmup_epochs",
+                    getattr(
+                        self,
+                        "_self_forced_requested_estimator_warmup_epochs",
+                        self.self_forced_estimator_warmup_epochs,
+                    ),
+                )
+            ),
+        )
+
+    def _get_closed_loop_self_forced_stage_position(self) -> tuple[int, int]:
+        """현재 epoch이 속한 closed-loop stage와 stage 내부 위치를 계산합니다."""
+        if int(self.closed_loop_sf_global_max_step) <= 0:
+            return 0, -1
+        base_epochs = self._closed_loop_sf_base_generator_epochs
+        if base_epochs is None or int(base_epochs) <= 0:
+            return 0, -1
+
+        current_epoch = int(self.current_epoch)
+        initial_generator_start = (
+            int(self.self_forced_start_epoch)
+            + int(self.self_forced_estimator_warmup_epochs)
+        )
+        initial_generator_end = initial_generator_start + int(base_epochs)
+        if current_epoch < initial_generator_start:
+            return 0, current_epoch - initial_generator_start
+        if current_epoch < initial_generator_end:
+            return 0, current_epoch - initial_generator_start
+
+        stage_warmup_epochs = int(self._get_closed_loop_sf_stage_warmup_epochs())
+        stage_block_epochs = stage_warmup_epochs + int(base_epochs)
+        if stage_block_epochs <= 0:
+            return 0, -1
+        relative_epoch = current_epoch - initial_generator_end
+        stage = 1 + relative_epoch // stage_block_epochs
+        if stage > int(self.closed_loop_sf_global_max_step):
+            stage = int(self.closed_loop_sf_global_max_step)
+        stage_position = relative_epoch % stage_block_epochs
+        return int(stage), int(stage_position)
+
+    def _get_closed_loop_self_forced_stage(self) -> int:
+        """현재 generator epoch이 속한 closed-loop curriculum stage를 계산합니다."""
+        stage, _ = self._get_closed_loop_self_forced_stage_position()
+        return int(stage)
+
+    def _is_closed_loop_sf_stage_warmup_active(self) -> bool:
+        """Closed-loop 추가 stage의 generated-estimator warmup epoch인지 판단합니다."""
+        stage, stage_position = self._get_closed_loop_self_forced_stage_position()
+        stage_warmup_epochs = int(self._get_closed_loop_sf_stage_warmup_epochs())
+        return bool(
+            stage > 0
+            and stage_warmup_epochs > 0
+            and 0 <= int(stage_position) < stage_warmup_epochs
+        )
+
+    def _get_self_forced_completed_generator_epoch_count_for_current_epoch(self) -> int:
+        """현재 epoch 종료 시점까지 완료되는 generator epoch 수를 warmup 제외 기준으로 계산합니다."""
+        current_epoch = int(self.current_epoch)
+        start_epoch = int(self.self_forced_start_epoch)
+        if current_epoch < start_epoch:
+            return 0
+
+        initial_warmup_epochs = int(self.self_forced_estimator_warmup_epochs)
+        initial_generator_start = start_epoch + initial_warmup_epochs
+        if current_epoch < initial_generator_start:
+            return 0
+
+        base_epochs = self._closed_loop_sf_base_generator_epochs
+        if base_epochs is None or int(base_epochs) <= 0:
+            return current_epoch - initial_generator_start + 1
+
+        base_epochs = int(base_epochs)
+        initial_generator_end = initial_generator_start + base_epochs
+        if current_epoch < initial_generator_end:
+            return current_epoch - initial_generator_start + 1
+
+        stage_warmup_epochs = int(self._get_closed_loop_sf_stage_warmup_epochs())
+        stage_block_epochs = stage_warmup_epochs + base_epochs
+        if stage_block_epochs <= 0:
+            return base_epochs
+
+        relative_epoch = current_epoch - initial_generator_end
+        completed_stage_blocks = relative_epoch // stage_block_epochs
+        stage_position = relative_epoch % stage_block_epochs
+        generator_epoch_count = base_epochs + completed_stage_blocks * base_epochs
+        if stage_position >= stage_warmup_epochs:
+            generator_epoch_count += min(
+                stage_position - stage_warmup_epochs + 1,
+                base_epochs,
+            )
+        return int(generator_epoch_count)
+
+    def _configure_closed_loop_self_forced_schedule(self) -> None:
+        """기존 self-forced stage 길이를 closed-loop 추가 stage까지 확장합니다."""
+        if self._closed_loop_sf_schedule_configured:
+            return
+        self._closed_loop_sf_schedule_configured = True
+        if (
+            not self.self_forced_enabled
+            or not self.self_forced_use_distribution_matching_loss
+            or int(self.closed_loop_sf_global_max_step) <= 0
+        ):
+            return
+        trainer = getattr(self, "trainer", None)
+        if trainer is None:
+            return
+        configured_max_epochs = getattr(trainer, "max_epochs", None)
+        if configured_max_epochs is None:
+            fit_loop = getattr(trainer, "fit_loop", None)
+            configured_max_epochs = getattr(fit_loop, "max_epochs", None)
+        if configured_max_epochs is None or int(configured_max_epochs) < 0:
+            return
+
+        initial_warmup_epochs = int(self.self_forced_estimator_warmup_epochs)
+        stage_warmup_epochs = int(
+            getattr(
+                self,
+                "_self_forced_requested_estimator_warmup_epochs",
+                self.self_forced_estimator_warmup_epochs,
+            )
+        )
+        stage_warmup_epochs = max(0, stage_warmup_epochs)
+        self._closed_loop_sf_stage_warmup_epochs = int(stage_warmup_epochs)
+
+        generator_start_epoch = int(self.self_forced_start_epoch) + initial_warmup_epochs
+        base_generator_epochs = int(configured_max_epochs) - generator_start_epoch
+        if base_generator_epochs <= 0:
+            return
+        self._closed_loop_sf_base_generator_epochs = int(base_generator_epochs)
+        expanded_max_epochs = (
+            generator_start_epoch
+            + int(base_generator_epochs)
+            + int(self.closed_loop_sf_global_max_step)
+            * (int(stage_warmup_epochs) + int(base_generator_epochs))
+        )
+        if expanded_max_epochs <= int(configured_max_epochs):
+            return
+
+        fit_loop = getattr(trainer, "fit_loop", None)
+        if fit_loop is not None and hasattr(fit_loop, "max_epochs"):
+            fit_loop.max_epochs = int(expanded_max_epochs)
+        if hasattr(trainer, "max_epochs"):
+            try:
+                trainer.max_epochs = int(expanded_max_epochs)
+            except Exception:
+                pass
+        print(
+            "[self-forced-closed-loop] expanded trainer max_epochs "
+            f"{int(configured_max_epochs)} -> {int(expanded_max_epochs)}; "
+            f"base_generator_epochs={int(base_generator_epochs)} "
+            f"initial_warmup_epochs={int(initial_warmup_epochs)} "
+            f"stage_warmup_epochs={int(stage_warmup_epochs)} "
+            f"global_max_step={int(self.closed_loop_sf_global_max_step)}"
+        )
+
+    def _prepare_closed_loop_self_forced_stage_for_epoch(self) -> None:
+        """새 closed-loop stage 첫 epoch에서 EMA→online 복사와 optimizer reset을 수행합니다."""
+        if not self._is_self_forced_active():
+            return
+        stage = self._get_closed_loop_self_forced_stage()
+        if stage <= 0 or stage == int(self._closed_loop_sf_last_prepared_stage):
+            return
+
+        self._ensure_self_forced_generator_ema_ready()
+        self._copy_self_forced_ema_to_online_generator()
+        self._reset_self_forced_generator_optimizer_state()
+        if bool(self.update_open_loop_teacher_when_roll):
+            self._copy_online_generator_to_self_forced_teacher()
+        self._closed_loop_sf_last_prepared_stage = int(stage)
+        print(
+            "[self-forced-closed-loop] started stage "
+            f"{int(stage)} with online<-EMA and generator optimizer reset; "
+            f"update_teacher={bool(self.update_open_loop_teacher_when_roll)}"
+        )
 
     @staticmethod
     def _switch_module_to_eval_preserving_modes(module: nn.Module) -> Dict[nn.Module, bool]:
@@ -2637,6 +2917,144 @@ class SMARTFlow(LightningModule):
             )
         return max(1, int(self.flow_window_steps // 5))
 
+    def _sample_closed_loop_sf_prefix_steps(self, device: torch.device) -> int:
+        """현재 closed-loop stage에서 사용할 EMA pre-roll 길이 M을 샘플합니다."""
+        if self._get_closed_loop_self_forced_stage() <= 0:
+            return 0
+        max_prefix_steps = int(self.closed_loop_sf_local_max_step)
+        if max_prefix_steps <= 0:
+            return 0
+        if self._distributed_available_and_initialized() and torch.distributed.get_rank() != 0:
+            sampled = 1
+        else:
+            sampled = int(
+                torch.randint(
+                    low=1,
+                    high=max_prefix_steps + 1,
+                    size=(1,),
+                    device=device,
+                    dtype=torch.long,
+                ).item()
+            )
+        return self._sync_distributed_int_from_rank0(sampled, device=device)
+
+    def _get_closed_loop_sf_stage_offset_steps(self) -> int:
+        """Return the accumulated 0.5s block offset for the current closed-loop stage."""
+        stage = int(self._get_closed_loop_self_forced_stage())
+        if stage <= 0:
+            return 0
+        local_max_step = int(self.closed_loop_sf_local_max_step)
+        if local_max_step <= 0:
+            return 0
+        return int((stage - 1) * local_max_step)
+
+    def _sample_closed_loop_sf_prefix_step_counts(self, device: torch.device) -> tuple[int, int, int]:
+        """Return stage offset, sampled local M, and total EMA pre-roll steps."""
+        local_steps = int(self._sample_closed_loop_sf_prefix_steps(device=device))
+        if local_steps <= 0:
+            return 0, 0, 0
+        offset_steps = int(self._get_closed_loop_sf_stage_offset_steps())
+        return offset_steps, local_steps, int(offset_steps + local_steps)
+
+    def _build_shifted_self_forced_tokenized_agent(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        rollout_state: Dict[str, object],
+    ) -> Dict[str, Tensor]:
+        """Prefix rollout의 마지막 coarse state를 self-forced anchor context로 반영합니다."""
+        pos_window = rollout_state["pos_window"]
+        head_window = rollout_state["head_window"]
+        valid_window = rollout_state["valid_window"]
+        pred_idx_window = rollout_state["pred_idx_window"]
+        if not (
+            torch.is_tensor(pos_window)
+            and torch.is_tensor(head_window)
+            and torch.is_tensor(valid_window)
+            and torch.is_tensor(pred_idx_window)
+        ):
+            raise TypeError("closed-loop prefix rollout state must contain tensor windows.")
+        if pos_window.shape[1] < 2:
+            raise ValueError("closed-loop prefix rollout state needs at least two coarse states.")
+
+        shifted = dict(tokenized_agent)
+        current_pos = pos_window[:, -1].detach()
+        previous_pos = pos_window[:, -2].detach()
+        current_head = head_window[:, -1].detach()
+        previous_head = head_window[:, -2].detach()
+        current_valid = valid_window[:, -1].detach()
+        previous_valid = valid_window[:, -2].detach()
+        current_idx = pred_idx_window[:, -1].detach()
+        previous_idx = pred_idx_window[:, -2].detach()
+
+        ctx_pos = tokenized_agent["ctx_sampled_pos"].clone()
+        ctx_heading = tokenized_agent["ctx_sampled_heading"].clone()
+        ctx_idx = tokenized_agent["ctx_sampled_idx"].clone()
+        ctx_valid = tokenized_agent["ctx_valid"].clone()
+        if ctx_pos.shape[1] < 2:
+            raise ValueError("closed-loop shifted self-forcing requires at least two context slots.")
+        ctx_pos[:, 0] = previous_pos.to(dtype=ctx_pos.dtype, device=ctx_pos.device)
+        ctx_pos[:, 1] = current_pos.to(dtype=ctx_pos.dtype, device=ctx_pos.device)
+        ctx_heading[:, 0] = previous_head.to(dtype=ctx_heading.dtype, device=ctx_heading.device)
+        ctx_heading[:, 1] = current_head.to(dtype=ctx_heading.dtype, device=ctx_heading.device)
+        ctx_idx[:, 0] = previous_idx.to(dtype=ctx_idx.dtype, device=ctx_idx.device)
+        ctx_idx[:, 1] = current_idx.to(dtype=ctx_idx.dtype, device=ctx_idx.device)
+        ctx_valid[:, 0] = previous_valid.to(dtype=ctx_valid.dtype, device=ctx_valid.device)
+        ctx_valid[:, 1] = current_valid.to(dtype=ctx_valid.dtype, device=ctx_valid.device)
+        if ctx_valid.shape[1] > 2:
+            ctx_pos[:, 2:] = ctx_pos[:, 1:2]
+            ctx_heading[:, 2:] = ctx_heading[:, 1:2]
+            ctx_idx[:, 2:] = ctx_idx[:, 1:2]
+            ctx_valid[:, 2:] = False
+
+        shifted["ctx_sampled_pos"] = ctx_pos
+        shifted["ctx_sampled_heading"] = ctx_heading
+        shifted["ctx_sampled_idx"] = ctx_idx
+        shifted["ctx_valid"] = ctx_valid
+
+        if "flow_eval_mask" in tokenized_agent:
+            flow_eval_mask = tokenized_agent["flow_eval_mask"].clone()
+        else:
+            flow_eval_mask = current_valid.new_zeros((current_valid.shape[0], 1))
+        flow_eval_mask[...] = False
+        flow_eval_mask[:, 0] = current_valid.to(dtype=flow_eval_mask.dtype, device=flow_eval_mask.device)
+        shifted["flow_eval_mask"] = flow_eval_mask
+        return shifted
+
+    def _run_closed_loop_sf_prefix_rollout(
+        self,
+        tokenized_map: Dict[str, Tensor],
+        tokenized_agent: Dict[str, Tensor],
+        prefix_steps_2hz: int,
+    ) -> Dict[str, object]:
+        """Run the accumulated EMA pre-roll once and return the final cache state."""
+        if prefix_steps_2hz <= 0:
+            raise ValueError("prefix_steps_2hz must be positive.")
+        self._ensure_self_forced_generator_ema_ready()
+        assert self.self_forced_generator_ema is not None
+        ema_modes = self._switch_module_to_eval_preserving_modes(self.self_forced_generator_ema)
+        try:
+            with torch.no_grad():
+                map_feature = self.self_forced_generator_ema.encode_map(tokenized_map)
+                rollout_cache = self.self_forced_generator_ema.prepare_training_rollout_cache(
+                    tokenized_agent,
+                    map_feature,
+                )
+                prefix_rollout = self.self_forced_generator_ema.rollout_from_cache(
+                    rollout_cache=rollout_cache,
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    sampling_scheme=self.self_forced_sampling,
+                    rollout_steps_2hz=prefix_steps_2hz,
+                    return_final_cache=True,
+                )
+        finally:
+            self._restore_module_training_modes(ema_modes)
+
+        final_cache = prefix_rollout.get("final_rollout_cache")
+        if not isinstance(final_cache, dict):
+            raise RuntimeError("closed-loop prefix rollout did not return final_rollout_cache.")
+        return final_cache
+
     def _sample_flow_state_from_clean(self, clean_path_norm: Tensor):
         """현재 Generator의 flow path 규칙으로 전체 tau 구간의 noisy path를 만듭니다.
 
@@ -2729,12 +3147,16 @@ class SMARTFlow(LightningModule):
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
+        initial_rollout_state: Dict[str, object] | None = None,
     ) -> Dict[str, Tensor]:
         """실제 inference와 같은 규칙으로 N초 committed self-rollout을 만듭니다.
 
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
+            initial_rollout_state: EMA prefix rollout이 만든 coarse state입니다. 값이 있으면
+                현재 online Generator weight로 이 state를 다시 인코딩한 뒤 gradient rollout을
+                시작합니다.
 
         Returns:
             Dict[str, Tensor]: closed-loop rollout 결과입니다. ``pred_traj_10hz`` 와
@@ -2744,7 +3166,14 @@ class SMARTFlow(LightningModule):
         encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
         try:
             map_feature = self.encoder.encode_map(tokenized_map)
-            rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
+            if initial_rollout_state is None:
+                rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
+            else:
+                rollout_cache = self.encoder.prepare_training_rollout_cache_from_state(
+                    tokenized_agent=tokenized_agent,
+                    map_feature=map_feature,
+                    initial_state=initial_rollout_state,
+                )
             return self.encoder.training_rollout_from_cache(
                 rollout_cache=rollout_cache,
                 tokenized_agent=tokenized_agent,
@@ -3403,6 +3832,7 @@ class SMARTFlow(LightningModule):
         self._sync_self_forced_auxiliary_models()
         self._load_self_forced_generated_estimator_bank()
         self._prepare_self_forced_generator_ema()
+        self._configure_closed_loop_self_forced_schedule()
 
     def on_validation_start(self) -> None:
         """validation 시작 직전에 scorer batch 수 자동 조정을 다시 시도합니다."""
@@ -3633,11 +4063,74 @@ class SMARTFlow(LightningModule):
             )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
+        (
+            prefix_offset_steps_2hz,
+            prefix_local_steps_2hz,
+            prefix_steps_2hz,
+        ) = self._sample_closed_loop_sf_prefix_step_counts(
+            device=tokenized_agent_eval["batch"].device,
+        )
+        initial_rollout_state = None
+        if prefix_steps_2hz > 0:
+            initial_rollout_state = self._run_closed_loop_sf_prefix_rollout(
+                tokenized_map=tokenized_map_eval,
+                tokenized_agent=tokenized_agent_eval,
+                prefix_steps_2hz=prefix_steps_2hz,
+            )
+            tokenized_agent_eval = self._build_shifted_self_forced_tokenized_agent(
+                tokenized_agent=tokenized_agent_eval,
+                rollout_state=initial_rollout_state,
+            )
         if is_estimator_warmup_active:
             with torch.no_grad():
-                rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+                rollout = self._run_self_forced_rollout(
+                    tokenized_map_eval,
+                    tokenized_agent_eval,
+                    initial_rollout_state=initial_rollout_state,
+                )
         else:
-            rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+            rollout = self._run_self_forced_rollout(
+                tokenized_map_eval,
+                tokenized_agent_eval,
+                initial_rollout_state=initial_rollout_state,
+            )
+        if int(self.closed_loop_sf_global_max_step) > 0:
+            total_log_value = torch.tensor(
+                float(prefix_steps_2hz),
+                device=tokenized_agent_eval["batch"].device,
+            )
+            self.log(
+                "train/closed_loop_sf_prefix_steps",
+                total_log_value,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            offset_log_value = torch.tensor(
+                float(prefix_offset_steps_2hz),
+                device=tokenized_agent_eval["batch"].device,
+            )
+            self.log(
+                "train/closed_loop_sf_stage_offset_steps",
+                offset_log_value,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
+            local_log_value = torch.tensor(
+                float(prefix_local_steps_2hz),
+                device=tokenized_agent_eval["batch"].device,
+            )
+            self.log(
+                "train/closed_loop_sf_local_prefix_steps",
+                local_log_value,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+                batch_size=1,
+            )
         committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
             rollout=rollout,
             tokenized_agent=tokenized_agent_eval,
@@ -4127,6 +4620,7 @@ open_metric_dict:
         self._reset_open_loop_train_epoch_metrics()
         self._automatic_open_loop_has_target_pending.clear()
         self._apply_self_forced_validation_schedule_for_current_epoch()
+        self._prepare_closed_loop_self_forced_stage_for_epoch()
 
     def on_train_epoch_end(self) -> None:
         """self-forced manual optimization에서 scheduler가 있으면 epoch마다 한 번 진행합니다.

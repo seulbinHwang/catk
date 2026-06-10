@@ -97,6 +97,9 @@ model_config:
     generated_estimator_lr: ${model.model_config.lr}
     estimator_updates_per_step: 5
     estimator_warmup_epochs: 0
+    closed_loop_sf_global_max_step: 1
+    closed_loop_sf_local_max_step: 4
+    update_open_loop_teacher_when_roll: false
     # Optional generated-estimator warmup bank.
     # When generated_estimator_init_path points to a bank entry, only the
     # generated estimator is loaded from that file. Generator, teacher,

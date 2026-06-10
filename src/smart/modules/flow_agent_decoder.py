@@ -1056,6 +1056,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self,
         tokenized_agent: Dict[str, torch.Tensor],
         map_feature: Dict[str, torch.Tensor],
+        initial_state: Dict[str, object] | None = None,
     ) -> Dict[str, object]:
         """여러 rollout이 공통으로 쓰는 초기 문맥을 한 번만 만듭니다.
 
@@ -1076,14 +1077,35 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         step_current_2hz = step_current_10hz // self.shift
         max_context_steps = 14
 
-        pos_window = tokenized_agent["gt_pos"][:, :step_current_2hz].clone()
-        head_window = tokenized_agent["gt_heading"][:, :step_current_2hz].clone()
+        if initial_state is None:
+            pos_window = tokenized_agent["gt_pos"][:, :step_current_2hz].clone()
+            head_window = tokenized_agent["gt_heading"][:, :step_current_2hz].clone()
+            valid_window = tokenized_agent["valid_mask"][:, :step_current_2hz].clone()
+            pred_idx_window = tokenized_agent["gt_idx"][:, :step_current_2hz].clone()
+            exec_pos_history_10hz, exec_head_history_10hz, exec_valid_history_10hz = (
+                self._build_initial_exec_state_history(tokenized_agent=tokenized_agent)
+            )
+        else:
+            pos_window = initial_state["pos_window"].detach().clone()
+            head_window = initial_state["head_window"].detach().clone()
+            valid_window = initial_state["valid_window"].detach().clone()
+            pred_idx_window = initial_state["pred_idx_window"].detach().clone()
+            exec_pos_history_10hz = initial_state["exec_pos_history_10hz"].detach().clone()
+            exec_head_history_10hz = initial_state["exec_head_history_10hz"].detach().clone()
+            exec_valid_history_10hz = initial_state["exec_valid_history_10hz"].detach().clone()
+            if pos_window.shape[0] != n_agent:
+                raise ValueError(
+                    "initial_state agent dimension must match tokenized_agent: "
+                    f"got {pos_window.shape[0]} and {n_agent}."
+                )
+            if pos_window.shape[1] < 2:
+                raise ValueError("initial_state must contain at least two coarse context steps.")
+            if pos_window.shape[1] > max_context_steps:
+                pos_window = pos_window[:, -max_context_steps:]
+                head_window = head_window[:, -max_context_steps:]
+                valid_window = valid_window[:, -max_context_steps:]
+                pred_idx_window = pred_idx_window[:, -max_context_steps:]
         head_vector_window = torch.stack([head_window.cos(), head_window.sin()], dim=-1)
-        valid_window = tokenized_agent["valid_mask"][:, :step_current_2hz].clone()
-        pred_idx_window = tokenized_agent["gt_idx"][:, :step_current_2hz].clone()
-        exec_pos_history_10hz, exec_head_history_10hz, exec_valid_history_10hz = (
-            self._build_initial_exec_state_history(tokenized_agent=tokenized_agent)
-        )
         exec_pos_pair_10hz = exec_pos_history_10hz[:, -2:].clone()
         exec_head_pair_10hz = exec_head_history_10hz[:, -2:].clone()
         exec_valid_pair_10hz = exec_valid_history_10hz[:, -2:].clone()
@@ -1227,6 +1249,19 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         return self._prepare_rollout_cache_impl(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+        )
+
+    def prepare_training_rollout_cache_from_state(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        initial_state: Dict[str, object],
+    ) -> Dict[str, object]:
+        """Prefix rollout이 만든 coarse state를 현재 decoder weight로 다시 인코딩합니다."""
+        return self._prepare_rollout_cache_impl(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            initial_state=initial_state,
         )
 
     def _clone_rollout_cache(self, rollout_cache: Dict[str, object]) -> Dict[str, object]:
@@ -1478,6 +1513,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
+        return_final_cache: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """공통 캐시를 복사해 한 번의 closed-loop rollout만 수행합니다.
 
@@ -2020,6 +2056,24 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         if terminal_steps_by_scenario is not None:
             out_dict["sf_terminal_step_by_scenario"] = terminal_steps_by_scenario
             out_dict["sf_terminal_s_by_scenario"] = terminal_s_by_scenario
+        if return_final_cache:
+            final_cache = dict(state)
+            final_cache.update(
+                {
+                    "pos_window": pos_window.detach(),
+                    "head_window": head_window.detach(),
+                    "head_vector_window": head_vector_window.detach(),
+                    "valid_window": valid_window.detach(),
+                    "pred_idx_window": pred_idx_window.detach(),
+                    "exec_pos_history_10hz": exec_pos_history_10hz.detach(),
+                    "exec_head_history_10hz": exec_head_history_10hz.detach(),
+                    "exec_valid_history_10hz": exec_valid_history_10hz.detach(),
+                    "exec_pos_pair_10hz": exec_pos_pair_10hz.detach(),
+                    "exec_head_pair_10hz": exec_head_pair_10hz.detach(),
+                    "exec_valid_pair_10hz": exec_valid_pair_10hz.detach(),
+                }
+            )
+            out_dict["final_rollout_cache"] = final_cache
         return out_dict
 
     @torch.no_grad()
@@ -2037,6 +2091,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         scenario_sampling_num_strata: int | None = None,
         return_flow_2s_preview: bool = False,
         rollout_steps_2hz: int | None = None,
+        return_final_cache: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """평가와 제출에서 no-gradient closed-loop rollout을 실행합니다.
 
@@ -2071,6 +2126,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             scenario_sampling_num_strata=scenario_sampling_num_strata,
             return_flow_2s_preview=return_flow_2s_preview,
             rollout_steps_2hz=rollout_steps_2hz,
+            return_final_cache=return_final_cache,
         )
 
     def training_rollout_from_cache(
@@ -2089,6 +2145,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         self_forced_epoch: int | None = None,
         detach_block_transition: bool = False,
         use_stop_motion: bool | None = None,
+        return_final_cache: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """self-forced 학습에서 gradient를 유지한 closed-loop rollout을 실행합니다.
 
@@ -2130,6 +2187,7 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             self_forced_epoch=self_forced_epoch,
             detach_block_transition=detach_block_transition,
             use_stop_motion=use_stop_motion,
+            return_final_cache=return_final_cache,
         )
 
     def path_flow_velocity_for_anchor0(

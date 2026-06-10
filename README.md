@@ -3973,6 +3973,8 @@ K commit block 수 = flow_window_steps / 5
 - self-forced checkpoint resume 에서는 checkpoint에 저장된 `F_rho` / `F_psi` / Generator EMA state를 그대로 보존합니다. 즉, resume 직후 fit 시작 hook이 두 보조 모델이나 EMA를 현재 Generator weight로 다시 덮어쓰지 않습니다.
 - guidance 방향을 계산할 때는 `F_rho` 와 비교용 `F_psi` 를 항상 eval mode로 둡니다. 그래서 dropout/history drop 같은 train-mode 랜덤성이 기준 방향에 섞이지 않습니다. `F_psi` 는 detached generated path에 fit되는 online update 구간에서만 train mode로 전환됩니다.
 - committed self-rollout 을 만들 때는 현재 Generator를 eval mode로 잠깐 전환하되 autograd는 유지합니다. 따라서 dropout/history drop 없이 실제 inference 조건의 trajectory를 만들고, 그 trajectory를 통해 `sf_loss` gradient는 그대로 Generator로 흐릅니다.
+- Closed-loop self-forcing curriculum. `closed_loop_sf_global_max_step=A` 가 1 이상이면 기존 t=0 self-forced generator epoch을 끝낸 뒤 추가 closed-loop stage를 A번 더 수행합니다. 각 추가 stage는 요청된 `estimator_warmup_epochs` 만큼의 generated-estimator warmup을 먼저 반복한 뒤, t=0에서 수행한 generator epoch 수만큼 online Generator를 학습합니다. W&B bank hit로 초기 t=0 warmup이 skip되어도 추가 stage warmup은 요청값을 유지합니다. 각 추가 stage 시작 시 validation/test에 쓰는 EMA Generator weight를 online Generator로 복사하고, stale AdamW momentum이 남지 않도록 Generator optimizer state를 reset합니다. `closed_loop_sf_local_max_step=N` 은 각 stage가 담당하는 0.5초 commit block 폭이자, 각 mini-batch에서 해당 stage 시작점 이후 추가로 EMA Generator를 굴릴 local pre-roll 길이 M의 상한입니다. M은 DDP rank 0이 `[1, N]`에서 하나 샘플해 모든 rank가 공유합니다. stage 1은 t=0에서 시작해 총 M step을 pre-roll하고, stage 2는 t=`N*0.5`초에서 시작하도록 총 `N+M` step을 한 번에 no-grad EMA pre-roll하며, stage 3은 t=`2N*0.5`초에서 시작하도록 총 `2N+M` step을 한 번에 pre-roll합니다. 즉 stage s의 실제 EMA pre-roll 길이는 `(s - 1) * N + M`이고, 불필요한 Python loop 없이 decoder rollout을 한 번 호출합니다. 이 pre-roll은 `torch.no_grad()` EMA로만 수행하고, 그 이후 generated-estimator warmup 또는 self-forcing loss에 쓰는 rollout은 online Generator로 다시 인코딩해 수행합니다. Warmup epoch에서는 online rollout도 `torch.no_grad()`로 만들어 `F_psi`만 적응시키고, generator 학습 epoch에서는 실제 self-forcing loss gradient가 online Generator로 흐릅니다.
+- `update_open_loop_teacher_when_roll=false` 가 기본값입니다. 기본값에서는 `F_rho` teacher를 pretrained 기준점으로 고정해 자기확증 루프를 피합니다. true로 override하면 closed-loop stage 시작 시 EMA에서 복사된 online Generator weight를 `F_rho` teacher에도 복사합니다.
 - control-space Flow Matching에서는 committed pose rollout을 그대로 `F_psi` / `F_rho` 입력으로 쓰지 않습니다. 실제 실행된 pose trajectory를 첫 anchor 기준 rolling control sequence로 다시 투영한 뒤 generated estimator, teacher, DMD/SiD loss를 모두 3차원 control flow state 위에서 계산합니다. 따라서 rollout은 metric/실행용 pose로 굴러가되, self-forced 분포맞춤 objective는 control-space와 섞이지 않습니다.
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 DDP 전체 rank가 random terminal step `s` 를 하나 공유하고, 모든 rank의 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
 - stop-motion gate는 self-forced 학습 rollout과 validation / test / submission inference 모두에서 사용하지 않습니다. `decoder.use_stop_motion` 과 `self_forced.use_stop_motion` 은 호환용 config 키로만 남아 있고 실제 동작은 false로 고정됩니다.
@@ -4019,6 +4021,9 @@ model:
       use_anchor_flow_matching_loss: false
       use_distribution_matching_loss: true
       use_stop_motion: false
+      closed_loop_sf_global_max_step: 1
+      closed_loop_sf_local_max_step: 4
+      update_open_loop_teacher_when_roll: false
       sampling:
         sample_steps: 16
         sample_method: euler
@@ -4034,6 +4039,20 @@ model:
 data:
   train_epoch_sample_fraction: 0.25
   train_epoch_sample_fraction_shuffle_flag: false
+```
+
+fm-sf-3 H100 8GPU static pod에서는 아래 launcher를 사용합니다. 기본 namespace는 `p-sp-labs-reai-training`이고, `--nproc-per-node 8` / `trainer.devices=8` / `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` 로 실행됩니다.
+
+```bash
+python scripts/launch_closed_loop_self_forced_h100x8_fmsf3_static_pod.py \
+  --project-root /tmp/catk_self_forcing_closed_loop_fmsf3 \
+  --task-name flow_closed_loop_self_forced_h100x8_fmsf3 \
+  --closed-loop-sf-global-max-step 3 \
+  --closed-loop-sf-local-max-step 4 \
+  --estimator-warmup-epochs 2 \
+  --max-epochs 6 \
+  --initial-bs 12 --oom-step 2 --min-bs 2 \
+  --replace
 ```
 
 기존 epoch별 random subset 모드로 되돌리려면 아래처럼 override합니다.
