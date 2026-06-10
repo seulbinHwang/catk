@@ -88,7 +88,7 @@ def main() -> int:
         "--task-name",
         (
             "flow_closed_loop_self_forced_dmd_h100x8_fmsf4_sfanchor_stride1_epoch061_x5f9g0ce_"
-            "activecontrol_sample16_backprop8_lr5e-5_bs5to2_frac025_ep2_warm0_global4_local4"
+            "activecontrol_sample16_backprop8_lr7e-5_bs5to2_frac025_ep2_warm0_global4_local4"
         ),
         "--session",
         "catk-closed-loop-sf-h100x8-fmsf4-sfanchor-stride1",
@@ -105,17 +105,17 @@ def main() -> int:
         "--precision",
         "bf16-mixed",
         "--learning-rate",
-        "5.0e-5",
+        "7.0e-5",
         "--generated-estimator-learning-rate",
-        "5.0e-5",
+        "7.0e-5",
         "--scorer-scene-num",
         "1680",
         "--estimator-warmup-epochs",
         "0",
         "--estimator-warmup-bank-artifact",
-        "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr5e-5:latest",
+        "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr7e-5:latest",
         "--estimator-warmup-bank-artifact-name",
-        "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr5e-5",
+        "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr7e-5",
         "--self-forced-use-stop-motion",
         "false",
         "--decoder-use-stop-motion",

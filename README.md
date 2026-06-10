@@ -2894,7 +2894,7 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
 | stage boundary | stage 시작 시 EMA Generator를 online Generator로 복사하고 Generator optimizer state reset |
 | pretrain | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | local checkpoint path | `/workspace/flow_closed_loop_self_forced_h100x8_fmsf4_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
-| lr | Generator `5.0e-5`, generated estimator `5.0e-5` |
+| lr | Generator `7.0e-5`, generated estimator `7.0e-5` |
 | estimator warmup | `0` epoch. W&B warmup bank 조회 없이 pretrained generator에서 초기화한 generated estimator로 바로 시작 |
 | DMD objective | `distribution_matching_objective=dmd`, active-control path |
 | DMD space / stable scale | `project_dmd_to_pose_space=false`, `dmd_use_stable_scale_filter=true`, `dmd_stable_scale_scope=agent` |
