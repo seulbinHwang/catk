@@ -2760,7 +2760,7 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf1_sf_anchor_static_pod.py --rep
 ```bash
 python scripts/launch_self_forced_dmd_h100x8_fmsf1_sf_anchor_static_pod.py \
   --replace \
-  --task-name flow_self_forced_dmd_h100x8_fmsf1_smoke_bs6 \
+  --task-name flow_self_forced_dmd_h100x8_fmsf1_smoke_bs5 \
   --session catk-self-forced-dmd-h100x8-fmsf1-smoke \
   --max-epochs 1 \
   --check-val-every-n-epoch 1 \
@@ -2776,7 +2776,7 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf1_sf_anchor_static_pod.py \
 | namespace | `p-sp-labs-reai-training` |
 | branch | `semi_control_sf_anchor` |
 | experiment | `self_forced_npfm_h100_6` |
-| default task | `flow_self_forced_dmd_h100x8_fmsf1_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs6_frac025_ep6_warm2_middle_val1_agent_oomretry` |
+| default task | `flow_self_forced_dmd_h100x8_fmsf1_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs5to2_frac025_ep6_warm2_middle_val1_agent_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x8_fmsf1_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=1`, 즉 16개 anchor 전체 |
@@ -2793,8 +2793,8 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf1_sf_anchor_static_pod.py \
 | train data fraction | `data.train_epoch_sample_fraction=0.25`, `data.train_epoch_sample_fraction_shuffle_flag=false` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | epochs | `MAX_EPOCHS=8`; warmup bank에서 2 epoch exact hit 시 실제 `trainer.max_epochs=6`, miss 시 warmup 2 + generator/DMD 6 |
-| initial train batch | per-rank `6`, effective global scene batch `48` |
-| OOM fallback | 기본 하한도 `6`이라 추가 하강 없이 중단. 더 낮춰 재시도하려면 `--min-bs`를 낮춰 override |
+| initial train batch | per-rank `5`, effective global scene batch `40` |
+| OOM fallback | 기본 `5 -> 4 -> 3 -> 2`, `--oom-step=1`, `--min-bs=2` |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-h100x8-fmsf1-sfanchor-stride1-lr5e5` |
@@ -2824,7 +2824,7 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf2_sf_anchor_warm0_static_pod.py
 | namespace | `p-sp-labs-reai-training` |
 | branch | `semi_control_sf_anchor` |
 | experiment | `self_forced_npfm_h100_6` |
-| default task | `flow_self_forced_dmd_h100x8_fmsf2_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs6_frac025_ep6_warm0_middle_val1_agent_oomretry` |
+| default task | `flow_self_forced_dmd_h100x8_fmsf2_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs5to2_frac025_ep6_warm0_middle_val1_agent_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x8_fmsf2_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=1`, 즉 16개 anchor 전체 |
@@ -2841,8 +2841,8 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf2_sf_anchor_warm0_static_pod.py
 | train data fraction | `data.train_epoch_sample_fraction=0.25`, `data.train_epoch_sample_fraction_shuffle_flag=false` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | epochs | 실제 `trainer.max_epochs=6` |
-| initial train batch | per-rank `6`, effective global scene batch `48` |
-| OOM fallback | 기본 하한도 `6`이라 추가 하강 없이 중단. 더 낮춰 재시도하려면 `--min-bs`를 낮춰 override |
+| initial train batch | per-rank `5`, effective global scene batch `40` |
+| OOM fallback | 기본 `5 -> 4 -> 3 -> 2`, `--oom-step=1`, `--min-bs=2` |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-h100x8-fmsf2-sfanchor-stride1-warm0-lr5e5` |
