@@ -116,7 +116,7 @@ data:
   train_batch_size: 26
   val_batch_size: 16
   test_batch_size: 16
-  num_workers: 4
+  num_workers: 8
   prefetch_factor: 1
   train_use_eval_agent_selection: true
   train_epoch_sample_fraction: 0.5

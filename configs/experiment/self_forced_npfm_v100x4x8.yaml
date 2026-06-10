@@ -46,5 +46,5 @@ data:
   train_batch_size: 2
   val_batch_size: 2
   test_batch_size: 2
-  num_workers: 4
+  num_workers: 8
   prefetch_factor: 1
