@@ -1,5 +1,7 @@
 **/__pycache__/
 **/*.pyc
 **/logs
+artifacts/*.log
+artifacts/*.out
 secrets/waymo/waymo_storage_state.json
 secrets/waymo/playwright_profile/

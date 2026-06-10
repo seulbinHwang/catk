@@ -1,7 +1,0 @@
-[watcher 20:38:21] watching run A task=ocsc_main_action_b4_0605_203750 (floor stop → relaunch with stride=-1)
-[watcher 02:17:19] run A processes gone.
-[watcher 02:17:39] RMM floor stop 감지: [RMM-floor] RMM 0.76448 < floor 0.765 → trainer.should_stop=True (조기 종료)
-[watcher 02:17:48] GPU 2 used=0MiB GPU 3 used=0MiB → 리런치 진행.
-[watcher 02:17:48] relaunched task=ocsc_main_action_b4_0605_203750_relaunch_stride05_0606_021748 (stride=-1, 0.5초)  log=artifacts/ocsc_main_action_b4_0605_203750_relaunch_stride05_0606_021748.log
-[watcher 02:17:53] tmux window 'action_relaunch' 생성
-[watcher 02:17:53] watcher 종료.

@@ -1,9 +1,0 @@
-[oldadam-g1e4] launching B=4 on GPU 3
-[oldadam-g1e4] scene_dir=/home2/pnc2/repos_python/datasets/catk_cache/_b4_scene_validation_head4/scene
-[oldadam-g1e4] log=artifacts/dmd_b4_noshuf_velhead_oldadam_g1e-4_c1e-5_a4u3_gpu3_0604_124431.log
-[oldadam-g1e4] B=4 pid=2619849 task=dmd_b4_noshuf_velhead_oldadam_g1e-4_c1e-5_a4u3_gpu3_0604_124431
-[oldadam-g1e4] B=4 complete
-[oldadam-g1e4] launching B=8 on GPU 3
-[oldadam-g1e4] scene_dir=/home2/pnc2/repos_python/datasets/catk_cache/_b8_scene_validation_head8/scene
-[oldadam-g1e4] log=artifacts/dmd_b8_noshuf_velhead_oldadam_g1e-4_c1e-5_a4u3_gpu3_0604_132956.log
-[oldadam-g1e4] B=8 pid=2729876 task=dmd_b8_noshuf_velhead_oldadam_g1e-4_c1e-5_a4u3_gpu3_0604_132956
