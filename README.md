@@ -2853,6 +2853,37 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf2_sf_anchor_warm0_static_pod.py
 python scripts/launch_self_forced_dmd_h100x8_fmsf2_sf_anchor_warm0_static_pod.py --stop
 ```
 
+#### fm-sf-6 H100x8 single-pod beta=0.8 one-epoch DMD self-forcing
+
+`fm-sf-2` warmup-free stride-1 launcher와 같은 설정을 쓰되, `fm-sf-6`
+H100 8GPU pod에서 짧은 beta ablation을 돌리려면 아래 wrapper를 씁니다. 차이는
+`model.model_config.self_forced.beta=0.8` 과 `trainer.max_epochs=1` 입니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x8_fmsf6_sf_anchor_warm0_beta08_ep1_static_pod.py --replace
+```
+
+기본 실험 설정:
+
+| 항목 | 값 |
+|---|---|
+| pod | `fm-sf-6` 8 H100 |
+| namespace | `p-sp-labs-reai-training` |
+| branch | `semi_control_sf_anchor` |
+| experiment | `self_forced_npfm_h100_6` |
+| default task | `flow_self_forced_dmd_h100x8_fmsf6_sfanchor_stride1_beta08_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs5to2_frac025_ep1_warm0_middle_val1_agent_oomretry` |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x8_fmsf6_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| beta | `model.model_config.self_forced.beta=0.8` |
+| epochs | 실제 `trainer.max_epochs=1` |
+| OOM fallback | `5 -> 4 -> 3 -> 2`, latest self-forced checkpoint resume |
+| tmux session | `catk-self-forced-dmd-h100x8-fmsf6-sfanchor-stride1-warm0-beta08-ep1-lr5e5` |
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x8_fmsf6_sf_anchor_warm0_beta08_ep1_static_pod.py --stop
+```
+
 #### testa A100x4 single-pod DMD self-forcing fine-tuning
 
 `testa` 단일 A100 4GPU pod에서 같은 epoch 61 pretrained Generator checkpoint로
