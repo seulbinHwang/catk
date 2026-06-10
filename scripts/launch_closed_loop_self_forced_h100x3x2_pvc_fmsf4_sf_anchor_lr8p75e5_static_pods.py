@@ -12,8 +12,8 @@ if __name__ == "__main__":
             pod_label="h100x3x2_pvc",
             pods=["pvc-1", "pvc-2"],
             nproc_per_node=3,
-            learning_rate="8.75e-4",
-            lr_tag="lr8p75e-4",
-            session="catk-closed-loop-sf-h100x3x2-pvc-fmsf4-lr8p75e4",
+            learning_rate="8.75e-5",
+            lr_tag="lr8p75e-5",
+            session="catk-closed-loop-sf-h100x3x2-pvc-fmsf4-lr8p75e5",
         )
     )
