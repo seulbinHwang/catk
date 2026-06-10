@@ -2887,7 +2887,7 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
 | experiment | `self_forced_npfm_h100_6` |
 | DDP shape | `trainer.num_nodes=1`, `trainer.devices=8`, 총 8 ranks |
 | rollout anchors | `rollout_anchor_stride=1`, 즉 scene당 16개 anchor lane 전체 |
-| closed-loop curriculum | `closed_loop_sf_global_max_step=3`, `closed_loop_sf_local_max_step=4` |
+| closed-loop curriculum | `closed_loop_sf_global_max_step=4`, `closed_loop_sf_local_max_step=4` |
 | see-all prefix 옵션 | 기본 `closed_loop_see_all=false`. `--closed-loop-see-all`을 주면 stage `s`에서 각 anchor lane별 prefix 길이를 `0..s*4` block 전체 구간에서 샘플 |
 | stage 시간 의미 | 기본 모드는 stage `s`에서 각 anchor lane이 자기 anchor 시점 기준 `(s - 1) * 4 + M`개 0.5초 block을 EMA로 pre-roll. `M`은 batch마다 `1..4`에서 rank 0이 샘플해 모든 rank가 공유 |
 | teacher update | `update_open_loop_teacher_when_roll=false`, frozen pretrained teacher 유지 |
@@ -2903,11 +2903,11 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
 | train subset | `train_epoch_sample_fraction=0.25`, sequential partition mode |
 | validation | `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | base max epochs | wrapper 기본 `2`; closed-loop schedule가 초기 generator epoch 수를 기준으로 추가 stage만큼 확장 |
-| initial train batch | per-rank `6`, OOM fallback `6 -> 4 -> 2` |
+| initial train batch | per-rank `5`, OOM fallback `5 -> 4 -> 3 -> 2` |
 | val/test batch | per-rank `8` |
 | tmux session | `catk-closed-loop-sf-h100x8-fmsf4-sfanchor-stride1` |
 
-2026-06-10 `fm-sf-4` H100x8 probe 기준:
+2026-06-10 `fm-sf-4` H100x8 global3/local4 probe 기준:
 
 | per-rank batch | 결과 | worst peak reserved | 판단 |
 |---:|---|---:|---|
@@ -2916,9 +2916,9 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
 | `8` | stage 2 self-forcing까지 통과 | `84.87%` | 통과했지만 장기 run 기본값으로는 공격적 |
 | `10` | stage 2 rollout에서 CUDA OOM | 실패 | 상한 초과 |
 
-따라서 장기 full run 기본 시작값은 per-rank `6`으로 둡니다. `bs8`도 같은
-closed-loop stage 2 prefix 길이 `8` block까지 통과했지만 peak reserved가
-`84.87%`까지 올라가므로, rare heavy batch 여유를 더 남기기 위해 `bs6`을
+따라서 global4 장기 full run 기본 시작값은 per-rank `5`로 둡니다. `bs8`도
+global3 stage 2 prefix 길이 `8` block까지 통과했지만 peak reserved가
+`84.87%`까지 올라가므로, global4 후반 stage와 rare heavy batch 여유를 남기기 위해 `bs5`를
 기본값으로 사용합니다. `bs10`은 실제로 `flow_local_decoder` step refiner
 attention 경로에서 OOM이 났습니다.
 

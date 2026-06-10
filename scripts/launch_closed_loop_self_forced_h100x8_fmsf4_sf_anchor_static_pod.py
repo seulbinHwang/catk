@@ -21,7 +21,7 @@ DEFAULT_EXTRA_OVERRIDES = " ".join(
         "model.model_config.self_forced.dmd_use_stable_scale_filter=true",
         "model.model_config.self_forced.dmd_stable_scale_scope=agent",
         "model.model_config.self_forced.rollout_anchor_stride=1",
-        "model.model_config.self_forced.closed_loop_sf_global_max_step=3",
+        "model.model_config.self_forced.closed_loop_sf_global_max_step=4",
         "model.model_config.self_forced.closed_loop_sf_local_max_step=4",
         "model.model_config.self_forced.update_open_loop_teacher_when_roll=false",
         "model.model_config.self_forced.clean_dmd_normalizer_eps=0.05",
@@ -88,14 +88,14 @@ def main() -> int:
         "--task-name",
         (
             "flow_closed_loop_self_forced_dmd_h100x8_fmsf4_sfanchor_stride1_epoch061_x5f9g0ce_"
-            "activecontrol_sample16_backprop8_lr5e-5_bs6to2_frac025_ep2_warm0_global3_local4"
+            "activecontrol_sample16_backprop8_lr5e-5_bs5to2_frac025_ep2_warm0_global4_local4"
         ),
         "--session",
         "catk-closed-loop-sf-h100x8-fmsf4-sfanchor-stride1",
         "--initial-bs",
-        "6",
+        "5",
         "--oom-step",
-        "2",
+        "1",
         "--min-bs",
         "2",
         "--val-batch-size",
