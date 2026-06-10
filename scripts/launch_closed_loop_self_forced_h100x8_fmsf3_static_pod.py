@@ -18,14 +18,14 @@ DEFAULT_LOG_DIR = "/tmp/catk_self_forcing_closed_loop_logs"
 DEFAULT_SESSION = "catk-closed-loop-sf-h100x8-fmsf3"
 DEFAULT_TASK = "flow_closed_loop_self_forced_h100x8_fmsf3"
 DEFAULT_EXPERIMENT = "self_forced_npfm_h100_6"
-DEFAULT_PRETRAIN_ARTIFACT = "jksg01019-naver-labs/SMART-FLOW/epoch-last-mqfq3u39:v121"
+DEFAULT_PRETRAIN_ARTIFACT = "jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57"
 DEFAULT_PRETRAIN_CKPT = (
-    "/workspace/flow_closed_loop_self_forced_h100x8_fmsf3_pretrain_epoch116_mqfq3u39"
-    "/v121/epoch_last.ckpt"
+    "/workspace/flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20"
+    "/v57/epoch_061.ckpt"
 )
 DEFAULT_PRETRAIN_DOWNLOAD_DIR = (
-    "/workspace/flow_closed_loop_self_forced_h100x8_fmsf3_pretrain_epoch116_mqfq3u39"
-    "/v121/artifact"
+    "/workspace/flow_control_space_pretrain_h100x4_h100x2_prefix_default_noslip_tailprefix_roundtrip05_lr6e-4_bs20"
+    "/v57/artifact"
 )
 
 
