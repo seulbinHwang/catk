@@ -527,7 +527,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-terminal-scope", default="global_batch")
     parser.add_argument("--random-terminal-policy", default="all")
     parser.add_argument("--min-executed-steps", type=int, default=16)
-    parser.add_argument("--closed-loop-sf-global-max-step", type=int, default=3)
+    parser.add_argument("--closed-loop-sf-global-max-step", type=int, default=4)
     parser.add_argument("--closed-loop-sf-local-max-step", type=int, default=4)
     parser.add_argument("--closed-loop-see-all", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
