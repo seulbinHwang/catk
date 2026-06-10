@@ -2928,6 +2928,49 @@ attention 경로에서 OOM이 났습니다.
 python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.py --stop
 ```
 
+#### fm-sf-5 H100x8 see-all closed-loop curriculum
+
+`fm-sf-4` 기본 실험과 같은 closed-loop multi-anchor self-forcing 설정을
+`p-sp-labs-reai-training/fm-sf-5` 단일 H100 8GPU pod에서 돌리되,
+`closed_loop_see_all=true`를 고정해 stage별 prefix 길이를 누적 구간 전체에서
+샘플하려면 아래 wrapper를 씁니다.
+
+```bash
+python scripts/launch_closed_loop_self_forced_h100x8_fmsf5_sf_anchor_seeall_static_pod.py --replace
+```
+
+기본 실험 설정:
+
+| 항목 | 값 |
+|---|---|
+| pod / namespace | `fm-sf-5` / `p-sp-labs-reai-training` |
+| branch | `closed_loop_sf_anchor` |
+| experiment | `self_forced_npfm_h100_6` |
+| DDP shape | `trainer.num_nodes=1`, `trainer.devices=8`, 총 8 ranks |
+| rollout anchors | `rollout_anchor_stride=1`, 즉 scene당 16개 anchor lane 전체 |
+| closed-loop curriculum | `closed_loop_sf_global_max_step=4`, `closed_loop_sf_local_max_step=4` |
+| see-all prefix | `closed_loop_see_all=true`. stage `s`에서 각 anchor lane별 prefix 길이를 `0..s*4` block 누적 구간 전체에서 샘플 |
+| pretrain | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| local checkpoint path | `/workspace/flow_closed_loop_self_forced_h100x8_fmsf5_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| lr | Generator `7.0e-5`, generated estimator `7.0e-5` |
+| estimator warmup | `0` epoch |
+| DMD objective | `distribution_matching_objective=dmd`, active-control path |
+| DMD space / stable scale | `project_dmd_to_pose_space=false`, `dmd_use_stable_scale_filter=true`, `dmd_stable_scale_scope=agent` |
+| detach block transition | `false` |
+| self-forced sampling | Euler `sample_steps=16`, `backprop_last_k=8`, random terminal `policy=all` |
+| train subset | `train_epoch_sample_fraction=0.25`, sequential partition mode |
+| validation | `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
+| base max epochs | wrapper 기본 `2`; closed-loop schedule가 초기 generator epoch 수를 기준으로 추가 stage만큼 확장 |
+| initial train batch | per-rank `5`, OOM fallback `5 -> 4 -> 3 -> 2` |
+| val/test batch | per-rank `8` |
+| tmux session | `catk-closed-loop-sf-h100x8-fmsf5-sfanchor-seeall-stride1` |
+
+중지:
+
+```bash
+python scripts/launch_closed_loop_self_forced_h100x8_fmsf5_sf_anchor_seeall_static_pod.py --stop
+```
+
 #### testa A100x4 single-pod DMD self-forcing fine-tuning
 
 `testa` 단일 A100 4GPU pod에서 같은 epoch 61 pretrained Generator checkpoint로
