@@ -381,6 +381,11 @@ class SMARTFlow(LightningModule):
                 "self_forced.closed_loop_sf_local_max_step must be positive, "
                 f"got {self.closed_loop_sf_local_max_step}."
             )
+        self.closed_loop_see_all = (
+            bool(getattr(self.self_forced_config, "closed_loop_see_all", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.update_open_loop_teacher_when_roll = (
             bool(getattr(self.self_forced_config, "update_open_loop_teacher_when_roll", False))
             if self.self_forced_config is not None
@@ -2938,6 +2943,28 @@ class SMARTFlow(LightningModule):
             )
         return self._sync_distributed_int_from_rank0(sampled, device=device)
 
+    def _sample_closed_loop_sf_see_all_prefix_steps(self, device: torch.device) -> int:
+        """closed-loop stage가 지금까지 누적된 미래 구간 전체를 보도록 K를 샘플합니다."""
+        stage = int(self._get_closed_loop_self_forced_stage())
+        if stage <= 0:
+            return 0
+        max_prefix_steps = int(stage * int(self.closed_loop_sf_local_max_step))
+        if max_prefix_steps <= 0:
+            return 0
+        if self._distributed_available_and_initialized() and torch.distributed.get_rank() != 0:
+            sampled = 0
+        else:
+            sampled = int(
+                torch.randint(
+                    low=0,
+                    high=max_prefix_steps + 1,
+                    size=(1,),
+                    device=device,
+                    dtype=torch.long,
+                ).item()
+            )
+        return self._sync_distributed_int_from_rank0(sampled, device=device)
+
     def _get_closed_loop_sf_stage_offset_steps(self) -> int:
         """Return the accumulated 0.5s block offset for the current closed-loop stage."""
         stage = int(self._get_closed_loop_self_forced_stage())
@@ -2950,6 +2977,9 @@ class SMARTFlow(LightningModule):
 
     def _sample_closed_loop_sf_prefix_step_counts(self, device: torch.device) -> tuple[int, int, int]:
         """Return stage offset, sampled local M, and total EMA pre-roll steps."""
+        if bool(self.closed_loop_see_all):
+            prefix_steps = int(self._sample_closed_loop_sf_see_all_prefix_steps(device=device))
+            return 0, prefix_steps, prefix_steps
         local_steps = int(self._sample_closed_loop_sf_prefix_steps(device=device))
         if local_steps <= 0:
             return 0, 0, 0

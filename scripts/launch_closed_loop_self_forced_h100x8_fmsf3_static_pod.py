@@ -119,6 +119,7 @@ def render_env(args: argparse.Namespace) -> str:
         "MIN_EXECUTED_STEPS": args.min_executed_steps,
         "CLOSED_LOOP_SF_GLOBAL_MAX_STEP": args.closed_loop_sf_global_max_step,
         "CLOSED_LOOP_SF_LOCAL_MAX_STEP": args.closed_loop_sf_local_max_step,
+        "CLOSED_LOOP_SEE_ALL": bool_text(args.closed_loop_see_all),
         "UPDATE_OPEN_LOOP_TEACHER_WHEN_ROLL": bool_text(args.update_open_loop_teacher_when_roll),
         "GENERATED_ESTIMATOR_INIT_PATH": args.generated_estimator_init_path,
         "GENERATED_ESTIMATOR_SKIP_WARMUP_ON_LOAD": bool_text(
@@ -150,7 +151,7 @@ echo "[launcher] project_root=${PROJECT_ROOT}"
 echo "[launcher] git_head=$(git rev-parse HEAD 2>/dev/null || echo no-git)"
 echo "[launcher] experiment=${EXPERIMENT} action=${ACTION} task=${TASK_NAME}"
 echo "[launcher] cuda_visible_devices=${CUDA_VISIBLE_DEVICES} nproc_per_node=${NPROC_PER_NODE}"
-echo "[launcher] closed_loop global=${CLOSED_LOOP_SF_GLOBAL_MAX_STEP} local=${CLOSED_LOOP_SF_LOCAL_MAX_STEP} update_teacher=${UPDATE_OPEN_LOOP_TEACHER_WHEN_ROLL}"
+echo "[launcher] closed_loop global=${CLOSED_LOOP_SF_GLOBAL_MAX_STEP} local=${CLOSED_LOOP_SF_LOCAL_MAX_STEP} see_all=${CLOSED_LOOP_SEE_ALL} update_teacher=${UPDATE_OPEN_LOOP_TEACHER_WHEN_ROLL}"
 echo "[launcher] batch fallback: ${INITIAL_BS} down to ${MIN_BS} by ${OOM_STEP}"
 
 source ~/.bashrc || true
@@ -255,6 +256,7 @@ build_overrides() {
     "model.model_config.self_forced.sampling.random_terminal_step.min_executed_steps=${MIN_EXECUTED_STEPS}"
     "model.model_config.self_forced.closed_loop_sf_global_max_step=${CLOSED_LOOP_SF_GLOBAL_MAX_STEP}"
     "model.model_config.self_forced.closed_loop_sf_local_max_step=${CLOSED_LOOP_SF_LOCAL_MAX_STEP}"
+    "model.model_config.self_forced.closed_loop_see_all=${CLOSED_LOOP_SEE_ALL}"
     "model.model_config.self_forced.update_open_loop_teacher_when_roll=${UPDATE_OPEN_LOOP_TEACHER_WHEN_ROLL}"
     "model.model_config.self_forced.generated_estimator_skip_warmup_on_load=${GENERATED_ESTIMATOR_SKIP_WARMUP_ON_LOAD}"
     "logger.wandb.offline=${WANDB_OFFLINE}"
@@ -527,6 +529,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-executed-steps", type=int, default=16)
     parser.add_argument("--closed-loop-sf-global-max-step", type=int, default=3)
     parser.add_argument("--closed-loop-sf-local-max-step", type=int, default=4)
+    parser.add_argument("--closed-loop-see-all", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--update-open-loop-teacher-when-roll",
         action=argparse.BooleanOptionalAction,
