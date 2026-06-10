@@ -21,7 +21,7 @@ DEFAULT_EXTRA_OVERRIDES = " ".join(
         "model.model_config.self_forced.dmd_use_stable_scale_filter=true",
         "model.model_config.self_forced.dmd_stable_scale_scope=agent",
         "model.model_config.self_forced.rollout_anchor_stride=1",
-        "model.model_config.self_forced.closed_loop_sf_global_max_step=2",
+        "model.model_config.self_forced.closed_loop_sf_global_max_step=3",
         "model.model_config.self_forced.closed_loop_sf_local_max_step=4",
         "model.model_config.self_forced.update_open_loop_teacher_when_roll=false",
         "model.model_config.self_forced.clean_dmd_normalizer_eps=0.05",
@@ -76,7 +76,7 @@ def main() -> int:
         "--task-name",
         (
             "flow_closed_loop_self_forced_dmd_h100x8_fmsf4_sfanchor_stride1_epoch061_x5f9g0ce_"
-            "activecontrol_sample16_backprop8_lr5e-5_bs6to2_frac025_ep6_warm2_global2_local4"
+            "activecontrol_sample16_backprop8_lr5e-5_bs6to2_frac025_ep2_warm0_global3_local4"
         ),
         "--session",
         "catk-closed-loop-sf-h100x8-fmsf4-sfanchor-stride1",
@@ -99,7 +99,7 @@ def main() -> int:
         "--scorer-scene-num",
         "1680",
         "--estimator-warmup-epochs",
-        "2",
+        "0",
         "--estimator-warmup-bank-artifact",
         "generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr5e-5:latest",
         "--estimator-warmup-bank-artifact-name",
@@ -113,7 +113,7 @@ def main() -> int:
         "--train-memory-balanced-batches",
         "true",
         "--max-epochs",
-        "8",
+        "2",
         "--check-val-every-n-epoch",
         "1",
         "--limit-val-batches",
