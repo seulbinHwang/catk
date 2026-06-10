@@ -4047,8 +4047,8 @@ fm-sf-3 H100 8GPU static pod에서는 아래 launcher를 사용합니다. 기본
 python scripts/launch_closed_loop_self_forced_h100x8_fmsf3_static_pod.py \
   --project-root /tmp/catk_self_forcing_closed_loop_fmsf3 \
   --task-name flow_closed_loop_self_forced_h100x8_fmsf3 \
-  --learning-rate 5e-5 \
-  --generated-estimator-learning-rate 5e-5 \
+  --learning-rate 7e-5 \
+  --generated-estimator-learning-rate 7e-5 \
   --estimator-warmup-epochs 0 \
   --max-epochs 5 \
   --closed-loop-sf-global-max-step 3 \
