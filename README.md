@@ -4059,9 +4059,9 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf3_static_pod.py \
   --replace
 ```
 
-`estimator_warmup_epochs=0`, `max_epochs=5`, `closed_loop_sf_global_max_step=1` 로 실행하면
-t=0 self-forcing generator 학습 5 epoch 뒤 closed-loop stage 1 generator 학습 5 epoch이 추가되어
-trainer는 총 10 epoch으로 확장됩니다.
+`estimator_warmup_epochs=0`, `max_epochs=5`, `closed_loop_sf_global_max_step=3` 로 실행하면
+t=0 self-forcing generator 학습 5 epoch 뒤 closed-loop stage 1~3 generator 학습이 각각 5 epoch씩 추가되어
+trainer는 총 20 epoch으로 확장됩니다.
 
 fm-sf-3 H100 8GPU 기준 기본 시작 batch는 per-rank `72`입니다. CUDA OOM이 발생하면 launcher가 같은
 `task_name`의 최신 `epoch_last.ckpt`, `last.ckpt`, 또는 `epoch_*.ckpt`를 찾아 `ckpt_path`로 넘기고,
