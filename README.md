@@ -2805,6 +2805,54 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf1_sf_anchor_static_pod.py \
 python scripts/launch_self_forced_dmd_h100x8_fmsf1_sf_anchor_static_pod.py --stop
 ```
 
+#### fm-sf-2 H100x8 single-pod stride-1 warmup-free DMD self-forcing
+
+`fm-sf-1` H100x8 recipe와 같은 설정에서 generated-estimator warmup만 끄고
+비교하려면 `fm-sf-2` 전용 launcher를 씁니다. pod를 만들거나 재시작하지 않고,
+`p-sp-labs-reai-training/fm-sf-2` 안의 tmux session과
+`torchrun --nnodes=1 --nproc_per_node=8`만 시작합니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x8_fmsf2_sf_anchor_warm0_static_pod.py --replace
+```
+
+기본 실험 설정:
+
+| 항목 | 값 |
+|---|---|
+| pod | `fm-sf-2` 8 H100 |
+| namespace | `p-sp-labs-reai-training` |
+| branch | `semi_control_sf_anchor` |
+| experiment | `self_forced_npfm_h100_6` |
+| default task | `flow_self_forced_dmd_h100x8_fmsf2_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs8to6_frac025_ep6_warm0_middle_val1_agent_oomretry` |
+| pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x8_fmsf2_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=1`, 즉 16개 anchor 전체 |
+| DDP shape | `trainer.num_nodes=1`, `trainer.devices=8`, 총 8 ranks |
+| precision | `bf16-mixed` |
+| lr | Generator `5.0e-5`, generated estimator `5.0e-5` |
+| estimator warmup | `0` epoch. W&B warmup bank는 조회하지 않고, generated estimator는 pretrained generator에서 초기화된 상태로 바로 DMD 학습을 시작합니다. |
+| DMD objective | `model.model_config.self_forced.distribution_matching_objective=dmd` |
+| DMD space / stable scale | `project_dmd_to_pose_space=false`, `dmd_use_stable_scale_filter=true`, `dmd_stable_scale_scope=agent` |
+| detach block transition | `false` |
+| self-forced sample steps | Euler `sample_steps=16` |
+| self-forced backprop | `backprop_last_k=8` |
+| random terminal policy | `all` |
+| train data fraction | `data.train_epoch_sample_fraction=0.25`, `data.train_epoch_sample_fraction_shuffle_flag=false` |
+| validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
+| epochs | 실제 `trainer.max_epochs=6` |
+| initial train batch | per-rank `8`, effective global scene batch `64` |
+| OOM fallback | `8 -> 6`, latest self-forced checkpoint resume |
+| val/test batch | per-rank `8` |
+| scorer scenes | `1680` |
+| tmux session | `catk-self-forced-dmd-h100x8-fmsf2-sfanchor-stride1-warm0-lr5e5` |
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x8_fmsf2_sf_anchor_warm0_static_pod.py --stop
+```
+
 #### testa A100x4 single-pod DMD self-forcing fine-tuning
 
 `testa` 단일 A100 4GPU pod에서 같은 epoch 61 pretrained Generator checkpoint로
