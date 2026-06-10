@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch self-forced A100x4x2 static multi-node training on existing pods.
+"""Launch self-forced static multi-node training on existing 2-pod jobs.
 
 This launcher never creates, deletes, or restarts pods. It only uses
 ``kubectl exec`` to start or stop a tmux session inside already-running pods.
@@ -120,6 +120,7 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
         "MAX_EPOCHS": args.max_epochs,
+        "CHECK_VAL_EVERY_N_EPOCH": args.check_val_every_n_epoch,
         "TRAIN_EPOCH_SAMPLE_FRACTION": args.train_epoch_sample_fraction,
         "TRAIN_MEMORY_BALANCED_BATCHES": args.train_memory_balanced_batches,
         "CATK_EXTRA_OVERRIDES": args.extra_hydra_overrides,
@@ -1104,6 +1105,9 @@ while (( bs >= MIN_BS )); do
   if [[ -n "${{MAX_EPOCHS:-}}" ]]; then
     torchrun_args+=(trainer.max_epochs="$MAX_EPOCHS")
   fi
+  if [[ -n "${{CHECK_VAL_EVERY_N_EPOCH:-}}" ]]; then
+    torchrun_args+=(trainer.check_val_every_n_epoch="$CHECK_VAL_EVERY_N_EPOCH")
+  fi
   if [[ -n "${{TRAIN_EPOCH_SAMPLE_FRACTION:-}}" ]]; then
     torchrun_args+=(data.train_epoch_sample_fraction="$TRAIN_EPOCH_SAMPLE_FRACTION")
   fi
@@ -1347,7 +1351,7 @@ def exec_in_pod(args: argparse.Namespace, pod: str, script: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launch self-forced A100x4x2 training on existing static pods.",
+        description="Launch self-forced 2-pod static multi-node training.",
     )
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     parser.add_argument("--pods", nargs="+", default=DEFAULT_PODS)
@@ -1431,6 +1435,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--max-epochs", default="")
+    parser.add_argument("--check-val-every-n-epoch", default="")
     parser.add_argument("--train-epoch-sample-fraction", default="")
     parser.add_argument("--train-memory-balanced-batches", default="true")
     parser.add_argument("--extra-hydra-overrides", default="")
@@ -1445,8 +1450,8 @@ def parse_args() -> argparse.Namespace:
         return args
     if len(args.pods) != 2:
         parser.error("--pods must contain exactly two pods for the A100x4x2 preset")
-    if args.nproc_per_node != 4:
-        parser.error("--nproc-per-node must be 4 for the A100x4x2 preset")
+    if args.nproc_per_node < 1:
+        parser.error("--nproc-per-node must be >= 1")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
     if args.oom_step < 1:

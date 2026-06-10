@@ -2680,6 +2680,69 @@ per-rank `bs18`의 anchor-rollout 수는 기존 첫-anchor 방식의 `bs144`와 
 python scripts/launch_self_forced_dmd_a100x4x2_testa_sf_anchor_static_pods.py --stop
 ```
 
+#### pvc-1/pvc-2 H100x3x2 stride-1 multi-anchor DMD self-forcing fine-tuning
+
+`semi_control_sf_anchor` 브랜치에서 `pvc-1`, `pvc-2` 두 H100x3 pod를 2-node
+DDP job으로 묶어, self-forcing 본체가 scene 안의 16개 rollout anchor를 모두 쓰게
+학습하려면 아래 wrapper를 사용합니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3x2_pvc_sf_anchor_static_pods.py --replace
+```
+
+짧은 probe는 아래처럼 실행합니다.
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3x2_pvc_sf_anchor_static_pods.py \
+  --replace \
+  --task-name sfanchor_stride1_probe_bs8 \
+  --session catk-sfanchor-stride1-probe-bs8 \
+  --max-epochs 1 \
+  --limit-train-batches 2 \
+  --limit-val-batches 0
+```
+
+기본 실험 설정:
+
+| 항목 | 값 |
+|---|---|
+| pods | `pvc-1` 3 H100 + `pvc-2` 3 H100 |
+| branch | `semi_control_sf_anchor` |
+| experiment | `self_forced_npfm_h100_6` |
+| default task | `flow_self_forced_dmd_h100x3x2_pvc_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs8to6_frac025_ep8_warm2_middle_val1_oomretry` |
+| pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
+| local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3x2_pvc_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
+| rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=1`, 즉 16개 anchor 전체 |
+| DDP shape | `trainer.num_nodes=2`, `trainer.devices=3`, 총 6 ranks |
+| precision | `bf16-mixed` |
+| lr | Generator `5.0e-5`, generated estimator `5.0e-5` |
+| estimator warmup | 요청값 `2` epoch, W&B generated-estimator warmup bank `generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-lr5e-5:latest` 사용. exact hit이면 warmup은 다운로드로 대체되고 실제 generator+DMD 학습 예산은 8 epoch로 조정됩니다. |
+| DMD objective | `model.model_config.self_forced.distribution_matching_objective=dmd` |
+| detach block transition | `false` |
+| self-forced sample steps | Euler `sample_steps=16` |
+| self-forced backprop | `backprop_last_k=8` |
+| random terminal policy | `all` |
+| train data fraction | `data.train_epoch_sample_fraction=0.25` |
+| validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
+| epochs | `MAX_EPOCHS=10`; warmup bank에서 2 epoch exact hit 시 실제 `trainer.max_epochs=8`, miss 시 warmup 2 + generator/DMD 8 |
+| initial train batch | per-rank `8`, effective global scene batch `48` |
+| OOM fallback | `8 -> 6`, latest self-forced checkpoint resume |
+| val/test batch | per-rank `8` |
+| scorer scenes | `1680` |
+| tmux session | `catk-self-forced-dmd-h100x3x2-pvc-sfanchor-stride1-lr5e5` |
+
+`rollout_anchor_stride=1`은 scene마다 16개 anchor 전체를 self-forcing 본체에 쓰므로,
+stride-2 recipe보다 메모리 사용량이 큽니다. 2026-06-10 probe 기준 `bs12`는
+첫 train step을 통과했지만 peak가 약 `77.6GiB / 79.6GiB`까지 올라 rare heavy
+batch 여유가 얇았고, full run `bs10`은 실제 CUDA OOM이 났습니다. 그래서 full run
+기본 시작값은 per-rank `bs8`로 둡니다.
+
+학습 프로세스만 멈추고 pod는 그대로 두려면:
+
+```bash
+python scripts/launch_self_forced_dmd_h100x3x2_pvc_sf_anchor_static_pods.py --stop
+```
+
 #### testa A100x4 single-pod DMD self-forcing fine-tuning
 
 `testa` 단일 A100 4GPU pod에서 같은 epoch 61 pretrained Generator checkpoint로
