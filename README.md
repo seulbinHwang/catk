@@ -4047,13 +4047,21 @@ fm-sf-3 H100 8GPU static pod에서는 아래 launcher를 사용합니다. 기본
 python scripts/launch_closed_loop_self_forced_h100x8_fmsf3_static_pod.py \
   --project-root /tmp/catk_self_forcing_closed_loop_fmsf3 \
   --task-name flow_closed_loop_self_forced_h100x8_fmsf3 \
+  --learning-rate 5e-5 \
+  --generated-estimator-learning-rate 5e-5 \
+  --estimator-warmup-epochs 0 \
+  --max-epochs 5 \
   --closed-loop-sf-global-max-step 3 \
   --closed-loop-sf-local-max-step 4 \
-  --estimator-warmup-epochs 2 \
-  --max-epochs 6 \
+  --dmd-use-stable-scale-filter \
+  --dmd-stable-scale-scope agent \
   --initial-bs 12 --oom-step 2 --min-bs 2 \
   --replace
 ```
+
+`estimator_warmup_epochs=0`, `max_epochs=5`, `closed_loop_sf_global_max_step=1` 로 실행하면
+t=0 self-forcing generator 학습 5 epoch 뒤 closed-loop stage 1 generator 학습 5 epoch이 추가되어
+trainer는 총 10 epoch으로 확장됩니다.
 
 기존 epoch별 random subset 모드로 되돌리려면 아래처럼 override합니다.
 
