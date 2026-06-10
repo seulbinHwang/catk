@@ -76,16 +76,16 @@ def main() -> int:
         "--task-name",
         (
             "flow_closed_loop_self_forced_dmd_h100x8_fmsf4_sfanchor_stride1_epoch061_x5f9g0ce_"
-            "activecontrol_sample16_backprop8_lr5e-5_bs8to6_frac025_ep6_warm2_global2_local4"
+            "activecontrol_sample16_backprop8_lr5e-5_bs6to2_frac025_ep6_warm2_global2_local4"
         ),
         "--session",
         "catk-closed-loop-sf-h100x8-fmsf4-sfanchor-stride1",
         "--initial-bs",
-        "8",
+        "6",
         "--oom-step",
         "2",
         "--min-bs",
-        "6",
+        "2",
         "--val-batch-size",
         "8",
         "--test-batch-size",

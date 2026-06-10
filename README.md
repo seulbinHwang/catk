@@ -2872,7 +2872,8 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
   --task-name flow_closed_loop_sf_h100x8_fmsf4_smoke \
   --session catk-closed-loop-sf-h100x8-fmsf4-smoke \
   --max-epochs 3 \
-  --limit-train-batches 2 \
+  --check-val-every-n-epoch 999 \
+  --limit-train-batches 1 \
   --limit-val-batches 0
 ```
 
@@ -2900,9 +2901,24 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
 | train subset | `train_epoch_sample_fraction=0.25`, sequential partition mode |
 | validation | `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | base max epochs | wrapper 기본 `8`; closed-loop schedule가 초기 generator epoch 수를 기준으로 추가 stage만큼 확장 |
-| initial train batch | per-rank `8`, OOM fallback `8 -> 6` |
+| initial train batch | per-rank `6`, OOM fallback `6 -> 4 -> 2` |
 | val/test batch | per-rank `8` |
 | tmux session | `catk-closed-loop-sf-h100x8-fmsf4-sfanchor-stride1` |
+
+2026-06-10 `fm-sf-4` H100x8 probe 기준:
+
+| per-rank batch | 결과 | worst peak reserved | 판단 |
+|---:|---|---:|---|
+| `4` | stage 2 self-forcing까지 통과 | `60.66%` | 안정 |
+| `6` | stage 2 self-forcing까지 통과 | `67.95%` | full run 기본값 |
+| `8` | stage 2 self-forcing까지 통과 | `84.87%` | 통과했지만 장기 run 기본값으로는 공격적 |
+| `10` | stage 2 rollout에서 CUDA OOM | 실패 | 상한 초과 |
+
+따라서 장기 full run 기본 시작값은 per-rank `6`으로 둡니다. `bs8`도 같은
+closed-loop stage 2 prefix 길이 `8` block까지 통과했지만 peak reserved가
+`84.87%`까지 올라가므로, rare heavy batch 여유를 더 남기기 위해 `bs6`을
+기본값으로 사용합니다. `bs10`은 실제로 `flow_local_decoder` step refiner
+attention 경로에서 OOM이 났습니다.
 
 중지:
 
