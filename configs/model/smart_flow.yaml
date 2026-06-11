@@ -103,6 +103,7 @@ model_config:
     closed_loop_sf_global_max_step: 1
     closed_loop_sf_local_max_step: 4
     closed_loop_see_all: false
+    gradually_see: false
     update_open_loop_teacher_when_roll: false
     # Optional generated-estimator warmup bank.
     # When generated_estimator_init_path points to a bank entry, only the

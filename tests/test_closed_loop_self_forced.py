@@ -35,6 +35,7 @@ def _make_closed_loop_model() -> SMARTFlow:
     model.closed_loop_sf_global_max_step = 2
     model.closed_loop_sf_local_max_step = 4
     model.closed_loop_see_all = False
+    model.gradually_see = False
     model._closed_loop_sf_base_generator_epochs = 4
     model._closed_loop_sf_stage_warmup_epochs = 2
     model.self_forced_use_distribution_matching_loss = True
@@ -118,6 +119,141 @@ def test_closed_loop_see_all_allows_zero_second_prefix(monkeypatch) -> None:
     _set_current_epoch(model, 6)
 
     assert model._sample_closed_loop_sf_prefix_step_counts(device=device) == (0, 0, 0)
+
+
+def test_gradually_see_opens_stage_local_window_over_epochs(monkeypatch) -> None:
+    model = _make_closed_loop_model()
+    model.gradually_see = True
+    model.closed_loop_see_all = False
+    model.self_forced_estimator_warmup_epochs = 0
+    model._closed_loop_sf_stage_warmup_epochs = 0
+    model._closed_loop_sf_base_generator_epochs = 7
+    model.closed_loop_sf_global_max_step = 3
+    device = torch.device("cpu")
+
+    requested_ranges: list[tuple[int, int]] = []
+
+    def fake_randint(*, low, high, size, device, dtype):
+        requested_ranges.append((low, high))
+        return torch.tensor([high - 1], device=device, dtype=dtype)
+
+    monkeypatch.setattr(torch, "randint", fake_randint)
+
+    expected = {
+        7: (0, 1, 1),
+        8: (0, 1, 1),
+        9: (0, 2, 2),
+        10: (0, 2, 2),
+        11: (0, 3, 3),
+        12: (0, 3, 3),
+        13: (0, 4, 4),
+        14: (4, 1, 5),
+        15: (4, 1, 5),
+        16: (4, 2, 6),
+        17: (4, 2, 6),
+        18: (4, 3, 7),
+        19: (4, 3, 7),
+        20: (4, 4, 8),
+    }
+    for epoch, counts in expected.items():
+        _set_current_epoch(model, epoch)
+        assert model._sample_closed_loop_sf_prefix_step_counts(device=device) == counts
+
+    assert requested_ranges == [
+        (1, 2),
+        (1, 2),
+        (1, 3),
+        (1, 3),
+        (1, 4),
+        (1, 4),
+        (1, 5),
+        (1, 2),
+        (1, 2),
+        (1, 3),
+        (1, 3),
+        (1, 4),
+        (1, 4),
+        (1, 5),
+    ]
+
+
+def test_gradually_see_counts_stage_warmup_inside_stage_epoch_index() -> None:
+    model = _make_closed_loop_model()
+    model.gradually_see = True
+    model.closed_loop_see_all = False
+    model.self_forced_estimator_warmup_epochs = 0
+    model._closed_loop_sf_stage_warmup_epochs = 2
+    model._closed_loop_sf_base_generator_epochs = 5
+    model.closed_loop_sf_local_max_step = 4
+
+    expected_open_steps = {
+        5: 1,
+        6: 1,
+        7: 2,
+        8: 2,
+        9: 3,
+        10: 3,
+        11: 4,
+    }
+    for epoch, open_steps in expected_open_steps.items():
+        _set_current_epoch(model, epoch)
+        assert model._get_closed_loop_sf_gradual_local_max_step() == open_steps
+
+
+def test_gradually_see_all_opens_cumulative_window_over_epochs(monkeypatch) -> None:
+    model = _make_closed_loop_model()
+    model.gradually_see = True
+    model.closed_loop_see_all = True
+    model.self_forced_estimator_warmup_epochs = 0
+    model._closed_loop_sf_stage_warmup_epochs = 0
+    model._closed_loop_sf_base_generator_epochs = 7
+    model.closed_loop_sf_global_max_step = 3
+    device = torch.device("cpu")
+
+    requested_ranges: list[tuple[int, int]] = []
+
+    def fake_randint(*, low, high, size, device, dtype):
+        requested_ranges.append((low, high))
+        return torch.tensor([high - 1], device=device, dtype=dtype)
+
+    monkeypatch.setattr(torch, "randint", fake_randint)
+
+    expected = {
+        7: (0, 1, 1),
+        8: (0, 1, 1),
+        9: (0, 2, 2),
+        10: (0, 2, 2),
+        11: (0, 3, 3),
+        12: (0, 3, 3),
+        13: (0, 4, 4),
+        14: (0, 5, 5),
+        15: (0, 5, 5),
+        16: (0, 6, 6),
+        17: (0, 6, 6),
+        18: (0, 7, 7),
+        19: (0, 7, 7),
+        20: (0, 8, 8),
+    }
+    for epoch, counts in expected.items():
+        _set_current_epoch(model, epoch)
+        assert model._sample_closed_loop_sf_prefix_step_counts(device=device) == counts
+
+    assert requested_ranges == [
+        (0, 2),
+        (0, 2),
+        (0, 3),
+        (0, 3),
+        (0, 4),
+        (0, 4),
+        (0, 5),
+        (0, 6),
+        (0, 6),
+        (0, 7),
+        (0, 7),
+        (0, 8),
+        (0, 8),
+        (0, 9),
+    ]
 
 
 def test_closed_loop_self_forced_stage_warmup_repeats_after_bank_skipped_initial_warmup() -> None:
