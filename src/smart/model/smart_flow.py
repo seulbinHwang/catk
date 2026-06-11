@@ -1612,6 +1612,8 @@ class SMARTFlow(LightningModule):
     def _build_multi_anchor_self_forced_tokenized_agent(
         self,
         tokenized_agent: Dict[str, Tensor],
+        *,
+        anchor_stride: int | None = None,
     ) -> tuple[Dict[str, Tensor], Tensor]:
         """self-forcing rollout을 모든 유효 anchor에서 병렬로 돌릴 agent token을 만듭니다."""
         anchor_mask_2d = tokenized_agent.get("self_forced_rollout_anchor_mask")
@@ -1624,10 +1626,20 @@ class SMARTFlow(LightningModule):
             )
 
         source_num_anchor = int(anchor_mask_2d.shape[1])
+        effective_anchor_stride = (
+            int(self.self_forced_rollout_anchor_stride)
+            if anchor_stride is None
+            else int(anchor_stride)
+        )
+        if effective_anchor_stride < 1:
+            raise ValueError(
+                "self-forced rollout anchor stride must be a positive integer, "
+                f"got {effective_anchor_stride}."
+            )
         anchor_offsets = torch.arange(
             0,
             source_num_anchor,
-            self.self_forced_rollout_anchor_stride,
+            effective_anchor_stride,
             device=anchor_mask_2d.device,
             dtype=torch.long,
         )
@@ -1709,6 +1721,12 @@ class SMARTFlow(LightningModule):
             )
 
         return runtime_tokenized_agent, self._flatten_anchor_major_tensor(anchor_mask_2d).bool()
+
+    def _get_self_forced_rollout_anchor_stride_for_current_stage(self) -> int:
+        """초기 self-forcing은 전체 anchor를 쓰고, closed-loop stage만 설정 stride를 씁니다."""
+        if self._get_closed_loop_self_forced_stage() <= 0:
+            return 1
+        return int(self.self_forced_rollout_anchor_stride)
 
     def _expand_self_forced_map_feature_for_tokenized_agent(
         self,
@@ -3483,8 +3501,10 @@ class SMARTFlow(LightningModule):
                 closed-loop rollout 결과, anchor-expanded agent token, 그리고 self-forced
                 loss에 쓸 anchor-expanded mask와 prefix rollout state입니다.
         """
+        anchor_stride = self._get_self_forced_rollout_anchor_stride_for_current_stage()
         rollout_tokenized_agent, anchor_mask = self._build_multi_anchor_self_forced_tokenized_agent(
             tokenized_agent,
+            anchor_stride=anchor_stride,
         )
         initial_rollout_state = None
         if int(prefix_steps_2hz) > 0:

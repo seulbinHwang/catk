@@ -35,12 +35,35 @@ def _make_closed_loop_model() -> SMARTFlow:
     model.closed_loop_sf_global_max_step = 2
     model.closed_loop_sf_local_max_step = 4
     model.closed_loop_see_all = False
+    model.self_forced_rollout_anchor_stride = 2
     model._closed_loop_sf_base_generator_epochs = 4
     model._closed_loop_sf_stage_warmup_epochs = 2
     model.self_forced_use_distribution_matching_loss = True
     model._self_forced_original_check_val_every_n_epoch = None
     model._self_forced_validation_schedule_captured = False
     return model
+
+
+def _make_minimal_anchor_tokenized_agent(
+    *,
+    num_agents: int = 2,
+    num_anchors: int = 16,
+) -> dict[str, torch.Tensor | int]:
+    return {
+        "batch": torch.zeros(num_agents, dtype=torch.long),
+        "num_graphs": 1,
+        "self_forced_rollout_anchor_mask": torch.ones(
+            num_agents,
+            num_anchors,
+            dtype=torch.bool,
+        ),
+        "trajectory_token_veh": torch.zeros(1),
+        "trajectory_token_ped": torch.zeros(1),
+        "trajectory_token_cyc": torch.zeros(1),
+        "token_bank_all_veh": torch.zeros(1),
+        "token_bank_all_ped": torch.zeros(1),
+        "token_bank_all_cyc": torch.zeros(1),
+    }
 
 
 def test_closed_loop_self_forced_stage_uses_warmup_plus_generator_blocks() -> None:
@@ -61,6 +84,46 @@ def test_closed_loop_self_forced_stage_uses_warmup_plus_generator_blocks() -> No
     for epoch, stage in expected.items():
         _set_current_epoch(model, epoch)
         assert model._get_closed_loop_self_forced_stage() == stage
+
+
+def test_initial_self_forcing_stage_always_uses_all_rollout_anchors() -> None:
+    model = _make_closed_loop_model()
+    model.self_forced_rollout_anchor_stride = 4
+    _set_current_epoch(model, 2)
+
+    assert model._get_closed_loop_self_forced_stage() == 0
+    assert model._get_self_forced_rollout_anchor_stride_for_current_stage() == 1
+
+    tokenized_agent = _make_minimal_anchor_tokenized_agent()
+    rollout_tokenized_agent, anchor_mask = model._build_multi_anchor_self_forced_tokenized_agent(
+        tokenized_agent,  # type: ignore[arg-type]
+        anchor_stride=model._get_self_forced_rollout_anchor_stride_for_current_stage(),
+    )
+
+    assert rollout_tokenized_agent["_self_forced_anchor_repeat_count"] == 16
+    assert rollout_tokenized_agent["num_graphs"] == 16
+    assert anchor_mask.shape == (32,)
+    assert anchor_mask.all()
+
+
+def test_closed_loop_self_forcing_stage_uses_configured_rollout_anchor_stride() -> None:
+    model = _make_closed_loop_model()
+    model.self_forced_rollout_anchor_stride = 4
+    _set_current_epoch(model, 6)
+
+    assert model._get_closed_loop_self_forced_stage() == 1
+    assert model._get_self_forced_rollout_anchor_stride_for_current_stage() == 4
+
+    tokenized_agent = _make_minimal_anchor_tokenized_agent()
+    rollout_tokenized_agent, anchor_mask = model._build_multi_anchor_self_forced_tokenized_agent(
+        tokenized_agent,  # type: ignore[arg-type]
+        anchor_stride=model._get_self_forced_rollout_anchor_stride_for_current_stage(),
+    )
+
+    assert rollout_tokenized_agent["_self_forced_anchor_repeat_count"] == 4
+    assert rollout_tokenized_agent["num_graphs"] == 4
+    assert anchor_mask.shape == (8,)
+    assert anchor_mask.all()
 
 
 def test_closed_loop_stage_offsets_advance_by_local_max_step() -> None:
