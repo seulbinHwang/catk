@@ -25,6 +25,10 @@ model:
       path_step_size: 0.05
       anchor_weight: 0.1
       use_anchor_flow_matching_loss: false
+      # self-forced rollout 시작 anchor stride. 0=기존 anchor0(1초 history) 단독.
+      # s>0이면 0.5초 단위 s step 간격 GT 시작점을 (scene×anchor) 복제로 병렬 rollout.
+      # 예: 4 → 1s/3s/5s/7s 4개 시작점.
+      start_anchor_stride: 0
       # Training self-rollout 전용입니다. Inference/validation stop-motion은
       # model_config.decoder.use_stop_motion으로 별도 제어합니다.
       use_stop_motion: false

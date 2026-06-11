@@ -80,6 +80,10 @@ UNFROZEN_RANGE="${UNFROZEN_RANGE:-}"
 # generator 가 teacher 의 open-loop FM 에서 drift 하는 것을 억제한다. false=기존(off).
 USE_ANCHOR_FM_LOSS="${USE_ANCHOR_FM_LOSS:-false}"
 ANCHOR_WEIGHT="${ANCHOR_WEIGHT:-0.05}"
+# self-forced rollout 시작 anchor stride. 0(기본)=기존 anchor0(1초 history) 단독.
+# s>0 이면 0.5초 단위 s step 간격의 GT 시작점을 (scene × anchor) 복제로 병렬 rollout.
+# 예: 4 → 1s/3s/5s/7s 4개 시작점(샘플 4배, rollout 메모리/연산도 비례 증가).
+START_ANCHOR_STRIDE="${START_ANCHOR_STRIDE:-0}"
 
 # data / trainer
 TRAIN_B="${TRAIN_B:-8}"
@@ -145,6 +149,7 @@ set -- \
   model.model_config.self_forced.sampling.backprop_last_k="${BACKPROP_LAST_K}" \
   model.model_config.self_forced.use_anchor_flow_matching_loss="${USE_ANCHOR_FM_LOSS}" \
   model.model_config.self_forced.anchor_weight="${ANCHOR_WEIGHT}" \
+  ++model.model_config.self_forced.start_anchor_stride="${START_ANCHOR_STRIDE}" \
   model.model_config.sim_agents_metric_workers="${SIM_AGENTS_METRIC_WORKERS}" \
   model.model_config.self_forced.cadence="${CADENCE}" \
   model.model_config.self_forced.estimator_updates_per_step="${ESTIMATOR_UPDATES_PER_STEP}" \
@@ -181,7 +186,7 @@ echo "  estimator_init_ckpt=${ESTIMATOR_INIT_CKPT:-<none>}"
 echo "  objective=${DM_OBJECTIVE} use_ema=${USE_EMA} warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
 echo "  normalize_dir=${NORMALIZE_DIRECTION} per_channel_norm=${PER_CHANNEL_NORMALIZER} path_step=${PATH_STEP_SIZE} normalizer_eps=${NORMALIZER_EPS}"
 echo "  grad_policy=${TERMINAL_POLICY} backprop_last_k=${BACKPROP_LAST_K} (all+16=full-gradient: 블록 detach 없음 + 16 ODE step 전부)"
-echo "  anchor_fm_loss=${USE_ANCHOR_FM_LOSS} anchor_weight=${ANCHOR_WEIGHT}"
+echo "  anchor_fm_loss=${USE_ANCHOR_FM_LOSS} anchor_weight=${ANCHOR_WEIGHT} start_anchor_stride=${START_ANCHOR_STRIDE}"
 echo "  zone_schedule(warmup:joint steps)=${WARMUP_ZONE_STEPS}:${JOINT_ZONE_STEPS} (0:0=off)"
 echo "  unfrozen_range=${UNFROZEN_RANGE:-<config default>}"
 echo "  train_B=${TRAIN_B} val_B=${VAL_B} scorer_scene=${SCORER_SCENE_NUM} val_check=${VAL_CHECK_INTERVAL} precision=${PRECISION}"

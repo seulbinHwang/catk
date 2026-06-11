@@ -31,10 +31,19 @@ from src.smart.metrics.flow_metrics import (
     yaw_fde_future,
 )
 from src.smart.modules.self_forced_path_flow import (
-    build_anchor0_normalized_committed_control,
-    build_anchor0_normalized_committed_path,
+    build_anchor_normalized_committed_path,
+    build_packed_normalized_committed_control,
     get_anchor0_valid_mask,
     masked_mean_square_loss,
+)
+from src.smart.modules.self_forced_multi_anchor import (
+    build_anchor_current_pose,
+    build_multi_anchor_mask,
+    pack_anchor_invariant,
+    pack_replicated_rows,
+    replicate_map_feature_for_anchors,
+    replicate_tokenized_agent_for_anchors,
+    select_self_forced_anchor_offsets,
 )
 from src.smart.modules.self_forced_dmd_guidance import build_clean_dmd_direction
 from src.smart.modules.self_forced_sid_loss import compute_clean_sid_loss
@@ -331,6 +340,14 @@ class SMARTFlow(LightningModule):
             bool(getattr(self.self_forced_config, "use_anchor_flow_matching_loss", True))
             if self.self_forced_config is not None
             else True
+        )
+        # self-forced rollout 시작 anchor stride. 0이면 기존 동작(anchor 0 단독),
+        # s>0이면 0.5초 단위 s step 간격으로 GT 시작점을 늘려 (scene × anchor)
+        # 복제 rollout을 병렬 실행한다. 예: 4 → 1s/3s/5s/7s 시작.
+        self.self_forced_start_anchor_stride = (
+            int(getattr(self.self_forced_config, "start_anchor_stride", 0))
+            if self.self_forced_config is not None
+            else 0
         )
         self.self_forced_estimator_updates_per_step = (
             max(1, int(getattr(self.self_forced_config, "estimator_updates_per_step", 1)))
@@ -2292,6 +2309,7 @@ class SMARTFlow(LightningModule):
         noisy_path_norm: Tensor,
         tau: Tensor,
         anchor_mask: Tensor,
+        anchor_offsets: list[int],
     ) -> Dict[str, Tensor]:
         """주어진 decoder가 noisy N초 path를 어떻게 clean path로 보는지 계산합니다.
 
@@ -2299,20 +2317,24 @@ class SMARTFlow(LightningModule):
             decoder: ``F_rho`` 또는 ``F_psi`` 역할의 decoder입니다.
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
-            noisy_path_norm: noisy path입니다. shape은 ``[n_valid_agent, F_win, 4]`` 입니다.
-            tau: flow interpolation time입니다. shape은 ``[n_valid_agent]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다. shape은 ``[n_agent]`` 입니다.
+            noisy_path_norm: anchor-major packed noisy path입니다.
+                shape은 ``[n_valid, F_win, 4]`` 입니다.
+            tau: flow interpolation time입니다. shape은 ``[n_valid]`` 입니다.
+            anchor_mask: 유효 (agent, anchor) mask입니다.
+                shape은 ``[n_agent, n_selected]`` 입니다.
+            anchor_offsets: 사용하는 anchor offset 목록입니다.
 
         Returns:
             Dict[str, Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다.
         """
         map_feature = decoder.encode_map(tokenized_map)
-        return decoder.path_flow_velocity_for_anchor0(
+        return decoder.path_flow_velocity_for_anchors(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
             path_noisy_norm=noisy_path_norm,
             tau=tau,
             anchor_mask=anchor_mask,
+            anchor_offsets=anchor_offsets,
         )
 
     def _build_self_forced_zero_metrics(self, reference: Tensor) -> Dict[str, Tensor]:
@@ -2333,30 +2355,74 @@ class SMARTFlow(LightningModule):
         }
         return metric_dict
 
+    def _get_self_forced_anchor_offsets(self, tokenized_agent: Dict[str, Tensor]) -> list[int]:
+        """stride 설정과 GT 길이로 self-forced 시작 anchor offset을 정합니다.
+
+        Args:
+            tokenized_agent: 평가 모드 agent token 사전입니다.
+
+        Returns:
+            list[int]: 사용할 anchor offset 목록입니다. stride가 꺼져 있거나
+            ``flow_eval_mask`` 가 없으면 기존 동작인 ``[0]`` 입니다.
+        """
+        flow_eval_mask = tokenized_agent.get("flow_eval_mask")
+        if flow_eval_mask is None or self.self_forced_start_anchor_stride <= 0:
+            return [0]
+        shift = int(self.token_processor.shift)
+        # ctx 토큰 t는 raw step ``shift*(t+1)`` 이므로 raw 길이는 ``shift*n_token + 1`` 입니다.
+        num_raw_steps = shift * int(tokenized_agent["ctx_sampled_pos"].shape[1]) + 1
+        return select_self_forced_anchor_offsets(
+            anchor_stride=self.self_forced_start_anchor_stride,
+            num_anchor=int(flow_eval_mask.shape[1]),
+            num_raw_steps=num_raw_steps,
+            flow_window_steps=int(self.flow_window_steps),
+            shift=shift,
+        )
+
     def _run_self_forced_rollout(
         self,
         tokenized_map: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
+        anchor_offsets: list[int],
     ) -> Dict[str, Tensor]:
         """실제 inference와 같은 규칙으로 N초 committed self-rollout을 만듭니다.
+
+        anchor offset이 여러 개면 (scene × anchor) 복제 입력을 만들어 한 번의
+        rollout 호출로 모든 GT 시작점을 병렬 실행합니다. map은 한 번만 인코딩하고
+        feature만 복제합니다.
 
         Args:
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
+            anchor_offsets: 사용할 anchor offset 목록입니다.
 
         Returns:
             Dict[str, Tensor]: closed-loop rollout 결과입니다. ``pred_traj_10hz`` 와
-            ``pred_head_10hz`` 는 실제로 commit된 N초 rollout입니다. random-s 학습이 켜져
-            있으면 DDP 전체 rank가 공유한 ``s`` 와 tau 구간도 함께 들어갑니다.
+            ``pred_head_10hz`` 는 실제로 commit된 N초 rollout이며, multi-anchor면
+            행이 anchor-major(``n_selected * n_agent``)로 펼쳐져 있습니다.
+            random-s 학습이 켜져 있으면 DDP 전체 rank가 공유한 ``s`` 와 tau 구간도
+            함께 들어갑니다.
         """
         encoder_modes = self._switch_module_to_eval_preserving_modes(self.encoder)
         try:
             map_feature = self.encoder.encode_map(tokenized_map)
-            rollout_cache = self.encoder.prepare_training_rollout_cache(tokenized_agent, map_feature)
+            rollout_agent = replicate_tokenized_agent_for_anchors(
+                tokenized_agent=tokenized_agent,
+                anchor_offsets=anchor_offsets,
+            )
+            rollout_map_feature = replicate_map_feature_for_anchors(
+                map_feature=map_feature,
+                num_graphs=int(tokenized_agent["num_graphs"]),
+                num_selected_anchors=len(anchor_offsets),
+            )
+            rollout_cache = self.encoder.prepare_training_rollout_cache(
+                rollout_agent,
+                rollout_map_feature,
+            )
             return self.encoder.training_rollout_from_cache(
                 rollout_cache=rollout_cache,
-                tokenized_agent=tokenized_agent,
-                map_feature=map_feature,
+                tokenized_agent=rollout_agent,
+                map_feature=rollout_map_feature,
                 sampling_scheme=self.self_forced_sampling,
                 rollout_steps_2hz=self._get_self_forced_rollout_steps_2hz(),
                 self_forced_epoch=int(self.current_epoch),
@@ -2370,37 +2436,69 @@ class SMARTFlow(LightningModule):
         self,
         rollout: Dict[str, Tensor],
         tokenized_agent: Dict[str, Tensor],
+        anchor_offsets: list[int],
     ) -> tuple[Tensor, Tensor]:
-        """committed rollout을 첫 anchor 기준 packed N초 flow state로 변환합니다.
+        """committed rollout을 anchor 원점 기준 packed N초 flow state로 변환합니다.
 
         Args:
-            rollout: ``_run_self_forced_rollout`` 의 출력입니다.
-            tokenized_agent: 평가 모드 agent token 사전입니다.
+            rollout: ``_run_self_forced_rollout`` 의 출력입니다. multi-anchor면
+                행이 anchor-major(``n_selected * n_agent``)로 펼쳐져 있습니다.
+            tokenized_agent: 평가 모드 agent token 사전입니다(복제 전 원본).
+            anchor_offsets: 사용한 anchor offset 목록입니다.
 
         Returns:
-            tuple[Tensor, Tensor]: packed flow state와 agent mask입니다.
-                pose-space shape은 ``[n_valid_agent, F_win, 4]`` 이고,
-                control-space shape은 ``[n_valid_agent, F_win, 3]`` 이며,
-                mask shape은 ``[n_agent]`` 입니다.
+            tuple[Tensor, Tensor]: packed flow state와 (agent, anchor) mask입니다.
+                pose-space shape은 ``[n_valid, F_win, 4]`` 이고,
+                control-space shape은 ``[n_valid, F_win, 3]`` 이며,
+                mask shape은 ``[n_agent, n_selected]`` 입니다. packing 순서는
+                decoder ``_pack_anchor_hidden`` 과 같은 anchor-major입니다.
 
         Notes:
             random terminal N은 self-rollout을 어디에서 끊을지만 정합니다.
             이후 generated estimator 학습과 generator update의 noising tau는
             여기서 전달하지 않습니다.
         """
-        anchor_mask = get_anchor0_valid_mask(tokenized_agent)
-        committed_path_norm = build_anchor0_normalized_committed_path(
+        if "flow_eval_mask" in tokenized_agent:
+            anchor_mask = build_multi_anchor_mask(
+                flow_eval_mask=tokenized_agent["flow_eval_mask"],
+                anchor_offsets=anchor_offsets,
+            )
+        else:
+            if list(anchor_offsets) != [0]:
+                raise ValueError(
+                    "Multi-anchor self-forced rollout requires flow_eval_mask, "
+                    f"got anchor_offsets={list(anchor_offsets)}."
+                )
+            anchor_mask = get_anchor0_valid_mask(tokenized_agent).view(-1, 1)
+
+        # anchor별 frame 원점(ctx slot 1+k)을 rollout 행 순서(anchor-major)로 폅니다.
+        current_pos, current_head = build_anchor_current_pose(
+            tokenized_agent=tokenized_agent,
+            anchor_offsets=anchor_offsets,
+        )
+        current_pos_rows = current_pos.transpose(0, 1).reshape(-1, 2)
+        current_head_rows = current_head.transpose(0, 1).reshape(-1)
+        committed_path_norm = build_anchor_normalized_committed_path(
             pred_traj_10hz=rollout["pred_traj_10hz"],
             pred_head_10hz=rollout["pred_head_10hz"],
-            tokenized_agent=tokenized_agent,
+            current_pos=current_pos_rows,
+            current_head=current_head_rows,
             flow_window_steps=self.flow_window_steps,
         )
-        packed_path_norm = committed_path_norm[anchor_mask]
+        packed_path_norm = pack_replicated_rows(committed_path_norm, anchor_mask)
         if self.use_kinematic_control_flow:
-            packed_path_norm = build_anchor0_normalized_committed_control(
+            packed_path_norm = build_packed_normalized_committed_control(
                 committed_path_norm=packed_path_norm,
-                tokenized_agent=tokenized_agent,
-                anchor_mask=anchor_mask,
+                agent_type=pack_anchor_invariant(tokenized_agent["type"], anchor_mask).to(
+                    device=packed_path_norm.device
+                ),
+                agent_length=(
+                    pack_anchor_invariant(tokenized_agent["shape"][:, 0], anchor_mask).to(
+                        device=packed_path_norm.device
+                    )
+                    if "shape" in tokenized_agent
+                    else None
+                ),
                 pos_scale_m=self.encoder.agent_encoder.control_pos_scale_m,
                 vehicle_yaw_scale_rad=self.encoder.agent_encoder.control_vehicle_yaw_scale_rad,
                 pedestrian_yaw_scale_rad=self.encoder.agent_encoder.control_pedestrian_yaw_scale_rad,
@@ -2418,6 +2516,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_offsets: list[int],
         *,
         has_committed_path_global: bool | None = None,
     ) -> Tensor:
@@ -2427,10 +2526,11 @@ class SMARTFlow(LightningModule):
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 N초 self-forced flow state입니다.
-                pose-space에서는 ``[n_valid_agent, F_win, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, F_win, 3]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
-                shape은 ``[n_agent]`` 입니다.
+                pose-space에서는 ``[n_valid, F_win, 4]`` 이고,
+                control-space에서는 ``[n_valid, F_win, 3]`` 입니다.
+            anchor_mask: 유효 (agent, anchor) mask입니다.
+                shape은 ``[n_agent, n_selected]`` 입니다.
+            anchor_offsets: 사용하는 anchor offset 목록입니다.
             has_committed_path_global: DDP 전체 rank 기준으로 self-forced path가 하나라도
                 있는지입니다. 값이 없으면 이 함수 안에서 동기화합니다.
 
@@ -2491,6 +2591,7 @@ class SMARTFlow(LightningModule):
                             noisy_path_norm=noisy_path_norm,
                             tau=tau,
                             anchor_mask=estimator_anchor_mask,
+                            anchor_offsets=anchor_offsets,
                         )
                         last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
                     else:
@@ -2519,6 +2620,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_offsets: list[int],
     ) -> Tensor:
         """clean-DMD 방향을 고정된 평가자 출력으로 계산합니다.
 
@@ -2526,10 +2628,11 @@ class SMARTFlow(LightningModule):
             tokenized_map: map token 사전입니다.
             tokenized_agent: agent token 사전입니다.
             committed_path_norm: Generator가 closed-loop로 실제 실행한 self-forced flow state입니다.
-                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
-            anchor_mask: 첫 anchor 기준으로 유효한 agent mask입니다.
-                shape은 ``[n_agent]`` 입니다.
+                pose-space에서는 ``[n_valid, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid, flow_window_steps, 3]`` 입니다.
+            anchor_mask: 유효 (agent, anchor) mask입니다.
+                shape은 ``[n_agent, n_selected]`` 입니다.
+            anchor_offsets: 사용하는 anchor offset 목록입니다.
 
         Returns:
             Tensor: 현재 committed path에 더할 정규화된 DMD 방향입니다.
@@ -2561,6 +2664,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                anchor_offsets=anchor_offsets,
             )
             generated_pred = self._predict_path_flow_clean_estimate(
                 decoder=self.self_forced_generated_estimator,
@@ -2569,6 +2673,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                anchor_offsets=anchor_offsets,
             )
             # 비보행자 delta_n(control ch1)은 trajectory에 영향 없는 죽은 채널이므로
             # DMD direction 에서 제외(0)한다.  control-space(3d)에서만 적용.
@@ -2604,6 +2709,10 @@ class SMARTFlow(LightningModule):
     ) -> Tensor | None:
         """control-space DMD direction 에서 비보행자 delta_n(ch1)을 0으로 만드는 mask.
 
+        Args:
+            anchor_mask: 유효 (agent, anchor) mask입니다.
+                shape은 ``[n_agent, n_selected]`` 입니다.
+
         Returns:
             ``[n_valid, 1, C]`` mask 또는 (pose-space 등) None.
         """
@@ -2613,7 +2722,9 @@ class SMARTFlow(LightningModule):
             return None
         from src.smart.modules.kinematic_control import PEDESTRIAN_TYPE_ID
 
-        agent_type = tokenized_agent["type"][anchor_mask].to(device=reference.device)
+        agent_type = pack_anchor_invariant(tokenized_agent["type"], anchor_mask).to(
+            device=reference.device
+        )
         if int(agent_type.shape[0]) != int(reference.shape[0]):
             return None
         if bool(self.encoder.agent_encoder.use_holonomic_model_only):
@@ -2676,6 +2787,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_offsets: list[int],
     ) -> tuple[Tensor, Tensor]:
         """같은 noisy path에서 teacher와 generated estimator의 clean 예측을 구합니다.
 
@@ -2683,10 +2795,11 @@ class SMARTFlow(LightningModule):
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 self-forced flow state입니다.
-                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
-                shape은 ``[n_agent]`` 입니다.
+                pose-space에서는 ``[n_valid, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid, flow_window_steps, 3]`` 입니다.
+            anchor_mask: 유효 (agent, anchor) mask입니다.
+                shape은 ``[n_agent, n_selected]`` 입니다.
+            anchor_offsets: 사용하는 anchor offset 목록입니다.
 
         Returns:
             tuple[Tensor, Tensor]: ``target_clean_norm`` 과 ``generated_clean_norm`` 입니다.
@@ -2710,6 +2823,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                anchor_offsets=anchor_offsets,
             )
             generated_pred = self._predict_path_flow_clean_estimate(
                 decoder=self.self_forced_generated_estimator,
@@ -2718,6 +2832,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                anchor_offsets=anchor_offsets,
             )
 
         if hasattr(self, "_assert_self_forced_generator_update_isolated"):
@@ -2730,6 +2845,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_offsets: list[int],
     ) -> Tensor:
         """Self-forced rollout path에 SiD-lite loss를 계산합니다.
 
@@ -2737,10 +2853,11 @@ class SMARTFlow(LightningModule):
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 self-forced flow state ``X`` 입니다.
-                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
-                shape은 ``[n_agent]`` 입니다.
+                pose-space에서는 ``[n_valid, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid, flow_window_steps, 3]`` 입니다.
+            anchor_mask: 유효 (agent, anchor) mask입니다.
+                shape은 ``[n_agent, n_selected]`` 입니다.
+            anchor_offsets: 사용하는 anchor offset 목록입니다.
 
         Returns:
             Tensor: scalar SiD-lite loss입니다. shape은 ``[]`` 입니다.
@@ -2750,6 +2867,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            anchor_offsets=anchor_offsets,
         )
         self._set_self_forced_backward_context(
             committed_path_norm=committed_path_norm,
@@ -2770,6 +2888,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        anchor_offsets: list[int],
     ) -> Tensor:
         """설정에 따라 DMD-style 또는 SiD-style generator loss를 계산합니다.
 
@@ -2777,10 +2896,11 @@ class SMARTFlow(LightningModule):
             tokenized_map: 평가 모드 map token 사전입니다.
             tokenized_agent: 평가 모드 agent token 사전입니다.
             committed_path_norm: Generator가 실제로 실행한 self-forced flow state입니다.
-                pose-space에서는 ``[n_valid_agent, flow_window_steps, 4]`` 이고,
-                control-space에서는 ``[n_valid_agent, flow_window_steps, 3]`` 입니다.
-            anchor_mask: 첫 anchor에서 사용할 agent mask입니다.
-                shape은 ``[n_agent]`` 입니다.
+                pose-space에서는 ``[n_valid, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid, flow_window_steps, 3]`` 입니다.
+            anchor_mask: 유효 (agent, anchor) mask입니다.
+                shape은 ``[n_agent, n_selected]`` 입니다.
+            anchor_offsets: 사용하는 anchor offset 목록입니다.
 
         Returns:
             Tensor: scalar 분포 맞춤 loss입니다. shape은 ``[]`` 입니다.
@@ -2791,6 +2911,7 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent,
                 committed_path_norm=committed_path_norm,
                 anchor_mask=anchor_mask,
+                anchor_offsets=anchor_offsets,
             )
 
         path_delta = self._compute_self_forced_direction(
@@ -2798,6 +2919,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            anchor_offsets=anchor_offsets,
         )
         target_path_norm = (committed_path_norm + self.self_forced_path_step_size * path_delta).detach()
         self._set_self_forced_backward_context(
@@ -2961,6 +3083,7 @@ class SMARTFlow(LightningModule):
             )
 
         tokenized_map_eval, tokenized_agent_eval = self._build_eval_tokenized_inputs(data)
+        anchor_offsets = self._get_self_forced_anchor_offsets(tokenized_agent_eval)
         warmup_active = self._is_self_forced_estimator_warmup_active()
         if self.self_forced_warmup_zone_steps > 0 and self.self_forced_joint_zone_steps > 0:
             # 반복 zone 스케줄이 켜졌을 때만 zone 상태를 기록합니다(1=warmup, 0=joint).
@@ -2988,13 +3111,22 @@ class SMARTFlow(LightningModule):
         self._epoch_boundary_trace("sf_rollout:start", generator_step=int(bool(is_generator_step)))
         if warmup_active or not is_generator_step:
             with torch.no_grad():
-                rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+                rollout = self._run_self_forced_rollout(
+                    tokenized_map_eval,
+                    tokenized_agent_eval,
+                    anchor_offsets=anchor_offsets,
+                )
         else:
-            rollout = self._run_self_forced_rollout(tokenized_map_eval, tokenized_agent_eval)
+            rollout = self._run_self_forced_rollout(
+                tokenized_map_eval,
+                tokenized_agent_eval,
+                anchor_offsets=anchor_offsets,
+            )
         self._epoch_boundary_trace("sf_rollout:end", generator_step=int(bool(is_generator_step)))
         committed_path_norm, anchor_mask = self._pack_self_forced_committed_rollout(
             rollout=rollout,
             tokenized_agent=tokenized_agent_eval,
+            anchor_offsets=anchor_offsets,
         )
         has_committed_path_local = committed_path_norm.numel() > 0
         self._epoch_boundary_trace(
@@ -3072,6 +3204,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent_eval,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            anchor_offsets=anchor_offsets,
             has_committed_path_global=has_committed_path_global,
         )
         self._epoch_boundary_trace("sf_estimator_update:end")
@@ -3094,6 +3227,7 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent_eval,
                 committed_path_norm=committed_path_norm,
                 anchor_mask=anchor_mask,
+                anchor_offsets=anchor_offsets,
             )
         else:
             sf_loss = self._build_trainable_connected_zero_loss(self.encoder)
@@ -3145,6 +3279,7 @@ class SMARTFlow(LightningModule):
         self.log("train/sf_is_generator_step", 1.0, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
         self.log("train/sf_generated_estimator_loss", gen_estimator_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_fm_enabled", float(self.self_forced_use_anchor_fm_loss), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
+        self.log("train/sf_num_start_anchors", float(len(anchor_offsets)), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_loss", anchor_loss.detach(), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         self.log("train/sf_anchor_weight", float(self.self_forced_anchor_weight), on_step=False, on_epoch=True, sync_dist=True, batch_size=1)
         if "sf_terminal_s_by_scenario" in rollout:
