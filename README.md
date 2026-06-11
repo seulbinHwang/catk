@@ -4081,6 +4081,22 @@ fm-sf-3 H100 8GPU 기준 기본 시작 batch는 per-rank `72`입니다. CUDA OOM
 full-epoch 초반 peak가 약 `72.7GB / 81.6GB`까지 올라 안정권으로 보지 않았고, `bs=72`는 full-epoch
 검증에서 약 `67.8GB / 81.6GB` 수준의 관측 peak로 더 보수적인 기본값입니다.
 
+fm-sf-5 H100 8GPU에서는 testas gradually-see resume recipe와 같은 설정에서 closed-loop stage 길이만
+`trainer.max_closed_loop_epochs=10`으로 늘린 비교 실험을 아래 launcher로 실행합니다. t=0 stage는
+기존처럼 5 epoch이고, 추가 closed-loop stage 4개가 각각 10 epoch씩 실행되어 총 길이는
+`5 + 4 * 10 = 45` epoch입니다.
+
+```bash
+python scripts/launch_closed_loop_self_forced_h100x8_fmsf5_gradually_see_maxcl10_static_pod.py --replace
+```
+
+fm-sf-4 H100 8GPU에서는 같은 max-closed-loop-epochs=10 resume recipe에서
+`closed_loop_see_all=false`만 비교하려면 아래 launcher를 사용합니다.
+
+```bash
+python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_seeall_false_maxcl10_static_pod.py --replace
+```
+
 기존 epoch별 random subset 모드로 되돌리려면 아래처럼 override합니다.
 
 ```bash
