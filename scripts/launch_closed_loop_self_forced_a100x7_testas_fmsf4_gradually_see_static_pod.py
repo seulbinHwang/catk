@@ -28,7 +28,6 @@ DEFAULT_EXTRA_OVERRIDES = " ".join(
         "model.model_config.self_forced.project_dmd_to_pose_space=false",
         "model.model_config.self_forced.dmd_use_stable_scale_filter=true",
         "model.model_config.self_forced.dmd_stable_scale_scope=agent",
-        "model.model_config.self_forced.rollout_anchor_stride=1",
         "model.model_config.self_forced.closed_loop_sf_global_max_step=4",
         "model.model_config.self_forced.closed_loop_sf_local_max_step=4",
         "model.model_config.self_forced.closed_loop_see_all=true",
