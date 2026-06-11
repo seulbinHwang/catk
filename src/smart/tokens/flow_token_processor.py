@@ -347,6 +347,15 @@ class FlowTokenProcessor(TokenProcessor):
             )
 
         tokenized_agent.update(
+            self._build_anchor_rollout_init_states(
+                data=data,
+                valid=valid,
+                pos=pos,
+                heading=heading,
+                raw_current_steps=raw_current_steps,
+            )
+        )
+        tokenized_agent.update(
             {
                 "flow_eval_mask": flow_eval_mask,
                 "flow_eval_clean_norm": self._concat_flow_chunks(
@@ -373,6 +382,53 @@ class FlowTokenProcessor(TokenProcessor):
             }
         )
         return tokenized_agent
+
+    def _build_anchor_rollout_init_states(
+        self,
+        data: HeteroData,
+        valid: Tensor,
+        pos: Tensor,
+        heading: Tensor,
+        raw_current_steps: List[int],
+    ) -> Dict[str, Tensor]:
+        """anchor별 self-forced rollout 초기 10Hz 상태를 한 번에 만듭니다.
+
+        anchor k는 10Hz raw step ``shift*(k+2)`` 를 현재 시점으로 쓰는 시작점입니다.
+        기존 anchor0 전용 ``rollout_init_fine_*`` 와 같은 규칙(최근 ``shift+1`` 개
+        fine 상태)을 모든 anchor에 대해 batched gather로 계산합니다.
+        마지막 두 fine 상태가 기존 ``rollout_init_fine_*_pair`` 에 해당합니다.
+
+        Args:
+            data: 원본 장면 배치입니다. z 좌표를 읽는 데 씁니다.
+            valid: 전체 유효 여부입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            pos: 전체 중심점입니다. shape은 ``[n_agent, n_step, 2]`` 입니다.
+            heading: 전체 방향입니다. shape은 ``[n_agent, n_step]`` 입니다.
+            raw_current_steps: anchor별 현재 10Hz raw step 목록입니다.
+
+        Returns:
+            Dict[str, Tensor]:
+                - ``sf_anchor_fine_pos_history``: ``[n_agent, n_anchor, shift+1, 2]``
+                - ``sf_anchor_fine_head_history``: ``[n_agent, n_anchor, shift+1]``
+                - ``sf_anchor_fine_valid_history``: ``[n_agent, n_anchor, shift+1]``
+                - ``sf_anchor_z``: anchor 시점 z 좌표입니다. ``[n_agent, n_anchor]``
+        """
+        device = pos.device
+        num_raw_steps = pos.shape[1]
+        anchor_raw_steps = torch.tensor(
+            raw_current_steps,
+            device=device,
+            dtype=torch.long,
+        ).clamp(max=num_raw_steps - 1)
+        history_offsets = torch.arange(-self.shift, 1, device=device, dtype=torch.long)
+        # history_idx: [n_anchor, shift+1]. 기록이 부족하면 가장 앞 상태를 반복하는
+        # 기존 pad 규칙과 같도록 0으로 clamp합니다.
+        history_idx = (anchor_raw_steps.view(-1, 1) + history_offsets.view(1, -1)).clamp(min=0)
+        return {
+            "sf_anchor_fine_pos_history": pos[:, history_idx],
+            "sf_anchor_fine_head_history": heading[:, history_idx],
+            "sf_anchor_fine_valid_history": valid[:, history_idx],
+            "sf_anchor_z": data["agent"]["position"][:, anchor_raw_steps, 2],
+        }
 
     def _build_kinematic_flow_train_targets_batched(
         self,
