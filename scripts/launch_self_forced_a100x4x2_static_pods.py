@@ -112,14 +112,17 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
         export_line("LOG_DIR", args.log_dir),
         export_line("RUN_ROOT", run_root(args)),
         export_line("RETRY_STATE_DIR", f"{run_root(args)}/retry_state"),
+        export_line("INITIAL_ACTION", args.initial_action),
     ]
     optional = {
         "CATK_LR": args.learning_rate,
         "CATK_GENERATED_ESTIMATOR_LR": args.generated_estimator_learning_rate,
+        "CATK_LR_COSINE_FINAL_RATIO": args.lr_cosine_final_ratio,
         "DECODER_USE_STOP_MOTION": args.decoder_use_stop_motion,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
         "MAX_EPOCHS": args.max_epochs,
+        "CHECK_VAL_EVERY_N_EPOCH": args.check_val_every_n_epoch,
         "TRAIN_EPOCH_SAMPLE_FRACTION": args.train_epoch_sample_fraction,
         "TRAIN_MEMORY_BALANCED_BATCHES": args.train_memory_balanced_batches,
         "CATK_EXTRA_OVERRIDES": args.extra_hydra_overrides,
@@ -167,7 +170,7 @@ ESTIMATOR_WARMUP_BANK_LR=""
 echo "[self-forced-a100x4x2] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
 echo "[self-forced-a100x4x2] started at $(date '+%F %T')"
 echo "[self-forced-a100x4x2] experiment=${{EXPERIMENT}} bs=${{INITIAL_BS}} precision=${{PRECISION}}"
-echo "[self-forced-a100x4x2] lr=${{CATK_LR:-preset}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
+echo "[self-forced-a100x4x2] lr=${{CATK_LR:-preset}} lr_cosine_final_ratio=${{CATK_LR_COSINE_FINAL_RATIO:-preset}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
 echo "[self-forced-a100x4x2] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
 echo "[self-forced-a100x4x2] pretrain_ckpt=${{PRETRAIN_CKPT}}"
 echo "[self-forced-a100x4x2] attach survives after exit; press Ctrl-b d to detach"
@@ -637,7 +640,10 @@ resolve_attempt_plan() {{
         plan_message="failed_to_hash_resume_checkpoint"
       fi
     else
-      action="finetune"
+      action="${{INITIAL_ACTION:-auto}}"
+      if [[ -z "$action" || "$action" == "auto" ]]; then
+        action="finetune"
+      fi
       ckpt_path="$PRETRAIN_CKPT"
     fi
     {{
@@ -779,8 +785,8 @@ find_latest_self_forced_ckpt() {{
 
 strip_shell_quotes() {{
   local value="$1"
-  value="${{value%\"}}"
-  value="${{value#\"}}"
+  value="${{value%\\\"}}"
+  value="${{value#\\\"}}"
   value="${{value%\'}}"
   value="${{value#\'}}"
   printf '%s\n' "$value"
@@ -1092,6 +1098,9 @@ while (( bs >= MIN_BS )); do
   if [[ -n "${{CATK_LR:-}}" ]]; then
     torchrun_args+=(model.model_config.lr="$CATK_LR")
   fi
+  if [[ -n "${{CATK_LR_COSINE_FINAL_RATIO:-}}" ]]; then
+    torchrun_args+=(model.model_config.self_forced.lr_cosine_final_ratio="$CATK_LR_COSINE_FINAL_RATIO")
+  fi
   if [[ -n "${{DECODER_USE_STOP_MOTION:-}}" ]]; then
     torchrun_args+=(model.model_config.decoder.use_stop_motion="$DECODER_USE_STOP_MOTION")
   fi
@@ -1103,6 +1112,9 @@ while (( bs >= MIN_BS )); do
   fi
   if [[ -n "${{MAX_EPOCHS:-}}" ]]; then
     torchrun_args+=(trainer.max_epochs="$MAX_EPOCHS")
+  fi
+  if [[ -n "${{CHECK_VAL_EVERY_N_EPOCH:-}}" ]]; then
+    torchrun_args+=(trainer.check_val_every_n_epoch="$CHECK_VAL_EVERY_N_EPOCH")
   fi
   if [[ -n "${{TRAIN_EPOCH_SAMPLE_FRACTION:-}}" ]]; then
     torchrun_args+=(data.train_epoch_sample_fraction="$TRAIN_EPOCH_SAMPLE_FRACTION")
@@ -1422,15 +1434,30 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(use_estimator_warmup_bank=True)
     parser.add_argument("--self-forced-use-stop-motion", default="false")
     parser.add_argument("--decoder-use-stop-motion", default="")
+    parser.add_argument(
+        "--initial-action",
+        choices=("auto", "finetune", "fit"),
+        default="auto",
+        help=(
+            "Action to use when no task checkpoint exists yet. Default auto keeps "
+            "the historical finetune behavior; use fit for full Lightning checkpoint resumes."
+        ),
+    )
     parser.add_argument("--learning-rate", default="1.0e-6")
     parser.add_argument(
         "--generated-estimator-learning-rate",
         default="",
         help="Generated-estimator optimizer lr. Defaults to --learning-rate via model config.",
     )
+    parser.add_argument(
+        "--lr-cosine-final-ratio",
+        default="",
+        help="Optional final cosine LR multiplier override for self-forced optimizers.",
+    )
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
     parser.add_argument("--max-epochs", default="")
+    parser.add_argument("--check-val-every-n-epoch", default="")
     parser.add_argument("--train-epoch-sample-fraction", default="")
     parser.add_argument("--train-memory-balanced-batches", default="true")
     parser.add_argument("--extra-hydra-overrides", default="")
@@ -1443,10 +1470,10 @@ def parse_args() -> argparse.Namespace:
 
     if args.stop:
         return args
-    if len(args.pods) != 2:
-        parser.error("--pods must contain exactly two pods for the A100x4x2 preset")
-    if args.nproc_per_node != 4:
-        parser.error("--nproc-per-node must be 4 for the A100x4x2 preset")
+    if len(args.pods) < 1:
+        parser.error("--pods must contain at least one pod")
+    if args.nproc_per_node < 1:
+        parser.error("--nproc-per-node must be >= 1")
     if args.initial_bs < 1:
         parser.error("--initial-bs must be >= 1")
     if args.oom_step < 1:
