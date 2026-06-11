@@ -501,6 +501,7 @@ class SMARTFlow(LightningModule):
         self._self_forced_original_check_val_every_n_epoch: int | None = None
         self._self_forced_validation_schedule_captured = False
         self._closed_loop_sf_base_generator_epochs: int | None = None
+        self._closed_loop_sf_stage_generator_epochs: int | None = None
         self._closed_loop_sf_stage_warmup_epochs: int = (
             int(self._self_forced_requested_estimator_warmup_epochs)
         )
@@ -2267,8 +2268,11 @@ class SMARTFlow(LightningModule):
         """현재 epoch이 속한 closed-loop stage와 stage 내부 위치를 계산합니다."""
         if int(self.closed_loop_sf_global_max_step) <= 0:
             return 0, -1
-        base_epochs = self._closed_loop_sf_base_generator_epochs
-        if base_epochs is None or int(base_epochs) <= 0:
+        initial_generator_epochs = self._closed_loop_sf_base_generator_epochs
+        stage_generator_epochs = self._closed_loop_sf_stage_generator_epochs
+        if initial_generator_epochs is None or int(initial_generator_epochs) <= 0:
+            return 0, -1
+        if stage_generator_epochs is None or int(stage_generator_epochs) <= 0:
             return 0, -1
 
         current_epoch = int(self.current_epoch)
@@ -2276,14 +2280,14 @@ class SMARTFlow(LightningModule):
             int(self.self_forced_start_epoch)
             + int(self.self_forced_estimator_warmup_epochs)
         )
-        initial_generator_end = initial_generator_start + int(base_epochs)
+        initial_generator_end = initial_generator_start + int(initial_generator_epochs)
         if current_epoch < initial_generator_start:
             return 0, current_epoch - initial_generator_start
         if current_epoch < initial_generator_end:
             return 0, current_epoch - initial_generator_start
 
         stage_warmup_epochs = int(self._get_closed_loop_sf_stage_warmup_epochs())
-        stage_block_epochs = stage_warmup_epochs + int(base_epochs)
+        stage_block_epochs = stage_warmup_epochs + int(stage_generator_epochs)
         if stage_block_epochs <= 0:
             return 0, -1
         relative_epoch = current_epoch - initial_generator_end
@@ -2310,10 +2314,10 @@ class SMARTFlow(LightningModule):
 
     def _get_closed_loop_sf_stage_total_epochs(self) -> int:
         """현재 closed-loop stage 하나에 배정된 총 epoch 수를 반환합니다."""
-        base_epochs = self._closed_loop_sf_base_generator_epochs
-        if base_epochs is None:
+        stage_generator_epochs = self._closed_loop_sf_stage_generator_epochs
+        if stage_generator_epochs is None:
             return 0
-        return int(self._get_closed_loop_sf_stage_warmup_epochs()) + int(base_epochs)
+        return int(self._get_closed_loop_sf_stage_warmup_epochs()) + int(stage_generator_epochs)
 
     def _get_closed_loop_sf_gradual_local_max_step(self) -> int:
         """gradually_see curriculum에서 현재 epoch에 열린 local prefix upper bound입니다."""
@@ -2349,23 +2353,27 @@ class SMARTFlow(LightningModule):
             return current_epoch - initial_generator_start + 1
 
         base_epochs = int(base_epochs)
+        stage_generator_epochs = self._closed_loop_sf_stage_generator_epochs
+        if stage_generator_epochs is None or int(stage_generator_epochs) <= 0:
+            stage_generator_epochs = base_epochs
+        stage_generator_epochs = int(stage_generator_epochs)
         initial_generator_end = initial_generator_start + base_epochs
         if current_epoch < initial_generator_end:
             return current_epoch - initial_generator_start + 1
 
         stage_warmup_epochs = int(self._get_closed_loop_sf_stage_warmup_epochs())
-        stage_block_epochs = stage_warmup_epochs + base_epochs
+        stage_block_epochs = stage_warmup_epochs + stage_generator_epochs
         if stage_block_epochs <= 0:
             return base_epochs
 
         relative_epoch = current_epoch - initial_generator_end
         completed_stage_blocks = relative_epoch // stage_block_epochs
         stage_position = relative_epoch % stage_block_epochs
-        generator_epoch_count = base_epochs + completed_stage_blocks * base_epochs
+        generator_epoch_count = base_epochs + completed_stage_blocks * stage_generator_epochs
         if stage_position >= stage_warmup_epochs:
             generator_epoch_count += min(
                 stage_position - stage_warmup_epochs + 1,
-                base_epochs,
+                stage_generator_epochs,
             )
         return int(generator_epoch_count)
 
@@ -2389,6 +2397,21 @@ class SMARTFlow(LightningModule):
             configured_max_epochs = getattr(fit_loop, "max_epochs", None)
         if configured_max_epochs is None or int(configured_max_epochs) < 0:
             return
+        configured_max_epochs = int(configured_max_epochs)
+        configured_max_closed_loop_epochs = getattr(
+            trainer,
+            "max_closed_loop_epochs",
+            configured_max_epochs,
+        )
+        if configured_max_closed_loop_epochs is None:
+            configured_max_closed_loop_epochs = configured_max_epochs
+        configured_max_closed_loop_epochs = int(configured_max_closed_loop_epochs)
+        if configured_max_closed_loop_epochs <= 0:
+            raise ValueError(
+                "trainer.max_closed_loop_epochs must be positive when "
+                "closed_loop_sf_global_max_step is enabled, "
+                f"got {configured_max_closed_loop_epochs}."
+            )
 
         initial_warmup_epochs = int(self.self_forced_estimator_warmup_epochs)
         stage_warmup_epochs = int(
@@ -2405,12 +2428,21 @@ class SMARTFlow(LightningModule):
         base_generator_epochs = int(configured_max_epochs) - generator_start_epoch
         if base_generator_epochs <= 0:
             return
+        stage_generator_epochs = int(configured_max_closed_loop_epochs) - int(stage_warmup_epochs)
+        if stage_generator_epochs <= 0:
+            raise ValueError(
+                "trainer.max_closed_loop_epochs must be greater than the "
+                "closed-loop stage warmup epochs so each closed-loop stage has "
+                "at least one generator epoch, got "
+                f"max_closed_loop_epochs={configured_max_closed_loop_epochs}, "
+                f"stage_warmup_epochs={stage_warmup_epochs}."
+            )
         self._closed_loop_sf_base_generator_epochs = int(base_generator_epochs)
+        self._closed_loop_sf_stage_generator_epochs = int(stage_generator_epochs)
         expanded_max_epochs = (
-            generator_start_epoch
-            + int(base_generator_epochs)
+            int(configured_max_epochs)
             + int(self.closed_loop_sf_global_max_step)
-            * (int(stage_warmup_epochs) + int(base_generator_epochs))
+            * int(configured_max_closed_loop_epochs)
         )
         if expanded_max_epochs <= int(configured_max_epochs):
             return
@@ -2427,6 +2459,8 @@ class SMARTFlow(LightningModule):
             "[self-forced-closed-loop] expanded trainer max_epochs "
             f"{int(configured_max_epochs)} -> {int(expanded_max_epochs)}; "
             f"base_generator_epochs={int(base_generator_epochs)} "
+            f"closed_loop_stage_epochs={int(configured_max_closed_loop_epochs)} "
+            f"closed_loop_generator_epochs={int(stage_generator_epochs)} "
             f"initial_warmup_epochs={int(initial_warmup_epochs)} "
             f"stage_warmup_epochs={int(stage_warmup_epochs)} "
             f"global_max_step={int(self.closed_loop_sf_global_max_step)}"

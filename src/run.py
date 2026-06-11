@@ -62,6 +62,45 @@ def _is_self_forced_enabled(cfg: DictConfig) -> bool:
     return bool(self_forced_cfg and self_forced_cfg.get("enabled", False))
 
 
+def _resolve_trainer_max_closed_loop_epochs(cfg: DictConfig) -> int | None:
+    trainer_cfg = cfg.get("trainer")
+    if trainer_cfg is None:
+        return None
+    value = trainer_cfg.get("max_closed_loop_epochs", None)
+    if value is None:
+        value = trainer_cfg.get("max_epochs", None)
+    if value is None:
+        return None
+    resolved = int(value)
+    if resolved <= 0:
+        raise ValueError(
+            "trainer.max_closed_loop_epochs must be positive when set, "
+            f"got {resolved}."
+        )
+    return resolved
+
+
+def _pop_trainer_max_closed_loop_epochs(cfg: DictConfig) -> tuple[bool, Any]:
+    trainer_cfg = cfg.get("trainer")
+    if trainer_cfg is None or "max_closed_loop_epochs" not in trainer_cfg:
+        return False, None
+    with open_dict(trainer_cfg):
+        value = trainer_cfg.pop("max_closed_loop_epochs")
+    return True, value
+
+
+def _restore_trainer_max_closed_loop_epochs(
+    cfg: DictConfig,
+    *,
+    was_present: bool,
+    value: Any,
+) -> None:
+    if not was_present or cfg.get("trainer") is None:
+        return
+    with open_dict(cfg.trainer):
+        cfg.trainer.max_closed_loop_epochs = value
+
+
 def _load_lightning_checkpoint(ckpt_path: str) -> dict[str, Any]:
     checkpoint = torch.load(ckpt_path, map_location="cpu")
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
@@ -294,10 +333,24 @@ def run(cfg: DictConfig) -> None:
     log.info(f"Instantiating loggers...")
     logger: List[Logger] = instantiate_loggers(cfg.get("logger"))
 
+    max_closed_loop_epochs = _resolve_trainer_max_closed_loop_epochs(cfg)
+
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
-    trainer: Trainer = hydra.utils.instantiate(
-        cfg.trainer, callbacks=callbacks, logger=logger
+    max_closed_loop_was_present, max_closed_loop_raw_value = (
+        _pop_trainer_max_closed_loop_epochs(cfg)
     )
+    try:
+        trainer: Trainer = hydra.utils.instantiate(
+            cfg.trainer, callbacks=callbacks, logger=logger
+        )
+    finally:
+        _restore_trainer_max_closed_loop_epochs(
+            cfg,
+            was_present=max_closed_loop_was_present,
+            value=max_closed_loop_raw_value,
+        )
+    if max_closed_loop_epochs is not None:
+        setattr(trainer, "max_closed_loop_epochs", int(max_closed_loop_epochs))
 
     log.info("Logging hyperparameters!")
     log_hyperparameters(
