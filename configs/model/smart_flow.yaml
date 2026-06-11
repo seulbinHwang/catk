@@ -97,7 +97,7 @@ model_config:
     generated_estimator_lr: ${model.model_config.lr}
     # Cosine decay final multiplier for both Generator and generated estimator
     # optimizers over the effective self-forced curriculum length.
-    lr_cosine_final_ratio: 0.01
+    lr_cosine_final_ratio: 1.0
     estimator_updates_per_step: 5
     estimator_warmup_epochs: 0
     closed_loop_sf_global_max_step: 1

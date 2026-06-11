@@ -499,7 +499,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--learning-rate", default="7e-5")
     parser.add_argument("--generated-estimator-learning-rate", default="7e-5")
-    parser.add_argument("--lr-cosine-final-ratio", default="0.01")
+    parser.add_argument("--lr-cosine-final-ratio", default="1.0")
     parser.add_argument("--estimator-warmup-epochs", type=int, default=0)
     parser.add_argument("--max-epochs", type=int, default=5)
     parser.add_argument("--check-val-every-n-epoch", type=int, default=1)

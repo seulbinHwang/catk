@@ -397,9 +397,9 @@ class SMARTFlow(LightningModule):
             else self.lr
         )
         self.self_forced_lr_cosine_final_ratio = (
-            float(getattr(self.self_forced_config, "lr_cosine_final_ratio", 0.01))
+            float(getattr(self.self_forced_config, "lr_cosine_final_ratio", 1.0))
             if self.self_forced_config is not None
-            else 0.01
+            else 1.0
         )
         if not (0.0 < self.self_forced_lr_cosine_final_ratio <= 1.0):
             raise ValueError(

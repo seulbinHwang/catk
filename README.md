@@ -2069,7 +2069,7 @@ kubectl exec -it -n p-pnc testaa -c main -- tmux attach -t catk-pretrain-mixed-h
 - Generated estimator warmup 기본값은 `estimator_warmup_epochs=0` 입니다. self-forcing 시작 직후부터 generated estimator 업데이트와 Generator 업데이트를 같은 train step 안에서 수행합니다.
 - 4x/6x H100 self-forced preset과 OOM retry script는 모두 첫 시도 `data.train_batch_size=36` 을 기본으로 둡니다.
 - self-forced preset은 각 epoch마다 train dataset의 25%만 새로 랜덤 샘플링해 학습합니다. 비율은 `data.train_epoch_sample_fraction` 으로 바꾸며, `1.0` 으로 두면 전체 train dataset을 사용합니다.
-- self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 같은 cosine LR decay를 씁니다. 시작 LR은 각각 `model.model_config.lr`, `model.model_config.self_forced.generated_estimator_lr` 이고, 마지막 실질 self-forced epoch LR은 `model.model_config.self_forced.lr_cosine_final_ratio` 배가 됩니다. 기본값은 `0.01` 입니다. 기준 길이는 단순 `trainer.max_epochs`가 아니라 closed-loop stage 확장과 실제 estimator warmup skip 이후 trainer가 실행하는 self-forced curriculum 전체 epoch입니다.
+- self-forced fine-tuning에서는 Generator optimizer와 generated estimator optimizer 모두 같은 cosine LR decay를 씁니다. 시작 LR은 각각 `model.model_config.lr`, `model.model_config.self_forced.generated_estimator_lr` 이고, 마지막 실질 self-forced epoch LR은 `model.model_config.self_forced.lr_cosine_final_ratio` 배가 됩니다. 기본값은 `1.0` 이라 override하지 않으면 고정 LR처럼 학습합니다. 기준 길이는 단순 `trainer.max_epochs`가 아니라 closed-loop stage 확장과 실제 estimator warmup skip 이후 trainer가 실행하는 self-forced curriculum 전체 epoch입니다.
 - H100x6 차이: `defaults` 에서 `override /trainer: ddp` 를 박아 두고 `trainer.devices=6` 을 고정 → preset 만 줘도 6 GPU DDP 가 가동됩니다 (베이스 `self_forced_npfm.yaml` 은 trainer 를 override 하지 않아 single-process 로 떨어집니다).
 - 새 self-forced fine-tuning 시작을 위해 preset 이 `action=finetune` 을 기본으로 고정합니다. 따라서 `ckpt_path` 는 optimizer/epoch 를 resume하지 않고 pretrained weight만 로드합니다.
 - 전제: `ckpt_path` 에는 같은 `flow_window_steps` 로 pretrain 된 Generator checkpoint 를 넣습니다. 모델 default 는 `flow_window_steps=20` (2초) 이고, ckpt 가 2초 horizon 으로 pretrain 된 경우 override 하지 않는 편이 안전합니다.
@@ -3975,7 +3975,7 @@ K commit block 수 = flow_window_steps / 5
 - committed self-rollout 을 만들 때는 현재 Generator를 eval mode로 잠깐 전환하되 autograd는 유지합니다. 따라서 dropout/history drop 없이 실제 inference 조건의 trajectory를 만들고, 그 trajectory를 통해 `sf_loss` gradient는 그대로 Generator로 흐릅니다.
 - Closed-loop self-forcing curriculum. `closed_loop_sf_global_max_step=A` 가 1 이상이면 기존 t=0 self-forced generator epoch을 끝낸 뒤 추가 closed-loop stage를 A번 더 수행합니다. 각 추가 stage는 요청된 `estimator_warmup_epochs` 만큼의 generated-estimator warmup을 먼저 반복한 뒤, t=0에서 수행한 generator epoch 수만큼 online Generator를 학습합니다. W&B bank hit로 초기 t=0 warmup이 skip되어도 추가 stage warmup은 요청값을 유지합니다. 각 추가 stage 시작 시 validation/test에 쓰는 EMA Generator weight를 online Generator로 복사하고, stale AdamW momentum이 남지 않도록 Generator optimizer state를 reset합니다. `closed_loop_sf_local_max_step=N` 은 0.5초 commit block 기준의 stage 폭입니다. 기본값 `closed_loop_see_all=false` 에서는 기존 동작을 유지합니다. 즉 mini-batch마다 DDP rank 0이 local pre-roll 길이 `M∈[1,N]` 을 하나 샘플해 모든 rank가 공유하고, stage s의 실제 EMA pre-roll 길이는 `(s - 1) * N + M` 입니다. N=4이면 stage 1은 0.5~2.0초, stage 2는 2.5~4.0초, stage 3은 4.5~6.0초 상태에서 self-forcing을 시작합니다. `closed_loop_see_all=true` 로 두면 stage s마다 누적 구간 전체에서 `K∈[0, s*N]` 을 샘플합니다. N=4이면 stage 1은 0~2.0초, stage 2는 0~4.0초, stage 3은 0~6.0초 상태를 모두 볼 수 있습니다. 두 모드 모두 EMA pre-roll은 `torch.no_grad()` 로 한 번의 decoder rollout 호출만 사용하고, 그 이후 generated-estimator warmup 또는 self-forcing loss에 쓰는 rollout은 online Generator로 다시 인코딩해 수행합니다. Warmup epoch에서는 online rollout도 `torch.no_grad()`로 만들어 `F_psi`만 적응시키고, generator 학습 epoch에서는 실제 self-forcing loss gradient가 online Generator로 흐릅니다.
 - Closed-loop stage에서 EMA pre-roll 뒤 `F_rho` / `F_psi` 가 noisy path의 clean estimate를 계산할 때도, 마지막 두 generated state만 따로 축약한 context를 쓰지 않습니다. 대신 pre-roll이 끝난 시점의 validation-like rollout state를 그대로 조건으로 사용합니다. 즉 t=0의 GT history에서 출발해 EMA가 만든 generated trajectory가 누적되고, 모델의 일반 closed-loop context window 밖으로 밀린 오래된 state만 자연스럽게 빠진 동일한 history를 online Generator, generated estimator, teacher가 공유합니다. 이 규칙은 `closed_loop_see_all=false` 와 `closed_loop_see_all=true` 모두에 적용됩니다.
-- Self-forced cosine LR decay. `model.model_config.self_forced.lr_cosine_final_ratio=0.01` 이 기본값입니다. Generator와 generated estimator optimizer는 매 epoch 시작 시 현재 curriculum epoch 위치에 맞는 LR로 갱신됩니다. 예를 들어 `estimator_warmup_epochs=0`, `max_epochs=5`, `closed_loop_sf_global_max_step=4`이면 실질 self-forced 길이는 `25` epoch이고, epoch 0은 시작 LR, epoch 24는 시작 LR의 1%가 됩니다. `action=fit ckpt_path=...` 로 중간 재개해도 checkpoint의 epoch 번호 기준으로 같은 cosine 위치의 LR을 다시 계산합니다.
+- Self-forced cosine LR decay. `model.model_config.self_forced.lr_cosine_final_ratio=1.0` 이 기본값입니다. Generator와 generated estimator optimizer는 매 epoch 시작 시 현재 curriculum epoch 위치에 맞는 LR로 갱신됩니다. 기본값에서는 epoch 0부터 마지막 실질 self-forced epoch까지 시작 LR을 유지합니다. decay를 쓰려면 예를 들어 `0.01` 로 override하면 됩니다. `estimator_warmup_epochs=0`, `max_epochs=5`, `closed_loop_sf_global_max_step=4`, `lr_cosine_final_ratio=0.01`이면 실질 self-forced 길이는 `25` epoch이고, epoch 0은 시작 LR, epoch 24는 시작 LR의 1%가 됩니다. `action=fit ckpt_path=...` 로 중간 재개해도 checkpoint의 epoch 번호 기준으로 같은 cosine 위치의 LR을 다시 계산합니다.
 - `update_open_loop_teacher_when_roll=false` 가 기본값입니다. 기본값에서는 `F_rho` teacher를 pretrained 기준점으로 고정해 자기확증 루프를 피합니다. true로 override하면 closed-loop stage 시작 시 EMA에서 복사된 online Generator weight를 `F_rho` teacher에도 복사합니다.
 - control-space Flow Matching에서는 committed pose rollout을 그대로 `F_psi` / `F_rho` 입력으로 쓰지 않습니다. 실제 실행된 pose trajectory를 첫 anchor 기준 rolling control sequence로 다시 투영한 뒤 generated estimator, teacher, DMD/SiD loss를 모두 3차원 control flow state 위에서 계산합니다. 따라서 rollout은 metric/실행용 pose로 굴러가되, self-forced 분포맞춤 objective는 control-space와 섞이지 않습니다.
 - inference 와 동일한 0.5초 commit/update 규칙을 쓰되 `flow_window_steps / 5` block 만큼만 도는 differentiable training rollout 경로. 학습 중에는 DDP 전체 rank가 random terminal step `s` 를 하나 공유하고, 모든 rank의 scenario/agent와 0.5초 commit block이 같은 `s` 를 씁니다. 실제 실행 step 수는 `K = sample_steps + 1 - s` 이며, terminal 이전 step은 no-grad로 계산하고 terminal clean estimate를 만드는 마지막 step 하나만 gradient를 유지합니다.
@@ -4027,7 +4027,7 @@ model:
       closed_loop_sf_local_max_step: 4
       closed_loop_see_all: false
       update_open_loop_teacher_when_roll: false
-      lr_cosine_final_ratio: 0.01
+      lr_cosine_final_ratio: 1.0
       sampling:
         sample_steps: 16
         sample_method: euler
@@ -4053,7 +4053,7 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf3_static_pod.py \
   --task-name flow_closed_loop_self_forced_h100x8_fmsf3 \
   --learning-rate 7e-5 \
   --generated-estimator-learning-rate 7e-5 \
-  --lr-cosine-final-ratio 0.01 \
+  --lr-cosine-final-ratio 1.0 \
   --estimator-warmup-epochs 0 \
   --max-epochs 5 \
   --closed-loop-sf-global-max-step 3 \
