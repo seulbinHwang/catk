@@ -4097,6 +4097,13 @@ fm-sf-4 H100 8GPU에서는 같은 max-closed-loop-epochs=10 resume recipe에서
 python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_seeall_false_maxcl10_static_pod.py --replace
 ```
 
+fm-sf-6 H100 8GPU에서 같은 `closed_loop_see_all=false` 비교 실험을 한 번 더 실행하려면
+아래 launcher를 사용합니다.
+
+```bash
+python scripts/launch_closed_loop_self_forced_h100x8_fmsf6_seeall_false_maxcl10_static_pod.py --replace
+```
+
 기존 epoch별 random subset 모드로 되돌리려면 아래처럼 override합니다.
 
 ```bash
