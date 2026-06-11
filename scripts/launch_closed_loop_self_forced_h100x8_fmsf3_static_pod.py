@@ -74,6 +74,7 @@ def render_env(args: argparse.Namespace) -> str:
         "TASK_NAME": args.task_name,
         "CACHE_ROOT": args.cache_root,
         "LOG_DIR": args.log_dir,
+        "CKPT_PATH": args.ckpt_path,
         "PRETRAIN_CKPT": args.pretrain_ckpt,
         "WANDB_PRETRAIN_ARTIFACT": args.wandb_pretrain_artifact,
         "WANDB_PRETRAIN_DOWNLOAD_DIR": args.pretrain_download_dir,
@@ -88,6 +89,7 @@ def render_env(args: argparse.Namespace) -> str:
         "LR_COSINE_FINAL_RATIO": args.lr_cosine_final_ratio,
         "ESTIMATOR_WARMUP_EPOCHS": args.estimator_warmup_epochs,
         "MAX_EPOCHS": args.max_epochs,
+        "MAX_CLOSED_LOOP_EPOCHS": args.max_closed_loop_epochs or "",
         "CHECK_VAL_EVERY_N_EPOCH": args.check_val_every_n_epoch,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
@@ -154,6 +156,9 @@ echo "[launcher] experiment=${EXPERIMENT} action=${ACTION} task=${TASK_NAME}"
 echo "[launcher] cuda_visible_devices=${CUDA_VISIBLE_DEVICES} nproc_per_node=${NPROC_PER_NODE}"
 echo "[launcher] closed_loop global=${CLOSED_LOOP_SF_GLOBAL_MAX_STEP} local=${CLOSED_LOOP_SF_LOCAL_MAX_STEP} see_all=${CLOSED_LOOP_SEE_ALL} update_teacher=${UPDATE_OPEN_LOOP_TEACHER_WHEN_ROLL}"
 echo "[launcher] lr=${CATK_LR} generated_estimator_lr=${GENERATED_ESTIMATOR_LR} lr_cosine_final_ratio=${LR_COSINE_FINAL_RATIO}"
+if [[ -n "${MAX_CLOSED_LOOP_EPOCHS}" ]]; then
+  echo "[launcher] max_closed_loop_epochs=${MAX_CLOSED_LOOP_EPOCHS}"
+fi
 echo "[launcher] batch fallback: ${INITIAL_BS} down to ${MIN_BS} by ${OOM_STEP}"
 
 source ~/.bashrc || true
@@ -264,6 +269,9 @@ build_overrides() {
     "model.model_config.self_forced.generated_estimator_skip_warmup_on_load=${GENERATED_ESTIMATOR_SKIP_WARMUP_ON_LOAD}"
     "logger.wandb.offline=${WANDB_OFFLINE}"
   )
+  if [[ -n "${MAX_CLOSED_LOOP_EPOCHS}" ]]; then
+    HYDRA_OVERRIDES+=("trainer.max_closed_loop_epochs=${MAX_CLOSED_LOOP_EPOCHS}")
+  fi
   if [[ "${NUM_WORKERS}" == "0" ]]; then
     HYDRA_OVERRIDES+=("data.persistent_workers=false" "data.prefetch_factor=null")
   else
@@ -271,6 +279,8 @@ build_overrides() {
   fi
   if [[ -n "${resume_ckpt}" ]]; then
     HYDRA_OVERRIDES+=("ckpt_path=${resume_ckpt}")
+  elif [[ -n "${CKPT_PATH}" ]]; then
+    HYDRA_OVERRIDES+=("ckpt_path=${CKPT_PATH}")
   elif [[ "${ACTION}" != "fit" && -n "${PRETRAIN_CKPT}" ]]; then
     HYDRA_OVERRIDES+=("ckpt_path=${PRETRAIN_CKPT}")
   fi
@@ -462,10 +472,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--oom-step must be positive.")
     if args.action != "fit" and not args.pretrain_ckpt and not args.wandb_pretrain_artifact:
         raise SystemExit("finetune/validate/test require --pretrain-ckpt or --wandb-pretrain-artifact.")
+    if args.ckpt_path and args.action != "fit":
+        raise SystemExit("--ckpt-path is intended for action=fit resume runs.")
     if args.closed_loop_sf_global_max_step < 0:
         raise SystemExit("--closed-loop-sf-global-max-step must be >= 0.")
     if args.closed_loop_sf_local_max_step < 1:
         raise SystemExit("--closed-loop-sf-local-max-step must be >= 1.")
+    if args.max_closed_loop_epochs and args.max_closed_loop_epochs < 1:
+        raise SystemExit("--max-closed-loop-epochs must be >= 1.")
     lr_cosine_final_ratio = float(args.lr_cosine_final_ratio)
     if not (0.0 < lr_cosine_final_ratio <= 1.0):
         raise SystemExit("--lr-cosine-final-ratio must be in (0, 1].")
@@ -488,6 +502,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-name", default=DEFAULT_TASK)
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--action", default="finetune", choices=["fit", "finetune", "validate", "test"])
+    parser.add_argument(
+        "--ckpt-path",
+        default="",
+        help=(
+            "Optional Lightning checkpoint for action=fit resume runs. This is "
+            "passed as Hydra ckpt_path on the first attempt; OOM retries then "
+            "resume from the latest checkpoint found under the task run root."
+        ),
+    )
     parser.add_argument("--pretrain-ckpt", default=DEFAULT_PRETRAIN_CKPT)
     parser.add_argument("--wandb-pretrain-artifact", default=DEFAULT_PRETRAIN_ARTIFACT)
     parser.add_argument("--pretrain-download-dir", default=DEFAULT_PRETRAIN_DOWNLOAD_DIR)
@@ -502,6 +525,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-cosine-final-ratio", default="1.0")
     parser.add_argument("--estimator-warmup-epochs", type=int, default=0)
     parser.add_argument("--max-epochs", type=int, default=5)
+    parser.add_argument(
+        "--max-closed-loop-epochs",
+        type=int,
+        default=None,
+        help=(
+            "Optional trainer.max_closed_loop_epochs override. When unset, the "
+            "training code keeps its default behavior and uses trainer.max_epochs "
+            "as each closed-loop stage length."
+        ),
+    )
     parser.add_argument("--check-val-every-n-epoch", type=int, default=1)
     parser.add_argument("--limit-train-batches", default="1.0")
     parser.add_argument("--limit-val-batches", default="0.1")
