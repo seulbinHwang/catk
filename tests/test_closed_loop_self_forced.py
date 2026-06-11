@@ -7,9 +7,16 @@ from src.smart.model.smart_flow import SMARTFlow
 
 
 class _DummyTrainer:
-    def __init__(self, current_epoch: int = 0, check_val_every_n_epoch: int = 1) -> None:
+    def __init__(
+        self,
+        current_epoch: int = 0,
+        check_val_every_n_epoch: int = 1,
+        max_epochs: int = 18,
+    ) -> None:
         self.current_epoch = int(current_epoch)
         self.check_val_every_n_epoch = int(check_val_every_n_epoch)
+        self.max_epochs = int(max_epochs)
+        self.fit_loop = type("_DummyFitLoop", (), {"max_epochs": int(max_epochs)})()
 
 
 def _set_current_epoch(model: SMARTFlow, epoch: int) -> None:
@@ -242,3 +249,44 @@ def test_closed_loop_optimizer_state_reset_after_ema_copy_boundary() -> None:
 
     assert len(optimizer.state) == 0
     assert all(parameter.grad is None for parameter in online.parameters())
+
+
+def test_self_forced_cosine_lr_default_ratio_keeps_constant_lr() -> None:
+    model = _make_closed_loop_model()
+    model.self_forced_enabled = True
+    model.self_forced_start_epoch = 0
+    model.self_forced_estimator_warmup_epochs = 0
+    model._self_forced_requested_estimator_warmup_epochs = 0
+    model.closed_loop_sf_global_max_step = 4
+    model._closed_loop_sf_schedule_configured = False
+    model.self_forced_lr_cosine_final_ratio = 1.0
+    model.trainer = _DummyTrainer(max_epochs=5)
+
+    model._configure_closed_loop_self_forced_schedule()
+
+    assert model.trainer.max_epochs == 25
+    for epoch in (0, 12, 24):
+        _set_current_epoch(model, epoch)
+        assert abs(model._get_self_forced_lr_cosine_ratio_for_epoch() - 1.0) < 1e-12
+
+
+def test_self_forced_cosine_lr_updates_both_optimizers_on_resume_epoch() -> None:
+    model = _make_closed_loop_model()
+    model.self_forced_enabled = True
+    model.self_forced_start_epoch = 0
+    model.self_forced_lr_cosine_final_ratio = 0.01
+    model.lr = 7e-5
+    model.self_forced_generated_estimator_lr = 5e-5
+    model.trainer = _DummyTrainer(current_epoch=24, max_epochs=25)
+    model.log = lambda *args, **kwargs: None  # type: ignore[method-assign]
+
+    generator = nn.Linear(2, 1)
+    estimator = nn.Linear(2, 1)
+    generator_optimizer = torch.optim.AdamW(generator.parameters(), lr=0.123)
+    estimator_optimizer = torch.optim.AdamW(estimator.parameters(), lr=0.456)
+    model.optimizers = lambda: [generator_optimizer, estimator_optimizer]  # type: ignore[method-assign]
+
+    model._apply_self_forced_lr_schedule_for_current_epoch()
+
+    assert abs(generator_optimizer.param_groups[0]["lr"] - 7e-7) < 1e-12
+    assert abs(estimator_optimizer.param_groups[0]["lr"] - 5e-7) < 1e-12

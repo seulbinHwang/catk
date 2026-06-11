@@ -116,6 +116,7 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
     optional = {
         "CATK_LR": args.learning_rate,
         "CATK_GENERATED_ESTIMATOR_LR": args.generated_estimator_learning_rate,
+        "CATK_LR_COSINE_FINAL_RATIO": args.lr_cosine_final_ratio,
         "DECODER_USE_STOP_MOTION": args.decoder_use_stop_motion,
         "LIMIT_TRAIN_BATCHES": args.limit_train_batches,
         "LIMIT_VAL_BATCHES": args.limit_val_batches,
@@ -168,7 +169,7 @@ ESTIMATOR_WARMUP_BANK_LR=""
 echo "[self-forced-a100x4x2] pod=$(hostname) rank=${{NODE_RANK}} task=${{TASK_NAME}}"
 echo "[self-forced-a100x4x2] started at $(date '+%F %T')"
 echo "[self-forced-a100x4x2] experiment=${{EXPERIMENT}} bs=${{INITIAL_BS}} precision=${{PRECISION}}"
-echo "[self-forced-a100x4x2] lr=${{CATK_LR:-preset}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
+echo "[self-forced-a100x4x2] lr=${{CATK_LR:-preset}} lr_cosine_final_ratio=${{CATK_LR_COSINE_FINAL_RATIO:-preset}} estimator_warmup=${{ESTIMATOR_WARMUP_EPOCHS}} self_forced_use_stop_motion=${{SELF_FORCED_USE_STOP_MOTION}}"
 echo "[self-forced-a100x4x2] pretrain_artifact=${{WANDB_PRETRAIN_ARTIFACT}}"
 echo "[self-forced-a100x4x2] pretrain_ckpt=${{PRETRAIN_CKPT}}"
 echo "[self-forced-a100x4x2] attach survives after exit; press Ctrl-b d to detach"
@@ -1133,6 +1134,9 @@ while (( bs >= MIN_BS )); do
   if [[ -n "${{CATK_GENERATED_ESTIMATOR_LR:-}}" ]]; then
     torchrun_args+=(model.model_config.self_forced.generated_estimator_lr="$(strip_shell_quotes "$CATK_GENERATED_ESTIMATOR_LR")")
   fi
+  if [[ -n "${{CATK_LR_COSINE_FINAL_RATIO:-}}" ]]; then
+    torchrun_args+=(model.model_config.self_forced.lr_cosine_final_ratio="$(strip_shell_quotes "$CATK_LR_COSINE_FINAL_RATIO")")
+  fi
 
   echo
   echo "[self-forced-a100x4x2] $attempt_tag action=$action ckpt=$ckpt_path"
@@ -1431,6 +1435,11 @@ def parse_args() -> argparse.Namespace:
         "--generated-estimator-learning-rate",
         default="",
         help="Generated-estimator optimizer lr. Defaults to --learning-rate via model config.",
+    )
+    parser.add_argument(
+        "--lr-cosine-final-ratio",
+        default="1.0",
+        help="Final cosine LR multiplier for self-forced generator and generated-estimator optimizers.",
     )
     parser.add_argument("--limit-train-batches", default="")
     parser.add_argument("--limit-val-batches", default="")
