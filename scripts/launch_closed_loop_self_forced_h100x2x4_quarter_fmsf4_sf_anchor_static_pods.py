@@ -37,7 +37,7 @@ def default_extra_overrides(
             f"model.model_config.self_forced.rollout_anchor_stride={rollout_anchor_stride}",
             "model.model_config.self_forced.skip_initial_stage_from_checkpoint="
             f"{str(skip_initial_stage_checkpoint).lower()}",
-            "model.model_config.self_forced.closed_loop_sf_global_max_step=4",
+            "model.model_config.self_forced.closed_loop_sf_global_max_step=2",
             "model.model_config.self_forced.closed_loop_sf_local_max_step=4",
             "model.model_config.self_forced.update_open_loop_teacher_when_roll=false",
             "model.model_config.self_forced.clean_dmd_normalizer_eps=0.05",
@@ -48,6 +48,7 @@ def default_extra_overrides(
             "model.model_config.self_forced.sampling.random_terminal_step.min_executed_steps=16",
             "model.model_config.self_forced.sampling.backprop_last_k=8",
             "data.train_epoch_sample_fraction_shuffle_flag=false",
+            "trainer.max_epochs=6",
         ]
     )
 
@@ -56,7 +57,7 @@ def split_wrapper_args(argv: list[str]) -> tuple[list[str], str, int, bool]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--extra-hydra-overrides", default="")
     parser.add_argument("--closed-loop-see-all", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--rollout-anchor-stride", type=int, default=2)
+    parser.add_argument("--rollout-anchor-stride", type=int, default=4)
     parser.add_argument(
         "--skip-initial-stage-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -103,7 +104,7 @@ def main() -> int:
         skip_initial_stage_checkpoint,
     ) = split_wrapper_args(sys.argv[1:])
     pod_label = "h100x2x4_quarter"
-    lr_tag = "lr7e-5"
+    lr_tag = "lr5e-5"
     pretrain_root = (
         f"/workspace/flow_closed_loop_self_forced_{pod_label}_fmsf4_pretrain_epoch061_x5f9g0ce/v57"
     )
@@ -129,7 +130,7 @@ def main() -> int:
     task_name = (
         f"flow_closed_loop_self_forced_dmd_{pod_label}_fmsf4_sfanchor_stride{rollout_anchor_stride}_"
         f"{checkpoint_tag}_activecontrol_sample16_backprop8_{lr_tag}_bs4to2_frac025_"
-        "ep2_warm0_global4_local4"
+        "ep6_warm0_global2_local4"
     )
     bank_name = f"generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-{lr_tag}"
 
@@ -180,9 +181,11 @@ def main() -> int:
         "--precision",
         "bf16-mixed",
         "--learning-rate",
-        "7.0e-5",
+        "5.0e-5",
         "--generated-estimator-learning-rate",
-        "7.0e-5",
+        "5.0e-5",
+        "--lr-cosine-final-ratio",
+        "0.01",
         "--scorer-scene-num",
         "1680",
         "--estimator-warmup-epochs",
@@ -199,8 +202,6 @@ def main() -> int:
         "0.25",
         "--train-memory-balanced-batches",
         "true",
-        "--max-epochs",
-        "2",
         "--check-val-every-n-epoch",
         "1",
         "--limit-val-batches",
