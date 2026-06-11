@@ -3217,6 +3217,7 @@ class SMARTFlow(LightningModule):
         tau: Tensor,
         anchor_mask: Tensor,
         map_feature: Dict[str, Tensor] | None = None,
+        initial_rollout_state: Dict[str, object] | None = None,
     ) -> Dict[str, Tensor]:
         """주어진 decoder가 noisy N초 path를 어떻게 clean path로 보는지 계산합니다.
 
@@ -3235,6 +3236,15 @@ class SMARTFlow(LightningModule):
         """
         if map_feature is None:
             map_feature = decoder.encode_map(tokenized_map)
+        if initial_rollout_state is not None:
+            return decoder.path_flow_velocity_from_rollout_state(
+                tokenized_agent=tokenized_agent,
+                map_feature=map_feature,
+                path_noisy_norm=noisy_path_norm,
+                tau=tau,
+                anchor_mask=anchor_mask,
+                initial_state=initial_rollout_state,
+            )
         return decoder.path_flow_velocity_for_anchor0(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
@@ -3359,6 +3369,7 @@ class SMARTFlow(LightningModule):
         anchor_mask: Tensor,
         *,
         has_committed_path_global: bool | None = None,
+        initial_rollout_state: Dict[str, object] | None = None,
     ) -> Tensor:
         """detached self-rollout으로 generated estimator F_psi를 online 업데이트합니다.
 
@@ -3433,6 +3444,7 @@ class SMARTFlow(LightningModule):
                             tau=tau,
                             anchor_mask=estimator_anchor_mask,
                             map_feature=estimator_map_feature,
+                            initial_rollout_state=initial_rollout_state,
                         )
                         last_loss = flow_matching_loss(pred_dict["velocity"], flow_target)
                     else:
@@ -3463,6 +3475,7 @@ class SMARTFlow(LightningModule):
         anchor_mask: Tensor,
         active_control_mask: Tensor | None = None,
         dmd_injection_scale: float | Tensor = 1.0,
+        initial_rollout_state: Dict[str, object] | None = None,
     ) -> Tensor:
         """clean-DMD 방향을 고정된 평가자 출력으로 계산합니다.
 
@@ -3514,6 +3527,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                initial_rollout_state=initial_rollout_state,
             )
             generated_pred = self._predict_path_flow_clean_estimate(
                 decoder=self.self_forced_generated_estimator,
@@ -3522,6 +3536,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                initial_rollout_state=initial_rollout_state,
             )
             if self._should_project_self_forced_dmd_to_pose_space(committed_path_norm):
                 path_delta = self._compute_pose_projected_self_forced_control_delta(
@@ -3775,6 +3790,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        initial_rollout_state: Dict[str, object] | None = None,
     ) -> tuple[Tensor, Tensor]:
         """같은 noisy path에서 teacher와 generated estimator의 clean 예측을 구합니다.
 
@@ -3809,6 +3825,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                initial_rollout_state=initial_rollout_state,
             )
             generated_pred = self._predict_path_flow_clean_estimate(
                 decoder=self.self_forced_generated_estimator,
@@ -3817,6 +3834,7 @@ class SMARTFlow(LightningModule):
                 noisy_path_norm=flow_sample.x_t,
                 tau=flow_sample.tau,
                 anchor_mask=anchor_mask,
+                initial_rollout_state=initial_rollout_state,
             )
 
         if hasattr(self, "_assert_self_forced_generator_update_isolated"):
@@ -3829,6 +3847,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        initial_rollout_state: Dict[str, object] | None = None,
     ) -> Tensor:
         """Self-forced rollout path에 SiD-lite loss를 계산합니다.
 
@@ -3849,6 +3868,7 @@ class SMARTFlow(LightningModule):
             tokenized_agent=tokenized_agent,
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
+            initial_rollout_state=initial_rollout_state,
         )
         self._set_self_forced_backward_context(
             committed_path_norm=committed_path_norm,
@@ -3869,6 +3889,7 @@ class SMARTFlow(LightningModule):
         tokenized_agent: Dict[str, Tensor],
         committed_path_norm: Tensor,
         anchor_mask: Tensor,
+        initial_rollout_state: Dict[str, object] | None = None,
     ) -> Tensor:
         """설정에 따라 DMD-style 또는 SiD-style generator loss를 계산합니다.
 
@@ -3890,6 +3911,7 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent,
                 committed_path_norm=committed_path_norm,
                 anchor_mask=anchor_mask,
+                initial_rollout_state=initial_rollout_state,
             )
 
         active_control_mask = self._build_self_forced_active_control_mask(
@@ -3911,6 +3933,7 @@ class SMARTFlow(LightningModule):
             anchor_mask=anchor_mask,
             active_control_mask=active_control_mask,
             dmd_injection_scale=dmd_injection_scale,
+            initial_rollout_state=initial_rollout_state,
         )
         surrogate_injection_scale = 1.0 if pose_projected_dmd else dmd_injection_scale
         sf_loss, target_path_norm = active_control_dmd_surrogate_loss(
@@ -4329,6 +4352,7 @@ class SMARTFlow(LightningModule):
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
             has_committed_path_global=has_committed_path_global,
+            initial_rollout_state=initial_rollout_state,
         )
         if is_estimator_warmup_active:
             return self._finish_self_forced_estimator_warmup_step(gen_estimator_loss)
@@ -4338,6 +4362,7 @@ class SMARTFlow(LightningModule):
                 tokenized_agent=tokenized_agent_eval,
                 committed_path_norm=committed_path_norm,
                 anchor_mask=anchor_mask,
+                initial_rollout_state=initial_rollout_state,
             )
         else:
             sf_loss = self._build_trainable_connected_zero_loss(self.encoder)

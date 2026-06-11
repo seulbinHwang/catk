@@ -2247,6 +2247,45 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
         clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
         return {"velocity": velocity, "clean": clean}
 
+    def path_flow_velocity_from_rollout_state(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        path_noisy_norm: torch.Tensor,
+        tau: torch.Tensor,
+        anchor_mask: torch.Tensor,
+        initial_state: Dict[str, object],
+    ) -> Dict[str, torch.Tensor]:
+        """Predict flow velocity using the same current hidden state as closed-loop rollout."""
+        if path_noisy_norm.numel() == 0:
+            empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
+            return {"velocity": empty, "clean": empty}
+        if path_noisy_norm.shape[1:] != (self.flow_window_steps, self.flow_state_dim):
+            raise ValueError(
+                "path_noisy_norm must have shape [n_valid_agent, flow_window_steps, flow_state_dim], "
+                f"got {tuple(path_noisy_norm.shape)}."
+            )
+        if int(anchor_mask.sum().item()) != int(path_noisy_norm.shape[0]):
+            raise ValueError(
+                "anchor_mask true count must match path_noisy_norm first dim, "
+                f"got {int(anchor_mask.sum().item())} and {path_noisy_norm.shape[0]}."
+            )
+
+        rollout_cache = self.prepare_training_rollout_cache_from_state(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            initial_state=initial_state,
+        )
+        current_hidden = rollout_cache["feat_a_now"]
+        single_anchor_mask = anchor_mask.bool().view(-1, 1)
+        anchor_hidden_valid = self._pack_anchor_hidden(
+            current_hidden.unsqueeze(1),
+            single_anchor_mask,
+        )
+        velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
+        clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
+        return {"velocity": velocity, "clean": clean}
+
     @torch.no_grad()
     def inference(
         self,

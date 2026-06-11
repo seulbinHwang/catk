@@ -254,6 +254,98 @@ def test_shifted_self_forced_tokenized_agent_uses_prefix_final_state() -> None:
     assert shifted["kept"] is tokenized_agent["kept"]
 
 
+def test_prefix_state_clean_prediction_uses_rollout_context() -> None:
+    model = _make_closed_loop_model()
+    tokenized_map = {"map": torch.ones(1)}
+    tokenized_agent = {"agent": torch.ones(1)}
+    map_feature = {"feature": torch.ones(1)}
+    noisy_path = torch.ones(2, 20, 4)
+    tau = torch.ones(2)
+    anchor_mask = torch.tensor([True, False, True])
+    initial_state = {"pos_window": torch.ones(3, 4, 2)}
+    calls: list[tuple[str, object | None]] = []
+
+    class _Decoder:
+        def encode_map(self, tokenized_map_arg):
+            calls.append(("encode_map", tokenized_map_arg))
+            return map_feature
+
+        def path_flow_velocity_for_anchor0(self, **kwargs):
+            raise AssertionError("prefix clean prediction must not use two-token anchor context")
+
+        def path_flow_velocity_from_rollout_state(self, **kwargs):
+            calls.append(("rollout_state", kwargs["initial_state"]))
+            assert kwargs["tokenized_agent"] is tokenized_agent
+            assert kwargs["map_feature"] is map_feature
+            assert kwargs["path_noisy_norm"] is noisy_path
+            assert kwargs["tau"] is tau
+            assert kwargs["anchor_mask"] is anchor_mask
+            return {
+                "velocity": torch.zeros_like(noisy_path),
+                "clean": torch.zeros_like(noisy_path),
+            }
+
+    pred = model._predict_path_flow_clean_estimate(
+        decoder=_Decoder(),  # type: ignore[arg-type]
+        tokenized_map=tokenized_map,
+        tokenized_agent=tokenized_agent,
+        noisy_path_norm=noisy_path,
+        tau=tau,
+        anchor_mask=anchor_mask,
+        map_feature=map_feature,
+        initial_rollout_state=initial_state,
+    )
+
+    assert calls == [("rollout_state", initial_state)]
+    assert torch.equal(pred["velocity"], torch.zeros_like(noisy_path))
+    assert torch.equal(pred["clean"], torch.zeros_like(noisy_path))
+
+
+def test_base_clean_prediction_keeps_anchor0_context_without_prefix_state() -> None:
+    model = _make_closed_loop_model()
+    tokenized_map = {"map": torch.ones(1)}
+    tokenized_agent = {"agent": torch.ones(1)}
+    map_feature = {"feature": torch.ones(1)}
+    noisy_path = torch.ones(2, 20, 4)
+    tau = torch.ones(2)
+    anchor_mask = torch.tensor([True, False, True])
+    calls: list[str] = []
+
+    class _Decoder:
+        def encode_map(self, tokenized_map_arg):
+            calls.append("encode_map")
+            return map_feature
+
+        def path_flow_velocity_for_anchor0(self, **kwargs):
+            calls.append("anchor0")
+            assert kwargs["tokenized_agent"] is tokenized_agent
+            assert kwargs["map_feature"] is map_feature
+            assert kwargs["path_noisy_norm"] is noisy_path
+            assert kwargs["tau"] is tau
+            assert kwargs["anchor_mask"] is anchor_mask
+            return {
+                "velocity": torch.zeros_like(noisy_path),
+                "clean": torch.zeros_like(noisy_path),
+            }
+
+        def path_flow_velocity_from_rollout_state(self, **kwargs):
+            raise AssertionError("base self-forcing must keep existing anchor0 context")
+
+    pred = model._predict_path_flow_clean_estimate(
+        decoder=_Decoder(),  # type: ignore[arg-type]
+        tokenized_map=tokenized_map,
+        tokenized_agent=tokenized_agent,
+        noisy_path_norm=noisy_path,
+        tau=tau,
+        anchor_mask=anchor_mask,
+        map_feature=map_feature,
+    )
+
+    assert calls == ["anchor0"]
+    assert torch.equal(pred["velocity"], torch.zeros_like(noisy_path))
+    assert torch.equal(pred["clean"], torch.zeros_like(noisy_path))
+
+
 def test_self_forced_cosine_lr_uses_expanded_curriculum_length() -> None:
     model = _make_closed_loop_model()
     model.self_forced_enabled = True

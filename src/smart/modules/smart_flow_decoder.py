@@ -356,6 +356,25 @@ class SMARTFlowDecoder(nn.Module):
             anchor_mask=anchor_mask,
         )
 
+    def path_flow_velocity_from_rollout_state(
+        self,
+        tokenized_agent: Dict[str, Tensor],
+        map_feature: Dict[str, Tensor],
+        path_noisy_norm: Tensor,
+        tau: Tensor,
+        anchor_mask: Tensor,
+        initial_state: Dict[str, object],
+    ) -> Dict[str, Tensor]:
+        """Predict flow velocity from the validation-like closed-loop state context."""
+        return self.agent_encoder.path_flow_velocity_from_rollout_state(
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+            path_noisy_norm=path_noisy_norm,
+            tau=tau,
+            anchor_mask=anchor_mask,
+            initial_state=initial_state,
+        )
+
 
     def sample_open_loop_future(
         self,
