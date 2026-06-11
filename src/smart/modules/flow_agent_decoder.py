@@ -1938,6 +1938,77 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             use_stop_motion=use_stop_motion,
         )
 
+    def path_flow_velocity_for_anchors(
+        self,
+        tokenized_agent: Dict[str, torch.Tensor],
+        map_feature: Dict[str, torch.Tensor],
+        path_noisy_norm: torch.Tensor,
+        tau: torch.Tensor,
+        anchor_mask: torch.Tensor,
+        anchor_offsets: list[int],
+    ) -> Dict[str, torch.Tensor]:
+        """선택한 flow anchor들의 noisy path에 대한 flow velocity를 예측합니다.
+
+        pretraining open-loop 학습과 같은 규칙으로 GT ctx 토큰을 causal 인코딩한 뒤,
+        anchor offset k의 hidden(ctx slot ``1+k``)을 anchor-major로 packing해
+        flow decoder를 한 번만 호출합니다.
+
+        Args:
+            tokenized_agent: 평가 모드 기준 토큰 사전입니다.
+            map_feature: 이 decoder가 직접 만든 지도 특징입니다.
+            path_noisy_norm: noisy N초 flow state입니다. anchor-major packed이며
+                pose-space에서는 ``[n_valid, flow_window_steps, 4]`` 이고,
+                control-space에서는 ``[n_valid, flow_window_steps, 3]`` 입니다.
+            tau: flow interpolation time입니다. shape은 ``[n_valid]`` 입니다.
+            anchor_mask: 유효 (agent, anchor) 마스크입니다.
+                shape은 ``[n_agent, n_selected]`` 입니다.
+            anchor_offsets: 사용할 anchor offset 목록입니다. ``anchor_mask`` 의
+                열 순서와 같아야 합니다.
+
+        Returns:
+            Dict[str, torch.Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다. 두 텐서 shape은
+            ``[n_valid, flow_window_steps, flow_state_dim]`` 입니다.
+        """
+        if path_noisy_norm.numel() == 0:
+            empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
+            return {"velocity": empty, "clean": empty}
+        if path_noisy_norm.shape[1:] != (self.flow_window_steps, self.flow_state_dim):
+            raise ValueError(
+                "path_noisy_norm must have shape [n_valid, flow_window_steps, flow_state_dim], "
+                f"got {tuple(path_noisy_norm.shape)}."
+            )
+        if anchor_mask.dim() != 2 or anchor_mask.shape[1] != len(anchor_offsets):
+            raise ValueError(
+                "anchor_mask must have shape [n_agent, n_selected] matching anchor_offsets, "
+                f"got {tuple(anchor_mask.shape)} and {len(anchor_offsets)} offsets."
+            )
+        if int(anchor_mask.sum().item()) != int(path_noisy_norm.shape[0]):
+            raise ValueError(
+                "anchor_mask true count must match path_noisy_norm first dim, "
+                f"got {int(anchor_mask.sum().item())} and {path_noisy_norm.shape[0]}."
+            )
+
+        ctx_hidden_pack = self._encode_context(
+            agent_token_index=tokenized_agent["ctx_sampled_idx"],
+            pos_a=tokenized_agent["ctx_sampled_pos"],
+            head_a=tokenized_agent["ctx_sampled_heading"],
+            mask=tokenized_agent["ctx_valid"],
+            tokenized_agent=tokenized_agent,
+            map_feature=map_feature,
+        )
+        anchor_slots = [1 + int(offset) for offset in anchor_offsets]
+        if ctx_hidden_pack.shape[1] <= max(anchor_slots):
+            raise ValueError(
+                "path_flow_velocity_for_anchors requires one leading context token "
+                f"plus all anchor tokens: max slot {max(anchor_slots)}, "
+                f"ctx tokens {ctx_hidden_pack.shape[1]}."
+            )
+        anchor_hidden = ctx_hidden_pack[:, anchor_slots, :]
+        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, anchor_mask.bool())
+        velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
+        clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
+        return {"velocity": velocity, "clean": clean}
+
     def path_flow_velocity_for_anchor0(
         self,
         tokenized_agent: Dict[str, torch.Tensor],
@@ -1961,39 +2032,14 @@ class SMARTFlowAgentDecoder(SMARTAgentEncoder):
             Dict[str, torch.Tensor]: ``velocity`` 와 ``clean`` 을 담은 사전입니다. 두 텐서 shape은
             ``[n_valid_agent, flow_window_steps, flow_state_dim]`` 입니다.
         """
-        if path_noisy_norm.numel() == 0:
-            empty = path_noisy_norm.new_zeros((0, self.flow_window_steps, self.flow_state_dim))
-            return {"velocity": empty, "clean": empty}
-        if path_noisy_norm.shape[1:] != (self.flow_window_steps, self.flow_state_dim):
-            raise ValueError(
-                "path_noisy_norm must have shape [n_valid_agent, flow_window_steps, flow_state_dim], "
-                f"got {tuple(path_noisy_norm.shape)}."
-            )
-        if int(anchor_mask.sum().item()) != int(path_noisy_norm.shape[0]):
-            raise ValueError(
-                "anchor_mask true count must match path_noisy_norm first dim, "
-                f"got {int(anchor_mask.sum().item())} and {path_noisy_norm.shape[0]}."
-            )
-
-        ctx_hidden_pack = self._encode_context(
-            agent_token_index=tokenized_agent["ctx_sampled_idx"],
-            pos_a=tokenized_agent["ctx_sampled_pos"],
-            head_a=tokenized_agent["ctx_sampled_heading"],
-            mask=tokenized_agent["ctx_valid"],
+        return self.path_flow_velocity_for_anchors(
             tokenized_agent=tokenized_agent,
             map_feature=map_feature,
+            path_noisy_norm=path_noisy_norm,
+            tau=tau,
+            anchor_mask=anchor_mask.bool().view(-1, 1),
+            anchor_offsets=[0],
         )
-        if ctx_hidden_pack.shape[1] < 2:
-            raise ValueError(
-                "path_flow_velocity_for_anchor0 requires at least one leading context "
-                "token and one anchor token."
-            )
-        anchor_hidden = ctx_hidden_pack[:, 1:2, :]
-        single_anchor_mask = anchor_mask.bool().view(-1, 1)
-        anchor_hidden_valid = self._pack_anchor_hidden(anchor_hidden, single_anchor_mask)
-        velocity = self.flow_decoder(anchor_hidden_valid, path_noisy_norm, tau)
-        clean = self.flow_ode.predict_clean_from_velocity(path_noisy_norm, velocity, tau)
-        return {"velocity": velocity, "clean": clean}
 
     @torch.no_grad()
     def inference(

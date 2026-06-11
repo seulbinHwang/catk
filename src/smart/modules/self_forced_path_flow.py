@@ -69,6 +69,72 @@ def get_anchor0_valid_mask(tokenized_agent: Dict[str, Tensor]) -> Tensor:
     return valid_mask[:, -1].bool()
 
 
+def build_anchor_normalized_committed_path(
+    pred_traj_10hz: Tensor,
+    pred_head_10hz: Tensor,
+    current_pos: Tensor,
+    current_head: Tensor,
+    flow_window_steps: int,
+    pos_scale_m: float = 20.0,
+) -> Tensor:
+    """commit된 N초 rollout을 주어진 anchor 원점 기준 정규화 path로 바꿉니다.
+
+    Args:
+        pred_traj_10hz: closed-loop에서 실제 실행된 중심점입니다.
+            shape은 ``[n_row, T_rollout, 2]`` 입니다. multi-anchor 복제 rollout이면
+            행이 anchor-major로 펼쳐진 ``n_selected * n_agent`` 입니다.
+        pred_head_10hz: 같은 rollout의 heading입니다. shape은 ``[n_row, T_rollout]`` 입니다.
+        current_pos: 각 행의 anchor 원점 중심점입니다. shape은 ``[n_row, 2]`` 입니다.
+        current_head: 각 행의 anchor 원점 방향입니다. shape은 ``[n_row]`` 입니다.
+        flow_window_steps: pretrain flow window 길이입니다. 10Hz step 수입니다.
+        pos_scale_m: flow 학습에서 위치를 정규화할 때 쓴 meter scale입니다.
+
+    Returns:
+        Tensor: anchor 원점 기준의 정규화된 committed rollout입니다.
+            shape은 ``[n_row, flow_window_steps, 4]`` 이고 마지막 차원은
+            ``[x/scale, y/scale, cos(local_heading), sin(local_heading)]`` 입니다.
+    """
+    if pred_traj_10hz.dim() != 3 or pred_traj_10hz.shape[-1] != 2:
+        raise ValueError("pred_traj_10hz must have shape [n_row, T, 2].")
+    if pred_head_10hz.shape[:2] != pred_traj_10hz.shape[:2]:
+        raise ValueError("pred_head_10hz must have shape [n_row, T] matching pred_traj_10hz.")
+    if pred_traj_10hz.shape[1] < flow_window_steps:
+        raise ValueError(
+            "Committed rollout is shorter than flow_window_steps: "
+            f"got {pred_traj_10hz.shape[1]} and {flow_window_steps}."
+        )
+    if tuple(current_pos.shape) != (pred_traj_10hz.shape[0], 2):
+        raise ValueError(
+            "current_pos must have shape [n_row, 2] matching pred_traj_10hz rows, "
+            f"got {tuple(current_pos.shape)}."
+        )
+    if tuple(current_head.shape) != (pred_traj_10hz.shape[0],):
+        raise ValueError(
+            "current_head must have shape [n_row] matching pred_traj_10hz rows, "
+            f"got {tuple(current_head.shape)}."
+        )
+
+    # path_pos/head shape: [n_row, flow_window_steps, 2] / [n_row, flow_window_steps]
+    path_pos = pred_traj_10hz[:, :flow_window_steps]
+    path_head = pred_head_10hz[:, :flow_window_steps]
+
+    path_pos_local, path_head_local = transform_to_local(
+        pos_global=path_pos,
+        head_global=path_head,
+        pos_now=current_pos,
+        head_now=current_head,
+    )
+    return torch.stack(
+        [
+            path_pos_local[..., 0] / float(pos_scale_m),
+            path_pos_local[..., 1] / float(pos_scale_m),
+            path_head_local.cos(),
+            path_head_local.sin(),
+        ],
+        dim=-1,
+    )
+
+
 def build_anchor0_normalized_committed_path(
     pred_traj_10hz: Tensor,
     pred_head_10hz: Tensor,
@@ -92,39 +158,17 @@ def build_anchor0_normalized_committed_path(
             shape은 ``[n_agent, flow_window_steps, 4]`` 이고 마지막 차원은
             ``[x/scale, y/scale, cos(local_heading), sin(local_heading)]`` 입니다.
     """
-    if pred_traj_10hz.dim() != 3 or pred_traj_10hz.shape[-1] != 2:
-        raise ValueError("pred_traj_10hz must have shape [n_agent, T, 2].")
-    if pred_head_10hz.shape[:2] != pred_traj_10hz.shape[:2]:
-        raise ValueError("pred_head_10hz must have shape [n_agent, T] matching pred_traj_10hz.")
-    if pred_traj_10hz.shape[1] < flow_window_steps:
-        raise ValueError(
-            "Committed rollout is shorter than flow_window_steps: "
-            f"got {pred_traj_10hz.shape[1]} and {flow_window_steps}."
-        )
     if "ctx_sampled_pos" not in tokenized_agent or "ctx_sampled_heading" not in tokenized_agent:
         raise KeyError("tokenized_agent must contain ctx_sampled_pos and ctx_sampled_heading.")
 
-    # path_pos/head shape: [n_agent, flow_window_steps, 2] / [n_agent, flow_window_steps]
-    path_pos = pred_traj_10hz[:, :flow_window_steps]
-    path_head = pred_head_10hz[:, :flow_window_steps]
-
     # anchor 0은 history 마지막 1초 시점(raw step 10)을 뜻하므로 ctx slot 1을 원점으로 씁니다.
-    current_pos = tokenized_agent["ctx_sampled_pos"][:, 1]
-    current_head = tokenized_agent["ctx_sampled_heading"][:, 1]
-    path_pos_local, path_head_local = transform_to_local(
-        pos_global=path_pos,
-        head_global=path_head,
-        pos_now=current_pos,
-        head_now=current_head,
-    )
-    return torch.stack(
-        [
-            path_pos_local[..., 0] / float(pos_scale_m),
-            path_pos_local[..., 1] / float(pos_scale_m),
-            path_head_local.cos(),
-            path_head_local.sin(),
-        ],
-        dim=-1,
+    return build_anchor_normalized_committed_path(
+        pred_traj_10hz=pred_traj_10hz,
+        pred_head_10hz=pred_head_10hz,
+        current_pos=tokenized_agent["ctx_sampled_pos"][:, 1],
+        current_head=tokenized_agent["ctx_sampled_heading"][:, 1],
+        flow_window_steps=flow_window_steps,
+        pos_scale_m=pos_scale_m,
     )
 
 
@@ -190,9 +234,72 @@ def build_anchor0_normalized_committed_control(
         if "shape" in tokenized_agent
         else None
     )
+    return build_packed_normalized_committed_control(
+        committed_path_norm=committed_path_norm,
+        agent_type=agent_type,
+        agent_length=agent_length,
+        pos_scale_m=pos_scale_m,
+        vehicle_yaw_scale_rad=vehicle_yaw_scale_rad,
+        pedestrian_yaw_scale_rad=pedestrian_yaw_scale_rad,
+        cyclist_yaw_scale_rad=cyclist_yaw_scale_rad,
+        use_holonomic_model_only=use_holonomic_model_only,
+        use_rolling_supervision=use_rolling_supervision,
+        vehicle_no_slip_point_ratio=vehicle_no_slip_point_ratio,
+        cyclist_no_slip_point_ratio=cyclist_no_slip_point_ratio,
+        pose_pos_scale_m=pose_pos_scale_m,
+    )
+
+
+def build_packed_normalized_committed_control(
+    committed_path_norm: Tensor,
+    agent_type: Tensor,
+    agent_length: Tensor | None,
+    *,
+    pos_scale_m: float,
+    vehicle_yaw_scale_rad: float,
+    pedestrian_yaw_scale_rad: float,
+    cyclist_yaw_scale_rad: float,
+    use_holonomic_model_only: bool = False,
+    use_rolling_supervision: bool = True,
+    vehicle_no_slip_point_ratio: float = 0.0,
+    cyclist_no_slip_point_ratio: float = 0.0,
+    pose_pos_scale_m: float = POSE_NORM_POS_SCALE_M,
+) -> Tensor:
+    """packed anchor-local pose rollout을 control-space flow state로 바꿉니다.
+
+    ``build_anchor0_normalized_committed_control`` 의 core입니다. multi-anchor
+    학습처럼 (agent, anchor) 단위로 packed된 행에도 그대로 쓸 수 있도록
+    agent 속성을 packed 텐서로 직접 받습니다.
+
+    Args:
+        committed_path_norm: anchor-local pose path입니다.
+            shape은 ``[n_row, T, 4]`` 입니다.
+        agent_type: 각 행의 agent type입니다. shape은 ``[n_row]`` 입니다.
+        agent_length: 각 행의 agent box length입니다. shape은 ``[n_row]`` 이고
+            no-slip point 비율을 안 쓰면 ``None`` 일 수 있습니다.
+        pos_scale_m: control 이동량 정규화 scale입니다.
+        vehicle_yaw_scale_rad: vehicle yaw 정규화 scale입니다.
+        pedestrian_yaw_scale_rad: pedestrian yaw 정규화 scale입니다.
+        cyclist_yaw_scale_rad: cyclist yaw 정규화 scale입니다.
+        use_holonomic_model_only: ``True`` 이면 모든 agent type에 holonomic control
+            projection을 씁니다.
+        use_rolling_supervision: ``True`` 이면 decoder-consistent rolling projection을
+            사용하고, ``False`` 이면 raw pose pair inverse를 사용합니다.
+        vehicle_no_slip_point_ratio: vehicle box length에 곱하는 no-slip point offset 비율입니다.
+        cyclist_no_slip_point_ratio: cyclist box length에 곱하는 no-slip point offset 비율입니다.
+        pose_pos_scale_m: pose-space 위치 정규화 scale입니다.
+
+    Returns:
+        Tensor: 정규화된 rolling control path입니다. shape은 ``[n_row, T, 3]`` 입니다.
+    """
+    if committed_path_norm.ndim != 3 or committed_path_norm.shape[-1] != POSE_FLOW_DIM:
+        raise ValueError(
+            "committed_path_norm must have shape [n_row, T, 4], "
+            f"got {tuple(committed_path_norm.shape)}."
+        )
     if agent_type.shape[0] != committed_path_norm.shape[0]:
         raise ValueError(
-            "anchor_mask selected agent count must match committed_path_norm batch: "
+            "agent_type row count must match committed_path_norm batch: "
             f"got {agent_type.shape[0]} and {committed_path_norm.shape[0]}."
         )
     if committed_path_norm.shape[0] == 0:
