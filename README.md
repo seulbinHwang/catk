@@ -4212,6 +4212,40 @@ kubectl exec -it -n p-pnc testas -c main -- \
   tmux attach -t catk-clsf-testas-g4-seeall-maxcl10-lrdecay01
 ```
 
+fm-sf-3 H100 8GPU에서는 같은 see-all maxcl10 LR 0.1 recipe에서
+`gradually_see=true`만 비교하려면 아래 launcher를 사용합니다.
+
+```bash
+python scripts/launch_closed_loop_self_forced_h100x8_fmsf3_gradually_see_lr01_maxcl10_static_pod.py --replace
+```
+
+기본 실험 설정:
+
+| 항목 | 값 |
+|---|---|
+| pod | `fm-sf-3` H100 8GPU |
+| namespace | `p-sp-labs-reai-training` |
+| branch | `self_forcing_closed_loop` |
+| experiment | `self_forced_npfm_a100x4x2` |
+| action | `fit` |
+| resume checkpoint | `/workspace/closed_loop_gradually_see_resume/a100x4x2_lrdecay001_resume_e5/epoch_last.ckpt` |
+| DDP shape | `trainer.num_nodes=1`, `trainer.devices=8`, 총 8 ranks |
+| precision | `bf16-mixed` |
+| train batch | per-rank `72`, effective global batch `576` |
+| OOM fallback | `72 -> 70 -> 68 -> ... -> 2`, latest self-forced checkpoint resume |
+| lr | Generator `7e-5`, generated estimator `7e-5` |
+| lr decay | `model.model_config.self_forced.lr_cosine_final_ratio=0.1` |
+| curriculum | `closed_loop_sf_global_max_step=4`, `closed_loop_sf_local_max_step=4` |
+| stage length | t=0 stage `5` epochs, closed-loop stage당 `10` epochs, 총 `45` epochs |
+| gradually-see | `gradually_see=true`, `closed_loop_see_all=true` |
+| objective | DMD distribution matching, anchor FM off |
+| DMD filters | stable scale on, teacher alignment off, trust region off |
+| sampling | Euler `sample_steps=16`, `backprop_last_k=8`, terminal policy `all` |
+| train data | `train_epoch_sample_fraction=0.25`, sequential partition shuffle flag `false`, memory-balanced batches `true` |
+| validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, `scorer_scene_num=1680` |
+| val/test batch | per-rank `8` |
+| tmux session | `catk-clsf-h100x8-fmsf3-graduallysee-maxcl10-lrdecay01` |
+
 fm-sf-4 H100 8GPU에서는 같은 max-closed-loop-epochs=10 resume recipe에서
 `closed_loop_see_all=false`만 비교하려면 아래 launcher를 사용합니다.
 
