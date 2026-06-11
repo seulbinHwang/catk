@@ -38,7 +38,12 @@ def _make_closed_loop_model() -> SMARTFlow:
     model.self_forced_rollout_anchor_stride = 2
     model._closed_loop_sf_base_generator_epochs = 4
     model._closed_loop_sf_stage_warmup_epochs = 2
+    model.self_forced_enabled = True
     model.self_forced_use_distribution_matching_loss = True
+    model.self_forced_skip_initial_stage_from_checkpoint = True
+    model._self_forced_aux_loaded_from_checkpoint = False
+    model._self_forced_resume_checkpoint_next_epoch = None
+    model._closed_loop_sf_initial_stage_end_epoch_override = None
     model._self_forced_original_check_val_every_n_epoch = None
     model._self_forced_validation_schedule_captured = False
     return model
@@ -124,6 +129,37 @@ def test_closed_loop_self_forcing_stage_uses_configured_rollout_anchor_stride() 
     assert rollout_tokenized_agent["num_graphs"] == 4
     assert anchor_mask.shape == (8,)
     assert anchor_mask.all()
+
+
+def test_skip_initial_stage_resume_starts_at_closed_loop_stage_one() -> None:
+    model = _make_closed_loop_model()
+    model.self_forced_estimator_warmup_epochs = 0
+    model._self_forced_requested_estimator_warmup_epochs = 0
+    model.closed_loop_sf_global_max_step = 2
+    model.self_forced_rollout_anchor_stride = 4
+    model._self_forced_aux_loaded_from_checkpoint = True
+    model._self_forced_resume_checkpoint_next_epoch = 6
+    model._closed_loop_sf_schedule_configured = False
+    model.trainer = _DummyTrainer(current_epoch=6, max_epochs=2)
+
+    model._configure_closed_loop_self_forced_schedule()
+
+    assert model._closed_loop_sf_base_generator_epochs == 2
+    assert model._closed_loop_sf_initial_stage_end_epoch_override == 6
+    assert model.trainer.max_epochs == 10
+
+    _set_current_epoch(model, 6)
+    assert model._get_closed_loop_self_forced_stage() == 1
+    assert model._get_self_forced_rollout_anchor_stride_for_current_stage() == 4
+
+    tokenized_agent = _make_minimal_anchor_tokenized_agent()
+    rollout_tokenized_agent, anchor_mask = model._build_multi_anchor_self_forced_tokenized_agent(
+        tokenized_agent,  # type: ignore[arg-type]
+        anchor_stride=model._get_self_forced_rollout_anchor_stride_for_current_stage(),
+    )
+
+    assert rollout_tokenized_agent["_self_forced_anchor_repeat_count"] == 4
+    assert anchor_mask.shape == (8,)
 
 
 def test_closed_loop_stage_offsets_advance_by_local_max_step() -> None:

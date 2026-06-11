@@ -303,6 +303,11 @@ class SMARTFlow(LightningModule):
                 "self_forced.rollout_anchor_stride must be a positive integer, "
                 f"got {self.self_forced_rollout_anchor_stride!r}."
             )
+        self.self_forced_skip_initial_stage_from_checkpoint = (
+            bool(getattr(self.self_forced_config, "skip_initial_stage_from_checkpoint", True))
+            if self.self_forced_config is not None
+            else True
+        )
         self.closed_loop_sf_global_max_step = (
             int(getattr(self.self_forced_config, "closed_loop_sf_global_max_step", 1))
             if self.self_forced_config is not None
@@ -526,6 +531,8 @@ class SMARTFlow(LightningModule):
         self._closed_loop_sf_stage_warmup_epochs: int = (
             int(self._self_forced_requested_estimator_warmup_epochs)
         )
+        self._self_forced_resume_checkpoint_next_epoch: int | None = None
+        self._closed_loop_sf_initial_stage_end_epoch_override: int | None = None
         self._closed_loop_sf_last_prepared_stage: int = 0
         self._closed_loop_sf_schedule_configured = False
         self._automatic_open_loop_has_target_since_step = False
@@ -2434,6 +2441,28 @@ class SMARTFlow(LightningModule):
             ),
         )
 
+    def _should_skip_initial_self_forced_stage_from_checkpoint(self) -> bool:
+        """self-forced checkpoint가 초기 16-anchor stage를 대체하는 resume인지 판단합니다."""
+        return bool(
+            getattr(self, "self_forced_skip_initial_stage_from_checkpoint", True)
+            and getattr(self, "_self_forced_aux_loaded_from_checkpoint", False)
+            and getattr(self, "_self_forced_resume_checkpoint_next_epoch", None) is not None
+        )
+
+    def _get_closed_loop_initial_generator_start_epoch(self) -> int:
+        return int(self.self_forced_start_epoch) + int(self.self_forced_estimator_warmup_epochs)
+
+    def _get_closed_loop_initial_stage_end_epoch(self, base_epochs: int | None = None) -> int:
+        """초기 self-forcing stage가 끝난 것으로 볼 epoch boundary입니다."""
+        initial_generator_start = self._get_closed_loop_initial_generator_start_epoch()
+        if base_epochs is None:
+            base_epochs = self._closed_loop_sf_base_generator_epochs
+        normal_end = initial_generator_start + max(0, int(base_epochs or 0))
+        override = getattr(self, "_closed_loop_sf_initial_stage_end_epoch_override", None)
+        if override is None:
+            return int(normal_end)
+        return max(int(initial_generator_start), int(override))
+
     def _get_closed_loop_self_forced_stage_position(self) -> tuple[int, int]:
         """현재 epoch이 속한 closed-loop stage와 stage 내부 위치를 계산합니다."""
         if int(self.closed_loop_sf_global_max_step) <= 0:
@@ -2443,11 +2472,10 @@ class SMARTFlow(LightningModule):
             return 0, -1
 
         current_epoch = int(self.current_epoch)
-        initial_generator_start = (
-            int(self.self_forced_start_epoch)
-            + int(self.self_forced_estimator_warmup_epochs)
+        initial_generator_start = self._get_closed_loop_initial_generator_start_epoch()
+        initial_generator_end = self._get_closed_loop_initial_stage_end_epoch(
+            base_epochs=int(base_epochs),
         )
-        initial_generator_end = initial_generator_start + int(base_epochs)
         if current_epoch < initial_generator_start:
             return 0, current_epoch - initial_generator_start
         if current_epoch < initial_generator_end:
@@ -2486,8 +2514,7 @@ class SMARTFlow(LightningModule):
         if current_epoch < start_epoch:
             return 0
 
-        initial_warmup_epochs = int(self.self_forced_estimator_warmup_epochs)
-        initial_generator_start = start_epoch + initial_warmup_epochs
+        initial_generator_start = self._get_closed_loop_initial_generator_start_epoch()
         if current_epoch < initial_generator_start:
             return 0
 
@@ -2496,8 +2523,12 @@ class SMARTFlow(LightningModule):
             return current_epoch - initial_generator_start + 1
 
         base_epochs = int(base_epochs)
-        initial_generator_end = initial_generator_start + base_epochs
+        initial_generator_end = self._get_closed_loop_initial_stage_end_epoch(
+            base_epochs=base_epochs,
+        )
         if current_epoch < initial_generator_end:
+            if getattr(self, "_closed_loop_sf_initial_stage_end_epoch_override", None) is not None:
+                return base_epochs
             return current_epoch - initial_generator_start + 1
 
         stage_warmup_epochs = int(self._get_closed_loop_sf_stage_warmup_epochs())
@@ -2553,12 +2584,22 @@ class SMARTFlow(LightningModule):
         if base_generator_epochs <= 0:
             return
         self._closed_loop_sf_base_generator_epochs = int(base_generator_epochs)
-        expanded_max_epochs = (
-            generator_start_epoch
-            + int(base_generator_epochs)
-            + int(self.closed_loop_sf_global_max_step)
-            * (int(stage_warmup_epochs) + int(base_generator_epochs))
-        )
+        skip_initial_stage = self._should_skip_initial_self_forced_stage_from_checkpoint()
+        self._closed_loop_sf_initial_stage_end_epoch_override = None
+        if skip_initial_stage:
+            resume_next_epoch = int(self._self_forced_resume_checkpoint_next_epoch or 0)
+            initial_stage_end_epoch = max(int(generator_start_epoch), resume_next_epoch)
+            self._closed_loop_sf_initial_stage_end_epoch_override = int(initial_stage_end_epoch)
+            expanded_max_epochs = int(initial_stage_end_epoch) + int(self.closed_loop_sf_global_max_step) * (
+                int(stage_warmup_epochs) + int(base_generator_epochs)
+            )
+        else:
+            initial_stage_end_epoch = int(generator_start_epoch) + int(base_generator_epochs)
+            expanded_max_epochs = (
+                int(initial_stage_end_epoch)
+                + int(self.closed_loop_sf_global_max_step)
+                * (int(stage_warmup_epochs) + int(base_generator_epochs))
+            )
         if expanded_max_epochs <= int(configured_max_epochs):
             return
 
@@ -2576,7 +2617,9 @@ class SMARTFlow(LightningModule):
             f"base_generator_epochs={int(base_generator_epochs)} "
             f"initial_warmup_epochs={int(initial_warmup_epochs)} "
             f"stage_warmup_epochs={int(stage_warmup_epochs)} "
-            f"global_max_step={int(self.closed_loop_sf_global_max_step)}"
+            f"global_max_step={int(self.closed_loop_sf_global_max_step)} "
+            f"skip_initial_stage_from_checkpoint={bool(skip_initial_stage)} "
+            f"initial_stage_end_epoch={int(initial_stage_end_epoch)}"
         )
 
     def _get_self_forced_lr_schedule_total_epochs(self) -> int:
@@ -2923,6 +2966,13 @@ class SMARTFlow(LightningModule):
         self._self_forced_generator_ema_loaded_from_checkpoint = bool(
             self.self_forced_enabled and has_generator_ema
         )
+        checkpoint_epoch = checkpoint.get("epoch", None)
+        try:
+            self._self_forced_resume_checkpoint_next_epoch = (
+                int(checkpoint_epoch) + 1 if checkpoint_epoch is not None else None
+            )
+        except (TypeError, ValueError):
+            self._self_forced_resume_checkpoint_next_epoch = None
 
     def _assert_motion_missingness_checkpoint_compatible(self, checkpoint: Dict[str, Any]) -> None:
         """motion missingness 입력 차원과 맞지 않는 예전 checkpoint를 명확히 거부합니다."""

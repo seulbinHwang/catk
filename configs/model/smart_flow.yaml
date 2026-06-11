@@ -88,6 +88,9 @@ model_config:
     # local_max_step은 stage offset 폭이자 각 batch의 local pre-roll 샘플 상한입니다.
     closed_loop_sf_global_max_step: 1
     closed_loop_sf_local_max_step: 4
+    # true이면 self-forced checkpoint로 action=fit resume할 때, checkpoint가 초기
+    # 16-anchor stage를 이미 끝낸 것으로 보고 바로 closed-loop 추가 stage로 들어갑니다.
+    skip_initial_stage_from_checkpoint: true
     # false이면 stage s에서 (s-1)*N + M prefix를 씁니다.
     # true이면 stage s에서 0..s*N 전체 누적 prefix 구간을 샘플합니다.
     closed_loop_see_all: false

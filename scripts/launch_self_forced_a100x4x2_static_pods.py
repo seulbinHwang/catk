@@ -84,6 +84,10 @@ def render_env(args: argparse.Namespace, *, rank: int, master_addr: str) -> str:
         export_line("PRETRAIN_CKPT", args.pretrain_ckpt),
         export_line("WANDB_PRETRAIN_ARTIFACT", args.wandb_pretrain_artifact),
         export_line("WANDB_PRETRAIN_DOWNLOAD_DIR", args.pretrain_download_dir),
+        export_line("INITIAL_ACTION", args.initial_action),
+        export_line("PRETRAIN_EXPECTED_SHA256", args.pretrain_expected_sha256),
+        export_line("PRETRAIN_EXPECTED_EPOCH", args.pretrain_expected_epoch),
+        export_line("PRETRAIN_EXPECTED_GLOBAL_STEP", args.pretrain_expected_global_step),
         export_line("EXPERIMENT", args.experiment),
         export_line("TASK_NAME", args.task_name),
         export_line("NNODES", len(args.pods)),
@@ -639,8 +643,19 @@ resolve_attempt_plan() {{
         plan_message="failed_to_hash_resume_checkpoint"
       fi
     else
-      action="finetune"
+      action="${{INITIAL_ACTION:-finetune}}"
       ckpt_path="$PRETRAIN_CKPT"
+      if [[ "$action" == "fit" ]]; then
+        ckpt_size="$(stat -c %s "$ckpt_path" 2>/dev/null || true)"
+        ckpt_sha256="$(sha256sum "$ckpt_path" 2>/dev/null | awk '{{ print $1 }}')"
+        if [[ -z "$ckpt_size" || -z "$ckpt_sha256" ]]; then
+          plan_status=1
+          plan_message="failed_to_hash_initial_fit_checkpoint"
+        fi
+      elif [[ "$action" != "finetune" ]]; then
+        plan_status=1
+        plan_message="invalid_initial_action"
+      fi
     fi
     {{
       echo "action=$action"
@@ -770,6 +785,67 @@ PY
   fi
 
   test -f "$PRETRAIN_CKPT"
+}}
+
+verify_pretrain_checkpoint() {{
+  if [[ -z "${{PRETRAIN_EXPECTED_SHA256:-}}" \
+      && -z "${{PRETRAIN_EXPECTED_EPOCH:-}}" \
+      && -z "${{PRETRAIN_EXPECTED_GLOBAL_STEP:-}}" ]]; then
+    return 0
+  fi
+
+  python - <<'PY'
+import hashlib
+import os
+import sys
+
+path = os.environ["PRETRAIN_CKPT"]
+expected_sha = os.environ.get("PRETRAIN_EXPECTED_SHA256", "")
+expected_epoch = os.environ.get("PRETRAIN_EXPECTED_EPOCH", "")
+expected_global_step = os.environ.get("PRETRAIN_EXPECTED_GLOBAL_STEP", "")
+
+if expected_sha:
+    digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    if digest != expected_sha:
+        print(
+            f"ERROR: checkpoint sha256 mismatch for {{path}}: "
+            f"expected={{expected_sha}} actual={{digest}}",
+            file=sys.stderr,
+        )
+        sys.exit(10)
+
+if expected_epoch or expected_global_step:
+    try:
+        import torch
+    except Exception as exc:
+        print(f"ERROR: failed to import torch for checkpoint verification: {{exc}}", file=sys.stderr)
+        sys.exit(11)
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location="cpu")
+    if expected_epoch and int(checkpoint.get("epoch")) != int(expected_epoch):
+        print(
+            f"ERROR: checkpoint epoch mismatch for {{path}}: "
+            f"expected={{expected_epoch}} actual={{checkpoint.get('epoch')}}",
+            file=sys.stderr,
+        )
+        sys.exit(12)
+    if expected_global_step and int(checkpoint.get("global_step")) != int(expected_global_step):
+        print(
+            f"ERROR: checkpoint global_step mismatch for {{path}}: "
+            f"expected={{expected_global_step}} actual={{checkpoint.get('global_step')}}",
+            file=sys.stderr,
+        )
+        sys.exit(13)
+
+print(
+    "Verified checkpoint: "
+    f"path={{path}} epoch={{expected_epoch or 'unchecked'}} "
+    f"global_step={{expected_global_step or 'unchecked'}} "
+    f"sha256={{expected_sha or 'unchecked'}}"
+)
+PY
 }}
 
 find_latest_self_forced_ckpt() {{
@@ -1045,6 +1121,7 @@ start_retry_sync_server
 trap stop_retry_sync_server EXIT
 wait_for_retry_sync_server || exit 1
 ensure_pretrain_checkpoint || exit $?
+verify_pretrain_checkpoint || exit $?
 
 bs="$INITIAL_BS"
 attempt=0
@@ -1286,7 +1363,7 @@ tmux select-pane -t {shq(args.session)}
 """
 
     return f"""set -Eeuo pipefail
-if [ ! -d {shq(args.project_root)}/.git ]; then
+if [ ! -e {shq(args.project_root)}/.git ]; then
   echo "[launcher] PROJECT_ROOT is not a git checkout: {args.project_root}" >&2
   exit 2
 fi
@@ -1375,6 +1452,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--wandb-pretrain-artifact", default=DEFAULT_WANDB_PRETRAIN_ARTIFACT)
     parser.add_argument("--pretrain-download-dir", default=DEFAULT_PRETRAIN_DOWNLOAD_DIR)
+    parser.add_argument(
+        "--initial-action",
+        choices=("finetune", "fit"),
+        default="finetune",
+        help=(
+            "Action to use when TASK_NAME has no existing self-forced checkpoint. "
+            "Use 'fit' only for an already self-forced Lightning checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--pretrain-expected-sha256",
+        default="",
+        help="Optional sha256 that the downloaded initial checkpoint must match.",
+    )
+    parser.add_argument(
+        "--pretrain-expected-epoch",
+        default="",
+        help="Optional Lightning checkpoint epoch that the initial checkpoint must match.",
+    )
+    parser.add_argument(
+        "--pretrain-expected-global-step",
+        default="",
+        help="Optional Lightning checkpoint global_step that the initial checkpoint must match.",
+    )
     parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT)
     parser.add_argument("--task-name", default=DEFAULT_TASK_NAME)
     parser.add_argument("--session", default=DEFAULT_SESSION)
