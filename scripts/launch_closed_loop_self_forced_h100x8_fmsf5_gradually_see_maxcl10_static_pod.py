@@ -20,6 +20,7 @@ DEFAULT_SESSION = "catk-clsf-h100x8-fmsf5-graduallysee-maxcl10-lrdecay001"
 
 DEFAULT_EXTRA_OVERRIDES = " ".join(
     [
+        "trainer.num_nodes=1",
         "model.model_config.val_open_loop=false",
         "model.model_config.self_forced.use_distribution_matching_loss=true",
         "model.model_config.self_forced.distribution_matching_objective=dmd",
