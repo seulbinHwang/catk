@@ -73,16 +73,16 @@ def main() -> int:
         "--task-name",
         (
             "flow_self_forced_dmd_h100x8_fmsf2_sfanchor_stride1_epoch061_x5f9g0ce_"
-            "activecontrol_sample16_backprop8_lr5e-5_bs8to6_frac025_ep6_warm0_middle_val1_agent_oomretry"
+            "activecontrol_sample16_backprop8_lr5e-5_bs4to2_frac025_ep6_warm0_middle_val1_agent_oomretry"
         ),
         "--session",
         "catk-self-forced-dmd-h100x8-fmsf2-sfanchor-stride1-warm0-lr5e5",
         "--initial-bs",
-        "8",
+        "4",
         "--oom-step",
         "2",
         "--min-bs",
-        "6",
+        "2",
         "--val-batch-size",
         "8",
         "--test-batch-size",

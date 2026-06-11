@@ -71,7 +71,7 @@ def launch_variant(
     pretrain_root = f"/workspace/flow_closed_loop_self_forced_{pod_label}_fmsf4_pretrain_epoch061_x5f9g0ce/v57"
     task_name = (
         f"flow_closed_loop_self_forced_dmd_{pod_label}_fmsf4_sfanchor_stride1_epoch061_x5f9g0ce_"
-        f"activecontrol_sample16_backprop8_{lr_tag}_bs5to2_frac025_ep2_warm0_global4_local4"
+        f"activecontrol_sample16_backprop8_{lr_tag}_bs4to2_frac025_ep2_warm0_global4_local4"
     )
     bank_name = f"generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-{lr_tag}"
     args = [
@@ -98,7 +98,7 @@ def launch_variant(
         "--session",
         session,
         "--initial-bs",
-        "5",
+        "4",
         "--oom-step",
         "1",
         "--min-bs",

@@ -2709,7 +2709,7 @@ python scripts/launch_self_forced_dmd_h100x3x2_pvc_sf_anchor_static_pods.py \
 | pods | `pvc-1` 3 H100 + `pvc-2` 3 H100 |
 | branch | `semi_control_sf_anchor` |
 | experiment | `self_forced_npfm_h100_6` |
-| default task | `flow_self_forced_dmd_h100x3x2_pvc_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs8to6_frac025_ep8_warm2_middle_val1_oomretry` |
+| default task | `flow_self_forced_dmd_h100x3x2_pvc_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs4to2_frac025_ep8_warm2_middle_val1_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x3x2_pvc_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=1`, 즉 16개 anchor 전체 |
@@ -2725,8 +2725,8 @@ python scripts/launch_self_forced_dmd_h100x3x2_pvc_sf_anchor_static_pods.py \
 | train data fraction | `data.train_epoch_sample_fraction=0.25` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | epochs | `MAX_EPOCHS=10`; warmup bank에서 2 epoch exact hit 시 실제 `trainer.max_epochs=8`, miss 시 warmup 2 + generator/DMD 8 |
-| initial train batch | per-rank `8`, effective global scene batch `48` |
-| OOM fallback | `8 -> 6`, latest self-forced checkpoint resume |
+| initial train batch | per-rank `4`, effective global scene batch `24` |
+| OOM fallback | `4 -> 2`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-h100x3x2-pvc-sfanchor-stride1-lr5e5` |
@@ -2735,7 +2735,7 @@ python scripts/launch_self_forced_dmd_h100x3x2_pvc_sf_anchor_static_pods.py \
 stride-2 recipe보다 메모리 사용량이 큽니다. 2026-06-10 probe 기준 `bs12`는
 첫 train step을 통과했지만 peak가 약 `77.6GiB / 79.6GiB`까지 올라 rare heavy
 batch 여유가 얇았고, full run `bs10`은 실제 CUDA OOM이 났습니다. 그래서 full run
-기본 시작값은 per-rank `bs8`로 둡니다.
+기본 시작값은 per-rank `bs4`로 둡니다.
 
 학습 프로세스만 멈추고 pod는 그대로 두려면:
 
@@ -2776,7 +2776,7 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf1_sf_anchor_static_pod.py \
 | namespace | `p-sp-labs-reai-training` |
 | branch | `semi_control_sf_anchor` |
 | experiment | `self_forced_npfm_h100_6` |
-| default task | `flow_self_forced_dmd_h100x8_fmsf1_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs8to6_frac025_ep6_warm2_middle_val1_agent_oomretry` |
+| default task | `flow_self_forced_dmd_h100x8_fmsf1_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs4to2_frac025_ep6_warm2_middle_val1_agent_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x8_fmsf1_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=1`, 즉 16개 anchor 전체 |
@@ -2793,8 +2793,8 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf1_sf_anchor_static_pod.py \
 | train data fraction | `data.train_epoch_sample_fraction=0.25`, `data.train_epoch_sample_fraction_shuffle_flag=false` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | epochs | `MAX_EPOCHS=8`; warmup bank에서 2 epoch exact hit 시 실제 `trainer.max_epochs=6`, miss 시 warmup 2 + generator/DMD 6 |
-| initial train batch | per-rank `8`, effective global scene batch `64` |
-| OOM fallback | `8 -> 6`, latest self-forced checkpoint resume |
+| initial train batch | per-rank `4`, effective global scene batch `32` |
+| OOM fallback | `4 -> 2`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-h100x8-fmsf1-sfanchor-stride1-lr5e5` |
@@ -2824,7 +2824,7 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf2_sf_anchor_warm0_static_pod.py
 | namespace | `p-sp-labs-reai-training` |
 | branch | `semi_control_sf_anchor` |
 | experiment | `self_forced_npfm_h100_6` |
-| default task | `flow_self_forced_dmd_h100x8_fmsf2_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs8to6_frac025_ep6_warm0_middle_val1_agent_oomretry` |
+| default task | `flow_self_forced_dmd_h100x8_fmsf2_sfanchor_stride1_epoch061_x5f9g0ce_activecontrol_sample16_backprop8_lr5e-5_bs4to2_frac025_ep6_warm0_middle_val1_agent_oomretry` |
 | pretrained checkpoint artifact | `jksg01019-naver-labs/SMART-FLOW/epoch-last-x5f9g0ce:v57` |
 | local checkpoint path in pod | `/workspace/flow_self_forced_dmd_h100x8_fmsf2_pretrain_epoch061_x5f9g0ce/v57/epoch_061.ckpt` |
 | rollout anchors | `model.model_config.self_forced.rollout_anchor_stride=1`, 즉 16개 anchor 전체 |
@@ -2841,8 +2841,8 @@ python scripts/launch_self_forced_dmd_h100x8_fmsf2_sf_anchor_warm0_static_pod.py
 | train data fraction | `data.train_epoch_sample_fraction=0.25`, `data.train_epoch_sample_fraction_shuffle_flag=false` |
 | validation | `val_closed_loop=true`, `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | epochs | 실제 `trainer.max_epochs=6` |
-| initial train batch | per-rank `8`, effective global scene batch `64` |
-| OOM fallback | `8 -> 6`, latest self-forced checkpoint resume |
+| initial train batch | per-rank `4`, effective global scene batch `32` |
+| OOM fallback | `4 -> 2`, latest self-forced checkpoint resume |
 | val/test batch | per-rank `8` |
 | scorer scenes | `1680` |
 | tmux session | `catk-self-forced-dmd-h100x8-fmsf2-sfanchor-stride1-warm0-lr5e5` |
@@ -2903,7 +2903,7 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
 | train subset | `train_epoch_sample_fraction=0.25`, sequential partition mode |
 | validation | `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | base max epochs | wrapper 기본 `2`; closed-loop schedule가 초기 generator epoch 수를 기준으로 추가 stage만큼 확장 |
-| initial train batch | per-rank `5`, OOM fallback `5 -> 4 -> 3 -> 2` |
+| initial train batch | per-rank `4`, OOM fallback `4 -> 3 -> 2` |
 | val/test batch | per-rank `8` |
 | tmux session | `catk-closed-loop-sf-h100x8-fmsf4-sfanchor-stride1` |
 
@@ -2916,9 +2916,9 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf4_sf_anchor_static_pod.
 | `8` | stage 2 self-forcing까지 통과 | `84.87%` | 통과했지만 장기 run 기본값으로는 공격적 |
 | `10` | stage 2 rollout에서 CUDA OOM | 실패 | 상한 초과 |
 
-따라서 global4 장기 full run 기본 시작값은 per-rank `5`로 둡니다. `bs8`도
+따라서 global4 장기 full run 기본 시작값은 per-rank `4`로 둡니다. `bs8`도
 global3 stage 2 prefix 길이 `8` block까지 통과했지만 peak reserved가
-`84.87%`까지 올라가므로, global4 후반 stage와 rare heavy batch 여유를 남기기 위해 `bs5`를
+`84.87%`까지 올라가므로, global4 후반 stage와 rare heavy batch 여유를 남기기 위해 `bs4`를
 기본값으로 사용합니다. `bs10`은 실제로 `flow_local_decoder` step refiner
 attention 경로에서 OOM이 났습니다.
 
@@ -2961,7 +2961,7 @@ python scripts/launch_closed_loop_self_forced_h100x8_fmsf5_sf_anchor_seeall_stat
 | train subset | `train_epoch_sample_fraction=0.25`, sequential partition mode |
 | validation | `val_open_loop=false`, `limit_val_batches=0.1`, `check_val_every_n_epoch=1` |
 | base max epochs | wrapper 기본 `2`; closed-loop schedule가 초기 generator epoch 수를 기준으로 추가 stage만큼 확장 |
-| initial train batch | per-rank `5`, OOM fallback `5 -> 4 -> 3 -> 2` |
+| initial train batch | per-rank `4`, OOM fallback `4 -> 3 -> 2` |
 | val/test batch | per-rank `8` |
 | tmux session | `catk-closed-loop-sf-h100x8-fmsf5-sfanchor-seeall-stride1` |
 

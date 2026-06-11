@@ -86,12 +86,12 @@ def main() -> int:
         "--task-name",
         (
             "flow_closed_loop_self_forced_dmd_h100x8_fmsf5_sfanchor_seeall_stride1_epoch061_x5f9g0ce_"
-            "activecontrol_sample16_backprop8_lr7e-5_bs5to2_frac025_ep2_warm0_global4_local4"
+            "activecontrol_sample16_backprop8_lr7e-5_bs4to2_frac025_ep2_warm0_global4_local4"
         ),
         "--session",
         "catk-closed-loop-sf-h100x8-fmsf5-sfanchor-seeall-stride1",
         "--initial-bs",
-        "5",
+        "4",
         "--oom-step",
         "1",
         "--min-bs",
