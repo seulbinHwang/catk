@@ -396,6 +396,16 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else self.lr
         )
+        self.self_forced_lr_cosine_final_ratio = (
+            float(getattr(self.self_forced_config, "lr_cosine_final_ratio", 0.01))
+            if self.self_forced_config is not None
+            else 0.01
+        )
+        if not (0.0 < self.self_forced_lr_cosine_final_ratio <= 1.0):
+            raise ValueError(
+                "self_forced.lr_cosine_final_ratio must be in (0, 1], "
+                f"got {self.self_forced_lr_cosine_final_ratio}."
+            )
         self.self_forced_cache_frozen_map_features = (
             bool(getattr(self.self_forced_config, "cache_frozen_map_features", True))
             if self.self_forced_config is not None
@@ -2413,6 +2423,84 @@ class SMARTFlow(LightningModule):
             f"update_teacher={bool(self.update_open_loop_teacher_when_roll)}"
         )
 
+    def _get_self_forced_lr_schedule_total_epochs(self) -> int:
+        """실제로 실행될 self-forced epoch 수를 반환합니다."""
+        trainer = getattr(self, "trainer", None)
+        max_epochs = None
+        if trainer is not None:
+            fit_loop = getattr(trainer, "fit_loop", None)
+            max_epochs = getattr(fit_loop, "max_epochs", None)
+            if max_epochs is None:
+                max_epochs = getattr(trainer, "max_epochs", None)
+        if max_epochs is None or int(max_epochs) < 0:
+            max_epochs = getattr(self, "lr_total_steps", 1)
+        return max(1, int(max_epochs) - int(self.self_forced_start_epoch))
+
+    def _get_self_forced_lr_cosine_ratio_for_epoch(self, epoch: int | None = None) -> float:
+        """현재 self-forced curriculum 위치의 cosine LR 배율입니다."""
+        current_epoch = int(self.current_epoch if epoch is None else epoch)
+        epoch_index = max(0, current_epoch - int(self.self_forced_start_epoch))
+        total_epochs = int(self._get_self_forced_lr_schedule_total_epochs())
+        if total_epochs <= 1:
+            progress = 1.0 if epoch_index >= 0 else 0.0
+        else:
+            progress = min(1.0, max(0.0, float(epoch_index) / float(total_epochs - 1)))
+        final_ratio = float(self.self_forced_lr_cosine_final_ratio)
+        return final_ratio + 0.5 * (1.0 - final_ratio) * (1.0 + math.cos(math.pi * progress))
+
+    @staticmethod
+    def _set_optimizer_lr(optimizer, lr: float) -> None:
+        raw_optimizer = getattr(optimizer, "optimizer", optimizer)
+        for group in getattr(raw_optimizer, "param_groups", []):
+            group["lr"] = float(lr)
+
+    def _apply_self_forced_lr_schedule_for_current_epoch(self) -> None:
+        """Generator와 generated estimator optimizer LR을 실질 epoch 기준 cosine 값으로 맞춥니다."""
+        if not self.self_forced_enabled:
+            return
+        ratio = float(self._get_self_forced_lr_cosine_ratio_for_epoch())
+        try:
+            optimizers = self.optimizers()
+        except RuntimeError:
+            return
+        if not isinstance(optimizers, (list, tuple)):
+            optimizers = [optimizers]
+        if len(optimizers) >= 1:
+            self._set_optimizer_lr(optimizers[0], float(self.lr) * ratio)
+        if len(optimizers) >= 2:
+            self._set_optimizer_lr(
+                optimizers[1],
+                float(self.self_forced_generated_estimator_lr) * ratio,
+            )
+        if getattr(self, "trainer", None) is not None:
+            try:
+                self.log(
+                    "train/self_forced_lr_ratio",
+                    ratio,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
+                self.log(
+                    "train/self_forced_generator_lr",
+                    float(self.lr) * ratio,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
+                self.log(
+                    "train/self_forced_generated_estimator_lr",
+                    float(self.self_forced_generated_estimator_lr) * ratio,
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True,
+                    batch_size=1,
+                )
+            except Exception:
+                pass
+
     @staticmethod
     def _switch_module_to_eval_preserving_modes(module: nn.Module) -> Dict[nn.Module, bool]:
         """autograd는 유지한 채 module을 eval mode로 바꾸고 기존 mode를 기록합니다.
@@ -3863,6 +3951,7 @@ class SMARTFlow(LightningModule):
         self._load_self_forced_generated_estimator_bank()
         self._prepare_self_forced_generator_ema()
         self._configure_closed_loop_self_forced_schedule()
+        self._apply_self_forced_lr_schedule_for_current_epoch()
 
     def on_validation_start(self) -> None:
         """validation 시작 직전에 scorer batch 수 자동 조정을 다시 시도합니다."""
@@ -4651,6 +4740,7 @@ open_metric_dict:
         self._automatic_open_loop_has_target_pending.clear()
         self._apply_self_forced_validation_schedule_for_current_epoch()
         self._prepare_closed_loop_self_forced_stage_for_epoch()
+        self._apply_self_forced_lr_schedule_for_current_epoch()
 
     def on_train_epoch_end(self) -> None:
         """self-forced manual optimization에서 scheduler가 있으면 epoch마다 한 번 진행합니다.

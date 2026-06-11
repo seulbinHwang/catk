@@ -85,6 +85,7 @@ def render_env(args: argparse.Namespace) -> str:
         "MIN_BS": args.min_bs,
         "CATK_LR": args.learning_rate,
         "GENERATED_ESTIMATOR_LR": generated_estimator_lr,
+        "LR_COSINE_FINAL_RATIO": args.lr_cosine_final_ratio,
         "ESTIMATOR_WARMUP_EPOCHS": args.estimator_warmup_epochs,
         "MAX_EPOCHS": args.max_epochs,
         "CHECK_VAL_EVERY_N_EPOCH": args.check_val_every_n_epoch,
@@ -152,6 +153,7 @@ echo "[launcher] git_head=$(git rev-parse HEAD 2>/dev/null || echo no-git)"
 echo "[launcher] experiment=${EXPERIMENT} action=${ACTION} task=${TASK_NAME}"
 echo "[launcher] cuda_visible_devices=${CUDA_VISIBLE_DEVICES} nproc_per_node=${NPROC_PER_NODE}"
 echo "[launcher] closed_loop global=${CLOSED_LOOP_SF_GLOBAL_MAX_STEP} local=${CLOSED_LOOP_SF_LOCAL_MAX_STEP} see_all=${CLOSED_LOOP_SEE_ALL} update_teacher=${UPDATE_OPEN_LOOP_TEACHER_WHEN_ROLL}"
+echo "[launcher] lr=${CATK_LR} generated_estimator_lr=${GENERATED_ESTIMATOR_LR} lr_cosine_final_ratio=${LR_COSINE_FINAL_RATIO}"
 echo "[launcher] batch fallback: ${INITIAL_BS} down to ${MIN_BS} by ${OOM_STEP}"
 
 source ~/.bashrc || true
@@ -235,6 +237,7 @@ build_overrides() {
     "data.train_epoch_sample_fraction_shuffle_flag=${TRAIN_EPOCH_SAMPLE_FRACTION_SHUFFLE_FLAG}"
     "model.model_config.lr=${CATK_LR}"
     "model.model_config.self_forced.generated_estimator_lr=${GENERATED_ESTIMATOR_LR}"
+    "model.model_config.self_forced.lr_cosine_final_ratio=${LR_COSINE_FINAL_RATIO}"
     "model.model_config.self_forced.estimator_warmup_epochs=${ESTIMATOR_WARMUP_EPOCHS}"
     "model.model_config.self_forced.estimator_updates_per_step=${ESTIMATOR_UPDATES_PER_STEP}"
     "model.model_config.self_forced.unfrozen_range=${UNFROZEN_RANGE}"
@@ -463,6 +466,9 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--closed-loop-sf-global-max-step must be >= 0.")
     if args.closed_loop_sf_local_max_step < 1:
         raise SystemExit("--closed-loop-sf-local-max-step must be >= 1.")
+    lr_cosine_final_ratio = float(args.lr_cosine_final_ratio)
+    if not (0.0 < lr_cosine_final_ratio <= 1.0):
+        raise SystemExit("--lr-cosine-final-ratio must be in (0, 1].")
 
 
 def parse_args() -> argparse.Namespace:
@@ -493,6 +499,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-bs", type=int, default=2)
     parser.add_argument("--learning-rate", default="7e-5")
     parser.add_argument("--generated-estimator-learning-rate", default="7e-5")
+    parser.add_argument("--lr-cosine-final-ratio", default="0.01")
     parser.add_argument("--estimator-warmup-epochs", type=int, default=0)
     parser.add_argument("--max-epochs", type=int, default=5)
     parser.add_argument("--check-val-every-n-epoch", type=int, default=1)
