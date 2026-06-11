@@ -94,6 +94,7 @@ model_config:
     # false이면 stage s에서 (s-1)*N + M prefix를 씁니다.
     # true이면 stage s에서 0..s*N 전체 누적 prefix 구간을 샘플합니다.
     closed_loop_see_all: false
+    gradually_see: false
     update_open_loop_teacher_when_roll: false
     # Clean-DMD direction filters. These apply identically to pose-projected
     # and direct control-space DMD paths.

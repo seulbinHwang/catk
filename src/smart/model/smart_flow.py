@@ -333,6 +333,11 @@ class SMARTFlow(LightningModule):
             if self.self_forced_config is not None
             else False
         )
+        self.gradually_see = (
+            bool(getattr(self.self_forced_config, "gradually_see", False))
+            if self.self_forced_config is not None
+            else False
+        )
         self.update_open_loop_teacher_when_roll = (
             bool(getattr(self.self_forced_config, "update_open_loop_teacher_when_roll", False))
             if self.self_forced_config is not None
@@ -2507,6 +2512,30 @@ class SMARTFlow(LightningModule):
             and 0 <= int(stage_position) < stage_warmup_epochs
         )
 
+    def _get_closed_loop_sf_stage_total_epochs(self) -> int:
+        """현재 closed-loop stage 하나에 배정된 warmup 포함 총 epoch 수입니다."""
+        base_epochs = self._closed_loop_sf_base_generator_epochs
+        if base_epochs is None:
+            return 0
+        return int(self._get_closed_loop_sf_stage_warmup_epochs()) + int(base_epochs)
+
+    def _get_closed_loop_sf_gradual_local_max_step(self) -> int:
+        """gradually_see에서 현재 stage epoch에 열린 local prefix upper bound입니다."""
+        local_max_step = int(self.closed_loop_sf_local_max_step)
+        if local_max_step <= 0:
+            return 0
+        if not bool(getattr(self, "gradually_see", False)):
+            return local_max_step
+        stage, stage_position = self._get_closed_loop_self_forced_stage_position()
+        if int(stage) <= 0 or int(stage_position) < 0:
+            return 0
+        stage_total_epochs = int(self._get_closed_loop_sf_stage_total_epochs())
+        if stage_total_epochs <= 0:
+            return local_max_step
+        growth_interval = max(1, int(round(float(stage_total_epochs) / float(local_max_step))))
+        opened_steps = 1 + int(stage_position) // growth_interval
+        return max(1, min(local_max_step, int(opened_steps)))
+
     def _get_self_forced_completed_generator_epoch_count_for_current_epoch(self) -> int:
         """현재 epoch 종료 시점까지 완료되는 generator epoch 수를 warmup 제외 기준으로 계산합니다."""
         current_epoch = int(self.current_epoch)
@@ -3240,7 +3269,7 @@ class SMARTFlow(LightningModule):
         """현재 closed-loop stage에서 사용할 local EMA pre-roll 길이 M을 샘플합니다."""
         if self._get_closed_loop_self_forced_stage() <= 0:
             return 0
-        max_prefix_steps = int(self.closed_loop_sf_local_max_step)
+        max_prefix_steps = int(self._get_closed_loop_sf_gradual_local_max_step())
         if max_prefix_steps <= 0:
             return 0
         if self._distributed_available_and_initialized() and torch.distributed.get_rank() != 0:
@@ -3265,7 +3294,12 @@ class SMARTFlow(LightningModule):
         local_max_step = int(self.closed_loop_sf_local_max_step)
         if local_max_step <= 0:
             return 0
-        max_prefix_steps = int(stage * local_max_step)
+        if bool(getattr(self, "gradually_see", False)):
+            max_prefix_steps = int((stage - 1) * local_max_step) + int(
+                self._get_closed_loop_sf_gradual_local_max_step()
+            )
+        else:
+            max_prefix_steps = int(stage * local_max_step)
         if self._distributed_available_and_initialized() and torch.distributed.get_rank() != 0:
             sampled = 0
         else:
