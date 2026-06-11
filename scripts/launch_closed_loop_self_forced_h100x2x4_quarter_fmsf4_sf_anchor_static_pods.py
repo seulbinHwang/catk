@@ -129,7 +129,7 @@ def main() -> int:
 
     task_name = (
         f"flow_closed_loop_self_forced_dmd_{pod_label}_fmsf4_sfanchor_stride{rollout_anchor_stride}_"
-        f"{checkpoint_tag}_activecontrol_sample16_backprop8_{lr_tag}_bs4to2_frac025_"
+        f"{checkpoint_tag}_activecontrol_sample16_backprop8_{lr_tag}_bs28to4step4_frac025_"
         "ep6_warm0_global2_local4"
     )
     bank_name = f"generated-estimator-warmup-bank-pretrain-x5f9g0ce-v57-{lr_tag}"
@@ -169,11 +169,11 @@ def main() -> int:
         "--session",
         f"catk-closed-loop-sf-h100x2x4-quarter-fmsf4-stride{rollout_anchor_stride}",
         "--initial-bs",
-        "4",
+        "28",
         "--oom-step",
-        "1",
+        "4",
         "--min-bs",
-        "2",
+        "4",
         "--val-batch-size",
         "8",
         "--test-batch-size",
@@ -185,7 +185,7 @@ def main() -> int:
         "--generated-estimator-learning-rate",
         "5.0e-5",
         "--lr-cosine-final-ratio",
-        "0.01",
+        "0.1",
         "--scorer-scene-num",
         "1680",
         "--estimator-warmup-epochs",
