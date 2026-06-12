@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from src.smart.model.smart_flow import SMARTFlow
+from src.smart.modules.self_forced_dmd_guidance import compute_self_forced_dmd_injection_scale
 
 
 class _DummyTrainer:
@@ -90,6 +91,105 @@ def test_closed_loop_self_forced_stage_uses_warmup_plus_generator_blocks() -> No
     for epoch, stage in expected.items():
         _set_current_epoch(model, epoch)
         assert model._get_closed_loop_self_forced_stage() == stage
+
+
+def test_closed_loop_dmd_injection_ramp_restarts_for_each_generator_stage() -> None:
+    model = _make_closed_loop_model()
+
+    expected = {
+        # Initial anchor stage after the initial estimator warmup.
+        2: (0, 0, 0.25),
+        3: (1, 0, 0.625),
+        4: (2, 0, 1.0),
+        5: (3, 0, 1.0),
+        # Closed-loop stage 1 after its repeated stage warmup.
+        8: (0, 0, 0.25),
+        9: (1, 0, 0.625),
+        10: (2, 0, 1.0),
+        11: (3, 0, 1.0),
+        # Closed-loop stage 2 also starts a fresh generator-local ramp.
+        14: (0, 0, 0.25),
+        15: (1, 0, 0.625),
+        16: (2, 0, 1.0),
+        17: (3, 0, 1.0),
+    }
+    for epoch, (ramp_epoch, start_epoch, scale) in expected.items():
+        _set_current_epoch(model, epoch)
+        assert model._get_self_forced_dmd_injection_ramp_epoch_context() == (
+            ramp_epoch,
+            start_epoch,
+        )
+        assert (
+            compute_self_forced_dmd_injection_scale(
+                current_epoch=ramp_epoch,
+                dmd_start_epoch=start_epoch,
+                use_ramp=True,
+            )
+            == scale
+        )
+
+
+def test_dmd_injection_ramp_keeps_global_epoch_context_without_closed_loop() -> None:
+    model = _make_closed_loop_model()
+    model.closed_loop_sf_global_max_step = 0
+    model._closed_loop_sf_base_generator_epochs = None
+
+    expected = {
+        0: (0, 2, 0.25),
+        1: (1, 2, 0.25),
+        2: (2, 2, 0.25),
+        3: (3, 2, 0.625),
+        4: (4, 2, 1.0),
+    }
+    for epoch, (ramp_epoch, start_epoch, scale) in expected.items():
+        _set_current_epoch(model, epoch)
+        assert model._get_self_forced_dmd_injection_ramp_epoch_context() == (
+            ramp_epoch,
+            start_epoch,
+        )
+        assert (
+            compute_self_forced_dmd_injection_scale(
+                current_epoch=ramp_epoch,
+                dmd_start_epoch=start_epoch,
+                use_ramp=True,
+            )
+            == scale
+        )
+
+
+def test_closed_loop_dmd_injection_ramp_restarts_after_skip_initial_stage_resume() -> None:
+    model = _make_closed_loop_model()
+    model.self_forced_estimator_warmup_epochs = 0
+    model._self_forced_requested_estimator_warmup_epochs = 0
+    model.closed_loop_sf_global_max_step = 2
+    model._self_forced_aux_loaded_from_checkpoint = True
+    model._self_forced_resume_checkpoint_next_epoch = 6
+    model._closed_loop_sf_schedule_configured = False
+    model.trainer = _DummyTrainer(current_epoch=6, max_epochs=2)
+
+    model._configure_closed_loop_self_forced_schedule()
+
+    expected = {
+        6: (1, 0, 0, 0.25),
+        7: (1, 1, 0, 0.625),
+        8: (2, 0, 0, 0.25),
+        9: (2, 1, 0, 0.625),
+    }
+    for epoch, (stage, ramp_epoch, start_epoch, scale) in expected.items():
+        _set_current_epoch(model, epoch)
+        assert model._get_closed_loop_self_forced_stage() == stage
+        assert model._get_self_forced_dmd_injection_ramp_epoch_context() == (
+            ramp_epoch,
+            start_epoch,
+        )
+        assert (
+            compute_self_forced_dmd_injection_scale(
+                current_epoch=ramp_epoch,
+                dmd_start_epoch=start_epoch,
+                use_ramp=True,
+            )
+            == scale
+        )
 
 
 def test_initial_self_forcing_stage_always_uses_all_rollout_anchors() -> None:

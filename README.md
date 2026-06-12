@@ -2153,7 +2153,7 @@ Clean-DMD 방향 안정화 필터는 pose-projected 경로와 direct control-spa
 | `dmd_stable_scale_scope` | `agent` | `agent`는 agent별, `type`은 같은 scene 안 같은 agent type별, `scene`은 같은 scene 전체 agent별로 stable scale을 공유합니다. |
 | `dmd_use_teacher_alignment_filter` | `false` | \(a=\mathbf{1}[\langle P_T-P_X,R\rangle>0]\) gate를 적용해 teacher 방향과 정렬된 agent만 남깁니다. |
 | `dmd_use_trust_region_filter` | `false` | \(D=D_1\min(1,\mathrm{rms}(G)/(\mathrm{rms}(D_1)+\epsilon))\) 로 DMD 방향 크기를 teacher 거리 이하로 제한합니다. |
-| `dmd_use_injection_ramp` | `false` | `true`이면 DMD target 주입량을 warmup 종료 후 첫 generator-DMD epoch부터 \(\lambda_e=0.25+0.75\min(1,\frac{\max(0,e-e_0)}{2})\) 로 2 epoch 동안 키웁니다. `false`이면 항상 \(\lambda=1\) 입니다. |
+| `dmd_use_injection_ramp` | `false` | `true`이면 DMD target 주입량을 각 generator-DMD stage 안에서 \(\lambda_j=0.25+0.75\min(1,\frac{\max(0,j)}{2})\) 로 2 epoch 동안 키웁니다. `closed_loop_sf_global_max_step>0` 에서는 초기 anchor stage와 각 closed-loop stage마다 \(j=0\)부터 ramp를 다시 시작합니다. `false`이면 항상 \(\lambda=1\) 입니다. |
 
 여기서 \(R\) 은 teacher-estimator clean 추정 차이, \(G\) 는 현재 generator와 teacher의 차이입니다.
 기본값인 `project_dmd_to_pose_space=false` 에서는 위 값들이 control-space에서 계산되고,

@@ -2519,6 +2519,32 @@ class SMARTFlow(LightningModule):
             return 0
         return int(self._get_closed_loop_sf_stage_warmup_epochs()) + int(base_epochs)
 
+    def _get_self_forced_dmd_injection_ramp_epoch_context(self) -> tuple[int, int]:
+        """DMD injection ramp가 참조할 epoch 좌표계를 반환합니다.
+
+        Closed-loop curriculum이 켜진 경우 ramp는 전체 fit timeline이 아니라
+        초기 anchor stage와 각 closed-loop stage의 generator epoch 안에서 재시작합니다.
+        """
+        current_epoch = int(self.current_epoch)
+        global_dmd_start_epoch = int(self.self_forced_start_epoch) + int(
+            self.self_forced_estimator_warmup_epochs
+        )
+        if (
+            int(self.closed_loop_sf_global_max_step) <= 0
+            or self._closed_loop_sf_base_generator_epochs is None
+            or int(self._closed_loop_sf_base_generator_epochs) <= 0
+        ):
+            return current_epoch, global_dmd_start_epoch
+
+        stage, stage_position = self._get_closed_loop_self_forced_stage_position()
+        if int(stage) <= 0:
+            initial_generator_start = self._get_closed_loop_initial_generator_start_epoch()
+            return max(0, current_epoch - int(initial_generator_start)), 0
+
+        stage_warmup_epochs = int(self._get_closed_loop_sf_stage_warmup_epochs())
+        stage_generator_epoch = int(stage_position) - int(stage_warmup_epochs)
+        return max(0, int(stage_generator_epoch)), 0
+
     def _get_closed_loop_sf_gradual_local_max_step(self) -> int:
         """gradually_see에서 현재 stage epoch에 열린 local prefix upper bound입니다."""
         local_max_step = int(self.closed_loop_sf_local_max_step)
@@ -4247,9 +4273,9 @@ class SMARTFlow(LightningModule):
             committed_path_norm=committed_path_norm,
             anchor_mask=anchor_mask,
         )
-        dmd_start_epoch = int(self.self_forced_start_epoch) + int(self.self_forced_estimator_warmup_epochs)
+        dmd_ramp_epoch, dmd_start_epoch = self._get_self_forced_dmd_injection_ramp_epoch_context()
         dmd_injection_scale = compute_self_forced_dmd_injection_scale(
-            current_epoch=int(self.current_epoch),
+            current_epoch=int(dmd_ramp_epoch),
             dmd_start_epoch=dmd_start_epoch,
             use_ramp=self.self_forced_dmd_use_injection_ramp,
         )
